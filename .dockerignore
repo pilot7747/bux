@@ -1,0 +1,44 @@
+# Version control and CI
+.git/
+.github/
+
+# Docker build files
+Dockerfile
+.dockerignore
+
+# Python environments, caches, and build output
+.venv/
+venv/
+**/__pycache__/
+**/*.py[cod]
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+.coverage
+.coverage.*
+htmlcov/
+build/
+dist/
+*.egg-info/
+**/.ipynb_checkpoints/
+
+# Editors and operating systems
+.idea/
+.vscode/
+**/.DS_Store
+
+# Local secrets
+.env
+.env.*
+
+# Local data and experiment artifacts
+data/
+datasets/
+checkpoints/
+runs/
+outputs/
+wandb/
+**/*.ckpt
+**/*.pt
+**/*.pth
+**/*.safetensors
