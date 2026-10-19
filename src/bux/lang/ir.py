@@ -15,7 +15,8 @@ A graph is a tree of nodes, each a function of the incoming stream ``x``:
     Ref         top of the tap, ignoring x     ``$name``; ``$name!`` also pops it
 
 Branches of Sum/Prod run left to right, which only matters for taps. Every Layer
-knows its input ``width`` (an int, or "tokens" for embeddings). Nodes with the same
+knows its input ``width``: an int, "tokens" for embeddings, or "streams" for layers
+that act on a residual stream widened by the residual algebra. Nodes with the same
 ``share`` key are a single module. ``Residual`` is kept distinct from ``_ + body`` so
 that backends can swap the residual algebra (e.g. hyper-connections) for it alone.
 """
@@ -27,7 +28,8 @@ from pydantic import BaseModel, ConfigDict, Field
 
 from bux.config import LayerConfig, ResidualConfig
 
-Width = int | Literal["tokens", "logits"]
+# "streams" is a residual stream widened by the residual algebra (hc, mhc, gr, attnres).
+Width = int | Literal["tokens", "logits", "streams"]
 
 
 class _Node(BaseModel):

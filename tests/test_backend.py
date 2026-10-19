@@ -1,9 +1,22 @@
+import math
+
 import jax
 import jax.numpy as jnp
 import pytest
 from flax import nnx
 
-from bux.backend import Model, num_params
+from bux import config as cfg
+from bux.backend import (
+    TOKENS,
+    Attention,
+    Context,
+    Engram,
+    Model,
+    _frequencies,
+    _ngram_rows,
+    _rope,
+    num_params,
+)
 from bux.lang import compile
 
 D, V, H, F = 32, 64, 4, 48
@@ -81,10 +94,11 @@ def test_wiring_runs(body):
     assert logits.shape == (2, 8, V) and bool(jnp.isfinite(logits).all())
 
 
-def test_every_head_is_an_output_and_nextn_looks_one_token_further():
+@pytest.mark.parametrize("shared", ["", "shared "], ids=["fresh", "shared"])
+def test_every_head_is_an_output_and_nextn_looks_one_token_further(shared):
     m = model(
         "shared out = head\n"
-        "mtp = $h! nextn [norm attn] [norm ffn] @h norm out\n"
+        f"{shared}mtp = $h! nextn [norm attn] [norm ffn] norm @h out\n"
         "model = embed [norm attn] [norm ffn] norm @h out mtp^2"
     )
     t = tokens()
@@ -97,12 +111,26 @@ def test_every_head_is_an_output_and_nextn_looks_one_token_further():
         assert not jnp.allclose(a[:, 5 - k], b[:, 5 - k])
 
 
+def test_nextn_embeds_the_token_ahead_as_the_embedding_does():
+    m = model("model = embed(norm=rmsnorm) [norm attn] norm @h head $h nextn norm head")
+    embed, nextn = m.graph.items[0], m.graph.items[-3]
+    embed.norm.scale[...] = jax.random.uniform(
+        jax.random.key(1), (D,), minval=0.5, maxval=2
+    )
+    t, h = tokens(), jax.random.normal(jax.random.key(2), (2, 8, D))
+    ahead = jnp.pad(t[:, 1:], ((0, 0), (0, 1)))
+    e = nextn.embed_norm(embed.norm(embed.tokens(ahead)))
+    expected = nextn.proj(jnp.concatenate([e, nextn.hidden_norm(h)], -1))
+    assert jnp.allclose(nextn(h, {TOKENS: [t]}), expected, atol=1e-5)
+
+
 @pytest.mark.parametrize(
     "body",
     [
         # LatentMoE with sqrtsoftplus routing, clamped and soft-capped experts
         (
             "e = moe(num_experts=4, top_k=2, num_shared_experts=1, router=sqrtsoftplus,"
+            " router_logit_scale=0.5,"
             " latent_size=16, latent_input_norm=norm, latent_output_norm=norm,"
             " expert_norm=rmsnorm(scale_input=true),"
             " expert=gated_mlp(intermediate_size=24, activation=situ, limit=5,"
@@ -124,6 +152,105 @@ def test_every_head_is_an_output_and_nextn_looks_one_token_further():
 def test_new_layer_options_run(body):
     logits = model(body)(tokens())
     assert logits.shape == (2, 8, V) and bool(jnp.isfinite(logits).all())
+
+
+def test_yarn_matches_transformers():
+    # Laguna XS 2.1 full attention: 64 of 128 dims rotated, correction range [7, 18];
+    # the expected values come from transformers' _compute_yarn_parameters.
+    yarn = cfg.YaRNConfig(factor=32, original_max_len=8192, beta_fast=64)
+    rope = cfg.RoPEConfig(base=500000, fraction=0.5, scaling=yarn)
+    inv_freq, gain = _frequencies(rope, 64)
+    expected = {
+        0: 1.0,
+        6: 0.08539710193872452,
+        7: 0.05666961893439293,
+        12: 0.00408140616491437,
+        17: 0.00011197696585441008,
+        18: 1.9461638657958247e-05,
+        31: 9.418306490260875e-08,
+    }
+    for i, v in expected.items():
+        assert math.isclose(float(inv_freq[i]), v, rel_tol=2e-6)
+    assert gain == 1.3465735902799727  # that config's attention_factor
+    x = jnp.concatenate([jnp.ones(32), jnp.zeros(32), jnp.full(64, 7.0)])
+    y = _rope(jnp.broadcast_to(x, (1, 2, 1, 128)), rope)[0, 1, 0]  # position 1
+    assert jnp.allclose(jnp.hypot(y[:32], y[32:64]), gain)  # cos and sin carry it
+    assert jnp.allclose(jnp.arctan2(y[32:64], y[:32]), inv_freq, rtol=1e-5)
+    assert (y[64:] == 7.0).all()  # the dims that are not rotated are untouched
+    mellum = cfg.RoPEConfig(
+        base=500000, scaling=cfg.YaRNConfig(factor=16, original_max_len=8192)
+    )
+    assert _frequencies(mellum, 128)[1] == 1.2772588722239782
+
+
+def test_yarn_attention_factor_on_the_softmax_scale():
+    def attn(on: str, head_dim: int) -> Attention:
+        y = cfg.YaRNConfig(factor=40, original_max_len=4096, attention_factor_on=on)
+        c = cfg.GQAConfig(
+            num_heads=2,
+            num_kv_heads=1,
+            head_dim=head_dim,
+            rope=cfg.RoPEConfig(scaling=y),
+        )
+        return Attention(c, D, (), nnx.Rngs(0))
+
+    # DeepSeek-V3: 192 ** -0.5 * (0.1 ln 40 + 1) ** 2, with cos and sin unscaled
+    assert math.isclose(attn("softmax", 192).scale, 0.1352337788608801, rel_tol=1e-12)
+    # With every dim rotated, both placements give the same attention.
+    x = jax.random.normal(jax.random.key(0), (1, 6, D))
+    assert jnp.allclose(attn("rotary", 8)(x, {}), attn("softmax", 8)(x, {}), atol=1e-5)
+
+
+def test_ngram_rows_look_back_n_tokens_within_a_document():
+    m, primes = (
+        jnp.asarray([3, 5, 7], jnp.uint32),
+        jnp.asarray([[11], [13]], jnp.uint32),
+    )
+    offsets = jnp.asarray([[0], [11]], jnp.uint32)
+
+    def rows(t, boundary=None):
+        return _ngram_rows(t, t, m, primes, offsets, boundary, 0)
+
+    t = tokens()
+    changed = t.at[:, 3].set((t[:, 3] + 1) % V)
+    differs = (rows(t) != rows(changed)).any(-1).any(0)
+    assert (
+        differs.tolist() == [False] * 3 + [True] * 3 + [False] * 2
+    )  # trigrams reach 3
+    assert ((rows(t)[..., 0] < 11) & (rows(t)[..., 1] >= 11)).all()
+    # With a boundary token at position 4, positions after it cannot see position 3.
+    t, changed = t.at[:, 4].set(V - 1), changed.at[:, 4].set(V - 1)
+    differs = (rows(t, V - 1) != rows(changed, V - 1)).any(-1).any(0)
+    assert differs.tolist() == [False] * 3 + [True] * 2 + [False] * 3
+
+
+def test_engram_adds_gated_memory_and_is_causal():
+    m = model(
+        "mem = engram(head_dim=4, table_size=50)\n"
+        "model = embed [norm attn] mem [norm ffn] norm head"
+    )
+    t = tokens()
+    changed = t.at[:, 5:].set((t[:, 5:] + 1) % V)
+    assert jnp.allclose(m(t)[:, :5], m(changed)[:, :5], atol=1e-5)
+    engram = m.graph.items[2]
+    x = jax.random.normal(jax.random.key(1), (2, 8, D))
+    assert not jnp.allclose(engram(x, {TOKENS: [t]}), x)
+    engram.table[...] = jnp.zeros_like(engram.table[...])
+    assert jnp.allclose(engram(x, {TOKENS: [t]}), x)  # no memory, no change
+
+
+def test_engram_gates_every_copy_of_a_widened_stream_with_its_own_key():
+    arch = compile(
+        PRELUDE + "residual = mhc(expansion=4)\nmodel = embed [norm attn] head"
+    )
+    c = cfg.EngramConfig(head_dim=4, table_size=50, conv_size=None)
+    engram = Engram(c, "streams", Context(arch, nnx.Rngs(0)))
+    x = jax.random.normal(jax.random.key(1), (2, 8, 4, D))
+    y = engram(x, {TOKENS: [tokens()]})
+    z = engram(x.at[:, :, 0].multiply(3.0), {TOKENS: [tokens()]})
+    assert y.shape == x.shape
+    assert not jnp.allclose(y[:, :, 0], z[:, :, 0] / 3.0)
+    assert jnp.allclose(y[:, :, 1:], z[:, :, 1:])
 
 
 def test_unregistered_layers_say_how_to_add_them():

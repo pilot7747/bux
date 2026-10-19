@@ -135,9 +135,10 @@ model = embed (m^6 sa)^9 norm head
 
 Every `head` is an output. A head ends the stream, so nothing can follow it but a tap
 read, and that is how a model goes on to a second output. `nextn` mixes the stream with
-the embedding of the next token, `W [norm(embed(t+1)); norm(h)]`, so a head after it
-predicts the token after next. This is DeepSeek-V3's multi-token prediction (MTP)
-module, with the main head shared:
+the next token's embedding, `W [norm(e); norm(h)]`, where `e` is what `embed` makes of
+the token (scaled and normalized, without positions), so a head after it predicts the
+token after next. This is DeepSeek-V3's multi-token prediction (MTP) module, with the
+main head shared:
 
 ```
 shared out = head
@@ -145,16 +146,18 @@ mtp = $h nextn layer(experts) norm out
 model = embed layer(dense)^3 layer(experts)^58 norm @h out mtp
 ```
 
-The k-th `nextn` in execution order embeds the token k positions ahead, so a chain of
-modules, each reading the previous one's hidden state, is a repeat:
+The k-th `nextn` to run embeds the token k positions ahead. A chain of modules, each
+reading the previous one's hidden state, is a repeat; with `shared`, one module runs at
+every depth and still looks one token further each time (GLM-5, Nemotron 3); and with
+`$h` instead of `$h!`, every depth reads the main model's state (MiMo-V2):
 
 ```
-mtp = $h! nextn layer(experts) @h norm out
+mtp = $h! nextn layer(experts) norm @h out
 model = embed block^40 norm @h out mtp^3       # 4 outputs: 1, 2, 3 and 4 tokens ahead
 ```
 
 A backend returns the heads' logits in execution order; head j predicts the token
-`1 + k` positions ahead, where k counts the `nextn` layers before it.
+`1 + k` positions ahead, where k counts the `nextn` layers run before it.
 
 ## Settings
 
@@ -162,10 +165,11 @@ A layer call takes keyword arguments, which map one-to-one to the pydantic field
 `bux/config.py`. Every config's `type` tag is also its name in the language:
 `gqa`, `mla`, `csa`, `mamba`, `mamba2`, `gla`, `deltanet`, `gdn`, `kda`, `lightning`,
 `rwkv7`, `conv`, `short_conv`, `mlp`, `gated_mlp`, `moe`, `layernorm`, `rmsnorm`, `dyt`,
-`linear`, `act`, `scale`, `dropout`, `embed`, `head`, `nextn`, `engram`. Settings that
-are not layers: `rope`, `pi`, `yarn`, `llama3`, `relbias`, `indexer`, and the residual
-algebras `hc`, `mhc`, `gr`, `attnres`, `vpgate`. Activation names (`swish`, `gelu`,
-`relu2`, `sigmoid`, `situ`, ...) are also leaves: `linear(features=h) swish`.
+`linear`, `act`, `scale`, `dropout`, `embed`, `head`, `nextn`, `engram`, `merge`.
+Settings that are not layers: `rope`, `pi`, `yarn`, `llama3`, `relbias`, `indexer`, and
+the residual algebras `hc`, `mhc`, `gr`, `attnres`, `vpgate`. Activation names
+(`swish`, `gelu`, `relu2`, `sigmoid`, `situ`, ...) are also leaves:
+`linear(features=h) swish`.
 
 Values are numbers (`1e-5`, `128_256`), strings, `true`/`false`/`none`, lists
 (`[1, 2]`, or `[1,]` for one element), configs (`rope(base=1e6)`), or arithmetic over
@@ -184,8 +188,9 @@ Top-level settings: `d_model` (required), `vocab_size`, and `residual`.
 
 ## Widths
 
-Every leaf knows its input width. `embed` maps token ids to `d_model`, `linear` maps to
-`features`, `head` maps to logits, and everything else keeps the width. The compiler checks:
+Every leaf knows its input width. `embed` maps token ids to `d_model` (or to the widened
+stream, see below), `linear` maps to `features`, `head` maps to logits, and everything
+else keeps the width. The compiler checks:
 
 - a residual branch and a repeated block return to the width they started at;
 - parallel branches agree on their width;
@@ -209,7 +214,30 @@ The other algebras:
 | `attnres(block_size=24)`   | `f` reads a learned softmax over depth of earlier block outputs instead of their sum (Kimi K3) |
 | `vpgate(temperature=0.3)`  | `a x + b f(x)` with `a^2 + b^2 = 1` per channel (Muse Spark)             |
 
-The streams are read back into one before the head.
+### Outside the brackets
+
+`hc`, `mhc`, `gr` and `attnres` widen the stream: between the branches it is several
+copies (for `attnres`, the outputs so far), and only a few things act on it as a whole:
+
+- `embed` widens it, and so does `nextn` when its input is one stream;
+- residual branches `[f]` read it, run `f` on one stream and write back; brackets
+  inside `f` are plain skips;
+- taps `@h` and `$h` save and restore it as it is;
+- `engram` adds its memory to every copy, with a key of its own, and `nextn` mixes the
+  next token's embedding into every copy (Qwen3.8-Flash-Next). Under `attnres`, whose
+  state is the outputs so far rather than copies, both need one stream.
+
+Any other layer outside a branch, such as the final norm or the head, needs one stream,
+so the compiler puts a `merge` before it: the read that a branch does, without the
+write. `bux fmt` prints it. A residual branch after that is an error, since the copies
+are gone, and so is reading a tap that holds the widened stream inside a branch:
+
+```
+residual = gr(expansion=4, rank=320)
+model = embed D ple "DDA" "DDDA"^11 @h out mtp      # = ... @h merge out $h nextn ...
+```
+
+`engram` is written bare, because it adds to the stream itself; `[engram]` is an error.
 
 ## The IR and backends
 

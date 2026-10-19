@@ -31,5 +31,5 @@ shared out = head
 logits = (_ * logit_scale) out
 mtp(mixer) = $h! nextn(norm=norm) layer(mixer, dense) @h logits
 
-model = embed norm "DD" "LLLG" "LLLLLG"^10 norm @h logits
+model = embed(norm=norm) "DD" "LLLG" "LLLLLG"^10 norm @h logits
         mtp(local) mtp(attn) mtp(local) mtp(attn) mtp(local)^4

@@ -385,8 +385,47 @@ def test_residual_algebras_and_their_errors():
     ):
         a = build(f"residual = {setting}\nmodel = embed [norm attn] [norm ffn] head")
         assert a.residual is not None and a.residual.type == setting.split("(")[0]
+        merges = [layer for layer in a.layers() if layer.config.type == "merge"]
+        assert len(merges) == (0 if setting == "vpgate" else 1)
     err = error("residual = rope()\nmodel = embed head")
     assert "hc(...)" in err.message and "vpgate(...)" in err.message
+
+
+MEMORY = "mem = engram(head_dim=4, table_size=50)\n"
+
+
+def test_engram_is_bare_and_adds_to_every_stream():
+    body = MEMORY + "model = embed [norm attn] mem [norm ffn] norm head"
+    widened = build("residual = mhc(expansion=4)\n" + body)
+    widths = {layer.config.type: layer.width for layer in widened.layers()}
+    assert widths["engram"] == "streams" and widths["rmsnorm"] == 16
+    assert unlabeled(widened.graph).endswith("mem [(norm ffn)] merge norm head)")
+    sources = build("residual = attnres\n" + MEMORY + "model = embed mem norm head")
+    assert unlabeled(sources.graph) == "(embed merge mem norm head)"
+    plain = build(body)
+    assert [layer.width for layer in plain.layers() if layer.label == "mem"] == [16]
+    assert "merge" not in unlabeled(plain.graph)
+
+
+def test_widened_streams_are_read_back_once():
+    mhc = "residual = mhc(expansion=4)\n"
+    assert "twice" in error(MEMORY + "model = embed [mem] head").message
+    assert (
+        "read back into one"
+        in error(mhc + "model = embed [attn] norm [ffn] head").message
+    )
+    assert "there is none here" in error("model = embed merge head").message
+    err = error(mhc + "model = embed @x0 [norm attn] [$x0 scale] head")
+    assert "only exists outside residual branches" in err.message
+
+
+def test_mtp_continues_from_the_widened_stream():
+    a = build(
+        "residual = gr(rank=4)\nshared out = head\nmtp = $h nextn [attn] out\n"
+        "model = embed [attn] @h out mtp"
+    )
+    kinds = [(layer.config.type, layer.width) for layer in a.layers()]
+    assert ("nextn", "streams") in kinds and kinds.count(("merge", "streams")) == 2
 
 
 def test_attention_shares_indexer_selections_through_a_port():

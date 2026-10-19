@@ -4,7 +4,7 @@
 #
 # LatentMoE: the 512 ReLU^2 experts (22 active) work in a 2048-wide latent space, while
 # the router and the shared expert see the full 8192. One MTP module (an attention and a
-# MoE layer) predicts the token after next.
+# MoE layer) runs twice with the same weights, to predict 2 and 3 tokens ahead.
 d_model    = 8192
 vocab_size = 131072
 
@@ -21,6 +21,6 @@ E = [norm experts]
 A = [norm attn]
 
 shared out = head
-mtp = $h nextn(norm=norm) A E norm out
+shared mtp = $h! nextn(norm=norm) A E norm @h out
 
-model = embed ("MEMEMEMAE" "MEMEMAE" "MEMEMEMAE")^4 "MEMEMEME" norm @h out mtp
+model = embed ("MEMEMEMAE" "MEMEMAE" "MEMEMEMAE")^4 "MEMEMEME" norm @h out mtp^2

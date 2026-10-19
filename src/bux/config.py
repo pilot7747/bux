@@ -57,13 +57,20 @@ class PositionInterpolationConfig(Config):
 
 
 class YaRNConfig(Config):
-    """YaRN RoPE extension (Peng et al., 2023), used by DeepSeek-V3 and Qwen."""
+    """YaRN RoPE extension (Peng et al., 2023), as in transformers: rotary pairs that
+    turn more than beta_fast times over original_max_len keep their frequency, those
+    that turn fewer than beta_slow times are divided by factor, with a linear ramp
+    between; and q.k is scaled by attention_factor ** 2."""
 
     type: Literal["yarn"] = "yarn"
     factor: float
     original_max_len: int
     beta_fast: float = 32.0
     beta_slow: float = 1.0
+    attention_factor: float | None = None  # None -> 0.1 * ln(factor) + 1; 1 disables it
+    # "rotary" multiplies cos and sin by it: only the rotated dims (transformers);
+    # "softmax" multiplies the softmax scale by its square: all qk dims (DeepSeek MLA).
+    attention_factor_on: Literal["rotary", "softmax"] = "rotary"
 
 
 class Llama3RoPEScalingConfig(Config):
@@ -124,6 +131,7 @@ class MoEConfig(Config):
     shared_expert_gate: bool = False  # sigmoid gate on the shared expert (Qwen)
     # sqrtsoftplus scores experts with sqrt(softplus(logit)) (DeepSeek-V4).
     router: Literal["softmax", "sigmoid", "sqrtsoftplus"] = "softmax"
+    router_logit_scale: float = 1.0  # multiplies the logits before scoring (Muse Spark)
     normalize_top_k: bool = True
     routed_scaling_factor: float = 1.0
     # Group-limited routing: pick top_k_groups of num_groups first (DeepSeek-V3).
@@ -186,7 +194,9 @@ class QuadraticAttentionConfig(AttentionConfig):
     qk_norm: NormalizationConfig | None = None
     softcap: float | None = None  # tanh soft-capping of the logits (Gemma 2)
     sinks: bool = False  # learned per-head attention sink logit (gpt-oss)
-    scale: float | None = None  # None -> head_dim ** -0.5
+    # None -> head_dim ** -0.5 (MLA: of qk_nope_head_dim + qk_rope_head_dim); YaRN with
+    # attention_factor_on=softmax multiplies it by attention_factor ** 2.
+    scale: float | None = None
     # Logits scaled by 1 + log_scale * ln(max(position / log_scale_floor, 1)), so that
     # attention stays sharp at long range (Inkling; Llama 4 temperature tuning).
     log_scale: float | None = None
@@ -397,6 +407,7 @@ class EmbeddingConfig(Config):
     type: Literal["embed"] = "embed"
     max_positions: int | None = None  # learned absolute positions (GPT-2)
     scale_by_sqrt_dim: bool = False  # Gemma
+    norm: NormalizationConfig | None = None  # after the scale (Inkling); nextn sees it
     dropout: float = 0.0
 
 
@@ -408,11 +419,16 @@ class LMHeadConfig(Config):
 
 
 class NextNConfig(Config):
-    """Multi-token prediction input (DeepSeek-V3): h -> W [norm(embed(t_{i+k})); norm(h)].
+    """Multi-token prediction input (DeepSeek-V3): h -> W [norm(e_{i+k}); norm(h)], with
+    e_{i+k} what `embed` makes of the token k positions ahead (scaled and normalized,
+    without positions), for the k-th nextn to run in a forward pass. So every head
+    after it predicts one token further ahead, and a shared MTP module run twice looks
+    1, then 2 tokens ahead (Nemotron 3, GLM-5). An MTP module is
+    ``$h! nextn block norm @h head``, run after the main head.
 
-    The k-th nextn layer of a model embeds the token k positions ahead with the model's
-    embedding, so every head after it predicts one token further ahead. An MTP module
-    is ``$h! nextn block @h norm head``, run after the main head.
+    On a widened stream it mixes the embedding into each copy, W_e norm(e) + W_h
+    norm(R)_j, with the copies normalized together (Qwen3.8-Flash-Next), and on one
+    stream under a widening algebra it widens its output, as `embed` does.
     """
 
     type: Literal["nextn"] = "nextn"
@@ -421,22 +437,24 @@ class NextNConfig(Config):
 
 class EngramConfig(Config):
     """Conditional memory (DeepSeek Engram, 2026): hashed n-gram embeddings of the input
-    tokens, gated by the stream. Every n-gram of 2 to `max_ngram_size` tokens ending at a
-    position is hashed by `num_heads` heads, each into its own table; the rows, joined to
-    e, give a key and a value, and the layer returns sigmoid(<norm(x), norm(W_k e)>) W_v e
-    (with a signed square root on the score). Use it as a residual branch, [engram(...)].
-    Like RoPE with positions, it reads the model's input tokens by itself.
+    tokens, gated by the stream. Every n-gram of 2 to `max_ngram_size` tokens ending
+    at a position is hashed by `num_heads` heads, each into a table of its own, and the
+    rows are joined into e. With a = <norm(x), norm(W_k e)> / sqrt(d), the layer adds
+    u = sigmoid(sign(a) sqrt(|a|)) W_v e to the stream x, then silu(conv(norm(u))).
+    Write it bare, not in [...]: on a widened stream it adds to each copy, gated by
+    a key of its own (DeepSeek-V4.1, Qwen3.8-Flash-Next). Like RoPE with positions, it
+    reads the model's input tokens by itself.
     """
 
     type: Literal["engram"] = "engram"
     head_dim: int  # width of a table row
-    table_size: int  # rows per table; each head hashes modulo its own prime near this
-    max_ngram_size: int = 3
+    table_size: int  # rows per head: the next prime >= this that no earlier head took
+    max_ngram_size: int = 3  # n-grams of 2 to this many tokens
     num_heads: int = 8  # hash heads per n-gram size
-    # Causal depthwise conv on the output, dilated by max_ngram_size; None disables it.
-    conv_size: int | None = 4
-    # Hash token classes (NFKC, lowercased) instead of raw ids (DeepSeek-V4.1); None -> ids.
-    vocab_classes: int | None = None
+    norm: NormalizationConfig = NormalizationConfig(type="rmsnorm")  # query, key, conv
+    conv_size: int | None = 4  # zero-initialized, dilated by max_ngram_size; None: none
+    vocab_classes: int | None = None  # hash normalized token classes, not raw ids
+    boundary_token: int | None = None  # n-grams do not reach back past it: EOS (Qwen)
 
 
 # --- Residual stream ------------------------------------------------------------
@@ -482,6 +500,15 @@ class ResidualGateConfig(Config):
 
     type: Literal["vpgate"] = "vpgate"
     temperature: float = 0.3
+    eps: float = 1e-3  # a = sqrt(max(1 - b^2, eps)): the stream is never cut off
+
+
+class MergeConfig(Config):
+    """Reads a widened residual stream (hc, mhc, gr, attnres) back into one: the read the
+    algebra does for a branch, without the write. The compiler puts one before the
+    first layer outside a branch that needs one stream, such as the final norm."""
+
+    type: Literal["merge"] = "merge"
 
 
 ResidualConfig = Annotated[
@@ -518,7 +545,8 @@ LayerConfig = Annotated[
     | EmbeddingConfig
     | LMHeadConfig
     | NextNConfig
-    | EngramConfig,
+    | EngramConfig
+    | MergeConfig,
     Field(discriminator="type"),
 ]
 

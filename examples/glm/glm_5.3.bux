@@ -4,7 +4,8 @@
 #
 # Most layers do not run their own indexer (IndexCache): a full layer exports its top-k
 # through the `index` port, and the three layers after it attend to the same keys. The
-# first 3 layers are dense. One MTP layer, with an indexer of its own.
+# first 3 layers are dense. One MTP layer, with an indexer of its own, is trained as 3
+# chained steps that share it (as the GLM-5 report describes).
 d_model    = 6144
 vocab_size = 154880
 
@@ -23,6 +24,6 @@ F = layer(attn(index=@topk))
 S = layer(attn(index=$topk))
 
 shared out = head
-mtp = $h nextn(norm=norm) layer(attn) norm out
+shared mtp = $h! nextn(norm=norm) layer(attn) norm @h out
 
-model = embed "AAA" "SSS" "FSSS"^18 norm @h out mtp
+model = embed "AAA" "SSS" "FSSS"^18 norm @h out mtp^3

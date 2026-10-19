@@ -706,10 +706,21 @@ class _Entry:
     popped: bool = False
 
 
+# Layers that act on every copy of a widened residual stream instead of reading it.
+_ON_COPIES = (cfg.EngramConfig, cfg.NextNConfig)
+
+
 class _Lowering:
-    def __init__(self, ev: _Evaluator, d_model: int):
+    def __init__(
+        self, ev: _Evaluator, d_model: int, residual: cfg.ResidualConfig | None
+    ):
         self.ev = ev
         self.d_model = d_model
+        # Whether the residual algebra widens the stream between branches, and whether
+        # into copies of it (attnres keeps the branch outputs so far instead).
+        self.widened = residual is not None and residual.type != "vpgate"
+        self.copies = residual is not None and residual.type in ("hc", "mhc", "gr")
+        self.depth = 0  # residual branches the node being lowered is inside
         self.stacks: dict[str, list[_Entry]] = {}
         self.frames: list[_Frame] = []
         self.shared: dict[str, ir.Node] = {}
@@ -739,7 +750,7 @@ class _Lowering:
         width: ir.Width = (
             "tokens"
             if first is not None and first.config.type == "embed"
-            else self.d_model
+            else ("streams" if self.widened else self.d_model)
         )
         typed, _ = self.lower(graph, width)
         if self.borrowers and self.embeddings != 1:
@@ -778,18 +789,44 @@ class _Lowering:
                 typed = []
                 for item in items:
                     t, out = self.lower(item, width)
-                    typed.append(t)
+                    # A layer that needed a merge came back as an unlabeled (merge, layer).
+                    if isinstance(t, ir.Seq) and t.label is None and t.share is None:
+                        typed.extend(t.items)
+                    else:
+                        typed.append(t)
                     width = typing.cast(ir.Width, out)
                 return ir.replace_children(node, tuple(typed)), width
             case ir.Residual(body=body):
-                if not isinstance(width, int):
+                if isinstance(body, ir.Layer) and isinstance(
+                    body.config, cfg.EngramConfig
+                ):
+                    raise self.error(
+                        "engram adds to the stream itself, so [engram] would add the "
+                        "stream twice",
+                        "write it bare: ... engram ...",
+                    )
+                inner = width
+                if self.widened and self.depth == 0:
+                    if width != "streams":
+                        raise self.error(
+                            "a residual branch needs the widened residual stream, but "
+                            "it was read back into one before this",
+                            "only branches, taps, engram and nextn keep it; save it "
+                            "with @h and go on from $h",
+                        )
+                    inner = self.d_model
+                elif not isinstance(width, int):
                     raise self.error(
                         f"a residual branch needs hidden states, but receives {width}"
                     )
-                t, out = self.lower(body, width)
-                if out != width:
+                self.depth += 1
+                try:
+                    t, out = self.lower(body, inner)
+                finally:
+                    self.depth -= 1
+                if out != inner:
                     raise self.error(
-                        f"a residual branch must keep the width, but this one maps {width} to {out}"
+                        f"a residual branch must keep the width, but this one maps {inner} to {out}"
                     )
                 return ir.replace_children(node, (t,)), width
             case ir.Sum(terms=terms) | ir.Prod(factors=terms):
@@ -836,6 +873,12 @@ class _Lowering:
                     raise self.error(
                         f"tap '{name}' holds the '{value.port}' port of a layer",
                         f"read it through the same port: layer({value.port}=${name})",
+                    )
+                if value == "streams" and self.depth > 0:
+                    raise self.error(
+                        f"tap '{name}' holds the widened residual stream, which only "
+                        "exists outside residual branches",
+                        f"read it back into one first: merge @{name}",
                     )
                 return node, value
         raise AssertionError(node)
@@ -886,11 +929,29 @@ class _Lowering:
                 "nothing can follow the LM head",
                 "to go on after a head, read a tap: @h norm head $h ...",
             )
-        if config.type == "embed":
+        on_streams = isinstance(config, cfg.MergeConfig) or (
+            self.copies and isinstance(config, _ON_COPIES)
+        )
+        if width == "streams" and not on_streams:
+            # The layer needs one stream: read the widened one back into one first.
+            merge = ir.Layer(config=cfg.MergeConfig(), width="streams")
+            typed, out = self.layer(node, self.d_model)
+            return ir.Seq(items=(merge, typed)), out
+        if isinstance(config, cfg.MergeConfig):
+            if width != "streams":
+                raise self.error(
+                    "merge reads a widened residual stream back into one, but there "
+                    "is none here",
+                    "widen it with residual = hc(...), mhc(...), gr(...) or attnres(...)"
+                    if not self.widened
+                    else None,
+                )
+            out = self.d_model
+        elif config.type == "embed":
             if width != "tokens":
                 raise self.error("an embedding takes token ids, so it must come first")
             self.embeddings += 1
-            out = self.d_model
+            out = "streams" if self.widened and self.depth == 0 else self.d_model
         elif width == "tokens":
             raise self.error(
                 f"{config.type} needs hidden states, but receives token ids",
@@ -903,9 +964,11 @@ class _Lowering:
             out = "logits"
         elif isinstance(config, cfg.LinearConfig):
             out = config.features
-        else:
-            if isinstance(config, cfg.NextNConfig) and self.where:
+        elif isinstance(config, cfg.NextNConfig):
+            if self.where:
                 self.borrowers.append(("nextn", self.where[-1]))
+            out = "streams" if self.widened and self.depth == 0 else width
+        else:
             out = width
         for port in sorted(node.ports, key=lambda p: p.mode == "write"):
             if port.mode == "write":
@@ -949,7 +1012,11 @@ def _compile(ev: _Evaluator, entry: str) -> ir.Architecture:
     if settings["d_model"] is None:
         raise BuxError("'d_model' is not defined", hint="d_model = 4096")
     st = ev.statements[entry]
-    lowering = _Lowering(ev, typing.cast(int, settings["d_model"]))
+    lowering = _Lowering(
+        ev,
+        typing.cast(int, settings["d_model"]),
+        typing.cast(cfg.ResidualConfig | None, settings["residual"]),
+    )
     graph = lowering.run(ev.graph(ev.definition(entry), st.name_span))
     if settings["vocab_size"] is None and (lowering.embeddings or lowering.heads):
         raise BuxError("'vocab_size' is not defined", hint="vocab_size = 32000")

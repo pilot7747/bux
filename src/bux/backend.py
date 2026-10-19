@@ -14,12 +14,14 @@ run so far. Repeats are unrolled; nodes with a share key are built once and reus
 """
 
 import functools
+import math
 import operator
 from collections.abc import Callable
 from dataclasses import dataclass, field
 
 import jax
 import jax.numpy as jnp
+import numpy as np
 from flax import nnx
 
 from bux import config as cfg
@@ -27,7 +29,7 @@ from bux.lang import ir
 
 Taps = dict[str, list]
 # Reserved tap keys, which no tap name can collide with.
-TOKENS, OUTPUTS = "<tokens>", "<outputs>"
+TOKENS, OUTPUTS, NEXTN = "<tokens>", "<outputs>", "<nextn>"
 
 
 @dataclass
@@ -36,7 +38,8 @@ class Context:
     rngs: nnx.Rngs
     shared: dict[str, nnx.Module] = field(default_factory=dict)
     embedding: Embedding | None = None
-    nextn: int = 0  # nextn layers built so far
+    engrams: int = 0  # engram layers built so far
+    primes: set[int] = field(default_factory=set)  # engram table sizes taken
 
 
 Builder = Callable[..., nnx.Module]
@@ -197,7 +200,7 @@ class Model(nnx.Module):
     """tokens (batch, seq) -> logits (batch, seq, vocab).
 
     Every head is an output. ``outputs`` returns them all in execution order; head j
-    predicts the token 1 + k positions ahead, where k counts the nextn layers before it.
+    predicts the token 1 + k positions ahead, where k counts the nextn layers run before it.
     """
 
     def __init__(self, arch: ir.Architecture, *, rngs: nnx.Rngs):
@@ -236,10 +239,16 @@ class Embedding(nnx.Module):
             nnx.Embed(c.max_positions, d, rngs=rngs) if c.max_positions else None
         )
         self.multiplier = d**0.5 if c.scale_by_sqrt_dim else 1.0
+        self.norm = Norm(c.norm, d) if c.norm is not None else None
         self.dropout = nnx.Dropout(c.dropout, rngs=rngs)
 
-    def __call__(self, tokens, taps: Taps):
+    def embed_tokens(self, tokens):
+        """The token embedding, scaled and normalized: what nextn sees."""
         x = self.tokens(tokens) * self.multiplier
+        return x if self.norm is None else self.norm(x)
+
+    def __call__(self, tokens, taps: Taps):
+        x = self.embed_tokens(tokens)
         if self.positions is not None:
             x = x + self.positions(jnp.arange(tokens.shape[-1]))
         return self.dropout(x)
@@ -284,11 +293,12 @@ def _(c: cfg.LMHeadConfig, width, ports, ctx: Context):
 
 
 class NextN(nnx.Module):
-    """Mixes the stream with the embedding of the token `offset` positions ahead."""
+    """Mixes the stream with the embedding of the token k positions ahead, where this
+    is the k-th nextn to run in the forward pass (shared modules run more than once)."""
 
-    def __init__(self, c: cfg.NextNConfig, width: int, offset: int, ctx: Context):
+    def __init__(self, c: cfg.NextNConfig, width: int, ctx: Context):
         assert ctx.embedding is not None
-        self.embedding, self.offset = ctx.embedding, offset
+        self.embedding = ctx.embedding
         self.hidden_norm = Norm(c.norm, width)
         self.embed_norm = Norm(c.norm, ctx.arch.d_model)
         self.proj = nnx.Linear(
@@ -296,21 +306,22 @@ class NextN(nnx.Module):
         )
 
     def __call__(self, x, taps: Taps):
-        tokens = taps[TOKENS][0]
-        # The last `offset` positions have no token that far ahead; pad them with 0.
-        ahead = jnp.pad(tokens[:, self.offset :], ((0, 0), (0, self.offset)))
-        e = self.embed_norm(self.embedding.tokens(ahead))
+        runs = taps.setdefault(NEXTN, [])
+        runs.append(None)
+        k, tokens = len(runs), taps[TOKENS][0]
+        # The last k positions have no token that far ahead; pad them with 0.
+        ahead = jnp.pad(tokens[:, k:], ((0, 0), (0, k)))
+        e = self.embed_norm(self.embedding.embed_tokens(ahead))
         return self.proj(jnp.concatenate([e, self.hidden_norm(x)], -1))
 
 
 @register("nextn")
 def _(c: cfg.NextNConfig, width, ports, ctx: Context):
-    ctx.nextn += 1
-    return NextN(c, width, ctx.nextn, ctx)
+    return NextN(c, width, ctx)
 
 
 class Norm(nnx.Module):
-    def __init__(self, c: cfg.NormalizationConfig, width: int):
+    def __init__(self, c: cfg.NormalizationConfig, width: int | tuple[int, ...]):
         self.kind = c.type
         self.eps = c.eps
         self.zero_centered = c.zero_centered
@@ -434,6 +445,7 @@ class MoE(nnx.Module):
         )
         self.down = nnx.Param(init(rngs.params(), (e, f, latent)))
         self.top_k, self.router_fn = c.top_k, c.router
+        self.router_logit_scale = c.router_logit_scale
         self.normalize, self.scaling = c.normalize_top_k, c.routed_scaling_factor
         self.activation = c.expert.activation
         self.limit, self.up_softcap = c.expert.limit, c.expert.up_softcap
@@ -455,7 +467,7 @@ class MoE(nnx.Module):
         )
 
     def __call__(self, x, taps: Taps):
-        logits = self.router(x)
+        logits = self.router(x) * self.router_logit_scale
         match self.router_fn:
             case "softmax":
                 scores = jax.nn.softmax(logits)
@@ -505,21 +517,58 @@ def _(c: cfg.MoEConfig, width, ports, ctx: Context):
     return MoE(c, width, ctx.rngs)
 
 
+def _attention_factor(y: cfg.YaRNConfig) -> float:
+    if y.attention_factor is not None:
+        return y.attention_factor
+    return 0.1 * math.log(y.factor) + 1 if y.factor > 1 else 1.0
+
+
+def _frequencies(rope: cfg.RoPEConfig, dims: int) -> tuple[jax.Array, float]:
+    """Inverse frequencies of the `dims` rotated dims, and the factor on cos and sin."""
+    inv_freq = 1.0 / rope.base ** (jnp.arange(0, dims, 2) / dims)
+    match rope.scaling:
+        case None:
+            return inv_freq, 1.0
+        case cfg.PositionInterpolationConfig(factor=factor):
+            return inv_freq / factor, 1.0
+        case cfg.YaRNConfig() as y:
+            # The pair that turns `turns` times over the original context, as
+            # transformers computes it (with truncation to whole pairs).
+            def pair(turns: float) -> float:
+                return (
+                    dims
+                    * math.log(y.original_max_len / (turns * 2 * math.pi))
+                    / (2 * math.log(rope.base))
+                )
+
+            low = max(math.floor(pair(y.beta_fast)), 0)
+            high = min(math.ceil(pair(y.beta_slow)), dims - 1)
+            ramp = jnp.clip(
+                (jnp.arange(dims // 2) - low) / ((high - low) or 1e-3), 0, 1
+            )
+            inv_freq = inv_freq / y.factor * ramp + inv_freq * (1 - ramp)
+            on_rotary = y.attention_factor_on == "rotary"
+            return inv_freq, _attention_factor(y) if on_rotary else 1.0
+        case other:
+            raise NotImplementedError(f"{other.type} RoPE scaling")
+
+
+def _logit_gain(rope: cfg.RoPEConfig | None) -> float:
+    """YaRN's attention_factor ** 2 if it goes on the softmax scale, else 1."""
+    y = rope.scaling if rope is not None else None
+    if isinstance(y, cfg.YaRNConfig) and y.attention_factor_on == "softmax":
+        return _attention_factor(y) ** 2
+    return 1.0
+
+
 def _rope(x: jax.Array, rope: cfg.RoPEConfig) -> jax.Array:
     """Rotate the first `fraction` of each head's dims (half-split layout); x is (b, t, h, d)."""
     dims = int(x.shape[-1] * rope.fraction) // 2 * 2
     if dims == 0:
         return x
-    inv_freq = 1.0 / rope.base ** (jnp.arange(0, dims, 2) / dims)
-    match rope.scaling:
-        case None:
-            pass
-        case cfg.PositionInterpolationConfig(factor=factor):
-            inv_freq = inv_freq / factor
-        case other:
-            raise NotImplementedError(f"{other.type} RoPE scaling")
+    inv_freq, gain = _frequencies(rope, dims)
     angles = jnp.arange(x.shape[1])[:, None] * inv_freq
-    sin, cos = jnp.sin(angles)[:, None, :], jnp.cos(angles)[:, None, :]
+    sin, cos = gain * jnp.sin(angles)[:, None, :], gain * jnp.cos(angles)[:, None, :]
     x1, x2, rest = x[..., : dims // 2], x[..., dims // 2 : dims], x[..., dims:]
     return jnp.concatenate([x1 * cos - x2 * sin, x2 * cos + x1 * sin, rest], -1)
 
@@ -540,7 +589,7 @@ class Attention(nnx.Module):
         dv = c.v_head_dim or d
         self.heads, self.kv_heads, self.head_dim, self.v_head_dim = h, kv, d, dv
         self.window, self.softcap = c.sliding_window_size, c.softcap
-        self.scale = c.scale or d**-0.5
+        self.scale = (c.scale or d**-0.5) * _logit_gain(c.rope)
         self.log_scale, self.log_scale_floor = c.log_scale, c.log_scale_floor
         self.rope = c.rope
         self.ports = tuple(ports)
@@ -638,21 +687,149 @@ def _(c: cfg.GQAConfig, width, ports, ctx: Context):
 class CausalConv(nnx.Module):
     """Depthwise causal convolution over positions of (batch, seq, channels)."""
 
-    def __init__(self, channels: int, size: int, bias: bool, rngs: nnx.Rngs):
-        init = nnx.initializers.lecun_normal()
+    def __init__(
+        self,
+        channels: int,
+        size: int,
+        bias: bool,
+        rngs: nnx.Rngs,
+        *,
+        dilation: int = 1,
+        zero: bool = False,
+    ):
+        init = nnx.initializers.zeros if zero else nnx.initializers.lecun_normal()
         self.weight = nnx.Param(init(rngs.params(), (size, channels)))
         self.bias = nnx.Param(jnp.zeros(channels)) if bias else None
+        self.dilation = dilation
 
     def __call__(self, x, taps: Taps | None = None):
-        size, t = self.weight.shape[0], x.shape[1]
-        padded = jnp.pad(x, ((0, 0), (size - 1, 0), (0, 0)))
-        y = sum(self.weight[i] * padded[:, i : i + t] for i in range(size))
+        size, t, r = self.weight.shape[0], x.shape[1], self.dilation
+        padded = jnp.pad(x, ((0, 0), ((size - 1) * r, 0), (0, 0)))
+        y = sum(self.weight[i] * padded[:, i * r : i * r + t] for i in range(size))
         return y if self.bias is None else y + self.bias
 
 
 @register("conv")
 def _(c: cfg.ConvConfig, width, ports, ctx: Context):
     return CausalConv(width, c.size, c.bias, ctx.rngs)
+
+
+def _next_primes(start: int, count: int, taken: set[int]) -> list[int]:
+    """The `count` smallest primes >= start that are not taken yet, which takes them."""
+    found, n = [], max(start, 2)
+    while len(found) < count:
+        if n not in taken and all(n % p for p in range(2, math.isqrt(n) + 1)):
+            found.append(n)
+            taken.add(n)
+        n += 1
+    return found
+
+
+def _ngram_rows(ids, tokens, multipliers, primes, offsets, boundary, pad):
+    """Table rows of the n-grams ending at every position, (b, t) -> (b, t, orders * heads).
+
+    The n-gram of the last j + 1 ids hashes to XOR_{i <= j} ids[t - i] * m_i, in wrapping
+    uint32 arithmetic. Positions before the sequence, or at and before the last boundary
+    token before t, count as `pad`, so that n-grams do not cross documents.
+    """
+    b, t = ids.shape
+    pos = jnp.arange(t)
+    start = jnp.zeros((b, t), jnp.int32)
+    if boundary is not None:
+        after = jnp.where(tokens == boundary, pos + 1, 0)
+        start = jnp.pad(jax.lax.cummax(after, axis=1)[:, :-1], ((0, 0), (1, 0)))
+    h, rows = jnp.zeros((b, t), jnp.uint32), []
+    for i in range(multipliers.shape[0]):
+        prev = jnp.take(ids, jnp.maximum(pos - i, 0), axis=1)
+        prev = jnp.where(pos - i >= start, prev, pad).astype(jnp.uint32)
+        h = h ^ (prev * multipliers[i])
+        if i:
+            rows.append(h[..., None] % primes[i - 1] + offsets[i - 1])
+    return jnp.concatenate(rows, -1).astype(jnp.int32)
+
+
+class Engram(nnx.Module):
+    """Hashed n-gram rows of the input tokens, gated by the stream and added to it. On a
+    widened stream (batch, seq, copies, d) every copy has a key of its own, and they
+    share the value."""
+
+    def __init__(self, c: cfg.EngramConfig, width, ctx: Context):
+        d, vocab = ctx.arch.d_model, ctx.arch.vocab_size
+        assert vocab is not None
+        copies = getattr(ctx.arch.residual, "expansion", 1) if width == "streams" else 1
+        orders, heads = c.max_ngram_size - 1, c.num_heads
+        primes = _next_primes(c.table_size, orders * heads, ctx.primes)
+        offsets = np.cumsum([0, *primes[:-1]])
+        self.primes = nnx.Variable(
+            jnp.asarray(primes, jnp.uint32).reshape(orders, heads)
+        )
+        self.offsets = nnx.Variable(
+            jnp.asarray(offsets, jnp.uint32).reshape(orders, heads)
+        )
+        ctx.engrams += 1
+        rng = np.random.default_rng(10007 * ctx.engrams)
+        odd = rng.integers(0, 2**31, c.max_ngram_size) * 2 + 1
+        self.multipliers = nnx.Variable(jnp.asarray(odd, jnp.uint32))
+        # A stand-in for the tokenizer's normalized classes, which a checkpoint replaces.
+        self.classes = (
+            nnx.Variable(jnp.arange(vocab) % c.vocab_classes)
+            if c.vocab_classes
+            else None
+        )
+        init = nnx.initializers.normal(1.0)
+        self.table = nnx.Param(init(ctx.rngs.params(), (sum(primes), c.head_dim)))
+        self.kv = nnx.Linear(
+            orders * heads * c.head_dim, (copies + 1) * d, use_bias=False, rngs=ctx.rngs
+        )
+        self.q_norm, self.k_norm = Norm(c.norm, (copies, d)), Norm(c.norm, (copies, d))
+        self.conv = (
+            CausalConv(
+                copies * d,
+                c.conv_size,
+                False,
+                ctx.rngs,
+                dilation=c.max_ngram_size,
+                zero=True,
+            )
+            if c.conv_size
+            else None
+        )
+        self.conv_norm = Norm(c.norm, (copies, d)) if c.conv_size else None
+        self.boundary = c.boundary_token
+
+    def __call__(self, x, taps: Taps):
+        tokens = taps[TOKENS][0]
+        ids, pad = tokens, self.boundary or 0
+        if self.classes is not None:
+            ids, pad = self.classes[...][tokens], self.classes[...][pad]
+        rows = _ngram_rows(
+            ids,
+            tokens,
+            self.multipliers[...],
+            self.primes[...],
+            self.offsets[...],
+            self.boundary,
+            pad,
+        )
+        h = x if x.ndim == 4 else x[..., None, :]
+        (b, t, n, d), kv = (
+            h.shape,
+            self.kv(self.table[...][rows].reshape(*rows.shape[:2], -1)),
+        )
+        key, value = kv[..., : n * d].reshape(b, t, n, d), kv[..., n * d :]
+        a = (self.q_norm(h) * self.k_norm(key)).sum(-1) / math.sqrt(d)
+        gate = jax.nn.sigmoid(jnp.sign(a) * jnp.sqrt(jnp.maximum(jnp.abs(a), 1e-6)))
+        u = gate[..., None] * value[..., None, :]
+        if self.conv is not None and self.conv_norm is not None:
+            conv = self.conv(self.conv_norm(u).reshape(b, t, n * d))
+            u = u + jax.nn.silu(conv).reshape(u.shape)
+        y = h + u
+        return y if x.ndim == 4 else y[..., 0, :]
+
+
+@register("engram")
+def _(c: cfg.EngramConfig, width, ports, ctx: Context):
+    return Engram(c, width, ctx)
 
 
 class Scale(nnx.Module):
