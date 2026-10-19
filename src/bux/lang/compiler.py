@@ -5,24 +5,30 @@ untyped graph. Lowering then walks it in execution order, with repeats unrolled,
 infer every layer's input width, check residuals and parallel branches for width
 agreement, simulate the tap stacks, and verify that shared blocks are used consistently.
 
+A program can span files (``use``), and its alternatives (``a | b``) make it a sweep
+of several runs: evaluation takes one alternative of each, picked by ``choices``.
+
 ``compile`` stops at the first error. ``check`` is for editors: it recovers from
-syntax errors and reports every definition that fails.
+syntax errors and reports every definition that fails, in every alternative.
+``compile_runs`` builds every run of a sweep, with its training settings.
 """
 
 import builtins
 import difflib
 import re
 import typing
-from collections.abc import Callable, Generator
+from collections.abc import Callable, Generator, Mapping, Sequence
 from contextlib import contextmanager
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
+from pathlib import Path
 
-from pydantic import ValidationError
+from pydantic import TypeAdapter, ValidationError
 
 from bux import config as cfg
-from bux.lang import ir
+from bux.lang import ir, modules
 from bux.lang import syntax as ast
 from bux.lang.syntax import BuxError, Span
+from bux.train import config as tcfg
 
 
 def _tags(union: object) -> dict[str, type[cfg.Config]]:
@@ -35,10 +41,25 @@ def _tags(union: object) -> dict[str, type[cfg.Config]]:
 
 
 LAYERS = _tags(cfg.LayerConfig)
-TYPES = LAYERS | _tags(cfg.SubConfig)
+TRAINING = _tags(tcfg.Setting)
+TYPES = LAYERS | _tags(cfg.SubConfig) | TRAINING
+_SOURCES = frozenset(t for t, cls in TRAINING.items() if issubclass(cls, tcfg.SOURCES))
 ACTIVATIONS = frozenset(typing.get_args(cfg.Activation))
 RESIDUALS = _tags(cfg.ResidualConfig)
 SETTINGS = ("d_model", "vocab_size", "residual")
+# Top-level settings that make a file a run: data, optimizer, schedule, steps, ...
+TRAIN_SETTINGS = tuple(tcfg.TrainConfig.model_fields)
+_RESERVED = (*SETTINGS, *TRAIN_SETTINGS, "model")
+_REQUIRED = tuple(
+    name for name, f in tcfg.TrainConfig.model_fields.items() if f.is_required()
+)
+_EXAMPLES = {
+    "data": 'data = text(path="data/fineweb/*.parquet")',
+    "optimizer": "optimizer = adamw(lr=3e-4)",
+    "seq_len": "seq_len = 1024",
+    "batch": "batch = 256",
+    "steps": "steps = 10k",
+}
 
 
 @dataclass(frozen=True)
@@ -70,6 +91,31 @@ class _Macro:
 @dataclass(frozen=True)
 class _PortValue:
     port: str
+
+
+@dataclass(frozen=True)
+class Axis:
+    """A dimension of a sweep: one ``a | b`` as written, or all the alternatives with
+    the same labels, which are picked together."""
+
+    key: Span | frozenset[str]
+    where: str  # the definition and setting of the first one met: "optimizer.lr"
+    options: tuple[str, ...]  # the labels, or the alternatives as written
+    span: Span  # of the first one met
+
+    @property
+    def labeled(self) -> bool:
+        return isinstance(self.key, frozenset)
+
+    def pick(self, option: int) -> int | str:
+        """What ``choices`` holds for the option at `option`."""
+        return self.options[option] if self.labeled else option
+
+    def part(self, pick: int | str) -> str:
+        """How a run that took `pick` is named: mqa, or optimizer.lr=1e-3."""
+        if isinstance(pick, str):
+            return pick
+        return f"{self.where}={self.options[pick]}"
 
 
 class _Reported(BuxError):
@@ -125,6 +171,12 @@ def _describe(v: object) -> str:
             return "a block"
 
 
+def _weighted(source: tcfg.DataConfig) -> tuple[tcfg.Weighted, ...]:
+    if isinstance(source, tcfg.MixtureConfig):
+        return source.sources
+    return (tcfg.Weighted(weight=1.0, source=source),)
+
+
 def _assign(data: dict, key: tuple[str, ...], value: object) -> None:
     for part in key[:-1]:
         inner = data.get(part)
@@ -140,33 +192,50 @@ def _assign(data: dict, key: tuple[str, ...], value: object) -> None:
 class _Evaluator:
     def __init__(
         self,
-        statements: list[ast.Statement],
-        source: str,
+        program: modules.Program,
         *,
         report: Callable[[BuxError], None] | None = None,
-        broken: set[str] | None = None,
+        choices: Mapping[Span | frozenset[str], int | str] | None = None,
     ):
-        """`report` collects statement errors instead of raising them (for check());
-        `broken` names definitions that failed to parse, whose uses are not errors."""
-        self.source = source
-        self.statements: dict[str, ast.Statement] = {}
-        self.broken = set(broken or ())
-        for st in statements:
-            error = None
-            if st.name in self.statements:
-                error = BuxError(f"'{st.name}' is defined twice", st.name_span)
-            elif st.params is not None and st.name in SETTINGS + ("model",):
-                error = BuxError(f"'{st.name}' cannot be a macro", st.name_span)
-                self.broken.add(st.name)
-            if error is None:
-                self.statements[st.name] = st
-            elif report is None:
-                raise error
-            else:
-                report(error)
+        """`report` collects statement errors instead of raising them (for check()).
+        `choices` picks alternatives, by Axis key; the others take their first."""
+        self.source = program.source
+        # Names of definitions that failed to parse, whose uses are not errors.
+        self.broken = set(program.broken)
+        # A module failed to load: names that it might have defined are not errors.
+        self.incomplete = program.incomplete
+        # Every definition of a name, a layer at a time, the lowest first.
+        self.chain: dict[str, list[ast.Statement]] = {}
+        for layer in program.layers:
+            names: set[str] = set()
+            for st in layer:
+                error = None
+                if st.name in names:
+                    error = BuxError(f"'{st.name}' is defined twice", st.name_span)
+                elif st.params is not None and st.name in _RESERVED:
+                    error = BuxError(f"'{st.name}' cannot be a macro", st.name_span)
+                    self.broken.add(st.name)
+                if error is None:
+                    names.add(st.name)
+                    chain = self.chain.setdefault(st.name, [])
+                    if st.amends and chain:
+                        st = replace(st, shared=chain[-1].shared)
+                    chain.append(st)
+                elif report is None:
+                    raise error
+                else:
+                    report(error)
+        # The definition in effect for each name: the one in the highest layer.
+        self.statements = {name: chain[-1] for name, chain in self.chain.items()}
         self.values: dict[str, object] = {}
+        # Values of the definitions that later layers amend or replace.
+        self.replaced: dict[tuple[str, int], object] = {}
+        # The definitions being evaluated, with their places in their chains.
         self.evaluating: list[str] = []
+        self.levels: list[int] = []
         self.depth = 0
+        self.choices = dict(choices or {})
+        self.axes: dict[Span | frozenset[str], Axis] = {}  # met so far, in order
         # Source spans of graph nodes, for errors found while lowering. The list keeps
         # the nodes alive so that their ids stay unique.
         self.spans: dict[int, Span] = {}
@@ -186,17 +255,30 @@ class _Evaluator:
 
     # --- Names ------------------------------------------------------------------
 
-    def definition(self, name: str) -> object:
-        st = self.statements[name]
+    def definition(self, name: str, level: int | None = None) -> object:
+        """The value of a definition: the one in effect, or the one at `level` of the
+        chain of definitions of `name`."""
+        chain = self.chain[name]
+        top = len(chain) - 1
+        level = top if level is None else level
+        st = chain[level]
         if st.params is not None:
             return _Macro(st)
-        if name not in self.values:
+        cached = name in self.values if level == top else (name, level) in self.replaced
+        if not cached:
             self.evaluating.append(name)
+            self.levels.append(level)
             try:
-                self.values[name] = self.eval(st.body, {})
+                value = self.eval(st.body, {})
             finally:
                 self.evaluating.pop()
-        return _Named(name, self.values[name], name if st.shared else None)
+                self.levels.pop()
+            if level == top:
+                self.values[name] = value
+            else:
+                self.replaced[name, level] = value
+        value = self.values[name] if level == top else self.replaced[name, level]
+        return _Named(name, value, name if st.shared else None)
 
     def lookup(self, name: str, span: Span, scope: dict[str, object]) -> object:
         if name in scope:
@@ -206,8 +288,21 @@ class _Evaluator:
         if name in self.statements:
             if name not in self.evaluating:
                 return self.definition(name)
-            # Inside its own definition a name means the builtin it shadows: mlp = mlp(...).
+            # Inside its own definition a name means what it meant before it: the
+            # definition this one amends or replaces, else the builtin: mlp = mlp(...).
+            inner = len(self.evaluating) - 1 - self.evaluating[::-1].index(name)
+            level = self.levels[inner]
+            if level > 0:
+                return self.definition(name, level - 1)
             if name not in TYPES and name not in ACTIVATIONS:
+                if self.chain[name][level].amends and self.incomplete:
+                    raise _Reported()
+                if self.chain[name][level].amends:
+                    raise BuxError(
+                        f"nothing defines '{name}' for this to amend",
+                        span,
+                        f"define it first: {name} = ...",
+                    )
                 cycle = self.evaluating[self.evaluating.index(name) :] + [name]
                 raise BuxError(f"definition cycle: {' -> '.join(cycle)}", span)
         if name in TYPES or name in ACTIVATIONS:
@@ -221,6 +316,8 @@ class _Evaluator:
         scope: typing.Iterable[str] = (),
         what: str = "layer or block",
     ) -> BuxError:
+        if self.incomplete:
+            return _Reported()
         known = [
             *scope,
             *self.statements,
@@ -275,7 +372,29 @@ class _Evaluator:
                 return self.call(e, scope)
             case ast.Attr():
                 return self.attr(e, scope)
+            case ast.Alt():
+                return self.eval(self.choose(e), scope)
         raise AssertionError(e)
+
+    def choose(self, e: ast.Alt) -> ast.Expr:
+        """The alternative that `choices` picks, or the first."""
+        key: Span | frozenset[str] = e.span
+        if e.labels:
+            key = frozenset(e.labels)
+            for other in self.axes:
+                if isinstance(other, frozenset) and other != key and other & key:
+                    raise BuxError(
+                        f"these alternatives share some labels with others, but not "
+                        f"all: {', '.join(sorted(key))} against {', '.join(sorted(other))}",
+                        e.span,
+                        "alternatives with the same labels are picked together, so "
+                        "give them all the same labels, or none in common",
+                    )
+        if key not in self.axes:
+            options = e.labels or tuple(self.text(o.span) for o in e.options)
+            self.axes[key] = Axis(key, e.where, options, e.span)
+        pick = self.choices.get(key, 0)
+        return e.options[e.labels.index(pick) if isinstance(pick, str) else pick]
 
     def attr(self, e: ast.Attr, scope: dict[str, object]) -> object:
         """`base.field`: a setting of a config, as written (width-dependent defaults read as none)."""
@@ -332,6 +451,8 @@ class _Evaluator:
                         return a**b
             except ZeroDivisionError:
                 raise BuxError("division by zero", e.span) from None
+        if (mixture := self.mix(e, left, right, scope)) is not None:
+            return mixture
         match e.op:
             case "+" | "-":
                 terms = [self.term(left, e.left.span), self.term(right, e.right.span)]
@@ -370,6 +491,46 @@ class _Evaluator:
                     "scale a branch with `f * 0.5`",
                 )
 
+    def mix(
+        self, e: ast.BinOp, left: object, right: object, scope: dict[str, object]
+    ) -> tcfg.MixtureConfig | None:
+        """Data sources mixed with + and weighted with *: 0.7 * web + 0.3 * code."""
+
+        def operand(v: object, side: ast.Expr) -> object:
+            v = _unwrap(v)
+            # The bare name of a kind of source is one with its defaults: web + synthetic.
+            if isinstance(v, _Builtin) and v.name in _SOURCES:
+                return self.construct(v.name, [], side.span)
+            return v
+
+        a, b = operand(left, e.left), operand(right, e.right)
+        if not (isinstance(a, tcfg.SOURCES) or isinstance(b, tcfg.SOURCES)):
+            return None
+        for v, side in ((a, e.left), (b, e.right)):
+            if isinstance(v, _Bare):
+                raise self.unknown(v.name, side.span, scope, "name")
+        if e.op == "+" and isinstance(a, tcfg.SOURCES) and isinstance(b, tcfg.SOURCES):
+            return tcfg.MixtureConfig(sources=_weighted(a) + _weighted(b))
+        if e.op == "*":
+            (weight, side), source = (
+                ((a, e.left), b) if isinstance(b, tcfg.SOURCES) else ((b, e.right), a)
+            )
+            if _is_number(weight) and isinstance(source, tcfg.SOURCES):
+                w = typing.cast(float, weight)
+                if w <= 0:
+                    raise BuxError("a data weight must be positive", side.span)
+                return tcfg.MixtureConfig(
+                    sources=tuple(
+                        part.model_copy(update={"weight": part.weight * w})
+                        for part in _weighted(source)
+                    )
+                )
+        raise BuxError(
+            "data is mixed with + and weighted with *",
+            e.span,
+            "0.7 * web + 0.3 * code, or web + code for an even mix",
+        )
+
     def term(self, v: object, span: Span) -> ir.Node:
         if _is_number(v):
             return self.node(
@@ -405,7 +566,14 @@ class _Evaluator:
             case cfg.Config():
                 if _tag(v) not in LAYERS:
                     raise BuxError(
-                        f"{_tag(v)}(...) is a setting of a layer, not a layer", span
+                        f"{_tag(v)}(...) is "
+                        + (
+                            "a training setting"
+                            if _tag(v) in TRAINING
+                            else "a setting of a layer"
+                        )
+                        + ", not a layer",
+                        span,
                     )
                 return self.node(ir.Layer(config=typing.cast(cfg.LayerConfig, v)), span)
             case _Builtin(name=name):
@@ -487,7 +655,8 @@ class _Evaluator:
                 fields, ports = self.arguments(e, scope, type(base))
                 if not fields:
                     return self.with_ports(base, ports, label, share, e.span)
-                if share:
+                # An amendment redefines a shared layer, which stays one module.
+                if share and not e.amend:
                     raise BuxError(
                         f"'{label}' is shared, so it cannot be changed here",
                         e.span,
@@ -498,6 +667,12 @@ class _Evaluator:
             case _Bare(name=name):
                 raise self.unknown(name, e.name_span)
         what = "an activation" if isinstance(callee, _Builtin) else _describe(callee)
+        if e.amend:
+            raise BuxError(
+                f"'{e.name}' is {what}, which has no settings to amend",
+                e.name_span,
+                f"redefine it instead: {e.name} = ...",
+            )
         raise BuxError(
             f"'{e.name}' is {what} and takes no arguments",
             e.name_span,
@@ -989,7 +1164,7 @@ class _Lowering:
 
 def _compile(ev: _Evaluator, entry: str) -> ir.Architecture:
     if entry not in ev.statements:
-        if entry in ev.broken:
+        if entry in ev.broken or ev.incomplete:
             raise _Reported()
         raise BuxError(
             f"no definition named '{entry}'",
@@ -1010,6 +1185,8 @@ def _compile(ev: _Evaluator, entry: str) -> ir.Architecture:
             raise BuxError(f"'{name}' must be {kind}, found {_describe(value)}", span)
         settings[name] = value
     if settings["d_model"] is None:
+        if ev.incomplete:
+            raise _Reported()
         raise BuxError("'d_model' is not defined", hint="d_model = 4096")
     st = ev.statements[entry]
     lowering = _Lowering(
@@ -1019,6 +1196,8 @@ def _compile(ev: _Evaluator, entry: str) -> ir.Architecture:
     )
     graph = lowering.run(ev.graph(ev.definition(entry), st.name_span))
     if settings["vocab_size"] is None and (lowering.embeddings or lowering.heads):
+        if ev.incomplete:
+            raise _Reported()
         raise BuxError("'vocab_size' is not defined", hint="vocab_size = 32000")
     return ir.Architecture(
         d_model=typing.cast(int, settings["d_model"]),
@@ -1028,67 +1207,324 @@ def _compile(ev: _Evaluator, entry: str) -> ir.Architecture:
     )
 
 
+def _expects(annotation: object) -> str:
+    """What a setting of this type is written as: adamw(...) or muon(...), an integer."""
+    kinds = []
+    for member in typing.get_args(annotation) or (annotation,):
+        if member is type(None):
+            kinds.append("none")
+        elif member is int:
+            kinds.append("an integer")
+        elif member is float:
+            kinds.append("a number")
+        elif member is tcfg.MixtureConfig:
+            kinds.append("a mix of sources (0.7 * web + 0.3 * code)")
+        elif isinstance(member, type) and issubclass(member, cfg.Config):
+            kinds += [
+                f"{t}(...)"
+                for t in typing.get_args(member.model_fields["type"].annotation)
+            ]
+    return ", ".join(kinds[:-1]) + " or " + kinds[-1] if len(kinds) > 1 else kinds[0]
+
+
+_ADAPTERS = {
+    name: TypeAdapter(f.rebuild_annotation())
+    for name, f in tcfg.TrainConfig.model_fields.items()
+}
+
+
+def _train(
+    ev: _Evaluator, arch: ir.Architecture | None, *, require: bool
+) -> tcfg.TrainConfig | None:
+    """The training settings, or None if there are none. Without `require`, a module
+    that sets only some of them is fine; its settings are checked all the same."""
+    values: dict[str, object] = {}
+    spans: dict[str, Span] = {}
+    for name in TRAIN_SETTINGS:
+        value, span = ev.setting(name)
+        if span is None:
+            continue
+        annotation = tcfg.TrainConfig.model_fields[name].annotation
+        kinds = typing.get_args(annotation) or (annotation,)
+        if isinstance(value, bool) and (int in kinds or float in kinds):
+            raise BuxError(
+                f"'{name}' must be {_expects(annotation)}, found a boolean", span
+            )
+        try:
+            values[name] = _ADAPTERS[name].validate_python(value)
+        except ValidationError as err:
+            errors = err.errors()
+            if errors and errors[0]["type"].startswith(("greater", "less")):
+                message = errors[0]["msg"].replace("Input should be", "must be")
+                raise BuxError(f"'{name}' {message}, found {value}", span) from None
+            found = value if _is_number(value) else _describe(value)
+            raise BuxError(
+                f"'{name}' must be {_expects(annotation)}, found {found}", span
+            ) from None
+        spans[name] = span
+    if not values:
+        return None
+    if missing := [n for n in _REQUIRED if n not in values]:
+        if not require or ev.incomplete:
+            return None
+        listed = (
+            ", ".join(missing[:-1]) + " and " + missing[-1]
+            if len(missing) > 1
+            else missing[0]
+        )
+        raise BuxError(
+            f"this file sets how to train, so it is a run, and a run needs {listed}",
+            hint=_EXAMPLES[missing[0]],
+        )
+    train = tcfg.TrainConfig.model_validate(values)
+    schedule = train.schedule
+    cooldown = (
+        schedule.cooldown(train.steps) if isinstance(schedule, tcfg.WSDSchedule) else 0
+    )
+    if schedule.warmup + cooldown > train.steps:
+        what = f"{schedule.warmup} of warmup" + (
+            f" and {cooldown} of cooldown" if cooldown else ""
+        )
+        raise BuxError(
+            f"the schedule takes {schedule.warmup + cooldown} steps ({what}), but the "
+            f"run has {train.steps}",
+            spans.get("schedule", spans["steps"]),
+        )
+    reads = {"data": train.data} | ({"eval": train.eval.data} if train.eval else {})
+    for name, data in reads.items():
+        kinds = sorted({s.type for s in tcfg.leaves(data)} & {"text", "chat"})
+        if kinds and train.tokenizer is None:
+            raise BuxError(
+                f"{' and '.join(kinds)} data is tokenized, so the run needs a tokenizer",
+                spans[name],
+                'tokenizer = tokenizer(name="gpt2")',
+            )
+    for layer in arch.layers() if arch is not None else ():
+        if isinstance(layer.config, cfg.EmbeddingConfig):
+            positions = layer.config.max_positions
+            if positions is not None and train.seq_len > positions:
+                raise BuxError(
+                    f"sequences of {train.seq_len} tokens are longer than the "
+                    f"{positions} positions the embedding learns",
+                    spans["seq_len"],
+                    f"seq_len = {positions}, or embed(max_positions={train.seq_len})",
+                )
+    return train
+
+
+Modules = Mapping[str, str] | modules.Loader | None
+
+
+def _load(
+    source: str,
+    filename: str,
+    overrides: Sequence[str],
+    found: Modules,
+    *,
+    recover: bool,
+) -> modules.Program:
+    loader = modules.from_mapping(found) if isinstance(found, Mapping) else found
+    return modules.load(
+        source, filename, overrides=overrides, loader=loader, recover=recover
+    )
+
+
+def _stem(filename: str) -> str:
+    return "run" if filename.startswith("<") else Path(filename).stem
+
+
 def compile(
-    source: str, *, entry: str = "model", filename: str = "<string>"
+    source: str,
+    *,
+    entry: str = "model",
+    filename: str = "<string>",
+    overrides: Sequence[str] = (),
+    modules: Modules = None,
 ) -> ir.Architecture:
-    """Compile .bux source; `entry` names the definition to build (a whole model by default)."""
+    """Compile .bux source; `entry` names the definition to build (a whole model by default).
+
+    `overrides` are statements from the command line, which redefine those of the file:
+    ``optimizer.lr=1e-3``. `modules` finds what ``use`` names: by default, files on the
+    search path; a mapping holds their sources by name. In a sweep, every alternative
+    takes its first option; ``compile_runs`` builds them all.
+    """
+    program = _load(source, filename, overrides, modules, recover=False)
     try:
-        ev = _Evaluator(ast.parse(source), source)
+        ev = _Evaluator(program)
         for name, st in ev.statements.items():
             if st.params is None:
                 ev.definition(name)
         return _compile(ev, entry)
     except BuxError as err:
-        raise err.attach(source, filename) from None
+        raise program.locate(err) from None
+
+
+def compile_runs(
+    source: str,
+    *,
+    entry: str = "model",
+    filename: str = "<string>",
+    overrides: Sequence[str] = (),
+    modules: Modules = None,
+) -> list[ir.Run]:
+    """Every run of a file: one for each combination of the alternatives it reaches,
+    the first written varying slowest. Settings as for `compile`."""
+    program = _load(source, filename, overrides, modules, recover=False)
+    runs: list[ir.Run] = []
+
+    def explore(choices: dict[Span | frozenset[str], int | str]) -> None:
+        ev = _Evaluator(program, choices=choices)
+        arch = _compile(ev, entry)
+        train = _train(ev, arch, require=True)
+        # The axes met so far are those the run depends on; the rest are in
+        # definitions that it does not use.
+        reached = sorted(ev.axes.values(), key=lambda axis: axis.span.start)
+        free = [axis for axis in reached if axis.key not in choices]
+        if free:
+            for option in range(len(free[0].options)):
+                explore({**choices, free[0].key: free[0].pick(option)})
+            return
+        for name, st in ev.statements.items():
+            if st.params is None:
+                ev.definition(name)
+        if train is None:
+            raise BuxError(
+                "this file does not say how to train its model",
+                hint="a run sets data, optimizer, seq_len, batch and steps",
+            )
+        parts = tuple(axis.part(choices[axis.key]) for axis in reached)
+        name = _stem(filename) + (f"[{', '.join(parts)}]" if parts else "")
+        runs.append(ir.Run(name=name, arch=arch, train=train, choices=parts))
+
+    try:
+        explore({})
+    except BuxError as err:
+        raise program.locate(err) from None
+    return runs
 
 
 @dataclass
 class Report:
     """What `check` found in a source file."""
 
+    # The file's own statements: the ones that the modules it uses define are not here.
     statements: list[ast.Statement]
-    errors: list[BuxError]
+    errors: list[BuxError]  # each attached to the file it is in, with a span into it
     # Only when there are no errors; then it equals what compile() returns.
     arch: ir.Architecture | None
     # Definitions that evaluated, by name: numbers, strings, lists, configs or IR nodes.
     values: dict[str, object]
+    # The first run of the sweep, when the file is a run and has no errors.
+    run: ir.Run | None = None
+    # The sweep's axes, in the order written, when the file has a model and no errors.
+    axes: list[Axis] = field(default_factory=list)
+    # For every module, the `use` in this file that brought it in.
+    via: dict[str, Span] = field(default_factory=dict)
+    # Every file joined, this one first: the spans of all statements index into it.
+    source: str = ""
+    # The definitions in effect that other files make, by name, with their files.
+    inherited: dict[str, ast.Statement] = field(default_factory=dict)
+    origin: dict[str, str] = field(default_factory=dict)
 
 
-def check(source: str, *, entry: str = "model", filename: str = "<string>") -> Report:
+def check(
+    source: str,
+    *,
+    entry: str = "model",
+    filename: str = "<string>",
+    overrides: Sequence[str] = (),
+    modules: Modules = None,
+) -> Report:
     """Compile like `compile`, but collect every error instead of raising the first.
 
     Syntax errors lose only their own statement, each definition is checked on its
-    own, and an error is not repeated at every use of a broken definition.
+    own, and an error is not repeated at every use of a broken definition. Every
+    alternative of a sweep is checked once, with the others at their first option.
+    A file without the entry and without d_model is a module of settings, and no error.
     """
     errors: list[BuxError] = []
 
     def report(err: BuxError) -> None:
         if isinstance(err, _Reported):
             return
-        if all((e.message, e.span) != (err.message, err.span) for e in errors):
-            errors.append(err.attach(source, filename))
+        err = program.locate(err)
+        if all(
+            (e.message, e.span, e.filename) != (err.message, err.span, err.filename)
+            for e in errors
+        ):
+            errors.append(err)
 
-    statements, syntax_errors, broken = ast.parse_recovering(source)
-    for err in syntax_errors:
+    program = _load(source, filename, overrides, modules, recover=True)
+    for err in program.errors:
         report(err)
-    ev = _Evaluator(statements, source, report=report, broken=broken)
-    for name, st in ev.statements.items():
-        if st.params is None:
+    first: tuple[_Evaluator, ir.Architecture | None, tcfg.TrainConfig | None] | None
+    first = None
+    todo: list[dict[Span | frozenset[str], int | str]] = [{}]
+    seen: set[tuple[Span | frozenset[str], int | str]] = set()
+    while todo:
+        choices = todo.pop(0)
+        ev = _Evaluator(program, report=report, choices=choices)
+        for name, st in ev.statements.items():
+            if st.params is None:
+                try:
+                    ev.definition(name)
+                except BuxError as err:
+                    report(err)
+        arch = train = None
+        if entry in ev.statements or "d_model" in ev.statements:
             try:
-                ev.definition(name)
+                arch = _compile(ev, entry)
             except BuxError as err:
                 report(err)
-    arch = None
-    try:
-        arch = _compile(ev, entry)
-    except BuxError as err:
-        report(err)
+        try:
+            train = _train(ev, arch, require=arch is not None)
+        except BuxError as err:
+            report(err)
+        first = first or (ev, arch, train)
+        for key, axis in ev.axes.items():
+            for option in range(1, len(axis.options)):
+                if (key, axis.pick(option)) not in seen:
+                    seen.add((key, axis.pick(option)))
+                    todo.append({**choices, key: axis.pick(option)})
+    assert first is not None
+    ev, arch, train = first
     values = {
         name: public
         for name, v in ev.values.items()
         if (public := _public(v)) is not None
     }
-    return Report(statements, errors, None if errors else arch, values)
+    clean = not errors
+    axes: list[Axis] = []
+    run = None
+    if clean and arch is not None:
+        # The sweep's axes are those the run reaches, which evaluating every definition,
+        # as above, does not tell apart from the others.
+        reach = _Evaluator(program)
+        _train(reach, _compile(reach, entry), require=True)
+        axes = sorted(reach.axes.values(), key=lambda axis: axis.span.start)
+        if train is not None:
+            parts = tuple(axis.part(axis.pick(0)) for axis in axes)
+            name = _stem(filename) + (f"[{', '.join(parts)}]" if parts else "")
+            run = ir.Run(name=name, arch=arch, train=train, choices=parts)
+    via = {u.filename: u.via for u in program.units[1:] if u.via is not None}
+    inherited = {
+        name: st for name, st in ev.statements.items() if st.span.start > len(source)
+    }
+    origin = {
+        name: program.unit(st.span.start).filename for name, st in inherited.items()
+    }
+    return Report(
+        program.main,
+        errors,
+        arch if clean else None,
+        values,
+        run,
+        axes,
+        via,
+        program.source,
+        inherited,
+        origin,
+    )
 
 
 def _public(v: object) -> object | None:

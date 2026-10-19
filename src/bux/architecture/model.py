@@ -4,7 +4,7 @@ import jax
 from flax import nnx
 
 from bux.architecture.graph import build_node
-from bux.architecture.registry import OUTPUTS, TOKENS, Context, Taps
+from bux.architecture.registry import OUTPUTS, POSITIONS, TOKENS, Context, Taps
 from bux.lang import ir
 
 
@@ -13,6 +13,8 @@ class Model(nnx.Module):
 
     Every head is an output. ``outputs`` returns them all in execution order; head j
     predicts the token 1 + k positions ahead, where k counts the nextn layers run before it.
+    Rows can hold several documents: given positions, (batch, seq) offsets of every
+    token in its document, each one is attended to, convolved and embedded on its own.
     """
 
     def __init__(self, arch: ir.Architecture, *, rngs: nnx.Rngs):
@@ -22,8 +24,12 @@ class Model(nnx.Module):
             )
         self.graph = build_node(arch.graph, Context(arch, rngs))
 
-    def outputs(self, tokens: jax.Array) -> list[jax.Array]:
+    def outputs(
+        self, tokens: jax.Array, positions: jax.Array | None = None
+    ) -> list[jax.Array]:
         taps: Taps = {TOKENS: [tokens]}
+        if positions is not None:
+            taps[POSITIONS] = [positions]
         last = self.graph(tokens, taps)
         return taps.get(OUTPUTS) or [last]
 

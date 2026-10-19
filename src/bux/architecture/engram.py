@@ -10,7 +10,7 @@ from flax import nnx
 from bux import config as cfg
 from bux.architecture.conv import CausalConv
 from bux.architecture.norm import Norm
-from bux.architecture.registry import TOKENS, Context, Taps, register
+from bux.architecture.registry import TOKENS, Context, Taps, positions, register
 
 
 def _next_primes(start: int, count: int, taken: set[int]) -> list[int]:
@@ -24,12 +24,13 @@ def _next_primes(start: int, count: int, taken: set[int]) -> list[int]:
     return found
 
 
-def _ngram_rows(ids, tokens, multipliers, primes, offsets, boundary, pad):
+def _ngram_rows(ids, tokens, multipliers, primes, offsets, boundary, pad, docs=None):
     """Table rows of the n-grams ending at every position, (b, t) -> (b, t, orders * heads).
 
     The n-gram of the last j + 1 ids hashes to XOR_{i <= j} ids[t - i] * m_i, in wrapping
-    uint32 arithmetic. Positions before the sequence, or at and before the last boundary
-    token before t, count as `pad`, so that n-grams do not cross documents.
+    uint32 arithmetic. Positions before the sequence, before the document (by `docs`,
+    the positions in it), or at and before the last boundary token before t, count as
+    `pad`, so that n-grams do not cross documents.
     """
     b, t = ids.shape
     pos = jnp.arange(t)
@@ -37,6 +38,8 @@ def _ngram_rows(ids, tokens, multipliers, primes, offsets, boundary, pad):
     if boundary is not None:
         after = jnp.where(tokens == boundary, pos + 1, 0)
         start = jnp.pad(jax.lax.cummax(after, axis=1)[:, :-1], ((0, 0), (1, 0)))
+    if docs is not None:
+        start = jnp.maximum(start, pos - docs)
     h, rows = jnp.zeros((b, t), jnp.uint32), []
     for i in range(multipliers.shape[0]):
         prev = jnp.take(ids, jnp.maximum(pos - i, 0), axis=1)
@@ -109,6 +112,7 @@ class Engram(nnx.Module):
             self.offsets[...],
             self.boundary,
             pad,
+            positions(taps),
         )
         h = x if x.ndim == 4 else x[..., None, :]
         (b, t, n, d), kv = (
@@ -120,7 +124,7 @@ class Engram(nnx.Module):
         gate = jax.nn.sigmoid(jnp.sign(a) * jnp.sqrt(jnp.maximum(jnp.abs(a), 1e-6)))
         u = gate[..., None] * value[..., None, :]
         if self.conv is not None and self.conv_norm is not None:
-            conv = self.conv(self.conv_norm(u).reshape(b, t, n * d))
+            conv = self.conv(self.conv_norm(u).reshape(b, t, n * d), taps)
             u = u + jax.nn.silu(conv).reshape(u.shape)
         y = h + u
         return y if x.ndim == 4 else y[..., 0, :]

@@ -4,6 +4,7 @@ from collections.abc import Callable
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING
 
+import jax
 from flax import nnx
 
 from bux.lang import ir
@@ -13,7 +14,13 @@ if TYPE_CHECKING:
 
 Taps = dict[str, list]
 # Reserved tap keys, which no tap name can collide with.
-TOKENS, OUTPUTS, NEXTN = "<tokens>", "<outputs>", "<nextn>"
+TOKENS, POSITIONS, OUTPUTS, NEXTN = "<tokens>", "<positions>", "<outputs>", "<nextn>"
+
+
+def positions(taps: Taps | None) -> jax.Array | None:
+    """Where each token is in its document, (batch, seq), so a 0 starts one; None when
+    every row is one document."""
+    return taps[POSITIONS][0] if taps and POSITIONS in taps else None
 
 
 @dataclass

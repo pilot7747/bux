@@ -15,6 +15,7 @@ from collections import Counter
 from collections.abc import Iterator
 from dataclasses import dataclass, field, replace
 from functools import cache
+from pathlib import Path
 
 from pydantic.fields import FieldInfo
 
@@ -51,12 +52,23 @@ class Hover:
     markdown: str
 
 
-def diagnostics(source: str) -> list[Diagnostic]:
+def diagnostics(source: str, path: str | None = None) -> list[Diagnostic]:
+    """Errors in the file at `path`. Those in modules it uses show at the `use`."""
+    filename = path or "<string>"
+    report = check(source, filename=filename)
     out = []
-    for err in check(source).errors:
+    for err in report.errors:
         span = err.span or Span(0, 0)
         hint = f"\nhint: {err.hint}" if err.hint else ""
-        out.append(Diagnostic(span.start, span.end, err.message + hint))
+        message = err.message + hint
+        if err.filename != filename:
+            via = report.via.get(err.filename)
+            if via is None:
+                continue
+            line = (err.source or "").count("\n", 0, span.start) + 1
+            message = f"{Path(err.filename).name}:{line}: {message}"
+            span = via
+        out.append(Diagnostic(span.start, span.end, message))
     return out
 
 
@@ -173,12 +185,15 @@ def _activation_doc(name: str) -> str:
 class _Index:
     """The parsed file and what `check` evaluated, for looking names up."""
 
-    def __init__(self, source: str):
-        self.source = source
-        self.report = check(source)
+    def __init__(self, source: str, path: str | None = None):
+        self.report = check(source, filename=path or "<string>")
+        # Every file joined, this one first, so that all statements' spans index into it.
+        self.source = self.report.source or source
         self.defs: dict[str, ast.Statement] = {}
         for st in self.report.statements:
             self.defs.setdefault(st.name, st)
+        for name, st in self.report.inherited.items():
+            self.defs.setdefault(name, st)
         self.macros = {n for n, st in self.defs.items() if st.params is not None}
 
     def resolve(self, name: str, inside: ast.Statement | None) -> str:
@@ -312,6 +327,9 @@ def _walk(e: ast.Expr, ctx: _Ctx, ix: _Index) -> Iterator[tuple[Span, tuple]]:
                 yield from _walk(item, inner, ix)
         case ast.Residual(body=body) | ast.Neg(operand=body):
             yield from _walk(body, inner, ix)
+        case ast.Alt(options=options):
+            for option in options:
+                yield from _walk(option, ctx, ix)
         case ast.BinOp(left=left, right=right):
             yield from _walk(left, inner, ix)
             yield from _walk(right, inner, ix)
@@ -334,8 +352,8 @@ def _expr_class(
 # --- Hover -----------------------------------------------------------------------------
 
 
-def hover(source: str, offset: int) -> Hover | None:
-    ix = _Index(source)
+def hover(source: str, offset: int, path: str | None = None) -> Hover | None:
+    ix = _Index(source, path)
     best: tuple[Span, tuple] | None = None
     for span, what in _occurrences(ix):
         if span.start <= offset < span.end and (
@@ -418,6 +436,10 @@ def _definition_doc(ix: _Index, st: ast.Statement) -> str:
             parts.append(f"= `{shown}`")
     if st.shared:
         parts.append("Shared: every use is the same module, with the same parameters.")
+    if (origin := ix.report.origin.get(st.name)) and ix.report.inherited.get(
+        st.name
+    ) is st:
+        parts.append(f"Defined in `{Path(origin).name}`.")
     return "\n\n".join(parts)
 
 
@@ -437,7 +459,7 @@ class _Open:
     keys: list[str] = field(default_factory=list)  # keys of the arguments before it
 
 
-def complete(source: str, offset: int) -> list[Completion]:
+def complete(source: str, offset: int, path: str | None = None) -> list[Completion]:
     before = source[:offset]
     word = _WORD.search(before)
     start = word.start() if word else offset
@@ -446,7 +468,7 @@ def complete(source: str, offset: int) -> list[Completion]:
         return []  # a new statement's name, or a comment
     if line.endswith(("@", "$")):
         return _tap_items(source, start)
-    ix = _Index(source)
+    ix = _Index(source, path)
     stmt_start = ast.statement_start(source, start)
     current = _current(ix, stmt_start)
     tokens = ast.tokenize(source, stmt_start, start, errors=[])[:-1]
@@ -620,6 +642,7 @@ def _value_items(
             items += [
                 Completion(tag, "config", _summary(m), _type_doc(tag), sort="0")
                 for tag in _tags(m)
+                if tag in TYPES  # not a mix, which is written as a sum
             ]
             items += [
                 _definition_item(ix, st, sort="0")

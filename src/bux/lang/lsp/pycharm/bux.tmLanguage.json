@@ -5,6 +5,8 @@
   "patterns": [
     { "include": "#comment" },
     { "include": "#string" },
+    { "include": "#module" },
+    { "include": "#label" },
     { "include": "#definition" },
     { "include": "#number" },
     { "include": "#constant" },
@@ -25,6 +27,22 @@
         { "name": "string.quoted.single.bux", "match": "'[^']*'?" }
       ]
     },
+    "module": {
+      "comment": "use NAME brings in the definitions of NAME.bux, found by name on the search path.",
+      "match": "^(use)\\s+([A-Za-z_][A-Za-z0-9_.-]*|\"[^\"]*\")",
+      "captures": {
+        "1": { "name": "keyword.control.import.bux" },
+        "2": { "name": "entity.name.namespace.bux" }
+      }
+    },
+    "label": {
+      "comment": "A label on an alternative: mqa: 1 | gqa: 4.",
+      "match": "\\b([A-Za-z_][A-Za-z0-9_]*)\\s*(:)",
+      "captures": {
+        "1": { "name": "entity.name.label.bux" },
+        "2": { "name": "punctuation.separator.label.bux" }
+      }
+    },
     "definition": {
       "comment": "A statement starts at column 0 (indented lines continue the previous one) or after ';'.",
       "match": "(?:^|(?<=;)\\s*)(?:(shared)\\s+)?([A-Za-z_][A-Za-z0-9_]*)(?=\\s*(?:\\([^)]*\\))?\\s*=)",
@@ -35,7 +53,7 @@
     },
     "number": {
       "name": "constant.numeric.bux",
-      "match": "\\b\\d[\\d_]*(?:\\.\\d[\\d_]*)?(?:[eE][+-]?\\d+)?\\b"
+      "match": "\\b\\d[\\d_]*(?:\\.\\d[\\d_]*)?(?:[eE][+-]?\\d+)?[kKMBT]?\\b"
     },
     "constant": {
       "patterns": [
@@ -62,7 +80,7 @@
     },
     "operator": {
       "patterns": [
-        { "name": "keyword.operator.bux", "match": "->|→|//|[-+*/^]" },
+        { "name": "keyword.operator.bux", "match": "->|→|//|[-+*/^|]" },
         { "name": "keyword.operator.assignment.bux", "match": "=" }
       ]
     },

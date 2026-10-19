@@ -32,6 +32,7 @@ Loosest first:
 
 | syntax              | meaning                                                     |
 |---------------------|-------------------------------------------------------------|
+| `f \| g`, `a: f \| b: g` | alternatives: a run for each, a sweep ([training](training.md)) |
 | `f + g`, `f - g`    | parallel branches on the same input, summed: `f(x) + g(x)`  |
 | `f * g`, `f * 0.5`  | parallel branches multiplied (gating), or scaled by a number |
 | `f g`, `f -> g`     | composition, left to right: `g(f(x))`                        |
@@ -131,6 +132,12 @@ model = embed (m^6 sa)^9 norm head
   the same parameters. Each use of a plain definition gets fresh parameters.
 - `head(tied=true)` reuses the embedding matrix.
 
+A file can build on others by name, `use llama3_8b`, and change one setting of a
+definition, `attn.num_kv_heads = 1`, which means `attn = attn(num_kv_heads=1)`. A
+definition then replaces the one it shadows everywhere, and inside its own definition
+a name means the definition it replaces (the builtin, when there is none). The
+[training guide](training.md) describes both, with runs and sweeps.
+
 ## Several outputs: multi-token prediction
 
 Every `head` is an output. A head ends the stream, so nothing can follow it but a tap
@@ -171,7 +178,8 @@ the residual algebras `hc`, `mhc`, `gr`, `attnres`, `vpgate`. Activation names
 (`swish`, `gelu`, `relu2`, `sigmoid`, `situ`, ...) are also leaves:
 `linear(features=h) swish`.
 
-Values are numbers (`1e-5`, `128_256`), strings, `true`/`false`/`none`, lists
+Values are numbers (`1e-5`, `128_256`, and counts with a suffix `k`, `M`, `B` or `T`:
+`128k`, `1.5B`), strings, `true`/`false`/`none`, lists
 (`[1, 2]`, or `[1,]` for one element), configs (`rope(base=1e6)`), or arithmetic over
 numeric definitions (`4 * d_model // 3`). A bare name that is not defined is a string,
 so `activation=swish` and `router=sigmoid` work without quotes. Where a setting wants
@@ -184,7 +192,9 @@ suggestions.
 `experts.expert` (a layer), `rope.base` (a builtin's default). It reads the value as
 written, so a default that depends on the width, like `head_dim`, reads as `none`.
 
-Top-level settings: `d_model` (required), `vocab_size`, and `residual`.
+Top-level settings: `d_model` (required), `vocab_size`, and `residual`. Training
+settings (`data`, `optimizer`, `schedule`, `steps`, ...) make a file a run: see
+[training](training.md).
 
 ## Widths
 
@@ -260,10 +270,13 @@ bux check  examples/qwen3_next.bux    # compile, count layers by type
 bux render examples/qwen3_next.bux    # circuit diagram; --expand to inline blocks
 bux fmt    examples/qwen3_next.bux    # canonical source
 bux json   examples/qwen3_next.bux    # the IR
+bux plan   experiments/smoke.bux      # the runs of a sweep
+bux train  experiments/smoke.bux      # train them
 ```
 
 `bux fmt` prints the IR, not your file: it inlines macros and numeric definitions and
-drops comments.
+drops comments. Statements after the file redefine the file's:
+`bux check model.bux d_model=1024 'attn.num_kv_heads = 1'`.
 
 Errors point at the source. Every command reports all the errors it finds: a syntax
 error loses only its own statement, and each definition is checked on its own.
@@ -289,8 +302,10 @@ error: gqa has no setting 'num_kv_head'
   and your norm definitions); macro parameters; fields after `name.`, with their current
   values; tap names after `@` and `$`; one-letter definitions inside patterns;
 - **hover**: a layer's documentation and settings, taken from `bux/config.py`; what a
-  definition is written as and what it evaluates to; whether a bare name is a
-  reference or a string.
+  definition is written as and what it evaluates to, and which module defines it;
+  whether a bare name is a reference or a string.
+
+Modules resolve from the file's own folder, and errors in them show at the `use`.
 
 PyCharm (or any JetBrains IDE) needs the LSP4IJ plugin. `src/bux/lang/lsp/pycharm`
 holds a TextMate grammar for highlighting and an LSP4IJ template that runs the
@@ -314,7 +329,8 @@ tested without an editor.
 
 ## Lexical rules
 
-A statement is `name = expr`, `name(params) = expr`, or `shared name = expr`. It ends at
+A statement is `name = expr`, `name(params) = expr`, `shared name = expr`,
+`name.key = expr` (an amendment) or `use module`. It ends at
 a newline unless the next line is indented or a bracket is still open; `;` also ends a
 statement. `#` starts a comment. A call needs its `(` right after the name, so
 `norm (attn + ffn)` composes two things, while `norm(eps=1e-5)` configures one. In the
@@ -324,8 +340,12 @@ same way `attn.num_heads` needs its `.` right after the name.
 
 ```
 statement := ["shared"] NAME ["(" params ")"] "=" expr
+           | NAME "." NAME { "." NAME } "=" expr       # an amendment
+           | "use" (NAME | STRING)
 params    := NAME ["=" expr] { "," NAME ["=" expr] } [","]
-expr      := prod { ("+" | "-") prod }
+expr      := option { "|" option }                     # alternatives
+option    := [NAME ":"] sum                            # all labeled, or none
+sum       := prod { ("+" | "-") prod }
 prod      := chain { ("*" | "/" | "//") chain }
 chain     := unary { ["->" | "→"] unary }
 unary     := "-" unary | power

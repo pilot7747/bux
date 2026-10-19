@@ -319,3 +319,19 @@ def test_engram_gates_every_copy_of_a_widened_stream_with_its_own_key():
 def test_unregistered_layers_say_how_to_add_them():
     with pytest.raises(NotImplementedError, match=r"register\('gdn'\)"):
         model("model = embed [norm gdn(num_heads=2, head_dim=8)] head")
+
+
+def test_documents_packed_in_a_row_see_only_themselves():
+    """After another document, at positions that start again, a document has the logits
+    it has alone: attention, rotary and learned positions and causal convolutions all
+    stop at its start."""
+    m = model(
+        "mix = gqa(num_heads=4, num_kv_heads=2, rope=rope(), kv_conv_size=2, log_scale=0.1)\n"
+        "model = embed(max_positions=16) [norm mix] [norm conv(size=3)] [norm ffn] norm head\n"
+    )
+    a, b = tokens(0, 5), tokens(1, 7)
+    positions = jnp.concatenate([jnp.arange(5), jnp.arange(7)])[None].repeat(2, 0)
+    [packed] = m.outputs(jnp.concatenate([a, b], axis=1), positions)
+    assert jnp.allclose(packed[:, :5], m(a), atol=1e-5)
+    assert jnp.allclose(packed[:, 5:], m(b), atol=1e-5)
+    assert not jnp.allclose(m(jnp.concatenate([a, b], axis=1))[:, 5:], m(b), atol=1e-3)

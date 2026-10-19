@@ -3,12 +3,15 @@ name = "bux"
 version = "0.1.0"
 requires-python = ">=3.14"
 dependencies = [
+    "awkward>=2.14.0",
     "flax>=0.12.10",
+    "gigatoken>=0.10.0,<0.11",
     "jax>=0.11.2",
     "matplotlib>=3.11.2",
     "numpy>=2.5.4",
     "optax>=0.2.8",
     "orbax-checkpoint>=0.12.7",
+    "pyarrow>=26.0.0",
     "pydantic>=2.14.1",
     "tomlkit>=0.15.2",
 ]
@@ -34,13 +37,24 @@ cuda = [
 lsp = [
     "pygls>=2.1.1",
 ]
+spark = [
+    "pandas>=2.2,<3",
+    "pyspark>=4.2",
+]
 
 [build-system]
 requires = ["uv_build>=0.13.1,<0.14"]
 build-backend = "uv_build"
+
+# Where `use NAME` finds NAME.bux, subfolders included, after the using file's own folder.
+[tool.bux]
+path = ["examples", "experiments"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 
 [tool.ty.terminal]
 error-on-warning = true
+
+[tool.ty.analysis]
+allowed-unresolved-imports = ["pyspark.**"]  # the optional `spark` extra

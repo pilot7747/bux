@@ -2,20 +2,24 @@
 
 Precedence, loosest first::
 
+    a | b   x: a | y: b  alternatives: one run for each (a sweep), optionally labeled
     a + b   a - b        parallel branches, summed
     a * b                parallel branches, multiplied (gating) or scaled by a number
     a b     a -> b       composition, left to right
     -a                   negation
     a^n                  n fresh copies of a in sequence (or a number power)
-    atoms                name, call(k=v), name.field, 1.5, "pattern", _, @tap, $tap, $tap!, (a), [a]
+    atoms                name, call(k=v), name.field, 1.5, 10B, "pattern", _, @tap, $tap,
+                         $tap!, (a), [a]
 
-Statements are ``name = expr``, ``name(param, param=default, ...) = expr`` (a macro)
-or ``shared name = expr``. A statement ends at a newline unless the next line is
-indented or a bracket is still open; ``;`` also ends one. ``#`` starts a comment.
+Statements are ``name = expr``, ``name(param, param=default, ...) = expr`` (a macro),
+``shared name = expr``, ``name.key = expr`` (an amendment: ``name = name(key=expr)``)
+or ``use module``. A statement ends at a newline unless the next line is indented or
+a bracket is still open; ``;`` also ends one. ``#`` starts a comment.
 """
 
 import re
-from dataclasses import dataclass
+from dataclasses import dataclass, field
+from decimal import Decimal
 
 
 @dataclass(frozen=True)
@@ -77,12 +81,19 @@ class Token:
     value: int | float | str | None = None
 
 
-_NUMBER = re.compile(r"\d[\d_]*(\.\d[\d_]*)?([eE][+-]?\d+)?")
+# A count can end in k, M, B or T: 128k, 1.5B, 10T. The suffix must end the token, so
+# 4kv is the number 4 followed by the name kv.
+_NUMBER = re.compile(
+    r"\d[\d_]*(\.\d[\d_]*)?([eE][+-]?\d+)?(?:([kKMBT])(?![A-Za-z0-9_]))?"
+)
+_SUFFIXES = {"k": 3, "K": 3, "M": 6, "B": 9, "T": 12}
 _NAME = re.compile(r"[A-Za-z_][A-Za-z0-9_]*")
 _OPS = (
     "->",
     "//",
     "→",
+    "|",
+    ":",
     "+",
     "-",
     "*",
@@ -160,7 +171,13 @@ def tokenize(
         if m := _NUMBER.match(src, i, stop):
             text = m.group()
             clean = text.replace("_", "")
-            value = float(clean) if (m.group(1) or m.group(2)) else int(clean)
+            value: int | float
+            if suffix := m.group(3):
+                # Exact, so that 1.1B is the integer 1_100_000_000.
+                exact = Decimal(clean[:-1]).scaleb(_SUFFIXES[suffix])
+                value = int(exact) if exact == exact.to_integral() else float(exact)
+            else:
+                value = float(clean) if (m.group(1) or m.group(2)) else int(clean)
             tokens.append(Token("NUMBER", text, Span(i, m.end()), space, value))
         elif m := _NAME.match(src, i, stop):
             tokens.append(Token("NAME", m.group(), Span(i, m.end()), space))
@@ -281,6 +298,20 @@ class Call(Expr):
     name: str
     name_span: Span
     args: tuple[Arg, ...]
+    amend: bool = False  # the body of `name.key = value`, which calls what it amends
+
+
+@dataclass(frozen=True)
+class Alt(Expr):
+    """Alternatives, ``a | b``: each run of the program takes one of them.
+
+    Unlabeled alternatives are an axis of their own. Labeled ones are an axis named by
+    their labels, so alternatives elsewhere with the same labels are picked together.
+    """
+
+    options: tuple[Expr, ...]
+    labels: tuple[str, ...]  # one per option, or none
+    where: str  # the definition and setting it is written in: "optimizer.lr"
 
 
 @dataclass(frozen=True)
@@ -302,6 +333,16 @@ class Statement:
     shared: bool = False
     defaults: tuple[tuple[str, Expr], ...] = ()
     param_spans: tuple[Span, ...] = ()
+    amends: bool = False  # `name.key = value`: its body is an amending Call
+
+
+@dataclass(frozen=True)
+class Use:
+    """``use module``: the definitions of another file, which this one can redefine."""
+
+    span: Span
+    module: str
+    module_span: Span
 
 
 # --- Parser ---------------------------------------------------------------------
@@ -311,6 +352,9 @@ class _Parser:
     def __init__(self, tokens: list[Token]):
         self.tokens = tokens
         self.pos = 0
+        self.uses: list[Use] = []
+        # The definition and setting keys being parsed, which name alternatives.
+        self.context: list[str] = []
 
     def peek(self, offset: int = 0) -> Token:
         return self.tokens[min(self.pos + offset, len(self.tokens) - 1)]
@@ -350,7 +394,14 @@ class _Parser:
                 self.next()
             if self.peek().kind == "EOF":
                 return statements
-            statements.append(self.statement())
+            first = self.peek()
+            if first.text == "use" and self.peek(1).kind in ("NAME", "STRING"):
+                self.next()
+                module = self.next()
+                name = str(module.value) if module.kind == "STRING" else module.text
+                self.uses.append(Use(first.span.to(module.span), name, module.span))
+            else:
+                statements.append(self.statement())
             if not (self.peek().kind in ("NEWLINE", "EOF") or self.at(";")):
                 raise self.unexpected("expected end of statement")
 
@@ -364,6 +415,15 @@ class _Parser:
         if shared:
             self.next()
         name = self.expect_name("a definition name")
+        self.context = [name.text]
+        if self.at(".") and not self.peek().space_before:
+            if shared:
+                raise BuxError(
+                    "an amendment keeps whether the definition is shared",
+                    first.span,
+                    f"leave out 'shared': {name.text}.key = ...",
+                )
+            return self.amendment(name)
         params, defaults, param_spans = None, [], []
         if self.at("(") and not self.peek().space_before:
             if shared:
@@ -406,8 +466,58 @@ class _Parser:
             tuple(param_spans),
         )
 
-    # expr := prod { ("+" | "-") prod }
+    # amendment := NAME "." NAME { "." NAME } "=" expr, which means NAME = NAME(key=expr)
+    def amendment(self, name: Token) -> Statement:
+        parts: list[Token] = []
+        while self.at(".") and not self.peek().space_before:
+            self.next()
+            parts.append(self.expect_name("a setting name after '.'"))
+        key = tuple(p.text for p in parts)
+        self.context += key
+        self.expect("=")
+        value = self.expr()
+        span = name.span.to(value.span)
+        arg = Arg(
+            parts[0].span.to(value.span), key, value, tuple(p.span for p in parts)
+        )
+        body = Call(span, name.text, name.span, (arg,), amend=True)
+        return Statement(span, name.text, name.span, None, body, amends=True)
+
+    # expr := option { "|" option }      option := [NAME ":"] sum
     def expr(self) -> Expr:
+        labels = [self.label()]
+        options = [self.sum()]
+        while self.at("|"):
+            self.next()
+            labels.append(self.label())
+            options.append(self.sum())
+        span = options[0].span.to(options[-1].span)
+        if len(options) == 1:
+            if labels[0] is not None:
+                raise BuxError(
+                    "a label names one of several alternatives",
+                    span,
+                    f"{labels[0]}: ... | other: ...",
+                )
+            return options[0]
+        named = [label for label in labels if label is not None]
+        if named and len(named) < len(labels):
+            raise BuxError("label every alternative or none of them", span)
+        if len(set(named)) < len(named):
+            raise BuxError("two alternatives have the same label", span)
+        return Alt(span, tuple(options), tuple(named), ".".join(self.context))
+
+    def label(self) -> str | None:
+        tok, colon = self.peek(), self.peek(1)
+        if tok.kind != "NAME" or tok.text in KEYWORDS:
+            return None
+        if colon.kind != "OP" or colon.text != ":":
+            return None
+        self.pos += 2
+        return tok.text
+
+    # sum := prod { ("+" | "-") prod }
+    def sum(self) -> Expr:
         left = self.prod()
         while self.at("+", "-"):
             op = self.next().text
@@ -537,7 +647,12 @@ class _Parser:
                 self.expect("=")
                 key = tuple(p.text for p in parts)
                 key_spans = [p.span for p in parts]
-            value = self.expr()
+            outer = self.context
+            self.context = outer + list(key or ())
+            try:
+                value = self.expr()
+            finally:
+                self.context = outer
             args.append(Arg(start.to(value.span), key, value, tuple(key_spans)))
             if not self.at(","):
                 break
@@ -558,8 +673,19 @@ class _Parser:
             i += 2
 
 
+@dataclass
+class Parsed:
+    """What parse_file found: the definitions, the modules used, and for a recovering
+    parse, the syntax errors and the names of the definitions that failed to parse."""
+
+    statements: list[Statement]
+    uses: list[Use]
+    errors: list[BuxError] = field(default_factory=list)
+    broken: set[str] = field(default_factory=set)
+
+
 def parse(source: str) -> list[Statement]:
-    return _Parser(tokenize(source)).program()
+    return parse_file(source).statements
 
 
 _STATEMENT_START = re.compile(r"^[^\s#)\]]", re.MULTILINE)
@@ -573,32 +699,47 @@ def statement_start(source: str, offset: int) -> int:
     )
 
 
-def parse_recovering(source: str) -> tuple[list[Statement], list[BuxError], set[str]]:
-    """Parse as much as possible, for editors.
+def parse_file(
+    source: str, start: int = 0, stop: int | None = None, *, recover: bool = False
+) -> Parsed:
+    """Parse ``source[start:stop]``, with spans into all of `source`.
 
-    Returns the statements that parse, the syntax errors, and the names of the
-    definitions that failed to parse. When the whole source does not parse, every
-    statement is parsed on its own. A statement then starts at each line that begins
-    in the first column, so an unclosed bracket loses only its own statement.
+    Without `recover`, the first syntax error raises. With it, as much as possible is
+    parsed, for editors: when the whole does not parse, every statement is parsed on
+    its own. A statement then starts at each line that begins in the first column, so
+    an unclosed bracket loses only its own statement.
     """
+    stop = len(source) if stop is None else stop
+    if not recover:
+        parser = _Parser(tokenize(source, start, stop))
+        return Parsed(parser.program(), parser.uses)
     try:
-        return parse(source), [], set()
+        parser = _Parser(tokenize(source, start, stop))
+        return Parsed(parser.program(), parser.uses)
     except BuxError as err:
         whole = err
-    statements: list[Statement] = []
-    errors: list[BuxError] = []
-    broken: set[str] = set()
-    starts = sorted({0} | {m.start() for m in _STATEMENT_START.finditer(source)})
-    for start, stop in zip(starts, [*starts[1:], len(source)]):
+    parsed = Parsed([], [])
+    starts = sorted(
+        {start} | {m.start() for m in _STATEMENT_START.finditer(source, start, stop)}
+    )
+    for begin, end in zip(starts, [*starts[1:], stop]):
         tokenizer_errors: list[BuxError] = []
-        tokens = tokenize(source, start, stop, tokenizer_errors)
+        parser = _Parser(tokenize(source, begin, end, tokenizer_errors))
         try:
             if tokenizer_errors:
                 raise tokenizer_errors[0]
-            statements += _Parser(tokens).program()
+            parsed.statements += parser.program()
         except BuxError as err:
-            errors.append(err)
-            if m := _HEADER.match(source, start):
-                broken.add(m.group(1))
+            parsed.errors.append(err)
+            if m := _HEADER.match(source, begin):
+                parsed.broken.add(m.group(1))
+        parsed.uses += parser.uses
     # Every statement parsed on its own, though the whole did not: report why.
-    return statements, errors or [whole], broken
+    parsed.errors = parsed.errors or [whole]
+    return parsed
+
+
+def parse_recovering(source: str) -> tuple[list[Statement], list[BuxError], set[str]]:
+    """Parse as much as possible, for editors: see parse_file."""
+    parsed = parse_file(source, recover=True)
+    return parsed.statements, parsed.errors, parsed.broken

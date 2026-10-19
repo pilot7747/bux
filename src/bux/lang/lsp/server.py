@@ -53,7 +53,7 @@ def _publish(ls: LanguageServer, uri: str) -> None:
             severity=lsp.DiagnosticSeverity.Error,
             source="bux",
         )
-        for d in features.diagnostics(doc.source)
+        for d in features.diagnostics(doc.source, doc.path)
     ]
     ls.text_document_publish_diagnostics(
         lsp.PublishDiagnosticsParams(
@@ -95,7 +95,7 @@ def _completion(ls: LanguageServer, params: lsp.CompletionParams) -> lsp.Complet
             insert_text=c.insert_text,
             sort_text=f"{c.sort}{c.label}",
         )
-        for c in features.complete(doc.source, offset)
+        for c in features.complete(doc.source, offset, doc.path)
     ]
     return lsp.CompletionList(is_incomplete=False, items=items)
 
@@ -103,7 +103,9 @@ def _completion(ls: LanguageServer, params: lsp.CompletionParams) -> lsp.Complet
 @server.feature(lsp.TEXT_DOCUMENT_HOVER)
 def _hover(ls: LanguageServer, params: lsp.HoverParams) -> lsp.Hover | None:
     doc = ls.workspace.get_text_document(params.text_document.uri)
-    found = features.hover(doc.source, doc.offset_at_position(params.position))
+    found = features.hover(
+        doc.source, doc.offset_at_position(params.position), doc.path
+    )
     if found is None:
         return None
     return lsp.Hover(

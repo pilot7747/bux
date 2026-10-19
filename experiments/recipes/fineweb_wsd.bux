@@ -1,0 +1,28 @@
+# A training recipe with no model of its own: an 80/20 mix of educational web text
+# and code, AdamW, and a warmup-stable-decay schedule over a budget of tokens. A run
+# uses it by name, next to an architecture:
+#
+#   use llama3_8b
+#   use fineweb_wsd
+#   budget = 3B        # steps, defined from budget below, follows
+#
+# The documents are Parquet files of FineWeb-Edu and Stack-Edu, in Llama 3 tokens,
+# which `bux prepare` packs best-fit, documents whole and seeing only themselves.
+tokenizer = tokenizer(name="unsloth/Meta-Llama-3.1-8B",
+                      bos="<|begin_of_text|>", eos="<|end_of_text|>")
+web  = text(path="data/fineweb-edu/*.parquet", bos=true)
+code = text(path="data/stack-edu/*.parquet", column="content", bos=true)
+data = 0.8 * web(split=[0, 0.999]) + 0.2 * code
+packing = best_fit
+
+optimizer = adamw(lr=3e-3, weight_decay=0.1)
+schedule  = wsd(warmup=1k, decay=0.2, shape=sqrt)
+loss      = loss(z=1e-4)
+
+seq_len = 2048
+batch   = 256                        # 512k tokens a step
+budget  = 10B                        # tokens
+steps   = budget // (batch * seq_len)
+
+eval       = eval(data=web(split=[0.999, 1]), every=1k)
+checkpoint = checkpoint(every=2k)

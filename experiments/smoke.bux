@@ -1,0 +1,19 @@
+# A smoke test: a tiny Llama-style model on random tokens, a few seconds on a laptop.
+#
+#   bux train experiments/smoke.bux
+#   bux train experiments/smoke.bux 'optimizer = muon(lr=0.02)' steps=100
+d_model    = 64
+vocab_size = 512
+
+norm  = rmsnorm
+attn  = gqa(num_heads=4, num_kv_heads=2, rope=rope())
+ffn   = gated_mlp(intermediate_size=4 * d_model, activation=swish)
+block = [norm attn] [norm ffn]
+model = embed block^2 norm head(tied=true)
+
+data      = synthetic
+optimizer = adamw(lr=3e-3)
+schedule  = wsd(warmup=10)
+seq_len   = 64
+batch     = 8
+steps     = 50

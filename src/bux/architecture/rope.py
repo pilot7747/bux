@@ -52,14 +52,22 @@ def logit_gain(rope: cfg.RoPEConfig | None) -> float:
     return 1.0
 
 
-def rotate(x: jax.Array, rope: cfg.RoPEConfig) -> jax.Array:
-    """Rotate the first `fraction` of each head's dims, paired by `layout`; x is (b, t, h, d)."""
+def rotate(
+    x: jax.Array, rope: cfg.RoPEConfig, positions: jax.Array | None = None
+) -> jax.Array:
+    """Rotate the first `fraction` of each head's dims, paired by `layout`, by the
+    positions (b, t) of the tokens, or their indices; x is (b, t, h, d)."""
     dims = int(x.shape[-1] * rope.fraction) // 2 * 2
     if dims == 0:
         return x
     inv_freq, gain = frequencies(rope, dims)
-    angles = jnp.arange(x.shape[1])[:, None] * inv_freq
-    sin, cos = gain * jnp.sin(angles)[:, None, :], gain * jnp.cos(angles)[:, None, :]
+    if positions is None:
+        positions = jnp.arange(x.shape[1])
+    angles = positions[..., None] * inv_freq
+    sin, cos = (
+        gain * jnp.sin(angles)[..., None, :],
+        gain * jnp.cos(angles)[..., None, :],
+    )
     x, rest = x[..., :dims], x[..., dims:]
     if rope.layout == "interleaved":
         x1, x2 = x[..., 0::2], x[..., 1::2]

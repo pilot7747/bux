@@ -1,0 +1,21 @@
+# MHA, GQA or MQA, at which learning rate? Six runs of a 12-layer Llama, in one file.
+#
+#   bux plan  experiments/attention_ablation.bux
+#   bux train experiments/attention_ablation.bux --only mqa
+#
+# The architecture and the recipe come from other files, by name. Definitions here
+# take the place of theirs everywhere, so llama3_8b's `block` picks up this `attn`.
+use llama3_8b
+use fineweb_wsd
+
+# Llama 3 8B, scaled down.
+d_model = 768
+ffn.intermediate_size = 2048
+model = embed block^12 norm head(tied=true)
+
+# Three attentions, crossed with two learning rates: 3 × 2 runs.
+attn.num_heads    = 12
+attn.num_kv_heads = mha: 12 | gqa: 4 | mqa: 1
+optimizer.lr      = 1e-3 | 3e-3
+
+budget = 3B

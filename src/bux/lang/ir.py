@@ -21,12 +21,15 @@ that act on a residual stream widened by the residual algebra. Nodes with the sa
 that backends can swap the residual algebra (e.g. hyper-connections) for it alone.
 """
 
+import hashlib
+import json
 from collections.abc import Iterator
 from typing import Annotated, Literal
 
 from pydantic import BaseModel, ConfigDict, Field
 
 from bux.config import LayerConfig, ResidualConfig
+from bux.train.config import TrainConfig
 
 # "streams" is a residual stream widened by the residual algebra (hc, mhc, gr, attnres).
 Width = int | Literal["tokens", "logits", "streams"]
@@ -196,3 +199,33 @@ def strip(node: Node, *, labels: bool = True, widths: bool = True) -> Node:
         )
     node = replace_children(node, kids)
     return node.model_copy(update=update)
+
+
+class Run(BaseModel):
+    """One training run: an architecture and how to train it, with every setting resolved.
+
+    This is what a run's directory keeps, next to the same as .bux source.
+    """
+
+    model_config = ConfigDict(frozen=True, extra="forbid")
+
+    name: (
+        str  # the file, and the alternatives it took: speedrun[mqa, optimizer.lr=0.01]
+    )
+    arch: Architecture
+    train: TrainConfig
+    # One per axis of the sweep, in the order written: "mqa", "optimizer.lr=0.01".
+    choices: tuple[str, ...] = ()
+
+    @property
+    def id(self) -> str:
+        """A hash of what the run computes, not of how it is written or watched:
+        renaming a definition, reaching the same settings through a sweep, or logging,
+        evaluating and checkpointing at other intervals keeps it."""
+        arch = self.arch.model_copy(update={"graph": strip(self.arch.graph)})
+        train = self.train.model_dump(
+            mode="json", exclude={"log", "eval", "checkpoint"}
+        )
+        what = {"arch": arch.model_dump(mode="json"), "train": train}
+        blob = json.dumps(what, sort_keys=True, separators=(",", ":"))
+        return hashlib.sha256(blob.encode()).hexdigest()[:10]

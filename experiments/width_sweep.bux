@@ -1,0 +1,16 @@
+# A width sweep with the learning rate tied to the width. Alternatives with the same
+# labels are picked together, so this is three runs, s, m and l, not nine; and every
+# setting written in terms of d_model follows it.
+use llama3_8b
+use fineweb_wsd
+
+model = embed block^12 norm head(tied=true)
+
+d_model      = s: 512  | m: 768  | l: 1024
+optimizer.lr = s: 4e-3 | m: 3e-3 | l: 2e-3
+
+attn.num_heads        = d_model // 64
+attn.num_kv_heads     = d_model // 256
+ffn.intermediate_size = 8 * d_model // 3
+
+budget = 2B

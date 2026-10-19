@@ -1,9 +1,9 @@
-"""Prints an Architecture back to .bux source.
+"""Prints an Architecture, or a whole Run, back to .bux source.
 
 Every labeled node becomes a definition, so the output reads like hand-written source:
 leaf definitions, then blocks in dependency order, then the model. Macro calls are
 inlined, since the IR only keeps what they produced. ``compile(to_source(a))``
-equals ``a`` up to labels.
+equals ``a`` up to labels, and a run's source compiles back to a run with its id.
 """
 
 import re
@@ -13,8 +13,9 @@ from pydantic import BaseModel
 
 from bux import config as cfg
 from bux.lang import ir
-from bux.lang.compiler import ACTIVATIONS, SETTINGS, TYPES
+from bux.lang.compiler import ACTIVATIONS, SETTINGS, TRAIN_SETTINGS, TYPES
 from bux.lang.syntax import KEYWORDS
+from bux.train import config as tcfg
 
 _IDENT = re.compile(r"[A-Za-z][A-Za-z0-9_]*\Z")
 SUM, PROD, SEQ, UNARY, POWER, ATOM = range(6)
@@ -45,7 +46,9 @@ class _Printer:
         self.arch = arch
         # Definitions may not shadow builtins or settings, so that inline configs and
         # bare strings keep their meaning.
-        taken = set(SETTINGS) | {"model"} | KEYWORDS | set(TYPES) | ACTIVATIONS
+        taken = (
+            {*SETTINGS, *TRAIN_SETTINGS, "model"} | KEYWORDS | set(TYPES) | ACTIVATIONS
+        )
         self.names: dict[str, str] = {}
         for node in ir.walk(arch.graph):
             if node is arch.graph or node.label is None or not _IDENT.match(node.label):
@@ -172,6 +175,8 @@ class _Printer:
     ) -> str:
         if isinstance(config, cfg.ActivationConfig) and not extra and not as_value:
             return config.fn
+        if isinstance(config, tcfg.MixtureConfig):
+            return self.value(config)
         args = []
         fields = type(config).model_fields
         for name in field_order(type(config)):
@@ -204,6 +209,10 @@ class _Printer:
                     and v not in self.defined
                 )
                 return v if bare else ('"' + v + '"' if '"' not in v else "'" + v + "'")
+            case tcfg.MixtureConfig(sources=sources):
+                return " + ".join(
+                    f"{w.weight!r} * {self.value(w.source)}" for w in sources
+                )
             case cfg.Config():
                 return self.leaf_names.get(v.model_dump_json()) or self.config(
                     v, as_value=True
@@ -216,6 +225,24 @@ class _Printer:
 
 def to_source(arch: ir.Architecture) -> str:
     return _Printer(arch).run()
+
+
+def run_to_source(run: ir.Run) -> str:
+    """A run as one file of its own: no modules, no alternatives, nothing left to resolve.
+
+    Training settings at their defaults are left out, as config settings are.
+    """
+    printer = _Printer(run.arch)
+    arch = printer.run()
+    fields = tcfg.TrainConfig.model_fields
+    settings = [
+        f"{name} = {printer.value(getattr(run.train, name))}"
+        for name in TRAIN_SETTINGS
+        if fields[name].is_required()
+        or getattr(run.train, name)
+        != fields[name].get_default(call_default_factory=True)
+    ]
+    return f"# {run.name}, run {run.id}\n{arch}\n" + "\n".join(settings) + "\n"
 
 
 # A printer with no definitions to refer to, so that values print in full.

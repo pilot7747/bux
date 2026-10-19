@@ -6,7 +6,15 @@ from flax import nnx
 from bux import config as cfg
 from bux.architecture.functional import softcap
 from bux.architecture.norm import Norm
-from bux.architecture.registry import NEXTN, OUTPUTS, TOKENS, Context, Taps, register
+from bux.architecture.registry import (
+    NEXTN,
+    OUTPUTS,
+    TOKENS,
+    Context,
+    Taps,
+    positions,
+    register,
+)
 
 
 class Embedding(nnx.Module):
@@ -27,7 +35,8 @@ class Embedding(nnx.Module):
     def __call__(self, tokens, taps: Taps):
         x = self.embed_tokens(tokens)
         if self.positions is not None:
-            x = x + self.positions(jnp.arange(tokens.shape[-1]))
+            pos = positions(taps)
+            x = x + self.positions(jnp.arange(tokens.shape[-1]) if pos is None else pos)
         return self.dropout(x)
 
 
