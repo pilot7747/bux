@@ -250,6 +250,80 @@ other intervals keeps it, and anything else changes it. So a changed run starts 
 directory of its own, and an unchanged one started again resumes from its latest
 checkpoint, ending exactly where it would have.
 
+## The trainer's blocks
+
+`train(run)` is a few lines that put blocks together, and each block works without
+the others, so changing one part of training means replacing one block:
+
+| block       | in                       | what it is                                        | to change it                     |
+|-------------|--------------------------|---------------------------------------------------|----------------------------------|
+| sources     | `bux/train/data.py`      | an endless stream of rows, per data config type    | register a builder               |
+| schedules   | `bux/train/optim.py`     | the curve after the warmup, per schedule type      | register a builder               |
+| optimizers  | `bux/train/optim.py`     | an optax transformation, per optimizer type        | register a builder               |
+| objective   | `bux/train/objective.py` | the loss: named, weighted terms, each a metric     | add a `Term`                     |
+| `Trainer`   | `bux/train/trainer.py`   | model, optimizer, objective; the compiled steps    | override `train_step`            |
+| hooks       | `bux/train/hooks.py`     | what happens every `every` steps: log, eval, save  | `train(run, hooks=[...])`        |
+| sinks       | `bux/train/sinks.py`     | where reports go: console, metrics.jsonl           | `train(run, sinks=[...])`        |
+
+A config's `type` finds its builder in a registry, as a layer's does. Registering under
+a taken name replaces the builder, so a variant of an optimizer is a function, not a
+fork; a new name also needs its config in `bux/train/config.py`, where the compiler
+and the editor find it:
+
+```python
+from bux.train.optim import optimizers, peak
+
+
+@optimizers.register("adamw")
+def _(c, multiplier, model):  # a config, the schedule's multiplier, the model
+    return optax.adamw(
+        peak(c.lr, multiplier), b1=c.b1, b2=c.b2, weight_decay=c.weight_decay
+    )
+```
+
+A hook runs after every `every` steps and after the last, and what it returns is a
+report, metrics by name, that every sink gets. A tracker is a sink:
+
+```python
+class WeightNorm(Hook):
+    every = 100
+
+    def __call__(self, trainer, metrics):
+        return {
+            "weight_norm": float(optax.tree.norm(nnx.state(trainer.model, nnx.Param)))
+        }
+
+
+class Wandb(Sink):
+    def __init__(self, run):
+        self.run = wandb.init(project="bux", name=run.name)
+
+    def write(self, step, report):
+        self.run.log(report, step=step)
+
+
+train(run, hooks=[WeightNorm()], sinks=[Wandb(run)])
+```
+
+A `Trainer` takes a model, an optax transformation and an objective, so a script or a
+notebook can train with blocks of its own and keep the rest:
+
+```python
+loss = objective(run.train.loss, run.arch)
+loss.terms["logit_l2"] = Term(1e-4, lambda logits, batch: jnp.mean(logits[0] ** 2))
+trainer = Trainer(Model(run.arch, rngs=nnx.Rngs(0)), optax.adamw(1e-3), loss)
+trainer.fit(
+    batches(run.train.data, run.train, vocab),
+    steps=1000,
+    hooks=[Log(every=10, lr=..., tokens=...)],
+    sinks=[Console("mine", 1000)],
+)
+```
+
+`train_step` and `eval_step` are what the trainer compiles, once; a subclass that
+overrides them changes what a step does (accumulating gradients, averaging the weights,
+skipping a spike) and keeps the loop, the hooks and checkpoints.
+
 ## Design notes
 
 **Why extend the language** rather than add a YAML or TOML file that points at the
@@ -277,5 +351,5 @@ or cross axes by convention instead of by name.
 The resolved run is plain data, so other front ends can make one: a `Run` built in
 Python trains the same way. Possible extensions: per-parameter-group optimizer
 settings selected by definition label; device meshes and sharding; learning-rate
-schedules composed in sequence with the same algebra; and trackers next to
-metrics.jsonl.
+schedules composed in sequence with the same algebra; and hooks, sinks and builders
+of one's own named in a `.bux` file, as plugins found on the module path.

@@ -129,33 +129,51 @@ def _splits(path: str, size: int = 1 << 28) -> list[list[int]]:
     return runs
 
 
+# A spill is a map task's documents sorted by key, as raw arrays, so that a reduce
+# finds its keys by bisection and maps in its documents and nothing else.
+_SPILLED = ("key", "offsets", "ids", "mask")
+
+
 def _map(job: Job, task: tuple[str, list[int]], spill: Path) -> int:
-    """Documents of some row groups, each batch sorted by key, to an Arrow file; the
-    tokens in them."""
+    """Documents of some row groups to a spill; the tokens in them."""
     path, groups = task
     records = pq.ParquetFile(path).iter_batches(
         batch_size=4096, row_groups=groups, columns=[job.source.column]
     )
-    tokens = 0
-    with pa.ipc.new_file(str(spill), documents.SCHEMA) as out:
-        for docs in job.map(records):
-            out.write_batch(docs.sort_by("key"))
-            tokens += len(docs["input_ids"].values)
-    return tokens
+    docs = pa.Table.from_batches(job.map(records), documents.SCHEMA).sort_by("key")
+    ids, offsets = packing.flat(docs["input_ids"])
+    mask, _ = packing.flat(docs["loss_mask"])
+    spill.mkdir()
+    for name, a in zip(_SPILLED, (docs["key"].to_numpy(), offsets, ids, mask)):
+        np.save(spill / f"{name}.npy", a)
+    return len(ids)
+
+
+def _take(spill: Path, chunk: int, chunks: int) -> pa.RecordBatch:
+    """A chunk's documents in a spill."""
+    key, offsets, ids, mask = (
+        np.load(spill / f"{name}.npy", mmap_mode="r") for name in _SPILLED
+    )
+    a = np.searchsorted(key, chunk << shift(chunks))
+    b = (
+        np.searchsorted(key, (chunk + 1) << shift(chunks))
+        if chunk + 1 < chunks
+        else len(key)
+    )
+    lo, hi = offsets[a], offsets[b]
+    return documents.of(
+        np.array(key[a:b]),
+        np.array(ids[lo:hi]),
+        offsets[a : b + 1] - lo,
+        np.array(mask[lo:hi]),
+    )
 
 
 def _reduce(
     job: Job, chunk: int, chunks: int, spills: list[Path], part: Path
 ) -> Counter:
     """The documents of a chunk, from every spill, to a Parquet file of rows."""
-    pieces = []
-    for spill in spills:
-        reader = pa.ipc.open_file(pa.memory_map(str(spill)))
-        for i in range(reader.num_record_batches):
-            batch = reader.get_batch(i)
-            keys = batch["key"].to_numpy() >> shift(chunks)
-            a, b = np.searchsorted(keys, [chunk, chunk + 1])
-            pieces.append(batch.slice(a, b - a))
+    pieces = [_take(spill, chunk, chunks) for spill in spills]
     rows, stats = job.reduce(chunk, pa.Table.from_batches(pieces, documents.SCHEMA))
     with pq.ParquetWriter(part, packing.SCHEMA, compression="zstd") as out:
         for batch in rows:
@@ -198,7 +216,7 @@ def prepare(
             run = stack.enter_context(ProcessPoolExecutor(workers)).map
         tmp = Path(stack.enter_context(tempfile.TemporaryDirectory(dir=cache)))
         tasks = [(f, groups) for f in files for groups in _splits(f)]
-        spills = [tmp / f"map-{i:05d}.arrow" for i in range(len(tasks))]
+        spills = [tmp / f"map-{i:05d}" for i in range(len(tasks))]
         tokens = sum(run(_map, itertools.repeat(job), tasks, spills))
         chunks = job.chunks(tokens)
         out = tmp / job.name

@@ -9,75 +9,130 @@ A run's directory, ``<out>/<name>-<id>``, holds:
 
 Its name says which alternatives it took, and its id hashes what it computes, so a
 changed setting gets a fresh directory and an unchanged one finds its checkpoints.
+
+``train`` builds a run out of blocks, each of which works without the others: a
+``Trainer`` (a model, its optimizer and its objective), the run's batches, hooks for
+its log, eval and checkpoint settings, and sinks for what they report. So a script
+of your own trains with its own blocks, or with the run's and one more:
+
+    trainer = Trainer(model, optax.adamw(1e-3), objective(run.train.loss, run.arch))
+    trainer.fit(batches(...), steps=1000, hooks=[...], sinks=[Console("mine", 1000)])
 """
 
-import json
+import contextlib
+import functools
 import re
-import time
-from collections.abc import Callable
+from collections.abc import Callable, Iterable, Iterator, Mapping, Sequence
 from pathlib import Path
+from typing import Any
 
 import jax
 import jax.numpy as jnp
 import optax
-import orbax.checkpoint as ocp
 from flax import nnx
 
 from bux.architecture import Model
 from bux.data.pipeline import DEFAULT_CACHE, jobs, prepare
 from bux.lang import ir
 from bux.lang.printer import run_to_source
-from bux.train import config as tcfg
 from bux.train.data import Batch, batches
-from bux.train.optim import optimizer, schedule
+from bux.train.hooks import Checkpoint, Eval, Hook, Log, Metrics
+from bux.train.objective import Objective, objective
+from bux.train.optim import optimizer, peak, schedule
+from bux.train.sinks import JSONL, Console, Latest, Sink
+
+
+def forward(model: Model, batch: Batch) -> list[jax.Array]:
+    """Every head's logits on `batch`, each document in a row on its own."""
+    return model.outputs(jnp.asarray(batch.input_ids), jnp.asarray(batch.position_ids))
+
+
+class Trainer:
+    """A model, the optimizer that trains it with `tx`, and the objective it
+    minimizes, `step` steps in.
+
+    `train_step` and `eval_step` are compiled once, so a subclass that overrides them
+    changes what a step does (accumulates gradients, keeps an average of the weights,
+    skips a spike) and keeps the loop, hooks and checkpoints. They get the model and
+    the optimizer as arguments, which is how nnx.jit sees them change.
+    """
+
+    def __init__(
+        self, model: Model, tx: optax.GradientTransformation, objective: Objective
+    ):
+        self.model, self.objective = model, objective
+        self.optimizer = nnx.Optimizer(model, tx, wrt=nnx.Param)
+        self.step = 0
+        self._train = nnx.jit(self.train_step)
+        self._eval = nnx.jit(self.eval_step)
+
+    def train_step(
+        self, model: Model, optimizer: nnx.Optimizer, batch: Batch
+    ) -> Metrics:
+        """The objective's gradient on `batch`, applied: the objective's terms, and
+        the gradient's norm."""
+
+        def loss(model: Model):
+            return self.objective(forward(model, batch), batch)
+
+        (_, metrics), grads = nnx.value_and_grad(loss, has_aux=True)(model)
+        optimizer.update(model, grads)
+        return metrics | {"grad_norm": optax.tree.norm(grads)}
+
+    def eval_step(self, model: Model, batch: Batch) -> jax.Array:
+        """The first head's loss on `batch`."""
+        return self.objective(forward(model, batch), batch)[1]["loss"]
+
+    def update(self, batch: Batch) -> Metrics:
+        """Take a step on `batch`."""
+        metrics = self._train(self.model, self.optimizer, jax.device_put(batch))
+        self.step += 1
+        return metrics
+
+    def evaluate(self, batches: Iterable[Batch]) -> float:
+        """The mean of `eval_step` over `batches`, in eval mode."""
+        self.model.eval()
+        try:
+            losses = [float(self._eval(self.model, jax.device_put(b))) for b in batches]
+        finally:
+            self.model.train()
+        return sum(losses) / len(losses)
+
+    def state(self) -> nnx.State:
+        """What a checkpoint keeps: the model's state and the optimizer's."""
+        return nnx.state((self.model, self.optimizer))
+
+    def load(self, state: Mapping[str, Any], step: int) -> None:
+        """Take up `state`, from `state()` or a checkpoint, at `step`."""
+        nnx.update((self.model, self.optimizer), state)
+        self.step = step
+
+    def fit(
+        self,
+        data: Iterator[Batch],
+        steps: int,
+        hooks: Sequence[Hook] = (),
+        sinks: Sequence[Sink] = (),
+    ) -> None:
+        """Train on `data` to step `steps`. After every step, the hooks due run in
+        order, and what they report goes to every sink. All of them close at the end,
+        or when training stops."""
+        with contextlib.ExitStack() as stack:
+            for part in (*sinks, *hooks):
+                stack.callback(part.close)
+            for hook in hooks:
+                hook.start(self)
+            while self.step < steps:
+                metrics = self.update(next(data))
+                for hook in hooks:
+                    if hook.due(self.step, steps) and (report := hook(self, metrics)):
+                        for sink in sinks:
+                            sink.write(self.step, report)
 
 
 def directory(run: ir.Run, out: str | Path) -> Path:
     slug = re.sub(r"[^A-Za-z0-9_.=+-]+", "_", run.name).strip("_")
     return Path(out) / f"{slug}-{run.id}"
-
-
-def lookahead(arch: ir.Architecture) -> list[int]:
-    """How far ahead each head predicts, in execution order: 1 + the nextn layers before it."""
-    ahead, nextn = [], 0
-    for layer in arch.layers():
-        if layer.config.type == "nextn":
-            nextn += 1
-        elif layer.config.type == "head":
-            ahead.append(1 + nextn)
-    return ahead or [1]
-
-
-def _cross_entropy(logits: jax.Array, batch: Batch, ahead: int) -> jax.Array:
-    """The mean loss of logits over positions t that predict a target, token t + ahead,
-    of their own document: at least `ahead` tokens into it. A position with nothing
-    that far ahead in its row, or in its document, is left out."""
-    targets = batch.input_ids[:, ahead:]
-    weight = batch.loss_mask[:, ahead:] & (batch.position_ids[:, ahead:] >= ahead)
-    loss = optax.softmax_cross_entropy_with_integer_labels(
-        logits[:, : targets.shape[1]].astype(jnp.float32), targets
-    )
-    return jnp.sum(loss * weight) / jnp.maximum(jnp.sum(weight), 1)
-
-
-def losses(
-    outputs: list[jax.Array], batch: Batch, ahead: list[int], c: tcfg.LossConfig
-) -> tuple[jax.Array, dict[str, jax.Array]]:
-    """The loss to minimize, and its terms."""
-    metrics = {"loss": _cross_entropy(outputs[0], batch, ahead[0])}
-    total = metrics["loss"]
-    if c.z:
-        log_z = jax.nn.logsumexp(outputs[0].astype(jnp.float32), axis=-1)
-        metrics["z_loss"] = jnp.mean(log_z**2)
-        total = total + c.z * metrics["z_loss"]
-    if len(outputs) > 1:
-        metrics["mtp"] = jnp.mean(
-            jnp.stack(
-                [_cross_entropy(o, batch, a) for o, a in zip(outputs[1:], ahead[1:])]
-            )
-        )
-        total = total + c.mtp * metrics["mtp"]
-    return total, metrics
 
 
 def train(
@@ -86,11 +141,14 @@ def train(
     *,
     cache: str | Path = DEFAULT_CACHE,
     echo: Callable[[str], None] = print,
+    hooks: Sequence[Hook] = (),
+    sinks: Sequence[Sink] = (),
 ) -> dict[str, float]:
     """Train `run` to its last step, writing to its directory under `out`, after
-    preparing the datasets it reads under `cache`; the last metrics logged."""
-    t = run.train
-    vocab = run.arch.vocab_size
+    preparing the datasets it reads under `cache`; the latest value of every metric
+    reported. `hooks` run after the run's own, and `sinks` get what all of them
+    report, as the console and metrics.jsonl do."""
+    t, vocab = run.train, run.arch.vocab_size
     if vocab is None:
         raise ValueError("a model without a vocabulary cannot be trained on tokens")
     for job in jobs(t):
@@ -102,90 +160,32 @@ def train(
 
     model = Model(run.arch, rngs=nnx.Rngs(t.seed))
     multiplier = schedule(t.schedule, t.steps)
-    opt = nnx.Optimizer(
-        model, optimizer(t.optimizer, multiplier, model, t.clip), wrt=nnx.Param
+    tx = optimizer(t.optimizer, multiplier, model, t.clip)
+    trainer = Trainer(model, tx, objective(t.loss, run.arch))
+
+    lr = peak(t.optimizer.lr, multiplier)
+    own: list[Hook] = [Log(every=t.log.every, lr=lr, tokens=t.batch * t.seq_len)]
+    if t.eval is not None:
+        held_out = functools.partial(
+            batches, t.eval.data, t, vocab, cache=cache, stream=1
+        )
+        own.append(Eval(held_out, every=t.eval.every, batches=t.eval.batches))
+    if (c := t.checkpoint) is not None:
+        checkpoint = Checkpoint(folder / "checkpoints", every=c.every, keep=c.keep)
+        if checkpoint.restore(trainer):
+            echo(f"{run.name}: resuming at step {trainer.step}")
+        own.append(checkpoint)
+
+    latest = Latest()
+    trainer.fit(
+        batches(t.data, t, vocab, cache=cache, start=trainer.step),
+        t.steps,
+        hooks=[*own, *hooks],
+        sinks=[
+            Console(run.name, t.steps, echo),
+            JSONL(folder / "metrics.jsonl", append=trainer.step > 0),
+            latest,
+            *sinks,
+        ],
     )
-    start = 0
-    manager = None
-    if t.checkpoint is not None:
-        manager = ocp.CheckpointManager(
-            (folder / "checkpoints").resolve(),
-            options=ocp.CheckpointManagerOptions(max_to_keep=t.checkpoint.keep),
-        )
-        if (latest := manager.latest_step()) is not None:
-            target = nnx.state((model, opt))
-            state = manager.restore(latest, args=ocp.args.StandardRestore(target))
-            nnx.update((model, opt), state)
-            start = latest
-            echo(f"{run.name}: resuming at step {start}")
-    ahead = lookahead(run.arch)
-
-    def outputs(model: Model, batch: Batch) -> list[jax.Array]:
-        return model.outputs(
-            jnp.asarray(batch.input_ids), jnp.asarray(batch.position_ids)
-        )
-
-    @nnx.jit
-    def step(model: Model, opt: nnx.Optimizer, batch: Batch):
-        def loss(model: Model):
-            return losses(outputs(model, batch), batch, ahead, t.loss)
-
-        (_, metrics), grads = nnx.value_and_grad(loss, has_aux=True)(model)
-        opt.update(model, grads)
-        return metrics | {"grad_norm": optax.tree.norm(grads)}
-
-    @nnx.jit
-    def evaluate(model: Model, batch: Batch) -> jax.Array:
-        return losses(outputs(model, batch), batch, ahead, t.loss)[1]["loss"]
-
-    log = (folder / "metrics.jsonl").open("a" if start else "w", encoding="utf-8")
-    data = batches(t.data, t, vocab, cache=cache, start=start)
-    last: dict[str, float] = {}
-    clock, since = time.perf_counter(), start
-    try:
-        for i in range(start, t.steps):
-            metrics = step(model, opt, jax.device_put(next(data)))
-            done = i + 1
-            if done % t.log.every == 0 or done == t.steps:
-                elapsed = time.perf_counter() - clock
-                last = {k: float(v) for k, v in metrics.items()}
-                last |= {
-                    "lr": float(t.optimizer.lr * multiplier(i)),
-                    "tokens": done * t.batch * t.seq_len,
-                    "tokens_per_s": (done - since) * t.batch * t.seq_len / elapsed,
-                }
-                clock, since = time.perf_counter(), done
-                log.write(json.dumps({"step": done} | last) + "\n")
-                log.flush()
-                echo(
-                    f"{run.name} step {done}/{t.steps}  loss {last['loss']:.4f}  "
-                    f"lr {last['lr']:.2e}  grad {last['grad_norm']:.3f}  "
-                    f"{last['tokens_per_s']:,.0f} tok/s"
-                )
-            if t.eval is not None and (done % t.eval.every == 0 or done == t.steps):
-                model.eval()
-                held_out = batches(t.eval.data, t, vocab, cache=cache, stream=1)
-                value = (
-                    sum(
-                        float(evaluate(model, jax.device_put(next(held_out))))
-                        for _ in range(t.eval.batches)
-                    )
-                    / t.eval.batches
-                )
-                model.train()
-                last["eval_loss"] = value
-                log.write(json.dumps({"step": done, "eval_loss": value}) + "\n")
-                log.flush()
-                echo(f"{run.name} step {done}/{t.steps}  eval loss {value:.4f}")
-            saves = t.checkpoint is not None and (
-                done % t.checkpoint.every == 0 or done == t.steps
-            )
-            if manager is not None and saves:
-                state = nnx.state((model, opt))
-                manager.save(done, args=ocp.args.StandardSave(state))
-    finally:
-        log.close()
-        if manager is not None:
-            manager.wait_until_finished()
-            manager.close()
-    return last
+    return latest.metrics

@@ -58,7 +58,7 @@ def _in_split(keys: np.ndarray, split: tuple[float, float]) -> np.ndarray:
     return (split[0] <= at) & ((at < split[1]) | (split[1] == 1))
 
 
-def _batch(keys: np.ndarray, ids: np.ndarray, offsets: np.ndarray, mask: np.ndarray):
+def of(keys: np.ndarray, ids: np.ndarray, offsets: np.ndarray, mask: np.ndarray):
     offsets = pa.array(offsets.astype(np.int32))
     columns = [
         pa.array(keys, pa.int64()),
@@ -83,7 +83,7 @@ def text(batch: pa.RecordBatch, c: tcfg.TextConfig, tok: Tokenizer) -> pa.Record
         ids, offsets = np.insert(ids, offsets[:-1], tok.bos), offsets + moved
     if c.eos:
         ids, offsets = np.insert(ids, offsets[1:], tok.eos), offsets + moved
-    return _batch(keys, ids, offsets, np.ones(len(ids), bool))
+    return of(keys, ids, offsets, np.ones(len(ids), bool))
 
 
 def _content(message: dict) -> str:
@@ -125,7 +125,7 @@ def chat(batch: pa.RecordBatch, c: tcfg.ChatConfig, tok: Tokenizer) -> pa.Record
             masks.append(mask)
             kept.append(key)
     lengths = np.array([len(d) for d in docs], np.int64)
-    return _batch(
+    return of(
         np.array(kept, np.int64),
         np.concatenate(docs or [np.zeros(0, np.int32)]),
         np.concatenate([[0], np.cumsum(lengths)]),

@@ -19,8 +19,11 @@ from bux.data.pipeline import jobs
 from bux.lang import compile, compile_runs
 from bux.train import config as tcfg
 from bux.train.data import batches, plain
-from bux.train.optim import matrices, schedule
-from bux.train.trainer import directory, lookahead, losses, train
+from bux.train.hooks import Hook, Log
+from bux.train.objective import Term, cross_entropy, lookahead, objective
+from bux.train.optim import matrices, optimizer, optimizers, schedule, schedules
+from bux.train.sinks import Latest, Sink
+from bux.train.trainer import Trainer, directory, train
 
 SMOKE = Path(__file__).parent.parent / "experiments" / "smoke.bux"
 
@@ -138,7 +141,7 @@ def test_heads_predict_further_ahead_after_each_nextn():
     tokens = np.asarray(jax.random.randint(jax.random.key(0), (2, 8), 0, 32))
     outputs = Model(arch, rngs=nnx.Rngs(0)).outputs(jnp.asarray(tokens))
     batch = plain(tokens)
-    total, metrics = losses(outputs, batch, lookahead(arch), tcfg.LossConfig(z=1e-4))
+    total, metrics = objective(tcfg.LossConfig(z=1e-4), arch)(outputs, batch)
     expected = metrics["loss"] + 1e-4 * metrics["z_loss"] + 0.3 * metrics["mtp"]
     assert jnp.allclose(total, expected) and set(metrics) == {"loss", "z_loss", "mtp"}
 
@@ -150,14 +153,11 @@ def test_a_head_learns_only_targets_of_its_own_document_in_the_mask():
     ce = optax.softmax_cross_entropy_with_integer_labels(logits[:, :5], tokens[:, 3:])[
         0
     ]
-
-    def loss(b):
-        return losses([logits], b, [3], tcfg.LossConfig())[1]["loss"]
-
-    assert jnp.allclose(loss(batch), ce[jnp.array([0, 4])].mean())  # 0->3 and 4->7
+    ahead = cross_entropy(logits, batch, 3)
+    assert jnp.allclose(ahead, ce[jnp.array([0, 4])].mean())  # 0->3 and 4->7
     mask = batch.loss_mask.copy()
     mask[0, 7] = False
-    assert jnp.allclose(loss(batch._replace(loss_mask=mask)), ce[0])
+    assert jnp.allclose(cross_entropy(logits, batch._replace(loss_mask=mask), 3), ce[0])
 
 
 def test_a_run_writes_its_directory_and_resumes_where_it_stopped(tmp_path):
@@ -212,6 +212,61 @@ def test_muon_runs_end_to_end(tmp_path):
     run = smoke("optimizer = muon(lr=0.02)", "steps = 3")
     last = train(run, tmp_path, echo=lambda _: None)
     assert np.isfinite(last["loss"])
+
+
+def test_a_builder_registered_for_a_type_replaces_its_own(monkeypatch):
+    def half(c, steps):
+        return lambda step: jnp.asarray(0.5)
+
+    monkeypatch.setitem(schedules.builders, "constant", half)
+    assert values(tcfg.ConstantSchedule(warmup=2), 4) == [0.25, 0.5, 0.5, 0.5]
+    monkeypatch.delitem(optimizers.builders, "adamw")
+    hint = r"no 'adamw' optimizer yet; add one with @bux\.train\.optim\.optimizers"
+    with pytest.raises(NotImplementedError, match=hint):
+        optimizer(tcfg.AdamWConfig(lr=1e-3), half(None, 1), nnx.Module())
+
+
+class WeightNorm(Hook):
+    every = 2
+
+    def __call__(self, trainer, metrics):
+        params = nnx.state(trainer.model, nnx.Param)
+        return {"weight_norm": float(optax.tree.norm(params))}
+
+
+class Steps(Sink):
+    def __init__(self):
+        self.reports: list[tuple[int, set[str]]] = []
+
+    def write(self, step, report):
+        self.reports.append((step, set(report)))
+
+
+def test_a_trainer_takes_terms_hooks_and_sinks_of_ones_own():
+    arch = compile(ARCH + "model = embed block norm head\n")
+    loss = objective(tcfg.LossConfig(), arch)
+    loss.terms["logit_l2"] = Term(1e-4, lambda logits, _: jnp.mean(logits[0] ** 2))
+    trainer = Trainer(Model(arch, rngs=nnx.Rngs(0)), optax.adamw(1e-3), loss)
+    lr = schedule(tcfg.ConstantSchedule(), 3)
+    latest, steps = Latest(), Steps()
+    data = batches(tcfg.SyntheticConfig(), rows(tcfg.SyntheticConfig(), 2, 8), 32)
+    hooks = [Log(every=1, lr=lr, tokens=16), WeightNorm()]
+    trainer.fit(data, 3, hooks=hooks, sinks=[latest, steps])
+    assert trainer.step == 3
+    assert [s for s, _ in steps.reports] == [1, 2, 2, 3, 3]  # log, then weight norm
+    assert {"loss", "logit_l2", "grad_norm", "lr", "weight_norm"} <= set(latest.metrics)
+
+
+def test_a_run_reports_what_hooks_of_ones_own_return(tmp_path):
+    steps = Steps()
+    run = smoke("steps = 4")
+    last = train(
+        run, tmp_path, echo=lambda _: None, hooks=[WeightNorm()], sinks=[steps]
+    )
+    lines = (directory(run, tmp_path) / "metrics.jsonl").read_text().splitlines()
+    assert [s for s, keys in steps.reports if "weight_norm" in keys] == [2, 4]
+    assert sum("weight_norm" in json.loads(line) for line in lines) == 2
+    assert "weight_norm" in last and "loss" in last
 
 
 def test_the_command_line(tmp_path, capsys):

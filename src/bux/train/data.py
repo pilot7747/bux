@@ -6,6 +6,8 @@ source is an endless stream of rows, each epoch in a new order. Batch i holds ro
 i * n to (i + 1) * n of each source, n of them in proportion to its weight, so it
 depends only on the seed and i: a run that resumes at step i reads what it would
 have read had it never stopped.
+
+A source is found by its config's type in ``sources``.
 """
 
 import functools
@@ -21,6 +23,7 @@ import pyarrow.parquet as pq
 
 from bux.data.pipeline import DEFAULT_CACHE, Job
 from bux.train import config as tcfg
+from bux.train.registry import Registry
 
 
 class Batch(NamedTuple):
@@ -152,22 +155,24 @@ class Synthetic:
         return plain(rng.integers(0, self.vocab_size, (n, self.seq_len), np.int32))
 
 
-def source(
-    c: tcfg.Source,
-    t: tcfg.TrainConfig,
-    vocab_size: int,
-    cache: str | Path,
-    seed: tuple[int, ...],
-) -> Source:
-    match c:
-        case tcfg.TextConfig() | tcfg.ChatConfig():
-            folder = Path(cache) / Job.of(c, t).name
-            return Prepared(folder, vocab_size, t.seq_len, seed)
-        case tcfg.TokensConfig():
-            return Shards(c, t.seq_len, seed)
-        case tcfg.SyntheticConfig():
-            return Synthetic(vocab_size, t.seq_len, seed)
-    raise AssertionError(c)
+# A source's builder gets its config, the run's settings, the model's vocabulary size,
+# where prepared datasets are, and the seed of its stream.
+sources = Registry[Source]("data source", "bux.train.data.sources")
+
+
+@sources.register("text", "chat")
+def _(c: tcfg.TextConfig | tcfg.ChatConfig, t, vocab_size, cache, seed) -> Source:
+    return Prepared(Path(cache) / Job.of(c, t).name, vocab_size, t.seq_len, seed)
+
+
+@sources.register("tokens")
+def _(c: tcfg.TokensConfig, t, vocab_size, cache, seed) -> Source:
+    return Shards(c, t.seq_len, seed)
+
+
+@sources.register("synthetic")
+def _(c: tcfg.SyntheticConfig, t, vocab_size, cache, seed) -> Source:
+    return Synthetic(vocab_size, t.seq_len, seed)
 
 
 def apportion(weights: Sequence[float], n: int) -> list[int]:
@@ -201,12 +206,12 @@ def batches(
                 f"a batch of {t.batch} rows has no room for a source of weight "
                 f"{p.weight / sum(q.weight for q in parts):.3g}"
             )
-    sources = [
-        source(p.source, t, vocab_size, cache, (t.seed, stream, k))
+    streams = [
+        sources.build(p.source, t, vocab_size, cache, (t.seed, stream, k))
         for k, p in enumerate(parts)
     ]
     for i in itertools.count(start):
-        batch = Batch.concat([s.rows(i * n, n) for s, n in zip(sources, counts)])
+        batch = Batch.concat([s.rows(i * n, n) for s, n in zip(streams, counts)])
         if (top := int(batch.input_ids.max())) >= vocab_size:
             raise ValueError(
                 f"token id {top} is outside the vocabulary of {vocab_size}"

@@ -15,11 +15,14 @@ eval = eval(data=fineweb(split=[0.99, 1]))
 
 ```
 $ bux prepare experiments/speedrun.bux
-text-60ef0bc70e: 14,722,385 documents, ... tokens -> ... rows of 1024, 99.9% filled, ...
+text-0c8c782640: 14,720,729 documents, 10,248,316,202 tokens -> 10,022,812 rows of 1024, 99.9% filled, 99.7% targets, 0 tokens cut (175.2s)
+text-17a28baeab: 148,133 documents, 102,868,057 tokens -> 100,602 rows of 1024, 99.9% filled, 99.7% targets, 0 tokens cut (16.5s)
 ```
 
-`bux train` prepares what is missing first, so `bux prepare` is only a way to do it
-ahead, or elsewhere.
+That is the speedrun's FineWeb, 29 GB of Parquet, in under three minutes on 16 cores
+of a laptop, to 17 GB of rows; the 1% held out comes from the same files. `bux train`
+prepares what is missing first, so `bux prepare` is only a way to do it ahead, or
+elsewhere.
 
 ## Rows
 
@@ -127,8 +130,9 @@ engine delivered it in, plans its rows, and writes them a row group at a time.
 Both are functions over Arrow record batches, with nothing else to share, so any
 engine that speaks Arrow runs them. `bux.data.pipeline.prepare` runs them on this
 machine, in a process a core: the map spills each task's documents, sorted by key,
-to an Arrow file, about 5 bytes a token of scratch space next to the cache, and each
-reduce reads its key range out of every spill through memory maps.
+as raw arrays, about 5 bytes a token of scratch space next to the cache, and each
+reduce finds its key range in every spill by bisection and maps in its documents and
+nothing else, so that the shuffle reads every byte once.
 `bux.data.spark.prepare` runs them on Spark, as `mapInArrow` and `applyInArrow`
 (`uv sync --extra spark`):
 
@@ -151,7 +155,7 @@ tokenizer, the packing and `seq_len`. So a run finds the one it needs, a changed
 setting makes another, and a cache can be shared by runs and copied between machines:
 
 ```
-data/packed/text-60ef0bc70e/
+data/packed/text-0c8c782640/
     part-00000.parquet ...    rows; a row group of about a million tokens
     dataset.json              the job, its input files, the parts, statistics; written last
 ```

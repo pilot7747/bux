@@ -25,7 +25,7 @@ SCHEMA = pa.schema(
 )
 
 
-def _flat(column: pa.ChunkedArray) -> tuple[np.ndarray, np.ndarray]:
+def flat(column: pa.ChunkedArray) -> tuple[np.ndarray, np.ndarray]:
     """A list column's values end to end, and n + 1 offsets into them."""
     lists = column.cast(pa.large_list(column.type.value_type)).combine_chunks()
     offsets = lists.offsets.to_numpy()
@@ -44,8 +44,8 @@ class Docs:
     @classmethod
     def of(cls, table: pa.Table, length: int) -> Docs:
         table = table.sort_by("key")  # whatever order an engine delivered them in
-        ids, offsets = _flat(table["input_ids"])
-        mask, _ = _flat(table["loss_mask"])
+        ids, offsets = flat(table["input_ids"])
+        mask, _ = flat(table["loss_mask"])
         positions = np.arange(len(ids)) - np.repeat(offsets[:-1], np.diff(offsets))
         return cls(
             np.concatenate([ids, np.zeros(length, np.int32)]),
