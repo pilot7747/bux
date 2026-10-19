@@ -7,8 +7,9 @@ vocab_size = 163840
 
 norm    = rmsnorm(eps=1e-5)
 attn    = mla(num_heads=64, q_lora_rank=1536, kv_lora_rank=512,
-              rope=rope(base=50000, scaling=yarn(factor=64, original_max_len=4096,
-                                                 attention_factor_on=softmax)))
+              rope=rope(base=50000, layout=interleaved,
+                        scaling=yarn(factor=64, original_max_len=4096,
+                                     attention_factor_on=softmax)))
 dense   = gated_mlp(intermediate_size=18432, activation=swish)
 experts = moe(num_experts=384, top_k=8, num_shared_experts=1, router=sigmoid,
               routed_scaling_factor=2.827, load_balancing=aux_free,

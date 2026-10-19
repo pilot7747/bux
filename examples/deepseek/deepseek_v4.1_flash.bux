@@ -30,8 +30,9 @@ memory  = engram(head_dim=256, table_size=16000000, max_ngram_size=4, norm=norm,
 # Window-only layers keep the base RoPE; the others extend theirs with YaRN, but without
 # its attention factor: cos, sin and the 512 ** -0.5 softmax scale stay as they are.
 window = csa(num_heads=64, q_lora_rank=1280, o_lora_rank=1024, o_groups=8,
-             sliding_window_size=128, sinks=true, rope=rope(fraction=0.125))
-far    = rope(base=160000, fraction=0.125,
+             sliding_window_size=128, sinks=true,
+             rope=rope(fraction=0.125, layout=interleaved))
+far    = rope(base=160000, fraction=0.125, layout=interleaved,
               scaling=yarn(factor=16, original_max_len=65536, attention_factor=1))
 pairs  = window(compress_ratio=2, rope=far, indexer=indexer(num_heads=32, top_k=512))
 single = pairs(compress_ratio=1)

@@ -11,7 +11,8 @@ vocab_size = 154880
 
 norm    = rmsnorm(eps=1e-5)
 attn    = mla(num_heads=64, q_lora_rank=2048, kv_lora_rank=512, qk_nope_head_dim=192,
-              qk_rope_head_dim=64, v_head_dim=256, rope=rope(base=8000000),
+              qk_rope_head_dim=64, v_head_dim=256,
+              rope=rope(base=8000000, layout=interleaved),
               indexer=indexer(num_heads=32, head_dim=128, top_k=2048))
 dense   = gated_mlp(intermediate_size=12288, activation=swish)
 experts = moe(num_experts=256, top_k=8, num_shared_experts=1, router=sigmoid,

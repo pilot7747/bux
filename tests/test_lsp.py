@@ -43,7 +43,12 @@ def test_completes_the_settings_of_a_layer():
     assert got.index("num_kv_heads") < got.index("rope")  # required first
     # Through a definition, and while the statement is still unfinished.
     assert "sliding_window_size" in labels(PRELUDE + "x = attn(|\nmodel = embed head")
-    assert labels(PRELUDE + "x = gqa(rope.|)") == ["base", "fraction", "scaling"]
+    assert labels(PRELUDE + "x = gqa(rope.|)") == [
+        "base",
+        "fraction",
+        "layout",
+        "scaling",
+    ]
     item = next(
         c
         for c in features.complete(*cursor(PRELUDE + "x = gqa(|)"))

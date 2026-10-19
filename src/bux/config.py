@@ -92,6 +92,9 @@ class RoPEConfig(Config):
     base: float = 10000.0
     # Partial rotary: only this fraction of each head's dims is rotated (GLM, Qwen3-Next).
     fraction: float = 1.0
+    # Which rotated dims pair up: "half" turns dim i with i + dims / 2 (GPT-NeoX, Llama),
+    # "interleaved" turns dim 2i with 2i + 1 (GPT-J, Cohere).
+    layout: Literal["half", "interleaved"] = "half"
     scaling: RoPEScalingConfig | None = None
 
 

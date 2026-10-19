@@ -175,6 +175,20 @@ def test_yarn_matches_transformers():
     assert frequencies(mellum, 128)[1] == 1.2772588722239782
 
 
+def test_interleaved_rope_is_the_half_layout_with_the_rotated_dims_reordered():
+    # GPT-J and Cohere turn dims 2i and 2i + 1 together, where the half layout turns
+    # i and i + 4; here 8 of 16 dims are rotated, and the other 8 stay in place.
+    x = jax.random.normal(jax.random.key(0), (1, 5, 2, 16))
+    half = cfg.RoPEConfig(fraction=0.5)
+    interleaved = cfg.RoPEConfig(fraction=0.5, layout="interleaved")
+    order = jnp.concatenate(
+        [jnp.arange(8).reshape(2, 4).T.reshape(-1), jnp.arange(8, 16)]
+    )
+    assert jnp.allclose(
+        rotate(x[..., order], interleaved), rotate(x, half)[..., order], atol=1e-6
+    )
+
+
 def test_yarn_attention_factor_on_the_softmax_scale():
     def attn(on: str, head_dim: int) -> Attention:
         y = cfg.YaRNConfig(factor=40, original_max_len=4096, attention_factor_on=on)

@@ -53,12 +53,18 @@ def logit_gain(rope: cfg.RoPEConfig | None) -> float:
 
 
 def rotate(x: jax.Array, rope: cfg.RoPEConfig) -> jax.Array:
-    """Rotate the first `fraction` of each head's dims (half-split layout); x is (b, t, h, d)."""
+    """Rotate the first `fraction` of each head's dims, paired by `layout`; x is (b, t, h, d)."""
     dims = int(x.shape[-1] * rope.fraction) // 2 * 2
     if dims == 0:
         return x
     inv_freq, gain = frequencies(rope, dims)
     angles = jnp.arange(x.shape[1])[:, None] * inv_freq
     sin, cos = gain * jnp.sin(angles)[:, None, :], gain * jnp.cos(angles)[:, None, :]
-    x1, x2, rest = x[..., : dims // 2], x[..., dims // 2 : dims], x[..., dims:]
-    return jnp.concatenate([x1 * cos - x2 * sin, x2 * cos + x1 * sin, rest], -1)
+    x, rest = x[..., :dims], x[..., dims:]
+    if rope.layout == "interleaved":
+        x1, x2 = x[..., 0::2], x[..., 1::2]
+        y = jnp.stack([x1 * cos - x2 * sin, x2 * cos + x1 * sin], -1).reshape(x.shape)
+    else:
+        x1, x2 = x[..., : dims // 2], x[..., dims // 2 :]
+        y = jnp.concatenate([x1 * cos - x2 * sin, x2 * cos + x1 * sin], -1)
+    return jnp.concatenate([y, rest], -1)

@@ -1,0 +1,23 @@
+# North Mini Code 1.0 (Cohere, 2026): a 30B MoE with 3B active, for agentic coding,
+# with a 256K context. Every layer is a parallel block: attention and the FFN read the
+# same normalized input. Three sliding-window layers with RoPE per global layer with
+# no positional encoding, after a dense first layer whose global attention keeps RoPE.
+# The router keeps the top 8 of 128 experts by sigmoid score, without renormalizing
+# them, and there is no shared expert.
+d_model    = 2048
+vocab_size = 262144
+
+norm    = rmsnorm
+attn    = gqa(num_heads=32, num_kv_heads=4, head_dim=128,
+              rope=rope(base=50000, layout=interleaved))
+local   = attn(sliding_window_size=4096)
+global  = attn(rope=none)
+dense   = gated_mlp(intermediate_size=3072, activation=swish)
+experts = moe(num_experts=128, top_k=8, router=sigmoid, normalize_top_k=false,
+              expert=gated_mlp(intermediate_size=768, activation=swish))
+
+layer(mixer, ffn=experts) = [norm (mixer + ffn)]
+L = layer(local)
+G = layer(global)
+
+model = embed layer(attn, dense) "LLLG"^12 norm head(tied=true)

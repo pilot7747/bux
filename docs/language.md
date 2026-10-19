@@ -355,7 +355,7 @@ drawing can be edited directly.
 
 The example files at the top of `examples/` transcribe public configs from memory.
 Ones marked "-style" or "approximate" simplify details, so verify the numbers before
-relying on them. The folders, one per model family (`deepseek/`, `glm/`, `inkling/`,
-`kimi/`, `laguna/`, `mellum/`, `mimo/`, `muse/`, `nemotron/`, `qwen/`), transcribe
+relying on them. The folders, one per model family (`cohere/`, `deepseek/`, `glm/`,
+`inkling/`, `kimi/`, `laguna/`, `mellum/`, `mimo/`, `muse/`, `nemotron/`, `qwen/`), transcribe
 recent releases from their published `config.json` and modeling code. Their comments
 name what is left out (vision encoders, speculative drafters) or approximated.

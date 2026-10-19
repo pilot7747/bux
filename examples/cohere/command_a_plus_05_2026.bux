@@ -1,0 +1,24 @@
+# Command A+ (Cohere, 2026): the language model of a 218B MoE with 25B active, for
+# agentic, multilingual and reasoning work, with a 128K context. It keeps Command A's
+# layout: parallel blocks under one bias-free LayerNorm, and three sliding-window
+# layers with RoPE per global layer with no positional encoding. Each layer routes to
+# 8 of 128 experts by normalized sigmoid scores and runs 4 shared ones as one wide
+# MLP, then averages the two. A router bias balanced the experts in training, but the
+# released weights leave it out. The SigLIP vision encoder is not described here.
+d_model    = 4096
+vocab_size = 262144
+
+norm    = layernorm(eps=1e-5)
+attn    = gqa(num_heads=128, num_kv_heads=8, head_dim=128,
+              rope=rope(base=50000, layout=interleaved))
+local   = attn(sliding_window_size=4096)
+global  = attn(rope=none)
+experts = moe(num_experts=128, top_k=8, num_shared_experts=4, router=sigmoid,
+              load_balancing=aux_free,
+              expert=gated_mlp(intermediate_size=4096, activation=swish)) * 0.5
+
+layer(mixer) = [norm (mixer + experts)]
+L = layer(local)
+G = layer(global)
+
+model = embed "LLLG"^8 norm head(tied=true)

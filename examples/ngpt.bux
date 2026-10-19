@@ -6,7 +6,7 @@ vocab_size = 32000
 
 unit = rmsnorm(affine=false)
 step = scale(init=0.05, per_channel=true)
-attn = gqa(num_heads=16, num_kv_heads=16, rope=rope())
+attn = gqa(num_heads=16, num_kv_heads=16, rope=rope(layout=interleaved))
 ffn  = gated_mlp(intermediate_size=4096, activation=swish)
 
 block = [(attn unit - _) step] unit [(ffn unit - _) step] unit
