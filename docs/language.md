@@ -246,7 +246,7 @@ model = embed D ple "DDA" "DDDA"^11 @h out mtp      # = ... @h merge out $h next
 `Prod`, `Neg`, `Const`, `Identity`, `Repeat`, `Tap`, `Ref`), documented in
 `bux/lang/ir.py`. It is plain pydantic, so it serializes to JSON and goes into a
 checkpoint as-is. A backend is one function per node kind plus a registry of leaves.
-`bux/backend.py` is a working Flax NNX one. `Repeat` is kept rather than unrolled,
+`bux/architecture/` is a working Flax NNX one. `Repeat` is kept rather than unrolled,
 so a backend can `nnx.scan` over identical blocks.
 
 `bux.lang.printer.to_source(arch)` prints any IR back to readable source, including IR

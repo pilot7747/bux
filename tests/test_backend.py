@@ -6,17 +6,9 @@ import pytest
 from flax import nnx
 
 from bux import config as cfg
-from bux.backend import (
-    TOKENS,
-    Attention,
-    Context,
-    Engram,
-    Model,
-    _frequencies,
-    _ngram_rows,
-    _rope,
-    num_params,
-)
+from bux.architecture import TOKENS, Attention, Context, Engram, Model, num_params
+from bux.architecture.engram import _ngram_rows
+from bux.architecture.rope import frequencies, rotate
 from bux.lang import compile
 
 D, V, H, F = 32, 64, 4, 48
@@ -159,7 +151,7 @@ def test_yarn_matches_transformers():
     # the expected values come from transformers' _compute_yarn_parameters.
     yarn = cfg.YaRNConfig(factor=32, original_max_len=8192, beta_fast=64)
     rope = cfg.RoPEConfig(base=500000, fraction=0.5, scaling=yarn)
-    inv_freq, gain = _frequencies(rope, 64)
+    inv_freq, gain = frequencies(rope, 64)
     expected = {
         0: 1.0,
         6: 0.08539710193872452,
@@ -173,14 +165,14 @@ def test_yarn_matches_transformers():
         assert math.isclose(float(inv_freq[i]), v, rel_tol=2e-6)
     assert gain == 1.3465735902799727  # that config's attention_factor
     x = jnp.concatenate([jnp.ones(32), jnp.zeros(32), jnp.full(64, 7.0)])
-    y = _rope(jnp.broadcast_to(x, (1, 2, 1, 128)), rope)[0, 1, 0]  # position 1
+    y = rotate(jnp.broadcast_to(x, (1, 2, 1, 128)), rope)[0, 1, 0]  # position 1
     assert jnp.allclose(jnp.hypot(y[:32], y[32:64]), gain)  # cos and sin carry it
     assert jnp.allclose(jnp.arctan2(y[32:64], y[:32]), inv_freq, rtol=1e-5)
     assert (y[64:] == 7.0).all()  # the dims that are not rotated are untouched
     mellum = cfg.RoPEConfig(
         base=500000, scaling=cfg.YaRNConfig(factor=16, original_max_len=8192)
     )
-    assert _frequencies(mellum, 128)[1] == 1.2772588722239782
+    assert frequencies(mellum, 128)[1] == 1.2772588722239782
 
 
 def test_yarn_attention_factor_on_the_softmax_scale():
