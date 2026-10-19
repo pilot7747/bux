@@ -1,0 +1,22 @@
+# Qwen3.8-2.4T-A95B (Alibaba, 2026): the largest of the family, text only. The
+# Qwen3-Next layout at 4x the width and nearly 2x the depth: 23 x (3 Gated DeltaNet
+# layers, 1 gated attention layer), each followed by a MoE of 512 experts, 10 routed and
+# 1 gated shared expert active. One MTP layer, with the same MoE.
+d_model    = 8192
+vocab_size = 248320
+
+norm    = rmsnorm(zero_centered=true)
+delta   = gdn(num_heads=16, num_v_heads=128, head_dim=128)
+attn    = gqa(num_heads=64, num_kv_heads=4, head_dim=256, gated=true, qk_norm=norm,
+              rope=rope(base=10000000, fraction=0.25))
+experts = moe(num_experts=512, top_k=10, num_shared_experts=1, shared_expert_gate=true,
+              aux_loss_coef=1e-3, expert=gated_mlp(intermediate_size=2048, activation=swish))
+
+layer(mixer) = [norm mixer] [norm experts]
+D = layer(delta)
+A = layer(attn)
+
+shared out = head
+mtp = $h nextn(norm=norm) A norm out
+
+model = embed "DDDA"^23 norm @h out mtp

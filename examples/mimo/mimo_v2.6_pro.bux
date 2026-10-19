@@ -1,0 +1,29 @@
+# MiMo-V2.6-Pro (Xiaomi, 2026): a 1T MoE of 70 layers, most of them sliding-window
+# attention with a 128-token window and a learned sink per head. A global layer comes
+# every 7 or 8 layers, and the first layer is global and dense.
+#
+# Query and key heads are 192 wide and value heads 128; a third of each query and key
+# head is rotated, with a long RoPE base on global layers only. Three chained MTP
+# layers, sliding-window and dense, predict up to 3 tokens further ahead. Vision and
+# audio encoders are not described here.
+d_model    = 6144
+vocab_size = 152576
+
+norm    = rmsnorm(eps=1e-5)
+attn    = gqa(num_heads=128, num_kv_heads=8, head_dim=192, v_head_dim=128,
+              rope=rope(base=10000000, fraction=0.334))
+local   = attn(sliding_window_size=128, sinks=true, rope.base=10000)
+dense   = gated_mlp(intermediate_size=16384, activation=swish)
+experts = moe(num_experts=384, top_k=8, router=sigmoid, load_balancing=aux_free,
+              expert=gated_mlp(intermediate_size=2048, activation=swish))
+
+# The values are scaled by 0.612, about sqrt(d_model / (128 heads * 128)).
+layer(mixer, ffn=experts) = [norm (mixer * 0.612)] [norm ffn]
+F = layer(attn, dense)
+G = layer(attn)
+S = layer(local)
+
+shared out = head
+mtp = $h! nextn(norm=norm) layer(local, dense) @h norm out
+
+model = embed "F" "SSSSSS" "GSSSSSSS"^6 "GSSSSSS"^2 "G" norm @h out mtp^3

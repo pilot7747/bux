@@ -1,0 +1,35 @@
+# Muse Spark Open 816B-A42B (Meta, 2026): 62 MoE layers. As in Llama 4, whose vocabulary
+# it uses, three local layers with RoPE run for every global layer without positional
+# encoding; here the local layers attend to a sliding window. What is new:
+#
+#   - a variance-preserving residual gate instead of the plain sum: a branch is mixed
+#     in as a * x + b * f(x), with a^2 + b^2 = 1 for every channel;
+#   - every branch output is normalized again, and the attention output also per head,
+#     before its sigmoid gate;
+#   - the 256 experts (8 active, none shared) work in a 4096-wide pool, normalized on
+#     the way in and after every expert, while the router sees the full width.
+#
+# The config is gated. The README gives the sizes, and the checkpoint's parameter counts
+# confirm them; the window, the RoPE base, the norm epsilons and the logit soft-cap are
+# transformers' defaults for muse_spark. Vision and audio encoders are not described.
+d_model     = 8192
+vocab_size  = 202048
+residual    = vpgate(temperature=0.3)
+logit_scale = (256 / d_model)^0.5
+
+norm    = rmsnorm(eps=1e-5, zero_centered=true)
+bare    = rmsnorm(eps=1e-5, affine=false)
+post    = rmsnorm(eps=1e-8, affine=false)
+rescale = rmsnorm(eps=1e-8, zero_centered=true, scale_input=true)
+attn    = gqa(num_heads=128, num_kv_heads=16, head_dim=64, qk_norm=bare, scale=0.68412581,
+              gated=true, output_norm=bare)
+local   = attn(sliding_window_size=2048, rope=rope(base=500000))
+experts = moe(num_experts=256, top_k=8, router=sigmoid, load_balancing=aux_free,
+              latent_size=4096, latent_input_norm=norm, expert_norm=rescale,
+              expert=gated_mlp(intermediate_size=4096, activation=swish))
+
+layer(mixer) = [norm mixer post] [norm experts rescale]
+L = layer(local)
+G = layer(attn)
+
+model = embed bare "LG" "LLLG"^15 (rmsnorm(eps=1e-5) * logit_scale) head(softcap=20)

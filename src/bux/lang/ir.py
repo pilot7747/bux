@@ -25,7 +25,7 @@ from typing import Annotated, Literal
 
 from pydantic import BaseModel, ConfigDict, Field
 
-from bux.config import HyperConnectionsConfig, LayerConfig
+from bux.config import LayerConfig, ResidualConfig
 
 Width = int | Literal["tokens", "logits"]
 
@@ -121,7 +121,7 @@ class Architecture(BaseModel):
     d_model: int
     vocab_size: int | None = None
     # None: plain additive residuals.
-    residual: HyperConnectionsConfig | None = None
+    residual: ResidualConfig | None = None
     graph: Node
 
     def layers(self) -> Iterator[Layer]:
@@ -174,13 +174,23 @@ def replace_children(node: Node, new: tuple[Node, ...]) -> Node:
 
 
 def strip(node: Node, *, labels: bool = True, widths: bool = True) -> Node:
-    """The node without display labels and/or inferred widths, for structural comparison."""
+    """The node without display labels and/or inferred widths, for structural comparison.
+
+    Without labels, a sequence directly inside a sequence (a sum inside a sum, a product
+    inside a product) is flattened into it, as the compiler does with unlabeled groups.
+    """
     update: dict[str, object] = {}
     if labels:
         update["label"] = None
     if widths and isinstance(node, Layer):
         update["width"] = None
-    node = replace_children(
-        node, tuple(strip(c, labels=labels, widths=widths) for c in children(node))
-    )
+    kids = tuple(strip(c, labels=labels, widths=widths) for c in children(node))
+    if labels and isinstance(node, Seq | Sum | Prod):
+        same = type(node)
+        kids = tuple(
+            k
+            for c in kids
+            for k in (children(c) if type(c) is same and c.share is None else (c,))
+        )
+    node = replace_children(node, kids)
     return node.model_copy(update=update)

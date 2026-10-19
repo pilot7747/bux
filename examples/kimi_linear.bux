@@ -5,7 +5,7 @@ d_model    = 2304
 vocab_size = 163840
 
 norm    = rmsnorm
-kda     = kda(num_heads=32, head_dim=128)
+kda     = kda(num_heads=32, head_dim=128, output_gate_rank=128)
 mla     = mla(num_heads=32, kv_lora_rank=512, rope=none)
 dense   = gated_mlp(intermediate_size=9216, activation=swish)
 experts = moe(num_experts=256, top_k=8, num_shared_experts=1, router=sigmoid,

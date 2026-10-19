@@ -1,0 +1,35 @@
+# NVIDIA Nemotron 3.5 Bolt 74B-A9B (2026): the language model of a vision-language
+# model built to run in 24GB with native 2-bit weights. It is the Nemotron 3 hybrid
+# (Mamba-2, LatentMoE and attention layers, each a single mixer in a pre-norm
+# residual, no positional encoding), compressed with Puzzle neural architecture search.
+#
+# The search kept the Mamba-2 and attention layers and resized every MoE layer on its
+# own: 240 to 496 experts, 1536 to 2560 wide, always 9 active in a 1024-wide latent.
+# There is no MTP, and the vision encoder is not described here.
+d_model    = 4096
+vocab_size = 131072
+
+norm    = rmsnorm(eps=1e-5)
+ssm     = mamba2(state_size=128, head_dim=64, num_groups=8)
+attn    = gqa(num_heads=32, num_kv_heads=2, head_dim=128)
+experts = moe(num_experts=240, top_k=9, num_shared_experts=1, router=sigmoid,
+              routed_scaling_factor=5.0, load_balancing=aux_free, latent_size=1024,
+              expert=mlp(intermediate_size=2048, activation=relu2),
+              shared_expert=mlp(intermediate_size=5376, activation=relu2))
+
+M = [norm ssm]
+A = [norm attn]
+E(n, width) = [norm experts(num_experts=n, expert.intermediate_size=width)]
+
+# One line per attention layer.
+model = embed
+        M E(240, 2048) M E(240, 1536) M E(240, 2048) M A
+        E(304, 2304) M E(240, 2304) M E(240, 2048) M E(240, 2048) M A
+        E(304, 2304) M E(304, 2048) M E(432, 2560) M E(432, 2304) M A
+        E(240, 2048) M E(432, 2304) M E(304, 2560) M E(304, 2304) M E(432, 2304) M A
+        E(368, 2304) M E(368, 2048) M E(368, 2304) M E(432, 2560) M E(368, 2560) M A
+        E(496, 2560) M E(432, 2560) M E(240, 2304) M E(368, 2304) M E(368, 2560) M A
+        E(304, 2048) M E(240, 2304) M E(240, 2304) M E(240, 2048) M E(240, 2048) M A
+        E(368, 2048) M E(368, 2304) M E(432, 2304) M E(432, 2560) M A
+        E(496, 2560) M E(432, 2560) M E(432, 2560) M E(496, 2560) M E(368, 2560)
+        norm head

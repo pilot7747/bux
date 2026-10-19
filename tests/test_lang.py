@@ -7,7 +7,7 @@ from bux.lang import Architecture, BuxError, check, compile, ir
 from bux.lang.printer import to_source
 from bux.lang.render import render
 
-EXAMPLES = sorted(Path(__file__).parent.parent.joinpath("examples").glob("*.bux"))
+EXAMPLES = sorted(Path(__file__).parent.parent.joinpath("examples").rglob("*.bux"))
 
 PRELUDE = """
 d_model = 16
@@ -363,6 +363,43 @@ def test_shared_blocks_must_agree_on_width():
     assert "different widths" in err.message
 
 
+def test_heads_are_outputs_and_mtp_reads_on_from_a_tap():
+    a = build(
+        "shared out = head\n"
+        "mtp = $h! nextn [norm attn] @h norm out\n"
+        "model = embed [norm attn] norm @h out mtp^2"
+    )
+    kinds = [layer.config.type for layer in a.layers()]
+    assert kinds.count("head") == 3 and kinds.count("nextn") == 2
+    err = error("model = embed head norm")
+    assert "follow the LM head" in err.message and "$h" in (err.hint or "")
+    assert "exactly one embedding" in error("b = nextn", entry="b").message
+
+
+def test_residual_algebras_and_their_errors():
+    for setting in (
+        "mhc(expansion=4)",
+        "gr(rank=4)",
+        "attnres(block_size=2)",
+        "vpgate",
+    ):
+        a = build(f"residual = {setting}\nmodel = embed [norm attn] [norm ffn] head")
+        assert a.residual is not None and a.residual.type == setting.split("(")[0]
+    err = error("residual = rope()\nmodel = embed head")
+    assert "hc(...)" in err.message and "vpgate(...)" in err.message
+
+
+def test_attention_shares_indexer_selections_through_a_port():
+    a = build(
+        "a = mla(num_heads=2, indexer=indexer(num_heads=2, head_dim=4, top_k=8))\n"
+        "model = embed [norm a(index=@k)] [norm a(index=$k)] head"
+    )
+    assert [p.mode for layer in a.layers() for p in layer.ports] == ["write", "read"]
+    assert (
+        "ports: index" in error("model = embed [mla(num_heads=2, kv=@x)] head").message
+    )
+
+
 # --- Errors -------------------------------------------------------------------------
 
 
@@ -417,6 +454,13 @@ def test_render_draws_residual_branches_under_the_stream():
 def test_printer_keeps_negation_inside_sequences_unary():
     arch = build("model = embed (-attn) [ffn] head")
     assert "embed (-attn) [ffn] head" in to_source(arch)
+
+
+def test_a_macro_call_in_a_sequence_prints_inline_and_round_trips():
+    arch = build("layer(f) = [norm f] [norm ffn]\nmodel = embed layer(attn) norm head")
+    source = to_source(arch)
+    assert "model = embed [norm attn] [norm ffn] norm head" in source
+    assert ir.strip(compile(source).graph) == ir.strip(arch.graph)
 
 
 FUZZ_PIECES = [

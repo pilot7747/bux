@@ -1,0 +1,19 @@
+# Mellum2-12B-A2.5B-Thinking (JetBrains, 2026): the reasoning model of the Mellum 2
+# family, a 12B MoE with 2.5B active. Three sliding-window layers per global layer, all
+# with QK-norm; only the global layers stretch RoPE with YaRN, to 128K tokens. Every
+# layer routes to 8 of 64 small experts, with no shared expert.
+d_model    = 2304
+vocab_size = 98304
+
+norm    = rmsnorm
+attn    = gqa(num_heads=32, num_kv_heads=4, head_dim=128, qk_norm=norm, rope=rope(base=500000))
+local   = attn(sliding_window_size=1024)
+global  = attn(rope.scaling=yarn(factor=16, original_max_len=8192))
+experts = moe(num_experts=64, top_k=8, aux_loss_coef=1e-3,
+              expert=gated_mlp(intermediate_size=896, activation=swish))
+
+layer(mixer) = [norm mixer] [norm experts]
+L = layer(local)
+G = layer(global)
+
+model = embed "LLLG"^7 norm head

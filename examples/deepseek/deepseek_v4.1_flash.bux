@@ -1,0 +1,47 @@
+# DeepSeek-V4.1-Flash (DeepSeek, 2026): 552B parameters, 16B active, in 40 MoE layers on
+# a 4-way manifold-constrained hyper-connection stream.
+#
+# Attention is compressed sparse attention (CSA): 64 query heads share a single 512-wide
+# latent that is both key and value. Each query sees a 128-token window plus the top 512
+# compressed latents that an indexer picks. Only a few layers compress latents and run the
+# indexer; the ones after them reuse both through ports.
+#
+#   - layers 0-1: window only;
+#   - layers 2-19: every pair of tokens is pooled into one latent; layers 2, 8 and 14
+#     compute the latents and the top-k, and the next five layers reuse them;
+#   - layers 20-39: one latent per token, all computed by layer 20. Every fourth layer
+#     from 24 re-runs only the indexer, inside a coarse candidate pool from layer 20.
+#
+# Engram, a hashed n-gram memory of 196B parameters, sits before layers 1 and 14. In the
+# model it gates each of the 4 streams separately. Experts are clamped SwiGLUs scored by
+# sqrt(softplus(.)). The 3 MTP blocks are a speculative drafter trained afterwards on the
+# frozen model, so they are not part of it here; neither is the vision encoder.
+d_model    = 5120
+vocab_size = 129280
+residual   = mhc(expansion=4)
+
+norm    = rmsnorm(eps=1e-20)
+experts = moe(num_experts=384, top_k=6, num_shared_experts=1, router=sqrtsoftplus,
+              routed_scaling_factor=1.5, load_balancing=aux_free,
+              expert=gated_mlp(intermediate_size=2304, activation=swish, limit=10))
+memory  = engram(head_dim=256, table_size=16000000, max_ngram_size=4, conv_size=none,
+                 vocab_classes=99092)
+
+# Window-only layers keep the base RoPE; the others extend theirs with YaRN.
+window = csa(num_heads=64, q_lora_rank=1280, o_lora_rank=1024, o_groups=8,
+             sliding_window_size=128, sinks=true, rope=rope(fraction=0.125))
+far    = rope(base=160000, fraction=0.125, scaling=yarn(factor=16, original_max_len=65536))
+pairs  = window(compress_ratio=2, rope=far, indexer=indexer(num_heads=32, top_k=512))
+single = pairs(compress_ratio=1)
+
+layer(mixer) = [norm mixer] [norm experts]
+W = layer(window)
+P = layer(pairs(kv=@kv, index=@topk))                    # compresses, indexes
+p = layer(pairs(kv=$kv, index=$topk))                    # reuses the last P
+S = layer(single(kv=@kv, index=@topk, candidates=@pool))
+s = layer(single(kv=$kv, index=$topk))
+I = layer(single(kv=$kv, index=@topk, candidates=$pool))  # re-indexes within the pool
+
+model = embed W [memory] W "Pppppp"^2 [memory] "Pppppp"
+        "Ssss" "Isss"^4
+        norm head

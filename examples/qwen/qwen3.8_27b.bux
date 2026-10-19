@@ -1,0 +1,21 @@
+# Qwen3.8-27B (Alibaba, 2026): a dense model of the family. As in Qwen3-Next, three
+# Gated DeltaNet layers run for every gated attention layer, but here every layer has
+# a dense SwiGLU MLP. One MTP layer predicts the token after next. The vision encoder
+# is not described here.
+d_model    = 5120
+vocab_size = 248320
+
+norm  = rmsnorm(zero_centered=true)
+delta = gdn(num_heads=16, num_v_heads=48, head_dim=128)
+attn  = gqa(num_heads=24, num_kv_heads=4, head_dim=256, gated=true, qk_norm=norm,
+            rope=rope(base=10000000, fraction=0.25))
+ffn   = gated_mlp(intermediate_size=17408, activation=swish)
+
+layer(mixer) = [norm mixer] [norm ffn]
+D = layer(delta)
+A = layer(attn)
+
+shared out = head
+mtp = $h nextn(norm=norm) A norm out
+
+model = embed "DDDA"^16 norm @h out mtp

@@ -1,0 +1,26 @@
+# NVIDIA Nemotron 3 Ultra 550B-A55B (2026): a Mamba-2 / Transformer hybrid MoE. Every
+# layer is a single mixer in a pre-norm residual: Mamba-2 and MoE layers alternate, with
+# an attention layer every 7 to 9 layers and no positional encoding anywhere.
+#
+# LatentMoE: the 512 ReLU^2 experts (22 active) work in a 2048-wide latent space, while
+# the router and the shared expert see the full 8192. One MTP module (an attention and a
+# MoE layer) predicts the token after next.
+d_model    = 8192
+vocab_size = 131072
+
+norm    = rmsnorm(eps=1e-5)
+ssm     = mamba2(state_size=128, head_dim=64, num_groups=8)
+attn    = gqa(num_heads=64, num_kv_heads=2, head_dim=128)
+experts = moe(num_experts=512, top_k=22, num_shared_experts=1, router=sigmoid,
+              routed_scaling_factor=5.0, load_balancing=aux_free, latent_size=2048,
+              expert=mlp(intermediate_size=5120, activation=relu2),
+              shared_expert=mlp(intermediate_size=10240, activation=relu2))
+
+M = [norm ssm]
+E = [norm experts]
+A = [norm attn]
+
+shared out = head
+mtp = $h nextn(norm=norm) A E norm out
+
+model = embed ("MEMEMEMAE" "MEMEMAE" "MEMEMEMAE")^4 "MEMEMEME" norm @h out mtp

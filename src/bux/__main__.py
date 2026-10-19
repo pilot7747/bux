@@ -5,7 +5,7 @@ import sys
 from collections import Counter
 
 from bux.lang import Architecture, check
-from bux.lang.printer import to_source
+from bux.lang.printer import config_to_source, to_source
 from bux.lang.render import render
 
 
@@ -15,7 +15,7 @@ def summary(arch: Architecture) -> str:
         f"d_model={arch.d_model} vocab_size={arch.vocab_size} layers={counts.total()}"
     )
     if arch.residual is not None:
-        head += f" residual={arch.residual.type}(expansion={arch.residual.expansion})"
+        head += f" residual={config_to_source(arch.residual)}"
     return head + "\n" + "  ".join(f"{t}×{n}" for t, n in counts.most_common())
 
 

@@ -1,0 +1,18 @@
+# Kimi K2.5 (Moonshot AI, 2026): the language model of Kimi K2, 1T parameters with 32B
+# active, under a MoonViT vision encoder that is not described here. The DeepSeek-V3
+# layout with half the attention heads, 384 experts in one group, a single dense layer,
+# no MTP, and a 64x YaRN extension of a 4K base context.
+d_model    = 7168
+vocab_size = 163840
+
+norm    = rmsnorm(eps=1e-5)
+attn    = mla(num_heads=64, q_lora_rank=1536, kv_lora_rank=512,
+              rope=rope(base=50000, scaling=yarn(factor=64, original_max_len=4096)))
+dense   = gated_mlp(intermediate_size=18432, activation=swish)
+experts = moe(num_experts=384, top_k=8, num_shared_experts=1, router=sigmoid,
+              routed_scaling_factor=2.827, load_balancing=aux_free,
+              expert=gated_mlp(intermediate_size=2048, activation=swish))
+
+layer(ffn) = [norm attn] [norm ffn]
+
+model = embed layer(dense) layer(experts)^60 norm head

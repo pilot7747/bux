@@ -1,0 +1,37 @@
+# Qwen3.8-Flash-Next (Alibaba, 2026): a small model that tries three new things
+# on top of the Qwen3-Next layout (12 x 3 Gated DeltaNet : 1 gated attention, all MoE).
+#
+#   - A gated residual (GR) stream of 4 copies replaces both the plain residual and the
+#     pre-norms: each branch reads a gated mean of the normalized copies and writes its
+#     output back to each copy with a weight of its own. The read before the head
+#     replaces the final norm.
+#   - Per-layer embeddings (PLE) before the second layer: 51B parameters of hashed
+#     bigram and trigram embeddings, gated by the stream, as in Engram.
+#   - Every attention layer is sparse (QSA): a 4-head indexer scores keys pooled in
+#     blocks of 4 and keeps the best 2048 keys per query.
+#
+# The Gated DeltaNet output gate is a sigmoid here, not a swish. The MTP layer fuses the
+# next token's embedding into each copy of the stream, which nextn approximates. The
+# vision encoder is not described here.
+d_model    = 2560
+vocab_size = 248320
+residual   = gr(expansion=4, rank=320)
+
+norm    = rmsnorm(zero_centered=true)
+delta   = gdn(num_heads=16, num_v_heads=48, head_dim=128, output_gate=sigmoid)
+attn    = gqa(num_heads=24, num_kv_heads=2, head_dim=256, gated=true, qk_norm=norm,
+              rope=rope(base=10000000, fraction=0.25),
+              indexer=indexer(num_heads=4, head_dim=128, top_k=2048, block_size=4,
+                              weighted=false))
+experts = moe(num_experts=512, top_k=10, num_shared_experts=1, shared_expert_gate=true,
+              aux_loss_coef=1e-3, expert=gated_mlp(intermediate_size=640, activation=swish))
+ple     = engram(head_dim=160, table_size=20000000, max_ngram_size=3)
+
+layer(mixer) = [mixer] [experts]
+D = layer(delta)
+A = layer(attn)
+
+shared out = head
+mtp = $h nextn(norm=norm) A out
+
+model = embed D [ple] "DDA" "DDDA"^11 @h out mtp

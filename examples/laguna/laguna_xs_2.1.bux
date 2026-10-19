@@ -1,0 +1,24 @@
+# Laguna XS 2.1 (Poolside, 2026): a 33B MoE with 3B active, for agentic coding. Three
+# sliding-window layers per global layer, after a global first layer. The two kinds
+# differ in more than the window: global layers have 48 heads and rotate half of each
+# head with a YaRN-stretched RoPE, sliding layers 64 heads and a plain full RoPE. Every
+# head's output is scaled by a softplus gate of its own. The first layer is dense.
+d_model    = 2048
+vocab_size = 100352
+
+norm    = rmsnorm
+attn    = gqa(num_heads=64, num_kv_heads=8, head_dim=128, qk_norm=norm,
+              gated=true, gate_per_head=true, gate_activation=softplus)
+global  = attn(num_heads=48, rope=rope(base=500000, fraction=0.5,
+               scaling=yarn(factor=32, original_max_len=8192, beta_fast=64)))
+local   = attn(sliding_window_size=512, rope=rope())
+dense   = gated_mlp(intermediate_size=8192, activation=swish)
+experts = moe(num_experts=256, top_k=8, num_shared_experts=1, router=sigmoid,
+              routed_scaling_factor=2.5, load_balancing=aux_free,
+              expert=gated_mlp(intermediate_size=512, activation=swish))
+
+layer(mixer, ffn=experts) = [norm mixer] [norm ffn]
+G = layer(global)
+L = layer(local)
+
+model = embed layer(global, dense) "LLL" "GLLL"^9 norm head

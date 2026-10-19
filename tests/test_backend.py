@@ -81,6 +81,51 @@ def test_wiring_runs(body):
     assert logits.shape == (2, 8, V) and bool(jnp.isfinite(logits).all())
 
 
+def test_every_head_is_an_output_and_nextn_looks_one_token_further():
+    m = model(
+        "shared out = head\n"
+        "mtp = $h! nextn [norm attn] [norm ffn] @h norm out\n"
+        "model = embed [norm attn] [norm ffn] norm @h out mtp^2"
+    )
+    t = tokens()
+    changed = t.at[:, 5].set((t[:, 5] + 1) % V)
+    before, after = m.outputs(t), m.outputs(changed)
+    assert len(before) == 3 and jnp.allclose(m(t), before[0])
+    # The head after k nextn layers sees k tokens past its position.
+    for k, (a, b) in enumerate(zip(before, after)):
+        assert jnp.allclose(a[:, : 5 - k], b[:, : 5 - k], atol=1e-5)
+        assert not jnp.allclose(a[:, 5 - k], b[:, 5 - k])
+
+
+@pytest.mark.parametrize(
+    "body",
+    [
+        # LatentMoE with sqrtsoftplus routing, clamped and soft-capped experts
+        (
+            "e = moe(num_experts=4, top_k=2, num_shared_experts=1, router=sqrtsoftplus,"
+            " latent_size=16, latent_input_norm=norm, latent_output_norm=norm,"
+            " expert_norm=rmsnorm(scale_input=true),"
+            " expert=gated_mlp(intermediate_size=24, activation=situ, limit=5,"
+            " up_softcap=8))\n"
+            "model = embed [norm e] norm head"
+        ),
+        # per-head softplus gates, narrow values, output norm, relative bias,
+        # log-length scaling and convolved keys and values
+        (
+            "a = gqa(num_heads=4, num_kv_heads=2, head_dim=8, v_head_dim=4, gated=true,"
+            " gate_per_head=true, gate_activation=softplus, output_norm=norm,"
+            " relative_bias=relbias(rank=2, extent=4), log_scale=0.1,"
+            " log_scale_floor=2, kv_conv_size=3)\n"
+            "model = embed [norm a] [norm ffn [conv]] norm head"
+        ),
+    ],
+    ids=["latent_moe", "attention_options"],
+)
+def test_new_layer_options_run(body):
+    logits = model(body)(tokens())
+    assert logits.shape == (2, 8, V) and bool(jnp.isfinite(logits).all())
+
+
 def test_unregistered_layers_say_how_to_add_them():
     with pytest.raises(NotImplementedError, match=r"register\('gdn'\)"):
         model("model = embed [norm gdn(num_heads=2, head_dim=8)] head")

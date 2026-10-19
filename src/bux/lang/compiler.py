@@ -37,6 +37,7 @@ def _tags(union: object) -> dict[str, type[cfg.Config]]:
 LAYERS = _tags(cfg.LayerConfig)
 TYPES = LAYERS | _tags(cfg.SubConfig)
 ACTIVATIONS = frozenset(typing.get_args(cfg.Activation))
+RESIDUALS = _tags(cfg.ResidualConfig)
 SETTINGS = ("d_model", "vocab_size", "residual")
 
 
@@ -714,7 +715,8 @@ class _Lowering:
         self.shared: dict[str, ir.Node] = {}
         self.where: list[Span] = []
         self.embeddings = 0
-        self.tied: list[Span] = []
+        # Layers that reuse the embedding matrix (tied heads, nextn), with their spans.
+        self.borrowers: list[tuple[str, Span]] = []
         self.heads = 0
 
     def error(self, message: str, hint: str | None = None) -> BuxError:
@@ -740,10 +742,10 @@ class _Lowering:
             else self.d_model
         )
         typed, _ = self.lower(graph, width)
-        if self.tied and self.embeddings != 1:
+        if self.borrowers and self.embeddings != 1:
+            what, span = self.borrowers[0]
             raise BuxError(
-                f"a tied head needs exactly one embedding, found {self.embeddings}",
-                self.tied[0],
+                f"{what} needs exactly one embedding, found {self.embeddings}", span
             )
         return typed
 
@@ -880,7 +882,10 @@ class _Lowering:
         config = node.config
         out: ir.Width
         if width == "logits":
-            raise self.error("nothing can follow the LM head")
+            raise self.error(
+                "nothing can follow the LM head",
+                "to go on after a head, read a tap: @h norm head $h ...",
+            )
         if config.type == "embed":
             if width != "tokens":
                 raise self.error("an embedding takes token ids, so it must come first")
@@ -894,11 +899,13 @@ class _Lowering:
         elif isinstance(config, cfg.LMHeadConfig):
             self.heads += 1
             if config.tied and self.where:
-                self.tied.append(self.where[-1])
+                self.borrowers.append(("a tied head", self.where[-1]))
             out = "logits"
         elif isinstance(config, cfg.LinearConfig):
             out = config.features
         else:
+            if isinstance(config, cfg.NextNConfig) and self.where:
+                self.borrowers.append(("nextn", self.where[-1]))
             out = width
         for port in sorted(node.ports, key=lambda p: p.mode == "write"):
             if port.mode == "write":
@@ -928,11 +935,15 @@ def _compile(ev: _Evaluator, entry: str) -> ir.Architecture:
     settings = {}
     for name in SETTINGS:
         value, span = ev.setting(name)
-        expected = cfg.HyperConnectionsConfig if name == "residual" else int
+        expected = tuple(RESIDUALS.values()) if name == "residual" else int
         if value is not None and (
             not isinstance(value, expected) or isinstance(value, bool)
         ):
-            kind = "hc(...) or mhc(...)" if name == "residual" else "an integer"
+            kind = (
+                " or ".join(f"{t}(...)" for t in RESIDUALS)
+                if name == "residual"
+                else "an integer"
+            )
             raise BuxError(f"'{name}' must be {kind}, found {_describe(value)}", span)
         settings[name] = value
     if settings["d_model"] is None:
@@ -945,7 +956,7 @@ def _compile(ev: _Evaluator, entry: str) -> ir.Architecture:
     return ir.Architecture(
         d_model=typing.cast(int, settings["d_model"]),
         vocab_size=typing.cast(int | None, settings["vocab_size"]),
-        residual=typing.cast(cfg.HyperConnectionsConfig | None, settings["residual"]),
+        residual=typing.cast(cfg.ResidualConfig | None, settings["residual"]),
         graph=graph,
     )
 

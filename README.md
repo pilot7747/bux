@@ -17,9 +17,10 @@ uv run bux check examples/gpt2.bux
 uv run bux render examples/gpt2.bux
 ```
 
-Explore the [example architectures](examples/) and the
-[language guide](docs/language.md) for composition, residual connections, parameter
-sharing, and editor support.
+Explore the [example architectures](examples/), from GPT-2 to recent releases
+grouped by model family (DeepSeek, GLM, Inkling, Kimi, Laguna, Mellum, MiMo, Muse,
+Nemotron, Qwen), and the [language guide](docs/language.md) for composition, residual
+connections, parameter sharing, and editor support.
 
 Run the tests with `uv run pytest`.
 

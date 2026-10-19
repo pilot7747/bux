@@ -1,0 +1,21 @@
+# DeepSeek-V3.2-Exp (DeepSeek, 2025): DeepSeek-V3.1-Terminus with DeepSeek Sparse
+# Attention. A lightning indexer in every layer, the MTP layer included, scores all
+# earlier keys cheaply, and MLA attends to the top 2048 of them only. Everything else
+# is the DeepSeek-V3 architecture (see deepseek_r1.bux).
+d_model    = 7168
+vocab_size = 129280
+
+norm    = rmsnorm
+attn    = mla(num_heads=128, q_lora_rank=1536, kv_lora_rank=512, indexer=indexer(top_k=2048),
+              rope=rope(scaling=yarn(factor=40, original_max_len=4096)))
+dense   = gated_mlp(intermediate_size=18432, activation=swish)
+experts = moe(num_experts=256, top_k=8, num_shared_experts=1, router=sigmoid,
+              routed_scaling_factor=2.5, num_groups=8, top_k_groups=4, load_balancing=aux_free,
+              expert=gated_mlp(intermediate_size=2048, activation=swish))
+
+layer(ffn) = [norm attn] [norm ffn]
+
+shared out = head
+mtp = $h nextn layer(experts) norm out
+
+model = embed layer(dense)^3 layer(experts)^58 norm @h out mtp

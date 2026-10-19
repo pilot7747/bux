@@ -9,7 +9,7 @@ import pytest
 
 from bux.lang.lsp import features
 
-EXAMPLES = sorted(Path(__file__).parent.parent.joinpath("examples").glob("*.bux"))
+EXAMPLES = sorted(Path(__file__).parent.parent.joinpath("examples").rglob("*.bux"))
 
 PRELUDE = """d_model = 16
 vocab_size = 32

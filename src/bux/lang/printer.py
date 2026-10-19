@@ -80,8 +80,11 @@ class _Printer:
         sections = [settings, self.leaves, self.blocks, [model]]
         return "\n\n".join("\n".join(lines) for lines in sections if lines) + "\n"
 
+    def name(self, node: ir.Node) -> str | None:
+        return self.names.get(_key(node)) if node.label is not None else None
+
     def reference(self, node: ir.Node) -> str | None:
-        name = self.names.get(_key(node)) if node.label is not None else None
+        name = self.name(node)
         if name is None or name in self.emitted:
             return name
         self.emitted.add(name)
@@ -105,7 +108,7 @@ class _Printer:
                 # Only the first item may start with "-": `a -b` would read as a - b.
                 parts = [
                     self.wrap(item, UNARY if i == 0 else POWER)
-                    for i, item in enumerate(items)
+                    for i, item in enumerate(self.spliced(items))
                 ]
                 return " ".join(parts), SEQ
             case ir.Residual(body=body):
@@ -138,6 +141,16 @@ class _Printer:
             case ir.Ref(name=name, pop=pop):
                 return f"${name}{'!' if pop else ''}", ATOM
         raise AssertionError(node)
+
+    def spliced(self, items: tuple[ir.Node, ...]) -> list[ir.Node]:
+        """Unnamed sequences inside a sequence, such as macro calls, print inline."""
+        out: list[ir.Node] = []
+        for item in items:
+            if isinstance(item, ir.Seq) and self.name(item) is None:
+                out += self.spliced(item.items)
+            else:
+                out.append(item)
+        return out
 
     def wrap(self, node: ir.Node, min_prec: int) -> str:
         text, prec = self.expr(node)

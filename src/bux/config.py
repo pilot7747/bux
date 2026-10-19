@@ -20,7 +20,10 @@ class Config(BaseModel):
     ports: ClassVar[frozenset[str]] = frozenset()
 
 
-Activation = Literal["relu", "relu2", "gelu", "gelu_tanh", "swish", "sigmoid", "tanh"]
+# situ is 4 * tanh(x / 4) * sigmoid(x): SiLU with its linear factor soft-capped (Kimi K3).
+Activation = Literal[
+    "relu", "relu2", "gelu", "gelu_tanh", "swish", "sigmoid", "tanh", "softplus", "situ"
+]
 
 
 # --- Normalization ------------------------------------------------------------
@@ -33,6 +36,7 @@ class NormalizationConfig(Config):
     bias: bool = False  # layernorm only
     # Scale parametrized as (1 + w) with w initialized at 0 (Gemma, Qwen3-Next).
     zero_centered: bool = False
+    scale_input: bool = False  # scale before normalizing, norm(w * x) (Muse Spark)
 
 
 class DyTConfig(Config):
@@ -84,6 +88,15 @@ class RoPEConfig(Config):
     scaling: RoPEScalingConfig | None = None
 
 
+class RelativeBiasConfig(Config):
+    """Data-dependent relative position bias (Inkling): every head adds <W_h x_i, P[i - j]>
+    to its logit for key j, with a learned table P of `extent` offsets, `rank` wide."""
+
+    type: Literal["relbias"] = "relbias"
+    rank: int = 16
+    extent: int = 1024  # offsets with a bias; farther keys get none
+
+
 # --- Channel mixers -----------------------------------------------------------
 
 
@@ -93,6 +106,10 @@ class MLPConfig(Config):
     activation: Activation
     dropout: float = 0.0
     bias: bool = False
+    # Clamped SwiGLU: the gate input is capped at limit, the up branch at +-limit
+    # (gpt-oss, DeepSeek-V4).
+    limit: float | None = None
+    up_softcap: float | None = None  # tanh soft-capping of the up branch (Kimi K3)
 
 
 class MoEConfig(Config):
@@ -105,7 +122,8 @@ class MoEConfig(Config):
     num_shared_experts: int = 0
     shared_expert: MLPConfig | None = None  # None -> same shape as `expert`
     shared_expert_gate: bool = False  # sigmoid gate on the shared expert (Qwen)
-    router: Literal["softmax", "sigmoid"] = "softmax"
+    # sqrtsoftplus scores experts with sqrt(softplus(logit)) (DeepSeek-V4).
+    router: Literal["softmax", "sigmoid", "sqrtsoftplus"] = "softmax"
     normalize_top_k: bool = True
     routed_scaling_factor: float = 1.0
     # Group-limited routing: pick top_k_groups of num_groups first (DeepSeek-V3).
@@ -115,6 +133,15 @@ class MoEConfig(Config):
     load_balancing: Literal["aux_loss", "aux_free"] = "aux_loss"
     aux_loss_coef: float = 1e-2
     capacity_factor: float | None = None  # None -> dropless
+    # LatentMoE: routed experts run in a narrower space, between a down and an up
+    # projection; the router and the shared experts see the full width (Nemotron 3).
+    latent_size: int | None = None
+    latent_input_norm: NormalizationConfig | None = None  # after the down projection
+    latent_output_norm: NormalizationConfig | None = None  # on the routed sum (Kimi K3)
+    expert_norm: NormalizationConfig | None = None  # on each routed expert's output
+    # The shared experts are weighted by the router too, normalized with the top-k
+    # (Inkling); otherwise they are added with weight 1.
+    shared_expert_sink: bool = False
 
 
 # --- Token mixers ---------------------------------------------------------------
@@ -131,20 +158,40 @@ class SparseIndexerConfig(Config):
     num_heads: int = 64
     head_dim: int = 128
     top_k: int = 2048
+    # Score keys mean-pooled in blocks of this many and pick whole blocks, top_k keys in
+    # all, plus the current block (Qwen3.8 QSA).
+    block_size: int = 1
+    weighted: bool = True  # learned per-head score weights (DSA); else a plain sum
+    # What a `candidates` port exports: the best `candidate_top_k` blocks of
+    # `candidate_block_size` keys, each scored by its best key (DeepSeek-V4.1).
+    candidate_block_size: int = 8
+    candidate_top_k: int = 2048  # blocks in the candidate pool
 
 
 class QuadraticAttentionConfig(AttentionConfig):
-    """Softmax attention."""
+    """Softmax attention.
+
+    Ports, where a layer lists them: ``index`` exports the indexer's top-k, or imports
+    it instead of running an indexer of its own (GLM-5, DeepSeek-V4.1).
+    """
 
     sliding_window_size: int | None = None
     attention_dropout: float = 0.0
     output_dropout: float = 0.0
     # Elementwise sigmoid gate on the attention output (Qwen3-Next gated attention).
     gated: bool = False
+    gate_per_head: bool = False  # one gate value per head instead (Laguna)
+    gate_activation: Activation = "sigmoid"  # of the gate (Laguna: softplus)
+    output_norm: NormalizationConfig | None = None  # per head, before the gate (Muse)
     qk_norm: NormalizationConfig | None = None
     softcap: float | None = None  # tanh soft-capping of the logits (Gemma 2)
     sinks: bool = False  # learned per-head attention sink logit (gpt-oss)
     scale: float | None = None  # None -> head_dim ** -0.5
+    # Logits scaled by 1 + log_scale * ln(max(position / log_scale_floor, 1)), so that
+    # attention stays sharp at long range (Inkling; Llama 4 temperature tuning).
+    log_scale: float | None = None
+    log_scale_floor: int = 8192
+    relative_bias: RelativeBiasConfig | None = None
     indexer: SparseIndexerConfig | None = None
 
 
@@ -153,21 +200,29 @@ class GQAConfig(QuadraticAttentionConfig):
 
     Ports: ``v`` exports the value heads, or imports them for value-residual mixing
     (ResFormer); ``kv`` exports keys and values, or imports them instead of computing
-    its own (cross-layer KV sharing, YOCO / CLA).
+    its own (cross-layer KV sharing, YOCO / CLA); ``index`` shares the indexer's top-k.
     """
 
-    ports: ClassVar[frozenset[str]] = frozenset({"v", "kv"})
+    ports: ClassVar[frozenset[str]] = frozenset({"v", "kv", "index"})
 
     type: Literal["gqa"] = "gqa"
     num_heads: int
     num_kv_heads: int
     head_dim: int | None = None  # None -> width // num_heads
+    v_head_dim: int | None = None  # None -> head_dim (MiMo-V2: 128 against 192)
     bias: bool = False  # qkv bias (GPT-2, Qwen2)
     rope: RoPEConfig | None = None
+    # Causal depthwise conv on keys and values, added to them: k + conv(k) (Inkling).
+    kv_conv_size: int | None = None
 
 
 class MLAConfig(QuadraticAttentionConfig):
-    """Multi-head latent attention (DeepSeek-V2/V3, Kimi K2, Kimi Linear)."""
+    """Multi-head latent attention (DeepSeek-V2/V3, Kimi K2, Kimi Linear).
+
+    Ports: ``index`` shares the indexer's top-k across layers (GLM-5 IndexCache).
+    """
+
+    ports: ClassVar[frozenset[str]] = frozenset({"index"})
 
     type: Literal["mla"] = "mla"
     num_heads: int
@@ -179,6 +234,33 @@ class MLAConfig(QuadraticAttentionConfig):
     rope: RoPEConfig | None = RoPEConfig()  # on the decoupled qk_rope_head_dim part
 
 
+class CSAConfig(QuadraticAttentionConfig):
+    """Compressed sparse attention (DeepSeek-V4): every query head attends to a sliding
+    window of per-token latents and to the indexer's top-k compressed latents. A latent
+    is the key and the value at once, a single KV head shared by all query heads, and
+    each `compress_ratio` tokens are pooled into one compressed latent.
+
+    Ports: ``kv`` exports the compressed latents (with the indexer's keys), or imports
+    them instead of compressing its own; ``index`` exports the indexer's top-k, or
+    imports it instead of running an indexer; ``candidates`` exports coarse blocks of
+    compressed positions, and an indexer that imports them selects only inside them.
+    """
+
+    ports: ClassVar[frozenset[str]] = frozenset({"kv", "index", "candidates"})
+
+    type: Literal["csa"] = "csa"
+    num_heads: int
+    head_dim: int = 512
+    q_lora_rank: int | None = None  # None -> full-rank query projection
+    # Grouped low-rank output projection: o_groups groups of heads, each projected to
+    # o_lora_rank, then mixed back to the width; None -> one dense projection.
+    o_lora_rank: int | None = None
+    o_groups: int = 1
+    # Tokens pooled into one compressed latent; None -> window only.
+    compress_ratio: int | None = None
+    rope: RoPEConfig | None = RoPEConfig()
+
+
 class LinearAttentionConfig(AttentionConfig):
     """Recurrent token mixers with a matrix-valued state of shape (head_dim, v_head_dim) per value head."""
 
@@ -188,7 +270,8 @@ class LinearAttentionConfig(AttentionConfig):
     num_v_heads: int | None = None  # None -> num_heads
     v_head_dim: int | None = None  # None -> head_dim
     conv_size: int | None = 4  # causal depthwise conv on q, k, v; None disables it
-    output_gate: bool = True  # swish-gated output norm before the output projection
+    # Gate on the output norm before the output projection; None disables it.
+    output_gate: Literal["swish", "sigmoid"] | None = "swish"
 
 
 class GLAConfig(LinearAttentionConfig):
@@ -216,6 +299,11 @@ class KDAConfig(LinearAttentionConfig):
 
     type: Literal["kda"] = "kda"
     gate_rank: int | None = None  # rank of the decay projection; None -> head_dim
+    output_gate: Literal["swish", "sigmoid"] | None = "sigmoid"
+    output_gate_rank: int | None = None  # rank of the output gate; None -> full rank
+    # Bounded decay lower_bound * sigmoid(.), in (lower_bound, 0), instead of
+    # -exp(A) * softplus(.) (Kimi K3: -5).
+    gate_lower_bound: float | None = None
 
 
 class LightningAttentionConfig(LinearAttentionConfig):
@@ -259,6 +347,15 @@ class Mamba2Config(StateSpaceConfig):
     state_size: int = 128
     head_dim: int = 64
     num_groups: int = 1  # groups sharing B and C, like kv heads in GQA
+
+
+class ConvConfig(AttentionConfig):
+    """Causal depthwise convolution over positions, with no gate or activation. As a
+    residual branch, [conv] is a short-conv shortcut (Inkling; Canon layers)."""
+
+    type: Literal["conv"] = "conv"
+    size: int = 4
+    bias: bool = False
 
 
 class ShortConvConfig(AttentionConfig):
@@ -310,6 +407,38 @@ class LMHeadConfig(Config):
     softcap: float | None = None  # tanh soft-capping of the logits (Gemma 2)
 
 
+class NextNConfig(Config):
+    """Multi-token prediction input (DeepSeek-V3): h -> W [norm(embed(t_{i+k})); norm(h)].
+
+    The k-th nextn layer of a model embeds the token k positions ahead with the model's
+    embedding, so every head after it predicts one token further ahead. An MTP module
+    is ``$h! nextn block @h norm head``, run after the main head.
+    """
+
+    type: Literal["nextn"] = "nextn"
+    norm: NormalizationConfig = NormalizationConfig(type="rmsnorm")  # on both inputs
+
+
+class EngramConfig(Config):
+    """Conditional memory (DeepSeek Engram, 2026): hashed n-gram embeddings of the input
+    tokens, gated by the stream. Every n-gram of 2 to `max_ngram_size` tokens ending at a
+    position is hashed by `num_heads` heads, each into its own table; the rows, joined to
+    e, give a key and a value, and the layer returns sigmoid(<norm(x), norm(W_k e)>) W_v e
+    (with a signed square root on the score). Use it as a residual branch, [engram(...)].
+    Like RoPE with positions, it reads the model's input tokens by itself.
+    """
+
+    type: Literal["engram"] = "engram"
+    head_dim: int  # width of a table row
+    table_size: int  # rows per table; each head hashes modulo its own prime near this
+    max_ngram_size: int = 3
+    num_heads: int = 8  # hash heads per n-gram size
+    # Causal depthwise conv on the output, dilated by max_ngram_size; None disables it.
+    conv_size: int | None = 4
+    # Hash token classes (NFKC, lowercased) instead of raw ids (DeepSeek-V4.1); None -> ids.
+    vocab_classes: int | None = None
+
+
 # --- Residual stream ------------------------------------------------------------
 
 
@@ -324,6 +453,46 @@ class HyperConnectionsConfig(Config):
     sinkhorn_iters: int = 20
 
 
+class GatedResidualConfig(Config):
+    """Gated residual (Qwen3.8-Flash-Next, 2026): `expansion` streams, each RMS-normalized
+    when read. A branch reads their mean under a low-rank sigmoid gate and writes its
+    output back to every stream with a weight in (0, 2) of its own. The read normalizes,
+    so branches need no pre-norm, and the read before the head replaces the final norm.
+    """
+
+    type: Literal["gr"] = "gr"
+    rank: int  # of the read gate (Qwen3.8-Flash-Next: d_model / 8)
+    expansion: int = 4
+
+
+class AttentionResidualConfig(Config):
+    """Attention residuals (Kimi, 2026): a branch reads a softmax over depth of the
+    embedding and the branch outputs so far, scored against a learned query of its own,
+    instead of their plain sum. Outputs are summed in blocks of `block_size` branches,
+    and each block is one source; the head reads the same way.
+    """
+
+    type: Literal["attnres"] = "attnres"
+    block_size: int | None = None  # None -> every branch output is a source of its own
+
+
+class ResidualGateConfig(Config):
+    """Variance-preserving residual gate (Muse Spark): x <- a * x + b * f(x) per channel,
+    with b = sigmoid(g / temperature) for a learned g, and a = sqrt(1 - b^2)."""
+
+    type: Literal["vpgate"] = "vpgate"
+    temperature: float = 0.3
+
+
+ResidualConfig = Annotated[
+    HyperConnectionsConfig
+    | GatedResidualConfig
+    | AttentionResidualConfig
+    | ResidualGateConfig,
+    Field(discriminator="type"),
+]
+
+
 LayerConfig = Annotated[
     NormalizationConfig
     | DyTConfig
@@ -331,6 +500,7 @@ LayerConfig = Annotated[
     | MoEConfig
     | GQAConfig
     | MLAConfig
+    | CSAConfig
     | GLAConfig
     | DeltaNetConfig
     | GatedDeltaNetConfig
@@ -339,13 +509,16 @@ LayerConfig = Annotated[
     | RWKV7Config
     | MambaConfig
     | Mamba2Config
+    | ConvConfig
     | ShortConvConfig
     | LinearConfig
     | ActivationConfig
     | ScaleConfig
     | DropoutConfig
     | EmbeddingConfig
-    | LMHeadConfig,
+    | LMHeadConfig
+    | NextNConfig
+    | EngramConfig,
     Field(discriminator="type"),
 ]
 
@@ -355,7 +528,11 @@ SubConfig = Annotated[
     | PositionInterpolationConfig
     | YaRNConfig
     | Llama3RoPEScalingConfig
+    | RelativeBiasConfig
     | SparseIndexerConfig
-    | HyperConnectionsConfig,
+    | HyperConnectionsConfig
+    | GatedResidualConfig
+    | AttentionResidualConfig
+    | ResidualGateConfig,
     Field(discriminator="type"),
 ]

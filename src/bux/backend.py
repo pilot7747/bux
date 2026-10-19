@@ -9,7 +9,8 @@ grouped-query attention. Other mixers plug in the same way:
         return MyGatedDeltaNet(config, width, rngs=ctx.rngs)
 
 Modules are called as ``module(x, taps)``: ``taps`` holds the tap stacks for one
-forward pass. Repeats are unrolled; nodes with a share key are built once and reused.
+forward pass, and under reserved keys the input tokens and the logits of every head
+run so far. Repeats are unrolled; nodes with a share key are built once and reused.
 """
 
 import functools
@@ -25,6 +26,8 @@ from bux import config as cfg
 from bux.lang import ir
 
 Taps = dict[str, list]
+# Reserved tap keys, which no tap name can collide with.
+TOKENS, OUTPUTS = "<tokens>", "<outputs>"
 
 
 @dataclass
@@ -33,6 +36,7 @@ class Context:
     rngs: nnx.Rngs
     shared: dict[str, nnx.Module] = field(default_factory=dict)
     embedding: Embedding | None = None
+    nextn: int = 0  # nextn layers built so far
 
 
 Builder = Callable[..., nnx.Module]
@@ -64,6 +68,10 @@ def _activation(name: str, x: jax.Array) -> jax.Array:
             return jax.nn.sigmoid(x)
         case "tanh":
             return jnp.tanh(x)
+        case "softplus":
+            return jax.nn.softplus(x)
+        case "situ":
+            return _softcap(x, 4.0) * jax.nn.sigmoid(x)
     raise ValueError(name)
 
 
@@ -186,7 +194,11 @@ def _build(node: ir.Node, ctx: Context) -> nnx.Module:
 
 
 class Model(nnx.Module):
-    """tokens (batch, seq) -> logits (batch, seq, vocab)."""
+    """tokens (batch, seq) -> logits (batch, seq, vocab).
+
+    Every head is an output. ``outputs`` returns them all in execution order; head j
+    predicts the token 1 + k positions ahead, where k counts the nextn layers before it.
+    """
 
     def __init__(self, arch: ir.Architecture, *, rngs: nnx.Rngs):
         if arch.residual is not None:
@@ -195,8 +207,14 @@ class Model(nnx.Module):
             )
         self.graph = build_node(arch.graph, Context(arch, rngs))
 
+    def outputs(self, tokens: jax.Array) -> list[jax.Array]:
+        taps: Taps = {TOKENS: [tokens]}
+        last = self.graph(tokens, taps)
+        return taps.get(OUTPUTS) or [last]
+
     def __call__(self, tokens: jax.Array) -> jax.Array:
-        return self.graph(tokens, {})
+        """The first head's logits: the next-token prediction."""
+        return self.outputs(tokens)[0]
 
 
 def num_params(module: nnx.Module) -> int:
@@ -255,7 +273,9 @@ class Head(nnx.Module):
             logits = self.proj(x)
         if self.bias is not None:
             logits = logits + self.bias
-        return _softcap(logits, self.softcap)
+        logits = _softcap(logits, self.softcap)
+        taps.setdefault(OUTPUTS, []).append(logits)
+        return logits
 
 
 @register("head")
@@ -263,21 +283,53 @@ def _(c: cfg.LMHeadConfig, width, ports, ctx: Context):
     return Head(c, width, ctx)
 
 
+class NextN(nnx.Module):
+    """Mixes the stream with the embedding of the token `offset` positions ahead."""
+
+    def __init__(self, c: cfg.NextNConfig, width: int, offset: int, ctx: Context):
+        assert ctx.embedding is not None
+        self.embedding, self.offset = ctx.embedding, offset
+        self.hidden_norm = Norm(c.norm, width)
+        self.embed_norm = Norm(c.norm, ctx.arch.d_model)
+        self.proj = nnx.Linear(
+            ctx.arch.d_model + width, width, use_bias=False, rngs=ctx.rngs
+        )
+
+    def __call__(self, x, taps: Taps):
+        tokens = taps[TOKENS][0]
+        # The last `offset` positions have no token that far ahead; pad them with 0.
+        ahead = jnp.pad(tokens[:, self.offset :], ((0, 0), (0, self.offset)))
+        e = self.embed_norm(self.embedding.tokens(ahead))
+        return self.proj(jnp.concatenate([e, self.hidden_norm(x)], -1))
+
+
+@register("nextn")
+def _(c: cfg.NextNConfig, width, ports, ctx: Context):
+    ctx.nextn += 1
+    return NextN(c, width, ctx.nextn, ctx)
+
+
 class Norm(nnx.Module):
     def __init__(self, c: cfg.NormalizationConfig, width: int):
         self.kind = c.type
         self.eps = c.eps
         self.zero_centered = c.zero_centered
+        self.scale_input = c.scale_input
         init = jnp.zeros if c.zero_centered else jnp.ones
         self.scale = nnx.Param(init(width)) if c.affine else None
         self.bias = nnx.Param(jnp.zeros(width)) if c.bias else None
 
     def __call__(self, x, taps: Taps | None = None):
+        gain = None
+        if self.scale is not None:
+            gain = 1 + self.scale if self.zero_centered else self.scale
+        if gain is not None and self.scale_input:
+            x = x * gain
         if self.kind == "layernorm":
             x = x - x.mean(-1, keepdims=True)
         x = x * jax.lax.rsqrt(jnp.square(x).mean(-1, keepdims=True) + self.eps)
-        if self.scale is not None:
-            x = x * (1 + self.scale if self.zero_centered else self.scale)
+        if gain is not None and not self.scale_input:
+            x = x * gain
         if self.bias is not None:
             x = x + self.bias
         return x
@@ -314,14 +366,26 @@ class MLP(nnx.Module):
         )
         self.down = nnx.Linear(size, width, use_bias=c.bias, rngs=rngs)
         self.activation = c.activation
+        self.limit, self.up_softcap = c.limit, c.up_softcap
         self.dropout = nnx.Dropout(c.dropout, rngs=rngs)
 
     def __call__(self, x, taps: Taps | None = None):
+        up = _bound(self.up(x), self.limit, self.up_softcap)
         if self.gate is not None:
-            h = _activation(self.activation, self.gate(x)) * self.up(x)
+            gate = self.gate(x)
+            if self.limit is not None:
+                gate = jnp.minimum(gate, self.limit)
+            h = _activation(self.activation, gate) * up
         else:
-            h = _activation(self.activation, self.up(x))
+            h = _activation(self.activation, up)
         return self.dropout(self.down(h))
+
+
+def _bound(x: jax.Array, limit: float | None, softcap: float | None) -> jax.Array:
+    """The up branch of a GLU, clamped to +-limit and/or tanh soft-capped."""
+    if limit is not None:
+        x = jnp.clip(x, -limit, limit)
+    return _softcap(x, softcap)
 
 
 @register("mlp", "gated_mlp")
@@ -335,22 +399,44 @@ class MoE(nnx.Module):
     def __init__(self, c: cfg.MoEConfig, width: int, rngs: nnx.Rngs):
         if c.num_groups > 1:
             raise NotImplementedError("group-limited routing")
+        if c.shared_expert_sink:
+            raise NotImplementedError("routed shared experts (shared_expert_sink)")
         e, f = c.num_experts, c.expert.intermediate_size
         init = nnx.initializers.lecun_normal()
         self.router = nnx.Linear(width, e, use_bias=False, rngs=rngs)
         self.router_bias = (
             nnx.Variable(jnp.zeros(e)) if c.load_balancing == "aux_free" else None
         )
-        self.up = nnx.Param(init(rngs.params(), (e, width, f)))
+        # LatentMoE: the routed experts work between these two projections.
+        latent = c.latent_size or width
+        self.to_latent = (
+            nnx.Linear(width, latent, use_bias=False, rngs=rngs)
+            if c.latent_size
+            else None
+        )
+        self.latent_input_norm = (
+            Norm(c.latent_input_norm, latent) if c.latent_input_norm else None
+        )
+        self.latent_output_norm = (
+            Norm(c.latent_output_norm, latent) if c.latent_output_norm else None
+        )
+        self.expert_norm = Norm(c.expert_norm, latent) if c.expert_norm else None
+        self.from_latent = (
+            nnx.Linear(latent, width, use_bias=False, rngs=rngs)
+            if c.latent_size
+            else None
+        )
+        self.up = nnx.Param(init(rngs.params(), (e, latent, f)))
         self.gate = (
-            nnx.Param(init(rngs.params(), (e, width, f)))
+            nnx.Param(init(rngs.params(), (e, latent, f)))
             if c.expert.type == "gated_mlp"
             else None
         )
-        self.down = nnx.Param(init(rngs.params(), (e, f, width)))
+        self.down = nnx.Param(init(rngs.params(), (e, f, latent)))
         self.top_k, self.router_fn = c.top_k, c.router
         self.normalize, self.scaling = c.normalize_top_k, c.routed_scaling_factor
         self.activation = c.expert.activation
+        self.limit, self.up_softcap = c.expert.limit, c.expert.up_softcap
         shared = c.shared_expert or c.expert
         self.shared = (
             MLP(
@@ -370,11 +456,13 @@ class MoE(nnx.Module):
 
     def __call__(self, x, taps: Taps):
         logits = self.router(x)
-        scores = (
-            jax.nn.softmax(logits)
-            if self.router_fn == "softmax"
-            else jax.nn.sigmoid(logits)
-        )
+        match self.router_fn:
+            case "softmax":
+                scores = jax.nn.softmax(logits)
+            case "sigmoid":
+                scores = jax.nn.sigmoid(logits)
+            case "sqrtsoftplus":
+                scores = jnp.sqrt(jax.nn.softplus(logits))
         choice = scores if self.router_bias is None else scores + self.router_bias[...]
         _, idx = jax.lax.top_k(choice, self.top_k)
         weights = jnp.take_along_axis(scores, idx, axis=-1)
@@ -382,13 +470,28 @@ class MoE(nnx.Module):
             weights = weights / weights.sum(-1, keepdims=True)
         weights = weights * self.scaling
         dense = (jax.nn.one_hot(idx, scores.shape[-1]) * weights[..., None]).sum(-2)
-        h = jnp.einsum("btd,edf->btef", x, self.up[...])
+        z = x if self.to_latent is None else self.to_latent(x)
+        if self.latent_input_norm is not None:
+            z = self.latent_input_norm(z)
+        h = _bound(
+            jnp.einsum("btd,edf->btef", z, self.up[...]), self.limit, self.up_softcap
+        )
         if self.gate is not None:
-            gate = jnp.einsum("btd,edf->btef", x, self.gate[...])
+            gate = jnp.einsum("btd,edf->btef", z, self.gate[...])
+            if self.limit is not None:
+                gate = jnp.minimum(gate, self.limit)
             h = _activation(self.activation, gate) * h
         else:
             h = _activation(self.activation, h)
-        y = jnp.einsum("btef,efd,bte->btd", h, self.down[...], dense)
+        if self.expert_norm is not None:
+            each = self.expert_norm(jnp.einsum("btef,efd->bted", h, self.down[...]))
+            y = jnp.einsum("bted,bte->btd", each, dense)
+        else:
+            y = jnp.einsum("btef,efd,bte->btd", h, self.down[...], dense)
+        if self.latent_output_norm is not None:
+            y = self.latent_output_norm(y)
+        if self.from_latent is not None:
+            y = self.from_latent(y)
         if self.shared is not None:
             s = self.shared(x)
             if self.shared_gate is not None:
@@ -430,13 +533,15 @@ class Attention(nnx.Module):
     """
 
     def __init__(self, c: cfg.GQAConfig, width: int, ports, rngs: nnx.Rngs):
-        if c.indexer is not None:
+        if c.indexer is not None or any(p.name == "index" for p in ports):
             raise NotImplementedError("sparse attention indexer")
         h, kv = c.num_heads, c.num_kv_heads
         d = c.head_dim or width // h
-        self.heads, self.kv_heads, self.head_dim = h, kv, d
+        dv = c.v_head_dim or d
+        self.heads, self.kv_heads, self.head_dim, self.v_head_dim = h, kv, d, dv
         self.window, self.softcap = c.sliding_window_size, c.softcap
         self.scale = c.scale or d**-0.5
+        self.log_scale, self.log_scale_floor = c.log_scale, c.log_scale_floor
         self.rope = c.rope
         self.ports = tuple(ports)
         reads_kv = any(p.name == "kv" and p.mode != "write" for p in ports)
@@ -447,13 +552,21 @@ class Attention(nnx.Module):
 
         self.q = linear(width, h * d)
         self.k = None if reads_kv else linear(width, kv * d)
-        self.v = None if reads_kv else linear(width, kv * d)
-        self.o = linear(h * d, width)
-        self.gate = linear(width, h * d) if c.gated else None
+        self.v = None if reads_kv else linear(width, kv * dv)
+        self.o = linear(h * dv, width)
+        conv = c.kv_conv_size if not reads_kv else None
+        self.k_conv = CausalConv(kv * d, conv, False, rngs) if conv else None
+        self.v_conv = CausalConv(kv * dv, conv, False, rngs) if conv else None
+        self.gate = linear(width, h if c.gate_per_head else h * dv) if c.gated else None
+        self.gate_activation = c.gate_activation
+        self.out_norm = Norm(c.output_norm, dv) if c.output_norm else None
         self.q_norm = Norm(c.qk_norm, d) if c.qk_norm else None
         self.k_norm = Norm(c.qk_norm, d) if c.qk_norm and not reads_kv else None
         self.sinks = nnx.Param(jnp.zeros(h)) if c.sinks else None
         self.v_mix = nnx.Param(jnp.asarray(0.5)) if reads_v else None
+        rel = c.relative_bias
+        self.rel_proj = linear(width, h * rel.rank) if rel else None
+        self.rel_table = nnx.Param(jnp.zeros((rel.rank, rel.extent))) if rel else None
 
     def __call__(self, x, taps: Taps):
         b, t, _ = x.shape
@@ -464,8 +577,11 @@ class Attention(nnx.Module):
         if self.k is None or self.v is None:
             k, v = _read(taps, ports["kv", False])
         else:
-            k = self.k(x).reshape(b, t, self.kv_heads, self.head_dim)
-            v = self.v(x).reshape(b, t, self.kv_heads, self.head_dim)
+            k, v = self.k(x), self.v(x)
+            if self.k_conv is not None and self.v_conv is not None:
+                k, v = k + self.k_conv(k), v + self.v_conv(v)
+            k = k.reshape(b, t, self.kv_heads, self.head_dim)
+            v = v.reshape(b, t, self.kv_heads, self.v_head_dim)
             if self.k_norm is not None:
                 k = self.k_norm(k)
             if self.rope is not None:
@@ -481,10 +597,19 @@ class Attention(nnx.Module):
 
         group = self.heads // self.kv_heads
         k, v = jnp.repeat(k, group, axis=2), jnp.repeat(v, group, axis=2)
-        logits = _softcap(
-            jnp.einsum("bthd,bshd->bhts", q, k) * self.scale, self.softcap
-        )
+        logits = jnp.einsum("bthd,bshd->bhts", q, k) * self.scale
         pos = jnp.arange(t)
+        if self.rel_proj is not None and self.rel_table is not None:
+            r = self.rel_proj(x).reshape(b, t, self.heads, -1)
+            offset = pos[:, None] - pos[None, :]
+            extent = self.rel_table.shape[-1]
+            table = self.rel_table[...][:, jnp.clip(offset, 0, extent - 1)]
+            near = (offset >= 0) & (offset < extent)
+            logits = logits + jnp.einsum("bthr,rts->bhts", r, table) * near
+        if self.log_scale is not None:
+            ahead = jnp.maximum((pos + 1) / self.log_scale_floor, 1.0)
+            logits = logits * (1 + self.log_scale * jnp.log(ahead))[:, None]
+        logits = _softcap(logits, self.softcap)
         mask = pos[:, None] >= pos[None, :]
         if self.window is not None:
             mask &= pos[:, None] - pos[None, :] < self.window
@@ -497,14 +622,37 @@ class Attention(nnx.Module):
         else:
             probs = jax.nn.softmax(logits)
         out = jnp.einsum("bhts,bshd->bthd", probs, v)
+        if self.out_norm is not None:
+            out = self.out_norm(out)
         if self.gate is not None:
-            out = out * jax.nn.sigmoid(self.gate(x)).reshape(out.shape)
+            gate = _activation(self.gate_activation, self.gate(x))
+            out = out * gate.reshape(b, t, self.heads, -1)
         return self.o(out.reshape(b, t, -1))
 
 
 @register("gqa")
 def _(c: cfg.GQAConfig, width, ports, ctx: Context):
     return Attention(c, width, ports, ctx.rngs)
+
+
+class CausalConv(nnx.Module):
+    """Depthwise causal convolution over positions of (batch, seq, channels)."""
+
+    def __init__(self, channels: int, size: int, bias: bool, rngs: nnx.Rngs):
+        init = nnx.initializers.lecun_normal()
+        self.weight = nnx.Param(init(rngs.params(), (size, channels)))
+        self.bias = nnx.Param(jnp.zeros(channels)) if bias else None
+
+    def __call__(self, x, taps: Taps | None = None):
+        size, t = self.weight.shape[0], x.shape[1]
+        padded = jnp.pad(x, ((0, 0), (size - 1, 0), (0, 0)))
+        y = sum(self.weight[i] * padded[:, i : i + t] for i in range(size))
+        return y if self.bias is None else y + self.bias
+
+
+@register("conv")
+def _(c: cfg.ConvConfig, width, ports, ctx: Context):
+    return CausalConv(width, c.size, c.bias, ctx.rngs)
 
 
 class Scale(nnx.Module):

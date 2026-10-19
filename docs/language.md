@@ -81,8 +81,9 @@ gqa(...) * (linear(features=d_model) sigmoid) # output-gated attention
     ```
 - **Internal tensors** go through layer *ports*: `attn(v=@v1)` exports the attention
   values, and `attn(v=$v1)` mixes them back in later (value residual / ResFormer).
-  `attn(kv=@kv)` and `attn(kv=$kv)` share K/V across layers (YOCO, CLA). A config class
-  lists its ports in `ports`.
+  `attn(kv=@kv)` and `attn(kv=$kv)` share K/V across layers (YOCO, CLA), and
+  `attn(index=@k)` / `attn(index=$k)` share a sparse attention indexer's top-k
+  (GLM-5's IndexCache, DeepSeek-V4.1). A config class lists its ports in `ports`.
 
 The compiler simulates every stack through the unrolled model. Reading a tap before it
 is written, popping an empty one, or reading a port tap as hidden states are compile
@@ -130,15 +131,41 @@ model = embed (m^6 sa)^9 norm head
   the same parameters. Each use of a plain definition gets fresh parameters.
 - `head(tied=true)` reuses the embedding matrix.
 
+## Several outputs: multi-token prediction
+
+Every `head` is an output. A head ends the stream, so nothing can follow it but a tap
+read, and that is how a model goes on to a second output. `nextn` mixes the stream with
+the embedding of the next token, `W [norm(embed(t+1)); norm(h)]`, so a head after it
+predicts the token after next. This is DeepSeek-V3's multi-token prediction (MTP)
+module, with the main head shared:
+
+```
+shared out = head
+mtp = $h nextn layer(experts) norm out
+model = embed layer(dense)^3 layer(experts)^58 norm @h out mtp
+```
+
+The k-th `nextn` in execution order embeds the token k positions ahead, so a chain of
+modules, each reading the previous one's hidden state, is a repeat:
+
+```
+mtp = $h! nextn layer(experts) @h norm out
+model = embed block^40 norm @h out mtp^3       # 4 outputs: 1, 2, 3 and 4 tokens ahead
+```
+
+A backend returns the heads' logits in execution order; head j predicts the token
+`1 + k` positions ahead, where k counts the `nextn` layers before it.
+
 ## Settings
 
 A layer call takes keyword arguments, which map one-to-one to the pydantic fields in
 `bux/config.py`. Every config's `type` tag is also its name in the language:
-`gqa`, `mla`, `mamba`, `mamba2`, `gla`, `deltanet`, `gdn`, `kda`, `lightning`, `rwkv7`,
-`short_conv`, `mlp`, `gated_mlp`, `moe`, `layernorm`, `rmsnorm`, `dyt`, `linear`,
-`act`, `scale`, `dropout`, `embed`, `head`. Settings that are not layers: `rope`,
-`pi`, `yarn`, `llama3`, `indexer`, `hc`, `mhc`. Activation names (`swish`, `gelu`,
-`relu2`, `sigmoid`, ...) are also leaves: `linear(features=h) swish`.
+`gqa`, `mla`, `csa`, `mamba`, `mamba2`, `gla`, `deltanet`, `gdn`, `kda`, `lightning`,
+`rwkv7`, `conv`, `short_conv`, `mlp`, `gated_mlp`, `moe`, `layernorm`, `rmsnorm`, `dyt`,
+`linear`, `act`, `scale`, `dropout`, `embed`, `head`, `nextn`, `engram`. Settings that
+are not layers: `rope`, `pi`, `yarn`, `llama3`, `relbias`, `indexer`, and the residual
+algebras `hc`, `mhc`, `gr`, `attnres`, `vpgate`. Activation names (`swish`, `gelu`,
+`relu2`, `sigmoid`, `situ`, ...) are also leaves: `linear(features=h) swish`.
 
 Values are numbers (`1e-5`, `128_256`), strings, `true`/`false`/`none`, lists
 (`[1, 2]`, or `[1,]` for one element), configs (`rope(base=1e6)`), or arithmetic over
@@ -172,6 +199,17 @@ stream is widened into 4 streams, and every residual branch reads, writes, and m
 through learned (for `mhc`, doubly stochastic) connections. The IR keeps `Residual`
 separate from `_ + f` for this reason. `[f]` is the residual stream's own connection,
 so backends can replace it, while `_ + f` is plain arithmetic.
+
+The other algebras:
+
+| setting                    | `[f]` becomes                                                           |
+|----------------------------|-------------------------------------------------------------------------|
+| `hc(expansion=4)`          | hyper-connections, as `mhc` but without the doubly stochastic mixing     |
+| `gr(rank=320)`             | a gated read of 4 normalized streams and a weighted write to each; branches need no pre-norm (Qwen3.8-Flash-Next) |
+| `attnres(block_size=24)`   | `f` reads a learned softmax over depth of earlier block outputs instead of their sum (Kimi K3) |
+| `vpgate(temperature=0.3)`  | `a x + b f(x)` with `a^2 + b^2 = 1` per channel (Muse Spark)             |
+
+The streams are read back into one before the head.
 
 ## The IR and backends
 
@@ -284,8 +322,12 @@ Alternatives considered:
   They are precise but unreadable, and per-layer lists say nothing about wiring.
 
 Possible extensions: a `cat` merge (Zamba concatenates x0 into the shared block);
-several outputs for multi-token prediction heads; recursive macros for nested
-structures; and parsing the rendered diagrams back, so a drawing can be edited directly.
+recursive macros for nested structures; and parsing the rendered diagrams back, so a
+drawing can be edited directly.
 
-The example files transcribe public configs from memory. Ones marked "-style" or
-"approximate" simplify details, so verify the numbers before relying on them.
+The example files at the top of `examples/` transcribe public configs from memory.
+Ones marked "-style" or "approximate" simplify details, so verify the numbers before
+relying on them. The folders, one per model family (`deepseek/`, `glm/`, `inkling/`,
+`kimi/`, `laguna/`, `mellum/`, `mimo/`, `muse/`, `nemotron/`, `qwen/`), transcribe
+recent releases from their published `config.json` and modeling code. Their comments
+name what is left out (vision encoders, speculative drafters) or approximated.

@@ -1,0 +1,28 @@
+# Kimi K3 (Moonshot AI, 2026): Kimi Linear scaled to 93 layers. Three Kimi Delta
+# Attention layers run for every gated MLA layer, with one more MLA layer on top, and
+# there is no positional encoding anywhere.
+#
+# Attention residuals replace the residual sum: each branch reads a learned softmax over
+# depth of the embedding and of blocks of 24 branch outputs, which is 12 layers.
+#
+# The 896 experts are SiTU-GLU FFNs in a 3584-wide latent space; the router and the 2
+# shared experts see the full width. KDA bounds its decay from below and gates its
+# output at full rank. The vision encoder is not described here.
+d_model    = 7168
+vocab_size = 163840
+residual   = attnres(block_size=24)
+
+norm    = rmsnorm(eps=1e-5)
+kda     = kda(num_heads=96, head_dim=128, gate_lower_bound=-5)
+mla     = mla(num_heads=96, q_lora_rank=1536, kv_lora_rank=512, gated=true, rope=none)
+dense   = gated_mlp(intermediate_size=33792, activation=situ, up_softcap=25)
+experts = moe(num_experts=896, top_k=16, num_shared_experts=2, router=sigmoid,
+              load_balancing=aux_free, latent_size=3584, latent_output_norm=norm,
+              expert=gated_mlp(intermediate_size=3072, activation=situ, up_softcap=25))
+
+layer(mixer, ffn) = [norm mixer] [norm ffn]
+F = layer(kda, dense)
+K = layer(kda, experts)
+A = layer(mla, experts)
+
+model = embed "FKKA" "KKKA"^22 "A" norm head

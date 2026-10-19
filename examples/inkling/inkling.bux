@@ -1,0 +1,35 @@
+# Inkling (Thinking Machines, 2026): a multimodal MoE with 41B active parameters and no
+# RoPE. Five sliding-window layers run for every global layer. Positions come from a
+# data-dependent relative bias on the logits, and global layers sharpen their logits
+# with the log of the position past 128K tokens.
+#
+# Short causal convolutions are everywhere: on the keys and values, and as a shortcut
+# y + conv(y) on every branch output. The MoE weights its 2 shared experts with the
+# router too, as part of the top-6. Eight chained MTP layers predict up to 8 tokens
+# further ahead. The vision encoder is not described here.
+d_model     = 6144
+vocab_size  = 201024
+logit_scale = 1 / 24
+
+norm    = rmsnorm
+attn    = gqa(num_heads=64, num_kv_heads=8, head_dim=128, qk_norm=norm, scale=1 / 128,
+              kv_conv_size=4, relative_bias=relbias(rank=16, extent=1024),
+              log_scale=0.1, log_scale_floor=128000)
+local   = attn(num_kv_heads=16, sliding_window_size=512, relative_bias.extent=512,
+               log_scale=none)
+dense   = gated_mlp(intermediate_size=24576, activation=swish)
+experts = moe(num_experts=256, top_k=6, num_shared_experts=2, shared_expert_sink=true,
+              router=sigmoid, routed_scaling_factor=8, load_balancing=aux_free,
+              expert=gated_mlp(intermediate_size=3072, activation=swish))
+
+layer(mixer, ffn) = [norm mixer [conv]] [norm ffn scale [conv]]
+D = layer(local, dense)
+L = layer(local, experts)
+G = layer(attn, experts)
+
+shared out = head
+logits = (_ * logit_scale) out
+mtp(mixer) = $h! nextn(norm=norm) layer(mixer, dense) @h logits
+
+model = embed norm "DD" "LLLG" "LLLLLG"^10 norm @h logits
+        mtp(local) mtp(attn) mtp(local) mtp(attn) mtp(local)^4
