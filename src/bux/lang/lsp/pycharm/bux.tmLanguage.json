@@ -1,0 +1,79 @@
+{
+  "$schema": "https://raw.githubusercontent.com/martinring/tmlanguage/master/tmlanguage.json",
+  "name": "bux",
+  "scopeName": "source.bux",
+  "patterns": [
+    { "include": "#comment" },
+    { "include": "#string" },
+    { "include": "#definition" },
+    { "include": "#number" },
+    { "include": "#constant" },
+    { "include": "#tap" },
+    { "include": "#call" },
+    { "include": "#argument" },
+    { "include": "#operator" },
+    { "include": "#punctuation" }
+  ],
+  "repository": {
+    "comment": {
+      "name": "comment.line.number-sign.bux",
+      "match": "#.*$"
+    },
+    "string": {
+      "patterns": [
+        { "name": "string.quoted.double.bux", "match": "\"[^\"]*\"?" },
+        { "name": "string.quoted.single.bux", "match": "'[^']*'?" }
+      ]
+    },
+    "definition": {
+      "comment": "A statement starts at column 0 (indented lines continue the previous one) or after ';'.",
+      "match": "(?:^|(?<=;)\\s*)(?:(shared)\\s+)?([A-Za-z_][A-Za-z0-9_]*)(?=\\s*(?:\\([^)]*\\))?\\s*=)",
+      "captures": {
+        "1": { "name": "storage.modifier.bux" },
+        "2": { "name": "entity.name.function.bux" }
+      }
+    },
+    "number": {
+      "name": "constant.numeric.bux",
+      "match": "\\b\\d[\\d_]*(?:\\.\\d[\\d_]*)?(?:[eE][+-]?\\d+)?\\b"
+    },
+    "constant": {
+      "patterns": [
+        { "name": "constant.language.bux", "match": "\\b(?:true|false|none|_)\\b" },
+        { "name": "storage.modifier.bux", "match": "\\bshared\\b" }
+      ]
+    },
+    "tap": {
+      "match": "([@$])([A-Za-z_][A-Za-z0-9_]*)(!)?",
+      "captures": {
+        "1": { "name": "keyword.operator.tap.bux" },
+        "2": { "name": "variable.other.tap.bux" },
+        "3": { "name": "keyword.operator.tap.bux" }
+      }
+    },
+    "call": {
+      "comment": "A call needs its '(' right after the name.",
+      "name": "support.function.bux",
+      "match": "\\b[A-Za-z_][A-Za-z0-9_]*(?=\\()"
+    },
+    "argument": {
+      "name": "variable.parameter.bux",
+      "match": "\\b[A-Za-z_][A-Za-z0-9_]*(?:\\.[A-Za-z_][A-Za-z0-9_]*)*(?=\\s*=)"
+    },
+    "operator": {
+      "patterns": [
+        { "name": "keyword.operator.bux", "match": "->|→|//|[-+*/^]" },
+        { "name": "keyword.operator.assignment.bux", "match": "=" }
+      ]
+    },
+    "punctuation": {
+      "patterns": [
+        { "name": "punctuation.section.brackets.bux", "match": "[\\[\\]]" },
+        { "name": "punctuation.section.parens.bux", "match": "[()]" },
+        { "name": "punctuation.separator.comma.bux", "match": "," },
+        { "name": "punctuation.accessor.bux", "match": "\\." },
+        { "name": "punctuation.terminator.statement.bux", "match": ";" }
+      ]
+    }
+  }
+}

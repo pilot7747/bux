@@ -1,0 +1,10 @@
+# GPT-2 small (OpenAI, 2019): LayerNorm with biases, learned positions, tied head.
+d_model    = 768
+vocab_size = 50257
+
+norm = layernorm(eps=1e-5, bias=true)
+attn = gqa(num_heads=12, num_kv_heads=12, bias=true)
+ffn  = mlp(intermediate_size=4 * d_model, activation=gelu_tanh, bias=true)
+
+block = [norm attn] [norm ffn]
+model = embed(max_positions=1024) block^12 norm head(tied=true)

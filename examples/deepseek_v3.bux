@@ -1,0 +1,16 @@
+# DeepSeek-V3 (2024): MLA in every layer; 3 dense layers, then 58 MoE layers with
+# sigmoid routing over 8 expert groups and auxiliary-loss-free load balancing.
+d_model    = 7168
+vocab_size = 129280
+
+norm    = rmsnorm
+attn    = mla(num_heads=128, q_lora_rank=1536, kv_lora_rank=512,
+              rope=rope(scaling=yarn(factor=40, original_max_len=4096)))
+dense   = gated_mlp(intermediate_size=18432, activation=swish)
+experts = moe(num_experts=256, top_k=8, num_shared_experts=1, router=sigmoid,
+              routed_scaling_factor=2.5, num_groups=8, top_k_groups=4, load_balancing=aux_free,
+              expert=gated_mlp(intermediate_size=2048, activation=swish))
+
+layer(ffn) = [norm attn] [norm ffn]
+
+model = embed layer(dense)^3 layer(experts)^58 norm head

@@ -1,0 +1,11 @@
+# GPT-J 6B (EleutherAI, 2021): the parallel block. Attention and MLP read the same
+# normalized input and their outputs are summed into the stream (PaLM does the same).
+d_model    = 4096
+vocab_size = 50400
+
+norm = layernorm(eps=1e-5, bias=true)
+attn = gqa(num_heads=16, num_kv_heads=16, rope=rope(fraction=0.25))
+ffn  = mlp(intermediate_size=16384, activation=gelu_tanh, bias=true)
+
+block = [norm (attn + ffn)]
+model = embed block^28 norm head(bias=true)

@@ -1,0 +1,23 @@
+{
+  "name": "bux",
+  "displayName": "bux",
+  "description": "Syntax highlighting, brackets and comments for .bux architecture files.",
+  "version": "0.1.0",
+  "contributes": {
+    "languages": [
+      {
+        "id": "bux",
+        "extensions": [".bux"],
+        "aliases": ["bux"],
+        "configuration": "./language-configuration.json"
+      }
+    ],
+    "grammars": [
+      {
+        "language": "bux",
+        "scopeName": "source.bux",
+        "path": "./bux.tmLanguage.json"
+      }
+    ]
+  }
+}

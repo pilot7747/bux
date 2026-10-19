@@ -1,0 +1,14 @@
+# Manifold-constrained hyper-connections (DeepSeek mHC, 2025): the usual pre-norm
+# graph, but the residual stream is widened into 4 streams, and every residual branch
+# [...] reads from and writes to them through learned doubly stochastic mixing.
+# The wiring stays the same; only the meaning of [...] changes.
+d_model    = 2048
+vocab_size = 128256
+residual   = mhc(expansion=4)
+
+norm = rmsnorm
+attn = gqa(num_heads=16, num_kv_heads=4, rope=rope())
+ffn  = gated_mlp(intermediate_size=5632, activation=swish)
+
+block = [norm attn] [norm ffn]
+model = embed block^24 norm head

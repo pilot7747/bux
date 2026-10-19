@@ -1,0 +1,17 @@
+# Qwen3-Next-80B-A3B (Alibaba, 2025): 12 x (3 Gated DeltaNet layers, 1 gated attention
+# layer), each followed by an ultra-sparse MoE (512 experts, 10 active + 1 shared).
+d_model    = 2048
+vocab_size = 151936
+
+norm    = rmsnorm(zero_centered=true)
+delta   = gdn(num_heads=16, num_v_heads=32, head_dim=128)
+attn    = gqa(num_heads=16, num_kv_heads=2, head_dim=256, gated=true, qk_norm=norm,
+              rope=rope(base=10000000, fraction=0.25))
+experts = moe(num_experts=512, top_k=10, num_shared_experts=1, shared_expert_gate=true,
+              expert=gated_mlp(intermediate_size=512, activation=swish))
+
+layer(mixer) = [norm mixer] [norm experts]
+D = layer(delta)
+A = layer(attn)
+
+model = embed "DDDA"^12 norm head

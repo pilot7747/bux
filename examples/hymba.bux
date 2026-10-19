@@ -1,0 +1,17 @@
+# Hymba-style hybrid heads (NVIDIA, 2024): attention and SSM run side by side inside every
+# layer; each branch is normalized and scaled, then summed. Sliding-window attention
+# everywhere except the first, middle and last layer. Sizes are approximate.
+d_model    = 1600
+vocab_size = 32001
+
+norm  = rmsnorm
+local = gqa(num_heads=25, num_kv_heads=5, sliding_window_size=1024, rope=rope())
+full  = local(sliding_window_size=none)
+ssm   = mamba(state_size=16)
+ffn   = gated_mlp(intermediate_size=5504, activation=swish)
+
+layer(attn) = [norm (attn norm scale + ssm norm scale)] [norm ffn]
+L = layer(local)
+F = layer(full)
+
+model = embed F L^14 F L^15 F norm head(tied=true)

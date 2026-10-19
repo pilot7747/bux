@@ -1,0 +1,15 @@
+# Zamba-style (Zyphra, 2024): a Mamba-2 backbone that calls one shared attention block
+# every six layers. "shared" makes a definition a single module instead of a template,
+# so all nine uses of `sa` have the same parameters. Sizes are approximate.
+d_model    = 2048
+vocab_size = 32000
+
+norm = rmsnorm
+ssm  = mamba2(state_size=64)
+attn = gqa(num_heads=32, num_kv_heads=32, rope=rope())
+ffn  = gated_mlp(intermediate_size=8192, activation=swish)
+
+m = [norm ssm]
+shared sa = [norm attn] [norm ffn]
+
+model = embed (m^6 sa)^9 norm head

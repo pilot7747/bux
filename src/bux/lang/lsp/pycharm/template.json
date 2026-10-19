@@ -1,0 +1,18 @@
+{
+  "id": "bux",
+  "name": "bux",
+  "programArgs": {
+    "default": "\"$PROJECT_DIR$/.venv/bin/bux-lsp\"",
+    "windows": "\"$PROJECT_DIR$/.venv/Scripts/bux-lsp.exe\""
+  },
+  "fileTypeMappings": [
+    {
+      "fileType": {
+        "patterns": [
+          "*.bux"
+        ]
+      },
+      "languageId": "bux"
+    }
+  ]
+}

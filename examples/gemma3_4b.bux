@@ -1,0 +1,16 @@
+# Gemma 3 4B (Google, 2025): sandwich norms, QK-norm, five sliding-window layers per
+# global layer, and different RoPE bases for the two kinds.
+d_model    = 2560
+vocab_size = 262208
+
+norm   = rmsnorm(zero_centered=true)
+attn   = gqa(num_heads=8, num_kv_heads=4, head_dim=256, qk_norm=norm, rope=rope(base=10000))
+local  = attn(sliding_window_size=1024)
+global = attn(rope=rope(base=1000000, scaling=pi(factor=8)))
+ffn    = gated_mlp(intermediate_size=10240, activation=gelu_tanh)
+
+layer(mixer) = [norm mixer norm] [norm ffn norm]
+L = layer(local)
+G = layer(global)
+
+model = embed(scale_by_sqrt_dim=true) "LLLLLG"^5 "LLLL" norm head(tied=true)

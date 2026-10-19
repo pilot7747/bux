@@ -1,0 +1,10 @@
+# Llama 3 8B (Meta, 2024): the reference pre-norm decoder.
+d_model    = 4096
+vocab_size = 128256
+
+norm = rmsnorm(eps=1e-5)
+attn = gqa(num_heads=32, num_kv_heads=8, rope=rope(base=500000))
+ffn  = gated_mlp(intermediate_size=14336, activation=swish)
+
+block = [norm attn] [norm ffn]
+model = embed block^32 norm head

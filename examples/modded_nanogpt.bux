@@ -1,0 +1,17 @@
+# modded-nanogpt-style speedrun GPT (Keller Jordan et al., 2024-25): ReLU², QK-norm,
+# every block mixes in the embedding x0, and a U-net of skip connections joins the
+# first half of the network to the second half in reverse order.
+d_model    = 768
+vocab_size = 50304
+
+norm = rmsnorm(affine=false)
+attn = gqa(num_heads=6, num_kv_heads=6, head_dim=128, qk_norm=norm, rope=rope(base=1024))
+ffn  = mlp(intermediate_size=4 * d_model, activation=relu2)
+
+# x <- a*x + b*x0, then an ordinary pre-norm block
+block = (scale + $x0 scale(init=0.0)) [norm attn] [norm ffn]
+
+model = embed norm @x0
+        (block @skip)^6              # first half: push every output onto `skip`
+        ([$skip! scale] block)^6     # second half: pop them back in reverse, weighted
+        norm head(softcap=15)

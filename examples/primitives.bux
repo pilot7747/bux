@@ -1,0 +1,12 @@
+# Layers built from primitives with the same algebra: a SwiGLU MLP and an output-gated
+# attention, spelled out with `*` gating and explicit projections. Widths are checked:
+# a residual branch has to come back to d_model.
+d_model    = 512
+vocab_size = 32000
+hidden     = 1408
+
+swiglu     = (linear(features=hidden) swish * linear(features=hidden)) linear(features=d_model)
+gated_attn = gqa(num_heads=8, num_kv_heads=8, rope=rope()) * linear(features=d_model) sigmoid
+
+block = [rmsnorm gated_attn] [rmsnorm swiglu]
+model = embed block^8 rmsnorm head(tied=true)

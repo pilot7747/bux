@@ -1,0 +1,13 @@
+# Value residual learning (ResFormer, Zhou et al., 2024): the first layer exports its
+# attention values through the `v` port of gqa, and every later layer mixes them into
+# its own values.
+d_model    = 768
+vocab_size = 50304
+
+norm = rmsnorm
+attn = gqa(num_heads=12, num_kv_heads=12, rope=rope())
+ffn  = gated_mlp(intermediate_size=2048, activation=swish)
+
+first = [norm attn(v=@v1)] [norm ffn]
+rest  = [norm attn(v=$v1)] [norm ffn]
+model = embed first rest^11 norm head

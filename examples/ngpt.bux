@@ -1,0 +1,13 @@
+# nGPT-style normalized transformer (NVIDIA, 2024): hidden states stay on the unit
+# sphere, and each branch moves them toward its own normalized output by a learned
+# per-channel step:  h <- norm(h + alpha * (norm(f(h)) - h)).
+d_model    = 1024
+vocab_size = 32000
+
+unit = rmsnorm(affine=false)
+step = scale(init=0.05, per_channel=true)
+attn = gqa(num_heads=16, num_kv_heads=16, rope=rope())
+ffn  = gated_mlp(intermediate_size=4096, activation=swish)
+
+block = [(attn unit - _) step] unit [(ffn unit - _) step] unit
+model = embed unit block^24 head
