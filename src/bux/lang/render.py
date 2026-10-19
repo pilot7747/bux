@@ -8,6 +8,7 @@ drawn themselves underneath, so a 48-layer hybrid stays one screen wide::
       └─norm──attn─┘  └─norm──ffn─┘
 """
 
+from collections.abc import Sequence
 from dataclasses import dataclass
 
 from bux import config as cfg
@@ -144,7 +145,7 @@ class _Renderer:
             case ir.Residual(body=body):
                 return _branches([_text(""), self.box(body)], [True, True], "⊕")
             case ir.Sum(terms=terms):
-                return self.parallel(list(terms), "⊕")
+                return self.parallel(terms, "⊕")
             case ir.Prod(factors=factors):
                 scales = [f for f in factors if isinstance(f, ir.Const)]
                 others = [f for f in factors if not isinstance(f, ir.Const)]
@@ -176,7 +177,7 @@ class _Renderer:
                 return _text(f"${name}{'!' if pop else ''}")
         raise AssertionError(node)
 
-    def parallel(self, terms: list[ir.Node], merge: str) -> _Box:
+    def parallel(self, terms: Sequence[ir.Node], merge: str) -> _Box:
         # Fed branches first, so the fork sits on the row where the stream enters.
         order = sorted(terms, key=_starts_with_ref)
         return _branches(

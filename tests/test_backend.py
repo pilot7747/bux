@@ -1,4 +1,5 @@
 import math
+from typing import Literal
 
 import jax
 import jax.numpy as jnp
@@ -6,8 +7,18 @@ import pytest
 from flax import nnx
 
 from bux import config as cfg
-from bux.architecture import TOKENS, Attention, Context, Engram, Model, num_params
+from bux.architecture import (
+    TOKENS,
+    Attention,
+    Context,
+    Embedding,
+    Engram,
+    Model,
+    NextN,
+    num_params,
+)
 from bux.architecture.engram import _ngram_rows
+from bux.architecture.graph import Sequence
 from bux.architecture.rope import frequencies, rotate
 from bux.lang import compile, ir
 
@@ -24,6 +35,14 @@ ffn = gated_mlp(intermediate_size={F}, activation=swish)
 
 def model(body: str) -> Model:
     return Model(compile(PRELUDE + body), rngs=nnx.Rngs(0))
+
+
+def layer[T](m: Model, index: int, cls: type[T]) -> T:
+    """The top-level layer of `m` at `index`, checked to be a `cls`."""
+    assert isinstance(m.graph, Sequence)
+    item = m.graph.items[index]
+    assert isinstance(item, cls)
+    return item
 
 
 def tokens(seed: int = 0, length: int = 8) -> jax.Array:
@@ -105,13 +124,13 @@ def test_every_head_is_an_output_and_nextn_looks_one_token_further(shared):
 
 def test_nextn_embeds_the_token_ahead_as_the_embedding_does():
     m = model("model = embed(norm=rmsnorm) [norm attn] norm @h head $h nextn norm head")
-    embed, nextn = m.graph.items[0], m.graph.items[-3]
-    embed.norm.scale[...] = jax.random.uniform(
-        jax.random.key(1), (D,), minval=0.5, maxval=2
-    )
+    embed, nextn = layer(m, 0, Embedding), layer(m, -3, NextN)
+    norm = embed.norm
+    assert norm is not None and norm.scale is not None
+    norm.scale[...] = jax.random.uniform(jax.random.key(1), (D,), minval=0.5, maxval=2)
     t, h = tokens(), jax.random.normal(jax.random.key(2), (2, 8, D))
     ahead = jnp.pad(t[:, 1:], ((0, 0), (0, 1)))
-    e = nextn.embed_norm(embed.norm(embed.tokens(ahead)))
+    e = nextn.embed_norm(norm(embed.tokens(ahead)))
     expected = nextn.proj(jnp.concatenate([e, nextn.hidden_norm(h)], -1))
     assert jnp.allclose(nextn(h, {TOKENS: [t]}), expected, atol=1e-5)
 
@@ -190,7 +209,7 @@ def test_interleaved_rope_is_the_half_layout_with_the_rotated_dims_reordered():
 
 
 def test_yarn_attention_factor_on_the_softmax_scale():
-    def attn(on: str, head_dim: int) -> Attention:
+    def attn(on: Literal["rotary", "softmax"], head_dim: int) -> Attention:
         y = cfg.YaRNConfig(factor=40, original_max_len=4096, attention_factor_on=on)
         c = cfg.GQAConfig(
             num_heads=2,
@@ -276,7 +295,7 @@ def test_engram_adds_gated_memory_and_is_causal():
     t = tokens()
     changed = t.at[:, 5:].set((t[:, 5:] + 1) % V)
     assert jnp.allclose(m(t)[:, :5], m(changed)[:, :5], atol=1e-5)
-    engram = m.graph.items[2]
+    engram = layer(m, 2, Engram)
     x = jax.random.normal(jax.random.key(1), (2, 8, D))
     assert not jnp.allclose(engram(x, {TOKENS: [t]}), x)
     engram.table[...] = jnp.zeros_like(engram.table[...])

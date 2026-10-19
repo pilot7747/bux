@@ -22,7 +22,8 @@ grouped by model family (Cohere, DeepSeek, GLM, Inkling, Kimi, Laguna, Mellum, M
 Muse, Nemotron, Qwen), and the [language guide](docs/language.md) for composition, residual
 connections, parameter sharing, and editor support.
 
-Run the tests with `uv run pytest`.
+Run the CI checks (ruff, ty, and the tests) with `make`, or one of them with `make lint`,
+`make typecheck`, or `make test`.
 
 ## Docker
 

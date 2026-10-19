@@ -179,6 +179,7 @@ def test_macros():
         "model = embed layer(attn) layer(mlp=attn, mixer=ffn) head"
     )
     assert unlabeled(a.graph) == "(embed layer(attn) layer(mlp=attn, mixer=ffn) head)"
+    assert isinstance(a.graph, ir.Seq)
     first, second = a.graph.items[1:3]
     assert unlabeled(first) == "([(norm attn)] [(norm ffn)])"
     assert unlabeled(second) == "([(norm ffn)] [(norm attn)])"
@@ -188,8 +189,12 @@ def test_macros():
 
 def test_shared_definitions():
     a = build("shared blk = [norm attn]\nmodel = embed blk^4 [norm attn] head")
-    shares = [layer.share for layer in a.graph.items[1].body.body.items]
-    assert shares == [None, None] and a.graph.items[1].body.share == "blk"
+    assert isinstance(a.graph, ir.Seq)
+    blk = a.graph.items[1]
+    assert isinstance(blk, ir.Repeat) and isinstance(blk.body, ir.Residual)
+    assert isinstance(blk.body.body, ir.Seq)
+    shares = [layer.share for layer in blk.body.body.items]
+    assert shares == [None, None] and blk.body.share == "blk"
     assert (
         "shared"
         in error(
@@ -247,6 +252,7 @@ def test_unknown_names_are_reported_as_names_with_suggestions():
         "unknown name 'dmodel'",
         "did you mean 'd_model'?",
     )
+    assert err.source is not None and err.span is not None
     assert err.source[err.span.start : err.span.end] == "dmodel"
     err = error(
         "hidden = 64\nf = mlp(intermediate_size=hiden, activation=gelu)\nmodel = embed [f] head"

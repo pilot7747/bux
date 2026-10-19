@@ -634,9 +634,8 @@ def _expression_items(
     ix: _Index, current: ast.Statement | None, values: bool = False
 ) -> list[Completion]:
     """Names usable in an expression; with `values`, leave out layers and activations."""
-    items = [
-        Completion(p, "parameter", sort="0") for p in (current and current.params) or ()
-    ]
+    params = current.params if current is not None else None
+    items = [Completion(p, "parameter", sort="0") for p in params or ()]
     for name, st in ix.defs.items():
         if current is not None and name == current.name:
             continue

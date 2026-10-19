@@ -34,8 +34,5 @@ jobs:
       - name: Install dependencies
         run: uv sync --locked --dev
 
-      - name: Lint
-        run: uv run --locked ruff check .
-
-      - name: Test
-        run: uv run --locked pytest -q
+      - name: Lint, type check, and test
+        run: make ci

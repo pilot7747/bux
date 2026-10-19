@@ -13,7 +13,7 @@ import builtins
 import difflib
 import re
 import typing
-from collections.abc import Callable, Iterator
+from collections.abc import Callable, Generator
 from contextlib import contextmanager
 from dataclasses import dataclass, field
 
@@ -401,7 +401,7 @@ class _Evaluator:
                     span,
                 )
             case _ if isinstance(v, ir.NODE_TYPES):
-                return typing.cast(ir.Node, v)
+                return v
             case cfg.Config():
                 if _tag(v) not in LAYERS:
                     raise BuxError(
@@ -734,7 +734,7 @@ class _Lowering:
         return BuxError(message, self.where[-1] if self.where else None, hint)
 
     @contextmanager
-    def frame(self, label: str) -> Iterator[None]:
+    def frame(self, label: str) -> Generator[None]:
         frame = _Frame(label)
         self.frames.append(frame)
         try:

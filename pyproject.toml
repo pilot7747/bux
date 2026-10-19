@@ -19,6 +19,7 @@ dev = [
     "pygls>=2.1.1",
     "pytest>=9.1.1",
     "ruff>=0.17.1",
+    "ty>=0.0.89",
 ]
 
 [project.scripts]
@@ -40,3 +41,6 @@ build-backend = "uv_build"
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
+
+[tool.ty.terminal]
+error-on-warning = true
