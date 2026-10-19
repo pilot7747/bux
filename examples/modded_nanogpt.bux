@@ -5,7 +5,8 @@ d_model    = 768
 vocab_size = 50304
 
 norm = rmsnorm(affine=false)
-attn = gqa(num_heads=6, num_kv_heads=6, head_dim=128, qk_norm=norm, rope=rope(base=1024))
+attn = gqa(num_heads=6, num_kv_heads=6, head_dim=128, fused_qkv=true, qk_norm=norm,
+           rope=rope(base=1024))
 ffn  = mlp(intermediate_size=4 * d_model, activation=relu2)
 
 # x <- a*x + b*x0, then an ordinary pre-norm block

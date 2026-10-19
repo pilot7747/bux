@@ -223,7 +223,11 @@ class GQAConfig(QuadraticAttentionConfig):
     num_kv_heads: int
     head_dim: int | None = None  # None -> width // num_heads
     v_head_dim: int | None = None  # None -> head_dim (MiMo-V2: 128 against 192)
-    bias: bool = False  # qkv bias (GPT-2, Qwen2)
+    bias: bool = False  # on the projections of the input: q, k, v, gate (GPT-2, Qwen2)
+    output_bias: bool | None = None  # None -> bias (GPT-2); Qwen2 has none
+    # One projection makes the queries, keys and values, split after, instead of one
+    # each: the same function and init, held as one matrix (GPT-2, MiMo-V2.6-Pro).
+    fused_qkv: bool = False
     rope: RoPEConfig | None = None
     # Causal depthwise conv on keys and values, added to them: k + conv(k) (Inkling).
     kv_conv_size: int | None = None

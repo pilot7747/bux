@@ -75,14 +75,17 @@ class Attention(nnx.Module):
         reads = {p.name for p in ports if p.mode != "write"}
         own_kv = "kv" not in reads  # else the kv tap's keys and values replace its own
 
-        def linear(n_in: int, n_out: int) -> nnx.Linear:
-            return nnx.Linear(n_in, n_out, use_bias=c.bias, rngs=rngs)
+        def linear(n_in: int, n_out: int, bias: bool | None = None) -> nnx.Linear:
+            use_bias = c.bias if bias is None else bias
+            return nnx.Linear(n_in, n_out, use_bias=use_bias, rngs=rngs)
 
         # The randomly initialized layers; reordering them changes a seed's init.
-        self.q = linear(width, h * d)
-        self.k = linear(width, kv * d) if own_kv else None
-        self.v = linear(width, kv * dv) if own_kv else None
-        self.o = linear(h * dv, width)
+        fused, split = own_kv and c.fused_qkv, own_kv and not c.fused_qkv
+        self.qkv = linear(width, h * d + kv * (d + dv)) if fused else None
+        self.q = None if fused else linear(width, h * d)
+        self.k = linear(width, kv * d) if split else None
+        self.v = linear(width, kv * dv) if split else None
+        self.o = linear(h * dv, width, c.output_bias)
         conv = c.kv_conv_size if own_kv else None
         self.k_conv = CausalConv(kv * d, conv, False, rngs) if conv else None
         self.v_conv = CausalConv(kv * dv, conv, False, rngs) if conv else None
@@ -109,8 +112,9 @@ class Attention(nnx.Module):
         self.gate_activation = c.gate_activation
 
     def __call__(self, x, taps: Taps):
-        q = self._queries(x)
-        k, v = self._keys_and_values(x, taps)
+        q, *kv = self._projections(x)
+        q = self._queries(q)
+        k, v = self._keys_and_values(*kv) if kv else _read(taps, self.ports, "kv")
         if self.v_mix is not None:  # value residual
             v = self.v_mix * v + (1 - self.v_mix) * _read(taps, self.ports, "v")
         _write(taps, self.ports, "v", v)
@@ -123,23 +127,30 @@ class Attention(nnx.Module):
         out = jnp.einsum("bhts,bshd->bthd", probs, self._per_query_head(v))
         return self._output(x, out)
 
-    def _queries(self, x) -> jax.Array:
-        """The (b, t, heads, head_dim) queries."""
-        b, t, _ = x.shape
-        q = self.q(x).reshape(b, t, self.heads, self.head_dim)
+    def _projections(self, x) -> list[jax.Array]:
+        """The (b, t, channels) queries, then keys and values unless the layer reads
+        them from its kv port: slices of one projection when fused, else one each."""
+        if self.qkv is not None:
+            q, k = self.heads * self.head_dim, self.kv_heads * self.head_dim
+            return jnp.split(self.qkv(x), [q, q + k], axis=-1)
+        return [p(x) for p in (self.q, self.k, self.v) if p is not None]
+
+    def _queries(self, q: jax.Array) -> jax.Array:
+        """The (b, t, heads, head_dim) queries, from their projection."""
+        b, t, _ = q.shape
+        q = q.reshape(b, t, self.heads, self.head_dim)
         if self.q_norm is not None:
             q = self.q_norm(q)
         if self.rope is not None:
             q = rotate(q, self.rope)
         return q
 
-    def _keys_and_values(self, x, taps: Taps) -> tuple[jax.Array, jax.Array]:
+    def _keys_and_values(
+        self, k: jax.Array, v: jax.Array
+    ) -> tuple[jax.Array, jax.Array]:
         """The (b, t, kv_heads, head_dim) keys and (b, t, kv_heads, v_head_dim) values,
-        the layer's own or those it reads from its kv port."""
-        if self.k is None or self.v is None:
-            return _read(taps, self.ports, "kv")
-        b, t, _ = x.shape
-        k, v = self.k(x), self.v(x)
+        from their projections."""
+        b, t, _ = k.shape
         if self.k_conv is not None and self.v_conv is not None:
             k, v = k + self.k_conv(k), v + self.v_conv(v)
         k = k.reshape(b, t, self.kv_heads, self.head_dim)

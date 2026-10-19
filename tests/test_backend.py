@@ -9,7 +9,7 @@ from bux import config as cfg
 from bux.architecture import TOKENS, Attention, Context, Engram, Model, num_params
 from bux.architecture.engram import _ngram_rows
 from bux.architecture.rope import frequencies, rotate
-from bux.lang import compile
+from bux.lang import compile, ir
 
 D, V, H, F = 32, 64, 4, 48
 
@@ -205,6 +205,44 @@ def test_yarn_attention_factor_on_the_softmax_scale():
     # With every dim rotated, both placements give the same attention.
     x = jax.random.normal(jax.random.key(0), (1, 6, D))
     assert jnp.allclose(attn("rotary", 8)(x, {}), attn("softmax", 8)(x, {}), atol=1e-5)
+
+
+def test_fused_qkv_is_the_three_projections_side_by_side():
+    def attn(fused: bool, ports=()) -> Attention:
+        c = cfg.GQAConfig(
+            num_heads=4,
+            num_kv_heads=2,
+            head_dim=8,
+            v_head_dim=4,
+            bias=True,
+            kv_conv_size=3,
+            rope=cfg.RoPEConfig(),
+            fused_qkv=fused,
+        )
+        return Attention(c, D, ports, nnx.Rngs(0))
+
+    split, fused = attn(False), attn(True)
+    assert num_params(fused) == num_params(split)
+    for name in ("kernel", "bias"):
+        parts = [getattr(p, name)[...] for p in (split.q, split.k, split.v)]
+        getattr(fused.qkv, name)[...] = jnp.concatenate(parts, -1)
+    fused.o, fused.k_conv, fused.v_conv = split.o, split.k_conv, split.v_conv
+    x = jax.random.normal(jax.random.key(0), (1, 6, D))
+    assert jnp.allclose(fused(x, {}), split(x, {}), atol=1e-5)
+    # Reading its keys and values from a kv port, it projects only queries.
+    read = attn(True, (ir.Port(name="kv", tap="kv", mode="read"),))
+    assert read.qkv is None and read.q is not None
+
+
+def test_output_bias_follows_bias_unless_set():
+    def attn(**bias) -> Attention:
+        c = cfg.GQAConfig(num_heads=4, num_kv_heads=2, **bias)
+        return Attention(c, D, (), nnx.Rngs(0))
+
+    plain, gpt2, qwen2 = attn(), attn(bias=True), attn(bias=True, output_bias=False)
+    assert gpt2.o.bias is not None and qwen2.o.bias is None
+    assert num_params(gpt2) - num_params(qwen2) == D  # the output's bias alone
+    assert num_params(attn(output_bias=True)) - num_params(plain) == D
 
 
 def test_ngram_rows_look_back_n_tokens_within_a_document():

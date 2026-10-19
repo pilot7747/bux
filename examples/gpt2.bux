@@ -3,7 +3,7 @@ d_model    = 768
 vocab_size = 50257
 
 norm = layernorm(eps=1e-5, bias=true)
-attn = gqa(num_heads=12, num_kv_heads=12, bias=true)
+attn = gqa(num_heads=12, num_kv_heads=12, bias=true, fused_qkv=true)
 ffn  = mlp(intermediate_size=4 * d_model, activation=gelu_tanh, bias=true)
 
 block = [norm attn] [norm ffn]

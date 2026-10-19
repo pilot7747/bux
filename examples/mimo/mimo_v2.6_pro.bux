@@ -11,7 +11,7 @@ vocab_size = 152576
 
 norm    = rmsnorm(eps=1e-5)
 attn    = gqa(num_heads=128, num_kv_heads=8, head_dim=192, v_head_dim=128,
-              rope=rope(base=10000000, fraction=0.334))
+              fused_qkv=true, rope=rope(base=10000000, fraction=0.334))
 local   = attn(sliding_window_size=128, sinks=true, rope.base=10000)
 dense   = gated_mlp(intermediate_size=16384, activation=swish)
 experts = moe(num_experts=384, top_k=8, router=sigmoid, load_balancing=aux_free,

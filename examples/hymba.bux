@@ -5,7 +5,8 @@ d_model    = 1600
 vocab_size = 32001
 
 norm  = rmsnorm
-local = gqa(num_heads=25, num_kv_heads=5, sliding_window_size=1024, rope=rope())
+local = gqa(num_heads=25, num_kv_heads=5, fused_qkv=true, sliding_window_size=1024,
+            rope=rope())
 full  = local(sliding_window_size=none)
 ssm   = mamba(state_size=16)
 ffn   = gated_mlp(intermediate_size=5504, activation=swish)
