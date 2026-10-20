@@ -183,6 +183,39 @@ its signature and registers the default where the layer lives (`"dense"` in
    whose shape it has; any other leaf is replicated.
 4. A name that is not a field of `LayoutConfig` is an error that names the parameter.
 
+## As built: what WP1 changed in the contract
+
+WP0 and WP1 are done (`src/bux/parallel/`, `docs/parallelism.md`). Where they differ
+from the contract above, the code wins:
+
+- **Names are bux's metadata, not Flax's.** `parallel.named(*names, init=LECUN)` is
+  `nnx.with_metadata(init, names=names)`, and a raw parameter is
+  `nnx.Param(value, names=("heads",))`. Flax's `out_sharding` would make
+  `nnx.eval_shape` under a mesh resolve the names as mesh axes and fail, so bux never
+  uses it, and nothing turns Flax's eager sharding off. Pass the layer's current
+  init as `init=`, so that values do not change.
+- **The optimizer's state inherits the names**: Flax's `to_opt_state` copies a
+  parameter's metadata to its moments. Rule 3 (matching paths) is gone; FSDP applies
+  to `nnx.Param` (unless `zero=1`) and to `nnx.OptState`, names to every variable.
+- `use(grid, layout, methods)` validates that every non-default method is
+  registered; a default not registered yet is a call site not wired yet.
+  `parallel.check(batch, seq_len)` raises the batch and seq_len errors, and `train()`
+  calls it.
+- The trainer calls `parallel.place(model, optimizer)` when it is made, and inside
+  every jitted step, so the state never drifts from its shardings (zero=1 needs it).
+- `shard(x, *names)` takes a name, or None, for every dimension. None is whole.
+- `CausalConv(..., channel="kv_heads")` names a conv's channels.
+- `Registry.find(tag)` returns a builder by name; `parallel.method(kind)` uses it.
+  A method registers with `@bux.parallel.methods.<kind>.register("name")`.
+- Fixtures: `losses(source, steps=3, **settings)`, each setting its source
+  (`mesh="mesh(fsdp=8)"`, `optimizer="muon(lr=0.02)"`), with synthetic data,
+  `adamw(lr=1e-2)`, `seq_len=16` and `batch=8` unless given; `involuntary()` counts
+  XLA's full-rematerialization warnings since its last call.
+- Measured with no layer named: every mesh of WP1's tests matches one device to 3e-6
+  with AdamW and Muon. The MoE under `fsdp=2 × expert=2 × tensor=2` rematerializes
+  twice; nothing else does.
+- The suite takes about 6 minutes on 8 fake devices, idle.
+
 ## WP0: JAX 0.12
 
 **Owns:** `pyproject.toml`, `uv.lock`.
