@@ -145,9 +145,11 @@ the run's, or the default outside `use`. A name that is not registered is an err
 where its layer lives.
 
 A method that communicates by hand does it in a `jax.shard_map` over its own axis,
-`axis_names={axis}`, the other axes staying Auto. What reads the whole batch (MoE
-routing, balance losses, the router bias) stays outside, in the global view, so its
-semantics do not change.
+`axis_names={axis}`, the other axes staying Auto; one that sorts tokens, as the MoE's
+do, is manual over every axis that splits them, since a sort in the global view gathers
+every token onto every device. What reads the whole batch (MoE routing, balance
+losses, the router bias) stays outside, in the global view, so its semantics do not
+change.
 
 ## In a script
 
