@@ -1,4 +1,5 @@
-"""Normalization: layernorm, rmsnorm and DyT."""
+"""Normalization: layernorm, rmsnorm and DyT. Norm statistics are in float32, whatever
+dtype the run computes in (``precision``)."""
 
 import jax
 import jax.numpy as jnp
@@ -28,14 +29,21 @@ class Norm(nnx.Module):
             gain = 1 + self.scale if self.zero_centered else self.scale
         if gain is not None and self.scale_input:
             x = x * gain
-        if self.kind == "layernorm":
-            x = x - x.mean(-1, keepdims=True)
-        x = x * jax.lax.rsqrt(jnp.square(x).mean(-1, keepdims=True) + self.eps)
+        x = self.normalize(x)
         if gain is not None and not self.scale_input:
             x = x * gain
         if self.bias is not None:
             x = x + self.bias
         return x
+
+    def normalize(self, x: Float[Array, "*lead d"]) -> Float[Array, "*lead d"]:
+        """x over its RMS, centered first for a layernorm: the statistics in float32,
+        the result in x's dtype."""
+        y = x.astype(jnp.float32)
+        if self.kind == "layernorm":
+            y = y - y.mean(-1, keepdims=True)
+        y = y * jax.lax.rsqrt(jnp.square(y).mean(-1, keepdims=True) + self.eps)
+        return y.astype(x.dtype)
 
 
 @register("layernorm", "rmsnorm")

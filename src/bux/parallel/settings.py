@@ -1,5 +1,5 @@
 """`use`, which puts a run's mesh, layout and methods in force, and `check`, which
-says whether its batches split over the mesh."""
+says whether its batches split into its microbatches and over the mesh."""
 
 import contextlib
 from collections.abc import Generator
@@ -41,20 +41,28 @@ def _row_axes(name: str, on: Active) -> tuple[str, ...]:
 
 
 def check(batch: int, seq_len: int) -> None:
-    """Raise unless `batch` rows of `seq_len` tokens split evenly by rows over the
-    batch axes and by positions over the seq and stream axes."""
+    """Raise unless `batch` rows of `seq_len` tokens split evenly into
+    `methods.microbatches`, each by rows over the batch axes, and by positions over
+    the seq and stream axes."""
     on = active()
     if on is None:
         return
-    for setting, n, name in (
-        ("batch", batch, "batch"),
-        ("seq_len", seq_len, "seq"),
-        ("seq_len", seq_len, "stream"),
+    n = on.methods.microbatches
+    if batch % n:
+        raise ValueError(
+            f"batch = {batch} does not split into methods.microbatches = {n}"
+        )
+    each = f", {n} microbatches of {batch // n} rows" if n > 1 else ""
+    for setting, size, name, times, of in (
+        ("batch", batch, "batch", n, each),
+        ("seq_len", seq_len, "seq", 1, ""),
+        ("seq_len", seq_len, "stream", 1, ""),
     ):
         over = _row_axes(name, on)
-        if n % on.size(*over):
+        if (size // times) % on.size(*over):
             split = " × ".join(f"{a}={on.size(a)}" for a in over)
             raise ValueError(
-                f"{setting} = {n} does not split over layout.{name}, {split}: "
-                f"make it a multiple of {on.size(*over)}, or change mesh or layout"
+                f"{setting} = {size} does not split over layout.{name}, {split}{of}: "
+                f"make it a multiple of {on.size(*over) * times}, or change mesh or "
+                "layout"
             )

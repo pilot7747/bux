@@ -56,8 +56,8 @@ the plan needs no devices:
 $ bux plan examples/experiments/smoke.bux 'mesh = fsdp: mesh(fsdp=8) | one: mesh(data=1)'
 2 runs
 id          params  tokens  tok/param  gpus  params/gpu  optim/gpu  run
-bbbf3ae709  156k    25.6k   0.2        8     76.2KiB     152KiB     smoke[fsdp]
-bbbf3ae709  156k    25.6k   0.2        1     609KiB      1.19MiB    smoke[one]
+5aadfe9db2  156k    25.6k   0.2        8     76.2KiB     152KiB     smoke[fsdp]
+5aadfe9db2  156k    25.6k   0.2        1     609KiB      1.19MiB    smoke[one]
 ```
 
 ## Names
@@ -574,3 +574,107 @@ On one CPU, for the gradient of a 24-layer Llama's forward (`d_model=64`, 8 rows
 
 `Scanned.layers` holds the stacked passes, and `graph.run(graphdef, state, times, x,
 taps)` runs any stack of them, such as a pipeline stage's share.
+
+## Precision and microbatches
+
+```
+precision = precision(compute=bfloat16)   # in the run's id
+methods   = methods(microbatches=4)       # gradient accumulation: not in it
+```
+
+Unlike the settings above, `precision` changes what a run computes, so it is in the
+run's id: `precision.compute = float32 | bfloat16` is a sweep of two runs. `compute` is
+`float32` or `bfloat16`; float16 would need loss scaling.
+
+### Precision
+
+Parameters, their gradients and the optimizer's state stay float32. The train and eval
+steps cast the model's floating-point parameters to `compute` inside the loss
+(`trainer.cast`), so that the forward and the backward compute in it, and gradients
+reach the float32 parameters through the cast. What is not a parameter keeps its
+dtype: the router bias and its counts, RNG state, Lightning's slopes.
+
+Float32 islands compute from what they are given in float32, and give back its dtype:
+
+| where                                           | what is float32                                   |
+|-------------------------------------------------|---------------------------------------------------|
+| `Norm.normalize`, `l2norm`                      | the statistics, and the normalized values          |
+| the MoE's router                                | its logits, scores and top-k, the balance loss and the bias; the weights go back to the stream's dtype |
+| `recurrence`, `delta_rule`, `selective_scan`    | the recurrent state, and its decays               |
+| `rope.rotate`                                   | the rotation                                      |
+| the objective                                   | the logits, as the loss and the z-loss take them  |
+
+Softmax attention computes its logits and softmax in `compute` for now. Every other
+matmul runs in `compute`, and the stream stays in it from the embedding to the logits,
+which `tests/test_precision.py` checks for every family. Gradients are reduced over the
+batch axes in the dtype the backward makes them, bfloat16 for a weight's; they add up
+over microbatches in float32.
+
+XLA:CPU fails to compile a bfloat16 `psum` that a `shard_map`'s transpose makes, as the
+MoE's `sorted` and EP methods do on more than one device (its reducer ends in a copy,
+which `ChangeOpDataType` cannot clone). The tests split bfloat16 runs with
+`methods(moe=dense)`. GPUs all-reduce bfloat16 natively, which this has not been run
+on.
+
+### Microbatches
+
+`methods.microbatches = n` takes each step's batch in n microbatches: a `lax.scan`
+over them inside the train step, their gradients summed in float32, and one update.
+Microbatch i is rows i, i + n, i + 2n and so on (`parallel.microbatches`), so that
+every device's rows split evenly among them and none moves. `batch` must split into n
+microbatches whose rows split over the batch axes, which `parallel.check` says before
+anything is built.
+
+What the step computes is the whole batch's:
+
+- **The objective's terms**, means over targets, weigh by each microbatch's share of
+  the batch's targets (`trainer.weigh`), so that the loss and the z-loss are the
+  batch's, also when a loss mask leaves microbatches with unequal numbers of targets.
+  `mtp`'s heads weigh by the first head's targets.
+- **What layers report** weighs by each microbatch's share of rows, 1 / n: a
+  balance loss over sequences (`aux_loss_scope=sequence`) and the indexer's loss are
+  the batch's. A balance loss over the batch is the mean of the microbatches' own,
+  each over its rows: its f_e and P_e are a microbatch's means, not the batch's.
+- **The router bias** moves once a step, from the whole batch's picks. The trainer
+  sets `deferred` on every module that has it: the MoE's training forwards then route
+  with the bias where the step found it and add their picks to `router_load`, and
+  `settle` moves the bias after the last microbatch. A layer of one's own that learns
+  from the batch outside of gradients does the same (`trainer.Settles`). Called
+  outside a step, a training forward moves the bias at once; and a shared MoE moves
+  once a step, from the picks of all its uses.
+- **Dropout** draws each microbatch's masks in turn from the run's RNG stream: the
+  same distribution as the whole batch's, not the same masks, and the stream's count
+  advances n times a step. A resumed run draws the same.
+
+`tests/test_precision.py` checks the gradients, the metrics and the router bias
+against the whole batch's, on one device and on `fsdp=8` and `fsdp=2, expert=2,
+tensor=2`. Dropout's masks and a balance loss over the batch aside, microbatches
+change how a run computes, not what, so they keep its id as the rest of `methods`
+does.
+
+Each microbatch's gradient is a global array, reduced over the batch axes inside the
+scan: under FSDP, a reduce-scatter a microbatch, as ZeRO-3 does. XLA:GPU has a pass
+(while-loop all-reduce code motion) meant to move a data-parallel all-reduce out of
+such a loop, which this has not been run on; XLA:CPU all-reduces n times a step.
+`parallel.microbatches` is there for pipeline parallelism to split its batch the same
+way.
+
+### Memory and losses
+
+The compiled train step's temporaries on one device, for 4 Llama blocks of width 256,
+`seq_len = 256`, `batch = 32` (`compiled.memory_analysis()`):
+
+| `compute`  | 1 microbatch | 4 microbatches |
+|------------|--------------|----------------|
+| `float32`  | 2032 MiB     | 472 MiB        |
+| `bfloat16` | 1128 MiB     | 225 MiB        |
+
+The loss in `float32` / `bfloat16` of two blocks of width 128 on the tests' corpus of
+eight words, byte by byte (`seq_len = 128`, `batch = 16`, `adamw(lr=3e-3)`, cosine):
+
+| mixer    | step 10         | step 50         | step 200        |
+|----------|-----------------|-----------------|-----------------|
+| `gqa`    | 2.2348 / 2.2389 | 0.4089 / 0.4089 | 0.4209 / 0.4213 |
+| `moe`    | 1.3595 / 1.3602 | 1.0057 / 1.0071 | 1.0250 / 1.0248 |
+| `gdn`    | 1.5034 / 1.4998 | 0.4112 / 0.4269 | 0.4205 / 0.4204 |
+| `mamba2` | 0.9262 / 0.9276 | 0.4134 / 0.4129 | 0.4211 / 0.4207 |

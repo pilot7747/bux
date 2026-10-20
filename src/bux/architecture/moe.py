@@ -63,7 +63,7 @@ def mix(
     idx: Int[Array, "*n k"], weights: Float[Array, "*n k"], e: int
 ) -> Float[Array, "*n e"]:
     """Every expert's weight for each token, 0 outside its top-k picks `idx`."""
-    return (jax.nn.one_hot(idx, e) * weights[..., None]).sum(-2)
+    return (jax.nn.one_hot(idx, e, dtype=weights.dtype) * weights[..., None]).sum(-2)
 
 
 def hidden(
@@ -144,9 +144,12 @@ class MoE(nnx.Module):
         # With shared_expert_sink, the router scores the shared experts too, last.
         sinks = c.num_shared_experts if c.shared_expert_sink else 0
         self.router = _linear(width, e + sinks, ("embed", None), rngs)
-        self.router_bias = (
-            nnx.Variable(jnp.zeros(e)) if c.load_balancing == "aux_free" else None
-        )
+        free = c.load_balancing == "aux_free"
+        self.router_bias = nnx.Variable(jnp.zeros(e)) if free else None
+        # The picks of each expert since the bias last moved; with `deferred` set (by
+        # the trainer), the bias moves in `settle`, once a step, not in every forward.
+        self.router_load = nnx.Variable(jnp.zeros(e)) if free else None
+        self.deferred = False
         self.bias_update_rate = c.bias_update_rate
         self.aux_loss_weight = c.aux_loss_weight
         self.per_sequence = c.aux_loss_scope == "sequence"
@@ -202,8 +205,9 @@ class MoE(nnx.Module):
     ]:
         """Each token's top-k experts and their weights, and the shared experts'
         weights if the router scores them too; in a training forward, it also
-        balances the experts."""
-        logits = self.router(x) * self.router_logit_scale
+        balances the experts. Scores and top-k are in float32, the weights in x's
+        dtype."""
+        logits = self.router(x.astype(jnp.float32)) * self.router_logit_scale
         match self.router_fn:
             case "softmax":
                 scores = jax.nn.softmax(logits)
@@ -217,27 +221,37 @@ class MoE(nnx.Module):
             choice = _limit_groups(choice, self.groups, self.top_k_groups)
         _, idx = jax.lax.top_k(choice, self.top_k)
         if training(taps):
-            self._balance(scores.astype(jnp.float32), idx, taps)
+            self._balance(scores, idx, taps)
         weights = jnp.take_along_axis(scores, idx, axis=-1)
         if self.normalize:
             total = weights.sum(-1, keepdims=True) + sinks.sum(-1, keepdims=True)
             weights, sinks = weights / total, sinks / total
-        sinks = sinks * self.scaling if sinks.shape[-1] else None
-        return idx, weights * self.scaling, sinks
+        weights, sinks = (w.astype(x.dtype) * self.scaling for w in (weights, sinks))
+        return idx, weights, sinks if sinks.shape[-1] else None
 
     def _balance(
         self, scores: Float[Array, "b t e"], idx: Int[Array, "b t k"], taps: Taps
     ) -> None:
-        """Report the balance loss, and move the router bias toward the experts
-        picked less than the mean over the batch (DeepSeek-V3)."""
+        """Report the balance loss, and count the picks for the router bias, which
+        moves now unless `deferred`."""
         picks = jax.nn.one_hot(idx, scores.shape[-1]).sum(-2)
         if self.aux_loss_weight:
             loss = balance_loss(scores, picks, self.top_k, self.per_sequence)
             report(taps, "balance_loss", self.aux_loss_weight, loss)
-        if self.router_bias is not None:
-            load = picks.sum((0, 1))
-            step = self.bias_update_rate * jnp.sign(load.mean() - load)
-            self.router_bias[...] = self.router_bias[...] + step
+        if self.router_load is not None:
+            self.router_load[...] = self.router_load[...] + picks.sum((0, 1))
+            if not self.deferred:
+                self.settle()
+
+    def settle(self) -> None:
+        """Move the router bias toward the experts picked less than the mean since it
+        last moved (DeepSeek-V3), and count again from zero."""
+        if self.router_bias is None or self.router_load is None:
+            return
+        load = self.router_load[...]
+        step = self.bias_update_rate * jnp.sign(load.mean() - load)
+        self.router_bias[...] = self.router_bias[...] + step
+        self.router_load[...] = jnp.zeros_like(load)
 
     def kernels(self) -> Kernels:
         """The routed experts' kernels, as arrays."""

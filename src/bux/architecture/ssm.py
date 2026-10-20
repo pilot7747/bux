@@ -37,11 +37,14 @@ def selective_scan(
 
     with the heads in g groups that share B and C, as kv heads share keys in GQA. Mamba
     has a head a channel (p = 1) and an A a channel and state dim; Mamba-2 has an A a
-    head (n = 1 in A). The state starts at zero, and again where a document starts."""
+    head (n = 1 in A). The state starts at zero, and again where a document starts.
+    In float32, the outputs in x's dtype."""
     b, t, h, p = x.shape
     n, per_group = B.shape[-1], h // B.shape[2]
     within = jnp.ones((b, t), jnp.int32) if docs is None else docs.within
-    keep = (within > 0).astype(x.dtype)  # 0 where a document starts
+    keep = (within > 0).astype(jnp.float32)  # 0 where a document starts
+    dtype = x.dtype
+    x, dt, A, B, C = (a.astype(jnp.float32) for a in (x, dt, A, B, C))
 
     def step(
         state: Float[Array, "b h p n"],
@@ -62,8 +65,8 @@ def selective_scan(
         return state, jnp.einsum("bhpn,bhn->bhp", state, C)
 
     time_major = jax.tree.map(lambda a: jnp.moveaxis(a, 1, 0), (x, dt, B, C, keep))
-    _, y = jax.lax.scan(step, jnp.zeros((b, h, p, n), x.dtype), time_major)
-    return jnp.moveaxis(y, 0, 1)
+    _, y = jax.lax.scan(step, jnp.zeros((b, h, p, n), jnp.float32), time_major)
+    return jnp.moveaxis(y, 0, 1).astype(dtype)
 
 
 def _dt_bias(
@@ -146,7 +149,7 @@ class Mamba(nnx.Module):
         dt, B, C = jnp.split(self.x_proj(u), [r, r + n], axis=-1)
         dt = jax.nn.softplus(self.dt_norm(dt) @ self.dt_proj[...] + self.dt_bias[...])
         B, C = self.b_norm(B)[:, :, None], self.c_norm(C)[:, :, None]
-        A = -jnp.exp(self.A_log[...])
+        A = -jnp.exp(self.A_log[...].astype(jnp.float32))
         y = selective_scan(u[..., None], dt, A, B, C, segments(taps))[..., 0]
         return self.out_proj(_channels((y + u * self.D[...]) * jax.nn.silu(z), "mlp"))
 
@@ -202,7 +205,7 @@ class Mamba2(nnx.Module):
         u = parallel.shard(u.reshape(b, t, self.heads, self.head_dim), *_HEADS, None)
         B, C = B.reshape(b, t, g, n), C.reshape(b, t, g, n)
         dt = parallel.shard(jax.nn.softplus(dt + self.dt_bias[...]), *_HEADS)
-        A = -jnp.exp(self.A_log[...])[:, None]
+        A = -jnp.exp(self.A_log[...].astype(jnp.float32))[:, None]
         y = selective_scan(u, dt, A, B, C, segments(taps)) + u * self.D[...][:, None]
         y = y.reshape(b, t, e) * jax.nn.silu(z)
         y = self.norm(y.reshape(b, t, g, -1)).reshape(b, t, e)

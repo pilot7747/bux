@@ -1,5 +1,5 @@
 """Where state and batches live: the sharding of every variable, a model born
-sharded, and batches split by rows."""
+sharded, and batches split by rows, and into microbatches."""
 
 from collections.abc import Callable
 
@@ -10,7 +10,7 @@ from jax.sharding import NamedSharding
 from jax.sharding import PartitionSpec as P
 from jaxtyping import Array, Shaped
 
-from bux.parallel.layout import NAMES, fsdp, partition, resolve
+from bux.parallel.layout import NAMES, fsdp, partition, resolve, shard
 from bux.parallel.mesh import Active, active
 
 
@@ -77,3 +77,19 @@ def rows[T](batch: T) -> T:
         return jax.make_array_from_callback(x.shape, split, lambda part: x[part])
 
     return jax.tree.map(put, batch)
+
+
+def microbatches[T](batch: T, n: int) -> T:
+    """Every (b, ...) array of `batch` as `n` microbatches, (n, b / n, ...): microbatch
+    i the rows i, i + n, i + 2n and so on, so that every device's rows split evenly
+    among them, and none moves. Each splits by rows over `batch` and positions over
+    `seq`, as ``rows`` puts them."""
+
+    def split(x: Shaped[Array, "b ..."]) -> Shaped[Array, "n m ..."]:
+        b = x.shape[0]
+        if b % n:
+            raise ValueError(f"{b} rows do not split into {n} microbatches")
+        y = x.reshape(b // n, n, *x.shape[1:]).swapaxes(0, 1)
+        return shard(y, *(None, "batch", "seq", *(None,) * x.ndim)[: y.ndim])
+
+    return jax.tree.map(split, batch)

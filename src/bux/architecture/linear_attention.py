@@ -107,7 +107,9 @@ def delta_rule(
 
         S_t = (I - beta_t k_t k_t^T) diag(w_t) S_{t-1} + beta_t k_t v_t^T.
 
-    That is `recurrence` with a = -w k, and b = beta k for k."""
+    That is `recurrence` with a = -w k, and b = beta k for k: in float32, as
+    `recurrence` is."""
+    k, log_decay = k.astype(jnp.float32), log_decay.astype(jnp.float32)
     step = beta[..., None] * k
     return recurrence(q, step, v, log_decay, docs, a=-jnp.exp(log_decay) * k, b=step)
 
@@ -127,8 +129,11 @@ def heads(y: Float[Array, "b t h *k"]) -> Float[Array, "b t h *k"]:
 
 
 def l2norm(x: Float[Array, "*lead k"], eps: float = 1e-6) -> Float[Array, "*lead k"]:
-    """x over its L2 norm, as fla computes it: x / sqrt(|x|^2 + eps)."""
-    return x * jax.lax.rsqrt(jnp.square(x).sum(-1, keepdims=True) + eps)
+    """x over its L2 norm, as fla computes it: x / sqrt(|x|^2 + eps); in float32, the
+    result in x's dtype."""
+    y = x.astype(jnp.float32)
+    y = y * jax.lax.rsqrt(jnp.square(y).sum(-1, keepdims=True) + eps)
+    return y.astype(x.dtype)
 
 
 class LowRank(nnx.Module):
