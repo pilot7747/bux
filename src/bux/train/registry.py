@@ -40,12 +40,16 @@ class Registry[T]:
 
         return decorate
 
-    def build(self, config: Tagged, *args: Any) -> T:
-        """What `config` builds, given the builder's other arguments."""
-        builder = self.builders.get(config.type)
+    def find(self, tag: str) -> Callable[..., T]:
+        """The builder registered under `tag`."""
+        builder = self.builders.get(tag)
         if builder is None:
             raise NotImplementedError(
-                f"the trainer has no {config.type!r} {self.kind} yet; "
-                f"add one with @{self.where}.register({config.type!r})"
+                f"the trainer has no {tag!r} {self.kind} yet; "
+                f"add one with @{self.where}.register({tag!r})"
             )
-        return builder(config, *args)
+        return builder
+
+    def build(self, config: Tagged, *args: Any) -> T:
+        """What `config` builds, given the builder's other arguments."""
+        return self.find(config.type)(config, *args)

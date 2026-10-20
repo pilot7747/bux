@@ -1,4 +1,5 @@
-"""Trains a compiled Run with the reference Flax NNX backend, on the default device.
+"""Trains a compiled Run with the reference Flax NNX backend, on the devices its mesh
+takes (``bux.parallel``).
 
 A run's directory, ``<out>/<name>-<id>``, holds:
 
@@ -26,12 +27,12 @@ from collections.abc import Callable, Iterable, Iterator, Mapping, Sequence
 from pathlib import Path
 from typing import Any
 
-import jax
 import jax.numpy as jnp
 import optax
 from flax import nnx
 from jaxtyping import Array, Float
 
+from bux import parallel
 from bux.architecture import Model
 from bux.architecture.registry import Loss
 from bux.data.pipeline import DEFAULT_CACHE, jobs, prepare
@@ -40,7 +41,7 @@ from bux.lang.printer import run_to_source
 from bux.train.data import Batch, batches
 from bux.train.hooks import Checkpoint, Eval, Hook, Log, Metrics
 from bux.train.objective import Objective, objective
-from bux.train.optim import optimizer, peak, schedule
+from bux.train.optim import Schedule, optimizer, peak, schedule
 from bux.train.sinks import JSONL, Console, Latest, Sink
 
 
@@ -65,6 +66,9 @@ class Trainer:
     changes what a step does (accumulates gradients, keeps an average of the weights,
     skips a spike) and keeps the loop, hooks and checkpoints. They get the model and
     the optimizer as arguments, which is how nnx.jit sees them change.
+
+    Made inside ``parallel.use``, it puts its state on the shardings the layout gives
+    it, and every step keeps it there.
     """
 
     def __init__(
@@ -72,10 +76,18 @@ class Trainer:
     ):
         self.model, self.objective = model, objective
         self.optimizer = nnx.Optimizer(model, tx, wrt=nnx.Param)
+        parallel.place(self.model, self.optimizer)
         self.step = 0
         self.stopping = False  # set, by a signal handler say, to stop after this step
-        self._train = nnx.jit(self.train_step)
+        self._train = nnx.jit(self._placed_step)
         self._eval = nnx.jit(self.eval_step)
+
+    def _placed_step(
+        self, model: Model, optimizer: nnx.Optimizer, batch: Batch
+    ) -> Metrics:
+        metrics = self.train_step(model, optimizer, batch)
+        parallel.place(model, optimizer)
+        return metrics
 
     def train_step(
         self, model: Model, optimizer: nnx.Optimizer, batch: Batch
@@ -97,7 +109,7 @@ class Trainer:
 
     def update(self, batch: Batch) -> Metrics:
         """Take a step on `batch`."""
-        metrics = self._train(self.model, self.optimizer, jax.device_put(batch))
+        metrics = self._train(self.model, self.optimizer, parallel.rows(batch))
         self.step += 1
         return metrics
 
@@ -105,7 +117,7 @@ class Trainer:
         """The mean of `eval_step` over `batches`, in eval mode."""
         self.model.eval()
         try:
-            losses = [float(self._eval(self.model, jax.device_put(b))) for b in batches]
+            losses = [float(self._eval(self.model, parallel.rows(b))) for b in batches]
         finally:
             self.model.train()
         return sum(losses) / len(losses)
@@ -174,34 +186,49 @@ def train(
     (folder / "run.bux").write_text(run_to_source(run), encoding="utf-8")
     (folder / "run.json").write_text(run.model_dump_json(indent=2), encoding="utf-8")
 
-    model = Model(run.arch, rngs=nnx.Rngs(t.seed))
-    multiplier = schedule(t.schedule, t.steps)
-    tx = optimizer(t.optimizer, multiplier, model, t.clip)
-    trainer = Trainer(model, tx, objective(t.loss, run.arch))
+    with parallel.use(t.mesh, t.layout, t.methods):
+        parallel.check(t.batch, t.seq_len)
+        model = parallel.build(lambda: Model(run.arch, rngs=nnx.Rngs(t.seed)))
+        multiplier = schedule(t.schedule, t.steps)
+        tx = optimizer(t.optimizer, multiplier, model, t.clip)
+        trainer = Trainer(model, tx, objective(t.loss, run.arch))
+        read = functools.partial(batches, t=t, vocab_size=vocab, cache=cache)
+        lr = peak(t.optimizer.lr, multiplier)
+        own = _hooks(run, trainer, folder, lr, read, echo)
+        latest = Latest()
+        trainer.fit(
+            read(t.data, start=trainer.step),
+            t.steps,
+            hooks=[*own, *hooks],
+            sinks=[
+                Console(run.name, t.steps, echo),
+                JSONL(folder / "metrics.jsonl", append=trainer.step > 0),
+                latest,
+                *sinks,
+            ],
+        )
+    return latest.metrics
 
-    lr = peak(t.optimizer.lr, multiplier)
+
+def _hooks(
+    run: ir.Run,
+    trainer: Trainer,
+    folder: Path,
+    lr: Schedule,
+    read: Callable[..., Iterator[Batch]],
+    echo: Callable[[str], None],
+) -> list[Hook]:
+    """The run's own hooks: its log, eval and checkpoint, which resumes `trainer`
+    from the latest checkpoint in `folder` if there is one. `read` makes the
+    batches of a data config."""
+    t = run.train
     own: list[Hook] = [Log(every=t.log.every, lr=lr, tokens=t.batch * t.seq_len)]
     if t.eval is not None:
-        held_out = functools.partial(
-            batches, t.eval.data, t, vocab, cache=cache, stream=1
-        )
+        held_out = functools.partial(read, t.eval.data, stream=1)
         own.append(Eval(held_out, every=t.eval.every, batches=t.eval.batches))
     if (c := t.checkpoint) is not None:
         checkpoint = Checkpoint(folder / "checkpoints", every=c.every, keep=c.keep)
         if checkpoint.restore(trainer):
             echo(f"{run.name}: resuming at step {trainer.step}")
         own.append(checkpoint)
-
-    latest = Latest()
-    trainer.fit(
-        batches(t.data, t, vocab, cache=cache, start=trainer.step),
-        t.steps,
-        hooks=[*own, *hooks],
-        sinks=[
-            Console(run.name, t.steps, echo),
-            JSONL(folder / "metrics.jsonl", append=trainer.step > 0),
-            latest,
-            *sinks,
-        ],
-    )
-    return latest.metrics
+    return own

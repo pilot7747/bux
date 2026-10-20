@@ -1,7 +1,8 @@
 """The graph side: one small module per IR node kind, assembled by ``build_node``.
 
 A residual branch outside any other is the residual algebra's (``residual``), when the
-architecture sets one; inside a branch, or without one, it is a plain skip.
+architecture sets one; inside a branch, or without one, it is a plain skip. What a
+branch returns is the stream, which splits as the layout's `stream` says.
 """
 
 import functools
@@ -14,6 +15,7 @@ from jaxtyping import Array, Shaped
 from bux.architecture import residual
 from bux.architecture.registry import Context, Stream, Taps, build_layer
 from bux.lang import ir
+from bux.parallel import stream
 
 
 class Sequence(nnx.Module):
@@ -31,7 +33,7 @@ class ResidualBranch(nnx.Module):
         self.body = body
 
     def __call__(self, x: Stream, taps: Taps) -> Stream:
-        return x + self.body(x, taps)
+        return stream(x + self.body(x, taps))
 
 
 class Parallel(nnx.Module):

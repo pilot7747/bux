@@ -21,6 +21,7 @@ from bux import config as cfg
 from bux.architecture.norm import Norm
 from bux.architecture.registry import Context, Taps, register
 from bux.lang import ir
+from bux.parallel import stream
 
 # In Sinkhorn's sums and added to mhc's read: DeepSeek-V4's hc_eps.
 _EPS = 1e-6
@@ -162,7 +163,7 @@ class HyperConnections(nnx.Module):
         if self.dynamic_beta is not None:
             beta = beta + self.dynamic_beta(x)[..., 0]
         kept = jnp.einsum("btjk,btjd->btkd", alpha[..., 1:], x)
-        return kept + beta[..., None] * y[:, :, None]
+        return stream(kept + beta[..., None] * y[:, :, None])
 
 
 class ManifoldHyperConnections(nnx.Module):
@@ -234,7 +235,7 @@ class ManifoldHyperConnections(nnx.Module):
         res = sinkhorn(logits[..., 2 * n :].reshape(b, t, n, n), self.iters)
         y = self.body(jnp.einsum("btn,btnd->btd", read, x), taps)
         kept = jnp.einsum("btjk,btjd->btkd", res, x)
-        return kept + post[..., None] * y[:, :, None]
+        return stream(kept + post[..., None] * y[:, :, None])
 
 
 class GatedResidual(nnx.Module):
@@ -283,7 +284,7 @@ class GatedResidual(nnx.Module):
         r = self.norm(x)
         y = self.body(self._read(r), taps)
         weight = 2 * jax.nn.sigmoid(self.write(r.reshape(b, t, n * d)) / n)
-        return x + weight[..., None] * y[:, :, None]
+        return stream(x + weight[..., None] * y[:, :, None])
 
 
 class AttentionResidual(nnx.Module):
@@ -312,7 +313,7 @@ class AttentionResidual(nnx.Module):
     ) -> Float[Array, "b t s+1 d"]:
         assert self.body is not None
         y = self.body(self.read(x), taps)
-        return jnp.concatenate([x, y[:, :, None]], 2)
+        return stream(jnp.concatenate([x, y[:, :, None]], 2))
 
 
 class ResidualGate(nnx.Module):
@@ -340,7 +341,7 @@ class ResidualGate(nnx.Module):
 
     def __call__(self, x: Float[Array, "b t d"], taps: Taps) -> Float[Array, "b t d"]:
         a, b = self.weights()
-        return a * x + b * self.body(x, taps)
+        return stream(a * x + b * self.body(x, taps))
 
 
 Reader = HyperConnections | ManifoldHyperConnections | GatedResidual | AttentionResidual

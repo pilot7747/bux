@@ -73,6 +73,9 @@ fe14a5e39c  183M    3B      16.4       attention_ablation[mha, optimizer.lr=3e-3
 | `eval`       | `eval(data=..., every=..., batches=...)`, or `none`    | `none`         |
 | `checkpoint` | `checkpoint(every=..., keep=...)`, or `none`           | `none`         |
 | `log`        | `log(every=...)`                                       | `log`          |
+| `mesh`       | `mesh(data=..., fsdp=..., tensor=...)`: the device grid | `mesh`: every device on `data` |
+| `layout`     | `layout(...)`: which mesh axes each named dimension splits over | `layout` |
+| `methods`    | `methods(attention=..., moe=..., ...)`: how what communicates is computed | `methods` |
 
 The settings of each config are pydantic fields in `bux/train/config.py`, and the
 editor shows them on hover and completes them, as it does for layers. In short:
@@ -264,7 +267,8 @@ bux json  examples/experiments/smoke.bux     # every run's IR
 `bux.lang.compile_runs(source)` returns a `Run` per combination: an `Architecture`, a
 `TrainConfig` (`bux/train/config.py`), a name, and the alternatives it took, all plain
 pydantic. `bux.train.trainer.train(run)` trains one with the reference Flax NNX
-backend, on the default device, into `runs/<name>-<id>/`:
+backend, on the devices its `mesh` takes (see the
+[parallelism guide](parallelism.md)), into `runs/<name>-<id>/`:
 
 ```
 run.bux        the run as one file: no modules, no alternatives; bux train takes it as is
@@ -274,8 +278,9 @@ checkpoints/   model and optimizer state, with a checkpoint setting (orbax)
 ```
 
 The id is a hash of what the run computes: renaming a definition, reaching the same
-settings through another file or a sweep, or logging, evaluating and checkpointing at
-other intervals keeps it, and anything else changes it. So a changed run starts in a
+settings through another file or a sweep, logging, evaluating and checkpointing at
+other intervals, or splitting it over devices another way (`mesh`, `layout`,
+`methods`) keeps it, and anything else changes it. So a changed run starts in a
 directory of its own, and an unchanged one started again resumes from its latest
 checkpoint, ending exactly where it would have.
 

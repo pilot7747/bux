@@ -201,6 +201,10 @@ def strip(node: Node, *, labels: bool = True, widths: bool = True) -> Node:
     return node.model_copy(update=update)
 
 
+# Training settings that change how a run is watched or computed, not what it computes.
+_UNCOMPUTED = {"log", "eval", "checkpoint", "mesh", "layout", "methods"}
+
+
 class Run(BaseModel):
     """One training run: an architecture and how to train it, with every setting resolved.
 
@@ -219,13 +223,12 @@ class Run(BaseModel):
 
     @property
     def id(self) -> str:
-        """A hash of what the run computes, not of how it is written or watched:
-        renaming a definition, reaching the same settings through a sweep, or logging,
-        evaluating and checkpointing at other intervals keeps it."""
+        """A hash of what the run computes, not of how it is written, watched or
+        split over devices: renaming a definition, reaching the same settings through a
+        sweep, logging, evaluating and checkpointing at other intervals, or another
+        mesh, layout or methods keeps it."""
         arch = self.arch.model_copy(update={"graph": strip(self.arch.graph)})
-        train = self.train.model_dump(
-            mode="json", exclude={"log", "eval", "checkpoint"}
-        )
+        train = self.train.model_dump(mode="json", exclude=_UNCOMPUTED)
         what = {"arch": arch.model_dump(mode="json"), "train": train}
         blob = json.dumps(what, sort_keys=True, separators=(",", ":"))
         return hashlib.sha256(blob.encode()).hexdigest()[:10]

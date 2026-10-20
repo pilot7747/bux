@@ -23,4 +23,5 @@ with Flax NNX.
   Write short functions with clear names, and comment only what the code can't say.
 - **The DSL is the interface.** If an experiment can be written in `.bux`, write it
   there. Extend the language or a registry instead of writing Python for one
-  experiment. See `docs/language.md`, `docs/training.md`, and `docs/data.md`.
+  experiment. See `docs/language.md`, `docs/training.md`, `docs/data.md`, and
+  `docs/parallelism.md`.

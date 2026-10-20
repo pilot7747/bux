@@ -13,7 +13,8 @@ from bux.lang import ir
 
 
 class CausalConv(nnx.Module):
-    """Depthwise causal convolution over positions."""
+    """Depthwise causal convolution over positions, its channels named `channel`
+    (``bux.parallel``)."""
 
     def __init__(
         self,
@@ -24,10 +25,12 @@ class CausalConv(nnx.Module):
         *,
         dilation: int = 1,
         zero: bool = False,
+        channel: str | None = None,
     ):
         init = nnx.initializers.zeros if zero else nnx.initializers.lecun_normal()
-        self.weight = nnx.Param(init(rngs.params(), (size, channels)))
-        self.bias = nnx.Param(jnp.zeros(channels)) if bias else None
+        weight = init(rngs.params(), (size, channels))
+        self.weight = nnx.Param(weight, names=(None, channel))
+        self.bias = nnx.Param(jnp.zeros(channels), names=(channel,)) if bias else None
         self.dilation = dilation
 
     def __call__(

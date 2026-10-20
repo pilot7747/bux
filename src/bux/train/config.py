@@ -288,6 +288,59 @@ class LogConfig(Config):
     every: Positive = 10
 
 
+# --- Parallelism -----------------------------------------------------------------------
+# How a run splits over devices, which changes how it computes, not what: none of the
+# three is in the run's id. bux.parallel reads them; docs/parallelism.md explains them.
+
+Axis = Literal["data", "stage", "fsdp", "context", "expert", "tensor"]
+Axes = Axis | tuple[Axis, ...] | None  # the mesh axes a named dimension splits over
+
+
+class MeshConfig(Config):
+    """The device grid: a size per axis, the slowest links first."""
+
+    type: Literal["mesh"] = "mesh"
+    data: Positive | None = None  # None: the devices the other axes leave
+    stage: Positive = 1
+    fsdp: Positive = 1
+    context: Positive = 1
+    expert: Positive = 1
+    tensor: Positive = 1
+
+
+class LayoutConfig(Config):
+    """Which mesh axes each named dimension of parameters and activations splits over.
+    A dimension the axes' sizes do not divide stays whole."""
+
+    type: Literal["layout"] = "layout"
+    batch: Axes = ("data", "fsdp", "expert")  # rows
+    seq: Axes = "context"  # positions, inside a layer
+    stream: Axes = "context"  # positions of the residual stream, between branches
+    embed: Axes = None  # the model's width
+    vocab: Axes = "tensor"
+    heads: Axes = "tensor"  # query heads, or a mixer's heads
+    kv_heads: Axes = "tensor"
+    mlp: Axes = "tensor"  # hidden units
+    experts: Axes = "expert"
+    latent: Axes = None  # low-rank bottlenecks: MLA, LatentMoE
+    zero: Literal[1, 3] = 3  # 1: FSDP splits the optimizer state alone
+
+
+class MethodsConfig(Config):
+    """How each part that communicates is computed, by the name of a function in its
+    registry in bux.parallel.methods: another method is a function, not a field."""
+
+    type: Literal["methods"] = "methods"
+    attention: str = "xla"
+    moe: str = "dense"
+    recurrence: str = "scan"
+    repeat: str = "unroll"
+    remat: str = "none"
+    pipeline: str = "gpipe"
+    orthogonalize: str = "gspmd"  # how Muon reaches whole matrices
+    microbatches: Positive = 1
+
+
 class TrainConfig(Config):
     """The training settings of a run: one field per top-level setting of a .bux file."""
 
@@ -305,6 +358,9 @@ class TrainConfig(Config):
     eval: EvalConfig | None = None
     checkpoint: CheckpointConfig | None = None
     log: LogConfig = LogConfig()
+    mesh: MeshConfig = MeshConfig()
+    layout: LayoutConfig = LayoutConfig()
+    methods: MethodsConfig = MethodsConfig()
 
 
 # The configs a .bux file calls by name, besides layers and their settings.
@@ -325,7 +381,10 @@ Setting = Annotated[
     | LossConfig
     | EvalConfig
     | CheckpointConfig
-    | LogConfig,
+    | LogConfig
+    | MeshConfig
+    | LayoutConfig
+    | MethodsConfig,
     Field(discriminator="type"),
 ]
 
