@@ -1,5 +1,6 @@
 """The leaf registry, the context builders get, and the taps modules are called with."""
 
+from collections import Counter
 from collections.abc import Callable
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING
@@ -39,8 +40,10 @@ class Context:
     rngs: nnx.Rngs
     shared: dict[str, nnx.Module] = field(default_factory=dict)
     embedding: "Embedding | None" = None
-    engrams: int = 0  # engram layers built so far
+    built: Counter[str] = field(default_factory=Counter)  # layers so far, by type
     primes: set[int] = field(default_factory=set)  # engram table sizes taken
+    depth: int = 0  # residual branches the node being built is inside
+    branches: int = 0  # branches the residual algebra has built so far
 
 
 Builder = Callable[..., nnx.Module]
@@ -64,4 +67,6 @@ def build_layer(layer: ir.Layer, ctx: Context) -> nnx.Module:
             f"the reference backend has no '{config.type}' layer yet; "
             f"add one with @bux.architecture.register({config.type!r})"
         )
-    return builder(config, layer.width, layer.ports, ctx)
+    module = builder(config, layer.width, layer.ports, ctx)
+    ctx.built[config.type] += 1
+    return module

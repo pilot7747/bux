@@ -1,4 +1,8 @@
-"""The graph side: one small module per IR node kind, assembled by ``build_node``."""
+"""The graph side: one small module per IR node kind, assembled by ``build_node``.
+
+A residual branch outside any other is the residual algebra's (``residual``), when the
+architecture sets one; inside a branch, or without one, it is a plain skip.
+"""
 
 import functools
 import operator
@@ -7,6 +11,7 @@ import jax.numpy as jnp
 from flax import nnx
 from jaxtyping import Array, Shaped
 
+from bux.architecture import residual
 from bux.architecture.registry import Context, Stream, Taps, build_layer
 from bux.lang import ir
 
@@ -96,7 +101,7 @@ def _build(node: ir.Node, ctx: Context) -> nnx.Module:
         case ir.Seq(items=items):
             return Sequence([build_node(item, ctx) for item in items])
         case ir.Residual(body=body):
-            return ResidualBranch(build_node(body, ctx))
+            return _residual(body, ctx)
         case ir.Sum(terms=terms):
             return Parallel([build_node(t, ctx) for t in terms], "sum")
         case ir.Prod(factors=factors):
@@ -114,3 +119,15 @@ def _build(node: ir.Node, ctx: Context) -> nnx.Module:
         case ir.Ref(name=name, pop=pop):
             return TapRead(name, pop)
     raise AssertionError(node)
+
+
+def _residual(body: ir.Node, ctx: Context) -> nnx.Module:
+    """The branch around `body`: the algebra's at depth 0, else a plain skip."""
+    ctx.depth += 1
+    try:
+        inner = build_node(body, ctx)
+    finally:
+        ctx.depth -= 1
+    if ctx.arch.residual is None or ctx.depth > 0:
+        return ResidualBranch(inner)
+    return residual.branch(ctx.arch.residual, inner, ctx)

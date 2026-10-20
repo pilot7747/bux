@@ -328,13 +328,23 @@ class LightningAttentionConfig(LinearAttentionConfig):
 
     type: Literal["lightning"] = "lightning"
     conv_size: int | None = None
+    output_gate: Literal["swish", "sigmoid"] | None = "sigmoid"  # MiniMax-01
 
 
 class RWKV7Config(LinearAttentionConfig):
-    """RWKV-7 "Goose" time mixing: generalized delta rule with vector-valued gates (Peng et al., 2025)."""
+    """RWKV-7 "Goose" time mixing: generalized delta rule with vector-valued gates (Peng et al., 2025).
+
+    Ports: ``v`` exports the values, or imports them for RWKV-7's value residual: the
+    first layer exports its values, and every later one mixes them into its own, by a
+    learned amount a channel from a projection of rank `v_rank`.
+    """
+
+    ports: ClassVar[frozenset[str]] = frozenset({"v"})
 
     type: Literal["rwkv7"] = "rwkv7"
     conv_size: int | None = None
+    # The gate is a low-rank projection with this activation between, act(x G1) G2.
+    output_gate: Literal["swish", "sigmoid"] | None = "sigmoid"
     decay_rank: int = 64
     a_rank: int = 64
     v_rank: int = 32

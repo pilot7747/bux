@@ -21,10 +21,6 @@ class Model(nnx.Module):
     """
 
     def __init__(self, arch: ir.Architecture, *, rngs: nnx.Rngs):
-        if arch.residual is not None:
-            raise NotImplementedError(
-                "hyper-connections are not in the reference backend yet"
-            )
         self.graph = build_node(arch.graph, Context(arch, rngs))
 
     def outputs(

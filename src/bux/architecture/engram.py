@@ -82,8 +82,7 @@ class Engram(nnx.Module):
         self.offsets = nnx.Variable(
             jnp.asarray(offsets, jnp.uint32).reshape(orders, heads)
         )
-        ctx.engrams += 1
-        rng = np.random.default_rng(10007 * ctx.engrams)
+        rng = np.random.default_rng(10007 * (ctx.built["engram"] + 1))
         odd = rng.integers(0, 2**31, c.max_ngram_size) * 2 + 1
         self.multipliers = nnx.Variable(jnp.asarray(odd, jnp.uint32))
         # A stand-in for the tokenizer's normalized classes, which a checkpoint replaces.

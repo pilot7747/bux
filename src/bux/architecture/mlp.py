@@ -24,18 +24,20 @@ class MLP(nnx.Module):
         self.limit, self.up_softcap = c.limit, c.up_softcap
         self.dropout = nnx.Dropout(c.dropout, rngs=rngs)
 
+    def hidden(self, x: Float[Array, "*lead d"]) -> Float[Array, "*lead f"]:
+        """What the down projection takes."""
+        up = bound(self.up(x), self.limit, self.up_softcap)
+        if self.gate is None:
+            return activation(self.activation, up)
+        gate = self.gate(x)
+        if self.limit is not None:
+            gate = jnp.minimum(gate, self.limit)
+        return activation(self.activation, gate) * up
+
     def __call__(
         self, x: Float[Array, "*lead d"], taps: Taps | None = None
     ) -> Float[Array, "*lead d"]:
-        up = bound(self.up(x), self.limit, self.up_softcap)
-        if self.gate is not None:
-            gate = self.gate(x)
-            if self.limit is not None:
-                gate = jnp.minimum(gate, self.limit)
-            h = activation(self.activation, gate) * up
-        else:
-            h = activation(self.activation, up)
-        return self.dropout(self.down(h))
+        return self.dropout(self.down(self.hidden(x)))
 
 
 @register("mlp", "gated_mlp")

@@ -1,4 +1,4 @@
-"""Rotary position embeddings, with position interpolation and YaRN scaling."""
+"""Rotary position embeddings, with position interpolation, YaRN and Llama 3 scaling."""
 
 import math
 
@@ -42,8 +42,15 @@ def frequencies(
             inv_freq = inv_freq / y.factor * ramp + inv_freq * (1 - ramp)
             on_rotary = y.attention_factor_on == "rotary"
             return inv_freq, _attention_factor(y) if on_rotary else 1.0
-        case other:
-            raise NotImplementedError(f"{other.type} RoPE scaling")
+        case cfg.Llama3RoPEScalingConfig() as s:
+            # Pairs that turn fewer than low_freq_factor times over the original
+            # context are divided by factor, those that turn more than
+            # high_freq_factor times keep their frequency, with a linear blend in
+            # between, as transformers computes it.
+            turns = s.original_max_len * inv_freq / (2 * math.pi)
+            span = s.high_freq_factor - s.low_freq_factor
+            ramp = jnp.clip((turns - s.low_freq_factor) / span, 0, 1)
+            return inv_freq / s.factor * (1 - ramp) + inv_freq * ramp, 1.0
 
 
 def logit_gain(rope: cfg.RoPEConfig | None) -> float:
