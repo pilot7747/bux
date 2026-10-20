@@ -32,7 +32,7 @@ from bux.train.optim import matrices, optimizer, optimizers, schedule, schedules
 from bux.train.sinks import Latest, Sink
 from bux.train.trainer import Trainer, directory, train
 
-SMOKE = Path(__file__).parent.parent / "experiments" / "smoke.bux"
+SMOKE = Path(__file__).parent.parent / "examples" / "experiments" / "smoke.bux"
 
 ARCH = """
 d_model = 16

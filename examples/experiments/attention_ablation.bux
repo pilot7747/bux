@@ -1,7 +1,7 @@
 # MHA, GQA or MQA, at which learning rate? Six runs of a 12-layer Llama, in one file.
 #
-#   bux plan  experiments/attention_ablation.bux
-#   bux train experiments/attention_ablation.bux --only mqa
+#   bux plan  examples/experiments/attention_ablation.bux
+#   bux train examples/experiments/attention_ablation.bux --only mqa
 #
 # The architecture and the recipe come from other files, by name. Definitions here
 # take the place of theirs everywhere, so llama3_8b's `block` picks up this `attn`.

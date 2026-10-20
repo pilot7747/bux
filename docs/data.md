@@ -14,7 +14,7 @@ eval = eval(data=fineweb(split=[0.99, 1]))
 ```
 
 ```
-$ bux prepare experiments/speedrun.bux
+$ bux prepare examples/experiments/speedrun.bux
 text-0c8c782640: 14,720,729 documents, 10,248,316,202 tokens -> 10,022,812 rows of 1024, 99.9% filled, 99.7% targets, 0 tokens cut (175.2s)
 text-17a28baeab: 148,133 documents, 102,868,057 tokens -> 100,602 rows of 1024, 99.9% filled, 99.7% targets, 0 tokens cut (16.5s)
 ```
@@ -145,7 +145,7 @@ from bux.data import spark
 from bux.data.pipeline import jobs
 from bux.lang import compile_runs
 
-[run] = compile_runs(open("experiments/speedrun.bux").read())
+[run] = compile_runs(open("examples/experiments/speedrun.bux").read())
 for job in jobs(run.train):
     spark.prepare(job, SparkSession.builder.getOrCreate(), "s3://bucket/packed")
 ```

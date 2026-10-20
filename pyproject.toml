@@ -50,7 +50,7 @@ build-backend = "uv_build"
 
 # Where `use NAME` finds NAME.bux, subfolders included, after the using file's own folder.
 [tool.bux]
-path = ["examples", "experiments"]
+path = ["examples"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]  # tests/conftest.py has every array checked as they run

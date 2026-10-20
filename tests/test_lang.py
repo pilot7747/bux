@@ -7,7 +7,9 @@ from bux.lang import Architecture, BuxError, check, compile, ir
 from bux.lang.printer import to_source
 from bux.lang.render import render
 
-EXAMPLES = sorted(Path(__file__).parent.parent.joinpath("examples").rglob("*.bux"))
+EXAMPLES = sorted(
+    Path(__file__).parent.parent.joinpath("examples", "architectures").rglob("*.bux")
+)
 
 PRELUDE = """
 d_model = 16

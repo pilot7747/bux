@@ -4,8 +4,8 @@
 # rather than cut; the rest are best-fit packed, each seeing only itself.
 #
 #   hf download HuggingFaceTB/smol-smoltalk --repo-type dataset --local-dir data/smol-smoltalk
-#   bux prepare experiments/sft.bux
-#   bux train experiments/sft.bux
+#   bux prepare examples/experiments/sft.bux
+#   bux train examples/experiments/sft.bux
 #
 # The model is a small Qwen3-shaped one, trained from scratch.
 use llama3_8b

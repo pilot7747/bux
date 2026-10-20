@@ -15,7 +15,7 @@ from bux.launch import Stop, launch, status, summary
 from bux.train.hooks import Hook
 from bux.train.trainer import Trainer, directory, train
 
-SMOKE = Path(__file__).parent.parent / "experiments" / "smoke.bux"
+SMOKE = Path(__file__).parent.parent / "examples" / "experiments" / "smoke.bux"
 
 
 def smoke(*overrides: str):

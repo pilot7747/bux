@@ -11,7 +11,7 @@
 #   docker build -t bux .
 #   docker run --rm --gpus all bux
 #   docker run --rm --gpus all -v "$PWD/data:/opt/bux/data" -v "$PWD/runs:/opt/bux/runs" \
-#     bux experiments/speedrun.bux
+#     bux examples/experiments/speedrun.bux
 ARG CUDA_VERSION=13.4.3
 ARG UBUNTU_VERSION=24.04
 
@@ -70,4 +70,4 @@ RUN --mount=type=cache,target=/home/$USERNAME/.cache/uv,uid=1000,gid=1000 \
 # Exec form, so that the launcher is PID 1 and gets the SIGTERM that stops a container, at
 # which it checkpoints the step it is at and exits.
 ENTRYPOINT ["bux", "launch"]
-CMD ["experiments/smoke.bux"]
+CMD ["examples/experiments/smoke.bux"]

@@ -32,8 +32,8 @@ ablation below is a whole experiment of six runs, with its architecture and its
 recipe from other files:
 
 ```
-use llama3_8b                      # examples/llama3_8b.bux
-use fineweb_wsd                    # experiments/recipes/fineweb_wsd.bux
+use llama3_8b                      # examples/architectures/llama3_8b.bux
+use fineweb_wsd                    # examples/experiments/recipes/fineweb_wsd.bux
 
 d_model = 768
 ffn.intermediate_size = 2048
@@ -46,7 +46,7 @@ budget            = 3B
 ```
 
 ```
-$ bux plan experiments/attention_ablation.bux
+$ bux plan examples/experiments/attention_ablation.bux
 6 runs
 id          params  tokens  tok/param  run
 4c6613d749  183M    3B      16.4       attention_ablation[mha, optimizer.lr=1e-3]
@@ -100,9 +100,9 @@ written, and that they fit together: the warmup and cooldown fit in the steps, a
 sequences fit in the positions a learned positional embedding has.
 
 ```
-$ bux check experiments/attention_ablation.bux steps=50
+$ bux check examples/experiments/attention_ablation.bux steps=50
 error: the schedule takes 1010 steps (1000 of warmup and 10 of cooldown), but the run has 50
-  --> experiments/recipes/fineweb_wsd.bux:19:13
+  --> examples/experiments/recipes/fineweb_wsd.bux:19:13
    |
 19 | schedule  = wsd(warmup=1k, decay=0.2, shape=sqrt)
    |             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
@@ -146,7 +146,7 @@ the folders listed in `pyproject.toml`, then those in `BUX_PATH`:
 
 ```toml
 [tool.bux]
-path = ["examples", "experiments"]
+path = ["examples"]
 ```
 
 Folders organize files without becoming part of their names, so moving a file into a
@@ -180,9 +180,9 @@ Every command takes statements after the file, which redefine the file's as one 
 layer over it would:
 
 ```
-bux train experiments/smoke.bux optimizer.lr=1e-2 'schedule = cosine(warmup=5)'
-bux train experiments/smoke.bux 'use fineweb_wsd'           # modules too
-bux plan  experiments/smoke.bux 'optimizer.lr = 1e-3 | 3e-3'  # and sweeps
+bux train examples/experiments/smoke.bux optimizer.lr=1e-2 'schedule = cosine(warmup=5)'
+bux train examples/experiments/smoke.bux 'use fineweb_wsd'           # modules too
+bux plan  examples/experiments/smoke.bux 'optimizer.lr = 1e-3 | 3e-3'  # and sweeps
 ```
 
 So there are four ways to vary an experiment, `use`, an amendment, the command line and
@@ -225,13 +225,13 @@ at their first.
 ## Running
 
 ```
-bux check experiments/smoke.bux     # the model, the run, the sweep
-bux plan  experiments/smoke.bux     # every run: id, parameters, tokens, tokens per parameter
-bux prepare experiments/sft.bux     # tokenize and pack its documents; --cache DIR, --workers N
-bux train experiments/smoke.bux     # train every run, one after another; --only TEXT, --out DIR
-bux launch experiments/smoke.bux    # train what is left of every run, a GPU each: see below
-bux fmt   experiments/smoke.bux     # every run as a file of its own
-bux json  experiments/smoke.bux     # every run's IR
+bux check examples/experiments/smoke.bux     # the model, the run, the sweep
+bux plan  examples/experiments/smoke.bux     # every run: id, parameters, tokens, tokens per parameter
+bux prepare examples/experiments/sft.bux     # tokenize and pack its documents; --cache DIR, --workers N
+bux train examples/experiments/smoke.bux     # train every run, one after another; --only TEXT, --out DIR
+bux launch examples/experiments/smoke.bux    # train what is left of every run, a GPU each: see below
+bux fmt   examples/experiments/smoke.bux     # every run as a file of its own
+bux json  examples/experiments/smoke.bux     # every run's IR
 ```
 
 `bux.lang.compile_runs(source)` returns a `Run` per combination: an `Architecture`, a
@@ -259,8 +259,8 @@ is the entrypoint for production, and the Docker image's: it trains an experimen
 end, however often it is stopped and started again.
 
 ```
-bux launch experiments/attention_ablation.bux             # all 6 runs, a GPU each
-bux launch experiments/attention_ablation.bux --index 3   # the fourth, in an array job
+bux launch examples/experiments/attention_ablation.bux             # all 6 runs, a GPU each
+bux launch examples/experiments/attention_ablation.bux --index 3   # the fourth, in an array job
 ```
 
 First it prepares the datasets the runs read, once. A run alone then trains in the

@@ -1,8 +1,8 @@
 """The launcher, ``bux launch``: what trains an experiment, a .bux file of one run or a
 sweep of many, to its end, on a cluster as on a laptop.
 
-    bux launch experiments/attention_ablation.bux             # all 6 runs, a GPU each
-    bux launch experiments/attention_ablation.bux --index 3   # the fourth, in an array job
+    bux launch examples/experiments/attention_ablation.bux             # all 6 runs, a GPU each
+    bux launch examples/experiments/attention_ablation.bux --index 3   # the fourth, in an array job
 
 First it prepares the datasets the runs read, once. A run alone then trains in this
 process, on the first visible GPU. A sweep trains in workers, a process a run, one on

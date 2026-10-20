@@ -1,14 +1,14 @@
 # A modded-nanogpt-style speedrun recipe (Keller Jordan et al., 2024-25) on its
-# architecture, which comes from examples/ by name. Approximate: the record runs give
-# the embedding, the head and the scalars Adam learning rates of their own, and change
-# the sequence length and Muon's momentum during the run.
+# architecture, which comes from examples/architectures/ by name. Approximate: the
+# record runs give the embedding, the head and the scalars Adam learning rates of their
+# own, and change the sequence length and Muon's momentum during the run.
 #
 # The data is the FineWeb slice the speedrun's shards come from, as Parquet files:
 #
 #   hf download HuggingFaceFW/fineweb --repo-type dataset \
 #       --include "sample/10BT/*" --local-dir data/fineweb
-#   bux prepare experiments/speedrun.bux        # tokenized and packed once, ~10B tokens
-#   bux train experiments/speedrun.bux
+#   bux prepare examples/experiments/speedrun.bux  # tokenized and packed once, ~10B tokens
+#   bux train examples/experiments/speedrun.bux
 #
 # GPT-2 tokens, every document after an <|endoftext|>, as in the shards. Best-fit
 # packing starts every row at a document and keeps documents whole, each seeing only

@@ -1,7 +1,7 @@
 # A smoke test: a tiny Llama-style model on random tokens, a few seconds on a laptop.
 #
-#   bux train experiments/smoke.bux
-#   bux train experiments/smoke.bux 'optimizer = muon(lr=0.02)' steps=100
+#   bux train examples/experiments/smoke.bux
+#   bux train examples/experiments/smoke.bux 'optimizer = muon(lr=0.02)' steps=100
 d_model    = 64
 vocab_size = 512
 

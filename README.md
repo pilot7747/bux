@@ -13,8 +13,8 @@ Requires Python 3.14+ and [uv](https://docs.astral.sh/uv/).
 
 ```sh
 uv sync
-uv run bux check examples/gpt2.bux
-uv run bux render examples/gpt2.bux
+uv run bux check examples/architectures/gpt2.bux
+uv run bux render examples/architectures/gpt2.bux
 ```
 
 ## Runs and sweeps
@@ -34,10 +34,10 @@ optimizer.lr      = 1e-3 | 3e-3                 # 3 × 2 = 6 runs
 ```
 
 ```sh
-uv run bux plan experiments/attention_ablation.bux   # the 6 runs, their sizes and budgets
-uv run bux train experiments/smoke.bux               # a few seconds on a laptop
-uv run bux train experiments/smoke.bux 'optimizer = muon(lr=0.02)' steps=100
-uv run bux launch experiments/attention_ablation.bux # the 6 runs, a GPU each
+uv run bux plan examples/experiments/attention_ablation.bux   # the 6 runs, their sizes and budgets
+uv run bux train examples/experiments/smoke.bux               # a few seconds on a laptop
+uv run bux train examples/experiments/smoke.bux 'optimizer = muon(lr=0.02)' steps=100
+uv run bux launch examples/experiments/attention_ablation.bux # the 6 runs, a GPU each
 ```
 
 Every setting is checked before anything runs, at the line that wrote it, and every
@@ -63,14 +63,15 @@ eval      = eval(data=fineweb(split=[0.99, 1]))
 ```
 
 ```sh
-uv run bux prepare experiments/speedrun.bux          # the speedrun's FineWeb, once
+uv run bux prepare examples/experiments/speedrun.bux          # the speedrun's FineWeb, once
 ```
 
 See the [data guide](docs/data.md) for conversations, packings, and the pipeline.
 
-Explore the [example architectures](examples/), from GPT-2 to recent releases
-grouped by model family (Cohere, DeepSeek, GLM, Inkling, Kimi, Laguna, Mellum, MiMo,
-Muse, Nemotron, Qwen), and the [language guide](docs/language.md) for composition, residual
+Explore the [example architectures](examples/architectures/), from GPT-2 to recent
+releases grouped by model family (Cohere, DeepSeek, GLM, Inkling, Kimi, Laguna, Mellum,
+MiMo, Muse, Nemotron, Qwen), the [example experiments](examples/experiments/) that
+train them, and the [language guide](docs/language.md) for composition, residual
 connections, parameter sharing, and editor support.
 
 Run the CI checks (ruff, ty, and the tests) with `make`, or one of them with `make lint`,
@@ -91,7 +92,7 @@ trains the smoke run. Mount `data/` and `runs/` to keep what it prepares and tra
 docker build -t bux .
 docker run --rm --gpus all bux
 docker run --rm --gpus all -v "$PWD/data:/opt/bux/data" -v "$PWD/runs:/opt/bux/runs" \
-  bux experiments/speedrun.bux
+  bux examples/experiments/speedrun.bux
 docker run --rm -it --entrypoint bash bux    # a shell, or --entrypoint bux for the CLI
 ```
 

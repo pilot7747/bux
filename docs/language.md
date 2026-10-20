@@ -266,12 +266,12 @@ that was generated or mutated programmatically, e.g. by an architecture search.
 ## Command line
 
 ```
-bux check  examples/qwen3_next.bux    # compile, count layers by type
-bux render examples/qwen3_next.bux    # circuit diagram; --expand to inline blocks
-bux fmt    examples/qwen3_next.bux    # canonical source
-bux json   examples/qwen3_next.bux    # the IR
-bux plan   experiments/smoke.bux      # the runs of a sweep
-bux train  experiments/smoke.bux      # train them
+bux check  examples/architectures/qwen3_next.bux  # compile, count layers by type
+bux render examples/architectures/qwen3_next.bux  # circuit diagram; --expand to inline blocks
+bux fmt    examples/architectures/qwen3_next.bux  # canonical source
+bux json   examples/architectures/qwen3_next.bux  # the IR
+bux plan   examples/experiments/smoke.bux         # the runs of a sweep
+bux train  examples/experiments/smoke.bux         # train them
 ```
 
 `bux fmt` prints the IR, not your file: it inlines macros and numeric definitions and
@@ -373,9 +373,9 @@ Possible extensions: a `cat` merge (Zamba concatenates x0 into the shared block)
 recursive macros for nested structures; and parsing the rendered diagrams back, so a
 drawing can be edited directly.
 
-The example files at the top of `examples/` transcribe public configs from memory.
-Ones marked "-style" or "approximate" simplify details, so verify the numbers before
-relying on them. The folders, one per model family (`cohere/`, `deepseek/`, `glm/`,
+The example files at the top of `examples/architectures/` transcribe public configs
+from memory. Ones marked "-style" or "approximate" simplify details, so verify the
+numbers before relying on them. The folders, one per model family (`cohere/`, `deepseek/`, `glm/`,
 `inkling/`, `kimi/`, `laguna/`, `mellum/`, `mimo/`, `muse/`, `nemotron/`, `qwen/`), transcribe
 recent releases from their published `config.json` and modeling code. Their comments
 name what is left out (vision encoders, speculative drafters) or approximated.

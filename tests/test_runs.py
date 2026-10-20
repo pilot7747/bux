@@ -12,7 +12,7 @@ from bux.lang.syntax import tokenize
 from bux.train import config as tcfg
 
 ROOT = Path(__file__).parent.parent
-EXPERIMENTS = sorted(ROOT.joinpath("experiments").rglob("*.bux"))
+EXPERIMENTS = sorted(ROOT.joinpath("examples", "experiments").rglob("*.bux"))
 
 ARCH = """
 d_model = 16
@@ -360,7 +360,7 @@ def test_experiments_compile_and_print_back_to_the_same_runs(path):
 
 def test_experiments_sweep_as_documented():
     def count(stem: str) -> int:
-        path = ROOT / "experiments" / f"{stem}.bux"
+        path = ROOT / "examples" / "experiments" / f"{stem}.bux"
         return len(compile_runs(path.read_text(), filename=str(path)))
 
     assert count("attention_ablation") == 6 and count("width_sweep") == 3
