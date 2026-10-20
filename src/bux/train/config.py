@@ -323,6 +323,7 @@ class LayoutConfig(Config):
     mlp: Axes = "tensor"  # hidden units
     experts: Axes = "expert"
     latent: Axes = None  # low-rank bottlenecks: MLA, LatentMoE
+    layers: Axes = None  # the stacked passes of a scanned repeat
     zero: Literal[1, 3] = 3  # 1: FSDP splits the optimizer state alone
 
 

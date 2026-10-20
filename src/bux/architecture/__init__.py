@@ -14,7 +14,8 @@ Modules are called as ``module(x, taps)``: ``taps`` holds the tap stacks for one
 forward pass, and under reserved keys the input tokens, the documents rows are packed
 with (``segments(taps)``, None for a document a row), the logits of every head run
 so far, and in a training step the loss terms layers add (``report``). Repeats are
-unrolled; nodes with a share key are built once and reused.
+unrolled, or stacked and scanned (``methods.repeat``); nodes with a share key are
+built once and reused.
 
 Arrays say their dtype and shape with jaxtyping, as ``x: Float[Array, "b t d"]`` for a
 stream of b rows of t positions, d wide, and the tests check them on every call.

@@ -24,6 +24,7 @@ from collections.abc import Callable, Iterator
 from pathlib import Path
 from typing import TYPE_CHECKING
 
+import jax
 import orbax.checkpoint as ocp
 from jaxtyping import Array, Float
 
@@ -105,14 +106,18 @@ class Checkpoint(Hook):
     def __init__(self, folder: Path, *, every: int, keep: int):
         self.every = every
         self.manager = ocp.CheckpointManager(
-            folder.resolve(), options=ocp.CheckpointManagerOptions(max_to_keep=keep)
+            folder.resolve(),
+            options=ocp.CheckpointManagerOptions(max_to_keep=keep),
+            item_handlers=ocp.StandardCheckpointHandler(),  # so it reads metadata
         )
 
     def restore(self, trainer: "Trainer") -> bool:
         """Load the latest checkpoint into `trainer`, if there is one."""
         if (latest := self.manager.latest_step()) is None:
             return False
-        args = ocp.args.StandardRestore(trainer.state())
+        state = trainer.state()
+        _fits(self.manager.item_metadata(latest), state, latest)
+        args = ocp.args.StandardRestore(state)
         trainer.load(self.manager.restore(latest, args=args), step=latest)
         return True
 
@@ -125,3 +130,28 @@ class Checkpoint(Hook):
     def close(self) -> None:
         self.manager.wait_until_finished()
         self.manager.close()
+
+
+def _fits(saved: object, state: object, step: int) -> None:
+    """Raise unless the checkpoint of `step`, whose metadata is `saved`, holds the
+    variables of `state`. `methods.repeat` is not in a run's id, but it changes them:
+    `scan` stacks a repeat's passes into one."""
+    on_disk, mine = _paths(saved), _paths(state)
+    if on_disk == mine:
+        return
+    raise ValueError(
+        f"the checkpoint of step {step} does not hold this model's state: it has "
+        f"{min(on_disk - mine, default='nothing else')}, the model "
+        f"{min(mine - on_disk, default='nothing else')}. A run saved with "
+        "methods(repeat=unroll) resumes with unroll alone, and one with scan with scan"
+    )
+
+
+def _paths(tree: object) -> set[str]:
+    """The path of every leaf of `tree`, as a checkpoint keeps it."""
+
+    def key(k: object) -> str:
+        return str(next(getattr(k, a) for a in ("key", "idx", "name") if hasattr(k, a)))
+
+    leaves = jax.tree_util.tree_leaves_with_path(tree)
+    return {"/".join(map(key, path)) for path, _ in leaves}
