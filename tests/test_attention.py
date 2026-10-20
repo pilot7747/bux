@@ -1,5 +1,6 @@
 """Softmax attention layers: MLA, CSA, the sparse attention indexer and its loss, and
-what they share with GQA (tests/test_backend.py has GQA's own)."""
+what they share with GQA (tests/test_backend.py has GQA's own); and all of them split
+by head over the 8 CPU devices the tests have, against one device."""
 
 import math
 
@@ -9,8 +10,11 @@ import numpy as np
 import optax
 import pytest
 from flax import nnx
+from jax.sharding import NamedSharding
+from jax.sharding import PartitionSpec as P
 
 from bux import config as cfg
+from bux import parallel
 from bux.architecture import (
     SEGMENTS,
     Attention,
@@ -22,14 +26,15 @@ from bux.architecture import (
     num_params,
 )
 from bux.architecture.csa import CSA
+from bux.architecture.indexer import _top
 from bux.architecture.mla import MLA
 from bux.architecture.registry import LOSSES
 from bux.architecture.rope import rotate
-from bux.lang import compile, ir
+from bux.lang import compile, compile_runs, ir
 from bux.train import config as tcfg
 from bux.train.data import Batch
 from bux.train.objective import objective
-from bux.train.trainer import Trainer
+from bux.train.trainer import Trainer, train
 
 D, V = 32, 64
 
@@ -791,3 +796,89 @@ def test_a_value_residual_mixes_the_taps_values_into_the_layers(kind, learned, w
     a, b = weights
     own = attn.v(x).reshape(2, 12, 2, 8)
     assert jnp.allclose(v, a * own + b * first, atol=1e-6)
+
+
+# --- Split over devices (bux.parallel) -------------------------------------------------
+
+ONE = "mesh(data=1)"
+SPLIT = {
+    "gqa": "gqa(num_heads=4, num_kv_heads=2, rope=rope())",
+    "mqa": "gqa(num_heads=4, num_kv_heads=1, rope=rope())",
+    "fused_qkv": "gqa(num_heads=4, num_kv_heads=2, rope=rope(), fused_qkv=true, bias=true)",
+    "gated_sinks": (
+        "gqa(num_heads=4, num_kv_heads=2, rope=rope(), gated=true, sinks=true,"
+        " kv_conv_size=3, relative_bias=relbias(rank=2, extent=4))"
+    ),
+    "mla": "latent",
+    "mla_indexer": "latent(indexer=small)",
+    "csa": "window(compress_ratio=2, indexer=small(top_k=2))",
+}
+# A mesh and a layout each. On tensor=4, GQA's 2 kv heads, MQA's one, the indexer's 2
+# heads and CSA's 2 output groups do not split, and stay whole.
+BY_HEAD = [
+    ("mesh(fsdp=4, tensor=2)", "layout()"),
+    ("mesh(fsdp=2, tensor=4)", "layout()"),
+]
+BY_POSITION = [
+    ("mesh(fsdp=2, tensor=4)", "layout(stream=tensor)"),  # sequence parallelism
+    ("mesh(context=2, tensor=2)", "layout()"),  # all-gather context parallelism
+]
+
+
+def split(layer: str) -> str:
+    return PRELUDE + f"a = {layer}\nmodel = embed [norm a] [norm ffn] norm head"
+
+
+def trains_the_same(losses, involuntary, layer: str, splits: list) -> None:
+    """Assert that `layer` trains as on one device, and that XLA rematerializes no
+    array in full, split as each of `splits` says."""
+    one = losses(split(layer), mesh=ONE)
+    for mesh, layout in splits:
+        involuntary()
+        split_losses = losses(split(layer), mesh=mesh, layout=layout)
+        assert np.allclose(split_losses, one, atol=1e-5), (mesh, layout)
+        assert involuntary() == 0, (mesh, layout)
+
+
+@pytest.mark.parametrize("layer", SPLIT.values(), ids=SPLIT.keys())
+def test_attention_split_by_head_trains_the_same_and_rematerializes_nothing(
+    losses, involuntary, layer
+):
+    trains_the_same(losses, involuntary, layer, BY_HEAD)
+
+
+@pytest.mark.parametrize("layer", ["gqa", "mla", "csa"])
+def test_attention_trains_the_same_with_the_positions_split(losses, involuntary, layer):
+    trains_the_same(losses, involuntary, SPLIT[layer], BY_POSITION)
+
+
+def test_the_indexers_loss_is_the_same_split_by_head(tmp_path):
+    def indexer_loss(mesh: str) -> float:
+        settings = "data = synthetic\noptimizer = adamw(lr=1e-2)\nsteps = 3\n"
+        settings += "seq_len = 16\nbatch = 8\n"
+        [run] = compile_runs(f"{split(SPLIT['mla_indexer'])}\n{settings}mesh = {mesh}")
+        return train(run, tmp_path / mesh, echo=lambda _: None)["indexer_loss"]
+
+    one = indexer_loss(ONE)
+    assert indexer_loss("mesh(fsdp=4, tensor=2)") == pytest.approx(one, abs=1e-5)
+
+
+@pytest.mark.parametrize(("tensor", "kv"), [(2, P(None, "tensor")), (4, P(None, None))])
+def test_kv_heads_split_only_between_heads(tensor, kv):
+    """2 kv heads of 8 dims are 16 columns, which split 4 ways; the heads do not."""
+    c = cfg.GQAConfig(num_heads=4, num_kv_heads=2)
+    with parallel.use(tcfg.MeshConfig(tensor=tensor)):
+        state = nnx.state(parallel.build(lambda: Attention(c, D, (), nnx.Rngs(0))))
+        specs = parallel.shardings(state)
+    assert specs["q"]["kernel"].spec == P(None, "tensor")
+    assert specs["o"]["kernel"].spec == P("tensor", None)
+    assert specs["k"]["kernel"].spec == specs["v"]["kernel"].spec == kv
+
+
+def test_the_indexers_top_k_keeps_the_first_of_equal_scores_and_splits_by_row():
+    scores = jnp.asarray([[[1.0, 2.0, 2.0, 2.0, -jnp.inf]]])
+    assert _top(scores, 2).tolist() == [[[False, True, True, False, False]]]
+    with parallel.use(tcfg.MeshConfig(data=8)) as mesh:
+        rows = jax.device_put(jnp.ones((8, 4, 6)), NamedSharding(mesh, P("data")))
+        compiled = jax.jit(lambda s: _top(s, 3)).lower(rows).compile().as_text()
+    assert compiled is not None and "all-gather" not in compiled

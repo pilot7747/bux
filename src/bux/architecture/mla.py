@@ -7,7 +7,14 @@ from flax import nnx
 from jaxtyping import Array, Float, Int
 
 from bux import config as cfg
-from bux.architecture.attention import SoftmaxAttention, _own_indexer
+from bux.architecture.attention import (
+    Names,
+    SoftmaxAttention,
+    _by_head,
+    _input,
+    _linear,
+    _own_indexer,
+)
 from bux.architecture.indexer import from_stream
 from bux.architecture.norm import Norm
 from bux.architecture.registry import Context, Taps, register, segments
@@ -29,6 +36,9 @@ class MLA(SoftmaxAttention):
     Ports: `index` and `candidates`, as for `SoftmaxAttention`; the indexer's queries
     come from the query latent (or the input) and its keys from the input, as in
     DeepSeek-V3.2.
+
+    Every head has keys and values of its own, so they split over `heads`; the down
+    projections make the `latent`s, which the up projections take.
     """
 
     def __init__(
@@ -39,21 +49,23 @@ class MLA(SoftmaxAttention):
         self.kv_lora_rank = c.kv_lora_rank
         indexer = _own_indexer(c, ports)
 
-        def linear(n_in: int, n_out: int) -> nnx.Linear:
-            return nnx.Linear(n_in, n_out, use_bias=False, rngs=rngs)
+        def linear(n_in: int, n_out: int, names: Names) -> nnx.Linear:
+            return _linear(n_in, n_out, names, False, rngs)
 
         # The randomly initialized layers; reordering them changes a seed's init.
         latent = c.q_lora_rank
-        self.q_a = linear(width, latent) if latent else None
-        self.q = linear(latent or width, h * (n + r))
-        self.kv_a = linear(width, c.kv_lora_rank + r)
-        self.kv_b = linear(c.kv_lora_rank, h * (n + dv))
-        self.o = linear(h * dv, width)
+        heads = ("heads", h)  # flattened with their dims
+        query = "latent" if latent else "embed"  # what the queries are projected from
+        self.q_a = linear(width, latent, ("embed", "latent")) if latent else None
+        self.q = linear(latent or width, h * (n + r), (query, heads))
+        self.kv_a = linear(width, c.kv_lora_rank + r, ("embed", "latent"))
+        self.kv_b = linear(c.kv_lora_rank, h * (n + dv), ("latent", heads))
+        self.o = linear(h * dv, width, (heads, "embed"))
         scale = (c.scale or (n + r) ** -0.5) * logit_gain(c.rope)
         super().__init__(c, width, h, h, dv, scale, False, ports, rngs)
         rotated = int(r * c.rope.fraction) // 2 * 2 if c.rope else 0
         self.indexer = (
-            from_stream(indexer, width, latent or width, c.rope, rotated, rngs)
+            from_stream(indexer, width, latent or width, c.rope, rotated, rngs, query)
             if indexer
             else None
         )
@@ -66,6 +78,7 @@ class MLA(SoftmaxAttention):
         self.rope = c.rope
 
     def __call__(self, x: Float[Array, "b t d"], taps: Taps) -> Float[Array, "b t d"]:
+        x = _input(x)
         b, t, _ = x.shape
         h, n, r = self.heads, self.nope_head_dim, self.rope_head_dim
         docs = segments(taps)
@@ -83,6 +96,7 @@ class MLA(SoftmaxAttention):
         if self.q_norm is not None and self.k_norm is not None:
             q, k = self.q_norm(q), self.k_norm(k)
         q, k = self._rotate(q, pos), self._rotate(k, pos)
+        q, k, v = (_by_head(a, "heads") for a in (q, k, v))
         keep, scores = self._select_tokens(x, query, docs, taps)
         if keep is None:
             return self._output(x, self._attend(x, q, k, v, docs))

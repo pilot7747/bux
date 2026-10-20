@@ -46,7 +46,9 @@ self.sinks = nnx.Param(jnp.zeros(h), names=("heads",))
 ```
 
 The names are the fields of `layout`, a closed set; any other is an error that names
-the parameter.
+the parameter. A dimension that flattens several of what it names, as a projection's
+`h * k` columns flatten `h` heads, names them with their count, `("heads", h)`: then
+it splits only between them.
 
 | name       | what it is                                  | default axes                |
 |------------|---------------------------------------------|-----------------------------|
@@ -68,8 +70,9 @@ to resolve them. The optimizer's state inherits them from the parameters it trac
 ### How names resolve
 
 1. Dimension by dimension, each name's axes, less the axes of size 1 and those an
-   earlier dimension took. If their sizes do not divide the dimension, it stays
-   whole: GQA's 2 kv heads under `tensor=4` are replicated.
+   earlier dimension took. If their sizes do not divide the dimension, or its count,
+   it stays whole: GQA's 2 kv heads under `tensor=4` are replicated, though their
+   `2 * k` columns would split 4 ways.
 2. Then FSDP: the largest dimension left whole that the `fsdp` size divides splits
    over `fsdp`, unless a dimension already does. So a layer with no names at all
    trains under FSDP; names matter for TP and EP alone.
@@ -136,3 +139,36 @@ The tests run on 8 CPU devices (`tests/conftest.py`), and compare a run split ov
 them with one on a single device: `losses(source, mesh="mesh(fsdp=8)")` trains a few
 steps and returns the losses. `involuntary()` counts the times XLA warned that it
 rematerialized an array in full, which a complete layout should never make it do.
+
+## Softmax attention
+
+`gqa`, `mla`, `csa` and the indexer split by head, as Megatron does: a device projects
+the input to its own heads, attends with them, and takes their rows of the output
+projection, whose sums over `tensor` make the output.
+
+| layer    | parameter                                    | names                      |
+|----------|----------------------------------------------|----------------------------|
+| all      | `gate`, `rel_proj`                           | `(embed, heads)`           |
+| all      | `o`                                          | `(heads, embed)`           |
+| all      | `sinks`                                      | `(heads,)`                 |
+| GQA      | `q`                                          | `(embed, heads)`           |
+| GQA      | `k`, `v`, and the channels of their convs    | `(embed, kv_heads)`        |
+| GQA      | fused `qkv`, split where shards do not end   | `(embed, none)`            |
+| MLA, CSA | down projections `q_a`, `kv_a`               | `(embed, latent)`          |
+| MLA, CSA | up projections `q`, `kv_b`                   | `(latent, heads)`          |
+| CSA      | grouped `o_a`, by group                      | `(heads, none, none)`      |
+| indexer  | `q`, `weights`                               | `(latent or embed, heads)` |
+
+Each flattened dimension names its heads with their count. What every head shares,
+MQA's kv head, CSA's latents and the indexer's keys, is every device's; so are kv
+heads that `tensor` does not divide, which every device computes and whose gradients
+the devices that share them sum.
+
+The input of a layer is constrained to `(batch, seq, none)`, so with
+`layout(stream=tensor)` it is gathered once before the projections (sequence
+parallelism); queries, keys, values and head outputs to `(batch, seq, heads, none)`;
+the logits to `(batch, heads, seq, none)`, the keys whole, which with `seq` over
+`context` is all-gather context parallelism.
+
+The indexer picks its top-k with a stable sort: `lax.top_k` gathers every row onto
+each device.

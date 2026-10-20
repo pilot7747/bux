@@ -22,11 +22,17 @@ NAMES = "names"  # the metadata key a parameter's names are under
 DIMENSIONS = tuple(n for n in LayoutConfig.model_fields if n not in ("type", "zero"))
 
 Split = tuple[str, ...]  # the mesh axes one dimension splits over, () for whole
+# What a dimension is: a name, None for nothing, or a name and a count for a dimension
+# that flattens `count` of them, ("kv_heads", 2) for 2 kv heads of 64 dims. That one
+# splits only between them.
+Name = str | tuple[str, int] | None
 LECUN = nnx.initializers.lecun_normal()  # nnx.Linear's kernel_init
 
 
-def axes(layout: LayoutConfig, name: str | None) -> Split:
+def axes(layout: LayoutConfig, name: Name) -> Split:
     """The axes `layout` gives the dimension `name`."""
+    if isinstance(name, tuple):
+        name = name[0]
     if name is None:
         return ()
     if name not in DIMENSIONS:
@@ -35,11 +41,10 @@ def axes(layout: LayoutConfig, name: str | None) -> Split:
     return () if a is None else (a,) if isinstance(a, str) else tuple(a)
 
 
-def resolve(
-    names: Sequence[str | None], shape: tuple[int, ...], on: Active
-) -> list[Split]:
+def resolve(names: Sequence[Name], shape: tuple[int, ...], on: Active) -> list[Split]:
     """Dimension by dimension, its name's axes, less those of size 1 and those an
-    earlier dimension took: all of them if their sizes divide it, else none."""
+    earlier dimension took: all of them if their sizes divide it (or its count), else
+    none."""
     if len(names) != len(shape):
         raise ValueError(f"{len(names)} names for {len(shape)} dimensions: {names}")
     taken: set[str] = set()
@@ -48,7 +53,7 @@ def resolve(
         split = tuple(
             a for a in axes(on.layout, name) if on.size(a) > 1 and a not in taken
         )
-        if n % on.size(*split):
+        if (name[1] if isinstance(name, tuple) else n) % on.size(*split):
             split = ()
         taken.update(split)
         splits.append(split)
@@ -72,7 +77,7 @@ def partition(splits: list[Split]) -> P:
     return P(*(None if not s else s[0] if len(s) == 1 else s for s in splits))
 
 
-def spec(names: Sequence[str | None], shape: tuple[int, ...]) -> P:
+def spec(names: Sequence[Name], shape: tuple[int, ...]) -> P:
     """The partition spec of an array of `shape` whose dimensions are `names`."""
     on = active()
     if on is None:
@@ -80,7 +85,7 @@ def spec(names: Sequence[str | None], shape: tuple[int, ...]) -> P:
     return partition(resolve(names, shape, on))
 
 
-def shard(x: Shaped[Array, "*s"], *names: str | None) -> Shaped[Array, "*s"]:
+def shard(x: Shaped[Array, "*s"], *names: Name) -> Shaped[Array, "*s"]:
     """`x`, constrained to split as its dimensions' `names` say; as it is outside
     ``use``."""
     if active() is None:
@@ -95,7 +100,7 @@ def stream(x: Shaped[Array, "b t *r"]) -> Shaped[Array, "b t *r"]:
 
 
 def named(
-    *names: str | None,
+    *names: Name,
     init: nnx.Initializer = LECUN,
 ) -> nnx.Initializer:
     """`init`, making parameters whose dimensions are `names`: for `kernel_init=`."""

@@ -1,4 +1,10 @@
-"""Softmax attention: the core that its layers share, and causal grouped-query attention."""
+"""Softmax attention: the core that its layers share, and causal grouped-query attention.
+
+Under tensor parallelism (``bux.parallel``) a device has whole heads: their columns of
+the projections in, their queries, keys, values, logits and outputs, and their rows of
+the output projection. Keys stay whole along their positions, so with `seq` split
+they are gathered: all-gather context parallelism.
+"""
 
 from collections.abc import Sequence
 from typing import Any
@@ -9,6 +15,7 @@ from flax import nnx
 from jaxtyping import Array, Bool, Float, Int
 
 from bux import config as cfg
+from bux import parallel
 from bux.architecture.conv import CausalConv
 from bux.architecture.functional import activation, softcap
 from bux.architecture.indexer import Indexer, Scores, from_stream
@@ -24,6 +31,33 @@ from bux.architecture.registry import (
 from bux.architecture.rope import logit_gain, rotate
 from bux.architecture.segments import Segments
 from bux.lang import ir
+
+Names = tuple[parallel.Name, parallel.Name]  # a projection's input and output
+
+
+def _linear(
+    n_in: int, n_out: int, names: Names, bias: bool, rngs: nnx.Rngs
+) -> nnx.Linear:
+    """`nnx.Linear`, with its kernel's dimensions `names` and its bias's the last."""
+    return nnx.Linear(
+        n_in,
+        n_out,
+        use_bias=bias,
+        kernel_init=parallel.named(*names),
+        bias_init=parallel.named(names[1], init=nnx.initializers.zeros),
+        rngs=rngs,
+    )
+
+
+def _input(x: Float[Array, "b t d"]) -> Float[Array, "b t d"]:
+    """A layer's input, its positions split as inside a layer (`seq`), not as the
+    stream: under sequence parallelism, gathered before the projections."""
+    return parallel.shard(x, "batch", "seq", None)
+
+
+def _by_head(x: Float[Array, "b t h e"], name: str) -> Float[Array, "b t h e"]:
+    """Queries, keys, values or head outputs, split by head as the heads' `name` says."""
+    return parallel.shard(x, "batch", "seq", name, None)
 
 
 def _read(taps: Taps, ports: tuple[ir.Port, ...], name: str) -> Any:
@@ -158,7 +192,7 @@ class SoftmaxAttention(nnx.Module):
         dv, rel = v_head_dim, c.relative_bias
 
         def linear(n_in: int, n_out: int) -> nnx.Linear:
-            return nnx.Linear(n_in, n_out, use_bias=bias, rngs=rngs)
+            return _linear(n_in, n_out, ("embed", ("heads", heads)), bias, rngs)
 
         # The randomly initialized layers, after the layer's own projections.
         self.gate = (
@@ -172,7 +206,7 @@ class SoftmaxAttention(nnx.Module):
         self.log_scale, self.log_scale_floor = c.log_scale, c.log_scale_floor
         self.softcap = c.softcap
         self.window = c.sliding_window_size
-        self.sinks = nnx.Param(jnp.zeros(heads)) if c.sinks else None
+        self.sinks = nnx.Param(jnp.zeros(heads), names=("heads",)) if c.sinks else None
         self.attention_dropout = (
             nnx.Dropout(c.attention_dropout, rngs=rngs) if c.attention_dropout else None
         )
@@ -240,6 +274,7 @@ class SoftmaxAttention(nnx.Module):
         for the query's position and soft-capped."""
         b, t, _ = x.shape
         logits = jnp.einsum("bthd,bshd->bhts", q, self._per_query_head(k)) * self.scale
+        logits = parallel.shard(logits, "batch", "heads", "seq", None)  # keys whole
         if self.rel_proj is not None and self.rel_table is not None:
             r = self.rel_proj(x).reshape(b, t, self.heads, -1)
             logits = logits + _relative_bias(r, self.rel_table[...], self._offsets(t))
@@ -325,7 +360,7 @@ class SoftmaxAttention(nnx.Module):
         if self.gate is not None:
             gate = activation(self.gate_activation, self.gate(x))
             out = out * gate.reshape(b, t, self.heads, -1)
-        y = self._project(out)
+        y = self._project(_by_head(out, "heads"))
         return y if self.output_dropout is None else self.output_dropout(y)
 
     def _project(self, out: Float[Array, "b t h v"]) -> Float[Array, "b t d"]:
@@ -361,20 +396,29 @@ class Attention(SoftmaxAttention):
         own_kv = "kv" not in reads  # else the kv tap's keys and values replace its own
         indexer = _own_indexer(c, ports)
 
-        def linear(n_in: int, n_out: int, bias: bool | None = None) -> nnx.Linear:
-            use_bias = c.bias if bias is None else bias
-            return nnx.Linear(n_in, n_out, use_bias=use_bias, rngs=rngs)
+        heads, kv_heads = ("heads", h), ("kv_heads", kv)  # flattened with their dims
+
+        def linear(
+            n_in: int, n_out: int, names: Names, bias: bool | None = None
+        ) -> nnx.Linear:
+            return _linear(n_in, n_out, names, c.bias if bias is None else bias, rngs)
+
+        def conv(channels: int, size: int) -> CausalConv:
+            return CausalConv(channels, size, False, rngs, channel=kv_heads)
 
         # The randomly initialized layers; reordering them changes a seed's init.
         fused, split = own_kv and c.fused_qkv, own_kv and not c.fused_qkv
-        self.qkv = linear(width, h * d + kv * (d + dv)) if fused else None
-        self.q = None if fused else linear(width, h * d)
-        self.k = linear(width, kv * d) if split else None
-        self.v = linear(width, kv * dv) if split else None
-        self.o = linear(h * dv, width, c.output_bias)
-        conv = c.kv_conv_size if own_kv else None
-        self.k_conv = CausalConv(kv * d, conv, False, rngs) if conv else None
-        self.v_conv = CausalConv(kv * dv, conv, False, rngs) if conv else None
+        # Fused, the split points of q, k and v do not fall on shard boundaries.
+        self.qkv = (
+            linear(width, h * d + kv * (d + dv), ("embed", None)) if fused else None
+        )
+        self.q = None if fused else linear(width, h * d, ("embed", heads))
+        self.k = linear(width, kv * d, ("embed", kv_heads)) if split else None
+        self.v = linear(width, kv * dv, ("embed", kv_heads)) if split else None
+        self.o = linear(h * dv, width, (heads, "embed"), c.output_bias)
+        size = c.kv_conv_size if own_kv else None
+        self.k_conv = conv(kv * d, size) if size else None
+        self.v_conv = conv(kv * dv, size) if size else None
         scale = (c.scale or d**-0.5) * logit_gain(c.rope)
         super().__init__(c, width, h, kv, dv, scale, c.bias, ports, rngs)
         rotated = int(d * c.rope.fraction) // 2 * 2 if c.rope else 0
@@ -394,6 +438,7 @@ class Attention(SoftmaxAttention):
         self.v_mix = nnx.Param(jnp.full(shape, 0.5)) if trained else None
 
     def __call__(self, x: Float[Array, "b t d"], taps: Taps) -> Float[Array, "b t d"]:
+        x = _input(x)
         docs = segments(taps)
         pos = None if docs is None else docs.positions
         q, *kv = self._projections(x)
@@ -438,7 +483,7 @@ class Attention(SoftmaxAttention):
             q = self.q_norm(q)
         if self.rope is not None:
             q = rotate(q, self.rope, pos)
-        return q
+        return _by_head(q, "heads")
 
     def _keys_and_values(
         self, k: Float[Array, "b s _"], v: Float[Array, "b s _"], taps: Taps
@@ -454,7 +499,7 @@ class Attention(SoftmaxAttention):
         if self.rope is not None:
             docs = segments(taps)
             k = rotate(k, self.rope, None if docs is None else docs.positions)
-        return k, v
+        return _by_head(k, "kv_heads"), _by_head(v, "kv_heads")
 
 
 @register("gqa")

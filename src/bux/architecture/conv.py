@@ -10,6 +10,7 @@ from jaxtyping import Array, Float
 from bux import config as cfg
 from bux.architecture.registry import Context, Taps, register, segments
 from bux.lang import ir
+from bux.parallel import Name
 
 
 class CausalConv(nnx.Module):
@@ -25,7 +26,7 @@ class CausalConv(nnx.Module):
         *,
         dilation: int = 1,
         zero: bool = False,
-        channel: str | None = None,
+        channel: Name = None,
     ):
         init = nnx.initializers.zeros if zero else nnx.initializers.lecun_normal()
         weight = init(rngs.params(), (size, channels))
