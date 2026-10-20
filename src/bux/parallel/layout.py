@@ -43,12 +43,13 @@ def axes(layout: LayoutConfig, name: Name) -> Split:
 
 
 def resolve(names: Sequence[Name], shape: tuple[int, ...], on: Active) -> list[Split]:
-    """Dimension by dimension, its name's axes, less those of size 1 and those an
-    earlier dimension took: all of them if their sizes divide it (or its count), else
+    """Dimension by dimension, its name's axes, less those of size 1, those an
+    earlier dimension took, and those a shard_map being traced maps by hand (inside
+    it, a device's own): all of them if their sizes divide it (or its count), else
     none."""
     if len(names) != len(shape):
         raise ValueError(f"{len(names)} names for {len(shape)} dimensions: {names}")
-    taken: set[str] = set()
+    taken = set(jax.sharding.get_abstract_mesh().manual_axes)
     splits = []
     for name, n in zip(names, shape):
         split = tuple(
@@ -92,7 +93,10 @@ def shard(x: Shaped[Array, "*s"], *names: Name) -> Shaped[Array, "*s"]:
     if (on := active()) is None:
         return x
     split = partition(resolve(names, x.shape, on))
-    return jax.lax.with_sharding_constraint(x, NamedSharding(on.mesh, split))
+    if not isinstance(x, jax.core.Tracer):
+        return jax.lax.with_sharding_constraint(x, NamedSharding(on.mesh, split))
+    # A bare spec is of the mesh being traced, which knows a shard_map's manual axes.
+    return jax.lax.with_sharding_constraint(x, split)
 
 
 def stream(x: Shaped[Array, "b t *r"]) -> Shaped[Array, "b t *r"]:

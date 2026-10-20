@@ -485,7 +485,7 @@ def test_a_flash_kernel_attends_within_documents_by_their_ids(monkeypatch):
         )
         q, k, v = (
             a.transpose(0, 2, 1, 3)  # heads first
-            for a in (q * self.scale, *map(self._per_query_head, (k, v)))
+            for a in (q * self.scale, *(jnp.repeat(a, H // 2, axis=2) for a in (k, v)))
         )
         out = jax.vmap(mha)(q, k, v, splash.SegmentIds(docs.ids, docs.ids))
         return out.transpose(0, 2, 1, 3)

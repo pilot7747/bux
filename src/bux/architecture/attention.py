@@ -2,8 +2,9 @@
 
 Under tensor parallelism (``bux.parallel``) a device has whole heads: their columns of
 the projections in, their queries, keys, values, logits and outputs, and their rows of
-the output projection. Keys stay whole along their positions, so with `seq` split
-they are gathered: all-gather context parallelism.
+the output projection. The core (logits, probabilities, values) is the run's method of
+``methods.attention``; under `xla`, the default, keys stay whole along their
+positions, so with `seq` split they are gathered: all-gather context parallelism.
 """
 
 from collections.abc import Sequence
@@ -31,8 +32,11 @@ from bux.architecture.registry import (
 from bux.architecture.rope import logit_gain, rotate
 from bux.architecture.segments import Segments
 from bux.lang import ir
+from bux.parallel import methods
+from bux.parallel.context import Visibility, sees
 
 Names = tuple[parallel.Name, parallel.Name]  # a projection's input and output
+MIN = float(jnp.finfo(jnp.float32).min)  # the logit of a key not seen
 
 
 def _linear(
@@ -118,13 +122,7 @@ def _causal(
     """Which of t keys at the same positions each of t queries sees: none ahead of it,
     none `window` or more behind, and none of another document."""
     index = jnp.arange(t)
-    offset = index[:, None] - index[None, :]
-    visible = offset >= 0
-    if window is not None:
-        visible &= offset < window
-    if docs is not None:
-        visible = visible & (docs.ids[:, :, None] == docs.ids[:, None, :])
-    return visible
+    return sees(window, index, index, None if docs is None else (docs.ids, docs.ids))
 
 
 def _relative_bias(
@@ -157,6 +155,71 @@ def _softmax_with_sinks(
     b, h, t, _ = logits.shape
     sink = jnp.broadcast_to(sinks[None, :, None, None], (b, h, t, 1))
     return jax.nn.softmax(jnp.concatenate([logits, sink], -1))[..., :-1]
+
+
+def _per_query_head(kv: Float[Array, "b s g e"], heads: int) -> Float[Array, "b s h e"]:
+    """Keys or values repeated for every query head of their group."""
+    return jnp.repeat(kv, heads // kv.shape[2], axis=2)
+
+
+def _scores(
+    q: Float[Array, "b t h k"], k: Float[Array, "b s g k"], scale: float
+) -> Float[Array, "b h t s"]:
+    """Every query's scaled dot product with every key, in float32; the keys whole
+    along their positions."""
+    k = _per_query_head(k, q.shape[2])
+    logits = jnp.einsum("bthd,bshd->bhts", q, k, preferred_element_type=jnp.float32)
+    return parallel.shard(logits * scale, "batch", "heads", "seq", None)
+
+
+def _probabilities(
+    logits: Float[Array, "b h t s"],
+    visible: Bool[Array, "*rows t s"],
+    sinks: Float[Array, " h"] | None,
+) -> Float[Array, "b h t s"]:
+    """The softmax over the keys each query sees, beside its head's sink if any, in
+    float32; a query that sees no key gets nothing."""
+    logits = jnp.where(visible, logits.astype(jnp.float32), MIN)
+    if sinks is None:
+        probs = jax.nn.softmax(logits)
+    else:
+        probs = _softmax_with_sinks(logits, sinks.astype(jnp.float32))
+    return jnp.where(visible, probs, 0)
+
+
+def _mix(
+    probs: Float[Array, "b h t s"], v: Float[Array, "b s g v"]
+) -> Float[Array, "b t h v"]:
+    """Every query's values, weighted by its probabilities."""
+    v = _per_query_head(v, probs.shape[1])
+    return jnp.einsum("bhts,bshd->bthd", probs.astype(v.dtype), v)
+
+
+@methods.attention.register("xla")
+def xla(
+    q: Float[Array, "b t h k"],
+    k: Float[Array, "b t g k"],
+    v: Float[Array, "b t g v"],
+    seen: Visibility,
+) -> Float[Array, "b t h v"]:
+    """`methods.attention`'s default: all t by t logits at once. With `seq` over
+    `context`, each device has its own queries' rows of them, and every key and
+    value: all-gather context parallelism."""
+    index = jnp.arange(q.shape[1])
+    ids = None if seen.ids is None else (seen.ids, seen.ids)
+    visible = sees(seen.window, index, index, ids)[..., None, :, :]
+    logits = softcap(_scores(q, k, seen.scale), seen.softcap)
+    return _mix(_probabilities(logits, visible, seen.sinks), v)
+
+
+def _only_xla(feature: str) -> None:
+    """Raise unless the run's attention is `xla`, which alone has `feature`."""
+    on = parallel.active()
+    name = on.methods.attention if on else "xla"
+    if name != "xla":
+        raise NotImplementedError(
+            f"methods.attention = {name} has no {feature}; only xla has"
+        )
 
 
 class SoftmaxAttention(nnx.Module):
@@ -231,25 +294,43 @@ class SoftmaxAttention(nnx.Module):
     ) -> Float[Array, "b t h v"]:
         """Every query's average of the values of the keys it sees, of those it `keep`s
         if given, by the softmax of their logits; in a training forward, the indexer's
-        loss, from its `scores`. This makes all t by t logits, and the mask with them;
-        a flash kernel skips the blocks no query sees, by the documents' ids (and the
-        top-k, by the indexer's selection)."""
+        loss, from its `scores`. By the run's `methods.attention`, unless the layer
+        has what only `xla` has: then by xla's code here, which makes all t by t
+        logits, and the mask with them."""
+        alone = self._xla_alone(keep)
+        if alone is None:
+            return parallel.method("attention")(q, k, v, self._visibility(docs))
+        _only_xla(alone)
         visible = self._visible(docs, x.shape[1])
         if keep is not None:
             visible = visible & keep
-        visible = visible[..., None, :, :]
         logits = self._logits(x, q, k, docs)
-        logits = jnp.where(visible, logits, jnp.finfo(logits.dtype).min)
-        if self.sinks is not None:
-            probs = _softmax_with_sinks(logits, self.sinks[...])
-        else:
-            probs = jax.nn.softmax(logits)
-        probs = jnp.where(visible, probs, 0)  # a query that sees no key gets nothing
+        probs = _probabilities(logits, visible[..., None, :, :], self._sinks())
         if scores is not None:
             self._train_indexer(probs, scores, taps)
         if self.attention_dropout is not None:
             probs = self.attention_dropout(probs)
-        return jnp.einsum("bhts,bshd->bthd", probs, self._per_query_head(v))
+        return _mix(probs, v)
+
+    def _visibility(self, docs: Segments | None) -> Visibility:
+        """What a method of `methods.attention` takes of the layer and the documents."""
+        ids = None if docs is None else docs.ids
+        return Visibility(ids, self.window, self.scale, self.softcap, self._sinks())
+
+    def _sinks(self) -> Float[Array, " h"] | None:
+        return None if self.sinks is None else self.sinks[...]
+
+    def _xla_alone(self, keep: Bool[Array, "b t s"] | None) -> str | None:
+        """The first of what only `xla` has that the layer uses: a mask of the keys
+        each query keeps (an indexer's top-k, which its loss comes with, or CSA's
+        compressed latents), relative bias, length scale or attention dropout."""
+        uses = {
+            "mask of kept keys (an indexer's top-k, or CSA's compression)": keep,
+            "relative_bias": self.rel_proj,
+            "log_scale": self.log_scale,
+            "attention_dropout": self.attention_dropout,
+        }
+        return next((feature for feature, x in uses.items() if x is not None), None)
 
     def _train_indexer(
         self, probs: Float[Array, "b h t s"], scores: Scores, taps: Taps | None
@@ -273,8 +354,7 @@ class SoftmaxAttention(nnx.Module):
         """Every query's logits for every key: scaled, with the relative bias, scaled
         for the query's position and soft-capped."""
         b, t, _ = x.shape
-        logits = jnp.einsum("bthd,bshd->bhts", q, self._per_query_head(k)) * self.scale
-        logits = parallel.shard(logits, "batch", "heads", "seq", None)  # keys whole
+        logits = _scores(q, k, self.scale)
         if self.rel_proj is not None and self.rel_table is not None:
             r = self.rel_proj(x).reshape(b, t, self.heads, -1)
             logits = logits + _relative_bias(r, self.rel_table[...], self._offsets(t))
@@ -292,10 +372,6 @@ class SoftmaxAttention(nnx.Module):
         """Which keys each query sees: none ahead of it or a window or more behind, and
         none of another document."""
         return _causal(t, self.window, docs)
-
-    def _per_query_head(self, kv: Float[Array, "b s g e"]) -> Float[Array, "b s h e"]:
-        """Keys or values repeated for every query head of their group."""
-        return jnp.repeat(kv, self.heads // self.kv_heads, axis=2)
 
     def _select(
         self,
@@ -381,8 +457,8 @@ class Attention(SoftmaxAttention):
     Shapes: b rows, t queries and s keys (the same positions), d the width, h heads and
     g kv heads, k and v the head dims of keys and values.
 
-    `_attend` is where a fused kernel goes: what it needs of packed rows is
-    `Segments.ids`, a document id a token, and no t by t mask.
+    A fused kernel is a method of `methods.attention` (bux.parallel.context): what it
+    needs of packed rows is `Segments.ids`, a document id a token, and no t by t mask.
     """
 
     def __init__(
