@@ -244,6 +244,77 @@ in a LatentMoE; `to_latent` `(embed, latent)` and `from_latent` `(latent, embed)
 `dense` constrains its hidden units to `(batch, seq, experts, mlp)`, so that under
 FSDP the weights move to the tokens rather than the tokens to the weights.
 
+## Expert parallelism
+
+Three methods of `methods.moe` split the experts over the axes `layout.experts` gives
+them, `expert` by default: each device holds its own experts' kernels, and runs them
+on the picks of every device of its group.
+
+```
+mesh    = mesh(fsdp=2, expert=4)
+methods = methods(moe=all_to_all)
+```
+
+| method              | what it does                                                  |
+|---------------------|---------------------------------------------------------------|
+| `all_gather`        | each device gathers its group's tokens, runs its own experts on them, and a `psum_scatter` brings each token its sum back |
+| `all_to_all`        | each pick goes to its expert's device and back by `jax.lax.all_to_all`, in a buffer a peer that holds every local pick, so that none drops |
+| `ragged_all_to_all` | the same, one ragged slice a peer, by `jax.lax.ragged_all_to_all`: buffers hold what every peer could send, but only what they do send moves. XLA:CPU lacks it |
+
+Each runs in a `jax.shard_map` manual over the axes that split the tokens (those of
+`batch` and `seq`), not over `expert` alone: a sort of tokens split over an Auto axis
+gathers them all onto every device. The kernels enter split over the experts' axes and
+whole over the others, so FSDP gathers a device's own experts alone; `tensor` stays
+Auto. Routing, the balance loss and the router bias run before, in the global view,
+and do not change.
+
+Where no axis splits the experts (`expert=1`, or a number of experts it does not
+divide), each method is `sorted`. Experts over an axis that leaves the tokens whole,
+as `layout(experts=tensor)` does, split the tokens over it too inside the method;
+rows that do not split over it are an error.
+
+A method is a body that runs on one device's tokens, and `experts.method` makes it
+one of `methods.moe`:
+
+```python
+from bux.parallel import experts, methods
+
+
+def mine(z, idx, weights, kernels, *, axes, ffn, norm):
+    # This device's tokens and picks, and its experts' kernels: experts
+    # [i * n, (i + 1) * n) for n = len(kernels[0]), i = jax.lax.axis_index(axes).
+    ...
+
+
+methods.moe.register("mine")(experts.method(mine))
+```
+
+`experts.ragged` takes the ragged exchange as `exchange=`, so another collective is a
+function: the tests run it on CPU through one built from `all_to_all`, and
+`scripts/gpu_smoke/experts.py` runs the real one, and every other method, on GPUs.
+
+Collectives in the compiled train step of the two-MoE model of
+`tests/test_experts.py` on 8 CPU devices, their number and the KiB their results take
+on one device:
+
+| mesh                       | method       | all-gather | all-to-all | reduce-scatter | all-reduce |
+|----------------------------|--------------|------------|------------|----------------|------------|
+| `expert=8`                 | `sorted`     | 8, 392     |            |                | 2, 678     |
+|                            | `all_gather` | 10, 76     |            | 6, 8           | 2, 294     |
+|                            | `all_to_all` | 2, 8       | 10, 258    |                | 2, 294     |
+| `data=2, fsdp=2, expert=2` | `sorted`     | 54, 879    |            |                | 6, 808     |
+|                            | `all_gather` | 56, 512    |            | 6, 8           | 8, 616     |
+|                            | `all_to_all` | 48, 495    | 10, 64     |                | 8, 616     |
+| `fsdp=2, expert=4`         | `sorted`     | 54, 783    |            |                | 6, 808     |
+|                            | `all_gather` | 56, 433    |            | 6, 8           | 6, 520     |
+|                            | `all_to_all` | 48, 399    | 10, 129    |                | 6, 520     |
+
+`sorted` gathers every expert's kernels and all-reduces their gradients; the others
+move tokens instead. Dropless with buffers of a fixed size, `all_to_all` moves
+`top_k` times the rows `all_gather` does, as every peer's buffer holds every local
+pick: it is the CPU sibling of `ragged_all_to_all`, which moves the picks alone. No
+method rematerializes anything on these meshes, nor on `fsdp=2, expert=2, tensor=2`.
+
 ## Muon: `methods.orthogonalize`
 
 Newton-Schulz takes fifteen products of each update matrix a step. On a matrix split
