@@ -28,7 +28,7 @@ def _spec(path: tuple, x: object, on: Active) -> P:
     sharded = isinstance(x, nnx.OptState) or (
         isinstance(x, nnx.Param) and on.layout.zero == 3
     )
-    return partition(fsdp(splits, shape, on) if sharded else splits)
+    return partition(fsdp(splits, shape, on, names) if sharded else splits)
 
 
 def _variable(x: object) -> bool:

@@ -18,6 +18,7 @@ from bux.parallel.mesh import Active, active
 from bux.train.config import LayoutConfig
 
 NAMES = "names"  # the metadata key a parameter's names are under
+LAYERS = "layers"  # the stacked dimension of a scanned repeat
 # The names a dimension can have: every field of the layout that is a dimension.
 DIMENSIONS = tuple(n for n in LayoutConfig.model_fields if n not in ("type", "zero"))
 
@@ -60,13 +61,20 @@ def resolve(names: Sequence[Name], shape: tuple[int, ...], on: Active) -> list[S
     return splits
 
 
-def fsdp(splits: list[Split], shape: tuple[int, ...], on: Active) -> list[Split]:
+def fsdp(
+    splits: list[Split], shape: tuple[int, ...], on: Active, names: Sequence[Name]
+) -> list[Split]:
     """`splits` with the largest whole dimension that `fsdp` divides split over it,
-    unless a dimension already is."""
+    unless a dimension already is. A scanned repeat's stacked `layers` never is: a
+    scan takes a layer at a time."""
     n = on.size("fsdp")
     if n == 1 or any("fsdp" in s for s in splits):
         return splits
-    whole = [i for i, s in enumerate(splits) if not s and shape[i] % n == 0]
+    whole = [
+        i
+        for i, s in enumerate(splits)
+        if not s and shape[i] % n == 0 and names[i] != LAYERS
+    ]
     if not whole:
         return splits
     i = max(whole, key=lambda i: shape[i])

@@ -292,3 +292,82 @@ all-to-alls) for the 2-block Llama and the MoE of `tests/test_parallel.py`:
 With `gather`, Muon all-reduces as often as AdamW, and adds an all-gather a matrix
 and two all-to-alls an expert stack; the optimizer's update alone does no all-reduce.
 Step times on fake CPU devices, which share one CPU, say nothing.
+
+## Repeats and remat: `methods.repeat`, `methods.remat`
+
+```
+methods = methods(repeat=scan, remat=dots)
+```
+
+`f^n` builds `n` passes of `f`. With `repeat=unroll`, the default, each is a module of
+its own, in a row. With `repeat=scan`, the passes are built the same way, so every
+init that depends on depth (hc's, vpgate's, MiniMax's) is as unrolled, and then
+stacked into one `Scanned` module: each variable of the first pass holds every pass's,
+along a new leading dimension named `layers`, and `jax.lax.scan` runs them. A repeat
+stays unrolled where its passes do not stack:
+
+- their graphdefs or the shapes of their variables differ (Engram's tables);
+- they share a module or a variable: a `shared` definition, or nextn's embedding;
+- they widen the stream as they go, as attnres does.
+
+A scan carries the stream and whatever taps a pass replaces, such as single-pass
+mhc's read, and collects the losses each pass reports (the MoE's balance loss) and the
+state it changes (the router bias). Before it scans, a trial pass, traced but not
+run, checks that the shapes of the stream and of the taps come out as they went in.
+If they do not from the first pass, the first runs alone and the scan starts at the
+second: single-pass mhc's first pass starts its read. If they never do, as when every
+pass pushes to a tap (a U-net's `(block @skip)^6`), the passes run one by one, off the
+same stacked state.
+
+The `layers` dimension is a name of the layout, `layers` (none by default), which FSDP
+never takes: a scan reads a layer at a time. Weight decay and Muon count from after
+it, so a stacked norm scale is still a vector, and a stacked kernel a batch of
+matrices.
+
+The state of a scanned repeat has another structure than the unrolled one's, but the
+run's id is the same, as `methods` is not in it. A checkpoint therefore resumes only
+with the `repeat` it was saved with; with the other, the restore fails at once and
+says so.
+
+`remat` rematerializes in the backward pass what the forward does not keep, by a
+`jax.checkpoint` policy:
+
+| method          | what the forward keeps                                     |
+|-----------------|------------------------------------------------------------|
+| `none`          | everything: nothing is computed twice; the default         |
+| `full`          | nothing but the input of each branch or pass               |
+| `dots`          | the products of matrices                                   |
+| `dots_no_batch` | the products of matrices without batch dimensions          |
+
+Each residual branch outside any other is rematerialized as a whole, with the read
+and write of the residual algebra; a scanned pass is, as one; and nothing inside
+either is again. In a `.bux` file `none` is the null value, so a sweep writes the
+method as a string: `methods.remat = "none" | full`. Another policy is a function:
+
+```python
+import jax
+
+from bux.parallel import methods
+
+methods.remat.register("offload")(
+    jax.checkpoint_policies.offload_dot_with_no_batch_dims("device", "pinned_host")
+)
+```
+
+On one CPU, for the gradient of a 24-layer Llama's forward (`d_model=64`, 8 rows of
+128 tokens), and for its first training step, which compiles it:
+
+| repeat   | trace + compile | first step, AdamW | first step, Muon |
+|----------|-----------------|-------------------|------------------|
+| `unroll` | 1.2 s           | 2.9 s             | 6.9 s            |
+| `scan`   | 0.3 s           | 0.8 s             | 0.9 s            |
+
+| remat           | temp memory, unrolled | scanned |
+|-----------------|-----------------------|---------|
+| `none`          | 328 MiB               | 326 MiB |
+| `full`          | 22 MiB                | 23 MiB  |
+| `dots`          | 133 MiB               | 138 MiB |
+| `dots_no_batch` | 79 MiB                | 82 MiB  |
+
+`Scanned.layers` holds the stacked passes, and `graph.run(graphdef, state, times, x,
+taps)` runs any stack of them, such as a pipeline stage's share.

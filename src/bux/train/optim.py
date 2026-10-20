@@ -26,6 +26,7 @@ from optax.contrib._muon import orthogonalize_via_newton_schulz, scale_by_shape
 
 from bux import parallel
 from bux.architecture import DyT, Embedding, Engram, Head, MoE, Norm
+from bux.architecture.graph import Scanned
 from bux.parallel import methods
 from bux.parallel.layout import Split, partition
 from bux.train import config as tcfg
@@ -120,9 +121,16 @@ def _keys(path: tuple) -> tuple:
     return keys[:-1] if keys and keys[-1] == "value" else keys
 
 
+def stacked(model: nnx.Module) -> Callable[[tuple], int]:
+    """How many stacked dimensions lead the parameter at a path: one for each scanned
+    repeat it is in, whose passes it stacks."""
+    scans = [path for path, node in nnx.iter_graph(model) if isinstance(node, Scanned)]
+    return lambda keys: sum(keys[: len(s)] == s for s in scans)
+
+
 def undecayed(model: nnx.Module) -> list[tuple]:
     """The paths that weight decay leaves alone, whatever their shape: norms' and
-    Engram's n-gram tables."""
+    Engram's n-gram tables, stacked or not."""
     found: list[tuple] = []
     for path, node in nnx.iter_graph(model):
         if isinstance(node, Norm | DyT):
@@ -133,12 +141,13 @@ def undecayed(model: nnx.Module) -> list[tuple]:
 
 
 def decayed(model: nnx.Module) -> Callable[[PyTree], PyTree[bool]]:
-    """The weight decay mask: matrices and stacks of them, outside `undecayed(model)`."""
-    skip = undecayed(model)
+    """The weight decay mask: matrices and stacks of them, outside `undecayed(model)`.
+    A scanned repeat's stacked dimension does not count: its norm scales are vectors."""
+    skip, lead = undecayed(model), stacked(model)
 
     def decays(path: tuple, x: Float[Array, "*_"]) -> bool:
         keys = _keys(path)
-        return x.ndim >= 2 and not any(keys[: len(s)] == s for s in skip)
+        return x.ndim - lead(keys) >= 2 and not any(keys[: len(s)] == s for s in skip)
 
     return lambda params: jax.tree_util.tree_map_with_path(decays, params)
 
@@ -160,22 +169,24 @@ def adamw(
 def matrices(model: nnx.Module) -> dict[tuple, MuonDimensionNumbers]:
     """The parameters Muon trains, by path: the kernels of linear layers in the blocks,
     and stacked expert weights, one expert at a time. The embedding and the LM head
-    are left out."""
+    are left out. A scanned repeat's stacked dimension leads, a batch dimension."""
     outside = [
         path
         for path, node in nnx.iter_graph(model)
         if isinstance(node, Embedding | Head)
     ]
+    lead = stacked(model)
     found: dict[tuple, MuonDimensionNumbers] = {}
     for path, node in nnx.iter_graph(model):
         if any(path[: len(o)] == o for o in outside):
             continue
+        n = lead(path)
         if isinstance(node, nnx.Linear):
-            found[(*path, "kernel")] = MuonDimensionNumbers(0, 1)
+            found[(*path, "kernel")] = MuonDimensionNumbers(n, n + 1)
         elif isinstance(node, MoE):
             for name in ("up", "gate", "down"):
                 if getattr(node, name, None) is not None:
-                    found[(*path, name)] = MuonDimensionNumbers(1, 2)
+                    found[(*path, name)] = MuonDimensionNumbers(n + 1, n + 2)
     return found
 
 
