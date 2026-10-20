@@ -1,5 +1,6 @@
 # Jamba v0.1 (AI21, 2024): Mamba layers with one attention layer in eight, and MoE in
-# every other layer. No positional encoding anywhere.
+# every other layer. No positional encoding anywhere. The router keeps the top two of
+# its softmax as they are, without renormalizing them.
 d_model    = 4096
 vocab_size = 65536
 
@@ -7,7 +8,8 @@ norm    = rmsnorm
 attn    = gqa(num_heads=32, num_kv_heads=8)
 ssm     = mamba(state_size=16)
 dense   = gated_mlp(intermediate_size=14336, activation=swish)
-experts = moe(num_experts=16, top_k=2, expert=dense)
+experts = moe(num_experts=16, top_k=2, normalize_top_k=false, aux_loss_coef=1e-3,
+              expert=dense)
 
 layer(mixer, ffn) = [norm mixer] [norm ffn]
 m = layer(ssm, dense)

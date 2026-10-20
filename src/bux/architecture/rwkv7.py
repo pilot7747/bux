@@ -105,7 +105,9 @@ class RWKV7(nnx.Module):
         self.k_k = nnx.Param(0.71 - linear * 0.1)
         self.k_a = nnx.Param(jnp.full(nk, 1.02))
         self.r_k = nnx.Param(jnp.full((hv, dk), -0.04))
-        group = cfg.NormalizationConfig(type="layernorm", bias=True, eps=dv * 1e-5)
+        group = cfg.NormalizationConfig(
+            type="layernorm", bias=True, eps=dv * c.norm_eps
+        )
         self.norm = Norm(group, (hv, dv))
         self.o = nnx.Linear(
             nv, width, use_bias=False, kernel_init=nnx.initializers.zeros, rngs=rngs

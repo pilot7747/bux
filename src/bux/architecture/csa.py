@@ -18,14 +18,12 @@ from bux.architecture.attention import (
     _rows,
     _write,
 )
-from bux.architecture.indexer import Indexer
+from bux.architecture.indexer import Indexer, Scores
 from bux.architecture.norm import Norm
 from bux.architecture.registry import Context, Taps, register, segments
 from bux.architecture.rope import frequencies, logit_gain, rotate
 from bux.architecture.segments import Segments
 from bux.lang import ir
-
-_LATENT_NORM = cfg.NormalizationConfig(type="rmsnorm")
 
 
 class Latents(NamedTuple):
@@ -101,7 +99,7 @@ class CSA(SoftmaxAttention):
                 width,
                 latent or width,
                 d if own_kv else None,
-                _LATENT_NORM,
+                c.latent_norm,
                 c.rope,
                 rotated,
                 rngs,
@@ -111,10 +109,10 @@ class CSA(SoftmaxAttention):
         )
 
         # Queries, latents and compression
-        self.q_a_norm = Norm(_LATENT_NORM, latent) if latent else None
+        self.q_a_norm = Norm(c.latent_norm, latent) if latent else None
         self.q_norm = Norm(c.qk_norm, d) if c.qk_norm else None
-        self.kv_norm = Norm(_LATENT_NORM, d)
-        self.compress_norm = Norm(_LATENT_NORM, d) if own_kv else None
+        self.kv_norm = Norm(c.latent_norm, d)
+        self.compress_norm = Norm(c.latent_norm, d) if own_kv else None
         self.rope = c.rope
 
     def __call__(self, x: Float[Array, "b t d"], taps: Taps) -> Float[Array, "b t d"]:
@@ -137,10 +135,10 @@ class CSA(SoftmaxAttention):
             else:
                 latents = self._compress(x, rows)
             _write(taps, self.ports, "kv", latents)
-            keep = self._compressed(x, query, rows, docs, latents, taps)
+            keep, scores = self._compressed(x, query, rows, docs, latents, taps)
             kv = jnp.concatenate([kv, latents.kv[:, :, None]], axis=1)
-            window = jnp.ones((b, t, t), bool)
-            out = self._attend(x, q, kv, kv, docs, jnp.concatenate([window, keep], -1))
+            keep = jnp.concatenate([jnp.ones((b, t, t), bool), keep], -1)
+            out = self._attend(x, q, kv, kv, docs, keep, scores, taps)
         return self._output(x, self._unrotate(out, rows.positions))
 
     def _compress(self, x: Float[Array, "b t d"], rows: Segments) -> Latents:
@@ -173,16 +171,17 @@ class CSA(SoftmaxAttention):
         docs: Segments | None,
         latents: Latents,
         taps: Taps,
-    ) -> Bool[Array, "b t s"]:
+    ) -> tuple[Bool[Array, "b t s"], Scores | None]:
         """Which compressed latents each query attends to: complete ones of its document,
-        from its group's last token on, of those the indexer keeps."""
+        from its group's last token on, of those the indexer keeps; and the indexer's
+        scores of them, if it runs one."""
         b, t, _ = x.shape
         allowed = jnp.broadcast_to(_causal(t, None, docs), (b, t, t))
         allowed = allowed & (latents.order >= 0)[:, None, :]
-        keep = self._select(
+        keep, scores = self._select(
             x, query, rows.positions, latents.index, allowed, latents.order, taps
         )
-        return allowed if keep is None else allowed & keep
+        return allowed if keep is None else allowed & keep, scores
 
     def _visible(self, docs: Segments | None, t: int) -> Bool[Array, "*rows t s"]:
         """The window's latents, then the compressed ones, which no window limits."""

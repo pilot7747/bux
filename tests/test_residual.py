@@ -35,7 +35,10 @@ shared out = head
 WIDENING = [
     "hc(expansion=3)",
     "hc(expansion=2, dynamic=false)",
+    "hc(expansion=3, single_pass=true)",
     "mhc(expansion=4)",
+    "mhc(expansion=2, dynamic=false)",
+    "mhc(expansion=4, single_pass=true)",
     "gr(expansion=2, rank=4)",
     "attnres(block_size=2)",
     "attnres",
@@ -60,6 +63,14 @@ def tokens(seed: int = 0, length: int = 8) -> Int[Array, "b t"]:
 class Zero(nnx.Module):
     def __call__(self, x, taps):
         return jnp.zeros_like(x)
+
+
+class Tanh(nnx.Module):
+    def __init__(self, seed: int):
+        self.w = jax.random.normal(jax.random.key(seed), (D, D)) / D**0.5
+
+    def __call__(self, x, taps):
+        return jnp.tanh(x @ self.w)
 
 
 def randomize(module: nnx.Module, seed: int = 1, scale: float = 1.0) -> None:
@@ -114,7 +125,16 @@ def test_mtp_engram_and_taps_run(residual, body):
 
 @pytest.mark.parametrize(
     "residual",
-    ["hc(expansion=4)", "hc(dynamic=false)", "mhc", "attnres(block_size=3)", "vpgate"],
+    [
+        "hc(expansion=4)",
+        "hc(dynamic=false)",
+        "hc(single_pass=true)",
+        "mhc",
+        "mhc(dynamic=false)",
+        "mhc(single_pass=true)",
+        "attnres(block_size=3)",
+        "vpgate",
+    ],
 )
 def test_at_init_an_algebra_is_the_pre_norm_residual(residual):
     """hc as the paper initializes it, and mhc, attnres and vpgate as they are here,
@@ -150,11 +170,71 @@ def test_mhc_mixes_the_streams_through_doubly_stochastic_matrices():
     assert isinstance(c, cfg.HyperConnectionsConfig)
     branch = ManifoldHyperConnections(c, D, Zero())
     randomize(branch, scale=0.1)
+    assert branch.scale is not None
     branch.scale[...] = jnp.ones(3)  # logits of about unit size
     x = jax.random.normal(jax.random.key(2), (2, 8, 4, D))
     y = branch(x, {})
     assert not jnp.allclose(y, x, atol=1e-1)
     assert jnp.allclose(y.sum(2), x.sum(2), atol=2e-3)
+
+
+def hc_split_sinkhorn(mixes, scale, base, n=4, eps=1e-6):
+    """DeepSeek-V4.1's kernel.py, with the Sinkhorn above: pre, post and comb[j, k]."""
+    pre = jax.nn.sigmoid(mixes[..., :n] * scale[0] + base[:n]) + eps
+    post = 2 * jax.nn.sigmoid(mixes[..., n : 2 * n] * scale[1] + base[n : 2 * n])
+    comb = mixes[..., 2 * n :] * scale[2] + base[2 * n :]
+    return pre, post, sinkhorn(comb.reshape(*comb.shape[:-1], n, n), 20)
+
+
+def test_single_pass_mhc_is_deepseek_v4_1s():
+    """As V4.1's inference/model.py runs it: a branch computes pre, post and comb from
+    the streams it gets, but reads them with the pre of the branch before (the first,
+    with stream 0 alone), and the head reads with the last pre."""
+    c = cfg.HyperConnectionsConfig(type="mhc", single_pass=True, norm_eps=1e-20)
+    bodies = [Tanh(k) for k in range(3)]
+    branches = [ManifoldHyperConnections(c, D, body) for body in bodies]
+    for k, branch in enumerate(branches):
+        randomize(branch, seed=k, scale=0.3)
+    x = 1e-3 * jax.random.normal(jax.random.key(9), (2, 8, 4, D))  # small: eps shows
+    taps, y = {}, x
+    for branch in branches:
+        y = branch(y, taps)
+    ours = Merge(None)(y, taps)
+
+    h, pre_mix = x, jax.nn.one_hot(jnp.zeros((2, 8), int), 4)  # make_identity_pre_mix
+    for branch, body in zip(branches, bodies):  # Block.forward
+        assert branch.proj is not None and branch.scale is not None
+        flat = h.reshape(2, 8, 4 * D)  # hc_mixes
+        rsqrt = jax.lax.rsqrt(jnp.square(flat).mean(-1, keepdims=True) + 1e-20)
+        mixes = (flat @ branch.proj[...]) * rsqrt
+        pre, post, comb = hc_split_sinkhorn(mixes, branch.scale[...], branch.bias[...])
+        out = body(jnp.sum(pre_mix[..., None] * h, 2), {})  # hc_pre
+        kept = jnp.sum(comb[..., None] * h[:, :, :, None], 2)  # hc_post
+        h, pre_mix = post[..., None] * out[:, :, None] + kept, pre
+    assert jnp.allclose(ours, jnp.sum(pre_mix[..., None] * h, 2), rtol=1e-4, atol=1e-9)
+    # The head's read has no parameters of its own.
+    m = model("mhc(single_pass=true)", "model = embed [norm attn] [norm ffn] norm head")
+    merge = top(m)[3]
+    assert isinstance(merge, Merge) and merge.reader is None and num_params(merge) == 0
+
+
+def test_mhc_without_dynamic_has_static_coefficients():
+    c = cfg.HyperConnectionsConfig(type="mhc", dynamic=False)
+    branch = ManifoldHyperConnections(c, D, Zero())
+    assert branch.proj is None and branch.scale is None
+    randomize(branch)
+    res = sinkhorn(branch.bias[...][8:].reshape(4, 4), 20)
+    x = jax.random.normal(jax.random.key(0), (2, 8, 4, D))
+    assert jnp.allclose(branch(x, {}), jnp.einsum("jk,btjd->btkd", res, x), atol=1e-5)
+
+
+def test_norm_eps_reaches_the_norms_of_every_algebra():
+    hc_config = cfg.HyperConnectionsConfig(type="hc", norm_eps=1e-5)
+    hc = HyperConnections(hc_config, D, 0, Zero())
+    gr = GatedResidual(cfg.GatedResidualConfig(rank=4, norm_eps=1e-5), D, nnx.Rngs(0))
+    attnres = AttentionResidual(cfg.AttentionResidualConfig(norm_eps=1e-5), D)
+    assert hc.dynamic_alpha is not None
+    assert hc.dynamic_alpha.norm.eps == gr.norm.eps == attnres.key_norm.eps == 1e-5
 
 
 def test_attnres_sources_are_the_embedding_and_blocks_of_outputs():
@@ -245,7 +325,14 @@ def test_a_shared_block_runs_at_every_depth(residual):
     assert logits.shape == (2, 8, V) and bool(jnp.isfinite(logits).all())
 
 
-@pytest.mark.parametrize("residual", ["gr(expansion=4, rank=8)", "mhc(expansion=2)"])
+@pytest.mark.parametrize(
+    "residual",
+    [
+        "gr(expansion=4, rank=8)",
+        "mhc(expansion=2)",
+        "mhc(expansion=2, single_pass=true)",
+    ],
+)
 def test_mtp_goes_on_from_the_widened_stream(residual):
     """Qwen3.8-Flash-Next: the MTP module starts from the copies before the main read,
     mixes the next token's embedding into each one, and reads them back for its head."""

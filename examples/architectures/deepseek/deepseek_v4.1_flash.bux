@@ -1,5 +1,9 @@
-# DeepSeek-V4.1-Flash (DeepSeek, 2026): 552B parameters, 16B active, in 40 MoE layers on
-# a 4-way manifold-constrained hyper-connection stream.
+# DeepSeek-V4.1-Flash (DeepSeek, 2026): 552B parameters besides Engram's, 16B active, in
+# 40 MoE layers on a 4-way manifold-constrained hyper-connection stream.
+#
+# The stream is V4.1's Single-Pass mHC: each branch reads its input with the coefficients
+# the branch before it computed (the first, stream 0 alone), and the head reads with the
+# last ones, with no parameters of its own.
 #
 # Attention is compressed sparse attention (CSA): 64 query heads share a single 512-wide
 # latent that is both key and value. Each query sees a 128-token window plus the top 512
@@ -14,15 +18,18 @@
 #
 # Engram, a hashed n-gram memory of 196B parameters, sits before layers 1 and 14 and
 # adds to each of the 4 streams with a gate of its own. It hashes normalized token
-# classes, and has no convolution. Experts are clamped SwiGLUs scored by sqrt(softplus(.)). The 3 MTP blocks are a speculative drafter trained afterwards on the
-# frozen model, so they are not part of it here; neither is the vision encoder.
+# classes (a stand-in map here, not the tokenizer's), and has no convolution. Experts
+# are clamped SwiGLUs scored by sqrt(softplus(.)). DSpark's 3 blocks are a speculative
+# drafter trained afterwards on the frozen model, so they are not part of it here;
+# neither is the vision encoder.
 d_model    = 5120
 vocab_size = 129280
-residual   = mhc(expansion=4)
+residual   = mhc(expansion=4, single_pass=true, norm_eps=1e-20)
 
 norm    = rmsnorm(eps=1e-20)
 experts = moe(num_experts=384, top_k=6, num_shared_experts=1, router=sqrtsoftplus,
-              routed_scaling_factor=1.5, load_balancing=aux_free,
+              routed_scaling_factor=1.5, load_balancing=aux_free, aux_loss_coef=1e-4,
+              aux_loss_scope=sequence,
               expert=gated_mlp(intermediate_size=2304, activation=swish, limit=10))
 memory  = engram(head_dim=256, table_size=16000000, max_ngram_size=4, norm=norm,
                  conv_size=none, vocab_classes=99092)
@@ -30,7 +37,7 @@ memory  = engram(head_dim=256, table_size=16000000, max_ngram_size=4, norm=norm,
 # Window-only layers keep the base RoPE; the others extend theirs with YaRN, but without
 # its attention factor: cos, sin and the 512 ** -0.5 softmax scale stay as they are.
 window = csa(num_heads=64, q_lora_rank=1280, o_lora_rank=1024, o_groups=8,
-             sliding_window_size=128, sinks=true,
+             sliding_window_size=128, sinks=true, latent_norm=norm,
              rope=rope(fraction=0.125, layout=interleaved))
 far    = rope(base=160000, fraction=0.125, layout=interleaved,
               scaling=yarn(factor=16, original_max_len=65536, attention_factor=1))

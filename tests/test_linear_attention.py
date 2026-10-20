@@ -190,6 +190,20 @@ def test_kda_decay_is_bounded_below_with_a_lower_bound():
     assert (kda.A_log[...] == 0).all()
 
 
+def test_the_output_norm_eps_is_a_setting():
+    """Kimi Linear normalizes KDA's heads with eps 1e-5, Qwen3-Next its GDN's with 1e-6,
+    and RWKV-7's group norm has its eps times the head dim."""
+    kda = cfg.KDAConfig(num_heads=2, head_dim=8, norm_eps=1e-5)
+    gdn = cfg.GatedDeltaNetConfig(num_heads=2, head_dim=8)
+    rwkv = cfg.RWKV7Config(num_heads=2, head_dim=8, v_head_dim=4)
+    norms = [
+        KimiDeltaAttention(kda, D, nnx.Rngs(0)).norm,
+        GatedDeltaNet(gdn, D, nnx.Rngs(0)).norm,
+        RWKV7(rwkv, D, (), nnx.Rngs(0)).norm,
+    ]
+    assert [n.eps for n in norms] == pytest.approx([1e-5, 1e-6, 4e-5])
+
+
 def test_lightning_decays_by_minimax_slopes_weakening_with_depth():
     # MiniMax's rates for 8 heads, and the factors of layers 0, 1 and 2 of 3
     base = [2.0**-i for i in range(1, 9)]

@@ -33,6 +33,7 @@ from flax import nnx
 from jaxtyping import Array, Float
 
 from bux.architecture import Model
+from bux.architecture.registry import Loss
 from bux.data.pipeline import DEFAULT_CACHE, jobs, prepare
 from bux.lang import ir
 from bux.lang.printer import run_to_source
@@ -46,6 +47,14 @@ from bux.train.sinks import JSONL, Console, Latest, Sink
 def forward(model: Model, batch: Batch) -> list[Float[Array, "b t vocab"]]:
     """Every head's logits on `batch`, each document in a row on its own."""
     return model.outputs(jnp.asarray(batch.input_ids), jnp.asarray(batch.position_ids))
+
+
+def training_forward(
+    model: Model, batch: Batch
+) -> tuple[list[Float[Array, "b t vocab"]], list[Loss]]:
+    """`forward` in a training step: with the losses the layers report."""
+    tokens, positions = jnp.asarray(batch.input_ids), jnp.asarray(batch.position_ids)
+    return model.training_outputs(tokens, positions)
 
 
 class Trainer:
@@ -75,7 +84,8 @@ class Trainer:
         the gradient's norm."""
 
         def loss(model: Model) -> tuple[Float[Array, ""], Metrics]:
-            return self.objective(forward(model, batch), batch)
+            logits, reported = training_forward(model, batch)
+            return self.objective(logits, batch, reported)
 
         (_, metrics), grads = nnx.value_and_grad(loss, has_aux=True)(model)
         optimizer.update(model, grads)

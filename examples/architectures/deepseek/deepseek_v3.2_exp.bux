@@ -13,6 +13,7 @@ attn    = mla(num_heads=128, q_lora_rank=1536, kv_lora_rank=512, indexer=indexer
 dense   = gated_mlp(intermediate_size=18432, activation=swish)
 experts = moe(num_experts=256, top_k=8, num_shared_experts=1, router=sigmoid,
               routed_scaling_factor=2.5, num_groups=8, top_k_groups=4, load_balancing=aux_free,
+              aux_loss_coef=1e-4, aux_loss_scope=sequence,
               expert=gated_mlp(intermediate_size=2048, activation=swish))
 
 layer(ffn) = [norm attn] [norm ffn]

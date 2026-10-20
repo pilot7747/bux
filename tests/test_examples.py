@@ -64,7 +64,13 @@ INDEXER = ", indexer=indexer(num_heads=2, head_dim=8, top_k=4)"
 SHRUNK = {
     "deepseek_v3.bux": [f"attn = {MLA}{YARN})", GROUPED],
     "deepseek/deepseek_v3.2_exp.bux": [f"attn = {MLA}{YARN}{INDEXER})", GROUPED],
-    "glm/glm_5.3.bux": [f"attn = {MLA}{INDEXER})", EXPERTS],
+    "glm/glm_5.3.bux": [
+        (
+            f"attn = {MLA}, indexer=indexer(num_heads=2, head_dim=8, top_k=4,"
+            " rope_layout=interleaved))"
+        ),
+        EXPERTS,
+    ],
     "kimi/kimi_k2.5.bux": [f"attn = {MLA})", EXPERTS],
     "deepseek/deepseek_v4.1_flash.bux": [
         "memory = engram(head_dim=4, table_size=50, conv_size=none, vocab_classes=40)",
@@ -94,7 +100,7 @@ SHRUNK = {
         (
             "attn = gqa(num_heads=4, num_kv_heads=2, head_dim=8, gated=true,"
             " qk_norm=norm, rope=rope(fraction=0.25), indexer=indexer(num_heads=2,"
-            " head_dim=8, top_k=4, block_size=2, weighted=false))"
+            " head_dim=8, top_k=4, block_size=2, weighted=false, norm=norm))"
         ),
         (
             "experts = moe(num_experts=4, top_k=2, num_shared_experts=1,"

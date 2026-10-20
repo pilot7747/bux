@@ -66,7 +66,8 @@ swiglu = (linear(features=h) swish * linear(features=h)) linear(features=d_model
 [norm attn scale(init=0)]                    # ReZero; scale(per_channel=true) for LayerScale
 (_ * 2.0 + attn) norm                        # DeepNorm-style weighted skip
 [(attn unit - _) step] unit                  # nGPT: h <- norm(h + a * (norm(f(h)) - h))
-gqa(...) * (linear(features=d_model) sigmoid) # output-gated attention
+gqa(gated=true)                              # gated attention, before o_proj (Qiu et al. G1)
+gqa(...) * (linear(features=d_model) sigmoid) # gated after o_proj instead (their G5)
 ```
 
 ## Skip connections: local, long-range, internal
@@ -214,6 +215,11 @@ stream is widened into 4 streams, and every residual branch reads, writes, and m
 through learned (for `mhc`, doubly stochastic) connections. The IR keeps `Residual`
 separate from `_ + f` for this reason. `[f]` is the residual stream's own connection,
 so backends can replace it, while `_ + f` is plain arithmetic.
+
+`mhc(single_pass=true)` is DeepSeek-V4.1's variant: each branch reads with the
+coefficients the branch before it computed (the first reads stream 0), and the read
+before the head has no parameters. Every algebra with a norm of its own takes
+`norm_eps`.
 
 The other algebras:
 

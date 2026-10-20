@@ -2,10 +2,14 @@
 # Attention in all 78 layers, with wider heads (192 + 64 for queries and keys, 256 for
 # values) and no RoPE stretching for its 1M-token context.
 #
-# Most layers do not run their own indexer (IndexCache): a full layer exports its top-k
-# through the `index` port, and the three layers after it attend to the same keys. The
-# first 3 layers are dense. One MTP layer, with an indexer of its own, is trained as 3
-# chained steps that share it (as the GLM-5 report describes).
+# Only layers 0, 1, 2, 6, 10, ..., 74 run an indexer (IndexShare, after IndexCache):
+# each exports its top-k through the `index` port, and the layers up to the next one
+# attend to the same keys. The first 3 layers are dense. One MTP layer, with an indexer of its
+# own, is trained as 3 chained steps that share it (as the GLM-5 report describes).
+#
+# Unlike DeepSeek-V3.2's, the indexer turns its RoPE dims in interleaved pairs.
+# Left out: since GLM-5.2, later MTP steps reuse the first step's top-k and keys and
+# values.
 d_model    = 6144
 vocab_size = 154880
 
@@ -13,7 +17,8 @@ norm    = rmsnorm(eps=1e-5)
 attn    = mla(num_heads=64, q_lora_rank=2048, kv_lora_rank=512, qk_nope_head_dim=192,
               qk_rope_head_dim=64, v_head_dim=256,
               rope=rope(base=8000000, layout=interleaved),
-              indexer=indexer(num_heads=32, head_dim=128, top_k=2048))
+              indexer=indexer(num_heads=32, head_dim=128, top_k=2048,
+                              rope_layout=interleaved))
 dense   = gated_mlp(intermediate_size=12288, activation=swish)
 experts = moe(num_experts=256, top_k=8, num_shared_experts=1, router=sigmoid,
               routed_scaling_factor=2.5, load_balancing=aux_free,

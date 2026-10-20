@@ -78,7 +78,7 @@ The settings of each config are pydantic fields in `bux/train/config.py`, and th
 editor shows them on hover and completes them, as it does for layers. In short:
 
 - `adamw(lr, b1=0.9, b2=0.95, eps, weight_decay=0.1)` decays matrices only, not norm
-  scales or biases.
+  scales, biases or Engram's tables.
 - `muon(lr, momentum=0.95, nesterov, ns_steps=5, weight_decay=0.1, consistent_rms=0.2,
   adam=none)` trains the matrices inside the blocks with Muon, stacked expert weights
   one expert at a time, and everything else (the embedding, the head, vectors) with
@@ -90,6 +90,33 @@ editor shows them on hover and completes them, as it does for layers. In short:
 - `loss(z=0, mtp=0.3)`: the cross-entropy of the first head, plus `z` times its
   log(Z)², plus `mtp` times the mean loss of the heads after it, each of which predicts
   one token further ahead for every `nextn` before it (see the language guide).
+
+**MoE load balancing** is set on the layer, by a loss, a bias or both:
+`moe(..., load_balancing=aux_free, aux_loss_coef=1e-4, aux_loss_scope=sequence)` is
+DeepSeek-V3's. The loss is `aux_loss_coef` times E Σ_e f_e P_e, f_e the fraction of the
+top-k picks that went to expert e and P_e its mean score normalized over the experts:
+1 when both are uniform, over the whole batch (Switch, Qwen) or over each sequence and
+then averaged (DeepSeek-V3). Its weight defaults to 1e-2, or 0 with `aux_free`; each
+layer adds its own, and `balance_loss` logs their sum. (transformers'
+`load_balancing_loss_func` is top_k times this, taken over all layers at once.)
+`aux_free` adds a bias per expert to the scores that pick the top-k, and after every
+training step moves it by `bias_update_rate` (1e-3) toward the experts picked less
+than the mean over the batch. Eval neither adds the loss nor moves the bias, and
+checkpoints keep the bias.
+
+**The sparse attention indexer** learns from a loss of its own, as DeepSeek-V3.2's
+does: `indexer(..., loss_weight=1)`. Each layer that runs one adds `loss_weight` times
+KL(p ‖ softmax(I)), taken over the keys the indexer kept and averaged over the queries:
+I its scores, and p the layer's attention to those keys, summed over heads and
+normalized over them. With `block_size` (Qwen3.8 QSA) a block counts as its most
+attended key, and only the complete blocks kept count. In CSA (DeepSeek-V4) the keys
+are the compressed latents, and p keeps the share the window and sinks take. The
+indexer's inputs and p are detached, so this loss trains the indexer alone and the
+language-modeling loss trains the rest. The weight then only scales the indexer's
+gradient, and its part of the norm `clip` bounds. A layer that reads `index` runs no
+indexer and adds nothing, and `indexer_loss` logs the sum. DeepSeek's dense warm-up is
+a stage with `top_k` at least `seq_len`, where attention is dense and the loss covers
+every key the query sees; bux does not freeze the rest of the model for it.
 
 Settings are definitions, so arithmetic, `name.field` reads and the number suffixes
 `k`, `M`, `B` and `T` work on them: `steps = 10B // (batch * seq_len)`, `warmup=2k`.
@@ -365,6 +392,11 @@ trainer.fit(
     sinks=[Console("mine", 1000)],
 )
 ```
+
+A layer adds a term of its own from its forward, in one line:
+`report(taps, "my_loss", weight, value)` (`bux/architecture/registry.py`). The
+objective adds weight × value to the training loss and logs the values, summed over
+the layers that report the name, under that name; eval leaves them out.
 
 `train_step` and `eval_step` are what the trainer compiles, once; a subclass that
 overrides them changes what a step does (accumulating gradients, averaging the weights,

@@ -1,7 +1,8 @@
 # Manifold-constrained hyper-connections (DeepSeek mHC, 2025): the usual pre-norm
 # graph, but the residual stream is widened into 4 streams, and every residual branch
 # [...] reads from and writes to them through learned doubly stochastic mixing.
-# The wiring stays the same; only the meaning of [...] changes.
+# The wiring stays the same; only the meaning of [...] changes. The backbone is a
+# generic dense one; the paper's models are DeepSeek-V3-style MoE with MLA.
 d_model    = 2048
 vocab_size = 128256
 residual   = mhc(expansion=4)

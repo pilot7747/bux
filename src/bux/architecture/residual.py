@@ -6,7 +6,8 @@ keeps the embedding and every branch output so far, (b, t, 1 + L, d), and sums t
 into blocks as it reads: so what a branch reads follows from the state alone, at
 whatever depth it runs (a shared block runs at several), and taps save and restore it
 as it is. vpgate keeps one stream. ``embed`` widens its output with ``widen``, and so
-does nextn when it gets one stream.
+does nextn when it gets one stream. Single-pass hc and mhc hand the read coefficients
+from one branch to the next in the taps.
 """
 
 import math
@@ -21,11 +22,10 @@ from bux.architecture.norm import Norm
 from bux.architecture.registry import Context, Taps, register
 from bux.lang import ir
 
-# In the RMS of mhc's flattened streams and Sinkhorn's sums: DeepSeek-V4's norm_eps and
-# hc_eps.
+# In Sinkhorn's sums and added to mhc's read: DeepSeek-V4's hc_eps.
 _EPS = 1e-6
-_RMSNORM = cfg.NormalizationConfig(type="rmsnorm")
-_LAYERNORM = cfg.NormalizationConfig(type="layernorm", affine=False)
+# The read coefficients the last single-pass branch computed, for the next read.
+_PENDING = "<pending read>"
 
 
 def widening(residual: cfg.ResidualConfig | None) -> int | None:
@@ -78,13 +78,32 @@ def sources(
     return jnp.concatenate(parts, 2)
 
 
+def _pending(taps: Taps, x: Float[Array, "b t n d"]) -> Float[Array, "b t n"]:
+    """What a single-pass read uses: the coefficients the last branch computed, or
+    stream 0 alone before any branch, as DeepSeek-V4.1 starts (make_identity_pre_mix).
+    """
+    if _PENDING in taps:
+        return taps[_PENDING][-1]
+    return jnp.broadcast_to(jax.nn.one_hot(0, x.shape[2]), x.shape[:3])
+
+
+def _single_pass_read(
+    own: Float[Array, "b t n"], x: Float[Array, "b t n d"], taps: Taps
+) -> Float[Array, "b t n"]:
+    """The `_pending` coefficients, leaving the branch's `own` for the next read."""
+    read = _pending(taps, x)
+    taps[_PENDING] = [own]
+    return read
+
+
 class _Dynamic(nnx.Module):
     """s tanh(norm(H) W) at every stream of H, where norm is a layernorm without
     parameters: what hyper-connection weights add with `dynamic`. W starts at 0, and the
     scale s at 0.01."""
 
-    def __init__(self, d: int, columns: int):
-        self.norm = Norm(_LAYERNORM, d)
+    def __init__(self, d: int, columns: int, eps: float):
+        layernorm = cfg.NormalizationConfig(type="layernorm", affine=False, eps=eps)
+        self.norm = Norm(layernorm, d)
         self.proj = nnx.Param(jnp.zeros((d, columns)))
         self.scale = nnx.Param(jnp.asarray(0.01))
 
@@ -100,7 +119,8 @@ class HyperConnections(nnx.Module):
     The k-th branch starts as a pre-norm residual, as in the paper: it reads stream
     k mod n (A_m = e_k), keeps the streams (A_r = I) and adds f to every one (B = 1).
     Without f it is the read alone, which starts as the paper's sum of the streams
-    (A_m = 1): ``merge``.
+    (A_m = 1): ``merge``. With `single_pass`, f reads with the A_m the branch before
+    computed (`_single_pass_read`).
     """
 
     def __init__(
@@ -111,15 +131,14 @@ class HyperConnections(nnx.Module):
         body: nnx.Module | None = None,
     ):
         n, write = c.expansion, body is not None
-        self.body = body
+        self.body, self.single_pass = body, c.single_pass
         a_m = jax.nn.one_hot(index % n, n) if write else jnp.ones(n)
         a = jnp.concatenate([a_m[:, None], jnp.eye(n)], 1)
         self.static_alpha = nnx.Param(a if write else a[:, :1])
         self.static_beta = nnx.Param(jnp.ones(n)) if write else None
-        self.dynamic_alpha = (
-            _Dynamic(d, a.shape[1] if write else 1) if c.dynamic else None
-        )
-        self.dynamic_beta = _Dynamic(d, 1) if c.dynamic and write else None
+        columns, eps = a.shape[1] if write else 1, c.norm_eps
+        self.dynamic_alpha = _Dynamic(d, columns, eps) if c.dynamic else None
+        self.dynamic_beta = _Dynamic(d, 1, eps) if c.dynamic and write else None
 
     def _alpha(self, x: Float[Array, "b t n d"]) -> Float[Array, "b t n k"]:
         """A = [A_m A_r] at every position, or A_m alone without f."""
@@ -135,7 +154,10 @@ class HyperConnections(nnx.Module):
     ) -> Float[Array, "b t n d"]:
         assert self.body is not None and self.static_beta is not None
         alpha = self._alpha(x)
-        y = self.body(jnp.einsum("btn,btnd->btd", alpha[..., 0], x), taps)
+        read = alpha[..., 0]
+        if self.single_pass:
+            read = _single_pass_read(read, x, taps)
+        y = self.body(jnp.einsum("btn,btnd->btd", read, x), taps)
         beta = jnp.broadcast_to(self.static_beta[...], x.shape[:3])
         if self.dynamic_beta is not None:
             beta = beta + self.dynamic_beta(x)[..., 0]
@@ -156,47 +178,61 @@ class ManifoldHyperConnections(nnx.Module):
     residual, as hc starts: reading the mean of the streams (pre = 1/n), adding f to
     each (post = 1) and keeping them (b_res = -8 off the diagonal, so that res is I to
     within e^-8, as arXiv 2605.21724 starts its mHC baselines). Without f it is the
-    read alone, as DeepSeek-V4's head reads the streams: ``merge``.
+    read alone, as DeepSeek-V4's head reads the streams: ``merge``. Without `dynamic`
+    there are no W and a, and the coefficients are the biases' alone.
+
+    With `single_pass`, f reads with the pre the branch before computed, or stream 0
+    alone in the first branch, as DeepSeek-V4.1 reads (X_{l+1} = B_l X_l +
+    C_l F_l(A_{l-1} X_l)). Whatever runs between two branches, such as engram or nextn,
+    leaves that pre as it is, as V4.1's engram does, and taps save the stream alone.
     """
 
     def __init__(
         self, c: cfg.HyperConnectionsConfig, d: int, body: nnx.Module | None = None
     ):
         n, write = c.expansion, body is not None
-        self.body = body
-        self.iters = c.sinkhorn_iters
+        self.body, self.single_pass = body, c.single_pass
+        self.iters, self.norm_eps = c.sinkhorn_iters, c.norm_eps
         pre = jnp.full(n, -math.log(max(n - 1, 1)))  # sigmoid(b_pre) = 1 / n
         res = -8.0 * (1 - jnp.eye(n))
         bias = jnp.concatenate([pre, jnp.zeros(n), res.reshape(-1)]) if write else pre
-        self.proj = nnx.Param(jnp.zeros((n * d, bias.shape[0])))  # W
-        self.scale = nnx.Param(jnp.full(3 if write else 1, 0.01))  # a
+        proj = jnp.zeros((n * d, bias.shape[0]))
+        scale = jnp.full(3 if write else 1, 0.01)
+        self.proj = nnx.Param(proj) if c.dynamic else None  # W
+        self.scale = nnx.Param(scale) if c.dynamic else None  # a
         self.bias = nnx.Param(bias)  # b
 
-    def _mixes(self, x: Float[Array, "b t n d"]) -> Float[Array, "b t k"]:
-        """r W: pre's columns, then post's, then res's row by row."""
+    def _logits(self, x: Float[Array, "b t n d"]) -> Float[Array, "b t k"]:
+        """a r W + b, or b alone without `dynamic`: pre's columns, then post's, then
+        res's row by row."""
         b, t, n, d = x.shape
+        bias = self.bias[...]
+        if self.proj is None or self.scale is None:
+            return jnp.broadcast_to(bias, (b, t, bias.shape[0]))
         flat = x.reshape(b, t, n * d)
-        rms = jax.lax.rsqrt(jnp.square(flat).mean(-1, keepdims=True) + _EPS)
-        return (flat @ self.proj[...]) * rms
+        rms = jax.lax.rsqrt(jnp.square(flat).mean(-1, keepdims=True) + self.norm_eps)
+        widths = (n, n, n * n)
+        a = jnp.concatenate([jnp.full(w, s) for s, w in zip(self.scale[...], widths)])
+        return (flat @ self.proj[...]) * rms * a + bias
 
-    def _pre(self, mixes: Float[Array, "b t k"], n: int) -> Float[Array, "b t n"]:
-        a, bias = self.scale[...], self.bias[...]
-        return jax.nn.sigmoid(mixes[..., :n] * a[0] + bias[:n]) + _EPS
+    def _pre(self, logits: Float[Array, "b t k"], n: int) -> Float[Array, "b t n"]:
+        return jax.nn.sigmoid(logits[..., :n]) + _EPS
 
     def read(self, x: Float[Array, "b t n d"]) -> Float[Array, "b t d"]:
-        return jnp.einsum("btn,btnd->btd", self._pre(self._mixes(x), x.shape[2]), x)
+        return jnp.einsum("btn,btnd->btd", self._pre(self._logits(x), x.shape[2]), x)
 
     def __call__(
         self, x: Float[Array, "b t n d"], taps: Taps
     ) -> Float[Array, "b t n d"]:
         assert self.body is not None
         b, t, n, _ = x.shape
-        mixes, a, bias = self._mixes(x), self.scale[...], self.bias[...]
-        pre = self._pre(mixes, n)
-        post = 2 * jax.nn.sigmoid(mixes[..., n : 2 * n] * a[1] + bias[n : 2 * n])
-        res = mixes[..., 2 * n :] * a[2] + bias[2 * n :]
-        res = sinkhorn(res.reshape(b, t, n, n), self.iters)
-        y = self.body(jnp.einsum("btn,btnd->btd", pre, x), taps)
+        logits = self._logits(x)
+        read = self._pre(logits, n)
+        if self.single_pass:
+            read = _single_pass_read(read, x, taps)
+        post = 2 * jax.nn.sigmoid(logits[..., n : 2 * n])
+        res = sinkhorn(logits[..., 2 * n :].reshape(b, t, n, n), self.iters)
+        y = self.body(jnp.einsum("btn,btnd->btd", read, x), taps)
         kept = jnp.einsum("btjk,btjd->btkd", res, x)
         return kept + post[..., None] * y[:, :, None]
 
@@ -220,7 +256,8 @@ class GatedResidual(nnx.Module):
     ):
         n = c.expansion
         self.body = body
-        self.norm = Norm(_RMSNORM, (n, d))
+        rmsnorm = cfg.NormalizationConfig(type="rmsnorm", eps=c.norm_eps)
+        self.norm = Norm(rmsnorm, (n, d))
         self.down = nnx.Linear(n * d, c.rank, use_bias=False, rngs=rngs)
         self.up = nnx.Linear(c.rank, n * d, use_bias=False, rngs=rngs)
         self.write = (
@@ -262,7 +299,7 @@ class AttentionResidual(nnx.Module):
     ):
         self.body = body
         self.query = nnx.Param(jnp.zeros(d))
-        self.key_norm = Norm(_RMSNORM, d)
+        self.key_norm = Norm(cfg.NormalizationConfig(type="rmsnorm", eps=c.norm_eps), d)
         self.block_size = c.block_size
 
     def read(self, x: Float[Array, "b t s d"]) -> Float[Array, "b t d"]:
@@ -311,12 +348,16 @@ Reader = HyperConnections | ManifoldHyperConnections | GatedResidual | Attention
 
 class Merge(nnx.Module):
     """Reads the widened stream back into one: the read a branch of the algebra does,
-    without the write, with parameters of its own."""
+    without the write, with parameters of its own. Single-pass, without a reader, it
+    reads with the coefficients the last branch computed, as DeepSeek-V4.1's head does.
+    """
 
-    def __init__(self, reader: Reader):
+    def __init__(self, reader: Reader | None):
         self.reader = reader
 
     def __call__(self, x: Float[Array, "b t s d"], taps: Taps) -> Float[Array, "b t d"]:
+        if self.reader is None:
+            return jnp.einsum("btn,btnd->btd", _pending(taps, x), x)
         return self.reader.read(x)
 
 
@@ -352,4 +393,7 @@ def branch(residual: cfg.ResidualConfig, body: nnx.Module, ctx: Context) -> nnx.
 def _(
     c: cfg.MergeConfig, width: ir.Width, ports: tuple[ir.Port, ...], ctx: Context
 ) -> Merge:
-    return Merge(_algebra(ctx.arch.residual, ctx))
+    residual = ctx.arch.residual
+    if isinstance(residual, cfg.HyperConnectionsConfig) and residual.single_pass:
+        return Merge(None)
+    return Merge(_algebra(residual, ctx))

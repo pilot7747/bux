@@ -1,18 +1,28 @@
-# Hymba-style hybrid heads (NVIDIA, 2024): attention and SSM run side by side inside every
-# layer; each branch is normalized and scaled, then summed. Sliding-window attention
-# everywhere except the first, middle and last layer. Sizes are approximate.
+# Hymba-1.5B-style hybrid heads (NVIDIA, 2024): attention and Mamba heads run side by
+# side on the same input in every layer; each branch is normalized and scaled, then
+# summed. Sliding-window attention everywhere except the first, middle and last layer,
+# and each sliding-window layer that computes K/V shares them with the next (16 with 17
+# and 18).
+#
+# Simplified: Hymba normalizes the branches' 3200-wide outputs and projects their mean
+# once, where here each branch projects back on its own; and it prepends 128 learned
+# meta tokens, which are left out.
 d_model    = 1600
 vocab_size = 32001
 
 norm  = rmsnorm
-local = gqa(num_heads=25, num_kv_heads=5, fused_qkv=true, sliding_window_size=1024,
-            rope=rope())
+# Hymba's window of 1024 does not count the query itself. The base is NTK-scaled from
+# 10000 for 4x the 2048 positions: 10000 * 7 ** (64 / 62).
+local = gqa(num_heads=25, num_kv_heads=5, v_head_dim=128, fused_qkv=true,
+            sliding_window_size=1025, rope=rope(base=74535))
 full  = local(sliding_window_size=none)
 ssm   = mamba(state_size=16)
 ffn   = gated_mlp(intermediate_size=5504, activation=swish)
 
 layer(attn) = [norm (attn norm scale + ssm norm scale)] [norm ffn]
-L = layer(local)
 F = layer(full)
+W = layer(local(kv=@kv))
+S = layer(local(kv=$kv))
+R = layer(local(kv=$kv!))
 
-model = embed F L^14 F L^15 F norm head(tied=true)
+model = embed F "WR"^7 F "WSR" "WR"^6 F norm head(tied=true)

@@ -83,10 +83,10 @@ class MLA(SoftmaxAttention):
         if self.q_norm is not None and self.k_norm is not None:
             q, k = self.q_norm(q), self.k_norm(k)
         q, k = self._rotate(q, pos), self._rotate(k, pos)
-        keep = self._select_tokens(x, query, docs, taps)
+        keep, scores = self._select_tokens(x, query, docs, taps)
         if keep is None:
             return self._output(x, self._attend(x, q, k, v, docs))
-        return self._output(x, self._attend(x, q, k, v, docs, keep))
+        return self._output(x, self._attend(x, q, k, v, docs, keep, scores, taps))
 
     def _rotate(
         self, x: Float[Array, "b t h k"], pos: Int[Array, "b t"] | None

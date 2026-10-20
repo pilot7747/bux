@@ -10,10 +10,10 @@
 # output at full rank. The vision encoder is not described here.
 d_model    = 7168
 vocab_size = 163840
-residual   = attnres(block_size=24)
+residual   = attnres(block_size=24, norm_eps=1e-5)
 
 norm    = rmsnorm(eps=1e-5)
-kda     = kda(num_heads=96, head_dim=128, gate_lower_bound=-5)
+kda     = kda(num_heads=96, head_dim=128, gate_lower_bound=-5, norm_eps=1e-5)
 mla     = mla(num_heads=96, q_lora_rank=1536, kv_lora_rank=512, gated=true, rope=none)
 dense   = gated_mlp(intermediate_size=33792, activation=situ, up_softcap=25)
 experts = moe(num_experts=896, top_k=16, num_shared_experts=2, router=sigmoid,

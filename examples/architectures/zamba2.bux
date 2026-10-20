@@ -1,15 +1,22 @@
-# Zamba-style (Zyphra, 2024): a Mamba-2 backbone that calls one shared attention block
-# every six layers. "shared" makes a definition a single module instead of a template,
-# so all nine uses of `sa` have the same parameters. Sizes are approximate.
+# Zamba2-1.2B-style (Zyphra, 2024): a Mamba-2 backbone that calls one shared transformer
+# block before every sixth Mamba-2 layer. "shared" makes a definition a single module
+# instead of a template, so all six uses of `sa` have the same parameters. The block has
+# no residual of its own: its output, through a linear layer of each call's own, is
+# added to the input of the Mamba-2 layer after it.
+#
+# Simplified: Zamba2 feeds the block the stream concatenated with the embedding, and
+# gives each call LoRA adapters on q, k, v and the MLP; here it reads the stream alone.
 d_model    = 2048
 vocab_size = 32000
 
-norm = rmsnorm
-ssm  = mamba2(state_size=64)
-attn = gqa(num_heads=32, num_kv_heads=32, rope=rope())
-ffn  = gated_mlp(intermediate_size=8192, activation=swish)
+norm = rmsnorm(eps=1e-5)
+ssm  = mamba2(state_size=128)
+# Heads as wide as on Zamba2's 4096-wide input, with logits scaled as if half as wide.
+attn = gqa(num_heads=32, num_kv_heads=32, head_dim=128, scale=0.125, rope=rope())
+ffn  = gated_mlp(intermediate_size=8192, activation=gelu)
 
 m = [norm ssm]
-shared sa = [norm attn] [norm ffn]
+shared sa = norm attn norm ffn
+h = [(_ + sa linear(features=d_model)) norm ssm]
 
-model = embed (m^6 sa)^9 norm head
+model = embed (m^5 h)^6 m^2 norm head(tied=true)

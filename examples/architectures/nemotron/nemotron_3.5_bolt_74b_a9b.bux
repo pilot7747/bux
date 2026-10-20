@@ -1,10 +1,12 @@
 # NVIDIA Nemotron 3.5 Bolt 74B-A9B (2026): the language model of a vision-language
 # model built to run in 24GB with native 2-bit weights. It is the Nemotron 3 hybrid
 # (Mamba-2, LatentMoE and attention layers, each a single mixer in a pre-norm
-# residual, no positional encoding), compressed with Puzzle neural architecture search.
+# residual, no positional encoding), compressed from Nemotron 3.5 Super VL 120B-A12B
+# with Star Elastic architecture search.
 #
-# The search kept the Mamba-2 and attention layers and resized every MoE layer on its
-# own: 240 to 496 experts, 1536 to 2560 wide, always 9 active in a 1024-wide latent.
+# The search kept the parent's Mamba-2 and attention layers and resized every MoE layer
+# on its own: 240 to 496 experts, 1536 to 2560 wide, always 9 active (22 in the parent)
+# in a 1024-wide latent.
 # There is no MTP, and the vision encoder is not described here.
 d_model    = 4096
 vocab_size = 131072

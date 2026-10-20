@@ -12,8 +12,9 @@ before it, so another implementation plugs in the same way, a fused kernel say:
 
 Modules are called as ``module(x, taps)``: ``taps`` holds the tap stacks for one
 forward pass, and under reserved keys the input tokens, the documents rows are packed
-with (``segments(taps)``, None for a document a row) and the logits of every head run
-so far. Repeats are unrolled; nodes with a share key are built once and reused.
+with (``segments(taps)``, None for a document a row), the logits of every head run
+so far, and in a training step the loss terms layers add (``report``). Repeats are
+unrolled; nodes with a share key are built once and reused.
 
 Arrays say their dtype and shape with jaxtyping, as ``x: Float[Array, "b t d"]`` for a
 stream of b rows of t positions, d wide, and the tests check them on every call.
@@ -41,14 +42,18 @@ from bux.architecture.model import Model, num_params
 from bux.architecture.moe import MoE
 from bux.architecture.norm import DyT, Norm
 from bux.architecture.registry import (
+    LOSSES,
     NEXTN,
     OUTPUTS,
     SEGMENTS,
     TOKENS,
     Context,
+    Loss,
     Taps,
     register,
+    report,
     segments,
+    training,
 )
 from bux.architecture.residual import (
     AttentionResidual,
@@ -64,6 +69,7 @@ from bux.architecture.ssm import Mamba, Mamba2, ShortConv
 
 __all__ = [
     "CSA",
+    "LOSSES",
     "MLA",
     "MLP",
     "NEXTN",
@@ -90,6 +96,7 @@ __all__ = [
     "KimiDeltaAttention",
     "LightningAttention",
     "Linear",
+    "Loss",
     "Mamba",
     "Mamba2",
     "ManifoldHyperConnections",
@@ -107,5 +114,7 @@ __all__ = [
     "build_node",
     "num_params",
     "register",
+    "report",
     "segments",
+    "training",
 ]

@@ -4,9 +4,9 @@
 # with the log of the position past 128K tokens.
 #
 # Short causal convolutions are everywhere: on the keys and values, and as a shortcut
-# y + conv(y) on every branch output. The MoE weights its 2 shared experts with the
-# router too, as part of the top-6. Eight chained MTP layers predict up to 8 tokens
-# further ahead. The vision encoder is not described here.
+# y + conv(y) on every branch output. The router scores the 2 shared experts too, and
+# normalizes their weights together with the top 6. Eight chained MTP layers predict
+# up to 8 tokens further ahead. The vision and audio encoders are not described here.
 d_model     = 6144
 vocab_size  = 201024
 logit_scale = 1 / 24

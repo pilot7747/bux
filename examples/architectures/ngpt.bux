@@ -1,12 +1,16 @@
-# nGPT-style normalized transformer (NVIDIA, 2024): hidden states stay on the unit
-# sphere, and each branch moves them toward its own normalized output by a learned
-# per-channel step:  h <- norm(h + alpha * (norm(f(h)) - h)).
+# nGPT-style normalized transformer (NVIDIA, 2024), the paper's 0.5B model: hidden
+# states stay on the sphere, and each branch moves them toward its own normalized
+# output by a learned per-channel step:  h <- norm(h + alpha * (norm(f(h)) - h)).
+# rmsnorm puts them at radius sqrt(d), nGPT's rescaling of the MLP input. The weights
+# are not kept on the sphere here, so nGPT's s_u, s_v and s_z fold into them.
 d_model    = 1024
 vocab_size = 32000
 
 unit = rmsnorm(affine=false)
 step = scale(init=0.05, per_channel=true)
-attn = gqa(num_heads=16, num_kv_heads=16, rope=rope(layout=interleaved))
+# Normalized q and k with gains (s_qk): at the default scale 1/sqrt(d_k), the logits
+# are sqrt(d_k) s_qk^2 cos(q, k), as nGPT's.
+attn = gqa(num_heads=16, num_kv_heads=16, qk_norm=rmsnorm, rope=rope(layout=interleaved))
 ffn  = gated_mlp(intermediate_size=4096, activation=swish)
 
 block = [(attn unit - _) step] unit [(ffn unit - _) step] unit

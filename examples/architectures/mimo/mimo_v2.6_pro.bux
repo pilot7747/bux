@@ -15,9 +15,11 @@ attn    = gqa(num_heads=128, num_kv_heads=8, head_dim=192, v_head_dim=128,
 local   = attn(sliding_window_size=128, sinks=true, rope.base=10000)
 dense   = gated_mlp(intermediate_size=16384, activation=swish)
 experts = moe(num_experts=384, top_k=8, router=sigmoid, load_balancing=aux_free,
+              aux_loss_coef=1e-5, aux_loss_scope=sequence,
               expert=gated_mlp(intermediate_size=2048, activation=swish))
 
-# The values are scaled by 0.612, about sqrt(d_model / (128 heads * 128)).
+# The values are scaled by 0.612, about sqrt(d_model / (128 heads * 128)). Scaling the
+# output instead is the same, since its projection has no bias.
 layer(mixer, ffn=experts) = [norm (mixer * 0.612)] [norm ffn]
 F = layer(attn, dense)
 G = layer(attn)

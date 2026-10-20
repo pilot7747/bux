@@ -1,19 +1,35 @@
-"""Softmax attention layers: MLA, CSA, the sparse attention indexer, and what they share
-with GQA (tests/test_backend.py has GQA's own)."""
+"""Softmax attention layers: MLA, CSA, the sparse attention indexer and its loss, and
+what they share with GQA (tests/test_backend.py has GQA's own)."""
 
 import math
 
 import jax
 import jax.numpy as jnp
+import numpy as np
+import optax
 import pytest
 from flax import nnx
 
 from bux import config as cfg
-from bux.architecture import SEGMENTS, Attention, Model, Segments, num_params
+from bux.architecture import (
+    SEGMENTS,
+    Attention,
+    Indexer,
+    Model,
+    MoE,
+    Segments,
+    Taps,
+    num_params,
+)
 from bux.architecture.csa import CSA
 from bux.architecture.mla import MLA
+from bux.architecture.registry import LOSSES
 from bux.architecture.rope import rotate
 from bux.lang import compile, ir
+from bux.train import config as tcfg
+from bux.train.data import Batch
+from bux.train.objective import objective
+from bux.train.trainer import Trainer
 
 D, V = 32, 64
 
@@ -27,6 +43,7 @@ latent = mla(num_heads=4, q_lora_rank=12, kv_lora_rank=8, qk_nope_head_dim=6,
              qk_rope_head_dim=4, v_head_dim=5)
 window = csa(num_heads=4, head_dim=16, q_lora_rank=12, o_lora_rank=6, o_groups=2,
              sliding_window_size=3, sinks=true, rope=rope(fraction=0.25, layout=interleaved))
+experts = moe(num_experts=4, top_k=2, expert=ffn)
 """
 
 BODIES = {
@@ -106,14 +123,19 @@ def causal(t: int, window: int | None = None):
     return jnp.broadcast_to(mask, (2, t, t))
 
 
-def masked_attention(q, k, v, scale, mask, sinks=None):
-    """softmax(q . k * scale) v over the keys `mask` keeps, next to the heads' sinks."""
+def attention_probs(q, k, scale, mask, sinks=None):
+    """softmax(q . k * scale) over the keys `mask` keeps, next to the heads' sinks."""
     logits = jnp.einsum("bthd,bshd->bhts", q, k) * scale
     logits = jnp.where(mask[:, None], logits, -jnp.inf)
     if sinks is not None:
         sink = jnp.broadcast_to(sinks[None, :, None, None], (*logits.shape[:3], 1))
         logits = jnp.concatenate([logits, sink], -1)
-    probs = jax.nn.softmax(logits)[..., : k.shape[1]]
+    return jnp.nan_to_num(jax.nn.softmax(logits)[..., : k.shape[1]])
+
+
+def masked_attention(q, k, v, scale, mask, sinks=None):
+    """softmax(q . k * scale) v over the keys `mask` keeps, next to the heads' sinks."""
+    probs = attention_probs(q, k, scale, mask, sinks)
     return jnp.einsum("bhts,bshd->bthd", probs, v)
 
 
@@ -212,7 +234,8 @@ def gqa(ports=(), **kw):
     return Attention(c, D, ports, nnx.Rngs(0))
 
 
-def gqa_reference(attn, x, mask):
+def gqa_heads(attn, x):
+    """The queries, keys and values of every head."""
     b, t, _ = x.shape
     h, g, d = attn.heads, attn.kv_heads, attn.head_dim
     assert attn.q is not None and attn.k is not None and attn.v is not None
@@ -220,7 +243,12 @@ def gqa_reference(attn, x, mask):
     q = rotate(attn.q(x).reshape(b, t, h, d), attn.rope)
     k = rotate(attn.k(x).reshape(b, t, g, d), attn.rope)
     v = attn.v(x).reshape(b, t, g, d)
-    k, v = (jnp.repeat(a, h // g, axis=2) for a in (k, v))
+    return q, *(jnp.repeat(a, h // g, axis=2) for a in (k, v))
+
+
+def gqa_reference(attn, x, mask):
+    b, t, _ = x.shape
+    q, k, v = gqa_heads(attn, x)
     return attn.o(masked_attention(q, k, v, attn.scale, mask).reshape(b, t, -1))
 
 
@@ -282,20 +310,97 @@ def test_a_small_top_k_attends_to_the_best_scored_keys_only(weighted):
     assert jnp.allclose(y, gqa_reference(attn, x, selected), atol=1e-5)
 
 
-def test_blocks_are_kept_whole_with_the_querys_own():
+def test_blocks_are_kept_whole_with_the_querys_unfinished_one():
     c = cfg.SparseIndexerConfig(num_heads=2, head_dim=8, top_k=4, block_size=2)
     attn = gqa(index_port("write"), indexer=c)
     x, taps = inputs(), {}
     y = attn(x, taps)
     [selected] = taps["topk"]
     pairs = selected.reshape(2, 12, 6, 2)
-    own = jnp.arange(12) // 2
-    # Each query keeps its own block, up to itself, and 2 whole earlier ones.
-    assert pairs[:, jnp.arange(12), own].sum(-1).tolist() == [[1, 2] * 6] * 2
-    earlier = pairs.all(-1) & (jnp.arange(6) < own[:, None])
-    assert (earlier.sum(-1) == jnp.minimum(own, 2)).all()
-    assert (pairs.any(-1) == pairs.all(-1) | (jnp.arange(6) == own[:, None])).all()
+    i = jnp.arange(12)
+    # 2 of the blocks each query sees all of, its own among them once it is complete,
+    # and the query itself while its block is unfinished.
+    assert (pairs.all(-1).sum(-1) == jnp.minimum((i + 1) // 2, 2)).all()
+    unfinished = (i % 2 == 0)[:, None] & (jnp.arange(6) == i[:, None] // 2)
+    assert (pairs.any(-1) & ~pairs.all(-1) == unfinished).all()
     assert jnp.allclose(y, gqa_reference(attn, x, selected), atol=1e-5)
+
+
+def test_qsa_keeps_the_blocks_qwen_does():
+    """Qwen3.8 QSA's selection as transformers' Qwen4ExpTextQSAIndexer makes it, query
+    by query: each complete block of 4 of the keys a query sees is the mean of its raw
+    keys, normalized, then turned to its first position; the best 2 are kept, and the
+    keys after them."""
+    norm = cfg.NormalizationConfig(type="rmsnorm", zero_centered=True)
+    c = cfg.SparseIndexerConfig(
+        num_heads=2, head_dim=16, top_k=8, block_size=4, weighted=False, norm=norm
+    )
+    attn = gqa(index_port("write"), indexer=c)
+    ix = attn.indexer
+    assert ix is not None and ix.k is not None and ix.rope is not None
+    assert ix.q_norm is not None and ix.k_norm is not None
+    ix.q_norm.scale[...] = jax.random.normal(jax.random.key(3), (16,))
+    ix.k_norm.scale[...] = jax.random.normal(jax.random.key(4), (16,))
+    pos = jnp.concatenate([jnp.arange(9), jnp.arange(23) + 5])[None].repeat(2, 0)
+    x, taps = inputs(length=32), Taps({SEGMENTS: [Segments.of(pos)]})
+    attn(x, taps)
+    [selected] = taps["topk"]
+
+    def turn(a, at):  # the first 8 dims, which the layer's RoPE turns in its heads
+        return jnp.concatenate([rotate(a[..., :8], ix.rope, at), a[..., 8:]], -1)
+
+    q = turn(ix.q_norm(ix.q(x).reshape(2, 32, 2, 16)), pos)
+    raw, doc = ix.k(x), jnp.arange(32) >= 9
+    visible = causal(32) & (doc[:, None] == doc[None])
+    expected = jnp.zeros((2, 32, 32), bool)
+    for row in range(2):
+        for i in range(32):
+            seen = jnp.flatnonzero(visible[row, i])
+            n = len(seen) // 4
+            expected = expected.at[row, i, seen[4 * n :]].set(True)
+            if n == 0:
+                continue
+            blocks = seen[: 4 * n].reshape(n, 4)
+            k = ix.k_norm(raw[row, blocks].mean(1))
+            k = turn(k[None, :, None], pos[row, blocks[:, 0]][None])[0, :, 0]
+            scores = jax.nn.relu(q[row, i] @ k.T).sum(0)
+            expected = expected.at[row, i, blocks[jnp.argsort(-scores)[:2]]].set(True)
+    assert (selected == expected).all()
+
+
+def test_glms_indexer_turns_its_rope_dims_in_interleaved_pairs():
+    """GLM-5.3's scores as transformers' GlmMoeDsaIndexer makes them: it turns pairs of
+    neighbouring dims, and lays them out evens first, which the scores do not see.
+    DeepSeek-V3.2's half layout scores differently."""
+    c = cfg.SparseIndexerConfig(
+        num_heads=2, head_dim=8, top_k=3, rope_layout="interleaved"
+    )
+    attn = mla(c)
+    ix = attn.indexer
+    assert ix is not None and ix.k is not None and ix.k_norm is not None
+    assert ix.weights is not None and attn.q_a is not None and attn.q_a_norm is not None
+    x = inputs()
+    query = attn.q_a_norm(attn.q_a(x))
+    angles = jnp.arange(12)[:, None, None] * 10000.0 ** -(jnp.arange(0, 4, 2) / 4)
+    cos, sin = jnp.cos(angles), jnp.sin(angles)
+
+    def turn(a):  # the first 4 dims, which the layer's RoPE turns
+        a1, a2 = a[..., 0:4:2], a[..., 1:4:2]
+        return jnp.concatenate(
+            [a1 * cos - a2 * sin, a2 * cos + a1 * sin, a[..., 4:]], -1
+        )
+
+    q = turn(ix.q(query).reshape(2, 12, 2, 8))
+    k = turn(ix.k_norm(ix.k(x))[:, :, None])[:, :, 0]
+    dots = jax.nn.relu(jnp.einsum("bthi,bsi->bths", q, k)) * 8**-0.5
+    expected = jnp.einsum("bths,bth->bts", dots, ix.weights(x) * 2**-0.5)
+    assert jnp.allclose(
+        ix.scores(x, query, None, ix.keys(x, None)), expected, atol=1e-5
+    )
+    half = mla(c.model_copy(update={"rope_layout": "half"})).indexer
+    assert half is not None
+    scores = half.scores(x, query, None, half.keys(x, None))
+    assert not jnp.allclose(scores, expected, atol=1e-3)
 
 
 def test_a_layer_reading_index_attends_to_the_writers_selection():
@@ -364,6 +469,16 @@ def test_csa_without_compression_is_window_attention():
     attn = csa(sliding_window_size=3)
     x = inputs()
     assert jnp.allclose(attn(x, {}), csa_reference(attn, x), atol=1e-5)
+
+
+def test_the_latent_norm_is_every_latents_and_the_indexer_keys():
+    """DeepSeek-V4.1 normalizes them all with eps 1e-20."""
+    tiny = cfg.NormalizationConfig(type="rmsnorm", eps=1e-20)
+    c = cfg.SparseIndexerConfig(num_heads=2, head_dim=8, top_k=2)
+    attn = csa(compress_ratio=2, indexer=c, latent_norm=tiny)
+    assert attn.indexer is not None
+    norms = (attn.q_a_norm, attn.kv_norm, attn.compress_norm, attn.indexer.k_norm)
+    assert [n.eps if n else None for n in norms] == [1e-20] * 4
 
 
 def test_compressed_latents_pool_their_groups():
@@ -442,6 +557,196 @@ def test_an_indexer_reading_candidates_selects_inside_them():
     assert (selected.sum(-1) == jnp.minimum(inside.sum(-1), 4)).all()
 
 
+def kl(p, scores, over):
+    """Every query's KL(p || softmax(scores)) over the keys `over` says, p normalized
+    over them; 0 for a query with none."""
+    p = jnp.where(over, p, 0)
+    p = p / p.sum(-1, keepdims=True)
+    log_q = jax.nn.log_softmax(jnp.where(over, scores, -jnp.inf))
+    terms = jnp.where(over & (p > 0), p * (jnp.log(p) - log_q), 0)
+    return jnp.where(over.any(-1), terms.sum(-1), 0)
+
+
+@pytest.mark.parametrize("top_k", [3, 12])
+def test_the_indexer_loss_is_the_kl_from_the_attention_to_its_top_k(top_k):
+    """DeepSeek-V3.2's, eq. 4: KL(p || softmax(I)) over the keys kept, p the attention
+    summed over heads and normalized over them, averaged over the queries. With every
+    key kept, the attention is dense, and this is the warm-up's loss, eq. 3."""
+    c = cfg.SparseIndexerConfig(num_heads=2, head_dim=8, top_k=top_k, loss_weight=0.5)
+    attn = gqa(index_port("write"), indexer=c)
+    assert attn.indexer is not None
+    x, taps = inputs(), {LOSSES: []}
+    attn(x, taps)
+    [selected], [loss] = taps["topk"], taps[LOSSES]
+    assert (loss.name, loss.weight) == ("indexer_loss", 0.5)
+    assert top_k < 12 or (selected == causal(12)).all()
+    q, k, _ = gqa_heads(attn, x)
+    p = attention_probs(q, k, attn.scale, selected).sum(1)
+    scores = attn.indexer.scores(x, x, None, attn.indexer.keys(x, None))
+    assert jnp.allclose(loss.value, kl(p, scores, selected).mean(), atol=1e-6)
+
+
+def test_qsas_loss_is_over_the_blocks_kept_each_by_its_most_attended_key():
+    """Qwen3.8 QSA's, eqs. 17 and 20: the attention summed over heads and max-pooled in
+    each block, over the complete blocks kept but not the unfinished one."""
+    c = cfg.SparseIndexerConfig(
+        num_heads=2, head_dim=8, top_k=4, block_size=2, weighted=False
+    )
+    attn = gqa(index_port("write"), indexer=c)
+    ix = attn.indexer
+    assert ix is not None and ix.k is not None and ix.k_norm is not None
+    x, taps = inputs(), {LOSSES: []}
+    attn(x, taps)
+    [selected], [loss] = taps["topk"], taps[LOSSES]
+    q, k, _ = gqa_heads(attn, x)
+    p = attention_probs(q, k, attn.scale, selected).sum(1)
+    blocks = p.reshape(2, 12, 6, 2).max(-1)
+    kept = selected.reshape(2, 12, 6, 2).all(-1)
+    means = ix.k_norm(ix.k(x).reshape(2, 6, 2, 8).mean(2))
+    first = jnp.arange(0, 12, 2)[None].repeat(2, 0)
+    scores = ix.scores(x, x, None, ix._rotate(means[:, :, None], first)[:, :, 0])
+    assert jnp.allclose(loss.value, kl(blocks, scores, kept).mean(), atol=1e-6)
+
+
+def test_csas_loss_is_against_the_attention_its_window_and_sinks_share():
+    """DeepSeek-V4's: the latents' part of the attention, whose softmax the window and
+    the sinks are in too, and not an attention to the latents alone."""
+    c = cfg.SparseIndexerConfig(num_heads=2, head_dim=8, top_k=2)
+    ports = tuple(ir.Port(name=n, tap=n, mode="write") for n in ("kv", "index"))
+    attn = csa(ports, compress_ratio=2, sliding_window_size=3, indexer=c)
+    ix = attn.indexer
+    assert ix is not None and attn.q_a is not None and attn.q_a_norm is not None
+    assert attn.rope is not None and attn.sinks is not None
+    x, taps = inputs(), {LOSSES: []}
+    attn(x, taps)
+    [latents], [selected], [loss] = taps["kv"], taps["index"], taps[LOSSES]
+    query = attn.q_a_norm(attn.q_a(x))
+    q = rotate(attn.q(query).reshape(2, 12, 4, 16), attn.rope)
+    window = rotate(attn.kv_norm(attn.kv(x))[:, :, None], attn.rope)
+    kv = jnp.repeat(jnp.concatenate([window, latents.kv[:, :, None]], 1), 4, axis=2)
+    mask = jnp.concatenate([causal(12, 3), selected], -1)
+    p = attention_probs(q, kv, attn.scale, mask, attn.sinks[...])[..., 12:].sum(1)
+    scores = ix.scores(x, query, jnp.arange(12)[None].repeat(2, 0), latents.index)
+    assert jnp.allclose(loss.value, kl(p, scores, selected).mean(), atol=1e-6)
+    alone = attention_probs(q, kv[:, 12:], attn.scale, selected).sum(1)
+    assert not jnp.allclose(loss.value, kl(alone, scores, selected).mean(), atol=1e-4)
+
+
+@pytest.mark.parametrize("make", INDEXERS.values(), ids=INDEXERS.keys())
+def test_the_indexer_loss_is_reported_in_training_forwards_only(make):
+    c = cfg.SparseIndexerConfig(num_heads=2, head_dim=8, top_k=6)
+    layer, x, taps = make(c), inputs(), {}
+    y = layer(x, taps)
+    assert LOSSES not in taps
+    taps = {LOSSES: []}
+    assert jnp.array_equal(layer(x, taps), y)
+    [loss] = taps[LOSSES]
+    assert loss.name == "indexer_loss" and loss.weight == 1.0
+    assert bool(jnp.isfinite(loss.value)) and loss.value > 0
+    taps = {LOSSES: []}
+    make(c.model_copy(update={"loss_weight": 0.0}))(x, taps)
+    assert taps[LOSSES] == []
+
+
+@pytest.mark.parametrize(
+    "body",
+    [
+        "mla",
+        "csa_window",
+        "mla_indexer",
+        "csa_compressed",
+        "csa_ports",
+        "mla_index_ports",
+    ],
+)
+def test_the_layers_that_run_an_indexer_report_its_loss_and_no_others(body):
+    """A layer that reads the index port runs none, and a model without an indexer
+    reports nothing."""
+    m, t = model(BODIES[body]), tokens()
+    logits, reported = m.training_outputs(t)
+    indexers = sum(isinstance(i, Indexer) for _, i in nnx.iter_modules(m))
+    assert [r.name for r in reported] == ["indexer_loss"] * indexers
+    assert jnp.array_equal(logits[0], m(t))
+
+
+def indexer_loss(m, t, positions=None):
+    """The indexer losses of a training forward of `m`, summed."""
+    _, reported = m.training_outputs(t, positions)
+    return sum(r.value for r in reported if r.name == "indexer_loss")
+
+
+@pytest.mark.parametrize(
+    "body", ["mla_indexer", "gqa_block_indexer", "csa_ports", "mla_index_ports"]
+)
+def test_the_indexer_loss_trains_the_indexers_and_nothing_else(body):
+    """Their inputs are detached, and so is the attention they learn from: none of its
+    gradient reaches the attention's projections, the MoE, the norms or the embedding.
+    An indexer that scores another's keys (DeepSeek-V4.1's Reindex) trains them too."""
+    body = BODIES[body]
+    m, t = model(body.replace("[norm ffn]", "[norm experts]")), tokens()
+    moe = any(isinstance(e, MoE) for _, e in nnx.iter_modules(m))
+    assert moe == ("[norm ffn]" in body)
+    grads = nnx.grad(lambda m: indexer_loss(m, t))(m)
+    for path, g in jax.tree_util.tree_leaves_with_path(grads):
+        name = jax.tree_util.keystr(path)
+        trained = "['indexer']" in name
+        assert bool(g.any()) == trained and bool(jnp.isfinite(g).all()), name
+
+
+def test_training_on_the_indexer_loss_alone_makes_it_keep_what_attention_attends_to():
+    """How many of the 4 keys that the attention attends to most it scores best."""
+    c = cfg.SparseIndexerConfig(num_heads=2, head_dim=8, top_k=4)
+    attn, x = gqa(indexer=c), inputs(length=32)
+    ix, mask = attn.indexer, causal(32)
+    assert ix is not None
+
+    def agreement():
+        q, k, _ = gqa_heads(attn, x)
+        p = attention_probs(q, k, attn.scale, mask).sum(1)
+        scores = jnp.where(mask, ix.scores(x, x, None, ix.keys(x, None)), -jnp.inf)
+        best = [jax.nn.one_hot(jax.lax.top_k(a, 4)[1], 32).sum(-2) for a in (p, scores)]
+        return float((best[0] * best[1]).sum(-1)[:, 4:].mean() / 4)
+
+    def loss(attn):
+        taps = {LOSSES: []}
+        attn(x, taps)
+        return taps[LOSSES][0].value
+
+    @nnx.jit
+    def step(attn, optimizer):
+        value, grads = nnx.value_and_grad(loss)(attn)
+        optimizer.update(attn, grads)
+        return value
+
+    optimizer = nnx.Optimizer(attn, optax.adam(1e-2), wrt=nnx.Param)
+    before, first = agreement(), step(attn, optimizer)
+    for _ in range(100):
+        last = step(attn, optimizer)
+    assert last < first / 2 and agreement() > before + 0.1
+
+
+@pytest.mark.parametrize(
+    "body", ["mla_indexer", "gqa_block_indexer", "csa_compressed", "csa_ports"]
+)
+def test_the_indexer_loss_of_documents_packed_in_a_row_is_theirs(body):
+    """Each document's queries' share of the mean, also where a query sees nothing the
+    indexer scores: before CSA's first latent, or QSA's first complete block. A train
+    step logs it, with a finite gradient."""
+    m = model(BODIES[body])
+    a, b = tokens(0, 5), tokens(1, 7)
+    t = jnp.concatenate([a, b], axis=1)
+    positions = jnp.concatenate([jnp.arange(5), jnp.arange(7)])[None].repeat(2, 0)
+    packed = indexer_loss(m, t, positions)
+    alone = (5 * indexer_loss(m, a) + 7 * indexer_loss(m, b)) / 12
+    assert bool(jnp.isfinite(packed)) and jnp.isclose(packed, alone, atol=1e-6)
+    arch = compile(PRELUDE + BODIES[body])
+    trainer = Trainer(m, optax.adamw(1e-3), objective(tcfg.LossConfig(), arch))
+    batch = Batch(np.asarray(t), np.asarray(positions), np.ones((2, 12), bool))
+    metrics = trainer.update(batch)
+    assert np.isclose(metrics["indexer_loss"], packed, atol=1e-5)
+    assert np.isfinite(metrics["grad_norm"])
+
+
 def test_unrotate_inverts_rotate_with_a_gain_on_cos_and_sin():
     yarn = cfg.YaRNConfig(factor=16, original_max_len=4, attention_factor=1.5)
     attn = csa(rope=cfg.RoPEConfig(fraction=0.5, scaling=yarn))
@@ -456,3 +761,33 @@ def test_dropout_on_the_probabilities_and_the_output():
     assert not jnp.allclose(dropped(x, {}), dropped(x, {}))
     dropped.eval()
     assert jnp.allclose(dropped(x, {}), gqa()(x, {}), atol=1e-6)
+
+
+@pytest.mark.parametrize(
+    ("kind", "learned", "weights"),
+    [
+        ("fixed", None, (0.5, 0.5)),
+        ("learned", [0.3, 2.0], (0.3, 2.0)),
+        ("convex", 0.3, (0.3, 0.7)),
+    ],
+)
+def test_a_value_residual_mixes_the_taps_values_into_the_layers(kind, learned, weights):
+    """a v + b v1: half and half (ResFormer's code), both weights learned from 0.5
+    (Learnable-ResFormer), or b = 1 - a with a learned."""
+    v1 = ir.Port(name="v", tap="v1", mode="read")
+    kv = ir.Port(name="kv", tap="kv", mode="write")
+    attn = gqa((v1, kv), value_residual=kind)
+    assert attn.v is not None
+    if learned is None:
+        assert attn.v_mix is None
+    else:
+        assert attn.v_mix is not None and (attn.v_mix[...] == 0.5).all()
+        attn.v_mix[...] = jnp.asarray(learned)
+    x = inputs()
+    first = jax.random.normal(jax.random.key(2), (2, 12, 2, 8))
+    taps = {"v1": [first]}
+    attn(x, taps)
+    [(_, v)] = taps["kv"]
+    a, b = weights
+    own = attn.v(x).reshape(2, 12, 2, 8)
+    assert jnp.allclose(v, a * own + b * first, atol=1e-6)

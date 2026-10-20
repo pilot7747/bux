@@ -248,7 +248,7 @@ class LinearAttention(nnx.Module):
             else linear(width, hv * dv)
         )
         self.norm_all_heads = norm_all_heads
-        rms = cfg.NormalizationConfig(type="rmsnorm")
+        rms = cfg.NormalizationConfig(type="rmsnorm", eps=c.norm_eps)
         self.norm = Norm(rms, hv * dv if norm_all_heads else dv)
         self.o = linear(hv * dv, width)
 
@@ -342,8 +342,9 @@ class KimiDeltaAttention(DeltaNet):
     """Kimi Delta Attention (Kimi Linear, 2025), as transformers and fla have it: Gated
     DeltaNet with a decay a key channel, g = -exp(A_log) softplus(f + dt_bias), where
     f = W_f2 W_f1 x is a low-rank projection (`gate_rank`) and A_log is one a head. With
-    a lower bound, g = lower_bound * sigmoid(exp(A_log) (f + dt_bias)), A_log starting
-    at 0 (Kimi K3, GLM-5-Next). The output gate is low rank too (`output_gate_rank`).
+    a lower bound (Kimi K3, GLM-5-Next), g = lower_bound * sigmoid(exp(A_log) (f +
+    dt_bias)), and A_log starts at 0, as in fla's safe gate (K3's code starts it at
+    log U(1, 16) either way). The output gate is low rank too (`output_gate_rank`).
     """
 
     def __init__(self, c: cfg.KDAConfig, width: int, rngs: nnx.Rngs):

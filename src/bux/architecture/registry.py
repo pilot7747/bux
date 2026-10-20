@@ -1,12 +1,23 @@
-"""The leaf registry, the context builders get, and the taps modules are called with."""
+"""The leaf registry, the context builders get, and the taps modules are called with.
+
+A layer adds a term to the training loss from its forward, in one line:
+
+    report(taps, "balance_loss", weight, value)  # value: a scalar array
+
+The objective adds weight * value to the loss, and logs the values, summed over the
+layers that report the name, as a metric of that name. Only a training step's forward
+(``Model.training_outputs``) collects them; elsewhere, eval included, ``report`` does
+nothing. ``training(taps)`` says which forward it is, for a layer that skips a costly
+loss outside training, or updates state of its own as it trains (an MoE's router bias).
+"""
 
 from collections import Counter
 from collections.abc import Callable
 from dataclasses import dataclass, field
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, NamedTuple, TypeGuard
 
 from flax import nnx
-from jaxtyping import Array, Int, Shaped
+from jaxtyping import Array, Float, Int, Shaped
 
 from bux.architecture.segments import Segments
 from bux.lang import ir
@@ -21,6 +32,28 @@ Stream = Shaped[Array, "*_"]
 Taps = dict[str, list]
 # Reserved tap keys, which no tap name can collide with.
 TOKENS, SEGMENTS, OUTPUTS, NEXTN = "<tokens>", "<segments>", "<outputs>", "<nextn>"
+LOSSES = "<losses>"
+
+
+class Loss(NamedTuple):
+    """A term a layer adds to the training loss: weight * value, logged as `name`."""
+
+    name: str
+    weight: float
+    value: Float[Array, ""]
+
+
+def training(taps: Taps | None) -> TypeGuard[Taps]:
+    """Whether this forward is a training step's, which collects reported losses."""
+    return taps is not None and LOSSES in taps
+
+
+def report(
+    taps: Taps | None, name: str, weight: float, value: Float[Array, ""]
+) -> None:
+    """Add weight * value to the training loss, and value to the metric `name`."""
+    if training(taps):
+        taps[LOSSES].append(Loss(name, weight, value))
 
 
 def segments(taps: Taps | None) -> Segments | None:

@@ -17,7 +17,7 @@ from jaxtyping import Array, ArrayLike, Float, PyTree, Real
 from optax.contrib import MuonDimensionNumbers, scale_by_muon
 from optax.contrib._muon import scale_by_shape
 
-from bux.architecture import Embedding, Head, MoE
+from bux.architecture import DyT, Embedding, Engram, Head, MoE, Norm
 from bux.train import config as tcfg
 from bux.train.registry import Registry
 
@@ -99,20 +99,6 @@ def optimizer(
     return optax.chain(optax.clip_by_global_norm(clip), tx)
 
 
-@optimizers.register("adamw")
-def adamw(
-    c: tcfg.AdamWConfig, multiplier: Schedule, model: nnx.Module | None = None
-) -> optax.GradientTransformation:
-    return optax.adamw(
-        peak(c.lr, multiplier),
-        b1=c.b1,
-        b2=c.b2,
-        eps=c.eps,
-        weight_decay=c.weight_decay,
-        mask=lambda params: jax.tree.map(lambda x: x.ndim >= 2, params),
-    )
-
-
 def _keys(path: tuple) -> tuple:
     """A pytree path as plain keys, without the Variable's trailing `value`."""
     keys = tuple(
@@ -120,6 +106,43 @@ def _keys(path: tuple) -> tuple:
         for k in path
     )
     return keys[:-1] if keys and keys[-1] == "value" else keys
+
+
+def undecayed(model: nnx.Module) -> list[tuple]:
+    """The paths that weight decay leaves alone, whatever their shape: norms' and
+    Engram's n-gram tables."""
+    found: list[tuple] = []
+    for path, node in nnx.iter_graph(model):
+        if isinstance(node, Norm | DyT):
+            found.append(path)
+        elif isinstance(node, Engram):
+            found.append((*path, "table"))
+    return found
+
+
+def decayed(model: nnx.Module) -> Callable[[PyTree], PyTree[bool]]:
+    """The weight decay mask: matrices and stacks of them, outside `undecayed(model)`."""
+    skip = undecayed(model)
+
+    def decays(path: tuple, x: Float[Array, "*_"]) -> bool:
+        keys = _keys(path)
+        return x.ndim >= 2 and not any(keys[: len(s)] == s for s in skip)
+
+    return lambda params: jax.tree_util.tree_map_with_path(decays, params)
+
+
+@optimizers.register("adamw")
+def adamw(
+    c: tcfg.AdamWConfig, multiplier: Schedule, model: nnx.Module
+) -> optax.GradientTransformation:
+    return optax.adamw(
+        peak(c.lr, multiplier),
+        b1=c.b1,
+        b2=c.b2,
+        eps=c.eps,
+        weight_decay=c.weight_decay,
+        mask=decayed(model),
+    )
 
 
 def matrices(model: nnx.Module) -> dict[tuple, MuonDimensionNumbers]:
@@ -170,10 +193,10 @@ def muon(
         scale_by_shape(
             weight_dimension_numbers=shapes, consistent_rms=c.consistent_rms
         ),
-        optax.add_decayed_weights(c.weight_decay),
+        optax.add_decayed_weights(c.weight_decay, mask=decayed(model)),
         optax.scale_by_learning_rate(peak(c.lr, multiplier)),
     )
     adam = c.adam or tcfg.AdamWConfig(lr=c.lr)
     return optax.partition(
-        {"muon": orthogonalized, "adam": adamw(adam, multiplier)}, labels
+        {"muon": orthogonalized, "adam": adamw(adam, multiplier, model)}, labels
     )

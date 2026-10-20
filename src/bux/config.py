@@ -140,10 +140,20 @@ class MoEConfig(Config):
     # Group-limited routing: pick top_k_groups of num_groups first (DeepSeek-V3).
     num_groups: int = 1
     top_k_groups: int = 1
-    # "aux_free" balances with a per-expert router bias instead of a loss (DeepSeek-V3).
+    # Balancing, by a loss, a bias or both. aux_free adds a bias per expert to the scores
+    # that pick the top-k, not to the weights, which every training step moves by
+    # bias_update_rate toward the experts picked less than the mean (DeepSeek-V3).
     load_balancing: Literal["aux_loss", "aux_free"] = "aux_loss"
-    aux_loss_coef: float = 1e-2
-    capacity_factor: float | None = None  # None -> dropless
+    bias_update_rate: Annotated[float, Field(ge=0)] = 1e-3
+    # Weight of a layer's balance loss, E * sum_e f_e P_e: f_e the fraction of the top-k
+    # picks that go to expert e, P_e its mean score normalized over the experts (Switch;
+    # DeepSeek-V3, eqs. 17-20). None -> 1e-2, or 0 with aux_free. Every layer adds its
+    # own, as in Megatron-LM; transformers instead pools the layers into one loss and
+    # counts tokens rather than picks, so its coefficient c is about c * top_k / layers.
+    aux_loss_coef: Annotated[float, Field(ge=0)] | None = None
+    # Over the whole batch (Switch, Qwen), or each sequence and then their mean (the
+    # complementary sequence-wise loss of DeepSeek-V3).
+    aux_loss_scope: Literal["batch", "sequence"] = "batch"
     # LatentMoE: routed experts run in a narrower space, between a down and an up
     # projection; the router and the shared experts see the full width (Nemotron 3).
     latent_size: int | None = None
@@ -153,6 +163,13 @@ class MoEConfig(Config):
     # The shared experts are weighted by the router too, normalized with the top-k
     # (Inkling); otherwise they are added with weight 1.
     shared_expert_sink: bool = False
+
+    @property
+    def aux_loss_weight(self) -> float:
+        """aux_loss_coef, or its default."""
+        if self.aux_loss_coef is not None:
+            return self.aux_loss_coef
+        return 0.0 if self.load_balancing == "aux_free" else 1e-2
 
 
 # --- Token mixers ---------------------------------------------------------------
@@ -170,13 +187,22 @@ class SparseIndexerConfig(Config):
     head_dim: int = 128
     top_k: int = 2048
     # Score keys mean-pooled in blocks of this many and pick whole blocks, top_k keys in
-    # all, plus the current block (Qwen3.8 QSA).
+    # all, plus the query's unfinished block (Qwen3.8 QSA).
     block_size: int = 1
     weighted: bool = True  # learned per-head score weights (DSA); else a plain sum
+    # Norm of each query head, and of the keys (after pooling them in blocks); None: no
+    # query norm, and the layer's key norm (DSA: a layernorm). Qwen3.8 QSA: an rmsnorm.
+    norm: NormalizationConfig | None = None
+    # How the RoPE dims of an indexer whose keys are the tokens are paired, whatever the
+    # layer's layout (DeepSeek-V3.2: half, GLM-5.3: interleaved).
+    rope_layout: Literal["half", "interleaved"] = "half"
     # What a `candidates` port exports: the best `candidate_top_k` blocks of
     # `candidate_block_size` keys, each scored by its best key (DeepSeek-V4.1).
     candidate_block_size: int = 8
     candidate_top_k: int = 2048  # blocks in the candidate pool
+    # Weight of the indexer's loss, which alone trains it: the KL from the attention to
+    # the keys it kept to the softmax of its scores (DSA). 0 leaves it untrained.
+    loss_weight: Annotated[float, Field(ge=0)] = 1.0
 
 
 class QuadraticAttentionConfig(AttentionConfig):
@@ -201,7 +227,8 @@ class QuadraticAttentionConfig(AttentionConfig):
     # attention_factor_on=softmax multiplies it by attention_factor ** 2.
     scale: float | None = None
     # Logits scaled by 1 + log_scale * ln(max(position / log_scale_floor, 1)), so that
-    # attention stays sharp at long range (Inkling; Llama 4 temperature tuning).
+    # attention stays sharp at long range (Inkling). Not Llama 4's temperature tuning,
+    # 1 + s * ln(1 + floor(position / floor)): a step function, on its NoPE layers.
     log_scale: float | None = None
     log_scale_floor: int = 8192
     relative_bias: RelativeBiasConfig | None = None
@@ -231,6 +258,10 @@ class GQAConfig(QuadraticAttentionConfig):
     rope: RoPEConfig | None = None
     # Causal depthwise conv on keys and values, added to them: k + conv(k) (Inkling).
     kv_conv_size: int | None = None
+    # How reading the v port mixes its values v1 into the layer's v, as a v + b v1 from
+    # a = b = 0.5: "fixed" keeps them (ResFormer's code), "learned" learns both
+    # (Learnable-ResFormer), "convex" learns a, with b = 1 - a.
+    value_residual: Literal["fixed", "learned", "convex"] = "fixed"
 
 
 class MLAConfig(QuadraticAttentionConfig):
@@ -276,6 +307,8 @@ class CSAConfig(QuadraticAttentionConfig):
     # Tokens pooled into one compressed latent; None -> window only.
     compress_ratio: int | None = None
     rope: RoPEConfig | None = RoPEConfig()
+    # Of the query latent, the latents, the compressed ones and the indexer's keys.
+    latent_norm: NormalizationConfig = NormalizationConfig(type="rmsnorm")
 
 
 class LinearAttentionConfig(AttentionConfig):
@@ -289,6 +322,8 @@ class LinearAttentionConfig(AttentionConfig):
     conv_size: int | None = 4  # causal depthwise conv on q, k, v; None disables it
     # Gate on the output norm before the output projection; None disables it.
     output_gate: Literal["swish", "sigmoid"] | None = "swish"
+    # Of the output norm (Qwen3-Next: 1e-6; Kimi Linear and fla: 1e-5).
+    norm_eps: float = 1e-6
 
 
 class GLAConfig(LinearAttentionConfig):
@@ -345,6 +380,7 @@ class RWKV7Config(LinearAttentionConfig):
     conv_size: int | None = None
     # The gate is a low-rank projection with this activation between, act(x G1) G2.
     output_gate: Literal["swish", "sigmoid"] | None = "sigmoid"
+    norm_eps: float = 1e-5  # times the value head dim, as fla has it (RWKV-LM: 64e-5)
     decay_rank: int = 64
     a_rank: int = 64
     v_rank: int = 32
@@ -480,12 +516,17 @@ class EngramConfig(Config):
 class HyperConnectionsConfig(Config):
     """Widen the residual stream into `expansion` streams with learned read/write/mix
     connections around every residual branch (Zhu et al., 2025). "mhc" projects the
-    stream mixing onto doubly stochastic matrices with Sinkhorn (DeepSeek mHC, 2025)."""
+    stream mixing onto doubly stochastic matrices with Sinkhorn (DeepSeek mHC, 2025).
+    With `single_pass`, a branch reads with the coefficients the one before it computed
+    (the first, stream 0 alone), and so does the read before the head, which has no
+    parameters of its own (DeepSeek-V4.1's Single-Pass mHC)."""
 
     type: Literal["hc", "mhc"]
     expansion: int = 4
-    dynamic: bool = True
+    dynamic: bool = True  # coefficients that depend on the stream; else static ones
     sinkhorn_iters: int = 20
+    single_pass: bool = False
+    norm_eps: float = 1e-6  # of the norm the dynamic coefficients see (V4.1: 1e-20)
 
 
 class GatedResidualConfig(Config):
@@ -498,6 +539,7 @@ class GatedResidualConfig(Config):
     type: Literal["gr"] = "gr"
     rank: int  # of the read gate (Qwen3.8-Flash-Next: d_model / 8)
     expansion: int = 4
+    norm_eps: float = 1e-6  # of the streams' RMS norm
 
 
 class AttentionResidualConfig(Config):
@@ -509,6 +551,7 @@ class AttentionResidualConfig(Config):
 
     type: Literal["attnres"] = "attnres"
     block_size: int | None = None  # None -> every branch output is a source of its own
+    norm_eps: float = 1e-6  # of the keys' RMS norm (Kimi K3: 1e-5)
 
 
 class ResidualGateConfig(Config):

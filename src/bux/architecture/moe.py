@@ -3,13 +3,13 @@
 import jax
 import jax.numpy as jnp
 from flax import nnx
-from jaxtyping import Array, Float
+from jaxtyping import Array, Float, Int
 
 from bux import config as cfg
 from bux.architecture.functional import activation, bound
 from bux.architecture.mlp import MLP
 from bux.architecture.norm import Norm
-from bux.architecture.registry import Context, Taps, register
+from bux.architecture.registry import Context, Taps, register, report, training
 from bux.lang import ir
 
 
@@ -23,6 +23,18 @@ def _limit_groups(
     best = jax.lax.top_k(grouped, min(2, e // groups))[0].sum(-1)
     kept = jax.nn.one_hot(jax.lax.top_k(best, keep)[1], groups).sum(-2) > 0
     return jnp.where(kept[..., None], grouped, -jnp.inf).reshape(b, t, e)
+
+
+def balance_loss(
+    scores: Float[Array, "b t e"], picks: Float[Array, "b t e"], k: int, sequence: bool
+) -> Float[Array, ""]:
+    """E * sum_e f_e P_e: f_e the fraction of the top-k `picks` that are expert e, P_e
+    its mean score normalized over the experts; over the batch, or the mean of it over
+    sequences (DeepSeek-V3, eqs. 17-20). 1 when both are uniform."""
+    over = 1 if sequence else (0, 1)
+    f = picks.mean(over) / k
+    p = (scores / scores.sum(-1, keepdims=True)).mean(over)
+    return scores.shape[-1] * (f * p).sum(-1).mean()
 
 
 class MoE(nnx.Module):
@@ -42,6 +54,9 @@ class MoE(nnx.Module):
         self.router_bias = (
             nnx.Variable(jnp.zeros(e)) if c.load_balancing == "aux_free" else None
         )
+        self.bias_update_rate = c.bias_update_rate
+        self.aux_loss_weight = c.aux_loss_weight
+        self.per_sequence = c.aux_loss_scope == "sequence"
         # LatentMoE: the routed experts work between these two projections.
         latent = c.latent_size or width
         self.to_latent = (
@@ -92,10 +107,11 @@ class MoE(nnx.Module):
         )
 
     def _route(
-        self, x: Float[Array, "b t d"]
+        self, x: Float[Array, "b t d"], taps: Taps | None = None
     ) -> tuple[Float[Array, "b t e"], Float[Array, "b t s"] | None]:
         """Every routed expert's weight for each token, 0 outside its top-k, and the
-        shared experts' weights if the router scores them too."""
+        shared experts' weights if the router scores them too; in a training
+        forward, it also balances the experts."""
         logits = self.router(x) * self.router_logit_scale
         match self.router_fn:
             case "softmax":
@@ -110,6 +126,8 @@ class MoE(nnx.Module):
         if self.groups > 1:
             choice = _limit_groups(choice, self.groups, self.top_k_groups)
         _, idx = jax.lax.top_k(choice, self.top_k)
+        if training(taps):
+            self._balance(scores.astype(jnp.float32), idx, taps)
         weights = jnp.take_along_axis(scores, idx, axis=-1)
         if self.normalize:
             total = weights.sum(-1, keepdims=True) + sinks.sum(-1, keepdims=True)
@@ -117,8 +135,22 @@ class MoE(nnx.Module):
         dense = (jax.nn.one_hot(idx, e) * weights[..., None]).sum(-2) * self.scaling
         return dense, sinks * self.scaling if sinks.shape[-1] else None
 
+    def _balance(
+        self, scores: Float[Array, "b t e"], idx: Int[Array, "b t k"], taps: Taps
+    ) -> None:
+        """Report the balance loss, and move the router bias toward the experts
+        picked less than the mean over the batch (DeepSeek-V3)."""
+        picks = jax.nn.one_hot(idx, scores.shape[-1]).sum(-2)
+        if self.aux_loss_weight:
+            loss = balance_loss(scores, picks, self.top_k, self.per_sequence)
+            report(taps, "balance_loss", self.aux_loss_weight, loss)
+        if self.router_bias is not None:
+            load = picks.sum((0, 1))
+            step = self.bias_update_rate * jnp.sign(load.mean() - load)
+            self.router_bias[...] = self.router_bias[...] + step
+
     def __call__(self, x: Float[Array, "b t d"], taps: Taps) -> Float[Array, "b t d"]:
-        dense, sinks = self._route(x)
+        dense, sinks = self._route(x, taps)
         z = x if self.to_latent is None else self.to_latent(x)
         if self.latent_input_norm is not None:
             z = self.latent_input_norm(z)

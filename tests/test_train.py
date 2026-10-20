@@ -28,7 +28,14 @@ from bux.train.objective import (
     targets,
     z_loss,
 )
-from bux.train.optim import matrices, optimizer, optimizers, schedule, schedules
+from bux.train.optim import (
+    decayed,
+    matrices,
+    optimizer,
+    optimizers,
+    schedule,
+    schedules,
+)
 from bux.train.sinks import Latest, Sink
 from bux.train.trainer import Trainer, directory, train
 
@@ -89,6 +96,38 @@ def test_muon_trains_the_block_matrices_and_adam_the_rest():
     }
     stacked = [d for p, d in matrices(m).items() if p[-1] in ("up", "gate", "down")]
     assert {(d.reduction_axis, d.output_axis) for d in stacked} == {(1, 2)}
+
+
+def test_weight_decay_leaves_norms_and_engram_tables_alone_whatever_their_shape():
+    """The gated residual's and Engram's norms have (n, d) gains, and Engram's tables
+    are matrices: none of them decays. Every other matrix does, Muon's included."""
+    m = Model(
+        compile(
+            ARCH
+            + "residual = gr(rank=4)\nmem = engram(head_dim=4, table_size=50)\n"
+            + "model = embed mem [attn] [dyt ffn] head\n"
+        ),
+        rngs=nnx.Rngs(0),
+    )
+    params = nnx.state(m, nnx.Param)
+    flags = jax.tree.leaves(decayed(m)(params))
+    leaves = jax.tree_util.tree_leaves_with_path(params)
+    assert len(flags) == len(leaves)
+    named = [
+        (tuple(k.key for k in path[:-1]), x.ndim, d)
+        for (path, x), d in zip(leaves, flags, strict=True)
+    ]
+    assert all(ndim >= 2 for _, ndim, d in named if d)
+    kept = {keys[-2:] for keys, ndim, d in named if ndim >= 2 and not d}
+    assert {k for _, k in kept} == {"scale", "table"}
+    assert {o for o, k in kept if k == "scale"} == {
+        "norm",  # the gated residual's, and its read before the head
+        "q_norm",
+        "k_norm",
+        "conv_norm",
+    }
+    decays = {keys for keys, _, d in named if d}
+    assert set(matrices(m)) <= decays
 
 
 def rows(data: tcfg.DataConfig, batch: int, seq_len: int) -> tcfg.TrainConfig:

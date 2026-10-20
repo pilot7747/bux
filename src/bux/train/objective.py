@@ -5,6 +5,9 @@ its name, so another term is a name, a weight and a function:
 
     obj = objective(run.train.loss, run.arch)
     obj.terms["logit_l2"] = Term(1e-4, lambda logits, batch: jnp.mean(logits[0] ** 2))
+
+The losses that layers report from a training forward (``report`` in
+``bux.architecture.registry``) are terms too, weighted by each layer.
 """
 
 from collections.abc import Callable, Sequence
@@ -16,6 +19,7 @@ import jax.numpy as jnp
 import optax
 from jaxtyping import Array, Bool, Float
 
+from bux.architecture.registry import Loss
 from bux.architecture.segments import Segments
 from bux.lang import ir
 from bux.train import config as tcfg
@@ -31,18 +35,24 @@ class Term(NamedTuple):
 
 @dataclass
 class Objective:
-    """The sum of weight * term over `terms`."""
+    """The sum of weight * term over `terms`, and over the losses layers report."""
 
     terms: dict[str, Term]
 
     def __call__(
-        self, logits: Logits, batch: Batch
+        self, logits: Logits, batch: Batch, reported: Sequence[Loss] = ()
     ) -> tuple[Float[Array, ""], dict[str, Float[Array, ""]]]:
-        """The loss to minimize, and its terms."""
+        """The loss to minimize, and its terms: a reported loss's values summed under
+        its name."""
         metrics = {name: term.fn(logits, batch) for name, term in self.terms.items()}
         total = jnp.zeros((), jnp.float32)
         for name, term in self.terms.items():
             total = total + term.weight * metrics[name]
+        for name, weight, value in reported:
+            if name in self.terms:
+                raise ValueError(f"a layer reports {name!r}, a term of the objective")
+            metrics[name] = metrics.get(name, 0) + value
+            total = total + weight * value
         return total, metrics
 
 

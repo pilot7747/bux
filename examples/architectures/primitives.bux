@@ -1,6 +1,7 @@
 # Layers built from primitives with the same algebra: a SwiGLU MLP and an output-gated
 # attention, spelled out with `*` gating and explicit projections. Widths are checked:
-# a residual branch has to come back to d_model.
+# a residual branch has to come back to d_model. The gate follows the output projection
+# (G5 in Qiu et al., 2025); their best, G1, gates each head before it: gqa(gated=true).
 d_model    = 512
 vocab_size = 32000
 hidden     = 1408

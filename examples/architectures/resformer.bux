@@ -1,12 +1,14 @@
-# Value residual learning (ResFormer, Zhou et al., 2024): the first layer exports its
-# attention values through the `v` port of gqa, and every later layer mixes them into
-# its own values.
+# Value residual learning (ResFormer, Zhou et al., 2024), the paper's 180M model: the
+# first layer exports its attention values through the `v` port of gqa, and every
+# later layer mixes them into its own as 0.5 v + 0.5 v1, as the official code does
+# (Identity-ResFormer). value_residual=learned learns both weights from 0.5 instead
+# (Learnable-ResFormer).
 d_model    = 768
-vocab_size = 50304
+vocab_size = 50277
 
-norm = rmsnorm
+norm = rmsnorm(eps=1e-5)
 attn = gqa(num_heads=12, num_kv_heads=12, rope=rope())
-ffn  = gated_mlp(intermediate_size=2048, activation=swish)
+ffn  = gated_mlp(intermediate_size=2688, activation=swish)
 
 first = [norm attn(v=@v1)] [norm ffn]
 rest  = [norm attn(v=$v1)] [norm ffn]

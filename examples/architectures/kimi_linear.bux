@@ -1,14 +1,15 @@
-# Kimi Linear 48B-A3B (Moonshot AI, 2025): 3 Kimi Delta Attention layers per MLA layer.
-# The MLA layers use no positional encoding at all; position comes from the KDA layers.
-# The first layer has a dense MLP, the rest MoE. Sizes are approximate.
+# Kimi Linear 48B-A3B (Moonshot AI, 2025): 3 Kimi Delta Attention layers per MLA layer,
+# 2 in the last group. The MLA layers use no positional encoding at all; position comes
+# from the KDA layers. The first layer has a dense MLP, the rest MoE.
 d_model    = 2304
 vocab_size = 163840
 
-norm    = rmsnorm
-kda     = kda(num_heads=32, head_dim=128, output_gate_rank=128)
+norm    = rmsnorm(eps=1e-5)
+kda     = kda(num_heads=32, head_dim=128, output_gate_rank=128, norm_eps=1e-5)
 mla     = mla(num_heads=32, kv_lora_rank=512, rope=none)
 dense   = gated_mlp(intermediate_size=9216, activation=swish)
 experts = moe(num_experts=256, top_k=8, num_shared_experts=1, router=sigmoid,
+              routed_scaling_factor=2.446, load_balancing=aux_free,
               expert=gated_mlp(intermediate_size=1024, activation=swish))
 
 layer(mixer, ffn) = [norm mixer] [norm ffn]

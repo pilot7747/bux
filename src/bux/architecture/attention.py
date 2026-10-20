@@ -11,9 +11,16 @@ from jaxtyping import Array, Bool, Float, Int
 from bux import config as cfg
 from bux.architecture.conv import CausalConv
 from bux.architecture.functional import activation, softcap
-from bux.architecture.indexer import Indexer, from_stream
+from bux.architecture.indexer import Indexer, Scores, from_stream
 from bux.architecture.norm import Norm
-from bux.architecture.registry import Context, Taps, register, segments
+from bux.architecture.registry import (
+    Context,
+    Taps,
+    register,
+    report,
+    segments,
+    training,
+)
 from bux.architecture.rope import logit_gain, rotate
 from bux.architecture.segments import Segments
 from bux.lang import ir
@@ -122,8 +129,8 @@ class SoftmaxAttention(nnx.Module):
     """What the softmax attention layers share, once they have their queries, keys and
     values: the logits, with their scale, relative bias, length scale and softcap; the
     causal, window, document and top-k masks; sinks and dropout; the output's norm,
-    gate and projection; and the sparse attention indexer, with its ports. A layer
-    makes its own projections, then calls this, then builds its indexer.
+    gate and projection; and the sparse attention indexer, with its ports and its
+    loss. A layer makes its own projections, then calls this, then builds its indexer.
 
     Ports: ``index`` written pushes the indexer's top-k, a mask of the keys each query
     attends to; read uses the tap's instead of running an indexer, so a layer that reads
@@ -185,11 +192,14 @@ class SoftmaxAttention(nnx.Module):
         v: Float[Array, "b s g v"],
         docs: Segments | None,
         keep: Bool[Array, "b t s"] | None = None,
+        scores: Scores | None = None,
+        taps: Taps | None = None,
     ) -> Float[Array, "b t h v"]:
         """Every query's average of the values of the keys it sees, of those it `keep`s
-        if given, by the softmax of their logits. This makes all t by t logits, and the
-        mask with them; a flash kernel skips the blocks no query sees, by the documents'
-        ids (and the top-k, by the indexer's selection)."""
+        if given, by the softmax of their logits; in a training forward, the indexer's
+        loss, from its `scores`. This makes all t by t logits, and the mask with them;
+        a flash kernel skips the blocks no query sees, by the documents' ids (and the
+        top-k, by the indexer's selection)."""
         visible = self._visible(docs, x.shape[1])
         if keep is not None:
             visible = visible & keep
@@ -201,9 +211,23 @@ class SoftmaxAttention(nnx.Module):
         else:
             probs = jax.nn.softmax(logits)
         probs = jnp.where(visible, probs, 0)  # a query that sees no key gets nothing
+        if scores is not None:
+            self._train_indexer(probs, scores, taps)
         if self.attention_dropout is not None:
             probs = self.attention_dropout(probs)
         return jnp.einsum("bhts,bshd->bthd", probs, self._per_query_head(v))
+
+    def _train_indexer(
+        self, probs: Float[Array, "b h t s"], scores: Scores, taps: Taps | None
+    ) -> None:
+        """In a training forward, report the indexer's loss against the attention to
+        the keys it scores, which come last (CSA's after the window)."""
+        if self.indexer is None or not self.indexer.loss_weight or not training(taps):
+            return
+        n = scores.values.shape[-1]
+        attention = probs[..., -n:].astype(jnp.float32).sum(1)
+        loss = self.indexer.loss(scores, attention)
+        report(taps, "indexer_loss", self.indexer.loss_weight, loss)
 
     def _logits(
         self,
@@ -247,10 +271,12 @@ class SoftmaxAttention(nnx.Module):
         allowed: Bool[Array, "b t s"],
         order: Int[Array, "b s"],
         taps: Taps,
-    ) -> Bool[Array, "b t s"] | None:
+    ) -> tuple[Bool[Array, "b t s"] | None, Scores | None]:
         """The keys each query attends to, of those it is `allowed`: what the index port
         reads, or the indexer's top-k, from its `query` input and `keys`; None for all.
-        `order` says which key of its document each slot holds, -1 for none."""
+        And the indexer's scores, if it runs one. `order` says which key of its
+        document each slot holds, -1 for none."""
+        scores = None
         if _reads(self.ports, "index"):
             keep = _read(taps, self.ports, "index")
         elif self.indexer is not None:
@@ -262,12 +288,14 @@ class SoftmaxAttention(nnx.Module):
             if _reads(self.ports, "candidates"):
                 pool = _read(taps, self.ports, "candidates")
             export = _writes(self.ports, "candidates")
-            keep, pool = self.indexer(x, query, pos, keys, allowed, order, pool, export)
+            keep, pool, scores = self.indexer(
+                x, query, pos, keys, allowed, order, pool, export
+            )
             _write(taps, self.ports, "candidates", pool)
         else:
-            return None
+            return None, None
         _write(taps, self.ports, "index", keep)
-        return keep
+        return keep, scores
 
     def _select_tokens(
         self,
@@ -275,10 +303,10 @@ class SoftmaxAttention(nnx.Module):
         query: Float[Array, "b t e"],
         docs: Segments | None,
         taps: Taps,
-    ) -> Bool[Array, "b t t"] | None:
+    ) -> tuple[Bool[Array, "b t t"] | None, Scores | None]:
         """`_select` where the keys are the tokens, and the indexer's keys come from them."""
         if self.indexer is None and not _reads(self.ports, "index"):
-            return None
+            return None, None
         b, t, _ = x.shape
         pos = None if docs is None else docs.positions
         keys = None if self.indexer is None else self.indexer.keys(x, pos)
@@ -309,10 +337,11 @@ class SoftmaxAttention(nnx.Module):
 class Attention(SoftmaxAttention):
     """Causal grouped-query attention.
 
-    Ports: `v` written pushes the values, read mixes the tap's values in with a learned
-    weight (value residual); `kv` written pushes (k, v), read uses them instead of
-    projecting its own (cross-layer KV sharing); `index` and `candidates` as for
-    `SoftmaxAttention`, with the indexer's keys projected from the layer's input.
+    Ports: `v` written pushes the values, read mixes the tap's values in, by the
+    weights `value_residual` says (value residual); `kv` written pushes (k, v), read
+    uses them instead of projecting its own (cross-layer KV sharing); `index` and
+    `candidates` as for `SoftmaxAttention`, with the indexer's keys projected from the
+    layer's input.
 
     Shapes: b rows, t queries and s keys (the same positions), d the width, h heads and
     g kv heads, k and v the head dims of keys and values.
@@ -359,7 +388,10 @@ class Attention(SoftmaxAttention):
         self.q_norm = Norm(c.qk_norm, d) if c.qk_norm else None
         self.k_norm = Norm(c.qk_norm, d) if c.qk_norm and own_kv else None
         self.rope = c.rope
-        self.v_mix = nnx.Param(jnp.asarray(0.5)) if "v" in reads else None
+        self.value_residual = c.value_residual
+        shape = (2,) if c.value_residual == "learned" else ()
+        trained = "v" in reads and c.value_residual != "fixed"
+        self.v_mix = nnx.Param(jnp.full(shape, 0.5)) if trained else None
 
     def __call__(self, x: Float[Array, "b t d"], taps: Taps) -> Float[Array, "b t d"]:
         docs = segments(taps)
@@ -367,14 +399,26 @@ class Attention(SoftmaxAttention):
         q, *kv = self._projections(x)
         q = self._queries(q, pos)
         k, v = self._keys_and_values(*kv, taps) if kv else _read(taps, self.ports, "kv")
-        if self.v_mix is not None:  # value residual
-            v = self.v_mix * v + (1 - self.v_mix) * _read(taps, self.ports, "v")
+        if _reads(self.ports, "v"):
+            v = self._mix_values(v, _read(taps, self.ports, "v"))
         _write(taps, self.ports, "v", v)
         _write(taps, self.ports, "kv", (k, v))
-        keep = self._select_tokens(x, x, docs, taps)
+        keep, scores = self._select_tokens(x, x, docs, taps)
         if keep is None:
             return self._output(x, self._attend(x, q, k, v, docs))
-        return self._output(x, self._attend(x, q, k, v, docs, keep))
+        return self._output(x, self._attend(x, q, k, v, docs, keep, scores, taps))
+
+    def _mix_values(
+        self, v: Float[Array, "b s g v"], v1: Float[Array, "b s g v"]
+    ) -> Float[Array, "b s g v"]:
+        """The value residual a v + b v1: a = b = 0.5 fixed, both learned, or a learned
+        and b = 1 - a."""
+        if self.v_mix is None:
+            return 0.5 * v + 0.5 * v1
+        w = self.v_mix[...]
+        if self.value_residual == "learned":
+            return w[0] * v + w[1] * v1
+        return w * v + (1 - w) * v1
 
     def _projections(self, x: Float[Array, "b t d"]) -> list[Float[Array, "b t _"]]:
         """The projected queries, then keys and values unless the layer reads them from
