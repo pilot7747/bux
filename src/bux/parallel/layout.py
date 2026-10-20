@@ -11,6 +11,7 @@ from collections.abc import Sequence
 
 import jax
 from flax import nnx
+from jax.sharding import NamedSharding
 from jax.sharding import PartitionSpec as P
 from jaxtyping import Array, Shaped
 
@@ -87,10 +88,11 @@ def spec(names: Sequence[Name], shape: tuple[int, ...]) -> P:
 
 def shard(x: Shaped[Array, "*s"], *names: Name) -> Shaped[Array, "*s"]:
     """`x`, constrained to split as its dimensions' `names` say; as it is outside
-    ``use``."""
-    if active() is None:
+    ``use``. Called eagerly, it moves `x` onto the mesh."""
+    if (on := active()) is None:
         return x
-    return jax.lax.with_sharding_constraint(x, spec(names, x.shape))
+    split = partition(resolve(names, x.shape, on))
+    return jax.lax.with_sharding_constraint(x, NamedSharding(on.mesh, split))
 
 
 def stream(x: Shaped[Array, "b t *r"]) -> Shaped[Array, "b t *r"]:
