@@ -5,18 +5,23 @@ from typing import Literal
 
 import jax
 import jax.numpy as jnp
+import numpy as np
 import pytest
 from flax import nnx
+from jax.sharding import PartitionSpec as P
 from jaxtyping import Array, Int
 
 from bux import config as cfg
+from bux import parallel
 from bux.architecture import (
+    MLP,
     SEGMENTS,
     TOKENS,
     Attention,
     Context,
     Embedding,
     Engram,
+    Head,
     Model,
     MoE,
     NextN,
@@ -28,7 +33,9 @@ from bux.architecture.engram import _ngram_rows
 from bux.architecture.graph import Sequence
 from bux.architecture.moe import mix
 from bux.architecture.rope import frequencies, rotate
-from bux.lang import compile, ir
+from bux.lang import compile, compile_runs, ir
+from bux.train import config as tcfg
+from bux.train.trainer import train
 
 D, V, H, F = 32, 64, 4, 48
 
@@ -485,3 +492,95 @@ def test_a_flash_kernel_attends_within_documents_by_their_ids(monkeypatch):
 
     monkeypatch.setattr(Attention, "_attend", kernel)
     assert jnp.allclose(attn(x, {SEGMENTS: [docs]}), reference, atol=1e-5)
+
+
+# --- Split over devices ----------------------------------------------------------------
+
+# Tensor parallelism 4 ways with FSDP, and 2 ways with sequence parallelism.
+SPLITS = [
+    {"mesh": "mesh(fsdp=2, tensor=4)"},
+    {"mesh": "mesh(fsdp=4, tensor=2)", "layout": "layout(stream=tensor)"},
+]
+# At 1e-2, these small runs are chaotic enough that rounding grows past 1e-5.
+STABLE = "adamw(lr=1e-3)"
+
+
+def _trains_as_on_one_device_split(losses, involuntary, source: str) -> None:
+    """`source` trains as on one device under every split, and XLA rematerializes
+    nothing in full."""
+    one = losses(source, mesh="mesh(data=1)", optimizer=STABLE)
+    involuntary()
+    for split in SPLITS:
+        assert np.allclose(losses(source, optimizer=STABLE, **split), one, atol=1e-5)
+    assert involuntary() == 0
+
+
+def _of[T](m: nnx.Module, cls: type[T]) -> T:
+    return next(x for _, x in nnx.iter_graph(m) if isinstance(x, cls))
+
+
+def _spec(v: nnx.Variable) -> P:
+    """Where `v` is, a name or None for every dimension."""
+    x = v[...]
+    spec = tuple(x.sharding.spec)
+    return P(*spec, *(None,) * (x.ndim - len(spec)))
+
+
+def test_the_vocabulary_and_the_hidden_units_split_over_tensor():
+    arch = compile(PRELUDE + "model = embed [norm ffn] norm head(bias=true)")
+    with parallel.use(tcfg.MeshConfig(tensor=4)):
+        m = parallel.build(lambda: Model(arch, rngs=nnx.Rngs(0)))
+        logits = nnx.jit(lambda m, t: m(t))(m, parallel.rows(np.asarray(tokens())))
+    mlp, head = _of(m, MLP), _of(m, Head)
+    assert head.proj is not None and head.proj.bias is not None
+    assert _spec(_of(m, Embedding).tokens.embedding) == P("tensor", None)
+    assert _spec(mlp.up.kernel) == _spec(head.proj.kernel) == P(None, "tensor")
+    assert _spec(mlp.down.kernel) == P("tensor", None)
+    assert _spec(head.proj.bias) == P("tensor")
+    assert logits.sharding.spec[-1] == "tensor"
+
+
+@pytest.mark.parametrize(
+    "body",
+    [
+        (
+            "f = mlp(intermediate_size=48, activation=gelu, bias=true, dropout=0.1)\n"
+            "model = embed [norm ffn] [norm f] norm head(softcap=30)"
+        ),
+        # learned positions, a normalized embedding, a conv and a tied head
+        (
+            "model = embed(max_positions=16, norm=rmsnorm) [norm conv(size=3)]"
+            " [norm ffn * (linear(features=32) sigmoid)] [scale(per_channel=true)]"
+            " norm head(tied=true, bias=true)"
+        ),
+        (
+            "mem = engram(head_dim=4, table_size=50)\n"
+            "model = embed [norm ffn] mem [norm ffn] norm head"
+        ),
+    ],
+    ids=["mlp", "embedding", "engram"],
+)
+def test_the_layers_train_as_on_one_device_split(losses, involuntary, body):
+    _trains_as_on_one_device_split(losses, involuntary, PRELUDE + body)
+
+
+@pytest.mark.parametrize(
+    "head", ["head(bias=true, softcap=30)", "head(tied=true, bias=true)"]
+)
+def test_the_loss_z_loss_and_mtp_are_the_same_with_the_vocabulary_split(tmp_path, head):
+    source = (
+        PRELUDE
+        + f"out = {head}\n"
+        + "mtp = $h! nextn [norm ffn] norm @h out\n"
+        + "model = embed [norm ffn] norm @h out mtp^2\n"
+        + "data = synthetic\noptimizer = adamw(lr=1e-3)\nloss = loss(z=1e-3)\n"
+        + "seq_len = 16\nbatch = 8\nsteps = 3\n"
+    )
+
+    def last(mesh: str) -> dict[str, float]:
+        [run] = compile_runs(source + f"mesh = {mesh}")
+        return train(run, tmp_path / mesh, echo=lambda _: None)
+
+    one, split = last("mesh(data=1)"), last("mesh(tensor=4)")
+    for term in ("loss", "z_loss", "mtp"):
+        assert split[term] == pytest.approx(one[term], abs=1e-5)

@@ -7,6 +7,7 @@ from flax import nnx
 from jaxtyping import Array, Float, Int
 
 from bux import config as cfg
+from bux import parallel
 from bux.architecture.functional import softcap
 from bux.architecture.norm import Norm
 from bux.architecture.registry import (
@@ -21,10 +22,31 @@ from bux.architecture.registry import (
 from bux.architecture.residual import widen, widening
 from bux.lang import ir
 
+# nnx.Embed's init.
+EMBED = nnx.initializers.variance_scaling(1.0, "fan_in", "normal", out_axis=0)
+
+
+def _table(rows: int, d: int, row: str | None, rngs: nnx.Rngs) -> nnx.Embed:
+    """A table of `rows` vectors of d, its rows named `row`."""
+    init = parallel.named(row, "embed", init=EMBED)
+    return nnx.Embed(rows, d, embedding_init=init, rngs=rngs)
+
+
+def lookup(
+    table: Float[Array, "n d"], ids: Int[Array, "*ids"], row: str | None
+) -> Float[Array, "*ids d"]:
+    """The rows `ids` of `table`, whose rows are named `row`, gathered from the table
+    whole but for its names, into rows and positions as a layer splits them: a gather
+    from a table split over `fsdp` makes XLA rematerialize it in full, and into
+    positions split as the stream is, under sequence parallelism, gather the table."""
+    rows = jnp.take(parallel.shard(table, row, "embed"), ids, axis=0)
+    return parallel.shard(rows, *("batch", "seq")[2 - ids.ndim :], None)
+
 
 class Embedding(nnx.Module):
     """Token ids to the stream; with `copies`, to the stream a residual algebra widens,
-    which starts as that many copies of it."""
+    which starts as that many copies of it. The token table splits over the vocabulary
+    (``bux.parallel``), and what it gives is the stream."""
 
     def __init__(
         self,
@@ -34,9 +56,9 @@ class Embedding(nnx.Module):
         rngs: nnx.Rngs,
         copies: int | None = None,
     ):
-        self.tokens = nnx.Embed(vocab, d, rngs=rngs)
+        self.tokens = _table(vocab, d, "vocab", rngs)
         self.positions = (
-            nnx.Embed(c.max_positions, d, rngs=rngs) if c.max_positions else None
+            _table(c.max_positions, d, None, rngs) if c.max_positions else None
         )
         self.multiplier = d**0.5 if c.scale_by_sqrt_dim else 1.0
         self.norm = Norm(c.norm, d) if c.norm is not None else None
@@ -45,7 +67,7 @@ class Embedding(nnx.Module):
 
     def embed_tokens(self, tokens: Int[Array, "b t"]) -> Float[Array, "b t d"]:
         """The token embedding, scaled and normalized: what nextn sees."""
-        x = self.tokens(tokens) * self.multiplier
+        x = lookup(self.tokens.embedding[...], tokens, "vocab") * self.multiplier
         return x if self.norm is None else self.norm(x)
 
     def __call__(
@@ -54,9 +76,10 @@ class Embedding(nnx.Module):
         x = self.embed_tokens(tokens)
         if self.positions is not None:
             pos = positions(taps)
-            x = x + self.positions(jnp.arange(tokens.shape[-1]) if pos is None else pos)
+            pos = jnp.arange(tokens.shape[-1]) if pos is None else pos
+            x = x + lookup(self.positions.embedding[...], pos, None)
         x = self.dropout(x)
-        return x if self.copies is None else widen(x, self.copies)
+        return parallel.stream(x if self.copies is None else widen(x, self.copies))
 
 
 @register("embed")
@@ -72,14 +95,28 @@ def _(
 
 
 class Head(nnx.Module):
+    """The stream to logits, split over the vocabulary, tied to the embedding or not:
+    the loss reduces over them where they are."""
+
     def __init__(self, c: cfg.LMHeadConfig, width: int, ctx: Context):
         vocab = ctx.arch.vocab_size
         assert vocab is not None
         self.embedding = ctx.embedding if c.tied else None
         self.proj = (
-            None if c.tied else nnx.Linear(width, vocab, use_bias=c.bias, rngs=ctx.rngs)
+            None
+            if c.tied
+            else nnx.Linear(
+                width,
+                vocab,
+                use_bias=c.bias,
+                kernel_init=parallel.named("embed", "vocab"),
+                bias_init=parallel.named("vocab", init=nnx.initializers.zeros),
+                rngs=ctx.rngs,
+            )
         )
-        self.bias = nnx.Param(jnp.zeros(vocab)) if c.tied and c.bias else None
+        self.bias = (
+            nnx.Param(jnp.zeros(vocab), names=("vocab",)) if c.tied and c.bias else None
+        )
         self.softcap = c.softcap
 
     def __call__(
@@ -92,7 +129,7 @@ class Head(nnx.Module):
             logits = self.proj(x)
         if self.bias is not None:
             logits = logits + self.bias
-        logits = softcap(logits, self.softcap)
+        logits = parallel.shard(softcap(logits, self.softcap), "batch", "seq", "vocab")
         taps.setdefault(OUTPUTS, []).append(logits)
         return logits
 
@@ -147,7 +184,7 @@ class NextN(nnx.Module):
         else:
             h = self.hidden_norm(x)
         y = self.proj(jnp.concatenate([e, h], -1))
-        return y if self.copies is None else widen(y, self.copies)
+        return parallel.stream(y if self.copies is None else widen(y, self.copies))
 
 
 @register("nextn")

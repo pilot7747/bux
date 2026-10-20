@@ -1,5 +1,6 @@
 import jax
 import jax.numpy as jnp
+import numpy as np
 import pytest
 from flax import nnx
 from jaxtyping import Array, Int
@@ -46,9 +47,12 @@ WIDENING = [
 ALGEBRAS = [*WIDENING, "vpgate"]
 
 
+def source(residual: str | None, body: str) -> str:
+    return PRELUDE + (f"residual = {residual}\n" if residual else "") + body
+
+
 def model(residual: str | None, body: str, seed: int = 0) -> Model:
-    setting = f"residual = {residual}\n" if residual else ""
-    return Model(compile(PRELUDE + setting + body), rngs=nnx.Rngs(seed))
+    return Model(compile(source(residual, body)), rngs=nnx.Rngs(seed))
 
 
 def top(m: Model) -> list[nnx.Module]:
@@ -378,3 +382,30 @@ def test_nextn_mixes_the_embedding_into_every_copy_normalized_together():
     # On one stream under an algebra that widens it, nextn widens its output.
     one = NextN(cfg.NextNConfig(), D, ctx)
     assert one(x[:, :, 0], {TOKENS: [t]}).shape == (2, 8, 4, D)
+
+
+# --- Split over devices ----------------------------------------------------------------
+
+# Tensor parallelism 4 ways with FSDP, and 2 ways with sequence parallelism.
+SPLITS = [
+    {"mesh": "mesh(fsdp=2, tensor=4)"},
+    {"mesh": "mesh(fsdp=4, tensor=2)", "layout": "layout(stream=tensor)"},
+]
+# At 1e-2, these small runs are chaotic enough that rounding grows past 1e-5.
+STABLE = "adamw(lr=1e-3)"
+
+
+@pytest.mark.parametrize("residual", ALGEBRAS)
+def test_every_algebra_trains_as_on_one_device_split(losses, involuntary, residual):
+    """The widened stream, from the embedding, every branch, engram and nextn, is
+    the stream wherever it is: split by rows, and by positions over `stream`."""
+    body = (
+        "mtp = $h! nextn [norm ffn] norm @h out\n"
+        "model = embed [norm conv] [norm ffn] mem norm @h out mtp"
+    )
+    one = losses(source(residual, body), mesh="mesh(data=1)", optimizer=STABLE)
+    involuntary()
+    for split in SPLITS:
+        split_losses = losses(source(residual, body), optimizer=STABLE, **split)
+        assert np.allclose(split_losses, one, atol=1e-5)
+    assert involuntary() == 0

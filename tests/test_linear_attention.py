@@ -1,10 +1,13 @@
 import jax
 import jax.numpy as jnp
+import numpy as np
 import pytest
 from flax import nnx
+from jax.sharding import PartitionSpec as P
 from jaxtyping import Array, Int
 
 from bux import config as cfg
+from bux import parallel
 from bux.architecture import Model
 from bux.architecture.graph import ResidualBranch, Sequence
 from bux.architecture.linear_attention import (
@@ -18,6 +21,7 @@ from bux.architecture.linear_attention import (
 )
 from bux.architecture.rwkv7 import RWKV7
 from bux.lang import compile
+from bux.train import config as tcfg
 
 D, V, F = 32, 64, 48
 
@@ -46,12 +50,17 @@ MIXERS = {
 }
 
 
-def model(name: str, *, draw: bool = True) -> Model:
-    """Two blocks of the mixer; rwkv7's second mixes in the first's values, and with
-    `draw` its output projections, which start at zero, are drawn at random."""
+def source(name: str) -> str:
+    """Two blocks of the mixer; rwkv7's second mixes in the first's values."""
     first, rest = ("mix(v=@v0)", "mix(v=$v0)") if name == "rwkv7" else ("mix", "mix")
     body = f"model = embed [norm {first}] [norm ffn] [norm {rest}] [norm ffn] norm head"
-    m = Model(compile(PRELUDE + f"mix = {MIXERS[name]}\n" + body), rngs=nnx.Rngs(0))
+    return PRELUDE + f"mix = {MIXERS[name]}\n" + body
+
+
+def model(name: str, *, draw: bool = True) -> Model:
+    """The model of `source`; with `draw`, rwkv7's output projections, which start at
+    zero, are drawn at random."""
+    m = Model(compile(source(name)), rngs=nnx.Rngs(0))
     for i, (_, node) in enumerate(nnx.iter_graph(m)):
         if draw and isinstance(node, RWKV7):
             shape = node.o.kernel.shape
@@ -243,3 +252,45 @@ def test_rwkv7_starts_by_depth_and_reads_values_only_through_its_port():
     assert (first.o.kernel[...] == 0).all()  # the output projection starts at zero
     x = jax.random.normal(jax.random.key(0), (2, 6, D))
     assert jnp.allclose(first(x, {}), 0)
+
+
+# --- Split over devices ----------------------------------------------------------------
+
+# Tensor parallelism 4 ways with FSDP, and 2 ways with sequence parallelism.
+SPLITS = [
+    {"mesh": "mesh(fsdp=2, tensor=4)"},
+    {"mesh": "mesh(fsdp=4, tensor=2)", "layout": "layout(stream=tensor)"},
+]
+# At 1e-2, these small runs are chaotic enough that rounding grows past 1e-5.
+STABLE = "adamw(lr=1e-3)"
+
+
+@pytest.mark.parametrize("name", MIXERS)
+def test_trains_as_on_one_device_split_over_heads(losses, involuntary, name):
+    one = losses(source(name), mesh="mesh(data=1)", optimizer=STABLE)
+    involuntary()
+    for split in SPLITS:
+        split_losses = losses(source(name), optimizer=STABLE, **split)
+        assert np.allclose(split_losses, one, atol=1e-5)
+    assert involuntary() == 0
+
+
+def _spec(v: nnx.Variable) -> P:
+    """Where `v` is, a name or None for every dimension."""
+    x = v[...]
+    spec = tuple(x.sharding.spec)
+    return P(*spec, *(None,) * (x.ndim - len(spec)))
+
+
+def test_projections_and_the_parameters_of_heads_split_over_heads():
+    with parallel.use(tcfg.MeshConfig(tensor=2)):
+        m = parallel.build(lambda: model("kda", draw=False))
+    kda = next(x for _, x in nnx.iter_graph(m) if isinstance(x, KimiDeltaAttention))
+    assert kda.gate is not None and kda.conv is not None
+    into = [kda.q.kernel, kda.k.kernel, kda.v.kernel, kda.b.kernel, kda.f.up]
+    assert all(_spec(p) == P(None, "tensor") for p in into)
+    assert _spec(kda.gate.up) == P(None, "tensor")
+    assert _spec(kda.o.kernel) == P("tensor", None)
+    assert _spec(kda.A_log) == _spec(kda.dt_bias) == P("tensor")
+    # One conv over q, k and v side by side, whose parts are not on shard boundaries
+    assert _spec(kda.conv.weight) == P(None, None)
