@@ -5,19 +5,25 @@ Settings after the file redefine the file's own, as a last layer over it would:
 sweep, as in a file: ``'optimizer.lr = 0.01 | 0.03'``.
 
 ``bux train`` trains the runs in this process, one after another. ``bux launch`` is
-the entrypoint for production (``bux.launch``): it trains a sweep a run a GPU, records
-what each run did, trains again only what is not done, and stops at SIGTERM with a
-checkpoint.
+the entrypoint for production (``bux.launch``): it trains a sweep a run on the GPUs
+its mesh needs, and a run alone on many hosts, records what each run did, trains
+again only what is not done, and stops at SIGTERM with a checkpoint. ``bux plan``
+says what each run takes: its GPUs, and its bytes on each.
 """
 
 import argparse
 import json
+import math
 import sys
 from collections import Counter
+from typing import TYPE_CHECKING
 
 from bux.lang import Architecture, BuxError, Run, check, compile_runs
 from bux.lang.printer import config_to_source, run_to_source, to_source, value_to_source
 from bux.lang.render import render
+
+if TYPE_CHECKING:  # imported where used: jax and the backend are slow to import
+    from flax import nnx
 
 
 def _si(n: float) -> str:
@@ -25,6 +31,15 @@ def _si(n: float) -> str:
         if n >= scale:
             return f"{n / scale:.3g}{suffix}"
     return f"{n:g}"
+
+
+def _bytes(n: int | None) -> str:
+    if n is None:
+        return "?"
+    for suffix, power in (("TiB", 40), ("GiB", 30), ("MiB", 20), ("KiB", 10)):
+        if n >= 2**power:
+            return f"{n / 2**power:.3g}{suffix}"
+    return f"{n}B"
 
 
 def summary(arch: Architecture) -> str:
@@ -53,36 +68,103 @@ def training(run: Run) -> str:
     )
 
 
-def parameters(arch: Architecture) -> int | None:
-    """The model's parameter count, from shapes alone, or None if the backend lacks a layer."""
+def abstract(run: Run) -> "tuple[nnx.Module, nnx.Optimizer] | None":
+    """The run's model and its optimizer, from shapes alone, or None if the backend
+    lacks a layer."""
+    import jax.numpy as jnp
     from flax import nnx
 
-    from bux.architecture import Model, num_params
+    from bux.architecture import Model
+    from bux.train.optim import optimizer
+
+    t = run.train
+
+    def make() -> tuple[Model, nnx.Optimizer]:
+        model = Model(run.arch, rngs=nnx.Rngs(0))
+        # The schedule shapes no state: a constant one, whatever the run's says.
+        tx = optimizer(t.optimizer, lambda step: jnp.ones(()), model, t.clip)
+        return model, nnx.Optimizer(model, tx, wrt=nnx.Param)
 
     try:
-        return num_params(nnx.eval_shape(lambda: Model(arch, rngs=nnx.Rngs(0))))
+        return nnx.eval_shape(make)
     except NotImplementedError:
         return None
 
 
-def plan(runs: list[Run]) -> str:
-    rows = [("id", "params", "tokens", "tok/param", "run")]
-    for run in runs:
-        t = run.train
-        tokens = t.steps * t.batch * t.seq_len
-        n = parameters(run.arch)
-        rows.append(
-            (
-                run.id,
-                _si(n) if n else "?",
-                _si(tokens),
-                f"{tokens / n:.1f}" if n else "?",
-                run.name,
-            )
-        )
-    widths = [max(len(row[i]) for row in rows) for i in range(4)]
+def per_device(state: "nnx.State") -> int:
+    """The bytes of `state` on each device, as ``parallel.shardings`` splits it."""
+    import jax
+    from flax import nnx
+
+    from bux import parallel
+
+    variables = jax.tree.leaves(state, is_leaf=lambda x: isinstance(x, nnx.Variable))
+    splits = jax.tree.leaves(parallel.shardings(state))
+    return sum(
+        math.prod(split.shard_shape(v.shape)) * v.dtype.itemsize
+        for v, split in zip(variables, splits, strict=True)
+        if hasattr(v.get_value(), "shape")
+    )
+
+
+def memory(
+    run: Run, made: "tuple[nnx.Module, nnx.Optimizer]", gpus: int
+) -> tuple[int, int] | None:
+    """The bytes of the parameters and of the optimizer's state that `run` `made` on
+    each of `gpus` GPUs, as its mesh and layout split them; None if its mesh does not
+    fit them."""
+    from flax import nnx
+    from jax.sharding import AbstractMesh, AxisType
+
+    from bux import parallel
+
+    t = run.train
+    try:
+        sizes = parallel.sizes(t.mesh, gpus)
+    except ValueError:
+        return None
+    auto = (AxisType.Auto,) * len(parallel.AXES)
+    grid = AbstractMesh(tuple(sizes.values()), parallel.AXES, axis_types=auto)
+    model, opt = made
+    with parallel.use(grid, t.layout, t.methods):
+        return per_device(nnx.state(model, nnx.Param)), per_device(nnx.state(opt))
+
+
+def _row(run: Run, gpus: int, alone: bool) -> tuple[str, ...]:
+    """What `plan` says of `run`, of `gpus` there are."""
+    from bux.architecture import num_params
+    from bux.launch import need
+
+    t = run.train
+    tokens = t.steps * t.batch * t.seq_len
+    made = abstract(run)
+    n = None if made is None else num_params(made[0])
+    used = need(t.mesh, gpus, alone=alone)
+    params, opt = (made and memory(run, made, used)) or (None, None)
+    return (
+        run.id,
+        _si(n) if n else "?",
+        _si(tokens),
+        f"{tokens / n:.1f}" if n else "?",
+        str(used),
+        _bytes(params),
+        _bytes(opt),
+        run.name,
+    )
+
+
+def plan(runs: list[Run], gpus: int | None = None) -> str:
+    """A line a run: its parameters and tokens, the GPUs it trains on of `gpus`
+    (default: the visible ones), and the bytes of its parameters and of its
+    optimizer's state on each."""
+    from bux.launch import visible_gpus
+
+    there = len(visible_gpus()) if gpus is None else gpus
+    head = ("id", "params", "tokens", "tok/param", "gpus", "params/gpu", "optim/gpu")
+    rows = [(*head, "run"), *(_row(run, there, len(runs) == 1) for run in runs)]
+    widths = [max(len(row[i]) for row in rows) for i in range(len(head))]
     lines = [
-        "  ".join(c.ljust(w) for c, w in zip(row, widths)) + "  " + row[4]
+        "  ".join(c.ljust(w) for c, w in zip(row, widths)) + "  " + row[-1]
         for row in rows
     ]
     return f"{len(runs)} run{'s' if len(runs) != 1 else ''}\n" + "\n".join(lines)

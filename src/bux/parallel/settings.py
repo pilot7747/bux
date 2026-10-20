@@ -5,7 +5,7 @@ import contextlib
 from collections.abc import Generator
 
 import jax
-from jax.sharding import Mesh
+from jax.sharding import AbstractMesh, Mesh, use_abstract_mesh
 
 from bux.parallel import methods as registries
 from bux.parallel.layout import axes
@@ -17,19 +17,20 @@ DEFAULT_LAYOUT, DEFAULT_METHODS = LayoutConfig(), MethodsConfig()
 
 @contextlib.contextmanager
 def use(
-    grid: MeshConfig | Mesh,
+    grid: MeshConfig | Mesh | AbstractMesh,
     layout: LayoutConfig = DEFAULT_LAYOUT,
     methods: MethodsConfig = DEFAULT_METHODS,
-) -> Generator[Mesh]:
+) -> Generator[Mesh | AbstractMesh]:
     """Train on `grid` with `layout` and `methods`: `jax.set_mesh`, and what `spec`,
-    `shard` and `method` read."""
-    m = grid if isinstance(grid, Mesh) else mesh(grid)
+    `shard` and `method` read. On an AbstractMesh, of no devices, `shardings` says
+    where state would live."""
+    m = mesh(grid) if isinstance(grid, MeshConfig) else grid
     if tuple(m.axis_names) != AXES:
         raise ValueError(f"a bux mesh has the axes {AXES}, not {m.axis_names}")
     registries.validate(methods)
     token = ACTIVE.set(Active(m, layout, methods))
     try:
-        with jax.set_mesh(m):
+        with jax.set_mesh(m) if isinstance(m, Mesh) else use_abstract_mesh(m):
             yield m
     finally:
         ACTIVE.reset(token)

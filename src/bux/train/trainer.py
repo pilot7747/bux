@@ -42,7 +42,7 @@ from bux.train.data import Batch, batches
 from bux.train.hooks import Checkpoint, Eval, Hook, Log, Metrics
 from bux.train.objective import Objective, objective
 from bux.train.optim import Schedule, optimizer, peak, schedule
-from bux.train.sinks import JSONL, Console, Latest, Sink
+from bux.train.sinks import JSONL, Console, Latest, Sink, primary
 
 
 def forward(model: Model, batch: Batch) -> list[Float[Array, "b t vocab"]]:
@@ -183,8 +183,11 @@ def train(
         prepare(job, cache, echo=echo)
     folder = directory(run, out)
     folder.mkdir(parents=True, exist_ok=True)
-    (folder / "run.bux").write_text(run_to_source(run), encoding="utf-8")
-    (folder / "run.json").write_text(run.model_dump_json(indent=2), encoding="utf-8")
+    if primary():  # of a job of many processes, the first writes the run's files
+        (folder / "run.bux").write_text(run_to_source(run), encoding="utf-8")
+        (folder / "run.json").write_text(
+            run.model_dump_json(indent=2), encoding="utf-8"
+        )
 
     with parallel.use(t.mesh, t.layout, t.methods):
         parallel.check(t.batch, t.seq_len)
