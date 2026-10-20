@@ -332,7 +332,7 @@ class MethodsConfig(Config):
 
     type: Literal["methods"] = "methods"
     attention: str = "xla"
-    moe: str = "dense"
+    moe: str = "sorted"
     recurrence: str = "scan"
     repeat: str = "unroll"
     remat: str = "none"

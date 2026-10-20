@@ -119,6 +119,50 @@ A method that communicates by hand does it in a `jax.shard_map` over its own axi
 routing, balance losses, the router bias) stays outside, in the global view, so its
 semantics do not change.
 
+## Mixture of experts
+
+The router runs in the global view: it picks each token's top-k experts, reports the
+balance loss and moves the router bias. A method of `methods.moe` then runs the picked
+experts, `(moe, z, idx, weights) -> y`: `z` the tokens `(b, t, d)` in the experts'
+width (the latent one in a LatentMoE), `idx` and `weights` their picks `(b, t, k)`,
+and `y` their weighted sum `(b, t, d)`, before `latent_output_norm`.
+
+| method   | what it does                                                         |
+|----------|----------------------------------------------------------------------|
+| `sorted` | the default: sorts the picks by expert, runs each expert on its rows alone, and unsorts; drops no token |
+| `dense`  | every expert on every token, weighted by the router: the reference   |
+
+On a mesh, `sorted` sorts each device's own tokens, in a `shard_map` over the axes
+that split rows and positions, with every expert's kernels gathered onto every device:
+`expert` then acts as a batch axis, as it does under `dense`. Splitting the experts
+themselves is expert parallelism, a method of its own.
+
+Its pieces are functions of arrays alone, in `bux.architecture.moe`, so that a method
+can run them on one device's experts inside a `shard_map`:
+
+- `experts(x, sizes, up, gate, down, ffn, norm)`: the expert FFN of rows sorted by
+  expert, `sizes[i]` of them expert i's, by `jax.lax.ragged_dot`, or tokamax's where
+  it is installed. Rows past `sizes.sum()` come out 0, before `norm`.
+- `routed(z, idx, weights, up, gate, down, ffn, norm)`: sort, `experts`, unsort. A
+  pick outside the experts of `up` adds nothing, so a device that holds experts
+  `[i, i + n)` passes `idx - i` and its own kernels.
+
+```python
+from bux.architecture.moe import routed
+from bux.parallel import methods
+
+
+@methods.moe.register("mine")
+def _(moe, z, idx, weights):
+    return routed(z, idx, weights, *moe.kernels(), moe.ffn, moe.expert_norm)
+```
+
+The MoE names its parameters: the router `(embed, None)`; `up` and `gate`
+`(experts, embed, mlp)` and `down` `(experts, mlp, embed)`, with `latent` for `embed`
+in a LatentMoE; `to_latent` `(embed, latent)` and `from_latent` `(latent, embed)`.
+`dense` constrains its hidden units to `(batch, seq, experts, mlp)`, so that under
+FSDP the weights move to the tokens rather than the tokens to the weights.
+
 ## In a script
 
 ```python

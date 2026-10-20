@@ -1,16 +1,38 @@
-"""Mixture of experts, with shared experts and LatentMoE projections."""
+"""Mixture of experts, with shared experts and LatentMoE projections.
+
+The router picks each token's top-k experts, and a method of ``methods.moe`` runs
+them (docs/parallelism.md): "dense" runs every expert on every token, the
+reference; "sorted", the default, sorts the picks by expert and runs each expert on
+its own rows (``experts``), dropping none.
+"""
+
+from collections.abc import Callable
 
 import jax
 import jax.numpy as jnp
 from flax import nnx
+from jax.sharding import PartitionSpec as P
 from jaxtyping import Array, Float, Int
 
 from bux import config as cfg
+from bux import parallel
 from bux.architecture.functional import activation, bound
 from bux.architecture.mlp import MLP
 from bux.architecture.norm import Norm
 from bux.architecture.registry import Context, Taps, register, report, training
 from bux.lang import ir
+from bux.parallel import methods
+
+try:  # tokamax's kernels, where its extra is installed (Linux)
+    from tokamax import ragged_dot
+except ImportError:
+    ragged_dot = jax.lax.ragged_dot
+
+Rows = Callable[[Float[Array, "n d"]], Float[Array, "n d"]]  # a norm of rows
+# The experts' kernels, stacked: up, gate (None for an mlp) and down.
+Kernels = tuple[
+    Float[Array, "e d f"], Float[Array, "e d f"] | None, Float[Array, "e f d"]
+]
 
 
 def _limit_groups(
@@ -37,8 +59,79 @@ def balance_loss(
     return scores.shape[-1] * (f * p).sum(-1).mean()
 
 
+def mix(
+    idx: Int[Array, "*n k"], weights: Float[Array, "*n k"], e: int
+) -> Float[Array, "*n e"]:
+    """Every expert's weight for each token, 0 outside its top-k picks `idx`."""
+    return (jax.nn.one_hot(idx, e) * weights[..., None]).sum(-2)
+
+
+def hidden(
+    up: Float[Array, "*n f"], gate: Float[Array, "*n f"] | None, ffn: cfg.MLPConfig
+) -> Float[Array, "*n f"]:
+    """What an expert's down projection takes, from its up and gate projections."""
+    up = bound(up, ffn.limit, ffn.up_softcap)
+    if gate is None:
+        return activation(ffn.activation, up)
+    if ffn.limit is not None:
+        gate = jnp.minimum(gate, ffn.limit)
+    return activation(ffn.activation, gate) * up
+
+
+def experts(
+    x: Float[Array, "n d"],
+    sizes: Int[Array, " e"],
+    up: Float[Array, "e d f"],
+    gate: Float[Array, "e d f"] | None,
+    down: Float[Array, "e f d"],
+    ffn: cfg.MLPConfig,
+    norm: Rows | None = None,
+) -> Float[Array, "n d"]:
+    """Each row of `x` through its expert's FFN, the rows sorted by expert: the first
+    sizes[0] are expert 0's, the next sizes[1] expert 1's, and so on; rows past them
+    come out 0, before `norm`. A function of its arguments alone, so that it runs on
+    one device's experts in a shard_map as it does on all of them."""
+    g = None if gate is None else ragged_dot(x, gate, sizes)
+    y = ragged_dot(hidden(ragged_dot(x, up, sizes), g, ffn), down, sizes)
+    return y if norm is None else norm(y)
+
+
+def by_expert(
+    idx: Int[Array, "*n k"], e: int
+) -> tuple[Int[Array, " m"], Int[Array, " e"]]:
+    """The order that sorts the picks `idx`, flattened, by expert (each expert's in
+    the order of its tokens), and how many picks each of the `e` experts has. Picks
+    outside [0, e) sort last and count for none."""
+    flat = idx.reshape(-1)
+    flat = jnp.where((flat >= 0) & (flat < e), flat, e)
+    return jnp.argsort(flat, stable=True), jnp.bincount(flat, length=e + 1)[:e]
+
+
+def routed(
+    z: Float[Array, "b t d"],
+    idx: Int[Array, "b t k"],
+    weights: Float[Array, "b t k"],
+    up: Float[Array, "e d f"],
+    gate: Float[Array, "e d f"] | None,
+    down: Float[Array, "e f d"],
+    ffn: cfg.MLPConfig,
+    norm: Rows | None = None,
+) -> Float[Array, "b t d"]:
+    """Each token's sum of its experts' outputs by their `weights`, the picks `idx`
+    sorted by expert, through ``experts``, and back. A pick outside the experts of
+    `up` adds nothing, so that one device's experts can take every pick."""
+    b, t, d = z.shape
+    k, e = idx.shape[-1], up.shape[0]
+    order, sizes = by_expert(idx, e)
+    rows = z.reshape(b * t, d)[order // k]
+    out = experts(rows, sizes, up, gate, down, ffn, norm)
+    each = out[jnp.argsort(order)].reshape(b, t, k, d)
+    mine = jnp.where((idx >= 0) & (idx < e), weights, 0)
+    return jnp.einsum("btkd,btk->btd", each, mine)
+
+
 class MoE(nnx.Module):
-    """Dense reference: every expert runs on every token, weighted by the router."""
+    """Token-choice top-k experts, run by the run's method of ``methods.moe``."""
 
     def __init__(self, c: cfg.MoEConfig, width: int, rngs: nnx.Rngs):
         e, f = c.num_experts, c.expert.intermediate_size
@@ -50,7 +143,7 @@ class MoE(nnx.Module):
         init = nnx.initializers.lecun_normal()
         # With shared_expert_sink, the router scores the shared experts too, last.
         sinks = c.num_shared_experts if c.shared_expert_sink else 0
-        self.router = nnx.Linear(width, e + sinks, use_bias=False, rngs=rngs)
+        self.router = _linear(width, e + sinks, ("embed", None), rngs)
         self.router_bias = (
             nnx.Variable(jnp.zeros(e)) if c.load_balancing == "aux_free" else None
         )
@@ -59,10 +152,9 @@ class MoE(nnx.Module):
         self.per_sequence = c.aux_loss_scope == "sequence"
         # LatentMoE: the routed experts work between these two projections.
         latent = c.latent_size or width
+        inner = "latent" if c.latent_size else "embed"  # the width the experts see
         self.to_latent = (
-            nnx.Linear(width, latent, use_bias=False, rngs=rngs)
-            if c.latent_size
-            else None
+            _linear(width, latent, ("embed", "latent"), rngs) if c.latent_size else None
         )
         self.latent_input_norm = (
             Norm(c.latent_input_norm, latent) if c.latent_input_norm else None
@@ -72,23 +164,22 @@ class MoE(nnx.Module):
         )
         self.expert_norm = Norm(c.expert_norm, latent) if c.expert_norm else None
         self.from_latent = (
-            nnx.Linear(latent, width, use_bias=False, rngs=rngs)
-            if c.latent_size
-            else None
+            _linear(latent, width, ("latent", "embed"), rngs) if c.latent_size else None
         )
-        self.up = nnx.Param(init(rngs.params(), (e, latent, f)))
+        into = ("experts", inner, "mlp")
+        self.up = nnx.Param(init(rngs.params(), (e, latent, f)), names=into)
         self.gate = (
-            nnx.Param(init(rngs.params(), (e, latent, f)))
+            nnx.Param(init(rngs.params(), (e, latent, f)), names=into)
             if c.expert.type == "gated_mlp"
             else None
         )
-        self.down = nnx.Param(init(rngs.params(), (e, f, latent)))
-        self.top_k, self.router_fn = c.top_k, c.router
+        out = ("experts", "mlp", inner)
+        self.down = nnx.Param(init(rngs.params(), (e, f, latent)), names=out)
+        self.num_experts, self.top_k, self.router_fn = e, c.top_k, c.router
         self.groups, self.top_k_groups = c.num_groups, c.top_k_groups
         self.router_logit_scale = c.router_logit_scale
         self.normalize, self.scaling = c.normalize_top_k, c.routed_scaling_factor
-        self.activation = c.expert.activation
-        self.limit, self.up_softcap = c.expert.limit, c.expert.up_softcap
+        self.ffn = c.expert  # what each routed expert computes
         shared = c.shared_expert or c.expert
         self.shared = (
             MLP(
@@ -101,17 +192,17 @@ class MoE(nnx.Module):
             else None
         )
         self.shared_gate = (
-            nnx.Linear(width, 1, use_bias=False, rngs=rngs)
-            if c.shared_expert_gate
-            else None
+            _linear(width, 1, ("embed", None), rngs) if c.shared_expert_gate else None
         )
 
     def _route(
         self, x: Float[Array, "b t d"], taps: Taps | None = None
-    ) -> tuple[Float[Array, "b t e"], Float[Array, "b t s"] | None]:
-        """Every routed expert's weight for each token, 0 outside its top-k, and the
-        shared experts' weights if the router scores them too; in a training
-        forward, it also balances the experts."""
+    ) -> tuple[
+        Int[Array, "b t k"], Float[Array, "b t k"], Float[Array, "b t s"] | None
+    ]:
+        """Each token's top-k experts and their weights, and the shared experts'
+        weights if the router scores them too; in a training forward, it also
+        balances the experts."""
         logits = self.router(x) * self.router_logit_scale
         match self.router_fn:
             case "softmax":
@@ -120,8 +211,7 @@ class MoE(nnx.Module):
                 scores = jax.nn.sigmoid(logits)
             case "sqrtsoftplus":
                 scores = jnp.sqrt(jax.nn.softplus(logits))
-        e = self.up.shape[0]
-        scores, sinks = scores[..., :e], scores[..., e:]
+        scores, sinks = scores[..., : self.num_experts], scores[..., self.num_experts :]
         choice = scores if self.router_bias is None else scores + self.router_bias[...]
         if self.groups > 1:
             choice = _limit_groups(choice, self.groups, self.top_k_groups)
@@ -132,8 +222,8 @@ class MoE(nnx.Module):
         if self.normalize:
             total = weights.sum(-1, keepdims=True) + sinks.sum(-1, keepdims=True)
             weights, sinks = weights / total, sinks / total
-        dense = (jax.nn.one_hot(idx, e) * weights[..., None]).sum(-2) * self.scaling
-        return dense, sinks * self.scaling if sinks.shape[-1] else None
+        sinks = sinks * self.scaling if sinks.shape[-1] else None
+        return idx, weights * self.scaling, sinks
 
     def _balance(
         self, scores: Float[Array, "b t e"], idx: Int[Array, "b t k"], taps: Taps
@@ -149,41 +239,109 @@ class MoE(nnx.Module):
             step = self.bias_update_rate * jnp.sign(load.mean() - load)
             self.router_bias[...] = self.router_bias[...] + step
 
-    def __call__(self, x: Float[Array, "b t d"], taps: Taps) -> Float[Array, "b t d"]:
-        dense, sinks = self._route(x, taps)
+    def kernels(self) -> Kernels:
+        """The routed experts' kernels, as arrays."""
+        gate = None if self.gate is None else self.gate[...]
+        return self.up[...], gate, self.down[...]
+
+    def _latent(self, x: Float[Array, "b t d"]) -> Float[Array, "b t l"]:
+        """The tokens as the routed experts see them."""
         z = x if self.to_latent is None else self.to_latent(x)
-        if self.latent_input_norm is not None:
-            z = self.latent_input_norm(z)
-        h = bound(
-            jnp.einsum("btd,edf->btef", z, self.up[...]), self.limit, self.up_softcap
-        )
-        if self.gate is not None:
-            gate = jnp.einsum("btd,edf->btef", z, self.gate[...])
-            if self.limit is not None:
-                gate = jnp.minimum(gate, self.limit)
-            h = activation(self.activation, gate) * h
+        return z if self.latent_input_norm is None else self.latent_input_norm(z)
+
+    def _shared(
+        self, x: Float[Array, "b t d"], sinks: Float[Array, "b t s"] | None
+    ) -> Float[Array, "b t d"]:
+        """The shared experts' output; if the router scores them, each one's part of
+        the hidden units weighted by its `sinks`."""
+        assert self.shared is not None
+        if sinks is None:
+            s = self.shared(x)
         else:
-            h = activation(self.activation, h)
-        if self.expert_norm is not None:
-            each = self.expert_norm(jnp.einsum("btef,efd->bted", h, self.down[...]))
-            y = jnp.einsum("bted,bte->btd", each, dense)
-        else:
-            y = jnp.einsum("btef,efd,bte->btd", h, self.down[...], dense)
+            h = self.shared.hidden(x)
+            h = h * jnp.repeat(sinks, h.shape[-1] // sinks.shape[-1], axis=-1)
+            s = self.shared.dropout(self.shared.down(h))
+        if self.shared_gate is not None:
+            s = s * jax.nn.sigmoid(self.shared_gate(x))
+        return s
+
+    def __call__(self, x: Float[Array, "b t d"], taps: Taps) -> Float[Array, "b t d"]:
+        idx, weights, sinks = self._route(x, taps)
+        y = parallel.method("moe")(self, self._latent(x), idx, weights)
         if self.latent_output_norm is not None:
             y = self.latent_output_norm(y)
         if self.from_latent is not None:
             y = self.from_latent(y)
-        if self.shared is not None:
-            if sinks is None:
-                s = self.shared(x)
-            else:  # each shared expert's part of the hidden units, by its weight
-                h = self.shared.hidden(x)
-                h = h * jnp.repeat(sinks, h.shape[-1] // sinks.shape[-1], axis=-1)
-                s = self.shared.dropout(self.shared.down(h))
-            if self.shared_gate is not None:
-                s = s * jax.nn.sigmoid(self.shared_gate(x))
-            y = y + s
-        return y
+        return y if self.shared is None else y + self._shared(x, sinks)
+
+
+def _linear(
+    i: int, o: int, names: tuple[str | None, str | None], rngs: nnx.Rngs
+) -> nnx.Linear:
+    """A linear map with no bias, its kernel's dimensions `names`."""
+    init = parallel.named(*names)  # nnx.Linear's lecun_normal
+    return nnx.Linear(i, o, use_bias=False, kernel_init=init, rngs=rngs)
+
+
+# --- Methods: (moe, z, idx, weights) -> the routed sum, in the experts' width -------
+
+
+@methods.moe.register("dense")
+def run_dense(
+    moe: MoE,
+    z: Float[Array, "b t d"],
+    idx: Int[Array, "b t k"],
+    weights: Float[Array, "b t k"],
+) -> Float[Array, "b t d"]:
+    """Every expert on every token, weighted by the router: the reference. Each
+    device runs every expert on its own tokens."""
+    up, gate, down = moe.kernels()
+    dense = mix(idx, weights, moe.num_experts)
+
+    def project(w: Float[Array, "e d f"]) -> Float[Array, "b t e f"]:
+        h = jnp.einsum("btd,edf->btef", z, w)
+        return parallel.shard(h, "batch", "seq", "experts", "mlp")
+
+    h = hidden(project(up), None if gate is None else project(gate), moe.ffn)
+    if moe.expert_norm is None:
+        return jnp.einsum("btef,efd,bte->btd", h, down, dense)
+    each = moe.expert_norm(jnp.einsum("btef,efd->bted", h, down))
+    return jnp.einsum("bted,bte->btd", each, dense)
+
+
+@methods.moe.register("sorted")
+def run_sorted(
+    moe: MoE,
+    z: Float[Array, "b t d"],
+    idx: Int[Array, "b t k"],
+    weights: Float[Array, "b t k"],
+) -> Float[Array, "b t d"]:
+    """Each expert on its own rows (``routed``), each device on its own tokens with
+    every expert's kernels: a shard_map over the axes that split the tokens, so that
+    no device sorts another's."""
+
+    def local(
+        z: Float[Array, "b t d"],
+        idx: Int[Array, "b t k"],
+        weights: Float[Array, "b t k"],
+        kernels: Kernels,
+    ) -> Float[Array, "b t d"]:
+        return routed(z, idx, weights, *kernels, moe.ffn, moe.expert_norm)
+
+    tokens = parallel.spec(("batch", "seq", None), z.shape)
+    if not _axes(tokens):
+        return local(z, idx, weights, moe.kernels())
+    return jax.shard_map(
+        local,
+        in_specs=(tokens, tokens, tokens, P()),
+        out_specs=tokens,
+        axis_names=_axes(tokens),
+    )(z, idx, weights, moe.kernels())
+
+
+def _axes(spec: P) -> set[str]:
+    """The mesh axes `spec` splits over."""
+    return {a for s in spec if s for a in ((s,) if isinstance(s, str) else s)}
 
 
 @register("moe")
