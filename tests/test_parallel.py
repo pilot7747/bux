@@ -8,6 +8,7 @@ import jax.numpy as jnp
 import numpy as np
 import pytest
 from flax import nnx
+from jax.sharding import NamedSharding
 from jax.sharding import PartitionSpec as P
 
 from bux import parallel
@@ -166,7 +167,7 @@ def test_zero_1_keeps_parameters_whole_and_splits_the_optimizer_state():
 def test_shard_called_eagerly_moves_an_array_onto_the_mesh():
     with use(data=2, tensor=4):
         x = parallel.shard(jnp.ones((8, 4)), "batch", "mlp")
-    assert x.sharding.spec == P("data", "tensor")
+    assert x.sharding == NamedSharding(x.sharding.mesh, P("data", "tensor"))
 
 
 def test_shard_does_nothing_without_a_mesh():

@@ -11,6 +11,7 @@ from collections.abc import Sequence
 
 import jax
 from flax import nnx
+from jax.core import Tracer
 from jax.sharding import NamedSharding
 from jax.sharding import PartitionSpec as P
 from jaxtyping import Array, Shaped
@@ -93,7 +94,7 @@ def shard(x: Shaped[Array, "*s"], *names: Name) -> Shaped[Array, "*s"]:
     if (on := active()) is None:
         return x
     split = partition(resolve(names, x.shape, on))
-    if not isinstance(x, jax.core.Tracer):
+    if not isinstance(x, Tracer):
         return jax.lax.with_sharding_constraint(x, NamedSharding(on.mesh, split))
     # A bare spec is of the mesh being traced, which knows a shard_map's manual axes.
     return jax.lax.with_sharding_constraint(x, split)
