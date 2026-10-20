@@ -29,9 +29,10 @@ set has size 1, and `data` takes the devices the others leave. Every axis is Aut
 layers do not say how anything splits, and the compiler propagates shardings from the
 parameters and a few constraints.
 
-`bux train` uses every visible device; `bux launch` still gives a run one GPU. A mesh that needs more devices than there are,
-a `batch` that does not split over the batch axes, and a `seq_len` that does not split
-over `seq` or `stream` are errors before anything is built.
+`bux train` uses every visible device; `bux launch` gives a run the GPUs its mesh
+needs ([below](#gpus-hosts-and-the-plan)). A mesh that needs more devices than there
+are, a `batch` that does not split over the batch axes, and a `seq_len` that does not
+split over `seq` or `stream` are errors before anything is built.
 
 ## Names
 
@@ -172,6 +173,32 @@ with parallel.use(t.mesh, t.layout, t.methods):
     model = parallel.build(lambda: Model(arch, rngs=nnx.Rngs(0)))
     trainer = Trainer(model, tx, loss)  # its state on its shardings
     trainer.update(batch)  # the batch through parallel.rows
+```
+
+## GPUs, hosts and the plan
+
+`bux launch` gives a run the GPUs of its mesh: the product of its axes' sizes, where
+`data` unset is every visible GPU for a run alone and one in a sweep. A sweep trains
+its runs side by side, each on a group of free GPUs, and a run that needs more GPUs
+than there are fails at once. A run alone also trains on many hosts, a process each,
+when Slurm, Open MPI or `JAX_NUM_PROCESSES` say so
+([Launching](training.md#launching)). The mesh then spans every process's devices,
+and `parallel.rows` builds a batch with `jax.make_array_from_callback`: every process
+makes all of it, as it depends only on the seed and the step, and puts the rows its
+own devices hold. `tests/test_launch.py` trains the smoke run as two processes of 4
+CPU devices each, through `jax.distributed` on localhost, as one process of 8 does.
+
+`bux plan` shows what each run takes before it starts: its GPUs, and the bytes of its
+parameters and of its optimizer's state on each. They come from `parallel.shardings`
+over a `jax.sharding.AbstractMesh`, which `parallel.use` takes as it does a mesh, so
+the plan needs no devices:
+
+```
+$ bux plan examples/experiments/smoke.bux 'mesh = fsdp: mesh(fsdp=8) | one: mesh(data=1)'
+2 runs
+id          params  tokens  tok/param  gpus  params/gpu  optim/gpu  run
+bbbf3ae709  156k    25.6k   0.2        8     76.2KiB     152KiB     smoke[fsdp]
+bbbf3ae709  156k    25.6k   0.2        1     609KiB      1.19MiB    smoke[one]
 ```
 
 ## Testing

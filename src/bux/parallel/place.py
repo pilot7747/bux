@@ -65,14 +65,15 @@ def place(*nodes: nnx.Pytree) -> None:
 
 def rows[T](batch: T) -> T:
     """Every array of `batch`, (b, t) and on the host, on the devices: rows over
-    `batch` and positions over `seq`."""
+    `batch` and positions over `seq`. Of a job of many processes, each has the whole
+    batch, and puts the parts its own devices hold."""
     on = active()
     if on is None:
         return jax.device_put(batch)
 
     def put(x: Shaped[np.ndarray, "b ..."]) -> Shaped[Array, "b ..."]:
         names = ("batch", "seq", *(None,) * x.ndim)[: x.ndim]
-        split = partition(resolve(names, x.shape, on))
-        return jax.device_put(x, NamedSharding(on.mesh, split))
+        split = NamedSharding(on.mesh, partition(resolve(names, x.shape, on)))
+        return jax.make_array_from_callback(x.shape, split, lambda part: x[part])
 
     return jax.tree.map(put, batch)

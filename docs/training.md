@@ -256,7 +256,7 @@ at their first.
 
 ```
 bux check examples/experiments/smoke.bux     # the model, the run, the sweep
-bux plan  examples/experiments/smoke.bux     # every run: id, parameters, tokens, tokens per parameter
+bux plan  examples/experiments/smoke.bux     # every run: id, parameters, tokens, GPUs, bytes on each
 bux prepare examples/experiments/sft.bux     # tokenize and pack its documents; --cache DIR, --workers N
 bux train examples/experiments/smoke.bux     # train every run, one after another; --only TEXT, --out DIR
 bux launch examples/experiments/smoke.bux    # train what is left of every run, a GPU each: see below
@@ -295,14 +295,18 @@ bux launch examples/experiments/attention_ablation.bux             # all 6 runs,
 bux launch examples/experiments/attention_ablation.bux --index 3   # the fourth, in an array job
 ```
 
-First it prepares the datasets the runs read, once. A run alone then trains in the
-launcher's process, on the first visible GPU. A sweep trains in workers, a process a
-run, one on each visible GPU at a time (`CUDA_VISIBLE_DEVICES` says which), or one at a
-time if there are none. A worker's output goes to the console and to its run's
-`train.log`, and a run that fails or runs out of memory leaves the others training.
+A run needs the GPUs of its `mesh`, the product of its axes' sizes, where `data` unset
+is every visible GPU for a run alone and one in a sweep; `bux plan` lists them. A run
+that needs more than there are fails at once. The launcher prepares the datasets the
+others read, once. A run alone then trains in the launcher's process, on the first
+GPUs it needs. A sweep trains in workers, a process a run, each on a group of free
+GPUs (`CUDA_VISIBLE_DEVICES` says which), the first pending run that fits starting
+first; or one at a time if there are no GPUs. A worker's output goes to the console
+and to its run's `train.log`, and a run that fails or runs out of memory leaves the
+others training.
 
 A run's directory also keeps a `status.json`: whether the run is `running`, `done`,
-`failed` or `stopped`, on what host and GPU, since when, at what step, and its latest
+`failed` or `stopped`, on what host and GPUs, since when, at what step, and its latest
 metrics. A run that is done is not trained again, and one that is not resumes from its
 latest checkpoint, so launching an experiment again, after a preemption, a crash or a
 fix, trains what is left of it. A sweep ends with a table of its runs:
@@ -325,6 +329,21 @@ array job trains a sweep a run a task: `--index $SLURM_ARRAY_TASK_ID` on Slurm, 
 `--index $(JOB_COMPLETION_INDEX)` in an indexed Kubernetes Job. Tasks that read the
 same documents each prepare them, which is safe but wasted work; run `bux prepare` once
 beforehand.
+
+A run alone trains on many hosts when the environment says how many processes there
+are: under Slurm's `srun` or Open MPI's `mpirun`, or with `JAX_COORDINATOR_ADDRESS`
+(process 0's `host:port`), `JAX_NUM_PROCESSES` and `JAX_PROCESS_ID` set on each. Every
+process runs the same command, and they join through `jax.distributed`; under Slurm
+and Open MPI, JAX gives each the GPU of its local rank, so start a task a GPU:
+
+```
+srun --nodes=4 --ntasks-per-node=8 bux launch speedrun.bux   # 32 GPUs, one mesh
+```
+
+The first process alone writes the console, `metrics.jsonl`, `status.json` and the
+run's files, and every one writes its part of a checkpoint, so `--out` is on a
+filesystem they all see. A signal to any of them stops them all after the same step.
+A sweep does not train on many hosts: give each run a job of its own, with `--index`.
 
 ## The trainer's blocks
 

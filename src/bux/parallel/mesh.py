@@ -5,7 +5,7 @@ import math
 from dataclasses import dataclass
 
 import jax
-from jax.sharding import AxisType, Mesh
+from jax.sharding import AbstractMesh, AxisType, Mesh
 
 from bux.train.config import LayoutConfig, MeshConfig, MethodsConfig
 
@@ -53,7 +53,7 @@ def mesh(c: MeshConfig) -> Mesh:
 class Active:
     """What `use` puts in force."""
 
-    mesh: Mesh
+    mesh: Mesh | AbstractMesh
     layout: LayoutConfig
     methods: MethodsConfig
 
