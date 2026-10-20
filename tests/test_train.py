@@ -1,7 +1,10 @@
 """The trainer: schedules, optimizers, data, losses, and runs that resume."""
 
+import contextlib
+import functools
 import itertools
 import json
+import re
 import shutil
 from pathlib import Path
 
@@ -12,7 +15,10 @@ import optax
 import pytest
 from conftest import corpus
 from flax import nnx
+from jax.sharding import PartitionSpec as P
+from optax.contrib import MuonDimensionNumbers, scale_by_muon
 
+from bux import parallel
 from bux.__main__ import main
 from bux.architecture import Model
 from bux.data.pipeline import jobs
@@ -31,10 +37,13 @@ from bux.train.objective import (
 from bux.train.optim import (
     decayed,
     matrices,
+    momentum,
     optimizer,
     optimizers,
+    orthogonalized,
     schedule,
     schedules,
+    whole,
 )
 from bux.train.sinks import Latest, Sink
 from bux.train.trainer import Trainer, directory, train
@@ -128,6 +137,112 @@ def test_weight_decay_leaves_norms_and_engram_tables_alone_whatever_their_shape(
     }
     decays = {keys for keys, _, d in named if d}
     assert set(matrices(m)) <= decays
+
+
+# --- Muon split over devices: methods.orthogonalize ------------------------------------
+
+MOE = (
+    ARCH
+    + "experts = moe(num_experts=8, top_k=2, expert=ffn)\n"
+    + "model = embed [norm attn] [norm experts] norm head\n"
+)
+SPLITS = {"fsdp": {"fsdp": 8}, "fsdp_tensor": {"fsdp": 4, "tensor": 2}}
+
+
+class Stack(nnx.Module):
+    """A matrix, and a stack of two: all Muon's."""
+
+    def __init__(self):
+        a, b = jax.random.split(jax.random.key(0))
+        self.w = nnx.Param(jax.random.normal(a, (16, 32)))
+        self.e = nnx.Param(jax.random.normal(b, (2, 16, 8)))
+
+
+def _muon_updates(tx: optax.GradientTransformation, params: dict, steps=3) -> list:
+    state, step = tx.init(params), jax.jit(tx.update)
+    found = []
+    for i in range(steps):
+        grads = jax.tree.map(lambda x, i=i: jnp.sin(x + i), params)
+        u, state = step(grads, state, params)
+        found.append(u)
+    return found
+
+
+@pytest.mark.parametrize("nesterov", [True, False])
+def test_muon_on_one_device_is_optax_s_whichever_method_orthogonalizes(nesterov):
+    stack = Stack()
+    params = nnx.to_pure_dict(nnx.state(stack, nnx.Param))
+    dims = {"w": MuonDimensionNumbers(0, 1), "e": MuonDimensionNumbers(1, 2)}
+    theirs = scale_by_muon(nesterov=nesterov, weight_dimension_numbers=dims)
+    expected = _muon_updates(theirs, params)
+    for method in ("gspmd", "gather"):
+        methods = tcfg.MethodsConfig(orthogonalize=method)
+        one = parallel.use(tcfg.MeshConfig(data=1), methods=methods)
+        for where in (contextlib.nullcontext(), one):
+            with where:
+                ours = optax.chain(
+                    momentum(0.95, nesterov),
+                    orthogonalized(5, {(k,): d for k, d in dims.items()}, stack),
+                )
+                got = _muon_updates(ours, params)
+            assert jax.tree.all(jax.tree.map(jnp.array_equal, got, expected))
+
+
+@functools.cache
+def _muon_step(orthogonalize: str = "gspmd", **mesh: int) -> tuple[list, str]:
+    """The MoE's parameters after a Muon step from fixed gradients, split over `mesh`
+    (outside parallel.use with none), and the compiled step's HLO."""
+    methods = tcfg.MethodsConfig(orthogonalize=orthogonalize)
+    split = parallel.use(tcfg.MeshConfig.model_validate(mesh), methods=methods)
+    with split if mesh else contextlib.nullcontext():
+        model = parallel.build(lambda: Model(compile(MOE), rngs=nnx.Rngs(0)))
+        c, lr = tcfg.MuonConfig(lr=0.02), schedule(tcfg.ConstantSchedule(), 1)
+        trained = nnx.Optimizer(model, optimizer(c, lr, model), wrt=nnx.Param)
+        parallel.place(model, trained)
+        grads = jax.tree.map(jnp.sin, nnx.state(model, nnx.Param))
+        step = nnx.jit(lambda m, o, g: o.update(m, g))
+        hlo = step.lower(model, trained, grads).compile().as_text() or ""
+        step(model, trained, grads)
+    return jax.tree.leaves(jax.tree.map(np.asarray, nnx.state(model, nnx.Param))), hlo
+
+
+@pytest.mark.parametrize("orthogonalize", ["gspmd", "gather"])
+@pytest.mark.parametrize("mesh", SPLITS.values(), ids=list(SPLITS))
+def test_muon_updates_split_over_devices_as_on_one(orthogonalize, mesh):
+    one, _ = _muon_step()
+    split, _ = _muon_step(orthogonalize, **mesh)
+    assert all(np.allclose(a, b, atol=1e-6) for a, b in zip(split, one, strict=True))
+
+
+def _all_reduces(hlo: str) -> int:
+    return len(re.findall(r"\ball-reduce(-start)?\(", hlo))
+
+
+@pytest.mark.parametrize("mesh", SPLITS.values(), ids=list(SPLITS))
+def test_muon_gathering_whole_matrices_needs_no_all_reduce(mesh):
+    """gspmd runs Newton-Schulz on shards, all-reducing products over split
+    dimensions; gather moves each matrix whole once and runs it there."""
+    _, gspmd = _muon_step("gspmd", **mesh)
+    _, gather = _muon_step("gather", **mesh)
+    assert _all_reduces(gather) == 0 < _all_reduces(gspmd)
+
+
+def test_gather_holds_matrices_whole_and_a_stack_split_over_what_that_frees():
+    mesh = parallel.mesh(tcfg.MeshConfig(fsdp=2, expert=2, tensor=2))
+    matrix, experts = MuonDimensionNumbers(0, 1), MuonDimensionNumbers(1, 2)
+    assert whole(P("fsdp", "tensor"), matrix, (64, 32), mesh) == P(None, None)
+    every = ("expert", "fsdp", "tensor")
+    split = P("expert", "fsdp", "tensor")
+    assert whole(split, experts, (8, 64, 32), mesh) == P(every, None, None)
+    # 4 experts do not split 8 ways: each stays whole, and the experts as they were.
+    assert whole(split, experts, (4, 64, 32), mesh) == P("expert", None, None)
+    assert whole(P(None, "fsdp"), experts, (3, 64, 32), mesh) == P(None, None, None)
+
+
+def test_a_run_that_gathers_matrices_for_muon_trains_as_on_one_device(losses):
+    muon = {"optimizer": "muon(lr=0.02)", "methods": "methods(orthogonalize=gather)"}
+    one = losses(MOE, mesh="mesh(data=1)", **muon)
+    assert np.allclose(losses(MOE, mesh="mesh(fsdp=8)", **muon), one, atol=1e-5)
 
 
 def rows(data: tcfg.DataConfig, batch: int, seq_len: int) -> tcfg.TrainConfig:

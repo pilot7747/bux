@@ -136,3 +136,52 @@ The tests run on 8 CPU devices (`tests/conftest.py`), and compare a run split ov
 them with one on a single device: `losses(source, mesh="mesh(fsdp=8)")` trains a few
 steps and returns the losses. `involuntary()` counts the times XLA warned that it
 rematerialized an array in full, which a complete layout should never make it do.
+
+## Muon: `methods.orthogonalize`
+
+Newton-Schulz takes fifteen products of each update matrix a step. On a matrix split
+over devices, most of them need an all-reduce, so how Muon reaches whole matrices is a
+method:
+
+| method   | what it does                                                                 |
+|----------|------------------------------------------------------------------------------|
+| `gspmd`  | Newton-Schulz on whatever shards the compiler gives each update; the default |
+| `gather` | each update whole in a `jax.shard_map` for Newton-Schulz, and back on its parameter's shards after |
+
+```
+methods = methods(orthogonalize=gather)
+```
+
+Under `gather`, a stack of matrices (the experts) is whole matrix by matrix, and its
+stacked dimension splits over the axes that frees, where they divide it: each device
+orthogonalizes its own experts. A lone matrix is whole on every device, and every
+device runs its Newton-Schulz. Owner-per-matrix schemes (Moonlight, Dion), which spread
+that work, are the next method.
+
+A method gets every update of a step at once, so that it can choose where each runs:
+
+```python
+from bux.parallel import methods
+
+
+@methods.orthogonalize.register("mine")
+def _(updates, dims, shardings, newton_schulz):
+    # updates: an array per Muon parameter; dims: their MuonDimensionNumbers;
+    # shardings: their parameters' NamedShardings, None outside parallel.use;
+    # newton_schulz(x, dims): optax's Newton-Schulz.
+    return [newton_schulz(x, d) for x, d in zip(updates, dims)]
+```
+
+Collectives in the compiled train step on 8 CPU devices (all-reduces / all-gathers /
+all-to-alls) for the 2-block Llama and the MoE of `tests/test_parallel.py`:
+
+| model, mesh               | AdamW       | Muon, `gspmd` | Muon, `gather` |
+|---------------------------|-------------|---------------|----------------|
+| Llama, `fsdp=8`           | 21 / 24 / 0 | 72 / 84 / 0   | 21 / 38 / 0    |
+| Llama, `fsdp=4, tensor=2` | 21 / 25 / 0 | 72 / 85 / 0   | 21 / 39 / 0    |
+| MoE, `fsdp=8`             | 26 / 33 / 8 | 67 / 183 / 8  | 26 / 48 / 14   |
+| MoE, `fsdp=4, tensor=2`   | 25 / 36 / 6 | 66 / 186 / 6  | 25 / 51 / 12   |
+
+With `gather`, Muon all-reduces as often as AdamW, and adds an all-gather a matrix
+and two all-to-alls an expert stack; the optimizer's update alone does no all-reduce.
+Step times on fake CPU devices, which share one CPU, say nothing.
