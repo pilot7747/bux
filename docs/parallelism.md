@@ -200,6 +200,81 @@ the logits to `(batch, heads, seq, none)`, the keys whole, which with `seq` over
 The indexer picks its top-k with a stable sort: `lax.top_k` gathers every row onto
 each device.
 
+## Context parallelism: `methods.attention`
+
+The core of softmax attention (logits, probabilities, values) is a method of
+`methods.attention`, `(q, k, v, visibility) -> out`: queries `(b, t, h, k)`, keys and
+values `(b, t, g, k)` and `(b, t, g, v)` of `g` kv heads at the queries' positions,
+and the head outputs `(b, t, h, v)`. A query sees no key ahead of it; the
+`Visibility` (`bux.parallel.context`) carries the rest: the documents' ids
+(`Segments.ids`, made in the global view before any method), the window, the scale,
+the soft cap and the sinks. Every method takes its softmax in float32.
+
+```
+mesh    = mesh(context=4, tensor=2)
+methods = methods(attention=ring)
+```
+
+| method    | what it does                                                         |
+|-----------|----------------------------------------------------------------------|
+| `xla`     | the default: all t by t logits at once. With `seq` over `context` a device has its queries' rows, and every key and value: all-gather CP |
+| `ring`    | each device keeps its queries, while the keys and values go round `context` a block at a time, by `ppermute`, into an online softmax; a block wholly ahead of the queries, or a window or more behind, is skipped. Its custom VJP sends them round again with their gradients, which then go home |
+| `ulysses` | all-to-alls over `context`, from a device's positions of every head to every position of its own heads; `xla` on those; and back. `context` must divide a device's heads; kv heads it does not divide are repeated |
+| `tokamax` | tokamax's flash attention (Mosaic, then Triton, then XLA), a document from its first token on as `k_start`, split by its `q_sharding`: all-gather CP in a kernel. No sinks; Linux only (the `cuda` extra) |
+
+What only `xla` has stays in the layer: a mask of the keys each query keeps (an
+indexer's top-k, CSA's compressed latents), relative bias, length scale and attention
+dropout. A layer with one of them under another method raises `NotImplementedError`
+naming it, as a method does for a feature of the visibility it lacks. The indexer's
+loss reads the attention's probabilities, which only `xla` makes; it comes with the
+indexer's top-k, so it is `xla`'s too.
+
+`ring` is a `shard_map` over `context` alone. `ulysses` is manual over every axis
+that splits q: an all-to-all in a `shard_map` of auto axes makes XLA gather every
+dimension they split, the rows too. Inside a `shard_map`, `shard` and `spec` leave
+out the axes it maps, so that a layer's constraints still hold there.
+
+Another method is a function:
+
+```python
+from bux.parallel import methods
+from bux.parallel.context import Visibility
+
+
+@methods.attention.register("mine")
+def _(q, k, v, seen: Visibility):
+    # seen.ids (b, t) or None, seen.window, seen.scale, seen.softcap, seen.sinks (h,)
+    if seen.sinks is not None:
+        raise NotImplementedError("methods.attention = mine has no sinks")
+    return methods.attention.find("xla")(q, k, v, seen)
+```
+
+Measured on 8 CPU devices: two windowed GQA layers (4 heads, 2 kv heads) in a
+training step on packed rows train as on one device, to 1e-6 over 3 steps, by every
+method on `context=2, tensor=2`, `context=4, fsdp=2` and `context=8` (not `ulysses`
+there: 4 heads), and none makes XLA rematerialize an array in full. The collectives of
+the compiled step (all-gathers / all-reduces / collective-permutes / all-to-alls; a
+collective in a loop counts once):
+
+| mesh                  | `xla`        | `ring`        | `ulysses`    | `tokamax`    |
+|-----------------------|--------------|---------------|--------------|--------------|
+| `context=2, tensor=2` | 12 / 12 / 4 / 4 | 12 / 10 / 10 / 4 | 5 / 10 / 4 / 20 | 10 / 14 / 5 / 8 |
+| `context=4, fsdp=2`   | 38 / 8 / 4 / 4  | 38 / 6 / 12 / 4  | 31 / 6 / 4 / 20 | 36 / 10 / 5 / 8 |
+| `context=8`           | 11 / 4 / 4 / 4  | 4 / 2 / 12 / 4   |                 | 9 / 6 / 5 / 8   |
+
+`xla` gathers each layer's keys and values whole; `ring` and `ulysses` gather no
+activation but the documents' ids (int32), and FSDP's parameters. A layer adds 4
+collective-permutes under `ring` (the blocks forward; the blocks and their gradients
+backward; the gradients home), 3 on `context=2`, where the backward pass shares the
+forward's one step, and 8 all-to-alls under `ulysses`. The temp memory of
+the gradient of one attention at t = 2048 on `context=4`: `xla` 66.0 MiB, `ulysses`
+64.5 MiB (whole rows of a quarter of the heads), `ring` 21.9 MiB (two blocks of keys).
+`tokamax` here is its XLA implementation; `scripts/gpu_smoke/attention.py` runs its
+kernels, and every method, on GPUs.
+
+Not yet: zigzag load balancing (device `c - 1` of the ring attends to `c` blocks,
+device 0 to one), and overlapping each block's transfer with its compute.
+
 ## Mixture of experts
 
 The router runs in the global view: it picks each token's top-k experts, reports the
