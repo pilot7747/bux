@@ -165,9 +165,9 @@ def test_zero_1_keeps_parameters_whole_and_splits_the_optimizer_state():
 
 
 def test_shard_called_eagerly_moves_an_array_onto_the_mesh():
-    with use(data=2, tensor=4):
+    with use(data=2, tensor=4) as mesh:
         x = parallel.shard(jnp.ones((8, 4)), "batch", "mlp")
-    assert x.sharding == NamedSharding(x.sharding.mesh, P("data", "tensor"))
+    assert x.sharding.is_equivalent_to(NamedSharding(mesh, P("data", "tensor")), 2)
 
 
 def test_shard_does_nothing_without_a_mesh():
