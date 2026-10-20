@@ -207,6 +207,7 @@ def test_how_a_run_splits_is_not_in_its_id_but_a_sweep_over_meshes_is_two_runs()
     plain = _run(LLAMA)
     split = _run(LLAMA, "mesh = mesh(fsdp=8)", "layout = layout(seq=none)")
     assert split.id == plain.id
+    assert _run(LLAMA, "precision = precision(compute=bfloat16)").id != plain.id
     a, b = compile_runs(_source(LLAMA, "mesh = dp: mesh(data=8) | fsdp: mesh(fsdp=8)"))
     assert a.id == b.id and a.name != b.name
     [again] = compile_runs(run_to_source(split))

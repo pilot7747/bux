@@ -29,7 +29,7 @@ from typing import Annotated, Literal
 from pydantic import BaseModel, ConfigDict, Field
 
 from bux.config import LayerConfig, ResidualConfig
-from bux.train.config import TrainConfig
+from bux.train.config import PrecisionConfig, TrainConfig
 
 # "streams" is a residual stream widened by the residual algebra (hc, mhc, gr, attnres).
 Width = int | Literal["tokens", "logits", "streams"]
@@ -203,6 +203,7 @@ def strip(node: Node, *, labels: bool = True, widths: bool = True) -> Node:
 
 # Training settings that change how a run is watched or computed, not what it computes.
 _UNCOMPUTED = {"log", "eval", "checkpoint", "mesh", "layout", "methods"}
+_NEWER = {"precision": PrecisionConfig()}
 
 
 class Run(BaseModel):
@@ -228,7 +229,10 @@ class Run(BaseModel):
         sweep, logging, evaluating and checkpointing at other intervals, or another
         mesh, layout or methods keeps it."""
         arch = self.arch.model_copy(update={"graph": strip(self.arch.graph)})
-        train = self.train.model_dump(mode="json", exclude=_UNCOMPUTED)
+        # A setting newer than run ids, at its default, is left out, so that ids made
+        # before it keep resuming.
+        new = {k for k, v in _NEWER.items() if getattr(self.train, k) == v}
+        train = self.train.model_dump(mode="json", exclude=_UNCOMPUTED | new)
         what = {"arch": arch.model_dump(mode="json"), "train": train}
         blob = json.dumps(what, sort_keys=True, separators=(",", ":"))
         return hashlib.sha256(blob.encode()).hexdigest()[:10]
