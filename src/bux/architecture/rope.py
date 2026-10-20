@@ -67,7 +67,7 @@ def rotate(
     positions: Int[Array, "b t"] | None = None,
 ) -> Float[Array, "b t h k"]:
     """Rotate the first `fraction` of each head's dims, paired by `layout`, by the
-    positions of the tokens, or their indices."""
+    positions of the tokens, or their indices: in float32, the result in x's dtype."""
     dims = int(x.shape[-1] * rope.fraction) // 2 * 2
     if dims == 0:
         return x
@@ -86,4 +86,4 @@ def rotate(
     else:
         x1, x2 = x[..., : dims // 2], x[..., dims // 2 :]
         y = jnp.concatenate([x1 * cos - x2 * sin, x2 * cos + x1 * sin], -1)
-    return jnp.concatenate([y, rest], -1)
+    return jnp.concatenate([y.astype(x.dtype), rest], -1)

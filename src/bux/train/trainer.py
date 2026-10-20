@@ -25,11 +25,13 @@ import functools
 import re
 from collections.abc import Callable, Iterable, Iterator, Mapping, Sequence
 from pathlib import Path
-from typing import Any
+from typing import Any, Protocol, runtime_checkable
 
+import jax
 import jax.numpy as jnp
 import optax
 from flax import nnx
+from jax.typing import DTypeLike
 from jaxtyping import Array, Float
 
 from bux import parallel
@@ -40,7 +42,7 @@ from bux.lang import ir
 from bux.lang.printer import run_to_source
 from bux.train.data import Batch, batches
 from bux.train.hooks import Checkpoint, Eval, Hook, Log, Metrics
-from bux.train.objective import Objective, objective
+from bux.train.objective import Objective, objective, targets
 from bux.train.optim import Schedule, optimizer, peak, schedule
 from bux.train.sinks import JSONL, Console, Latest, Sink, primary
 
@@ -58,23 +60,96 @@ def training_forward(
     return model.training_outputs(tokens, positions)
 
 
+def cast[M: nnx.Module](model: M, dtype: DTypeLike) -> M:
+    """A copy of `model`, its floating-point parameters in `dtype` and the rest of its
+    state as it is. Gradients through it reach the parameters in their own dtype."""
+    graphdef, params, rest = nnx.split(model, nnx.Param, ...)
+    params = jax.tree.map(
+        lambda x: x.astype(dtype) if jnp.issubdtype(x.dtype, jnp.floating) else x,
+        params,
+    )
+    return nnx.merge(graphdef, params, rest)
+
+
+@runtime_checkable
+class Settles(Protocol):
+    """A module that learns from a step's batch other than by gradients, as an MoE
+    moves its router bias. A training step sets `deferred`: the forwards of all its
+    microbatches count what they see, and `settle` applies it once, after them.
+    Outside a step, a training forward applies it at once."""
+
+    deferred: bool
+
+    def settle(self) -> None: ...
+
+
+def settle(model: nnx.Module) -> None:
+    """Every module's `settle`, once a step, after its forwards."""
+    for _, m in nnx.iter_modules(model):
+        if isinstance(m, Settles):
+            m.settle()
+
+
+def shares(batch: Batch, n: int) -> Float[Array, " n"]:
+    """Each of `n` microbatches' share of the targets of `batch` (the first head's),
+    or 1 / n each if it has none."""
+    counts = parallel.microbatches(targets(batch), n).sum((1, 2))
+    total = counts.sum()
+    return jnp.where(total > 0, counts / jnp.maximum(total, 1), 1 / n)
+
+
+def weigh(
+    total: Float[Array, ""],
+    metrics: Metrics,
+    reported: Sequence[Loss],
+    share: Float[Array, ""],
+    n: int,
+) -> tuple[Float[Array, ""], Metrics]:
+    """A microbatch's part of the objective of a batch of `n`: the objective's terms,
+    means over targets, by the microbatch's `share` of the targets; what the layers
+    report, by its share of the rows, 1 / n."""
+    theirs = sum((weight * value for _, weight, value in reported), jnp.zeros(()))
+    rows = {name for name, _, _ in reported}
+    metrics = {k: v * (1 / n if k in rows else share) for k, v in metrics.items()}
+    return share * (total - theirs) + theirs / n, metrics
+
+
+def _on_shards(state: nnx.State) -> nnx.State:
+    """`state`, constrained to the shardings of its variables, on a mesh."""
+    if parallel.active() is None:
+        return state
+    return jax.lax.with_sharding_constraint(state, parallel.shardings(state))
+
+
 class Trainer:
     """A model, the optimizer that trains it with `tx`, and the objective it
     minimizes, `step` steps in.
 
     `train_step` and `eval_step` are compiled once, so a subclass that overrides them
-    changes what a step does (accumulates gradients, keeps an average of the weights,
-    skips a spike) and keeps the loop, hooks and checkpoints. They get the model and
-    the optimizer as arguments, which is how nnx.jit sees them change.
+    changes what a step does (keeps an average of the weights, skips a spike) and
+    keeps the loop, hooks and checkpoints. They get the model and the optimizer as
+    arguments, which is how nnx.jit sees them change.
+
+    Both compute in `compute`, the model's parameters cast to it inside the loss, so
+    that the parameters, their gradients and the optimizer's state stay as they are
+    (float32). A step takes its batch in `microbatches` (gradient accumulation): a
+    scan over them, one gradient, one update.
 
     Made inside ``parallel.use``, it puts its state on the shardings the layout gives
     it, and every step keeps it there.
     """
 
     def __init__(
-        self, model: Model, tx: optax.GradientTransformation, objective: Objective
+        self,
+        model: Model,
+        tx: optax.GradientTransformation,
+        objective: Objective,
+        *,
+        compute: DTypeLike = jnp.float32,
+        microbatches: int = 1,
     ):
         self.model, self.objective = model, objective
+        self.compute, self.microbatches = jnp.dtype(compute), microbatches
         self.optimizer = nnx.Optimizer(model, tx, wrt=nnx.Param)
         parallel.place(self.model, self.optimizer)
         self.step = 0
@@ -94,18 +169,72 @@ class Trainer:
     ) -> Metrics:
         """The objective's gradient on `batch`, applied: the objective's terms, and
         the gradient's norm."""
-
-        def loss(model: Model) -> tuple[Float[Array, ""], Metrics]:
-            logits, reported = training_forward(model, batch)
-            return self.objective(logits, batch, reported)
-
-        (_, metrics), grads = nnx.value_and_grad(loss, has_aux=True)(model)
+        grads, metrics = self.gradients(model, batch)
         optimizer.update(model, grads)
         return metrics | {"grad_norm": optax.tree.norm(grads)}
 
+    def gradients(self, model: Model, batch: Batch) -> tuple[nnx.State, Metrics]:
+        """The objective's gradient on `batch`, and its terms: the sums of
+        `microbatches` parts (``weigh``), so that the loss is the batch's. The
+        forwards update the model's other state in turn, and then every module
+        ``settle``s."""
+        graphdef, params, rest = nnx.split(model, nnx.Param, ...)
+        if self.microbatches == 1:
+            grads, metrics, rest = self._microbatch(graphdef, params, rest, batch)
+        else:
+            grads, metrics, rest = self._accumulate(graphdef, params, rest, batch)
+        nnx.update(model, rest)
+        settle(model)
+        return grads, metrics
+
+    def _accumulate(
+        self, graphdef: nnx.GraphDef, params: nnx.State, rest: nnx.State, batch: Batch
+    ) -> tuple[nnx.State, Metrics, nnx.State]:
+        """`_microbatch` on each of the batch's microbatches in turn, summed."""
+
+        def one(
+            carry: tuple[nnx.State, nnx.State],
+            part: tuple[Batch, Float[Array, ""]],
+        ) -> tuple[tuple[nnx.State, nnx.State], Metrics]:
+            total, rest = carry
+            grads, metrics, rest = self._microbatch(graphdef, params, rest, *part)
+            return (jax.tree.map(jnp.add, total, grads), rest), metrics
+
+        n = self.microbatches
+        parts = (parallel.microbatches(batch, n), shares(batch, n))
+        zeros = _on_shards(jax.tree.map(jnp.zeros_like, params))
+        (grads, rest), metrics = jax.lax.scan(one, (zeros, rest), parts)
+        return grads, {k: v.sum() for k, v in metrics.items()}, rest
+
+    def _microbatch(
+        self,
+        graphdef: nnx.GraphDef,
+        params: nnx.State,
+        rest: nnx.State,
+        batch: Batch,
+        share: Float[Array, ""] | None = None,
+    ) -> tuple[nnx.State, Metrics, nnx.State]:
+        """The objective's gradient on `batch` and its terms, computed in `compute`,
+        as the part of the step's that `share` of its targets makes (``weigh``); and
+        the model's other state after the forward."""
+
+        def loss(params: nnx.State) -> tuple[Float[Array, ""], tuple[Metrics, Any]]:
+            model = cast(nnx.merge(graphdef, params, rest, copy=True), self.compute)
+            model.set_attributes(deferred=True, raise_if_not_found=False)
+            logits, reported = training_forward(model, batch)
+            total, metrics = self.objective(logits, batch, reported)
+            if share is not None:
+                n = self.microbatches
+                total, metrics = weigh(total, metrics, reported, share, n)
+            return total, (metrics, nnx.state(model, nnx.Not(nnx.Param)))
+
+        (_, (metrics, rest)), grads = jax.value_and_grad(loss, has_aux=True)(params)
+        return grads, metrics, rest
+
     def eval_step(self, model: Model, batch: Batch) -> Float[Array, ""]:
-        """The first head's loss on `batch`."""
-        return self.objective(forward(model, batch), batch)[1]["loss"]
+        """The first head's loss on `batch`, computed in `compute`."""
+        logits = forward(cast(model, self.compute), batch)
+        return self.objective(logits, batch)[1]["loss"]
 
     def update(self, batch: Batch) -> Metrics:
         """Take a step on `batch`."""
@@ -194,7 +323,13 @@ def train(
         model = parallel.build(lambda: Model(run.arch, rngs=nnx.Rngs(t.seed)))
         multiplier = schedule(t.schedule, t.steps)
         tx = optimizer(t.optimizer, multiplier, model, t.clip)
-        trainer = Trainer(model, tx, objective(t.loss, run.arch))
+        trainer = Trainer(
+            model,
+            tx,
+            objective(t.loss, run.arch),
+            compute=t.precision.compute,
+            microbatches=t.methods.microbatches,
+        )
         read = functools.partial(batches, t=t, vocab_size=vocab, cache=cache)
         lr = peak(t.optimizer.lr, multiplier)
         own = _hooks(run, trainer, folder, lr, read, echo)

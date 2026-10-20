@@ -166,6 +166,7 @@ def test_zero_1_keeps_parameters_whole_and_splits_the_optimizer_state():
 def test_shard_called_eagerly_moves_an_array_onto_the_mesh():
     with use(data=2, tensor=4):
         x = parallel.shard(jnp.ones((8, 4)), "batch", "mlp")
+    assert isinstance(x.sharding, jax.sharding.NamedSharding)
     assert x.sharding.spec == P("data", "tensor")
 
 

@@ -13,7 +13,8 @@ rest. Every parameter's largest whole dimension also splits over `fsdp`. Outside
     mesh      the device grid                     AXES, mesh, active
     settings  a run's settings in force           use, check
     layout    names, resolved to mesh axes        named, spec, shard, stream
-    place     where state and batches live        shardings, build, place, rows
+    place     where state and batches live        shardings, build, place, rows,
+                                                  microbatches
     methods   a registry per kind of method       method
 
 docs/parallelism.md explains them.
@@ -23,7 +24,7 @@ from bux.parallel import methods
 from bux.parallel.layout import DIMENSIONS, NAMES, Name, named, shard, spec, stream
 from bux.parallel.mesh import AXES, active, mesh, sizes
 from bux.parallel.methods import method
-from bux.parallel.place import build, place, rows, shardings
+from bux.parallel.place import build, microbatches, place, rows, shardings
 from bux.parallel.settings import check, use
 
 # isort: split
@@ -44,6 +45,7 @@ __all__ = [
     "mesh",
     "method",
     "methods",
+    "microbatches",
     "named",
     "pipeline",
     "place",
