@@ -7,6 +7,7 @@ from typing import TYPE_CHECKING
 from flax import nnx
 from jaxtyping import Array, Int, Shaped
 
+from bux.architecture.segments import Segments
 from bux.lang import ir
 
 if TYPE_CHECKING:
@@ -18,13 +19,18 @@ if TYPE_CHECKING:
 Stream = Shaped[Array, "*_"]
 Taps = dict[str, list]
 # Reserved tap keys, which no tap name can collide with.
-TOKENS, POSITIONS, OUTPUTS, NEXTN = "<tokens>", "<positions>", "<outputs>", "<nextn>"
+TOKENS, SEGMENTS, OUTPUTS, NEXTN = "<tokens>", "<segments>", "<outputs>", "<nextn>"
+
+
+def segments(taps: Taps | None) -> Segments | None:
+    """The documents of the rows; None when every row is one document."""
+    return taps[SEGMENTS][0] if taps and SEGMENTS in taps else None
 
 
 def positions(taps: Taps | None) -> Int[Array, "b t"] | None:
-    """Where each token is in its document, so a 0 starts one; None when every row is
-    one document."""
-    return taps[POSITIONS][0] if taps and POSITIONS in taps else None
+    """Where each token is in its document; None when every row is one document."""
+    s = segments(taps)
+    return None if s is None else s.positions
 
 
 @dataclass

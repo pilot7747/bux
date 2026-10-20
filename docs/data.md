@@ -31,16 +31,18 @@ A row is three arrays of `seq_len`:
 | array          | what                                                                 |
 |----------------|----------------------------------------------------------------------|
 | `input_ids`    | tokens                                                               |
-| `position_ids` | where each token is in its document: a 0 starts one                  |
+| `position_ids` | where each token is in its document, until they stop increasing      |
 | `loss_mask`    | whether a token is a target: false for prompts, padding, templates   |
 
-Positions say everything about the packing. The model rotates and embeds by them, and
-attends, convolves and hashes n-grams only within a document, which starts at a 0.
-The loss of a head that predicts `k` tokens ahead is on token `t + k` from position
-`t` when `loss_mask[t + k]` and `position_ids[t + k] >= k`: a target of the document
-that predicts it, never the first token of the next one. It is the mean over every
-target of the batch, so that a row of many short replies weighs no more than a row
-of one long one.
+Positions say everything about the packing. A document starts at a row's first token
+and wherever positions stop increasing, as at the 0 after a document. The model
+rotates and embeds by them, and attends, convolves and hashes n-grams only within a
+document. The loss of a head that predicts `k` tokens ahead is on token `t + k` from
+position `t` when `loss_mask[t + k]` and token `t + k` is in the document of token
+`t`: a target of the document that predicts it, never the first token of the next
+one. It is the mean over every target of the batch, so that a row of many short
+replies weighs no more than a row of one long one; the z-loss is the mean over the
+same positions of the first head.
 
 ## Documents
 
@@ -183,8 +185,12 @@ engine, splits need no bookkeeping, and the reduce's output depends on nothing b
 its chunk.
 
 **Positions, not segment ids.** Resetting positions per document carries the
-segments (a 0 starts one) and the positions RoPE needs in one array; segment ids
-for a varlen or splash attention kernel are a cumulative sum of `position_ids == 0`.
+segments and the positions RoPE needs in one array. The model makes the rest from
+them once a forward pass (`bux.architecture.Segments`): a document id a token, the
+segment ids that splash and Pallas flash attention take in place of a t by t mask,
+and how far each token is into its document, where convolutions and the loss stop,
+and where each query's first key is for kernels that take that (tokamax's). The
+`cu_seqlens` of varlen kernels are where the ids change.
 
 **Packings considered.** First-fit decreasing (Axolotl's multipack, NeMo) and
 shortest-pack-first histogram packing (Krell et al., 2021) pack about as well as best

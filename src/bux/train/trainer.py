@@ -64,6 +64,7 @@ class Trainer:
         self.model, self.objective = model, objective
         self.optimizer = nnx.Optimizer(model, tx, wrt=nnx.Param)
         self.step = 0
+        self.stopping = False  # set, by a signal handler say, to stop after this step
         self._train = nnx.jit(self.train_step)
         self._eval = nnx.jit(self.eval_step)
 
@@ -115,20 +116,24 @@ class Trainer:
         hooks: Sequence[Hook] = (),
         sinks: Sequence[Sink] = (),
     ) -> None:
-        """Train on `data` to step `steps`. After every step, the hooks due run in
-        order, and what they report goes to every sink. All of them close at the end,
-        or when training stops."""
+        """Train on `data` to step `steps`, or until `stopping` is set, after which
+        every hook's `stop` runs. After every step, the hooks due run in order, and
+        what they report goes to every sink. All of them close at the end, or when
+        training stops."""
         with contextlib.ExitStack() as stack:
             for part in (*sinks, *hooks):
                 stack.callback(part.close)
             for hook in hooks:
                 hook.start(self)
-            while self.step < steps:
+            while self.step < steps and not self.stopping:
                 metrics = self.update(next(data))
                 for hook in hooks:
                     if hook.due(self.step, steps) and (report := hook(self, metrics)):
                         for sink in sinks:
                             sink.write(self.step, report)
+            if self.step < steps:
+                for hook in hooks:
+                    hook.stop(self)
 
 
 def directory(run: ir.Run, out: str | Path) -> Path:

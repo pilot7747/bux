@@ -12,8 +12,9 @@ from bux import config as cfg
 from bux.architecture.conv import CausalConv
 from bux.architecture.functional import activation, softcap
 from bux.architecture.norm import Norm
-from bux.architecture.registry import Context, Taps, positions, register
+from bux.architecture.registry import Context, Taps, register, segments
 from bux.architecture.rope import logit_gain, rotate
+from bux.architecture.segments import Segments
 from bux.lang import ir
 
 
@@ -72,6 +73,9 @@ class Attention(nnx.Module):
 
     Shapes: b rows, t queries and s keys (the same positions), d the width, h heads and
     g kv heads, k and v the head dims of keys and values.
+
+    `_attend` is where a fused kernel goes: what it needs of packed rows is
+    `Segments.ids`, a document id a token, and no t by t mask.
     """
 
     def __init__(
@@ -124,7 +128,8 @@ class Attention(nnx.Module):
         self.gate_activation = c.gate_activation
 
     def __call__(self, x: Float[Array, "b t d"], taps: Taps) -> Float[Array, "b t d"]:
-        pos = positions(taps)
+        docs = segments(taps)
+        pos = None if docs is None else docs.positions
         q, *kv = self._projections(x)
         q = self._queries(q, pos)
         k, v = self._keys_and_values(*kv, taps) if kv else _read(taps, self.ports, "kv")
@@ -132,13 +137,25 @@ class Attention(nnx.Module):
             v = self.v_mix * v + (1 - self.v_mix) * _read(taps, self.ports, "v")
         _write(taps, self.ports, "v", v)
         _write(taps, self.ports, "kv", (k, v))
-        logits = self._logits(x, q, k, pos)
+        return self._output(x, self._attend(x, q, k, v, docs))
+
+    def _attend(
+        self,
+        x: Float[Array, "b t d"],
+        q: Float[Array, "b t h k"],
+        k: Float[Array, "b s g k"],
+        v: Float[Array, "b s g v"],
+        docs: Segments | None,
+    ) -> Float[Array, "b t h v"]:
+        """Every query's average of the values of the keys it sees, by the softmax of
+        their logits. This makes all t by t logits, and the mask with them; a flash
+        kernel skips the blocks no query sees, by the documents' ids."""
+        logits = self._logits(x, q, k, docs)
         if self.sinks is not None:
             probs = _softmax_with_sinks(logits, self.sinks[...])
         else:
             probs = jax.nn.softmax(logits)
-        out = jnp.einsum("bhts,bshd->bthd", probs, self._per_query_head(v))
-        return self._output(x, out)
+        return jnp.einsum("bhts,bshd->bthd", probs, self._per_query_head(v))
 
     def _projections(self, x: Float[Array, "b t d"]) -> list[Float[Array, "b t _"]]:
         """The projected queries, then keys and values unless the layer reads them from
@@ -172,7 +189,8 @@ class Attention(nnx.Module):
         if self.k_norm is not None:
             k = self.k_norm(k)
         if self.rope is not None:
-            k = rotate(k, self.rope, positions(taps))
+            docs = segments(taps)
+            k = rotate(k, self.rope, None if docs is None else docs.positions)
         return k, v
 
     def _per_query_head(self, kv: Float[Array, "b s g e"]) -> Float[Array, "b s h e"]:
@@ -184,7 +202,7 @@ class Attention(nnx.Module):
         x: Float[Array, "b t d"],
         q: Float[Array, "b t h k"],
         k: Float[Array, "b s g k"],
-        pos: Int[Array, "b t"] | None,
+        docs: Segments | None,
     ) -> Float[Array, "b h t s"]:
         """The logits, at the dtype's minimum for keys a query does not see: later ones,
         and those of other documents."""
@@ -198,15 +216,15 @@ class Attention(nnx.Module):
             r = self.rel_proj(x).reshape(b, t, self.heads, -1)
             logits = logits + _relative_bias(r, self.rel_table[...], offset)
         if self.log_scale is not None:
-            at = index if pos is None else pos[:, None]
+            at = index if docs is None else docs.positions[:, None]
             logits *= _length_scale(at, self.log_scale, self.log_scale_floor)
         logits = softcap(logits, self.softcap)
         visible = offset >= 0
         if self.window is not None:
             visible &= offset < self.window
-        if pos is not None:
-            doc = jnp.cumsum(pos == 0, axis=-1)
-            visible = visible & (doc[:, None, :, None] == doc[:, None, None, :])
+        if docs is not None:
+            ids = docs.ids
+            visible = visible & (ids[:, None, :, None] == ids[:, None, None, :])
         return jnp.where(visible, logits, jnp.finfo(logits.dtype).min)
 
     def _output(

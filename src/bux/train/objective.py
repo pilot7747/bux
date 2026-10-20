@@ -14,8 +14,9 @@ from typing import NamedTuple
 import jax
 import jax.numpy as jnp
 import optax
-from jaxtyping import Array, Float
+from jaxtyping import Array, Bool, Float
 
+from bux.architecture.segments import Segments
 from bux.lang import ir
 from bux.train import config as tcfg
 from bux.train.data import Batch
@@ -52,7 +53,7 @@ def objective(c: tcfg.LossConfig, arch: ir.Architecture) -> Objective:
     ahead = lookahead(arch)
     terms = {"loss": Term(1.0, lambda logits, b: cross_entropy(logits[0], b, ahead[0]))}
     if c.z:
-        terms["z_loss"] = Term(c.z, lambda logits, b: z_loss(logits[0]))
+        terms["z_loss"] = Term(c.z, lambda logits, b: z_loss(logits[0], targets(b)))
     if len(ahead) > 1:
 
         def mtp(logits: Logits, b: Batch) -> Float[Array, ""]:
@@ -74,20 +75,36 @@ def lookahead(arch: ir.Architecture) -> list[int]:
     return ahead or [1]
 
 
+def targets(batch: Batch, ahead: int = 1) -> Bool[Array, "b _"]:
+    """Whether each position t but the row's last `ahead` predicts a target: token
+    t + ahead is one (by loss_mask), and of t's own document."""
+    within = Segments.of(jnp.asarray(batch.position_ids)).within
+    return jnp.asarray(batch.loss_mask[:, ahead:]) & (within[:, ahead:] >= ahead)
+
+
+def _mean(values: Float[Array, "b t"], weight: Bool[Array, "b _"]) -> Float[Array, ""]:
+    """The mean of the first values of each row, where `weight` is true."""
+    values = values[:, : weight.shape[1]]
+    return jnp.sum(values * weight) / jnp.maximum(jnp.sum(weight), 1)
+
+
 def cross_entropy(
     logits: Float[Array, "b t vocab"], batch: Batch, ahead: int = 1
 ) -> Float[Array, ""]:
-    """The mean loss of logits over positions t that predict a target, token t + ahead,
-    of their own document: at least `ahead` tokens into it. A position with nothing
-    that far ahead in its row, or in its document, is left out."""
-    targets = batch.input_ids[:, ahead:]
-    weight = batch.loss_mask[:, ahead:] & (batch.position_ids[:, ahead:] >= ahead)
+    """The mean loss of logits over positions t that predict a target, token t + ahead.
+    A position with nothing that far ahead in its row, or in its document, is left
+    out."""
+    weight = targets(batch, ahead)
     loss = optax.softmax_cross_entropy_with_integer_labels(
-        logits[:, : targets.shape[1]].astype(jnp.float32), targets
+        logits[:, : weight.shape[1]].astype(jnp.float32), batch.input_ids[:, ahead:]
     )
-    return jnp.sum(loss * weight) / jnp.maximum(jnp.sum(weight), 1)
+    return _mean(loss, weight)
 
 
-def z_loss(logits: Float[Array, "b t vocab"]) -> Float[Array, ""]:
-    """The mean of log(Z)^2, which keeps the softmax's normalizer near 1 (PaLM)."""
-    return jnp.mean(jax.nn.logsumexp(logits.astype(jnp.float32), axis=-1) ** 2)
+def z_loss(
+    logits: Float[Array, "b t vocab"], weight: Bool[Array, "b _"] | None = None
+) -> Float[Array, ""]:
+    """The mean of log(Z)^2, which keeps the softmax's normalizer near 1 (PaLM), over
+    the positions `weight` says, as `targets` does, or all of them."""
+    z = jax.nn.logsumexp(logits.astype(jnp.float32), axis=-1) ** 2
+    return jnp.mean(z) if weight is None else _mean(z, weight)

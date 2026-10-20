@@ -29,9 +29,10 @@ Fraction = Annotated[float, Field(ge=0, le=1)]
 
 # --- Data ---------------------------------------------------------------------------
 # A source is an endless stream of rows of seq_len tokens: input_ids, position_ids
-# (where each token is in its document, so a 0 starts one) and loss_mask (whether
-# each token is a target). Documents, `text` and `chat`, become rows once, when
-# bux.data tokenizes and packs them; `tokens` and `synthetic` are rows already.
+# (where each token is in its document, so one starts wherever they stop increasing)
+# and loss_mask (whether each token is a target). Documents, `text` and `chat`,
+# become rows once, when bux.data tokenizes and packs them; `tokens` and `synthetic`
+# are rows already.
 
 
 def _ordered(split: tuple[float, float]) -> tuple[float, float]:

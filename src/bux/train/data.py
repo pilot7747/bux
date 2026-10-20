@@ -1,11 +1,11 @@
 """Batches of rows, from prepared datasets, token shards, random tokens, or mixtures.
 
 A row is seq_len tokens: input_ids, position_ids (where each token is in its
-document, so a 0 starts one) and loss_mask (whether each token is a target). Every
-source is an endless stream of rows, each epoch in a new order. Batch i holds rows
-i * n to (i + 1) * n of each source, n of them in proportion to its weight, so it
-depends only on the seed and i: a run that resumes at step i reads what it would
-have read had it never stopped.
+document, so one starts wherever they stop increasing) and loss_mask (whether each
+token is a target). Every source is an endless stream of rows, each epoch in a new
+order. Batch i holds rows i * n to (i + 1) * n of each source, n of them in
+proportion to its weight, so it depends only on the seed and i: a run that resumes
+at step i reads what it would have read had it never stopped.
 
 A source is found by its config's type in ``sources``.
 """

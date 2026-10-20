@@ -240,6 +240,11 @@ def prepare(
             "stats": stats,
         }
         (out / "dataset.json").write_text(json.dumps(meta, indent=2), encoding="utf-8")
-        out.rename(folder)
+        try:
+            out.rename(folder)
+        except OSError:  # another process, a task of the same array job say, was first
+            if not (folder / "dataset.json").exists():
+                raise
+            return folder
     echo(summary(job.name, stats, job.seq_len, time.perf_counter() - clock))
     return folder

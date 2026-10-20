@@ -37,11 +37,14 @@ optimizer.lr      = 1e-3 | 3e-3                 # 3 × 2 = 6 runs
 uv run bux plan experiments/attention_ablation.bux   # the 6 runs, their sizes and budgets
 uv run bux train experiments/smoke.bux               # a few seconds on a laptop
 uv run bux train experiments/smoke.bux 'optimizer = muon(lr=0.02)' steps=100
+uv run bux launch experiments/attention_ablation.bux # the 6 runs, a GPU each
 ```
 
 Every setting is checked before anything runs, at the line that wrote it, and every
-run directory keeps the run as one self-contained `run.bux`. See the
-[training guide](docs/training.md).
+run directory keeps the run as one self-contained `run.bux`. `bux launch` is the
+entrypoint for production: it trains a sweep a run per GPU, records how every run went,
+stops at SIGTERM with a checkpoint, and, launched again, trains only what is left. See
+the [training guide](docs/training.md).
 
 ## Data
 
@@ -81,9 +84,15 @@ The image runs JAX on CUDA 13 for Blackwell and Hopper GPUs, with
 [tokamax](https://github.com/openxla/tokamax) kernels, as the non-root user `bux` (UID 1000).
 It needs an NVIDIA driver 580 or newer and the NVIDIA Container Toolkit.
 
+Its entrypoint is `bux launch`, which takes a `.bux` file and trains it; with none, it
+trains the smoke run. Mount `data/` and `runs/` to keep what it prepares and trains:
+
 ```sh
 docker build -t bux .
-docker run --rm --gpus all bux python main.py
+docker run --rm --gpus all bux
+docker run --rm --gpus all -v "$PWD/data:/opt/bux/data" -v "$PWD/runs:/opt/bux/runs" \
+  bux experiments/speedrun.bux
+docker run --rm -it --entrypoint bash bux    # a shell, or --entrypoint bux for the CLI
 ```
 
 To publish it to `ghcr.io/pilot7747/bux` for amd64 and arm64, run the Docker workflow from

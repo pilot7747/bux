@@ -13,7 +13,9 @@ a subclass:
 
     train(run, hooks=[WeightNorm()])
 
-Hooks run in order, so the run's own (log, eval, checkpoint) see a step first.
+Hooks run in order, so the run's own (log, eval, checkpoint) see a step first. When
+training stops early (``Trainer.stopping``, which the launcher sets at SIGTERM), every
+hook's `stop` runs at the step it stopped at, and the checkpoint hook saves it.
 """
 
 import itertools
@@ -50,6 +52,9 @@ class Hook:
     def __call__(self, trainer: "Trainer", metrics: Metrics) -> Report | None:
         """After a step that it is due at, with what the step measured."""
         raise NotImplementedError
+
+    def stop(self, trainer: "Trainer") -> None:
+        """When training stops before the last step, at the step it stopped at."""
 
     def close(self) -> None:
         """After the last step, or when training stops."""
@@ -94,8 +99,8 @@ class Eval(Hook):
 
 
 class Checkpoint(Hook):
-    """The trainer's state, saved under `folder` at its step; the `keep` most recent
-    checkpoints stay."""
+    """The trainer's state, saved under `folder` at its step, and at the step training
+    stops at if it stops early; the `keep` most recent checkpoints stay."""
 
     def __init__(self, folder: Path, *, every: int, keep: int):
         self.every = every
@@ -113,6 +118,9 @@ class Checkpoint(Hook):
 
     def __call__(self, trainer: "Trainer", metrics: Metrics) -> None:
         self.manager.save(trainer.step, args=ocp.args.StandardSave(trainer.state()))
+
+    def stop(self, trainer: "Trainer") -> None:
+        self(trainer, {})  # unless the step is saved already, which orbax skips
 
     def close(self) -> None:
         self.manager.wait_until_finished()

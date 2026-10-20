@@ -1,8 +1,13 @@
-"""bux check|plan|prepare|train|render|fmt|json FILE [SETTING=VALUE ...] [--entry NAME]
+"""bux check|plan|prepare|train|launch|render|fmt|json FILE [SETTING=VALUE ...] [--entry NAME]
 
 Settings after the file redefine the file's own, as a last layer over it would:
 ``bux train speedrun.bux optimizer.lr=0.03 'steps = 2k'``. Alternatives there make a
 sweep, as in a file: ``'optimizer.lr = 0.01 | 0.03'``.
+
+``bux train`` trains the runs in this process, one after another. ``bux launch`` is
+the entrypoint for production (``bux.launch``): it trains a sweep a run a GPU, records
+what each run did, trains again only what is not done, and stops at SIGTERM with a
+checkpoint.
 """
 
 import argparse
@@ -89,7 +94,16 @@ def main(argv: list[str] | None = None) -> int:
     )
     parser.add_argument(
         "command",
-        choices=["check", "plan", "prepare", "train", "render", "fmt", "json"],
+        choices=[
+            "check",
+            "plan",
+            "prepare",
+            "train",
+            "launch",
+            "render",
+            "fmt",
+            "json",
+        ],
     )
     parser.add_argument("file")
     parser.add_argument(
@@ -107,18 +121,30 @@ def main(argv: list[str] | None = None) -> int:
         help="render: draw blocks inline instead of separately",
     )
     parser.add_argument(
-        "--out", default="runs", help="train: where run directories go (default: runs)"
+        "--out",
+        default="runs",
+        help="train, launch: where run directories go (default: runs)",
     )
     parser.add_argument(
-        "--only", metavar="TEXT", help="train: only the runs whose name contains TEXT"
+        "--only",
+        metavar="TEXT",
+        help="train, launch: only the runs whose name contains TEXT",
+    )
+    parser.add_argument(
+        "--index",
+        type=int,
+        help="train, launch: only the run at INDEX, from 0, in the order bux plan lists "
+        "them; $SLURM_ARRAY_TASK_ID or $JOB_COMPLETION_INDEX in an array job",
     )
     parser.add_argument(
         "--cache",
         default="data/packed",
-        help="prepare, train: where prepared datasets go (default: data/packed)",
+        help="prepare, train, launch: where prepared datasets go (default: data/packed)",
     )
     parser.add_argument(
-        "--workers", type=int, help="prepare: processes (default: one a core)"
+        "--workers",
+        type=int,
+        help="prepare, launch: processes that prepare data (default: one a core)",
     )
     args = parser.parse_args(argv)
     for setting in args.settings:
@@ -165,15 +191,32 @@ def main(argv: list[str] | None = None) -> int:
                 return 1
             for job in todo:
                 print(prepare(job, args.cache, workers=args.workers))
-        case "train":
+        case "train" | "launch":
             if not runs:
                 print("this file does not say how to train its model", file=sys.stderr)
                 return 1
+            if args.index is not None:
+                if not 0 <= args.index < len(runs):
+                    s = "s" if len(runs) != 1 else ""
+                    print(
+                        f"--index {args.index}, but the file makes {len(runs)} run{s}",
+                        file=sys.stderr,
+                    )
+                    return 1
+                runs = runs[args.index : args.index + 1]
+            if args.only is not None:
+                runs = [run for run in runs if args.only in run.name]
+                if not runs:
+                    print(f"no run's name contains {args.only!r}", file=sys.stderr)
+                    return 1
+            if args.command == "launch":
+                from bux.launch import launch
+
+                return launch(runs, args.out, cache=args.cache, workers=args.workers)
             from bux.train.trainer import train
 
             for run in runs:
-                if args.only is None or args.only in run.name:
-                    train(run, args.out, cache=args.cache)
+                train(run, args.out, cache=args.cache)
         case "render":
             print(render(arch, expand=args.expand), end="")
         case "fmt":

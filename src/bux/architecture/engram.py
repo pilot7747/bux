@@ -12,7 +12,7 @@ from jaxtyping import Array, ArrayLike, Float, Int, Int32, UInt32
 from bux import config as cfg
 from bux.architecture.conv import CausalConv
 from bux.architecture.norm import Norm
-from bux.architecture.registry import TOKENS, Context, Taps, positions, register
+from bux.architecture.registry import TOKENS, Context, Taps, register, segments
 from bux.lang import ir
 
 
@@ -35,14 +35,14 @@ def _ngram_rows(
     offsets: UInt32[Array, "n-1 heads"],
     boundary: int | None,
     pad: Int[ArrayLike, ""],
-    docs: Int[Array, "b t"] | None = None,
+    within: Int[Array, "b t"] | None = None,
 ) -> Int32[Array, "b t (n-1)*heads"]:
     """Table rows of the n-grams of 2 to n ids ending at every position, one a head.
 
     The n-gram of the last j + 1 ids hashes to XOR_{i <= j} ids[t - i] * m_i, in wrapping
-    uint32 arithmetic. Positions before the sequence, before the document (by `docs`,
-    the positions in it), or at and before the last boundary token before t, count as
-    `pad`, so that n-grams do not cross documents.
+    uint32 arithmetic. Positions before the sequence, before the document (by `within`,
+    how many tokens of it come before each), or at and before the last boundary token
+    before t, count as `pad`, so that n-grams do not cross documents.
     """
     b, t = ids.shape
     pos = jnp.arange(t)
@@ -50,8 +50,8 @@ def _ngram_rows(
     if boundary is not None:
         after = jnp.where(tokens == boundary, pos + 1, 0)
         start = jnp.pad(jax.lax.cummax(after, axis=1)[:, :-1], ((0, 0), (1, 0)))
-    if docs is not None:
-        start = jnp.maximum(start, pos - docs)
+    if within is not None:
+        start = jnp.maximum(start, pos - within)
     h, rows = jnp.zeros((b, t), jnp.uint32), []
     for i in range(multipliers.shape[0]):
         prev = jnp.take(ids, jnp.maximum(pos - i, 0), axis=1)
@@ -120,6 +120,7 @@ class Engram(nnx.Module):
         ids, pad = tokens, self.boundary or 0
         if self.classes is not None:
             ids, pad = self.classes[...][tokens], self.classes[...][pad]
+        docs = segments(taps)
         rows = _ngram_rows(
             ids,
             tokens,
@@ -128,7 +129,7 @@ class Engram(nnx.Module):
             self.offsets[...],
             self.boundary,
             pad,
-            positions(taps),
+            None if docs is None else docs.within,
         )
         h = x if x.ndim == 4 else x[..., None, :]
         (b, t, n, d), kv = (

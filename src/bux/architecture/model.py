@@ -5,7 +5,8 @@ from flax import nnx
 from jaxtyping import Array, Float, Int
 
 from bux.architecture.graph import build_node
-from bux.architecture.registry import OUTPUTS, POSITIONS, TOKENS, Context, Taps
+from bux.architecture.registry import OUTPUTS, SEGMENTS, TOKENS, Context, Taps
+from bux.architecture.segments import Segments
 from bux.lang import ir
 
 
@@ -15,7 +16,8 @@ class Model(nnx.Module):
     Every head is an output. ``outputs`` returns them all in execution order; head j
     predicts the token 1 + k positions ahead, where k counts the nextn layers run before it.
     Rows can hold several documents: given positions, the offsets of every token in its
-    document, each one is attended to, convolved and embedded on its own.
+    document, a document starts wherever they stop increasing, and each one is attended
+    to, convolved and embedded on its own (``Segments``).
     """
 
     def __init__(self, arch: ir.Architecture, *, rngs: nnx.Rngs):
@@ -30,7 +32,7 @@ class Model(nnx.Module):
     ) -> list[Float[Array, "b t vocab"]]:
         taps: Taps = {TOKENS: [tokens]}
         if positions is not None:
-            taps[POSITIONS] = [positions]
+            taps[SEGMENTS] = [Segments.of(positions)]
         last = self.graph(tokens, taps)
         return taps.get(OUTPUTS) or [last]
 

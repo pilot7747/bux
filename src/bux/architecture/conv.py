@@ -8,7 +8,7 @@ from flax import nnx
 from jaxtyping import Array, Float
 
 from bux import config as cfg
-from bux.architecture.registry import Context, Taps, positions, register
+from bux.architecture.registry import Context, Taps, register, segments
 from bux.lang import ir
 
 
@@ -36,11 +36,12 @@ class CausalConv(nnx.Module):
         size, t, r = self.weight.shape[0], x.shape[1], self.dilation
         padded = jnp.pad(x, ((0, 0), ((size - 1) * r, 0), (0, 0)))
         terms = [self.weight[i] * padded[:, i * r : i * r + t] for i in range(size)]
-        if (pos := positions(taps)) is not None:
+        if (docs := segments(taps)) is not None:
             # Tap i looks (size - 1 - i) * r tokens back, never before the document.
             back = (size - 1 - jnp.arange(size)) * r
             terms = [
-                jnp.where((pos >= n)[..., None], y, 0) for n, y in zip(back, terms)
+                jnp.where((docs.within >= n)[..., None], y, 0)
+                for n, y in zip(back, terms)
             ]
         y = functools.reduce(operator.add, terms)
         return y if self.bias is None else y + self.bias

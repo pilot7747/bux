@@ -9,8 +9,9 @@ each register one family of layers. Other mixers plug in the same way:
         return MyGatedDeltaNet(config, width, rngs=ctx.rngs)
 
 Modules are called as ``module(x, taps)``: ``taps`` holds the tap stacks for one
-forward pass, and under reserved keys the input tokens and the logits of every head
-run so far. Repeats are unrolled; nodes with a share key are built once and reused.
+forward pass, and under reserved keys the input tokens, the documents rows are packed
+with (``segments(taps)``, None for a document a row) and the logits of every head run
+so far. Repeats are unrolled; nodes with a share key are built once and reused.
 
 Arrays say their dtype and shape with jaxtyping, as ``x: Float[Array, "b t d"]`` for a
 stream of b rows of t positions, d wide, and the tests check them on every call.
@@ -27,12 +28,23 @@ from bux.architecture.mlp import MLP
 from bux.architecture.model import Model, num_params
 from bux.architecture.moe import MoE
 from bux.architecture.norm import DyT, Norm
-from bux.architecture.registry import NEXTN, OUTPUTS, TOKENS, Context, Taps, register
+from bux.architecture.registry import (
+    NEXTN,
+    OUTPUTS,
+    SEGMENTS,
+    TOKENS,
+    Context,
+    Taps,
+    register,
+    segments,
+)
+from bux.architecture.segments import Segments
 
 __all__ = [
     "MLP",
     "NEXTN",
     "OUTPUTS",
+    "SEGMENTS",
     "TOKENS",
     "Activation",
     "Attention",
@@ -49,8 +61,10 @@ __all__ = [
     "NextN",
     "Norm",
     "Scale",
+    "Segments",
     "Taps",
     "build_node",
     "num_params",
     "register",
+    "segments",
 ]

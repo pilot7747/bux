@@ -9,6 +9,7 @@ from jaxtyping import Array, Int
 
 from bux import config as cfg
 from bux.architecture import (
+    SEGMENTS,
     TOKENS,
     Attention,
     Context,
@@ -16,6 +17,7 @@ from bux.architecture import (
     Engram,
     Model,
     NextN,
+    Segments,
     num_params,
 )
 from bux.architecture.engram import _ngram_rows
@@ -336,3 +338,44 @@ def test_documents_packed_in_a_row_see_only_themselves():
     assert jnp.allclose(packed[:, :5], m(a), atol=1e-5)
     assert jnp.allclose(packed[:, 5:], m(b), atol=1e-5)
     assert not jnp.allclose(m(jnp.concatenate([a, b], axis=1))[:, 5:], m(b), atol=1e-3)
+    # The rest of a document cut short, whose positions go on from where it was cut
+    later = jnp.concatenate([jnp.arange(5), jnp.arange(7) + 2])[None].repeat(2, 0)
+    [packed] = m.outputs(jnp.concatenate([a, b], axis=1), later)
+    assert jnp.allclose(packed[:, 5:], m.outputs(b, later[:, 5:])[0], atol=1e-5)
+
+
+def test_a_document_starts_wherever_positions_stop_increasing():
+    """At the 0 after a document, or any position no greater than the last: a row cut
+    out of the middle of a document starts mid-way through it, and positions that skip
+    ahead stay in their document."""
+    docs = Segments.of(jnp.asarray([[7, 8, 9, 0, 1, 5, 6, 3, 4], [0, *range(8)]]))
+    assert docs.ids.tolist() == [[1, 1, 1, 2, 2, 2, 2, 3, 3], [1] + [2] * 8]
+    assert docs.within.tolist() == [[0, 1, 2, 0, 1, 2, 3, 0, 1], [0, *range(8)]]
+
+
+def test_a_flash_kernel_attends_within_documents_by_their_ids(monkeypatch):
+    """What attention needs of packed rows is a document id a token: splash attention,
+    the TPU kernel (interpreted here), takes them in place of a t by t mask."""
+    splash = pytest.importorskip("jax.experimental.pallas.ops.tpu.splash_attention")
+    c = cfg.GQAConfig(num_heads=H, num_kv_heads=2, rope=cfg.RoPEConfig())
+    attn = Attention(c, D, (), nnx.Rngs(0))
+    packed = jnp.concatenate([jnp.arange(n) for n in (50, 150, 56)])
+    docs = Segments.of(jnp.stack([packed, jnp.arange(256) + 100]))
+    x = jax.random.normal(jax.random.key(1), (2, 256, D))
+    reference = attn(x, {SEGMENTS: [docs]})
+
+    def kernel(self, x, q, k, v, docs):
+        t = q.shape[1]
+        mask = splash.MultiHeadMask([splash.CausalMask((t, t))] * self.heads)
+        mha = splash.make_splash_mha(
+            mask, head_shards=1, q_seq_shards=1, interpret=True
+        )
+        q, k, v = (
+            a.transpose(0, 2, 1, 3)  # heads first
+            for a in (q * self.scale, *map(self._per_query_head, (k, v)))
+        )
+        out = jax.vmap(mha)(q, k, v, splash.SegmentIds(docs.ids, docs.ids))
+        return out.transpose(0, 2, 1, 3)
+
+    monkeypatch.setattr(Attention, "_attend", kernel)
+    assert jnp.allclose(attn(x, {SEGMENTS: [docs]}), reference, atol=1e-5)

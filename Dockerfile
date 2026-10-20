@@ -5,8 +5,13 @@
 # `cuda` extra's pip wheels, pinned in uv.lock, so the base image only needs to supply the driver
 # plumbing; CUDA_VERSION should track the toolkit those wheels ship.
 #
+# Its entrypoint is the launcher, which takes a .bux file and trains what is left of its runs,
+# a GPU each; with no file, it trains the smoke run. Mount data/ and runs/ to keep them:
+#
 #   docker build -t bux .
-#   docker run --rm --gpus all bux python main.py
+#   docker run --rm --gpus all bux
+#   docker run --rm --gpus all -v "$PWD/data:/opt/bux/data" -v "$PWD/runs:/opt/bux/runs" \
+#     bux experiments/speedrun.bux
 ARG CUDA_VERSION=13.4.3
 ARG UBUNTU_VERSION=24.04
 
@@ -62,4 +67,7 @@ COPY --chown=1000:1000 . .
 RUN --mount=type=cache,target=/home/$USERNAME/.cache/uv,uid=1000,gid=1000 \
   uv sync --locked --no-dev --extra cuda
 
-CMD ["bash"]
+# Exec form, so that the launcher is PID 1 and gets the SIGTERM that stops a container, at
+# which it checkpoints the step it is at and exits.
+ENTRYPOINT ["bux", "launch"]
+CMD ["experiments/smoke.bux"]

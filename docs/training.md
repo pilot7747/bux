@@ -115,9 +115,10 @@ checked on its own, but a run needs a model.
 ## Data
 
 A batch is rows of `seq_len` tokens, each three arrays: `input_ids`, `position_ids`
-(where each token is in its document, so a 0 starts one) and `loss_mask` (whether a
-token is a target). The model attends, rotates and convolves within documents, and
-the loss is on targets of the document that predicts them.
+(where each token is in its document, so one starts wherever they stop increasing)
+and `loss_mask` (whether a token is a target). The model attends, rotates and
+convolves within documents, and the loss is on targets of the document that predicts
+them.
 
 `text(path=...)` and `chat(path=...)` are documents in Parquet files: raw text, or
 conversations in the OpenAI format. `bux prepare` tokenizes them with the run's
@@ -228,6 +229,7 @@ bux check experiments/smoke.bux     # the model, the run, the sweep
 bux plan  experiments/smoke.bux     # every run: id, parameters, tokens, tokens per parameter
 bux prepare experiments/sft.bux     # tokenize and pack its documents; --cache DIR, --workers N
 bux train experiments/smoke.bux     # train every run, one after another; --only TEXT, --out DIR
+bux launch experiments/smoke.bux    # train what is left of every run, a GPU each: see below
 bux fmt   experiments/smoke.bux     # every run as a file of its own
 bux json  experiments/smoke.bux     # every run's IR
 ```
@@ -249,6 +251,48 @@ settings through another file or a sweep, or logging, evaluating and checkpointi
 other intervals keeps it, and anything else changes it. So a changed run starts in a
 directory of its own, and an unchanged one started again resumes from its latest
 checkpoint, ending exactly where it would have.
+
+## Launching
+
+`bux train` trains in its own process, which suits a laptop and a debugger. `bux launch`
+is the entrypoint for production, and the Docker image's: it trains an experiment to its
+end, however often it is stopped and started again.
+
+```
+bux launch experiments/attention_ablation.bux             # all 6 runs, a GPU each
+bux launch experiments/attention_ablation.bux --index 3   # the fourth, in an array job
+```
+
+First it prepares the datasets the runs read, once. A run alone then trains in the
+launcher's process, on the first visible GPU. A sweep trains in workers, a process a
+run, one on each visible GPU at a time (`CUDA_VISIBLE_DEVICES` says which), or one at a
+time if there are none. A worker's output goes to the console and to its run's
+`train.log`, and a run that fails or runs out of memory leaves the others training.
+
+A run's directory also keeps a `status.json`: whether the run is `running`, `done`,
+`failed` or `stopped`, on what host and GPU, since when, at what step, and its latest
+metrics. A run that is done is not trained again, and one that is not resumes from its
+latest checkpoint, so launching an experiment again, after a preemption, a crash or a
+fix, trains what is left of it. A sweep ends with a table of its runs:
+
+```
+3 runs: 2 done, 1 stopped
+state    step       loss    eval loss  run
+done     3814/3814  3.2141  3.2577     width_sweep[s]
+done     3814/3814  3.0836  3.1302     width_sweep[m]
+stopped  2731/3814  3.0412  3.0815     width_sweep[l]
+```
+
+SIGTERM or Ctrl-C stops training after the step it is at, and saves that step if the
+run has a `checkpoint` setting; a second signal, a second or more later, stops it at
+once. The launcher exits with 0 when every run is done, 1 when one failed, and 128 + the
+signal's number when a signal stopped it.
+
+`--index N` trains only the run at N, from 0, in the order `bux plan` lists them, so an
+array job trains a sweep a run a task: `--index $SLURM_ARRAY_TASK_ID` on Slurm, or
+`--index $(JOB_COMPLETION_INDEX)` in an indexed Kubernetes Job. Tasks that read the
+same documents each prepare them, which is safe but wasted work; run `bux prepare` once
+beforehand.
 
 ## The trainer's blocks
 
@@ -282,7 +326,9 @@ def _(c, multiplier, model):  # a config, the schedule's multiplier, the model
 ```
 
 A hook runs after every `every` steps and after the last, and what it returns is a
-report, metrics by name, that every sink gets. A tracker is a sink:
+report, metrics by name, that every sink gets. When training stops early, because
+something set `trainer.stopping` as the launcher does at SIGTERM, every hook's `stop`
+runs, and the checkpoint hook saves the step. A tracker is a sink:
 
 ```python
 class WeightNorm(Hook):

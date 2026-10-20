@@ -20,7 +20,14 @@ from bux.lang import compile, compile_runs
 from bux.train import config as tcfg
 from bux.train.data import batches, plain
 from bux.train.hooks import Hook, Log
-from bux.train.objective import Term, cross_entropy, lookahead, objective
+from bux.train.objective import (
+    Term,
+    cross_entropy,
+    lookahead,
+    objective,
+    targets,
+    z_loss,
+)
 from bux.train.optim import matrices, optimizer, optimizers, schedule, schedules
 from bux.train.sinks import Latest, Sink
 from bux.train.trainer import Trainer, directory, train
@@ -158,6 +165,21 @@ def test_a_head_learns_only_targets_of_its_own_document_in_the_mask():
     mask = batch.loss_mask.copy()
     mask[0, 7] = False
     assert jnp.allclose(cross_entropy(logits, batch._replace(loss_mask=mask), 3), ce[0])
+    # The second document starts where positions stop increasing, not only at a 0.
+    later = batch._replace(position_ids=np.array([[0, 1, 2, 3, 2, 3, 4, 5]]))
+    assert jnp.allclose(cross_entropy(logits, later, 3), ahead)
+
+
+def test_the_z_loss_is_on_the_positions_that_predict_a_target():
+    logits = jax.random.normal(jax.random.key(0), (1, 8, 32))
+    batch = plain(np.arange(8)[None])._replace(
+        loss_mask=np.array([[True] * 5 + [False] * 3])  # padding after 5 tokens
+    )
+    z = jax.nn.logsumexp(logits[0], -1) ** 2
+    assert jnp.allclose(z_loss(logits, targets(batch)), z[:4].mean())  # 0->1 .. 3->4
+    arch = compile(ARCH + "model = embed block norm head\n")
+    _, metrics = objective(tcfg.LossConfig(z=1e-4), arch)([logits], batch)
+    assert jnp.allclose(metrics["z_loss"], z[:4].mean())
 
 
 def test_a_run_writes_its_directory_and_resumes_where_it_stopped(tmp_path):
