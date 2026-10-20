@@ -1,4 +1,10 @@
-"""State space mixers: Mamba as in Jamba, Mamba-2, and LFM2's gated short convolution."""
+"""State space mixers: Mamba as in Jamba, Mamba-2, and LFM2's gated short convolution.
+
+Under tensor parallelism (``bux.parallel``) their channels split, Mamba's and the short
+conv's over `mlp` and Mamba-2's over `heads`, and so does every parameter of a channel
+or a head: the scan runs on each device's own. Their input projections are fused (u
+and the gate side by side), so they stay whole, and every device computes them.
+"""
 
 import math
 
@@ -8,6 +14,7 @@ from flax import nnx
 from jaxtyping import Array, Float
 
 from bux import config as cfg
+from bux import parallel
 from bux.architecture.conv import CausalConv
 from bux.architecture.norm import Norm
 from bux.architecture.registry import Context, Taps, register, segments
@@ -70,6 +77,28 @@ def _dt_bias(
     return dt + jnp.log(-jnp.expm1(-dt))
 
 
+def _out(
+    n: int, width: int, name: parallel.Name, bias: bool, rngs: nnx.Rngs
+) -> nnx.Linear:
+    """The projection of n channels named `name` back to the width."""
+    init = parallel.named(name, "embed")
+    return nnx.Linear(n, width, use_bias=bias, kernel_init=init, rngs=rngs)
+
+
+def _whole(y: Float[Array, "b t n"]) -> Float[Array, "b t n"]:
+    """`y` whole but for its rows and positions, split as inside a layer (`seq`): a
+    layer's input, which under sequence parallelism is gathered before the
+    projections, not their weights; and what a fused projection gives, whose parts do
+    not split on shard boundaries."""
+    return parallel.shard(y, "batch", "seq", None)
+
+
+def _channels(y: Float[Array, "b t e"], name: parallel.Name) -> Float[Array, "b t e"]:
+    """`y`, its channels split as `name` says: what an output projection takes, so
+    that it reduces where they are, and the stream's split does not reach back."""
+    return parallel.shard(y, "batch", "seq", name)
+
+
 class Mamba(nnx.Module):
     """Mamba's selective SSM (Gu & Dao, 2023) as Jamba has it, with the time steps, B
     and C RMS-normalized.
@@ -86,24 +115,32 @@ class Mamba(nnx.Module):
         r = c.dt_rank or math.ceil(width / 16)
         self.rank, self.state_size = r, n
         self.in_proj = nnx.Linear(width, 2 * e, use_bias=False, rngs=rngs)
-        self.conv = CausalConv(e, c.conv_size, True, rngs)
-        self.x_proj = nnx.Linear(e, r + 2 * n, use_bias=False, rngs=rngs)
-        self.dt_proj = nnx.Param(
-            jax.random.uniform(rngs.params(), (r, e), minval=-(r**-0.5), maxval=r**-0.5)
+        self.conv = CausalConv(e, c.conv_size, True, rngs, channel="mlp")
+        self.x_proj = nnx.Linear(
+            e,
+            r + 2 * n,
+            use_bias=False,
+            kernel_init=parallel.named("mlp", None),
+            rngs=rngs,
         )
-        self.dt_bias = nnx.Param(_dt_bias(c, e, rngs))
+        dt_proj = jax.random.uniform(
+            rngs.params(), (r, e), minval=-(r**-0.5), maxval=r**-0.5
+        )
+        self.dt_proj = nnx.Param(dt_proj, names=(None, "mlp"))
+        self.dt_bias = nnx.Param(_dt_bias(c, e, rngs), names=("mlp",))
         norm = cfg.NormalizationConfig(type="rmsnorm", eps=1e-6)
         self.dt_norm = Norm(norm, r)
         self.b_norm, self.c_norm = Norm(norm, n), Norm(norm, n)
         # S4D-real: A = -(1, 2, ..., n) in every channel.
-        self.A_log = nnx.Param(jnp.tile(jnp.log(jnp.arange(1.0, n + 1)), (e, 1)))
-        self.D = nnx.Param(jnp.ones(e))
-        self.out_proj = nnx.Linear(e, width, use_bias=False, rngs=rngs)
+        A_log = jnp.tile(jnp.log(jnp.arange(1.0, n + 1)), (e, 1))
+        self.A_log = nnx.Param(A_log, names=("mlp", None))
+        self.D = nnx.Param(jnp.ones(e), names=("mlp",))
+        self.out_proj = _out(e, width, "mlp", False, rngs)
 
     def __call__(
         self, x: Float[Array, "b t d"], taps: Taps | None = None
     ) -> Float[Array, "b t d"]:
-        u, z = jnp.split(self.in_proj(x), 2, axis=-1)
+        u, z = jnp.split(_whole(self.in_proj(_whole(x))), 2, axis=-1)
         u = jax.nn.silu(self.conv(u, taps))
         r, n = self.rank, self.state_size
         dt, B, C = jnp.split(self.x_proj(u), [r, r + n], axis=-1)
@@ -111,7 +148,10 @@ class Mamba(nnx.Module):
         B, C = self.b_norm(B)[:, :, None], self.c_norm(C)[:, :, None]
         A = -jnp.exp(self.A_log[...])
         y = selective_scan(u[..., None], dt, A, B, C, segments(taps))[..., 0]
-        return self.out_proj((y + u * self.D[...]) * jax.nn.silu(z))
+        return self.out_proj(_channels((y + u * self.D[...]) * jax.nn.silu(z), "mlp"))
+
+
+_HEADS = ("batch", "seq", "heads")
 
 
 class Mamba2(nnx.Module):
@@ -139,30 +179,34 @@ class Mamba2(nnx.Module):
         self.in_proj = nnx.Linear(
             width, 2 * e + 2 * g * n + h, use_bias=False, rngs=rngs
         )
+        # Over u, B and C side by side, as the projection gives them: whole.
         self.conv = CausalConv(e + 2 * g * n, c.conv_size, True, rngs)
-        self.dt_bias = nnx.Param(_dt_bias(c, h, rngs))
+        self.dt_bias = nnx.Param(_dt_bias(c, h, rngs), names=("heads",))
         # A = -a, with a uniform in [1, 16] a head (Mamba-2's A_init_range).
         a = jax.random.uniform(rngs.params(), (h,), minval=1.0, maxval=16.0)
-        self.A_log = nnx.Param(jnp.log(a))
-        self.D = nnx.Param(jnp.ones(h))
+        self.A_log = nnx.Param(jnp.log(a), names=("heads",))
+        self.D = nnx.Param(jnp.ones(h), names=("heads",))
         norm = cfg.NormalizationConfig(type="rmsnorm", eps=1e-5)
         self.norm = Norm(norm, (g, e // g))
-        self.out_proj = nnx.Linear(e, width, use_bias=False, rngs=rngs)
+        self.out_proj = _out(e, width, ("heads", h), False, rngs)
 
     def __call__(
         self, x: Float[Array, "b t d"], taps: Taps | None = None
     ) -> Float[Array, "b t d"]:
         b, t, _ = x.shape
         e, g, n = self.inner, self.groups, self.state_size
-        z, ubc, dt = jnp.split(self.in_proj(x), [e, 2 * e + 2 * g * n], axis=-1)
+        x = _whole(x)
+        proj = _whole(self.in_proj(x))
+        z, ubc, dt = jnp.split(proj, [e, 2 * e + 2 * g * n], axis=-1)
         u, B, C = jnp.split(jax.nn.silu(self.conv(ubc, taps)), [e, e + g * n], axis=-1)
-        u = u.reshape(b, t, self.heads, self.head_dim)
+        u = parallel.shard(u.reshape(b, t, self.heads, self.head_dim), *_HEADS, None)
         B, C = B.reshape(b, t, g, n), C.reshape(b, t, g, n)
-        dt = jax.nn.softplus(dt + self.dt_bias[...])
+        dt = parallel.shard(jax.nn.softplus(dt + self.dt_bias[...]), *_HEADS)
         A = -jnp.exp(self.A_log[...])[:, None]
         y = selective_scan(u, dt, A, B, C, segments(taps)) + u * self.D[...][:, None]
         y = y.reshape(b, t, e) * jax.nn.silu(z)
-        return self.out_proj(self.norm(y.reshape(b, t, g, -1)).reshape(b, t, e))
+        y = self.norm(y.reshape(b, t, g, -1)).reshape(b, t, e)
+        return self.out_proj(_channels(y, ("heads", self.heads)))
 
 
 class ShortConv(nnx.Module):
@@ -171,14 +215,14 @@ class ShortConv(nnx.Module):
 
     def __init__(self, c: cfg.ShortConvConfig, width: int, rngs: nnx.Rngs):
         self.in_proj = nnx.Linear(width, 3 * width, use_bias=c.bias, rngs=rngs)
-        self.conv = CausalConv(width, c.conv_size, c.bias, rngs)
-        self.out_proj = nnx.Linear(width, width, use_bias=c.bias, rngs=rngs)
+        self.conv = CausalConv(width, c.conv_size, c.bias, rngs, channel="mlp")
+        self.out_proj = _out(width, width, "mlp", c.bias, rngs)
 
     def __call__(
         self, x: Float[Array, "b t d"], taps: Taps | None = None
     ) -> Float[Array, "b t d"]:
-        B, C, u = jnp.split(self.in_proj(x), 3, axis=-1)
-        return self.out_proj(C * self.conv(B * u, taps))
+        B, C, u = jnp.split(_whole(self.in_proj(_whole(x))), 3, axis=-1)
+        return self.out_proj(_channels(C * self.conv(B * u, taps), "mlp"))
 
 
 @register("mamba")

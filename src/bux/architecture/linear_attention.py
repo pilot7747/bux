@@ -15,6 +15,10 @@ out to them), k and v the head dims of keys and values.
 
 `recurrence` is the reference form, a scan over positions; a chunked kernel (fla's)
 computes the same.
+
+Under tensor parallelism (``bux.parallel``) every projection splits over `heads`, into
+the heads or out of them, and so does every parameter a head has: the recurrence runs
+on each device's own heads, with no communication.
 """
 
 import math
@@ -25,6 +29,7 @@ from flax import nnx
 from jaxtyping import Array, Float
 
 from bux import config as cfg
+from bux import parallel
 from bux.architecture.conv import CausalConv
 from bux.architecture.functional import activation
 from bux.architecture.norm import Norm
@@ -107,15 +112,30 @@ def delta_rule(
     return recurrence(q, step, v, log_decay, docs, a=-jnp.exp(log_decay) * k, b=step)
 
 
+def layer_input(x: Float[Array, "b t d"]) -> Float[Array, "b t d"]:
+    """A layer's input, its positions split as inside a layer (`seq`), not as the
+    stream: under sequence parallelism, gathered before the projections, not their
+    weights."""
+    return parallel.shard(x, "batch", "seq", None)
+
+
+def heads(y: Float[Array, "b t h *k"]) -> Float[Array, "b t h *k"]:
+    """`y`, something of every head at every position, split as the layout splits
+    heads: whole if their axes do not divide them, though a projection's h * k
+    channels may split, so that nothing else splits a head."""
+    return parallel.shard(y, "batch", "seq", "heads", *(None,) * (y.ndim - 3))
+
+
 def l2norm(x: Float[Array, "*lead k"], eps: float = 1e-6) -> Float[Array, "*lead k"]:
     """x over its L2 norm, as fla computes it: x / sqrt(|x|^2 + eps)."""
     return x * jax.lax.rsqrt(jnp.square(x).sum(-1, keepdims=True) + eps)
 
 
 class LowRank(nnx.Module):
-    """x -> act(x A) B + c, a projection through `rank` dims, with an optional
-    activation between and bias after. `orthogonal` starts it as RWKV-7 does, A at zero
-    and B orthogonal, scaled by 0.1; otherwise A and B start as dense layers do."""
+    """x -> act(x A) B + c, a projection of the width through `rank` dims (`latent`),
+    with an optional activation between and bias after, its outputs named `out`.
+    `orthogonal` starts it as RWKV-7 does, A at zero and B orthogonal, scaled by 0.1;
+    otherwise A and B start as dense layers do."""
 
     def __init__(
         self,
@@ -127,20 +147,20 @@ class LowRank(nnx.Module):
         activation: str | None = None,
         bias: Float[Array, " n"] | bool = False,
         orthogonal: bool = False,
+        out: parallel.Name = None,
     ):
         if orthogonal:
             gain = 0.1 * max(1.0, math.sqrt(rank / n_out))
-            self.down = nnx.Param(jnp.zeros((n_in, rank)))
+            down = jnp.zeros((n_in, rank))
             up = nnx.initializers.orthogonal(gain)(rngs.params(), (rank, n_out))
         else:
             init = nnx.initializers.lecun_normal()
-            self.down = nnx.Param(init(rngs.params(), (n_in, rank)))
+            down = init(rngs.params(), (n_in, rank))
             up = init(rngs.params(), (rank, n_out))
-        self.up = nnx.Param(up)
-        if isinstance(bias, bool):
-            self.bias = nnx.Param(jnp.zeros(n_out)) if bias else None
-        else:
-            self.bias = nnx.Param(bias)
+        self.down = nnx.Param(down, names=("embed", "latent"))
+        self.up = nnx.Param(up, names=("latent", out))
+        start = (jnp.zeros(n_out) if bias else None) if isinstance(bias, bool) else bias
+        self.bias = None if start is None else nnx.Param(start, names=(out,))
         self.activation = activation
 
     def __call__(self, x: Float[Array, "*lead d"]) -> Float[Array, "*lead n"]:
@@ -149,6 +169,12 @@ class LowRank(nnx.Module):
             h = activation(self.activation, h)
         y = h @ self.up[...]
         return y if self.bias is None else y + self.bias[...]
+
+
+def into_heads(width: int, heads: int, dim: int, rngs: nnx.Rngs) -> nnx.Linear:
+    """A projection of the width to `heads` heads of `dim` channels, side by side."""
+    init = parallel.named("embed", ("heads", heads))
+    return nnx.Linear(width, heads * dim, use_bias=False, kernel_init=init, rngs=rngs)
 
 
 def _dt_bias(rngs: nnx.Rngs, n: int) -> Float[Array, " n"]:
@@ -226,14 +252,12 @@ class LinearAttention(nnx.Module):
         dk, dv = c.head_dim, c.v_head_dim or c.head_dim
         self.heads, self.v_heads, self.head_dim, self.v_head_dim = h, hv, dk, dv
 
-        def linear(n_in: int, n_out: int) -> nnx.Linear:
-            return nnx.Linear(n_in, n_out, use_bias=False, rngs=rngs)
-
         self.q, self.k, self.v = (
-            linear(width, h * dk),
-            linear(width, h * dk),
-            linear(width, hv * dv),
+            into_heads(width, h, dk, rngs),
+            into_heads(width, h, dk, rngs),
+            into_heads(width, hv, dv, rngs),
         )
+        # One conv over q, k and v side by side, which it convolves apart.
         size = c.conv_size
         self.conv = (
             CausalConv(2 * h * dk + hv * dv, size, False, rngs) if size else None
@@ -243,14 +267,20 @@ class LinearAttention(nnx.Module):
         self.gate = (
             None
             if c.output_gate is None
-            else LowRank(width, gate_rank, hv * dv, rngs)
+            else LowRank(width, gate_rank, hv * dv, rngs, out=("heads", hv))
             if gate_rank
-            else linear(width, hv * dv)
+            else into_heads(width, hv, dv, rngs)
         )
         self.norm_all_heads = norm_all_heads
         rms = cfg.NormalizationConfig(type="rmsnorm", eps=c.norm_eps)
         self.norm = Norm(rms, hv * dv if norm_all_heads else dv)
-        self.o = linear(hv * dv, width)
+        self.o = nnx.Linear(
+            hv * dv,
+            width,
+            use_bias=False,
+            kernel_init=parallel.named(("heads", hv), "embed"),
+            rngs=rngs,
+        )
 
     def _qkv(
         self, x: Float[Array, "b t d"], taps: Taps
@@ -260,25 +290,24 @@ class LinearAttention(nnx.Module):
         """The queries, keys and values of every value head: projected, then convolved
         and through SiLU."""
         b, t, _ = x.shape
-        qkv = jnp.concatenate([self.q(x), self.k(x), self.v(x)], -1)
+        q, k, v = self.q(x), self.k(x), self.v(x)
         if self.conv is not None:
-            qkv = jax.nn.silu(self.conv(qkv, taps))
+            q, k, v = map(jax.nn.silu, self.conv.side_by_side((q, k, v), taps))
         elif self.silu:
-            qkv = jax.nn.silu(qkv)
-        n = self.heads * self.head_dim
-        q, k, v = jnp.split(qkv, [n, 2 * n], -1)
+            q, k, v = map(jax.nn.silu, (q, k, v))
         group = self.v_heads // self.heads
         q, k = (
-            jnp.repeat(y.reshape(b, t, self.heads, self.head_dim), group, axis=2)
+            jnp.repeat(heads(y.reshape(b, t, self.heads, self.head_dim)), group, axis=2)
             for y in (q, k)
         )
-        return q, k, v.reshape(b, t, self.v_heads, self.v_head_dim)
+        return q, k, heads(v.reshape(b, t, self.v_heads, self.v_head_dim))
 
     def _output(
         self, x: Float[Array, "b t d"], o: Float[Array, "b t h v"]
     ) -> Float[Array, "b t d"]:
         """The heads' outputs, normalized, gated and projected back to the width."""
         b, t, _ = x.shape
+        o = heads(o)
         o = self.norm(o.reshape(b, t, -1) if self.norm_all_heads else o)
         o = o.reshape(b, t, -1)
         if self.gate is not None and self.gate_activation is not None:
@@ -300,13 +329,14 @@ class DeltaNet(LinearAttention):
         gate_rank: int | None = None,
     ):
         super().__init__(c, width, rngs, gate_rank=gate_rank)
-        self.b = nnx.Linear(width, self.v_heads, use_bias=False, rngs=rngs)
+        self.b = into_heads(width, self.v_heads, 1, rngs)
 
     def __call__(self, x: Float[Array, "b t d"], taps: Taps) -> Float[Array, "b t d"]:
+        x = layer_input(x)
         q, k, v = self._qkv(x, taps)
         q, k = l2norm(q) * self.head_dim**-0.5, l2norm(k)
-        beta = jax.nn.sigmoid(self.b(x))
-        o = delta_rule(q, k, v, self._log_decay(x), beta, segments(taps))
+        beta = heads(jax.nn.sigmoid(self.b(x)))
+        o = delta_rule(q, k, v, heads(self._log_decay(x)), beta, segments(taps))
         return self._output(x, o)
 
     def _log_decay(self, x: Float[Array, "b t d"]) -> Float[Array, "b t h k"]:
@@ -327,9 +357,9 @@ class GatedDeltaNet(DeltaNet):
     def __init__(self, c: cfg.GatedDeltaNetConfig, width: int, rngs: nnx.Rngs):
         super().__init__(c, width, rngs)
         hv = self.v_heads
-        self.a = nnx.Linear(width, hv, use_bias=False, rngs=rngs)
-        self.A_log = nnx.Param(_log_uniform(rngs, hv, 0.01, 16))
-        self.dt_bias = nnx.Param(_dt_bias(rngs, hv))
+        self.a = into_heads(width, hv, 1, rngs)
+        self.A_log = nnx.Param(_log_uniform(rngs, hv, 0.01, 16), names=("heads",))
+        self.dt_bias = nnx.Param(_dt_bias(rngs, hv), names=("heads",))
 
     def _log_decay(self, x: Float[Array, "b t d"]) -> Float[Array, "b t h k"]:
         b, t, _ = x.shape
@@ -350,14 +380,15 @@ class KimiDeltaAttention(DeltaNet):
     def __init__(self, c: cfg.KDAConfig, width: int, rngs: nnx.Rngs):
         super().__init__(c, width, rngs, gate_rank=c.output_gate_rank)
         hv, dk = self.v_heads, self.head_dim
-        self.f = LowRank(width, c.gate_rank or dk, hv * dk, rngs)
+        self.f = LowRank(width, c.gate_rank or dk, hv * dk, rngs, out=("heads", hv))
         self.lower_bound = c.gate_lower_bound
         self.A_log = nnx.Param(
             _log_uniform(rngs, hv, 1, 16)
             if c.gate_lower_bound is None
-            else jnp.zeros(hv)
+            else jnp.zeros(hv),
+            names=("heads",),
         )
-        self.dt_bias = nnx.Param(_dt_bias(rngs, hv * dk))
+        self.dt_bias = nnx.Param(_dt_bias(rngs, hv * dk), names=(("heads", hv),))
 
     def _log_decay(self, x: Float[Array, "b t d"]) -> Float[Array, "b t h k"]:
         b, t, _ = x.shape
@@ -376,14 +407,17 @@ class GatedLinearAttention(LinearAttention):
 
     def __init__(self, c: cfg.GLAConfig, width: int, rngs: nnx.Rngs):
         super().__init__(c, width, rngs, silu=False)
-        n = self.v_heads * self.head_dim
-        self.f = LowRank(width, c.gate_rank, n, rngs, bias=True)
+        hv = self.v_heads
+        self.f = LowRank(
+            width, c.gate_rank, hv * self.head_dim, rngs, bias=True, out=("heads", hv)
+        )
 
     def __call__(self, x: Float[Array, "b t d"], taps: Taps) -> Float[Array, "b t d"]:
+        x = layer_input(x)
         b, t, _ = x.shape
         q, k, v = self._qkv(x, taps)
         f = self.f(x).reshape(b, t, self.v_heads, self.head_dim)
-        g = jax.nn.log_sigmoid(f) / 16
+        g = heads(jax.nn.log_sigmoid(f) / 16)
         o = recurrence(q * self.head_dim**-0.5, k, v, g, segments(taps))
         return self._output(x, o)
 
@@ -412,9 +446,12 @@ class LightningAttention(LinearAttention):
         layers: int = 1,
     ):
         super().__init__(c, width, rngs, norm_all_heads=True)
-        self.slopes = nnx.Variable(slopes(self.v_heads, layer, layers))
+        self.slopes = nnx.Variable(
+            slopes(self.v_heads, layer, layers), names=("heads",)
+        )
 
     def __call__(self, x: Float[Array, "b t d"], taps: Taps) -> Float[Array, "b t d"]:
+        x = layer_input(x)
         q, k, v = self._qkv(x, taps)
         g = jnp.broadcast_to(-self.slopes[...][:, None], q.shape)
         return self._output(x, recurrence(q, k, v, g, segments(taps)))

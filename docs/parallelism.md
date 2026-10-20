@@ -200,6 +200,61 @@ the logits to `(batch, heads, seq, none)`, the keys whole, which with `seq` over
 The indexer picks its top-k with a stable sort: `lax.top_k` gathers every row onto
 each device.
 
+## The other layers
+
+Dense layers split by hidden unit, as attention does by head; the embedding, the head
+and the logits by the vocabulary; and the recurrent mixers by head (Mamba's by
+channel), so that each device runs the recurrence of its own heads, with no
+communication.
+
+| layer                      | parameter                                       | names            |
+|----------------------------|-------------------------------------------------|------------------|
+| MLP                        | `up`, `gate`, their biases                      | `(embed, mlp)`   |
+| MLP                        | `down`                                          | `(mlp, embed)`   |
+| embedding                  | the token table                                 | `(vocab, embed)` |
+| embedding                  | learned positions                               | `(none, embed)`  |
+| head                       | `proj`, its bias or the tied head's             | `(embed, vocab)` |
+| linear attention, RWKV-7   | `q`, `k`, `v`, `r`, `a`, `b`, the output gate   | `(embed, heads)` |
+| linear attention, RWKV-7   | a low-rank projection's `down`, `up`            | `(embed, latent)`, `(latent, heads)` |
+| linear attention, RWKV-7   | `o`                                             | `(heads, embed)` |
+| linear attention, RWKV-7   | `A_log`, `dt_bias`, `slopes`, `k_k`, `k_a`, `r_k` | `(heads, ...)` |
+| Mamba, short conv          | the conv's channels, `dt_proj`, `dt_bias`, `A_log`, `D` | `mlp`    |
+| Mamba, short conv          | `x_proj`; `out_proj`                            | `(mlp, none)`; `(mlp, embed)` |
+| Mamba-2                    | `dt_bias`, `A_log`, `D`; `out_proj`             | `(heads,)`; `(heads, embed)` |
+| Engram                     | the table                                       | `(vocab, none)`  |
+
+Flattened heads are named with their count, as attention's are. What is fused stays
+whole, as GQA's fused `qkv` does: the SSMs' `in_proj` (u and the gate side by side),
+Mamba-2's conv over u, B and C, Engram's `kv` and nextn's `proj`. Every device
+computes them. Splitting such a projection in parts would keep its values under
+AdamW, but not under Muon, which orthogonalizes it as one matrix. Linear attention's
+one conv over q, k and v convolves each apart (`CausalConv.side_by_side`), so that
+they stay on their heads. Norms, the residual algebras, RWKV-7's token shift, `scale`
+and `linear` are not named: their widths mean whatever comes before them, and FSDP
+alone splits them.
+
+Constraints:
+
+- Each mixer's input is `(batch, seq, none)`: with `layout(stream=tensor)` it is
+  gathered once before the projections, not their weights. (The MLP gathers its
+  input without one.) Per-head arrays are `(batch, seq, heads, ...)`, the hidden units
+  `(batch, seq, mlp)`, and the SSMs' channels before `out_proj` theirs.
+- The embedding gathers from its table whole but for the vocabulary, into
+  `(batch, seq, none)`, then `stream`. From a table split over `fsdp`, XLA
+  rematerializes it in full; into positions split over `tensor`, it gathers the
+  table every step. Engram gathers from its table the same way.
+- The logits are `(batch, seq, vocab)`, tied heads too, and the loss reduces over the
+  vocabulary where it is: the log-normalizer and the target's logit are all-reduces
+  of `(b, t)`, for the loss, `z_loss` and `mtp` alike.
+- What the embedding, nextn and Engram give is the stream, widened or not, and passes
+  `stream`.
+
+On the 8 fake devices, every family trains as on one device to 4e-6 under
+`fsdp=2 × tensor=4`, `fsdp=4 × tensor=2` with sequence parallelism, `tensor=2`,
+`tensor=4` and `fsdp=8`, with no involuntary rematerialization. The tests train at
+`lr=1e-3`: at `1e-2` their small runs are unstable, and rounding (from `data=8` too)
+grows past 1e-5 in three steps.
+
 ## Mixture of experts
 
 The router runs in the global view: it picks each token's top-k experts, reports the

@@ -10,6 +10,7 @@ from flax import nnx
 from jaxtyping import Array, ArrayLike, Float, Int, Int32, UInt32
 
 from bux import config as cfg
+from bux import parallel
 from bux.architecture.conv import CausalConv
 from bux.architecture.norm import Norm
 from bux.architecture.registry import TOKENS, Context, Taps, register, segments
@@ -65,7 +66,8 @@ def _ngram_rows(
 class Engram(nnx.Module):
     """Hashed n-gram rows of the input tokens, gated by the stream and added to it. On a
     widened stream, with an axis of copies, every copy has a key of its own, and they
-    share the value."""
+    share the value. The table's rows split as the vocabulary does (``bux.parallel``),
+    and the rest is whole."""
 
     def __init__(
         self, c: cfg.EngramConfig, width: int | Literal["streams"], ctx: Context
@@ -92,7 +94,8 @@ class Engram(nnx.Module):
             else None
         )
         init = nnx.initializers.normal(1.0)
-        self.table = nnx.Param(init(ctx.rngs.params(), (sum(primes), c.head_dim)))
+        table = init(ctx.rngs.params(), (sum(primes), c.head_dim))
+        self.table = nnx.Param(table, names=("vocab", None))
         self.kv = nnx.Linear(
             orders * heads * c.head_dim, (copies + 1) * d, use_bias=False, rngs=ctx.rngs
         )
@@ -131,10 +134,13 @@ class Engram(nnx.Module):
             None if docs is None else docs.within,
         )
         h = x if x.ndim == 4 else x[..., None, :]
-        (b, t, n, d), kv = (
-            h.shape,
-            self.kv(self.table[...][rows].reshape(*rows.shape[:2], -1)),
-        )
+        # Gathered from the table whole over `fsdp`, as the embedding gathers; then
+        # the keys and the value side by side, whole.
+        table = parallel.shard(self.table[...], "vocab", None)
+        memory = table[rows].reshape(*rows.shape[:2], -1)
+        memory = parallel.shard(memory, "batch", "seq", None)
+        kv = parallel.shard(self.kv(memory), "batch", "seq", None)
+        b, t, n, d = h.shape
         key, value = kv[..., : n * d].reshape(b, t, n, d), kv[..., n * d :]
         a = (self.q_norm(h) * self.k_norm(key)).sum(-1) / math.sqrt(d)
         gate = jax.nn.sigmoid(jnp.sign(a) * jnp.sqrt(jnp.maximum(jnp.abs(a), 1e-6)))
@@ -143,7 +149,7 @@ class Engram(nnx.Module):
             conv = self.conv(self.conv_norm(u).reshape(b, t, n * d), taps)
             u = u + jax.nn.silu(conv).reshape(u.shape)
         y = h + u
-        return y if x.ndim == 4 else y[..., 0, :]
+        return parallel.stream(y if x.ndim == 4 else y[..., 0, :])
 
 
 @register("engram")
