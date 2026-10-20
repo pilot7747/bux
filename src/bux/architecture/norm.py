@@ -3,9 +3,11 @@
 import jax
 import jax.numpy as jnp
 from flax import nnx
+from jaxtyping import Array, Float
 
 from bux import config as cfg
 from bux.architecture.registry import Context, Taps, register
+from bux.lang import ir
 
 
 class Norm(nnx.Module):
@@ -18,7 +20,9 @@ class Norm(nnx.Module):
         self.scale = nnx.Param(init(width)) if c.affine else None
         self.bias = nnx.Param(jnp.zeros(width)) if c.bias else None
 
-    def __call__(self, x, taps: Taps | None = None):
+    def __call__(
+        self, x: Float[Array, "*lead d"], taps: Taps | None = None
+    ) -> Float[Array, "*lead d"]:
         gain = None
         if self.scale is not None:
             gain = 1 + self.scale if self.zero_centered else self.scale
@@ -35,7 +39,9 @@ class Norm(nnx.Module):
 
 
 @register("layernorm", "rmsnorm")
-def _(c: cfg.NormalizationConfig, width, ports, ctx: Context):
+def _(
+    c: cfg.NormalizationConfig, width: int, ports: tuple[ir.Port, ...], ctx: Context
+) -> Norm:
     return Norm(c, width)
 
 
@@ -45,10 +51,12 @@ class DyT(nnx.Module):
         self.weight = nnx.Param(jnp.ones(width))
         self.bias = nnx.Param(jnp.zeros(width))
 
-    def __call__(self, x, taps: Taps):
+    def __call__(
+        self, x: Float[Array, "*lead d"], taps: Taps
+    ) -> Float[Array, "*lead d"]:
         return jnp.tanh(self.alpha * x) * self.weight + self.bias
 
 
 @register("dyt")
-def _(c: cfg.DyTConfig, width, ports, ctx: Context):
+def _(c: cfg.DyTConfig, width: int, ports: tuple[ir.Port, ...], ctx: Context) -> DyT:
     return DyT(c, width)

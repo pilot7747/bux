@@ -75,7 +75,7 @@ class JSONL(Sink):
 class Latest(Sink):
     """The latest value of every metric reported."""
 
-    def __init__(self):
+    def __init__(self) -> None:
         self.metrics: dict[str, float] = {}
 
     def write(self, step: int, report: Report) -> None:

@@ -51,7 +51,9 @@ class Job:
     seq_len: int
 
     @classmethod
-    def of(cls, source: tcfg.TextConfig | tcfg.ChatConfig, t: tcfg.TrainConfig):
+    def of(
+        cls, source: tcfg.TextConfig | tcfg.ChatConfig, t: tcfg.TrainConfig
+    ) -> "Job":
         assert t.tokenizer is not None, "the compiler requires one for documents"
         return cls(source, t.tokenizer, t.packing, t.seq_len)
 

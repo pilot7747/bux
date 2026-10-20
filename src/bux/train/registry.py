@@ -16,9 +16,10 @@ A new tag needs its config in ``bux.train.config`` too, where the compiler finds
 """
 
 from collections.abc import Callable
-from typing import Any, Protocol
+from typing import Any, Protocol, runtime_checkable
 
 
+@runtime_checkable
 class Tagged(Protocol):
     @property
     def type(self) -> str: ...

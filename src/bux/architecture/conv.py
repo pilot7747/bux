@@ -1,14 +1,19 @@
 """Depthwise causal convolution, as a token mixer and inside other layers."""
 
+import functools
+import operator
+
 import jax.numpy as jnp
 from flax import nnx
+from jaxtyping import Array, Float
 
 from bux import config as cfg
 from bux.architecture.registry import Context, Taps, positions, register
+from bux.lang import ir
 
 
 class CausalConv(nnx.Module):
-    """Depthwise causal convolution over positions of (batch, seq, channels)."""
+    """Depthwise causal convolution over positions."""
 
     def __init__(
         self,
@@ -25,7 +30,9 @@ class CausalConv(nnx.Module):
         self.bias = nnx.Param(jnp.zeros(channels)) if bias else None
         self.dilation = dilation
 
-    def __call__(self, x, taps: Taps | None = None):
+    def __call__(
+        self, x: Float[Array, "b t c"], taps: Taps | None = None
+    ) -> Float[Array, "b t c"]:
         size, t, r = self.weight.shape[0], x.shape[1], self.dilation
         padded = jnp.pad(x, ((0, 0), ((size - 1) * r, 0), (0, 0)))
         terms = [self.weight[i] * padded[:, i * r : i * r + t] for i in range(size)]
@@ -35,10 +42,12 @@ class CausalConv(nnx.Module):
             terms = [
                 jnp.where((pos >= n)[..., None], y, 0) for n, y in zip(back, terms)
             ]
-        y = sum(terms)
+        y = functools.reduce(operator.add, terms)
         return y if self.bias is None else y + self.bias
 
 
 @register("conv")
-def _(c: cfg.ConvConfig, width, ports, ctx: Context):
+def _(
+    c: cfg.ConvConfig, width: int, ports: tuple[ir.Port, ...], ctx: Context
+) -> CausalConv:
     return CausalConv(width, c.size, c.bias, ctx.rngs)

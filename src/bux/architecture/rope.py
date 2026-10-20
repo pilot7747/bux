@@ -2,8 +2,8 @@
 
 import math
 
-import jax
 import jax.numpy as jnp
+from jaxtyping import Array, Float, Int
 
 from bux import config as cfg
 
@@ -14,7 +14,9 @@ def _attention_factor(y: cfg.YaRNConfig) -> float:
     return 0.1 * math.log(y.factor) + 1 if y.factor > 1 else 1.0
 
 
-def frequencies(rope: cfg.RoPEConfig, dims: int) -> tuple[jax.Array, float]:
+def frequencies(
+    rope: cfg.RoPEConfig, dims: int
+) -> tuple[Float[Array, " pairs"], float]:
     """Inverse frequencies of the `dims` rotated dims, and the factor on cos and sin."""
     inv_freq = 1.0 / rope.base ** (jnp.arange(0, dims, 2) / dims)
     match rope.scaling:
@@ -53,10 +55,12 @@ def logit_gain(rope: cfg.RoPEConfig | None) -> float:
 
 
 def rotate(
-    x: jax.Array, rope: cfg.RoPEConfig, positions: jax.Array | None = None
-) -> jax.Array:
+    x: Float[Array, "b t h k"],
+    rope: cfg.RoPEConfig,
+    positions: Int[Array, "b t"] | None = None,
+) -> Float[Array, "b t h k"]:
     """Rotate the first `fraction` of each head's dims, paired by `layout`, by the
-    positions (b, t) of the tokens, or their indices; x is (b, t, h, d)."""
+    positions of the tokens, or their indices."""
     dims = int(x.shape[-1] * rope.fraction) // 2 * 2
     if dims == 0:
         return x

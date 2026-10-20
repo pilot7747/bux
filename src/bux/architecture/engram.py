@@ -1,16 +1,19 @@
 """Engram: memory looked up by hashed n-grams of the input tokens."""
 
 import math
+from typing import Literal
 
 import jax
 import jax.numpy as jnp
 import numpy as np
 from flax import nnx
+from jaxtyping import Array, ArrayLike, Float, Int, Int32, UInt32
 
 from bux import config as cfg
 from bux.architecture.conv import CausalConv
 from bux.architecture.norm import Norm
 from bux.architecture.registry import TOKENS, Context, Taps, positions, register
+from bux.lang import ir
 
 
 def _next_primes(start: int, count: int, taken: set[int]) -> list[int]:
@@ -24,8 +27,17 @@ def _next_primes(start: int, count: int, taken: set[int]) -> list[int]:
     return found
 
 
-def _ngram_rows(ids, tokens, multipliers, primes, offsets, boundary, pad, docs=None):
-    """Table rows of the n-grams ending at every position, (b, t) -> (b, t, orders * heads).
+def _ngram_rows(
+    ids: Int[Array, "b t"],
+    tokens: Int[Array, "b t"],
+    multipliers: UInt32[Array, " n"],
+    primes: UInt32[Array, "n-1 heads"],
+    offsets: UInt32[Array, "n-1 heads"],
+    boundary: int | None,
+    pad: Int[ArrayLike, ""],
+    docs: Int[Array, "b t"] | None = None,
+) -> Int32[Array, "b t (n-1)*heads"]:
+    """Table rows of the n-grams of 2 to n ids ending at every position, one a head.
 
     The n-gram of the last j + 1 ids hashes to XOR_{i <= j} ids[t - i] * m_i, in wrapping
     uint32 arithmetic. Positions before the sequence, before the document (by `docs`,
@@ -52,10 +64,12 @@ def _ngram_rows(ids, tokens, multipliers, primes, offsets, boundary, pad, docs=N
 
 class Engram(nnx.Module):
     """Hashed n-gram rows of the input tokens, gated by the stream and added to it. On a
-    widened stream (batch, seq, copies, d) every copy has a key of its own, and they
+    widened stream, with an axis of copies, every copy has a key of its own, and they
     share the value."""
 
-    def __init__(self, c: cfg.EngramConfig, width, ctx: Context):
+    def __init__(
+        self, c: cfg.EngramConfig, width: int | Literal["streams"], ctx: Context
+    ):
         d, vocab = ctx.arch.d_model, ctx.arch.vocab_size
         assert vocab is not None
         copies = getattr(ctx.arch.residual, "expansion", 1) if width == "streams" else 1
@@ -99,7 +113,9 @@ class Engram(nnx.Module):
         self.conv_norm = Norm(c.norm, (copies, d)) if c.conv_size else None
         self.boundary = c.boundary_token
 
-    def __call__(self, x, taps: Taps):
+    def __call__(
+        self, x: Float[Array, "b t *copies d"], taps: Taps
+    ) -> Float[Array, "b t *copies d"]:
         tokens = taps[TOKENS][0]
         ids, pad = tokens, self.boundary or 0
         if self.classes is not None:
@@ -131,5 +147,10 @@ class Engram(nnx.Module):
 
 
 @register("engram")
-def _(c: cfg.EngramConfig, width, ports, ctx: Context):
+def _(
+    c: cfg.EngramConfig,
+    width: int | Literal["streams"],
+    ports: tuple[ir.Port, ...],
+    ctx: Context,
+) -> Engram:
     return Engram(c, width, ctx)

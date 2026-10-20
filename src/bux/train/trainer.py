@@ -30,6 +30,7 @@ import jax
 import jax.numpy as jnp
 import optax
 from flax import nnx
+from jaxtyping import Array, Float
 
 from bux.architecture import Model
 from bux.data.pipeline import DEFAULT_CACHE, jobs, prepare
@@ -42,7 +43,7 @@ from bux.train.optim import optimizer, peak, schedule
 from bux.train.sinks import JSONL, Console, Latest, Sink
 
 
-def forward(model: Model, batch: Batch) -> list[jax.Array]:
+def forward(model: Model, batch: Batch) -> list[Float[Array, "b t vocab"]]:
     """Every head's logits on `batch`, each document in a row on its own."""
     return model.outputs(jnp.asarray(batch.input_ids), jnp.asarray(batch.position_ids))
 
@@ -72,14 +73,14 @@ class Trainer:
         """The objective's gradient on `batch`, applied: the objective's terms, and
         the gradient's norm."""
 
-        def loss(model: Model):
+        def loss(model: Model) -> tuple[Float[Array, ""], Metrics]:
             return self.objective(forward(model, batch), batch)
 
         (_, metrics), grads = nnx.value_and_grad(loss, has_aux=True)(model)
         optimizer.update(model, grads)
         return metrics | {"grad_norm": optax.tree.norm(grads)}
 
-    def eval_step(self, model: Model, batch: Batch) -> jax.Array:
+    def eval_step(self, model: Model, batch: Batch) -> Float[Array, ""]:
         """The first head's loss on `batch`."""
         return self.objective(forward(model, batch), batch)[1]["loss"]
 
@@ -102,7 +103,7 @@ class Trainer:
         """What a checkpoint keeps: the model's state and the optimizer's."""
         return nnx.state((self.model, self.optimizer))
 
-    def load(self, state: Mapping[str, Any], step: int) -> None:
+    def load(self, state: nnx.State | Mapping[str, Any], step: int) -> None:
         """Take up `state`, from `state()` or a checkpoint, at `step`."""
         nnx.update((self.model, self.optimizer), state)
         self.step = step

@@ -71,7 +71,9 @@ Muse, Nemotron, Qwen), and the [language guide](docs/language.md) for compositio
 connections, parameter sharing, and editor support.
 
 Run the CI checks (ruff, ty, and the tests) with `make`, or one of them with `make lint`,
-`make typecheck`, or `make test`.
+`make typecheck`, or `make test`. Arrays say their dtype and shape with
+[jaxtyping](https://github.com/patrick-kidger/jaxtyping), as `Float[Array, "b t d"]`,
+and the tests check every call against them.
 
 ## Docker
 

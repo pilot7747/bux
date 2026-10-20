@@ -2,10 +2,12 @@
 
 import jax.numpy as jnp
 from flax import nnx
+from jaxtyping import Array, Float
 
 from bux import config as cfg
 from bux.architecture.functional import activation, bound
 from bux.architecture.registry import Context, Taps, register
+from bux.lang import ir
 
 
 class MLP(nnx.Module):
@@ -22,7 +24,9 @@ class MLP(nnx.Module):
         self.limit, self.up_softcap = c.limit, c.up_softcap
         self.dropout = nnx.Dropout(c.dropout, rngs=rngs)
 
-    def __call__(self, x, taps: Taps | None = None):
+    def __call__(
+        self, x: Float[Array, "*lead d"], taps: Taps | None = None
+    ) -> Float[Array, "*lead d"]:
         up = bound(self.up(x), self.limit, self.up_softcap)
         if self.gate is not None:
             gate = self.gate(x)
@@ -35,5 +39,5 @@ class MLP(nnx.Module):
 
 
 @register("mlp", "gated_mlp")
-def _(c: cfg.MLPConfig, width, ports, ctx: Context):
+def _(c: cfg.MLPConfig, width: int, ports: tuple[ir.Port, ...], ctx: Context) -> MLP:
     return MLP(c, width, ctx.rngs)

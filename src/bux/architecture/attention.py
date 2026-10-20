@@ -1,10 +1,12 @@
 """Causal grouped-query attention."""
 
 from collections.abc import Sequence
+from typing import Any
 
 import jax
 import jax.numpy as jnp
 from flax import nnx
+from jaxtyping import Array, Float, Int
 
 from bux import config as cfg
 from bux.architecture.conv import CausalConv
@@ -15,40 +17,47 @@ from bux.architecture.rope import logit_gain, rotate
 from bux.lang import ir
 
 
-def _read(taps: Taps, ports: tuple[ir.Port, ...], name: str):
+def _read(taps: Taps, ports: tuple[ir.Port, ...], name: str) -> Any:
     """What the layer reads (or pops) from its port `name`."""
     port = next(p for p in ports if p.name == name and p.mode != "write")
     stack = taps[port.tap]
     return stack.pop() if port.mode == "pop" else stack[-1]
 
 
-def _write(taps: Taps, ports: tuple[ir.Port, ...], name: str, value) -> None:
+def _write(taps: Taps, ports: tuple[ir.Port, ...], name: str, value: object) -> None:
     """Push `value` to the tap of port `name`, if the layer writes that port."""
     for port in ports:
         if port.name == name and port.mode == "write":
             taps.setdefault(port.tap, []).append(value)
 
 
-def _relative_bias(r: jax.Array, table: jax.Array, offset: jax.Array) -> jax.Array:
-    """The (b, h, t, s) bias <r[b, t, h], table[:, t - s]>, from r of (b, t, h, rank) and
-    a table of (rank, extent); keys ahead of the query, or extent or more behind, get none.
-    """
+def _relative_bias(
+    r: Float[Array, "b t h rank"],
+    table: Float[Array, "rank extent"],
+    offset: Int[Array, "t s"],
+) -> Float[Array, "b h t s"]:
+    """The bias <r[b, t, h], table[:, t - s]>; keys ahead of the query, or extent or
+    more behind, get none."""
     extent = table.shape[-1]
     rows = table[:, jnp.clip(offset, 0, extent - 1)]
     near = (offset >= 0) & (offset < extent)
     return jnp.einsum("bthr,rts->bhts", r, rows) * near
 
 
-def _length_scale(pos: jax.Array, log_scale: float, floor: int) -> jax.Array:
-    """The factor on each query's logits, (..., t, 1) for its position: 1 + log_scale *
+def _length_scale(
+    pos: Int[Array, "*lead t"], log_scale: float, floor: int
+) -> Float[Array, "*lead t 1"]:
+    """The factor on each query's logits, for its position: 1 + log_scale *
     ln(max(n / floor, 1)), at position n counted from 1."""
     ahead = jnp.maximum((pos + 1) / floor, 1.0)
     return (1 + log_scale * jnp.log(ahead))[..., None]
 
 
-def _softmax_with_sinks(logits: jax.Array, sinks: jax.Array) -> jax.Array:
-    """Softmax over the keys of (b, h, t, s) logits, next to a per-head sink logit that
-    takes a share of the probability and attends to nothing."""
+def _softmax_with_sinks(
+    logits: Float[Array, "b h t s"], sinks: Float[Array, " h"]
+) -> Float[Array, "b h t s"]:
+    """Softmax over the keys, next to a per-head sink logit that takes a share of the
+    probability and attends to nothing."""
     b, h, t, _ = logits.shape
     sink = jnp.broadcast_to(sinks[None, :, None, None], (b, h, t, 1))
     return jax.nn.softmax(jnp.concatenate([logits, sink], -1))[..., :-1]
@@ -60,6 +69,9 @@ class Attention(nnx.Module):
     Ports: `v` written pushes the values, read mixes the tap's values in with a learned
     weight (value residual); `kv` written pushes (k, v), read uses them instead of
     projecting its own (cross-layer KV sharing).
+
+    Shapes: b rows, t queries and s keys (the same positions), d the width, h heads and
+    g kv heads, k and v the head dims of keys and values.
     """
 
     def __init__(
@@ -111,7 +123,7 @@ class Attention(nnx.Module):
         self.out_norm = Norm(c.output_norm, dv) if c.output_norm else None
         self.gate_activation = c.gate_activation
 
-    def __call__(self, x, taps: Taps):
+    def __call__(self, x: Float[Array, "b t d"], taps: Taps) -> Float[Array, "b t d"]:
         pos = positions(taps)
         q, *kv = self._projections(x)
         q = self._queries(q, pos)
@@ -128,16 +140,18 @@ class Attention(nnx.Module):
         out = jnp.einsum("bhts,bshd->bthd", probs, self._per_query_head(v))
         return self._output(x, out)
 
-    def _projections(self, x) -> list[jax.Array]:
-        """The (b, t, channels) queries, then keys and values unless the layer reads
-        them from its kv port: slices of one projection when fused, else one each."""
+    def _projections(self, x: Float[Array, "b t d"]) -> list[Float[Array, "b t _"]]:
+        """The projected queries, then keys and values unless the layer reads them from
+        its kv port: slices of one projection when fused, else one each."""
         if self.qkv is not None:
             q, k = self.heads * self.head_dim, self.kv_heads * self.head_dim
             return jnp.split(self.qkv(x), [q, q + k], axis=-1)
         return [p(x) for p in (self.q, self.k, self.v) if p is not None]
 
-    def _queries(self, q: jax.Array, pos: jax.Array | None) -> jax.Array:
-        """The (b, t, heads, head_dim) queries, from their projection."""
+    def _queries(
+        self, q: Float[Array, "b t _"], pos: Int[Array, "b t"] | None
+    ) -> Float[Array, "b t h k"]:
+        """The queries, from their projection."""
         b, t, _ = q.shape
         q = q.reshape(b, t, self.heads, self.head_dim)
         if self.q_norm is not None:
@@ -147,10 +161,9 @@ class Attention(nnx.Module):
         return q
 
     def _keys_and_values(
-        self, k: jax.Array, v: jax.Array, taps: Taps
-    ) -> tuple[jax.Array, jax.Array]:
-        """The (b, t, kv_heads, head_dim) keys and (b, t, kv_heads, v_head_dim) values,
-        from their projections."""
+        self, k: Float[Array, "b s _"], v: Float[Array, "b s _"], taps: Taps
+    ) -> tuple[Float[Array, "b s g k"], Float[Array, "b s g v"]]:
+        """The keys and values, from their projections."""
         b, t, _ = k.shape
         if self.k_conv is not None and self.v_conv is not None:
             k, v = k + self.k_conv(k, taps), v + self.v_conv(v, taps)
@@ -162,15 +175,19 @@ class Attention(nnx.Module):
             k = rotate(k, self.rope, positions(taps))
         return k, v
 
-    def _per_query_head(self, kv: jax.Array) -> jax.Array:
+    def _per_query_head(self, kv: Float[Array, "b s g e"]) -> Float[Array, "b s h e"]:
         """Keys or values repeated for every query head of their group."""
         return jnp.repeat(kv, self.heads // self.kv_heads, axis=2)
 
     def _logits(
-        self, x, q: jax.Array, k: jax.Array, pos: jax.Array | None
-    ) -> jax.Array:
-        """The (b, heads, t, s) logits, at the dtype's minimum for keys a query does not
-        see: later ones, and those of other documents."""
+        self,
+        x: Float[Array, "b t d"],
+        q: Float[Array, "b t h k"],
+        k: Float[Array, "b s g k"],
+        pos: Int[Array, "b t"] | None,
+    ) -> Float[Array, "b h t s"]:
+        """The logits, at the dtype's minimum for keys a query does not see: later ones,
+        and those of other documents."""
         b, t, _ = x.shape
         index = jnp.arange(t)
         offset = (
@@ -192,9 +209,10 @@ class Attention(nnx.Module):
             visible = visible & (doc[:, None, :, None] == doc[:, None, None, :])
         return jnp.where(visible, logits, jnp.finfo(logits.dtype).min)
 
-    def _output(self, x, out: jax.Array) -> jax.Array:
-        """The (b, t, heads, v_head_dim) head outputs, normalized, gated and projected
-        back to the width."""
+    def _output(
+        self, x: Float[Array, "b t d"], out: Float[Array, "b t h v"]
+    ) -> Float[Array, "b t d"]:
+        """The head outputs, normalized, gated and projected back to the width."""
         b, t, _ = x.shape
         if self.out_norm is not None:
             out = self.out_norm(out)
@@ -205,5 +223,7 @@ class Attention(nnx.Module):
 
 
 @register("gqa")
-def _(c: cfg.GQAConfig, width, ports, ctx: Context):
+def _(
+    c: cfg.GQAConfig, width: int, ports: tuple[ir.Port, ...], ctx: Context
+) -> Attention:
     return Attention(c, width, ports, ctx.rngs)

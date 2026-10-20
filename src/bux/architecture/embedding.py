@@ -2,6 +2,7 @@
 
 import jax.numpy as jnp
 from flax import nnx
+from jaxtyping import Array, Float, Int
 
 from bux import config as cfg
 from bux.architecture.functional import softcap
@@ -15,6 +16,7 @@ from bux.architecture.registry import (
     positions,
     register,
 )
+from bux.lang import ir
 
 
 class Embedding(nnx.Module):
@@ -27,12 +29,12 @@ class Embedding(nnx.Module):
         self.norm = Norm(c.norm, d) if c.norm is not None else None
         self.dropout = nnx.Dropout(c.dropout, rngs=rngs)
 
-    def embed_tokens(self, tokens):
+    def embed_tokens(self, tokens: Int[Array, "b t"]) -> Float[Array, "b t d"]:
         """The token embedding, scaled and normalized: what nextn sees."""
         x = self.tokens(tokens) * self.multiplier
         return x if self.norm is None else self.norm(x)
 
-    def __call__(self, tokens, taps: Taps):
+    def __call__(self, tokens: Int[Array, "b t"], taps: Taps) -> Float[Array, "b t d"]:
         x = self.embed_tokens(tokens)
         if self.positions is not None:
             pos = positions(taps)
@@ -41,7 +43,9 @@ class Embedding(nnx.Module):
 
 
 @register("embed")
-def _(c: cfg.EmbeddingConfig, width, ports, ctx: Context):
+def _(
+    c: cfg.EmbeddingConfig, width: ir.Width, ports: tuple[ir.Port, ...], ctx: Context
+) -> Embedding:
     assert ctx.arch.vocab_size is not None
     embedding = Embedding(c, ctx.arch.vocab_size, ctx.arch.d_model, ctx.rngs)
     if ctx.embedding is None:
@@ -60,7 +64,9 @@ class Head(nnx.Module):
         self.bias = nnx.Param(jnp.zeros(vocab)) if c.tied and c.bias else None
         self.softcap = c.softcap
 
-    def __call__(self, x, taps: Taps):
+    def __call__(
+        self, x: Float[Array, "b t d"], taps: Taps
+    ) -> Float[Array, "b t vocab"]:
         if self.embedding is not None:
             logits = self.embedding.tokens.attend(x)
         else:
@@ -74,7 +80,9 @@ class Head(nnx.Module):
 
 
 @register("head")
-def _(c: cfg.LMHeadConfig, width, ports, ctx: Context):
+def _(
+    c: cfg.LMHeadConfig, width: int, ports: tuple[ir.Port, ...], ctx: Context
+) -> Head:
     return Head(c, width, ctx)
 
 
@@ -91,7 +99,7 @@ class NextN(nnx.Module):
             ctx.arch.d_model + width, width, use_bias=False, rngs=ctx.rngs
         )
 
-    def __call__(self, x, taps: Taps):
+    def __call__(self, x: Float[Array, "b t d"], taps: Taps) -> Float[Array, "b t d"]:
         runs = taps.setdefault(NEXTN, [])
         runs.append(None)
         k, tokens = len(runs), taps[TOKENS][0]
@@ -102,5 +110,7 @@ class NextN(nnx.Module):
 
 
 @register("nextn")
-def _(c: cfg.NextNConfig, width, ports, ctx: Context):
+def _(
+    c: cfg.NextNConfig, width: int, ports: tuple[ir.Port, ...], ctx: Context
+) -> NextN:
     return NextN(c, width, ctx)

@@ -8,10 +8,12 @@ documents a reduce gets, in key order, do not depend on the engine.
 import hashlib
 import itertools
 import json
+from collections.abc import Buffer, Iterable
 from dataclasses import dataclass
 
 import numpy as np
 import pyarrow as pa
+from jaxtyping import Bool, Int64, Integer
 
 from bux.data.tokenizer import Tokenizer, utf8
 from bux.train import config as tcfg
@@ -43,7 +45,7 @@ TEMPLATES = {
 }
 
 
-def _keys(contents) -> np.ndarray:
+def _keys(contents: Iterable[Buffer]) -> Int64[np.ndarray, " docs"]:
     return np.fromiter(
         (
             int.from_bytes(hashlib.blake2b(c, digest_size=8).digest()) >> 1
@@ -53,12 +55,19 @@ def _keys(contents) -> np.ndarray:
     )
 
 
-def _in_split(keys: np.ndarray, split: tuple[float, float]) -> np.ndarray:
+def _in_split(
+    keys: Int64[np.ndarray, " docs"], split: tuple[float, float]
+) -> Bool[np.ndarray, " docs"]:
     at = keys * 2.0**-63
     return (split[0] <= at) & ((at < split[1]) | (split[1] == 1))
 
 
-def of(keys: np.ndarray, ids: np.ndarray, offsets: np.ndarray, mask: np.ndarray):
+def of(
+    keys: Int64[np.ndarray, " docs"],
+    ids: Integer[np.ndarray, " tokens"],
+    offsets: Integer[np.ndarray, " docs+1"],
+    mask: Bool[np.ndarray, " tokens"],
+) -> pa.RecordBatch:
     offsets = pa.array(offsets.astype(np.int32))
     columns = [
         pa.array(keys, pa.int64()),

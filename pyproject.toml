@@ -7,6 +7,7 @@ dependencies = [
     "flax>=0.12.10",
     "gigatoken>=0.10.0,<0.11",
     "jax>=0.11.2",
+    "jaxtyping>=0.3.11",
     "matplotlib>=3.11.2",
     "numpy>=2.5.4",
     "optax>=0.2.8",
@@ -18,6 +19,7 @@ dependencies = [
 
 [dependency-groups]
 dev = [
+    "beartype>=0.23.1",
     "jupyterlab>=4.6.4",
     "pygls>=2.1.1",
     "pytest>=9.1.1",
@@ -51,7 +53,23 @@ build-backend = "uv_build"
 path = ["examples", "experiments"]
 
 [tool.pytest.ini_options]
-testpaths = ["tests"]
+testpaths = ["tests"]  # tests/conftest.py has every array checked as they run
+# flax's nnx.State is generic over typing.Hashable keys, which beartype frowns on
+filterwarnings = ["ignore::beartype.roar.BeartypeDecorHintPep585DeprecationWarning"]
+
+[tool.ruff.lint]
+# Every function says what it takes and returns; tests/test_typing.py checks that the
+# arrays among them say their dtype and shape.
+extend-select = ["ANN0", "ANN2"]
+# An annotation that names its own class, or a name imported only for type checking,
+# stays quoted: jaxtyping evaluates annotations where a function is defined.
+ignore = ["UP037"]
+
+[tool.ruff.lint.flake8-annotations]
+mypy-init-return = true
+
+[tool.ruff.lint.per-file-ignores]
+"tests/**" = ["ANN"]
 
 [tool.ty.terminal]
 error-on-warning = true

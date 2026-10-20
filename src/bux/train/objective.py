@@ -14,17 +14,18 @@ from typing import NamedTuple
 import jax
 import jax.numpy as jnp
 import optax
+from jaxtyping import Array, Float
 
 from bux.lang import ir
 from bux.train import config as tcfg
 from bux.train.data import Batch
 
-Logits = Sequence[jax.Array]  # every head's, (batch, seq, vocab), in execution order
+Logits = Sequence[Float[Array, "b t vocab"]]  # every head's, in execution order
 
 
 class Term(NamedTuple):
     weight: float
-    fn: Callable[[Logits, Batch], jax.Array]  # a scalar
+    fn: Callable[[Logits, Batch], Float[Array, ""]]
 
 
 @dataclass
@@ -35,7 +36,7 @@ class Objective:
 
     def __call__(
         self, logits: Logits, batch: Batch
-    ) -> tuple[jax.Array, dict[str, jax.Array]]:
+    ) -> tuple[Float[Array, ""], dict[str, Float[Array, ""]]]:
         """The loss to minimize, and its terms."""
         metrics = {name: term.fn(logits, batch) for name, term in self.terms.items()}
         total = jnp.zeros((), jnp.float32)
@@ -54,7 +55,7 @@ def objective(c: tcfg.LossConfig, arch: ir.Architecture) -> Objective:
         terms["z_loss"] = Term(c.z, lambda logits, b: z_loss(logits[0]))
     if len(ahead) > 1:
 
-        def mtp(logits: Logits, b: Batch) -> jax.Array:
+        def mtp(logits: Logits, b: Batch) -> Float[Array, ""]:
             further = zip(logits[1:], ahead[1:], strict=True)
             return jnp.mean(jnp.stack([cross_entropy(o, b, a) for o, a in further]))
 
@@ -73,7 +74,9 @@ def lookahead(arch: ir.Architecture) -> list[int]:
     return ahead or [1]
 
 
-def cross_entropy(logits: jax.Array, batch: Batch, ahead: int = 1) -> jax.Array:
+def cross_entropy(
+    logits: Float[Array, "b t vocab"], batch: Batch, ahead: int = 1
+) -> Float[Array, ""]:
     """The mean loss of logits over positions t that predict a target, token t + ahead,
     of their own document: at least `ahead` tokens into it. A position with nothing
     that far ahead in its row, or in its document, is left out."""
@@ -85,6 +88,6 @@ def cross_entropy(logits: jax.Array, batch: Batch, ahead: int = 1) -> jax.Array:
     return jnp.sum(loss * weight) / jnp.maximum(jnp.sum(weight), 1)
 
 
-def z_loss(logits: jax.Array) -> jax.Array:
+def z_loss(logits: Float[Array, "b t vocab"]) -> Float[Array, ""]:
     """The mean of log(Z)^2, which keeps the softmax's normalizer near 1 (PaLM)."""
     return jnp.mean(jax.nn.logsumexp(logits.astype(jnp.float32), axis=-1) ** 2)

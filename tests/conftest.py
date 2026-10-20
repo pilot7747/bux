@@ -1,4 +1,17 @@
-"""Fixtures for the data tests: a tokenizer and a corpus that need no network."""
+"""Fixtures for the data tests: a tokenizer and a corpus that need no network.
+
+First, before anything imports bux, jaxtyping instruments the packages that handle
+arrays, so that every call the tests make checks the dtype and shape of every array
+into and out of a function, with beartype taking an int where a float goes, as a static
+type checker does. (Its --jaxtyping-packages flag takes one package with that checker.)
+"""
+
+import jaxtyping
+
+jaxtyping.install_import_hook(
+    ["bux.architecture", "bux.data", "bux.train"],
+    "beartype.beartype(conf=beartype.BeartypeConf(is_pep484_tower=True))",
+)
 
 import json
 

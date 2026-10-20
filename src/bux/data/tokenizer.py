@@ -17,6 +17,7 @@ import pyarrow as pa
 # Resolves a Hub repo id or a path to the tokenizer.json contents. gigatoken does not
 # export it, hence the pinned minor version.
 from gigatoken._load.hf import to_tokenizer_json
+from jaxtyping import Int32, Int64, UInt8
 
 from bux.train import config as tcfg
 
@@ -37,7 +38,7 @@ class Tokenizer:
                 self.specials[token] = self.vocab_size
                 self.vocab_size += 1
         self.bos, self.eos = self.special(c.bos), self.special(c.eos)
-        self._markup: dict[str, np.ndarray] = {}
+        self._markup: dict[str, Int32[np.ndarray, " ids"]] = {}
 
     def special(self, token: str) -> int:
         if token not in self.specials:
@@ -47,9 +48,11 @@ class Tokenizer:
             )
         return self.specials[token]
 
-    def encode(self, texts: pa.Array) -> tuple[np.ndarray, np.ndarray]:
-        """The ids of every string, end to end as int32, and n + 1 offsets of where
-        each one's start. Nulls are empty."""
+    def encode(
+        self, texts: pa.Array
+    ) -> tuple[Int32[np.ndarray, " ids"], Int64[np.ndarray, " _"]]:
+        """The ids of every string, end to end, and n + 1 offsets of where each one's
+        start. Nulls are empty."""
         start, chars = utf8(texts)
         strings = ak.contents.ListOffsetArray(
             ak.index.Index64(start),
@@ -62,13 +65,13 @@ class Tokenizer:
         bounds = np.asarray(out.offsets, np.int64)
         return ids[bounds[0] : bounds[-1]], bounds - bounds[0]
 
-    def markup(self, text: str) -> np.ndarray:
+    def markup(self, text: str) -> Int32[np.ndarray, " ids"]:
         """Template text, in which every <|name|> is that special token."""
         if text not in self._markup:
             self._markup[text] = self._encode_markup(text)
         return self._markup[text]
 
-    def _encode_markup(self, text: str) -> np.ndarray:
+    def _encode_markup(self, text: str) -> Int32[np.ndarray, " ids"]:
         pieces = _SPECIAL.split(text)
         plain = pa.array(pieces[::2], pa.large_string())
         ids, offsets = self.encode(plain)
@@ -81,7 +84,9 @@ class Tokenizer:
         return np.concatenate(out)
 
 
-def utf8(texts: pa.Array) -> tuple[np.ndarray, np.ndarray]:
+def utf8(
+    texts: pa.Array,
+) -> tuple[Int64[np.ndarray, " _"], UInt8[np.ndarray, " bytes"]]:
     """The bytes of strings, without a copy: n + 1 offsets into one array of them."""
     texts = texts.cast(pa.large_string())
     _, offsets, data = texts.buffers()

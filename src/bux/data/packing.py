@@ -13,6 +13,7 @@ from dataclasses import dataclass
 
 import numpy as np
 import pyarrow as pa
+from jaxtyping import Bool, Int, Int32, Int64, Shaped
 
 from bux.train import config as tcfg
 
@@ -25,7 +26,9 @@ SCHEMA = pa.schema(
 )
 
 
-def flat(column: pa.ChunkedArray) -> tuple[np.ndarray, np.ndarray]:
+def flat(
+    column: pa.ChunkedArray,
+) -> tuple[Shaped[np.ndarray, " values"], Int64[np.ndarray, " _"]]:
     """A list column's values end to end, and n + 1 offsets into them."""
     lists = column.cast(pa.large_list(column.type.value_type)).combine_chunks()
     offsets = lists.offsets.to_numpy()
@@ -36,13 +39,14 @@ def flat(column: pa.ChunkedArray) -> tuple[np.ndarray, np.ndarray]:
 class Docs:
     """Documents in key order, end to end, then a row of padding."""
 
-    ids: np.ndarray
-    mask: np.ndarray
-    positions: np.ndarray  # of every token in its document, and in the padding
-    offsets: np.ndarray  # n + 1, where the documents start; the last is the padding's
+    ids: Int32[np.ndarray, " tokens"]
+    mask: Bool[np.ndarray, " tokens"]
+    positions: Int32[np.ndarray, " tokens"]  # in its document, and in the padding
+    # n + 1, where the documents start; the last is the padding's
+    offsets: Int64[np.ndarray, " _"]
 
     @classmethod
-    def of(cls, table: pa.Table, length: int) -> Docs:
+    def of(cls, table: pa.Table, length: int) -> "Docs":
         table = table.sort_by("key")  # whatever order an engine delivered them in
         ids, offsets = flat(table["input_ids"])
         mask, _ = flat(table["loss_mask"])
@@ -57,13 +61,15 @@ class Docs:
 
 @dataclass(frozen=True)
 class Plan:
-    starts: np.ndarray  # of the pieces, in row order
-    lengths: np.ndarray
-    rows: np.ndarray  # r + 1, where every row's pieces start
+    starts: Int[np.ndarray, " pieces"]  # in row order
+    lengths: Int[np.ndarray, " pieces"]
+    rows: Int[np.ndarray, " _"]  # r + 1, where every row's pieces start
     stats: Counter
 
 
-def _pieces(docs: Docs, long: str, length: int):
+def _pieces(
+    docs: Docs, long: str, length: int
+) -> tuple[Int[np.ndarray, " pieces"], Int[np.ndarray, " pieces"], Counter]:
     """Pieces of the documents: whole when they fit, else dropped, truncated, or split
     into pieces of `length` that overlap by a token, so that no target is lost."""
     sizes = np.diff(docs.offsets)
@@ -85,7 +91,9 @@ def _pieces(docs: Docs, long: str, length: int):
     )
 
 
-def _next_fit(sizes: np.ndarray, length: int, max_docs: int | None) -> list[list[int]]:
+def _next_fit(
+    sizes: Int[np.ndarray, " pieces"], length: int, max_docs: int | None
+) -> list[list[int]]:
     """Pieces in order, a new row whenever the next does not fit in the last."""
     rows: list[list[int]] = []
     room = 0
@@ -99,7 +107,7 @@ def _next_fit(sizes: np.ndarray, length: int, max_docs: int | None) -> list[list
 
 
 def _best_fit(
-    sizes: np.ndarray, length: int, max_docs: int | None, sort: bool
+    sizes: Int[np.ndarray, " pieces"], length: int, max_docs: int | None, sort: bool
 ) -> list[list[int]]:
     """Each piece, the longest first, into the open row with the least room for it."""
     order = np.argsort(-sizes, kind="stable") if sort else np.arange(len(sizes))
@@ -126,7 +134,14 @@ def _best_fit(
     return rows
 
 
-def _layout(rows, starts, lengths, length: int, pad: int, stats: Counter) -> Plan:
+def _layout(
+    rows: list[list[int]],
+    starts: Int[np.ndarray, " pieces"],
+    lengths: Int[np.ndarray, " pieces"],
+    length: int,
+    pad: int,
+    stats: Counter,
+) -> Plan:
     """The rows' pieces end to end, each row's padded to `length`."""
     counts = np.array([len(r) for r in rows], np.int64)
     flat = np.fromiter(itertools.chain.from_iterable(rows), np.int64, counts.sum())

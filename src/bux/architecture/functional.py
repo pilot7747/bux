@@ -2,9 +2,10 @@
 
 import jax
 import jax.numpy as jnp
+from jaxtyping import Array, Float
 
 
-def activation(name: str, x: jax.Array) -> jax.Array:
+def activation(name: str, x: Float[Array, "*shape"]) -> Float[Array, "*shape"]:
     match name:
         case "relu":
             return jax.nn.relu(x)
@@ -27,11 +28,13 @@ def activation(name: str, x: jax.Array) -> jax.Array:
     raise ValueError(name)
 
 
-def softcap(x: jax.Array, cap: float | None) -> jax.Array:
+def softcap(x: Float[Array, "*shape"], cap: float | None) -> Float[Array, "*shape"]:
     return x if cap is None else cap * jnp.tanh(x / cap)
 
 
-def bound(x: jax.Array, limit: float | None, cap: float | None) -> jax.Array:
+def bound(
+    x: Float[Array, "*shape"], limit: float | None, cap: float | None
+) -> Float[Array, "*shape"]:
     """The up branch of a GLU, clamped to +-limit and/or tanh soft-capped."""
     if limit is not None:
         x = jnp.clip(x, -limit, limit)

@@ -5,8 +5,9 @@ import operator
 
 import jax.numpy as jnp
 from flax import nnx
+from jaxtyping import Array, Shaped
 
-from bux.architecture.registry import Context, Taps, build_layer
+from bux.architecture.registry import Context, Stream, Taps, build_layer
 from bux.lang import ir
 
 
@@ -14,7 +15,7 @@ class Sequence(nnx.Module):
     def __init__(self, items: list[nnx.Module]):
         self.items = nnx.List(items)
 
-    def __call__(self, x, taps: Taps):
+    def __call__(self, x: Stream, taps: Taps) -> Stream:
         for item in self.items:
             x = item(x, taps)
         return x
@@ -24,7 +25,7 @@ class ResidualBranch(nnx.Module):
     def __init__(self, body: nnx.Module):
         self.body = body
 
-    def __call__(self, x, taps: Taps):
+    def __call__(self, x: Stream, taps: Taps) -> Stream:
         return x + self.body(x, taps)
 
 
@@ -33,7 +34,7 @@ class Parallel(nnx.Module):
         self.branches = nnx.List(branches)
         self.op = op
 
-    def __call__(self, x, taps: Taps):
+    def __call__(self, x: Stream, taps: Taps) -> Stream:
         outs = [branch(x, taps) for branch in self.branches]
         return functools.reduce(
             operator.add if self.op == "sum" else operator.mul, outs
@@ -44,7 +45,7 @@ class Negate(nnx.Module):
     def __init__(self, body: nnx.Module):
         self.body = body
 
-    def __call__(self, x, taps: Taps):
+    def __call__(self, x: Stream, taps: Taps) -> Stream:
         return -self.body(x, taps)
 
 
@@ -52,12 +53,12 @@ class Constant(nnx.Module):
     def __init__(self, value: float):
         self.value = value
 
-    def __call__(self, x, taps: Taps):
+    def __call__(self, x: Stream, taps: Taps) -> Shaped[Array, ""]:
         return jnp.asarray(self.value, dtype=x.dtype)
 
 
 class Identity(nnx.Module):
-    def __call__(self, x, taps: Taps):
+    def __call__(self, x: Stream, taps: Taps) -> Stream:
         return x
 
 
@@ -65,7 +66,7 @@ class TapWrite(nnx.Module):
     def __init__(self, name: str):
         self.name = name
 
-    def __call__(self, x, taps: Taps):
+    def __call__(self, x: Stream, taps: Taps) -> Stream:
         taps.setdefault(self.name, []).append(x)
         return x
 
@@ -75,7 +76,7 @@ class TapRead(nnx.Module):
         self.name = name
         self.pop = pop
 
-    def __call__(self, x, taps: Taps):
+    def __call__(self, x: Stream, taps: Taps) -> Stream:
         stack = taps[self.name]
         return stack.pop() if self.pop else stack[-1]
 

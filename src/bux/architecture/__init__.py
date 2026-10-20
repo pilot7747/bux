@@ -11,6 +11,9 @@ each register one family of layers. Other mixers plug in the same way:
 Modules are called as ``module(x, taps)``: ``taps`` holds the tap stacks for one
 forward pass, and under reserved keys the input tokens and the logits of every head
 run so far. Repeats are unrolled; nodes with a share key are built once and reused.
+
+Arrays say their dtype and shape with jaxtyping, as ``x: Float[Array, "b t d"]`` for a
+stream of b rows of t positions, d wide, and the tests check them on every call.
 """
 
 # Importing the layer modules registers their layers.

@@ -3,12 +3,14 @@
 import jax
 import jax.numpy as jnp
 from flax import nnx
+from jaxtyping import Array, Float
 
 from bux import config as cfg
 from bux.architecture.functional import activation, bound
 from bux.architecture.mlp import MLP
 from bux.architecture.norm import Norm
 from bux.architecture.registry import Context, Taps, register
+from bux.lang import ir
 
 
 class MoE(nnx.Module):
@@ -73,7 +75,7 @@ class MoE(nnx.Module):
             else None
         )
 
-    def __call__(self, x, taps: Taps):
+    def __call__(self, x: Float[Array, "b t d"], taps: Taps) -> Float[Array, "b t d"]:
         logits = self.router(x) * self.router_logit_scale
         match self.router_fn:
             case "softmax":
@@ -120,5 +122,5 @@ class MoE(nnx.Module):
 
 
 @register("moe")
-def _(c: cfg.MoEConfig, width, ports, ctx: Context):
+def _(c: cfg.MoEConfig, width: int, ports: tuple[ir.Port, ...], ctx: Context) -> MoE:
     return MoE(c, width, ctx.rngs)

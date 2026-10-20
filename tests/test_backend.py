@@ -5,6 +5,7 @@ import jax
 import jax.numpy as jnp
 import pytest
 from flax import nnx
+from jaxtyping import Array, Int
 
 from bux import config as cfg
 from bux.architecture import (
@@ -45,7 +46,7 @@ def layer[T](m: Model, index: int, cls: type[T]) -> T:
     return item
 
 
-def tokens(seed: int = 0, length: int = 8) -> jax.Array:
+def tokens(seed: int = 0, length: int = 8) -> Int[Array, "b t"]:
     return jax.random.randint(jax.random.key(seed), (2, length), 0, V)
 
 

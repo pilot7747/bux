@@ -22,17 +22,19 @@ from collections.abc import Callable, Iterator
 from pathlib import Path
 from typing import TYPE_CHECKING
 
-import jax
 import orbax.checkpoint as ocp
+from jaxtyping import Array, Float
 
 from bux.train.data import Batch
 from bux.train.optim import Schedule
 from bux.train.sinks import Report
 
 if TYPE_CHECKING:
+    # Quoted where used: jaxtyping, which checks annotations as the tests run, reads
+    # them as a module loads, and trainer.py imports this one.
     from bux.train.trainer import Trainer
 
-Metrics = dict[str, jax.Array]  # what a step measured, still on the device
+Metrics = dict[str, Float[Array, ""]]  # what a step measured, still on the device
 
 
 class Hook:
@@ -42,10 +44,10 @@ class Hook:
         """Whether the hook runs after `step` of a run of `steps`."""
         return step % self.every == 0 or step == steps
 
-    def start(self, trainer: Trainer) -> None:
+    def start(self, trainer: "Trainer") -> None:
         """Before the first step."""
 
-    def __call__(self, trainer: Trainer, metrics: Metrics) -> Report | None:
+    def __call__(self, trainer: "Trainer", metrics: Metrics) -> Report | None:
         """After a step that it is due at, with what the step measured."""
         raise NotImplementedError
 
@@ -61,10 +63,10 @@ class Log(Hook):
         self.every, self.lr, self.tokens = every, lr, tokens  # tokens a step
         self.clock, self.since = time.perf_counter(), 0
 
-    def start(self, trainer: Trainer) -> None:
+    def start(self, trainer: "Trainer") -> None:
         self.clock, self.since = time.perf_counter(), trainer.step
 
-    def __call__(self, trainer: Trainer, metrics: Metrics) -> Report:
+    def __call__(self, trainer: "Trainer", metrics: Metrics) -> Report:
         report = {k: float(v) for k, v in metrics.items()}  # waits for the step
         now = time.perf_counter()
         seen = (trainer.step - self.since) * self.tokens
@@ -86,7 +88,7 @@ class Eval(Hook):
     ):
         self.data, self.every, self.batches = data, every, batches
 
-    def __call__(self, trainer: Trainer, metrics: Metrics) -> Report:
+    def __call__(self, trainer: "Trainer", metrics: Metrics) -> Report:
         held_out = itertools.islice(self.data(), self.batches)
         return {"eval_loss": trainer.evaluate(held_out)}
 
@@ -101,7 +103,7 @@ class Checkpoint(Hook):
             folder.resolve(), options=ocp.CheckpointManagerOptions(max_to_keep=keep)
         )
 
-    def restore(self, trainer: Trainer) -> bool:
+    def restore(self, trainer: "Trainer") -> bool:
         """Load the latest checkpoint into `trainer`, if there is one."""
         if (latest := self.manager.latest_step()) is None:
             return False
@@ -109,7 +111,7 @@ class Checkpoint(Hook):
         trainer.load(self.manager.restore(latest, args=args), step=latest)
         return True
 
-    def __call__(self, trainer: Trainer, metrics: Metrics) -> None:
+    def __call__(self, trainer: "Trainer", metrics: Metrics) -> None:
         self.manager.save(trainer.step, args=ocp.args.StandardSave(trainer.state()))
 
     def close(self) -> None:

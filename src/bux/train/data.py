@@ -16,10 +16,11 @@ import itertools
 import json
 from collections.abc import Iterator, Sequence
 from pathlib import Path
-from typing import NamedTuple, Protocol
+from typing import NamedTuple, Protocol, runtime_checkable
 
 import numpy as np
 import pyarrow.parquet as pq
+from jaxtyping import Array, Bool, Int, Int32, Integer
 
 from bux.data.pipeline import DEFAULT_CACHE, Job
 from bux.train import config as tcfg
@@ -27,21 +28,23 @@ from bux.train.registry import Registry
 
 
 class Batch(NamedTuple):
-    input_ids: np.ndarray  # (rows, seq_len) int32
-    position_ids: np.ndarray  # int32
-    loss_mask: np.ndarray  # bool
+    # numpy arrays on the host, and jax ones once the trainer puts them on a device
+    input_ids: Int32[np.ndarray | Array, "b t"]
+    position_ids: Int32[np.ndarray | Array, "b t"]
+    loss_mask: Bool[np.ndarray | Array, "b t"]
 
     @classmethod
-    def concat(cls, parts: Sequence[Batch]) -> Batch:
+    def concat(cls, parts: Sequence["Batch"]) -> "Batch":
         return cls(*(np.concatenate(c) for c in zip(*parts, strict=True)))
 
 
-def plain(ids: np.ndarray) -> Batch:
+def plain(ids: Integer[np.ndarray, "b t"]) -> Batch:
     """Rows that each read as one text, every token a target."""
     positions = np.broadcast_to(np.arange(ids.shape[1], dtype=np.int32), ids.shape)
     return Batch(ids.astype(np.int32), positions, np.ones(ids.shape, bool))
 
 
+@runtime_checkable
 class Source(Protocol):
     def rows(self, start: int, n: int) -> Batch:
         """Rows `start` to `start + n` of the source's endless stream."""
@@ -49,7 +52,7 @@ class Source(Protocol):
 
 
 @functools.lru_cache(maxsize=8)
-def _order(n: int, seed: tuple[int, ...], epoch: int) -> np.ndarray:
+def _order(n: int, seed: tuple[int, ...], epoch: int) -> Int[np.ndarray, " n"]:
     """A permutation of range(n), a new one every epoch."""
     return np.random.default_rng((*seed, epoch)).permutation(n)
 
@@ -161,17 +164,35 @@ sources = Registry[Source]("data source", "bux.train.data.sources")
 
 
 @sources.register("text", "chat")
-def _(c: tcfg.TextConfig | tcfg.ChatConfig, t, vocab_size, cache, seed) -> Source:
+def _(
+    c: tcfg.TextConfig | tcfg.ChatConfig,
+    t: tcfg.TrainConfig,
+    vocab_size: int,
+    cache: str | Path,
+    seed: tuple[int, ...],
+) -> Source:
     return Prepared(Path(cache) / Job.of(c, t).name, vocab_size, t.seq_len, seed)
 
 
 @sources.register("tokens")
-def _(c: tcfg.TokensConfig, t, vocab_size, cache, seed) -> Source:
+def _(
+    c: tcfg.TokensConfig,
+    t: tcfg.TrainConfig,
+    vocab_size: int,
+    cache: str | Path,
+    seed: tuple[int, ...],
+) -> Source:
     return Shards(c, t.seq_len, seed)
 
 
 @sources.register("synthetic")
-def _(c: tcfg.SyntheticConfig, t, vocab_size, cache, seed) -> Source:
+def _(
+    c: tcfg.SyntheticConfig,
+    t: tcfg.TrainConfig,
+    vocab_size: int,
+    cache: str | Path,
+    seed: tuple[int, ...],
+) -> Source:
     return Synthetic(vocab_size, t.seq_len, seed)
 
 

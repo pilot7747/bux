@@ -339,6 +339,15 @@ wheels = [
 ]
 
 [[package]]
+name = "beartype"
+version = "0.23.1"
+source = { registry = "https://pypi.org/simple" }
+sdist = { url = "https://files.pythonhosted.org/packages/79/34/c0cfdaee9c796c8381439fed0fcab62810753b8b0adb1ec88fa7f41eaa5d/beartype-0.23.1.tar.gz", hash = "sha256:8b805f246b32931c74f2b321ea0939fe5bb2ff43c12a3eff19cc4c854b832e1d", size = 1993714, upload-time = "2026-10-11T05:36:55.251Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/1c/cb/2f6aa982e2860c1156830db3da7f823b71784ed7d533ca289ea9b6c6347a/beartype-0.23.1-py3-none-any.whl", hash = "sha256:4461b4dc57e3fdd6c8a8464b22cf118002eea107c33e9fef651c69068ab3cce3", size = 1582101, upload-time = "2026-10-11T05:36:52.431Z" },
+]
+
+[[package]]
 name = "beautifulsoup4"
 version = "4.15.0"
 source = { registry = "https://pypi.org/simple" }
@@ -377,6 +386,7 @@ dependencies = [
     { name = "flax" },
     { name = "gigatoken" },
     { name = "jax" },
+    { name = "jaxtyping" },
     { name = "matplotlib" },
     { name = "numpy" },
     { name = "optax" },
@@ -401,6 +411,7 @@ spark = [
 
 [package.dev-dependencies]
 dev = [
+    { name = "beartype" },
     { name = "jupyterlab" },
     { name = "pygls" },
     { name = "pytest" },
@@ -415,6 +426,7 @@ requires-dist = [
     { name = "gigatoken", specifier = ">=0.10.0,<0.11" },
     { name = "jax", specifier = ">=0.11.2" },
     { name = "jax", extras = ["cuda13"], marker = "sys_platform == 'linux' and extra == 'cuda'", specifier = ">=0.11.2" },
+    { name = "jaxtyping", specifier = ">=0.3.11" },
     { name = "matplotlib", specifier = ">=3.11.2" },
     { name = "numpy", specifier = ">=2.5.4" },
     { name = "optax", specifier = ">=0.2.8" },
@@ -431,6 +443,7 @@ provides-extras = ["cuda", "lsp", "spark"]
 
 [package.metadata.requires-dev]
 dev = [
+    { name = "beartype", specifier = ">=0.23.1" },
     { name = "jupyterlab", specifier = ">=4.6.4" },
     { name = "pygls", specifier = ">=2.1.1" },
     { name = "pytest", specifier = ">=9.1.1" },

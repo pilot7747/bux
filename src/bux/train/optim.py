@@ -13,7 +13,7 @@ import jax
 import jax.numpy as jnp
 import optax
 from flax import nnx
-from jax.typing import ArrayLike
+from jaxtyping import Array, ArrayLike, Float, PyTree, Real
 from optax.contrib import MuonDimensionNumbers, scale_by_muon
 from optax.contrib._muon import scale_by_shape
 
@@ -21,7 +21,7 @@ from bux.architecture import Embedding, Head, MoE
 from bux.train import config as tcfg
 from bux.train.registry import Registry
 
-Schedule = Callable[[ArrayLike], jax.Array]
+Schedule = Callable[[Real[ArrayLike, ""]], Float[Array, ""]]  # of the step
 
 schedules = Registry[Schedule]("schedule", "bux.train.optim.schedules")
 optimizers = Registry[optax.GradientTransformation](
@@ -37,7 +37,7 @@ def schedule(c: tcfg.ScheduleConfig, steps: int) -> Schedule:
     linear warmup, times the schedule's own curve."""
     curve = schedules.build(c, steps)
 
-    def multiplier(step: ArrayLike) -> jax.Array:
+    def multiplier(step: Real[ArrayLike, ""]) -> Float[Array, ""]:
         step = jnp.asarray(step, jnp.float32)
         warm = jnp.minimum((step + 1) / c.warmup, 1.0) if c.warmup else 1.0
         return jnp.asarray(warm * curve(step))
@@ -57,14 +57,14 @@ def _(c: tcfg.ConstantSchedule, steps: int) -> Schedule:
 
 @schedules.register("cosine")
 def _(c: tcfg.CosineSchedule, steps: int) -> Schedule:
-    def curve(step: ArrayLike) -> jax.Array:
+    def curve(step: Real[ArrayLike, ""]) -> Float[Array, ""]:
         t = jnp.clip((step + 1 - c.warmup) / max(steps - c.warmup, 1), 0, 1)
         return c.final + (1 - c.final) * 0.5 * (1 + jnp.cos(math.pi * t))
 
     return curve
 
 
-COOLDOWNS: dict[str, Callable[[jax.Array], jax.Array]] = {
+COOLDOWNS: dict[str, Callable[[Float[Array, ""]], Float[Array, ""]]] = {
     "linear": lambda t: 1 - t,
     "sqrt": lambda t: 1 - jnp.sqrt(t),
     "cosine": lambda t: 0.5 * (1 + jnp.cos(math.pi * t)),
@@ -75,7 +75,7 @@ COOLDOWNS: dict[str, Callable[[jax.Array], jax.Array]] = {
 def _(c: tcfg.WSDSchedule, steps: int) -> Schedule:
     cooldown = c.cooldown(steps)
 
-    def curve(step: ArrayLike) -> jax.Array:
+    def curve(step: Real[ArrayLike, ""]) -> Float[Array, ""]:
         t = jnp.clip((step + 1 - (steps - cooldown)) / max(cooldown, 1), 0, 1)
         return c.final + (1 - c.final) * COOLDOWNS[c.shape](t)
 
@@ -151,13 +151,13 @@ def muon(
     """Muon for `matrices(model)`, and AdamW for the rest."""
     dims = matrices(model)
 
-    def labels(params):
+    def labels(params: PyTree[Float[Array, "*_"]]) -> PyTree[str]:
         return jax.tree_util.tree_map_with_path(
             lambda p, _: "muon" if _keys(p) in dims else "adam", params
         )
 
     # Muon sees only its own parameters; the others are masked out of its tree.
-    def shapes(updates):
+    def shapes(updates: PyTree[Float[Array, "*_"]]) -> PyTree[MuonDimensionNumbers]:
         return jax.tree_util.tree_map_with_path(lambda p, _: dims[_keys(p)], updates)
 
     orthogonalized = optax.chain(
