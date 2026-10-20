@@ -19,7 +19,7 @@ compiler turns into a ``MixtureConfig``.
 
 from typing import Annotated, Literal
 
-from pydantic import AfterValidator, Field
+from pydantic import AfterValidator, BeforeValidator, Field
 
 from bux.config import Config
 
@@ -327,6 +327,11 @@ class LayoutConfig(Config):
     zero: Literal[1, 3] = 3  # 1: FSDP splits the optimizer state alone
 
 
+def _named_none(v: object) -> object:
+    """A method named none, which a .bux file writes as its none."""
+    return "none" if v is None else v
+
+
 class MethodsConfig(Config):
     """How each part that communicates is computed, by the name of a function in its
     registry in bux.parallel.methods: another method is a function, not a field."""
@@ -336,7 +341,7 @@ class MethodsConfig(Config):
     moe: str = "sorted"
     recurrence: str = "scan"
     repeat: str = "unroll"
-    remat: str = "none"
+    remat: Annotated[str, BeforeValidator(_named_none)] = "none"
     pipeline: str = "gpipe"
     orthogonalize: str = "gspmd"  # how Muon reaches whole matrices
     microbatches: Positive = 1
