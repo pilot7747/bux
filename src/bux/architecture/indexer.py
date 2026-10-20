@@ -13,6 +13,7 @@ from flax import nnx
 from jaxtyping import Array, Bool, Float, Int, Shaped
 
 from bux import config as cfg
+from bux import parallel
 from bux.architecture.norm import Norm
 from bux.architecture.rope import rotate
 
@@ -79,14 +80,18 @@ def _spread(
 
 
 def _top(scores: Float[Array, "b t n"], k: int) -> Bool[Array, "b t n"]:
-    """Each query's k highest scores, of those above -inf."""
-    b, t, n = scores.shape
+    """Each query's k highest scores, of those above -inf; of equal ones, the first."""
+    n = scores.shape[-1]
     if min(k, n) == 0:
         return jnp.zeros(scores.shape, bool)
-    _, index = jax.lax.top_k(scores, min(k, n))
-    rows, queries = jnp.arange(b)[:, None, None], jnp.arange(t)[None, :, None]
-    picked = jnp.zeros(scores.shape, bool).at[rows, queries, index].set(True)
-    return picked & (scores > -jnp.inf)
+    # A stable sort and a scatter mapped over rows split with the rows; lax.top_k and
+    # a scatter at broadcast indices gather every row onto each device.
+    index = jnp.argsort(-scores, axis=-1, stable=True)[..., : min(k, n)]
+
+    def pick(i: Int[Array, " k"]) -> Bool[Array, " n"]:
+        return jnp.zeros(n, bool).at[i].set(True)
+
+    return jax.vmap(jax.vmap(pick))(index) & (scores > -jnp.inf)
 
 
 def _newest(
@@ -114,6 +119,9 @@ class Indexer(nnx.Module):
     and keep keys only inside one it imports (DeepSeek-V4.1).
 
     `c.norm`, if set, normalizes each query head, and the keys instead of `key_norm`.
+
+    Its query heads split over `heads`, as the layer's do; its keys, a single head, are
+    every device's.
     """
 
     def __init__(
@@ -126,10 +134,11 @@ class Indexer(nnx.Module):
         rope: cfg.RoPEConfig | None,
         rope_dims: int,
         rngs: nnx.Rngs,
+        query: parallel.Name = "embed",
     ):
-        """Queries come from `query_width` wide inputs, and keys from `key_width` wide
-        ones, or from another layer when None. `rope` turns the first `rope_dims` dims
-        of both."""
+        """Queries come from `query_width` wide inputs, whose dimension is `query`
+        (``bux.parallel``), and keys from `key_width` wide ones, or from another layer
+        when None. `rope` turns the first `rope_dims` dims of both."""
         h, i = c.num_heads, c.head_dim
         self.heads, self.head_dim = h, i
         self.top_k, self.block_size = c.top_k, c.block_size
@@ -137,14 +146,14 @@ class Indexer(nnx.Module):
         self.candidate_top_k = c.candidate_top_k
         self.loss_weight = c.loss_weight
 
+        def linear(n_in: int, n_out: int, *names: parallel.Name) -> nnx.Linear:
+            init = parallel.named(*names)
+            return nnx.Linear(n_in, n_out, use_bias=False, kernel_init=init, rngs=rngs)
+
         # The randomly initialized layers; reordering them changes a seed's init.
-        self.q = nnx.Linear(query_width, h * i, use_bias=False, rngs=rngs)
-        self.k = (
-            nnx.Linear(key_width, i, use_bias=False, rngs=rngs) if key_width else None
-        )
-        self.weights = (
-            nnx.Linear(width, h, use_bias=False, rngs=rngs) if c.weighted else None
-        )
+        self.q = linear(query_width, h * i, query, ("heads", h))
+        self.k = linear(key_width, i, None, None) if key_width else None
+        self.weights = linear(width, h, "embed", "heads") if c.weighted else None
 
         self.q_norm = Norm(c.norm, i) if c.norm else None
         pools = c.block_size > 1  # it normalizes the blocks of keys it is given
@@ -176,7 +185,7 @@ class Indexer(nnx.Module):
         q = self.q(query).reshape(b, t, self.heads, self.head_dim)
         if self.q_norm is not None:
             q = self.q_norm(q)
-        q = self._rotate(q, pos)
+        q = parallel.shard(self._rotate(q, pos), "batch", "seq", "heads", None)
         dots = jax.nn.relu(jnp.einsum("bthi,bsi->bths", q, keys)) * self.head_dim**-0.5
         if self.weights is None:
             return dots.sum(2)
@@ -288,6 +297,7 @@ def from_stream(
     rope: cfg.RoPEConfig | None,
     rope_dims: int,
     rngs: nnx.Rngs,
+    query: parallel.Name = "embed",
 ) -> Indexer:
     """DeepSeek-V3.2's indexer, for keys that are the tokens: its keys are projected
     from the layer's input and layer-normalized (unless `c.norm` is set), and rotated
@@ -295,5 +305,5 @@ def from_stream(
     if rope is not None:
         rope = rope.model_copy(update={"layout": c.rope_layout})
     return Indexer(
-        c, width, query_width, width, _STREAM_KEY_NORM, rope, rope_dims, rngs
+        c, width, query_width, width, _STREAM_KEY_NORM, rope, rope_dims, rngs, query
     )

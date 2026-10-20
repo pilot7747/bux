@@ -10,8 +10,12 @@ from jaxtyping import Array, Bool, Float, Int
 
 from bux import config as cfg
 from bux.architecture.attention import (
+    Names,
     SoftmaxAttention,
+    _by_head,
     _causal,
+    _input,
+    _linear,
     _own_indexer,
     _read,
     _reads,
@@ -54,6 +58,9 @@ class CSA(SoftmaxAttention):
     Ports: `kv` written pushes the `Latents`, with the indexer's keys; read uses them
     instead of compressing its own, and an indexer that it runs scores those keys.
     `index` and `candidates` as for `SoftmaxAttention`, over the compressed latents.
+
+    The query heads split over `heads`, and the groups of the output projection with
+    them; the latents, a single head, are every device's.
     """
 
     def __init__(
@@ -72,24 +79,30 @@ class CSA(SoftmaxAttention):
         own_kv = r is not None and not _reads(ports, "kv")
         self.head_dim, self.compress_ratio = d, r
 
-        def linear(n_in: int, n_out: int) -> nnx.Linear:
-            return nnx.Linear(n_in, n_out, use_bias=False, rngs=rngs)
+        def linear(n_in: int, n_out: int, names: Names = (None, None)) -> nnx.Linear:
+            return _linear(n_in, n_out, names, False, rngs)
 
         # The randomly initialized layers; reordering them changes a seed's init.
         latent = c.q_lora_rank
-        self.q_a = linear(width, latent) if latent else None
-        self.q = linear(latent or width, h * d)
+        query = "latent" if latent else "embed"  # what the queries are projected from
+        self.q_a = linear(width, latent, ("embed", "latent")) if latent else None
+        self.q = linear(latent or width, h * d, (query, ("heads", h)))
         self.kv = linear(width, d)
         self.compress_kv = linear(width, d) if own_kv else None
         pooled = own_kv and r is not None and r > 1
         self.compress_gate = linear(width, d) if pooled else None
         init = nnx.initializers.lecun_normal(batch_axis=(0,))
         self.o_a = (
-            nnx.Param(init(rngs.params(), (groups, h * d // groups, rank)))
+            nnx.Param(
+                init(rngs.params(), (groups, h * d // groups, rank)),
+                names=("heads", None, None),
+            )
             if rank
             else None
         )
-        self.o = linear(groups * rank if rank else h * d, width)
+        # What o takes: the groups' ranks, or the heads' dims, flattened
+        heads = ("heads", groups) if rank else ("heads", h)
+        self.o = linear(groups * rank if rank else h * d, width, (heads, "embed"))
         scale = (c.scale or d**-0.5) * logit_gain(c.rope)
         super().__init__(c, width, h, 1, d, scale, False, ports, rngs)
         rotated = int(d * c.rope.fraction) // 2 * 2 if c.rope else 0
@@ -103,6 +116,7 @@ class CSA(SoftmaxAttention):
                 c.rope,
                 rotated,
                 rngs,
+                query,
             )
             if indexer
             else None
@@ -116,6 +130,7 @@ class CSA(SoftmaxAttention):
         self.rope = c.rope
 
     def __call__(self, x: Float[Array, "b t d"], taps: Taps) -> Float[Array, "b t d"]:
+        x = _input(x)
         b, t, _ = x.shape
         docs = segments(taps)
         rows = _rows(docs, b, t)
@@ -125,7 +140,7 @@ class CSA(SoftmaxAttention):
         q = self.q(query).reshape(b, t, self.heads, self.head_dim)
         if self.q_norm is not None:
             q = self.q_norm(q)
-        q = self._rotate(q, rows.positions)
+        q = _by_head(self._rotate(q, rows.positions), "heads")
         kv = self._rotate(self.kv_norm(self.kv(x))[:, :, None], rows.positions)
         if self.compress_ratio is None:
             out = self._attend(x, q, kv, kv, docs)
@@ -225,7 +240,10 @@ class CSA(SoftmaxAttention):
         if self.o_a is None:
             return self.o(out.reshape(b, t, -1))
         groups = self.o_a.shape[0]
-        low = jnp.einsum("btgi,gir->btgr", out.reshape(b, t, groups, -1), self.o_a[...])
+        # Split by group: groups that do not split stay whole, rather than each split
+        # over part of an axis, which XLA can only reach by replicating them.
+        grouped = _by_head(out.reshape(b, t, groups, -1), "heads")
+        low = jnp.einsum("btgi,gir->btgr", grouped, self.o_a[...])
         return self.o(low.reshape(b, t, -1))
 
 

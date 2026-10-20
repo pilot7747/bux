@@ -34,6 +34,32 @@ needs ([below](#gpus-hosts-and-the-plan)). A mesh that needs more devices than t
 are, a `batch` that does not split over the batch axes, and a `seq_len` that does not
 split over `seq` or `stream` are errors before anything is built.
 
+## GPUs, hosts and the plan
+
+`bux launch` gives a run the GPUs of its mesh: the product of its axes' sizes, where
+`data` unset is every visible GPU for a run alone and one in a sweep. A sweep trains
+its runs side by side, each on a group of free GPUs, and a run that needs more GPUs
+than there are fails at once. A run alone also trains on many hosts, a process each,
+when Slurm, Open MPI or `JAX_NUM_PROCESSES` say so
+([Launching](training.md#launching)). The mesh then spans every process's devices,
+and `parallel.rows` builds a batch with `jax.make_array_from_callback`: every process
+makes all of it, as it depends only on the seed and the step, and puts the rows its
+own devices hold. `tests/test_launch.py` trains the smoke run as two processes of 4
+CPU devices each, through `jax.distributed` on localhost, as one process of 8 does.
+
+`bux plan` shows what each run takes before it starts: its GPUs, and the bytes of its
+parameters and of its optimizer's state on each. They come from `parallel.shardings`
+over a `jax.sharding.AbstractMesh`, which `parallel.use` takes as it does a mesh, so
+the plan needs no devices:
+
+```
+$ bux plan examples/experiments/smoke.bux 'mesh = fsdp: mesh(fsdp=8) | one: mesh(data=1)'
+2 runs
+id          params  tokens  tok/param  gpus  params/gpu  optim/gpu  run
+bbbf3ae709  156k    25.6k   0.2        8     76.2KiB     152KiB     smoke[fsdp]
+bbbf3ae709  156k    25.6k   0.2        1     609KiB      1.19MiB    smoke[one]
+```
+
 ## Names
 
 A layer names the dimensions of a parameter where it makes it, and the layout says
@@ -47,7 +73,9 @@ self.sinks = nnx.Param(jnp.zeros(h), names=("heads",))
 ```
 
 The names are the fields of `layout`, a closed set; any other is an error that names
-the parameter.
+the parameter. A dimension that flattens several of what it names, as a projection's
+`h * k` columns flatten `h` heads, names them with their count, `("heads", h)`: then
+it splits only between them.
 
 | name       | what it is                                  | default axes                |
 |------------|---------------------------------------------|-----------------------------|
@@ -69,8 +97,9 @@ to resolve them. The optimizer's state inherits them from the parameters it trac
 ### How names resolve
 
 1. Dimension by dimension, each name's axes, less the axes of size 1 and those an
-   earlier dimension took. If their sizes do not divide the dimension, it stays
-   whole: GQA's 2 kv heads under `tensor=4` are replicated.
+   earlier dimension took. If their sizes do not divide the dimension, or its count,
+   it stays whole: GQA's 2 kv heads under `tensor=4` are replicated, though their
+   `2 * k` columns would split 4 ways.
 2. Then FSDP: the largest dimension left whole that the `fsdp` size divides splits
    over `fsdp`, unless a dimension already does. So a layer with no names at all
    trains under FSDP; names matter for TP and EP alone.
@@ -120,6 +149,57 @@ A method that communicates by hand does it in a `jax.shard_map` over its own axi
 routing, balance losses, the router bias) stays outside, in the global view, so its
 semantics do not change.
 
+## In a script
+
+```python
+from bux import parallel
+
+with parallel.use(t.mesh, t.layout, t.methods):
+    model = parallel.build(lambda: Model(arch, rngs=nnx.Rngs(0)))
+    trainer = Trainer(model, tx, loss)  # its state on its shardings
+    trainer.update(batch)  # the batch through parallel.rows
+```
+
+## Testing
+
+The tests run on 8 CPU devices (`tests/conftest.py`), and compare a run split over
+them with one on a single device: `losses(source, mesh="mesh(fsdp=8)")` trains a few
+steps and returns the losses. `involuntary()` counts the times XLA warned that it
+rematerialized an array in full, which a complete layout should never make it do.
+
+## Softmax attention
+
+`gqa`, `mla`, `csa` and the indexer split by head, as Megatron does: a device projects
+the input to its own heads, attends with them, and takes their rows of the output
+projection, whose sums over `tensor` make the output.
+
+| layer    | parameter                                    | names                      |
+|----------|----------------------------------------------|----------------------------|
+| all      | `gate`, `rel_proj`                           | `(embed, heads)`           |
+| all      | `o`                                          | `(heads, embed)`           |
+| all      | `sinks`                                      | `(heads,)`                 |
+| GQA      | `q`                                          | `(embed, heads)`           |
+| GQA      | `k`, `v`, and the channels of their convs    | `(embed, kv_heads)`        |
+| GQA      | fused `qkv`, split where shards do not end   | `(embed, none)`            |
+| MLA, CSA | down projections `q_a`, `kv_a`               | `(embed, latent)`          |
+| MLA, CSA | up projections `q`, `kv_b`                   | `(latent, heads)`          |
+| CSA      | grouped `o_a`, by group                      | `(heads, none, none)`      |
+| indexer  | `q`, `weights`                               | `(latent or embed, heads)` |
+
+Each flattened dimension names its heads with their count. What every head shares,
+MQA's kv head, CSA's latents and the indexer's keys, is every device's; so are kv
+heads that `tensor` does not divide, which every device computes and whose gradients
+the devices that share them sum.
+
+The input of a layer is constrained to `(batch, seq, none)`, so with
+`layout(stream=tensor)` it is gathered once before the projections (sequence
+parallelism); queries, keys, values and head outputs to `(batch, seq, heads, none)`;
+the logits to `(batch, heads, seq, none)`, the keys whole, which with `seq` over
+`context` is all-gather context parallelism.
+
+The indexer picks its top-k with a stable sort: `lax.top_k` gathers every row onto
+each device.
+
 ## Mixture of experts
 
 The router runs in the global view: it picks each token's top-k experts, reports the
@@ -163,50 +243,6 @@ The MoE names its parameters: the router `(embed, None)`; `up` and `gate`
 in a LatentMoE; `to_latent` `(embed, latent)` and `from_latent` `(latent, embed)`.
 `dense` constrains its hidden units to `(batch, seq, experts, mlp)`, so that under
 FSDP the weights move to the tokens rather than the tokens to the weights.
-
-## In a script
-
-```python
-from bux import parallel
-
-with parallel.use(t.mesh, t.layout, t.methods):
-    model = parallel.build(lambda: Model(arch, rngs=nnx.Rngs(0)))
-    trainer = Trainer(model, tx, loss)  # its state on its shardings
-    trainer.update(batch)  # the batch through parallel.rows
-```
-
-## GPUs, hosts and the plan
-
-`bux launch` gives a run the GPUs of its mesh: the product of its axes' sizes, where
-`data` unset is every visible GPU for a run alone and one in a sweep. A sweep trains
-its runs side by side, each on a group of free GPUs, and a run that needs more GPUs
-than there are fails at once. A run alone also trains on many hosts, a process each,
-when Slurm, Open MPI or `JAX_NUM_PROCESSES` say so
-([Launching](training.md#launching)). The mesh then spans every process's devices,
-and `parallel.rows` builds a batch with `jax.make_array_from_callback`: every process
-makes all of it, as it depends only on the seed and the step, and puts the rows its
-own devices hold. `tests/test_launch.py` trains the smoke run as two processes of 4
-CPU devices each, through `jax.distributed` on localhost, as one process of 8 does.
-
-`bux plan` shows what each run takes before it starts: its GPUs, and the bytes of its
-parameters and of its optimizer's state on each. They come from `parallel.shardings`
-over a `jax.sharding.AbstractMesh`, which `parallel.use` takes as it does a mesh, so
-the plan needs no devices:
-
-```
-$ bux plan examples/experiments/smoke.bux 'mesh = fsdp: mesh(fsdp=8) | one: mesh(data=1)'
-2 runs
-id          params  tokens  tok/param  gpus  params/gpu  optim/gpu  run
-bbbf3ae709  156k    25.6k   0.2        8     76.2KiB     152KiB     smoke[fsdp]
-bbbf3ae709  156k    25.6k   0.2        1     609KiB      1.19MiB    smoke[one]
-```
-
-## Testing
-
-The tests run on 8 CPU devices (`tests/conftest.py`), and compare a run split over
-them with one on a single device: `losses(source, mesh="mesh(fsdp=8)")` trains a few
-steps and returns the losses. `involuntary()` counts the times XLA warned that it
-rematerialized an array in full, which a complete layout should never make it do.
 
 ## Muon: `methods.orthogonalize`
 

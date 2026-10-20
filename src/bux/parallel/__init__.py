@@ -20,7 +20,7 @@ docs/parallelism.md explains them.
 """
 
 from bux.parallel import methods
-from bux.parallel.layout import DIMENSIONS, NAMES, named, shard, spec, stream
+from bux.parallel.layout import DIMENSIONS, NAMES, Name, named, shard, spec, stream
 from bux.parallel.mesh import AXES, active, mesh, sizes
 from bux.parallel.methods import method
 from bux.parallel.place import build, place, rows, shardings
@@ -35,6 +35,7 @@ __all__ = [
     "AXES",
     "DIMENSIONS",
     "NAMES",
+    "Name",
     "active",
     "build",
     "check",
