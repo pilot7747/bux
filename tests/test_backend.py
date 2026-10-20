@@ -26,6 +26,7 @@ from bux.architecture import (
 )
 from bux.architecture.engram import _ngram_rows
 from bux.architecture.graph import Sequence
+from bux.architecture.moe import mix
 from bux.architecture.rope import frequencies, rotate
 from bux.lang import compile, ir
 
@@ -236,7 +237,8 @@ def test_group_limited_routing_picks_experts_in_the_best_groups_only():
     assert e.router_bias is not None
     e.router_bias[...] = jax.random.normal(jax.random.key(3), (8,)) * 0.1
     x = jax.random.normal(jax.random.key(1), (2, 16, D))
-    dense, _ = e._route(x)
+    idx, weights, _ = e._route(x)
+    dense = mix(idx, weights, 8)
     scores = jax.nn.sigmoid(e.router(x))
     for row, score in zip(dense.reshape(-1, 8), scores.reshape(-1, 8)):
         choice = (score + e.router_bias[...]).reshape(4, 2)
@@ -261,9 +263,9 @@ def test_shared_expert_sink_weights_the_shared_experts_with_the_top_k():
         routed_scaling_factor=3.0,
     )
     x = jax.random.normal(jax.random.key(1), (2, 5, D))
-    dense, sinks = e._route(x)
+    _, weights, sinks = e._route(x)
     assert sinks is not None and sinks.shape == (2, 5, 2)
-    assert jnp.allclose(dense.sum(-1) + sinks.sum(-1), 3.0, atol=1e-5)
+    assert jnp.allclose(weights.sum(-1) + sinks.sum(-1), 3.0, atol=1e-5)
     scores = jax.nn.sigmoid(e.router(x))
     assert jnp.allclose(sinks[..., 1] / sinks[..., 0], scores[..., 5] / scores[..., 4])
     # The output is the routed experts plus each shared one, 8 hidden units of the

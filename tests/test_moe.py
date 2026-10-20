@@ -1,4 +1,5 @@
-"""MoE load balancing: the balance loss, the router bias, and the losses layers report."""
+"""MoE: the methods that run the experts, and load balancing: the balance loss, the
+router bias, and the losses layers report."""
 
 import jax
 import jax.numpy as jnp
@@ -6,11 +7,13 @@ import numpy as np
 import optax
 import pytest
 from flax import nnx
+from jax.sharding import PartitionSpec as P
 from jaxtyping import Array, Float, Int
 
 from bux import config as cfg
+from bux import parallel
 from bux.architecture import Model
-from bux.architecture.moe import MoE, balance_loss
+from bux.architecture.moe import MoE, balance_loss, experts, routed, run_sorted
 from bux.architecture.registry import LOSSES, Loss
 from bux.lang import compile
 from bux.train import config as tcfg
@@ -29,9 +32,13 @@ ffn = gated_mlp(intermediate_size=32, activation=swish)
 """
 
 
+GATED = cfg.MLPConfig(type="gated_mlp", intermediate_size=8, activation="swish")
+RMS = cfg.NormalizationConfig(type="rmsnorm")
+
+
 def moe_layer(**settings) -> MoE:
-    expert = cfg.MLPConfig(type="gated_mlp", intermediate_size=8, activation="swish")
-    c = cfg.MoEConfig(num_experts=4, top_k=2, expert=expert, **settings)
+    given = {"num_experts": 4, "top_k": 2, "expert": GATED} | settings
+    c = cfg.MoEConfig.model_validate(given)
     return MoE(c, D, nnx.Rngs(0))
 
 
@@ -73,8 +80,8 @@ def test_an_moe_reports_its_balance_loss_in_training_only():
     taps: dict[str, list] = {LOSSES: []}
     e(x, taps)
     [loss] = taps[LOSSES]
-    dense, _ = e._route(x)
-    picks = (dense > 0).astype(jnp.float32)
+    idx, _, _ = e._route(x)
+    picks = jax.nn.one_hot(idx, 4).sum(-2)
     scores = jax.nn.sigmoid(e.router(x))
     expected = balance_loss(scores, picks, 2, sequence=True)
     assert loss.name == "balance_loss" and loss.weight == 0.5
@@ -92,8 +99,8 @@ def test_training_moves_the_router_bias_toward_the_experts_picked_less():
     e = moe_layer(router="sigmoid", load_balancing="aux_free", bias_update_rate=0.01)
     assert e.router_bias is not None
     x = jax.random.normal(jax.random.key(1), (4, 8, D))
-    dense, _ = e._route(x)
-    load = (dense > 0).sum((0, 1))
+    idx, _, _ = e._route(x)
+    load = jax.nn.one_hot(idx, 4).sum((0, 1, 2))
     e(x, {})  # not a training forward
     assert (e.router_bias[...] == 0).all()
     e(x, {LOSSES: []})
@@ -172,3 +179,141 @@ def test_a_model_without_reporting_layers_trains_as_before():
     assert jnp.array_equal(logits[0], model.outputs(jnp.asarray(batch.input_ids))[0])
     trainer = Trainer(model, optax.adamw(1e-3), objective(tcfg.LossConfig(), arch))
     assert set(trainer.update(batch)) == {"loss", "grad_norm"}
+
+
+# --- The methods that run the experts --------------------------------------------------
+
+# Every MoE option the example architectures use.
+OPTIONS = {
+    "gated": {},
+    "mlp": {"expert": GATED.model_copy(update={"type": "mlp", "activation": "relu2"})},
+    "latent": {"latent_size": 8, "latent_input_norm": RMS, "latent_output_norm": RMS},
+    "expert norm": {
+        "expert_norm": RMS.model_copy(
+            update={"zero_centered": True, "scale_input": True}
+        )
+    },
+    "limit": {"expert": GATED.model_copy(update={"limit": 0.3})},
+    "softcap": {
+        "expert": GATED.model_copy(update={"activation": "situ", "up_softcap": 0.3})
+    },
+    "shared": {"num_shared_experts": 2, "shared_expert_gate": True},
+    "sinks": {"num_shared_experts": 2, "shared_expert_sink": True, "router": "sigmoid"},
+    "groups": {"num_experts": 8, "top_k": 3, "num_groups": 4, "top_k_groups": 2},
+    "scaled": {
+        "router": "sqrtsoftplus",
+        "router_logit_scale": 2.0,
+        "routed_scaling_factor": 2.5,
+        "normalize_top_k": False,
+    },
+}
+
+
+def run(method: str, e: MoE, x: Float[Array, "b t d"]):
+    """The output, and the gradients of the parameters and of `x`, by `method`."""
+    probe = jax.random.normal(jax.random.key(2), x.shape)
+    with parallel.use(tcfg.MeshConfig(data=1), methods=tcfg.MethodsConfig(moe=method)):
+        y = e(x, {})
+        grads = nnx.grad(lambda e, x: (e(x, {}) * probe).sum(), argnums=(0, 1))(e, x)
+    return y, grads
+
+
+@pytest.mark.parametrize("option", OPTIONS)
+def test_sorted_computes_what_dense_does_with_the_same_gradients(option):
+    e = moe_layer(**OPTIONS[option])
+    x = jax.random.normal(jax.random.key(1), (2, 5, D))
+    (dense, dense_grads), (fast, fast_grads) = run("dense", e, x), run("sorted", e, x)
+    assert jnp.allclose(fast, dense, atol=1e-5)
+    close = jax.tree.map(
+        lambda a, b: jnp.allclose(a, b, atol=1e-5), fast_grads, dense_grads
+    )
+    assert jax.tree.all(close)
+
+
+def test_sorted_drops_no_token_when_every_token_picks_the_same_experts():
+    e = moe_layer()
+    e.router.kernel[...] = jnp.zeros_like(e.router.kernel[...])  # every score ties
+    x = jax.random.normal(jax.random.key(1), (2, 5, D))
+    idx, _, _ = e._route(x)
+    assert (idx == jnp.array([0, 1])).all()
+    assert jnp.allclose(run("sorted", e, x)[0], run("dense", e, x)[0], atol=1e-5)
+
+
+def test_experts_run_each_row_through_its_own_and_rows_past_them_are_zero():
+    keys = jax.random.split(jax.random.key(0), 4)
+    x = jax.random.normal(keys[0], (9, D))
+    up, gate = (jax.random.normal(k, (3, D, 8)) for k in keys[1:3])
+    down = jax.random.normal(keys[3], (3, 8, D))
+    out = experts(x, jnp.array([3, 0, 4]), up, gate, down, GATED)
+    for row, expert in enumerate([0, 0, 0, 2, 2, 2, 2]):
+        h = jax.nn.swish(x[row] @ gate[expert]) * (x[row] @ up[expert])
+        assert jnp.allclose(out[row], h @ down[expert], rtol=1e-5, atol=1e-4)
+    assert (out[7:] == 0).all()
+
+
+def test_some_of_the_experts_add_their_own_picks_and_nothing_for_the_others():
+    """What a device that holds some of the experts computes: the picks numbered from
+    its first expert, the others' outside its range."""
+    e = moe_layer(expert_norm=cfg.NormalizationConfig(type="layernorm", bias=True))
+    assert e.expert_norm is not None and e.expert_norm.bias is not None
+    e.expert_norm.bias[...] = jnp.ones(D)  # so that a row of zeros comes out not 0
+    x = jax.random.normal(jax.random.key(1), (2, 5, D))
+    z, (idx, weights, _) = e._latent(x), e._route(x)
+    up, gate, down = e.kernels()
+    assert gate is not None
+
+    def some(first: int, n: int) -> Float[Array, "b t d"]:
+        mine = slice(first, first + n)
+        kernels = (up[mine], gate[mine], down[mine])
+        return routed(z, idx - first, weights, *kernels, e.ffn, e.expert_norm)
+
+    assert jnp.allclose(some(0, 1) + some(1, 3), some(0, 4), atol=1e-5)
+    assert jnp.allclose(some(0, 4), run("dense", e, x)[0], atol=1e-5)
+
+
+def test_sorted_is_the_default_method():
+    assert tcfg.MethodsConfig().moe == "sorted"
+    assert parallel.method("moe") is run_sorted
+
+
+# --- Split over devices ----------------------------------------------------------------
+
+SPLIT = """
+d_model = 64
+vocab_size = 128
+norm = rmsnorm
+rescale = rmsnorm(eps=1e-8, zero_centered=true, scale_input=true)
+attn = gqa(num_heads=4, num_kv_heads=2, rope=rope())
+experts = moe(num_experts=8, top_k=2, num_shared_experts=1, shared_expert_gate=true,
+              router=sigmoid, load_balancing=aux_free, latent_size=32,
+              latent_input_norm=norm, expert_norm=rescale,
+              expert=gated_mlp(intermediate_size=64, activation=swish))
+model = embed [norm attn] [norm experts] norm head
+"""
+
+
+@pytest.mark.parametrize("mesh", ["mesh(fsdp=8)", "mesh(fsdp=2, expert=2, tensor=2)"])
+@pytest.mark.parametrize("method", ["dense", "sorted"])
+def test_an_moe_trains_the_same_split_over_devices_and_rematerializes_nothing(
+    losses, involuntary, method, mesh
+):
+    methods = f"methods(moe={method})"
+    one = losses(SPLIT, mesh="mesh(data=1)", methods=methods)
+    involuntary()
+    split = losses(SPLIT, mesh=mesh, methods=methods)
+    assert involuntary() == 0
+    assert np.allclose(split, one, atol=1e-5)
+
+
+def test_an_moe_names_its_experts_and_its_projections():
+    expert = GATED.model_copy(update={"intermediate_size": 64})
+    c = cfg.MoEConfig(num_experts=8, top_k=2, latent_size=32, expert=expert)
+    with parallel.use(tcfg.MeshConfig(fsdp=2, expert=2, tensor=2)):
+        state = nnx.state(parallel.build(lambda: MoE(c, 64, nnx.Rngs(0))))
+        found = parallel.shardings(state)
+    # The experts over `expert` and their hidden units over `tensor`; FSDP splits the
+    # largest dimension left whole.
+    assert found["up"].spec == found["gate"].spec == P("expert", "fsdp", "tensor")
+    assert found["down"].spec == P("expert", "tensor", "fsdp")
+    assert found["router"]["kernel"].spec == P("fsdp", None)
+    assert found["to_latent"]["kernel"].spec == P("fsdp", None)
