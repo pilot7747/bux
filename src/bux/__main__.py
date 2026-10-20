@@ -24,6 +24,7 @@ from bux.lang.render import render
 
 if TYPE_CHECKING:  # imported where used: jax and the backend are slow to import
     from flax import nnx
+    from jax.sharding import AbstractMesh
 
 
 def _si(n: float) -> str:
@@ -68,12 +69,16 @@ def training(run: Run) -> str:
     )
 
 
-def abstract(run: Run) -> "tuple[nnx.Module, nnx.Optimizer] | None":
+def abstract(
+    run: Run, gpus: int | None = None
+) -> "tuple[nnx.Module, nnx.Optimizer] | None":
     """The run's model and its optimizer, from shapes alone, or None if the backend
-    lacks a layer."""
+    lacks a layer: built as on `gpus` GPUs if they fit its mesh, its repeats scanned
+    and pipelined as its methods say, else as outside any mesh."""
     import jax.numpy as jnp
     from flax import nnx
 
+    from bux import parallel
     from bux.architecture import Model
     from bux.train.optim import optimizer
 
@@ -85,10 +90,28 @@ def abstract(run: Run) -> "tuple[nnx.Module, nnx.Optimizer] | None":
         tx = optimizer(t.optimizer, lambda step: jnp.ones(()), model, t.clip)
         return model, nnx.Optimizer(model, tx, wrt=nnx.Param)
 
+    grid = None if gpus is None else _grid(run, gpus)
     try:
-        return nnx.eval_shape(make)
+        if grid is None:
+            return nnx.eval_shape(make)
+        with parallel.use(grid, t.layout, t.methods):
+            return nnx.eval_shape(make)
     except NotImplementedError:
         return None
+
+
+def _grid(run: Run, gpus: int) -> "AbstractMesh | None":
+    """The run's mesh on `gpus` GPUs, of no devices; None if it does not fit them."""
+    from jax.sharding import AbstractMesh, AxisType
+
+    from bux import parallel
+
+    try:
+        sizes = parallel.sizes(run.train.mesh, gpus)
+    except ValueError:
+        return None
+    auto = (AxisType.Auto,) * len(parallel.AXES)
+    return AbstractMesh(tuple(sizes.values()), parallel.AXES, axis_types=auto)
 
 
 def per_device(state: "nnx.State") -> int:
@@ -114,17 +137,12 @@ def memory(
     each of `gpus` GPUs, as its mesh and layout split them; None if its mesh does not
     fit them."""
     from flax import nnx
-    from jax.sharding import AbstractMesh, AxisType
 
     from bux import parallel
 
     t = run.train
-    try:
-        sizes = parallel.sizes(t.mesh, gpus)
-    except ValueError:
+    if (grid := _grid(run, gpus)) is None:
         return None
-    auto = (AxisType.Auto,) * len(parallel.AXES)
-    grid = AbstractMesh(tuple(sizes.values()), parallel.AXES, axis_types=auto)
     model, opt = made
     with parallel.use(grid, t.layout, t.methods):
         return per_device(nnx.state(model, nnx.Param)), per_device(nnx.state(opt))
@@ -134,13 +152,15 @@ def _row(run: Run, gpus: int, alone: bool) -> tuple[str, ...]:
     """What `plan` says of `run`, of `gpus` there are."""
     from bux.architecture import num_params
     from bux.launch import need
+    from bux.parallel.pipeline import bubble
 
     t = run.train
     tokens = t.steps * t.batch * t.seq_len
-    made = abstract(run)
-    n = None if made is None else num_params(made[0])
     used = need(t.mesh, gpus, alone=alone)
+    made = abstract(run, used)
+    n = None if made is None else num_params(made[0])
     params, opt = (made and memory(run, made, used)) or (None, None)
+    idle = bubble(t.mesh.stage, t.methods.microbatches, t.methods.rounds)
     return (
         run.id,
         _si(n) if n else "?",
@@ -149,18 +169,22 @@ def _row(run: Run, gpus: int, alone: bool) -> tuple[str, ...]:
         str(used),
         _bytes(params),
         _bytes(opt),
+        f"{idle:.0%}",
         run.name,
     )
 
 
 def plan(runs: list[Run], gpus: int | None = None) -> str:
     """A line a run: its parameters and tokens, the GPUs it trains on of `gpus`
-    (default: the visible ones), and the bytes of its parameters and of its
-    optimizer's state on each."""
+    (default: the visible ones), the bytes of its parameters and of its optimizer's
+    state on each, and the share of a step its pipeline's stages idle."""
     from bux.launch import visible_gpus
 
     there = len(visible_gpus()) if gpus is None else gpus
-    head = ("id", "params", "tokens", "tok/param", "gpus", "params/gpu", "optim/gpu")
+    head = (
+        *("id", "params", "tokens", "tok/param"),
+        *("gpus", "params/gpu", "optim/gpu", "bubble"),
+    )
     rows = [(*head, "run"), *(_row(run, there, len(runs) == 1) for run in runs)]
     widths = [max(len(row[i]) for row in rows) for i in range(len(head))]
     lines = [

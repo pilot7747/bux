@@ -8,7 +8,8 @@ A repeat is built as the run's `repeat` method says: ``unroll``, a module a pass
 ``scan``, which stacks the passes into one ``Scanned`` module where it can, its
 variables gaining a leading `layers` dimension, and runs them by `jax.lax.scan`. The
 run's `remat` method rematerializes each branch outside any other in the backward
-pass, and a scanned pass as a whole.
+pass, and a scanned pass as a whole. With more than one `stage`, the longest scanned
+repeat outside any other is pipelined over them, by the run's `pipeline` method.
 """
 
 import contextvars
@@ -24,9 +25,19 @@ from jaxtyping import Array, Float, Shaped
 
 from bux import parallel
 from bux.architecture import residual
-from bux.architecture.registry import LOSSES, Context, Loss, Stream, Taps, build_layer
+from bux.architecture.registry import (
+    LOSSES,
+    SEGMENTS,
+    TOKENS,
+    Context,
+    Loss,
+    Stream,
+    Taps,
+    build_layer,
+    training,
+)
 from bux.lang import ir
-from bux.parallel import methods, stream
+from bux.parallel import methods, pipeline, stream
 from bux.parallel.layout import LAYERS, NAMES
 
 
@@ -109,7 +120,8 @@ def build_node(node: ir.Node, ctx: Context) -> nnx.Module:
         if node.share not in ctx.shared:
             ctx.shared[node.share] = _build(node, ctx)
         return ctx.shared[node.share]
-    return _build(node, ctx)
+    built = _build(node, ctx)
+    return _staged(built) if node is ctx.arch.graph else built
 
 
 def _build(node: ir.Node, ctx: Context) -> nnx.Module:
@@ -173,7 +185,7 @@ def scan(body: ir.Node, times: int, ctx: Context) -> nnx.Module:
     if they can be (``scannable``); in a row if not."""
     passes = _passes(body, times, ctx)
     if scannable(passes):
-        return Scanned(passes)
+        return Scanned(_stack(passes), len(passes))
     return Sequence(passes, _branches((body,) * times, ctx))
 
 
@@ -228,15 +240,34 @@ def _stack(passes: list[nnx.Module]) -> nnx.Module:
 
 
 class Scanned(nnx.Module):
-    """A repeat of `times` passes run as one: `layers` is the first pass, each of its
-    variables the stack of every pass's, and a call runs them by `jax.lax.scan`
-    (``run``)."""
+    """A repeat of `times` passes run as one: `layers` is a pass, each of its
+    variables the stack of every pass's (``_stack``), and a call runs them by
+    `jax.lax.scan` (``run``); or by the run's pipeline method, once ``pipe`` splits
+    them over the stages."""
 
-    def __init__(self, passes: list[nnx.Module]):
-        self.times = len(passes)
-        self.layers = _stack(passes)
+    def __init__(self, layers: nnx.Module, times: int):
+        self.times, self.layers = times, layers
+        self.rounds = 0  # the rounds a pipeline takes them in; 0 if none does
+
+    def pipe(self, rounds: int) -> None:
+        """Split the stacked layers over `stage` by a dimension named `stages`: a
+        share a stage of the passes in a row; or, in `rounds` above 1, a share of
+        each round's, which then is a scanned repeat of its own."""
+        n = self.times // rounds
+        for v in _variables(self.layers):
+            names = v.get_metadata()[NAMES][1:]
+            if rounds == 1:
+                v.set_metadata(names=(pipeline.STAGES, *names))
+                continue
+            v.set_value(v.get_value().reshape(rounds, n, *v.shape[1:]))
+            v.set_metadata(names=(LAYERS, pipeline.STAGES, *names))
+        if rounds > 1:
+            self.layers, self.times = Scanned(self.layers, n), rounds
+        self.rounds = rounds
 
     def __call__(self, x: Stream, taps: Taps) -> Stream:
+        if self.rounds and pipeline.pipelined():
+            return _pipelined(self, x, taps)
         graphdef, state = nnx.split(self.layers)
         y, rest = run(graphdef, state, self.times, x, taps)
         nnx.update(self.layers, rest)
@@ -331,6 +362,138 @@ def _scan(
     (x, changed), (rest, losses) = jax.lax.scan(step, (x, stacks), state, times)
     _apply(taps, changed, call.reports, [[v[i] for v in losses] for i in range(times)])
     return x, rest
+
+
+# --- Pipelines: methods.pipeline ------------------------------------------------------
+# With mesh.stage > 1, the longest scanned repeat outside any other splits its stacked
+# layers over `stage`, and the run's pipeline method runs them (bux.parallel.pipeline).
+
+SPLIT = (TOKENS, SEGMENTS)  # the taps a pipeline splits into microbatches with x
+
+
+def _staged(root: nnx.Module) -> nnx.Module:
+    """`root`, its longest scanned repeat outside any other (the first of several as
+    long) pipelined if the mesh in force has stages."""
+    if (n := pipeline.stages()) == 1:
+        return root
+    found = [(p, m) for p, m in nnx.iter_graph(root) if isinstance(m, Scanned)]
+    inside = [p for p, _ in found for q, _ in found if p != q and p[: len(q)] == q]
+    outer = [m for p, m in found if p not in inside]
+    if not outer:
+        raise ValueError(
+            f"mesh.stage = {n} pipelines the longest scanned repeat, and the model has "
+            "none: repeat its blocks (block^8), and scan them, methods(repeat=scan)"
+        )
+    longest = max(outer, key=lambda m: m.times)
+    longest.pipe(pipeline.rounds(longest.times))
+    return root
+
+
+def _pipelined(scan: Scanned, x: Stream, taps: Taps) -> Stream:
+    """`scan`'s layers on `x` by the run's pipeline method, each stage running its
+    share of a round on a microbatch (``Stage``); the losses they report, each the
+    mean over microbatches, into `taps`."""
+    one, n = _pass(scan)
+    graphdef, params, rest = nnx.split(one, nnx.Param, ...)
+    if scan.rounds == 1:  # one round of them all
+        params, rest = jax.tree.map(lambda a: a[None], (params, rest))
+    _check(scan.rounds * n, graphdef, nnx.merge_state(params, rest), x, taps)
+    stage = Stage(graphdef, n // pipeline.stages(), training(taps))
+    y, rest, losses = parallel.method("pipeline")(stage, params, rest, x, _rows(taps))
+    nnx.update(one, rest if scan.rounds > 1 else jax.tree.map(lambda a: a[0], rest))
+    stage.report(taps, losses)
+    return y
+
+
+def _pass(scan: Scanned) -> tuple[nnx.Module, int]:
+    """A pass of a pipelined `scan`, its variables stacked by round, and the passes
+    a round."""
+    if isinstance(scan.layers, Scanned):
+        return scan.layers.layers, scan.layers.times
+    return scan.layers, scan.times
+
+
+class Stage:
+    """A stage's share of a round on a microbatch, `layers` layers, as a function of
+    arrays alone: ``(params, rest, x, rows) -> (y, rest, losses)``, by ``run``.
+    `reports` keeps the names and weights of the losses as it traces."""
+
+    def __init__(self, graphdef: nnx.GraphDef, layers: int, training: bool):
+        self.graphdef, self.layers, self.training = graphdef, layers, training
+        self.reports: list[tuple[str, float]] = []
+
+    def __call__(
+        self, params: nnx.State, rest: nnx.State, x: Stream, rows: Taps
+    ) -> tuple[Stream, nnx.State, Float[Array, "l n"]]:
+        local = _own(rows, self.training)
+        state = nnx.merge_state(params, rest)
+        y, rest = run(self.graphdef, state, self.layers, x, local)
+        losses = local.get(LOSSES, [])
+        self.reports = [
+            (a.name, a.weight) for a in losses[: len(losses) // self.layers]
+        ]
+        if not losses:
+            return y, rest, jnp.zeros((self.layers, 0))
+        return y, rest, jnp.stack([a.value for a in losses]).reshape(self.layers, -1)
+
+    def report(self, taps: Taps, losses: Float[Array, "r n k"]) -> None:
+        """Into `taps`, each layer's losses, of values `losses`."""
+        if not self.reports:
+            return
+        for values in losses.reshape(-1, losses.shape[-1]):
+            taps[LOSSES].extend(
+                Loss(name, weight, v)
+                for (name, weight), v in zip(self.reports, values, strict=True)
+            )
+
+
+def _rows(taps: Taps) -> Taps:
+    """The taps of the rows, which a pipeline splits into microbatches with them."""
+    return {k: taps[k] for k in SPLIT if k in taps}
+
+
+def _own(rows: Taps, training: bool) -> Taps:
+    """The taps a stage gets: those of its rows, and the losses a training forward
+    collects."""
+    own = {k: list(v) for k, v in rows.items()}
+    return (own | {LOSSES: []}) if training else own
+
+
+def _check(
+    passes: int, graphdef: nnx.GraphDef, state: nnx.State, x: Stream, taps: Taps
+) -> None:
+    """Raise if a pass of the pipelined repeat of `passes`, of stacked `state`, takes
+    a tap from before the repeat or leaves one changed after it."""
+    first = jax.tree.map(lambda a: a[0, 0], state)
+    if crossing := _crossing(graphdef, first, x, taps):
+        raise ValueError(
+            f"mesh.stage = {pipeline.stages()} pipelines the repeat of {passes} "
+            f"passes, but they take {', '.join(crossing)} from before it, or leave "
+            "it changed for after it: a pipeline sends its stages the stream alone. "
+            "Read each tap in the pass that writes it, or train with mesh.stage = 1"
+        )
+
+
+def _crossing(
+    graphdef: nnx.GraphDef, layer: nnx.State, x: Stream, taps: Taps
+) -> list[str]:
+    """The taps a pass of `layer` takes from before the repeat, but those a pipeline
+    splits with the stream, or leaves changed after it; and the stream, if the pass
+    changes its shape."""
+    local = _own(_rows(taps), training(taps))
+    token = _REMATTED.set(True)  # a trial remats nothing
+    try:
+        y = jax.eval_shape(lambda s, x: nnx.merge(graphdef, s)(x, local), layer, x)
+    except KeyError as e:  # a tap from before the repeat
+        if e.args and e.args[0] in taps:
+            return [e.args[0]]
+        raise
+    finally:
+        _REMATTED.reset(token)
+    changed = [
+        k for k, v in local.items() if k != LOSSES and not _same(taps.get(k, []), v)
+    ]
+    return sorted(changed) + (["the stream"] if _type(y) != _type(x) else [])
 
 
 # --- Pure calls, for jax.checkpoint and jax.lax.scan ------------------------------------
