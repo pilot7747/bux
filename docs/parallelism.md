@@ -56,8 +56,8 @@ the plan needs no devices:
 $ bux plan examples/experiments/smoke.bux 'mesh = fsdp: mesh(fsdp=8) | one: mesh(data=1)'
 2 runs
 id          params  tokens  tok/param  gpus  params/gpu  optim/gpu  run
-5aadfe9db2  156k    25.6k   0.2        8     76.2KiB     152KiB     smoke[fsdp]
-5aadfe9db2  156k    25.6k   0.2        1     609KiB      1.19MiB    smoke[one]
+bbbf3ae709  156k    25.6k   0.2        8     76.2KiB     152KiB     smoke[fsdp]
+bbbf3ae709  156k    25.6k   0.2        1     609KiB      1.19MiB    smoke[one]
 ```
 
 ## Names
