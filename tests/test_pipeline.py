@@ -17,7 +17,10 @@ from bux.architecture import Model, MoE
 from bux.architecture.graph import Scanned
 from bux.lang import compile, compile_runs
 from bux.parallel import pipeline
-from bux.train.trainer import directory, train
+from bux.train.data import plain
+from bux.train.objective import objective
+from bux.train.optim import optimizer, schedule
+from bux.train.trainer import Trainer, _accumulated, directory, train
 
 PRELUDE = """
 d_model = 64
@@ -193,6 +196,25 @@ def test_the_router_bias_moves_as_the_microbatches_in_a_row_would_move_it():
     piped = _model(BIASED, mesh, _how(micro))
     _forward(piped, mesh, _how(micro), training=True)
     assert np.allclose(_bias(piped), _bias(alone), atol=1e-6)
+
+
+def _stepped_bias(mesh: str, methods: str) -> Float[np.ndarray, "layers experts"]:
+    """The router bias of BIASED's model after a training step on TOKENS."""
+    [run] = compile_runs(f"{BIASED}\n{TRAIN}\nmesh = {mesh}\nmethods = {methods}")
+    t = run.train
+    with parallel.use(t.mesh, t.layout, t.methods):
+        model = parallel.build(lambda: Model(run.arch, rngs=nnx.Rngs(0)))
+        tx = optimizer(t.optimizer, schedule(t.schedule, t.steps), model, t.clip)
+        loss = objective(t.loss, run.arch)
+        trainer = Trainer(model, tx, loss, microbatches=_accumulated(4))
+        trainer.update(plain(TOKENS))
+    return _bias(trainer.model)
+
+
+def test_a_training_step_moves_a_pipelined_router_bias_once_from_the_whole_batch():
+    whole = _stepped_bias(ONE, SCAN)
+    piped = _stepped_bias("mesh(stage=2, data=1)", _how(4))
+    assert np.abs(whole).max() > 0 and np.allclose(piped, whole, atol=1e-6)
 
 
 def test_dropout_draws_a_mask_a_microbatch():
