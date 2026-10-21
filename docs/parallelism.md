@@ -716,11 +716,12 @@ which `tests/test_precision.py` checks for every family. Gradients are reduced o
 batch axes in the dtype the backward makes them, bfloat16 for a weight's; they add up
 over microbatches in float32.
 
-XLA:CPU fails to compile a bfloat16 `psum` that a `shard_map`'s transpose makes, as the
-MoE's `sorted` and EP methods do on more than one device (its reducer ends in a copy,
-which `ChangeOpDataType` cannot clone). The tests split bfloat16 runs with
-`methods(moe=dense)`. GPUs all-reduce bfloat16 natively, which this has not been run
-on.
+XLA:CPU fails to compile a bfloat16 `psum` that a `shard_map`'s transpose makes (its
+reducer ends in a copy, which `ChangeOpDataType` cannot clone), and aborts the process.
+The MoE's `sorted` and EP methods make one on more than one device, and so do the
+pipelines; `ring`, `ulysses` and `pass_state` train in bfloat16 on CPU. The tests split
+bfloat16 runs with `methods(moe=dense)` and no pipeline. GPUs all-reduce bfloat16
+natively, which this has not been run on.
 
 ### Microbatches
 
