@@ -216,6 +216,34 @@ from the contract above, the code wins:
   twice; nothing else does.
 - The suite takes about 6 minutes on 8 fake devices, idle.
 
+## As built: what the later waves changed
+
+All twelve WPs are merged; `docs/parallelism.md` is the reference. Where they left
+the plan:
+
+- **Decision 2:** the axes are `stage, data, fsdp, context, expert, tensor`. XLA aborts
+  on a `shard_map` nested in the pipeline's over an axis earlier than `stage` (WP12).
+- **Decision 7:** a method that sorts, routes or exchanges tokens (the MoE's, `ulysses`)
+  is manual over every axis that splits them, not over its own alone: a partly manual
+  `shard_map` makes XLA gather what the other axes split (WP4, WP7, WP8). `pass_state`
+  runs its combine in the global view instead (WP10).
+- **Counted names:** `("kv_heads", 2)` names a flattened `heads × head_dim` dimension,
+  which then splits only between heads (WP2). Fused projections stay unnamed (WP3).
+- **Each mixer's input** is constrained to `(batch, seq, None)`, which sequence
+  parallelism needs (WP2, WP3).
+- **Muon's `gather`** is a `shard_map`; constraints alone left Newton-Schulz on shards
+  (WP9).
+- **Microbatches** and the pipeline share `methods.microbatches`: under `stage > 1`
+  the trainer does not accumulate. The router bias is deferred in a training step and
+  moves once, from the whole batch's picks, under both (WP5, WP12).
+- **`precision`** at its default is left out of the run's id, so ids made before it
+  resume.
+- **`methods.repeat`** changes the checkpoint's structure: a restore across `unroll`
+  and `scan` is an error that says so (WP11). gpipe keeps `scan`'s layout.
+- **Not run anywhere yet:** `ragged_all_to_all`, tokamax's GPU kernels, and bfloat16
+  pipelines and MoE methods on more than one device, which XLA:CPU cannot compile. The
+  GPU scripts are in `scripts/gpu_smoke/`.
+
 ## WP0: JAX 0.12
 
 **Owns:** `pyproject.toml`, `uv.lock`.
