@@ -336,6 +336,108 @@ On the 8 fake devices, every family trains as on one device to 4e-6 under
 `lr=1e-3`: at `1e-2` their small runs are unstable, and rounding (from `data=8` too)
 grows past 1e-5 in three steps.
 
+## Context parallelism for recurrent mixers: `methods.recurrence`
+
+Every recurrent mixer keeps a state `S` of `k × v` a head, which each position decays,
+adds to and reads its outputs from, linearly. So a chunk of positions maps the state it
+starts from to the one it ends with by an affine map, its transition `S ↦ A S + B`,
+and each of its outputs gains `reads_t · S`. `A` is zero across a document start.
+
+```
+mesh    = mesh(context=4, tensor=2)
+methods = methods(recurrence=pass_state)
+```
+
+| method       | what it does                                                     |
+|--------------|------------------------------------------------------------------|
+| `scan`       | the default: one scan over every position. With `seq` over `context`, XLA gathers the sequence onto every device first |
+| `pass_state` | each device scans its own positions from a zero state and keeps their transition; the transitions fold, in turn, into the state each device's chunk starts from (LASP-2: XLA all-gathers them over `context`); and each device adds to its outputs what they read of that state |
+
+| family                                | `A`, a head          | `reads_t`  |
+|---------------------------------------|----------------------|------------|
+| DeltaNet, Gated DeltaNet, KDA, RWKV-7 | a `k × k` matrix     | `P_tᵀ q_t` |
+| GLA                                   | a diagonal of `k`    | `P_t q_t`  |
+| Mamba                                 | a diagonal of `n`    | `P_t C_t`  |
+| Lightning, Mamba-2                    | a scalar             | `P_t q_t`, `P_t C_t` |
+
+`P_t` is the product of the decays (`diag(w) + b aᵀ`, or `exp(dt A)`) from the chunk's
+start to position `t`, carried by the chunk's scan beside the state. For a matrix (and
+k = v) that doubles the scan's work and what its backward saves; a diagonal or a scalar
+costs a vector. The outputs `reads` are `(b, t, h, k)`, which for Mamba (a head a channel) is
+the size of the states its backward saves.
+
+`pass_state` is two `shard_map`s manual over every axis that splits the tokens, and
+neither holds a collective: the first runs each device's chunk, the second corrects its
+outputs, and the fold between them is in the global view. Inside a `shard_map` of auto
+axes, a collective makes XLA gather what they split: an all-gather of the transitions
+there gathered the heads over `tensor` too, so that every device folded all of them.
+Where nothing splits the positions, `pass_state` is `scan`.
+
+A method is `(recurrence) -> out`, the outputs `(b, t, h, v)` in float32. A
+`Recurrence` (`bux.parallel.recurrence`) names its `family` and holds `chunk`, which
+runs it over a chunk of positions from a zero state, with `xs`, the `(b, t, ...)` arrays
+of positions, and `shared`, what it takes whole (Mamba's `A`). `chunk(xs, shared,
+transition)` gives a `Chunk`: its outputs, the state it ends with and, with
+`transition`, `A` and the reads. `recurrence` (and so `delta_rule` and RWKV-7) and
+`selective_scan` run by the run's method; `scan` is in `linear_attention.py`. A method
+that cannot run a family raises `NotImplementedError` naming it:
+
+```python
+from bux.parallel import methods
+from bux.parallel.recurrence import Recurrence
+
+
+@methods.recurrence.register("mine")
+def _(r: Recurrence):
+    if r.family == "the selective scan":
+        raise NotImplementedError("methods.recurrence = mine has no selective scan")
+    return r.chunk(r.xs, r.shared, False).out
+```
+
+Measured on 8 CPU devices, two blocks of each family under `pass_state`: on packed rows
+whose documents cross the devices' chunks, the logits and gradients are one device's
+(to 1e-5 of each gradient's largest entry, as `scan` on the same mesh is) on
+`context=2 × tensor=2` and `context=4 × fsdp=2`; a run trains as on one device to 2.4e-6
+over 3 steps on those and `context=8`; and nothing is rematerialized in full, by either
+method. The all-gathers of the compiled train step
+(`seq_len = 24`, 8 rows, width 32), `scan` → `pass_state`; of `scan`'s, 12 to 20 gather
+a float32 array of every position, and none of `pass_state`'s does:
+
+| family    | `context=2, tensor=2` | `context=4, fsdp=2` | `context=8` |
+|-----------|-----------------------|---------------------|-------------|
+| DeltaNet  | 24 → 16               | 58 → 50             | 21 → 13     |
+| GDN       | 26 → 16               | 68 → 58             | 23 → 13     |
+| KDA       | 26 → 16               | 72 → 62             | 23 → 13     |
+| GLA       | 18 → 12               | 56 → 50             | 17 → 11     |
+| Lightning | 20 → 14               | 48 → 42             | 15 → 9      |
+| RWKV-7    | 32 → 22               | 91 → 81             | 23 → 13     |
+| Mamba     | 20 → 14               | 84 → 76             | 17 → 11     |
+| Mamba-2   | 36 → 30               | 72 → 64             | 17 → 11     |
+
+`pass_state` all-gathers 4 small arrays a layer: the states and transitions forward,
+again for the backward. Other collectives do not change, but for Mamba's and Mamba-2's
+`A`, whose gradient is summed over the token axes (one all-reduce a layer on
+`context=8`). The temp memory of the train step at `seq_len = 1024` (8 rows, width 64),
+`scan` → `pass_state`, in MiB:
+
+| family    | `context=4, fsdp=2` | `context=8`   |
+|-----------|---------------------|---------------|
+| GDN       | 26.7 → 21.2         | 41.3 → 21.3   |
+| GLA       | 18.8 → 11.3         | 29.3 → 11.2   |
+| Lightning | 11.3 → 9.0          | 14.6 → 8.9    |
+| RWKV-7    | 26.9 → 20.2         | 41.8 → 23.1   |
+| Mamba     | 136.2 → 70.6        | 248.1 → 70.8  |
+| Mamba-2   | 73.1 → 40.9         | 119.4 → 40.8  |
+
+Both meshes give a device 1024 tokens: `pass_state` holds those, `scan` every position
+of its rows. On `context=2 × tensor=2` a matrix family's carried `P` costs about what
+the halved sequence saves. Under `precision(compute=bfloat16)` it trains on CPU too:
+what the `shard_map`s' transposes sum is float32.
+
+Not yet: a `ppermute` chain instead of the all-gather, which holds every device's
+transitions (`c` matrices `k × k` a head) on each; and chunked kernels (fla's) as
+methods, which would take a family's own inputs rather than `Recurrence`'s.
+
 ## Mixture of experts
 
 The router runs in the global view: it picks each token's top-k experts, reports the
