@@ -333,6 +333,7 @@ class LayoutConfig(Config):
     experts: Axes = "expert"
     latent: Axes = None  # low-rank bottlenecks: MLA, LatentMoE
     layers: Axes = None  # the stacked passes of a scanned repeat
+    stages: Axes = "stage"  # those of a pipelined one, a share a stage
     zero: Literal[1, 3] = 3  # 1: FSDP splits the optimizer state alone
 
 
@@ -352,6 +353,7 @@ class MethodsConfig(Config):
     repeat: str = "unroll"
     remat: Annotated[str, BeforeValidator(_named_none)] = "none"
     pipeline: str = "gpipe"
+    rounds: Positive = 1  # times a circular pipeline sends a microbatch round
     orthogonalize: str = "gspmd"  # how Muon reaches whole matrices
     microbatches: Positive = 1
 

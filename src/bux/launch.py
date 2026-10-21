@@ -286,7 +286,7 @@ def visible_gpus() -> list[str]:
 def need(c: MeshConfig, gpus: int, *, alone: bool) -> int:
     """The GPUs a run of mesh `c` trains on, of `gpus` there are: the product of its
     axes' sizes, where `data` unset is every GPU for a run alone, and one in a sweep."""
-    rest = math.prod(getattr(c, a) for a in parallel.AXES[1:])
+    rest = math.prod(getattr(c, a) for a in parallel.AXES if a != "data")
     if c.data is not None:
         return c.data * rest
     return max(gpus, rest) if alone else rest

@@ -9,13 +9,15 @@ from jax.sharding import AbstractMesh, AxisType, Mesh
 
 from bux.train.config import LayoutConfig, MeshConfig, MethodsConfig
 
-# The slowest links first, so that `tensor` stays inside a node.
-AXES = ("data", "stage", "fsdp", "context", "expert", "tensor")
+# The slowest links first, so that `tensor` stays inside a node; `stage` before `data`,
+# as a pipeline's sends need the least bandwidth, and as XLA nests a shard_map inside
+# a pipeline's only over the axes after `stage` (bux.parallel.pipeline).
+AXES = ("stage", "data", "fsdp", "context", "expert", "tensor")
 
 
 def sizes(c: MeshConfig, devices: int) -> dict[str, int]:
     """Each axis's size on `devices` devices: `data` takes what the others leave."""
-    rest = {a: getattr(c, a) for a in AXES[1:]}
+    rest = {a: getattr(c, a) for a in AXES if a != "data"}
     taken = math.prod(rest.values())
     if c.data is None and devices % taken:
         raise ValueError(
@@ -25,10 +27,14 @@ def sizes(c: MeshConfig, devices: int) -> dict[str, int]:
     data = devices // taken if c.data is None else c.data
     if data * taken > devices:
         raise ValueError(
-            f"mesh: {_shape({'data': data, **rest})} needs {data * taken} devices, "
+            f"mesh: {_shape(_ordered(data, rest))} needs {data * taken} devices, "
             f"but there are {devices}"
         )
-    return {"data": data, **rest}
+    return _ordered(data, rest)
+
+
+def _ordered(data: int, rest: dict[str, int]) -> dict[str, int]:
+    return {a: data if a == "data" else rest[a] for a in AXES}
 
 
 def _shape(sizes: dict[str, int]) -> str:

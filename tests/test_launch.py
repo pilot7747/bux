@@ -316,7 +316,7 @@ def test_the_plan_says_each_runs_gpus_and_its_bytes_on_each(capsys):
     head, fsdp, one = capsys.readouterr().out.splitlines()[1:]
     assert head.split() == [
         *("id", "params", "tokens", "tok/param"),
-        *("gpus", "params/gpu", "optim/gpu", "run"),
+        *("gpus", "params/gpu", "optim/gpu", "bubble", "run"),
     ]
     assert fsdp.split()[4] == "8" and one.split()[4] == "1"
     runs = smoke(sweep)

@@ -23,9 +23,10 @@ layout.seq  = context | none
 
 ## The mesh
 
-One mesh, always of all six axes, in the order `data, stage, fsdp, context, expert,
-tensor`: the slowest links first, so that `tensor` stays inside a node. An axis not
-set has size 1, and `data` takes the devices the others leave. Every axis is Auto:
+One mesh, always of all six axes, in the order `stage, data, fsdp, context, expert,
+tensor`: the slowest links first, so that `tensor` stays inside a node, and `stage`
+before `data`, as a pipeline's sends need the least bandwidth
+([Pipelines](#pipelines-methodspipeline) says why it must). An axis not set has size 1, and `data` takes the devices the others leave. Every axis is Auto:
 layers do not say how anything splits, and the compiler propagates shardings from the
 parameters and a few constraints.
 
@@ -47,17 +48,18 @@ makes all of it, as it depends only on the seed and the step, and puts the rows 
 own devices hold. `tests/test_launch.py` trains the smoke run as two processes of 4
 CPU devices each, through `jax.distributed` on localhost, as one process of 8 does.
 
-`bux plan` shows what each run takes before it starts: its GPUs, and the bytes of its
-parameters and of its optimizer's state on each. They come from `parallel.shardings`
-over a `jax.sharding.AbstractMesh`, which `parallel.use` takes as it does a mesh, so
-the plan needs no devices:
+`bux plan` shows what each run takes before it starts: its GPUs, the bytes of its
+parameters and of its optimizer's state on each, and the share of a step its
+pipeline's stages idle ([below](#pipelines-methodspipeline)). The bytes come from
+`parallel.shardings` of the model built over a `jax.sharding.AbstractMesh`, which
+`parallel.use` takes as it does a mesh, so the plan needs no devices:
 
 ```
 $ bux plan examples/experiments/smoke.bux 'mesh = fsdp: mesh(fsdp=8) | one: mesh(data=1)'
 2 runs
-id          params  tokens  tok/param  gpus  params/gpu  optim/gpu  run
-bbbf3ae709  156k    25.6k   0.2        8     76.2KiB     152KiB     smoke[fsdp]
-bbbf3ae709  156k    25.6k   0.2        1     609KiB      1.19MiB    smoke[one]
+id          params  tokens  tok/param  gpus  params/gpu  optim/gpu  bubble  run
+bbbf3ae709  156k    25.6k   0.2        8     76.2KiB     152KiB     0%      smoke[fsdp]
+bbbf3ae709  156k    25.6k   0.2        1     609KiB      1.19MiB    0%      smoke[one]
 ```
 
 ## Names
@@ -89,6 +91,8 @@ it splits only between them.
 | `mlp`      | hidden units                                | `tensor`                    |
 | `experts`  | experts                                     | `expert`                    |
 | `latent`   | low-rank bottlenecks: MLA, LatentMoE        | `none`                      |
+| `layers`   | the stacked passes of a scanned repeat      | `none`                      |
+| `stages`   | those of a pipelined one, a share a stage   | `stage`                     |
 
 Names are bux's metadata, under `names`, not Flax's `out_sharding`: Flax never acts on
 them, so they cost nothing without a mesh, and `nnx.eval_shape` under one does not try
@@ -604,8 +608,8 @@ Float32 islands compute from what they are given in float32, and give back its d
 | `rope.rotate`                                   | the rotation                                      |
 | the objective                                   | the logits, as the loss and the z-loss take them  |
 
-Softmax attention computes its logits and softmax in `compute` for now. Every other
-matmul runs in `compute`, and the stream stays in it from the embedding to the logits,
+Softmax attention takes its softmax in float32, under every method of
+`methods.attention`. Every other matmul runs in `compute`, and the stream stays in it from the embedding to the logits,
 which `tests/test_precision.py` checks for every family. Gradients are reduced over the
 batch axes in the dtype the backward makes them, bfloat16 for a weight's; they add up
 over microbatches in float32.
@@ -678,3 +682,96 @@ eight words, byte by byte (`seq_len = 128`, `batch = 16`, `adamw(lr=3e-3)`, cosi
 | `moe`    | 1.3595 / 1.3602 | 1.0057 / 1.0071 | 1.0250 / 1.0248 |
 | `gdn`    | 1.5034 / 1.4998 | 0.4112 / 0.4269 | 0.4205 / 0.4204 |
 | `mamba2` | 0.9262 / 0.9276 | 0.4134 / 0.4129 | 0.4211 / 0.4207 |
+
+## Pipelines: `methods.pipeline`
+
+```
+mesh    = mesh(stage=4, fsdp=2)
+methods = methods(repeat=scan, microbatches=8)                                # gpipe
+methods = methods(repeat=scan, microbatches=8, pipeline=circular, rounds=2)
+```
+
+With `mesh.stage` above 1, the longest scanned repeat outside any other (the first of
+several as long) is pipelined. Its stacked layers split over `stage` by a dimension
+named `stages` of the layout, a share of the passes in a row a stage. The rest of the
+model, the embedding and the head too, does not split over `stage`: every stage
+computes it.
+A model with no scanned repeat is an error that says to repeat its blocks and scan
+them, `methods(repeat=scan)`, and so is a repeat whose passes do not split evenly over
+the stages.
+
+The batch's rows split into `methods.microbatches` microbatches, row `i·M + j` into
+microbatch `j`, so that each splits over the batch axes as the rows do. A method runs
+them in a `jax.shard_map` manual over `stage` alone, by a `lax.scan` over `R·M + S − 1`
+ticks: at each, every stage runs its share of a round on a microbatch (`graph.run`),
+and a `ppermute` sends its output on to the next stage, the last's to the first. The
+first stage takes each microbatch from a buffer of its own, where the last stage's
+outputs come back: there a circular round starts again, and from there the stream
+leaves, summed over the stages to every one.
+
+| method     | each microbatch                                                   | a stage idles           |
+|------------|-------------------------------------------------------------------|-------------------------|
+| `gpipe`    | goes through the stages once; the default                         | (S − 1) / (M + S − 1)   |
+| `circular` | goes round them `methods.rounds` times, each stage holding a share of every round's layers | (S − 1) / (R·M + S − 1) |
+
+`circular` needs a microbatch a stage at least, and `methods.rounds` is its alone.
+`bux plan` shows the share of a step a stage idles, the bubble:
+
+```
+$ bux plan examples/experiments/smoke.bux 'methods = methods(repeat=scan, microbatches=4)' \
+    'mesh = one: mesh(data=1) | pp: mesh(stage=2, data=1)'
+2 runs
+id          params  tokens  tok/param  gpus  params/gpu  optim/gpu  bubble  run
+bbbf3ae709  156k    25.6k   0.2        1     609KiB      1.19MiB    0%      smoke[one]
+bbbf3ae709  156k    25.6k   0.2        2     369KiB      738KiB     20%     smoke[pp]
+```
+
+A stage gets the stream and the taps of its rows (the tokens, the documents), split
+with it. A pass that reads a tap written before the repeat (`$v1`), or leaves one
+changed after it (single-pass mhc's read, a U-net's skips), is an error that names
+the tap: a pipeline sends its stages the stream alone. Sending taps along is later.
+
+The passes run once a microbatch, as if the microbatches went through the model one
+after another, so with one microbatch a pipeline computes what one device does:
+
+- the losses a layer reports, such as the MoE's balance loss, are the mean over
+  microbatches of each one's: the whole batch's for a loss of each sequence
+  (`aux_loss_scope=sequence`), near it for one of the batch;
+- the router bias moves once a step, from the whole batch's picks, as it does under
+  gradient accumulation: in a training step the MoE is `deferred`, and the
+  pipeline carries its `router_load` through the ticks it computes. A training
+  forward outside a step moves it once a microbatch, each from that one's load;
+- dropout draws a fresh mask for every microbatch.
+
+The microbatches are the pipeline's: the trainer asks `pipeline.pipelined()`, and a
+step does not accumulate gradients over them as well. With `gpipe` the stacked state
+keeps the shapes and the order of `repeat=scan`'s, so a run resumes on another number
+of stages, or on none; `circular` stacks each round's layers as a repeat of its own,
+and resumes as circular with as many rounds.
+
+Measured on 8 CPU devices, for a Llama of 8 blocks (`d_model=64`, 16 rows of 16
+tokens): how far the losses of three AdamW steps are from one device's at most, and
+the collectives in the compiled gradient of a forward, those in the loop once, so
+once a tick:
+
+| mesh                       | methods                                  | losses   | collective-permute | all-reduce | all-gather |
+|----------------------------|------------------------------------------|----------|--------------------|------------|------------|
+| `stage=2`                  | `microbatches=4`                         | 7.2e-6   | 2                  | 2          | 0          |
+| `stage=4`                  | `microbatches=8`                         | 1.8e-5   | 2                  | 2          | 0          |
+| `stage=4`                  | `microbatches=8, pipeline=circular, rounds=2` | 1.8e-5 | 2             | 2          | 0          |
+| `stage=2, data=2, fsdp=2`  | `microbatches=4`                         | 2.9e-6   | 3                  | 1          | 21         |
+| `data=2, fsdp=4`           |                                          | 6.2e-6   | 0                  | 0          | 22         |
+
+A ppermute a tick each way, and an all-reduce of the stream as it leaves, and of its
+gradient as it comes back; no parameter of a stage leaves it.
+
+This is not MaxText's vmap over the stages with `spmd_axis_name="stage"`: on JAX 0.12
+such a vmap cannot batch a shard_map manual over some of the axes, which the MoE's and
+context parallelism's methods are, inside the layers ("Axes mentioned in
+manual_axis_type ... should be of type Manual"). Nested in a shard_map over `stage`
+they run, on three conditions the pipeline keeps: the outer one does not check its
+values' varying axes (`check_vma=False`), else the gradient of a nested shard_map
+fails to lower; `stage` comes first in the mesh, as XLA aborts on a nested shard_map
+manual over an axis before the outer one's ("Manual axes must be sorted by mesh axis
+index"); and the pipeline takes a round's layers by dynamic slices, as XLA fails to
+partition over Auto axes the scatter that a gather's gradient is.

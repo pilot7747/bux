@@ -328,7 +328,7 @@ def train(
             tx,
             objective(t.loss, run.arch),
             compute=t.precision.compute,
-            microbatches=t.methods.microbatches,
+            microbatches=_accumulated(t.methods.microbatches),
         )
         read = functools.partial(batches, t=t, vocab_size=vocab, cache=cache)
         lr = peak(t.optimizer.lr, multiplier)
@@ -346,6 +346,12 @@ def train(
             ],
         )
     return latest.metrics
+
+
+def _accumulated(microbatches: int) -> int:
+    """The microbatches a step accumulates gradients over: none under a pipeline,
+    which takes them through its stages instead."""
+    return 1 if parallel.pipeline.pipelined() else microbatches
 
 
 def _hooks(
