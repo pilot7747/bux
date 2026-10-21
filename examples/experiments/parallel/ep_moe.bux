@@ -1,0 +1,29 @@
+# A 16B mixture of experts in DeepSeek-V3's shape (MLA, 64 fine-grained experts, 6 of
+# them a token, 2 shared, aux-loss-free balancing) on 2 nodes of 8 GPUs: each GPU of a
+# node holds 8 of the experts (expert parallelism), the rest is FSDP across the nodes,
+# and the rows split over both. With all_gather, every GPU of a node sees the node's
+# tokens and runs its own experts on them.
+#
+#   bux plan   examples/experiments/parallel/ep_moe.bux
+#   bux launch examples/experiments/parallel/ep_moe.bux     # on every host
+#
+# Every host runs the same command; docs/training.md says how they find each other.
+# all_gather runs anywhere. ragged_all_to_all sends each token to its experts' GPUs
+# alone, but runs on GPUs only: check it there with scripts/gpu_smoke/experts.py first.
+use deepseek_v3
+use fineweb_wsd
+
+d_model = 2048
+attn.num_heads          = 16
+dense.intermediate_size = 10944
+experts.num_experts        = 64
+experts.top_k              = 6
+experts.num_shared_experts = 2
+experts.num_groups         = 1
+experts.top_k_groups       = 1
+experts.expert             = gated_mlp(intermediate_size=1408, activation=swish)
+model = embed layer(dense) layer(experts)^26 norm head
+
+mesh      = mesh(fsdp=2, expert=8)
+precision = precision(compute=bfloat16)
+methods   = methods(moe=all_gather, repeat=scan, remat=dots)

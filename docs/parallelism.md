@@ -15,11 +15,32 @@ layout.seq  = context | none
 
 | setting   | what it says                                           | default                    |
 |-----------|--------------------------------------------------------|----------------------------|
-| `mesh`    | a size per axis: `data`, `stage`, `fsdp`, `context`, `expert`, `tensor` | every device on `data` |
+| `mesh`    | a size per axis: `stage`, `data`, `fsdp`, `context`, `expert`, `tensor` | every device on `data` |
 | `layout`  | which axes each named dimension splits over            | see below                  |
 | `methods` | how each part that communicates is computed, by name   | the one-device code        |
 
 `bux.parallel` reads them; the configs are in `bux/train/config.py`.
+
+## Examples
+
+Each file in `examples/experiments/parallel/` is a run, and `bux plan` shows its GPUs,
+the bytes of its parameters and of its optimizer's state on each, and its pipeline
+bubble, without any GPU.
+
+| file               | what it splits, and over what                                       |
+|--------------------|----------------------------------------------------------------------|
+| `laptop.bux`       | a tiny hybrid six ways over 8 CPU devices: DP, FSDP, TP, EP, CP, PP  |
+| `fsdp_8b.bux`      | Llama 3 8B, FSDP over 8 GPUs, bfloat16, scanned and rematerialized  |
+| `mesh_sweep.bux`   | a 1B Llama five ways over 8 GPUs: DDP, FSDP, ZeRO-1, HSDP, TP       |
+| `tp_70b.bux`       | Llama 3 70B over 32 GPUs: TP and sequence parallelism, FSDP across nodes |
+| `pp_70b.bux`       | the same over 32 GPUs: TP, and a circular pipeline across nodes     |
+| `ep_moe.bux`       | a 16B DeepSeek-V3-shaped MoE over 16 GPUs: EP and FSDP              |
+| `long_context.bux` | a Qwen3-Next-shaped hybrid on 64k-token rows over 8 GPUs: ring and `pass_state` |
+
+```
+XLA_FLAGS=--xla_force_host_platform_device_count=8 \
+    bux train examples/experiments/parallel/laptop.bux
+```
 
 ## The mesh
 

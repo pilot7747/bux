@@ -1,0 +1,27 @@
+# 64k-token rows on one node of 8 GPUs: a 3B mixture of experts in Qwen3-Next's shape,
+# 3 Gated DeltaNet layers to every gated attention layer, with each row's positions
+# split 8 ways (context parallelism). Attention passes its keys and values round the
+# GPUs (ring), and the DeltaNets pass their recurrent state along (pass_state), so
+# neither gathers a whole row onto a GPU. Each step's 8 rows go through one at a time.
+#
+#   bux plan   examples/experiments/parallel/long_context.bux
+#   bux launch examples/experiments/parallel/long_context.bux
+#
+# Documents shorter than a row are still packed into it and see only themselves.
+use qwen3_next
+use fineweb_wsd
+
+d_model = 1024
+delta   = gdn(num_heads=8, num_v_heads=16, head_dim=128)
+attn.num_heads      = 8
+experts.num_experts = 64
+experts.top_k       = 8
+model = embed "DDDA"^6 norm @h out mtp
+
+seq_len = 64k
+batch   = 8                                 # 512k tokens a step
+
+mesh      = mesh(context=8)
+precision = precision(compute=bfloat16)
+methods   = methods(attention=ring, recurrence=pass_state, repeat=scan, remat=full,
+                    microbatches=8)

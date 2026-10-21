@@ -1,0 +1,16 @@
+# Llama 3 70B on 4 nodes of 8 GPUs: tensor parallel within a node (each GPU holds 8 of
+# the 64 query heads and a slice of every MLP), the stream split by position between
+# the branches (sequence parallelism), and FSDP across the nodes.
+#
+#   bux plan   examples/experiments/parallel/tp_70b.bux
+#   bux launch examples/experiments/parallel/tp_70b.bux     # on every host
+#
+# Every host runs the same command; docs/training.md says how they find each other.
+use llama3_70b
+use fineweb_wsd
+
+mesh      = mesh(fsdp=4, tensor=8)
+layout    = layout(stream=tensor)
+precision = precision(compute=bfloat16)
+methods   = methods(repeat=scan, remat=full, microbatches=8)
+optimizer.lr = 1.5e-4

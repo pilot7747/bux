@@ -2,6 +2,7 @@
 8 CPU devices the tests have, against one device."""
 
 import shutil
+from pathlib import Path
 
 import jax
 import jax.numpy as jnp
@@ -21,6 +22,7 @@ from bux.train.objective import objective
 from bux.train.optim import optimizer, schedule
 from bux.train.trainer import Trainer, directory, train
 
+ROOT = Path(__file__).parent.parent
 PRELUDE = """
 d_model = 64
 vocab_size = 128
@@ -212,6 +214,15 @@ def test_how_a_run_splits_is_not_in_its_id_but_a_sweep_over_meshes_is_two_runs()
     assert a.id == b.id and a.name != b.name
     [again] = compile_runs(run_to_source(split))
     assert again.train.mesh.fsdp == 8 and again.train.layout.seq is None
+
+
+def test_the_laptop_example_trains_every_split_to_the_same_loss(tmp_path):
+    path = ROOT / "examples" / "experiments" / "parallel" / "laptop.bux"
+    few = ["steps = 3", "log = log(every=1)"]
+    runs = compile_runs(path.read_text(), filename=str(path), overrides=few)
+    assert len(runs) == 6 and len({run.id for run in runs}) == 1
+    last = [train(run, tmp_path, echo=lambda _: None)["loss"] for run in runs]
+    assert np.allclose(last, last[0], atol=1e-4)
 
 
 def test_a_checkpoint_restores_onto_another_mesh(tmp_path):

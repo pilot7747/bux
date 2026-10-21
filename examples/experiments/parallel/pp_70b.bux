@@ -1,0 +1,18 @@
+# Llama 3 70B on 4 nodes of 8 GPUs, as tp_70b.bux trains it but with a pipeline across
+# the nodes in place of FSDP: each node holds 20 of the 80 blocks, in two rounds of 10
+# (a circular pipeline), and a step's 256 rows go through in 16 microbatches. A stage
+# idles for (S - 1) / (R·M + S - 1) = 3 / 35 of a step; `bux plan` shows it.
+#
+#   bux plan   examples/experiments/parallel/pp_70b.bux
+#   bux launch examples/experiments/parallel/pp_70b.bux     # on every host
+#
+# Every host runs the same command; docs/training.md says how they find each other.
+use llama3_70b
+use fineweb_wsd
+
+mesh      = mesh(stage=4, tensor=8)
+layout    = layout(stream=tensor)
+precision = precision(compute=bfloat16)
+methods   = methods(repeat=scan, remat=full, pipeline=circular, rounds=2,
+                    microbatches=16)
+optimizer.lr = 1.5e-4

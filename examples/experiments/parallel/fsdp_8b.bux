@@ -1,0 +1,13 @@
+# Llama 3 8B at its full size on one node of 8 GPUs: every parameter, and its share of
+# AdamW's state, split 8 ways (FSDP), computing in bfloat16 with float32 parameters,
+# its 32 blocks scanned (one compiled block, not 32) and rematerialized in the
+# backward, and each step's 256 rows taken 64 at a time.
+#
+#   bux plan   examples/experiments/parallel/fsdp_8b.bux    # its GPUs, bytes on each
+#   bux launch examples/experiments/parallel/fsdp_8b.bux
+use llama3_8b
+use fineweb_wsd
+
+mesh      = mesh(fsdp=8)
+precision = precision(compute=bfloat16)
+methods   = methods(repeat=scan, remat=dots, microbatches=4)

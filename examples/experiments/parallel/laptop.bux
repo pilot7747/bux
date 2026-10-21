@@ -1,0 +1,49 @@
+# Every kind of parallelism on a laptop: a tiny hybrid of Gated DeltaNet, attention and
+# experts, split six ways over 8 CPU devices. How a run splits is not in its id, so the
+# six runs share one, and they end on the same loss to the digits printed. (Rounding
+# differs between splits, and an MoE's top-k picks amplify it as a run goes on.)
+#
+#   XLA_FLAGS=--xla_force_host_platform_device_count=8 \
+#       bux train examples/experiments/parallel/laptop.bux
+#   bux plan examples/experiments/parallel/laptop.bux   # each run's devices and bytes
+d_model    = 64
+vocab_size = 512
+
+norm    = rmsnorm
+delta   = gdn(num_heads=4, head_dim=16)
+attn    = gqa(num_heads=4, num_kv_heads=2, rope=rope())
+experts = moe(num_experts=8, top_k=2, aux_loss_scope=sequence,
+              expert=gated_mlp(intermediate_size=64, activation=swish))
+
+layer(mixer) = [norm mixer] [norm experts]
+D = layer(delta)
+A = layer(attn)
+model = embed "DA"^2 norm head(tied=true)
+
+data      = synthetic
+optimizer = adamw(lr=1e-3)
+seq_len   = 64
+batch     = 16
+steps     = 10
+
+# Data parallel; FSDP; tensor, with the stream split over it between branches
+# (sequence parallelism); experts; context, with ring attention and the recurrent
+# state passed along; and two pipeline stages over four microbatches.
+mesh    = dp:   mesh(data=8)
+        | fsdp: mesh(fsdp=8)
+        | tp:   mesh(fsdp=2, tensor=4)
+        | ep:   mesh(fsdp=2, expert=4)
+        | cp:   mesh(data=2, context=4)
+        | pp:   mesh(stage=2, fsdp=4)
+layout  = dp:   layout
+        | fsdp: layout
+        | tp:   layout(stream=tensor)
+        | ep:   layout
+        | cp:   layout
+        | pp:   layout
+methods = dp:   methods
+        | fsdp: methods
+        | tp:   methods
+        | ep:   methods(moe=all_gather)
+        | cp:   methods(attention=ring, recurrence=pass_state)
+        | pp:   methods(repeat=scan, microbatches=4)

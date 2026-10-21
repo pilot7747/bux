@@ -1,0 +1,10 @@
+# Llama 3 70B (Meta, 2024): Llama 3 8B's block, wider and 80 deep.
+d_model    = 8192
+vocab_size = 128256
+
+norm = rmsnorm(eps=1e-5)
+attn = gqa(num_heads=64, num_kv_heads=8, rope=rope(base=500000))
+ffn  = gated_mlp(intermediate_size=28672, activation=swish)
+
+block = [norm attn] [norm ffn]
+model = embed block^80 norm head

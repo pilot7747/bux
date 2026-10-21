@@ -1,0 +1,34 @@
+# Which split trains this model fastest on 8 GPUs? A 1B Llama for 100 steps, five
+# ways. They compute the same, so the runs share an id, and their losses agree to
+# bfloat16's rounding; compare their tokens_per_s in each run's metrics.jsonl.
+#
+#   bux plan   examples/experiments/parallel/mesh_sweep.bux   # bytes a GPU, each way
+#   bux launch examples/experiments/parallel/mesh_sweep.bux   # one after another
+use llama3_8b
+
+d_model = 2048
+attn.num_heads        = 16
+ffn.intermediate_size = 8192
+model = embed block^16 norm head(tied=true)
+
+data      = synthetic
+optimizer = adamw(lr=3e-4)
+seq_len   = 2048
+batch     = 64
+steps     = 100
+precision = precision(compute=bfloat16)
+
+# Replicated (DDP); fully sharded (FSDP, ZeRO-3); the optimizer's state alone sharded
+# (ZeRO-1); sharded within groups of 4 and replicated across 2 (HSDP); and tensor
+# parallel in pairs, with sequence parallelism.
+mesh   = ddp:   mesh(data=8)
+       | fsdp:  mesh(fsdp=8)
+       | zero1: mesh(fsdp=8)
+       | hsdp:  mesh(data=2, fsdp=4)
+       | tp:    mesh(fsdp=4, tensor=2)
+layout = ddp:   layout
+       | fsdp:  layout
+       | zero1: layout(zero=1)
+       | hsdp:  layout
+       | tp:    layout(stream=tensor)
+methods = methods(repeat=scan)
