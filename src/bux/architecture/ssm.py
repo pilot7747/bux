@@ -3,10 +3,12 @@
 Under tensor parallelism (``bux.parallel``) their channels split, Mamba's and the short
 conv's over `mlp` and Mamba-2's over `heads`, and so does every parameter of a channel
 or a head: the scan runs on each device's own. Their input projections are fused (u
-and the gate side by side), so they stay whole, and every device computes them.
+and the gate side by side), so they stay whole, and every device computes them. The
+selective scan runs by the run's `methods.recurrence`, as linear attention does.
 """
 
 import math
+from functools import partial
 
 import jax
 import jax.numpy as jnp
@@ -20,6 +22,7 @@ from bux.architecture.norm import Norm
 from bux.architecture.registry import Context, Taps, register, segments
 from bux.architecture.segments import Segments
 from bux.lang import ir
+from bux.parallel.recurrence import Chunk, Positions, Recurrence, Shared
 
 
 def selective_scan(
@@ -30,43 +33,63 @@ def selective_scan(
     C: Float[Array, "b t g n"],
     docs: Segments | None = None,
 ) -> Float[Array, "b t h p"]:
-    """The selective scan, a position at a time. Each of the h heads keeps a p by n
+    """The selective scan, a position at a time. Each of the h heads keeps an n by p
     state S, and at every position
 
-        S = exp(dt A) S + dt x B^T,    y = S C,
+        S = exp(dt A) S + B (dt x)^T,    y = S^T C,
 
     with the heads in g groups that share B and C, as kv heads share keys in GQA. Mamba
     has a head a channel (p = 1) and an A a channel and state dim; Mamba-2 has an A a
     head (n = 1 in A). The state starts at zero, and again where a document starts.
-    In float32, the outputs in x's dtype."""
-    b, t, h, p = x.shape
-    n, per_group = B.shape[-1], h // B.shape[2]
+    By the run's `methods.recurrence`, in float32, the outputs in x's dtype."""
+    b, t = x.shape[:2]
     within = jnp.ones((b, t), jnp.int32) if docs is None else docs.within
     keep = (within > 0).astype(jnp.float32)  # 0 where a document starts
-    dtype = x.dtype
-    x, dt, A, B, C = (a.astype(jnp.float32) for a in (x, dt, A, B, C))
+    scan = Recurrence("the selective scan", chunk, (x, dt, B, C, keep), (A,))
+    return parallel.method("recurrence")(scan).astype(x.dtype)
 
-    def step(
-        state: Float[Array, "b h p n"],
-        at: tuple[
-            Float[Array, "b h p"],
-            Float[Array, "b h"],
-            Float[Array, "b g n"],
-            Float[Array, "b g n"],
-            Float[Array, " b"],
-        ],
-    ) -> tuple[Float[Array, "b h p n"], Float[Array, "b h p"]]:
-        x, dt, B, C, keep = at
-        B, C = jnp.repeat(B, per_group, axis=1), jnp.repeat(C, per_group, axis=1)
-        decay = jnp.exp(dt[..., None] * A) * keep[:, None, None]
-        state = (
-            decay[:, :, None] * state + (dt[..., None] * x)[..., None] * B[:, :, None]
-        )
-        return state, jnp.einsum("bhpn,bhn->bhp", state, C)
 
-    time_major = jax.tree.map(lambda a: jnp.moveaxis(a, 1, 0), (x, dt, B, C, keep))
-    _, y = jax.lax.scan(step, jnp.zeros((b, h, p, n), jnp.float32), time_major)
-    return jnp.moveaxis(y, 0, 1).astype(dtype)
+_At = tuple[
+    Float[Array, "b h p"],
+    Float[Array, "b h"],
+    Float[Array, "b g n"],
+    Float[Array, "b g n"],
+    Float[Array, " b"],
+]
+_Carry = tuple[Float[Array, "b h n p"], Float[Array, "b h #n"] | None]  # S, and P
+
+
+def _step(
+    A: Float[Array, " h #n"], carry: _Carry, at: _At
+) -> tuple[_Carry, tuple[Float[Array, "b h p"], Float[Array, "b h n"] | None]]:
+    state, P = carry
+    x, dt, B, C, keep = at
+    per_group = x.shape[1] // B.shape[1]
+    B, C = jnp.repeat(B, per_group, axis=1), jnp.repeat(C, per_group, axis=1)
+    decay = jnp.exp(dt[..., None] * A) * keep[:, None, None]
+    state = decay[..., None] * state + B[..., None] * (dt[..., None] * x)[:, :, None]
+    y = jnp.einsum("bhnp,bhn->bhp", state, C)
+    if P is None:
+        return (state, None), (y, None)
+    P = decay * P
+    return (state, P), (y, P * C)
+
+
+def chunk(xs: Positions, shared: Shared, transition: bool) -> Chunk:
+    """`selective_scan` over a chunk of positions, from a zero state, by a scan in
+    float32: its state n by p a head, as keys by values; with the `transition`, the
+    product P of every position's exp(dt A), and each output's reads P C."""
+    x, dt, B, C, keep = (jnp.moveaxis(a.astype(jnp.float32), 1, 0) for a in xs)
+    A = shared[0].astype(jnp.float32)
+    _, b, h, p = x.shape
+    # Of x's kind, which in a shard_map varies where it does.
+    zero = jnp.zeros_like(x, shape=(b, h, B.shape[-1], p))
+    P = jnp.ones_like(x, shape=(b, h, A.shape[-1])) if transition else None
+    (state, P), (y, reads) = jax.lax.scan(
+        partial(_step, A), (zero, P), (x, dt, B, C, keep)
+    )
+    y = jnp.moveaxis(y, 0, 1)
+    return Chunk(y, state, P, None if reads is None else jnp.moveaxis(reads, 0, 1))
 
 
 def _dt_bias(

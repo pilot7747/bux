@@ -6,15 +6,18 @@ All of them run one recurrence (`recurrence`), over a state S of k by v a value 
 
     S_t = diag(w_t) S_{t-1} + b_t (a_t^T S_{t-1}) + k_t v_t^T,    o_t = S_t^T q_t
 
-with a decay w_t in (0, 1] a key channel. The b a^T term is how the delta rule writes
-over what S holds at a key (`delta_rule`), and RWKV-7 generalizes it. The state is zero
-at every document start, so a packed row gives each document what it gives alone.
+with a decay w_t in (0, 1] a key channel, or one a head. The b a^T term is how the
+delta rule writes over what S holds at a key (`delta_rule`), and RWKV-7 generalizes it.
+The state is zero at every document start, so a packed row gives each document what it
+gives alone.
 
 Shapes: b rows, t positions, d the width, h heads (value heads, once q and k are shared
 out to them), k and v the head dims of keys and values.
 
-`recurrence` is the reference form, a scan over positions; a chunked kernel (fla's)
-computes the same.
+`recurrence` is the reference form, a scan over positions (`chunk`); a chunked kernel
+(fla's) computes the same. It runs by the run's `methods.recurrence`: `scan`, the
+default, here, and `pass_state`, which splits the positions over `context`, in
+``bux.parallel.recurrence``.
 
 Under tensor parallelism (``bux.parallel``) every projection splits over `heads`, into
 the heads or out of them, and so does every parameter a head has: the recurrence runs
@@ -36,39 +39,93 @@ from bux.architecture.norm import Norm
 from bux.architecture.registry import Context, Taps, register, segments
 from bux.architecture.segments import Segments
 from bux.lang import ir
+from bux.parallel import methods
+from bux.parallel.recurrence import Chunk, Positions, Recurrence, Shared, Transition
 
-# One position of the recurrence: q, k, v, the log decay, a, b, and 1 where the token
-# continues a document, 0 where it starts one.
-_Inputs = tuple[
-    Float[Array, "b h k"],
-    Float[Array, "b h k"],
-    Float[Array, "b h v"],
-    Float[Array, "b h k"],
-    Float[Array, "b h k"],
-    Float[Array, "b h k"],
-    Float[Array, " b"],
-]
+
+@methods.recurrence.register("scan")
+def scan(r: Recurrence) -> Float[Array, "b t h v"]:
+    """`methods.recurrence`'s default: every position in one chunk. With `seq` over
+    `context`, XLA gathers them all onto every device."""
+    return r.chunk(r.xs, r.shared, False).out
+
+
+def _rank_one(
+    s: Float[Array, "b h k n"],
+    w: Float[Array, "b h #k"],
+    a: Float[Array, "b h k"] | None,
+    b: Float[Array, "b h k"] | None,
+) -> Float[Array, "b h k n"]:
+    """(diag(w) + b a^T) s, or diag(w) s without a and b: what a position makes of
+    the state, or of a transition."""
+    decayed = w[..., None] * s
+    if a is None or b is None:
+        return decayed
+    return decayed + b[..., None] * jnp.einsum("bhk,bhkn->bhn", a, s)[..., None, :]
+
+
+def _reads(transition: Transition, q: Float[Array, "b h k"]) -> Float[Array, "b h k"]:
+    """P^T q, for the transition P from a chunk's start: what the output reads of
+    the state the chunk starts from."""
+    if transition.ndim == 4:
+        return jnp.einsum("bhij,bhi->bhj", transition, q)
+    return transition * q
+
+
+# One position: q, k, v, the log decay, 1 where the token continues a document and 0
+# where it starts one, and a and b if any.
+_At = tuple[Float[Array, "b ..."], ...]
+_Carry = tuple[Float[Array, "b h k v"], Transition | None]  # the state, and P
 
 
 def _step(
-    state: Float[Array, "b h k v"], inputs: _Inputs
-) -> tuple[Float[Array, "b h k v"], Float[Array, "b h v"]]:
-    q, k, v, log_decay, a, b, continues = inputs
-    state = state * continues[:, None, None, None]
-    read = jnp.einsum("bhk,bhkv->bhv", a, state)
-    state = (
-        jnp.exp(log_decay)[..., None] * state
-        + b[..., None] * read[..., None, :]
-        + k[..., None] * v[..., None, :]
+    carry: _Carry, at: _At
+) -> tuple[_Carry, tuple[Float[Array, "b h v"], Float[Array, "b h k"] | None]]:
+    state, P = carry
+    q, k, v, log_decay, c, *ab = at
+    w, c = jnp.exp(log_decay), c[:, None, None]
+    a, b = ab or (None, None)
+    state = _rank_one(state * c[..., None], w, a, b) + k[..., None] * v[..., None, :]
+    out = jnp.einsum("bhk,bhkv->bhv", q, state)
+    if P is None:
+        return (state, None), (out, None)
+    P = _rank_one(P * c[..., None], w, a, b) if ab else w * c * P
+    return (state, P), (out, _reads(P, q))
+
+
+def _identity(
+    like: Float[Array, "..."], shape: tuple[int, ...], matrix: bool
+) -> Transition:
+    """The transition of no position, I of (b, h, k, k), or its diagonal of (b, h,
+    k): an array as `like` is, which in a shard_map varies where it does."""
+    if matrix:
+        return jnp.zeros_like(like, shape=(*shape, shape[-1])) + jnp.eye(shape[-1])
+    return jnp.ones_like(like, shape=shape)
+
+
+def chunk(xs: Positions, shared: Shared, transition: bool) -> Chunk:
+    """`recurrence` over a chunk of positions, from a zero state, by a scan in
+    float32; with the `transition`, the product P of every position's diag(w) +
+    b a^T (its diagonal without a and b), and each output's reads P^T q."""
+    q, k, v, log_decay, continues, *ab = (
+        jnp.moveaxis(y.astype(jnp.float32), 1, 0) for y in xs
     )
-    return state, jnp.einsum("bhk,bhkv->bhv", q, state)
+    _, batch, h, dk = k.shape
+    zero = jnp.zeros_like(k, shape=(batch, h, dk, v.shape[-1]))
+    shape = (batch, h, dk if ab else log_decay.shape[-1])
+    P = _identity(k, shape, bool(ab)) if transition else None
+    (state, P), (out, reads) = jax.lax.scan(
+        _step, (zero, P), (q, k, v, log_decay, continues, *ab)
+    )
+    out = jnp.moveaxis(out, 0, 1)
+    return Chunk(out, state, P, None if reads is None else jnp.moveaxis(reads, 0, 1))
 
 
 def recurrence(
     q: Float[Array, "b t h k"],
     k: Float[Array, "b t h k"],
     v: Float[Array, "b t h v"],
-    log_decay: Float[Array, "b t h k"],
+    log_decay: Float[Array, "b t h #k"],
     docs: Segments | None,
     a: Float[Array, "b t h k"] | None = None,
     b: Float[Array, "b t h k"] | None = None,
@@ -77,28 +134,25 @@ def recurrence(
 
         S_t = diag(w_t) S_{t-1} + b_t (a_t^T S_{t-1}) + k_t v_t^T,
 
-    with w = exp(log_decay), and S zero before every document; without a and b, decayed
-    linear attention. A scan over positions, in float32."""
-    if a is None or b is None:
-        a = b = jnp.zeros_like(k)
-    batch, t, h, dk = k.shape
+    with w = exp(log_decay), one a key channel or one a head, and S zero before
+    every document; without a and b, decayed linear attention. By the run's
+    `methods.recurrence`, in float32."""
+    batch, t = k.shape[:2]
     continues = (
         jnp.ones((batch, t)) if docs is None else (docs.within > 0).astype(jnp.float32)
     )
-    xs = jax.tree.map(
-        lambda y: jnp.moveaxis(y.astype(jnp.float32), 1, 0),
-        (q, k, v, log_decay, a, b, continues),
-    )
-    state = jnp.zeros((batch, h, dk, v.shape[-1]), jnp.float32)
-    _, o = jax.lax.scan(_step, state, xs)
-    return jnp.moveaxis(o, 0, 1).astype(v.dtype)
+    rank_one = a is not None and b is not None
+    family = "the generalized delta rule" if rank_one else "decayed linear attention"
+    xs = (q, k, v, log_decay, continues, *((a, b) if rank_one else ()))
+    run = parallel.method("recurrence")
+    return run(Recurrence(family, chunk, xs)).astype(v.dtype)
 
 
 def delta_rule(
     q: Float[Array, "b t h k"],
     k: Float[Array, "b t h k"],
     v: Float[Array, "b t h v"],
-    log_decay: Float[Array, "b t h k"],
+    log_decay: Float[Array, "b t h #k"],
     beta: Float[Array, "b t h"],
     docs: Segments | None,
 ) -> Float[Array, "b t h v"]:
@@ -344,10 +398,10 @@ class DeltaNet(LinearAttention):
         o = delta_rule(q, k, v, heads(self._log_decay(x)), beta, segments(taps))
         return self._output(x, o)
 
-    def _log_decay(self, x: Float[Array, "b t d"]) -> Float[Array, "b t h k"]:
-        """The log of the decay of the state, a key channel: none."""
+    def _log_decay(self, x: Float[Array, "b t d"]) -> Float[Array, "b t h #k"]:
+        """The log of the decay of the state, a key channel or one a head: none."""
         b, t, _ = x.shape
-        return jnp.zeros((b, t, self.v_heads, self.head_dim))
+        return jnp.zeros((b, t, self.v_heads, 1))
 
 
 class GatedDeltaNet(DeltaNet):
@@ -366,11 +420,9 @@ class GatedDeltaNet(DeltaNet):
         self.A_log = nnx.Param(_log_uniform(rngs, hv, 0.01, 16), names=("heads",))
         self.dt_bias = nnx.Param(_dt_bias(rngs, hv), names=("heads",))
 
-    def _log_decay(self, x: Float[Array, "b t d"]) -> Float[Array, "b t h k"]:
-        b, t, _ = x.shape
+    def _log_decay(self, x: Float[Array, "b t d"]) -> Float[Array, "b t h 1"]:
         rate = jax.nn.softplus(self.a(x) + self.dt_bias[...])
-        g = -jnp.exp(self.A_log[...]) * rate
-        return jnp.broadcast_to(g[..., None], (b, t, self.v_heads, self.head_dim))
+        return (-jnp.exp(self.A_log[...]) * rate)[..., None]
 
 
 class KimiDeltaAttention(DeltaNet):
@@ -458,7 +510,7 @@ class LightningAttention(LinearAttention):
     def __call__(self, x: Float[Array, "b t d"], taps: Taps) -> Float[Array, "b t d"]:
         x = layer_input(x)
         q, k, v = self._qkv(x, taps)
-        g = jnp.broadcast_to(-self.slopes[...][:, None], q.shape)
+        g = jnp.broadcast_to(-self.slopes[...][:, None], (*q.shape[:3], 1))
         return self._output(x, recurrence(q, k, v, g, segments(taps)))
 
 
