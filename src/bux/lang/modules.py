@@ -41,8 +41,8 @@ def _search_path(start: Path) -> list[Path]:
 
 
 def _roots(importer: str) -> list[tuple[Path, bool]]:
-    """Return the folders to search, each with whether to search its subfolders: the
-    folder of the file that uses the module on its own, then the search path."""
+    """Return where to look, and whether in subfolders: the folder of the file that
+    uses the module on its own, then the search path."""
     # An editor's file may not be saved yet; "<string>" and the like have no folder.
     here = (Path.cwd() if importer.startswith("<") else Path(importer).parent).resolve()
     env = [Path(p) for p in os.environ.get("BUX_PATH", "").split(os.pathsep) if p]
@@ -89,7 +89,7 @@ def find(name: str, importer: str) -> tuple[str, str]:
             )
         if matches:
             path = matches[0]
-            # Shown relative to the working directory, as the file named on the command line is.
+            # Relative to the working directory, like the file named on the command line.
             shown = (
                 os.path.relpath(path) if path.is_relative_to(Path.cwd()) else str(path)
             )
@@ -160,8 +160,7 @@ class Program:
 
 
 def _layers(statements: list[ast.Statement]) -> list[list[ast.Statement]]:
-    """Split a file's statements into layers: its definitions, then its amendments on
-    top, one per name."""
+    """Return a file's definitions, then its amendments on top, one per name."""
     plain = [st for st in statements if not st.amends]
     amends: dict[str, ast.Statement] = {}
     for st in statements:
@@ -207,7 +206,7 @@ def load(
 
 
 def _file_key(name: str) -> str:
-    """Return the same key for a file however its name is written."""
+    """Return which file `name` is, however written."""
     return name if name.startswith("<") else str(Path(name).resolve())
 
 
@@ -250,8 +249,7 @@ class _Linker:
         chain: tuple[str, ...],
         via: Span | None,
     ) -> list[list[ast.Statement]]:
-        """Return the layers of the modules that `uses` names, with the modules they
-        use below them."""
+        """Return the layers of the modules in `uses`, each above the modules it uses."""
         layers: list[list[ast.Statement]] = []
         for statement in uses:
             try:

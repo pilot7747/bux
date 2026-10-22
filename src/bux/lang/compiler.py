@@ -1,13 +1,12 @@
 """Compile .bux source into the architecture IR.
 
 Two passes. Evaluation resolves names, macros, layer settings and patterns into an
-untyped graph. Lowering then walks it in execution order, with repeats unrolled. It
-infers every layer's input width, checks that residuals and parallel branches agree
-on width, simulates the tap stacks, and checks that shared blocks are used the same
-way everywhere.
+untyped graph. Lowering then walks it in execution order, with repeats unrolled, to
+infer every layer's input width, check residuals and parallel branches for width
+agreement, simulate the tap stacks, and check that shared blocks are used consistently.
 
 A program can span files (``use``), and its alternatives (``a | b``) make it a sweep
-of several runs. Evaluation takes one alternative of each, picked by ``choices``.
+of several runs: evaluation takes one alternative of each, picked by ``choices``.
 
 ``compile`` stops at the first error. ``check`` is for editors: it recovers from
 syntax errors and reports every definition that fails, in every alternative.
@@ -110,7 +109,7 @@ class Axis:
         return isinstance(self.key, frozenset)
 
     def pick(self, option: int) -> int | str:
-        """Return what ``choices`` holds for option `option`: its label or index."""
+        """Return what ``choices`` holds for `option`: its label or index."""
         return self.options[option] if self.labeled else option
 
     def part(self, pick: int | str) -> str:
@@ -227,7 +226,7 @@ class _Evaluator:
         choices: Mapping[Span | frozenset[str], int | str] | None = None,
     ):
         """`report` collects statement errors instead of raising them, for check().
-        `choices` picks alternatives by Axis key; the others take their first option."""
+        `choices` picks alternatives by Axis key; the others take their first."""
         self.source = program.source
         # Names of definitions that failed to parse, whose uses are not errors.
         self.broken = set(program.broken)
@@ -253,8 +252,7 @@ class _Evaluator:
         self.node_spans: dict[int, Span] = {}
         self._alive: list[object] = []
         # Settings given as an undefined bare name, which became a string: arg span ->
-        # (name, span of the name, names in scope). Validation errors on them are
-        # reported as unknown names.
+        # (name, its span, names in scope), reported as unknown names if invalid.
         self.bare: dict[Span, tuple[str, Span, tuple[str, ...]]] = {}
 
     def add_layer(
@@ -414,7 +412,7 @@ class _Evaluator:
         raise AssertionError(expr)
 
     def choose(self, alt: ast.Alt) -> ast.Expr:
-        """Return the alternative that `choices` picks, or the first; record the axis."""
+        """Return the alternative that `choices` picks, or the first."""
         key: Span | frozenset[str] = alt.span
         if alt.labels:
             key = frozenset(alt.labels)
@@ -434,8 +432,7 @@ class _Evaluator:
         return alt.options[alt.labels.index(pick) if isinstance(pick, str) else pick]
 
     def attr(self, expr: ast.Attr, scope: dict[str, object]) -> object:
-        """Read a setting off a config, ``base.field``, as written: defaults that depend
-        on the width read as none."""
+        """Read ``base.field`` as written: width-dependent defaults read as none."""
         base = _unwrap(self.eval(expr.base, scope))
         match base:
             case _Builtin(name=name) if name in TYPES:
@@ -531,7 +528,7 @@ class _Evaluator:
         self, expr: ast.BinOp, left: object, right: object, scope: dict[str, object]
     ) -> tcfg.MixtureConfig | None:
         """Mix data sources with + and weight them with *: 0.7 * web + 0.3 * code.
-        Return None when neither side is a data source."""
+        Return None unless a side is a data source."""
 
         def operand(value: object, side: ast.Expr) -> object:
             value = _unwrap(value)
@@ -598,7 +595,7 @@ class _Evaluator:
     # --- Coercions ------------------------------------------------------------------
 
     def graph(self, value: object, span: Span) -> ir.Node:
-        """Convert `value` into a graph node, to use as a layer or block."""
+        """Return `value` as a layer or block."""
         match value:
             case _Named(label=label, value=inner, share=share):
                 node = self.graph(inner, span)
@@ -664,7 +661,7 @@ class _Evaluator:
         )
 
     def data(self, value: object, span: Span) -> object:
-        """Convert `value` into a setting value."""
+        """Return `value` as a setting value."""
         match value:
             case _Named(value=inner):
                 return self.data(inner, span)
@@ -1301,10 +1298,8 @@ _ADAPTERS = {
 def _train(
     ev: _Evaluator, arch: ir.Architecture | None, *, require: bool
 ) -> tcfg.TrainConfig | None:
-    """Validate the training settings and return them, or None if there are none.
-
-    Without `require`, a module may set only some of them, and those are still checked.
-    """
+    """Return the validated training settings, or None if there are none. Without
+    `require`, a module may set only some of them; they are checked all the same."""
     values: dict[str, object] = {}
     spans: dict[str, Span] = {}
     for name in TRAIN_SETTINGS:
@@ -1458,7 +1453,7 @@ def compile_runs(
     modules: Modules = None,
 ) -> list[ir.Run]:
     """Compile every run of a file: one per combination of the alternatives it reaches,
-    with the first one written varying slowest. The arguments are as for `compile`."""
+    the first written varying slowest. Arguments as for `compile`."""
     program = _load(source, filename, overrides, modules, recover=False)
     runs: list[ir.Run] = []
 
@@ -1497,7 +1492,7 @@ def compile_runs(
 class Report:
     """The result of `check` on a source file."""
 
-    # The file's own statements: the ones that the modules it uses define are not here.
+    # The file's own statements, not those of the modules it uses.
     statements: list[ast.Statement]
     errors: list[BuxError]  # each attached to the file it is in, with a span into it
     # Only when there are no errors; then it equals what compile() returns.
@@ -1634,7 +1629,7 @@ def _reached_axes(program: modules.Program, entry: str) -> list[Axis]:
 
 
 def _public(value: object) -> object | None:
-    """Convert a definition's value for Report.values, which shows no private types."""
+    """Return a definition's value as Report.values shows it, without private types."""
     value = _unwrap(value)
     match value:
         case _Builtin(name=name) if name in ACTIVATIONS:

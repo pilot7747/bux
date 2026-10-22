@@ -147,7 +147,7 @@ def children(node: Node) -> tuple[Node, ...]:
 
 
 def walk(node: Node) -> Iterator[Node]:
-    """Yield every node of the tree as written, in pre-order: a repeat's body once."""
+    """Yield the nodes of the tree as written, in pre-order; a repeat's body once."""
     yield node
     for child in children(node):
         yield from walk(child)

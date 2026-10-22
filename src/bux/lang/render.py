@@ -46,8 +46,8 @@ def _hcat(boxes: list[_Box], sep: str = "──") -> _Box:
 
 
 def _branches(terms: list[_Box], fed: list[bool], merge: str) -> _Box:
-    """Stack the terms between a fork on the left and a merge on the right. Terms
-    that start from a tap are not fed, so they are not connected to the fork."""
+    """Stack the terms between a fork on the left and a merge on the right; those
+    that start from a tap are not connected to the fork."""
     width = max(term.width for term in terms)
     rows: list[str] = []
     ports: list[int] = []
@@ -197,8 +197,7 @@ class _Renderer:
 
 
 def render(arch: ir.Architecture, *, expand: bool = False) -> str:
-    """Draw the model's circuit, then one circuit per labeled block it uses, unless
-    `expand` draws the blocks inline."""
+    """Draw the model's circuit, then one per labeled block it uses (unless `expand`)."""
     renderer = _Renderer(collapse=not expand)
     root = arch.graph.model_copy(update={"label": None})
     sections = [renderer.draw(arch.graph.label or "model", root)]

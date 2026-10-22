@@ -79,7 +79,7 @@ _FIELD = re.compile(r"\s+(\w+)\s*:[^#]*?(?:#\s*(.*))?$")
 
 @cache
 def _notes(cls: type[cfg.Config]) -> dict[str, str]:
-    """Return the comment on each field of `cls` in bux/config.py: its documentation."""
+    """Return each field's comment in bux/config.py, which documents it."""
     notes: dict[str, str] = {}
     for klass in reversed(cls.__mro__):
         if not (isinstance(klass, type) and issubclass(klass, cfg.Config)):
@@ -103,7 +103,7 @@ def _notes(cls: type[cfg.Config]) -> dict[str, str]:
 
 
 def _members(annotation: object) -> list[object]:
-    """Return the members of a union, with Annotated unwrapped."""
+    """Return a union's members, with Annotated unwrapped."""
     origin = typing.get_origin(annotation)
     if origin is typing.Annotated:
         return _members(typing.get_args(annotation)[0])
@@ -197,8 +197,7 @@ class _Index:
         self.macros = {n for n, st in self.defs.items() if st.params is not None}
 
     def resolve(self, name: str, inside: ast.Statement | None) -> str:
-        """Classify a name: param, definition, type, activation, or bare (a string, or
-        unknown)."""
+        """Classify a name: param, definition, type, activation, or bare (undefined)."""
         if inside is not None and name in (inside.params or ()):
             return "param"
         builtin = name in TYPES or name in ACTIVATIONS
@@ -214,8 +213,8 @@ class _Index:
     def config_class(
         self, name: str, inside: ast.Statement | None
     ) -> type[cfg.Config] | None:
-        """Return the config class a name stands for: a builtin, or a definition of one
-        or of an override of one."""
+        """Return the config class a name stands for: a builtin, or a definition of (an
+        override of) one."""
         seen: set[str] = set()
         while True:
             kind = self.resolve(name, inside)
@@ -251,7 +250,7 @@ class _Index:
         return " ".join(head.split()).rstrip("= ")
 
     def is_block(self, name: str) -> bool:
-        """Return whether a definition is a block or a macro: no setting can take one."""
+        """Return whether a definition is a block or macro, which no setting takes."""
         seen: set[str] = set()
         while name in self.defs and name not in seen:
             seen.add(name)
@@ -295,13 +294,13 @@ def _occurrences(ix: _Index) -> Iterator[tuple[Span, tuple]]:
         yield from _walk(st.body, ctx, ix)
 
 
-def _walk(e: ast.Expr, ctx: _Ctx, ix: _Index) -> Iterator[tuple[Span, tuple]]:
+def _walk(expr: ast.Expr, ctx: _Ctx, ix: _Index) -> Iterator[tuple[Span, tuple]]:
     inner = replace(ctx, setting=False)
-    match e:
+    match expr:
         case ast.Name(name=name):
-            yield e.span, ("ref", name, ctx)
+            yield expr.span, ("ref", name, ctx)
         case ast.Call(name=name, args=args):
-            yield e.name_span, ("ref", name, inner)
+            yield expr.name_span, ("ref", name, inner)
             configures = ix.config_class(name, ctx.statement) is not None
             for arg in args:
                 for i, span in enumerate(arg.key_spans):
@@ -309,17 +308,17 @@ def _walk(e: ast.Expr, ctx: _Ctx, ix: _Index) -> Iterator[tuple[Span, tuple]]:
                 setting = arg.key is not None and configures
                 yield from _walk(arg.value, replace(ctx, setting=setting), ix)
         case ast.Attr(base=base):
-            yield e.field_span, ("field", base, e.field, ctx)
+            yield expr.field_span, ("field", base, expr.field, ctx)
             yield from _walk(base, inner, ix)
         case ast.Tap(name=name):
-            yield e.span, ("tap", name, "write")
+            yield expr.span, ("tap", name, "write")
         case ast.Ref(name=name, pop=pop):
-            yield e.span, ("tap", name, "pop" if pop else "read")
+            yield expr.span, ("tap", name, "pop" if pop else "read")
         case ast.Lit(value=str() as text) if not ctx.setting:
             # A pattern: each letter refers to a one-letter definition.
             for k, ch in enumerate(text):
                 if not ch.isspace():
-                    start = e.span.start + 1 + k
+                    start = expr.span.start + 1 + k
                     yield Span(start, start + 1), ("ref", ch, inner)
         case ast.ListExpr(items=items):
             for item in items:
@@ -338,9 +337,9 @@ def _walk(e: ast.Expr, ctx: _Ctx, ix: _Index) -> Iterator[tuple[Span, tuple]]:
 
 
 def _expr_class(
-    ix: _Index, e: ast.Expr, inside: ast.Statement
+    ix: _Index, expr: ast.Expr, inside: ast.Statement
 ) -> type[cfg.Config] | None:
-    match e:
+    match expr:
         case ast.Name(name=name) | ast.Call(name=name):
             return ix.config_class(name, inside)
         case ast.Attr(base=base, field=name):
@@ -417,8 +416,7 @@ def _hover_text(ix: _Index, what: tuple) -> str | None:
 
 
 def _value_text(value: object) -> str | None:
-    """Print a definition's value as source, unless it is a block, which its own source
-    shows best."""
+    """Print a definition's value as source, unless it is a block: its source shows it best."""
     if isinstance(value, ir.Layer):
         value = value.config
     if isinstance(value, cfg.Config):
@@ -516,8 +514,7 @@ def _names_before_dot(tokens: list[ast.Token]) -> list[str]:
 
 
 def _current(ix: _Index, stmt_start: int) -> ast.Statement | None:
-    """Return the statement the cursor is in. While it does not parse, return one made
-    from its header."""
+    """Return the statement the cursor is in, or its header while it does not parse."""
     for st in ix.report.statements:
         if st.span.start == stmt_start:
             return st
@@ -578,8 +575,7 @@ def _key(arg: list[ast.Token]) -> tuple[str, ...] | None:
 
 
 def _dotted(arg: list[ast.Token]) -> tuple[str, ...] | None:
-    """Return the key typed so far, if the argument has nothing else: () or (rope,) for
-    `rope.`."""
+    """Return the key typed so far, if that is all the argument has: () or (rope,)."""
     if len(arg) % 2:
         return None
     names = []
@@ -666,8 +662,7 @@ def _value_items(
 def _expression_items(
     ix: _Index, current: ast.Statement | None, values: bool = False
 ) -> list[Completion]:
-    """Complete the names usable in an expression; with `values`, leave out layers and
-    activations."""
+    """List the names usable in an expression; with `values`, not layers or activations."""
     params = current.params if current is not None else None
     items = [Completion(p, "parameter", sort="0") for p in params or ()]
     for name, st in ix.defs.items():

@@ -23,8 +23,8 @@ SUM, PROD, SEQ, UNARY, POWER, ATOM = range(6)
 
 @cache
 def field_order(cls: type[BaseModel]) -> tuple[str, ...]:
-    """Return the fields of the class itself first, then those it inherits:
-    gqa(num_heads=...) before window sizes."""
+    """Return the class's own fields, then those it inherits: gqa(num_heads=...)
+    before window sizes."""
     order: list[str] = []
     for klass in cls.__mro__:
         is_model = isinstance(klass, type) and issubclass(klass, BaseModel)
@@ -152,8 +152,7 @@ class _Printer:
         raise AssertionError(node)
 
     def spliced(self, items: tuple[ir.Node, ...]) -> list[ir.Node]:
-        """Flatten the unnamed sequences inside a sequence, such as macro calls, so that
-        they print inline."""
+        """Splice unnamed sequences inside a sequence, such as macro calls, inline."""
         out: list[ir.Node] = []
         for item in items:
             if isinstance(item, ir.Seq) and self.name(item) is None:
@@ -235,8 +234,7 @@ def to_source(arch: ir.Architecture) -> str:
 
 
 def run_to_source(run: ir.Run) -> str:
-    """Print a run as one file of its own: no modules, no alternatives, nothing left
-    to resolve.
+    """Print a run as one file: no modules, no alternatives, nothing left to resolve.
 
     Training settings at their defaults are left out, as config settings are.
     """

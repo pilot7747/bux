@@ -116,8 +116,7 @@ KEYWORDS = frozenset({"true", "false", "none", "shared", "_"})
 
 
 def _continues(src: str, i: int, stop: int) -> bool:
-    """Return whether the first line after offset `i` that is not blank or a comment
-    is indented."""
+    """Return whether the next non-blank, non-comment line after `i` is indented."""
     while i < stop:
         j = i
         while j < stop and src[j] in " \t\r":
