@@ -37,7 +37,7 @@ from bux.architecture.registry import (
     training,
 )
 from bux.lang import ir
-from bux.parallel import methods, pipeline, stream
+from bux.parallel import methods, pipeline, shard_stream
 from bux.parallel.layout import LAYERS, NAMES
 
 
@@ -60,7 +60,7 @@ class ResidualBranch(nnx.Module):
         self.body = body
 
     def __call__(self, x: Stream, taps: Taps) -> Stream:
-        return stream(x + self.body(x, taps))
+        return shard_stream(x + self.body(x, taps))
 
 
 class Parallel(nnx.Module):

@@ -57,10 +57,10 @@ class PositionInterpolationConfig(Config):
 
 
 class YaRNConfig(Config):
-    """YaRN RoPE extension (Peng et al., 2023), as in transformers: rotary pairs that
-    turn more than beta_fast times over original_max_len keep their frequency, those
-    that turn fewer than beta_slow times are divided by factor, with a linear ramp
-    between; and q.k is scaled by attention_factor ** 2."""
+    """YaRN RoPE extension (Peng et al., 2023), as in transformers. Rotary pairs that
+    make more than beta_fast turns over original_max_len keep their frequency, those
+    that make fewer than beta_slow turns have it divided by factor, and a linear ramp
+    blends the ones between. q.k is scaled by attention_factor ** 2."""
 
     type: Literal["yarn"] = "yarn"
     factor: float
@@ -92,8 +92,8 @@ class RoPEConfig(Config):
     base: float = 10000.0
     # Partial rotary: only this fraction of each head's dims is rotated (GLM, Qwen3-Next).
     fraction: float = 1.0
-    # Which rotated dims pair up: "half" turns dim i with i + dims / 2 (GPT-NeoX, Llama),
-    # "interleaved" turns dim 2i with 2i + 1 (GPT-J, Cohere).
+    # Which rotated dims pair up: "half" rotates dim i with i + dims / 2 (GPT-NeoX,
+    # Llama), "interleaved" rotates dim 2i with 2i + 1 (GPT-J, Cohere).
     layout: Literal["half", "interleaved"] = "half"
     scaling: RoPEScalingConfig | None = None
 
@@ -140,18 +140,19 @@ class MoEConfig(Config):
     # Group-limited routing: pick top_k_groups of num_groups first (DeepSeek-V3).
     num_groups: int = 1
     top_k_groups: int = 1
-    # Balancing, by a loss, a bias or both. aux_free adds a bias per expert to the scores
-    # that pick the top-k, not to the weights, which every training step moves by
-    # bias_update_rate toward the experts picked less than the mean (DeepSeek-V3).
+    # Load balancing by a loss, a bias or both. aux_free adds a bias per expert to the
+    # scores that pick the top-k, not to the weights. Every training step moves it by
+    # bias_update_rate: up for experts picked less than the mean, down for those picked
+    # more (DeepSeek-V3).
     load_balancing: Literal["aux_loss", "aux_free"] = "aux_loss"
     bias_update_rate: Annotated[float, Field(ge=0)] = 1e-3
-    # Weight of a layer's balance loss, E * sum_e f_e P_e: f_e the fraction of the top-k
-    # picks that go to expert e, P_e its mean score normalized over the experts (Switch;
-    # DeepSeek-V3, eqs. 17-20). None -> 1e-2, or 0 with aux_free. Every layer adds its
-    # own, as in Megatron-LM; transformers instead pools the layers into one loss and
-    # counts tokens rather than picks, so its coefficient c is about c * top_k / layers.
+    # Weight of each layer's balance loss, E * sum_e f_e P_e, where f_e is the fraction
+    # of top-k picks that go to expert e and P_e its mean score, normalized over the
+    # experts (Switch; DeepSeek-V3, eqs. 17-20). None -> 1e-2, or 0 with aux_free. Every
+    # layer adds its own, as in Megatron-LM. transformers pools the layers into one loss
+    # and counts tokens, not picks, so its coefficient c is about c * top_k / layers.
     aux_loss_coef: Annotated[float, Field(ge=0)] | None = None
-    # Over the whole batch (Switch, Qwen), or each sequence and then their mean (the
+    # Over the whole batch (Switch, Qwen), or per sequence and then averaged (the
     # complementary sequence-wise loss of DeepSeek-V3).
     aux_loss_scope: Literal["batch", "sequence"] = "batch"
     # LatentMoE: routed experts run in a narrower space, between a down and an up
@@ -186,22 +187,23 @@ class SparseIndexerConfig(Config):
     num_heads: int = 64
     head_dim: int = 128
     top_k: int = 2048
-    # Score keys mean-pooled in blocks of this many and pick whole blocks, top_k keys in
-    # all, plus the query's unfinished block (Qwen3.8 QSA).
+    # Mean-pool keys in blocks of this many and pick whole blocks, top_k keys in total,
+    # plus the query's own unfinished block (Qwen3.8 QSA).
     block_size: int = 1
     weighted: bool = True  # learned per-head score weights (DSA); else a plain sum
-    # Norm of each query head, and of the keys (after pooling them in blocks); None: no
-    # query norm, and the layer's key norm (DSA: a layernorm). Qwen3.8 QSA: an rmsnorm.
+    # Norm of each query head and of the keys (after block pooling). None: no query
+    # norm, and the layer's own key norm (DSA: a layernorm). Qwen3.8 QSA: an rmsnorm.
     norm: NormalizationConfig | None = None
-    # How the RoPE dims of an indexer whose keys are the tokens are paired, whatever the
-    # layer's layout (DeepSeek-V3.2: half, GLM-5.3: interleaved).
+    # How the indexer pairs RoPE dims when its keys are the tokens, whatever the layer's
+    # layout (DeepSeek-V3.2: half, GLM-5.3: interleaved).
     rope_layout: Literal["half", "interleaved"] = "half"
     # What a `candidates` port exports: the best `candidate_top_k` blocks of
     # `candidate_block_size` keys, each scored by its best key (DeepSeek-V4.1).
     candidate_block_size: int = 8
     candidate_top_k: int = 2048  # blocks in the candidate pool
-    # Weight of the indexer's loss, which alone trains it: the KL from the attention to
-    # the keys it kept to the softmax of its scores (DSA). 0 leaves it untrained.
+    # Weight of the indexer's loss, its only training signal: the KL divergence from the
+    # attention over the kept keys to the softmax of its scores (DSA). 0 leaves it
+    # untrained.
     loss_weight: Annotated[float, Field(ge=0)] = 1.0
 
 
@@ -252,15 +254,15 @@ class GQAConfig(QuadraticAttentionConfig):
     v_head_dim: int | None = None  # None -> head_dim (MiMo-V2: 128 against 192)
     bias: bool = False  # on the projections of the input: q, k, v, gate (GPT-2, Qwen2)
     output_bias: bool | None = None  # None -> bias (GPT-2); Qwen2 has none
-    # One projection makes the queries, keys and values, split after, instead of one
+    # Make q, k and v with one projection and split it, instead of one projection
     # each: the same function and init, held as one matrix (GPT-2, MiMo-V2.6-Pro).
     fused_qkv: bool = False
     rope: RoPEConfig | None = None
     # Causal depthwise conv on keys and values, added to them: k + conv(k) (Inkling).
     kv_conv_size: int | None = None
-    # How reading the v port mixes its values v1 into the layer's v, as a v + b v1 from
-    # a = b = 0.5: "fixed" keeps them (ResFormer's code), "learned" learns both
-    # (Learnable-ResFormer), "convex" learns a, with b = 1 - a.
+    # How a layer that reads the v port mixes its values v1 into its own v, as
+    # a v + b v1 starting from a = b = 0.5: "fixed" keeps a and b (ResFormer's code),
+    # "learned" learns both (Learnable-ResFormer), "convex" learns a, with b = 1 - a.
     value_residual: Literal["fixed", "learned", "convex"] = "fixed"
 
 
@@ -307,7 +309,7 @@ class CSAConfig(QuadraticAttentionConfig):
     # Tokens pooled into one compressed latent; None -> window only.
     compress_ratio: int | None = None
     rope: RoPEConfig | None = RoPEConfig()
-    # Of the query latent, the latents, the compressed ones and the indexer's keys.
+    # Norm of the query latent, the latents, the compressed ones and indexer keys.
     latent_norm: NormalizationConfig = NormalizationConfig(type="rmsnorm")
 
 
@@ -316,13 +318,13 @@ class LinearAttentionConfig(AttentionConfig):
 
     num_heads: int
     head_dim: int
-    # More value heads than q/k heads shares each q/k head across a group (Qwen3-Next).
+    # With more value heads than q/k heads, each q/k head serves a group (Qwen3-Next).
     num_v_heads: int | None = None  # None -> num_heads
     v_head_dim: int | None = None  # None -> head_dim
     conv_size: int | None = 4  # causal depthwise conv on q, k, v; None disables it
     # Gate on the output norm before the output projection; None disables it.
     output_gate: Literal["swish", "sigmoid"] | None = "swish"
-    # Of the output norm (Qwen3-Next: 1e-6; Kimi Linear and fla: 1e-5).
+    # Epsilon of the output norm (Qwen3-Next: 1e-6; Kimi Linear and fla: 1e-5).
     norm_eps: float = 1e-6
 
 
@@ -371,7 +373,7 @@ class RWKV7Config(LinearAttentionConfig):
 
     Ports: ``v`` exports the values, or imports them for RWKV-7's value residual: the
     first layer exports its values, and every later one mixes them into its own, by a
-    learned amount a channel from a projection of rank `v_rank`.
+    learned amount per channel, from a projection of rank `v_rank`.
     """
 
     ports: ClassVar[frozenset[str]] = frozenset({"v"})
@@ -380,7 +382,7 @@ class RWKV7Config(LinearAttentionConfig):
     conv_size: int | None = None
     # The gate is a low-rank projection with this activation between, act(x G1) G2.
     output_gate: Literal["swish", "sigmoid"] | None = "sigmoid"
-    norm_eps: float = 1e-5  # times the value head dim, as fla has it (RWKV-LM: 64e-5)
+    norm_eps: float = 1e-5  # times the value head dim, as in fla (RWKV-LM: 64e-5)
     decay_rank: int = 64
     a_rank: int = 64
     v_rank: int = 32
@@ -460,7 +462,7 @@ class EmbeddingConfig(Config):
     type: Literal["embed"] = "embed"
     max_positions: int | None = None  # learned absolute positions (GPT-2)
     scale_by_sqrt_dim: bool = False  # Gemma
-    norm: NormalizationConfig | None = None  # after the scale (Inkling); nextn sees it
+    norm: NormalizationConfig | None = None  # after the scale (Inkling); nextn too
     dropout: float = 0.0
 
 
@@ -472,16 +474,16 @@ class LMHeadConfig(Config):
 
 
 class NextNConfig(Config):
-    """Multi-token prediction input (DeepSeek-V3): h -> W [norm(e_{i+k}); norm(h)], with
-    e_{i+k} what `embed` makes of the token k positions ahead (scaled and normalized,
-    without positions), for the k-th nextn to run in a forward pass. So every head
-    after it predicts one token further ahead, and a shared MTP module run twice looks
-    1, then 2 tokens ahead (Nemotron 3, GLM-5). An MTP module is
-    ``$h! nextn block norm @h head``, run after the main head.
+    """Multi-token prediction input (DeepSeek-V3): h -> W [norm(e_{i+k}); norm(h)].
+    For the k-th nextn in a forward pass, e_{i+k} is `embed`'s output for the token k
+    positions ahead (scaled and normalized, without positions). So every head after it
+    predicts one token further ahead, and a shared MTP module run twice looks 1, then 2
+    tokens ahead (Nemotron 3, GLM-5). An MTP module is ``$h! nextn block norm @h head``,
+    run after the main head.
 
     On a widened stream it mixes the embedding into each copy, W_e norm(e) + W_h
-    norm(R)_j, with the copies normalized together (Qwen3.8-Flash-Next), and on one
-    stream under a widening algebra it widens its output, as `embed` does.
+    norm(R)_j, normalizing the copies together (Qwen3.8-Flash-Next). On one stream
+    under a widening algebra it widens its output, as `embed` does.
     """
 
     type: Literal["nextn"] = "nextn"
@@ -491,23 +493,23 @@ class NextNConfig(Config):
 class EngramConfig(Config):
     """Conditional memory (DeepSeek Engram, 2026): hashed n-gram embeddings of the input
     tokens, gated by the stream. Every n-gram of 2 to `max_ngram_size` tokens ending
-    at a position is hashed by `num_heads` heads, each into a table of its own, and the
-    rows are joined into e. With a = <norm(x), norm(W_k e)> / sqrt(d), the layer adds
-    u = sigmoid(sign(a) sqrt(|a|)) W_v e to the stream x, then silu(conv(norm(u))).
+    at a position is hashed by `num_heads` heads, each into its own table, and the
+    rows are concatenated into e. With a = <norm(x), norm(W_k e)> / sqrt(d), the layer
+    adds u = sigmoid(sign(a) sqrt(|a|)) W_v e to the stream x, then silu(conv(norm(u))).
     Write it bare, not in [...]: on a widened stream it adds to each copy, gated by
-    a key of its own (DeepSeek-V4.1, Qwen3.8-Flash-Next). Like RoPE with positions, it
-    reads the model's input tokens by itself.
+    its own key (DeepSeek-V4.1, Qwen3.8-Flash-Next). It reads the model's input tokens
+    itself, as RoPE reads positions.
     """
 
     type: Literal["engram"] = "engram"
     head_dim: int  # width of a table row
-    table_size: int  # rows per head: the next prime >= this that no earlier head took
+    table_size: int  # rows per head: the next prime >= this not used by an earlier head
     max_ngram_size: int = 3  # n-grams of 2 to this many tokens
     num_heads: int = 8  # hash heads per n-gram size
     norm: NormalizationConfig = NormalizationConfig(type="rmsnorm")  # query, key, conv
-    conv_size: int | None = 4  # zero-initialized, dilated by max_ngram_size; None: none
+    conv_size: int | None = 4  # zero-initialized, dilated by max_ngram_size; None: off
     vocab_classes: int | None = None  # hash normalized token classes, not raw ids
-    boundary_token: int | None = None  # n-grams do not reach back past it: EOS (Qwen)
+    boundary_token: int | None = None  # n-grams stop at this token, e.g. EOS (Qwen)
 
 
 # --- Residual stream ------------------------------------------------------------
@@ -517,22 +519,22 @@ class HyperConnectionsConfig(Config):
     """Widen the residual stream into `expansion` streams with learned read/write/mix
     connections around every residual branch (Zhu et al., 2025). "mhc" projects the
     stream mixing onto doubly stochastic matrices with Sinkhorn (DeepSeek mHC, 2025).
-    With `single_pass`, a branch reads with the coefficients the one before it computed
-    (the first, stream 0 alone), and so does the read before the head, which has no
-    parameters of its own (DeepSeek-V4.1's Single-Pass mHC)."""
+    With `single_pass`, each branch reads with the coefficients that the branch before
+    it computed (the first reads stream 0 alone), and so does the parameter-free read
+    before the head (DeepSeek-V4.1's Single-Pass mHC)."""
 
     type: Literal["hc", "mhc"]
     expansion: int = 4
     dynamic: bool = True  # coefficients that depend on the stream; else static ones
     sinkhorn_iters: int = 20
     single_pass: bool = False
-    norm_eps: float = 1e-6  # of the norm the dynamic coefficients see (V4.1: 1e-20)
+    norm_eps: float = 1e-6  # of the norm before the dynamic coefficients (V4.1: 1e-20)
 
 
 class GatedResidualConfig(Config):
     """Gated residual (Qwen3.8-Flash-Next, 2026): `expansion` streams, each RMS-normalized
     when read. A branch reads their mean under a low-rank sigmoid gate and writes its
-    output back to every stream with a weight in (0, 2) of its own. The read normalizes,
+    output back to each stream with its own weight in (0, 2). The read normalizes,
     so branches need no pre-norm, and the read before the head replaces the final norm.
     """
 
@@ -543,14 +545,14 @@ class GatedResidualConfig(Config):
 
 
 class AttentionResidualConfig(Config):
-    """Attention residuals (Kimi, 2026): a branch reads a softmax over depth of the
-    embedding and the branch outputs so far, scored against a learned query of its own,
+    """Attention residuals (Kimi, 2026): each branch reads a softmax over depth of the
+    embedding and the branch outputs so far, scored against its own learned query,
     instead of their plain sum. Outputs are summed in blocks of `block_size` branches,
     and each block is one source; the head reads the same way.
     """
 
     type: Literal["attnres"] = "attnres"
-    block_size: int | None = None  # None -> every branch output is a source of its own
+    block_size: int | None = None  # None -> each branch output is its own source
     norm_eps: float = 1e-6  # of the keys' RMS norm (Kimi K3: 1e-5)
 
 

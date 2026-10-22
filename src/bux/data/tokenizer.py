@@ -1,8 +1,8 @@
-"""Tokenizers, run by gigatoken (Rust, SIMD pretokenization): strings in bulk to ids.
+"""Tokenizers run by gigatoken (Rust, SIMD pretokenization): strings to ids, in bulk.
 
-Special tokens are kept out of the encoder's reach, as tiktoken's encode_ordinary
-does: a web page that contains "<|endoftext|>" is text, not the end of a document.
-Only `special` and `markup` put special tokens in.
+The encoder never emits special tokens, like tiktoken's encode_ordinary: a web page
+that contains "<|endoftext|>" is text, not the end of a document. Only `special` and
+`markup` insert special tokens.
 """
 
 import functools
@@ -25,19 +25,19 @@ _SPECIAL = re.compile(r"(<\|[^|<>]+\|>)")
 
 
 class Tokenizer:
-    def __init__(self, c: tcfg.TokenizerConfig):
-        spec = json.loads(to_tokenizer_json(c.name))
+    def __init__(self, config: tcfg.TokenizerConfig):
+        spec = json.loads(to_tokenizer_json(config.name))
         added = spec.get("added_tokens") or []
         self.specials = {t["content"]: t["id"] for t in added if t.get("special")}
         spec["added_tokens"] = [t for t in added if not t.get("special")]
         self.encoder = gigatoken.Tokenizer.from_json(json.dumps(spec))
         ends = (i + 1 for i in self.specials.values())
         self.vocab_size: int = max(self.encoder.vocab_size, *ends)
-        for token in c.added:
+        for token in config.added:
             if token not in self.specials:
                 self.specials[token] = self.vocab_size
                 self.vocab_size += 1
-        self.bos, self.eos = self.special(c.bos), self.special(c.eos)
+        self.bos, self.eos = self.special(config.bos), self.special(config.eos)
         self._markup: dict[str, Int32[np.ndarray, " ids"]] = {}
 
     def special(self, token: str) -> int:
@@ -51,8 +51,8 @@ class Tokenizer:
     def encode(
         self, texts: pa.Array
     ) -> tuple[Int32[np.ndarray, " ids"], Int64[np.ndarray, " _"]]:
-        """The ids of every string, end to end, and n + 1 offsets of where each one's
-        start. Nulls are empty."""
+        """Encode every string; return the ids end to end, and n + 1 offsets where each
+        string's ids start. Nulls encode to nothing."""
         start, chars = utf8(texts)
         strings = ak.contents.ListOffsetArray(
             ak.index.Index64(start),
@@ -66,7 +66,7 @@ class Tokenizer:
         return ids[bounds[0] : bounds[-1]], bounds - bounds[0]
 
     def markup(self, text: str) -> Int32[np.ndarray, " ids"]:
-        """Template text, in which every <|name|> is that special token."""
+        """Encode template text, in which each <|name|> is that special token."""
         if text not in self._markup:
             self._markup[text] = self._encode_markup(text)
         return self._markup[text]
@@ -87,7 +87,7 @@ class Tokenizer:
 def utf8(
     texts: pa.Array,
 ) -> tuple[Int64[np.ndarray, " _"], UInt8[np.ndarray, " bytes"]]:
-    """The bytes of strings, without a copy: n + 1 offsets into one array of them."""
+    """Return the bytes of strings without a copy: n + 1 offsets into one array."""
     texts = texts.cast(pa.large_string())
     _, offsets, data = texts.buffers()
     start = np.frombuffer(offsets, np.int64, len(texts) + 1, texts.offset * 8)
@@ -95,6 +95,6 @@ def utf8(
 
 
 @functools.cache
-def load(c: tcfg.TokenizerConfig) -> Tokenizer:
-    """`c`, loaded once a process."""
-    return Tokenizer(c)
+def load(config: tcfg.TokenizerConfig) -> Tokenizer:
+    """Load the tokenizer that `config` describes, once per process."""
+    return Tokenizer(config)

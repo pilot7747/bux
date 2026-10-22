@@ -1,8 +1,8 @@
-"""The reduce: a chunk of documents to rows of `length` tokens.
+"""The reduce: pack a chunk of documents into rows of `length` tokens.
 
-A plan lays the rows out as pieces of documents end to end, `length` tokens a row,
-padding included as pieces of a pad region after the documents. Any range of rows
-is then one gather, so that a chunk is written a row group at a time.
+A plan lays out the rows as pieces of documents end to end, `length` tokens per row,
+with padding as pieces of a pad region after the documents. Any range of rows is then
+one gather, so a chunk is written one row group at a time.
 """
 
 import itertools
@@ -29,7 +29,7 @@ SCHEMA = pa.schema(
 def flat(
     column: pa.ChunkedArray,
 ) -> tuple[Shaped[np.ndarray, " values"], Int64[np.ndarray, " _"]]:
-    """A list column's values end to end, and n + 1 offsets into them."""
+    """Return a list column's values end to end, and n + 1 offsets into them."""
     lists = column.cast(pa.large_list(column.type.value_type)).combine_chunks()
     offsets = lists.offsets.to_numpy()
     return lists.flatten().to_numpy(zero_copy_only=False), offsets - offsets[0]
@@ -41,8 +41,8 @@ class Docs:
 
     ids: Int32[np.ndarray, " tokens"]
     mask: Bool[np.ndarray, " tokens"]
-    positions: Int32[np.ndarray, " tokens"]  # in its document, and in the padding
-    # n + 1, where the documents start; the last is the padding's
+    positions: Int32[np.ndarray, " tokens"]  # in its document, or in the padding
+    # n + 1: where each document starts, and then where the padding does
     offsets: Int64[np.ndarray, " _"]
 
     @classmethod
@@ -63,38 +63,39 @@ class Docs:
 class Plan:
     starts: Int[np.ndarray, " pieces"]  # in row order
     lengths: Int[np.ndarray, " pieces"]
-    rows: Int[np.ndarray, " _"]  # r + 1, where every row's pieces start
+    rows: Int[np.ndarray, " _"]  # r + 1: where each row's pieces start
     stats: Counter
 
 
 def _pieces(
     docs: Docs, long: str, length: int
 ) -> tuple[Int[np.ndarray, " pieces"], Int[np.ndarray, " pieces"], Counter]:
-    """Pieces of the documents: whole when they fit, else dropped, truncated, or split
-    into pieces of `length` that overlap by a token, so that no target is lost."""
+    """Cut the documents into pieces: whole when they fit; else dropped, truncated, or
+    split into pieces of `length` that overlap by one token, so that no target is lost.
+    """
     sizes = np.diff(docs.offsets)
-    over = sizes > length
+    too_long = sizes > length
     if long == "split":
-        count = np.where(over, (sizes - 2) // (length - 1) + 1, 1)
+        count = np.where(too_long, (sizes - 2) // (length - 1) + 1, 1)
     else:
-        count = np.where(over & (long == "drop"), 0, 1)
+        count = np.where(too_long & (long == "drop"), 0, 1)
     doc = np.repeat(np.arange(len(sizes)), count)
     j = np.arange(len(doc)) - np.repeat(np.cumsum(count) - count, count)
     starts = docs.offsets[:-1][doc] + j * (length - 1)
     lengths = np.minimum(sizes[doc] - j * (length - 1), length)
-    cut = {"drop": sizes[over].sum(), "truncate": (sizes[over] - length).sum()}
-    what = {"drop": "dropped", "truncate": "truncated", "split": "split"}[long]
+    cut = {"drop": sizes[too_long].sum(), "truncate": (sizes[too_long] - length).sum()}
+    stat = {"drop": "dropped", "truncate": "truncated", "split": "split"}[long]
     return (
         starts,
         lengths,
-        Counter({what: int(over.sum()), "cut": int(cut.get(long, 0))}),
+        Counter({stat: int(too_long.sum()), "cut": int(cut.get(long, 0))}),
     )
 
 
 def _next_fit(
     sizes: Int[np.ndarray, " pieces"], length: int, max_docs: int | None
 ) -> list[list[int]]:
-    """Pieces in order, a new row whenever the next does not fit in the last."""
+    """Pack pieces in order, starting a new row whenever the next one does not fit."""
     rows: list[list[int]] = []
     room = 0
     for piece, n in enumerate(sizes.tolist()):
@@ -109,11 +110,11 @@ def _next_fit(
 def _best_fit(
     sizes: Int[np.ndarray, " pieces"], length: int, max_docs: int | None, sort: bool
 ) -> list[list[int]]:
-    """Each piece, the longest first, into the open row with the least room for it."""
+    """Put each piece, longest first, into the open row with the least room for it."""
     order = np.argsort(-sizes, kind="stable") if sort else np.arange(len(sizes))
     rows: list[list[int]] = []
-    rooms: list[int] = []  # the distinct rooms of open rows, ascending
-    open_rows: dict[int, list[int]] = {}  # by their room
+    rooms: list[int] = []  # the open rows' distinct free space, ascending
+    open_rows: dict[int, list[int]] = {}  # open rows by their free space
     for piece, n in zip(order.tolist(), sizes[order].tolist(), strict=True):
         i = bisect_left(rooms, n)
         if i < len(rooms):
@@ -142,7 +143,7 @@ def _layout(
     pad: int,
     stats: Counter,
 ) -> Plan:
-    """The rows' pieces end to end, each row's padded to `length`."""
+    """Lay the rows' pieces end to end, padding each row to `length`."""
     counts = np.array([len(r) for r in rows], np.int64)
     flat = np.fromiter(itertools.chain.from_iterable(rows), np.int64, counts.sum())
     ends = np.cumsum(counts)
@@ -156,31 +157,31 @@ def _layout(
     )
 
 
-def plan(docs: Docs, c: tcfg.PackingConfig, length: int, seed: int) -> Plan:
-    """Rows of the documents in `docs`, in a random order."""
+def plan(docs: Docs, config: tcfg.PackingConfig, length: int, seed: int) -> Plan:
+    """Plan the rows of the documents in `docs`, in a random order."""
     rng = np.random.default_rng(seed)
     tokens = int(docs.offsets[-1])
-    seen = Counter(docs=len(docs.offsets) - 1, tokens=tokens)
-    if isinstance(c, tcfg.ConcatPacking):
+    stats = Counter(docs=len(docs.offsets) - 1, tokens=tokens)
+    if isinstance(config, tcfg.ConcatPacking):
         # Windows [i (length - 1), i (length - 1) + length): what does not fill one is cut.
         n = max(0, (tokens - 1) // (length - 1))
-        seen.update(rows=n, cut=tokens - (n * (length - 1) + 1 if n else 0))
+        stats.update(rows=n, cut=tokens - (n * (length - 1) + 1 if n else 0))
         starts = rng.permutation(n) * (length - 1)
-        return Plan(starts, np.full(n, length), np.arange(n + 1), seen)
-    starts, lengths, stats = _pieces(docs, c.long, length)
-    if isinstance(c, tcfg.BestFitPacking):
-        rows = _best_fit(lengths, length, c.max_docs, c.sort)
+        return Plan(starts, np.full(n, length), np.arange(n + 1), stats)
+    starts, lengths, cuts = _pieces(docs, config.long, length)
+    if isinstance(config, tcfg.BestFitPacking):
+        rows = _best_fit(lengths, length, config.max_docs, config.sort)
     else:
-        rows = _next_fit(lengths, length, c.max_docs)
+        rows = _next_fit(lengths, length, config.max_docs)
     rows = [rows[i] for i in rng.permutation(len(rows))]
-    seen.update(stats)
-    return _layout(rows, starts, lengths, length, tokens, seen)
+    stats.update(cuts)
+    return _layout(rows, starts, lengths, length, tokens, stats)
 
 
 def materialize(
     docs: Docs, plan: Plan, length: int, doc_mask: bool, size: int
 ) -> Iterator[pa.RecordBatch]:
-    """The planned rows, `size` at a time. Counts the targets in plan.stats as it goes."""
+    """Yield the planned rows, `size` at a time, counting targets in `plan.stats`."""
     for a in range(0, len(plan.rows) - 1, size):
         lo, hi = plan.rows[a], plan.rows[min(a + size, len(plan.rows) - 1)]
         starts, lengths = plan.starts[lo:hi], plan.lengths[lo:hi]

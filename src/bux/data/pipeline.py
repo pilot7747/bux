@@ -1,14 +1,14 @@
-"""The pipeline: a map and a reduce over Arrow record batches, for any MapReduce
-engine to run, and an engine that runs them on this machine's cores.
+"""The pipeline: a map and a reduce over Arrow record batches, which any MapReduce
+engine can run, and an engine that runs them on this machine's cores.
 
     records ─map─▶ documents under random keys ─shuffle─▶ chunks ─reduce─▶ rows
 
 The map tokenizes records into documents (bux.data.documents). The shuffle groups
-them by the top bits of their keys, into a power of two of chunks of about
-`packing.chunk` tokens, each a random sample. The reduce packs a chunk into rows
+them by the top bits of their keys into a power of two of chunks, each about
+`packing.chunk` tokens and a random sample. The reduce packs a chunk into rows
 (bux.data.packing). bux.data.spark runs the same two functions on Spark.
 
-A prepared dataset is a folder named for a hash of the job, under a cache:
+A prepared dataset is a folder under a cache, named for a hash of the job:
 
     data/packed/text-3f9a0c2e1b/
         part-00000.parquet ...   rows: input_ids, position_ids, loss_mask, seq_len each
@@ -52,10 +52,10 @@ class Job:
 
     @classmethod
     def of(
-        cls, source: tcfg.TextConfig | tcfg.ChatConfig, t: tcfg.TrainConfig
+        cls, source: tcfg.TextConfig | tcfg.ChatConfig, config: tcfg.TrainConfig
     ) -> "Job":
-        assert t.tokenizer is not None, "the compiler requires one for documents"
-        return cls(source, t.tokenizer, t.packing, t.seq_len)
+        assert config.tokenizer is not None, "the compiler requires one for documents"
+        return cls(source, config.tokenizer, config.packing, config.seq_len)
 
     def describe(self) -> dict:
         return {
@@ -73,26 +73,26 @@ class Job:
 
     @property
     def group_rows(self) -> int:
-        """Rows in a row group of the output: about a million tokens."""
+        """Return the rows per row group of the output: about a million tokens."""
         return max(1, 2**20 // self.seq_len)
 
     def map(self, records: Iterable[pa.RecordBatch]) -> Iterator[pa.RecordBatch]:
-        """Records to documents, a batch at a time: Spark's mapInArrow."""
+        """Turn records into documents, one batch at a time, as Spark's mapInArrow."""
         tok = load(self.tokenizer)
         if isinstance(self.source, tcfg.TextConfig):
             return (documents.text(b, self.source, tok) for b in records)
         return (documents.chat(b, self.source, tok) for b in records)
 
     def chunks(self, tokens: int) -> int:
-        """The chunks for `tokens` tokens of documents: a power of two, so that a
-        document's chunk is the top bits of its key, exactly, in any engine."""
+        """Return the number of chunks for `tokens` tokens: a power of two, so that a
+        document's chunk is exactly the top bits of its key, in any engine."""
         return 1 << max(0, round(math.log2(max(tokens, 1) / self.packing.chunk)))
 
     def reduce(
         self, chunk: int, docs: pa.Table
     ) -> tuple[Iterator[pa.RecordBatch], Counter]:
-        """A chunk's documents, in any order, to its rows, a row group at a time, and
-        statistics, which are complete once the rows are."""
+        """Pack a chunk's documents, in any order, into rows, one row group at a time;
+        also return statistics, complete once the rows are."""
         d = packing.Docs.of(docs, self.seq_len)
         plan = packing.plan(d, self.packing, self.seq_len, seed=chunk)
         rows = packing.materialize(
@@ -102,23 +102,24 @@ class Job:
 
 
 def shift(chunks: int) -> int:
-    """How far to shift a key right for its chunk, of `chunks`."""
+    """Return how far to shift a key right to get its chunk, out of `chunks`."""
     return 63 - (chunks.bit_length() - 1)
 
 
-def jobs(t: tcfg.TrainConfig) -> list[Job]:
-    """The datasets a run reads, in training and in evaluation, each once."""
-    sources = tcfg.leaves(t.data) + (tcfg.leaves(t.eval.data) if t.eval else ())
-    return list(
-        dict.fromkeys(Job.of(s, t) for s in sources if isinstance(s, tcfg.DOCUMENTS))
-    )
+def jobs(config: tcfg.TrainConfig) -> list[Job]:
+    """Return the datasets a run reads, in training and evaluation, once each."""
+    sources = tcfg.leaves(config.data)
+    if config.eval:
+        sources += tcfg.leaves(config.eval.data)
+    found = (Job.of(s, config) for s in sources if isinstance(s, tcfg.DOCUMENTS))
+    return list(dict.fromkeys(found))
 
 
 # --- On this machine ---------------------------------------------------------------------
 
 
 def _splits(path: str, size: int = 1 << 28) -> list[list[int]]:
-    """A Parquet file's row groups, in runs of about `size` bytes: the map's tasks."""
+    """Group a Parquet file's row groups into runs of about `size` bytes: map tasks."""
     meta = pq.read_metadata(path)
     runs, total = [[]], 0
     for g in range(meta.num_row_groups):
@@ -131,13 +132,13 @@ def _splits(path: str, size: int = 1 << 28) -> list[list[int]]:
     return runs
 
 
-# A spill is a map task's documents sorted by key, as raw arrays, so that a reduce
-# finds its keys by bisection and maps in its documents and nothing else.
+# A spill holds one map task's documents sorted by key, as raw arrays, so that a
+# reduce finds its keys by bisection and memory-maps only its own documents.
 _SPILLED = ("key", "offsets", "ids", "mask")
 
 
 def _map(job: Job, task: tuple[str, list[int]], spill: Path) -> int:
-    """Documents of some row groups to a spill; the tokens in them."""
+    """Write the documents of some row groups to a spill; return their token count."""
     path, groups = task
     records = pq.ParquetFile(path).iter_batches(
         batch_size=4096, row_groups=groups, columns=[job.source.column]
@@ -152,7 +153,7 @@ def _map(job: Job, task: tuple[str, list[int]], spill: Path) -> int:
 
 
 def _take(spill: Path, chunk: int, chunks: int) -> pa.RecordBatch:
-    """A chunk's documents in a spill."""
+    """Read a chunk's documents from a spill."""
     key, offsets, ids, mask = (
         np.load(spill / f"{name}.npy", mmap_mode="r") for name in _SPILLED
     )
@@ -163,7 +164,7 @@ def _take(spill: Path, chunk: int, chunks: int) -> pa.RecordBatch:
         else len(key)
     )
     lo, hi = offsets[a], offsets[b]
-    return documents.of(
+    return documents.record_batch(
         np.array(key[a:b]),
         np.array(ids[lo:hi]),
         offsets[a : b + 1] - lo,
@@ -174,7 +175,7 @@ def _take(spill: Path, chunk: int, chunks: int) -> pa.RecordBatch:
 def _reduce(
     job: Job, chunk: int, chunks: int, spills: list[Path], part: Path
 ) -> Counter:
-    """The documents of a chunk, from every spill, to a Parquet file of rows."""
+    """Pack a chunk's documents, from every spill, into a Parquet file of rows."""
     pieces = [_take(spill, chunk, chunks) for spill in spills]
     rows, stats = job.reduce(chunk, pa.Table.from_batches(pieces, documents.SCHEMA))
     with pq.ParquetWriter(part, packing.SCHEMA, compression="zstd") as out:
@@ -201,8 +202,8 @@ def prepare(
     workers: int | None = None,
     echo: Callable[[str], None] = print,
 ) -> Path:
-    """The folder of `job`'s dataset under `cache`, made unless it is there already,
-    by `workers` processes (None: one a core; 0: this one)."""
+    """Return the folder of `job`'s dataset under `cache`, preparing it if missing
+    with `workers` processes (None: one per core; 0: this one)."""
     cache = Path(cache)
     folder = cache / job.name
     if (folder / "dataset.json").exists():
@@ -242,7 +243,7 @@ def prepare(
         (out / "dataset.json").write_text(json.dumps(meta, indent=2), encoding="utf-8")
         try:
             out.rename(folder)
-        except OSError:  # another process, a task of the same array job say, was first
+        except OSError:  # another process, such as a task of the same array job, won
             if not (folder / "dataset.json").exists():
                 raise
             return folder

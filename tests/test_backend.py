@@ -530,7 +530,9 @@ def test_the_vocabulary_and_the_hidden_units_split_over_tensor():
     arch = compile(PRELUDE + "model = embed [norm ffn] norm head(bias=true)")
     with parallel.use(tcfg.MeshConfig(tensor=4)):
         m = parallel.build(lambda: Model(arch, rngs=nnx.Rngs(0)))
-        logits = nnx.jit(lambda m, t: m(t))(m, parallel.rows(np.asarray(tokens())))
+        logits = nnx.jit(lambda m, t: m(t))(
+            m, parallel.shard_batch(np.asarray(tokens()))
+        )
     mlp, head = _of(m, MLP), _of(m, Head)
     assert head.proj is not None and head.proj.bias is not None
     assert _spec(_of(m, Embedding).tokens.embedding) == P("tensor", None)

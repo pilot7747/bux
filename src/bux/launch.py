@@ -1,34 +1,34 @@
-"""The launcher, ``bux launch``: what trains an experiment, a .bux file of one run or a
-sweep of many, to its end, on a cluster as on a laptop.
+"""The launcher, ``bux launch``: train an experiment, a .bux file of one run or a
+sweep of many, to its end, on a cluster or on a laptop.
 
     bux launch examples/experiments/attention_ablation.bux             # all 6 runs
     bux launch examples/experiments/attention_ablation.bux --index 3   # the fourth, in an array job
 
-A run needs the GPUs of its mesh, the product of its axes' sizes, where `data` unset
-is every visible GPU for a run alone and one in a sweep; one that needs more than
-there are fails at once. The launcher prepares the datasets the others read, once. A
-run alone then trains in this process. A sweep trains in workers, a process a run,
-each on a group of free GPUs (CUDA_VISIBLE_DEVICES says which), the first pending run
-that fits starting first, or one at a time on the default device if there are none. A
-worker's output goes to the console and to its run's train.log, and a run that fails
-or runs out of memory leaves the others training.
+A run needs the GPUs of its mesh: the product of its axes' sizes, where an unset
+`data` is every visible GPU for a run alone and one in a sweep; a run that needs more
+than there are fails at once. The launcher prepares the datasets the other runs read,
+once. A run alone then trains in this process. A sweep trains one worker process per
+run, each on a group of free GPUs (CUDA_VISIBLE_DEVICES), the first pending run that
+fits first; without GPUs, one at a time on the default device. A worker's output goes
+to the console and to its run's train.log, and a run that fails or runs out of memory
+leaves the others training.
 
 A run alone trains on many hosts when the environment says so: Slurm's srun, Open
 MPI's mpirun, or JAX_COORDINATOR_ADDRESS, JAX_NUM_PROCESSES and JAX_PROCESS_ID. Its
-processes join through jax.distributed, and the first writes the console, status.json
-and the run's files; checkpoints are all of theirs.
+processes join through jax.distributed; the first writes the console, status.json and
+the run's files, and all of them write checkpoints.
 
 A run's directory (``bux.train.trainer``) also keeps a status.json: whether the run is
-running, done, failed or stopped, where, on what GPUs, since when, at what step, and
+running, done, failed or stopped, where, on which GPUs, since when, at what step, and
 its latest metrics. A run that is done is not trained again, and one that is not
 resumes from its latest checkpoint, so launching an experiment again, after a
 preemption, a crash or a fix, trains what is left of it.
 
-SIGTERM or SIGINT stops training after the step it is at, which a checkpoint setting
-saves, and a second one, a second or more later, stops it at once; a sweep's launcher
-passes them on to its workers, and a signal to any process of many stops them all at
-the same step. The launcher exits with 0 when every run is done, 1 when one failed,
-and 128 + the signal's number when a signal stopped them.
+SIGTERM or SIGINT stops training after the current step, saving a checkpoint if the
+run has a checkpoint setting; a second signal, a second or more later, stops it at
+once. A sweep's launcher passes signals on to its workers, and a signal to any process
+of a run stops them all at the same step. The launcher exits with 0 when every run is
+done, 1 when one failed, and 128 + the signal's number when a signal stopped them.
 """
 
 import contextlib
@@ -66,23 +66,23 @@ from bux.train.sinks import Latest, primary
 from bux.train.trainer import Trainer, directory, train
 
 SIGNALS = (signal.SIGTERM, signal.SIGINT)
-# A signal sooner than this after the first is the same one, delivered twice: to this
-# process and to its parent, `uv run` or `srun` say, which passes it on.
+# A signal sooner than this after the first is the same one delivered twice: to this
+# process, and to its parent (`uv run` or `srun`, say), which passes it on.
 REPEAT = 1.0  # seconds
-# What says how many processes train a run together, the first of them set: the user,
-# Slurm's srun, Open MPI's mpirun.
+# The variables that give the number of processes training one run, the first set
+# wins: the user's, Slurm's srun's, Open MPI's mpirun's.
 PROCESSES = ("JAX_NUM_PROCESSES", "SLURM_STEP_NUM_TASKS", "OMPI_COMM_WORLD_SIZE")
 
 
 def status(folder: Path) -> dict[str, Any]:
-    """What the run in `folder` last said of itself in its status.json, if anything."""
+    """Return the run's status.json in `folder`, or {} if there is none."""
     path = folder / "status.json"
     return json.loads(path.read_text(encoding="utf-8")) if path.exists() else {}
 
 
 def record(folder: Path, **fields: Any) -> None:
-    """Update the run's status.json with `fields`, all at once; of a job of many
-    processes, the first does."""
+    """Update the run's status.json with `fields`, all at once. In a job of many
+    processes, only the first writes it."""
     if not primary():
         return
     tmp = folder / "status.json.tmp"
@@ -91,11 +91,11 @@ def record(folder: Path, **fields: Any) -> None:
 
 
 def _print(line: str) -> None:
-    print(line, flush=True)  # now, though stdout is a pipe, to a container's log say
+    print(line, flush=True)  # now, even if stdout is a pipe, to a container's log say
 
 
 def _quiet(line: str) -> None:
-    """What a process of many but the first says: nothing."""
+    """Print nothing: the echo of every process of many but the first."""
 
 
 def _now() -> str:
@@ -110,58 +110,62 @@ def _name(signum: int) -> str:
 
 
 def processes(env: Mapping[str, str] = os.environ) -> int:
-    """How many processes train a run together, as `env` says: 1 alone."""
+    """Return how many processes train one run together, as `env` says: 1 alone."""
     return next((int(env[v]) for v in PROCESSES if v in env), 1)
 
 
 def join() -> None:
-    """Join the other processes of a job through jax.distributed, if there are any:
-    before anything touches a device."""
+    """Join the job's other processes through jax.distributed, if there are any.
+
+    Call it before anything touches a device.
+    """
     if processes() == 1 or jax.distributed.is_initialized():
         return
-    if "JAX_NUM_PROCESSES" in os.environ:  # and JAX_COORDINATOR_ADDRESS, jax reads it
+    if "JAX_NUM_PROCESSES" in os.environ:  # jax reads JAX_COORDINATOR_ADDRESS itself
         jax.distributed.initialize(
             num_processes=int(os.environ["JAX_NUM_PROCESSES"]),
             process_id=int(os.environ["JAX_PROCESS_ID"]),
         )
     else:
-        jax.distributed.initialize()  # as Slurm or Open MPI says
+        jax.distributed.initialize()  # from Slurm's or Open MPI's environment
 
 
 def _largest(signum: int) -> Int[Array, ""]:
-    """The largest of every process's `signum`, the same in all of them, once the
-    devices get to it."""
+    """Return the largest `signum` of all processes, the same in each, once the
+    devices compute it."""
     grid = Mesh(np.array(jax.devices()), ("devices",))
-    split = NamedSharding(grid, P("devices"))
-    local = np.full(jax.local_device_count(), signum, np.int32)  # one a device
-    said = jax.make_array_from_process_local_data(split, local)
+    sharding = NamedSharding(grid, P("devices"))
+    local = np.full(jax.local_device_count(), signum, np.int32)  # one per device
+    signums = jax.make_array_from_process_local_data(sharding, local)
     with jax.set_mesh(grid):
-        return jax.jit(jnp.max, out_shardings=NamedSharding(grid, P()))(said)
+        return jax.jit(jnp.max, out_shardings=NamedSharding(grid, P()))(signums)
 
 
 class Stop(Hook):
-    """Stops training at SIGTERM or SIGINT, after the step it is at; at a second
-    signal, or at one before training starts, at once, with a KeyboardInterrupt. Of a
-    job of many processes, a signal to any stops them all after the same step: the
-    one after they all hear what each said at the step before."""
+    """Stop training after the current step at SIGTERM or SIGINT.
+
+    A second signal, or one before training starts, stops it at once with a
+    KeyboardInterrupt. A signal to any process of many stops them all after the same
+    step, once they have all seen it.
+    """
 
     def __init__(self) -> None:
         self.trainer: Trainer | None = None
         self.signal: int | None = None  # the first one
         self.since = 0.0
-        self.many = False  # whether it is a job of many processes
-        self.said: Int[Array, ""] | None = None  # by every process, a step ago
+        self.multiprocess = False
+        self.agreed: Int[Array, ""] | None = None  # every process's signal, a step ago
 
     def due(self, step: int, steps: int) -> bool:
-        return self.many
+        return self.multiprocess
 
     def start(self, trainer: Trainer) -> None:
-        self.trainer, self.many = trainer, jax.process_count() > 1
+        self.trainer, self.multiprocess = trainer, jax.process_count() > 1
 
     def __call__(self, trainer: Trainer, metrics: Metrics) -> None:
-        # A step late, the devices have it by now: agreeing keeps a step in flight.
-        said, self.said = self.said, _largest(self.signal or 0)
-        if said is not None and (signum := int(said)):
+        # Read last step's result, ready by now, so as not to stall the step in flight.
+        agreed, self.agreed = self.agreed, _largest(self.signal or 0)
+        if agreed is not None and (signum := int(agreed)):
             if self.signal is None:  # another process's
                 self.signal, self.since = signum, time.monotonic()
             trainer.stopping = True
@@ -171,14 +175,14 @@ class Stop(Hook):
             self.signal, self.since = signum, time.monotonic()
             if self.trainer is None:
                 raise KeyboardInterrupt
-            if not self.many:  # many stop at the step they agree on
+            if not self.multiprocess:  # many stop at the step they agree on
                 self.trainer.stopping = True
         elif time.monotonic() - self.since >= REPEAT:
             raise KeyboardInterrupt
 
     @contextlib.contextmanager
     def armed(self) -> Generator["Stop"]:
-        """With the signals handled."""
+        """Handle SIGTERM and SIGINT inside the context."""
         previous = {s: signal.signal(s, self.handle) for s in SIGNALS}
         try:
             yield self
@@ -188,8 +192,8 @@ class Stop(Hook):
 
 
 def _devices(run: ir.Run, gpus: list[str] | None) -> str:
-    """What `run` trains on: 8 × NVIDIA H100 (GPU 0,...,7) of a host, or of 2
-    processes."""
+    """Describe what `run` trains on: 8 × NVIDIA H100 (GPU 0,...,7) of a host, or of
+    2 processes."""
     devices = jax.devices()
     n = math.prod(parallel.sizes(run.train.mesh, len(devices)).values())
     kind = devices[0].device_kind + (f" (GPU {','.join(gpus)})" if gpus else "")
@@ -199,7 +203,7 @@ def _devices(run: ir.Run, gpus: list[str] | None) -> str:
 
 
 def _outcome(run: ir.Run, stop: Stop, error: str | None) -> tuple[str, int, str]:
-    """How the run ended: its state, the exit code and what to say."""
+    """Return how the run ended: its state, the exit code and a message."""
     step = None if stop.trainer is None else stop.trainer.step
     at = "before training" if step is None else f"at step {step}"
     if error is not None:
@@ -210,8 +214,8 @@ def _outcome(run: ir.Run, stop: Stop, error: str | None) -> tuple[str, int, str]
             if run.train.checkpoint is not None
             else "starts it over, as it has no checkpoint setting"
         )
-        said = f"stopped {at} by {_name(stop.signal)}; launching it again {again}"
-        return "stopped", 128 + stop.signal, said
+        message = f"stopped {at} by {_name(stop.signal)}; launching it again {again}"
+        return "stopped", 128 + stop.signal, message
     return "done", 0, "done"
 
 
@@ -222,9 +226,9 @@ def train_here(
     *,
     echo: Callable[[str], None] = _print,
 ) -> int:
-    """Train `run` in this process, as `train` does, and record how it went in its
-    status.json; the exit code. Of a job of many processes, which it joins, the first
-    says and records it."""
+    """Train `run` in this process, as `train` does, record how it went in its
+    status.json, and return the exit code. In a job of many processes, which it joins,
+    only the first prints and records."""
     join()
     echo = echo if primary() else _quiet
     folder = directory(run, out)
@@ -243,35 +247,35 @@ def train_here(
     stop, latest, error = Stop(), Latest(), None
     try:
         with stop.armed():
-            on = _devices(run, gpus)
-            echo(f"{run.name}: training on {on} with jax {jax.__version__}")
+            devices = _devices(run, gpus)
+            echo(f"{run.name}: training on {devices} with jax {jax.__version__}")
             train(run, out, cache=cache, echo=echo, hooks=[stop], sinks=[latest])
     except KeyboardInterrupt:
         stop.signal = stop.signal or signal.SIGINT
     except Exception as err:  # noqa: BLE001
         traceback.print_exc()
         error = f"{type(err).__name__}: {err}"
-    state, code, said = _outcome(run, stop, error)
+    state, code, message = _outcome(run, stop, error)
     fields: dict[str, Any] = {"state": state, "ended": _now(), "error": error}
     if stop.trainer is not None:
         fields["step"] = stop.trainer.step
     if latest.metrics:
         fields["metrics"] = latest.metrics
     record(folder, **fields)
-    echo(f"{run.name}: {said}")
+    echo(f"{run.name}: {message}")
     return code
 
 
 def _listed() -> list[str] | None:
-    """The GPUs CUDA_VISIBLE_DEVICES lists, if it is set."""
+    """Return the GPUs that CUDA_VISIBLE_DEVICES lists, or None if it is not set."""
     if (listed := os.environ.get("CUDA_VISIBLE_DEVICES")) is None:
         return None
     return [g for g in listed.split(",") if g.strip() not in ("", "-1")]
 
 
 def visible_gpus() -> list[str]:
-    """The GPUs to give workers: those CUDA_VISIBLE_DEVICES lists, if it is set, or
-    else every one that nvidia-smi finds."""
+    """Return the GPUs to give workers: those CUDA_VISIBLE_DEVICES lists if it is
+    set, else every one that nvidia-smi finds."""
     if (listed := _listed()) is not None:
         return listed
     try:
@@ -283,18 +287,19 @@ def visible_gpus() -> list[str]:
     return [str(i) for i in range(sum(g.startswith("GPU ") for g in found.split("\n")))]
 
 
-def need(c: MeshConfig, gpus: int, *, alone: bool) -> int:
-    """The GPUs a run of mesh `c` trains on, of `gpus` there are: the product of its
-    axes' sizes, where `data` unset is every GPU for a run alone, and one in a sweep."""
-    rest = math.prod(getattr(c, a) for a in parallel.AXES if a != "data")
-    if c.data is not None:
-        return c.data * rest
+def need(config: MeshConfig, gpus: int, *, alone: bool) -> int:
+    """Return how many of `gpus` GPUs a run with mesh `config` uses: the product of
+    its axes' sizes, where an unset `data` is every GPU for a run alone, one in a sweep.
+    """
+    rest = math.prod(getattr(config, a) for a in parallel.AXES if a != "data")
+    if config.data is not None:
+        return config.data * rest
     return max(gpus, rest) if alone else rest
 
 
 def fit[S](needs: Sequence[int], free: Sequence[S]) -> tuple[int, list[S]] | None:
-    """The first of the runs that need `needs` GPUs to fit in the `free` ones, and the
-    group it gets: the first of them. None if none fits."""
+    """Return the first run, of those that need `needs` GPUs, that fits in the `free`
+    ones, and the group it gets: the first free ones. None if none fits."""
     for i, n in enumerate(needs):
         if n <= len(free):
             return i, list(free[:n])
@@ -304,9 +309,9 @@ def fit[S](needs: Sequence[int], free: Sequence[S]) -> tuple[int, list[S]] | Non
 def _spawn(
     run: ir.Run, out: str | Path, cache: str | Path, gpus: list[str]
 ) -> subprocess.Popen[str]:
-    """A worker that trains `run` on `gpus`, or on the default device if there are
-    none, from its run.json: what the launcher compiled, whatever its files say by
-    now."""
+    """Start a worker that trains `run` on `gpus`, or on the default device if there
+    are none, from its run.json: the run as the launcher compiled it, whatever the
+    files say by now."""
     folder = directory(run, out)
     folder.mkdir(parents=True, exist_ok=True)
     (folder / "run.json").write_text(run.model_dump_json(indent=2), encoding="utf-8")
@@ -334,17 +339,18 @@ def _spawn(
 def _ended(
     run: ir.Run, out: str | Path, code: int, signals: Sequence[int]
 ) -> str | None:
-    """Record how the worker that trained `run` ended, with `code`, if it died before
-    it could say; what to say if it failed."""
+    """Record how the worker that trained `run` ended, with exit `code`, if it died
+    before it could. Return an error message if the run failed."""
     folder = directory(run, out)
-    how = _name(-code) if code < 0 else f"exit {code}"
-    if status(folder).get("state") == "running":  # it died before it could say
+    exit_status = _name(-code) if code < 0 else f"exit {code}"
+    if status(folder).get("state") == "running":  # it died before it could record
         stopped = bool(signals) and code in (-signals[0], 128 + signals[0])
-        state, error = ("stopped", None) if stopped else ("failed", how)
+        state, error = ("stopped", None) if stopped else ("failed", exit_status)
         record(folder, state=state, ended=_now(), error=error)
     if status(folder)["state"] != "failed":
         return None
-    return f"{run.name}: failed ({how}); its output is in {folder / 'train.log'}"
+    log = folder / "train.log"
+    return f"{run.name}: failed ({exit_status}); its output is in {log}"
 
 
 def supervise(
@@ -355,9 +361,12 @@ def supervise(
     *,
     echo: Callable[[str], None] = _print,
 ) -> int:
-    """Train `runs` in workers, each on a group of free `gpus`, as many as its mesh
-    needs and no more than there are, the first pending run that fits starting first;
-    or one at a time on the default device if there are no GPUs. The exit code."""
+    """Train `runs` in workers and return the exit code.
+
+    Each worker gets a group of free `gpus`, as many as its mesh needs, and the first
+    pending run that fits starts first. Without GPUs, runs train one at a time on the
+    default device.
+    """
     slots: list[str | None] = [*gpus] or [None]  # None: the default device
     needs = [need(r.train.mesh, len(gpus), alone=False) if gpus else 1 for r in runs]
     pending, free = list(zip(runs, needs)), list(slots)
@@ -395,7 +404,7 @@ def supervise(
                 free = [s for s in free if s not in group]
                 worker = _spawn(run, out, cache, [g for g in group if g is not None])
                 active[worker] = run, group
-                if signals:  # that came as it started
+                if signals:  # a signal that came as it started
                     worker.send_signal(signals[0])
                 log = directory(run, out) / "train.log"
                 threading.Thread(target=relay, args=(worker, log), daemon=True).start()
@@ -404,9 +413,9 @@ def supervise(
             worker = ended.get()
             run, group = active.pop(worker)
             free = [s for s in slots if s in free or s in group]
-            if said := _ended(run, out, worker.returncode, signals):
+            if message := _ended(run, out, worker.returncode, signals):
                 failed = True
-                say(said)
+                say(message)
     finally:
         for s, handler in previous.items():
             signal.signal(s, handler)
@@ -414,7 +423,7 @@ def supervise(
 
 
 def summary(runs: Sequence[ir.Run], out: str | Path) -> str:
-    """A line a run: its state, its step, and its latest losses."""
+    """Return one line per run: its state, its step, and its latest losses."""
     rows: list[tuple[str, ...]] = [("state", "step", "loss", "eval loss", "run")]
     for run in runs:
         s = status(directory(run, out))
@@ -438,7 +447,7 @@ def _fitting(
     gpus: Sequence[str],
     echo: Callable[[str], None],
 ) -> list[ir.Run]:
-    """The runs that need no more of `gpus` than there are; the others fail."""
+    """Return the runs that need no more GPUs than `gpus`; record the others failed."""
     fits = []
     for run in runs:
         n = need(run.train.mesh, len(gpus), alone=len(runs) == 1)
@@ -459,8 +468,8 @@ def _prepare(
     workers: int | None,
     echo: Callable[[str], None],
 ) -> int | None:
-    """Prepare the datasets `runs` read, once each; the exit code if a signal stops
-    it."""
+    """Prepare the datasets `runs` read, once each. Return the exit code if a signal
+    stops it, else None."""
     stop = Stop()
     try:
         with stop.armed():
@@ -480,36 +489,38 @@ def launch(
     workers: int | None = None,
     echo: Callable[[str], None] = _print,
 ) -> int:
-    """Train what is left of `runs` under `out`, after preparing the datasets they
-    read under `cache`, with `workers` processes; the exit code. A run alone trains
-    in this process, on as many of `gpus` (default: every visible one) as it needs,
-    or with others on many hosts if the environment says so; a sweep in workers,
-    each on a group of them."""
+    """Train what is left of `runs` under `out`, and return the exit code.
+
+    First prepare the datasets they read under `cache`, with `workers` processes. A
+    run alone trains in this process, on as many of `gpus` (default: every visible
+    one) as it needs, or on many hosts if the environment says so. A sweep trains in
+    workers, each on a group of the GPUs.
+    """
     todo = [run for run in runs if status(directory(run, out)).get("state") != "done"]
     if done := len(runs) - len(todo):
         echo(f"{done} of {len(runs)} run{'s' if len(runs) != 1 else ''} done already")
     if not todo:
         return 0
-    if (many := processes()) > 1:
+    if (nproc := processes()) > 1:
         if len(todo) > 1:
-            echo(f"{many} processes train one run, not {len(todo)}: use --index")
+            echo(f"{nproc} processes train one run, not {len(todo)}: use --index")
             return 1
         join()
         echo = echo if primary() else _quiet
-    # Of many processes, each has the GPUs jax.distributed gives it.
-    there = [] if many > 1 else list(visible_gpus() if gpus is None else gpus)
-    if not (fits := _fitting(todo, out, there, echo)):
+    # In a job of many processes, each has the GPUs jax.distributed gives it.
+    available = [] if nproc > 1 else list(visible_gpus() if gpus is None else gpus)
+    if not (fits := _fitting(todo, out, available, echo)):
         return 1
     if (code := _prepare(fits, cache, workers, echo)) is not None:
         return code
     if len(todo) == 1:
-        if there:
-            n = need(todo[0].train.mesh, len(there), alone=True)
-            os.environ["CUDA_VISIBLE_DEVICES"] = ",".join(there[:n])
+        if available:
+            n = need(todo[0].train.mesh, len(available), alone=True)
+            os.environ["CUDA_VISIBLE_DEVICES"] = ",".join(available[:n])
         return train_here(todo[0], out, cache, echo=echo)
-    on = f" on GPUs {','.join(there)}" if there else ", one at a time"
-    echo(f"training {len(fits)} runs{on}")
-    code = supervise(fits, out, cache, there, echo=echo)
+    where = f" on GPUs {','.join(available)}" if available else ", one at a time"
+    echo(f"training {len(fits)} runs{where}")
+    code = supervise(fits, out, cache, available, echo=echo)
     echo(summary(runs, out))
     return code or int(len(fits) < len(todo))
 

@@ -198,7 +198,7 @@ def _muon_step(orthogonalize: str = "gspmd", **mesh: int) -> tuple[list, str]:
         model = parallel.build(lambda: Model(compile(MOE), rngs=nnx.Rngs(0)))
         c, lr = tcfg.MuonConfig(lr=0.02), schedule(tcfg.ConstantSchedule(), 1)
         trained = nnx.Optimizer(model, optimizer(c, lr, model), wrt=nnx.Param)
-        parallel.place(model, trained)
+        parallel.shard_state(model, trained)
         grads = jax.tree.map(jnp.sin, nnx.state(model, nnx.Param))
         step = nnx.jit(lambda m, o, g: o.update(m, g))
         hlo = step.lower(model, trained, grads).compile().as_text() or ""
