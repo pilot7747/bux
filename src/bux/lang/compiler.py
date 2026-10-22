@@ -689,9 +689,8 @@ class _Evaluator:
                 config = self.construct(name, fields, expr.span)
                 return self.with_ports(config, ports, None, None, expr.span)
             case _Named(label=label, share=share) if isinstance(
-                _unwrap(callee), cfg.Config
+                base := self.as_config(_unwrap(callee), expr.name_span), cfg.Config
             ):
-                base = typing.cast(cfg.Config, _unwrap(callee))
                 fields, ports = self.arguments(expr, scope, type(base))
                 if not fields:
                     return self.with_ports(base, ports, label, share, expr.span)
@@ -710,8 +709,17 @@ class _Evaluator:
                 raise self.unknown(name, expr.name_span, called=True)
         raise self.not_callable(expr, callee)
 
+    def as_config(self, value: object, span: Span) -> object:
+        """Return a bare layer or setting type, as in ``norm = rmsnorm``, as its
+        default config, and any other value as it is."""
+        match value:
+            case _Builtin(name=name) if name in TYPES:
+                return self.construct(name, [], span)
+        return value
+
     def not_callable(self, expr: ast.Call, callee: object) -> BuxError:
-        what = "an activation" if isinstance(callee, _Builtin) else _describe(callee)
+        builtin = isinstance(_unwrap(callee), _Builtin)
+        what = "an activation" if builtin else _describe(callee)
         if expr.amend:
             return BuxError(
                 f"'{expr.name}' is {what}, which has no settings to amend",
