@@ -28,9 +28,8 @@ from bux.train.registry import Registry
 
 
 class Batch(NamedTuple):
-    """Rows of tokens: numpy arrays on the host, jax ones on a device. The targets are
-    the inputs shifted: position t predicts input_ids[t + 1], a target if
-    loss_mask[t + 1] is (``objective.target_mask``)."""
+    """Rows of tokens, numpy on the host and jax on a device. Position t predicts
+    input_ids[t + 1], a target where loss_mask[t + 1] is (``objective.target_mask``)."""
 
     input_ids: Int32[np.ndarray | Array, "b t"]
     position_ids: Int32[np.ndarray | Array, "b t"]

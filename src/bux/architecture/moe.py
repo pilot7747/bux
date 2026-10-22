@@ -199,7 +199,7 @@ class MoE(nnx.Module):
         free = c.load_balancing == "aux_free"
         self.router_bias = nnx.Variable(jnp.zeros(e)) if free else None
         # The picks of each expert since the bias last moved; with `update_at_step_end`
-        # set (by the trainer), the bias moves in `step_end_update`, once a step.
+        # set (by the trainer), the bias moves in `step_end_update`, once per step.
         self.router_load = nnx.Variable(jnp.zeros(e)) if free else None
         self.update_at_step_end = False
         self.bias_update_rate = c.bias_update_rate

@@ -61,8 +61,8 @@ class Hook:
 
 class Log(Hook):
     """The step's metrics, with its learning rate, the tokens seen and the tokens per
-    second since the last log. Schedules count steps from 0, as optax does, so the
-    step just taken is `trainer.step - 1` to them."""
+    second since the last log. Optax counts from 0: the step just taken is
+    `trainer.step - 1`."""
 
     def __init__(self, *, every: int, lr: Schedule, tokens: int):
         self.every, self.lr, self.tokens = every, lr, tokens  # tokens per step

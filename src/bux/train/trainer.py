@@ -11,10 +11,9 @@ A run's directory, ``<out>/<name>-<id>``, holds:
 Its name says which alternatives it took, and its id hashes what it computes, so a
 changed setting gets a fresh directory and an unchanged one finds its checkpoints.
 
-``train`` builds a run out of blocks, each of which works without the others: a
-``Trainer`` (a model, its optimizer and its objective), the run's batches, hooks for
-its log, eval and checkpoint settings, and sinks for what they report. So a script
-of your own trains with its own blocks, or with the run's and one more:
+``train`` puts a run together from blocks that each work alone: a ``Trainer`` (a
+model, its optimizer and its objective), the run's batches, hooks for its log, eval
+and checkpoints, and sinks for what the hooks return. A script can swap any of them:
 
     trainer = Trainer(model, optax.adamw(1e-3), objective(run.train.loss, run.arch))
     trainer.fit(batches(...), steps=1000, hooks=[...], sinks=[Console("mine", 1000)])
@@ -75,9 +74,9 @@ def cast[M: nnx.Module](model: M, dtype: DTypeLike) -> M:
 @runtime_checkable
 class StepEndUpdate(Protocol):
     """A module that learns from the batch other than by gradients, as an MoE moves
-    its router bias. A training step sets `update_at_step_end`, so that the forwards
-    of all its microbatches only count what they see, and calls `step_end_update`
-    once after them. Outside a step, a training forward updates at once."""
+    its router bias. A training step sets `update_at_step_end`: its microbatches'
+    forwards only count what they see, and `step_end_update` applies it once after
+    them. Outside a step, a training forward applies it at once."""
 
     update_at_step_end: bool
 
@@ -85,7 +84,7 @@ class StepEndUpdate(Protocol):
 
 
 def apply_step_end_updates(model: nnx.Module) -> None:
-    """Call every module's `step_end_update`, once a step, after all its forwards."""
+    """Call every module's `step_end_update`, once per step, after all its forwards."""
     for _, module in nnx.iter_modules(model):
         if isinstance(module, StepEndUpdate):
             module.step_end_update()
@@ -121,8 +120,7 @@ class Trainer:
 
     Both compute in `compute`, the model's parameters cast to it inside the loss, so
     that the parameters, their gradients and the optimizer's state stay as they are
-    (float32). A step takes its batch in `microbatches` (gradient accumulation): a
-    scan over them, one gradient, one update.
+    (float32).
 
     Made inside ``parallel.use``, it puts its state on the shardings the layout gives
     it, and every step keeps it there.
@@ -184,10 +182,10 @@ class Trainer:
         buffers: nnx.State,
         batch: Batch,
     ) -> tuple[nnx.State, Metrics, nnx.State]:
-        """Sum `_grads` over the microbatches of `batch`, in a scan. Each one's
-        per-token part counts by its share of the batch's targets, and its per-row
-        part by 1 / n, so that the sums are the whole batch's means also when a loss
-        mask leaves the microbatches unequal numbers of targets."""
+        """Sum `_grads` over the microbatches of `batch` in a scan, each one's
+        per-token part scaled by its share of the batch's targets and its per-row part
+        by 1 / n: so the sums are the batch's, even when microbatches have unequal
+        numbers of targets."""
         n = self.microbatches
 
         def add_microbatch(
@@ -216,8 +214,8 @@ class Trainer:
         row_share: float,
     ) -> tuple[nnx.State, Metrics, nnx.State]:
         """Return the loss's gradient on `batch`, computed in `compute`, its metrics,
-        and the buffers after the forward. The objective's per-token part counts by
-        `token_share` and its per-row part by `row_share`."""
+        and the buffers after the forward, each part of the objective scaled by its
+        share."""
 
         def loss_fn(params: nnx.State) -> tuple[Float[Array, ""], tuple[Metrics, Any]]:
             model = cast(nnx.merge(graphdef, params, buffers, copy=True), self.compute)

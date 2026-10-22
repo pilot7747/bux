@@ -7,9 +7,7 @@ its name, so another term is a name, a weight and a function:
     obj.terms["logit_l2"] = Term(1e-4, lambda logits, batch: jnp.mean(logits[0] ** 2))
 
 The losses that layers report from a training forward (``report`` in
-``bux.architecture.registry``) are added too, weighted by each layer. They are means
-over rows, where the terms are means over target tokens, so the objective returns the
-two apart: gradient accumulation scales each by its own share of the batch.
+``bux.architecture.registry``) are terms too, weighted by each layer.
 """
 
 from collections.abc import Callable, Sequence
@@ -101,9 +99,8 @@ def prediction_offsets(arch: ir.Architecture) -> list[int]:
 
 
 def target_mask(batch: Batch, offset: int = 1) -> Bool[Array, "b _"]:
-    """Return whether each position t predicts a target, token t + offset: one in the
-    loss mask and in t's document. The rows' last `offset` positions have no such
-    token, so the mask is that much shorter than the rows."""
+    """Return whether each position t predicts a target: token t + offset is in the
+    loss mask and in t's document. The mask leaves out each row's last `offset`."""
     within = Segments.of(jnp.asarray(batch.position_ids)).within
     return jnp.asarray(batch.loss_mask[:, offset:]) & (within[:, offset:] >= offset)
 

@@ -366,8 +366,8 @@ class TrainConfig(Config):
     packing: PackingConfig = BestFitPacking()
     optimizer: OptimizerConfig
     schedule: ScheduleConfig = ConstantSchedule()
-    seq_len: Annotated[int, Field(ge=2)]  # tokens a row
-    batch: Positive  # rows a step
+    seq_len: Annotated[int, Field(ge=2)]  # tokens per row
+    batch: Positive  # rows per step
     steps: Positive
     seed: int = 0
     clip: float | None = 1.0  # clip gradients to this global norm; none disables it

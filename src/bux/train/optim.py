@@ -5,10 +5,8 @@ Each is found by its config's type: a schedule in ``schedules``, an optimizer in
 its curve after the warmup; an optimizer's gets the config, the schedule's multiplier
 and the model, and returns an optax transformation.
 
-A module class says how the optimizers treat its parameters: `no_weight_decay` names
-those that weight decay leaves alone, `no_muon` leaves the whole module to AdamW
-under Muon, and `muon_axes` maps a stacked parameter to the (reduction, output) axes
-of each of its matrices.
+Modules say how the optimizers treat their parameters with class attributes:
+`no_weight_decay`, `no_muon` and `muon_axes`.
 
 Muon orthogonalizes its updates by the run's ``orthogonalize`` method
 (``bux.parallel.methods``): ``gspmd`` on whatever shards the compiler gives them, or
@@ -133,9 +131,8 @@ def stacked_dims(model: nnx.Module) -> Callable[[tuple], int]:
 
 
 def no_decay_paths(model: nnx.Module) -> list[tuple]:
-    """Return the paths of the parameters that modules name in `no_weight_decay`, such
-    as norms' gains and Engram's n-gram tables, which weight decay leaves alone
-    whatever their shape."""
+    """Return the paths of the parameters that modules name in `no_weight_decay`
+    (norms' gains, Engram's tables), which weight decay skips whatever their shape."""
     found: list[tuple] = []
     for path, node in nnx.iter_graph(model):
         found += [(*path, name) for name in getattr(type(node), "no_weight_decay", ())]
@@ -171,9 +168,8 @@ def adamw(
 
 def muon_matrices(model: nnx.Module) -> dict[tuple, MuonDimensionNumbers]:
     """Return the parameters Muon trains, by path, with their matrices' axes: linear
-    layers' kernels, and what modules name in `muon_axes` (an MoE's stacked experts).
-    Modules marked `no_muon` (the embedding, the LM head) are left out. A scanned
-    repeat's stacked dimension leads, a batch dimension."""
+    layers' kernels and what modules name in `muon_axes`, outside `no_muon` modules
+    (the embedding, the LM head). A scanned repeat's stacked dimension leads."""
     outside = [
         path
         for path, node in nnx.iter_graph(model)
@@ -284,7 +280,7 @@ def orthogonalized(
 
 
 def newton_schulz(steps: int) -> NewtonSchulz:
-    """Return optax's Newton-Schulz orthogonalization, with `steps` iterations."""
+    """Return optax's Newton-Schulz, with `steps` iterations."""
 
     def orthogonal(
         x: Float[Array, "*m"], dims: MuonDimensionNumbers

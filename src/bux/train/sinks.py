@@ -31,8 +31,8 @@ Scalars = Mapping[str, float]
 
 
 def is_main_process() -> bool:
-    """Return whether this is process 0 of a job, or the only process. It asks without
-    touching a device."""
+    """Return whether this is process 0 of a job, or the only one, without touching a
+    device."""
     return not jax.distributed.is_initialized() or jax.process_index() == 0
 
 

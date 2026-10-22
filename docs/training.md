@@ -82,14 +82,12 @@ The settings of each config are pydantic fields in `bux/train/config.py`, and th
 editor shows them on hover and completes them, as it does for layers. In short:
 
 - `adamw(lr, b1=0.9, b2=0.95, eps, weight_decay=0.1)` decays matrices only, not norm
-  scales, biases or Engram's tables: a layer's class names what weight decay leaves
-  alone in `no_weight_decay`.
+  scales, biases or Engram's tables.
 - `muon(lr, momentum=0.95, nesterov, ns_steps=5, weight_decay=0.1, consistent_rms=0.2,
   adam=none)` trains the matrices inside the blocks with Muon, stacked expert weights
-  one expert at a time (a class's `muon_axes`), and everything else (the embedding
-  and the head, marked `no_muon`, and vectors) with `adam`, which defaults to
-  `adamw(lr=lr)`. With `consistent_rms=0.2` (Moonlight) one learning rate suits
-  both; `none` scales updates as Keller Jordan's Muon does.
+  one expert at a time, and everything else (the embedding, the head, vectors) with
+  `adam`, which defaults to `adamw(lr=lr)`. With `consistent_rms=0.2` (Moonlight) one
+  learning rate suits both; `none` scales updates as Keller Jordan's Muon does.
 - A schedule multiplies `lr`. `warmup` rises linearly over its steps. `cosine` decays to
   `final` (0.1) at the last step. `wsd` holds the peak, then cools down to `final` (0)
   over the last `decay` (0.2) of the steps, `linear`, `sqrt` (1 - sqrt(t)) or `cosine`.
@@ -403,8 +401,8 @@ def _(c, multiplier, model):  # a config, the schedule's multiplier, the model
     )
 ```
 
-A hook runs after every `every` steps and after the last, and what it returns,
-scalars (metrics by name, as numbers), goes to every sink. When training stops early, because
+A hook runs after every `every` steps and after the last, and the scalars it
+returns, metrics by name, go to every sink. When training stops early, because
 something set `trainer.stopping` as the launcher does at SIGTERM, every hook's `stop`
 runs, and the checkpoint hook saves the step. A tracker is a sink:
 
