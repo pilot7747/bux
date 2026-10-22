@@ -13,9 +13,10 @@ subclass:
 
     train(run, hooks=[WeightNorm()])
 
-Hooks run in order, so the run's own (log, eval, checkpoint) see a step first. When
-training stops early (``Trainer.stopping``, which the launcher sets at SIGTERM), every
-hook's `stop` runs at the step it stopped at, and the checkpoint hook saves it.
+Hooks run in order, so the run's own (log, eval, checkpoint, profile) see a step
+first. When training stops early (``Trainer.stopping``, which the launcher sets at
+SIGTERM), every hook's `stop` runs at the step it stopped at, and the checkpoint hook
+saves it.
 """
 
 import itertools
@@ -123,12 +124,16 @@ class Checkpoint(Hook):
         )
 
     def restore(self, trainer: "Trainer") -> bool:
-        """Load the latest checkpoint into `trainer`, if there is one."""
+        """Load the latest checkpoint into `trainer`, if there is one, in the memory of
+        the state it replaces: the steps, which donate it, then find the rest of the
+        memory in one piece, not on either side of it."""
         if (latest := self.manager.latest_step()) is None:
             return False
         state = trainer.state()
         _fits(self.manager.item_metadata(latest), state, latest)
-        args = ocp.args.StandardRestore(state)
+        shapes = jax.tree.map(_shape, state)
+        jax.tree.map(lambda x: x.delete(), state)
+        args = ocp.args.StandardRestore(shapes)
         trainer.load(self.manager.restore(latest, args=args), step=latest)
         return True
 
@@ -172,6 +177,11 @@ class Profile(Hook):
         if self.tracing:
             jax.profiler.stop_trace()
             self.tracing = False
+
+
+def _shape(x: jax.Array) -> jax.ShapeDtypeStruct:
+    """`x`'s shape, dtype and sharding: a typed key's too, which orbax's own drops."""
+    return jax.ShapeDtypeStruct(x.shape, x.dtype, sharding=x.sharding)
 
 
 def _fits(saved: object, state: object, step: int) -> None:

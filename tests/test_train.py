@@ -375,6 +375,7 @@ def test_a_run_writes_its_directory_and_resumes_where_it_stopped(tmp_path):
         "log = log(every=1)",
         "checkpoint = checkpoint(every=3)",
         "eval = eval(data=synthetic, every=3, batches=2)",
+        "ffn.dropout = 0.1",  # whose random keys the checkpoint keeps
     )
     whole = train(run, tmp_path, echo=lambda _: None)
     folder = directory(run, tmp_path)

@@ -287,8 +287,8 @@ class Trainer:
                 stack.callback(block.close)
             for hook in hooks:
                 hook.start(self)
-            put = prefetch(data, parallel.shard_batch)
-            on_devices = stack.enter_context(contextlib.closing(put))
+            loading = prefetch(data, parallel.shard_batch)
+            on_devices = stack.enter_context(contextlib.closing(loading))
             while self.step < steps and not self.stopping:
                 metrics = self.train_on_batch(next(on_devices))
                 for hook in hooks:
