@@ -445,6 +445,20 @@ def test_a_trainer_takes_terms_hooks_and_sinks_of_ones_own():
     assert {"loss", "logit_l2", "grad_norm", "lr", "weight_norm"} <= set(latest.metrics)
 
 
+def test_a_step_takes_the_memory_of_the_state_it_replaces():
+    arch = compile(ARCH + "model = embed block norm head\n")
+    trainer = Trainer(
+        Model(arch, rngs=nnx.Rngs(0)),
+        optax.adamw(1e-3),
+        objective(tcfg.LossConfig(), arch),
+    )
+    data = batches(tcfg.SyntheticConfig(), rows(tcfg.SyntheticConfig(), 2, 8), 32)
+    batch = jax.device_put(next(data))
+    step = trainer._train.lower(trainer.model, trainer.optimizer, batch).compile()
+    state = sum(x.nbytes for x in jax.tree.leaves(trainer.state()))
+    assert step.memory_analysis().alias_size_in_bytes == state
+
+
 def test_a_run_reports_what_hooks_of_ones_own_return(tmp_path):
     steps = Steps()
     run = smoke("steps = 4")

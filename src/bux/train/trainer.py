@@ -124,6 +124,10 @@ class Trainer:
 
     Made inside ``parallel.use``, it puts its state on the shardings the layout gives
     it, and every step keeps it there.
+
+    A training step donates the model's and the optimizer's arrays, so that their new
+    state takes the old one's memory: an array read from them before a step is gone
+    after it, and one to keep is a copy (``np.asarray``).
     """
 
     def __init__(
@@ -141,7 +145,8 @@ class Trainer:
         parallel.shard_state(self.model, self.optimizer)
         self.step = 0
         self.stopping = False  # set, by a signal handler say, to stop after this step
-        self._train = nnx.jit(self._train_step_on_shards)
+        donated = ("model", "optimizer")
+        self._train = nnx.jit(self._train_step_on_shards, donate_argnames=donated)
         self._eval = nnx.jit(self.eval_step)
 
     def _train_step_on_shards(
