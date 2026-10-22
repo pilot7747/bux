@@ -32,7 +32,7 @@ methods.remat.register("dots_no_batch")(
     jax.checkpoint_policies.dots_with_no_batch_dims_saveable
 )
 
-MIXERS = ("attention", "recurrence")
+MIXERS = ("attention", "recurrence")  # what the *_attention methods keep
 _names = jax.checkpoint_policies.save_only_these_names
 methods.remat.register("save_attention")(_names(*MIXERS))
 methods.remat.register("save_qkv_attention")(_names(*MIXERS, "qkv"))

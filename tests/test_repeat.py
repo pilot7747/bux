@@ -291,7 +291,13 @@ VALUES = (
     + "first = [norm attn(v=@v1)] [norm ffn]\nlater = [norm attn(v=$v1)] [norm ffn]\n"
     + "model = embed first later^2 norm head"
 )
-TAPS = {"moe": MOE, "values": VALUES, "single_pass": SINGLE_PASS}
+# Each pass of the repeat runs a nextn and a head, rematerialized as a whole by scan.
+NEXTN = (
+    PRELUDE
+    + "mtp = $h! nextn [norm ffn] norm @h head\n"
+    + "model = embed block norm @h head mtp^2"
+)
+TAPS = {"moe": MOE, "values": VALUES, "single_pass": SINGLE_PASS, "nextn": NEXTN}
 
 
 @pytest.mark.parametrize("arch", TAPS)

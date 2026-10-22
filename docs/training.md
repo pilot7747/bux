@@ -454,6 +454,16 @@ float32. A term of one's own gets the same `logits`, a sequence that makes a hea
 logits once a term reads them, once for every term that does: `logits[0] ** 2` above
 makes the first head's whole. `Model.outputs` returns every head's logits at once.
 
+Against the whole logits, on a B300, for the dense 1.3B of 16 Llama blocks of width
+2048 (vocabulary 128256, `bfloat16`, the default `methods`): the largest batch of
+4096-token rows is 56 rather than 28; at 8 rows, peak memory is 62 GiB rather than 81,
+and throughput 133k tokens a second rather than 145k, for the matmul the backward
+makes again. With a tied head, 58 GiB rather than 84, and 134k rather than 129k: the
+whole logits of a tied head come from a float32 matmul. On 8 of them under `fsdp=8`,
+8 rows each, the ratios hold (41 GiB rather than 60, 1.04M tokens a second rather
+than 1.12M): each device adds its share of the head's gradient up alone, and the mesh
+reduces it once.
+
 A layer adds a term of its own from its forward, in one line:
 `report(taps, "my_loss", weight, value)` (`bux/architecture/registry.py`). The
 objective adds weight × value to the training loss and logs the values, summed over

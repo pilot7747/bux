@@ -685,23 +685,47 @@ says so.
 `remat` rematerializes in the backward pass what the forward does not keep, by a
 `jax.checkpoint` policy:
 
-| method          | what the forward keeps                                     |
-|-----------------|------------------------------------------------------------|
-| `none`          | everything: nothing is computed twice; the default         |
-| `full`          | nothing but the input of each branch or pass               |
-| `dots`          | the products of matrices                                   |
-| `dots_no_batch` | the products of matrices without batch dimensions          |
+| method               | what the forward keeps                                     |
+|----------------------|------------------------------------------------------------|
+| `none`               | everything: nothing is computed twice; the default         |
+| `full`               | nothing but the input of each branch or pass               |
+| `dots`               | the products of matrices                                   |
+| `dots_no_batch`      | the products of matrices without batch dimensions          |
+| `save_attention`     | the mixers' outputs, `attention` and `recurrence`          |
+| `save_qkv_attention` | those, and attention's projections, `qkv`                  |
+| `dots_attention`     | `dots_no_batch`'s, the mixers' outputs and `experts`       |
+| `offload_attention`  | the mixers' outputs, in the host's memory                  |
 
 Each residual branch outside any other is rematerialized as a whole, with the read
 and write of the residual algebra; a scanned pass is, as one; and nothing inside
 either is again. In a `.bux` file `none` is the null value, so a sweep writes the
-method as a string: `methods.remat = "none" | full`. Another policy is a function:
+method as a string: `methods.remat = "none" | full`.
+
+The last four keep what layers name (`jax.ad_checkpoint.checkpoint_name`), as
+MaxText's policies do:
+
+| name         | what it is                                                           |
+|--------------|----------------------------------------------------------------------|
+| `attention`  | softmax attention's output, and what its backward takes              |
+| `recurrence` | the same of a recurrent mixer: linear attention, the SSMs, RWKV-7    |
+| `qkv`        | attention's q, k and v projections, MLA's q and kv                   |
+| `mlp`        | an MLP's up and gate projections                                     |
+| `experts`    | the MoE's grouped products                                           |
+
+What a kernel's backward takes is no product of matrices: flash attention's takes its
+output and log-sum-exp, so under `dots` the backward runs the kernel's forward again.
+`remat.named(name, f, *args)` names f's output and everything its backward takes, so
+that a policy that keeps the name runs none of f twice; attention's method and the
+recurrent mixers' run through it. Another policy is a function:
 
 ```python
 import jax
 
 from bux.parallel import methods
 
+methods.remat.register("save_mlp")(
+    jax.checkpoint_policies.save_only_these_names("attention", "mlp")
+)
 methods.remat.register("offload")(
     jax.checkpoint_policies.offload_dot_with_no_batch_dims("device", "pinned_host")
 )
@@ -715,12 +739,36 @@ On one CPU, for the gradient of a 24-layer Llama's forward (`d_model=64`, 8 rows
 | `unroll` | 1.2 s           | 2.9 s             | 6.9 s            |
 | `scan`   | 0.3 s           | 0.8 s             | 0.9 s            |
 
-| remat           | temp memory, unrolled | scanned |
-|-----------------|-----------------------|---------|
-| `none`          | 328 MiB               | 326 MiB |
-| `full`          | 22 MiB                | 23 MiB  |
-| `dots`          | 133 MiB               | 138 MiB |
-| `dots_no_batch` | 79 MiB                | 82 MiB  |
+| remat                | temp memory, unrolled | scanned |
+|----------------------|-----------------------|---------|
+| `none`               | 327 MiB               | 326 MiB |
+| `full`               | 22 MiB                | 23 MiB  |
+| `dots`               | 132 MiB               | 138 MiB |
+| `dots_no_batch`      | 79 MiB                | 82 MiB  |
+| `save_attention`     | 142 MiB               | 142 MiB |
+| `save_qkv_attention` | 142 MiB               | 142 MiB |
+| `dots_attention`     | 187 MiB               | 193 MiB |
+| `offload_attention`  | 142 MiB               | 142 MiB |
+
+On a CPU, attention is `xla`'s, whose backward takes the t by t probabilities: what
+`save_attention` keeps of it is more than `dots` keeps of the whole layer, and a CPU's
+host memory is its device's. On a GPU, flash attention's backward takes q, k, v, the
+output and the log-sum-exp. On a B300, for the dense 1.3B of 16 Llama blocks of width
+2048 (vocabulary 128256, 8 rows of 4096 tokens, `bfloat16`):
+
+| remat               | tok/s   | peak memory |
+|---------------------|---------|-------------|
+| `none`              | 132,000 | 62.4 GiB    |
+| `dots`              | 124,000 | 50.9 GiB    |
+| `save_attention`    | 122,000 | 42.6 GiB    |
+| `dots_attention`    | 132,000 | 52.9 GiB    |
+| `offload_attention` | 86,000  | 50.6 GiB    |
+
+`dots` runs flash attention's forward twice, and `save_attention` the matmuls of every
+layer; `dots_attention` runs neither, as fast as `none` in a sixth less memory.
+`save_qkv_attention` keeps what `save_attention` does here: attention's backward
+takes q, k and v after RoPE, so that only a QK-norm would read the projections.
+Offloading moves more than it saves, at this size.
 
 `Scanned.layers` holds the stacked passes, and `stacked.run(graphdef, state, times, x,
 taps)` runs any stack of them, such as a pipeline stage's share.
