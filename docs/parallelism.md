@@ -469,6 +469,9 @@ reference; Mamba's, a decay per channel and state dim, runs by that scan over
 positions. Under `scan`, the delta rule of a gate bounded at
 -5 or above (KDA's `gate_lower_bound`, DeltaNet's none) runs by cuDNN's fused KDA
 kernel on a B200 or B300 instead (`fused_delta`); it overflows below -5.
+`scripts/gpu_smoke/recurrence.py` checks the forms against their scans on a GPU,
+whose fusions the CPU tests do not see: on a B300 one took Mamba-2's gradients for B
+and C wrong, which a plain matmul in its place does not.
 
 Not yet: a `ppermute` chain instead of the all-gather, which holds every device's
 transitions (`c` matrices `k × k` per head) on each.

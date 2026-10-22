@@ -295,6 +295,7 @@ by itself where it cannot run:
 |------|----|------------------------|
 | softmax attention | `methods.attention = auto`, the default: tokamax's flash attention | 7x, and no t × t logits |
 | linear attention, RWKV-7 | `chunkwise`: chunks of 64 positions, the state across them by a Pallas kernel (`affine_scan`) | 14-17x a scan over positions |
+| Mamba-2 | `chunkwise`, B and C a group's, the state across chunks by a matmul | 25x a scan over positions (2 × 4096 tokens, rematerialized: at 8 × 4096 the scan needs 199 GiB) |
 | KDA with `gate_lower_bound`, DeltaNet | cuDNN's fused KDA kernel (`fused_delta`) | 13x `chunkwise` |
 | MoE experts | `grouped.ragged_dot`: tokamax's Mosaic and Triton kernels | 27x `jax.lax.ragged_dot` |
 | MoE dispatch | `pick_rows`, `permuted`: gathers where XLA would scatter | 4x |
@@ -305,6 +306,7 @@ Tokens a second on B300s, 8 × 4096 tokens a GPU, `precision(compute=bfloat16)`:
 |-----------------------------|-------|-------------------|
 | Llama-style, 1.3B           | 147k (about 40% MFU) | 1.14M |
 | Gated DeltaNet hybrid, `"DDDA"` | 92k | 720k |
+| Mamba-2 hybrid, `"MMMA"`, 1.5B (Nemotron-H's `mamba2`) | 97k | 741k |
 | KDA hybrid, `"KKKA"`        | 58k   |                   |
 | KDA with `gate_lower_bound=-5` | 108k |                |
 | MoE, 64 experts, top 8      | 103k  | 834k              |
