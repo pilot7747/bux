@@ -97,7 +97,7 @@ def _scan(
     as a whole as the run's `remat` says."""
     call = pure.Pure(graphdef, taps)
     layer = remat.checkpoint(
-        call, prevent_cse=False
+        call, prevent_cse=False, scanned=True
     )  # a scan keeps XLA from merging them
 
     def step(

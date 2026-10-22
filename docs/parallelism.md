@@ -683,7 +683,7 @@ says so.
 
 | method          | what the forward keeps                                     |
 |-----------------|------------------------------------------------------------|
-| `none`          | everything: nothing is computed twice; the default         |
+| `none`          | everything, but in a scanned pass (below); the default     |
 | `full`          | nothing but the input of each branch or pass               |
 | `dots`          | the products of matrices                                   |
 | `dots_no_batch` | the products of matrices without batch dimensions          |
@@ -703,6 +703,21 @@ methods.remat.register("offload")(
 )
 ```
 
+A scan keeps every value its backward reads, stacked by pass. Unrolled, XLA fuses the
+elementwise ones into the ops that read them and keeps none: a norm's float32 copy of
+the stream, an MLP's activation, a token's copy for each of its experts. So under
+`none` a scanned pass keeps all but what elementwise ops and those that only move or
+retype data make (`remat.CHEAP`), and its backward computes those again
+(`remat.unfused`). The temp memory of the compiled train step on a B300, for a 1B
+dense model (`A^16`), a Gated DeltaNet hybrid (`"DDDA"^4`) and a 64-expert MoE
+(`E^16`), in bfloat16 on 8 rows of 4096 tokens:
+
+| model | unrolled  | scanned, keeping everything | scanned  |
+|-------|-----------|-----------------------------|----------|
+| dense | 56.2 GiB  | 90.7 GiB                    | 48.7 GiB |
+| GDN   | 124.9 GiB | 213.8 GiB, out of memory    | 88.3 GiB |
+| MoE   | 95.8 GiB  | 131.7 GiB, out of memory    | 88.1 GiB |
+
 On one CPU, for the gradient of a 24-layer Llama's forward (`d_model=64`, 8 rows of
 128 tokens), and for its first training step, which compiles it:
 
@@ -713,9 +728,9 @@ On one CPU, for the gradient of a 24-layer Llama's forward (`d_model=64`, 8 rows
 
 | remat           | temp memory, unrolled | scanned |
 |-----------------|-----------------------|---------|
-| `none`          | 328 MiB               | 326 MiB |
+| `none`          | 327 MiB               | 142 MiB |
 | `full`          | 22 MiB                | 23 MiB  |
-| `dots`          | 133 MiB               | 138 MiB |
+| `dots`          | 132 MiB               | 138 MiB |
 | `dots_no_batch` | 79 MiB                | 82 MiB  |
 
 `Scanned.layers` holds the stacked passes, and `stacked.run(graphdef, state, times, x,

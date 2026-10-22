@@ -288,16 +288,26 @@ def test_a_rematerialized_branch_writes_its_taps_and_losses_as_it_would(losses, 
         assert np.allclose(losses(TAPS[arch], methods=how), plain, atol=1e-5)
 
 
+def _temp(source: str, methods: str) -> int:
+    _, c = _compiled(source, methods)
+    memory = c.memory_analysis()
+    assert memory is not None
+    return memory.temp_size_in_bytes
+
+
 @pytest.mark.parametrize("repeat", ["unroll", "scan"])
 @pytest.mark.parametrize("remat", ["full", "dots", "dots_no_batch"])
 def test_remat_needs_less_temp_memory(remat, repeat):
     def temp(remat: str) -> int:
-        _, c = _compiled(LLAMA, f'methods(repeat={repeat}, remat="{remat}")')
-        memory = c.memory_analysis()
-        assert memory is not None
-        return memory.temp_size_in_bytes
+        return _temp(LLAMA, f'methods(repeat={repeat}, remat="{remat}")')
 
     assert temp(remat) < temp("none")  # quoted: a bare none is no name
+
+
+@pytest.mark.parametrize("arch", [*SCANNED, "moe"])
+def test_a_scanned_repeat_needs_no_more_temp_memory_than_the_unrolled_one(arch):
+    source = (SCANNED | {"moe": MOE})[arch]
+    assert _temp(source, SCAN) <= _temp(source, UNROLL)
 
 
 # --- Checkpoints -----------------------------------------------------------------------
