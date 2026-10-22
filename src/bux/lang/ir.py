@@ -204,6 +204,18 @@ def strip(node: Node, *, labels: bool = True, widths: bool = True) -> Node:
 # Training settings that change how a run is watched or computed, not what it computes.
 _UNCOMPUTED = {"log", "eval", "checkpoint", "mesh", "layout", "methods"}
 _NEWER = {"precision": PrecisionConfig()}
+# Fields of a setting newer than run ids, by their defaults.
+_NEWER_FIELDS = {"optimizer": {"ns_coefficients": "jordan", "ns_dtype": "float32"}}
+
+
+def _without_newer_defaults(train: dict) -> dict:
+    """`train`, dumped, without the `_NEWER_FIELDS` at their defaults."""
+    for setting, fields in _NEWER_FIELDS.items():
+        given = train.get(setting) or {}
+        for field, default in fields.items():
+            if given.get(field) == default:
+                del given[field]
+    return train
 
 
 class Run(BaseModel):
@@ -229,10 +241,11 @@ class Run(BaseModel):
         logging, evaluating or checkpointing at other intervals, or another mesh, layout
         or methods keep it."""
         arch = self.arch.model_copy(update={"graph": strip(self.arch.graph)})
-        # A setting newer than run ids, at its default, is left out, so that ids made
-        # before it keep resuming.
+        # A setting or a field newer than run ids, at its default, is left out, so that
+        # ids made before it keep resuming.
         new = {k for k, v in _NEWER.items() if getattr(self.train, k) == v}
-        train = self.train.model_dump(mode="json", exclude=_UNCOMPUTED | new)
+        dumped = self.train.model_dump(mode="json", exclude=_UNCOMPUTED | new)
+        train = _without_newer_defaults(dumped)
         what = {"arch": arch.model_dump(mode="json"), "train": train}
         blob = json.dumps(what, sort_keys=True, separators=(",", ":"))
         return hashlib.sha256(blob.encode()).hexdigest()[:10]

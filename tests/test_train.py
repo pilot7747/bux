@@ -16,6 +16,7 @@ import pytest
 from conftest import corpus
 from flax import nnx
 from jax.sharding import PartitionSpec as P
+from jaxtyping import Array, Float
 from optax.contrib import MuonDimensionNumbers, scale_by_muon
 
 from bux import parallel
@@ -38,6 +39,7 @@ from bux.train.optim import (
     lr_multiplier,
     momentum,
     muon_matrices,
+    newton_schulz,
     optimizer,
     optimizers,
     orthogonalized,
@@ -192,9 +194,56 @@ def test_muon_on_one_device_is_optax_s_whichever_method_orthogonalizes(nesterov)
             assert jax.tree.all(jax.tree.map(jnp.array_equal, got, expected))
 
 
+def _spread(x: Float[Array, "m n"]) -> float:
+    """How far from 1 the singular values of `x` are."""
+    return float(
+        jnp.abs(jnp.linalg.svd(x.astype(jnp.float32), compute_uv=False) - 1).max()
+    )
+
+
+@pytest.mark.parametrize("coefficients", ["jordan", "polar_express"])
+def test_newton_schulz_in_bfloat16_is_close_to_float32(coefficients):
+    x = jax.random.normal(jax.random.key(0), (64, 256))
+    ns, dims = newton_schulz(5, coefficients), MuonDimensionNumbers(0, 1)
+    f32, bf16 = ns(x, dims), ns(x.astype(jnp.bfloat16), dims)
+    assert bf16.dtype == jnp.bfloat16
+    assert jnp.linalg.norm(bf16 - f32) < 0.1 * jnp.linalg.norm(f32)
+
+
+def test_polar_express_orthogonalizes_closer_than_jordan_s_quintic():
+    x = jax.random.normal(jax.random.key(0), (64, 256)) * jnp.logspace(-2, 0, 256)
+    dims = MuonDimensionNumbers(0, 1)
+    jordan, polar = (newton_schulz(5, c)(x, dims) for c in ("jordan", "polar_express"))
+    assert _spread(polar) < 0.15 and _spread(jordan) > 0.3
+    assert _spread(newton_schulz(8, "polar_express")(x, dims)) < 1e-3
+
+
+def test_muon_runs_newton_schulz_in_its_dtype_and_keeps_the_update_s():
+    stack = Stack()
+    params = nnx.to_pure_dict(nnx.state(stack, nnx.Param))
+    dims = {("w",): MuonDimensionNumbers(0, 1), ("e",): MuonDimensionNumbers(1, 2)}
+    f32, bf16 = (
+        _muon_updates(orthogonalized(5, dims, stack, dtype=dtype), params, steps=1)[0]
+        for dtype in (jnp.float32, jnp.bfloat16)
+    )
+    for a, b in zip(jax.tree.leaves(f32), jax.tree.leaves(bf16), strict=True):
+        assert b.dtype == jnp.float32 and not jnp.array_equal(a, b)
+        assert jnp.linalg.norm(b - a) < 0.1 * jnp.linalg.norm(a)
+
+
+def test_newton_schulz_s_dtype_is_in_the_run_s_id_unless_it_is_the_default():
+    plain = smoke("optimizer = muon(lr=0.02)")
+    f32 = smoke("optimizer = muon(lr=0.02, ns_dtype=float32)")
+    bf16 = smoke("optimizer = muon(lr=0.02, ns_dtype=bfloat16)")
+    assert plain.id == f32.id != bf16.id
+
+
 @functools.cache
 def _muon_step(
-    orthogonalize: str = "gspmd", zero: int = 3, **mesh: int
+    orthogonalize: str = "gspmd",
+    zero: int = 3,
+    ns_dtype: str = "float32",
+    **mesh: int,
 ) -> tuple[list, str]:
     """The MoE's parameters after a Muon step from fixed gradients, split over `mesh`
     (outside parallel.use with none), and the compiled step's HLO."""
@@ -203,7 +252,8 @@ def _muon_step(
     split = parallel.use(tcfg.MeshConfig.model_validate(mesh), layout, methods)
     with split if mesh else contextlib.nullcontext():
         model = parallel.build(lambda: Model(compile(MOE), rngs=nnx.Rngs(0)))
-        c, lr = tcfg.MuonConfig(lr=0.02), lr_multiplier(tcfg.ConstantSchedule(), 1)
+        c = tcfg.MuonConfig.model_validate({"lr": 0.02, "ns_dtype": ns_dtype})
+        lr = lr_multiplier(tcfg.ConstantSchedule(), 1)
         trained = nnx.Optimizer(model, optimizer(c, lr, model), wrt=nnx.Param)
         parallel.shard_state(model, trained)
         grads = jax.tree.map(jnp.sin, nnx.state(model, nnx.Param))
@@ -262,6 +312,25 @@ def test_muon_owners_under_zero_1_gather_less_than_gather_does():
     assert _count("all-gather", owner) + _count("all-to-all", owner) < _count(
         "all-gather", gather
     )
+
+
+def test_muon_owners_get_their_matrices_in_newton_schulz_s_dtype():
+    """In the program jax gives XLA, that is: XLA on CPU moves them in float32."""
+    methods = tcfg.MethodsConfig(orthogonalize="owner")
+    with parallel.use(tcfg.MeshConfig(fsdp=8), methods=methods):
+        stack = parallel.build(Stack)
+        params = nnx.to_pure_dict(nnx.state(stack, nnx.Param))
+        dims = {("w",): MuonDimensionNumbers(0, 1), ("e",): MuonDimensionNumbers(1, 2)}
+        tx = orthogonalized(5, dims, stack, dtype=jnp.bfloat16)
+        text = jax.jit(tx.update).lower(params, tx.init(params), params).as_text()
+    moved = re.findall(r"all_to_all.*?: \(tensor<[\dx]*(\w+)>", text)
+    assert len(moved) == 4 and set(moved) == {"bf16"}  # 2 shapes, there and back
+
+
+def test_muon_updates_in_bfloat16_split_over_devices_as_on_one():
+    one, _ = _muon_step(ns_dtype="bfloat16")
+    split, _ = _muon_step("owner", 3, "bfloat16", fsdp=4, tensor=2)
+    assert all(np.allclose(a, b, atol=1e-4) for a, b in zip(split, one, strict=True))
 
 
 def test_gather_holds_matrices_whole_and_a_stack_split_over_what_that_frees():

@@ -633,9 +633,9 @@ from bux.parallel import methods
 
 @methods.orthogonalize.register("mine")
 def _(updates, dims, shardings, newton_schulz):
-    # updates: an array per Muon parameter; dims: their MuonDimensionNumbers;
-    # shardings: their parameters' NamedShardings, None outside parallel.use;
-    # newton_schulz(x, dims): optax's Newton-Schulz.
+    # updates: an array per Muon parameter, in muon's ns_dtype; dims: their
+    # MuonDimensionNumbers; shardings: their parameters' NamedShardings, None
+    # outside parallel.use; newton_schulz(x, dims): optax's, in x's dtype.
     return [newton_schulz(x, d) for x, d in zip(updates, dims)]
 ```
 

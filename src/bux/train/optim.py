@@ -11,7 +11,8 @@ Modules say how the optimizers treat their parameters with class attributes:
 Muon orthogonalizes its updates by the run's ``orthogonalize`` method
 (``bux.parallel.methods``): ``gspmd`` on whatever shards the compiler gives them,
 ``gather``, each matrix whole on every device that holds it, or ``owner``, each
-matrix whole on one device.
+matrix whole on one device. Its Newton-Schulz's coefficients are found by name in
+``ns_coefficients``, a builder that gets the number of iterations.
 """
 
 import math
@@ -25,6 +26,7 @@ import optax
 from flax import nnx
 from jax.sharding import AbstractMesh, Mesh, NamedSharding
 from jax.sharding import PartitionSpec as P
+from jax.typing import DTypeLike
 from jaxtyping import Array, ArrayLike, Float, PyTree, Real
 from optax.contrib import MuonDimensionNumbers
 from optax.contrib._muon import orthogonalize_via_newton_schulz, scale_by_shape
@@ -43,6 +45,11 @@ NewtonSchulz = Callable[[Float[Array, "*m"], MuonDimensionNumbers], Float[Array,
 schedules = Registry[Schedule]("schedule", "bux.train.optim.schedules")
 optimizers = Registry[optax.GradientTransformation](
     "optimizer", "bux.train.optim.optimizers"
+)
+# Newton-Schulz's quintics a x + b x³ + c x⁵ for a number of iterations, by name: one
+# (a, b, c) for every iteration, or one for each.
+ns_coefficients = Registry[Float[Array, "*steps 3"]](
+    "set of Newton-Schulz coefficients", "bux.train.optim.ns_coefficients"
 )
 
 
@@ -209,7 +216,13 @@ def muon(
 
     rule = optax.chain(
         momentum(config.momentum, config.nesterov),
-        orthogonalized(config.ns_steps, dims, model),
+        orthogonalized(
+            config.ns_steps,
+            dims,
+            model,
+            coefficients=config.ns_coefficients,
+            dtype=config.ns_dtype,
+        ),
         scale_by_shape(
             weight_dimension_numbers=shapes, consistent_rms=config.consistent_rms
         ),
@@ -223,8 +236,6 @@ def muon(
 
 
 # --- Muon's parts: optax's scale_by_muon, with Newton-Schulz by method ----------------
-
-NS_COEFFS = (3.4445, -4.7750, 2.0315)  # Keller Jordan's quintic, optax's default
 
 
 def momentum(beta: float, nesterov: bool) -> optax.GradientTransformation:
@@ -256,12 +267,19 @@ def momentum(beta: float, nesterov: bool) -> optax.GradientTransformation:
 
 
 def orthogonalized(
-    steps: int, dims: dict[tuple, MuonDimensionNumbers], model: nnx.Module
+    steps: int,
+    dims: dict[tuple, MuonDimensionNumbers],
+    model: nnx.Module,
+    coefficients: str = "jordan",
+    dtype: DTypeLike = jnp.float32,
 ) -> optax.GradientTransformation:
     """Orthogonalize each update, a matrix or a stack of them as `dims` says by path,
-    with `steps` Newton-Schulz iterations, by the run's `orthogonalize` method. The
-    method gets all of a step's updates at once, so it can choose where each runs."""
+    with `steps` Newton-Schulz iterations of the quintics `coefficients` names, in
+    `dtype`, by the run's `orthogonalize` method. The method gets all of a step's
+    updates at once, so it can choose where each runs, and gets them in `dtype`, so
+    that what it moves is in it too."""
     model_params = nnx.state(model, nnx.Param)  # whose shardings the updates take
+    run = newton_schulz(steps, coefficients)
 
     def update(
         updates: PyTree[Float[Array, "*_"]],
@@ -271,26 +289,59 @@ def orthogonalized(
         keys = [_keys(path) for path, _ in leaves]
         shardings = shardings_by_path(model_params)
         orthogonal = parallel.method("orthogonalize")(
-            [x for _, x in leaves],
+            [x.astype(dtype) for _, x in leaves],
             [dims[k] for k in keys],
             None if shardings is None else [shardings[k] for k in keys],
-            newton_schulz(steps),
+            run,
         )
-        return jax.tree.unflatten(tree, orthogonal)
+        cast = [y.astype(x.dtype) for y, (_, x) in zip(orthogonal, leaves, strict=True)]
+        return jax.tree.unflatten(tree, cast)
 
     return optax.stateless(update)
 
 
-def newton_schulz(steps: int) -> NewtonSchulz:
-    """Return optax's Newton-Schulz, with `steps` iterations."""
+def newton_schulz(steps: int, coefficients: str = "jordan") -> NewtonSchulz:
+    """Return optax's Newton-Schulz, with `steps` iterations of the quintics
+    `coefficients` names, in the dtype of the matrix it gets."""
+    coeffs = ns_coefficients.find(coefficients)(steps)
 
     def orthogonal(
         x: Float[Array, "*m"], dims: MuonDimensionNumbers
     ) -> Float[Array, "*m"]:
-        coeffs = jnp.asarray(NS_COEFFS)
         return orthogonalize_via_newton_schulz(x, coeffs, steps, dimension_numbers=dims)
 
     return orthogonal
+
+
+@ns_coefficients.register("jordan")
+def _(steps: int) -> Float[Array, "3"]:
+    return jnp.asarray((3.4445, -4.7750, 2.0315))  # Keller Jordan's, optax's default
+
+
+# Amsel et al. (2025), for singular values in [0.001, 1]; the last one repeats.
+POLAR_EXPRESS = (
+    (8.28721201814563, -23.595886519098837, 17.300387312530933),
+    (4.107059111542203, -2.9478499167379106, 0.5448431082926601),
+    (3.9486908534822946, -2.908902115962949, 0.5518191394370137),
+    (3.3184196573706015, -2.488488024314874, 0.51004894012372),
+    (2.300652019954817, -1.6689039845747493, 0.4188073119525673),
+    (1.891301407787398, -1.2679958271945868, 0.37680408948524835),
+    (1.8750014808534479, -1.2500016453999487, 0.3750001645474248),
+    (1.875, -1.25, 0.375),
+)
+
+
+@ns_coefficients.register("polar_express")
+def _(steps: int, safety: float = 1.01) -> Float[Array, "steps 3"]:
+    """As its authors run it: each quintic but the last for singular values up to
+    `safety`, and the first for a matrix divided by `safety` times its norm, where
+    optax's divides by its norm."""
+    found = [POLAR_EXPRESS[min(i, len(POLAR_EXPRESS) - 1)] for i in range(steps)]
+    last = len(POLAR_EXPRESS) - 1
+    scale = [safety ** (i < last) * safety ** (i == 0) for i in range(steps)]
+    return jnp.asarray(
+        [(a / s, b / s**3, c / s**5) for (a, b, c), s in zip(found, scale)]
+    )
 
 
 def shardings_by_path(params: nnx.State) -> dict[tuple, NamedSharding] | None:

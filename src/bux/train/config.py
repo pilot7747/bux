@@ -199,6 +199,10 @@ class MuonConfig(Config):
     momentum: float = 0.95
     nesterov: bool = True
     ns_steps: int = 5  # Newton-Schulz iterations
+    # Their quintics, by name in bux.train.optim.ns_coefficients: Keller Jordan's, the
+    # same at every iteration, or polar_express's (Amsel et al., 2025), one for each.
+    ns_coefficients: str = "jordan"
+    ns_dtype: Literal["float32", "bfloat16"] = "float32"  # what Newton-Schulz runs in
     weight_decay: float = 0.1
     # Updates scaled to this RMS, as AdamW's roughly are, so that one lr suits both
     # (Moonlight: 0.2); none -> by sqrt(max(1, fan_out / fan_in)) (Keller Jordan).
