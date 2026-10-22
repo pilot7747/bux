@@ -8,8 +8,8 @@
     for job in jobs(run.train):
         spark.prepare(job, session, "s3://bucket/packed")
 
-A chunk's rows are the ones this machine's engine makes; which file holds them is up
-to Spark. Needs pyspark 4, which is not a dependency of bux.
+A chunk's rows are the same as the local engine makes; which file holds them is up
+to Spark. Needs pyspark 4, which bux does not depend on.
 """
 
 import json
@@ -35,8 +35,8 @@ def _ddl(schema: pa.Schema) -> str:
 
 
 def rows(job: Job, records: DataFrame) -> tuple[DataFrame, dict]:
-    """The rows of `records` (a DataFrame with the source's column), and the documents
-    and tokens in them."""
+    """Return the rows of `records` (a DataFrame with the source's column), and how
+    many documents and tokens they hold."""
     docs = records.select(job.source.column).mapInArrow(job.map, _ddl(documents.SCHEMA))
     docs = docs.persist()
     counted = docs.agg(F.count("*"), F.sum(F.size("input_ids"))).first()
@@ -54,7 +54,7 @@ def rows(job: Job, records: DataFrame) -> tuple[DataFrame, dict]:
 
 def prepare(job: Job, session: SparkSession, cache: str) -> str:
     """Write `job`'s dataset to a folder under `cache` (any URI Spark and Arrow can
-    write to), as the local engine would lay it out."""
+    write to), laid out as the local engine would."""
     folder = f"{cache.rstrip('/')}/{job.name}"
     out, stats = rows(job, session.read.parquet(job.source.path))
     out.write.parquet(folder)

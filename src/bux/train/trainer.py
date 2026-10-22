@@ -151,7 +151,7 @@ class Trainer:
         self.model, self.objective = model, objective
         self.compute, self.microbatches = jnp.dtype(compute), microbatches
         self.optimizer = nnx.Optimizer(model, tx, wrt=nnx.Param)
-        parallel.place(self.model, self.optimizer)
+        parallel.shard_state(self.model, self.optimizer)
         self.step = 0
         self.stopping = False  # set, by a signal handler say, to stop after this step
         self._train = nnx.jit(self._placed_step)
@@ -161,7 +161,7 @@ class Trainer:
         self, model: Model, optimizer: nnx.Optimizer, batch: Batch
     ) -> Metrics:
         metrics = self.train_step(model, optimizer, batch)
-        parallel.place(model, optimizer)
+        parallel.shard_state(model, optimizer)
         return metrics
 
     def train_step(
@@ -238,7 +238,7 @@ class Trainer:
 
     def update(self, batch: Batch) -> Metrics:
         """Take a step on `batch`."""
-        metrics = self._train(self.model, self.optimizer, parallel.rows(batch))
+        metrics = self._train(self.model, self.optimizer, parallel.shard_batch(batch))
         self.step += 1
         return metrics
 
@@ -246,7 +246,9 @@ class Trainer:
         """The mean of `eval_step` over `batches`, in eval mode."""
         self.model.eval()
         try:
-            losses = [float(self._eval(self.model, parallel.rows(b))) for b in batches]
+            losses = [
+                float(self._eval(self.model, parallel.shard_batch(b))) for b in batches
+            ]
         finally:
             self.model.train()
         return sum(losses) / len(losses)

@@ -37,14 +37,14 @@ optimizer.lr      = 1e-3 | 3e-3                 # 3 × 2 = 6 runs
 uv run bux plan examples/experiments/attention_ablation.bux   # the 6 runs, their sizes and budgets
 uv run bux train examples/experiments/smoke.bux               # a few seconds on a laptop
 uv run bux train examples/experiments/smoke.bux 'optimizer = muon(lr=0.02)' steps=100
-uv run bux launch examples/experiments/attention_ablation.bux # the 6 runs, a GPU each
+uv run bux launch examples/experiments/attention_ablation.bux # the 6 runs, one GPU each
 ```
 
 Every setting is checked before anything runs, at the line that wrote it, and every
 run directory keeps the run as one self-contained `run.bux`. `bux launch` is the
-entrypoint for production: it trains a sweep a run per GPU, records how every run went,
-stops at SIGTERM with a checkpoint, and, launched again, trains only what is left. See
-the [training guide](docs/training.md).
+entrypoint for production: it trains each run of a sweep on its own GPUs, records how
+every run went, stops at SIGTERM with a checkpoint, and, launched again, trains only
+what is left. See the [training guide](docs/training.md).
 
 ## Data
 

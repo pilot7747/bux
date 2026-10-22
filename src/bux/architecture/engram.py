@@ -149,7 +149,7 @@ class Engram(nnx.Module):
             conv = self.conv(self.conv_norm(u).reshape(b, t, n * d), taps)
             u = u + jax.nn.silu(conv).reshape(u.shape)
         y = h + u
-        return parallel.stream(y if x.ndim == 4 else y[..., 0, :])
+        return parallel.shard_stream(y if x.ndim == 4 else y[..., 0, :])
 
 
 @register("engram")

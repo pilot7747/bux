@@ -211,8 +211,8 @@ def test_microbatches_give_the_whole_batch_s_gradient_and_router_bias(arch, mesh
     with parallel.use(tcfg.MeshConfig.model_validate(_sizes(mesh))):
         whole = _trainer(ARCHITECTURES[arch])
         parts = _trainer(ARCHITECTURES[arch], microbatches=n)
-        g1, m1 = nnx.jit(whole.gradients)(whole.model, parallel.rows(batch))
-        gn, mn = nnx.jit(parts.gradients)(parts.model, parallel.rows(batch))
+        g1, m1 = nnx.jit(whole.gradients)(whole.model, parallel.shard_batch(batch))
+        gn, mn = nnx.jit(parts.gradients)(parts.model, parallel.shard_batch(batch))
     assert jax.tree.all(
         jax.tree.map(lambda a, b: jnp.allclose(a, b, atol=2e-6), g1, gn)
     )
@@ -264,7 +264,7 @@ def test_a_batch_that_does_not_split_into_microbatches_is_an_error(tmp_path):
 def test_microbatches_and_bfloat16_take_less_memory():
     def temp(**settings) -> int:
         trainer = _trainer(ARCHITECTURES["llama"], **settings)
-        batch = parallel.rows(_batch())
+        batch = parallel.shard_batch(_batch())
         step = trainer._train.lower(trainer.model, trainer.optimizer, batch).compile()
         memory = step.memory_analysis()
         assert memory is not None

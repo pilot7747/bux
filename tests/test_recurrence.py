@@ -302,7 +302,7 @@ def collectives(family: str, method: str) -> tuple[int, int]:
     with parallel.use(MESHES[4], methods=tcfg.MethodsConfig(recurrence=method)):
         loss = objective(tcfg.LossConfig(), arch)
         trainer = Trainer(model(family), optax.adamw(1e-3), loss)
-        batch = parallel.rows(packed_rows())
+        batch = parallel.shard_batch(packed_rows())
         step = trainer._train.lower(trainer.model, trainer.optimizer, batch)
         text = step.compile().as_text() or ""
     gathers = re.findall(r"= (\S+) all-gather(?:-start)?\(", text)

@@ -1,10 +1,9 @@
-"""Names: what each dimension of a parameter or an activation means, resolved to the
-mesh axes the run's layout splits it over.
+"""Dimension names, and the mesh axes the run's layout splits each over.
 
-A layer names the dimensions of a parameter where it makes it, as metadata of its
-own (``named``, or ``nnx.Param(value, names=(...))``), which Flax leaves alone; and
-of an activation where it knows what they mean (``shard``). Outside ``use`` names do
-nothing, so one device runs as if there were none.
+A layer names the dimensions of a parameter where it creates it (``named``, or
+``nnx.Param(value, names=(...))``), as bux's own metadata, which Flax ignores, and
+those of an activation with ``shard``. Outside ``use`` names do nothing, so one
+device runs as if there were none.
 """
 
 from collections.abc import Sequence
@@ -19,21 +18,21 @@ from jaxtyping import Array, Shaped
 from bux.parallel.mesh import Active, active
 from bux.train.config import LayoutConfig
 
-NAMES = "names"  # the metadata key a parameter's names are under
+NAMES = "names"  # the metadata key that holds a parameter's dimension names
 LAYERS = "layers"  # the stacked dimension of a scanned repeat
-# The names a dimension can have: every field of the layout that is a dimension.
+# Every field of the layout that names a dimension.
 DIMENSIONS = tuple(n for n in LayoutConfig.model_fields if n not in ("type", "zero"))
 
-Split = tuple[str, ...]  # the mesh axes one dimension splits over, () for whole
-# What a dimension is: a name, None for nothing, or a name and a count for a dimension
-# that flattens `count` of them, ("kv_heads", 2) for 2 kv heads of 64 dims. That one
-# splits only between them.
+Split = tuple[str, ...]  # the mesh axes one dimension splits over; () keeps it whole
+# A dimension's name: a string, None for no name, or (name, count) for a dimension
+# that flattens `count` of them, such as ("kv_heads", 2) for 2 kv heads of 64 dims.
+# Such a dimension splits only at the boundaries between them.
 Name = str | tuple[str, int] | None
 LECUN = nnx.initializers.lecun_normal()  # nnx.Linear's kernel_init
 
 
 def axes(layout: LayoutConfig, name: Name) -> Split:
-    """The axes `layout` gives the dimension `name`."""
+    """Return the mesh axes that `layout` gives the dimension `name`."""
     if isinstance(name, tuple):
         name = name[0]
     if name is None:
@@ -45,21 +44,23 @@ def axes(layout: LayoutConfig, name: Name) -> Split:
 
 
 def resolve(names: Sequence[Name], shape: tuple[int, ...], on: Active) -> list[Split]:
-    """Dimension by dimension, its name's axes, less those of size 1, those an
-    earlier dimension took, and those a shard_map being traced maps by hand (inside
-    it, a device's own): all of them if their sizes divide it (or its count), else
-    none."""
+    """Return the mesh axes that each dimension of an array splits over.
+
+    For each dimension, take the axes of its name, minus axes of size 1, axes an
+    earlier dimension already uses, and axes that a shard_map being traced handles
+    manually. If those axes don't divide the dimension's size (or its count), use none.
+    """
     if len(names) != len(shape):
         raise ValueError(f"{len(names)} names for {len(shape)} dimensions: {names}")
-    taken = set(jax.sharding.get_abstract_mesh().manual_axes)
+    used = set(jax.sharding.get_abstract_mesh().manual_axes)
     splits = []
-    for name, n in zip(names, shape):
+    for name, size in zip(names, shape):
         split = tuple(
-            a for a in axes(on.layout, name) if on.size(a) > 1 and a not in taken
+            a for a in axes(on.layout, name) if on.size(a) > 1 and a not in used
         )
-        if (name[1] if isinstance(name, tuple) else n) % on.size(*split):
+        if (name[1] if isinstance(name, tuple) else size) % on.size(*split):
             split = ()
-        taken.update(split)
+        used.update(split)
         splits.append(split)
     return splits
 
@@ -67,9 +68,9 @@ def resolve(names: Sequence[Name], shape: tuple[int, ...], on: Active) -> list[S
 def fsdp(
     splits: list[Split], shape: tuple[int, ...], on: Active, names: Sequence[Name]
 ) -> list[Split]:
-    """`splits` with the largest whole dimension that `fsdp` divides split over it,
-    unless a dimension already is. A scanned repeat's stacked `layers` never is: a
-    scan takes a layer at a time."""
+    """Split the largest whole dimension that `fsdp` divides over `fsdp`, unless one
+    already is. Never the stacked `layers` of a scanned repeat: a scan reads one layer
+    at a time."""
     n = on.size("fsdp")
     if n == 1 or any("fsdp" in s for s in splits):
         return splits
@@ -89,7 +90,7 @@ def partition(splits: list[Split]) -> P:
 
 
 def spec(names: Sequence[Name], shape: tuple[int, ...]) -> P:
-    """The partition spec of an array of `shape` whose dimensions are `names`."""
+    """Return the partition spec of an array of `shape` whose dimensions are `names`."""
     on = active()
     if on is None:
         return P()
@@ -97,8 +98,10 @@ def spec(names: Sequence[Name], shape: tuple[int, ...]) -> P:
 
 
 def shard(x: Shaped[Array, "*s"], *names: Name) -> Shaped[Array, "*s"]:
-    """`x`, constrained to split as its dimensions' `names` say; as it is outside
-    ``use``. Called eagerly, it moves `x` onto the mesh."""
+    """Constrain `x` to split as the `names` of its dimensions say.
+
+    Outside ``use`` it returns `x` as it is. Called eagerly, it moves `x` to the mesh.
+    """
     if (on := active()) is None:
         return x
     split = partition(resolve(names, x.shape, on))
@@ -108,9 +111,8 @@ def shard(x: Shaped[Array, "*s"], *names: Name) -> Shaped[Array, "*s"]:
     return jax.lax.with_sharding_constraint(x, split)
 
 
-def stream(x: Shaped[Array, "b t *r"]) -> Shaped[Array, "b t *r"]:
-    """The residual stream between branches: rows over `batch`, positions over
-    `stream`, the rest whole."""
+def shard_stream(x: Shaped[Array, "b t *r"]) -> Shaped[Array, "b t *r"]:
+    """Shard the residual stream: rows over `batch`, positions over `stream`."""
     return shard(x, "batch", "stream", *(None,) * (x.ndim - 2))
 
 
@@ -118,7 +120,7 @@ def named(
     *names: Name,
     init: nnx.Initializer = LECUN,
 ) -> nnx.Initializer:
-    """`init`, making parameters whose dimensions are `names`: for `kernel_init=`."""
+    """Wrap `init` to name the dimensions of its parameters, for ``kernel_init=``."""
     for name in names:
         axes(LayoutConfig(), name)  # an unknown name fails here, with or without a mesh
     return nnx.with_metadata(init, names=names)  # under NAMES

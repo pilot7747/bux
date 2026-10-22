@@ -79,7 +79,9 @@ class Embedding(nnx.Module):
             pos = jnp.arange(tokens.shape[-1]) if pos is None else pos
             x = x + lookup(self.positions.embedding[...], pos, None)
         x = self.dropout(x)
-        return parallel.stream(x if self.copies is None else widen(x, self.copies))
+        return parallel.shard_stream(
+            x if self.copies is None else widen(x, self.copies)
+        )
 
 
 @register("embed")
@@ -184,7 +186,9 @@ class NextN(nnx.Module):
         else:
             h = self.hidden_norm(x)
         y = self.proj(jnp.concatenate([e, h], -1))
-        return parallel.stream(y if self.copies is None else widen(y, self.copies))
+        return parallel.shard_stream(
+            y if self.copies is None else widen(y, self.copies)
+        )
 
 
 @register("nextn")

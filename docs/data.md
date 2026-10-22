@@ -46,7 +46,7 @@ same positions of the first head.
 
 ## Documents
 
-`text(...)` is raw text, a document a row of Parquet files:
+`text(...)` is raw text, one document per row of Parquet files:
 
 | setting  | what                                                        | default    |
 |----------|-------------------------------------------------------------|------------|
@@ -57,7 +57,7 @@ same positions of the first head.
 | `split`  | the documents whose hash falls in `[start, end)`            | `[0, 1]`   |
 
 `chat(...)` is conversations in the OpenAI format, a list of `{role, content}`
-messages a row, `content` a string or a list of `{type: text, text}` parts:
+messages per row, `content` a string or a list of `{type: text, text}` parts:
 
 | setting    | what                                                        | default    |
 |------------|-------------------------------------------------------------|------------|
@@ -94,7 +94,7 @@ one text, as GPT-2's did.
 | packing        | rows                                                          | `doc_mask` |
 |----------------|---------------------------------------------------------------|------------|
 | `concat`       | documents end to end, cut every `seq_len - 1` tokens: no padding, and documents are whole only by chance (GPT-2, the speedrun's shards) | `false` |
-| `greedy`       | whole documents in their shuffled order, a row padded and closed when the next does not fit (classic SFT); `max_docs=1` is one a row | `true` |
+| `greedy`       | whole documents in their shuffled order, a row padded and closed when the next does not fit (classic SFT); `max_docs=1` is one per row | `true` |
 | `best_fit`     | best-fit decreasing (Ding et al., 2024): the longest first, each into the open row it leaves least room in; nearly no padding and nearly no cuts | `true` |
 
 `greedy` and `best_fit` keep documents whole. `long` says what happens to one longer
@@ -131,8 +131,8 @@ engine delivered it in, plans its rows, and writes them a row group at a time.
 
 Both are functions over Arrow record batches, with nothing else to share, so any
 engine that speaks Arrow runs them. `bux.data.pipeline.prepare` runs them on this
-machine, in a process a core: the map spills each task's documents, sorted by key,
-as raw arrays, about 5 bytes a token of scratch space next to the cache, and each
+machine, in one process per core: the map spills each task's documents, sorted by key,
+as raw arrays, about 5 bytes per token of scratch space next to the cache, and each
 reduce finds its key range in every spill by bisection and maps in its documents and
 nothing else, so that the shuffle reads every byte once.
 `bux.data.spark.prepare` runs them on Spark, as `mapInArrow` and `applyInArrow`
@@ -186,7 +186,7 @@ its chunk.
 
 **Positions, not segment ids.** Resetting positions per document carries the
 segments and the positions RoPE needs in one array. The model makes the rest from
-them once a forward pass (`bux.architecture.Segments`): a document id a token, the
+them once per forward pass (`bux.architecture.Segments`): a document id per token, the
 segment ids that splash and Pallas flash attention take in place of a t by t mask,
 and how far each token is into its document, where convolutions and the loss stop,
 and where each query's first key is for kernels that take that (tokamax's). The
