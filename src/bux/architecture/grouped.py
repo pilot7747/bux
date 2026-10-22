@@ -33,22 +33,22 @@ TILES = (128, 64, 32, 16)  # the tiles of dw it tries, largest first
 
 
 def ragged_dot(
-    x: Float[Array, "m d"], w: Float[Array, "e d f"], sizes: Int[Array, " e"]
+    x: Float[Array, "m d"], w: Float[Array, "g d f"], sizes: Int[Array, " g"]
 ) -> Float[Array, "m f"]:
-    """The first sizes[0] rows of x by w[0], the next sizes[1] by w[1], and so on;
-    rows past them come out 0."""
+    """Return the first sizes[0] rows of x times w[0], the next sizes[1] times w[1],
+    and so on; rows past them come out 0."""
     if tokamax is None and jax.default_backend() != "gpu":
         return jax.lax.ragged_dot(x, w, sizes)
-    return _kernels(*_alike(x, w), sizes)
+    return _kernels(*_vary_alike(x, w), sizes)
 
 
-def _alike(
-    x: Float[Array, "m d"], w: Float[Array, "e d f"]
-) -> tuple[Float[Array, "m d"], Float[Array, "e d f"]]:
-    """x and w, each made to vary over the mesh axes either does, in a shard_map that
-    types what varies (an MoE's tokens over theirs, its experts over `expert`): so
-    the VJP's gradients vary as its inputs, and autodiff sums them over the axes the
-    inputs did not vary over, outside it."""
+def _vary_alike(
+    x: Float[Array, "m d"], w: Float[Array, "g d f"]
+) -> tuple[Float[Array, "m d"], Float[Array, "g d f"]]:
+    """Return x and w, each cast to vary over every mesh axis either does, in a
+    shard_map that types what varies (an MoE's tokens over theirs, its experts over
+    `expert`): then the VJP's gradients vary as its inputs, and autodiff sums them
+    over the other axes, outside it."""
     either = _varies(x) | _varies(w)
 
     def cast(a: Float[Array, "*a"]) -> Float[Array, "*a"]:
@@ -59,22 +59,22 @@ def _alike(
 
 
 def _varies(a: Float[Array, "*a"]) -> frozenset[str]:
-    """The mesh axes `a` varies over, in a shard_map that types them."""
+    """Return the mesh axes `a` varies over, in a shard_map that types them."""
     return frozenset(jax.typeof(a).manual_axis_type.varying)
 
 
 @jax.custom_vjp
 def _kernels(
-    x: Float[Array, "m d"], w: Float[Array, "e d f"], sizes: Int[Array, " e"]
+    x: Float[Array, "m d"], w: Float[Array, "g d f"], sizes: Int[Array, " g"]
 ) -> Float[Array, "m f"]:
-    return _rows(x, w, sizes)
+    return _grouped_dot(x, w, sizes)
 
 
-def _rows(
-    x: Float[Array, "m d"], w: Float[Array, "e d f"], sizes: Int[Array, " e"]
+def _grouped_dot(
+    x: Float[Array, "m d"], w: Float[Array, "g d f"], sizes: Int[Array, " g"]
 ) -> Float[Array, "m f"]:
-    """`ragged_dot` by tokamax's kernels, which leave the rows past the groups as
-    they find them, or by XLA."""
+    """Run `ragged_dot` by tokamax's kernels, zeroing the rows past the groups, or by
+    XLA."""
     if tokamax is None:
         return jax.lax.ragged_dot(x, w, sizes)
     varies = jax.typeof(x).manual_axis_type  # in a shard_map, what the output does
@@ -83,36 +83,38 @@ def _rows(
 
 
 # What the backward takes of the forward: its inputs.
-Saved = tuple[Float[Array, "m d"], Float[Array, "e d f"], Int[Array, " e"]]
+Saved = tuple[Float[Array, "m d"], Float[Array, "g d f"], Int[Array, " g"]]
 
 
 def _forward(
-    x: Float[Array, "m d"], w: Float[Array, "e d f"], sizes: Int[Array, " e"]
+    x: Float[Array, "m d"], w: Float[Array, "g d f"], sizes: Int[Array, " g"]
 ) -> tuple[Float[Array, "m f"], Saved]:
-    return _rows(x, w, sizes), (x, w, sizes)
+    return _grouped_dot(x, w, sizes), (x, w, sizes)
 
 
 def _backward(
     saved: Saved, dy: Float[Array, "m f"]
-) -> tuple[Float[Array, "m d"], Float[Array, "e d f"], None]:
+) -> tuple[Float[Array, "m d"], Float[Array, "g d f"], None]:
     x, w, sizes = saved
-    dx = _rows(dy, jnp.swapaxes(w, 1, 2), sizes).astype(x.dtype)
-    dw = _matrices(x, dy, sizes).astype(w.dtype)
-    return _typed(dx, x), _typed(dw, w), None
+    dx = _grouped_dot(dy, jnp.swapaxes(w, 1, 2), sizes).astype(x.dtype)
+    dw = _weight_grad(x, dy, sizes).astype(w.dtype)
+    return _vary_like(dx, x), _vary_like(dw, w), None
 
 
-def _typed(g: Float[Array, "*a"], like: Float[Array, "*a"]) -> Float[Array, "*a"]:
-    """The gradient `g`, typed to vary as `like` does: a kernel's outputs need not say
-    what they vary over, which a shard_map that types it asks of a VJP's."""
-    more = tuple(_varies(like) - _varies(g))
-    return jax.lax.pcast(g, more, to="varying") if more else g
+def _vary_like(
+    grad: Float[Array, "*a"], like: Float[Array, "*a"]
+) -> Float[Array, "*a"]:
+    """Return the gradient `grad` cast to vary as `like` does: a kernel's outputs need
+    not say what they vary over, which a shard_map that types it asks of a VJP's."""
+    more = tuple(_varies(like) - _varies(grad))
+    return jax.lax.pcast(grad, more, to="varying") if more else grad
 
 
-def _matrices(
-    x: Float[Array, "m d"], dy: Float[Array, "m f"], sizes: Int[Array, " e"]
-) -> Float[Array, "e d f"]:
-    """The gradient of the matrices: by tokamax's Triton kernel, 1.7 times as fast
-    as `contract` on a B300, where it runs."""
+def _weight_grad(
+    x: Float[Array, "m d"], dy: Float[Array, "m f"], sizes: Int[Array, " g"]
+) -> Float[Array, "g d f"]:
+    """Return dW, x^T dy per group: by tokamax's Triton kernel, 1.7 times as fast as
+    `contract` on a B300, where it runs."""
     if tokamax is not None and jax.default_backend() == "gpu":
         try:
             return tokamax.ragged_dot_general(
@@ -132,10 +134,10 @@ _kernels.defvjp(_forward, _backward)
 
 
 def contract(
-    x: Float[Array, "m d"], y: Float[Array, "m f"], sizes: Int[Array, " e"]
-) -> Float[Array, "e d f"]:
-    """x^T y a group of rows at a time, as `sizes` groups them: the gradient of
-    `ragged_dot`'s matrices. By a Pallas kernel on a GPU, a program a tile of a
+    x: Float[Array, "m d"], y: Float[Array, "m f"], sizes: Int[Array, " g"]
+) -> Float[Array, "g d f"]:
+    """Return x^T y for each group of rows, as `sizes` groups them: the gradient of
+    `ragged_dot`'s matrices. By a Pallas kernel on a GPU, one program per tile of a
     group's matrix; by XLA elsewhere."""
     td, tf = _tile(x.shape[1]), _tile(y.shape[1])
     if jax.default_backend() != "gpu" or td is None or tf is None:
@@ -144,23 +146,23 @@ def contract(
 
 
 def _tile(n: int) -> int | None:
-    """The largest of TILES that divides n, if any."""
+    """Return the largest of TILES that divides n, if any."""
     return next((t for t in TILES if n % t == 0), None)
 
 
 def _contract(
     x: Float[Array, "m d"],
     y: Float[Array, "m f"],
-    sizes: Int[Array, " e"],
+    sizes: Int[Array, " g"],
     td: int,
     tf: int,
     interpret: bool = False,
-) -> Float[Array, "e d f"]:
-    """`contract`'s kernel: a program a (td, tf) tile of a group's matrix, which
-    sums the products of the group's rows, BLOCK_ROWS at a time, in float32."""
+) -> Float[Array, "g d f"]:
+    """Run `contract`'s kernel: one program per (td, tf) tile of a group's matrix,
+    which sums the products of the group's rows, BLOCK_ROWS at a time, in float32."""
     from jax.experimental.pallas import triton as plgpu
 
-    (m, d), f, e = x.shape, y.shape[1], sizes.shape[0]
+    (m, d), f, groups = x.shape, y.shape[1], sizes.shape[0]
     ends = jnp.cumsum(sizes).astype(jnp.int32)
     bounds = jnp.stack([ends - sizes.astype(jnp.int32), ends], -1)
     rows = BLOCK_ROWS
@@ -186,14 +188,14 @@ def _contract(
 
     return pl.pallas_call(
         kernel,
-        grid=(e, d // td, f // tf),
+        grid=(groups, d // td, f // tf),
         in_specs=[
-            pl.BlockSpec((e, 2), lambda g, i, j: (0, 0)),
+            pl.BlockSpec((groups, 2), lambda g, i, j: (0, 0)),
             pl.BlockSpec((m, td), lambda g, i, j: (0, i)),
             pl.BlockSpec((m, tf), lambda g, i, j: (0, j)),
         ],
         out_specs=pl.BlockSpec((None, td, tf), lambda g, i, j: (g, i, j)),
-        out_shape=jax.ShapeDtypeStruct((e, d, f), x.dtype),
+        out_shape=jax.ShapeDtypeStruct((groups, d, f), x.dtype),
         compiler_params=plgpu.CompilerParams(num_warps=4, num_stages=3),
         interpret=interpret,
         name=f"contract_{math.prod((td, tf))}",

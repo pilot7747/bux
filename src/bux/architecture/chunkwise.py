@@ -17,8 +17,8 @@ outputs and the state the chunk ends with are affine in S_0 too:
 Every chunk's R, O, A and B come from matmuls over all chunks at once, and a scan over
 the chunks then carries the state. Nothing before a document's start reaches it.
 
-No exponent here is positive: a decay a key channel factors through the end of a
-block of `SUB` positions between s and t, and within a block it is taken a pair at a
+No exponent here is positive: a decay per key channel factors through the end of a
+block of `SUB` positions between s and t, and within a block it is taken one pair at a
 time.
 """
 
@@ -33,23 +33,22 @@ from bux import parallel
 from bux.architecture import affine_scan
 from bux.parallel.recurrence import Chunk, Positions, Transition
 
-SIZE = 64  # positions a chunk
-SUB = 16  # positions a block of a chunk, for a decay a key channel
+SIZE = 64  # positions per chunk
+SUB = 16  # positions per block of a chunk, for a decay per key channel
 
 Chunks = Float[Array, "b n h c _"]  # (b, n, h, C, ...): n chunks of C positions
 Pairs = Float[Array, "b n h c c"]  # of each position of a chunk with each
-States = Float[Array, "b n h k v"]  # a state, a chunk
-Maps = Float[Array, "b n h k k"] | Float[Array, "b n h _"]  # A, a chunk: or diagonal
+States = Float[Array, "b n h dk dv"]  # one state per chunk
+Maps = Float[Array, "b n h dk dk"] | Float[Array, "b n h _"]  # A per chunk, or diagonal
 
 
 def chunk(xs: Positions, transition: bool, size: int = SIZE, sub: int = SUB) -> Chunk:
-    """``linear_attention.chunk``'s `xs` (q, k, v, log decay, continues, and a and b
-    if any) over their positions from a zero state, in float32, by chunks of `size`
-    positions; with the `transition`, also its map of a start state, and the reads.
-    The delta rule's xs have a and no b, which is k: `_delta` takes them in half the
-    work."""
+    """Run ``linear_attention.chunk``'s `xs` (q, k, v, log decay, continues, and a
+    and b if any) from a zero state, in float32, by chunks of `size` positions; with
+    `transition`, also return its map of a start state, and the reads. The delta
+    rule's xs have a and no b, which is k: `_delta` takes them in half the work."""
     delta = len(xs) == 6
-    xs = tuple(_whole(x) for x in xs)
+    xs = tuple(shard_whole_positions(x) for x in xs)
     q, k, v, g, *ab = (_split(x.astype(jnp.float32), size) for x in xs[:4] + xs[5:])
     starts = 1 - xs[4].astype(jnp.float32)  # 1 where a document starts
     seg = jnp.cumsum(_split(starts[..., None, None], size)[:, :, :, :, 0], -1)
@@ -57,20 +56,21 @@ def chunk(xs: Positions, transition: bool, size: int = SIZE, sub: int = SUB) -> 
     R, O, A, B = affine(q, k, v, g, seg, *ab[: 1 if delta else 2], sub=min(sub, size))
     out, state, P, reads = _across(R, O, A, B, transition)
     t = xs[0].shape[1]
-    reads = None if reads is None else _whole(_merge(reads, t))
-    return Chunk(_whole(_merge(out, t)), state, P, reads)
+    reads = None if reads is None else shard_whole_positions(_merge(reads, t))
+    return Chunk(shard_whole_positions(_merge(out, t)), state, P, reads)
 
 
-def _whole(x: Float[Array, "b t *e"]) -> Float[Array, "b t *e"]:
-    """`x` of (b, t), (b, t, h) or (b, t, h, e), whole along its positions, which the
-    chunks' reshape takes: with `seq` split under `scan`, an all-gather of them (of
-    the outputs' gradients, too), which XLA would otherwise make a rematerialization
-    in full. Heads stay split."""
+def shard_whole_positions(x: Float[Array, "b t *e"]) -> Float[Array, "b t *e"]:
+    """Gather `x`, of (b, t), (b, t, h) or (b, t, h, e), whole along the positions, as
+    the chunks' reshape takes it: with `seq` split under `scan`, an all-gather (of the
+    outputs' gradients, too) where XLA would rematerialize it in full. Heads stay
+    split."""
     return parallel.shard(x, *("batch", None, "heads", None)[: x.ndim])
 
 
 def _split(x: Float[Array, "b t *e"], size: int) -> Chunks:
-    """(b, t, h, e) to chunks (b, n, h, C, e), the last padded with zeros."""
+    """Reshape (b, t, h, e) into chunks (b, n, h, C, e), padding the last with
+    zeros."""
     b, t = x.shape[:2]
     n = -(-t // size)
     x = jnp.pad(x, [(0, 0), (0, n * size - t)] + [(0, 0)] * (x.ndim - 2))
@@ -78,7 +78,7 @@ def _split(x: Float[Array, "b t *e"], size: int) -> Chunks:
 
 
 def _merge(x: Chunks, t: int) -> Float[Array, "b t h e"]:
-    """`_split`, undone."""
+    """Undo `_split`."""
     b, n, h, c, e = x.shape
     return jnp.moveaxis(x, 3, 2).reshape(b, n * c, h, e)[:, :t]
 
@@ -93,8 +93,8 @@ class _Decays(NamedTuple):
 
 
 def _decays(g: Chunks, seg: Float[Array, "b n 1 c"]) -> _Decays:
-    """What a chunk's decays and documents say, from its log decays `g` and `seg`,
-    the documents started by each position."""
+    """Return each chunk's summed decays and document masks, from its log decays `g`
+    and `seg`, the documents started by each position."""
     G = jnp.cumsum(g, -2)
     same = seg[..., :, None] == seg[..., None, :]
     tail = jnp.swapaxes(same[..., -1:, :], -1, -2)
@@ -112,9 +112,9 @@ def _affine(
     *,
     sub: int,
 ) -> tuple[Chunks, Chunks, Maps, States]:
-    """Each chunk's R, O, A and B: its outputs R S_0 + O and end state A S_0 + B of
-    a start state S_0, where `seg` counts the documents started by each position. A
-    is a matrix with a and b, else its diagonal (of k, or of 1)."""
+    """Return each chunk's R, O, A and B: its outputs R S_0 + O and end state
+    A S_0 + B from a start state S_0, where `seg` counts the documents started by each
+    position. A is a matrix with a and b, else its diagonal (of dk, or of 1)."""
     G, before, end, reach, same, tail = _decays(g, seg)
     qd = jnp.where(reach, q * jnp.exp(G), 0)  # Gamma(t, 0) q_t
     kd = jnp.where(tail, k * jnp.exp(end - G), 0)  # Gamma(C, s) k_s
@@ -142,9 +142,9 @@ def _delta(
     *,
     sub: int,
 ) -> tuple[Chunks, Chunks, Maps, States]:
-    """`_affine` where b is k: L_k = L, so U = T L V = T V - V, and the outputs and
-    the end state read the chunk's values through T alone, O = M T V and B = K^T T V
-    (Gamma'd), with two pairwise products where `_affine` takes four."""
+    """Compute `_affine` where b is k: L_k = L, so U = T L V = T V - V, and the
+    outputs and the end state read the chunk's values through T alone, O = M T V and
+    B = K^T T V (Gamma'd), with two pairwise products where `_affine` takes four."""
     G, before, end, reach, same, tail = _decays(g, seg)
     T = _inverse(_pairwise(a, k, before, G, same, True, sub))
     M = _pairwise(q, k, G, G, same, False, sub)
@@ -164,13 +164,13 @@ def _pairwise(
     strict: bool,
     sub: int,
 ) -> Pairs:
-    """sum_c x[t, c] y[s, c] exp(gx[t, c] - gy[s, c]) for s before t (or at t, unless
-    `strict`) of the `same` document, else 0; gx <= gy at every such pair."""
+    """Return sum_c x[t, c] y[s, c] exp(gx[t, c] - gy[s, c]) for s before t (or at t,
+    unless `strict`) of the `same` document, else 0; gx <= gy at every such pair."""
     c = x.shape[-2]
     index = jnp.arange(c)
     lower = index[:, None] > index[None, :] if strict else index[:, None] >= index
     visible = same & lower
-    if gx.shape[-1] == 1:  # a decay a head: a matmul, then the decays
+    if gx.shape[-1] == 1:  # one decay per head: a matmul, then the decays
         gap = jnp.where(visible, gx - jnp.swapaxes(gy, -1, -2), -jnp.inf)
         return (x @ jnp.swapaxes(y, -1, -2)) * jnp.exp(gap)
     return jnp.where(visible, _channels(x, y, gx, gy, lower, sub), 0)
@@ -181,9 +181,9 @@ def _pairwise(
 def _channels(
     x: Chunks, y: Chunks, gx: Chunks, gy: Chunks, lower: Bool[Array, "c c"], sub: int
 ) -> Pairs:
-    """`_pairwise` of a decay a key channel, at the pairs `lower` takes. From each
-    block of `sub` positions to those after it, through the decay at the block's end,
-    by a matmul; within a block, a decay a pair."""
+    """Compute `_pairwise` for a decay per key channel, at the pairs `lower` keeps.
+    From each block of `sub` positions to those after it, through the decay at the
+    block's end, by a matmul; within a block, one decay per pair."""
     *lead, c, e = x.shape
     n = c // sub
     xs, ys, gxs, gys = (z.reshape(*lead, n, sub, e) for z in (x, y, gx, gy))
@@ -201,9 +201,9 @@ def _channels(
 
 
 def _inverse(L: Pairs, leaf: int = 16) -> Pairs:
-    """(I - L)^-1 of a strictly lower triangular L, by halves: that of [[L1, 0],
-    [L21, L2]] is [[T1, 0], [T2 L21 T1, T2]], down to blocks of `leaf` solved a row
-    at a time. Every product is of entries of the inverse, which stay bounded where
+    """Return (I - L)^-1 of a strictly lower triangular L, by halves: that of
+    [[L1, 0], [L21, L2]] is [[T1, 0], [T2 L21 T1, T2]], down to blocks of `leaf`
+    solved one row at a time. Every product is of entries of the inverse, which stay bounded where
     the powers of L need not (keys alike, steps near 1)."""
     c = L.shape[-1]
     blocks = c // leaf
@@ -219,7 +219,7 @@ def _inverse(L: Pairs, leaf: int = 16) -> Pairs:
 
 
 def _blocks(L: Pairs, size: int, below: int) -> Float[Array, "b n h m s s"]:
-    """The blocks of `size` on L's diagonal, (..., c / size, size, size); with
+    """Return the blocks of `size` on L's diagonal, (..., c / size, size, size); with
     `below`, each lower left quarter of them instead."""
     *lead, c, _ = L.shape
     m = c // size
@@ -232,8 +232,8 @@ def _blocks(L: Pairs, size: int, below: int) -> Float[Array, "b n h m s s"]:
 
 
 def _substitute(L: Float[Array, "b n h m s s"]) -> Float[Array, "b n h m s s"]:
-    """(I - L)^-1 of strictly lower triangular blocks, a row at a time: row i is e_i +
-    L_i T, of the rows before it."""
+    """Return (I - L)^-1 of strictly lower triangular blocks, one row at a time: row
+    i is e_i + L_i T, of the rows before it."""
     s = L.shape[-1]
 
     def row(
@@ -250,26 +250,26 @@ def _substitute(L: Float[Array, "b n h m s s"]) -> Float[Array, "b n h m s s"]:
 def _matmul(
     x: Float[Array, "*b i j"], y: Float[Array, "*b j k"]
 ) -> Float[Array, "*b i k"]:
-    """x @ y in full float32: the inverse's rounding grows with its size."""
+    """Return x @ y in full float32: the inverse's rounding grows with its size."""
     return jnp.matmul(x, y, precision=jax.lax.Precision.HIGHEST)
 
 
-_Carry = tuple[Float[Array, "b h k v"], Transition | None]  # the state, and P
+_Carry = tuple[Float[Array, "b h dk dv"], Transition | None]  # the state, and P
 _At = tuple[
-    Float[Array, "b h c k"],
-    Float[Array, "b h c v"],
+    Float[Array, "b h c dk"],
+    Float[Array, "b h c dv"],
     Transition,
-    Float[Array, "b h k v"],
+    Float[Array, "b h dk dv"],
 ]
-_Out = tuple[Float[Array, "b h c v"], Float[Array, "b h c k"] | None]
+_Out = tuple[Float[Array, "b h c dv"], Float[Array, "b h c dk"] | None]
 
 
 def _across(
     R: Chunks, O: Chunks, A: Maps, B: States, transition: bool
-) -> tuple[Chunks, Float[Array, "b h k v"], Transition | None, Chunks | None]:
-    """The chunks' outputs, from a zero state that each carries to the next, and the
-    state they end with; with the `transition`, the map P of a start state that they
-    make together, and the reads R P of the outputs. Matrices A carry the state by
+) -> tuple[Chunks, Float[Array, "b h dk dv"], Transition | None, Chunks | None]:
+    """Return the chunks' outputs, from a zero state that each carries to the next,
+    and the state they end with; with `transition`, also the map P of a start state
+    that they make together, and the outputs' reads R P. Matrices A carry the state by
     ``affine_scan``'s kernel, and the outputs read it in one batched matmul."""
     if A.ndim == 5 and not transition:
         before, S = affine_scan.states(A, B)
@@ -300,7 +300,8 @@ def _across(
 
 
 def _then(A: Transition, S: Float[Array, "b h *rest"]) -> Float[Array, "b h *rest"]:
-    """A S, for a matrix A or its diagonal; S a state, or a map of A's kind."""
+    """Return A S, for a matrix A or its diagonal; S a state, or a map of A's
+    kind."""
     if A.ndim == S.ndim:
         return A @ S if A.ndim == 4 else A * S
     return A[..., None] * S

@@ -87,9 +87,9 @@ def test_an_moe_reports_its_balance_loss_in_training_only():
     assert loss.name == "balance_loss" and loss.weight == 0.5
     assert jnp.isclose(loss.value, expected)
     # The weight defaults to 1e-2, and to 0 with the bias, so nothing is reported.
-    assert moe_layer().aux_loss_weight == 1e-2
+    assert moe_layer().config.aux_loss_weight == 1e-2
     free = moe_layer(load_balancing="aux_free")
-    assert free.aux_loss_weight == 0
+    assert free.config.aux_loss_weight == 0
     taps = Taps(training=True)
     free(x, taps)
     assert taps.losses == []
@@ -268,7 +268,7 @@ def test_some_of_the_experts_add_their_own_picks_and_nothing_for_the_others():
     def some(first: int, n: int) -> Float[Array, "b t d"]:
         mine = slice(first, first + n)
         kernels = (up[mine], gate[mine], down[mine])
-        return routed(z, idx - first, weights, *kernels, e.ffn, e.expert_norm)
+        return routed(z, idx - first, weights, *kernels, e.config.expert, e.expert_norm)
 
     assert jnp.allclose(some(0, 1) + some(1, 3), some(0, 4), atol=1e-5)
     assert jnp.allclose(some(0, 4), run("dense", e, x)[0], atol=1e-5)

@@ -507,7 +507,7 @@ from bux.parallel import methods
 
 @methods.moe.register("mine")
 def _(moe, z, idx, weights):
-    return routed(z, idx, weights, *moe.kernels(), moe.ffn, moe.expert_norm)
+    return routed(z, idx, weights, *moe.kernels(), moe.config.expert, moe.expert_norm)
 ```
 
 The MoE names its parameters: the router `(embed, None)`; `up` and `gate`
