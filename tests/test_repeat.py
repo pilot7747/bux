@@ -17,7 +17,7 @@ from bux.architecture import Model, MoE, Norm
 from bux.architecture.graph import Scanned, Sequence
 from bux.architecture.residual import HyperConnections
 from bux.lang import compile, compile_runs
-from bux.train.optim import decayed, matrices
+from bux.train.optim import muon_matrices, weight_decay_mask
 from bux.train.trainer import directory, train
 
 PRELUDE = """
@@ -159,7 +159,7 @@ def test_a_repeat_of_repeats_stacks_twice():
     model = _model(nested)
     [inner] = [scan for scan in _scans(model) if scan.times == 2]
     kernel = _path(model, _first(nnx.Linear, inner)) + ("kernel",)
-    assert matrices(model)[kernel] == MuonDimensionNumbers(2, 3)
+    assert muon_matrices(model)[kernel] == MuonDimensionNumbers(2, 3)
     assert _scan_lengths(model) == [3]
     assert np.allclose(_logits(nested, SCAN), _logits(nested, UNROLL), atol=1e-5)
 
@@ -205,7 +205,7 @@ def test_single_pass_mhc_scans_from_the_layer_after_the_one_that_starts_its_read
 
 def test_muon_takes_the_stacked_dimension_as_a_batch_dimension():
     model = _model(MOE)
-    dims, [scan] = matrices(model), _scans(model)
+    dims, [scan] = muon_matrices(model), _scans(model)
     up = _path(model, _first(MoE, scan)) + ("up",)
     kernel = _path(model, _first(nnx.Linear, scan)) + ("kernel",)
     assert dims[up] == MuonDimensionNumbers(2, 3)
@@ -215,7 +215,9 @@ def test_muon_takes_the_stacked_dimension_as_a_batch_dimension():
 def test_weight_decay_leaves_stacked_norm_scales_alone():
     model = _model(LLAMA)
     [scan] = _scans(model)
-    mask = dict(nnx.to_flat_state(decayed(model)(nnx.state(model, nnx.Param))))
+    mask = dict(
+        nnx.to_flat_state(weight_decay_mask(model)(nnx.state(model, nnx.Param)))
+    )
     scale = _path(model, _first(Norm, scan)) + ("scale",)
     kernel = _path(model, _first(nnx.Linear, scan)) + ("kernel",)
     assert mask[scale].get_value() is False

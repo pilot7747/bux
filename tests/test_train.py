@@ -29,23 +29,23 @@ from bux.train.hooks import Hook, Log
 from bux.train.objective import (
     Term,
     cross_entropy,
-    lookahead,
     objective,
-    targets,
+    prediction_offsets,
+    target_mask,
     z_loss,
 )
 from bux.train.optim import (
-    decayed,
-    matrices,
+    lr_multiplier,
     momentum,
+    muon_matrices,
     optimizer,
     optimizers,
     orthogonalized,
-    schedule,
     schedules,
-    whole,
+    weight_decay_mask,
+    whole_matrix_spec,
 )
-from bux.train.sinks import Latest, Sink
+from bux.train.sinks import LatestMetrics, Sink
 from bux.train.trainer import Trainer, directory, train
 
 SMOKE = Path(__file__).parent.parent / "examples" / "experiments" / "smoke.bux"
@@ -68,7 +68,7 @@ def smoke(*overrides: str):
 
 
 def values(c: tcfg.ScheduleConfig, steps: int) -> list[float]:
-    f = schedule(c, steps)
+    f = lr_multiplier(c, steps)
     return [round(float(f(i)), 4) for i in range(steps)]
 
 
@@ -92,7 +92,9 @@ def test_muon_trains_the_block_matrices_and_adam_the_rest():
         ),
         rngs=nnx.Rngs(0),
     )
-    found = {path[-2:] if path[-1] == "kernel" else path[-1:] for path in matrices(m)}
+    found = {
+        path[-2:] if path[-1] == "kernel" else path[-1:] for path in muon_matrices(m)
+    }
     assert found == {
         ("q", "kernel"),
         ("k", "kernel"),
@@ -103,7 +105,9 @@ def test_muon_trains_the_block_matrices_and_adam_the_rest():
         ("gate",),
         ("down",),
     }
-    stacked = [d for p, d in matrices(m).items() if p[-1] in ("up", "gate", "down")]
+    stacked = [
+        d for p, d in muon_matrices(m).items() if p[-1] in ("up", "gate", "down")
+    ]
     assert {(d.reduction_axis, d.output_axis) for d in stacked} == {(1, 2)}
 
 
@@ -119,7 +123,7 @@ def test_weight_decay_leaves_norms_and_engram_tables_alone_whatever_their_shape(
         rngs=nnx.Rngs(0),
     )
     params = nnx.state(m, nnx.Param)
-    flags = jax.tree.leaves(decayed(m)(params))
+    flags = jax.tree.leaves(weight_decay_mask(m)(params))
     leaves = jax.tree_util.tree_leaves_with_path(params)
     assert len(flags) == len(leaves)
     named = [
@@ -136,7 +140,7 @@ def test_weight_decay_leaves_norms_and_engram_tables_alone_whatever_their_shape(
         "conv_norm",
     }
     decays = {keys for keys, _, d in named if d}
-    assert set(matrices(m)) <= decays
+    assert set(muon_matrices(m)) <= decays
 
 
 # --- Muon split over devices: methods.orthogonalize ------------------------------------
@@ -196,7 +200,7 @@ def _muon_step(orthogonalize: str = "gspmd", **mesh: int) -> tuple[list, str]:
     split = parallel.use(tcfg.MeshConfig.model_validate(mesh), methods=methods)
     with split if mesh else contextlib.nullcontext():
         model = parallel.build(lambda: Model(compile(MOE), rngs=nnx.Rngs(0)))
-        c, lr = tcfg.MuonConfig(lr=0.02), schedule(tcfg.ConstantSchedule(), 1)
+        c, lr = tcfg.MuonConfig(lr=0.02), lr_multiplier(tcfg.ConstantSchedule(), 1)
         trained = nnx.Optimizer(model, optimizer(c, lr, model), wrt=nnx.Param)
         parallel.place(model, trained)
         grads = jax.tree.map(jnp.sin, nnx.state(model, nnx.Param))
@@ -230,13 +234,19 @@ def test_muon_gathering_whole_matrices_needs_no_all_reduce(mesh):
 def test_gather_holds_matrices_whole_and_a_stack_split_over_what_that_frees():
     mesh = parallel.mesh(tcfg.MeshConfig(fsdp=2, expert=2, tensor=2))
     matrix, experts = MuonDimensionNumbers(0, 1), MuonDimensionNumbers(1, 2)
-    assert whole(P("fsdp", "tensor"), matrix, (64, 32), mesh) == P(None, None)
+    assert whole_matrix_spec(P("fsdp", "tensor"), matrix, (64, 32), mesh) == P(
+        None, None
+    )
     every = ("expert", "fsdp", "tensor")
     split = P("expert", "fsdp", "tensor")
-    assert whole(split, experts, (8, 64, 32), mesh) == P(every, None, None)
+    assert whole_matrix_spec(split, experts, (8, 64, 32), mesh) == P(every, None, None)
     # 4 experts do not split 8 ways: each stays whole, and the experts as they were.
-    assert whole(split, experts, (4, 64, 32), mesh) == P("expert", None, None)
-    assert whole(P(None, "fsdp"), experts, (3, 64, 32), mesh) == P(None, None, None)
+    assert whole_matrix_spec(split, experts, (4, 64, 32), mesh) == P(
+        "expert", None, None
+    )
+    assert whole_matrix_spec(P(None, "fsdp"), experts, (3, 64, 32), mesh) == P(
+        None, None, None
+    )
 
 
 def test_a_run_that_gathers_matrices_for_muon_trains_as_on_one_device(losses):
@@ -298,11 +308,11 @@ def test_heads_predict_further_ahead_after_each_nextn():
         ARCH + "mtp = $h! nextn [norm ffn] norm @h head\n"
         "model = embed block norm @h head mtp^2\n"
     )
-    assert lookahead(arch) == [1, 2, 3]
+    assert prediction_offsets(arch) == [1, 2, 3]
     tokens = np.asarray(jax.random.randint(jax.random.key(0), (2, 8), 0, 32))
     outputs = Model(arch, rngs=nnx.Rngs(0)).outputs(jnp.asarray(tokens))
     batch = plain(tokens)
-    total, metrics = objective(tcfg.LossConfig(z=1e-4), arch)(outputs, batch)
+    (total, metrics), _ = objective(tcfg.LossConfig(z=1e-4), arch)(outputs, batch)
     expected = metrics["loss"] + 1e-4 * metrics["z_loss"] + 0.3 * metrics["mtp"]
     assert jnp.allclose(total, expected) and set(metrics) == {"loss", "z_loss", "mtp"}
 
@@ -330,9 +340,11 @@ def test_the_z_loss_is_on_the_positions_that_predict_a_target():
         loss_mask=np.array([[True] * 5 + [False] * 3])  # padding after 5 tokens
     )
     z = jax.nn.logsumexp(logits[0], -1) ** 2
-    assert jnp.allclose(z_loss(logits, targets(batch)), z[:4].mean())  # 0->1 .. 3->4
+    assert jnp.allclose(
+        z_loss(logits, target_mask(batch)), z[:4].mean()
+    )  # 0->1 .. 3->4
     arch = compile(ARCH + "model = embed block norm head\n")
-    _, metrics = objective(tcfg.LossConfig(z=1e-4), arch)([logits], batch)
+    (_, metrics), _ = objective(tcfg.LossConfig(z=1e-4), arch)([logits], batch)
     assert jnp.allclose(metrics["z_loss"], z[:4].mean())
 
 
@@ -414,8 +426,8 @@ class Steps(Sink):
     def __init__(self):
         self.reports: list[tuple[int, set[str]]] = []
 
-    def write(self, step, report):
-        self.reports.append((step, set(report)))
+    def write(self, step, scalars):
+        self.reports.append((step, set(scalars)))
 
 
 def test_a_trainer_takes_terms_hooks_and_sinks_of_ones_own():
@@ -423,8 +435,8 @@ def test_a_trainer_takes_terms_hooks_and_sinks_of_ones_own():
     loss = objective(tcfg.LossConfig(), arch)
     loss.terms["logit_l2"] = Term(1e-4, lambda logits, _: jnp.mean(logits[0] ** 2))
     trainer = Trainer(Model(arch, rngs=nnx.Rngs(0)), optax.adamw(1e-3), loss)
-    lr = schedule(tcfg.ConstantSchedule(), 3)
-    latest, steps = Latest(), Steps()
+    lr = lr_multiplier(tcfg.ConstantSchedule(), 3)
+    latest, steps = LatestMetrics(), Steps()
     data = batches(tcfg.SyntheticConfig(), rows(tcfg.SyntheticConfig(), 2, 8), 32)
     hooks = [Log(every=1, lr=lr, tokens=16), WeightNorm()]
     trainer.fit(data, 3, hooks=hooks, sinks=[latest, steps])

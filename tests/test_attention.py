@@ -747,7 +747,7 @@ def test_the_indexer_loss_of_documents_packed_in_a_row_is_theirs(body):
     arch = compile(PRELUDE + BODIES[body])
     trainer = Trainer(m, optax.adamw(1e-3), objective(tcfg.LossConfig(), arch))
     batch = Batch(np.asarray(t), np.asarray(positions), np.ones((2, 12), bool))
-    metrics = trainer.update(batch)
+    metrics = trainer.train_on_batch(batch)
     assert np.isclose(metrics["indexer_loss"], packed, atol=1e-5)
     assert np.isfinite(metrics["grad_norm"])
 

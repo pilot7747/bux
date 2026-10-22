@@ -19,7 +19,7 @@ from bux.lang.printer import run_to_source
 from bux.train import config as tcfg
 from bux.train.data import plain
 from bux.train.objective import objective
-from bux.train.optim import optimizer, schedule
+from bux.train.optim import lr_multiplier, optimizer
 from bux.train.trainer import Trainer, directory, train
 
 ROOT = Path(__file__).parent.parent
@@ -90,7 +90,7 @@ def test_a_step_keeps_the_state_where_it_was():
     with parallel.use(t.mesh, t.layout, t.methods):
         trainer = _trainer(run)
         before = jax.tree.leaves(trainer.state())
-        trainer.update(_batch())
+        trainer.train_on_batch(_batch())
         after = jax.tree.leaves(trainer.state())
     assert all(
         a.sharding.is_equivalent_to(b.sharding, a.ndim) for a, b in zip(after, before)
@@ -264,7 +264,7 @@ def _run(arch: str, *settings: str):
 def _trainer(run):
     t = run.train
     model = parallel.build(lambda: Model(run.arch, rngs=nnx.Rngs(0)))
-    tx = optimizer(t.optimizer, schedule(t.schedule, t.steps), model, t.clip)
+    tx = optimizer(t.optimizer, lr_multiplier(t.schedule, t.steps), model, t.clip)
     return Trainer(model, tx, objective(t.loss, run.arch))
 
 

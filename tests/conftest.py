@@ -110,9 +110,9 @@ class Losses(Sink):
     def __init__(self):
         self.losses: list[float] = []
 
-    def write(self, step, report):
-        if "loss" in report:
-            self.losses.append(report["loss"])
+    def write(self, step, scalars):
+        if "loss" in scalars:
+            self.losses.append(scalars["loss"])
 
 
 @pytest.fixture

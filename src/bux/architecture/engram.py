@@ -69,6 +69,8 @@ class Engram(nnx.Module):
     share the value. The table's rows split as the vocabulary does (``bux.parallel``),
     and the rest is whole."""
 
+    no_weight_decay = ("table",)
+
     def __init__(
         self, c: cfg.EngramConfig, width: int | Literal["streams"], ctx: Context
     ):

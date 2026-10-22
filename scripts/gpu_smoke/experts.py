@@ -24,7 +24,7 @@ from bux import parallel
 from bux.architecture.moe import MoE
 from bux.lang import compile_runs
 from bux.train import config as tcfg
-from bux.train.sinks import Report, Sink
+from bux.train.sinks import Scalars, Sink
 from bux.train.trainer import train
 
 METHODS = ["sorted", "all_gather", "all_to_all", "ragged_all_to_all"]
@@ -49,10 +49,10 @@ NORM = cfg.NormalizationConfig(type="rmsnorm")
 
 class Reports(Sink):
     def __init__(self) -> None:
-        self.reports: list[Report] = []
+        self.reports: list[Scalars] = []
 
-    def write(self, step: int, report: Report) -> None:
-        self.reports.append(report)
+    def write(self, step: int, scalars: Scalars) -> None:
+        self.reports.append(scalars)
 
 
 def source(mesh: dict[str, int]) -> str:

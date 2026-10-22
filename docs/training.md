@@ -82,12 +82,14 @@ The settings of each config are pydantic fields in `bux/train/config.py`, and th
 editor shows them on hover and completes them, as it does for layers. In short:
 
 - `adamw(lr, b1=0.9, b2=0.95, eps, weight_decay=0.1)` decays matrices only, not norm
-  scales, biases or Engram's tables.
+  scales, biases or Engram's tables: a layer's class names what weight decay leaves
+  alone in `no_weight_decay`.
 - `muon(lr, momentum=0.95, nesterov, ns_steps=5, weight_decay=0.1, consistent_rms=0.2,
   adam=none)` trains the matrices inside the blocks with Muon, stacked expert weights
-  one expert at a time, and everything else (the embedding, the head, vectors) with
-  `adam`, which defaults to `adamw(lr=lr)`. With `consistent_rms=0.2` (Moonlight) one
-  learning rate suits both; `none` scales updates as Keller Jordan's Muon does.
+  one expert at a time (a class's `muon_axes`), and everything else (the embedding
+  and the head, marked `no_muon`, and vectors) with `adam`, which defaults to
+  `adamw(lr=lr)`. With `consistent_rms=0.2` (Moonlight) one learning rate suits
+  both; `none` scales updates as Keller Jordan's Muon does.
 - A schedule multiplies `lr`. `warmup` rises linearly over its steps. `cosine` decays to
   `final` (0.1) at the last step. `wsd` holds the peak, then cools down to `final` (0)
   over the last `decay` (0.2) of the steps, `linear`, `sqrt` (1 - sqrt(t)) or `cosine`.
@@ -391,18 +393,18 @@ fork; a new name also needs its config in `bux/train/config.py`, where the compi
 and the editor find it:
 
 ```python
-from bux.train.optim import optimizers, peak
+from bux.train.optim import lr_schedule, optimizers
 
 
 @optimizers.register("adamw")
 def _(c, multiplier, model):  # a config, the schedule's multiplier, the model
     return optax.adamw(
-        peak(c.lr, multiplier), b1=c.b1, b2=c.b2, weight_decay=c.weight_decay
+        lr_schedule(c.lr, multiplier), b1=c.b1, b2=c.b2, weight_decay=c.weight_decay
     )
 ```
 
-A hook runs after every `every` steps and after the last, and what it returns is a
-report, metrics by name, that every sink gets. When training stops early, because
+A hook runs after every `every` steps and after the last, and what it returns,
+scalars (metrics by name, as numbers), goes to every sink. When training stops early, because
 something set `trainer.stopping` as the launcher does at SIGTERM, every hook's `stop`
 runs, and the checkpoint hook saves the step. A tracker is a sink:
 
@@ -420,8 +422,8 @@ class Wandb(Sink):
     def __init__(self, run):
         self.run = wandb.init(project="bux", name=run.name)
 
-    def write(self, step, report):
-        self.run.log(report, step=step)
+    def write(self, step, scalars):
+        self.run.log(scalars, step=step)
 
 
 train(run, hooks=[WeightNorm()], sinks=[Wandb(run)])
@@ -448,8 +450,9 @@ objective adds weight × value to the training loss and logs the values, summed 
 the layers that report the name, under that name; eval leaves them out.
 
 `train_step` and `eval_step` are what the trainer compiles, once; a subclass that
-overrides them changes what a step does (accumulating gradients, averaging the weights,
-skipping a spike) and keeps the loop, the hooks and checkpoints.
+overrides them changes what a step does (averaging the weights, skipping a spike) and
+keeps the loop, the hooks and checkpoints. Gradient accumulation is built in:
+`methods(microbatches=n)`.
 
 ## Design notes
 

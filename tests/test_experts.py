@@ -219,8 +219,8 @@ def _biases(method: str, mesh: str) -> list[Float[np.ndarray, " e"]]:
     with split(method, mesh):
         model = parallel.build(lambda: Model(arch, rngs=nnx.Rngs(0)))
         trainer = Trainer(model, optax.adamw(1e-2), objective(tcfg.LossConfig(), arch))
-        trainer.update(batch)
-        trainer.update(batch)
+        trainer.train_on_batch(batch)
+        trainer.train_on_batch(batch)
     moes = [m for _, m in nnx.iter_modules(model) if isinstance(m, MoE)]
     return [np.asarray(m.router_bias[...]) for m in moes if m.router_bias is not None]
 

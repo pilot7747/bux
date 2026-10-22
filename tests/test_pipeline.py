@@ -19,7 +19,7 @@ from bux.lang import compile, compile_runs
 from bux.parallel import pipeline
 from bux.train.data import plain
 from bux.train.objective import objective
-from bux.train.optim import optimizer, schedule
+from bux.train.optim import lr_multiplier, optimizer
 from bux.train.trainer import Trainer, _accumulated, directory, train
 
 PRELUDE = """
@@ -204,10 +204,10 @@ def _stepped_bias(mesh: str, methods: str) -> Float[np.ndarray, "layers experts"
     t = run.train
     with parallel.use(t.mesh, t.layout, t.methods):
         model = parallel.build(lambda: Model(run.arch, rngs=nnx.Rngs(0)))
-        tx = optimizer(t.optimizer, schedule(t.schedule, t.steps), model, t.clip)
+        tx = optimizer(t.optimizer, lr_multiplier(t.schedule, t.steps), model, t.clip)
         loss = objective(t.loss, run.arch)
         trainer = Trainer(model, tx, loss, microbatches=_accumulated(4))
-        trainer.update(plain(TOKENS))
+        trainer.train_on_batch(plain(TOKENS))
     return _bias(trainer.model)
 
 

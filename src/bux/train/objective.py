@@ -7,7 +7,9 @@ its name, so another term is a name, a weight and a function:
     obj.terms["logit_l2"] = Term(1e-4, lambda logits, batch: jnp.mean(logits[0] ** 2))
 
 The losses that layers report from a training forward (``report`` in
-``bux.architecture.registry``) are terms too, weighted by each layer.
+``bux.architecture.registry``) are added too, weighted by each layer. They are means
+over rows, where the terms are means over target tokens, so the objective returns the
+two apart: gradient accumulation scales each by its own share of the batch.
 """
 
 from collections.abc import Callable, Sequence
@@ -25,12 +27,20 @@ from bux.lang import ir
 from bux.train import config as tcfg
 from bux.train.data import Batch
 
+Metrics = dict[str, Float[Array, ""]]  # what a step measured, still on the device
 Logits = Sequence[Float[Array, "b t vocab"]]  # every head's, in execution order
 
 
 class Term(NamedTuple):
     weight: float
     fn: Callable[[Logits, Batch], Float[Array, ""]]
+
+
+class Part(NamedTuple):
+    """A part of the objective: its values' weighted sum, and each value by name."""
+
+    loss: Float[Array, ""]
+    metrics: Metrics
 
 
 @dataclass
@@ -40,84 +50,89 @@ class Objective:
     terms: dict[str, Term]
 
     def __call__(
-        self, logits: Logits, batch: Batch, reported: Sequence[Loss] = ()
-    ) -> tuple[Float[Array, ""], dict[str, Float[Array, ""]]]:
-        """The loss to minimize, and its terms: a reported loss's values summed under
-        its name."""
+        self, logits: Logits, batch: Batch, aux_losses: Sequence[Loss] = ()
+    ) -> tuple[Part, Part]:
+        """Return the objective's two parts: its terms, means over target tokens, and
+        the losses layers report, means over rows, each name's values summed."""
         metrics = {name: term.fn(logits, batch) for name, term in self.terms.items()}
-        total = jnp.zeros((), jnp.float32)
+        loss = jnp.zeros((), jnp.float32)
         for name, term in self.terms.items():
-            total = total + term.weight * metrics[name]
-        for name, weight, value in reported:
+            loss = loss + term.weight * metrics[name]
+        aux_loss, aux_metrics = jnp.zeros((), jnp.float32), {}
+        for name, weight, value in aux_losses:
             if name in self.terms:
                 raise ValueError(f"a layer reports {name!r}, a term of the objective")
-            metrics[name] = metrics.get(name, 0) + value
-            total = total + weight * value
-        return total, metrics
+            aux_metrics[name] = aux_metrics.get(name, 0) + value
+            aux_loss = aux_loss + weight * value
+        return Part(loss, metrics), Part(aux_loss, aux_metrics)
 
 
-def objective(c: tcfg.LossConfig, arch: ir.Architecture) -> Objective:
-    """The loss of `c` for a model of `arch`: the cross-entropy of its first head, as
-    `loss`, its `z_loss`, and as `mtp` the mean loss of the heads that predict further
-    ahead."""
-    ahead = lookahead(arch)
-    terms = {"loss": Term(1.0, lambda logits, b: cross_entropy(logits[0], b, ahead[0]))}
-    if c.z:
-        terms["z_loss"] = Term(c.z, lambda logits, b: z_loss(logits[0], targets(b)))
-    if len(ahead) > 1:
+def objective(config: tcfg.LossConfig, arch: ir.Architecture) -> Objective:
+    """Return the loss of `config` for a model of `arch`: the first head's
+    cross-entropy as `loss`, its `z_loss`, and as `mtp` the mean loss of the heads
+    that predict further ahead."""
+    offsets = prediction_offsets(arch)
+    first = Term(1.0, lambda logits, b: cross_entropy(logits[0], b, offsets[0]))
+    terms = {"loss": first}
+    if config.z:
+        z = Term(config.z, lambda logits, b: z_loss(logits[0], target_mask(b)))
+        terms["z_loss"] = z
+    if len(offsets) > 1:
 
         def mtp(logits: Logits, b: Batch) -> Float[Array, ""]:
-            further = zip(logits[1:], ahead[1:], strict=True)
-            return jnp.mean(jnp.stack([cross_entropy(o, b, a) for o, a in further]))
+            further = zip(logits[1:], offsets[1:], strict=True)
+            losses = [cross_entropy(head, b, offset) for head, offset in further]
+            return jnp.mean(jnp.stack(losses))
 
-        terms["mtp"] = Term(c.mtp, mtp)
+        terms["mtp"] = Term(config.mtp, mtp)
     return Objective(terms)
 
 
-def lookahead(arch: ir.Architecture) -> list[int]:
-    """How far ahead each head predicts, in execution order: 1 + the nextn layers before it."""
-    ahead, nextn = [], 0
+def prediction_offsets(arch: ir.Architecture) -> list[int]:
+    """Return how many tokens ahead each head predicts, in execution order: 1 + the
+    nextn layers before it."""
+    offsets, nextn = [], 0
     for layer in arch.layers():
         if layer.config.type == "nextn":
             nextn += 1
         elif layer.config.type == "head":
-            ahead.append(1 + nextn)
-    return ahead or [1]
+            offsets.append(1 + nextn)
+    return offsets or [1]
 
 
-def targets(batch: Batch, ahead: int = 1) -> Bool[Array, "b _"]:
-    """Whether each position t but the row's last `ahead` predicts a target: token
-    t + ahead is one (by loss_mask), and of t's own document."""
+def target_mask(batch: Batch, offset: int = 1) -> Bool[Array, "b _"]:
+    """Return whether each position t predicts a target, token t + offset: one in the
+    loss mask and in t's document. The rows' last `offset` positions have no such
+    token, so the mask is that much shorter than the rows."""
     within = Segments.of(jnp.asarray(batch.position_ids)).within
-    return jnp.asarray(batch.loss_mask[:, ahead:]) & (within[:, ahead:] >= ahead)
+    return jnp.asarray(batch.loss_mask[:, offset:]) & (within[:, offset:] >= offset)
 
 
-def _mean(values: Float[Array, "b t"], weight: Bool[Array, "b _"]) -> Float[Array, ""]:
-    """The mean of the first values of each row, where `weight` is true."""
-    values = values[:, : weight.shape[1]]
-    return jnp.sum(values * weight) / jnp.maximum(jnp.sum(weight), 1)
+def _masked_mean(
+    values: Float[Array, "b t"], mask: Bool[Array, "b t"]
+) -> Float[Array, ""]:
+    return jnp.sum(values * mask) / jnp.maximum(jnp.sum(mask), 1)
 
 
 def cross_entropy(
-    logits: Float[Array, "b t vocab"], batch: Batch, ahead: int = 1
+    logits: Float[Array, "b t vocab"], batch: Batch, offset: int = 1
 ) -> Float[Array, ""]:
-    """The mean loss of logits over positions t that predict a target, token t + ahead.
-    A position with nothing that far ahead in its row, or in its document, is left
-    out: weighed 0, as the last `ahead` are, rather than sliced off the logits, whose
-    gradient would then pad a copy of them all."""
-    pad = ((0, 0), (0, ahead))
-    weight = jnp.pad(targets(batch, ahead), pad)
-    labels = jnp.pad(jnp.asarray(batch.input_ids)[:, ahead:], pad)
+    """Return the mean cross-entropy of predicting token t + offset from each position
+    t that has a target (`target_mask`). The last `offset` positions are masked out
+    rather than sliced off the logits, whose gradient would then pad a copy of them."""
+    pad = ((0, 0), (0, offset))
+    mask = jnp.pad(target_mask(batch, offset), pad)
+    targets = jnp.pad(jnp.asarray(batch.input_ids)[:, offset:], pad)
     loss = optax.softmax_cross_entropy_with_integer_labels(
-        logits.astype(jnp.float32), labels
+        logits.astype(jnp.float32), targets
     )
-    return _mean(loss, weight)
+    return _masked_mean(loss, mask)
 
 
 def z_loss(
-    logits: Float[Array, "b t vocab"], weight: Bool[Array, "b _"] | None = None
+    logits: Float[Array, "b t vocab"], mask: Bool[Array, "b _"] | None = None
 ) -> Float[Array, ""]:
-    """The mean of log(Z)^2, which keeps the softmax's normalizer near 1 (PaLM), over
-    the positions `weight` says, as `targets` does, or all of them."""
+    """Return the mean of log(Z)^2, which keeps the softmax's normalizer near 1 (PaLM),
+    over the first positions of each row that `mask` covers, or over all of them."""
     z = jax.nn.logsumexp(logits.astype(jnp.float32), axis=-1) ** 2
-    return jnp.mean(z) if weight is None else _mean(z, weight)
+    return jnp.mean(z) if mask is None else _masked_mean(z[:, : mask.shape[1]], mask)
