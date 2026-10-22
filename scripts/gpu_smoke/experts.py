@@ -21,7 +21,7 @@ from flax import nnx
 
 from bux import config as cfg
 from bux import parallel
-from bux.architecture.moe import MoE
+from bux.architecture import MoE, Taps
 from bux.lang import compile_runs
 from bux.train import config as tcfg
 from bux.train.sinks import Scalars, Sink
@@ -67,8 +67,8 @@ def layer(mesh: dict[str, int], method: str) -> list[np.ndarray]:
     grid, methods = tcfg.MeshConfig.model_validate(mesh), tcfg.MethodsConfig(moe=method)
     with parallel.use(grid, methods=methods):
         e = parallel.build(lambda: MoE(c, 128, nnx.Rngs(0)))
-        y = nnx.jit(lambda e, x: e(x, {}))(e, x)
-        g = nnx.jit(nnx.grad(lambda e, x: (e(x, {}) * probe).sum(), argnums=(0, 1)))
+        y = nnx.jit(lambda e, x: e(x, Taps()))(e, x)
+        g = nnx.jit(nnx.grad(lambda e, x: (e(x, Taps()) * probe).sum(), argnums=(0, 1)))
         return jax.tree.leaves(jax.device_get((y, g(e, x))))
 
 
