@@ -48,10 +48,10 @@ budget            = 3B
 ```
 $ bux plan examples/experiments/attention_ablation.bux
 6 runs
-id          params  tokens  tok/param  run
-4c6613d749  183M    3B      16.4       attention_ablation[mha, optimizer.lr=1e-3]
-fe14a5e39c  183M    3B      16.4       attention_ablation[mha, optimizer.lr=3e-3]
-69cdd0b96d  174M    3B      17.2       attention_ablation[gqa, optimizer.lr=1e-3]
+id          params  tokens  tok/param  flops/tok  gpus  ...  run
+4217af5bcf  183M    3B      16.4       1.33B      1     ...  attention_ablation[mha, optimizer.lr=1e-3]
+77044894a9  183M    3B      16.4       1.33B      1     ...  attention_ablation[mha, optimizer.lr=3e-3]
+86d63e1072  174M    3B      17.2       1.27B      1     ...  attention_ablation[gqa, optimizer.lr=1e-3]
 ...
 ```
 
@@ -73,6 +73,7 @@ fe14a5e39c  183M    3B      16.4       attention_ablation[mha, optimizer.lr=3e-3
 | `eval`       | `eval(data=..., every=..., batches=...)`, or `none`    | `none`         |
 | `checkpoint` | `checkpoint(every=..., keep=...)`, or `none`           | `none`         |
 | `log`        | `log(every=...)`                                       | `log`          |
+| `profile`    | `profile(start=..., steps=...)`: a trace of `steps` steps after step `start`, or `none` | `none` |
 | `precision`  | `precision(compute=bfloat16)`: the dtype forward and backward compute in; parameters stay float32 | `precision`: `float32` |
 | `mesh`       | `mesh(data=..., fsdp=..., tensor=...)`: the device grid | `mesh`: every device on `data` |
 | `layout`     | `layout(...)`: which mesh axes each named dimension splits over | `layout` |
@@ -274,22 +275,41 @@ backend, on the devices its `mesh` takes (see the
 ```
 run.bux        the run as one file: no modules, no alternatives; bux train takes it as is
 run.json       the IR
-metrics.jsonl  loss, lr, gradient norm and throughput every log.every steps, and eval losses
+metrics.jsonl  the log's metrics every log.every steps, and eval losses
 checkpoints/   model and optimizer state, with a checkpoint setting (orbax)
+profile/       a jax.profiler trace, with a profile setting
 ```
 
 The id is a hash of what the run computes: renaming a definition, reaching the same
-settings through another file or a sweep, logging, evaluating and checkpointing at
-other intervals, or splitting it over devices another way (`mesh`, `layout`,
+settings through another file or a sweep, logging, evaluating, checkpointing and
+profiling at other steps, or splitting it over devices another way (`mesh`, `layout`,
 `methods`) keeps it, and anything else changes it. So a changed run starts in a
 directory of its own, and an unchanged one started again resumes from its latest
 checkpoint, ending exactly where it would have.
+
+The log has the step's metrics: `loss` and every term of the objective, `grad_norm`
+before clipping, `lr`, `tokens` so far and `tokens_per_s` since the last log. On a GPU
+whose peak it knows (B300, B200, H200, H100, A100: dense bf16, from NVIDIA's
+datasheets), it also has `mfu`: the model's FLOPs a second over the peak of the
+mesh's GPUs. A step's FLOPs are counted once, before training, from the program of
+its loss's gradient on a batch, traced on shapes alone with remat and kernels off
+(`trainer.step_flops`, `bux/train/flops.py`): 2·m·n·k for every matrix product and
+convolution, times the length of every scan around it. So a new layer counts with
+no formula of its own, a rematerialized forward is not counted twice, and attention
+counts its t × t scores whole, as PaLM's MFU does, though a causal kernel computes
+half of them. `bux plan` shows the FLOPs a token: 7.7G for a Llama-style 1.3B at
+4096 tokens a row, 6 N of its matrices and 1.6G of attention.
+
+`profile = profile(start=20, steps=5)` traces the 5 steps after step 20 into
+`profile/`, waiting for the step before it starts and stops, for `xprof` or
+TensorBoard's profile plugin (`tensorboard --logdir runs/<run>/profile`).
 
 ## Speed on GPUs
 
 What XLA compiles slowly on a GPU runs by a kernel there, the same computation on a
 CPU by XLA; none of it is in a run's id. Each is in `bux.architecture` and falls back
-by itself where it cannot run:
+by itself where it cannot run, and all of them do inside `bux.kernels.off()` or with
+`BUX_KERNELS=off`, to debug one:
 
 | what | by | on a B300, against XLA |
 |------|----|------------------------|
@@ -299,15 +319,30 @@ by itself where it cannot run:
 | MoE experts | `grouped.ragged_dot`: tokamax's Mosaic and Triton kernels | 27x `jax.lax.ragged_dot` |
 | MoE dispatch | `pick_rows`, `permuted`: gathers where XLA would scatter | 4x |
 
-Tokens a second on B300s, 8 × 4096 tokens a GPU, `precision(compute=bfloat16)`:
+Tokens a second on B300s, 8 × 4096 tokens a GPU, `precision(compute=bfloat16)`, and
+the log's `mfu`:
 
 | model (d = 2048, 16 layers) | 1 GPU | 8, `mesh(fsdp=8)` |
 |-----------------------------|-------|-------------------|
-| Llama-style, 1.3B           | 147k (about 40% MFU) | 1.14M |
-| Gated DeltaNet hybrid, `"DDDA"` | 92k | 720k |
+| Llama-style, 1.3B           | 144k, 49% MFU | 1.12M, 48% |
+| Gated DeltaNet hybrid, `"DDDA"` | 93k, 30% | 720k |
 | KDA hybrid, `"KKKA"`        | 58k   |                   |
-| KDA with `gate_lower_bound=-5` | 108k |                |
-| MoE, 64 experts, top 8      | 103k  | 834k              |
+| KDA with `gate_lower_bound=-5` | 110k, 36% |            |
+| MoE, 64 experts, top 8      | 102k, 35% | 834k          |
+
+Batches go to the devices two ahead of the step (`prefetch`), and `methods(donate=true)`
+lets a step's new state take the old one's memory: the 1.3B's step then peaks at 70.5
+GiB instead of 81.1 on one GPU ([Donation](parallelism.md#donation-methodsdonate),
+which says why it is off by default).
+
+bux sets one XLA flag of its own (`bux/runtime.py`), for expert parallelism:
+`--xla_gpu_experimental_ragged_all_to_all_use_barrier_with_nccl=false`, without which
+NCCL's ragged all-to-all hangs. The flags that usually speed up collectives and
+scheduling changed nothing past the noise (1%) on the 1.3B on 1 and 8 GPUs, nor on
+the MoE on `mesh(fsdp=8)`: the latency-hiding scheduler, pipelined all-gathers,
+all-reduces and reduce-scatters, combine thresholds of 128 MiB, double-buffered while
+loops, command buffers off, Triton GEMMs off. FSDP over 8 GPUs gets 97% of 8 times
+one GPU's tokens already.
 
 ## Launching
 
@@ -348,6 +383,15 @@ SIGTERM or Ctrl-C stops training after the step it is at, and saves that step if
 run has a `checkpoint` setting; a second signal, a second or more later, stops it at
 once. The launcher exits with 0 when every run is done, 1 when one failed, and 128 + the
 signal's number when a signal stopped it.
+
+`bux train`, `bux launch` and a sweep's workers keep what they compile in JAX's
+persistent cache, in `$XDG_CACHE_HOME/bux/jax` (`~/.cache/bux/jax`), with the picks
+of XLA's GEMM autotuner next to it: a run launched again, or the next run of a sweep
+with the same program, loads its step instead of compiling it (0.5 s instead of 29
+for the MoE above on 8 B300s), and one that differs in a flag still finds the
+autotuner's picks (17 s). `JAX_COMPILATION_CACHE_DIR` says where instead, and set
+empty turns the cache off. They also put bux's XLA flags (`bux/runtime.py`) before
+`XLA_FLAGS`, a flag that it sets already keeping its value.
 
 `--index N` trains only the run at N, from 0, in the order `bux plan` lists them, so an
 array job trains a sweep a run a task: `--index $SLURM_ARRAY_TASK_ID` on Slurm, or
@@ -451,6 +495,14 @@ the layers that report the name, under that name; eval leaves them out.
 overrides them changes what a step does (averaging the weights, skipping a spike) and
 keeps the loop, the hooks and checkpoints. Gradient accumulation is built in:
 `methods(microbatches=n)`.
+
+With `Trainer(..., donate=True)`, as `methods(donate=true)` makes it, a training
+step donates the model's and the optimizer's arrays: an array read from
+`trainer.model` before a step is gone after it, so a hook that keeps one keeps a
+copy (`np.asarray`). `fit` reads `data` through `prefetch` (`bux/train/data.py`),
+a thread that puts the next two batches on the devices while a step runs; a run
+that resumes still reads from its step on, and an error reading a batch is raised at
+that batch.
 
 ## Design notes
 
