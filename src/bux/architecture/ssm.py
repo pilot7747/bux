@@ -4,7 +4,8 @@ Under tensor parallelism (``bux.parallel``) their channels split, Mamba's and th
 conv's over `mlp` and Mamba-2's over `heads`, and so does every parameter of a channel
 or a head: the scan runs on each device's own. Their input projections are fused (u
 and the gate side by side), so they stay whole, and every device computes them. The
-selective scan runs by the run's `methods.recurrence`, as linear attention does.
+selective scan runs by the run's `methods.recurrence`, as linear attention does, and
+Mamba-2's by linear attention's chunks of positions (``chunkwise``).
 """
 
 import math
@@ -17,6 +18,7 @@ from jaxtyping import Array, Float
 
 from bux import config as cfg
 from bux import parallel
+from bux.architecture import chunkwise
 from bux.architecture.conv import CausalConv
 from bux.architecture.norm import Norm
 from bux.architecture.registry import Context, Taps, register, segments
@@ -78,9 +80,25 @@ def _step(
 
 
 def chunk(xs: Positions, shared: Shared, transition: bool) -> Chunk:
-    """Run `selective_scan` over a chunk of positions from a zero state, by a scan in
-    float32, its state n by p per head, as keys by values. With `transition`, also
-    return the product P of every position's exp(dt A), and each output's reads P C."""
+    """Run `selective_scan` over a chunk of positions from a zero state, in float32,
+    its state n by p per head, as keys by values. With `transition`, also return the
+    product P of every position's exp(dt A), and each output's reads P C.
+
+    With one A per head, as Mamba-2's, it is decayed linear attention with q = C,
+    k = dt B, v = x and a log decay of dt A a head: by smaller chunks, with matmuls
+    within each (``chunkwise``). Mamba's, one A per channel and state dim, runs
+    `stepwise`."""
+    if shared[0].shape[-1] > 1:
+        return stepwise(xs, shared, transition)
+    x, dt, B, C, keep = (a.astype(jnp.float32) for a in xs)
+    per_group = x.shape[2] // B.shape[2]
+    B, C = (jnp.repeat(y, per_group, axis=2) for y in (B, C))
+    log_decay = dt[..., None] * shared[0].astype(jnp.float32)
+    return chunkwise.chunk((C, dt[..., None] * B, x, log_decay, keep), transition)
+
+
+def stepwise(xs: Positions, shared: Shared, transition: bool) -> Chunk:
+    """Run `chunk` one position at a time: a scan in float32, Mamba-2's reference."""
     x, dt, B, C, keep = (jnp.moveaxis(a.astype(jnp.float32), 1, 0) for a in xs)
     A = shared[0].astype(jnp.float32)
     _, b, h, p = x.shape
