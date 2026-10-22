@@ -4,7 +4,8 @@ Under tensor parallelism (``bux.parallel``) their channels split, Mamba's and th
 conv's over `mlp` and Mamba-2's over `heads`, and so does every parameter of a channel
 or a head: the scan runs on each device's own. Their input projections are fused (u
 and the gate side by side), so they stay whole, and every device computes them. The
-selective scan runs by the run's `methods.recurrence`, as linear attention does.
+selective scan runs by the run's `methods.recurrence`, as linear attention does, and
+Mamba-2's by linear attention's chunks of positions (``chunkwise``).
 """
 
 import math
@@ -17,12 +18,12 @@ from jaxtyping import Array, Float
 
 from bux import config as cfg
 from bux import parallel
-from bux.architecture import remat
+from bux.architecture import chunkwise, remat
 from bux.architecture.conv import CausalConv
 from bux.architecture.norm import Norm
 from bux.architecture.registry import Context, Taps, register, segments
 from bux.architecture.segments import Segments
-from bux.architecture.sharding import shard_layer_input
+from bux.architecture.sharding import projection, shard_layer_input
 from bux.lang import ir
 from bux.parallel.recurrence import Chunk, Positions, Recurrence, Shared
 
@@ -35,16 +36,17 @@ def selective_scan(
     C: Float[Array, "b t g n"],
     docs: Segments | None = None,
 ) -> Float[Array, "b t h p"]:
-    """Run the selective scan, one position at a time. Each of the h heads keeps an n
-    by p state S, and at every position
+    """Run the selective scan. Each of the h heads keeps an n by p state S, and at
+    every position
 
         S = exp(dt A) S + B (dt x)^T,    y = S^T C,
 
     with the heads in g groups that share B and C, as kv heads share keys in GQA. Mamba
-    has one head per channel (p = 1) and one A per channel and state dim; Mamba-2 has
-    one A per head (n = 1 in A). The state starts at zero, and again where a document
-    starts. It runs by the run's `methods.recurrence`, in float32, the outputs in x's
-    dtype, named `recurrence` (``remat.named``)."""
+    has one head per channel (p = 1) and one A per channel and state dim, and runs one
+    position at a time; Mamba-2 has one A per head (n = 1 in A), and runs by chunks
+    (`chunk`). The state starts at zero, and again where a document starts. It runs by
+    the run's `methods.recurrence`, in float32, the outputs in x's dtype, named
+    `recurrence` (``remat.named``)."""
     b, t = x.shape[:2]
     within = jnp.ones((b, t), jnp.int32) if docs is None else docs.within
     keep = (within > 0).astype(jnp.float32)  # 0 where a document starts
@@ -55,6 +57,22 @@ def selective_scan(
 
     y = remat.named("recurrence", scan, (x, dt, B, C, keep), (A,))
     return y.astype(x.dtype)
+
+
+def chunk(xs: Positions, shared: Shared, transition: bool) -> Chunk:
+    """Run `selective_scan` over a chunk of positions from a zero state, in float32,
+    its state n by p per head, as keys by values. With `transition`, also return the
+    product P of every position's exp(dt A), and each output's reads P C.
+
+    With one A per head, as Mamba-2's, it is decayed linear attention with q = C and
+    k = B, a group's, v = dt x and a log decay of dt A a head: by smaller chunks, with
+    matmuls within each (``chunkwise``). Mamba's, one A per channel and state dim,
+    runs `stepwise`."""
+    if shared[0].shape[-1] > 1:
+        return stepwise(xs, shared, transition)
+    x, dt, B, C, keep = (a.astype(jnp.float32) for a in xs)
+    log_decay = dt[..., None] * shared[0].astype(jnp.float32)
+    return chunkwise.chunk((C, B, dt[..., None] * x, log_decay, keep), transition)
 
 
 _At = tuple[
@@ -83,10 +101,8 @@ def _step(
     return (state, P), (y, P * C)
 
 
-def chunk(xs: Positions, shared: Shared, transition: bool) -> Chunk:
-    """Run `selective_scan` over a chunk of positions from a zero state, by a scan in
-    float32, its state n by p per head, as keys by values. With `transition`, also
-    return the product P of every position's exp(dt A), and each output's reads P C."""
+def stepwise(xs: Positions, shared: Shared, transition: bool) -> Chunk:
+    """Run `chunk` one position at a time: a scan in float32, Mamba-2's reference."""
     x, dt, B, C, keep = (jnp.moveaxis(a.astype(jnp.float32), 1, 0) for a in xs)
     A = shared[0].astype(jnp.float32)
     _, b, h, p = x.shape
@@ -116,7 +132,7 @@ def _out(
 ) -> nnx.Linear:
     """Make the projection of n channels named `name` back to the width."""
     init = parallel.named(name, "embed")
-    return nnx.Linear(n, width, use_bias=bias, kernel_init=init, rngs=rngs)
+    return projection(n, width, use_bias=bias, kernel_init=init, rngs=rngs)
 
 
 def shard_fused(y: Float[Array, "b t c"]) -> Float[Array, "b t c"]:
@@ -148,9 +164,9 @@ class Mamba(nnx.Module):
         d_inner, n = config.expand * width, config.state_size
         r = config.dt_rank or math.ceil(width / 16)
         self.rank, self.state_size = r, n
-        self.in_proj = nnx.Linear(width, 2 * d_inner, use_bias=False, rngs=rngs)
+        self.in_proj = projection(width, 2 * d_inner, use_bias=False, rngs=rngs)
         self.conv = CausalConv(d_inner, config.conv_size, True, rngs, channel="mlp")
-        self.x_proj = nnx.Linear(
+        self.x_proj = projection(
             d_inner,
             r + 2 * n,
             use_bias=False,
@@ -211,7 +227,7 @@ class Mamba2(nnx.Module):
             )
         self.inner, self.heads, self.head_dim = d_inner, h, config.head_dim
         self.groups, self.state_size = g, n
-        self.in_proj = nnx.Linear(
+        self.in_proj = projection(
             width, 2 * d_inner + 2 * g * n + h, use_bias=False, rngs=rngs
         )
         # Over u, B and C side by side, as the projection gives them: whole.
@@ -251,7 +267,7 @@ class ShortConv(nnx.Module):
 
     def __init__(self, config: cfg.ShortConvConfig, width: int, rngs: nnx.Rngs):
         bias = config.bias
-        self.in_proj = nnx.Linear(width, 3 * width, use_bias=bias, rngs=rngs)
+        self.in_proj = projection(width, 3 * width, use_bias=bias, rngs=rngs)
         self.conv = CausalConv(width, config.conv_size, bias, rngs, channel="mlp")
         self.out_proj = _out(width, width, "mlp", bias, rngs)
 

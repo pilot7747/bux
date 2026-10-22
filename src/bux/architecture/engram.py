@@ -14,6 +14,7 @@ from bux import parallel
 from bux.architecture.conv import CausalConv
 from bux.architecture.norm import Norm
 from bux.architecture.registry import Context, Taps, register, segments
+from bux.architecture.sharding import projection
 from bux.lang import ir
 
 
@@ -97,7 +98,7 @@ class Engram(nnx.Module):
         init = nnx.initializers.normal(1.0)
         table = init(ctx.rngs.params(), (sum(primes), head_dim))
         self.table = nnx.Param(table, names=("vocab", None))
-        self.kv = nnx.Linear(
+        self.kv = projection(
             orders * heads * head_dim, (copies + 1) * d, use_bias=False, rngs=ctx.rngs
         )
         norm, size = config.norm, config.conv_size

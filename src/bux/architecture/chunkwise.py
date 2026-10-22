@@ -15,7 +15,8 @@ outputs and the state the chunk ends with are affine in S_0 too:
     o = R S_0 + O,    S_C = A S_0 + B.
 
 Every chunk's R, O, A and B come from matmuls over all chunks at once, and a scan over
-the chunks then carries the state. Nothing before a document's start reaches it.
+the chunks then carries the state; for one decay a head, a matmul over them. Nothing
+before a document's start reaches it.
 
 No exponent here is positive: a decay per key channel factors through the end of a
 block of `SUB` positions between s and t, and within a block it is taken one pair at a
@@ -37,6 +38,7 @@ SIZE = 64  # positions per chunk
 SUB = 16  # positions per block of a chunk, for a decay per key channel
 
 Chunks = Float[Array, "b n h c _"]  # (b, n, h, C, ...): n chunks of C positions
+Grouped = Float[Array, "b n g c _"]  # chunks of g heads, or of groups of h
 Pairs = Float[Array, "b n h c c"]  # of each position of a chunk with each
 States = Float[Array, "b n h dk dv"]  # one state per chunk
 Maps = Float[Array, "b n h dk dk"] | Float[Array, "b n h _"]  # A per chunk, or diagonal
@@ -46,15 +48,21 @@ def chunk(xs: Positions, transition: bool, size: int = SIZE, sub: int = SUB) -> 
     """Run ``linear_attention.chunk``'s `xs` (q, k, v, log decay, continues, and a
     and b if any) from a zero state, in float32, by chunks of `size` positions; with
     `transition`, also return its map of a start state, and the reads. The delta
-    rule's xs have a and no b, which is k: `_delta` takes them in half the work."""
+    rule's xs have a and no b, which is k: `_delta` takes them in half the work. With
+    one decay a head and no a or b, q and k may be of fewer heads than v, each shared
+    by a group of them, as Mamba-2's C and B: `_scalar` takes them."""
     delta = len(xs) == 6
     xs = tuple(shard_whole_positions(x) for x in xs)
     q, k, v, g, *ab = (_split(x.astype(jnp.float32), size) for x in xs[:4] + xs[5:])
     starts = 1 - xs[4].astype(jnp.float32)  # 1 where a document starts
     seg = jnp.cumsum(_split(starts[..., None, None], size)[:, :, :, :, 0], -1)
-    affine = _delta if delta else _affine
-    R, O, A, B = affine(q, k, v, g, seg, *ab[: 1 if delta else 2], sub=min(sub, size))
-    out, state, P, reads = _across(R, O, A, B, transition)
+    if g.shape[-1] == 1 and not ab:
+        out, state, P, reads = _scalar(q, k, v, g, seg, transition)
+    else:
+        affine = _delta if delta else _affine
+        ab = ab[: 1 if delta else 2]
+        R, O, A, B = affine(q, k, v, g, seg, *ab, sub=min(sub, size))
+        out, state, P, reads = _across(R, O, A, B, transition)
     t = xs[0].shape[1]
     reads = None if reads is None else shard_whole_positions(_merge(reads, t))
     return Chunk(shard_whole_positions(_merge(out, t)), state, P, reads)
@@ -155,9 +163,52 @@ def _delta(
     return jnp.where(reach, q * jnp.exp(G), 0) + M @ W, M @ X, A, kd @ X
 
 
+def _scalar(
+    q: Grouped,
+    k: Grouped,
+    v: Chunks,
+    g: Chunks,
+    seg: Float[Array, "b n 1 c"],
+    transition: bool,
+) -> tuple[Chunks, Float[Array, "b h dk dv"], Transition | None, Chunks | None]:
+    """Return `_across`'s outputs, end state, P and reads for one decay a head and no
+    a or b, where q and k may be of groups of v's heads. The decays scale v and the
+    outputs, not q and k, so that a group's q and k reach all its heads at once: what
+    a chunk adds to the state is K^T V of every head of a group in one matmul, and so
+    is what its outputs read of the state before it, which `_passed` gives."""
+    G, _, end, reach, same, tail = _decays(g, seg)
+    O = _pairwise(q, k, G, G, same, False, 1) @ v
+    vd = jnp.where(tail, v * jnp.exp(end - G), 0)  # Gamma(C, s) v_s
+    adds = _by_group(jnp.swapaxes(k, -1, -2), vd)
+    # Each chunk's log decay: -inf across a document start, which its log would
+    # take from a decay of 0 at an infinite slope.
+    log = jnp.where(reach[..., -1, 0], end[..., 0, 0], -jnp.inf)
+    before, S, P, starts = _passed(log, adds)
+    decay = jnp.where(reach, jnp.exp(G), 0)  # Gamma(t, 0)
+    out = O + decay * _by_group(q, before)
+    if not transition:
+        return out, S, None, None
+    return out, S, P, _shared(q, v.shape[2]) * decay * starts[..., None, None]
+
+
+# A plain matmul: on a B300, XLA's Triton fusions of the einsum's gradients and the
+# pairs' took C's and B's gradients wrong at Mamba-2's shapes.
+def _by_group(
+    x: Float[Array, "b n g i j"], y: Float[Array, "b n h j e"]
+) -> Float[Array, "b n h i e"]:
+    """Return x @ y for every head of y, x of its group: one matmul a group, its
+    heads' columns side by side."""
+    b, n, h, j, e = y.shape
+    groups = x.shape[2]
+    split = y.reshape(b, n, groups, h // groups, j, e)
+    columns = jnp.moveaxis(split, 3, 4).reshape(b, n, groups, j, -1)
+    out = (x @ columns).reshape(b, n, groups, x.shape[3], h // groups, e)
+    return jnp.moveaxis(out, 4, 3).reshape(b, n, h, x.shape[3], e)
+
+
 def _pairwise(
-    x: Chunks,
-    y: Chunks,
+    x: Grouped,
+    y: Grouped,
     gx: Chunks,
     gy: Chunks,
     same: Bool[Array, "b n 1 c c"],
@@ -165,15 +216,21 @@ def _pairwise(
     sub: int,
 ) -> Pairs:
     """Return sum_c x[t, c] y[s, c] exp(gx[t, c] - gy[s, c]) for s before t (or at t,
-    unless `strict`) of the `same` document, else 0; gx <= gy at every such pair."""
+    unless `strict`) of the `same` document, else 0; gx <= gy at every such pair. With
+    one decay per head, x and y may be of groups of gx's heads."""
     c = x.shape[-2]
     index = jnp.arange(c)
     lower = index[:, None] > index[None, :] if strict else index[:, None] >= index
     visible = same & lower
     if gx.shape[-1] == 1:  # one decay per head: a matmul, then the decays
         gap = jnp.where(visible, gx - jnp.swapaxes(gy, -1, -2), -jnp.inf)
-        return (x @ jnp.swapaxes(y, -1, -2)) * jnp.exp(gap)
+        return _shared(x @ jnp.swapaxes(y, -1, -2), gx.shape[2]) * jnp.exp(gap)
     return jnp.where(visible, _channels(x, y, gx, gy, lower, sub), 0)
+
+
+def _shared(x: Float[Array, "b n g ..."], heads: int) -> Float[Array, "b n h ..."]:
+    """Share each group's x, (b, n, groups, ...), out to its heads."""
+    return jnp.repeat(x, heads // x.shape[2], axis=2)
 
 
 # Rematerialized: a pair's decays, sub times the input, would stay for the backward.
@@ -297,6 +354,29 @@ def _across(
     (S, P), (out, reads) = jax.lax.scan(step, (jnp.zeros_like(B[0]), P), (R, O, A, B))
     reads = None if reads is None else jnp.moveaxis(reads, 0, 1)
     return jnp.moveaxis(out, 0, 1), S, P, reads
+
+
+def _passed(
+    log: Float[Array, "b n h"], B: States
+) -> tuple[
+    States, Float[Array, "b h dk dv"], Float[Array, "b h 1"], Float[Array, "b n h"]
+]:
+    """Return, from each chunk's log decay, the state before each chunk and after the
+    last, and the product of the chunks' decays, and of those before each. The states
+    are one matmul of what the chunks add, by the decays of the chunks between (SSD's
+    state passing), where a scan would take a chunk at a time."""
+    index = jnp.arange(log.shape[1])
+    later = (index[:, None] > index)[:, None]  # (n, 1, n): chunk i or l after j
+    # The log decays of the chunks l after j up to i, at [i, j], by sums, not
+    # differences, which -inf at a document start would make nan; then up to i - 1.
+    upto = jnp.cumsum(jnp.where(later, log[..., None], 0), 1)
+    between = jnp.pad(upto, [(0, 0), (1, 0), (0, 0), (0, 0)])[:, :-1]
+    decays = jnp.where(later, jnp.exp(between), 0)
+    before = jnp.einsum("bihj,bjhkv->bihkv", decays, B)
+    S = jnp.exp(log[:, -1, :, None, None]) * before[:, -1] + B[:, -1]
+    total = jnp.cumsum(log, 1)
+    starts = jnp.exp(jnp.pad(total, [(0, 0), (1, 0), (0, 0)])[:, :-1])
+    return before, S, jnp.exp(total[:, -1, :, None]), starts
 
 
 def _then(A: Transition, S: Float[Array, "b h *rest"]) -> Float[Array, "b h *rest"]:

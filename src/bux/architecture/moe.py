@@ -221,7 +221,9 @@ class MoE(nnx.Module):
         self.config = config
         # With shared_expert_sink, the router scores the shared experts too, last.
         sinks = config.num_shared_experts if config.shared_expert_sink else 0
-        self.router = linear(width, n + sinks, ("embed", None), False, rngs)
+        self.router = linear(
+            width, n + sinks, ("embed", None), False, rngs, in_compute=True
+        )
         aux_free = config.load_balancing == "aux_free"
         self.router_bias = nnx.Variable(jnp.zeros(n)) if aux_free else None
         # The picks of each expert since the bias last moved; with `update_at_step_end`
@@ -255,7 +257,7 @@ class MoE(nnx.Module):
         self.expert_norm = _norm(config.expert_norm, latent)
         self.shared = _shared_experts(config, width, rngs)
         self.shared_gate = (
-            linear(width, 1, ("embed", None), False, rngs)
+            linear(width, 1, ("embed", None), False, rngs, in_compute=True)
             if config.shared_expert_gate
             else None
         )

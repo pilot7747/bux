@@ -6,6 +6,7 @@ import itertools
 import json
 import re
 import shutil
+import threading
 from pathlib import Path
 
 import jax
@@ -24,8 +25,9 @@ from bux.architecture import Model
 from bux.data.pipeline import jobs
 from bux.lang import compile, compile_runs
 from bux.train import config as tcfg
-from bux.train.data import batches, plain
-from bux.train.hooks import Hook, Log
+from bux.train import flops
+from bux.train.data import batches, plain, prefetch
+from bux.train.hooks import Hook, Log, Profile
 from bux.train.objective import (
     Term,
     cross_entropy,
@@ -46,7 +48,7 @@ from bux.train.optim import (
     whole_matrix_spec,
 )
 from bux.train.sinks import LatestMetrics, Sink
-from bux.train.trainer import Trainer, directory, train
+from bux.train.trainer import Trainer, directory, step_flops, train
 
 SMOKE = Path(__file__).parent.parent / "examples" / "experiments" / "smoke.bux"
 
@@ -303,6 +305,25 @@ def test_a_mixture_draws_in_proportion(tmp_path):
     assert tokens[:, 0].mean() == 0.25
 
 
+def test_prefetch_keeps_the_order_raises_what_its_thread_met_and_stops_when_closed():
+    def shards():
+        yield from range(3)
+        raise FileNotFoundError("no shards match")
+
+    early = prefetch(shards(), lambda x: 10 * x)
+    assert [next(early) for _ in range(3)] == [0, 10, 20]
+    with pytest.raises(FileNotFoundError, match="no shards match"):
+        next(early)
+    assert list(prefetch(iter("ab"), str.upper)) == ["A", "B"]
+    put: list[int] = []
+    threads = threading.active_count()
+    endless = prefetch(itertools.count(), lambda x: put.append(x) or x, ahead=2)
+    assert next(endless) == 0
+    endless.close()
+    assert len(put) <= 4  # the one taken, the two ahead, and one on its way
+    assert threading.active_count() == threads
+
+
 def test_heads_predict_further_ahead_after_each_nextn():
     arch = compile(
         ARCH + "mtp = $h! nextn [norm ffn] norm @h head\n"
@@ -354,6 +375,8 @@ def test_a_run_writes_its_directory_and_resumes_where_it_stopped(tmp_path):
         "log = log(every=1)",
         "checkpoint = checkpoint(every=3)",
         "eval = eval(data=synthetic, every=3, batches=2)",
+        "ffn.dropout = 0.1",  # whose random keys the checkpoint keeps
+        "methods = methods(donate=true)",  # saved, then donated to the next step
     )
     whole = train(run, tmp_path, echo=lambda _: None)
     folder = directory(run, tmp_path)
@@ -379,6 +402,18 @@ def test_a_run_writes_its_directory_and_resumes_where_it_stopped(tmp_path):
     assert (
         resumed["loss"] == whole["loss"] and resumed["grad_norm"] == whole["grad_norm"]
     )
+
+
+def test_a_profile_traces_its_steps_into_the_run_s_directory_and_keeps_its_id(
+    tmp_path,
+):
+    run = smoke("steps = 4", "profile = profile(start=1, steps=2)")
+    assert run.id == smoke("steps = 4").id
+    train(run, tmp_path, echo=lambda _: None)
+    traces = (directory(run, tmp_path) / "profile").rglob("*.xplane.pb")
+    assert len(list(traces)) == 1
+    hook = Profile(tmp_path, start=1, steps=2)
+    assert [s for s in range(1, 5) if hook.due(s, 4)] == [1, 3]
 
 
 def test_a_run_trains_on_text_that_it_prepares_first(tmp_path, byte_tokenizer):
@@ -443,6 +478,58 @@ def test_a_trainer_takes_terms_hooks_and_sinks_of_ones_own():
     assert trainer.step == 3
     assert [s for s, _ in steps.reports] == [1, 2, 2, 3, 3]  # log, then weight norm
     assert {"loss", "logit_l2", "grad_norm", "lr", "weight_norm"} <= set(latest.metrics)
+
+
+def test_a_step_s_flops_are_counted_from_its_program():
+    """The smoke run's: 6 N of its matrices, and 12 L d t of attention (PaLM's)."""
+    matrices = 2 * (2 * 64 * 64 + 2 * 64 * 32 + 3 * 64 * 256) + 64 * 512
+    attention = 12 * 2 * 64 * 64  # layers, heads × head_dim, positions
+    assert step_flops(smoke()) == (6 * matrices + attention) * 8 * 64
+    x, w, sizes = jnp.ones((6, 8)), jnp.ones((3, 8, 5)), jnp.array([1, 2, 3])
+    grad = jax.grad(lambda x, w: jax.lax.ragged_dot(x, w, sizes).sum(), (0, 1))
+    assert flops.count(grad, x, w) == 3 * 2 * 6 * 8 * 5
+
+    def scan(c):
+        return jax.lax.scan(lambda c, _: (c @ x.T @ x, None), c, length=5)[0]
+
+    assert flops.count(scan, jnp.ones((4, 8))) == 5 * 2 * (2 * 4 * 6 * 8)
+    depthwise = functools.partial(
+        jax.lax.conv_general_dilated,
+        window_strides=(1,),
+        padding="VALID",
+        feature_group_count=6,
+    )
+    ones = jnp.ones((2, 6, 10)), jnp.ones((6, 1, 3))
+    assert flops.count(depthwise, *ones) == 2 * (2 * 6 * 8) * 3
+
+
+def test_the_log_reports_mfu_where_the_devices_peak_is_known():
+    assert flops.peak(jax.devices()[0].device_kind) is None  # a CPU's
+    assert flops.peak("NVIDIA B300 SXM6 AC") == 2.25e15
+    arch = compile(ARCH + "model = embed block norm head\n")
+    loss = objective(tcfg.LossConfig(), arch)
+    trainer = Trainer(Model(arch, rngs=nnx.Rngs(0)), optax.adamw(1e-3), loss)
+    lr = lr_multiplier(tcfg.ConstantSchedule(), 2)
+    data = batches(tcfg.SyntheticConfig(), rows(tcfg.SyntheticConfig(), 2, 8), 32)
+    latest = LatestMetrics()
+    log = Log(every=1, lr=lr, tokens=16, flops=4e6, peak=1e9)
+    trainer.fit(data, 2, hooks=[log], sinks=[latest])
+    steps_per_s = latest.metrics["tokens_per_s"] / 16
+    assert latest.metrics["mfu"] == pytest.approx(steps_per_s * 4e6 / 1e9)
+
+
+@pytest.mark.parametrize("donate", [False, True])
+def test_a_step_that_donates_takes_the_memory_of_the_state_it_replaces(donate):
+    arch = compile(ARCH + "model = embed block norm head\n")
+    loss = objective(tcfg.LossConfig(), arch)
+    model = Model(arch, rngs=nnx.Rngs(0))
+    trainer = Trainer(model, optax.adamw(1e-3), loss, donate=donate)
+    data = batches(tcfg.SyntheticConfig(), rows(tcfg.SyntheticConfig(), 2, 8), 32)
+    batch = jax.device_put(next(data))
+    step = trainer._train.lower(trainer.model, trainer.optimizer, batch).compile()
+    state = sum(x.nbytes for x in jax.tree.leaves(trainer.state()))
+    memory = step.memory_analysis()
+    assert memory is not None and memory.alias_size_in_bytes == donate * state
 
 
 def test_a_run_reports_what_hooks_of_ones_own_return(tmp_path):

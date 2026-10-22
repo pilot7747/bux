@@ -2,6 +2,9 @@
 the reference, a position at a time: outputs, end states, transitions and reads, and
 gradients, over chunks and blocks smaller than the documents and larger."""
 
+import importlib.util
+from pathlib import Path
+
 import jax
 import jax.numpy as jnp
 import numpy as np
@@ -76,6 +79,31 @@ def test_chunks_differentiate_as_positions_do(decay, rank_one, strong):
     for i, (a, b) in enumerate(zip(*grads, strict=True)):
         assert bool(jnp.isfinite(a).all()), i
         np.testing.assert_allclose(a, b, atol=5e-5, rtol=5e-5, err_msg=str(i))
+
+
+@pytest.mark.parametrize("strong", [False, True])
+@pytest.mark.parametrize(("size", "sub"), [(4, 2), (64, 16)])
+def test_q_and_k_of_a_group_are_its_heads(strong, size, sub):
+    """With one decay a head, one q and k for both heads, as Mamba-2's C and B."""
+    q, k, v, g, continues = _inputs(1, False, strong)
+    q, k = q[:, :, :1], k[:, :, :1]
+    got = chunkwise.chunk((q, k, v, g, continues), True, size, sub)
+    shared = (jnp.repeat(q, H, 2), jnp.repeat(k, H, 2), v, g, continues)
+    want = stepwise(shared, (), True)
+    for name in ("out", "state", "transition", "reads"):
+        a, b = getattr(got, name), getattr(want, name)
+        np.testing.assert_allclose(a, b, atol=2e-5, rtol=2e-5, err_msg=name)
+
+
+def test_the_gpu_smoke_script_compares_every_form_on_cpu(monkeypatch):
+    path = Path(__file__).parent.parent / "scripts" / "gpu_smoke" / "recurrence.py"
+    spec = importlib.util.spec_from_file_location("gpu_smoke_recurrence", path)
+    assert spec is not None and spec.loader is not None
+    smoke = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(smoke)
+    monkeypatch.setattr(smoke, "T", 150)  # chunks of 64 and a part of one
+    for case in smoke.CASES:
+        assert max(smoke.errors(case)) < smoke.TOLERANCE, case
 
 
 def test_keys_alike_with_steps_near_one_stay_finite():

@@ -17,7 +17,7 @@ from jax.experimental import pallas as pl
 from jax.sharding import PartitionSpec as P
 from jaxtyping import Array, Float, Int
 
-from bux import parallel
+from bux import kernels, parallel
 
 BLOCK = 32  # columns of the state a program carries
 WARPS = 8
@@ -64,7 +64,7 @@ def _kernel_runs(k: int, v: int) -> bool:
     """Return whether the kernel runs: on a GPU, where its tiles, k by k and k by
     BLOCK, divide as Triton needs."""
     fits = k >= 16 and k & (k - 1) == 0 and v % BLOCK == 0
-    return jax.default_backend() == "gpu" and fits
+    return kernels.gpu() and fits
 
 
 def _reference(

@@ -66,22 +66,25 @@ when Slurm, Open MPI or `JAX_NUM_PROCESSES` say so
 ([Launching](training.md#launching)). The mesh then spans every process's devices,
 and `parallel.shard_batch` builds a batch with `jax.make_array_from_callback`: every
 process makes all of it, as it depends only on the seed and the step, and puts the
-rows its own devices hold. `tests/test_launch.py` trains the smoke run as two
+rows its own devices hold, two batches ahead in a thread of its own (`prefetch`),
+which takes no part in collectives. `tests/test_launch.py` trains the smoke run as two
 processes of 4 CPU devices each, through `jax.distributed` on localhost, as one
 process of 8 does.
 
-`bux plan` shows what each run takes before it starts: its GPUs, the bytes of its
-parameters and of its optimizer's state on each, and the share of a step its
-pipeline's stages idle ([below](#pipelines-methodspipeline)). The bytes come from
-`parallel.shardings` of the model built over a `jax.sharding.AbstractMesh`, which
-`parallel.use` takes as it does a mesh, so the plan needs no devices:
+`bux plan` shows what each run takes before it starts: its FLOPs a token
+([the log](training.md#running)), its GPUs, the bytes of its parameters and of its
+optimizer's state on each, and the share of a step its pipeline's stages idle
+([below](#pipelines-methodspipeline)). The bytes come from `parallel.shardings` of
+the model built over a `jax.sharding.AbstractMesh`, which `parallel.use` takes as it
+does a mesh, so the plan needs no devices. They are the state's alone: a step's
+activations and new state come on top.
 
 ```
 $ bux plan examples/experiments/smoke.bux 'mesh = fsdp: mesh(fsdp=8) | one: mesh(data=1)'
 2 runs
-id          params  tokens  tok/param  gpus  params/gpu  optim/gpu  bubble  run
-bbbf3ae709  156k    25.6k   0.2        8     76.2KiB     152KiB     0%      smoke[fsdp]
-bbbf3ae709  156k    25.6k   0.2        1     609KiB      1.19MiB    0%      smoke[one]
+id          params  tokens  tok/param  flops/tok  gpus  params/gpu  optim/gpu  bubble  run
+bbbf3ae709  156k    25.6k   0.2        1.03M      8     76.2KiB     152KiB     0%      smoke[fsdp]
+bbbf3ae709  156k    25.6k   0.2        1.03M      1     609KiB      1.19MiB    0%      smoke[one]
 ```
 
 ## Names
@@ -465,9 +468,17 @@ what the `shard_map`s' transposes sum is float32.
 A chunk runs by `chunkwise` (`bux.architecture.chunkwise`), the form of fla's chunked
 kernels, under every method: matmuls within chunks of 64 positions, and a scan of the
 state across them, by a Pallas kernel on a GPU (`affine_scan`). `stepwise`, a scan
-over positions, is its reference. Under `scan`, the delta rule of a gate bounded at
+over positions, is its reference. With one decay a head, the state passes across the
+chunks by a matmul (SSD's state passing), and q and k may be shared by groups of heads.
+Mamba-2's selective scan runs so, as decayed linear attention with `q = C` and `k = B`
+of its groups, `v = dt x` and a log decay `dt A` a head, and `ssm.stepwise` is its
+reference; Mamba's, a decay per channel and state dim, runs by that scan over
+positions. Under `scan`, the delta rule of a gate bounded at
 -5 or above (KDA's `gate_lower_bound`, DeltaNet's none) runs by cuDNN's fused KDA
 kernel on a B200 or B300 instead (`fused_delta`); it overflows below -5.
+`scripts/gpu_smoke/recurrence.py` checks the forms against their scans on a GPU,
+whose fusions the CPU tests do not see: on a B300 one took Mamba-2's gradients for B
+and C wrong, which a plain matmul in its place does not.
 
 Not yet: a `ppermute` chain instead of the all-gather, which holds every device's
 transitions (`c` matrices `k × k` per head) on each.
@@ -595,7 +606,9 @@ On 8 B300s (`scripts/gpu_smoke/experts.py`, a small MoE), every method computes 
 one GPU does; `sorted` is the fastest there, 400k tokens a second, then `all_gather`
 and `all_to_all` (335k), then `ragged_all_to_all` (270k). On jax 0.12 NCCL's ragged
 all-to-all hangs unless XLA_FLAGS has
-`--xla_gpu_experimental_ragged_all_to_all_use_barrier_with_nccl=false`.
+`--xla_gpu_experimental_ragged_all_to_all_use_barrier_with_nccl=false`, which
+`bux train` and `bux launch` add to it, and so does `bux.runtime.configure()` in a
+script that calls it before it touches a device.
 
 ## Muon: `methods.orthogonalize`
 
@@ -782,7 +795,8 @@ methods   = methods(microbatches=4)       # gradient accumulation: not in it
 
 Unlike the settings above, `precision` changes what a run computes, so it is in the
 run's id: `precision.compute = float32 | bfloat16` is a sweep of two runs. `compute` is
-`float32` or `bfloat16`; float16 would need loss scaling.
+`float32` or `bfloat16`; float16 would need loss scaling. `matmuls` is the format the
+projections inside blocks multiply in, `compute` unless it says `mxfp8` or `nvfp4`.
 
 ### Precision
 
@@ -803,11 +817,12 @@ Float32 islands compute from what they are given in float32, and give back its d
 | the head                                        | its logits, from its matmul in `compute` (tied or not) accumulated in float32; the softcap, the softmax and the loss |
 
 Softmax attention takes its softmax in float32, under every method of
-`methods.attention`. Every other matmul runs in `compute`, and the stream stays in it
-from the embedding to the heads, which `tests/test_precision.py` checks for every
-family. Gradients are reduced over the batch axes in the dtype the backward makes
-them, bfloat16 for a weight's, but the head's kernel's, which adds up over the chunks
-of the loss in float32; they add up over microbatches in float32.
+`methods.attention`. Every other matmul runs in `compute`, or in the format of
+`matmuls` (below), and the stream stays in `compute` from the embedding to the heads,
+which `tests/test_precision.py` checks for every family. Gradients are reduced over the
+batch axes in the dtype the backward makes them, bfloat16 for a weight's, but the head
+kernel's under `methods(loss=chunks)`, which adds up over the chunks in float32; they
+add up over microbatches in float32.
 
 XLA:CPU fails to compile a bfloat16 `psum` that a `shard_map`'s transpose makes (its
 reducer ends in a copy, which `ChangeOpDataType` cannot clone), and aborts the process.
@@ -815,6 +830,63 @@ The MoE's `sorted` and EP methods make one on more than one device, and so do th
 pipelines; `ring`, `ulysses` and `pass_state` train in bfloat16 on CPU. The tests split
 bfloat16 runs with `methods(moe=dense)` and no pipeline. GPUs all-reduce bfloat16
 natively, which this has not been run on.
+
+### Matmul formats
+
+```
+precision = precision(compute=bfloat16, matmuls=mxfp8)
+```
+
+`matmuls` names a format of the registry in `bux.architecture.matmuls`. A block-scaled
+format quantizes the operands of all three GEMMs of y = x W, the forward's and the
+backward's two, each along what its GEMM contracts, in blocks with a scale each
+(`bux.architecture.blockscaled`):
+
+| format    | values  | a scale per                                   | and                                       |
+|-----------|---------|-----------------------------------------------|-------------------------------------------|
+| `compute` | `compute` | none                                        | the default                               |
+| `mxfp8`   | E4M3    | 32, a power of two (E8M0)                     | dy in E4M3 too, as Transformer Engine's MXFP8 recipe |
+| `nvfp4`   | E2M1    | 16 (E4M3), and the tensor (float32); W's per 16 x 16 tile, so that y and dx see the same W | dy rounded stochastically, and x and dy transformed for dW by a random Hadamard transform of 16, as NVIDIA's NVFP4 pretraining recipe |
+
+On a Blackwell GPU cuDNN's block-scaled GEMM multiplies them (`__cudnn$blockScaledDot`
+in the HLO), and for `mxfp8` a Pallas kernel quantizes each of x, W and dy and its
+transpose in one pass. Elsewhere XLA dequantizes and multiplies, which computes the
+same values, so the tests run the formats on CPU. The forward keeps what the backward
+multiplies, x^T and W in the format, rather than x and W.
+
+Every projection made by `sharding.projection` or `sharding.linear` multiplies by
+`matmuls.dot_general`, which runs the format in force: attention's q, k, v, o and
+gate; the MLPs', the shared experts' and LatentMoE's; MLA's, CSA's, the indexer's; the
+linear attentions', RWKV-7's and Mamba's; Engram's, nextn's and `linear`'s. These stay
+in `compute`: the embedding and the head, softmax attention's own matmuls and its
+relative bias, the router and the shared experts' gate, hyper-connections, norms,
+low-rank gates and decays, recurrent states, and the routed experts
+(`grouped.ragged_dot`, and `methods(moe=dense)`'s einsums). A projection whose tokens,
+inputs or outputs are not whole blocks multiplies in `compute`. On a mesh, one that
+does not split into whole blocks on every device (a multiple of the block times the
+devices) stays whole on each: so the blocks are the same on any mesh, and so is what a
+run computes, which `tests/test_precision.py` checks on `fsdp=4, tensor=2` and in a
+pipeline. NVFP4's stochastic rounding draws its noise from a hash of each element's
+index and the batch's tokens, the same on any mesh too.
+
+Under FSDP each device quantizes its part of W, so the all-gathers move float8 values
+and their scales, half of bfloat16's bytes. A projection multiplies its tokens
+flattened, rows by positions, and a split along positions is not one along the
+flattened tokens: a `ring` run on `context=2` trained 13% slower in `mxfp8` than in
+bfloat16 on B300s.
+
+A recipe is a function, and the trainer enters `matmuls.use` as it traces its steps:
+
+```python
+from bux.architecture import matmuls
+
+
+@matmuls.formats.register("mine")
+def _(lhs, rhs, dimension_numbers, **kwargs): ...  # jax.lax.dot_general's arguments
+```
+
+`matmuls.block_scaled(recipe)` makes one of a `blockscaled.Recipe`: how it quantizes x,
+W and dy, each twice.
 
 ### Microbatches
 
@@ -879,6 +951,25 @@ eight words, byte by byte (`seq_len = 128`, `batch = 16`, `adamw(lr=3e-3)`, cosi
 | `gdn`    | 1.5034 / 1.4998 | 0.4112 / 0.4269 | 0.4205 / 0.4204 |
 | `mamba2` | 0.9262 / 0.9276 | 0.4134 / 0.4129 | 0.4211 / 0.4207 |
 
+### Donation: `methods.donate`
+
+`methods(donate=true)` donates the model's and the optimizer's arrays to the step,
+so the new state takes the old one's memory where XLA can write it in place. On one
+B300 (bf16, 8 × 4096 tokens) the step of the Llama-style 1.3B then peaks at 70.5 GiB
+instead of 81.1, and the KDA hybrid runs 3% faster. The MoE's (64 experts, top 8,
+5.2B) peaks at 153 GiB instead of 161, but XLA writes little of its state in place
+there, and its temporaries double, to 95.8 GiB in one piece of the memory: on one
+GPU, a checkpoint's few buffers in the wrong place leave no such piece, and the run
+runs out of memory. Donation also changes how XLA rounds a step a little (the
+gradient's norm by 7e-6 at the dense model's first step on a GPU, the loss by 2e-6
+at zamba2's third on a CPU), so it is off by default. With it, an array read from
+`trainer.model` before a step is gone after it; a checkpoint is safe, as orbax
+copies the state to the host before `save` returns.
+
+Either way the trainer keeps the state in the buffers it was made in
+(`parallel.shard_state` moves only what is elsewhere), and a run that resumes loads
+its checkpoint into the memory of the state it replaces.
+
 ## Pipelines: `methods.pipeline`
 
 ```
@@ -917,9 +1008,9 @@ leaves, summed over the stages to every one.
 $ bux plan examples/experiments/smoke.bux 'methods = methods(repeat=scan, microbatches=4)' \
     'mesh = one: mesh(data=1) | pp: mesh(stage=2, data=1)'
 2 runs
-id          params  tokens  tok/param  gpus  params/gpu  optim/gpu  bubble  run
-bbbf3ae709  156k    25.6k   0.2        1     609KiB      1.19MiB    0%      smoke[one]
-bbbf3ae709  156k    25.6k   0.2        2     369KiB      738KiB     20%     smoke[pp]
+id          params  tokens  tok/param  flops/tok  gpus  params/gpu  optim/gpu  bubble  run
+bbbf3ae709  156k    25.6k   0.2        1.03M      1     609KiB      1.19MiB    0%      smoke[one]
+bbbf3ae709  156k    25.6k   0.2        1.03M      2     369KiB      738KiB     20%     smoke[pp]
 ```
 
 A stage gets the stream and the taps of its rows (the tokens, the documents), split

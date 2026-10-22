@@ -24,7 +24,7 @@ from bux.architecture.norm import Norm
 from bux.architecture.ports import read, write
 from bux.architecture.registry import Context, Taps, register, segments
 from bux.architecture.segments import Segments
-from bux.architecture.sharding import shard_heads, shard_layer_input
+from bux.architecture.sharding import projection, shard_heads, shard_layer_input
 from bux.lang import ir
 
 
@@ -95,7 +95,7 @@ class RWKV7(nnx.Module):
                 maxval=scale / math.sqrt(width),
             )
             init = parallel.named("embed", ("heads", n_heads), init=init)
-            return nnx.Linear(width, n_out, use_bias=False, kernel_init=init, rngs=rngs)
+            return projection(width, n_out, use_bias=False, kernel_init=init, rngs=rngs)
 
         def lora(
             rank: int,
@@ -138,7 +138,7 @@ class RWKV7(nnx.Module):
         )
         self.norm = Norm(group, (hv, dv))
         zeros = parallel.named(("heads", hv), "embed", init=nnx.initializers.zeros)
-        self.o = nnx.Linear(nv, width, use_bias=False, kernel_init=zeros, rngs=rngs)
+        self.o = projection(nv, width, use_bias=False, kernel_init=zeros, rngs=rngs)
 
     def __call__(self, x: Float[Array, "b t d"], taps: Taps) -> Float[Array, "b t d"]:
         x = shard_layer_input(x)

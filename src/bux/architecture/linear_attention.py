@@ -40,7 +40,7 @@ from bux.architecture.functional import activation
 from bux.architecture.norm import Norm
 from bux.architecture.registry import Context, Taps, register, segments
 from bux.architecture.segments import Segments
-from bux.architecture.sharding import shard_heads, shard_layer_input
+from bux.architecture.sharding import projection, shard_heads, shard_layer_input
 from bux.lang import ir
 from bux.parallel import methods
 from bux.parallel.recurrence import Chunk, Positions, Recurrence, Shared, Transition
@@ -260,7 +260,7 @@ def into_heads(width: int, heads: int, dim: int, rngs: nnx.Rngs) -> nnx.Linear:
     """Make a projection of the width to `heads` heads of `dim` channels, side by
     side."""
     init = parallel.named("embed", ("heads", heads))
-    return nnx.Linear(width, heads * dim, use_bias=False, kernel_init=init, rngs=rngs)
+    return projection(width, heads * dim, use_bias=False, kernel_init=init, rngs=rngs)
 
 
 def _dt_bias(rngs: nnx.Rngs, n: int) -> Float[Array, " n"]:
@@ -361,7 +361,7 @@ class LinearAttention(nnx.Module):
         self.norm_all_heads = norm_all_heads
         rms = cfg.NormalizationConfig(type="rmsnorm", eps=config.norm_eps)
         self.norm = Norm(rms, hv * dv if norm_all_heads else dv)
-        self.o = nnx.Linear(
+        self.o = projection(
             hv * dv,
             width,
             use_bias=False,
