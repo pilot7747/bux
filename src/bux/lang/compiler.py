@@ -315,6 +315,7 @@ class _Evaluator:
         span: Span,
         scope: typing.Iterable[str] = (),
         what: str = "layer or block",
+        called: bool = False,
     ) -> BuxError:
         if self.incomplete:
             return _Reported()
@@ -329,11 +330,14 @@ class _Evaluator:
         ]
         # The name itself can be in scope where it was not visible: blk(a=b, b=1).
         close = difflib.get_close_matches(name, [k for k in known if k != name], n=1)
-        return BuxError(
-            f"unknown {what} '{name}'",
-            span,
-            f"did you mean '{close[0]}'?" if close else None,
-        )
+        hint = f"did you mean '{close[0]}'?" if close else None
+        if called:
+            new = (
+                f"a new layer '{name}' needs a config in the LayerConfig union of "
+                f"bux/config.py and a builder under @bux.architecture.register({name!r})"
+            )
+            hint = f"{hint} Or: {new}" if hint else new
+        return BuxError(f"unknown {what} '{name}'", span, hint)
 
     # --- Expressions --------------------------------------------------------------
 
@@ -665,7 +669,7 @@ class _Evaluator:
                 config = self.override(base, fields, e.span)
                 return self.with_ports(config, ports, self.text(e.span), None, e.span)
             case _Bare(name=name):
-                raise self.unknown(name, e.name_span)
+                raise self.unknown(name, e.name_span, called=True)
         what = "an activation" if isinstance(callee, _Builtin) else _describe(callee)
         if e.amend:
             raise BuxError(
