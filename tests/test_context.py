@@ -236,7 +236,9 @@ def packed_losses(layer: str, mesh: tcfg.MeshConfig, method: str) -> list[float]
     with parallel.use(mesh, methods=tcfg.MethodsConfig(attention=method)):
         model = parallel.build(lambda: Model(arch, rngs=nnx.Rngs(0)))
         trainer = Trainer(model, optax.adamw(1e-2), objective(tcfg.LossConfig(), arch))
-        return [float(trainer.update(packed(step))["loss"]) for step in range(3)]
+        return [
+            float(trainer.train_on_batch(packed(step))["loss"]) for step in range(3)
+        ]
 
 
 def trains_the_same(losses, involuntary, layer: str, method: str) -> None:

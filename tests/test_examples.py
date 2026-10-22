@@ -10,7 +10,7 @@ from flax import nnx
 
 from bux.architecture import Model, num_params
 from bux.lang import compile, compile_file
-from bux.train.objective import lookahead
+from bux.train.objective import prediction_offsets
 
 ROOT = Path(__file__).parent.parent / "examples" / "architectures"
 EXAMPLES = sorted(ROOT.rglob("*.bux"))
@@ -31,7 +31,7 @@ def test_examples_build_and_run_at_full_size(path):
         return nnx.merge(graphdef, state).outputs(tokens, positions)
 
     logits = jax.eval_shape(outputs, state, tokens, positions)
-    heads = len(lookahead(arch))
+    heads = len(prediction_offsets(arch))
     assert [o.shape for o in logits] == [(2, 16, arch.vocab_size)] * heads
     assert num_params(model) > 0
 

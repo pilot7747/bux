@@ -1,13 +1,13 @@
 """Hooks: what the training loop does between steps, every so many of them.
 
 A hook runs after every `every` steps and after the last. What it returns, if
-anything, is a report that goes to every sink (``bux.train.sinks``). Another hook is
-a subclass:
+anything, is scalars that go to every sink (``bux.train.sinks``). Another hook is a
+subclass:
 
     class WeightNorm(Hook):
         every = 100
 
-        def __call__(self, trainer: Trainer, metrics: Metrics) -> Report:
+        def __call__(self, trainer: Trainer, metrics: Metrics) -> Scalars:
             params = nnx.state(trainer.model, nnx.Param)
             return {"weight_norm": float(optax.tree.norm(params))}
 
@@ -26,18 +26,16 @@ from typing import TYPE_CHECKING
 
 import jax
 import orbax.checkpoint as ocp
-from jaxtyping import Array, Float
 
 from bux.train.data import Batch
+from bux.train.objective import Metrics
 from bux.train.optim import Schedule
-from bux.train.sinks import Report
+from bux.train.sinks import Scalars
 
 if TYPE_CHECKING:
     # Quoted where used: jaxtyping, which checks annotations as the tests run, reads
     # them as a module loads, and trainer.py imports this one.
     from bux.train.trainer import Trainer
-
-Metrics = dict[str, Float[Array, ""]]  # what a step measured, still on the device
 
 
 class Hook:
@@ -50,7 +48,7 @@ class Hook:
     def start(self, trainer: "Trainer") -> None:
         """Before the first step."""
 
-    def __call__(self, trainer: "Trainer", metrics: Metrics) -> Report | None:
+    def __call__(self, trainer: "Trainer", metrics: Metrics) -> Scalars | None:
         """After a step that it is due at, with what the step measured."""
         raise NotImplementedError
 
@@ -62,27 +60,28 @@ class Hook:
 
 
 class Log(Hook):
-    """The step's metrics, with the learning rate, the tokens seen and the tokens a
-    second since the last log."""
+    """The step's metrics, with its learning rate, the tokens seen and the tokens per
+    second since the last log. Optax counts from 0: the step just taken is
+    `trainer.step - 1`."""
 
     def __init__(self, *, every: int, lr: Schedule, tokens: int):
-        self.every, self.lr, self.tokens = every, lr, tokens  # tokens a step
+        self.every, self.lr, self.tokens = every, lr, tokens  # tokens per step
         self.clock, self.since = time.perf_counter(), 0
 
     def start(self, trainer: "Trainer") -> None:
         self.clock, self.since = time.perf_counter(), trainer.step
 
-    def __call__(self, trainer: "Trainer", metrics: Metrics) -> Report:
-        report = {k: float(v) for k, v in metrics.items()}  # waits for the step
+    def __call__(self, trainer: "Trainer", metrics: Metrics) -> Scalars:
+        scalars = {k: float(v) for k, v in metrics.items()}  # waits for the step
         now = time.perf_counter()
         seen = (trainer.step - self.since) * self.tokens
-        report |= {
+        scalars |= {
             "lr": float(self.lr(trainer.step - 1)),
             "tokens": trainer.step * self.tokens,
             "tokens_per_s": seen / (now - self.clock),
         }
         self.clock, self.since = now, trainer.step
-        return report
+        return scalars
 
 
 class Eval(Hook):
@@ -94,7 +93,7 @@ class Eval(Hook):
     ):
         self.data, self.every, self.batches = data, every, batches
 
-    def __call__(self, trainer: "Trainer", metrics: Metrics) -> Report:
+    def __call__(self, trainer: "Trainer", metrics: Metrics) -> Scalars:
         held_out = itertools.islice(self.data(), self.batches)
         return {"eval_loss": trainer.evaluate(held_out)}
 

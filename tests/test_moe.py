@@ -120,10 +120,10 @@ def test_a_train_step_moves_the_bias_eval_does_not_and_checkpoints_keep_it(tmp_p
     batch = plain(tokens())
     eager = nnx.clone(model)
     eager.training_outputs(jnp.asarray(batch.input_ids))
-    trainer.update(batch)
+    trainer.train_on_batch(batch)
     first = bias(model)
     assert jnp.array_equal(first, bias(eager)) and (first != 0).any()
-    trainer.update(batch)  # from where the first step left it
+    trainer.train_on_batch(batch)  # from where the first step left it
     assert jnp.allclose(jnp.abs(bias(model) - first).max(), 1e-3)
     moved = bias(model)
     trainer.evaluate([batch])
@@ -156,7 +156,8 @@ def test_reported_losses_are_terms_of_the_training_loss_weighted_by_each_layer()
     ]
     a, b = (r.value for r in reported)
     obj = objective(tcfg.LossConfig(), arch)
-    total, metrics = obj(logits, batch, reported)
+    per_token, per_row = obj(logits, batch, reported)
+    total, metrics = per_token.loss + per_row.loss, per_token.metrics | per_row.metrics
     assert set(metrics) == {"loss", "balance_loss"}
     assert jnp.isclose(metrics["balance_loss"], a + b)
     assert jnp.isclose(total, metrics["loss"] + 0.1 * a + 0.3 * b)
@@ -165,7 +166,7 @@ def test_reported_losses_are_terms_of_the_training_loss_weighted_by_each_layer()
 
     # A train step logs the term; eval is the cross-entropy alone.
     trainer = Trainer(model, optax.adamw(1e-3), obj)
-    assert "balance_loss" in trainer.update(batch)
+    assert "balance_loss" in trainer.train_on_batch(batch)
     ce = cross_entropy(model.outputs(jnp.asarray(batch.input_ids))[0], batch)
     assert np.isclose(trainer.evaluate([batch]), float(ce), rtol=1e-5)
 
@@ -178,7 +179,7 @@ def test_a_model_without_reporting_layers_trains_as_before():
     assert reported == []
     assert jnp.array_equal(logits[0], model.outputs(jnp.asarray(batch.input_ids))[0])
     trainer = Trainer(model, optax.adamw(1e-3), objective(tcfg.LossConfig(), arch))
-    assert set(trainer.update(batch)) == {"loss", "grad_norm"}
+    assert set(trainer.train_on_batch(batch)) == {"loss", "grad_norm"}
 
 
 # --- The methods that run the experts --------------------------------------------------

@@ -48,6 +48,8 @@ class Embedding(nnx.Module):
     which starts as that many copies of it. The token table splits over the vocabulary
     (``bux.parallel``), and what it gives is the stream."""
 
+    no_muon = True
+
     def __init__(
         self,
         c: cfg.EmbeddingConfig,
@@ -99,6 +101,8 @@ def _(
 class Head(nnx.Module):
     """The stream to logits, split over the vocabulary, tied to the embedding or not:
     the loss reduces over them where they are."""
+
+    no_muon = True
 
     def __init__(self, c: cfg.LMHeadConfig, width: int, ctx: Context):
         vocab = ctx.arch.vocab_size

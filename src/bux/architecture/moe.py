@@ -8,6 +8,7 @@ its own rows (``experts``), dropping none.
 
 from collections.abc import Callable
 from functools import partial
+from typing import ClassVar
 
 import jax
 import jax.numpy as jnp
@@ -182,6 +183,8 @@ def routed(
 class MoE(nnx.Module):
     """Token-choice top-k experts, run by the run's method of ``methods.moe``."""
 
+    muon_axes: ClassVar = {"up": (1, 2), "gate": (1, 2), "down": (1, 2)}
+
     def __init__(self, c: cfg.MoEConfig, width: int, rngs: nnx.Rngs):
         e, f = c.num_experts, c.expert.intermediate_size
         if e % c.num_groups or c.top_k > c.top_k_groups * (e // c.num_groups):
@@ -195,10 +198,10 @@ class MoE(nnx.Module):
         self.router = _linear(width, e + sinks, ("embed", None), rngs)
         free = c.load_balancing == "aux_free"
         self.router_bias = nnx.Variable(jnp.zeros(e)) if free else None
-        # The picks of each expert since the bias last moved; with `deferred` set (by
-        # the trainer), the bias moves in `settle`, once a step, not in every forward.
+        # The picks of each expert since the bias last moved; with `update_at_step_end`
+        # set (by the trainer), the bias moves in `step_end_update`, once per step.
         self.router_load = nnx.Variable(jnp.zeros(e)) if free else None
-        self.deferred = False
+        self.update_at_step_end = False
         self.bias_update_rate = c.bias_update_rate
         self.aux_loss_weight = c.aux_loss_weight
         self.per_sequence = c.aux_loss_scope == "sequence"
@@ -282,17 +285,17 @@ class MoE(nnx.Module):
         self, scores: Float[Array, "b t e"], idx: Int[Array, "b t k"], taps: Taps
     ) -> None:
         """Report the balance loss, and count the picks for the router bias, which
-        moves now unless `deferred`."""
+        moves now unless `update_at_step_end`."""
         picks = jax.nn.one_hot(idx, scores.shape[-1]).sum(-2)
         if self.aux_loss_weight:
             loss = balance_loss(scores, picks, self.top_k, self.per_sequence)
             report(taps, "balance_loss", self.aux_loss_weight, loss)
         if self.router_load is not None:
             self.router_load[...] = self.router_load[...] + picks.sum((0, 1))
-            if not self.deferred:
-                self.settle()
+            if not self.update_at_step_end:
+                self.step_end_update()
 
-    def settle(self) -> None:
+    def step_end_update(self) -> None:
         """Move the router bias toward the experts picked less than the mean since it
         last moved (DeepSeek-V3), and count again from zero."""
         if self.router_bias is None or self.router_load is None:

@@ -12,6 +12,8 @@ from bux.lang import ir
 
 
 class Norm(nnx.Module):
+    no_weight_decay = ("scale", "bias")
+
     def __init__(self, c: cfg.NormalizationConfig, width: int | tuple[int, ...]):
         self.kind = c.type
         self.eps = c.eps
@@ -54,6 +56,8 @@ def _(
 
 
 class DyT(nnx.Module):
+    no_weight_decay = ("alpha", "weight", "bias")
+
     def __init__(self, c: cfg.DyTConfig, width: int):
         self.alpha = nnx.Param(jnp.asarray(c.alpha_init))
         self.weight = nnx.Param(jnp.ones(width))

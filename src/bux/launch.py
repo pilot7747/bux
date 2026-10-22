@@ -62,7 +62,7 @@ from bux.data.pipeline import DEFAULT_CACHE, jobs, prepare
 from bux.lang import ir
 from bux.train.config import MeshConfig
 from bux.train.hooks import Hook, Metrics
-from bux.train.sinks import Latest, primary
+from bux.train.sinks import LatestMetrics, is_main_process
 from bux.train.trainer import Trainer, directory, train
 
 SIGNALS = (signal.SIGTERM, signal.SIGINT)
@@ -83,7 +83,7 @@ def status(folder: Path) -> dict[str, Any]:
 def record(folder: Path, **fields: Any) -> None:
     """Update the run's status.json with `fields`, all at once. In a job of many
     processes, only the first writes it."""
-    if not primary():
+    if not is_main_process():
         return
     tmp = folder / "status.json.tmp"
     tmp.write_text(json.dumps(status(folder) | fields, indent=2), encoding="utf-8")
@@ -230,7 +230,7 @@ def train_here(
     status.json, and return the exit code. In a job of many processes, which it joins,
     only the first prints and records."""
     join()
-    echo = echo if primary() else _quiet
+    echo = echo if is_main_process() else _quiet
     folder = directory(run, out)
     folder.mkdir(parents=True, exist_ok=True)
     gpus = _listed() or None
@@ -244,7 +244,7 @@ def train_here(
         ended=None,
         error=None,
     )
-    stop, latest, error = Stop(), Latest(), None
+    stop, latest, error = Stop(), LatestMetrics(), None
     try:
         with stop.armed():
             devices = _devices(run, gpus)
@@ -506,7 +506,7 @@ def launch(
             echo(f"{nproc} processes train one run, not {len(todo)}: use --index")
             return 1
         join()
-        echo = echo if primary() else _quiet
+        echo = echo if is_main_process() else _quiet
     # In a job of many processes, each has the GPUs jax.distributed gives it.
     available = [] if nproc > 1 else list(visible_gpus() if gpus is None else gpus)
     if not (fits := _fitting(todo, out, available, echo)):

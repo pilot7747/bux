@@ -186,7 +186,7 @@ from bux import parallel
 with parallel.use(t.mesh, t.layout, t.methods):
     model = parallel.build(lambda: Model(arch, rngs=nnx.Rngs(0)))
     trainer = Trainer(model, tx, loss)  # its state on its shardings
-    trainer.update(batch)  # the batch through parallel.shard_batch
+    trainer.train_on_batch(batch)  # the batch through parallel.shard_batch
 ```
 
 ## Testing
@@ -775,20 +775,20 @@ anything is built.
 What the step computes is the whole batch's:
 
 - **The objective's terms**, means over targets, weigh by each microbatch's share of
-  the batch's targets (`trainer.weigh`), so that the loss and the z-loss are the
-  batch's, also when a loss mask leaves microbatches with unequal numbers of targets.
-  `mtp`'s heads weigh by the first head's targets.
+  the batch's targets (`trainer.token_shares`), so that the loss and the z-loss are
+  the batch's, also when a loss mask leaves microbatches with unequal numbers of
+  targets. `mtp`'s heads weigh by the first head's targets.
 - **What layers report** weighs by each microbatch's share of rows, 1 / n: a
   balance loss over sequences (`aux_loss_scope=sequence`) and the indexer's loss are
   the batch's. A balance loss over the batch is the mean of the microbatches' own,
   each over its rows: its f_e and P_e are a microbatch's means, not the batch's.
 - **The router bias** moves once a step, from the whole batch's picks. The trainer
-  sets `deferred` on every module that has it: the MoE's training forwards then route
-  with the bias where the step found it and add their picks to `router_load`, and
-  `settle` moves the bias after the last microbatch. A layer of one's own that learns
-  from the batch outside of gradients does the same (`trainer.Settles`). Called
-  outside a step, a training forward moves the bias at once; and a shared MoE moves
-  once a step, from the picks of all its uses.
+  sets `update_at_step_end` on every module that has it: the MoE's training forwards
+  then route with the bias where the step found it and add their picks to
+  `router_load`, and `step_end_update` moves the bias after the last microbatch. A
+  layer of one's own that learns from the batch outside of gradients does the same
+  (`trainer.StepEndUpdate`). Called outside a step, a training forward moves the
+  bias at once; and a shared MoE moves once a step, from the picks of all its uses.
 - **Dropout** draws each microbatch's masks in turn from the run's RNG stream: the
   same distribution as the whole batch's, not the same masks, and the stream's count
   advances n times a step. A resumed run draws the same.
@@ -881,7 +881,7 @@ after another, so with one microbatch a pipeline computes what one device does:
   microbatches of each one's: the whole batch's for a loss of each sequence
   (`aux_loss_scope=sequence`), near it for one of the batch;
 - the router bias moves once a step, from the whole batch's picks, as it does under
-  gradient accumulation: in a training step the MoE is `deferred`, and the
+  gradient accumulation: in a training step the MoE has `update_at_step_end`, and the
   pipeline carries its `router_load` through the ticks it computes. A training
   forward outside a step moves it once a microbatch, each from that one's load;
 - dropout draws a fresh mask for every microbatch.

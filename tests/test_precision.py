@@ -20,7 +20,7 @@ from bux.lang import compile_runs
 from bux.train import config as tcfg
 from bux.train.data import Batch, plain
 from bux.train.objective import objective
-from bux.train.optim import optimizer, schedule
+from bux.train.optim import lr_multiplier, optimizer
 from bux.train.trainer import Trainer, cast, forward, train
 
 PRELUDE = """
@@ -114,7 +114,7 @@ def test_bfloat16_on_a_split_mesh_trains_as_on_one_device(losses, involuntary, a
 def test_parameters_gradients_and_the_optimizer_state_stay_float32():
     trainer = _trainer(ARCHITECTURES["moe"], compute=jnp.bfloat16)
     grads, _ = nnx.jit(trainer.gradients)(trainer.model, _batch())
-    trainer.update(_batch())
+    trainer.train_on_batch(_batch())
     params = nnx.state(trainer.model, nnx.Param)
     moments = nnx.state(trainer.optimizer, nnx.OptState)
     floats = [
@@ -296,7 +296,7 @@ def _trainer(arch: str, **settings) -> Trainer:
     [run] = compile_runs(_source(arch=arch))
     t = run.train
     model = parallel.build(lambda: Model(run.arch, rngs=nnx.Rngs(0)))
-    tx = optimizer(t.optimizer, schedule(t.schedule, t.steps), model, t.clip)
+    tx = optimizer(t.optimizer, lr_multiplier(t.schedule, t.steps), model, t.clip)
     return Trainer(model, tx, objective(t.loss, run.arch), **settings)
 
 
