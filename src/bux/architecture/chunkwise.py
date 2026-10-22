@@ -179,27 +179,31 @@ def _scalar(
     G, _, end, reach, same, tail = _decays(g, seg)
     O = _pairwise(q, k, G, G, same, False, 1) @ v
     vd = jnp.where(tail, v * jnp.exp(end - G), 0)  # Gamma(C, s) v_s
-    adds = _by_group("bzgck,bzgrcv->bzgrkv", k, vd)
+    adds = _by_group(jnp.swapaxes(k, -1, -2), vd)
     # Each chunk's log decay: -inf across a document start, which its log would
     # take from a decay of 0 at an infinite slope.
     log = jnp.where(reach[..., -1, 0], end[..., 0, 0], -jnp.inf)
     before, S, P, starts = _passed(log, adds)
     decay = jnp.where(reach, jnp.exp(G), 0)  # Gamma(t, 0)
-    out = O + decay * _by_group("bzgck,bzgrkv->bzgrcv", q, before)
+    out = O + decay * _by_group(q, before)
     if not transition:
         return out, S, None, None
     return out, S, P, _shared(q, v.shape[2]) * decay * starts[..., None, None]
 
 
+# A plain matmul: on a B300, XLA's Triton fusions of the einsum's gradients and the
+# pairs' took C's and B's gradients wrong at Mamba-2's shapes.
 def _by_group(
-    spec: str, x: Grouped, y: Float[Array, "b n h ..."]
-) -> Float[Array, "b n h ..."]:
-    """Return the einsum `spec` of x, of groups g, and y, of their heads, which it
-    takes as (g, r): r heads a group."""
-    b, n, h = y.shape[:3]
+    x: Float[Array, "b n g i j"], y: Float[Array, "b n h j e"]
+) -> Float[Array, "b n h i e"]:
+    """Return x @ y for every head of y, x of its group: one matmul a group, its
+    heads' columns side by side."""
+    b, n, h, j, e = y.shape
     groups = x.shape[2]
-    out = jnp.einsum(spec, x, y.reshape(b, n, groups, h // groups, *y.shape[3:]))
-    return out.reshape(b, n, h, *out.shape[4:])
+    split = y.reshape(b, n, groups, h // groups, j, e)
+    columns = jnp.moveaxis(split, 3, 4).reshape(b, n, groups, j, -1)
+    out = (x @ columns).reshape(b, n, groups, x.shape[3], h // groups, e)
+    return jnp.moveaxis(out, 4, 3).reshape(b, n, h, x.shape[3], e)
 
 
 def _pairwise(
