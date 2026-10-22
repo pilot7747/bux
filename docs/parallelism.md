@@ -730,7 +730,8 @@ methods   = methods(microbatches=4)       # gradient accumulation: not in it
 
 Unlike the settings above, `precision` changes what a run computes, so it is in the
 run's id: `precision.compute = float32 | bfloat16` is a sweep of two runs. `compute` is
-`float32` or `bfloat16`; float16 would need loss scaling.
+`float32` or `bfloat16`; float16 would need loss scaling. `matmuls` is the format the
+projections inside blocks multiply in, `compute` unless it says `mxfp8` or `nvfp4`.
 
 ### Precision
 
@@ -751,7 +752,8 @@ Float32 islands compute from what they are given in float32, and give back its d
 | the objective                                   | the logits, as the loss and the z-loss take them  |
 
 Softmax attention takes its softmax in float32, under every method of
-`methods.attention`. Every other matmul runs in `compute`, and the stream stays in it from the embedding to the logits,
+`methods.attention`. Every other matmul runs in `compute`, or in the format of
+`matmuls` (below), and the stream stays in `compute` from the embedding to the logits,
 which `tests/test_precision.py` checks for every family. Gradients are reduced over the
 batch axes in the dtype the backward makes them, bfloat16 for a weight's; they add up
 over microbatches in float32.
@@ -762,6 +764,57 @@ The MoE's `sorted` and EP methods make one on more than one device, and so do th
 pipelines; `ring`, `ulysses` and `pass_state` train in bfloat16 on CPU. The tests split
 bfloat16 runs with `methods(moe=dense)` and no pipeline. GPUs all-reduce bfloat16
 natively, which this has not been run on.
+
+### Matmul formats
+
+```
+precision = precision(compute=bfloat16, matmuls=mxfp8)
+```
+
+`matmuls` names a format of the registry in `bux.architecture.matmuls`. A block-scaled
+format quantizes the operands of all three GEMMs of y = x W, the forward's and the
+backward's two, each along what its GEMM contracts, in blocks with a scale each
+(`bux.architecture.blockscaled`):
+
+| format    | values  | a scale per                                   | and                                       |
+|-----------|---------|-----------------------------------------------|-------------------------------------------|
+| `compute` | `compute` | none                                        | the default                               |
+| `mxfp8`   | E4M3    | 32, a power of two (E8M0)                     | dy in E4M3 too, as Transformer Engine's MXFP8 recipe |
+| `nvfp4`   | E2M1    | 16 (E4M3), and the tensor (float32); W's per 16 x 16 tile, so that y and dx see the same W | dy rounded stochastically, and x and dy transformed for dW by a random Hadamard transform of 16, as NVIDIA's NVFP4 pretraining recipe |
+
+On a Blackwell GPU cuDNN's block-scaled GEMM multiplies them (`__cudnn$blockScaledDot`
+in the HLO), and for `mxfp8` a Pallas kernel quantizes each of x, W and dy and its
+transpose in one pass. Elsewhere XLA dequantizes and multiplies, which computes the
+same values, so the tests run the formats on CPU. The forward keeps what the backward
+multiplies, x^T and W in the format, rather than x and W.
+
+Every projection made by `sharding.projection` or `sharding.linear` multiplies by
+`matmuls.dot_general`, which runs the format in force: attention's q, k, v, o and
+gate; the MLPs', the shared experts' and LatentMoE's; MLA's, CSA's, the indexer's; the
+linear attentions', RWKV-7's and Mamba's; Engram's, nextn's and `linear`'s. These stay
+in `compute`: the embedding and the head, softmax attention's own matmuls and its
+relative bias, the router and the shared experts' gate, hyper-connections, norms,
+low-rank gates and decays, recurrent states, and the routed experts
+(`grouped.ragged_dot`, and `methods(moe=dense)`'s einsums). A projection whose tokens,
+inputs or outputs are not whole blocks multiplies in `compute`. On a mesh, one that
+does not split into whole blocks on every device (a multiple of the block times the
+devices) stays whole on each: so the blocks are the same on any mesh, and so is what a
+run computes, which `tests/test_precision.py` checks on `fsdp=4, tensor=2` and in a
+pipeline. NVFP4's stochastic rounding draws its noise from a hash of each element's
+index and the batch's tokens, the same on any mesh too.
+
+A recipe is a function, and the trainer enters `matmuls.use` as it traces its steps:
+
+```python
+from bux.architecture import matmuls
+
+
+@matmuls.formats.register("mine")
+def _(lhs, rhs, dimension_numbers, **kwargs): ...  # jax.lax.dot_general's arguments
+```
+
+`matmuls.block_scaled(recipe)` makes one of a `blockscaled.Recipe`: how it quantizes x,
+W and dy, each twice.
 
 ### Microbatches
 

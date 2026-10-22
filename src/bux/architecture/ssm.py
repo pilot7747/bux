@@ -21,7 +21,7 @@ from bux.architecture.conv import CausalConv
 from bux.architecture.norm import Norm
 from bux.architecture.registry import Context, Taps, register, segments
 from bux.architecture.segments import Segments
-from bux.architecture.sharding import shard_layer_input
+from bux.architecture.sharding import projection, shard_layer_input
 from bux.lang import ir
 from bux.parallel.recurrence import Chunk, Positions, Recurrence, Shared
 
@@ -110,7 +110,7 @@ def _out(
 ) -> nnx.Linear:
     """Make the projection of n channels named `name` back to the width."""
     init = parallel.named(name, "embed")
-    return nnx.Linear(n, width, use_bias=bias, kernel_init=init, rngs=rngs)
+    return projection(n, width, use_bias=bias, kernel_init=init, rngs=rngs)
 
 
 def shard_fused(y: Float[Array, "b t c"]) -> Float[Array, "b t c"]:
@@ -142,9 +142,9 @@ class Mamba(nnx.Module):
         d_inner, n = config.expand * width, config.state_size
         r = config.dt_rank or math.ceil(width / 16)
         self.rank, self.state_size = r, n
-        self.in_proj = nnx.Linear(width, 2 * d_inner, use_bias=False, rngs=rngs)
+        self.in_proj = projection(width, 2 * d_inner, use_bias=False, rngs=rngs)
         self.conv = CausalConv(d_inner, config.conv_size, True, rngs, channel="mlp")
-        self.x_proj = nnx.Linear(
+        self.x_proj = projection(
             d_inner,
             r + 2 * n,
             use_bias=False,
@@ -205,7 +205,7 @@ class Mamba2(nnx.Module):
             )
         self.inner, self.heads, self.head_dim = d_inner, h, config.head_dim
         self.groups, self.state_size = g, n
-        self.in_proj = nnx.Linear(
+        self.in_proj = projection(
             width, 2 * d_inner + 2 * g * n + h, use_bias=False, rngs=rngs
         )
         # Over u, B and C side by side, as the projection gives them: whole.
@@ -245,7 +245,7 @@ class ShortConv(nnx.Module):
 
     def __init__(self, config: cfg.ShortConvConfig, width: int, rngs: nnx.Rngs):
         bias = config.bias
-        self.in_proj = nnx.Linear(width, 3 * width, use_bias=bias, rngs=rngs)
+        self.in_proj = projection(width, 3 * width, use_bias=bias, rngs=rngs)
         self.conv = CausalConv(width, config.conv_size, bias, rngs, channel="mlp")
         self.out_proj = _out(width, width, "mlp", bias, rngs)
 

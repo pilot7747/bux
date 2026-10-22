@@ -7,6 +7,7 @@ from jaxtyping import Array, Float
 from bux import config as cfg
 from bux.architecture.functional import activation
 from bux.architecture.registry import Context, Taps, register
+from bux.architecture.sharding import projection
 from bux.lang import ir
 
 
@@ -27,7 +28,7 @@ def _(
 
 class Linear(nnx.Module):
     def __init__(self, c: cfg.LinearConfig, width: int, rngs: nnx.Rngs):
-        self.proj = nnx.Linear(width, c.features, use_bias=c.bias, rngs=rngs)
+        self.proj = projection(width, c.features, use_bias=c.bias, rngs=rngs)
 
     def __call__(
         self, x: Float[Array, "*lead d"], taps: Taps

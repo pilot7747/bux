@@ -12,7 +12,7 @@ from bux.architecture.functional import softcap
 from bux.architecture.norm import Norm
 from bux.architecture.registry import Context, Taps, positions, register
 from bux.architecture.residual import widen, widening
-from bux.architecture.sharding import linear
+from bux.architecture.sharding import linear, projection
 from bux.lang import ir
 
 # nnx.Embed's init.
@@ -106,7 +106,11 @@ class Head(nnx.Module):
         assert vocab is not None
         self.embedding = ctx.built.embedding if tied else None
         self.proj = (
-            None if tied else linear(width, vocab, ("embed", "vocab"), bias, ctx.rngs)
+            None
+            if tied
+            else linear(
+                width, vocab, ("embed", "vocab"), bias, ctx.rngs, in_compute=True
+            )
         )
         self.bias = (
             nnx.Param(jnp.zeros(vocab), names=("vocab",)) if tied and bias else None
@@ -162,7 +166,7 @@ class NextN(nnx.Module):
             self.hidden_norm = Norm(config.norm, width)
             self.copies = None if ctx.depth else copies
         self.embed_norm = Norm(config.norm, d)
-        self.proj = nnx.Linear(d + width, width, use_bias=False, rngs=ctx.rngs)
+        self.proj = projection(d + width, width, use_bias=False, rngs=ctx.rngs)
 
     def __call__(
         self, x: Float[Array, "b t *copies d"], taps: Taps

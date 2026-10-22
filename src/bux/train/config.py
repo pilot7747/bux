@@ -289,12 +289,15 @@ class LogConfig(Config):
 
 
 class PrecisionConfig(Config):
-    """The dtype the forward and backward compute in. Parameters and the optimizer's
-    state stay float32, and so do norm statistics, router scores and top-k, recurrent
-    states and the loss. Unlike the three settings below, it is in the run's id."""
+    """The dtype the forward and backward compute in, and the format the projections
+    inside blocks multiply in (bux.architecture.matmuls). Parameters and the
+    optimizer's state stay float32, and so do norm statistics, router scores and
+    top-k, recurrent states and the loss. Unlike the three settings below, it is in
+    the run's id."""
 
     type: Literal["precision"] = "precision"
     compute: Literal["float32", "bfloat16"] = "float32"
+    matmuls: str = "compute"  # a format of bux.architecture.matmuls: mxfp8, nvfp4
 
 
 # --- Parallelism -----------------------------------------------------------------------

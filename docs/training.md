@@ -73,7 +73,7 @@ fe14a5e39c  183M    3B      16.4       attention_ablation[mha, optimizer.lr=3e-3
 | `eval`       | `eval(data=..., every=..., batches=...)`, or `none`    | `none`         |
 | `checkpoint` | `checkpoint(every=..., keep=...)`, or `none`           | `none`         |
 | `log`        | `log(every=...)`                                       | `log`          |
-| `precision`  | `precision(compute=bfloat16)`: the dtype forward and backward compute in; parameters stay float32 | `precision`: `float32` |
+| `precision`  | `precision(compute=bfloat16, matmuls=mxfp8)`: the dtype forward and backward compute in, parameters staying float32, and the format block projections multiply in | `precision`: `float32`, `compute` |
 | `mesh`       | `mesh(data=..., fsdp=..., tensor=...)`: the device grid | `mesh`: every device on `data` |
 | `layout`     | `layout(...)`: which mesh axes each named dimension splits over | `layout` |
 | `methods`    | `methods(attention=..., moe=..., microbatches=...)`: how what communicates is computed, and the microbatches a step takes its batch in | `methods` |
