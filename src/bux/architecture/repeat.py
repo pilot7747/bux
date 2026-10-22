@@ -7,10 +7,12 @@ and runs them by `jax.lax.scan` (``stacked.run``). With more than one `stage`, t
 longest scanned repeat outside any other is pipelined over them (``pipe_longest``).
 """
 
+from collections.abc import Callable
 from typing import Any
 
 import jax.numpy as jnp
 from flax import nnx
+from jax.typing import DTypeLike
 
 from bux.architecture import pipelined, residual, stacked
 from bux.architecture.graph import Sequence, branches, build_node
@@ -90,11 +92,14 @@ class Scanned(nnx.Module):
     """A repeat of `times` passes run as one module. `layers` is one pass whose
     variables hold every pass's, stacked (``_stack``). A call scans them
     (``stacked.run``), or runs them by the run's pipeline method once ``pipe`` has
-    split them over the stages."""
+    split them over the stages. Where `compute` is set, a training step's cast of the
+    model left them as they are (``scanned_variables``), and each pass casts its own
+    to it."""
 
     def __init__(self, layers: nnx.Module, times: int):
         self.times, self.layers = times, layers
         self.rounds = 0  # the rounds a pipeline takes them in; 0 if none does
+        self.compute: DTypeLike | None = None
 
     def pipe(self, rounds: int) -> None:
         """Split the stacked layers over `stage`, by a dimension named `stages`.
@@ -117,9 +122,9 @@ class Scanned(nnx.Module):
     def __call__(self, x: Stream, taps: Taps) -> Stream:
         if self.rounds and pipeline.pipelined():
             layers, passes = self._round()
-            return pipelined.run(layers, passes, self.rounds, x, taps)
+            return pipelined.run(layers, passes, self.rounds, x, taps, self.compute)
         graphdef, state = nnx.split(self.layers)
-        y, rest = stacked.run(graphdef, state, self.times, x, taps)
+        y, rest = stacked.run(graphdef, state, self.times, x, taps, self.compute)
         nnx.update(self.layers, rest)
         return y
 
@@ -129,6 +134,12 @@ class Scanned(nnx.Module):
         if isinstance(self.layers, Scanned):
             return self.layers.layers, self.layers.times
         return self.layers, self.times
+
+
+def scanned_variables(root: nnx.Module) -> Callable[[tuple, object], bool]:
+    """Return a filter of the variables of `root`'s scanned repeats."""
+    found = [p for p, m in nnx.iter_graph(root) if isinstance(m, Scanned)]
+    return lambda path, _: any(path[: len(p)] == p for p in found)
 
 
 def pipe_longest(root: nnx.Module) -> nnx.Module:

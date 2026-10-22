@@ -18,7 +18,7 @@ from bux.architecture.graph import Sequence
 from bux.architecture.residual import HyperConnections
 from bux.lang import compile, compile_runs
 from bux.train.optim import muon_matrices, weight_decay_mask
-from bux.train.trainer import directory, train
+from bux.train.trainer import cast, directory, train
 
 PRELUDE = """
 d_model = 64
@@ -128,6 +128,22 @@ def test_a_scanned_moe_reports_its_losses_and_moves_its_bias_as_unrolled(losses)
     assert _scans(_model(MOE))
     scanned = losses(MOE, steps=4, methods=SCAN)
     assert np.allclose(scanned, losses(MOE, steps=4), atol=1e-5)
+
+
+@pytest.mark.parametrize("arch", ["llama", "moe"])
+def test_a_scanned_repeat_casts_each_pass_as_it_runs_it(arch):
+    model = _model((SCANNED | {"moe": MOE})[arch])
+    by_pass = cast(model, jnp.bfloat16)
+    [scan] = _scans(by_pass)
+    stacked = jax.tree.leaves(nnx.state(scan.layers, nnx.Param))
+    assert scan.compute == jnp.bfloat16
+    assert all(x.dtype == jnp.float32 for x in stacked)
+    graphdef, params, rest = nnx.split(model, nnx.Param, ...)
+    params = jax.tree.map(lambda x: x.astype(jnp.bfloat16), params)
+    at_once = nnx.merge(graphdef, params, rest)
+    with _use(SCAN):
+        y, z = (nnx.jit(lambda m, t: m(t))(m, TOKENS) for m in (by_pass, at_once))
+    assert y.dtype == jnp.bfloat16 and jnp.array_equal(y, z)
 
 
 @pytest.mark.parametrize("orthogonalize", ["gspmd", "gather"])
