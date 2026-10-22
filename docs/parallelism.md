@@ -461,9 +461,17 @@ what the `shard_map`s' transposes sum is float32.
 A chunk runs by `chunkwise` (`bux.architecture.chunkwise`), the form of fla's chunked
 kernels, under every method: matmuls within chunks of 64 positions, and a scan of the
 state across them, by a Pallas kernel on a GPU (`affine_scan`). `stepwise`, a scan
-over positions, is its reference. Under `scan`, the delta rule of a gate bounded at
+over positions, is its reference. With one decay a head, the state passes across the
+chunks by a matmul (SSD's state passing), and q and k may be shared by groups of heads.
+Mamba-2's selective scan runs so, as decayed linear attention with `q = C` and `k = B`
+of its groups, `v = dt x` and a log decay `dt A` a head, and `ssm.stepwise` is its
+reference; Mamba's, a decay per channel and state dim, runs by that scan over
+positions. Under `scan`, the delta rule of a gate bounded at
 -5 or above (KDA's `gate_lower_bound`, DeltaNet's none) runs by cuDNN's fused KDA
 kernel on a B200 or B300 instead (`fused_delta`); it overflows below -5.
+`scripts/gpu_smoke/recurrence.py` checks the forms against their scans on a GPU,
+whose fusions the CPU tests do not see: on a B300 one took Mamba-2's gradients for B
+and C wrong, which a plain matmul in its place does not.
 
 Not yet: a `ppermute` chain instead of the all-gather, which holds every device's
 transitions (`c` matrices `k × k` per head) on each.

@@ -14,8 +14,9 @@ from bux import config as cfg
 from bux import parallel
 from bux.architecture import CausalConv, Model, Segments, Taps, num_params
 from bux.architecture.graph import ResidualBranch, Sequence
-from bux.architecture.ssm import Mamba, Mamba2, ShortConv
+from bux.architecture.ssm import Mamba, Mamba2, ShortConv, chunk, stepwise
 from bux.lang import compile
+from bux.parallel.recurrence import Chunked, Positions, Shared
 from bux.train import config as tcfg
 
 D, V = 24, 64
@@ -276,6 +277,52 @@ def test_matches_a_naive_loop_over_positions(name):
         )
         expected = np.concatenate([naive(layer, first), naive(layer, second)])
         assert np.allclose(y[row], expected, atol=1e-4)
+
+
+# --- Mamba-2 by chunks -----------------------------------------------------------------
+
+H, HEAD, G, N = 4, 3, 2, 5  # heads of HEAD channels, in G groups of B and C of N
+
+
+def ssd_inputs(t: int) -> tuple[Positions, Shared]:
+    """Mamba-2's x, dt, B, C and continues over t positions, and A, from decays that
+    keep the state over many chunks to ones that empty it in a position. The first
+    row's documents start 30 positions in and every 37 after, across chunks of 64;
+    the second's one document started before it."""
+    keys = jax.random.split(jax.random.key(0), 3)
+    x = jax.random.normal(keys[0], (2, t, H, HEAD))
+    dt = jax.nn.softplus(jax.random.normal(keys[1], (2, t, H)))
+    B, C = jax.random.normal(keys[2], (2, 2, t, G, N))
+    starts = np.arange(t) % 37 == 30
+    continues = jnp.asarray(np.stack([~starts, np.ones(t, bool)]), jnp.float32)
+    A = -jnp.asarray([0.01, 0.3, 2.0, 16.0])[:, None]
+    return (x, dt, B, C, continues), (A,)
+
+
+@pytest.mark.parametrize("t", [19, 64, 150])
+def test_mamba2_by_chunks_computes_what_positions_do(t):
+    xs, shared = ssd_inputs(t)
+    got, want = chunk(xs, shared, True), stepwise(xs, shared, True)
+    for name in ("out", "state", "transition", "reads"):
+        a, b = getattr(got, name), getattr(want, name)
+        np.testing.assert_allclose(a, b, atol=2e-5, rtol=2e-5, err_msg=name)
+
+
+def test_mamba2_by_chunks_differentiates_as_positions_do():
+    (x, dt, B, C, continues), shared = ssd_inputs(150)
+    weights = jnp.cos(jnp.arange(x.size)).reshape(x.shape)
+
+    def loss(f: Chunked, *args: Float[Array, "..."]) -> Float[Array, ""]:
+        *xs, A = args
+        return (f((*xs, continues), (A,), False).out * weights).sum()
+
+    args = (x, dt, B, C, *shared)
+    grads = [
+        jax.grad(loss, argnums=(1, 2, 3, 4, 5))(f, *args) for f in (chunk, stepwise)
+    ]
+    for i, (a, b) in enumerate(zip(*grads, strict=True)):
+        scale = float(jnp.abs(b).max())
+        np.testing.assert_allclose(a, b, atol=2e-6 * scale, err_msg=str(i))
 
 
 # --- Split over devices ----------------------------------------------------------------

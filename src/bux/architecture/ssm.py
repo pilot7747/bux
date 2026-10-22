@@ -4,7 +4,8 @@ Under tensor parallelism (``bux.parallel``) their channels split, Mamba's and th
 conv's over `mlp` and Mamba-2's over `heads`, and so does every parameter of a channel
 or a head: the scan runs on each device's own. Their input projections are fused (u
 and the gate side by side), so they stay whole, and every device computes them. The
-selective scan runs by the run's `methods.recurrence`, as linear attention does.
+selective scan runs by the run's `methods.recurrence`, as linear attention does, and
+Mamba-2's by linear attention's chunks of positions (``chunkwise``).
 """
 
 import math
@@ -17,6 +18,7 @@ from jaxtyping import Array, Float
 
 from bux import config as cfg
 from bux import parallel
+from bux.architecture import chunkwise
 from bux.architecture.conv import CausalConv
 from bux.architecture.norm import Norm
 from bux.architecture.registry import Context, Taps, register, segments
@@ -34,21 +36,37 @@ def selective_scan(
     C: Float[Array, "b t g n"],
     docs: Segments | None = None,
 ) -> Float[Array, "b t h p"]:
-    """Run the selective scan, one position at a time. Each of the h heads keeps an n
-    by p state S, and at every position
+    """Run the selective scan. Each of the h heads keeps an n by p state S, and at
+    every position
 
         S = exp(dt A) S + B (dt x)^T,    y = S^T C,
 
     with the heads in g groups that share B and C, as kv heads share keys in GQA. Mamba
-    has one head per channel (p = 1) and one A per channel and state dim; Mamba-2 has
-    one A per head (n = 1 in A). The state starts at zero, and again where a document
-    starts. It runs by the run's `methods.recurrence`, in float32, the outputs in x's
-    dtype."""
+    has one head per channel (p = 1) and one A per channel and state dim, and runs one
+    position at a time; Mamba-2 has one A per head (n = 1 in A), and runs by chunks
+    (`chunk`). The state starts at zero, and again where a document starts. It runs by
+    the run's `methods.recurrence`, in float32, the outputs in x's dtype."""
     b, t = x.shape[:2]
     within = jnp.ones((b, t), jnp.int32) if docs is None else docs.within
     keep = (within > 0).astype(jnp.float32)  # 0 where a document starts
     scan = Recurrence("the selective scan", chunk, (x, dt, B, C, keep), (A,))
     return parallel.method("recurrence")(scan).astype(x.dtype)
+
+
+def chunk(xs: Positions, shared: Shared, transition: bool) -> Chunk:
+    """Run `selective_scan` over a chunk of positions from a zero state, in float32,
+    its state n by p per head, as keys by values. With `transition`, also return the
+    product P of every position's exp(dt A), and each output's reads P C.
+
+    With one A per head, as Mamba-2's, it is decayed linear attention with q = C and
+    k = B, a group's, v = dt x and a log decay of dt A a head: by smaller chunks, with
+    matmuls within each (``chunkwise``). Mamba's, one A per channel and state dim,
+    runs `stepwise`."""
+    if shared[0].shape[-1] > 1:
+        return stepwise(xs, shared, transition)
+    x, dt, B, C, keep = (a.astype(jnp.float32) for a in xs)
+    log_decay = dt[..., None] * shared[0].astype(jnp.float32)
+    return chunkwise.chunk((C, B, dt[..., None] * x, log_decay, keep), transition)
 
 
 _At = tuple[
@@ -77,10 +95,8 @@ def _step(
     return (state, P), (y, P * C)
 
 
-def chunk(xs: Positions, shared: Shared, transition: bool) -> Chunk:
-    """Run `selective_scan` over a chunk of positions from a zero state, by a scan in
-    float32, its state n by p per head, as keys by values. With `transition`, also
-    return the product P of every position's exp(dt A), and each output's reads P C."""
+def stepwise(xs: Positions, shared: Shared, transition: bool) -> Chunk:
+    """Run `chunk` one position at a time: a scan in float32, Mamba-2's reference."""
     x, dt, B, C, keep = (jnp.moveaxis(a.astype(jnp.float32), 1, 0) for a in xs)
     A = shared[0].astype(jnp.float32)
     _, b, h, p = x.shape
