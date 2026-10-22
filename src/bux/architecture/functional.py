@@ -30,12 +30,3 @@ def activation(name: str, x: Float[Array, "*shape"]) -> Float[Array, "*shape"]:
 
 def softcap(x: Float[Array, "*shape"], cap: float | None) -> Float[Array, "*shape"]:
     return x if cap is None else cap * jnp.tanh(x / cap)
-
-
-def bound(
-    x: Float[Array, "*shape"], limit: float | None, cap: float | None
-) -> Float[Array, "*shape"]:
-    """The up branch of a GLU, clamped to +-limit and/or tanh soft-capped."""
-    if limit is not None:
-        x = jnp.clip(x, -limit, limit)
-    return softcap(x, cap)

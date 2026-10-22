@@ -18,44 +18,45 @@ from bux.architecture.attention import _read, _write
 from bux.architecture.linear_attention import (
     LowRank,
     depth,
-    heads,
     l2norm,
-    layer_input,
     recurrence,
 )
 from bux.architecture.norm import Norm
 from bux.architecture.registry import Context, Taps, register, segments
 from bux.architecture.segments import Segments
+from bux.architecture.sharding import shard_heads, shard_layer_input
 from bux.lang import ir
 
 
 def _previous(x: Float[Array, "b t d"], docs: Segments | None) -> Float[Array, "b t d"]:
-    """Every token's predecessor in its document, zero at a document's start."""
+    """Return every token's predecessor in its document, zero at a document's
+    start."""
     prev = jnp.pad(x, ((0, 0), (1, 0), (0, 0)))[:, :-1]
     return prev if docs is None else jnp.where((docs.within > 0)[..., None], prev, 0)
 
 
 class RWKV7(nnx.Module):
     """RWKV-7 time mixing. Every projection reads the token moved toward the one before
-    it by a learned amount a channel (token shift). The state follows the generalized
+    it by a learned amount per channel (token shift). The state follows the generalized
     delta rule
 
         S_t = (diag(w_t) - (a_t kk_t) kk_t^T) S_{t-1} + k_t v_t^T,    o_t = S_t^T r_t
 
     with kk the normalized key it removes from, a the in-context learning rate, and
-    log w = -e^-0.5 sigmoid(.) a key channel. Low-rank projections make w, a, the output
-    gate g and the value residual's mix. The output is a layer norm of each head, plus a
-    bonus (r k r_k) v a head, times g. Parameters start as RWKV-LM starts them, by the
-    layer's depth among the model's token mixers.
+    log w = -e^-0.5 sigmoid(.) per key channel. Low-rank projections make w, a, the
+    output gate g and the value residual's mix. The output is a layer norm of each head,
+    plus a bonus (r k r_k) v per head, times g. Parameters start as RWKV-LM starts them,
+    by the layer's depth among the model's token mixers.
 
     Ports: `v` written pushes the values; read moves the values toward the tap's by a
-    learned amount a channel, from a projection of rank `v_rank`. That is RWKV-7's value
-    residual, with the first layer's values: `rwkv7(v=@v0)` first, then `rwkv7(v=$v0)`.
+    learned amount per channel, from a projection of rank `v_rank`. That is RWKV-7's
+    value residual, with the first layer's values: `rwkv7(v=@v0)` first, then
+    `rwkv7(v=$v0)`.
     """
 
     def __init__(
         self,
-        c: cfg.RWKV7Config,
+        config: cfg.RWKV7Config,
         width: int,
         ports: Sequence[ir.Port],
         rngs: nnx.Rngs,
@@ -63,12 +64,12 @@ class RWKV7(nnx.Module):
         layer: int = 0,
         layers: int = 1,
     ):
-        if c.conv_size is not None:
+        if config.conv_size is not None:
             raise NotImplementedError("rwkv7 with a short conv (it shifts tokens)")
-        h, hv = c.num_heads, c.num_v_heads or c.num_heads
+        h, hv = config.num_heads, config.num_v_heads or config.num_heads
         if hv % h:
             raise ValueError(f"num_v_heads={hv} is not a multiple of num_heads={h}")
-        dk, dv = c.head_dim, c.v_head_dim or c.head_dim
+        dk, dv = config.head_dim, config.v_head_dim or config.head_dim
         self.heads, self.v_heads, self.head_dim, self.v_head_dim = h, hv, dk, dv
         self.ports = tuple(ports)
         nk, nv = h * dk, hv * dv
@@ -85,13 +86,13 @@ class RWKV7(nnx.Module):
         zigzag = zigzag * jnp.abs(zigzag)
         decay = -6 + 6 * (n / max(nk - 1, 1)) ** (1 + deep**0.3)
 
-        def dense(n_out: int, bound: float, n_heads: int) -> nnx.Linear:
-            """A projection from the width to `n_heads` heads, uniform in
-            +-bound / sqrt(width)."""
+        def dense(n_out: int, scale: float, n_heads: int) -> nnx.Linear:
+            """Make a projection from the width to `n_heads` heads, uniform in
+            +-scale / sqrt(width)."""
             init = functools.partial(
                 jax.random.uniform,
-                minval=-bound / math.sqrt(width),
-                maxval=bound / math.sqrt(width),
+                minval=-scale / math.sqrt(width),
+                maxval=scale / math.sqrt(width),
             )
             init = parallel.named("embed", ("heads", n_heads), init=init)
             return nnx.Linear(width, n_out, use_bias=False, kernel_init=init, rngs=rngs)
@@ -116,36 +117,38 @@ class RWKV7(nnx.Module):
 
         self.r, self.k = dense(nk, 0.5, h), dense(nk, 0.05, h)
         self.v = dense(nv, 0.5, hv)
-        self.w = lora(c.decay_rank, nk, decay + 0.5 + zigzag * 2.5, "tanh", h)
-        self.a = lora(c.a_rank, nk, -0.19 + zigzag * 0.3 + linear * 0.4, None, h)
+        self.w = lora(config.decay_rank, nk, decay + 0.5 + zigzag * 2.5, "tanh", h)
+        self.a = lora(config.a_rank, nk, -0.19 + zigzag * 0.3 + linear * 0.4, None, h)
         reads_v = any(p.name == "v" and p.mode != "write" for p in ports)
         self.v_mix = (
-            lora(c.v_rank, nv, 0.73 - v_linear * 0.4, None, hv) if reads_v else None
+            lora(config.v_rank, nv, 0.73 - v_linear * 0.4, None, hv)
+            if reads_v
+            else None
         )
         self.g = (
-            lora(c.gate_rank, nv, False, c.output_gate, hv)
-            if c.output_gate is not None
+            lora(config.gate_rank, nv, False, config.output_gate, hv)
+            if config.output_gate is not None
             else None
         )
         self.k_k = nnx.Param(0.71 - linear * 0.1, names=(("heads", h),))
         self.k_a = nnx.Param(jnp.full(nk, 1.02), names=(("heads", h),))
         self.r_k = nnx.Param(jnp.full((hv, dk), -0.04), names=("heads", None))
         group = cfg.NormalizationConfig(
-            type="layernorm", bias=True, eps=dv * c.norm_eps
+            type="layernorm", bias=True, eps=dv * config.norm_eps
         )
         self.norm = Norm(group, (hv, dv))
         zeros = parallel.named(("heads", hv), "embed", init=nnx.initializers.zeros)
         self.o = nnx.Linear(nv, width, use_bias=False, kernel_init=zeros, rngs=rngs)
 
     def __call__(self, x: Float[Array, "b t d"], taps: Taps) -> Float[Array, "b t d"]:
-        x = layer_input(x)
+        x = shard_layer_input(x)
         b, t, _ = x.shape
         h, hv, dk, dv = self.heads, self.v_heads, self.head_dim, self.v_head_dim
         docs = segments(taps)
         xr, xw, xk, xv, xa, xg = (
             x + (_previous(x, docs) - x) * self.shift[:, None, None]
         )
-        r, k, v = self.r(xr), self.k(xk), heads(self.v(xv).reshape(b, t, hv, dv))
+        r, k, v = self.r(xr), self.k(xk), shard_heads(self.v(xv).reshape(b, t, hv, dv))
         if self.v_mix is not None:  # value residual
             mix = jax.nn.sigmoid(self.v_mix(xv)).reshape(v.shape)
             v = v + (_read(taps, self.ports, "v") - v) * mix
@@ -155,13 +158,13 @@ class RWKV7(nnx.Module):
         kk = k * self.k_k
         k = k * (1 + (a - 1) * self.k_a)
 
-        def split(y: Float[Array, "b t n"]) -> Float[Array, "b t h k"]:
+        def split(y: Float[Array, "b t n"]) -> Float[Array, "b t h dk"]:
             """Split into heads, each serving its group of value heads."""
-            return jnp.repeat(heads(y.reshape(b, t, h, dk)), hv // h, axis=2)
+            return jnp.repeat(shard_heads(y.reshape(b, t, h, dk)), hv // h, axis=2)
 
         r, k, log_w, a, kk = map(split, (r, k, log_w, a, kk))
         kk = l2norm(kk, eps=1e-12)
-        o = heads(recurrence(r, k, v, log_w, docs, a=-kk, b=kk * a))
+        o = shard_heads(recurrence(r, k, v, log_w, docs, a=-kk, b=kk * a))
         o = self.norm(o) + (r * k * self.r_k).sum(-1, keepdims=True) * v
         o = o.reshape(b, t, -1)
         if self.g is not None:

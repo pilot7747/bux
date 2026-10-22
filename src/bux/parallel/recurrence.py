@@ -1,19 +1,19 @@
 """Context parallelism for recurrent mixers: what the methods of `methods.recurrence`
 take, and `pass_state`.
 
-Every recurrent mixer keeps a state S of k by v a head, which each position decays
-and adds to, and reads its outputs from, linearly. So a chunk of positions maps the
-state it starts from to the one it ends with by an affine map, its transition
+Every recurrent mixer keeps one state S of dk by dv per head, which each position
+decays and adds to, and reads its outputs from, linearly. So a chunk of positions maps
+the state it starts from to the one it ends with by an affine map, its transition
 
     S -> A S + B,
 
-with A a k by k matrix a head (the delta rule, RWKV-7), or its diagonal (GLA, Mamba),
-or a scalar (Lightning, Mamba-2), and zero across a document start; and each output
-of the chunk gains reads_t . S from the state S it starts from.
+with A one dk by dk matrix per head (the delta rule, RWKV-7), or its diagonal (GLA,
+Mamba), or a scalar (Lightning, Mamba-2), and zero across a document start; and each
+output of the chunk gains reads_t . S from the state S it starts from.
 
 A method is ``(recurrence) -> out``: a `Recurrence` names the family and holds a
 function that runs it over a chunk of positions from a zero state (`Chunk`), with
-its inputs; `out` is the outputs (b, t, h, v) in float32. `scan`, the default, runs
+its inputs; `out` is the outputs (b, t, h, dv) in float32. `scan`, the default, runs
 every position as one chunk, and is in bux.architecture.linear_attention. A method
 that cannot run a family raises NotImplementedError naming it.
 """
@@ -31,20 +31,20 @@ from bux.parallel import methods
 from bux.parallel.layout import spec
 from bux.parallel.mesh import active
 
-Positions = tuple[Shaped[Array, "b t ..."], ...]  # what a chunk takes a position of
+Positions = tuple[Shaped[Array, "b t ..."], ...]  # what a chunk takes per position
 Shared = tuple[Float[Array, "..."], ...]  # what it takes whole: parameters
-# A matrix a head, or its diagonal: of k entries, or of 1.
-Transition = Float[Array, "b h k k"] | Float[Array, "b h _"]
+# One matrix per head, or its diagonal: of dk entries, or of 1.
+Transition = Float[Array, "b h dk dk"] | Float[Array, "b h _"]
 
 
 class Chunk(NamedTuple):
     """What a recurrence gives over a chunk of positions from a zero state; with its
     transition, also what a state it started from would add."""
 
-    out: Float[Array, "b t h v"]  # the outputs, in float32
-    state: Float[Array, "b h k v"] | None  # the state it ends with: B
+    out: Float[Array, "b t h dv"]  # the outputs, in float32
+    state: Float[Array, "b h dk dv"] | None  # the state it ends with: B
     transition: Transition | None  # A
-    reads: Float[Array, "b t h k"] | None  # out_t gains reads_t . S from a start S
+    reads: Float[Array, "b t h dk"] | None  # out_t gains reads_t . S from a start S
 
 
 # (xs, shared, transition) -> Chunk: the transition and the reads only if asked for.
@@ -62,9 +62,9 @@ class Recurrence(NamedTuple):
 
 
 def then(
-    transition: Transition, state: Float[Array, "b h k v"]
-) -> Float[Array, "b h k v"]:
-    """A S: a chunk's transition, applied to the state it starts from."""
+    transition: Transition, state: Float[Array, "b h dk dv"]
+) -> Float[Array, "b h dk dv"]:
+    """Return A S: a chunk's transition applied to the state it starts from."""
     if transition.ndim == state.ndim:
         return jnp.einsum("bhij,bhjv->bhiv", transition, state)
     return transition[..., None] * state
@@ -74,11 +74,11 @@ def then(
 
 
 @methods.recurrence.register("pass_state")
-def pass_state(r: Recurrence) -> Float[Array, "b t h v"]:
-    """Each device of the axes that split positions runs its own chunk from a zero
-    state, keeping its transition; the transitions fold, in turn, into the state each
-    chunk starts from (LASP-2: XLA all-gathers them); and each device corrects its
-    outputs by what they read of it.
+def pass_state(r: Recurrence) -> Float[Array, "b t h dv"]:
+    """Run each device's chunk of positions from a zero state, keeping its
+    transition; fold the transitions in turn into the state each chunk starts from
+    (LASP-2: XLA all-gathers them); then correct each device's outputs by what they
+    read of it.
 
     Both shard_maps are manual over every axis that splits the tokens and hold no
     collective, so that the axes they leave auto (`tensor`) keep the heads split: the
@@ -86,7 +86,7 @@ def pass_state(r: Recurrence) -> Float[Array, "b t h v"]:
     tokens = _tokens(r.xs[0])
     if tokens is None:
         return r.chunk(r.xs, r.shared, False).out
-    chunks = P(tokens[1], tokens[0])  # (c, b, ...): one of c chunks a device
+    chunks = P(tokens[1], tokens[0])  # (c, b, ...): one of c chunks per device
     manual = set(_axes(tokens))
     out, states, transitions, reads = jax.shard_map(
         partial(_run, r.chunk, r.family),
@@ -100,46 +100,47 @@ def pass_state(r: Recurrence) -> Float[Array, "b t h v"]:
 
 
 def _tokens(x: Shaped[Array, "b t ..."]) -> P | None:
-    """How a (b, t, ...) array splits, rows over `batch` and positions over `seq`;
-    None if the positions do not."""
+    """Return how a (b, t, ...) array splits, rows over `batch` and positions over
+    `seq`; None if the positions do not split."""
     if active() is None:
         return None
     rows, positions = spec(("batch", "seq"), x.shape[:2])
     return None if positions is None else P(rows, positions)
 
 
-def _axes(s: P) -> set[str]:
-    """The mesh axes `s` splits over."""
-    return {a for d in s if d for a in ((d,) if isinstance(d, str) else d)}
+def _axes(split: P) -> set[str]:
+    """Return the mesh axes `split` splits over."""
+    return {a for s in split if s for a in ((s,) if isinstance(s, str) else s)}
 
 
 def _run(
     chunk: Chunked, family: str, xs: Positions, shared: Shared
 ) -> tuple[
-    Float[Array, "b n h v"],
-    Float[Array, "1 b h k v"],
+    Float[Array, "b n h dv"],
+    Float[Array, "1 b h dk dv"],
     Float[Array, "1 b h ..."],
-    Float[Array, "b n h k"],
+    Float[Array, "b n h dk"],
 ]:
-    """A device's chunk: its outputs, its state and transition (one of a stack of
-    chunks), and its reads."""
-    c = chunk(xs, shared, True)
-    if c.state is None or c.transition is None or c.reads is None:
+    """Run a device's chunk: return its outputs, its state and transition (as one of
+    a stack of chunks), and its reads."""
+    result = chunk(xs, shared, True)
+    if result.state is None or result.transition is None or result.reads is None:
         raise NotImplementedError(
             f"methods.recurrence = pass_state: {family} gives no transition"
         )
-    return c.out, c.state[None], c.transition[None], c.reads
+    return result.out, result.state[None], result.transition[None], result.reads
 
 
 def _starts(
-    states: Float[Array, "c b h k v"], transitions: Float[Array, "c b h ..."]
-) -> Float[Array, "c b h k v"]:
-    """The state each of c chunks starts from: every chunk's map before it, in turn,
-    from a zero state."""
+    states: Float[Array, "c b h dk dv"], transitions: Float[Array, "c b h ..."]
+) -> Float[Array, "c b h dk dv"]:
+    """Return the state each of c chunks starts from: the maps before it, applied in
+    turn to a zero state."""
 
     def step(
-        s: Float[Array, "b h k v"], chunk: tuple[Float[Array, "b h k v"], Transition]
-    ) -> tuple[Float[Array, "b h k v"], Float[Array, "b h k v"]]:
+        s: Float[Array, "b h dk dv"],
+        chunk: tuple[Float[Array, "b h dk dv"], Transition],
+    ) -> tuple[Float[Array, "b h dk dv"], Float[Array, "b h dk dv"]]:
         ends, transition = chunk
         return then(transition, s) + ends, s
 
@@ -147,9 +148,9 @@ def _starts(
 
 
 def _correct(
-    out: Float[Array, "b n h v"],
-    reads: Float[Array, "b n h k"],
-    start: Float[Array, "1 b h k v"],
-) -> Float[Array, "b n h v"]:
-    """A device's outputs, with what they read of the state its chunk starts from."""
+    out: Float[Array, "b n h dv"],
+    reads: Float[Array, "b n h dk"],
+    start: Float[Array, "1 b h dk dv"],
+) -> Float[Array, "b n h dv"]:
+    """Add to a device's outputs what they read of the state its chunk starts from."""
     return out + jnp.einsum("bnhk,bhkv->bnhv", reads, start[0])

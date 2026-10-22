@@ -12,14 +12,14 @@ from bux.lang import ir
 
 
 class Norm(nnx.Module):
-    def __init__(self, c: cfg.NormalizationConfig, width: int | tuple[int, ...]):
-        self.kind = c.type
-        self.eps = c.eps
-        self.zero_centered = c.zero_centered
-        self.scale_input = c.scale_input
-        init = jnp.zeros if c.zero_centered else jnp.ones
-        self.scale = nnx.Param(init(width)) if c.affine else None
-        self.bias = nnx.Param(jnp.zeros(width)) if c.bias else None
+    def __init__(self, config: cfg.NormalizationConfig, width: int | tuple[int, ...]):
+        self.kind = config.type
+        self.eps = config.eps
+        self.zero_centered = config.zero_centered
+        self.scale_input = config.scale_input
+        init = jnp.zeros if config.zero_centered else jnp.ones
+        self.scale = nnx.Param(init(width)) if config.affine else None
+        self.bias = nnx.Param(jnp.zeros(width)) if config.bias else None
 
     def __call__(
         self, x: Float[Array, "*lead d"], taps: Taps | None = None
@@ -37,8 +37,8 @@ class Norm(nnx.Module):
         return x
 
     def normalize(self, x: Float[Array, "*lead d"]) -> Float[Array, "*lead d"]:
-        """x over its RMS, centered first for a layernorm: the statistics in float32,
-        the result in x's dtype."""
+        """Return x over its RMS, centered first for a layernorm: the statistics in
+        float32, the result in x's dtype."""
         y = x.astype(jnp.float32)
         if self.kind == "layernorm":
             y = y - y.mean(-1, keepdims=True)

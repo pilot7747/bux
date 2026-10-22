@@ -31,7 +31,7 @@ from bux.architecture import (
 )
 from bux.architecture.engram import _ngram_rows
 from bux.architecture.graph import Sequence
-from bux.architecture.moe import mix
+from bux.architecture.moe import dense_weights
 from bux.architecture.rope import frequencies, rotate
 from bux.lang import compile, compile_runs, ir
 from bux.train import config as tcfg
@@ -245,7 +245,7 @@ def test_group_limited_routing_picks_experts_in_the_best_groups_only():
     e.router_bias[...] = jax.random.normal(jax.random.key(3), (8,)) * 0.1
     x = jax.random.normal(jax.random.key(1), (2, 16, D))
     idx, weights, _ = e._route(x)
-    dense = mix(idx, weights, 8)
+    dense = dense_weights(idx, weights, 8)
     scores = jax.nn.sigmoid(e.router(x))
     for row, score in zip(dense.reshape(-1, 8), scores.reshape(-1, 8)):
         choice = (score + e.router_bias[...]).reshape(4, 2)

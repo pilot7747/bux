@@ -3,10 +3,10 @@ axes `layout.experts` gives them (`expert`), each device running its own.
 
     all_gather         each device gathers its group's tokens, runs its experts on
                        them, and a psum_scatter brings each token its sum back
-    all_to_all         each pick goes to its expert's device and back, in a buffer
-                       a peer that holds every local pick: dropless
-    ragged_all_to_all  each pick goes to its expert's device and back, one ragged
-                       slice a peer; XLA:CPU lacks it
+    all_to_all         each pick goes to its expert's device and back, in one buffer
+                       per peer that holds every local pick: dropless
+    ragged_all_to_all  each pick goes to its expert's device and back, in one ragged
+                       slice per peer; XLA:CPU lacks it
 
 Each runs a body on one device's tokens (``method``), in a shard_map manual over the
 axes that split the tokens, so that every device sorts its own. The experts' kernels
@@ -28,10 +28,10 @@ from bux.architecture.moe import (
     Kernels,
     MoE,
     Rows,
-    by_expert,
     pick_rows,
     routed,
     run_sorted,
+    sort_by_expert,
 )
 from bux.parallel import methods
 from bux.parallel.layout import spec
@@ -46,8 +46,8 @@ Exchange = Callable[..., Float[Array, "m d"]]
 
 
 def method(body: Body) -> Callable[..., Float[Array, "b t d"]]:
-    """A method of ``methods.moe`` that runs `body` on every device: `sorted` where
-    no axis splits the experts."""
+    """Return a method of ``methods.moe`` that runs `body` on every device, or
+    `sorted` where no axis splits the experts."""
 
     def run(
         moe: MoE,
@@ -55,11 +55,12 @@ def method(body: Body) -> Callable[..., Float[Array, "b t d"]]:
         idx: Int[Array, "b t k"],
         weights: Float[Array, "b t k"],
     ) -> Float[Array, "b t d"]:
-        ep = _axes(spec(("experts",), (moe.num_experts,)))
+        ep = _axes(spec(("experts",), (moe.config.num_experts,)))
         if not ep:
             return run_sorted(moe, z, idx, weights)
         tokens = _tokens(z, ep)
-        local = functools.partial(body, axes=ep, ffn=moe.ffn, norm=moe.expert_norm)
+        ffn, norm = moe.config.expert, moe.expert_norm
+        local = functools.partial(body, axes=ep, ffn=ffn, norm=norm)
         return jax.shard_map(
             local,
             in_specs=(tokens, tokens, tokens, P(ep)),
@@ -70,14 +71,14 @@ def method(body: Body) -> Callable[..., Float[Array, "b t d"]]:
     return run
 
 
-def _axes(s: P) -> Axes:
-    """The mesh axes `s` splits over, in order."""
-    return tuple(a for e in s if e for a in ((e,) if isinstance(e, str) else e))
+def _axes(split: P) -> Axes:
+    """Return the mesh axes `split` splits over, in order."""
+    return tuple(a for s in split if s for a in ((s,) if isinstance(s, str) else s))
 
 
 def _tokens(z: Float[Array, "b t d"], ep: Axes) -> P:
-    """The tokens' spec: rows over `batch` and positions over `seq`, and rows over
-    the experts' axes `ep` too where those leave them whole."""
+    """Return the tokens' spec: rows over `batch` and positions over `seq`, and rows
+    over the experts' axes `ep` too where those leave them whole."""
     batch, seq, _ = spec(("batch", "seq", None), z.shape)
     taken = _axes(P(batch, seq))
     rows = _axes(P(batch)) + tuple(a for a in ep if a not in taken)
@@ -104,8 +105,8 @@ def gathered(
     ffn: cfg.MLPConfig,
     norm: Rows | None,
 ) -> Float[Array, "b t d"]:
-    """Every device of the group gets all of its tokens, runs its own experts on
-    them, and keeps the group's sum for its own."""
+    """Gather the group's tokens onto each of its devices, run each device's experts
+    on them, and reduce-scatter the sums back."""
     first = jax.lax.axis_index(axes) * kernels[0].shape[0]
     group = functools.partial(jax.lax.all_gather, axis_name=axes, tiled=True)
     y = routed(group(z), group(idx) - first, group(weights), *kernels, ffn, norm)
@@ -118,11 +119,11 @@ def gathered(
 def _buffers(
     idx: Int[Array, "b t k"], local: int, peers: int
 ) -> tuple[Int[Array, "p n"], Int[Array, "p n"], tuple[Int[Array, " n"], ...]]:
-    """A buffer of n slots a peer, for the n picks: the pick in each slot (any, past
-    the peer's), and its expert on that peer (`local`, none, past them); and the
-    slot of each pick, as (peer, slot)."""
+    """Lay the n picks out in a buffer of n slots per peer: return the pick in each
+    slot (any, past the peer's), its expert on that peer (`local`, none, past them),
+    and each pick's (peer, slot)."""
     flat, n = idx.reshape(-1), idx.size
-    order, sizes = by_expert(idx, local * peers)
+    order, sizes = sort_by_expert(idx, local * peers)
     sent = sizes.reshape(peers, local).sum(-1)
     start = jnp.cumsum(sent) - sent
     slot = jnp.arange(n)
@@ -142,7 +143,7 @@ def exchanged(
     ffn: cfg.MLPConfig,
     norm: Rows | None,
 ) -> Float[Array, "b t d"]:
-    """Each pick to its expert's device and back, through buffers of a fixed size:
+    """Send each pick to its expert's device and back, through fixed-size buffers:
     each peer's holds every local pick, so that none drops."""
     d, k, local = z.shape[-1], idx.shape[-1], kernels[0].shape[0]
     pick, expert, slot = _buffers(idx, local, jax.lax.axis_size(axes))
@@ -150,25 +151,25 @@ def exchanged(
         jax.lax.all_to_all, axis_name=axes, split_axis=0, concat_axis=0, tiled=True
     )
     rows, expert = swap(z.reshape(-1, d)[pick // k]), swap(expert)[..., None]
-    one = jnp.ones(expert.shape, z.dtype)
-    out = swap(routed(rows, expert, one, *kernels, ffn, norm))
-    each = out[slot].reshape(*idx.shape, d)
-    return jnp.einsum("btkd,btk->btd", each, weights)
+    ones = jnp.ones(expert.shape, z.dtype)
+    out = swap(routed(rows, expert, ones, *kernels, ffn, norm))
+    per_pick = out[slot].reshape(*idx.shape, d)
+    return jnp.einsum("btkd,btk->btd", per_pick, weights)
 
 
 # --- ragged_all_to_all -----------------------------------------------------------------
 
 
 def _arrived(counts: Int[Array, "p l"], m: int) -> Int[Array, " m"]:
-    """The local expert of each of `m` rows that arrive from the peers in turn, each
-    peer's sorted by expert, counts[i, j] of them from peer i for expert j; `l`,
-    none, past them."""
+    """Return the local expert of each of `m` rows that arrive from the peers in
+    turn, each peer's sorted by expert, counts[i, j] of them from peer i for expert j;
+    `l`, none, past them."""
     ends = jnp.cumsum(counts.reshape(-1))
     # How many groups end at or before each row (jnp.searchsorted fails in a
     # shard_map on jax 0.12).
-    g = jnp.cumsum(jnp.zeros(m, ends.dtype).at[ends].add(1, mode="drop"))
+    ended = jnp.cumsum(jnp.zeros(m, ends.dtype).at[ends].add(1, mode="drop"))
     local = counts.shape[1]
-    return jnp.where(g < counts.size, g % local, local)
+    return jnp.where(ended < counts.size, ended % local, local)
 
 
 def ragged(
@@ -182,35 +183,35 @@ def ragged(
     norm: Rows | None,
     exchange: Exchange = jax.lax.ragged_all_to_all,
 ) -> Float[Array, "b t d"]:
-    """Each peer's picks to it as one slice and back, after the slices of the peers
-    before: a buffer holds what every peer could send, but only what they do send
+    """Send each peer its picks as one slice and back, after the slices of the peers
+    before it: a buffer holds what every peer could send, but only what they do send
     moves."""
     d, k, n, local = z.shape[-1], idx.shape[-1], idx.size, kernels[0].shape[0]
-    peers, me = jax.lax.axis_size(axes), jax.lax.axis_index(axes)
-    order, sizes = by_expert(idx, local * peers)
+    peers, device = jax.lax.axis_size(axes), jax.lax.axis_index(axes)
+    order, sizes = sort_by_expert(idx, local * peers)
     every = jax.lax.all_gather(sizes, axes)  # each device's picks of each expert
-    s = every.reshape(peers, peers, local).sum(-1)  # s[i, j]: from device i to j
-    before, ahead = jnp.cumsum(s, 0) - s, jnp.cumsum(s, 1) - s
+    sent = every.reshape(peers, peers, local).sum(-1)  # [i, j]: from device i to j
+    before, ahead = jnp.cumsum(sent, 0) - sent, jnp.cumsum(sent, 1) - sent
     # Buffers like z, so that they vary over the devices as it does: the exchange
     # types its result as its buffer.
-    there = exchange(
+    received = exchange(
         pick_rows(z.reshape(-1, d), order, jnp.argsort(order), k),
         jnp.zeros_like(z, shape=(peers * n, d)),
-        *(ahead[me], s[me], before[me], s[:, me]),
+        *(ahead[device], sent[device], before[device], sent[:, device]),
         axis_name=axes,
     )
-    mine = jax.lax.dynamic_slice_in_dim(every, me * local, local, axis=1)
-    expert = _arrived(mine, peers * n)[None, :, None]
-    one = jnp.ones(expert.shape, z.dtype)
-    out = routed(there[None], expert, one, *kernels, ffn, norm)[0]
-    back = exchange(
+    counts = jax.lax.dynamic_slice_in_dim(every, device * local, local, axis=1)
+    expert = _arrived(counts, peers * n)[None, :, None]
+    ones = jnp.ones(expert.shape, z.dtype)
+    out = routed(received[None], expert, ones, *kernels, ffn, norm)[0]
+    returned = exchange(
         out,
         jnp.zeros_like(z, shape=(n, d)),
-        *(before[:, me], s[:, me], ahead[:, me], s[me]),
+        *(before[:, device], sent[:, device], ahead[:, device], sent[device]),
         axis_name=axes,
     )
-    each = back[jnp.argsort(order)].reshape(*idx.shape, d)
-    return jnp.einsum("btkd,btk->btd", each, weights)
+    per_pick = returned[jnp.argsort(order)].reshape(*idx.shape, d)
+    return jnp.einsum("btkd,btk->btd", per_pick, weights)
 
 
 methods.moe.register("all_gather")(method(gathered))

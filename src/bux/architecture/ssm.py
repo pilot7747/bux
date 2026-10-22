@@ -21,6 +21,7 @@ from bux.architecture.conv import CausalConv
 from bux.architecture.norm import Norm
 from bux.architecture.registry import Context, Taps, register, segments
 from bux.architecture.segments import Segments
+from bux.architecture.sharding import shard_layer_input
 from bux.lang import ir
 from bux.parallel.recurrence import Chunk, Positions, Recurrence, Shared
 
@@ -33,15 +34,16 @@ def selective_scan(
     C: Float[Array, "b t g n"],
     docs: Segments | None = None,
 ) -> Float[Array, "b t h p"]:
-    """The selective scan, a position at a time. Each of the h heads keeps an n by p
-    state S, and at every position
+    """Run the selective scan, one position at a time. Each of the h heads keeps an n
+    by p state S, and at every position
 
         S = exp(dt A) S + B (dt x)^T,    y = S^T C,
 
     with the heads in g groups that share B and C, as kv heads share keys in GQA. Mamba
-    has a head a channel (p = 1) and an A a channel and state dim; Mamba-2 has an A a
-    head (n = 1 in A). The state starts at zero, and again where a document starts.
-    By the run's `methods.recurrence`, in float32, the outputs in x's dtype."""
+    has one head per channel (p = 1) and one A per channel and state dim; Mamba-2 has
+    one A per head (n = 1 in A). The state starts at zero, and again where a document
+    starts. It runs by the run's `methods.recurrence`, in float32, the outputs in x's
+    dtype."""
     b, t = x.shape[:2]
     within = jnp.ones((b, t), jnp.int32) if docs is None else docs.within
     keep = (within > 0).astype(jnp.float32)  # 0 where a document starts
@@ -76,9 +78,9 @@ def _step(
 
 
 def chunk(xs: Positions, shared: Shared, transition: bool) -> Chunk:
-    """`selective_scan` over a chunk of positions, from a zero state, by a scan in
-    float32: its state n by p a head, as keys by values; with the `transition`, the
-    product P of every position's exp(dt A), and each output's reads P C."""
+    """Run `selective_scan` over a chunk of positions from a zero state, by a scan in
+    float32, its state n by p per head, as keys by values. With `transition`, also
+    return the product P of every position's exp(dt A), and each output's reads P C."""
     x, dt, B, C, keep = (jnp.moveaxis(a.astype(jnp.float32), 1, 0) for a in xs)
     A = shared[0].astype(jnp.float32)
     _, b, h, p = x.shape
@@ -93,11 +95,11 @@ def chunk(xs: Positions, shared: Shared, transition: bool) -> Chunk:
 
 
 def _dt_bias(
-    c: cfg.StateSpaceConfig, size: int, rngs: nnx.Rngs
+    config: cfg.StateSpaceConfig, size: int, rngs: nnx.Rngs
 ) -> Float[Array, " size"]:
-    """The time step bias as Mamba initializes it: softplus^-1 of steps log-uniform
-    between dt_min and dt_max, floored at 1e-4."""
-    low, high = math.log(c.dt_min), math.log(c.dt_max)
+    """Return the time step bias as Mamba initializes it: softplus^-1 of steps
+    log-uniform between dt_min and dt_max, floored at 1e-4."""
+    low, high = math.log(config.dt_min), math.log(config.dt_max)
     dt = jnp.exp(jax.random.uniform(rngs.params(), (size,), minval=low, maxval=high))
     dt = jnp.maximum(dt, 1e-4)
     return dt + jnp.log(-jnp.expm1(-dt))
@@ -106,22 +108,22 @@ def _dt_bias(
 def _out(
     n: int, width: int, name: parallel.Name, bias: bool, rngs: nnx.Rngs
 ) -> nnx.Linear:
-    """The projection of n channels named `name` back to the width."""
+    """Make the projection of n channels named `name` back to the width."""
     init = parallel.named(name, "embed")
     return nnx.Linear(n, width, use_bias=bias, kernel_init=init, rngs=rngs)
 
 
-def _whole(y: Float[Array, "b t n"]) -> Float[Array, "b t n"]:
-    """`y` whole but for its rows and positions, split as inside a layer (`seq`): a
-    layer's input, which under sequence parallelism is gathered before the
-    projections, not their weights; and what a fused projection gives, whose parts do
-    not split on shard boundaries."""
+def shard_fused(y: Float[Array, "b t c"]) -> Float[Array, "b t c"]:
+    """Keep a fused projection's output whole over its channels, whose parts do not
+    split on shard boundaries; its rows and positions split as inside a layer."""
     return parallel.shard(y, "batch", "seq", None)
 
 
-def _channels(y: Float[Array, "b t e"], name: parallel.Name) -> Float[Array, "b t e"]:
-    """`y`, its channels split as `name` says: what an output projection takes, so
-    that it reduces where they are, and the stream's split does not reach back."""
+def shard_channels(
+    y: Float[Array, "b t c"], name: parallel.Name
+) -> Float[Array, "b t c"]:
+    """Shard the channels an output projection takes as `name` says, so that it
+    reduces where they are, and the stream's split does not reach back."""
     return parallel.shard(y, "batch", "seq", name)
 
 
@@ -131,42 +133,42 @@ class Mamba(nnx.Module):
 
     The input projects to u and a gate z, both `expand` times the width. u is convolved
     over positions and SiLU'd, and projects to B and C, which all its channels share,
-    and to a time step of rank dt_rank, projected up to one a channel. Every channel
+    and to a time step of rank dt_rank, projected up to one per channel. Every channel
     keeps a state of state_size, which decays at its own rate in each state dim. With
     D u added, the output is gated by SiLU(z) and projected back.
     """
 
-    def __init__(self, c: cfg.MambaConfig, width: int, rngs: nnx.Rngs):
-        e, n = c.expand * width, c.state_size
-        r = c.dt_rank or math.ceil(width / 16)
+    def __init__(self, config: cfg.MambaConfig, width: int, rngs: nnx.Rngs):
+        d_inner, n = config.expand * width, config.state_size
+        r = config.dt_rank or math.ceil(width / 16)
         self.rank, self.state_size = r, n
-        self.in_proj = nnx.Linear(width, 2 * e, use_bias=False, rngs=rngs)
-        self.conv = CausalConv(e, c.conv_size, True, rngs, channel="mlp")
+        self.in_proj = nnx.Linear(width, 2 * d_inner, use_bias=False, rngs=rngs)
+        self.conv = CausalConv(d_inner, config.conv_size, True, rngs, channel="mlp")
         self.x_proj = nnx.Linear(
-            e,
+            d_inner,
             r + 2 * n,
             use_bias=False,
             kernel_init=parallel.named("mlp", None),
             rngs=rngs,
         )
         dt_proj = jax.random.uniform(
-            rngs.params(), (r, e), minval=-(r**-0.5), maxval=r**-0.5
+            rngs.params(), (r, d_inner), minval=-(r**-0.5), maxval=r**-0.5
         )
         self.dt_proj = nnx.Param(dt_proj, names=(None, "mlp"))
-        self.dt_bias = nnx.Param(_dt_bias(c, e, rngs), names=("mlp",))
+        self.dt_bias = nnx.Param(_dt_bias(config, d_inner, rngs), names=("mlp",))
         norm = cfg.NormalizationConfig(type="rmsnorm", eps=1e-6)
         self.dt_norm = Norm(norm, r)
         self.b_norm, self.c_norm = Norm(norm, n), Norm(norm, n)
         # S4D-real: A = -(1, 2, ..., n) in every channel.
-        A_log = jnp.tile(jnp.log(jnp.arange(1.0, n + 1)), (e, 1))
+        A_log = jnp.tile(jnp.log(jnp.arange(1.0, n + 1)), (d_inner, 1))
         self.A_log = nnx.Param(A_log, names=("mlp", None))
-        self.D = nnx.Param(jnp.ones(e), names=("mlp",))
-        self.out_proj = _out(e, width, "mlp", False, rngs)
+        self.D = nnx.Param(jnp.ones(d_inner), names=("mlp",))
+        self.out_proj = _out(d_inner, width, "mlp", False, rngs)
 
     def __call__(
         self, x: Float[Array, "b t d"], taps: Taps | None = None
     ) -> Float[Array, "b t d"]:
-        u, z = jnp.split(_whole(self.in_proj(_whole(x))), 2, axis=-1)
+        u, z = jnp.split(shard_fused(self.in_proj(shard_layer_input(x))), 2, axis=-1)
         u = jax.nn.silu(self.conv(u, taps))
         r, n = self.rank, self.state_size
         dt, B, C = jnp.split(self.x_proj(u), [r, r + n], axis=-1)
@@ -174,7 +176,8 @@ class Mamba(nnx.Module):
         B, C = self.b_norm(B)[:, :, None], self.c_norm(C)[:, :, None]
         A = -jnp.exp(self.A_log[...].astype(jnp.float32))
         y = selective_scan(u[..., None], dt, A, B, C, segments(taps))[..., 0]
-        return self.out_proj(_channels((y + u * self.D[...]) * jax.nn.silu(z), "mlp"))
+        y = (y + u * self.D[...]) * jax.nn.silu(z)
+        return self.out_proj(shard_channels(y, "mlp"))
 
 
 _HEADS = ("batch", "seq", "heads")
@@ -185,70 +188,72 @@ class Mamba2(nnx.Module):
     mixers compute it.
 
     The input projects to a gate z, to u, B and C, which are convolved over positions
-    together and SiLU'd, and to a time step a head. u splits into heads of head_dim,
-    whose states decay by one rate a head, and B and C into num_groups groups that the
-    heads share. With D u added, the output is gated by SiLU(z), RMS-normalized a group
-    of heads at a time (as Mamba-2's reference, Zamba2 and Nemotron-H group it) and
-    projected back.
+    together and SiLU'd, and to one time step per head. u splits into heads of
+    head_dim, whose states decay by one rate per head, and B and C into num_groups
+    groups that the heads share. With D u added, the output is gated by SiLU(z),
+    RMS-normalized one group of heads at a time (as Mamba-2's reference, Zamba2 and
+    Nemotron-H group it) and projected back.
     """
 
-    def __init__(self, c: cfg.Mamba2Config, width: int, rngs: nnx.Rngs):
-        e, n, g = c.expand * width, c.state_size, c.num_groups
-        h = e // c.head_dim
-        if h * c.head_dim != e or h % g:
+    def __init__(self, config: cfg.Mamba2Config, width: int, rngs: nnx.Rngs):
+        d_inner, n, g = config.expand * width, config.state_size, config.num_groups
+        h = d_inner // config.head_dim
+        if h * config.head_dim != d_inner or h % g:
             raise ValueError(
-                f"mamba2 splits {e} channels into heads of {c.head_dim}, and those "
-                f"into {g} groups"
+                f"mamba2 splits {d_inner} channels into heads of {config.head_dim}, "
+                f"and those into {g} groups"
             )
-        self.inner, self.heads, self.head_dim = e, h, c.head_dim
+        self.inner, self.heads, self.head_dim = d_inner, h, config.head_dim
         self.groups, self.state_size = g, n
         self.in_proj = nnx.Linear(
-            width, 2 * e + 2 * g * n + h, use_bias=False, rngs=rngs
+            width, 2 * d_inner + 2 * g * n + h, use_bias=False, rngs=rngs
         )
         # Over u, B and C side by side, as the projection gives them: whole.
-        self.conv = CausalConv(e + 2 * g * n, c.conv_size, True, rngs)
-        self.dt_bias = nnx.Param(_dt_bias(c, h, rngs), names=("heads",))
-        # A = -a, with a uniform in [1, 16] a head (Mamba-2's A_init_range).
+        self.conv = CausalConv(d_inner + 2 * g * n, config.conv_size, True, rngs)
+        self.dt_bias = nnx.Param(_dt_bias(config, h, rngs), names=("heads",))
+        # A = -a, with a uniform in [1, 16] per head (Mamba-2's A_init_range).
         a = jax.random.uniform(rngs.params(), (h,), minval=1.0, maxval=16.0)
         self.A_log = nnx.Param(jnp.log(a), names=("heads",))
         self.D = nnx.Param(jnp.ones(h), names=("heads",))
         norm = cfg.NormalizationConfig(type="rmsnorm", eps=1e-5)
-        self.norm = Norm(norm, (g, e // g))
-        self.out_proj = _out(e, width, ("heads", h), False, rngs)
+        self.norm = Norm(norm, (g, d_inner // g))
+        self.out_proj = _out(d_inner, width, ("heads", h), False, rngs)
 
     def __call__(
         self, x: Float[Array, "b t d"], taps: Taps | None = None
     ) -> Float[Array, "b t d"]:
         b, t, _ = x.shape
-        e, g, n = self.inner, self.groups, self.state_size
-        x = _whole(x)
-        proj = _whole(self.in_proj(x))
-        z, ubc, dt = jnp.split(proj, [e, 2 * e + 2 * g * n], axis=-1)
-        u, B, C = jnp.split(jax.nn.silu(self.conv(ubc, taps)), [e, e + g * n], axis=-1)
+        d_inner, g, n = self.inner, self.groups, self.state_size
+        x = shard_layer_input(x)
+        proj = shard_fused(self.in_proj(x))
+        z, ubc, dt = jnp.split(proj, [d_inner, 2 * d_inner + 2 * g * n], axis=-1)
+        ubc = jax.nn.silu(self.conv(ubc, taps))
+        u, B, C = jnp.split(ubc, [d_inner, d_inner + g * n], axis=-1)
         u = parallel.shard(u.reshape(b, t, self.heads, self.head_dim), *_HEADS, None)
         B, C = B.reshape(b, t, g, n), C.reshape(b, t, g, n)
         dt = parallel.shard(jax.nn.softplus(dt + self.dt_bias[...]), *_HEADS)
         A = -jnp.exp(self.A_log[...].astype(jnp.float32))[:, None]
         y = selective_scan(u, dt, A, B, C, segments(taps)) + u * self.D[...][:, None]
-        y = y.reshape(b, t, e) * jax.nn.silu(z)
-        y = self.norm(y.reshape(b, t, g, -1)).reshape(b, t, e)
-        return self.out_proj(_channels(y, ("heads", self.heads)))
+        y = y.reshape(b, t, d_inner) * jax.nn.silu(z)
+        y = self.norm(y.reshape(b, t, g, -1)).reshape(b, t, d_inner)
+        return self.out_proj(shard_channels(y, ("heads", self.heads)))
 
 
 class ShortConv(nnx.Module):
     """LFM2's double-gated short convolution: the input projects to B, C and u, and
     the output is C times the causal convolution of B u, projected back."""
 
-    def __init__(self, c: cfg.ShortConvConfig, width: int, rngs: nnx.Rngs):
-        self.in_proj = nnx.Linear(width, 3 * width, use_bias=c.bias, rngs=rngs)
-        self.conv = CausalConv(width, c.conv_size, c.bias, rngs, channel="mlp")
-        self.out_proj = _out(width, width, "mlp", c.bias, rngs)
+    def __init__(self, config: cfg.ShortConvConfig, width: int, rngs: nnx.Rngs):
+        bias = config.bias
+        self.in_proj = nnx.Linear(width, 3 * width, use_bias=bias, rngs=rngs)
+        self.conv = CausalConv(width, config.conv_size, bias, rngs, channel="mlp")
+        self.out_proj = _out(width, width, "mlp", bias, rngs)
 
     def __call__(
         self, x: Float[Array, "b t d"], taps: Taps | None = None
     ) -> Float[Array, "b t d"]:
-        B, C, u = jnp.split(_whole(self.in_proj(_whole(x))), 3, axis=-1)
-        return self.out_proj(_channels(C * self.conv(B * u, taps), "mlp"))
+        B, C, u = jnp.split(shard_fused(self.in_proj(shard_layer_input(x))), 3, axis=-1)
+        return self.out_proj(shard_channels(C * self.conv(B * u, taps), "mlp"))
 
 
 @register("mamba")
