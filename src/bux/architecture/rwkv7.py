@@ -14,7 +14,6 @@ from jaxtyping import Array, Float
 
 from bux import config as cfg
 from bux import parallel
-from bux.architecture.attention import _read, _write
 from bux.architecture.linear_attention import (
     LowRank,
     depth,
@@ -22,6 +21,7 @@ from bux.architecture.linear_attention import (
     recurrence,
 )
 from bux.architecture.norm import Norm
+from bux.architecture.ports import read, write
 from bux.architecture.registry import Context, Taps, register, segments
 from bux.architecture.segments import Segments
 from bux.architecture.sharding import shard_heads, shard_layer_input
@@ -151,8 +151,8 @@ class RWKV7(nnx.Module):
         r, k, v = self.r(xr), self.k(xk), shard_heads(self.v(xv).reshape(b, t, hv, dv))
         if self.v_mix is not None:  # value residual
             mix = jax.nn.sigmoid(self.v_mix(xv)).reshape(v.shape)
-            v = v + (_read(taps, self.ports, "v") - v) * mix
-        _write(taps, self.ports, "v", v)
+            v = v + (read(taps, self.ports, "v") - v) * mix
+        write(taps, self.ports, "v", v)
         log_w = -math.exp(-0.5) * jax.nn.sigmoid(self.w(xw))
         a = jax.nn.sigmoid(self.a(xa))
         kk = k * self.k_k

@@ -20,7 +20,7 @@ from bux import parallel
 from bux.architecture import Model
 from bux.lang import compile
 from bux.parallel import methods
-from bux.parallel.context import Visibility
+from bux.parallel.context import AttentionArgs
 from bux.train import config as tcfg
 from bux.train.data import Batch
 from bux.train.objective import objective
@@ -60,8 +60,8 @@ class Case(NamedTuple):
     softcap: float | None = None
     sinks: bool = False
 
-    def visibility(self, sinks: Float[Array, " h"]) -> Visibility:
-        return Visibility(
+    def visibility(self, sinks: Float[Array, " h"]) -> AttentionArgs:
+        return AttentionArgs(
             self.ids, self.window, D**-0.5, self.softcap, sinks if self.sinks else None
         )
 

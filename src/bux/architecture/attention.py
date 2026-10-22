@@ -1,17 +1,14 @@
-"""Softmax attention: the core that its layers share, and causal grouped-query attention.
+"""Causal grouped-query attention, and what it shares with MLA and CSA.
 
-Under tensor parallelism (``bux.parallel``) a device has whole heads: their columns of
-the projections in, their queries, keys, values, logits and outputs, and their rows of
-the output projection. The core (logits, probabilities, values) is the run's method of
-``methods.attention``: `auto`, the default, runs tokamax's fused kernels on a GPU and
-`xla` elsewhere. Under both, keys stay whole along their positions, so with `seq`
-split they are gathered: all-gather context parallelism.
+`Attention` is the GPT-2 and Llama layer: projections, QK-norm, RoPE, the run's
+`methods.attention` (``bux.parallel.context``), and the output projection. Two mixins
+add what needs all t by t logits, which only `xla`'s math makes: `FullLogits`
+(relative bias, length scale, attention dropout) and `Sparse` (the indexer of sparse
+attention). `build_gqa` picks the class the config needs.
 """
 
 from collections.abc import Sequence
-from typing import Any
 
-import jax
 import jax.numpy as jnp
 from flax import nnx
 from jaxtyping import Array, Bool, Float, Int
@@ -19,9 +16,10 @@ from jaxtyping import Array, Bool, Float, Int
 from bux import config as cfg
 from bux import parallel
 from bux.architecture.conv import CausalConv
-from bux.architecture.functional import activation, softcap
+from bux.architecture.functional import activation
 from bux.architecture.indexer import Indexer, Scores, from_stream
 from bux.architecture.norm import Norm
+from bux.architecture.ports import read, reads, write, writes
 from bux.architecture.registry import (
     Context,
     Taps,
@@ -30,191 +28,264 @@ from bux.architecture.registry import (
     segments,
     training,
 )
-from bux.architecture.rope import logit_gain, rotate
+from bux.architecture.rope import logit_gain, rotate, rotated_dims
 from bux.architecture.segments import Segments
+from bux.architecture.sharding import linear, shard_heads, shard_layer_input
 from bux.lang import ir
-from bux.parallel import methods
-from bux.parallel.context import Visibility, sees
+from bux.parallel.context import (
+    AttentionArgs,
+    causal_mask,
+    masked_softmax,
+    scaled_logits,
+    softcap,
+    weighted_values,
+)
 
 Names = tuple[parallel.Name, parallel.Name]  # a projection's input and output
-MIN = float(jnp.finfo(jnp.float32).min)  # the logit of a key not seen
+SoftmaxConfig = cfg.GQAConfig | cfg.MLAConfig | cfg.CSAConfig
+KEEP_MASK = "mask of kept keys (an indexer's top-k, or CSA's compression)"
 
 
-def _linear(
-    n_in: int, n_out: int, names: Names, bias: bool, rngs: nnx.Rngs
-) -> nnx.Linear:
-    """`nnx.Linear`, with its kernel's dimensions `names` and its bias's the last."""
-    return nnx.Linear(
-        n_in,
-        n_out,
-        use_bias=bias,
-        kernel_init=parallel.named(*names),
-        bias_init=parallel.named(names[1], init=nnx.initializers.zeros),
-        rngs=rngs,
-    )
+class SoftmaxAttention(nnx.Module):
+    """What the softmax attention layers share once they have q, k and v: the scale,
+    softcap, window and sinks of the attention method, and the output's norm, gate,
+    projection and dropout. A layer makes its projections, `o` among them, first.
 
+    Under tensor parallelism a device has whole heads: their columns of the input
+    projections, their q, k, v and outputs, and their rows of `o`.
+    """
 
-def _input(x: Float[Array, "b t d"]) -> Float[Array, "b t d"]:
-    """A layer's input, its positions split as inside a layer (`seq`), not as the
-    stream: under sequence parallelism, gathered before the projections."""
-    return parallel.shard(x, "batch", "seq", None)
+    o: nnx.Linear  # the output projection, which the layer makes
 
+    def __init__(
+        self,
+        config: SoftmaxConfig,
+        width: int,
+        heads: int,
+        kv_heads: int,
+        qk_head_dim: int,
+        v_head_dim: int,
+        bias: bool,
+        ports: Sequence[ir.Port],
+        rngs: nnx.Rngs,
+    ):
+        self.heads, self.kv_heads = heads, kv_heads
+        self.ports = tuple(ports)
+        gate_width = heads if config.gate_per_head else heads * v_head_dim
+        names = ("embed", ("heads", heads))
 
-def _by_head(x: Float[Array, "b t h e"], name: str) -> Float[Array, "b t h e"]:
-    """Queries, keys, values or head outputs, split by head as the heads' `name` says."""
-    return parallel.shard(x, "batch", "seq", name, None)
-
-
-def _read(taps: Taps, ports: tuple[ir.Port, ...], name: str) -> Any:
-    """What the layer reads (or pops) from its port `name`."""
-    port = next(p for p in ports if p.name == name and p.mode != "write")
-    stack = taps[port.tap]
-    return stack.pop() if port.mode == "pop" else stack[-1]
-
-
-def _write(taps: Taps, ports: tuple[ir.Port, ...], name: str, value: object) -> None:
-    """Push `value` to the tap of port `name`, if the layer writes that port."""
-    for port in ports:
-        if port.name == name and port.mode == "write":
-            taps.setdefault(port.tap, []).append(value)
-
-
-def _reads(ports: Sequence[ir.Port], name: str) -> bool:
-    """Whether the layer reads (or pops) its port `name`."""
-    return any(p.name == name and p.mode != "write" for p in ports)
-
-
-def _writes(ports: Sequence[ir.Port], name: str) -> bool:
-    """Whether the layer writes its port `name`."""
-    return any(p.name == name and p.mode == "write" for p in ports)
-
-
-def _own_indexer(
-    c: cfg.GQAConfig | cfg.MLAConfig | cfg.CSAConfig, ports: Sequence[ir.Port]
-) -> cfg.SparseIndexerConfig | None:
-    """The indexer the layer runs: none when it reads its selection from the index port
-    instead, so a layer that does needs none in its config either."""
-    own = None if _reads(ports, "index") else c.indexer
-    needs = [
-        p.name
-        for p in ports
-        if p.name == "candidates" or (p.name == "index" and p.mode == "write")
-    ]
-    if needs and own is None:
-        raise ValueError(
-            f"{c.type}: the '{needs[0]}' port needs an indexer that the layer runs: "
-            "give it indexer=indexer(...), and do not read index"
+        # The randomly initialized layers, after the layer's own projections.
+        self.gate = (
+            linear(width, gate_width, names, bias, rngs) if config.gated else None
         )
-    if own is not None and own.block_size > 1 and "candidates" in needs:
-        raise NotImplementedError("candidate pools of an indexer with block_size > 1")
-    return own
+        self._init_logit_layers(config, width, bias, rngs)
+        self.output_dropout = (
+            nnx.Dropout(config.output_dropout, rngs=rngs)
+            if config.output_dropout
+            else None
+        )
+
+        self.scale = (config.scale or qk_head_dim**-0.5) * logit_gain(config.rope)
+        self.softcap = config.softcap
+        self.window = config.sliding_window_size
+        self.sinks = (
+            nnx.Param(jnp.zeros(heads), names=("heads",)) if config.sinks else None
+        )
+        self.out_norm = (
+            Norm(config.output_norm, v_head_dim) if config.output_norm else None
+        )
+        self.gate_activation = config.gate_activation
+
+    def _init_logit_layers(
+        self, config: SoftmaxConfig, width: int, bias: bool, rngs: nnx.Rngs
+    ) -> None:
+        """Make the layers of `FullLogits`' features."""
+
+    def _attend(
+        self,
+        x: Float[Array, "b t d"],
+        q: Float[Array, "b t h dk"],
+        k: Float[Array, "b s g dk"],
+        v: Float[Array, "b s g dv"],
+        docs: Segments | None,
+    ) -> Float[Array, "b t h dv"]:
+        """Return every query's softmax-weighted values by the run's
+        `methods.attention`; `x` is for `FullLogits`."""
+        ids = None if docs is None else docs.ids
+        args = AttentionArgs(ids, self.window, self.scale, self.softcap, self._sinks())
+        return parallel.method("attention")(q, k, v, args)
+
+    def _sinks(self) -> Float[Array, " h"] | None:
+        return None if self.sinks is None else self.sinks[...]
+
+    def _output(
+        self, x: Float[Array, "b t d"], out: Float[Array, "b t h dv"]
+    ) -> Float[Array, "b t d"]:
+        """Normalize and gate the head outputs, then project them back to the width."""
+        b, t, _ = x.shape
+        if self.out_norm is not None:
+            out = self.out_norm(out)
+        if self.gate is not None:
+            gate = activation(self.gate_activation, self.gate(x))
+            out = out * gate.reshape(b, t, self.heads, -1)
+        y = self._project(shard_heads(out))
+        return y if self.output_dropout is None else self.output_dropout(y)
+
+    def _project(self, out: Float[Array, "b t h dv"]) -> Float[Array, "b t d"]:
+        """Project the heads back to the width."""
+        b, t, _, _ = out.shape
+        return self.o(out.reshape(b, t, -1))
 
 
-def _rows(docs: Segments | None, b: int, t: int) -> Segments:
-    """The documents of the rows, or one a row."""
-    if docs is not None:
-        return docs
-    return Segments.of(jnp.broadcast_to(jnp.arange(t, dtype=jnp.int32), (b, t)))
+class Attention(SoftmaxAttention):
+    """Causal grouped-query attention: MHA when num_kv_heads == num_heads, MQA when it
+    is 1.
+
+    Ports: `v` written pushes the values; read mixes the tap's values into the layer's,
+    as `value_residual` says (ResFormer). `kv` written pushes (k, v); read uses them
+    instead of projecting its own (cross-layer KV sharing).
+
+    Shapes: b rows, t queries and s keys (the same positions), d the width, h heads and
+    g kv heads, dk and dv the head dims of keys and values.
+    """
+
+    def __init__(
+        self,
+        config: cfg.GQAConfig,
+        width: int,
+        ports: Sequence[ir.Port],
+        rngs: nnx.Rngs,
+    ):
+        h, g = config.num_heads, config.num_kv_heads
+        dk = config.head_dim or width // h
+        dv = config.v_head_dim or dk
+        self.head_dim, self.v_head_dim = dk, dv
+        projects_kv = not reads(ports, "kv")  # else it takes the kv tap's
+        heads, kv_heads = ("heads", h), ("kv_heads", g)  # flattened with their dims
+
+        def proj(
+            n_in: int, n_out: int, names: Names, bias: bool | None = None
+        ) -> nnx.Linear:
+            bias = config.bias if bias is None else bias
+            return linear(n_in, n_out, names, bias, rngs)
+
+        def conv(channels: int, size: int) -> CausalConv:
+            return CausalConv(channels, size, False, rngs, channel=kv_heads)
+
+        # The randomly initialized layers; reordering them changes a seed's init.
+        fused = projects_kv and config.fused_qkv
+        split = projects_kv and not config.fused_qkv
+        # Fused, the split points of q, k and v do not fall on shard boundaries.
+        self.qkv = (
+            proj(width, h * dk + g * (dk + dv), ("embed", None)) if fused else None
+        )
+        self.q = None if fused else proj(width, h * dk, ("embed", heads))
+        self.k = proj(width, g * dk, ("embed", kv_heads)) if split else None
+        self.v = proj(width, g * dv, ("embed", kv_heads)) if split else None
+        self.o = proj(h * dv, width, (heads, "embed"), config.output_bias)
+        size = config.kv_conv_size if projects_kv else None
+        self.k_conv = conv(g * dk, size) if size else None
+        self.v_conv = conv(g * dv, size) if size else None
+        super().__init__(config, width, h, g, dk, dv, config.bias, ports, rngs)
+
+        qk_norm = config.qk_norm
+        self.q_norm = Norm(qk_norm, dk) if qk_norm else None
+        self.k_norm = Norm(qk_norm, dk) if qk_norm and projects_kv else None
+        self.rope = config.rope
+        self.value_residual = config.value_residual
+        shape = (2,) if config.value_residual == "learned" else ()
+        trained = reads(ports, "v") and config.value_residual != "fixed"
+        self.v_mix = nnx.Param(jnp.full(shape, 0.5)) if trained else None
+
+    def __call__(self, x: Float[Array, "b t d"], taps: Taps) -> Float[Array, "b t d"]:
+        x = shard_layer_input(x)
+        docs = segments(taps)
+        q, k, v = self._heads(x, docs, taps)
+        return self._output(x, self._attend(x, q, k, v, docs))
+
+    def _heads(
+        self, x: Float[Array, "b t d"], docs: Segments | None, taps: Taps
+    ) -> tuple[
+        Float[Array, "b t h dk"], Float[Array, "b s g dk"], Float[Array, "b s g dv"]
+    ]:
+        """Return the queries, keys and values, with the v port's values mixed in;
+        the keys and values from the kv port if the layer reads it."""
+        pos = None if docs is None else docs.positions
+        q, *kv = self._projections(x)
+        q = self._queries(q, pos)
+        if kv:
+            k, v = self._keys_and_values(*kv, pos, taps)
+        else:
+            k, v = read(taps, self.ports, "kv")
+        if reads(self.ports, "v"):
+            v = self._mix_values(v, read(taps, self.ports, "v"))
+        write(taps, self.ports, "v", v)
+        write(taps, self.ports, "kv", (k, v))
+        return q, k, v
+
+    def _projections(self, x: Float[Array, "b t d"]) -> list[Float[Array, "b t _"]]:
+        """Project the queries, then the keys and values unless the layer reads them
+        from its kv port: slices of one projection when fused, else one each."""
+        if self.qkv is not None:
+            q, k = self.heads * self.head_dim, self.kv_heads * self.head_dim
+            return jnp.split(self.qkv(x), [q, q + k], axis=-1)
+        return [p(x) for p in (self.q, self.k, self.v) if p is not None]
+
+    def _queries(
+        self, q: Float[Array, "b t _"], pos: Int[Array, "b t"] | None
+    ) -> Float[Array, "b t h dk"]:
+        """Reshape the projected queries into heads, then apply QK-norm and RoPE."""
+        b, t, _ = q.shape
+        q = q.reshape(b, t, self.heads, self.head_dim)
+        if self.q_norm is not None:
+            q = self.q_norm(q)
+        if self.rope is not None:
+            q = rotate(q, self.rope, pos)
+        return shard_heads(q)
+
+    def _keys_and_values(
+        self,
+        k: Float[Array, "b s _"],
+        v: Float[Array, "b s _"],
+        pos: Int[Array, "b s"] | None,
+        taps: Taps,
+    ) -> tuple[Float[Array, "b s g dk"], Float[Array, "b s g dv"]]:
+        """Add the causal conv to the projected keys and values, reshape them into
+        heads, then apply QK-norm and RoPE to the keys."""
+        b, s, _ = k.shape
+        if self.k_conv is not None and self.v_conv is not None:
+            k, v = k + self.k_conv(k, taps), v + self.v_conv(v, taps)
+        k = k.reshape(b, s, self.kv_heads, self.head_dim)
+        v = v.reshape(b, s, self.kv_heads, self.v_head_dim)
+        if self.k_norm is not None:
+            k = self.k_norm(k)
+        if self.rope is not None:
+            k = rotate(k, self.rope, pos)
+        return shard_heads(k, "kv_heads"), shard_heads(v, "kv_heads")
+
+    def _mix_values(
+        self, v: Float[Array, "b s g dv"], v1: Float[Array, "b s g dv"]
+    ) -> Float[Array, "b s g dv"]:
+        """Return the value residual a v + b v1: a = b = 0.5 fixed, both learned, or a
+        learned and b = 1 - a."""
+        if self.v_mix is None:
+            return 0.5 * v + 0.5 * v1
+        w = self.v_mix[...]
+        if self.value_residual == "learned":
+            return w[0] * v + w[1] * v1
+        return w * v + (1 - w) * v1
 
 
-def _causal(
+def token_mask(
     t: int, window: int | None, docs: Segments | None
-) -> Bool[Array, "*rows t s"]:
-    """Which of t keys at the same positions each of t queries sees: none ahead of it,
-    none `window` or more behind, and none of another document."""
-    index = jnp.arange(t)
-    return sees(window, index, index, None if docs is None else (docs.ids, docs.ids))
+) -> Bool[Array, "*b t s"]:
+    """Return the causal mask of t queries over the t keys at their positions, within
+    `window` and each query's document."""
+    return causal_mask(t, window, None if docs is None else docs.ids)
 
 
-def _relative_bias(
-    r: Float[Array, "b t h rank"],
-    table: Float[Array, "rank extent"],
-    offset: Int[Array, "t s"],
-) -> Float[Array, "b h t s"]:
-    """The bias <r[b, t, h], table[:, t - s]>; keys ahead of the query, or extent or
-    more behind, get none."""
-    extent = table.shape[-1]
-    rows = table[:, jnp.clip(offset, 0, extent - 1)]
-    near = (offset >= 0) & (offset < extent)
-    return jnp.einsum("bthr,rts->bhts", r, rows) * near
-
-
-def _length_scale(
-    pos: Int[Array, "*lead t"], log_scale: float, floor: int
-) -> Float[Array, "*lead t 1"]:
-    """The factor on each query's logits, for its position: 1 + log_scale *
-    ln(max(n / floor, 1)), at position n counted from 1."""
-    ahead = jnp.maximum((pos + 1) / floor, 1.0)
-    return (1 + log_scale * jnp.log(ahead))[..., None]
-
-
-def _softmax_with_sinks(
-    logits: Float[Array, "b h t s"], sinks: Float[Array, " h"]
-) -> Float[Array, "b h t s"]:
-    """Softmax over the keys, next to a per-head sink logit that takes a share of the
-    probability and attends to nothing."""
-    b, h, t, _ = logits.shape
-    sink = jnp.broadcast_to(sinks[None, :, None, None], (b, h, t, 1))
-    return jax.nn.softmax(jnp.concatenate([logits, sink], -1))[..., :-1]
-
-
-def _per_query_head(kv: Float[Array, "b s g e"], heads: int) -> Float[Array, "b s h e"]:
-    """Keys or values repeated for every query head of their group."""
-    return jnp.repeat(kv, heads // kv.shape[2], axis=2)
-
-
-def _scores(
-    q: Float[Array, "b t h k"], k: Float[Array, "b s g k"], scale: float
-) -> Float[Array, "b h t s"]:
-    """Every query's scaled dot product with every key, in float32; the keys whole
-    along their positions."""
-    k = _per_query_head(k, q.shape[2])
-    logits = jnp.einsum("bthd,bshd->bhts", q, k, preferred_element_type=jnp.float32)
-    return parallel.shard(logits * scale, "batch", "heads", "seq", None)
-
-
-def _probabilities(
-    logits: Float[Array, "b h t s"],
-    visible: Bool[Array, "*rows t s"],
-    sinks: Float[Array, " h"] | None,
-) -> Float[Array, "b h t s"]:
-    """The softmax over the keys each query sees, beside its head's sink if any, in
-    float32; a query that sees no key gets nothing."""
-    logits = jnp.where(visible, logits.astype(jnp.float32), MIN)
-    if sinks is None:
-        probs = jax.nn.softmax(logits)
-    else:
-        probs = _softmax_with_sinks(logits, sinks.astype(jnp.float32))
-    return jnp.where(visible, probs, 0)
-
-
-def _mix(
-    probs: Float[Array, "b h t s"], v: Float[Array, "b s g v"]
-) -> Float[Array, "b t h v"]:
-    """Every query's values, weighted by its probabilities."""
-    v = _per_query_head(v, probs.shape[1])
-    return jnp.einsum("bhts,bshd->bthd", probs.astype(v.dtype), v)
-
-
-@methods.attention.register("xla")
-def xla(
-    q: Float[Array, "b t h k"],
-    k: Float[Array, "b t g k"],
-    v: Float[Array, "b t g v"],
-    seen: Visibility,
-) -> Float[Array, "b t h v"]:
-    """`methods.attention`'s reference: all t by t logits at once. With `seq` over
-    `context`, each device has its own queries' rows of them, and every key and
-    value: all-gather context parallelism."""
-    index = jnp.arange(q.shape[1])
-    ids = None if seen.ids is None else (seen.ids, seen.ids)
-    visible = sees(seen.window, index, index, ids)[..., None, :, :]
-    logits = softcap(_scores(q, k, seen.scale), seen.softcap)
-    return _mix(_probabilities(logits, visible, seen.sinks), v)
-
-
-def _only_xla(feature: str) -> None:
-    """Raise unless the run's attention is `xla`, which alone has `feature`, or
+def require_xla(feature: str) -> None:
+    """Raise unless the run's attention is `xla`, the only method with `feature`, or
     `auto`, which takes xla for it."""
     on = parallel.active()
     name = on.methods.attention if on else "auto"
@@ -224,118 +295,179 @@ def _only_xla(feature: str) -> None:
         )
 
 
-class SoftmaxAttention(nnx.Module):
-    """What the softmax attention layers share, once they have their queries, keys and
-    values: the logits, with their scale, relative bias, length scale and softcap; the
-    causal, window, document and top-k masks; sinks and dropout; the output's norm,
-    gate and projection; and the sparse attention indexer, with its ports and its
-    loss. A layer makes its own projections, then calls this, then builds its indexer.
+def _relative_bias(
+    r: Float[Array, "b t h rank"],
+    table: Float[Array, "rank extent"],
+    offset: Int[Array, "t s"],
+) -> Float[Array, "b h t s"]:
+    """Return the bias <r[b, t, h], table[:, t - s]>; keys ahead of the query, or
+    extent or more behind, get none."""
+    extent = table.shape[-1]
+    rows = table[:, jnp.clip(offset, 0, extent - 1)]
+    near = (offset >= 0) & (offset < extent)
+    return jnp.einsum("bthr,rts->bhts", r, rows) * near
 
-    Ports: ``index`` written pushes the indexer's top-k, a mask of the keys each query
-    attends to; read uses the tap's instead of running an indexer, so a layer that reads
-    it builds none, whatever its config says. ``candidates`` written pushes the
-    indexer's candidate pool, and read keeps its top-k inside the tap's.
-    """
 
-    o: nnx.Linear  # the output projection, which the layer makes
-    indexer: Indexer | None  # which the layer builds, if it runs one
+def _length_scale(
+    pos: Int[Array, "*lead t"], log_scale: float, floor: int
+) -> Float[Array, "*lead t 1"]:
+    """Return the factor on each query's logits for its position n, counted from 1:
+    1 + log_scale * ln(max(n / floor, 1))."""
+    ahead = jnp.maximum((pos + 1) / floor, 1.0)
+    return (1 + log_scale * jnp.log(ahead))[..., None]
 
-    def __init__(
-        self,
-        c: cfg.QuadraticAttentionConfig,
-        width: int,
-        heads: int,
-        kv_heads: int,
-        v_head_dim: int,
-        scale: float,
-        bias: bool,
-        ports: Sequence[ir.Port],
-        rngs: nnx.Rngs,
-    ):
-        self.heads, self.kv_heads = heads, kv_heads
-        self.ports = tuple(ports)
-        dv, rel = v_head_dim, c.relative_bias
 
-        def linear(n_in: int, n_out: int) -> nnx.Linear:
-            return _linear(n_in, n_out, ("embed", ("heads", heads)), bias, rngs)
+class FullLogits(SoftmaxAttention):
+    """Softmax attention with features that need all t by t logits: relative bias,
+    length scale and attention dropout. It runs `xla`'s masked softmax itself, so it
+    raises under a method other than `xla` or `auto`."""
 
-        # The randomly initialized layers, after the layer's own projections.
-        self.gate = (
-            linear(width, heads if c.gate_per_head else heads * dv) if c.gated else None
+    def _init_logit_layers(
+        self, config: SoftmaxConfig, width: int, bias: bool, rngs: nnx.Rngs
+    ) -> None:
+        rel, names = config.relative_bias, ("embed", ("heads", self.heads))
+        self.rel_proj = (
+            linear(width, self.heads * rel.rank, names, bias, rngs) if rel else None
         )
-        self.rel_proj = linear(width, heads * rel.rank) if rel else None
-
-        # Logits and probabilities
-        self.scale = scale
         self.rel_table = nnx.Param(jnp.zeros((rel.rank, rel.extent))) if rel else None
-        self.log_scale, self.log_scale_floor = c.log_scale, c.log_scale_floor
-        self.softcap = c.softcap
-        self.window = c.sliding_window_size
-        self.sinks = nnx.Param(jnp.zeros(heads), names=("heads",)) if c.sinks else None
-        self.attention_dropout = (
-            nnx.Dropout(c.attention_dropout, rngs=rngs) if c.attention_dropout else None
-        )
-
-        # Output
-        self.out_norm = Norm(c.output_norm, dv) if c.output_norm else None
-        self.gate_activation = c.gate_activation
-        self.output_dropout = (
-            nnx.Dropout(c.output_dropout, rngs=rngs) if c.output_dropout else None
-        )
+        self.log_scale, self.log_scale_floor = config.log_scale, config.log_scale_floor
+        rate = config.attention_dropout
+        self.attention_dropout = nnx.Dropout(rate, rngs=rngs) if rate else None
 
     def _attend(
         self,
         x: Float[Array, "b t d"],
-        q: Float[Array, "b t h k"],
-        k: Float[Array, "b s g k"],
-        v: Float[Array, "b s g v"],
+        q: Float[Array, "b t h dk"],
+        k: Float[Array, "b s g dk"],
+        v: Float[Array, "b s g dv"],
         docs: Segments | None,
-        keep: Bool[Array, "b t s"] | None = None,
-        scores: Scores | None = None,
-        taps: Taps | None = None,
-    ) -> Float[Array, "b t h v"]:
-        """Every query's average of the values of the keys it sees, of those it `keep`s
-        if given, by the softmax of their logits; in a training forward, the indexer's
-        loss, from its `scores`. By the run's `methods.attention`, unless the layer
-        has what only `xla` has: then by xla's code here, which makes all t by t
-        logits, and the mask with them."""
-        alone = self._xla_alone(keep)
-        if alone is None:
-            return parallel.method("attention")(q, k, v, self._visibility(docs))
-        _only_xla(alone)
-        visible = self._visible(docs, x.shape[1])
-        if keep is not None:
-            visible = visible & keep
-        logits = self._logits(x, q, k, docs)
-        probs = _probabilities(logits, visible[..., None, :, :], self._sinks())
-        if scores is not None:
-            self._train_indexer(probs, scores, taps)
-        if self.attention_dropout is not None:
-            probs = self.attention_dropout(probs)
-        return _mix(probs, v)
+    ) -> Float[Array, "b t h dv"]:
+        feature = self._feature()
+        if feature is None:
+            return super()._attend(x, q, k, v, docs)
+        require_xla(feature)
+        return self._values(self._probabilities(x, q, k, docs), v)
 
-    def _visibility(self, docs: Segments | None) -> Visibility:
-        """What a method of `methods.attention` takes of the layer and the documents."""
-        ids = None if docs is None else docs.ids
-        return Visibility(ids, self.window, self.scale, self.softcap, self._sinks())
-
-    def _sinks(self) -> Float[Array, " h"] | None:
-        return None if self.sinks is None else self.sinks[...]
-
-    def _xla_alone(self, keep: Bool[Array, "b t s"] | None) -> str | None:
-        """The first of what only `xla` has that the layer uses: a mask of the keys
-        each query keeps (an indexer's top-k, which its loss comes with, or CSA's
-        compressed latents), relative bias, length scale or attention dropout."""
+    def _feature(self) -> str | None:
+        """Return the first of the logit features that the layer uses, if any."""
         uses = {
-            "mask of kept keys (an indexer's top-k, or CSA's compression)": keep,
             "relative_bias": self.rel_proj,
             "log_scale": self.log_scale,
             "attention_dropout": self.attention_dropout,
         }
-        return next((feature for feature, x in uses.items() if x is not None), None)
+        return next((name for name, used in uses.items() if used is not None), None)
+
+    def _probabilities(
+        self,
+        x: Float[Array, "b t d"],
+        q: Float[Array, "b t h dk"],
+        k: Float[Array, "b s g dk"],
+        docs: Segments | None,
+        keep_mask: Bool[Array, "b t s"] | None = None,
+    ) -> Float[Array, "b h t s"]:
+        """Return the softmax over the keys the mask, and `keep_mask` if given, keep."""
+        mask = self._mask(docs, x.shape[1])
+        if keep_mask is not None:
+            mask = mask & keep_mask
+        logits = self._logits(x, q, k, docs)
+        return masked_softmax(logits, mask[..., None, :, :], self._sinks())
+
+    def _values(
+        self, probs: Float[Array, "b h t s"], v: Float[Array, "b s g dv"]
+    ) -> Float[Array, "b t h dv"]:
+        """Return every query's values weighted by its probabilities, after dropout."""
+        if self.attention_dropout is not None:
+            probs = self.attention_dropout(probs)
+        return weighted_values(probs, v)
+
+    def _logits(
+        self,
+        x: Float[Array, "b t d"],
+        q: Float[Array, "b t h dk"],
+        k: Float[Array, "b s g dk"],
+        docs: Segments | None,
+    ) -> Float[Array, "b h t s"]:
+        """Return every query's logits for every key: scaled, plus the relative bias,
+        scaled for the query's position, and soft-capped."""
+        b, t, _ = x.shape
+        logits = scaled_logits(q, k, self.scale)
+        if self.rel_proj is not None and self.rel_table is not None:
+            r = self.rel_proj(x).reshape(b, t, self.heads, -1)
+            logits = logits + _relative_bias(r, self.rel_table[...], self._offsets(t))
+        if self.log_scale is not None:
+            at = jnp.arange(t) if docs is None else docs.positions[:, None]
+            logits *= _length_scale(at, self.log_scale, self.log_scale_floor)
+        return softcap(logits, self.softcap)
+
+    def _offsets(self, t: int) -> Int[Array, "t s"]:
+        """Return how far each key is behind each query."""
+        index = jnp.arange(t)
+        return index[:, None] - index[None, :]
+
+    def _mask(self, docs: Segments | None, t: int) -> Bool[Array, "*b t s"]:
+        return token_mask(t, self.window, docs)
+
+
+def indexer_config(
+    config: SoftmaxConfig, ports: Sequence[ir.Port]
+) -> cfg.SparseIndexerConfig | None:
+    """Return the config of the indexer the layer runs: None when it reads its keep
+    mask from the index port instead, whatever its config says."""
+    indexer = None if reads(ports, "index") else config.indexer
+    needs = [
+        p.name
+        for p in ports
+        if p.name == "candidates" or (p.name == "index" and p.mode == "write")
+    ]
+    if needs and indexer is None:
+        raise ValueError(
+            f"{config.type}: the '{needs[0]}' port needs an indexer that the layer "
+            "runs: give it indexer=indexer(...), and do not read index"
+        )
+    if indexer is not None and indexer.block_size > 1 and "candidates" in needs:
+        raise NotImplementedError("candidate pools of an indexer with block_size > 1")
+    return indexer
+
+
+def documents_or_rows(docs: Segments | None, b: int, t: int) -> Segments:
+    """Return the packed documents, or one document per row."""
+    if docs is not None:
+        return docs
+    return Segments.of(jnp.broadcast_to(jnp.arange(t, dtype=jnp.int32), (b, t)))
+
+
+class Sparse(FullLogits):
+    """Sparse attention (DeepSeek-V3.2): each query attends only to the keys an
+    indexer keeps. Its loss alone trains it, against the attention's probabilities.
+
+    Ports: `index` written pushes the keep mask; read uses the tap's instead of running
+    an indexer, so the layer builds none. `candidates` written pushes the candidate
+    pool; read keeps the indexer's choice inside the tap's.
+    """
+
+    indexer: Indexer | None  # which the layer builds, if it runs one
+
+    def _attend_kept(
+        self,
+        x: Float[Array, "b t d"],
+        q: Float[Array, "b t h dk"],
+        k: Float[Array, "b s g dk"],
+        v: Float[Array, "b s g dv"],
+        docs: Segments | None,
+        keep_mask: Bool[Array, "b t s"] | None,
+        scores: Scores | None,
+        taps: Taps,
+    ) -> Float[Array, "b t h dv"]:
+        """Return `_attend` over the keys each query keeps; in training, also report
+        the indexer's loss from its `scores`."""
+        require_xla(KEEP_MASK)
+        probs = self._probabilities(x, q, k, docs, keep_mask)
+        if scores is not None:
+            self._train_indexer(probs, scores, taps)
+        return self._values(probs, v)
 
     def _train_indexer(
-        self, probs: Float[Array, "b h t s"], scores: Scores, taps: Taps | None
+        self, probs: Float[Array, "b h t s"], scores: Scores, taps: Taps
     ) -> None:
         """In a training forward, report the indexer's loss against the attention to
         the keys it scores, which come last (CSA's after the window)."""
@@ -346,69 +478,40 @@ class SoftmaxAttention(nnx.Module):
         loss = self.indexer.loss(scores, attention)
         report(taps, "indexer_loss", self.indexer.loss_weight, loss)
 
-    def _logits(
-        self,
-        x: Float[Array, "b t d"],
-        q: Float[Array, "b t h k"],
-        k: Float[Array, "b s g k"],
-        docs: Segments | None,
-    ) -> Float[Array, "b h t s"]:
-        """Every query's logits for every key: scaled, with the relative bias, scaled
-        for the query's position and soft-capped."""
-        b, t, _ = x.shape
-        logits = _scores(q, k, self.scale)
-        if self.rel_proj is not None and self.rel_table is not None:
-            r = self.rel_proj(x).reshape(b, t, self.heads, -1)
-            logits = logits + _relative_bias(r, self.rel_table[...], self._offsets(t))
-        if self.log_scale is not None:
-            at = jnp.arange(t) if docs is None else docs.positions[:, None]
-            logits *= _length_scale(at, self.log_scale, self.log_scale_floor)
-        return softcap(logits, self.softcap)
-
-    def _offsets(self, t: int) -> Int[Array, "t s"]:
-        """How far each key is behind each query."""
-        index = jnp.arange(t)
-        return index[:, None] - index[None, :]
-
-    def _visible(self, docs: Segments | None, t: int) -> Bool[Array, "*rows t s"]:
-        """Which keys each query sees: none ahead of it or a window or more behind, and
-        none of another document."""
-        return _causal(t, self.window, docs)
-
     def _select(
         self,
         x: Float[Array, "b t d"],
         query: Float[Array, "b t e"],
         pos: Int[Array, "b t"] | None,
         keys: Float[Array, "b s i"] | None,
-        allowed: Bool[Array, "b t s"],
+        mask: Bool[Array, "b t s"],
         order: Int[Array, "b s"],
         taps: Taps,
     ) -> tuple[Bool[Array, "b t s"] | None, Scores | None]:
-        """The keys each query attends to, of those it is `allowed`: what the index port
-        reads, or the indexer's top-k, from its `query` input and `keys`; None for all.
-        And the indexer's scores, if it runs one. `order` says which key of its
-        document each slot holds, -1 for none."""
+        """Return the keys each query keeps of those `mask` allows (the index port's,
+        or the indexer's top-k from `query` and `keys`; None for all), and the
+        indexer's scores if it ran. `order` says which key of its document each slot
+        holds, -1 for none."""
         scores = None
-        if _reads(self.ports, "index"):
-            keep = _read(taps, self.ports, "index")
+        if reads(self.ports, "index"):
+            keep_mask = read(taps, self.ports, "index")
         elif self.indexer is not None:
             if keys is None:
                 raise ValueError(
                     "the indexer has no keys: the kv port's layer has none"
                 )
-            pool = None
-            if _reads(self.ports, "candidates"):
-                pool = _read(taps, self.ports, "candidates")
-            export = _writes(self.ports, "candidates")
-            keep, pool, scores = self.indexer(
-                x, query, pos, keys, allowed, order, pool, export
+            candidates = None
+            if reads(self.ports, "candidates"):
+                candidates = read(taps, self.ports, "candidates")
+            export = writes(self.ports, "candidates")
+            keep_mask, candidates, scores = self.indexer(
+                x, query, pos, keys, mask, order, candidates, export
             )
-            _write(taps, self.ports, "candidates", pool)
+            write(taps, self.ports, "candidates", candidates)
         else:
             return None, None
-        _write(taps, self.ports, "index", keep)
-        return keep, scores
+        write(taps, self.ports, "index", keep_mask)
+        return keep_mask, scores
 
     def _select_tokens(
         self,
@@ -417,171 +520,76 @@ class SoftmaxAttention(nnx.Module):
         docs: Segments | None,
         taps: Taps,
     ) -> tuple[Bool[Array, "b t t"] | None, Scores | None]:
-        """`_select` where the keys are the tokens, and the indexer's keys come from them."""
-        if self.indexer is None and not _reads(self.ports, "index"):
+        """Return `_select` for keys that are the tokens, the indexer's keys projected
+        from them."""
+        if self.indexer is None and not reads(self.ports, "index"):
             return None, None
         b, t, _ = x.shape
         pos = None if docs is None else docs.positions
         keys = None if self.indexer is None else self.indexer.keys(x, pos)
-        allowed = jnp.broadcast_to(self._visible(docs, t), (b, t, t))
-        return self._select(
-            x, query, pos, keys, allowed, _rows(docs, b, t).within, taps
-        )
-
-    def _output(
-        self, x: Float[Array, "b t d"], out: Float[Array, "b t h v"]
-    ) -> Float[Array, "b t d"]:
-        """The head outputs, normalized, gated and projected back to the width."""
-        b, t, _ = x.shape
-        if self.out_norm is not None:
-            out = self.out_norm(out)
-        if self.gate is not None:
-            gate = activation(self.gate_activation, self.gate(x))
-            out = out * gate.reshape(b, t, self.heads, -1)
-        y = self._project(_by_head(out, "heads"))
-        return y if self.output_dropout is None else self.output_dropout(y)
-
-    def _project(self, out: Float[Array, "b t h v"]) -> Float[Array, "b t d"]:
-        """The heads projected back to the width."""
-        b, t, _, _ = out.shape
-        return self.o(out.reshape(b, t, -1))
+        mask = jnp.broadcast_to(self._mask(docs, t), (b, t, t))
+        order = documents_or_rows(docs, b, t).within
+        return self._select(x, query, pos, keys, mask, order, taps)
 
 
-class Attention(SoftmaxAttention):
-    """Causal grouped-query attention.
+class FullLogitsAttention(FullLogits, Attention):
+    pass
 
-    Ports: `v` written pushes the values, read mixes the tap's values in, by the
-    weights `value_residual` says (value residual); `kv` written pushes (k, v), read
-    uses them instead of projecting its own (cross-layer KV sharing); `index` and
-    `candidates` as for `SoftmaxAttention`, with the indexer's keys projected from the
-    layer's input.
 
-    Shapes: b rows, t queries and s keys (the same positions), d the width, h heads and
-    g kv heads, k and v the head dims of keys and values.
-
-    A fused kernel is a method of `methods.attention` (bux.parallel.context): what it
-    needs of packed rows is `Segments.ids`, a document id a token, and no t by t mask.
-    """
+class SparseAttention(Sparse, Attention):
+    """GQA with an indexer whose keys are projected from the layer's input."""
 
     def __init__(
-        self, c: cfg.GQAConfig, width: int, ports: Sequence[ir.Port], rngs: nnx.Rngs
+        self,
+        config: cfg.GQAConfig,
+        width: int,
+        ports: Sequence[ir.Port],
+        rngs: nnx.Rngs,
     ):
-        h, kv = c.num_heads, c.num_kv_heads
-        d = c.head_dim or width // h
-        dv = c.v_head_dim or d
-        self.head_dim, self.v_head_dim = d, dv
-        reads = {p.name for p in ports if p.mode != "write"}
-        own_kv = "kv" not in reads  # else the kv tap's keys and values replace its own
-        indexer = _own_indexer(c, ports)
-
-        heads, kv_heads = ("heads", h), ("kv_heads", kv)  # flattened with their dims
-
-        def linear(
-            n_in: int, n_out: int, names: Names, bias: bool | None = None
-        ) -> nnx.Linear:
-            return _linear(n_in, n_out, names, c.bias if bias is None else bias, rngs)
-
-        def conv(channels: int, size: int) -> CausalConv:
-            return CausalConv(channels, size, False, rngs, channel=kv_heads)
-
-        # The randomly initialized layers; reordering them changes a seed's init.
-        fused, split = own_kv and c.fused_qkv, own_kv and not c.fused_qkv
-        # Fused, the split points of q, k and v do not fall on shard boundaries.
-        self.qkv = (
-            linear(width, h * d + kv * (d + dv), ("embed", None)) if fused else None
-        )
-        self.q = None if fused else linear(width, h * d, ("embed", heads))
-        self.k = linear(width, kv * d, ("embed", kv_heads)) if split else None
-        self.v = linear(width, kv * dv, ("embed", kv_heads)) if split else None
-        self.o = linear(h * dv, width, (heads, "embed"), c.output_bias)
-        size = c.kv_conv_size if own_kv else None
-        self.k_conv = conv(kv * d, size) if size else None
-        self.v_conv = conv(kv * dv, size) if size else None
-        scale = (c.scale or d**-0.5) * logit_gain(c.rope)
-        super().__init__(c, width, h, kv, dv, scale, c.bias, ports, rngs)
-        rotated = int(d * c.rope.fraction) // 2 * 2 if c.rope else 0
+        indexer = indexer_config(config, ports)
+        super().__init__(config, width, ports, rngs)
+        rope = config.rope
+        rotated = rotated_dims(self.head_dim, rope)
         self.indexer = (
-            from_stream(indexer, width, width, c.rope, rotated, rngs)
-            if indexer
-            else None
+            from_stream(indexer, width, width, rope, rotated, rngs) if indexer else None
         )
-
-        # Queries, keys and values
-        self.q_norm = Norm(c.qk_norm, d) if c.qk_norm else None
-        self.k_norm = Norm(c.qk_norm, d) if c.qk_norm and own_kv else None
-        self.rope = c.rope
-        self.value_residual = c.value_residual
-        shape = (2,) if c.value_residual == "learned" else ()
-        trained = "v" in reads and c.value_residual != "fixed"
-        self.v_mix = nnx.Param(jnp.full(shape, 0.5)) if trained else None
 
     def __call__(self, x: Float[Array, "b t d"], taps: Taps) -> Float[Array, "b t d"]:
-        x = _input(x)
+        x = shard_layer_input(x)
         docs = segments(taps)
-        pos = None if docs is None else docs.positions
-        q, *kv = self._projections(x)
-        q = self._queries(q, pos)
-        k, v = self._keys_and_values(*kv, taps) if kv else _read(taps, self.ports, "kv")
-        if _reads(self.ports, "v"):
-            v = self._mix_values(v, _read(taps, self.ports, "v"))
-        _write(taps, self.ports, "v", v)
-        _write(taps, self.ports, "kv", (k, v))
-        keep, scores = self._select_tokens(x, x, docs, taps)
-        if keep is None:
-            return self._output(x, self._attend(x, q, k, v, docs))
-        return self._output(x, self._attend(x, q, k, v, docs, keep, scores, taps))
+        q, k, v = self._heads(x, docs, taps)
+        keep_mask, scores = self._select_tokens(x, x, docs, taps)
+        out = self._attend_kept(x, q, k, v, docs, keep_mask, scores, taps)
+        return self._output(x, out)
 
-    def _mix_values(
-        self, v: Float[Array, "b s g v"], v1: Float[Array, "b s g v"]
-    ) -> Float[Array, "b s g v"]:
-        """The value residual a v + b v1: a = b = 0.5 fixed, both learned, or a learned
-        and b = 1 - a."""
-        if self.v_mix is None:
-            return 0.5 * v + 0.5 * v1
-        w = self.v_mix[...]
-        if self.value_residual == "learned":
-            return w[0] * v + w[1] * v1
-        return w * v + (1 - w) * v1
 
-    def _projections(self, x: Float[Array, "b t d"]) -> list[Float[Array, "b t _"]]:
-        """The projected queries, then keys and values unless the layer reads them from
-        its kv port: slices of one projection when fused, else one each."""
-        if self.qkv is not None:
-            q, k = self.heads * self.head_dim, self.kv_heads * self.head_dim
-            return jnp.split(self.qkv(x), [q, q + k], axis=-1)
-        return [p(x) for p in (self.q, self.k, self.v) if p is not None]
+def pick[L: SoftmaxAttention](
+    config: SoftmaxConfig,
+    ports: Sequence[ir.Port],
+    plain: type[L],
+    full: type[L],
+    sparse: type[L],
+) -> type[L]:
+    """Return `sparse` for an indexer or its ports, `full` for another feature that
+    needs all t by t logits, else `plain`."""
+    sparse_ports = any(p.name in ("index", "candidates") for p in ports)
+    if config.indexer is not None or sparse_ports:
+        return sparse
+    if config.relative_bias or config.log_scale is not None or config.attention_dropout:
+        return full
+    return plain
 
-    def _queries(
-        self, q: Float[Array, "b t _"], pos: Int[Array, "b t"] | None
-    ) -> Float[Array, "b t h k"]:
-        """The queries, from their projection."""
-        b, t, _ = q.shape
-        q = q.reshape(b, t, self.heads, self.head_dim)
-        if self.q_norm is not None:
-            q = self.q_norm(q)
-        if self.rope is not None:
-            q = rotate(q, self.rope, pos)
-        return _by_head(q, "heads")
 
-    def _keys_and_values(
-        self, k: Float[Array, "b s _"], v: Float[Array, "b s _"], taps: Taps
-    ) -> tuple[Float[Array, "b s g k"], Float[Array, "b s g v"]]:
-        """The keys and values, from their projections."""
-        b, t, _ = k.shape
-        if self.k_conv is not None and self.v_conv is not None:
-            k, v = k + self.k_conv(k, taps), v + self.v_conv(v, taps)
-        k = k.reshape(b, t, self.kv_heads, self.head_dim)
-        v = v.reshape(b, t, self.kv_heads, self.v_head_dim)
-        if self.k_norm is not None:
-            k = self.k_norm(k)
-        if self.rope is not None:
-            docs = segments(taps)
-            k = rotate(k, self.rope, None if docs is None else docs.positions)
-        return _by_head(k, "kv_heads"), _by_head(v, "kv_heads")
+def build_gqa(
+    config: cfg.GQAConfig, width: int, ports: Sequence[ir.Port], rngs: nnx.Rngs
+) -> Attention:
+    """Make GQA with the features that `config` and `ports` ask for."""
+    layer = pick(config, ports, Attention, FullLogitsAttention, SparseAttention)
+    return layer(config, width, ports, rngs)
 
 
 @register("gqa")
 def _(
     c: cfg.GQAConfig, width: int, ports: tuple[ir.Port, ...], ctx: Context
 ) -> Attention:
-    return Attention(c, width, ports, ctx.rngs)
+    return build_gqa(c, width, ports, ctx.rngs)
