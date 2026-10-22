@@ -27,6 +27,7 @@ from typing import TYPE_CHECKING
 
 import jax
 import orbax.checkpoint as ocp
+from jaxtyping import Array, Shaped
 
 from bux.train.data import Batch
 from bux.train.objective import Metrics
@@ -179,7 +180,7 @@ class Profile(Hook):
             self.tracing = False
 
 
-def _shape(x: jax.Array) -> jax.ShapeDtypeStruct:
+def _shape(x: Shaped[Array, "..."]) -> jax.ShapeDtypeStruct:
     """`x`'s shape, dtype and sharding: a typed key's too, which orbax's own drops."""
     return jax.ShapeDtypeStruct(x.shape, x.dtype, sharding=x.sharding)
 
