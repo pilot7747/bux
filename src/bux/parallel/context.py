@@ -16,6 +16,7 @@ from jax.sharding import NamedSharding
 from jax.sharding import PartitionSpec as P
 from jaxtyping import Array, Bool, Float, Int
 
+from bux import kernels
 from bux.parallel import methods
 from bux.parallel.layout import shard, spec
 from bux.parallel.mesh import active
@@ -555,7 +556,7 @@ def auto(
 ) -> Float[Array, "b t h dv"]:
     """Run `tokamax` on a GPU, which makes no t by t logits (7 times faster than `xla`
     at t = 4096 on a B300), unless `args` has sinks; else `xla`. The default."""
-    if flash is not None and args.sinks is None and jax.default_backend() == "gpu":
+    if flash is not None and args.sinks is None and kernels.gpu():
         return tokamax(q, k, v, args)
     return xla(q, k, v, args)
 
