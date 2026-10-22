@@ -180,8 +180,10 @@ def _scalar(
     O = _pairwise(q, k, G, G, same, False, 1) @ v
     vd = jnp.where(tail, v * jnp.exp(end - G), 0)  # Gamma(C, s) v_s
     adds = _by_group("bzgck,bzgrcv->bzgrkv", k, vd)
-    A = jnp.where(reach[..., -1, :], jnp.exp(end[..., 0, :]), 0)
-    before, S, P, starts = _passed(A, adds)
+    # Each chunk's log decay: -inf across a document start, which its log would
+    # take from a decay of 0 at an infinite slope.
+    log = jnp.where(reach[..., -1, 0], end[..., 0, 0], -jnp.inf)
+    before, S, P, starts = _passed(log, adds)
     decay = jnp.where(reach, jnp.exp(G), 0)  # Gamma(t, 0)
     out = O + decay * _by_group("bzgck,bzgrkv->bzgrcv", q, before)
     if not transition:
@@ -351,15 +353,14 @@ def _across(
 
 
 def _passed(
-    A: Float[Array, "b n h 1"], B: States
+    log: Float[Array, "b n h"], B: States
 ) -> tuple[
     States, Float[Array, "b h dk dv"], Float[Array, "b h 1"], Float[Array, "b n h"]
 ]:
-    """Return, for one decay a head, the state before each chunk and after the last,
-    and the product of the chunks' decays, and of those before each. The states are
-    one matmul of what the chunks add, by the decays of the chunks between (SSD's
+    """Return, from each chunk's log decay, the state before each chunk and after the
+    last, and the product of the chunks' decays, and of those before each. The states
+    are one matmul of what the chunks add, by the decays of the chunks between (SSD's
     state passing), where a scan would take a chunk at a time."""
-    log = jnp.where(A > 0, jnp.log(jnp.where(A > 0, A, 1)), -jnp.inf)[..., 0]
     index = jnp.arange(log.shape[1])
     later = (index[:, None] > index)[:, None]  # (n, 1, n): chunk i or l after j
     # The log decays of the chunks l after j up to i, at [i, j], by sums, not
@@ -368,7 +369,7 @@ def _passed(
     between = jnp.pad(upto, [(0, 0), (1, 0), (0, 0), (0, 0)])[:, :-1]
     decays = jnp.where(later, jnp.exp(between), 0)
     before = jnp.einsum("bihj,bjhkv->bihkv", decays, B)
-    S = A[:, -1, ..., None] * before[:, -1] + B[:, -1]
+    S = jnp.exp(log[:, -1, :, None, None]) * before[:, -1] + B[:, -1]
     total = jnp.cumsum(log, 1)
     starts = jnp.exp(jnp.pad(total, [(0, 0), (1, 0), (0, 0)])[:, :-1])
     return before, S, jnp.exp(total[:, -1, :, None]), starts
