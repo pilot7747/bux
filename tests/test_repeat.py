@@ -13,8 +13,8 @@ from jaxtyping import Float
 from optax.contrib import MuonDimensionNumbers
 
 from bux import parallel
-from bux.architecture import Model, MoE, Norm
-from bux.architecture.graph import Scanned, Sequence
+from bux.architecture import Model, MoE, Norm, Scanned
+from bux.architecture.graph import Sequence
 from bux.architecture.residual import HyperConnections
 from bux.lang import compile, compile_runs
 from bux.train.optim import muon_matrices, weight_decay_mask

@@ -28,7 +28,7 @@ from optax.contrib import MuonDimensionNumbers
 from optax.contrib._muon import orthogonalize_via_newton_schulz, scale_by_shape
 
 from bux import parallel
-from bux.architecture.graph import Scanned
+from bux.architecture import Scanned
 from bux.parallel import methods
 from bux.parallel.layout import Split, partition
 from bux.train import config as tcfg

@@ -718,7 +718,7 @@ On one CPU, for the gradient of a 24-layer Llama's forward (`d_model=64`, 8 rows
 | `dots`          | 133 MiB               | 138 MiB |
 | `dots_no_batch` | 79 MiB                | 82 MiB  |
 
-`Scanned.layers` holds the stacked passes, and `graph.run(graphdef, state, times, x,
+`Scanned.layers` holds the stacked passes, and `stacked.run(graphdef, state, times, x,
 taps)` runs any stack of them, such as a pipeline stage's share.
 
 ## Precision and microbatches
@@ -846,7 +846,7 @@ the stages.
 The batch's rows split into `methods.microbatches` microbatches, row `i·M + j` into
 microbatch `j`, so that each splits over the batch axes as the rows do. A method runs
 them in a `jax.shard_map` manual over `stage` alone, by a `lax.scan` over `R·M + S − 1`
-ticks: at each, every stage runs its share of a round on a microbatch (`graph.run`),
+ticks: at each, every stage runs its share of a round on a microbatch (`stacked.run`),
 and a `ppermute` sends its output on to the next stage, the last's to the first. The
 first stage takes each microbatch from a buffer of its own, where the last stage's
 outputs come back: there a circular round starts again, and from there the stream

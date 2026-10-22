@@ -269,6 +269,37 @@ so a backend can `nnx.scan` over identical blocks.
 that was generated or mutated programmatically, e.g. by an architecture search.
 `compile(to_source(a))` equals `a` up to labels.
 
+### Adding a layer
+
+A new layer type takes two pieces. First, its config, a class in `bux/config.py` added
+to the `LayerConfig` union. The union is what the compiler knows layer names from, and
+what the IR, checkpoints, run ids, the printer and the editor read configs by:
+
+```python
+class DiffAttentionConfig(Config):
+    type: Literal["diffattn"] = "diffattn"
+    num_heads: int
+```
+
+Second, a builder, registered for the config's `type` in any module imported before
+the model is built. It takes the config, the width the layer reads, its ports, and a
+`Context` with the architecture and the `rngs`. The module it returns is called as
+`module(x, taps)`; `segments(taps)`, `positions(taps)`, `training(taps)` and
+`report(taps, name, weight, value)` are what a layer reads and reports:
+
+```python
+from bux.architecture import Context, register
+
+
+@register("diffattn")
+def _(c: DiffAttentionConfig, width: int, ports: tuple[ir.Port, ...], ctx: Context):
+    return DiffAttention(c, width, rngs=ctx.rngs)
+```
+
+Registering a builder for an existing type replaces bux's own. A config can only come
+from `bux/config.py`: the union is a pydantic discriminated union that `ir.Layer` and
+the compiler fix as they load.
+
 ## Command line
 
 ```

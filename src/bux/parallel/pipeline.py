@@ -1,28 +1,28 @@
 """Pipeline parallelism over `stage`: the methods of `methods.pipeline`.
 
 With ``mesh.stage`` above 1, the longest scanned repeat outside any other is
-pipelined (bux.architecture.graph): its stacked layers split over `stage`, a share a
-stage, and the rest of the model stays whole on every stage. A method runs them on
-the ``methods.microbatches`` microbatches of the batch's rows, in a shard_map manual
-over `stage` alone, each stage on its own devices:
+pipelined (bux.architecture.pipelined): its stacked layers split over `stage`, one
+share per stage, and the rest of the model stays whole on every stage. A method runs
+them on the ``methods.microbatches`` microbatches of the batch's rows, in a shard_map
+manual over `stage` alone, each stage on its own devices:
 
     a lax.scan over R·M + S − 1 ticks: M microbatches through S stages, R rounds;
-    each tick, a stage's share of a round on a microbatch,
-    and each stage's output to the next by a ppermute, the last's to the first.
+    at each tick, every stage runs its share of a round on one microbatch,
+    and a ppermute sends each stage's output to the next, the last's to the first.
 
 The first stage takes each microbatch from a buffer of its own, where the last
 stage's outputs come back: there a circular round starts again, and there the stream
 leaves, summed over the stages to all of them. ``gpipe`` sends every microbatch
-through the stages once; ``circular`` round them ``methods.rounds`` times, each stage
-holding a share of every round's layers, so that a stage idles (S − 1) / (R·M + S − 1)
-of a step (``bubble``).
+through the stages once; ``circular`` sends them round ``methods.rounds`` times, each
+stage holding a share of every round's layers, so that a stage idles
+(S − 1) / (R·M + S − 1) of a step (``bubble``).
 
 A method is ``(stage, params, rest, x, rows) -> (y, rest, losses)``. ``stage`` runs a
-stage's share of a round on a microbatch; ``params`` and ``rest`` are the layers'
-parameters and other state, each leaf (rounds, layers a round, ...); ``x`` is the
-stream, and ``rows`` the taps of its rows. It returns the stream, the state as the
-layers leave it, and the losses each layer reports, the mean over microbatches,
-(rounds, layers a round, reports).
+stage's share of a round on one microbatch; ``params`` and ``rest`` are the layers'
+parameters and other state, each leaf (rounds, layers per round, ...); ``x`` is the
+stream, and ``rows`` the tokens and documents of its rows. It returns the stream, the
+state as the layers leave it, and the losses each layer reports, averaged over
+microbatches, (rounds, layers per round, reports).
 """
 
 import functools
@@ -39,27 +39,27 @@ from bux.parallel.mesh import Active, active
 
 AXIS = "stage"
 STAGES = "stages"  # the stacked dimension of a pipelined repeat, split over stage
-# A stage's share of a round on a microbatch: (params, rest, x, rows) -> (y, rest,
-# losses), its losses (layers, reports).
+# A stage's share of a round, run on one microbatch: (params, rest, x, rows) -> (y,
+# rest, losses), with losses (layers, reports).
 Stage = Callable[..., tuple[Shaped[Array, "b t *r"], PyTree, Float[Array, "l n"]]]
 Out = tuple[Shaped[Array, "b t *r"], PyTree, Float[Array, "rounds l n"]]
 
 
 def stages() -> int:
-    """The stages of the mesh in force: 1 outside ``use``."""
+    """Return the number of stages of the mesh in force: 1 outside ``use``."""
     on = active()
     return 1 if on is None else on.size(AXIS)
 
 
 def pipelined() -> bool:
-    """Whether the run in force pipelines its longest scanned repeat: then the
-    pipeline takes ``methods.microbatches``, and a step does not accumulate gradients
-    over them."""
+    """Return whether the run in force pipelines its longest scanned repeat. Then the
+    pipeline takes the ``methods.microbatches``, and a step does not accumulate
+    gradients over them."""
     return stages() > 1
 
 
 def bubble(stages: int, microbatches: int, rounds: int = 1) -> float:
-    """The fraction of a step each stage idles: (S − 1) / (R·M + S − 1)."""
+    """Return the fraction of a step each stage idles: (S − 1) / (R·M + S − 1)."""
     return (stages - 1) / (rounds * microbatches + stages - 1)
 
 
@@ -71,23 +71,23 @@ def _on() -> Active:
 
 
 def rounds(passes: int) -> int:
-    """The rounds the run in force pipelines a repeat of `passes` passes in. Raise
-    unless they split evenly over the stages of every round, and circular rounds have
-    a microbatch a stage to keep the stages busy."""
+    """Return how many rounds the run in force pipelines a repeat of `passes` passes
+    in. Raise unless the passes split evenly over the stages of every round, and a
+    circular pipeline has at least one microbatch per stage to keep the stages busy."""
     on = _on()
-    s, c = on.size(AXIS), on.methods
-    if passes % (s * c.rounds):
+    s, settings = on.size(AXIS), on.methods
+    if passes % (s * settings.rounds):
         raise ValueError(
             f"mesh.stage = {s} pipelines the longest scanned repeat, of {passes} "
-            f"passes, in methods.rounds = {c.rounds}: make its passes a multiple "
-            f"of {s * c.rounds}"
+            f"passes, in methods.rounds = {settings.rounds}: make its passes a "
+            f"multiple of {s * settings.rounds}"
         )
-    if c.rounds > 1 and c.microbatches < s:
+    if settings.rounds > 1 and settings.microbatches < s:
         raise ValueError(
             f"a circular pipeline takes a microbatch a stage at least: "
-            f"methods.microbatches = {c.microbatches} < mesh.stage = {s}"
+            f"methods.microbatches = {settings.microbatches} < mesh.stage = {s}"
         )
-    return c.rounds
+    return settings.rounds
 
 
 @methods.pipeline.register("gpipe")
@@ -115,17 +115,17 @@ def circular(
     x: Shaped[Array, "b t *r"],
     rows: PyTree,
 ) -> Out:
-    """Each microbatch round the stages `methods.rounds` times, a round's layers split
-    over them: they idle (S − 1) / (R·M + S − 1)."""
+    """Send each microbatch round the stages `methods.rounds` times, each round's
+    layers split over them: they idle (S − 1) / (R·M + S − 1)."""
     on = _on()
     clock = Clock(on.size(AXIS), on.methods.microbatches, on.methods.rounds)
     return clock.run(stage, params, rest, x, rows)
 
 
 class Clock(NamedTuple):
-    """M microbatches through S stages, R rounds: k ticks in, a stage takes the k-th
-    of the R·M runs, microbatch k mod M of round k // M. Stage s is s ticks in at
-    tick s."""
+    """The schedule of M microbatches through S stages in R rounds. Stage s starts at
+    tick s, and k ticks after it starts, it runs the k-th of the R·M runs: microbatch
+    k mod M of round k // M."""
 
     stages: int
     microbatches: int
@@ -138,8 +138,8 @@ class Clock(NamedTuple):
     def at(
         self, k: Int[Array, ""]
     ) -> tuple[Bool[Array, ""], Int[Array, ""], Int[Array, ""]]:
-        """Of a stage `k` ticks in: whether it works, on which microbatch, of which
-        round."""
+        """Return, for a stage `k` ticks after it starts, whether it is busy, and
+        which microbatch and round it runs."""
         runs = self.rounds * self.microbatches
         busy = (k >= 0) & (k < runs)
         k = jnp.clip(k, 0, runs - 1)
@@ -153,19 +153,19 @@ class Clock(NamedTuple):
         x: Shaped[Array, "b t *r"],
         rows: PyTree,
     ) -> Out:
-        """The pipeline, each stage on its own devices (``_device``); then the first
-        stage's buffer, where the stream ends, to every stage."""
+        """Run the pipeline, each stage on its own devices (``_device``), and return
+        the first stage's buffer, where the stream ends up, on every stage."""
         s, m = self.stages, self.microbatches
         if x.shape[0] % m:
             raise ValueError(
                 f"{x.shape[0]} rows do not split into methods.microbatches = {m}"
             )
         rows = jax.tree.map(lambda a: _micro(a, m), rows)
-        own = P(AXIS)  # a stage's, on its devices
+        by_stage = P(AXIS)  # each stage's own, on its devices
         io, rest, losses = jax.shard_map(
             functools.partial(_device, self, stage),
-            in_specs=(own, own, P(), P()),
-            out_specs=own,
+            in_specs=(by_stage, by_stage, P(), P()),
+            out_specs=by_stage,
             axis_names={AXIS},
             check_vma=False,  # else nested shard_maps' gradients fail to lower
         )(_by_stage(params, s), _by_stage(rest, s), _micro(x, m), rows)
@@ -175,7 +175,7 @@ class Clock(NamedTuple):
     def mean(
         self, losses: Float[Array, "t l n"], rounds: Int[Array, " t"]
     ) -> Float[Array, "r l n"]:
-        """A stage's losses of each round, the mean over microbatches."""
+        """Return a stage's losses in each round, averaged over microbatches."""
         hot = jax.nn.one_hot(rounds, self.rounds, dtype=losses.dtype)
         return jnp.einsum("tr,tln->rln", hot, losses) / self.microbatches
 
@@ -188,14 +188,14 @@ def _device(
     xs: Shaped[Array, "m n t *r"],
     rows: PyTree,
 ) -> tuple[Shaped[Array, "1 m n t *r"], PyTree, Float[Array, "1 rounds l k"]]:
-    """A stage's part, on its devices: every tick, its share of a round on a
-    microbatch (``_tick``). The first stage's buffer ends with the stream."""
-    me = jax.lax.axis_index(AXIS)
+    """Run one stage on its devices: at every tick, its share of a round on one
+    microbatch (``_tick``). The first stage's buffer ends up holding the stream."""
+    index = jax.lax.axis_index(AXIS)
     params, rest = _at(params, 0), _at(rest, 0)  # this stage's
-    tick = functools.partial(_tick, clock, stage, params, rows, me)
+    tick = functools.partial(_tick, clock, stage, params, rows, index)
     carry = (jnp.zeros_like(xs[0]), xs, rest)
-    (_, io, rest), (losses, of) = jax.lax.scan(tick, carry, jnp.arange(clock.ticks))
-    return io[None], jax.tree.map(lambda a: a[None], rest), clock.mean(losses, of)[None]
+    (_, io, rest), (losses, r) = jax.lax.scan(tick, carry, jnp.arange(clock.ticks))
+    return io[None], jax.tree.map(lambda a: a[None], rest), clock.mean(losses, r)[None]
 
 
 def _tick(
@@ -203,67 +203,68 @@ def _tick(
     stage: Stage,
     params: PyTree,
     rows: PyTree,
-    me: Int[Array, ""],
+    index: Int[Array, ""],
     carry: tuple[Shaped[Array, "n t *r"], Shaped[Array, "m n t *r"], PyTree],
     t: Int[Array, ""],
 ) -> tuple[
     tuple[Shaped[Array, "n t *r"], Shaped[Array, "m n t *r"], PyTree],
     tuple[Float[Array, "l k"], Int[Array, ""]],
 ]:
-    """Stage `me`'s run at tick `t`: the first takes its microbatch from its buffer,
-    the others what the stage before gave them; its state as it was where it is idle.
-    Then its output on to the next stage, the last's into the first's buffer."""
+    """Run stage `index` at tick `t`. The first stage takes its microbatch from its
+    buffer, the others what the stage before sent them; an idle stage keeps its state.
+    Then send its output on to the next stage, the last's into the first's buffer."""
     shift, io, rest = carry
-    busy, micro, of = clock.at(t - me)
-    x = jnp.where(me == 0, _at(io, t % clock.microbatches), shift)
-    own = _at(rest, of)
-    y, new, losses = stage(_at(params, of), own, x, _at(rows, micro))
-    new = jax.tree.map(lambda a, b: jnp.where(busy, a, b), new, own)
-    rest = _put(rest, of, new)
+    busy, micro, r = clock.at(t - index)
+    x = jnp.where(index == 0, _at(io, t % clock.microbatches), shift)
+    before = _at(rest, r)
+    y, new, losses = stage(_at(params, r), before, x, _at(rows, micro))
+    new = jax.tree.map(lambda a, b: jnp.where(busy, a, b), new, before)
+    rest = _put(rest, r, new)
     shift = _rotate(y)
     back, done = (t - clock.stages + 1) % clock.microbatches, t >= clock.stages - 1
     io = _put(io, back, jnp.where(done, shift, _at(io, back)))
-    return (shift, io, rest), (jnp.where(busy, losses, 0), of)
+    return (shift, io, rest), (jnp.where(busy, losses, 0), r)
 
 
 def _rotate(y: Shaped[Array, "n t *r"]) -> Shaped[Array, "n t *r"]:
-    """A stage's output to the next stage, the last's to the first."""
+    """Send each stage's output to the next stage, the last's to the first."""
     n = jax.lax.axis_size(AXIS)
     return jax.lax.ppermute(y, AXIS, [(i, (i + 1) % n) for i in range(n)])
 
 
 def _first(a: Shaped[Array, "s ..."]) -> Bool[Array, "s ..."]:
-    """Whether each slice of `a` is the first stage's, broadcastable to `a`."""
+    """Return whether each slice of `a` is the first stage's, broadcastable to `a`."""
     return (jnp.arange(a.shape[0]) == 0).reshape(-1, *(1,) * (a.ndim - 1))
 
 
 def _micro(a: Shaped[Array, "b t *r"], m: int) -> Shaped[Array, "m n t *r"]:
-    """Rows i·m + j of `a` as microbatch j, so that each splits as the rows do."""
+    """Split `a` into m microbatches, row i·m + j into microbatch j, so that each
+    splits over the devices as the rows do."""
     return a.reshape(a.shape[0] // m, m, *a.shape[1:]).swapaxes(0, 1)
 
 
 def _whole(a: Shaped[Array, "m n t *r"]) -> Shaped[Array, "b t *r"]:
-    """The rows of microbatches, as `_micro` took them."""
+    """Join microbatches back into rows: the inverse of `_micro`."""
     return a.swapaxes(0, 1).reshape(a.shape[0] * a.shape[1], *a.shape[2:])
 
 
 # By dynamic slices, not gathers and scatters: XLA fails to split a scatter over Auto
 # axes inside the shard_map, as a gather's gradient is.
 def _at(tree: PyTree, i: Int[Array, ""] | int) -> PyTree:
-    """Slice `i` of every leaf of `tree`."""
+    """Return slice `i` of every leaf of `tree`."""
     return jax.tree.map(lambda a: jax.lax.dynamic_index_in_dim(a, i, 0, False), tree)
 
 
 def _put(tree: PyTree, i: Int[Array, ""], new: PyTree) -> PyTree:
-    """`tree`, slice `i` of every leaf `new`'s."""
+    """Return `tree` with slice `i` of every leaf replaced by `new`'s."""
     return jax.tree.map(
         lambda a, v: jax.lax.dynamic_update_index_in_dim(a, v, i, 0), tree, new
     )
 
 
 def _by_stage(tree: PyTree, s: int) -> PyTree:
-    """Each leaf (rounds, layers, ...) as (s, rounds, layers / s, ...): a stage's
-    share of every round."""
+    """Reshape each leaf from (rounds, layers, ...) to (s, rounds, layers / s, ...):
+    for each stage, its share of every round."""
 
     def split(a: Shaped[Array, "r n *_"]) -> Shaped[Array, "s r l *_"]:
         r, n = a.shape[:2]
@@ -273,7 +274,8 @@ def _by_stage(tree: PyTree, s: int) -> PyTree:
 
 
 def _by_round(tree: PyTree) -> PyTree:
-    """Each leaf (s, rounds, layers / s, ...) as (rounds, layers, ...)."""
+    """Reshape each leaf from (s, rounds, layers / s, ...) back to (rounds, layers,
+    ...)."""
 
     def join(a: Shaped[Array, "s r l *_"]) -> Shaped[Array, "r n *_"]:
         s, r, n = a.shape[:3]

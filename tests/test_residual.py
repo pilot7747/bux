@@ -6,7 +6,7 @@ from flax import nnx
 from jaxtyping import Array, Int
 
 from bux import config as cfg
-from bux.architecture import TOKENS, Context, Embedding, Model, NextN, num_params
+from bux.architecture import Built, Context, Embedding, Model, NextN, Taps, num_params
 from bux.architecture.graph import Sequence
 from bux.architecture.norm import Norm
 from bux.architecture.residual import (
@@ -177,7 +177,7 @@ def test_mhc_mixes_the_streams_through_doubly_stochastic_matrices():
     assert branch.scale is not None
     branch.scale[...] = jnp.ones(3)  # logits of about unit size
     x = jax.random.normal(jax.random.key(2), (2, 8, 4, D))
-    y = branch(x, {})
+    y = branch(x, Taps())
     assert not jnp.allclose(y, x, atol=1e-1)
     assert jnp.allclose(y.sum(2), x.sum(2), atol=2e-3)
 
@@ -200,7 +200,7 @@ def test_single_pass_mhc_is_deepseek_v4_1s():
     for k, branch in enumerate(branches):
         randomize(branch, seed=k, scale=0.3)
     x = 1e-3 * jax.random.normal(jax.random.key(9), (2, 8, 4, D))  # small: eps shows
-    taps, y = {}, x
+    taps, y = Taps(), x
     for branch in branches:
         y = branch(y, taps)
     ours = Merge(None)(y, taps)
@@ -212,7 +212,7 @@ def test_single_pass_mhc_is_deepseek_v4_1s():
         rsqrt = jax.lax.rsqrt(jnp.square(flat).mean(-1, keepdims=True) + 1e-20)
         mixes = (flat @ branch.proj[...]) * rsqrt
         pre, post, comb = hc_split_sinkhorn(mixes, branch.scale[...], branch.bias[...])
-        out = body(jnp.sum(pre_mix[..., None] * h, 2), {})  # hc_pre
+        out = body(jnp.sum(pre_mix[..., None] * h, 2), Taps())  # hc_pre
         kept = jnp.sum(comb[..., None] * h[:, :, :, None], 2)  # hc_post
         h, pre_mix = post[..., None] * out[:, :, None] + kept, pre
     assert jnp.allclose(ours, jnp.sum(pre_mix[..., None] * h, 2), rtol=1e-4, atol=1e-9)
@@ -229,7 +229,9 @@ def test_mhc_without_dynamic_has_static_coefficients():
     randomize(branch)
     res = sinkhorn(branch.bias[...][8:].reshape(4, 4), 20)
     x = jax.random.normal(jax.random.key(0), (2, 8, 4, D))
-    assert jnp.allclose(branch(x, {}), jnp.einsum("jk,btjd->btkd", res, x), atol=1e-5)
+    assert jnp.allclose(
+        branch(x, Taps()), jnp.einsum("jk,btjd->btkd", res, x), atol=1e-5
+    )
 
 
 def test_norm_eps_reaches_the_norms_of_every_algebra():
@@ -263,7 +265,7 @@ def test_attnres_sources_are_the_embedding_and_blocks_of_outputs():
 def test_attnres_branches_add_their_outputs_to_the_state():
     m = model("attnres(block_size=2)", "model = embed [norm attn] [norm ffn] norm head")
     embed, first, second, merge, *_ = top(m)
-    taps = {TOKENS: [tokens()]}
+    taps = Taps(tokens=tokens())
     x = embed(tokens(), taps)
     assert x.shape == (2, 8, 1, D)
     assert first(x, taps).shape == (2, 8, 2, D)
@@ -293,7 +295,7 @@ def test_merge_reads_the_stream_back_where_the_compiler_puts_it(residual):
     m = model(residual, "model = embed [norm attn] [norm ffn] norm head")
     merge = top(m)[3]
     assert isinstance(merge, Merge) and isinstance(top(m)[4], Norm)
-    taps = {TOKENS: [tokens()]}
+    taps = Taps(tokens=tokens())
     x = top(m)[2](top(m)[1](top(m)[0](tokens(), taps), taps), taps)
     assert merge(x, taps).shape == (2, 8, D)
     # The merge has parameters of its own, apart from the branches'.
@@ -306,10 +308,10 @@ def test_gr_reads_normalized_streams_and_its_read_replaces_the_final_norm():
     assert isinstance(merge, Merge) and isinstance(merge.reader, GatedResidual)
     x = jax.random.normal(jax.random.key(0), (2, 8, 4, D))
     scaled = x * jnp.asarray([3.0, 0.5, 1.0, 2.0])[:, None]  # each stream its own size
-    assert jnp.allclose(merge(x, {}), merge(scaled, {}), atol=1e-5)
+    assert jnp.allclose(merge(x, Taps()), merge(scaled, Taps()), atol=1e-5)
     branch = top(m)[1]
     assert isinstance(branch, GatedResidual)
-    y = branch(x, {TOKENS: [tokens()]})
+    y = branch(x, Taps(tokens=tokens()))
     assert y.shape == x.shape and not jnp.allclose(y, x)
     logits = m(tokens())
     assert logits.shape == (2, 8, V) and bool(jnp.isfinite(logits).all())
@@ -363,10 +365,10 @@ def test_nextn_mixes_the_embedding_into_every_copy_normalized_together():
     source = PRELUDE + "residual = gr(rank=8)\nmodel = embed [attn] head"
     embed = top(Model(compile(source), rngs=nnx.Rngs(0)))[0]
     assert isinstance(embed, Embedding)
-    ctx = Context(compile(source), nnx.Rngs(0), embedding=embed)
+    ctx = Context(compile(source), nnx.Rngs(0), built=Built(embedding=embed))
     nextn = NextN(cfg.NextNConfig(), "streams", ctx)
     t, x = tokens(), jax.random.normal(jax.random.key(1), (2, 8, 4, D))
-    y = nextn(x, {TOKENS: [t]})
+    y = nextn(x, Taps(tokens=t))
     assert y.shape == x.shape
     ahead = jnp.pad(t[:, 1:], ((0, 0), (0, 1)))
     e = nextn.embed_norm(embed.embed_tokens(ahead))
@@ -375,13 +377,13 @@ def test_nextn_mixes_the_embedding_into_every_copy_normalized_together():
         expected = nextn.proj(jnp.concatenate([e, h[:, :, j]], -1))
         assert jnp.allclose(y[:, :, j], expected, atol=1e-5)
     # Together: the copies keep their sizes relative to each other.
-    assert jnp.allclose(nextn(3 * x, {TOKENS: [t]}), y, atol=1e-4)
+    assert jnp.allclose(nextn(3 * x, Taps(tokens=t)), y, atol=1e-4)
     assert not jnp.allclose(
-        nextn(x.at[:, :, 0].multiply(3.0), {TOKENS: [t]})[:, :, 1], y[:, :, 1]
+        nextn(x.at[:, :, 0].multiply(3.0), Taps(tokens=t))[:, :, 1], y[:, :, 1]
     )
     # On one stream under an algebra that widens it, nextn widens its output.
     one = NextN(cfg.NextNConfig(), D, ctx)
-    assert one(x[:, :, 0], {TOKENS: [t]}).shape == (2, 8, 4, D)
+    assert one(x[:, :, 0], Taps(tokens=t)).shape == (2, 8, 4, D)
 
 
 # --- Split over devices ----------------------------------------------------------------
