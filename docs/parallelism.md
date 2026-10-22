@@ -803,6 +803,12 @@ run computes, which `tests/test_precision.py` checks on `fsdp=4, tensor=2` and i
 pipeline. NVFP4's stochastic rounding draws its noise from a hash of each element's
 index and the batch's tokens, the same on any mesh too.
 
+Under FSDP each device quantizes its part of W, so the all-gathers move float8 values
+and their scales, half of bfloat16's bytes. A projection multiplies its tokens
+flattened, rows by positions, and a split along positions is not one along the
+flattened tokens: a `ring` run on `context=2` trained 13% slower in `mxfp8` than in
+bfloat16 on B300s.
+
 A recipe is a function, and the trainer enters `matmuls.use` as it traces its steps:
 
 ```python
