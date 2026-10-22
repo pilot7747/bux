@@ -2,6 +2,8 @@
 against `sorted` on one device."""
 
 import functools
+import importlib.util
+from pathlib import Path
 
 import jax
 import jax.numpy as jnp
@@ -231,3 +233,14 @@ def test_the_router_bias_moves_as_it_does_on_one_device(method):
     assert len(one) == 2 and all((b != 0).any() for b in one)
     split = _biases(method, "data=2, fsdp=2, expert=2")
     assert all(np.array_equal(a, b) for a, b in zip(split, one, strict=True))
+
+
+def test_the_gpu_smoke_script_compares_a_layer_on_cpu():
+    path = Path(__file__).parent.parent / "scripts" / "gpu_smoke" / "experts.py"
+    spec = importlib.util.spec_from_file_location("gpu_smoke_experts", path)
+    assert spec is not None and spec.loader is not None
+    smoke = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(smoke)
+    one = smoke.layer(smoke.ONE, "sorted")
+    split = smoke.layer({"fsdp": 2, "expert": 4}, "all_to_all")
+    assert smoke.differs(split, one) < 1e-4
