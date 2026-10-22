@@ -179,7 +179,7 @@ def test_muon_on_one_device_is_optax_s_whichever_method_orthogonalizes(nesterov)
     dims = {"w": MuonDimensionNumbers(0, 1), "e": MuonDimensionNumbers(1, 2)}
     theirs = scale_by_muon(nesterov=nesterov, weight_dimension_numbers=dims)
     expected = _muon_updates(theirs, params)
-    for method in ("gspmd", "gather"):
+    for method in ("gspmd", "gather", "owner"):
         methods = tcfg.MethodsConfig(orthogonalize=method)
         one = parallel.use(tcfg.MeshConfig(data=1), methods=methods)
         for where in (contextlib.nullcontext(), one):
@@ -193,11 +193,14 @@ def test_muon_on_one_device_is_optax_s_whichever_method_orthogonalizes(nesterov)
 
 
 @functools.cache
-def _muon_step(orthogonalize: str = "gspmd", **mesh: int) -> tuple[list, str]:
+def _muon_step(
+    orthogonalize: str = "gspmd", zero: int = 3, **mesh: int
+) -> tuple[list, str]:
     """The MoE's parameters after a Muon step from fixed gradients, split over `mesh`
     (outside parallel.use with none), and the compiled step's HLO."""
     methods = tcfg.MethodsConfig(orthogonalize=orthogonalize)
-    split = parallel.use(tcfg.MeshConfig.model_validate(mesh), methods=methods)
+    layout = tcfg.LayoutConfig.model_validate({"zero": zero})
+    split = parallel.use(tcfg.MeshConfig.model_validate(mesh), layout, methods)
     with split if mesh else contextlib.nullcontext():
         model = parallel.build(lambda: Model(compile(MOE), rngs=nnx.Rngs(0)))
         c, lr = tcfg.MuonConfig(lr=0.02), lr_multiplier(tcfg.ConstantSchedule(), 1)
@@ -210,7 +213,7 @@ def _muon_step(orthogonalize: str = "gspmd", **mesh: int) -> tuple[list, str]:
     return jax.tree.leaves(jax.tree.map(np.asarray, nnx.state(model, nnx.Param))), hlo
 
 
-@pytest.mark.parametrize("orthogonalize", ["gspmd", "gather"])
+@pytest.mark.parametrize("orthogonalize", ["gspmd", "gather", "owner"])
 @pytest.mark.parametrize("mesh", SPLITS.values(), ids=list(SPLITS))
 def test_muon_updates_split_over_devices_as_on_one(orthogonalize, mesh):
     one, _ = _muon_step()
@@ -218,17 +221,47 @@ def test_muon_updates_split_over_devices_as_on_one(orthogonalize, mesh):
     assert all(np.allclose(a, b, atol=1e-6) for a, b in zip(split, one, strict=True))
 
 
-def _all_reduces(hlo: str) -> int:
-    return len(re.findall(r"\ball-reduce(-start)?\(", hlo))
+MORE_SPLITS = {
+    "data_fsdp": {"data": 2, "fsdp": 4},
+    "fsdp_expert_tensor": {"fsdp": 2, "expert": 2, "tensor": 2},
+    "expert": {"expert": 8},
+}
+
+
+@pytest.mark.parametrize("zero", [3, 1])
+@pytest.mark.parametrize("mesh", MORE_SPLITS.values(), ids=list(MORE_SPLITS))
+def test_muon_owners_orthogonalize_as_gspmd_does(mesh, zero):
+    gspmd, _ = _muon_step("gspmd", zero, **mesh)
+    owner, _ = _muon_step("owner", zero, **mesh)
+    assert all(np.allclose(a, b, atol=1e-6) for a, b in zip(owner, gspmd, strict=True))
+
+
+def _count(op: str, hlo: str) -> int:
+    return len(re.findall(rf"\b{op}(-start)?\(", hlo))
 
 
 @pytest.mark.parametrize("mesh", SPLITS.values(), ids=list(SPLITS))
 def test_muon_gathering_whole_matrices_needs_no_all_reduce(mesh):
     """gspmd runs Newton-Schulz on shards, all-reducing products over split
-    dimensions; gather moves each matrix whole once and runs it there."""
+    dimensions; gather moves each matrix whole once and runs it there; owner moves
+    each to one device, the matrices of a shape and split by one all-to-all."""
     _, gspmd = _muon_step("gspmd", **mesh)
     _, gather = _muon_step("gather", **mesh)
-    assert _all_reduces(gather) == 0 < _all_reduces(gspmd)
+    _, owner = _muon_step("owner", **mesh)
+    assert _count("all-reduce", gather) == _count("all-reduce", owner) == 0
+    assert _count("all-reduce", gspmd) > 0
+    assert _count("all-gather", gather) > _count("all-gather", owner)
+    assert _count("all-to-all", owner) > 0
+
+
+def test_muon_owners_under_zero_1_gather_less_than_gather_does():
+    """The update comes split by FSDP, as the optimizer's state: owner sends its shards
+    to the owners, and gathers the results, where gather gathers every matrix."""
+    _, gather = _muon_step("gather", 1, fsdp=8)
+    _, owner = _muon_step("owner", 1, fsdp=8)
+    assert _count("all-gather", owner) + _count("all-to-all", owner) < _count(
+        "all-gather", gather
+    )
 
 
 def test_gather_holds_matrices_whole_and_a_stack_split_over_what_that_frees():
@@ -249,8 +282,12 @@ def test_gather_holds_matrices_whole_and_a_stack_split_over_what_that_frees():
     )
 
 
-def test_a_run_that_gathers_matrices_for_muon_trains_as_on_one_device(losses):
-    muon = {"optimizer": "muon(lr=0.02)", "methods": "methods(orthogonalize=gather)"}
+@pytest.mark.parametrize("orthogonalize", ["gather", "owner"])
+def test_a_run_that_moves_matrices_for_muon_trains_as_on_one_device(
+    losses, orthogonalize
+):
+    how = f"methods(orthogonalize={orthogonalize})"
+    muon = {"optimizer": "muon(lr=0.02)", "methods": how}
     one = losses(MOE, mesh="mesh(data=1)", **muon)
     assert np.allclose(losses(MOE, mesh="mesh(fsdp=8)", **muon), one, atol=1e-5)
 

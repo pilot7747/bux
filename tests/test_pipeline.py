@@ -149,7 +149,7 @@ def test_a_circular_pipeline_trains_as_one_device(losses):
     assert np.allclose(piped, one, atol=1e-5)
 
 
-@pytest.mark.parametrize("orthogonalize", ["gspmd", "gather"])
+@pytest.mark.parametrize("orthogonalize", ["gspmd", "gather", "owner"])
 @pytest.mark.parametrize("pipeline", ["gpipe", "circular"])
 def test_muon_trains_a_pipelined_repeat_as_one_device(losses, pipeline, orthogonalize):
     muon, rounds = "muon(lr=0.02)", 2 if pipeline == "circular" else 1

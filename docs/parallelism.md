@@ -603,16 +603,27 @@ method:
 |----------|------------------------------------------------------------------------------|
 | `gspmd`  | Newton-Schulz on whatever shards the compiler gives each update; the default |
 | `gather` | each update whole in a `jax.shard_map` for Newton-Schulz, and back on its parameter's shards after |
+| `owner`  | each matrix whole on one device, its owner, which runs its matrices of a shape as one batch |
 
 ```
-methods = methods(orthogonalize=gather)
+methods = methods(orthogonalize=owner)
 ```
 
 Under `gather`, a stack of matrices (the experts) is whole matrix by matrix, and its
 stacked dimension splits over the axes that frees, where they divide it: each device
 orthogonalizes its own experts. A lone matrix is whole on every device, and every
-device runs its Newton-Schulz. Owner-per-matrix schemes (Moonlight, Dion), which spread
-that work, are the next method.
+device runs its Newton-Schulz.
+
+`owner` spreads that work, as Moonlight's and Dion's distributed Muon do. Every matrix,
+a stack's one by one, has one owner. The matrices of a shape and split, from every
+update of the step, are dealt out evenly over the devices, padded with zero matrices
+to a multiple of them, so that each device does the same work, and the work of a shape
+(m·n·min(m, n) a matrix) is split evenly. One all-to-all takes each device's shards of
+them to their owners, which orthogonalize their matrices of a shape as one batched
+chain of products; another brings the results back to the parameters' shards, and an
+all-gather copies them over the axes that do not split the parameter (`data`, say).
+Under `layout(zero=1)` an update comes split by FSDP, as the optimizer's state is, and
+its matrices go back whole along FSDP's side by an all-gather, as the parameter is.
 
 A method gets every update of a step at once, so that it can choose where each runs:
 
@@ -631,16 +642,22 @@ def _(updates, dims, shardings, newton_schulz):
 Collectives in the compiled train step on 8 CPU devices (all-reduces / all-gathers /
 all-to-alls) for the 2-block Llama and the MoE of `tests/test_parallel.py`:
 
-| model, mesh               | AdamW       | Muon, `gspmd` | Muon, `gather` |
-|---------------------------|-------------|---------------|----------------|
-| Llama, `fsdp=8`           | 21 / 24 / 0 | 72 / 84 / 0   | 21 / 38 / 0    |
-| Llama, `fsdp=4, tensor=2` | 21 / 25 / 0 | 72 / 85 / 0   | 21 / 39 / 0    |
-| MoE, `fsdp=8`             | 26 / 33 / 8 | 67 / 183 / 8  | 26 / 48 / 14   |
-| MoE, `fsdp=4, tensor=2`   | 25 / 36 / 6 | 66 / 186 / 6  | 25 / 51 / 12   |
+| model, mesh                         | AdamW       | Muon, `gspmd` | Muon, `gather` | Muon, `owner` |
+|-------------------------------------|-------------|---------------|----------------|---------------|
+| Llama, `fsdp=8`                     | 22 / 26 / 0 | 73 / 86 / 0   | 22 / 40 / 0    | 22 / 26 / 6   |
+| Llama, `fsdp=4, tensor=2`           | 34 / 33 / 0 | 133 / 213 / 0 | 34 / 61 / 0    | 34 / 33 / 16  |
+| MoE, `fsdp=8`                       | 24 / 31 / 0 | 65 / 181 / 0  | 24 / 46 / 6    | 24 / 31 / 8   |
+| MoE, `fsdp=4, tensor=2`             | 36 / 35 / 0 | 164 / 250 / 0 | 36 / 73 / 0    | 36 / 36 / 18  |
+| Llama, `fsdp=8`, `zero=1`           | 22 / 21 / 0 | 73 / 81 / 0   | 22 / 21 / 0    | 22 / 10 / 3   |
+| Llama, `fsdp=4, tensor=2`, `zero=1` | 34 / 21 / 0 | 133 / 201 / 0 | 34 / 35 / 0    | 34 / 11 / 12  |
 
 With `gather`, Muon all-reduces as often as AdamW, and adds one all-gather per matrix
 and two all-to-alls per expert stack; the optimizer's update alone does no all-reduce.
-Step times on fake CPU devices, which share one CPU, say nothing.
+With `owner`, Muon all-reduces and all-gathers as AdamW does, and adds one all-to-all
+each way for every shape and split of matrix, two where a matrix splits on both sides
+(`tensor`). Under `zero=1` its few all-gathers of whole matrices replace the one each
+parameter takes otherwise. Step times on fake CPU devices, which share one CPU, say
+nothing.
 
 ## Repeats and remat: `methods.repeat`, `methods.remat`
 
