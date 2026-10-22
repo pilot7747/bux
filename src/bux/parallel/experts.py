@@ -24,7 +24,15 @@ from jax.sharding import PartitionSpec as P
 from jaxtyping import Array, Float, Int
 
 from bux import config as cfg
-from bux.architecture.moe import Kernels, MoE, Rows, by_expert, routed, run_sorted
+from bux.architecture.moe import (
+    Kernels,
+    MoE,
+    Rows,
+    by_expert,
+    pick_rows,
+    routed,
+    run_sorted,
+)
 from bux.parallel import methods
 from bux.parallel.layout import spec
 from bux.parallel.mesh import active
@@ -186,7 +194,7 @@ def ragged(
     # Buffers like z, so that they vary over the devices as it does: the exchange
     # types its result as its buffer.
     there = exchange(
-        z.reshape(-1, d)[order // k],
+        pick_rows(z.reshape(-1, d), order, jnp.argsort(order), k),
         jnp.zeros_like(z, shape=(peers * n, d)),
         *(ahead[me], s[me], before[me], s[:, me]),
         axis_name=axes,

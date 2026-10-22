@@ -240,9 +240,10 @@ the plan:
   resume.
 - **`methods.repeat`** changes the checkpoint's structure: a restore across `unroll`
   and `scan` is an error that says so (WP11). gpipe keeps `scan`'s layout.
-- **Not run anywhere yet:** `ragged_all_to_all`, tokamax's GPU kernels, and bfloat16
-  pipelines and MoE methods on more than one device, which XLA:CPU cannot compile. The
-  GPU scripts are in `scripts/gpu_smoke/`.
+- **Run on GPUs since (8 B300s):** every `methods.attention` and `methods.moe`, with
+  tokamax's kernels (`scripts/gpu_smoke/`); `ragged_all_to_all` needs NCCL's barrier
+  off on jax 0.12 (docs/parallelism.md). **Not yet:** bfloat16 pipelines on more than
+  one device, which XLA:CPU cannot compile.
 
 ## WP0: JAX 0.12
 

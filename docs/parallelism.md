@@ -244,14 +244,15 @@ methods = methods(attention=ring)
 
 | method    | what it does                                                         |
 |-----------|----------------------------------------------------------------------|
-| `xla`     | the default: all t by t logits at once. With `seq` over `context` a device has its queries' rows, and every key and value: all-gather CP |
+| `auto`    | the default: `tokamax` on a GPU (7x `xla`'s speed at t = 4096 on a B300), `xla` elsewhere and for sinks, and for what only `xla` has |
+| `xla`     | all t by t logits at once. With `seq` over `context` a device has its queries' rows, and every key and value: all-gather CP |
 | `ring`    | each device keeps its queries, while the keys and values go round `context` a block at a time, by `ppermute`, into an online softmax; a block wholly ahead of the queries, or a window or more behind, is skipped. Its custom VJP sends them round again with their gradients, which then go home |
 | `ulysses` | all-to-alls over `context`, from a device's positions of every head to every position of its own heads; `xla` on those; and back. `context` must divide a device's heads; kv heads it does not divide are repeated |
 | `tokamax` | tokamax's flash attention (Mosaic, then Triton, then XLA), a document from its first token on as `k_start`, split by its `q_sharding`: all-gather CP in a kernel. No sinks; Linux only (the `cuda` extra) |
 
 What only `xla` has stays in the layer: a mask of the keys each query keeps (an
 indexer's top-k, CSA's compressed latents), relative bias, length scale and attention
-dropout. A layer with one of them under another method raises `NotImplementedError`
+dropout. A layer with one of them under a method other than `auto` raises `NotImplementedError`
 naming it, as a method does for a feature of the visibility it lacks. The indexer's
 loss reads the attention's probabilities, which only `xla` makes; it comes with the
 indexer's top-k, so it is `xla`'s too.
@@ -371,7 +372,7 @@ methods = methods(recurrence=pass_state)
 
 | method       | what it does                                                     |
 |--------------|------------------------------------------------------------------|
-| `scan`       | the default: one scan over every position. With `seq` over `context`, XLA gathers the sequence onto every device first |
+| `scan`       | the default: every position as one chunk, which `chunkwise` runs by chunks of 64 positions (or cuDNN's kernel, below). With `seq` over `context`, XLA gathers the sequence onto every device first |
 | `pass_state` | each device scans its own positions from a zero state and keeps their transition; the transitions fold, in turn, into the state each device's chunk starts from (LASP-2: XLA all-gathers them over `context`); and each device adds to its outputs what they read of that state |
 
 | family                                | `A`, a head          | `reads_t`  |
@@ -455,9 +456,15 @@ of its rows. On `context=2 × tensor=2` a matrix family's carried `P` costs abou
 the halved sequence saves. Under `precision(compute=bfloat16)` it trains on CPU too:
 what the `shard_map`s' transposes sum is float32.
 
+A chunk runs by `chunkwise` (`bux.architecture.chunkwise`), the form of fla's chunked
+kernels, under every method: matmuls within chunks of 64 positions, and a scan of the
+state across them, by a Pallas kernel on a GPU (`affine_scan`). `stepwise`, a scan
+over positions, is its reference. Under `scan`, the delta rule of a gate bounded at
+-5 or above (KDA's `gate_lower_bound`, DeltaNet's none) runs by cuDNN's fused KDA
+kernel on a B200 or B300 instead (`fused_delta`); it overflows below -5.
+
 Not yet: a `ppermute` chain instead of the all-gather, which holds every device's
-transitions (`c` matrices `k × k` a head) on each; and chunked kernels (fla's) as
-methods, which would take a family's own inputs rather than `Recurrence`'s.
+transitions (`c` matrices `k × k` a head) on each.
 
 ## Mixture of experts
 
@@ -481,11 +488,15 @@ Its pieces are functions of arrays alone, in `bux.architecture.moe`, so that a m
 can run them on one device's experts inside a `shard_map`:
 
 - `experts(x, sizes, up, gate, down, ffn, norm)`: the expert FFN of rows sorted by
-  expert, `sizes[i]` of them expert i's, by `jax.lax.ragged_dot`, or tokamax's where
-  it is installed. Rows past `sizes.sum()` come out 0, before `norm`.
+  expert, `sizes[i]` of them expert i's, by `grouped.ragged_dot`: tokamax's Mosaic
+  kernel on a GPU, and its Triton one for the kernels' gradient (27 times XLA's
+  `jax.lax.ragged_dot` on a B300), or XLA's. Rows past `sizes.sum()` come out 0,
+  before `norm`.
 - `routed(z, idx, weights, up, gate, down, ffn, norm)`: sort, `experts`, unsort. A
   pick outside the experts of `up` adds nothing, so a device that holds experts
-  `[i, i + n)` passes `idx - i` and its own kernels.
+  `[i, i + n)` passes `idx - i` and its own kernels. The sort and the unsort are
+  `pick_rows` and `permuted`, whose gradients gather by the inverse permutation
+  where XLA's would scatter-add.
 
 ```python
 from bux.architecture.moe import routed
@@ -573,6 +584,12 @@ move tokens instead. Dropless with buffers of a fixed size, `all_to_all` moves
 `top_k` times the rows `all_gather` does, as every peer's buffer holds every local
 pick: it is the CPU sibling of `ragged_all_to_all`, which moves the picks alone. No
 method rematerializes anything on these meshes, nor on `fsdp=2, expert=2, tensor=2`.
+
+On 8 B300s (`scripts/gpu_smoke/experts.py`, a small MoE), every method computes what
+one GPU does; `sorted` is the fastest there, 400k tokens a second, then `all_gather`
+and `all_to_all` (335k), then `ragged_all_to_all` (270k). On jax 0.12 NCCL's ragged
+all-to-all hangs unless XLA_FLAGS has
+`--xla_gpu_experimental_ragged_all_to_all_use_barrier_with_nccl=false`.
 
 ## Muon: `methods.orthogonalize`
 

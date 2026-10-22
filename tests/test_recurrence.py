@@ -244,10 +244,11 @@ def logits_and_grads(m: Model) -> tuple[Float[Array, "b t vocab"], list]:
 
 
 def assert_rounds_alike(split: Float[Array, "..."], whole: Float[Array, "..."]) -> None:
-    """`split` is `whole` to 1e-5 of its largest entry: as float32 sums of many
-    terms round, a gradient's taken over every position."""
+    """`split` is `whole` to 5e-5 of its largest entry: as float32 sums of many
+    terms round, a gradient's taken over every position, and the chunks'
+    (``chunkwise``) in other orders on each device's positions than on all."""
     scale = float(jnp.abs(whole).max())
-    np.testing.assert_allclose(split, whole, atol=1e-5 * scale)
+    np.testing.assert_allclose(split, whole, atol=5e-5 * scale)
 
 
 @pytest.mark.parametrize("family", FAMILIES)
@@ -258,7 +259,7 @@ def test_every_family_computes_and_differentiates_packed_rows_as_on_one_device(
     logits, grads = logits_and_grads(model(family))
     with parallel.use(MESHES[context], methods=PASS):
         split_logits, split_grads = logits_and_grads(model(family))
-    np.testing.assert_allclose(split_logits, logits, atol=1e-5)
+    assert_rounds_alike(split_logits, logits)
     for split, whole in zip(split_grads, grads, strict=True):
         assert_rounds_alike(split, whole)
 

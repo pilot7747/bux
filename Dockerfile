@@ -1,7 +1,8 @@
 # syntax=docker/dockerfile:1
 
 # GPU image for bux: JAX on CUDA 13 for Blackwell (and Hopper), plus tokamax's Pallas kernels
-# (FlashAttention, MoE grouped matmul, fused cross-entropy). CUDA, cuDNN and NCCL come from the
+# (FlashAttention, MoE grouped matmul) and cudnn-frontend's (KDA), which tokamax's extra brings
+# (docs/training.md, Speed on GPUs). CUDA, cuDNN and NCCL come from the
 # `cuda` extra's pip wheels, pinned in uv.lock, so the base image only needs to supply the driver
 # plumbing; CUDA_VERSION should track the toolkit those wheels ship.
 #

@@ -285,6 +285,30 @@ other intervals, or splitting it over devices another way (`mesh`, `layout`,
 directory of its own, and an unchanged one started again resumes from its latest
 checkpoint, ending exactly where it would have.
 
+## Speed on GPUs
+
+What XLA compiles slowly on a GPU runs by a kernel there, the same computation on a
+CPU by XLA; none of it is in a run's id. Each is in `bux.architecture` and falls back
+by itself where it cannot run:
+
+| what | by | on a B300, against XLA |
+|------|----|------------------------|
+| softmax attention | `methods.attention = auto`, the default: tokamax's flash attention | 7x, and no t × t logits |
+| linear attention, RWKV-7 | `chunkwise`: chunks of 64 positions, the state across them by a Pallas kernel (`affine_scan`) | 14-17x a scan over positions |
+| KDA with `gate_lower_bound`, DeltaNet | cuDNN's fused KDA kernel (`fused_delta`) | 13x `chunkwise` |
+| MoE experts | `grouped.ragged_dot`: tokamax's Mosaic and Triton kernels | 27x `jax.lax.ragged_dot` |
+| MoE dispatch | `pick_rows`, `permuted`: gathers where XLA would scatter | 4x |
+
+Tokens a second on B300s, 8 × 4096 tokens a GPU, `precision(compute=bfloat16)`:
+
+| model (d = 2048, 16 layers) | 1 GPU | 8, `mesh(fsdp=8)` |
+|-----------------------------|-------|-------------------|
+| Llama-style, 1.3B           | 147k (about 40% MFU) | 1.14M |
+| Gated DeltaNet hybrid, `"DDDA"` | 92k | 720k |
+| KDA hybrid, `"KKKA"`        | 58k   |                   |
+| KDA with `gate_lower_bound=-5` | 108k |                |
+| MoE, 64 experts, top 8      | 103k  | 834k              |
+
 ## Launching
 
 `bux train` trains in its own process, which suits a laptop and a debugger. `bux launch`

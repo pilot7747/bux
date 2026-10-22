@@ -1,5 +1,5 @@
 """Context parallelism for attention: what the methods of `methods.attention` take,
-and `ring`, `ulysses` and `tokamax`.
+and `ring`, `ulysses`, `tokamax` and `auto`.
 
 A method is ``(q, k, v, visibility) -> out``: queries (b, t, h, k), keys and values
 (b, t, g, k) and (b, t, g, v) of g kv heads at the queries' positions, and every
@@ -477,6 +477,21 @@ def tokamax(
         except NotImplementedError as e:
             errors.append(e)
     raise ExceptionGroup("methods.attention = tokamax: no kernel runs here", errors)
+
+
+@methods.attention.register("auto")
+def auto(
+    q: Float[Array, "b t h k"],
+    k: Float[Array, "b t g k"],
+    v: Float[Array, "b t g v"],
+    seen: Visibility,
+) -> Float[Array, "b t h v"]:
+    """`methods.attention`'s default: `tokamax` on a GPU, whose kernels make no t by
+    t logits (7 times faster than `xla` at t = 4096 on a B300), where it has what
+    `seen` asks; `xla` elsewhere, and for sinks."""
+    if flash is not None and seen.sinks is None and jax.default_backend() == "gpu":
+        return tokamax(q, k, v, seen)
+    return _xla(q, k, v, seen)
 
 
 def _flash_shardings(

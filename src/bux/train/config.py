@@ -347,7 +347,7 @@ class MethodsConfig(Config):
     registry in bux.parallel.methods: another method is a function, not a field."""
 
     type: Literal["methods"] = "methods"
-    attention: str = "xla"
+    attention: str = "auto"
     moe: str = "sorted"
     recurrence: str = "scan"
     repeat: str = "unroll"

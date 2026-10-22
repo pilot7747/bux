@@ -14,10 +14,10 @@ gives alone.
 Shapes: b rows, t positions, d the width, h heads (value heads, once q and k are shared
 out to them), k and v the head dims of keys and values.
 
-`recurrence` is the reference form, a scan over positions (`chunk`); a chunked kernel
-(fla's) computes the same. It runs by the run's `methods.recurrence`: `scan`, the
-default, here, and `pass_state`, which splits the positions over `context`, in
-``bux.parallel.recurrence``.
+`recurrence` runs by chunks of positions (``chunkwise``, the form of fla's chunked
+kernels), and `stepwise` is its reference, a scan over positions. It runs by the run's
+`methods.recurrence`: `scan`, the default, here, and `pass_state`, which splits the
+positions over `context`, in ``bux.parallel.recurrence``.
 
 Under tensor parallelism (``bux.parallel``) every projection splits over `heads`, into
 the heads or out of them, and so does every parameter a head has: the recurrence runs
@@ -33,6 +33,7 @@ from jaxtyping import Array, Float
 
 from bux import config as cfg
 from bux import parallel
+from bux.architecture import chunkwise, fused_delta
 from bux.architecture.conv import CausalConv
 from bux.architecture.functional import activation
 from bux.architecture.norm import Norm
@@ -104,12 +105,20 @@ def _identity(
 
 
 def chunk(xs: Positions, shared: Shared, transition: bool) -> Chunk:
-    """`recurrence` over a chunk of positions, from a zero state, by a scan in
-    float32; with the `transition`, the product P of every position's diag(w) +
-    b a^T (its diagonal without a and b), and each output's reads P^T q."""
+    """`recurrence` over a chunk of positions, from a zero state, in float32: by
+    chunks of its own, matmuls within each and a scan across them (``chunkwise``);
+    with the `transition`, the product P of every position's diag(w) + b a^T (its
+    diagonal without a and b), and each output's reads P^T q."""
+    return chunkwise.chunk(xs, transition)
+
+
+def stepwise(xs: Positions, shared: Shared, transition: bool) -> Chunk:
+    """`chunk`, a position at a time: a scan in float32, the reference."""
     q, k, v, log_decay, continues, *ab = (
         jnp.moveaxis(y.astype(jnp.float32), 1, 0) for y in xs
     )
+    if len(ab) == 1:  # the delta rule's: b is k
+        ab = [ab[0], k]
     _, batch, h, dk = k.shape
     zero = jnp.zeros_like(k, shape=(batch, h, dk, v.shape[-1]))
     shape = (batch, h, dk if ab else log_decay.shape[-1])
@@ -136,14 +145,17 @@ def recurrence(
 
     with w = exp(log_decay), one a key channel or one a head, and S zero before
     every document; without a and b, decayed linear attention. By the run's
-    `methods.recurrence`, in float32."""
+    `methods.recurrence`, in float32. Where b is k, the delta rule's, the
+    recurrence's positions leave b out: (q, k, v, log decay, continues, a), which
+    ``chunkwise`` runs in half the work."""
     batch, t = k.shape[:2]
     continues = (
         jnp.ones((batch, t)) if docs is None else (docs.within > 0).astype(jnp.float32)
     )
     rank_one = a is not None and b is not None
     family = "the generalized delta rule" if rank_one else "decayed linear attention"
-    xs = (q, k, v, log_decay, continues, *((a, b) if rank_one else ()))
+    ab = (a,) if rank_one and b is k else (a, b) if rank_one else ()
+    xs = (q, k, v, log_decay, continues, *ab)
     run = parallel.method("recurrence")
     return run(Recurrence(family, chunk, xs)).astype(v.dtype)
 
@@ -155,6 +167,7 @@ def delta_rule(
     log_decay: Float[Array, "b t h #k"],
     beta: Float[Array, "b t h"],
     docs: Segments | None,
+    floor: float | None = None,
 ) -> Float[Array, "b t h v"]:
     """The gated delta rule: each token decays the state, then moves what it holds at
     k_t a step beta_t toward v_t,
@@ -162,7 +175,24 @@ def delta_rule(
         S_t = (I - beta_t k_t k_t^T) diag(w_t) S_{t-1} + beta_t k_t v_t^T.
 
     That is `recurrence` with a = -w k, and b = beta k for k: in float32, as
-    `recurrence` is."""
+    `recurrence` is. Where no log decay is below `floor`, and on a B200 or B300,
+    cuDNN's fused kernel runs it instead (``fused_delta``), with q, k and v in their
+    own dtype."""
+    if fused_delta.runs(k.shape[-1], v.shape[-1], floor):
+        g = jnp.broadcast_to(log_decay, k.shape)
+        return fused_delta.delta_rule(q, k, v, g, beta, docs, _chunked)
+    return _chunked(q, k, v, log_decay, beta, docs)
+
+
+def _chunked(
+    q: Float[Array, "b t h k"],
+    k: Float[Array, "b t h k"],
+    v: Float[Array, "b t h v"],
+    log_decay: Float[Array, "b t h #k"],
+    beta: Float[Array, "b t h"],
+    docs: Segments | None,
+) -> Float[Array, "b t h v"]:
+    """`delta_rule` by `recurrence`."""
     k, log_decay = k.astype(jnp.float32), log_decay.astype(jnp.float32)
     step = beta[..., None] * k
     return recurrence(q, step, v, log_decay, docs, a=-jnp.exp(log_decay) * k, b=step)
@@ -395,13 +425,17 @@ class DeltaNet(LinearAttention):
         q, k, v = self._qkv(x, taps)
         q, k = l2norm(q) * self.head_dim**-0.5, l2norm(k)
         beta = heads(jax.nn.sigmoid(self.b(x)))
-        o = delta_rule(q, k, v, heads(self._log_decay(x)), beta, segments(taps))
-        return self._output(x, o)
+        g, docs = heads(self._log_decay(x)), segments(taps)
+        return self._output(x, delta_rule(q, k, v, g, beta, docs, self._floor()))
 
     def _log_decay(self, x: Float[Array, "b t d"]) -> Float[Array, "b t h #k"]:
         """The log of the decay of the state, a key channel or one a head: none."""
         b, t, _ = x.shape
         return jnp.zeros((b, t, self.v_heads, 1))
+
+    def _floor(self) -> float | None:
+        """The least log decay `_log_decay` can give, if it is bounded: 0."""
+        return 0.0
 
 
 class GatedDeltaNet(DeltaNet):
@@ -423,6 +457,9 @@ class GatedDeltaNet(DeltaNet):
     def _log_decay(self, x: Float[Array, "b t d"]) -> Float[Array, "b t h 1"]:
         rate = jax.nn.softplus(self.a(x) + self.dt_bias[...])
         return (-jnp.exp(self.A_log[...]) * rate)[..., None]
+
+    def _floor(self) -> float | None:
+        return None  # -exp(A_log) softplus(...) is unbounded
 
 
 class KimiDeltaAttention(DeltaNet):
@@ -454,6 +491,9 @@ class KimiDeltaAttention(DeltaNet):
         if self.lower_bound is not None:
             return self.lower_bound * jax.nn.sigmoid(rate * f)
         return -rate * jax.nn.softplus(f)
+
+    def _floor(self) -> float | None:
+        return self.lower_bound
 
 
 class GatedLinearAttention(LinearAttention):

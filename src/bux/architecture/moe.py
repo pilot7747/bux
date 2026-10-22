@@ -7,6 +7,7 @@ its own rows (``experts``), dropping none.
 """
 
 from collections.abc import Callable
+from functools import partial
 
 import jax
 import jax.numpy as jnp
@@ -17,16 +18,12 @@ from jaxtyping import Array, Float, Int
 from bux import config as cfg
 from bux import parallel
 from bux.architecture.functional import activation, bound
+from bux.architecture.grouped import ragged_dot
 from bux.architecture.mlp import MLP
 from bux.architecture.norm import Norm
 from bux.architecture.registry import Context, Taps, register, report, training
 from bux.lang import ir
 from bux.parallel import methods
-
-try:  # tokamax's kernels, where its extra is installed (Linux)
-    from tokamax import ragged_dot
-except ImportError:
-    ragged_dot = jax.lax.ragged_dot
 
 Rows = Callable[[Float[Array, "n d"]], Float[Array, "n d"]]  # a norm of rows
 # The experts' kernels, stacked: up, gate (None for an mlp) and down.
@@ -107,6 +104,57 @@ def by_expert(
     return jnp.argsort(flat, stable=True), jnp.bincount(flat, length=e + 1)[:e]
 
 
+@partial(jax.custom_vjp, nondiff_argnums=(3,))
+def pick_rows(
+    z: Float[Array, "n d"], order: Int[Array, " m"], back: Int[Array, " m"], k: int
+) -> Float[Array, "m d"]:
+    """z[order // k]: the rows of the picks `order`, a permutation of the m = n k
+    picks, k of each row of z, which `back` undoes. Its gradient gathers the picks
+    back by `back` and sums each row's k, where XLA's would scatter-add, 4 times as
+    slow on a B300."""
+    return z[order // k]
+
+
+def _pick_rows_forward(
+    z: Float[Array, "n d"], order: Int[Array, " m"], back: Int[Array, " m"], k: int
+) -> tuple[Float[Array, "m d"], Int[Array, " m"]]:
+    return z[order // k], back
+
+
+def _pick_rows_backward(
+    k: int, back: Int[Array, " m"], g: Float[Array, "m d"]
+) -> tuple[Float[Array, "n d"], None, None]:
+    rows = g[back].reshape(-1, k, g.shape[-1])
+    return jnp.sum(rows, 1, dtype=jnp.float32).astype(g.dtype), None, None
+
+
+pick_rows.defvjp(_pick_rows_forward, _pick_rows_backward)
+
+
+@jax.custom_vjp
+def permuted(
+    x: Float[Array, "m d"], order: Int[Array, " m"], back: Int[Array, " m"]
+) -> Float[Array, "m d"]:
+    """x[order], for a permutation `order` that `back` undoes: its gradient gathers
+    by `back`, where XLA's would scatter-add."""
+    return x[order]
+
+
+def _permuted_forward(
+    x: Float[Array, "m d"], order: Int[Array, " m"], back: Int[Array, " m"]
+) -> tuple[Float[Array, "m d"], Int[Array, " m"]]:
+    return x[order], back
+
+
+def _permuted_backward(
+    back: Int[Array, " m"], g: Float[Array, "m d"]
+) -> tuple[Float[Array, "m d"], None, None]:
+    return g[back], None, None
+
+
+permuted.defvjp(_permuted_forward, _permuted_backward)
+
+
 def routed(
     z: Float[Array, "b t d"],
     idx: Int[Array, "b t k"],
@@ -123,9 +171,10 @@ def routed(
     b, t, d = z.shape
     k, e = idx.shape[-1], up.shape[0]
     order, sizes = by_expert(idx, e)
-    rows = z.reshape(b * t, d)[order // k]
+    back = jnp.argsort(order)
+    rows = pick_rows(z.reshape(b * t, d), order, back, k)
     out = experts(rows, sizes, up, gate, down, ffn, norm)
-    each = out[jnp.argsort(order)].reshape(b, t, k, d)
+    each = permuted(out, back, order).reshape(b, t, k, d)
     mine = jnp.where((idx >= 0) & (idx < e), weights, 0)
     return jnp.einsum("btkd,btk->btd", each, mine)
 
@@ -345,11 +394,14 @@ def run_sorted(
     tokens = parallel.spec(("batch", "seq", None), z.shape)
     if not _axes(tokens):
         return local(z, idx, weights, moe.kernels())
+    # Untyped by what varies: tokamax's kernel takes jnp.searchsorted, which fails in
+    # a shard_map on jax 0.12 where it is typed; nothing here communicates.
     return jax.shard_map(
         local,
         in_specs=(tokens, tokens, tokens, P()),
         out_specs=tokens,
         axis_names=_axes(tokens),
+        check_vma=False,
     )(z, idx, weights, moe.kernels())
 
 

@@ -103,10 +103,13 @@ def cross_entropy(
 ) -> Float[Array, ""]:
     """The mean loss of logits over positions t that predict a target, token t + ahead.
     A position with nothing that far ahead in its row, or in its document, is left
-    out."""
-    weight = targets(batch, ahead)
+    out: weighed 0, as the last `ahead` are, rather than sliced off the logits, whose
+    gradient would then pad a copy of them all."""
+    pad = ((0, 0), (0, ahead))
+    weight = jnp.pad(targets(batch, ahead), pad)
+    labels = jnp.pad(jnp.asarray(batch.input_ids)[:, ahead:], pad)
     loss = optax.softmax_cross_entropy_with_integer_labels(
-        logits[:, : weight.shape[1]].astype(jnp.float32), batch.input_ids[:, ahead:]
+        logits.astype(jnp.float32), labels
     )
     return _mean(loss, weight)
 

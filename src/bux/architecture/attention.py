@@ -3,8 +3,9 @@
 Under tensor parallelism (``bux.parallel``) a device has whole heads: their columns of
 the projections in, their queries, keys, values, logits and outputs, and their rows of
 the output projection. The core (logits, probabilities, values) is the run's method of
-``methods.attention``; under `xla`, the default, keys stay whole along their
-positions, so with `seq` split they are gathered: all-gather context parallelism.
+``methods.attention``: `auto`, the default, runs tokamax's fused kernels on a GPU and
+`xla` elsewhere. Under both, keys stay whole along their positions, so with `seq`
+split they are gathered: all-gather context parallelism.
 """
 
 from collections.abc import Sequence
@@ -202,7 +203,7 @@ def xla(
     v: Float[Array, "b t g v"],
     seen: Visibility,
 ) -> Float[Array, "b t h v"]:
-    """`methods.attention`'s default: all t by t logits at once. With `seq` over
+    """`methods.attention`'s reference: all t by t logits at once. With `seq` over
     `context`, each device has its own queries' rows of them, and every key and
     value: all-gather context parallelism."""
     index = jnp.arange(q.shape[1])
@@ -213,10 +214,11 @@ def xla(
 
 
 def _only_xla(feature: str) -> None:
-    """Raise unless the run's attention is `xla`, which alone has `feature`."""
+    """Raise unless the run's attention is `xla`, which alone has `feature`, or
+    `auto`, which takes xla for it."""
     on = parallel.active()
-    name = on.methods.attention if on else "xla"
-    if name != "xla":
+    name = on.methods.attention if on else "auto"
+    if name not in ("xla", "auto"):
         raise NotImplementedError(
             f"methods.attention = {name} has no {feature}; only xla has"
         )
