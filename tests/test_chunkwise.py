@@ -2,6 +2,9 @@
 the reference, a position at a time: outputs, end states, transitions and reads, and
 gradients, over chunks and blocks smaller than the documents and larger."""
 
+import importlib.util
+from pathlib import Path
+
 import jax
 import jax.numpy as jnp
 import numpy as np
@@ -90,6 +93,17 @@ def test_q_and_k_of_a_group_are_its_heads(strong, size, sub):
     for name in ("out", "state", "transition", "reads"):
         a, b = getattr(got, name), getattr(want, name)
         np.testing.assert_allclose(a, b, atol=2e-5, rtol=2e-5, err_msg=name)
+
+
+def test_the_gpu_smoke_script_compares_every_form_on_cpu(monkeypatch):
+    path = Path(__file__).parent.parent / "scripts" / "gpu_smoke" / "recurrence.py"
+    spec = importlib.util.spec_from_file_location("gpu_smoke_recurrence", path)
+    assert spec is not None and spec.loader is not None
+    smoke = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(smoke)
+    monkeypatch.setattr(smoke, "T", 150)  # chunks of 64 and a part of one
+    for case in smoke.CASES:
+        assert max(smoke.errors(case)) < smoke.TOLERANCE, case
 
 
 def test_keys_alike_with_steps_near_one_stay_finite():
