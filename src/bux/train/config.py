@@ -288,6 +288,15 @@ class LogConfig(Config):
     every: Positive = 10
 
 
+class ProfileConfig(Config):
+    """A jax.profiler trace of `steps` steps, those after step `start`, in the run's
+    directory under profile/, which TensorBoard's profile plugin and xprof read."""
+
+    type: Literal["profile"] = "profile"
+    start: Annotated[int, Field(ge=0)] = 10
+    steps: Positive = 5
+
+
 class PrecisionConfig(Config):
     """The dtype the forward and backward compute in, and the format the projections
     inside blocks multiply in (bux.architecture.matmuls). Parameters and the
@@ -359,6 +368,8 @@ class MethodsConfig(Config):
     rounds: Positive = 1  # times a circular pipeline sends a microbatch round
     orthogonalize: str = "gspmd"  # how Muon reaches whole matrices
     microbatches: Positive = 1
+    # A step's new state takes the old one's memory: a lower peak, in fewer pieces.
+    donate: bool = False
 
 
 class TrainConfig(Config):
@@ -378,6 +389,7 @@ class TrainConfig(Config):
     eval: EvalConfig | None = None
     checkpoint: CheckpointConfig | None = None
     log: LogConfig = LogConfig()
+    profile: ProfileConfig | None = None
     precision: PrecisionConfig = PrecisionConfig()
     mesh: MeshConfig = MeshConfig()
     layout: LayoutConfig = LayoutConfig()
@@ -403,6 +415,7 @@ Setting = Annotated[
     | EvalConfig
     | CheckpointConfig
     | LogConfig
+    | ProfileConfig
     | PrecisionConfig
     | MeshConfig
     | LayoutConfig

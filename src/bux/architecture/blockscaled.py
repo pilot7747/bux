@@ -26,6 +26,8 @@ from jax.sharding import PartitionSpec as P
 from jax.typing import DTypeLike
 from jaxtyping import Array, Float, Int, Shaped, UInt8, UInt32
 
+from bux import kernels
+
 E4M3, E2M1 = 448.0, 6.0  # the largest float8 E4M3 and float4 E2M1
 
 
@@ -145,7 +147,7 @@ def mx_twice(
 ) -> tuple[Blocks, Blocks]:
     """Return x and x^T in MXFP8: by one pass of a kernel over x on a GPU, and by XLA
     elsewhere. MXFP8 rounds to nearest, and needs no seed."""
-    if jax.default_backend() != "gpu":
+    if not kernels.gpu():
         return mx_quantize(x), mx_quantize(x.T)
     return mx_kernel_twice(x)
 
