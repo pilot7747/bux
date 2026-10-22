@@ -161,7 +161,7 @@ from bux.parallel import methods
 
 
 @methods.attention.register("mine")
-def _(q, k, v, visibility): ...
+def _(q, k, v, args): ...
 ```
 
 and `methods = methods(attention=mine)` picks it. `parallel.method("attention")` is
@@ -230,10 +230,10 @@ each device.
 ## Context parallelism: `methods.attention`
 
 The core of softmax attention (logits, probabilities, values) is a method of
-`methods.attention`, `(q, k, v, visibility) -> out`: queries `(b, t, h, k)`, keys and
+`methods.attention`, `(q, k, v, args) -> out`: queries `(b, t, h, k)`, keys and
 values `(b, t, g, k)` and `(b, t, g, v)` of `g` kv heads at the queries' positions,
 and the head outputs `(b, t, h, v)`. A query sees no key ahead of it; the
-`Visibility` (`bux.parallel.context`) carries the rest: the documents' ids
+`AttentionArgs` (`bux.parallel.context`) carries the rest: the documents' ids
 (`Segments.ids`, made in the global view before any method), the window, the scale,
 the soft cap and the sinks. Every method takes its softmax in float32.
 
@@ -253,7 +253,7 @@ methods = methods(attention=ring)
 What only `xla` has stays in the layer: a mask of the keys each query keeps (an
 indexer's top-k, CSA's compressed latents), relative bias, length scale and attention
 dropout. A layer with one of them under a method other than `auto` raises `NotImplementedError`
-naming it, as a method does for a feature of the visibility it lacks. The indexer's
+naming it, as a method does for a feature of the `AttentionArgs` it lacks. The indexer's
 loss reads the attention's probabilities, which only `xla` makes; it comes with the
 indexer's top-k, so it is `xla`'s too.
 
@@ -266,15 +266,15 @@ Another method is a function:
 
 ```python
 from bux.parallel import methods
-from bux.parallel.context import Visibility
+from bux.parallel.context import AttentionArgs
 
 
 @methods.attention.register("mine")
-def _(q, k, v, seen: Visibility):
-    # seen.ids (b, t) or None, seen.window, seen.scale, seen.softcap, seen.sinks (h,)
-    if seen.sinks is not None:
+def _(q, k, v, args: AttentionArgs):
+    # args.ids (b, t) or None, args.window, args.scale, args.softcap, args.sinks (h,)
+    if args.sinks is not None:
         raise NotImplementedError("methods.attention = mine has no sinks")
-    return methods.attention.find("xla")(q, k, v, seen)
+    return methods.attention.find("xla")(q, k, v, args)
 ```
 
 Measured on 8 CPU devices: two windowed GQA layers (4 heads, 2 kv heads) in a

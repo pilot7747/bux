@@ -25,9 +25,10 @@ from bux.architecture import (
     Taps,
     num_params,
 )
+from bux.architecture.attention import build_gqa
 from bux.architecture.csa import CSA
 from bux.architecture.indexer import _top
-from bux.architecture.mla import MLA
+from bux.architecture.mla import MLA, build_mla
 from bux.architecture.registry import LOSSES
 from bux.architecture.rope import rotate
 from bux.lang import compile, compile_runs, ir
@@ -236,7 +237,7 @@ def test_mla_without_rope_sees_no_positions():
 
 def gqa(ports=(), **kw):
     c = cfg.GQAConfig(num_heads=4, num_kv_heads=2, rope=cfg.RoPEConfig(), **kw)
-    return Attention(c, D, ports, nnx.Rngs(0))
+    return build_gqa(c, D, ports, nnx.Rngs(0))
 
 
 def gqa_heads(attn, x):
@@ -271,7 +272,7 @@ def mla(indexer=None):
         v_head_dim=5,
         indexer=indexer,
     )
-    return MLA(c, D, (), nnx.Rngs(0))
+    return build_mla(c, D, (), nnx.Rngs(0))
 
 
 INDEXERS = {
