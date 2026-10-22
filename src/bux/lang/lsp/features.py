@@ -53,7 +53,7 @@ class Hover:
 
 
 def diagnostics(source: str, path: str | None = None) -> list[Diagnostic]:
-    """Errors in the file at `path`. Those in modules it uses show at the `use`."""
+    """Return the errors in the file at `path`. Those in modules show at the `use`."""
     filename = path or "<string>"
     report = check(source, filename=filename)
     out = []
@@ -79,7 +79,7 @@ _FIELD = re.compile(r"\s+(\w+)\s*:[^#]*?(?:#\s*(.*))?$")
 
 @cache
 def _notes(cls: type[cfg.Config]) -> dict[str, str]:
-    """The comments on each field in bux/config.py, which document it."""
+    """Return the comment on each field of `cls` in bux/config.py: its documentation."""
     notes: dict[str, str] = {}
     for klass in reversed(cls.__mro__):
         if not (isinstance(klass, type) and issubclass(klass, cfg.Config)):
@@ -103,7 +103,7 @@ def _notes(cls: type[cfg.Config]) -> dict[str, str]:
 
 
 def _members(annotation: object) -> list[object]:
-    """The members of a union, with Annotated unwrapped."""
+    """Return the members of a union, with Annotated unwrapped."""
     origin = typing.get_origin(annotation)
     if origin is typing.Annotated:
         return _members(typing.get_args(annotation)[0])
@@ -126,7 +126,7 @@ def _tags(cls: type[cfg.Config]) -> tuple[str, ...]:
 
 
 def _type(annotation: object) -> str:
-    """A field type the way values are written: int | none, relu | gelu, rope."""
+    """Write a field's type as its values are written: int | none, relu | gelu, rope."""
     parts = []
     for m in _members(annotation):
         if typing.get_origin(m) is typing.Literal:
@@ -197,7 +197,8 @@ class _Index:
         self.macros = {n for n, st in self.defs.items() if st.params is not None}
 
     def resolve(self, name: str, inside: ast.Statement | None) -> str:
-        """What a name means: param, definition, type, activation, or bare (a string or unknown)."""
+        """Classify a name: param, definition, type, activation, or bare (a string, or
+        unknown)."""
         if inside is not None and name in (inside.params or ()):
             return "param"
         builtin = name in TYPES or name in ACTIVATIONS
@@ -213,7 +214,8 @@ class _Index:
     def config_class(
         self, name: str, inside: ast.Statement | None
     ) -> type[cfg.Config] | None:
-        """The config class a name stands for: a builtin, or a definition of (an override of) one."""
+        """Return the config class a name stands for: a builtin, or a definition of one
+        or of an override of one."""
         seen: set[str] = set()
         while True:
             kind = self.resolve(name, inside)
@@ -236,7 +238,7 @@ class _Index:
     def setting_class(
         self, callee: str, key: tuple[str, ...], inside: ast.Statement | None
     ) -> type[cfg.Config] | None:
-        """The class whose fields follow `callee(key.`, e.g. RoPEConfig for gqa(rope.."""
+        """Return the class whose fields follow `callee(key.`: RoPEConfig for gqa(rope."""
         cls = self.config_class(callee, inside)
         for part in key:
             f = cls.model_fields.get(part) if cls is not None else None
@@ -249,7 +251,7 @@ class _Index:
         return " ".join(head.split()).rstrip("= ")
 
     def is_block(self, name: str) -> bool:
-        """Whether a definition is a block or a macro, which no setting can take."""
+        """Return whether a definition is a block or a macro: no setting can take one."""
         seen: set[str] = set()
         while name in self.defs and name not in seen:
             seen.add(name)
@@ -282,7 +284,7 @@ class _Ctx:
 
 
 def _occurrences(ix: _Index) -> Iterator[tuple[Span, tuple]]:
-    """Every name-like thing in the file, with what it is."""
+    """Yield every name-like thing in the file, with what it is."""
     for st in ix.report.statements:
         ctx = _Ctx(st)
         yield st.name_span, ("def", st)
@@ -415,7 +417,8 @@ def _hover_text(ix: _Index, what: tuple) -> str | None:
 
 
 def _value_text(value: object) -> str | None:
-    """A definition's value as source, unless it is a block, which its own source shows best."""
+    """Print a definition's value as source, unless it is a block, which its own source
+    shows best."""
     if isinstance(value, ir.Layer):
         value = value.config
     if isinstance(value, cfg.Config):
@@ -488,14 +491,7 @@ def complete(source: str, offset: int, path: str | None = None) -> list[Completi
             ix, typing.cast(str, inner.callee), dotted, inner.keys, current
         )
     if line.endswith("."):
-        names = []
-        for i in range(len(tokens) - 1, 0, -2):
-            dot, name = tokens[i], tokens[i - 1]
-            if dot.text != "." or name.kind != "NAME" or dot.space_before:
-                break
-            names.insert(0, name.text)
-            if name.space_before or i < 2 or tokens[i - 2].text != ".":
-                break
+        names = _names_before_dot(tokens)
         return _field_items(ix, names, current) if names else []
     if inner is not None and key is not None:
         callee = typing.cast(str, inner.callee)
@@ -507,8 +503,21 @@ def complete(source: str, offset: int, path: str | None = None) -> list[Completi
     return _expression_items(ix, current)
 
 
+def _names_before_dot(tokens: list[ast.Token]) -> list[str]:
+    names = []
+    for i in range(len(tokens) - 1, 0, -2):
+        dot, name = tokens[i], tokens[i - 1]
+        if dot.text != "." or name.kind != "NAME" or dot.space_before:
+            break
+        names.insert(0, name.text)
+        if name.space_before or i < 2 or tokens[i - 2].text != ".":
+            break
+    return names
+
+
 def _current(ix: _Index, stmt_start: int) -> ast.Statement | None:
-    """The statement the cursor is in, if only by its header while it does not parse."""
+    """Return the statement the cursor is in. While it does not parse, return one made
+    from its header."""
     for st in ix.report.statements:
         if st.span.start == stmt_start:
             return st
@@ -554,7 +563,7 @@ def _open_brackets(tokens: list[ast.Token]) -> list[_Open]:
 
 
 def _key(arg: list[ast.Token]) -> tuple[str, ...] | None:
-    """The key of an argument that has one: (rope, base) for `rope.base = ...`."""
+    """Return the key of an argument, if any: (rope, base) for `rope.base = ...`."""
     names = []
     for i, tok in enumerate(arg):
         if i % 2 == 0:
@@ -569,7 +578,8 @@ def _key(arg: list[ast.Token]) -> tuple[str, ...] | None:
 
 
 def _dotted(arg: list[ast.Token]) -> tuple[str, ...] | None:
-    """The key typed so far, when that is all the argument has: () or (rope,) for `rope.`."""
+    """Return the key typed so far, if the argument has nothing else: () or (rope,) for
+    `rope.`."""
     if len(arg) % 2:
         return None
     names = []
@@ -656,7 +666,8 @@ def _value_items(
 def _expression_items(
     ix: _Index, current: ast.Statement | None, values: bool = False
 ) -> list[Completion]:
-    """Names usable in an expression; with `values`, leave out layers and activations."""
+    """Complete the names usable in an expression; with `values`, leave out layers and
+    activations."""
     params = current.params if current is not None else None
     items = [Completion(p, "parameter", sort="0") for p in params or ()]
     for name, st in ix.defs.items():
@@ -696,7 +707,7 @@ def _definition_item(ix: _Index, st: ast.Statement, sort: str = "1") -> Completi
 def _field_items(
     ix: _Index, names: list[str], current: ast.Statement | None
 ) -> list[Completion]:
-    """Completions after `name.`: the settings of the config it stands for, with their values."""
+    """Complete after `name.`: the settings of the config it stands for, and values."""
     if ix.resolve(names[0], current) == "param":
         return []
     cls = ix.config_class(names[0], current)

@@ -1,4 +1,4 @@
-"""Draws an Architecture as a circuit of the residual stream.
+"""Draw an Architecture as a circuit of the residual stream.
 
 The stream runs left to right along the top. A branch forks off below it and merges
 back: ``⊕`` sums, ``⊗`` multiplies. Labeled blocks are drawn as ``┤name├`` and then
@@ -46,50 +46,55 @@ def _hcat(boxes: list[_Box], sep: str = "──") -> _Box:
 
 
 def _branches(terms: list[_Box], fed: list[bool], merge: str) -> _Box:
-    """Terms stacked vertically between a fork on the left and a merge on the right.
-    Unfed terms (those starting from a tap) are not connected to the fork."""
-    width = max(t.width for t in terms)
+    """Stack the terms between a fork on the left and a merge on the right. Terms
+    that start from a tap are not fed, so they are not connected to the fork."""
+    width = max(term.width for term in terms)
     rows: list[str] = []
     ports: list[int] = []
-    for t in terms:
-        ports.append(len(rows) + t.port)
-        for i, r in enumerate(t.rows):
-            rows.append(r + ("─" if i == t.port else " ") * (width - len(r)))
-    feeds = [p for p, f in zip(ports, fed) if f]
-    out = []
-    for y, row in enumerate(rows):
-        if feeds and y == feeds[0]:
-            left = "┬─" if len(feeds) > 1 else "──"
-        elif y in feeds[1:-1]:
-            left = "├─"
-        elif len(feeds) > 1 and y == feeds[-1]:
-            left = "└─"
-        elif feeds and feeds[0] < y < feeds[-1]:
-            left = "│ "
-        else:
-            left = "  "
-        if y == ports[0]:
-            right = "─" + merge
-        elif y in ports[1:-1]:
-            right = "─┤"
-        elif y == ports[-1]:
-            right = "─┘"
-        elif ports[0] < y < ports[-1]:
-            right = " │"
-        else:
-            right = "  "
-        out.append(left + row + right)
+    for term in terms:
+        ports.append(len(rows) + term.port)
+        for i, row in enumerate(term.rows):
+            rows.append(row + ("─" if i == term.port else " ") * (width - len(row)))
+    feeds = [port for port, is_fed in zip(ports, fed) if is_fed]
+    out = [
+        _fork_edge(y, feeds) + row + _merge_edge(y, ports, merge)
+        for y, row in enumerate(rows)
+    ]
     return _Box(tuple(out), ports[0])
+
+
+def _fork_edge(y: int, feeds: list[int]) -> str:
+    if feeds and y == feeds[0]:
+        return "┬─" if len(feeds) > 1 else "──"
+    if y in feeds[1:-1]:
+        return "├─"
+    if len(feeds) > 1 and y == feeds[-1]:
+        return "└─"
+    if feeds and feeds[0] < y < feeds[-1]:
+        return "│ "
+    return "  "
+
+
+def _merge_edge(y: int, ports: list[int], merge: str) -> str:
+    if y == ports[0]:
+        return "─" + merge
+    if y in ports[1:-1]:
+        return "─┤"
+    if y == ports[-1]:
+        return "─┘"
+    if ports[0] < y < ports[-1]:
+        return " │"
+    return "  "
 
 
 def _frame(box: _Box, label: str) -> _Box:
     inner = box.width + 2
     top = f"╭─{label}" + "─" * max(0, inner - len(label) - 1) + "╮"
     rows = [top]
-    for i, r in enumerate(box.rows):
-        r = r + ("─" if i == box.port else " ") * (box.width - len(r))
+    for i, row in enumerate(box.rows):
+        row = row + ("─" if i == box.port else " ") * (box.width - len(row))
         rows.append(
-            ("┤─" if i == box.port else "│ ") + r + ("─├" if i == box.port else " │")
+            ("┤─" if i == box.port else "│ ") + row + ("─├" if i == box.port else " │")
         )
     rows.append("╰" + "─" * inner + "╯")
     return _Box(tuple(rows), box.port + 1)
@@ -192,15 +197,15 @@ class _Renderer:
 
 
 def render(arch: ir.Architecture, *, expand: bool = False) -> str:
-    """The model's circuit, followed by one circuit per labeled block it uses (unless `expand`)."""
-    r = _Renderer(collapse=not expand)
+    """Draw the model's circuit, then one circuit per labeled block it uses, unless
+    `expand` draws the blocks inline."""
+    renderer = _Renderer(collapse=not expand)
     root = arch.graph.model_copy(update={"label": None})
-    sections = [r.draw(arch.graph.label or "model", root)]
+    sections = [renderer.draw(arch.graph.label or "model", root)]
     drawn: set[str] = set()
-    while pending := [name for name in r.blocks if name not in drawn]:
+    while pending := [name for name in renderer.blocks if name not in drawn]:
         for name in pending:
             drawn.add(name)
-            sections.append(
-                r.draw(name, r.blocks[name].model_copy(update={"label": None}))
-            )
+            block = renderer.blocks[name].model_copy(update={"label": None})
+            sections.append(renderer.draw(name, block))
     return "\n\n".join(sections) + "\n"

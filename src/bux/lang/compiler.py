@@ -1,12 +1,13 @@
-"""Compiles .bux source into the architecture IR.
+"""Compile .bux source into the architecture IR.
 
 Two passes. Evaluation resolves names, macros, layer settings and patterns into an
-untyped graph. Lowering then walks it in execution order, with repeats unrolled, to
-infer every layer's input width, check residuals and parallel branches for width
-agreement, simulate the tap stacks, and verify that shared blocks are used consistently.
+untyped graph. Lowering then walks it in execution order, with repeats unrolled. It
+infers every layer's input width, checks that residuals and parallel branches agree
+on width, simulates the tap stacks, and checks that shared blocks are used the same
+way everywhere.
 
 A program can span files (``use``), and its alternatives (``a | b``) make it a sweep
-of several runs: evaluation takes one alternative of each, picked by ``choices``.
+of several runs. Evaluation takes one alternative of each, picked by ``choices``.
 
 ``compile`` stops at the first error. ``check`` is for editors: it recovers from
 syntax errors and reports every definition that fails, in every alternative.
@@ -15,6 +16,7 @@ syntax errors and reports every definition that fails, in every alternative.
 
 import builtins
 import difflib
+import operator
 import re
 import typing
 from collections.abc import Callable, Generator, Mapping, Sequence
@@ -64,7 +66,7 @@ _EXAMPLES = {
 
 @dataclass(frozen=True)
 class _Named:
-    """A value reached through a definition or macro call; graphs built from it carry the label."""
+    """A value reached through a definition or a macro call: its graphs carry the label."""
 
     label: str
     value: object
@@ -95,8 +97,8 @@ class _PortValue:
 
 @dataclass(frozen=True)
 class Axis:
-    """A dimension of a sweep: one ``a | b`` as written, or all the alternatives with
-    the same labels, which are picked together."""
+    """One axis of a sweep: one ``a | b`` as written, or all the alternatives with the
+    same labels, which are picked together."""
 
     key: Span | frozenset[str]
     where: str  # the definition and setting of the first one met: "optimizer.lr"
@@ -108,21 +110,31 @@ class Axis:
         return isinstance(self.key, frozenset)
 
     def pick(self, option: int) -> int | str:
-        """What ``choices`` holds for the option at `option`."""
+        """Return what ``choices`` holds for option `option`: its label or index."""
         return self.options[option] if self.labeled else option
 
     def part(self, pick: int | str) -> str:
-        """How a run that took `pick` is named: mqa, or optimizer.lr=1e-3."""
+        """Return how a run that took `pick` is named: mqa, or optimizer.lr=1e-3."""
         if isinstance(pick, str):
             return pick
         return f"{self.where}={self.options[pick]}"
 
 
 class _Reported(BuxError):
-    """Raised on a use of a definition whose own error was already reported; check() drops it."""
+    """A repeat, at a use, of an error already reported; check() drops it."""
 
     def __init__(self) -> None:
         super().__init__("already reported")
+
+
+_ARITHMETIC: dict[str, Callable[[float, float], float]] = {
+    "+": operator.add,
+    "-": operator.sub,
+    "*": operator.mul,
+    "/": operator.truediv,
+    "//": operator.floordiv,
+    "^": operator.pow,
+}
 
 
 def _tag(config: cfg.Config) -> str:
@@ -130,29 +142,33 @@ def _tag(config: cfg.Config) -> str:
     return getattr(config, "type")  # noqa: B009
 
 
-def _unwrap(v: object) -> object:
-    while isinstance(v, _Named):
-        v = v.value
-    return v
+def _unwrap(value: object) -> object:
+    while isinstance(value, _Named):
+        value = value.value
+    return value
 
 
-def _is_number(v: object) -> bool:
-    v = _unwrap(v)
-    return isinstance(v, int | float) and not isinstance(v, bool)
+def _is_number(value: object) -> bool:
+    value = _unwrap(value)
+    return isinstance(value, int | float) and not isinstance(value, bool)
 
 
-def _flatten(nodes: list[ir.Node], cls: type, field: str) -> tuple[ir.Node, ...]:
+def _activation(name: str) -> cfg.ActivationConfig:
+    return cfg.ActivationConfig(fn=typing.cast(cfg.Activation, name))
+
+
+def _flatten(nodes: list[ir.Node], cls: type, children: str) -> tuple[ir.Node, ...]:
     out: list[ir.Node] = []
     for node in nodes:
         if isinstance(node, cls) and node.label is None and node.share is None:
-            out.extend(getattr(node, field))
+            out.extend(getattr(node, children))
         else:
             out.append(node)
     return tuple(out)
 
 
-def _describe(v: object) -> str:
-    match _unwrap(v):
+def _describe(value: object) -> str:
+    match _unwrap(value):
         case bool():
             return "a boolean"
         case int() | float():
@@ -163,8 +179,8 @@ def _describe(v: object) -> str:
             return "none"
         case list():
             return "a list"
-        case cfg.Config() as c:
-            return f"a {_tag(c)} config"
+        case cfg.Config() as config:
+            return f"a {_tag(config)} config"
         case _Macro(statement=st):
             return f"the macro '{st.name}'"
         case _:
@@ -189,6 +205,19 @@ def _assign(data: dict, key: tuple[str, ...], value: object) -> None:
     data[key[-1]] = value
 
 
+def _port(
+    key: tuple[str, ...], tap: ir.Tap | ir.Ref, cls: type[cfg.Config], span: Span
+) -> ir.Port:
+    if len(key) > 1 or key[0] not in cls.ports:
+        available = ", ".join(sorted(cls.ports)) or "none"
+        raise BuxError(f"no port '{'.'.join(key)}' (ports: {available})", span)
+    mode = "write" if isinstance(tap, ir.Tap) else ("pop" if tap.pop else "read")
+    return ir.Port(name=key[0], tap=tap.name, mode=mode)
+
+
+_Fields = list[tuple[tuple[str, ...], object, Span]]
+
+
 class _Evaluator:
     def __init__(
         self,
@@ -197,34 +226,17 @@ class _Evaluator:
         report: Callable[[BuxError], None] | None = None,
         choices: Mapping[Span | frozenset[str], int | str] | None = None,
     ):
-        """`report` collects statement errors instead of raising them (for check()).
-        `choices` picks alternatives, by Axis key; the others take their first."""
+        """`report` collects statement errors instead of raising them, for check().
+        `choices` picks alternatives by Axis key; the others take their first option."""
         self.source = program.source
         # Names of definitions that failed to parse, whose uses are not errors.
         self.broken = set(program.broken)
         # A module failed to load: names that it might have defined are not errors.
         self.incomplete = program.incomplete
-        # Every definition of a name, a layer at a time, the lowest first.
+        # Every definition of each name, lowest layer first.
         self.chain: dict[str, list[ast.Statement]] = {}
         for layer in program.layers:
-            names: set[str] = set()
-            for st in layer:
-                error = None
-                if st.name in names:
-                    error = BuxError(f"'{st.name}' is defined twice", st.name_span)
-                elif st.params is not None and st.name in _RESERVED:
-                    error = BuxError(f"'{st.name}' cannot be a macro", st.name_span)
-                    self.broken.add(st.name)
-                if error is None:
-                    names.add(st.name)
-                    chain = self.chain.setdefault(st.name, [])
-                    if st.amends and chain:
-                        st = replace(st, shared=chain[-1].shared)
-                    chain.append(st)
-                elif report is None:
-                    raise error
-                else:
-                    report(error)
+            self.add_layer(layer, report)
         # The definition in effect for each name: the one in the highest layer.
         self.statements = {name: chain[-1] for name, chain in self.chain.items()}
         self.values: dict[str, object] = {}
@@ -238,15 +250,36 @@ class _Evaluator:
         self.axes: dict[Span | frozenset[str], Axis] = {}  # met so far, in order
         # Source spans of graph nodes, for errors found while lowering. The list keeps
         # the nodes alive so that their ids stay unique.
-        self.spans: dict[int, Span] = {}
+        self.node_spans: dict[int, Span] = {}
         self._alive: list[object] = []
         # Settings given as an undefined bare name, which became a string: arg span ->
         # (name, span of the name, names in scope). Validation errors on them are
         # reported as unknown names.
         self.bare: dict[Span, tuple[str, Span, tuple[str, ...]]] = {}
 
+    def add_layer(
+        self, layer: list[ast.Statement], report: Callable[[BuxError], None] | None
+    ) -> None:
+        names: set[str] = set()
+        for st in layer:
+            if st.name in names:
+                error = BuxError(f"'{st.name}' is defined twice", st.name_span)
+            elif st.params is not None and st.name in _RESERVED:
+                error = BuxError(f"'{st.name}' cannot be a macro", st.name_span)
+                self.broken.add(st.name)
+            else:
+                names.add(st.name)
+                chain = self.chain.setdefault(st.name, [])
+                if st.amends and chain:
+                    st = replace(st, shared=chain[-1].shared)
+                chain.append(st)
+                continue
+            if report is None:
+                raise error
+            report(error)
+
     def node[N](self, node: N, span: Span) -> N:
-        self.spans[id(node)] = span
+        self.node_spans[id(node)] = span
         self._alive.append(node)
         return node
 
@@ -256,8 +289,8 @@ class _Evaluator:
     # --- Names ------------------------------------------------------------------
 
     def definition(self, name: str, level: int | None = None) -> object:
-        """The value of a definition: the one in effect, or the one at `level` of the
-        chain of definitions of `name`."""
+        """Evaluate the definition of `name` in effect, or the one at `level` of its
+        chain, once, and return its value."""
         chain = self.chain[name]
         top = len(chain) - 1
         level = top if level is None else level
@@ -337,222 +370,236 @@ class _Evaluator:
 
     # --- Expressions --------------------------------------------------------------
 
-    def eval(self, e: ast.Expr, scope: dict[str, object]) -> object:
-        match e:
+    def eval(self, expr: ast.Expr, scope: dict[str, object]) -> object:
+        match expr:
             case ast.Lit(value=value):
                 return value
             case ast.Name(name=name):
-                return self.lookup(name, e.span, scope)
+                return self.lookup(name, expr.span, scope)
             case ast.Identity():
-                return self.node(ir.Identity(), e.span)
+                return self.node(ir.Identity(), expr.span)
             case ast.Tap(name=name):
-                return self.node(ir.Tap(name=name), e.span)
+                return self.node(ir.Tap(name=name), expr.span)
             case ast.Ref(name=name, pop=pop):
-                return self.node(ir.Ref(name=name, pop=pop), e.span)
+                return self.node(ir.Ref(name=name, pop=pop), expr.span)
             case ast.ListExpr(items=items):
                 return [self.data(self.eval(item, scope), item.span) for item in items]
             case ast.Residual(body=body):
                 return self.node(
                     ir.Residual(body=self.graph(self.eval(body, scope), body.span)),
-                    e.span,
+                    expr.span,
                 )
             case ast.Seq(items=items):
                 nodes = [
                     self.graph(self.eval(item, scope), item.span) for item in items
                 ]
-                return self.node(ir.Seq(items=_flatten(nodes, ir.Seq, "items")), e.span)
+                return self.node(
+                    ir.Seq(items=_flatten(nodes, ir.Seq, "items")), expr.span
+                )
             case ast.Neg(operand=operand):
-                v = self.eval(operand, scope)
-                if _is_number(v):
-                    return -typing.cast(float, _unwrap(v))
-                return self.node(ir.Neg(body=self.graph(v, operand.span)), e.span)
+                value = self.eval(operand, scope)
+                if _is_number(value):
+                    return -typing.cast(float, _unwrap(value))
+                return self.node(
+                    ir.Neg(body=self.graph(value, operand.span)), expr.span
+                )
             case ast.BinOp():
-                return self.binop(e, scope)
+                return self.binop(expr, scope)
             case ast.Call():
-                return self.call(e, scope)
+                return self.call(expr, scope)
             case ast.Attr():
-                return self.attr(e, scope)
+                return self.attr(expr, scope)
             case ast.Alt():
-                return self.eval(self.choose(e), scope)
-        raise AssertionError(e)
+                return self.eval(self.choose(expr), scope)
+        raise AssertionError(expr)
 
-    def choose(self, e: ast.Alt) -> ast.Expr:
-        """The alternative that `choices` picks, or the first."""
-        key: Span | frozenset[str] = e.span
-        if e.labels:
-            key = frozenset(e.labels)
+    def choose(self, alt: ast.Alt) -> ast.Expr:
+        """Return the alternative that `choices` picks, or the first; record the axis."""
+        key: Span | frozenset[str] = alt.span
+        if alt.labels:
+            key = frozenset(alt.labels)
             for other in self.axes:
                 if isinstance(other, frozenset) and other != key and other & key:
                     raise BuxError(
                         f"these alternatives share some labels with others, but not "
                         f"all: {', '.join(sorted(key))} against {', '.join(sorted(other))}",
-                        e.span,
+                        alt.span,
                         "alternatives with the same labels are picked together, so "
                         "give them all the same labels, or none in common",
                     )
         if key not in self.axes:
-            options = e.labels or tuple(self.text(o.span) for o in e.options)
-            self.axes[key] = Axis(key, e.where, options, e.span)
+            options = alt.labels or tuple(self.text(o.span) for o in alt.options)
+            self.axes[key] = Axis(key, alt.where, options, alt.span)
         pick = self.choices.get(key, 0)
-        return e.options[e.labels.index(pick) if isinstance(pick, str) else pick]
+        return alt.options[alt.labels.index(pick) if isinstance(pick, str) else pick]
 
-    def attr(self, e: ast.Attr, scope: dict[str, object]) -> object:
-        """`base.field`: a setting of a config, as written (width-dependent defaults read as none)."""
-        base = _unwrap(self.eval(e.base, scope))
+    def attr(self, expr: ast.Attr, scope: dict[str, object]) -> object:
+        """Read a setting off a config, ``base.field``, as written: defaults that depend
+        on the width read as none."""
+        base = _unwrap(self.eval(expr.base, scope))
         match base:
             case _Builtin(name=name) if name in TYPES:
-                base = self.construct(name, [], e.base.span)
+                base = self.construct(name, [], expr.base.span)
             case _Builtin(name=name):
-                base = cfg.ActivationConfig(fn=typing.cast(cfg.Activation, name))
+                base = _activation(name)
             case ir.Layer(config=config):
                 base = config
             case _Bare(name=name):
-                raise self.unknown(name, e.base.span, scope, "name")
+                raise self.unknown(name, expr.base.span, scope, "name")
         if not isinstance(base, cfg.Config):
             raise BuxError(
                 f"only layers and settings have fields, but this is {_describe(base)}",
-                e.base.span,
+                expr.base.span,
             )
         fields = type(base).model_fields
-        if e.field not in fields:
-            close = difflib.get_close_matches(e.field, list(fields), n=1)
+        if expr.field not in fields:
+            close = difflib.get_close_matches(expr.field, list(fields), n=1)
             raise BuxError(
-                f"{_tag(base)} has no setting '{e.field}'",
-                e.field_span,
+                f"{_tag(base)} has no setting '{expr.field}'",
+                expr.field_span,
                 f"did you mean '{close[0]}'?" if close else None,
             )
-        return getattr(base, e.field)
+        return getattr(base, expr.field)
 
-    def binop(self, e: ast.BinOp, scope: dict[str, object]) -> object:
-        left, right = self.eval(e.left, scope), self.eval(e.right, scope)
-        # In arithmetic an undefined name is a typo for a number, not a block.
-        for v, other, side in ((left, right, e.left), (right, left, e.right)):
-            if isinstance(v, _Bare) and (
-                _is_number(other)
-                or e.op in ("/", "//")
-                or (e.op == "^" and side is e.right)
-            ):
-                raise self.unknown(v.name, side.span, scope, "name")
+    def binop(self, expr: ast.BinOp, scope: dict[str, object]) -> object:
+        left, right = self.eval(expr.left, scope), self.eval(expr.right, scope)
+        self.reject_bare_numbers(expr, left, right, scope)
         if _is_number(left) and _is_number(right):
-            a, b = typing.cast(float, _unwrap(left)), typing.cast(float, _unwrap(right))
-            try:
-                match e.op:
-                    case "+":
-                        return a + b
-                    case "-":
-                        return a - b
-                    case "*":
-                        return a * b
-                    case "/":
-                        return a / b
-                    case "//":
-                        return a // b
-                    case "^":
-                        return a**b
-            except ZeroDivisionError:
-                raise BuxError("division by zero", e.span) from None
-        if (mixture := self.mix(e, left, right, scope)) is not None:
+            return self.arithmetic(expr, left, right)
+        if (mixture := self.mixture(expr, left, right, scope)) is not None:
             return mixture
-        match e.op:
+        match expr.op:
             case "+" | "-":
-                terms = [self.term(left, e.left.span), self.term(right, e.right.span)]
-                if e.op == "-":
-                    last = terms[-1]
-                    terms[-1] = (
-                        ir.Const(value=-last.value)
-                        if isinstance(last, ir.Const)
-                        else self.node(ir.Neg(body=last), e.right.span)
-                    )
-                return self.node(ir.Sum(terms=_flatten(terms, ir.Sum, "terms")), e.span)
+                return self.branch_sum(expr, left, right)
             case "*":
                 factors = [
-                    self.factor(left, e.left.span),
-                    self.factor(right, e.right.span),
+                    self.factor(left, expr.left.span),
+                    self.factor(right, expr.right.span),
                 ]
                 return self.node(
-                    ir.Prod(factors=_flatten(factors, ir.Prod, "factors")), e.span
+                    ir.Prod(factors=_flatten(factors, ir.Prod, "factors")), expr.span
                 )
             case "^":
-                times = _unwrap(right)
-                if isinstance(times, bool) or not isinstance(times, int) or times < 1:
-                    raise BuxError(
-                        "a repeat count must be a positive integer", e.right.span
-                    )
-                body = self.graph(left, e.left.span)
-                return (
-                    body
-                    if times == 1
-                    else self.node(ir.Repeat(body=body, times=times), e.span)
-                )
+                return self.repeat(expr, left, right)
             case op:
                 raise BuxError(
                     f"'{op}' only divides numbers",
-                    e.span,
+                    expr.span,
                     "scale a branch with `f * 0.5`",
                 )
 
-    def mix(
-        self, e: ast.BinOp, left: object, right: object, scope: dict[str, object]
+    def reject_bare_numbers(
+        self, expr: ast.BinOp, left: object, right: object, scope: dict[str, object]
+    ) -> None:
+        # In arithmetic an undefined name is a typo for a number, not a block.
+        for value, other, side in ((left, right, expr.left), (right, left, expr.right)):
+            if isinstance(value, _Bare) and (
+                _is_number(other)
+                or expr.op in ("/", "//")
+                or (expr.op == "^" and side is expr.right)
+            ):
+                raise self.unknown(value.name, side.span, scope, "name")
+
+    def arithmetic(self, expr: ast.BinOp, left: object, right: object) -> float:
+        a, b = typing.cast(float, _unwrap(left)), typing.cast(float, _unwrap(right))
+        try:
+            return _ARITHMETIC[expr.op](a, b)
+        except ZeroDivisionError:
+            raise BuxError("division by zero", expr.span) from None
+
+    def branch_sum(self, expr: ast.BinOp, left: object, right: object) -> ir.Node:
+        terms = [self.term(left, expr.left.span), self.term(right, expr.right.span)]
+        if expr.op == "-":
+            last = terms[-1]
+            terms[-1] = (
+                ir.Const(value=-last.value)
+                if isinstance(last, ir.Const)
+                else self.node(ir.Neg(body=last), expr.right.span)
+            )
+        return self.node(ir.Sum(terms=_flatten(terms, ir.Sum, "terms")), expr.span)
+
+    def repeat(self, expr: ast.BinOp, left: object, right: object) -> ir.Node:
+        times = _unwrap(right)
+        if isinstance(times, bool) or not isinstance(times, int) or times < 1:
+            raise BuxError("a repeat count must be a positive integer", expr.right.span)
+        body = self.graph(left, expr.left.span)
+        if times == 1:
+            return body
+        return self.node(ir.Repeat(body=body, times=times), expr.span)
+
+    def mixture(
+        self, expr: ast.BinOp, left: object, right: object, scope: dict[str, object]
     ) -> tcfg.MixtureConfig | None:
-        """Data sources mixed with + and weighted with *: 0.7 * web + 0.3 * code."""
+        """Mix data sources with + and weight them with *: 0.7 * web + 0.3 * code.
+        Return None when neither side is a data source."""
 
-        def operand(v: object, side: ast.Expr) -> object:
-            v = _unwrap(v)
+        def operand(value: object, side: ast.Expr) -> object:
+            value = _unwrap(value)
             # The bare name of a kind of source is one with its defaults: web + synthetic.
-            if isinstance(v, _Builtin) and v.name in _SOURCES:
-                return self.construct(v.name, [], side.span)
-            return v
+            if isinstance(value, _Builtin) and value.name in _SOURCES:
+                return self.construct(value.name, [], side.span)
+            return value
 
-        a, b = operand(left, e.left), operand(right, e.right)
+        a, b = operand(left, expr.left), operand(right, expr.right)
         if not (isinstance(a, tcfg.SOURCES) or isinstance(b, tcfg.SOURCES)):
             return None
-        for v, side in ((a, e.left), (b, e.right)):
-            if isinstance(v, _Bare):
-                raise self.unknown(v.name, side.span, scope, "name")
-        if e.op == "+" and isinstance(a, tcfg.SOURCES) and isinstance(b, tcfg.SOURCES):
+        for value, side in ((a, expr.left), (b, expr.right)):
+            if isinstance(value, _Bare):
+                raise self.unknown(value.name, side.span, scope, "name")
+        if (
+            expr.op == "+"
+            and isinstance(a, tcfg.SOURCES)
+            and isinstance(b, tcfg.SOURCES)
+        ):
             return tcfg.MixtureConfig(sources=_weighted(a) + _weighted(b))
-        if e.op == "*":
+        if expr.op == "*":
             (weight, side), source = (
-                ((a, e.left), b) if isinstance(b, tcfg.SOURCES) else ((b, e.right), a)
+                ((a, expr.left), b)
+                if isinstance(b, tcfg.SOURCES)
+                else ((b, expr.right), a)
             )
             if _is_number(weight) and isinstance(source, tcfg.SOURCES):
-                w = typing.cast(float, weight)
-                if w <= 0:
-                    raise BuxError("a data weight must be positive", side.span)
-                return tcfg.MixtureConfig(
-                    sources=tuple(
-                        part.model_copy(update={"weight": part.weight * w})
-                        for part in _weighted(source)
-                    )
-                )
+                return self.weighted(source, typing.cast(float, weight), side.span)
         raise BuxError(
             "data is mixed with + and weighted with *",
-            e.span,
+            expr.span,
             "0.7 * web + 0.3 * code, or web + code for an even mix",
         )
 
-    def term(self, v: object, span: Span) -> ir.Node:
-        if _is_number(v):
-            return self.node(
-                ir.Const(value=float(typing.cast(float, _unwrap(v)))), span
+    def weighted(
+        self, source: tcfg.DataConfig, weight: float, span: Span
+    ) -> tcfg.MixtureConfig:
+        if weight <= 0:
+            raise BuxError("a data weight must be positive", span)
+        return tcfg.MixtureConfig(
+            sources=tuple(
+                part.model_copy(update={"weight": part.weight * weight})
+                for part in _weighted(source)
             )
-        return self.graph(v, span)
+        )
 
-    def factor(self, v: object, span: Span) -> ir.Node:
-        if _is_number(v) and isinstance(_unwrap(v), int):
-            n = _unwrap(v)
+    def term(self, value: object, span: Span) -> ir.Node:
+        if _is_number(value):
+            return self.node(
+                ir.Const(value=float(typing.cast(float, _unwrap(value)))), span
+            )
+        return self.graph(value, span)
+
+    def factor(self, value: object, span: Span) -> ir.Node:
+        if _is_number(value) and isinstance(_unwrap(value), int):
+            n = _unwrap(value)
             raise BuxError(
                 f"multiplying a block by the integer {n} is ambiguous",
                 span,
                 f"write blk^{n} to repeat it, or {n}.0 to scale its output",
             )
-        return self.term(v, span)
+        return self.term(value, span)
 
     # --- Coercions ------------------------------------------------------------------
 
-    def graph(self, v: object, span: Span) -> ir.Node:
-        """`v` used as a layer or block."""
-        match v:
+    def graph(self, value: object, span: Span) -> ir.Node:
+        """Convert `value` into a graph node, to use as a layer or block."""
+        match value:
             case _Named(label=label, value=inner, share=share):
                 node = self.graph(inner, span)
                 return self.node(
@@ -561,34 +608,24 @@ class _Evaluator:
                     ),
                     span,
                 )
-            case _ if isinstance(v, ir.NODE_TYPES):
-                return v
+            case _ if isinstance(value, ir.NODE_TYPES):
+                return value
             case cfg.Config():
-                if _tag(v) not in LAYERS:
-                    raise BuxError(
-                        f"{_tag(v)}(...) is "
-                        + (
-                            "a training setting"
-                            if _tag(v) in TRAINING
-                            else "a setting of a layer"
-                        )
-                        + ", not a layer",
-                        span,
+                if _tag(value) not in LAYERS:
+                    kind = (
+                        "a training setting"
+                        if _tag(value) in TRAINING
+                        else "a setting of a layer"
                     )
-                return self.node(ir.Layer(config=typing.cast(cfg.LayerConfig, v)), span)
+                    raise BuxError(f"{_tag(value)}(...) is {kind}, not a layer", span)
+                config = typing.cast(cfg.LayerConfig, value)
+                return self.node(ir.Layer(config=config), span)
+            case _Builtin(name=name) if name in ACTIVATIONS:
+                return self.graph(_activation(name), span)
             case _Builtin(name=name):
-                if name in ACTIVATIONS:
-                    return self.node(
-                        ir.Layer(
-                            config=cfg.ActivationConfig(
-                                fn=typing.cast(cfg.Activation, name)
-                            )
-                        ),
-                        span,
-                    )
                 return self.graph(self.construct(name, [], span), span)
             case str():
-                return self.pattern(v, span)
+                return self.pattern(value, span)
             case _Bare(name=name):
                 raise self.unknown(name, span)
             case _Macro(statement=st):
@@ -596,37 +633,39 @@ class _Evaluator:
                     f"'{st.name}' is a macro and needs arguments: {st.name}({', '.join(st.params or ())})",
                     span,
                 )
-            case int() | float() if not isinstance(v, bool):
+            case int() | float() if not isinstance(value, bool):
                 raise BuxError(
                     "a number is not a layer",
                     span,
                     "repeat a block with blk^3, scale a branch with f * 0.5",
                 )
-        raise BuxError(f"expected a layer or block, found {_describe(v)}", span)
+        raise BuxError(f"expected a layer or block, found {_describe(value)}", span)
 
     def pattern(self, text: str, span: Span) -> ir.Node:
-        """ "MMMA" is the sequence M M M A of one-letter top-level definitions."""
+        """Expand a pattern: "MMMA" is the sequence M M M A of one-letter names."""
         nodes = []
-        for k, ch in enumerate(text):
-            if ch.isspace():
+        for k, letter in enumerate(text):
+            if letter.isspace():
                 continue
-            where = Span(span.start + 1 + k, span.start + 2 + k)
-            if ch in self.broken and ch not in self.statements:
+            letter_span = Span(span.start + 1 + k, span.start + 2 + k)
+            if letter in self.broken and letter not in self.statements:
                 raise _Reported()
-            if not ch.isalpha() or ch not in self.statements:
+            if not letter.isalpha() or letter not in self.statements:
                 raise BuxError(
-                    f"pattern letter '{ch}' is not a one-letter definition", where
+                    f"pattern letter '{letter}' is not a one-letter definition",
+                    letter_span,
                 )
-            nodes.append(self.graph(self.lookup(ch, where, {}), where))
+            definition = self.lookup(letter, letter_span, {})
+            nodes.append(self.graph(definition, letter_span))
         if not nodes:
             raise BuxError("empty pattern", span)
         return (
             nodes[0] if len(nodes) == 1 else self.node(ir.Seq(items=tuple(nodes)), span)
         )
 
-    def data(self, v: object, span: Span) -> object:
-        """`v` used as a setting value."""
-        match v:
+    def data(self, value: object, span: Span) -> object:
+        """Convert `value` into a setting value."""
+        match value:
             case _Named(value=inner):
                 return self.data(inner, span)
             case _Builtin(name=name):
@@ -634,60 +673,65 @@ class _Evaluator:
             case _Bare(name=name):
                 return name
             case None | bool() | int() | float() | str() | list() | cfg.Config():
-                return v
-        raise BuxError(f"expected a value, found {_describe(v)}", span)
+                return value
+        raise BuxError(f"expected a value, found {_describe(value)}", span)
 
     # --- Calls ----------------------------------------------------------------------
 
-    def call(self, e: ast.Call, scope: dict[str, object]) -> object:
-        callee = self.lookup(e.name, e.name_span, scope)
+    def call(self, expr: ast.Call, scope: dict[str, object]) -> object:
+        callee = self.lookup(expr.name, expr.name_span, scope)
         match callee:
             case _Macro(statement=st):
-                return self.apply(st, e, scope)
+                return self.apply(st, expr, scope)
             case _Builtin(name=name) if name in TYPES:
-                fields, ports = self.arguments(e, scope, TYPES[name])
-                config = self.construct(name, fields, e.span)
-                return self.with_ports(config, ports, None, None, e.span)
+                fields, ports = self.arguments(expr, scope, TYPES[name])
+                config = self.construct(name, fields, expr.span)
+                return self.with_ports(config, ports, None, None, expr.span)
             case _Named(label=label, share=share) if isinstance(
                 _unwrap(callee), cfg.Config
             ):
                 base = typing.cast(cfg.Config, _unwrap(callee))
-                fields, ports = self.arguments(e, scope, type(base))
+                fields, ports = self.arguments(expr, scope, type(base))
                 if not fields:
-                    return self.with_ports(base, ports, label, share, e.span)
+                    return self.with_ports(base, ports, label, share, expr.span)
                 # An amendment redefines a shared layer, which stays one module.
-                if share and not e.amend:
+                if share and not expr.amend:
                     raise BuxError(
                         f"'{label}' is shared, so it cannot be changed here",
-                        e.span,
+                        expr.span,
                         "define a separate layer",
                     )
-                config = self.override(base, fields, e.span)
-                return self.with_ports(config, ports, self.text(e.span), None, e.span)
+                config = self.override(base, fields, expr.span)
+                return self.with_ports(
+                    config, ports, self.text(expr.span), None, expr.span
+                )
             case _Bare(name=name):
-                raise self.unknown(name, e.name_span)
+                raise self.unknown(name, expr.name_span)
+        raise self.not_callable(expr, callee)
+
+    def not_callable(self, expr: ast.Call, callee: object) -> BuxError:
         what = "an activation" if isinstance(callee, _Builtin) else _describe(callee)
-        if e.amend:
-            raise BuxError(
-                f"'{e.name}' is {what}, which has no settings to amend",
-                e.name_span,
-                f"redefine it instead: {e.name} = ...",
+        if expr.amend:
+            return BuxError(
+                f"'{expr.name}' is {what}, which has no settings to amend",
+                expr.name_span,
+                f"redefine it instead: {expr.name} = ...",
             )
-        raise BuxError(
-            f"'{e.name}' is {what} and takes no arguments",
-            e.name_span,
-            f"to parametrize a block, make it a macro: {e.name}(x) = ..."
+        return BuxError(
+            f"'{expr.name}' is {what} and takes no arguments",
+            expr.name_span,
+            f"to parametrize a block, make it a macro: {expr.name}(x) = ..."
             if what == "a block"
             else None,
         )
 
     def arguments(
-        self, e: ast.Call, scope: dict[str, object], cls: type[cfg.Config]
-    ) -> tuple[list[tuple[tuple[str, ...], object, Span]], list[ir.Port]]:
-        fields: list[tuple[tuple[str, ...], object, Span]] = []
+        self, expr: ast.Call, scope: dict[str, object], cls: type[cfg.Config]
+    ) -> tuple[_Fields, list[ir.Port]]:
+        fields: _Fields = []
         ports: list[ir.Port] = []
         seen: set[tuple[str, ...]] = set()
-        for arg in e.args:
+        for arg in expr.args:
             if arg.key is None:
                 raise BuxError(
                     "layer settings are keyword arguments: name=value", arg.span
@@ -695,26 +739,17 @@ class _Evaluator:
             if arg.key in seen:
                 raise BuxError(f"'{'.'.join(arg.key)}' is given twice", arg.span)
             seen.add(arg.key)
-            v = self.eval(arg.value, scope)
-            if isinstance(v, ir.Tap | ir.Ref):
-                port = arg.key[0]
-                if len(arg.key) > 1 or port not in cls.ports:
-                    available = ", ".join(sorted(cls.ports)) or "none"
-                    raise BuxError(
-                        f"no port '{'.'.join(arg.key)}' (ports: {available})", arg.span
-                    )
-                mode = (
-                    "write" if isinstance(v, ir.Tap) else ("pop" if v.pop else "read")
-                )
-                ports.append(ir.Port(name=port, tap=v.name, mode=mode))
+            value = self.eval(arg.value, scope)
+            if isinstance(value, ir.Tap | ir.Ref):
+                ports.append(_port(arg.key, value, cls, arg.span))
+                continue
+            # A macro body runs once per call, so the same argument can be a bare
+            # name in one call and not in the next.
+            if isinstance(value, _Bare):
+                self.bare[arg.span] = (value.name, arg.value.span, tuple(scope))
             else:
-                # A macro body runs once per call, so the same argument can be a bare
-                # name in one call and not in the next.
-                if isinstance(v, _Bare):
-                    self.bare[arg.span] = (v.name, arg.value.span, tuple(scope))
-                else:
-                    self.bare.pop(arg.span, None)
-                fields.append((arg.key, self.data(v, arg.value.span), arg.span))
+                self.bare.pop(arg.span, None)
+            fields.append((arg.key, self.data(value, arg.value.span), arg.span))
         return fields, ports
 
     def with_ports(
@@ -735,119 +770,116 @@ class _Evaluator:
             span,
         )
 
-    def construct(
-        self, tag: str, fields: list[tuple[tuple[str, ...], object, Span]], span: Span
-    ) -> cfg.Config:
+    def construct(self, tag: str, fields: _Fields, span: Span) -> cfg.Config:
         data: dict = {"type": tag}
-        for key, value, where in fields:
+        for key, value, arg_span in fields:
             if key == ("type",):
-                raise BuxError("the type is set by the name of the call", where)
+                raise BuxError("the type is set by the name of the call", arg_span)
             _assign(data, key, value)
         return self.validate(TYPES[tag], data, fields, span)
 
-    def override(
-        self,
-        base: cfg.Config,
-        fields: list[tuple[tuple[str, ...], object, Span]],
-        span: Span,
-    ) -> cfg.Config:
+    def override(self, base: cfg.Config, fields: _Fields, span: Span) -> cfg.Config:
         data = base.model_dump()
         for key, value, _ in fields:
             _assign(data, key, value)
         return self.validate(type(base), data, fields, span)
 
     def validate(
-        self,
-        cls: type[cfg.Config],
-        data: dict,
-        fields: list[tuple[tuple[str, ...], object, Span]],
-        span: Span,
+        self, cls: type[cfg.Config], data: dict, fields: _Fields, span: Span
     ) -> cfg.Config:
         try:
             return cls.model_validate(data)
         except ValidationError as err:
-            errors = err.errors()
-            error = next(
-                (e for e in errors if e["type"] == "extra_forbidden"), errors[0]
-            )
-            loc = tuple(str(p) for p in error["loc"])
-            where = next(
-                (s for k, _, s in fields if loc[: len(k)] == k or k[: len(loc)] == loc),
-                span,
-            )
-            path = ".".join(loc)
-            tag = data["type"]
-            match error["type"]:
-                case "extra_forbidden":
-                    close = difflib.get_close_matches(
-                        loc[-1], list(cls.model_fields), n=1
-                    )
-                    hint = (
-                        f"did you mean '{close[0]}'?"
-                        if close and len(loc) == 1
-                        else None
-                    )
-                    raise BuxError(
-                        f"{tag} has no setting '{path}'", where, hint
-                    ) from None
-                case "missing":
-                    raise BuxError(
-                        f"{tag} needs '{path}'", where, f"{tag}({path}=...)"
-                    ) from None
-            hint = None
-            if error["type"] == "literal_error":
-                expected = error.get("ctx", {}).get("expected", "")
-                options = re.findall(r"'([^']*)'", str(expected))
-                close = difflib.get_close_matches(str(error["input"]), options, n=1)
-                hint = f"did you mean '{close[0]}'?" if close else None
-            elif where in self.bare:
-                # A bare name only works as a string, and this setting wants something
-                # else, so the name was meant to refer to a definition.
-                name, name_span, scope = self.bare[where]
-                raise self.unknown(name, name_span, scope, "name") from None
-            raise BuxError(
-                f"{tag}: {path}: {error['msg']}" if path else f"{tag}: {error['msg']}",
-                where,
-                hint,
-            ) from None
+            raise self.invalid(cls, data["type"], err, fields, span) from None
 
-    def apply(self, st: ast.Statement, e: ast.Call, scope: dict[str, object]) -> object:
+    def invalid(
+        self,
+        cls: type[cfg.Config],
+        tag: str,
+        err: ValidationError,
+        fields: _Fields,
+        span: Span,
+    ) -> BuxError:
+        errors = err.errors()
+        forbidden = [error for error in errors if error["type"] == "extra_forbidden"]
+        error = (forbidden or errors)[0]
+        loc = tuple(str(p) for p in error["loc"])
+        arg_span = next(
+            (s for k, _, s in fields if loc[: len(k)] == k or k[: len(loc)] == loc),
+            span,
+        )
+        path = ".".join(loc)
+        match error["type"]:
+            case "extra_forbidden":
+                close = difflib.get_close_matches(loc[-1], list(cls.model_fields), n=1)
+                hint = (
+                    f"did you mean '{close[0]}'?" if close and len(loc) == 1 else None
+                )
+                return BuxError(f"{tag} has no setting '{path}'", arg_span, hint)
+            case "missing":
+                return BuxError(f"{tag} needs '{path}'", arg_span, f"{tag}({path}=...)")
+        hint = None
+        if error["type"] == "literal_error":
+            expected = error.get("ctx", {}).get("expected", "")
+            options = re.findall(r"'([^']*)'", str(expected))
+            close = difflib.get_close_matches(str(error["input"]), options, n=1)
+            hint = f"did you mean '{close[0]}'?" if close else None
+        elif arg_span in self.bare:
+            # A bare name only works as a string, and this setting wants something
+            # else, so the name was meant to refer to a definition.
+            name, name_span, scope = self.bare[arg_span]
+            return self.unknown(name, name_span, scope, "name")
+        return BuxError(
+            f"{tag}: {path}: {error['msg']}" if path else f"{tag}: {error['msg']}",
+            arg_span,
+            hint,
+        )
+
+    def apply(
+        self, st: ast.Statement, expr: ast.Call, scope: dict[str, object]
+    ) -> object:
+        macro_scope = self.bind(st, expr, scope)
+        self.depth += 1
+        if self.depth > 64:
+            raise BuxError(f"'{st.name}' recurses too deeply", expr.span)
+        try:
+            return _Named(self.text(expr.span), self.eval(st.body, macro_scope))
+        finally:
+            self.depth -= 1
+
+    def bind(
+        self, st: ast.Statement, expr: ast.Call, scope: dict[str, object]
+    ) -> dict[str, object]:
         params = st.params or ()
-        bound: dict[str, object] = {}
-        positional = [a for a in e.args if a.key is None]
+        args: dict[str, object] = {}
+        positional = [a for a in expr.args if a.key is None]
         if len(positional) > len(params):
             raise BuxError(
                 f"'{st.name}' takes {len(params)} argument(s)",
                 positional[len(params)].span,
             )
         for param, arg in zip(params, positional):
-            bound[param] = self.eval(arg.value, scope)
-        for arg in e.args:
+            args[param] = self.eval(arg.value, scope)
+        for arg in expr.args:
             if arg.key is None:
                 continue
             name = ".".join(arg.key)
             if name not in params:
                 raise BuxError(f"'{st.name}' has no parameter '{name}'", arg.span)
-            if name in bound:
+            if name in args:
                 raise BuxError(f"'{name}' is given twice", arg.span)
-            bound[name] = self.eval(arg.value, scope)
+            args[name] = self.eval(arg.value, scope)
         defaults = dict(st.defaults)
-        if missing := [p for p in params if p not in bound and p not in defaults]:
+        if missing := [p for p in params if p not in args and p not in defaults]:
             raise BuxError(
-                f"'{st.name}' is missing argument(s): {', '.join(missing)}", e.span
+                f"'{st.name}' is missing argument(s): {', '.join(missing)}", expr.span
             )
         # A default sees the parameters before it: blk(n, kv=n // 4) = ...
         for i, param in enumerate(params):
-            if param not in bound:
-                earlier = {p: bound[p] for p in params[:i]}
-                bound[param] = self.eval(defaults[param], earlier)
-        self.depth += 1
-        if self.depth > 64:
-            raise BuxError(f"'{st.name}' recurses too deeply", e.span)
-        try:
-            return _Named(self.text(e.span), self.eval(st.body, bound))
-        finally:
-            self.depth -= 1
+            if param not in args:
+                earlier = {p: args[p] for p in params[:i]}
+                args[param] = self.eval(defaults[param], earlier)
+        return args
 
     # --- Settings -------------------------------------------------------------------
 
@@ -899,14 +931,14 @@ class _Lowering:
         self.stacks: dict[str, list[_Entry]] = {}
         self.frames: list[_Frame] = []
         self.shared: dict[str, ir.Node] = {}
-        self.where: list[Span] = []
+        self.spans: list[Span] = []
         self.embeddings = 0
         # Layers that reuse the embedding matrix (tied heads, nextn), with their spans.
         self.borrowers: list[tuple[str, Span]] = []
         self.heads = 0
 
     def error(self, message: str, hint: str | None = None) -> BuxError:
-        return BuxError(message, self.where[-1] if self.where else None, hint)
+        return BuxError(message, self.spans[-1] if self.spans else None, hint)
 
     @contextmanager
     def frame(self, label: str) -> Generator[None]:
@@ -920,7 +952,7 @@ class _Lowering:
                 if entry.used_in is frame and not entry.popped:
                     entry.owner = label
 
-    def run(self, graph: ir.Node) -> ir.Node:
+    def lower_model(self, graph: ir.Node) -> ir.Node:
         first = next(ir.unrolled_layers(graph), None)
         width: ir.Width = (
             "tokens"
@@ -936,9 +968,9 @@ class _Lowering:
         return typed
 
     def lower(self, node: ir.Node, width: ir.Width) -> tuple[ir.Node, ir.Width | None]:
-        span = self.ev.spans.get(id(node))
+        span = self.ev.node_spans.get(id(node))
         if span is not None:
-            self.where.append(span)
+            self.spans.append(span)
         try:
             if node.label is not None and not isinstance(node, ir.Layer):
                 with self.frame(node.label):
@@ -954,112 +986,137 @@ class _Lowering:
             return typed, out
         finally:
             if span is not None:
-                self.where.pop()
+                self.spans.pop()
 
     def _lower(self, node: ir.Node, width: ir.Width) -> tuple[ir.Node, ir.Width | None]:
         match node:
             case ir.Layer():
                 return self.layer(node, width)
             case ir.Seq(items=items):
-                typed = []
-                for item in items:
-                    t, out = self.lower(item, width)
-                    # A layer that needed a merge came back as an unlabeled (merge, layer).
-                    if isinstance(t, ir.Seq) and t.label is None and t.share is None:
-                        typed.extend(t.items)
-                    else:
-                        typed.append(t)
-                    width = typing.cast(ir.Width, out)
-                return ir.replace_children(node, tuple(typed)), width
+                return self.seq(node, items, width)
             case ir.Residual(body=body):
-                if isinstance(body, ir.Layer) and isinstance(
-                    body.config, cfg.EngramConfig
-                ):
-                    raise self.error(
-                        "engram adds to the stream itself, so [engram] would add the "
-                        "stream twice",
-                        "write it bare: ... engram ...",
-                    )
-                inner = width
-                if self.widened and self.depth == 0:
-                    if width != "streams":
-                        raise self.error(
-                            "a residual branch needs the widened residual stream, but "
-                            "it was read back into one before this",
-                            "only branches, taps, engram and nextn keep it; save it "
-                            "with @h and go on from $h",
-                        )
-                    inner = self.d_model
-                elif not isinstance(width, int):
-                    raise self.error(
-                        f"a residual branch needs hidden states, but receives {width}"
-                    )
-                self.depth += 1
-                try:
-                    t, out = self.lower(body, inner)
-                finally:
-                    self.depth -= 1
-                if out != inner:
-                    raise self.error(
-                        f"a residual branch must keep the width, but this one maps {inner} to {out}"
-                    )
-                return ir.replace_children(node, (t,)), width
+                return self.residual(node, body, width)
             case ir.Sum(terms=terms) | ir.Prod(factors=terms):
-                typed, outs = [], []
-                for term in terms:
-                    t, out = self.lower(term, width)
-                    typed.append(t)
-                    if out is not None and out not in outs:
-                        outs.append(out)
-                if not outs:
-                    raise self.error("parallel branches need at least one layer")
-                if len(outs) > 1:
-                    raise self.error(
-                        f"parallel branches disagree on width: {', '.join(map(str, outs))}"
-                    )
-                return ir.replace_children(node, tuple(typed)), outs[0]
+                return self.branches(node, terms, width)
             case ir.Neg(body=body):
-                t, out = self.lower(body, width)
-                return ir.replace_children(node, (t,)), out
+                typed, out = self.lower(body, width)
+                return ir.replace_children(node, (typed,)), out
             case ir.Const():
                 return node, None
             case ir.Identity():
                 return node, width
             case ir.Repeat(body=body, times=times):
-                span = self.ev.spans.get(id(body))
-                text = self.ev.text(span) if span is not None else "the block"
-                label = f"one pass of {f'({text})' if ' ' in text else text}^{times}"
-                with self.frame(label):
-                    t, out = self.lower(body, width)
-                if out != width:
-                    raise self.error(
-                        f"a repeated block must keep the width, but this one maps {width} to {out}"
-                    )
-                for _ in range(times - 1):
-                    with self.frame(label):
-                        self.lower(body, width)
-                return ir.replace_children(node, (t,)), width
+                return self.repeat(node, body, times, width)
             case ir.Tap(name=name):
                 self.write(name, width)
                 return node, width
             case ir.Ref(name=name, pop=pop):
-                value = self.read(name, pop)
-                if isinstance(value, _PortValue):
-                    raise self.error(
-                        f"tap '{name}' holds the '{value.port}' port of a layer",
-                        f"read it through the same port: layer({value.port}=${name})",
-                    )
-                if value == "streams" and self.depth > 0:
-                    raise self.error(
-                        f"tap '{name}' holds the widened residual stream, which only "
-                        "exists outside residual branches",
-                        f"read it back into one first: merge @{name}",
-                    )
-                return node, value
+                return node, self.read_hidden(name, pop)
         raise AssertionError(node)
+
+    def seq(
+        self, node: ir.Node, items: tuple[ir.Node, ...], width: ir.Width
+    ) -> tuple[ir.Node, ir.Width]:
+        typed = []
+        for item in items:
+            typed_item, out = self.lower(item, width)
+            # A layer that needed a merge came back as an unlabeled (merge, layer).
+            if (
+                isinstance(typed_item, ir.Seq)
+                and typed_item.label is None
+                and typed_item.share is None
+            ):
+                typed.extend(typed_item.items)
+            else:
+                typed.append(typed_item)
+            width = typing.cast(ir.Width, out)
+        return ir.replace_children(node, tuple(typed)), width
+
+    def residual(
+        self, node: ir.Node, body: ir.Node, width: ir.Width
+    ) -> tuple[ir.Node, ir.Width]:
+        if isinstance(body, ir.Layer) and isinstance(body.config, cfg.EngramConfig):
+            raise self.error(
+                "engram adds to the stream itself, so [engram] would add the "
+                "stream twice",
+                "write it bare: ... engram ...",
+            )
+        inner = width
+        if self.widened and self.depth == 0:
+            if width != "streams":
+                raise self.error(
+                    "a residual branch needs the widened residual stream, but "
+                    "it was read back into one before this",
+                    "only branches, taps, engram and nextn keep it; save it "
+                    "with @h and go on from $h",
+                )
+            inner = self.d_model
+        elif not isinstance(width, int):
+            raise self.error(
+                f"a residual branch needs hidden states, but receives {width}"
+            )
+        self.depth += 1
+        try:
+            typed, out = self.lower(body, inner)
+        finally:
+            self.depth -= 1
+        if out != inner:
+            raise self.error(
+                f"a residual branch must keep the width, but this one maps {inner} to {out}"
+            )
+        return ir.replace_children(node, (typed,)), width
+
+    def branches(
+        self, node: ir.Node, terms: tuple[ir.Node, ...], width: ir.Width
+    ) -> tuple[ir.Node, ir.Width]:
+        typed, outs = [], []
+        for term in terms:
+            typed_term, out = self.lower(term, width)
+            typed.append(typed_term)
+            if out is not None and out not in outs:
+                outs.append(out)
+        if not outs:
+            raise self.error("parallel branches need at least one layer")
+        if len(outs) > 1:
+            raise self.error(
+                f"parallel branches disagree on width: {', '.join(map(str, outs))}"
+            )
+        return ir.replace_children(node, tuple(typed)), outs[0]
+
+    def repeat(
+        self, node: ir.Node, body: ir.Node, times: int, width: ir.Width
+    ) -> tuple[ir.Node, ir.Width]:
+        span = self.ev.node_spans.get(id(body))
+        text = self.ev.text(span) if span is not None else "the block"
+        label = f"one pass of {f'({text})' if ' ' in text else text}^{times}"
+        with self.frame(label):
+            typed, out = self.lower(body, width)
+        if out != width:
+            raise self.error(
+                f"a repeated block must keep the width, but this one maps {width} to {out}"
+            )
+        for _ in range(times - 1):
+            with self.frame(label):
+                self.lower(body, width)
+        return ir.replace_children(node, (typed,)), width
 
     def write(self, tap: str, value: ir.Width | _PortValue) -> None:
         self.stacks.setdefault(tap, []).append(_Entry(value, tuple(self.frames)))
+
+    def read_hidden(self, tap: str, pop: bool) -> ir.Width:
+        value = self.read(tap, pop)
+        if isinstance(value, _PortValue):
+            raise self.error(
+                f"tap '{tap}' holds the '{value.port}' port of a layer",
+                f"read it through the same port: layer({value.port}=${tap})",
+            )
+        if value == "streams" and self.depth > 0:
+            raise self.error(
+                f"tap '{tap}' holds the widened residual stream, which only "
+                "exists outside residual branches",
+                f"read it back into one first: merge @{tap}",
+            )
+        return value
 
     def read(self, tap: str, pop: bool) -> ir.Width | _PortValue:
         stack = self.stacks.get(tap)
@@ -1073,7 +1130,7 @@ class _Lowering:
                 f"tap '{tap}' is empty: everything written to it was already popped"
             )
         entry = stack[-1]
-        if entry.owner is not None and any(e.owner is None for e in stack[:-1]):
+        if entry.owner is not None and any(other.owner is None for other in stack[:-1]):
             # A block wrote the tap for its own use and left the value behind, where
             # it now hides what the reader most likely wants.
             raise self.error(
@@ -1083,22 +1140,24 @@ class _Lowering:
                 "or give one of the two taps another name",
             )
         if entry.owner is None:
-            common = None
-            for written, current in zip(entry.frames, self.frames):
-                if written is not current:
-                    break
-                common = written
-            if common is not None:
-                entry.used_in = common
-                common.used.append(entry)
+            self.mark_used(entry)
         if pop:
             stack.pop()
             entry.popped = True
         return entry.value
 
+    def mark_used(self, entry: _Entry) -> None:
+        common = None
+        for written, current in zip(entry.frames, self.frames):
+            if written is not current:
+                break
+            common = written
+        if common is not None:
+            entry.used_in = common
+            common.used.append(entry)
+
     def layer(self, node: ir.Layer, width: ir.Width) -> tuple[ir.Node, ir.Width]:
         config = node.config
-        out: ir.Width
         if width == "logits":
             raise self.error(
                 "nothing can follow the LM head",
@@ -1112,6 +1171,11 @@ class _Lowering:
             merge = ir.Layer(config=cfg.MergeConfig(), width="streams")
             typed, out = self.layer(node, self.d_model)
             return ir.Seq(items=(merge, typed)), out
+        out = self.layer_output(config, width)
+        self.connect(node.ports)
+        return node.model_copy(update={"width": width}), out
+
+    def layer_output(self, config: cfg.LayerConfig, width: ir.Width) -> ir.Width:
         if isinstance(config, cfg.MergeConfig):
             if width != "streams":
                 raise self.error(
@@ -1121,31 +1185,32 @@ class _Lowering:
                     if not self.widened
                     else None,
                 )
-            out = self.d_model
-        elif config.type == "embed":
+            return self.d_model
+        if config.type == "embed":
             if width != "tokens":
                 raise self.error("an embedding takes token ids, so it must come first")
             self.embeddings += 1
-            out = "streams" if self.widened and self.depth == 0 else self.d_model
-        elif width == "tokens":
+            return "streams" if self.widened and self.depth == 0 else self.d_model
+        if width == "tokens":
             raise self.error(
                 f"{config.type} needs hidden states, but receives token ids",
                 "start with an embedding",
             )
-        elif isinstance(config, cfg.LMHeadConfig):
+        if isinstance(config, cfg.LMHeadConfig):
             self.heads += 1
-            if config.tied and self.where:
-                self.borrowers.append(("a tied head", self.where[-1]))
-            out = "logits"
-        elif isinstance(config, cfg.LinearConfig):
-            out = config.features
-        elif isinstance(config, cfg.NextNConfig):
-            if self.where:
-                self.borrowers.append(("nextn", self.where[-1]))
-            out = "streams" if self.widened and self.depth == 0 else width
-        else:
-            out = width
-        for port in sorted(node.ports, key=lambda p: p.mode == "write"):
+            if config.tied and self.spans:
+                self.borrowers.append(("a tied head", self.spans[-1]))
+            return "logits"
+        if isinstance(config, cfg.LinearConfig):
+            return config.features
+        if isinstance(config, cfg.NextNConfig):
+            if self.spans:
+                self.borrowers.append(("nextn", self.spans[-1]))
+            return "streams" if self.widened and self.depth == 0 else width
+        return width
+
+    def connect(self, ports: tuple[ir.Port, ...]) -> None:
+        for port in sorted(ports, key=lambda p: p.mode == "write"):
             if port.mode == "write":
                 self.write(port.tap, _PortValue(port.name))
                 continue
@@ -1159,7 +1224,6 @@ class _Lowering:
                 raise self.error(
                     f"port '{port.name}' reads tap '{port.tap}', which holds {held}"
                 )
-        return node.model_copy(update={"width": width}), out
 
 
 def _compile(ev: _Evaluator, entry: str) -> ir.Architecture:
@@ -1170,6 +1234,27 @@ def _compile(ev: _Evaluator, entry: str) -> ir.Architecture:
             f"no definition named '{entry}'",
             hint=f"define it: {entry} = embed ... head",
         )
+    settings = _model_settings(ev)
+    d_model = typing.cast(int | None, settings["d_model"])
+    vocab_size = typing.cast(int | None, settings["vocab_size"])
+    residual = typing.cast(cfg.ResidualConfig | None, settings["residual"])
+    if d_model is None:
+        if ev.incomplete:
+            raise _Reported()
+        raise BuxError("'d_model' is not defined", hint="d_model = 4096")
+    lowering = _Lowering(ev, d_model, residual)
+    model = ev.graph(ev.definition(entry), ev.statements[entry].name_span)
+    graph = lowering.lower_model(model)
+    if vocab_size is None and (lowering.embeddings or lowering.heads):
+        if ev.incomplete:
+            raise _Reported()
+        raise BuxError("'vocab_size' is not defined", hint="vocab_size = 32000")
+    return ir.Architecture(
+        d_model=d_model, vocab_size=vocab_size, residual=residual, graph=graph
+    )
+
+
+def _model_settings(ev: _Evaluator) -> dict[str, object]:
     settings = {}
     for name in SETTINGS:
         value, span = ev.setting(name)
@@ -1184,31 +1269,11 @@ def _compile(ev: _Evaluator, entry: str) -> ir.Architecture:
             )
             raise BuxError(f"'{name}' must be {kind}, found {_describe(value)}", span)
         settings[name] = value
-    if settings["d_model"] is None:
-        if ev.incomplete:
-            raise _Reported()
-        raise BuxError("'d_model' is not defined", hint="d_model = 4096")
-    st = ev.statements[entry]
-    lowering = _Lowering(
-        ev,
-        typing.cast(int, settings["d_model"]),
-        typing.cast(cfg.ResidualConfig | None, settings["residual"]),
-    )
-    graph = lowering.run(ev.graph(ev.definition(entry), st.name_span))
-    if settings["vocab_size"] is None and (lowering.embeddings or lowering.heads):
-        if ev.incomplete:
-            raise _Reported()
-        raise BuxError("'vocab_size' is not defined", hint="vocab_size = 32000")
-    return ir.Architecture(
-        d_model=typing.cast(int, settings["d_model"]),
-        vocab_size=typing.cast(int | None, settings["vocab_size"]),
-        residual=typing.cast(cfg.ResidualConfig | None, settings["residual"]),
-        graph=graph,
-    )
+    return settings
 
 
 def _expects(annotation: object) -> str:
-    """What a setting of this type is written as: adamw(...) or muon(...), an integer."""
+    """Say how a setting of this type is written: adamw(...) or muon(...), an integer."""
     kinds = []
     for member in typing.get_args(annotation) or (annotation,):
         if member is type(None):
@@ -1236,47 +1301,64 @@ _ADAPTERS = {
 def _train(
     ev: _Evaluator, arch: ir.Architecture | None, *, require: bool
 ) -> tcfg.TrainConfig | None:
-    """The training settings, or None if there are none. Without `require`, a module
-    that sets only some of them is fine; its settings are checked all the same."""
+    """Validate the training settings and return them, or None if there are none.
+
+    Without `require`, a module may set only some of them, and those are still checked.
+    """
     values: dict[str, object] = {}
     spans: dict[str, Span] = {}
     for name in TRAIN_SETTINGS:
         value, span = ev.setting(name)
         if span is None:
             continue
-        annotation = tcfg.TrainConfig.model_fields[name].annotation
-        kinds = typing.get_args(annotation) or (annotation,)
-        if isinstance(value, bool) and (int in kinds or float in kinds):
-            raise BuxError(
-                f"'{name}' must be {_expects(annotation)}, found a boolean", span
-            )
-        try:
-            values[name] = _ADAPTERS[name].validate_python(value)
-        except ValidationError as err:
-            errors = err.errors()
-            if errors and errors[0]["type"].startswith(("greater", "less")):
-                message = errors[0]["msg"].replace("Input should be", "must be")
-                raise BuxError(f"'{name}' {message}, found {value}", span) from None
-            found = value if _is_number(value) else _describe(value)
-            raise BuxError(
-                f"'{name}' must be {_expects(annotation)}, found {found}", span
-            ) from None
+        values[name] = _train_setting(name, value, span)
         spans[name] = span
     if not values:
         return None
     if missing := [n for n in _REQUIRED if n not in values]:
         if not require or ev.incomplete:
             return None
-        listed = (
-            ", ".join(missing[:-1]) + " and " + missing[-1]
-            if len(missing) > 1
-            else missing[0]
-        )
-        raise BuxError(
-            f"this file sets how to train, so it is a run, and a run needs {listed}",
-            hint=_EXAMPLES[missing[0]],
-        )
+        raise _missing_settings(missing)
     train = tcfg.TrainConfig.model_validate(values)
+    _check_schedule(train, spans)
+    _check_tokenizer(train, spans)
+    _check_positions(train, arch, spans)
+    return train
+
+
+def _train_setting(name: str, value: object, span: Span) -> object:
+    annotation = tcfg.TrainConfig.model_fields[name].annotation
+    kinds = typing.get_args(annotation) or (annotation,)
+    if isinstance(value, bool) and (int in kinds or float in kinds):
+        raise BuxError(
+            f"'{name}' must be {_expects(annotation)}, found a boolean", span
+        )
+    try:
+        return _ADAPTERS[name].validate_python(value)
+    except ValidationError as err:
+        errors = err.errors()
+        if errors and errors[0]["type"].startswith(("greater", "less")):
+            message = errors[0]["msg"].replace("Input should be", "must be")
+            raise BuxError(f"'{name}' {message}, found {value}", span) from None
+        found = value if _is_number(value) else _describe(value)
+        raise BuxError(
+            f"'{name}' must be {_expects(annotation)}, found {found}", span
+        ) from None
+
+
+def _missing_settings(missing: list[str]) -> BuxError:
+    listed = (
+        ", ".join(missing[:-1]) + " and " + missing[-1]
+        if len(missing) > 1
+        else missing[0]
+    )
+    return BuxError(
+        f"this file sets how to train, so it is a run, and a run needs {listed}",
+        hint=_EXAMPLES[missing[0]],
+    )
+
+
+def _check_schedule(train: tcfg.TrainConfig, spans: dict[str, Span]) -> None:
     schedule = train.schedule
     cooldown = (
         schedule.cooldown(train.steps) if isinstance(schedule, tcfg.WSDSchedule) else 0
@@ -1290,6 +1372,9 @@ def _train(
             f"run has {train.steps}",
             spans.get("schedule", spans["steps"]),
         )
+
+
+def _check_tokenizer(train: tcfg.TrainConfig, spans: dict[str, Span]) -> None:
     reads = {"data": train.data} | ({"eval": train.eval.data} if train.eval else {})
     for name, data in reads.items():
         kinds = sorted({s.type for s in tcfg.leaves(data)} & {"text", "chat"})
@@ -1299,6 +1384,11 @@ def _train(
                 spans[name],
                 'tokenizer = tokenizer(name="gpt2")',
             )
+
+
+def _check_positions(
+    train: tcfg.TrainConfig, arch: ir.Architecture | None, spans: dict[str, Span]
+) -> None:
     for layer in arch.layers() if arch is not None else ():
         if isinstance(layer.config, cfg.EmbeddingConfig):
             positions = layer.config.max_positions
@@ -1309,7 +1399,6 @@ def _train(
                     spans["seq_len"],
                     f"seq_len = {positions}, or embed(max_positions={train.seq_len})",
                 )
-    return train
 
 
 Modules = Mapping[str, str] | modules.Loader | None
@@ -1329,8 +1418,9 @@ def _load(
     )
 
 
-def _stem(filename: str) -> str:
-    return "run" if filename.startswith("<") else Path(filename).stem
+def _run_name(filename: str, parts: tuple[str, ...]) -> str:
+    stem = "run" if filename.startswith("<") else Path(filename).stem
+    return stem + (f"[{', '.join(parts)}]" if parts else "")
 
 
 def compile(
@@ -1367,8 +1457,8 @@ def compile_runs(
     overrides: Sequence[str] = (),
     modules: Modules = None,
 ) -> list[ir.Run]:
-    """Every run of a file: one for each combination of the alternatives it reaches,
-    the first written varying slowest. Settings as for `compile`."""
+    """Compile every run of a file: one per combination of the alternatives it reaches,
+    with the first one written varying slowest. The arguments are as for `compile`."""
     program = _load(source, filename, overrides, modules, recover=False)
     runs: list[ir.Run] = []
 
@@ -1393,7 +1483,7 @@ def compile_runs(
                 hint="a run sets data, optimizer, seq_len, batch and steps",
             )
         parts = tuple(axis.part(choices[axis.key]) for axis in reached)
-        name = _stem(filename) + (f"[{', '.join(parts)}]" if parts else "")
+        name = _run_name(filename, parts)
         runs.append(ir.Run(name=name, arch=arch, train=train, choices=parts))
 
     try:
@@ -1405,7 +1495,7 @@ def compile_runs(
 
 @dataclass
 class Report:
-    """What `check` found in a source file."""
+    """The result of `check` on a source file."""
 
     # The file's own statements: the ones that the modules it uses define are not here.
     statements: list[ast.Statement]
@@ -1449,14 +1539,52 @@ def check(
             return
         err = program.locate(err)
         if all(
-            (e.message, e.span, e.filename) != (err.message, err.span, err.filename)
-            for e in errors
+            (known.message, known.span, known.filename)
+            != (err.message, err.span, err.filename)
+            for known in errors
         ):
             errors.append(err)
 
     program = _load(source, filename, overrides, modules, recover=True)
     for err in program.errors:
         report(err)
+    ev, arch, train = _check_alternatives(program, entry, report)
+    values = {
+        name: public
+        for name, value in ev.values.items()
+        if (public := _public(value)) is not None
+    }
+    clean = not errors
+    axes: list[Axis] = []
+    run = None
+    if clean and arch is not None:
+        axes = _reached_axes(program, entry)
+        if train is not None:
+            parts = tuple(axis.part(axis.pick(0)) for axis in axes)
+            name = _run_name(filename, parts)
+            run = ir.Run(name=name, arch=arch, train=train, choices=parts)
+    inherited = {
+        name: st for name, st in ev.statements.items() if st.span.start > len(source)
+    }
+    return Report(
+        statements=program.main,
+        errors=errors,
+        arch=arch if clean else None,
+        values=values,
+        run=run,
+        axes=axes,
+        via={u.filename: u.via for u in program.units[1:] if u.via is not None},
+        source=program.source,
+        inherited=inherited,
+        origin={
+            name: program.unit(st.span.start).filename for name, st in inherited.items()
+        },
+    )
+
+
+def _check_alternatives(
+    program: modules.Program, entry: str, report: Callable[[BuxError], None]
+) -> tuple[_Evaluator, ir.Architecture | None, tcfg.TrainConfig | None]:
     first: tuple[_Evaluator, ir.Architecture | None, tcfg.TrainConfig | None] | None
     first = None
     todo: list[dict[Span | frozenset[str], int | str]] = [{}]
@@ -1464,22 +1592,7 @@ def check(
     while todo:
         choices = todo.pop(0)
         ev = _Evaluator(program, report=report, choices=choices)
-        for name, st in ev.statements.items():
-            if st.params is None:
-                try:
-                    ev.definition(name)
-                except BuxError as err:
-                    report(err)
-        arch = train = None
-        if entry in ev.statements or "d_model" in ev.statements:
-            try:
-                arch = _compile(ev, entry)
-            except BuxError as err:
-                report(err)
-        try:
-            train = _train(ev, arch, require=arch is not None)
-        except BuxError as err:
-            report(err)
+        arch, train = _check_once(ev, entry, report)
         first = first or (ev, arch, train)
         for key, axis in ev.axes.items():
             for option in range(1, len(axis.options)):
@@ -1487,52 +1600,45 @@ def check(
                     seen.add((key, axis.pick(option)))
                     todo.append({**choices, key: axis.pick(option)})
     assert first is not None
-    ev, arch, train = first
-    values = {
-        name: public
-        for name, v in ev.values.items()
-        if (public := _public(v)) is not None
-    }
-    clean = not errors
-    axes: list[Axis] = []
-    run = None
-    if clean and arch is not None:
-        # The sweep's axes are those the run reaches, which evaluating every definition,
-        # as above, does not tell apart from the others.
-        reach = _Evaluator(program)
-        _train(reach, _compile(reach, entry), require=True)
-        axes = sorted(reach.axes.values(), key=lambda axis: axis.span.start)
-        if train is not None:
-            parts = tuple(axis.part(axis.pick(0)) for axis in axes)
-            name = _stem(filename) + (f"[{', '.join(parts)}]" if parts else "")
-            run = ir.Run(name=name, arch=arch, train=train, choices=parts)
-    via = {u.filename: u.via for u in program.units[1:] if u.via is not None}
-    inherited = {
-        name: st for name, st in ev.statements.items() if st.span.start > len(source)
-    }
-    origin = {
-        name: program.unit(st.span.start).filename for name, st in inherited.items()
-    }
-    return Report(
-        program.main,
-        errors,
-        arch if clean else None,
-        values,
-        run,
-        axes,
-        via,
-        program.source,
-        inherited,
-        origin,
-    )
+    return first
 
 
-def _public(v: object) -> object | None:
-    """A definition's value as Report.values shows it: no private evaluation types."""
-    v = _unwrap(v)
-    match v:
+def _check_once(
+    ev: _Evaluator, entry: str, report: Callable[[BuxError], None]
+) -> tuple[ir.Architecture | None, tcfg.TrainConfig | None]:
+    for name, st in ev.statements.items():
+        if st.params is None:
+            try:
+                ev.definition(name)
+            except BuxError as err:
+                report(err)
+    arch = train = None
+    if entry in ev.statements or "d_model" in ev.statements:
+        try:
+            arch = _compile(ev, entry)
+        except BuxError as err:
+            report(err)
+    try:
+        train = _train(ev, arch, require=arch is not None)
+    except BuxError as err:
+        report(err)
+    return arch, train
+
+
+def _reached_axes(program: modules.Program, entry: str) -> list[Axis]:
+    # The sweep's axes are those the run reaches, which evaluating every definition,
+    # as check does, does not tell apart from the others.
+    ev = _Evaluator(program)
+    _train(ev, _compile(ev, entry), require=True)
+    return sorted(ev.axes.values(), key=lambda axis: axis.span.start)
+
+
+def _public(value: object) -> object | None:
+    """Convert a definition's value for Report.values, which shows no private types."""
+    value = _unwrap(value)
+    match value:
         case _Builtin(name=name) if name in ACTIVATIONS:
-            return cfg.ActivationConfig(fn=typing.cast(cfg.Activation, name))
+            return _activation(name)
         case _Builtin(name=name):
             try:
                 return TYPES[name].model_validate({"type": name})
@@ -1540,7 +1646,7 @@ def _public(v: object) -> object | None:
                 return None
         case _Bare(name=name):
             return name
-    return v
+    return value
 
 
 def compile_file(path: str, *, entry: str = "model") -> ir.Architecture:

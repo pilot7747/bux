@@ -1,4 +1,4 @@
-"""Prints an Architecture, or a whole Run, back to .bux source.
+"""Print an Architecture, or a whole Run, back to .bux source.
 
 Every labeled node becomes a definition, so the output reads like hand-written source:
 leaf definitions, then blocks in dependency order, then the model. Macro calls are
@@ -23,14 +23,20 @@ SUM, PROD, SEQ, UNARY, POWER, ATOM = range(6)
 
 @cache
 def field_order(cls: type[BaseModel]) -> tuple[str, ...]:
-    """Fields of the class itself first, then those it inherits: gqa(num_heads=...) before window sizes."""
+    """Return the fields of the class itself first, then those it inherits:
+    gqa(num_heads=...) before window sizes."""
     order: list[str] = []
-    for k in cls.__mro__:
-        if not (isinstance(k, type) and issubclass(k, BaseModel)) or k is BaseModel:
+    for klass in cls.__mro__:
+        is_model = isinstance(klass, type) and issubclass(klass, BaseModel)
+        if not is_model or klass is BaseModel:
             continue
-        parent = next((b for b in k.__bases__ if issubclass(b, BaseModel)), BaseModel)
+        parent = next(
+            (b for b in klass.__bases__ if issubclass(b, BaseModel)), BaseModel
+        )
         order += [
-            f for f in k.model_fields if f not in parent.model_fields and f not in order
+            name
+            for name in klass.model_fields
+            if name not in parent.model_fields and name not in order
         ]
     return tuple(order)
 
@@ -73,7 +79,7 @@ class _Printer:
         self.leaves: list[str] = []
         self.blocks: list[str] = []
 
-    def run(self) -> str:
+    def architecture(self) -> str:
         settings = [f"d_model = {self.arch.d_model}"]
         if self.arch.vocab_size is not None:
             settings.append(f"vocab_size = {self.arch.vocab_size}")
@@ -146,7 +152,8 @@ class _Printer:
         raise AssertionError(node)
 
     def spliced(self, items: tuple[ir.Node, ...]) -> list[ir.Node]:
-        """Unnamed sequences inside a sequence, such as macro calls, print inline."""
+        """Flatten the unnamed sequences inside a sequence, such as macro calls, so that
+        they print inline."""
         out: list[ir.Node] = []
         for item in items:
             if isinstance(item, ir.Seq) and self.name(item) is None:
@@ -224,16 +231,17 @@ class _Printer:
 
 
 def to_source(arch: ir.Architecture) -> str:
-    return _Printer(arch).run()
+    return _Printer(arch).architecture()
 
 
 def run_to_source(run: ir.Run) -> str:
-    """A run as one file of its own: no modules, no alternatives, nothing left to resolve.
+    """Print a run as one file of its own: no modules, no alternatives, nothing left
+    to resolve.
 
     Training settings at their defaults are left out, as config settings are.
     """
     printer = _Printer(run.arch)
-    arch = printer.run()
+    arch = printer.architecture()
     fields = tcfg.TrainConfig.model_fields
     settings = [
         f"{name} = {printer.value(getattr(run.train, name))}"
@@ -250,10 +258,10 @@ _PLAIN = ir.Architecture(d_model=1, graph=ir.Identity())
 
 
 def config_to_source(config: cfg.Config) -> str:
-    """One config as source, defaults left out: gqa(num_heads=8, num_kv_heads=8)."""
+    """Print one config as source, without defaults: gqa(num_heads=8, num_kv_heads=8)."""
     return _Printer(_PLAIN).config(config)
 
 
 def value_to_source(value: object) -> str:
-    """A setting value as source: 1e-05, swish, none, rope(), [1, 2]."""
+    """Print a setting value as source: 1e-05, swish, none, rope(), [1, 2]."""
     return _Printer(_PLAIN).value(value)

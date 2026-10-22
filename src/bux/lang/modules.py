@@ -41,8 +41,8 @@ def _search_path(start: Path) -> list[Path]:
 
 
 def _roots(importer: str) -> list[tuple[Path, bool]]:
-    """Where to look, and whether subfolders too: the folder of the file that uses the
-    module on its own, then the search path."""
+    """Return the folders to search, each with whether to search its subfolders: the
+    folder of the file that uses the module on its own, then the search path."""
     # An editor's file may not be saved yet; "<string>" and the like have no folder.
     here = (Path.cwd() if importer.startswith("<") else Path(importer).parent).resolve()
     env = [Path(p) for p in os.environ.get("BUX_PATH", "").split(os.pathsep) if p]
@@ -54,7 +54,7 @@ def _roots(importer: str) -> list[tuple[Path, bool]]:
 
 
 def _modules(root: Path, recursive: bool) -> dict[str, list[Path]]:
-    """The .bux files under `root` by name, skipping hidden folders."""
+    """Return the .bux files under `root` by name, skipping hidden folders."""
     found: dict[str, list[Path]] = {}
     for folder, dirs, files in os.walk(root):
         dirs[:] = sorted(d for d in dirs if not d.startswith(".") and d not in _SKIP)
@@ -76,7 +76,7 @@ def _check_name(name: str) -> None:
 
 
 def find(name: str, importer: str) -> tuple[str, str]:
-    """The source and filename of the module `name`; the default Loader."""
+    """Return the source and filename of the module `name`: the default Loader."""
     known: list[str] = []
     for root, recursive in _roots(importer):
         modules = _modules(root, recursive)
@@ -105,7 +105,7 @@ def find(name: str, importer: str) -> tuple[str, str]:
 
 
 def from_mapping(modules: Mapping[str, str]) -> Loader:
-    """A Loader over sources held in memory, by module name."""
+    """Return a Loader over sources held in memory, by module name."""
 
     def find_in(name: str, importer: str) -> tuple[str, str]:
         if name not in modules:
@@ -149,7 +149,7 @@ class Program:
         return next(u for u in reversed(self.units) if u.start <= offset)
 
     def locate(self, err: BuxError) -> BuxError:
-        """`err`, with its span made local to the file it is in, and that file attached."""
+        """Make the span of `err` local to the file it is in, and attach that file."""
         if err.source is not None:
             return err
         unit = self.units[0]
@@ -160,7 +160,8 @@ class Program:
 
 
 def _layers(statements: list[ast.Statement]) -> list[list[ast.Statement]]:
-    """A file's definitions, then its amendments on top, one per name."""
+    """Split a file's statements into layers: its definitions, then its amendments on
+    top, one per name."""
     plain = [st for st in statements if not st.amends]
     amends: dict[str, ast.Statement] = {}
     for st in statements:
@@ -190,73 +191,89 @@ def load(
     Without `recover` the first error raises, located. With it, errors are collected
     in ``Program.errors`` and what parses is kept, as ``check`` needs.
     """
-    loader = loader or find
-    program = Program(source, [Unit(filename, source, 0)], [], [], [])
+    linker = _Linker(source, filename, loader or find, recover)
+    program = linker.program
+    main = linker.parse(0, len(source))
+    chain = (_file_key(filename),)
+    program.main, program.uses = main.statements, main.uses
+    program.layers = linker.use(main.uses, filename, chain, None)
+    program.layers += _layers(main.statements)
+    if overrides:
+        # Modules used on the command line go between the file and the settings there.
+        extra = linker.add("\n".join(overrides), COMMAND_LINE, None)
+        program.layers += linker.use(extra.uses, filename, chain, None)
+        program.layers += _layers(extra.statements)
+    return program
 
-    def key(name: str) -> str:
-        """Which file a name is, however it is written."""
-        return name if name.startswith("<") else str(Path(name).resolve())
 
-    me = key(filename)
+def _file_key(name: str) -> str:
+    """Return the same key for a file however its name is written."""
+    return name if name.startswith("<") else str(Path(name).resolve())
 
-    def fail(err: BuxError) -> None:
-        if not recover:
-            raise program.locate(err)
-        program.errors.append(err)
 
-    def parse(start: int, stop: int) -> ast.Parsed:
+class _Linker:
+    def __init__(self, source: str, filename: str, loader: Loader, recover: bool):
+        self.program = Program(source, [Unit(filename, source, 0)], [], [], [])
+        self.loader = loader
+        self.recover = recover
+        self.placed: set[str] = set()
+
+    def fail(self, err: BuxError) -> None:
+        if not self.recover:
+            raise self.program.locate(err)
+        self.program.errors.append(err)
+
+    def parse(self, start: int, stop: int) -> ast.Parsed:
+        program = self.program
         try:
-            parsed = ast.parse_file(program.source, start, stop, recover=recover)
+            parsed = ast.parse_file(program.source, start, stop, recover=self.recover)
         except BuxError as err:
-            fail(err)
+            self.fail(err)
             return ast.Parsed([], [])
         for err in parsed.errors:
-            fail(err)
+            self.fail(err)
         program.broken |= parsed.broken
         # A module's broken statements could define anything.
         program.incomplete |= bool(parsed.errors) and start > 0
         return parsed
 
-    def add(text: str, name: str, via: Span | None) -> ast.Parsed:
-        start = len(program.source) + 1
-        program.source += "\n" + text
-        program.units.append(Unit(name, text, start, via))
-        return parse(start, len(program.source))
-
-    placed: set[str] = set()
+    def add(self, text: str, name: str, via: Span | None) -> ast.Parsed:
+        start = len(self.program.source) + 1
+        self.program.source += "\n" + text
+        self.program.units.append(Unit(name, text, start, via))
+        return self.parse(start, len(self.program.source))
 
     def use(
-        uses: list[ast.Use], importer: str, chain: tuple[str, ...], via: Span | None
+        self,
+        uses: list[ast.Use],
+        importer: str,
+        chain: tuple[str, ...],
+        via: Span | None,
     ) -> list[list[ast.Statement]]:
-        """The layers of the modules `uses` names, with the modules they use below them."""
+        """Return the layers of the modules that `uses` names, with the modules they
+        use below them."""
         layers: list[list[ast.Statement]] = []
-        for u in uses:
+        for statement in uses:
             try:
-                _check_name(u.module)
-                text, name = loader(u.module, importer)
+                _check_name(statement.module)
+                text, name = self.loader(statement.module, importer)
             except BuxError as err:
-                program.incomplete = True
-                fail(BuxError(err.message, u.module_span, err.hint))
+                self.program.incomplete = True
+                self.fail(BuxError(err.message, statement.module_span, err.hint))
                 continue
-            if key(name) in chain:
-                program.incomplete = True
+            key = _file_key(name)
+            if key in chain:
+                self.program.incomplete = True
                 cycle = " -> ".join(Path(n).stem for n in (*chain, name))
-                fail(BuxError(f"modules use each other: {cycle}", u.module_span))
+                error = BuxError(
+                    f"modules use each other: {cycle}", statement.module_span
+                )
+                self.fail(error)
                 continue
-            if key(name) in placed:
+            if key in self.placed:
                 continue
-            placed.add(key(name))
-            parsed = add(text, name, via or u.span)
-            layers += use(parsed.uses, name, (*chain, key(name)), via or u.span)
+            self.placed.add(key)
+            parsed = self.add(text, name, via or statement.span)
+            layers += self.use(parsed.uses, name, (*chain, key), via or statement.span)
             layers += _layers(parsed.statements)
         return layers
-
-    main = parse(0, len(source))
-    program.main, program.uses = main.statements, main.uses
-    program.layers = use(main.uses, filename, (me,), None) + _layers(main.statements)
-    if overrides:
-        # Modules used on the command line go between the file and the settings there.
-        extra = add("\n".join(overrides), COMMAND_LINE, None)
-        program.layers += use(extra.uses, filename, (me,), None)
-        program.layers += _layers(extra.statements)
-    return program
