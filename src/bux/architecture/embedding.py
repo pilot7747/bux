@@ -8,7 +8,7 @@ from jaxtyping import Array, Float, Int
 
 from bux import config as cfg
 from bux import parallel
-from bux.architecture.functional import softcap
+from bux.architecture.logits import HeadOutput, Projection
 from bux.architecture.norm import Norm
 from bux.architecture.registry import Context, Taps, positions, register
 from bux.architecture.residual import widen, widening
@@ -96,8 +96,11 @@ def _(
 
 
 class Head(nnx.Module):
-    """The stream to logits, split over the vocabulary, where the loss reduces them:
-    x W, or, tied, x E^T in float32, with E the first embedding's token table."""
+    """The stream to logits, split over the vocabulary: x W, or, tied, x E^T with E the
+    first embedding's token table, in the stream's dtype with float32 accumulation,
+    then the bias and the softcap. It leaves its input and its projection in the taps
+    (``HeadOutput``), from which the objective makes the logits a chunk at a time, and
+    passes the stream on."""
 
     no_muon = True
 
@@ -113,20 +116,19 @@ class Head(nnx.Module):
         )
         self.softcap = config.softcap
 
-    def __call__(
-        self, x: Float[Array, "b t d"], taps: Taps
-    ) -> Float[Array, "b t vocab"]:
+    def projection(self) -> Projection:
+        """Return the map from the stream to logits, of the weights as they are now."""
         if self.embedding is not None:
-            table = self.embedding.tokens.embedding[...]
-            logits = jnp.dot(x.astype(jnp.float32), table.astype(jnp.float32).T)
+            kernel, bias = self.embedding.tokens.embedding[...].T, self.bias
         else:
             assert self.proj is not None
-            logits = self.proj(x)
-        if self.bias is not None:
-            logits = logits + self.bias
-        logits = parallel.shard(softcap(logits, self.softcap), "batch", "seq", "vocab")
-        taps.logits.append(logits)
-        return logits
+            kernel, bias = self.proj.kernel[...], self.proj.bias
+        cap = None if self.softcap is None else jnp.asarray(self.softcap, jnp.float32)
+        return Projection(kernel, None if bias is None else bias[...], cap)
+
+    def __call__(self, x: Float[Array, "b t d"], taps: Taps) -> Float[Array, "b t d"]:
+        taps.heads.append(HeadOutput(x, self.projection()))
+        return x
 
 
 @register("head")

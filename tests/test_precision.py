@@ -81,6 +81,7 @@ FAMILIES = ARCHITECTURES | {
     "nextn": PRELUDE
     + "mtp = $h! nextn [norm ffn] norm @h head\n"
     + "model = embed [norm attn] [norm ffn] norm @h head mtp^2",
+    "tied": _with("attn").replace("norm head", "norm head(tied=true, softcap=30)"),
 }
 BF16 = "precision(compute=bfloat16)"
 ONE = "mesh(data=1)"
@@ -134,7 +135,10 @@ def test_eval_computes_in_bfloat16_near_float32():
 @pytest.mark.parametrize("family", FAMILIES)
 def test_a_bfloat16_forward_keeps_the_stream_in_bfloat16(family):
     model = cast(_trainer(FAMILIES[family]).model, jnp.bfloat16)
-    assert all(y.dtype == jnp.bfloat16 for y in forward(model, _batch()))
+    heads = forward(model, _batch())
+    assert all(head.hidden.dtype == jnp.bfloat16 for head in heads)
+    assert all(head.projection.kernel.dtype == jnp.bfloat16 for head in heads)
+    assert all(head.logits().dtype == jnp.float32 for head in heads)
 
 
 ISLANDS = (

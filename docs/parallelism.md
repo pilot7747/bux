@@ -348,9 +348,13 @@ Constraints:
   `(batch, seq, none)`, then `shard_stream`. From a table split over `fsdp`, XLA
   rematerializes it in full; into positions split over `tensor`, it gathers the
   table every step. Engram gathers from its table the same way.
-- The logits are `(batch, seq, vocab)`, tied heads too, and the loss reduces over the
-  vocabulary where it is: the log-normalizer and the target's logit are all-reduces
-  of `(b, t)`, for the loss, `z_loss` and `mtp` alike.
+- The loss makes the logits a chunk of each device's positions at a time
+  (`bux/architecture/logits.py`): `(batch, seq, none, vocab)` over the devices'
+  shards, tied heads too, and reduces over the vocabulary where it is: the
+  log-normalizer and the target's logit are all-reduces of a chunk's positions, for
+  the loss, `z_loss` and `mtp` alike. The head's kernel is gathered over `fsdp` once
+  for all the chunks, and each device adds its share of the kernel's gradient up on
+  its own, reduced once after the last chunk.
 - What the embedding, nextn and Engram return is the stream, widened or not, and
   goes through `shard_stream`.
 
@@ -748,13 +752,14 @@ Float32 islands compute from what they are given in float32, and give back its d
 | the MoE's router                                | its logits, scores and top-k, the balance loss and the bias; the weights go back to the stream's dtype |
 | `recurrence`, `delta_rule`, `selective_scan`    | the recurrent state, and its decays               |
 | `rope.rotate`                                   | the rotation                                      |
-| the objective                                   | the logits, as the loss and the z-loss take them  |
+| the head                                        | its logits, from its matmul in `compute` (tied or not) accumulated in float32; the softcap, the softmax and the loss |
 
 Softmax attention takes its softmax in float32, under every method of
-`methods.attention`. Every other matmul runs in `compute`, and the stream stays in it from the embedding to the logits,
-which `tests/test_precision.py` checks for every family. Gradients are reduced over the
-batch axes in the dtype the backward makes them, bfloat16 for a weight's; they add up
-over microbatches in float32.
+`methods.attention`. Every other matmul runs in `compute`, and the stream stays in it
+from the embedding to the heads, which `tests/test_precision.py` checks for every
+family. Gradients are reduced over the batch axes in the dtype the backward makes
+them, bfloat16 for a weight's, but the head's kernel's, which adds up over the chunks
+of the loss in float32; they add up over microbatches in float32.
 
 XLA:CPU fails to compile a bfloat16 `psum` that a `shard_map`'s transpose makes (its
 reducer ends in a copy, which `ChangeOpDataType` cannot clone), and aborts the process.

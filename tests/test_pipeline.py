@@ -100,9 +100,9 @@ def _forward(model: Model, mesh: str, methods: str, training: bool = False) -> N
     which moves the state its layers change, if `training`."""
     tokens = jnp.asarray(TOKENS)
     with _use(mesh, methods):
-        nnx.jit(lambda m: m.training_outputs(tokens)[0] if training else m(tokens))(
-            model
-        )
+        nnx.jit(
+            lambda m: m.training_heads(tokens)[0][0].logits() if training else m(tokens)
+        )(model)
 
 
 # --- Against one device ----------------------------------------------------------------
@@ -191,7 +191,7 @@ def test_the_router_bias_moves_as_the_microbatches_in_a_row_would_move_it():
     micro, mesh = 4, "mesh(stage=2, data=1)"
     alone = _model(BIASED)
     for m in range(micro):
-        alone.training_outputs(jnp.asarray(TOKENS[m::micro]))
+        alone.training_heads(jnp.asarray(TOKENS[m::micro]))
     piped = _model(BIASED, mesh, _how(micro))
     _forward(piped, mesh, _how(micro), training=True)
     assert np.allclose(_bias(piped), _bias(alone), atol=1e-6)

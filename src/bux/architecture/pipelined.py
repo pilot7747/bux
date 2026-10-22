@@ -117,7 +117,7 @@ def _crossing(
         name
         for name, ran in [
             ("nextn", local.nextn_runs > 0),
-            ("the heads' logits", bool(local.logits)),
+            ("the heads' outputs", bool(local.heads)),
             ("the single-pass read", local.pending_read is not None),
         ]
         if ran

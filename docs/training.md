@@ -442,6 +442,18 @@ trainer.fit(
 )
 ```
 
+The model gives the objective its heads' outputs, not their logits: `Model.heads`
+(`training_heads` in a training step) returns each head's input and its projection,
+a `HeadOutput` (`bux/architecture/logits.py`). At a vocabulary of 128K and 8 rows of
+4096 tokens, the float32 logits alone take 16 GB, and their gradient as much again.
+The default terms, `loss`, `z_loss` and `mtp`, take only log Z and the target's logit
+at each position, which `logits.scores(i, offset)` gives for head i a chunk of
+positions at a time: the matmul, the logsumexp and the target's logit of at most 2 GiB
+of logits at once, made again in the backward, the head's gradient added up in
+float32. A term of one's own gets the same `logits`, a sequence that makes a head's
+logits once a term reads them, once for every term that does: `logits[0] ** 2` above
+makes the first head's whole. `Model.outputs` returns every head's logits at once.
+
 A layer adds a term of its own from its forward, in one line:
 `report(taps, "my_loss", weight, value)` (`bux/architecture/registry.py`). The
 objective adds weight × value to the training loss and logs the values, summed over
