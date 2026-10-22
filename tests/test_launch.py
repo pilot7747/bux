@@ -326,3 +326,10 @@ def test_the_plan_says_each_runs_gpus_and_its_bytes_on_each(capsys):
     assert split is not None and whole is not None
     assert split[0] * 8 == whole[0]  # every parameter of the smoke model splits
     assert split[1] == pytest.approx(whole[1] / 8, rel=1e-3)  # and its moments
+
+
+def test_the_plan_sizes_muons_state_on_a_mesh(capsys):
+    muon = ("optimizer = muon(lr=0.02)", "mesh = mesh(fsdp=8)")
+    assert main(["plan", str(SMOKE), *muon]) == 0  # its state holds masked nodes
+    row = capsys.readouterr().out.splitlines()[-1].split()
+    assert row[4] == "8" and "?" not in row[5:7]

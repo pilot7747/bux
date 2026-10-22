@@ -74,7 +74,10 @@ def abstract(
 ) -> "tuple[nnx.Module, nnx.Optimizer] | None":
     """Build the run's model and optimizer from shapes alone; None if the backend
     lacks a layer. Under the run's mesh on `gpus` GPUs if it fits, with repeats
-    scanned and pipelined as the methods say, else outside any mesh."""
+    scanned and pipelined as the methods say, else outside any mesh.
+
+    ``graph_updates=False`` skips flax's sharding of the shapes, which under a mesh
+    fails on the masked nodes in Muon's state; ``memory`` shards them itself."""
     import jax.numpy as jnp
     from flax import nnx
 
@@ -93,9 +96,9 @@ def abstract(
     grid = None if gpus is None else _grid(run, gpus)
     try:
         if grid is None:
-            return nnx.eval_shape(make)
+            return nnx.eval_shape(make, graph_updates=False)
         with parallel.use(grid, t.layout, t.methods):
-            return nnx.eval_shape(make)
+            return nnx.eval_shape(make, graph_updates=False)
     except NotImplementedError:
         return None
 
