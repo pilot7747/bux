@@ -28,19 +28,19 @@ if TYPE_CHECKING:  # imported where used: jax and the backend are slow to import
 
 
 def _si(n: float) -> str:
-    for suffix, scale in (("T", 1e12), ("B", 1e9), ("M", 1e6), ("k", 1e3)):
-        if n >= scale:
-            return f"{n / scale:.3g}{suffix}"
-    return f"{n:g}"
+    for suffix, scale in (("", 1), ("k", 1e3), ("M", 1e6), ("B", 1e9)):
+        if "e" not in (shown := f"{n / scale:.3g}"):
+            return shown + suffix
+    return f"{n / 1e12:.3g}T"
 
 
 def _bytes(n: int | None) -> str:
     if n is None:
         return "?"
-    for suffix, power in (("TiB", 40), ("GiB", 30), ("MiB", 20), ("KiB", 10)):
-        if n >= 2**power:
-            return f"{n / 2**power:.3g}{suffix}"
-    return f"{n}B"
+    for suffix, power in (("B", 0), ("KiB", 10), ("MiB", 20), ("GiB", 30)):
+        if "e" not in (shown := f"{n / 2**power:.3g}"):
+            return shown + suffix
+    return f"{n / 2**40:.3g}TiB"
 
 
 def summary(arch: Architecture) -> str:
