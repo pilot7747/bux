@@ -3,6 +3,7 @@ repeats unrolled and nothing rematerialized, on one device and split over 8."""
 
 import shutil
 import time
+from typing import Any
 
 import jax
 import jax.numpy as jnp
@@ -17,6 +18,8 @@ from bux.architecture import Model, MoE, Norm, Scanned
 from bux.architecture.graph import Sequence
 from bux.architecture.residual import HyperConnections
 from bux.lang import compile, compile_runs
+from bux.parallel import methods
+from bux.parallel.context import xla
 from bux.train.optim import muon_matrices, weight_decay_mask
 from bux.train.trainer import directory, train
 
@@ -52,6 +55,8 @@ SCANNED = {"llama": LLAMA, "pattern": PATTERN, "hc": HC}
 ONE = "mesh(data=1)"
 MESHES = [ONE, "mesh(fsdp=8)", "mesh(fsdp=2, expert=2, tensor=2)"]
 SCAN, UNROLL = "methods(repeat=scan)", "methods(repeat=unroll)"
+# The policies that keep what layers name (bux.architecture.remat).
+NAMED = ["save_attention", "save_qkv_attention", "dots_attention", "offload_attention"]
 TOKENS = np.random.default_rng(0).integers(0, 128, (8, 16))
 TRAIN = "data = synthetic\noptimizer = adamw(lr=1e-2)\nseq_len = 16\nbatch = 8\n"
 
@@ -241,9 +246,8 @@ def test_scanned_fsdp_needs_no_full_rematerialization(losses, involuntary):
 # --- Compile time and remat ------------------------------------------------------------
 
 
-def _compiled(source: str, methods: str) -> tuple[float, jax.stages.Compiled]:
-    """The seconds the gradient of a forward of `source` takes to trace and compile,
-    and what it compiles to."""
+def _gradient(source: str, methods: str) -> tuple[Any, tuple[nnx.State, nnx.State]]:
+    """The gradient of a forward of `source`, jitted, and what it takes."""
     model = _model(source, methods)
     graphdef, params, rest = nnx.split(model, nnx.Param, ...)
 
@@ -251,9 +255,16 @@ def _compiled(source: str, methods: str) -> tuple[float, jax.stages.Compiled]:
         m = nnx.merge(graphdef, params, rest)
         return nnx.grad(lambda m: m(jnp.asarray(TOKENS)).mean())(m)
 
+    return jax.jit(grads), (params, rest)
+
+
+def _compiled(source: str, methods: str) -> tuple[float, jax.stages.Compiled]:
+    """The seconds the gradient of a forward of `source` takes to trace and compile,
+    and what it compiles to."""
+    grads, args = _gradient(source, methods)
     with _use(methods):
         start = time.perf_counter()
-        compiled = jax.jit(grads).lower(params, rest).compile()
+        compiled = grads.lower(*args).compile()
     return time.perf_counter() - start, compiled
 
 
@@ -264,7 +275,10 @@ def test_scanning_24_layers_compiles_faster_than_unrolling_them():
     assert scanned < unrolled / 2
 
 
-@pytest.mark.parametrize("remat", ["full", "dots", "dots_no_batch"])
+REMATS = ["full", "dots", "dots_no_batch", *NAMED]
+
+
+@pytest.mark.parametrize("remat", REMATS)
 def test_remat_trains_the_same(losses, remat):
     plain = losses(HC)
     for repeat in ("unroll", "scan"):
@@ -289,7 +303,7 @@ def test_a_rematerialized_branch_writes_its_taps_and_losses_as_it_would(losses, 
 
 
 @pytest.mark.parametrize("repeat", ["unroll", "scan"])
-@pytest.mark.parametrize("remat", ["full", "dots", "dots_no_batch"])
+@pytest.mark.parametrize("remat", REMATS)
 def test_remat_needs_less_temp_memory(remat, repeat):
     def temp(remat: str) -> int:
         _, c = _compiled(LLAMA, f'methods(repeat={repeat}, remat="{remat}")')
@@ -298,6 +312,39 @@ def test_remat_needs_less_temp_memory(remat, repeat):
         return memory.temp_size_in_bytes
 
     assert temp(remat) < temp("none")  # quoted: a bare none is no name
+
+
+@jax.custom_vjp
+def _cube_root(q: Float[jax.Array, "*s"]) -> Float[jax.Array, "*s"]:
+    """A kernel whose backward takes what only its forward makes, as a flash kernel's
+    takes its log-sum-exp, which no policy by products of matrices keeps."""
+    return jnp.cbrt(q)
+
+
+def _cube_root_forward(
+    q: Float[jax.Array, "*s"],
+) -> tuple[Float[jax.Array, "*s"], Float[jax.Array, "*s"]]:
+    root = jnp.cbrt(q)
+    return root, root
+
+
+_cube_root.defvjp(_cube_root_forward, lambda root, g: (g / (3 * root**2 + 1),))
+
+
+@methods.attention.register("cube_root")
+def _(q, k, v, args):
+    return xla(_cube_root(q), k, v, args)
+
+
+@pytest.mark.parametrize(
+    ("remat", "runs"), [("none", 1), ("dots", 2), *((name, 1) for name in NAMED)]
+)
+def test_a_policy_that_keeps_attention_runs_its_kernel_once(remat, runs):
+    how = f'methods(attention=cube_root, remat="{remat}")'
+    grads, args = _gradient(LLAMA, how)
+    with _use(how):
+        text = grads.lower(*args).as_text()
+    assert text.count("stablehlo.cbrt") == 3 * runs  # 3 layers
 
 
 # --- Checkpoints -----------------------------------------------------------------------

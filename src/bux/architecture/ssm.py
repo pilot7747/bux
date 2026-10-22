@@ -17,6 +17,7 @@ from jaxtyping import Array, Float
 
 from bux import config as cfg
 from bux import parallel
+from bux.architecture import remat
 from bux.architecture.conv import CausalConv
 from bux.architecture.norm import Norm
 from bux.architecture.registry import Context, Taps, register, segments
@@ -43,12 +44,17 @@ def selective_scan(
     has one head per channel (p = 1) and one A per channel and state dim; Mamba-2 has
     one A per head (n = 1 in A). The state starts at zero, and again where a document
     starts. It runs by the run's `methods.recurrence`, in float32, the outputs in x's
-    dtype."""
+    dtype, named `recurrence` (``remat.named``)."""
     b, t = x.shape[:2]
     within = jnp.ones((b, t), jnp.int32) if docs is None else docs.within
     keep = (within > 0).astype(jnp.float32)  # 0 where a document starts
-    scan = Recurrence("the selective scan", chunk, (x, dt, B, C, keep), (A,))
-    return parallel.method("recurrence")(scan).astype(x.dtype)
+    run = parallel.method("recurrence")
+
+    def scan(xs: Positions, shared: Shared) -> Float[Array, "b t h p"]:
+        return run(Recurrence("the selective scan", chunk, xs, shared))
+
+    y = remat.named("recurrence", scan, (x, dt, B, C, keep), (A,))
+    return y.astype(x.dtype)
 
 
 _At = tuple[

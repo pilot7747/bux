@@ -11,10 +11,12 @@ from collections.abc import Sequence
 
 import jax.numpy as jnp
 from flax import nnx
+from jax.ad_checkpoint import checkpoint_name
 from jaxtyping import Array, Bool, Float, Int
 
 from bux import config as cfg
 from bux import parallel
+from bux.architecture import remat
 from bux.architecture.conv import CausalConv
 from bux.architecture.functional import activation
 from bux.architecture.indexer import Indexer, Scores, from_stream
@@ -110,10 +112,22 @@ class SoftmaxAttention(nnx.Module):
         docs: Segments | None,
     ) -> Float[Array, "b t h dv"]:
         """Return every query's softmax-weighted values by the run's
-        `methods.attention`; `x` is for `FullLogits`."""
+        `methods.attention`, named `attention` with what its backward takes
+        (``remat.named``); `x` is for `FullLogits`."""
         ids = None if docs is None else docs.ids
         args = AttentionArgs(ids, self.window, self.scale, self.softcap, self._sinks())
-        return parallel.method("attention")(q, k, v, args)
+        method = parallel.method("attention")
+
+        def attend(
+            q: Float[Array, "b t h dk"],
+            k: Float[Array, "b s g dk"],
+            v: Float[Array, "b s g dv"],
+            ids: Int[Array, "b t"] | None,
+            sinks: Float[Array, " h"] | None,
+        ) -> Float[Array, "b t h dv"]:
+            return method(q, k, v, args._replace(ids=ids, sinks=sinks))
+
+        return remat.named("attention", attend, q, k, v, ids, args.sinks)
 
     def _sinks(self) -> Float[Array, " h"] | None:
         return None if self.sinks is None else self.sinks[...]
@@ -123,6 +137,7 @@ class SoftmaxAttention(nnx.Module):
     ) -> Float[Array, "b t d"]:
         """Normalize and gate the head outputs, then project them back to the width."""
         b, t, _ = x.shape
+        out = checkpoint_name(out, "attention")
         if self.out_norm is not None:
             out = self.out_norm(out)
         if self.gate is not None:
@@ -228,8 +243,10 @@ class Attention(SoftmaxAttention):
         from its kv port: slices of one projection when fused, else one each."""
         if self.qkv is not None:
             q, k = self.heads * self.head_dim, self.kv_heads * self.head_dim
-            return jnp.split(self.qkv(x), [q, q + k], axis=-1)
-        return [p(x) for p in (self.q, self.k, self.v) if p is not None]
+            qkv = checkpoint_name(self.qkv(x), "qkv")
+            return jnp.split(qkv, [q, q + k], axis=-1)
+        projections = (self.q, self.k, self.v)
+        return [checkpoint_name(p(x), "qkv") for p in projections if p is not None]
 
     def _queries(
         self, q: Float[Array, "b t _"], pos: Int[Array, "b t"] | None

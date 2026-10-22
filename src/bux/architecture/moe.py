@@ -15,6 +15,7 @@ from typing import ClassVar
 import jax
 import jax.numpy as jnp
 from flax import nnx
+from jax.ad_checkpoint import checkpoint_name
 from jax.sharding import PartitionSpec as P
 from jaxtyping import Array, Float, Int
 
@@ -80,9 +81,16 @@ def experts(
     """Run each row of `x` through its expert's FFN, then `norm`. The rows are sorted
     by expert: the first sizes[0] are expert 0's, the next sizes[1] expert 1's, and so
     on; rows past them come out 0 before `norm`. It depends on its arguments alone, so
-    it runs on one device's experts in a shard_map as it does on all of them."""
-    g = None if gate is None else ragged_dot(x, gate, sizes)
-    y = ragged_dot(activate(ffn, ragged_dot(x, up, sizes), g), down, sizes)
+    it runs on one device's experts in a shard_map as it does on all of them. Its
+    products are named `experts` (``remat``)."""
+
+    def product(
+        x: Float[Array, "n e"], w: Float[Array, "E e f"]
+    ) -> Float[Array, "n f"]:
+        return checkpoint_name(ragged_dot(x, w, sizes), "experts")
+
+    g = None if gate is None else product(x, gate)
+    y = product(activate(ffn, product(x, up), g), down)
     return y if norm is None else norm(y)
 
 
