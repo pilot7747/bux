@@ -4,7 +4,7 @@ runs. A new method is a function:
     from bux.parallel import methods
 
     @methods.attention.register("mine")
-    def _(q, k, v, visibility): ...
+    def _(q, k, v, args): ...
 
 and ``methods = methods(attention=mine)`` picks it. Whoever adds a kind of method
 defines its signature, and registers its default next to the layer that calls it.
