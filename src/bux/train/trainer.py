@@ -7,6 +7,7 @@ A run's directory, ``<out>/<name>-<id>``, holds:
     run.json       its IR
     metrics.jsonl  a line of metrics every `log.every` steps, and at every eval
     checkpoints/   with a `checkpoint` setting; a run there resumes from the latest
+    profile/       with a `profile` setting, a trace of its steps
 
 Its name says which alternatives it took, and its id hashes what it computes, so a
 changed setting gets a fresh directory and an unchanged one finds its checkpoints.
@@ -40,7 +41,7 @@ from bux.data.pipeline import DEFAULT_CACHE, jobs, prepare
 from bux.lang import ir
 from bux.lang.printer import run_to_source
 from bux.train.data import Batch, batches
-from bux.train.hooks import Checkpoint, Eval, Hook, Log
+from bux.train.hooks import Checkpoint, Eval, Hook, Log, Profile
 from bux.train.objective import Metrics, Objective, objective, target_mask
 from bux.train.optim import Schedule, lr_multiplier, lr_schedule, optimizer
 from bux.train.sinks import JSONL, Console, LatestMetrics, Sink, is_main_process
@@ -371,8 +372,8 @@ def _hooks(
     make_batches: Callable[..., Iterator[Batch]],
     echo: Callable[[str], None],
 ) -> list[Hook]:
-    """Return the run's own hooks: its log, eval and checkpoint, which resumes
-    `trainer` from the latest checkpoint in `folder` if there is one."""
+    """Return the run's own hooks: its log, eval, checkpoint, which resumes `trainer`
+    from the latest checkpoint in `folder` if there is one, and profile."""
     config = run.train
     tokens = config.batch * config.seq_len
     hooks: list[Hook] = [Log(every=config.log.every, lr=lr, tokens=tokens)]
@@ -386,4 +387,6 @@ def _hooks(
         if checkpoint.restore(trainer):
             echo(f"{run.name}: resuming at step {trainer.step}")
         hooks.append(checkpoint)
+    if (trace := config.profile) is not None:
+        hooks.append(Profile(folder / "profile", start=trace.start, steps=trace.steps))
     return hooks

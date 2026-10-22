@@ -25,7 +25,7 @@ from bux.data.pipeline import jobs
 from bux.lang import compile, compile_runs
 from bux.train import config as tcfg
 from bux.train.data import batches, plain
-from bux.train.hooks import Hook, Log
+from bux.train.hooks import Hook, Log, Profile
 from bux.train.objective import (
     Term,
     cross_entropy,
@@ -379,6 +379,18 @@ def test_a_run_writes_its_directory_and_resumes_where_it_stopped(tmp_path):
     assert (
         resumed["loss"] == whole["loss"] and resumed["grad_norm"] == whole["grad_norm"]
     )
+
+
+def test_a_profile_traces_its_steps_into_the_run_s_directory_and_keeps_its_id(
+    tmp_path,
+):
+    run = smoke("steps = 4", "profile = profile(start=1, steps=2)")
+    assert run.id == smoke("steps = 4").id
+    train(run, tmp_path, echo=lambda _: None)
+    traces = (directory(run, tmp_path) / "profile").rglob("*.xplane.pb")
+    assert len(list(traces)) == 1
+    hook = Profile(tmp_path, start=1, steps=2)
+    assert [s for s in range(1, 5) if hook.due(s, 4)] == [1, 3]
 
 
 def test_a_run_trains_on_text_that_it_prepares_first(tmp_path, byte_tokenizer):

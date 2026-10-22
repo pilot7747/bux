@@ -288,6 +288,15 @@ class LogConfig(Config):
     every: Positive = 10
 
 
+class ProfileConfig(Config):
+    """A jax.profiler trace of `steps` steps, those after step `start`, in the run's
+    directory under profile/, which TensorBoard's profile plugin and xprof read."""
+
+    type: Literal["profile"] = "profile"
+    start: Annotated[int, Field(ge=0)] = 10
+    steps: Positive = 5
+
+
 class PrecisionConfig(Config):
     """The dtype the forward and backward compute in. Parameters and the optimizer's
     state stay float32, and so do norm statistics, router scores and top-k, recurrent
@@ -375,6 +384,7 @@ class TrainConfig(Config):
     eval: EvalConfig | None = None
     checkpoint: CheckpointConfig | None = None
     log: LogConfig = LogConfig()
+    profile: ProfileConfig | None = None
     precision: PrecisionConfig = PrecisionConfig()
     mesh: MeshConfig = MeshConfig()
     layout: LayoutConfig = LayoutConfig()
@@ -400,6 +410,7 @@ Setting = Annotated[
     | EvalConfig
     | CheckpointConfig
     | LogConfig
+    | ProfileConfig
     | PrecisionConfig
     | MeshConfig
     | LayoutConfig

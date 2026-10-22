@@ -131,6 +131,37 @@ class Checkpoint(Hook):
         self.manager.close()
 
 
+class Profile(Hook):
+    """A jax.profiler trace, into `folder`, of the `steps` steps after step `start`.
+    It waits for the step before it starts and stops, so the trace holds whole steps."""
+
+    def __init__(self, folder: Path, *, start: int, steps: int):
+        self.folder, self.first, self.last = folder, start, start + steps
+        self.tracing = False
+
+    def due(self, step: int, steps: int) -> bool:
+        return step in (self.first, self.last)
+
+    def start(self, trainer: "Trainer") -> None:
+        self._at(trainer.step)  # step 0, or the step a run resumes at
+
+    def __call__(self, trainer: "Trainer", metrics: Metrics) -> None:
+        jax.block_until_ready(metrics)
+        self._at(trainer.step)
+
+    def _at(self, step: int) -> None:
+        if step == self.first:
+            jax.profiler.start_trace(self.folder)
+            self.tracing = True
+        else:
+            self.close()
+
+    def close(self) -> None:
+        if self.tracing:
+            jax.profiler.stop_trace()
+            self.tracing = False
+
+
 def _fits(saved: object, state: object, step: int) -> None:
     """Raise unless the checkpoint of `step`, whose metadata is `saved`, holds the
     variables of `state`. `methods.repeat` is not in a run's id, but it changes them:
