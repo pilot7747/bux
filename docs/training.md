@@ -330,10 +330,10 @@ the log's `mfu`:
 | KDA with `gate_lower_bound=-5` | 110k, 36% |            |
 | MoE, 64 experts, top 8      | 102k, 35% | 834k          |
 
-Batches go to the devices two ahead of the step (`prefetch`), and `methods(donate=true)`
-lets a step's new state take the old one's memory: the 1.3B's step then peaks at 70.5
-GiB instead of 81.1 on one GPU ([Donation](parallelism.md#donation-methodsdonate),
-which says why it is off by default).
+Batches go to the devices two ahead of the step (`prefetch`). With
+`methods(donate=true)` a step's new state takes the old one's memory: the 1.3B's step
+then peaks at 70.5 GiB instead of 81.1 on one GPU
+([Donation](parallelism.md#donation-methodsdonate) says why it is off by default).
 
 bux sets one XLA flag of its own (`bux/runtime.py`), for expert parallelism:
 `--xla_gpu_experimental_ragged_all_to_all_use_barrier_with_nccl=false`, without which
