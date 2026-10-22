@@ -327,7 +327,9 @@ class FullLogits(SoftmaxAttention):
     ) -> None:
         rel, names = config.relative_bias, ("embed", ("heads", self.heads))
         self.rel_proj = (
-            linear(width, self.heads * rel.rank, names, bias, rngs) if rel else None
+            linear(width, self.heads * rel.rank, names, bias, rngs, in_compute=True)
+            if rel
+            else None
         )
         self.rel_table = nnx.Param(jnp.zeros((rel.rank, rel.extent))) if rel else None
         self.log_scale, self.log_scale_floor = config.log_scale, config.log_scale_floor

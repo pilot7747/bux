@@ -73,7 +73,7 @@ fe14a5e39c  183M    3B      16.4       attention_ablation[mha, optimizer.lr=3e-3
 | `eval`       | `eval(data=..., every=..., batches=...)`, or `none`    | `none`         |
 | `checkpoint` | `checkpoint(every=..., keep=...)`, or `none`           | `none`         |
 | `log`        | `log(every=...)`                                       | `log`          |
-| `precision`  | `precision(compute=bfloat16)`: the dtype forward and backward compute in; parameters stay float32 | `precision`: `float32` |
+| `precision`  | `precision(compute=bfloat16, matmuls=mxfp8)`: the dtype forward and backward compute in, parameters staying float32, and the format block projections multiply in | `precision`: `float32`, `compute` |
 | `mesh`       | `mesh(data=..., fsdp=..., tensor=...)`: the device grid | `mesh`: every device on `data` |
 | `layout`     | `layout(...)`: which mesh axes each named dimension splits over | `layout` |
 | `methods`    | `methods(attention=..., moe=..., microbatches=...)`: how what communicates is computed, and the microbatches a step takes its batch in | `methods` |
@@ -308,6 +308,24 @@ Tokens a second on B300s, 8 × 4096 tokens a GPU, `precision(compute=bfloat16)`:
 | KDA hybrid, `"KKKA"`        | 58k   |                   |
 | KDA with `gate_lower_bound=-5` | 108k |                |
 | MoE, 64 experts, top 8      | 103k  | 834k              |
+
+Unlike these, a low-precision matmul format changes what a run computes, so it is a
+setting, `precision(matmuls=...)` (docs/parallelism.md, "Matmul formats"). On a B300,
+cuDNN's MXFP8 GEMM runs at 1.75x bfloat16's rate (2.7-3.0 PFLOP/s at the model's
+shapes), and quantizing each operand twice, in one pass of a Pallas kernel, gives some
+of it back: an MLP projection's forward and backward take 1.3-1.35x less time, q's and
+o's 1.1x, and k's and v's, half as wide, 7% more. NVFP4 quantizes in XLA, which makes
+its projections 5-8x slower than bfloat16's; and the routed experts stay in bfloat16:
+
+| `matmuls`, 1.3B Llama-style | 1 GPU | 8, `mesh(fsdp=8)` |
+|-----------------------------|-------|-------------------|
+| `compute` (bfloat16)        | 142k  | 1.12M             |
+| `mxfp8`                     | 167k (1.18x) | 1.30M (1.16x) |
+| `nvfp4`                     | 43k   |                   |
+
+On 300 steps of packed documents, autotuning pinned, `mxfp8`'s loss is bfloat16's to
+within the noise between seeds. The MoE trains as fast in `mxfp8` as in bfloat16,
+105k: its experts are most of its matmuls.
 
 ## Launching
 

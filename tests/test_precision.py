@@ -2,16 +2,21 @@
 float32 islands inside them, and gradient accumulation against the whole batch, on one
 device and split over the 8 CPU devices the tests have."""
 
+from collections.abc import Callable
+
 import jax
 import jax.numpy as jnp
 import numpy as np
 import pytest
 from flax import nnx
+from jax.extend.core import ClosedJaxpr, Jaxpr
+from jax.sharding import NamedSharding
+from jax.sharding import PartitionSpec as P
 from jaxtyping import Array, Float
 
 from bux import config as cfg
 from bux import parallel
-from bux.architecture import Model
+from bux.architecture import Model, blockscaled, matmuls
 from bux.architecture.linear_attention import delta_rule, l2norm, recurrence
 from bux.architecture.moe import MoE
 from bux.architecture.norm import Norm
@@ -197,6 +202,178 @@ def test_precision_is_in_the_run_s_id_and_a_sweep_over_it_is_two_runs():
     assert plain.id == f32.id
 
 
+# --- Matmul formats ---------------------------------------------------------------------
+
+PROJECTION = (((2,), (0,)), ((), ()))  # x @ w, as nnx.Linear multiplies
+# Each format's relative error, forward and backward, against float32 at random
+# normal operands (float8 rounds to 1 part in 16, float4 to 1 in 4), and how far a few
+# steps' losses may be from bfloat16's.
+FORMATS = {"mxfp8": (0.02, 0.06), "nvfp4": (0.08, 0.25)}
+LOSSES = {"mxfp8": 1e-2, "nvfp4": 3e-2}
+
+
+def _precision(fmt: str) -> str:
+    return f"precision(compute=bfloat16, matmuls={fmt})"
+
+
+def _projection(
+    fmt: str | Callable, shape: tuple[int, int, int], dtype=jnp.bfloat16
+) -> list:
+    """Return x @ w in the format `fmt`, or by a dot_general, and its gradients by x
+    and w."""
+    multiply = matmuls.formats.find(fmt) if isinstance(fmt, str) else fmt
+    b, k, n = shape
+    keys = jax.random.split(jax.random.key(0), 3)
+    x = jax.random.normal(keys[0], (b, 32, k)).astype(dtype)
+    w = (jax.random.normal(keys[1], (k, n)) * k**-0.5).astype(dtype)
+    g = jax.random.normal(keys[2], (b, 32, n)).astype(dtype)
+    y, vjp = jax.vjp(lambda x, w: multiply(x, w, PROJECTION), x, w)
+    return [y, *vjp(g)]
+
+
+def _error(a: Float[Array, "*s"], b: Float[Array, "*s"]) -> float:
+    a, b = a.astype(jnp.float32), b.astype(jnp.float32)
+    return float(jnp.linalg.norm(a - b) / jnp.linalg.norm(b))
+
+
+@pytest.mark.parametrize("fmt", FORMATS)
+def test_a_format_multiplies_forward_and_backward_near_float32(fmt):
+    shape, (low, high) = (4, 256, 512), FORMATS[fmt]
+    exact = _projection("compute", shape, jnp.float32)
+    bf16, quantized = _projection("compute", shape), _projection(fmt, shape)
+    for y, q, e in zip(bf16, quantized, exact, strict=True):
+        assert bool(jnp.isfinite(q).all()) and q.dtype == jnp.bfloat16
+        assert _error(y, e) < 0.01 and low < _error(q, e) < high
+
+
+def test_mxfp8_is_jax_s_scaled_dot_general():
+    config = [jax.nn.get_scaled_dot_general_config("mxfp8")] * 3
+
+    def jax_s(
+        x: Float[Array, "b t k"], w: Float[Array, "k n"], dimensions: tuple
+    ) -> Float[Array, "b t n"]:
+        return jax.nn.scaled_dot_general(x, w, dimensions, jnp.bfloat16, config)
+
+    shape = (4, 256, 512)
+    for ours, theirs in zip(_projection("mxfp8", shape), _projection(jax_s, shape)):
+        assert jnp.array_equal(ours, theirs)
+
+
+@pytest.mark.parametrize("fmt", FORMATS)
+def test_a_projection_not_in_whole_blocks_multiplies_in_compute(fmt):
+    shape = (2, 40, 64)
+    for y, q in zip(_projection("compute", shape), _projection(fmt, shape)):
+        assert jnp.array_equal(y, q)
+
+
+def test_nvfp4_tiles_quantize_w_as_its_transpose():
+    w = jax.random.normal(jax.random.key(0), (64, 32))
+
+    def dequantized(w: Float[Array, "r c"]) -> Float[Array, "r c"]:
+        q = blockscaled.nv_quantize(w, tiles=True)
+        scales = jnp.repeat(q.scales.astype(jnp.float32), 16, axis=1)
+        assert q.scale is not None
+        return q.values.astype(jnp.float32) * scales * q.scale
+
+    assert jnp.array_equal(dequantized(w), dequantized(w.T).T)
+    assert 0.05 < _error(dequantized(w), w) < 0.2
+
+
+def test_nvfp4_rounds_gradients_stochastically_and_unbiased():
+    # 1.5 at the start of each block takes it to E2M1's 6, and 1.25 to 5, halfway
+    # between its 4 and 6.
+    x = jnp.full((256, 64), 1.25).at[:, ::16].set(1.5)
+    rest = np.arange(64) % 16 != 0
+
+    def values(stochastic: bool = False) -> Float[Array, "r c"]:
+        q = blockscaled.nv_quantize(x, stochastic=stochastic)
+        return q.values.astype(jnp.float32)[:, rest]
+
+    assert jnp.unique(values()).size == 1
+    assert set(jnp.unique(values(stochastic=True)).tolist()) == {4.0, 6.0}
+    assert float(values(stochastic=True).mean()) == pytest.approx(5.0, rel=0.01)
+
+
+def test_the_hadamard_transform_is_orthogonal():
+    h = blockscaled.HADAMARD
+    assert np.allclose(h @ h.T, np.eye(16), atol=1e-6) and set(np.abs(h).flat) == {0.25}
+
+
+# Interpreted off a GPU: x and x^T in one pass, each device on its part of x.
+@pytest.mark.parametrize(
+    "spec", [P(), P("data", None), P(None, "data"), P("data", "tensor")]
+)
+def test_the_mxfp8_kernel_quantizes_as_xla_does_on_any_split(spec):
+    x = (jax.random.normal(jax.random.key(0), (256, 384)) * 3).astype(jnp.bfloat16)
+    with parallel.use(tcfg.MeshConfig(data=4, tensor=2)) as mesh:
+        split = jax.device_put(x, NamedSharding(mesh, spec))
+        kernel = jax.jit(blockscaled.mx_kernel_twice)(split)
+    xla = blockscaled.mx_quantize(x), blockscaled.mx_quantize(x.T)
+    for ours, theirs in zip(kernel, xla, strict=True):
+        for a, b in [(ours.values, theirs.values), (ours.scales, theirs.scales)]:
+            assert jnp.array_equal(a.astype(jnp.float32), b.astype(jnp.float32))
+
+
+def test_block_projections_multiply_in_the_format_and_the_router_and_head_in_compute():
+    model = _trainer(ARCHITECTURES["moe"]).model
+    linears = [(p, m) for p, m in nnx.iter_modules(model) if isinstance(m, nnx.Linear)]
+    compute = {p[-1] for p, m in linears if m.dot_general is not matmuls.dot_general}
+    assert compute == {"router", "proj"}  # proj: the head's
+
+    def run() -> list[Float[Array, "b t vocab"]]:
+        with matmuls.use("mxfp8"):
+            return forward(cast(model, jnp.bfloat16), _batch())
+
+    # The up, gate and down of 2 FFNs and of 2 MoEs' shared experts.
+    assert _count(jax.make_jaxpr(run)().jaxpr, "scaled_matmul_wrapper") == 12
+
+
+@pytest.mark.parametrize("fmt", FORMATS)
+@pytest.mark.parametrize("arch", ["llama", "moe"])
+def test_a_run_in_a_format_trains_near_bfloat16(losses, arch, fmt):
+    given = {"mesh": ONE, "optimizer": STABLE}
+    bf16 = losses(ARCHITECTURES[arch], precision=BF16, **given)
+    quantized = losses(ARCHITECTURES[arch], precision=_precision(fmt), **given)
+    assert np.allclose(quantized, bf16, rtol=LOSSES[fmt])
+    assert not np.array_equal(quantized, bf16)
+
+
+# In float32, which rounds too finely to move a value across a step of float8: the
+# blocks, and their values, are those of one device.
+@pytest.mark.parametrize("fmt", FORMATS)
+def test_a_format_on_a_split_mesh_trains_as_on_one_device(losses, fmt):
+    given = {"optimizer": STABLE, "precision": f"precision(matmuls={fmt})"}
+    one = losses(ARCHITECTURES["llama"], mesh=ONE, **given)
+    split = losses(ARCHITECTURES["llama"], mesh="mesh(fsdp=4, tensor=2)", **given)
+    assert np.allclose(split, one, rtol=1e-5)
+
+
+def test_a_pipeline_trains_in_mxfp8_as_its_stages_do_on_one_device(losses):
+    source = PRELUDE + "block = [norm attn] [norm ffn]\nmodel = embed block^4 norm head"
+    given = {"optimizer": STABLE, "precision": "precision(matmuls=mxfp8)"}
+    scan = losses(source, mesh=ONE, methods="methods(repeat=scan)", **given)
+    how = "methods(repeat=scan, microbatches=2)"
+    piped = losses(source, mesh="mesh(stage=2, data=1)", methods=how, **given)
+    assert np.allclose(piped, scan, rtol=1e-5)
+
+
+def test_the_matmul_format_is_in_the_run_s_id_and_a_bfloat16_run_s_is_as_it_was():
+    plain, mxfp8 = compile_runs(
+        _source(f"precision = {BF16}", "precision.matmuls = compute | mxfp8")
+    )
+    assert mxfp8.train.precision.matmuls == "mxfp8"
+    assert plain.id != mxfp8.id and plain.name != mxfp8.name
+    [bf16] = compile_runs(_source(f"precision = {BF16}"))
+    assert bf16.id == plain.id == "de94a2eb32"  # as before matmuls
+
+
+def test_a_format_not_registered_is_an_error():
+    trainer = _trainer(ARCHITECTURES["llama"], matmuls="mine")
+    hint = r"no 'mine' matmul format yet; add one with @bux\.architecture\.matmuls"
+    with pytest.raises(NotImplementedError, match=hint):
+        trainer.train_on_batch(_batch())
+
+
 # --- Microbatches -----------------------------------------------------------------------
 
 # A mesh, and the microbatches its batch axes leave rows for, of the 16 rows of _batch.
@@ -317,6 +494,20 @@ def _sizes(mesh: str) -> dict[str, int]:
     """mesh(fsdp=2, tensor=4) as {"fsdp": 2, "tensor": 4}."""
     inside = mesh.removeprefix("mesh(").removesuffix(")")
     return {k: int(v) for k, v in (kv.split("=") for kv in inside.split(", "))}
+
+
+def _count(jaxpr: Jaxpr, primitive: str) -> int:
+    """How many times `primitive` runs in `jaxpr`, inside the jaxprs it calls too."""
+    n = 0
+    for eqn in jaxpr.eqns:
+        n += eqn.primitive.name == primitive
+        for param in eqn.params.values():
+            for sub in param if isinstance(param, tuple | list) else (param,):
+                if isinstance(sub, ClosedJaxpr):
+                    sub = sub.jaxpr
+                if isinstance(sub, Jaxpr):
+                    n += _count(sub, primitive)
+    return n
 
 
 def _counts(model: Model) -> list[int]:

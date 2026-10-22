@@ -17,7 +17,7 @@ from bux import config as cfg
 from bux import parallel
 from bux.architecture.norm import Norm
 from bux.architecture.rope import rotate
-from bux.architecture.sharding import shard_heads
+from bux.architecture.sharding import projection, shard_heads
 
 # DeepSeek-V3.2's indexer keys, projected from the layer's input, are layer-normalized.
 _STREAM_KEY_NORM = cfg.NormalizationConfig(type="layernorm", bias=True)
@@ -155,7 +155,7 @@ class Indexer(nnx.Module):
 
         def linear(n_in: int, n_out: int, *names: parallel.Name) -> nnx.Linear:
             init = parallel.named(*names)
-            return nnx.Linear(n_in, n_out, use_bias=False, kernel_init=init, rngs=rngs)
+            return projection(n_in, n_out, use_bias=False, kernel_init=init, rngs=rngs)
 
         # The randomly initialized layers; reordering them changes a seed's init.
         self.q = linear(query_width, h * i, query, ("heads", h))

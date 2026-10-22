@@ -1,13 +1,23 @@
-"""The sharding constraints and the dense layer that several layers share.
+"""The sharding constraints and the dense layers that several layers share.
 
 Each constraint only says how an activation splits over the mesh (``bux.parallel``);
 outside ``parallel.use`` it returns its input unchanged.
 """
 
+from typing import Any
+
+import jax
 from flax import nnx
 from jaxtyping import Array, Float, Shaped
 
 from bux import parallel
+from bux.architecture import matmuls
+
+
+def projection(n_in: int, n_out: int, **kwargs: Any) -> nnx.Linear:
+    """Make an `nnx.Linear` of a block, which multiplies in the run's matmul format
+    (``matmuls``)."""
+    return nnx.Linear(n_in, n_out, dot_general=matmuls.dot_general, **kwargs)
 
 
 def linear(
@@ -16,14 +26,17 @@ def linear(
     names: tuple[parallel.Name, parallel.Name],
     bias: bool,
     rngs: nnx.Rngs,
+    in_compute: bool = False,
 ) -> nnx.Linear:
-    """Make an `nnx.Linear` whose kernel's dimensions are `names`, its bias's the last."""
+    """Make a `projection` whose kernel's dimensions are `names`, its bias's the last;
+    or `in_compute`, an `nnx.Linear` that multiplies in the dtype the run computes in."""
     return nnx.Linear(
         n_in,
         n_out,
         use_bias=bias,
         kernel_init=parallel.named(*names),
         bias_init=parallel.named(names[1], init=nnx.initializers.zeros),
+        dot_general=jax.lax.dot_general if in_compute else matmuls.dot_general,
         rngs=rngs,
     )
 

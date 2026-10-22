@@ -34,7 +34,7 @@ from jax.typing import DTypeLike
 from jaxtyping import Array, Float
 
 from bux import parallel
-from bux.architecture import Model
+from bux.architecture import Model, matmuls
 from bux.architecture.registry import Loss
 from bux.data.pipeline import DEFAULT_CACHE, jobs, prepare
 from bux.lang import ir
@@ -120,7 +120,8 @@ class Trainer:
 
     Both compute in `compute`, the model's parameters cast to it inside the loss, so
     that the parameters, their gradients and the optimizer's state stay as they are
-    (float32).
+    (float32); and the projections inside blocks multiply in the format `matmuls`
+    names (``bux.architecture.matmuls``).
 
     Made inside ``parallel.use``, it puts its state on the shardings the layout gives
     it, and every step keeps it there.
@@ -133,10 +134,12 @@ class Trainer:
         objective: Objective,
         *,
         compute: DTypeLike = jnp.float32,
+        matmuls: str = "compute",
         microbatches: int = 1,
     ):
         self.model, self.objective = model, objective
         self.compute, self.microbatches = jnp.dtype(compute), microbatches
+        self.matmuls = matmuls
         self.optimizer = nnx.Optimizer(model, tx, wrt=nnx.Param)
         parallel.shard_state(self.model, self.optimizer)
         self.step = 0
@@ -220,7 +223,8 @@ class Trainer:
         def loss_fn(params: nnx.State) -> tuple[Float[Array, ""], tuple[Metrics, Any]]:
             model = cast(nnx.merge(graphdef, params, buffers, copy=True), self.compute)
             model.set_attributes(update_at_step_end=True, raise_if_not_found=False)
-            logits, aux_losses = training_forward(model, batch)
+            with matmuls.use(self.matmuls, jnp.asarray(batch.input_ids)):
+                logits, aux_losses = training_forward(model, batch)
             per_token, per_row = self.objective(logits, batch, aux_losses)
             loss = token_share * per_token.loss + row_share * per_row.loss
             metrics = _scaled(per_token.metrics, token_share)
@@ -232,7 +236,8 @@ class Trainer:
 
     def eval_step(self, model: Model, batch: Batch) -> Float[Array, ""]:
         """Return the first head's loss on `batch`, computed in `compute`."""
-        logits = forward(cast(model, self.compute), batch)
+        with matmuls.use(self.matmuls):
+            logits = forward(cast(model, self.compute), batch)
         per_token, _ = self.objective(logits, batch)
         return per_token.metrics["loss"]
 
@@ -330,6 +335,7 @@ def train(
             tx,
             objective(config.loss, run.arch),
             compute=config.precision.compute,
+            matmuls=config.precision.matmuls,
             microbatches=_accumulated(config.methods.microbatches),
         )
         make_batches = functools.partial(
