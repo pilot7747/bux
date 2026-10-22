@@ -341,10 +341,10 @@ def test_the_plan_says_each_runs_gpus_and_its_bytes_on_each(capsys):
     assert main(["plan", str(SMOKE), sweep]) == 0
     head, fsdp, one = capsys.readouterr().out.splitlines()[1:]
     assert head.split() == [
-        *("id", "params", "tokens", "tok/param"),
+        *("id", "params", "tokens", "tok/param", "flops/tok"),
         *("gpus", "params/gpu", "optim/gpu", "bubble", "run"),
     ]
-    assert fsdp.split()[4] == "8" and one.split()[4] == "1"
+    assert fsdp.split()[5] == "8" and one.split()[5] == "1"
     runs = smoke(sweep)
     made = abstract(runs[0])
     assert made is not None
@@ -365,4 +365,4 @@ def test_the_plan_sizes_muons_state_on_a_mesh(capsys):
     muon = ("optimizer = muon(lr=0.02)", "mesh = mesh(fsdp=8)")
     assert main(["plan", str(SMOKE), *muon]) == 0  # its state holds masked nodes
     row = capsys.readouterr().out.splitlines()[-1].split()
-    assert row[4] == "8" and "?" not in row[5:7]
+    assert row[5] == "8" and "?" not in row[4:8]

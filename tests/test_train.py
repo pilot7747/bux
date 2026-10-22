@@ -24,6 +24,7 @@ from bux.architecture import Model
 from bux.data.pipeline import jobs
 from bux.lang import compile, compile_runs
 from bux.train import config as tcfg
+from bux.train import flops
 from bux.train.data import batches, plain
 from bux.train.hooks import Hook, Log, Profile
 from bux.train.objective import (
@@ -46,7 +47,7 @@ from bux.train.optim import (
     whole_matrix_spec,
 )
 from bux.train.sinks import LatestMetrics, Sink
-from bux.train.trainer import Trainer, directory, train
+from bux.train.trainer import Trainer, directory, step_flops, train
 
 SMOKE = Path(__file__).parent.parent / "examples" / "experiments" / "smoke.bux"
 
@@ -457,6 +458,44 @@ def test_a_trainer_takes_terms_hooks_and_sinks_of_ones_own():
     assert {"loss", "logit_l2", "grad_norm", "lr", "weight_norm"} <= set(latest.metrics)
 
 
+def test_a_step_s_flops_are_counted_from_its_program():
+    """The smoke run's: 6 N of its matrices, and 12 L d t of attention (PaLM's)."""
+    matrices = 2 * (2 * 64 * 64 + 2 * 64 * 32 + 3 * 64 * 256) + 64 * 512
+    attention = 12 * 2 * 64 * 64  # layers, heads × head_dim, positions
+    assert step_flops(smoke()) == (6 * matrices + attention) * 8 * 64
+    x, w, sizes = jnp.ones((6, 8)), jnp.ones((3, 8, 5)), jnp.array([1, 2, 3])
+    grad = jax.grad(lambda x, w: jax.lax.ragged_dot(x, w, sizes).sum(), (0, 1))
+    assert flops.count(grad, x, w) == 3 * 2 * 6 * 8 * 5
+
+    def scan(c):
+        return jax.lax.scan(lambda c, _: (c @ x.T @ x, None), c, length=5)[0]
+
+    assert flops.count(scan, jnp.ones((4, 8))) == 5 * 2 * (2 * 4 * 6 * 8)
+    depthwise = functools.partial(
+        jax.lax.conv_general_dilated,
+        window_strides=(1,),
+        padding="VALID",
+        feature_group_count=6,
+    )
+    ones = jnp.ones((2, 6, 10)), jnp.ones((6, 1, 3))
+    assert flops.count(depthwise, *ones) == 2 * (2 * 6 * 8) * 3
+
+
+def test_the_log_reports_mfu_where_the_devices_peak_is_known():
+    assert flops.peak(jax.devices()[0].device_kind) is None  # a CPU's
+    assert flops.peak("NVIDIA B300 SXM6 AC") == 2.25e15
+    arch = compile(ARCH + "model = embed block norm head\n")
+    loss = objective(tcfg.LossConfig(), arch)
+    trainer = Trainer(Model(arch, rngs=nnx.Rngs(0)), optax.adamw(1e-3), loss)
+    lr = lr_multiplier(tcfg.ConstantSchedule(), 2)
+    data = batches(tcfg.SyntheticConfig(), rows(tcfg.SyntheticConfig(), 2, 8), 32)
+    latest = LatestMetrics()
+    log = Log(every=1, lr=lr, tokens=16, flops=4e6, peak=1e9)
+    trainer.fit(data, 2, hooks=[log], sinks=[latest])
+    steps_per_s = latest.metrics["tokens_per_s"] / 16
+    assert latest.metrics["mfu"] == pytest.approx(steps_per_s * 4e6 / 1e9)
+
+
 def test_a_step_takes_the_memory_of_the_state_it_replaces():
     arch = compile(ARCH + "model = embed block norm head\n")
     trainer = Trainer(
@@ -468,7 +507,8 @@ def test_a_step_takes_the_memory_of_the_state_it_replaces():
     batch = jax.device_put(next(data))
     step = trainer._train.lower(trainer.model, trainer.optimizer, batch).compile()
     state = sum(x.nbytes for x in jax.tree.leaves(trainer.state()))
-    assert step.memory_analysis().alias_size_in_bytes == state
+    memory = step.memory_analysis()
+    assert memory is not None and memory.alias_size_in_bytes == state
 
 
 def test_a_run_reports_what_hooks_of_ones_own_return(tmp_path):

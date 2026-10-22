@@ -32,14 +32,15 @@ import jax.numpy as jnp
 import optax
 from flax import nnx
 from jax.typing import DTypeLike
-from jaxtyping import Array, Float
+from jaxtyping import Array, Float, Int32
 
-from bux import parallel
-from bux.architecture import Model
+from bux import kernels, parallel
+from bux.architecture import Model, remat
 from bux.architecture.registry import Loss
 from bux.data.pipeline import DEFAULT_CACHE, jobs, prepare
 from bux.lang import ir
 from bux.lang.printer import run_to_source
+from bux.train import flops
 from bux.train.data import Batch, batches
 from bux.train.hooks import Checkpoint, Eval, Hook, Log, Profile
 from bux.train.objective import Metrics, Objective, objective, target_mask
@@ -243,7 +244,8 @@ class Trainer:
         return per_token.metrics["loss"]
 
     def train_on_batch(self, batch: Batch) -> Metrics:
-        """Take one training step on `batch`, and return its metrics."""
+        """Take one training step on `batch`, on the host or on the devices
+        (``parallel.shard_batch``), and return its metrics."""
         metrics = self._train(self.model, self.optimizer, parallel.shard_batch(batch))
         self.step += 1
         return metrics
@@ -326,10 +328,11 @@ def train(
             run.model_dump_json(indent=2), encoding="utf-8"
         )
 
+    multiplier = lr_multiplier(config.schedule, config.steps)
+    log = _log(run, lr_schedule(config.optimizer.lr, multiplier))
     with parallel.use(config.mesh, config.layout, config.methods):
         parallel.check(config.batch, config.seq_len)
         model = parallel.build(lambda: Model(run.arch, rngs=nnx.Rngs(config.seed)))
-        multiplier = lr_multiplier(config.schedule, config.steps)
         tx = optimizer(config.optimizer, multiplier, model, config.clip)
         trainer = Trainer(
             model,
@@ -341,8 +344,7 @@ def train(
         make_batches = functools.partial(
             batches, config=config, vocab_size=vocab, cache=cache
         )
-        lr = lr_schedule(config.optimizer.lr, multiplier)
-        run_hooks = _hooks(run, trainer, folder, lr, make_batches, echo)
+        run_hooks = _hooks(run, trainer, folder, log, make_batches, echo)
         latest = LatestMetrics()
         trainer.fit(
             make_batches(config.data, start=trainer.step),
@@ -364,19 +366,60 @@ def _accumulated(microbatches: int) -> int:
     return 1 if parallel.pipeline.pipelined() else microbatches
 
 
+def step_flops(run: ir.Run) -> float:
+    """Return the model FLOPs of a training step of `run`: its loss's gradient on a
+    batch, counted from its program (``flops.count``) on one device, outside any mesh,
+    with remat and kernels off, which would add work or hide it."""
+    t = run.train
+    loss = objective(t.loss, run.arch)
+
+    def gradient(
+        params: nnx.State, rest: nnx.State, ids: Int32[Array, "b t"]
+    ) -> nnx.State:
+        positions = jnp.arange(t.seq_len, dtype=jnp.int32)
+        batch = Batch(ids, jnp.broadcast_to(positions, ids.shape), ids >= 0)
+
+        def f(params: nnx.State) -> Float[Array, ""]:
+            model = nnx.merge(graphdef, params, rest, copy=True)
+            model = cast(model, t.precision.compute)
+            model.set_attributes(update_at_step_end=True, raise_if_not_found=False)
+            logits, losses = training_forward(model, batch)
+            per_token, per_row = loss(logits, batch, losses)
+            return per_token.loss + per_row.loss
+
+        return jax.grad(f)(params)
+
+    with remat.off(), kernels.off():
+        abstract = nnx.eval_shape(lambda: Model(run.arch, rngs=nnx.Rngs(t.seed)))
+        graphdef, params, rest = nnx.split(abstract, nnx.Param, ...)
+        ids = jax.ShapeDtypeStruct((t.batch, t.seq_len), jnp.int32)
+        return flops.count(gradient, params, rest, ids)
+
+
+def _log(run: ir.Run, lr: Schedule) -> Log:
+    """Return the run's log, with its MFU where the peak of its devices is known."""
+    t = run.train
+    devices = parallel.mesh(t.mesh).devices
+    each = flops.peak(devices.flat[0].device_kind)
+    most = each and each * devices.size
+    work = step_flops(run) if most else None
+    return Log(
+        every=t.log.every, lr=lr, tokens=t.batch * t.seq_len, flops=work, peak=most
+    )
+
+
 def _hooks(
     run: ir.Run,
     trainer: Trainer,
     folder: Path,
-    lr: Schedule,
+    log: Log,
     make_batches: Callable[..., Iterator[Batch]],
     echo: Callable[[str], None],
 ) -> list[Hook]:
-    """Return the run's own hooks: its log, eval, checkpoint, which resumes `trainer`
+    """Return the run's own hooks: its `log`, eval, checkpoint, which resumes `trainer`
     from the latest checkpoint in `folder` if there is one, and profile."""
     config = run.train
-    tokens = config.batch * config.seq_len
-    hooks: list[Hook] = [Log(every=config.log.every, lr=lr, tokens=tokens)]
+    hooks: list[Hook] = [log]
     if (evals := config.eval) is not None:
         held_out = functools.partial(make_batches, evals.data, held_out=True)
         hooks.append(Eval(held_out, every=evals.every, batches=evals.batches))
