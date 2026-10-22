@@ -302,6 +302,9 @@ def _train(args: argparse.Namespace, runs: list[Run]) -> int:
         runs = _select(runs, args.index, args.only)
     except ValueError as err:
         return _error(str(err))
+    from bux.runtime import configure
+
+    configure()
     if args.command == "launch":
         from bux.launch import launch
 

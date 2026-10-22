@@ -60,6 +60,7 @@ from jaxtyping import Array, Int
 from bux import parallel
 from bux.data.pipeline import DEFAULT_CACHE, jobs, prepare
 from bux.lang import ir
+from bux.runtime import configure
 from bux.train.config import MeshConfig
 from bux.train.hooks import Hook, Metrics
 from bux.train.sinks import LatestMetrics, is_main_process
@@ -526,6 +527,7 @@ def launch(
 
 
 if __name__ == "__main__":  # a sweep's worker: python -m bux.launch FOLDER CACHE
+    configure()
     folder, cache = Path(sys.argv[1]), Path(sys.argv[2])
     run = ir.Run.model_validate_json((folder / "run.json").read_text(encoding="utf-8"))
     sys.exit(train_here(run, folder.parent, cache))
