@@ -556,19 +556,20 @@ def _orthogonalize_owned(
     stacks = [_as_stack(x, p) for x, p in zip(shards, plans, strict=True)]
     groups: dict[tuple, list[int]] = {}
     for i, (x, p) in enumerate(zip(stacks, plans)):
-        groups.setdefault((x.dtype, *p.shape, p.rows, p.cols, p.copies), []).append(i)
+        key = (x.dtype, *p.shape, p.rows, p.cols, p.copies, p.state_only)
+        groups.setdefault(key, []).append(i)
     owned = {
         key: _to_owners(jnp.concatenate([stacks[i] for i in group]), plans[group[0]])
         for key, group in groups.items()
     }
     orthogonal = _batched(owned, newton_schulz)
-    out: list[Float[Array, "*_"]] = [jnp.zeros(())] * len(shards)
+    out: dict[int, Float[Array, "*_"]] = {}
     for key, group in groups.items():
         back = _from_owners(orthogonal[key], plans[group[0]])
         ends = np.cumsum([len(stacks[i]) for i in group])
         for i, x in zip(group, jnp.split(back[: ends[-1]], ends[:-1]), strict=True):
             out[i] = _from_stack(x, plans[i])
-    return out
+    return [out[i] for i in range(len(shards))]
 
 
 def _as_stack(x: Float[Array, "*s"], p: Owned) -> Float[Array, "b m n"]:
