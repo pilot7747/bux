@@ -15,7 +15,8 @@ outputs and the state the chunk ends with are affine in S_0 too:
     o = R S_0 + O,    S_C = A S_0 + B.
 
 Every chunk's R, O, A and B come from matmuls over all chunks at once, and a scan over
-the chunks then carries the state. Nothing before a document's start reaches it.
+the chunks then carries the state; for one decay a head, a matmul over them. Nothing
+before a document's start reaches it.
 
 No exponent here is positive: a decay per key channel factors through the end of a
 block of `SUB` positions between s and t, and within a block it is taken one pair at a
@@ -270,10 +271,15 @@ def _across(
     """Return the chunks' outputs, from a zero state that each carries to the next,
     and the state they end with; with `transition`, also the map P of a start state
     that they make together, and the outputs' reads R P. Matrices A carry the state by
-    ``affine_scan``'s kernel, and the outputs read it in one batched matmul."""
+    ``affine_scan``'s kernel, scalars by `_passed`, and the outputs read it in one
+    batched matmul."""
     if A.ndim == 5 and not transition:
         before, S = affine_scan.states(A, B)
         return O + R @ before, S, None, None
+    if A.ndim == 4 and A.shape[-1] == 1:
+        before, S, P, starts = _passed(A, B)
+        reads = R * starts[..., None, None] if transition else None
+        return O + R @ before, S, P if transition else None, reads
     R, O, A, B = (jnp.moveaxis(x, 1, 0) for x in (R, O, A, B))
     P = None
     if transition:
@@ -297,6 +303,30 @@ def _across(
     (S, P), (out, reads) = jax.lax.scan(step, (jnp.zeros_like(B[0]), P), (R, O, A, B))
     reads = None if reads is None else jnp.moveaxis(reads, 0, 1)
     return jnp.moveaxis(out, 0, 1), S, P, reads
+
+
+def _passed(
+    A: Float[Array, "b n h 1"], B: States
+) -> tuple[
+    States, Float[Array, "b h dk dv"], Float[Array, "b h 1"], Float[Array, "b n h"]
+]:
+    """Return, for one decay a head, the state before each chunk and after the last,
+    and the product of the chunks' decays, and of those before each. The states are
+    one matmul of what the chunks add, by the decays of the chunks between (SSD's
+    state passing), where a scan would take a chunk at a time."""
+    log = jnp.where(A > 0, jnp.log(jnp.where(A > 0, A, 1)), -jnp.inf)[..., 0]
+    index = jnp.arange(log.shape[1])
+    later = (index[:, None] > index)[:, None]  # (n, 1, n): chunk i or l after j
+    # The log decays of the chunks l after j up to i, at [i, j], by sums, not
+    # differences, which -inf at a document start would make nan; then up to i - 1.
+    upto = jnp.cumsum(jnp.where(later, log[..., None], 0), 1)
+    between = jnp.pad(upto, [(0, 0), (1, 0), (0, 0), (0, 0)])[:, :-1]
+    decays = jnp.where(later, jnp.exp(between), 0)
+    before = jnp.einsum("bihj,bjhkv->bihkv", decays, B)
+    S = A[:, -1, ..., None] * before[:, -1] + B[:, -1]
+    total = jnp.cumsum(log, 1)
+    starts = jnp.exp(jnp.pad(total, [(0, 0), (1, 0), (0, 0)])[:, :-1])
+    return before, S, jnp.exp(total[:, -1, :, None]), starts
 
 
 def _then(A: Transition, S: Float[Array, "b h *rest"]) -> Float[Array, "b h *rest"]:
