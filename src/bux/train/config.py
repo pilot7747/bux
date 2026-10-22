@@ -365,6 +365,8 @@ class MethodsConfig(Config):
     rounds: Positive = 1  # times a circular pipeline sends a microbatch round
     orthogonalize: str = "gspmd"  # how Muon reaches whole matrices
     microbatches: Positive = 1
+    # A step's new state takes the old one's memory: a lower peak, in fewer pieces.
+    donate: bool = False
 
 
 class TrainConfig(Config):

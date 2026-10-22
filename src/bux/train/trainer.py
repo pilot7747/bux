@@ -127,9 +127,9 @@ class Trainer:
     Made inside ``parallel.use``, it puts its state on the shardings the layout gives
     it, and every step keeps it there.
 
-    A training step donates the model's and the optimizer's arrays, so that their new
-    state takes the old one's memory: an array read from them before a step is gone
-    after it, and one to keep is a copy (``np.asarray``).
+    With `donate`, a training step donates the model's and the optimizer's arrays, so
+    that their new state takes the old one's memory: an array read from them before a
+    step is gone after it, and one to keep is a copy (``np.asarray``).
     """
 
     def __init__(
@@ -140,6 +140,7 @@ class Trainer:
         *,
         compute: DTypeLike = jnp.float32,
         microbatches: int = 1,
+        donate: bool = False,
     ):
         self.model, self.objective = model, objective
         self.compute, self.microbatches = jnp.dtype(compute), microbatches
@@ -147,7 +148,7 @@ class Trainer:
         parallel.shard_state(self.model, self.optimizer)
         self.step = 0
         self.stopping = False  # set, by a signal handler say, to stop after this step
-        donated = ("model", "optimizer")
+        donated = ("model", "optimizer") if donate else ()
         self._train = nnx.jit(self._train_step_on_shards, donate_argnames=donated)
         self._eval = nnx.jit(self.eval_step)
 
@@ -343,6 +344,7 @@ def train(
             objective(config.loss, run.arch),
             compute=config.precision.compute,
             microbatches=_accumulated(config.methods.microbatches),
+            donate=config.methods.donate,
         )
         make_batches = functools.partial(
             batches, config=config, vocab_size=vocab, cache=cache

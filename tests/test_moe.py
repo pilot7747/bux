@@ -121,7 +121,7 @@ def test_a_train_step_moves_the_bias_eval_does_not_and_checkpoints_keep_it(tmp_p
     eager = nnx.clone(model)
     eager.training_outputs(jnp.asarray(batch.input_ids))
     trainer.train_on_batch(batch)
-    first = np.asarray(bias(model))  # a copy: the next step donates the model's
+    first = bias(model)
     assert jnp.array_equal(first, bias(eager)) and (first != 0).any()
     trainer.train_on_batch(batch)  # from where the first step left it
     assert jnp.allclose(jnp.abs(bias(model) - first).max(), 1e-3)

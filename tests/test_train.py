@@ -376,6 +376,7 @@ def test_a_run_writes_its_directory_and_resumes_where_it_stopped(tmp_path):
         "checkpoint = checkpoint(every=3)",
         "eval = eval(data=synthetic, every=3, batches=2)",
         "ffn.dropout = 0.1",  # whose random keys the checkpoint keeps
+        "methods = methods(donate=true)",  # saved, then donated to the next step
     )
     whole = train(run, tmp_path, echo=lambda _: None)
     folder = directory(run, tmp_path)
@@ -517,19 +518,18 @@ def test_the_log_reports_mfu_where_the_devices_peak_is_known():
     assert latest.metrics["mfu"] == pytest.approx(steps_per_s * 4e6 / 1e9)
 
 
-def test_a_step_takes_the_memory_of_the_state_it_replaces():
+@pytest.mark.parametrize("donate", [False, True])
+def test_a_step_that_donates_takes_the_memory_of_the_state_it_replaces(donate):
     arch = compile(ARCH + "model = embed block norm head\n")
-    trainer = Trainer(
-        Model(arch, rngs=nnx.Rngs(0)),
-        optax.adamw(1e-3),
-        objective(tcfg.LossConfig(), arch),
-    )
+    loss = objective(tcfg.LossConfig(), arch)
+    model = Model(arch, rngs=nnx.Rngs(0))
+    trainer = Trainer(model, optax.adamw(1e-3), loss, donate=donate)
     data = batches(tcfg.SyntheticConfig(), rows(tcfg.SyntheticConfig(), 2, 8), 32)
     batch = jax.device_put(next(data))
     step = trainer._train.lower(trainer.model, trainer.optimizer, batch).compile()
     state = sum(x.nbytes for x in jax.tree.leaves(trainer.state()))
     memory = step.memory_analysis()
-    assert memory is not None and memory.alias_size_in_bytes == state
+    assert memory is not None and memory.alias_size_in_bytes == donate * state
 
 
 def test_a_run_reports_what_hooks_of_ones_own_return(tmp_path):
