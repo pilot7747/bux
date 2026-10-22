@@ -708,15 +708,24 @@ elementwise ones into the ops that read them and keeps none: a norm's float32 co
 the stream, an MLP's activation, a token's copy for each of its experts. So under
 `none` a scanned pass keeps all but what elementwise ops and those that only move or
 retype data make (`remat.CHEAP`), and its backward computes those again
-(`remat.unfused`). The temp memory of the compiled train step on a B300, for a 1B
-dense model (`A^16`), a Gated DeltaNet hybrid (`"DDDA"^4`) and a 64-expert MoE
-(`E^16`), in bfloat16 on 8 rows of 4096 tokens:
+(`remat.unfused`). Nor does a training step cast the stacked parameters to its compute
+dtype, which would keep a copy of them all, and of their gradients: each pass casts its
+own as it runs (`Scanned.compute`). On a B300, for a 1B dense model (`A^16`), a Gated
+DeltaNet hybrid (`"DDDA"^4`) and a 64-expert MoE (`E^16`), in bfloat16 on 8 rows of
+4096 tokens, the temp memory of the compiled train step, and tokens a second:
 
-| model | unrolled  | scanned, keeping everything | scanned  |
-|-------|-----------|-----------------------------|----------|
-| dense | 56.2 GiB  | 90.7 GiB                    | 48.7 GiB |
-| GDN   | 124.9 GiB | 213.8 GiB, out of memory    | 88.3 GiB |
-| MoE   | 95.8 GiB  | 131.7 GiB, out of memory    | 88.1 GiB |
+| model         | memory: unrolled | scanned, before | scanned  | tokens: unrolled | scanned |
+|---------------|------------------|-----------------|----------|------------------|---------|
+| dense         | 56.2 GiB         | 90.7 GiB        | 47.3 GiB | 145k             | 138k    |
+| GDN           | 124.9 GiB        | 213.8 GiB, OOM  | 86.7 GiB | 94k              | 78k     |
+| MoE           | 95.8 GiB         | 131.7 GiB, OOM  | 80.0 GiB | 106k             | 91k     |
+| dense, fsdp=8 |                  |                 |          | 592k             | 670k    |
+
+("Before" kept every value its backward reads, and the cast copy.) On one GPU a scan
+is still slower: it copies each value it keeps into its stack and back out, where
+unrolled layers read it where it was made, and the more it keeps the more it copies:
+the GDN hybrid's float32 chunk states. On eight, one row each, it is faster, and it
+compiles 2.3 times as fast.
 
 On one CPU, for the gradient of a 24-layer Llama's forward (`d_model=64`, 8 rows of
 128 tokens), and for its first training step, which compiles it:
