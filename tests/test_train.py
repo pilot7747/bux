@@ -6,6 +6,7 @@ import itertools
 import json
 import re
 import shutil
+import threading
 from pathlib import Path
 
 import jax
@@ -25,7 +26,7 @@ from bux.data.pipeline import jobs
 from bux.lang import compile, compile_runs
 from bux.train import config as tcfg
 from bux.train import flops
-from bux.train.data import batches, plain
+from bux.train.data import batches, plain, prefetch
 from bux.train.hooks import Hook, Log, Profile
 from bux.train.objective import (
     Term,
@@ -302,6 +303,25 @@ def test_a_mixture_draws_in_proportion(tmp_path):
     )
     tokens = next(batches(mix, rows(mix, 4000, 4), 2)).input_ids
     assert tokens[:, 0].mean() == 0.25
+
+
+def test_prefetch_keeps_the_order_raises_what_its_thread_met_and_stops_when_closed():
+    def shards():
+        yield from range(3)
+        raise FileNotFoundError("no shards match")
+
+    early = prefetch(shards(), lambda x: 10 * x)
+    assert [next(early) for _ in range(3)] == [0, 10, 20]
+    with pytest.raises(FileNotFoundError, match="no shards match"):
+        next(early)
+    assert list(prefetch(iter("ab"), str.upper)) == ["A", "B"]
+    put: list[int] = []
+    threads = threading.active_count()
+    endless = prefetch(itertools.count(), lambda x: put.append(x) or x, ahead=2)
+    assert next(endless) == 0
+    endless.close()
+    assert len(put) <= 4  # the one taken, the two ahead, and one on its way
+    assert threading.active_count() == threads
 
 
 def test_heads_predict_further_ahead_after_each_nextn():

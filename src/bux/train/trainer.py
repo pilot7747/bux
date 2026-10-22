@@ -41,7 +41,7 @@ from bux.data.pipeline import DEFAULT_CACHE, jobs, prepare
 from bux.lang import ir
 from bux.lang.printer import run_to_source
 from bux.train import flops
-from bux.train.data import Batch, batches
+from bux.train.data import Batch, batches, prefetch
 from bux.train.hooks import Checkpoint, Eval, Hook, Log, Profile
 from bux.train.objective import Metrics, Objective, objective, target_mask
 from bux.train.optim import Schedule, lr_multiplier, lr_schedule, optimizer
@@ -278,16 +278,19 @@ class Trainer:
         sinks: Sequence[Sink] = (),
     ) -> None:
         """Train on `data` to step `steps`, or until `stopping` is set, after which
-        every hook's `stop` runs. After every step, the hooks due run in order, and
-        what they return goes to every sink. All of them close at the end, or when
-        training stops."""
+        every hook's `stop` runs; the next batches go to the devices as a step runs
+        (``prefetch``). After every step, the hooks due run in order, and what they
+        return goes to every sink. All of them close at the end, or when training
+        stops."""
         with contextlib.ExitStack() as stack:
             for block in (*sinks, *hooks):
                 stack.callback(block.close)
             for hook in hooks:
                 hook.start(self)
+            put = prefetch(data, parallel.shard_batch)
+            on_devices = stack.enter_context(contextlib.closing(put))
             while self.step < steps and not self.stopping:
-                metrics = self.train_on_batch(next(data))
+                metrics = self.train_on_batch(next(on_devices))
                 for hook in hooks:
                     if hook.due(self.step, steps) and (scalars := hook(self, metrics)):
                         for sink in sinks:
