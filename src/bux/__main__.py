@@ -28,19 +28,19 @@ if TYPE_CHECKING:  # imported where used: jax and the backend are slow to import
 
 
 def _si(n: float) -> str:
-    for suffix, scale in (("T", 1e12), ("B", 1e9), ("M", 1e6), ("k", 1e3)):
-        if n >= scale:
-            return f"{n / scale:.3g}{suffix}"
-    return f"{n:g}"
+    for suffix, scale in (("", 1), ("k", 1e3), ("M", 1e6), ("B", 1e9)):
+        if "e" not in (shown := f"{n / scale:.3g}"):
+            return shown + suffix
+    return f"{n / 1e12:.3g}T"
 
 
 def _bytes(n: int | None) -> str:
     if n is None:
         return "?"
-    for suffix, power in (("TiB", 40), ("GiB", 30), ("MiB", 20), ("KiB", 10)):
-        if n >= 2**power:
-            return f"{n / 2**power:.3g}{suffix}"
-    return f"{n}B"
+    for suffix, power in (("B", 0), ("KiB", 10), ("MiB", 20), ("GiB", 30)):
+        if "e" not in (shown := f"{n / 2**power:.3g}"):
+            return shown + suffix
+    return f"{n / 2**40:.3g}TiB"
 
 
 def summary(arch: Architecture) -> str:
@@ -74,7 +74,10 @@ def abstract(
 ) -> "tuple[nnx.Module, nnx.Optimizer] | None":
     """Build the run's model and optimizer from shapes alone; None if the backend
     lacks a layer. Under the run's mesh on `gpus` GPUs if it fits, with repeats
-    scanned and pipelined as the methods say, else outside any mesh."""
+    scanned and pipelined as the methods say, else outside any mesh.
+
+    ``graph_updates=False`` skips flax's sharding of the shapes, which under a mesh
+    fails on the masked nodes in Muon's state; ``memory`` shards them itself."""
     import jax.numpy as jnp
     from flax import nnx
 
@@ -93,9 +96,9 @@ def abstract(
     grid = None if gpus is None else _grid(run, gpus)
     try:
         if grid is None:
-            return nnx.eval_shape(make)
+            return nnx.eval_shape(make, graph_updates=False)
         with parallel.use(grid, t.layout, t.methods):
-            return nnx.eval_shape(make)
+            return nnx.eval_shape(make, graph_updates=False)
     except NotImplementedError:
         return None
 

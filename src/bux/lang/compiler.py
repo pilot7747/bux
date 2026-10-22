@@ -147,6 +147,16 @@ def _unwrap(value: object) -> object:
     return value
 
 
+def _config_type(value: object) -> type[cfg.Config] | None:
+    """Return the class of a config, or of a bare layer or setting type."""
+    match value:
+        case cfg.Config():
+            return type(value)
+        case _Builtin(name=name) if name in TYPES:
+            return TYPES[name]
+    return None
+
+
 def _is_number(value: object) -> bool:
     value = _unwrap(value)
     return isinstance(value, int | float) and not isinstance(value, bool)
@@ -688,13 +698,13 @@ class _Evaluator:
                 fields, ports = self.arguments(expr, scope, TYPES[name])
                 config = self.construct(name, fields, expr.span)
                 return self.with_ports(config, ports, None, None, expr.span)
-            case _Named(label=label, share=share) if isinstance(
-                _unwrap(callee), cfg.Config
+            case _Named(label=label, share=share) if cls := _config_type(
+                base := _unwrap(callee)
             ):
-                base = typing.cast(cfg.Config, _unwrap(callee))
-                fields, ports = self.arguments(expr, scope, type(base))
+                fields, ports = self.arguments(expr, scope, cls)
                 if not fields:
-                    return self.with_ports(base, ports, label, share, expr.span)
+                    config = self.amended(base, fields, expr.span)
+                    return self.with_ports(config, ports, label, share, expr.span)
                 # An amendment redefines a shared layer, which stays one module.
                 if share and not expr.amend:
                     raise BuxError(
@@ -702,7 +712,7 @@ class _Evaluator:
                         expr.span,
                         "define a separate layer",
                     )
-                config = self.override(base, fields, expr.span)
+                config = self.amended(base, fields, expr.span)
                 return self.with_ports(
                     config, ports, self.text(expr.span), None, expr.span
                 )
@@ -710,8 +720,17 @@ class _Evaluator:
                 raise self.unknown(name, expr.name_span, called=True)
         raise self.not_callable(expr, callee)
 
+    def amended(self, base: object, fields: _Fields, span: Span) -> cfg.Config:
+        """Return the config `base` with `fields` set; a bare type, as in
+        ``norm = rmsnorm``, is its builtin called with them."""
+        if isinstance(base, _Builtin):
+            return self.construct(base.name, fields, span)
+        base = typing.cast(cfg.Config, base)
+        return self.override(base, fields, span) if fields else base
+
     def not_callable(self, expr: ast.Call, callee: object) -> BuxError:
-        what = "an activation" if isinstance(callee, _Builtin) else _describe(callee)
+        builtin = isinstance(_unwrap(callee), _Builtin)
+        what = "an activation" if builtin else _describe(callee)
         if expr.amend:
             return BuxError(
                 f"'{expr.name}' is {what}, which has no settings to amend",

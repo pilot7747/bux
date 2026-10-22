@@ -217,11 +217,25 @@ def test_an_amendment_keeps_a_layer_shared():
     assert {c.num_kv_heads for c in layers(run, cfg.GQAConfig)} == {1}
 
 
+def test_an_amendment_reaches_a_layer_or_setting_defined_by_a_bare_type():
+    source = ARCH + TRAIN + "layout = layout\nnorm.eps = 1e-3\nlayout.zero = 1"
+    [run] = runs(source)
+    assert {c.eps for c in layers(run, cfg.NormalizationConfig)} == {1e-3}
+    assert run.train.layout.zero == 1
+    bare = "attn = gqa\nattn.num_heads = 2\nattn.num_kv_heads = 1"
+    [run] = runs(RUN + bare)
+    assert layer(run, cfg.GQAConfig).num_kv_heads == 1
+    swept = ARCH + TRAIN + "methods = a: methods | b: methods(microbatches=4)"
+    amended = runs(swept, overrides=["methods = methods(microbatches=2)"])
+    assert [r.train.methods.microbatches for r in amended] == [2, 2]
+
+
 @pytest.mark.parametrize(
     ("source", "message"),
     [
         ("foo.bar = 1", "nothing defines 'foo' for this to amend"),
         ("block.bar = 1", "'block' is a block, which has no settings to amend"),
+        ("act = gelu\nact.x = 1", "'act' is an activation, which has no settings"),
         ("optimizer.lr = 1\noptimizer.lr = 2", "'lr' is given twice"),
     ],
 )

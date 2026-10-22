@@ -5,8 +5,11 @@
 
 On every visible GPU, an even number of them, each method of methods.moe on each
 mesh: the MoE layer's output and gradients against `sorted` on one GPU, then a short
-run's losses against one GPU's, and its tokens a second. It exits 1 if anything
-differs. If NCCL's ragged all-to-all hangs, as it was reported to on jax 0.11, try
+run's losses against one GPU's, and its tokens a second. It exits 1 if the layer or
+the first loss differs by more than 1e-4, or any later loss by more than 1e-3:
+rounding differs between splits, and the top-k picks and the updates after them
+amplify it as the run goes on (examples/experiments/parallel/laptop.bux). If NCCL's
+ragged all-to-all hangs, as it was reported to on jax 0.11, try
 XLA_FLAGS=--xla_gpu_experimental_ragged_all_to_all_use_barrier_with_nccl=false.
 """
 
@@ -21,7 +24,7 @@ from flax import nnx
 
 from bux import config as cfg
 from bux import parallel
-from bux.architecture.moe import MoE
+from bux.architecture import MoE, Taps
 from bux.lang import compile_runs
 from bux.train import config as tcfg
 from bux.train.sinks import Scalars, Sink
@@ -67,8 +70,8 @@ def layer(mesh: dict[str, int], method: str) -> list[np.ndarray]:
     grid, methods = tcfg.MeshConfig.model_validate(mesh), tcfg.MethodsConfig(moe=method)
     with parallel.use(grid, methods=methods):
         e = parallel.build(lambda: MoE(c, 128, nnx.Rngs(0)))
-        y = nnx.jit(lambda e, x: e(x, {}))(e, x)
-        g = nnx.jit(nnx.grad(lambda e, x: (e(x, {}) * probe).sum(), argnums=(0, 1)))
+        y = nnx.jit(lambda e, x: e(x, Taps()))(e, x)
+        g = nnx.jit(nnx.grad(lambda e, x: (e(x, Taps()) * probe).sum(), argnums=(0, 1)))
         return jax.tree.leaves(jax.device_get((y, g(e, x))))
 
 
@@ -115,11 +118,11 @@ def main() -> int:
         for method in METHODS:
             out = differs(layer(mesh, method), ref)
             losses, speed = run(mesh, method, steps)
-            loss = differs(losses, one)
-            failed |= out > 1e-4 or loss > 1e-4
+            first, loss = differs(losses[:1], one[:1]), differs(losses, one)
+            failed |= out > 1e-4 or first > 1e-4 or loss > 1e-3
             print(
-                f"{source(mesh):28} {method:18} {speed:,.0f} tok/s; "
-                f"off by {out:.1e} in the layer, {loss:.1e} in the losses",
+                f"{source(mesh):28} {method:18} {speed:,.0f} tok/s; off by {out:.1e} "
+                f"in the layer, {first:.1e} in the first loss, {loss:.1e} in all",
                 flush=True,
             )
     return int(failed)

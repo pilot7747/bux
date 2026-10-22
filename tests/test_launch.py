@@ -15,7 +15,7 @@ from types import SimpleNamespace
 import pytest
 
 import bux.launch
-from bux.__main__ import abstract, main, memory
+from bux.__main__ import _bytes, _si, abstract, main, memory
 from bux.lang import compile_runs
 from bux.launch import Stop, fit, launch, need, processes, status, summary
 from bux.train.config import MeshConfig
@@ -326,3 +326,17 @@ def test_the_plan_says_each_runs_gpus_and_its_bytes_on_each(capsys):
     assert split is not None and whole is not None
     assert split[0] * 8 == whole[0]  # every parameter of the smoke model splits
     assert split[1] == pytest.approx(whole[1] / 8, rel=1e-3)  # and its moments
+
+
+def test_the_plan_shows_three_digits_never_an_exponent():
+    assert _bytes(1010 * 2**20) == "0.986GiB" and _bytes(609 * 2**10) == "609KiB"
+    assert _bytes(512) == "512B" and _bytes(3 * 2**40) == "3TiB"
+    assert _si(999_600) == "1M" and _si(25_600) == "25.6k" and _si(512) == "512"
+    assert _si(10e9) == "10B" and _si(70.6e9) == "70.6B"
+
+
+def test_the_plan_sizes_muons_state_on_a_mesh(capsys):
+    muon = ("optimizer = muon(lr=0.02)", "mesh = mesh(fsdp=8)")
+    assert main(["plan", str(SMOKE), *muon]) == 0  # its state holds masked nodes
+    row = capsys.readouterr().out.splitlines()[-1].split()
+    assert row[4] == "8" and "?" not in row[5:7]
