@@ -84,17 +84,15 @@ def chunk(xs: Positions, shared: Shared, transition: bool) -> Chunk:
     its state n by p per head, as keys by values. With `transition`, also return the
     product P of every position's exp(dt A), and each output's reads P C.
 
-    With one A per head, as Mamba-2's, it is decayed linear attention with q = C,
-    k = dt B, v = x and a log decay of dt A a head: by smaller chunks, with matmuls
-    within each (``chunkwise``). Mamba's, one A per channel and state dim, runs
-    `stepwise`."""
+    With one A per head, as Mamba-2's, it is decayed linear attention with q = C and
+    k = B, a group's, v = dt x and a log decay of dt A a head: by smaller chunks, with
+    matmuls within each (``chunkwise``). Mamba's, one A per channel and state dim,
+    runs `stepwise`."""
     if shared[0].shape[-1] > 1:
         return stepwise(xs, shared, transition)
     x, dt, B, C, keep = (a.astype(jnp.float32) for a in xs)
-    per_group = x.shape[2] // B.shape[2]
-    B, C = (jnp.repeat(y, per_group, axis=2) for y in (B, C))
     log_decay = dt[..., None] * shared[0].astype(jnp.float32)
-    return chunkwise.chunk((C, dt[..., None] * B, x, log_decay, keep), transition)
+    return chunkwise.chunk((C, B, dt[..., None] * x, log_decay, keep), transition)
 
 
 def stepwise(xs: Positions, shared: Shared, transition: bool) -> Chunk:

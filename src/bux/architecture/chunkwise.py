@@ -38,6 +38,7 @@ SIZE = 64  # positions per chunk
 SUB = 16  # positions per block of a chunk, for a decay per key channel
 
 Chunks = Float[Array, "b n h c _"]  # (b, n, h, C, ...): n chunks of C positions
+Grouped = Float[Array, "b n g c _"]  # chunks of g heads, or of groups of h
 Pairs = Float[Array, "b n h c c"]  # of each position of a chunk with each
 States = Float[Array, "b n h dk dv"]  # one state per chunk
 Maps = Float[Array, "b n h dk dk"] | Float[Array, "b n h _"]  # A per chunk, or diagonal
@@ -47,15 +48,21 @@ def chunk(xs: Positions, transition: bool, size: int = SIZE, sub: int = SUB) -> 
     """Run ``linear_attention.chunk``'s `xs` (q, k, v, log decay, continues, and a
     and b if any) from a zero state, in float32, by chunks of `size` positions; with
     `transition`, also return its map of a start state, and the reads. The delta
-    rule's xs have a and no b, which is k: `_delta` takes them in half the work."""
+    rule's xs have a and no b, which is k: `_delta` takes them in half the work. With
+    one decay a head and no a or b, q and k may be of fewer heads than v, each shared
+    by a group of them, as Mamba-2's C and B: `_scalar` takes them."""
     delta = len(xs) == 6
     xs = tuple(shard_whole_positions(x) for x in xs)
     q, k, v, g, *ab = (_split(x.astype(jnp.float32), size) for x in xs[:4] + xs[5:])
     starts = 1 - xs[4].astype(jnp.float32)  # 1 where a document starts
     seg = jnp.cumsum(_split(starts[..., None, None], size)[:, :, :, :, 0], -1)
-    affine = _delta if delta else _affine
-    R, O, A, B = affine(q, k, v, g, seg, *ab[: 1 if delta else 2], sub=min(sub, size))
-    out, state, P, reads = _across(R, O, A, B, transition)
+    if g.shape[-1] == 1 and not ab:
+        out, state, P, reads = _scalar(q, k, v, g, seg, transition)
+    else:
+        affine = _delta if delta else _affine
+        ab = ab[: 1 if delta else 2]
+        R, O, A, B = affine(q, k, v, g, seg, *ab, sub=min(sub, size))
+        out, state, P, reads = _across(R, O, A, B, transition)
     t = xs[0].shape[1]
     reads = None if reads is None else shard_whole_positions(_merge(reads, t))
     return Chunk(shard_whole_positions(_merge(out, t)), state, P, reads)
@@ -156,9 +163,46 @@ def _delta(
     return jnp.where(reach, q * jnp.exp(G), 0) + M @ W, M @ X, A, kd @ X
 
 
+def _scalar(
+    q: Grouped,
+    k: Grouped,
+    v: Chunks,
+    g: Chunks,
+    seg: Float[Array, "b n 1 c"],
+    transition: bool,
+) -> tuple[Chunks, Float[Array, "b h dk dv"], Transition | None, Chunks | None]:
+    """Return `_across`'s outputs, end state, P and reads for one decay a head and no
+    a or b, where q and k may be of groups of v's heads. The decays scale v and the
+    outputs, not q and k, so that a group's q and k reach all its heads at once: what
+    a chunk adds to the state is K^T V of every head of a group in one matmul, and so
+    is what its outputs read of the state before it, which `_passed` gives."""
+    G, _, end, reach, same, tail = _decays(g, seg)
+    O = _pairwise(q, k, G, G, same, False, 1) @ v
+    vd = jnp.where(tail, v * jnp.exp(end - G), 0)  # Gamma(C, s) v_s
+    adds = _by_group("bzgck,bzgrcv->bzgrkv", k, vd)
+    A = jnp.where(reach[..., -1, :], jnp.exp(end[..., 0, :]), 0)
+    before, S, P, starts = _passed(A, adds)
+    decay = jnp.where(reach, jnp.exp(G), 0)  # Gamma(t, 0)
+    out = O + decay * _by_group("bzgck,bzgrkv->bzgrcv", q, before)
+    if not transition:
+        return out, S, None, None
+    return out, S, P, _shared(q, v.shape[2]) * decay * starts[..., None, None]
+
+
+def _by_group(
+    spec: str, x: Grouped, y: Float[Array, "b n h ..."]
+) -> Float[Array, "b n h ..."]:
+    """Return the einsum `spec` of x, of groups g, and y, of their heads, which it
+    takes as (g, r): r heads a group."""
+    b, n, h = y.shape[:3]
+    groups = x.shape[2]
+    out = jnp.einsum(spec, x, y.reshape(b, n, groups, h // groups, *y.shape[3:]))
+    return out.reshape(b, n, h, *out.shape[4:])
+
+
 def _pairwise(
-    x: Chunks,
-    y: Chunks,
+    x: Grouped,
+    y: Grouped,
     gx: Chunks,
     gy: Chunks,
     same: Bool[Array, "b n 1 c c"],
@@ -166,15 +210,21 @@ def _pairwise(
     sub: int,
 ) -> Pairs:
     """Return sum_c x[t, c] y[s, c] exp(gx[t, c] - gy[s, c]) for s before t (or at t,
-    unless `strict`) of the `same` document, else 0; gx <= gy at every such pair."""
+    unless `strict`) of the `same` document, else 0; gx <= gy at every such pair. With
+    one decay per head, x and y may be of groups of gx's heads."""
     c = x.shape[-2]
     index = jnp.arange(c)
     lower = index[:, None] > index[None, :] if strict else index[:, None] >= index
     visible = same & lower
     if gx.shape[-1] == 1:  # one decay per head: a matmul, then the decays
         gap = jnp.where(visible, gx - jnp.swapaxes(gy, -1, -2), -jnp.inf)
-        return (x @ jnp.swapaxes(y, -1, -2)) * jnp.exp(gap)
+        return _shared(x @ jnp.swapaxes(y, -1, -2), gx.shape[2]) * jnp.exp(gap)
     return jnp.where(visible, _channels(x, y, gx, gy, lower, sub), 0)
+
+
+def _shared(x: Float[Array, "b n g ..."], heads: int) -> Float[Array, "b n h ..."]:
+    """Share each group's x, (b, n, groups, ...), out to its heads."""
+    return jnp.repeat(x, heads // x.shape[2], axis=2)
 
 
 # Rematerialized: a pair's decays, sub times the input, would stay for the backward.
@@ -271,15 +321,10 @@ def _across(
     """Return the chunks' outputs, from a zero state that each carries to the next,
     and the state they end with; with `transition`, also the map P of a start state
     that they make together, and the outputs' reads R P. Matrices A carry the state by
-    ``affine_scan``'s kernel, scalars by `_passed`, and the outputs read it in one
-    batched matmul."""
+    ``affine_scan``'s kernel, and the outputs read it in one batched matmul."""
     if A.ndim == 5 and not transition:
         before, S = affine_scan.states(A, B)
         return O + R @ before, S, None, None
-    if A.ndim == 4 and A.shape[-1] == 1:
-        before, S, P, starts = _passed(A, B)
-        reads = R * starts[..., None, None] if transition else None
-        return O + R @ before, S, P if transition else None, reads
     R, O, A, B = (jnp.moveaxis(x, 1, 0) for x in (R, O, A, B))
     P = None
     if transition:

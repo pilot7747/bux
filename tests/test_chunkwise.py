@@ -78,6 +78,20 @@ def test_chunks_differentiate_as_positions_do(decay, rank_one, strong):
         np.testing.assert_allclose(a, b, atol=5e-5, rtol=5e-5, err_msg=str(i))
 
 
+@pytest.mark.parametrize("strong", [False, True])
+@pytest.mark.parametrize(("size", "sub"), [(4, 2), (64, 16)])
+def test_q_and_k_of_a_group_are_its_heads(strong, size, sub):
+    """With one decay a head, one q and k for both heads, as Mamba-2's C and B."""
+    q, k, v, g, continues = _inputs(1, False, strong)
+    q, k = q[:, :, :1], k[:, :, :1]
+    got = chunkwise.chunk((q, k, v, g, continues), True, size, sub)
+    shared = (jnp.repeat(q, H, 2), jnp.repeat(k, H, 2), v, g, continues)
+    want = stepwise(shared, (), True)
+    for name in ("out", "state", "transition", "reads"):
+        a, b = getattr(got, name), getattr(want, name)
+        np.testing.assert_allclose(a, b, atol=2e-5, rtol=2e-5, err_msg=name)
+
+
 def test_keys_alike_with_steps_near_one_stay_finite():
     """Keys nearly equal, as a trained model's can be, with steps beta near 1: the
     powers of L grow as 64^n here, though the inverse does not."""
