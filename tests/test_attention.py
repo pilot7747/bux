@@ -16,7 +16,6 @@ from jax.sharding import PartitionSpec as P
 from bux import config as cfg
 from bux import parallel
 from bux.architecture import (
-    SEGMENTS,
     Attention,
     Indexer,
     Model,
@@ -25,10 +24,10 @@ from bux.architecture import (
     Taps,
     num_params,
 )
+from bux.architecture.attention import build_gqa
 from bux.architecture.csa import CSA
 from bux.architecture.indexer import _top
-from bux.architecture.mla import MLA
-from bux.architecture.registry import LOSSES
+from bux.architecture.mla import MLA, build_mla
 from bux.architecture.rope import rotate
 from bux.lang import compile, compile_runs, ir
 from bux.train import config as tcfg
@@ -223,20 +222,20 @@ def test_mla_is_deepseeks_attention():
     logits += jnp.einsum("bthr,bsr->bhts", q_rope, k_rope[:, :, 0])
     logits = jnp.where(causal(t)[:, None], logits * mla.scale, -jnp.inf)
     out = jnp.einsum("bhts,bshv->bthv", jax.nn.softmax(logits), kv[..., 6:])
-    assert jnp.allclose(mla(x, {}), mla.o(out.reshape(b, t, -1)), atol=1e-5)
+    assert jnp.allclose(mla(x, Taps()), mla.o(out.reshape(b, t, -1)), atol=1e-5)
 
 
 def test_mla_without_rope_sees_no_positions():
     c = cfg.MLAConfig(num_heads=2, kv_lora_rank=8, rope=None)
     mla = MLA(c, D, (), nnx.Rngs(0))
     x = inputs()
-    shifted = {SEGMENTS: [Segments.of(jnp.arange(12)[None].repeat(2, 0) + 100)]}
-    assert jnp.allclose(mla(x, shifted), mla(x, {}), atol=1e-5)
+    shifted = Taps(segments=Segments.of(jnp.arange(12)[None].repeat(2, 0) + 100))
+    assert jnp.allclose(mla(x, shifted), mla(x, Taps()), atol=1e-5)
 
 
 def gqa(ports=(), **kw):
     c = cfg.GQAConfig(num_heads=4, num_kv_heads=2, rope=cfg.RoPEConfig(), **kw)
-    return Attention(c, D, ports, nnx.Rngs(0))
+    return build_gqa(c, D, ports, nnx.Rngs(0))
 
 
 def gqa_heads(attn, x):
@@ -271,7 +270,7 @@ def mla(indexer=None):
         v_head_dim=5,
         indexer=indexer,
     )
-    return MLA(c, D, (), nnx.Rngs(0))
+    return build_mla(c, D, (), nnx.Rngs(0))
 
 
 INDEXERS = {
@@ -292,9 +291,9 @@ def test_an_indexer_that_keeps_every_key_is_dense_attention(make):
     others as without it."""
     every = cfg.SparseIndexerConfig(num_heads=2, head_dim=8, top_k=12)
     x = inputs()
-    assert jnp.allclose(make(every)(x, {}), make(None)(x, {}), atol=1e-5)
+    assert jnp.allclose(make(every)(x, Taps()), make(None)(x, Taps()), atol=1e-5)
     few = cfg.SparseIndexerConfig(num_heads=2, head_dim=8, top_k=3)
-    assert not jnp.allclose(make(few)(x, {}), make(None)(x, {}), atol=1e-3)
+    assert not jnp.allclose(make(few)(x, Taps()), make(None)(x, Taps()), atol=1e-3)
 
 
 @pytest.mark.parametrize("weighted", [True, False])
@@ -302,7 +301,7 @@ def test_a_small_top_k_attends_to_the_best_scored_keys_only(weighted):
     c = cfg.SparseIndexerConfig(num_heads=2, head_dim=8, top_k=3, weighted=weighted)
     attn = gqa(index_port("write"), indexer=c)
     assert attn.indexer is not None
-    x, taps = inputs(), {}
+    x, taps = inputs(), Taps()
     y = attn(x, taps)
     [selected] = taps["topk"]
     # The best 3 of the keys each query sees, by the indexer's scores
@@ -318,7 +317,7 @@ def test_a_small_top_k_attends_to_the_best_scored_keys_only(weighted):
 def test_blocks_are_kept_whole_with_the_querys_unfinished_one():
     c = cfg.SparseIndexerConfig(num_heads=2, head_dim=8, top_k=4, block_size=2)
     attn = gqa(index_port("write"), indexer=c)
-    x, taps = inputs(), {}
+    x, taps = inputs(), Taps()
     y = attn(x, taps)
     [selected] = taps["topk"]
     pairs = selected.reshape(2, 12, 6, 2)
@@ -347,7 +346,7 @@ def test_qsa_keeps_the_blocks_qwen_does():
     ix.q_norm.scale[...] = jax.random.normal(jax.random.key(3), (16,))
     ix.k_norm.scale[...] = jax.random.normal(jax.random.key(4), (16,))
     pos = jnp.concatenate([jnp.arange(9), jnp.arange(23) + 5])[None].repeat(2, 0)
-    x, taps = inputs(length=32), Taps({SEGMENTS: [Segments.of(pos)]})
+    x, taps = inputs(length=32), Taps(segments=Segments.of(pos))
     attn(x, taps)
     [selected] = taps["topk"]
 
@@ -415,7 +414,7 @@ def test_a_layer_reading_index_attends_to_the_writers_selection():
     configured = gqa(index_port("read"), indexer=c)  # reading it, it builds none
     assert reader.indexer is None and configured.indexer is None
     assert num_params(configured) == num_params(reader) == num_params(gqa())
-    x, taps = inputs(), {}
+    x, taps = inputs(), Taps()
     writer(x, taps)
     [selected] = taps["topk"]
     h = inputs(2)
@@ -473,7 +472,7 @@ def csa_reference(attn, x, latents=None, visible=None, window=3):
 def test_csa_without_compression_is_window_attention():
     attn = csa(sliding_window_size=3)
     x = inputs()
-    assert jnp.allclose(attn(x, {}), csa_reference(attn, x), atol=1e-5)
+    assert jnp.allclose(attn(x, Taps()), csa_reference(attn, x), atol=1e-5)
 
 
 def test_the_latent_norm_is_every_latents_and_the_indexer_keys():
@@ -502,7 +501,7 @@ def test_compressed_latents_pool_their_groups():
     visible = jnp.arange(t)[:, None] >= jnp.arange(2, t, 3)[None]
     visible = jnp.broadcast_to(visible, (b, t, 4))
     expected = csa_reference(attn, x, latents, visible)
-    assert jnp.allclose(attn(x, {}), expected, atol=1e-5)
+    assert jnp.allclose(attn(x, Taps()), expected, atol=1e-5)
 
 
 @pytest.mark.parametrize("ratio", [3, 1])
@@ -512,8 +511,8 @@ def test_compressed_latents_are_hidden_until_complete(ratio):
     c = cfg.SparseIndexerConfig(num_heads=2, head_dim=8, top_k=2)
     attn = csa(sliding_window_size=1, compress_ratio=ratio, indexer=c)
     x = inputs()
-    changed = attn(x.at[:, 3].multiply(-2.0), {})
-    differs = (jnp.abs(changed - attn(x, {})) > 1e-6).any(-1).any(0)
+    changed = attn(x.at[:, 3].multiply(-2.0), Taps())
+    differs = (jnp.abs(changed - attn(x, Taps())) > 1e-6).any(-1).any(0)
     complete = 3 + ratio - 1 - 3 % ratio  # the last token of position 3's group
     assert differs[:3].tolist() == [False] * 3 and differs[3]
     assert not differs[4:complete].any() and differs[complete]
@@ -531,7 +530,7 @@ def test_reading_kv_reuses_the_latents_and_their_indexer_keys():
     # With the writer's parameters, which its compressor shifted, it is the writer.
     reader.o_a, reader.o = writer.o_a, writer.o
     reader.indexer.q, reader.indexer.weights = writer.indexer.q, writer.indexer.weights
-    x, taps = inputs(), {}
+    x, taps = inputs(), Taps()
     y = writer(x, taps)
     assert jnp.allclose(reader(x, taps), y, atol=1e-5)
 
@@ -550,7 +549,7 @@ def test_an_indexer_reading_candidates_selects_inside_them():
         ports=(kv.model_copy(update=reads), candidates.model_copy(update=reads),
                ir.Port(name="index", tap="topk", mode="write")),
     )  # fmt: skip
-    x, taps = inputs(), {}
+    x, taps = inputs(), Taps()
     source(x, taps)
     second(inputs(2), taps)
     [inside], [selected] = taps["pool"], taps["topk"]
@@ -580,9 +579,9 @@ def test_the_indexer_loss_is_the_kl_from_the_attention_to_its_top_k(top_k):
     c = cfg.SparseIndexerConfig(num_heads=2, head_dim=8, top_k=top_k, loss_weight=0.5)
     attn = gqa(index_port("write"), indexer=c)
     assert attn.indexer is not None
-    x, taps = inputs(), {LOSSES: []}
+    x, taps = inputs(), Taps(training=True)
     attn(x, taps)
-    [selected], [loss] = taps["topk"], taps[LOSSES]
+    [selected], [loss] = taps["topk"], taps.losses
     assert (loss.name, loss.weight) == ("indexer_loss", 0.5)
     assert top_k < 12 or (selected == causal(12)).all()
     q, k, _ = gqa_heads(attn, x)
@@ -600,9 +599,9 @@ def test_qsas_loss_is_over_the_blocks_kept_each_by_its_most_attended_key():
     attn = gqa(index_port("write"), indexer=c)
     ix = attn.indexer
     assert ix is not None and ix.k is not None and ix.k_norm is not None
-    x, taps = inputs(), {LOSSES: []}
+    x, taps = inputs(), Taps(training=True)
     attn(x, taps)
-    [selected], [loss] = taps["topk"], taps[LOSSES]
+    [selected], [loss] = taps["topk"], taps.losses
     q, k, _ = gqa_heads(attn, x)
     p = attention_probs(q, k, attn.scale, selected).sum(1)
     blocks = p.reshape(2, 12, 6, 2).max(-1)
@@ -622,9 +621,9 @@ def test_csas_loss_is_against_the_attention_its_window_and_sinks_share():
     ix = attn.indexer
     assert ix is not None and attn.q_a is not None and attn.q_a_norm is not None
     assert attn.rope is not None and attn.sinks is not None
-    x, taps = inputs(), {LOSSES: []}
+    x, taps = inputs(), Taps(training=True)
     attn(x, taps)
-    [latents], [selected], [loss] = taps["kv"], taps["index"], taps[LOSSES]
+    [latents], [selected], [loss] = taps["kv"], taps["index"], taps.losses
     query = attn.q_a_norm(attn.q_a(x))
     q = rotate(attn.q(query).reshape(2, 12, 4, 16), attn.rope)
     window = rotate(attn.kv_norm(attn.kv(x))[:, :, None], attn.rope)
@@ -640,17 +639,17 @@ def test_csas_loss_is_against_the_attention_its_window_and_sinks_share():
 @pytest.mark.parametrize("make", INDEXERS.values(), ids=INDEXERS.keys())
 def test_the_indexer_loss_is_reported_in_training_forwards_only(make):
     c = cfg.SparseIndexerConfig(num_heads=2, head_dim=8, top_k=6)
-    layer, x, taps = make(c), inputs(), {}
+    layer, x, taps = make(c), inputs(), Taps()
     y = layer(x, taps)
-    assert LOSSES not in taps
-    taps = {LOSSES: []}
+    assert taps.losses == []
+    taps = Taps(training=True)
     assert jnp.array_equal(layer(x, taps), y)
-    [loss] = taps[LOSSES]
+    [loss] = taps.losses
     assert loss.name == "indexer_loss" and loss.weight == 1.0
     assert bool(jnp.isfinite(loss.value)) and loss.value > 0
-    taps = {LOSSES: []}
+    taps = Taps(training=True)
     make(c.model_copy(update={"loss_weight": 0.0}))(x, taps)
-    assert taps[LOSSES] == []
+    assert taps.losses == []
 
 
 @pytest.mark.parametrize(
@@ -713,9 +712,9 @@ def test_training_on_the_indexer_loss_alone_makes_it_keep_what_attention_attends
         return float((best[0] * best[1]).sum(-1)[:, 4:].mean() / 4)
 
     def loss(attn):
-        taps = {LOSSES: []}
+        taps = Taps(training=True)
         attn(x, taps)
-        return taps[LOSSES][0].value
+        return taps.losses[0].value
 
     @nnx.jit
     def step(attn, optimizer):
@@ -747,7 +746,7 @@ def test_the_indexer_loss_of_documents_packed_in_a_row_is_theirs(body):
     arch = compile(PRELUDE + BODIES[body])
     trainer = Trainer(m, optax.adamw(1e-3), objective(tcfg.LossConfig(), arch))
     batch = Batch(np.asarray(t), np.asarray(positions), np.ones((2, 12), bool))
-    metrics = trainer.update(batch)
+    metrics = trainer.train_on_batch(batch)
     assert np.isclose(metrics["indexer_loss"], packed, atol=1e-5)
     assert np.isfinite(metrics["grad_norm"])
 
@@ -763,9 +762,9 @@ def test_unrotate_inverts_rotate_with_a_gain_on_cos_and_sin():
 def test_dropout_on_the_probabilities_and_the_output():
     dropped = gqa(attention_dropout=0.5, output_dropout=0.5)
     x = inputs()
-    assert not jnp.allclose(dropped(x, {}), dropped(x, {}))
+    assert not jnp.allclose(dropped(x, Taps()), dropped(x, Taps()))
     dropped.eval()
-    assert jnp.allclose(dropped(x, {}), gqa()(x, {}), atol=1e-6)
+    assert jnp.allclose(dropped(x, Taps()), gqa()(x, Taps()), atol=1e-6)
 
 
 @pytest.mark.parametrize(
@@ -790,7 +789,7 @@ def test_a_value_residual_mixes_the_taps_values_into_the_layers(kind, learned, w
         attn.v_mix[...] = jnp.asarray(learned)
     x = inputs()
     first = jax.random.normal(jax.random.key(2), (2, 12, 2, 8))
-    taps = {"v1": [first]}
+    taps = Taps({"v1": [first]})
     attn(x, taps)
     [(_, v)] = taps["kv"]
     a, b = weights

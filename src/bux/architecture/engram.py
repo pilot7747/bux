@@ -13,12 +13,12 @@ from bux import config as cfg
 from bux import parallel
 from bux.architecture.conv import CausalConv
 from bux.architecture.norm import Norm
-from bux.architecture.registry import TOKENS, Context, Taps, register, segments
+from bux.architecture.registry import Context, Taps, register, segments
 from bux.lang import ir
 
 
 def _next_primes(start: int, count: int, taken: set[int]) -> list[int]:
-    """The `count` smallest primes >= start that are not taken yet, which takes them."""
+    """Return the `count` smallest primes >= start not taken yet, and take them."""
     found, n = [], max(start, 2)
     while len(found) < count:
         if n not in taken and all(n % p for p in range(2, math.isqrt(n) + 1)):
@@ -38,7 +38,8 @@ def _ngram_rows(
     pad: Int[ArrayLike, ""],
     within: Int[Array, "b t"] | None = None,
 ) -> Int32[Array, "b t (n-1)*heads"]:
-    """Table rows of the n-grams of 2 to n ids ending at every position, one a head.
+    """Return the table rows of the n-grams of 2 to n ids ending at every position,
+    one per head.
 
     The n-gram of the last j + 1 ids hashes to XOR_{i <= j} ids[t - i] * m_i, in wrapping
     uint32 arithmetic. Positions before the sequence, before the document (by `within`,
@@ -69,14 +70,17 @@ class Engram(nnx.Module):
     share the value. The table's rows split as the vocabulary does (``bux.parallel``),
     and the rest is whole."""
 
+    no_weight_decay = ("table",)
+
     def __init__(
-        self, c: cfg.EngramConfig, width: int | Literal["streams"], ctx: Context
+        self, config: cfg.EngramConfig, width: int | Literal["streams"], ctx: Context
     ):
         d, vocab = ctx.arch.d_model, ctx.arch.vocab_size
         assert vocab is not None
         copies = getattr(ctx.arch.residual, "expansion", 1) if width == "streams" else 1
-        orders, heads = c.max_ngram_size - 1, c.num_heads
-        primes = _next_primes(c.table_size, orders * heads, ctx.primes)
+        n, heads, head_dim = config.max_ngram_size, config.num_heads, config.head_dim
+        orders = n - 1
+        primes = _next_primes(config.table_size, orders * heads, ctx.built.primes)
         offsets = np.cumsum([0, *primes[:-1]])
         self.primes = nnx.Variable(
             jnp.asarray(primes, jnp.uint32).reshape(orders, heads)
@@ -84,41 +88,33 @@ class Engram(nnx.Module):
         self.offsets = nnx.Variable(
             jnp.asarray(offsets, jnp.uint32).reshape(orders, heads)
         )
-        rng = np.random.default_rng(10007 * (ctx.built["engram"] + 1))
-        odd = rng.integers(0, 2**31, c.max_ngram_size) * 2 + 1
+        rng = np.random.default_rng(10007 * (ctx.built.count["engram"] + 1))
+        odd = rng.integers(0, 2**31, n) * 2 + 1
         self.multipliers = nnx.Variable(jnp.asarray(odd, jnp.uint32))
         # A stand-in for the tokenizer's normalized classes, which a checkpoint replaces.
-        self.classes = (
-            nnx.Variable(jnp.arange(vocab) % c.vocab_classes)
-            if c.vocab_classes
-            else None
-        )
+        classes = config.vocab_classes
+        self.classes = nnx.Variable(jnp.arange(vocab) % classes) if classes else None
         init = nnx.initializers.normal(1.0)
-        table = init(ctx.rngs.params(), (sum(primes), c.head_dim))
+        table = init(ctx.rngs.params(), (sum(primes), head_dim))
         self.table = nnx.Param(table, names=("vocab", None))
         self.kv = nnx.Linear(
-            orders * heads * c.head_dim, (copies + 1) * d, use_bias=False, rngs=ctx.rngs
+            orders * heads * head_dim, (copies + 1) * d, use_bias=False, rngs=ctx.rngs
         )
-        self.q_norm, self.k_norm = Norm(c.norm, (copies, d)), Norm(c.norm, (copies, d))
+        norm, size = config.norm, config.conv_size
+        self.q_norm, self.k_norm = Norm(norm, (copies, d)), Norm(norm, (copies, d))
         self.conv = (
-            CausalConv(
-                copies * d,
-                c.conv_size,
-                False,
-                ctx.rngs,
-                dilation=c.max_ngram_size,
-                zero=True,
-            )
-            if c.conv_size
+            CausalConv(copies * d, size, False, ctx.rngs, dilation=n, zero=True)
+            if size
             else None
         )
-        self.conv_norm = Norm(c.norm, (copies, d)) if c.conv_size else None
-        self.boundary = c.boundary_token
+        self.conv_norm = Norm(norm, (copies, d)) if size else None
+        self.boundary = config.boundary_token
 
     def __call__(
         self, x: Float[Array, "b t *copies d"], taps: Taps
     ) -> Float[Array, "b t *copies d"]:
-        tokens = taps[TOKENS][0]
+        tokens = taps.tokens
+        assert tokens is not None
         ids, pad = tokens, self.boundary or 0
         if self.classes is not None:
             ids, pad = self.classes[...][tokens], self.classes[...][pad]
@@ -149,7 +145,7 @@ class Engram(nnx.Module):
             conv = self.conv(self.conv_norm(u).reshape(b, t, n * d), taps)
             u = u + jax.nn.silu(conv).reshape(u.shape)
         y = h + u
-        return parallel.stream(y if x.ndim == 4 else y[..., 0, :])
+        return parallel.shard_stream(y if x.ndim == 4 else y[..., 0, :])
 
 
 @register("engram")

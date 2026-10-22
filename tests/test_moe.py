@@ -12,9 +12,9 @@ from jaxtyping import Array, Float, Int
 
 from bux import config as cfg
 from bux import parallel
-from bux.architecture import Model
+from bux.architecture import Model, Taps
 from bux.architecture.moe import MoE, balance_loss, experts, routed, run_sorted
-from bux.architecture.registry import LOSSES, Loss
+from bux.architecture.registry import Loss
 from bux.lang import compile
 from bux.train import config as tcfg
 from bux.train.data import plain
@@ -77,9 +77,9 @@ def test_the_balance_loss_is_its_closed_form_and_one_when_balanced():
 def test_an_moe_reports_its_balance_loss_in_training_only():
     e = moe_layer(router="sigmoid", aux_loss_coef=0.5, aux_loss_scope="sequence")
     x = jax.random.normal(jax.random.key(1), (2, 5, D))
-    taps: dict[str, list] = {LOSSES: []}
+    taps = Taps(training=True)
     e(x, taps)
-    [loss] = taps[LOSSES]
+    [loss] = taps.losses
     idx, _, _ = e._route(x)
     picks = jax.nn.one_hot(idx, 4).sum(-2)
     scores = jax.nn.sigmoid(e.router(x))
@@ -87,12 +87,12 @@ def test_an_moe_reports_its_balance_loss_in_training_only():
     assert loss.name == "balance_loss" and loss.weight == 0.5
     assert jnp.isclose(loss.value, expected)
     # The weight defaults to 1e-2, and to 0 with the bias, so nothing is reported.
-    assert moe_layer().aux_loss_weight == 1e-2
+    assert moe_layer().config.aux_loss_weight == 1e-2
     free = moe_layer(load_balancing="aux_free")
-    assert free.aux_loss_weight == 0
-    taps = {LOSSES: []}
+    assert free.config.aux_loss_weight == 0
+    taps = Taps(training=True)
     free(x, taps)
-    assert taps[LOSSES] == []
+    assert taps.losses == []
 
 
 def test_training_moves_the_router_bias_toward_the_experts_picked_less():
@@ -101,9 +101,9 @@ def test_training_moves_the_router_bias_toward_the_experts_picked_less():
     x = jax.random.normal(jax.random.key(1), (4, 8, D))
     idx, _, _ = e._route(x)
     load = jax.nn.one_hot(idx, 4).sum((0, 1, 2))
-    e(x, {})  # not a training forward
+    e(x, Taps())  # not a training forward
     assert (e.router_bias[...] == 0).all()
-    e(x, {LOSSES: []})
+    e(x, Taps(training=True))
     assert jnp.array_equal(e.router_bias[...], 0.01 * jnp.sign(load.mean() - load))
     assert (e.router_bias[...] != 0).any()
 
@@ -120,10 +120,10 @@ def test_a_train_step_moves_the_bias_eval_does_not_and_checkpoints_keep_it(tmp_p
     batch = plain(tokens())
     eager = nnx.clone(model)
     eager.training_outputs(jnp.asarray(batch.input_ids))
-    trainer.update(batch)
+    trainer.train_on_batch(batch)
     first = bias(model)
     assert jnp.array_equal(first, bias(eager)) and (first != 0).any()
-    trainer.update(batch)  # from where the first step left it
+    trainer.train_on_batch(batch)  # from where the first step left it
     assert jnp.allclose(jnp.abs(bias(model) - first).max(), 1e-3)
     moved = bias(model)
     trainer.evaluate([batch])
@@ -156,7 +156,8 @@ def test_reported_losses_are_terms_of_the_training_loss_weighted_by_each_layer()
     ]
     a, b = (r.value for r in reported)
     obj = objective(tcfg.LossConfig(), arch)
-    total, metrics = obj(logits, batch, reported)
+    per_token, per_row = obj(logits, batch, reported)
+    total, metrics = per_token.loss + per_row.loss, per_token.metrics | per_row.metrics
     assert set(metrics) == {"loss", "balance_loss"}
     assert jnp.isclose(metrics["balance_loss"], a + b)
     assert jnp.isclose(total, metrics["loss"] + 0.1 * a + 0.3 * b)
@@ -165,7 +166,7 @@ def test_reported_losses_are_terms_of_the_training_loss_weighted_by_each_layer()
 
     # A train step logs the term; eval is the cross-entropy alone.
     trainer = Trainer(model, optax.adamw(1e-3), obj)
-    assert "balance_loss" in trainer.update(batch)
+    assert "balance_loss" in trainer.train_on_batch(batch)
     ce = cross_entropy(model.outputs(jnp.asarray(batch.input_ids))[0], batch)
     assert np.isclose(trainer.evaluate([batch]), float(ce), rtol=1e-5)
 
@@ -178,7 +179,7 @@ def test_a_model_without_reporting_layers_trains_as_before():
     assert reported == []
     assert jnp.array_equal(logits[0], model.outputs(jnp.asarray(batch.input_ids))[0])
     trainer = Trainer(model, optax.adamw(1e-3), objective(tcfg.LossConfig(), arch))
-    assert set(trainer.update(batch)) == {"loss", "grad_norm"}
+    assert set(trainer.train_on_batch(batch)) == {"loss", "grad_norm"}
 
 
 # --- The methods that run the experts --------------------------------------------------
@@ -213,8 +214,10 @@ def run(method: str, e: MoE, x: Float[Array, "b t d"]):
     """The output, and the gradients of the parameters and of `x`, by `method`."""
     probe = jax.random.normal(jax.random.key(2), x.shape)
     with parallel.use(tcfg.MeshConfig(data=1), methods=tcfg.MethodsConfig(moe=method)):
-        y = e(x, {})
-        grads = nnx.grad(lambda e, x: (e(x, {}) * probe).sum(), argnums=(0, 1))(e, x)
+        y = e(x, Taps())
+        grads = nnx.grad(lambda e, x: (e(x, Taps()) * probe).sum(), argnums=(0, 1))(
+            e, x
+        )
     return y, grads
 
 
@@ -265,7 +268,7 @@ def test_some_of_the_experts_add_their_own_picks_and_nothing_for_the_others():
     def some(first: int, n: int) -> Float[Array, "b t d"]:
         mine = slice(first, first + n)
         kernels = (up[mine], gate[mine], down[mine])
-        return routed(z, idx - first, weights, *kernels, e.ffn, e.expert_norm)
+        return routed(z, idx - first, weights, *kernels, e.config.expert, e.expert_norm)
 
     assert jnp.allclose(some(0, 1) + some(1, 3), some(0, 4), atol=1e-5)
     assert jnp.allclose(some(0, 4), run("dense", e, x)[0], atol=1e-5)

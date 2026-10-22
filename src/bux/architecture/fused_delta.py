@@ -28,17 +28,17 @@ except ImportError:
 
 DIMS = (64, 128)  # the head dims the kernel takes
 SM = ("10.0", "10.3")  # the GPUs it runs on: B200, B300
-FLOOR = -5.0  # the least log decay a position it runs may have
+FLOOR = -5.0  # the least log decay it takes at any position
 # Documents a row of 4096 tokens may hold for the kernel: an empty sequence costs as
 # much as 10 tokens, so cu_seqlens has room for this many, and more go by `otherwise`.
 DOCS = 32
 
-Rule = Callable[..., Float[Array, "b t h v"]]  # linear_attention's delta_rule
+Rule = Callable[..., Float[Array, "b t h dv"]]  # linear_attention's delta_rule
 
 
 def runs(dk: int, dv: int, floor: float | None) -> bool:
-    """Whether the kernel runs a layer of these head dims whose log decays are never
-    below `floor`, by the run's methods, here."""
+    """Return whether the kernel runs a layer of these head dims whose log decays are
+    never below `floor`, by the run's methods, here."""
     on = parallel.active()
     method = on.methods.recurrence if on else "scan"
     bounded = floor is not None and floor >= FLOOR
@@ -48,22 +48,22 @@ def runs(dk: int, dv: int, floor: float | None) -> bool:
 
 @functools.cache
 def _gpu() -> bool:
-    """Whether the default device is a GPU the kernel runs on."""
+    """Return whether the default device is a GPU the kernel runs on."""
     device = jax.devices()[0]
     return device.platform == "gpu" and getattr(device, "compute_capability", "") in SM
 
 
 def delta_rule(
-    q: Float[Array, "b t h k"],
-    k: Float[Array, "b t h k"],
-    v: Float[Array, "b t h v"],
-    log_decay: Float[Array, "b t h k"],
+    q: Float[Array, "b t h dk"],
+    k: Float[Array, "b t h dk"],
+    v: Float[Array, "b t h dv"],
+    log_decay: Float[Array, "b t h dk"],
     beta: Float[Array, "b t h"],
     docs: Segments | None,
     otherwise: Rule,
-) -> Float[Array, "b t h v"]:
-    """`linear_attention.delta_rule` by the kernel, in v's dtype, where `runs`; by
-    `otherwise` for rows of more documents than cu_seqlens has room for."""
+) -> Float[Array, "b t h dv"]:
+    """Run `linear_attention.delta_rule` by the kernel, in v's dtype, where `runs`;
+    by `otherwise` for rows of more documents than cu_seqlens holds."""
     docs = docs or Segments.of(jnp.broadcast_to(jnp.arange(q.shape[1]), q.shape[:2]))
     xs = (q, k, v, log_decay, beta, *docs)
     if parallel.active() is None:
@@ -80,29 +80,29 @@ def delta_rule(
 
 def _rows(
     otherwise: Rule,
-    q: Float[Array, "b t h k"],
-    k: Float[Array, "b t h k"],
-    v: Float[Array, "b t h v"],
-    g: Float[Array, "b t h k"],
+    q: Float[Array, "b t h dk"],
+    k: Float[Array, "b t h dk"],
+    v: Float[Array, "b t h dv"],
+    g: Float[Array, "b t h dk"],
     beta: Float[Array, "b t h"],
     positions: Int[Array, "b t"],
     ids: Int[Array, "b t"],
     within: Int[Array, "b t"],
-) -> Float[Array, "b t h v"]:
-    """One device's rows: by the kernel if cu_seqlens holds their documents."""
+) -> Float[Array, "b t h dv"]:
+    """Run one device's rows by the kernel if cu_seqlens holds their documents."""
     b, t = within.shape
     room = b * max(1, t * DOCS // 4096)
     fits = jnp.sum(within == 0) <= room
     docs = Segments(positions, ids, within)
 
     def fallback(
-        q: Float[Array, "b t h k"],
-        k: Float[Array, "b t h k"],
-        v: Float[Array, "b t h v"],
-        g: Float[Array, "b t h k"],
+        q: Float[Array, "b t h dk"],
+        k: Float[Array, "b t h dk"],
+        v: Float[Array, "b t h dv"],
+        g: Float[Array, "b t h dk"],
         beta: Float[Array, "b t h"],
         within: Int[Array, "b t"],
-    ) -> Float[Array, "b t h v"]:
+    ) -> Float[Array, "b t h dv"]:
         return otherwise(q, k, v, g, beta, docs).astype(v.dtype)
 
     kernel = functools.partial(_kernel, room=room)
@@ -110,17 +110,17 @@ def _rows(
 
 
 def _kernel(
-    q: Float[Array, "b t h k"],
-    k: Float[Array, "b t h k"],
-    v: Float[Array, "b t h v"],
-    g: Float[Array, "b t h k"],
+    q: Float[Array, "b t h dk"],
+    k: Float[Array, "b t h dk"],
+    v: Float[Array, "b t h dv"],
+    g: Float[Array, "b t h dk"],
     beta: Float[Array, "b t h"],
     within: Int[Array, "b t"],
     *,
     room: int,
-) -> Float[Array, "b t h v"]:
-    """The rows packed as the kernel takes them, tokens end to end, each document a
-    sequence; `room` sequences, the last ones empty."""
+) -> Float[Array, "b t h dv"]:
+    """Run the kernel on the rows packed end to end, each document a sequence, in
+    `room` sequences, the last ones empty."""
     assert frost is not None
     b, t, h, _ = q.shape
     dtype = v.dtype if v.dtype in (jnp.bfloat16, jnp.float32) else jnp.float32

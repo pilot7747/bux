@@ -13,7 +13,7 @@ from jaxtyping import Array, Float, Int, Shaped
 
 from bux import config as cfg
 from bux import parallel
-from bux.architecture import Model
+from bux.architecture import Model, Taps
 from bux.architecture.moe import MoE
 from bux.lang import compile
 from bux.parallel import experts, methods
@@ -108,7 +108,7 @@ def _inputs(rows: int = 8) -> tuple[Float[Array, "b t d"], Float[Array, "b t d"]
 
 
 def _loss(e: MoE, x: Float[Array, "b t d"], probe: Float[Array, "b t d"]):
-    return (e(x, {}) * probe).sum()
+    return (e(x, Taps()) * probe).sum()
 
 
 @functools.cache
@@ -118,7 +118,7 @@ def _outputs(method: str, mesh: str, option: str, rows: int = 8):
     x, probe = _inputs(rows)
     with split(method, mesh):
         e = parallel.build(lambda: layer(**OPTIONS[option]))
-        y = nnx.jit(lambda e, x: e(x, {}))(e, x)
+        y = nnx.jit(lambda e, x: e(x, Taps()))(e, x)
         grads = nnx.jit(nnx.grad(_loss, argnums=(0, 1)))(e, x, probe)
         return jax.device_get((y, grads))
 
@@ -160,7 +160,7 @@ def test_where_the_mesh_does_not_split_the_experts_a_method_sorts():
     e = layer(num_experts=6)  # expert=4 does not divide them
     x, _ = _inputs()
     with split("all_to_all", "fsdp=2, expert=4"):
-        hlo = nnx.jit(lambda e, x: e(x, {})).lower(e, x).compile().as_text() or ""
+        hlo = nnx.jit(lambda e, x: e(x, Taps())).lower(e, x).compile().as_text() or ""
     assert "all-to-all" not in hlo
 
 
@@ -219,8 +219,8 @@ def _biases(method: str, mesh: str) -> list[Float[np.ndarray, " e"]]:
     with split(method, mesh):
         model = parallel.build(lambda: Model(arch, rngs=nnx.Rngs(0)))
         trainer = Trainer(model, optax.adamw(1e-2), objective(tcfg.LossConfig(), arch))
-        trainer.update(batch)
-        trainer.update(batch)
+        trainer.train_on_batch(batch)
+        trainer.train_on_batch(batch)
     moes = [m for _, m in nnx.iter_modules(model) if isinstance(m, MoE)]
     return [np.asarray(m.router_bias[...]) for m in moes if m.router_bias is not None]
 

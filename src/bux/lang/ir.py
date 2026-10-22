@@ -130,7 +130,7 @@ class Architecture(BaseModel):
     graph: Node
 
     def layers(self) -> Iterator[Layer]:
-        """All leaves in execution order, with repeats unrolled."""
+        """Return every layer in execution order, with repeats unrolled."""
         return unrolled_layers(self.graph)
 
 
@@ -147,7 +147,7 @@ def children(node: Node) -> tuple[Node, ...]:
 
 
 def walk(node: Node) -> Iterator[Node]:
-    """Pre-order traversal of the tree as written (repeats are visited once)."""
+    """Yield the nodes of the tree as written, in pre-order; a repeat's body once."""
     yield node
     for child in children(node):
         yield from walk(child)
@@ -179,7 +179,7 @@ def replace_children(node: Node, new: tuple[Node, ...]) -> Node:
 
 
 def strip(node: Node, *, labels: bool = True, widths: bool = True) -> Node:
-    """The node without display labels and/or inferred widths, for structural comparison.
+    """Return the node without labels, inferred widths or both, to compare structure.
 
     Without labels, a sequence directly inside a sequence (a sum inside a sum, a product
     inside a product) is flattened into it, as the compiler does with unlabeled groups.
@@ -224,10 +224,10 @@ class Run(BaseModel):
 
     @property
     def id(self) -> str:
-        """A hash of what the run computes, not of how it is written, watched or
-        split over devices: renaming a definition, reaching the same settings through a
-        sweep, logging, evaluating and checkpointing at other intervals, or another
-        mesh, layout or methods keeps it."""
+        """A hash of what the run computes, not of how it is written, watched or split
+        over devices. Renaming a definition, reaching the same settings through a sweep,
+        logging, evaluating or checkpointing at other intervals, or another mesh, layout
+        or methods keep it."""
         arch = self.arch.model_copy(update={"graph": strip(self.arch.graph)})
         # A setting newer than run ids, at its default, is left out, so that ids made
         # before it keep resuming.

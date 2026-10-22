@@ -8,7 +8,7 @@ from jaxtyping import Array, Int
 
 from bux import config as cfg
 from bux import parallel
-from bux.architecture import Model
+from bux.architecture import Model, Taps
 from bux.architecture.graph import ResidualBranch, Sequence
 from bux.architecture.linear_attention import (
     GatedDeltaNet,
@@ -186,7 +186,7 @@ def test_grouped_value_heads_share_each_qk_head():
     for name in ("v", "a", "b", "gate", "norm", "o", "A_log", "dt_bias"):
         setattr(mha, name, getattr(gva, name))
     x = jax.random.normal(jax.random.key(0), (2, 6, D))
-    assert jnp.allclose(mha(x, {}), gva(x, {}), atol=1e-5)
+    assert jnp.allclose(mha(x, Taps()), gva(x, Taps()), atol=1e-5)
 
 
 def test_kda_decay_is_bounded_below_with_a_lower_bound():
@@ -251,7 +251,7 @@ def test_rwkv7_starts_by_depth_and_reads_values_only_through_its_port():
     assert (later.shift[...] <= first.shift[...] + 1e-6).all()
     assert (first.o.kernel[...] == 0).all()  # the output projection starts at zero
     x = jax.random.normal(jax.random.key(0), (2, 6, D))
-    assert jnp.allclose(first(x, {}), 0)
+    assert jnp.allclose(first(x, Taps()), 0)
 
 
 # --- Split over devices ----------------------------------------------------------------

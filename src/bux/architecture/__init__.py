@@ -1,21 +1,21 @@
 """Reference Flax NNX backend: turns an Architecture into a runnable nnx.Module.
 
-Every IR node kind maps to one small module (``graph``), so the graph side is complete,
-and a residual branch outside any other is the residual algebra's (``residual``).
-Leaves come from a registry keyed by config type (``registry``); the other modules here
-each register one family of layers. A builder registered for a type replaces the one
-before it, so another implementation plugs in the same way, a fused kernel say:
+Every IR node kind maps to one small module (``graph``), and a residual branch outside
+any other is the residual algebra's (``residual``). Repeats are unrolled, or stacked
+and scanned (``repeat``, ``stacked``), and pipelined over the mesh's stages
+(``pipelined``). Layers come from a registry keyed by config type (``registry``); the
+other modules here each register one family of layers. A builder registered for a
+type replaces the one before it, so another implementation, a fused kernel say, plugs
+in the same way:
 
     @register("gdn")
     def _(config: GatedDeltaNetConfig, width: int, ports: tuple[Port, ...], ctx: Context):
         return MyGatedDeltaNet(config, width, rngs=ctx.rngs)
 
-Modules are called as ``module(x, taps)``: ``taps`` holds the tap stacks for one
-forward pass, and under reserved keys the input tokens, the documents rows are packed
-with (``segments(taps)``, None for a document a row), the logits of every head run
-so far, and in a training step the loss terms layers add (``report``). Repeats are
-unrolled, or stacked and scanned (``methods.repeat``); nodes with a share key are
-built once and reused.
+Modules are called as ``module(x, taps)``. ``Taps`` holds one forward pass's tap
+stacks, and as attributes its input tokens and their documents (``segments(taps)``),
+the logits of every head run so far, and in a training step the losses layers add
+(``report``). Nodes with a share key are built once and reused.
 
 Arrays say their dtype and shape with jaxtyping, as ``x: Float[Array, "b t d"]`` for a
 stream of b rows of t positions, d wide, and the tests check them on every call.
@@ -43,19 +43,18 @@ from bux.architecture.model import Model, num_params
 from bux.architecture.moe import MoE
 from bux.architecture.norm import DyT, Norm
 from bux.architecture.registry import (
-    LOSSES,
-    NEXTN,
-    OUTPUTS,
-    SEGMENTS,
-    TOKENS,
+    Builder,
+    Built,
     Context,
     Loss,
     Taps,
+    positions,
     register,
     report,
     segments,
     training,
 )
+from bux.architecture.repeat import Scanned
 from bux.architecture.residual import (
     AttentionResidual,
     GatedResidual,
@@ -70,17 +69,14 @@ from bux.architecture.ssm import Mamba, Mamba2, ShortConv
 
 __all__ = [
     "CSA",
-    "LOSSES",
     "MLA",
     "MLP",
-    "NEXTN",
-    "OUTPUTS",
     "RWKV7",
-    "SEGMENTS",
-    "TOKENS",
     "Activation",
     "Attention",
     "AttentionResidual",
+    "Builder",
+    "Built",
     "CausalConv",
     "Context",
     "DeltaNet",
@@ -108,12 +104,14 @@ __all__ = [
     "Norm",
     "ResidualGate",
     "Scale",
+    "Scanned",
     "Segments",
     "ShortConv",
     "SoftmaxAttention",
     "Taps",
     "build_node",
     "num_params",
+    "positions",
     "register",
     "report",
     "segments",

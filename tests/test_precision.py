@@ -20,7 +20,7 @@ from bux.lang import compile_runs
 from bux.train import config as tcfg
 from bux.train.data import Batch, plain
 from bux.train.objective import objective
-from bux.train.optim import optimizer, schedule
+from bux.train.optim import lr_multiplier, optimizer
 from bux.train.trainer import Trainer, cast, forward, train
 
 PRELUDE = """
@@ -114,7 +114,7 @@ def test_bfloat16_on_a_split_mesh_trains_as_on_one_device(losses, involuntary, a
 def test_parameters_gradients_and_the_optimizer_state_stay_float32():
     trainer = _trainer(ARCHITECTURES["moe"], compute=jnp.bfloat16)
     grads, _ = nnx.jit(trainer.gradients)(trainer.model, _batch())
-    trainer.update(_batch())
+    trainer.train_on_batch(_batch())
     params = nnx.state(trainer.model, nnx.Param)
     moments = nnx.state(trainer.optimizer, nnx.OptState)
     floats = [
@@ -211,8 +211,8 @@ def test_microbatches_give_the_whole_batch_s_gradient_and_router_bias(arch, mesh
     with parallel.use(tcfg.MeshConfig.model_validate(_sizes(mesh))):
         whole = _trainer(ARCHITECTURES[arch])
         parts = _trainer(ARCHITECTURES[arch], microbatches=n)
-        g1, m1 = nnx.jit(whole.gradients)(whole.model, parallel.rows(batch))
-        gn, mn = nnx.jit(parts.gradients)(parts.model, parallel.rows(batch))
+        g1, m1 = nnx.jit(whole.gradients)(whole.model, parallel.shard_batch(batch))
+        gn, mn = nnx.jit(parts.gradients)(parts.model, parallel.shard_batch(batch))
     assert jax.tree.all(
         jax.tree.map(lambda a, b: jnp.allclose(a, b, atol=2e-6), g1, gn)
     )
@@ -264,7 +264,7 @@ def test_a_batch_that_does_not_split_into_microbatches_is_an_error(tmp_path):
 def test_microbatches_and_bfloat16_take_less_memory():
     def temp(**settings) -> int:
         trainer = _trainer(ARCHITECTURES["llama"], **settings)
-        batch = parallel.rows(_batch())
+        batch = parallel.shard_batch(_batch())
         step = trainer._train.lower(trainer.model, trainer.optimizer, batch).compile()
         memory = step.memory_analysis()
         assert memory is not None
@@ -296,7 +296,7 @@ def _trainer(arch: str, **settings) -> Trainer:
     [run] = compile_runs(_source(arch=arch))
     t = run.train
     model = parallel.build(lambda: Model(run.arch, rngs=nnx.Rngs(0)))
-    tx = optimizer(t.optimizer, schedule(t.schedule, t.steps), model, t.clip)
+    tx = optimizer(t.optimizer, lr_multiplier(t.schedule, t.steps), model, t.clip)
     return Trainer(model, tx, objective(t.loss, run.arch), **settings)
 
 

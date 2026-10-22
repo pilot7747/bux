@@ -21,7 +21,7 @@ from jaxtyping import Array, Float, Int
 import bux.architecture  # noqa: F401  (registers xla)
 from bux import parallel
 from bux.parallel import methods
-from bux.parallel.context import Visibility
+from bux.parallel.context import AttentionArgs
 from bux.train import config as tcfg
 
 B, T, H, G, D = 2, 4096, 8, 2, 128
@@ -42,10 +42,10 @@ def documents(seed: int) -> Int[Array, "b t"]:
 
 IDS = documents(0)
 CASES = {
-    "documents": Visibility(IDS, None, D**-0.5, None, None),
-    "window": Visibility(IDS, 1000, D**-0.5, None, None),
-    "softcap": Visibility(None, None, D**-0.5, 30.0, None),
-    "sinks": Visibility(IDS, None, D**-0.5, None, jnp.linspace(-1, 1, H)),
+    "documents": AttentionArgs(IDS, None, D**-0.5, None, None),
+    "window": AttentionArgs(IDS, 1000, D**-0.5, None, None),
+    "softcap": AttentionArgs(None, None, D**-0.5, 30.0, None),
+    "sinks": AttentionArgs(IDS, None, D**-0.5, None, jnp.linspace(-1, 1, H)),
 }
 
 
@@ -56,7 +56,7 @@ def inputs() -> tuple[Float[Array, "b t _ k"], ...]:
     return tuple(jax.random.normal(k, s, DTYPE) for k, s in zip(key, shapes))
 
 
-def step(method: str, seen: Visibility) -> Step:
+def step(method: str, seen: AttentionArgs) -> Step:
     """A jitted forward and backward of `method`: its output, and the gradients."""
     f = methods.attention.find(method)
 

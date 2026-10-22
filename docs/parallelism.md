@@ -61,13 +61,14 @@ split over `seq` or `stream` are errors before anything is built.
 `bux launch` gives a run the GPUs of its mesh: the product of its axes' sizes, where
 `data` unset is every visible GPU for a run alone and one in a sweep. A sweep trains
 its runs side by side, each on a group of free GPUs, and a run that needs more GPUs
-than there are fails at once. A run alone also trains on many hosts, a process each,
+than there are fails at once. A run alone also trains on many hosts, one process each,
 when Slurm, Open MPI or `JAX_NUM_PROCESSES` say so
 ([Launching](training.md#launching)). The mesh then spans every process's devices,
-and `parallel.rows` builds a batch with `jax.make_array_from_callback`: every process
-makes all of it, as it depends only on the seed and the step, and puts the rows its
-own devices hold. `tests/test_launch.py` trains the smoke run as two processes of 4
-CPU devices each, through `jax.distributed` on localhost, as one process of 8 does.
+and `parallel.shard_batch` builds a batch with `jax.make_array_from_callback`: every
+process makes all of it, as it depends only on the seed and the step, and puts the
+rows its own devices hold. `tests/test_launch.py` trains the smoke run as two
+processes of 4 CPU devices each, through `jax.distributed` on localhost, as one
+process of 8 does.
 
 `bux plan` shows what each run takes before it starts: its GPUs, the bytes of its
 parameters and of its optimizer's state on each, and the share of a step its
@@ -113,7 +114,7 @@ it splits only between them.
 | `experts`  | experts                                     | `expert`                    |
 | `latent`   | low-rank bottlenecks: MLA, LatentMoE        | `none`                      |
 | `layers`   | the stacked passes of a scanned repeat      | `none`                      |
-| `stages`   | those of a pipelined one, a share a stage   | `stage`                     |
+| `stages`   | those of a pipelined one, a share per stage | `stage`                     |
 
 Names are bux's metadata, under `names`, not Flax's `out_sharding`: Flax never acts on
 them, so they cost nothing without a mesh, and `nnx.eval_shape` under one does not try
@@ -121,34 +122,35 @@ to resolve them. The optimizer's state inherits them from the parameters it trac
 
 ### How names resolve
 
-1. Dimension by dimension, each name's axes, less the axes of size 1 and those an
-   earlier dimension took. If their sizes do not divide the dimension, or its count,
-   it stays whole: GQA's 2 kv heads under `tensor=4` are replicated, though their
-   `2 * k` columns would split 4 ways.
-2. Then FSDP: the largest dimension left whole that the `fsdp` size divides splits
-   over `fsdp`, unless a dimension already does. So a layer with no names at all
-   trains under FSDP; names matter for TP and EP alone.
-3. FSDP is for parameters and the optimizer's state, or with `layout(zero=1)` for the
-   optimizer's state alone. Anything else, such as RNG state, keeps its names alone.
+1. For each dimension, take the axes of its name, minus axes of size 1 and axes an
+   earlier dimension already uses. If their sizes don't divide the dimension (or its
+   count), it stays whole: GQA's 2 kv heads under `tensor=4` are replicated, though
+   their `2 * k` columns would split 4 ways.
+2. Then FSDP: the largest whole dimension that the `fsdp` size divides splits over
+   `fsdp`, unless a dimension already does. So a layer with no names at all still
+   trains under FSDP; names matter only for TP and EP.
+3. FSDP applies to parameters and the optimizer's state, or with `layout(zero=1)` to
+   the optimizer's state alone. Other state, such as RNG state, splits by its names
+   alone.
 
-`parallel.build(make)` makes a module with every parameter born on its shards, so no
-parameter is ever whole on one device; its values are those `make()` gives. The
-trainer puts its state on these shardings when it is made, and every step keeps it
-there.
+`parallel.build(make)` creates a module with every parameter born on its shards, so
+no parameter is ever whole on one device; its values are those `make()` gives. The
+trainer moves its state to these shardings with `parallel.shard_state` when it is
+created, and every step keeps it there.
 
 ## Activations
 
-The stream is constrained at every residual branch, rows over `batch` and positions
-over `stream`, the rest whole. A layer adds a constraint where it knows what a
-dimension means:
+`parallel.shard_stream` constrains the residual stream after every residual branch:
+rows over `batch`, positions over `stream`, the rest whole. A layer adds a constraint
+where it knows what a dimension means:
 
 ```python
 q = parallel.shard(q, "batch", "seq", "heads", None)
 ```
 
-`shard`, `stream` and `spec` do nothing outside `parallel.use`, so one device runs as
-if they were not there. Batches go to the devices by `parallel.rows`: every `(b, t)`
-array over `batch` and `seq`.
+`shard`, `shard_stream` and `spec` do nothing outside `parallel.use`, so one device
+runs as if they were not there. `parallel.shard_batch` puts batches on the devices:
+every `(b, t)` array over `batch` and `seq`.
 
 ## Methods
 
@@ -161,13 +163,13 @@ from bux.parallel import methods
 
 
 @methods.attention.register("mine")
-def _(q, k, v, visibility): ...
+def _(q, k, v, args): ...
 ```
 
-and `methods = methods(attention=mine)` picks it. `parallel.method("attention")` is
-the run's, or the default outside `use`. A name that is not registered is an error at
-`use`. The section of each kind says its signature, and the default is registered
-where its layer lives.
+and `methods = methods(attention=mine)` picks it. `parallel.method("attention")`
+returns the run's method, or the default outside `use`. A name that is not registered
+is an error at `use`. The section of each kind gives its signature, and the default
+is registered next to the layer that calls it.
 
 A method that communicates by hand does it in a `jax.shard_map` over its own axis,
 `axis_names={axis}`, the other axes staying Auto; one that sorts tokens, as the MoE's
@@ -184,7 +186,7 @@ from bux import parallel
 with parallel.use(t.mesh, t.layout, t.methods):
     model = parallel.build(lambda: Model(arch, rngs=nnx.Rngs(0)))
     trainer = Trainer(model, tx, loss)  # its state on its shardings
-    trainer.update(batch)  # the batch through parallel.rows
+    trainer.train_on_batch(batch)  # the batch through parallel.shard_batch
 ```
 
 ## Testing
@@ -230,10 +232,10 @@ each device.
 ## Context parallelism: `methods.attention`
 
 The core of softmax attention (logits, probabilities, values) is a method of
-`methods.attention`, `(q, k, v, visibility) -> out`: queries `(b, t, h, k)`, keys and
+`methods.attention`, `(q, k, v, args) -> out`: queries `(b, t, h, k)`, keys and
 values `(b, t, g, k)` and `(b, t, g, v)` of `g` kv heads at the queries' positions,
 and the head outputs `(b, t, h, v)`. A query sees no key ahead of it; the
-`Visibility` (`bux.parallel.context`) carries the rest: the documents' ids
+`AttentionArgs` (`bux.parallel.context`) carries the rest: the documents' ids
 (`Segments.ids`, made in the global view before any method), the window, the scale,
 the soft cap and the sinks. Every method takes its softmax in float32.
 
@@ -253,7 +255,7 @@ methods = methods(attention=ring)
 What only `xla` has stays in the layer: a mask of the keys each query keeps (an
 indexer's top-k, CSA's compressed latents), relative bias, length scale and attention
 dropout. A layer with one of them under a method other than `auto` raises `NotImplementedError`
-naming it, as a method does for a feature of the visibility it lacks. The indexer's
+naming it, as a method does for a feature of the `AttentionArgs` it lacks. The indexer's
 loss reads the attention's probabilities, which only `xla` makes; it comes with the
 indexer's top-k, so it is `xla`'s too.
 
@@ -266,15 +268,15 @@ Another method is a function:
 
 ```python
 from bux.parallel import methods
-from bux.parallel.context import Visibility
+from bux.parallel.context import AttentionArgs
 
 
 @methods.attention.register("mine")
-def _(q, k, v, seen: Visibility):
-    # seen.ids (b, t) or None, seen.window, seen.scale, seen.softcap, seen.sinks (h,)
-    if seen.sinks is not None:
+def _(q, k, v, args: AttentionArgs):
+    # args.ids (b, t) or None, args.window, args.scale, args.softcap, args.sinks (h,)
+    if args.sinks is not None:
         raise NotImplementedError("methods.attention = mine has no sinks")
-    return methods.attention.find("xla")(q, k, v, seen)
+    return methods.attention.find("xla")(q, k, v, args)
 ```
 
 Measured on 8 CPU devices: two windowed GQA layers (4 heads, 2 kv heads) in a
@@ -343,14 +345,14 @@ Constraints:
   input without one.) Per-head arrays are `(batch, seq, heads, ...)`, the hidden units
   `(batch, seq, mlp)`, and the SSMs' channels before `out_proj` theirs.
 - The embedding gathers from its table whole but for the vocabulary, into
-  `(batch, seq, none)`, then `stream`. From a table split over `fsdp`, XLA
+  `(batch, seq, none)`, then `shard_stream`. From a table split over `fsdp`, XLA
   rematerializes it in full; into positions split over `tensor`, it gathers the
   table every step. Engram gathers from its table the same way.
 - The logits are `(batch, seq, vocab)`, tied heads too, and the loss reduces over the
   vocabulary where it is: the log-normalizer and the target's logit are all-reduces
   of `(b, t)`, for the loss, `z_loss` and `mtp` alike.
-- What the embedding, nextn and Engram give is the stream, widened or not, and passes
-  `stream`.
+- What the embedding, nextn and Engram return is the stream, widened or not, and
+  goes through `shard_stream`.
 
 On the 8 fake devices, every family trains as on one device to 4e-6 under
 `fsdp=2 × tensor=4`, `fsdp=4 × tensor=2` with sequence parallelism, `tensor=2`,
@@ -360,7 +362,7 @@ grows past 1e-5 in three steps.
 
 ## Context parallelism for recurrent mixers: `methods.recurrence`
 
-Every recurrent mixer keeps a state `S` of `k × v` a head, which each position decays,
+Every recurrent mixer keeps a state `S` of `k × v` per head, which each position decays,
 adds to and reads its outputs from, linearly. So a chunk of positions maps the state it
 starts from to the one it ends with by an affine map, its transition `S ↦ A S + B`,
 and each of its outputs gains `reads_t · S`. `A` is zero across a document start.
@@ -385,8 +387,8 @@ methods = methods(recurrence=pass_state)
 `P_t` is the product of the decays (`diag(w) + b aᵀ`, or `exp(dt A)`) from the chunk's
 start to position `t`, carried by the chunk's scan beside the state. For a matrix (and
 k = v) that doubles the scan's work and what its backward saves; a diagonal or a scalar
-costs a vector. The outputs `reads` are `(b, t, h, k)`, which for Mamba (a head a channel) is
-the size of the states its backward saves.
+costs a vector. The outputs `reads` are `(b, t, h, k)`, which for Mamba (one head per
+channel) is the size of the states its backward saves.
 
 `pass_state` is two `shard_map`s manual over every axis that splits the tokens, and
 neither holds a collective: the first runs each device's chunk, the second corrects its
@@ -436,9 +438,9 @@ a float32 array of every position, and none of `pass_state`'s does:
 | Mamba     | 20 → 14               | 84 → 76             | 17 → 11     |
 | Mamba-2   | 36 → 30               | 72 → 64             | 17 → 11     |
 
-`pass_state` all-gathers 4 small arrays a layer: the states and transitions forward,
+`pass_state` all-gathers 4 small arrays per layer: the states and transitions forward,
 again for the backward. Other collectives do not change, but for Mamba's and Mamba-2's
-`A`, whose gradient is summed over the token axes (one all-reduce a layer on
+`A`, whose gradient is summed over the token axes (one all-reduce per layer on
 `context=8`). The temp memory of the train step at `seq_len = 1024` (8 rows, width 64),
 `scan` → `pass_state`, in MiB:
 
@@ -464,7 +466,7 @@ over positions, is its reference. Under `scan`, the delta rule of a gate bounded
 kernel on a B200 or B300 instead (`fused_delta`); it overflows below -5.
 
 Not yet: a `ppermute` chain instead of the all-gather, which holds every device's
-transitions (`c` matrices `k × k` a head) on each.
+transitions (`c` matrices `k × k` per head) on each.
 
 ## Mixture of experts
 
@@ -505,7 +507,7 @@ from bux.parallel import methods
 
 @methods.moe.register("mine")
 def _(moe, z, idx, weights):
-    return routed(z, idx, weights, *moe.kernels(), moe.ffn, moe.expert_norm)
+    return routed(z, idx, weights, *moe.kernels(), moe.config.expert, moe.expert_norm)
 ```
 
 The MoE names its parameters: the router `(embed, None)`; `up` and `gate`
@@ -528,8 +530,8 @@ methods = methods(moe=all_to_all)
 | method              | what it does                                                  |
 |---------------------|---------------------------------------------------------------|
 | `all_gather`        | each device gathers its group's tokens, runs its own experts on them, and a `psum_scatter` brings each token its sum back |
-| `all_to_all`        | each pick goes to its expert's device and back by `jax.lax.all_to_all`, in a buffer a peer that holds every local pick, so that none drops |
-| `ragged_all_to_all` | the same, one ragged slice a peer, by `jax.lax.ragged_all_to_all`: buffers hold what every peer could send, but only what they do send moves. XLA:CPU lacks it |
+| `all_to_all`        | each pick goes to its expert's device and back by `jax.lax.all_to_all`, in one buffer per peer that holds every local pick, so that none drops |
+| `ragged_all_to_all` | the same, one ragged slice per peer, by `jax.lax.ragged_all_to_all`: buffers hold what every peer could send, but only what they do send moves. XLA:CPU lacks it |
 
 Each runs in a `jax.shard_map` manual over the axes that split the tokens (those of
 `batch` and `seq`), not over `expert` alone: a sort of tokens split over an Auto axis
@@ -593,7 +595,7 @@ all-to-all hangs unless XLA_FLAGS has
 
 ## Muon: `methods.orthogonalize`
 
-Newton-Schulz takes fifteen products of each update matrix a step. On a matrix split
+Newton-Schulz takes fifteen products of each update matrix per step. On a matrix split
 over devices, most of them need an all-reduce, so how Muon reaches whole matrices is a
 method:
 
@@ -636,8 +638,8 @@ all-to-alls) for the 2-block Llama and the MoE of `tests/test_parallel.py`:
 | MoE, `fsdp=8`             | 26 / 33 / 8 | 67 / 183 / 8  | 26 / 48 / 14   |
 | MoE, `fsdp=4, tensor=2`   | 25 / 36 / 6 | 66 / 186 / 6  | 25 / 51 / 12   |
 
-With `gather`, Muon all-reduces as often as AdamW, and adds an all-gather a matrix
-and two all-to-alls an expert stack; the optimizer's update alone does no all-reduce.
+With `gather`, Muon all-reduces as often as AdamW, and adds one all-gather per matrix
+and two all-to-alls per expert stack; the optimizer's update alone does no all-reduce.
 Step times on fake CPU devices, which share one CPU, say nothing.
 
 ## Repeats and remat: `methods.repeat`, `methods.remat`
@@ -716,7 +718,7 @@ On one CPU, for the gradient of a 24-layer Llama's forward (`d_model=64`, 8 rows
 | `dots`          | 133 MiB               | 138 MiB |
 | `dots_no_batch` | 79 MiB                | 82 MiB  |
 
-`Scanned.layers` holds the stacked passes, and `graph.run(graphdef, state, times, x,
+`Scanned.layers` holds the stacked passes, and `stacked.run(graphdef, state, times, x,
 taps)` runs any stack of them, such as a pipeline stage's share.
 
 ## Precision and microbatches
@@ -773,20 +775,20 @@ anything is built.
 What the step computes is the whole batch's:
 
 - **The objective's terms**, means over targets, weigh by each microbatch's share of
-  the batch's targets (`trainer.weigh`), so that the loss and the z-loss are the
-  batch's, also when a loss mask leaves microbatches with unequal numbers of targets.
-  `mtp`'s heads weigh by the first head's targets.
+  the batch's targets (`trainer.token_shares`), so that the loss and the z-loss are
+  the batch's, also when a loss mask leaves microbatches with unequal numbers of
+  targets. `mtp`'s heads weigh by the first head's targets.
 - **What layers report** weighs by each microbatch's share of rows, 1 / n: a
   balance loss over sequences (`aux_loss_scope=sequence`) and the indexer's loss are
   the batch's. A balance loss over the batch is the mean of the microbatches' own,
   each over its rows: its f_e and P_e are a microbatch's means, not the batch's.
 - **The router bias** moves once a step, from the whole batch's picks. The trainer
-  sets `deferred` on every module that has it: the MoE's training forwards then route
-  with the bias where the step found it and add their picks to `router_load`, and
-  `settle` moves the bias after the last microbatch. A layer of one's own that learns
-  from the batch outside of gradients does the same (`trainer.Settles`). Called
-  outside a step, a training forward moves the bias at once; and a shared MoE moves
-  once a step, from the picks of all its uses.
+  sets `update_at_step_end` on every module that has it: the MoE's training forwards
+  then route with the bias where the step found it and add their picks to
+  `router_load`, and `step_end_update` moves the bias after the last microbatch. A
+  layer of one's own that learns from the batch outside of gradients does the same
+  (`trainer.StepEndUpdate`). Called outside a step, a training forward moves the
+  bias at once; and a shared MoE moves once a step, from the picks of all its uses.
 - **Dropout** draws each microbatch's masks in turn from the run's RNG stream: the
   same distribution as the whole batch's, not the same masks, and the stream's count
   advances n times a step. A resumed run draws the same.
@@ -834,7 +836,7 @@ methods = methods(repeat=scan, microbatches=8, pipeline=circular, rounds=2)
 
 With `mesh.stage` above 1, the longest scanned repeat outside any other (the first of
 several as long) is pipelined. Its stacked layers split over `stage` by a dimension
-named `stages` of the layout, a share of the passes in a row a stage. The rest of the
+named `stages` of the layout, one share of consecutive passes per stage. The rest of the
 model, the embedding and the head too, does not split over `stage`: every stage
 computes it.
 A model with no scanned repeat is an error that says to repeat its blocks and scan
@@ -844,7 +846,7 @@ the stages.
 The batch's rows split into `methods.microbatches` microbatches, row `i·M + j` into
 microbatch `j`, so that each splits over the batch axes as the rows do. A method runs
 them in a `jax.shard_map` manual over `stage` alone, by a `lax.scan` over `R·M + S − 1`
-ticks: at each, every stage runs its share of a round on a microbatch (`graph.run`),
+ticks: at each, every stage runs its share of a round on a microbatch (`stacked.run`),
 and a `ppermute` sends its output on to the next stage, the last's to the first. The
 first stage takes each microbatch from a buffer of its own, where the last stage's
 outputs come back: there a circular round starts again, and from there the stream
@@ -855,7 +857,7 @@ leaves, summed over the stages to every one.
 | `gpipe`    | goes through the stages once; the default                         | (S − 1) / (M + S − 1)   |
 | `circular` | goes round them `methods.rounds` times, each stage holding a share of every round's layers | (S − 1) / (R·M + S − 1) |
 
-`circular` needs a microbatch a stage at least, and `methods.rounds` is its alone.
+`circular` needs at least one microbatch per stage, and only it reads `methods.rounds`.
 `bux plan` shows the share of a step a stage idles, the bubble:
 
 ```
@@ -879,7 +881,7 @@ after another, so with one microbatch a pipeline computes what one device does:
   microbatches of each one's: the whole batch's for a loss of each sequence
   (`aux_loss_scope=sequence`), near it for one of the batch;
 - the router bias moves once a step, from the whole batch's picks, as it does under
-  gradient accumulation: in a training step the MoE is `deferred`, and the
+  gradient accumulation: in a training step the MoE has `update_at_step_end`, and the
   pipeline carries its `router_load` through the ticks it computes. A training
   forward outside a step moves it once a microbatch, each from that one's load;
 - dropout draws a fresh mask for every microbatch.
@@ -903,7 +905,7 @@ once a tick:
 | `stage=2, data=2, fsdp=2`  | `microbatches=4`                         | 2.9e-6   | 3                  | 1          | 21         |
 | `data=2, fsdp=4`           |                                          | 6.2e-6   | 0                  | 0          | 22         |
 
-A ppermute a tick each way, and an all-reduce of the stream as it leaves, and of its
+One ppermute per tick each way, and an all-reduce of the stream as it leaves, and of its
 gradient as it comes back; no parameter of a stage leaves it.
 
 This is not MaxText's vmap over the stages with `spmd_axis_name="stage"`: on JAX 0.12

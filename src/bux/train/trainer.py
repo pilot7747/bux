@@ -11,10 +11,9 @@ A run's directory, ``<out>/<name>-<id>``, holds:
 Its name says which alternatives it took, and its id hashes what it computes, so a
 changed setting gets a fresh directory and an unchanged one finds its checkpoints.
 
-``train`` builds a run out of blocks, each of which works without the others: a
-``Trainer`` (a model, its optimizer and its objective), the run's batches, hooks for
-its log, eval and checkpoint settings, and sinks for what they report. So a script
-of your own trains with its own blocks, or with the run's and one more:
+``train`` puts a run together from blocks that each work alone: a ``Trainer`` (a
+model, its optimizer and its objective), the run's batches, hooks for its log, eval
+and checkpoints, and sinks for what the hooks return. A script can swap any of them:
 
     trainer = Trainer(model, optax.adamw(1e-3), objective(run.train.loss, run.arch))
     trainer.fit(batches(...), steps=1000, hooks=[...], sinks=[Console("mine", 1000)])
@@ -41,89 +40,78 @@ from bux.data.pipeline import DEFAULT_CACHE, jobs, prepare
 from bux.lang import ir
 from bux.lang.printer import run_to_source
 from bux.train.data import Batch, batches
-from bux.train.hooks import Checkpoint, Eval, Hook, Log, Metrics
-from bux.train.objective import Objective, objective, targets
-from bux.train.optim import Schedule, optimizer, peak, schedule
-from bux.train.sinks import JSONL, Console, Latest, Sink, primary
+from bux.train.hooks import Checkpoint, Eval, Hook, Log
+from bux.train.objective import Metrics, Objective, objective, target_mask
+from bux.train.optim import Schedule, lr_multiplier, lr_schedule, optimizer
+from bux.train.sinks import JSONL, Console, LatestMetrics, Sink, is_main_process
 
 
 def forward(model: Model, batch: Batch) -> list[Float[Array, "b t vocab"]]:
-    """Every head's logits on `batch`, each document in a row on its own."""
+    """Return every head's logits on `batch`, each document of a row on its own."""
     return model.outputs(jnp.asarray(batch.input_ids), jnp.asarray(batch.position_ids))
 
 
 def training_forward(
     model: Model, batch: Batch
 ) -> tuple[list[Float[Array, "b t vocab"]], list[Loss]]:
-    """`forward` in a training step: with the losses the layers report."""
+    """Return `forward`'s logits in a training step, and the losses layers report."""
     tokens, positions = jnp.asarray(batch.input_ids), jnp.asarray(batch.position_ids)
     return model.training_outputs(tokens, positions)
 
 
 def cast[M: nnx.Module](model: M, dtype: DTypeLike) -> M:
-    """A copy of `model`, its floating-point parameters in `dtype` and the rest of its
-    state as it is. Gradients through it reach the parameters in their own dtype."""
-    graphdef, params, rest = nnx.split(model, nnx.Param, ...)
+    """Return a copy of `model` with its floating-point parameters in `dtype` and the
+    rest of its state as it is. Gradients through it reach the parameters in their
+    own dtype."""
+    graphdef, params, buffers = nnx.split(model, nnx.Param, ...)
     params = jax.tree.map(
         lambda x: x.astype(dtype) if jnp.issubdtype(x.dtype, jnp.floating) else x,
         params,
     )
-    return nnx.merge(graphdef, params, rest)
+    return nnx.merge(graphdef, params, buffers)
 
 
 @runtime_checkable
-class Settles(Protocol):
-    """A module that learns from a step's batch other than by gradients, as an MoE
-    moves its router bias. A training step sets `deferred`: the forwards of all its
-    microbatches count what they see, and `settle` applies it once, after them.
-    Outside a step, a training forward applies it at once."""
+class StepEndUpdate(Protocol):
+    """A module that learns from the batch other than by gradients, as an MoE moves
+    its router bias. A training step sets `update_at_step_end`: its microbatches'
+    forwards only count what they see, and `step_end_update` applies it once after
+    them. Outside a step, a training forward applies it at once."""
 
-    deferred: bool
+    update_at_step_end: bool
 
-    def settle(self) -> None: ...
-
-
-def settle(model: nnx.Module) -> None:
-    """Every module's `settle`, once a step, after its forwards."""
-    for _, m in nnx.iter_modules(model):
-        if isinstance(m, Settles):
-            m.settle()
+    def step_end_update(self) -> None: ...
 
 
-def shares(batch: Batch, n: int) -> Float[Array, " n"]:
-    """Each of `n` microbatches' share of the targets of `batch` (the first head's),
-    or 1 / n each if it has none."""
-    counts = parallel.microbatches(targets(batch), n).sum((1, 2))
-    total = counts.sum()
-    return jnp.where(total > 0, counts / jnp.maximum(total, 1), 1 / n)
+def apply_step_end_updates(model: nnx.Module) -> None:
+    """Call every module's `step_end_update`, once per step, after all its forwards."""
+    for _, module in nnx.iter_modules(model):
+        if isinstance(module, StepEndUpdate):
+            module.step_end_update()
 
 
-def weigh(
-    total: Float[Array, ""],
-    metrics: Metrics,
-    reported: Sequence[Loss],
-    share: Float[Array, ""],
-    n: int,
-) -> tuple[Float[Array, ""], Metrics]:
-    """A microbatch's part of the objective of a batch of `n`: the objective's terms,
-    means over targets, by the microbatch's `share` of the targets; what the layers
-    report, by its share of the rows, 1 / n."""
-    theirs = sum((weight * value for _, weight, value in reported), jnp.zeros(()))
-    rows = {name for name, _, _ in reported}
-    metrics = {k: v * (1 / n if k in rows else share) for k, v in metrics.items()}
-    return share * (total - theirs) + theirs / n, metrics
+def token_shares(batch: Batch, n: int) -> Float[Array, " n"]:
+    """Return each of `n` microbatches' share of the batch's target tokens (the first
+    head's), or 1 / n each if it has none."""
+    counts = parallel.microbatches(target_mask(batch), n).sum((1, 2))
+    num_targets = counts.sum()
+    return jnp.where(num_targets > 0, counts / jnp.maximum(num_targets, 1), 1 / n)
 
 
-def _on_shards(state: nnx.State) -> nnx.State:
-    """`state`, constrained to the shardings of its variables, on a mesh."""
+def _scaled(metrics: Metrics, share: float | Float[Array, ""]) -> Metrics:
+    return {k: v * share for k, v in metrics.items()}
+
+
+def _shard_state(state: nnx.State) -> nnx.State:
+    """Constrain `state` to the shardings of its variables, on a mesh."""
     if parallel.active() is None:
         return state
     return jax.lax.with_sharding_constraint(state, parallel.shardings(state))
 
 
 class Trainer:
-    """A model, the optimizer that trains it with `tx`, and the objective it
-    minimizes, `step` steps in.
+    """A model, its optimizer, which applies `tx`, and the objective it minimizes;
+    `step` counts the steps taken.
 
     `train_step` and `eval_step` are compiled once, so a subclass that overrides them
     changes what a step does (keeps an average of the weights, skips a spike) and
@@ -132,8 +120,7 @@ class Trainer:
 
     Both compute in `compute`, the model's parameters cast to it inside the loss, so
     that the parameters, their gradients and the optimizer's state stay as they are
-    (float32). A step takes its batch in `microbatches` (gradient accumulation): a
-    scan over them, one gradient, one update.
+    (float32).
 
     Made inside ``parallel.use``, it puts its state on the shardings the layout gives
     it, and every step keeps it there.
@@ -151,102 +138,117 @@ class Trainer:
         self.model, self.objective = model, objective
         self.compute, self.microbatches = jnp.dtype(compute), microbatches
         self.optimizer = nnx.Optimizer(model, tx, wrt=nnx.Param)
-        parallel.place(self.model, self.optimizer)
+        parallel.shard_state(self.model, self.optimizer)
         self.step = 0
         self.stopping = False  # set, by a signal handler say, to stop after this step
-        self._train = nnx.jit(self._placed_step)
+        self._train = nnx.jit(self._train_step_on_shards)
         self._eval = nnx.jit(self.eval_step)
 
-    def _placed_step(
+    def _train_step_on_shards(
         self, model: Model, optimizer: nnx.Optimizer, batch: Batch
     ) -> Metrics:
         metrics = self.train_step(model, optimizer, batch)
-        parallel.place(model, optimizer)
+        parallel.shard_state(model, optimizer)
         return metrics
 
     def train_step(
         self, model: Model, optimizer: nnx.Optimizer, batch: Batch
     ) -> Metrics:
-        """The objective's gradient on `batch`, applied: the objective's terms, and
-        the gradient's norm."""
+        """Take one optimizer step on `batch`, and return its metrics with
+        `grad_norm`, the gradients' norm before clipping."""
         grads, metrics = self.gradients(model, batch)
         optimizer.update(model, grads)
         return metrics | {"grad_norm": optax.tree.norm(grads)}
 
     def gradients(self, model: Model, batch: Batch) -> tuple[nnx.State, Metrics]:
-        """The objective's gradient on `batch`, and its terms: the sums of
-        `microbatches` parts (``weigh``), so that the loss is the batch's. The
-        forwards update the model's other state in turn, and then every module
-        ``settle``s."""
-        graphdef, params, rest = nnx.split(model, nnx.Param, ...)
+        """Return the loss's gradient on `batch` and its metrics, summed over the
+        `microbatches`. The forwards update the model's buffers (its state that is not
+        a parameter) in turn, and then the step-end updates run."""
+        graphdef, params, buffers = nnx.split(model, nnx.Param, ...)
         if self.microbatches == 1:
-            grads, metrics, rest = self._microbatch(graphdef, params, rest, batch)
+            grads, metrics, buffers = self._grads(
+                graphdef, params, buffers, batch, token_share=1.0, row_share=1.0
+            )
         else:
-            grads, metrics, rest = self._accumulate(graphdef, params, rest, batch)
-        nnx.update(model, rest)
-        settle(model)
+            grads, metrics, buffers = self._accumulate(graphdef, params, buffers, batch)
+        nnx.update(model, buffers)
+        apply_step_end_updates(model)
         return grads, metrics
 
     def _accumulate(
-        self, graphdef: nnx.GraphDef, params: nnx.State, rest: nnx.State, batch: Batch
-    ) -> tuple[nnx.State, Metrics, nnx.State]:
-        """`_microbatch` on each of the batch's microbatches in turn, summed."""
-
-        def one(
-            carry: tuple[nnx.State, nnx.State],
-            part: tuple[Batch, Float[Array, ""]],
-        ) -> tuple[tuple[nnx.State, nnx.State], Metrics]:
-            total, rest = carry
-            grads, metrics, rest = self._microbatch(graphdef, params, rest, *part)
-            return (jax.tree.map(jnp.add, total, grads), rest), metrics
-
-        n = self.microbatches
-        parts = (parallel.microbatches(batch, n), shares(batch, n))
-        zeros = _on_shards(jax.tree.map(jnp.zeros_like, params))
-        (grads, rest), metrics = jax.lax.scan(one, (zeros, rest), parts)
-        return grads, {k: v.sum() for k, v in metrics.items()}, rest
-
-    def _microbatch(
         self,
         graphdef: nnx.GraphDef,
         params: nnx.State,
-        rest: nnx.State,
+        buffers: nnx.State,
         batch: Batch,
-        share: Float[Array, ""] | None = None,
     ) -> tuple[nnx.State, Metrics, nnx.State]:
-        """The objective's gradient on `batch` and its terms, computed in `compute`,
-        as the part of the step's that `share` of its targets makes (``weigh``); and
-        the model's other state after the forward."""
+        """Sum `_grads` over the microbatches of `batch` in a scan, each one's
+        per-token part scaled by its share of the batch's targets and its per-row part
+        by 1 / n: so the sums are the batch's, even when microbatches have unequal
+        numbers of targets."""
+        n = self.microbatches
 
-        def loss(params: nnx.State) -> tuple[Float[Array, ""], tuple[Metrics, Any]]:
-            model = cast(nnx.merge(graphdef, params, rest, copy=True), self.compute)
-            model.set_attributes(deferred=True, raise_if_not_found=False)
-            logits, reported = training_forward(model, batch)
-            total, metrics = self.objective(logits, batch, reported)
-            if share is not None:
-                n = self.microbatches
-                total, metrics = weigh(total, metrics, reported, share, n)
-            return total, (metrics, nnx.state(model, nnx.Not(nnx.Param)))
+        def add_microbatch(
+            carry: tuple[nnx.State, nnx.State],
+            xs: tuple[Batch, Float[Array, ""]],
+        ) -> tuple[tuple[nnx.State, nnx.State], Metrics]:
+            grad_sum, buffers = carry
+            microbatch, token_share = xs
+            grads, metrics, buffers = self._grads(
+                graphdef, params, buffers, microbatch, token_share, row_share=1 / n
+            )
+            return (jax.tree.map(jnp.add, grad_sum, grads), buffers), metrics
 
-        (_, (metrics, rest)), grads = jax.value_and_grad(loss, has_aux=True)(params)
-        return grads, metrics, rest
+        xs = (parallel.microbatches(batch, n), token_shares(batch, n))
+        zeros = _shard_state(jax.tree.map(jnp.zeros_like, params))
+        (grads, buffers), metrics = jax.lax.scan(add_microbatch, (zeros, buffers), xs)
+        return grads, {k: v.sum() for k, v in metrics.items()}, buffers
+
+    def _grads(
+        self,
+        graphdef: nnx.GraphDef,
+        params: nnx.State,
+        buffers: nnx.State,
+        batch: Batch,
+        token_share: float | Float[Array, ""],
+        row_share: float,
+    ) -> tuple[nnx.State, Metrics, nnx.State]:
+        """Return the loss's gradient on `batch`, computed in `compute`, its metrics,
+        and the buffers after the forward, each part of the objective scaled by its
+        share."""
+
+        def loss_fn(params: nnx.State) -> tuple[Float[Array, ""], tuple[Metrics, Any]]:
+            model = cast(nnx.merge(graphdef, params, buffers, copy=True), self.compute)
+            model.set_attributes(update_at_step_end=True, raise_if_not_found=False)
+            logits, aux_losses = training_forward(model, batch)
+            per_token, per_row = self.objective(logits, batch, aux_losses)
+            loss = token_share * per_token.loss + row_share * per_row.loss
+            metrics = _scaled(per_token.metrics, token_share)
+            metrics |= _scaled(per_row.metrics, row_share)
+            return loss, (metrics, nnx.state(model, nnx.Not(nnx.Param)))
+
+        grads, (metrics, buffers) = jax.grad(loss_fn, has_aux=True)(params)
+        return grads, metrics, buffers
 
     def eval_step(self, model: Model, batch: Batch) -> Float[Array, ""]:
-        """The first head's loss on `batch`, computed in `compute`."""
+        """Return the first head's loss on `batch`, computed in `compute`."""
         logits = forward(cast(model, self.compute), batch)
-        return self.objective(logits, batch)[1]["loss"]
+        per_token, _ = self.objective(logits, batch)
+        return per_token.metrics["loss"]
 
-    def update(self, batch: Batch) -> Metrics:
-        """Take a step on `batch`."""
-        metrics = self._train(self.model, self.optimizer, parallel.rows(batch))
+    def train_on_batch(self, batch: Batch) -> Metrics:
+        """Take one training step on `batch`, and return its metrics."""
+        metrics = self._train(self.model, self.optimizer, parallel.shard_batch(batch))
         self.step += 1
         return metrics
 
     def evaluate(self, batches: Iterable[Batch]) -> float:
-        """The mean of `eval_step` over `batches`, in eval mode."""
+        """Return the mean of `eval_step` over `batches`, in eval mode."""
         self.model.eval()
         try:
-            losses = [float(self._eval(self.model, parallel.rows(b))) for b in batches]
+            losses = [
+                float(self._eval(self.model, parallel.shard_batch(b))) for b in batches
+            ]
         finally:
             self.model.train()
         return sum(losses) / len(losses)
@@ -269,19 +271,19 @@ class Trainer:
     ) -> None:
         """Train on `data` to step `steps`, or until `stopping` is set, after which
         every hook's `stop` runs. After every step, the hooks due run in order, and
-        what they report goes to every sink. All of them close at the end, or when
+        what they return goes to every sink. All of them close at the end, or when
         training stops."""
         with contextlib.ExitStack() as stack:
-            for part in (*sinks, *hooks):
-                stack.callback(part.close)
+            for block in (*sinks, *hooks):
+                stack.callback(block.close)
             for hook in hooks:
                 hook.start(self)
             while self.step < steps and not self.stopping:
-                metrics = self.update(next(data))
+                metrics = self.train_on_batch(next(data))
                 for hook in hooks:
-                    if hook.due(self.step, steps) and (report := hook(self, metrics)):
+                    if hook.due(self.step, steps) and (scalars := hook(self, metrics)):
                         for sink in sinks:
-                            sink.write(self.step, report)
+                            sink.write(self.step, scalars)
             if self.step < steps:
                 for hook in hooks:
                     hook.stop(self)
@@ -302,44 +304,46 @@ def train(
     sinks: Sequence[Sink] = (),
 ) -> dict[str, float]:
     """Train `run` to its last step, writing to its directory under `out`, after
-    preparing the datasets it reads under `cache`; the latest value of every metric
-    reported. `hooks` run after the run's own, and `sinks` get what all of them
-    report, as the console and metrics.jsonl do."""
-    t, vocab = run.train, run.arch.vocab_size
+    preparing the datasets it reads under `cache`; return the latest value of every
+    metric. `hooks` run after the run's own, and `sinks` get what all of them return,
+    as the console and metrics.jsonl do."""
+    config, vocab = run.train, run.arch.vocab_size
     if vocab is None:
         raise ValueError("a model without a vocabulary cannot be trained on tokens")
-    for job in jobs(t):
+    for job in jobs(config):
         prepare(job, cache, echo=echo)
     folder = directory(run, out)
     folder.mkdir(parents=True, exist_ok=True)
-    if primary():  # of a job of many processes, the first writes the run's files
+    if is_main_process():
         (folder / "run.bux").write_text(run_to_source(run), encoding="utf-8")
         (folder / "run.json").write_text(
             run.model_dump_json(indent=2), encoding="utf-8"
         )
 
-    with parallel.use(t.mesh, t.layout, t.methods):
-        parallel.check(t.batch, t.seq_len)
-        model = parallel.build(lambda: Model(run.arch, rngs=nnx.Rngs(t.seed)))
-        multiplier = schedule(t.schedule, t.steps)
-        tx = optimizer(t.optimizer, multiplier, model, t.clip)
+    with parallel.use(config.mesh, config.layout, config.methods):
+        parallel.check(config.batch, config.seq_len)
+        model = parallel.build(lambda: Model(run.arch, rngs=nnx.Rngs(config.seed)))
+        multiplier = lr_multiplier(config.schedule, config.steps)
+        tx = optimizer(config.optimizer, multiplier, model, config.clip)
         trainer = Trainer(
             model,
             tx,
-            objective(t.loss, run.arch),
-            compute=t.precision.compute,
-            microbatches=_accumulated(t.methods.microbatches),
+            objective(config.loss, run.arch),
+            compute=config.precision.compute,
+            microbatches=_accumulated(config.methods.microbatches),
         )
-        read = functools.partial(batches, t=t, vocab_size=vocab, cache=cache)
-        lr = peak(t.optimizer.lr, multiplier)
-        own = _hooks(run, trainer, folder, lr, read, echo)
-        latest = Latest()
+        make_batches = functools.partial(
+            batches, config=config, vocab_size=vocab, cache=cache
+        )
+        lr = lr_schedule(config.optimizer.lr, multiplier)
+        run_hooks = _hooks(run, trainer, folder, lr, make_batches, echo)
+        latest = LatestMetrics()
         trainer.fit(
-            read(t.data, start=trainer.step),
-            t.steps,
-            hooks=[*own, *hooks],
+            make_batches(config.data, start=trainer.step),
+            config.steps,
+            hooks=[*run_hooks, *hooks],
             sinks=[
-                Console(run.name, t.steps, echo),
+                Console(run.name, config.steps, echo),
                 JSONL(folder / "metrics.jsonl", append=trainer.step > 0),
                 latest,
                 *sinks,
@@ -349,8 +353,8 @@ def train(
 
 
 def _accumulated(microbatches: int) -> int:
-    """The microbatches a step accumulates gradients over: none under a pipeline,
-    which takes them through its stages instead."""
+    """Return how many microbatches a step accumulates gradients over: one under a
+    pipeline, which takes them through its stages instead."""
     return 1 if parallel.pipeline.pipelined() else microbatches
 
 
@@ -359,20 +363,22 @@ def _hooks(
     trainer: Trainer,
     folder: Path,
     lr: Schedule,
-    read: Callable[..., Iterator[Batch]],
+    make_batches: Callable[..., Iterator[Batch]],
     echo: Callable[[str], None],
 ) -> list[Hook]:
-    """The run's own hooks: its log, eval and checkpoint, which resumes `trainer`
-    from the latest checkpoint in `folder` if there is one. `read` makes the
-    batches of a data config."""
-    t = run.train
-    own: list[Hook] = [Log(every=t.log.every, lr=lr, tokens=t.batch * t.seq_len)]
-    if t.eval is not None:
-        held_out = functools.partial(read, t.eval.data, stream=1)
-        own.append(Eval(held_out, every=t.eval.every, batches=t.eval.batches))
-    if (c := t.checkpoint) is not None:
-        checkpoint = Checkpoint(folder / "checkpoints", every=c.every, keep=c.keep)
+    """Return the run's own hooks: its log, eval and checkpoint, which resumes
+    `trainer` from the latest checkpoint in `folder` if there is one."""
+    config = run.train
+    tokens = config.batch * config.seq_len
+    hooks: list[Hook] = [Log(every=config.log.every, lr=lr, tokens=tokens)]
+    if (evals := config.eval) is not None:
+        held_out = functools.partial(make_batches, evals.data, held_out=True)
+        hooks.append(Eval(held_out, every=evals.every, batches=evals.batches))
+    if (saves := config.checkpoint) is not None:
+        checkpoint = Checkpoint(
+            folder / "checkpoints", every=saves.every, keep=saves.keep
+        )
         if checkpoint.restore(trainer):
             echo(f"{run.name}: resuming at step {trainer.step}")
-        own.append(checkpoint)
-    return own
+        hooks.append(checkpoint)
+    return hooks

@@ -65,10 +65,10 @@ class CausalConv(nnx.Module):
     def side_by_side(
         self, xs: Sequence[Float[Array, "b t _"]], taps: Taps | None = None
     ) -> list[Float[Array, "b t _"]]:
-        """The conv of inputs whose channels sit side by side in its own, as of their
-        concatenation, but each on its own: q, k and v split over their own heads,
-        which concatenating them would move. The parts of its weights do not split on
-        shard boundaries, so it takes them whole."""
+        """Convolve inputs whose channels sit side by side in the conv's, as their
+        concatenation would, but each on its own: q, k and v split over their own
+        heads, which concatenating them would move. The parts of its weights do not
+        split on shard boundaries, so it takes them whole."""
         cuts = list(itertools.accumulate(x.shape[-1] for x in xs))[:-1]
         weights = jnp.split(parallel.shard(self.weight[...], None, None), cuts, axis=1)
         biases = (

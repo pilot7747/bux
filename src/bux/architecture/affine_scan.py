@@ -1,9 +1,9 @@
 """The states of a chain of affine maps of matrices, S_{n+1} = A_n S_n + B_n from a zero
 S_0: how the delta rule carries its state from chunk to chunk (``chunkwise``).
 
-On a GPU a Pallas kernel runs the whole chain, a program a head and a block of the
+On a GPU a Pallas kernel runs the whole chain, one program per head and block of the
 state's columns, which stays in registers from map to map; XLA's scan would launch
-kernels for every one. Its gradient runs the same kernel back along the chain, on
+kernels for every map. Its gradient runs the same kernel back along the chain, on
 the maps transposed. Elsewhere, or at shapes the kernel does not take, `lax.scan`.
 On a mesh, which XLA cannot split a kernel over, a `shard_map` gives each device its
 own rows and heads.
@@ -28,8 +28,9 @@ Adds = Float[Array, "z n k v"]  # B, or a state before each map
 def states(
     A: Float[Array, "b n h k k"], B: Float[Array, "b n h k v"]
 ) -> tuple[Float[Array, "b n h k v"], Float[Array, "b h k v"]]:
-    """The state before each of the n maps of each row and head, and the last."""
-    if not _kernel(A.shape[-1], B.shape[-1]):
+    """Return the state before each of the n maps of each row and head, and the
+    last."""
+    if not _kernel_runs(A.shape[-1], B.shape[-1]):
         return _heads(A, B)
     split = parallel.spec(("batch", None, "heads", None, None), B.shape)
     if not any(split):
@@ -45,7 +46,7 @@ def states(
 def _heads(
     A: Float[Array, "b n h k k"], B: Float[Array, "b n h k v"]
 ) -> tuple[Float[Array, "b n h k v"], Float[Array, "b h k v"]]:
-    """`states`, a chain a row and head."""
+    """Run `states` as one chain per row and head."""
     b, n, h, k, v = B.shape
     A, B = (jnp.moveaxis(x, 2, 1).reshape(b * h, n, k, -1) for x in (A, B))
     before, last = _chains(A, B)
@@ -53,15 +54,15 @@ def _heads(
 
 
 def _chains(A: Maps, B: Adds) -> tuple[Adds, Float[Array, "z k v"]]:
-    """The state before each map, and the last."""
-    if not _kernel(A.shape[-1], B.shape[-1]):
+    """Return the state before each map, and the last."""
+    if not _kernel_runs(A.shape[-1], B.shape[-1]):
         return _reference(A, B, jnp.zeros_like(B[:, 0]))
     return _kernel_states(A, B)
 
 
-def _kernel(k: int, v: int) -> bool:
-    """Whether the kernel runs: on a GPU, where its tiles, k by k and k by BLOCK,
-    divide as Triton needs."""
+def _kernel_runs(k: int, v: int) -> bool:
+    """Return whether the kernel runs: on a GPU, where its tiles, k by k and k by
+    BLOCK, divide as Triton needs."""
     fits = k >= 16 and k & (k - 1) == 0 and v % BLOCK == 0
     return jax.default_backend() == "gpu" and fits
 
@@ -116,8 +117,8 @@ def _run(
     warps: int = WARPS,
     maps: Any = jnp.float32,
 ) -> tuple[Adds, Float[Array, "z k v"]]:
-    """The kernel: a program a chain and `block` columns, from `start`, the maps
-    read in `maps`; interpreted off a GPU, as tests run it."""
+    """Run the kernel, one program per chain and `block` columns, from `start`, the
+    maps read in `maps`; interpreted off a GPU, as tests run it."""
     from jax.experimental.pallas import triton as plgpu
 
     z, n, k, _ = A.shape

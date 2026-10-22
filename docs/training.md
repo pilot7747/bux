@@ -391,18 +391,18 @@ fork; a new name also needs its config in `bux/train/config.py`, where the compi
 and the editor find it:
 
 ```python
-from bux.train.optim import optimizers, peak
+from bux.train.optim import lr_schedule, optimizers
 
 
 @optimizers.register("adamw")
 def _(c, multiplier, model):  # a config, the schedule's multiplier, the model
     return optax.adamw(
-        peak(c.lr, multiplier), b1=c.b1, b2=c.b2, weight_decay=c.weight_decay
+        lr_schedule(c.lr, multiplier), b1=c.b1, b2=c.b2, weight_decay=c.weight_decay
     )
 ```
 
-A hook runs after every `every` steps and after the last, and what it returns is a
-report, metrics by name, that every sink gets. When training stops early, because
+A hook runs after every `every` steps and after the last, and the scalars it
+returns, metrics by name, go to every sink. When training stops early, because
 something set `trainer.stopping` as the launcher does at SIGTERM, every hook's `stop`
 runs, and the checkpoint hook saves the step. A tracker is a sink:
 
@@ -420,8 +420,8 @@ class Wandb(Sink):
     def __init__(self, run):
         self.run = wandb.init(project="bux", name=run.name)
 
-    def write(self, step, report):
-        self.run.log(report, step=step)
+    def write(self, step, scalars):
+        self.run.log(scalars, step=step)
 
 
 train(run, hooks=[WeightNorm()], sinks=[Wandb(run)])
@@ -448,8 +448,9 @@ objective adds weight × value to the training loss and logs the values, summed 
 the layers that report the name, under that name; eval leaves them out.
 
 `train_step` and `eval_step` are what the trainer compiles, once; a subclass that
-overrides them changes what a step does (accumulating gradients, averaging the weights,
-skipping a spike) and keeps the loop, the hooks and checkpoints.
+overrides them changes what a step does (averaging the weights, skipping a spike) and
+keeps the loop, the hooks and checkpoints. Gradient accumulation is built in:
+`methods(microbatches=n)`.
 
 ## Design notes
 

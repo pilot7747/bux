@@ -4,7 +4,7 @@ A document starts at a row's first token and wherever positions stop increasing,
 at the 0 after a document. So a row cut out of the middle of one starts mid-way
 through it, and positions that skip ahead stay in their document.
 
-``Segments`` says where the documents are in the forms the layers need, made once a
+``Segments`` says where the documents are in the forms the layers need, made once per
 forward pass and none of them t by t: `ids`, the segment ids flash attention kernels
 take (splash attention's, Pallas's) to skip the blocks no query sees, and `within`,
 where causal convolutions, n-grams and targets stop looking back. A kernel that
@@ -26,7 +26,7 @@ class Segments(NamedTuple):
 
     @classmethod
     def of(cls, positions: Int[Array, "b t"]) -> "Segments":
-        """The documents of rows at `positions`."""
+        """Return the documents of rows at `positions`."""
         b, t = positions.shape
         index = jnp.arange(t)
         start = jnp.concatenate(

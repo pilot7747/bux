@@ -6,59 +6,55 @@ from jaxtyping import Array, Float
 
 from bux import config as cfg
 from bux import parallel
-from bux.architecture.functional import activation, bound
+from bux.architecture.functional import activation, softcap
 from bux.architecture.registry import Context, Taps, register
+from bux.architecture.sharding import linear
 from bux.lang import ir
 
 
-def _linear(
-    n_in: int,
-    n_out: int,
-    names: tuple[parallel.Name, parallel.Name],
-    bias: bool,
-    rngs: nnx.Rngs,
-) -> nnx.Linear:
-    """A dense layer whose kernel's dimensions are `names`, and its bias's the last."""
-    return nnx.Linear(
-        n_in,
-        n_out,
-        use_bias=bias,
-        kernel_init=parallel.named(*names),
-        bias_init=parallel.named(names[1], init=nnx.initializers.zeros),
-        rngs=rngs,
-    )
+def activate(
+    config: cfg.MLPConfig,
+    up: Float[Array, "*lead f"],
+    gate: Float[Array, "*lead f"] | None,
+) -> Float[Array, "*lead f"]:
+    """Return act(up), or act(gate) * up when gated; `limit` clips both (gate from
+    above only), and `up_softcap` caps up."""
+    if config.limit is not None:
+        up = jnp.clip(up, -config.limit, config.limit)
+    up = softcap(up, config.up_softcap)
+    if gate is None:
+        return activation(config.activation, up)
+    if config.limit is not None:
+        gate = jnp.minimum(gate, config.limit)
+    return activation(config.activation, gate) * up
 
 
-def _hidden_units(h: Float[Array, "*lead f"]) -> Float[Array, "*lead f"]:
-    """`h` over `mlp`, and its rows and positions, if it has them, split as inside a
-    layer (`seq`, not `stream`)."""
+def shard_hidden(h: Float[Array, "*lead f"]) -> Float[Array, "*lead f"]:
+    """Shard the hidden units over `mlp`, and their rows and positions, if any, as
+    inside a layer."""
     lead = ("batch", "seq", *(None,) * h.ndim)[: h.ndim - 1]
     return parallel.shard(h, *lead, "mlp")
 
 
 class MLP(nnx.Module):
-    def __init__(self, c: cfg.MLPConfig, width: int, rngs: nnx.Rngs, size: int = 0):
-        size = size or c.intermediate_size
-        self.up = _linear(width, size, ("embed", "mlp"), c.bias, rngs)
+    def __init__(
+        self, config: cfg.MLPConfig, width: int, rngs: nnx.Rngs, size: int = 0
+    ):
+        size = size or config.intermediate_size
+        gated = config.type == "gated_mlp"
+        self.up = linear(width, size, ("embed", "mlp"), config.bias, rngs)
         self.gate = (
-            _linear(width, size, ("embed", "mlp"), c.bias, rngs)
-            if c.type == "gated_mlp"
-            else None
+            linear(width, size, ("embed", "mlp"), config.bias, rngs) if gated else None
         )
-        self.down = _linear(size, width, ("mlp", "embed"), c.bias, rngs)
-        self.activation = c.activation
-        self.limit, self.up_softcap = c.limit, c.up_softcap
-        self.dropout = nnx.Dropout(c.dropout, rngs=rngs)
+        self.down = linear(size, width, ("mlp", "embed"), config.bias, rngs)
+        self.config = config
+        self.dropout = nnx.Dropout(config.dropout, rngs=rngs)
 
     def hidden(self, x: Float[Array, "*lead d"]) -> Float[Array, "*lead f"]:
-        """What the down projection takes: its hidden units, over `mlp`."""
-        up = bound(self.up(x), self.limit, self.up_softcap)
-        if self.gate is None:
-            return _hidden_units(activation(self.activation, up))
-        gate = self.gate(x)
-        if self.limit is not None:
-            gate = jnp.minimum(gate, self.limit)
-        return _hidden_units(activation(self.activation, gate) * up)
+        """Return the hidden units the down projection takes."""
+        up = self.up(x)
+        gate = None if self.gate is None else self.gate(x)
+        return shard_hidden(activate(self.config, up, gate))
 
     def __call__(
         self, x: Float[Array, "*lead d"], taps: Taps | None = None

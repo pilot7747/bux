@@ -28,7 +28,9 @@ from bux.train.registry import Registry
 
 
 class Batch(NamedTuple):
-    # numpy arrays on the host, and jax ones once the trainer puts them on a device
+    """Rows of tokens, numpy on the host and jax on a device. Position t predicts
+    input_ids[t + 1], a target where loss_mask[t + 1] is (``objective.target_mask``)."""
+
     input_ids: Int32[np.ndarray | Array, "b t"]
     position_ids: Int32[np.ndarray | Array, "b t"]
     loss_mask: Bool[np.ndarray | Array, "b t"]
@@ -117,12 +119,13 @@ class Shards:
     """Windows of memory-mapped shards of tokens, each epoch in a new order. They
     overlap by a token, so that every token is a target once."""
 
-    def __init__(self, c: tcfg.TokensConfig, seq_len: int, seed: tuple[int, ...]):
-        paths = sorted(glob.glob(c.path))
+    def __init__(self, config: tcfg.TokensConfig, seq_len: int, seed: tuple[int, ...]):
+        paths = sorted(glob.glob(config.path))
         if not paths:
-            raise FileNotFoundError(f"no shards match {c.path!r}")
+            raise FileNotFoundError(f"no shards match {config.path!r}")
         self.shards = [
-            np.memmap(p, dtype=c.dtype, mode="r", offset=c.header) for p in paths
+            np.memmap(p, dtype=config.dtype, mode="r", offset=config.header)
+            for p in paths
         ]
         self.counts = np.array(
             [max(0, (len(s) - 1) // (seq_len - 1)) for s in self.shards]
@@ -130,7 +133,7 @@ class Shards:
         self.ends = np.cumsum(self.counts)
         if not self.ends[-1]:
             raise ValueError(
-                f"every shard of {c.path!r} is shorter than {seq_len} tokens"
+                f"every shard of {config.path!r} is shorter than {seq_len} tokens"
             )
         self.seq_len, self.seed = seq_len, seed
 
@@ -205,30 +208,31 @@ def apportion(weights: Sequence[float], n: int) -> list[int]:
 
 
 def batches(
-    c: tcfg.DataConfig,
-    t: tcfg.TrainConfig,
+    data: tcfg.DataConfig,
+    config: tcfg.TrainConfig,
     vocab_size: int,
     *,
     cache: str | Path = DEFAULT_CACHE,
     start: int = 0,
-    stream: int = 0,
+    held_out: bool = False,
 ) -> Iterator[Batch]:
-    """Batches of t.batch rows of t.seq_len tokens, from batch `start` on. Streams
-    with different numbers draw independently: training is 0, evaluation 1."""
+    """Yield batches of `config.batch` rows of `config.seq_len` tokens from `data`,
+    from batch `start` on. Held-out batches are drawn independently of training's."""
     parts = (
-        c.sources
-        if isinstance(c, tcfg.MixtureConfig)
-        else (tcfg.Weighted(weight=1, source=c),)
+        data.sources
+        if isinstance(data, tcfg.MixtureConfig)
+        else (tcfg.Weighted(weight=1, source=data),)
     )
-    counts = apportion([p.weight for p in parts], t.batch)
+    counts = apportion([p.weight for p in parts], config.batch)
     for p, n in zip(parts, counts, strict=True):
         if not n:
             raise ValueError(
-                f"a batch of {t.batch} rows has no room for a source of weight "
+                f"a batch of {config.batch} rows has no room for a source of weight "
                 f"{p.weight / sum(q.weight for q in parts):.3g}"
             )
+    seed = (config.seed, int(held_out))
     streams = [
-        sources.build(p.source, t, vocab_size, cache, (t.seed, stream, k))
+        sources.build(p.source, config, vocab_size, cache, (*seed, k))
         for k, p in enumerate(parts)
     ]
     for i in itertools.count(start):

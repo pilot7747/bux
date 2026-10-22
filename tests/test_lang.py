@@ -457,6 +457,12 @@ def test_errors_point_at_the_source():
     assert "model = embed [norm atn] head" in text and "^^^" in text
 
 
+def test_an_unknown_layer_called_with_settings_says_how_to_add_one():
+    err = error("model = embed [norm diffattn(num_heads=12)] head")
+    assert err.hint is not None and err.hint.startswith("did you mean 'attn'?")
+    assert "LayerConfig" in err.hint and "register('diffattn')" in err.hint
+
+
 def test_unknown_setting_suggests_the_right_one():
     err = error("model = embed [gqa(num_heads=2, num_kv_head=2)] head")
     assert (
