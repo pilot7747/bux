@@ -18,6 +18,7 @@ a bracket is still open; ``;`` also ends one. ``#`` starts a comment.
 """
 
 import re
+from collections.abc import Callable
 from dataclasses import dataclass, field
 from decimal import Decimal
 
@@ -115,7 +116,7 @@ KEYWORDS = frozenset({"true", "false", "none", "shared", "_"})
 
 
 def _continues(src: str, i: int, stop: int) -> bool:
-    """Whether the first non-blank, non-comment line after offset `i` is indented."""
+    """Return whether the next non-blank, non-comment line after `i` is indented."""
     while i < stop:
         j = i
         while j < stop and src[j] in " \t\r":
@@ -129,13 +130,52 @@ def _continues(src: str, i: int, stop: int) -> bool:
     return False
 
 
+def _token(
+    src: str, i: int, stop: int, space: bool, fail: Callable[[BuxError], None]
+) -> Token | None:
+    if m := _NUMBER.match(src, i, stop):
+        return _number(m, space)
+    if m := _NAME.match(src, i, stop):
+        return Token("NAME", m.group(), Span(i, m.end()), space)
+    if src[i] in "\"'":
+        return _string(src, i, stop, space, fail)
+    op = next((op for op in _OPS if src.startswith(op, i)), None)
+    return None if op is None else Token("OP", op, Span(i, i + len(op)), space)
+
+
+def _number(m: re.Match[str], space: bool) -> Token:
+    text = m.group()
+    clean = text.replace("_", "")
+    value: int | float
+    if suffix := m.group(3):
+        # Exact, so that 1.1B is the integer 1_100_000_000.
+        exact = Decimal(clean[:-1]).scaleb(_SUFFIXES[suffix])
+        value = int(exact) if exact == exact.to_integral() else float(exact)
+    else:
+        value = float(clean) if (m.group(1) or m.group(2)) else int(clean)
+    return Token("NUMBER", text, Span(m.start(), m.end()), space, value)
+
+
+def _string(
+    src: str, i: int, stop: int, space: bool, fail: Callable[[BuxError], None]
+) -> Token:
+    end = src.find(src[i], i + 1, stop)
+    if end == -1 or "\n" in src[i:end]:
+        fail(BuxError("unterminated string", Span(i, i + 1)))
+        # Recovering: the string runs to the end of the line.
+        end = src.find("\n", i, stop)
+        end = stop if end == -1 else end
+        return Token("STRING", src[i:end], Span(i, end), space, src[i + 1 : end])
+    return Token("STRING", src[i : end + 1], Span(i, end + 1), space, src[i + 1 : end])
+
+
 def tokenize(
     src: str,
     start: int = 0,
     stop: int | None = None,
     errors: list[BuxError] | None = None,
 ) -> list[Token]:
-    """Tokens of ``src[start:stop]``, with spans into all of `src`.
+    """Split ``src[start:stop]`` into tokens, with spans into all of `src`.
 
     Errors raise, unless an `errors` list is given: then they are appended to it and
     tokenizing goes on, which editors need for half-typed source.
@@ -160,64 +200,21 @@ def tokenize(
             ):
                 tokens.append(Token("NEWLINE", "\n", Span(i, i + 1), space))
             i, space = i + 1, True
-            continue
-        if ch in " \t\r":
+        elif ch in " \t\r":
             i, space = i + 1, True
-            continue
-        if ch == "#":
+        elif ch == "#":
             newline = src.find("\n", i, stop)
             i, space = (stop if newline == -1 else newline), True
-            continue
-        if m := _NUMBER.match(src, i, stop):
-            text = m.group()
-            clean = text.replace("_", "")
-            value: int | float
-            if suffix := m.group(3):
-                # Exact, so that 1.1B is the integer 1_100_000_000.
-                exact = Decimal(clean[:-1]).scaleb(_SUFFIXES[suffix])
-                value = int(exact) if exact == exact.to_integral() else float(exact)
-            else:
-                value = float(clean) if (m.group(1) or m.group(2)) else int(clean)
-            tokens.append(Token("NUMBER", text, Span(i, m.end()), space, value))
-        elif m := _NAME.match(src, i, stop):
-            tokens.append(Token("NAME", m.group(), Span(i, m.end()), space))
-        elif ch in "\"'":
-            end = src.find(ch, i + 1, stop)
-            if end == -1 or "\n" in src[i:end]:
-                fail(BuxError("unterminated string", Span(i, i + 1)))
-                # Recovering: the string runs to the end of the line.
-                end = src.find("\n", i, stop)
-                end = stop if end == -1 else end
-                tokens.append(
-                    Token("STRING", src[i:end], Span(i, end), space, src[i + 1 : end])
-                )
-                i, space = end, False
-                continue
-            tokens.append(
-                Token(
-                    "STRING",
-                    src[i : end + 1],
-                    Span(i, end + 1),
-                    space,
-                    src[i + 1 : end],
-                )
-            )
-            i, space = end + 1, False
-            continue
+        elif (token := _token(src, i, stop, space, fail)) is None:
+            fail(BuxError(f"unexpected character {ch!r}", Span(i, i + 1)))
+            i, space = i + 1, False
         else:
-            op = next((op for op in _OPS if src.startswith(op, i)), None)
-            if op is None:
-                fail(BuxError(f"unexpected character {ch!r}", Span(i, i + 1)))
-                i, space = i + 1, False
-                continue
-            if op in "([":
+            if token.kind == "OP" and token.text in ("(", "["):
                 depth += 1
-            elif op in ")]":
+            elif token.kind == "OP" and token.text in (")", "]"):
                 depth = max(0, depth - 1)
-            tokens.append(Token("OP", op, Span(i, i + len(op)), space))
-            i, space = i + len(op), False
-            continue
-        i, space = m.end(), False
+            tokens.append(token)
+            i, space = token.span.end, False
     # "found end of input" points just after the last token, not past trailing lines.
     last = next((t.span.end for t in reversed(tokens) if t.kind != "NEWLINE"), stop)
     tokens.append(Token("EOF", "", Span(last, last), space))
@@ -424,35 +421,14 @@ class _Parser:
                     f"leave out 'shared': {name.text}.key = ...",
                 )
             return self.amendment(name)
-        params, defaults, param_spans = None, [], []
+        params, defaults, param_spans = None, (), ()
         if self.at("(") and not self.peek().space_before:
             if shared:
                 raise BuxError(
                     "a macro cannot be shared; share the blocks it builds instead",
                     name.span,
                 )
-            self.next()
-            params = []
-            while not self.at(")"):
-                param = self.expect_name("a parameter name")
-                if param.text in params:
-                    raise BuxError(
-                        f"parameter '{param.text}' is listed twice", param.span
-                    )
-                params.append(param.text)
-                param_spans.append(param.span)
-                if self.at("="):
-                    self.next()
-                    defaults.append((param.text, self.expr()))
-                elif defaults:
-                    raise BuxError(
-                        "parameters without a default must come first", param.span
-                    )
-                if not self.at(","):
-                    break
-                self.next()
-            self.expect(")")
-            params = tuple(params)
+            params, defaults, param_spans = self.parameters()
         self.expect("=")
         body = self.expr()
         return Statement(
@@ -462,9 +438,35 @@ class _Parser:
             params,
             body,
             shared,
-            tuple(defaults),
-            tuple(param_spans),
+            defaults,
+            param_spans,
         )
+
+    def parameters(
+        self,
+    ) -> tuple[tuple[str, ...], tuple[tuple[str, Expr], ...], tuple[Span, ...]]:
+        self.expect("(")
+        params: list[str] = []
+        defaults: list[tuple[str, Expr]] = []
+        spans: list[Span] = []
+        while not self.at(")"):
+            param = self.expect_name("a parameter name")
+            if param.text in params:
+                raise BuxError(f"parameter '{param.text}' is listed twice", param.span)
+            params.append(param.text)
+            spans.append(param.span)
+            if self.at("="):
+                self.next()
+                defaults.append((param.text, self.expr()))
+            elif defaults:
+                raise BuxError(
+                    "parameters without a default must come first", param.span
+                )
+            if not self.at(","):
+                break
+            self.next()
+        self.expect(")")
+        return tuple(params), tuple(defaults), tuple(spans)
 
     # amendment := NAME "." NAME { "." NAME } "=" expr, which means NAME = NAME(key=expr)
     def amendment(self, name: Token) -> Statement:
@@ -675,8 +677,8 @@ class _Parser:
 
 @dataclass
 class Parsed:
-    """What parse_file found: the definitions, the modules used, and for a recovering
-    parse, the syntax errors and the names of the definitions that failed to parse."""
+    """The result of parse_file: the definitions and the modules used. A recovering
+    parse adds the syntax errors and the names of definitions that failed to parse."""
 
     statements: list[Statement]
     uses: list[Use]
@@ -693,7 +695,7 @@ _HEADER = re.compile(r"(?:shared[ \t]+)?([A-Za-z_][A-Za-z0-9_]*)")
 
 
 def statement_start(source: str, offset: int) -> int:
-    """Where the statement that `offset` is in starts, judged like parse_recovering does."""
+    """Return where the statement around `offset` starts, as parse_file recovers."""
     return max(
         (m.start() for m in _STATEMENT_START.finditer(source, 0, offset)), default=0
     )
@@ -718,6 +720,10 @@ def parse_file(
         return Parsed(parser.program(), parser.uses)
     except BuxError as err:
         whole = err
+    return _parse_each(source, start, stop, whole)
+
+
+def _parse_each(source: str, start: int, stop: int, whole: BuxError) -> Parsed:
     parsed = Parsed([], [])
     starts = sorted(
         {start} | {m.start() for m in _STATEMENT_START.finditer(source, start, stop)}
@@ -734,7 +740,7 @@ def parse_file(
             if m := _HEADER.match(source, begin):
                 parsed.broken.add(m.group(1))
         parsed.uses += parser.uses
-    # Every statement parsed on its own, though the whole did not: report why.
+    # Every statement parsed on its own, but the whole did not: report why.
     parsed.errors = parsed.errors or [whole]
     return parsed
 
