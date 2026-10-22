@@ -311,7 +311,7 @@ def depth(ctx: Context, kind: str) -> tuple[int, int]:
     and how many token mixers it runs: the layer index and count that MiniMax and
     RWKV-7 start a layer by. A layer built outside the model's graph is the first."""
     starts, layers = _mixer_depths(ctx.arch, kind)
-    i = ctx.built[kind]
+    i = ctx.built.count[kind]
     return (starts[i] if i < len(starts) else 0), max(layers, 1)
 
 

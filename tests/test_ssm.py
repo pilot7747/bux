@@ -12,7 +12,7 @@ from jaxtyping import Array, Float, Int
 
 from bux import config as cfg
 from bux import parallel
-from bux.architecture import SEGMENTS, CausalConv, Model, Segments, num_params
+from bux.architecture import CausalConv, Model, Segments, Taps, num_params
 from bux.architecture.graph import ResidualBranch, Sequence
 from bux.architecture.ssm import Mamba, Mamba2, ShortConv
 from bux.lang import compile
@@ -269,7 +269,7 @@ def test_matches_a_naive_loop_over_positions(name):
         assert np.allclose(y[row], expected, atol=1e-4)
     # Two documents in a row, 3 and 4 tokens long, each from a zero state.
     docs = Segments.of(jnp.asarray([[0, 1, 2, 0, 1, 2, 3]] * 2))
-    y = layer(x, {SEGMENTS: [docs]})
+    y = layer(x, Taps(segments=docs))
     for row in range(2):
         first, second = (
             np.asarray(x[row, s], np.float64) for s in (slice(3), slice(3, 7))

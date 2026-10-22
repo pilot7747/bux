@@ -10,15 +10,7 @@ from bux import config as cfg
 from bux import parallel
 from bux.architecture.functional import softcap
 from bux.architecture.norm import Norm
-from bux.architecture.registry import (
-    NEXTN,
-    OUTPUTS,
-    TOKENS,
-    Context,
-    Taps,
-    positions,
-    register,
-)
+from bux.architecture.registry import Context, Taps, positions, register
 from bux.architecture.residual import widen, widening
 from bux.lang import ir
 
@@ -89,8 +81,8 @@ def _(
     assert ctx.arch.vocab_size is not None
     copies = widening(ctx.arch.residual) if ctx.depth == 0 else None
     embedding = Embedding(c, ctx.arch.vocab_size, ctx.arch.d_model, ctx.rngs, copies)
-    if ctx.embedding is None:
-        ctx.embedding = embedding
+    if ctx.built.embedding is None:
+        ctx.built.embedding = embedding
     return embedding
 
 
@@ -101,7 +93,7 @@ class Head(nnx.Module):
     def __init__(self, c: cfg.LMHeadConfig, width: int, ctx: Context):
         vocab = ctx.arch.vocab_size
         assert vocab is not None
-        self.embedding = ctx.embedding if c.tied else None
+        self.embedding = ctx.built.embedding if c.tied else None
         self.proj = (
             None
             if c.tied
@@ -130,7 +122,7 @@ class Head(nnx.Module):
         if self.bias is not None:
             logits = logits + self.bias
         logits = parallel.shard(softcap(logits, self.softcap), "batch", "seq", "vocab")
-        taps.setdefault(OUTPUTS, []).append(logits)
+        taps.logits.append(logits)
         return logits
 
 
@@ -155,9 +147,9 @@ class NextN(nnx.Module):
     def __init__(
         self, c: cfg.NextNConfig, width: int | Literal["streams"], ctx: Context
     ):
-        assert ctx.embedding is not None
+        assert ctx.built.embedding is not None
         d, copies = ctx.arch.d_model, widening(ctx.arch.residual)
-        self.embedding = ctx.embedding
+        self.embedding = ctx.built.embedding
         if width == "streams":  # n copies in, n copies out
             assert copies is not None
             self.hidden_norm, self.copies = Norm(c.norm, copies * d), None
@@ -171,9 +163,9 @@ class NextN(nnx.Module):
     def __call__(
         self, x: Float[Array, "b t *copies d"], taps: Taps
     ) -> Float[Array, "b t *widened d"]:
-        runs = taps.setdefault(NEXTN, [])
-        runs.append(None)
-        k, tokens = len(runs), taps[TOKENS][0]
+        taps.nextn_runs += 1
+        k, tokens = taps.nextn_runs, taps.tokens
+        assert tokens is not None
         # The last k positions (all, in a shorter row) have no token that far ahead;
         # pad them with 0.
         ahead = jnp.pad(tokens[:, k:], ((0, 0), (0, min(k, tokens.shape[1]))))

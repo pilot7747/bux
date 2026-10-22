@@ -1,13 +1,13 @@
-"""The residual algebras: what a residual branch [f] outside any other does in place of
+"""The residual algebras: what a residual branch [f] outside any other does instead of
 x + f(x), and ``merge``, which reads the stream they widen back into one.
 
 hc, mhc and gr widen the stream into n copies of it, an array (b, t, n, d). attnres
 keeps the embedding and every branch output so far, (b, t, 1 + L, d), and sums them
-into blocks as it reads: so what a branch reads follows from the state alone, at
+into blocks as it reads. So what a branch reads follows from the state alone, at
 whatever depth it runs (a shared block runs at several), and taps save and restore it
 as it is. vpgate keeps one stream. ``embed`` widens its output with ``widen``, and so
 does nextn when it gets one stream. Single-pass hc and mhc hand the read coefficients
-from one branch to the next in the taps.
+from one branch to the next in ``Taps.pending_read``.
 """
 
 import math
@@ -25,8 +25,6 @@ from bux.parallel import stream
 
 # In Sinkhorn's sums and added to mhc's read: DeepSeek-V4's hc_eps.
 _EPS = 1e-6
-# The read coefficients the last single-pass branch computed, for the next read.
-_PENDING = "<pending read>"
 
 
 def widening(residual: cfg.ResidualConfig | None) -> int | None:
@@ -80,20 +78,21 @@ def sources(
 
 
 def _pending(taps: Taps, x: Float[Array, "b t n d"]) -> Float[Array, "b t n"]:
-    """What a single-pass read uses: the coefficients the last branch computed, or
-    stream 0 alone before any branch, as DeepSeek-V4.1 starts (make_identity_pre_mix).
+    """Return the coefficients a single-pass read uses: those the last branch computed,
+    or stream 0 alone before any branch, as DeepSeek-V4.1 starts (make_identity_pre_mix).
     """
-    if _PENDING in taps:
-        return taps[_PENDING][-1]
+    if taps.pending_read is not None:
+        return taps.pending_read
     return jnp.broadcast_to(jax.nn.one_hot(0, x.shape[2]), x.shape[:3])
 
 
 def _single_pass_read(
-    own: Float[Array, "b t n"], x: Float[Array, "b t n d"], taps: Taps
+    computed: Float[Array, "b t n"], x: Float[Array, "b t n d"], taps: Taps
 ) -> Float[Array, "b t n"]:
-    """The `_pending` coefficients, leaving the branch's `own` for the next read."""
+    """Return the `_pending` coefficients, and leave the ones this branch `computed`
+    for the next read."""
     read = _pending(taps, x)
-    taps[_PENDING] = [own]
+    taps.pending_read = computed
     return read
 
 

@@ -12,9 +12,9 @@ from jaxtyping import Array, Float, Int
 
 from bux import config as cfg
 from bux import parallel
-from bux.architecture import Model
+from bux.architecture import Model, Taps
 from bux.architecture.moe import MoE, balance_loss, experts, routed, run_sorted
-from bux.architecture.registry import LOSSES, Loss
+from bux.architecture.registry import Loss
 from bux.lang import compile
 from bux.train import config as tcfg
 from bux.train.data import plain
@@ -77,9 +77,9 @@ def test_the_balance_loss_is_its_closed_form_and_one_when_balanced():
 def test_an_moe_reports_its_balance_loss_in_training_only():
     e = moe_layer(router="sigmoid", aux_loss_coef=0.5, aux_loss_scope="sequence")
     x = jax.random.normal(jax.random.key(1), (2, 5, D))
-    taps: dict[str, list] = {LOSSES: []}
+    taps = Taps(training=True)
     e(x, taps)
-    [loss] = taps[LOSSES]
+    [loss] = taps.losses
     idx, _, _ = e._route(x)
     picks = jax.nn.one_hot(idx, 4).sum(-2)
     scores = jax.nn.sigmoid(e.router(x))
@@ -90,9 +90,9 @@ def test_an_moe_reports_its_balance_loss_in_training_only():
     assert moe_layer().aux_loss_weight == 1e-2
     free = moe_layer(load_balancing="aux_free")
     assert free.aux_loss_weight == 0
-    taps = {LOSSES: []}
+    taps = Taps(training=True)
     free(x, taps)
-    assert taps[LOSSES] == []
+    assert taps.losses == []
 
 
 def test_training_moves_the_router_bias_toward_the_experts_picked_less():
@@ -101,9 +101,9 @@ def test_training_moves_the_router_bias_toward_the_experts_picked_less():
     x = jax.random.normal(jax.random.key(1), (4, 8, D))
     idx, _, _ = e._route(x)
     load = jax.nn.one_hot(idx, 4).sum((0, 1, 2))
-    e(x, {})  # not a training forward
+    e(x, Taps())  # not a training forward
     assert (e.router_bias[...] == 0).all()
-    e(x, {LOSSES: []})
+    e(x, Taps(training=True))
     assert jnp.array_equal(e.router_bias[...], 0.01 * jnp.sign(load.mean() - load))
     assert (e.router_bias[...] != 0).any()
 
@@ -213,8 +213,10 @@ def run(method: str, e: MoE, x: Float[Array, "b t d"]):
     """The output, and the gradients of the parameters and of `x`, by `method`."""
     probe = jax.random.normal(jax.random.key(2), x.shape)
     with parallel.use(tcfg.MeshConfig(data=1), methods=tcfg.MethodsConfig(moe=method)):
-        y = e(x, {})
-        grads = nnx.grad(lambda e, x: (e(x, {}) * probe).sum(), argnums=(0, 1))(e, x)
+        y = e(x, Taps())
+        grads = nnx.grad(lambda e, x: (e(x, Taps()) * probe).sum(), argnums=(0, 1))(
+            e, x
+        )
     return y, grads
 
 

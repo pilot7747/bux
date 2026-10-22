@@ -13,8 +13,7 @@ from jaxtyping import Float
 
 from bux import parallel
 from bux.__main__ import main
-from bux.architecture import Model, MoE
-from bux.architecture.graph import Scanned
+from bux.architecture import Model, MoE, Scanned
 from bux.lang import compile, compile_runs
 from bux.parallel import pipeline
 from bux.train.data import plain

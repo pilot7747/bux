@@ -15,8 +15,6 @@ from bux import config as cfg
 from bux import parallel
 from bux.architecture import (
     MLP,
-    SEGMENTS,
-    TOKENS,
     Attention,
     Context,
     Embedding,
@@ -26,6 +24,7 @@ from bux.architecture import (
     MoE,
     NextN,
     Segments,
+    Taps,
     num_params,
     registry,
 )
@@ -147,7 +146,7 @@ def test_nextn_embeds_the_token_ahead_as_the_embedding_does():
     ahead = jnp.pad(t[:, 1:], ((0, 0), (0, 1)))
     e = nextn.embed_norm(norm(embed.tokens(ahead)))
     expected = nextn.proj(jnp.concatenate([e, nextn.hidden_norm(h)], -1))
-    assert jnp.allclose(nextn(h, {TOKENS: [t]}), expected, atol=1e-5)
+    assert jnp.allclose(nextn(h, Taps(tokens=t)), expected, atol=1e-5)
 
 
 @pytest.mark.parametrize(
@@ -286,9 +285,9 @@ def test_shared_expert_sink_weights_the_shared_experts_with_the_top_k():
         w[..., None] * (jax.nn.swish(x @ gate[:, j]) * (x @ up[:, j])) @ down[j]
         for w, j in zip(jnp.moveaxis(sinks, -1, 0), each)
     )
-    full = e(x, {})
+    full = e(x, Taps())
     e.shared = None
-    assert jnp.allclose(full, e(x, {}) + shared, atol=1e-5)
+    assert jnp.allclose(full, e(x, Taps()) + shared, atol=1e-5)
 
 
 def test_interleaved_rope_is_the_half_layout_with_the_rotated_dims_reordered():
@@ -320,7 +319,9 @@ def test_yarn_attention_factor_on_the_softmax_scale():
     assert math.isclose(attn("softmax", 192).scale, 0.1352337788608801, rel_tol=1e-12)
     # With every dim rotated, both placements give the same attention.
     x = jax.random.normal(jax.random.key(0), (1, 6, D))
-    assert jnp.allclose(attn("rotary", 8)(x, {}), attn("softmax", 8)(x, {}), atol=1e-5)
+    assert jnp.allclose(
+        attn("rotary", 8)(x, Taps()), attn("softmax", 8)(x, Taps()), atol=1e-5
+    )
 
 
 def test_fused_qkv_is_the_three_projections_side_by_side():
@@ -344,7 +345,7 @@ def test_fused_qkv_is_the_three_projections_side_by_side():
         getattr(fused.qkv, name)[...] = jnp.concatenate(parts, -1)
     fused.o, fused.k_conv, fused.v_conv = split.o, split.k_conv, split.v_conv
     x = jax.random.normal(jax.random.key(0), (1, 6, D))
-    assert jnp.allclose(fused(x, {}), split(x, {}), atol=1e-5)
+    assert jnp.allclose(fused(x, Taps()), split(x, Taps()), atol=1e-5)
     # Reading its keys and values from a kv port, it projects only queries.
     read = attn(True, (ir.Port(name="kv", tap="kv", mode="read"),))
     assert read.qkv is None and read.q is not None
@@ -394,9 +395,9 @@ def test_engram_adds_gated_memory_and_is_causal():
     assert jnp.allclose(m(t)[:, :5], m(changed)[:, :5], atol=1e-5)
     engram = layer(m, 2, Engram)
     x = jax.random.normal(jax.random.key(1), (2, 8, D))
-    assert not jnp.allclose(engram(x, {TOKENS: [t]}), x)
+    assert not jnp.allclose(engram(x, Taps(tokens=t)), x)
     engram.table[...] = jnp.zeros_like(engram.table[...])
-    assert jnp.allclose(engram(x, {TOKENS: [t]}), x)  # no memory, no change
+    assert jnp.allclose(engram(x, Taps(tokens=t)), x)  # no memory, no change
 
 
 def test_engram_gates_every_copy_of_a_widened_stream_with_its_own_key():
@@ -406,8 +407,8 @@ def test_engram_gates_every_copy_of_a_widened_stream_with_its_own_key():
     c = cfg.EngramConfig(head_dim=4, table_size=50, conv_size=None)
     engram = Engram(c, "streams", Context(arch, nnx.Rngs(0)))
     x = jax.random.normal(jax.random.key(1), (2, 8, 4, D))
-    y = engram(x, {TOKENS: [tokens()]})
-    z = engram(x.at[:, :, 0].multiply(3.0), {TOKENS: [tokens()]})
+    y = engram(x, Taps(tokens=tokens()))
+    z = engram(x.at[:, :, 0].multiply(3.0), Taps(tokens=tokens()))
     assert y.shape == x.shape
     assert not jnp.allclose(y[:, :, 0], z[:, :, 0] / 3.0)
     assert jnp.allclose(y[:, :, 1:], z[:, :, 1:])
@@ -475,7 +476,7 @@ def test_a_flash_kernel_attends_within_documents_by_their_ids(monkeypatch):
     packed = jnp.concatenate([jnp.arange(n) for n in (50, 150, 56)])
     docs = Segments.of(jnp.stack([packed, jnp.arange(256) + 100]))
     x = jax.random.normal(jax.random.key(1), (2, 256, D))
-    reference = attn(x, {SEGMENTS: [docs]})
+    reference = attn(x, Taps(segments=docs))
 
     def kernel(self, x, q, k, v, docs):
         t = q.shape[1]
@@ -491,7 +492,7 @@ def test_a_flash_kernel_attends_within_documents_by_their_ids(monkeypatch):
         return out.transpose(0, 2, 1, 3)
 
     monkeypatch.setattr(Attention, "_attend", kernel)
-    assert jnp.allclose(attn(x, {SEGMENTS: [docs]}), reference, atol=1e-5)
+    assert jnp.allclose(attn(x, Taps(segments=docs)), reference, atol=1e-5)
 
 
 # --- Split over devices ----------------------------------------------------------------

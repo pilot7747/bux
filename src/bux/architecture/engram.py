@@ -13,7 +13,7 @@ from bux import config as cfg
 from bux import parallel
 from bux.architecture.conv import CausalConv
 from bux.architecture.norm import Norm
-from bux.architecture.registry import TOKENS, Context, Taps, register, segments
+from bux.architecture.registry import Context, Taps, register, segments
 from bux.lang import ir
 
 
@@ -76,7 +76,7 @@ class Engram(nnx.Module):
         assert vocab is not None
         copies = getattr(ctx.arch.residual, "expansion", 1) if width == "streams" else 1
         orders, heads = c.max_ngram_size - 1, c.num_heads
-        primes = _next_primes(c.table_size, orders * heads, ctx.primes)
+        primes = _next_primes(c.table_size, orders * heads, ctx.built.primes)
         offsets = np.cumsum([0, *primes[:-1]])
         self.primes = nnx.Variable(
             jnp.asarray(primes, jnp.uint32).reshape(orders, heads)
@@ -84,7 +84,7 @@ class Engram(nnx.Module):
         self.offsets = nnx.Variable(
             jnp.asarray(offsets, jnp.uint32).reshape(orders, heads)
         )
-        rng = np.random.default_rng(10007 * (ctx.built["engram"] + 1))
+        rng = np.random.default_rng(10007 * (ctx.built.count["engram"] + 1))
         odd = rng.integers(0, 2**31, c.max_ngram_size) * 2 + 1
         self.multipliers = nnx.Variable(jnp.asarray(odd, jnp.uint32))
         # A stand-in for the tokenizer's normalized classes, which a checkpoint replaces.
@@ -118,7 +118,8 @@ class Engram(nnx.Module):
     def __call__(
         self, x: Float[Array, "b t *copies d"], taps: Taps
     ) -> Float[Array, "b t *copies d"]:
-        tokens = taps[TOKENS][0]
+        tokens = taps.tokens
+        assert tokens is not None
         ids, pad = tokens, self.boundary or 0
         if self.classes is not None:
             ids, pad = self.classes[...][tokens], self.classes[...][pad]
