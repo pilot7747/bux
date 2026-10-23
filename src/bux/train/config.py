@@ -393,6 +393,9 @@ class MethodsConfig(Config):
     type: Literal["methods"] = "methods"
     attention: str = "auto"
     moe: str = "sorted"
+    # The picks a device of all_gather or the ragged MoE methods takes, a multiple of
+    # its own; what does not fit drops, which `dropped` reports. None: all that come.
+    capacity: Annotated[float, Field(gt=0)] | None = None
     recurrence: str = "scan"
     repeat: str = "unroll"
     # A policy by name, or as data: remat(save=[attention], first=8).
