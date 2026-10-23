@@ -229,8 +229,10 @@ parallelism); queries, keys, values and head outputs to `(batch, seq, heads, non
 the logits to `(batch, heads, seq, none)`, the keys whole, which with `seq` over
 `context` is all-gather context parallelism.
 
-The indexer picks its top-k with a stable sort: `lax.top_k` gathers every row onto
-each device.
+The indexer picks its top-k by counting, the k-th highest score found bit by bit, which
+splits with the rows and positions: `lax.top_k` sorts, and in the global view gathers
+every row onto each device. Its scores' kernel (`bux.architecture.scoring`) is a
+`shard_map` that gives a device its rows, positions and heads, and sums the heads'.
 
 ## Context parallelism: `methods.attention`
 
@@ -255,12 +257,20 @@ methods = methods(attention=ring)
 | `ulysses` | all-to-alls over `context`, from a device's positions of every head to every position of its own heads; `xla` on those; and back. `context` must divide a device's heads; kv heads it does not divide are repeated |
 | `tokamax` | tokamax's flash attention (Mosaic, then Triton, then XLA), a document from its first token on as `k_start`, split by its `q_sharding`: all-gather CP in a kernel. No sinks; Linux only (the `cuda` extra) |
 
-What only `xla` has stays in the layer: a mask of the keys each query keeps (an
-indexer's top-k, CSA's compressed latents), relative bias, length scale and attention
-dropout. A layer with one of them under a method other than `auto` raises `NotImplementedError`
-naming it, as a method does for a feature of the `AttentionArgs` it lacks. The indexer's
-loss reads the attention's probabilities, which only `xla` makes; it comes with the
-indexer's top-k, so it is `xla`'s too.
+What only `xla` has stays in the layer: relative bias, length scale and attention
+dropout. A layer with one of them under a method other than `auto` raises
+`NotImplementedError` naming it, as a method does for a feature of the
+`AttentionArgs` it lacks.
+
+Sparse attention (an indexer's top-k, CSA's compressed latents) attends by
+`bux.architecture.sparse` under `xla`, `tokamax` and `auto`, and raises under the
+others. Its keys come in parts (CSA's window, then its latents) that share one softmax,
+merged by their logsumexp in a custom VJP. On a GPU tokamax's flash kernel runs each
+part with the kept keys as a boolean mask: dense compute, exact, and t² bits of mask
+forward and bytes backward. Under `xla`, off a GPU, or in `bux.kernels.off()`, XLA runs
+it a chunk of queries at a time. Either way it is a `shard_map` that gives a device its
+rows, queries and heads, and every key: all-gather CP. The indexer's loss takes the
+attention's probabilities again from its logsumexp, a chunk of queries at a time.
 
 `ring` is a `shard_map` over `context` alone. `ulysses` is manual over every axis
 that splits q: an all-to-all in a `shard_map` of auto axes makes XLA gather every

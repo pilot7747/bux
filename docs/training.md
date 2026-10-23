@@ -113,7 +113,9 @@ checkpoints keep the bias.
 does: `indexer(..., loss_weight=1)`. Each layer that runs one adds `loss_weight` times
 KL(p ‖ softmax(I)), taken over the keys the indexer kept and averaged over the queries:
 I its scores, and p the layer's attention to those keys, summed over heads and
-normalized over them. With `block_size` (Qwen3.8 QSA) a block counts as its most
+normalized over them. p comes from the attention's logsumexp a chunk of queries at a
+time, and the indexer scores each chunk again, so neither makes t × t floats. With
+`block_size` (Qwen3.8 QSA) a block counts as its most
 attended key, and only the complete blocks kept count. In CSA (DeepSeek-V4) the keys
 are the compressed latents, and p keeps the share the window and sinks take. The
 indexer's inputs and p are detached, so this loss trains the indexer alone and the
@@ -314,6 +316,7 @@ by itself where it cannot run, and all of them do inside `bux.kernels.off()` or 
 | what | by | on a B300, against XLA |
 |------|----|------------------------|
 | softmax attention | `methods.attention = auto`, the default: tokamax's flash attention | 7x, and no t × t logits |
+| sparse attention (DSA, QSA, CSA) | `sparse`: tokamax's flash attention with the kept keys as a mask; the indexer's scores by a Pallas kernel (`scoring`), its top-k by counting | 2.6x a chunk of queries at a time, and no t × t floats |
 | linear attention, RWKV-7 | `chunkwise`: chunks of 64 positions, the state across them by a Pallas kernel (`affine_scan`) | 14-17x a scan over positions |
 | Mamba-2 | `chunkwise`, B and C a group's, the state across chunks by a matmul | 25x a scan over positions (2 × 4096 tokens, rematerialized: at 8 × 4096 the scan needs 199 GiB) |
 | KDA with `gate_lower_bound`, DeltaNet | cuDNN's fused KDA kernel (`fused_delta`) | 13x `chunkwise` |
@@ -331,6 +334,21 @@ the log's `mfu`:
 | KDA hybrid, `"KKKA"`        | 58k   |                   |
 | KDA with `gate_lower_bound=-5` | 110k, 36% |            |
 | MoE, 64 experts, top 8      | 102k, 35% | 834k          |
+
+Sparse attention trains at long context. A DeepSeek-V3.2-style 1B (MLA of 16 heads,
+DSA's indexer of 64 heads and top 2048 in all 16 layers, dense MLPs) on one B300, in
+bfloat16, against the same model by all t × t logits, as bux attended before `sparse`:
+
+| tokens a row × rows | t × t logits | `sparse` |
+|---------------------|--------------|----------|
+| 4096 × 2            | 27.0k tok/s, 85.6 GiB | 28.6k, 31.0 GiB |
+| 4096 × 8            | out of memory | 34.9k, 73.9 GiB |
+| 16384 × 1           | out of memory | 10.1k, 50.4 GiB |
+| 32768 × 1           | out of memory | 7.1k, 84.7 GiB |
+
+At 32k a layer's attention takes 1.4-1.9 times dense flash attention's time, and the
+indexer most of the rest: its selection 61 ms, its loss 75 ms and the loss's target
+33 ms, forward and backward.
 
 Batches go to the devices two ahead of the step (`prefetch`). With
 `methods(donate=true)` a step's new state takes the old one's memory: the 1.3B's step
