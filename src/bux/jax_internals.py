@@ -32,7 +32,9 @@ VERIFIED_ON = {
 
 # --- Jaxprs: split.py takes a backward apart by them, flops.py counts them --------
 #
-# `core` is jax.extend.core: Jaxpr, ClosedJaxpr, JaxprEqn, Literal.
+# `core` is jax.extend.core: Jaxpr, ClosedJaxpr, JaxprEqn, Literal. A param renamed
+# fails loudly where it is read; a primitive renamed only stops matching, which
+# split.py and flops.py would miss in silence.
 
 Primitive = core.Primitive  # what a remat policy is called with, by each equation
 CALLS = frozenset({"jit", "remat2"})  # the primitives of jax.jit and jax.checkpoint
@@ -45,20 +47,20 @@ def calls_a_jaxpr(eqn: core.JaxprEqn) -> bool:
 
 
 def called_jaxpr(eqn: core.JaxprEqn) -> core.ClosedJaxpr:
-    """Return the jaxpr that the call `eqn` runs: its param "jaxpr"."""
+    """Return the jaxpr that the call `eqn` runs, which split.py inlines."""
     inner = eqn.params["jaxpr"]
     return inner if isinstance(inner, core.ClosedJaxpr) else core.ClosedJaxpr(inner, ())
 
 
 def is_scan(eqn: core.JaxprEqn) -> bool:
-    """Whether `eqn` is a lax.scan, which split.py splits and flops.py counts by its
-    length."""
+    """Whether `eqn` is a lax.scan, which split.py splits in two (else the input's
+    part runs it whole) and flops.py counts by its length."""
     return eqn.primitive.name == "scan"
 
 
 def is_cond(eqn: core.JaxprEqn) -> bool:
     """Whether `eqn` is a lax.cond (or lax.switch), which split.py splits branch by
-    branch."""
+    branch (else the input's part runs it whole)."""
     return eqn.primitive.name == "cond"
 
 
@@ -77,7 +79,7 @@ def scan_counts(eqn: core.JaxprEqn) -> tuple[int, int]:
 
 def scan_options(eqn: core.JaxprEqn) -> dict[str, Any]:
     """Return the scan `eqn`'s length, direction and unrolling, as lax.scan takes
-    them to run it again."""
+    them: split.py runs each part's scan so."""
     p = eqn.params
     return {"length": p["length"], "reverse": p["reverse"], "unroll": p["unroll"]}
 
@@ -89,7 +91,8 @@ def cond_branches(eqn: core.JaxprEqn) -> Sequence[core.ClosedJaxpr]:
 
 def bind(eqn: core.JaxprEqn, ins: Sequence[Any]) -> list[Any]:
     """Run the equation `eqn` on `ins`, under its context (its mesh, its dtype of
-    compute), as jax.core.eval_jaxpr does: its outputs, as a list."""
+    compute), as jax.core.eval_jaxpr does: its outputs, as a list. split.py runs
+    each part of a backward so."""
     params = eqn.primitive.get_bind_params(eqn.params)
     with eqn.ctx.manager:
         out = eqn.primitive.bind(*ins, **params)
@@ -97,6 +100,8 @@ def bind(eqn: core.JaxprEqn, ins: Sequence[Any]) -> list[Any]:
 
 
 # --- A vjp rebuilt from its residuals: scheduled.py keeps them a microbatch apart --
+#
+# `VJP` is what jax.vjp returns, a pytree of its residuals.
 
 
 def rebuild_vjp(
@@ -153,12 +158,10 @@ def cudnn_attention(
     window: int | None,
 ) -> jax.Array:
     """Return cuDNN's causal attention, within `window`, and with `lengths` and
-    `starts` of each row's documents each by itself (cuDNN's packed layout): JAX's
-    own call of it, which jax.nn.dot_product_attention does not expose."""
-    packed = lengths is not None
-    mask = (
-        cudnn_fused.MaskType.PADDING_CAUSAL if packed else cudnn_fused.MaskType.CAUSAL
-    )
+    `starts` of each row's documents each by itself (cuDNN's packed layout): by
+    JAX's own call of it, as jax.nn.dot_product_attention takes no packed layout."""
+    masks = cudnn_fused.MaskType
+    mask = masks.CAUSAL if lengths is None else masks.PADDING_CAUSAL
     return cudnn_fused.dot_product_attention(
         q,
         k,
