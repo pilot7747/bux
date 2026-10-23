@@ -6,7 +6,7 @@ import numpy as np
 import pytest
 from flax import nnx
 from jax.sharding import PartitionSpec as P
-from jaxtyping import Array, Int
+from jaxtyping import Array, Int, Shaped
 
 from bux import config as cfg
 from bux import parallel
@@ -145,7 +145,7 @@ def _kept_bytes(
     beta = jax.nn.sigmoid(jax.random.normal(ks[4], (b, t, h)))
     xs = (q, k, v, g, beta)
 
-    def kept(*xs: jax.Array) -> list[jax.Array]:
+    def kept(*xs: Shaped[jax.Array, "..."]) -> list[Shaped[jax.Array, "..."]]:
         return jax.tree.leaves(jax.vjp(lambda *x: delta_rule(*x, None), *xs)[1])
 
     methods = tcfg.MethodsConfig(states=states)

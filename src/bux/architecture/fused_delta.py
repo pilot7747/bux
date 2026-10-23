@@ -28,7 +28,7 @@ from typing import Any
 import jax
 import jax.numpy as jnp
 from jax.sharding import PartitionSpec as P
-from jaxtyping import Array, Float, Int
+from jaxtyping import Array, Float, Int, Shaped
 
 from bux import kernels, parallel
 from bux.architecture.segments import Segments
@@ -126,8 +126,12 @@ def _rows(
     return jax.lax.cond(fits, kernel, fallback, q, k, v, g, beta, within)
 
 
-Rows = tuple[Array, ...]  # q, k, v, the log decay and beta (b, t, h, ...), and within
-Tokens = tuple[Array, ...]  # the same packed end to end (THD), and cu_seqlens
+Rows = tuple[
+    Shaped[Array, "..."], ...
+]  # q, k, v, the log decay and beta (b, t, h, ...), and within
+Tokens = tuple[
+    Shaped[Array, "..."], ...
+]  # the same packed end to end (THD), and cu_seqlens
 
 
 @functools.partial(jax.custom_vjp, nondiff_argnums=(0,))
@@ -147,14 +151,16 @@ def _kernel(
     return _kernel_forward(room, q, k, v, g, beta, within)[0]
 
 
-def _kernel_forward(room: int, *rows: Array) -> tuple[Float[Array, "b t h dv"], Rows]:
+def _kernel_forward(
+    room: int, *rows: Shaped[Array, "..."]
+) -> tuple[Float[Array, "b t h dv"], Rows]:
     v = rows[2]
     return _run(*_packed(room, *rows)).reshape(v.shape), rows
 
 
 def _kernel_backward(
     room: int, rows: Rows, d_out: Float[Array, "b t h dv"]
-) -> tuple[Array | None, ...]:
+) -> tuple[Shaped[Array, "..."] | None, ...]:
     tokens = _packed(room, *rows)
     grads = _grads(*tokens, d_out.reshape(tokens[2].shape).astype(tokens[0].dtype))
     return (*(d.reshape(x.shape).astype(x.dtype) for d, x in zip(grads, rows)), None)
@@ -163,7 +169,7 @@ def _kernel_backward(
 _kernel.defvjp(_kernel_forward, _kernel_backward)
 
 
-def _packed(room: int, *rows: Array) -> Tokens:
+def _packed(room: int, *rows: Shaped[Array, "..."]) -> Tokens:
     """Return the rows packed end to end, q, k and v in v's dtype, the log decays and
     steps in float32, and the documents' bounds cu_seqlens, `room` + 1 of them."""
     q, k, v, g, beta, within = rows
@@ -176,7 +182,7 @@ def _packed(room: int, *rows: Array) -> Tokens:
     return q, k, v, gates, beta.reshape(b * t, h).astype(jnp.float32), cu
 
 
-def _run(*tokens: Array) -> Array:
+def _run(*tokens: Shaped[Array, "..."]) -> Shaped[Array, "..."]:
     """Return the outputs of the packed tokens by GDN's kernel for one decay a head
     (gates of n by h), else KDA's."""
     if tokens[3].ndim == 2:
@@ -185,7 +191,7 @@ def _run(*tokens: Array) -> Array:
     return frost.kimi_delta_attention_fwd(*tokens, scale=1.0)[0]
 
 
-def _grads(*tokens: Array) -> tuple[Array, ...]:
+def _grads(*tokens: Shaped[Array, "..."]) -> tuple[Shaped[Array, "..."], ...]:
     """Return the gradients of q, k, v, the log decays and the steps of the packed
     tokens, of which the last is the outputs': by the kernels' backward passes,
     which compute the chunks' states again."""
@@ -197,7 +203,7 @@ def _grads(*tokens: Array) -> tuple[Array, ...]:
     return tuple(frost.kimi_delta_attention_bwd(saved, d_out)[:5])
 
 
-def _like(x: Array) -> jax.ShapeDtypeStruct:
+def _like(x: Shaped[Array, "..."]) -> jax.ShapeDtypeStruct:
     """Return the shape and dtype of a result like `x`."""
     return jax.ShapeDtypeStruct(x.shape, x.dtype)
 
@@ -206,8 +212,8 @@ def _like(x: Array) -> jax.ShapeDtypeStruct:
 
 
 def _graph_call(
-    op: str, results: list[jax.ShapeDtypeStruct], *xs: Array
-) -> tuple[Array, ...]:
+    op: str, results: list[jax.ShapeDtypeStruct], *xs: Shaped[Array, "..."]
+) -> tuple[Shaped[Array, "..."], ...]:
     """Run cuDNN's graph of the node `op` on `xs`, as a callback that XLA hands its
     buffers and its stream; the graph's workspace is one more of its results."""
     shapes = tuple((x.shape, x.dtype.name) for x in xs)
