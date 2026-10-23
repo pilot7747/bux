@@ -109,6 +109,14 @@ def _top(scores: Float[Array, "b t n"], top_k: int) -> Int[Array, "b t k"]:
     return _indices(kept, k)
 
 
+def _dense(k: int, n: int) -> bool:
+    """Return whether the loss scores all n keys again rather than gather the k each
+    query keeps: when it keeps a quarter of them or more. The gather's gradient adds
+    into a key once for every query that keeps it, and on a B300 those adds cost more
+    than scoring every key below that (at 4k keys, top 2048: 5 times as much)."""
+    return 4 * k >= n
+
+
 def _ordered(x: Float[Array, "*s"]) -> UInt[Array, "*s"]:
     """Return unsigned integers in the order of the floats `x`."""
     u = jax.lax.bitcast_convert_type(x.astype(jnp.float32), jnp.uint32)
@@ -347,13 +355,29 @@ class Indexer(nnx.Module):
             if scored.block is not None:
                 p = _per_block(p, scored.block, "max")
             p = jnp.take_along_axis(p, jnp.maximum(kept, 0), axis=-1)
-            scores = self._scores_at(x, query, pos, scored.keys, kept)
+            scores = self._scores_of(x, query, pos, scored.keys, kept)
             return _kl(p, scores.astype(jnp.float32), kept >= 0)
 
         own = (scored.x, scored.query, scored.pos, scored.kept)
-        k = scored.kept.shape[-1] * max(self.heads, self.head_dim)
-        count = chunks(scored.x.shape[1], max(k, width))
+        k, n = scored.kept.shape[-1], scored.keys.shape[1]
+        per = self.heads * n if _dense(k, n) else k * max(self.heads, self.head_dim)
+        count = chunks(scored.x.shape[1], max(per, width))
         return chunked(jax.checkpoint(kl), (own, xs), count).mean()
+
+    def _scores_of(
+        self,
+        x: Float[Array, "b t d"],
+        query: Float[Array, "b t e"],
+        pos: Int[Array, "b t"],
+        keys: Float[Array, "b s i"],
+        index: Int[Array, "b t k"],
+    ) -> Float[Array, "b t k"]:
+        """Return each query's scores for its kept keys: of every key, then taken,
+        where `_dense` says that is cheaper; else of the kept keys alone."""
+        if not _dense(index.shape[-1], keys.shape[1]):
+            return self._scores_at(x, query, pos, keys, index)
+        every = self.scores(x, query, pos, keys)
+        return jnp.take_along_axis(every, jnp.maximum(index, 0), axis=-1)
 
     def _blocks(
         self,
