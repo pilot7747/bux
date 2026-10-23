@@ -476,6 +476,7 @@ PATTERN = (
     + "A = [norm attn] [norm ffn]\nmtp = $h! nextn [norm ffn] norm @h head\n"
     + 'model = embed "AA" A^2 norm @h head mtp'
 )
+BRANCHES = PRELUDE + "model = embed [norm ffn]^4 norm head"  # a pass is a branch
 # The residual branches outside any other: before the first head, and all.
 NUMBERED = {
     "llama": (FAMILIES["llama"], 4, 4),
@@ -483,6 +484,7 @@ NUMBERED = {
     "mhc": (FAMILIES["mhc"], 4, 4),
     "scanned": (SCANNED, 8, 8),
     "pattern": (PATTERN, 8, 9),
+    "branches": (BRANCHES, 4, 4),
 }
 
 
@@ -500,19 +502,40 @@ def test_branches_are_numbered_as_they_run_scanned_or_not(arch):
     assert ran is not None and (model.main_branches, ran.next) == (main, every)
 
 
-@pytest.mark.parametrize("given", ["first=3", "last=2", "first=1, last=0.5"])
-def test_a_scanned_repeat_multiplies_its_first_and_last_as_unrolled(losses, given):
+EDGES = [
+    (SCANNED, "first=3"),
+    (SCANNED, "last=2"),
+    (SCANNED, "first=1, last=0.5"),
+    (BRANCHES, "first=1, last=2"),
+]
+
+
+@pytest.mark.parametrize(("source", "given"), EDGES)
+def test_a_scanned_repeat_multiplies_its_first_and_last_as_unrolled(
+    losses, source, given
+):
     # The first step's loss, which the formats decide: in mxfp8 a gradient moves by
     # a few percent at a change of one ulp in the parameters, as the scan's sums make.
     everywhere = "precision(compute=float32, matmuls=mxfp8)"
     precision = everywhere.replace(")", f", {given})")
     run = {"mesh": ONE, "optimizer": STABLE, "steps": 1}
-    [unrolled] = losses(SCANNED, precision=precision, **run)
+    [unrolled] = losses(source, precision=precision, **run)
     scan = "methods(repeat=scan)"
-    [scanned] = losses(SCANNED, precision=precision, methods=scan, **run)
-    [quantized] = losses(SCANNED, precision=everywhere, **run)
+    [scanned] = losses(source, precision=precision, methods=scan, **run)
+    [quantized] = losses(source, precision=everywhere, **run)
     assert scanned == pytest.approx(unrolled, rel=1e-6)
     assert quantized != pytest.approx(unrolled, rel=1e-5)
+
+
+def test_first_and_last_branches_inside_a_pipeline_are_an_error(losses):
+    given = {
+        "optimizer": STABLE,
+        "precision": "precision(compute=float32, matmuls=mxfp8, first=1)",
+        "mesh": "mesh(stage=2, data=1)",
+        "methods": "methods(repeat=scan, microbatches=2)",
+    }
+    with pytest.raises(ValueError, match="fall inside a pipelined repeat"):
+        losses(SCANNED, **given)
 
 
 def test_the_routed_experts_in_a_format_are_an_error():
