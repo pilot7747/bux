@@ -1,7 +1,7 @@
 """The heads' losses by each method of `methods.loss` (bux.architecture.logits), the
 logits whole and by chunks of positions, against the reference cross-entropy: values
-and gradients, on one device and split over the 8 CPU devices the tests have, and the
-memory chunks leave."""
+and gradients, on one device and split over the 8 CPU devices the tests have, how
+often each multiplies by the vocabulary, and the memory chunks leave."""
 
 from collections.abc import Callable
 
@@ -10,6 +10,7 @@ import jax.numpy as jnp
 import numpy as np
 import pytest
 from flax import nnx
+from jax.extend.core import ClosedJaxpr, Jaxpr
 from jaxtyping import Array, Float, Int
 
 from bux import parallel
@@ -163,6 +164,51 @@ def test_a_term_that_reads_the_logits_makes_them_once():
     obj.terms["logit_l2"] = Term(1e-4, lambda logits, _: jnp.mean(logits[0] ** 2))
     (_, metrics), _ = obj(model.heads(*_inputs(batch)), batch)
     assert jnp.allclose(metrics["logit_l2"], jnp.mean(heads[0] ** 2))
+
+
+def _vocab_products(jaxpr: Jaxpr) -> int:
+    """How many products of matrices in `jaxpr` take or make a vocabulary's 256."""
+    n = 0
+    for eqn in jaxpr.eqns:
+        shapes = [getattr(v.aval, "shape", ()) for v in (*eqn.invars, *eqn.outvars)]
+        n += eqn.primitive.name == "dot_general" and any(256 in s for s in shapes)
+        for param in eqn.params.values():
+            for sub in param if isinstance(param, tuple | list) else (param,):
+                if isinstance(sub, ClosedJaxpr):
+                    sub = sub.jaxpr
+                if isinstance(sub, Jaxpr):
+                    n += _vocab_products(sub)
+    return n
+
+
+@pytest.mark.parametrize("loss", LOSSES)
+def test_a_head_multiplies_by_the_vocabulary_three_times_by_either_method(
+    chunked, loss
+):
+    # Its logits, and their gradients by W and by x: by chunks, all in the forward, in
+    # a scan whose body the jaxpr has once.
+    arch, batch = _arch(HEADS["untied"]), _batch()
+    graphdef, params, rest = nnx.split(Model(arch, rngs=nnx.Rngs(0)), nnx.Param, ...)
+    obj = objective(tcfg.LossConfig(mtp=0.5), arch)
+
+    def of(params: nnx.State) -> Float[Array, ""]:
+        model = nnx.merge(graphdef, params, rest)
+        return obj(model.heads(*_inputs(batch)), batch)[0].loss
+
+    with _use(ONE, loss):
+        jaxpr = jax.make_jaxpr(jax.grad(of))(params)
+    assert _vocab_products(jaxpr.jaxpr) == 3 * 3  # 3 heads
+
+
+def test_chunks_give_the_loss_without_its_gradient_as_logits_do(chunked):
+    arch, batch = _arch(HEADS["tied_bias_softcap"]), _batch()
+    model = Model(arch, rngs=nnx.Rngs(0))
+
+    def loss(method: str) -> Float[Array, ""]:
+        with _use(ONE, method):
+            return jax.jit(_fused(arch))(model, batch)
+
+    np.testing.assert_allclose(loss("chunks"), loss("logits"), rtol=1e-5)
 
 
 # --- Memory -----------------------------------------------------------------------------
