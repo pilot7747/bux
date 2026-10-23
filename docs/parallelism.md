@@ -64,12 +64,13 @@ its runs side by side, each on a group of free GPUs, and a run that needs more G
 than there are fails at once. A run alone also trains on many hosts, one process each,
 when Slurm, Open MPI or `JAX_NUM_PROCESSES` say so
 ([Launching](training.md#launching)). The mesh then spans every process's devices,
-and `parallel.shard_batch` builds a batch with `jax.make_array_from_callback`: every
-process makes all of it, as it depends only on the seed and the step, and puts the
-rows its own devices hold, just before the step that reads it (a thread loads the
-next two on the host, `prefetch`). `tests/test_launch.py` trains the smoke run as two
-processes of 4 CPU devices each, through `jax.distributed` on localhost, as one
-process of 8 does.
+each node holding a block of its innermost axes ([Many nodes](#many-nodes)). Each
+process reads the rows of a batch that its devices hold (`parallel.local_rows`), as
+a batch depends only on the seed and the step, and `parallel.shard_batch` puts them
+there with `jax.make_array_from_callback`, just before the step that reads it (a
+thread loads the next two on the host, `prefetch`). `tests/test_launch.py` trains
+the smoke run as two processes of 4 CPU devices each, through `jax.distributed` on
+localhost, as one process of 8 does.
 
 `bux plan` shows what each run takes before it starts: its FLOPs a token
 ([the log](training.md#running)), its GPUs, the bytes of its parameters and of its
@@ -85,6 +86,84 @@ $ bux plan examples/experiments/smoke.bux 'mesh = fsdp: mesh(fsdp=8) | one: mesh
 id          params  tokens  tok/param  flops/tok  gpus  params/gpu  optim/gpu  bubble  run
 bbbf3ae709  156k    25.6k   0.2        1.03M      8     76.2KiB     152KiB     0%      smoke[fsdp]
 bbbf3ae709  156k    25.6k   0.2        1.03M      1     609KiB      1.19MiB    0%      smoke[one]
+```
+
+## Many nodes
+
+```
+mesh = mesh(fsdp=16)            # FSDP over two nodes of 8 GPUs
+mesh = mesh(data=2, fsdp=8)     # HSDP: FSDP within a node, a copy on each
+```
+
+XLA puts the GPUs of a node, or of an NVLink domain that spans nodes, in one slice
+(`slice_index`), and `jax.make_mesh` refuses devices of more than one. So
+`parallel.mesh` lays them out itself (`mesh.grid`), as MaxText's hybrid mesh does: a
+node holds a block of the innermost axes, filled from `tensor` outward, and the axes
+outside it span nodes (`mesh.split`). On nodes of 8, `mesh(data=2, fsdp=8,
+tensor=2)` puts `tensor=2 × fsdp=4` in each, and `data=2 × fsdp=2` across them. A
+mesh that does not fill nodes so, `tensor=3` on nodes of 8, is an error that names the
+axis. Where devices have no slice, as CPUs do, a process is a node.
+
+Each process reads the rows of a batch that its devices hold, and leaves the others 0
+(`parallel.local_rows`): no process reads the whole batch, and no source makes the
+permutation of a whole corpus ([Reading](data.md#reading)).
+`tests/test_nodes.py` checks that processes reading their own rows of every kind of
+source make the batch one process does.
+
+FSDP's axes take `context` and `expert` with `fsdp` (`layout.fsdp`, [How names
+resolve](#how-names-resolve)), so a dense parameter and its Adam state are not copied
+over them; `layout.fsdp = fsdp` takes `fsdp` alone. On 8 CPU devices a dense run and
+an MoE train as one device does on `fsdp=2, context=2, expert=2` and `context=2,
+expert=4`, with no rematerialization in full. On 8 B300s, for the 1.3B dense model of
+[Muon](#muon-methodsorthogonalize) on `fsdp=4, context=2` and its 5.2B MoE on
+`fsdp=2, expert=4` (8 rows of 4096 a GPU, bfloat16), it is a little faster, and it
+halves what the dense model keeps a GPU:
+
+| model, mesh                 | `layout.fsdp = fsdp` | the default  | parameters a GPU |
+|-----------------------------|----------------------|--------------|------------------|
+| dense, `fsdp=4, context=2`  | 886k tok/s           | **903k**     | 1.19 GiB → 611 MiB |
+| MoE, `fsdp=2, expert=4`     | 820k tok/s           | **830k**     | 3.42 GiB → 2.40 GiB |
+
+### The compile cache
+
+The processes of a job must all find a program in JAX's cache, or all compile it: on
+GPUs XLA's autotuner splits its work among the processes that compile a program, and
+each waits for the others' shares (`xla_gpu_shard_autotuning`), so one that compiles
+a program another loads waits a day. Only the first process writes the cache, so they
+agree only where it is one folder for all of them, on a filesystem every host mounts:
+set `JAX_COMPILATION_CACHE_DIR` there. When the processes join,
+`runtime.agree_on_cache` checks that it is, a file the first makes there that the
+others see, and else turns the cache off and says so: each launch then compiles
+everything, together. JAX's `jax_share_binary_between_hosts` hangs the same way (the
+first compiles alone and waits for the others' shares), so bux leaves it off.
+
+### On B300s
+
+NCCL reaches InfiniBand through libibverbs and its mlx5 provider, which the Docker
+image installs. Without them it talks between nodes over TCP sockets: on two B300
+nodes an all-reduce of 64 MiB a GPU across the nodes ran at a bus bandwidth of 1 GB/s,
+and 25 GB/s over InfiniBand (4 and 42 GB/s over all 16 GPUs). `NCCL_DEBUG=INFO`
+says which: `Using network IB`, not `Socket`.
+
+The 1.3B dense model, 8 rows of 4096 a GPU, bfloat16, the cache on a filesystem both
+nodes mount (launch: from its start to the fifth step):
+
+| mesh                         | GPUs | tok/s     | a GPU  | of one node's | launch, cold / warm |
+|------------------------------|------|-----------|--------|---------------|---------------------|
+| `fsdp=8`                     | 8    | 1,133k    | 141.4k |               |                     |
+| `fsdp=16`                    | 16   | 2,220k    | 138.7k | 98.1%         | 78 s / 42 s         |
+| `data=2, fsdp=8` (HSDP)      | 16   | 2,238k    | 139.9k | 98.9%         | 80 s / 42 s         |
+
+Warm, both processes load the train step from the cache (0.3 s, where it compiles in
+16 s); with a cache on each node, which bux turns off, every launch is cold (76 s).
+
+Each host runs one process, the same command, with `JAX_COORDINATOR_ADDRESS` (the
+first host's `ip:port`), `JAX_NUM_PROCESSES` and `JAX_PROCESS_ID`:
+
+```
+JAX_COORDINATOR_ADDRESS=10.0.0.1:12355 JAX_NUM_PROCESSES=2 JAX_PROCESS_ID=0 \
+JAX_COMPILATION_CACHE_DIR=/shared/bux-cache \
+    bux launch bench.bux 'mesh = mesh(data=2, fsdp=8)' --out /shared/runs
 ```
 
 ## Names
@@ -129,9 +208,13 @@ to resolve them. The optimizer's state inherits them from the parameters it trac
    earlier dimension already uses. If their sizes don't divide the dimension (or its
    count), it stays whole: GQA's 2 kv heads under `tensor=4` are replicated, though
    their `2 * k` columns would split 4 ways.
-2. Then FSDP: the largest whole dimension that the `fsdp` size divides splits over
-   `fsdp`, unless a dimension already does. So a layer with no names at all still
-   trains under FSDP; names matter only for TP and EP.
+2. Then FSDP: the largest whole dimension that FSDP's axes divide splits over them,
+   or if none does, over as many of them as one does, from the first. FSDP's axes are
+   `layout.fsdp`, those of `fsdp`, `context` and `expert` that no dimension splits
+   over already: the axes that would copy a dense parameter, but `data`, whose copies
+   are HSDP's. So a layer with no names at all still trains under FSDP, an expert
+   kernel keeps its experts over `expert` and splits over `fsdp` and `context`, and
+   names matter only for TP and EP.
 3. FSDP applies to parameters and the optimizer's state, or with `layout(zero=1)` to
    the optimizer's state alone. Other state, such as RNG state, splits by its names
    alone.

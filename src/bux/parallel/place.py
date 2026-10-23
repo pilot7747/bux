@@ -7,9 +7,9 @@ import jax
 import numpy as np
 from flax import nnx
 from jax.core import Tracer
-from jax.sharding import NamedSharding
+from jax.sharding import Mesh, NamedSharding
 from jax.sharding import PartitionSpec as P
-from jaxtyping import Array, Shaped
+from jaxtyping import Array, Int, Shaped
 
 from bux.parallel.layout import NAMES, fsdp, partition, resolve, shard
 from bux.parallel.mesh import Active, active
@@ -74,19 +74,35 @@ def shard_batch[T](batch: T) -> T:
     """Put every (b, t) host array of `batch` on the devices: rows over `batch`,
     positions over `seq`.
 
-    In a job of many processes, each has the whole batch and puts the parts its own
-    devices hold.
+    In a job of many processes, each puts the parts its own devices hold, of a batch
+    whose other rows it need not have (``local_rows``).
     """
     on = active()
     if on is None:
         return jax.device_put(batch)
 
     def put(x: Shaped[np.ndarray, "b ..."]) -> Shaped[Array, "b ..."]:
-        names = ("batch", "seq", *(None,) * x.ndim)[: x.ndim]
-        sharding = NamedSharding(on.mesh, partition(resolve(names, x.shape, on)))
+        sharding = _batch_sharding(x.shape, on)
         return jax.make_array_from_callback(x.shape, sharding, lambda part: x[part])
 
     return jax.tree.map(put, batch)
+
+
+def _batch_sharding(shape: tuple[int, ...], on: Active) -> NamedSharding:
+    names = ("batch", "seq", *(None,) * len(shape))[: len(shape)]
+    return NamedSharding(on.mesh, partition(resolve(names, shape, on)))
+
+
+def local_rows(rows: int, seq_len: int) -> Int[np.ndarray, " n"]:
+    """Return the rows of a batch of `rows` that this process's devices hold, as
+    ``shard_batch`` splits it, in order: every row on one process or outside ``use``."""
+    on = active()
+    if on is None or jax.process_count() == 1 or not isinstance(on.mesh, Mesh):
+        return np.arange(rows)
+    shape = (rows, seq_len)
+    held = _batch_sharding(shape, on).addressable_devices_indices_map(shape).values()
+    mine = {r for part in held if part is not None for r in range(rows)[part[0]]}
+    return np.array(sorted(mine), int)
 
 
 def microbatches[T](batch: T, n: int) -> T:
