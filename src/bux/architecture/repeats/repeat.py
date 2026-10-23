@@ -140,7 +140,7 @@ class Scanned(nnx.Module):
     def _runs(self) -> list[range]:
         """Split the passes into runs that trace alike: whose branches multiply alike
         (``matmuls.cuts``), and that rematerialize alike (``remat.cuts``)."""
-        cuts = [*matmuls.cuts(self.times, self.each), *remat.cuts(self.times)]
+        cuts = [*matmuls.cuts(self.times, self.each), *remat.cuts()]
         return tracing.runs(self.times, cuts)
 
     def _pipelined(self, x: Stream, taps: Taps) -> Stream:

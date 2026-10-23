@@ -117,8 +117,8 @@ class Stage:
     """A stage's share of a round, run on one microbatch as a function of arrays alone:
     ``(params, rest, x, rows) -> (y, rest, losses)``. Stage s runs `shares[s]` of
     the round's passes, and holds as many as the most any runs, `layers`: it passes
-    the stream through the others (``pipeline.spread``). As it traces, `reports` keeps the
-    names and weights of the losses."""
+    the stream through the others (``pipeline.spread``). As it traces, `reports`
+    keeps the names and weights of the losses."""
 
     def __init__(
         self,
@@ -163,7 +163,7 @@ class Stage:
         (``_skipping``). The run's `remat(first=n)` counts them from the stage's
         first."""
         every, rests = min(self.shares), []
-        for run in tracing.runs(self.layers, [every, *remat.cuts(self.layers)]):
+        for run in tracing.runs(self.layers, [every, *remat.cuts()]):
             part = stacked.passes(state, run)
             with tracing.passes(run):
                 if run.start < every:
@@ -205,15 +205,15 @@ def _skipping(
     pipelined pass leaves the taps as it found them, so the scan carries the stream
     alone."""
     call = pure.Pure(graphdef, taps)
+    layer = stacked.scanned_pass(call, compute)
 
-    def run(
+    def run_layer(
         s: nnx.State, x: Stream
     ) -> tuple[Stream, nnx.State, list[Float[Array, ""]]]:
-        y, rest, _, losses = call(stacked.cast(s, compute), x, pure.NOTHING)
+        y, rest, _, losses = layer(s, x, pure.NOTHING)
         return y, rest, losses
 
-    layer = remat.checkpoint(run, prevent_cse=False, scanned=True)
-    _, _, reported = jax.eval_shape(layer, stacked.at(state, 0), x)
+    _, _, reported = jax.eval_shape(run_layer, stacked.at(state, 0), x)
 
     def skip(
         s: nnx.State, x: Stream
@@ -223,7 +223,7 @@ def _skipping(
 
     def step(x: Stream, xs: tuple[nnx.State, Bool[Array, ""]]) -> tuple[Stream, tuple]:
         s, runs = xs
-        y, rest, losses = jax.lax.cond(runs, layer, skip, s, x)
+        y, rest, losses = jax.lax.cond(runs, run_layer, skip, s, x)
         return y, (rest, losses)
 
     y, (rest, losses) = jax.lax.scan(step, x, (state, on))

@@ -124,17 +124,10 @@ def _scan(
     carry: pure.Changes,
     compute: DTypeLike | None,
 ) -> tuple[Stream, nnx.State]:
-    """Run the layers by `jax.lax.scan`, carrying `x` and `carry`, each cast to
-    `compute` and rematerialized as a whole as the run's `remat` says."""
+    """Run the layers by `jax.lax.scan`, carrying `x` and `carry`, each as
+    ``scanned_pass`` calls it."""
     call = pure.Pure(graphdef, taps)
-
-    def cast_call(
-        s: nnx.State, x: Stream, carry: pure.Changes
-    ) -> tuple[Stream, nnx.State, pure.Changes, list[Float[Array, ""]]]:
-        return call(cast(s, compute), x, carry)
-
-    # A scan keeps XLA from merging them.
-    layer = remat.checkpoint(cast_call, prevent_cse=False, scanned=True)
+    layer = scanned_pass(call, compute)
 
     def step(
         c: tuple[Stream, pure.Changes], s: nnx.State
@@ -145,3 +138,16 @@ def _scan(
     (x, changes), (rest, losses) = jax.lax.scan(step, (x, carry), state, times)
     pure.apply(taps, changes, call, [[v[i] for v in losses] for i in range(times)])
     return x, rest
+
+
+def scanned_pass(call: pure.Pure, compute: DTypeLike | None) -> pure.Call:
+    """Return `call` as a scan calls it on a pass: its parameters cast to `compute`,
+    and rematerialized as a whole as the run's `remat` says."""
+
+    def cast_call(
+        s: nnx.State, x: Stream, carry: pure.Changes
+    ) -> tuple[Stream, nnx.State, pure.Changes, list[Float[Array, ""]]]:
+        return call(cast(s, compute), x, carry)
+
+    # A scan keeps XLA from merging them.
+    return remat.checkpoint(cast_call, prevent_cse=False, scanned=True)

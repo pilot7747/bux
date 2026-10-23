@@ -68,7 +68,7 @@ def use(
     if isinstance(precision, str):
         precision = PrecisionConfig(matmuls=precision)
     for name in _formats(precision):
-        formats.find(name)
+        formats.find(name)  # raises at once for a name no format has
     seed = None if tokens is None else _seed(tokens)
     precision_token, seed_token = PRECISION.set(precision), SEED.set(seed)
     try:
@@ -79,7 +79,7 @@ def use(
 
 
 def _formats(precision: PrecisionConfig) -> set[str]:
-    """The formats `precision` names: its `matmuls`, and its roles'."""
+    """Return the formats `precision` names: its `matmuls`, and its roles'."""
     roles = precision.roles.model_dump(exclude={"type"}).values()
     return {precision.matmuls, *(fmt for fmt in roles if fmt)}
 
@@ -304,12 +304,13 @@ def blocks_whole(
     lhs_kept = [i for i in range(lhs.ndim) if i not in (*lc, *lb)]
     rhs_kept = [i for i in range(rhs.ndim) if i not in (*rc, *rb)]
     sizes = gemm_sizes(lhs, rhs, dimension_numbers)
-    m, n, k = (s % (block * devices) != 0 for s in sizes)
-    out_m = range(len(lb), len(lb) + len(lhs_kept))
+    whole_m, whole_n, whole_k = (s % (block * devices) != 0 for s in sizes)
+    out_m = range(len(lb), len(lb) + len(lhs_kept))  # the output's dimensions of m
     out_n = range(out_m.stop, out_m.stop + len(rhs_kept))
-    lhs = _whole(lhs, [*(lc if k else ()), *(lhs_kept if m else ())])
-    rhs = _whole(rhs, [*(rc if k else ()), *(rhs_kept if n else ())])
-    return _whole(gemm(lhs, rhs), [*(out_m if m else ()), *(out_n if n else ())])
+    lhs = _whole(lhs, [*(lc if whole_k else ()), *(lhs_kept if whole_m else ())])
+    rhs = _whole(rhs, [*(rc if whole_k else ()), *(rhs_kept if whole_n else ())])
+    out = [*(out_m if whole_m else ()), *(out_n if whole_n else ())]
+    return _whole(gemm(lhs, rhs), out)
 
 
 def _whole(x: Float[Array, "..."], dims: list[int]) -> Float[Array, "..."]:

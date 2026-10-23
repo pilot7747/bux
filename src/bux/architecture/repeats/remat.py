@@ -129,6 +129,7 @@ def setting() -> str | RematConfig:
 
 
 def _found(remat: str | RematConfig) -> Policy:
+    """Return the policy `remat` names, or the one it describes."""
     if isinstance(remat, str):
         return methods.remat.find(remat)
     return keeping(remat.save, remat.offload)
@@ -150,9 +151,9 @@ def _past_first(remat: str | RematConfig) -> bool:
     return first is not None and at is not None and at >= first
 
 
-def cuts(times: int) -> list[int]:
-    """Return where the run's `first` cuts `times` passes of a repeat, after which
-    they rematerialize nothing (``tracing.runs``)."""
+def cuts() -> list[int]:
+    """Return where the run's `first` cuts a repeat's passes, after which they
+    rematerialize nothing (``tracing.runs``)."""
     first = getattr(setting(), "first", None)
     return [] if first is None else [first]
 
