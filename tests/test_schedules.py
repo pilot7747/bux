@@ -94,9 +94,9 @@ def _step_grads(mesh: str, methods: str) -> list[Float[np.ndarray, " n"]]:
 def test_a_table_runs_every_op_once_after_what_it_reads(name, stages, microbatches):
     table = schedule.TABLES[name](stages, microbatches)
     when: dict[tuple[str, int, int], tuple[int, int]] = {}
-    for (t, s, k), op in table._each():
-        assert (op.kind, s, op.micro) not in when
-        when[op.kind, s, op.micro] = (t, k)
+    for (t, s, lane), op in table.each_op():
+        assert (op.kind, s, op.microbatch) not in when
+        when[op.kind, s, op.microbatch] = (t, lane)
     kinds = "FBW" if table.split else "FB"
     ops = [
         (kind, s, j)
@@ -105,18 +105,18 @@ def test_a_table_runs_every_op_once_after_what_it_reads(name, stages, microbatch
         for j in range(microbatches)
     ]
     assert set(when) == set(ops)
-    for (kind, s, j), (t, k) in when.items():
+    for (kind, s, j), (t, lane) in when.items():
         if kind == "F" and s > 0:
             assert when["F", s - 1, j][0] < t  # sent at the end of an earlier tick
         if kind == "B":
-            assert when["F", s, j] < (t, k)
+            assert when["F", s, j] < (t, lane)
             assert s == stages - 1 or when["B", s + 1, j][0] < t
         if kind == "W":
-            assert when["B", s, j] < (t, k)
+            assert when["B", s, j] < (t, lane)
 
 
 def _slots(table: schedule.Table, buffer: str) -> int:
-    return int(table.slots()[buffer].max()) + 1
+    return int(table.buffer_slots()[buffer].max()) + 1
 
 
 def test_1f1b_holds_fewer_microbatches_than_gpipe_and_idles_as_much():
@@ -128,7 +128,7 @@ def test_1f1b_holds_fewer_microbatches_than_gpipe_and_idles_as_much():
 def test_zbh1_holds_a_microbatch_a_stage_and_idles_a_tick_a_stage():
     table = schedule.zero_bubble_h1(4, 8)
     assert table.ticks == 3 * 8 + 4 - 1
-    assert _slots(table, "residuals") == _slots(table, "weights") == 4
+    assert _slots(table, "residuals") == _slots(table, "saved") == 4
     assert table.bubble() == pytest.approx(3 / 27)
 
 
@@ -188,9 +188,9 @@ def test_a_split_backward_takes_the_whole_ones_gradients_and_each_matmul_once(
             d_params, dx = _rebuilt(vjp, r, jax.tree.unflatten(tree, p))(d)
             return [*jax.tree.leaves(d_params), dx]
 
-        shapes = [jax.ShapeDtypeStruct(a.shape, a.dtype) for a in [*residuals, dy]]
-        free = [jax.ShapeDtypeStruct(a.shape, a.dtype) for a in flat]
-        two = split.split(backward, free, shapes, weights=len(flat))
+        b_only = [jax.ShapeDtypeStruct(a.shape, a.dtype) for a in [*residuals, dy]]
+        shared = [jax.ShapeDtypeStruct(a.shape, a.dtype) for a in flat]
+        two = split.split(backward, shared, b_only, weight_grads=len(flat))
         (dx,), saved = two.inputs(*flat, *residuals, dy)
         got = [*two.weights(*flat, saved), dx]
         want = backward(*flat, *residuals, dy)
