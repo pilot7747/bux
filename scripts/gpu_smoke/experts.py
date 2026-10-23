@@ -119,7 +119,8 @@ def main() -> int:
             out = differs(layer(mesh, method), ref)
             losses, speed = run(mesh, method, steps)
             first, loss = differs(losses[:1], one[:1]), differs(losses, one)
-            failed |= out > 1e-4 or first > 1e-4 or loss > 1e-3
+            # bfloat16, the default, rounds a run's later losses apart by up to 2e-3.
+            failed |= out > 1e-4 or first > 1e-4 or loss > 3e-3
             print(
                 f"{source(mesh):28} {method:18} {speed:,.0f} tok/s; off by {out:.1e} "
                 f"in the layer, {first:.1e} in the first loss, {loss:.1e} in all",

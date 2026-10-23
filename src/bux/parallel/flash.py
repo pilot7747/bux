@@ -27,8 +27,9 @@ try:  # tokamax's kernels, where its extra is installed (Linux)
     from tokamax._src.ops.attention import base as masks
 
     MOSAIC = tokamax.IMPLEMENTATIONS.get("mosaic_gpu")
+    TRITON = tokamax.IMPLEMENTATIONS.get("triton")
 except ImportError:
-    MOSAIC = masks = None
+    MOSAIC = TRITON = masks = None
 
 F32 = jnp.float32
 
@@ -151,6 +152,32 @@ def tokamax_runs() -> bool:
     """Whether tokamax's Mosaic kernels run here: on a GPU (``bux.kernels``), with
     tokamax installed."""
     return MOSAIC is not None and kernels.gpu()
+
+
+def tokamax_takes(x: Float[Array, "*s"]) -> bool:
+    """Whether tokamax's Mosaic kernels run here and take `x`'s dtype: bfloat16 or
+    float16, not float32, which they reject."""
+    return tokamax_runs() and x.dtype in (jnp.bfloat16, jnp.float16)
+
+
+def triton_takes(x: Float[Array, "*s"]) -> bool:
+    """Whether tokamax's Triton kernel runs here for `x`: in float32, which the Mosaic
+    kernels reject."""
+    return TRITON is not None and kernels.gpu() and x.dtype == F32
+
+
+def triton(
+    q: Float[Array, "b t h dk"],
+    k: Float[Array, "b s g dk"],
+    v: Float[Array, "b s g dv"],
+    keys: Keys,
+    scale: float,
+    cap: float | None,
+) -> Float[Array, "b t h dv"]:
+    """Attend by tokamax's Triton kernel, differentiated by tokamax: float32 with no
+    t by t logits. No sinks."""
+    assert TRITON is not None
+    return TRITON(q, k, v, **_tokamax_args(keys, scale, cap))
 
 
 def _tokamax_args(keys: Keys, scale: float, cap: float | None) -> dict:

@@ -233,12 +233,16 @@ def whole_rows(
 ) -> Float[Array, "b t h dv"]:
     """Attend with whole rows, on one device, by the fastest kernel that takes the
     call: cuDNN's in rows of `CUDNN_ROWS` or more and with a window, else tokamax's
-    (a soft cap, sinks, float32), else cuDNN's, else `xla`."""
+    (a soft cap, sinks), else cuDNN's; in float32, tokamax's Triton kernel, or `xla`
+    with sinks."""
     cudnn = flash.cudnn_takes(q, k, v, args.softcap, args.sinks)
     if cudnn and (q.shape[1] >= CUDNN_ROWS or args.window is not None):
         return _cudnn(q, k, v, args)
-    if flash.tokamax_runs():
+    if flash.tokamax_takes(q):
         return _flash(flash.TOKAMAX, q, k, v, args)
+    if args.sinks is None and flash.triton_takes(q):
+        keys = Keys(True, first_keys(args, *q.shape[:2]))
+        return flash.triton(q, k, v, keys, args.scale, args.softcap)
     return _cudnn(q, k, v, args) if cudnn else xla(q, k, v, args)
 
 
@@ -266,7 +270,7 @@ def _cudnn(
     cudnn = partial(flash.cudnn, ids=args.ids, window=args.window, scale=args.scale)
     if args.ids is None:
         return cudnn(q, k, v, documents=1)
-    if flash.tokamax_runs():
+    if flash.tokamax_takes(q):
         other = partial(_flash, flash.TOKAMAX, args=args)
     else:
         other = partial(xla, args=args)
@@ -400,10 +404,10 @@ def tokamax(
     window by each query's first key, sinks by the logsumexp. With `seq` over
     `context`, a device gathers every key and value and attends with its queries:
     all-gather CP in a kernel, whose backward pass does every block."""
-    if not flash.tokamax_runs():
+    if not flash.tokamax_takes(q):
         raise NotImplementedError(
-            "methods.attention = tokamax needs tokamax's GPU kernels: a GPU, and the "
-            "cuda extra (Linux)"
+            "methods.attention = tokamax needs tokamax's GPU kernels: a GPU, the cuda "
+            "extra (Linux), and bfloat16 or float16"
         )
     return gathered(flash.TOKAMAX, q, k, v, args)
 
@@ -456,7 +460,7 @@ def auto(
     """The default. On a GPU, the fastest kernel that takes the call on each device's
     whole rows (`whole_rows`): cuDNN's in long rows or with a window (on a B300 1.3x
     tokamax's speed causal at t = 32k, 4x with packed documents), else tokamax's,
-    which takes sinks, a soft cap and float32. With `seq` over `context`, `ulysses`
+    which takes sinks and a soft cap; in float32 its Triton kernel, or `xla`. With `seq` over `context`, `ulysses`
     where context divides a device's heads, else `ring`. `xla` where neither kernel
     runs, and for what only xla has."""
     if not (flash.tokamax_runs() or flash.cudnn_runs()):

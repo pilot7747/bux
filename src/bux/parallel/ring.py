@@ -60,7 +60,7 @@ def ring(
     on = active()
     if on is None:
         return whole_rows(q, k, v, args)
-    kernel = flash.TOKAMAX if flash.tokamax_runs() else flash.JNP
+    kernel = flash.TOKAMAX if flash.tokamax_takes(q) else flash.JNP
     start = first_keys(args, *q.shape[:2])
     zigzag = start is None and q.shape[1] // on.size(AXIS) % 2 == 0
     static = Static(kernel, args.scale, args.softcap, zigzag)

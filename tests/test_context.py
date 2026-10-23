@@ -45,9 +45,10 @@ POSITIONS = np.asarray([[*range(3, 8), *range(7), *range(4)], [*range(T)]])
 
 @pytest.fixture
 def kernels(monkeypatch):
-    """tokamax's kernel on a CPU: jnp's."""
+    """tokamax's kernel on a CPU: jnp's, which takes float32 too."""
     monkeypatch.setattr(flash, "TOKAMAX", flash.JNP)
     monkeypatch.setattr(flash, "tokamax_runs", lambda: True)
+    monkeypatch.setattr(flash, "tokamax_takes", lambda x: True)
 
 
 def documents(positions: Int[np.ndarray, "b t"]) -> Int[Array, "b t"]:

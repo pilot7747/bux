@@ -199,7 +199,7 @@ def attend(
     each part, the parts and the sinks in one softmax in float32; and each query's
     logsumexp, which passes no gradient. With `seq` over `context` a device has its
     queries and every key: all-gather context parallelism."""
-    static, parts = _Static(scale, cap, _flash(), True), tuple(parts)
+    static, parts = _Static(scale, cap, _flash(q), True), tuple(parts)
     split = parallel.spec(("batch", "seq", "heads", None), q.shape)
     names = axes(split)
     if parallel.active() is None or not names:
@@ -219,9 +219,10 @@ def attend(
     )(q, parts, sinks)
 
 
-def _flash() -> bool:
-    """Return whether the parts run by tokamax: under `tokamax`, or `auto` on a GPU.
-    `xla` runs them by XLA; the other methods have no mask of kept keys."""
+def _flash(q: Float[Array, "b t h dk"]) -> bool:
+    """Return whether the parts run by tokamax: under `tokamax`, or `auto` on a GPU in
+    bfloat16 or float16, which its kernels take. `xla` runs them by XLA; the other
+    methods have no mask of kept keys."""
     on = parallel.active()
     name = on.methods.attention if on else "auto"
     if name not in ("xla", "auto", "tokamax"):
@@ -232,7 +233,8 @@ def _flash() -> bool:
         raise NotImplementedError(
             "methods.attention = tokamax needs tokamax, of the cuda extra (Linux)"
         )
-    return name != "xla" and MOSAIC is not None and kernels.gpu()
+    half = q.dtype in (jnp.bfloat16, jnp.float16)
+    return name != "xla" and MOSAIC is not None and kernels.gpu() and half
 
 
 def _heads_like(part: Part, split: P, heads: int) -> Part:
