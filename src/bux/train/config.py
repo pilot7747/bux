@@ -358,6 +358,28 @@ def _named_none(v: object) -> object:
     return "none" if v is None else v
 
 
+def _listed(v: object) -> object:
+    """One name, as a list of one."""
+    return (v,) if isinstance(v, str) else v
+
+
+Names = Annotated[tuple[str, ...], BeforeValidator(_listed)]
+
+
+class RematConfig(Config):
+    """What a rematerialized branch or scanned pass keeps for the backward pass, by the
+    names layers give what they make (bux.architecture.remat); the backward computes
+    the rest again. A preset is a name: save_attention is remat(save=[attention,
+    recurrence])."""
+
+    type: Literal["remat"] = "remat"
+    save: Names = ()  # kept on the device: attention, qkv, mlp, dots, ...
+    offload: Names = ()  # moved to the host's memory until the backward reads them
+    # The passes of each repeat it rematerializes, from the first; the rest keep
+    # everything. None: every pass.
+    first: Annotated[int, Field(ge=0)] | None = None
+
+
 class MethodsConfig(Config):
     """How each part that communicates is computed, by the name of a function in its
     registry in bux.parallel.methods: another method is a function, not a field."""
@@ -367,7 +389,8 @@ class MethodsConfig(Config):
     moe: str = "sorted"
     recurrence: str = "scan"
     repeat: str = "unroll"
-    remat: Annotated[str, BeforeValidator(_named_none)] = "none"
+    # A policy by name, or as data: remat(save=[attention], first=8).
+    remat: Annotated[str | RematConfig, BeforeValidator(_named_none)] = "none"
     pipeline: str = "gpipe"
     rounds: Positive = 1  # times a circular pipeline sends a microbatch round
     orthogonalize: str = "owner"  # how Muon reaches whole matrices
@@ -424,6 +447,7 @@ Setting = Annotated[
     | PrecisionConfig
     | MeshConfig
     | LayoutConfig
+    | RematConfig
     | MethodsConfig,
     Field(discriminator="type"),
 ]

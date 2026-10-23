@@ -140,7 +140,7 @@ class SoftmaxAttention(nnx.Module):
     ) -> Float[Array, "b t d"]:
         """Normalize and gate the head outputs, then project them back to the width."""
         b, t, _ = x.shape
-        out = checkpoint_name(out, "attention")
+        out = checkpoint_name(out, "attention.out")
         if self.out_norm is not None:
             out = self.out_norm(out)
         if self.gate is not None:
@@ -482,11 +482,14 @@ class Sparse(FullLogits):
         taps: Taps,
     ) -> Float[Array, "b t h dv"]:
         """Return every query's softmax-weighted values over what it attends to of
-        each part, all in one softmax; in training, also report the indexer's loss
-        from what it `scored`, against the attention to the last part."""
+        each part, all in one softmax, named `attention` (``remat.named``); in
+        training, also report the indexer's loss from what it `scored`, against the
+        attention to the last part."""
         if self._feature() is not None:
             return self._attend_logits(x, q, parts, docs, scored, taps)
-        out, lse = sparse.attend(q, parts, self._sinks(), self.scale, self.softcap)
+        # The indexer's loss reads them too, so that a policy keeps them for both.
+        q, parts = remat.label("attention.in", (q, tuple(parts)))
+        out, lse = remat.named("attention", self._sparse, q, parts, self._sinks())
         if self._trains(scored, taps):
             assert scored is not None
             last = parts[-1]
@@ -494,6 +497,16 @@ class Sparse(FullLogits):
             width = q.shape[2] * last.k.shape[1]
             self._train_indexer(scored, partial(self._target, last), xs, width, taps)
         return out
+
+    def _sparse(
+        self,
+        q: Float[Array, "b t h dk"],
+        parts: tuple[sparse.Part, ...],
+        sinks: Float[Array, " h"] | None,
+    ) -> tuple[Float[Array, "b t h dv"], Float[Array, "b t h"]]:
+        """Return ``sparse.attend``'s output and logsumexp, by the layer's scale and
+        softcap."""
+        return sparse.attend(q, parts, sinks, self.scale, self.softcap)
 
     def _target(self, part: sparse.Part, xs: tuple) -> Float[Array, "b c s"]:
         """Return a chunk of queries' attention to the keys of `part`, given their
