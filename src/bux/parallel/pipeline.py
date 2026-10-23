@@ -35,10 +35,11 @@ from typing import NamedTuple
 
 import jax
 import jax.numpy as jnp
+import numpy as np
 from jax.sharding import PartitionSpec as P
 from jaxtyping import Array, Bool, Float, Int, PyTree, Shaped
 
-from bux.parallel import gather, methods
+from bux.parallel import gather, methods, schedule
 from bux.parallel.mesh import Active, active
 
 AXIS = "stage"
@@ -62,8 +63,13 @@ def pipelined() -> bool:
     return stages() > 1
 
 
-def bubble(stages: int, microbatches: int, rounds: int = 1) -> float:
-    """Return the fraction of a step each stage idles: (S − 1) / (R·M + S − 1)."""
+def bubble(
+    stages: int, microbatches: int, rounds: int = 1, method: str = "gpipe"
+) -> float:
+    """Return the fraction of a step each stage idles: (S − 1) / (R·M + S − 1), or
+    for a method run by a table, as its table says (``schedule.Table.bubble``)."""
+    if method in schedule.TABLES and stages > 1:
+        return schedule.TABLES[method](stages, microbatches).bubble()
     return (stages - 1) / (rounds * microbatches + stages - 1)
 
 
@@ -74,17 +80,32 @@ def _on() -> Active:
     return on
 
 
+def uneven() -> tuple[int, ...] | None:
+    """Return the passes of the pipelined repeat each stage runs, if the run in force
+    gives them (``methods.stages``); None if they split evenly."""
+    on = active()
+    return None if on is None or on.methods.stages is None else tuple(on.methods.stages)
+
+
 def rounds(passes: int) -> int:
     """Return how many rounds the run in force pipelines a repeat of `passes` passes
-    in. Raise unless the passes split evenly over the stages of every round, and a
-    circular pipeline has at least one microbatch per stage to keep the stages busy."""
+    in. Raise unless the passes split evenly over the stages of every round, or as
+    `methods.stages` says, and a circular pipeline has at least one microbatch per
+    stage to keep the stages busy."""
     on = _on()
     s, settings = on.size(AXIS), on.methods
-    if passes % (s * settings.rounds):
+    if (split := uneven()) is not None:
+        _check_uneven(split, s, passes, settings.rounds)
+    elif passes % (s * settings.rounds):
         raise ValueError(
             f"mesh.stage = {s} pipelines the longest scanned repeat, of {passes} "
             f"passes, in methods.rounds = {settings.rounds}: make its passes a "
             f"multiple of {s * settings.rounds}"
+        )
+    if settings.rounds > 1 and settings.pipeline in schedule.TABLES:
+        raise ValueError(
+            f"methods(pipeline={settings.pipeline}) goes round the stages once, not "
+            f"methods.rounds = {settings.rounds} times"
         )
     if settings.rounds > 1 and settings.microbatches < s:
         raise ValueError(
@@ -92,6 +113,40 @@ def rounds(passes: int) -> int:
             f"methods.microbatches = {settings.microbatches} < mesh.stage = {s}"
         )
     return settings.rounds
+
+
+def _check_uneven(
+    split: tuple[int, ...], stages: int, passes: int, rounds: int
+) -> None:
+    """Raise unless `split` gives each of the `stages` passes, `passes` in all, in one
+    round."""
+    if len(split) != stages or sum(split) != passes:
+        raise ValueError(
+            f"methods.stages = {list(split)} splits {sum(split)} passes over "
+            f"{len(split)} stages, and the pipelined repeat has {passes} passes over "
+            f"mesh.stage = {stages}"
+        )
+    if rounds > 1:
+        raise ValueError("methods.stages splits one round, not methods.rounds")
+
+
+def spread(
+    stacked: Shaped[Array, "l ..."], split: tuple[int, ...]
+) -> Shaped[Array, "m ..."]:
+    """Return a stacked variable of the passes `split` gives each stage, laid out as
+    many to a stage as the most any takes: each stage's own, then copies of its
+    first, which it skips (``layers_run``)."""
+    most, start, parts = max(split), 0, []
+    for n in split:
+        own = stacked[start : start + n]
+        parts += [own, jnp.broadcast_to(own[:1], (most - n, *own.shape[1:]))]
+        start += n
+    return jnp.concatenate(parts)
+
+
+def layers_run(split: tuple[int, ...]) -> Bool[np.ndarray, "s l"]:
+    """Return which of its slots each stage runs, where `split` gives the passes."""
+    return np.arange(max(split))[None, :] < np.array(split)[:, None]
 
 
 @methods.pipeline.register("gpipe")

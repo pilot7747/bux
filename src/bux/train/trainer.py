@@ -25,7 +25,7 @@ import functools
 import re
 from collections.abc import Callable, Iterable, Iterator, Mapping, Sequence
 from pathlib import Path
-from typing import Any, Protocol, runtime_checkable
+from typing import Any, NamedTuple, Protocol, runtime_checkable
 
 import jax
 import jax.numpy as jnp
@@ -36,10 +36,11 @@ from jax.typing import DTypeLike
 from jaxtyping import Array, Float, Int32, Shaped
 
 from bux import kernels, parallel
-from bux.architecture import Model, Scanned, matmuls, remat
+from bux.architecture import Model, Scanned, matmuls, pipelined, remat
 from bux.architecture.logits import HeadOutput
-from bux.architecture.registry import Loss
+from bux.architecture.registry import Loss, Stream
 from bux.architecture.repeat import scanned_variables
+from bux.architecture.segments import Segments
 from bux.data.pipeline import DEFAULT_CACHE, jobs, prepare
 from bux.lang import ir
 from bux.lang.printer import run_to_source
@@ -154,6 +155,133 @@ def _by_spec(
     return jax.tree.map(lambda s, v: v.replace(f(s, v.get_value())), specs, state)
 
 
+class _Micro(NamedTuple):
+    """A pipeline's microbatches, each leaf (microbatches, rows, ...): the rows, and
+    each row's share of the batch's target tokens."""
+
+    batch: Batch
+    shares: Float[Array, "m n"]
+
+
+def _row_shares(batch: Batch) -> Float[Array, " b"]:
+    """Return each row's share of the batch's target tokens (the first head's)."""
+    counts = target_mask(batch).sum(1)
+    return counts / jnp.maximum(counts.sum(), 1)
+
+
+class _Cut:
+    """A model cut at its pipelined repeat, for a pipeline that schedules its own
+    backward (``parallel.scheduled``): the repeat's layers' parameters and state
+    (``layers``), the parameters outside the repeat (`others`) and the rest of their
+    state (`kept`), and the model's forward cut there, a microbatch at a time
+    (``parts``). The cut model holds stand-ins for the repeat's variables, which it
+    does not run (``pipelined.stream_into``, ``pipelined.leaving``)."""
+
+    def __init__(self, model: Model, objective: Objective, rows: int):
+        [(self.path, scanned)] = [
+            (p, m)
+            for p, m in nnx.iter_graph(model)
+            if isinstance(m, Scanned) and m.rounds
+        ]
+        self.objective, self.rows = objective, rows  # the microbatches of every device
+        _check_outside(model, self._inside)
+        split = nnx.split(
+            model, nnx.All(nnx.Param, self._inside), self._inside, nnx.Param, ...
+        )
+        self.graphdef, self.piped, self.rest, self.others, self.kept = split
+        self.stand_ins = jax.tree.map(_stand_in, (self.piped, self.rest))
+        graphdef = nnx.graphdef(scanned.layers)
+        self.stage = pipelined.Stage.of(graphdef, scanned.times, True, None)
+
+    def _inside(self, path: tuple, _: object) -> bool:
+        return path[: len(self.path)] == self.path
+
+    def layers(self) -> tuple[nnx.State, nnx.State]:
+        """Return the repeat's layers' parameters and other state, each leaf (rounds,
+        layers, ...) with one round."""
+        at = (*self.path, "layers")
+        return _under(self.piped, at, 1), _under(self.rest, at, 1)
+
+    def joined(self, layers: nnx.State, outside: nnx.State) -> nnx.State:
+        """Return the model's state from the repeat's `layers`, by (rounds, layers,
+        ...), and the rest of the model's."""
+        inner = jax.tree.map(lambda a: a[0], layers)
+        return nnx.merge_state(_prefixed((*self.path, "layers"), inner), outside)
+
+    def parts(self) -> "parallel.scheduled.Parts":
+        return parallel.scheduled.Parts(
+            self.first, self.staged, self.last, lambda: self.stage.reports
+        )
+
+    def model(self, others: nnx.State, kept: nnx.State) -> Model:
+        return nnx.merge(self.graphdef, *self.stand_ins, others, kept)
+
+    def first(
+        self, others: nnx.State, kept: nnx.State, rows: _Micro
+    ) -> tuple[Stream, nnx.State]:
+        """Run a microbatch up to the repeat: the stream there, and the state of the
+        layers before it as they leave it."""
+        model = self.model(others, kept)
+        x = pipelined.stream_into(lambda: training_forward(model, rows.batch))
+        return x, nnx.state(model, nnx.All(nnx.Not(nnx.Param), nnx.Not(self._inside)))
+
+    def staged(
+        self, params: nnx.State, rest: nnx.State, x: Stream, rows: _Micro
+    ) -> tuple[Stream, nnx.State, Float[Array, "l k"]]:
+        """Run a stage's share of the repeat on a microbatch, its documents apart."""
+        positions, tokens = rows.batch.position_ids, rows.batch.input_ids
+        local = pipelined.Rows(Segments.of(jnp.asarray(positions)), jnp.asarray(tokens))
+        return self.stage(params, rest, x, local)
+
+    def last(
+        self, others: nnx.State, kept: nnx.State, rows: _Micro, y: Stream
+    ) -> tuple[Float[Array, ""], Metrics]:
+        """Run a microbatch from the stream leaving the repeat, `y`, to its share of
+        the step's loss, and that of its metrics."""
+        with pipelined.leaving(y):
+            heads, aux_losses = training_forward(self.model(others, kept), rows.batch)
+        per_token, per_row = self.objective(heads, rows.batch, aux_losses)
+        share = rows.shares.sum()
+        loss = share * per_token.loss + per_row.loss / self.rows
+        metrics = _scaled(per_token.metrics, share)
+        return loss, metrics | _scaled(per_row.metrics, 1 / self.rows)
+
+
+def _check_outside(model: nnx.Module, inside: Callable[[tuple, object], bool]) -> None:
+    """Raise if a layer outside the pipelined repeat learns from the whole batch: a
+    scheduled pipeline runs those a microbatch at a time, on one stage."""
+    on = parallel.active()
+    method = on.methods.pipeline if on else "?"
+    for path, module in nnx.iter_modules(model):
+        if isinstance(module, StepEndUpdate) and not inside(path, module):
+            raise ValueError(
+                f"methods.pipeline = {method!r} runs the "
+                "layers outside the pipelined repeat a microbatch at a time, and "
+                f"{type(module).__name__} at {'.'.join(map(str, path))} learns from the "
+                "whole batch: put it in the repeat, or use methods(pipeline=gpipe)"
+            )
+
+
+def _stand_in(a: Shaped[Array, "..."]) -> jax.ShapeDtypeStruct:
+    return jax.ShapeDtypeStruct(a.shape, a.dtype)
+
+
+def _under(state: nnx.State, path: tuple, rounds: int) -> nnx.State:
+    """Return the part of `state` under `path`, each leaf with `rounds` in front: none
+    if it has nothing there."""
+    for key in path:
+        if key not in state:
+            return nnx.State({})
+        state = state[key]
+    return jax.tree.map(lambda a: a.reshape(rounds, *a.shape), state)
+
+
+def _prefixed(path: tuple, state: nnx.State) -> nnx.State:
+    """Return `state` as the part under `path` of a larger one."""
+    flat = nnx.to_flat_state(state)
+    return nnx.from_flat_state([((*path, *p), v) for p, v in flat])
+
+
 class Trainer:
     """A model, its optimizer, which applies `tx`, and the objective it minimizes;
     `step` counts the steps taken.
@@ -252,7 +380,12 @@ class Trainer:
             return "methods(accumulate=reduced) reduces as the backward makes them"
         if self.gather != "step":
             return "needs the parameters gathered once a step: methods(gather=step)"
-        if self.reduce != self.compute and parallel.pipeline.pipelined():
+        scheduled = parallel.scheduled.active() is not None  # sums all in float32
+        if (
+            self.reduce != self.compute
+            and parallel.pipeline.pipelined()
+            and not scheduled
+        ):
             return "a pipeline's embedding and head do not: they reduce in the backward"
         if not rows_independent(model):
             return (
@@ -282,7 +415,9 @@ class Trainer:
         `microbatches`. The forwards update the model's buffers (its state that is not
         a parameter) in turn, and then the step-end updates run."""
         graphdef, params, buffers = nnx.split(model, nnx.Param, ...)
-        if self.reduces_once and not parallel.pipeline.pipelined():
+        if parallel.scheduled.active() is not None:
+            grads, metrics, buffers = self._scheduled(graphdef, params, buffers, batch)
+        elif self.reduces_once and not parallel.pipeline.pipelined():
             grads, metrics, buffers = self._unreduced(graphdef, params, buffers, batch)
         elif self.microbatches > 1:
             grads, metrics, buffers = self._reduced(graphdef, params, buffers, batch)
@@ -311,6 +446,35 @@ class Trainer:
                 graphdef, params, buffers, batch, token_share=1.0, row_share=1.0
             )
         return _shard_state(grads), metrics, buffers
+
+    def _scheduled(
+        self,
+        graphdef: nnx.GraphDef,
+        params: nnx.State,
+        buffers: nnx.State,
+        batch: Batch,
+    ) -> tuple[nnx.State, Metrics, nnx.State]:
+        """Return `_grads` of the whole batch from a pipeline that schedules its own
+        backward (``parallel.scheduled``), with the parameters cast and gathered once
+        (``_gathered``). It runs the model a microbatch at a time, cut at the
+        pipelined repeat (``_Cut``): the part before the repeat on the first stage,
+        and the part after it, to the loss, on the last."""
+        method = parallel.scheduled.active()
+        assert method is not None
+        n = method.table().microbatches
+        apart = parallel.gather.rows() if self.reduces_once else ()
+        model = nnx.merge(graphdef, self._gathered(params), buffers)
+        model.set_attributes(update_at_step_end=True, raise_if_not_found=False)
+        cut = _Cut(model, self.objective, rows=n * _size(apart))
+        shares = parallel.microbatches(_row_shares(batch), n)
+        rows = _Micro(parallel.microbatches(batch, n), shares)
+        tokens = jnp.asarray(batch.input_ids)
+        with parallel.gather.apart(apart), matmuls.use(self.matmuls, tokens):
+            out = method.gradients(
+                cut.parts(), *cut.layers(), cut.others, cut.kept, rows
+            )
+        grads = cut.joined(out.params, out.others)
+        return _shard_state(grads), out.metrics, cut.joined(out.rest, out.kept)
 
     def _gathered(self, params: nnx.State) -> nnx.State:
         """Return `params` as the microbatches use them: with `gather` "step", cast to

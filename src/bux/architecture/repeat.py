@@ -129,11 +129,15 @@ class Scanned(nnx.Module):
 
         With one round, each stage holds a contiguous share of the passes. With more,
         the passes split into `rounds` rounds, each a scanned repeat of its own, and
-        each stage holds a share of every round."""
-        n = self.times // rounds
+        each stage holds a share of every round. Where `methods.stages` gives each
+        stage its share, each holds as many as the most any takes (``spread``), and
+        `times` still counts the passes that run."""
+        n, split = self.times // rounds, pipeline.uneven()
         for v in _variables(self.layers):
             names = v.get_metadata()[NAMES][1:]
             if rounds == 1:
+                if split is not None:
+                    v.set_value(pipeline.spread(v.get_value(), split))
                 v.set_metadata(names=(pipeline.STAGES, *names))
                 continue
             v.set_value(v.get_value().reshape(rounds, n, *v.shape[1:]))
