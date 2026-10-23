@@ -203,7 +203,7 @@ def test_precision_is_in_the_run_s_id_and_a_sweep_over_it_is_two_runs():
     assert bf16.train.precision.compute == "bfloat16"
     assert f32.id != bf16.id and f32.name != bf16.name
     [plain] = compile_runs(_source())
-    assert plain.id == f32.id
+    assert plain.train.precision.compute == "bfloat16" and plain.id == bf16.id
 
 
 # --- Matmul formats ---------------------------------------------------------------------
@@ -347,7 +347,10 @@ def test_a_run_in_a_format_trains_near_bfloat16(losses, arch, fmt):
 # blocks, and their values, are those of one device.
 @pytest.mark.parametrize("fmt", FORMATS)
 def test_a_format_on_a_split_mesh_trains_as_on_one_device(losses, fmt):
-    given = {"optimizer": STABLE, "precision": f"precision(matmuls={fmt})"}
+    given = {
+        "optimizer": STABLE,
+        "precision": f"precision(compute=float32, matmuls={fmt})",
+    }
     one = losses(ARCHITECTURES["llama"], mesh=ONE, **given)
     split = losses(ARCHITECTURES["llama"], mesh="mesh(fsdp=4, tensor=2)", **given)
     assert np.allclose(split, one, rtol=1e-5)
@@ -355,7 +358,11 @@ def test_a_format_on_a_split_mesh_trains_as_on_one_device(losses, fmt):
 
 def test_a_pipeline_trains_in_mxfp8_as_its_stages_do_on_one_device(losses):
     source = PRELUDE + "block = [norm attn] [norm ffn]\nmodel = embed block^4 norm head"
-    given = {"optimizer": STABLE, "precision": "precision(matmuls=mxfp8)"}
+    # In float32: XLA:CPU cannot compile a pipeline's bfloat16 psums.
+    given = {
+        "optimizer": STABLE,
+        "precision": "precision(compute=float32, matmuls=mxfp8)",
+    }
     scan = losses(source, mesh=ONE, methods="methods(repeat=scan)", **given)
     how = "methods(repeat=scan, microbatches=2)"
     piped = losses(source, mesh="mesh(stage=2, data=1)", methods=how, **given)

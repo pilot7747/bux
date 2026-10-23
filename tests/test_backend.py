@@ -578,6 +578,7 @@ def test_the_loss_z_loss_and_mtp_are_the_same_with_the_vocabulary_split(tmp_path
         + "model = embed [norm ffn] norm @h out mtp^2\n"
         + "data = synthetic\noptimizer = adamw(lr=1e-3)\nloss = loss(z=1e-3)\n"
         + "seq_len = 16\nbatch = 8\nsteps = 3\n"
+        + "precision = precision(compute=float32)\n"  # splits compare to 1e-5
     )
 
     def last(mesh: str) -> dict[str, float]:

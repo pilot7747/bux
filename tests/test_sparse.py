@@ -184,8 +184,8 @@ def trained(layers: str, logits: bool) -> tuple[float, float, nnx.State]:
     tokens = jax.random.randint(jax.random.key(1), (B, T), 0, 64)
 
     def loss(m):
-        [out], reported = m.training_outputs(tokens, POSITIONS)
-        lm = -jax.nn.log_softmax(out)[..., 0].mean()
+        [head], reported = m.training_heads(tokens, POSITIONS)
+        lm = -jax.nn.log_softmax(head.logits())[..., 0].mean()
         indexer = sum(r.value for r in reported)
         return lm + indexer, (lm, indexer)
 

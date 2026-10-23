@@ -866,6 +866,7 @@ def test_the_indexers_loss_is_the_same_split_by_head(tmp_path):
     def indexer_loss(mesh: str) -> float:
         settings = "data = synthetic\noptimizer = adamw(lr=1e-2)\nsteps = 3\n"
         settings += "seq_len = 16\nbatch = 8\n"
+        settings += "precision = precision(compute=float32)\n"  # splits to 1e-5
         [run] = compile_runs(f"{split(SPLIT['mla_indexer'])}\n{settings}mesh = {mesh}")
         return train(run, tmp_path / mesh, echo=lambda _: None)["indexer_loss"]
 

@@ -48,6 +48,7 @@ ONE, SCAN = "mesh(data=1)", "methods(repeat=scan)"
 TOKENS = np.random.default_rng(0).integers(0, 128, (8, 16))
 TRAIN = (
     "data = synthetic\noptimizer = adamw(lr=1e-2)\nseq_len = 16\nbatch = 8\nsteps = 4"
+    "\nprecision = precision(compute=float32)"  # XLA:CPU: no bfloat16 pipelines
 )
 
 
