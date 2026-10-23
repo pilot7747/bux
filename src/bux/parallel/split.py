@@ -6,8 +6,10 @@ weights' (`W`). ``split`` sorts them and gives a function of each part: `B` runs
 equations and hands `W` the values that `W`'s equations read (``Plan.saved``), so
 that no equation runs twice. A scan, as the backward of a scan over layers is, splits
 the same way into a scan of each part, the `B` scan handing the `W` one its saved
-values a pass at a time, stacked. Calls of jaxprs (jit, remat) are inlined first; any
-other equation goes whole to the part that needs it, to `B` if both do.
+values a pass at a time, stacked; and a cond into a cond of each part, of the same
+branch, the `B` one handing the `W` one what its branch saved. Calls of jaxprs (jit,
+remat) are inlined first; any other equation goes whole to the part that needs it,
+to `B` if both do.
 
     dx, saved = split.inputs(*free, *rest)    # now, on the critical path
     grads = split.weights(*free, saved)       # later, in a tick that would idle
@@ -19,6 +21,7 @@ from dataclasses import dataclass, field
 from typing import Any
 
 import jax
+import jax.numpy as jnp
 from jax.extend import core
 
 # Primitives that call a jaxpr, inlined before the split.
@@ -36,7 +39,7 @@ class Plan:
 
     jaxpr: core.Jaxpr
     consts: Sequence[Any]
-    parts: list["str | ScanPlan | None"]
+    parts: list["str | ScanPlan | CondPlan | None"]
     reads: dict[str, set[Key]] = field(default_factory=dict)
     saved: list[Key] = field(default_factory=list)
 
@@ -51,6 +54,18 @@ class ScanPlan:
     carried: list[int]
     outs: dict[str, list[int]]
     stacked: list[Key]
+
+
+@dataclass
+class CondPlan:
+    """A cond split in two, each of its `branches` planned. `B` computes the outputs
+    `outs["B"]`, `W` those of `outs["W"]`; `saved[k]` names what branch k's `B` part
+    hands its `W` part, which the `B` cond gives out for every branch, zeros but for
+    the one it ran."""
+
+    branches: list[Plan]
+    outs: dict[str, list[int]]
+    saved: list[list[Key]]
 
 
 @dataclass(frozen=True)
@@ -122,10 +137,22 @@ def _eval_inlined(
             outs = _eval_inlined(inner.jaxpr, inner.consts, ins)
         elif eqn.primitive.name == "scan":
             outs = _rescanned(eqn, ins)
+        elif eqn.primitive.name == "cond":
+            outs = _reconded(eqn, ins)
         else:
             outs = _bind(eqn, ins)
         env |= dict(zip(eqn.outvars, outs, strict=True))
     return [_read(env, v) for v in jaxpr.outvars]
+
+
+def _reconded(eqn: core.JaxprEqn, ins: list[Any]) -> list[Any]:
+    """Run the cond of `eqn` on `ins`, with its branches inlined."""
+    index, *ops = ins
+
+    def branch(b: core.ClosedJaxpr) -> Callable[..., list[Any]]:
+        return lambda *ops: _eval_inlined(b.jaxpr, b.consts, ops)
+
+    return jax.lax.switch(index, [branch(b) for b in eqn.params["branches"]], *ops)
 
 
 def _rescanned(eqn: core.JaxprEqn, ins: list[Any]) -> list[Any]:
@@ -191,6 +218,10 @@ def _plan(
             scan = plan.parts[i] = _plan_scan(eqn, i, need)
             by_b |= {eqn.outvars[k] for k in [*scan.carried, *scan.outs["B"]]}
             by_b |= set(scan.stacked)
+        elif all(wanted) and eqn.primitive.name == "cond":
+            cond = plan.parts[i] = _plan_cond(eqn, i, need)
+            by_b |= {eqn.outvars[k] for k in cond.outs["B"]}
+            by_b |= set(itertools.chain(*cond.saved))
         elif wanted[0]:
             plan.parts[i] = "B"
             need["B"] |= _vars(eqn.invars)
@@ -246,6 +277,30 @@ def _plan_scan(eqn: core.JaxprEqn, index: int, need: dict[str, set[Key]]) -> Sca
     return ScanPlan(sub, sorted(carried), outs_by, stacked)
 
 
+def _plan_cond(eqn: core.JaxprEqn, index: int, need: dict[str, set[Key]]) -> CondPlan:
+    """Plan a cond whose outputs both parts need, and add to `need` what each of its
+    parts reads: its operands, the index for both, and what `B` saves for `W`."""
+    outs = eqn.outvars
+    needed = {"B": [v in need["B"] for v in outs]}
+    needed["W"] = [v in need["W"] and not b for v, b in zip(outs, needed["B"])]
+    branches = [
+        _plan(b.jaxpr, b.consts, needed, [True] * len(b.jaxpr.invars))
+        for b in eqn.params["branches"]
+    ]
+    saved = [
+        [("cond", index, k, i) for i in range(len(b.saved))]
+        for k, b in enumerate(branches)
+    ]
+    need["B"] |= _vars(eqn.invars[:1])
+    need["W"] |= _vars(eqn.invars[:1]) | set(itertools.chain(*saved))
+    for k, v in enumerate(eqn.invars[1:]):
+        for p in PARTS:
+            if any(b.jaxpr.invars[k] in b.reads[p] for b in branches):
+                need[p] |= _vars([v])
+    by = {p: [k for k in range(len(outs)) if needed[p][k]] for p in PARTS}
+    return CondPlan(branches, by, saved)
+
+
 def _vars(atoms: Sequence[Any], keep: Sequence[bool] | None = None) -> set[Key]:
     keep = [True] * len(atoms) if keep is None else keep
     return {
@@ -278,6 +333,77 @@ def _run(plan: Plan, env: Env, part: str) -> None:
             env |= dict(zip(eqn.outvars, outs, strict=True))
         elif isinstance(p, ScanPlan):
             (_run_scan_b if part == "B" else _run_scan_w)(eqn, p, env)
+        elif isinstance(p, CondPlan):
+            (_run_cond_b if part == "B" else _run_cond_w)(eqn, p, env)
+
+
+def _run_cond_b(eqn: core.JaxprEqn, cond: CondPlan, env: Env) -> None:
+    """Run the `B` cond of `cond`: its outputs, and what each branch saves, zeros for
+    the branches it did not run."""
+    index, ops = _read(env, eqn.invars[0]), _operands(eqn, cond, env, "B")
+
+    def branch(k: int) -> Callable[..., tuple[list[Any], list[Any]]]:
+        plan = cond.branches[k]
+
+        def run(ops: dict[int, Any]) -> tuple[list[Any], list[Any]]:
+            inner = _start(plan, {plan.jaxpr.invars[i]: v for i, v in ops.items()})
+            _run(plan, inner, "B")
+            outs = [_read(inner, plan.jaxpr.outvars[i]) for i in cond.outs["B"]]
+            return outs, [inner[s] for s in plan.saved]
+
+        return run
+
+    shapes = [jax.eval_shape(branch(k), ops)[1] for k in range(len(cond.branches))]
+
+    def padded(k: int) -> Callable[..., tuple[list[Any], list[list[Any]]]]:
+        def run(ops: dict[int, Any]) -> tuple[list[Any], list[list[Any]]]:
+            outs, own = branch(k)(ops)
+            saved = [own if j == k else _zeros(shapes[j]) for j in range(len(shapes))]
+            return outs, saved
+
+        return run
+
+    branches = [padded(k) for k in range(len(cond.branches))]
+    outs, saved = jax.lax.switch(index, branches, ops)
+    env |= {eqn.outvars[i]: v for i, v in zip(cond.outs["B"], outs, strict=True)}
+    for keys, values in zip(cond.saved, saved, strict=True):
+        env |= dict(zip(keys, values, strict=True))
+
+
+def _run_cond_w(eqn: core.JaxprEqn, cond: CondPlan, env: Env) -> None:
+    """Run the `W` cond of `cond`, each branch from what its `B` part saved."""
+    index, ops = _read(env, eqn.invars[0]), _operands(eqn, cond, env, "W")
+    saved = [[env[k] for k in keys] for keys in cond.saved]
+
+    def branch(k: int) -> Callable[..., list[Any]]:
+        plan = cond.branches[k]
+
+        def run(ops: dict[int, Any], saved: list[list[Any]]) -> list[Any]:
+            inner = _start(plan, {plan.jaxpr.invars[i]: v for i, v in ops.items()})
+            inner |= dict(zip(plan.saved, saved[k], strict=True))
+            _run(plan, inner, "W")
+            return [_read(inner, plan.jaxpr.outvars[i]) for i in cond.outs["W"]]
+
+        return run
+
+    branches = [branch(k) for k in range(len(cond.branches))]
+    outs = jax.lax.switch(index, branches, ops, saved)
+    env |= {eqn.outvars[i]: v for i, v in zip(cond.outs["W"], outs, strict=True)}
+
+
+def _operands(
+    eqn: core.JaxprEqn, cond: CondPlan, env: Env, part: str
+) -> dict[int, Any]:
+    """Return the operands of the cond that a branch's `part` reads, by position."""
+    return {
+        k: _read(env, v)
+        for k, v in enumerate(eqn.invars[1:])
+        if any(b.jaxpr.invars[k] in b.reads[part] for b in cond.branches)
+    }
+
+
+def _zeros(shapes: list[jax.ShapeDtypeStruct]) -> list[Any]:
+    return [jnp.zeros(a.shape, a.dtype) for a in shapes]
 
 
 def _run_scan_b(eqn: core.JaxprEqn, scan: ScanPlan, env: Env) -> None:

@@ -78,6 +78,12 @@ class Table:
             kinds[t, s, k], micros[t, s, k] = KINDS.index(op.kind), op.micro
         return kinds, micros
 
+    def kinds_in(self, slot: int) -> list[int]:
+        """Return the codes of the kinds of op the table runs in `slot`."""
+        return sorted(
+            {KINDS.index(op.kind) for (_, _, k), op in self._each() if k == slot}
+        )
+
     def received(self, kind: str) -> Int[np.ndarray, "t s"]:
         """Return the microbatch each stage receives at the end of each tick, or -1:
         the output of the stage before's forward (`F`), or the input gradient of the
@@ -137,7 +143,8 @@ class Table:
                     )
                     held[s, j] = (filled, at[BACKWARD, s, j])
                 elif buffer == "residuals":
-                    held[s, j] = (at[FORWARD, s, j], at[BACKWARD, s, j])
+                    until = WEIGHTS if self.split else BACKWARD  # which reads them last
+                    held[s, j] = (at[FORWARD, s, j], at[until, s, j])
                 elif buffer == "weights" and self.split:
                     held[s, j] = (at[BACKWARD, s, j], at[WEIGHTS, s, j])
         return held

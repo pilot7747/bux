@@ -1318,16 +1318,19 @@ its checkpoint into the memory of the state it replaces.
 mesh    = mesh(stage=4, fsdp=2)
 methods = methods(repeat=scan, microbatches=8)                                # gpipe
 methods = methods(repeat=scan, microbatches=8, pipeline=circular, rounds=2)
+methods = methods(repeat=scan, microbatches=8, pipeline="zbh1")              # zero bubble
+methods = methods(repeat=scan, microbatches=8, pipeline="1f1b", stages=[5, 4, 4, 3])
 ```
 
 With `mesh.stage` above 1, the longest scanned repeat outside any other (the first of
 several as long) is pipelined. Its stacked layers split over `stage` by a dimension
 named `stages` of the layout, one share of consecutive passes per stage. The rest of the
-model, the embedding and the head too, does not split over `stage`: every stage
-computes it.
+model, the embedding and the head too, does not split over `stage`: under `gpipe` and
+`circular` every stage computes it, and under `1f1b` and `zbh1` the first stage runs
+the embedding and the last the head ([Schedules](#schedules-1f1b-zbh1)).
 A model with no scanned repeat is an error that says to repeat its blocks and scan
-them, `methods(repeat=scan)`, and so is a repeat whose passes do not split evenly over
-the stages.
+them, `methods(repeat=scan)`, and so is a repeat whose passes do not split over the
+stages evenly, or as `methods.stages` says ([Uneven stages](#uneven-stages-methodsstages)).
 
 The batch's rows split into `methods.microbatches` microbatches, row `i·M + j` into
 microbatch `j`, so that each splits over the batch axes as the rows do. A method runs
@@ -1338,12 +1341,16 @@ first stage takes each microbatch from a buffer of its own, where the last stage
 outputs come back: there a circular round starts again, and from there the stream
 leaves, summed over the stages to every one.
 
-| method     | each microbatch                                                   | a stage idles           |
-|------------|-------------------------------------------------------------------|-------------------------|
-| `gpipe`    | goes through the stages once; the default                         | (S − 1) / (M + S − 1)   |
-| `circular` | goes round them `methods.rounds` times, each stage holding a share of every round's layers | (S − 1) / (R·M + S − 1) |
+| method     | each microbatch                                                   | a stage holds   | a stage idles           |
+|------------|-------------------------------------------------------------------|-----------------|-------------------------|
+| `gpipe`    | goes through the stages once; the default                         | M + S − 1 ticks | (S − 1) / (M + S − 1)   |
+| `circular` | goes round them `methods.rounds` times, each stage holding a share of every round's layers | R·M + S − 1 ticks | (S − 1) / (R·M + S − 1) |
+| `1f1b`     | as in gpipe, and its backward as soon as it can run               | 2S − 1          | (S − 1) / (M + S − 1)   |
+| `zbh1`     | as in gpipe, its backward split in two, the weights' part where a stage would idle | S, and S of the weights' | (S − 1) / (3M + S − 1) |
 
-`circular` needs at least one microbatch per stage, and only it reads `methods.rounds`.
+What a stage holds is the residuals of as many ticks or microbatches. `circular` needs
+at least one microbatch per stage, and only it reads `methods.rounds`. The bubble of
+`zbh1` counts a forward, a backward of the input and one of the weights as a tick each.
 `bux plan` shows the share of a step a stage idles, the bubble:
 
 ```
@@ -1414,3 +1421,93 @@ fails to lower; `stage` comes first in the mesh, as XLA aborts on a nested shard
 manual over an axis before the outer one's ("Manual axes must be sorted by mesh axis
 index"); and the pipeline takes a round's layers by dynamic slices, as XLA fails to
 partition over Auto axes the scatter that a gather's gradient is.
+
+### Schedules: `1f1b`, `zbh1`
+
+```
+methods = methods(repeat=scan, microbatches=8, pipeline="1f1b")
+methods = methods(repeat=scan, microbatches=8, pipeline="zbh1")
+```
+
+`gpipe` and `circular` run the forward alone, and JAX's transpose of their scan of
+ticks is the backward, so a stage holds every tick's residuals until it. `1f1b` and
+`zbh1` take each microbatch's backward by hand (`bux.parallel.scheduled`), at the
+ticks of a table (`bux.parallel.schedule`), and a stage keeps a microbatch's residuals
+from its forward to its backward alone. The forward is a `jax.vjp`, whose residuals
+are a pytree of arrays: a few microbatches' of them sit in a buffer, and the backward
+rebuilds the vjp from its slot, the stage's parameters put back, which it does not
+save with each. A table gives each stage its ops in order, a queue to each slot of a
+tick; at each tick a slot runs the next op of its queue once what the op reads is
+there, and at the tick's end a stage sends its forward's output on and its
+backward's input gradient back. The names are quoted: the DSL reads `1f1b` as a
+number.
+
+- **`1f1b`**: two slots a tick, a forward and a whole backward, each as soon as it can
+  run. Stage s holds 2(S − s) − 1 microbatches, not M + S − 1 ticks, and the stages
+  idle as gpipe's do: as lockstep ticks they cannot keep the S − s of an asynchronous
+  1F1B without idling longer.
+- **`zbh1`**: one slot, and the backward split in two: `B` takes the input's gradient,
+  on the critical path, and `W` the weights' later, in a tick the stage would idle.
+  Stage s runs S − s forwards, then a backward, the weights of the microbatch s before
+  it, and a forward, in turn (ZB-H1 of Qi et al., "Zero Bubble Pipeline Parallelism"):
+  every stage holds S microbatches' residuals and S of what `W` reads, and the stages
+  idle S − 1 ticks of 3M + S − 1.
+
+`bux.parallel.split` splits a backward by its equations: those that lead to the
+input's gradient run in `B` and hand those that lead only to the weights' the values
+they read. A scan of the backward, the one over a stage's layers, splits into a scan
+of each part, the first stacking what each pass saves for the second; a cond splits
+into a cond of each; calls of jaxprs (jit, remat) are inlined; any other equation,
+such as an MoE's shard_map, goes whole to `B`. No equation runs twice: of 4 Llama
+blocks' backward, `W` runs the 28 matmuls of the weights' gradients and `B` the rest,
+which `tests/test_schedules.py` checks against the whole backward, with remat too.
+
+A backward needs the gradient of the loss as soon as the last stage has a
+microbatch's forward, so these pipelines take the whole model, cut at the pipelined
+repeat (`trainer._Cut`): the model's own forward, a microbatch at a time, up to the
+repeat on the first stage (`pipelined.stream_into`), and from the repeat to the loss
+on the last (`pipelined.leaving`), where the stage's layers stand in by their shapes.
+So the embedding runs on the first stage alone, the head and the objective on the
+last, each once a microbatch, where gpipe runs them on every stage for the whole
+batch. Their gradients add up in float32 on their stage and sum over the stages as
+they leave, and the stages' own add up in float32 on their devices. The losses the
+stages' layers report enter the loss by their weights, and their means its metrics;
+the router bias moves once a step, as under gpipe. A layer outside the repeat that
+learns from the whole batch, as an MoE's router does, is an error: it would learn a
+microbatch at a time. Gathered once and reduced once work as for gpipe: the
+parameters come in cast to `compute` and gathered, and where the rows are apart each
+device runs its own and every gradient sums over the rows' axes once, at the end. A
+forward alone, an eval's, runs gpipe's.
+
+Each kind of op runs under a `lax.cond` of its own: in one `lax.switch` of them all,
+XLA copied every buffer that one op writes and another reads in each branch, a tick
+at a time (job 1 below ran so).
+
+### Uneven stages: `methods.stages`
+
+```
+mesh    = mesh(stage=4, fsdp=2)
+methods = methods(repeat=scan, microbatches=8, pipeline="1f1b", stages=[5, 4, 4, 3])
+```
+
+`methods.stages` gives each stage its passes of the pipelined repeat, first to last:
+fewer on the last, which runs the head under `1f1b` and `zbh1`. A sharding splits the
+stacked layers evenly, so each stage holds as many as the most any runs
+(`pipeline.spread`): its own, then copies of its first, which it skips by a
+`lax.cond`. The copies are parameters too, with their optimizer's state, and their
+gradient is 0; a run resumes on the same split only. The split must give every stage
+its passes and sum to the repeat's, in one round, else it is an error that says so.
+
+### Later: DualPipe
+
+DualPipe (DeepSeek-V3) and its half, DualPipeV, send microbatches through the stages
+both ways, each device holding two chunks of the layers, and run one microbatch's
+forward and another's backward in one op, so that an MoE's all-to-all in one hides
+behind the other's compute. It fits the executor of `1f1b` and `zbh1`: its V is a
+table of ops on two chunks, a device holding chunk s and chunk 2S − 1 − s; the
+layers stack by chunk as `circular` stacks rounds, the second in the stages' reverse
+order; each chunk sends its way, four ppermutes a tick; and an op `FB` runs a
+forward and a backward in one branch, where XLA's scheduler can overlap them. The
+embedding and the head then both sit on device 0, at the two ends of the V. It pays
+where an MoE's all-to-all is exposed; a dense model loses nothing to `zbh1`'s one
+chunk.

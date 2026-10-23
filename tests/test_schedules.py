@@ -148,8 +148,14 @@ def _dots(f, *args) -> int:
     return count(jax.make_jaxpr(f)(*args).jaxpr, 1)
 
 
-@pytest.mark.parametrize("remat", ["none", "full"])
-def test_a_split_backward_takes_the_whole_ones_gradients_and_each_matmul_once(remat):
+SPLITS = [("none", None), ("full", None), ("none", [True, False, True, True])]
+
+
+@pytest.mark.parametrize(("remat", "runs"), SPLITS, ids=["", "remat", "skipping"])
+def test_a_split_backward_takes_the_whole_ones_gradients_and_each_matmul_once(
+    remat, runs
+):
+    """Of 4 Llama blocks, a stage's (the blocks `runs` marks, by a cond each)."""
     with _use(ONE, f"methods(repeat=scan, remat={remat})"):
         model = Model(
             compile(PRELUDE + "model = embed block^4 norm head"), rngs=nnx.Rngs(0)
@@ -161,7 +167,13 @@ def test_a_split_backward_takes_the_whole_ones_gradients_and_each_matmul_once(re
         rows = pipelined.Rows(None, jnp.zeros((2, 16), jnp.int32))
 
         def forward(p: nnx.State, x: jax.Array) -> jax.Array:
-            return stage(p, rest, x, rows)[0]
+            if runs is None:
+                return stage(p, rest, x, rows)[0]
+            taps = pipelined._stage_taps(rows, True)
+            state = nnx.merge_state(p, rest)
+            return pipelined._skipping(graphdef, state, jnp.array(runs), x, taps, None)[
+                0
+            ]
 
         _, vjp = jax.vjp(forward, params, x, saveable_args=(False, True))
         flat, tree = jax.tree.leaves(params), jax.tree.structure(params)
@@ -183,7 +195,7 @@ def test_a_split_backward_takes_the_whole_ones_gradients_and_each_matmul_once(re
     for a, e in zip(got, want, strict=True):
         assert np.allclose(a, e, atol=1e-6)
     assert w == 4 * 7  # a weight's gradient per matrix: q, k, v, o, gate, up, down
-    assert b + w == _dots(backward, *flat, *residuals, dy)
+    assert b + w == _dots(backward, *flat, *residuals, dy)  # none of them twice
 
 
 def _use(mesh: str, methods: str):
@@ -276,6 +288,25 @@ def test_a_layer_outside_the_repeat_that_learns_from_the_batch_is_an_error():
     error = pytest.raises(ValueError, match="learns from the whole batch")
     with parallel.use(t.mesh, t.layout, t.methods), error:
         trainer.train_on_batch(plain(TOKENS))
+
+
+@pytest.mark.parametrize("name", ["gpipe", *PIPELINES])
+def test_only_a_scheduled_pipeline_reduces_its_gradients_in_float32(name):
+    run = _run(LLAMA, "mesh(stage=2, fsdp=4)", _how(name, 4))
+    t = run.train
+    with parallel.use(t.mesh, t.layout, t.methods):
+        model = parallel.build(lambda: Model(run.arch, rngs=nnx.Rngs(0)))
+        tx = optimizer(t.optimizer, lr_multiplier(t.schedule, t.steps), model, t.clip)
+        loss = objective(t.loss, run.arch)
+
+        def make() -> Trainer:
+            return Trainer(model, tx, loss, compute="bfloat16", reduce="float32")
+
+        if name == "gpipe":
+            with pytest.raises(ValueError, match="embedding and head do not"):
+                make()
+        else:
+            assert make().reduces_once
 
 
 def test_a_scheduled_pipeline_goes_round_the_stages_once():

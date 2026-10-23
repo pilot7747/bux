@@ -368,7 +368,12 @@ class Trainer:
             return "methods(accumulate=reduced) reduces as the backward makes them"
         if self.gather != "step":
             return "needs the parameters gathered once a step: methods(gather=step)"
-        if self.reduce != self.compute and parallel.pipeline.pipelined():
+        scheduled = parallel.scheduled.active() is not None  # sums all in float32
+        if (
+            self.reduce != self.compute
+            and parallel.pipeline.pipelined()
+            and not scheduled
+        ):
             return "a pipeline's embedding and head do not: they reduce in the backward"
         if not rows_independent(model):
             return (
