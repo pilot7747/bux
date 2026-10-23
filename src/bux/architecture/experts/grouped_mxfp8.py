@@ -41,7 +41,7 @@ from bux.architecture.precision.blockscaled import MX_BLOCK, Blocks
 E8M0 = jnp.float8_e8m0fnu
 LANES = 128  # tensor memory's rows: a tile's, and a tile of scales'
 SCALE_TILE = 4  # scales to a row of a tile of scales: 128 values of k
-EPILOGUE = (64, 32)  # columns the store takes at a time: the most that n is whole of
+STORE = 128  # bytes of a row the store takes at a time: the widest swizzle
 
 
 class Tiles(NamedTuple):
@@ -380,9 +380,7 @@ def _buffers(tiles: Tiles, n: int, out: jnp.dtype) -> _Buffers:
         b=_swizzled((s, tiles.n // tiles.sms, tiles.k), e4m3),
         a_scales=plgpu.SMEM((s, tiles.m // LANES, k_tiles, 32, 16), E8M0),
         b_scales=plgpu.SMEM((s, n_tiles, k_tiles, 32, 16), E8M0),
-        out=_swizzled(
-            (2, tiles.m, next(e for e in EPILOGUE if n % e == 0)), out, rows=1
-        ),
+        out=_swizzled((2, tiles.m, _store_width(n, out)), out, rows=1),
         acc=plgpu.TMEM((tiles.m, 2 * tiles.n), jnp.float32, collective=pair),
         a_scales_tm=scales((tiles.m, tiles.k // MX_BLOCK), E8M0),
         b_scales_tm=scales((n_tiles * LANES, tiles.k // MX_BLOCK), E8M0),
@@ -391,6 +389,15 @@ def _buffers(tiles: Tiles, n: int, out: jnp.dtype) -> _Buffers:
         multiplied=plgpu.Barrier(num_barriers=2, orders_tensor_core=True),
         stored=_barrier_of_both(tiles.sms, num_barriers=2, orders_tensor_core=True),
     )
+
+
+def _store_width(n: int, out: jnp.dtype) -> int:
+    """Return how many columns of `out` the store takes at a time: STORE bytes of
+    them, or half or a quarter of that, the most that n is whole of."""
+    width = STORE // out.itemsize
+    while n % width:
+        width //= 2
+    return width
 
 
 def _barrier_of_both(sms: int, **kwargs: Any) -> Any:
