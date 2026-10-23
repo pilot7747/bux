@@ -142,6 +142,26 @@ section of `docs/` says how its piece works and what it measured.
 - Recipes: `nvidia_mxfp8`, `nvidia_nvfp4`, `nemotron3_nvfp4`, `deepseek_v3_fp8`,
   `torchtitan_mxfp8`
 
+### Measured
+
+On B300s, `sota` against `main` (83dc97f), each with its own defaults:
+
+| run | main | sota |
+|-----|------|------|
+| dense, 1 GPU | 143.8k tok/s, 70.6 GiB | 144.0k, 51.1 GiB |
+| GDN hybrid, 1 GPU | 93.5k, 140.4 GiB | 122.1k, 70.6 GiB |
+| KDA bounded, 1 GPU | 113.5k, 176.2 GiB | 128.0k, 91.4 GiB |
+| MXFP8, 1 GPU | 168.2k | 171.0k |
+| NVFP4 everywhere, 1 GPU | 0.3x bf16 | 178.3k |
+| PP stage=4, 8 GPUs | gpipe 483k, 65.0 GiB | 1f1b, uneven stages, 595k, 52.7 GiB |
+| TP=8 + SP in MXFP8 | 245.1k | `tensor=chunked` 260.9k |
+| EP=8, 32k tokens a GPU | out of memory | 549k (`sorted` without EP: 820k) |
+
+Two nodes, 16 GPUs, a dense 1.3B: FSDP and HSDP train at 97% of one node's rate a
+GPU; at 8 microbatches, reducing once makes HSDP 100% of it, against 90% reduced each
+microbatch. A second launch with JAX's cache on a shared filesystem reaches step 5 in
+42 s instead of 75.
+
 ### Left open
 
 - DualPipe: designed in `docs/parallelism.md`, not built.
