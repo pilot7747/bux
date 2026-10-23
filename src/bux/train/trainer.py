@@ -31,6 +31,7 @@ import jax
 import jax.numpy as jnp
 import optax
 from flax import nnx
+from jax.sharding import PartitionSpec as P
 from jax.typing import DTypeLike
 from jaxtyping import Array, Float, Int32
 
@@ -42,7 +43,9 @@ from bux.architecture.repeat import scanned_variables
 from bux.data.pipeline import DEFAULT_CACHE, jobs, prepare
 from bux.lang import ir
 from bux.lang.printer import run_to_source
+from bux.parallel.gather import Axes
 from bux.train import flops, xla
+from bux.train.config import PrecisionConfig
 from bux.train.data import Batch, batches, prefetch
 from bux.train.hooks import Checkpoint, Eval, Hook, Log, Profile
 from bux.train.objective import Metrics, Objective, objective, target_mask
@@ -98,12 +101,26 @@ def apply_step_end_updates(model: nnx.Module) -> None:
             module.step_end_update()
 
 
-def token_shares(batch: Batch, n: int) -> Float[Array, " n"]:
+def token_shares(batch: Batch, n: int, over: Axes = ()) -> Float[Array, " n"]:
     """Return each of `n` microbatches' share of the batch's target tokens (the first
-    head's), or 1 / n each if it has none."""
+    head's), or an even share if it has none. In a shard_map manual over the axes
+    `over`, of the targets of every device's rows."""
     counts = parallel.microbatches(target_mask(batch), n).sum((1, 2))
-    num_targets = counts.sum()
-    return jnp.where(num_targets > 0, counts / jnp.maximum(num_targets, 1), 1 / n)
+    num_targets = jax.lax.psum(counts.sum(), over) if over else counts.sum()
+    even = 1 / (n * _size(over))
+    return jnp.where(num_targets > 0, counts / jnp.maximum(num_targets, 1), even)
+
+
+def rows_independent(model: nnx.Module) -> bool:
+    """Return whether `model` computes each row of a batch apart from the others: no
+    module of it learns from the whole batch (``StepEndUpdate``), as an MoE's router
+    does, whose balance loss reads it too."""
+    return not any(isinstance(m, StepEndUpdate) for _, m in nnx.iter_modules(model))
+
+
+def _size(axes: Axes) -> int:
+    on = parallel.active()
+    return 1 if on is None else on.size(*axes)
 
 
 def _scaled(metrics: Metrics, share: float | Float[Array, ""]) -> Metrics:
@@ -115,6 +132,24 @@ def _shard_state(state: nnx.State) -> nnx.State:
     if parallel.active() is None:
         return state
     return jax.lax.with_sharding_constraint(state, parallel.shardings(state))
+
+
+def _cast_params(params: nnx.State, dtype: DTypeLike) -> nnx.State:
+    return jax.tree.map(
+        lambda x: x.astype(dtype) if jnp.issubdtype(x.dtype, jnp.floating) else x,
+        params,
+    )
+
+
+def _add(total: Float[Array, "*s"], part: Float[Array, "*s"]) -> Float[Array, "*s"]:
+    return total + part.astype(total.dtype)
+
+
+def _by_spec(
+    f: Callable[[P, Array], Array], specs: nnx.State, state: nnx.State
+) -> nnx.State:
+    """Apply `f` to each variable's value of `state` and its spec in `specs`."""
+    return jax.tree.map(lambda s, v: v.replace(f(s, v.get_value())), specs, state)
 
 
 class Trainer:
@@ -132,7 +167,13 @@ class Trainer:
     names (``bux.architecture.matmuls``).
 
     Made inside ``parallel.use``, it puts its state on the shardings the layout gives
-    it, and every step keeps it there.
+    it, and every step keeps it there. A step that runs its layers more than once, in
+    `microbatches` or a pipeline's ticks, gathers its parameters once with `gather`
+    "step", or as each layer runs with "layer". With `accumulate` "unreduced" its
+    microbatches' gradients add up on each device and reduce once, in `reduce`
+    (``parallel.gather``), a pipeline's in float32; with "reduced" they reduce each
+    microbatch; "auto" adds them up unreduced where the rows' axes span processes,
+    and where that computes the same, as `_why_not_unreduced` says.
 
     With `donate`, a training step donates the model's and the optimizer's arrays, so
     that their new state takes the old one's memory: an array read from them before a
@@ -150,12 +191,17 @@ class Trainer:
         compute: DTypeLike = jnp.float32,
         matmuls: str = "compute",
         microbatches: int = 1,
+        gather: str = "step",
+        accumulate: str = "auto",
+        reduce: DTypeLike | None = None,
         donate: bool = False,
         compiler_options: xla.Options | None = None,
     ):
         self.model, self.objective = model, objective
         self.compute, self.microbatches = jnp.dtype(compute), microbatches
-        self.matmuls = matmuls
+        self.matmuls, self.gather = matmuls, gather
+        self.reduce, self.accumulate = jnp.dtype(reduce or compute), accumulate
+        self.reduces_once = self._reduces_once(model)
         self.optimizer = nnx.Optimizer(model, tx, wrt=nnx.Param)
         parallel.shard_state(self.model, self.optimizer)
         self.step = 0
@@ -165,6 +211,44 @@ class Trainer:
             self._train_step_on_shards, compiler_options or {}, donate_argnames=donated
         )
         self._eval = nnx.jit(self.eval_step)
+
+    def _reduces_once(self, model: Model) -> bool:
+        """Return whether a step adds up its gradients unreduced (``_unreduced``, or a
+        pipeline's ``gather.apart``): where `accumulate` or a `reduce` other than
+        `compute` asks for it, and by "auto" where the step runs its layers more than
+        once, the rows' axes span processes (``gather.rows_span_processes``) and that
+        computes the same. Raise where it is asked for but would not."""
+        in_float32 = self.reduce != self.compute
+        asked = self.accumulate == "unreduced" or in_float32
+        runs = self.microbatches > 1 or parallel.pipeline.pipelined()
+        across = parallel.gather.rows_span_processes()
+        auto = self.accumulate == "auto" and runs and across
+        if not (asked or auto) or not parallel.gather.rows():
+            return False  # with no axis splitting the rows, nothing reduces over them
+        why = self._why_not_unreduced(model)
+        if why is not None and asked:
+            what = (
+                f"precision(reduce={self.reduce.name}) reduces a step's gradients once"
+                if in_float32
+                else "methods(accumulate=unreduced) adds up each device's gradients"
+            )
+            raise ValueError(f"{what}, which {why}")
+        return why is None
+
+    def _why_not_unreduced(self, model: Model) -> str | None:
+        """Return why a step could not add up its gradients unreduced, or None."""
+        if self.accumulate == "reduced":
+            return "methods(accumulate=reduced) reduces as the backward makes them"
+        if self.gather != "step":
+            return "needs the parameters gathered once a step: methods(gather=step)"
+        if self.reduce != self.compute and parallel.pipeline.pipelined():
+            return "a pipeline's embedding and head do not: they reduce in the backward"
+        if not rows_independent(model):
+            return (
+                "a layer that learns from the whole batch, as the MoE's router does, "
+                "cannot: methods(accumulate=reduced)"
+            )
+        return None
 
     def _train_step_on_shards(
         self, model: Model, optimizer: nnx.Optimizer, batch: Batch
@@ -187,15 +271,102 @@ class Trainer:
         `microbatches`. The forwards update the model's buffers (its state that is not
         a parameter) in turn, and then the step-end updates run."""
         graphdef, params, buffers = nnx.split(model, nnx.Param, ...)
-        if self.microbatches == 1:
-            grads, metrics, buffers = self._grads(
-                graphdef, params, buffers, batch, token_share=1.0, row_share=1.0
-            )
+        if self.reduces_once and not parallel.pipeline.pipelined():
+            grads, metrics, buffers = self._unreduced(graphdef, params, buffers, batch)
+        elif self.microbatches > 1:
+            grads, metrics, buffers = self._reduced(graphdef, params, buffers, batch)
         else:
-            grads, metrics, buffers = self._accumulate(graphdef, params, buffers, batch)
+            grads, metrics, buffers = self._whole(graphdef, params, buffers, batch)
         nnx.update(model, buffers)
         apply_step_end_updates(model)
         return grads, metrics
+
+    def _whole(
+        self,
+        graphdef: nnx.GraphDef,
+        params: nnx.State,
+        buffers: nnx.State,
+        batch: Batch,
+    ) -> tuple[nnx.State, Metrics, nnx.State]:
+        """Return `_grads` of the whole batch at once. A pipeline that gathers once a
+        step takes the parameters whole over FSDP's axes, in float32: its ticks add up
+        their gradients in the dtype of what they read. One that reduces them once
+        runs its stages manual over the rows' axes (``gather.apart``)."""
+        if self.gather == "step" and parallel.pipeline.pipelined():
+            params = parallel.gather.whole(params)
+        apart = parallel.gather.rows() if self.reduces_once else ()
+        with parallel.gather.apart(apart):
+            grads, metrics, buffers = self._grads(
+                graphdef, params, buffers, batch, token_share=1.0, row_share=1.0
+            )
+        return _shard_state(grads), metrics, buffers
+
+    def _gathered(self, params: nnx.State) -> nnx.State:
+        """Return `params` as the microbatches use them: with `gather` "step", cast to
+        `compute` on each device's shards and then gathered whole, once a step."""
+        if self.gather != "step":
+            return params
+        return parallel.gather.whole(_shard_state(_cast_params(params, self.compute)))
+
+    def _reduced(
+        self,
+        graphdef: nnx.GraphDef,
+        params: nnx.State,
+        buffers: nnx.State,
+        batch: Batch,
+    ) -> tuple[nnx.State, Metrics, nnx.State]:
+        """Return `_accumulate`'s sums, each microbatch's gradient reduced over the
+        batch axes as the backward makes it, and added to its shards."""
+        zeros = _shard_state(jax.tree.map(jnp.zeros_like, params))
+        shares = token_shares(batch, self.microbatches)
+        used, n = self._gathered(params), self.microbatches
+        return self._accumulate(graphdef, used, buffers, batch, zeros, shares, n)
+
+    def _unreduced(
+        self,
+        graphdef: nnx.GraphDef,
+        params: nnx.State,
+        buffers: nnx.State,
+        batch: Batch,
+    ) -> tuple[nnx.State, Metrics, nnx.State]:
+        """Return `_accumulate`'s sums, computed in a shard_map manual over the axes
+        that split the rows: each device gathers its shards of the parameters once,
+        in `compute`, adds up its own rows' gradients over the microbatches, and the
+        sums reduce once, in `reduce`, each device keeping its shards."""
+        over = parallel.gather.rows()
+        splits = parallel.gather.splits(params, over)
+        rows = self.microbatches * _size(over)
+
+        def gathered(spec: P, x: Array) -> Array:
+            return parallel.gather.gather(spec, x.astype(self.compute))
+
+        def reduced(spec: P, g: Float[Array, "*w"]) -> Float[Array, "*s"]:
+            summed = parallel.gather.scatter(spec, over, g, self.reduce)
+            return summed.astype(g.dtype)
+
+        def on_device(
+            params: nnx.State, buffers: nnx.State, batch: Batch
+        ) -> tuple[nnx.State, Metrics, nnx.State]:
+            whole = _by_spec(gathered, splits, params)
+            zeros = jax.tree.map(
+                lambda w, p: jnp.zeros(w.shape, p.dtype), whole, params
+            )
+            shares = token_shares(batch, self.microbatches, over)
+            own = parallel.gather.own_streams(buffers, over)
+            grads, metrics, after = self._accumulate(
+                graphdef, whole, own, batch, zeros, shares, rows
+            )
+            grads = _by_spec(reduced, splits, grads)
+            after = parallel.gather.keys_of(buffers, after)
+            return grads, jax.lax.psum(metrics, over), after
+
+        return jax.shard_map(
+            on_device,
+            in_specs=(splits, P(), P(over)),
+            out_specs=(splits, P(), P()),
+            axis_names=set(over),
+            check_vma=False,  # each device's gradients are its own, summed by hand
+        )(params, buffers, batch)
 
     def _accumulate(
         self,
@@ -203,12 +374,14 @@ class Trainer:
         params: nnx.State,
         buffers: nnx.State,
         batch: Batch,
+        zeros: nnx.State,
+        token_shares: Float[Array, " n"],
+        rows: int,
     ) -> tuple[nnx.State, Metrics, nnx.State]:
-        """Sum `_grads` over the microbatches of `batch` in a scan, each one's
-        per-token part scaled by its share of the batch's targets and its per-row part
-        by 1 / n: so the sums are the batch's, even when microbatches have unequal
-        numbers of targets."""
-        n = self.microbatches
+        """Sum `_grads` over the microbatches of `batch` in a scan, into `zeros`, each
+        one's per-token part scaled by its share of the batch's targets and its
+        per-row part by 1 / `rows`, the microbatches of every device: so the sums are
+        the batch's, even when microbatches have unequal numbers of targets."""
 
         def add_microbatch(
             carry: tuple[nnx.State, nnx.State],
@@ -217,12 +390,11 @@ class Trainer:
             grad_sum, buffers = carry
             microbatch, token_share = xs
             grads, metrics, buffers = self._grads(
-                graphdef, params, buffers, microbatch, token_share, row_share=1 / n
+                graphdef, params, buffers, microbatch, token_share, row_share=1 / rows
             )
-            return (jax.tree.map(jnp.add, grad_sum, grads), buffers), metrics
+            return (jax.tree.map(_add, grad_sum, grads), buffers), metrics
 
-        xs = (parallel.microbatches(batch, n), token_shares(batch, n))
-        zeros = _shard_state(jax.tree.map(jnp.zeros_like, params))
+        xs = (parallel.microbatches(batch, self.microbatches), token_shares)
         (grads, buffers), metrics = jax.lax.scan(add_microbatch, (zeros, buffers), xs)
         return grads, {k: v.sum() for k, v in metrics.items()}, buffers
 
@@ -359,6 +531,9 @@ def train(
             compute=config.precision.compute,
             matmuls=config.precision.matmuls,
             microbatches=_accumulated(config.methods.microbatches),
+            gather=config.methods.gather,
+            accumulate=config.methods.accumulate,
+            reduce=_reduce_dtype(config.precision),
             donate=config.methods.donate,
             compiler_options=xla.options(config.compiler),
         )
@@ -403,6 +578,11 @@ def _check_cpu_bfloat16(run: ir.Run) -> None:
         f"XLA:CPU cannot train {what} in bfloat16 on more than one device: set "
         "precision(compute=float32), or methods(moe=dense) for an MoE"
     )
+
+
+def _reduce_dtype(precision: PrecisionConfig) -> str:
+    """Return the dtype `precision` sums gradients over the batch's rows in."""
+    return precision.compute if precision.reduce == "compute" else precision.reduce
 
 
 def _accumulated(microbatches: int) -> int:

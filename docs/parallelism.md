@@ -1044,10 +1044,23 @@ Float32 islands compute from what they are given in float32, and give back its d
 Softmax attention takes its softmax in float32, under every method of
 `methods.attention`. Every other matmul runs in `compute`, or in the format of
 `matmuls` (below), and the stream stays in `compute` from the embedding to the heads,
-which `tests/test_precision.py` checks for every family. Gradients are reduced over the
-batch axes in the dtype the backward makes them, bfloat16 for a weight's, but the head
-kernel's under `methods(loss=chunks)`, which adds up over the chunks in float32; they
-add up over microbatches in float32.
+which `tests/test_precision.py` checks for every family.
+
+Gradients add up over microbatches in float32. Over the rows' axes they are reduced in
+`precision.reduce`: `compute`, the default, or `float32`, as Megatron's are. In
+`compute` they are reduced as the backward makes them, bfloat16 for a weight's (but the
+head kernel's under `methods(loss=chunks)`, which adds up over the chunks in float32);
+where a step adds its gradients up unreduced ([below](#gathered-once-reduced-once-methodsgather-methodsaccumulate)),
+each device's sum is rounded to it before the one reduction. In `float32` that
+reduction sums float32, twice the bytes, once a step; on B300s, through the NICs, a
+step of the dense 1.3B trains 5% slower in it. `float32` changes what a run
+computes, so it is in the run's id, and a run that leaves `compute` keeps the id it
+had. It needs the step to add its gradients up unreduced, also at one microbatch: XLA
+reduces those of the backward in the dtype of the matmul that makes them, as it does
+for a run whose layers learn from the whole batch, such as an MoE's, and for a
+pipeline's embedding and head, which run outside it: there `float32` is an error. A
+pipeline that reduces once sums its stages' gradients in float32 either way, as their
+parameters are whole in float32.
 
 XLA:CPU fails to compile a bfloat16 `psum` that a `shard_map`'s transpose makes (its
 reducer ends in a copy, which `ChangeOpDataType` cannot clone), and aborts the process.
@@ -1150,12 +1163,108 @@ tensor=2`. Dropout's masks and a balance loss over the batch aside, microbatches
 change how a run computes, not what, so they keep its id as the rest of `methods`
 does.
 
-Each microbatch's gradient is a global array, reduced over the batch axes inside the
-scan: under FSDP, a reduce-scatter a microbatch, as ZeRO-3 does. XLA:GPU has a pass
-(while-loop all-reduce code motion) meant to move a data-parallel all-reduce out of
-such a loop, which this has not been run on; XLA:CPU all-reduces n times a step.
 `parallel.microbatches` is there for pipeline parallelism to split its batch the same
 way.
+
+### Gathered once, reduced once: `methods.gather`, `methods.accumulate`
+
+```
+methods = methods(microbatches=8)                                  # reduced once across hosts
+methods = methods(microbatches=8, accumulate=unreduced)            # reduced once
+methods = methods(microbatches=8, accumulate=reduced)              # reduced each microbatch
+methods = methods(microbatches=8, gather=layer, accumulate=reduced)  # ZeRO-3
+```
+
+Every axis is Auto, and XLA does not move a collective out of a loop. Left to it, a
+step of n microbatches under FSDP gathers each layer's parameters as it runs, n times
+forward and, in a scan of layers, n times back, and reduce-scatters the gradients n
+times: what ZeRO-3 does, and `methods(gather=layer, accumulate=reduced)` still does.
+`bux.parallel.gather` does better, in two parts:
+
+- **Gathered once** (`gather=step`, the default). Before the microbatches, each
+  device casts its shards of the parameters to `compute` and gathers them
+  (`gather.whole`: split by their names alone, whole over FSDP's axes), and every
+  microbatch uses that copy. A pipeline's step does the same before its ticks, in
+  float32, as its ticks add up the gradients in the dtype of what they read.
+- **Reduced once** (`accumulate=unreduced`). The gradients add up unreduced, each
+  device's own, and reduce once at the end. JAX types an array that each device holds a
+  part of the sum of, `P(unreduced={...})`, only on Explicit or Manual axes, so the step
+  runs in a `shard_map` manual over the axes that split the rows (`gather.rows`,
+  `data` and `fsdp` by default): each device gathers its shards by `all_gather`, sums
+  the gradients of its rows' microbatches into a float32 copy of every parameter, and a
+  `psum_scatter` keeps its shards of their sum (`gather.scatter`), in
+  `precision.reduce`. Each device folds its index into the RNG keys, so that dropout
+  draws masks for its own rows. The other axes stay Auto inside, and their reductions
+  (over `tensor`, `context`) happen each microbatch.
+
+Inside that `shard_map` a layer sees its device's rows alone, so a layer that learns
+from the whole batch would learn from a part (`trainer.rows_independent`): the MoE's
+router, its bias and its balance loss over the batch. `accumulate=auto`, the default,
+adds up unreduced where the step has microbatches or a pipeline, the devices along the
+rows' axes span more than one process (`gather.rows_span_processes`: their
+reductions go between hosts), its rows are independent and the parameters are
+gathered once; else each microbatch's gradient reduces as the backward makes it,
+onto its shards, which over NVLink is faster (below). `accumulate=unreduced` where it
+would not compute the same is an error that says why.
+
+A step of 8 microbatches then moves what a step of 1 does. In the compiled step of
+`fsdp=8`, each collective counted as many times as the loops around it run
+(`tests/test_gather.py`), for the dense 1.3B of `docs/training.md` on B300s, 64 rows
+of 4096:
+
+| methods                                        | all-gathers     | reduce-scatters |
+|------------------------------------------------|-----------------|-----------------|
+| `microbatches=1`                               | 66, 2.68 GiB    | 9, 2.68 GiB     |
+| `microbatches=8, gather=layer, accumulate=reduced` | 528, 21.5 GiB | 72, 21.5 GiB  |
+| `microbatches=8`                               | 66, 2.68 GiB    | 9, 2.68 GiB     |
+| `repeat=scan, microbatches=8, gather=layer, accumulate=reduced` | 1048, 34.1 GiB | 152, 21.5 GiB |
+| `repeat=scan, microbatches=8`                  | 10, 2.68 GiB    | 7, 2.68 GiB     |
+
+Tokens a second and the peak memory of a GPU, on one node of 8 B300s, the same run,
+20 steps:
+
+| mesh, methods                                      | tok/s | peak     |
+|----------------------------------------------------|-------|----------|
+| `fsdp=8`, `microbatches=1`                         | 1147k | 58.5 GiB |
+| `fsdp=8`, `microbatches=8, gather=layer, accumulate=reduced` | 817k | 11.9 GiB |
+| `fsdp=8`, `microbatches=8, accumulate=reduced`     | 925k  | 11.6 GiB |
+| `fsdp=8`, `microbatches=8`                         | 907k  | 15.7 GiB |
+| `fsdp=8`, `repeat=scan, microbatches=8, gather=layer, accumulate=reduced` | 719k | 10.2 GiB |
+| `fsdp=8`, `repeat=scan, microbatches=8`            | 803k  | 15.7 GiB |
+| `fsdp=2, tensor=4`, `layout(stream=tensor)`, `microbatches=8, gather=layer, accumulate=reduced` | 647k | 11.9 GiB |
+| `fsdp=2, tensor=4`, `layout(stream=tensor)`, `microbatches=8` | 640k | 12.9 GiB |
+| `stage=2, fsdp=4`, `repeat=scan, microbatches=8, gather=layer, accumulate=reduced` | 660k | 88.3 GiB |
+| `stage=2, fsdp=4`, `repeat=scan, microbatches=8, accumulate=reduced` | 640k | 97.8 GiB |
+| `stage=2, fsdp=4`, `repeat=scan, microbatches=8`   | 644k  | 97.8 GiB |
+
+Over NVLink, gathering once is the gain: XLA overlaps a reduce-scatter a microbatch
+with the backward, and adding up unreduced reads and writes a float32 copy of every
+gradient a microbatch, as each device's own. Between nodes the collectives are the
+cost. With NCCL kept off NVLink and shared memory (`NCCL_P2P_DISABLE=1
+NCCL_SHM_DISABLE=1`, and XLA's one-shot all-reduce off), every one goes through the
+NICs, as between nodes:
+
+| mesh, methods                                                      | tok/s |
+|--------------------------------------------------------------------|-------|
+| `fsdp=8`, `microbatches=1`                                         | 1030k |
+| `fsdp=8`, `microbatches=1`, `precision(reduce=float32)`            | 976k  |
+| `fsdp=8`, `microbatches=8, gather=layer, accumulate=reduced`       | 358k  |
+| `fsdp=8`, `microbatches=8, accumulate=reduced`                     | 500k  |
+| `fsdp=8`, `microbatches=8`                                         | 738k  |
+| `fsdp=8`, `microbatches=8`, `precision(reduce=float32)`            | 699k  |
+| `stage=2, fsdp=4`, `repeat=scan, microbatches=8, gather=layer, accumulate=reduced` | 464k |
+| `stage=2, fsdp=4`, `repeat=scan, microbatches=8, accumulate=reduced` | 521k |
+| `stage=2, fsdp=4`, `repeat=scan, microbatches=8`                   | 566k  |
+
+So `gather=step` is the default, and `accumulate=auto` adds up unreduced only where the
+rows' axes span processes, as between nodes. With deterministic GEMMs the three dense runs
+of 8 microbatches on one node end their 10 steps at 11.86792, 11.86793 (`reduced`) and
+11.86804 (`unreduced`).
+
+The cost is memory: the gathered copy of the parameters in `compute`, and, unreduced,
+a float32 sum of every parameter's gradient on each device, held through the step.
+`layout(zero=1)` keeps the parameters whole between steps too; with `gather=step` it
+saves no collective, and holds float32 copies where the step holds `compute`'s.
 
 ### Memory and losses
 
@@ -1264,7 +1373,17 @@ after another, so with one microbatch a pipeline computes what one device does:
 - dropout draws a fresh mask for every microbatch.
 
 The microbatches are the pipeline's: the trainer asks `pipeline.pipelined()`, and a
-step does not accumulate gradients over them as well. With `gpipe` the stacked state
+step does not accumulate gradients over them as well. It gathers the parameters FSDP
+splits once a step, before the ticks (`methods.gather = step`, [above](#gathered-once-reduced-once-methodsgather-methodsaccumulate)),
+in float32, since the ticks add up a stage's gradients in the dtype of what they read;
+`gather=layer` gathers each layer's as it runs, every tick, both ways. Where the rows
+are independent and their axes span processes, `accumulate=auto` (or
+`accumulate=unreduced` anywhere) reduces the gradients once too: the trainer says so
+(`gather.apart`), and the pipeline's `shard_map` is then manual over the axes that
+split the rows as well as over `stage`. A stage runs its device's rows alone, each
+tick's gradients stay its own, and the `shard_map`'s transpose sums them over those
+axes once, as they leave it, in float32. Else (`accumulate=reduced`, or an MoE) they
+reduce every tick, as the backward makes them. With `gpipe` the stacked state
 keeps the shapes and the order of `repeat=scan`'s, so a run resumes on another number
 of stages, or on none; `circular` stacks each round's layers as a repeat of its own,
 and resumes as circular with as many rounds.

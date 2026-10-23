@@ -18,11 +18,13 @@ rest. Every parameter's largest whole dimension also splits over `fsdp`. Outside
                                                   shard_batch, local_rows,
                                                   microbatches
     methods   one registry per kind of method     method
+    gather    a step's parameters gathered once,  whole, rows, splits, gather,
+              its gradients reduced once          scatter, apart
 
 docs/parallelism.md explains them.
 """
 
-from bux.parallel import methods
+from bux.parallel import gather, methods
 from bux.parallel.layout import (
     DIMENSIONS,
     NAMES,
@@ -60,6 +62,7 @@ __all__ = [
     "context",
     "experts",
     "flash",
+    "gather",
     "local_rows",
     "mesh",
     "method",
