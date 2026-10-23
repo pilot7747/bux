@@ -60,7 +60,7 @@ from jaxtyping import Array, Int
 from bux import parallel
 from bux.data.pipeline import DEFAULT_CACHE, jobs, prepare
 from bux.lang import ir
-from bux.runtime import configure
+from bux.runtime import compile_once, configure
 from bux.train.config import MeshConfig
 from bux.train.hooks import Hook, Metrics
 from bux.train.sinks import LatestMetrics, is_main_process
@@ -116,7 +116,9 @@ def processes(env: Mapping[str, str] = os.environ) -> int:
 
 
 def join() -> None:
-    """Join the job's other processes through jax.distributed, if there are any.
+    """Join the job's other processes through jax.distributed, if there are any, and
+    compile each program once for all of them where they share a cache
+    (``runtime.compile_once``).
 
     Call it before anything touches a device.
     """
@@ -129,6 +131,7 @@ def join() -> None:
         )
     else:
         jax.distributed.initialize()  # from Slurm's or Open MPI's environment
+    compile_once()
 
 
 def _largest(signum: int) -> Int[Array, ""]:
