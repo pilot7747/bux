@@ -752,16 +752,16 @@ one_gpu[nvfp4]     182,654    183,500  +0.5%    56.4%     43.8     43.8    -0.00
 `diff` is the change of the tokens a second, and `loss diff` the change of the loss at
 the last log. The node's suite, one tree after the other, moved by 0.3% at most: FSDP
 1.13M, at 8 microbatches 923k, the MoE sorted 832k and by EP 540k, TP 227k and the
-pipeline 683k. A run is `slower` or `faster` when its tokens a second move by more
+pipeline 683k; the two nodes' by 1.7%: FSDP and HSDP 2.21M, the MoE sorted 1.58M and
+by EP 1.04M. A run is `slower` or `faster` when its tokens a second move by more
 than `--noise` (3%), `more memory` or `less memory` when its peak does, `loss` when
 its last loss moves by more than `--loss` (0.05), and `failed`; `compare` exits with 1
 if any run is flagged but `faster` or `less memory`.
 
-XLA's GEMM autotuner picks kernels by timing them, so two runs that tune apart, as
-side by side, round differently: on random tokens the MoE, whose top-k picks amplify
-it, ended 0.04 apart, the rest 0.01 at most. One after the other, the second loads the
-first's picks from the compile cache, and they ended within 0.009. Pin
-`XLA_FLAGS="--xla_gpu_autotune_level=0 --xla_gpu_deterministic_ops=true"` on both
+XLA's GEMM autotuner picks kernels by timing them, and some kernels add in no fixed
+order, so two runs of one tree round differently: on these random tokens the MoE,
+whose top-k picks amplify it, ended up to 0.04 apart, every other run 0.011 at most.
+Pin `XLA_FLAGS="--xla_gpu_autotune_level=0 --xla_gpu_deterministic_ops=true"` on both
 before calling a smaller change of a loss a regression.
 
 ## The trainer's blocks
