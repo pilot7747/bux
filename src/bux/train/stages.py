@@ -74,9 +74,8 @@ def _on_stages(run: ir.Run) -> Generator[None]:
     t = run.train
     shape = tuple(t.mesh.stage if a == pipeline.AXIS else 1 for a in parallel.AXES)
     auto = (AxisType.Auto,) * len(parallel.AXES)
-    with parallel.use(
-        AbstractMesh(shape, parallel.AXES, axis_types=auto), t.layout, t.methods
-    ):
+    grid = AbstractMesh(shape, parallel.AXES, axis_types=auto)
+    with parallel.use(grid, t.layout, t.methods):
         yield
 
 

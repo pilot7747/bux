@@ -478,9 +478,11 @@ class MethodsConfig(Config):
     # its inputs either way.
     states: Literal["keep", "recompute"] = "keep"
     repeat: str = "unroll"
-    # A policy by name, or as data: remat(save=[attention], first=8).
-    remat: Annotated[str | RematConfig, BeforeValidator(_named_none)] = "none"
-    # 1f1b, but where it can't run (docs/parallelism.md, "Pipelines"): gpipe, circular.
+    # A policy by name, or as data: remat(save=[attention], first=8). auto: the first
+    # of none, dots_attention, dots, save_attention and full whose step fits.
+    remat: Annotated[str | RematConfig, BeforeValidator(_named_none)] = "auto"
+    # 1f1b, zbh1, gpipe or circular: 1f1b runs where gpipe does, but in rounds and
+    # where a layer outside the pipelined repeat learns from the whole batch.
     pipeline: str = "1f1b"
     rounds: Positive = 1  # times a circular pipeline sends a microbatch round
     # The passes of the pipelined repeat each stage runs, first to last. None: under

@@ -19,7 +19,9 @@ from flax import nnx
 from bux.architecture.repeats import remat
 from bux.train import xla
 
-MARGIN = 0.9  # of a device's memory a step may take, by XLA's analysis
+# Of a device's memory a step may take, by XLA's analysis: on B300s it was the peak
+# to 0.1 GiB, and steps of 98% of a device trained.
+MARGIN = 0.97
 
 
 class Tried(NamedTuple):
