@@ -313,7 +313,9 @@ def into_heads(width: int, heads: int, dim: int, rngs: nnx.Rngs) -> nnx.Linear:
     """Make a projection of the width to `heads` heads of `dim` channels, side by
     side."""
     init = parallel.named("embed", ("heads", heads))
-    return projection(width, heads * dim, use_bias=False, kernel_init=init, rngs=rngs)
+    return projection(
+        width, heads * dim, "recurrence", use_bias=False, kernel_init=init, rngs=rngs
+    )
 
 
 def _dt_bias(rngs: nnx.Rngs, n: int) -> Float[Array, " n"]:
@@ -417,6 +419,7 @@ class LinearAttention(nnx.Module):
         self.o = projection(
             hv * dv,
             width,
+            "recurrence_out",
             use_bias=False,
             kernel_init=parallel.named(("heads", hv), "embed"),
             rngs=rngs,

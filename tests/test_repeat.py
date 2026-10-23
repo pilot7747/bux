@@ -439,10 +439,14 @@ def _scaled_matmuls(how: str) -> int:
     """How many MXFP8 GEMMs the gradient of tanh(x W) takes, inside a shard_map
     rematerialized by `how`."""
 
-    def project(x: Float[jax.Array, "m k"], w: Float[jax.Array, "k n"]) -> jax.Array:
+    def project(
+        x: Float[jax.Array, "m k"], w: Float[jax.Array, "k n"]
+    ) -> Float[jax.Array, "m n"]:
         return jnp.tanh(matmuls.dot_general(x, w, (((1,), (0,)), ((), ()))))
 
-    def loss(x: Float[jax.Array, "m k"], w: Float[jax.Array, "k n"]) -> jax.Array:
+    def loss(
+        x: Float[jax.Array, "m k"], w: Float[jax.Array, "k n"]
+    ) -> Float[jax.Array, ""]:
         rematted = remat.checkpoint(project, prevent_cse=True)
         return jax.shard_map(rematted, in_specs=P(), out_specs=P())(x, w).sum()
 

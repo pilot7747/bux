@@ -199,14 +199,20 @@ class Indexer(nnx.Module):
         self.candidate_top_k = config.candidate_top_k
         self.loss_weight = config.loss_weight
 
-        def linear(n_in: int, n_out: int, *names: parallel.Name) -> nnx.Linear:
+        def linear(
+            n_in: int, n_out: int, role: str, *names: parallel.Name
+        ) -> nnx.Linear:
             init = parallel.named(*names)
-            return projection(n_in, n_out, use_bias=False, kernel_init=init, rngs=rngs)
+            return projection(
+                n_in, n_out, role, use_bias=False, kernel_init=init, rngs=rngs
+            )
 
         # The randomly initialized layers; reordering them changes a seed's init.
-        self.q = linear(query_width, h * i, query, ("heads", h))
-        self.k = linear(key_width, i, None, None) if key_width else None
-        self.weights = linear(width, h, "embed", "heads") if config.weighted else None
+        self.q = linear(query_width, h * i, "q", query, ("heads", h))
+        self.k = linear(key_width, i, "kv", None, None) if key_width else None
+        self.weights = (
+            linear(width, h, "q", "embed", "heads") if config.weighted else None
+        )
 
         self.q_norm = Norm(config.norm, i) if config.norm else None
         pools = config.block_size > 1  # it normalizes the blocks of keys it is given

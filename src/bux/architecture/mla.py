@@ -52,18 +52,18 @@ class MLA(SoftmaxAttention):
         self.nope_head_dim, self.rope_head_dim, self.v_head_dim = n, r, dv
         self.kv_lora_rank = config.kv_lora_rank
 
-        def proj(n_in: int, n_out: int, names: Names) -> nnx.Linear:
-            return linear(n_in, n_out, names, False, rngs)
+        def proj(n_in: int, n_out: int, names: Names, role: str) -> nnx.Linear:
+            return linear(n_in, n_out, names, False, rngs, role=role)
 
         # The randomly initialized layers; reordering them changes a seed's init.
         latent = config.q_lora_rank
         heads = ("heads", h)  # flattened with their dims
         query = "latent" if latent else "embed"  # what the queries are projected from
-        self.q_a = proj(width, latent, ("embed", "latent")) if latent else None
-        self.q = proj(latent or width, h * (n + r), (query, heads))
-        self.kv_a = proj(width, config.kv_lora_rank + r, ("embed", "latent"))
-        self.kv_b = proj(config.kv_lora_rank, h * (n + dv), ("latent", heads))
-        self.o = proj(h * dv, width, (heads, "embed"))
+        self.q_a = proj(width, latent, ("embed", "latent"), "q") if latent else None
+        self.q = proj(latent or width, h * (n + r), (query, heads), "q")
+        self.kv_a = proj(width, config.kv_lora_rank + r, ("embed", "latent"), "kv")
+        self.kv_b = proj(config.kv_lora_rank, h * (n + dv), ("latent", heads), "kv")
+        self.o = proj(h * dv, width, (heads, "embed"), "o")
         super().__init__(config, width, h, h, n + r, dv, False, ports, rngs)
 
         self.q_a_norm = Norm(_LATENT_NORM, latent) if latent else None

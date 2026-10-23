@@ -38,6 +38,7 @@ import jax
 from flax import nnx
 from jax.ad_checkpoint import Offloadable, checkpoint_name, name_p
 from jax.extend.core import Primitive
+from jaxtyping import Shaped
 
 from bux import parallel
 from bux.architecture import pure
@@ -225,7 +226,7 @@ def named[R](name: str, f: Callable[..., R], *args: Any) -> R:
         out, pull = jax.vjp(f, *args)
         inputs = {id(a) for a in jax.tree.leaves(args)}
 
-        def labelled(a: jax.Array) -> jax.Array:
+        def labelled(a: Shaped[jax.Array, "*s"]) -> Shaped[jax.Array, "*s"]:
             part = "in" if id(a) in inputs else "out"
             return checkpoint_name(a, f"{name}.{part}")
 

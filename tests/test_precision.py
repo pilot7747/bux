@@ -16,12 +16,13 @@ from jaxtyping import Array, Float
 
 from bux import config as cfg
 from bux import parallel
-from bux.architecture import Model, blockscaled, matmuls
+from bux.architecture import Model, blockscaled, matmuls, remat
 from bux.architecture.linear_attention import delta_rule, l2norm, recurrence
 from bux.architecture.moe import MoE
 from bux.architecture.norm import Norm
+from bux.architecture.registry import Taps
 from bux.architecture.ssm import selective_scan
-from bux.lang import compile_runs
+from bux.lang import BuxError, compile_runs
 from bux.train import config as tcfg
 from bux.train.data import Batch, plain
 from bux.train.objective import objective
@@ -212,8 +213,8 @@ PROJECTION = (((2,), (0,)), ((), ()))  # x @ w, as nnx.Linear multiplies
 # Each format's relative error, forward and backward, against float32 at random
 # normal operands (float8 rounds to 1 part in 16, float4 to 1 in 4), and how far a few
 # steps' losses may be from bfloat16's.
-FORMATS = {"mxfp8": (0.02, 0.06), "nvfp4": (0.08, 0.25)}
-LOSSES = {"mxfp8": 1e-2, "nvfp4": 3e-2}
+FORMATS = {"mxfp8": (0.02, 0.06), "mxfp8_2d": (0.02, 0.06), "nvfp4": (0.08, 0.25)}
+LOSSES = {"mxfp8": 1e-2, "mxfp8_2d": 1e-2, "nvfp4": 3e-2}
 
 
 def _precision(fmt: str) -> str:
@@ -321,7 +322,7 @@ def test_the_mxfp8_kernel_quantizes_as_xla_does_on_any_split(spec):
 def test_block_projections_multiply_in_the_format_and_the_router_and_head_in_compute():
     model = _trainer(ARCHITECTURES["moe"]).model
     linears = [(p, m) for p, m in nnx.iter_modules(model) if isinstance(m, nnx.Linear)]
-    compute = {p[-1] for p, m in linears if m.dot_general is not matmuls.dot_general}
+    compute = {p[-1] for p, m in linears if m.dot_general is jax.lax.dot_general}
     assert compute == {"router", "proj"}  # proj: the head's
 
     def run() -> list[Float[Array, "b t vocab"]]:
@@ -393,6 +394,291 @@ def test_a_format_not_registered_is_an_error():
     hint = r"no 'mine' matmul format yet; add one with @bux\.architecture\.matmuls"
     with pytest.raises(NotImplementedError, match=hint):
         trainer.train_on_batch(_batch())
+
+
+# --- Which projections, which branches, which passes ------------------------------------
+
+
+def test_mxfp8_2d_quantizes_w_as_its_transpose():
+    w = jax.random.normal(jax.random.key(0), (64, 96))
+    rows, columns = blockscaled.mx_tiles_twice(w)
+
+    def dequantized(q: blockscaled.Blocks) -> Float[Array, "r c"]:
+        scales = jnp.repeat(q.scales.astype(jnp.float32), 32, axis=1)
+        return q.values.astype(jnp.float32) * scales
+
+    assert jnp.array_equal(dequantized(rows), dequantized(columns).T)
+    assert 0.01 < _error(dequantized(rows), w) < 0.06
+
+
+def _multiplied(passes: tuple[tcfg.Pass, ...]) -> list:
+    """Return x @ w and its gradients by x and w in mxfp8, only `passes` in it."""
+    with matmuls.use(tcfg.PrecisionConfig(matmuls="mxfp8", passes=passes)):
+        return _projection(matmuls.dot_general, (4, 256, 512))
+
+
+def test_only_the_passes_named_multiply_in_the_format():
+    exact, quantized = _projection("compute", (4, 256, 512)), _multiplied(tcfg.PASSES)
+    for i, name in enumerate(tcfg.PASSES):
+        alone = _multiplied((name,))
+        others = _multiplied(tuple(p for p in tcfg.PASSES if p != name))
+        assert jnp.array_equal(alone[i], quantized[i])
+        assert jnp.allclose(others[i], exact[i], rtol=1e-2, atol=1e-2)
+        assert not jnp.allclose(others[i], quantized[i], rtol=1e-3, atol=1e-3)
+    for y, e in zip(_multiplied(()), exact, strict=True):
+        assert jnp.array_equal(y, e)
+
+
+# llama: 2 attention branches of q, k, v and o, and 2 FFN branches of up, gate, down.
+QUANTIZED = {
+    "matmuls=mxfp8": 14,
+    "matmuls=mxfp8, roles=roles(kv=compute)": 10,
+    "matmuls=nvfp4, roles=roles(q=compute, o=compute, mlp=mxfp8)": 10,
+    "matmuls=mxfp8, first=1": 10,
+    "matmuls=mxfp8, last=1": 11,
+    "matmuls=mxfp8, first=1, last=0.5": 3,
+    "roles=roles(mlp=mxfp8)": 6,
+}
+
+
+def _block_scaled(model: Model, precision: tcfg.PrecisionConfig) -> int:
+    """How many projections of a forward of `model` multiply in a format."""
+
+    def run_forward() -> list[Float[Array, "b t vocab"]]:
+        with matmuls.use(precision):
+            return [head.logits() for head in forward(model, _batch())]
+
+    return _count(jax.make_jaxpr(run_forward)().jaxpr, "scaled_matmul_wrapper")
+
+
+@pytest.mark.parametrize("given", QUANTIZED)
+def test_roles_and_branches_choose_what_multiplies_in_the_format(given):
+    [run] = compile_runs(_source(f"precision = precision({given})"))
+    model = parallel.build(lambda: Model(run.arch, rngs=nnx.Rngs(0)))
+    assert _block_scaled(model, run.train.precision) == QUANTIZED[given]
+
+
+def test_the_branches_after_the_first_head_take_the_mtp_role():
+    [run] = compile_runs(_source(arch=FAMILIES["nextn"]))
+    model = parallel.build(lambda: Model(run.arch, rngs=nnx.Rngs(0)))
+    mxfp8 = tcfg.PrecisionConfig(matmuls="mxfp8")
+    mtp = mxfp8.model_copy(update={"roles": tcfg.RolesConfig(mtp="compute")})
+    # 4 + 3 in the main model, and nextn's projection and 3 in each MTP pass.
+    assert _block_scaled(model, mxfp8) == 7 + 2 * 4
+    assert _block_scaled(model, mtp) == 7
+
+
+def test_every_block_projection_has_a_role():
+    unnamed = set()
+    for family, source in FAMILIES.items():
+        [run] = compile_runs(_source(arch=source))
+        model = parallel.build(lambda run=run: Model(run.arch, rngs=nnx.Rngs(0)))
+        for path, m in nnx.iter_modules(model):
+            if isinstance(m, nnx.Linear) and m.dot_general is matmuls.dot_general:
+                unnamed.add((family, path[-1]))
+    assert unnamed == {("engram", "kv")}
+
+
+SCANNED = PRELUDE + "block = [norm attn] [norm ffn]\nmodel = embed block^4 norm head"
+PATTERN = (
+    PRELUDE
+    + "A = [norm attn] [norm ffn]\nmtp = $h! nextn [norm ffn] norm @h head\n"
+    + 'model = embed "AA" A^2 norm @h head mtp'
+)
+BRANCHES = PRELUDE + "model = embed [norm ffn]^4 norm head"  # a pass is a branch
+# The residual branches outside any other: before the first head, and all.
+NUMBERED = {
+    "llama": (FAMILIES["llama"], 4, 4),
+    "nextn": (FAMILIES["nextn"], 2, 4),
+    "mhc": (FAMILIES["mhc"], 4, 4),
+    "scanned": (SCANNED, 8, 8),
+    "pattern": (PATTERN, 8, 9),
+    "branches": (BRANCHES, 4, 4),
+}
+
+
+@pytest.mark.parametrize("arch", NUMBERED)
+def test_branches_are_numbered_as_they_run_scanned_or_not(arch):
+    source, main, every = NUMBERED[arch]
+    [run] = compile_runs(_source(arch=source))
+    tokens = jnp.asarray(_batch().input_ids)
+    methods = tcfg.MethodsConfig(repeat="scan")
+    with parallel.use(tcfg.MeshConfig(data=1), methods=methods):
+        model = Model(run.arch, rngs=nnx.Rngs(0))
+        with matmuls.forward(model.main_branches):
+            model.graph(tokens, Taps(tokens=tokens))
+            ran = matmuls._COUNT.get()
+    assert ran is not None and (model.main_branches, ran.next) == (main, every)
+
+
+EDGES = [
+    (SCANNED, "first=3"),
+    (SCANNED, "last=2"),
+    (SCANNED, "first=1, last=0.5"),
+    (BRANCHES, "first=1, last=2"),
+]
+
+
+def _formats_traced(
+    source: str, precision: str, methods: tcfg.MethodsConfig, monkeypatch
+) -> dict:
+    """Return the format each projection of a forward of `source` multiplies in, by
+    its pass of a repeat (as remat counts them) and its role, run by `methods`."""
+    [run] = compile_runs(_source(f"precision = {precision}", arch=source))
+    seen, of = {}, matmuls.format_of
+
+    def recorded(role: str | None) -> str:
+        seen[remat._PASS.get(), role] = fmt = of(role)
+        return fmt
+
+    monkeypatch.setattr(matmuls, "format_of", recorded)
+    with parallel.use(tcfg.MeshConfig(data=1), methods=methods):
+        model = Model(run.arch, rngs=nnx.Rngs(0))
+        with matmuls.use(run.train.precision):
+            forward(model, _batch())
+    monkeypatch.setattr(matmuls, "format_of", of)
+    # A scan's trial of a pass, which never runs, traces it outside any pass.
+    return {key: fmt for key, fmt in seen.items() if key[0] is not None}
+
+
+@pytest.mark.parametrize(("source", "given"), EDGES)
+def test_a_scanned_repeat_multiplies_its_first_and_last_as_unrolled(
+    losses, monkeypatch, source, given
+):
+    precision = f"precision(compute=float32, matmuls=mxfp8, {given})"
+    how = tcfg.MethodsConfig(repeat="unroll")
+    unrolled = _formats_traced(source, precision, how, monkeypatch)
+    # A scan traces a run of passes that multiply alike once, as its first.
+    how = tcfg.MethodsConfig(repeat="scan")
+    scanned = _formats_traced(source, precision, how, monkeypatch)
+    assert scanned.items() <= unrolled.items()
+    assert set(unrolled.values()) == {"compute", "mxfp8"}
+    # XLA fuses what a scanned pass after one in compute quantizes apart, which moves
+    # mxfp8's loss by an ulp's rounding: 5e-5, where another format moves it 4e-4.
+    run = {"mesh": ONE, "optimizer": STABLE, "steps": 1, "precision": precision}
+    [losses_unrolled] = losses(source, **run)
+    [losses_scanned] = losses(source, methods="methods(repeat=scan)", **run)
+    assert losses_scanned == pytest.approx(losses_unrolled, rel=1e-4)
+
+
+def test_a_scan_split_by_precision_and_by_remat_counts_its_passes_as_unrolled(
+    monkeypatch,
+):
+    # Passes 1 to 3 multiply in mxfp8, and remat's first 3 split them again.
+    precision = "precision(compute=float32, matmuls=mxfp8, first=2)"
+    policy = tcfg.RematConfig(first=3)
+    runs = {
+        repeat: tcfg.MethodsConfig(repeat=repeat, remat=policy)
+        for repeat in ("unroll", "scan")
+    }
+    unrolled = _formats_traced(SCANNED, precision, runs["unroll"], monkeypatch)
+    scanned = _formats_traced(SCANNED, precision, runs["scan"], monkeypatch)
+    assert scanned.items() <= unrolled.items()
+    assert {at for at, _ in scanned} == {0, 1, 3}
+
+
+def test_first_and_last_branches_inside_a_pipeline_are_an_error(losses):
+    given = {
+        "optimizer": STABLE,
+        "precision": "precision(compute=float32, matmuls=mxfp8, first=1)",
+        "mesh": "mesh(stage=2, data=1)",
+        "methods": "methods(repeat=scan, microbatches=2)",
+    }
+    with pytest.raises(ValueError, match="fall inside a pipelined repeat"):
+        losses(SCANNED, **given)
+
+
+def test_the_routed_experts_in_a_format_are_an_error():
+    with pytest.raises(BuxError, match="grouped block-scaled GEMM is not in bux yet"):
+        compile_runs(_source("precision = precision(roles=roles(experts=mxfp8))"))
+
+
+def test_a_switch_takes_up_its_passes_at_its_step(losses):
+    given = {"mesh": ONE, "optimizer": STABLE, "steps": 4}
+    mxfp8 = losses(ARCHITECTURES["llama"], precision=_precision("mxfp8"), **given)
+    late = _precision("mxfp8").replace(")", ", switch=switch(at=0.5))")
+    switched = losses(ARCHITECTURES["llama"], precision=late, **given)
+    bf16 = losses(ARCHITECTURES["llama"], precision=BF16, **given)
+    assert switched[:2] == mxfp8[:2] and switched[2:] != mxfp8[2:]
+    assert np.allclose(switched, bf16, rtol=LOSSES["mxfp8"])
+
+
+def test_evaluation_in_compute_evaluates_as_compute_does():
+    def evaluated(precision: tcfg.PrecisionConfig | str) -> float:
+        llama = ARCHITECTURES["llama"]
+        trainer = _trainer(llama, compute=jnp.bfloat16, matmuls=precision)
+        return trainer.evaluate([_batch()])
+
+    mxfp8 = tcfg.PrecisionConfig(matmuls="mxfp8")
+    in_compute = mxfp8.model_copy(update={"eval": "compute"})
+    assert evaluated(in_compute) == evaluated("compute") != evaluated(mxfp8)
+
+
+def test_moments_in_bfloat16_train_with_gradients_reduced_once(losses, involuntary):
+    given = {
+        "mesh": "mesh(fsdp=8)",
+        "methods": "methods(microbatches=2, accumulate=unreduced)",
+        "optimizer": STABLE,
+        "batch": "16",
+        "steps": 5,
+    }
+    once = "precision(reduce=float32)"
+    f32 = losses(ARCHITECTURES["llama"], precision=once, **given)
+    involuntary()
+    moments = once.replace(")", ", moments=bfloat16)")
+    bf16 = losses(ARCHITECTURES["llama"], precision=moments, **given)
+    assert np.allclose(bf16, f32, rtol=1e-3) and bf16 != f32
+    assert involuntary() == 0
+
+
+def test_moments_in_bfloat16_train_near_float32(losses):
+    given = {"mesh": ONE, "optimizer": STABLE, "steps": 5}
+    f32 = losses(ARCHITECTURES["llama"], precision=BF16, **given)
+    moments = "precision(moments=bfloat16)"
+    bf16 = losses(ARCHITECTURES["llama"], precision=moments, **given)
+    assert np.allclose(bf16, f32, rtol=1e-3) and bf16 != f32
+
+    [run] = compile_runs(_source())
+    model = parallel.build(lambda: Model(run.arch, rngs=nnx.Rngs(0)))
+    multiplier = lr_multiplier(run.train.schedule, run.train.steps)
+    tx = optimizer(run.train.optimizer, multiplier, model, moments=jnp.bfloat16)
+    state = nnx.state(nnx.Optimizer(model, tx, wrt=nnx.Param), nnx.OptState)
+    floats = [
+        x for x in jax.tree.leaves(state) if jnp.issubdtype(x.dtype, jnp.floating)
+    ]
+    assert floats and all(x.dtype == jnp.bfloat16 for x in floats)
+
+
+RECIPES = {
+    "nvidia_mxfp8": "mxfp8",
+    "nvidia_nvfp4": "nvfp4",
+    "deepseek_v3_fp8": "mxfp8_2d",
+    "torchtitan_mxfp8": "mxfp8_2d",
+    "nemotron3_nvfp4": "nvfp4",
+}
+
+
+@pytest.mark.parametrize("recipe", RECIPES)
+def test_a_recipe_is_a_module_a_run_uses_and_sweeps(recipe):
+    runs = compile_runs(f"use {recipe}\n" + _source("precision.last = 1 | 2"))
+    assert [r.train.precision.last for r in runs] == [1, 2]
+    assert all(r.train.precision.matmuls == RECIPES[recipe] for r in runs)
+    model = parallel.build(lambda: Model(runs[0].arch, rngs=nnx.Rngs(0)))
+    assert _block_scaled(model, runs[0].train.precision) > 0
+
+
+def test_precision_s_new_settings_at_their_defaults_keep_the_run_s_id():
+    def run_id(*settings: str) -> str:
+        [run] = compile_runs(_source(*settings))
+        return run.id
+
+    plain, f32 = run_id(), run_id("precision = precision(compute=float32)")
+    assert run_id("precision = precision(eval=compute)") == plain
+    assert run_id("precision = precision(compute=float32, eval=compute)") == f32
+    defaults = "precision(roles=roles(), first=0, last=0, moments=float32)"
+    assert run_id(f"precision = {defaults}") == plain
+    for changed in ("last=2", "moments=bfloat16", "passes=[fprop,]"):
+        assert run_id(f"precision = precision({changed})") != plain
 
 
 # --- Microbatches -----------------------------------------------------------------------

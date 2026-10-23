@@ -15,6 +15,7 @@ from bux import parallel
 from bux.architecture import Model, Taps
 from bux.architecture.moe import MoE, balance_loss, experts, routed, run_sorted
 from bux.architecture.registry import Loss
+from bux.architecture.remat import rematted
 from bux.lang import compile
 from bux.train import config as tcfg
 from bux.train.data import plain
@@ -275,6 +276,25 @@ def test_some_of_the_experts_add_their_own_picks_and_nothing_for_the_others():
     assert jnp.allclose(some(0, 4), run("dense", e, x)[0], atol=1e-5)
 
 
+@pytest.mark.parametrize(
+    ("remat", "products"),
+    [("none", 9), ("full", 12), ("dots", 9), ("dots_no_batch", 9)],
+)
+def test_the_dots_policies_keep_the_experts_products(remat, products):
+    """Three grouped products forward and two for each backward, for the rows and for
+    the kernels: what the policy does not keep, the backward computes again."""
+    e, x = moe_layer(), jax.random.normal(jax.random.key(1), (2, 5, D))
+    graphdef, state = nnx.split(e)
+
+    def loss(state: nnx.State, x: Float[Array, "b t d"]) -> Float[Array, ""]:
+        return rematted(nnx.merge(graphdef, state), x, Taps()).sum()
+
+    how = tcfg.MethodsConfig(remat=remat)
+    with parallel.use(tcfg.MeshConfig(data=1), methods=how):
+        jaxpr = jax.make_jaxpr(jax.grad(loss, argnums=(0, 1)))(state, x)
+    assert str(jaxpr).count("ragged_dot_general") == products
+
+
 def test_sorted_is_the_default_method():
     assert tcfg.MethodsConfig().moe == "sorted"
     assert parallel.method("moe") is run_sorted
@@ -316,8 +336,8 @@ def test_an_moe_names_its_experts_and_its_projections():
         state = nnx.state(parallel.build(lambda: MoE(c, 64, nnx.Rngs(0))))
         found = parallel.shardings(state)
     # The experts over `expert` and their hidden units over `tensor`; FSDP splits the
-    # largest dimension left whole.
+    # largest dimension left whole, over `expert` too where no dimension takes it.
     assert found["up"].spec == found["gate"].spec == P("expert", "fsdp", "tensor")
     assert found["down"].spec == P("expert", "tensor", "fsdp")
-    assert found["router"]["kernel"].spec == P("fsdp", None)
-    assert found["to_latent"]["kernel"].spec == P("fsdp", None)
+    assert found["router"]["kernel"].spec == P(("fsdp", "expert"), None)
+    assert found["to_latent"]["kernel"].spec == P(("fsdp", "expert"), None)
