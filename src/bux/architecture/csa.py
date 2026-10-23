@@ -9,6 +9,7 @@ from flax import nnx
 from jaxtyping import Array, Float, Int
 
 from bux import config as cfg
+from bux import parallel
 from bux.architecture import sparse
 from bux.architecture.attention import Names, Sparse, documents_or_rows, indexer_config
 from bux.architecture.indexer import Indexer
@@ -79,18 +80,20 @@ class CSA(Sparse):
         compresses = r is not None and not reads(ports, "kv")
         self.head_dim, self.compress_ratio = d, r
 
-        def proj(n_in: int, n_out: int, names: Names = (None, None)) -> nnx.Linear:
-            return linear(n_in, n_out, names, False, rngs)
+        def proj(
+            n_in: int, n_out: int, role: str, names: Names = (None, None)
+        ) -> nnx.Linear:
+            return linear(n_in, n_out, names, False, rngs, role=role)
 
         # The randomly initialized layers; reordering them changes a seed's init.
         latent = config.q_lora_rank
         query = "latent" if latent else "embed"  # what the queries are projected from
-        self.q_a = proj(width, latent, ("embed", "latent")) if latent else None
-        self.q = proj(latent or width, h * d, (query, ("heads", h)))
-        self.kv = proj(width, d)
-        self.compress_kv = proj(width, d) if compresses else None
+        self.q_a = proj(width, latent, "q", ("embed", "latent")) if latent else None
+        self.q = proj(latent or width, h * d, "q", (query, ("heads", h)))
+        self.kv = proj(width, d, "kv")
+        self.compress_kv = proj(width, d, "kv") if compresses else None
         pooled = compresses and r is not None and r > 1
-        self.compress_gate = proj(width, d) if pooled else None
+        self.compress_gate = proj(width, d, "kv") if pooled else None
         init = nnx.initializers.lecun_normal(batch_axis=(0,))
         self.o_a = (
             nnx.Param(
@@ -102,7 +105,7 @@ class CSA(Sparse):
         )
         # What o takes: the groups' ranks, or the heads' dims, flattened
         heads = ("heads", groups) if rank else ("heads", h)
-        self.o = proj(groups * rank if rank else h * d, width, (heads, "embed"))
+        self.o = proj(groups * rank if rank else h * d, width, "o", (heads, "embed"))
         super().__init__(config, width, h, 1, d, d, False, ports, rngs)
         rotated = rotated_dims(d, config.rope)
         self.indexer = (
@@ -175,7 +178,8 @@ class CSA(Sparse):
             kv = jnp.stack([kv[:, i : i + t] for i in range(r)], axis=2)
             gate = jnp.stack([gate[:, i : i + t] for i in range(r)], axis=2)
             kv = (kv * jax.nn.softmax(gate, axis=2)).sum(2)
-        latent = self.compress_norm(kv)
+        # Split as positions, not as the norm's scale: FSDP may split that by `context`.
+        latent = parallel.shard(self.compress_norm(kv), "batch", "seq", None)
         first = rows.positions[:, jnp.maximum(jnp.arange(t) - (r - 1), 0)]
         order = jnp.where((rows.within + 1) % r == 0, rows.within // r, -1)
         index = None

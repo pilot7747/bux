@@ -48,6 +48,27 @@ MESHES = {
     "data=4, tensor=2": ({"data": 4, "tensor": 2}, "context"),
 }
 ONE = {"one device": ({"data": 1}, "context")}
+MX = tcfg.PrecisionConfig(matmuls="mxfp8")
+# Precisions; the branches of LLAMA (of 4) that chunked splits into chunks, as a
+# projection whose share would multiply otherwise than the whole stays gspmd's; and
+# how near its gradients come. Where NVFP4 takes a gradient that a chunked branch
+# summed otherwise in its last bits, its 2-bit mantissa moves some values a step.
+PRECISIONS = {
+    "compute": (tcfg.PrecisionConfig(), 4, 1e-5),
+    "mxfp8": (MX, 4, 1e-5),
+    "mxfp8_2d": (tcfg.PrecisionConfig(matmuls="mxfp8_2d"), 4, 1e-5),
+    "nvfp4": (tcfg.PrecisionConfig(matmuls="nvfp4"), 0, 1e-5),
+    "mxfp8, the MLPs nvfp4": (
+        MX.model_copy(update={"roles": tcfg.RolesConfig(mlp="nvfp4")}),
+        2,
+        1e-3,
+    ),
+    "nvfp4, compute first and last": (
+        tcfg.PrecisionConfig(matmuls="nvfp4", first=1, last=1),
+        2,
+        1e-3,
+    ),
+}
 COLLECTIVES = ("all-gather", "reduce-scatter", "all-reduce")
 
 
@@ -62,10 +83,14 @@ def _loss(model: Model, tokens: Int[Array, "b t"]) -> Float[Array, ""]:
 
 @functools.cache
 def _outputs(
-    method: str, mesh: str, source: str = LLAMA, fmt: str = "compute", chunks: int = 2
+    method: str,
+    mesh: str,
+    source: str = LLAMA,
+    precision: str = "compute",
+    chunks: int = 2,
 ):
     """The logits and every parameter's gradient of a loss by `method` on `mesh`, in
-    the matmul format `fmt`, in `chunks` chunks under `chunked`, on the host; and the
+    one of the PRECISIONS, in `chunks` chunks under `chunked`, on the host; and the
     collectives the gradient makes."""
     sizes, stream = (MESHES | ONE)[mesh]
     with (
@@ -74,7 +99,7 @@ def _outputs(
             tcfg.LayoutConfig.model_validate({"stream": stream}),
             tcfg.MethodsConfig(tensor=method, tensor_chunks=chunks),
         ),
-        matmuls.use(fmt),
+        matmuls.use(PRECISIONS[precision][0]),
     ):
         model = parallel.build(lambda: Model(compile(source), rngs=nnx.Rngs(0)))
         tokens = parallel.shard_batch(_tokens())
@@ -89,7 +114,7 @@ def _outputs(
 
 
 def assert_close(a, b, tolerance: float = 1e-5) -> None:
-    def close(x: np.ndarray, y: np.ndarray) -> bool:
+    def close(x: Float[np.ndarray, "*s"], y: Float[np.ndarray, "*s"]) -> bool:
         return np.allclose(x, y, atol=tolerance * max(1.0, np.abs(y).max()))
 
     assert jax.tree.all(jax.tree.map(close, a, b))
@@ -117,14 +142,22 @@ def test_chunked_reduces_each_projection_a_chunk_of_rows_at_a_time(chunks, made)
     assert chunked["reduce-scatter"] == 2 * 2 * 2 * made
 
 
-@pytest.mark.parametrize("fmt", ["mxfp8", "nvfp4"])
-def test_a_block_scaled_format_computes_by_chunks_what_it_does_whole(fmt):
-    """MXFP8's blocks are a device's share's, chunk by chunk; NVFP4 scales by the
-    whole operand's largest value, so its projections stay gspmd's."""
+@pytest.mark.parametrize("precision", PRECISIONS)
+def test_each_projection_by_chunks_multiplies_as_it_does_whole_in_its_format(
+    precision,
+):
+    """MXFP8's blocks are a device's share's, chunk by chunk, MXFP8 2D's tiles too;
+    NVFP4 scales by the whole operand's largest value, so its projections stay
+    gspmd's, by the format of their role and their branch."""
     mesh = "fsdp=2, tensor=4, sequence parallel"
-    chunked, counts = _outputs("chunked", mesh, WIDE, fmt)
-    assert_close(chunked, _outputs("gspmd", mesh, WIDE, fmt)[0])
-    assert (counts["reduce-scatter"] > 0) == (fmt == "mxfp8")
+    _, branches, tolerance = PRECISIONS[precision]
+    (logits, grads), counts = _outputs("chunked", mesh, WIDE, precision)
+    (whole_logits, whole_grads), _ = _outputs("gspmd", mesh, WIDE, precision)
+    assert_close(logits, whole_logits)
+    assert_close(grads, whole_grads, tolerance)
+    # Each chunked branch reduce-scatters its output forward and its input's gradient
+    # backward, in 2 chunks.
+    assert counts["reduce-scatter"] == branches * 2 * 2
 
 
 # Scanned and rematerialized, as a large run is; the MoE in one microbatch, as more

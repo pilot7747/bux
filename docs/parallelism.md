@@ -516,11 +516,11 @@ Constraints:
   table every step. Engram gathers from its table the same way.
 - The logits are `(batch, seq, vocab)`, tied heads too, and the loss reduces over the
   vocabulary where it is: the log-normalizer and the target's logit are all-reduces
-  of `(b, t)`, for the loss, `z_loss` and `mtp` alike. Under `methods(loss=chunks)`
-  (`bux/architecture/logits.py`) they are made a chunk of each device's positions at
-  a time, `(batch, seq, none, vocab)` over the devices' shards; the head's kernel is
-  gathered over `fsdp` once for all the chunks, and each device adds its share of the
-  kernel's gradient up on its own, reduced once after the last chunk.
+  of `(b, t)`, for the loss, `z_loss` and `mtp` alike. By chunks, `methods.loss`'s
+  default (`bux/architecture/logits.py`), they are made a chunk of each device's
+  positions at a time, `(batch, seq, none, vocab)` over the devices' shards; the
+  head's kernel is gathered over `fsdp` once for all the chunks, and each device adds
+  its share of the kernel's gradient up on its own, reduced once after the last chunk.
 - What the embedding, nextn and Engram return is the stream, widened or not, and
   goes through `shard_stream`.
 
@@ -553,11 +553,12 @@ does. Each chunk's collective is NCCL's, at full NVLink speed, and an optimizati
 barrier ties it to the one before, so that XLA neither combines them nor runs them
 side by side. `chunked` is `gspmd` where it has nothing to overlap (no sequence
 parallelism for the input projections), where a kernel splits otherwise than by
-`tensor`, and where a device's share would multiply otherwise than the whole: in
-MXFP8 unless the chunk's tokens and the share are whole blocks, and in NVFP4 always,
-whose scale is the whole operand's. Where `tensor_chunks` does not divide a
-device's rows, it takes as many chunks as divide both. A method is a class of two
-functions:
+`tensor`, and where a device's share would multiply otherwise than the whole, in
+the format that projection takes in its branch (its role's, or compute in the
+`first` and `last`): in `mxfp8` and `mxfp8_2d` unless the chunk's tokens and the
+share are whole blocks, and in `nvfp4` always, whose scale is the whole operand's.
+Where `tensor_chunks` does not divide a device's rows, it takes as many chunks as
+divide both. A method is a class of two functions:
 
 ```python
 from bux.parallel import methods, tensor
@@ -577,9 +578,11 @@ class Mine:
 On 8 CPU devices `chunked` gives `gspmd`'s outputs and gradients to 1e-5, in 1, 2
 and 4 chunks, on `fsdp=2, tensor=4` and `tensor=8` with sequence parallelism, on
 `fsdp=2, context=2, tensor=2` with the stream over both, and on `data=4, tensor=2`
-without; in MXFP8 too; and a Llama (scanned, rematerialized, in 2 microbatches)
-and an MoE (rematerialized) train as on one device, with no involuntary
-rematerialization.
+without; in `mxfp8` and `mxfp8_2d` too. With `nvfp4` for the MLPs, or for all but
+the first and last branches, those stay `gspmd`'s, and the gradients they take from
+chunked branches move some of NVFP4's values a step: to 1e-3. A Llama (scanned,
+rematerialized, in 2 microbatches) and an MoE (rematerialized) train as on one
+device, with no involuntary rematerialization.
 
 On 8 B300s, 4 of Llama 3 70B's layers (scanned, `remat=full`, 8 rows of 4096), TP=8
 with sequence parallelism, tokens a second and the exposed communication of a step
@@ -739,9 +742,11 @@ transitions (`c` matrices `k × k` per head) on each.
 
 The router runs in the global view: it picks each token's top-k experts, reports the
 balance loss and moves the router bias. A method of `methods.moe` then runs the picked
-experts, `(moe, z, idx, weights) -> y`: `z` the tokens `(b, t, d)` in the experts'
-width (the latent one in a LatentMoE), `idx` and `weights` their picks `(b, t, k)`,
-and `y` their weighted sum `(b, t, d)`, before `latent_output_norm`.
+experts, `(moe, z, idx, weights, taps) -> y`: `z` the tokens `(b, t, d)` in the
+experts' width (the latent one in a LatentMoE), `idx` and `weights` their picks
+`(b, t, k)`, and `y` their weighted sum `(b, t, d)`, before `latent_output_norm`.
+`taps` are the forward's, through which a method reports what it measures, as the
+ragged ones report `dropped` ([below](#expert-parallelism)).
 
 | method   | what it does                                                         |
 |----------|----------------------------------------------------------------------|
@@ -765,7 +770,8 @@ can run them on one device's experts inside a `shard_map`:
   pick outside the experts of `up` adds nothing, so a device that holds experts
   `[i, i + n)` passes `idx - i` and its own kernels. The sort and the unsort are
   `pick_rows` and `permuted`, whose gradients gather by the inverse permutation
-  where XLA's would scatter-add.
+  where XLA's would scatter-add. `pick_rows` also takes the first m picks alone,
+  and `sum_rows`, its transpose, sums each token's k picks' rows.
 
 ```python
 from bux.architecture.moe import routed
@@ -773,7 +779,7 @@ from bux.parallel import methods
 
 
 @methods.moe.register("mine")
-def _(moe, z, idx, weights):
+def _(moe, z, idx, weights, taps=None):
     return routed(z, idx, weights, *moe.kernels(), moe.config.expert, moe.expert_norm)
 ```
 
@@ -785,20 +791,21 @@ FSDP the weights move to the tokens rather than the tokens to the weights.
 
 ## Expert parallelism
 
-Three methods of `methods.moe` split the experts over the axes `layout.experts` gives
+Four methods of `methods.moe` split the experts over the axes `layout.experts` gives
 them, `expert` by default: each device holds its own experts' kernels, and runs them
 on the picks of every device of its group.
 
 ```
 mesh    = mesh(fsdp=2, expert=4)
-methods = methods(moe=all_to_all)
+methods = methods(moe=ragged_all_to_all, capacity=1.25)
 ```
 
 | method              | what it does                                                  |
 |---------------------|---------------------------------------------------------------|
 | `all_gather`        | each device gathers its group's tokens, runs its own experts on them, and a `psum_scatter` brings each token its sum back |
 | `all_to_all`        | each pick goes to its expert's device and back by `jax.lax.all_to_all`, in one buffer per peer that holds every local pick, so that none drops |
-| `ragged_all_to_all` | the same, one ragged slice per peer, by `jax.lax.ragged_all_to_all`: buffers hold what every peer could send, but only what they do send moves. XLA:CPU lacks it |
+| `ragged_all_to_all` | each pick goes to its expert's device and back by `jax.lax.ragged_all_to_all`, a slice for each expert of each peer: a device's rows arrive sorted by its experts, which run on them as they are. XLA:CPU lacks it |
+| `ragged_tokens`     | the same, but each token goes once to each device that holds any of its experts, with its picks there, and comes back as their weighted sum: a row per device, not per pick |
 
 Each runs in a `jax.shard_map` manual over the axes that split the tokens (those of
 `batch` and `seq`), not over `expert` alone: a sort of tokens split over an Auto axis
@@ -812,6 +819,25 @@ divide), each method is `sorted`. Experts over an axis that leaves the tokens wh
 as `layout(experts=tensor)` does, split the tokens over it too inside the method;
 rows that do not split over it are an error.
 
+### A capacity
+
+Dropless, a device of `all_gather` or of the ragged methods takes what every peer
+could send it: `expert` times the picks it has, and its experts run on all those
+rows. `methods.capacity` bounds them at that many times its own picks (its tokens
+times `top_k`), about what it takes on average, and drops what does not fit: its last
+experts' picks first, and of an expert's, the last peers'. A dropped pick adds nothing
+to its token. A training step reports the share of the picks dropped as `dropped`,
+summed over the MoE layers, as `balance_loss` is. A capacity that drops anything
+changes what a run computes, unlike the rest of `methods`, though it stays out of the
+run's id. `ragged_tokens` takes as many tokens as picks, or as many as could come, a
+token from each device. `all_to_all` has no capacity.
+
+The buffers that receive are `jax.lax.empty`: the experts make 0 of the rows past
+theirs, and the rows that do not come back are masked. XLA's one-shot ragged
+all-to-all, on one node, copies each slice with one block of 128 threads, so each
+exchange goes in 2048 pieces at least (`experts.PIECES`): on 8 B300s a slice for each
+expert of each peer moved 90 GB/s, and the pieces 600 GB/s.
+
 A method is a body that runs on one device's tokens, and `experts.method` makes it
 one of `methods.moe`:
 
@@ -822,15 +848,17 @@ from bux.parallel import experts, methods
 def mine(z, idx, weights, kernels, *, axes, ffn, norm):
     # This device's tokens and picks, and its experts' kernels: experts
     # [i * n, (i + 1) * n) for n = len(kernels[0]), i = jax.lax.axis_index(axes).
+    # Return the tokens' sums, and the share of the group's picks it dropped.
     ...
 
 
 methods.moe.register("mine")(experts.method(mine))
 ```
 
-`experts.ragged` takes the ragged exchange as `exchange=`, so another collective is a
-function: the tests run it on CPU through one built from `all_to_all`, and
-`scripts/gpu_smoke/experts.py` runs the real one, and every other method, on GPUs.
+`experts.ragged` and `experts.tokens` take the ragged exchange as `exchange=`, so
+another collective is a function: the tests run them on CPU through one built from
+`all_to_all`, and `scripts/gpu_smoke/experts.py` runs the real one, and every other
+method, on GPUs.
 
 Collectives in the compiled train step of the two-MoE model of
 `tests/test_experts.py` on 8 CPU devices, their number and the KiB their results take
@@ -854,10 +882,41 @@ move tokens instead. Dropless with buffers of a fixed size, `all_to_all` moves
 pick: it is the CPU sibling of `ragged_all_to_all`, which moves the picks alone. No
 method rematerializes anything on these meshes, nor on `fsdp=2, expert=2, tensor=2`.
 
-On 8 B300s (`scripts/gpu_smoke/experts.py`, a small MoE), every method computes what
-one GPU does; `sorted` is the fastest there, 400k tokens a second, then `all_gather`
-and `all_to_all` (335k), then `ragged_all_to_all` (270k). On jax 0.12 NCCL's ragged
-all-to-all hangs unless XLA_FLAGS has
+On 8 B300s every method computes what one GPU does (`scripts/gpu_smoke/experts.py`,
+in float32: 7e-7 apart at most). For the baseline's MoE (`d_model` 2048, 64 experts,
+`top_k` 8, 16 layers, `bfloat16`) on 32k tokens a GPU, tokens a second and peak memory:
+
+| method                           | mesh       | remat `none`        | remat `dots`     |
+|----------------------------------|------------|---------------------|------------------|
+| `sorted`                         | `fsdp=8`   | 816k, 84 GiB        | 737k, 52 GiB     |
+| `all_gather`, `capacity=1.25`    | `expert=8` | 612k, 89 GiB        | 515k, 65 GiB     |
+| `ragged_all_to_all`, `capacity=1.25` | `expert=8` | 550k, 88 GiB    | 452k, 73 GiB     |
+| `ragged_tokens`, `capacity=1.25` | `expert=8` | 547k, 90 GiB        | 479k, 74 GiB     |
+
+Before the by-expert slices, the capacity and the pieces, `all_to_all` and
+`ragged_all_to_all` ran out of memory at 16k tokens a GPU, and under `remat=full` at
+32k they made 72k and 25k tokens a second (now `ragged_all_to_all` dropless: 263k).
+On one node at this shape, then, `sorted` is still the fastest: its FSDP gathers 0.5
+GB of experts a layer, where the exchanges move 1 GB of picks each way. Under `dots`
+the exchanges run again in the backward, since their results are no products. XLA's
+ragged all-to-all leaves an allocation inside the memory pool after the first step,
+so that a step whose temporaries take over half of it fits only once:
+`XLA_PYTHON_CLIENT_MEM_FRACTION=.95` gives the pool more room. `ragged_tokens` moves
+about 30% fewer rows when the routing is random, and half as few or fewer where a
+group limit keeps each token on half the devices (`num_groups` the size of `expert`,
+`top_k_groups` half of it), but it sends the picks and their weights besides, and
+here gains nothing. At the start of a run on random tokens, a capacity of 1.25 drops
+4-10% of the picks a layer, and 1.5 at 16k tokens 3-4%. Neither
+`--xla_gpu_experimental_ragged_all_to_all_use_device_kernel` nor
+`--xla_gpu_ragged_all_to_all_mode=peer` changes the speed; `=symmetric` fails in NCCL
+("Window address must be suitably aligned"). Nor does XLA's grouped matmul catch up
+with tokamax's: `jax.lax.ragged_dot` trains `sorted` 20 times slower, and with
+`--xla_gpu_experimental_use_ragged_dot_fusion` (cuDNN) it fails to compile.
+
+Keep `expert` inside a node for now: across hosts, XLA splits a ragged all-to-all in
+an intra-host one and an all-gather of the tokens across hosts.
+
+On jax 0.12 NCCL's ragged all-to-all hangs unless XLA_FLAGS has
 `--xla_gpu_experimental_ragged_all_to_all_use_barrier_with_nccl=false`, which
 `bux train` and `bux launch` add to it, and so does `bux.runtime.configure()` in a
 script that calls it before it touches a device.
@@ -982,54 +1041,84 @@ run's id is the same, as `methods` is not in it. A checkpoint therefore resumes 
 with the `repeat` it was saved with; with the other, the restore fails at once and
 says so.
 
-`remat` rematerializes in the backward pass what the forward does not keep, by a
-`jax.checkpoint` policy:
+`remat` rematerializes in the backward pass what the forward does not keep. A policy
+keeps what layers name (`jax.ad_checkpoint.checkpoint_name`), as MaxText's and
+Megatron's selective recomputation do, and the backward computes the rest again:
 
-| method               | what the forward keeps                                     |
-|----------------------|------------------------------------------------------------|
-| `none`               | everything, but in a scanned pass (below); the default     |
-| `full`               | nothing but the input of each branch or pass               |
-| `dots`               | the products of matrices                                   |
-| `dots_no_batch`      | the products of matrices without batch dimensions          |
-| `save_attention`     | the mixers' outputs, `attention` and `recurrence`          |
-| `save_qkv_attention` | those, and attention's projections, `qkv`                  |
-| `dots_attention`     | `dots_no_batch`'s, the mixers' outputs and `experts`       |
-| `offload_attention`  | the mixers' outputs, in the host's memory                  |
+```
+methods = methods(remat=remat(save=[attention, mlp], first=8))
+```
+
+| setting   | what it is                                                                 |
+|-----------|----------------------------------------------------------------------------|
+| `save`    | the names it keeps on the device                                           |
+| `offload` | the names it moves to the host's memory until the backward reads them     |
+| `first`   | how many passes of each repeat it rematerializes, from the first (of each stage's share, pipelined); the rest keep everything. None: every pass |
+
+| name              | what it is                                                          |
+|-------------------|---------------------------------------------------------------------|
+| `attention.in`    | softmax attention's q, k and v, as its kernel takes them (after RoPE) |
+| `attention.out`   | its output, and what else its backward takes: the log-sum-exp       |
+| `attention.index` | the keys sparse attention's indexer keeps for each query            |
+| `recurrence.in`   | a recurrent mixer's inputs, as its kernel takes them: linear attention, the SSMs, RWKV-7 |
+| `recurrence.out`  | its output, and what else its backward takes: the chunks' states    |
+| `qkv`             | attention's q, k and v projections; MLA's latents                   |
+| `mlp`             | an MLP's up and gate projections                                    |
+| `experts`         | the MoE's grouped products                                          |
+| `dots`            | every product of matrices, MXFP8's and the experts' too             |
+| `dots_no_batch`   | those without batch dimensions                                      |
+
+A name covers those under it, so `attention` is all three of attention's. They are
+names of what layers make, not definitions: `save=[mlp]` is no layer type, and
+`save=[attention]` a list of one. A preset is a policy by name:
+
+| method               | what the forward keeps                           | as data                      |
+|----------------------|--------------------------------------------------|------------------------------|
+| `none`               | everything, but in a scanned pass (below); the default |                        |
+| `full`               | nothing but the input of each branch or pass     | `remat()`                    |
+| `dots`               | the products of matrices                         | `remat(save=dots)`           |
+| `dots_no_batch`      | the products of matrices without batch dimensions | `remat(save=dots_no_batch)` |
+| `save_attention`     | the mixers' kernels' inputs and outputs          | `remat(save=[attention, recurrence])` |
+| `save_qkv_attention` | those, and attention's projections               | `remat(save=[attention, recurrence, qkv])` |
+| `dots_attention`     | `dots_no_batch`'s, the mixers' and the experts'  | `remat(save=[dots_no_batch, attention, recurrence, experts])` |
+| `offload_attention`  | the mixers', in the host's memory                | `remat(offload=[attention, recurrence])` |
 
 Each residual branch outside any other is rematerialized as a whole, with the read
 and write of the residual algebra; a scanned pass is, as one; and nothing inside
-either is again. In a `.bux` file `none` is the null value, so a sweep writes the
-method as a string: `methods.remat = "none" | full`.
-
-The last four keep what layers name (`jax.ad_checkpoint.checkpoint_name`), as
-MaxText's policies do:
-
-| name         | what it is                                                           |
-|--------------|----------------------------------------------------------------------|
-| `attention`  | softmax attention's output, and what its backward takes              |
-| `recurrence` | the same of a recurrent mixer: linear attention, the SSMs, RWKV-7    |
-| `qkv`        | attention's q, k and v projections, MLA's q and kv                   |
-| `mlp`        | an MLP's up and gate projections                                     |
-| `experts`    | the MoE's grouped products                                           |
+either is again. With `first=n`, the first n passes of each repeat are; unrolled, the
+rest keep everything, and scanned, they run in a scan of their own, as `none`'s. In a
+`.bux` file `none` is the null value, so a sweep writes the method as a string:
+`methods.remat = "none" | full`.
 
 What a kernel's backward takes is no product of matrices: flash attention's takes its
 output and log-sum-exp, so under `dots` the backward runs the kernel's forward again.
-`remat.named(name, f, *args)` names f's output and everything its backward takes, so
-that a policy that keeps the name runs none of f twice; attention's method and the
-recurrent mixers' run through it. Another policy is a function:
+`remat.named(name, f, *args)` names f's inputs `name.in` and its output and the rest
+of what its backward takes `name.out`, so that a policy that keeps the name runs none
+of f twice; attention's methods, sparse attention and the recurrent mixers run
+through it. Sparse attention's indexer names the keys it keeps, so that its backward
+neither picks them again nor runs the flash forward again. MLA names its latents, not
+the heads' projections up from them: as in DeepSeek's and Megatron's
+(`mla_up_proj`), a policy that keeps `qkv` projects them up again. `dots` keeps
+MXFP8's GEMMs inside a `shard_map` too, where jax's own policy missed them: in a
+pipeline of 2 B300s (4 microbatches of the dense 1.3B), at the same speed as when it
+ran them again, 155.7k tokens a second, in 53.3 GiB rather than 42.7; `full` trains
+that pipeline at 160k. Another policy is a function, which a name of `methods.remat`
+gives:
 
 ```python
 import jax
 
+from bux.architecture import remat
 from bux.parallel import methods
 
-methods.remat.register("save_mlp")(
-    jax.checkpoint_policies.save_only_these_names("attention", "mlp")
-)
-methods.remat.register("offload")(
+methods.remat.register("save_mlp")(remat.keeping(save=("attention", "mlp")))
+methods.remat.register("offload_dots")(
     jax.checkpoint_policies.offload_dot_with_no_batch_dims("device", "pinned_host")
 )
 ```
+
+jax's own `save_only_these_names` matches names whole, so it takes `attention.out`,
+not `attention`.
 
 A scan keeps every value its backward reads, stacked by pass. Unrolled, XLA fuses the
 elementwise ones into the ops that read them and keeps none: a norm's float32 copy of
@@ -1079,24 +1168,57 @@ On a CPU, attention is `xla`'s, whose backward takes the t by t probabilities: w
 `save_attention` keeps of it is more than `dots` keeps of the whole layer, and a CPU's
 host memory is its device's. On a GPU, flash attention's backward takes q, k, v, the
 output and the log-sum-exp. On a B300, for the dense 1.3B of 16 Llama blocks of width
-2048 (vocabulary 128256, 8 rows of 4096 tokens, `bfloat16`):
+2048 (vocabulary 128256), a Gated DeltaNet hybrid (`"DDDA"^4`) and a 64-expert MoE
+(`E^16`, top 8), in `bfloat16` on 8 rows of 4096 tokens, the loss by chunks, tokens a
+second and the peak memory:
 
-| remat                | tok/s   | peak memory |
-|----------------------|---------|-------------|
-| `none`               | 145,000 | 81.3 GiB    |
-| `dots`               | 134,000 | 69.8 GiB    |
-| `save_attention`     | 132,000 | 61.9 GiB    |
-| `save_qkv_attention` | 130,000 | 61.9 GiB    |
-| `dots_attention`     | 139,000 | 71.8 GiB    |
-| `offload_attention`  | 90,000  | 62.0 GiB    |
+| remat                                        | dense        | GDN          | MoE          |
+|----------------------------------------------|--------------|--------------|--------------|
+| `none`                                       | 139k, 51.1 GiB | 89.1k, 120.9 GiB | 101k, 134.0 GiB |
+| `dots_attention`                             | 137k, 41.6   | 76.9k, 106.9 | 97.2k, 108.4 |
+| `remat(save=[attention, mlp])`               | 135k, 41.6   |              |              |
+| `remat(save=[attention, recurrence.in, mlp])` |             | 74.9k, 41.0  |              |
+| `remat(save=[attention, experts])`           |              |              | 95.9k, 108.3 |
+| `dots`                                       | 128k, 39.5   | 74.0k, 75.7  | 93.7k, 106.4 |
+| `save_attention`                             | 126k, 30.6   | 73.4k, 89.9  | 87.7k, 81.7  |
+| `remat(save=[attention, recurrence.in])`     |              | 71.9k, 31.4  |              |
+| `full`                                       | 120k, 24.5   | 72.7k, 30.3  | 84.2k, 75.8  |
+| `remat(first=8)`, `first=2` for GDN: half the passes | 127k, 37.8 | 79.3k, 73.6 | 90.1k, 104.6 |
+| `remat(save=[attention], first=8)`           | 133k, 40.9   |              |              |
+| `offload_attention`                          | 82.1k, 39.5  |              |              |
 
-`dots` runs flash attention's forward twice, and `save_attention` the matmuls of every
-layer; `dots_attention` runs neither, 4% slower than `none` in 12% less memory.
-`save_qkv_attention` keeps what `save_attention` does here: attention's backward
-takes q, k and v after RoPE, so that only a QK-norm would read the projections.
-Offloading moves more than it saves, at this size. The head's logits are the largest
-part of the rest, which `methods(loss=chunks)` leaves out
-([The trainer's blocks](training.md#the-trainers-blocks)).
+`none` is the fastest, and the default; a policy buys rows. `dots` runs flash
+attention's forward twice, and `save_attention` the matmuls of every layer;
+`dots_attention` runs neither, 2% slower than `none` in 19% less memory on the dense
+model, as does `remat(save=[attention, mlp])`. A GDN layer's recurrence keeps its
+chunks' float32 states (`recurrence.out`), most of what `save_attention` keeps there:
+keeping its inputs alone (`recurrence.in`), whose backward runs the chunked forward
+again, is faster than `save_attention` in less than half its memory. In a Mamba-2
+hybrid (`"MMMA"^4`) too, `recurrence.in` in place of `recurrence` costs 2-3% for 59-68%
+less memory (`save_attention` 78.5k in 99.6 GiB, against 76.4k in 31.7); in a KDA
+hybrid by cuDNN's kernel, which costs more to run again, 7-11%. `first` gives the
+points between: half the passes in full is as fast as `dots` in a little less memory,
+and slower than the policy of names it would match: those keep a layer's costly parts,
+where `first` computes the whole layer again. With more rows a GPU:
+
+| remat                                        | dense                | GDN                 | MoE                |
+|----------------------------------------------|----------------------|---------------------|--------------------|
+| `none`                                       | 56 rows: 146k, 191.2 GiB | 12 rows: 91.0k, 166.2 GiB | 10 rows: 105k, 149.8 GiB |
+| `dots_attention`                             | 48: 147k, 151.6; 64: 145k, 196.7 |         | 12: 102k, 127.5    |
+| `remat(save=[attention, recurrence.in, mlp])` |                     | 32: 79.7k, 110.3    |                    |
+| `save_attention`                             | 96: 138k, 161.7      |                     | 16: 93.8k, 95.8    |
+| `full`                                       | 128: 126k, 113.2     | 32: 76.5k, 67.3     | 16: 89.6k, 83.8    |
+
+Offloading saves nothing unrolled, and costs a third of the speed: XLA schedules
+each layer's copy to the host inside the backward, just before the copy back, so the
+device keeps the value from the forward on as if saved, and the round trip adds a
+buffer (the compiled gradient's temp memory is 17.7 GiB against `save_attention`'s
+13.4, and 1.0 GiB goes to the host); the latency-hiding scheduler compiles the same
+program. Scanned, it works as MaxText's does: the scan stacks each pass's values into
+buffers in the host's memory, 6.0 GiB of them, and the device peaks at 22.3 GiB
+against `save_attention`'s 30.1, at 84k tokens a second against 121k (90k with
+`--xla_gpu_enable_pipelined_host_offloading=true`). `full`, unrolled, peaks at 24.5
+GiB at 120k: on a B300, computing the values again is cheaper than the copies.
 
 `Scanned.layers` holds the stacked passes, and `stacked.run(graphdef, state, times, x,
 taps)` runs any stack of them, such as a pipeline stage's share.
@@ -1129,7 +1251,7 @@ Float32 islands compute from what they are given in float32, and give back its d
 | the MoE's router                                | its logits, scores and top-k, the balance loss and the bias; the weights go back to the stream's dtype |
 | `recurrence`, `delta_rule`, `selective_scan`    | the recurrent state, and its decays               |
 | `rope.rotate`                                   | the rotation                                      |
-| the head                                        | its matmul's accumulation, tied or not, and its log Z and loss; under `methods(loss=chunks)`, its logits |
+| the head                                        | its matmul's accumulation, tied or not, and its log Z and loss; by chunks, the default `methods.loss`, its logits |
 
 Softmax attention takes its softmax in float32, under every method of
 `methods.attention`. Every other matmul runs in `compute`, or in the format of
@@ -1139,8 +1261,8 @@ which `tests/test_precision.py` checks for every family.
 Gradients add up over microbatches in float32. Over the rows' axes they are reduced in
 `precision.reduce`: `compute`, the default, or `float32`, as Megatron's are. In
 `compute` they are reduced as the backward makes them, bfloat16 for a weight's (but the
-head kernel's under `methods(loss=chunks)`, which adds up over the chunks in float32);
-where a step adds its gradients up unreduced ([below](#gathered-once-reduced-once-methodsgather-methodsaccumulate)),
+head kernel's by chunks, the default `methods.loss`, which adds up over the chunks in
+float32); where a step adds its gradients up unreduced ([below](#gathered-once-reduced-once-methodsgather-methodsaccumulate)),
 each device's sum is rounded to it before the one reduction. In `float32` that
 reduction sums float32, twice the bytes, once a step; on B300s, through the NICs, a
 step of the dense 1.3B trains 5% slower in it. `float32` changes what a run
@@ -1175,6 +1297,7 @@ backward's two, each along what its GEMM contracts, in blocks with a scale each
 |-----------|---------|-----------------------------------------------|-------------------------------------------|
 | `compute` | `compute` | none                                        | the default                               |
 | `mxfp8`   | E4M3    | 32, a power of two (E8M0)                     | dy in E4M3 too, as Transformer Engine's MXFP8 recipe |
+| `mxfp8_2d` | E4M3   | 32 of x and dy; W's per 32 x 32 tile, quantized by XLA | so that y and dx see the same W, as TorchTitan's |
 | `nvfp4`   | E2M1    | 16 (E4M3), and the tensor (float32); W's per 16 x 16 tile, so that y and dx see the same W | dy rounded stochastically, and x and dy transformed for dW by a random Hadamard transform of 16, as NVIDIA's NVFP4 pretraining recipe |
 
 On a Blackwell GPU cuDNN's block-scaled GEMM multiplies them (`__cudnn$blockScaledDot`
@@ -1184,8 +1307,9 @@ same values, so the tests run the formats on CPU. The forward keeps what the bac
 multiplies, x^T and W in the format, rather than x and W.
 
 Every projection made by `sharding.projection` or `sharding.linear` multiplies by
-`matmuls.dot_general`, which runs the format in force: attention's q, k, v, o and
-gate; the MLPs', the shared experts' and LatentMoE's; MLA's, CSA's, the indexer's; the
+`matmuls.dot_general`, which runs the format in force for its role and the residual
+branch it is in (docs/training.md, "Precision"): attention's q, k, v, o and gate;
+the MLPs', the shared experts' and LatentMoE's; MLA's, CSA's, the indexer's; the
 linear attentions', RWKV-7's and Mamba's; Engram's, nextn's and `linear`'s. These stay
 in `compute`: the embedding and the head, softmax attention's own matmuls and its
 relative bias, the router and the shared experts' gate, hyper-connections, norms,

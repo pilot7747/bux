@@ -1,0 +1,10 @@
+# Nemotron 3 Super's NVFP4 pretraining (NVIDIA, 2025): NVIDIA's NVFP4 recipe, but
+# MXFP8 for the Mamba output projections, and bfloat16 for attention's q, k, v and o,
+# LatentMoE's projections to and from its latent, the MTP modules and the last 15% of
+# the layers.
+#
+# Left out: NVFP4 routed experts, most of its matmuls, which stay in bfloat16; on a
+# hybrid without routed experts the recipe applies whole.
+precision = precision(compute=bfloat16, matmuls=nvfp4, last=0.15,
+                      roles=roles(q=compute, kv=compute, o=compute, latent=compute,
+                                  mtp=compute, recurrence_out=mxfp8))

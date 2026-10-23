@@ -54,6 +54,9 @@ _RESERVED = (*SETTINGS, *TRAIN_SETTINGS, "model")
 _REQUIRED = tuple(
     name for name, f in tcfg.TrainConfig.model_fields.items() if f.is_required()
 )
+# Settings of names that layers give what they make, which the compiler reads as
+# written (``_Evaluator.names``).
+_REMAT_NAMES = (("save",), ("offload",))
 _EXAMPLES = {
     "data": 'data = text(path="data/fineweb/*.parquet")',
     "optimizer": "optimizer = adamw(lr=3e-4)",
@@ -759,6 +762,9 @@ class _Evaluator:
             if arg.key in seen:
                 raise BuxError(f"'{'.'.join(arg.key)}' is given twice", arg.span)
             seen.add(arg.key)
+            if cls is tcfg.RematConfig and arg.key in _REMAT_NAMES:
+                fields.append((arg.key, self.names(arg.value), arg.span))
+                continue
             value = self.eval(arg.value, scope)
             if isinstance(value, ir.Tap | ir.Ref):
                 ports.append(_port(arg.key, value, cls, arg.span))
@@ -771,6 +777,25 @@ class _Evaluator:
                 self.bare.pop(arg.span, None)
             fields.append((arg.key, self.data(value, arg.value.span), arg.span))
         return fields, ports
+
+    def names(self, expr: ast.Expr) -> list[str]:
+        """Read names of what layers make, as `remat` takes them: attention,
+        attention.in, "mlp", or a list of them. They are not definitions, so `mlp` is
+        no layer type here, and `[attention]` a list of one."""
+        match expr:
+            case ast.Name(name=name) | ast.Lit(value=str() as name):
+                return [name]
+            case ast.Attr(base=ast.Name(name=base), field=field):
+                return [f"{base}.{field}"]
+            case ast.ListExpr(items=items):
+                return [name for item in items for name in self.names(item)]
+            case ast.Residual(body=body):
+                return self.names(body)
+            case ast.Alt():
+                return self.names(self.choose(expr))
+        raise BuxError(
+            "expected a name of what layers make, or a list of them", expr.span
+        )
 
     def with_ports(
         self,
@@ -844,9 +869,10 @@ class _Evaluator:
             options = re.findall(r"'([^']*)'", str(expected))
             close = difflib.get_close_matches(str(error["input"]), options, n=1)
             hint = f"did you mean '{close[0]}'?" if close else None
-        elif arg_span in self.bare:
+        elif arg_span in self.bare and error["type"] != "value_error":
             # A bare name only works as a string, and this setting wants something
-            # else, so the name was meant to refer to a definition.
+            # else, so the name was meant to refer to a definition. A value error is
+            # the setting's own check, of a string it takes.
             name, name_span, scope = self.bare[arg_span]
             return self.unknown(name, name_span, scope, "name")
         return BuxError(

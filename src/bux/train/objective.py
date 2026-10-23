@@ -7,10 +7,10 @@ its name, so another term is a name, a weight and a function:
     obj.terms["logit_l2"] = Term(1e-4, lambda logits, batch: jnp.mean(logits[0] ** 2))
 
 A head's logits are made only when a term reads them (``Heads``). The terms here take
-what they need of them a chunk of positions at a time instead, and so never make them
-all (``bux.architecture.logits``). The losses that layers report from a training
-forward (``report`` in ``bux.architecture.registry``) are terms too, weighted by each
-layer.
+only their sums over positions (``Heads.sums``), which `methods.loss = chunks` takes a
+chunk of positions at a time, and so never makes them all (``bux.architecture.logits``).
+The losses that layers report from a training forward (``report`` in
+``bux.architecture.registry``) are terms too, weighted by each layer.
 """
 
 from collections.abc import Callable, Sequence
@@ -22,7 +22,7 @@ import jax.numpy as jnp
 import optax
 from jaxtyping import Array, Bool, Float, Int
 
-from bux.architecture.logits import HeadOutput, Scores
+from bux.architecture.logits import HeadOutput, Scores, Sums
 from bux.architecture.registry import Loss
 from bux.architecture.segments import Segments
 from bux.lang import ir
@@ -35,12 +35,12 @@ Output = HeadOutput | Float[Array, "b t vocab"]  # a head's output, or its logit
 
 class Heads(Sequence):  # not Sequence[Array]: a type checker would read an item
     """Every head's logits on `batch`, in execution order, each made once a term
-    reads it. `scores` gives a head's cross-entropy what it takes, without them."""
+    reads it. `sums` gives a head's cross-entropy and z-loss, without them."""
 
     def __init__(self, outputs: Sequence[Output], batch: Batch):
         self.outputs, self.batch = list(outputs), batch
         self._logits: dict[int, Float[Array, "b t vocab"]] = {}
-        self._scores: dict[tuple[int, int], Scores] = {}
+        self._sums: dict[tuple[int, int, bool], Sums] = {}
 
     def __len__(self) -> int:
         return len(self.outputs)
@@ -59,17 +59,20 @@ class Heads(Sequence):  # not Sequence[Array]: a type checker would read an item
             self._logits[i] = out.logits() if isinstance(out, HeadOutput) else out
         return self._logits[i]
 
-    def scores(self, i: int, offset: int) -> Scores:
-        """Return head i's scores of token t + offset at each position t, a chunk at
-        a time (``HeadOutput.scores``); the last `offset` score token 0."""
-        if (i, offset) not in self._scores:
+    def sums(self, i: int, offset: int, z: bool = False) -> Sums:
+        """Return head i's mean cross-entropy of predicting token t + offset at each
+        position t with a target (`target_mask`), and its mean log Z squared there if
+        `z`, by the run's `methods.loss` (``HeadOutput.sums``). Ask for both at once:
+        each call takes the head's logits again."""
+        if (i, offset, z) not in self._sums:
             out, targets = self.outputs[i], targets_ahead(self.batch, offset)
-            self._scores[i, offset] = (
-                out.scores(targets)
+            weights = mean_weights(self.batch, offset)
+            self._sums[i, offset, z] = (
+                out.sums(targets, weights, z)
                 if isinstance(out, HeadOutput)
-                else Scores.of(out, targets)
+                else Scores.of(out, targets).sums(weights, z)
             )
-        return self._scores[i, offset]
+        return self._sums[i, offset, z]
 
 
 class Term(NamedTuple):
@@ -114,17 +117,19 @@ def objective(config: tcfg.LossConfig, arch: ir.Architecture) -> Objective:
     """Return the loss of `config` for a model of `arch`: the first head's
     cross-entropy as `loss`, its `z_loss`, and as `mtp` the mean loss of the heads
     that predict further ahead."""
-    offsets = prediction_offsets(arch)
-    first = Term(1.0, lambda heads, b: head_cross_entropy(heads, 0, b, offsets[0]))
-    terms = {"loss": first}
-    if config.z:
-        z = Term(config.z, lambda heads, b: head_z_loss(heads, 0, b, offsets[0]))
-        terms["z_loss"] = z
+    offsets, z = prediction_offsets(arch), bool(config.z)
+
+    def first(heads: Heads) -> Sums:
+        return heads.sums(0, offsets[0], z)
+
+    terms = {"loss": Term(1.0, lambda heads, _: first(heads).ce)}
+    if z:
+        terms["z_loss"] = Term(config.z, lambda heads, _: first(heads).z)
     if len(offsets) > 1:
 
-        def mtp(heads: Heads, b: Batch) -> Float[Array, ""]:
+        def mtp(heads: Heads, _: Batch) -> Float[Array, ""]:
             further = enumerate(offsets[1:], 1)
-            losses = [head_cross_entropy(heads, i, b, offset) for i, offset in further]
+            losses = [heads.sums(i, offset).ce for i, offset in further]
             return jnp.mean(jnp.stack(losses))
 
         terms["mtp"] = Term(config.mtp, mtp)
@@ -160,27 +165,17 @@ def _padded_mask(batch: Batch, offset: int) -> Bool[Array, "b t"]:
     return jnp.pad(target_mask(batch, offset), ((0, 0), (0, offset)))
 
 
+def mean_weights(batch: Batch, offset: int = 1) -> Float[Array, "b t"]:
+    """Return each position's weight in a mean over the positions with a target
+    `offset` ahead: 1 / their count there, 0 elsewhere."""
+    mask = _padded_mask(batch, offset)
+    return mask / jnp.maximum(jnp.sum(mask), 1)
+
+
 def _masked_mean(
     values: Float[Array, "b t"], mask: Bool[Array, "b t"]
 ) -> Float[Array, ""]:
     return jnp.sum(values * mask) / jnp.maximum(jnp.sum(mask), 1)
-
-
-def head_cross_entropy(
-    heads: Heads, i: int, batch: Batch, offset: int = 1
-) -> Float[Array, ""]:
-    """Return head i's `cross_entropy` from its scores, without its logits."""
-    lse, target = heads.scores(i, offset)
-    return _masked_mean(lse - target, _padded_mask(batch, offset))
-
-
-def head_z_loss(
-    heads: Heads, i: int, batch: Batch, offset: int = 1
-) -> Float[Array, ""]:
-    """Return head i's `z_loss` over the positions with a target `offset` ahead, from
-    its scores."""
-    lse = heads.scores(i, offset).lse
-    return _masked_mean(lse**2, _padded_mask(batch, offset))
 
 
 def cross_entropy(

@@ -38,6 +38,9 @@ from bux.parallel.mesh import active
 
 AXIS = "tensor"
 Entry = str | tuple[str, ...] | None  # one dimension of a PartitionSpec
+# The formats that scale each block of a device's share by itself alone, and their
+# blocks: a share of whole blocks multiplies as the whole does.
+LOCAL_BLOCKS = {"mxfp8": blockscaled.MX_BLOCK, "mxfp8_2d": blockscaled.MX_BLOCK}
 
 
 @runtime_checkable
@@ -209,21 +212,32 @@ def _by_rows(linear: nnx.Linear, split: Split) -> bool:
 
 def _as_whole(linear: nnx.Linear, split: Split) -> bool:
     """Whether a chunk times a device's share of the kernel of `linear` multiplies as
-    the whole does in the matmul format in force: `compute` does, and MXFP8 where
-    the chunk's tokens and the share are whole blocks. NVFP4 does not: it scales by
-    the largest value of the whole operand."""
-    share = [
-        n // s
-        for n, s in zip(
-            linear.kernel.shape, splits(_names(linear), linear.kernel.shape)
-        )
-    ]
-    match matmuls.FORMAT.get():
+    the whole does, in the format it multiplies in where it traces (`_format`):
+    `compute` does, and MXFP8's where the chunk's tokens and the share are whole
+    blocks (`LOCAL_BLOCKS`). NVFP4's does not: it scales by the largest value of the
+    whole operand."""
+    shape = tuple(linear.kernel.shape)
+    share = [n // s for n, s in zip(shape, splits(_names(linear), shape))]
+    match _format(linear):
         case "compute":
             return True
-        case "mxfp8":
-            return all(n % blockscaled.MX_BLOCK == 0 for n in (split.tokens, *share))
+        case str(name) if name in LOCAL_BLOCKS:
+            block = LOCAL_BLOCKS[name]
+            return all(n % block == 0 for n in (split.tokens, *share))
     return False
+
+
+def _format(linear: nnx.Linear) -> str | None:
+    """Return the format `linear` multiplies in, in the branch that is tracing: its
+    role's (``matmuls.format_of``); None for a dot_general of another kind."""
+    dot = linear.dot_general
+    if dot is jax.lax.dot_general:
+        return "compute"
+    if dot is matmuls.dot_general:
+        return matmuls.format_of(None)
+    if isinstance(dot, partial) and dot.func is matmuls.dot_general:
+        return matmuls.format_of(dot.keywords.get("role"))
+    return None
 
 
 def _shard_map(

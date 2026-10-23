@@ -52,18 +52,18 @@ class MLA(SoftmaxAttention):
         self.nope_head_dim, self.rope_head_dim, self.v_head_dim = n, r, dv
         self.kv_lora_rank = config.kv_lora_rank
 
-        def proj(n_in: int, n_out: int, names: Names) -> nnx.Linear:
-            return linear(n_in, n_out, names, False, rngs)
+        def proj(n_in: int, n_out: int, names: Names, role: str) -> nnx.Linear:
+            return linear(n_in, n_out, names, False, rngs, role=role)
 
         # The randomly initialized layers; reordering them changes a seed's init.
         latent = config.q_lora_rank
         heads = ("heads", h)  # flattened with their dims
         query = "latent" if latent else "embed"  # what the queries are projected from
-        self.q_a = proj(width, latent, ("embed", "latent")) if latent else None
-        self.q = proj(latent or width, h * (n + r), (query, heads))
-        self.kv_a = proj(width, config.kv_lora_rank + r, ("embed", "latent"))
-        self.kv_b = proj(config.kv_lora_rank, h * (n + dv), ("latent", heads))
-        self.o = proj(h * dv, width, (heads, "embed"))
+        self.q_a = proj(width, latent, ("embed", "latent"), "q") if latent else None
+        self.q = proj(latent or width, h * (n + r), (query, heads), "q")
+        self.kv_a = proj(width, config.kv_lora_rank + r, ("embed", "latent"), "kv")
+        self.kv_b = proj(config.kv_lora_rank, h * (n + dv), ("latent", heads), "kv")
+        self.o = proj(h * dv, width, (heads, "embed"), "o")
         super().__init__(config, width, h, h, n + r, dv, False, ports, rngs)
 
         self.q_a_norm = Norm(_LATENT_NORM, latent) if latent else None
@@ -79,10 +79,11 @@ class MLA(SoftmaxAttention):
         return self._output(x, self._attend(x, q, k, v, docs))
 
     def _query_input(self, x: Float[Array, "b t d"]) -> Float[Array, "b t e"]:
-        """Return the normalized query latent, or the input at full rank."""
+        """Return the normalized query latent, named `qkv`, or the input at full
+        rank."""
         if self.q_a is None or self.q_a_norm is None:
             return x
-        return self.q_a_norm(self.q_a(x))
+        return self.q_a_norm(checkpoint_name(self.q_a(x), "qkv"))
 
     def _heads(
         self,
@@ -92,14 +93,17 @@ class MLA(SoftmaxAttention):
     ) -> tuple[
         Float[Array, "b t h dk"], Float[Array, "b t h dk"], Float[Array, "b t h dv"]
     ]:
-        """Return every head's q, k and v, the keys' RoPE dims shared by all heads."""
+        """Return every head's q, k and v, the keys' RoPE dims shared by all heads.
+        The kv latent and the shared key dims are named `qkv`, as the query latent is:
+        a policy that keeps them computes the heads' projections up from them again,
+        as DeepSeek's and Megatron's MLA do."""
         b, t, _ = x.shape
         h, n, r = self.heads, self.nope_head_dim, self.rope_head_dim
         pos = None if docs is None else docs.positions
-        q = checkpoint_name(self.q(query), "qkv").reshape(b, t, h, n + r)
-        kv_latent, k_rope = jnp.split(self.kv_a(x), [self.kv_lora_rank], axis=-1)
-        kv = checkpoint_name(self.kv_b(self.kv_a_norm(kv_latent)), "qkv")
-        kv = kv.reshape(b, t, h, n + self.v_head_dim)
+        q = self.q(query).reshape(b, t, h, n + r)
+        latent = checkpoint_name(self.kv_a(x), "qkv")
+        kv_latent, k_rope = jnp.split(latent, [self.kv_lora_rank], axis=-1)
+        kv = self.kv_b(self.kv_a_norm(kv_latent)).reshape(b, t, h, n + self.v_head_dim)
         k_nope, v = jnp.split(kv, [n], axis=-1)
         k = jnp.concatenate(
             [k_nope, jnp.broadcast_to(k_rope[:, :, None], (b, t, h, r))], -1

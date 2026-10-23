@@ -43,11 +43,12 @@ class MLP(nnx.Module):
     ):
         size = size or config.intermediate_size
         gated = config.type == "gated_mlp"
-        self.up = linear(width, size, ("embed", "mlp"), config.bias, rngs)
+        into, out_of = ("embed", "mlp"), ("mlp", "embed")
+        self.up = linear(width, size, into, config.bias, rngs, role="mlp")
         self.gate = (
-            linear(width, size, ("embed", "mlp"), config.bias, rngs) if gated else None
+            linear(width, size, into, config.bias, rngs, role="mlp") if gated else None
         )
-        self.down = linear(size, width, ("mlp", "embed"), config.bias, rngs)
+        self.down = linear(size, width, out_of, config.bias, rngs, role="mlp")
         self.config = config
         self.dropout = nnx.Dropout(config.dropout, rngs=rngs)
 
