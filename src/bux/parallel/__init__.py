@@ -18,7 +18,7 @@ rest. Every parameter's largest whole dimension also splits over `fsdp`. Outside
                                                   shard_batch, microbatches
     methods   one registry per kind of method     method
     gather    a step's parameters gathered once,  whole, rows, splits, gather,
-              its gradients reduced once          scatter
+              its gradients reduced once          scatter, apart
 
 docs/parallelism.md explains them.
 """

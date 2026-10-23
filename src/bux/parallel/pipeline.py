@@ -17,6 +17,10 @@ through the stages once; ``circular`` sends them round ``methods.rounds`` times,
 stage holding a share of every round's layers, so that a stage idles
 (S − 1) / (R·M + S − 1) of a step (``bubble``).
 
+Where the step computes its rows apart (``gather.apart``), the shard_map is manual
+over the axes that split them too: each device runs its own rows, and a stage's
+gradients reduce once, as they leave it, not once a tick.
+
 A method is ``(stage, params, rest, x, rows) -> (y, rest, losses)``. ``stage`` runs a
 stage's share of a round on one microbatch; ``params`` and ``rest`` are the layers'
 parameters and other state, each leaf (rounds, layers per round, ...); ``x`` is the

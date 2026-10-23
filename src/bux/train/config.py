@@ -382,7 +382,7 @@ class MethodsConfig(Config):
     gather: Literal["step", "layer"] = "step"
     # How its microbatches' gradients add up: unreduced, each device's own reduced once
     # a step; or reduced each microbatch. auto: unreduced where that computes the
-    # same, the rows independent of each other and no pipeline.
+    # same, no layer learning from the whole batch as an MoE's router does.
     accumulate: Literal["auto", "unreduced", "reduced"] = "auto"
     # A step's new state takes the old one's memory: a lower peak, in fewer pieces.
     donate: bool = True

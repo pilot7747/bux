@@ -1113,10 +1113,10 @@ times: what ZeRO-3 does, and `methods(gather=layer, accumulate=reduced)` still d
 Inside that `shard_map` a layer sees its device's rows alone, so a layer that learns
 from the whole batch would learn from a part (`trainer.rows_independent`): the MoE's
 router, its bias and its balance loss over the batch. `accumulate=auto`, the default,
-adds up unreduced where the step has microbatches, its rows are independent, the
-parameters are gathered once and no pipeline splits it; else each microbatch's
-gradient reduces as the backward makes it, onto its shards. `accumulate=unreduced`
-where it would not compute the same is an error that says why.
+adds up unreduced where the step has microbatches or a pipeline, its rows are
+independent and the parameters are gathered once; else each microbatch's gradient
+reduces as the backward makes it, onto its shards. `accumulate=unreduced` where it
+would not compute the same is an error that says why.
 
 A step of 8 microbatches then moves what a step of 1 does. In the compiled step of
 `fsdp=8`, each collective counted as many times as the loops around it run
