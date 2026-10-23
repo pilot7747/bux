@@ -259,17 +259,29 @@ def test_cudnn_s_attention_takes_the_arguments_bux_passes():
     assert jax_internals.cudnn_attention_here() == (jax.default_backend() == "gpu")
 
 
+CPU = pytest.mark.skipif(jax.default_backend() != "cpu", reason="numpy reads a CPU's")
+RESULTS = [jax.ShapeDtypeStruct((3,), jnp.float32)]
+
+
+@CPU
 def test_a_buffer_callback_writes_its_results_into_xla_s_buffers():
+    def run(context: Any, outs: tuple, *ins: Any) -> None:
+        np.multiply(np.from_dlpack(ins[0]), 2, out=np.from_dlpack(outs[0]))
+
+    (y,) = jax.jit(jax_internals.buffer_callback(run, RESULTS))(jnp.arange(3.0))
+    np.testing.assert_array_equal(y, [0.0, 2.0, 4.0])
+
+
+@GPU
+def test_a_buffer_callback_hands_its_run_xla_s_stream_and_device():
     seen = []
 
     def run(context: Any, outs: tuple, *ins: Any) -> None:
-        seen.append((hasattr(type(context), "stream"), ins[0].__dlpack_device__()))
-        np.multiply(np.from_dlpack(ins[0]), 2, out=np.from_dlpack(outs[0]))
+        seen.append((context.stream, ins[0].__dlpack_device__()))
 
-    results = [jax.ShapeDtypeStruct((3,), jnp.float32)]
-    (y,) = jax.jit(jax_internals.buffer_callback(run, results))(jnp.arange(3.0))
-    np.testing.assert_array_equal(y, [0.0, 2.0, 4.0])
-    assert seen[0][0], "XLA's context has no stream"
+    jax.jit(jax_internals.buffer_callback(run, RESULTS))(jnp.arange(3.0))
+    [(stream, (kind, device))] = seen
+    assert isinstance(stream, int) and kind == 2 and device == 0  # kDLCUDA, GPU 0
 
 
 @GPU

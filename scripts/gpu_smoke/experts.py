@@ -51,7 +51,7 @@ log = log(every=1)
 EXPERT = cfg.MLPConfig(type="gated_mlp", intermediate_size=128, activation="swish")
 NORM = cfg.NormalizationConfig(type="rmsnorm")
 MXFP8 = "precision(roles=roles(experts=mxfp8))"
-MXFP8_TOLERANCE = 2e-2  # of the losses, against bfloat16's
+MXFP8_TOLERANCE = 1e-2  # of the losses, against bfloat16's: 1e-3 off on B300s
 
 
 class Reports(Sink):
