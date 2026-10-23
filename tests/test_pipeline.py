@@ -161,7 +161,9 @@ def test_muon_trains_a_pipelined_repeat_as_one_device(losses, pipeline, orthogon
     assert np.allclose(piped, one, atol=1e-5)
 
 
-@pytest.mark.parametrize("remat", ["full", "dots", "save_attention"])
+@pytest.mark.parametrize(
+    "remat", ["full", "dots", "save_attention", "remat(save=[attention], first=1)"]
+)
 def test_a_rematerialized_pipeline_trains_as_one_device(losses, remat):
     piped = losses(LLAMA, mesh="mesh(stage=2, data=1)", methods=_how(4, remat=remat))
     assert np.allclose(piped, losses(LLAMA, mesh=ONE, methods=SCAN), atol=1e-5)

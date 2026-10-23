@@ -365,7 +365,13 @@ bfloat16, against the same model by all t × t logits, as bux attended before `s
 
 At 32k a layer's attention takes 1.4-1.9 times dense flash attention's time, and the
 indexer most of the rest: its selection 61 ms, its loss 75 ms and the loss's target
-33 ms, forward and backward.
+33 ms, forward and backward. Under `methods(remat=save_attention)` the backward neither
+selects the keys again nor runs the flash forward again
+([Repeats and remat](parallelism.md#repeats-and-remat-methodsrepeat-methodsremat)):
+at 32k, 7.27k tokens a second in 39.8 GiB, as fast as no remat (7.11k, 77.9 GiB),
+where it ran at 5.85k before; at 16k, 10.2k against 8.65k. MLA keeps its latents for
+`save_qkv_attention`, not the heads' projections up from them: at 8 rows of 4096,
+34.1k in 41.2 GiB, against 30.1k in 51.5 before.
 
 A thread loads the next two batches as a step runs (`prefetch`). A step's new state
 takes the old one's memory (`methods.donate`): the 1.3B's step peaks at 70.6 GiB
@@ -619,41 +625,46 @@ trainer.fit(
 The model gives the objective its heads' outputs, not their logits: `Model.heads`
 (`training_heads` in a training step) returns each head's input and its projection,
 a `HeadOutput` (`bux/architecture/logits.py`). The default terms, `loss`, `z_loss`
-and `mtp`, take only log Z and the target's logit at each position, which
-`logits.scores(i, offset)` gives for head i by the run's `methods.loss`:
+and `mtp`, are means over the targets of the cross-entropy, log Z minus the target's
+logit, and of log Z squared, which `heads.sums(i, offset, z)` gives for head i by the
+run's `methods.loss`:
 
 | method   | how                                                                 |
 |----------|---------------------------------------------------------------------|
-| `logits` | one matmul for every position, the logits whole in `compute`; the default |
-| `chunks` | the matmul, the logsumexp and the target's logit of at most 2 GiB of float32 logits at once, made again in the backward, the head's gradient added up in float32 |
+| `chunks` | the matmul, the logsumexp and the target's logit of at most 2 GiB of float32 logits at once, and their gradients by the kernel and the stream with them, the kernel's added up in float32: the backward only scales those; the default |
+| `logits` | one matmul for every position, the logits whole in `compute`        |
 
 At a vocabulary of 128K, the float32 logits of 8 rows of 4096 tokens take 16 GB, and
-their gradient as much again: `chunks` is for a run that memory bounds, a large
-vocabulary and batch, or a long row, where the 9% it costs buys rows. Another method
-is a function of a head's output and the targets, `@methods.loss.register("mine")`,
-that returns their `Scores`. A term of one's own gets the same `logits`, a sequence
-that makes a head's logits once a term reads them, once for every term that does:
-`logits[0] ** 2` above makes the first head's whole, by either method.
-`Model.outputs` returns every head's logits at once.
+their gradient as much again. A sum over positions is linear in each position's term,
+so its gradient is known in the forward but for one factor, its cotangent, which the
+backward multiplies in: by chunks, a head multiplies by its vocabulary three times, as
+by whole logits, and keeps the gradients from the forward to the backward in
+`compute`, the kernel's and the stream's. Each sum keeps its own, so a z-loss costs a
+second matmul by the kernel and one by the stream. Another method is a function of a
+head's output, the targets, their weights and whether to sum log Z squared,
+`@methods.loss.register("mine")`, that returns their `Sums`. A term of one's own gets
+the same `logits`, a sequence that makes a head's logits once a term reads them, once
+for every term that does: `logits[0] ** 2` above makes the first head's whole, by
+either method. `Model.outputs` returns every head's logits at once.
 
 On a B300, for the dense 1.3B of 16 Llama blocks of width 2048 (vocabulary 128256,
-`bfloat16`, 8 rows of 4096 tokens), against the whole logits before the head left
-them to the objective, whose tied head multiplied in float32; the largest batch with
-donation, the default:
+`bfloat16`, 8 rows of 4096 tokens), against the whole logits, and against the chunks
+before they took their gradients in the forward, whose backward made each chunk's
+logits again:
 
-| head, `methods.loss` | tok/s | peak memory | largest batch |
-|----------------------|-------|-------------|---------------|
-| untied, before       | 143k  | 81.2 GiB    | 28 rows       |
-| untied, `logits`     | 145k  | 81.3 GiB    | 28 rows       |
-| untied, `chunks`     | 131k  | 62.5 GiB    | 56 rows, 137k |
-| tied, before         | 129k  | 84.4 GiB    |               |
-| tied, `logits`       | 144k  | 76.3 GiB    |               |
-| tied, `chunks`       | 134k  | 57.6 GiB    |               |
+| head, `methods.loss`      | tok/s | peak memory | largest batch |
+|---------------------------|-------|-------------|---------------|
+| untied, `logits`          | 138k  | 70.6 GiB    |               |
+| untied, chunks, before    | 125k  | 52.1 GiB    |               |
+| untied, `chunks`          | 139k  | 51.1 GiB    | 56 rows, 146k |
+| tied, `logits`            | 141k  | 67.5 GiB    |               |
+| tied, `chunks`            | 139k  | 48.1 GiB    |               |
 
-`chunks` makes the logits twice, and moves them in float32. On 8 B300s under `fsdp=8`,
-8 rows each, its ratios hold (41 GiB rather than 60, 1.04M tokens a second rather than
-1.12M): each device adds its share of the head's gradient up alone, and the mesh
-reduces it once.
+On 8 B300s under `fsdp=8`, 8 rows each, `chunks` trains at 1.071M tokens a second in
+38.9 GiB, and `logits` at 1.064M in 58.5: each device adds its share of the head's
+gradient up alone, and the mesh reduces it once. The GDN hybrid and the MoE of
+[Repeats and remat](parallelism.md#repeats-and-remat-methodsrepeat-methodsremat) train
+6% and 5% faster by `chunks` than they did by chunks before.
 
 A layer adds a term of its own from its forward, in one line:
 `report(taps, "my_loss", weight, value)` (`bux/architecture/registry.py`). The

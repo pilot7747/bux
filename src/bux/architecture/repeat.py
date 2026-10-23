@@ -14,7 +14,7 @@ import jax.numpy as jnp
 from flax import nnx
 from jax.typing import DTypeLike
 
-from bux.architecture import pipelined, residual, stacked
+from bux.architecture import pipelined, remat, residual, stacked
 from bux.architecture.graph import Sequence, branches, build_node
 from bux.architecture.registry import Context, Stream, Taps
 from bux.lang import ir
@@ -25,7 +25,7 @@ from bux.parallel.layout import LAYERS, NAMES
 @methods.repeat.register("unroll")
 def unroll(body: ir.Node, times: int, ctx: Context) -> nnx.Module:
     """Build one module per pass, run in a row."""
-    return Sequence(_passes(body, times, ctx), branches((body,) * times, ctx))
+    return Passes(_passes(body, times, ctx), branches((body,) * times, ctx))
 
 
 @methods.repeat.register("scan")
@@ -35,11 +35,22 @@ def scan(body: ir.Node, times: int, ctx: Context) -> nnx.Module:
     passes = _passes(body, times, ctx)
     if scannable(passes):
         return Scanned(_stack(passes), len(passes))
-    return Sequence(passes, branches((body,) * times, ctx))
+    return Passes(passes, branches((body,) * times, ctx))
 
 
 def _passes(body: ir.Node, times: int, ctx: Context) -> list[nnx.Module]:
     return [build_node(body, ctx) for _ in range(times)]
+
+
+class Passes(Sequence):
+    """The passes of a repeat, run in a row, each traced as its pass
+    (``remat.at_pass``), which the run's `remat(first=n)` counts."""
+
+    def __call__(self, x: Stream, taps: Taps) -> Stream:
+        for i, (item, branch) in enumerate(zip(self.items, self.branches, strict=True)):
+            with remat.at_pass(i):
+                x = remat.rematted(item, x, taps) if branch else item(x, taps)
+        return x
 
 
 def scannable(passes: list[nnx.Module]) -> bool:
