@@ -1,6 +1,6 @@
 """The gated delta rule by cuDNN's fused kernels (Frost, in cudnn-frontend, which
-tokamax's cuda extra installs): forward and backward, a tenth of ``chunkwise``'s
-time on a B300, keeping only their inputs for the backward pass.
+tokamax's cuda extra installs): forward and backward in a fifth (GDN) to a tenth (KDA)
+of ``chunkwise``'s time on a B300, keeping only their inputs for the backward pass.
 
 One decay a head (Gated DeltaNet, DeltaNet) runs by Frost's GDN kernel, which takes
 each pair's decay as the exp of a difference of summed log decays, never positive: it
@@ -9,11 +9,10 @@ cuDNN's graph of it on XLA's stream (`_graph_call`).
 
 A decay per key channel (KDA) runs by Frost's KDA kernel, through cudnn-frontend's
 own JAX call. It factors each decay through the start of a tile of 16 positions, so it
-overflows where a tile decays a channel below exp(-87): a gate bounded at -5
-(`gate_lower_bound`, Kimi K3) always fits it. Any other runs by it on the (row, head)
-pairs where 16 positions decay no channel by more than exp(-80), and by ``chunkwise``
-on the rest (`_patched`), up to a quarter of the pairs; past that, ``chunkwise`` runs
-it all.
+loses precision where a tile decays a channel by exp(-86), and overflows at exp(-90):
+it runs a gate bounded at -5 (`gate_lower_bound`, Kimi K3), and no other. Within 12
+steps of bux's start, KDA's unbounded gates are that steep in 30 to 90% of the (row,
+head) pairs of most layers.
 
 The kernels run on one SM100 or SM103 GPU at a time, on token-packed rows and their
 documents' bounds (cu_seqlens); on a mesh, a `shard_map` gives them each device's rows
@@ -21,7 +20,6 @@ and heads. They take heads of 64 or 128, and every position of a row: not
 `methods.recurrence = pass_state`, which splits them.
 """
 
-import contextlib
 import functools
 import threading
 from collections.abc import Callable
@@ -30,7 +28,7 @@ from typing import Any
 import jax
 import jax.numpy as jnp
 from jax.sharding import PartitionSpec as P
-from jaxtyping import Array, Bool, Float, Int
+from jaxtyping import Array, Float, Int
 
 from bux import kernels, parallel
 from bux.architecture.segments import Segments
@@ -45,8 +43,7 @@ except ImportError:
 
 DIMS = (64, 128)  # the head dims the kernels take
 SM = ("10.0", "10.3")  # the GPUs they run on: B200, B300
-FLOOR = -5.0  # the least log decay a position may have, for KDA's kernel to run
-TILE = 16  # positions per tile of KDA's kernel, from each sequence's start
+FLOOR = -5.0  # the least log decay a channel may have, for KDA's kernel to run
 # Documents a row of 4096 tokens may hold for the kernels: an empty sequence costs as
 # much as 10 tokens, so cu_seqlens has room for this many, and more go by `otherwise`.
 DOCS = 32
@@ -54,14 +51,16 @@ DOCS = 32
 Rule = Callable[..., Float[Array, "b t h dv"]]  # linear_attention's delta_rule
 
 
-def runs(dk: int, dv: int, dtype: Any) -> bool:
+def runs(dk: int, dv: int, dtype: Any, decays: int, floor: float | None) -> bool:
     """Return whether a kernel runs a layer of these head dims, its q, k and v of
-    `dtype`, by the run's methods, here: 16-bit values only."""
+    `dtype` and `decays` log decays a head, never below `floor`, by the run's methods,
+    here: 16-bit values only, and a decay per channel bounded at `FLOOR`."""
     on = parallel.active()
     method = on.methods.recurrence if on else "scan"
     shapes = dk in DIMS and dv in DIMS and dtype in (jnp.bfloat16, jnp.float16)
+    gates = decays == 1 or (floor is not None and floor >= FLOOR)
     here = kernels.gpu() and _sm()
-    return frost is not None and method == "scan" and shapes and here
+    return frost is not None and method == "scan" and shapes and gates and here
 
 
 @functools.cache
@@ -78,17 +77,13 @@ def delta_rule(
     log_decay: Float[Array, "b t h #dk"],
     beta: Float[Array, "b t h"],
     docs: Segments | None,
-    floor: float | None,
     otherwise: Rule,
 ) -> Float[Array, "b t h dv"]:
     """Run `linear_attention.delta_rule` by a kernel, in v's dtype, where `runs`; by
-    `otherwise` for rows of more documents than cu_seqlens holds, and for a decay per
-    channel steeper than KDA's kernel takes, where `floor`, the least log decay, does
-    not bound it."""
+    `otherwise` for rows of more documents than cu_seqlens holds."""
     docs = docs or Segments.of(jnp.broadcast_to(jnp.arange(q.shape[1]), q.shape[:2]))
     xs = (q, k, v, log_decay, beta, *docs)
-    bounded = log_decay.shape[-1] == 1 or (floor is not None and floor >= FLOOR)
-    rule = functools.partial(_rows, otherwise, bounded)
+    rule = functools.partial(_rows, otherwise)
     if parallel.active() is None:
         return rule(*xs)
     rows = parallel.spec(("batch", "seq", "heads", None), q.shape)
@@ -102,7 +97,6 @@ def delta_rule(
 
 def _rows(
     otherwise: Rule,
-    bounded: bool,
     q: Float[Array, "b t h dk"],
     k: Float[Array, "b t h dk"],
     v: Float[Array, "b t h dv"],
@@ -112,18 +106,12 @@ def _rows(
     ids: Int[Array, "b t"],
     within: Int[Array, "b t"],
 ) -> Float[Array, "b t h dv"]:
-    """Run one device's rows by a kernel if cu_seqlens holds their documents; with
-    gates the kernel may not take, unless more than `STEEP` of the (row, head) pairs
-    are too steep for it."""
-    b, t, h, _ = q.shape
+    """Run one device's rows by a kernel if cu_seqlens holds their documents."""
+    b, t = within.shape
     room = b * max(1, t * DOCS // 4096)
     fits = jnp.sum(within == 0) <= room
     docs = Segments(positions, ids, within)
     kernel = functools.partial(_kernel, room)
-    if not bounded:
-        steep = _steep(g)
-        fits &= jnp.sum(steep) <= _patches(b, h)
-        kernel = functools.partial(_patched, kernel, otherwise, docs, steep)
 
     def fallback(
         q: Float[Array, "b t h dk"],
@@ -136,56 +124,6 @@ def _rows(
         return otherwise(q, k, v, g, beta, docs).astype(v.dtype)
 
     return jax.lax.cond(fits, kernel, fallback, q, k, v, g, beta, within)
-
-
-STEEP = 1 / 4  # the share of (row, head) pairs the chunks may run for KDA's kernel
-
-
-def _patches(b: int, h: int) -> int:
-    """Return how many (row, head) pairs of b rows of h heads `_patched` runs by the
-    chunks."""
-    return max(1, int(b * h * STEEP))
-
-
-def _steep(g: Float[Array, "b t h dk"]) -> Bool[Array, "b h"]:
-    """Return the (row, head) pairs where `TILE` positions decay a channel by more
-    than exp(TILE * FLOOR), which a tile of KDA's kernel may not: a log decay of -5 a
-    position on average, where -5.4 loses precision and -5.6 overflows."""
-    window, strides = (1, TILE, 1, 1), (1, 1, 1, 1)
-    edges = ((0, 0), (TILE - 1, 0), (0, 0), (0, 0))
-    g = g.astype(jnp.float32)
-    sums = jax.lax.reduce_window(g, 0.0, jax.lax.add, window, strides, edges)
-    return jnp.min(sums, axis=(1, 3)) < TILE * FLOOR
-
-
-def _patched(
-    kernel: Rule,
-    otherwise: Rule,
-    docs: Segments,
-    steep: Bool[Array, "b h"],
-    q: Float[Array, "b t h dk"],
-    k: Float[Array, "b t h dk"],
-    v: Float[Array, "b t h dv"],
-    g: Float[Array, "b t h dk"],
-    beta: Float[Array, "b t h"],
-    within: Int[Array, "b t"],
-) -> Float[Array, "b t h dv"]:
-    """Run the kernel on every (row, head) pair, the `steep` ones with no decay, and
-    replace those by `otherwise`'s chunks, run on them alone. Slots past the steep
-    pairs run the first pair again, and add nothing."""
-    b, _, h, _ = q.shape
-    flat = jnp.nonzero(steep.reshape(-1), size=_patches(b, h), fill_value=0)[0]
-    rows, heads = flat // h, flat % h
-    used = jnp.arange(flat.size) < jnp.sum(steep)
-
-    def picked(x: Float[Array, "b t h ..."]) -> Float[Array, "n t 1 ..."]:
-        return x[rows, :, heads][:, :, None]
-
-    safe = jnp.where(steep[:, None, :, None], 0.0, g)
-    out = jnp.where(steep[:, None, :, None], 0.0, kernel(q, k, v, safe, beta, within))
-    few = Segments(*(x[rows] for x in docs))
-    patch = otherwise(*map(picked, (q, k, v, g, beta)), few)[:, :, 0]
-    return out.at[rows, :, heads].add(jnp.where(used[:, None, None], patch, 0.0))
 
 
 Rows = tuple[Array, ...]  # q, k, v, the log decay and beta (b, t, h, ...), and within
@@ -260,6 +198,7 @@ def _grads(*tokens: Array) -> tuple[Array, ...]:
 
 
 def _like(x: Array) -> jax.ShapeDtypeStruct:
+    """Return the shape and dtype of a result like `x`."""
     return jax.ShapeDtypeStruct(x.shape, x.dtype)
 
 
@@ -278,23 +217,21 @@ def _graph_call(
 
     def run(ctx: Any, outs: tuple[Any, ...], *ins: Any) -> None:
         device = ins[0].__dlpack_device__()[1]
-        first = (op, shapes, device) not in _RAN
         *outputs, workspace = outs
-        with _ONE_AT_A_TIME if first else contextlib.nullcontext():
+        with _ONE_AT_A_TIME:
             graph = _graph(op, shapes, device)
             pack = dict(zip(graph.ports, (*ins, *outputs), strict=True))
             handle = _handle(device, ctx.stream)
             graph.execute(pack, workspace=workspace, handle=handle)
-        _RAN.add((op, shapes, device))
 
     return tuple(buffer_callback(run, (*results, scratch))(*xs)[:-1])
 
 
-# XLA calls each device's callback from that device's thread. A graph's first run
-# builds it and compiles its kernels, which two threads must not do at once (8 GPUs
-# crashed so); later runs only launch them.
+# XLA calls each device's callback from that device's thread. Two threads must not
+# build and compile a graph at once (8 GPUs crashed so); and one at a time, 8 GPUs
+# train faster than with every callback contending for the GIL: 828k tokens a second
+# against 726k.
 _ONE_AT_A_TIME = threading.Lock()
-_RAN: set[tuple] = set()  # the graphs that have run once
 
 
 # Each graph's inputs, and its outputs with the input whose dtype each takes, in the

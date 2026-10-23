@@ -3,8 +3,8 @@ scans over positions, on one GPU at a hybrid's shapes, 2 rows of 4096 in packed
 documents: the outputs and every input's gradient, in float32. XLA's GPU fusions
 can differ from its CPU's, which the tests run: on a B300, a grouped einsum's took
 Mamba-2's gradients for B and C wrong. Then the delta rule by cuDNN's kernels
-(``fused_delta``), in bfloat16, against its chunks in float32: GDN's at any gate,
-KDA's at a gate bounded at -5, and unbounded with heads too steep for it.
+(``fused_delta``), in bfloat16, against its chunks in float32: GDN's at steep gates
+and spikes, KDA's at a gate bounded at -5.
 
     uv run --extra cuda python scripts/gpu_smoke/recurrence.py
 
@@ -120,24 +120,25 @@ def errors(case: str) -> list[float]:
     return [float(np.linalg.norm(a - b) / np.linalg.norm(b)) for a, b in zip(got, want)]
 
 
-# The delta rule's gates: channels, the least log decay, the floor it is bounded at,
-# and the heads whose gates are at -12, too steep for KDA's kernel.
-KERNELS: dict[str, tuple[int, float, float | None, tuple[int, ...]]] = {
-    "gdn's kernel, gates to -20": (1, -20.0, None, ()),
-    "kda's kernel, gates to -5": (128, -5.0, -5.0, ()),
-    "kda's kernel, 2 heads too steep": (128, -3.0, None, (3, 11)),
+# The delta rule's gates: channels, the least log decay, and the floor it is bounded
+# at; a spike of the log decay every 16 positions, if any.
+KERNELS: dict[str, tuple[int, float, float | None, float | None]] = {
+    "gdn's kernel, gates to -20": (1, -20.0, None, None),
+    "gdn's kernel, spikes of -1e4": (1, -1.0, None, -1e4),
+    "kda's kernel, gates to -5": (128, -5.0, -5.0, None),
 }
 
 
 def delta_inputs(case: str) -> tuple[Float[Array, "..."], ...]:
     """q, k and v in bfloat16, of 16 heads of 128, the log decay and beta."""
-    decay, low, _, steep = KERNELS[case]
+    decay, low, _, spike = KERNELS[case]
     rng = np.random.default_rng(list(KERNELS).index(case))
     q, k, v = rng.normal(size=(3, B, T, 16, 128))
     q = q / np.linalg.norm(q, axis=-1, keepdims=True) / np.sqrt(128)
     k = k / np.linalg.norm(k, axis=-1, keepdims=True)
     g = low / (1 + np.exp(-rng.normal(size=(B, T, 16, decay))))
-    g[:, :, list(steep)] = -12.0
+    if spike is not None:
+        g[:, 5::16] = spike
     beta = 1 / (1 + np.exp(-rng.normal(size=(B, T, 16))))
     qkv = (jnp.asarray(x, jnp.bfloat16) for x in (q, k, v))
     return (*qkv, jnp.asarray(g, jnp.float32), jnp.asarray(beta, jnp.float32))

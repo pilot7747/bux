@@ -214,14 +214,16 @@ def delta_rule(
 
     That is `recurrence` with a = -w k, and beta k for both b and k, in float32. On a
     B200 or B300, with q, k and v of 16 bits, cuDNN's fused kernels run it instead
-    (``fused_delta``), in their dtype, and keep only those for the backward pass: so
-    do the chunks they fall back on, whatever the run's `methods.states`. `floor` is
-    the least log decay, if the gate bounds it."""
-    if fused_delta.runs(k.shape[-1], v.shape[-1], v.dtype):
+    (``fused_delta``), in their dtype: one decay a head at any gate, a decay per
+    channel where `floor`, the least log decay, bounds it at -5. They keep only their
+    inputs for the backward pass, and so do the chunks they fall back on, whatever
+    the run's `methods.states`."""
+    shapes = (k.shape[-1], v.shape[-1], v.dtype, log_decay.shape[-1])
+    if fused_delta.runs(*shapes, floor):
         otherwise = functools.partial(_chunked, states="recompute")
 
         def fused(*xs: Float[Array, "b t ..."]) -> Float[Array, "b t h dv"]:
-            return fused_delta.delta_rule(*xs, docs, floor, otherwise)
+            return fused_delta.delta_rule(*xs, docs, otherwise)
 
         return remat.named("recurrence", fused, q, k, v, log_decay, beta)
     return _chunked(q, k, v, log_decay, beta, docs)
