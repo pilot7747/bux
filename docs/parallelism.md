@@ -960,18 +960,21 @@ Softmax attention takes its softmax in float32, under every method of
 `matmuls` (below), and the stream stays in `compute` from the embedding to the heads,
 which `tests/test_precision.py` checks for every family.
 
-Gradients add up over microbatches in float32. Over the batch axes they are reduced in
+Gradients add up over microbatches in float32. Over the rows' axes they are reduced in
 `precision.reduce`: `compute`, the default, or `float32`, as Megatron's are. In
 `compute` they are reduced as the backward makes them, bfloat16 for a weight's (but the
 head kernel's under `methods(loss=chunks)`, which adds up over the chunks in float32);
 where a step adds its gradients up unreduced ([below](#gathered-once-reduced-once-methodsgather-methodsaccumulate)),
 each device's sum is rounded to it before the one reduction. In `float32` that
-reduction sums float32, twice the bytes, once a step. `float32` changes what a run
+reduction sums float32, twice the bytes, once a step; on B300s a step of one
+microbatch of the dense 1.3B trains 2% slower in it. `float32` changes what a run
 computes, so it is in the run's id, and a run that leaves `compute` keeps the id it
 had. It needs the step to add its gradients up unreduced, also at one microbatch: XLA
-reduces those of the backward in the dtype of the matmul that makes them, as a run
-whose layers learn from the whole batch, such as an MoE's, or a pipeline does, where
-`float32` is an error.
+reduces those of the backward in the dtype of the matmul that makes them, as it does
+for a run whose layers learn from the whole batch, such as an MoE's, and for a
+pipeline's embedding and head, which run outside it: there `float32` is an error. A
+pipeline that reduces once sums its stages' gradients in float32 either way, as their
+parameters are whole in float32.
 
 XLA:CPU fails to compile a bfloat16 `psum` that a `shard_map`'s transpose makes (its
 reducer ends in a copy, which `ChangeOpDataType` cannot clone), and aborts the process.
@@ -1243,9 +1246,13 @@ The microbatches are the pipeline's: the trainer asks `pipeline.pipelined()`, an
 step does not accumulate gradients over them as well. It gathers the parameters FSDP
 splits once a step, before the ticks (`methods.gather = step`, [above](#gathered-once-reduced-once-methodsgather-methodsaccumulate)),
 in float32, since the ticks add up a stage's gradients in the dtype of what they read;
-`gather=layer` gathers each layer's as it runs, every tick, both ways. The gradients
-still reduce as the backward makes them, every tick: a stage's layers run in the
-pipeline's `shard_map`, which is manual over `stage` alone. With `gpipe` the stacked state
+`gather=layer` gathers each layer's as it runs, every tick, both ways. Where the rows
+are independent, `accumulate=auto` reduces the gradients once too: the trainer says so
+(`gather.apart`), and the pipeline's `shard_map` is then manual over the axes that
+split the rows as well as over `stage`. A stage runs its device's rows alone, each
+tick's gradients stay its own, and the `shard_map`'s transpose sums them over those
+axes once, as they leave it, in float32. Else (`accumulate=reduced`, or an MoE) they
+reduce every tick, as the backward makes them. With `gpipe` the stacked state
 keeps the shapes and the order of `repeat=scan`'s, so a run resumes on another number
 of stages, or on none; `circular` stacks each round's layers as a repeat of its own,
 and resumes as circular with as many rounds.

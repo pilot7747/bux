@@ -201,6 +201,13 @@ def test_each_device_draws_its_own_rows_masks():
             "",
             "gather=step",
         ),
+        (
+            LLAMA,
+            "mesh(stage=2, fsdp=4)",
+            "methods(repeat=scan)",
+            "precision(reduce=float32)",
+            "embedding and head",
+        ),
     ],
 )
 def test_adding_up_unreduced_where_it_would_not_compute_the_same_is_an_error(
