@@ -1887,8 +1887,10 @@ fewer on the last, which runs the head under `1f1b` and `zbh1`. A sharding split
 stacked layers evenly, so each stage holds as many as the most any runs
 (`pipeline.spread`): its own, then copies of its first, which it skips by a
 `lax.cond`. The copies are parameters too, with their optimizer's state, and their
-gradient is 0; a run resumes on the same split only. The split must give every stage
-its passes and sum to the repeat's, in one round, else it is an error that says so.
+gradient is 0; a run resumes on the same split only, and on another it fails at once,
+as its checkpoints keep the split ([Resuming](training.md#resuming)). The split must
+give every stage its passes and sum to the repeat's, in one round, else it is an error
+that says so.
 
 ### Later: DualPipe
 

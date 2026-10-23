@@ -23,6 +23,7 @@ and checkpoints, and sinks for what the hooks return. A script can swap any of t
 import contextlib
 import functools
 import re
+import time
 from collections.abc import Callable, Iterable, Iterator, Mapping, Sequence
 from pathlib import Path
 from typing import Any, NamedTuple, Protocol, runtime_checkable
@@ -735,7 +736,7 @@ def train(
             hooks=[*run_hooks, *hooks],
             sinks=[
                 Console(run.name, config.steps, echo),
-                JSONL(folder / "metrics.jsonl", append=trainer.step > 0),
+                JSONL(folder / "metrics.jsonl", start=trainer.step),
                 latest,
                 *sinks,
             ],
@@ -839,8 +840,12 @@ def _hooks(
         checkpoint = Checkpoint(
             folder / "checkpoints", every=saves.every, keep=saves.keep
         )
+        start = time.perf_counter()
         if checkpoint.restore(trainer):
-            echo(f"{run.name}: resuming at step {trainer.step}")
+            seconds = time.perf_counter() - start
+            echo(
+                f"{run.name}: restored in {seconds:.1f}s, resuming at step {trainer.step}"
+            )
         hooks.append(checkpoint)
     if (trace := config.profile) is not None:
         hooks.append(Profile(folder / "profile", start=trace.start, steps=trace.steps))
