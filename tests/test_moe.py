@@ -336,8 +336,8 @@ def test_an_moe_names_its_experts_and_its_projections():
         state = nnx.state(parallel.build(lambda: MoE(c, 64, nnx.Rngs(0))))
         found = parallel.shardings(state)
     # The experts over `expert` and their hidden units over `tensor`; FSDP splits the
-    # largest dimension left whole.
+    # largest dimension left whole, over `expert` too where no dimension takes it.
     assert found["up"].spec == found["gate"].spec == P("expert", "fsdp", "tensor")
     assert found["down"].spec == P("expert", "tensor", "fsdp")
-    assert found["router"]["kernel"].spec == P("fsdp", None)
-    assert found["to_latent"]["kernel"].spec == P("fsdp", None)
+    assert found["router"]["kernel"].spec == P(("fsdp", "expert"), None)
+    assert found["to_latent"]["kernel"].spec == P(("fsdp", "expert"), None)

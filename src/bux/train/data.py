@@ -5,7 +5,8 @@ document, so one starts wherever they stop increasing) and loss_mask (whether ea
 token is a target). Every source is an endless stream of rows, each epoch in a new
 order. Batch i holds rows i * n to (i + 1) * n of each source, n of them in
 proportion to its weight, so it depends only on the seed and i: a run that resumes
-at step i reads what it would have read had it never stopped.
+at step i reads what it would have read had it never stopped. In a job of many
+processes, each reads only the rows of a batch that its devices hold.
 
 A source is found by its config's type in ``sources``. The trainer reads batches
 through ``prefetch``, which loads the next ones as a step runs.
@@ -24,8 +25,9 @@ from typing import NamedTuple, Protocol, runtime_checkable
 
 import numpy as np
 import pyarrow.parquet as pq
-from jaxtyping import Array, Bool, Int, Int32, Integer
+from jaxtyping import Array, Bool, Int, Int32, Integer, UInt64
 
+from bux import parallel
 from bux.data.pipeline import DEFAULT_CACHE, Job
 from bux.train import config as tcfg
 from bux.train.registry import Registry
@@ -61,6 +63,45 @@ class Source(Protocol):
 def _order(n: int, seed: tuple[int, ...], epoch: int) -> Int[np.ndarray, " n"]:
     """A permutation of range(n), a new one every epoch."""
     return np.random.default_rng((*seed, epoch)).permutation(n)
+
+
+ROUNDS = 4  # a Feistel network's: Luby and Rackoff's bound for a random permutation
+
+
+def permuted(
+    i: Integer[np.ndarray, " k"], n: int, seed: tuple[int, ...]
+) -> Int[np.ndarray, " k"]:
+    """Where a random permutation of range(n), drawn from `seed`, sends each of `i`,
+    without making the permutation: a corpus of 10T tokens has 2.4G windows of 4096.
+
+    A Feistel network permutes the numbers of 2h bits, 4^h >= n, and what it sends past
+    n goes through it again until it lands below n (cycle walking), as grain's
+    index_shuffle does."""
+    half = max(1, ((n - 1).bit_length() + 1) // 2)
+    keys = np.random.SeedSequence(seed).generate_state(ROUNDS, np.uint64)
+    out = _feistel(i.astype(np.uint64), half, keys)
+    while (past := out >= n).any():
+        out[past] = _feistel(out[past], half, keys)
+    return out.astype(np.int64)
+
+
+def _feistel(
+    x: UInt64[np.ndarray, " k"], half: int, keys: UInt64[np.ndarray, " r"]
+) -> UInt64[np.ndarray, " k"]:
+    """A bijection of the numbers of 2 * `half` bits: a round per key, each of which
+    swaps the halves and mixes a hash of one into the other."""
+    bits, mask = np.uint64(half), np.uint64((1 << half) - 1)
+    left, right = x >> bits, x & mask
+    for key in keys:
+        left, right = right, left ^ (_hash(right ^ key) & mask)
+    return (left << bits) | right
+
+
+def _hash(z: UInt64[np.ndarray, " k"]) -> UInt64[np.ndarray, " k"]:
+    """SplitMix64's finalizer: every bit of `z` moves every bit of the hash."""
+    z = (z ^ (z >> np.uint64(30))) * np.uint64(0xBF58476D1CE4E5B9)
+    z = (z ^ (z >> np.uint64(27))) * np.uint64(0x94D049BB133111EB)
+    return z ^ (z >> np.uint64(31))
 
 
 class Prepared:
@@ -145,7 +186,10 @@ class Shards:
         total = int(self.ends[-1])
         epoch, at = np.divmod(np.arange(start, start + n), total)
         windows = np.concatenate(
-            [_order(total, self.seed, int(e))[at[epoch == e]] for e in np.unique(epoch)]
+            [
+                permuted(at[epoch == e], total, (*self.seed, int(e)))
+                for e in np.unique(epoch)
+            ]
         )
         shard = np.searchsorted(self.ends, windows, side="right")
         offset = (windows - self.ends[shard] + self.counts[shard]) * (self.seq_len - 1)
@@ -157,12 +201,18 @@ class Shards:
 
 
 class Synthetic:
+    """Uniformly random tokens, each row of the stream drawn from its own seed, so that
+    a process draws the rows it holds alone."""
+
     def __init__(self, vocab_size: int, seq_len: int, seed: tuple[int, ...]):
         self.vocab_size, self.seq_len, self.seed = vocab_size, seq_len, seed
 
     def rows(self, start: int, n: int) -> Batch:
-        rng = np.random.default_rng((*self.seed, start))
-        return plain(rng.integers(0, self.vocab_size, (n, self.seq_len), np.int32))
+        return plain(np.stack([self._row(r) for r in range(start, start + n)]))
+
+    def _row(self, r: int) -> Int32[np.ndarray, " t"]:
+        rng = np.random.default_rng((*self.seed, r))
+        return rng.integers(0, self.vocab_size, self.seq_len, np.int32)
 
 
 # A source's builder gets its config, the run's settings, the model's vocabulary size,
@@ -258,9 +308,29 @@ def batches(
     cache: str | Path = DEFAULT_CACHE,
     start: int = 0,
     held_out: bool = False,
+    rows: Sequence[int] | Int[np.ndarray, " n"] | None = None,
 ) -> Iterator[Batch]:
     """Yield batches of `config.batch` rows of `config.seq_len` tokens from `data`,
-    from batch `start` on. Held-out batches are drawn independently of training's."""
+    from batch `start` on. Held-out batches are drawn independently of training's.
+
+    Of each batch only `rows` are read, by default those that this process's devices
+    hold (``parallel.local_rows``), every row on one process; the others stay 0."""
+    if rows is None:
+        rows = parallel.local_rows(config.batch, config.seq_len)
+    return _batches(
+        data, config, vocab_size, cache, start, held_out, np.asarray(rows, np.int64)
+    )
+
+
+def _batches(
+    data: tcfg.DataConfig,
+    config: tcfg.TrainConfig,
+    vocab_size: int,
+    cache: str | Path,
+    start: int,
+    held_out: bool,
+    rows: Int[np.ndarray, " n"],
+) -> Iterator[Batch]:
     parts = (
         data.sources
         if isinstance(data, tcfg.MixtureConfig)
@@ -279,9 +349,38 @@ def batches(
         for k, p in enumerate(parts)
     ]
     for i in itertools.count(start):
-        batch = Batch.concat([s.rows(i * n, n) for s, n in zip(streams, counts)])
+        batch = _read(streams, counts, i, rows, config.seq_len)
         if (top := int(batch.input_ids.max())) >= vocab_size:
             raise ValueError(
                 f"token id {top} is outside the vocabulary of {vocab_size}"
             )
         yield batch
+
+
+def _read(
+    streams: Sequence[Source],
+    counts: Sequence[int],
+    i: int,
+    rows: Int[np.ndarray, " n"],
+    seq_len: int,
+) -> Batch:
+    """Batch i, `counts[k]` rows of each stream in turn, of which only `rows` are read;
+    the others stay 0."""
+    shape = (sum(counts), seq_len)
+    batch = Batch(
+        np.zeros(shape, np.int32), np.zeros(shape, np.int32), np.zeros(shape, bool)
+    )
+    first = 0  # the stream's first row in the batch
+    for stream, n in zip(streams, counts, strict=True):
+        own = rows[(first <= rows) & (rows < first + n)] - first
+        for at, m in _runs(own):
+            for whole, part in zip(batch, stream.rows(i * n + at, m), strict=True):
+                whole[first + at : first + at + m] = part
+        first += n
+    return batch
+
+
+def _runs(rows: Int[np.ndarray, " n"]) -> list[tuple[int, int]]:
+    """The runs of consecutive numbers in sorted `rows`: (first, length) of each."""
+    breaks = np.flatnonzero(np.diff(rows) != 1) + 1
+    return [(int(run[0]), len(run)) for run in np.split(rows, breaks) if len(run)]

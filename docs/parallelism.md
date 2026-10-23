@@ -64,12 +64,13 @@ its runs side by side, each on a group of free GPUs, and a run that needs more G
 than there are fails at once. A run alone also trains on many hosts, one process each,
 when Slurm, Open MPI or `JAX_NUM_PROCESSES` say so
 ([Launching](training.md#launching)). The mesh then spans every process's devices,
-and `parallel.shard_batch` builds a batch with `jax.make_array_from_callback`: every
-process makes all of it, as it depends only on the seed and the step, and puts the
-rows its own devices hold, just before the step that reads it (a thread loads the
-next two on the host, `prefetch`). `tests/test_launch.py` trains the smoke run as two
-processes of 4 CPU devices each, through `jax.distributed` on localhost, as one
-process of 8 does.
+each node holding a block of its innermost axes ([Many nodes](#many-nodes)). Each
+process reads the rows of a batch that its devices hold (`parallel.local_rows`), as
+a batch depends only on the seed and the step, and `parallel.shard_batch` puts them
+there with `jax.make_array_from_callback`, just before the step that reads it (a
+thread loads the next two on the host, `prefetch`). `tests/test_launch.py` trains
+the smoke run as two processes of 4 CPU devices each, through `jax.distributed` on
+localhost, as one process of 8 does.
 
 `bux plan` shows what each run takes before it starts: its FLOPs a token
 ([the log](training.md#running)), its GPUs, the bytes of its parameters and of its
@@ -85,6 +86,84 @@ $ bux plan examples/experiments/smoke.bux 'mesh = fsdp: mesh(fsdp=8) | one: mesh
 id          params  tokens  tok/param  flops/tok  gpus  params/gpu  optim/gpu  bubble  run
 bbbf3ae709  156k    25.6k   0.2        1.03M      8     76.2KiB     152KiB     0%      smoke[fsdp]
 bbbf3ae709  156k    25.6k   0.2        1.03M      1     609KiB      1.19MiB    0%      smoke[one]
+```
+
+## Many nodes
+
+```
+mesh = mesh(fsdp=16)            # FSDP over two nodes of 8 GPUs
+mesh = mesh(data=2, fsdp=8)     # HSDP: FSDP within a node, a copy on each
+```
+
+XLA puts the GPUs of a node, or of an NVLink domain that spans nodes, in one slice
+(`slice_index`), and `jax.make_mesh` refuses devices of more than one. So
+`parallel.mesh` lays them out itself (`mesh.grid`), as MaxText's hybrid mesh does: a
+node holds a block of the innermost axes, filled from `tensor` outward, and the axes
+outside it span nodes (`mesh.split`). On nodes of 8, `mesh(data=2, fsdp=8,
+tensor=2)` puts `tensor=2 × fsdp=4` in each, and `data=2 × fsdp=2` across them. A
+mesh that does not fill nodes so, `tensor=3` on nodes of 8, is an error that names the
+axis. Where devices have no slice, as CPUs do, a process is a node.
+
+Each process reads the rows of a batch that its devices hold, and leaves the others 0
+(`parallel.local_rows`): no process reads the whole batch, and no source makes the
+permutation of a whole corpus ([Reading](data.md#reading)).
+`tests/test_nodes.py` checks that processes reading their own rows of every kind of
+source make the batch one process does.
+
+FSDP's axes take `context` and `expert` with `fsdp` (`layout.fsdp`, [How names
+resolve](#how-names-resolve)), so a dense parameter and its Adam state are not copied
+over them; `layout.fsdp = fsdp` takes `fsdp` alone. On 8 CPU devices a dense run and
+an MoE train as one device does on `fsdp=2, context=2, expert=2` and `context=2,
+expert=4`, with no rematerialization in full. On 8 B300s, for the 1.3B dense model of
+[Muon](#muon-methodsorthogonalize) on `fsdp=4, context=2` and its 5.2B MoE on
+`fsdp=2, expert=4` (8 rows of 4096 a GPU, bfloat16), it is a little faster, and it
+halves what the dense model keeps a GPU:
+
+| model, mesh                 | `layout.fsdp = fsdp` | the default  | parameters a GPU |
+|-----------------------------|----------------------|--------------|------------------|
+| dense, `fsdp=4, context=2`  | 886k tok/s           | **903k**     | 1.19 GiB → 611 MiB |
+| MoE, `fsdp=2, expert=4`     | 820k tok/s           | **830k**     | 3.42 GiB → 2.40 GiB |
+
+### The compile cache
+
+The processes of a job must all find a program in JAX's cache, or all compile it: on
+GPUs XLA's autotuner splits its work among the processes that compile a program, and
+each waits for the others' shares (`xla_gpu_shard_autotuning`), so one that compiles
+a program another loads waits a day. Only the first process writes the cache, so they
+agree only where it is one folder for all of them, on a filesystem every host mounts:
+set `JAX_COMPILATION_CACHE_DIR` there. When the processes join,
+`runtime.agree_on_cache` checks that it is, a file the first makes there that the
+others see, and else turns the cache off and says so: each launch then compiles
+everything, together. JAX's `jax_share_binary_between_hosts` hangs the same way (the
+first compiles alone and waits for the others' shares), so bux leaves it off.
+
+### On B300s
+
+NCCL reaches InfiniBand through libibverbs and its mlx5 provider, which the Docker
+image installs. Without them it talks between nodes over TCP sockets: on two B300
+nodes an all-reduce of 64 MiB a GPU across the nodes ran at a bus bandwidth of 1 GB/s,
+and 25 GB/s over InfiniBand (4 and 42 GB/s over all 16 GPUs). `NCCL_DEBUG=INFO`
+says which: `Using network IB`, not `Socket`.
+
+The 1.3B dense model, 8 rows of 4096 a GPU, bfloat16, the cache on a filesystem both
+nodes mount (launch: from its start to the fifth step):
+
+| mesh                         | GPUs | tok/s     | a GPU  | of one node's | launch, cold / warm |
+|------------------------------|------|-----------|--------|---------------|---------------------|
+| `fsdp=8`                     | 8    | 1,133k    | 141.4k |               |                     |
+| `fsdp=16`                    | 16   | 2,220k    | 138.7k | 98.1%         | 78 s / 42 s         |
+| `data=2, fsdp=8` (HSDP)      | 16   | 2,238k    | 139.9k | 98.9%         | 80 s / 42 s         |
+
+Warm, both processes load the train step from the cache (0.3 s, where it compiles in
+16 s); with a cache on each node, which bux turns off, every launch is cold (76 s).
+
+Each host runs one process, the same command, with `JAX_COORDINATOR_ADDRESS` (the
+first host's `ip:port`), `JAX_NUM_PROCESSES` and `JAX_PROCESS_ID`:
+
+```
+JAX_COORDINATOR_ADDRESS=10.0.0.1:12355 JAX_NUM_PROCESSES=2 JAX_PROCESS_ID=0 \
+JAX_COMPILATION_CACHE_DIR=/shared/bux-cache \
+    bux launch bench.bux 'mesh = mesh(data=2, fsdp=8)' --out /shared/runs
 ```
 
 ## Names
@@ -129,9 +208,13 @@ to resolve them. The optimizer's state inherits them from the parameters it trac
    earlier dimension already uses. If their sizes don't divide the dimension (or its
    count), it stays whole: GQA's 2 kv heads under `tensor=4` are replicated, though
    their `2 * k` columns would split 4 ways.
-2. Then FSDP: the largest whole dimension that the `fsdp` size divides splits over
-   `fsdp`, unless a dimension already does. So a layer with no names at all still
-   trains under FSDP; names matter only for TP and EP.
+2. Then FSDP: the largest whole dimension that FSDP's axes divide splits over them,
+   or if none does, over as many of them as one does, from the first. FSDP's axes are
+   `layout.fsdp`, those of `fsdp`, `context` and `expert` that no dimension splits
+   over already: the axes that would copy a dense parameter, but `data`, whose copies
+   are HSDP's. So a layer with no names at all still trains under FSDP, an expert
+   kernel keeps its experts over `expert` and splits over `fsdp` and `context`, and
+   names matter only for TP and EP.
 3. FSDP applies to parameters and the optimizer's state, or with `layout(zero=1)` to
    the optimizer's state alone. Other state, such as RNG state, splits by its names
    alone.
@@ -255,7 +338,7 @@ methods = methods(attention=ring)
 | `xla`     | all t by t logits at once. With `seq` over `context` a device has its queries' rows, and every key and value: all-gather CP |
 | `cudnn`   | cuDNN's fused attention (jax's) on each device's whole rows, documents in its packed layout. bfloat16 or float16, keys' and values' head dims equal and up to 256 (its packed layout gets MLA's wrong); no soft cap, no sinks, no positions over `context` |
 | `tokamax` | tokamax's flash attention, its Mosaic kernels: a document and a window as each query's first key, sinks by the logsumexp. With `seq` over `context`, a device gathers every key and value and attends with its queries in one call: all-gather CP, whose backward pass does every block. Linux only (the `cuda` extra) |
-| `ring`    | every key and value gathered once over `context`, and a flash call (tokamax's; jnp's on a CPU) for each device's block of them, merged by their logsumexps. A block no query sees is skipped: one ahead of them all, or before every query's first key, its document's or its window's. Without documents the queries go zigzag, device `i` holding chunks `i` and `2c-1-i` of `2c`, so that every device attends to as much. The backward pass runs each block's kernel backward with the final output and logsumexp, and reduce-scatters the blocks' gradients |
+| `ring`    | every key and value gathered once over `context`, and a flash call (tokamax's; jnp's on a CPU) for each device's block of them, merged by their logsumexps, a device's own block first, as the others' are gathered. A block no query sees is skipped: one ahead of them all, or before every query's first key, its document's or its window's. Without documents the queries go zigzag, device `i` holding chunks `i` and `2c-1-i` of `2c`, so that every device attends to as much; its own block is then a gathered one. The backward pass runs each block's kernel backward with the final output and logsumexp, and reduce-scatters the blocks' gradients |
 | `ulysses` | all-to-alls over `context`, from a device's positions of every head to every position of its own heads; `auto`'s kernel on those whole rows; and back. `context` must divide a device's heads; kv heads it does not divide are repeated |
 
 What only `xla` has stays in the layer: relative bias, length scale and attention
@@ -360,7 +443,9 @@ With sinks, 243k by `ulysses` (tokamax's kernel), where `auto` took `xla` at 66k
 `ulysses` ran `xla` at 96k, and the `ring` it replaced 75k. In a model `ulysses` is
 the faster even with 45% of the batches past cuDNN's room for documents, which
 tokamax then takes, so `auto` takes it; `ring` stays the method for longer packed
-rows, as at 128k above.
+rows, as at 128k above. That `ring` attends to its own block while the others' are
+gathered changes nothing past the noise in this model (223k on packed documents
+against 225k gathering it first): a layer's gather is short against its attention.
 
 On 8 CPU devices, two windowed GQA layers (4 heads, 2 kv heads) with sinks and a soft
 cap train on packed rows as on one device, to 1e-5 over 3 steps, by every method on
@@ -430,11 +515,11 @@ Constraints:
   table every step. Engram gathers from its table the same way.
 - The logits are `(batch, seq, vocab)`, tied heads too, and the loss reduces over the
   vocabulary where it is: the log-normalizer and the target's logit are all-reduces
-  of `(b, t)`, for the loss, `z_loss` and `mtp` alike. Under `methods(loss=chunks)`
-  (`bux/architecture/logits.py`) they are made a chunk of each device's positions at
-  a time, `(batch, seq, none, vocab)` over the devices' shards; the head's kernel is
-  gathered over `fsdp` once for all the chunks, and each device adds its share of the
-  kernel's gradient up on its own, reduced once after the last chunk.
+  of `(b, t)`, for the loss, `z_loss` and `mtp` alike. By chunks, `methods.loss`'s
+  default (`bux/architecture/logits.py`), they are made a chunk of each device's
+  positions at a time, `(batch, seq, none, vocab)` over the devices' shards; the
+  head's kernel is gathered over `fsdp` once for all the chunks, and each device adds
+  its share of the kernel's gradient up on its own, reduced once after the last chunk.
 - What the embedding, nextn and Engram return is the stream, widened or not, and
   goes through `shard_stream`.
 
@@ -863,56 +948,84 @@ run's id is the same, as `methods` is not in it. A checkpoint therefore resumes 
 with the `repeat` it was saved with; with the other, the restore fails at once and
 says so.
 
-`remat` rematerializes in the backward pass what the forward does not keep, by a
-`jax.checkpoint` policy:
+`remat` rematerializes in the backward pass what the forward does not keep. A policy
+keeps what layers name (`jax.ad_checkpoint.checkpoint_name`), as MaxText's and
+Megatron's selective recomputation do, and the backward computes the rest again:
 
-| method               | what the forward keeps                                     |
-|----------------------|------------------------------------------------------------|
-| `none`               | everything, but in a scanned pass (below); the default     |
-| `full`               | nothing but the input of each branch or pass               |
-| `dots`               | the products of matrices, and `experts`                    |
-| `dots_no_batch`      | the products of matrices without batch dimensions, and `experts` |
-| `save_attention`     | the mixers' outputs, `attention` and `recurrence`          |
-| `save_qkv_attention` | those, and attention's projections, `qkv`                  |
-| `dots_attention`     | `dots_no_batch`'s, the mixers' outputs and `experts`       |
-| `offload_attention`  | the mixers' outputs, in the host's memory                  |
+```
+methods = methods(remat=remat(save=[attention, mlp], first=8))
+```
+
+| setting   | what it is                                                                 |
+|-----------|----------------------------------------------------------------------------|
+| `save`    | the names it keeps on the device                                           |
+| `offload` | the names it moves to the host's memory until the backward reads them     |
+| `first`   | how many passes of each repeat it rematerializes, from the first (of each stage's share, pipelined); the rest keep everything. None: every pass |
+
+| name              | what it is                                                          |
+|-------------------|---------------------------------------------------------------------|
+| `attention.in`    | softmax attention's q, k and v, as its kernel takes them (after RoPE) |
+| `attention.out`   | its output, and what else its backward takes: the log-sum-exp       |
+| `attention.index` | the keys sparse attention's indexer keeps for each query            |
+| `recurrence.in`   | a recurrent mixer's inputs, as its kernel takes them: linear attention, the SSMs, RWKV-7 |
+| `recurrence.out`  | its output, and what else its backward takes: the chunks' states    |
+| `qkv`             | attention's q, k and v projections; MLA's latents                   |
+| `mlp`             | an MLP's up and gate projections                                    |
+| `experts`         | the MoE's grouped products                                          |
+| `dots`            | every product of matrices, MXFP8's and the experts' too             |
+| `dots_no_batch`   | those without batch dimensions                                      |
+
+A name covers those under it, so `attention` is all three of attention's. They are
+names of what layers make, not definitions: `save=[mlp]` is no layer type, and
+`save=[attention]` a list of one. A preset is a policy by name:
+
+| method               | what the forward keeps                           | as data                      |
+|----------------------|--------------------------------------------------|------------------------------|
+| `none`               | everything, but in a scanned pass (below); the default |                        |
+| `full`               | nothing but the input of each branch or pass     | `remat()`                    |
+| `dots`               | the products of matrices                         | `remat(save=dots)`           |
+| `dots_no_batch`      | the products of matrices without batch dimensions | `remat(save=dots_no_batch)` |
+| `save_attention`     | the mixers' kernels' inputs and outputs          | `remat(save=[attention, recurrence])` |
+| `save_qkv_attention` | those, and attention's projections               | `remat(save=[attention, recurrence, qkv])` |
+| `dots_attention`     | `dots_no_batch`'s, the mixers' and the experts'  | `remat(save=[dots_no_batch, attention, recurrence, experts])` |
+| `offload_attention`  | the mixers', in the host's memory                | `remat(offload=[attention, recurrence])` |
 
 Each residual branch outside any other is rematerialized as a whole, with the read
 and write of the residual algebra; a scanned pass is, as one; and nothing inside
-either is again. In a `.bux` file `none` is the null value, so a sweep writes the
-method as a string: `methods.remat = "none" | full`.
-
-The last four keep what layers name (`jax.ad_checkpoint.checkpoint_name`), as
-MaxText's policies do, and so do the dots for the experts: `grouped.ragged_dot` is
-no `dot_general` (on a GPU, a custom VJP over tokamax's kernels), which a policy by
-products of matrices would compute again whole.
-
-| name         | what it is                                                           |
-|--------------|----------------------------------------------------------------------|
-| `attention`  | softmax attention's output, and what its backward takes              |
-| `recurrence` | the same of a recurrent mixer: linear attention, the SSMs, RWKV-7    |
-| `qkv`        | attention's q, k and v projections, MLA's q and kv                   |
-| `mlp`        | an MLP's up and gate projections                                     |
-| `experts`    | the MoE's grouped products                                           |
+either is again. With `first=n`, the first n passes of each repeat are; unrolled, the
+rest keep everything, and scanned, they run in a scan of their own, as `none`'s. In a
+`.bux` file `none` is the null value, so a sweep writes the method as a string:
+`methods.remat = "none" | full`.
 
 What a kernel's backward takes is no product of matrices: flash attention's takes its
 output and log-sum-exp, so under `dots` the backward runs the kernel's forward again.
-`remat.named(name, f, *args)` names f's output and everything its backward takes, so
-that a policy that keeps the name runs none of f twice; attention's method and the
-recurrent mixers' run through it. Another policy is a function:
+`remat.named(name, f, *args)` names f's inputs `name.in` and its output and the rest
+of what its backward takes `name.out`, so that a policy that keeps the name runs none
+of f twice; attention's methods, sparse attention and the recurrent mixers run
+through it. Sparse attention's indexer names the keys it keeps, so that its backward
+neither picks them again nor runs the flash forward again. MLA names its latents, not
+the heads' projections up from them: as in DeepSeek's and Megatron's
+(`mla_up_proj`), a policy that keeps `qkv` projects them up again. `dots` keeps
+MXFP8's GEMMs inside a `shard_map` too, where jax's own policy missed them: in a
+pipeline of 2 B300s (4 microbatches of the dense 1.3B), at the same speed as when it
+ran them again, 155.7k tokens a second, in 53.3 GiB rather than 42.7; `full` trains
+that pipeline at 160k. Another policy is a function, which a name of `methods.remat`
+gives:
 
 ```python
 import jax
 
+from bux.architecture import remat
 from bux.parallel import methods
 
-methods.remat.register("save_mlp")(
-    jax.checkpoint_policies.save_only_these_names("attention", "mlp")
-)
-methods.remat.register("offload")(
+methods.remat.register("save_mlp")(remat.keeping(save=("attention", "mlp")))
+methods.remat.register("offload_dots")(
     jax.checkpoint_policies.offload_dot_with_no_batch_dims("device", "pinned_host")
 )
 ```
+
+jax's own `save_only_these_names` matches names whole, so it takes `attention.out`,
+not `attention`.
 
 A scan keeps every value its backward reads, stacked by pass. Unrolled, XLA fuses the
 elementwise ones into the ops that read them and keeps none: a norm's float32 copy of
@@ -936,7 +1049,8 @@ DeltaNet hybrid (`"DDDA"^4`) and a 64-expert MoE (`E^16`), in bfloat16 on 8 rows
 is still slower: it copies each value it keeps into its stack and back out, where
 unrolled layers read it where it was made, and the more it keeps the more it copies:
 the GDN hybrid's float32 chunk states. On eight, one row each, it is faster, and it
-compiles 2.3 times as fast.
+compiles 2.3 times as fast; with `compiler(preset=maxtext)` the dense scan trains at
+719k, 15% over unrolled ([XLA's options](training.md#xlas-options-compiler)).
 
 On one CPU, for the gradient of a 24-layer Llama's forward (`d_model=64`, 8 rows of
 128 tokens), and for its first training step, which compiles it:
@@ -961,24 +1075,57 @@ On a CPU, attention is `xla`'s, whose backward takes the t by t probabilities: w
 `save_attention` keeps of it is more than `dots` keeps of the whole layer, and a CPU's
 host memory is its device's. On a GPU, flash attention's backward takes q, k, v, the
 output and the log-sum-exp. On a B300, for the dense 1.3B of 16 Llama blocks of width
-2048 (vocabulary 128256, 8 rows of 4096 tokens, `bfloat16`):
+2048 (vocabulary 128256), a Gated DeltaNet hybrid (`"DDDA"^4`) and a 64-expert MoE
+(`E^16`, top 8), in `bfloat16` on 8 rows of 4096 tokens, the loss by chunks, tokens a
+second and the peak memory:
 
-| remat                | tok/s   | peak memory |
-|----------------------|---------|-------------|
-| `none`               | 145,000 | 81.3 GiB    |
-| `dots`               | 134,000 | 69.8 GiB    |
-| `save_attention`     | 132,000 | 61.9 GiB    |
-| `save_qkv_attention` | 130,000 | 61.9 GiB    |
-| `dots_attention`     | 139,000 | 71.8 GiB    |
-| `offload_attention`  | 90,000  | 62.0 GiB    |
+| remat                                        | dense        | GDN          | MoE          |
+|----------------------------------------------|--------------|--------------|--------------|
+| `none`                                       | 139k, 51.1 GiB | 89.1k, 120.9 GiB | 101k, 134.0 GiB |
+| `dots_attention`                             | 137k, 41.6   | 76.9k, 106.9 | 97.2k, 108.4 |
+| `remat(save=[attention, mlp])`               | 135k, 41.6   |              |              |
+| `remat(save=[attention, recurrence.in, mlp])` |             | 74.9k, 41.0  |              |
+| `remat(save=[attention, experts])`           |              |              | 95.9k, 108.3 |
+| `dots`                                       | 128k, 39.5   | 74.0k, 75.7  | 93.7k, 106.4 |
+| `save_attention`                             | 126k, 30.6   | 73.4k, 89.9  | 87.7k, 81.7  |
+| `remat(save=[attention, recurrence.in])`     |              | 71.9k, 31.4  |              |
+| `full`                                       | 120k, 24.5   | 72.7k, 30.3  | 84.2k, 75.8  |
+| `remat(first=8)`, `first=2` for GDN: half the passes | 127k, 37.8 | 79.3k, 73.6 | 90.1k, 104.6 |
+| `remat(save=[attention], first=8)`           | 133k, 40.9   |              |              |
+| `offload_attention`                          | 82.1k, 39.5  |              |              |
 
-`dots` runs flash attention's forward twice, and `save_attention` the matmuls of every
-layer; `dots_attention` runs neither, 4% slower than `none` in 12% less memory.
-`save_qkv_attention` keeps what `save_attention` does here: attention's backward
-takes q, k and v after RoPE, so that only a QK-norm would read the projections.
-Offloading moves more than it saves, at this size. The head's logits are the largest
-part of the rest, which `methods(loss=chunks)` leaves out
-([The trainer's blocks](training.md#the-trainers-blocks)).
+`none` is the fastest, and the default; a policy buys rows. `dots` runs flash
+attention's forward twice, and `save_attention` the matmuls of every layer;
+`dots_attention` runs neither, 2% slower than `none` in 19% less memory on the dense
+model, as does `remat(save=[attention, mlp])`. A GDN layer's recurrence keeps its
+chunks' float32 states (`recurrence.out`), most of what `save_attention` keeps there:
+keeping its inputs alone (`recurrence.in`), whose backward runs the chunked forward
+again, is faster than `save_attention` in less than half its memory. In a Mamba-2
+hybrid (`"MMMA"^4`) too, `recurrence.in` in place of `recurrence` costs 2-3% for 59-68%
+less memory (`save_attention` 78.5k in 99.6 GiB, against 76.4k in 31.7); in a KDA
+hybrid by cuDNN's kernel, which costs more to run again, 7-11%. `first` gives the
+points between: half the passes in full is as fast as `dots` in a little less memory,
+and slower than the policy of names it would match: those keep a layer's costly parts,
+where `first` computes the whole layer again. With more rows a GPU:
+
+| remat                                        | dense                | GDN                 | MoE                |
+|----------------------------------------------|----------------------|---------------------|--------------------|
+| `none`                                       | 56 rows: 146k, 191.2 GiB | 12 rows: 91.0k, 166.2 GiB | 10 rows: 105k, 149.8 GiB |
+| `dots_attention`                             | 48: 147k, 151.6; 64: 145k, 196.7 |         | 12: 102k, 127.5    |
+| `remat(save=[attention, recurrence.in, mlp])` |                     | 32: 79.7k, 110.3    |                    |
+| `save_attention`                             | 96: 138k, 161.7      |                     | 16: 93.8k, 95.8    |
+| `full`                                       | 128: 126k, 113.2     | 32: 76.5k, 67.3     | 16: 89.6k, 83.8    |
+
+Offloading saves nothing unrolled, and costs a third of the speed: XLA schedules
+each layer's copy to the host inside the backward, just before the copy back, so the
+device keeps the value from the forward on as if saved, and the round trip adds a
+buffer (the compiled gradient's temp memory is 17.7 GiB against `save_attention`'s
+13.4, and 1.0 GiB goes to the host); the latency-hiding scheduler compiles the same
+program. Scanned, it works as MaxText's does: the scan stacks each pass's values into
+buffers in the host's memory, 6.0 GiB of them, and the device peaks at 22.3 GiB
+against `save_attention`'s 30.1, at 84k tokens a second against 121k (90k with
+`--xla_gpu_enable_pipelined_host_offloading=true`). `full`, unrolled, peaks at 24.5
+GiB at 120k: on a B300, computing the values again is cheaper than the copies.
 
 `Scanned.layers` holds the stacked passes, and `stacked.run(graphdef, state, times, x,
 taps)` runs any stack of them, such as a pipeline stage's share.
@@ -1011,15 +1158,28 @@ Float32 islands compute from what they are given in float32, and give back its d
 | the MoE's router                                | its logits, scores and top-k, the balance loss and the bias; the weights go back to the stream's dtype |
 | `recurrence`, `delta_rule`, `selective_scan`    | the recurrent state, and its decays               |
 | `rope.rotate`                                   | the rotation                                      |
-| the head                                        | its matmul's accumulation, tied or not, and its log Z and loss; under `methods(loss=chunks)`, its logits |
+| the head                                        | its matmul's accumulation, tied or not, and its log Z and loss; by chunks, the default `methods.loss`, its logits |
 
 Softmax attention takes its softmax in float32, under every method of
 `methods.attention`. Every other matmul runs in `compute`, or in the format of
 `matmuls` (below), and the stream stays in `compute` from the embedding to the heads,
-which `tests/test_precision.py` checks for every family. Gradients are reduced over the
-batch axes in the dtype the backward makes them, bfloat16 for a weight's, but the head
-kernel's under `methods(loss=chunks)`, which adds up over the chunks in float32; they
-add up over microbatches in float32.
+which `tests/test_precision.py` checks for every family.
+
+Gradients add up over microbatches in float32. Over the rows' axes they are reduced in
+`precision.reduce`: `compute`, the default, or `float32`, as Megatron's are. In
+`compute` they are reduced as the backward makes them, bfloat16 for a weight's (but the
+head kernel's by chunks, the default `methods.loss`, which adds up over the chunks in
+float32); where a step adds its gradients up unreduced ([below](#gathered-once-reduced-once-methodsgather-methodsaccumulate)),
+each device's sum is rounded to it before the one reduction. In `float32` that
+reduction sums float32, twice the bytes, once a step; on B300s, through the NICs, a
+step of the dense 1.3B trains 5% slower in it. `float32` changes what a run
+computes, so it is in the run's id, and a run that leaves `compute` keeps the id it
+had. It needs the step to add its gradients up unreduced, also at one microbatch: XLA
+reduces those of the backward in the dtype of the matmul that makes them, as it does
+for a run whose layers learn from the whole batch, such as an MoE's, and for a
+pipeline's embedding and head, which run outside it: there `float32` is an error. A
+pipeline that reduces once sums its stages' gradients in float32 either way, as their
+parameters are whole in float32.
 
 XLA:CPU fails to compile a bfloat16 `psum` that a `shard_map`'s transpose makes (its
 reducer ends in a copy, which `ChangeOpDataType` cannot clone), and aborts the process.
@@ -1122,12 +1282,108 @@ tensor=2`. Dropout's masks and a balance loss over the batch aside, microbatches
 change how a run computes, not what, so they keep its id as the rest of `methods`
 does.
 
-Each microbatch's gradient is a global array, reduced over the batch axes inside the
-scan: under FSDP, a reduce-scatter a microbatch, as ZeRO-3 does. XLA:GPU has a pass
-(while-loop all-reduce code motion) meant to move a data-parallel all-reduce out of
-such a loop, which this has not been run on; XLA:CPU all-reduces n times a step.
 `parallel.microbatches` is there for pipeline parallelism to split its batch the same
 way.
+
+### Gathered once, reduced once: `methods.gather`, `methods.accumulate`
+
+```
+methods = methods(microbatches=8)                                  # reduced once across hosts
+methods = methods(microbatches=8, accumulate=unreduced)            # reduced once
+methods = methods(microbatches=8, accumulate=reduced)              # reduced each microbatch
+methods = methods(microbatches=8, gather=layer, accumulate=reduced)  # ZeRO-3
+```
+
+Every axis is Auto, and XLA does not move a collective out of a loop. Left to it, a
+step of n microbatches under FSDP gathers each layer's parameters as it runs, n times
+forward and, in a scan of layers, n times back, and reduce-scatters the gradients n
+times: what ZeRO-3 does, and `methods(gather=layer, accumulate=reduced)` still does.
+`bux.parallel.gather` does better, in two parts:
+
+- **Gathered once** (`gather=step`, the default). Before the microbatches, each
+  device casts its shards of the parameters to `compute` and gathers them
+  (`gather.whole`: split by their names alone, whole over FSDP's axes), and every
+  microbatch uses that copy. A pipeline's step does the same before its ticks, in
+  float32, as its ticks add up the gradients in the dtype of what they read.
+- **Reduced once** (`accumulate=unreduced`). The gradients add up unreduced, each
+  device's own, and reduce once at the end. JAX types an array that each device holds a
+  part of the sum of, `P(unreduced={...})`, only on Explicit or Manual axes, so the step
+  runs in a `shard_map` manual over the axes that split the rows (`gather.rows`,
+  `data` and `fsdp` by default): each device gathers its shards by `all_gather`, sums
+  the gradients of its rows' microbatches into a float32 copy of every parameter, and a
+  `psum_scatter` keeps its shards of their sum (`gather.scatter`), in
+  `precision.reduce`. Each device folds its index into the RNG keys, so that dropout
+  draws masks for its own rows. The other axes stay Auto inside, and their reductions
+  (over `tensor`, `context`) happen each microbatch.
+
+Inside that `shard_map` a layer sees its device's rows alone, so a layer that learns
+from the whole batch would learn from a part (`trainer.rows_independent`): the MoE's
+router, its bias and its balance loss over the batch. `accumulate=auto`, the default,
+adds up unreduced where the step has microbatches or a pipeline, the devices along the
+rows' axes span more than one process (`gather.rows_span_processes`: their
+reductions go between hosts), its rows are independent and the parameters are
+gathered once; else each microbatch's gradient reduces as the backward makes it,
+onto its shards, which over NVLink is faster (below). `accumulate=unreduced` where it
+would not compute the same is an error that says why.
+
+A step of 8 microbatches then moves what a step of 1 does. In the compiled step of
+`fsdp=8`, each collective counted as many times as the loops around it run
+(`tests/test_gather.py`), for the dense 1.3B of `docs/training.md` on B300s, 64 rows
+of 4096:
+
+| methods                                        | all-gathers     | reduce-scatters |
+|------------------------------------------------|-----------------|-----------------|
+| `microbatches=1`                               | 66, 2.68 GiB    | 9, 2.68 GiB     |
+| `microbatches=8, gather=layer, accumulate=reduced` | 528, 21.5 GiB | 72, 21.5 GiB  |
+| `microbatches=8`                               | 66, 2.68 GiB    | 9, 2.68 GiB     |
+| `repeat=scan, microbatches=8, gather=layer, accumulate=reduced` | 1048, 34.1 GiB | 152, 21.5 GiB |
+| `repeat=scan, microbatches=8`                  | 10, 2.68 GiB    | 7, 2.68 GiB     |
+
+Tokens a second and the peak memory of a GPU, on one node of 8 B300s, the same run,
+20 steps:
+
+| mesh, methods                                      | tok/s | peak     |
+|----------------------------------------------------|-------|----------|
+| `fsdp=8`, `microbatches=1`                         | 1147k | 58.5 GiB |
+| `fsdp=8`, `microbatches=8, gather=layer, accumulate=reduced` | 817k | 11.9 GiB |
+| `fsdp=8`, `microbatches=8, accumulate=reduced`     | 925k  | 11.6 GiB |
+| `fsdp=8`, `microbatches=8`                         | 907k  | 15.7 GiB |
+| `fsdp=8`, `repeat=scan, microbatches=8, gather=layer, accumulate=reduced` | 719k | 10.2 GiB |
+| `fsdp=8`, `repeat=scan, microbatches=8`            | 803k  | 15.7 GiB |
+| `fsdp=2, tensor=4`, `layout(stream=tensor)`, `microbatches=8, gather=layer, accumulate=reduced` | 647k | 11.9 GiB |
+| `fsdp=2, tensor=4`, `layout(stream=tensor)`, `microbatches=8` | 640k | 12.9 GiB |
+| `stage=2, fsdp=4`, `repeat=scan, microbatches=8, gather=layer, accumulate=reduced` | 660k | 88.3 GiB |
+| `stage=2, fsdp=4`, `repeat=scan, microbatches=8, accumulate=reduced` | 640k | 97.8 GiB |
+| `stage=2, fsdp=4`, `repeat=scan, microbatches=8`   | 644k  | 97.8 GiB |
+
+Over NVLink, gathering once is the gain: XLA overlaps a reduce-scatter a microbatch
+with the backward, and adding up unreduced reads and writes a float32 copy of every
+gradient a microbatch, as each device's own. Between nodes the collectives are the
+cost. With NCCL kept off NVLink and shared memory (`NCCL_P2P_DISABLE=1
+NCCL_SHM_DISABLE=1`, and XLA's one-shot all-reduce off), every one goes through the
+NICs, as between nodes:
+
+| mesh, methods                                                      | tok/s |
+|--------------------------------------------------------------------|-------|
+| `fsdp=8`, `microbatches=1`                                         | 1030k |
+| `fsdp=8`, `microbatches=1`, `precision(reduce=float32)`            | 976k  |
+| `fsdp=8`, `microbatches=8, gather=layer, accumulate=reduced`       | 358k  |
+| `fsdp=8`, `microbatches=8, accumulate=reduced`                     | 500k  |
+| `fsdp=8`, `microbatches=8`                                         | 738k  |
+| `fsdp=8`, `microbatches=8`, `precision(reduce=float32)`            | 699k  |
+| `stage=2, fsdp=4`, `repeat=scan, microbatches=8, gather=layer, accumulate=reduced` | 464k |
+| `stage=2, fsdp=4`, `repeat=scan, microbatches=8, accumulate=reduced` | 521k |
+| `stage=2, fsdp=4`, `repeat=scan, microbatches=8`                   | 566k  |
+
+So `gather=step` is the default, and `accumulate=auto` adds up unreduced only where the
+rows' axes span processes, as between nodes. With deterministic GEMMs the three dense runs
+of 8 microbatches on one node end their 10 steps at 11.86792, 11.86793 (`reduced`) and
+11.86804 (`unreduced`).
+
+The cost is memory: the gathered copy of the parameters in `compute`, and, unreduced,
+a float32 sum of every parameter's gradient on each device, held through the step.
+`layout(zero=1)` keeps the parameters whole between steps too; with `gather=step` it
+saves no collective, and holds float32 copies where the step holds `compute`'s.
 
 ### Memory and losses
 
@@ -1236,7 +1492,17 @@ after another, so with one microbatch a pipeline computes what one device does:
 - dropout draws a fresh mask for every microbatch.
 
 The microbatches are the pipeline's: the trainer asks `pipeline.pipelined()`, and a
-step does not accumulate gradients over them as well. With `gpipe` the stacked state
+step does not accumulate gradients over them as well. It gathers the parameters FSDP
+splits once a step, before the ticks (`methods.gather = step`, [above](#gathered-once-reduced-once-methodsgather-methodsaccumulate)),
+in float32, since the ticks add up a stage's gradients in the dtype of what they read;
+`gather=layer` gathers each layer's as it runs, every tick, both ways. Where the rows
+are independent and their axes span processes, `accumulate=auto` (or
+`accumulate=unreduced` anywhere) reduces the gradients once too: the trainer says so
+(`gather.apart`), and the pipeline's `shard_map` is then manual over the axes that
+split the rows as well as over `stage`. A stage runs its device's rows alone, each
+tick's gradients stay its own, and the `shard_map`'s transpose sums them over those
+axes once, as they leave it, in float32. Else (`accumulate=reduced`, or an MoE) they
+reduce every tick, as the backward makes them. With `gpipe` the stacked state
 keeps the shapes and the order of `repeat=scan`'s, so a run resumes on another number
 of stages, or on none; `circular` stacks each round's layers as a repeat of its own,
 and resumes as circular with as many rounds.

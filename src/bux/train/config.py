@@ -311,6 +311,9 @@ class PrecisionConfig(Config):
     type: Literal["precision"] = "precision"
     compute: Literal["float32", "bfloat16"] = "bfloat16"
     matmuls: str = "compute"  # a format of bux.architecture.matmuls: mxfp8, nvfp4
+    # The dtype gradients are summed over the batch's rows in: compute, or float32 as
+    # Megatron's are, which a step sums once (methods.accumulate = unreduced).
+    reduce: Literal["compute", "float32"] = "compute"
 
 
 # --- Parallelism -----------------------------------------------------------------------
@@ -350,12 +353,37 @@ class LayoutConfig(Config):
     latent: Axes = None  # low-rank bottlenecks: MLA, LatentMoE
     layers: Axes = None  # the stacked passes of a scanned repeat
     stages: Axes = "stage"  # those of a pipelined one, a share a stage
+    # What FSDP splits a parameter's largest whole dimension over: the axes that copy
+    # dense parameters but `data`, which HSDP keeps as copies.
+    fsdp: Axes = ("fsdp", "context", "expert")
     zero: Literal[1, 3] = 3  # 1: FSDP splits the optimizer state alone
 
 
 def _named_none(v: object) -> object:
     """A method named none, which a .bux file writes as its none."""
     return "none" if v is None else v
+
+
+def _listed(v: object) -> object:
+    """One name, as a list of one."""
+    return (v,) if isinstance(v, str) else v
+
+
+Names = Annotated[tuple[str, ...], BeforeValidator(_listed)]
+
+
+class RematConfig(Config):
+    """What a rematerialized branch or scanned pass keeps for the backward pass, by the
+    names layers give what they make (bux.architecture.remat); the backward computes
+    the rest again. A preset is a name: save_attention is remat(save=[attention,
+    recurrence])."""
+
+    type: Literal["remat"] = "remat"
+    save: Names = ()  # kept on the device: attention, qkv, mlp, dots, ...
+    offload: Names = ()  # moved to the host's memory until the backward reads them
+    # The passes of each repeat it rematerializes, from the first; the rest keep
+    # everything. None: every pass.
+    first: Annotated[int, Field(ge=0)] | None = None
 
 
 class MethodsConfig(Config):
@@ -365,19 +393,49 @@ class MethodsConfig(Config):
     type: Literal["methods"] = "methods"
     attention: str = "auto"
     moe: str = "sorted"
-    # The rows a device of ragged_all_to_all takes, a multiple of the picks it sends;
-    # what does not fit drops, which `dropped` reports. None: as many as could come.
+    # The picks a device of all_gather or the ragged MoE methods takes, a multiple of
+    # its own; what does not fit drops, which `dropped` reports. None: all that come.
     capacity: Annotated[float, Field(gt=0)] | None = None
     recurrence: str = "scan"
     repeat: str = "unroll"
-    remat: Annotated[str, BeforeValidator(_named_none)] = "none"
+    # A policy by name, or as data: remat(save=[attention], first=8).
+    remat: Annotated[str | RematConfig, BeforeValidator(_named_none)] = "none"
     pipeline: str = "gpipe"
     rounds: Positive = 1  # times a circular pipeline sends a microbatch round
     orthogonalize: str = "owner"  # how Muon reaches whole matrices
-    loss: str = "logits"  # how the loss takes a head's logits: whole, or by chunks
+    loss: str = "chunks"  # how the loss takes a head's logits: by chunks, or whole
     microbatches: Positive = 1
+    # Where a step runs its layers more than once (microbatches, a pipeline's ticks),
+    # it casts and gathers the parameters FSDP splits once, or as each layer runs
+    # (ZeRO-3), which holds one layer's at a time.
+    gather: Literal["step", "layer"] = "step"
+    # How its microbatches' gradients add up: unreduced, each device's own reduced once
+    # a step; or reduced each microbatch. auto: unreduced where the devices along the
+    # rows' axes span more than one process (between hosts), and no layer learns from
+    # the whole batch as an MoE's router does; else reduced.
+    accumulate: Literal["auto", "unreduced", "reduced"] = "auto"
     # A step's new state takes the old one's memory: a lower peak, in fewer pieces.
     donate: bool = True
+
+
+def _flags(options: str) -> str:
+    for option in options.split():
+        if "=" not in option:
+            raise ValueError(f"an option is --name=value, not {option!r}")
+    return options
+
+
+class CompilerConfig(Config):
+    """XLA's options for the training step: a preset's, by name in bux.train.xla, and
+    options of one's own over them. Like the three settings above, it changes how a
+    run computes, not what, and is not in the run's id."""
+
+    type: Literal["compiler"] = "compiler"
+    preset: str = "default"  # XLA's own; o1, lhs, maxtext, collective_matmul
+    # Over the preset's, as XLA_FLAGS writes them: "--xla_gpu_enable_triton_gemm=false
+    # --xla_gpu_threshold_for_windowed_einsum_mib=0". XLA's debug options, and jax's
+    # optimization_level and memory_fitting_level.
+    options: Annotated[str, AfterValidator(_flags)] = ""
 
 
 class TrainConfig(Config):
@@ -402,6 +460,7 @@ class TrainConfig(Config):
     mesh: MeshConfig = MeshConfig()
     layout: LayoutConfig = LayoutConfig()
     methods: MethodsConfig = MethodsConfig()
+    compiler: CompilerConfig = CompilerConfig()
 
 
 # The configs a .bux file calls by name, besides layers and their settings.
@@ -427,7 +486,9 @@ Setting = Annotated[
     | PrecisionConfig
     | MeshConfig
     | LayoutConfig
-    | MethodsConfig,
+    | RematConfig
+    | MethodsConfig
+    | CompilerConfig,
     Field(discriminator="type"),
 ]
 

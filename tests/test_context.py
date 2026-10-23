@@ -12,7 +12,7 @@ import numpy as np
 import optax
 import pytest
 from flax import nnx
-from jax.extend.core import Jaxpr
+from jax.extend.core import Jaxpr, Literal
 from jax.sharding import NamedSharding
 from jax.sharding import PartitionSpec as P
 from jaxtyping import Array, Float, Int
@@ -179,6 +179,40 @@ def test_ring_gathers_the_keys_and_sends_only_zigzag_queries(ids, sends):
     assert text is not None and ("collective-permute" in text) == sends
     gathered = [line for line in text.splitlines() if " all-gather(" in line]
     assert any(" f32[" in line.split("=")[1] for line in gathered)
+
+
+def ungathered_products(jaxpr: Jaxpr, gathered: frozenset = frozenset()) -> int:
+    """Count the matrix products in `jaxpr` and the jaxprs inside it that read no
+    all-gather's result, `gathered` the variables that do as it starts."""
+    tainted, count = set(gathered), 0
+
+    def read(v: object) -> bool:
+        return not isinstance(v, Literal) and v in tainted
+
+    for eqn in jaxpr.eqns:
+        reads = any(map(read, eqn.invars))
+        count += eqn.primitive.name == "dot_general" and not reads
+        for param in eqn.params.values():
+            inner = getattr(param, "jaxpr", param)
+            if isinstance(inner, Jaxpr) and len(inner.invars) == len(eqn.invars):
+                inputs = zip(inner.invars, eqn.invars, strict=True)
+                count += ungathered_products(
+                    inner, frozenset(i for i, o in inputs if read(o))
+                )
+        if reads or eqn.primitive.name == "all_gather":
+            tainted.update(eqn.outvars)
+    return count
+
+
+@pytest.mark.parametrize(("ids", "own"), [(IDS, 2), (None, 0)])
+def test_ring_attends_to_its_own_block_while_the_others_are_gathered(ids, own):
+    """Its logits and weighted values; zigzag, its own block is a gathered one."""
+    q, k, v, sinks, _ = attention(Case(4, 2))
+    seen = Case(4, 2, ids).visibility(sinks)
+    with parallel.use(tcfg.MeshConfig(context=4, fsdp=2)):
+        f = lambda q, k, v: methods.attention.find("ring")(q, k, v, seen)
+        jaxpr = jax.make_jaxpr(f)(q, k, v).jaxpr
+    assert ungathered_products(jaxpr) == own
 
 
 def test_names_inside_a_shard_map_leave_out_the_axes_it_maps():

@@ -3,7 +3,8 @@
 ``run`` scans them by `jax.lax.scan` where a pass leaves the stream and the taps in
 the shapes it found them, and otherwise calls them one at a time. Each pass is
 rematerialized as a whole, as the run's `remat` says, and casts its own parameters to
-the dtype a step computes in (``cast``).
+the dtype a step computes in (``cast``). With the run's `remat(first=n)`, the passes
+after the first n run in a scan of their own, which rematerializes none.
 """
 
 import jax
@@ -37,12 +38,36 @@ def run(
     for i in range(times):
         layer = cast(_at(state, i), compute)
         if i < 2 and (carry := _steady(graphdef, layer, x, taps)) is not None:
-            since = _since(state, i)
-            x, rest = _scan(graphdef, since, times - i, x, taps, carry, compute)
-            return x, _join([*done, rest])
-        x, rest = _layer(graphdef, layer, x, taps)
+            x, scanned = _scans(graphdef, state, (i, times), x, taps, carry, compute)
+            return x, _join([*done, *scanned])
+        with remat.at_pass(i):
+            x, rest = _layer(graphdef, layer, x, taps)
         done.append(jax.tree.map(lambda a: a[None], rest))
     return x, _join(done)
+
+
+def _scans(
+    graphdef: nnx.GraphDef,
+    state: nnx.State,
+    passes: tuple[int, int],
+    x: Stream,
+    taps: Taps,
+    carry: pure.Changes,
+    compute: DTypeLike | None,
+) -> tuple[Stream, list[nnx.State]]:
+    """Scan the layers from `passes[0]` to `passes[1]`, a scan for each run of them
+    that rematerializes alike (``remat.spans``), starting from `carry`."""
+    rests = []
+    for start, stop in remat.spans(*passes):
+        if start > passes[0]:  # from the taps the last scan left
+            again = _steady(graphdef, cast(_at(state, start), compute), x, taps)
+            assert again is not None, "a pass that was steady is still"
+            carry = again
+        with remat.at_pass(start):
+            layers = _between(state, start, stop)
+            x, rest = _scan(graphdef, layers, stop - start, x, taps, carry, compute)
+        rests.append(rest)
+    return x, rests
 
 
 def cast(state: nnx.State, dtype: DTypeLike | None) -> nnx.State:
@@ -65,8 +90,8 @@ def _at(state: nnx.State, i: int) -> nnx.State:
     return jax.tree.map(lambda a: a[i], state)
 
 
-def _since(state: nnx.State, i: int) -> nnx.State:
-    return jax.tree.map(lambda a: a[i:], state)
+def _between(state: nnx.State, start: int, stop: int) -> nnx.State:
+    return jax.tree.map(lambda a: a[start:stop], state)
 
 
 def _join(parts: list[nnx.State]) -> nnx.State:

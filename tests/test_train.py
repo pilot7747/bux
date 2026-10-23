@@ -611,9 +611,10 @@ def test_a_trainer_takes_terms_hooks_and_sinks_of_ones_own():
 
 
 def test_a_step_s_flops_are_counted_from_its_program():
-    """The smoke run's: 6 N of its matrices, and 12 L d t of attention (PaLM's)."""
+    """The smoke run's: 6 N of its matrices, and 12 L d t of attention (PaLM's) times
+    the share of the t × t logits that a causal mask keeps, (t + 1) / 2t."""
     matrices = 2 * (2 * 64 * 64 + 2 * 64 * 32 + 3 * 64 * 256) + 64 * 512
-    attention = 12 * 2 * 64 * 64  # layers, heads × head_dim, positions
+    attention = 12 * 2 * 64 * 64 * 65 / 128  # layers, heads × head_dim, positions
     assert step_flops(smoke()) == (6 * matrices + attention) * 8 * 64
     x, w, sizes = jnp.ones((6, 8)), jnp.ones((3, 8, 5)), jnp.array([1, 2, 3])
     grad = jax.grad(lambda x, w: jax.lax.ragged_dot(x, w, sizes).sum(), (0, 1))

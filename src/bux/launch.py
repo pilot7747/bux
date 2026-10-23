@@ -16,7 +16,8 @@ leaves the others training.
 A run alone trains on many hosts when the environment says so: Slurm's srun, Open
 MPI's mpirun, or JAX_COORDINATOR_ADDRESS, JAX_NUM_PROCESSES and JAX_PROCESS_ID. Its
 processes join through jax.distributed; the first writes the console, status.json and
-the run's files, and all of them write checkpoints.
+the run's files, and all of them write checkpoints. They keep JAX's cache only where
+it is one folder for all of them (``runtime.agree_on_cache``).
 
 A run's directory (``bux.train.trainer``) also keeps a status.json: whether the run is
 running, done, failed or stopped, where, on which GPUs, since when, at what step, and
@@ -60,7 +61,7 @@ from jaxtyping import Array, Int
 from bux import parallel
 from bux.data.pipeline import DEFAULT_CACHE, jobs, prepare
 from bux.lang import ir
-from bux.runtime import configure
+from bux.runtime import agree_on_cache, configure
 from bux.train.config import MeshConfig
 from bux.train.hooks import Hook, Metrics
 from bux.train.sinks import LatestMetrics, is_main_process
@@ -116,7 +117,8 @@ def processes(env: Mapping[str, str] = os.environ) -> int:
 
 
 def join() -> None:
-    """Join the job's other processes through jax.distributed, if there are any.
+    """Join the job's other processes through jax.distributed, if there are any, and
+    keep JAX's cache only if it is one for all of them (``runtime.agree_on_cache``).
 
     Call it before anything touches a device.
     """
@@ -129,6 +131,7 @@ def join() -> None:
         )
     else:
         jax.distributed.initialize()  # from Slurm's or Open MPI's environment
+    agree_on_cache()
 
 
 def _largest(signum: int) -> Int[Array, ""]:
