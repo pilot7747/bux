@@ -1,6 +1,7 @@
 """Runs across nodes: the mesh over several of them, each process's rows of a batch,
 and FSDP over several axes, on the 8 CPU devices the tests have, against one."""
 
+import math
 import os
 import socket
 import subprocess
@@ -8,15 +9,36 @@ import sys
 from pathlib import Path
 from types import SimpleNamespace
 
+import jax
 import numpy as np
 import pytest
 from conftest import corpus
+from flax import nnx
+from jax.sharding import AbstractMesh, AxisType
 
 from bux import parallel
+from bux.architecture import Model
 from bux.data.pipeline import jobs, prepare
+from bux.lang import compile
+from bux.parallel.layout import fsdp
 from bux.parallel.mesh import grid, split
 from bux.train import config as tcfg
 from bux.train.data import batches, permuted
+
+PRELUDE = """
+d_model = 64
+vocab_size = 128
+norm = rmsnorm
+attn = gqa(num_heads=4, num_kv_heads=2, rope=rope())
+ffn = gated_mlp(intermediate_size=256, activation=swish)
+"""
+DENSE = PRELUDE + "block = [norm attn] [norm ffn]\nmodel = embed block^2 norm head"
+MOE = (
+    PRELUDE
+    + "experts = moe(num_experts=8, top_k=2, num_shared_experts=1, "
+    + "expert=gated_mlp(intermediate_size=64, activation=swish))\n"
+    + "model = embed [norm attn] [norm experts] [norm attn] [norm ffn] norm head"
+)
 
 
 def _sizes(per_node: int = 8, nodes: int = 2, **axes: int) -> dict[str, int]:
@@ -191,3 +213,76 @@ def test_processes_find_out_whether_their_cache_is_one_folder(tmp_path):
     assert _asked([tmp_path / "one"] * 2) == ["True", "True"]
     assert not list((tmp_path / "one").iterdir())  # the marker is gone
     assert _asked([tmp_path / "a", tmp_path / "b"]) == ["False", "False"]
+
+
+# --- FSDP over several axes ------------------------------------------------------------
+
+
+def _splits(source: str, layout: tcfg.LayoutConfig, **mesh: int) -> list[tuple]:
+    """Each parameter's names, and the mesh axes each of its dimensions splits over."""
+    arch = compile(source)
+    with parallel.use(tcfg.MeshConfig.model_validate(mesh), layout):
+        params = nnx.state(parallel.build(lambda: Model(arch, rngs=nnx.Rngs(0))))
+        found = parallel.shardings(nnx.state(params, nnx.Param))
+    variables = jax.tree.leaves(nnx.state(params, nnx.Param), is_leaf=_variable)
+    return [
+        (x.get_metadata().get(parallel.NAMES), [_axes(e) for e in s.spec])
+        for x, s in zip(variables, jax.tree.leaves(found), strict=True)
+    ]
+
+
+def _variable(x: object) -> bool:
+    return isinstance(x, nnx.Variable)
+
+
+def _axes(entry: str | tuple[str, ...] | None) -> set[str]:
+    return set() if entry is None else {entry} if isinstance(entry, str) else set(entry)
+
+
+def test_fsdp_splits_dense_parameters_over_context_and_expert_too_and_experts_keep_theirs():
+    mesh = {"fsdp": 2, "context": 2, "expert": 2}
+    for names, axes in _splits(MOE, tcfg.LayoutConfig(), **mesh):
+        if names and names[0] == "experts":
+            assert axes[0] == {"expert"} and {"fsdp", "context"} in axes[1:]
+        elif axes:
+            assert {"fsdp", "context", "expert"} in axes
+    alone = tcfg.LayoutConfig(fsdp="fsdp")
+    assert all(
+        set().union(*axes) <= {"fsdp", "expert"}
+        for _, axes in _splits(MOE, alone, **mesh)
+    )
+
+
+def _fsdp(shape: tuple[int, ...], **mesh: int) -> list[tuple[str, ...]]:
+    """How FSDP splits a parameter of `shape` without names on an abstract `mesh`."""
+    sizes = _sizes(per_node=math.prod(mesh.values()), nodes=1, **mesh)
+    auto = (AxisType.Auto,) * len(parallel.AXES)
+    with parallel.use(
+        AbstractMesh(tuple(sizes.values()), parallel.AXES, axis_types=auto)
+    ):
+        on = parallel.active()
+        assert on is not None
+        return fsdp([()] * len(shape), shape, on, (None,) * len(shape))
+
+
+def test_a_dimension_that_fsdps_axes_do_not_all_divide_splits_over_the_first_few():
+    assert _fsdp((12, 4), fsdp=2, context=2, expert=3) == [
+        ("fsdp", "context", "expert"),
+        (),
+    ]
+    assert _fsdp((12, 6), fsdp=2, context=2, expert=2) == [("fsdp", "context"), ()]
+    assert _fsdp((6, 10), fsdp=2, context=2, expert=2) == [(), ("fsdp",)]
+    assert _fsdp((3, 5), fsdp=2, context=2, expert=2) == [(), ()]
+
+
+@pytest.mark.parametrize(
+    "mesh", ["mesh(fsdp=2, context=2, expert=2)", "mesh(context=2, expert=4)"]
+)
+@pytest.mark.parametrize("source", [DENSE, MOE], ids=["dense", "moe"])
+def test_a_run_whose_fsdp_spans_context_and_expert_trains_as_one_device_does(
+    losses, involuntary, source, mesh
+):
+    one = losses(source, mesh="mesh(data=1)")
+    involuntary()
+    assert np.allclose(losses(source, mesh=mesh), one, atol=1e-5)
+    assert involuntary() == 0

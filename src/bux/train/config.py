@@ -350,6 +350,9 @@ class LayoutConfig(Config):
     latent: Axes = None  # low-rank bottlenecks: MLA, LatentMoE
     layers: Axes = None  # the stacked passes of a scanned repeat
     stages: Axes = "stage"  # those of a pipelined one, a share a stage
+    # What FSDP splits a parameter's largest whole dimension over: the axes that copy
+    # dense parameters but `data`, which HSDP keeps as copies.
+    fsdp: Axes = ("fsdp", "context", "expert")
     zero: Literal[1, 3] = 3  # 1: FSDP splits the optimizer state alone
 
 
