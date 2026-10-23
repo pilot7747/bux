@@ -4,9 +4,14 @@ attends to, and its loss.
 Keys sit in slots along a row, in order, and `order` says which key of its document
 each slot holds (-1 for a slot with none, as between compressed latents). Blocks of
 keys are counted from a document's first key, so none spans two documents.
+
+It scores a chunk of queries at a time (``sparse.chunked``), so that no t by t floats
+are made: it keeps each query's top-k by index (``sparse.Kept``), and its loss scores
+each chunk again.
 """
 
-from typing import Literal, NamedTuple
+from collections.abc import Callable
+from typing import Any, Literal, NamedTuple
 
 import jax
 import jax.numpy as jnp
@@ -18,19 +23,26 @@ from bux import parallel
 from bux.architecture.norm import Norm
 from bux.architecture.rope import rotate
 from bux.architecture.sharding import projection, shard_heads
+from bux.architecture.sparse import Kept, Span, by_rows, chunked, chunks, hits, mask
 
 # DeepSeek-V3.2's indexer keys, projected from the layer's input, are layer-normalized.
 _STREAM_KEY_NORM = cfg.NormalizationConfig(type="layernorm", bias=True)
 
 
-class Scores(NamedTuple):
-    """The indexer's scores and which of them it kept, for its loss: one per key, or
-    with `block` (which block each key is in) one per block of keys, at the block's
-    index."""
+class Scored(NamedTuple):
+    """What the indexer kept by its scores, for its loss to score again: its inputs,
+    the keys it scored (a block's at the block's index), and what it kept of them,
+    by index (-1 for none), with `block` (which block each key is in) blocks."""
 
-    values: Float[Array, "b t n"]
-    kept: Bool[Array, "b t n"]
+    x: Float[Array, "b t d"]
+    query: Float[Array, "b t e"]
+    pos: Int[Array, "b t"]
+    keys: Float[Array, "b s i"]
+    kept: Int[Array, "b t k"]
     block: Int[Array, "b s"] | None = None
+
+
+Target = Callable[[Any], Float[Array, "b c s"]]  # a chunk's attention to the keys
 
 
 def _kl(
@@ -73,40 +85,36 @@ def _per_block(
     return jax.vmap(row)(values, block)
 
 
-def _spread(
-    per: Shaped[Array, "b t n"], block: Int[Array, "b s"]
-) -> Shaped[Array, "b t s"]:
-    """Return, for each slot, what its block has."""
-    b, t, _ = per.shape
-    index = jnp.broadcast_to(block[:, None], (b, t, block.shape[1]))
-    return jnp.take_along_axis(per, index, axis=-1)
+def _top(scores: Float[Array, "b t n"], top_k: int) -> Int[Array, "b t k"]:
+    """Return the indices of each query's top_k highest scores, of those above -inf,
+    and -1 past them; of equal ones, the first. By each device's rows: lax.top_k
+    gathers every row onto each device otherwise."""
+    k = min(top_k, scores.shape[-1])
+
+    def top(scores: Float[Array, "b t n"]) -> Int[Array, "b t k"]:
+        values, index = jax.lax.top_k(scores, k)
+        return jnp.where(values > -jnp.inf, index, -1)
+
+    return by_rows(top, scores)
 
 
-def _top(scores: Float[Array, "b t n"], top_k: int) -> Bool[Array, "b t n"]:
-    """Return each query's top_k highest scores, of those above -inf; of equal ones, the
-    first."""
-    n = scores.shape[-1]
-    if min(top_k, n) == 0:
-        return jnp.zeros(scores.shape, bool)
-    # A stable sort and a scatter mapped over rows split with the rows; lax.top_k and
-    # a scatter at broadcast indices gather every row onto each device.
-    index = jnp.argsort(-scores, axis=-1, stable=True)[..., : min(top_k, n)]
-
-    def pick(top: Int[Array, " top_k"]) -> Bool[Array, " n"]:
-        return jnp.zeros(n, bool).at[top].set(True)
-
-    return jax.vmap(jax.vmap(pick))(index) & (scores > -jnp.inf)
+def _newest(seen: Bool[Array, "b t s"], block: Int[Array, "b s"]) -> Int[Array, "b t"]:
+    """Return the block of the newest key each query sees; -1 for a query that sees
+    none."""
+    s = seen.shape[-1]
+    last = jnp.argmax(jnp.where(seen, jnp.arange(s), -1), axis=-1)
+    return jnp.where(seen.any(-1), jnp.take_along_axis(block, last, axis=1), -1)
 
 
-def _newest(
-    mask: Bool[Array, "b t s"], block: Int[Array, "b s"]
-) -> Bool[Array, "b t s"]:
-    """Return whether each block (at its index) holds the newest key `mask` keeps for
-    each query."""
-    s = mask.shape[-1]
-    last = jnp.argmax(jnp.where(mask, jnp.arange(s), -1), axis=-1)
-    newest = jnp.take_along_axis(block, last, axis=1)
-    return (jnp.arange(s) == newest[..., None]) & mask.any(-1, keepdims=True)
+def _positions(
+    pos: Int[Array, "b t"] | None, x: Float[Array, "b t d"]
+) -> Int[Array, "b t"]:
+    """Return the positions, those of the row's slots if none are given: a chunk of
+    queries is not the first of the row."""
+    if pos is not None:
+        return pos
+    b, t, _ = x.shape
+    return jnp.broadcast_to(jnp.arange(t, dtype=jnp.int32), (b, t))
 
 
 class Indexer(nnx.Module):
@@ -205,61 +213,98 @@ class Indexer(nnx.Module):
         query: Float[Array, "b t e"],
         pos: Int[Array, "b t"] | None,
         keys: Float[Array, "b s i"],
-        mask: Bool[Array, "b t s"],
+        span: Span,
         order: Int[Array, "b s"],
-        candidates: Bool[Array, "b t s"] | None = None,
+        candidates: Kept | None = None,
         export_candidates: bool = False,
-    ) -> tuple[Bool[Array, "b t s"], Bool[Array, "b t s"] | None, Scores]:
-        """Return the keys each query keeps, of those `mask` and the `candidates` (if
-        given) allow; the candidate pool, if asked for; and the scores."""
-        if candidates is not None:
-            mask = mask & candidates
+    ) -> tuple[Kept, Kept | None, Scored]:
+        """Return the keys each query keeps, of those of its `span` and the
+        `candidates` (if given); the candidate pool, if asked for; and what it
+        scored."""
+        x, query = jax.lax.stop_gradient((x, query))
+        pos = _positions(pos, x)
         if self.block_size > 1:
-            keep_mask, scored = self._blocks(x, query, pos, keys, mask, order)
-            return keep_mask, None, scored
-        scores = self.scores(x, query, pos, keys)
-        ranked = jnp.where(mask, jax.lax.stop_gradient(scores), -jnp.inf)
-        keep_mask = _top(ranked, self.top_k)
-        pool = self._candidates(ranked, order) if export_candidates else None
-        return keep_mask, pool, Scores(scores, keep_mask)
+            kept, scored = self._blocks(x, query, pos, keys, span, order)
+            return kept, None, scored
+        s, exists = keys.shape[1], order >= 0
+        ranked_keys = jax.lax.stop_gradient(keys)
+        pooled = _groups(order, self.candidate_block_size)
+        among = None if candidates is None else candidates.block
+
+        def pick(xs: tuple) -> tuple[Int[Array, "b c k"], Int[Array, "b c p"] | None]:
+            x, query, pos, span, index = xs
+            inside = None if index is None else Kept(index, among)
+            seen = mask(span, s, exists, inside)
+            ranked = jnp.where(seen, self.scores(x, query, pos, ranked_keys), -jnp.inf)
+            if not export_candidates:
+                return _top(ranked, self.top_k), None
+            return _top(ranked, self.top_k), self._candidates(ranked, pooled)
+
+        index = None if candidates is None else candidates.index
+        xs = (x, query, pos, span, index)
+        index, best = chunked(pick, xs, chunks(x.shape[1], (self.heads + 1) * s))
+        pool = None if best is None else Kept(best, pooled)
+        return Kept(index), pool, Scored(x, query, pos, keys, index)
 
     def loss(
-        self, scores: Scores, attention: Float[Array, "b t s"]
+        self, scored: Scored, target: Target, xs: Any, width: int
     ) -> Float[Array, ""]:
         """Return KL(p || softmax(I)) over what the indexer kept, averaged over the
-        queries (DeepSeek-V3.2, eq. 4): I its scores, and p the `attention` summed over
-        heads and normalized over the kept keys. A block's p is its most attended key's
-        (Qwen3.8 QSA, eqs. 17 and 20)."""
-        p = jax.lax.stop_gradient(attention.astype(jnp.float32))
-        if scores.block is not None:
-            p = _per_block(p, scores.block, "max")
-        return _kl(p, scores.values.astype(jnp.float32), scores.kept).mean()
+        queries (DeepSeek-V3.2, eq. 4): I its scores, and p the attention summed over
+        heads and normalized over the kept keys, which `target` gives for a chunk of
+        `xs` (arrays of (b, t, ...)), `width` elements a query. A block's p is its most
+        attended key's (Qwen3.8 QSA, eqs. 17 and 20). It scores each chunk of
+        queries again, and so does its backward pass."""
+        n = scored.keys.shape[1]
+
+        def kl(both: tuple) -> Float[Array, "b c"]:
+            (x, query, pos, kept), xs = both
+            p = jax.lax.stop_gradient(target(xs).astype(jnp.float32))
+            if scored.block is not None:
+                p = _per_block(p, scored.block, "max")
+            scores = self.scores(x, query, pos, scored.keys).astype(jnp.float32)
+            return _kl(p, scores, hits(kept, n))
+
+        own = (scored.x, scored.query, scored.pos, scored.kept)
+        count = chunks(scored.x.shape[1], max(self.heads * n, width))
+        return chunked(jax.checkpoint(kl), (own, xs), count).mean()
 
     def _blocks(
         self,
         x: Float[Array, "b t d"],
         query: Float[Array, "b t e"],
-        pos: Int[Array, "b t"] | None,
+        pos: Int[Array, "b t"],
         keys: Float[Array, "b s i"],
-        mask: Bool[Array, "b t s"],
+        span: Span,
         order: Int[Array, "b s"],
-    ) -> tuple[Bool[Array, "b t s"], Scores]:
+    ) -> tuple[Kept, Scored]:
         """Keep whole blocks of block_size keys: the top_k // block_size best of those
-        `mask` keeps all of, and the masked-in keys of the query's own block until it
-        is complete. Return the keep mask and the blocks' scores."""
-        block = _groups(order, self.block_size)
-        counts = _per_block(mask.astype(jnp.int32), block, "sum")
-        full = counts == self.block_size
-        scores = self.scores(x, query, pos, self._block_keys(keys, pos, order, block))
-        ranked = jnp.where(full, jax.lax.stop_gradient(scores), -jnp.inf)
-        picked = _top(ranked, self.top_k // self.block_size)
-        keep_mask = _spread(picked | (_newest(mask, block) & ~full), block) & mask
-        return keep_mask, Scores(scores, picked, block)
+        the span has all of, and the span's keys of the query's own block until it is
+        complete. Return them, and what it scored."""
+        s, size = keys.shape[1], self.block_size
+        block = _groups(order, size)
+        block_keys = self._block_keys(keys, pos, order, block)
+        exists, ranked_keys = order >= 0, jax.lax.stop_gradient(block_keys)
+
+        def pick(xs: tuple) -> tuple[Int[Array, "b c k"], Int[Array, "b c"]]:
+            x, query, pos, span = xs
+            seen = mask(span, s, exists)
+            full = _per_block(seen.astype(jnp.int32), block, "sum") == size
+            scores = self.scores(x, query, pos, ranked_keys)
+            picked = _top(jnp.where(full, scores, -jnp.inf), self.top_k // size)
+            own = _newest(seen, block)
+            unfinished = ~jnp.take_along_axis(full, jnp.maximum(own, 0)[..., None], -1)
+            return picked, jnp.where(unfinished[..., 0], own, -1)
+
+        xs = (x, query, pos, span)
+        picked, own = chunked(pick, xs, chunks(x.shape[1], (self.heads + 2) * s))
+        kept = Kept(jnp.concatenate([picked, own[..., None]], -1), block)
+        return kept, Scored(x, query, pos, block_keys, picked, block)
 
     def _block_keys(
         self,
         keys: Float[Array, "b s i"],
-        pos: Int[Array, "b s"] | None,
+        pos: Int[Array, "b s"],
         order: Int[Array, "b s"],
         block: Int[Array, "b s"],
     ) -> Float[Array, "b s i"]:
@@ -269,24 +314,21 @@ class Indexer(nnx.Module):
         exists = (order >= 0)[:, None, :]
         sums = _per_block(keys.transpose(0, 2, 1) * exists, block, "sum")
         means = self.k_norm(sums.transpose(0, 2, 1) / self.block_size)
-        if pos is None:
-            pos = jnp.broadcast_to(jnp.arange(order.shape[1]), order.shape)
         first = jnp.where(_starts(order, self.block_size), pos, 0)[:, None]
         first = _per_block(first, block, "sum")[:, 0]
         return self._rotate(means[:, :, None], first)[:, :, 0]
 
     def _candidates(
-        self, scores: Float[Array, "b t s"], order: Int[Array, "b s"]
-    ) -> Bool[Array, "b t s"]:
-        """Return the candidate pool: the candidate_top_k best blocks of
-        candidate_block_size keys, each scored by its best key, and always the block of
-        the newest key a query may attend to, which may not be full yet."""
-        block = _groups(order, self.candidate_block_size)
-        mask = scores > -jnp.inf
-        best = jnp.where(
-            _newest(mask, block), jnp.inf, _per_block(scores, block, "max")
-        )
-        return _spread(_top(best, self.candidate_top_k), block) & mask
+        self, ranked: Float[Array, "b t s"], block: Int[Array, "b s"]
+    ) -> Int[Array, "b t p"]:
+        """Return the candidate pool, by index: the candidate_top_k best of the
+        `block`s of candidate_block_size keys, each scored by its best key, and always
+        the block of the newest key a query may attend to, which may not be full
+        yet."""
+        s = ranked.shape[-1]
+        newest = jnp.arange(s) == _newest(ranked > -jnp.inf, block)[..., None]
+        best = jnp.where(newest, jnp.inf, _per_block(ranked, block, "max"))
+        return _top(best, self.candidate_top_k)
 
     def _rotate(
         self, x: Float[Array, "b t h i"], pos: Int[Array, "b t"] | None
