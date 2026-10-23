@@ -1,6 +1,7 @@
-"""The heads' losses a chunk of positions at a time (bux.architecture.logits), against
-the reference cross-entropy of whole logits: values and gradients, on one device and
-split over the 8 CPU devices the tests have, and the memory they leave."""
+"""The heads' losses by each method of `methods.loss` (bux.architecture.logits), the
+logits whole and by chunks of positions, against the reference cross-entropy: values
+and gradients, on one device and split over the 8 CPU devices the tests have, and the
+memory chunks leave."""
 
 from collections.abc import Callable
 
@@ -49,6 +50,8 @@ HEADS = {
 LOSS = tcfg.LossConfig(z=1e-2, mtp=0.5)
 CHUNK = 4 * 256 * 8  # bytes of float32 logits: 8 positions of 256 a chunk
 MESHES = ["mesh(tensor=2, fsdp=4)", "mesh(data=2, context=2, tensor=2)"]
+LOSSES = ["logits", "chunks"]
+ONE = "mesh(data=1)"
 Loss = Callable[[Model, Batch], Float[Array, ""]]
 
 
@@ -110,8 +113,10 @@ def _assert_close(a, b) -> None:
         np.testing.assert_allclose(np.asarray(x), np.asarray(y), rtol=1e-4, atol=1e-6)
 
 
-def _use(mesh: str):
-    [run] = compile_runs(PRELUDE + MTP + "out = head\n" + TRAIN + f"mesh = {mesh}")
+def _use(mesh: str, loss: str):
+    """`parallel.use`, on `mesh`, the loss by the method `loss`."""
+    settings = f"mesh = {mesh}\nmethods = methods(loss={loss})\n"
+    [run] = compile_runs(PRELUDE + MTP + "out = head\n" + TRAIN + settings)
     t = run.train
     return parallel.use(t.mesh, t.layout, t.methods)
 
@@ -119,24 +124,29 @@ def _use(mesh: str):
 # --- Against the reference --------------------------------------------------------------
 
 
+@pytest.mark.parametrize("loss", LOSSES)
 @pytest.mark.parametrize("head", HEADS)
-def test_the_loss_and_its_gradients_are_the_reference_cross_entropy(chunked, head):
+def test_the_loss_and_its_gradients_are_the_reference_cross_entropy(
+    chunked, head, loss
+):
     arch, batch = _arch(HEADS[head]), _batch()
     assert logits.Chunks.of(8, 16, 256).count == 16
     model = Model(arch, rngs=nnx.Rngs(0))
-    fused = _value_and_grads(_fused(arch), model, batch)
+    with _use(ONE, loss):
+        fused = _value_and_grads(_fused(arch), model, batch)
     _assert_close(fused, _value_and_grads(_reference(arch), model, batch))
 
 
+@pytest.mark.parametrize("loss", LOSSES)
 @pytest.mark.parametrize("mesh", MESHES)
 @pytest.mark.parametrize("head", ["bias_softcap", "tied_bias_softcap"])
 def test_the_loss_split_over_devices_is_the_one_device_loss(
-    chunked, involuntary, head, mesh
+    chunked, involuntary, head, mesh, loss
 ):
     arch, batch = _arch(HEADS[head]), _batch()
     one = _value_and_grads(_fused(arch), Model(arch, rngs=nnx.Rngs(0)), batch)
     involuntary()
-    with _use(mesh):
+    with _use(mesh, loss):
         model = parallel.build(lambda: Model(arch, rngs=nnx.Rngs(0)))
         split = _value_and_grads(_fused(arch), model, parallel.shard_batch(batch))
     _assert_close(split, one)
@@ -158,7 +168,7 @@ def test_a_term_that_reads_the_logits_makes_them_once():
 # --- Memory -----------------------------------------------------------------------------
 
 
-def test_the_loss_leaves_a_fraction_of_the_logits_memory(monkeypatch):
+def test_chunks_leave_a_fraction_of_the_logits_memory(monkeypatch):
     """At 8 rows of 128 positions and a vocabulary of 8192, the logits take 32 MiB."""
     monkeypatch.setattr(logits, "CHUNK_BYTES", 2**21)  # 16 chunks
     source = PRELUDE.replace("256", "8192")
@@ -166,15 +176,16 @@ def test_the_loss_leaves_a_fraction_of_the_logits_memory(monkeypatch):
     model = Model(arch, rngs=nnx.Rngs(0))
     batch = _batch(8, 128)
 
-    def temp(loss: Loss) -> int:
+    def temp(method: str) -> int:
         graphdef, params, rest = nnx.split(model, nnx.Param, ...)
 
         def of(params: nnx.State) -> Float[Array, ""]:
-            return loss(nnx.merge(graphdef, params, rest), batch)
+            return _fused(arch)(nnx.merge(graphdef, params, rest), batch)
 
-        compiled = jax.jit(jax.grad(of)).lower(params).compile()
+        with _use(ONE, method):
+            compiled = jax.jit(jax.grad(of)).lower(params).compile()
         memory = compiled.memory_analysis()
         assert memory is not None
         return memory.temp_size_in_bytes
 
-    assert temp(_fused(arch)) < 0.25 * temp(_reference(arch))
+    assert temp("chunks") < 0.25 * temp("logits")

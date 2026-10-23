@@ -1,14 +1,24 @@
-"""A head's logits, made a chunk of positions at a time.
+"""A head's output, and the two ways the loss takes its logits: `methods.loss`.
+
+A head leaves the objective its input and its projection (``HeadOutput``) rather
+than its logits, and the loss takes log Z and the target's logit at every position
+from them (``HeadOutput.scores``), by the run's method:
+
+    logits   one matmul for all positions, the logits whole in the stream's dtype:
+             the fastest, the default
+    chunks   the matmul, the logsumexp and the target's logit a chunk of positions at
+             a time, in float32, as Liger's and Apple's Cut Cross-Entropy do: the
+             backward makes each chunk's logits again
 
 At a vocabulary of 128K, the float32 logits of 8 rows of 4096 tokens take 16 GB, and
-their gradient as much again. So a head leaves the objective its input and its
-projection (``HeadOutput``), and ``HeadOutput.scores`` takes them through the matmul,
-the logsumexp and the target's logit a chunk of positions at a time, as Liger's and
-Apple's Cut Cross-Entropy do: the backward makes each chunk's logits again.
+their gradient as much again; by chunks, each device takes its own positions in
+chunks of at most `CHUNK_BYTES` of logits, which split over `vocab` as whole logits
+would, and adds up its share of the head's gradient in float32, which the mesh
+reduces once, after the last chunk. Another method is a function of the head's
+output and the targets that returns their `Scores`:
 
-Each device takes its own positions in chunks of at most `CHUNK_BYTES` of logits,
-which split over `vocab` as whole logits would, and adds up its share of the head's
-gradient in float32, which the mesh reduces once, after the last chunk.
+    @methods.loss.register("mine")
+    def _(head: HeadOutput, targets: Int[Array, "b t"]) -> Scores: ...
 """
 
 import math
@@ -16,41 +26,47 @@ from typing import NamedTuple
 
 import jax
 import jax.numpy as jnp
+from jax.typing import DTypeLike
 from jaxtyping import Array, Bool, Float, Int, Shaped
 
 from bux import parallel
+from bux.parallel import methods
 
 CHUNK_BYTES = 2**31  # of float32 logits that a device makes at once
 
 
 class Projection(NamedTuple):
-    """A head's map from the stream to logits, softcap(x W + b): float32, from a
-    matmul in the stream's dtype. A tied head's W is the embedding's table,
+    """A head's map from the stream to logits, softcap(x W + b), from a matmul in the
+    stream's dtype accumulated in float32. A tied head's W is the embedding's table,
     transposed. The softcap is an array, so that jax's transforms pass it through."""
 
     kernel: Float[Array, "d vocab"]
     bias: Float[Array, " vocab"] | None
     softcap: Float[Array, ""] | None
 
-    def __call__(self, x: Float[Array, "*n d"]) -> Float[Array, "*n vocab"]:
-        bias = None if self.bias is None else self.bias.astype(jnp.float32)
-        return self.finish(self.matmul(x), bias)
+    def __call__(
+        self, x: Float[Array, "*n d"], dtype: DTypeLike = jnp.float32
+    ) -> Float[Array, "*n vocab"]:
+        """Return the logits of `x`, in `dtype`."""
+        return self.finish(self.matmul(x, dtype), self.bias)
 
-    def matmul(self, x: Float[Array, "*n d"]) -> Float[Array, "*n vocab"]:
-        """Return x W, accumulated and given in float32."""
-        return jnp.einsum(
-            "...d,dv->...v", x, self.kernel, preferred_element_type=jnp.float32
-        )
+    def matmul(
+        self, x: Float[Array, "*n d"], dtype: DTypeLike = jnp.float32
+    ) -> Float[Array, "*n vocab"]:
+        """Return x W, accumulated in float32 and given in `dtype`."""
+        dims = (((x.ndim - 1,), (0,)), ((), ()))
+        return jax.lax.dot_general(x, self.kernel, dims, preferred_element_type=dtype)
 
     def finish(
         self, raw: Float[Array, "*n vocab"], bias: Float[Array, " vocab"] | None
     ) -> Float[Array, "*n vocab"]:
-        """Return the logits of x W: plus the bias, in float32, softcapped. The
-        backward of ``scores`` differentiates it by jax, so another needs none."""
-        logits = raw if bias is None else raw + bias
+        """Return the logits of x W: plus the bias, softcapped, in x W's dtype. The
+        backward of `chunks` differentiates it by jax, so another needs none."""
+        logits = raw if bias is None else raw + bias.astype(raw.dtype)
         if self.softcap is None:
             return logits
-        return self.softcap * jnp.tanh(logits / self.softcap)
+        cap = self.softcap.astype(raw.dtype)
+        return cap * jnp.tanh(logits / cap)
 
 
 class Scores(NamedTuple):
@@ -64,7 +80,7 @@ class Scores(NamedTuple):
     def of(
         cls, logits: Float[Array, "b t vocab"], targets: Int[Array, "b t"]
     ) -> "Scores":
-        """Return the scores of logits given whole."""
+        """Return the scores of logits given whole, in float32."""
         logits = logits.astype(jnp.float32)
         return cls(jax.nn.logsumexp(logits, -1), _pick(logits, targets))
 
@@ -76,12 +92,25 @@ class HeadOutput(NamedTuple):
     projection: Projection
 
     def logits(self) -> Float[Array, "b t vocab"]:
-        """Return the logits, all at once, in float32."""
-        return parallel.shard(self.projection(self.hidden), "batch", "seq", "vocab")
+        """Return the logits, all at once, in the stream's dtype."""
+        logits = self.projection(self.hidden, self.hidden.dtype)
+        return parallel.shard(logits, "batch", "seq", "vocab")
 
     def scores(self, targets: Int[Array, "b t"]) -> Scores:
-        """Return the scores of `targets` at each position, a chunk at a time."""
-        return Scores(*_scores(self.projection, self.hidden, targets))
+        """Return the scores of `targets` at each position, by `methods.loss`."""
+        return parallel.method("loss")(self, targets)
+
+
+@methods.loss.register("logits")
+def by_logits(head: HeadOutput, targets: Int[Array, "b t"]) -> Scores:
+    """Score the head's logits made whole, as a term that reads them makes them."""
+    return Scores.of(head.logits(), targets)
+
+
+@methods.loss.register("chunks")
+def by_chunks(head: HeadOutput, targets: Int[Array, "b t"]) -> Scores:
+    """Score the head's logits a chunk of each device's positions at a time."""
+    return Scores(*_scores(head.projection, head.hidden, targets))
 
 
 def _pick(

@@ -33,7 +33,7 @@ Metrics = dict[str, Float[Array, ""]]  # what a step measured, still on the devi
 Output = HeadOutput | Float[Array, "b t vocab"]  # a head's output, or its logits
 
 
-class Heads(Sequence[Float[Array, "b t vocab"]]):
+class Heads(Sequence):  # not Sequence[Array]: a type checker would read an item
     """Every head's logits on `batch`, in execution order, each made once a term
     reads it. `scores` gives a head's cross-entropy what it takes, without them."""
 

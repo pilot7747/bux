@@ -143,7 +143,7 @@ def test_a_bfloat16_forward_keeps_the_stream_in_bfloat16(family):
     heads = forward(model, _batch())
     assert all(head.hidden.dtype == jnp.bfloat16 for head in heads)
     assert all(head.projection.kernel.dtype == jnp.bfloat16 for head in heads)
-    assert all(head.logits().dtype == jnp.float32 for head in heads)
+    assert all(head.logits().dtype == jnp.bfloat16 for head in heads)
 
 
 ISLANDS = (
