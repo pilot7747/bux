@@ -1,3 +1,5 @@
+from typing import Literal
+
 import jax
 import jax.numpy as jnp
 import numpy as np
@@ -129,6 +131,38 @@ def test_the_delta_rule_decays_then_moves_the_state_toward_v_at_k():
         state = state + k[:, i, ..., None] * step[:, :, None, :]
         expected = jnp.einsum("bhk,bhkv->bhv", q[:, i], state)
         assert jnp.allclose(o[:, i], expected, atol=1e-5)
+
+
+def _kept_bytes(
+    decay: int, states: Literal["recompute", "keep"]
+) -> tuple[int, int, int]:
+    """What the delta rule's backward pass keeps under `methods(states=...)`, and
+    the bytes of its inputs and of an inverse of each chunk of 64."""
+    b, t, h, d = 1, 256, 2, 128
+    ks = jax.random.split(jax.random.key(0), 5)
+    q, k, v = (jax.random.normal(key, (b, t, h, d), jnp.bfloat16) for key in ks[:3])
+    g = -jax.random.uniform(ks[3], (b, t, h, decay))
+    beta = jax.nn.sigmoid(jax.random.normal(ks[4], (b, t, h)))
+    xs = (q, k, v, g, beta)
+
+    def kept(*xs: jax.Array) -> list[jax.Array]:
+        return jax.tree.leaves(jax.vjp(lambda *x: delta_rule(*x, None), *xs)[1])
+
+    methods = tcfg.MethodsConfig(states=states)
+    with parallel.use(tcfg.MeshConfig(data=1), methods=methods):
+        shapes = jax.eval_shape(kept, *xs)
+    inputs = sum(x.nbytes for x in xs) + b * t * 4  # and where documents continue
+    return sum(x.size * x.dtype.itemsize for x in shapes), inputs, b * h * t * 64 * 4
+
+
+@pytest.mark.parametrize("decay", [1, 128], ids=["gdn", "kda"])
+def test_the_delta_rule_recomputed_keeps_its_inputs_and_each_chunks_inverse(decay):
+    """What its backward pass keeps with `states=recompute`: q, k, v, the log decay
+    and beta, where they come in, and each chunk's inverse; and by default, with
+    `states=keep`, also the chunks' states and maps, which recompute computes again."""
+    recomputed, inputs, inverses = _kept_bytes(decay, "recompute")
+    assert recomputed <= inputs + inverses
+    assert _kept_bytes(decay, "keep")[0] > 10 * recomputed
 
 
 def test_decayed_linear_attention_is_the_parallel_masked_decay_form():

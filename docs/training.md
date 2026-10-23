@@ -418,9 +418,10 @@ by itself where it cannot run, and all of them do inside `bux.kernels.off()` or 
 |------|----|------------------------|
 | softmax attention | `methods.attention = auto`, the default: cuDNN's fused attention in rows of 8192 or more and with a window, else tokamax's flash attention (sinks, a soft cap) | 7x, and no t × t logits |
 | sparse attention (DSA, QSA, CSA) | `sparse`: tokamax's flash attention with the kept keys as a mask; the indexer's scores by a Pallas kernel (`scoring`), its top-k by counting | 2.6x a chunk of queries at a time, and no t × t floats |
-| linear attention, RWKV-7 | `chunkwise`: chunks of 64 positions, the state across them by a Pallas kernel (`affine_scan`) | 14-17x a scan over positions |
+| linear attention, RWKV-7 | `chunkwise`: chunks of 64 positions, the state across them by a Pallas kernel (`affine_scan`); `methods(states=recompute)` keeps a fourteenth of the memory for the backward | 14-17x a scan over positions |
 | Mamba-2 | `chunkwise`, B and C a group's, the state across chunks by a matmul | 25x a scan over positions (2 × 4096 tokens, rematerialized: at 8 × 4096 the scan needs 199 GiB) |
-| KDA with `gate_lower_bound`, DeltaNet | cuDNN's fused KDA kernel (`fused_delta`) | 13x `chunkwise` |
+| Gated DeltaNet, DeltaNet | cuDNN's fused GDN kernel (`fused_delta`), by cuDNN's graph from a `buffer_callback`: any gate | 5x `chunkwise` |
+| KDA with `gate_lower_bound` | cuDNN's fused KDA kernel (`fused_delta`) | 10x `chunkwise` |
 | MoE experts | `grouped.ragged_dot`: tokamax's Mosaic and Triton kernels | 27x `jax.lax.ragged_dot` |
 | MoE dispatch | `pick_rows`, `permuted`: gathers where XLA would scatter | 4x |
 
@@ -430,11 +431,18 @@ the log's `mfu` (of the attention a causal mask keeps):
 | model (d = 2048, 16 layers) | 1 GPU | 8, `mesh(fsdp=8)` |
 |-----------------------------|-------|-------------------|
 | Llama-style, 1.3B           | 144k, 44% MFU | 1.12M, 43% |
-| Gated DeltaNet hybrid, `"DDDA"` | 93k, 29% | 720k |
+| Gated DeltaNet hybrid, `"DDDA"` | 117k, 37% | 818k |
 | Mamba-2 hybrid, `"MMMA"`, 1.5B (Nemotron-H's `mamba2`) | 97k | 741k |
-| KDA hybrid, `"KKKA"`        | 58k   |                   |
-| KDA with `gate_lower_bound=-5` | 110k, 35% |            |
+| KDA hybrid, `"KKKA"`        | 59k   |                   |
+| KDA with `gate_lower_bound=-5` | 127k, 40% | 926k     |
 | MoE, 64 experts, top 8      | 102k, 31% | 834k          |
+
+The GDN hybrid trained at 93k (715k on 8) by chunks before its kernel, in 121 GiB
+where it now takes 71 (58 on 8, against 108), and so fits 24 rows (136k, 169 GiB); KDA
+with `gate_lower_bound` at 110k in 173 GiB, now 91, and 16 rows (133k, 163 GiB). Their
+losses over 30 steps, GEMM autotuning off, are within 1.7e-4 of the chunks' (GDN) and
+the same (KDA). On 8 GPUs the GDN kernel's callbacks run one at a time, 87% of 8 GPUs
+alone, where KDA's kernel, which cudnn-frontend calls from JAX itself, runs at 91%.
 
 Sparse attention trains at long context. A DeepSeek-V3.2-style 1B (MLA of 16 heads,
 DSA's indexer of 64 heads and top 2048 in all 16 layers, dense MLPs) on one B300, in

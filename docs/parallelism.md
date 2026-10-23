@@ -636,7 +636,7 @@ methods = methods(recurrence=pass_state)
 
 | method       | what it does                                                     |
 |--------------|------------------------------------------------------------------|
-| `scan`       | the default: every position as one chunk, which `chunkwise` runs by chunks of 64 positions (or cuDNN's kernel, below). With `seq` over `context`, XLA gathers the sequence onto every device first |
+| `scan`       | the default: every position as one chunk, which `chunkwise` runs by chunks of 64 positions (or cuDNN's kernels, below). With `seq` over `context`, XLA gathers the sequence onto every device first |
 | `pass_state` | each device scans its own positions from a zero state and keeps their transition; the transitions fold, in turn, into the state each device's chunk starts from (LASP-2: XLA all-gathers them over `context`); and each device adds to its outputs what they read of that state |
 
 | family                                | `A`, a head          | `reads_t`  |
@@ -728,12 +728,44 @@ chunks by a matmul (SSD's state passing), and q and k may be shared by groups of
 Mamba-2's selective scan runs so, as decayed linear attention with `q = C` and `k = B`
 of its groups, `v = dt x` and a log decay `dt A` a head, and `ssm.stepwise` is its
 reference; Mamba's, a decay per channel and state dim, runs by that scan over
-positions. Under `scan`, the delta rule of a gate bounded at
--5 or above (KDA's `gate_lower_bound`, DeltaNet's none) runs by cuDNN's fused KDA
-kernel on a B200 or B300 instead (`fused_delta`); it overflows below -5.
+positions.
+
+What the backward pass of `recurrence` (and so `delta_rule` and RWKV-7) reads of its
+chunks' float32 states and maps is `methods.states`: `keep`, the default, keeps them
+from the forward pass; `recompute` computes them again, as fla's kernels do, from the
+inputs as they come (q, k and v in bfloat16 under `precision(compute=bfloat16)`) and
+each chunk's `(I - L)⁻¹`, which it keeps. That inverse's own backward, `Tᵀ dT Tᵀ` of
+`T` alone, also makes `keep` faster than before. The delta rule's forward and backward
+pass at 8 × 4096 tokens of 16 heads of 128, on a B300, and what it keeps:
+
+| delta rule | GDN | KDA |
+|------------|-----|-----|
+| by chunks, before | 13.1 ms, 7.24 GiB | 29.6 ms, 7.99 GiB |
+| `states=keep` | 11.6 ms, 6.51 GiB | 28.9 ms, 7.26 GiB |
+| `states=recompute` | 14.9 ms, 0.50 GiB | 33.6 ms, 0.75 GiB |
+| by its kernel (KDA bounded at -5) | 2.5 ms | 2.9 ms |
+
+A GLA hybrid (`"GGGA"^4`), which runs by chunks alone, trains at 84.4k tokens a second
+in 83.5 GiB with `keep`, and at 77.1k in 66.8 GiB with `recompute`; that fits 32 rows
+(78.8k, 192.2 GiB), where `keep` fits 16 (86.2k, 149.4).
+
+Under `scan`, on a B200 or B300, with q, k and v of 16 bits, the delta rule runs by
+cuDNN's fused kernels instead (`fused_delta`, Frost in cudnn-frontend), which keep only
+its inputs for the backward pass, and so do the chunks they fall back on. One decay a
+head (GDN, DeltaNet) runs by Frost's GDN kernel, which takes each pair's decay as the
+exp of a difference of summed log decays: any gate, -20 a position or a single -10⁴.
+cudnn-frontend gives it no JAX call, so a `buffer_callback` runs cuDNN's graph of it on
+XLA's stream, one device at a time. A decay per channel (KDA) runs by Frost's KDA
+kernel where `gate_lower_bound` bounds it at -5 or above. That kernel factors each
+decay through the start of a tile of 16 positions, so it loses precision where a tile
+decays a channel by exp(-86), and overflows at exp(-90). Unbounded, KDA runs by
+`chunkwise`: within 12 steps of bux's start, its gates are that steep in 30 to 90% of
+the (row, head) pairs of most layers, and a check that fell back from the kernel to
+the chunks left the GPU idle 12 ms a layer, on top of the chunks' 28.
 `scripts/gpu_smoke/recurrence.py` checks the forms against their scans on a GPU,
-whose fusions the CPU tests do not see: on a B300 one took Mamba-2's gradients for B
-and C wrong, which a plain matmul in its place does not.
+whose fusions the CPU tests do not see (on a B300 one took Mamba-2's gradients for B
+and C wrong, which a plain matmul in its place does not), and the kernels against the
+chunks.
 
 Not yet: a `ppermute` chain instead of the all-gather, which holds every device's
 transitions (`c` matrices `k × k` per head) on each.
@@ -1061,7 +1093,7 @@ methods = methods(remat=remat(save=[attention, mlp], first=8))
 | `attention.out`   | its output, and what else its backward takes: the log-sum-exp       |
 | `attention.index` | the keys sparse attention's indexer keeps for each query            |
 | `recurrence.in`   | a recurrent mixer's inputs, as its kernel takes them: linear attention, the SSMs, RWKV-7 |
-| `recurrence.out`  | its output, and what else its backward takes: the chunks' states    |
+| `recurrence.out`  | its output, and what else its backward takes: the chunks' states, their inverses with `methods(states=recompute)`, nothing more by cuDNN's kernels |
 | `qkv`             | attention's q, k and v projections; MLA's latents                   |
 | `mlp`             | an MLP's up and gate projections                                    |
 | `experts`         | the MoE's grouped products                                          |
@@ -1190,11 +1222,13 @@ second and the peak memory:
 `none` is the fastest, and the default; a policy buys rows. `dots` runs flash
 attention's forward twice, and `save_attention` the matmuls of every layer;
 `dots_attention` runs neither, 2% slower than `none` in 19% less memory on the dense
-model, as does `remat(save=[attention, mlp])`. A GDN layer's recurrence keeps its
-chunks' float32 states (`recurrence.out`), most of what `save_attention` keeps there:
-keeping its inputs alone (`recurrence.in`), whose backward runs the chunked forward
-again, is faster than `save_attention` in less than half its memory. In a Mamba-2
-hybrid (`"MMMA"^4`) too, `recurrence.in` in place of `recurrence` costs 2-3% for 59-68%
+model, as does `remat(save=[attention, mlp])`. A GDN layer's recurrence by chunks
+keeps their float32 states (`recurrence.out`), most of what `save_attention` keeps
+there: keeping its inputs alone (`recurrence.in`), whose backward runs the chunked
+forward again, is faster than `save_attention` in less than half its memory. (Since
+measured, GDN runs by cuDNN's kernel, which keeps only its inputs: [Context
+parallelism for recurrent mixers](#context-parallelism-for-recurrent-mixers-methodsrecurrence).)
+In a Mamba-2 hybrid (`"MMMA"^4`) too, `recurrence.in` in place of `recurrence` costs 2-3% for 59-68%
 less memory (`save_attention` 78.5k in 99.6 GiB, against 76.4k in 31.7); in a KDA
 hybrid by cuDNN's kernel, which costs more to run again, 7-11%. `first` gives the
 points between: half the passes in full is as fast as `dots` in a little less memory,
