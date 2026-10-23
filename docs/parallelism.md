@@ -749,7 +749,9 @@ It keeps x^T in MXFP8 for dW rather than x in bfloat16, so it takes 14 GiB less.
 the scales laid out as Blackwell's tensor memory takes them, 128 rows by 4 of k a
 tile, which TMA loads and `tcgen05.cp` copies on, the GEMM of rows computes the same,
 and on a B300 is 10 to 25% faster: still far from twice bfloat16's, which wants a
-warp-specialized kernel with two-CTA MMAs, as tokamax's bfloat16 one is.
+warp-specialized kernel with two-CTA MMAs, as tokamax's bfloat16 one is. It trains at
+bfloat16's loss: 98M tokens of FineWeb-Edu end 0.13% and 0.05% below it, with FP8
+dispatch (docs/training.md, "Precision").
 
 ## Expert parallelism
 

@@ -240,6 +240,12 @@ seeds differ by 1.6%:
 NVIDIA measured 1.5% at the end of 10T tokens on a 12B, against FP8, and 0.5% with
 the switch.
 
+The baseline's MoE (64 experts, top-8, 16 layers of `d_model` 2048) trained the same
+3000 steps on two B300s a run, its experts split over them (`ragged_all_to_all`, no
+capacity). With `roles=roles(experts=mxfp8)` and `dispatch=mxfp8` its held-out loss is
+0.13% and 0.05% below bfloat16's at seeds 0 and 1, where the seeds differ by 1.65%;
+it trains at 105k tokens a second against 127k, in 75 GiB against 89.
+
 ## Data
 
 A batch is rows of `seq_len` tokens, each three arrays: `input_ids`, `position_ids`
