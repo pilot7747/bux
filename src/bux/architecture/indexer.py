@@ -5,9 +5,9 @@ Keys sit in slots along a row, in order, and `order` says which key of its docum
 each slot holds (-1 for a slot with none, as between compressed latents). Blocks of
 keys are counted from a document's first key, so none spans two documents.
 
-It scores a chunk of queries at a time (``sparse.chunked``), so that no t by t floats
-are made: it keeps each query's top-k by index (``sparse.Kept``), and its loss scores
-each chunk again.
+It ranks a chunk of queries at a time (``sparse.chunked``), so that no t by t floats
+are made, on a GPU by ``scoring``'s kernel; it keeps each query's top-k by index
+(``sparse.Kept``), and its loss scores the kept keys of each chunk again.
 """
 
 from collections.abc import Callable
@@ -16,14 +16,15 @@ from typing import Any, Literal, NamedTuple
 import jax
 import jax.numpy as jnp
 from flax import nnx
-from jaxtyping import Array, Bool, Float, Int, Shaped
+from jaxtyping import Array, Bool, Float, Int, Shaped, UInt
 
 from bux import config as cfg
 from bux import parallel
+from bux.architecture import scoring
 from bux.architecture.norm import Norm
 from bux.architecture.rope import rotate
 from bux.architecture.sharding import projection, shard_heads
-from bux.architecture.sparse import Kept, Span, by_rows, chunked, chunks, mask
+from bux.architecture.sparse import Kept, Span, chunked, chunks, mask
 
 # DeepSeek-V3.2's indexer keys, projected from the layer's input, are layer-normalized.
 _STREAM_KEY_NORM = cfg.NormalizationConfig(type="layernorm", bias=True)
@@ -87,15 +88,43 @@ def _per_block(
 
 def _top(scores: Float[Array, "b t n"], top_k: int) -> Int[Array, "b t k"]:
     """Return the indices of each query's top_k highest scores, of those above -inf,
-    and -1 past them; of equal ones, the first. By each device's rows: lax.top_k
-    gathers every row onto each device otherwise."""
+    in order of index, and -1 past them; of equal ones, the first.
+
+    It finds the k-th highest by its bits, one count of those at least as high a bit,
+    and keeps those above it and the first of those equal to it. XLA's top-k sorts
+    every row on a GPU, 6 times slower at 32k keys, and in the global view gathers
+    every row onto each device."""
     k = min(top_k, scores.shape[-1])
+    key = _ordered(scores)
 
-    def top(scores: Float[Array, "b t n"]) -> Int[Array, "b t k"]:
-        values, index = jax.lax.top_k(scores, k)
-        return jnp.where(values > -jnp.inf, index, -1)
+    def bit(i: Int[Array, ""], kth: UInt[Array, "b t"]) -> UInt[Array, "b t"]:
+        higher = kth | (jnp.uint32(1) << (31 - i).astype(jnp.uint32))
+        enough = (key >= higher[..., None]).sum(-1) >= k
+        return jnp.where(enough, higher, kth)
 
-    return by_rows(top, scores)
+    kth = jax.lax.fori_loop(0, 32, bit, jnp.zeros(scores.shape[:-1], jnp.uint32))
+    above, tied = key > kth[..., None], key == kth[..., None]
+    room = k - above.sum(-1, keepdims=True)
+    kept = (above | (tied & (jnp.cumsum(tied, -1) <= room))) & (scores > -jnp.inf)
+    return _indices(kept, k)
+
+
+def _ordered(x: Float[Array, "*s"]) -> UInt[Array, "*s"]:
+    """Return unsigned integers in the order of the floats `x`."""
+    u = jax.lax.bitcast_convert_type(x.astype(jnp.float32), jnp.uint32)
+    return jnp.where(u >> 31 == 1, ~u, u | jnp.uint32(1 << 31))
+
+
+def _indices(kept: Bool[Array, "b t n"], k: int) -> Int[Array, "b t k"]:
+    """Return the indices of each row's (at most) k kept slots, -1 past them."""
+    n = kept.shape[-1]
+    slot = jnp.where(kept, jnp.cumsum(kept, -1) - 1, k)
+
+    def row(slot: Int[Array, " n"]) -> Int[Array, " k"]:
+        index = jnp.arange(n, dtype=jnp.int32)
+        return jnp.full(k + 1, -1, jnp.int32).at[slot].set(index)[:k]
+
+    return jax.vmap(jax.vmap(row))(slot)
 
 
 def _newest(seen: Bool[Array, "b t s"], block: Int[Array, "b s"]) -> Int[Array, "b t"]:
@@ -207,11 +236,37 @@ class Indexer(nnx.Module):
         keys: Float[Array, "b s i"],
         index: Int[Array, "b t k"],
     ) -> Float[Array, "b t k"]:
-        """Return each query's scores for the keys at its `index`, its kept ones."""
+        """Return each query's scores for the keys at its `index`, its kept ones. The
+        keys are gathered in float32: the gradient adds into a key once for every
+        query that keeps it, which in bfloat16 a GPU does one at a time."""
         x, query = jax.lax.stop_gradient((x, query))
-        picked = jax.vmap(lambda k, i: k[i])(keys, jnp.maximum(index, 0))
+        rows = jax.vmap(lambda k, i: k[i])
+        picked = rows(keys.astype(jnp.float32), jnp.maximum(index, 0))
         dots = jnp.einsum("bthi,btki->bthk", self._queries(query, pos), picked)
         return self._weigh(x, dots)
+
+    def _ranking(
+        self,
+        x: Float[Array, "b t d"],
+        query: Float[Array, "b t e"],
+        pos: Int[Array, "b t"],
+        keys: Float[Array, "b s i"],
+        end: Int[Array, "b t"],
+    ) -> Float[Array, "b t s"]:
+        """Return the scores that rank the keys, passing no gradient: by
+        ``scoring``'s kernel where it runs. Keys from a query's `end` on score
+        anything."""
+        x, query, keys = jax.lax.stop_gradient((x, query, keys))
+        if not scoring.runs(x.shape[1], keys.shape[1], self.head_dim):
+            return self.scores(x, query, pos, keys)
+        q, w = self._queries(query, pos), self._head_weights(x)
+        return scoring.scores(q, w, keys, end)
+
+    def _per_query(self, t: int, s: int) -> int:
+        """Return the elements a query makes in the largest intermediate of ranking s
+        keys: those of every head unless the kernel runs."""
+        kernel = scoring.runs(t, s, self.head_dim)
+        return (4 if kernel else self.heads + 4) * s
 
     def _queries(
         self, query: Float[Array, "b t e"], pos: Int[Array, "b t"] | None
@@ -227,11 +282,14 @@ class Indexer(nnx.Module):
         self, x: Float[Array, "b t d"], dots: Float[Array, "b t h s"]
     ) -> Float[Array, "b t s"]:
         """Return the heads' ReLU'd dot products summed, by the weights if learned."""
-        dots = jax.nn.relu(dots) * self.head_dim**-0.5
+        return jnp.einsum("bths,bth->bts", jax.nn.relu(dots), self._head_weights(x))
+
+    def _head_weights(self, x: Float[Array, "b t d"]) -> Float[Array, "b t h"]:
+        """Return each head's weight in a query's scores, with the head dims' scale."""
+        scale = self.head_dim**-0.5
         if self.weights is None:
-            return dots.sum(2)
-        w = self.weights(x) * self.heads**-0.5
-        return jnp.einsum("bths,bth->bts", dots, w)
+            return jnp.full((*x.shape[:2], self.heads), scale, x.dtype)
+        return self.weights(x) * (scale * self.heads**-0.5)
 
     def __call__(
         self,
@@ -261,14 +319,15 @@ class Indexer(nnx.Module):
             x, query, pos, span, index = xs
             inside = None if index is None else Kept(index, among)
             seen = mask(span, s, exists, inside)
-            ranked = jnp.where(seen, self.scores(x, query, pos, ranked_keys), -jnp.inf)
+            scores = self._ranking(x, query, pos, ranked_keys, span.end)
+            ranked = jnp.where(seen, scores, -jnp.inf)
             if not export_candidates:
                 return _top(ranked, self.top_k), None
             return _top(ranked, self.top_k), self._candidates(ranked, pooled)
 
         index = None if candidates is None else candidates.index
-        xs = (x, query, pos, span, index)
-        index, best = chunked(pick, xs, chunks(x.shape[1], (self.heads + 1) * s))
+        xs, t = (x, query, pos, span, index), x.shape[1]
+        index, best = chunked(pick, xs, chunks(t, self._per_query(t, s)))
         pool = None if best is None else Kept(best, pooled)
         return Kept(index), pool, Scored(x, query, pos, keys, index)
 
@@ -317,14 +376,14 @@ class Indexer(nnx.Module):
             x, query, pos, span = xs
             seen = mask(span, s, exists)
             full = _per_block(seen.astype(jnp.int32), block, "sum") == size
-            scores = self.scores(x, query, pos, ranked_keys)
+            scores = self._ranking(x, query, pos, ranked_keys, span.end)
             picked = _top(jnp.where(full, scores, -jnp.inf), self.top_k // size)
             own = _newest(seen, block)
             unfinished = ~jnp.take_along_axis(full, jnp.maximum(own, 0)[..., None], -1)
             return picked, jnp.where(unfinished[..., 0], own, -1)
 
-        xs = (x, query, pos, span)
-        picked, own = chunked(pick, xs, chunks(x.shape[1], (self.heads + 2) * s))
+        xs, t = (x, query, pos, span), x.shape[1]
+        picked, own = chunked(pick, xs, chunks(t, self._per_query(t, s)))
         kept = Kept(jnp.concatenate([picked, own[..., None]], -1), block)
         return kept, Scored(x, query, pos, block_keys, picked, block)
 

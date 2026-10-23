@@ -13,7 +13,7 @@ from jaxtyping import Array, Float
 
 from bux import config as cfg
 from bux import parallel
-from bux.architecture import Model, Segments, Taps, sparse
+from bux.architecture import Model, Segments, Taps, scoring, sparse
 from bux.architecture.attention import Sparse, build_gqa
 from bux.architecture.indexer import _top
 from bux.lang import compile
@@ -233,3 +233,34 @@ def test_memory_grows_linearly_with_the_queries(monkeypatch):
     monkeypatch.setattr(sparse, "ELEMENTS", 1 << 14)
     assert step_memory(2048) < 2.3 * step_memory(1024)
     assert step_memory(2048, logits=True) > 3.5 * step_memory(1024, logits=True)
+
+
+# --- The indexer's selection ----------------------------------------------------------
+
+
+@pytest.mark.parametrize("seed", range(4))
+def test_the_indexers_top_k_keeps_what_lax_top_k_does(seed):
+    """Of equal scores the first, none at -inf; many ties at 0, as ReLU makes."""
+    rng = np.random.default_rng(seed)
+    scores = rng.normal(size=(2, 9, 200)).astype(np.float32)
+    scores[rng.random(scores.shape) < 0.3] = 0.0
+    scores[rng.random(scores.shape) < 0.2] = -np.inf
+    for k in (1, 7, 64, 200):
+        values, index = jax.lax.top_k(jnp.asarray(scores), k)
+        want = jnp.where(values > -jnp.inf, index, -1)
+        got = _top(jnp.asarray(scores), k)
+        assert np.array_equal(np.sort(got, -1), np.sort(want, -1)), k
+
+
+def test_the_scoring_kernel_scores_as_xla_does():
+    """Interpreted, as off a GPU; a block of keys after every query's end scores 0."""
+    key = jax.random.split(jax.random.key(0), 4)
+    q = jax.random.normal(key[0], (2, 32, 3, 16))
+    w = jax.random.normal(key[1], (2, 32, 3))
+    keys = jax.random.normal(key[2], (2, 256, 16))
+    end = jnp.broadcast_to(jnp.arange(1, 33) * 4, (2, 32))  # up to 128: a block
+    want = jnp.einsum("bthi,bsi->bths", q, keys)
+    want = jnp.einsum("bths,bth->bts", jax.nn.relu(want), w)
+    got = scoring._kernel(q, w, keys, end)
+    np.testing.assert_allclose(got[..., :128], want[..., :128], atol=1e-4)
+    assert not got[..., 128:].any()

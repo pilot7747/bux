@@ -37,6 +37,7 @@ except ImportError:
 
 KEPT = "mask of kept keys (an indexer's top-k, or CSA's compression)"
 ELEMENTS = 1 << 27  # the most a chunk of queries makes of an intermediate
+HEAD_DIMS = 256  # the widest heads tokamax's kernels take
 F32 = jnp.float32
 
 
@@ -172,19 +173,7 @@ def _join(x: Shaped[Array, "chunks b c *r"]) -> Shaped[Array, "b t *r"]:
     return jnp.moveaxis(x, 0, 2).reshape(b, c * n, *x.shape[3:])
 
 
-def by_rows[R](
-    f: Callable[[Shaped[Array, "b t n"]], R], x: Shaped[Array, "b t n"]
-) -> R:
-    """Return f(x), run on each device's rows and positions of x: XLA splits some ops
-    (lax.top_k) by neither, and gathers every row onto each device."""
-    split = parallel.spec(("batch", "seq", None), x.shape)
-    names = _axes(split)
-    if not names:
-        return f(x)
-    return jax.shard_map(f, in_specs=split, out_specs=split, axis_names=names)(x)
-
-
-def _axes(split: P) -> set[str]:
+def axes(split: P) -> set[str]:
     """Return the mesh axes `split` splits over."""
     return {a for d in split if d for a in ((d,) if isinstance(d, str) else d)}
 
@@ -212,7 +201,7 @@ def attend(
     queries and every key: all-gather context parallelism."""
     static, parts = _Static(scale, cap, _flash(), True), tuple(parts)
     split = parallel.spec(("batch", "seq", "heads", None), q.shape)
-    names = _axes(split)
+    names = axes(split)
     if parallel.active() is None or not names:
         return _attend(q, parts, sinks, static)
     parts = tuple(_heads_like(p, split, q.shape[2]) for p in parts)
@@ -293,9 +282,17 @@ def _forward(
     static: _Static,
 ) -> tuple[Float[Array, "b t h dv"], Float[Array, "b t h"]]:
     """Return `_attend`: each part's output and logsumexp, combined."""
-    fwd = _flash_fwd if static.flash else _xla_fwd
-    outs, lses = zip(*(fwd(q, p, static) for p in parts))
+    outs, lses = zip(*(_runs(p, static)[0](q, p, static) for p in parts))
     return _combine(outs, lses, sinks, q.dtype)
+
+
+def _runs(part: Part, static: _Static) -> tuple[Callable, Callable]:
+    """Return the forward and backward of `part`: tokamax's, for heads it takes (its
+    kernels run out of shared memory past 256 dims, as CSA's 512 do), else XLA's. A
+    part's forward and backward are each exact alone."""
+    if static.flash and max(part.k.shape[-1], part.v.shape[-1]) <= HEAD_DIMS:
+        return _flash_fwd, _flash_bwd
+    return _xla_fwd, _xla_bwd
 
 
 def _combine(
@@ -332,8 +329,7 @@ def _attend_bwd(static: _Static, saved: tuple, cotangents: tuple) -> tuple:
     The logsumexp's cotangent is dropped: it is for what is detached."""
     q, parts, sinks, out, lse = saved
     dout = cotangents[0]
-    bwd = _flash_bwd if static.flash else _xla_bwd
-    grads = [bwd(q, p, out, dout, lse, static) for p in parts]
+    grads = [_runs(p, static)[1](q, p, out, dout, lse, static) for p in parts]
     dq = grads[0][0] if len(grads) == 1 else sum(g[0].astype(F32) for g in grads)
     dparts = tuple(Part(dk, dv, None, None, None) for _, dk, dv in grads)  # ty: ignore
     dsinks = None if sinks is None else _sink_grads(sinks, out, dout, lse)
@@ -470,13 +466,15 @@ def _xla_bwd(
 def _flash_fwd(
     q: Float[Array, "b t h dk"], part: Part, static: _Static
 ) -> tuple[Float[Array, "b t h dv"], Float[Array, "b t h"]]:
-    """Return a part's softmax-weighted values and logsumexp by tokamax's kernel."""
+    """Return a part's softmax-weighted values and logsumexp by tokamax's kernel; 0
+    and -inf for a query that attends to nothing."""
     assert MOSAIC is not None
     out, (m, l) = MOSAIC(
         q, part.k, part.v, return_residuals=True, **_flash_args(part, static)
     )
+    seen = (l > 0).transpose(0, 2, 1)
     lse = jnp.where(l > 0, m + jnp.log(jnp.where(l > 0, l, 1)), -jnp.inf)
-    return out, lse.transpose(0, 2, 1)
+    return jnp.where(seen[..., None], out, 0), lse.transpose(0, 2, 1)
 
 
 def _flash_bwd(
