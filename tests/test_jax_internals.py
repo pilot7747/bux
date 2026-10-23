@@ -20,6 +20,7 @@ import pytest
 from jax.ad_checkpoint import checkpoint_name, name_p
 from jax.extend.core import primitives
 from jax.sharding import PartitionSpec as P
+from jaxtyping import Array, Shaped
 
 from bux import jax_internals, kernels
 from bux.architecture.repeats import remat
@@ -78,7 +79,7 @@ def test_the_packages_are_the_versions_bux_s_internals_were_verified_on():
 # --- Jaxprs ---------------------------------------------------------------------------
 
 
-def _calls(x: jax.Array) -> jax.Array:
+def _calls(x: Shaped[Array, "..."]) -> Shaped[Array, "..."]:
     y = jax.jit(jnp.sin)(x)
     return jax.checkpoint(jnp.cos)(y)
 
@@ -92,12 +93,14 @@ def test_jit_and_checkpoint_call_jaxprs_by_the_names_split_inlines():
             assert isinstance(jax_internals.called_jaxpr(e), core.ClosedJaxpr)
 
 
-def _eval(closed: core.ClosedJaxpr, *args: jax.Array) -> list[jax.Array]:
+def _eval(
+    closed: core.ClosedJaxpr, *args: Shaped[Array, "..."]
+) -> list[Shaped[Array, "..."]]:
     """Run `closed` on `args` one equation at a time, by `jax_internals.bind`."""
     env = dict(zip(closed.jaxpr.constvars, closed.consts, strict=True))
     env |= dict(zip(closed.jaxpr.invars, args, strict=True))
 
-    def read(v: Any) -> jax.Array:
+    def read(v: Any) -> Shaped[Array, "..."]:
         return v.val if isinstance(v, core.Literal) else env[v]
 
     for e in closed.jaxpr.eqns:
@@ -107,7 +110,7 @@ def _eval(closed: core.ClosedJaxpr, *args: jax.Array) -> list[jax.Array]:
 
 
 def test_bind_runs_each_equation_as_the_function_does():
-    def f(x: jax.Array) -> tuple[jax.Array, jax.Array]:
+    def f(x: Shaped[Array, "..."]) -> tuple[Shaped[Array, "..."], Shaped[Array, "..."]]:
         values, order = jax.lax.sort((x * 2.0 + 1.0, jnp.arange(3)), num_keys=1)
         return values, order  # sort has two results
 
@@ -118,7 +121,9 @@ def test_bind_runs_each_equation_as_the_function_does():
 def test_a_scan_s_body_counts_and_options_run_it_again():
     w = jnp.arange(4.0)
 
-    def f(c: jax.Array, xs: jax.Array) -> tuple[jax.Array, jax.Array]:
+    def f(
+        c: Shaped[Array, "..."], xs: Shaped[Array, "..."]
+    ) -> tuple[Shaped[Array, "..."], Shaped[Array, "..."]]:
         step = lambda c, x: (c * x + w, (c * w).sum())
         return jax.lax.scan(step, c, xs, reverse=True, unroll=2)
 
@@ -132,7 +137,9 @@ def test_a_scan_s_body_counts_and_options_run_it_again():
     }
     body = jax_internals.scan_body(eqn)
 
-    def step(c: jax.Array, x: jax.Array) -> tuple[jax.Array, jax.Array]:
+    def step(
+        c: Shaped[Array, "..."], x: Shaped[Array, "..."]
+    ) -> tuple[Shaped[Array, "..."], Shaped[Array, "..."]]:
         new, y = _eval(body, w, c, x)
         return new, y
 
@@ -213,7 +220,7 @@ def test_a_sharding_constraint_says_its_devices():
 
 
 def test_a_vjp_is_rebuilt_from_its_residuals_and_its_unsaved_primal():
-    def f(params: dict, x: jax.Array) -> jax.Array:
+    def f(params: dict, x: Shaped[Array, "..."]) -> Shaped[Array, "..."]:
         return jnp.tanh(x @ params["w"]) * params["b"]
 
     params = {"w": jnp.linspace(-1, 1, 12).reshape(4, 3), "b": jnp.arange(3.0)}
@@ -243,7 +250,7 @@ def test_the_unpartitioned_scaled_matmul_is_jax_nn_s_in_a_shard_map():
 
     @jax.jit
     @jax.shard_map(mesh=one, in_specs=P(), out_specs=P())
-    def manual(*args: jax.Array) -> jax.Array:
+    def manual(*args: Shaped[Array, "..."]) -> Shaped[Array, "..."]:
         return jax_internals.scaled_matmul_unpartitioned(*args, jnp.bfloat16)
 
     np.testing.assert_array_equal(manual(*args), expected)
@@ -295,18 +302,20 @@ def test_cudnn_s_attention_attends_causally_and_by_documents():
         assert _off(out, _attention(q, k, v, mask)) < 2e-2
 
 
-def _qkv(key: jax.Array, shape: tuple[int, ...]) -> list[jax.Array]:
+def _qkv(
+    key: Shaped[Array, "..."], shape: tuple[int, ...]
+) -> list[Shaped[Array, "..."]]:
     return [jax.random.normal(k, shape, jnp.bfloat16) for k in jax.random.split(key, 3)]
 
 
-def _attention(q, k, v, mask=None) -> jax.Array:
+def _attention(q, k, v, mask=None) -> Shaped[Array, "..."]:
     """XLA's causal attention, within `mask` if any, at a scale of 1/8."""
     return jax.nn.dot_product_attention(
         q, k, v, mask=mask, scale=0.125, is_causal=True, implementation="xla"
     )
 
 
-def _off(x: jax.Array, y: jax.Array) -> float:
+def _off(x: Shaped[Array, "..."], y: Shaped[Array, "..."]) -> float:
     """How far x is from y at worst, relative to y's largest magnitude."""
     a, b = np.asarray(x, np.float32), np.asarray(y, np.float32)
     return float(np.abs(a - b).max() / np.abs(b).max())
@@ -350,7 +359,9 @@ def test_jax_triton_s_calls_survive_dead_code_elimination():
 
     from bux.architecture.experts import grouped_triton  # installs the rule
 
-    def values(x: jax.Array) -> jax.Array:  # one of the quantizer's 4 results
+    def values(
+        x: Shaped[Array, "..."],
+    ) -> Shaped[Array, "..."]:  # one of the quantizer's 4 results
         return grouped_triton.quantized_twice(x, jnp.int32(64))[0].values
 
     jaxpr = jax.make_jaxpr(values)(jnp.ones((64, 128), jnp.bfloat16)).jaxpr

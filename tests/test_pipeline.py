@@ -1,6 +1,7 @@
 """Pipelines over `stage` (methods.pipeline, mesh.stage > 1), against one device: the
 longest scanned repeat split over the stages, on methods.microbatches microbatches."""
 
+import re
 import shutil
 
 import jax
@@ -387,5 +388,28 @@ def test_a_gpipe_checkpoint_resumes_on_one_stage(tmp_path):
     shutil.rmtree(directory(piped, tmp_path) / "checkpoints" / "4")
     said: list[str] = []
     resumed = train(run("mesh(data=1)"), tmp_path, echo=said.append)
+    assert said[0].endswith("resuming at step 2")
+    assert resumed["loss"] == pytest.approx(whole["loss"], abs=1e-5)
+
+
+def test_an_uneven_pipeline_resumes_with_its_split_alone(tmp_path):
+    def run(mesh: str, split: str | None):
+        how = _how(4, '"1f1b"', stages=split) if split else "methods(repeat=scan)"
+        every = "checkpoint = checkpoint(every=2)"
+        [r] = compile_runs(f"{LLAMA}\n{TRAIN}\nmesh = {mesh}\nmethods = {how}\n{every}")
+        return r
+
+    piped = run("mesh(stage=4, fsdp=2)", "[3, 2, 2, 1]")
+    whole = train(piped, tmp_path, echo=lambda _: None)
+    shutil.rmtree(directory(piped, tmp_path) / "checkpoints" / "4")
+    # [3, 3, 1, 1] stacks as many layers as [3, 2, 2, 1], each in another place.
+    for mesh, split in [("mesh(stage=4, fsdp=2)", "[3, 3, 1, 1]"), ("mesh()", None)]:
+        changed = "and this run has " + (split or "none")
+        with pytest.raises(ValueError, match=re.escape(changed)):
+            train(run(mesh, split), tmp_path, echo=lambda _: None)
+    said: list[str] = []
+    resumed = train(
+        run("mesh(stage=4, data=2)", "[3, 2, 2, 1]"), tmp_path, echo=said.append
+    )
     assert said[0].endswith("resuming at step 2")
     assert resumed["loss"] == pytest.approx(whole["loss"], abs=1e-5)

@@ -566,7 +566,7 @@ def test_a_checkpoint_resumes_only_with_the_repeat_method_it_was_saved_with(tmp_
 
     whole = train(run("scan"), tmp_path, echo=lambda _: None)
     shutil.rmtree(directory(run("scan"), tmp_path) / "checkpoints" / "4")
-    with pytest.raises(ValueError, match=r"saved with methods\(repeat=unroll\)"):
+    with pytest.raises(ValueError, match="resumes with the methods it was saved with"):
         train(run("unroll"), tmp_path, echo=lambda _: None)
     said: list[str] = []
     resumed = train(run("scan"), tmp_path, echo=said.append)
