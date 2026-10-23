@@ -31,7 +31,7 @@ from jax.sharding import PartitionSpec as P
 from jaxtyping import Array, Bool, Float, Int, Shaped, UInt8
 
 from bux import config as cfg
-from bux.architecture import blockscaled, matmuls
+from bux.architecture import blockscaled, matmuls, remat
 from bux.architecture.blockscaled import Blocks
 from bux.architecture.grouped_blockscaled import dequantized
 from bux.architecture.moe import (
@@ -60,6 +60,9 @@ Routed = tuple[Float[Array, "b t d"], Float[Array, ""]]
 Body = Callable[..., Routed]
 # jax.lax.ragged_all_to_all's signature: another exchange is a function.
 Exchange = Callable[..., Shaped[Array, "m d"]]
+# What the ragged exchanges send and bring back, which `dots` keeps (``remat``): else
+# its backward would exchange them again.
+EXCHANGED = "experts.exchanged"
 # The pieces a ragged exchange sends in, at least: XLA's one-shot kernel on a node
 # copies each with one block of 128 threads, ~90 GB/s with 64 on 8 B300s.
 PIECES = 2048
@@ -454,10 +457,11 @@ def ragged(
     slices = _slices(every, rows)
     sent = _dispatch(slices, starts[device], device)
     picks = pick_rows(z.reshape(-1, d), order, back, k)
-    arrived = _dispatched(exchange, picks, rows, sent, axes)
+    arrived = remat.label(EXCHANGED, _dispatched(exchange, picks, rows, sent, axes))
     made = experts(arrived, slices.kept[device].sum(1), *kernels, ffn, norm)
     theirs = jax.lax.dynamic_slice_in_dim(starts, device * local, local, axis=1)
-    returned = _exchanged(exchange, made, n, _combine(slices, theirs, device), axes)
+    back_there = _combine(slices, theirs, device)
+    returned = remat.label(EXCHANGED, _exchanged(exchange, made, n, back_there, axes))
     kept = _came_back(sent, idx.reshape(-1)[order])
     per_pick = permuted(jnp.where(kept[:, None], returned, 0), back, order)
     y = jnp.einsum("btkd,btk->btd", per_pick.reshape(*idx.shape, d), weights)
@@ -517,18 +521,18 @@ def tokens(
     sent = _dispatch(slices, starts[device], device)
 
     def send(a: Shaped[Array, "n e"]) -> Shaped[Array, "rows e"]:
-        return _exchanged(exchange, a, rows, sent, axes)
+        return remat.label(EXCHANGED, _exchanged(exchange, a, rows, sent, axes))
 
-    x = _dispatched(
-        exchange, pick_rows(z.reshape(-1, d), order, back, k), rows, sent, axes
-    )
+    tokens = pick_rows(z.reshape(-1, d), order, back, k)
+    x = remat.label(EXCHANGED, _dispatched(exchange, tokens, rows, sent, axes))
     choices = _picked_there(idx.reshape(-1, k), weights.reshape(-1, k), local)
     picked, chosen = (send(a[order]) for a in choices)
     came = (jnp.arange(rows) < slices.kept[device].sum())[:, None]
     picked, chosen = jnp.where(came, picked, local), jnp.where(came, chosen, 0)
     made, ran = _run_first(x, picked, chosen, kernels, ffn, norm, room)
     theirs = jax.lax.dynamic_slice_in_dim(starts, device, 1, axis=1)
-    returned = _exchanged(exchange, made, n, _combine(slices, theirs, device), axes)
+    back_there = _combine(slices, theirs, device)
+    returned = remat.label(EXCHANGED, _exchanged(exchange, made, n, back_there, axes))
     gone = visit.reshape(-1)[order]  # where each visit went, sorted
     kept = (gone < peers) & _came_back(sent, gone)
     y = sum_rows(jnp.where(kept[:, None], returned, 0), back, order, k)

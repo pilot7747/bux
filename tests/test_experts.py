@@ -386,6 +386,30 @@ experts = moe(num_experts=8, top_k=2, num_shared_experts=1, shared_expert_gate=t
               expert=gated_mlp(intermediate_size=64, activation=swish))
 model = embed [norm attn] [norm experts] [norm attn] [norm experts] norm head
 """
+
+
+# Of each of ARCH's 2 MoEs: forward there and back, backward the transposes; and the
+# forward's again, under a policy that keeps none of what they bring.
+@pytest.mark.parametrize(
+    ("remat", "exchanges"), [("none", 4), ("dots", 4), ("full", 6)]
+)
+def test_dots_keeps_what_the_ragged_exchanges_bring_and_runs_none_again(
+    remat, exchanges
+):
+    how = tcfg.MethodsConfig(moe=RAGGED, remat=remat)
+    with parallel.use(tcfg.MeshConfig(fsdp=2, expert=4), methods=how):
+        model = parallel.build(lambda: Model(compile(ARCH), rngs=nnx.Rngs(0)))
+        graphdef, params, rest = nnx.split(model, nnx.Param, ...)
+        tokens = jnp.zeros((8, 16), jnp.int32)
+
+        def grads(params: nnx.State, rest: nnx.State) -> nnx.State:
+            m = nnx.merge(graphdef, params, rest)
+            return nnx.grad(lambda m: m(tokens).mean())(m)
+
+        text = jax.jit(grads).lower(params, rest).as_text()
+    assert text.count("@ragged_all_to_all") == 2 * exchanges
+
+
 TRAINING = [
     "mesh(data=2, fsdp=2, expert=2)",
     "mesh(fsdp=2, expert=4)",

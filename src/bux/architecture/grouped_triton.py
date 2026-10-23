@@ -16,10 +16,23 @@ import jax.numpy as jnp
 import jax_triton
 import triton
 import triton.language as tl
+from jax._src.interpreters import partial_eval
+from jax.extend.core import JaxprEqn
 from jax.typing import DTypeLike
 from jaxtyping import Array, Float, Int, Shaped, UInt8
 
 from bux.architecture.blockscaled import MX_BLOCK, Blocks
+
+
+def _keeps_its_inputs(
+    used: list[bool], live: list[bool], eqn: JaxprEqn
+) -> tuple[list[bool], JaxprEqn]:
+    """Dead-code elimination's rule of a Triton call: keep it whole. jax-triton 0.4.1
+    registers one of jax 0.11's signature, which jax 0.12's calls with one more."""
+    return [True] * len(eqn.invars), eqn
+
+
+partial_eval.dce_rules[jax_triton.triton_lib.triton_kernel_call_p] = _keeps_its_inputs
 
 
 class Tiles(NamedTuple):
@@ -103,9 +116,99 @@ def contract(
     )
 
 
+QUANTIZE = Tiles(m=64, n=128, k=0, warps=4, stages=1)  # the most of each
+
+
+def quantized_twice(
+    x: Float[Array, "r c"], rows: Int[Array, ""], most: Tiles = QUANTIZE
+) -> tuple[Blocks, Blocks]:
+    """Return x and x^T in MXFP8, as `blockscaled.mx_twice` does, x's rows from
+    `rows` on as 0: one pass over x, a tile a program, the largest of 32 times a
+    power of two up to `most`'s that x's sides are whole tiles of."""
+    r, c = x.shape
+    tiles = most._replace(m=_tile(r, most.m), n=_tile(c, most.n))
+    shapes = [((r, c), jnp.uint8), ((r, c // 32), jnp.uint8)]
+    shapes += [((c, r), jnp.uint8), ((c, r // 32), jnp.uint8)]
+    values, scales, t_values, t_scales = jax_triton.triton_call(
+        x,
+        rows.astype(jnp.int32).reshape(1),
+        kernel=_quantize,
+        out_type=[jax.ShapeDtypeStruct(*s) for s in shapes],
+        grid=(r // tiles.m, c // tiles.n),
+        name="bux_mx_twice",
+        num_warps=tiles.warps,
+        num_stages=tiles.stages,
+        r=r,
+        c=c,
+        tile_r=tiles.m,
+        tile_c=tiles.n,
+    )
+    return _blocks(values, scales), _blocks(t_values, t_scales)
+
+
+def _tile(n: int, most: int) -> int:
+    """Return the largest tile, 32 times a power of two up to `most`, that n is whole
+    tiles of."""
+    tile = most
+    while n % tile:
+        tile //= 2
+    assert tile >= 32, f"{n} is not whole blocks of 32"
+    return tile
+
+
+def _blocks(values: UInt8[Array, "r c"], exponents: UInt8[Array, "r n"]) -> Blocks:
+    as_e4m3 = jax.lax.bitcast_convert_type(values, jnp.float8_e4m3fn)
+    as_e8m0 = jax.lax.bitcast_convert_type(exponents, jnp.float8_e8m0fnu)
+    return Blocks(as_e4m3, as_e8m0, None)
+
+
 def _bytes(x: Shaped[Array, "*s"]) -> UInt8[Array, "*s"]:
     """Return x's bytes: E4M3 values or E8M0 scales, which jax-triton passes so."""
     return jax.lax.bitcast_convert_type(x, jnp.uint8)
+
+
+@triton.jit
+def _in_e4m3(blocks: Any) -> tuple[Any, Any]:
+    """Return blocks (a, b, 32) of float32 in E4M3, each times the least power of two
+    that takes its largest value to at most 448, and those powers' biased exponents
+    (E8M0's bits), as ``blockscaled._mx_tile`` computes them."""
+    over = tl.max(tl.abs(blocks), axis=2) / 448.0
+    bits = over.to(tl.uint32, bitcast=True)
+    exponent = (bits >> 23).to(tl.int32) + ((bits & 0x7FFFFF) != 0).to(tl.int32) - 127
+    exponent = tl.minimum(tl.maximum(exponent, -126), 126)
+    down = ((127 - exponent).to(tl.uint32) << 23).to(tl.float32, bitcast=True)
+    values = tl.clamp(blocks * down[:, :, None], -448.0, 448.0).to(tl.float8e4nv)
+    return values.to(tl.uint8, bitcast=True), (exponent + 127).to(tl.uint8)
+
+
+@triton.jit
+def _quantize(
+    x: Any,
+    rows: Any,
+    values: Any,
+    scales: Any,
+    t_values: Any,
+    t_scales: Any,
+    r: tl.constexpr,
+    c: tl.constexpr,
+    tile_r: tl.constexpr,
+    tile_c: tl.constexpr,
+) -> None:
+    """A tile of x in E4M3 in blocks of 32 along its rows, and of x^T along its
+    columns, x's rows from `rows` on as 0."""
+    i, j = tl.program_id(0), tl.program_id(1)
+    rs = (i * tile_r + tl.arange(0, tile_r)).to(tl.int64)
+    cs = (j * tile_c + tl.arange(0, tile_c)).to(tl.int64)
+    tile = tl.load(x + rs[:, None] * c + cs[None, :]).to(tl.float32)
+    tile = tl.where((rs < tl.load(rows))[:, None], tile, 0.0)
+    v, e = _in_e4m3(tile.reshape(tile_r, tile_c // 32, 32))
+    tl.store(values + rs[:, None] * c + cs[None, :], v.reshape(tile_r, tile_c))
+    blocks_c = j * (tile_c // 32) + tl.arange(0, tile_c // 32)
+    tl.store(scales + rs[:, None] * (c // 32) + blocks_c[None, :], e)
+    v, e = _in_e4m3(tl.trans(tile).reshape(tile_c, tile_r // 32, 32))
+    tl.store(t_values + cs[:, None] * r + rs[None, :], v.reshape(tile_c, tile_r))
+    blocks_r = i * (tile_r // 32) + tl.arange(0, tile_r // 32)
+    tl.store(t_scales + cs[:, None] * (r // 32) + blocks_r[None, :], e)
 
 
 # Triton's pointers, which index and load as arrays do not, and its constants.

@@ -16,7 +16,7 @@ from jaxtyping import Array, Float
 
 from bux import config as cfg
 from bux import parallel
-from bux.architecture import Model, blockscaled, matmuls, remat
+from bux.architecture import Model, blockscaled, grouped_blockscaled, matmuls, remat
 from bux.architecture.linear_attention import delta_rule, l2norm, recurrence
 from bux.architecture.moe import MoE
 from bux.architecture.norm import Norm
@@ -588,9 +588,51 @@ def test_first_and_last_branches_inside_a_pipeline_are_an_error(losses):
         losses(SCANNED, **given)
 
 
-def test_the_routed_experts_in_a_format_are_an_error():
-    with pytest.raises(BuxError, match="grouped block-scaled GEMM is not in bux yet"):
-        compile_runs(_source("precision = precision(roles=roles(experts=mxfp8))"))
+def test_the_routed_experts_in_a_format_with_no_grouped_gemm_are_an_error():
+    with pytest.raises(BuxError, match="bux has no grouped GEMM in nvfp4"):
+        compile_runs(_source("precision = precision(roles=roles(experts=nvfp4))"))
+
+
+# The moe architecture's 2 MoEs, each a GEMM of up and gate, and one of down.
+GROUPED = {
+    "matmuls=mxfp8": 4,
+    "roles=roles(experts=mxfp8)": 4,
+    "roles=roles(experts=mxfp8_2d)": 4,
+    "matmuls=mxfp8, roles=roles(experts=compute)": 0,
+    "matmuls=nvfp4": 0,  # no grouped GEMM in it: compute
+    "matmuls=mxfp8, first=1": 2,  # the first MoE is the first branch
+}
+
+
+@pytest.mark.parametrize("given", GROUPED)
+def test_the_routed_experts_multiply_as_their_role_or_matmuls_say(monkeypatch, given):
+    calls, ragged_dot = [], grouped_blockscaled.ragged_dot
+
+    def counted(*args, **kwargs):
+        calls.append(args[3])  # its recipe
+        return ragged_dot(*args, **kwargs)
+
+    monkeypatch.setattr(grouped_blockscaled, "ragged_dot", counted)
+    [run] = compile_runs(
+        _source(f"precision = precision({given})", arch=ARCHITECTURES["moe"])
+    )
+    model = parallel.build(lambda: Model(run.arch, rngs=nnx.Rngs(0)))
+    _block_scaled(model, run.train.precision)
+    assert len(calls) == GROUPED[given]
+
+
+# In float32, as above; but the experts' dW quantizes in blocks of 32 of the rows each
+# device has of an expert, which differ as a mesh splits the tokens.
+@pytest.mark.parametrize("method", ["sorted", "all_to_all", "all_gather"])
+def test_mxfp8_experts_on_a_split_mesh_train_near_one_device(losses, method):
+    given = {
+        "optimizer": STABLE,
+        "precision": "precision(compute=float32, roles=roles(experts=mxfp8))",
+        "methods": f"methods(moe={method})",
+    }
+    one = losses(ARCHITECTURES["moe"], mesh=ONE, **given)
+    split = losses(ARCHITECTURES["moe"], mesh="mesh(fsdp=2, expert=4)", **given)
+    assert np.allclose(split, one, rtol=1e-4)
 
 
 def test_a_switch_takes_up_its_passes_at_its_step(losses):
@@ -675,9 +717,11 @@ def test_precision_s_new_settings_at_their_defaults_keep_the_run_s_id():
     plain, f32 = run_id(), run_id("precision = precision(compute=float32)")
     assert run_id("precision = precision(eval=compute)") == plain
     assert run_id("precision = precision(compute=float32, eval=compute)") == f32
-    defaults = "precision(roles=roles(), first=0, last=0, moments=float32)"
+    defaults = (
+        "precision(roles=roles(), first=0, last=0, moments=float32, dispatch=compute)"
+    )
     assert run_id(f"precision = {defaults}") == plain
-    for changed in ("last=2", "moments=bfloat16", "passes=[fprop,]"):
+    for changed in ("last=2", "moments=bfloat16", "passes=[fprop,]", "dispatch=mxfp8"):
         assert run_id(f"precision = precision({changed})") != plain
 
 

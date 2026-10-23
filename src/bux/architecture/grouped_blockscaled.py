@@ -32,6 +32,7 @@ except ImportError:
     grouped_triton = None
 
 BLOCK = blockscaled.MX_BLOCK
+TRITON_QUANTIZES = True  # MXFP8's quantizer on a GPU: Triton's kernel, or blockscaled's
 # The formats of ``matmuls`` that run here, by their recipes: train.config.GROUPED.
 RECIPES = {"mxfp8": blockscaled.MXFP8, "mxfp8_2d": blockscaled.MXFP8_2D}
 
@@ -90,8 +91,8 @@ def _forward(
     passes: tuple[Pass, ...],
 ) -> tuple[Float[Array, "m n"], Saved]:
     fprop, dgrad, wgrad = (p in passes for p in PASSES)
-    x = _in_groups(x, sizes)
-    x_k, x_m = _twice(recipe.x, x, seed, rows=fprop, columns=wgrad)
+    rows = sizes.sum()
+    x_k, x_m = _twice(recipe.x, x, seed, rows=fprop, columns=wgrad, kept=rows)
     w_n, w_k = _each_twice(recipe.w, w, seed, rows=dgrad, columns=fprop)
     y = _rows(x_k, w_k, sizes, dtypes[2], stacked="columns")
     return y, (x_m, w_n, sizes, seed)
@@ -106,8 +107,8 @@ def _backward(
 ) -> tuple[Float[Array, "m k"], Float[Array, "g k n"], None, None]:
     x_m, w_n, sizes, seed = saved
     _, dgrad, wgrad = (p in passes for p in PASSES)
-    dy = _in_groups(dy, sizes)
-    dy_n, dy_m = _twice(recipe.dy, dy, seed, rows=dgrad, columns=wgrad)
+    rows = sizes.sum()
+    dy_n, dy_m = _twice(recipe.dy, dy, seed, rows=dgrad, columns=wgrad, kept=rows)
     w_t = w_n if isinstance(w_n, Blocks) else jnp.swapaxes(w_n, 1, 2)
     dx = _rows(dy_n, w_t, sizes, dtypes[0], stacked="rows")
     return dx, _contract(x_m, dy_m, sizes, dtypes[1]), None, None
@@ -116,25 +117,42 @@ def _backward(
 _ragged.defvjp(_forward, _backward)
 
 
-def _in_groups(x: Float[Array, "m k"], sizes: Int[Array, " g"]) -> Float[Array, "m k"]:
-    """Return x with the rows past the groups 0: an exchange's buffer leaves them as
-    they were, and a block of x^T would scale them with the groups' last rows."""
-    return jnp.where((jnp.arange(x.shape[0]) < sizes.sum())[:, None], x, 0)
-
-
 def _twice(
     quantize: Twice,
     a: Float[Array, "r c"],
     seed: UInt32[Array, ""],
     rows: bool,
     columns: bool,
+    kept: Int[Array, ""] | None = None,
 ) -> tuple[Rows, Rows]:
     """Return a in blocks along its rows where `rows`, and a^T in blocks along its
-    columns where `columns`; else a, as it is."""
+    columns where `columns`; else a, as it is. Its rows from `kept` on quantize as 0:
+    an exchange's buffer leaves them as they were, and a block of a^T would scale
+    them with the groups' last rows."""
     if not rows and not columns:
         return a, a
-    along_rows, along_columns = quantize(a, seed)
+    kept = jnp.asarray(a.shape[0]) if kept is None else kept
+    along_rows, along_columns = _quantized(quantize, a, seed, kept)
     return along_rows if rows else a, along_columns if columns else a
+
+
+def _quantized(
+    quantize: Twice,
+    a: Float[Array, "r c"],
+    seed: UInt32[Array, ""],
+    kept: Int[Array, ""],
+) -> tuple[Blocks, Blocks]:
+    """Return quantize(a), a's rows from `kept` on as 0: MXFP8 by Triton's kernel on
+    a GPU, in one pass with the zeros."""
+    if TRITON_QUANTIZES and quantize is blockscaled.mx_twice and _triton():
+        assert grouped_triton is not None
+        return grouped_triton.quantized_twice(a, kept)
+    return quantize(jnp.where((jnp.arange(a.shape[0]) < kept)[:, None], a, 0), seed)
+
+
+def _triton() -> bool:
+    """Whether Triton's kernels run here."""
+    return grouped_triton is not None and kernels.gpu()
 
 
 def _each_twice(
@@ -171,7 +189,8 @@ def _rows(
         assert not isinstance(b, Blocks)
         return grouped.dot(a, b, sizes).astype(out)
     assert isinstance(b, Blocks)
-    if grouped_triton is not None and kernels.gpu():
+    if _triton():
+        assert grouped_triton is not None
         at = tiles_of(sizes, a.values.shape[0], grouped_triton.ROWS.m)
         y = grouped_triton.rows(a, b, at, sizes.shape[0], stacked, out)
         return jnp.where((jnp.arange(y.shape[0]) < sizes.sum())[:, None], y, 0)
@@ -180,7 +199,10 @@ def _rows(
 
 
 def _contract(
-    a: Rows, b: Rows, sizes: Int[Array, " g"], out: DTypeLike
+    a: Rows,
+    b: Blocks | Float[Array, "m n"],
+    sizes: Int[Array, " g"],
+    out: DTypeLike,
 ) -> Float[Array, "g k n"]:
     """Return a^T b over each group's rows: in the format where both are, given as
     a^T and b^T in blocks along the rows, by Triton on a GPU; else by ``grouped``."""
@@ -188,7 +210,8 @@ def _contract(
         assert not isinstance(b, Blocks)
         return grouped.weight_grad(a, b, sizes).astype(out)
     assert isinstance(b, Blocks)
-    if grouped_triton is not None and kernels.gpu():
+    if _triton():
+        assert grouped_triton is not None
         return grouped_triton.contract(a, b, sizes, out)
     rows = (dequantized(a).T, dequantized(b).T)
     dw = jax.lax.ragged_dot_general(*rows, sizes, grouped.RAGGED_CONTRACTING)
