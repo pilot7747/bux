@@ -228,7 +228,9 @@ def layout() -> dict[str, list[int] | None]:
     """Return how the run in force lays out its state where the arrays' paths and
     shapes do not say: the passes of an uneven pipeline's stages, which spread its
     layers over them as no other split does (``pipeline.spread``)."""
-    split = parallel.pipeline.uneven() if parallel.pipeline.pipelined() else None
+    on, split = parallel.active(), None
+    if on is not None and parallel.pipeline.pipelined():
+        split = on.methods.stages
     if split is not None and len(set(split)) == 1:
         split = None  # even, as a pipeline lays out its layers without a split
     return {"methods.stages": None if split is None else list(split)}
