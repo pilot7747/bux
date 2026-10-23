@@ -125,7 +125,9 @@ def shard(x: Shaped[Array, "*s"], *names: Name) -> Shaped[Array, "*s"]:
     if (on := active()) is None:
         return x
     split = partition(resolve(names, x.shape, on))
-    if not isinstance(x, Tracer):
+    manual = jax.sharding.get_abstract_mesh().manual_axes
+    if not isinstance(x, Tracer) or not manual:
+        # So also a gradient's tracer of an array that is not on the mesh yet.
         return jax.lax.with_sharding_constraint(x, NamedSharding(on.mesh, split))
     # A bare spec is of the mesh being traced, which knows a shard_map's manual axes.
     return jax.lax.with_sharding_constraint(x, split)

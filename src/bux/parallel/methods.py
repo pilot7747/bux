@@ -32,6 +32,7 @@ remat = _registry("remat")
 pipeline = _registry("pipeline")
 orthogonalize = _registry("orthogonalize")
 loss = _registry("loss")
+tensor = _registry("tensor")
 
 REGISTRIES = {
     "attention": attention,
@@ -42,6 +43,7 @@ REGISTRIES = {
     "pipeline": pipeline,
     "orthogonalize": orthogonalize,
     "loss": loss,
+    "tensor": tensor,
 }
 
 

@@ -505,10 +505,11 @@ alone splits them.
 
 Constraints:
 
-- Each mixer's input is `(batch, seq, none)`: with `layout(stream=tensor)` it is
-  gathered once before the projections, not their weights. (The MLP gathers its
-  input without one.) Per-head arrays are `(batch, seq, heads, ...)`, the hidden units
-  `(batch, seq, mlp)`, and the SSMs' channels before `out_proj` theirs.
+- Each mixer's input is `(batch, seq, none)`, and so is the MLP's: with
+  `layout(stream=tensor)` it is gathered once before the projections, not their
+  weights ([below](#tensor-parallelism-methodstensor)). Per-head arrays are
+  `(batch, seq, heads, ...)`, the hidden units `(batch, seq, mlp)`, and the SSMs'
+  channels before `out_proj` theirs.
 - The embedding gathers from its table whole but for the vocabulary, into
   `(batch, seq, none)`, then `shard_stream`. From a table split over `fsdp`, XLA
   rematerializes it in full; into positions split over `tensor`, it gathers the
@@ -528,6 +529,98 @@ On the 8 fake devices, every family trains as on one device to 4e-6 under
 `tensor=4` and `fsdp=8`, with no involuntary rematerialization. The tests train at
 `lr=1e-3`: at `1e-2` their small runs are unstable, and rounding (from `data=8` too)
 grows past 1e-5 in three steps.
+
+## Tensor parallelism: `methods.tensor`
+
+At a layer's edges, TP communicates. Under sequence parallelism a device gathers the
+layer's input over `tensor` before the projections that split by columns, and the
+output projection's partial sums reduce-scatter back to its positions; without it,
+they all-reduce. How those collectives meet the matmuls is a method:
+
+```
+methods = methods(tensor=chunked, tensor_chunks=2)
+```
+
+| method    | what it does                                                          |
+|-----------|-----------------------------------------------------------------------|
+| `gspmd`   | the default: the compiler's collectives, at the boundary of the matmul each feeds or drains, which waits for it |
+| `chunked` | each device's rows in `tensor_chunks` chunks (2), in a `shard_map` manual over every axis: chunk i + 1 all-gathers while chunk i multiplies, and chunk i reduce-scatters while chunk i + 1 multiplies |
+
+GQA's q, k and v (or its fused `qkv`) and the MLPs' up and gate, the shared experts'
+too, project their input by `sharding.project_input`; their output projections, and
+MLA's, by `sharding.project_output`. The other layers gather their input as `gspmd`
+does. Each chunk's collective is NCCL's, at full NVLink speed, and an optimization
+barrier ties it to the one before, so that XLA neither combines them nor runs them
+side by side. `chunked` is `gspmd` where it has nothing to overlap (no sequence
+parallelism for the input projections), where a kernel splits otherwise than by
+`tensor`, and where a device's share would multiply otherwise than the whole, in
+the format that projection takes in its branch (its role's, or compute in the
+`first` and `last`): in `mxfp8` and `mxfp8_2d` unless the chunk's tokens and the
+share are whole blocks, and in `nvfp4` always, whose scale is the whole operand's.
+Where `tensor_chunks` does not divide a device's rows, it takes as many chunks as
+divide both. A method is a class of two functions:
+
+```python
+from bux.parallel import methods, tensor
+
+
+@methods.tensor.register("mine")
+class Mine:
+    @staticmethod
+    def project_in(x, linears):  # -> the input as the layer takes it, [l(x), ...]
+        return tensor.GSPMD.project_in(x, linears)
+
+    @staticmethod
+    def project_out(h, linear):  # -> linear(h), split as the stream is
+        return linear(h)
+```
+
+On 8 CPU devices `chunked` gives `gspmd`'s outputs and gradients to 1e-5, in 1, 2
+and 4 chunks, on `fsdp=2, tensor=4` and `tensor=8` with sequence parallelism, on
+`fsdp=2, context=2, tensor=2` with the stream over both, and on `data=4, tensor=2`
+without; in `mxfp8` and `mxfp8_2d` too. With `nvfp4` for the MLPs, or for all but
+the first and last branches, those stay `gspmd`'s, and the gradients they take from
+chunked branches move some of NVFP4's values a step: to 1e-3. A Llama (scanned,
+rematerialized, in 2 microbatches) and an MoE (rematerialized) train as on one
+device, with no involuntary rematerialization.
+
+On 8 B300s, 4 of Llama 3 70B's layers (scanned, `remat=full`, 8 rows of 4096), TP=8
+with sequence parallelism, tokens a second and the exposed communication of a step
+in ms of its time:
+
+| `methods.tensor`   | bfloat16           | `matmuls=mxfp8`    |
+|--------------------|--------------------|--------------------|
+| `gspmd`            | 219k, 36.5 of 150  | 250k, 41.8 of 131  |
+| `chunked`, 2       | **222k**, 28.2 of 148 | **263k**, 26.5 of 125 |
+| `chunked`, 4       | 219k, 23.6 of 150  | 257k, 25.3 of 128  |
+
+Chunks hide a quarter to a third of the wait, and the matmuls beside them give most
+of it back: NCCL's ring kernels take 32 channels of SMs, so the GEMMs of a step take
+82 ms beside 2 chunks' collectives and 88 beside 4's, against 79, and the chunks'
+slices and concatenations 2.6 to 3.4 ms. With fewer CTAs (`NCCL_MAX_CTAS=8`) NCCL's
+collectives take more than twice as long. On `fsdp=2, tensor=4`, `chunked` is 3% slower
+(232k against 240k). In MXFP8 it is 5% faster: `gspmd`'s block-scaled output
+projections all-reduce their partial sums (32 ms a step), where `chunked`
+reduce-scatters them. So `gspmd` stays the default, and `chunked` is TP's method in
+MXFP8.
+
+Neither did these gain: the MLP by chunks from its gather to its reduce-scatter; each
+scanned pass on two halves of its rows side by side, which hides more (20 ms exposed
+with `chunked`) at 218k; XLA's windowed einsum (`compiler(preset=collective_matmul)`,
+93k, [XLA's options](training.md#xlas-options-compiler)). XLA's NCCL symmetric
+buffers, `compiler(options="--xla_gpu_experimental_enable_nccl_symmetric_buffers=true")`,
+make each 1.5 to 2.7% faster (224k by `gspmd`; 227k by `chunked` with
+`NCCL_CTA_POLICY=2`; 266k by `chunked` in MXFP8), but every such run ends its 40 steps
+at a loss of 12.058 rather than 12.075: NCCL's symmetric kernels reduce otherwise.
+
+Not yet: a collective matmul whose communication takes no SMs. TransformerEngine's
+(`dense(..., collective_op_set=...)`, its userbuffers on copy engines) is on PyPI only
+as source that builds against CUDA 12 (2.20.2), and would bring its own GEMMs and NCCL
+communicators. jax's Pallas kernel (`pallas.ops.gpu.collective_matmul_mgpu`) sends
+each tile of x on to the next device from shared memory, by remote refs, as its GEMM
+multiplies it, but only on Hopper, and through NVSHMEM, which jax 0.12's XLA does not
+enable: on a B300 it takes a port to tcgen05 (`blackwell_matmul_mgpu`) and a
+reduce-scatter in the epilogue of the output projection.
 
 ## Context parallelism for recurrent mixers: `methods.recurrence`
 

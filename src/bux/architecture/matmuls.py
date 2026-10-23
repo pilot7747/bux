@@ -40,6 +40,7 @@ from typing import Any
 
 import jax
 import jax.numpy as jnp
+from jax.sharding import AxisType
 from jax.sharding import PartitionSpec as P
 from jax.typing import DTypeLike
 from jaxtyping import Array, Float, Int, UInt32
@@ -430,8 +431,10 @@ def blocks_whole(
 
 def _whole(x: Float[Array, "..."], dims: list[int]) -> Float[Array, "..."]:
     """Constrain `x`'s `dims` to be whole on every device, and leave the rest to the
-    compiler; and its gradient likewise."""
-    if not dims or parallel.active() is None:
+    compiler; and its gradient likewise. In a shard_map manual over every axis, each
+    device holds its own part already."""
+    auto = AxisType.Auto in jax.sharding.get_abstract_mesh().axis_types
+    if not dims or parallel.active() is None or not auto:
         return x
     spec = [None if i in dims else P.UNCONSTRAINED for i in range(x.ndim)]
     return jax.lax.with_sharding_constraint(x, P(*spec))
