@@ -40,6 +40,7 @@ def scores(
     """Return every query's score of every key by the kernel: sum over heads of w
     times the ReLU'd dot product. Keys from a query's `end` on score 0 or anything:
     it does not see them."""
+    q, w, keys = jax.lax.stop_gradient((q, w, keys))  # nor the parameters behind them
     split = parallel.spec(("batch", "seq", "heads", None), q.shape)
     names = axes(split)
     if not names:

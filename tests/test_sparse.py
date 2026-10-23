@@ -264,3 +264,5 @@ def test_the_scoring_kernel_scores_as_xla_does():
     got = scoring._kernel(q, w, keys, end)
     np.testing.assert_allclose(got[..., :128], want[..., :128], atol=1e-4)
     assert not got[..., 128:].any()
+    passes = jax.grad(lambda q: scoring.scores(q, w, keys, end).sum())(q)
+    assert not passes.any()  # no gradient, the kernel's or its inputs'
