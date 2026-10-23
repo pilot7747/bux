@@ -21,6 +21,7 @@ from bux.parallel import flash, methods
 from bux.parallel.flash import Keys
 from bux.parallel.layout import shard, spec
 from bux.parallel.mesh import active
+from bux.train import flops
 
 AXIS = "context"
 MIN = float(jnp.finfo(jnp.float32).min)  # the logit of a masked key
@@ -131,9 +132,11 @@ def xla(
     """Compute attention from all t by t logits at once, the reference method. With
     `seq` over `context`, a device has its queries' rows of the logits and every key
     and value: all-gather context parallelism."""
-    mask = causal_mask(q.shape[1], args.window, args.ids)[..., None, :, :]
-    logits = softcap(scaled_logits(q, k, args.scale), args.softcap)
-    return weighted_values(masked_softmax(logits, mask, args.sinks), v)
+    t = q.shape[1]
+    mask = causal_mask(t, args.window, args.ids)[..., None, :, :]
+    with flops.visible(flops.causal_share(t, args.window)):  # for MFU
+        logits = softcap(scaled_logits(q, k, args.scale), args.softcap)
+        return weighted_values(masked_softmax(logits, mask, args.sinks), v)
 
 
 # --- on each device -----------------------------------------------------------------

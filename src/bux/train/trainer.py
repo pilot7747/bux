@@ -42,7 +42,7 @@ from bux.architecture.repeat import scanned_variables
 from bux.data.pipeline import DEFAULT_CACHE, jobs, prepare
 from bux.lang import ir
 from bux.lang.printer import run_to_source
-from bux.train import flops
+from bux.train import flops, xla
 from bux.train.data import Batch, batches, prefetch
 from bux.train.hooks import Checkpoint, Eval, Hook, Log, Profile
 from bux.train.objective import Metrics, Objective, objective, target_mask
@@ -137,6 +137,8 @@ class Trainer:
     With `donate`, a training step donates the model's and the optimizer's arrays, so
     that their new state takes the old one's memory: an array read from them before a
     step is gone after it, and one to keep is a copy (``np.asarray``).
+
+    The training step compiles with XLA's `compiler_options` (``bux.train.xla``).
     """
 
     def __init__(
@@ -149,6 +151,7 @@ class Trainer:
         matmuls: str = "compute",
         microbatches: int = 1,
         donate: bool = False,
+        compiler_options: xla.Options | None = None,
     ):
         self.model, self.objective = model, objective
         self.compute, self.microbatches = jnp.dtype(compute), microbatches
@@ -158,7 +161,9 @@ class Trainer:
         self.step = 0
         self.stopping = False  # set, by a signal handler say, to stop after this step
         donated = ("model", "optimizer") if donate else ()
-        self._train = nnx.jit(self._train_step_on_shards, donate_argnames=donated)
+        self._train = xla.jit(
+            self._train_step_on_shards, compiler_options or {}, donate_argnames=donated
+        )
         self._eval = nnx.jit(self.eval_step)
 
     def _train_step_on_shards(
@@ -355,6 +360,7 @@ def train(
             matmuls=config.precision.matmuls,
             microbatches=_accumulated(config.methods.microbatches),
             donate=config.methods.donate,
+            compiler_options=xla.options(config.compiler),
         )
         make_batches = functools.partial(
             batches, config=config, vocab_size=vocab, cache=cache
