@@ -7,6 +7,7 @@ import jax
 import jax.extend
 import jax.numpy as jnp
 import numpy as np
+import optax
 import pytest
 from flax import nnx
 from jaxtyping import Float, Shaped
@@ -20,7 +21,7 @@ from bux.lang import compile, compile_runs
 from bux.parallel import pipeline, schedule, split
 from bux.parallel.scheduled import _rebuilt
 from bux.train.data import plain
-from bux.train.objective import objective
+from bux.train.objective import Objective, objective
 from bux.train.optim import lr_multiplier, optimizer
 from bux.train.trainer import Trainer, _accumulated
 
@@ -61,15 +62,21 @@ def _run(source: str, mesh: str, methods: str):
     return run
 
 
+def _built(run) -> tuple[Model, optax.GradientTransformation, Objective]:
+    """The model of `run`, its optimizer and its objective, under the mesh in force."""
+    t = run.train
+    model = parallel.build(lambda: Model(run.arch, rngs=nnx.Rngs(0)))
+    tx = optimizer(t.optimizer, lr_multiplier(t.schedule, t.steps), model, t.clip)
+    return model, tx, objective(t.loss, run.arch)
+
+
 def _trainer(source: str, mesh: str, methods: str) -> Trainer:
     """A trainer of `source`'s model, made under `mesh` and `methods`."""
     run = _run(source, mesh, methods)
     t = run.train
     with parallel.use(t.mesh, t.layout, t.methods):
-        model = parallel.build(lambda: Model(run.arch, rngs=nnx.Rngs(0)))
-        tx = optimizer(t.optimizer, lr_multiplier(t.schedule, t.steps), model, t.clip)
+        model, tx, loss = _built(run)
         microbatches = _accumulated(t.methods.microbatches)
-        loss = objective(t.loss, run.arch)
         return Trainer(
             model, tx, loss, microbatches=microbatches, accumulate=t.methods.accumulate
         )
@@ -289,11 +296,8 @@ def _formats(name: str, monkeypatch) -> dict[int | None, set[str]]:
 
     monkeypatch.setattr(matmuls, "format_of", recorded)
     with parallel.use(t.mesh, t.layout, t.methods):
-        model = parallel.build(lambda: Model(run.arch, rngs=nnx.Rngs(0)))
-        tx = optimizer(t.optimizer, lr_multiplier(t.schedule, t.steps), model, t.clip)
-        trainer = Trainer(
-            model, tx, objective(t.loss, run.arch), matmuls=t.precision, microbatches=1
-        )
+        model, tx, loss = _built(run)
+        trainer = Trainer(model, tx, loss, matmuls=t.precision, microbatches=1)
         batch = parallel.shard_batch(plain(TOKENS))
         trainer._train.lower(trainer.model, trainer.optimizer, batch)
     monkeypatch.setattr(matmuls, "format_of", of)
@@ -378,9 +382,7 @@ def test_only_a_scheduled_pipeline_reduces_its_gradients_in_float32(name):
     run = _run(LLAMA, "mesh(stage=2, fsdp=4)", _how(name, 4))
     t = run.train
     with parallel.use(t.mesh, t.layout, t.methods):
-        model = parallel.build(lambda: Model(run.arch, rngs=nnx.Rngs(0)))
-        tx = optimizer(t.optimizer, lr_multiplier(t.schedule, t.steps), model, t.clip)
-        loss = objective(t.loss, run.arch)
+        model, tx, loss = _built(run)
 
         def make() -> Trainer:
             return Trainer(model, tx, loss, compute="bfloat16", reduce="float32")
