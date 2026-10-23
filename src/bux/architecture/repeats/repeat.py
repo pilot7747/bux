@@ -171,7 +171,8 @@ class Scanned(nnx.Module):
         self.rounds = rounds
 
     def _by_stage(self) -> None:
-        """Lay the stacked passes out by stage, each stage's after the one's before."""
+        """Lay the stacked passes out by stage, as many to a stage as the most any runs
+        (``pipeline.spread``)."""
         shares = pipeline.shares(self.times)
         for v in _variables(self.layers):
             names = v.get_metadata()[NAMES][1:]
