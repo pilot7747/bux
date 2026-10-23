@@ -199,8 +199,8 @@ Four settings choose which projections, and when:
 `eval=compute` evaluates in compute, whatever training multiplies in, and is not in
 the run's id. `dispatch=mxfp8` has the ragged MoE methods send the tokens to their
 experts in MXFP8, as DeepSeek-V3 does, and what comes back in compute
-(docs/parallelism.md, "FP8 dispatch"). `moments=bfloat16` keeps the optimizer's moments in bfloat16 between
-steps, as DeepSeek-V3's AdamW does, and updates them in float32. Rounded to nearest,
+(docs/parallelism.md, "FP8 dispatch"). `moments=bfloat16` keeps the optimizer's
+moments in bfloat16 between steps, as DeepSeek-V3's AdamW does, and updates them in float32. Rounded to nearest,
 a moment ignores a change below 2^-9 of itself: at b2 = 0.95, a square gradient 4%
 off the second moment moves it, at 0.999 only one 3x off.
 

@@ -703,20 +703,20 @@ precision = precision(roles=roles(experts=mxfp8))
 ```
 
 The routed experts' role, `experts`, takes `compute`, `mxfp8` or `mxfp8_2d`
-(docs/training.md, "Precision"), and `nvfp4` is an error. Unlike the other roles,
-none is compute, not `matmuls`: on B300s it trains slower than bfloat16 (below). In a
-format, `experts` runs up and gate as one GEMM, so
-that x quantizes once, and each GEMM by `grouped_blockscaled.ragged_dot`: every operand
-of the forward's GEMM and of the backward's two quantized along what that GEMM
-contracts, as a projection's are, and each expert's W on its own. On a GPU Triton's
-`tl.dot_scaled` multiplies them, Blackwell's block-scaled MMA, in the kernels of
-`grouped_triton`, which load by TMA: `rows` for x W and dy W^T, a program per tile of
-rows of each expert, and `contract` for dW, the tiles of rows wholly inside an expert
-by TMA and the two it shares with its neighbours by loads that take the neighbours'
-rows as 0. One pass of a Triton kernel quantizes x and x^T, and zeroes the rows past
-the experts', which an exchange's buffer leaves as they were. Elsewhere XLA dequantizes
-and multiplies, which computes the same values, so the tests run it on CPU. Only
-`passes` multiply in the format, the others by `grouped`'s kernels, as they are.
+(docs/training.md, "Precision"), and `nvfp4` is an error. Unlike the other roles, none
+is compute, not `matmuls`: on B300s it trains slower than bfloat16 (below). In a
+format, `experts` runs up and gate as one GEMM, so that x quantizes once, and each
+GEMM by `grouped_blockscaled.ragged_dot`: every operand of the forward's GEMM and of
+the backward's two quantized along what that GEMM contracts, as a projection's are,
+and each expert's W on its own. On a GPU Triton's `tl.dot_scaled` multiplies them,
+Blackwell's block-scaled MMA, in the kernels of `grouped_triton`, which load by TMA:
+`rows` for x W and dy W^T, a program per tile of rows of each expert, and `contract`
+for dW, the tiles of rows wholly inside an expert by TMA and the two it shares with
+its neighbours by loads that take the neighbours' rows as 0. One pass of a Triton
+kernel quantizes x and x^T, and zeroes the rows past the experts', which an exchange's
+buffer leaves as they were. Elsewhere XLA dequantizes and multiplies, which computes
+the same values, so the tests run it on CPU. Only `passes` multiply in the format, the
+others by `grouped`'s kernels, as they are.
 
 Unlike a projection's, the experts' dW quantizes the rows a device has of an expert in
 blocks of 32 as they lie: a block that two experts share has one scale, and each
@@ -860,8 +860,7 @@ On one node at this shape, then, `sorted` is still the fastest: its FSDP gathers
 GB of experts a layer, where the exchanges move 1 GB of picks each way. Under `dots`
 the exchanges ran again in the backward, since their results are no products; named
 for it ([below](#fp8-dispatch-precisiondispatch)), `ragged_all_to_all` trains at 515k
-tokens a second in 77.5 GiB, from 452k in 72.6. XLA's
-ragged all-to-all leaves an allocation inside the memory pool after the first step,
+tokens a second in 77.5 GiB, from 452k in 72.6. XLA's ragged all-to-all leaves an allocation inside the memory pool after the first step,
 so that a step whose temporaries take over half of it fits only once:
 `XLA_PYTHON_CLIENT_MEM_FRACTION=.95` gives the pool more room. `ragged_tokens` moves
 about 30% fewer rows when the routing is random, and half as few or fewer where a
@@ -1297,11 +1296,11 @@ branch it is in (docs/training.md, "Precision"): attention's q, k, v, o and gate
 the MLPs', the shared experts' and LatentMoE's; MLA's, CSA's, the indexer's; the
 linear attentions', RWKV-7's and Mamba's; Engram's, nextn's and `linear`'s. The routed
 experts multiply in `compute` unless their role says `mxfp8` or `mxfp8_2d`, which a
-grouped GEMM of their own takes ([The experts in MXFP8](#the-experts-in-mxfp8)). These stay
-in `compute`: the embedding and the head, softmax attention's own matmuls and its
+grouped GEMM of their own takes ([The experts in MXFP8](#the-experts-in-mxfp8)).
+These stay in `compute`: the embedding and the head, softmax attention's own matmuls and its
 relative bias, the router and the shared experts' gate, hyper-connections, norms,
-low-rank gates and decays, recurrent states, and `methods(moe=dense)`'s einsums. A projection whose tokens,
-inputs or outputs are not whole blocks multiplies in `compute`. On a mesh, one that
+low-rank gates and decays, recurrent states, and `methods(moe=dense)`'s einsums. A
+projection whose tokens, inputs or outputs are not whole blocks multiplies in `compute`. On a mesh, one that
 does not split into whole blocks on every device (a multiple of the block times the
 devices) stays whole on each: so the blocks are the same on any mesh, and so is what a
 run computes, which `tests/test_precision.py` checks on `fsdp=4, tensor=2` and in a
