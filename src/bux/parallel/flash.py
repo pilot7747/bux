@@ -20,16 +20,11 @@ import jax
 import jax.numpy as jnp
 from jaxtyping import Array, Bool, Float, Int
 
-from bux import kernels
+from bux import jax_internals, kernels
 
-try:  # tokamax's kernels, where its extra is installed (Linux)
-    from tokamax._src.ops.attention import api as tokamax
-    from tokamax._src.ops.attention import base as masks
-
-    MOSAIC = tokamax.IMPLEMENTATIONS.get("mosaic_gpu")
-    TRITON = tokamax.IMPLEMENTATIONS.get("triton")
-except ImportError:
-    MOSAIC = TRITON = masks = None
+# tokamax's kernels, None where its extra is not installed (it is on Linux)
+MOSAIC = jax_internals.tokamax_attention("mosaic_gpu")
+TRITON = jax_internals.tokamax_attention("triton")
 
 F32 = jnp.float32
 
@@ -181,9 +176,10 @@ def triton(
 
 
 def _tokamax_args(keys: Keys, scale: float, cap: float | None) -> dict:
-    assert masks is not None
     per_head = [None if x is None else x[:, None] for x in (keys.start, keys.end)]
-    mask = masks.Mask(k_start=per_head[0], k_end=per_head[1], is_causal=keys.causal)
+    mask = jax_internals.tokamax_mask(
+        k_start=per_head[0], k_end=per_head[1], is_causal=keys.causal
+    )
     return {
         "mask": mask,
         "logits_scale": scale,
@@ -221,11 +217,8 @@ def _tokamax_backward(
 ) -> Grads:
     """tokamax's VJP, given the residuals (lse, 1): P = exp(s - lse)."""
     assert MOSAIC is not None
-    lse = _finite(lse)
-    bound = MOSAIC.bind(q, k, v, **_tokamax_args(keys, scale, cap))
-    kwargs = {n: a for n, a in bound.kwargs.items() if n != "return_residuals"}
-    grads = MOSAIC.vjp((lse, jnp.ones_like(lse)), out, dout, *bound.args, **kwargs)
-    return grads["q"], grads["k"], grads["v"]
+    args = _tokamax_args(keys, scale, cap)
+    return jax_internals.tokamax_vjp(MOSAIC, _finite(lse), out, dout, q, k, v, args)
 
 
 TOKAMAX = Kernel(_tokamax_forward, _tokamax_backward)
@@ -357,13 +350,7 @@ def cudnn_runs() -> bool:
 
 @cache
 def _cudnn_here() -> bool:
-    if jax.default_backend() != "gpu":
-        return False
-    from jax._src.cudnn import fused_attention_stablehlo as fused
-
-    try:
-        fused.check_cudnn_version()
-    except RuntimeError:
+    if jax.default_backend() != "gpu" or not jax_internals.cudnn_attention_here():
         return False
     return float(getattr(jax.devices()[0], "compute_capability", 0)) >= 9
 
@@ -402,25 +389,10 @@ def cudnn(
     """Return cuDNN's causal attention of whole rows, within `window`, and each of up
     to `documents` documents of a row (by `ids`) by itself, in cuDNN's packed layout:
     cuDNN skips what no query sees, forward and backward."""
-    from jax._src.cudnn import fused_attention_stablehlo as fused
-
     lengths = starts = None
-    mask = fused.MaskType.CAUSAL
     if ids is not None:
         lengths, starts = packed_documents(ids, documents)
-        mask = fused.MaskType.PADDING_CAUSAL
-    return fused.dot_product_attention(
-        q,
-        k,
-        v,
-        q_seqlen=lengths,
-        kv_seqlen=lengths,
-        q_offsets=starts,
-        kv_offsets=starts,
-        scale=scale,
-        mask_type=mask,
-        sliding_window_length=window,
-    )
+    return jax_internals.cudnn_attention(q, k, v, lengths, starts, scale, window)
 
 
 def packed_documents(

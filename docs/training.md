@@ -437,7 +437,7 @@ by itself where it cannot run, and all of them do inside `bux.kernels.off()` or 
 | Gated DeltaNet, DeltaNet | cuDNN's fused GDN kernel (`fused_delta`), by cuDNN's graph from a `buffer_callback`: any gate | 5x `chunkwise` |
 | KDA with `gate_lower_bound` | cuDNN's fused KDA kernel (`fused_delta`) | 10x `chunkwise` |
 | MoE experts | `grouped.ragged_dot`: tokamax's Mosaic and Triton kernels | 27x `jax.lax.ragged_dot` |
-| MoE dispatch | `pick_rows`, `permuted`: gathers where XLA would scatter | 4x |
+| MoE dispatch | `token_rows`, `permuted`: gathers where XLA would scatter | 4x |
 | NVFP4's quantizers | `nvfp4`: Pallas kernels, a pass for the largest magnitudes and one that writes both copies, rounded by Blackwell's E2M1 conversions | 3-5x |
 
 Tokens a second on B300s, 8 × 4096 tokens a GPU, `precision(compute=bfloat16)`, and
@@ -695,6 +695,74 @@ The first process alone writes the console, `metrics.jsonl`, `status.json` and t
 run's files, and every one writes its part of a checkpoint, so `--out` is on a
 filesystem they all see. A signal to any of them stops them all after the same step.
 A sweep does not train on many hosts: give each run a job of its own, with `--index`.
+
+## Benchmarks
+
+`examples/benchmarks/` has a suite for each scale, a sweep of named runs of the 1.3B
+and its kin in `baseline.bux`: `one_gpu.bux`, the dense model, its GDN, KDA, bounded
+KDA and Mamba-2 hybrids, its MoE, and the dense one in MXFP8 and NVFP4, a GPU each;
+`one_node.bux`, FSDP at 1 and 8 microbatches, the MoE sorted and by EP, TP=8 in
+chunks and a 1f1b pipeline, on 8 GPUs; and `two_nodes.bux`, FSDP, HSDP and the MoE
+both ways, on 16. `scripts/benchmark.py` trains a suite and compares two results:
+
+```
+python scripts/benchmark.py run examples/benchmarks/one_gpu.bux --out new.json
+python scripts/benchmark.py compare old.json new.json
+```
+
+`run` trains each run in a worker of its own on the GPUs its mesh needs, as many side
+by side as fit, as a sweep's launch does; on many hosts each runs the same command,
+and the runs train one at a time on all of them. Of each run it keeps the median
+`tokens_per_s` and `mfu` of the logs after the first, whose time includes compiling,
+the peak memory of the busiest GPU, and the loss at every log, in the JSON file; the
+runs' directories and each worker's output (`<run>.txt`) go in the folder beside it.
+Settings after the suite go to every run (`'steps = 60'`), and `--only TEXT` trains
+only the runs whose name has TEXT.
+
+Nodes differ by a few percent, so measure a change against the tree before it, on the
+same node. `--tree PATH` trains the suite with another checkout's bux, `PATH/src`, in
+this one's environment, so a one-GPU suite runs both side by side on half a node each,
+and a node's suite runs one tree after the other:
+
+```
+git worktree add ../before main
+CUDA_VISIBLE_DEVICES=0,1,2,3 python scripts/benchmark.py run examples/benchmarks/one_gpu.bux \
+    --tree ../before --out old.json &
+CUDA_VISIBLE_DEVICES=4,5,6,7 python scripts/benchmark.py run examples/benchmarks/one_gpu.bux \
+    --out new.json
+wait
+python scripts/benchmark.py compare old.json new.json
+```
+
+`compare` prints a line a run, here of one tree against itself, side by side on a
+node of 8 B300s:
+
+```
+run              old tok/s  new tok/s   diff  new MFU  old GiB  new GiB  loss diff
+one_gpu[dense]     144,920    144,408  -0.4%    44.4%     51.1     51.1    -0.0001
+one_gpu[gdn]       121,571    120,504  -0.9%    37.9%     70.6     70.6    -0.0009
+one_gpu[kda]        60,217     59,961  -0.4%    18.9%    122.0    122.0    +0.0007
+one_gpu[kdab]      127,947    129,974  +1.6%    41.0%     91.4     91.4    -0.0005
+one_gpu[moe]       106,512    106,531  +0.0%    32.8%    134.0    134.0    -0.0407
+one_gpu[mamba2]     97,456     96,862  -0.6%    33.0%    122.6    122.6    +0.0002
+one_gpu[mxfp8]     169,221    167,646  -0.9%    51.5%     46.9     46.9    -0.0109
+one_gpu[nvfp4]     182,654    183,500  +0.5%    56.4%     43.8     43.8    -0.0005
+```
+
+`diff` is the change of the tokens a second, and `loss diff` the change of the loss at
+the last log. The node's suite, one tree after the other, moved by 0.3% at most: FSDP
+1.13M, at 8 microbatches 923k, the MoE sorted 832k and by EP 540k, TP 227k and the
+pipeline 683k; the two nodes' by 1.7%: FSDP and HSDP 2.21M, the MoE sorted 1.58M and
+by EP 1.04M. A run is `slower` or `faster` when its tokens a second move by more
+than `--noise` (3%), `more memory` or `less memory` when its peak does, `loss` when
+its last loss moves by more than `--loss` (0.05), and `failed`; `compare` exits with 1
+if any run is flagged but `faster` or `less memory`.
+
+XLA's GEMM autotuner picks kernels by timing them, and some kernels add in no fixed
+order, so two runs of one tree round differently: on these random tokens the MoE,
+whose top-k picks amplify it, ended up to 0.04 apart, every other run 0.011 at most.
+Pin `XLA_FLAGS="--xla_gpu_autotune_level=0 --xla_gpu_deterministic_ops=true"` on both
+before calling a smaller change of a loss a regression.
 
 ## The trainer's blocks
 

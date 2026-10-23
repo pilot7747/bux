@@ -1,0 +1,40 @@
+# The one-node suite: the baseline on 8 GPUs, each way it splits there. FSDP, at 1
+# and 8 microbatches; the MoE's experts sorted under FSDP, and sent to their GPUs by
+# a ragged all-to-all (EP) at a capacity of 1.25; 4 of Llama 3 70B's layers by tensor
+# parallelism with sequence parallelism, its collectives in chunks, a row a GPU; and
+# two pipeline stages of 10 and 6 layers, 1f1b.
+#
+#   python scripts/benchmark.py run examples/benchmarks/one_node.bux --out new.json
+use baseline
+
+wide_attn = gqa(num_heads=64, num_kv_heads=8, rope=rope(base=500000))
+wide_ffn  = gated_mlp(intermediate_size=28672, activation=swish)
+W = layer(wide_attn, wide_ffn)
+
+model   = fsdp:    embed A^16 norm head
+        | fsdp_m8: embed A^16 norm head
+        | moe:     embed E^16 norm head
+        | moe_ep:  embed E^16 norm head
+        | tp:      embed W^4 norm head
+        | pp:      embed A^16 norm head
+d_model = fsdp: 2048 | fsdp_m8: 2048 | moe: 2048 | moe_ep: 2048 | tp: 8192 | pp: 2048
+batch   = fsdp: 64   | fsdp_m8: 64   | moe: 64   | moe_ep: 64   | tp: 8    | pp: 64
+
+mesh    = fsdp:    mesh(fsdp=8)
+        | fsdp_m8: mesh(fsdp=8)
+        | moe:     mesh(fsdp=8)
+        | moe_ep:  mesh(expert=8)
+        | tp:      mesh(tensor=8)
+        | pp:      mesh(stage=2, fsdp=4)
+layout  = fsdp:    layout
+        | fsdp_m8: layout
+        | moe:     layout
+        | moe_ep:  layout
+        | tp:      layout(stream=tensor)
+        | pp:      layout
+methods = fsdp:    methods
+        | fsdp_m8: methods(microbatches=8)
+        | moe:     methods(moe=sorted)
+        | moe_ep:  methods(moe=ragged_all_to_all, capacity=1.25)
+        | tp:      methods(repeat=scan, remat=full, tensor=chunked)
+        | pp:      methods(repeat=scan, microbatches=8, pipeline="1f1b", stages=[10, 6])

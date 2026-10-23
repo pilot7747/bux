@@ -21,10 +21,10 @@ from typing import Any
 
 import jax
 import jax.numpy as jnp
-from jax.extend import core
 
-# Primitives that call a jaxpr, inlined before the split.
-CALLS = frozenset({"pjit", "jit", "closed_call", "core_call", "remat2", "checkpoint"})
+from bux import jax_internals
+from bux.jax_internals import core
+
 Key = Hashable  # a variable of a jaxpr, or a value a split scan stacks for W
 Env = dict[Any, Any]  # the value of each key
 PARTS = ("B", "W")
@@ -137,17 +137,15 @@ def _eval_inlined(
     env |= dict(zip(jaxpr.invars, args, strict=True))
     for eqn in jaxpr.eqns:
         ins = [_read(env, v) for v in eqn.invars]
-        if eqn.primitive.name in CALLS:
-            inner = eqn.params["jaxpr"]
-            if not isinstance(inner, core.ClosedJaxpr):
-                inner = core.ClosedJaxpr(inner, ())
+        if jax_internals.calls_a_jaxpr(eqn):
+            inner = jax_internals.called_jaxpr(eqn)
             outs = _eval_inlined(inner.jaxpr, inner.consts, ins)
-        elif eqn.primitive.name == "scan":
+        elif jax_internals.is_scan(eqn):
             outs = _rescanned(eqn, ins)
-        elif eqn.primitive.name == "cond":
+        elif jax_internals.is_cond(eqn):
             outs = _reconded(eqn, ins)
         else:
-            outs = _bind(eqn, ins)
+            outs = jax_internals.bind(eqn, ins)
         env |= dict(zip(eqn.outvars, outs, strict=True))
     return [_read(env, v) for v in jaxpr.outvars]
 
@@ -159,12 +157,13 @@ def _reconded(eqn: core.JaxprEqn, ins: list[Any]) -> list[Any]:
     def branch(b: core.ClosedJaxpr) -> Callable[..., list[Any]]:
         return lambda *ops: _eval_inlined(b.jaxpr, b.consts, ops)
 
-    return jax.lax.switch(index, [branch(b) for b in eqn.params["branches"]], *ops)
+    branches = jax_internals.cond_branches(eqn)
+    return jax.lax.switch(index, [branch(b) for b in branches], *ops)
 
 
 def _rescanned(eqn: core.JaxprEqn, ins: list[Any]) -> list[Any]:
     """Run the scan of `eqn` on `ins`, with its body inlined."""
-    body, (c, n) = eqn.params["jaxpr"], _counts(eqn)
+    body, (c, n) = jax_internals.scan_body(eqn), _counts(eqn)
     consts, init, xs = ins[:c], ins[c : c + n], ins[c + n :]
 
     def step(carry: list, x: list) -> tuple[list, list]:
@@ -177,25 +176,13 @@ def _rescanned(eqn: core.JaxprEqn, ins: list[Any]) -> list[Any]:
 
 def _counts(eqn: core.JaxprEqn) -> tuple[int, int]:
     """Return how many constants and carries the scan of `eqn` takes."""
-    consts, carry, _ = eqn.params["ft_in"].unpack()
-    return len(consts), len(carry)
+    return jax_internals.scan_counts(eqn)
 
 
 def _scan(
     eqn: core.JaxprEqn, step: Callable, init: list[Any], xs: Any
 ) -> tuple[Any, Any]:
-    p = eqn.params
-    return jax.lax.scan(
-        step, init, xs, length=p["length"], reverse=p["reverse"], unroll=p["unroll"]
-    )
-
-
-def _bind(eqn: core.JaxprEqn, ins: list[Any]) -> list[Any]:
-    """Run equation `eqn` on `ins`, as jax.core.eval_jaxpr does."""
-    params = eqn.primitive.get_bind_params(eqn.params)
-    with eqn.ctx.manager:
-        out = eqn.primitive.bind(*ins, **params)
-    return out if eqn.primitive.multiple_results else [out]
+    return jax.lax.scan(step, init, xs, **jax_internals.scan_options(eqn))
 
 
 def _read(env: Env, v: Any) -> Any:
@@ -222,11 +209,11 @@ def _plan(
     for i in reversed(range(len(jaxpr.eqns))):
         eqn = jaxpr.eqns[i]
         wanted = [any(v in need[p] for v in eqn.outvars) for p in PARTS]
-        if all(wanted) and eqn.primitive.name == "scan":
+        if all(wanted) and jax_internals.is_scan(eqn):
             scan = plan.parts[i] = _plan_scan(eqn, i, need)
             by_b |= {eqn.outvars[k] for k in [*scan.carried, *scan.outs["B"]]}
             by_b |= set(scan.stacked)
-        elif all(wanted) and eqn.primitive.name == "cond":
+        elif all(wanted) and jax_internals.is_cond(eqn):
             cond = plan.parts[i] = _plan_cond(eqn, i, need)
             by_b |= {eqn.outvars[k] for k in cond.outs["B"]}
             by_b |= set(itertools.chain(*cond.saved))
@@ -250,7 +237,7 @@ def _plan_scan(eqn: core.JaxprEqn, index: int, need: dict[str, set[Key]]) -> Sca
     """Plan a scan whose outputs both parts need, and add to `need` what each of its
     parts reads. `B` carries what it needs of the carries, and any carry its pass
     reads; `W` carries the rest."""
-    body, (c, n) = eqn.params["jaxpr"], _counts(eqn)
+    body, (c, n) = jax_internals.scan_body(eqn), _counts(eqn)
     invars, outs = body.jaxpr.invars, eqn.outvars
     carried = {k for k in range(n) if outs[k] in need["B"]}
     while True:  # until B carries every carry its passes read
@@ -309,7 +296,7 @@ def _plan_cond(eqn: core.JaxprEqn, index: int, need: dict[str, set[Key]]) -> Con
     needed["W"] = [v in need["W"] and not b for v, b in zip(outs, needed["B"])]
     branches = [
         _plan(b.jaxpr, b.consts, needed, [True] * len(b.jaxpr.invars))
-        for b in eqn.params["branches"]
+        for b in jax_internals.cond_branches(eqn)
     ]
     saved: list[list[Key]] = [
         [("cond", index, k, i) for i in range(len(b.saved))]
@@ -364,7 +351,7 @@ def _run(plan: Plan, env: Env, part: str) -> None:
     of each scan and cond that splits."""
     for eqn, p in zip(plan.jaxpr.eqns, plan.parts, strict=True):
         if p == part:
-            outs = _bind(eqn, [_read(env, v) for v in eqn.invars])
+            outs = jax_internals.bind(eqn, [_read(env, v) for v in eqn.invars])
             env |= dict(zip(eqn.outvars, outs, strict=True))
         elif isinstance(p, ScanPlan) and part == "B":
             _run_scan_b(eqn, p, env)
@@ -523,4 +510,4 @@ def _xs_read(eqn: core.JaxprEqn, scan: ScanPlan, part: str) -> list[Any]:
 
 
 def _index(eqn: core.JaxprEqn, body_var: Any) -> int:
-    return eqn.params["jaxpr"].jaxpr.invars.index(body_var)
+    return jax_internals.scan_body(eqn).jaxpr.invars.index(body_var)
