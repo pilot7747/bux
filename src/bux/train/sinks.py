@@ -72,11 +72,16 @@ class Console(Sink):
 
 
 class JSONL(Sink):
-    """One line of JSON per write, with its step: metrics.jsonl, the main process's."""
+    """One line of JSON per write, with its step: metrics.jsonl, the main process's.
+    A run that resumes at step `start` keeps the lines up to it, and drops those of
+    the steps it takes again, which a crash after its checkpoint left."""
 
-    def __init__(self, path: Path, *, append: bool = False):
-        mode = "a" if append else "w"
-        self.file = path.open(mode, encoding="utf-8") if is_main_process() else None
+    def __init__(self, path: Path, *, start: int = 0):
+        self.file = None
+        if is_main_process():
+            if start:
+                _drop_after(path, start)
+            self.file = path.open("a" if start else "w", encoding="utf-8")
 
     def write(self, step: int, scalars: Scalars) -> None:
         if self.file is not None:
@@ -86,6 +91,17 @@ class JSONL(Sink):
     def close(self) -> None:
         if self.file is not None:
             self.file.close()
+
+
+def _drop_after(path: Path, step: int) -> None:
+    """Drop the lines of `path` past `step`, and one a crash cut short."""
+    if not path.exists():
+        return
+    lines = path.read_text(encoding="utf-8").splitlines(keepends=True)
+    whole = [line for line in lines if line.endswith("\n")]
+    kept = [line for line in whole if json.loads(line)["step"] <= step]
+    if len(kept) < len(lines):
+        path.write_text("".join(kept), encoding="utf-8")
 
 
 class LatestMetrics(Sink):
