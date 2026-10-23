@@ -66,8 +66,8 @@ class Projection(NamedTuple):
     def finish(
         self, raw: Float[Array, "*n vocab"], bias: Float[Array, " vocab"] | None
     ) -> Float[Array, "*n vocab"]:
-        """Return the logits of x W: plus the bias, softcapped, in x W's dtype. The
-        backward of `chunks` differentiates it by jax, so another needs none."""
+        """Return the logits of x W: plus the bias, softcapped, in x W's dtype.
+        `chunks` differentiates it by jax as it goes, so another needs none."""
         logits = raw if bias is None else raw + bias.astype(raw.dtype)
         if self.softcap is None:
             return logits
@@ -255,6 +255,8 @@ def _sums_fwd(
 
     zeros = _shard(jnp.zeros((chunks.rows, chunks.seq, d, vocab)), None, "vocab")
     kernel = (zeros, None if bias is None else jnp.zeros_like(bias))
+    # Each sum's gradients of the kernel and the bias so far: the cross-entropy's, and
+    # the z-loss's if `z`.
     start = (Sums(jnp.zeros(()), jnp.zeros(())), [kernel] * (1 + z))
     xs = tuple(chunks.split(a) for a in (x, targets, weights))
     (sums, kernels), dxs = jax.lax.scan(step, start, xs)
