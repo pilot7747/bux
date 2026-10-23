@@ -614,6 +614,23 @@ def test_evaluation_in_compute_evaluates_as_compute_does():
     assert evaluated(in_compute) == evaluated("compute") != evaluated(mxfp8)
 
 
+def test_moments_in_bfloat16_train_with_gradients_reduced_once(losses, involuntary):
+    given = {
+        "mesh": "mesh(fsdp=8)",
+        "methods": "methods(microbatches=2, accumulate=unreduced)",
+        "optimizer": STABLE,
+        "batch": "16",
+        "steps": 5,
+    }
+    once = "precision(reduce=float32)"
+    f32 = losses(ARCHITECTURES["llama"], precision=once, **given)
+    involuntary()
+    moments = once.replace(")", ", moments=bfloat16)")
+    bf16 = losses(ARCHITECTURES["llama"], precision=moments, **given)
+    assert np.allclose(bf16, f32, rtol=1e-3) and bf16 != f32
+    assert involuntary() == 0
+
+
 def test_moments_in_bfloat16_train_near_float32(losses):
     given = {"mesh": ONE, "optimizer": STABLE, "steps": 5}
     f32 = losses(ARCHITECTURES["llama"], precision=BF16, **given)
