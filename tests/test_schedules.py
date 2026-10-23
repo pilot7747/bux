@@ -246,8 +246,9 @@ def test_a_scheduled_pipeline_reduces_once_where_it_runs_the_rows_apart(losses, 
 @pytest.mark.parametrize("remat", ["full", "dots"])
 def test_a_rematerialized_scheduled_pipeline_trains_as_one_device(losses, name, remat):
     how = _how(name, 4, remat=remat)
-    piped = losses(LLAMA, mesh="mesh(stage=2, data=1)", methods=how)
-    assert np.allclose(piped, losses(LLAMA, mesh=ONE, methods=SCAN), atol=1e-5)
+    piped = losses(LLAMA, mesh="mesh(stage=2, data=1)", methods=how, batch="16")
+    one = losses(LLAMA, mesh=ONE, methods=SCAN, batch="16")
+    assert np.allclose(piped, one, atol=1e-5)
 
 
 @pytest.mark.parametrize("name", PIPELINES)
