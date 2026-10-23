@@ -7,14 +7,16 @@ axes `layout.experts` gives them (`expert`), each device running its own.
                        per peer that holds every local pick: dropless
     ragged_all_to_all  each pick goes to its expert's device and back, in one ragged
                        slice per expert of each peer, so that a device's rows arrive
-                       sorted by its experts; `methods.capacity` bounds them. XLA:CPU
-                       lacks it
+                       sorted by its experts. XLA:CPU lacks it
+    ragged_tokens      each token goes once to each device its picks are on, with
+                       those picks, and back as their weighted sum
 
 Each runs a body on one device's tokens (``method``), in a shard_map manual over the
 axes that split the tokens, so that every device sorts its own. The experts' kernels
 enter split over the experts' axes and whole over the others (FSDP's gathered
 first); `tensor` stays Auto. Routing, the balance loss and the router bias ran
-before, in the global view.
+before, in the global view. `methods.capacity` bounds the rows a device of all but
+all_to_all takes, and the picks its experts run, at that many times its own picks.
 """
 
 import functools
@@ -124,6 +126,43 @@ def _tokens(z: Float[Array, "b t d"], ep: Axes) -> P:
     return P(rows or None, seq, None)
 
 
+# --- A capacity ------------------------------------------------------------------------
+
+
+def _rows(n: int, peers: int, capacity: float | None) -> int:
+    """Return how many rows a device of `peers` takes, sending `n`: `capacity` times
+    as many, or all that could come."""
+    most = n * peers
+    return most if capacity is None else min(most, math.ceil(capacity * n))
+
+
+def _fit(sizes: Int[Array, " g"], rows: int) -> Int[Array, " g"]:
+    """Return how many rows of each group fit in the first `rows`."""
+    return jnp.clip(rows - (jnp.cumsum(sizes) - sizes), 0, sizes)
+
+
+def _run_first(
+    x: Float[Array, "*v d"],
+    idx: Int[Array, "*v k"],
+    weights: Float[Array, "*v k"],
+    kernels: Kernels,
+    ffn: cfg.MLPConfig,
+    norm: Rows | None,
+    room: int,
+) -> tuple[Float[Array, "m d"], Int[Array, ""]]:
+    """Return each row's sum of its picks' expert outputs, weighted, as ``routed``
+    does, but of the first `room` picks by expert alone, flat; and how many ran. A
+    pick outside the experts adds nothing, as in ``routed``."""
+    (d, k), local = (x.shape[-1], idx.shape[-1]), kernels[0].shape[0]
+    order, sizes = sort_by_expert(idx, local)
+    back = jnp.argsort(order)
+    order, sizes = order[:room], _fit(sizes, room)
+    rows = pick_rows(x.reshape(-1, d), order, back, k)
+    made = experts(rows, sizes, *kernels, ffn, norm)
+    kept = jnp.where((idx >= 0) & (idx < local), weights, 0).reshape(-1)
+    return sum_rows(made * kept[order][:, None], back, order, k), sizes.sum()
+
+
 # --- all_gather ------------------------------------------------------------------------
 
 
@@ -214,13 +253,6 @@ class Ragged(NamedTuple):
     send_sizes: Int[Array, " s"]
     output_offsets: Int[Array, " s"]
     recv_sizes: Int[Array, " s"]
-
-
-def _rows(n: int, peers: int, capacity: float | None) -> int:
-    """Return how many rows a device of `peers` takes, sending `n`: `capacity` times
-    as many, or all that could come."""
-    most = n * peers
-    return most if capacity is None else min(most, math.ceil(capacity * n))
 
 
 def _slices(every: Int[Array, "p E"], rows: int) -> Slices:
@@ -359,33 +391,6 @@ def _picked_there(
     experts = jnp.where(there, idx[:, None, :] % local, local)
     picked = jnp.where(there, weights[:, None, :], 0)
     return experts.reshape(-1, idx.shape[-1]), picked.reshape(-1, idx.shape[-1])
-
-
-def _fit(sizes: Int[Array, " g"], rows: int) -> Int[Array, " g"]:
-    """Return how many rows of each group fit in the first `rows`."""
-    return jnp.clip(rows - (jnp.cumsum(sizes) - sizes), 0, sizes)
-
-
-def _run_first(
-    x: Float[Array, "*v d"],
-    idx: Int[Array, "*v k"],
-    weights: Float[Array, "*v k"],
-    kernels: Kernels,
-    ffn: cfg.MLPConfig,
-    norm: Rows | None,
-    room: int,
-) -> tuple[Float[Array, "m d"], Int[Array, ""]]:
-    """Return each row's sum of its picks' expert outputs, weighted, as ``routed``
-    does, but of the first `room` picks by expert alone, flat; and how many ran. A
-    pick outside the experts adds nothing, as in ``routed``."""
-    (d, k), local = (x.shape[-1], idx.shape[-1]), kernels[0].shape[0]
-    order, sizes = sort_by_expert(idx, local)
-    back = jnp.argsort(order)
-    order, sizes = order[:room], _fit(sizes, room)
-    rows = pick_rows(x.reshape(-1, d), order, back, k)
-    made = experts(rows, sizes, *kernels, ffn, norm)
-    kept = jnp.where((idx >= 0) & (idx < local), weights, 0).reshape(-1)
-    return sum_rows(made * kept[order][:, None], back, order, k), sizes.sum()
 
 
 def tokens(
