@@ -1,8 +1,8 @@
 """Grouped block-scaled GEMMs: an MoE's experts, y = x W[g] for the rows of each group
 g as `grouped.ragged_dot` runs them, and its gradients, each operand of each of the
 three GEMMs quantized along what that GEMM contracts as a `blockscaled.Recipe` says.
-On a GPU Triton's `tl.dot_scaled` multiplies them, Blackwell's block-scaled MMA
-(``grouped_triton``); elsewhere XLA dequantizes and multiplies, which computes the
+On a Blackwell GPU tcgen05's block-scaled MMA multiplies them, by Mosaic GPU kernels
+(``grouped_mxfp8``); elsewhere XLA dequantizes and multiplies, which computes the
 same values.
 
 The recipes whose values are E4M3 with a power-of-two scale per 32 run here
@@ -23,7 +23,7 @@ from jax.typing import DTypeLike
 from jaxtyping import Array, Float, Int, UInt32
 
 from bux import kernels
-from bux.architecture.experts import grouped
+from bux.architecture.experts import grouped, grouped_mxfp8
 from bux.architecture.precision import blockscaled
 from bux.architecture.precision.blockscaled import PASSES, Blocks, Pass, Twice
 
@@ -51,9 +51,10 @@ def ragged_dot(
     passes: tuple[Pass, ...] = PASSES,
 ) -> Float[Array, "m n"]:
     """Return what `grouped.ragged_dot` does, its GEMMs in `passes` as `recipe`
-    quantizes them. Rows go in blocks of 32 too, so x gains rows of 0 up to them."""
-    m = x.shape[0]
-    whole = -(-m // BLOCK) * BLOCK
+    quantizes them. Rows go in the kernels' tiles of 128 too, so x gains rows of 0
+    up to them."""
+    m, tile = x.shape[0], grouped_mxfp8.LANES
+    whole = -(-m // tile) * tile
     x = jnp.pad(x, ((0, whole - m), (0, 0))) if whole > m else x
     dtypes = (x.dtype, w.dtype, jnp.result_type(x, w))
     return _ragged(x, w, sizes, seed, recipe, dtypes, passes)[:m]
@@ -187,17 +188,14 @@ def _rows(
     stacked: Stacked,
 ) -> Float[Array, "m n"]:
     """Return each group's rows of a times its matrix: in the format where both are,
-    b's (n, k) matrices `stacked` so, by Triton on a GPU; else b[g] (k, n), by
-    ``grouped``'s kernels."""
+    b's (n, k) matrices `stacked` so, by ``grouped_mxfp8`` on a Blackwell GPU; else
+    b[g] (k, n), by ``grouped``'s kernels."""
     if not isinstance(a, Blocks):
         assert not isinstance(b, Blocks)
         return grouped.dot(a, b, sizes).astype(out)
     assert isinstance(b, Blocks)
-    if _triton():
-        assert grouped_triton is not None
-        at = tiles_of(sizes, a.values.shape[0], grouped_triton.ROWS.m)
-        y = grouped_triton.rows(a, b, at, sizes.shape[0], stacked, out)
-        return jnp.where((jnp.arange(y.shape[0]) < sizes.sum())[:, None], y, 0)
+    if grouped_mxfp8.runs():
+        return grouped_mxfp8.rows(a, b, sizes, stacked, out)
     matrices = _stacked(dequantized(b), sizes.shape[0], stacked)
     return jax.lax.ragged_dot(dequantized(a), matrices, sizes).astype(out)
 
@@ -209,14 +207,14 @@ def _contract(
     out: DTypeLike,
 ) -> Float[Array, "g k n"]:
     """Return a^T b over each group's rows: in the format where both are, given as
-    a^T and b^T in blocks along the rows, by Triton on a GPU; else by ``grouped``."""
+    a^T and b^T in blocks along the rows, by ``grouped_mxfp8`` on a Blackwell GPU;
+    else by ``grouped``."""
     if not isinstance(a, Blocks):
         assert not isinstance(b, Blocks)
         return grouped.weight_grad(a, b, sizes).astype(out)
     assert isinstance(b, Blocks)
-    if _triton():
-        assert grouped_triton is not None
-        return grouped_triton.contract(a, b, sizes, out)
+    if grouped_mxfp8.runs():
+        return grouped_mxfp8.contract(a, b, sizes, out)
     rows = (dequantized(a).T, dequantized(b).T)
     dw = jax.lax.ragged_dot_general(*rows, sizes, grouped.RAGGED_CONTRACTING)
     return dw.astype(out)
@@ -237,23 +235,3 @@ def _stacked(
     if stacked == "rows":
         return jnp.swapaxes(values.reshape(groups, -1, values.shape[-1]), 1, 2)
     return values.reshape(values.shape[0], groups, -1).transpose(1, 2, 0)
-
-
-def tiles_of(sizes: Int[Array, " g"], m: int, tile: int) -> Int[Array, "t 3"]:
-    """Return, for each tile of `tile` rows of m that a group has rows in, the group
-    and where its rows there start and end; then (0, 0, 0), as many as make the most
-    there can be: one a tile of m, and one more a group but the first."""
-    g = sizes.shape[0]
-    ends = jnp.cumsum(sizes)
-    starts = ends - sizes
-    first = starts // tile
-    count = jnp.where(sizes > 0, -(-ends // tile) - first, 0)
-    before = jnp.cumsum(count) - count
-    at = jnp.arange(-(-m // tile) + g - 1)
-    group = jnp.minimum(jnp.searchsorted(before + count, at, side="right"), g - 1)
-    index = first[group] + at - before[group]
-    lo = jnp.maximum(starts[group], index * tile)
-    hi = jnp.minimum(ends[group], (index + 1) * tile)
-    real = at < count.sum()
-    spans = [group, jnp.where(real, lo, 0), jnp.where(real, hi, 0)]
-    return jnp.stack(spans, -1).astype(jnp.int32)

@@ -35,6 +35,7 @@ from jax.experimental.pallas import mosaic_gpu as plgpu
 from jax.typing import DTypeLike
 from jaxtyping import Array, Bool, Float, Int, Shaped
 
+from bux import kernels
 from bux.architecture.precision.blockscaled import MX_BLOCK, Blocks
 
 E8M0 = jnp.float8_e8m0fnu
@@ -66,6 +67,14 @@ CONTRACT = Tiles(m=LANES, n=128, k=LANES, stages=5)  # k: a tile of rows
 
 # How each group's (n, k) matrix stacks: by rows, (g n, k); by columns, (n, g k).
 Stacked = Literal["rows", "columns"]
+
+
+def runs() -> bool:
+    """Whether these kernels run here: on a Blackwell GPU (sm_100 on), outside
+    ``kernels.off``."""
+    if not kernels.gpu():
+        return False
+    return float(getattr(jax.devices()[0], "compute_capability", 0)) >= 10
 
 
 # --- The operands, as the kernels load them ---------------------------------------
