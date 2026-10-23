@@ -81,7 +81,9 @@ class SoftmaxAttention(nnx.Module):
 
         # The randomly initialized layers, after the layer's own projections.
         self.gate = (
-            linear(width, gate_width, names, bias, rngs) if config.gated else None
+            linear(width, gate_width, names, bias, rngs, role="q")
+            if config.gated
+            else None
         )
         self._init_logit_layers(config, width, bias, rngs)
         self.output_dropout = (
@@ -182,10 +184,10 @@ class Attention(SoftmaxAttention):
         heads, kv_heads = ("heads", h), ("kv_heads", g)  # flattened with their dims
 
         def proj(
-            n_in: int, n_out: int, names: Names, bias: bool | None = None
+            n_in: int, n_out: int, names: Names, role: str, bias: bool | None = None
         ) -> nnx.Linear:
             bias = config.bias if bias is None else bias
-            return linear(n_in, n_out, names, bias, rngs)
+            return linear(n_in, n_out, names, bias, rngs, role=role)
 
         def conv(channels: int, size: int) -> CausalConv:
             return CausalConv(channels, size, False, rngs, channel=kv_heads)
@@ -195,12 +197,12 @@ class Attention(SoftmaxAttention):
         split = projects_kv and not config.fused_qkv
         # Fused, the split points of q, k and v do not fall on shard boundaries.
         self.qkv = (
-            proj(width, h * dk + g * (dk + dv), ("embed", None)) if fused else None
+            proj(width, h * dk + g * (dk + dv), ("embed", None), "q") if fused else None
         )
-        self.q = None if fused else proj(width, h * dk, ("embed", heads))
-        self.k = proj(width, g * dk, ("embed", kv_heads)) if split else None
-        self.v = proj(width, g * dv, ("embed", kv_heads)) if split else None
-        self.o = proj(h * dv, width, (heads, "embed"), config.output_bias)
+        self.q = None if fused else proj(width, h * dk, ("embed", heads), "q")
+        self.k = proj(width, g * dk, ("embed", kv_heads), "kv") if split else None
+        self.v = proj(width, g * dv, ("embed", kv_heads), "kv") if split else None
+        self.o = proj(h * dv, width, (heads, "embed"), "o", config.output_bias)
         size = config.kv_conv_size if projects_kv else None
         self.k_conv = conv(g * dk, size) if size else None
         self.v_conv = conv(g * dv, size) if size else None

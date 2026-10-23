@@ -24,9 +24,11 @@ def run(
     x: Stream,
     taps: Taps,
     compute: DTypeLike | None = None,
+    start: int = 0,
 ) -> tuple[Stream, nnx.State]:
     """Run the `times` layers that `graphdef` and the stacked `state` make on `x`, each
-    with its parameters cast to `compute`, if given (``cast``).
+    with its parameters cast to `compute`, if given (``cast``): passes `start` on of
+    their repeat, as the run's `remat(first=n)` counts them.
 
     Return the stream, and the layers' state other than parameters as they leave it.
     The scan starts at the first layer whose pass is steady (``_steady``): the first,
@@ -38,9 +40,10 @@ def run(
     for i in range(times):
         layer = cast(_at(state, i), compute)
         if i < 2 and (carry := _steady(graphdef, layer, x, taps)) is not None:
-            x, scanned = _scans(graphdef, state, (i, times), x, taps, carry, compute)
+            passes = (start + i, start + times)
+            x, scanned = _scans(graphdef, state, passes, x, taps, carry, compute, start)
             return x, _join([*done, *scanned])
-        with remat.at_pass(i):
+        with remat.at_pass(start + i):
             x, rest = _layer(graphdef, layer, x, taps)
         done.append(jax.tree.map(lambda a: a[None], rest))
     return x, _join(done)
@@ -54,18 +57,21 @@ def _scans(
     taps: Taps,
     carry: pure.Changes,
     compute: DTypeLike | None,
+    start: int = 0,
 ) -> tuple[Stream, list[nnx.State]]:
-    """Scan the layers from `passes[0]` to `passes[1]`, a scan for each run of them
-    that rematerializes alike (``remat.spans``), starting from `carry`."""
+    """Scan passes `passes[0]` to `passes[1]` of their repeat, a scan for each run of
+    them that rematerializes alike (``remat.spans``), starting from `carry`; `state`
+    holds their repeat's passes from `start` on."""
     rests = []
-    for start, stop in remat.spans(*passes):
-        if start > passes[0]:  # from the taps the last scan left
-            again = _steady(graphdef, cast(_at(state, start), compute), x, taps)
+    for first, stop in remat.spans(*passes):
+        if first > passes[0]:  # from the taps the last scan left
+            layer = cast(_at(state, first - start), compute)
+            again = _steady(graphdef, layer, x, taps)
             assert again is not None, "a pass that was steady is still"
             carry = again
-        with remat.at_pass(start):
-            layers = _between(state, start, stop)
-            x, rest = _scan(graphdef, layers, stop - start, x, taps, carry, compute)
+        with remat.at_pass(first):
+            layers = _between(state, first - start, stop - start)
+            x, rest = _scan(graphdef, layers, stop - first, x, taps, carry, compute)
         rests.append(rest)
     return x, rests
 

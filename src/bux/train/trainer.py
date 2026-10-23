@@ -165,8 +165,9 @@ class Trainer:
 
     Both compute in `compute`, the model's parameters cast to it inside the loss, so
     that the parameters, their gradients and the optimizer's state stay as they are
-    (float32); and the projections inside blocks multiply in the format `matmuls`
-    names (``bux.architecture.matmuls``).
+    (float32); and the projections inside blocks multiply as the precision `matmuls`
+    says, or in the format it names (``bux.architecture.matmuls``). At the step of a
+    `switch`, the steps take up its precision, and compile again.
 
     Made inside ``parallel.use``, it puts its state on the shardings the layout gives
     it, and every step keeps it there. A step that runs its layers more than once, in
@@ -191,7 +192,8 @@ class Trainer:
         objective: Objective,
         *,
         compute: DTypeLike = jnp.float32,
-        matmuls: str = "compute",
+        matmuls: PrecisionConfig | str = "compute",
+        switch: tuple[int, PrecisionConfig] | None = None,
         microbatches: int = 1,
         gather: str = "step",
         accumulate: str = "auto",
@@ -201,16 +203,23 @@ class Trainer:
     ):
         self.model, self.objective = model, objective
         self.compute, self.microbatches = jnp.dtype(compute), microbatches
-        self.matmuls, self.gather = matmuls, gather
+        self.matmuls, self.switch, self.gather = matmuls, switch, gather
         self.reduce, self.accumulate = jnp.dtype(reduce or compute), accumulate
         self.reduces_once = self._reduces_once(model)
         self.optimizer = nnx.Optimizer(model, tx, wrt=nnx.Param)
         parallel.shard_state(self.model, self.optimizer)
         self.step = 0
         self.stopping = False  # set, by a signal handler say, to stop after this step
-        donated = ("model", "optimizer") if donate else ()
+        self._donated = ("model", "optimizer") if donate else ()
+        self._compiler_options = compiler_options or {}
+        self._compile()
+
+    def _compile(self) -> None:
+        """Make the compiled steps, which read `matmuls` as they trace."""
         self._train = xla.jit(
-            self._train_step_on_shards, compiler_options or {}, donate_argnames=donated
+            self._train_step_on_shards,
+            self._compiler_options,
+            donate_argnames=self._donated,
         )
         self._eval = nnx.jit(self.eval_step)
 
@@ -429,16 +438,22 @@ class Trainer:
 
     def eval_step(self, model: Model, batch: Batch) -> Float[Array, ""]:
         """Return the first head's loss on `batch`, computed in `compute`."""
-        with matmuls.use(self.matmuls):
+        with matmuls.use(matmuls.evaluating(self.matmuls)):
             heads = forward(cast(model, self.compute), batch)
         per_token, _ = self.objective(heads, batch)
         return per_token.metrics["loss"]
 
     def train_on_batch(self, batch: Batch) -> Metrics:
         """Take one training step on `batch`, and return its metrics."""
+        self._switch_if_due()
         metrics = self._train(self.model, self.optimizer, parallel.shard_batch(batch))
         self.step += 1
         return metrics
+
+    def _switch_if_due(self) -> None:
+        if self.switch is not None and self.step >= self.switch[0]:
+            self.matmuls, self.switch = self.switch[1], None
+            self._compile()
 
     def evaluate(self, batches: Iterable[Batch]) -> float:
         """Return the mean of `eval_step` over `batches`, in eval mode."""
@@ -525,13 +540,17 @@ def train(
         parallel.check(config.batch, config.seq_len)
         _check_cpu_bfloat16(run)
         model = parallel.build(lambda: Model(run.arch, rngs=nnx.Rngs(config.seed)))
-        tx = optimizer(config.optimizer, multiplier, model, config.clip)
+        precision = config.precision
+        tx = optimizer(
+            config.optimizer, multiplier, model, config.clip, precision.moments
+        )
         trainer = Trainer(
             model,
             tx,
             objective(config.loss, run.arch),
-            compute=config.precision.compute,
-            matmuls=config.precision.matmuls,
+            compute=precision.compute,
+            matmuls=precision,
+            switch=matmuls.late(precision, config.steps),
             microbatches=_accumulated(config.methods.microbatches),
             gather=config.methods.gather,
             accumulate=config.methods.accumulate,

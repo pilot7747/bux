@@ -1204,6 +1204,7 @@ backward's two, each along what its GEMM contracts, in blocks with a scale each
 |-----------|---------|-----------------------------------------------|-------------------------------------------|
 | `compute` | `compute` | none                                        | the default                               |
 | `mxfp8`   | E4M3    | 32, a power of two (E8M0)                     | dy in E4M3 too, as Transformer Engine's MXFP8 recipe |
+| `mxfp8_2d` | E4M3   | 32 of x and dy; W's per 32 x 32 tile, quantized by XLA | so that y and dx see the same W, as TorchTitan's |
 | `nvfp4`   | E2M1    | 16 (E4M3), and the tensor (float32); W's per 16 x 16 tile, so that y and dx see the same W | dy rounded stochastically, and x and dy transformed for dW by a random Hadamard transform of 16, as NVIDIA's NVFP4 pretraining recipe |
 
 On a Blackwell GPU cuDNN's block-scaled GEMM multiplies them (`__cudnn$blockScaledDot`
@@ -1213,8 +1214,9 @@ same values, so the tests run the formats on CPU. The forward keeps what the bac
 multiplies, x^T and W in the format, rather than x and W.
 
 Every projection made by `sharding.projection` or `sharding.linear` multiplies by
-`matmuls.dot_general`, which runs the format in force: attention's q, k, v, o and
-gate; the MLPs', the shared experts' and LatentMoE's; MLA's, CSA's, the indexer's; the
+`matmuls.dot_general`, which runs the format in force for its role and the residual
+branch it is in (docs/training.md, "Precision"): attention's q, k, v, o and gate;
+the MLPs', the shared experts' and LatentMoE's; MLA's, CSA's, the indexer's; the
 linear attentions', RWKV-7's and Mamba's; Engram's, nextn's and `linear`'s. These stay
 in `compute`: the embedding and the head, softmax attention's own matmuls and its
 relative bias, the router and the shared experts' gate, hyper-connections, norms,

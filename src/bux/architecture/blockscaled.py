@@ -6,9 +6,11 @@ which dequantizes and computes the same values.
 A `Recipe` quantizes each of x, W and dy twice, along its rows and along its columns:
 x along k for y = x W and along m for dW = x^T dy, W along n for dx = dy W^T and along
 k for y, dy along n for dx and along m for dW. The forward keeps x's and W's second
-copies for the backward, in the format, rather than x and W. ``matmuls`` registers a
-format per recipe: `mxfp8` and `nvfp4`. A seed, which the trainer draws from each
-batch, seeds what rounds stochastically.
+copies for the backward, in the format, rather than x and W. Only the GEMMs named in
+`passes` multiply in the format, the others in the dtype of their operands, which the
+forward then keeps as they are. ``matmuls`` registers a format per recipe: `mxfp8`,
+`mxfp8_2d` and `nvfp4`. A seed, which the trainer draws from each batch, seeds what
+rounds stochastically.
 """
 
 from collections.abc import Callable
@@ -54,32 +56,40 @@ class Recipe(NamedTuple):
     dy: Twice
 
 
+Pass = str  # "fprop", "dgrad" or "wgrad": y's GEMM, dx's and dW's
+PASSES: tuple[Pass, ...] = ("fprop", "dgrad", "wgrad")
+
+
 def project(
     x: Float[Array, "*lead k"],
     w: Float[Array, "k n"],
     recipe: Recipe,
     out: DTypeLike,
     seed: UInt32[Array, ""],
+    passes: tuple[Pass, ...] = PASSES,
 ) -> Float[Array, "*lead n"]:
-    """Return x W in `out`, its three GEMMs as `recipe` quantizes them."""
+    """Return x W in `out`, its GEMMs named in `passes` as `recipe` quantizes them."""
     dtypes = (x.dtype, w.dtype, jnp.dtype(out))
-    y = _project(x.reshape(-1, x.shape[-1]), w, seed, recipe, dtypes)
+    y = _project(x.reshape(-1, x.shape[-1]), w, seed, recipe, dtypes, passes)
     return y.reshape(*x.shape[:-1], w.shape[1])
 
 
 Dtypes = tuple[np.dtype, np.dtype, np.dtype]  # x's, W's and y's
-Saved = tuple[Blocks, Blocks, UInt32[Array, ""]]  # x^T along m, W along n, the seed
+# An operand of a GEMM: in the format, or as it is where its pass multiplies in compute.
+Operand = Blocks | Float[Array, "_ _"]
+Saved = tuple[Operand, Operand, UInt32[Array, ""]]  # x^T along m, W along n, the seed
 
 
-@partial(jax.custom_vjp, nondiff_argnums=(3, 4))
+@partial(jax.custom_vjp, nondiff_argnums=(3, 4, 5))
 def _project(
     x: Float[Array, "m k"],
     w: Float[Array, "k n"],
     seed: UInt32[Array, ""],
     recipe: Recipe,
     dtypes: Dtypes,
+    passes: tuple[Pass, ...],
 ) -> Float[Array, "m n"]:
-    return _forward(x, w, seed, recipe, dtypes)[0]
+    return _forward(x, w, seed, recipe, dtypes, passes)[0]
 
 
 def _forward(
@@ -88,21 +98,52 @@ def _forward(
     seed: UInt32[Array, ""],
     recipe: Recipe,
     dtypes: Dtypes,
+    passes: tuple[Pass, ...],
 ) -> tuple[Float[Array, "m n"], Saved]:
-    x_k, x_m = recipe.x(x, seed)
-    w_n, w_k = recipe.w(w, seed)
-    return gemm(x_k, w_k, dtypes[2]), (x_m, w_n, seed)
+    fprop, dgrad, wgrad = (p in passes for p in PASSES)
+    x_k, x_m = _twice(recipe.x, x, seed, rows=fprop, columns=wgrad)
+    w_n, w_k = _twice(recipe.w, w, seed, rows=dgrad, columns=fprop)
+    return times(x_k, w_k, dtypes[2]), (x_m, w_n, seed)
 
 
 def _backward(
-    recipe: Recipe, dtypes: Dtypes, saved: Saved, dy: Float[Array, "m n"]
+    recipe: Recipe,
+    dtypes: Dtypes,
+    passes: tuple[Pass, ...],
+    saved: Saved,
+    dy: Float[Array, "m n"],
 ) -> tuple[Float[Array, "m k"], Float[Array, "k n"], None]:
     x_m, w_n, seed = saved
-    dy_n, dy_m = recipe.dy(dy, seed)
-    return gemm(dy_n, w_n, dtypes[0]), gemm(x_m, dy_m, dtypes[1]), None
+    _, dgrad, wgrad = (p in passes for p in PASSES)
+    dy_n, dy_m = _twice(recipe.dy, dy, seed, rows=dgrad, columns=wgrad)
+    return times(dy_n, w_n, dtypes[0]), times(x_m, dy_m, dtypes[1]), None
 
 
 _project.defvjp(_forward, _backward)
+
+
+def _twice(
+    quantize: Twice,
+    a: Float[Array, "r c"],
+    seed: UInt32[Array, ""],
+    rows: bool,
+    columns: bool,
+) -> tuple[Operand, Operand]:
+    """Return a and a^T, each in the format where a pass multiplies it in the format
+    (`rows` for a, `columns` for a^T), else as it is."""
+    if not rows and not columns:
+        return a, a.T
+    along_rows, along_columns = quantize(a, seed)
+    return along_rows if rows else a, along_columns if columns else a.T
+
+
+def times(a: Operand, b: Operand, out: DTypeLike) -> Float[Array, "m n"]:
+    """Return a b^T in `out`: by the block-scaled GEMM where both are in the format,
+    else as they are."""
+    if isinstance(a, Blocks) and isinstance(b, Blocks):
+        return gemm(a, b, out)
+    assert not isinstance(a, Blocks) and not isinstance(b, Blocks)
+    return jnp.matmul(a, b.T, preferred_element_type=out)
 
 
 def gemm(a: Blocks, b: Blocks, out: DTypeLike) -> Float[Array, "m n"]:
@@ -279,7 +320,34 @@ _mx_partitioned.def_partition(
     sharding_rule="r c -> r c, r c, c r, c r",
 )
 
+
+def mx_tiles_twice(
+    w: Float[Array, "r c"], seed: UInt32[Array, ""] | None = None
+) -> tuple[Blocks, Blocks]:
+    """Return W and W^T in MXFP8 with a scale per 32 x 32 tile, so that y = x W and
+    dx = dy W^T multiply the same values (TorchTitan's weights). By XLA: a weight is
+    small next to the activations."""
+    values, exponents = _mx_square(w.astype(jnp.float32))
+    rows = jnp.repeat(exponents, MX_BLOCK, axis=0)
+    columns = jnp.repeat(exponents.T, MX_BLOCK, axis=0)
+    return _mx_blocks(values, rows), _mx_blocks(values.T, columns)
+
+
+def _mx_square(
+    x: Float[Array, "r c"],
+) -> tuple[Shaped[Array, "r c"], UInt8[Array, "p q"]]:
+    """Return x's E4M3 values, and the biased exponents of a power-of-two scale per
+    32 x 32 tile, the least that takes the tile's largest value to at most 448."""
+    (r, c), b = x.shape, MX_BLOCK
+    tiles = x.reshape(r // b, b, c // b, b)
+    exponent = _exponent_above(jnp.abs(tiles).max((1, 3)) / E4M3)
+    values = tiles * _power_of_two(-exponent)[:, None, :, None]
+    values = jnp.clip(values, -E4M3, E4M3).astype(jnp.float8_e4m3fn).reshape(r, c)
+    return values, (exponent + 127).astype(jnp.uint8)
+
+
 MXFP8 = Recipe(MX_BLOCK, mx_twice, mx_twice, mx_twice)
+MXFP8_2D = Recipe(MX_BLOCK, mx_twice, mx_tiles_twice, mx_twice)
 
 
 # --- NVFP4 --------------------------------------------------------------------------

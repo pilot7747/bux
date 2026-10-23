@@ -80,18 +80,20 @@ class CSA(Sparse):
         compresses = r is not None and not reads(ports, "kv")
         self.head_dim, self.compress_ratio = d, r
 
-        def proj(n_in: int, n_out: int, names: Names = (None, None)) -> nnx.Linear:
-            return linear(n_in, n_out, names, False, rngs)
+        def proj(
+            n_in: int, n_out: int, role: str, names: Names = (None, None)
+        ) -> nnx.Linear:
+            return linear(n_in, n_out, names, False, rngs, role=role)
 
         # The randomly initialized layers; reordering them changes a seed's init.
         latent = config.q_lora_rank
         query = "latent" if latent else "embed"  # what the queries are projected from
-        self.q_a = proj(width, latent, ("embed", "latent")) if latent else None
-        self.q = proj(latent or width, h * d, (query, ("heads", h)))
-        self.kv = proj(width, d)
-        self.compress_kv = proj(width, d) if compresses else None
+        self.q_a = proj(width, latent, "q", ("embed", "latent")) if latent else None
+        self.q = proj(latent or width, h * d, "q", (query, ("heads", h)))
+        self.kv = proj(width, d, "kv")
+        self.compress_kv = proj(width, d, "kv") if compresses else None
         pooled = compresses and r is not None and r > 1
-        self.compress_gate = proj(width, d) if pooled else None
+        self.compress_gate = proj(width, d, "kv") if pooled else None
         init = nnx.initializers.lecun_normal(batch_axis=(0,))
         self.o_a = (
             nnx.Param(
@@ -103,7 +105,7 @@ class CSA(Sparse):
         )
         # What o takes: the groups' ranks, or the heads' dims, flattened
         heads = ("heads", groups) if rank else ("heads", h)
-        self.o = proj(groups * rank if rank else h * d, width, (heads, "embed"))
+        self.o = proj(groups * rank if rank else h * d, width, "o", (heads, "embed"))
         super().__init__(config, width, h, 1, d, d, False, ports, rngs)
         rotated = rotated_dims(d, config.rope)
         self.indexer = (

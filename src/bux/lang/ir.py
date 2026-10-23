@@ -209,18 +209,31 @@ _UNCOMPUTED |= {"mesh", "layout", "methods", "compiler"}  # how it splits and co
 _NEWER = {"precision": PrecisionConfig(compute="float32")}
 # Fields of a setting newer than run ids, by what runs computed before them.
 _NEWER_FIELDS = {
-    "precision": {"matmuls": "compute", "reduce": "compute"},
+    "precision": {
+        "matmuls": "compute",
+        "reduce": "compute",
+        **PrecisionConfig().model_dump(
+            mode="json", include={"roles", "first", "last", "passes", "switch"}
+        ),
+        "moments": "float32",
+    },
     "optimizer": {"ns_coefficients": "jordan", "ns_dtype": "float32"},
 }
+# Fields of a setting that only change how a run is watched.
+_UNCOMPUTED_FIELDS = {"precision": ("eval",)}
 
 
 def _without_newer_fields(train: dict) -> dict:
-    """`train`, dumped, without the `_NEWER_FIELDS` that compute as runs did before."""
+    """`train`, dumped, without the `_NEWER_FIELDS` that compute as runs did before,
+    nor the `_UNCOMPUTED_FIELDS`."""
     for setting, fields in _NEWER_FIELDS.items():
         given = train.get(setting) or {}
         for field, before in fields.items():
             if given.get(field) == before:
                 del given[field]
+    for setting, names in _UNCOMPUTED_FIELDS.items():
+        for name in names:
+            (train.get(setting) or {}).pop(name, None)
     return train
 
 
@@ -249,9 +262,12 @@ class Run(BaseModel):
         arch = self.arch.model_copy(update={"graph": strip(self.arch.graph)})
         # A setting or a field newer than run ids is left out where it computes as runs
         # did before it, so that ids made before it resume.
-        new = {k for k, v in _NEWER.items() if getattr(self.train, k) == v}
-        dumped = self.train.model_dump(mode="json", exclude=_UNCOMPUTED | new)
+        dumped = self.train.model_dump(mode="json", exclude=_UNCOMPUTED)
         train = _without_newer_fields(dumped)
+        for setting, before in _NEWER.items():
+            old = _without_newer_fields({setting: before.model_dump(mode="json")})
+            if train[setting] == old[setting]:
+                del train[setting]
         what = {"arch": arch.model_dump(mode="json"), "train": train}
         blob = json.dumps(what, sort_keys=True, separators=(",", ":"))
         return hashlib.sha256(blob.encode()).hexdigest()[:10]

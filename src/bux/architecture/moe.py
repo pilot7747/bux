@@ -271,12 +271,12 @@ class MoE(nnx.Module):
         latent = config.latent_size or width
         inner = "latent" if config.latent_size else "embed"  # the width the experts see
         self.to_latent = (
-            linear(width, latent, ("embed", "latent"), False, rngs)
+            linear(width, latent, ("embed", "latent"), False, rngs, role="latent")
             if config.latent_size
             else None
         )
         self.from_latent = (
-            linear(latent, width, ("latent", "embed"), False, rngs)
+            linear(latent, width, ("latent", "embed"), False, rngs, role="latent")
             if config.latent_size
             else None
         )
