@@ -1778,17 +1778,17 @@ ticks of a table (`bux.parallel.schedule`), and a stage keeps a microbatch's res
 from its forward to its backward alone. The forward is a `jax.vjp`, whose residuals
 are a pytree of arrays: a few microbatches' of them sit in a buffer, and the backward
 rebuilds the vjp from its slot, the stage's parameters put back, which it does not
-save with each. A table gives each stage its ops in order, a queue to each slot of a
-tick; at each tick a slot runs the next op of its queue once what the op reads is
+save with each. A table gives each stage its ops in order, a queue to each lane of a
+tick; at each tick a lane runs the next op of its queue once what the op reads is
 there, and at the tick's end a stage sends its forward's output on and its
 backward's input gradient back. The names are quoted: the DSL reads `1f1b` as a
 number.
 
-- **`1f1b`**: two slots a tick, a forward and a whole backward, each as soon as it can
+- **`1f1b`**: two lanes a tick, a forward and a whole backward, each as soon as it can
   run. Stage s holds 2(S − s) − 1 microbatches, not M + S − 1 ticks, and the stages
   idle as gpipe's do: as lockstep ticks they cannot keep the S − s of an asynchronous
   1F1B without idling longer.
-- **`zbh1`**: one slot, and the backward split in two: `B` takes the input's gradient,
+- **`zbh1`**: one lane, and the backward split in two: `B` takes the input's gradient,
   on the critical path, and `W` the weights' later, in a tick the stage would idle.
   Stage s runs S − s forwards, then a backward, the weights of the microbatch s before
   it, and a forward, in turn (ZB-H1 of Qi et al., "Zero Bubble Pipeline Parallelism"):
