@@ -9,20 +9,24 @@ Modules say how the optimizers treat their parameters with class attributes:
 `no_weight_decay`, `no_muon` and `muon_axes`.
 
 Muon orthogonalizes its updates by the run's ``orthogonalize`` method
-(``bux.parallel.methods``): ``gspmd`` on whatever shards the compiler gives them, or
-``gather``, each matrix whole.
+(``bux.parallel.methods``): ``gspmd`` on whatever shards the compiler gives them,
+``gather``, each matrix whole on every device that holds it, or ``owner``, each
+matrix whole on one device. Its Newton-Schulz's coefficients are found by name in
+``ns_coefficients``, a builder that gets the number of iterations.
 """
 
 import math
 import typing
-from collections.abc import Callable
+from collections.abc import Callable, Sequence
 
 import jax
 import jax.numpy as jnp
+import numpy as np
 import optax
 from flax import nnx
 from jax.sharding import AbstractMesh, Mesh, NamedSharding
 from jax.sharding import PartitionSpec as P
+from jax.typing import DTypeLike
 from jaxtyping import Array, ArrayLike, Float, PyTree, Real
 from optax.contrib import MuonDimensionNumbers
 from optax.contrib._muon import orthogonalize_via_newton_schulz, scale_by_shape
@@ -41,6 +45,11 @@ NewtonSchulz = Callable[[Float[Array, "*m"], MuonDimensionNumbers], Float[Array,
 schedules = Registry[Schedule]("schedule", "bux.train.optim.schedules")
 optimizers = Registry[optax.GradientTransformation](
     "optimizer", "bux.train.optim.optimizers"
+)
+# Newton-Schulz's quintics a x + b x³ + c x⁵ for a number of iterations, by name: one
+# (a, b, c) for every iteration, or one for each.
+ns_coefficients = Registry[Float[Array, "*steps 3"]](
+    "set of Newton-Schulz coefficients", "bux.train.optim.ns_coefficients"
 )
 
 
@@ -207,7 +216,13 @@ def muon(
 
     rule = optax.chain(
         momentum(config.momentum, config.nesterov),
-        orthogonalized(config.ns_steps, dims, model),
+        orthogonalized(
+            config.ns_steps,
+            dims,
+            model,
+            coefficients=config.ns_coefficients,
+            dtype=config.ns_dtype,
+        ),
         scale_by_shape(
             weight_dimension_numbers=shapes, consistent_rms=config.consistent_rms
         ),
@@ -221,8 +236,6 @@ def muon(
 
 
 # --- Muon's parts: optax's scale_by_muon, with Newton-Schulz by method ----------------
-
-NS_COEFFS = (3.4445, -4.7750, 2.0315)  # Keller Jordan's quintic, optax's default
 
 
 def momentum(beta: float, nesterov: bool) -> optax.GradientTransformation:
@@ -254,12 +267,19 @@ def momentum(beta: float, nesterov: bool) -> optax.GradientTransformation:
 
 
 def orthogonalized(
-    steps: int, dims: dict[tuple, MuonDimensionNumbers], model: nnx.Module
+    steps: int,
+    dims: dict[tuple, MuonDimensionNumbers],
+    model: nnx.Module,
+    coefficients: str = "jordan",
+    dtype: DTypeLike = jnp.float32,
 ) -> optax.GradientTransformation:
     """Orthogonalize each update, a matrix or a stack of them as `dims` says by path,
-    with `steps` Newton-Schulz iterations, by the run's `orthogonalize` method. The
-    method gets all of a step's updates at once, so it can choose where each runs."""
+    with `steps` Newton-Schulz iterations of the quintics `coefficients` names, in
+    `dtype`, by the run's `orthogonalize` method. The method gets all of a step's
+    updates at once, so it can choose where each runs, and gets them in `dtype`, so
+    that what it moves is in it too."""
     model_params = nnx.state(model, nnx.Param)  # whose shardings the updates take
+    run = newton_schulz(steps, coefficients)
 
     def update(
         updates: PyTree[Float[Array, "*_"]],
@@ -269,26 +289,59 @@ def orthogonalized(
         keys = [_keys(path) for path, _ in leaves]
         shardings = shardings_by_path(model_params)
         orthogonal = parallel.method("orthogonalize")(
-            [x for _, x in leaves],
+            [x.astype(dtype) for _, x in leaves],
             [dims[k] for k in keys],
             None if shardings is None else [shardings[k] for k in keys],
-            newton_schulz(steps),
+            run,
         )
-        return jax.tree.unflatten(tree, orthogonal)
+        cast = [y.astype(x.dtype) for y, (_, x) in zip(orthogonal, leaves, strict=True)]
+        return jax.tree.unflatten(tree, cast)
 
     return optax.stateless(update)
 
 
-def newton_schulz(steps: int) -> NewtonSchulz:
-    """Return optax's Newton-Schulz, with `steps` iterations."""
+def newton_schulz(steps: int, coefficients: str = "jordan") -> NewtonSchulz:
+    """Return optax's Newton-Schulz, with `steps` iterations of the quintics
+    `coefficients` names, in the dtype of the matrix it gets."""
+    coeffs = ns_coefficients.find(coefficients)(steps)
 
     def orthogonal(
         x: Float[Array, "*m"], dims: MuonDimensionNumbers
     ) -> Float[Array, "*m"]:
-        coeffs = jnp.asarray(NS_COEFFS)
         return orthogonalize_via_newton_schulz(x, coeffs, steps, dimension_numbers=dims)
 
     return orthogonal
+
+
+@ns_coefficients.register("jordan")
+def _(steps: int) -> Float[Array, "3"]:
+    return jnp.asarray((3.4445, -4.7750, 2.0315))  # Keller Jordan's, optax's default
+
+
+# Amsel et al. (2025), for singular values in [0.001, 1]; the last one repeats.
+POLAR_EXPRESS = (
+    (8.28721201814563, -23.595886519098837, 17.300387312530933),
+    (4.107059111542203, -2.9478499167379106, 0.5448431082926601),
+    (3.9486908534822946, -2.908902115962949, 0.5518191394370137),
+    (3.3184196573706015, -2.488488024314874, 0.51004894012372),
+    (2.300652019954817, -1.6689039845747493, 0.4188073119525673),
+    (1.891301407787398, -1.2679958271945868, 0.37680408948524835),
+    (1.8750014808534479, -1.2500016453999487, 0.3750001645474248),
+    (1.875, -1.25, 0.375),
+)
+
+
+@ns_coefficients.register("polar_express")
+def _(steps: int, safety: float = 1.01) -> Float[Array, "steps 3"]:
+    """As its authors run it: each quintic but the last for singular values up to
+    `safety`, and the first for a matrix divided by `safety` times its norm, where
+    optax's divides by its norm."""
+    found = [POLAR_EXPRESS[min(i, len(POLAR_EXPRESS) - 1)] for i in range(steps)]
+    last = len(POLAR_EXPRESS) - 1
+    scale = [safety ** (i < last) * safety ** (i == 0) for i in range(steps)]
+    return jnp.asarray(
+        [(a / s, b / s**3, c / s**5) for (a, b, c), s in zip(found, scale)]
+    )
 
 
 def shardings_by_path(params: nnx.State) -> dict[tuple, NamedSharding] | None:
@@ -366,7 +419,7 @@ def whole_matrix_spec(
     mesh axes that frees moved onto the first stacked dimension they divide, so that
     each device orthogonalizes whole matrices, its own part of the stack."""
     matrix_dims = _matrix_axes(dims, len(shape))
-    axes = [_mesh_axes(spec[i] if i < len(spec) else None) for i in range(len(shape))]
+    axes = _splits(spec, len(shape))
     freed = tuple(a for i in sorted(matrix_dims) for a in axes[i])
     new = [() if i in matrix_dims else a for i, a in enumerate(axes)]
     for i, n in enumerate(shape):
@@ -383,5 +436,197 @@ def _matrix_axes(dims: MuonDimensionNumbers, ndim: int) -> set[int]:
     return {a % ndim for g in given for a in ((g,) if isinstance(g, int) else g)}
 
 
+def _splits(spec: P, ndim: int) -> list[Split]:
+    """Return the mesh axes that `spec` splits each of `ndim` dimensions over."""
+    return [_mesh_axes(spec[i] if i < len(spec) else None) for i in range(ndim)]
+
+
 def _mesh_axes(entry: str | tuple[str, ...] | None) -> Split:
     return () if entry is None else (entry,) if isinstance(entry, str) else entry
+
+
+@methods.orthogonalize.register("owner")
+def owner(
+    updates: list[Float[Array, "*_"]],
+    dims: list[MuonDimensionNumbers],
+    shardings: list[NamedSharding] | None,
+    newton_schulz: NewtonSchulz,
+) -> list[Float[Array, "*_"]]:
+    """Orthogonalize each matrix, a stack's one by one, whole on one device: its owner.
+    The matrices of a shape and split are dealt out evenly over the devices, reach
+    their owners by an all-to-all, run as one batch there, and go back to their
+    parameters' shards by another all-to-all, and an all-gather over the axes that
+    copy them.
+
+    Under ``layout(zero=1)`` an update comes split as the optimizer's state is, by
+    FSDP too, and its matrices go back whole along the side FSDP split."""
+    if shardings is None:
+        return gspmd(updates, dims, shardings, newton_schulz)
+    mesh, outs = shardings[0].mesh, [s.spec for s in shardings]
+    ins = [_state_spec(s, x.shape, d, mesh) for x, d, s in zip(updates, dims, outs)]
+    plans = [
+        _plan(x.shape, d, i, o, mesh) for x, d, i, o in zip(updates, dims, ins, outs)
+    ]
+    per_device = jax.shard_map(
+        lambda *xs: tuple(_orthogonalize_owned(list(xs), plans, newton_schulz)),
+        mesh=mesh,
+        in_specs=tuple(ins),
+        out_specs=tuple(outs),
+    )
+    shard = jax.lax.with_sharding_constraint
+    return list(
+        per_device(*(shard(x, NamedSharding(mesh, s)) for x, s in zip(updates, ins)))
+    )
+
+
+def _state_spec(
+    spec: P,
+    shape: tuple[int, ...],
+    dims: MuonDimensionNumbers,
+    mesh: Mesh | AbstractMesh,
+) -> P:
+    """Return where the optimizer keeps the update of a parameter of `spec`: on its
+    shards, and if FSDP does not split it (zero=1), split by FSDP too, on the longest
+    whole side of its matrices that FSDP divides, as bux.parallel.place splits it."""
+    axes = _splits(spec, len(shape))
+    n = mesh.shape["fsdp"]
+    if n == 1 or any("fsdp" in a for a in axes):
+        return spec
+    sides = sorted(_matrix_axes(dims, len(shape)))
+    whole = [i for i in sides if not axes[i] and shape[i] % n == 0]
+    if not whole:
+        return spec
+    axes[max(whole, key=lambda i: shape[i])] = ("fsdp",)
+    return partition(axes)
+
+
+class Owned(typing.NamedTuple):
+    """How a device's shard of an update is a stack of matrix shards: its dimensions
+    in `order` (the stacked ones, then each matrix's shorter side and its longer), the
+    mesh axes that split each side, those the update is copied over, and those that
+    the update splits but its parameter does not (FSDP's under zero=1)."""
+
+    order: tuple[int, ...]
+    shape: tuple[int, int]  # a matrix's, whole
+    rows: Split
+    cols: Split
+    copies: Split
+    state_only: Split
+    out_shape: tuple[int, ...]  # the parameter's shard
+
+
+def _plan(
+    shape: tuple[int, ...],
+    dims: MuonDimensionNumbers,
+    spec: P,
+    out: P,
+    mesh: Mesh | AbstractMesh,
+) -> Owned:
+    """Return how an update of `shape`, split by `spec`, stacks into matrix shards,
+    and how its parameter's shards, by `out`, are."""
+    r, o = (_side(a, len(shape)) for a in (dims.reduction_axis, dims.output_axis))
+    if shape[r] > shape[o]:  # optax's Newton-Schulz transposes it so too
+        r, o = o, r
+    splits, kept = _splits(spec, len(shape)), _splits(out, len(shape))
+    used, sizes = {a for s in splits for a in s}, mesh.shape
+    return Owned(
+        order=(*(i for i in range(len(shape)) if i not in (r, o)), r, o),
+        shape=(shape[r], shape[o]),
+        rows=splits[r],
+        cols=splits[o],
+        copies=tuple(a for a, n in sizes.items() if n > 1 and a not in used),
+        state_only=tuple(a for a in sizes if a in used - {a for k in kept for a in k}),
+        out_shape=tuple(
+            n // math.prod(sizes[a] for a in k) for n, k in zip(shape, kept)
+        ),
+    )
+
+
+def _side(axis: int | Sequence[int], ndim: int) -> int:
+    """The dimension of one side of a matrix: `owner` takes no side of several."""
+    [a] = (axis,) if isinstance(axis, int) else axis
+    return a % ndim
+
+
+def _orthogonalize_owned(
+    shards: list[Float[Array, "*_"]], plans: list[Owned], newton_schulz: NewtonSchulz
+) -> list[Float[Array, "*_"]]:
+    """On one device: send each stack of matrix shards to the matrices' owners, run
+    Newton-Schulz on what this device owns, and bring the results back."""
+    stacks = [_as_stack(x, p) for x, p in zip(shards, plans, strict=True)]
+    groups: dict[tuple, list[int]] = {}
+    for i, (x, p) in enumerate(zip(stacks, plans)):
+        key = (x.dtype, *p.shape, p.rows, p.cols, p.copies, p.state_only)
+        groups.setdefault(key, []).append(i)
+    owned = {
+        key: _to_owners(jnp.concatenate([stacks[i] for i in group]), plans[group[0]])
+        for key, group in groups.items()
+    }
+    orthogonal = _batched(owned, newton_schulz)
+    out: dict[int, Float[Array, "*_"]] = {}
+    for key, group in groups.items():
+        back = _from_owners(orthogonal[key], plans[group[0]])
+        ends = np.cumsum([len(stacks[i]) for i in group])
+        for i, x in zip(group, jnp.split(back[: ends[-1]], ends[:-1]), strict=True):
+            out[i] = _from_stack(x, plans[i])
+    return [out[i] for i in range(len(shards))]
+
+
+def _as_stack(x: Float[Array, "*s"], p: Owned) -> Float[Array, "b m n"]:
+    x = x.transpose(p.order)
+    return x.reshape(-1, *x.shape[-2:])
+
+
+def _from_stack(x: Float[Array, "b m n"], p: Owned) -> Float[Array, "*s"]:
+    x = x.reshape(tuple(p.out_shape[i] for i in p.order))
+    return x.transpose(np.argsort(p.order))
+
+
+def _to_owners(x: Float[Array, "b m n"], p: Owned) -> Float[Array, "c M N"]:
+    """Move a stack of matrix shards to the matrices' owners: padded to deal out
+    evenly, this device's share among its copies, each side whole from the devices
+    that split it."""
+    devices = _size(p.rows + p.cols + p.copies)
+    x = jnp.pad(x, ((0, -len(x) % devices), (0, 0), (0, 0)))
+    if p.copies:
+        share = len(x) // _size(p.copies)
+        start = jax.lax.axis_index(p.copies) * share
+        x = jax.lax.dynamic_slice_in_dim(x, start, share)
+    if p.rows:
+        x = jax.lax.all_to_all(x, p.rows, 0, 1, tiled=True)
+    if p.cols:
+        x = jax.lax.all_to_all(x, p.cols, 0, 2, tiled=True)
+    return x
+
+
+def _size(axes: Split) -> int:
+    return math.prod(jax.lax.axis_size(a) for a in axes)
+
+
+def _from_owners(x: Float[Array, "c M N"], p: Owned) -> Float[Array, "b m n"]:
+    """`_to_owners` undone, but for the padding, onto the parameter's shards: every
+    copy's, and a side that only the optimizer's state splits whole."""
+    for side, split in ((2, p.cols), (1, p.rows)):
+        if split and split == p.state_only:
+            x = jax.lax.all_gather(x, split, axis=0, tiled=True, to="invarying")
+        elif split:
+            x = jax.lax.all_to_all(x, split, side, 0, tiled=True)
+    if p.copies:
+        x = jax.lax.all_gather(x, p.copies, axis=0, tiled=True, to="invarying")
+    return x
+
+
+def _batched(
+    stacks: dict[tuple, Float[Array, "c m n"]], newton_schulz: NewtonSchulz
+) -> dict[tuple, Float[Array, "c m n"]]:
+    """Orthogonalize the stacks of whole matrices of each dtype and shape as one."""
+    by_shape: dict[tuple, list[tuple]] = {}
+    for key in stacks:
+        by_shape.setdefault(key[:3], []).append(key)
+    out = {}
+    for keys in by_shape.values():
+        joined = jnp.concatenate([stacks[k] for k in keys])
+        done = newton_schulz(joined, MuonDimensionNumbers(1, 2))
+        ends = np.cumsum([len(stacks[k]) for k in keys])
+        out.update(zip(keys, jnp.split(done, ends[:-1]), strict=True))
+    return out

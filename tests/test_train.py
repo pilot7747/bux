@@ -17,6 +17,7 @@ import pytest
 from conftest import corpus
 from flax import nnx
 from jax.sharding import PartitionSpec as P
+from jaxtyping import Array, Float
 from optax.contrib import MuonDimensionNumbers, scale_by_muon
 
 from bux import parallel
@@ -40,6 +41,7 @@ from bux.train.optim import (
     lr_multiplier,
     momentum,
     muon_matrices,
+    newton_schulz,
     optimizer,
     optimizers,
     orthogonalized,
@@ -181,7 +183,7 @@ def test_muon_on_one_device_is_optax_s_whichever_method_orthogonalizes(nesterov)
     dims = {"w": MuonDimensionNumbers(0, 1), "e": MuonDimensionNumbers(1, 2)}
     theirs = scale_by_muon(nesterov=nesterov, weight_dimension_numbers=dims)
     expected = _muon_updates(theirs, params)
-    for method in ("gspmd", "gather"):
+    for method in ("gspmd", "gather", "owner"):
         methods = tcfg.MethodsConfig(orthogonalize=method)
         one = parallel.use(tcfg.MeshConfig(data=1), methods=methods)
         for where in (contextlib.nullcontext(), one):
@@ -194,15 +196,66 @@ def test_muon_on_one_device_is_optax_s_whichever_method_orthogonalizes(nesterov)
             assert jax.tree.all(jax.tree.map(jnp.array_equal, got, expected))
 
 
+def _spread(x: Float[Array, "m n"]) -> float:
+    """How far from 1 the singular values of `x` are."""
+    return float(
+        jnp.abs(jnp.linalg.svd(x.astype(jnp.float32), compute_uv=False) - 1).max()
+    )
+
+
+@pytest.mark.parametrize("coefficients", ["jordan", "polar_express"])
+def test_newton_schulz_in_bfloat16_is_close_to_float32(coefficients):
+    x = jax.random.normal(jax.random.key(0), (64, 256))
+    ns, dims = newton_schulz(5, coefficients), MuonDimensionNumbers(0, 1)
+    f32, bf16 = ns(x, dims), ns(x.astype(jnp.bfloat16), dims)
+    assert bf16.dtype == jnp.bfloat16
+    assert jnp.linalg.norm(bf16 - f32) < 0.1 * jnp.linalg.norm(f32)
+
+
+def test_polar_express_orthogonalizes_closer_than_jordan_s_quintic():
+    x = jax.random.normal(jax.random.key(0), (64, 256)) * jnp.logspace(-2, 0, 256)
+    dims = MuonDimensionNumbers(0, 1)
+    jordan, polar = (newton_schulz(5, c)(x, dims) for c in ("jordan", "polar_express"))
+    assert _spread(polar) < 0.15 and _spread(jordan) > 0.3
+    assert _spread(newton_schulz(8, "polar_express")(x, dims)) < 1e-3
+
+
+def test_muon_runs_newton_schulz_in_its_dtype_and_keeps_the_update_s():
+    stack = Stack()
+    params = nnx.to_pure_dict(nnx.state(stack, nnx.Param))
+    dims = {("w",): MuonDimensionNumbers(0, 1), ("e",): MuonDimensionNumbers(1, 2)}
+    f32, bf16 = (
+        _muon_updates(orthogonalized(5, dims, stack, dtype=dtype), params, steps=1)[0]
+        for dtype in (jnp.float32, jnp.bfloat16)
+    )
+    for a, b in zip(jax.tree.leaves(f32), jax.tree.leaves(bf16), strict=True):
+        assert b.dtype == jnp.float32 and not jnp.array_equal(a, b)
+        assert jnp.linalg.norm(b - a) < 0.1 * jnp.linalg.norm(a)
+
+
+def test_newton_schulz_s_dtype_is_in_the_run_s_id():
+    plain = smoke("optimizer = muon(lr=0.02)")
+    f32 = smoke("optimizer = muon(lr=0.02, ns_dtype=float32)")
+    bf16 = smoke("optimizer = muon(lr=0.02, ns_dtype=bfloat16)")
+    assert plain.id == bf16.id != f32.id
+
+
 @functools.cache
-def _muon_step(orthogonalize: str = "gspmd", **mesh: int) -> tuple[list, str]:
+def _muon_step(
+    orthogonalize: str = "gspmd",
+    zero: int = 3,
+    ns_dtype: str = "float32",
+    **mesh: int,
+) -> tuple[list, str]:
     """The MoE's parameters after a Muon step from fixed gradients, split over `mesh`
     (outside parallel.use with none), and the compiled step's HLO."""
     methods = tcfg.MethodsConfig(orthogonalize=orthogonalize)
-    split = parallel.use(tcfg.MeshConfig.model_validate(mesh), methods=methods)
+    layout = tcfg.LayoutConfig.model_validate({"zero": zero})
+    split = parallel.use(tcfg.MeshConfig.model_validate(mesh), layout, methods)
     with split if mesh else contextlib.nullcontext():
         model = parallel.build(lambda: Model(compile(MOE), rngs=nnx.Rngs(0)))
-        c, lr = tcfg.MuonConfig(lr=0.02), lr_multiplier(tcfg.ConstantSchedule(), 1)
+        c = tcfg.MuonConfig.model_validate({"lr": 0.02, "ns_dtype": ns_dtype})
+        lr = lr_multiplier(tcfg.ConstantSchedule(), 1)
         trained = nnx.Optimizer(model, optimizer(c, lr, model), wrt=nnx.Param)
         parallel.shard_state(model, trained)
         grads = jax.tree.map(jnp.sin, nnx.state(model, nnx.Param))
@@ -212,7 +265,7 @@ def _muon_step(orthogonalize: str = "gspmd", **mesh: int) -> tuple[list, str]:
     return jax.tree.leaves(jax.tree.map(np.asarray, nnx.state(model, nnx.Param))), hlo
 
 
-@pytest.mark.parametrize("orthogonalize", ["gspmd", "gather"])
+@pytest.mark.parametrize("orthogonalize", ["gspmd", "gather", "owner"])
 @pytest.mark.parametrize("mesh", SPLITS.values(), ids=list(SPLITS))
 def test_muon_updates_split_over_devices_as_on_one(orthogonalize, mesh):
     one, _ = _muon_step()
@@ -220,17 +273,66 @@ def test_muon_updates_split_over_devices_as_on_one(orthogonalize, mesh):
     assert all(np.allclose(a, b, atol=1e-6) for a, b in zip(split, one, strict=True))
 
 
-def _all_reduces(hlo: str) -> int:
-    return len(re.findall(r"\ball-reduce(-start)?\(", hlo))
+MORE_SPLITS = {
+    "data_fsdp": {"data": 2, "fsdp": 4},
+    "fsdp_expert_tensor": {"fsdp": 2, "expert": 2, "tensor": 2},
+    "expert": {"expert": 8},
+}
+
+
+@pytest.mark.parametrize("zero", [3, 1])
+@pytest.mark.parametrize("mesh", MORE_SPLITS.values(), ids=list(MORE_SPLITS))
+def test_muon_owners_orthogonalize_as_gspmd_does(mesh, zero):
+    gspmd, _ = _muon_step("gspmd", zero, **mesh)
+    owner, _ = _muon_step("owner", zero, **mesh)
+    assert all(np.allclose(a, b, atol=1e-6) for a, b in zip(owner, gspmd, strict=True))
+
+
+def _count(op: str, hlo: str) -> int:
+    return len(re.findall(rf"\b{op}(-start)?\(", hlo))
 
 
 @pytest.mark.parametrize("mesh", SPLITS.values(), ids=list(SPLITS))
 def test_muon_gathering_whole_matrices_needs_no_all_reduce(mesh):
     """gspmd runs Newton-Schulz on shards, all-reducing products over split
-    dimensions; gather moves each matrix whole once and runs it there."""
+    dimensions; gather moves each matrix whole once and runs it there; owner moves
+    each to one device, the matrices of a shape and split by one all-to-all."""
     _, gspmd = _muon_step("gspmd", **mesh)
     _, gather = _muon_step("gather", **mesh)
-    assert _all_reduces(gather) == 0 < _all_reduces(gspmd)
+    _, owner = _muon_step("owner", **mesh)
+    assert _count("all-reduce", gather) == _count("all-reduce", owner) == 0
+    assert _count("all-reduce", gspmd) > 0
+    assert _count("all-gather", gather) > _count("all-gather", owner)
+    assert _count("all-to-all", owner) > 0
+
+
+def test_muon_owners_under_zero_1_gather_less_than_gather_does():
+    """The update comes split by FSDP, as the optimizer's state: owner sends its shards
+    to the owners, and gathers the results, where gather gathers every matrix."""
+    _, gather = _muon_step("gather", 1, fsdp=8)
+    _, owner = _muon_step("owner", 1, fsdp=8)
+    assert _count("all-gather", owner) + _count("all-to-all", owner) < _count(
+        "all-gather", gather
+    )
+
+
+def test_muon_owners_get_their_matrices_in_newton_schulz_s_dtype():
+    """In the program jax gives XLA, that is: XLA on CPU moves them in float32."""
+    methods = tcfg.MethodsConfig(orthogonalize="owner")
+    with parallel.use(tcfg.MeshConfig(fsdp=8), methods=methods):
+        stack = parallel.build(Stack)
+        params = nnx.to_pure_dict(nnx.state(stack, nnx.Param))
+        dims = {("w",): MuonDimensionNumbers(0, 1), ("e",): MuonDimensionNumbers(1, 2)}
+        tx = orthogonalized(5, dims, stack, dtype=jnp.bfloat16)
+        text = jax.jit(tx.update).lower(params, tx.init(params), params).as_text()
+    moved = re.findall(r"all_to_all.*?: \(tensor<[\dx]*(\w+)>", text)
+    assert len(moved) == 4 and set(moved) == {"bf16"}  # 2 shapes, there and back
+
+
+def test_muon_updates_in_bfloat16_split_over_devices_as_on_one():
+    one, _ = _muon_step(ns_dtype="bfloat16")
+    split, _ = _muon_step("owner", 3, "bfloat16", fsdp=4, tensor=2)
+    assert all(np.allclose(a, b, atol=1e-4) for a, b in zip(split, one, strict=True))
 
 
 def test_gather_holds_matrices_whole_and_a_stack_split_over_what_that_frees():
@@ -251,8 +353,12 @@ def test_gather_holds_matrices_whole_and_a_stack_split_over_what_that_frees():
     )
 
 
-def test_a_run_that_gathers_matrices_for_muon_trains_as_on_one_device(losses):
-    muon = {"optimizer": "muon(lr=0.02)", "methods": "methods(orthogonalize=gather)"}
+@pytest.mark.parametrize("orthogonalize", ["gather", "owner"])
+def test_a_run_that_moves_matrices_for_muon_trains_as_on_one_device(
+    losses, orthogonalize
+):
+    how = f"methods(orthogonalize={orthogonalize})"
+    muon = {"optimizer": "muon(lr=0.02, ns_dtype=float32)", "methods": how}
     one = losses(MOE, mesh="mesh(data=1)", **muon)
     assert np.allclose(losses(MOE, mesh="mesh(fsdp=8)", **muon), one, atol=1e-5)
 
