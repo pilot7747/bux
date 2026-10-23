@@ -22,7 +22,7 @@ linear)` the output projection, split as the stream is.
 import math
 from collections.abc import Callable, Sequence
 from functools import partial
-from typing import Any, NamedTuple, Protocol, cast
+from typing import Any, NamedTuple, Protocol, cast, runtime_checkable
 
 import jax
 import jax.numpy as jnp
@@ -40,6 +40,7 @@ CHUNKS = 4  # of each device's rows; fewer where its rows are fewer
 Entry = str | tuple[str, ...] | None  # one dimension of a PartitionSpec
 
 
+@runtime_checkable
 class Method(Protocol):
     @staticmethod
     def project_in(
