@@ -255,7 +255,7 @@ methods = methods(attention=ring)
 | `xla`     | all t by t logits at once. With `seq` over `context` a device has its queries' rows, and every key and value: all-gather CP |
 | `cudnn`   | cuDNN's fused attention (jax's) on each device's whole rows, documents in its packed layout. bfloat16 or float16, keys' and values' head dims equal and up to 256 (its packed layout gets MLA's wrong); no soft cap, no sinks, no positions over `context` |
 | `tokamax` | tokamax's flash attention, its Mosaic kernels: a document and a window as each query's first key, sinks by the logsumexp. With `seq` over `context`, a device gathers every key and value and attends with its queries in one call: all-gather CP, whose backward pass does every block. Linux only (the `cuda` extra) |
-| `ring`    | every key and value gathered once over `context`, and a flash call (tokamax's; jnp's on a CPU) for each device's block of them, merged by their logsumexps. A block no query sees is skipped: one ahead of them all, or before every query's first key, its document's or its window's. Without documents the queries go zigzag, device `i` holding chunks `i` and `2c-1-i` of `2c`, so that every device attends to as much. The backward pass runs each block's kernel backward with the final output and logsumexp, and reduce-scatters the blocks' gradients |
+| `ring`    | every key and value gathered once over `context`, and a flash call (tokamax's; jnp's on a CPU) for each device's block of them, merged by their logsumexps, a device's own block first, as the others' are gathered. A block no query sees is skipped: one ahead of them all, or before every query's first key, its document's or its window's. Without documents the queries go zigzag, device `i` holding chunks `i` and `2c-1-i` of `2c`, so that every device attends to as much; its own block is then a gathered one. The backward pass runs each block's kernel backward with the final output and logsumexp, and reduce-scatters the blocks' gradients |
 | `ulysses` | all-to-alls over `context`, from a device's positions of every head to every position of its own heads; `auto`'s kernel on those whole rows; and back. `context` must divide a device's heads; kv heads it does not divide are repeated |
 
 What only `xla` has stays in the layer: relative bias, length scale and attention
@@ -360,7 +360,9 @@ With sinks, 243k by `ulysses` (tokamax's kernel), where `auto` took `xla` at 66k
 `ulysses` ran `xla` at 96k, and the `ring` it replaced 75k. In a model `ulysses` is
 the faster even with 45% of the batches past cuDNN's room for documents, which
 tokamax then takes, so `auto` takes it; `ring` stays the method for longer packed
-rows, as at 128k above.
+rows, as at 128k above. That `ring` attends to its own block while the others' are
+gathered changes nothing past the noise in this model (223k on packed documents
+against 225k gathering it first): a layer's gather is short against its attention.
 
 On 8 CPU devices, two windowed GQA layers (4 heads, 2 kv heads) with sinks and a soft
 cap train on packed rows as on one device, to 1e-5 over 3 steps, by every method on
@@ -878,7 +880,8 @@ DeltaNet hybrid (`"DDDA"^4`) and a 64-expert MoE (`E^16`), in bfloat16 on 8 rows
 is still slower: it copies each value it keeps into its stack and back out, where
 unrolled layers read it where it was made, and the more it keeps the more it copies:
 the GDN hybrid's float32 chunk states. On eight, one row each, it is faster, and it
-compiles 2.3 times as fast.
+compiles 2.3 times as fast; with `compiler(preset=maxtext)` the dense scan trains at
+719k, 15% over unrolled ([XLA's options](training.md#xlas-options-compiler)).
 
 On one CPU, for the gradient of a 24-layer Llama's forward (`d_model=64`, 8 rows of
 128 tokens), and for its first training step, which compiles it:

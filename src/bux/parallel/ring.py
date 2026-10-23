@@ -5,14 +5,16 @@ A device keeps its n queries and gathers every device's block of n keys and valu
 once (on a B300 node an all-gather moves ~6x the bytes a second of a ring's
 ppermutes). It attends to each block by a kernel's call, merging the blocks by their
 logsumexps, and skips a block no query sees: one ahead of them all, or before the
-first key of each (its document's first token, or its window's). The backward pass
+first key of each (its document's first token, or its window's). Its own block comes
+first, from its own keys and values, while the others' are gathered. The backward pass
 runs each block's kernel backward with the final output and logsumexp, and sums each
 block's gradients onto its device.
 
 In the positions' order a row of one document balances badly: device c - 1 attends
 to c blocks, device 0 to one. So without documents or a window the queries go zigzag:
 device i holds the i-th and the (2c-1-i)-th of 2c chunks, and attends to its own
-block and to half of every other's.
+block and to half of every other's. Its keys and values stay in the positions' order,
+so its own block zigzag is the gathered one.
 """
 
 from collections.abc import Callable
@@ -135,6 +137,14 @@ class Plan(NamedTuple):
         blocks = jax.lax.all_gather(x, AXIS)
         return _reorder(blocks, _zigzag_order(self.c)) if self.zigzag else blocks
 
+    def mine(
+        self, x: Float[Array, "b n g e"], blocks: Float[Array, "c b n g e"]
+    ) -> Float[Array, "b n g e"]:
+        """Return this device's block of x, as the queries are laid out: x itself, so
+        that it attends to it while the others' are gathered; zigzag, the gathered
+        one, as x is in the positions' order."""
+        return blocks[self.me] if self.zigzag else x
+
     def scatter(self, dx: Float[Array, "c b n g e"]) -> Float[Array, "b n g e"]:
         """Sum each block's gradients onto its device."""
         if self.zigzag:
@@ -175,7 +185,8 @@ def _ring_fwd(
     plan = Plan.here(q.shape[1], static.zigzag)
     ks, vs, me = plan.blocks(k), plan.blocks(v), plan.me
     attend = partial(static.kernel.forward, scale=static.scale, cap=static.cap)
-    out, lse = attend(q, ks[me], vs[me], plan.keys(me, start, causal=True))
+    mine = plan.mine(k, ks), plan.mine(v, vs)
+    out, lse = attend(q, *mine, plan.keys(me, start, causal=True))
     pieces = [partial(_attend, p, plan, attend, q, start) for p in plan.pieces()]
     branches = [_skip, *pieces]
 
@@ -223,7 +234,8 @@ def _ring_bwd(static: Static, saved: tuple, dout: Float[Array, "b n h dv"]) -> t
     plan = Plan.here(q.shape[1], static.zigzag)
     ks, vs, me = plan.blocks(k), plan.blocks(v), plan.me
     grads = partial(static.kernel.backward, scale=static.scale, cap=static.cap)
-    dq, dk, dv = grads(q, ks[me], vs[me], out, dout, lse, plan.keys(me, start, True))
+    mine = plan.mine(k, ks), plan.mine(v, vs)
+    dq, dk, dv = grads(q, *mine, out, dout, lse, plan.keys(me, start, True))
     seen = (q, out, dout, lse, start)
     pieces = [partial(_differentiate, p, plan, grads, *seen) for p in plan.pieces()]
     branches = [_no_grads, *pieces]

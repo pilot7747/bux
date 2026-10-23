@@ -377,6 +377,26 @@ class MethodsConfig(Config):
     donate: bool = True
 
 
+def _flags(options: str) -> str:
+    for option in options.split():
+        if "=" not in option:
+            raise ValueError(f"an option is --name=value, not {option!r}")
+    return options
+
+
+class CompilerConfig(Config):
+    """XLA's options for the training step: a preset's, by name in bux.train.xla, and
+    options of one's own over them. Like the three settings above, it changes how a
+    run computes, not what, and is not in the run's id."""
+
+    type: Literal["compiler"] = "compiler"
+    preset: str = "default"  # XLA's own; o1, lhs, maxtext, collective_matmul
+    # Over the preset's, as XLA_FLAGS writes them: "--xla_gpu_enable_triton_gemm=false
+    # --xla_gpu_threshold_for_windowed_einsum_mib=0". XLA's debug options, and jax's
+    # optimization_level and memory_fitting_level.
+    options: Annotated[str, AfterValidator(_flags)] = ""
+
+
 class TrainConfig(Config):
     """The training settings of a run: one field per top-level setting of a .bux file."""
 
@@ -399,6 +419,7 @@ class TrainConfig(Config):
     mesh: MeshConfig = MeshConfig()
     layout: LayoutConfig = LayoutConfig()
     methods: MethodsConfig = MethodsConfig()
+    compiler: CompilerConfig = CompilerConfig()
 
 
 # The configs a .bux file calls by name, besides layers and their settings.
@@ -424,7 +445,8 @@ Setting = Annotated[
     | PrecisionConfig
     | MeshConfig
     | LayoutConfig
-    | MethodsConfig,
+    | MethodsConfig
+    | CompilerConfig,
     Field(discriminator="type"),
 ]
 

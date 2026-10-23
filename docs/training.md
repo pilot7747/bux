@@ -78,6 +78,7 @@ id          params  tokens  tok/param  flops/tok  gpus  ...  run
 | `mesh`       | `mesh(data=..., fsdp=..., tensor=...)`: the device grid | `mesh`: every device on `data` |
 | `layout`     | `layout(...)`: which mesh axes each named dimension splits over | `layout` |
 | `methods`    | `methods(attention=..., moe=..., microbatches=...)`: how what communicates is computed, and the microbatches a step takes its batch in | `methods` |
+| `compiler`   | `compiler(preset=..., options=...)`: XLA's options for the training step ([below](#xlas-options-compiler)) | `compiler`: XLA's defaults |
 
 The settings of each config are pydantic fields in `bux/train/config.py`, and the
 editor shows them on hover and completes them, as it does for layers. In short:
@@ -291,10 +292,10 @@ profile/       a jax.profiler trace, with a profile setting
 
 The id is a hash of what the run computes: renaming a definition, reaching the same
 settings through another file or a sweep, logging, evaluating, checkpointing and
-profiling at other steps, or splitting it over devices another way (`mesh`, `layout`,
-`methods`) keeps it, and anything else changes it. So a changed run starts in a
-directory of its own, and an unchanged one started again resumes from its latest
-checkpoint, ending exactly where it would have.
+profiling at other steps, splitting it over devices another way (`mesh`, `layout`,
+`methods`) or compiling it with other options (`compiler`) keeps it, and anything else
+changes it. So a changed run starts in a directory of its own, and an unchanged one
+started again resumes from its latest checkpoint, ending exactly where it would have.
 
 The log has the step's metrics: `loss` and every term of the objective, `grad_norm`
 before clipping, `lr`, `tokens` so far and `tokens_per_s` since the last log. On a GPU
@@ -304,14 +305,23 @@ mesh's GPUs. A step's FLOPs are counted once, before training, from the program 
 its loss's gradient on a batch, traced on shapes alone with remat and kernels off
 (`trainer.step_flops`, `bux/train/flops.py`): 2·m·n·k for every matrix product and
 convolution, times the length of every scan around it. So a new layer counts with
-no formula of its own, a rematerialized forward is not counted twice, and attention
-counts its t × t scores whole, as PaLM's MFU does, though a causal kernel computes
-half of them. `bux plan` shows the FLOPs a token: 7.7G for a Llama-style 1.3B at
-4096 tokens a row, 6 N of its matrices and 1.6G of attention.
+no formula of its own, and a rematerialized forward is not counted twice. Attention
+counts the share of its t × t logits that its mask keeps, (t + 1) / 2t causal and
+less with a window, as Megatron's MFU does and a flash kernel computes; not the
+documents of a packed row, which change from batch to batch. (PaLM's MFU counts them
+whole, which made bux's 10% higher at 4096 tokens a row.) `bux plan` shows the FLOPs a
+token: 6.9G for a Llama-style 1.3B at 4096 tokens a row, 6 N of its matrices and 0.8G
+of attention.
 
 `profile = profile(start=20, steps=5)` traces the 5 steps after step 20 into
 `profile/`, waiting for the step before it starts and stops, for `xprof` or
-TensorBoard's profile plugin (`tensorboard --logdir runs/<run>/profile`).
+TensorBoard's profile plugin (`tensorboard --logdir runs/<run>/profile`). On GPUs the
+log then has, at step 25, what a step of them spent in collectives, `comm_ms`, and in
+collectives with no kernel computing beside them on any stream, `exposed_comm_ms`: the
+communication the step waits for. Each is the mean of the GPUs the process traced
+(`bux/train/trace.py`): a kernel communicates if NCCL runs it or XLA's op that
+launched it is a collective, CUDA's copies neither communicate nor compute, and every
+other kernel computes.
 
 ## Speed on GPUs
 
@@ -331,16 +341,16 @@ by itself where it cannot run, and all of them do inside `bux.kernels.off()` or 
 | MoE dispatch | `pick_rows`, `permuted`: gathers where XLA would scatter | 4x |
 
 Tokens a second on B300s, 8 × 4096 tokens a GPU, `precision(compute=bfloat16)`, and
-the log's `mfu`:
+the log's `mfu` (of the attention a causal mask keeps):
 
 | model (d = 2048, 16 layers) | 1 GPU | 8, `mesh(fsdp=8)` |
 |-----------------------------|-------|-------------------|
-| Llama-style, 1.3B           | 144k, 49% MFU | 1.12M, 48% |
-| Gated DeltaNet hybrid, `"DDDA"` | 93k, 30% | 720k |
+| Llama-style, 1.3B           | 144k, 44% MFU | 1.12M, 43% |
+| Gated DeltaNet hybrid, `"DDDA"` | 93k, 29% | 720k |
 | Mamba-2 hybrid, `"MMMA"`, 1.5B (Nemotron-H's `mamba2`) | 97k | 741k |
 | KDA hybrid, `"KKKA"`        | 58k   |                   |
-| KDA with `gate_lower_bound=-5` | 110k, 36% |            |
-| MoE, 64 experts, top 8      | 102k, 35% | 834k          |
+| KDA with `gate_lower_bound=-5` | 110k, 35% |            |
+| MoE, 64 experts, top 8      | 102k, 31% | 834k          |
 
 Sparse attention trains at long context. A DeepSeek-V3.2-style 1B (MLA of 16 heads,
 DSA's indexer of 64 heads and top 2048 in all 16 layers, dense MLPs) on one B300, in
@@ -369,7 +379,8 @@ scheduling changed nothing past the noise (1%) on the 1.3B on 1 and 8 GPUs, nor 
 the MoE on `mesh(fsdp=8)`: the latency-hiding scheduler, pipelined all-gathers,
 all-reduces and reduce-scatters, combine thresholds of 128 MiB, double-buffered while
 loops, command buffers off, Triton GEMMs off. FSDP over 8 GPUs gets 97% of 8 times
-one GPU's tokens already.
+one GPU's tokens already. Other splits wait longer for their collectives, and the
+`compiler` setting tries XLA's options on them (below).
 
 On packed documents (`best_fit` of documents of 16 to 4000 words, GPT-2 tokens), on
 one GPU, the 1.3B trains at 145k tok/s in rows of 4096 by tokamax's kernel, and at
@@ -396,6 +407,70 @@ its projections 5-8x slower than bfloat16's; and the routed experts stay in bflo
 On 300 steps of packed documents, autotuning pinned, `mxfp8`'s loss is bfloat16's to
 within the noise between seeds. The MoE trains as fast in `mxfp8` as in bfloat16,
 105k: its experts are most of its matmuls.
+
+### XLA's options: `compiler`
+
+```
+compiler = compiler(preset=o1)
+compiler = compiler(options="--xla_gpu_threshold_for_windowed_einsum_mib=0")
+compiler.preset = default | o1 | lhs | maxtext       # a sweep
+```
+
+The training step compiles with a preset's options, and the setting's own `options`
+over them, written as XLA_FLAGS writes them: XLA's debug options, and jax's
+`optimization_level` and `memory_fitting_level`. They are the step's alone
+(`bux/train/xla.py`), so a run's step compiles with its options in a process that
+compiled another's with others, and they go over XLA_FLAGS. Like `mesh`, `layout` and
+`methods`, `compiler` changes how a run computes, not what, and is not in its id.
+
+| preset              | what it sets                                                     |
+|---------------------|------------------------------------------------------------------|
+| `default`           | nothing: XLA's defaults                                           |
+| `o1`                | `optimization_level=O1`: collective pipelining, double-buffered loops, and the latency hiding scheduler for any collective |
+| `lhs`               | the latency hiding scheduler, for any collective                  |
+| `maxtext`           | MaxText's GPU recipe: the scheduler, combine thresholds of 128, 128 and 64 MiB, pipelined collectives, double-buffered loops, a high-priority stream for collectives, Triton GEMMs, command buffers and XLA's rematerialization off |
+| `collective_matmul` | XLA's windowed einsum: tensor parallelism's all-gathers and reduce-scatters as loops of collective-permutes beside their shares of the matmul |
+
+Another preset is an entry of `bux.train.xla.PRESETS`. XLA (in jax 0.12 and at its
+head) runs the latency hiding scheduler on Hopper and Blackwell by itself, but only on
+a step whose collectives its cost model knows: not one with `ragged_all_to_all`
+(`methods(moe=ragged_all_to_all)`), which `lhs` and `o1` schedule. Host offload does
+not stop it.
+
+On one node of 8 B300s, bfloat16, rows of 4096 tokens but for the ring's, tokens a
+second, and the exposed communication of a step in ms of its time (the log's
+`exposed_comm_ms`, profiled):
+
+| run | `default` | `o1` | `lhs` | `maxtext` |
+|-----|-----------|------|-------|-----------|
+| TP=8 and sequence parallelism: 4 of Llama 3 70B's layers, scanned, `remat=full`, 8 rows | **218k**, 34 of 150 | 211k, 31 | 218k, 34 | 216k, 35 |
+| EP=8 by `all_to_all`: 8 layers of 64 experts, top 8, d = 2048, a row a GPU | 158k, 62 of 208 | 157k | 155k | 159k |
+| EP=8 by `ragged_all_to_all`, as above | 45k, 618 of 733 | 45k | 45k | 45k |
+| the 1.3B, `fsdp=8`, 8 rows a GPU | **1.14M**, 3.5 of 230 | 1.13M | | 1.09M, 9.0 |
+| the same in 8 microbatches | **842k**, 57 of 311 | 830k, 64 | 836k | 789k, 74 |
+| the same scanned (`repeat=scan`), a row a GPU | 662k, 11 of 50 | 682k, 8 | 661k | **718k**, 10 |
+| `ring` over `context=8`, rows of 32k, one document, the 218M of [CP](parallelism.md#context-parallelism-methodsattention) | **183k**, 137 of 1436 | 167k | 182k | |
+| the same on packed documents | 223k, 128 of 1177 | 210k | **225k**, 23 | |
+
+`collective_matmul` takes TP to 93k: its 325 collective-permutes a step, 0.84 ms each,
+take 274 ms (XLA's windowed einsum; over memcpy, `--xla_gpu_use_memcpy_local_p2p`, the
+same). TP waits for its reduce-scatters (17 ms a step) and all-gathers (15 ms) at the
+boundaries of the matmuls they feed, which no schedule moves; it takes a collective
+matmul of one's own. `ragged_all_to_all` waits 610 ms a step for its 96 exchanges;
+with 4 rows a GPU its step runs out of memory under `default` (a temporary of 97 GiB)
+and fits under the others, at 55k against `all_to_all`'s 176k. FSDP's
+collectives take 14% of the step and hide all but 1.5% of it. A collective's time
+includes the wait for its slowest peer, so on unevenly loaded devices, such as the
+ring's on packed rows, `exposed_comm_ms` swings between runs of one speed.
+
+Only scanned layers gain, under FSDP: `maxtext` trains the scanned 1.3B at 719k
+(three runs, against 656-662k), faster than the same unrolled (623k, and 572k under
+`maxtext`). Of its options, the pipelining and double buffering of `o1` give 3%, and
+cuBLAS's GEMMs where XLA would take Triton's inside the loop
+(`--xla_gpu_enable_triton_gemm=false`) 5%; the combine thresholds, XLA's
+rematerialization and command buffers nothing. With TP the scanned layers gain nothing.
+So `default`, XLA's own options, stays the default, and a scanned FSDP run is worth
+`compiler(preset=maxtext)`.
 
 ## Launching
 
