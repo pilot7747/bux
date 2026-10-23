@@ -106,7 +106,7 @@ def test_a_signal_stops_a_run_at_a_checkpoint_and_a_launch_resumes_it(
     monkeypatch.undo()
     said.clear()
     assert launch([run], tmp_path, echo=said.append) == 0
-    assert "smoke: resuming at step 3" in said
+    assert any(line.endswith("resuming at step 3") for line in said)
     assert status(folder)["state"] == "done" and status(folder)["step"] == 6
 
 
@@ -252,9 +252,12 @@ def _free_port() -> int:
         return s.getsockname()[1]
 
 
-def joined(out: Path, settings: tuple[str, ...]) -> list[subprocess.Popen]:
+def joined(
+    out: Path, settings: tuple[str, ...], *, apart: bool = False
+) -> list[subprocess.Popen]:
     """Two processes of 4 CPU devices each, launching the smoke run under `out`
-    together, each saying what it says to out/process<i>.txt."""
+    together, each saying what it says to out/process<i>.txt; with `apart`, each into a
+    folder of its own, out/process<i>, as if each saw only a disk of its own."""
     out.mkdir(exist_ok=True)
     env = os.environ | {
         "XLA_FLAGS": "--xla_force_host_platform_device_count=4",
@@ -267,7 +270,7 @@ def joined(out: Path, settings: tuple[str, ...]) -> list[subprocess.Popen]:
         with (out / f"process{i}.txt").open("a") as log:
             workers.append(
                 subprocess.Popen(
-                    [*command, "--out", str(out)],
+                    [*command, "--out", str(out / f"process{i}" if apart else out)],
                     env=env | {"JAX_PROCESS_ID": str(i)},
                     stdout=log,
                     stderr=subprocess.STDOUT,
@@ -332,6 +335,18 @@ def test_two_processes_train_as_one_does_and_a_signal_to_either_stops_both(tmp_p
     train(run, tmp_path / "one", echo=lambda _: None)  # one process of 8 devices
     one = lines(directory(run, tmp_path / "one") / "metrics.jsonl")
     assert [m["loss"] for m in two] == pytest.approx([m["loss"] for m in one], abs=1e-5)
+
+
+def test_two_processes_whose_checkpoints_go_apart_fail_at_once(tmp_path):
+    settings = (
+        "schedule.warmup = 1",
+        "steps = 4",
+        "mesh = mesh(fsdp=8)",
+        "checkpoint = checkpoint(every=2)",
+    )
+    assert ended(joined(tmp_path, settings, apart=True)) == [1, 1], outputs(tmp_path)
+    for said in outputs(tmp_path):
+        assert "processes of this job do not share" in said, said
 
 
 # --- The plan --------------------------------------------------------------------------

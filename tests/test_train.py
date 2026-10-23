@@ -28,7 +28,7 @@ from bux.lang import compile, compile_runs
 from bux.train import config as tcfg
 from bux.train import flops
 from bux.train.data import batches, plain, prefetch
-from bux.train.hooks import Hook, Log, Profile
+from bux.train.hooks import Checkpoint, Hook, Log, Profile
 from bux.train.objective import (
     Term,
     cross_entropy,
@@ -524,7 +524,8 @@ def test_a_run_writes_its_directory_and_resumes_where_it_stopped(tmp_path):
     assert [line["step"] for line in lines if "loss" in line] == [1, 2, 3, 4, 5, 6]
     assert "eval_loss" in whole
 
-    # Lose the last checkpoint: the run resumes from step 3 and ends where it did.
+    # Lose the last checkpoint: the run resumes from step 3 and ends where it did,
+    # its metrics logged once a step, as if it had not stopped.
     shutil.rmtree(folder / "checkpoints" / "6")
     said: list[str] = []
     resumed = train(run, tmp_path, echo=said.append)
@@ -532,6 +533,26 @@ def test_a_run_writes_its_directory_and_resumes_where_it_stopped(tmp_path):
     assert (
         resumed["loss"] == whole["loss"] and resumed["grad_norm"] == whole["grad_norm"]
     )
+    again = [json.loads(line) for line in (folder / "metrics.jsonl").open()]
+    assert [line["step"] for line in again] == [line["step"] for line in lines]
+
+
+def test_a_checkpoint_restores_only_into_a_state_of_its_arrays(tmp_path):
+    def trainer(width: int) -> Trainer:
+        arch = compile(f"d_model = {width}\nvocab_size = 32\nmodel = embed head\n")
+        model = Model(arch, rngs=nnx.Rngs(0))
+        return Trainer(model, optax.adamw(1e-3), objective(tcfg.LossConfig(), arch))
+
+    save = Checkpoint(tmp_path, every=1, keep=1)
+    save(trainer(16), {})
+    save.close()
+    narrower, load = trainer(8), Checkpoint(tmp_path, every=1, keep=1)
+    with pytest.raises(
+        ValueError, match=re.escape("[32, 16], and this run's float32[32, 8]")
+    ):
+        load.restore(narrower)
+    load.close()
+    assert not any(x.is_deleted() for x in jax.tree.leaves(narrower.state()))
 
 
 def test_a_profile_traces_its_steps_into_the_run_s_directory_and_keeps_its_id(
