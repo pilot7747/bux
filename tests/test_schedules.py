@@ -15,7 +15,7 @@ from bux import parallel
 from bux.__main__ import main
 from bux.architecture import Model, MoE, Scanned
 from bux.architecture.precision import matmuls
-from bux.architecture.repeats import pipelined
+from bux.architecture.repeats import pipelined, tracing
 from bux.lang import compile, compile_runs
 from bux.parallel import pipeline, schedule, split
 from bux.parallel.scheduled import _rebuilt
@@ -164,7 +164,7 @@ def test_a_split_backward_takes_the_whole_ones_gradients_and_each_matmul_once(
         )
         [scanned] = [m for _, m in nnx.iter_graph(model) if isinstance(m, Scanned)]
         graphdef, params, rest = nnx.split(scanned.layers, nnx.Param, ...)
-        stage = pipelined.Stage(graphdef, 4, True, None)
+        stage = pipelined.Stage(graphdef, (4,), True, None)
         x, dy = (jax.random.normal(jax.random.key(i), (2, 16, 64)) for i in range(2))
         rows = pipelined.Rows(None, jnp.zeros((2, 16), jnp.int32))
 
@@ -284,7 +284,8 @@ def _formats(name: str, monkeypatch) -> dict[int | None, set[str]]:
 
     def recorded(role: str | None) -> str:
         fmt = of(role)
-        seen.setdefault(matmuls._BRANCH.get(), set()).add(fmt)
+        branch = tracing.current_branch()
+        seen.setdefault(branch and branch.number, set()).add(fmt)
         return fmt
 
     monkeypatch.setattr(matmuls, "format_of", recorded)

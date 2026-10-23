@@ -1336,7 +1336,13 @@ against `save_attention`'s 30.1, at 84k tokens a second against 121k (90k with
 GiB at 120k: on a B300, computing the values again is cheaper than the copies.
 
 `Scanned.layers` holds the stacked passes, and `stacked.run(graphdef, state, times, x,
-taps)` runs any stack of them, such as a pipeline stage's share.
+taps)` runs any stack of them, such as a pipeline stage's share. A scan traces one
+pass for all it runs, so a repeat first cuts its passes into runs that trace alike
+(`tracing.runs`): where precision's first and last branches start or stop
+(`matmuls.cuts`), where `remat(first=n)` stops (`remat.cuts`), and in a pipeline's
+stage where some stage skips them. Each run traces inside `tracing.passes(run,
+each)`, which tells remat the pass (`tracing.current_pass`) and precision the branch
+(`tracing.current_branch`); another reason for passes to trace apart is another cut.
 
 ## Precision and microbatches
 

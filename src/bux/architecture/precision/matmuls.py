@@ -13,8 +13,8 @@ projections do, whose dimensions are whole blocks; anything else multiplies in
 
 A projection has a role, which its layer gives it (``role``), and `roles` can give a
 role a format of its own. The residual branches outside any other are numbered as
-they run (``branch``), so that the `first` and `last` of the model, before its first
-head, multiply in compute, and those after it as `roles.mtp` says.
+they trace (``tracing``), so that the `first` and `last` of the model, before its
+first head, multiply in compute, and those after it as `roles.mtp` says.
 
 A format is a dot_general by name, so a new recipe is a function:
 
@@ -30,11 +30,9 @@ head, softmax attention's own matmuls, the router, norms and recurrent states st
 """
 
 import contextlib
-import dataclasses
 import functools
-import itertools
 import math
-from collections.abc import Callable, Generator, Iterator
+from collections.abc import Callable, Generator
 from contextvars import ContextVar
 from typing import Any
 
@@ -47,7 +45,7 @@ from jaxtyping import Array, Float, Int, UInt32
 
 from bux import parallel
 from bux.architecture.precision import blockscaled, nvfp4
-from bux.lang import ir
+from bux.architecture.repeats import tracing
 from bux.train.config import PrecisionConfig, RolesConfig
 from bux.train.registry import Registry
 
@@ -70,7 +68,7 @@ def use(
     if isinstance(precision, str):
         precision = PrecisionConfig(matmuls=precision)
     for name in _formats(precision):
-        formats.find(name)
+        formats.find(name)  # raises at once for a name no format has
     seed = None if tokens is None else _seed(tokens)
     precision_token, seed_token = PRECISION.set(precision), SEED.set(seed)
     try:
@@ -81,7 +79,7 @@ def use(
 
 
 def _formats(precision: PrecisionConfig) -> set[str]:
-    """The formats `precision` names: its `matmuls`, and its roles'."""
+    """Return the formats `precision` names: its `matmuls`, and its roles'."""
     roles = precision.roles.model_dump(exclude={"type"}).values()
     return {precision.matmuls, *(fmt for fmt in roles if fmt)}
 
@@ -135,8 +133,8 @@ def format_of(role: str | None) -> str:
     """Return the format a projection of `role` multiplies in, in the branch that is
     tracing: compute in the first and last, `roles.mtp`'s after the first head, else
     its role's or `matmuls`."""
-    precision, branch, count = in_force(), _BRANCH.get(), _COUNT.get()
-    kind = None if branch is None or count is None else count.kind(branch, precision)
+    precision = in_force()
+    kind = _kind(tracing.current_branch(), precision)
     if kind == "compute":
         return "compute"
     name = "mtp" if kind == "mtp" else role
@@ -147,37 +145,17 @@ def format_of(role: str | None) -> str:
 # --- Residual branches ------------------------------------------------------------------
 
 
-@dataclasses.dataclass
-class Count:
-    """The residual branches outside any other in a forward: `main` of them before its
-    first head, and the number of the `next` to run. Each of `scans` is a scan that
-    traces one pass for all of them: its first branch, and the branches of a pass."""
-
-    main: int
-    next: int = 0
-    scans: list[tuple[int, int]] = dataclasses.field(default_factory=list)
-
-    def take(self) -> int:
-        """Return the number of the next branch, and count it."""
-        n = self.peek()
-        self.next += 1
-        return n
-
-    def peek(self) -> int:
-        """Return the number of the next branch: in a scan, its first pass's."""
-        n = self.next
-        for first, each in reversed(self.scans):
-            n = first + (n - first) % each
-        return n
-
-    def kind(self, n: int, precision: PrecisionConfig) -> str:
-        """Return how branch `n` multiplies: in `compute`, as `mtp` after the first
-        head where `roles.mtp` says, else as `roles`."""
-        first = _number(precision.first, self.main)
-        last = _number(precision.last, self.main)
-        if n < first or self.main - last <= n < self.main:
-            return "compute"
-        return "mtp" if n >= self.main and precision.roles.mtp else "roles"
+def _kind(branch: tracing.Branch | None, precision: PrecisionConfig) -> str:
+    """Return how `branch` multiplies: in `compute` among the model's first and last,
+    as `mtp` after its first head where `roles.mtp` says, else as `roles`, as
+    outside any branch."""
+    if branch is None:
+        return "roles"
+    n, main = branch
+    first, last = _number(precision.first, main), _number(precision.last, main)
+    if n < first or main - last <= n < main:
+        return "compute"
+    return "mtp" if n >= main and precision.roles.mtp else "roles"
 
 
 def _number(given: float, of: int) -> int:
@@ -185,109 +163,14 @@ def _number(given: float, of: int) -> int:
     return given if isinstance(given, int) else math.ceil(given * of)
 
 
-_COUNT = ContextVar[Count | None]("branches", default=None)
-_BRANCH = ContextVar[int | None]("branch", default=None)
-
-
-@contextlib.contextmanager
-def forward(main: int) -> Generator[None]:
-    """Number the residual branches of a forward of a model with `main` of them before
-    its first head (``main_branches``)."""
-    token = _COUNT.set(Count(main))
-    try:
-        yield
-    finally:
-        _COUNT.reset(token)
-
-
-@contextlib.contextmanager
-def branch() -> Generator[None]:
-    """Number the residual branch outside any other that traces inside, which decides
-    what its projections multiply in (``format_of``)."""
-    count = _COUNT.get()
-    token = _BRANCH.set(None if count is None else count.take())
-    try:
-        yield
-    finally:
-        _BRANCH.reset(token)
-
-
-@contextlib.contextmanager
-def scanned(times: int, each: int) -> Generator[None]:
-    """Number the branches of `times` passes of `each` branches that one trace runs, a
-    scan's: each as its first pass's, however often it traces, and the branches after
-    them as if every pass had run."""
-    count = _COUNT.get()
-    if count is None or each == 0:
-        yield
-        return
-    first = count.next
-    count.scans.append((first, each))
-    try:
-        yield
-    finally:
-        count.scans.pop()
-        count.next = first + times * each
-
-
-def spans(times: int, each: int) -> list[range]:
-    """Split the next `times` passes of `each` branches into runs of passes whose
-    branches multiply alike, which a scan can trace once (`scanned`)."""
-    count = _COUNT.get()
-    if count is None or each == 0:
-        return [range(times)]
-    start, precision = count.peek(), in_force()
-    kinds = [
-        tuple(count.kind(start + p * each + j, precision) for j in range(each))
-        for p in range(times)
-    ]
-    cuts = [p for p in range(1, times) if kinds[p] != kinds[p - 1]]
-    ends = [0, *cuts, times]
-    return [range(a, b) for a, b in itertools.pairwise(ends)]
-
-
-def main_branches(graph: ir.Node) -> int:
-    """Return the residual branches outside any other that run before the first head:
-    those of the model, which `first` and `last` count, and not its MTP modules'."""
-    count = 0
-    for event in _events(graph):
-        if event == "head":
-            break
-        count += 1
-    return count
-
-
-def branches_of(node: ir.Node) -> int:
-    """Return the residual branches outside any other that one run of `node` takes,
-    as an item of a sequence or the body of a repeat outside any branch."""
-    return sum(event == "branch" for event in _item(node))
-
-
-def _events(node: ir.Node) -> Iterator[str]:
-    """Yield "branch" for each residual branch outside any other, and "head" for each
-    head, in the order they run: as ``graph.branches`` finds the branches."""
-    match node:
-        case ir.Layer(config=config) if config.type == "head":
-            yield "head"
-        case ir.Seq(items=items):
-            for item in items:
-                yield from _item(item)
-        case ir.Repeat(body=body, times=times):
-            for _ in range(times):
-                yield from _item(body)
-        case ir.Residual():
-            return  # what it holds is inside a branch
-        case _:
-            for child in ir.children(node):
-                yield from _events(child)
-
-
-def _item(node: ir.Node) -> Iterator[str]:
-    """The events of an item of a sequence or a repeat's body: a branch, if it is one."""
-    if isinstance(node, ir.Residual):
-        yield "branch"
-    else:
-        yield from _events(node)
+def cuts(times: int, each: int) -> list[int]:
+    """Return the passes of the next `times` of a repeat, of `each` branches outside
+    any other, whose branches multiply unlike the pass's before: where the precision's
+    first or last start or stop (``tracing.runs``)."""
+    precision = in_force()
+    kinds = [_kind(b, precision) for b in tracing.next_branches(times * each)]
+    passes = [kinds[p * each : (p + 1) * each] for p in range(times)]
+    return [p for p in range(1, times) if passes[p] != passes[p - 1]]
 
 
 # --- Formats ----------------------------------------------------------------------------
@@ -421,12 +304,13 @@ def blocks_whole(
     lhs_kept = [i for i in range(lhs.ndim) if i not in (*lc, *lb)]
     rhs_kept = [i for i in range(rhs.ndim) if i not in (*rc, *rb)]
     sizes = gemm_sizes(lhs, rhs, dimension_numbers)
-    m, n, k = (s % (block * devices) != 0 for s in sizes)
-    out_m = range(len(lb), len(lb) + len(lhs_kept))
+    whole_m, whole_n, whole_k = (s % (block * devices) != 0 for s in sizes)
+    out_m = range(len(lb), len(lb) + len(lhs_kept))  # the output's dimensions of m
     out_n = range(out_m.stop, out_m.stop + len(rhs_kept))
-    lhs = _whole(lhs, [*(lc if k else ()), *(lhs_kept if m else ())])
-    rhs = _whole(rhs, [*(rc if k else ()), *(rhs_kept if n else ())])
-    return _whole(gemm(lhs, rhs), [*(out_m if m else ()), *(out_n if n else ())])
+    lhs = _whole(lhs, [*(lc if whole_k else ()), *(lhs_kept if whole_m else ())])
+    rhs = _whole(rhs, [*(rc if whole_k else ()), *(rhs_kept if whole_n else ())])
+    out = [*(out_m if whole_m else ()), *(out_n if whole_n else ())]
+    return _whole(gemm(lhs, rhs), out)
 
 
 def _whole(x: Float[Array, "..."], dims: list[int]) -> Float[Array, "..."]:

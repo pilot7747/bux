@@ -2,9 +2,9 @@
 
 With ``mesh.stage`` above 1, the longest scanned repeat outside any other is
 pipelined (bux.architecture.repeats.pipelined): its stacked layers split over `stage`,
-one share per stage, and the rest of the model stays whole on every stage. A method runs
-them on the ``methods.microbatches`` microbatches of the batch's rows, in a shard_map
-manual over `stage` alone, each stage on its own devices:
+one share per stage (``shares``), and the rest of the model stays whole on every
+stage. A method runs them on the ``methods.microbatches`` microbatches of the batch's
+rows, in a shard_map manual over `stage` alone, each stage on its own devices:
 
     a lax.scan over R·M + S − 1 ticks: M microbatches through S stages, R rounds;
     at each tick, every stage runs its share of a round on one microbatch,
@@ -80,11 +80,12 @@ def _on() -> Active:
     return on
 
 
-def uneven() -> tuple[int, ...] | None:
-    """Return the passes of the pipelined repeat each stage runs, if the run in force
-    gives them (``methods.stages``); None if they split evenly."""
-    on = active()
-    return None if on is None or on.methods.stages is None else tuple(on.methods.stages)
+def shares(passes: int) -> tuple[int, ...]:
+    """Return how many of a round's `passes` each stage runs: as `methods.stages` gives
+    them, or as many each."""
+    on, n = active(), stages()
+    given = None if on is None else on.methods.stages
+    return (passes // n,) * n if given is None else tuple(given)
 
 
 def rounds(passes: int) -> int:
@@ -94,8 +95,8 @@ def rounds(passes: int) -> int:
     stage to keep the stages busy."""
     on = _on()
     s, settings = on.size(AXIS), on.methods
-    if (split := uneven()) is not None:
-        _check_uneven(split, s, passes, settings.rounds)
+    if settings.stages is not None:
+        _check_shares(tuple(settings.stages), s, passes, settings.rounds)
     elif passes % (s * settings.rounds):
         raise ValueError(
             f"mesh.stage = {s} pipelines the longest scanned repeat, of {passes} "
@@ -115,15 +116,15 @@ def rounds(passes: int) -> int:
     return settings.rounds
 
 
-def _check_uneven(
-    split: tuple[int, ...], stages: int, passes: int, rounds: int
+def _check_shares(
+    given: tuple[int, ...], stages: int, passes: int, rounds: int
 ) -> None:
-    """Raise unless `split` gives each of the `stages` passes, `passes` in all, in one
-    round."""
-    if len(split) != stages or sum(split) != passes:
+    """Raise unless `given` gives each of the `stages` its passes, `passes` in all, in
+    one round."""
+    if len(given) != stages or sum(given) != passes:
         raise ValueError(
-            f"methods.stages = {list(split)} splits {sum(split)} passes over "
-            f"{len(split)} stages, and the pipelined repeat has {passes} passes over "
+            f"methods.stages = {list(given)} splits {sum(given)} passes over "
+            f"{len(given)} stages, and the pipelined repeat has {passes} passes over "
             f"mesh.stage = {stages}"
         )
     if rounds > 1:
@@ -131,22 +132,26 @@ def _check_uneven(
 
 
 def spread(
-    stacked: Shaped[Array, "l ..."], split: tuple[int, ...]
+    stacked: Shaped[Array, "l ..."], shares: tuple[int, ...]
 ) -> Shaped[Array, "m ..."]:
-    """Return a stacked variable of the passes `split` gives each stage, laid out as
-    many to a stage as the most any takes: each stage's own, then copies of its
+    """Return a stacked variable of `shares` of its passes for each stage, laid out
+    as many to a stage as the most any runs: each stage's own, then copies of its
     first, which it skips (``layers_run``)."""
-    most, start, parts = max(split), 0, []
-    for n in split:
+    most = max(shares)
+    if min(shares) == most:
+        return stacked
+    start, parts = 0, []
+    for n in shares:
         own = stacked[start : start + n]
         parts += [own, jnp.broadcast_to(own[:1], (most - n, *own.shape[1:]))]
         start += n
     return jnp.concatenate(parts)
 
 
-def layers_run(split: tuple[int, ...]) -> Bool[np.ndarray, "s l"]:
-    """Return which of its slots each stage runs, where `split` gives the passes."""
-    return np.arange(max(split))[None, :] < np.array(split)[:, None]
+def layers_run(shares: tuple[int, ...]) -> Bool[np.ndarray, "s l"]:
+    """Return which of the layers it holds each stage runs, of `shares` of the
+    passes (``spread``)."""
+    return np.arange(max(shares))[None, :] < np.array(shares)[:, None]
 
 
 @methods.pipeline.register("gpipe")
