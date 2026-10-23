@@ -339,7 +339,7 @@ the log's `mfu`:
 | KDA with `gate_lower_bound=-5` | 110k, 36% |            |
 | MoE, 64 experts, top 8      | 102k, 35% | 834k          |
 
-Batches go to the devices two ahead of the step (`prefetch`). With
+A thread loads the next two batches as a step runs (`prefetch`). With
 `methods(donate=true)` a step's new state takes the old one's memory: the 1.3B's step
 then peaks at 70.5 GiB instead of 81.1 on one GPU
 ([Donation](parallelism.md#donation-methodsdonate) says why it is off by default).
@@ -566,9 +566,11 @@ With `Trainer(..., donate=True)`, as `methods(donate=true)` makes it, a training
 step donates the model's and the optimizer's arrays: an array read from
 `trainer.model` before a step is gone after it, so a hook that keeps one keeps a
 copy (`np.asarray`). `fit` reads `data` through `prefetch` (`bux/train/data.py`),
-a thread that puts the next two batches on the devices while a step runs; a run
-that resumes still reads from its step on, and an error reading a batch is raised at
-that batch.
+a thread that loads the next two batches on the host while a step runs; a run that
+resumes still reads from its step on, and an error reading a batch is raised at that
+batch. Each goes to the devices just before its step, from the training thread: one
+put there from the thread, while a step's temporaries held most of a GPU, landed
+below them and split what they left free, and the next step's no longer fit.
 
 ## Design notes
 

@@ -72,7 +72,7 @@ def shard_state(*nodes: nnx.Pytree) -> None:
 
 def shard_batch[T](batch: T) -> T:
     """Put every (b, t) host array of `batch` on the devices: rows over `batch`,
-    positions over `seq`. One there already, which it put, stays.
+    positions over `seq`.
 
     In a job of many processes, each has the whole batch and puts the parts its own
     devices hold.
@@ -81,11 +81,9 @@ def shard_batch[T](batch: T) -> T:
     if on is None:
         return jax.device_put(batch)
 
-    def put(x: Shaped[np.ndarray | Array, "b ..."]) -> Shaped[Array, "b ..."]:
+    def put(x: Shaped[np.ndarray, "b ..."]) -> Shaped[Array, "b ..."]:
         names = ("batch", "seq", *(None,) * x.ndim)[: x.ndim]
         sharding = NamedSharding(on.mesh, partition(resolve(names, x.shape, on)))
-        if isinstance(x, jax.Array):
-            return jax.device_put(x, sharding)
         return jax.make_array_from_callback(x.shape, sharding, lambda part: x[part])
 
     return jax.tree.map(put, batch)

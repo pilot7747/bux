@@ -256,8 +256,7 @@ class Trainer:
         return per_token.metrics["loss"]
 
     def train_on_batch(self, batch: Batch) -> Metrics:
-        """Take one training step on `batch`, on the host or on the devices
-        (``parallel.shard_batch``), and return its metrics."""
+        """Take one training step on `batch`, and return its metrics."""
         metrics = self._train(self.model, self.optimizer, parallel.shard_batch(batch))
         self.step += 1
         return metrics
@@ -290,19 +289,17 @@ class Trainer:
         sinks: Sequence[Sink] = (),
     ) -> None:
         """Train on `data` to step `steps`, or until `stopping` is set, after which
-        every hook's `stop` runs; the next batches go to the devices as a step runs
-        (``prefetch``). After every step, the hooks due run in order, and what they
-        return goes to every sink. All of them close at the end, or when training
-        stops."""
+        every hook's `stop` runs; the next batches load as a step runs (``prefetch``).
+        After every step, the hooks due run in order, and what they return goes to
+        every sink. All of them close at the end, or when training stops."""
         with contextlib.ExitStack() as stack:
             for block in (*sinks, *hooks):
                 stack.callback(block.close)
             for hook in hooks:
                 hook.start(self)
-            loading = prefetch(data, parallel.shard_batch)
-            on_devices = stack.enter_context(contextlib.closing(loading))
+            loaded = stack.enter_context(contextlib.closing(prefetch(data)))
             while self.step < steps and not self.stopping:
-                metrics = self.train_on_batch(next(on_devices))
+                metrics = self.train_on_batch(next(loaded))
                 for hook in hooks:
                     if hook.due(self.step, steps) and (scalars := hook(self, metrics)):
                         for sink in sinks:

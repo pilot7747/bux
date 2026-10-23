@@ -416,18 +416,42 @@ def test_prefetch_keeps_the_order_raises_what_its_thread_met_and_stops_when_clos
         yield from range(3)
         raise FileNotFoundError("no shards match")
 
-    early = prefetch(shards(), lambda x: 10 * x)
-    assert [next(early) for _ in range(3)] == [0, 10, 20]
+    def counted():
+        for i in itertools.count():
+            read.append(i)
+            yield i
+
+    early = prefetch(shards())
+    assert [next(early) for _ in range(3)] == [0, 1, 2]
     with pytest.raises(FileNotFoundError, match="no shards match"):
         next(early)
-    assert list(prefetch(iter("ab"), str.upper)) == ["A", "B"]
-    put: list[int] = []
+    assert list(prefetch(iter("ab"))) == ["a", "b"]
+    read: list[int] = []
     threads = threading.active_count()
-    endless = prefetch(itertools.count(), lambda x: put.append(x) or x, ahead=2)
+    endless = prefetch(counted(), ahead=2)
     assert next(endless) == 0
     endless.close()
-    assert len(put) <= 4  # the one taken, the two ahead, and one on its way
+    assert len(read) <= 4  # the one taken, the two ahead, and one on its way
     assert threading.active_count() == threads
+
+
+def test_a_step_puts_its_batch_on_the_devices_itself_not_the_thread_ahead():
+    """An array the thread put on a GPU, as a step's temporaries held most of its
+    memory, split what they left free: the next step's did not fit."""
+    arch = compile(ARCH + "model = embed block norm head\n")
+    given: list[type] = []
+
+    class Watched(Trainer):
+        def train_on_batch(self, batch):
+            given.append(type(batch.input_ids))
+            return super().train_on_batch(batch)
+
+    loss = objective(tcfg.LossConfig(), arch)
+    trainer = Watched(Model(arch, rngs=nnx.Rngs(0)), optax.adamw(1e-3), loss)
+    trainer.fit(
+        batches(tcfg.SyntheticConfig(), rows(tcfg.SyntheticConfig(), 2, 8), 32), 2
+    )
+    assert given == [np.ndarray, np.ndarray]
 
 
 def test_heads_predict_further_ahead_after_each_nextn():

@@ -66,8 +66,8 @@ when Slurm, Open MPI or `JAX_NUM_PROCESSES` say so
 ([Launching](training.md#launching)). The mesh then spans every process's devices,
 and `parallel.shard_batch` builds a batch with `jax.make_array_from_callback`: every
 process makes all of it, as it depends only on the seed and the step, and puts the
-rows its own devices hold, two batches ahead in a thread of its own (`prefetch`),
-which takes no part in collectives. `tests/test_launch.py` trains the smoke run as two
+rows its own devices hold, just before the step that reads it (a thread loads the
+next two on the host, `prefetch`). `tests/test_launch.py` trains the smoke run as two
 processes of 4 CPU devices each, through `jax.distributed` on localhost, as one
 process of 8 does.
 

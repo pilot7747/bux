@@ -8,18 +8,17 @@ proportion to its weight, so it depends only on the seed and i: a run that resum
 at step i reads what it would have read had it never stopped.
 
 A source is found by its config's type in ``sources``. The trainer reads batches
-through ``prefetch``, which puts the next ones on the devices as a step runs.
+through ``prefetch``, which loads the next ones as a step runs.
 """
 
 import contextlib
-import contextvars
 import functools
 import glob
 import itertools
 import json
 import queue
 import threading
-from collections.abc import Callable, Generator, Iterator, Sequence
+from collections.abc import Generator, Iterator, Sequence
 from pathlib import Path
 from typing import NamedTuple, Protocol, runtime_checkable
 
@@ -216,28 +215,28 @@ class _End(NamedTuple):
     error: Exception | None  # what ended the items, if not their end
 
 
-def prefetch[T](
-    items: Iterator[T], put: Callable[[T], T], ahead: int = 2
-) -> Generator[T]:
-    """Yield `put` of each of `items`, which a thread runs `ahead` items early: so the
-    next batches load and go to the devices as a step runs. The thread runs in this
-    context (``parallel.use``'s), stops when the generator closes, and what it raises
-    is raised here, in order."""
+def prefetch[T](items: Iterator[T], ahead: int = 2) -> Generator[T]:
+    """Yield `items`, which a thread reads `ahead` early: so the next batches load as a
+    step runs. It stops when the generator closes, and what it raises is raised here,
+    in order.
+
+    It leaves the devices alone: a batch put there from another thread, as a step's
+    temporaries hold most of the memory, lands below them, and the next step's no
+    longer fit in what is left above it."""
     ready: queue.Queue[T | _End] = queue.Queue(ahead)
     closed = threading.Event()
 
     def fill() -> None:
         try:
             for item in items:
-                ready.put(put(item))
+                ready.put(item)
                 if closed.is_set():
                     return
             ready.put(_End(None))
         except Exception as err:  # noqa: BLE001
             ready.put(_End(err))
 
-    run = contextvars.copy_context().run
-    thread = threading.Thread(target=run, args=(fill,), daemon=True)
+    thread = threading.Thread(target=fill, daemon=True)
     thread.start()
     try:
         while not isinstance(item := ready.get(), _End):
