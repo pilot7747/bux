@@ -1416,9 +1416,10 @@ backward's two, each along what its GEMM contracts, in blocks with a scale each
 | `nvfp4`   | E2M1    | 16 (E4M3), and the tensor (float32); W's per 16 x 16 tile, so that y and dx see the same W | dy rounded stochastically, and x and dy transformed for dW by a random Hadamard transform of 16, as NVIDIA's NVFP4 pretraining recipe |
 
 On a Blackwell GPU cuDNN's block-scaled GEMM multiplies them (`__cudnn$blockScaledDot`
-in the HLO), and for `mxfp8` a Pallas kernel quantizes each of x, W and dy and its
-transpose in one pass. Elsewhere XLA dequantizes and multiplies, which computes the
-same values, so the tests run the formats on CPU. The forward keeps what the backward
+in the HLO), and Pallas kernels quantize each of x, W and dy and its transpose: for
+`mxfp8` in one pass, for `nvfp4` in two, the first for the largest magnitudes that
+set its global scales (`bux.architecture.nvfp4`). Elsewhere XLA dequantizes and
+multiplies, which computes the same values, so the tests run the formats on CPU. The forward keeps what the backward
 multiplies, x^T and W in the format, rather than x and W.
 
 Every projection made by `sharding.projection` or `sharding.linear` multiplies by
@@ -1435,8 +1436,9 @@ projection whose tokens, inputs or outputs are not whole blocks multiplies in `c
 does not split into whole blocks on every device (a multiple of the block times the
 devices) stays whole on each: so the blocks are the same on any mesh, and so is what a
 run computes, which `tests/test_precision.py` checks on `fsdp=4, tensor=2` and in a
-pipeline. NVFP4's stochastic rounding draws its noise from a hash of each element's
-index and the batch's tokens, the same on any mesh too.
+pipeline. NVFP4's stochastic rounding draws its noise from a hash of each group of 4
+elements' index and the batch's tokens, 8 bits an element, the same on any mesh too:
+NVFP4's kernels each take the place of their device's part in the whole.
 
 Under FSDP each device quantizes its part of W, so the all-gathers move float8 values
 and their scales, half of bfloat16's bytes. A projection multiplies its tokens

@@ -215,7 +215,7 @@ precision.last = 4 | 8
 | recipe | precision | left out |
 |--------|-----------|----------|
 | `nvidia_mxfp8` | Transformer Engine's MXFP8: E4M3 everywhere, gradients too | MXFP8 routed experts, which are slower in bux |
-| `nvidia_nvfp4` | NVIDIA's NVFP4 pretraining: W in 16 x 16 tiles, dy rounded stochastically, a Hadamard transform for dW; `first=2, last=8` | NVFP4 routed experts, and its speed: bux quantizes NVFP4 in XLA |
+| `nvidia_nvfp4` | NVIDIA's NVFP4 pretraining: W in 16 x 16 tiles, dy rounded stochastically, a Hadamard transform for dW; `first=2, last=8` | NVFP4 routed experts |
 | `nemotron3_nvfp4` | NVFP4, `recurrence_out` in MXFP8, and `q`, `kv`, `o`, `latent`, `mtp` and the last 15% in bfloat16 | NVFP4 routed experts, most of its matmuls |
 | `deepseek_v3_fp8` | `mxfp8_2d`, the tokens sent to the routed experts in MXFP8, moments in bfloat16 | groups of 128 with float32 scales, the float32 promotion, FP8 routed experts, activations kept in FP8 |
 | `torchtitan_mxfp8` | `mxfp8_2d` | MXFP8 routed experts, and saving a linear's input in bfloat16 |
@@ -231,14 +231,20 @@ seeds differ by 1.6%:
 | `deepseek_v3_fp8` | +0.15% | -0.03% | 127k |
 | `moments=bfloat16` | +0.07% | -0.01% | 116k |
 | `mxfp8, first=2, last=2` | +0.09% | | 127k |
-| `nvfp4` | +0.61% | | 39k |
-| `nvidia_nvfp4` | +0.38% | +0.33% | 49k |
-| `nvidia_nvfp4` and its switch at 0.82 | +0.31% | +0.26% | 49k |
-| `nvidia_nvfp4`, `last=4` | +0.46% | | 44k |
-| `nvfp4, last=0.15`, `q`, `kv` and `o` in compute | +0.34% | | 56k |
+| `nvfp4` | +0.75% | | 135k |
+| `nvidia_nvfp4` | +0.48% | +0.56% | 129k |
+| `nvidia_nvfp4` and its switch at 0.82 | +0.46% | +0.51% | 127k |
+| `nvidia_nvfp4`, `last=4` † | +0.46% | | 44k |
+| `nvfp4, last=0.15`, `q`, `kv` and `o` in compute † | +0.34% | | 56k |
 
 NVIDIA measured 1.5% at the end of 10T tokens on a 12B, against FP8, and 0.5% with
-the switch.
+the switch. NVFP4 quantizes by its kernels here, bfloat16 4.0383 and 3.9696 beside
+them. The rows marked † quantized by XLA, which on a GPU folds the cast to E4M3 and
+back: it scaled each block's values by its scale unrounded, and the GEMM by the
+rounded one, up to 6% apart (`blockscaled.nv_quantize` keeps them alike now). That
+moved nothing past the noise: NVIDIA's recipe quantized by XLA gives +0.44% and
++0.51%, with the fold +0.44% and +0.41%, and by the kernels with a float32 GEMM output
++0.50% and +0.53%. A change at the ulp moves a gap by up to 0.15 points.
 
 The baseline's MoE (64 experts, top-8, 16 layers of `d_model` 2048) trained the same
 3000 steps on two B300s a run, its experts split over them (`ragged_all_to_all`, no
@@ -432,6 +438,7 @@ by itself where it cannot run, and all of them do inside `bux.kernels.off()` or 
 | KDA with `gate_lower_bound` | cuDNN's fused KDA kernel (`fused_delta`) | 10x `chunkwise` |
 | MoE experts | `grouped.ragged_dot`: tokamax's Mosaic and Triton kernels | 27x `jax.lax.ragged_dot` |
 | MoE dispatch | `pick_rows`, `permuted`: gathers where XLA would scatter | 4x |
+| NVFP4's quantizers | `nvfp4`: Pallas kernels, a pass for the largest magnitudes and one that writes both copies, rounded by Blackwell's E2M1 conversions | 3-5x |
 
 Tokens a second on B300s, 8 × 4096 tokens a GPU, `precision(compute=bfloat16)`, and
 the log's `mfu` (of the attention a causal mask keeps):
@@ -501,14 +508,24 @@ setting, `precision(matmuls=...)` (docs/parallelism.md, "Matmul formats"). On a 
 cuDNN's MXFP8 GEMM runs at 1.75x bfloat16's rate (2.7-3.0 PFLOP/s at the model's
 shapes), and quantizing each operand twice, in one pass of a Pallas kernel, gives some
 of it back: an MLP projection's forward and backward take 1.3-1.35x less time, q's and
-o's 1.1x, and k's and v's, half as wide, 7% more. NVFP4 quantizes in XLA, which makes
-its projections 5-8x slower than bfloat16's; and the routed experts stay in bfloat16:
+o's 1.1x, and k's and v's, half as wide, 7% more. cuDNN's NVFP4 GEMM runs at 4.8-5.5
+PFLOP/s at the MLP's shapes, 1.7-1.9x MXFP8's, with a bfloat16 output that the two
+tensors' scales then rescale, in what reads it (cuDNN's own global scale is no faster,
+and takes it in bfloat16). NVFP4's quantizers are two passes of Pallas kernels over
+each operand (``bux.architecture.nvfp4``): its largest magnitude and that of its
+transpose through the Hadamard transform, then both copies at once, each value
+rounded, saturated and packed by Blackwell's `cvt.rn` and `cvt.rs` (stochastic, 8
+random bits a value). An MLP projection's forward and backward then take 1.07-1.1x
+less time than MXFP8's, but q's and o's 1.1x more and k's and v's 1.25x: the second
+pass, ~20 more small kernels a projection (scales for cuDNN's layout, the global
+scales) and the transform's copy, at 2-2.5 TB/s, cost more than their GEMMs save. The
+routed experts stay in bfloat16:
 
 | `matmuls`, 1.3B Llama-style | 1 GPU | 8, `mesh(fsdp=8)` |
 |-----------------------------|-------|-------------------|
 | `compute` (bfloat16)        | 142k  | 1.12M             |
 | `mxfp8`                     | 167k (1.18x) | 1.30M (1.16x) |
-| `nvfp4`                     | 43k   |                   |
+| `nvfp4`                     | 179k (1.22x), bfloat16 147k and `mxfp8` 169k beside it |   |
 
 On 300 steps of packed documents, autotuning pinned, `mxfp8`'s loss is bfloat16's to
 within the noise between seeds. The MoE trains as fast in `mxfp8` as in bfloat16,
@@ -525,7 +542,12 @@ Which projections multiply in `mxfp8`, on one B300 ([Precision](#precision)):
 | `first=2, last=2`, of 32 branches     | 161k  | 66.9 GiB    |
 | `passes=[fprop, dgrad]`               | 152k  | 69.9 GiB    |
 | `moments=bfloat16`                    | 169k  | 61.6 GiB    |
-| `nvfp4, first=2, last=8`              | 55k   | 69.8 GiB    |
+| `nvfp4, first=2, last=8`              | 167k  | 46.1 GiB    |
+| `nvfp4`                               | 179k  | 43.8 GiB    |
+
+The `nvfp4` rows are of a later tree, where a step donates its state: bfloat16 there
+147k in 51.1 GiB, `mxfp8` 169k in 46.9. Its first 2 and last 8 branches in bfloat16
+leave NVIDIA's recipe as fast as `mxfp8`; NVFP4 everywhere is 1.06x it.
 
 k and v in bfloat16 are slower, not faster: q still quantizes x, the copy all three
 shared, and k's and v's GEMMs then run at bfloat16's rate, x kept for them too. Over 8
