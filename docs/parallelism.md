@@ -1093,18 +1093,25 @@ eight words, byte by byte (`seq_len = 128`, `batch = 16`, `adamw(lr=3e-3)`, cosi
 
 ### Donation: `methods.donate`
 
-`methods(donate=true)` donates the model's and the optimizer's arrays to the step,
-so the new state takes the old one's memory where XLA can write it in place. On one
-B300 (bf16, 8 × 4096 tokens) the step of the Llama-style 1.3B then peaks at 70.5 GiB
-instead of 81.1, and the KDA hybrid runs 3% faster. The MoE's (64 experts, top 8,
-5.2B) peaks at 153 GiB instead of 161, but XLA writes little of its state in place
-there, and its temporaries double, to 95.8 GiB in one piece of the memory: on one
-GPU, a checkpoint's few buffers in the wrong place leave no such piece, and the run
-runs out of memory. Donation also changes how XLA rounds a step a little (the
-gradient's norm by 7e-6 at the dense model's first step on a GPU, the loss by 2e-6
-at zamba2's third on a CPU), so it is off by default. With it, an array read from
-`trainer.model` before a step is gone after it; a checkpoint is safe, as orbax
-copies the state to the host before `save` returns.
+A step donates the model's and the optimizer's arrays, so that its new state takes
+the old one's memory where XLA can write it in place; `methods(donate=false)` keeps
+them. On one B300 (bf16, 8 × 4096 tokens), the peak and the largest free piece of the
+GPU's memory after 20 steps, in GiB, and tokens a second:
+
+| model                         | kept: peak, free | donated: peak, free | tok/s, kept / donated |
+|-------------------------------|------------------|---------------------|-----------------------|
+| Llama-style 1.3B              | 81.3, 172.1      | 70.6, 186.5         | 143.6k / 142.9k       |
+| MoE, 64 experts, top 8 (5.2B) | 163.9, 85.5      | 153.5, 143.1        | 103.8k / 106.2k       |
+| Gated DeltaNet hybrid         | 148.4, 169.8     | 140.4, 185.3        | 92.1k / 91.9k         |
+| KDA, `gate_lower_bound=-5`    | 183.4, 169.7     | 176.2, 185.3        | 110.9k / 114.4k       |
+
+So more fits: donated, the 1.3B trains 36 rows a GPU and the MoE 12, which run out of
+memory kept, and the MoE with a checkpoint every 10 steps trains, where kept it runs
+out of memory at the step after its first save. Donation changes how XLA rounds a
+step a little (the gradient's norm by 7e-6 at the dense model's first step on a GPU,
+the loss by 2e-6 at zamba2's third on a CPU): runs compared bitwise donate alike. An
+array read from `trainer.model` before a step is gone after it; a checkpoint is safe,
+as orbax copies the state to the host before `save` returns.
 
 Either way the trainer keeps the state in the buffers it was made in
 (`parallel.shard_state` moves only what is elsewhere), and a run that resumes loads
