@@ -19,7 +19,8 @@ from collections.abc import Mapping, MutableMapping, Sequence
 from pathlib import Path
 
 import jax
-from jax._src import distributed
+
+from bux import jax_internals
 
 # GPU flags, which XLA takes on any backend and a CPU ignores.
 XLA_FLAGS = (
@@ -64,12 +65,12 @@ def agree_on_cache() -> None:
     from its cache waits a day. Only the first process writes the cache, so where each
     host has one of its own, the first would load what the others compile."""
     folder = jax.config.jax_compilation_cache_dir
-    alone = (distributed.global_state.num_processes or 1) == 1
-    if alone or not folder or "://" in folder:  # gs:// and the like: one for all
+    me, n = jax_internals.processes()
+    if n == 1 or not folder or "://" in folder:  # gs:// and the like: one for all
         return
     if not shared(Path(folder)):
         jax.config.update("jax_compilation_cache_dir", None)
-        if distributed.global_state.process_id == 0:
+        if me == 0:
             warnings.warn(
                 f"JAX's cache in {folder} is this host's alone, so it is off, and "
                 "every launch compiles every program: a JAX_COMPILATION_CACHE_DIR on "
@@ -82,8 +83,8 @@ def shared(folder: Path) -> bool:
     """Whether `folder` is the same directory for every process of the job: a file
     that the first makes there, the others see. Every process calls it; they talk
     through jax.distributed's key-value store, so that nothing compiles."""
-    client = distributed.global_state.client
-    me, n = distributed.global_state.process_id, distributed.global_state.num_processes
+    client = jax_internals.key_value_store()
+    me, n = jax_internals.processes()
     assert client is not None, "the processes have not joined"
     if me == 0:
         made = f".bux-{secrets.token_hex(8)}"

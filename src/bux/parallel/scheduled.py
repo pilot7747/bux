@@ -34,10 +34,10 @@ from typing import Any, NamedTuple
 import jax
 import jax.numpy as jnp
 import numpy as np
-from jax._src.api import VJP, NotNeeded, NotSaveable
 from jax.sharding import PartitionSpec as P
 from jaxtyping import Array, Float, Int, PyTree, Shaped
 
+from bux import jax_internals
 from bux.parallel import gather, methods, pipeline, schedule, split
 from bux.parallel.pipeline import AXIS, Out, Stage, _at, _by_round, _by_stage, _put
 
@@ -167,8 +167,8 @@ class Shapes(NamedTuple):
     """What each part leaves, traced once on microbatch 0."""
 
     x: jax.ShapeDtypeStruct
-    first: VJP
-    stage: VJP
+    first: jax_internals.VJP
+    stage: jax_internals.VJP
     losses: jax.ShapeDtypeStruct
     metrics: dict[str, jax.ShapeDtypeStruct]
 
@@ -389,7 +389,7 @@ class Ticks:
     def _vjp(self, residuals: list[Leaf]) -> Vjp:
         """Return this stage's vjp, rebuilt from a slot's `residuals`."""
         assert self.shapes is not None
-        return _rebuilt(self.shapes.stage, residuals, self.params)
+        return jax_internals.rebuild_vjp(self.shapes.stage, residuals, self.params)
 
     def _split(self) -> split.Split:
         """Return this stage's backward split in two: the input's gradient and what
@@ -403,7 +403,9 @@ class Ticks:
 
         def backward(*args: Leaf) -> list[Leaf]:
             p, (*r, dy, dl) = args[: len(params)], args[len(params) :]
-            vjp = _rebuilt(shapes.stage, r, jax.tree.unflatten(tree, p))
+            vjp = jax_internals.rebuild_vjp(
+                shapes.stage, r, jax.tree.unflatten(tree, p)
+            )
             d_params, dx = vjp((dy, dl))
             return [*jax.tree.leaves(d_params), dx]
 
@@ -413,7 +415,9 @@ class Ticks:
 
     def _unembed(self, held: Held, slot: Int[Array, ""], dx: Stream) -> Held:
         assert self.shapes is not None
-        vjp = _rebuilt(self.shapes.first, _at(held.firsts, slot), self.others)
+        vjp = jax_internals.rebuild_vjp(
+            self.shapes.first, _at(held.firsts, slot), self.others
+        )
         (d_others,) = vjp(dx)
         return held._replace(others=_added(held.others, d_others))
 
@@ -498,22 +502,6 @@ def _added(total: PyTree, part: PyTree) -> PyTree:
 def _merged(metrics: Metrics, more: Metrics) -> Metrics:
     """Return `metrics` and `more`, a name both have summed."""
     return metrics | {k: v + metrics[k] if k in metrics else v for k, v in more.items()}
-
-
-def _rebuilt(shapes: Vjp, leaves: list[Leaf], unsaved: PyTree) -> VJP:
-    """Return the vjp of the structure `shapes` from its residual `leaves`, with its
-    first primal, which it did not save, put back as `unsaved`."""
-    vjp = jax.tree.unflatten(jax.tree.structure(shapes), leaves)
-
-    def sentinel(v: object) -> bool:
-        return isinstance(v, NotSaveable | NotNeeded)
-
-    held, tree = jax.tree.flatten(vjp.args_res[0], is_leaf=sentinel)
-    values = [
-        u if isinstance(h, NotSaveable) else h
-        for h, u in zip(held, jax.tree.leaves(unsaved), strict=True)
-    ]
-    return vjp.replace(args_res=[jax.tree.unflatten(tree, values), *vjp.args_res[1:]])
 
 
 def _shape(a: Leaf | jax.ShapeDtypeStruct) -> jax.ShapeDtypeStruct:
