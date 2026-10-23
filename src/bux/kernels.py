@@ -1,7 +1,7 @@
 """Whether bux's kernels run: on a GPU, unless they are ``off``.
 
 Every kernel (``affine_scan``, ``grouped``, ``fused_delta``, ``blockscaled``'s
-quantizer, and tokamax's attention under ``methods.attention = auto``, dense and
+quantizer, ``scoring``, and the flash attention of tokamax and cuDNN, dense and
 ``sparse``) asks `gpu` and falls back to XLA where it is false. So inside ``off``, or
 with BUX_KERNELS=off, everything traces by XLA: to count the FLOPs a kernel hides, or
 to debug one.

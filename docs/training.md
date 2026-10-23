@@ -322,7 +322,7 @@ by itself where it cannot run, and all of them do inside `bux.kernels.off()` or 
 
 | what | by | on a B300, against XLA |
 |------|----|------------------------|
-| softmax attention | `methods.attention = auto`, the default: tokamax's flash attention | 7x, and no t × t logits |
+| softmax attention | `methods.attention = auto`, the default: cuDNN's fused attention in rows of 8192 or more and with a window, else tokamax's flash attention (sinks, a soft cap) | 7x, and no t × t logits |
 | sparse attention (DSA, QSA, CSA) | `sparse`: tokamax's flash attention with the kept keys as a mask; the indexer's scores by a Pallas kernel (`scoring`), its top-k by counting | 2.6x a chunk of queries at a time, and no t × t floats |
 | linear attention, RWKV-7 | `chunkwise`: chunks of 64 positions, the state across them by a Pallas kernel (`affine_scan`) | 14-17x a scan over positions |
 | Mamba-2 | `chunkwise`, B and C a group's, the state across chunks by a matmul | 25x a scan over positions (2 × 4096 tokens, rematerialized: at 8 × 4096 the scan needs 199 GiB) |
@@ -370,6 +370,14 @@ the MoE on `mesh(fsdp=8)`: the latency-hiding scheduler, pipelined all-gathers,
 all-reduces and reduce-scatters, combine thresholds of 128 MiB, double-buffered while
 loops, command buffers off, Triton GEMMs off. FSDP over 8 GPUs gets 97% of 8 times
 one GPU's tokens already.
+
+On packed documents (`best_fit` of documents of 16 to 4000 words, GPT-2 tokens), on
+one GPU, the 1.3B trains at 145k tok/s in rows of 4096 by tokamax's kernel, and at
+139k in rows of 16384 by cuDNN's, which skips every block no query sees, where
+tokamax's, whose backward pass does every block of a row, gives 109k (random tokens:
+111k and 101k). With sinks, 142k in rows of 4096, where `auto` took xla, whose t × t
+logits did not fit. Rows of 32k over 8 GPUs: docs/parallelism.md, "Context
+parallelism".
 
 Unlike these, a low-precision matmul format changes what a run computes, so it is a
 setting, `precision(matmuls=...)` (docs/parallelism.md, "Matmul formats"). On a B300,

@@ -39,7 +39,7 @@ from bux.parallel.settings import check, use
 
 # isort: split
 # Imported last, so that the names above exist when their methods register themselves.
-from bux.parallel import context, experts, pipeline, recurrence
+from bux.parallel import context, experts, flash, pipeline, recurrence, ring
 
 __all__ = [
     "AXES",
@@ -51,6 +51,7 @@ __all__ = [
     "check",
     "context",
     "experts",
+    "flash",
     "mesh",
     "method",
     "methods",
@@ -58,6 +59,7 @@ __all__ = [
     "named",
     "pipeline",
     "recurrence",
+    "ring",
     "shard",
     "shard_batch",
     "shard_state",
