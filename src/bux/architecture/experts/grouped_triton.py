@@ -351,7 +351,7 @@ def _contract_part(
 def _in_e4m3(blocks: tl.tensor) -> tuple[tl.tensor, tl.tensor]:
     """Return blocks (a, b, 32) of float32 in E4M3, each times the least power of two
     that takes its largest value to at most 448, and those powers' biased exponents
-    (E8M0's bits), as ``blockscaled._mx_tile`` computes them."""
+    (E8M0's bits), as ``blockscaled._in_e4m3`` computes them."""
     over = tl.max(tl.abs(blocks), axis=2) / 448.0
     bits = over.to(tl.uint32, bitcast=True)
     exponent = (bits >> 23).to(tl.int32) + ((bits & 0x7FFFFF) != 0).to(tl.int32) - 127
