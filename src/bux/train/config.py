@@ -374,7 +374,7 @@ class MethodsConfig(Config):
     loss: str = "logits"  # how the loss takes a head's logits: whole, or by chunks
     microbatches: Positive = 1
     # A step's new state takes the old one's memory: a lower peak, in fewer pieces.
-    donate: bool = False
+    donate: bool = True
 
 
 class TrainConfig(Config):
