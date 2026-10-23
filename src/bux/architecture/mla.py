@@ -149,10 +149,8 @@ class SparseMLA(Sparse, MLA):
         x = shard_layer_input(x)
         docs = segments(taps)
         query = self._query_input(x)
-        q, k, v = self._heads(x, query, docs)
-        keep_mask, scores = self._select_tokens(x, query, docs, taps)
-        out = self._attend_kept(x, q, k, v, docs, keep_mask, scores, taps)
-        return self._output(x, out)
+        heads = self._heads(x, query, docs)
+        return self._output(x, self._attend_tokens(x, query, heads, docs, taps))
 
 
 def build_mla(

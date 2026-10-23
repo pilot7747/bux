@@ -197,6 +197,13 @@ def test_a_batch_that_does_not_split_is_an_error_that_names_the_setting(tmp_path
         train(run, tmp_path, echo=lambda _: None)
 
 
+def test_a_run_that_xla_cpu_cannot_compile_in_bfloat16_says_so(tmp_path):
+    bf16 = "precision = precision(compute=bfloat16)"
+    run = _run(ARCHITECTURES["moe"], "mesh = mesh(fsdp=8)", bf16)
+    with pytest.raises(ValueError, match=r"XLA:CPU cannot train an MoE.*float32"):
+        train(run, tmp_path, echo=lambda _: None)
+
+
 def test_a_method_not_registered_is_an_error():
     methods = tcfg.MethodsConfig(attention="mine")
     hint = r"no 'mine' attention method yet; add one with @bux\.parallel\.methods"

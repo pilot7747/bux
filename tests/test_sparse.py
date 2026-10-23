@@ -1,0 +1,268 @@
+"""Attention over kept keys (bux.architecture.sparse) by XLA, a chunk of queries at a
+time, against all t by t logits: values, gradients and the indexer's loss, with
+packed documents, on one device and split over the 8 CPU devices the tests have; and
+memory that grows linearly with the queries. scripts/gpu_smoke/sparse.py checks
+tokamax's kernel against it on a GPU."""
+
+import jax
+import jax.numpy as jnp
+import numpy as np
+import pytest
+from flax import nnx
+from jaxtyping import Array, Float
+
+from bux import config as cfg
+from bux import parallel
+from bux.architecture import Model, Segments, Taps, scoring, sparse
+from bux.architecture.attention import Sparse, build_gqa
+from bux.architecture.indexer import _top
+from bux.lang import compile
+from bux.parallel.context import masked_softmax, scaled_logits, softcap, weighted_values
+from bux.train import config as tcfg
+
+B, T, H, D = 2, 16, 4, 8
+# Three documents in the first row, cut mid-way, and one in the second.
+POSITIONS = jnp.asarray([[*range(3, 8), *range(7), *range(4)], [*range(T)]])
+ROWS = Segments.of(POSITIONS)
+TINY = 1 << 9  # sparse.ELEMENTS for chunks of 2 to 8 queries
+
+
+def kept(seed: int, span: sparse.Span, top_k: int, size: int = 1) -> sparse.Kept:
+    """Each query's top_k random slots of its span, or blocks of `size` slots."""
+    scores = jax.random.uniform(jax.random.key(seed), (B, T, T // size))
+    if size == 1:
+        return sparse.Kept(_top(jnp.where(sparse.mask(span, T), scores, -1), top_k))
+    block = jnp.broadcast_to(jnp.arange(T) // size, (B, T))
+    return sparse.Kept(_top(scores, top_k), block)
+
+
+def heads(
+    seed: int, g: int, dv: int = D
+) -> tuple[Float[Array, "b s g dk"], Float[Array, "b s g dv"]]:
+    """Random keys and values of g heads."""
+    key = jax.random.split(jax.random.key(seed))
+    return (
+        jax.random.normal(key[0], (B, T, g, D)),
+        jax.random.normal(key[1], (B, T, g, dv)),
+    )
+
+
+def case(name: str) -> tuple[list[sparse.Part], bool, float | None]:
+    """The parts of a case, whether it has sinks, and its soft cap."""
+    tokens, window = sparse.token_span(ROWS, None), sparse.token_span(ROWS, 6)
+    if name == "csa":  # MQA: a window, then latents every other slot, top 3 of them
+        k, v = heads(1, 1)
+        latents = heads(2, 1)[0]
+        exists = jnp.broadcast_to(jnp.arange(T) % 2 == 1, (B, T))
+        some = sparse.Part(latents, latents, tokens, exists, kept(3, tokens, 3))
+        return [sparse.Part(k, v, sparse.token_span(ROWS, 3)), some], True, 5.0
+    g, span = (2, window) if name == "window" else (2, tokens)
+    k, v = heads(1, g, D + 2)
+    chosen = {
+        "all": None,
+        "tokens": kept(3, span, 5),
+        "window": kept(3, span, 4),
+        "blocks": kept(3, span, 2, size=3),
+    }[name]
+    return [sparse.Part(k, v, span, None, chosen)], name == "window", None
+
+
+CASES = ["all", "tokens", "window", "blocks", "csa"]
+SCALE = D**-0.5
+
+
+def reference(q, parts, sinks, cap):
+    """All t by t logits, as the `xla` method takes them."""
+    k, v = (jnp.concatenate(kv, axis=1) for kv in zip(*((p.k, p.v) for p in parts)))
+    mask = jnp.concatenate([sparse.visible(p) for p in parts], -1)
+    logits = softcap(scaled_logits(q, k, SCALE), cap)
+    return weighted_values(masked_softmax(logits, mask[:, None], sinks), v)
+
+
+def run(f, name: str):
+    """f's output on a case, and its gradients for q, every part's k and v, and the
+    sinks."""
+    parts, has_sinks, cap = case(name)
+    key = jax.random.split(jax.random.key(0), 3)
+    q = jax.random.normal(key[0], (B, T, H, D))
+    sinks = jax.random.normal(key[1], (H,)) if has_sinks else None
+    keys = [(p.k, p.v) for p in parts]
+
+    def loss(q, keys, sinks):
+        given = [p._replace(k=k, v=v) for p, (k, v) in zip(parts, keys)]
+        out = f(q, given, sinks, cap)
+        cotangent = jax.random.normal(key[2], out.shape)
+        return (out * cotangent).sum(), out
+
+    return jax.jit(jax.grad(loss, argnums=(0, 1, 2), has_aux=True))(q, keys, sinks)
+
+
+def kernel(q, parts, sinks, cap):
+    return sparse.attend(q, parts, sinks, SCALE, cap)[0]
+
+
+def close(a, b) -> None:
+    for x, y in zip(jax.tree.leaves(a), jax.tree.leaves(b), strict=True):
+        np.testing.assert_allclose(x, y, atol=2e-5, rtol=1e-5)
+
+
+@pytest.mark.parametrize("elements", [sparse.ELEMENTS, TINY], ids=["whole", "chunks"])
+@pytest.mark.parametrize("name", CASES)
+def test_attention_over_kept_keys_is_all_logits_attention(monkeypatch, name, elements):
+    monkeypatch.setattr(sparse, "ELEMENTS", elements)
+    grads, out = run(kernel, name)
+    want_grads, want = run(reference, name)
+    close(out, want)
+    close(grads, want_grads)
+
+
+def test_the_logsumexp_is_the_softmaxs_of_every_part_and_the_sinks(monkeypatch):
+    monkeypatch.setattr(sparse, "ELEMENTS", TINY)
+    parts, _, cap = case("csa")
+    q, sinks = jax.random.normal(jax.random.key(0), (B, T, H, D)), jnp.arange(H) - 1.0
+    _, lse = sparse.attend(q, parts, sinks, SCALE, cap)
+    k = jnp.repeat(jnp.concatenate([p.k for p in parts], 1), H, axis=2)
+    logits = softcap(jnp.einsum("bthd,bshd->bths", q, k) * SCALE, cap)
+    seen = jnp.concatenate([sparse.visible(p) for p in parts], -1)[:, :, None]
+    sink = jnp.broadcast_to(sinks[:, None], (B, T, H, 1))
+    every = jnp.concatenate([jnp.where(seen, logits, -jnp.inf), sink], -1)
+    np.testing.assert_allclose(lse, jax.nn.logsumexp(every, -1), atol=1e-5)
+
+
+MESHES = {
+    "context_tensor": tcfg.MeshConfig(context=2, tensor=2),
+    "context_fsdp": tcfg.MeshConfig(context=4, fsdp=2),
+    "data_tensor": tcfg.MeshConfig(data=2, tensor=4),
+}
+
+
+@pytest.mark.parametrize("mesh", MESHES.values(), ids=MESHES.keys())
+@pytest.mark.parametrize("name", ["window", "blocks", "csa"])
+def test_split_over_devices_it_attends_as_on_one(monkeypatch, name, mesh):
+    """A device has its rows, queries and heads, and every key."""
+    monkeypatch.setattr(sparse, "ELEMENTS", TINY)
+    grads, out = run(kernel, name)
+    with parallel.use(mesh):
+        split_grads, split_out = run(kernel, name)
+    close(split_out, out)
+    close(split_grads, grads)
+
+
+# --- In a layer -----------------------------------------------------------------------
+
+PRELUDE = """
+d_model = 32
+vocab_size = 64
+norm = rmsnorm
+ffn = gated_mlp(intermediate_size=48, activation=swish)
+small = indexer(num_heads=2, head_dim=8, top_k=3)
+latent = mla(num_heads=4, q_lora_rank=12, kv_lora_rank=8, qk_nope_head_dim=6,
+             qk_rope_head_dim=4, v_head_dim=5)
+window = csa(num_heads=4, head_dim=16, q_lora_rank=12, o_lora_rank=6, o_groups=2,
+             sliding_window_size=3, sinks=true, softcap=20,
+             rope=rope(fraction=0.25, layout=interleaved))
+"""
+LAYERS = {
+    "gqa": "[norm gqa(num_heads=4, num_kv_heads=2, rope=rope(), sliding_window_size=9,"
+    " indexer=small)]",
+    "qsa": "[norm gqa(num_heads=4, num_kv_heads=2, rope=rope(fraction=0.5),"
+    " indexer=small(top_k=4, block_size=2, weighted=false))]",
+    "mla_ports": "[norm latent(indexer=small, index=@k)] [norm latent(index=$k)]",
+    "csa_ports": "[norm window(compress_ratio=2, indexer=small(candidate_block_size=2,"
+    " candidate_top_k=2), kv=@kv, candidates=@pool)]"
+    " [norm window(compress_ratio=2, indexer=small, kv=$kv, candidates=$pool)]",
+}
+
+
+def trained(layers: str, logits: bool) -> tuple[float, float, nnx.State]:
+    """The language-modeling and indexer losses of a training forward on packed rows,
+    and the gradient of their sum; by all t by t logits if `logits`."""
+    m = Model(
+        compile(PRELUDE + f"model = embed {layers} [norm ffn] norm head"),
+        rngs=nnx.Rngs(0),
+    )
+    tokens = jax.random.randint(jax.random.key(1), (B, T), 0, 64)
+
+    def loss(m):
+        [out], reported = m.training_outputs(tokens, POSITIONS)
+        lm = -jax.nn.log_softmax(out)[..., 0].mean()
+        indexer = sum(r.value for r in reported)
+        return lm + indexer, (lm, indexer)
+
+    with pytest.MonkeyPatch.context() as patch:
+        if logits:  # as a layer with one of FullLogits' features attends
+            patch.setattr(Sparse, "_feature", lambda self: "all t by t logits")
+        (_, (lm, indexer)), grads = nnx.value_and_grad(loss, has_aux=True)(m)
+    return float(lm), float(indexer), nnx.state(grads)
+
+
+@pytest.mark.parametrize("layers", LAYERS.values(), ids=LAYERS.keys())
+def test_a_layer_trains_as_by_all_t_by_t_logits(monkeypatch, layers):
+    """The values, the indexer's loss and every gradient, of the indexer's too."""
+    monkeypatch.setattr(sparse, "ELEMENTS", TINY)
+    lm, indexer, grads = trained(layers, logits=False)
+    want_lm, want_indexer, want_grads = trained(layers, logits=True)
+    assert indexer > 0 and np.isclose(indexer, want_indexer, atol=1e-6)
+    assert np.isclose(lm, want_lm, atol=1e-6)
+    close(grads, want_grads)
+
+
+def step_memory(t: int, logits: bool = False) -> int:
+    """The temporary bytes of a sparse GQA layer's training forward and backward on t
+    tokens, its indexer's loss with it."""
+    indexer = cfg.SparseIndexerConfig(num_heads=2, head_dim=8, top_k=8)
+    c = cfg.GQAConfig(num_heads=4, num_kv_heads=2, indexer=indexer)
+    graphdef, state = nnx.split(build_gqa(c, 32, (), nnx.Rngs(0)))
+
+    def loss(state, x):
+        taps = Taps(training=True)
+        y = nnx.merge(graphdef, state)(x, taps)
+        return y.sum() + taps.losses[0].value
+
+    with pytest.MonkeyPatch.context() as patch:
+        if logits:
+            patch.setattr(Sparse, "_feature", lambda self: "all t by t logits")
+        compiled = jax.jit(jax.grad(loss)).lower(state, jnp.ones((1, t, 32))).compile()
+    stats = compiled.memory_analysis()
+    assert stats is not None
+    return stats.temp_size_in_bytes
+
+
+def test_memory_grows_linearly_with_the_queries(monkeypatch):
+    """Twice the tokens, twice the memory; by all t by t logits, four times."""
+    monkeypatch.setattr(sparse, "ELEMENTS", 1 << 14)
+    assert step_memory(2048) < 2.3 * step_memory(1024)
+    assert step_memory(2048, logits=True) > 3.5 * step_memory(1024, logits=True)
+
+
+# --- The indexer's selection ----------------------------------------------------------
+
+
+@pytest.mark.parametrize("seed", range(4))
+def test_the_indexers_top_k_keeps_what_lax_top_k_does(seed):
+    """Of equal scores the first, none at -inf; many ties at 0, as ReLU makes."""
+    rng = np.random.default_rng(seed)
+    scores = rng.normal(size=(2, 9, 200)).astype(np.float32)
+    scores[rng.random(scores.shape) < 0.3] = 0.0
+    scores[rng.random(scores.shape) < 0.2] = -np.inf
+    for k in (1, 7, 64, 200):
+        values, index = jax.lax.top_k(jnp.asarray(scores), k)
+        want = jnp.where(values > -jnp.inf, index, -1)
+        got = _top(jnp.asarray(scores), k)
+        assert np.array_equal(np.sort(got, -1), np.sort(want, -1)), k
+
+
+def test_the_scoring_kernel_scores_as_xla_does():
+    """Interpreted, as off a GPU; a block of keys after every query's end scores 0."""
+    key = jax.random.split(jax.random.key(0), 4)
+    q = jax.random.normal(key[0], (2, 32, 3, 16))
+    w = jax.random.normal(key[1], (2, 32, 3))
+    keys = jax.random.normal(key[2], (2, 256, 16))
+    end = jnp.broadcast_to(jnp.arange(1, 33) * 4, (2, 32))  # up to 128: a block
+    want = jnp.einsum("bthi,bsi->bths", q, keys)
+    want = jnp.einsum("bths,bth->bts", jax.nn.relu(want), w)
+    got = scoring._kernel(q, w, keys, end)
+    np.testing.assert_allclose(got[..., :128], want[..., :128], atol=1e-4)
+    assert not got[..., 128:].any()
+    passes = jax.grad(lambda q: scoring.scores(q, w, keys, end).sum())(q)
+    assert not passes.any()  # no gradient, the kernel's or its inputs'

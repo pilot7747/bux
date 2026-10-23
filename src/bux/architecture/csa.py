@@ -6,17 +6,12 @@ from typing import NamedTuple
 import jax
 import jax.numpy as jnp
 from flax import nnx
-from jaxtyping import Array, Bool, Float, Int
+from jaxtyping import Array, Float, Int
 
 from bux import config as cfg
-from bux.architecture.attention import (
-    Names,
-    Sparse,
-    documents_or_rows,
-    indexer_config,
-    token_mask,
-)
-from bux.architecture.indexer import Indexer, Scores
+from bux.architecture import sparse
+from bux.architecture.attention import Names, Sparse, documents_or_rows, indexer_config
+from bux.architecture.indexer import Indexer
 from bux.architecture.norm import Norm
 from bux.architecture.ports import read, reads, write
 from bux.architecture.registry import Context, Taps, register, segments
@@ -57,6 +52,8 @@ class CSA(Sparse):
     Ports: `kv` written pushes the `Latents`, with the indexer's keys; read uses them
     instead of compressing its own, and an indexer that it runs scores those keys.
     `index` and `candidates` as for `Sparse`, over the compressed latents.
+
+    The window and the compressed latents are two ``sparse.Part``s of one softmax.
 
     The query heads split over `heads`, and the groups of the output projection with
     them; the latents, a single head, are every device's.
@@ -153,12 +150,14 @@ class CSA(Sparse):
             else:
                 latents = self._compress(x, rows)
             write(taps, self.ports, "kv", latents)
-            keep_mask, scores = self._select_latents(
-                x, query, rows, docs, latents, taps
+            window = sparse.Part(kv, kv, sparse.token_span(rows, self.window))
+            span = sparse.token_span(rows, None)
+            kept, scored = self._select(
+                x, query, rows.positions, latents.index, span, latents.order, taps
             )
-            kv = jnp.concatenate([kv, latents.kv[:, :, None]], axis=1)
-            keep_mask = jnp.concatenate([jnp.ones((b, t, t), bool), keep_mask], -1)
-            out = self._attend_kept(x, q, kv, kv, docs, keep_mask, scores, taps)
+            latent = latents.kv[:, :, None]
+            compressed = sparse.Part(latent, latent, span, latents.order >= 0, kept)
+            out = self._attend_kept(x, q, [window, compressed], docs, scored, taps)
         return self._output(x, self._unrotate(out, rows.positions))
 
     def _compress(self, x: Float[Array, "b t d"], rows: Segments) -> Latents:
@@ -183,34 +182,6 @@ class CSA(Sparse):
         if self.indexer is not None:
             index = self.indexer.keys(latent, first)
         return Latents(self._rotate(latent[:, :, None], first)[:, :, 0], index, order)
-
-    def _select_latents(
-        self,
-        x: Float[Array, "b t d"],
-        query: Float[Array, "b t e"],
-        rows: Segments,
-        docs: Segments | None,
-        latents: Latents,
-        taps: Taps,
-    ) -> tuple[Bool[Array, "b t s"], Scores | None]:
-        """Return which compressed latents each query keeps: complete ones of its
-        document, from its group's last token on, of those the indexer keeps; and the
-        indexer's scores of them, if it runs one."""
-        b, t, _ = x.shape
-        mask = jnp.broadcast_to(token_mask(t, None, docs), (b, t, t))
-        mask = mask & (latents.order >= 0)[:, None, :]
-        keep_mask, scores = self._select(
-            x, query, rows.positions, latents.index, mask, latents.order, taps
-        )
-        return mask if keep_mask is None else mask & keep_mask, scores
-
-    def _mask(self, docs: Segments | None, t: int) -> Bool[Array, "*b t s"]:
-        """Return the mask of the window's latents, then of the compressed ones, which
-        no window limits."""
-        window = token_mask(t, self.window, docs)
-        if self.compress_ratio is None:
-            return window
-        return jnp.concatenate([window, token_mask(t, None, docs)], -1)
 
     def _offsets(self, t: int) -> Int[Array, "t s"]:
         """Return how far each latent's token is behind each query; a compressed

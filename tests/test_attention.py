@@ -23,6 +23,7 @@ from bux.architecture import (
     Segments,
     Taps,
     num_params,
+    sparse,
 )
 from bux.architecture.attention import build_gqa
 from bux.architecture.csa import CSA
@@ -125,6 +126,13 @@ def causal(t: int, window: int | None = None):
     if window is not None:
         mask &= i[:, None] - i[None, :] < window
     return jnp.broadcast_to(mask, (2, t, t))
+
+
+def keeps(kept, visible):
+    """Which keys `kept` keeps, of those `visible` says each query sees."""
+    b, t, s = visible.shape
+    every = sparse.Span(jnp.zeros((b, t), jnp.int32), jnp.full((b, t), s, jnp.int32))
+    return sparse.mask(every, s, None, kept) & visible
 
 
 def attention_probs(q, k, scale, mask, sinks=None):
@@ -303,7 +311,7 @@ def test_a_small_top_k_attends_to_the_best_scored_keys_only(weighted):
     assert attn.indexer is not None
     x, taps = inputs(), Taps()
     y = attn(x, taps)
-    [selected] = taps["topk"]
+    selected = keeps(taps["topk"][0], causal(12))
     # The best 3 of the keys each query sees, by the indexer's scores
     scores = attn.indexer.scores(x, x, None, attn.indexer.keys(x, None))
     scores = jnp.where(causal(12), scores, -jnp.inf)
@@ -319,7 +327,7 @@ def test_blocks_are_kept_whole_with_the_querys_unfinished_one():
     attn = gqa(index_port("write"), indexer=c)
     x, taps = inputs(), Taps()
     y = attn(x, taps)
-    [selected] = taps["topk"]
+    selected = keeps(taps["topk"][0], causal(12))
     pairs = selected.reshape(2, 12, 6, 2)
     i = jnp.arange(12)
     # 2 of the blocks each query sees all of, its own among them once it is complete,
@@ -369,7 +377,7 @@ def test_qsa_keeps_the_blocks_qwen_does():
             k = turn(k[None, :, None], pos[row, blocks[:, 0]][None])[0, :, 0]
             scores = jax.nn.relu(q[row, i] @ k.T).sum(0)
             expected = expected.at[row, i, blocks[jnp.argsort(-scores)[:2]]].set(True)
-    assert (selected == expected).all()
+    assert (keeps(selected, visible) == expected).all()
 
 
 def test_glms_indexer_turns_its_rope_dims_in_interleaved_pairs():
@@ -416,7 +424,7 @@ def test_a_layer_reading_index_attends_to_the_writers_selection():
     assert num_params(configured) == num_params(reader) == num_params(gqa())
     x, taps = inputs(), Taps()
     writer(x, taps)
-    [selected] = taps["topk"]
+    selected = keeps(taps["topk"][0], causal(12))
     h = inputs(2)
     assert jnp.allclose(reader(h, taps), gqa_reference(reader, h, selected), atol=1e-5)
     dense = gqa_reference(reader, h, causal(12))
@@ -552,7 +560,7 @@ def test_an_indexer_reading_candidates_selects_inside_them():
     x, taps = inputs(), Taps()
     source(x, taps)
     second(inputs(2), taps)
-    [inside], [selected] = taps["pool"], taps["topk"]
+    inside, selected = (keeps(taps[n][0], causal(12)) for n in ("pool", "topk"))
     blocks = inside.reshape(2, 12, 6, 2).any(-1)
     own = jnp.arange(12) // 2
     assert (blocks[:, jnp.arange(12), own]).all()  # the newest latent's block
@@ -581,7 +589,8 @@ def test_the_indexer_loss_is_the_kl_from_the_attention_to_its_top_k(top_k):
     assert attn.indexer is not None
     x, taps = inputs(), Taps(training=True)
     attn(x, taps)
-    [selected], [loss] = taps["topk"], taps.losses
+    [kept], [loss] = taps["topk"], taps.losses
+    selected = keeps(kept, causal(12))
     assert (loss.name, loss.weight) == ("indexer_loss", 0.5)
     assert top_k < 12 or (selected == causal(12)).all()
     q, k, _ = gqa_heads(attn, x)
@@ -601,7 +610,8 @@ def test_qsas_loss_is_over_the_blocks_kept_each_by_its_most_attended_key():
     assert ix is not None and ix.k is not None and ix.k_norm is not None
     x, taps = inputs(), Taps(training=True)
     attn(x, taps)
-    [selected], [loss] = taps["topk"], taps.losses
+    [kept], [loss] = taps["topk"], taps.losses
+    selected = keeps(kept, causal(12))
     q, k, _ = gqa_heads(attn, x)
     p = attention_probs(q, k, attn.scale, selected).sum(1)
     blocks = p.reshape(2, 12, 6, 2).max(-1)
@@ -623,7 +633,8 @@ def test_csas_loss_is_against_the_attention_its_window_and_sinks_share():
     assert attn.rope is not None and attn.sinks is not None
     x, taps = inputs(), Taps(training=True)
     attn(x, taps)
-    [latents], [selected], [loss] = taps["kv"], taps["index"], taps.losses
+    [latents], [kept], [loss] = taps["kv"], taps["index"], taps.losses
+    selected = keeps(kept, causal(12) & (latents.order >= 0)[:, None])
     query = attn.q_a_norm(attn.q_a(x))
     q = rotate(attn.q(query).reshape(2, 12, 4, 16), attn.rope)
     window = rotate(attn.kv_norm(attn.kv(x))[:, :, None], attn.rope)
@@ -876,7 +887,8 @@ def test_kv_heads_split_only_between_heads(tensor, kv):
 
 def test_the_indexers_top_k_keeps_the_first_of_equal_scores_and_splits_by_row():
     scores = jnp.asarray([[[1.0, 2.0, 2.0, 2.0, -jnp.inf]]])
-    assert _top(scores, 2).tolist() == [[[False, True, True, False, False]]]
+    assert _top(scores, 2).tolist() == [[[1, 2]]]
+    assert _top(scores[..., -2:], 2).tolist() == [[[0, -1]]]
     with parallel.use(tcfg.MeshConfig(data=8)) as mesh:
         rows = jax.device_put(jnp.ones((8, 4, 6)), NamedSharding(mesh, P("data")))
         compiled = jax.jit(lambda s: _top(s, 3)).lower(rows).compile().as_text()
