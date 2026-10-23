@@ -152,35 +152,6 @@ def _by_spec(
     return jax.tree.map(lambda s, v: v.replace(f(s, v.get_value())), specs, state)
 
 
-def _own_streams(buffers: nnx.State, over: Axes) -> nnx.State:
-    """Fold this device's index into every RNG key of `buffers`, in a shard_map manual
-    over `over`: so that each device draws masks for its own rows, not the same ones
-    as every other device."""
-    index = jax.lax.axis_index(over)
-    fold_in = jax.vmap(jax.random.fold_in, (0, None))  # a scanned repeat's, stacked
-
-    def fold(v: nnx.Variable) -> nnx.Variable:
-        if not isinstance(v, nnx.RngKey):
-            return v
-        keys = v.get_value()
-        return v.replace(fold_in(keys.reshape(-1), index).reshape(keys.shape))
-
-    return jax.tree.map(fold, buffers, is_leaf=_is_variable)
-
-
-def _keys_of(before: nnx.State, after: nnx.State) -> nnx.State:
-    """Return `after` with the RNG keys of `before`: a forward moves only the counts."""
-
-    def pick(new: nnx.Variable, old: nnx.Variable) -> nnx.Variable:
-        return old if isinstance(old, nnx.RngKey) else new
-
-    return jax.tree.map(pick, after, before, is_leaf=_is_variable)
-
-
-def _is_variable(x: object) -> bool:
-    return isinstance(x, nnx.Variable)
-
-
 class Trainer:
     """A model, its optimizer, which applies `tx`, and the objective it minimizes;
     `step` counts the steps taken.
@@ -200,8 +171,9 @@ class Trainer:
     `microbatches` or a pipeline's ticks, gathers its parameters once with `gather`
     "step", or as each layer runs with "layer". With `accumulate` "unreduced" its
     microbatches' gradients add up on each device and reduce once, in `reduce`
-    (``parallel.gather``); with "reduced" they reduce each microbatch; "auto" adds
-    them up unreduced where that computes the same, as `_why_not_unreduced` says.
+    (``parallel.gather``), a pipeline's in float32; with "reduced" they reduce each
+    microbatch; "auto" adds them up unreduced where that computes the same, as
+    `_why_not_unreduced` says.
 
     With `donate`, a training step donates the model's and the optimizer's arrays, so
     that their new state takes the old one's memory: an array read from them before a
@@ -236,13 +208,14 @@ class Trainer:
         self._eval = nnx.jit(self.eval_step)
 
     def _reduces_once(self, model: Model) -> bool:
-        """Return whether a step adds up its gradients unreduced (``_unreduced``):
-        where `accumulate` or a `reduce` other than `compute` asks for it, and by
-        "auto" where the step has microbatches and that computes the same. Raise where
-        it is asked for but would not."""
+        """Return whether a step adds up its gradients unreduced (``_unreduced``, or a
+        pipeline's ``gather.apart``): where `accumulate` or a `reduce` other than
+        `compute` asks for it, and by "auto" where the step runs its layers more than
+        once and that computes the same. Raise where it is asked for but would not."""
         in_float32 = self.reduce != self.compute
         asked = self.accumulate == "unreduced" or in_float32
-        auto = self.accumulate == "auto" and self.microbatches > 1
+        runs = self.microbatches > 1 or parallel.pipeline.pipelined()
+        auto = self.accumulate == "auto" and runs
         if not (asked or auto) or not parallel.gather.rows():
             return False  # with no axis splitting the rows, nothing reduces over them
         why = self._why_not_unreduced(model)
@@ -259,8 +232,6 @@ class Trainer:
         """Return why a step could not add up its gradients unreduced, or None."""
         if self.accumulate == "reduced":
             return "methods(accumulate=reduced) reduces as the backward makes them"
-        if parallel.pipeline.pipelined():
-            return "a pipeline does not: its stages run in a shard_map of their own"
         if self.gather != "step":
             return "needs the parameters gathered once a step: methods(gather=step)"
         if not rows_independent(model):
@@ -291,7 +262,7 @@ class Trainer:
         `microbatches`. The forwards update the model's buffers (its state that is not
         a parameter) in turn, and then the step-end updates run."""
         graphdef, params, buffers = nnx.split(model, nnx.Param, ...)
-        if self.reduces_once:
+        if self.reduces_once and not parallel.pipeline.pipelined():
             grads, metrics, buffers = self._unreduced(graphdef, params, buffers, batch)
         elif self.microbatches > 1:
             grads, metrics, buffers = self._reduced(graphdef, params, buffers, batch)
@@ -310,12 +281,15 @@ class Trainer:
     ) -> tuple[nnx.State, Metrics, nnx.State]:
         """Return `_grads` of the whole batch at once. A pipeline that gathers once a
         step takes the parameters whole over FSDP's axes, in float32: its ticks add up
-        their gradients in the dtype of what they read."""
+        their gradients in the dtype of what they read. One that reduces them once
+        runs its stages manual over the rows' axes (``gather.apart``)."""
         if self.gather == "step" and parallel.pipeline.pipelined():
             params = parallel.gather.whole(params)
-        grads, metrics, buffers = self._grads(
-            graphdef, params, buffers, batch, token_share=1.0, row_share=1.0
-        )
+        apart = parallel.gather.rows() if self.reduces_once else ()
+        with parallel.gather.apart(apart):
+            grads, metrics, buffers = self._grads(
+                graphdef, params, buffers, batch, token_share=1.0, row_share=1.0
+            )
         return _shard_state(grads), metrics, buffers
 
     def _gathered(self, params: nnx.State) -> nnx.State:
@@ -369,12 +343,13 @@ class Trainer:
                 lambda w, p: jnp.zeros(w.shape, p.dtype), whole, params
             )
             shares = token_shares(batch, self.microbatches, over)
-            own = _own_streams(buffers, over)
+            own = parallel.gather.own_streams(buffers, over)
             grads, metrics, after = self._accumulate(
                 graphdef, whole, own, batch, zeros, shares, rows
             )
             grads = _by_spec(reduced, splits, grads)
-            return grads, jax.lax.psum(metrics, over), _keys_of(buffers, after)
+            after = parallel.gather.keys_of(buffers, after)
+            return grads, jax.lax.psum(metrics, over), after
 
         return jax.shard_map(
             on_device,

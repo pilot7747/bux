@@ -15,11 +15,12 @@ from jax.sharding import PartitionSpec as P
 from bux import parallel
 from bux.architecture import Model
 from bux.lang import compile_runs
+from bux.parallel.gather import own_streams
 from bux.train import config as tcfg
 from bux.train.data import plain
 from bux.train.objective import objective
 from bux.train.optim import lr_multiplier, optimizer
-from bux.train.trainer import Trainer, _accumulated, _own_streams, _reduce_dtype
+from bux.train.trainer import Trainer, _accumulated, _reduce_dtype
 
 PRELUDE = """
 d_model = 64
@@ -68,11 +69,18 @@ def test_gathered_once_a_step_of_an_moe_reduces_its_gradients_each_microbatch():
     assert _sum(eight, GRADIENTS) >= 7 * _sum(one, GRADIENTS)
 
 
-def test_a_pipeline_gathers_its_stages_parameters_once_a_step():
+def test_a_pipeline_gathers_its_stages_parameters_and_reduces_them_once_a_step():
+    """Its 4 microbatches go through 2 stages in 5 ticks, gathering and reducing as
+    they run before; and reduced each tick, only gathered once."""
     how = "methods(repeat=scan, microbatches=4{})"
     after = _moved(LLAMA, "mesh(stage=2, fsdp=4)", how.format(""))
+    gathered = _moved(
+        LLAMA, "mesh(stage=2, fsdp=4)", how.format(", accumulate=reduced")
+    )
     before = _moved(LLAMA, "mesh(stage=2, fsdp=4)", how.format(", gather=layer"))
     assert before["all-gather"] >= 4 * after["all-gather"] > 0
+    assert gathered["all-gather"] == after["all-gather"]
+    assert _sum(gathered, GRADIENTS) >= 3 * _sum(after, GRADIENTS)
 
 
 # --- What it computes -------------------------------------------------------------------
@@ -161,7 +169,7 @@ def test_each_device_draws_its_own_rows_masks():
         keys = nnx.state(rngs, nnx.RngKey)
 
         def drawn(keys: nnx.State) -> jax.Array:
-            own = _own_streams(keys, ("fsdp",))
+            own = own_streams(keys, ("fsdp",))
             key = jax.tree.leaves(own)[0]
             return jax.random.key_data(key)[None]
 
@@ -192,13 +200,6 @@ def test_each_device_draws_its_own_rows_masks():
             "methods(gather=layer, accumulate=unreduced)",
             "",
             "gather=step",
-        ),
-        (
-            LLAMA,
-            "mesh(stage=2, fsdp=4)",
-            "methods(repeat=scan, accumulate=unreduced)",
-            "",
-            "pipeline",
         ),
     ],
 )

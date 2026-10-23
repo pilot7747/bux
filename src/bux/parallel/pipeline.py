@@ -34,7 +34,7 @@ import jax.numpy as jnp
 from jax.sharding import PartitionSpec as P
 from jaxtyping import Array, Bool, Float, Int, PyTree, Shaped
 
-from bux.parallel import methods
+from bux.parallel import gather, methods
 from bux.parallel.mesh import Active, active
 
 AXIS = "stage"
@@ -161,12 +161,14 @@ class Clock(NamedTuple):
                 f"{x.shape[0]} rows do not split into methods.microbatches = {m}"
             )
         rows = jax.tree.map(lambda a: _micro(a, m), rows)
+        apart = gather.rows_apart()  # the axes that split the rows, if manual here too
         by_stage = P(AXIS)  # each stage's own, on its devices
+        by_row = P(None, apart or None)  # each device's rows of every microbatch
         io, rest, losses = jax.shard_map(
-            functools.partial(_device, self, stage),
-            in_specs=(by_stage, by_stage, P(), P()),
-            out_specs=by_stage,
-            axis_names={AXIS},
+            functools.partial(_device, self, stage, apart),
+            in_specs=(by_stage, by_stage, by_row, by_row),
+            out_specs=(P(AXIS, None, apart or None), by_stage, by_stage),
+            axis_names={AXIS, *apart},
             check_vma=False,  # else nested shard_maps' gradients fail to lower
         )(_by_stage(params, s), _by_stage(rest, s), _micro(x, m), rows)
         y = jnp.sum(jnp.where(_first(io), io, 0), 0)  # the first stage's buffer
@@ -183,19 +185,26 @@ class Clock(NamedTuple):
 def _device(
     clock: Clock,
     stage: Stage,
+    apart: tuple[str, ...],
     params: PyTree,
     rest: PyTree,
     xs: Shaped[Array, "m n t *r"],
     rows: PyTree,
 ) -> tuple[Shaped[Array, "1 m n t *r"], PyTree, Float[Array, "1 rounds l k"]]:
     """Run one stage on its devices: at every tick, its share of a round on one
-    microbatch (``_tick``). The first stage's buffer ends up holding the stream."""
+    microbatch (``_tick``). The first stage's buffer ends up holding the stream.
+
+    Manual over the axes `apart` too, it runs this device's rows alone: its gradients
+    are its own, which the shard_map's transpose sums over `apart` as they leave."""
     index = jax.lax.axis_index(AXIS)
-    params, rest = _at(params, 0), _at(rest, 0)  # this stage's
+    params, before = _at(params, 0), _at(rest, 0)  # this stage's
     tick = functools.partial(_tick, clock, stage, params, rows, index)
-    carry = (jnp.zeros_like(xs[0]), xs, rest)
+    carry = (jnp.zeros_like(xs[0]), xs, gather.own_streams(before, apart))
     (_, io, rest), (losses, r) = jax.lax.scan(tick, carry, jnp.arange(clock.ticks))
-    return io[None], jax.tree.map(lambda a: a[None], rest), clock.mean(losses, r)[None]
+    rest = gather.keys_of(before, rest)
+    losses = clock.mean(losses, r)
+    losses = jax.lax.pmean(losses, apart) if apart else losses
+    return io[None], jax.tree.map(lambda a: a[None], rest), losses[None]
 
 
 def _tick(

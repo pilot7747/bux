@@ -9,14 +9,21 @@ of, which JAX types only on Explicit or Manual axes (``P(unreduced=...)``). So a
 whose rows are independent runs in a shard_map manual over the axes that split them
 (``rows``): there each device gathers its shard of every parameter (``gather``), sums
 its own rows' gradients over the microbatches, and sums the sums over the devices
-once (``scatter``), each device keeping its shard.
+once (``scatter``), each device keeping its shard. A pipeline's step does the same in
+its own shard_map, made manual over those axes too (``apart``).
 
-    whole     the parameters as a step uses them, whole over FSDP's axes
-    rows      the axes that split the batch's rows, which the shard_map is manual over
-    splits    each parameter's split over them
-    gather    a device's shard of a parameter, gathered whole
-    scatter   a device's part of a gradient, summed over the devices, as a shard
+    whole        the parameters as a step uses them, whole over FSDP's axes
+    rows         the axes that split the batch's rows, the shard_map manual over them
+    splits       each parameter's split over them
+    gather       a device's shard of a parameter, gathered whole
+    scatter      a device's part of a gradient, summed over the devices, as a shard
+    own_streams  each device's own RNG keys, so that it draws its own rows' masks
+    apart        says that the step computes its rows apart, which a pipeline reads
 """
+
+import contextlib
+import contextvars
+from collections.abc import Generator
 
 import jax
 import jax.numpy as jnp
@@ -92,3 +99,55 @@ def _summable(g: Float[Array, "*s"]) -> Float[Array, "*s"]:
     """Return `g` as XLA sums it: on a CPU in float32, as XLA:CPU sums a bfloat16
     all-reduce, and aborts on one in a shard_map (docs/parallelism.md)."""
     return g.astype(jnp.float32) if jax.default_backend() == "cpu" else g
+
+
+def own_streams(state: nnx.State, over: Axes) -> nnx.State:
+    """Fold this device's index into every RNG key of `state`, in a shard_map manual
+    over `over`: so that each device draws masks for its own rows, not the same ones
+    as every other device."""
+    if not over:
+        return state
+    index = jax.lax.axis_index(over)
+    fold_in = jax.vmap(jax.random.fold_in, (0, None))  # a scanned repeat's, stacked
+
+    def fold(v: nnx.Variable) -> nnx.Variable:
+        if not isinstance(v, nnx.RngKey):
+            return v
+        keys = v.get_value()
+        return v.replace(fold_in(keys.reshape(-1), index).reshape(keys.shape))
+
+    return jax.tree.map(fold, state, is_leaf=_is_variable)
+
+
+def keys_of(before: nnx.State, after: nnx.State) -> nnx.State:
+    """Return `after` with the RNG keys of `before`: a forward moves only the counts."""
+
+    def pick(new: nnx.Variable, old: nnx.Variable) -> nnx.Variable:
+        return old if isinstance(old, nnx.RngKey) else new
+
+    return jax.tree.map(pick, after, before, is_leaf=_is_variable)
+
+
+def _is_variable(x: object) -> bool:
+    return isinstance(x, nnx.Variable)
+
+
+APART = contextvars.ContextVar[Axes]("bux.parallel.gather.apart", default=())
+
+
+@contextlib.contextmanager
+def apart(over: Axes) -> Generator[None]:
+    """Say that the step being traced computes each row apart from the others over
+    the axes `over`: a pipeline then runs its stages manual over them too, so that
+    its ticks' gradients stay each device's own, summed once as they leave it."""
+    token = APART.set(over)
+    try:
+        yield
+    finally:
+        APART.reset(token)
+
+
+def rows_apart() -> Axes:
+    """Return the axes `apart` put in force, but those a shard_map being traced maps."""
+    manual = set(jax.sharding.get_abstract_mesh().manual_axes)
+    return tuple(a for a in APART.get() if a not in manual)
