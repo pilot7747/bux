@@ -724,6 +724,27 @@ counts the other's rows as 0. Which rows share a block, and so dW, depend on how
 mesh splits the tokens: in float32, 3 steps on `fsdp=2, expert=4` lose within 1e-4 of
 one device's (`tests/test_precision.py`), not the same.
 
+On a B300, at the baseline MoE's shapes (d 2048, f 704, 262144 picks), it is slower
+than bfloat16. An MoE layer's experts take 13.7 ms forward and backward, against
+tokamax's 9.1 in bfloat16, and 11.1 ms with `passes=[fprop, dgrad]`. Its GEMMs run at
+400 to 600 TFLOP/s, as tokamax's bfloat16 ones do and half of cuDNN's batched
+block-scaled GEMM at the same shapes (1.1 PFLOP/s): `tl.dot_scaled` takes each 32's
+scales, rows of 4 bytes too short for TMA, through registers at every step of k. And
+the quantizer passes over x, the hidden units and both gradients, each twice, at 1.5
+TB/s or less, 5 ms a layer. On 8 B300s at 32k tokens a GPU:
+
+| method | experts | tokens a second | peak |
+|--------|---------|-----------------|------|
+| `sorted`, `fsdp=8` | bfloat16 | 827k | 83.8 GiB |
+| | `mxfp8` | 703k | 69.4 GiB |
+| | `mxfp8`, `passes=[fprop, dgrad]` | 763k | 79.9 GiB |
+| `ragged_all_to_all`, `capacity=1.25`, `expert=8` | bfloat16 | 548k | 88.4 GiB |
+| | `mxfp8` | 477k | 73.4 GiB |
+
+It keeps x^T in MXFP8 for dW rather than x in bfloat16, so it takes 14 GiB less. It
+would be faster with the scales in the layout Blackwell's tensor memory takes them in,
+128 rows by 4 of k a tile, which TMA can load, and a quantizer near the memory's speed.
+
 ## Expert parallelism
 
 Four methods of `methods.moe` split the experts over the axes `layout.experts` gives
