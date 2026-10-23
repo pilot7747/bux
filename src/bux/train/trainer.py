@@ -219,8 +219,6 @@ class Trainer:
         if not (asked or auto) or not parallel.gather.rows():
             return False  # with no axis splitting the rows, nothing reduces over them
         why = self._why_not_unreduced(model)
-        if in_float32 and parallel.pipeline.pipelined():
-            why = "a pipeline's embedding and head do not: they reduce in the backward"
         if why is not None and asked:
             what = (
                 f"precision(reduce={self.reduce.name}) reduces a step's gradients once"
@@ -236,6 +234,8 @@ class Trainer:
             return "methods(accumulate=reduced) reduces as the backward makes them"
         if self.gather != "step":
             return "needs the parameters gathered once a step: methods(gather=step)"
+        if self.reduce != self.compute and parallel.pipeline.pipelined():
+            return "a pipeline's embedding and head do not: they reduce in the backward"
         if not rows_independent(model):
             return (
                 "a layer that learns from the whole batch, as the MoE's router does, "

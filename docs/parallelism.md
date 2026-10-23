@@ -1131,6 +1131,29 @@ of 4096:
 | `repeat=scan, microbatches=8, gather=layer, accumulate=reduced` | 1048, 34.1 GiB | 152, 21.5 GiB |
 | `repeat=scan, microbatches=8`                  | 10, 2.68 GiB    | 7, 2.68 GiB     |
 
+Tokens a second and the peak memory of a GPU, on one node of 8 B300s, the same run,
+20 steps:
+
+| mesh, methods                                      | tok/s | peak     |
+|----------------------------------------------------|-------|----------|
+| `fsdp=8`, `microbatches=1`                         | 1147k | 58.5 GiB |
+| `fsdp=8`, `microbatches=8, gather=layer, accumulate=reduced` | 817k | 11.9 GiB |
+| `fsdp=8`, `microbatches=8, accumulate=reduced`     | 925k  | 11.6 GiB |
+| `fsdp=8`, `microbatches=8`                         | 907k  | 15.7 GiB |
+| `fsdp=8`, `repeat=scan, microbatches=8, gather=layer, accumulate=reduced` | 719k | 10.2 GiB |
+| `fsdp=8`, `repeat=scan, microbatches=8`            | 803k  | 15.7 GiB |
+| `fsdp=2, tensor=4`, `layout(stream=tensor)`, `microbatches=8, gather=layer, accumulate=reduced` | 647k | 11.9 GiB |
+| `fsdp=2, tensor=4`, `layout(stream=tensor)`, `microbatches=8` | 640k | 12.9 GiB |
+| `stage=2, fsdp=4`, `repeat=scan, microbatches=8, gather=layer, accumulate=reduced` | 660k | 88.3 GiB |
+| `stage=2, fsdp=4`, `repeat=scan, microbatches=8, accumulate=reduced` | 640k | 97.8 GiB |
+| `stage=2, fsdp=4`, `repeat=scan, microbatches=8`   | 644k  | 97.8 GiB |
+
+Over NVLink, gathering once is the gain: XLA overlaps a reduce-scatter a microbatch
+with the backward, and adding up unreduced reads and writes a float32 copy of every
+gradient a microbatch, as each device's own. With deterministic GEMMs the three dense
+runs of 8 microbatches end their 10 steps at 11.86792, 11.86793 (`reduced`) and
+11.86804 (`unreduced`).
+
 The cost is memory: the gathered copy of the parameters in `compute`, and, unreduced,
 a float32 sum of every parameter's gradient on each device, held through the step.
 `layout(zero=1)` keeps the parameters whole between steps too; with `gather=step` it
