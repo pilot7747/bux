@@ -455,10 +455,13 @@ second, and the exposed communication of a step in ms of its time (the log's
 `collective_matmul` takes TP to 93k: its 325 collective-permutes a step, 0.84 ms each,
 take 274 ms (XLA's windowed einsum; over memcpy, `--xla_gpu_use_memcpy_local_p2p`, the
 same). TP waits for its reduce-scatters (17 ms a step) and all-gathers (15 ms) at the
-boundaries of the matmuls they feed, which no schedule moves; it takes a collective
-matmul of one's own. `ragged_all_to_all` waits 610 ms a step for its 96 exchanges;
-with 4 rows a GPU its step runs out of memory under `default` (a temporary of 97 GiB)
-and fits under the others, at 55k against `all_to_all`'s 176k. FSDP's
+boundaries of the matmuls they feed, which no schedule moves. `methods(tensor=chunked)`
+moves them beside the matmuls, a chunk at a time, and hides a quarter of the wait,
+which the matmuls beside give back ([Tensor
+parallelism](parallelism.md#tensor-parallelism-methodstensor)). `ragged_all_to_all`
+waits 610 ms a step for its 96 exchanges; with 4 rows a GPU its step runs out of
+memory under `default` (a temporary of 97 GiB) and fits under the others, at 55k
+against `all_to_all`'s 176k. FSDP's
 collectives take 14% of the step and hide all but 1.5% of it. A collective's time
 includes the wait for its slowest peer, so on unevenly loaded devices, such as the
 ring's on packed rows, `exposed_comm_ms` swings between runs of one speed.

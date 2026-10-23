@@ -95,7 +95,7 @@ def assert_close(a, b, tolerance: float = 1e-5) -> None:
     assert jax.tree.all(jax.tree.map(close, a, b))
 
 
-@pytest.mark.parametrize("chunks", [2, 4])
+@pytest.mark.parametrize("chunks", [1, 2, 4])
 @pytest.mark.parametrize("mesh", MESHES)
 def test_chunked_projections_compute_what_gspmd_s_do_with_the_same_gradients(
     mesh, chunks
