@@ -8,7 +8,9 @@ mesh: the MoE layer's output and gradients against `sorted` on one GPU, then a s
 run's losses against one GPU's, and its tokens a second. It exits 1 if the layer or
 the first loss differs by more than 1e-4, or any later loss by more than 1e-3:
 rounding differs between splits, and the top-k picks and the updates after them
-amplify it as the run goes on (examples/experiments/parallel/laptop.bux). If NCCL's
+amplify it as the run goes on (examples/experiments/parallel/laptop.bux). Then the
+run with its routed experts in MXFP8 (Triton's grouped GEMMs, `grouped_triton`), on one
+GPU and by ragged_all_to_all: within `MXFP8_TOLERANCE` of bfloat16's losses. If NCCL's
 ragged all-to-all hangs, as it was reported to on jax 0.11, try
 XLA_FLAGS=--xla_gpu_experimental_ragged_all_to_all_use_barrier_with_nccl=false.
 """
@@ -48,6 +50,8 @@ log = log(every=1)
 """
 EXPERT = cfg.MLPConfig(type="gated_mlp", intermediate_size=128, activation="swish")
 NORM = cfg.NormalizationConfig(type="rmsnorm")
+MXFP8 = "precision(roles=roles(experts=mxfp8))"
+MXFP8_TOLERANCE = 1e-2  # of the losses, against bfloat16's: 1e-3 off on B300s
 
 
 class Reports(Sink):
@@ -75,13 +79,17 @@ def layer(mesh: dict[str, int], method: str) -> list[np.ndarray]:
         return jax.tree.leaves(jax.device_get((y, g(e, x))))
 
 
-def run(mesh: dict[str, int], method: str, steps: int) -> tuple[list[float], float]:
-    """A short run's losses by `method` on `mesh`, and its median tokens a second."""
+def run(
+    mesh: dict[str, int], method: str, steps: int, precision: str = "precision()"
+) -> tuple[list[float], float]:
+    """A short run's losses by `method` on `mesh` in `precision`, and its median
+    tokens a second."""
     settings = {
         "mesh": source(mesh),
         "methods": f"methods(moe={method})",
         "steps": steps,
         "batch": 8 * jax.device_count(),
+        "precision": precision,
     }
     [r] = compile_runs(ARCH + "".join(f"\n{k} = {v}" for k, v in settings.items()))
     sink = Reports()
@@ -127,6 +135,15 @@ def main() -> int:
                 f"in the layer, {first:.1e} in the first loss, {loss:.1e} in all",
                 flush=True,
             )
+    for mesh, method in ((ONE, "sorted"), (meshes[0], "ragged_all_to_all")):
+        losses, speed = run(mesh, method, steps, MXFP8)
+        loss = differs(losses, one)
+        failed |= loss > MXFP8_TOLERANCE
+        print(
+            f"{source(mesh):28} {method:18} {speed:,.0f} tok/s in MXFP8; off by "
+            f"{loss:.1e} in the losses",
+            flush=True,
+        )
     return int(failed)
 
 

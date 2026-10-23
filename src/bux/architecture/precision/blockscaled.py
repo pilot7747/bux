@@ -24,7 +24,6 @@ from typing import Any, Literal, NamedTuple
 import jax
 import jax.numpy as jnp
 import numpy as np
-from jax._src.cudnn.scaled_matmul_stablehlo import _scaled_matmul_p
 from jax.experimental import pallas as pl
 from jax.experimental.custom_partitioning import custom_partitioning
 from jax.sharding import Mesh, NamedSharding
@@ -32,7 +31,7 @@ from jax.sharding import PartitionSpec as P
 from jax.typing import DTypeLike
 from jaxtyping import Array, Float, Int, Shaped, UInt8, UInt32
 
-from bux import kernels
+from bux import jax_internals, kernels
 
 E4M3_MAX = 448.0  # float8 E4M3's largest value
 
@@ -180,7 +179,7 @@ def scaled_matmul(a: Blocks, b: Blocks, out: DTypeLike) -> Float[Array, "m n"]:
     jax's custom partitioning cannot place there."""
     args = (a.values[None], b.values[None], a.scales[None], b.scales[None])
     if _manual():
-        return _scaled_matmul_p.bind(*args, preferred_element_type=jnp.dtype(out))[0][0]
+        return jax_internals.scaled_matmul_unpartitioned(*args, out)[0]
     return jax.nn.scaled_matmul(*args, preferred_element_type=out)[0]
 
 

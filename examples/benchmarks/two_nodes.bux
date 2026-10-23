@@ -1,0 +1,21 @@
+# The two-node suite: the baseline on 16 GPUs of two hosts, 8 rows a GPU. FSDP over
+# all 16; HSDP, sharded within a host and copied across the two; and the MoE, sorted
+# under HSDP, and by EP within a host (a ragged all-to-all, at a capacity of 1.25).
+#
+#   python scripts/benchmark.py run examples/benchmarks/two_nodes.bux --out new.json   # on each host
+use baseline
+
+model   = fsdp:   embed A^16 norm head
+        | hsdp:   embed A^16 norm head
+        | moe:    embed E^16 norm head
+        | moe_ep: embed E^16 norm head
+batch   = 128
+
+mesh    = fsdp:   mesh(fsdp=16)
+        | hsdp:   mesh(data=2, fsdp=8)
+        | moe:    mesh(data=2, fsdp=8)
+        | moe_ep: mesh(data=2, expert=8)
+methods = fsdp:   methods
+        | hsdp:   methods
+        | moe:    methods(moe=sorted)
+        | moe_ep: methods(moe=ragged_all_to_all, capacity=1.25)

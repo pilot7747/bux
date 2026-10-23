@@ -1,0 +1,32 @@
+# What the benchmarks measure: a 1.3B Llama-style model, d_model 2048 and 16 layers,
+# its hybrids with Gated DeltaNet, KDA and Mamba-2, and its MoE, on random tokens in
+# rows of 4096, 8 rows a GPU, in bfloat16. Each suite here splits them its own way.
+d_model    = 2048
+vocab_size = 128256
+
+norm    = rmsnorm(eps=1e-5)
+attn    = gqa(num_heads=16, num_kv_heads=8, rope=rope(base=500000))
+ffn     = gated_mlp(intermediate_size=5632, activation=swish)
+delta   = gdn(num_heads=16, head_dim=128)
+kimi    = kda(num_heads=16, head_dim=128)
+bounded = kda(num_heads=16, head_dim=128, gate_lower_bound=-5)
+ssm     = mamba2(state_size=128, head_dim=64, num_groups=8)
+experts = moe(num_experts=64, top_k=8,
+              expert=gated_mlp(intermediate_size=704, activation=swish))
+
+layer(mixer, f) = [norm mixer] [norm f]
+A = layer(attn, ffn)
+D = layer(delta, ffn)
+K = layer(kimi, ffn)
+B = layer(bounded, ffn)
+M = layer(ssm, ffn)
+E = layer(attn, experts)
+model = embed A^16 norm head
+
+data      = synthetic
+optimizer = adamw(lr=3e-4)
+seq_len   = 4096
+batch     = 8
+steps     = 30
+log       = log(every=5)
+precision = precision(compute=bfloat16)

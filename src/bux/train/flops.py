@@ -17,7 +17,9 @@ from collections.abc import Callable, Iterator, Sequence
 from typing import Any
 
 import jax
-from jax.extend import core
+
+from bux import jax_internals
+from bux.jax_internals import core
 
 _VISIBLE = re.compile(r"visible=([0-9.e+-]+)")
 
@@ -78,9 +80,11 @@ def _equation(e: core.JaxprEqn, share: float) -> float:
             each = math.prod(rhs) / rhs[e.params["dimension_numbers"].rhs_spec[0]]
             return share * 2 * math.prod(_shape(e.outvars[0])) * each
         case "scan":
-            return e.params["length"] * flops(e.params["jaxpr"].jaxpr, share)
+            length = jax_internals.scan_options(e)["length"]
+            return length * flops(jax_internals.scan_body(e).jaxpr, share)
         case "cond":
-            return max(flops(b.jaxpr, share) for b in e.params["branches"])
+            branches = jax_internals.cond_branches(e)
+            return max(flops(b.jaxpr, share) for b in branches)
     # jit, shard_map, custom_vjp, ...
     return sum(flops(j, share) for j in _inner(e.params))
 

@@ -23,17 +23,12 @@ import jax.numpy as jnp
 from jax.sharding import PartitionSpec as P
 from jaxtyping import Array, Bool, Float, Int, Shaped
 
-from bux import kernels, parallel
+from bux import jax_internals, kernels, parallel
 from bux.architecture.common.segments import Segments
 from bux.parallel.context import softcap
 
-try:  # tokamax's kernels, where its extra is installed (Linux)
-    from tokamax._src.ops.attention import api as flash
-    from tokamax._src.ops.attention import base as masks
-
-    MOSAIC = flash.IMPLEMENTATIONS.get("mosaic_gpu")
-except ImportError:
-    masks = MOSAIC = None
+# tokamax's kernels, None where its extra is not installed (it is on Linux)
+MOSAIC = jax_internals.tokamax_attention("mosaic_gpu")
 
 KEPT = "mask of kept keys (an indexer's top-k, or CSA's compression)"
 ELEMENTS = 1 << 27  # the most a chunk of queries makes of an intermediate
@@ -492,18 +487,14 @@ def _flash_bwd(
     """Return a part's share of the gradients by tokamax's backward kernels, given
     the softmax's statistics: P = exp(logits - lse), and rowsum(dout * out)."""
     assert MOSAIC is not None
-    bound = MOSAIC.bind(q, part.k, part.v, **_flash_args(part, static))
-    kwargs = {n: x for n, x in bound.kwargs.items() if n != "return_residuals"}
-    lse = _finite(lse).transpose(0, 2, 1)
-    grads = MOSAIC.vjp((lse, jnp.ones_like(lse)), out, dout, *bound.args, **kwargs)
-    return grads["q"], grads["k"], grads["v"]
+    args, lse = _flash_args(part, static), _finite(lse).transpose(0, 2, 1)
+    return jax_internals.tokamax_vjp(MOSAIC, lse, out, dout, q, part.k, part.v, args)
 
 
 def _flash_args(part: Part, static: _Static) -> dict[str, Any]:
     """Return tokamax's arguments for `part`: the kept and existing slots as a
     boolean mask, the span as each query's first key and, with the positions split,
     the key after its last."""
-    assert masks is not None
     keep = (
         None if part.kept is None else mask(part.span, part.k.shape[1], None, part.kept)
     )
@@ -513,7 +504,7 @@ def _flash_args(part: Part, static: _Static) -> dict[str, Any]:
         keep = exists if keep is None else keep & exists
     end = None if static.causal else part.span.end[:, None]
     return {
-        "mask": masks.Mask(
+        "mask": jax_internals.tokamax_mask(
             keep, k_start=part.span.start[:, None], k_end=end, is_causal=static.causal
         ),
         "logits_scale": static.scale,
