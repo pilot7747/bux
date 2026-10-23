@@ -193,6 +193,15 @@ def kept_quantized(blocks: Blocks) -> Blocks:
     return Blocks(values, scales, blocks.tensor_scale)
 
 
+def dequantized(blocks: Blocks) -> Float[Array, "r c"]:
+    """Return the values `blocks` hold, in float32: each times its block's scale and
+    the tensor's."""
+    block = blocks.values.shape[-1] // blocks.scales.shape[-1]
+    scales = jnp.repeat(blocks.scales.astype(jnp.float32), block, axis=-1)
+    values = blocks.values.astype(jnp.float32) * scales
+    return values if blocks.tensor_scale is None else values * blocks.tensor_scale
+
+
 # --- Quantizing kernels: what MXFP8's and NVFP4's share -------------------------------
 # A Pallas kernel runs a program per tile of x, which writes its part of x's copy and of
 # x^T's at once. Custom partitioning runs it on each device's part of x.
@@ -208,6 +217,12 @@ def interpreted() -> bool:
 def largest_tile(n: int, tiles: tuple[int, ...]) -> int:
     """Return the largest of `tiles` that divides n."""
     return next(t for t in tiles if n % t == 0)
+
+
+def as_bytes(x: Shaped[Array, "*s"]) -> UInt8[Array, "*s"]:
+    """Return the bits of a format of a byte, E4M3 values or E4M3 and E8M0 scales, as
+    a kernel stores them."""
+    return jax.lax.bitcast_convert_type(x, jnp.uint8)
 
 
 def on_each_device(
@@ -312,6 +327,30 @@ def _power_of_two(e: Int[Array, "*s"]) -> Float[Array, "*s"]:
     return jax.lax.bitcast_convert_type((e + 127).astype(jnp.uint32) << 23, jnp.float32)
 
 
+# MXFP8 as bytes: what an exchange sends a row, or a Triton kernel takes.
+
+
+def mx_from_bytes(
+    values: UInt8[Array, "r c"], exponents: UInt8[Array, "r n"]
+) -> Blocks:
+    """Return MXFP8 blocks of their bytes: E4M3 values, and their scales' biased
+    exponents (E8M0's bits)."""
+    as_e4m3 = jax.lax.bitcast_convert_type(values, jnp.float8_e4m3fn)
+    as_e8m0 = jax.lax.bitcast_convert_type(exponents, jnp.float8_e8m0fnu)
+    return Blocks(as_e4m3, as_e8m0, None)
+
+
+def mx_packed(blocks: Blocks) -> UInt8[Array, "r e"]:
+    """Return each row of MXFP8 `blocks` as one row of bytes, c + c / 32 of them: its
+    E4M3 values, then its scales."""
+    return jnp.concatenate([as_bytes(blocks.values), as_bytes(blocks.scales)], axis=-1)
+
+
+def mx_unpacked(packed: UInt8[Array, "r e"], c: int) -> Blocks:
+    """Return the MXFP8 blocks of rows of `c` values that `mx_packed` made."""
+    return mx_from_bytes(packed[:, :c], packed[:, c:])
+
+
 # The kernel's tiles, of rows and of columns, largest first: 64 x 128 is the fastest
 # on a B300, 3.2 TB/s at an MLP's shapes, 1.4x 128 x 128.
 ROWS, COLUMNS = (64, 32), (128, 64, 32)
@@ -369,7 +408,7 @@ def _mx_quantize_tile(
     rows_ref[...], row_exponents_ref[...] = _in_e4m3(tile, "rows")
     values, exponents = _in_e4m3(tile, "columns")
     # x^T's values transpose as bytes, a quarter of x's float32 tile.
-    cols_ref[...] = jax.lax.bitcast_convert_type(values, jnp.uint8).T
+    cols_ref[...] = as_bytes(values).T
     col_exponents_ref[...] = exponents.T
 
 

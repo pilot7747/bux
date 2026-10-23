@@ -25,7 +25,13 @@ from jaxtyping import Array, Float, Shaped, UInt8, UInt32
 
 from bux import kernels
 from bux.architecture.precision import blockscaled
-from bux.architecture.precision.blockscaled import E4M3_MAX, Blocks, Recipe, Shardings
+from bux.architecture.precision.blockscaled import (
+    E4M3_MAX,
+    Blocks,
+    Recipe,
+    Shardings,
+    as_bytes,
+)
 
 BLOCK = 16
 E2M1_MAX = 6.0  # float4 E2M1's largest value
@@ -338,16 +344,16 @@ def _quantize_tile(
     scales = block_scales(x, encode_ref[0], kind.tiles)
     values = scaled_values(x, scales, decode_ref[0])
     bits = _tile_bits(row, column, (tr, tc), c, salt) if kind.stochastic else None
-    rows_ref[...], row_scales_ref[...] = _to_e2m1(values, bits), _bytes(scales)
+    rows_ref[...], row_scales_ref[...] = _to_e2m1(values, bits), as_bytes(scales)
     if kind.tiles:  # W^T: the same values, transposed
         cols_ref[...] = _to_e2m1(values.T)
-        col_scales_ref[...] = _tiles_transposed(_bytes(scales))
+        col_scales_ref[...] = _tiles_transposed(as_bytes(scales))
         return
     xt = _hadamard_transposed(tile, hadamard_ref[...])  # x^T's tile, transformed
     scales = block_scales(xt, encode_ref[1])
     values = scaled_values(xt, scales, decode_ref[1])
     bits = _tile_bits(column, row, (tc, tr), r, salt) if kind.stochastic else None
-    cols_ref[...], col_scales_ref[...] = _to_e2m1(values, bits), _bytes(scales)
+    cols_ref[...], col_scales_ref[...] = _to_e2m1(values, bits), as_bytes(scales)
 
 
 def _tile_bits(
@@ -372,11 +378,6 @@ def _hadamard_transposed(
     each 16 of x's rows."""
     columns = (((0,), (0,)), ((), ()))
     return jax.lax.dot_general(x, hadamard, columns, preferred_element_type=jnp.float32)
-
-
-def _bytes(scales: Shaped[Array, "r n"]) -> UInt8[Array, "r n"]:
-    """Return the bits of E4M3 scales, which a kernel stores."""
-    return jax.lax.bitcast_convert_type(scales, jnp.uint8)
 
 
 def _tiles_transposed(scales: UInt8[Array, "r q"]) -> UInt8[Array, "c p"]:
