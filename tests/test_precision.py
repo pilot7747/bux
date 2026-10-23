@@ -24,7 +24,7 @@ from bux.architecture.precision import blockscaled, matmuls, nvfp4
 from bux.architecture.recurrent.linear_attention import delta_rule, l2norm, recurrence
 from bux.architecture.recurrent.ssm import selective_scan
 from bux.architecture.registry import Taps
-from bux.architecture.repeats import remat
+from bux.architecture.repeats import tracing
 from bux.lang import BuxError, compile_runs
 from bux.train import config as tcfg
 from bux.train.data import Batch, plain
@@ -545,10 +545,10 @@ def test_branches_are_numbered_as_they_run_scanned_or_not(arch):
     methods = tcfg.MethodsConfig(repeat="scan")
     with parallel.use(tcfg.MeshConfig(data=1), methods=methods):
         model = Model(run.arch, rngs=nnx.Rngs(0))
-        with matmuls.forward(model.main_branches):
+        with tracing.forward(model.main_branches):
             model.graph(tokens, Taps(tokens=tokens))
-            ran = matmuls._COUNT.get()
-    assert ran is not None and (model.main_branches, ran.next) == (main, every)
+            [after] = tracing.next_branches(1)
+    assert (after.main, after.number) == (main, every)
 
 
 EDGES = [
@@ -568,7 +568,7 @@ def _formats_traced(
     seen, of = {}, matmuls.format_of
 
     def recorded(role: str | None) -> str:
-        seen[remat._PASS.get(), role] = fmt = of(role)
+        seen[tracing.current_pass(), role] = fmt = of(role)
         return fmt
 
     monkeypatch.setattr(matmuls, "format_of", recorded)
@@ -577,8 +577,7 @@ def _formats_traced(
         with matmuls.use(run.train.precision):
             forward(model, _batch())
     monkeypatch.setattr(matmuls, "format_of", of)
-    # A scan's trial of a pass, which never runs, traces it outside any pass.
-    return {key: fmt for key, fmt in seen.items() if key[0] is not None}
+    return seen
 
 
 @pytest.mark.parametrize(("source", "given"), EDGES)

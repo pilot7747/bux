@@ -1,0 +1,17 @@
+# The one-GPU suite: the baseline's models, a GPU each, and the dense one with its
+# matmuls in MXFP8 and in NVFP4.
+#
+#   python scripts/benchmark.py run examples/benchmarks/one_gpu.bux --out new.json
+use baseline
+
+model = dense:  embed A^16 norm head
+      | gdn:    embed "DDDA"^4 norm head
+      | kda:    embed "KKKA"^4 norm head
+      | kdab:   embed "BBBA"^4 norm head
+      | moe:    embed E^16 norm head
+      | mamba2: embed "MMMA"^4 norm head
+      | mxfp8:  embed A^16 norm head
+      | nvfp4:  embed A^16 norm head
+
+precision.matmuls = dense: compute | gdn: compute | kda: compute | kdab: compute
+                  | moe: compute | mamba2: compute | mxfp8: mxfp8 | nvfp4: nvfp4
