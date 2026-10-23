@@ -18,23 +18,13 @@ import jax.numpy as jnp
 import jax_triton
 import triton
 import triton.language as tl
-from jax._src.interpreters import partial_eval
-from jax.extend.core import JaxprEqn
 from jax.typing import DTypeLike
 from jaxtyping import Array, Float, Int, Shaped, UInt8
 
+from bux import jax_internals
 from bux.architecture.precision.blockscaled import MX_BLOCK, Blocks
 
-
-def _keeps_its_inputs(
-    used: list[bool], live: list[bool], eqn: JaxprEqn
-) -> tuple[list[bool], JaxprEqn]:
-    """Dead-code elimination's rule of a Triton call: keep it whole. jax-triton 0.4.1
-    registers one of jax 0.11's signature, which jax 0.12's calls with one more."""
-    return [True] * len(eqn.invars), eqn
-
-
-partial_eval.dce_rules[jax_triton.triton_lib.triton_kernel_call_p] = _keeps_its_inputs
+jax_internals.keep_triton_calls_whole()  # jax-triton's own rule fails on jax 0.12
 
 
 class Tiles(NamedTuple):

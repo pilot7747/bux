@@ -37,12 +37,12 @@ from typing import Any
 import jax
 from flax import nnx
 from jax.ad_checkpoint import Offloadable, checkpoint_name, name_p
-from jax.extend.core import Primitive
 from jaxtyping import Shaped
 
 from bux import parallel
 from bux.architecture.registry import Stream, Taps
 from bux.architecture.repeats import pure
+from bux.jax_internals import Primitive
 from bux.parallel import methods
 from bux.train.config import RematConfig
 
@@ -188,8 +188,8 @@ CHEAP = frozenset(
     """abs add add_any and clamp cos div eq erf exp exp2 expm1 ge gt integer_pow
     is_finite le log log1p logistic lt max min mul ne neg not or pow rsqrt select_n
     sign sin sqrt square sub tanh xor
-    broadcast_in_dim concatenate convert_element_type copy copy_p dynamic_slice
-    expand_dims iota pad reduce_precision reshape rev slice squeeze transpose""".split()  # noqa: SIM905
+    broadcast_in_dim concatenate convert_element_type copy dynamic_slice
+    iota pad reduce_precision reshape rev slice squeeze transpose""".split()  # noqa: SIM905
 )
 
 

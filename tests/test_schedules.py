@@ -11,14 +11,13 @@ import pytest
 from flax import nnx
 from jaxtyping import Float, Shaped
 
-from bux import parallel
+from bux import jax_internals, parallel
 from bux.__main__ import main
 from bux.architecture import Model, MoE, Scanned
 from bux.architecture.precision import matmuls
 from bux.architecture.repeats import pipelined
 from bux.lang import compile, compile_runs
 from bux.parallel import pipeline, schedule, split
-from bux.parallel.scheduled import _rebuilt
 from bux.train.data import plain
 from bux.train.objective import objective
 from bux.train.optim import lr_multiplier, optimizer
@@ -185,7 +184,8 @@ def test_a_split_backward_takes_the_whole_ones_gradients_and_each_matmul_once(
 
         def backward(*args: Shaped[jax.Array, "..."]) -> list[Shaped[jax.Array, "..."]]:
             p, (*r, d) = args[: len(flat)], args[len(flat) :]
-            d_params, dx = _rebuilt(vjp, r, jax.tree.unflatten(tree, p))(d)
+            vjp_of = jax_internals.rebuild_vjp(vjp, r, jax.tree.unflatten(tree, p))
+            d_params, dx = vjp_of(d)
             return [*jax.tree.leaves(d_params), dx]
 
         shapes = [jax.ShapeDtypeStruct(a.shape, a.dtype) for a in [*residuals, dy]]
