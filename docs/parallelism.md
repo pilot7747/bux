@@ -696,6 +696,33 @@ in a LatentMoE; `to_latent` `(embed, latent)` and `from_latent` `(latent, embed)
 `dense` constrains its hidden units to `(batch, seq, experts, mlp)`, so that under
 FSDP the weights move to the tokens rather than the tokens to the weights.
 
+### The experts in MXFP8
+
+```
+precision = precision(roles=roles(experts=mxfp8))   # or matmuls=mxfp8, which they follow
+```
+
+The routed experts' role, `experts`, takes `compute`, `mxfp8` or `mxfp8_2d`
+(docs/training.md, "Precision"); `nvfp4` is an error, and under a `matmuls` of it the
+experts multiply in compute. In a format, `experts` runs up and gate as one GEMM, so
+that x quantizes once, and each GEMM by `grouped_blockscaled.ragged_dot`: every operand
+of the forward's GEMM and of the backward's two quantized along what that GEMM
+contracts, as a projection's are, and each expert's W on its own. On a GPU Triton's
+`tl.dot_scaled` multiplies them, Blackwell's block-scaled MMA, in the kernels of
+`grouped_triton`, which load by TMA: `rows` for x W and dy W^T, a program per tile of
+rows of each expert, and `contract` for dW, the tiles of rows wholly inside an expert
+by TMA and the two it shares with its neighbours by loads that take the neighbours'
+rows as 0. One pass of a Triton kernel quantizes x and x^T, and zeroes the rows past
+the experts', which an exchange's buffer leaves as they were. Elsewhere XLA dequantizes
+and multiplies, which computes the same values, so the tests run it on CPU. Only
+`passes` multiply in the format, the others by `grouped`'s kernels, as they are.
+
+Unlike a projection's, the experts' dW quantizes the rows a device has of an expert in
+blocks of 32 as they lie: a block that two experts share has one scale, and each
+counts the other's rows as 0. Which rows share a block, and so dW, depend on how the
+mesh splits the tokens: in float32, 3 steps on `fsdp=2, expert=4` lose within 1e-4 of
+one device's (`tests/test_precision.py`), not the same.
+
 ## Expert parallelism
 
 Four methods of `methods.moe` split the experts over the axes `layout.experts` gives
@@ -797,7 +824,7 @@ in float32: 7e-7 apart at most). For the baseline's MoE (`d_model` 2048, 64 expe
 |----------------------------------|------------|---------------------|------------------|
 | `sorted`                         | `fsdp=8`   | 816k, 84 GiB        | 737k, 52 GiB     |
 | `all_gather`, `capacity=1.25`    | `expert=8` | 612k, 89 GiB        | 515k, 65 GiB     |
-| `ragged_all_to_all`, `capacity=1.25` | `expert=8` | 550k, 88 GiB    | 452k, 73 GiB     |
+| `ragged_all_to_all`, `capacity=1.25` | `expert=8` | 550k, 88 GiB    | 515k, 78 GiB     |
 | `ragged_tokens`, `capacity=1.25` | `expert=8` | 547k, 90 GiB        | 479k, 74 GiB     |
 
 Before the by-expert slices, the capacity and the pieces, `all_to_all` and
@@ -805,7 +832,9 @@ Before the by-expert slices, the capacity and the pieces, `all_to_all` and
 32k they made 72k and 25k tokens a second (now `ragged_all_to_all` dropless: 263k).
 On one node at this shape, then, `sorted` is still the fastest: its FSDP gathers 0.5
 GB of experts a layer, where the exchanges move 1 GB of picks each way. Under `dots`
-the exchanges run again in the backward, since their results are no products. XLA's
+the exchanges ran again in the backward, since their results are no products; named
+for it ([below](#fp8-dispatch-precisiondispatch)), `ragged_all_to_all` trains at 515k
+tokens a second in 77.5 GiB, from 452k in 72.6. XLA's
 ragged all-to-all leaves an allocation inside the memory pool after the first step,
 so that a step whose temporaries take over half of it fits only once:
 `XLA_PYTHON_CLIENT_MEM_FRACTION=.95` gives the pool more room. `ragged_tokens` moves
@@ -827,6 +856,29 @@ On jax 0.12 NCCL's ragged all-to-all hangs unless XLA_FLAGS has
 `--xla_gpu_experimental_ragged_all_to_all_use_barrier_with_nccl=false`, which
 `bux train` and `bux launch` add to it, and so does `bux.runtime.configure()` in a
 script that calls it before it touches a device.
+
+### FP8 dispatch: `precision.dispatch`
+
+```
+precision = precision(dispatch=mxfp8)
+```
+
+The ragged methods send the tokens to their experts in MXFP8, as DeepSeek-V3 does:
+E4M3 values and a power-of-two scale per 32, d + d/32 bytes a row, 52% of bfloat16's
+at d = 2048, dequantized to the compute dtype where they arrive. What comes back, and
+the backward's two exchanges, go in compute; the gradient is the exchange's, as if the
+tokens went unquantized (`experts._in_mxfp8`). Rows that are not whole blocks go as
+they are. It changes what a run computes, so it is in the run's id.
+
+On 8 B300s, for the baseline's MoE at 32k tokens a GPU and a capacity of 1.25, it trains
+at the speed of bfloat16's: `ragged_all_to_all` 545k tokens a second against 548k, and
+`ragged_tokens` 552k against 549k. Each dispatch takes half as long, about 0.9 ms a
+layer less, but XLA's pass that quantizes before it and the one that dequantizes after
+it cost as much. It would pay where the experts' MXFP8 GEMM took the rows as they
+arrive, and the gather that picks them quantized them.
+
+The ragged exchanges name what they bring `experts.exchanged`, under `experts`, so that
+`remat=dots`, which keeps `experts`, does not exchange them again in the backward.
 
 ## Muon: `methods.orthogonalize`
 
@@ -1217,11 +1269,12 @@ Every projection made by `sharding.projection` or `sharding.linear` multiplies b
 `matmuls.dot_general`, which runs the format in force for its role and the residual
 branch it is in (docs/training.md, "Precision"): attention's q, k, v, o and gate;
 the MLPs', the shared experts' and LatentMoE's; MLA's, CSA's, the indexer's; the
-linear attentions', RWKV-7's and Mamba's; Engram's, nextn's and `linear`'s. These stay
+linear attentions', RWKV-7's and Mamba's; Engram's, nextn's and `linear`'s. The routed
+experts multiply by a grouped GEMM of their own in `mxfp8` and `mxfp8_2d`
+([The experts in MXFP8](#the-experts-in-mxfp8)), and in `compute` under any other format. These stay
 in `compute`: the embedding and the head, softmax attention's own matmuls and its
 relative bias, the router and the shared experts' gate, hyper-connections, norms,
-low-rank gates and decays, recurrent states, and the routed experts
-(`grouped.ragged_dot`, and `methods(moe=dense)`'s einsums). A projection whose tokens,
+low-rank gates and decays, recurrent states, and `methods(moe=dense)`'s einsums. A projection whose tokens,
 inputs or outputs are not whole blocks multiplies in `compute`. On a mesh, one that
 does not split into whole blocks on every device (a multiple of the block times the
 devices) stays whole on each: so the blocks are the same on any mesh, and so is what a

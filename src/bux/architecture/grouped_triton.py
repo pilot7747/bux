@@ -138,30 +138,33 @@ QUANTIZE = Tiles(m=64, n=128, k=0, warps=4, stages=1)  # the most of each
 
 
 def quantized_twice(
-    x: Float[Array, "r c"], rows: Int[Array, ""], most: Tiles = QUANTIZE
-) -> tuple[Blocks, Blocks]:
-    """Return x and x^T in MXFP8, as `blockscaled.mx_twice` does, x's rows from
-    `rows` on as 0: one pass over x, a tile a program, the largest of 32 times a
-    power of two up to `most`'s that x's sides are whole tiles of."""
+    x: Float[Array, "r c"],
+    rows: Int[Array, ""],
+    columns: bool = True,
+    most: Tiles = QUANTIZE,
+) -> tuple[Blocks, Blocks | None]:
+    """Return x and, if `columns`, x^T in MXFP8, as `blockscaled.mx_twice` does, x's
+    rows from `rows` on as 0: one pass over x, a tile a program, the largest of 32
+    times a power of two up to `most`'s that x's sides are whole tiles of."""
     r, c = x.shape
     tiles = most._replace(m=_tile(r, most.m), n=_tile(c, most.n))
     shapes = [((r, c), jnp.uint8), ((r, c // 32), jnp.uint8)]
-    shapes += [((c, r), jnp.uint8), ((c, r // 32), jnp.uint8)]
-    values, scales, t_values, t_scales = jax_triton.triton_call(
+    shapes += [((c, r), jnp.uint8), ((c, r // 32), jnp.uint8)] if columns else []
+    values, scales, *transposed = jax_triton.triton_call(
         x,
         rows.astype(jnp.int32).reshape(1),
-        kernel=_quantize,
+        kernel=_quantize if columns else _quantize_rows,
         out_type=[jax.ShapeDtypeStruct(*s) for s in shapes],
         grid=(r // tiles.m, c // tiles.n),
-        name="bux_mx_twice",
+        name="bux_mx_twice" if columns else "bux_mx_rows",
         num_warps=tiles.warps,
         num_stages=tiles.stages,
-        r=r,
+        **({"r": r} if columns else {}),
         c=c,
         tile_r=tiles.m,
         tile_c=tiles.n,
     )
-    return _blocks(values, scales), _blocks(t_values, t_scales)
+    return _blocks(values, scales), _blocks(*transposed) if columns else None
 
 
 def _tile(n: int, most: int) -> int:
@@ -214,19 +217,62 @@ def _quantize(
 ) -> None:
     """A tile of x in E4M3 in blocks of 32 along its rows, and of x^T along its
     columns, x's rows from `rows` on as 0."""
-    i, j = tl.program_id(0), tl.program_id(1)
-    rs = (i * tile_r + tl.arange(0, tile_r)).to(tl.int64)
-    cs = (j * tile_c + tl.arange(0, tile_c)).to(tl.int64)
-    tile = tl.load(x + rs[:, None] * c + cs[None, :]).to(tl.float32)
-    tile = tl.where((rs < tl.load(rows))[:, None], tile, 0.0)
-    v, e = _in_e4m3(tile.reshape(tile_r, tile_c // 32, 32))
-    tl.store(values + rs[:, None] * c + cs[None, :], v.reshape(tile_r, tile_c))
-    blocks_c = j * (tile_c // 32) + tl.arange(0, tile_c // 32)
-    tl.store(scales + rs[:, None] * (c // 32) + blocks_c[None, :], e)
+    tile, rs, cs = _tile_of(x, rows, c, tile_r, tile_c)
+    _store_rows(tile, values, scales, rs, cs, c, tile_r, tile_c)
     v, e = _in_e4m3(tl.trans(tile).reshape(tile_c, tile_r // 32, 32))
     tl.store(t_values + cs[:, None] * r + rs[None, :], v.reshape(tile_c, tile_r))
-    blocks_r = i * (tile_r // 32) + tl.arange(0, tile_r // 32)
-    tl.store(t_scales + cs[:, None] * (r // 32) + blocks_r[None, :], e)
+    blocks = tl.program_id(0) * (tile_r // 32) + tl.arange(0, tile_r // 32)
+    tl.store(t_scales + cs[:, None] * (r // 32) + blocks[None, :], e)
+
+
+@triton.jit
+def _quantize_rows(
+    x: tl.tensor,
+    rows: tl.tensor,
+    values: tl.tensor,
+    scales: tl.tensor,
+    c: tl.constexpr,
+    tile_r: tl.constexpr,
+    tile_c: tl.constexpr,
+) -> None:
+    """A tile of x in E4M3 in blocks of 32 along its rows, x's rows from `rows` on as
+    0."""
+    tile, rs, cs = _tile_of(x, rows, c, tile_r, tile_c)
+    _store_rows(tile, values, scales, rs, cs, c, tile_r, tile_c)
+
+
+@triton.jit
+def _tile_of(
+    x: tl.tensor,
+    rows: tl.tensor,
+    c: tl.constexpr,
+    tile_r: tl.constexpr,
+    tile_c: tl.constexpr,
+) -> tuple[tl.tensor, tl.tensor, tl.tensor]:
+    """Return this program's tile of x in float32, its rows from `rows` on as 0, and
+    the tile's rows and columns."""
+    rs = (tl.program_id(0) * tile_r + tl.arange(0, tile_r)).to(tl.int64)
+    cs = (tl.program_id(1) * tile_c + tl.arange(0, tile_c)).to(tl.int64)
+    tile = tl.load(x + rs[:, None] * c + cs[None, :]).to(tl.float32)
+    return tl.where((rs < tl.load(rows))[:, None], tile, 0.0), rs, cs
+
+
+@triton.jit
+def _store_rows(
+    tile: tl.tensor,
+    values: tl.tensor,
+    scales: tl.tensor,
+    rs: tl.tensor,
+    cs: tl.tensor,
+    c: tl.constexpr,
+    tile_r: tl.constexpr,
+    tile_c: tl.constexpr,
+) -> None:
+    """Store the tile in E4M3 in blocks of 32 along its rows, and their scales."""
+    v, e = _in_e4m3(tile.reshape(tile_r, tile_c // 32, 32))
+    tl.store(values + rs[:, None] * c + cs[None, :], v.reshape(tile_r, tile_c))
+    blocks = tl.program_id(1) * (tile_c // 32) + tl.arange(0, tile_c // 32)
+    tl.store(scales + rs[:, None] * (c // 32) + blocks[None, :], e)
 
 
 # Triton's kernels: what they take is a tl.tensor, a pointer or a TMA descriptor, or

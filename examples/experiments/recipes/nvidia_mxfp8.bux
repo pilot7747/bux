@@ -1,11 +1,9 @@
 # NVIDIA's MXFP8 recipe (Transformer Engine's MXFP8BlockScaling): every projection
 # inside a block in E4M3, the gradients too, with a power-of-two scale per 32 values,
-# rounded up. Softmax attention's own matmuls, the embedding, the head and the router
-# stay in bfloat16. A run uses it by name, next to an architecture:
+# rounded up, the routed experts' grouped GEMMs too. Softmax attention's own matmuls,
+# the embedding, the head and the router stay in bfloat16. A run uses it by name, next
+# to an architecture:
 #
 #   use llama3_8b
 #   use nvidia_mxfp8
-#
-# Left out: MXFP8 routed experts, which stay in bfloat16 until bux has a grouped
-# block-scaled GEMM.
 precision = precision(compute=bfloat16, matmuls=mxfp8)

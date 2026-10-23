@@ -132,8 +132,11 @@ def _twice(
     if not rows and not columns:
         return a, a
     kept = jnp.asarray(a.shape[0]) if kept is None else kept
-    along_rows, along_columns = _quantized(quantize, a, seed, kept)
-    return along_rows if rows else a, along_columns if columns else a
+    along_rows, along_columns = _quantized(quantize, a, seed, kept, columns)
+    if not columns:
+        return along_rows, a
+    assert along_columns is not None
+    return along_rows if rows else a, along_columns
 
 
 def _quantized(
@@ -141,12 +144,13 @@ def _quantized(
     a: Float[Array, "r c"],
     seed: UInt32[Array, ""],
     kept: Int[Array, ""],
-) -> tuple[Blocks, Blocks]:
+    columns: bool,
+) -> tuple[Blocks, Blocks | None]:
     """Return quantize(a), a's rows from `kept` on as 0: MXFP8 by Triton's kernel on
-    a GPU, in one pass with the zeros."""
+    a GPU, in one pass with the zeros, and a^T only if `columns`."""
     if TRITON_QUANTIZES and quantize is blockscaled.mx_twice and _triton():
         assert grouped_triton is not None
-        return grouped_triton.quantized_twice(a, kept)
+        return grouped_triton.quantized_twice(a, kept, columns)
     return quantize(jnp.where((jnp.arange(a.shape[0]) < kept)[:, None], a, 0), seed)
 
 
