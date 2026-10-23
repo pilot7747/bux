@@ -231,11 +231,11 @@ def test_muon_runs_newton_schulz_in_its_dtype_and_keeps_the_update_s():
         assert jnp.linalg.norm(b - a) < 0.1 * jnp.linalg.norm(a)
 
 
-def test_newton_schulz_s_dtype_is_in_the_run_s_id_unless_it_is_the_default():
+def test_newton_schulz_s_dtype_is_in_the_run_s_id():
     plain = smoke("optimizer = muon(lr=0.02)")
     f32 = smoke("optimizer = muon(lr=0.02, ns_dtype=float32)")
     bf16 = smoke("optimizer = muon(lr=0.02, ns_dtype=bfloat16)")
-    assert plain.id == f32.id != bf16.id
+    assert plain.id == bf16.id != f32.id
 
 
 @functools.cache
@@ -356,7 +356,7 @@ def test_a_run_that_moves_matrices_for_muon_trains_as_on_one_device(
     losses, orthogonalize
 ):
     how = f"methods(orthogonalize={orthogonalize})"
-    muon = {"optimizer": "muon(lr=0.02)", "methods": how}
+    muon = {"optimizer": "muon(lr=0.02, ns_dtype=float32)", "methods": how}
     one = losses(MOE, mesh="mesh(data=1)", **muon)
     assert np.allclose(losses(MOE, mesh="mesh(fsdp=8)", **muon), one, atol=1e-5)
 

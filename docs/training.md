@@ -84,15 +84,17 @@ editor shows them on hover and completes them, as it does for layers. In short:
 - `adamw(lr, b1=0.9, b2=0.95, eps, weight_decay=0.1)` decays matrices only, not norm
   scales, biases or Engram's tables.
 - `muon(lr, momentum=0.95, nesterov, ns_steps=5, ns_coefficients=jordan,
-  ns_dtype=float32, weight_decay=0.1, consistent_rms=0.2, adam=none)` trains the matrices inside the blocks with Muon, stacked expert weights
-  one expert at a time, and everything else (the embedding, the head, vectors) with
-  `adam`, which defaults to `adamw(lr=lr)`. With `consistent_rms=0.2` (Moonlight) one
-  learning rate suits both; `none` scales updates as Keller Jordan's Muon does.
-  `ns_coefficients` names the quintics of Newton-Schulz's iterations: `jordan`'s, the
-  same at each, or `polar_express`'s (Amsel et al., 2025), one for each, closer to
-  orthogonal in as many. `ns_dtype=bfloat16` runs Newton-Schulz in bfloat16, as Keller
-  Jordan's does, and moves the updates between devices in it (`methods.orthogonalize`);
-  the result is within a few percent of float32's.
+  ns_dtype=bfloat16, weight_decay=0.1, consistent_rms=0.2, adam=none)` trains the
+  matrices inside the blocks with Muon, stacked expert weights one expert at a time,
+  and everything else (the embedding, the head, vectors) with `adam`, which defaults to
+  `adamw(lr=lr)`. With `consistent_rms=0.2` (Moonlight) one learning rate suits both;
+  `none` scales updates as Keller Jordan's Muon does. `ns_coefficients` names the
+  quintics of Newton-Schulz's iterations: `jordan`'s, the same at each, or
+  `polar_express`'s (Amsel et al., 2025), one for each, closer to orthogonal in as
+  many. Newton-Schulz runs in `ns_dtype`, bfloat16 as in Keller Jordan's Muon, and the
+  updates move between devices in it (`methods.orthogonalize`). Its result is within
+  a few percent of float32's; on a B300, 240 steps of the 1.3B dense model on packed
+  documents lose the same with either, within the difference between two float32 runs.
 - A schedule multiplies `lr`. `warmup` rises linearly over its steps. `cosine` decays to
   `final` (0.1) at the last step. `wsd` holds the peak, then cools down to `final` (0)
   over the last `decay` (0.2) of the steps, `linear`, `sqrt` (1 - sqrt(t)) or `cosine`.

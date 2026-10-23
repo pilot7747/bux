@@ -204,16 +204,16 @@ def strip(node: Node, *, labels: bool = True, widths: bool = True) -> Node:
 # Training settings that change how a run is watched or computed, not what it computes.
 _UNCOMPUTED = {"log", "eval", "checkpoint", "mesh", "layout", "methods"}
 _NEWER = {"precision": PrecisionConfig()}
-# Fields of a setting newer than run ids, by their defaults.
+# Fields of a setting newer than run ids, by what runs computed before them.
 _NEWER_FIELDS = {"optimizer": {"ns_coefficients": "jordan", "ns_dtype": "float32"}}
 
 
-def _without_newer_defaults(train: dict) -> dict:
-    """`train`, dumped, without the `_NEWER_FIELDS` at their defaults."""
+def _without_newer_fields(train: dict) -> dict:
+    """`train`, dumped, without the `_NEWER_FIELDS` that compute as runs did before."""
     for setting, fields in _NEWER_FIELDS.items():
         given = train.get(setting) or {}
-        for field, default in fields.items():
-            if given.get(field) == default:
+        for field, before in fields.items():
+            if given.get(field) == before:
                 del given[field]
     return train
 
@@ -241,11 +241,11 @@ class Run(BaseModel):
         logging, evaluating or checkpointing at other intervals, or another mesh, layout
         or methods keep it."""
         arch = self.arch.model_copy(update={"graph": strip(self.arch.graph)})
-        # A setting or a field newer than run ids, at its default, is left out, so that
-        # ids made before it keep resuming.
+        # A setting or a field newer than run ids is left out where it computes as runs
+        # did before it (a setting at its default), so that ids made before it resume.
         new = {k for k, v in _NEWER.items() if getattr(self.train, k) == v}
         dumped = self.train.model_dump(mode="json", exclude=_UNCOMPUTED | new)
-        train = _without_newer_defaults(dumped)
+        train = _without_newer_fields(dumped)
         what = {"arch": arch.model_dump(mode="json"), "train": train}
         blob = json.dumps(what, sort_keys=True, separators=(",", ":"))
         return hashlib.sha256(blob.encode()).hexdigest()[:10]

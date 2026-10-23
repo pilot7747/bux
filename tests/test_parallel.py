@@ -72,7 +72,7 @@ def test_a_run_trains_the_same_split_over_devices(losses, arch, mesh):
 
 @pytest.mark.parametrize("mesh", MESHES)
 def test_muon_trains_the_same_split_over_devices(losses, mesh):
-    muon = "muon(lr=0.02)"
+    muon = "muon(lr=0.02, ns_dtype=float32)"  # bfloat16 rounds a split apart
     one = losses(ARCHITECTURES["moe"], mesh=ONE, optimizer=muon)
     split = losses(ARCHITECTURES["moe"], mesh=mesh, optimizer=muon)
     assert np.allclose(split, one, atol=1e-5)

@@ -152,7 +152,7 @@ def test_a_circular_pipeline_trains_as_one_device(losses):
 @pytest.mark.parametrize("orthogonalize", ["gspmd", "gather", "owner"])
 @pytest.mark.parametrize("pipeline", ["gpipe", "circular"])
 def test_muon_trains_a_pipelined_repeat_as_one_device(losses, pipeline, orthogonalize):
-    muon, rounds = "muon(lr=0.02)", 2 if pipeline == "circular" else 1
+    muon, rounds = "muon(lr=0.02, ns_dtype=float32)", 2 if pipeline == "circular" else 1
     how = _how(4, pipeline, rounds, orthogonalize=orthogonalize)
     mesh, batch = "mesh(stage=2, fsdp=2)", "16"  # 4 microbatches over data × fsdp
     piped = losses(LLAMA, mesh=mesh, optimizer=muon, methods=how, batch=batch)
