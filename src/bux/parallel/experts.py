@@ -25,7 +25,7 @@ from typing import NamedTuple
 import jax
 import jax.numpy as jnp
 from jax.sharding import PartitionSpec as P
-from jaxtyping import Array, Bool, Float, Int
+from jaxtyping import Array, Bool, Float, Int, Shaped
 
 from bux import config as cfg
 from bux.architecture.moe import (
@@ -38,6 +38,7 @@ from bux.architecture.moe import (
     routed,
     run_sorted,
     sort_by_expert,
+    sum_rows,
 )
 from bux.architecture.registry import Taps, report
 from bux.parallel import methods
@@ -52,7 +53,7 @@ Routed = tuple[Float[Array, "b t d"], Float[Array, ""]]
 # its own tokens and its own experts' kernels, the experts split over `axes`.
 Body = Callable[..., Routed]
 # jax.lax.ragged_all_to_all's signature: another exchange is a function.
-Exchange = Callable[..., Float[Array, "m d"]]
+Exchange = Callable[..., Shaped[Array, "m d"]]
 
 
 def method(body: Body) -> Callable[..., Float[Array, "b t d"]]:
@@ -258,7 +259,7 @@ def _came_back(sent: Ragged, expert: Int[Array, " n"]) -> Bool[Array, " n"]:
     return at < sent.send_sizes[expert]
 
 
-def _buffer(rows: int, like: Float[Array, "*s d"]) -> Float[Array, "rows d"]:
+def _buffer(rows: int, like: Shaped[Array, "*s d"]) -> Shaped[Array, "rows d"]:
     """Return `rows` rows, as wide as `like`, to receive into, left as they are: the
     experts make 0 of the rows past theirs, and what does not come back is masked."""
     return jax.lax.empty((rows, like.shape[-1]), like.dtype)
@@ -300,6 +301,105 @@ def ragged(
     return y, 1 - slices.kept.sum() / every.sum()
 
 
+# --- ragged_tokens ---------------------------------------------------------------------
+
+
+def _visits(idx: Int[Array, "n k"], local: int, peers: int) -> Int[Array, "n k"]:
+    """Return the device of each pick that is its token's first there, the device it
+    visits; and `peers`, none, for the others."""
+    on = idx // local
+    same = on[:, :, None] == on[:, None, :]  # [t, s, r]: picks s and r on one device
+    earlier = jnp.tri(idx.shape[-1], k=-1, dtype=bool)  # r before s
+    return jnp.where((same & earlier).any(-1), peers, on)
+
+
+def _picked_there(
+    idx: Int[Array, "n k"], weights: Float[Array, "n k"], local: int
+) -> tuple[Int[Array, "m k"], Float[Array, "m k"]]:
+    """Return, for each pick, its token's picks on its device: their experts there
+    (`local`, none, for the picks elsewhere) and their weights (0)."""
+    on = idx // local
+    there = on[:, :, None] == on[:, None, :]  # [t, s, r]: pick r on pick s's device
+    experts = jnp.where(there, idx[:, None, :] % local, local)
+    picked = jnp.where(there, weights[:, None, :], 0)
+    return experts.reshape(-1, idx.shape[-1]), picked.reshape(-1, idx.shape[-1])
+
+
+def _fit(sizes: Int[Array, " g"], rows: int) -> Int[Array, " g"]:
+    """Return how many rows of each group fit in the first `rows`."""
+    return jnp.clip(rows - (jnp.cumsum(sizes) - sizes), 0, sizes)
+
+
+def _visited(
+    x: Float[Array, "v d"],
+    idx: Int[Array, "v k"],
+    weights: Float[Array, "v k"],
+    arrived: Int[Array, ""],
+    kernels: Kernels,
+    ffn: cfg.MLPConfig,
+    norm: Rows | None,
+    room: int,
+) -> tuple[Float[Array, "v d"], Int[Array, ""]]:
+    """Return each of the first `arrived` tokens' sum of its picks' expert outputs,
+    weighted, as ``routed`` does, but of the first `room` picks by expert alone; and
+    how many picks ran."""
+    k, local = idx.shape[-1], kernels[0].shape[0]
+    came = (jnp.arange(x.shape[0]) < arrived)[:, None]
+    idx, weights = jnp.where(came, idx, local), jnp.where(came, weights, 0)
+    order, sizes = sort_by_expert(idx, local)
+    back = jnp.argsort(order)
+    order, sizes = order[:room], _fit(sizes, room)
+    made = experts(pick_rows(x, order, back, k), sizes, *kernels, ffn, norm)
+    weighted = made * weights.reshape(-1)[order][:, None]
+    return sum_rows(weighted, back, order, k), sizes.sum()
+
+
+def tokens(
+    z: Float[Array, "b t d"],
+    idx: Int[Array, "b t k"],
+    weights: Float[Array, "b t k"],
+    kernels: Kernels,
+    *,
+    axes: Axes,
+    ffn: cfg.MLPConfig,
+    norm: Rows | None,
+    exchange: Exchange = jax.lax.ragged_all_to_all,
+) -> Routed:
+    """Send each token once to each device that holds any of its experts, with its
+    picks there, and back as their weighted sum: a row per device it goes to, not
+    per pick, as ``ragged`` sends. A device runs `methods.capacity` times the picks
+    it has, and drops the rest as ``ragged`` does; it takes as many tokens, or the
+    most that could come, a token from each device."""
+    d, k, n, local = z.shape[-1], idx.shape[-1], idx.size, kernels[0].shape[0]
+    peers, device = jax.lax.axis_size(axes), jax.lax.axis_index(axes)
+    room = _rows(n, peers, _capacity())  # the picks a device runs
+    visit = _visits(idx.reshape(-1, k), local, peers)
+    order, sizes = sort_by_expert(visit, peers)  # each device's visits, in turn
+    back = jnp.argsort(order)
+    every = jax.lax.all_gather(sizes, axes)  # [i, j]: device i's visits to device j
+    starts = jnp.cumsum(every, 1) - every
+    rows = min(room, peers * n // k)  # a token visits a device at most once
+    slices = _slices(every, rows)
+    sent = _dispatch(slices, starts[device], device)
+
+    def send(a: Shaped[Array, "n e"]) -> Shaped[Array, "rows e"]:
+        return exchange(a, _buffer(rows, a), *sent, axis_name=axes)
+
+    x = send(pick_rows(z.reshape(-1, d), order, back, k))
+    choices = _picked_there(idx.reshape(-1, k), weights.reshape(-1, k), local)
+    picked, chosen = (send(a[order]) for a in choices)
+    arrived = slices.kept[device].sum()
+    made, ran = _visited(x, picked, chosen, arrived, kernels, ffn, norm, room)
+    theirs = jax.lax.dynamic_slice_in_dim(starts, device, 1, axis=1)
+    combine = _combine(slices, theirs, device)
+    returned = exchange(made, _buffer(n, z), *combine, axis_name=axes)
+    gone = visit.reshape(-1)[order]  # where each visit went, sorted
+    kept = (gone < peers) & _came_back(sent, gone)
+    y = sum_rows(jnp.where(kept[:, None], returned, 0), back, order, k)
+    return y.reshape(z.shape), 1 - ran / n
+
+
 methods.moe.register("all_gather")(method(gathered))
 methods.moe.register("all_to_all")(method(exchanged))
 methods.moe.register("ragged_all_to_all")(method(ragged))
+methods.moe.register("ragged_tokens")(method(tokens))
