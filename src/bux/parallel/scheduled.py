@@ -147,7 +147,7 @@ class Held(NamedTuple):
     inputs: Shaped[Array, "k n t *r"]  # the stream the stage before sent
     cotangents: Shaped[Array, "k n t *r"]  # the gradient the stage after sent
     residuals: list[Shaped[Array, "k ..."]]  # each forward's vjp, until its backward
-    firsts: list[Shaped[Array, "k ..."]]  # the vjp of the part before, on stage 0
+    first_residuals: list[Shaped[Array, "k ..."]]  # the first part's, on stage 0
     saved: list[Shaped[Array, "k ..."]]  # what a split backward saves for W
     rest: PyTree  # the layers' state
     kept: PyTree  # the rest of the model's, which the part before the repeat changes
@@ -293,7 +293,7 @@ class Ticks:
             inputs=self._buffer("inputs", shapes.x),
             cotangents=self._buffer("cotangents", shapes.x),
             residuals=self._buffers("residuals", jax.tree.leaves(shapes.stage)),
-            firsts=self._buffers("residuals", jax.tree.leaves(shapes.first)),
+            first_residuals=self._buffers("residuals", jax.tree.leaves(shapes.first)),
             saved=self._buffers("saved", saved),
             rest=rest,
             kept=kept,
@@ -330,7 +330,7 @@ class Ticks:
         first stage runs the part before the repeat first, and the last stage the
         part after it, to the loss, whose gradient it keeps for its backward."""
         rows = _at(self.rows, j)
-        x, firsts, kept = jax.lax.cond(
+        x, first_residuals, kept = jax.lax.cond(
             self.index == 0,
             self._from_first_part,
             self._from_stage_before,
@@ -342,7 +342,7 @@ class Ticks:
         slot = self.slot("residuals", j)
         held = held._replace(
             residuals=_put(held.residuals, slot, jax.tree.leaves(vjp)),
-            firsts=_put(held.firsts, slot, firsts),
+            first_residuals=_put(held.first_residuals, slot, first_residuals),
             rest=rest,
             kept=kept,
             losses=held.losses + losses,
@@ -418,6 +418,14 @@ class Ticks:
         saved = _put(held.saved, self.slot("saved", j), saved)
         return held._replace(saved=saved, to_previous=dx)
 
+    def _through_first_part(self, held: Held, slot: Int[Array, ""], dx: Stream) -> Held:
+        """Take `dx` on back through the part before the repeat, to the parameters
+        outside it, from its residuals in `slot`."""
+        residuals = _at(held.first_residuals, slot)
+        vjp = jax_internals.rebuild_vjp(self.shapes.first, residuals, self.others)
+        (d_others,) = vjp(dx)
+        return held._replace(d_others=_added(held.d_others, d_others))
+
     def weights(self, held: Held, j: Int[Array, ""]) -> Held:
         """Take microbatch `j`'s gradient on to this stage's weights, from what its
         backward saved."""
@@ -431,7 +439,6 @@ class Ticks:
 
     def _vjp(self, residuals: list[Leaf]) -> Vjp:
         """Return this stage's vjp, rebuilt from a slot's `residuals`."""
-        assert self.shapes is not None
         return jax_internals.rebuild_vjp(self.shapes.stage, residuals, self.params)
 
     def _split_backward(self) -> split.Split:
@@ -454,16 +461,6 @@ class Ticks:
         shared = [_shape(a) for a in [*params, *residuals]]
         cotangents = [_shape(shapes.x), _shape(shapes.losses)]
         return split.split(backward, shared, cotangents, weight_grads=len(params))
-
-    def _through_first_part(self, held: Held, slot: Int[Array, ""], dx: Stream) -> Held:
-        """Take `dx` on back through the part before the repeat, to the parameters
-        outside it, from its residuals in `slot`."""
-        assert self.shapes is not None
-        vjp = jax_internals.rebuild_vjp(
-            self.shapes.first, _at(held.firsts, slot), self.others
-        )
-        (d_others,) = vjp(dx)
-        return held._replace(d_others=_added(held.d_others, d_others))
 
     def _losses_cotangent(self) -> Losses:
         """Return the gradient of the step's loss with respect to the losses this

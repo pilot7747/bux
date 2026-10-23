@@ -141,16 +141,16 @@ def _eval_inlined(
             inner = jax_internals.called_jaxpr(eqn)
             outs = _eval_inlined(inner.jaxpr, inner.consts, ins)
         elif jax_internals.is_scan(eqn):
-            outs = _rescanned(eqn, ins)
+            outs = _scan_inlined(eqn, ins)
         elif jax_internals.is_cond(eqn):
-            outs = _reconded(eqn, ins)
+            outs = _cond_inlined(eqn, ins)
         else:
             outs = jax_internals.bind(eqn, ins)
         env |= dict(zip(eqn.outvars, outs, strict=True))
     return [_read(env, v) for v in jaxpr.outvars]
 
 
-def _reconded(eqn: core.JaxprEqn, ins: list[Any]) -> list[Any]:
+def _cond_inlined(eqn: core.JaxprEqn, ins: list[Any]) -> list[Any]:
     """Run the cond of `eqn` on `ins`, with its branches inlined."""
     index, *ops = ins
 
@@ -161,28 +161,17 @@ def _reconded(eqn: core.JaxprEqn, ins: list[Any]) -> list[Any]:
     return jax.lax.switch(index, [branch(b) for b in branches], *ops)
 
 
-def _rescanned(eqn: core.JaxprEqn, ins: list[Any]) -> list[Any]:
+def _scan_inlined(eqn: core.JaxprEqn, ins: list[Any]) -> list[Any]:
     """Run the scan of `eqn` on `ins`, with its body inlined."""
-    body, (c, n) = jax_internals.scan_body(eqn), _counts(eqn)
+    body, (c, n) = jax_internals.scan_body(eqn), jax_internals.scan_counts(eqn)
     consts, init, xs = ins[:c], ins[c : c + n], ins[c + n :]
 
     def step(carry: list, x: list) -> tuple[list, list]:
         outs = _eval_inlined(body.jaxpr, body.consts, [*consts, *carry, *x])
         return outs[:n], outs[n:]
 
-    carry, ys = _scan(eqn, step, init, xs)
+    carry, ys = _scan_like(eqn, step, init, xs)
     return [*carry, *ys]
-
-
-def _counts(eqn: core.JaxprEqn) -> tuple[int, int]:
-    """Return how many constants and carries the scan of `eqn` takes."""
-    return jax_internals.scan_counts(eqn)
-
-
-def _scan(
-    eqn: core.JaxprEqn, step: Callable, init: list[Any], xs: Any
-) -> tuple[Any, Any]:
-    return jax.lax.scan(step, init, xs, **jax_internals.scan_options(eqn))
 
 
 def _read(env: Env, v: Any) -> Any:
@@ -208,20 +197,21 @@ def _plan(
     by_b: set[Key] = set()  # what B defines
     for i in reversed(range(len(jaxpr.eqns))):
         eqn = jaxpr.eqns[i]
-        wanted = [any(v in need[p] for v in eqn.outvars) for p in PARTS]
-        if all(wanted) and jax_internals.is_scan(eqn):
+        wanted = {p: any(v in need[p] for v in eqn.outvars) for p in PARTS}
+        both = wanted["B"] and wanted["W"]
+        if both and jax_internals.is_scan(eqn):
             scan = plan.parts[i] = _plan_scan(eqn, i, need)
             by_b |= {eqn.outvars[k] for k in [*scan.carried, *scan.outs["B"]]}
             by_b |= set(scan.stacked)
-        elif all(wanted) and jax_internals.is_cond(eqn):
+        elif both and jax_internals.is_cond(eqn):
             cond = plan.parts[i] = _plan_cond(eqn, i, need)
             by_b |= {eqn.outvars[k] for k in cond.outs["B"]}
             by_b |= set(itertools.chain(*cond.saved))
-        elif wanted[0]:  # by B alone, or by both: B hands W what it gives
+        elif wanted["B"]:  # by B alone, or by both: B hands W what it gives
             plan.parts[i] = "B"
             need["B"] |= _vars(eqn.invars)
             by_b |= set(eqn.outvars)
-        elif wanted[1]:
+        elif wanted["W"]:
             plan.parts[i] = "W"
             need["W"] |= _vars(eqn.invars)
     ins = {*jaxpr.invars, *jaxpr.constvars}
@@ -237,7 +227,7 @@ def _plan_scan(eqn: core.JaxprEqn, index: int, need: dict[str, set[Key]]) -> Sca
     """Plan a scan whose outputs both parts need, and add to `need` what each of its
     parts reads. `B` carries what it needs of the carries, and any carry its pass
     reads; `W` carries the rest."""
-    body, (c, n) = jax_internals.scan_body(eqn), _counts(eqn)
+    body, (c, n) = jax_internals.scan_body(eqn), jax_internals.scan_counts(eqn)
     invars, outs = body.jaxpr.invars, eqn.outvars
     carried = {k for k in range(n) if outs[k] in need["B"]}
     while True:  # until B carries every carry its passes read
@@ -277,7 +267,7 @@ def _add_scan_reads(
 ) -> None:
     """Add to `need` what each part's scan of `eqn` reads: the first value of each
     carry it carries, and the constants and scanned inputs its `body` reads."""
-    c, n = _counts(eqn)
+    c, n = jax_internals.scan_counts(eqn)
     for k, v in enumerate(eqn.invars):
         if c <= k < c + n:
             need["B" if k - c in carried else "W"] |= _vars([v])
@@ -449,21 +439,20 @@ def _zeros(shapes: list[jax.ShapeDtypeStruct]) -> list[Any]:
 def _run_scan_b(eqn: core.JaxprEqn, scan: ScanPlan, env: Env) -> None:
     """Run the `B` scan of `scan`: the carries it carries, its outputs, and what each
     pass saves for `W`, stacked."""
-    body, (c, _) = scan.body, _counts(eqn)
+    body, (c, _) = scan.body, jax_internals.scan_counts(eqn)
     given = _given(eqn, scan, env, "B")
     carry_in = [body.jaxpr.invars[c + k] for k in scan.carried]
-    xs_in = _xs_read(eqn, scan, "B")
+    xs_in, xs = _scanned(eqn, scan, env, "B")
 
-    def step(carry: list, xs: list) -> tuple[list, tuple[list, list]]:
+    def step(carry: list, x: list) -> tuple[list, tuple[list, list]]:
         inputs = given | dict(zip(carry_in, carry, strict=True))
-        inner = _run_part(body, "B", inputs | dict(zip(xs_in, xs, strict=True)))
+        inner = _run_part(body, "B", inputs | dict(zip(xs_in, x, strict=True)))
         ys = _outputs(body, inner, scan.outs["B"])
         saved = [inner[k] for k in body.saved]
         return _outputs(body, inner, scan.carried), (ys, saved)
 
     init = [_read(env, eqn.invars[c + k]) for k in scan.carried]
-    xs = [_read(env, eqn.invars[_index(eqn, v)]) for v in xs_in]
-    carry, (ys, stacked) = _scan(eqn, step, init, xs)
+    carry, (ys, stacked) = _scan_like(eqn, step, init, xs)
     env |= {eqn.outvars[k]: v for k, v in zip(scan.carried, carry, strict=True)}
     env |= {eqn.outvars[k]: v for k, v in zip(scan.outs["B"], ys, strict=True)}
     env |= dict(zip(scan.stacked, stacked, strict=True))
@@ -472,14 +461,14 @@ def _run_scan_b(eqn: core.JaxprEqn, scan: ScanPlan, env: Env) -> None:
 def _run_scan_w(eqn: core.JaxprEqn, scan: ScanPlan, env: Env) -> None:
     """Run the `W` scan of `scan`: the other carries and its outputs, each pass from
     what the `B` scan stacked."""
-    body, (c, n) = scan.body, _counts(eqn)
+    body, (c, n) = scan.body, jax_internals.scan_counts(eqn)
     given = _given(eqn, scan, env, "W")
     own = [k for k in range(n) if k not in scan.carried]
     carry_in = [body.jaxpr.invars[c + k] for k in own]
-    xs_in = _xs_read(eqn, scan, "W")
+    xs_in, xs = _scanned(eqn, scan, env, "W")
 
-    def step(carry: list, xs: tuple[list, list]) -> tuple[list, list]:
-        read, saved = xs
+    def step(carry: list, x: tuple[list, list]) -> tuple[list, list]:
+        read, saved = x
         inputs = given | dict(zip(carry_in, carry, strict=True))
         inputs |= dict(zip(xs_in, read, strict=True))
         inputs |= dict(zip(body.saved, saved, strict=True))
@@ -487,15 +476,15 @@ def _run_scan_w(eqn: core.JaxprEqn, scan: ScanPlan, env: Env) -> None:
         return _outputs(body, inner, own), _outputs(body, inner, scan.outs["W"])
 
     init = [_read(env, eqn.invars[c + k]) for k in own]
-    xs = [_read(env, eqn.invars[_index(eqn, v)]) for v in xs_in]
-    carry, ys = _scan(eqn, step, init, (xs, [env[k] for k in scan.stacked]))
+    stacked = [env[k] for k in scan.stacked]
+    carry, ys = _scan_like(eqn, step, init, (xs, stacked))
     env |= {eqn.outvars[k]: v for k, v in zip(own, carry, strict=True)}
     env |= {eqn.outvars[k]: v for k, v in zip(scan.outs["W"], ys, strict=True)}
 
 
 def _given(eqn: core.JaxprEqn, scan: ScanPlan, env: Env, part: str) -> Env:
     """Return the constants of the scan that `part`'s pass reads, by body variable."""
-    invars, (c, _) = scan.body.jaxpr.invars, _counts(eqn)
+    invars, (c, _) = scan.body.jaxpr.invars, jax_internals.scan_counts(eqn)
     return {
         invars[k]: _read(env, eqn.invars[k])
         for k in range(c)
@@ -503,11 +492,19 @@ def _given(eqn: core.JaxprEqn, scan: ScanPlan, env: Env, part: str) -> Env:
     }
 
 
-def _xs_read(eqn: core.JaxprEqn, scan: ScanPlan, part: str) -> list[Any]:
-    """Return the body variables of the scanned inputs that `part`'s pass reads."""
-    invars, first = scan.body.jaxpr.invars, sum(_counts(eqn))
-    return [v for v in invars[first:] if v in scan.body.reads[part]]
+def _scanned(
+    eqn: core.JaxprEqn, scan: ScanPlan, env: Env, part: str
+) -> tuple[list[Any], list[Any]]:
+    """Return the scanned inputs that `part`'s pass reads: their body variables, and
+    their values in `env`, as the body's inputs stand for the scan's one to one."""
+    invars, first = scan.body.jaxpr.invars, sum(jax_internals.scan_counts(eqn))
+    read = [k for k in range(first, len(invars)) if invars[k] in scan.body.reads[part]]
+    return [invars[k] for k in read], [_read(env, eqn.invars[k]) for k in read]
 
 
-def _index(eqn: core.JaxprEqn, body_var: Any) -> int:
-    return jax_internals.scan_body(eqn).jaxpr.invars.index(body_var)
+def _scan_like(
+    eqn: core.JaxprEqn, step: Callable, init: list[Any], xs: Any
+) -> tuple[Any, Any]:
+    """Return `step` scanned over `xs` from `init` as the scan `eqn` scans: as long,
+    the same way round, unrolled alike."""
+    return jax.lax.scan(step, init, xs, **jax_internals.scan_options(eqn))
