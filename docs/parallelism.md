@@ -268,8 +268,10 @@ change.
 
 ```python
 from bux import parallel
+from bux.train import stages
 
-with parallel.use(t.mesh, t.layout, t.methods):
+# The run's methods, with a pipeline's stages balanced as `train` balances them.
+with parallel.use(t.mesh, t.layout, stages.balanced(run)):
     model = parallel.build(lambda: Model(arch, rngs=nnx.Rngs(0)))
     trainer = Trainer(model, tx, loss)  # its state on its shardings
     trainer.train_on_batch(batch)  # the batch through parallel.shard_batch
@@ -1187,7 +1189,8 @@ names of what layers make, not definitions: `save=[mlp]` is no layer type, and
 
 | method               | what the forward keeps                           | as data                      |
 |----------------------|--------------------------------------------------|------------------------------|
-| `none`               | everything, but in a scanned pass (below); the default |                        |
+| `auto`               | the first of `none`, `dots_attention`, `dots`, `save_attention` and `full` whose training step fits (below); the default | |
+| `none`               | everything, but in a scanned pass (below)        |                              |
 | `full`               | nothing but the input of each branch or pass     | `remat()`                    |
 | `dots`               | the products of matrices                         | `remat(save=dots)`           |
 | `dots_no_batch`      | the products of matrices without batch dimensions | `remat(save=dots_no_batch)` |
@@ -1300,7 +1303,8 @@ second and the peak memory:
 | `remat(save=[attention], first=8)`           | 133k, 40.9   |              |              |
 | `offload_attention`                          | 82.1k, 39.5  |              |              |
 
-`none` is the fastest, and the default; a policy buys rows. `dots` runs flash
+`none` is the fastest; a policy buys rows, and `auto` takes the fastest that fits
+(below). `dots` runs flash
 attention's forward twice, and `save_attention` the matmuls of every layer;
 `dots_attention` runs neither, 2% slower than `none` in 19% less memory on the dense
 model, as does `remat(save=[attention, mlp])`. A GDN layer's recurrence by chunks
@@ -1323,6 +1327,8 @@ where `first` computes the whole layer again. With more rows a GPU:
 | `remat(save=[attention, recurrence.in, mlp])` |                     | 32: 79.7k, 110.3    |                    |
 | `save_attention`                             | 96: 138k, 161.7      |                     | 16: 93.8k, 95.8    |
 | `full`                                       | 128: 126k, 113.2     | 32: 76.5k, 67.3     | 16: 89.6k, 83.8    |
+
+AUTO_SECTION
 
 Offloading saves nothing unrolled, and costs a third of the speed: XLA schedules
 each layer's copy to the host inside the backward, just before the copy back, so the
@@ -1895,20 +1901,34 @@ and deterministic ops, `gpipe`, `1f1b` and `zbh1`, on even stages and uneven, gi
 the same loss at the first step, and within 7e-4 at the tenth, on a loss falling
 0.07 a step.
 
-### Uneven stages: `methods.stages`
+### Stages: `methods.stages`
 
 ```
 mesh    = mesh(stage=4, fsdp=2)
-methods = methods(repeat=scan, microbatches=8, pipeline="1f1b", stages=[5, 4, 4, 3])
+methods = methods(repeat=scan, microbatches=8, stages=[5, 4, 4, 3])
 ```
 
-`methods.stages` gives each stage its passes of the pipelined repeat, first to last:
-fewer on the last, which runs the head under `1f1b` and `zbh1`. A sharding splits the
-stacked layers evenly, so each stage holds as many as the most any runs
-(`pipeline.spread`): its own, then copies of its first, which it skips by a
+`methods.stages` gives each stage its passes of the pipelined repeat, first to last.
+Left out, under `1f1b` and `zbh1` a run splits them so that its stages do as much work
+each as they can (`bux.train.stages`): the first stage runs the model up to the
+repeat too, the embedding, and the last the model after it, to the loss, the head.
+It counts the FLOPs of a row's forward (`bux.train.flops`) in a pass, before the
+repeat and after it, on the model cut at the repeat as the schedule cuts it, and
+takes the split whose slowest stage does the least, of those as slow the most even
+(`pipeline.balanced`). The embedding is a gather, no FLOPs; the 1.3B's head, at a
+vocabulary of 128k and rows of 4096, is 4.7 passes' work, so the 16 passes split
+`[10, 6]` over 2 stages, `[5, 5, 5, 1]` over 4 and `[3, 2, 2, 2, 2, 2, 2, 1]` over 8.
+`bux train` says the split it takes, and `bux plan` counts the stages' parameters by
+it. Under `gpipe` and `circular`, where every stage runs the rest of the model, the
+passes split as evenly as they go.
+
+A sharding splits the stacked layers evenly, so each stage holds as many as the most
+any runs (`pipeline.spread`): its own, then copies of its first, which it skips by a
 `lax.cond`. The copies are parameters too, with their optimizer's state, and their
 gradient is 0; a run resumes on the same split only. The split must give every stage
-its passes and sum to the repeat's, in one round, else it is an error that says so.
+a pass and sum to the repeat's, in one round, else it is an error that says so.
+
+STAGES_TABLE
 
 ### Later: DualPipe
 
