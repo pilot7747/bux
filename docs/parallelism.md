@@ -1738,7 +1738,8 @@ a peak of 40.4 GiB so, against 673k and 24.6 GiB with a cond each.
 
 On one node of 8 B300s, the 1.3B dense model of [Gathered once](#gathered-once-reduced-once-methodsgather-methodsaccumulate)
 (16 Llama blocks, a vocabulary of 128k), 64 rows of 4096 a step in bfloat16,
-`repeat=scan, microbatches=8`, tokens a second and the peak memory of a GPU:
+`repeat=scan, microbatches=8, loss=logits`, tokens a second and the peak memory of a
+GPU:
 
 | mesh             | `methods.pipeline`                 | tok/s | peak      |
 |------------------|------------------------------------|-------|-----------|
@@ -1761,7 +1762,10 @@ GEMMs, against the first's 137. Fewer blocks on it take that back: on 4 stages t
 head is nearly a stage's work, and `stages=[5, 5, 5, 1]` runs 21% faster than gpipe
 on half its memory. At 16 microbatches the gap grows: on `stage=4`, 652k tokens a
 second at 32.0 GiB against gpipe's 521k at 117.8 GiB, and on `stage=2, stages=[10,
-6]`, 651k at 16.9 GiB against 578k at 107.1 GiB.
+6]`, 651k at 16.9 GiB against 578k at 107.1 GiB. With the loss by chunks, the
+default, gpipe holds less and the gap stays: on `stage=2`, 624k at 60.0 GiB against
+`stages=[10, 6]`'s 679k at 30.8 GiB; on `stage=4`, 484k at 65.0 GiB against
+`stages=[5, 5, 5, 1]`'s 596k at 52.7 GiB.
 
 `zbh1` is slower here than `1f1b`, and no faster on uneven stages: `B` writes out
 what `W` reads, and `W` reads it back, and on `stage=2` a step spends 48 ms of 461 in
