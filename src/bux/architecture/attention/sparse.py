@@ -24,7 +24,7 @@ from jax.sharding import PartitionSpec as P
 from jaxtyping import Array, Bool, Float, Int, Shaped
 
 from bux import kernels, parallel
-from bux.architecture.segments import Segments
+from bux.architecture.common.segments import Segments
 from bux.parallel.context import softcap
 
 try:  # tokamax's kernels, where its extra is installed (Linux)

@@ -31,7 +31,7 @@ from flax import nnx
 from jax.sharding import PartitionSpec as P
 from jaxtyping import Array, Float
 
-from bux.architecture import blockscaled, matmuls
+from bux.architecture.precision import blockscaled, matmuls
 from bux.parallel import methods
 from bux.parallel.layout import NAMES, Name, shard, spec, splits
 from bux.parallel.mesh import active

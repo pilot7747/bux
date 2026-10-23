@@ -303,8 +303,8 @@ class ProfileConfig(Config):
 
 # --- Precision ---------------------------------------------------------------------------
 # What a run computes in, and the format each projection inside a block multiplies in
-# (bux.architecture.matmuls): by the kind of projection, by the residual branch it is
-# in, and by the GEMM.
+# (bux.architecture.precision.matmuls): by the kind of projection, by the residual
+# branch it is in, and by the GEMM.
 
 # The GEMMs of a projection y = x W: y's (fprop), and the gradient's by x (dgrad) and
 # by W (wgrad).
@@ -312,8 +312,8 @@ Pass = Literal["fprop", "dgrad", "wgrad"]
 PASSES: tuple[Pass, ...] = ("fprop", "dgrad", "wgrad")
 
 
-# The formats of bux.architecture.matmuls the routed experts' grouped GEMM multiplies
-# in (bux.architecture.grouped_blockscaled.RECIPES).
+# The formats of bux.architecture.precision.matmuls the routed experts' grouped GEMM
+# multiplies in (bux.architecture.experts.grouped_blockscaled.RECIPES).
 GROUPED = ("compute", "mxfp8", "mxfp8_2d")
 
 
@@ -361,8 +361,8 @@ class SwitchConfig(Config):
 
 class PrecisionConfig(Config):
     """The dtype the forward and backward compute in, and the format the projections
-    inside blocks multiply in (bux.architecture.matmuls): `matmuls`, or what `roles`
-    gives a kind of projection, and compute in the `first` and `last` residual
+    inside blocks multiply in (bux.architecture.precision.matmuls): `matmuls`, or what
+    `roles` gives a kind of projection, and compute in the `first` and `last` residual
     branches of the model. Of each projection's GEMMs, only `passes` multiply in the
     format. Parameters stay float32, and so do the optimizer's `moments`, unless
     bfloat16, norm statistics, router scores and top-k, recurrent states and the loss;
@@ -371,7 +371,8 @@ class PrecisionConfig(Config):
 
     type: Literal["precision"] = "precision"
     compute: Literal["float32", "bfloat16"] = "bfloat16"
-    matmuls: str = "compute"  # a format of bux.architecture.matmuls: mxfp8, nvfp4
+    # A format of bux.architecture.precision.matmuls: mxfp8, nvfp4.
+    matmuls: str = "compute"
     roles: RolesConfig = RolesConfig()
     # The residual branches outside any other, first and last before the first head,
     # that multiply in compute: a number of them, or a share.
@@ -448,9 +449,9 @@ Names = Annotated[tuple[str, ...], BeforeValidator(_listed)]
 
 class RematConfig(Config):
     """What a rematerialized branch or scanned pass keeps for the backward pass, by the
-    names layers give what they make (bux.architecture.remat); the backward computes
-    the rest again. A preset is a name: save_attention is remat(save=[attention,
-    recurrence])."""
+    names layers give what they make (bux.architecture.repeats.remat); the backward
+    computes the rest again. A preset is a name: save_attention is
+    remat(save=[attention, recurrence])."""
 
     type: Literal["remat"] = "remat"
     save: Names = ()  # kept on the device: attention, qkv, mlp, dots, ...

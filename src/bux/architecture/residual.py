@@ -18,7 +18,7 @@ from flax import nnx
 from jaxtyping import Array, Float
 
 from bux import config as cfg
-from bux.architecture.norm import Norm
+from bux.architecture.layers.norm import Norm
 from bux.architecture.registry import Context, Taps, register
 from bux.lang import ir
 from bux.parallel import shard_stream

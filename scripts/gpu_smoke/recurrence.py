@@ -19,7 +19,8 @@ import jax.numpy as jnp
 import numpy as np
 from jaxtyping import Array, Float
 
-from bux.architecture import Segments, linear_attention, ssm
+from bux.architecture import Segments
+from bux.architecture.recurrent import linear_attention, ssm
 from bux.parallel.recurrence import Chunked, Positions, Shared
 
 B, T = 2, 4096

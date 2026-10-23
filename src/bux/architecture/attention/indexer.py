@@ -21,11 +21,12 @@ from jaxtyping import Array, Bool, Float, Int, Shaped, UInt
 
 from bux import config as cfg
 from bux import parallel
-from bux.architecture import remat, scoring
-from bux.architecture.norm import Norm
-from bux.architecture.rope import rotate
-from bux.architecture.sharding import projection, shard_heads
-from bux.architecture.sparse import Kept, Span, chunked, chunks, mask
+from bux.architecture.attention import scoring
+from bux.architecture.attention.rope import rotate
+from bux.architecture.attention.sparse import Kept, Span, chunked, chunks, mask
+from bux.architecture.common.sharding import projection, shard_heads
+from bux.architecture.layers.norm import Norm
+from bux.architecture.repeats import remat
 
 # DeepSeek-V3.2's indexer keys, projected from the layer's input, are layer-normalized.
 _STREAM_KEY_NORM = cfg.NormalizationConfig(type="layernorm", bias=True)

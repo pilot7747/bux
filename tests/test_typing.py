@@ -15,7 +15,7 @@ import jaxtyping
 import pytest
 
 from bux import config as cfg
-from bux.architecture.rope import rotate
+from bux.architecture.attention.rope import rotate
 from bux.train.objective import z_loss
 
 ROOT = Path(__file__).parents[1]

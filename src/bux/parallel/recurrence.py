@@ -14,8 +14,8 @@ output of the chunk gains reads_t . S from the state S it starts from.
 A method is ``(recurrence) -> out``: a `Recurrence` names the family and holds a
 function that runs it over a chunk of positions from a zero state (`Chunk`), with
 its inputs; `out` is the outputs (b, t, h, dv) in float32. `scan`, the default, runs
-every position as one chunk, and is in bux.architecture.linear_attention. A method
-that cannot run a family raises NotImplementedError naming it.
+every position as one chunk, and is in bux.architecture.recurrent.linear_attention. A
+method that cannot run a family raises NotImplementedError naming it.
 """
 
 from collections.abc import Callable

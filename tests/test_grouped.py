@@ -1,14 +1,16 @@
-"""Grouped matmuls (bux.architecture.grouped): the Pallas kernel of the matrices'
-gradient, interpreted on the CPU, and the custom VJP that runs the kernels, against
-`jax.lax.ragged_dot` and its own gradients; and in MXFP8 (grouped_blockscaled), by XLA
-on the CPU, against ragged_dot of the operands quantized as each GEMM contracts them."""
+"""Grouped matmuls (bux.architecture.experts.grouped): the Pallas kernel of the
+matrices' gradient, interpreted on the CPU, and the custom VJP that runs the kernels,
+against `jax.lax.ragged_dot` and its own gradients; and in MXFP8 (grouped_blockscaled),
+by XLA on the CPU, against ragged_dot of the operands quantized as each GEMM contracts
+them."""
 
 import jax
 import jax.numpy as jnp
 import numpy as np
 from jaxtyping import Array, Float
 
-from bux.architecture import blockscaled, grouped, grouped_blockscaled
+from bux.architecture.experts import grouped, grouped_blockscaled
+from bux.architecture.precision import blockscaled
 from bux.train import config as tcfg
 
 M, D, F = 300, 32, 48
@@ -39,7 +41,7 @@ def test_the_vjp_is_ragged_dots():
         np.testing.assert_allclose(a, b, rtol=1e-5, atol=1e-4)
 
 
-# --- In MXFP8 (bux.architecture.grouped_blockscaled) -----------------------------------
+# --- In MXFP8 (bux.architecture.experts.grouped_blockscaled) ---------------------------
 
 W32 = jax.random.normal(jax.random.key(3), (5, D, 64))  # whole blocks of 32
 G32 = jax.random.normal(jax.random.key(4), (M, 64))

@@ -1,10 +1,10 @@
 """Sparse attention on GPUs: tokamax's flash kernel with the kept keys as a mask
-(``bux.architecture.sparse`` under `methods.attention = auto`) against XLA's chunks of
-queries (inside ``bux.kernels.off()``), on one GPU and with the positions split over
-2: top-k tokens of GQA and MLA, QSA's blocks, CSA's window and latents (512 dims,
-which XLA runs), on packed documents with a window, sinks and a soft cap; the output,
-the logsumexp and the gradients. Then the time of a forward and backward of each, and
-of dense flash attention, from 4k to 32k tokens.
+(``bux.architecture.attention.sparse`` under `methods.attention = auto`) against XLA's
+chunks of queries (inside ``bux.kernels.off()``), on one GPU and with the positions
+split over 2: top-k tokens of GQA and MLA, QSA's blocks, CSA's window and latents (512
+dims, which XLA runs), on packed documents with a window, sinks and a soft cap; the
+output, the logsumexp and the gradients. Then the time of a forward and backward of
+each, and of dense flash attention, from 4k to 32k tokens.
 
     uv run --extra cuda python scripts/gpu_smoke/sparse.py
 
@@ -24,7 +24,8 @@ from jaxtyping import Array, Float
 
 import bux.architecture  # noqa: F401  (registers the attention methods)
 from bux import kernels, parallel
-from bux.architecture import Segments, sparse
+from bux.architecture import Segments
+from bux.architecture.attention import sparse
 from bux.parallel import methods
 from bux.parallel.context import AttentionArgs
 from bux.train import config as tcfg

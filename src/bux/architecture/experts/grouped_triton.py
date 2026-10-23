@@ -23,7 +23,7 @@ from jax.extend.core import JaxprEqn
 from jax.typing import DTypeLike
 from jaxtyping import Array, Float, Int, Shaped, UInt8
 
-from bux.architecture.blockscaled import MX_BLOCK, Blocks
+from bux.architecture.precision.blockscaled import MX_BLOCK, Blocks
 
 
 def _keeps_its_inputs(

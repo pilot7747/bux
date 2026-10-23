@@ -11,7 +11,7 @@ from flax import nnx
 from jaxtyping import Array, Float, Shaped
 
 from bux import parallel
-from bux.architecture import matmuls
+from bux.architecture.precision import matmuls
 
 
 def projection(

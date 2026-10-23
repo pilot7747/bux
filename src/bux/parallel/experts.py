@@ -31,10 +31,8 @@ from jax.sharding import PartitionSpec as P
 from jaxtyping import Array, Bool, Float, Int, Shaped, UInt8
 
 from bux import config as cfg
-from bux.architecture import blockscaled, matmuls, remat
-from bux.architecture.blockscaled import Blocks
-from bux.architecture.grouped_blockscaled import dequantized
-from bux.architecture.moe import (
+from bux.architecture.experts.grouped_blockscaled import dequantized
+from bux.architecture.experts.moe import (
     Kernels,
     MoE,
     Rows,
@@ -46,7 +44,10 @@ from bux.architecture.moe import (
     sort_by_expert,
     sum_rows,
 )
+from bux.architecture.precision import blockscaled, matmuls
+from bux.architecture.precision.blockscaled import Blocks
 from bux.architecture.registry import Taps, report
+from bux.architecture.repeats import remat
 from bux.parallel import methods
 from bux.parallel.layout import spec
 from bux.parallel.mesh import active

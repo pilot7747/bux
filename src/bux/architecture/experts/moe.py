@@ -21,12 +21,13 @@ from jaxtyping import Array, Float, Int
 
 from bux import config as cfg
 from bux import parallel
-from bux.architecture import grouped_blockscaled, matmuls
-from bux.architecture.grouped import ragged_dot
-from bux.architecture.mlp import MLP, activate
-from bux.architecture.norm import Norm
+from bux.architecture.common.sharding import linear
+from bux.architecture.experts import grouped_blockscaled
+from bux.architecture.experts.grouped import ragged_dot
+from bux.architecture.layers.mlp import MLP, activate
+from bux.architecture.layers.norm import Norm
+from bux.architecture.precision import matmuls
 from bux.architecture.registry import Context, Taps, register, report, training
-from bux.architecture.sharding import linear
 from bux.lang import ir
 from bux.parallel import methods
 

@@ -7,9 +7,9 @@ from jaxtyping import Array, Float
 
 from bux import config as cfg
 from bux import parallel
-from bux.architecture.functional import activation, softcap
+from bux.architecture.common.functional import activation, softcap
+from bux.architecture.common.sharding import linear, project_input, project_output
 from bux.architecture.registry import Context, Taps, register
-from bux.architecture.sharding import linear, project_input, project_output
 from bux.lang import ir
 
 

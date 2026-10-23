@@ -1,6 +1,6 @@
-"""The recurrence of linear attention by chunks (bux.architecture.chunkwise) against
-the reference, a position at a time: outputs, end states, transitions and reads, and
-gradients, over chunks and blocks smaller than the documents and larger."""
+"""The recurrence of linear attention by chunks (bux.architecture.recurrent.chunkwise)
+against the reference, a position at a time: outputs, end states, transitions and reads,
+and gradients, over chunks and blocks smaller than the documents and larger."""
 
 import importlib.util
 from pathlib import Path
@@ -11,8 +11,9 @@ import numpy as np
 import pytest
 from jaxtyping import Array, Float
 
-from bux.architecture import Segments, chunkwise
-from bux.architecture.linear_attention import stepwise
+from bux.architecture import Segments
+from bux.architecture.recurrent import chunkwise
+from bux.architecture.recurrent.linear_attention import stepwise
 
 B, T, H, K, V = 2, 19, 2, 4, 3
 POSITIONS = np.asarray([[*range(5), *range(9), *range(5)], [*range(T)]], np.int32)

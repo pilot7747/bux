@@ -8,7 +8,7 @@ from jax.ad_checkpoint import checkpoint_name
 from jaxtyping import Array, Float, Int
 
 from bux import config as cfg
-from bux.architecture.attention import (
+from bux.architecture.attention.gqa import (
     FullLogits,
     Names,
     SoftmaxAttention,
@@ -16,12 +16,12 @@ from bux.architecture.attention import (
     indexer_config,
     pick,
 )
-from bux.architecture.indexer import from_stream
-from bux.architecture.norm import Norm
+from bux.architecture.attention.indexer import from_stream
+from bux.architecture.attention.rope import rotate, rotated_dims
+from bux.architecture.common.segments import Segments
+from bux.architecture.common.sharding import linear, shard_heads, shard_layer_input
+from bux.architecture.layers.norm import Norm
 from bux.architecture.registry import Context, Taps, register, segments
-from bux.architecture.rope import rotate, rotated_dims
-from bux.architecture.segments import Segments
-from bux.architecture.sharding import linear, shard_heads, shard_layer_input
 from bux.lang import ir
 
 _LATENT_NORM = cfg.NormalizationConfig(type="rmsnorm")

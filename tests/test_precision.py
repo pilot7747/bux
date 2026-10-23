@@ -16,19 +16,15 @@ from jaxtyping import Array, Float
 
 from bux import config as cfg
 from bux import parallel
-from bux.architecture import (
-    Model,
-    blockscaled,
-    grouped_blockscaled,
-    matmuls,
-    nvfp4,
-    remat,
-)
-from bux.architecture.linear_attention import delta_rule, l2norm, recurrence
-from bux.architecture.moe import MoE
-from bux.architecture.norm import Norm
+from bux.architecture import Model
+from bux.architecture.experts import grouped_blockscaled
+from bux.architecture.experts.moe import MoE
+from bux.architecture.layers.norm import Norm
+from bux.architecture.precision import blockscaled, matmuls, nvfp4
+from bux.architecture.recurrent.linear_attention import delta_rule, l2norm, recurrence
+from bux.architecture.recurrent.ssm import selective_scan
 from bux.architecture.registry import Taps
-from bux.architecture.ssm import selective_scan
+from bux.architecture.repeats import remat
 from bux.lang import BuxError, compile_runs
 from bux.train import config as tcfg
 from bux.train.data import Batch, plain
@@ -432,7 +428,10 @@ def test_the_reduce_dtype_is_in_the_run_s_id_and_a_run_that_leaves_it_is_as_it_w
 
 def test_a_format_not_registered_is_an_error():
     trainer = _trainer(ARCHITECTURES["llama"], matmuls="mine")
-    hint = r"no 'mine' matmul format yet; add one with @bux\.architecture\.matmuls"
+    hint = (
+        r"no 'mine' matmul format yet; "
+        r"add one with @bux\.architecture\.precision\.matmuls\.formats"
+    )
     with pytest.raises(NotImplementedError, match=hint):
         trainer.train_on_batch(_batch())
 

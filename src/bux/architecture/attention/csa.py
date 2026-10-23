@@ -10,15 +10,20 @@ from jaxtyping import Array, Float, Int
 
 from bux import config as cfg
 from bux import parallel
-from bux.architecture import sparse
-from bux.architecture.attention import Names, Sparse, documents_or_rows, indexer_config
-from bux.architecture.indexer import Indexer
-from bux.architecture.norm import Norm
-from bux.architecture.ports import read, reads, write
+from bux.architecture.attention import sparse
+from bux.architecture.attention.gqa import (
+    Names,
+    Sparse,
+    documents_or_rows,
+    indexer_config,
+)
+from bux.architecture.attention.indexer import Indexer
+from bux.architecture.attention.rope import frequencies, rotate, rotated_dims
+from bux.architecture.common.ports import read, reads, write
+from bux.architecture.common.segments import Segments
+from bux.architecture.common.sharding import linear, shard_heads, shard_layer_input
+from bux.architecture.layers.norm import Norm
 from bux.architecture.registry import Context, Taps, register, segments
-from bux.architecture.rope import frequencies, rotate, rotated_dims
-from bux.architecture.segments import Segments
-from bux.architecture.sharding import linear, shard_heads, shard_layer_input
 from bux.lang import ir
 
 

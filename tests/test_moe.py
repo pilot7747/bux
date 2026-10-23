@@ -13,9 +13,9 @@ from jaxtyping import Array, Float, Int
 from bux import config as cfg
 from bux import parallel
 from bux.architecture import Model, Taps
-from bux.architecture.moe import MoE, balance_loss, experts, routed, run_sorted
+from bux.architecture.experts.moe import MoE, balance_loss, experts, routed, run_sorted
 from bux.architecture.registry import Loss
-from bux.architecture.remat import rematted
+from bux.architecture.repeats.remat import rematted
 from bux.lang import compile
 from bux.train import config as tcfg
 from bux.train.data import plain

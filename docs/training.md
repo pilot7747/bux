@@ -163,8 +163,8 @@ precision = precision(compute=bfloat16, matmuls=mxfp8,
 
 A run computes in `compute`, its parameters cast to it inside each step and kept in
 float32, and the projections inside blocks multiply in `matmuls`, a format of
-`bux.architecture.matmuls`: `compute`, `mxfp8`, `mxfp8_2d` (W's scales per 32 x 32
-tile, the same for y and dx) or `nvfp4` (docs/parallelism.md, "Matmul formats").
+`bux.architecture.precision.matmuls`: `compute`, `mxfp8`, `mxfp8_2d` (W's scales per 32
+x 32 tile, the same for y and dx) or `nvfp4` (docs/parallelism.md, "Matmul formats").
 Four settings choose which projections, and when:
 
 - `roles` gives a kind of projection a format of its own; `none` is `matmuls`. Its
@@ -513,8 +513,8 @@ o's 1.1x, and k's and v's, half as wide, 7% more. cuDNN's NVFP4 GEMM runs at 4.8
 PFLOP/s at the MLP's shapes, 1.7-1.9x MXFP8's, with a bfloat16 output that the two
 tensors' scales then rescale, in what reads it (cuDNN's own global scale is no faster,
 and takes it in bfloat16). NVFP4's quantizers are two passes of Pallas kernels over
-each operand (``bux.architecture.nvfp4``): its largest magnitude and that of its
-transpose through the Hadamard transform, then both copies at once, each value
+each operand (``bux.architecture.precision.nvfp4``): its largest magnitude and that of
+its transpose through the Hadamard transform, then both copies at once, each value
 rounded, saturated and packed by Blackwell's `cvt.rn` and `cvt.rs` (stochastic, 8
 random bits a value). An MLP projection's forward and backward then take 1.07-1.1x
 less time than MXFP8's, but q's and o's 1.1x more and k's and v's 1.25x: the second

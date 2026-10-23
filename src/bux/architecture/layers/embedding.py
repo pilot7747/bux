@@ -8,11 +8,11 @@ from jaxtyping import Array, Float, Int
 
 from bux import config as cfg
 from bux import parallel
+from bux.architecture.common.sharding import linear, projection
+from bux.architecture.layers.norm import Norm
 from bux.architecture.logits import HeadOutput, Projection
-from bux.architecture.norm import Norm
 from bux.architecture.registry import Context, Taps, positions, register
 from bux.architecture.residual import widen, widening
-from bux.architecture.sharding import linear, projection
 from bux.lang import ir
 
 # nnx.Embed's init.

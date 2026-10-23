@@ -28,10 +28,10 @@ from bux.architecture import (
     num_params,
     registry,
 )
-from bux.architecture.engram import _ngram_rows
+from bux.architecture.attention.rope import frequencies, rotate
+from bux.architecture.experts.moe import dense_weights
 from bux.architecture.graph import Sequence
-from bux.architecture.moe import dense_weights
-from bux.architecture.rope import frequencies, rotate
+from bux.architecture.layers.engram import _ngram_rows
 from bux.lang import compile, compile_runs, ir
 from bux.train import config as tcfg
 from bux.train.trainer import train

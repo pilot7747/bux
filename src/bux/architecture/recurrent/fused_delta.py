@@ -31,7 +31,7 @@ from jax.sharding import PartitionSpec as P
 from jaxtyping import Array, Float, Int, Shaped
 
 from bux import kernels, parallel
-from bux.architecture.segments import Segments
+from bux.architecture.common.segments import Segments
 
 try:  # cudnn-frontend and its JAX kernels, where the cuda extra is installed (Linux)
     import cudnn

@@ -11,10 +11,10 @@ from jaxtyping import Array, ArrayLike, Float, Int, Int32, UInt32
 
 from bux import config as cfg
 from bux import parallel
-from bux.architecture.conv import CausalConv
-from bux.architecture.norm import Norm
+from bux.architecture.common.sharding import projection
+from bux.architecture.layers.conv import CausalConv
+from bux.architecture.layers.norm import Norm
 from bux.architecture.registry import Context, Taps, register, segments
-from bux.architecture.sharding import projection
 from bux.lang import ir
 
 

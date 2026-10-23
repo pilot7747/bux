@@ -33,8 +33,8 @@ from jax.sharding import PartitionSpec as P
 from jaxtyping import Array, Float, Shaped, UInt8, UInt32
 
 from bux import kernels
-from bux.architecture import blockscaled
-from bux.architecture.blockscaled import HADAMARD, NV_BLOCK, Blocks, Recipe
+from bux.architecture.precision import blockscaled
+from bux.architecture.precision.blockscaled import HADAMARD, NV_BLOCK, Blocks, Recipe
 
 # The kernels' tiles, of rows and of columns, largest first, each a whole number of
 # blocks: 64 x 128 is the fastest on a B300.

@@ -15,21 +15,13 @@ from jax.sharding import PartitionSpec as P
 
 from bux import config as cfg
 from bux import parallel
-from bux.architecture import (
-    Attention,
-    Indexer,
-    Model,
-    MoE,
-    Segments,
-    Taps,
-    num_params,
-    sparse,
-)
-from bux.architecture.attention import build_gqa
-from bux.architecture.csa import CSA
-from bux.architecture.indexer import _top
-from bux.architecture.mla import MLA, build_mla
-from bux.architecture.rope import rotate
+from bux.architecture import Attention, Indexer, Model, MoE, Segments, Taps, num_params
+from bux.architecture.attention import sparse
+from bux.architecture.attention.csa import CSA
+from bux.architecture.attention.gqa import build_gqa
+from bux.architecture.attention.indexer import _top
+from bux.architecture.attention.mla import MLA, build_mla
+from bux.architecture.attention.rope import rotate
 from bux.lang import compile, compile_runs, ir
 from bux.train import config as tcfg
 from bux.train.data import Batch

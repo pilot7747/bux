@@ -16,9 +16,11 @@ import jax.numpy as jnp
 from flax import nnx
 from jax.typing import DTypeLike
 
-from bux.architecture import matmuls, pipelined, remat, residual, stacked
+from bux.architecture import residual
 from bux.architecture.graph import Sequence, branches, build_node, run_branch
+from bux.architecture.precision import matmuls
 from bux.architecture.registry import Context, Stream, Taps
+from bux.architecture.repeats import pipelined, remat, stacked
 from bux.lang import ir
 from bux.parallel import methods, pipeline
 from bux.parallel.layout import LAYERS, NAMES

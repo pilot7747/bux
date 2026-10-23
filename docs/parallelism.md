@@ -314,8 +314,8 @@ the logits to `(batch, heads, seq, none)`, the keys whole, which with `seq` over
 
 The indexer picks its top-k by counting, the k-th highest score found bit by bit, which
 splits with the rows and positions: `lax.top_k` sorts, and in the global view gathers
-every row onto each device. Its scores' kernel (`bux.architecture.scoring`) is a
-`shard_map` that gives a device its rows, positions and heads, and sums the heads'.
+every row onto each device. Its scores' kernel (`bux.architecture.attention.scoring`) is
+a `shard_map` that gives a device its rows, positions and heads, and sums the heads'.
 
 ## Context parallelism: `methods.attention`
 
@@ -347,13 +347,13 @@ dropout. A layer with one of them under a method other than `auto` raises
 `AttentionArgs` it lacks.
 
 Sparse attention (an indexer's top-k, CSA's compressed latents) attends by
-`bux.architecture.sparse` under `xla`, `tokamax` and `auto`, and raises under the
-others. Its keys come in parts (CSA's window, then its latents) that share one softmax,
-merged by their logsumexp in a custom VJP. On a GPU tokamax's flash kernel runs each
-part with the kept keys as a boolean mask: dense compute, exact, and t² bits of mask
-forward and bytes backward. Under `xla`, off a GPU, or in `bux.kernels.off()`, XLA runs
-it a chunk of queries at a time. Either way it is a `shard_map` that gives a device its
-rows, queries and heads, and every key: all-gather CP. The indexer's loss takes the
+`bux.architecture.attention.sparse` under `xla`, `tokamax` and `auto`, and raises under
+the others. Its keys come in parts (CSA's window, then its latents) that share one
+softmax, merged by their logsumexp in a custom VJP. On a GPU tokamax's flash kernel runs
+each part with the kept keys as a boolean mask: dense compute, exact, and t² bits of
+mask forward and bytes backward. Under `xla`, off a GPU, or in `bux.kernels.off()`, XLA
+runs it a chunk of queries at a time. Either way it is a `shard_map` that gives a device
+its rows, queries and heads, and every key: all-gather CP. The indexer's loss takes the
 attention's probabilities again from its logsumexp, a chunk of queries at a time.
 
 `bux.parallel.flash` has the kernels. A `Kernel` attends to a block of keys: its
@@ -720,14 +720,14 @@ of its rows. On `context=2 × tensor=2` a matrix family's carried `P` costs abou
 the halved sequence saves. Under `precision(compute=bfloat16)` it trains on CPU too:
 what the `shard_map`s' transposes sum is float32.
 
-A chunk runs by `chunkwise` (`bux.architecture.chunkwise`), the form of fla's chunked
-kernels, under every method: matmuls within chunks of 64 positions, and a scan of the
-state across them, by a Pallas kernel on a GPU (`affine_scan`). `stepwise`, a scan
-over positions, is its reference. With one decay a head, the state passes across the
-chunks by a matmul (SSD's state passing), and q and k may be shared by groups of heads.
-Mamba-2's selective scan runs so, as decayed linear attention with `q = C` and `k = B`
-of its groups, `v = dt x` and a log decay `dt A` a head, and `ssm.stepwise` is its
-reference; Mamba's, a decay per channel and state dim, runs by that scan over
+A chunk runs by `chunkwise` (`bux.architecture.recurrent.chunkwise`), the form of fla's
+chunked kernels, under every method: matmuls within chunks of 64 positions, and a scan
+of the state across them, by a Pallas kernel on a GPU (`affine_scan`). `stepwise`, a
+scan over positions, is its reference. With one decay a head, the state passes across
+the chunks by a matmul (SSD's state passing), and q and k may be shared by groups of
+heads. Mamba-2's selective scan runs so, as decayed linear attention with `q = C` and
+`k = B` of its groups, `v = dt x` and a log decay `dt A` a head, and `ssm.stepwise` is
+its reference; Mamba's, a decay per channel and state dim, runs by that scan over
 positions.
 
 What the backward pass of `recurrence` (and so `delta_rule` and RWKV-7) reads of its
@@ -790,8 +790,8 @@ that split rows and positions, with every expert's kernels gathered onto every d
 `expert` then acts as a batch axis, as it does under `dense`. Splitting the experts
 themselves is expert parallelism, a method of its own.
 
-Its pieces are functions of arrays alone, in `bux.architecture.moe`, so that a method
-can run them on one device's experts inside a `shard_map`:
+Its pieces are functions of arrays alone, in `bux.architecture.experts.moe`, so that a
+method can run them on one device's experts inside a `shard_map`:
 
 - `experts(x, sizes, up, gate, down, ffn, norm)`: the expert FFN of rows sorted by
   expert, `sizes[i]` of them expert i's, by `grouped.ragged_dot`: tokamax's Mosaic
@@ -806,7 +806,7 @@ can run them on one device's experts inside a `shard_map`:
   and `sum_rows`, its transpose, sums each token's k picks' rows.
 
 ```python
-from bux.architecture.moe import routed
+from bux.architecture.experts.moe import routed
 from bux.parallel import methods
 
 
@@ -1221,7 +1221,7 @@ gives:
 ```python
 import jax
 
-from bux.architecture import remat
+from bux.architecture.repeats import remat
 from bux.parallel import methods
 
 methods.remat.register("save_mlp")(remat.keeping(save=("attention", "mlp")))
@@ -1403,10 +1403,10 @@ would make one says so before it compiles: on a CPU, such runs set
 precision = precision(compute=bfloat16, matmuls=mxfp8)
 ```
 
-`matmuls` names a format of the registry in `bux.architecture.matmuls`. A block-scaled
-format quantizes the operands of all three GEMMs of y = x W, the forward's and the
-backward's two, each along what its GEMM contracts, in blocks with a scale each
-(`bux.architecture.blockscaled`):
+`matmuls` names a format of the registry in `bux.architecture.precision.matmuls`. A
+block-scaled format quantizes the operands of all three GEMMs of y = x W, the forward's
+and the backward's two, each along what its GEMM contracts, in blocks with a scale each
+(`bux.architecture.precision.blockscaled`):
 
 | format    | values  | a scale per                                   | and                                       |
 |-----------|---------|-----------------------------------------------|-------------------------------------------|
@@ -1418,9 +1418,10 @@ backward's two, each along what its GEMM contracts, in blocks with a scale each
 On a Blackwell GPU cuDNN's block-scaled GEMM multiplies them (`__cudnn$blockScaledDot`
 in the HLO), and Pallas kernels quantize each of x, W and dy and its transpose: for
 `mxfp8` in one pass, for `nvfp4` in two, the first for the largest magnitudes that
-set its global scales (`bux.architecture.nvfp4`). Elsewhere XLA dequantizes and
-multiplies, which computes the same values, so the tests run the formats on CPU. The forward keeps what the backward
-multiplies, x^T and W in the format, rather than x and W.
+set its global scales (`bux.architecture.precision.nvfp4`). Elsewhere XLA dequantizes
+and multiplies, which computes the same values, so the tests run the formats on CPU. The
+forward keeps what the backward multiplies, x^T and W in the format, rather than x and
+W.
 
 Every projection made by `sharding.projection` or `sharding.linear` multiplies by
 `matmuls.dot_general`, which runs the format in force for its role and the residual
@@ -1449,7 +1450,7 @@ bfloat16 on B300s.
 A recipe is a function, and the trainer enters `matmuls.use` as it traces its steps:
 
 ```python
-from bux.architecture import matmuls
+from bux.architecture.precision import matmuls
 
 
 @matmuls.formats.register("mine")
