@@ -790,30 +790,30 @@ pick: it is the CPU sibling of `ragged_all_to_all`, which moves the picks alone.
 method rematerializes anything on these meshes, nor on `fsdp=2, expert=2, tensor=2`.
 
 On 8 B300s every method computes what one GPU does (`scripts/gpu_smoke/experts.py`,
-in float32: 6e-7 apart at most). For the baseline's MoE (`d_model` 2048, 64 experts,
+in float32: 7e-7 apart at most). For the baseline's MoE (`d_model` 2048, 64 experts,
 `top_k` 8, 16 layers, `bfloat16`) on 32k tokens a GPU, tokens a second and peak memory:
 
 | method                           | mesh       | remat `none`        | remat `dots`     |
 |----------------------------------|------------|---------------------|------------------|
-| `sorted`                         | `fsdp=8`   | 819k, 103 GiB       | 719k, 68 GiB     |
-| `all_gather`, `capacity=1.25`    | `expert=8` | 588k, 115 GiB       | 509k, 82 GiB     |
-| `ragged_all_to_all`, `capacity=1.25` | `expert=8` | 544k, 113 GiB   | 451k, 84 GiB     |
-| `ragged_tokens`, `capacity=1.25` | `expert=8` | 532k, 116 GiB       | 478k, 83 GiB     |
+| `sorted`                         | `fsdp=8`   | 816k, 84 GiB        | 737k, 52 GiB     |
+| `all_gather`, `capacity=1.25`    | `expert=8` | 612k, 89 GiB        | 515k, 65 GiB     |
+| `ragged_all_to_all`, `capacity=1.25` | `expert=8` | 550k, 88 GiB    | 452k, 73 GiB     |
+| `ragged_tokens`, `capacity=1.25` | `expert=8` | 547k, 90 GiB        | 479k, 74 GiB     |
 
 Before the by-expert slices, the capacity and the pieces, `all_to_all` and
 `ragged_all_to_all` ran out of memory at 16k tokens a GPU, and under `remat=full` at
 32k they made 72k and 25k tokens a second (now `ragged_all_to_all` dropless: 263k).
 On one node at this shape, then, `sorted` is still the fastest: its FSDP gathers 0.5
 GB of experts a layer, where the exchanges move 1 GB of picks each way. Under `dots`
-the exchanges run again in the backward, since their results are no products. The
-ragged methods under `none` need `XLA_PYTHON_CLIENT_MEM_FRACTION=.95`: XLA's ragged
-all-to-all leaves an allocation inside the default pool (75% of the GPU) after the
-first step, and a temp over half of it no longer fits. `ragged_tokens` moves about
-30% fewer rows when the routing is random, and half as few or fewer where a group
-limit keeps each token on half the devices (`num_groups` the size of `expert`,
+the exchanges run again in the backward, since their results are no products. XLA's
+ragged all-to-all leaves an allocation inside the memory pool after the first step,
+so that a step whose temporaries take over half of it fits only once:
+`XLA_PYTHON_CLIENT_MEM_FRACTION=.95` gives the pool more room. `ragged_tokens` moves
+about 30% fewer rows when the routing is random, and half as few or fewer where a
+group limit keeps each token on half the devices (`num_groups` the size of `expert`,
 `top_k_groups` half of it), but it sends the picks and their weights besides, and
 here gains nothing. At the start of a run on random tokens, a capacity of 1.25 drops
-5-16% of the picks a layer, and 1.5 at 16k tokens 3-4%. Neither
+4-10% of the picks a layer, and 1.5 at 16k tokens 3-4%. Neither
 `--xla_gpu_experimental_ragged_all_to_all_use_device_kernel` nor
 `--xla_gpu_ragged_all_to_all_mode=peer` changes the speed; `=symmetric` fails in NCCL
 ("Window address must be suitably aligned"). Nor does XLA's grouped matmul catch up
