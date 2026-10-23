@@ -1,8 +1,9 @@
-"""Context parallelism for attention (bux.parallel.context): every method of
+"""Context parallelism for attention (bux.parallel.context and ring): every method of
 `methods.attention` against `xla` on one device, with the positions split over
-`context` on the 8 CPU devices the tests have."""
+`context` on the 8 CPU devices the tests have. A CPU runs neither cuDNN's kernel nor
+tokamax's, so tokamax's is jnp's here (bux.parallel.flash.JNP), which has its
+interface; scripts/gpu_smoke/attention.py runs the GPU kernels."""
 
-import importlib.util
 from typing import NamedTuple
 
 import jax
@@ -19,26 +20,34 @@ from jaxtyping import Array, Float, Int
 from bux import parallel
 from bux.architecture import Model
 from bux.lang import compile
-from bux.parallel import methods
+from bux.parallel import flash, methods
 from bux.parallel.context import AttentionArgs
 from bux.train import config as tcfg
 from bux.train.data import Batch
 from bux.train.objective import objective
 from bux.train.trainer import Trainer
 
-TOKAMAX = pytest.mark.skipif(
-    importlib.util.find_spec("tokamax") is None,
-    reason="tokamax is the cuda extra's (Linux); scripts/gpu_smoke/attention.py",
-)
-METHODS = ["ring", "ulysses", pytest.param("tokamax", marks=TOKAMAX)]
-# Each context size with another axis: heads over tensor, or rows over fsdp.
-MESHES = {
+METHODS = ["ring", "ulysses", "tokamax", "auto"]
+# Each context size with another axis, heads over tensor or rows over fsdp; and
+# context=1 for the kernels on whole rows.
+CONTEXTS = {
     2: tcfg.MeshConfig(context=2, tensor=2),
     4: tcfg.MeshConfig(context=4, fsdp=2),
+}
+MESHES = CONTEXTS | {
+    8: tcfg.MeshConfig(context=8),
+    1: tcfg.MeshConfig(fsdp=2, tensor=2),
 }
 B, T, D = 2, 16, 8
 # Three documents in the first row, cut mid-way, and one in the second.
 POSITIONS = np.asarray([[*range(3, 8), *range(7), *range(4)], [*range(T)]])
+
+
+@pytest.fixture
+def kernels(monkeypatch):
+    """tokamax's kernel on a CPU: jnp's."""
+    monkeypatch.setattr(flash, "TOKAMAX", flash.JNP)
+    monkeypatch.setattr(flash, "tokamax_runs", lambda: True)
 
 
 def documents(positions: Int[np.ndarray, "b t"]) -> Int[Array, "b t"]:
@@ -73,6 +82,7 @@ CASES = {
     "mha_window": Case(4, 4, IDS, window=3),
     "mqa_softcap_window": Case(8, 1, window=6, softcap=2.0),
     "gqa_sinks": Case(4, 2, IDS, window=5, sinks=True),
+    "gqa_causal_sinks_softcap": Case(4, 2, softcap=3.0, sinks=True),
 }
 
 
@@ -108,9 +118,13 @@ def attend(
 @pytest.mark.parametrize("case", CASES.values(), ids=CASES.keys())
 @pytest.mark.parametrize("context", MESHES)
 @pytest.mark.parametrize("method", METHODS)
-def test_every_method_attends_and_differentiates_as_xla_does(method, context, case):
-    if method == "tokamax" and case.sinks:
-        pytest.skip("tokamax has no sinks")
+def test_every_method_attends_and_differentiates_as_xla_does(
+    kernels, method, context, case
+):
+    if method in ("ring", "ulysses") and context == 1:
+        pytest.skip("whole rows: auto's and tokamax's")
+    if method == "ulysses" and case.heads % context:
+        pytest.skip("context must divide the heads")
     out, grads = attend("xla", case)
     with parallel.use(MESHES[context]):
         split_out, split_grads = attend(method, case)
@@ -134,34 +148,35 @@ def exponents(jaxpr: Jaxpr) -> list[str]:
 
 
 @pytest.mark.parametrize("method", ["xla", *METHODS])
-def test_every_method_takes_its_softmax_in_float32(method):
+def test_every_method_takes_its_softmax_in_float32(kernels, method):
     """Forward and backward, on bfloat16 queries, keys and values."""
-    case = CASES["gqa_documents"]._replace(softcap=5.0)
+    case = CASES["gqa_sinks"]._replace(softcap=5.0)
     q, k, v, sinks, cotangent = (x.astype(jnp.bfloat16) for x in attention(case))
     f = methods.attention.find(method)
 
     def loss(q, k, v):
         return (f(q, k, v, case.visibility(sinks)) * cotangent).sum()
 
-    with parallel.use(MESHES[2]):
+    with parallel.use(CONTEXTS[2]):
         jaxpr = jax.make_jaxpr(jax.grad(loss, argnums=(0, 1, 2)))(q, k, v).jaxpr
     found = exponents(jaxpr)
     assert found and set(found) == {"float32"}
 
 
-def test_ring_sends_keys_round_and_gathers_none():
-    """Only the documents' ids are gathered; the keys and values go round."""
-    case = CASES["gqa_documents"]
-    q, k, v, sinks, _ = attention(case)
-    seen = case.visibility(sinks)
+@pytest.mark.parametrize(("ids", "sends"), [(IDS, False), (None, True)])
+def test_ring_gathers_the_keys_and_sends_only_zigzag_queries(ids, sends):
+    """The keys and values are gathered, and nothing goes round; without documents or
+    a window the queries go zigzag and back by collective-permutes."""
+    q, k, v, sinks, _ = attention(Case(4, 2))
+    seen = Case(4, 2, ids).visibility(sinks)
     with parallel.use(tcfg.MeshConfig(context=4, fsdp=2)) as mesh:
         put = NamedSharding(mesh, P("fsdp", "context"))
         q, k, v = (jax.device_put(x, put) for x in (q, k, v))
         f = jax.jit(lambda q, k, v: methods.attention.find("ring")(q, k, v, seen))
         text = f.lower(q, k, v).compile().as_text()
-    assert text is not None and "collective-permute" in text
+    assert text is not None and ("collective-permute" in text) == sends
     gathered = [line for line in text.splitlines() if " all-gather(" in line]
-    assert gathered and all(" s32[" in line.split("=")[1] for line in gathered)
+    assert any(" f32[" in line.split("=")[1] for line in gathered)
 
 
 def test_names_inside_a_shard_map_leave_out_the_axes_it_maps():
@@ -190,6 +205,24 @@ def test_ulysses_needs_context_to_divide_the_heads_of_a_device():
         f(q, k, v)
 
 
+def test_cudnns_packed_layout_has_where_each_document_starts_and_its_length():
+    """Starts only, then -1 (an end there gives wrong results), as cuDNN takes them."""
+    lengths, starts = flash.packed_documents(IDS, 4)
+    assert lengths.tolist() == [[5, 7, 4, -1], [16, -1, -1, -1]]
+    assert starts.tolist() == [[0, 5, 12, -1, -1], [0, -1, -1, -1, -1]]
+    assert int(flash.documents_in(IDS)) == 3
+
+
+def test_the_gpu_kernels_say_what_they_need_on_a_cpu():
+    q, k, v, sinks, _ = attention(Case(4, 2))
+    for method, need in (("tokamax", "a GPU"), ("cudnn", "cuDNN on a GPU")):
+        with pytest.raises(NotImplementedError, match=f"{method} needs.*{need}"):
+            methods.attention.find(method)(q, k, v, Case(4, 2).visibility(sinks))
+    seen = Case(4, 2, softcap=1.0).visibility(sinks)
+    with pytest.raises(NotImplementedError, match="cudnn has no softcap"):
+        methods.attention.find("cudnn")(q, k, v, seen)
+
+
 # --- In a model --------------------------------------------------------------------
 
 PRELUDE = """
@@ -198,13 +231,10 @@ vocab_size = 64
 norm = rmsnorm
 ffn = gated_mlp(intermediate_size=48, activation=swish)
 """
-# Sinks and a soft cap, but tokamax has no sinks.
-LAYER = {
-    "ring": "gqa(num_heads=4, num_kv_heads=2, rope=rope(), sliding_window_size=6, "
-    "sinks=true, softcap=20)",
-    "ulysses": "gqa(num_heads=4, num_kv_heads=2, rope=rope(), sinks=true, softcap=20)",
-    "tokamax": "gqa(num_heads=4, num_kv_heads=2, rope=rope(), sliding_window_size=6)",
-}
+LAYER = (
+    "gqa(num_heads=4, num_kv_heads=2, rope=rope(), sliding_window_size=6, "
+    "sinks=true, softcap=20)"
+)
 
 
 def source(layer: str) -> str:
@@ -254,9 +284,9 @@ def trains_the_same(losses, involuntary, layer: str, method: str) -> None:
 
 @pytest.mark.parametrize("method", METHODS)
 def test_a_run_trains_the_same_by_each_method_and_rematerializes_nothing(
-    losses, involuntary, method
+    kernels, losses, involuntary, method
 ):
-    trains_the_same(losses, involuntary, LAYER[method], method)
+    trains_the_same(losses, involuntary, LAYER, method)
 
 
 # MLA, and CSA's window alone: one kv head that is its keys and its values, and sinks.
@@ -277,10 +307,10 @@ def test_mla_and_csa_train_the_same_by_ring_and_ulysses(
 
 
 @pytest.mark.parametrize("method", METHODS)
-def test_packed_documents_train_the_same_by_each_method(method):
-    one = packed_losses(LAYER[method], tcfg.MeshConfig(data=1), "xla")
-    for mesh in MESHES.values():
-        assert np.allclose(packed_losses(LAYER[method], mesh, method), one, atol=1e-5)
+def test_packed_documents_train_the_same_by_each_method(kernels, method):
+    one = packed_losses(LAYER, tcfg.MeshConfig(data=1), "xla")
+    for mesh in CONTEXTS.values():
+        assert np.allclose(packed_losses(LAYER, mesh, method), one, atol=1e-5)
 
 
 # What only xla has, each with the name its error gives it.
@@ -299,11 +329,3 @@ ONLY_XLA = {
 def test_what_only_xla_has_is_an_error_under_another_method(losses, feature, layer):
     with pytest.raises(NotImplementedError, match=f"ring has no .*{feature}"):
         losses(source(layer), mesh="mesh(context=2)", methods="methods(attention=ring)")
-
-
-def test_tokamax_has_no_sinks():
-    q, k, v, sinks, _ = attention(Case(4, 2))
-    seen = Case(4, 2, sinks=True).visibility(sinks)
-    match = "tokamax has no sinks|tokamax needs tokamax"
-    with pytest.raises(NotImplementedError, match=match):
-        methods.attention.find("tokamax")(q, k, v, seen)
