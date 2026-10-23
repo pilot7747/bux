@@ -480,10 +480,12 @@ class MethodsConfig(Config):
     repeat: str = "unroll"
     # A policy by name, or as data: remat(save=[attention], first=8).
     remat: Annotated[str | RematConfig, BeforeValidator(_named_none)] = "none"
-    pipeline: str = "gpipe"
+    # 1f1b, but where it can't run (docs/parallelism.md, "Pipelines"): gpipe, circular.
+    pipeline: str = "1f1b"
     rounds: Positive = 1  # times a circular pipeline sends a microbatch round
-    # The passes of the pipelined repeat each stage runs, first to last: fewer on the
-    # first and last, which run the embedding and the head. None: an even share.
+    # The passes of the pipelined repeat each stage runs, first to last. None: under
+    # 1f1b and zbh1, the split that balances the stages' FLOPs, the embedding's on the
+    # first and the head's on the last (bux.train.stages); else as even as it goes.
     stages: list[Positive] | None = None
     orthogonalize: str = "owner"  # how Muon reaches whole matrices
     loss: str = "chunks"  # how the loss takes a head's logits: by chunks, or whole

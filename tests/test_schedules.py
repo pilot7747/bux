@@ -19,6 +19,7 @@ from bux.architecture.repeats import pipelined, tracing
 from bux.lang import compile, compile_runs
 from bux.parallel import pipeline, schedule, split
 from bux.parallel.scheduled import _rebuilt
+from bux.train import stages
 from bux.train.data import plain
 from bux.train.objective import objective
 from bux.train.optim import lr_multiplier, optimizer
@@ -360,6 +361,41 @@ def test_a_scheduled_step_moves_the_router_bias_once_from_the_whole_batch(name):
     whole = _stepped_bias(ONE, SCAN)
     piped = _stepped_bias("mesh(stage=2, data=1)", _how(name, 4))
     assert np.abs(whole).max() > 0 and np.allclose(piped, whole, atol=1e-6)
+
+
+# --- The default, and the stages that balance its work ---------------------------------
+
+# A head of 4096 words: as much work as about four of its blocks.
+WIDE = LLAMA.replace("vocab_size = 128", "vocab_size = 4096")
+
+
+def test_a_pipeline_runs_1f1b_unless_the_run_says_otherwise():
+    with _use("mesh(stage=2)", "methods(repeat=scan, microbatches=2)"):
+        method = parallel.scheduled.active()
+    assert method is not None and method.name == "1f1b"
+
+
+def test_balanced_stages_leave_the_last_the_head_s_work():
+    head = pipeline.Work(before=0, each=1, after=4.7)  # the 1.3B's, by its FLOPs
+    assert pipeline.balanced(16, 4, head) == (5, 5, 5, 1)
+    assert pipeline.balanced(16, 2, head) == (10, 6)
+    assert pipeline.balanced(15, 4, pipeline.Work(0, 1, 0)) == (4, 4, 4, 3)
+
+
+@pytest.mark.parametrize("name", PIPELINES)
+def test_a_scheduled_run_splits_its_passes_by_their_work(losses, name):
+    mesh, how = "mesh(stage=2, data=1)", _how(name, 4)
+    assert stages.balanced(_run(WIDE, mesh, how)).stages == [6, 2]
+    assert stages.balanced(_run(WIDE, mesh, _how("gpipe", 4))).stages is None
+    piped = losses(WIDE, mesh=mesh, methods=how, batch="16")
+    assert np.allclose(
+        piped, losses(WIDE, mesh=ONE, methods=SCAN, batch="16"), atol=1e-5
+    )
+
+
+def test_given_stages_win_over_the_balanced_ones():
+    given = _how("1f1b", 4, stages="[4, 4]")
+    assert stages.balanced(_run(WIDE, "mesh(stage=2, data=1)", given)).stages == [4, 4]
 
 
 # --- Errors and the plan --------------------------------------------------------------

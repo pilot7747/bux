@@ -92,11 +92,16 @@ class Compiled:
         self.compiled: dict[tuple, Any] = {}
 
     def __call__(self, *args: Any) -> Any:
+        return self.compile(*args)(*args)
+
+    def compile(self, *args: Any) -> Any:
+        """Return the function compiled for the shapes and dtypes of `args`, which
+        the first call of them compiles."""
         key = _signature(args)
         if key not in self.compiled:
             lowered = self.jitted.lower(*args)
             self.compiled[key] = lowered.compile(self.options)
-        return self.compiled[key](*args)
+        return self.compiled[key]
 
 
 def _signature(args: tuple) -> tuple:

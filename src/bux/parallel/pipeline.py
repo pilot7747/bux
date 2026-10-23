@@ -30,7 +30,7 @@ microbatches, (rounds, layers per round, reports).
 """
 
 import functools
-from collections.abc import Callable
+from collections.abc import Callable, Iterator
 from typing import NamedTuple
 
 import jax
@@ -41,6 +41,7 @@ from jaxtyping import Array, Bool, Float, Int, PyTree, Shaped
 
 from bux.parallel import gather, methods, schedule
 from bux.parallel.mesh import Active, active
+from bux.train.config import MethodsConfig
 
 AXIS = "stage"
 STAGES = "stages"  # the stacked dimension of a pipelined repeat, split over stage
@@ -82,53 +83,118 @@ def _on() -> Active:
 
 def shares(passes: int) -> tuple[int, ...]:
     """Return how many of a round's `passes` each stage runs: as `methods.stages` gives
-    them, or as many each."""
+    them, or as evenly as they split (``even``). A run's training fills in the split
+    that balances a schedule's stages (``balanced``, bux.train.stages)."""
     on, n = active(), stages()
     given = None if on is None else on.methods.stages
-    return (passes // n,) * n if given is None else tuple(given)
+    return even(passes, n) if given is None else tuple(given)
+
+
+def even(passes: int, stages: int) -> tuple[int, ...]:
+    """Return `passes` split over `stages` as evenly as they go, the first stages
+    taking one more where they do not divide."""
+    each, more = divmod(passes, stages)
+    return tuple(each + (s < more) for s in range(stages))
+
+
+class Work(NamedTuple):
+    """What a scheduled pipeline's stages compute for a microbatch, in FLOPs: every
+    stage `each` a pass, the first also the model before the pipelined repeat
+    (`before`: the embedding), and the last the model after it, to the loss
+    (`after`: the head)."""
+
+    before: float
+    each: float
+    after: float
+
+    def of(self, split: tuple[int, ...]) -> list[float]:
+        """Return each stage's work, of `split` passes each."""
+        work = [n * self.each for n in split]
+        work[0] += self.before
+        work[-1] += self.after
+        return work
+
+
+def balanced(passes: int, stages: int, work: Work) -> tuple[int, ...]:
+    """Return the split of `passes` over `stages`, a pass a stage at least, whose
+    slowest stage does the least `work`; of those as slow, the most even, and then
+    the one heaviest at the front."""
+
+    def slowest_then_spread(split: tuple[int, ...]) -> tuple[float, float]:
+        each = work.of(split)
+        return max(each), sum(w * w for w in each)
+
+    return min(_splits(passes, stages), key=slowest_then_spread)
+
+
+def _splits(passes: int, stages: int) -> Iterator[tuple[int, ...]]:
+    """Yield the splits of `passes` over `stages` that give each a pass, the most
+    passes on the first stage first. The stages between the first and the last work
+    alike, so they only split what those two leave, as evenly as it goes."""
+    if stages == 1:
+        yield (passes,)
+        return
+    between = stages - 2
+    for first in reversed(range(1, passes)):
+        for last in range(1, passes - first + 1):
+            rest = passes - first - last
+            if between == 0 and rest == 0:
+                yield first, last
+            elif between > 0 and rest >= between:
+                yield first, *even(rest, between), last
 
 
 def rounds(passes: int) -> int:
     """Return how many rounds the run in force pipelines a repeat of `passes` passes
-    in. Raise unless the passes split evenly over the stages of every round, or as
-    `methods.stages` says, and a circular pipeline has at least one microbatch per
-    stage to keep the stages busy."""
+    in. Raise unless each stage runs a pass at least, in one round as `shares` gives
+    them, or in a circular pipeline's rounds evenly, with a microbatch per stage at
+    least to keep the stages busy."""
     on = _on()
     s, settings = on.size(AXIS), on.methods
-    if settings.stages is not None:
-        _check_shares(tuple(settings.stages), s, passes, settings.rounds)
-    elif passes % (s * settings.rounds):
+    if passes < s:
         raise ValueError(
             f"mesh.stage = {s} pipelines the longest scanned repeat, of {passes} "
-            f"passes, in methods.rounds = {settings.rounds}: make its passes a "
-            f"multiple of {s * settings.rounds}"
+            f"passes: give it a pass a stage at least"
         )
-    if settings.rounds > 1 and settings.pipeline in schedule.TABLES:
-        raise ValueError(
-            f"methods(pipeline={settings.pipeline}) goes round the stages once, not "
-            f"methods.rounds = {settings.rounds} times"
-        )
-    if settings.rounds > 1 and settings.microbatches < s:
-        raise ValueError(
-            f"a circular pipeline takes a microbatch a stage at least: "
-            f"methods.microbatches = {settings.microbatches} < mesh.stage = {s}"
-        )
+    if settings.rounds == 1:
+        _check_shares(shares(passes), s, passes)
+    else:
+        _check_circular(passes, s, settings)
     return settings.rounds
 
 
-def _check_shares(
-    given: tuple[int, ...], stages: int, passes: int, rounds: int
-) -> None:
-    """Raise unless `given` gives each of the `stages` its passes, `passes` in all, in
-    one round."""
+def _check_shares(given: tuple[int, ...], stages: int, passes: int) -> None:
+    """Raise unless `given` gives each of the `stages` its passes, `passes` in all."""
     if len(given) != stages or sum(given) != passes:
         raise ValueError(
             f"methods.stages = {list(given)} splits {sum(given)} passes over "
             f"{len(given)} stages, and the pipelined repeat has {passes} passes over "
             f"mesh.stage = {stages}"
         )
-    if rounds > 1:
+
+
+def _check_circular(passes: int, stages: int, settings: MethodsConfig) -> None:
+    """Raise unless a circular pipeline can send `passes` round `stages` in
+    `settings.rounds` rounds."""
+    rounds, total = settings.rounds, stages * settings.rounds
+    if settings.stages is not None:
         raise ValueError("methods.stages splits one round, not methods.rounds")
+    if passes % total:
+        raise ValueError(
+            f"mesh.stage = {stages} pipelines the longest scanned repeat, of {passes} "
+            f"passes, in methods.rounds = {rounds}: make its passes a multiple of "
+            f"{total}"
+        )
+    if settings.pipeline in schedule.TABLES:
+        raise ValueError(
+            f"methods(pipeline={settings.pipeline}) goes round the stages once, not "
+            f"methods.rounds = {rounds} times: use methods(pipeline=circular)"
+        )
+    if settings.microbatches < stages:
+        raise ValueError(
+            f"a circular pipeline takes a microbatch a stage at least: "
+            f"methods.microbatches = {settings.microbatches} < mesh.stage = {stages}"
+        )
 
 
 def spread(

@@ -1658,21 +1658,23 @@ its checkpoint into the memory of the state it replaces.
 
 ```
 mesh    = mesh(stage=4, fsdp=2)
-methods = methods(repeat=scan, microbatches=8)                                # gpipe
+methods = methods(repeat=scan, microbatches=8)                     # 1f1b, stages balanced
+methods = methods(repeat=scan, microbatches=8, pipeline=gpipe)
 methods = methods(repeat=scan, microbatches=8, pipeline=circular, rounds=2)
 methods = methods(repeat=scan, microbatches=8, pipeline="zbh1")              # zero bubble
-methods = methods(repeat=scan, microbatches=8, pipeline="1f1b", stages=[5, 4, 4, 3])
+methods = methods(repeat=scan, microbatches=8, stages=[5, 4, 4, 3])
 ```
 
 With `mesh.stage` above 1, the longest scanned repeat outside any other (the first of
 several as long) is pipelined. Its stacked layers split over `stage` by a dimension
-named `stages` of the layout, one share of consecutive passes per stage. The rest of the
-model, the embedding and the head too, does not split over `stage`: under `gpipe` and
-`circular` every stage computes it, and under `1f1b` and `zbh1` the first stage runs
-the embedding and the last the head ([Schedules](#schedules-1f1b-zbh1)).
+named `stages` of the layout, one share of consecutive passes per stage, as
+`methods.stages` gives them or as a run balances them ([Stages](#stages-methodsstages)).
+The rest of the model, the embedding and the head too, does not split over `stage`:
+under `gpipe` and `circular` every stage computes it, and under `1f1b` and `zbh1` the
+first stage runs the embedding and the last the head ([Schedules](#schedules-1f1b-zbh1)).
 A model with no scanned repeat is an error that says to repeat its blocks and scan
-them, `methods(repeat=scan)`, and so is a repeat whose passes do not split over the
-stages evenly, or as `methods.stages` says ([Uneven stages](#uneven-stages-methodsstages)).
+them, `methods(repeat=scan)`, and so is a repeat of fewer passes than stages, or one
+whose passes `methods.stages` does not split.
 
 The batch's rows split into `methods.microbatches` microbatches, row `i·M + j` into
 microbatch `j`, so that each splits over the batch axes as the rows do. A method runs
@@ -1685,14 +1687,30 @@ leaves, summed over the stages to every one.
 
 | method     | each microbatch                                                   | a stage holds   | a stage idles           |
 |------------|-------------------------------------------------------------------|-----------------|-------------------------|
-| `gpipe`    | goes through the stages once; the default                         | M + S − 1 ticks | (S − 1) / (M + S − 1)   |
+| `gpipe`    | goes through the stages once                                      | M + S − 1 ticks | (S − 1) / (M + S − 1)   |
 | `circular` | goes round them `methods.rounds` times, each stage holding a share of every round's layers | R·M + S − 1 ticks | (S − 1) / (R·M + S − 1) |
-| `1f1b`     | as in gpipe, and its backward as soon as it can run               | 2S − 1          | (S − 1) / (M + S − 1)   |
+| `1f1b`     | as in gpipe, and its backward as soon as it can run; the default  | 2S − 1          | (S − 1) / (M + S − 1)   |
 | `zbh1`     | as in gpipe, its backward split in two, the weights' part where a stage would idle | S, and S of the weights' | (S − 1) / (3M + S − 1) |
 
 What a stage holds is the residuals of as many ticks or microbatches. `circular` needs
 at least one microbatch per stage, and only it reads `methods.rounds`. The bubble of
 `zbh1` counts a forward, a backward of the input and one of the weights as a tick each.
+
+`1f1b` is the default: on one node of B300s it trains the 1.3B below 9-23% faster than
+`gpipe`, in half its memory or less, on the stages a run balances. It runs where
+`gpipe` does, but:
+
+- in rounds: only `circular` goes round the stages more than once, and
+  `methods(rounds=2)` under `1f1b` is an error that says so;
+- where a layer outside the pipelined repeat learns from the whole batch, as an MoE's
+  router does: `1f1b` runs the layers outside the repeat a microbatch at a time, on
+  one stage, which is an error that says to use `gpipe`;
+- a forward alone, as an eval's, runs `gpipe`'s: `1f1b` is the schedule of a
+  training step's backward.
+
+With one stage nothing pipelines, and a model's MTP modules run on the last stage,
+with its head.
+
 `bux plan` shows the share of a step a stage idles, the bubble:
 
 ```
@@ -1732,10 +1750,12 @@ are independent and their axes span processes, `accumulate=auto` (or
 split the rows as well as over `stage`. A stage runs its device's rows alone, each
 tick's gradients stay its own, and the `shard_map`'s transpose sums them over those
 axes once, as they leave it, in float32. Else (`accumulate=reduced`, or an MoE) they
-reduce every tick, as the backward makes them. With `gpipe` the stacked state
-keeps the shapes and the order of `repeat=scan`'s, so a run resumes on another number
-of stages, or on none; `circular` stacks each round's layers as a repeat of its own,
-and resumes as circular with as many rounds.
+reduce every tick, as the backward makes them. On stages of as many passes each the
+stacked state keeps the shapes and the order of `repeat=scan`'s, so a run resumes on
+another number of stages, or on none; on uneven stages, as a run balances them under
+`1f1b`, it resumes on the same split ([Stages](#stages-methodsstages)); `circular`
+stacks each round's layers as a repeat of its own, and resumes as circular with as
+many rounds.
 
 Measured on 8 CPU devices, for a Llama of 8 blocks (`d_model=64`, 16 rows of 16
 tokens): how far the losses of three AdamW steps are from one device's at most, and

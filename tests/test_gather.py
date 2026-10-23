@@ -76,9 +76,9 @@ def test_gathered_once_a_step_of_an_moe_reduces_its_gradients_each_microbatch():
 
 
 def test_a_pipeline_gathers_its_stages_parameters_and_reduces_them_once_a_step():
-    """Its 4 microbatches go through 2 stages in 5 ticks, gathering and reducing as
-    they run before; and reduced each tick, only gathered once."""
-    how = "methods(repeat=scan, microbatches=4{})"
+    """Its 4 microbatches go through 2 stages in 5 ticks of gpipe, gathering and
+    reducing as they run before; and reduced each tick, only gathered once."""
+    how = "methods(repeat=scan, microbatches=4, pipeline=gpipe{})"
     after = _moved(LLAMA, "mesh(stage=2, fsdp=4)", how.format(", accumulate=unreduced"))
     gathered = _moved(LLAMA, "mesh(stage=2, fsdp=4)", how.format(""))
     before = _moved(LLAMA, "mesh(stage=2, fsdp=4)", how.format(", gather=layer"))
@@ -232,7 +232,7 @@ def test_each_device_draws_its_own_rows_masks():
         (
             LLAMA,
             "mesh(stage=2, fsdp=4)",
-            "methods(repeat=scan)",
+            "methods(repeat=scan, pipeline=gpipe)",
             "precision(reduce=float32)",
             "embedding and head",
         ),
