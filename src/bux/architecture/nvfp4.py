@@ -13,10 +13,10 @@ same for W and W^T, untransformed, and its largest magnitude is XLA's: a weight 
 small next to the activations.
 
 Off a GPU the kernels run interpreted, the conversions by their arithmetic, and
-quantize as XLA does, bit for bit. On a B300 they round x and W as XLA does there, bit
-for bit, and 0.15% of the values a step apart from XLA on a CPU: a GPU divides within
-an ulp of the CPU, and the scales' few bits put many values on the midpoints between
-E2M1's.
+quantize as XLA does, bit for bit. On a B300 they round x and W bit for bit as XLA
+does there; against XLA on a CPU 0.15% of the values are a step apart: a GPU's division
+is at times an ulp from the CPU's, and the scales' few bits put many values on the
+midpoints between E2M1's.
 """
 
 from collections.abc import Callable
@@ -40,7 +40,8 @@ from bux.architecture.blockscaled import HADAMARD, NV_BLOCK, Blocks, Recipe
 # blocks: 64 x 128 is the fastest on a B300.
 ROWS, COLUMNS = (64, 32, 16), (128, 64, 32, 16)
 WARPS = 4
-# The random Hadamard transform of each 16 of a tile's rows, of the largest.
+# The random Hadamard transform of the largest tile's rows, 16 at a time
+# (blockscaled.HADAMARD on the diagonal); a smaller tile takes its top left corner.
 HADAMARDS = np.kron(np.eye(ROWS[0] // NV_BLOCK), HADAMARD).astype(np.float32)
 
 

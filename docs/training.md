@@ -229,14 +229,20 @@ seeds differ by 1.6%:
 | `deepseek_v3_fp8` | +0.15% | -0.03% | 127k |
 | `moments=bfloat16` | +0.07% | -0.01% | 116k |
 | `mxfp8, first=2, last=2` | +0.09% | | 127k |
-| `nvfp4` | +0.61% | | 39k |
-| `nvidia_nvfp4` | +0.38% | +0.33% | 49k |
-| `nvidia_nvfp4` and its switch at 0.82 | +0.31% | +0.26% | 49k |
-| `nvidia_nvfp4`, `last=4` | +0.46% | | 44k |
-| `nvfp4, last=0.15`, `q`, `kv` and `o` in compute | +0.34% | | 56k |
+| `nvfp4` | +0.75% | | 135k |
+| `nvidia_nvfp4` | +0.48% | +0.56% | 129k |
+| `nvidia_nvfp4` and its switch at 0.82 | +0.46% | +0.51% | 127k |
+| `nvidia_nvfp4`, `last=4` † | +0.46% | | 44k |
+| `nvfp4, last=0.15`, `q`, `kv` and `o` in compute † | +0.34% | | 56k |
 
 NVIDIA measured 1.5% at the end of 10T tokens on a 12B, against FP8, and 0.5% with
-the switch.
+the switch. NVFP4 quantizes by its kernels here, bfloat16 4.0383 and 3.9696 beside
+them. The rows marked † quantized by XLA, which on a GPU folds the cast to E4M3 and
+back: it scaled each block's values by its scale unrounded, and the GEMM by the
+rounded one, up to 6% apart (`blockscaled.nv_quantize` keeps them alike now). That
+moved nothing past the noise: NVIDIA's recipe quantized by XLA gives +0.44% and
++0.51%, with the fold +0.44% and +0.41%, and by the kernels with a float32 GEMM output
++0.50% and +0.53%. A change at the ulp moves a gap by up to 0.15 points.
 
 ## Data
 
