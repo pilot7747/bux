@@ -226,6 +226,31 @@ def test_dropout_draws_a_mask_a_microbatch():
     assert counts and all(np.all(np.asarray(c[...]) == 4) for c in counts)
 
 
+UNEVEN = [
+    ("mesh(stage=2, data=1)", "[3, 5]", 4),
+    ("mesh(stage=4, data=1)", "[1, 3, 3, 1]", 8),
+]
+
+
+@pytest.mark.parametrize("method", ["gpipe", "1f1b", "zbh1"])
+@pytest.mark.parametrize(("mesh", "stages", "microbatches"), UNEVEN)
+def test_uneven_stages_train_as_one_device(losses, method, mesh, stages, microbatches):
+    how = _how(microbatches, f'"{method}"', stages=stages)
+    piped = losses(LLAMA, mesh=mesh, methods=how, batch="16")
+    one = losses(LLAMA, mesh=ONE, methods=SCAN, batch="16")
+    assert np.allclose(piped, one, atol=1e-5)
+
+
+def test_uneven_stages_hold_as_many_layers_as_the_most_any_runs():
+    model = _model(LLAMA, "mesh(stage=2, fsdp=2)", _how(4, stages="[3, 5]"))
+    [scan] = _scans(model)
+    kernel = next(v for _, v in nnx.iter_graph(scan) if isinstance(v, nnx.Param))
+    assert (scan.times, kernel.shape[0]) == (2 * 5, 2 * 5)
+    with _use("mesh(stage=2, fsdp=2)", _how(4, stages="[3, 5]")):
+        spec = parallel.shardings(nnx.state(scan, nnx.Param))
+    assert all(s.spec[0] == "stage" for s in jax.tree.leaves(spec))
+
+
 # --- What pipelines --------------------------------------------------------------------
 
 
@@ -310,8 +335,9 @@ def test_a_tap_read_across_the_pipelined_repeat_is_an_error_that_names_it():
         (PRELUDE + "model = embed block norm head", SCAN, r"methods\(repeat=scan\)"),
         (PRELUDE + "model = embed block^6 norm head", SCAN, "a multiple of 4"),
         (LLAMA, _how(2, "circular", 2), "a microbatch a stage"),
+        (LLAMA, _how(2, stages="[1, 2, 2, 1]"), "splits 6 passes"),
     ],
-    ids=["unrolled", "no repeat", "uneven", "too few microbatches"],
+    ids=["unrolled", "no repeat", "uneven", "too few microbatches", "wrong split"],
 )
 def test_a_model_that_cannot_pipeline_is_an_error_that_says_why(source, methods, error):
     with pytest.raises(ValueError, match=error):

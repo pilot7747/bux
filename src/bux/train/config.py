@@ -376,6 +376,9 @@ class MethodsConfig(Config):
     remat: Annotated[str, BeforeValidator(_named_none)] = "none"
     pipeline: str = "gpipe"
     rounds: Positive = 1  # times a circular pipeline sends a microbatch round
+    # The passes of the pipelined repeat each stage runs, first to last: fewer on the
+    # first and last, which run the embedding and the head. None: an even share.
+    stages: list[Positive] | None = None
     orthogonalize: str = "owner"  # how Muon reaches whole matrices
     loss: str = "logits"  # how the loss takes a head's logits: whole, or by chunks
     microbatches: Positive = 1
