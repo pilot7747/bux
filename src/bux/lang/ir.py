@@ -208,7 +208,7 @@ _UNCOMPUTED = {"log", "eval", "checkpoint", "profile", "mesh", "layout", "method
 _NEWER = {"precision": PrecisionConfig(compute="float32")}
 # Fields of a setting newer than run ids, by what runs computed before them.
 _NEWER_FIELDS = {
-    "precision": {"matmuls": "compute"},
+    "precision": {"matmuls": "compute", "reduce": "compute"},
     "optimizer": {"ns_coefficients": "jordan", "ns_dtype": "float32"},
 }
 

@@ -311,6 +311,9 @@ class PrecisionConfig(Config):
     type: Literal["precision"] = "precision"
     compute: Literal["float32", "bfloat16"] = "bfloat16"
     matmuls: str = "compute"  # a format of bux.architecture.matmuls: mxfp8, nvfp4
+    # The dtype gradients are summed over the batch's rows in: compute, or float32 as
+    # Megatron's are, which a step sums once (methods.accumulate = unreduced).
+    reduce: Literal["compute", "float32"] = "compute"
 
 
 # --- Parallelism -----------------------------------------------------------------------
@@ -373,6 +376,14 @@ class MethodsConfig(Config):
     orthogonalize: str = "owner"  # how Muon reaches whole matrices
     loss: str = "logits"  # how the loss takes a head's logits: whole, or by chunks
     microbatches: Positive = 1
+    # Where a step runs its layers more than once (microbatches, a pipeline's ticks),
+    # it casts and gathers the parameters FSDP splits once, or as each layer runs
+    # (ZeRO-3), which holds one layer's at a time.
+    gather: Literal["step", "layer"] = "step"
+    # How its microbatches' gradients add up: unreduced, each device's own reduced once
+    # a step; or reduced each microbatch. auto: unreduced where that computes the
+    # same, the rows independent of each other and no pipeline.
+    accumulate: Literal["auto", "unreduced", "reduced"] = "auto"
     # A step's new state takes the old one's memory: a lower peak, in fewer pieces.
     donate: bool = True
 

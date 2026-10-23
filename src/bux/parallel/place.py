@@ -15,9 +15,9 @@ from bux.parallel.layout import NAMES, fsdp, partition, resolve, shard
 from bux.parallel.mesh import Active, active
 
 
-def _spec(path: tuple, x: object, on: Active) -> P:
+def _spec(path: tuple, x: object, on: Active, gathered: bool) -> P:
     """Return a variable's spec: its names resolved, then FSDP for the optimizer's
-    state, and for parameters unless the layout's `zero` is 1."""
+    state, and for parameters unless the layout's `zero` is 1 or they are `gathered`."""
     if not isinstance(x, nnx.Variable) or not hasattr(x.get_value(), "shape"):
         return P()  # optax's masked nodes, say
     shape = tuple(x.shape)
@@ -27,7 +27,7 @@ def _spec(path: tuple, x: object, on: Active) -> P:
     except ValueError as e:
         raise ValueError(f"{jax.tree_util.keystr(path)}: {e}") from None
     use_fsdp = isinstance(x, nnx.OptState) or (
-        isinstance(x, nnx.Param) and on.layout.zero == 3
+        isinstance(x, nnx.Param) and on.layout.zero == 3 and not gathered
     )
     return partition(fsdp(splits, shape, on, names) if use_fsdp else splits)
 
@@ -36,13 +36,17 @@ def _variable(x: object) -> bool:
     return isinstance(x, nnx.Variable)
 
 
-def shardings(state: nnx.State) -> nnx.State:
-    """Return the NamedSharding of every variable of `state` on the mesh of `use`."""
+def shardings(state: nnx.State, gathered: bool = False) -> nnx.State:
+    """Return the NamedSharding of every variable of `state` on the mesh of `use`; or
+    with `gathered`, of the parameters as a step uses them: split by their names
+    alone, whole over FSDP's axes."""
     on = active()
     if on is None:
         raise RuntimeError("shardings are of the mesh `bux.parallel.use` sets")
     return jax.tree_util.tree_map_with_path(
-        lambda p, x: NamedSharding(on.mesh, _spec(p, x, on)), state, is_leaf=_variable
+        lambda p, x: NamedSharding(on.mesh, _spec(p, x, on, gathered)),
+        state,
+        is_leaf=_variable,
     )
 
 
