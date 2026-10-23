@@ -351,13 +351,13 @@ Constraints:
   `(batch, seq, none)`, then `shard_stream`. From a table split over `fsdp`, XLA
   rematerializes it in full; into positions split over `tensor`, it gathers the
   table every step. Engram gathers from its table the same way.
-- The loss makes the logits a chunk of each device's positions at a time
-  (`bux/architecture/logits.py`): `(batch, seq, none, vocab)` over the devices'
-  shards, tied heads too, and reduces over the vocabulary where it is: the
-  log-normalizer and the target's logit are all-reduces of a chunk's positions, for
-  the loss, `z_loss` and `mtp` alike. The head's kernel is gathered over `fsdp` once
-  for all the chunks, and each device adds its share of the kernel's gradient up on
-  its own, reduced once after the last chunk.
+- The logits are `(batch, seq, vocab)`, tied heads too, and the loss reduces over the
+  vocabulary where it is: the log-normalizer and the target's logit are all-reduces
+  of `(b, t)`, for the loss, `z_loss` and `mtp` alike. Under `methods(loss=chunks)`
+  (`bux/architecture/logits.py`) they are made a chunk of each device's positions at
+  a time, `(batch, seq, none, vocab)` over the devices' shards; the head's kernel is
+  gathered over `fsdp` once for all the chunks, and each device adds its share of the
+  kernel's gradient up on its own, reduced once after the last chunk.
 - What the embedding, nextn and Engram return is the stream, widened or not, and
   goes through `shard_stream`.
 
@@ -769,19 +769,22 @@ host memory is its device's. On a GPU, flash attention's backward takes q, k, v,
 output and the log-sum-exp. On a B300, for the dense 1.3B of 16 Llama blocks of width
 2048 (vocabulary 128256, 8 rows of 4096 tokens, `bfloat16`):
 
-| remat               | tok/s   | peak memory |
-|---------------------|---------|-------------|
-| `none`              | 132,000 | 62.4 GiB    |
-| `dots`              | 124,000 | 50.9 GiB    |
-| `save_attention`    | 122,000 | 42.6 GiB    |
-| `dots_attention`    | 132,000 | 52.9 GiB    |
-| `offload_attention` | 86,000  | 50.6 GiB    |
+| remat                | tok/s   | peak memory |
+|----------------------|---------|-------------|
+| `none`               | 145,000 | 81.3 GiB    |
+| `dots`               | 134,000 | 69.8 GiB    |
+| `save_attention`     | 132,000 | 61.9 GiB    |
+| `save_qkv_attention` | 130,000 | 61.9 GiB    |
+| `dots_attention`     | 139,000 | 71.8 GiB    |
+| `offload_attention`  | 90,000  | 62.0 GiB    |
 
 `dots` runs flash attention's forward twice, and `save_attention` the matmuls of every
-layer; `dots_attention` runs neither, as fast as `none` in a sixth less memory.
+layer; `dots_attention` runs neither, 4% slower than `none` in 12% less memory.
 `save_qkv_attention` keeps what `save_attention` does here: attention's backward
 takes q, k and v after RoPE, so that only a QK-norm would read the projections.
-Offloading moves more than it saves, at this size.
+Offloading moves more than it saves, at this size. The head's logits are the largest
+part of the rest, which `methods(loss=chunks)` leaves out
+([The trainer's blocks](training.md#the-trainers-blocks)).
 
 `Scanned.layers` holds the stacked passes, and `stacked.run(graphdef, state, times, x,
 taps)` runs any stack of them, such as a pipeline stage's share.
@@ -814,7 +817,7 @@ Float32 islands compute from what they are given in float32, and give back its d
 | the MoE's router                                | its logits, scores and top-k, the balance loss and the bias; the weights go back to the stream's dtype |
 | `recurrence`, `delta_rule`, `selective_scan`    | the recurrent state, and its decays               |
 | `rope.rotate`                                   | the rotation                                      |
-| the head                                        | its logits, from its matmul in `compute` (tied or not) accumulated in float32; the softcap, the softmax and the loss |
+| the head                                        | its matmul's accumulation, tied or not, and its log Z and loss; under `methods(loss=chunks)`, its logits |
 
 Softmax attention takes its softmax in float32, under every method of
 `methods.attention`. Every other matmul runs in `compute`, or in the format of

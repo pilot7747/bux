@@ -508,24 +508,41 @@ trainer.fit(
 
 The model gives the objective its heads' outputs, not their logits: `Model.heads`
 (`training_heads` in a training step) returns each head's input and its projection,
-a `HeadOutput` (`bux/architecture/logits.py`). At a vocabulary of 128K and 8 rows of
-4096 tokens, the float32 logits alone take 16 GB, and their gradient as much again.
-The default terms, `loss`, `z_loss` and `mtp`, take only log Z and the target's logit
-at each position, which `logits.scores(i, offset)` gives for head i a chunk of
-positions at a time: the matmul, the logsumexp and the target's logit of at most 2 GiB
-of logits at once, made again in the backward, the head's gradient added up in
-float32. A term of one's own gets the same `logits`, a sequence that makes a head's
-logits once a term reads them, once for every term that does: `logits[0] ** 2` above
-makes the first head's whole. `Model.outputs` returns every head's logits at once.
+a `HeadOutput` (`bux/architecture/logits.py`). The default terms, `loss`, `z_loss`
+and `mtp`, take only log Z and the target's logit at each position, which
+`logits.scores(i, offset)` gives for head i by the run's `methods.loss`:
 
-Against the whole logits, on a B300, for the dense 1.3B of 16 Llama blocks of width
-2048 (vocabulary 128256, `bfloat16`, the default `methods`): the largest batch of
-4096-token rows is 56 rather than 28; at 8 rows, peak memory is 62 GiB rather than 81,
-and throughput 133k tokens a second rather than 145k, for the matmul the backward
-makes again. With a tied head, 58 GiB rather than 84, and 134k rather than 129k: the
-whole logits of a tied head come from a float32 matmul. On 8 of them under `fsdp=8`,
-8 rows each, the ratios hold (41 GiB rather than 60, 1.04M tokens a second rather
-than 1.12M): each device adds its share of the head's gradient up alone, and the mesh
+| method   | how                                                                 |
+|----------|---------------------------------------------------------------------|
+| `logits` | one matmul for every position, the logits whole in `compute`; the default |
+| `chunks` | the matmul, the logsumexp and the target's logit of at most 2 GiB of float32 logits at once, made again in the backward, the head's gradient added up in float32 |
+
+At a vocabulary of 128K, the float32 logits of 8 rows of 4096 tokens take 16 GB, and
+their gradient as much again: `chunks` is for a run that memory bounds, a large
+vocabulary and batch, or a long row, where the 9% it costs buys rows. Another method
+is a function of a head's output and the targets, `@methods.loss.register("mine")`,
+that returns their `Scores`. A term of one's own gets the same `logits`, a sequence
+that makes a head's logits once a term reads them, once for every term that does:
+`logits[0] ** 2` above makes the first head's whole, by either method.
+`Model.outputs` returns every head's logits at once.
+
+On a B300, for the dense 1.3B of 16 Llama blocks of width 2048 (vocabulary 128256,
+`bfloat16`, 8 rows of 4096 tokens), against the whole logits before the head left
+them to the objective, whose tied head multiplied in float32; the largest batch with
+`methods(donate=true)`:
+
+| head, `methods.loss` | tok/s | peak memory | largest batch |
+|----------------------|-------|-------------|---------------|
+| untied, before       | 143k  | 81.2 GiB    | 28 rows       |
+| untied, `logits`     | 145k  | 81.3 GiB    | 28 rows       |
+| untied, `chunks`     | 131k  | 62.5 GiB    | 56 rows, 137k |
+| tied, before         | 129k  | 84.4 GiB    |               |
+| tied, `logits`       | 144k  | 76.3 GiB    |               |
+| tied, `chunks`       | 134k  | 57.6 GiB    |               |
+
+`chunks` makes the logits twice, and moves them in float32. On 8 B300s under `fsdp=8`,
+8 rows each, its ratios hold (41 GiB rather than 60, 1.04M tokens a second rather than
+1.12M): each device adds its share of the head's gradient up alone, and the mesh
 reduces it once.
 
 A layer adds a term of its own from its forward, in one line:
