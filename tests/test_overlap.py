@@ -111,7 +111,7 @@ def test_exposed_comm_is_the_collectives_time_with_no_compute_beside_them(tmp_pa
     gpu0 = plane(
         0,
         {
-            "Stream #13(compute)": [("gemm", 0, 30), ("memcpy D2D", 30, 45)],
+            "Stream #13(compute)": [("gemm", 0, 30), ("MemcpyD2D", 30, 45)],
             "Stream #20(nccl)": [
                 ("all-gather-start.1", 0, 40),
                 ("ncclDevKernel_ReduceScatter", 50, 60),

@@ -3,8 +3,9 @@ take, and how long they run with no compute beside them, which the step waits fo
 
 A GPU's kernels are on the trace's lines of streams ("Stream #13(compute)"). A kernel
 communicates if NCCL runs it, or if XLA's op that launched it (its `hlo_op`) is a
-collective; copies and memsets are neither; every other kernel computes. A collective
-is exposed where no computing kernel overlaps it, on any of its GPU's streams.
+collective; CUDA's copies and memsets are neither; every other kernel computes. A
+collective is exposed where no computing kernel overlaps it, on any of its GPU's
+streams. Its time includes the wait for its slowest peer.
 """
 
 import re
@@ -16,10 +17,10 @@ from jax.profiler import ProfileData
 Intervals = list[tuple[float, float]]  # (start, end) in ns
 
 _COLLECTIVE = re.compile(
-    r"nccl|all-gather|all-reduce|reduce-scatter|all-to-all|collective-permute|"
-    r"send|recv|memcpyp2p|memcpy p2p"
+    r"nccl|all[-_]gather|all[-_]reduce|reduce[-_]scatter|all[-_]to[-_]all|"
+    r"collective[-_]permute|send|recv|memcpy ?p(2|to)p"
 )
-_COPY = re.compile(r"memcpy|memset")
+_COPY = re.compile(r"memcpy ?[hd](2|to)[hd]|memset")  # CUDA's, not XLA's copy kernels
 
 
 class Kernels(NamedTuple):
