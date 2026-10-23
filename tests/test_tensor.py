@@ -68,7 +68,7 @@ def _outputs(method: str, mesh: str, source: str = LLAMA, fmt: str = "compute"):
     with (
         parallel.use(
             tcfg.MeshConfig.model_validate(sizes),
-            tcfg.LayoutConfig(stream=stream),
+            tcfg.LayoutConfig.model_validate({"stream": stream}),
             tcfg.MethodsConfig(tensor=method),
         ),
         matmuls.use(fmt),
