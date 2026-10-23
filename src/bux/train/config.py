@@ -394,7 +394,7 @@ class MethodsConfig(Config):
     pipeline: str = "gpipe"
     rounds: Positive = 1  # times a circular pipeline sends a microbatch round
     orthogonalize: str = "owner"  # how Muon reaches whole matrices
-    loss: str = "logits"  # how the loss takes a head's logits: whole, or by chunks
+    loss: str = "chunks"  # how the loss takes a head's logits: by chunks, or whole
     microbatches: Positive = 1
     # A step's new state takes the old one's memory: a lower peak, in fewer pieces.
     donate: bool = True

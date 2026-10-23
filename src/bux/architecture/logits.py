@@ -5,11 +5,11 @@ than its logits, and the loss takes what it needs of them (``HeadOutput.sums``):
 sums over positions of the cross-entropy, log Z minus the target's logit, and of log
 Z squared, each position weighted, by the run's method:
 
-    logits   one matmul for all positions, the logits whole in the stream's dtype:
-             the default
     chunks   the matmul, the logsumexp and the target's logit a chunk of positions at
              a time, in float32, as Liger's and Apple's Cut Cross-Entropy do, and the
-             chunk's gradients with them: the backward only scales those
+             chunk's gradients with them, so that the backward only scales those: the
+             default
+    logits   one matmul for all positions, the logits whole in the stream's dtype
 
 At a vocabulary of 128K, the float32 logits of 8 rows of 4096 tokens take 16 GB, and
 their gradient as much again; by chunks, each device takes its own positions in
