@@ -564,7 +564,9 @@ second, and the exposed communication of a step in ms of its time (the log's
 take 274 ms (XLA's windowed einsum; over memcpy, `--xla_gpu_use_memcpy_local_p2p`, the
 same). TP waits for its reduce-scatters (17 ms a step) and all-gathers (15 ms) at the
 boundaries of the matmuls they feed, which no schedule moves; it takes a collective
-matmul of one's own. `ragged_all_to_all` waits 610 ms a step for its 96 exchanges;
+matmul of one's own. `ragged_all_to_all` waits 610 ms a step for its 96 exchanges
+(of a slice a peer, before they went by expert and in pieces:
+[Expert parallelism](parallelism.md#expert-parallelism));
 with 4 rows a GPU its step runs out of memory under `default` (a temporary of 97 GiB)
 and fits under the others, at 55k against `all_to_all`'s 176k. FSDP's
 collectives take 14% of the step and hide all but 1.5% of it. A collective's time
