@@ -246,11 +246,12 @@ methods = methods(attention=ring)
 
 | method    | what it does                                                         |
 |-----------|----------------------------------------------------------------------|
-| `auto`    | the default: `tokamax` on a GPU (7x `xla`'s speed at t = 4096 on a B300), `xla` elsewhere and for sinks, and for what only `xla` has |
+| `auto`    | the default. On a GPU, the fastest kernel that takes the call on each device's whole rows: cuDNN's in rows of 8192 positions or more and with a window, else tokamax's. With `seq` over `context`, `ulysses` where `context` divides a device's heads, else `ring`. `xla` on a CPU, and for what only `xla` has |
 | `xla`     | all t by t logits at once. With `seq` over `context` a device has its queries' rows, and every key and value: all-gather CP |
-| `ring`    | each device keeps its queries, while the keys and values go round `context` a block at a time, by `ppermute`, into an online softmax; a block wholly ahead of the queries, or a window or more behind, is skipped. Its custom VJP sends them round again with their gradients, which then go home |
-| `ulysses` | all-to-alls over `context`, from a device's positions of every head to every position of its own heads; `xla` on those; and back. `context` must divide a device's heads; kv heads it does not divide are repeated |
-| `tokamax` | tokamax's flash attention (Mosaic, then Triton, then XLA), a document from its first token on as `k_start`, split by its `q_sharding`: all-gather CP in a kernel. No sinks; Linux only (the `cuda` extra) |
+| `cudnn`   | cuDNN's fused attention (jax's) on each device's whole rows, documents in its packed layout. bfloat16 or float16, keys' and values' head dims equal and up to 256 (its packed layout gets MLA's wrong); no soft cap, no sinks, no positions over `context` |
+| `tokamax` | tokamax's flash attention, its Mosaic kernels: a document and a window as each query's first key, sinks by the logsumexp. With `seq` over `context`, a device gathers every key and value and attends with its queries in one call: all-gather CP, whose backward pass does every block. Linux only (the `cuda` extra) |
+| `ring`    | every key and value gathered once over `context`, and a flash call (tokamax's; jnp's on a CPU) for each device's block of them, merged by their logsumexps. A block no query sees is skipped: one ahead of them all, or before every query's first key, its document's or its window's. Without documents the queries go zigzag, device `i` holding chunks `i` and `2c-1-i` of `2c`, so that every device attends to as much. The backward pass runs each block's kernel backward with the final output and logsumexp, and reduce-scatters the blocks' gradients |
+| `ulysses` | all-to-alls over `context`, from a device's positions of every head to every position of its own heads; `auto`'s kernel on those whole rows; and back. `context` must divide a device's heads; kv heads it does not divide are repeated |
 
 What only `xla` has stays in the layer: a mask of the keys each query keeps (an
 indexer's top-k, CSA's compressed latents), relative bias, length scale and attention
@@ -259,10 +260,34 @@ naming it, as a method does for a feature of the `AttentionArgs` it lacks. The i
 loss reads the attention's probabilities, which only `xla` makes; it comes with the
 indexer's top-k, so it is `xla`'s too.
 
-`ring` is a `shard_map` over `context` alone. `ulysses` is manual over every axis
-that splits q: an all-to-all in a `shard_map` of auto axes makes XLA gather every
-dimension they split, the rows too. Inside a `shard_map`, `shard` and `spec` leave
-out the axes it maps, so that a layer's constraints still hold there.
+`bux.parallel.flash` has the kernels. A `Kernel` attends to a block of keys: its
+forward pass returns each query's logsumexp beside its output, and its backward pass
+takes one. Given the output and logsumexp of a larger softmax, over more blocks or a
+sink beside the keys, one block's backward pass is that softmax's gradient through
+the block, as FlashAttention-2's recomputes `P = exp(s - lse)`. So `ring` merges blocks
+by their logsumexps (`flash.merge`), and a sink folds into one, `y = o exp(lse - L)`
+with `L = logaddexp(lse, sink)`, the backward pass run with `L` (`flash.attend`).
+tokamax's kernels are one such kernel (its VJP, given the residuals `(lse, 1)`), and
+`flash.JNP` the same in jnp, all t by s logits at once, which a CPU runs: with
+`flash.TOKAMAX = flash.JNP` the tests check `tokamax`'s and `auto`'s paths too. A new
+kernel is a `flash.Kernel(forward, backward)`.
+
+cuDNN's attention in jax neither returns nor takes a logsumexp, so it runs whole rows
+only. Its packed layout has room for a static number of documents a row, and its
+backward pass takes time in proportion, and 8 bytes for each position of each head's
+channels of each document's room: `context.documents_bound` makes room for up to t / 256
+and 2^30 such numbers (16 for 8 rows of 4096 or one of 32k), and a `lax.cond` gives a
+batch with a row of more documents to tokamax. In rows of 4096 that `lax.cond` costs a
+1.3B what cuDNN gains it (145k tok/s on a B300 either way), so `auto` takes cuDNN
+from rows of 8192 on: in rows of 16384 of packed documents, 1.3x tokamax's speed.
+
+Every kernel runs in a `shard_map` manual over every axis (`context.on_devices`),
+each device on its rows and heads: XLA cannot split a kernel's call, an all-to-all in
+a `shard_map` of auto axes makes XLA gather every dimension they split, and cuDNN's
+partitioner fails beside manual axes. Kernels need `check_vma=False`, under which the
+`shard_map` sums the sinks' gradient over the devices that share them. Inside a
+`shard_map`, `shard` and `spec` leave out the axes it maps, so that a layer's
+constraints still hold there.
 
 Another method is a function:
 
@@ -279,31 +304,73 @@ def _(q, k, v, args: AttentionArgs):
     return methods.attention.find("xla")(q, k, v, args)
 ```
 
-Measured on 8 CPU devices: two windowed GQA layers (4 heads, 2 kv heads) in a
-training step on packed rows train as on one device, to 1e-6 over 3 steps, by every
-method on `context=2, tensor=2`, `context=4, fsdp=2` and `context=8` (not `ulysses`
-there: 4 heads), and none makes XLA rematerialize an array in full. The collectives of
-the compiled step (all-gathers / all-reduces / collective-permutes / all-to-alls; a
+On a B300, in bfloat16, 16 heads and 8 kv heads of 128 dims, a forward and backward
+pass (ms):
+
+| kernel    | causal, 8 rows of 4096 | causal, 32k | 13 documents, 32k | window 4096, 32k |
+|-----------|-------|------|------|------|
+| `cudnn`   | 2.82  | 12.2 | 3.3  | 5.0  |
+| `tokamax` | 3.08  | 16.0 | 14.1 | 14.5 |
+
+cuDNN skips what no query sees, forward and backward; tokamax's backward pass skips
+only what is ahead of the queries, which a window as each query's first key keeps
+(its own window mask does every block: 29.2 ms). cuDNN's room for documents costs:
+the row of 13 takes 3.3 ms with room for 16, 3.9 for 32, 5.0 for 64 and 7.4 for 128.
+
+On 8 B300s, `context=8`, one row, 6 calls in a jit to spread the ~2.5 ms a call on 8
+GPUs takes, a forward and backward pass (ms):
+
+| t, documents   | one GPU's tokamax / 8 | `ulysses` | `ring` | `tokamax` |
+|----------------|------|----------|----------|------|
+| 32k, one       | 2.06 | **2.39** | 5.24     | 5.08 |
+| 128k, one      | 31.9 | **26.0** | 38.3     | 68.9 |
+| 32k, of 2048   | 1.71 | **1.89** | 2.29     | 4.48 |
+| 128k, of 2048  | 26.0 | 27.6     | **8.06** | 57.4 |
+
+`ulysses` runs cuDNN, but past its room for documents (64 of them in a row of 128k)
+tokamax, whose backward pass does every block; `ring` skips most blocks of packed rows
+on every device. The `ring` this one replaced sent the blocks round by ppermute (~85
+GB/s on a B300 node, an all-gather ~550) into an online softmax of their logits: 33.4
+and 440 ms causal.
+
+In a model, on 8 B300s: 8 layers of `d_model = 1024`, 16 heads and 8 kv heads of 128
+dims (218M), rows of 32k over `mesh(context=8)`, `remat=full`, 8 microbatches,
+bfloat16 (tok/s):
+
+| `methods.attention` | one document a row | packed documents (46 a row) |
+|---------------------|--------------------|-----------------------------|
+| `ulysses`, `auto`   | **252k**           | **273k**                    |
+| `ring`              | 175k               | 221k                        |
+| `tokamax`           | 200k               | 211k                        |
+
+With sinks, 243k by `ulysses` (tokamax's kernel), where `auto` took `xla` at 66k;
+`ulysses` ran `xla` at 96k, and the `ring` it replaced 75k. In a model `ulysses` is
+the faster even with 45% of the batches past cuDNN's room for documents, which
+tokamax then takes, so `auto` takes it; `ring` stays the method for longer packed
+rows, as at 128k above.
+
+On 8 CPU devices, two windowed GQA layers (4 heads, 2 kv heads) with sinks and a soft
+cap train on packed rows as on one device, to 1e-5 over 3 steps, by every method on
+`context=2, tensor=2` and `context=4, fsdp=2`, and none makes XLA rematerialize an
+array in full; on `context=8` too, every method's attention and its gradients are
+`xla`'s (not `ulysses`' with 4 heads). The collectives of the compiled step of two
+windowed layers (all-gathers / all-reduces / collective-permutes / all-to-alls; a
 collective in a loop counts once):
 
-| mesh                  | `xla`        | `ring`        | `ulysses`    | `tokamax`    |
-|-----------------------|--------------|---------------|--------------|--------------|
-| `context=2, tensor=2` | 12 / 12 / 4 / 4 | 12 / 10 / 10 / 4 | 5 / 10 / 4 / 20 | 10 / 14 / 5 / 8 |
-| `context=4, fsdp=2`   | 38 / 8 / 4 / 4  | 38 / 6 / 12 / 4  | 31 / 6 / 4 / 20 | 36 / 10 / 5 / 8 |
-| `context=8`           | 11 / 4 / 4 / 4  | 4 / 2 / 12 / 4   |                 | 9 / 6 / 5 / 8   |
+| mesh                  | `xla`           | `ring`          | `ulysses`       |
+|-----------------------|-----------------|-----------------|-----------------|
+| `context=2, tensor=2` | 10 / 20 / 4 / 4 | 8 / 20 / 5 / 8  | 3 / 20 / 4 / 20 |
+| `context=4, fsdp=2`   | 31 / 8 / 4 / 4  | 29 / 8 / 5 / 8  | 24 / 8 / 4 / 20 |
+| `context=8`           | 10 / 4 / 4 / 4  | 8 / 4 / 5 / 8   |                 |
 
-`xla` gathers each layer's keys and values whole; `ring` and `ulysses` gather no
-activation but the documents' ids (int32), and FSDP's parameters. A layer adds 4
-collective-permutes under `ring` (the blocks forward; the blocks and their gradients
-backward; the gradients home), 3 on `context=2`, where the backward pass shares the
-forward's one step, and 8 all-to-alls under `ulysses`. The temp memory of
-the gradient of one attention at t = 2048 on `context=4`: `xla` 66.0 MiB, `ulysses`
-64.5 MiB (whole rows of a quarter of the heads), `ring` 21.9 MiB (two blocks of keys).
-`tokamax` here is its XLA implementation; `scripts/gpu_smoke/attention.py` runs its
-kernels, and every method, on GPUs.
-
-Not yet: zigzag load balancing (device `c - 1` of the ring attends to `c` blocks,
-device 0 to one), and overlapping each block's transfer with its compute.
+`xla` and `ring` gather each layer's keys and values whole, `ring` once forward and
+once backward, where it reduce-scatters their gradients; with documents nothing goes
+round. `ulysses` gathers no activation but the documents' ids, and adds 8 all-to-alls
+a layer. The rest are FSDP's parameters, and int32 and boolean arrays of the
+documents' starts. The temp memory of the gradient of one attention at t = 2048 on
+`context=4`: `xla` 68.5 MiB, `ulysses` 81.0 MiB (whole rows of a quarter of the heads),
+`ring` 26.5 MiB (every block of keys, and no logits).
+`scripts/gpu_smoke/attention.py` runs every method by its GPU kernels against `xla`.
 
 ## The other layers
 

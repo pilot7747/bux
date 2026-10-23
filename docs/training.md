@@ -293,7 +293,7 @@ by itself where it cannot run:
 
 | what | by | on a B300, against XLA |
 |------|----|------------------------|
-| softmax attention | `methods.attention = auto`, the default: tokamax's flash attention | 7x, and no t × t logits |
+| softmax attention | `methods.attention = auto`, the default: cuDNN's fused attention in rows of 8192 or more and with a window, else tokamax's flash attention (sinks, a soft cap) | 7x, and no t × t logits |
 | linear attention, RWKV-7 | `chunkwise`: chunks of 64 positions, the state across them by a Pallas kernel (`affine_scan`) | 14-17x a scan over positions |
 | KDA with `gate_lower_bound`, DeltaNet | cuDNN's fused KDA kernel (`fused_delta`) | 13x `chunkwise` |
 | MoE experts | `grouped.ragged_dot`: tokamax's Mosaic and Triton kernels | 27x `jax.lax.ragged_dot` |
@@ -308,6 +308,14 @@ Tokens a second on B300s, 8 × 4096 tokens a GPU, `precision(compute=bfloat16)`:
 | KDA hybrid, `"KKKA"`        | 58k   |                   |
 | KDA with `gate_lower_bound=-5` | 108k |                |
 | MoE, 64 experts, top 8      | 103k  | 834k              |
+
+On packed documents (`best_fit` of documents of 16 to 4000 words, GPT-2 tokens), on
+one GPU, the 1.3B trains at 145k tok/s in rows of 4096 by tokamax's kernel, and at
+139k in rows of 16384 by cuDNN's, which skips every block no query sees, where
+tokamax's, whose backward pass does every block of a row, gives 109k (random tokens:
+111k and 101k). With sinks, 142k in rows of 4096, where `auto` took xla, whose t × t
+logits did not fit. Rows of 32k over 8 GPUs: docs/parallelism.md, "Context
+parallelism".
 
 Unlike these, a low-precision matmul format changes what a run computes, so it is a
 setting, `precision(matmuls=...)` (docs/parallelism.md, "Matmul formats"). On a B300,
