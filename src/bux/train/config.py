@@ -312,11 +312,16 @@ Pass = Literal["fprop", "dgrad", "wgrad"]
 PASSES: tuple[Pass, ...] = ("fprop", "dgrad", "wgrad")
 
 
-def _in_compute(fmt: str | None) -> str | None:
-    if fmt not in (None, "compute"):
+# The formats of bux.architecture.matmuls the routed experts' grouped GEMM multiplies
+# in (bux.architecture.grouped_blockscaled.RECIPES).
+GROUPED = ("compute", "mxfp8", "mxfp8_2d")
+
+
+def _grouped(fmt: str | None) -> str | None:
+    if fmt not in (None, *GROUPED):
         raise ValueError(
-            "the routed experts multiply in compute: a grouped block-scaled GEMM is "
-            "not in bux yet"
+            f"the routed experts multiply in {', '.join(GROUPED)}: bux has no grouped "
+            f"GEMM in {fmt}"
         )
     return fmt
 
@@ -335,8 +340,9 @@ class RolesConfig(Config):
     kv: str | None = None  # attention's keys and values
     o: str | None = None  # attention's output projection
     mlp: str | None = None  # MLPs, the shared experts' too
-    # The routed experts, in compute until bux has a grouped block-scaled GEMM.
-    experts: Annotated[str | None, AfterValidator(_in_compute)] = None
+    # The routed experts: one of GROUPED; none is compute, not `matmuls`, as their
+    # grouped MXFP8 GEMM is slower than bfloat16's (docs/parallelism.md).
+    experts: Annotated[str | None, AfterValidator(_grouped)] = None
     latent: str | None = None  # LatentMoE's projections to and from its latent
     recurrence: str | None = None  # the recurrent mixers' projections, but the output
     recurrence_out: str | None = None  # their output projection, Mamba's out_proj
@@ -379,6 +385,9 @@ class PrecisionConfig(Config):
     # The dtype gradients are summed over the batch's rows in: compute, or float32 as
     # Megatron's are, which a step sums once (methods.accumulate = unreduced).
     reduce: Literal["compute", "float32"] = "compute"
+    # What the ragged MoE methods send tokens to their experts in: compute, or MXFP8
+    # (DeepSeek-V3's FP8 dispatch); what comes back, and gradients, go in compute.
+    dispatch: Literal["compute", "mxfp8"] = "compute"
 
 
 # --- Parallelism -----------------------------------------------------------------------

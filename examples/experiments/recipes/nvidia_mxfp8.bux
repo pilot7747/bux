@@ -6,6 +6,6 @@
 #   use llama3_8b
 #   use nvidia_mxfp8
 #
-# Left out: MXFP8 routed experts, which stay in bfloat16 until bux has a grouped
-# block-scaled GEMM.
+# Left out: MXFP8 routed experts, which stay in bfloat16: bux's grouped MXFP8 GEMM
+# trains slower than bfloat16's (precision.roles.experts = mxfp8 takes it).
 precision = precision(compute=bfloat16, matmuls=mxfp8)

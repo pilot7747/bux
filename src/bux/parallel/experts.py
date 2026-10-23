@@ -17,6 +17,7 @@ enter split over the experts' axes and whole over the others (FSDP's gathered
 first); `tensor` stays Auto. Routing, the balance loss and the router bias ran
 before, in the global view. `methods.capacity` bounds the rows a device of all but
 all_to_all takes, and the picks its experts run, at that many times its own picks.
+The ragged methods send tokens in `precision.dispatch`: compute, or MXFP8.
 """
 
 import functools
@@ -27,9 +28,12 @@ from typing import NamedTuple
 import jax
 import jax.numpy as jnp
 from jax.sharding import PartitionSpec as P
-from jaxtyping import Array, Bool, Float, Int, Shaped
+from jaxtyping import Array, Bool, Float, Int, Shaped, UInt8
 
 from bux import config as cfg
+from bux.architecture import blockscaled, matmuls, remat
+from bux.architecture.blockscaled import Blocks
+from bux.architecture.grouped_blockscaled import dequantized
 from bux.architecture.moe import (
     Kernels,
     MoE,
@@ -56,6 +60,9 @@ Routed = tuple[Float[Array, "b t d"], Float[Array, ""]]
 Body = Callable[..., Routed]
 # jax.lax.ragged_all_to_all's signature: another exchange is a function.
 Exchange = Callable[..., Shaped[Array, "m d"]]
+# What the ragged exchanges send and bring back, which `dots` keeps (``remat``): else
+# its backward would exchange them again.
+EXCHANGED = "experts.exchanged"
 # The pieces a ragged exchange sends in, at least: XLA's one-shot kernel on a node
 # copies each with one block of 128 threads, ~90 GB/s with 64 on 8 B300s.
 PIECES = 2048
@@ -328,10 +335,101 @@ def _in_pieces(slices: Ragged, parts: int) -> Ragged:
 def _exchanged(
     exchange: Exchange, x: Shaped[Array, "n e"], rows: int, slices: Ragged, axes: Axes
 ) -> Shaped[Array, "rows e"]:
-    """Return what `slices` send of x, in `rows` rows. XLA's kernel copies each slice
-    with one block of threads, so the slices go in PIECES pieces in all."""
+    """Return what `slices` send of x, in `rows` rows."""
+    return _exchanged_into(exchange, x, _buffer(rows, x), slices, axes)
+
+
+def _exchanged_into(
+    exchange: Exchange,
+    x: Shaped[Array, "n e"],
+    into: Shaped[Array, "m e"],
+    slices: Ragged,
+    axes: Axes,
+) -> Shaped[Array, "m e"]:
+    """Return `into` with what `slices` send of x in it. XLA's kernel copies each
+    slice with one block of threads, so the slices go in PIECES pieces in all."""
     parts = max(1, PIECES // slices.send_sizes.size)
-    return exchange(x, _buffer(rows, x), *_in_pieces(slices, parts), axis_name=axes)
+    return exchange(x, into, *_in_pieces(slices, parts), axis_name=axes)
+
+
+def _reversed(slices: Ragged, axes: Axes) -> Ragged:
+    """Return the exchange that sends back what `slices` send, each row where it came
+    from: what a ragged all-to-all's transpose sends, as jax's."""
+    swap = functools.partial(
+        jax.lax.all_to_all, axis_name=axes, split_axis=0, concat_axis=0, tiled=True
+    )
+    return Ragged(
+        swap(slices.output_offsets),
+        slices.recv_sizes,
+        swap(slices.input_offsets),
+        slices.send_sizes,
+    )
+
+
+def _dispatched(
+    exchange: Exchange, x: Float[Array, "n d"], rows: int, slices: Ragged, axes: Axes
+) -> Float[Array, "rows d"]:
+    """Return what `slices` send of the tokens x, in `rows` rows, as `_exchanged`
+    does: in MXFP8 where `precision.dispatch` says and x's rows are whole blocks, back
+    in x's dtype where they arrive."""
+    if matmuls.in_force().dispatch == "compute" or x.shape[-1] % blockscaled.MX_BLOCK:
+        return _exchanged(exchange, x, rows, slices, axes)
+    return _in_mxfp8(exchange, rows, axes, x.shape, x, slices)
+
+
+@functools.partial(jax.custom_vjp, nondiff_argnums=(0, 1, 2, 3))
+def _in_mxfp8(
+    exchange: Exchange,
+    rows: int,
+    axes: Axes,
+    shape: tuple[int, int],
+    x: Float[Array, "n d"],
+    slices: Ragged,
+) -> Float[Array, "rows d"]:
+    """Return `_exchanged` of x sent in MXFP8, E4M3 values and a power-of-two scale
+    per 32: a row of d + d / 32 bytes a token, about half of bfloat16's. Its gradient
+    is `_exchanged`'s, in the gradient's dtype."""
+    blocks = blockscaled.mx_quantize(x)
+    packed = jnp.concatenate([_bytes(blocks.values), _bytes(blocks.scales)], axis=-1)
+    arrived = _exchanged(exchange, packed, rows, slices, axes)
+    return _unpacked(arrived, shape[-1]).astype(x.dtype)
+
+
+def _in_mxfp8_forward(
+    exchange: Exchange,
+    rows: int,
+    axes: Axes,
+    shape: tuple[int, int],
+    x: Float[Array, "n d"],
+    slices: Ragged,
+) -> tuple[Float[Array, "rows d"], Ragged]:
+    return _in_mxfp8(exchange, rows, axes, shape, x, slices), slices
+
+
+def _in_mxfp8_backward(
+    exchange: Exchange,
+    rows: int,
+    axes: Axes,
+    shape: tuple[int, int],
+    slices: Ragged,
+    g: Float[Array, "rows d"],
+) -> tuple[Float[Array, "n d"], None]:
+    zeros = jnp.zeros(shape, g.dtype)  # what is not sent has no gradient
+    return _exchanged_into(exchange, g, zeros, _reversed(slices, axes), axes), None
+
+
+_in_mxfp8.defvjp(_in_mxfp8_forward, _in_mxfp8_backward)
+
+
+def _bytes(x: Shaped[Array, "*s"]) -> UInt8[Array, "*s"]:
+    return jax.lax.bitcast_convert_type(x, jnp.uint8)
+
+
+def _unpacked(packed: UInt8[Array, "m e"], d: int) -> Float[Array, "m d"]:
+    """Return the tokens of `packed`, E4M3 values then their scales, dequantized."""
+    values = jax.lax.bitcast_convert_type(packed[:, :d], jnp.float8_e4m3fn)
+    scales = jax.lax.bitcast_convert_type(packed[:, d:], jnp.float8_e8m0fnu)
+    return dequantized(Blocks(values, scales, None))
 
 
 def ragged(
@@ -359,10 +457,11 @@ def ragged(
     slices = _slices(every, rows)
     sent = _dispatch(slices, starts[device], device)
     picks = pick_rows(z.reshape(-1, d), order, back, k)
-    arrived = _exchanged(exchange, picks, rows, sent, axes)
+    arrived = remat.label(EXCHANGED, _dispatched(exchange, picks, rows, sent, axes))
     made = experts(arrived, slices.kept[device].sum(1), *kernels, ffn, norm)
     theirs = jax.lax.dynamic_slice_in_dim(starts, device * local, local, axis=1)
-    returned = _exchanged(exchange, made, n, _combine(slices, theirs, device), axes)
+    back_there = _combine(slices, theirs, device)
+    returned = remat.label(EXCHANGED, _exchanged(exchange, made, n, back_there, axes))
     kept = _came_back(sent, idx.reshape(-1)[order])
     per_pick = permuted(jnp.where(kept[:, None], returned, 0), back, order)
     y = jnp.einsum("btkd,btk->btd", per_pick.reshape(*idx.shape, d), weights)
@@ -422,16 +521,18 @@ def tokens(
     sent = _dispatch(slices, starts[device], device)
 
     def send(a: Shaped[Array, "n e"]) -> Shaped[Array, "rows e"]:
-        return _exchanged(exchange, a, rows, sent, axes)
+        return remat.label(EXCHANGED, _exchanged(exchange, a, rows, sent, axes))
 
-    x = send(pick_rows(z.reshape(-1, d), order, back, k))
+    tokens = pick_rows(z.reshape(-1, d), order, back, k)
+    x = remat.label(EXCHANGED, _dispatched(exchange, tokens, rows, sent, axes))
     choices = _picked_there(idx.reshape(-1, k), weights.reshape(-1, k), local)
     picked, chosen = (send(a[order]) for a in choices)
     came = (jnp.arange(rows) < slices.kept[device].sum())[:, None]
     picked, chosen = jnp.where(came, picked, local), jnp.where(came, chosen, 0)
     made, ran = _run_first(x, picked, chosen, kernels, ffn, norm, room)
     theirs = jax.lax.dynamic_slice_in_dim(starts, device, 1, axis=1)
-    returned = _exchanged(exchange, made, n, _combine(slices, theirs, device), axes)
+    back_there = _combine(slices, theirs, device)
+    returned = remat.label(EXCHANGED, _exchanged(exchange, made, n, back_there, axes))
     gone = visit.reshape(-1)[order]  # where each visit went, sorted
     kept = (gone < peers) & _came_back(sent, gone)
     y = sum_rows(jnp.where(kept[:, None], returned, 0), back, order, k)

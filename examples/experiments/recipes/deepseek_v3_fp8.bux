@@ -1,11 +1,14 @@
 # DeepSeek-V3's FP8 training (DeepSeek-AI, 2024), as near as cuDNN's block-scaled GEMM
 # takes it: E4M3 everywhere, the gradients too, activations scaled along their rows and
 # weights by square tiles, so that y and dx see the same W; the embedding, the head,
-# the router, norms and softmax attention's own matmuls in bfloat16; and AdamW's
-# moments in bfloat16.
+# the router, norms and softmax attention's own matmuls in bfloat16; the tokens sent to
+# their experts in FP8, and what comes back in bfloat16; and AdamW's moments in
+# bfloat16.
 #
 # Left out: their groups of 1 x 128 and 128 x 128 with float32 scales, for MXFP8's
 # 1 x 32 and 32 x 32 with power-of-two ones; their float32 promotion every 128 of k,
 # for Hopper's FP8 accumulation, where Blackwell's accumulates in float32; FP8 routed
-# experts, which stay in bfloat16; and the activations they keep and send in FP8.
-precision = precision(compute=bfloat16, matmuls=mxfp8_2d, moments=bfloat16)
+# experts, which stay in bfloat16, as bux's grouped MXFP8 GEMM is slower
+# (precision.roles.experts = mxfp8_2d takes it); and the activations they keep in FP8.
+precision = precision(compute=bfloat16, matmuls=mxfp8_2d, moments=bfloat16,
+                      dispatch=mxfp8)

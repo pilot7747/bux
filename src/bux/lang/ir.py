@@ -216,6 +216,7 @@ _NEWER_FIELDS = {
             mode="json", include={"roles", "first", "last", "passes", "switch"}
         ),
         "moments": "float32",
+        "dispatch": "compute",
     },
     "optimizer": {"ns_coefficients": "jordan", "ns_dtype": "float32"},
 }

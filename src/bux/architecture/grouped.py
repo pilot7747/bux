@@ -99,7 +99,7 @@ def _backward(
 ) -> tuple[Float[Array, "m d"], Float[Array, "g d f"], None]:
     x, w, sizes = saved
     dx = _grouped_dot(dy, jnp.swapaxes(w, 1, 2), sizes).astype(x.dtype)
-    dw = _weight_grad(x, dy, sizes).astype(w.dtype)
+    dw = weight_grad(x, dy, sizes).astype(w.dtype)
     return _vary_like(dx, x), _vary_like(dw, w), None
 
 
@@ -112,7 +112,17 @@ def _vary_like(
     return jax.lax.pcast(grad, more, to="varying") if more else grad
 
 
-def _weight_grad(
+def dot(
+    x: Float[Array, "m d"], w: Float[Array, "g d f"], sizes: Int[Array, " g"]
+) -> Float[Array, "m f"]:
+    """Return `ragged_dot` by the kernels, with no VJP of its own: a step of
+    another's."""
+    return (
+        _grouped_dot(x, w, sizes) if kernels.gpu() else jax.lax.ragged_dot(x, w, sizes)
+    )
+
+
+def weight_grad(
     x: Float[Array, "m d"], dy: Float[Array, "m f"], sizes: Int[Array, " g"]
 ) -> Float[Array, "g d f"]:
     """Return dW, x^T dy per group: by tokamax's Triton kernel, 1.7 times as fast as

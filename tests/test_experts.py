@@ -6,6 +6,7 @@ import importlib.util
 import itertools
 import math
 from pathlib import Path
+from typing import Literal
 
 import jax
 import jax.numpy as jnp
@@ -17,7 +18,7 @@ from jaxtyping import Array, Bool, Float, Int, Shaped
 
 from bux import config as cfg
 from bux import parallel
-from bux.architecture import Model, Taps
+from bux.architecture import Model, Taps, blockscaled, grouped_blockscaled, matmuls
 from bux.architecture.moe import MoE, routed
 from bux.lang import compile
 from bux.parallel import experts, methods
@@ -311,6 +312,66 @@ def test_what_the_buffers_held_before_the_exchange_never_shows(
     assert_close((y, grads), (want, want_grads))
 
 
+# --- FP8 dispatch ----------------------------------------------------------------------
+
+WIDE = 64  # whole blocks of 32, which MXFP8 takes
+
+
+def _quantized(z: Float[Array, "*s d"]) -> Float[Array, "*s d"]:
+    """z in MXFP8 and back, its gradient as z's."""
+    back = grouped_blockscaled.dequantized(blockscaled.mx_quantize(z.reshape(-1, WIDE)))
+    return z + jax.lax.stop_gradient(back.reshape(z.shape) - z)
+
+
+@functools.cache
+def _dispatched(method: str, mesh: str, dispatch: Literal["compute", "mxfp8"]):
+    """The layer's output and gradients, as `_outputs`, at WIDE, its tokens sent in
+    `dispatch`."""
+    x = jax.random.normal(jax.random.key(1), (8, 4, WIDE))
+    probe = jax.random.normal(jax.random.key(2), x.shape)
+    config = cfg.MoEConfig(num_experts=8, top_k=2, expert=GATED)
+    with split(method, mesh), matmuls.use(tcfg.PrecisionConfig(dispatch=dispatch)):
+        e = parallel.build(lambda: MoE(config, WIDE, nnx.Rngs(0)))
+        y = nnx.jit(lambda e, x: e(x, Taps()))(e, x)
+        grads = nnx.jit(nnx.grad(_loss, argnums=(0, 1)))(e, x, probe)
+        return jax.device_get((y, grads))
+
+
+@pytest.mark.parametrize("mesh", ["data=2, fsdp=2, expert=2", GROUPED])
+@pytest.mark.parametrize("method", RAGGEDS)
+def test_a_dispatch_in_mxfp8_computes_what_sorted_does_of_its_tokens_quantized(
+    monkeypatch, method, mesh
+):
+    """Its gradient is the exchange's, as if the tokens went unquantized."""
+
+    def run(moe, z, idx, weights, taps=None):
+        kernels, ffn = moe.kernels(), moe.config.expert
+        return routed(_quantized(z), idx, weights, *kernels, ffn, moe.expert_norm)
+
+    monkeypatch.setitem(methods.moe.builders, "quantized", run)
+    want = _dispatched("quantized", "one device", "compute")
+    got = _dispatched(method, mesh, "mxfp8")
+    assert_close(got, want)
+    assert not np.allclose(got[0], _dispatched(method, mesh, "compute")[0])
+
+
+def test_a_dispatch_in_mxfp8_sends_a_byte_a_value_and_one_a_scale_of_32():
+    x = jax.random.normal(jax.random.key(1), (8, 4, WIDE))
+    config = cfg.MoEConfig(num_experts=8, top_k=2, expert=GATED)
+    precision = tcfg.PrecisionConfig(dispatch="mxfp8")
+    with split(RAGGED, "fsdp=2, expert=4"), matmuls.use(precision):
+        e = parallel.build(lambda: MoE(config, WIDE, nnx.Rngs(0)))
+        loss = nnx.grad(lambda e, x: e(x, Taps()).sum(), argnums=(0, 1))
+        lowered = nnx.jit(loss).lower(e, x).as_text()
+    exchanges = [line for line in lowered.splitlines() if "@ragged_all_to_all" in line]
+    sent = [line.split(" : (")[1].split(",")[0] for line in exchanges]
+    # Forward, there in bytes and back; backward, both ways in float32.
+    assert sorted(sent) == sorted(
+        [f"tensor<8x{WIDE + WIDE // 32}xui8>"]
+        + ["tensor<32x64xf32>", "tensor<8x64xf32>", "tensor<32x64xf32>"]
+    )
+
+
 # --- Training --------------------------------------------------------------------------
 
 ARCH = """
@@ -325,6 +386,30 @@ experts = moe(num_experts=8, top_k=2, num_shared_experts=1, shared_expert_gate=t
               expert=gated_mlp(intermediate_size=64, activation=swish))
 model = embed [norm attn] [norm experts] [norm attn] [norm experts] norm head
 """
+
+
+# Of each of ARCH's 2 MoEs: forward there and back, backward the transposes; and the
+# forward's again, under a policy that keeps none of what they bring.
+@pytest.mark.parametrize(
+    ("remat", "exchanges"), [("none", 4), ("dots", 4), ("full", 6)]
+)
+def test_dots_keeps_what_the_ragged_exchanges_bring_and_runs_none_again(
+    remat, exchanges
+):
+    how = tcfg.MethodsConfig(moe=RAGGED, remat=remat)
+    with parallel.use(tcfg.MeshConfig(fsdp=2, expert=4), methods=how):
+        model = parallel.build(lambda: Model(compile(ARCH), rngs=nnx.Rngs(0)))
+        graphdef, params, rest = nnx.split(model, nnx.Param, ...)
+        tokens = jnp.zeros((8, 16), jnp.int32)
+
+        def grads(params: nnx.State, rest: nnx.State) -> nnx.State:
+            m = nnx.merge(graphdef, params, rest)
+            return nnx.grad(lambda m: m(tokens).mean())(m)
+
+        text = jax.jit(grads).lower(params, rest).as_text()
+    assert text.count("@ragged_all_to_all") == 2 * exchanges
+
+
 TRAINING = [
     "mesh(data=2, fsdp=2, expert=2)",
     "mesh(fsdp=2, expert=4)",

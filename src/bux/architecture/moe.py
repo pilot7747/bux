@@ -21,6 +21,7 @@ from jaxtyping import Array, Float, Int
 
 from bux import config as cfg
 from bux import parallel
+from bux.architecture import grouped_blockscaled, matmuls
 from bux.architecture.grouped import ragged_dot
 from bux.architecture.mlp import MLP, activate
 from bux.architecture.norm import Norm
@@ -82,16 +83,37 @@ def experts(
     by expert: the first sizes[0] are expert 0's, the next sizes[1] expert 1's, and so
     on; rows past them come out 0 before `norm`. It depends on its arguments alone, so
     it runs on one device's experts in a shard_map as it does on all of them. Its
-    products are named `experts` (``remat``)."""
+    products are named `experts` (``remat``), and multiply in the experts' format
+    (``experts_format``): by ``grouped_blockscaled`` in one of its RECIPES, there up
+    and gate as one, else in compute."""
+    recipe = grouped_blockscaled.RECIPES.get(experts_format())
 
     def product(
         x: Float[Array, "n e"], w: Float[Array, "E e f"]
     ) -> Float[Array, "n f"]:
-        return checkpoint_name(ragged_dot(x, w, sizes), "experts")
+        if recipe is None or not grouped_blockscaled.fits(x, w):
+            return checkpoint_name(ragged_dot(x, w, sizes), "experts")
+        precision, seed = matmuls.in_force(), matmuls.seed()
+        y = grouped_blockscaled.ragged_dot(x, w, sizes, recipe, seed, precision.passes)
+        return checkpoint_name(y, "experts")
 
-    g = None if gate is None else product(x, gate)
-    y = product(activate(ffn, product(x, up), g), down)
+    if gate is not None and recipe is not None and grouped_blockscaled.fits(x, up):
+        # One GEMM for both: x quantizes once.
+        u, g = jnp.split(product(x, jnp.concatenate([up, gate], -1)), 2, axis=-1)
+    else:
+        u, g = product(x, up), None if gate is None else product(x, gate)
+    y = product(activate(ffn, u, g), down)
     return y if norm is None else norm(y)
+
+
+def experts_format() -> str:
+    """Return the format the routed experts multiply in, in the branch that is
+    tracing: their role's (``matmuls.format_of``), or compute where `roles.experts` is
+    none. Unlike the other roles, they take no format from `matmuls`: on B300s their
+    grouped MXFP8 GEMM trains the baseline's MoE slower than bfloat16 does."""
+    if matmuls.in_force().roles.experts is None:
+        return "compute"
+    return matmuls.format_of("experts")
 
 
 def sort_by_expert(

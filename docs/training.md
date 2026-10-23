@@ -180,7 +180,7 @@ Four settings choose which projections, and when:
   | `recurrence` | the linear attentions', RWKV-7's and Mamba's projections, but the output |
   | `recurrence_out` | their output projection |
   | `mtp` | nextn's projection, and every branch after the first head |
-  | `experts` | the routed experts: `compute` only, until bux has a grouped block-scaled GEMM |
+  | `experts` | the routed experts, by a grouped GEMM: `compute`, `mxfp8` or `mxfp8_2d`; `none` is compute, not `matmuls`, as theirs is slower than bfloat16's (docs/parallelism.md) |
 
   The embedding, the head, the router and softmax attention's own matmuls always
   stay in compute.
@@ -197,8 +197,10 @@ Four settings choose which projections, and when:
   18%, here, and all of it with `passes=[]`.
 
 `eval=compute` evaluates in compute, whatever training multiplies in, and is not in
-the run's id. `moments=bfloat16` keeps the optimizer's moments in bfloat16 between
-steps, as DeepSeek-V3's AdamW does, and updates them in float32. Rounded to nearest,
+the run's id. `dispatch=mxfp8` has the ragged MoE methods send the tokens to their
+experts in MXFP8, as DeepSeek-V3 does, and what comes back in compute
+(docs/parallelism.md, "FP8 dispatch"). `moments=bfloat16` keeps the optimizer's
+moments in bfloat16 between steps, as DeepSeek-V3's AdamW does, and updates them in float32. Rounded to nearest,
 a moment ignores a change below 2^-9 of itself: at b2 = 0.95, a square gradient 4%
 off the second moment moves it, at 0.999 only one 3x off.
 
@@ -212,10 +214,10 @@ precision.last = 4 | 8
 
 | recipe | precision | left out |
 |--------|-----------|----------|
-| `nvidia_mxfp8` | Transformer Engine's MXFP8: E4M3 everywhere, gradients too | MXFP8 routed experts |
+| `nvidia_mxfp8` | Transformer Engine's MXFP8: E4M3 everywhere, gradients too | MXFP8 routed experts, which are slower in bux |
 | `nvidia_nvfp4` | NVIDIA's NVFP4 pretraining: W in 16 x 16 tiles, dy rounded stochastically, a Hadamard transform for dW; `first=2, last=8` | NVFP4 routed experts, and its speed: bux quantizes NVFP4 in XLA |
 | `nemotron3_nvfp4` | NVFP4, `recurrence_out` in MXFP8, and `q`, `kv`, `o`, `latent`, `mtp` and the last 15% in bfloat16 | NVFP4 routed experts, most of its matmuls |
-| `deepseek_v3_fp8` | `mxfp8_2d`, moments in bfloat16 | groups of 128 with float32 scales, the float32 promotion, FP8 routed experts and activations |
+| `deepseek_v3_fp8` | `mxfp8_2d`, the tokens sent to the routed experts in MXFP8, moments in bfloat16 | groups of 128 with float32 scales, the float32 promotion, FP8 routed experts, activations kept in FP8 |
 | `torchtitan_mxfp8` | `mxfp8_2d` | MXFP8 routed experts, and saving a linear's input in bfloat16 |
 
 On one B300 each, the 1.3B Llama-style model trained 3000 steps of 8 x 4096 tokens of
@@ -237,6 +239,12 @@ seeds differ by 1.6%:
 
 NVIDIA measured 1.5% at the end of 10T tokens on a 12B, against FP8, and 0.5% with
 the switch.
+
+The baseline's MoE (64 experts, top-8, 16 layers of `d_model` 2048) trained the same
+3000 steps on two B300s a run, its experts split over them (`ragged_all_to_all`, no
+capacity). With `roles=roles(experts=mxfp8)` and `dispatch=mxfp8` its held-out loss is
+0.13% and 0.05% below bfloat16's at seeds 0 and 1, where the seeds differ by 1.65%;
+it trains at 105k tokens a second against 127k, in 75 GiB against 89.
 
 ## Data
 
