@@ -29,13 +29,16 @@ from bux.parallel import methods
 
 methods.remat.register("none")(jax.checkpoint_policies.everything_saveable)
 methods.remat.register("full")(jax.checkpoint_policies.nothing_saveable)
-methods.remat.register("dots")(jax.checkpoint_policies.dots_saveable)
-methods.remat.register("dots_no_batch")(
-    jax.checkpoint_policies.dots_with_no_batch_dims_saveable
-)
-
 MIXERS = ("attention", "recurrence")  # what the *_attention methods keep
 _names = jax.checkpoint_policies.save_only_these_names
+_or = jax.checkpoint_policies.save_from_both_policies
+# The experts' grouped products are no dot_general, so the dots keep them by name.
+methods.remat.register("dots")(
+    _or(jax.checkpoint_policies.dots_saveable, _names("experts"))
+)
+methods.remat.register("dots_no_batch")(
+    _or(jax.checkpoint_policies.dots_with_no_batch_dims_saveable, _names("experts"))
+)
 methods.remat.register("save_attention")(_names(*MIXERS))
 methods.remat.register("save_qkv_attention")(_names(*MIXERS, "qkv"))
 methods.remat.register("dots_attention")(

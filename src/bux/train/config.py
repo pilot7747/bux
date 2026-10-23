@@ -365,6 +365,9 @@ class MethodsConfig(Config):
     type: Literal["methods"] = "methods"
     attention: str = "auto"
     moe: str = "sorted"
+    # The rows a device of ragged_all_to_all takes, a multiple of the picks it sends;
+    # what does not fit drops, which `dropped` reports. None: as many as could come.
+    capacity: Annotated[float, Field(gt=0)] | None = None
     recurrence: str = "scan"
     repeat: str = "unroll"
     remat: Annotated[str, BeforeValidator(_named_none)] = "none"

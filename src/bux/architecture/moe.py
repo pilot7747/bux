@@ -264,7 +264,7 @@ class MoE(nnx.Module):
 
     def __call__(self, x: Float[Array, "b t d"], taps: Taps) -> Float[Array, "b t d"]:
         idx, weights, sinks = self._route(x, taps)
-        y = parallel.method("moe")(self, self._latent(x), idx, weights)
+        y = parallel.method("moe")(self, self._latent(x), idx, weights, taps)
         if self.latent_output_norm is not None:
             y = self.latent_output_norm(y)
         if self.from_latent is not None:
@@ -358,7 +358,7 @@ class MoE(nnx.Module):
         return y
 
 
-# --- Methods: (moe, z, idx, weights) -> the routed sum, in the experts' width -------
+# --- Methods: (moe, z, idx, weights, taps) -> the routed sum, in the experts' width -
 
 
 @methods.moe.register("dense")
@@ -367,6 +367,7 @@ def run_dense(
     z: Float[Array, "b t d"],
     idx: Int[Array, "b t k"],
     weights: Float[Array, "b t k"],
+    taps: Taps | None = None,
 ) -> Float[Array, "b t d"]:
     """Run every expert on every token and weight the outputs by the router: the
     reference. Each device runs every expert on its own tokens."""
@@ -392,6 +393,7 @@ def run_sorted(
     z: Float[Array, "b t d"],
     idx: Int[Array, "b t k"],
     weights: Float[Array, "b t k"],
+    taps: Taps | None = None,
 ) -> Float[Array, "b t d"]:
     """Run each expert on its own rows (``routed``), each device on its own tokens
     with every expert's kernels: a shard_map over the axes that split the tokens, so
