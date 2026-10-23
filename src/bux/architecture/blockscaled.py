@@ -9,8 +9,8 @@ k for y, dy along n for dx and along m for dW. The forward keeps x's and W's sec
 copies for the backward, in the format, rather than x and W. Only the GEMMs named in
 `passes` multiply in the format, the others in the dtype of their operands, which the
 forward then keeps as they are. ``matmuls`` registers a format per recipe: `mxfp8`,
-`mxfp8_2d` and `nvfp4`. A seed, which the trainer draws from each batch, seeds what
-rounds stochastically.
+`mxfp8_2d` and `nvfp4` (``nvfp4``). A seed, which the trainer draws from each batch,
+seeds what rounds stochastically.
 """
 
 from collections.abc import Callable
@@ -354,6 +354,7 @@ MXFP8_2D = Recipe(MX_BLOCK, mx_twice, mx_tiles_twice, mx_twice)
 
 
 # --- NVFP4 --------------------------------------------------------------------------
+# By XLA: the reference of NVFP4's kernels (``nvfp4``), and its format off a GPU.
 
 NV_BLOCK = 16
 # A random Hadamard transform of 16 along the rows dW contracts: orthogonal, so it
@@ -455,12 +456,17 @@ def nv_values(
 def round_stochastically(
     v: Float[Array, "*s"], u: Float[Array, "*s"]
 ) -> Float[Array, "*s"]:
-    """Return v at one of the two E2M1 values around it, the upper with odds of how
-    far v is above the lower, given uniform noise u in [0, 1)."""
+    """Return v at one of the two E2M1 values around it, given noise u in [0, 1) in
+    8 bits: the upper where u and how far v is above the lower, in steps between them
+    and rounded up to 8 bits, add up to 1, as Blackwell's stochastic conversion
+    rounds. So the upper's odds are how far v is above the lower, to 1/256 of a step."""
     size = jnp.abs(v)
     step = jnp.where(size < 2, 0.5, jnp.where(size < 4, 1.0, 2.0))
     steps = jnp.where(size < 2, 2.0, jnp.where(size < 4, 1.0, 0.5))  # 1 / step, exactly
-    return jnp.sign(v) * jnp.minimum(jnp.floor(size * steps + u) * step, E2M1)
+    lower = jnp.floor(size * steps)
+    above = jnp.ceil((size * steps - lower) * 256) * 2.0**-8
+    rounded = jnp.where(above + u >= 1, lower + 1, lower) * step
+    return jnp.sign(v) * jnp.minimum(rounded, E2M1)
 
 
 def _noise(

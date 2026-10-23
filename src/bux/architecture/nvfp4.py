@@ -13,9 +13,10 @@ same for W and W^T, untransformed, and its largest magnitude is XLA's: a weight 
 small next to the activations.
 
 Off a GPU the kernels run interpreted, the conversions by their arithmetic, and
-quantize as XLA does, bit for bit. On one Triton divides within 2 ulps, not exactly,
-and a value within as much of a midpoint between E2M1's values may round the other
-way.
+quantize as XLA does, bit for bit. On a B300 they round x and W as XLA does there, bit
+for bit, and 0.15% of the values a step apart from XLA on a CPU: a GPU divides within
+an ulp of the CPU, and the scales' few bits put many values on the midpoints between
+E2M1's.
 """
 
 from collections.abc import Callable

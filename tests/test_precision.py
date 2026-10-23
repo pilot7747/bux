@@ -299,6 +299,15 @@ def test_nvfp4_rounds_gradients_stochastically_and_unbiased():
     assert float(values(stochastic=True).mean()) == pytest.approx(5.0, rel=0.01)
 
 
+def test_stochastic_rounding_rounds_as_blackwells_conversion_does():
+    # As a B300's cvt.rs rounded them: up where a value's fraction of a step, rounded
+    # up to 8 bits, and its random byte add up to 1, so also where they fall just short.
+    v = jnp.array([0.771353, -2.656003, -3.879317, 1.25, 1.25, 1.125, 1.125])
+    byte = jnp.array([117, 88, 30, 127, 128, 191, 192])
+    rounded = blockscaled.round_stochastically(v, byte * 2.0**-8)
+    assert rounded.tolist() == [1.0, -3.0, -4.0, 1.0, 1.5, 1.0, 1.5]
+
+
 def test_the_hadamard_transform_is_orthogonal():
     h = blockscaled.HADAMARD
     assert np.allclose(h @ h.T, np.eye(16), atol=1e-6) and set(np.abs(h).flat) == {0.25}
