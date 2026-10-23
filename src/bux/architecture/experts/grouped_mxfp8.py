@@ -41,7 +41,7 @@ from bux.architecture.precision.blockscaled import MX_BLOCK, Blocks
 E8M0 = jnp.float8_e8m0fnu
 LANES = 128  # tensor memory's rows: a tile's, and a tile of scales'
 SCALE_TILE = 4  # scales to a row of a tile of scales: 128 values of k
-EPILOGUE = 64  # columns of the accumulator the store takes at a time
+EPILOGUE = (64, 32)  # columns the store takes at a time: the most that n is whole of
 
 
 class Tiles(NamedTuple):
@@ -93,11 +93,12 @@ def rows(
     (m, k), groups = a.values.shape, sizes.shape[0]
     matrices = _matrices(b.values, groups, stacked)
     n = matrices.shape[1 if stacked == "rows" else 0]
+    values, matrices = _whole_tiles_of_k(a.values), _whole_tiles_of_k(matrices)
     scales = (in_tensor_memory(a.scales), _matrix_scales(b.scales, groups, stacked))
     past = jnp.maximum(m - sizes.sum(), 0)[None].astype(sizes.dtype)
     at = tiles_of(jnp.concatenate([sizes, past]), m, tiles.height)
     kernel = _rows_kernel(m, n, k, at.shape[0], groups, stacked, jnp.dtype(out), tiles)
-    return kernel(a.values, matrices, *scales, at[:, 0], at[:, 1], at[:, 2])
+    return kernel(values, matrices, *scales, at[:, 0], at[:, 1], at[:, 2])
 
 
 def tiles_of(sizes: Int[Array, " g"], m: int, tile: int) -> Int[Array, "t 3"]:
@@ -161,6 +162,13 @@ def _matrices(
     if stacked == "rows":
         return values.reshape(groups, r // groups, c)
     return values.reshape(r, groups, c // groups)
+
+
+def _whole_tiles_of_k(values: Shaped[Array, "*r k"]) -> Shaped[Array, "*r q"]:
+    """Return the values with k padded by 0 to whole tiles of 128, which TMA loads
+    in swizzled rows of 128 bytes: 0 times whatever the padded scales say."""
+    pad = -values.shape[-1] % LANES
+    return jnp.pad(values, [(0, 0)] * (values.ndim - 1) + [(0, pad)]) if pad else values
 
 
 def _matrix_scales(
@@ -296,9 +304,8 @@ def _rows_kernel(
         store = functools.partial(_store_rows, y=y)
         _each_tile(place, load, store, _Buffers(*scratch), tiles)
 
-    swizzle = 128 if k % 128 == 0 else 64  # TMA takes a tiling k is whole tiles of
     name = f"bux_mxfp8_rows_{stacked}"
-    return _launch(body, (m, n), out, count * columns, tiles, swizzle, name)
+    return _launch(body, (m, n), out, count * columns, tiles, name)
 
 
 @functools.cache
@@ -332,7 +339,7 @@ def _contract_kernel(d: int, f: int, groups: int, out: jnp.dtype, tiles: Tiles) 
         _each_tile(place, load, store, _Buffers(*scratch), tiles)
 
     count = groups * row_tiles * columns
-    return _launch(body, (groups, d, f), out, count, tiles, 128, "bux_mxfp8_contract")
+    return _launch(body, (groups, d, f), out, count, tiles, "bux_mxfp8_contract")
 
 
 def _launch(
@@ -341,7 +348,6 @@ def _launch(
     out: jnp.dtype,
     count: int,
     tiles: Tiles,
-    swizzle: int,
     name: str,
 ) -> Any:
     """Return `body` as a kernel of `count` tiles over two warpgroups on each of
@@ -349,7 +355,7 @@ def _launch(
     return plgpu.kernel(
         body,
         out_type=jax.ShapeDtypeStruct(shape, out),
-        scratch_types=tuple(_buffers(tiles, swizzle, out)),
+        scratch_types=tuple(_buffers(tiles, shape[-1], out)),
         grid=(count,),
         grid_names=("tiles",),
         cluster=(tiles.sms,),
@@ -361,8 +367,8 @@ def _launch(
     )
 
 
-def _buffers(tiles: Tiles, swizzle: int, out: jnp.dtype) -> _Buffers:
-    """Return the buffers of a kernel of `tiles`, its tiles of k swizzled so."""
+def _buffers(tiles: Tiles, n: int, out: jnp.dtype) -> _Buffers:
+    """Return the buffers of a kernel of `tiles` with n columns of `out`."""
     e4m3 = jnp.float8_e4m3fn
     s, k_tiles, n_tiles = tiles.stages, tiles.k // LANES, -(-tiles.n // LANES)
     pair = tiles.sms > 1  # tensor memory that the pair's MMA reads on both SMs
@@ -370,11 +376,13 @@ def _buffers(tiles: Tiles, swizzle: int, out: jnp.dtype) -> _Buffers:
         plgpu.TMEM, layout=plgpu.TMEMLayout.SCALES_LAYOUT, collective=pair
     )
     return _Buffers(
-        a=_swizzled((s, tiles.m, tiles.k), e4m3, swizzle=swizzle),
-        b=_swizzled((s, tiles.n // tiles.sms, tiles.k), e4m3, swizzle=swizzle),
+        a=_swizzled((s, tiles.m, tiles.k), e4m3),
+        b=_swizzled((s, tiles.n // tiles.sms, tiles.k), e4m3),
         a_scales=plgpu.SMEM((s, tiles.m // LANES, k_tiles, 32, 16), E8M0),
         b_scales=plgpu.SMEM((s, n_tiles, k_tiles, 32, 16), E8M0),
-        out=_swizzled((2, tiles.m, EPILOGUE), out, rows=1),
+        out=_swizzled(
+            (2, tiles.m, next(e for e in EPILOGUE if n % e == 0)), out, rows=1
+        ),
         acc=plgpu.TMEM((tiles.m, 2 * tiles.n), jnp.float32, collective=pair),
         a_scales_tm=scales((tiles.m, tiles.k // MX_BLOCK), E8M0),
         b_scales_tm=scales((n_tiles * LANES, tiles.k // MX_BLOCK), E8M0),
@@ -392,13 +400,11 @@ def _barrier_of_both(sms: int, **kwargs: Any) -> Any:
     return plgpu.ClusterBarrier(collective_axes=("pair",), **kwargs)
 
 
-def _swizzled(
-    shape: tuple[int, ...], dtype: DTypeLike, rows: int = 8, swizzle: int = 128
-) -> Any:
-    """Return shared memory for tiles of `shape`, in tiles of `rows` by `swizzle`
+def _swizzled(shape: tuple[int, ...], dtype: DTypeLike, rows: int = 8) -> Any:
+    """Return shared memory for tiles of `shape`, in tiles of `rows` by up to 128
     bytes, swizzled as TMA and the MMA read them."""
     bits = jnp.dtype(dtype).itemsize * 8
-    swizzle = min(swizzle, plgpu.find_swizzle(shape[-1] * bits))
+    swizzle = plgpu.find_swizzle(shape[-1] * bits)
     # Concrete transforms, which ty takes for their abstract Protocol.
     tiling = plgpu.TilingTransform((rows, swizzle * 8 // bits))  # ty: ignore
     swizzled = plgpu.SwizzleTransform(swizzle)  # ty: ignore
@@ -658,14 +664,15 @@ def _store(
     part: Callable[[Any, pl.Slice], None],
     zero: Bool[Array, ""] | bool = False,
 ) -> None:
-    """Once the MMAs are done: the accumulator, EPILOGUE columns at a time, into the
-    output's dtype in shared memory (or 0 where `zero`), and `part` of it to memory.
-    The accumulator is free for the MMAs again once it is read."""
-    t = tile.tiles
+    """Once the MMAs are done: the accumulator, as many columns at a time as the
+    store's buffers hold, into the output's dtype in shared memory (or 0 where
+    `zero`), and `part` of it to memory. The accumulator is free for the MMAs again
+    once it is read."""
+    t, width = tile.tiles, buffers.out.shape[-1]
     plgpu.barrier_wait(buffers.multiplied.at[tile.acc])
-    for e in range(t.n // EPILOGUE):
+    for e in range(t.n // width):
         staged = buffers.out.at[e % 2]
-        held = pl.ds(tile.acc * t.n + e * EPILOGUE, EPILOGUE)
+        held = pl.ds(tile.acc * t.n + e * width, width)
         acc = plgpu.async_load_tmem(
             buffers.acc.at[:, held], layout=plgpu.Layout.TCGEN05
         )
@@ -673,7 +680,7 @@ def _store(
             acc = jnp.where(jnp.broadcast_to(zero, acc.shape), jnp.zeros_like(acc), acc)
         staged[...] = acc.astype(staged.dtype)
         plgpu.commit_smem()
-        part(staged, pl.ds(tile.column * t.n + e * EPILOGUE, EPILOGUE))
+        part(staged, pl.ds(tile.column * t.n + e * width, width))
         plgpu.wait_smem_to_gmem(1, wait_read_only=True)
     plgpu.wait_load_tmem()
     plgpu.barrier_arrive(buffers.stored.at[tile.acc])
