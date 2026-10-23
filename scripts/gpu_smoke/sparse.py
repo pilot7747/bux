@@ -13,7 +13,6 @@ It needs tokamax (the cuda extra), and exits 1 if the kernel differs from XLA.
 
 import sys
 import time
-from collections.abc import Callable
 from typing import NamedTuple
 
 import jax
@@ -113,7 +112,7 @@ def inputs(case: Case, b: int, t: int) -> tuple:
     return normal(b, t, h, case.dk), keys, sinks, normal(b, t, h, case.dv)
 
 
-Step = Callable[..., tuple]
+Step = jax.stages.Wrapped  # jitted (q, keys, sinks, dout) -> (grads, (out, lse))
 
 
 def step(case: Case, rows: Segments) -> Step:
