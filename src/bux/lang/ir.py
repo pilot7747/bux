@@ -202,7 +202,8 @@ def strip(node: Node, *, labels: bool = True, widths: bool = True) -> Node:
 
 
 # Training settings that change how a run is watched or computed, not what it computes.
-_UNCOMPUTED = {"log", "eval", "checkpoint", "profile", "mesh", "layout", "methods"}
+_UNCOMPUTED = {"log", "eval", "checkpoint", "profile"}
+_UNCOMPUTED |= {"mesh", "layout", "methods", "compiler"}  # how it splits and compiles
 # Settings newer than run ids, as runs computed before them: in float32, which was
 # the default then.
 _NEWER = {"precision": PrecisionConfig(compute="float32")}
@@ -210,6 +211,7 @@ _NEWER = {"precision": PrecisionConfig(compute="float32")}
 _NEWER_FIELDS = {
     "precision": {
         "matmuls": "compute",
+        "reduce": "compute",
         **PrecisionConfig().model_dump(
             mode="json", include={"roles", "first", "last", "passes", "switch"}
         ),
@@ -256,7 +258,7 @@ class Run(BaseModel):
         """A hash of what the run computes, not of how it is written, watched or split
         over devices. Renaming a definition, reaching the same settings through a sweep,
         logging, evaluating, checkpointing or profiling at other steps, or another
-        mesh, layout or methods keep it."""
+        mesh, layout, methods or compiler options keep it."""
         arch = self.arch.model_copy(update={"graph": strip(self.arch.graph)})
         # A setting or a field newer than run ids is left out where it computes as runs
         # did before it, so that ids made before it resume.

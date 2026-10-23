@@ -7,17 +7,17 @@ import jax
 import numpy as np
 from flax import nnx
 from jax.core import Tracer
-from jax.sharding import NamedSharding
+from jax.sharding import Mesh, NamedSharding
 from jax.sharding import PartitionSpec as P
-from jaxtyping import Array, Shaped
+from jaxtyping import Array, Int, Shaped
 
 from bux.parallel.layout import NAMES, fsdp, partition, resolve, shard
 from bux.parallel.mesh import Active, active
 
 
-def _spec(path: tuple, x: object, on: Active) -> P:
+def _spec(path: tuple, x: object, on: Active, gathered: bool) -> P:
     """Return a variable's spec: its names resolved, then FSDP for the optimizer's
-    state, and for parameters unless the layout's `zero` is 1."""
+    state, and for parameters unless the layout's `zero` is 1 or they are `gathered`."""
     if not isinstance(x, nnx.Variable) or not hasattr(x.get_value(), "shape"):
         return P()  # optax's masked nodes, say
     shape = tuple(x.shape)
@@ -27,7 +27,7 @@ def _spec(path: tuple, x: object, on: Active) -> P:
     except ValueError as e:
         raise ValueError(f"{jax.tree_util.keystr(path)}: {e}") from None
     use_fsdp = isinstance(x, nnx.OptState) or (
-        isinstance(x, nnx.Param) and on.layout.zero == 3
+        isinstance(x, nnx.Param) and on.layout.zero == 3 and not gathered
     )
     return partition(fsdp(splits, shape, on, names) if use_fsdp else splits)
 
@@ -36,13 +36,17 @@ def _variable(x: object) -> bool:
     return isinstance(x, nnx.Variable)
 
 
-def shardings(state: nnx.State) -> nnx.State:
-    """Return the NamedSharding of every variable of `state` on the mesh of `use`."""
+def shardings(state: nnx.State, gathered: bool = False) -> nnx.State:
+    """Return the NamedSharding of every variable of `state` on the mesh of `use`; or
+    with `gathered`, of the parameters as a step uses them: split by their names
+    alone, whole over FSDP's axes."""
     on = active()
     if on is None:
         raise RuntimeError("shardings are of the mesh `bux.parallel.use` sets")
     return jax.tree_util.tree_map_with_path(
-        lambda p, x: NamedSharding(on.mesh, _spec(p, x, on)), state, is_leaf=_variable
+        lambda p, x: NamedSharding(on.mesh, _spec(p, x, on, gathered)),
+        state,
+        is_leaf=_variable,
     )
 
 
@@ -74,19 +78,35 @@ def shard_batch[T](batch: T) -> T:
     """Put every (b, t) host array of `batch` on the devices: rows over `batch`,
     positions over `seq`.
 
-    In a job of many processes, each has the whole batch and puts the parts its own
-    devices hold.
+    In a job of many processes, each puts the parts its own devices hold, of a batch
+    whose other rows it need not have (``local_rows``).
     """
     on = active()
     if on is None:
         return jax.device_put(batch)
 
     def put(x: Shaped[np.ndarray, "b ..."]) -> Shaped[Array, "b ..."]:
-        names = ("batch", "seq", *(None,) * x.ndim)[: x.ndim]
-        sharding = NamedSharding(on.mesh, partition(resolve(names, x.shape, on)))
+        sharding = _batch_sharding(x.shape, on)
         return jax.make_array_from_callback(x.shape, sharding, lambda part: x[part])
 
     return jax.tree.map(put, batch)
+
+
+def _batch_sharding(shape: tuple[int, ...], on: Active) -> NamedSharding:
+    names = ("batch", "seq", *(None,) * len(shape))[: len(shape)]
+    return NamedSharding(on.mesh, partition(resolve(names, shape, on)))
+
+
+def local_rows(rows: int, seq_len: int) -> Int[np.ndarray, " n"]:
+    """Return the rows of a batch of `rows` that this process's devices hold, as
+    ``shard_batch`` splits it, in order: every row on one process or outside ``use``."""
+    on = active()
+    if on is None or jax.process_count() == 1 or not isinstance(on.mesh, Mesh):
+        return np.arange(rows)
+    shape = (rows, seq_len)
+    held = _batch_sharding(shape, on).addressable_devices_indices_map(shape).values()
+    mine = {r for part in held if part is not None for r in range(rows)[part[0]]}
+    return np.array(sorted(mine), int)
 
 
 def microbatches[T](batch: T, n: int) -> T:

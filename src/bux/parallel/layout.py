@@ -16,12 +16,14 @@ from jax.sharding import PartitionSpec as P
 from jaxtyping import Array, Shaped
 
 from bux.parallel.mesh import Active, active
-from bux.train.config import LayoutConfig
+from bux.train.config import Axes, LayoutConfig
 
 NAMES = "names"  # the metadata key that holds a parameter's dimension names
 LAYERS = "layers"  # the stacked dimension of a scanned repeat
 # Every field of the layout that names a dimension.
-DIMENSIONS = tuple(n for n in LayoutConfig.model_fields if n not in ("type", "zero"))
+DIMENSIONS = tuple(
+    n for n in LayoutConfig.model_fields if n not in ("type", "fsdp", "zero")
+)
 
 Split = tuple[str, ...]  # the mesh axes one dimension splits over; () keeps it whole
 # A dimension's name: a string, None for no name, or (name, count) for a dimension
@@ -39,7 +41,10 @@ def axes(layout: LayoutConfig, name: Name) -> Split:
         return ()
     if name not in DIMENSIONS:
         raise ValueError(f"'{name}' is not a dimension; the names are {DIMENSIONS}")
-    a = getattr(layout, name)
+    return _split(getattr(layout, name))
+
+
+def _split(a: Axes) -> Split:
     return () if a is None else (a,) if isinstance(a, str) else tuple(a)
 
 
@@ -68,21 +73,28 @@ def resolve(names: Sequence[Name], shape: tuple[int, ...], on: Active) -> list[S
 def fsdp(
     splits: list[Split], shape: tuple[int, ...], on: Active, names: Sequence[Name]
 ) -> list[Split]:
-    """Split the largest whole dimension that `fsdp` divides over `fsdp`, unless one
-    already is. Never the stacked `layers` of a scanned repeat: a scan reads one layer
-    at a time."""
-    n = on.size("fsdp")
-    if n == 1 or any("fsdp" in s for s in splits):
-        return splits
+    """Split the largest whole dimension over FSDP's axes (`layout.fsdp`) that no
+    dimension splits over yet, or if none divides by them all, over as many of them as
+    one does, from the first. Never the stacked `layers` of a scanned repeat: a scan
+    reads one layer at a time."""
+    taken = {a for s in splits for a in s}
+    over = [a for a in _split(on.layout.fsdp) if on.size(a) > 1 and a not in taken]
+    for k in range(len(over), 0, -1):
+        if (i := _largest_whole(splits, shape, names, on.size(*over[:k]))) is not None:
+            return [*splits[:i], tuple(over[:k]), *splits[i + 1 :]]
+    return splits
+
+
+def _largest_whole(
+    splits: list[Split], shape: tuple[int, ...], names: Sequence[Name], n: int
+) -> int | None:
+    """The largest dimension that nothing splits and `n` divides, but `layers`."""
     whole = [
         i
         for i, s in enumerate(splits)
         if not s and shape[i] % n == 0 and names[i] != LAYERS
     ]
-    if not whole:
-        return splits
-    i = max(whole, key=lambda i: shape[i])
-    return [*splits[:i], ("fsdp",), *splits[i + 1 :]]
+    return max(whole, key=lambda i: shape[i]) if whole else None
 
 
 def partition(splits: list[Split]) -> P:

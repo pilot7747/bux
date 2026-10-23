@@ -32,11 +32,12 @@ class Sequence(nnx.Module):
 
     def __call__(self, x: Stream, taps: Taps) -> Stream:
         for item, branch in zip(self.items, self.branches, strict=True):
-            x = _branch(item, x, taps) if branch else item(x, taps)
+            x = run_branch(item, x, taps) if branch else item(x, taps)
         return x
 
 
-def _branch(item: nnx.Module, x: Stream, taps: Taps) -> Stream:
+def run_branch(item: nnx.Module, x: Stream, taps: Taps) -> Stream:
+    """Run a residual branch outside any other: numbered, and rematerialized."""
     with matmuls.branch():
         return remat.rematted(item, x, taps)
 

@@ -16,8 +16,8 @@ import jax.numpy as jnp
 from flax import nnx
 from jax.typing import DTypeLike
 
-from bux.architecture import matmuls, pipelined, residual, stacked
-from bux.architecture.graph import Sequence, branches, build_node
+from bux.architecture import matmuls, pipelined, remat, residual, stacked
+from bux.architecture.graph import Sequence, branches, build_node, run_branch
 from bux.architecture.registry import Context, Stream, Taps
 from bux.lang import ir
 from bux.parallel import methods, pipeline
@@ -27,7 +27,7 @@ from bux.parallel.layout import LAYERS, NAMES
 @methods.repeat.register("unroll")
 def unroll(body: ir.Node, times: int, ctx: Context) -> nnx.Module:
     """Build one module per pass, run in a row."""
-    return Sequence(_passes(body, times, ctx), branches((body,) * times, ctx))
+    return Passes(_passes(body, times, ctx), branches((body,) * times, ctx))
 
 
 @methods.repeat.register("scan")
@@ -39,11 +39,23 @@ def scan(body: ir.Node, times: int, ctx: Context) -> nnx.Module:
         [branch] = branches((body,), ctx)
         each = matmuls.branches_of(body) if ctx.depth == 0 else 0
         return Scanned(_stack(passes), len(passes), each, branch)
-    return Sequence(passes, branches((body,) * times, ctx))
+    return Passes(passes, branches((body,) * times, ctx))
 
 
 def _passes(body: ir.Node, times: int, ctx: Context) -> list[nnx.Module]:
     return [build_node(body, ctx) for _ in range(times)]
+
+
+class Passes(Sequence):
+    """The passes of a repeat, run in a row, each traced as its pass
+    (``remat.at_pass``), which the run's `remat(first=n)` counts. A pass that is a
+    branch outside any other runs as one (``graph.run_branch``)."""
+
+    def __call__(self, x: Stream, taps: Taps) -> Stream:
+        for i, (item, branch) in enumerate(zip(self.items, self.branches, strict=True)):
+            with remat.at_pass(i):
+                x = run_branch(item, x, taps) if branch else item(x, taps)
+        return x
 
 
 def scannable(passes: list[nnx.Module]) -> bool:
@@ -137,9 +149,11 @@ class Scanned(nnx.Module):
         graphdef, state = nnx.split(self.layers)
         done = []
         for span in matmuls.spans(self.times, self.each):
-            part = _span(state, span, self.times)
-            with self._numbered(len(span)):
-                x, rest = stacked.run(graphdef, part, len(span), x, taps, self.compute)
+            part, times = _span(state, span, self.times), len(span)
+            with self._numbered(times):
+                x, rest = stacked.run(
+                    graphdef, part, times, x, taps, self.compute, start=span.start
+                )
             done.append(rest)
         nnx.update(self.layers, _joined(done))
         return x

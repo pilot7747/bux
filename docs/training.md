@@ -74,10 +74,11 @@ id          params  tokens  tok/param  flops/tok  gpus  ...  run
 | `checkpoint` | `checkpoint(every=..., keep=...)`, or `none`           | `none`         |
 | `log`        | `log(every=...)`                                       | `log`          |
 | `profile`    | `profile(start=..., steps=...)`: a trace of `steps` steps after step `start`, or `none` | `none` |
-| `precision`  | `precision(compute=bfloat16, matmuls=mxfp8, ...)`: the dtype forward and backward compute in, parameters staying float32, and the formats block projections multiply in ([Precision](#precision)) | `precision`: `bfloat16`, `compute` |
+| `precision`  | `precision(compute=bfloat16, matmuls=mxfp8, reduce=float32, ...)`: the dtype forward and backward compute in, parameters staying float32, the formats block projections multiply in ([Precision](#precision)), and the dtype gradients are summed over the devices in | `precision`: `bfloat16`, `compute`, `compute` |
 | `mesh`       | `mesh(data=..., fsdp=..., tensor=...)`: the device grid | `mesh`: every device on `data` |
 | `layout`     | `layout(...)`: which mesh axes each named dimension splits over | `layout` |
 | `methods`    | `methods(attention=..., moe=..., microbatches=...)`: how what communicates is computed, and the microbatches a step takes its batch in | `methods` |
+| `compiler`   | `compiler(preset=..., options=...)`: XLA's options for the training step ([below](#xlas-options-compiler)) | `compiler`: XLA's defaults |
 
 The settings of each config are pydantic fields in `bux/train/config.py`, and the
 editor shows them on hover and completes them, as it does for layers. In short:
@@ -375,10 +376,10 @@ profile/       a jax.profiler trace, with a profile setting
 
 The id is a hash of what the run computes: renaming a definition, reaching the same
 settings through another file or a sweep, logging, evaluating, checkpointing and
-profiling at other steps, or splitting it over devices another way (`mesh`, `layout`,
-`methods`) keeps it, and anything else changes it. So a changed run starts in a
-directory of its own, and an unchanged one started again resumes from its latest
-checkpoint, ending exactly where it would have.
+profiling at other steps, splitting it over devices another way (`mesh`, `layout`,
+`methods`) or compiling it with other options (`compiler`) keeps it, and anything else
+changes it. So a changed run starts in a directory of its own, and an unchanged one
+started again resumes from its latest checkpoint, ending exactly where it would have.
 
 The log has the step's metrics: `loss` and every term of the objective, `grad_norm`
 before clipping, `lr`, `tokens` so far and `tokens_per_s` since the last log. On a GPU
@@ -388,14 +389,23 @@ mesh's GPUs. A step's FLOPs are counted once, before training, from the program 
 its loss's gradient on a batch, traced on shapes alone with remat and kernels off
 (`trainer.step_flops`, `bux/train/flops.py`): 2·m·n·k for every matrix product and
 convolution, times the length of every scan around it. So a new layer counts with
-no formula of its own, a rematerialized forward is not counted twice, and attention
-counts its t × t scores whole, as PaLM's MFU does, though a causal kernel computes
-half of them. `bux plan` shows the FLOPs a token: 7.7G for a Llama-style 1.3B at
-4096 tokens a row, 6 N of its matrices and 1.6G of attention.
+no formula of its own, and a rematerialized forward is not counted twice. Attention
+counts the share of its t × t logits that its mask keeps, (t + 1) / 2t causal and
+less with a window, as Megatron's MFU does and a flash kernel computes; not the
+documents of a packed row, which change from batch to batch. (PaLM's MFU counts them
+whole, which made bux's 10% higher at 4096 tokens a row.) `bux plan` shows the FLOPs a
+token: 6.9G for a Llama-style 1.3B at 4096 tokens a row, 6 N of its matrices and 0.8G
+of attention.
 
 `profile = profile(start=20, steps=5)` traces the 5 steps after step 20 into
 `profile/`, waiting for the step before it starts and stops, for `xprof` or
-TensorBoard's profile plugin (`tensorboard --logdir runs/<run>/profile`).
+TensorBoard's profile plugin (`tensorboard --logdir runs/<run>/profile`). On GPUs the
+log then has, at step 25, what a step of them spent in collectives, `comm_ms`, and in
+collectives with no kernel computing beside them on any stream, `exposed_comm_ms`: the
+communication the step waits for. Each is the mean of the GPUs the process traced
+(`bux/train/trace.py`): a kernel communicates if NCCL runs it or XLA's op that
+launched it is a collective, CUDA's copies neither communicate nor compute, and every
+other kernel computes.
 
 ## Speed on GPUs
 
@@ -415,16 +425,16 @@ by itself where it cannot run, and all of them do inside `bux.kernels.off()` or 
 | MoE dispatch | `pick_rows`, `permuted`: gathers where XLA would scatter | 4x |
 
 Tokens a second on B300s, 8 × 4096 tokens a GPU, `precision(compute=bfloat16)`, and
-the log's `mfu`:
+the log's `mfu` (of the attention a causal mask keeps):
 
 | model (d = 2048, 16 layers) | 1 GPU | 8, `mesh(fsdp=8)` |
 |-----------------------------|-------|-------------------|
-| Llama-style, 1.3B           | 144k, 49% MFU | 1.12M, 48% |
-| Gated DeltaNet hybrid, `"DDDA"` | 93k, 30% | 720k |
+| Llama-style, 1.3B           | 144k, 44% MFU | 1.12M, 43% |
+| Gated DeltaNet hybrid, `"DDDA"` | 93k, 29% | 720k |
 | Mamba-2 hybrid, `"MMMA"`, 1.5B (Nemotron-H's `mamba2`) | 97k | 741k |
 | KDA hybrid, `"KKKA"`        | 58k   |                   |
-| KDA with `gate_lower_bound=-5` | 110k, 36% |            |
-| MoE, 64 experts, top 8      | 102k, 35% | 834k          |
+| KDA with `gate_lower_bound=-5` | 110k, 35% |            |
+| MoE, 64 experts, top 8      | 102k, 31% | 834k          |
 
 Sparse attention trains at long context. A DeepSeek-V3.2-style 1B (MLA of 16 heads,
 DSA's indexer of 64 heads and top 2048 in all 16 layers, dense MLPs) on one B300, in
@@ -439,7 +449,13 @@ bfloat16, against the same model by all t × t logits, as bux attended before `s
 
 At 32k a layer's attention takes 1.4-1.9 times dense flash attention's time, and the
 indexer most of the rest: its selection 61 ms, its loss 75 ms and the loss's target
-33 ms, forward and backward.
+33 ms, forward and backward. Under `methods(remat=save_attention)` the backward neither
+selects the keys again nor runs the flash forward again
+([Repeats and remat](parallelism.md#repeats-and-remat-methodsrepeat-methodsremat)):
+at 32k, 7.27k tokens a second in 39.8 GiB, as fast as no remat (7.11k, 77.9 GiB),
+where it ran at 5.85k before; at 16k, 10.2k against 8.65k. MLA keeps its latents for
+`save_qkv_attention`, not the heads' projections up from them: at 8 rows of 4096,
+34.1k in 41.2 GiB, against 30.1k in 51.5 before.
 
 A thread loads the next two batches as a step runs (`prefetch`). A step's new state
 takes the old one's memory (`methods.donate`): the 1.3B's step peaks at 70.6 GiB
@@ -453,7 +469,8 @@ scheduling changed nothing past the noise (1%) on the 1.3B on 1 and 8 GPUs, nor 
 the MoE on `mesh(fsdp=8)`: the latency-hiding scheduler, pipelined all-gathers,
 all-reduces and reduce-scatters, combine thresholds of 128 MiB, double-buffered while
 loops, command buffers off, Triton GEMMs off. FSDP over 8 GPUs gets 97% of 8 times
-one GPU's tokens already.
+one GPU's tokens already. Other splits wait longer for their collectives, and the
+`compiler` setting tries XLA's options on them (below).
 
 On packed documents (`best_fit` of documents of 16 to 4000 words, GPT-2 tokens), on
 one GPU, the 1.3B trains at 145k tok/s in rows of 4096 by tokamax's kernel, and at
@@ -498,6 +515,70 @@ k and v in bfloat16 are slower, not faster: q still quantizes x, the copy all th
 shared, and k's and v's GEMMs then run at bfloat16's rate, x kept for them too. Over 8
 GPUs, `mesh(fsdp=8)`, `mxfp8` and `mxfp8_2d` both train at 1.34M (bfloat16: 1.14M),
 and scanned, `first=2, last=2` at 1.20M, where `mxfp8` alone gives 1.22M.
+
+### XLA's options: `compiler`
+
+```
+compiler = compiler(preset=o1)
+compiler = compiler(options="--xla_gpu_threshold_for_windowed_einsum_mib=0")
+compiler.preset = default | o1 | lhs | maxtext       # a sweep
+```
+
+The training step compiles with a preset's options, and the setting's own `options`
+over them, written as XLA_FLAGS writes them: XLA's debug options, and jax's
+`optimization_level` and `memory_fitting_level`. They are the step's alone
+(`bux/train/xla.py`), so a run's step compiles with its options in a process that
+compiled another's with others, and they go over XLA_FLAGS. Like `mesh`, `layout` and
+`methods`, `compiler` changes how a run computes, not what, and is not in its id.
+
+| preset              | what it sets                                                     |
+|---------------------|------------------------------------------------------------------|
+| `default`           | nothing: XLA's defaults                                           |
+| `o1`                | `optimization_level=O1`: collective pipelining, double-buffered loops, and the latency hiding scheduler for any collective |
+| `lhs`               | the latency hiding scheduler, for any collective                  |
+| `maxtext`           | MaxText's GPU recipe: the scheduler, combine thresholds of 128, 128 and 64 MiB, pipelined collectives, double-buffered loops, a high-priority stream for collectives, Triton GEMMs, command buffers and XLA's rematerialization off |
+| `collective_matmul` | XLA's windowed einsum: tensor parallelism's all-gathers and reduce-scatters as loops of collective-permutes beside their shares of the matmul |
+
+Another preset is an entry of `bux.train.xla.PRESETS`. XLA (in jax 0.12 and at its
+head) runs the latency hiding scheduler on Hopper and Blackwell by itself, but only on
+a step whose collectives its cost model knows: not one with `ragged_all_to_all`
+(`methods(moe=ragged_all_to_all)`), which `lhs` and `o1` schedule. Host offload does
+not stop it.
+
+On one node of 8 B300s, bfloat16, rows of 4096 tokens but for the ring's, tokens a
+second, and the exposed communication of a step in ms of its time (the log's
+`exposed_comm_ms`, profiled):
+
+| run | `default` | `o1` | `lhs` | `maxtext` |
+|-----|-----------|------|-------|-----------|
+| TP=8 and sequence parallelism: 4 of Llama 3 70B's layers, scanned, `remat=full`, 8 rows | **218k**, 34 of 150 | 211k, 31 | 218k, 34 | 216k, 35 |
+| EP=8 by `all_to_all`: 8 layers of 64 experts, top 8, d = 2048, a row a GPU | 158k, 62 of 208 | 157k | 155k | 159k |
+| EP=8 by `ragged_all_to_all`, as above | 45k, 618 of 733 | 45k | 45k | 45k |
+| the 1.3B, `fsdp=8`, 8 rows a GPU | **1.14M**, 3.5 of 230 | 1.13M | | 1.09M, 9.0 |
+| the same in 8 microbatches | **842k**, 57 of 311 | 830k, 64 | 836k | 789k, 74 |
+| the same scanned (`repeat=scan`), a row a GPU | 662k, 11 of 50 | 682k, 8 | 661k | **718k**, 10 |
+| `ring` over `context=8`, rows of 32k, one document, the 218M of [CP](parallelism.md#context-parallelism-methodsattention) | **183k**, 137 of 1436 | 167k | 182k | |
+| the same on packed documents | 223k, 128 of 1177 | 210k | **225k**, 23 | |
+
+`collective_matmul` takes TP to 93k: its 325 collective-permutes a step, 0.84 ms each,
+take 274 ms (XLA's windowed einsum; over memcpy, `--xla_gpu_use_memcpy_local_p2p`, the
+same). TP waits for its reduce-scatters (17 ms a step) and all-gathers (15 ms) at the
+boundaries of the matmuls they feed, which no schedule moves; it takes a collective
+matmul of one's own. `ragged_all_to_all` waits 610 ms a step for its 96 exchanges;
+with 4 rows a GPU its step runs out of memory under `default` (a temporary of 97 GiB)
+and fits under the others, at 55k against `all_to_all`'s 176k. FSDP's
+collectives take 14% of the step and hide all but 1.5% of it. A collective's time
+includes the wait for its slowest peer, so on unevenly loaded devices, such as the
+ring's on packed rows, `exposed_comm_ms` swings between runs of one speed.
+
+Only scanned layers gain, under FSDP: `maxtext` trains the scanned 1.3B at 719k
+(three runs, against 656-662k), faster than the same unrolled (623k, and 572k under
+`maxtext`). Of its options, the pipelining and double buffering of `o1` give 3%, and
+cuBLAS's GEMMs where XLA would take Triton's inside the loop
+(`--xla_gpu_enable_triton_gemm=false`) 5%; the combine thresholds, XLA's
+rematerialization and command buffers nothing. With TP the scanned layers gain nothing.
+So `default`, XLA's own options, stays the default, and a scanned FSDP run is worth
+`compiler(preset=maxtext)`.
 
 ## Launching
 
@@ -546,7 +627,9 @@ with the same program, loads its step instead of compiling it (0.5 s instead of 
 for the MoE above on 8 B300s), and one that differs in a flag still finds the
 autotuner's picks (17 s). `JAX_COMPILATION_CACHE_DIR` says where instead, and set
 empty turns the cache off. They also put bux's XLA flags (`bux/runtime.py`) before
-`XLA_FLAGS`, a flag that it sets already keeping its value.
+`XLA_FLAGS`, a flag that it sets already keeping its value. In a job of many hosts
+only the first writes the cache, so put it on a filesystem they all mount: bux turns
+off one that is each host's own ([Many nodes](parallelism.md#the-compile-cache)).
 
 `--index N` trains only the run at N, from 0, in the order `bux plan` lists them, so an
 array job trains a sweep a run a task: `--index $SLURM_ARRAY_TASK_ID` on Slurm, or
@@ -644,41 +727,46 @@ trainer.fit(
 The model gives the objective its heads' outputs, not their logits: `Model.heads`
 (`training_heads` in a training step) returns each head's input and its projection,
 a `HeadOutput` (`bux/architecture/logits.py`). The default terms, `loss`, `z_loss`
-and `mtp`, take only log Z and the target's logit at each position, which
-`logits.scores(i, offset)` gives for head i by the run's `methods.loss`:
+and `mtp`, are means over the targets of the cross-entropy, log Z minus the target's
+logit, and of log Z squared, which `heads.sums(i, offset, z)` gives for head i by the
+run's `methods.loss`:
 
 | method   | how                                                                 |
 |----------|---------------------------------------------------------------------|
-| `logits` | one matmul for every position, the logits whole in `compute`; the default |
-| `chunks` | the matmul, the logsumexp and the target's logit of at most 2 GiB of float32 logits at once, made again in the backward, the head's gradient added up in float32 |
+| `chunks` | the matmul, the logsumexp and the target's logit of at most 2 GiB of float32 logits at once, and their gradients by the kernel and the stream with them, the kernel's added up in float32: the backward only scales those; the default |
+| `logits` | one matmul for every position, the logits whole in `compute`        |
 
 At a vocabulary of 128K, the float32 logits of 8 rows of 4096 tokens take 16 GB, and
-their gradient as much again: `chunks` is for a run that memory bounds, a large
-vocabulary and batch, or a long row, where the 9% it costs buys rows. Another method
-is a function of a head's output and the targets, `@methods.loss.register("mine")`,
-that returns their `Scores`. A term of one's own gets the same `logits`, a sequence
-that makes a head's logits once a term reads them, once for every term that does:
-`logits[0] ** 2` above makes the first head's whole, by either method.
-`Model.outputs` returns every head's logits at once.
+their gradient as much again. A sum over positions is linear in each position's term,
+so its gradient is known in the forward but for one factor, its cotangent, which the
+backward multiplies in: by chunks, a head multiplies by its vocabulary three times, as
+by whole logits, and keeps the gradients from the forward to the backward in
+`compute`, the kernel's and the stream's. Each sum keeps its own, so a z-loss costs a
+second matmul by the kernel and one by the stream. Another method is a function of a
+head's output, the targets, their weights and whether to sum log Z squared,
+`@methods.loss.register("mine")`, that returns their `Sums`. A term of one's own gets
+the same `logits`, a sequence that makes a head's logits once a term reads them, once
+for every term that does: `logits[0] ** 2` above makes the first head's whole, by
+either method. `Model.outputs` returns every head's logits at once.
 
 On a B300, for the dense 1.3B of 16 Llama blocks of width 2048 (vocabulary 128256,
-`bfloat16`, 8 rows of 4096 tokens), against the whole logits before the head left
-them to the objective, whose tied head multiplied in float32; the largest batch with
-donation, the default:
+`bfloat16`, 8 rows of 4096 tokens), against the whole logits, and against the chunks
+before they took their gradients in the forward, whose backward made each chunk's
+logits again:
 
-| head, `methods.loss` | tok/s | peak memory | largest batch |
-|----------------------|-------|-------------|---------------|
-| untied, before       | 143k  | 81.2 GiB    | 28 rows       |
-| untied, `logits`     | 145k  | 81.3 GiB    | 28 rows       |
-| untied, `chunks`     | 131k  | 62.5 GiB    | 56 rows, 137k |
-| tied, before         | 129k  | 84.4 GiB    |               |
-| tied, `logits`       | 144k  | 76.3 GiB    |               |
-| tied, `chunks`       | 134k  | 57.6 GiB    |               |
+| head, `methods.loss`      | tok/s | peak memory | largest batch |
+|---------------------------|-------|-------------|---------------|
+| untied, `logits`          | 138k  | 70.6 GiB    |               |
+| untied, chunks, before    | 125k  | 52.1 GiB    |               |
+| untied, `chunks`          | 139k  | 51.1 GiB    | 56 rows, 146k |
+| tied, `logits`            | 141k  | 67.5 GiB    |               |
+| tied, `chunks`            | 139k  | 48.1 GiB    |               |
 
-`chunks` makes the logits twice, and moves them in float32. On 8 B300s under `fsdp=8`,
-8 rows each, its ratios hold (41 GiB rather than 60, 1.04M tokens a second rather than
-1.12M): each device adds its share of the head's gradient up alone, and the mesh
-reduces it once.
+On 8 B300s under `fsdp=8`, 8 rows each, `chunks` trains at 1.071M tokens a second in
+38.9 GiB, and `logits` at 1.064M in 58.5: each device adds its share of the head's
+gradient up alone, and the mesh reduces it once. The GDN hybrid and the MoE of
+[Repeats and remat](parallelism.md#repeats-and-remat-methodsrepeat-methodsremat) train
+6% and 5% faster by `chunks` than they did by chunks before.
 
 A layer adds a term of its own from its forward, in one line:
 `report(taps, "my_loss", weight, value)` (`bux/architecture/registry.py`). The
@@ -688,7 +776,10 @@ the layers that report the name, under that name; eval leaves them out.
 `train_step` and `eval_step` are what the trainer compiles, once; a subclass that
 overrides them changes what a step does (averaging the weights, skipping a spike) and
 keeps the loop, the hooks and checkpoints. Gradient accumulation is built in:
-`methods(microbatches=n)`.
+`methods(microbatches=n)`, which on a mesh gathers the parameters once a step and, where
+the rows are independent and span hosts, reduces the gradients once (docs/parallelism.md, "Gathered
+once, reduced once"); `Trainer(..., gather=, accumulate=, reduce=)` takes the same
+settings.
 
 With `Trainer(..., donate=True)`, as a run's `methods.donate` makes it by default, a
 training step donates the model's and the optimizer's arrays: an array read from

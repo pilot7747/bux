@@ -16,7 +16,7 @@ from jaxtyping import Array, Float
 
 from bux import config as cfg
 from bux import parallel
-from bux.architecture import Model, blockscaled, matmuls
+from bux.architecture import Model, blockscaled, matmuls, remat
 from bux.architecture.linear_attention import delta_rule, l2norm, recurrence
 from bux.architecture.moe import MoE
 from bux.architecture.norm import Norm
@@ -380,6 +380,15 @@ def test_the_matmul_format_is_in_the_run_s_id_and_a_bfloat16_run_s_is_as_it_was(
     assert bf16.id == plain.id == "de94a2eb32"  # as before matmuls
 
 
+def test_the_reduce_dtype_is_in_the_run_s_id_and_a_run_that_leaves_it_is_as_it_was():
+    plain, f32 = compile_runs(
+        _source(f"precision = {BF16}", "precision.reduce = compute | float32")
+    )
+    assert f32.train.precision.reduce == "float32"
+    assert plain.id != f32.id and plain.name != f32.name
+    assert plain.id == "de94a2eb32"  # as before reduce
+
+
 def test_a_format_not_registered_is_an_error():
     trainer = _trainer(ARCHITECTURES["llama"], matmuls="mine")
     hint = r"no 'mine' matmul format yet; add one with @bux\.architecture\.matmuls"
@@ -510,21 +519,62 @@ EDGES = [
 ]
 
 
+def _formats_traced(
+    source: str, precision: str, methods: tcfg.MethodsConfig, monkeypatch
+) -> dict:
+    """Return the format each projection of a forward of `source` multiplies in, by
+    its pass of a repeat (as remat counts them) and its role, run by `methods`."""
+    [run] = compile_runs(_source(f"precision = {precision}", arch=source))
+    seen, of = {}, matmuls.format_of
+
+    def recorded(role: str | None) -> str:
+        seen[remat._PASS.get(), role] = fmt = of(role)
+        return fmt
+
+    monkeypatch.setattr(matmuls, "format_of", recorded)
+    with parallel.use(tcfg.MeshConfig(data=1), methods=methods):
+        model = Model(run.arch, rngs=nnx.Rngs(0))
+        with matmuls.use(run.train.precision):
+            forward(model, _batch())
+    monkeypatch.setattr(matmuls, "format_of", of)
+    # A scan's trial of a pass, which never runs, traces it outside any pass.
+    return {key: fmt for key, fmt in seen.items() if key[0] is not None}
+
+
 @pytest.mark.parametrize(("source", "given"), EDGES)
 def test_a_scanned_repeat_multiplies_its_first_and_last_as_unrolled(
-    losses, source, given
+    losses, monkeypatch, source, given
 ):
-    # The first step's loss, which the formats decide: in mxfp8 a gradient moves by
-    # a few percent at a change of one ulp in the parameters, as the scan's sums make.
-    everywhere = "precision(compute=float32, matmuls=mxfp8)"
-    precision = everywhere.replace(")", f", {given})")
-    run = {"mesh": ONE, "optimizer": STABLE, "steps": 1}
-    [unrolled] = losses(source, precision=precision, **run)
-    scan = "methods(repeat=scan)"
-    [scanned] = losses(source, precision=precision, methods=scan, **run)
-    [quantized] = losses(source, precision=everywhere, **run)
-    assert scanned == pytest.approx(unrolled, rel=1e-6)
-    assert quantized != pytest.approx(unrolled, rel=1e-5)
+    precision = f"precision(compute=float32, matmuls=mxfp8, {given})"
+    how = tcfg.MethodsConfig(repeat="unroll")
+    unrolled = _formats_traced(source, precision, how, monkeypatch)
+    # A scan traces a run of passes that multiply alike once, as its first.
+    how = tcfg.MethodsConfig(repeat="scan")
+    scanned = _formats_traced(source, precision, how, monkeypatch)
+    assert scanned.items() <= unrolled.items()
+    assert set(unrolled.values()) == {"compute", "mxfp8"}
+    # XLA fuses what a scanned pass after one in compute quantizes apart, which moves
+    # mxfp8's loss by an ulp's rounding: 5e-5, where another format moves it 4e-4.
+    run = {"mesh": ONE, "optimizer": STABLE, "steps": 1, "precision": precision}
+    [losses_unrolled] = losses(source, **run)
+    [losses_scanned] = losses(source, methods="methods(repeat=scan)", **run)
+    assert losses_scanned == pytest.approx(losses_unrolled, rel=1e-4)
+
+
+def test_a_scan_split_by_precision_and_by_remat_counts_its_passes_as_unrolled(
+    monkeypatch,
+):
+    # Passes 1 to 3 multiply in mxfp8, and remat's first 3 split them again.
+    precision = "precision(compute=float32, matmuls=mxfp8, first=2)"
+    policy = tcfg.RematConfig(first=3)
+    runs = {
+        repeat: tcfg.MethodsConfig(repeat=repeat, remat=policy)
+        for repeat in ("unroll", "scan")
+    }
+    unrolled = _formats_traced(SCANNED, precision, runs["unroll"], monkeypatch)
+    scanned = _formats_traced(SCANNED, precision, runs["scan"], monkeypatch)
+    assert scanned.items() <= unrolled.items()
+    assert {at for at, _ in scanned} == {0, 1, 3}
 
 
 def test_first_and_last_branches_inside_a_pipeline_are_an_error(losses):
