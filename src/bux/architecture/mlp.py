@@ -2,6 +2,7 @@
 
 import jax.numpy as jnp
 from flax import nnx
+from jax.ad_checkpoint import checkpoint_name
 from jaxtyping import Array, Float
 
 from bux import config as cfg
@@ -51,9 +52,10 @@ class MLP(nnx.Module):
         self.dropout = nnx.Dropout(config.dropout, rngs=rngs)
 
     def hidden(self, x: Float[Array, "*lead d"]) -> Float[Array, "*lead f"]:
-        """Return the hidden units the down projection takes."""
-        up = self.up(x)
-        gate = None if self.gate is None else self.gate(x)
+        """Return the hidden units the down projection takes, from the up and gate
+        projections, named `mlp` (``remat``)."""
+        up = checkpoint_name(self.up(x), "mlp")
+        gate = None if self.gate is None else checkpoint_name(self.gate(x), "mlp")
         return shard_hidden(activate(self.config, up, gate))
 
     def __call__(

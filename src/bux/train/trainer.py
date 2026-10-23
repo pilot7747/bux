@@ -36,6 +36,7 @@ from jaxtyping import Array, Float, Int32
 
 from bux import kernels, parallel
 from bux.architecture import Model, Scanned, matmuls, remat
+from bux.architecture.logits import HeadOutput
 from bux.architecture.registry import Loss
 from bux.architecture.repeat import scanned_variables
 from bux.data.pipeline import DEFAULT_CACHE, jobs, prepare
@@ -49,17 +50,15 @@ from bux.train.optim import Schedule, lr_multiplier, lr_schedule, optimizer
 from bux.train.sinks import JSONL, Console, LatestMetrics, Sink, is_main_process
 
 
-def forward(model: Model, batch: Batch) -> list[Float[Array, "b t vocab"]]:
-    """Return every head's logits on `batch`, each document of a row on its own."""
-    return model.outputs(jnp.asarray(batch.input_ids), jnp.asarray(batch.position_ids))
+def forward(model: Model, batch: Batch) -> list[HeadOutput]:
+    """Return every head's output on `batch`, each document of a row on its own."""
+    return model.heads(jnp.asarray(batch.input_ids), jnp.asarray(batch.position_ids))
 
 
-def training_forward(
-    model: Model, batch: Batch
-) -> tuple[list[Float[Array, "b t vocab"]], list[Loss]]:
-    """Return `forward`'s logits in a training step, and the losses layers report."""
+def training_forward(model: Model, batch: Batch) -> tuple[list[HeadOutput], list[Loss]]:
+    """Return `forward`'s outputs in a training step, and the losses layers report."""
     tokens, positions = jnp.asarray(batch.input_ids), jnp.asarray(batch.position_ids)
-    return model.training_outputs(tokens, positions)
+    return model.training_heads(tokens, positions)
 
 
 def cast[M: nnx.Module](model: M, dtype: DTypeLike) -> M:
@@ -239,8 +238,8 @@ class Trainer:
             model = cast(nnx.merge(graphdef, params, buffers, copy=True), self.compute)
             model.set_attributes(update_at_step_end=True, raise_if_not_found=False)
             with matmuls.use(self.matmuls, jnp.asarray(batch.input_ids)):
-                logits, aux_losses = training_forward(model, batch)
-            per_token, per_row = self.objective(logits, batch, aux_losses)
+                heads, aux_losses = training_forward(model, batch)
+            per_token, per_row = self.objective(heads, batch, aux_losses)
             loss = token_share * per_token.loss + row_share * per_row.loss
             metrics = _scaled(per_token.metrics, token_share)
             metrics |= _scaled(per_row.metrics, row_share)
@@ -252,8 +251,8 @@ class Trainer:
     def eval_step(self, model: Model, batch: Batch) -> Float[Array, ""]:
         """Return the first head's loss on `batch`, computed in `compute`."""
         with matmuls.use(self.matmuls):
-            logits = forward(cast(model, self.compute), batch)
-        per_token, _ = self.objective(logits, batch)
+            heads = forward(cast(model, self.compute), batch)
+        per_token, _ = self.objective(heads, batch)
         return per_token.metrics["loss"]
 
     def train_on_batch(self, batch: Batch) -> Metrics:
@@ -401,8 +400,8 @@ def step_flops(run: ir.Run) -> float:
             model = nnx.merge(graphdef, params, rest, copy=True)
             model = cast(model, t.precision.compute)
             model.set_attributes(update_at_step_end=True, raise_if_not_found=False)
-            logits, losses = training_forward(model, batch)
-            per_token, per_row = loss(logits, batch, losses)
+            heads, losses = training_forward(model, batch)
+            per_token, per_row = loss(heads, batch, losses)
             return per_token.loss + per_row.loss
 
         return jax.grad(f)(params)

@@ -92,7 +92,7 @@ def _steady(
     ):
         return None
     carry = pure.Changes(
-        None if changed.logits is None else taps.logits,
+        None if changed.heads is None else taps.heads,
         None if changed.pending_read is None else taps.pending_read,
         {k: taps[k] for k in changed.stacks},
     )

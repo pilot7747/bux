@@ -6,19 +6,23 @@ its name, so another term is a name, a weight and a function:
     obj = objective(run.train.loss, run.arch)
     obj.terms["logit_l2"] = Term(1e-4, lambda logits, batch: jnp.mean(logits[0] ** 2))
 
-The losses that layers report from a training forward (``report`` in
-``bux.architecture.registry``) are terms too, weighted by each layer.
+A head's logits are made only when a term reads them (``Heads``). The terms here take
+what they need of them a chunk of positions at a time instead, and so never make them
+all (``bux.architecture.logits``). The losses that layers report from a training
+forward (``report`` in ``bux.architecture.registry``) are terms too, weighted by each
+layer.
 """
 
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass
-from typing import NamedTuple
+from typing import NamedTuple, overload
 
 import jax
 import jax.numpy as jnp
 import optax
-from jaxtyping import Array, Bool, Float
+from jaxtyping import Array, Bool, Float, Int
 
+from bux.architecture.logits import HeadOutput, Scores
 from bux.architecture.registry import Loss
 from bux.architecture.segments import Segments
 from bux.lang import ir
@@ -26,12 +30,51 @@ from bux.train import config as tcfg
 from bux.train.data import Batch
 
 Metrics = dict[str, Float[Array, ""]]  # what a step measured, still on the device
-Logits = Sequence[Float[Array, "b t vocab"]]  # every head's, in execution order
+Output = HeadOutput | Float[Array, "b t vocab"]  # a head's output, or its logits
+
+
+class Heads(Sequence):  # not Sequence[Array]: a type checker would read an item
+    """Every head's logits on `batch`, in execution order, each made once a term
+    reads it. `scores` gives a head's cross-entropy what it takes, without them."""
+
+    def __init__(self, outputs: Sequence[Output], batch: Batch):
+        self.outputs, self.batch = list(outputs), batch
+        self._logits: dict[int, Float[Array, "b t vocab"]] = {}
+        self._scores: dict[tuple[int, int], Scores] = {}
+
+    def __len__(self) -> int:
+        return len(self.outputs)
+
+    @overload
+    def __getitem__(self, i: int) -> Float[Array, "b t vocab"]: ...
+    @overload
+    def __getitem__(self, i: slice) -> list[Float[Array, "b t vocab"]]: ...
+    def __getitem__(
+        self, i: int | slice
+    ) -> Float[Array, "b t vocab"] | list[Float[Array, "b t vocab"]]:
+        if isinstance(i, slice):
+            return [self[j] for j in range(len(self))[i]]
+        if i not in self._logits:
+            out = self.outputs[i]
+            self._logits[i] = out.logits() if isinstance(out, HeadOutput) else out
+        return self._logits[i]
+
+    def scores(self, i: int, offset: int) -> Scores:
+        """Return head i's scores of token t + offset at each position t, a chunk at
+        a time (``HeadOutput.scores``); the last `offset` score token 0."""
+        if (i, offset) not in self._scores:
+            out, targets = self.outputs[i], targets_ahead(self.batch, offset)
+            self._scores[i, offset] = (
+                out.scores(targets)
+                if isinstance(out, HeadOutput)
+                else Scores.of(out, targets)
+            )
+        return self._scores[i, offset]
 
 
 class Term(NamedTuple):
     weight: float
-    fn: Callable[[Logits, Batch], Float[Array, ""]]
+    fn: Callable[[Heads, Batch], Float[Array, ""]]
 
 
 class Part(NamedTuple):
@@ -48,11 +91,13 @@ class Objective:
     terms: dict[str, Term]
 
     def __call__(
-        self, logits: Logits, batch: Batch, aux_losses: Sequence[Loss] = ()
+        self, outputs: Sequence[Output], batch: Batch, aux_losses: Sequence[Loss] = ()
     ) -> tuple[Part, Part]:
         """Return the objective's two parts: its terms, means over target tokens, and
-        the losses layers report, means over rows, each name's values summed."""
-        metrics = {name: term.fn(logits, batch) for name, term in self.terms.items()}
+        the losses layers report, means over rows, each name's values summed. Each
+        head is given as its output, or as its logits."""
+        heads = Heads(outputs, batch)
+        metrics = {name: term.fn(heads, batch) for name, term in self.terms.items()}
         loss = jnp.zeros((), jnp.float32)
         for name, term in self.terms.items():
             loss = loss + term.weight * metrics[name]
@@ -70,16 +115,16 @@ def objective(config: tcfg.LossConfig, arch: ir.Architecture) -> Objective:
     cross-entropy as `loss`, its `z_loss`, and as `mtp` the mean loss of the heads
     that predict further ahead."""
     offsets = prediction_offsets(arch)
-    first = Term(1.0, lambda logits, b: cross_entropy(logits[0], b, offsets[0]))
+    first = Term(1.0, lambda heads, b: head_cross_entropy(heads, 0, b, offsets[0]))
     terms = {"loss": first}
     if config.z:
-        z = Term(config.z, lambda logits, b: z_loss(logits[0], target_mask(b)))
+        z = Term(config.z, lambda heads, b: head_z_loss(heads, 0, b, offsets[0]))
         terms["z_loss"] = z
     if len(offsets) > 1:
 
-        def mtp(logits: Logits, b: Batch) -> Float[Array, ""]:
-            further = zip(logits[1:], offsets[1:], strict=True)
-            losses = [cross_entropy(head, b, offset) for head, offset in further]
+        def mtp(heads: Heads, b: Batch) -> Float[Array, ""]:
+            further = enumerate(offsets[1:], 1)
+            losses = [head_cross_entropy(heads, i, b, offset) for i, offset in further]
             return jnp.mean(jnp.stack(losses))
 
         terms["mtp"] = Term(config.mtp, mtp)
@@ -105,25 +150,50 @@ def target_mask(batch: Batch, offset: int = 1) -> Bool[Array, "b _"]:
     return jnp.asarray(batch.loss_mask[:, offset:]) & (within[:, offset:] >= offset)
 
 
+def targets_ahead(batch: Batch, offset: int = 1) -> Int[Array, "b t"]:
+    """Return token t + offset at each position t, and 0 at the last `offset`."""
+    return jnp.pad(jnp.asarray(batch.input_ids)[:, offset:], ((0, 0), (0, offset)))
+
+
+def _padded_mask(batch: Batch, offset: int) -> Bool[Array, "b t"]:
+    """Return `target_mask`, False at the last `offset` positions."""
+    return jnp.pad(target_mask(batch, offset), ((0, 0), (0, offset)))
+
+
 def _masked_mean(
     values: Float[Array, "b t"], mask: Bool[Array, "b t"]
 ) -> Float[Array, ""]:
     return jnp.sum(values * mask) / jnp.maximum(jnp.sum(mask), 1)
 
 
+def head_cross_entropy(
+    heads: Heads, i: int, batch: Batch, offset: int = 1
+) -> Float[Array, ""]:
+    """Return head i's `cross_entropy` from its scores, without its logits."""
+    lse, target = heads.scores(i, offset)
+    return _masked_mean(lse - target, _padded_mask(batch, offset))
+
+
+def head_z_loss(
+    heads: Heads, i: int, batch: Batch, offset: int = 1
+) -> Float[Array, ""]:
+    """Return head i's `z_loss` over the positions with a target `offset` ahead, from
+    its scores."""
+    lse = heads.scores(i, offset).lse
+    return _masked_mean(lse**2, _padded_mask(batch, offset))
+
+
 def cross_entropy(
     logits: Float[Array, "b t vocab"], batch: Batch, offset: int = 1
 ) -> Float[Array, ""]:
     """Return the mean cross-entropy of predicting token t + offset from each position
-    t that has a target (`target_mask`). The last `offset` positions are masked out
-    rather than sliced off the logits, whose gradient would then pad a copy of them."""
-    pad = ((0, 0), (0, offset))
-    mask = jnp.pad(target_mask(batch, offset), pad)
-    targets = jnp.pad(jnp.asarray(batch.input_ids)[:, offset:], pad)
+    t that has a target (`target_mask`), from logits given whole. The last `offset`
+    positions are masked out rather than sliced off the logits, whose gradient would
+    then pad a copy of them."""
     loss = optax.softmax_cross_entropy_with_integer_labels(
-        logits.astype(jnp.float32), targets
+        logits.astype(jnp.float32), targets_ahead(batch, offset)
     )
-    return _masked_mean(loss, mask)
+    return _masked_mean(loss, _padded_mask(batch, offset))
 
 
 def z_loss(

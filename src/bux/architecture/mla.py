@@ -4,6 +4,7 @@ from collections.abc import Sequence
 
 import jax.numpy as jnp
 from flax import nnx
+from jax.ad_checkpoint import checkpoint_name
 from jaxtyping import Array, Float, Int
 
 from bux import config as cfg
@@ -95,9 +96,10 @@ class MLA(SoftmaxAttention):
         b, t, _ = x.shape
         h, n, r = self.heads, self.nope_head_dim, self.rope_head_dim
         pos = None if docs is None else docs.positions
-        q = self.q(query).reshape(b, t, h, n + r)
+        q = checkpoint_name(self.q(query), "qkv").reshape(b, t, h, n + r)
         kv_latent, k_rope = jnp.split(self.kv_a(x), [self.kv_lora_rank], axis=-1)
-        kv = self.kv_b(self.kv_a_norm(kv_latent)).reshape(b, t, h, n + self.v_head_dim)
+        kv = checkpoint_name(self.kv_b(self.kv_a_norm(kv_latent)), "qkv")
+        kv = kv.reshape(b, t, h, n + self.v_head_dim)
         k_nope, v = jnp.split(kv, [n], axis=-1)
         k = jnp.concatenate(
             [k_nope, jnp.broadcast_to(k_rope[:, :, None], (b, t, h, r))], -1

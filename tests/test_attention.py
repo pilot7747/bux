@@ -667,15 +667,15 @@ def test_the_layers_that_run_an_indexer_report_its_loss_and_no_others(body):
     """A layer that reads the index port runs none, and a model without an indexer
     reports nothing."""
     m, t = model(BODIES[body]), tokens()
-    logits, reported = m.training_outputs(t)
+    heads, reported = m.training_heads(t)
     indexers = sum(isinstance(i, Indexer) for _, i in nnx.iter_modules(m))
     assert [r.name for r in reported] == ["indexer_loss"] * indexers
-    assert jnp.array_equal(logits[0], m(t))
+    assert jnp.array_equal(heads[0].logits(), m(t))
 
 
 def indexer_loss(m, t, positions=None):
     """The indexer losses of a training forward of `m`, summed."""
-    _, reported = m.training_outputs(t, positions)
+    _, reported = m.training_heads(t, positions)
     return sum(r.value for r in reported if r.name == "indexer_loss")
 
 

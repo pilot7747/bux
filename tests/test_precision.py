@@ -86,6 +86,7 @@ FAMILIES = ARCHITECTURES | {
     "nextn": PRELUDE
     + "mtp = $h! nextn [norm ffn] norm @h head\n"
     + "model = embed [norm attn] [norm ffn] norm @h head mtp^2",
+    "tied": _with("attn").replace("norm head", "norm head(tied=true, softcap=30)"),
 }
 BF16 = "precision(compute=bfloat16)"
 ONE = "mesh(data=1)"
@@ -139,7 +140,10 @@ def test_eval_computes_in_bfloat16_near_float32():
 @pytest.mark.parametrize("family", FAMILIES)
 def test_a_bfloat16_forward_keeps_the_stream_in_bfloat16(family):
     model = cast(_trainer(FAMILIES[family]).model, jnp.bfloat16)
-    assert all(y.dtype == jnp.bfloat16 for y in forward(model, _batch()))
+    heads = forward(model, _batch())
+    assert all(head.hidden.dtype == jnp.bfloat16 for head in heads)
+    assert all(head.projection.kernel.dtype == jnp.bfloat16 for head in heads)
+    assert all(head.logits().dtype == jnp.bfloat16 for head in heads)
 
 
 ISLANDS = (
@@ -322,7 +326,8 @@ def test_block_projections_multiply_in_the_format_and_the_router_and_head_in_com
 
     def run() -> list[Float[Array, "b t vocab"]]:
         with matmuls.use("mxfp8"):
-            return forward(cast(model, jnp.bfloat16), _batch())
+            heads = forward(cast(model, jnp.bfloat16), _batch())
+            return [head.logits() for head in heads]
 
     # The up, gate and down of 2 FFNs and of 2 MoEs' shared experts.
     assert _count(jax.make_jaxpr(run)().jaxpr, "scaled_matmul_wrapper") == 12
