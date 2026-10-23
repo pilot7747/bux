@@ -15,7 +15,7 @@ from flax import nnx
 from jaxtyping import Array, Shaped
 
 from bux import parallel
-from bux.architecture import remat, residual
+from bux.architecture import matmuls, remat, residual
 from bux.architecture.registry import Context, Stream, Taps, build_layer
 from bux.lang import ir
 from bux.parallel import shard_stream
@@ -23,7 +23,8 @@ from bux.parallel import shard_stream
 
 class Sequence(nnx.Module):
     """Run the items one after another. Those that are `branches` outside any other
-    are rematerialized as the run's `remat` says (``remat.rematted``)."""
+    are numbered, for the precision's first and last (``matmuls.branch``), and
+    rematerialized as the run's `remat` says (``remat.rematted``)."""
 
     def __init__(self, items: list[nnx.Module], branches: tuple[bool, ...] = ()):
         self.items = nnx.List(items)
@@ -31,8 +32,13 @@ class Sequence(nnx.Module):
 
     def __call__(self, x: Stream, taps: Taps) -> Stream:
         for item, branch in zip(self.items, self.branches, strict=True):
-            x = remat.rematted(item, x, taps) if branch else item(x, taps)
+            x = _branch(item, x, taps) if branch else item(x, taps)
         return x
+
+
+def _branch(item: nnx.Module, x: Stream, taps: Taps) -> Stream:
+    with matmuls.branch():
+        return remat.rematted(item, x, taps)
 
 
 class ResidualBranch(nnx.Module):

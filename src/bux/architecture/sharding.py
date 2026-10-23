@@ -14,10 +14,12 @@ from bux import parallel
 from bux.architecture import matmuls
 
 
-def projection(n_in: int, n_out: int, **kwargs: Any) -> nnx.Linear:
-    """Make an `nnx.Linear` of a block, which multiplies in the run's matmul format
-    (``matmuls``)."""
-    return nnx.Linear(n_in, n_out, dot_general=matmuls.dot_general, **kwargs)
+def projection(
+    n_in: int, n_out: int, role: str | None = None, **kwargs: Any
+) -> nnx.Linear:
+    """Make an `nnx.Linear` of a block, which multiplies in the format the run's
+    precision gives its `role` (``matmuls``)."""
+    return nnx.Linear(n_in, n_out, dot_general=matmuls.role(role), **kwargs)
 
 
 def linear(
@@ -27,16 +29,18 @@ def linear(
     bias: bool,
     rngs: nnx.Rngs,
     in_compute: bool = False,
+    role: str | None = None,
 ) -> nnx.Linear:
-    """Make a `projection` whose kernel's dimensions are `names`, its bias's the last;
-    or `in_compute`, an `nnx.Linear` that multiplies in the dtype the run computes in."""
+    """Make a `projection` of `role` whose kernel's dimensions are `names`, its bias's
+    the last; or `in_compute`, an `nnx.Linear` that multiplies in the dtype the run
+    computes in."""
     return nnx.Linear(
         n_in,
         n_out,
         use_bias=bias,
         kernel_init=parallel.named(*names),
         bias_init=parallel.named(names[1], init=nnx.initializers.zeros),
-        dot_general=jax.lax.dot_general if in_compute else matmuls.dot_general,
+        dot_general=jax.lax.dot_general if in_compute else matmuls.role(role),
         rngs=rngs,
     )
 

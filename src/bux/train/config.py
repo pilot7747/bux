@@ -301,16 +301,81 @@ class ProfileConfig(Config):
     steps: Positive = 5
 
 
+# --- Precision ---------------------------------------------------------------------------
+# What a run computes in, and the format each projection inside a block multiplies in
+# (bux.architecture.matmuls): by the kind of projection, by the residual branch it is
+# in, and by the GEMM.
+
+# The GEMMs of a projection y = x W: y's (fprop), and the gradient's by x (dgrad) and
+# by W (wgrad).
+Pass = Literal["fprop", "dgrad", "wgrad"]
+PASSES: tuple[Pass, ...] = ("fprop", "dgrad", "wgrad")
+
+
+def _in_compute(fmt: str | None) -> str | None:
+    if fmt not in (None, "compute"):
+        raise ValueError(
+            "the routed experts multiply in compute: a grouped block-scaled GEMM is "
+            "not in bux yet"
+        )
+    return fmt
+
+
+# A number of residual branches, or a share of the model's, rounded up.
+Branches = Annotated[int, Field(ge=0)] | Annotated[float, Field(gt=0, lt=1)]
+
+
+class RolesConfig(Config):
+    """The format each kind of projection multiplies in, where it is not the
+    precision's `matmuls`; none is `matmuls`. The embedding, the head, the router and
+    softmax attention's own matmuls always stay in compute."""
+
+    type: Literal["roles"] = "roles"
+    q: str | None = None  # attention's queries and gate (gqa, mla, csa, the indexer)
+    kv: str | None = None  # attention's keys and values
+    o: str | None = None  # attention's output projection
+    mlp: str | None = None  # MLPs, the shared experts' too
+    # The routed experts, in compute until bux has a grouped block-scaled GEMM.
+    experts: Annotated[str | None, AfterValidator(_in_compute)] = None
+    latent: str | None = None  # LatentMoE's projections to and from its latent
+    recurrence: str | None = None  # the recurrent mixers' projections, but the output
+    recurrence_out: str | None = None  # their output projection, Mamba's out_proj
+    mtp: str | None = None  # nextn's projection, and every branch after the first head
+
+
+class SwitchConfig(Config):
+    """From `at` of the steps on, only `passes` multiply in the format: the end of a
+    run in a higher precision. NVIDIA's NVFP4 recipe takes fprop to bfloat16 for the
+    last 18%: passes=[dgrad, wgrad]."""
+
+    type: Literal["switch"] = "switch"
+    at: Annotated[float, Field(gt=0, lt=1)]
+    passes: tuple[Pass, ...] = ()
+
+
 class PrecisionConfig(Config):
     """The dtype the forward and backward compute in, and the format the projections
-    inside blocks multiply in (bux.architecture.matmuls). Parameters and the
-    optimizer's state stay float32, and so do norm statistics, router scores and
-    top-k, recurrent states and the loss. Unlike the three settings below, it is in
-    the run's id."""
+    inside blocks multiply in (bux.architecture.matmuls): `matmuls`, or what `roles`
+    gives a kind of projection, and compute in the `first` and `last` residual
+    branches of the model. Of each projection's GEMMs, only `passes` multiply in the
+    format. Parameters stay float32, and so do the optimizer's `moments`, unless
+    bfloat16, norm statistics, router scores and top-k, recurrent states and the loss.
+    Unlike the three settings below, it is in the run's id, but for `eval`."""
 
     type: Literal["precision"] = "precision"
     compute: Literal["float32", "bfloat16"] = "bfloat16"
     matmuls: str = "compute"  # a format of bux.architecture.matmuls: mxfp8, nvfp4
+    roles: RolesConfig = RolesConfig()
+    # The residual branches outside any other, first and last before the first head,
+    # that multiply in compute: a number of them, or a share.
+    first: Branches = 0
+    last: Branches = 0
+    passes: tuple[Pass, ...] = PASSES  # the GEMMs that multiply in the format
+    switch: SwitchConfig | None = None
+    eval: Literal["train", "compute"] = (
+        "train"  # evaluation multiplies as training does
+    )
+    moments: Literal["float32", "bfloat16"] = "float32"  # the optimizer's state
 
 
 # --- Parallelism -----------------------------------------------------------------------
@@ -422,6 +487,8 @@ Setting = Annotated[
     | LogConfig
     | ProfileConfig
     | PrecisionConfig
+    | RolesConfig
+    | SwitchConfig
     | MeshConfig
     | LayoutConfig
     | MethodsConfig,

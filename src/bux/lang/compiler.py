@@ -844,9 +844,10 @@ class _Evaluator:
             options = re.findall(r"'([^']*)'", str(expected))
             close = difflib.get_close_matches(str(error["input"]), options, n=1)
             hint = f"did you mean '{close[0]}'?" if close else None
-        elif arg_span in self.bare:
+        elif arg_span in self.bare and error["type"] != "value_error":
             # A bare name only works as a string, and this setting wants something
-            # else, so the name was meant to refer to a definition.
+            # else, so the name was meant to refer to a definition. A value error is
+            # the setting's own check, of a string it takes.
             name, name_span, scope = self.bare[arg_span]
             return self.unknown(name, name_span, scope, "name")
         return BuxError(
