@@ -8,9 +8,9 @@ memory until the backward reads it, and computes everything else again
 (``keeping``). Each residual branch outside any other is rematerialized as a unit
 (``rematted``), and so is each scanned pass; nothing inside either is again. With
 `first`, only the first passes of each repeat are, and the rest keep everything
-(``at_pass``). A policy is also a name in `methods.remat` (``PRESETS``): `none` keeps
-everything, but in a scanned pass, which keeps all but what elementwise ops make
-(``unfused``).
+(``tracing.current_pass``). A policy is also a name in `methods.remat`
+(``PRESETS``): `none` keeps everything, but in a scanned pass, which keeps all but
+what elementwise ops make (``unfused``).
 
 Layers name what is worth keeping (``checkpoint_name``):
 
@@ -41,7 +41,7 @@ from jaxtyping import Shaped
 
 from bux import parallel
 from bux.architecture.registry import Stream, Taps
-from bux.architecture.repeats import pure
+from bux.architecture.repeats import pure, tracing
 from bux.jax_internals import Primitive
 from bux.parallel import methods
 from bux.train.config import RematConfig
@@ -120,8 +120,6 @@ _REMATTED = contextvars.ContextVar("rematted", default=False)
 # Set while a call traces under a policy of the run's: what `named` names, only it
 # keeps. Under `unfused`, naming would keep what it makes the backward compute again.
 _NAMING = contextvars.ContextVar("naming", default=False)
-# The pass of the outermost repeat that traces, which `first` counts; None outside.
-_PASS = contextvars.ContextVar[int | None]("pass", default=None)
 
 
 def setting() -> str | RematConfig:
@@ -131,6 +129,7 @@ def setting() -> str | RematConfig:
 
 
 def _found(remat: str | RematConfig) -> Policy:
+    """Return the policy `remat` names, or the one it describes."""
     if isinstance(remat, str):
         return methods.remat.find(remat)
     return keeping(remat.save, remat.offload)
@@ -146,29 +145,17 @@ def policy() -> Policy | None:
 
 
 def _past_first(remat: str | RematConfig) -> bool:
-    first, at = getattr(remat, "first", None), _PASS.get()
+    """Return whether the pass tracing comes after the run's `first`
+    (``tracing.current_pass``)."""
+    first, at = getattr(remat, "first", None), tracing.current_pass()
     return first is not None and at is not None and at >= first
 
 
-@contextlib.contextmanager
-def at_pass(i: int) -> Generator[None]:
-    """Trace the block as pass i of a repeat, for `first`; inside a pass of an outer
-    repeat, as that pass still."""
-    token = _PASS.set(i) if _PASS.get() is None else None
-    try:
-        yield
-    finally:
-        if token is not None:
-            _PASS.reset(token)
-
-
-def spans(start: int, stop: int) -> list[tuple[int, int]]:
-    """Return passes start to stop of a repeat as runs that rematerialize alike: those
-    before the run's `first`, and the rest."""
+def cuts() -> list[int]:
+    """Return where the run's `first` cuts a repeat's passes, after which they
+    rematerialize nothing (``tracing.runs``)."""
     first = getattr(setting(), "first", None)
-    if first is None or not start < first < stop:
-        return [(start, stop)]
-    return [(start, first), (first, stop)]
+    return [] if first is None else [first]
 
 
 @contextlib.contextmanager

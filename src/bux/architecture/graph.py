@@ -16,16 +16,15 @@ from jaxtyping import Array, Shaped
 
 from bux import parallel
 from bux.architecture import residual
-from bux.architecture.precision import matmuls
 from bux.architecture.registry import Context, Stream, Taps, build_layer
-from bux.architecture.repeats import remat
+from bux.architecture.repeats import remat, tracing
 from bux.lang import ir
 from bux.parallel import shard_stream
 
 
 class Sequence(nnx.Module):
     """Run the items one after another. Those that are `branches` outside any other
-    are numbered, for the precision's first and last (``matmuls.branch``), and
+    are numbered, for the precision's first and last (``tracing.branch``), and
     rematerialized as the run's `remat` says (``remat.rematted``)."""
 
     def __init__(self, items: list[nnx.Module], branches: tuple[bool, ...] = ()):
@@ -40,7 +39,7 @@ class Sequence(nnx.Module):
 
 def run_branch(item: nnx.Module, x: Stream, taps: Taps) -> Stream:
     """Run a residual branch outside any other: numbered, and rematerialized."""
-    with matmuls.branch():
+    with tracing.branch():
         return remat.rematted(item, x, taps)
 
 

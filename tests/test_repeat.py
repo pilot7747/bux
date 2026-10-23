@@ -20,7 +20,7 @@ from bux import parallel
 from bux.architecture import Model, MoE, Norm, Scanned
 from bux.architecture.graph import Sequence
 from bux.architecture.precision import matmuls
-from bux.architecture.repeats import remat
+from bux.architecture.repeats import remat, tracing
 from bux.architecture.residual import HyperConnections
 from bux.lang import compile, compile_runs
 from bux.lang.printer import run_to_source
@@ -227,6 +227,37 @@ def test_single_pass_mhc_scans_from_the_layer_after_the_one_that_starts_its_read
     assert _scan_lengths(_model(SINGLE_PASS)) == [2]
     scanned = _logits(SINGLE_PASS, SCAN)
     assert np.allclose(scanned, _logits(SINGLE_PASS, UNROLL), atol=1e-5)
+
+
+# --- What traces -----------------------------------------------------------------------
+
+
+def _numbered() -> int:
+    with tracing.branch():
+        branch = tracing.current_branch()
+        assert branch is not None
+        return branch.number
+
+
+def test_a_run_of_passes_numbers_its_branches_as_its_first_pass_s():
+    with tracing.forward(main=8):
+        _numbered()
+        with tracing.passes(range(1, 4), each=2):
+            traced_twice = [_numbered() for _ in range(2 * 2)]
+            at = tracing.current_pass()
+        [after] = tracing.next_branches(1)
+    assert traced_twice == [1, 2, 1, 2] and at == 1 and after.number == 1 + 3 * 2
+
+
+def test_a_repeat_inside_a_pass_traces_as_that_pass():
+    with tracing.passes(range(2, 3)), tracing.passes(range(5, 7)):
+        assert tracing.current_pass() == 2
+    assert tracing.current_pass() is None
+
+
+def test_runs_cut_passes_where_they_trace_apart():
+    assert tracing.runs(8, [3, 0, 3, 8, 11]) == [range(3), range(3, 8)]
+    assert tracing.runs(4) == [range(4)]
 
 
 # --- The optimizer and the layout ------------------------------------------------------
