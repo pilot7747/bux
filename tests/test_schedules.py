@@ -390,7 +390,7 @@ def test_balanced_stages_leave_the_last_the_head_s_work():
 def test_a_scheduled_run_splits_its_passes_by_their_work(losses, name):
     mesh, how = "mesh(stage=2, data=1)", _how(name, 4)
     assert stages.balanced(_run(WIDE, mesh, how)).stages == [6, 2]
-    assert stages.balanced(_run(WIDE, mesh, _how("gpipe", 4))).stages is None
+    assert stages.balanced(_run(WIDE, mesh, _how("gpipe", 4))).stages == [4, 4]
     piped = losses(WIDE, mesh=mesh, methods=how, batch="16")
     assert np.allclose(
         piped, losses(WIDE, mesh=ONE, methods=SCAN, batch="16"), atol=1e-5

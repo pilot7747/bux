@@ -708,7 +708,7 @@ def train(
     log = _log(run, lr_schedule(config.optimizer.lr, multiplier))
     methods = stages.balanced(run)
     if methods.stages != config.methods.stages:
-        echo(f"{run.name}: methods.stages = {methods.stages}, by their work")
+        echo(f"{run.name}: methods.stages = {methods.stages}")
     with parallel.use(config.mesh, config.layout, methods):
         parallel.check(config.batch, config.seq_len)
         _check_cpu_bfloat16(run)

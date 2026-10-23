@@ -1,12 +1,14 @@
-"""The split of a scheduled pipeline's passes over its stages, where the run leaves
-`methods.stages` to bux: the one that balances the stages' work.
+"""The split of a pipeline's passes over its stages, where the run leaves
+`methods.stages` to bux: the one that balances the stages' work, which a run's
+checkpoints keep.
 
 Under 1f1b and zbh1 the first stage also runs the model up to the pipelined repeat
 (the embedding), and the last runs the rest of it to the loss (the head), so with as
 many passes on each, the last stage is the slowest and the others wait for it. The
 work is a row's forward in FLOPs (``flops.count``), in each part of the model cut at
 the repeat as a schedule cuts it (``pipelined.stream_into``, ``pipelined.leaving``),
-and ``pipeline.balanced`` picks the split whose slowest stage does the least.
+and ``pipeline.balanced`` picks the split whose slowest stage does the least. Under
+gpipe every stage runs the rest of the model, so its stages split the passes evenly.
 """
 
 import contextlib
@@ -35,14 +37,16 @@ from bux.train.objective import Objective, objective
 
 def balanced(run: ir.Run) -> MethodsConfig:
     """Return the run's methods, with the stages that balance their work where it
-    pipelines by a schedule and does not give them."""
+    pipelines in one round and does not give them."""
     t = run.train
-    methods = t.methods
-    scheduled = methods.pipeline in schedule.TABLES
-    if t.mesh.stage == 1 or methods.stages is not None or not scheduled:
+    methods, n = t.methods, t.mesh.stage
+    if n == 1 or methods.stages is not None or methods.rounds > 1:
         return methods
     passes, work = _work(run)
-    split = pipeline.balanced(passes, t.mesh.stage, work)
+    if methods.pipeline in schedule.TABLES:
+        split = pipeline.balanced(passes, n, work)
+    else:
+        split = pipeline.even(passes, n)
     return methods.model_copy(update={"stages": list(split)})
 
 

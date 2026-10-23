@@ -429,3 +429,27 @@ def test_an_uneven_pipeline_resumes_with_its_split_alone(tmp_path):
     )
     assert said[0].endswith("resuming at step 2")
     assert resumed["loss"] == pytest.approx(whole["loss"], abs=1e-5)
+
+
+def test_a_pipeline_resumes_on_the_stages_its_run_balanced(tmp_path):
+    wide = LLAMA.replace("vocab_size = 128", "vocab_size = 4096")  # a head of 4 blocks
+
+    def run(split: str | None):
+        how = _how(4, '"1f1b"', **({"stages": split} if split else {}))
+        every = "checkpoint = checkpoint(every=2)"
+        mesh = "mesh(stage=2, data=1)"
+        [r] = compile_runs(f"{wide}\n{TRAIN}\nmesh = {mesh}\nmethods = {how}\n{every}")
+        return r
+
+    said: list[str] = []
+    whole = train(run(None), tmp_path, echo=said.append)
+    assert said[0].endswith("methods.stages = [6, 2]")
+    shutil.rmtree(directory(run(None), tmp_path) / "checkpoints" / "4")
+    with pytest.raises(
+        ValueError, match=re.escape("saved with methods.stages = [6, 2]")
+    ):
+        train(run("[4, 4]"), tmp_path, echo=lambda _: None)
+    said.clear()
+    resumed = train(run(None), tmp_path, echo=said.append)
+    assert said[1].endswith("resuming at step 2")
+    assert resumed["loss"] == pytest.approx(whole["loss"], abs=1e-5)
