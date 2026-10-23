@@ -587,7 +587,7 @@ the layers that report the name, under that name; eval leaves them out.
 overrides them changes what a step does (averaging the weights, skipping a spike) and
 keeps the loop, the hooks and checkpoints. Gradient accumulation is built in:
 `methods(microbatches=n)`, which on a mesh gathers the parameters once a step and, where
-the rows are independent, reduces the gradients once (docs/parallelism.md, "Gathered
+the rows are independent and span hosts, reduces the gradients once (docs/parallelism.md, "Gathered
 once, reduced once"); `Trainer(..., gather=, accumulate=, reduce=)` takes the same
 settings.
 

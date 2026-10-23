@@ -15,7 +15,7 @@ from jax.sharding import PartitionSpec as P
 from bux import parallel
 from bux.architecture import Model
 from bux.lang import compile_runs
-from bux.parallel.gather import own_streams
+from bux.parallel.gather import own_streams, spans_processes
 from bux.train import config as tcfg
 from bux.train.data import plain
 from bux.train.objective import objective
@@ -42,6 +42,7 @@ TRAIN = (
 )
 TOKENS = np.random.default_rng(0).integers(0, 128, (64, 16))
 SCAN = "methods(repeat=scan, microbatches={n})"
+UNREDUCED = "methods(repeat=scan, microbatches={n}, accumulate=unreduced)"
 BEFORE = "methods(repeat=scan, microbatches={n}, gather=layer, accumulate=reduced)"
 GRADIENTS = ("reduce-scatter", "all-reduce")
 
@@ -51,12 +52,16 @@ GRADIENTS = ("reduce-scatter", "all-reduce")
 
 def test_a_step_of_8_microbatches_moves_the_parameters_and_gradients_once():
     """As one of 1 does, in a scan of layers that gathers each one's as it runs, forward
-    and back; where before the parameters moved 8 times as much, and the gradients."""
+    and back; where before the parameters moved 8 times as much, and the gradients.
+    On one process, auto gathers once and reduces each microbatch."""
     one = _moved(LLAMA, "mesh(fsdp=8)", SCAN.format(n=1))
-    eight = _moved(LLAMA, "mesh(fsdp=8)", SCAN.format(n=8))
+    eight = _moved(LLAMA, "mesh(fsdp=8)", UNREDUCED.format(n=8))
+    auto = _moved(LLAMA, "mesh(fsdp=8)", SCAN.format(n=8))
     before = _moved(LLAMA, "mesh(fsdp=8)", BEFORE.format(n=8))
     assert eight["all-gather"] <= one["all-gather"]
     assert _sum(eight, GRADIENTS) <= _sum(one, GRADIENTS)
+    assert auto["all-gather"] == eight["all-gather"]
+    assert _sum(auto, GRADIENTS) >= 7 * _sum(one, GRADIENTS)
     assert before["all-gather"] >= 8 * eight["all-gather"]
     assert _sum(before, GRADIENTS) >= 7 * _sum(one, GRADIENTS)
 
@@ -73,14 +78,36 @@ def test_a_pipeline_gathers_its_stages_parameters_and_reduces_them_once_a_step()
     """Its 4 microbatches go through 2 stages in 5 ticks, gathering and reducing as
     they run before; and reduced each tick, only gathered once."""
     how = "methods(repeat=scan, microbatches=4{})"
-    after = _moved(LLAMA, "mesh(stage=2, fsdp=4)", how.format(""))
-    gathered = _moved(
-        LLAMA, "mesh(stage=2, fsdp=4)", how.format(", accumulate=reduced")
-    )
+    after = _moved(LLAMA, "mesh(stage=2, fsdp=4)", how.format(", accumulate=unreduced"))
+    gathered = _moved(LLAMA, "mesh(stage=2, fsdp=4)", how.format(""))
     before = _moved(LLAMA, "mesh(stage=2, fsdp=4)", how.format(", gather=layer"))
     assert before["all-gather"] >= 4 * after["all-gather"] > 0
     assert gathered["all-gather"] == after["all-gather"]
     assert _sum(gathered, GRADIENTS) >= 3 * _sum(after, GRADIENTS)
+
+
+# Each device's process on a mesh's grid, the rows' axes, and whether they span more.
+PROCESSES = [
+    (np.zeros((2, 4), int), (1,), False),  # one host
+    (np.array([[0, 0, 1, 1]]), (1,), True),  # the rows split over two hosts
+    (np.array([[0, 0], [1, 1]]), (1,), False),  # the hosts on another axis: stage
+    (np.array([[0, 0], [1, 1]]), (0,), True),
+    (np.array([[0, 0], [1, 1]]), (0, 1), True),  # data across hosts, fsdp within
+    (np.array([[0, 1], [0, 1]]), (), False),  # no axis splits the rows
+]
+
+
+@pytest.mark.parametrize(("processes", "axes", "spans"), PROCESSES)
+def test_a_reduction_over_axes_goes_between_hosts_where_their_devices_do(
+    processes, axes, spans
+):
+    assert spans_processes(processes, axes) == spans
+
+
+def test_the_tests_8_devices_are_one_process_whose_rows_span_none():
+    with parallel.use(tcfg.MeshConfig(data=2, fsdp=4)):
+        assert parallel.gather.rows() == ("data", "fsdp")
+        assert not parallel.gather.rows_span_processes()
 
 
 # --- What it computes -------------------------------------------------------------------
@@ -94,7 +121,7 @@ MESHES = [
 
 
 @pytest.mark.parametrize(("mesh", "layout"), MESHES)
-@pytest.mark.parametrize("accumulate", ["unreduced", "reduced"])
+@pytest.mark.parametrize("accumulate", ["unreduced", "reduced", "auto"])
 def test_microbatches_added_up_either_way_give_the_whole_batch_s_gradient(
     mesh, layout, accumulate
 ):

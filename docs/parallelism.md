@@ -1083,7 +1083,8 @@ way.
 ### Gathered once, reduced once: `methods.gather`, `methods.accumulate`
 
 ```
-methods = methods(microbatches=8)                                  # gathered and reduced once
+methods = methods(microbatches=8)                                  # reduced once across hosts
+methods = methods(microbatches=8, accumulate=unreduced)            # reduced once
 methods = methods(microbatches=8, accumulate=reduced)              # reduced each microbatch
 methods = methods(microbatches=8, gather=layer, accumulate=reduced)  # ZeRO-3
 ```
@@ -1113,9 +1114,11 @@ times: what ZeRO-3 does, and `methods(gather=layer, accumulate=reduced)` still d
 Inside that `shard_map` a layer sees its device's rows alone, so a layer that learns
 from the whole batch would learn from a part (`trainer.rows_independent`): the MoE's
 router, its bias and its balance loss over the batch. `accumulate=auto`, the default,
-adds up unreduced where the step has microbatches or a pipeline, its rows are
-independent and the parameters are gathered once; else each microbatch's gradient
-reduces as the backward makes it, onto its shards. `accumulate=unreduced` where it
+adds up unreduced where the step has microbatches or a pipeline, the devices along the
+rows' axes span more than one process (`gather.rows_span_processes`: their
+reductions go between hosts), its rows are independent and the parameters are
+gathered once; else each microbatch's gradient reduces as the backward makes it,
+onto its shards, which over NVLink is faster (below). `accumulate=unreduced` where it
 would not compute the same is an error that says why.
 
 A step of 8 microbatches then moves what a step of 1 does. In the compiled step of
@@ -1167,7 +1170,8 @@ NICs, as between nodes:
 | `stage=2, fsdp=4`, `repeat=scan, microbatches=8, accumulate=reduced` | 521k |
 | `stage=2, fsdp=4`, `repeat=scan, microbatches=8`                   | 566k  |
 
-So `gather=step` and `accumulate=auto` are the defaults. With deterministic GEMMs the three dense runs
+So `gather=step` is the default, and `accumulate=auto` adds up unreduced only where the
+rows' axes span processes, as between nodes. With deterministic GEMMs the three dense runs
 of 8 microbatches on one node end their 10 steps at 11.86792, 11.86793 (`reduced`) and
 11.86804 (`unreduced`).
 
@@ -1287,7 +1291,8 @@ step does not accumulate gradients over them as well. It gathers the parameters 
 splits once a step, before the ticks (`methods.gather = step`, [above](#gathered-once-reduced-once-methodsgather-methodsaccumulate)),
 in float32, since the ticks add up a stage's gradients in the dtype of what they read;
 `gather=layer` gathers each layer's as it runs, every tick, both ways. Where the rows
-are independent, `accumulate=auto` reduces the gradients once too: the trainer says so
+are independent and their axes span processes, `accumulate=auto` (or
+`accumulate=unreduced` anywhere) reduces the gradients once too: the trainer says so
 (`gather.apart`), and the pipeline's `shard_map` is then manual over the axes that
 split the rows as well as over `stage`. A stage runs its device's rows alone, each
 tick's gradients stay its own, and the `shard_map`'s transpose sums them over those

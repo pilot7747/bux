@@ -172,8 +172,8 @@ class Trainer:
     "step", or as each layer runs with "layer". With `accumulate` "unreduced" its
     microbatches' gradients add up on each device and reduce once, in `reduce`
     (``parallel.gather``), a pipeline's in float32; with "reduced" they reduce each
-    microbatch; "auto" adds them up unreduced where that computes the same, as
-    `_why_not_unreduced` says.
+    microbatch; "auto" adds them up unreduced where the rows' axes span processes,
+    and where that computes the same, as `_why_not_unreduced` says.
 
     With `donate`, a training step donates the model's and the optimizer's arrays, so
     that their new state takes the old one's memory: an array read from them before a
@@ -211,11 +211,13 @@ class Trainer:
         """Return whether a step adds up its gradients unreduced (``_unreduced``, or a
         pipeline's ``gather.apart``): where `accumulate` or a `reduce` other than
         `compute` asks for it, and by "auto" where the step runs its layers more than
-        once and that computes the same. Raise where it is asked for but would not."""
+        once, the rows' axes span processes (``gather.rows_span_processes``) and that
+        computes the same. Raise where it is asked for but would not."""
         in_float32 = self.reduce != self.compute
         asked = self.accumulate == "unreduced" or in_float32
         runs = self.microbatches > 1 or parallel.pipeline.pipelined()
-        auto = self.accumulate == "auto" and runs
+        across = parallel.gather.rows_span_processes()
+        auto = self.accumulate == "auto" and runs and across
         if not (asked or auto) or not parallel.gather.rows():
             return False  # with no axis splitting the rows, nothing reduces over them
         why = self._why_not_unreduced(model)

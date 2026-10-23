@@ -12,13 +12,14 @@ its own rows' gradients over the microbatches, and sums the sums over the device
 once (``scatter``), each device keeping its shard. A pipeline's step does the same in
 its own shard_map, made manual over those axes too (``apart``).
 
-    whole        the parameters as a step uses them, whole over FSDP's axes
-    rows         the axes that split the batch's rows, the shard_map manual over them
-    splits       each parameter's split over them
-    gather       a device's shard of a parameter, gathered whole
-    scatter      a device's part of a gradient, summed over the devices, as a shard
-    own_streams  each device's own RNG keys, so that it draws its own rows' masks
-    apart        says that the step computes its rows apart, which a pipeline reads
+    whole                the parameters as a step uses them, whole over FSDP's axes
+    rows                 the axes that split the batch's rows, manual in the shard_map
+    rows_span_processes  whether they cross hosts, where reducing once pays
+    splits               each parameter's split over them
+    gather               a device's shard of a parameter, gathered whole
+    scatter              a device's part of a gradient, summed over them, as a shard
+    own_streams          each device's own RNG keys, for its own rows' masks
+    apart                says the step computes its rows apart, which a pipeline reads
 """
 
 import contextlib
@@ -27,10 +28,12 @@ from collections.abc import Generator
 
 import jax
 import jax.numpy as jnp
+import numpy as np
 from flax import nnx
+from jax.sharding import Mesh
 from jax.sharding import PartitionSpec as P
 from jax.typing import DTypeLike
-from jaxtyping import Array, Float, Shaped
+from jaxtyping import Array, Float, Int, Shaped
 
 from bux.parallel.layout import axes
 from bux.parallel.mesh import active
@@ -57,6 +60,29 @@ def rows() -> Axes:
     return tuple(
         a for a in axes(on.layout, "batch") if on.size(a) > 1 and a not in manual
     )
+
+
+def spans_processes(processes: Int[np.ndarray, "..."], axes: tuple[int, ...]) -> bool:
+    """Return whether the devices along the mesh dimensions `axes` belong to more than
+    one process, given each device's process index on the mesh's grid: whether a
+    reduction over them goes between hosts."""
+    along = [processes.shape[a] for a in axes]
+    moved = np.moveaxis(processes, axes, range(-len(axes), 0))
+    groups = moved.reshape(-1, int(np.prod(along)))
+    return bool((groups != groups[:, :1]).any())
+
+
+def rows_span_processes() -> bool:
+    """Return whether the axes that split the rows (``rows``) span more than one
+    process of the run's mesh. Only then does a step's one reduction beat one a
+    microbatch: between hosts the collectives go through the NICs, while over NVLink
+    XLA hides a microbatch's behind the backward."""
+    on = active()
+    if on is None or not isinstance(on.mesh, Mesh):
+        return False  # an AbstractMesh has no devices
+    names = list(on.mesh.axis_names)
+    processes = np.vectorize(lambda d: d.process_index, otypes=[int])(on.mesh.devices)
+    return spans_processes(processes, tuple(names.index(a) for a in rows()))
 
 
 def splits(params: nnx.State, over: Axes) -> nnx.State:
