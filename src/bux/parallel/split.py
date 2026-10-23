@@ -287,7 +287,7 @@ def _plan_cond(eqn: core.JaxprEqn, index: int, need: dict[str, set[Key]]) -> Con
         _plan(b.jaxpr, b.consts, needed, [True] * len(b.jaxpr.invars))
         for b in eqn.params["branches"]
     ]
-    saved = [
+    saved: list[list[Key]] = [
         [("cond", index, k, i) for i in range(len(b.saved))]
         for k, b in enumerate(branches)
     ]
