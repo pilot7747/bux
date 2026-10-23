@@ -231,7 +231,7 @@ def _buffers(idx: Int[Array, "b t k"], local: int, peers: int) -> Buffers:
     flat, n = idx.reshape(-1), idx.size
     order, inverse, sizes = sort_by_expert(idx, local * peers)
     sent = sizes.reshape(peers, local).sum(-1)  # the picks for each peer
-    start = jnp.cumsum(sent) - sent  # where each peer's start, sorted
+    start = jnp.cumsum(sent) - sent  # where each peer's picks start, sorted
     slot = jnp.arange(n)
     pick = order[jnp.minimum(start[:, None] + slot, n - 1)]
     expert = jnp.where(slot < sent[:, None], flat[pick] % local, local)
