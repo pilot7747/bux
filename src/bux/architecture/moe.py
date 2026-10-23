@@ -84,9 +84,9 @@ def experts(
     on; rows past them come out 0 before `norm`. It depends on its arguments alone, so
     it runs on one device's experts in a shard_map as it does on all of them. Its
     products are named `experts` (``remat``), and multiply in the experts' format
-    (``matmuls.format_of``): by ``grouped_blockscaled`` in one of its RECIPES, there
-    up and gate as one, else in compute."""
-    recipe = grouped_blockscaled.RECIPES.get(matmuls.format_of("experts"))
+    (``experts_format``): by ``grouped_blockscaled`` in one of its RECIPES, there up
+    and gate as one, else in compute."""
+    recipe = grouped_blockscaled.RECIPES.get(experts_format())
 
     def product(
         x: Float[Array, "n e"], w: Float[Array, "E e f"]
@@ -104,6 +104,16 @@ def experts(
         u, g = product(x, up), None if gate is None else product(x, gate)
     y = product(activate(ffn, u, g), down)
     return y if norm is None else norm(y)
+
+
+def experts_format() -> str:
+    """Return the format the routed experts multiply in, in the branch that is
+    tracing: their role's (``matmuls.format_of``), or compute where `roles.experts` is
+    none. Unlike the other roles, they take no format from `matmuls`: on B300s their
+    grouped MXFP8 GEMM trains the baseline's MoE slower than bfloat16 does."""
+    if matmuls.in_force().roles.experts is None:
+        return "compute"
+    return matmuls.format_of("experts")
 
 
 def sort_by_expert(

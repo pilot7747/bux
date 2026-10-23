@@ -47,8 +47,9 @@ class Tiles(NamedTuple):
     stages: int
 
 
-ROWS = Tiles(m=128, n=128, k=128, warps=4, stages=4)
-CONTRACT = Tiles(m=128, n=128, k=128, warps=4, stages=4)
+# The fastest tried at the baseline MoE's shapes on a B300 (docs/parallelism.md).
+ROWS = Tiles(m=128, n=128, k=256, warps=8, stages=2)
+CONTRACT = Tiles(m=128, n=256, k=128, warps=8, stages=3)
 
 
 def rows(

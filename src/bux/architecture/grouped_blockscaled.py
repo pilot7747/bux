@@ -32,7 +32,6 @@ except ImportError:
     grouped_triton = None
 
 BLOCK = blockscaled.MX_BLOCK
-TRITON_QUANTIZES = True  # MXFP8's quantizer on a GPU: Triton's kernel, or blockscaled's
 # The formats of ``matmuls`` that run here, by their recipes: train.config.GROUPED.
 RECIPES = {"mxfp8": blockscaled.MXFP8, "mxfp8_2d": blockscaled.MXFP8_2D}
 
@@ -148,7 +147,7 @@ def _quantized(
 ) -> tuple[Blocks, Blocks | None]:
     """Return quantize(a), a's rows from `kept` on as 0: MXFP8 by Triton's kernel on
     a GPU, in one pass with the zeros, and a^T only if `columns`."""
-    if TRITON_QUANTIZES and quantize is blockscaled.mx_twice and _triton():
+    if quantize is blockscaled.mx_twice and _triton():
         assert grouped_triton is not None
         return grouped_triton.quantized_twice(a, kept, columns)
     return quantize(jnp.where((jnp.arange(a.shape[0]) < kept)[:, None], a, 0), seed)

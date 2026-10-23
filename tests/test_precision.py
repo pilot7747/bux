@@ -595,17 +595,19 @@ def test_the_routed_experts_in_a_format_with_no_grouped_gemm_are_an_error():
 
 # The moe architecture's 2 MoEs, each a GEMM of up and gate, and one of down.
 GROUPED = {
-    "matmuls=mxfp8": 4,
     "roles=roles(experts=mxfp8)": 4,
     "roles=roles(experts=mxfp8_2d)": 4,
+    "matmuls=nvfp4, roles=roles(experts=mxfp8)": 4,
+    "matmuls=mxfp8": 0,  # none is compute, for the experts
     "matmuls=mxfp8, roles=roles(experts=compute)": 0,
-    "matmuls=nvfp4": 0,  # no grouped GEMM in it: compute
-    "matmuls=mxfp8, first=1": 2,  # the first MoE is the first branch
+    "roles=roles(experts=mxfp8), first=1": 2,  # the first MoE is the first branch
 }
 
 
 @pytest.mark.parametrize("given", GROUPED)
-def test_the_routed_experts_multiply_as_their_role_or_matmuls_say(monkeypatch, given):
+def test_the_routed_experts_multiply_as_their_role_says_and_else_in_compute(
+    monkeypatch, given
+):
     calls, ragged_dot = [], grouped_blockscaled.ragged_dot
 
     def counted(*args, **kwargs):

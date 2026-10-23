@@ -699,12 +699,13 @@ FSDP the weights move to the tokens rather than the tokens to the weights.
 ### The experts in MXFP8
 
 ```
-precision = precision(roles=roles(experts=mxfp8))   # or matmuls=mxfp8, which they follow
+precision = precision(roles=roles(experts=mxfp8))
 ```
 
 The routed experts' role, `experts`, takes `compute`, `mxfp8` or `mxfp8_2d`
-(docs/training.md, "Precision"); `nvfp4` is an error, and under a `matmuls` of it the
-experts multiply in compute. In a format, `experts` runs up and gate as one GEMM, so
+(docs/training.md, "Precision"), and `nvfp4` is an error. Unlike the other roles,
+none is compute, not `matmuls`: on B300s it trains slower than bfloat16 (below). In a
+format, `experts` runs up and gate as one GEMM, so
 that x quantizes once, and each GEMM by `grouped_blockscaled.ragged_dot`: every operand
 of the forward's GEMM and of the backward's two quantized along what that GEMM
 contracts, as a projection's are, and each expert's W on its own. On a GPU Triton's
@@ -1270,8 +1271,8 @@ Every projection made by `sharding.projection` or `sharding.linear` multiplies b
 branch it is in (docs/training.md, "Precision"): attention's q, k, v, o and gate;
 the MLPs', the shared experts' and LatentMoE's; MLA's, CSA's, the indexer's; the
 linear attentions', RWKV-7's and Mamba's; Engram's, nextn's and `linear`'s. The routed
-experts multiply by a grouped GEMM of their own in `mxfp8` and `mxfp8_2d`
-([The experts in MXFP8](#the-experts-in-mxfp8)), and in `compute` under any other format. These stay
+experts multiply in `compute` unless their role says `mxfp8` or `mxfp8_2d`, which a
+grouped GEMM of their own takes ([The experts in MXFP8](#the-experts-in-mxfp8)). These stay
 in `compute`: the embedding and the head, softmax attention's own matmuls and its
 relative bias, the router and the shared experts' gate, hyper-connections, norms,
 low-rank gates and decays, recurrent states, and `methods(moe=dense)`'s einsums. A projection whose tokens,

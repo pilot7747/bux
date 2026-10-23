@@ -180,7 +180,7 @@ Four settings choose which projections, and when:
   | `recurrence` | the linear attentions', RWKV-7's and Mamba's projections, but the output |
   | `recurrence_out` | their output projection |
   | `mtp` | nextn's projection, and every branch after the first head |
-  | `experts` | the routed experts, by a grouped GEMM: `compute`, `mxfp8` or `mxfp8_2d`; under any other `matmuls`, compute |
+  | `experts` | the routed experts, by a grouped GEMM: `compute`, `mxfp8` or `mxfp8_2d`; `none` is compute, not `matmuls`, as theirs is slower than bfloat16's (docs/parallelism.md) |
 
   The embedding, the head, the router and softmax attention's own matmuls always
   stay in compute.
@@ -214,11 +214,11 @@ precision.last = 4 | 8
 
 | recipe | precision | left out |
 |--------|-----------|----------|
-| `nvidia_mxfp8` | Transformer Engine's MXFP8: E4M3 everywhere, gradients and routed experts too | |
+| `nvidia_mxfp8` | Transformer Engine's MXFP8: E4M3 everywhere, gradients too | MXFP8 routed experts, which are slower in bux |
 | `nvidia_nvfp4` | NVIDIA's NVFP4 pretraining: W in 16 x 16 tiles, dy rounded stochastically, a Hadamard transform for dW; `first=2, last=8` | NVFP4 routed experts, and its speed: bux quantizes NVFP4 in XLA |
 | `nemotron3_nvfp4` | NVFP4, `recurrence_out` in MXFP8, and `q`, `kv`, `o`, `latent`, `mtp` and the last 15% in bfloat16 | NVFP4 routed experts, most of its matmuls |
-| `deepseek_v3_fp8` | `mxfp8_2d`, routed experts too, the tokens sent to them in MXFP8, moments in bfloat16 | groups of 128 with float32 scales, the float32 promotion, activations kept in FP8 |
-| `torchtitan_mxfp8` | `mxfp8_2d`, routed experts too | saving a linear's input in bfloat16 |
+| `deepseek_v3_fp8` | `mxfp8_2d`, the tokens sent to the routed experts in MXFP8, moments in bfloat16 | groups of 128 with float32 scales, the float32 promotion, FP8 routed experts, activations kept in FP8 |
+| `torchtitan_mxfp8` | `mxfp8_2d` | MXFP8 routed experts, and saving a linear's input in bfloat16 |
 
 On one B300 each, the 1.3B Llama-style model trained 3000 steps of 8 x 4096 tokens of
 FineWeb-Edu (98M tokens), GEMM autotuning off. Its held-out loss at the end, in

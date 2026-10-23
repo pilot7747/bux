@@ -340,7 +340,8 @@ class RolesConfig(Config):
     kv: str | None = None  # attention's keys and values
     o: str | None = None  # attention's output projection
     mlp: str | None = None  # MLPs, the shared experts' too
-    # The routed experts: one of GROUPED, or under `matmuls` that is not one, compute.
+    # The routed experts: one of GROUPED; none is compute, not `matmuls`, as their
+    # grouped MXFP8 GEMM is slower than bfloat16's (docs/parallelism.md).
     experts: Annotated[str | None, AfterValidator(_grouped)] = None
     latent: str | None = None  # LatentMoE's projections to and from its latent
     recurrence: str | None = None  # the recurrent mixers' projections, but the output
