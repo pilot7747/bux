@@ -160,59 +160,46 @@ def test_windows_come_in_a_permutation_of_each_epoch_drawn_from_the_seed():
 
 # --- The compile cache -----------------------------------------------------------------
 
-# A process of a job of two on CPUs, which asks whether a folder is one for both. Gloo
-# carries their collectives, its peers on localhost, which a laptop resolves.
-SHARED = """
-import sys
-from pathlib import Path
+# A process of a job of two, which says where its cache is once they have joined.
+JOINED = """
+import jax
 
-import jax.extend.backend
-from jax._src import distributed, xla_bridge
-from jax._src.lib import _jax
-
-
-def cpu():
-    client = distributed.global_state.client
-    gloo = _jax.make_gloo_tcp_collectives(client, hostname="localhost")
-    return xla_bridge.make_cpu_client(collectives=gloo)
-
-
-jax.extend.backend.register_backend_factory("cpu", cpu, fail_quietly=False)
 from bux.launch import join
-from bux.runtime import shared
+from bux.runtime import configure
 
+configure()
 join()
-print(shared(Path(sys.argv[1])))
+print(jax.config.jax_compilation_cache_dir)
 """
 
 
-def _asked(folders: list[Path]) -> list[str]:
-    """What two processes say of `folders`, one each."""
+def _kept(folders: list[Path]) -> list[str]:
+    """Where two processes, whose caches are `folders`, keep them once joined."""
     with socket.socket() as s:
         s.bind(("localhost", 0))
         port = s.getsockname()[1]
     env = os.environ | {
-        "XLA_FLAGS": "--xla_force_host_platform_device_count=2",
         "JAX_COORDINATOR_ADDRESS": f"localhost:{port}",
         "JAX_NUM_PROCESSES": "2",
     }
     workers = [
         subprocess.Popen(
-            [sys.executable, "-c", SHARED, str(folder)],
-            env=env | {"JAX_PROCESS_ID": str(i)},
+            [sys.executable, "-c", JOINED],
+            env=env | {"JAX_PROCESS_ID": str(i), "JAX_COMPILATION_CACHE_DIR": str(f)},
             stdout=subprocess.PIPE,
             stderr=subprocess.STDOUT,
             text=True,
         )
-        for i, folder in enumerate(folders)
+        for i, f in enumerate(folders)
     ]
     return [w.communicate(timeout=120)[0].strip().split("\n")[-1] for w in workers]
 
 
-def test_processes_find_out_whether_their_cache_is_one_folder(tmp_path):
-    assert _asked([tmp_path / "one"] * 2) == ["True", "True"]
-    assert not list((tmp_path / "one").iterdir())  # the marker is gone
-    assert _asked([tmp_path / "a", tmp_path / "b"]) == ["False", "False"]
+def test_processes_keep_their_cache_only_where_it_is_one_folder_for_all(tmp_path):
+    one = tmp_path / "one"
+    assert _kept([one, one]) == [str(one)] * 2
+    assert not list(one.iterdir())  # the marker is gone
+    assert _kept([tmp_path / "a", tmp_path / "b"]) == ["None", "None"]
 
 
 # --- FSDP over several axes ------------------------------------------------------------
