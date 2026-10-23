@@ -9,6 +9,7 @@ from flax import nnx
 from jaxtyping import Array, Float, Int
 
 from bux import config as cfg
+from bux import parallel
 from bux.architecture import sparse
 from bux.architecture.attention import Names, Sparse, documents_or_rows, indexer_config
 from bux.architecture.indexer import Indexer
@@ -175,7 +176,8 @@ class CSA(Sparse):
             kv = jnp.stack([kv[:, i : i + t] for i in range(r)], axis=2)
             gate = jnp.stack([gate[:, i : i + t] for i in range(r)], axis=2)
             kv = (kv * jax.nn.softmax(gate, axis=2)).sum(2)
-        latent = self.compress_norm(kv)
+        # Split as positions, not as the norm's scale: FSDP may split that by `context`.
+        latent = parallel.shard(self.compress_norm(kv), "batch", "seq", None)
         first = rows.positions[:, jnp.maximum(jnp.arange(t) - (r - 1), 0)]
         order = jnp.where((rows.within + 1) % r == 0, rows.within // r, -1)
         index = None
