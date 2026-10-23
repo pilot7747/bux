@@ -395,9 +395,10 @@ class MethodsConfig(Config):
     moe: str = "sorted"
     recurrence: str = "scan"
     # What the backward pass of a recurrence by chunks reads of its chunks' states:
-    # computed again from its inputs, or kept from the forward pass, in 14 times the
-    # memory for a fifth less time.
-    states: Literal["recompute", "keep"] = "recompute"
+    # kept from the forward pass, or computed again from its inputs, in a fourteenth
+    # of the memory and a fifth more time. The delta rule by cuDNN's kernels keeps only
+    # its inputs either way.
+    states: Literal["keep", "recompute"] = "keep"
     repeat: str = "unroll"
     # A policy by name, or as data: remat(save=[attention], first=8).
     remat: Annotated[str | RematConfig, BeforeValidator(_named_none)] = "none"

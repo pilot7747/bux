@@ -543,7 +543,7 @@ methods = methods(recurrence=pass_state)
 
 | method       | what it does                                                     |
 |--------------|------------------------------------------------------------------|
-| `scan`       | the default: every position as one chunk, which `chunkwise` runs by chunks of 64 positions (or cuDNN's kernel, below). With `seq` over `context`, XLA gathers the sequence onto every device first |
+| `scan`       | the default: every position as one chunk, which `chunkwise` runs by chunks of 64 positions (or cuDNN's kernels, below). With `seq` over `context`, XLA gathers the sequence onto every device first |
 | `pass_state` | each device scans its own positions from a zero state and keeps their transition; the transitions fold, in turn, into the state each device's chunk starts from (LASP-2: XLA all-gathers them over `context`); and each device adds to its outputs what they read of that state |
 
 | family                                | `A`, a head          | `reads_t`  |
@@ -635,12 +635,41 @@ chunks by a matmul (SSD's state passing), and q and k may be shared by groups of
 Mamba-2's selective scan runs so, as decayed linear attention with `q = C` and `k = B`
 of its groups, `v = dt x` and a log decay `dt A` a head, and `ssm.stepwise` is its
 reference; Mamba's, a decay per channel and state dim, runs by that scan over
-positions. Under `scan`, the delta rule of a gate bounded at
--5 or above (KDA's `gate_lower_bound`, DeltaNet's none) runs by cuDNN's fused KDA
-kernel on a B200 or B300 instead (`fused_delta`); it overflows below -5.
+positions.
+
+The backward pass of `recurrence` (and so `delta_rule` and RWKV-7) computes its chunks
+again, as fla's kernels do: it keeps the inputs as they come, bfloat16 q, k and v
+under `precision(compute=bfloat16)`, and each chunk's `(I - L)⁻¹`, whose own backward
+is `Tᵀ dT Tᵀ`; not the chunks' float32 states and maps. That is 14 times less memory
+for GDN, 11 for KDA, in a fifth more time; `methods(states=keep)` keeps them all:
+
+| delta rule, 8 × 4096 tokens, 16 heads of 128, on a B300 | forward and backward | what it keeps |
+|------------------------------|----------|----------|
+| GDN, by chunks, before       | 13.1 ms  | 7.24 GiB |
+| `states=keep`                | 11.6 ms  | 6.51 GiB |
+| `states=recompute`, the default | 14.9 ms | 0.50 GiB |
+| by GDN's kernel              | 2.5 ms   | 0.38 GiB |
+| KDA, by chunks, before       | 29.6 ms  | 7.99 GiB |
+| `states=keep`                | 28.9 ms  | 7.26 GiB |
+| `states=recompute`           | 33.6 ms  | 0.75 GiB |
+| by KDA's kernel, gates bounded at -5 | 2.9 ms | 0.63 GiB |
+
+Under `scan`, on a B200 or B300, with q, k and v of 16 bits, the delta rule runs by
+cuDNN's fused kernels instead (`fused_delta`, Frost in cudnn-frontend), which keep its
+inputs alone. One decay a head (GDN, DeltaNet) runs by Frost's GDN kernel, which takes
+each pair's decay as the exp of a difference of summed log decays: any gate, -20 a
+position or a single -10⁴. cudnn-frontend gives it no JAX call, so a `buffer_callback`
+runs cuDNN's graph of it on XLA's stream. A decay per channel (KDA) runs by Frost's
+KDA kernel, which factors each decay through the start of a tile of 16 positions: it
+loses precision where a tile decays a channel by exp(-86) and overflows at exp(-90).
+A gate bounded at -5 always fits; an unbounded one runs by the kernel on the
+(row, head) pairs whose every 16 positions decay by no more than exp(-80), and by
+`chunkwise` on the rest, up to a quarter of the pairs (`_patched`). At bux's start,
+KDA's gates are that steep in 9% of the pairs, all in 3 of 16 heads.
 `scripts/gpu_smoke/recurrence.py` checks the forms against their scans on a GPU,
-whose fusions the CPU tests do not see: on a B300 one took Mamba-2's gradients for B
-and C wrong, which a plain matmul in its place does not.
+whose fusions the CPU tests do not see (on a B300 one took Mamba-2's gradients for B
+and C wrong, which a plain matmul in its place does not), and the kernels against the
+chunks.
 
 Not yet: a `ppermute` chain instead of the all-gather, which holds every device's
 transitions (`c` matrices `k × k` per head) on each.

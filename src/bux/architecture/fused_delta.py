@@ -5,7 +5,7 @@ time on a B300, keeping only their inputs for the backward pass.
 One decay a head (Gated DeltaNet, DeltaNet) runs by Frost's GDN kernel, which takes
 each pair's decay as the exp of a difference of summed log decays, never positive: it
 runs any gate. cudnn-frontend gives it no JAX call, so a `buffer_callback` runs
-cuDNN's graph of it on XLA's stream (`gated_delta_net`).
+cuDNN's graph of it on XLA's stream (`_graph_call`).
 
 A decay per key channel (KDA) runs by Frost's KDA kernel, through cudnn-frontend's
 own JAX call. It factors each decay through the start of a tile of 16 positions, so it
@@ -21,6 +21,7 @@ and heads. They take heads of 64 or 128, and every position of a row: not
 `methods.recurrence = pass_state`, which splits them.
 """
 
+import contextlib
 import functools
 import threading
 from collections.abc import Callable
@@ -118,7 +119,7 @@ def _rows(
     room = b * max(1, t * DOCS // 4096)
     fits = jnp.sum(within == 0) <= room
     docs = Segments(positions, ids, within)
-    kernel = functools.partial(_kernel, room=room)
+    kernel = functools.partial(_kernel, room)
     if not bounded:
         steep = _steep(g)
         fits &= jnp.sum(steep) <= _patches(b, h)
@@ -187,65 +188,82 @@ def _patched(
     return out.at[rows, :, heads].add(jnp.where(used[:, None, None], patch, 0.0))
 
 
+Rows = tuple[Array, ...]  # q, k, v, the log decay and beta (b, t, h, ...), and within
+Tokens = tuple[Array, ...]  # the same packed end to end (THD), and cu_seqlens
+
+
+@functools.partial(jax.custom_vjp, nondiff_argnums=(0,))
 def _kernel(
+    room: int,
     q: Float[Array, "b t h dk"],
     k: Float[Array, "b t h dk"],
     v: Float[Array, "b t h dv"],
     g: Float[Array, "b t h #dk"],
     beta: Float[Array, "b t h"],
     within: Int[Array, "b t"],
-    *,
-    room: int,
 ) -> Float[Array, "b t h dv"]:
     """Run a kernel on the rows packed end to end, each document a sequence, in
-    `room` sequences, the last ones empty: GDN's for one decay a head, else KDA's."""
-    assert frost is not None
+    `room` sequences, the last ones empty: GDN's for one decay a head, else KDA's.
+    Its backward pass keeps the rows as they come, of the shapes the chunks keep
+    them in, so that the two branches of `_rows`' cond share that memory."""
+    return _kernel_forward(room, q, k, v, g, beta, within)[0]
+
+
+def _kernel_forward(room: int, *rows: Array) -> tuple[Float[Array, "b t h dv"], Rows]:
+    v = rows[2]
+    return _run(*_packed(room, *rows)).reshape(v.shape), rows
+
+
+def _kernel_backward(
+    room: int, rows: Rows, d_out: Float[Array, "b t h dv"]
+) -> tuple[Array | None, ...]:
+    tokens = _packed(room, *rows)
+    grads = _grads(*tokens, d_out.reshape(tokens[2].shape).astype(tokens[0].dtype))
+    return (*(d.reshape(x.shape).astype(x.dtype) for d, x in zip(grads, rows)), None)
+
+
+_kernel.defvjp(_kernel_forward, _kernel_backward)
+
+
+def _packed(room: int, *rows: Array) -> Tokens:
+    """Return the rows packed end to end, q, k and v in v's dtype, the log decays and
+    steps in float32, and the documents' bounds cu_seqlens, `room` + 1 of them."""
+    q, k, v, g, beta, within = rows
     b, t, h, _ = q.shape
     q, k, v = (x.reshape(b * t, *x.shape[2:]).astype(v.dtype) for x in (q, k, v))
     starts = jnp.nonzero(within.reshape(-1) == 0, size=room, fill_value=b * t)[0]
     cu = jnp.append(starts, b * t).astype(jnp.int32)
     gates = g.reshape(b * t, h, -1).astype(jnp.float32)
-    steps = beta.reshape(b * t, h).astype(jnp.float32)
-    if gates.shape[-1] == 1:
-        out = gated_delta_net(q, k, v, gates[..., 0], steps, cu)
-    else:
-        out, _ = frost.kimi_delta_attention(q, k, v, gates, steps, cu, scale=1.0)
-    return out.reshape(b, t, h, -1)
+    gates = gates[..., 0] if gates.shape[-1] == 1 else gates
+    return q, k, v, gates, beta.reshape(b * t, h).astype(jnp.float32), cu
+
+
+def _run(*tokens: Array) -> Array:
+    """Return the outputs of the packed tokens by GDN's kernel for one decay a head
+    (gates of n by h), else KDA's."""
+    if tokens[3].ndim == 2:
+        return _graph_call("gdn", [_like(tokens[2])], *tokens)[0]
+    assert frost is not None
+    return frost.kimi_delta_attention_fwd(*tokens, scale=1.0)[0]
+
+
+def _grads(*tokens: Array) -> tuple[Array, ...]:
+    """Return the gradients of q, k, v, the log decays and the steps of the packed
+    tokens, of which the last is the outputs': by the kernels' backward passes,
+    which compute the chunks' states again."""
+    *xs, d_out = tokens
+    if xs[3].ndim == 2:
+        return _graph_call("gdn_bwd", [_like(x) for x in xs[:5]], *xs, d_out)
+    assert frost is not None
+    saved = frost.KdaResidual((*xs, None, None, None), None, frost.KdaConfig(scale=1.0))
+    return tuple(frost.kimi_delta_attention_bwd(saved, d_out)[:5])
+
+
+def _like(x: Array) -> jax.ShapeDtypeStruct:
+    return jax.ShapeDtypeStruct(x.shape, x.dtype)
 
 
 # --- Gated DeltaNet: Frost's GDN kernel by cuDNN's graph, on XLA's stream -------------
-
-Tokens = Float[Array, "n h _"]  # n tokens packed end to end, of h heads
-Gates = Float[Array, "n h"]  # a log decay or a step per token and head
-
-
-@jax.custom_vjp
-def gated_delta_net(
-    q: Tokens, k: Tokens, v: Tokens, g: Gates, beta: Gates, cu: Int[Array, " s"]
-) -> Tokens:
-    """Return the outputs of the gated delta rule of one decay a head, q unscaled,
-    for the sequences between the bounds `cu` of the packed tokens (THD)."""
-    return _gdn_forward(q, k, v, g, beta, cu)[0]
-
-
-def _gdn_forward(
-    q: Tokens, k: Tokens, v: Tokens, g: Gates, beta: Gates, cu: Int[Array, " s"]
-) -> tuple[Tokens, tuple[Array, ...]]:
-    xs = (q, k, v, g, beta, cu)
-    (out,) = _graph_call("gdn", [jax.ShapeDtypeStruct(v.shape, v.dtype)], *xs)
-    return out, xs
-
-
-def _gdn_backward(xs: tuple[Array, ...], d_out: Tokens) -> tuple[Array | None, ...]:
-    """The kernel's backward pass, which computes the chunks' states again."""
-    grads = [jax.ShapeDtypeStruct(x.shape, x.dtype) for x in xs[:5]]
-    dq, dk, dv, dg, dbeta = _graph_call(
-        "gdn_bwd", grads, *xs, d_out.astype(xs[0].dtype)
-    )
-    return dq, dk, dv, dg, dbeta, None
-
-
-gated_delta_net.defvjp(_gdn_forward, _gdn_backward)
 
 
 def _graph_call(
@@ -260,19 +278,23 @@ def _graph_call(
 
     def run(ctx: Any, outs: tuple[Any, ...], *ins: Any) -> None:
         device = ins[0].__dlpack_device__()[1]
+        first = (op, shapes, device) not in _RAN
         *outputs, workspace = outs
-        with _ONE_AT_A_TIME:
+        with _ONE_AT_A_TIME if first else contextlib.nullcontext():
             graph = _graph(op, shapes, device)
             pack = dict(zip(graph.ports, (*ins, *outputs), strict=True))
             handle = _handle(device, ctx.stream)
             graph.execute(pack, workspace=workspace, handle=handle)
+        _RAN.add((op, shapes, device))
 
     return tuple(buffer_callback(run, (*results, scratch))(*xs)[:-1])
 
 
-# XLA calls each device's callback from that device's thread, and cuDNN's graphs, and
-# the kernels they compile on their first run, are not safe to share between threads.
+# XLA calls each device's callback from that device's thread. A graph's first run
+# builds it and compiles its kernels, which two threads must not do at once (8 GPUs
+# crashed so); later runs only launch them.
 _ONE_AT_A_TIME = threading.Lock()
+_RAN: set[tuple] = set()  # the graphs that have run once
 
 
 # Each graph's inputs, and its outputs with the input whose dtype each takes, in the

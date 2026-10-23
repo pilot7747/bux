@@ -4,7 +4,7 @@ a document as cu_seqlens says. So what is checked is the packing: rows end to en
 documents' bounds, rows of more documents than cu_seqlens has room for, and which
 gates KDA's kernel takes."""
 
-import types
+import functools
 
 import jax
 import jax.numpy as jnp
@@ -15,29 +15,35 @@ from bux.architecture import Segments, fused_delta
 from bux.architecture.linear_attention import _chunked
 
 B, T, H, K = 2, 64, 2, 8
+# What the kernels fall back on: the chunks, recomputed, as linear_attention passes.
+_recomputed = functools.partial(_chunked, states="recompute")
 
 
-def _kernel(q, k, v, g, beta, cu, *, scale):
-    """kimi_delta_attention on THD arrays: each sequence of cu its own document."""
+def _run(q, k, v, g, beta, cu):
+    """The kernels on THD arrays, each sequence of cu its own document: GDN's for
+    gates of one decay a head (n, h), else KDA's."""
     n = q.shape[0]
     starts = jnp.zeros(n, bool).at[cu[:-1]].set(True, mode="drop")
     first = jax.lax.cummax(jnp.where(starts, jnp.arange(n), 0))
     docs = Segments.of((jnp.arange(n) - first)[None].astype(jnp.int32))
-    out = _chunked(q[None] * scale, k[None], v[None], g[None], beta[None], docs)
-    return out[0], None
+    g = g[..., None] if g.ndim == 2 else g
+    return _chunked(q[None], k[None], v[None], g[None], beta[None], docs)[0]
 
 
-def _gdn(q, k, v, g, beta, cu):
-    """gated_delta_net, by the stand-in of KDA's kernel with one decay a head."""
-    return _kernel(q, k, v, g[..., None], beta, cu, scale=1.0)[0]
+def _grads_of(run):
+    """The kernels' backward passes, of the stand-in `run`."""
+
+    def grads(*tokens):
+        *xs, d_out = tokens
+        return jax.vjp(lambda *x: run(*x, xs[-1]), *xs[:5])[1](d_out)
+
+    return grads
 
 
 @pytest.fixture
 def stand_in(monkeypatch):
-    monkeypatch.setattr(
-        fused_delta, "frost", types.SimpleNamespace(kimi_delta_attention=_kernel)
-    )
-    monkeypatch.setattr(fused_delta, "gated_delta_net", _gdn)
+    monkeypatch.setattr(fused_delta, "_run", _run)
+    monkeypatch.setattr(fused_delta, "_grads", _grads_of(_run))
 
 
 def _inputs(decay: int = K, low: float = -5.0):
@@ -61,22 +67,45 @@ def _documents(every: int) -> Segments:
 @pytest.mark.parametrize("every", [T, 20, 3])
 @pytest.mark.parametrize("room", [4096 * 64, fused_delta.DOCS])
 def test_packed_rows_give_what_rows_do(stand_in, monkeypatch, decay, every, room):
+    """And their gradients: the kernels' backward passes, packed as the forward."""
     monkeypatch.setattr(fused_delta, "DOCS", room)
     docs, xs = _documents(every), _inputs(decay)
-    got = fused_delta.delta_rule(*xs, docs, -5.0, _chunked)
-    np.testing.assert_allclose(got, _chunked(*xs, docs), atol=1e-5)
+
+    def fused(*xs):
+        return fused_delta.delta_rule(*xs, -5.0, _recomputed)
+
+    np.testing.assert_allclose(fused(*xs, docs), _chunked(*xs, docs), atol=1e-5)
+    grads = [jax.grad(_loss(f, docs), argnums=range(5))(*xs) for f in (fused, _chunked)]
+    for a, b in zip(*grads, strict=True):
+        np.testing.assert_allclose(a, b, atol=1e-4)
 
 
-def _overflows(q, k, v, g, beta, cu, *, scale):
+@pytest.mark.parametrize("decay", [1, K], ids=["gdn", "kda"])
+def test_the_kernels_keep_the_rows_as_the_chunks_do(stand_in, decay):
+    """For the backward pass: q, k, v, the log decay and beta, as they come, which the
+    cond's two branches share, and the chunks' inverses, of the branch not taken."""
+    docs, xs = _documents(20), _inputs(decay)
+
+    def kept(*xs):
+        rule = lambda *x: fused_delta.delta_rule(*x, docs, -5.0, _recomputed)
+        return jax.tree.leaves(jax.vjp(rule, *xs)[1])
+
+    inverses, rows = B * H * T * 64 * 4, sum(x.nbytes for x in xs)
+    small = 4 * B * T * 4  # where documents continue, and so on
+    kept_bytes = sum(x.size * x.dtype.itemsize for x in jax.eval_shape(kept, *xs))
+    assert kept_bytes <= rows + inverses + small
+
+
+def _overflows(q, k, v, g, beta, cu):
     """KDA's kernel as it fails: nan wherever a head's gate falls below -5."""
-    out, _ = _kernel(q, k, v, g, beta, cu, scale=scale)
-    return jnp.where((g < fused_delta.FLOOR).any(-1)[..., None], jnp.nan, out), None
+    out = _run(q, k, v, g, beta, cu)
+    return jnp.where((g < fused_delta.FLOOR).any(-1)[..., None], jnp.nan, out)
 
 
 @pytest.fixture
-def overflowing(stand_in, monkeypatch):
-    kernel = types.SimpleNamespace(kimi_delta_attention=_overflows)
-    monkeypatch.setattr(fused_delta, "frost", kernel)
+def overflowing(monkeypatch):
+    monkeypatch.setattr(fused_delta, "_run", _overflows)
+    monkeypatch.setattr(fused_delta, "_grads", _grads_of(_overflows))
 
 
 def _steep(pairs) -> tuple:
@@ -106,7 +135,7 @@ def test_kda_runs_the_pairs_too_steep_for_its_kernel_by_chunks(
     docs, xs = _documents(20), _steep(pairs)
 
     def fused(*xs):
-        return fused_delta.delta_rule(*xs, None, _chunked)
+        return fused_delta.delta_rule(*xs, None, _recomputed)
 
     got, want = fused(*xs, docs), _chunked(*xs, docs)
     np.testing.assert_allclose(got, want, atol=1e-5)
@@ -118,7 +147,7 @@ def test_kda_runs_the_pairs_too_steep_for_its_kernel_by_chunks(
 
 def test_kda_runs_by_chunks_alone_past_its_share_of_steep_pairs(overflowing):
     docs, xs = _documents(T), _steep([(0, 0), (1, 1)])
-    got = fused_delta.delta_rule(*xs, docs, None, _chunked)
+    got = fused_delta.delta_rule(*xs, docs, None, _recomputed)
     np.testing.assert_allclose(got, _chunked(*xs, docs), atol=1e-5)
 
 

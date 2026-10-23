@@ -156,10 +156,10 @@ def _kept_bytes(
 
 
 @pytest.mark.parametrize("decay", [1, 128], ids=["gdn", "kda"])
-def test_the_delta_rule_keeps_its_inputs_and_each_chunks_inverse(decay):
-    """What its backward pass keeps by default: q, k, v, the log decay and beta,
-    where they come in, and each chunk's inverse; and with `states=keep`, also the
-    chunks' states and maps, which the default computes again."""
+def test_the_delta_rule_recomputed_keeps_its_inputs_and_each_chunks_inverse(decay):
+    """What its backward pass keeps with `states=recompute`: q, k, v, the log decay
+    and beta, where they come in, and each chunk's inverse; and by default, with
+    `states=keep`, also the chunks' states and maps, which recompute computes again."""
     recomputed, inputs, inverses = _kept_bytes(decay, "recompute")
     assert recomputed <= inputs + inverses
     assert _kept_bytes(decay, "keep")[0] > 10 * recomputed
