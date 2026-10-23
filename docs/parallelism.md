@@ -696,7 +696,7 @@ says so.
 
 | method          | what the forward keeps                                     |
 |-----------------|------------------------------------------------------------|
-| `none`          | everything: nothing is computed twice; the default         |
+| `none`          | everything, but in a scanned pass (below); the default     |
 | `full`          | nothing but the input of each branch or pass               |
 | `dots`          | the products of matrices                                   |
 | `dots_no_batch` | the products of matrices without batch dimensions          |
@@ -716,6 +716,30 @@ methods.remat.register("offload")(
 )
 ```
 
+A scan keeps every value its backward reads, stacked by pass. Unrolled, XLA fuses the
+elementwise ones into the ops that read them and keeps none: a norm's float32 copy of
+the stream, an MLP's activation, a token's copy for each of its experts. So under
+`none` a scanned pass keeps all but what elementwise ops and those that only move or
+retype data make (`remat.CHEAP`), and its backward computes those again
+(`remat.unfused`). Nor does a training step cast the stacked parameters to its compute
+dtype, which would keep a copy of them all, and of their gradients: each pass casts its
+own as it runs (`Scanned.compute`). On a B300, for a 1B dense model (`A^16`), a Gated
+DeltaNet hybrid (`"DDDA"^4`) and a 64-expert MoE (`E^16`), in bfloat16 on 8 rows of
+4096 tokens, the temp memory of the compiled train step, and tokens a second:
+
+| model         | memory: unrolled | scanned, before | scanned  | tokens: unrolled | scanned |
+|---------------|------------------|-----------------|----------|------------------|---------|
+| dense         | 56.2 GiB         | 90.7 GiB        | 47.3 GiB | 145k             | 138k    |
+| GDN           | 124.9 GiB        | 213.8 GiB, OOM  | 86.7 GiB | 94k              | 78k     |
+| MoE           | 95.8 GiB         | 131.7 GiB, OOM  | 80.0 GiB | 106k             | 91k     |
+| dense, fsdp=8 |                  |                 |          | 592k             | 670k    |
+
+("Before" kept every value its backward reads, and the cast copy.) On one GPU a scan
+is still slower: it copies each value it keeps into its stack and back out, where
+unrolled layers read it where it was made, and the more it keeps the more it copies:
+the GDN hybrid's float32 chunk states. On eight, one row each, it is faster, and it
+compiles 2.3 times as fast.
+
 On one CPU, for the gradient of a 24-layer Llama's forward (`d_model=64`, 8 rows of
 128 tokens), and for its first training step, which compiles it:
 
@@ -726,9 +750,9 @@ On one CPU, for the gradient of a 24-layer Llama's forward (`d_model=64`, 8 rows
 
 | remat           | temp memory, unrolled | scanned |
 |-----------------|-----------------------|---------|
-| `none`          | 328 MiB               | 326 MiB |
+| `none`          | 327 MiB               | 142 MiB |
 | `full`          | 22 MiB                | 23 MiB  |
-| `dots`          | 133 MiB               | 138 MiB |
+| `dots`          | 132 MiB               | 138 MiB |
 | `dots_no_batch` | 79 MiB                | 82 MiB  |
 
 `Scanned.layers` holds the stacked passes, and `stacked.run(graphdef, state, times, x,

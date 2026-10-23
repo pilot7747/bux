@@ -1,7 +1,8 @@
 """Rematerialization: the methods of `methods.remat`, and the calls they apply to.
 
 A method is a jax.checkpoint policy: what the forward pass keeps for the backward one,
-which computes the rest again. `none` keeps everything, so nothing is redone. Each
+which computes the rest again. `none` keeps everything, so nothing is redone, but in a
+scanned pass, which keeps all but what elementwise ops make (``unfused``). Each
 residual branch outside any other is rematerialized (``rematted``), and so is each
 scanned pass as a whole; nothing inside either is rematerialized again.
 """
@@ -12,6 +13,7 @@ from collections.abc import Callable, Generator
 
 import jax
 from flax import nnx
+from jax.extend.core import Primitive
 
 from bux import parallel
 from bux.architecture import pure
@@ -50,9 +52,36 @@ def off() -> Generator[None]:
         _REMATTED.reset(token)
 
 
-def checkpoint[**A, R](f: Callable[A, R], prevent_cse: bool) -> Callable[A, R]:
-    """Return `f` rematerialized by the run's remat policy; `f` itself if there is none."""
-    if (found := policy()) is None:
+# Elementwise ops and those that only move or retype data: XLA fuses them into the ops
+# that read them, so unrolled layers never keep what they make for the backward.
+CHEAP = frozenset(
+    """abs add add_any and clamp cos div eq erf exp exp2 expm1 ge gt integer_pow
+    is_finite le log log1p logistic lt max min mul ne neg not or pow rsqrt select_n
+    sign sin sqrt square sub tanh xor
+    broadcast_in_dim concatenate convert_element_type copy copy_p dynamic_slice
+    expand_dims iota pad reduce_precision reshape rev slice squeeze transpose""".split()  # noqa: SIM905
+)
+
+
+def unfused(prim: Primitive, *_: object, **params: object) -> bool:
+    """The policy of a scanned pass where the run has none: keep all but what `CHEAP`
+    ops make, and a sharding constraint on one device (on more, it may communicate),
+    which the backward computes again. A scan keeps every value its backward reads,
+    stacked by pass, where XLA would fuse those into their readers."""
+    if prim.name == "sharding_constraint":
+        return getattr(params["sharding"], "num_devices", 2) > 1
+    return prim.name not in CHEAP
+
+
+def checkpoint[**A, R](
+    f: Callable[A, R], prevent_cse: bool, scanned: bool = False
+) -> Callable[A, R]:
+    """Return `f` rematerialized by the run's remat policy, or if `scanned` by
+    `unfused` where there is none; `f` itself otherwise."""
+    found = policy()
+    if found is None and scanned and not _REMATTED.get():
+        found = unfused
+    if found is None:
         return f
 
     def inner(*args: A.args, **kwargs: A.kwargs) -> R:

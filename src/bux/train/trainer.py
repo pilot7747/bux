@@ -35,8 +35,9 @@ from jax.typing import DTypeLike
 from jaxtyping import Array, Float, Int32
 
 from bux import kernels, parallel
-from bux.architecture import Model, matmuls, remat
+from bux.architecture import Model, Scanned, matmuls, remat
 from bux.architecture.registry import Loss
+from bux.architecture.repeat import scanned_variables
 from bux.data.pipeline import DEFAULT_CACHE, jobs, prepare
 from bux.lang import ir
 from bux.lang.printer import run_to_source
@@ -64,13 +65,19 @@ def training_forward(
 def cast[M: nnx.Module](model: M, dtype: DTypeLike) -> M:
     """Return a copy of `model` with its floating-point parameters in `dtype` and the
     rest of its state as it is. Gradients through it reach the parameters in their
-    own dtype."""
-    graphdef, params, buffers = nnx.split(model, nnx.Param, ...)
+    own dtype. A scanned repeat's stay as they are, and each pass casts its own as it
+    runs (``Scanned.compute``)."""
+    stacked = nnx.All(nnx.Param, scanned_variables(model))
+    graphdef, kept, params, buffers = nnx.split(model, stacked, nnx.Param, ...)
     params = jax.tree.map(
         lambda x: x.astype(dtype) if jnp.issubdtype(x.dtype, jnp.floating) else x,
         params,
     )
-    return nnx.merge(graphdef, params, buffers)
+    copy = nnx.merge(graphdef, kept, params, buffers)
+    for _, node in nnx.iter_graph(copy):
+        if isinstance(node, Scanned):
+            node.compute = jnp.dtype(dtype)
+    return copy
 
 
 @runtime_checkable
