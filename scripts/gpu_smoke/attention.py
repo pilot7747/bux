@@ -1,11 +1,13 @@
-"""WP8 on GPUs: every method of `methods.attention` against `xla` on one GPU, with the
-positions split over `context` on packed documents, a window, a soft cap, sinks and
-GQA, forward and gradients; then the time of a forward and backward of each.
+"""WP8 on GPUs: every method of `methods.attention` against `xla` on one GPU, on packed
+documents (a dozen a row, and more than cuDNN's packed layout takes), a window, a
+soft cap, sinks and GQA, forward and gradients: on whole rows on one GPU, then with
+the positions split over `context`; and the time of a forward and backward of each.
 
     uv run --extra cuda python scripts/gpu_smoke/attention.py
 
 It needs 2 GPUs or more (a power of 2), and tokamax (the cuda extra), whose kernels
-CPU cannot run: it says which of them ran. It exits 1 if a method differs from xla.
+CPU cannot run: it says which kernels each step calls. It exits 1 if a method differs
+from xla.
 """
 
 import sys
@@ -27,23 +29,27 @@ from bux.train import config as tcfg
 B, T, H, G, D = 2, 4096, 8, 2, 128
 DTYPE = jnp.bfloat16
 TOLERANCE = 2e-2  # of the largest value, in bfloat16
-METHODS = ("ring", "ulysses", "tokamax")
+WHOLE = ("cudnn", "tokamax", "auto")  # on whole rows
+SPLIT = ("ring", "ulysses", "tokamax", "auto")  # with the positions over context
+KERNELS = {"cudnn": "cudnn$fmha", "mosaic": "mosaic", "triton": "triton"}
 Step = jax.stages.Wrapped  # jitted (q, k, v, dout) -> ((loss, out), (dq, dk, dv))
 
 
-def documents(seed: int) -> Int[Array, "b t"]:
-    """Each row's documents' ids, from 1: a dozen documents of random lengths."""
+def documents(seed: int, n: int) -> Int[Array, "b t"]:
+    """Each row's documents' ids, from 1: about n documents of random lengths."""
     rng = np.random.default_rng(seed)
     starts = np.zeros((B, T), np.int32)
     for row in range(B):
-        starts[row, np.unique([0, *rng.integers(1, T, 12)])] = 1
+        starts[row, np.unique([0, *rng.integers(1, T, n)])] = 1
     return jnp.asarray(np.cumsum(starts, 1), jnp.int32)
 
 
-IDS = documents(0)
+IDS, MANY = documents(0, 12), documents(1, 60)
 CASES = {
     "documents": AttentionArgs(IDS, None, D**-0.5, None, None),
+    "many_docs": AttentionArgs(MANY, None, D**-0.5, None, None),
     "window": AttentionArgs(IDS, 1000, D**-0.5, None, None),
+    "causal": AttentionArgs(None, None, D**-0.5, None, None),
     "softcap": AttentionArgs(None, None, D**-0.5, 30.0, None),
     "sinks": AttentionArgs(IDS, None, D**-0.5, None, jnp.linspace(-1, 1, H)),
 }
@@ -87,27 +93,33 @@ def milliseconds(f: Step, *args: Float[Array, "..."]) -> float:
     return (time.perf_counter() - start) * 100
 
 
-def kernel(f: Step, *args: Float[Array, "..."]) -> str:
-    """Which of tokamax's kernels the compiled step calls."""
+def kernels(f: Step, *args: Float[Array, "..."]) -> str:
+    """Which GPU kernels the compiled step calls, or xla."""
     text = (f.lower(*args).compile().as_text() or "").lower()
-    return next((k for k in ("mosaic", "triton") if k in text), "xla")
+    return "+".join(k for k, name in KERNELS.items() if name in text) or "xla"
+
+
+def takes(method: str, seen: AttentionArgs) -> bool:
+    """Whether `method` takes the case: cudnn has no soft cap and no sinks."""
+    return method != "cudnn" or (seen.softcap is None and seen.sinks is None)
 
 
 def compare(context: int, x: tuple[Float[Array, "b t _ k"], ...]) -> bool:
-    """Every method on `context` GPUs against xla on one; whether all agree."""
+    """Every method on `context` GPUs against xla on one, or on whole rows on one GPU
+    for context 1; whether all agree."""
     agree = True
     for case, seen in CASES.items():
         (_, out), grads = step("xla", seen)(*x)
-        for method in METHODS:
-            if method == "tokamax" and seen.sinks is not None:
-                continue  # tokamax has no sinks
+        for method in WHOLE if context == 1 else SPLIT:
+            if not takes(method, seen):
+                continue
             with parallel.use(tcfg.MeshConfig(data=1, context=context)) as mesh:
                 put = NamedSharding(mesh, P(None, "context"))
                 split = tuple(jax.device_put(a, put) for a in x)
                 f = step(method, seen)
                 (_, split_out), split_grads = f(*split)
                 ms = milliseconds(f, *split)
-                ran = kernel(f, *split) if method == "tokamax" else ""
+                ran = kernels(f, *split)
             errors = [error(split_out, out)]
             errors += [error(a, b) for a, b in zip(split_grads, grads)]
             ok = max(errors) < TOLERANCE
@@ -115,7 +127,8 @@ def compare(context: int, x: tuple[Float[Array, "b t _ k"], ...]) -> bool:
             shown = " ".join(f"{e:.1e}" for e in errors)
             print(
                 f"context={context} {method:8} {case:10} out, dq, dk, dv {shown}"
-                f"  {ms:7.1f} ms {ran:7} {'ok' if ok else 'DIFFERS'}"
+                f"  {ms:7.1f} ms {ran:14} {'ok' if ok else 'DIFFERS'}",
+                flush=True,
             )
     return agree
 
@@ -128,7 +141,7 @@ def main() -> None:
     for case, seen in CASES.items():
         ms = milliseconds(step("xla", seen), *x)
         print(f"{jax.devices()[0].device_kind}: xla on one GPU, {case}, {ms:.1f} ms")
-    agree = [compare(c, x) for c in sorted({2, gpus})]  # every mesh, failing or not
+    agree = [compare(c, x) for c in sorted({1, 2, gpus})]  # every mesh, failing or not
     sys.exit(0 if all(agree) else 1)
 
 
