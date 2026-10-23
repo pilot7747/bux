@@ -16,7 +16,7 @@ from jaxtyping import Array, Float
 
 from bux import config as cfg
 from bux import parallel
-from bux.architecture import Model, blockscaled, matmuls, remat
+from bux.architecture import Model, blockscaled, matmuls, nvfp4, remat
 from bux.architecture.linear_attention import delta_rule, l2norm, recurrence
 from bux.architecture.moe import MoE
 from bux.architecture.norm import Norm
@@ -317,6 +317,31 @@ def test_the_mxfp8_kernel_quantizes_as_xla_does_on_any_split(spec):
     for ours, theirs in zip(kernel, xla, strict=True):
         for a, b in [(ours.values, theirs.values), (ours.scales, theirs.scales)]:
             assert jnp.array_equal(a.astype(jnp.float32), b.astype(jnp.float32))
+
+
+# A block that its scale takes to E2M1's 6 and the midpoints between its values, which
+# round to the even one.
+MIDPOINTS = [12, 0.5, 1.5, 2.5, 3.5, 5, 7, 10, -0.5, -1.5, -2.5, -3.5, -5, -7, -10, 0]
+
+
+# Interpreted off a GPU: x's largest magnitudes, then x and x^T, each device on its
+# part of x, the noise of each element's place in the whole.
+@pytest.mark.parametrize("kind", [{}, {"tiles": True}, {"stochastic": True}])
+@pytest.mark.parametrize(
+    "spec", [P(), P("data", None), P(None, "data"), P("data", "tensor")]
+)
+def test_the_nvfp4_kernels_quantize_as_xla_does_on_any_split(spec, kind):
+    x = (jax.random.normal(jax.random.key(0), (256, 384)) * 2).astype(jnp.bfloat16)
+    x = x.at[0, :16].set(jnp.array(MIDPOINTS, jnp.bfloat16))
+    seed = jnp.uint32(7)
+    with parallel.use(tcfg.MeshConfig(data=4, tensor=2)) as mesh:
+        split = jax.device_put(x, NamedSharding(mesh, spec))
+        kernel = jax.jit(lambda x, s: nvfp4.kernel_twice(x, s, **kind))(split, seed)
+    xla = blockscaled.nv_twice(x, seed, **kind)
+    for ours, theirs in zip(kernel, xla, strict=True):
+        for a, b in [(ours.values, theirs.values), (ours.scales, theirs.scales)]:
+            assert jnp.array_equal(a.astype(jnp.float32), b.astype(jnp.float32))
+        assert ours.scale == theirs.scale
 
 
 def test_block_projections_multiply_in_the_format_and_the_router_and_head_in_compute():
