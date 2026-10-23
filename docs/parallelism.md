@@ -745,9 +745,11 @@ of k. On 8 B300s at 32k tokens a GPU:
 | `ragged_tokens`, `capacity=1.25`, `expert=8` | bfloat16 | 549k | 90.2 GiB |
 | | `mxfp8`, `dispatch=mxfp8` | 477k | 77.4 GiB |
 
-It keeps x^T in MXFP8 for dW rather than x in bfloat16, so it takes 14 GiB less. It
-would be faster with the scales in the layout Blackwell's tensor memory takes them in,
-128 rows by 4 of k a tile, which TMA loads and `tcgen05.cp` copies on.
+It keeps x^T in MXFP8 for dW rather than x in bfloat16, so it takes 14 GiB less. With
+the scales laid out as Blackwell's tensor memory takes them, 128 rows by 4 of k a
+tile, which TMA loads and `tcgen05.cp` copies on, the GEMM of rows computes the same,
+and on a B300 is 10 to 25% faster: still far from twice bfloat16's, which wants a
+warp-specialized kernel with two-CTA MMAs, as tokamax's bfloat16 one is.
 
 ## Expert parallelism
 
