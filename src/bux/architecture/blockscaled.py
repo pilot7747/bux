@@ -147,10 +147,13 @@ def times(a: Operand, b: Operand, out: DTypeLike) -> Float[Array, "m n"]:
 
 
 def gemm(a: Blocks, b: Blocks, out: DTypeLike) -> Float[Array, "m n"]:
-    """Return a b^T in `out`, of their values, block scales and scales."""
+    """Return a b^T in `out`, of their values, block scales and scales. The scales'
+    product rescales the GEMM's output in `out`, where XLA fuses it into what reads
+    it, rather than in a float32 copy."""
+    y = scaled_matmul(a, b, out)
     if a.scale is None or b.scale is None:
-        return scaled_matmul(a, b, out)
-    return (scaled_matmul(a, b, jnp.float32) * (a.scale * b.scale)).astype(out)
+        return y
+    return (y.astype(jnp.float32) * (a.scale * b.scale)).astype(out)
 
 
 def scaled_matmul(a: Blocks, b: Blocks, out: DTypeLike) -> Float[Array, "m n"]:
@@ -358,8 +361,8 @@ NV_BLOCK = 16
 # Hadamard matrix, (-1)^popcount(i & j), its rows' signs drawn once.
 _I = np.arange(NV_BLOCK)
 _SYLVESTER = (-1.0) ** np.bitwise_count(_I[:, None] & _I[None, :])
-_SIGNS = np.random.default_rng(0).choice([-1.0, 1.0], NV_BLOCK)
-HADAMARD = (_SIGNS[:, None] * _SYLVESTER / 4).astype(np.float32)
+SIGNS = np.random.default_rng(0).choice([-1.0, 1.0], NV_BLOCK)
+HADAMARD = (SIGNS[:, None] * _SYLVESTER / 4).astype(np.float32)
 
 
 def nv_twice(
@@ -368,8 +371,8 @@ def nv_twice(
     tiles: bool = False,
     stochastic: bool = False,
 ) -> tuple[Blocks, Blocks]:
-    """Return x and x^T in NVFP4 (`nv_quantize`). x^T multiplies along x's rows, which
-    dW contracts unless `tiles` (W), so it is transformed first."""
+    """Return x and x^T in NVFP4 (`nv_quantize`), by XLA. x^T multiplies along x's
+    rows, which dW contracts unless `tiles` (W), so it is transformed first."""
     quantize = partial(nv_quantize, seed=seed, tiles=tiles, stochastic=stochastic)
     return quantize(x), quantize(x.T, hadamard=not tiles)
 
@@ -386,38 +389,84 @@ def nv_quantize(
     its largest value to 6 x 448. `stochastic` rounds the values up or down, with
     odds that leave them unbiased, by noise from `seed`; `hadamard` first transforms
     each 16 of a row."""
-    r, c = x.shape
     x = x.astype(jnp.float32)
     if hadamard:
-        x = (x.reshape(r, c // NV_BLOCK, NV_BLOCK) @ HADAMARD).reshape(r, c)
-    amax = jnp.abs(x).max()
-    scale = jnp.maximum(amax, jnp.finfo(jnp.float32).tiny) / (E2M1 * E4M3)
-    blocks = (x / scale).reshape(r, c // NV_BLOCK, NV_BLOCK)
-    scales = _tile_amax(blocks) if tiles else jnp.abs(blocks).max(-1)
-    scales = jnp.minimum(scales / E2M1, E4M3).astype(jnp.float8_e4m3fn)
-    wide = scales.astype(jnp.float32)
-    values = blocks / jnp.where(wide > 0, wide, 1)[..., None]
+        x = transform_rows(x)
+    encode = nv_encode(jnp.abs(x).max())
+    values, scales = nv_rows(x, encode, 1 / encode, tiles)
     if stochastic:
-        values = _round_stochastically(values, _noise(values.shape, seed))
-    values = jnp.clip(values, -E2M1, E2M1).astype(jnp.float4_e2m1fn).reshape(r, c)
-    return _keep(Blocks(values, scales, scale))
+        values = round_stochastically(values, _noise(values.shape, seed))
+    values = jnp.clip(values, -E2M1, E2M1).astype(jnp.float4_e2m1fn)
+    return _keep(Blocks(values, scales, 1 / encode))
 
 
-def _tile_amax(blocks: Float[Array, "r n b"]) -> Float[Array, "r n"]:
-    """Return the largest magnitude of each 16 x 16 tile, for each of its rows."""
-    r, n, b = blocks.shape
-    tiles = jnp.abs(blocks).reshape(r // b, b, n, b).max((1, 3))
-    return jnp.repeat(tiles, b, axis=0)
+def transform_rows(x: Float[Array, "r c"]) -> Float[Array, "r c"]:
+    """Return x with each 16 of a row through the random Hadamard transform."""
+    r, c = x.shape
+    blocks = x.reshape(r, c // NV_BLOCK, NV_BLOCK)
+    return jnp.matmul(blocks, HADAMARD, precision="highest").reshape(r, c)
 
 
-def _round_stochastically(
+def nv_encode(amax: Float[Array, "*s"]) -> Float[Array, "*s"]:
+    """Return the global scale that takes `amax` to 6 x 448, Transformer Engine's; 1
+    for 0."""
+    encode = jnp.minimum(E2M1 * E4M3 / amax, jnp.finfo(jnp.float32).max)
+    return jnp.where((amax == 0) | (encode == 0), 1.0, encode)
+
+
+def nv_rows(
+    x: Float[Array, "r c"],
+    encode: Float[Array, ""],
+    decode: Float[Array, ""],
+    tiles: bool = False,
+) -> tuple[Float[Array, "r c"], Shaped[Array, "r n"]]:
+    """Return x's values scaled to E2M1's range, and an E4M3 scale per 16 of a row, or
+    per 16 x 16 `tiles`, under the global scale `encode` (and `decode`, its inverse).
+    The kernels quantize their tiles by it, as XLA does the whole."""
+    (r, c), b = x.shape, NV_BLOCK
+    blocks = x.reshape(r, c // b, b)
+    amax = jnp.abs(blocks).max(2)
+    if tiles:
+        amax = each_row(amax.reshape(r // b, b, c // b).max(1))
+    scales = nv_scales(amax, encode)
+    values = blocks * nv_inverse(scales, decode)[:, :, None]
+    return values.reshape(r, c), scales
+
+
+def each_row(tiles: Shaped[Array, "p q"]) -> Shaped[Array, "r q"]:
+    """Return a 16 x 16 tile's value for each of its 16 rows."""
+    p, q = tiles.shape
+    rows = jnp.broadcast_to(tiles[:, None, :], (p, NV_BLOCK, q))
+    return rows.reshape(p * NV_BLOCK, q)
+
+
+def nv_scales(
+    amax: Float[Array, "*s"], encode: Float[Array, ""]
+) -> Shaped[Array, "*s"]:
+    """Return the E4M3 scale of blocks whose largest magnitude is `amax`: what takes it
+    to 6, under the global scale, at most 448."""
+    scale = jnp.minimum(amax * (encode * (1 / E2M1)), E4M3)
+    return scale.astype(jnp.float8_e4m3fn)
+
+
+def nv_inverse(
+    scales: Shaped[Array, "*s"], decode: Float[Array, ""]
+) -> Float[Array, "*s"]:
+    """Return what takes a block's values to E2M1's range: 1 / (its scale x `decode`),
+    at most float32's largest, for a scale of 0."""
+    inverse = 1 / (scales.astype(jnp.float32) * decode)
+    return jnp.minimum(inverse, jnp.finfo(jnp.float32).max)
+
+
+def round_stochastically(
     v: Float[Array, "*s"], u: Float[Array, "*s"]
 ) -> Float[Array, "*s"]:
     """Return v at one of the two E2M1 values around it, the upper with odds of how
     far v is above the lower, given uniform noise u in [0, 1)."""
     size = jnp.abs(v)
     step = jnp.where(size < 2, 0.5, jnp.where(size < 4, 1.0, 2.0))
-    return jnp.sign(v) * jnp.minimum(jnp.floor(size / step + u) * step, E2M1)
+    steps = jnp.where(size < 2, 2.0, jnp.where(size < 4, 1.0, 0.5))  # 1 / step, exactly
+    return jnp.sign(v) * jnp.minimum(jnp.floor(size * steps + u) * step, E2M1)
 
 
 def _noise(
@@ -426,8 +475,18 @@ def _noise(
     """Return uniform noise in [0, 1), a hash of each element's index and `seed`: the
     same on any mesh."""
     i = jax.lax.iota(jnp.uint32, int(np.prod(shape))).reshape(shape)
-    salt = mix(jnp.uint32(0) if seed is None else seed)
-    return (mix(i * jnp.uint32(0x9E3779B1) + salt) >> 8).astype(jnp.float32) * 2.0**-24
+    return uniform(i, salt(seed))
+
+
+def salt(seed: UInt32[Array, ""] | None) -> UInt32[Array, ""]:
+    """Return what `uniform` hashes with each index, of `seed` (0 for None)."""
+    return mix(jnp.uint32(0) if seed is None else seed)
+
+
+def uniform(index: UInt32[Array, "*s"], salt: UInt32[Array, ""]) -> Float[Array, "*s"]:
+    """Return noise in [0, 1) for each `index`: a hash of it and `salt`."""
+    hashed = mix(index * jnp.uint32(0x9E3779B1) + salt)
+    return (hashed >> 8).astype(jnp.float32) * 2.0**-24
 
 
 def mix(h: UInt32[Array, "*s"]) -> UInt32[Array, "*s"]:
@@ -435,11 +494,3 @@ def mix(h: UInt32[Array, "*s"]) -> UInt32[Array, "*s"]:
     h = (h ^ (h >> 16)) * jnp.uint32(0x85EBCA6B)
     h = (h ^ (h >> 13)) * jnp.uint32(0xC2B2AE35)
     return h ^ (h >> 16)
-
-
-NVFP4 = Recipe(
-    NV_BLOCK,
-    x=nv_twice,
-    w=partial(nv_twice, tiles=True),
-    dy=partial(nv_twice, stochastic=True),
-)

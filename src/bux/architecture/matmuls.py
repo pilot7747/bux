@@ -45,7 +45,7 @@ from jax.typing import DTypeLike
 from jaxtyping import Array, Float, Int, UInt32
 
 from bux import parallel
-from bux.architecture import blockscaled
+from bux.architecture import blockscaled, nvfp4
 from bux.lang import ir
 from bux.train.config import PrecisionConfig, RolesConfig
 from bux.train.registry import Registry
@@ -442,7 +442,5 @@ def _whole(x: Float[Array, "..."], dims: list[int]) -> Float[Array, "..."]:
 formats.register("mxfp8")(block_scaled(blockscaled.MXFP8))
 # MXFP8 with W's scales per 32 x 32 tile, the same for y and dx (TorchTitan's).
 formats.register("mxfp8_2d")(block_scaled(blockscaled.MXFP8_2D))
-# NVFP4: E2M1 values, an E4M3 scale per 16 and a float32 scale per tensor, W in 16 x 16
-# tiles, dy rounded stochastically, and x and dy transformed for dW (NVIDIA's
-# pretraining recipe).
-formats.register("nvfp4")(block_scaled(blockscaled.NVFP4))
+# NVFP4 (``nvfp4``): NVIDIA's pretraining recipe.
+formats.register("nvfp4")(block_scaled(nvfp4.NVFP4))
