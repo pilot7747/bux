@@ -393,7 +393,8 @@ settings through another file or a sweep, logging, evaluating, checkpointing and
 profiling at other steps, splitting it over devices another way (`mesh`, `layout`,
 `methods`) or compiling it with other options (`compiler`) keeps it, and anything else
 changes it. So a changed run starts in a directory of its own, and an unchanged one
-started again resumes from its latest checkpoint, ending exactly where it would have.
+started again resumes from its latest checkpoint, ending exactly where it would have
+([Resuming](#resuming)).
 
 The log has the step's metrics: `loss` and every term of the objective, `grad_norm`
 before clipping, `lr`, `tokens` so far and `tokens_per_s` since the last log. On a GPU
@@ -695,6 +696,65 @@ The first process alone writes the console, `metrics.jsonl`, `status.json` and t
 run's files, and every one writes its part of a checkpoint, so `--out` is on a
 filesystem they all see. A signal to any of them stops them all after the same step.
 A sweep does not train on many hosts: give each run a job of its own, with `--index`.
+
+### Resuming
+
+A run launched again loads its latest checkpoint (`speedrun: restored in 1.8s,
+resuming at step 16`) and trains on as if it had not stopped: the checkpoint holds the
+model's state and the optimizer's, random keys and an MoE's router bias with them,
+batch `i` depends on the seed and `i` alone, and `metrics.jsonl` drops the lines of
+any steps it takes again, which a crash after the checkpoint left. A run's mesh,
+layout and methods are not in its id, so it resumes on another mesh or another number
+of nodes too, orbax reading each array onto the shardings the new mesh gives it.
+
+Verified on B300s, one node and two, with GEMM autotuning off and deterministic ops
+(`--xla_gpu_autotune_level=0 --xla_gpu_deterministic_ops=true`): a 0.2B Llama of 8
+layers and a 0.4B MoE (16 experts, top-2) on packed documents, in bfloat16 with
+donation, 8 rows of 2048 tokens a GPU, 30 steps with a checkpoint every 10,
+stopped through `bux launch` by SIGTERM once step 15 was logged, or by SIGKILL as a
+crash would, and launched again. Against the run trained in one go, on its mesh:
+
+| saved on                                | resumed on          | at    | restore  | losses after it                 |
+|-----------------------------------------|---------------------|-------|----------|---------------------------------|
+| 1 GPU: dense, MXFP8, NVFP4              | the same            | 16-17 | 1.4-1.9s | equal, bit for bit              |
+| 1 GPU, stopped twice                    | the same            | 9, 23 | 1.2-1.4s | equal                           |
+| 1 GPU, SIGKILL after step 15            | the same            | 10    | 1.5s     | equal                           |
+| fsdp=8: AdamW, Muon, MXFP8              | the same            | 16    | 1.7-2.1s | equal                           |
+| fsdp=8                                  | data=2, fsdp=4      | 16    | 1.9s     | within 1e-4 (4e-3)              |
+| fsdp=8                                  | tensor=2, fsdp=4    | 16    | 1.9s     | within 6e-4 (3e-3)              |
+| MoE, expert=8, `ragged_all_to_all`      | the same            | 16    | 2.3s     | equal                           |
+| MoE, expert=8, `ragged_all_to_all`      | fsdp=8, `sorted`    | 16    | 2.5s     | within 7e-2 (1.1, as it spikes) |
+| 1f1b, stage=2 x fsdp=4, even            | the same; one stage | 16    | 1.9s     | equal; within 5e-4 (2e-2)       |
+| 1f1b, stage=2 x fsdp=4, `stages=[5, 3]` | the same; one stage | 16    | 2.0s     | equal; fails at once            |
+| two nodes, fsdp=16                      | the same            | 21    | 1.7s     | equal                           |
+| two nodes, fsdp=16                      | one node, fsdp=8    | 21    | 2.1s     | within 2e-5 (1e-3)              |
+| one node, fsdp=8                        | two nodes, fsdp=16  | 16    | 2.0s     | within 7e-5 (1e-3)              |
+
+In brackets, how far apart the losses of the runs trained in one go on the two meshes
+are. On two nodes, the SIGTERM went to the second node's process alone, and both
+stopped at the same step.
+
+A resume that cannot work fails before it reads the checkpoint, and says what changed:
+the arrays' paths, dtypes and shapes, and the order of a pipeline's layers in them.
+`methods.repeat` (`scan` stacks a repeat's passes into one array), a circular
+pipeline's `rounds` (a stack a round) and an uneven pipeline's `stages` (each stage's
+passes, then copies of its first) change them, so a run resumes with those it was
+saved with:
+
+```
+ValueError: the checkpoint of step 16 does not hold this run's state: it was saved
+with methods.stages = [5, 3], and this run has none. A run resumes with the methods it
+was saved with where they lay out its state: repeat (unroll or scan), a circular
+pipeline's rounds and an uneven one's stages
+```
+
+An even `gpipe` or `1f1b` pipeline keeps its layers in the order of `repeat=scan`, so
+it resumes on any number of stages, or on none. In a job of many processes, each saves
+its part of a checkpoint into the run's directory, so `--out` is a folder every node
+sees, not a node's own disk or `/dev/shm`: the checkpoint hook checks that every
+process sees the files the others write there, and fails at once if one does not.
+Orbax alone waits at the first save for the parts it cannot see: on two nodes, each
+with a folder of its own, twenty minutes before it timed out.
 
 ## The trainer's blocks
 
