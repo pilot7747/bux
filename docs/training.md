@@ -74,7 +74,7 @@ id          params  tokens  tok/param  flops/tok  gpus  ...  run
 | `checkpoint` | `checkpoint(every=..., keep=...)`, or `none`           | `none`         |
 | `log`        | `log(every=...)`                                       | `log`          |
 | `profile`    | `profile(start=..., steps=...)`: a trace of `steps` steps after step `start`, or `none` | `none` |
-| `precision`  | `precision(compute=bfloat16, matmuls=mxfp8)`: the dtype forward and backward compute in, parameters staying float32, and the format block projections multiply in | `precision`: `bfloat16`, `compute` |
+| `precision`  | `precision(compute=bfloat16, matmuls=mxfp8, ...)`: the dtype forward and backward compute in, parameters staying float32, and the formats block projections multiply in ([Precision](#precision)) | `precision`: `bfloat16`, `compute` |
 | `mesh`       | `mesh(data=..., fsdp=..., tensor=...)`: the device grid | `mesh`: every device on `data` |
 | `layout`     | `layout(...)`: which mesh axes each named dimension splits over | `layout` |
 | `methods`    | `methods(attention=..., moe=..., microbatches=...)`: how what communicates is computed, and the microbatches a step takes its batch in | `methods` |
@@ -152,6 +152,70 @@ error: the schedule takes 1010 steps (1000 of warmup and 10 of cooldown), but th
 A file is a run once it sets any training setting; then it needs all the required
 ones. A file with no model and no `d_model`, such as a recipe, is a module: it is
 checked on its own, but a run needs a model.
+
+## Precision
+
+```
+precision = precision(compute=bfloat16, matmuls=mxfp8,
+                      roles=roles(kv=compute), first=2, last=2)
+```
+
+A run computes in `compute`, its parameters cast to it inside each step and kept in
+float32, and the projections inside blocks multiply in `matmuls`, a format of
+`bux.architecture.matmuls`: `compute`, `mxfp8`, `mxfp8_2d` (W's scales per 32 x 32
+tile, the same for y and dx) or `nvfp4` (docs/parallelism.md, "Matmul formats").
+Four settings choose which projections, and when:
+
+- `roles` gives a kind of projection a format of its own; `none` is `matmuls`. Its
+  layer gives each projection its role (`sharding.linear(..., role="kv")`):
+
+  | role | projections |
+  |------|-------------|
+  | `q` | attention's queries and output gate: gqa's, mla's, csa's, the indexer's |
+  | `kv` | attention's keys and values |
+  | `o` | attention's output projection |
+  | `mlp` | the MLPs, the shared experts' too |
+  | `latent` | LatentMoE's projections to and from its latent |
+  | `recurrence` | the linear attentions', RWKV-7's and Mamba's projections, but the output |
+  | `recurrence_out` | their output projection |
+  | `mtp` | nextn's projection, and every branch after the first head |
+  | `experts` | the routed experts: `compute` only, until bux has a grouped block-scaled GEMM |
+
+  The embedding, the head, the router and softmax attention's own matmuls always
+  stay in compute.
+- `first` and `last` keep that many residual branches outside any other, at the
+  start and at the end of the model before its first head, in compute: a number, or
+  a share of them, rounded up (`last=0.15`). A branch is one `[...]`, so a
+  Llama-style block, `[norm attn] [norm ffn]`, is two. A scanned repeat scans apart
+  the passes that multiply alike; a pipelined one must multiply alike throughout.
+- `passes` are the GEMMs of y = x W that multiply in the format: `fprop`, y's, and
+  the gradient's by x, `dgrad`, and by W, `wgrad`. The others multiply in compute,
+  and the forward keeps their operands as they are.
+- `switch=switch(at=0.82, passes=[dgrad, wgrad])` takes up other `passes` from that
+  share of the steps on, and compiles the steps again: fprop in compute for the last
+  18%, here, and all of it with `passes=[]`.
+
+`eval=compute` evaluates in compute, whatever training multiplies in, and is not in
+the run's id. `moments=bfloat16` keeps the optimizer's moments in bfloat16 between
+steps, as DeepSeek-V3's AdamW does, and updates them in float32. Rounded to nearest,
+a moment ignores a change below 2^-9 of itself: at b2 = 0.95, a square gradient 4%
+off the second moment moves it, at 0.999 only one 3x off.
+
+A recipe is a module (`examples/experiments/recipes/`), which a run uses and sweeps:
+
+```
+use llama3_8b
+use nvidia_nvfp4
+precision.last = 4 | 8
+```
+
+| recipe | precision | left out |
+|--------|-----------|----------|
+| `nvidia_mxfp8` | Transformer Engine's MXFP8: E4M3 everywhere, gradients too | MXFP8 routed experts |
+| `nvidia_nvfp4` | NVIDIA's NVFP4 pretraining: W in 16 x 16 tiles, dy rounded stochastically, a Hadamard transform for dW; `first=2, last=8` | NVFP4 routed experts, and its speed: bux quantizes NVFP4 in XLA |
+| `nemotron3_nvfp4` | NVFP4, `recurrence_out` in MXFP8, and `q`, `kv`, `o`, `latent`, `mtp` and the last 15% in bfloat16 | NVFP4 routed experts, most of its matmuls |
+| `deepseek_v3_fp8` | `mxfp8_2d`, moments in bfloat16 | groups of 128 with float32 scales, the float32 promotion, FP8 routed experts and activations |
+| `torchtitan_mxfp8` | `mxfp8_2d` | MXFP8 routed experts, and saving a linear's input in bfloat16 |
 
 ## Data
 
@@ -396,6 +460,22 @@ its projections 5-8x slower than bfloat16's; and the routed experts stay in bflo
 On 300 steps of packed documents, autotuning pinned, `mxfp8`'s loss is bfloat16's to
 within the noise between seeds. The MoE trains as fast in `mxfp8` as in bfloat16,
 105k: its experts are most of its matmuls.
+
+Which projections multiply in `mxfp8`, on one B300 ([Precision](#precision)):
+
+| `precision(matmuls=mxfp8, ...)`, 1.3B | tok/s | peak memory |
+|---------------------------------------|-------|-------------|
+| `compute` (bfloat16)                  | 144k  | 70.6 GiB    |
+| `mxfp8`                               | 167k  | 66.3 GiB    |
+| `mxfp8_2d`                            | 165k  | 66.3 GiB    |
+| `roles=roles(kv=compute)`             | 164k  | 68.4 GiB    |
+| `first=2, last=2`, of 32 branches     | 161k  | 66.9 GiB    |
+| `passes=[fprop, dgrad]`               | 152k  | 69.9 GiB    |
+| `moments=bfloat16`                    | 169k  | 61.6 GiB    |
+| `nvfp4, first=2, last=8`              | 55k   | 69.8 GiB    |
+
+k and v in bfloat16 are slower, not faster: q still quantizes x, the copy all three
+shared, and k's and v's GEMMs then run at bfloat16's rate, x kept for them too.
 
 ## Launching
 

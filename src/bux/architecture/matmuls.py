@@ -55,6 +55,7 @@ Gemm = Callable[[Float[Array, "..."], Float[Array, "..."]], Float[Array, "..."]]
 
 formats = Registry[Any]("matmul format", "bux.architecture.matmuls.formats")
 PRECISION = ContextVar[PrecisionConfig | None]("precision", default=None)
+_COMPUTE = PrecisionConfig()  # in force outside `use`
 SEED = ContextVar[UInt32[Array, ""] | None]("matmuls seed", default=None)
 
 
@@ -87,9 +88,6 @@ def _formats(precision: PrecisionConfig) -> set[str]:
 def in_force() -> PrecisionConfig:
     """Return the precision in force: all in compute outside `use`."""
     return PRECISION.get() or _COMPUTE
-
-
-_COMPUTE = PrecisionConfig()
 
 
 def seed() -> UInt32[Array, ""]:
@@ -140,9 +138,8 @@ def format_of(role: str | None) -> str:
     kind = None if branch is None or count is None else count.kind(branch, precision)
     if kind == "compute":
         return "compute"
-    if kind == "mtp":
-        role = "mtp"
-    given = getattr(precision.roles, role) if role else None
+    name = "mtp" if kind == "mtp" else role
+    given = getattr(precision.roles, name) if name else None
     return given or precision.matmuls
 
 

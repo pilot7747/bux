@@ -559,6 +559,24 @@ def test_moments_in_bfloat16_train_near_float32(losses):
     assert floats and all(x.dtype == jnp.bfloat16 for x in floats)
 
 
+RECIPES = {
+    "nvidia_mxfp8": "mxfp8",
+    "nvidia_nvfp4": "nvfp4",
+    "deepseek_v3_fp8": "mxfp8_2d",
+    "torchtitan_mxfp8": "mxfp8_2d",
+    "nemotron3_nvfp4": "nvfp4",
+}
+
+
+@pytest.mark.parametrize("recipe", RECIPES)
+def test_a_recipe_is_a_module_a_run_uses_and_sweeps(recipe):
+    runs = compile_runs(f"use {recipe}\n" + _source("precision.last = 1 | 2"))
+    assert [r.train.precision.last for r in runs] == [1, 2]
+    assert all(r.train.precision.matmuls == RECIPES[recipe] for r in runs)
+    model = parallel.build(lambda: Model(runs[0].arch, rngs=nnx.Rngs(0)))
+    assert _block_scaled(model, runs[0].train.precision) > 0
+
+
 def test_precision_s_new_settings_at_their_defaults_keep_the_run_s_id():
     def run_id(*settings: str) -> str:
         [run] = compile_runs(_source(*settings))
