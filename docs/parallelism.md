@@ -724,26 +724,30 @@ counts the other's rows as 0. Which rows share a block, and so dW, depend on how
 mesh splits the tokens: in float32, 3 steps on `fsdp=2, expert=4` lose within 1e-4 of
 one device's (`tests/test_precision.py`), not the same.
 
-On a B300, at the baseline MoE's shapes (d 2048, f 704, 262144 picks), it is slower
-than bfloat16. An MoE layer's experts take 13.7 ms forward and backward, against
-tokamax's 9.1 in bfloat16, and 11.1 ms with `passes=[fprop, dgrad]`. Its GEMMs run at
-400 to 600 TFLOP/s, as tokamax's bfloat16 ones do and half of cuDNN's batched
-block-scaled GEMM at the same shapes (1.1 PFLOP/s): `tl.dot_scaled` takes each 32's
-scales, rows of 4 bytes too short for TMA, through registers at every step of k. And
-the quantizer passes over x, the hidden units and both gradients, each twice, at 1.5
-TB/s or less, 5 ms a layer. On 8 B300s at 32k tokens a GPU:
+On B300s, at the baseline MoE's shapes (d 2048, f 704, 262144 picks a GPU), it is
+slower than bfloat16. In a step of `sorted` under `fsdp=8`, its GEMMs of rows take 85
+ms (860 TFLOP/s) and of dW 59 ms (610), where tokamax's bfloat16 ones take 65 and 46,
+and the quantizer, over x, the hidden units and both gradients, each twice, 38 ms more.
+A block-scaled MMA runs at twice bfloat16's rate, but `tl.dot_scaled` takes the scales,
+rows of 4 bytes too short for TMA, through registers into tensor memory at every step
+of k. On 8 B300s at 32k tokens a GPU:
 
 | method | experts | tokens a second | peak |
 |--------|---------|-----------------|------|
 | `sorted`, `fsdp=8` | bfloat16 | 827k | 83.8 GiB |
 | | `mxfp8` | 703k | 69.4 GiB |
 | | `mxfp8`, `passes=[fprop, dgrad]` | 763k | 79.9 GiB |
+| | bfloat16, `remat=dots` | 741k | 51.9 GiB |
+| | `mxfp8`, `remat=dots` | 604k | 48.3 GiB |
 | `ragged_all_to_all`, `capacity=1.25`, `expert=8` | bfloat16 | 548k | 88.4 GiB |
 | | `mxfp8` | 477k | 73.4 GiB |
+| | `mxfp8`, `dispatch=mxfp8` | 472k | 73.4 GiB |
+| `ragged_tokens`, `capacity=1.25`, `expert=8` | bfloat16 | 549k | 90.2 GiB |
+| | `mxfp8`, `dispatch=mxfp8` | 477k | 77.4 GiB |
 
 It keeps x^T in MXFP8 for dW rather than x in bfloat16, so it takes 14 GiB less. It
 would be faster with the scales in the layout Blackwell's tensor memory takes them in,
-128 rows by 4 of k a tile, which TMA can load, and a quantizer near the memory's speed.
+128 rows by 4 of k a tile, which TMA loads and `tcgen05.cp` copies on.
 
 ## Expert parallelism
 
