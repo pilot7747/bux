@@ -72,7 +72,7 @@ def test_a_run_trains_the_same_split_over_devices(losses, arch, mesh):
 
 @pytest.mark.parametrize("mesh", MESHES)
 def test_muon_trains_the_same_split_over_devices(losses, mesh):
-    muon = "muon(lr=0.02)"
+    muon = "muon(lr=0.02, ns_dtype=float32)"  # bfloat16 rounds a split apart
     one = losses(ARCHITECTURES["moe"], mesh=ONE, optimizer=muon)
     split = losses(ARCHITECTURES["moe"], mesh=mesh, optimizer=muon)
     assert np.allclose(split, one, atol=1e-5)
@@ -197,6 +197,13 @@ def test_a_batch_that_does_not_split_is_an_error_that_names_the_setting(tmp_path
         train(run, tmp_path, echo=lambda _: None)
 
 
+def test_a_run_that_xla_cpu_cannot_compile_in_bfloat16_says_so(tmp_path):
+    bf16 = "precision = precision(compute=bfloat16)"
+    run = _run(ARCHITECTURES["moe"], "mesh = mesh(fsdp=8)", bf16)
+    with pytest.raises(ValueError, match=r"XLA:CPU cannot train an MoE.*float32"):
+        train(run, tmp_path, echo=lambda _: None)
+
+
 def test_a_method_not_registered_is_an_error():
     methods = tcfg.MethodsConfig(attention="mine")
     hint = r"no 'mine' attention method yet; add one with @bux\.parallel\.methods"
@@ -248,6 +255,7 @@ TRAIN = [
     "seq_len = 16",
     "batch = 8",
     "steps = 3",
+    "precision = precision(compute=float32)",  # splits compare to 1e-5
 ]
 
 

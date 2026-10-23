@@ -14,7 +14,7 @@ in the same way:
 
 Modules are called as ``module(x, taps)``. ``Taps`` holds one forward pass's tap
 stacks, and as attributes its input tokens and their documents (``segments(taps)``),
-the logits of every head run so far, and in a training step the losses layers add
+the output of every head run so far, and in a training step the losses layers add
 (``report``). Nodes with a share key are built once and reused.
 
 Arrays say their dtype and shape with jaxtyping, as ``x: Float[Array, "b t d"]`` for a

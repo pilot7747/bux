@@ -12,7 +12,8 @@ rest. Every parameter's largest whole dimension also splits over `fsdp`. Outside
 
     mesh      the device grid                     AXES, mesh, active
     settings  the run's settings in force         use, check
-    layout    names, resolved to mesh axes        named, spec, shard, shard_stream
+    layout    names, resolved to mesh axes        named, spec, splits, shard,
+                                                  shard_stream
     place     where state and batches live        shardings, build, shard_state,
                                                   shard_batch, microbatches
     methods   one registry per kind of method     method
@@ -29,6 +30,7 @@ from bux.parallel.layout import (
     shard,
     shard_stream,
     spec,
+    splits,
 )
 from bux.parallel.mesh import AXES, active, mesh, sizes
 from bux.parallel.methods import method
@@ -37,7 +39,7 @@ from bux.parallel.settings import check, use
 
 # isort: split
 # Imported last, so that the names above exist when their methods register themselves.
-from bux.parallel import context, experts, pipeline, recurrence
+from bux.parallel import context, experts, flash, pipeline, recurrence, ring
 
 __all__ = [
     "AXES",
@@ -49,6 +51,7 @@ __all__ = [
     "check",
     "context",
     "experts",
+    "flash",
     "mesh",
     "method",
     "methods",
@@ -56,6 +59,7 @@ __all__ = [
     "named",
     "pipeline",
     "recurrence",
+    "ring",
     "shard",
     "shard_batch",
     "shard_state",
@@ -63,5 +67,6 @@ __all__ = [
     "shardings",
     "sizes",
     "spec",
+    "splits",
     "use",
 ]

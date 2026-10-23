@@ -18,7 +18,7 @@ import jax.numpy as jnp
 from jax.sharding import PartitionSpec as P
 from jaxtyping import Array, Float, Int
 
-from bux import parallel
+from bux import kernels, parallel
 from bux.architecture.segments import Segments
 
 try:  # cudnn-frontend's JAX kernels, where the cuda extra is installed (Linux)
@@ -43,14 +43,15 @@ def runs(dk: int, dv: int, floor: float | None) -> bool:
     method = on.methods.recurrence if on else "scan"
     bounded = floor is not None and floor >= FLOOR
     shapes = dk in DIMS and dv in DIMS
-    return frost is not None and bounded and method == "scan" and shapes and _gpu()
+    here = kernels.gpu() and _sm()
+    return frost is not None and bounded and method == "scan" and shapes and here
 
 
 @functools.cache
-def _gpu() -> bool:
-    """Return whether the default device is a GPU the kernel runs on."""
+def _sm() -> bool:
+    """Return whether the default device is one the kernel runs on."""
     device = jax.devices()[0]
-    return device.platform == "gpu" and getattr(device, "compute_capability", "") in SM
+    return getattr(device, "compute_capability", "") in SM
 
 
 def delta_rule(

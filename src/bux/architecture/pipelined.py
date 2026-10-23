@@ -12,6 +12,7 @@ from typing import NamedTuple
 import jax
 import jax.numpy as jnp
 from flax import nnx
+from jax.typing import DTypeLike
 from jaxtyping import Array, Float, Int
 
 from bux import parallel
@@ -28,15 +29,24 @@ class Rows(NamedTuple):
     tokens: Int[Array, "b t"] | None
 
 
-def run(layers: nnx.Module, passes: int, rounds: int, x: Stream, taps: Taps) -> Stream:
+def run(
+    layers: nnx.Module,
+    passes: int,
+    rounds: int,
+    x: Stream,
+    taps: Taps,
+    compute: DTypeLike | None = None,
+) -> Stream:
     """Run `layers`, stacked by round, by the run's pipeline method: each stage runs its
-    share of a round's `passes` on one microbatch at a time (``Stage``). The losses they
-    report go into `taps`, each the mean over microbatches."""
+    share of a round's `passes` on one microbatch at a time (``Stage``), each pass cast
+    to `compute`, if given. The losses they report go into `taps`, each the mean over
+    microbatches."""
     graphdef, params, rest = nnx.split(layers, nnx.Param, ...)
     if rounds == 1:
         params, rest = jax.tree.map(lambda a: a[None], (params, rest))
-    _check(rounds * passes, graphdef, nnx.merge_state(params, rest), x, taps)
-    stage = Stage(graphdef, passes // pipeline.stages(), taps.training)
+    state = nnx.merge_state(params, rest)
+    _check(rounds * passes, graphdef, state, x, taps, compute)
+    stage = Stage(graphdef, passes // pipeline.stages(), taps.training, compute)
     rows = Rows(taps.segments, taps.tokens)
     y, rest, losses = parallel.method("pipeline")(stage, params, rest, x, rows)
     nnx.update(layers, rest if rounds > 1 else jax.tree.map(lambda a: a[0], rest))
@@ -49,8 +59,15 @@ class Stage:
     of arrays alone: ``(params, rest, x, rows) -> (y, rest, losses)``. As it traces,
     `reports` keeps the names and weights of the losses."""
 
-    def __init__(self, graphdef: nnx.GraphDef, layers: int, training: bool):
+    def __init__(
+        self,
+        graphdef: nnx.GraphDef,
+        layers: int,
+        training: bool,
+        compute: DTypeLike | None,
+    ):
         self.graphdef, self.layers, self.training = graphdef, layers, training
+        self.compute = compute
         self.reports: list[tuple[str, float]] = []
 
     def __call__(
@@ -58,7 +75,7 @@ class Stage:
     ) -> tuple[Stream, nnx.State, Float[Array, "l n"]]:
         local = _stage_taps(rows, self.training)
         state = nnx.merge_state(params, rest)
-        y, rest = stacked.run(self.graphdef, state, self.layers, x, local)
+        y, rest = stacked.run(self.graphdef, state, self.layers, x, local, self.compute)
         losses = local.losses
         self.reports = [
             (a.name, a.weight) for a in losses[: len(losses) // self.layers]
@@ -84,11 +101,16 @@ def _stage_taps(rows: Rows, training: bool) -> Taps:
 
 
 def _check(
-    passes: int, graphdef: nnx.GraphDef, state: nnx.State, x: Stream, taps: Taps
+    passes: int,
+    graphdef: nnx.GraphDef,
+    state: nnx.State,
+    x: Stream,
+    taps: Taps,
+    compute: DTypeLike | None,
 ) -> None:
     """Raise if a pass of the pipelined repeat of `passes`, of stacked `state`, reads
     a tap from before the repeat or leaves one changed for after it."""
-    first = jax.tree.map(lambda a: a[0, 0], state)
+    first = stacked.cast(jax.tree.map(lambda a: a[0, 0], state), compute)
     if crossing := _crossing(graphdef, first, x, taps):
         raise ValueError(
             f"mesh.stage = {pipeline.stages()} pipelines the repeat of {passes} "
@@ -117,7 +139,7 @@ def _crossing(
         name
         for name, ran in [
             ("nextn", local.nextn_runs > 0),
-            ("the heads' logits", bool(local.logits)),
+            ("the heads' outputs", bool(local.heads)),
             ("the single-pass read", local.pending_read is not None),
         ]
         if ran

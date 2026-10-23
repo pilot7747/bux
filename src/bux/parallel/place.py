@@ -6,6 +6,7 @@ from collections.abc import Callable
 import jax
 import numpy as np
 from flax import nnx
+from jax.core import Tracer
 from jax.sharding import NamedSharding
 from jax.sharding import PartitionSpec as P
 from jaxtyping import Array, Shaped
@@ -57,11 +58,16 @@ def build[M: nnx.Module](make: Callable[[], M]) -> M:
 
 def shard_state(*nodes: nnx.Pytree) -> None:
     """Shard the state of `nodes` by its `shardings`: move it there eagerly, and keep
-    it there inside a step."""
+    it there inside a step.
+
+    Eagerly, what is there already stays in its buffers: a step that donates them
+    then finds the rest of the memory in one piece, not on either side of a copy."""
     if active() is None:
         return
     state = nnx.state(nodes)
-    nnx.update(nodes, jax.lax.with_sharding_constraint(state, shardings(state)))
+    traced = any(isinstance(x, Tracer) for x in jax.tree.leaves(state))
+    put = jax.lax.with_sharding_constraint if traced else jax.device_put
+    nnx.update(nodes, put(state, shardings(state)))
 
 
 def shard_batch[T](batch: T) -> T:

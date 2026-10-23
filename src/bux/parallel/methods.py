@@ -31,6 +31,7 @@ repeat = _registry("repeat")
 remat = _registry("remat")
 pipeline = _registry("pipeline")
 orthogonalize = _registry("orthogonalize")
+loss = _registry("loss")
 
 REGISTRIES = {
     "attention": attention,
@@ -40,6 +41,7 @@ REGISTRIES = {
     "remat": remat,
     "pipeline": pipeline,
     "orthogonalize": orthogonalize,
+    "loss": loss,
 }
 
 

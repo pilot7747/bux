@@ -34,13 +34,13 @@ from jaxtyping import Array, Float
 
 from bux import config as cfg
 from bux import parallel
-from bux.architecture import chunkwise, fused_delta
+from bux.architecture import chunkwise, fused_delta, remat
 from bux.architecture.conv import CausalConv
 from bux.architecture.functional import activation
 from bux.architecture.norm import Norm
 from bux.architecture.registry import Context, Taps, register, segments
 from bux.architecture.segments import Segments
-from bux.architecture.sharding import shard_heads, shard_layer_input
+from bux.architecture.sharding import projection, shard_heads, shard_layer_input
 from bux.lang import ir
 from bux.parallel import methods
 from bux.parallel.recurrence import Chunk, Positions, Recurrence, Shared, Transition
@@ -148,9 +148,9 @@ def recurrence(
 
     with w = exp(log_decay), one per key channel or one per head, and S zero before
     every document; without a and b, it is decayed linear attention. It runs by the
-    run's `methods.recurrence`, in float32. Where b is k, as in the delta rule, the
-    positions leave b out, (q, k, v, log decay, continues, a), which ``chunkwise``
-    runs in half the work."""
+    run's `methods.recurrence`, in float32, named `recurrence` (``remat.named``).
+    Where b is k, as in the delta rule, the positions leave b out, (q, k, v, log
+    decay, continues, a), which ``chunkwise`` runs in half the work."""
     batch, t = k.shape[:2]
     continues = (
         jnp.ones((batch, t)) if docs is None else (docs.within > 0).astype(jnp.float32)
@@ -158,9 +158,13 @@ def recurrence(
     rank_one = a is not None and b is not None
     family = "the generalized delta rule" if rank_one else "decayed linear attention"
     ab = (a,) if rank_one and b is k else (a, b) if rank_one else ()
-    xs = (q, k, v, log_decay, continues, *ab)
     run = parallel.method("recurrence")
-    return run(Recurrence(family, chunk, xs)).astype(v.dtype)
+
+    def mix(*xs: Float[Array, "b t ..."]) -> Float[Array, "b t h dv"]:
+        return run(Recurrence(family, chunk, xs))
+
+    xs = (q, k, v, log_decay, continues, *ab)
+    return remat.named("recurrence", mix, *xs).astype(v.dtype)
 
 
 def delta_rule(
@@ -182,7 +186,11 @@ def delta_rule(
     it instead (``fused_delta``), with q, k and v in their own dtype."""
     if fused_delta.runs(k.shape[-1], v.shape[-1], floor):
         g = jnp.broadcast_to(log_decay, k.shape)
-        return fused_delta.delta_rule(q, k, v, g, beta, docs, _chunked)
+
+        def fused(*xs: Float[Array, "b t ..."]) -> Float[Array, "b t h dv"]:
+            return fused_delta.delta_rule(*xs, docs, _chunked)
+
+        return remat.named("recurrence", fused, q, k, v, g, beta)
     return _chunked(q, k, v, log_decay, beta, docs)
 
 
@@ -252,7 +260,7 @@ def into_heads(width: int, heads: int, dim: int, rngs: nnx.Rngs) -> nnx.Linear:
     """Make a projection of the width to `heads` heads of `dim` channels, side by
     side."""
     init = parallel.named("embed", ("heads", heads))
-    return nnx.Linear(width, heads * dim, use_bias=False, kernel_init=init, rngs=rngs)
+    return projection(width, heads * dim, use_bias=False, kernel_init=init, rngs=rngs)
 
 
 def _dt_bias(rngs: nnx.Rngs, n: int) -> Float[Array, " n"]:
@@ -353,7 +361,7 @@ class LinearAttention(nnx.Module):
         self.norm_all_heads = norm_all_heads
         rms = cfg.NormalizationConfig(type="rmsnorm", eps=config.norm_eps)
         self.norm = Norm(rms, hv * dv if norm_all_heads else dv)
-        self.o = nnx.Linear(
+        self.o = projection(
             hv * dv,
             width,
             use_bias=False,

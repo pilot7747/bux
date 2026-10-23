@@ -52,6 +52,7 @@ class Console(Sink):
         "lr": "lr {:.2e}",
         "grad_norm": "grad {:.3f}",
         "tokens_per_s": "{:,.0f} tok/s",
+        "mfu": "mfu {:.1%}",
         "eval_loss": "eval loss {:.4f}",
     }
 

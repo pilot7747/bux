@@ -18,6 +18,7 @@ import bux.launch
 from bux.__main__ import _bytes, _si, abstract, main, memory
 from bux.lang import compile_runs
 from bux.launch import Stop, fit, launch, need, processes, status, summary
+from bux.runtime import cache_dir, xla_flags
 from bux.train.config import MeshConfig
 from bux.train.hooks import Hook
 from bux.train.trainer import Trainer, directory, train
@@ -203,6 +204,31 @@ def test_a_run_alone_trains_on_the_gpus_it_needs(tmp_path, monkeypatch):
     assert "cpu (GPU 4,5) of " in said[0]
 
 
+# --- XLA -------------------------------------------------------------------------------
+
+
+def test_bux_s_xla_flags_go_first_and_one_already_set_keeps_its_value():
+    ragged = "--xla_gpu_experimental_ragged_all_to_all_use_barrier_with_nccl"
+    assert xla_flags("") == f"{ragged}=false"
+    assert xla_flags("--xla_dump_to=x") == f"{ragged}=false --xla_dump_to=x"
+    assert (
+        xla_flags(f"{ragged}=true --xla_dump_to=x") == f"{ragged}=true --xla_dump_to=x"
+    )
+    assert cache_dir({"XDG_CACHE_HOME": "/c"}) == Path("/c/bux/jax")
+
+
+def test_a_launch_keeps_its_compiled_steps_for_the_next(tmp_path):
+    env = os.environ | {
+        "XDG_CACHE_HOME": str(tmp_path),
+        "JAX_PERSISTENT_CACHE_MIN_COMPILE_TIME_SECS": "0",  # even a smoke run's
+    }
+    del env["JAX_COMPILATION_CACHE_DIR"]
+    settings = ["steps=1", "schedule.warmup=1", "--out", str(tmp_path / "runs")]
+    command = [sys.executable, "-m", "bux", "train", str(SMOKE), *settings]
+    subprocess.run(command, env=env, check=True, capture_output=True)
+    assert any("train_step" in p.name for p in (tmp_path / "bux" / "jax").iterdir())
+
+
 # --- Many processes --------------------------------------------------------------------
 
 
@@ -278,6 +304,7 @@ def test_two_processes_train_as_one_does_and_a_signal_to_either_stops_both(tmp_p
         "mesh = mesh(fsdp=8)",
         "log = log(every=1)",
         "checkpoint = checkpoint(every=100)",
+        "precision.compute = float32",  # bfloat16 rounds apart between splits
     )
     [run] = compile_runs(SMOKE.read_text(), filename=str(SMOKE), overrides=settings)
     out = tmp_path / "two"
@@ -315,10 +342,10 @@ def test_the_plan_says_each_runs_gpus_and_its_bytes_on_each(capsys):
     assert main(["plan", str(SMOKE), sweep]) == 0
     head, fsdp, one = capsys.readouterr().out.splitlines()[1:]
     assert head.split() == [
-        *("id", "params", "tokens", "tok/param"),
+        *("id", "params", "tokens", "tok/param", "flops/tok"),
         *("gpus", "params/gpu", "optim/gpu", "bubble", "run"),
     ]
-    assert fsdp.split()[4] == "8" and one.split()[4] == "1"
+    assert fsdp.split()[5] == "8" and one.split()[5] == "1"
     runs = smoke(sweep)
     made = abstract(runs[0])
     assert made is not None
@@ -339,4 +366,4 @@ def test_the_plan_sizes_muons_state_on_a_mesh(capsys):
     muon = ("optimizer = muon(lr=0.02)", "mesh = mesh(fsdp=8)")
     assert main(["plan", str(SMOKE), *muon]) == 0  # its state holds masked nodes
     row = capsys.readouterr().out.splitlines()[-1].split()
-    assert row[4] == "8" and "?" not in row[5:7]
+    assert row[5] == "8" and "?" not in row[4:8]

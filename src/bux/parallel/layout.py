@@ -97,6 +97,14 @@ def spec(names: Sequence[Name], shape: tuple[int, ...]) -> P:
     return partition(resolve(names, shape, on))
 
 
+def splits(names: Sequence[Name], shape: tuple[int, ...]) -> tuple[int, ...]:
+    """Return how many ways each dimension of an array of `shape` named `names` splits."""
+    on = active()
+    if on is None:
+        return (1,) * len(shape)
+    return tuple(on.size(*split) for split in resolve(names, shape, on))
+
+
 def shard(x: Shaped[Array, "*s"], *names: Name) -> Shaped[Array, "*s"]:
     """Constrain `x` to split as the `names` of its dimensions say.
 

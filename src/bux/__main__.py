@@ -8,7 +8,7 @@ sweep, as in a file: ``'optimizer.lr = 0.01 | 0.03'``.
 the entrypoint for production (``bux.launch``): it trains each run of a sweep on the
 GPUs its mesh needs, or a run alone on many hosts, records what each run did, trains
 again only what is not done, and stops at SIGTERM with a checkpoint. ``bux plan``
-shows what each run takes: its GPUs, and its bytes on each.
+shows what each run takes: its FLOPs a token, its GPUs, and its bytes on each.
 """
 
 import argparse
@@ -151,6 +151,17 @@ def memory(
         return per_device(nnx.state(model, nnx.Param)), per_device(nnx.state(opt))
 
 
+def flops_per_token(run: Run) -> float | None:
+    """Return the model FLOPs a training token of `run` takes
+    (``trainer.step_flops``); None if the backend lacks a layer."""
+    from bux.train.trainer import step_flops
+
+    try:
+        return step_flops(run) / (run.train.batch * run.train.seq_len)
+    except NotImplementedError:
+        return None
+
+
 def _row(run: Run, gpus: int, alone: bool) -> tuple[str, ...]:
     """Return the cells of `run`'s line in the plan, out of `gpus` GPUs."""
     from bux.architecture import num_params
@@ -164,11 +175,13 @@ def _row(run: Run, gpus: int, alone: bool) -> tuple[str, ...]:
     n = None if made is None else num_params(made[0])
     param_bytes, opt_bytes = (made and memory(run, made, used)) or (None, None)
     idle = bubble(t.mesh.stage, t.methods.microbatches, t.methods.rounds)
+    work = flops_per_token(run)
     return (
         run.id,
         _si(n) if n else "?",
         _si(tokens),
         f"{tokens / n:.1f}" if n else "?",
+        _si(work) if work else "?",
         str(used),
         _bytes(param_bytes),
         _bytes(opt_bytes),
@@ -178,14 +191,15 @@ def _row(run: Run, gpus: int, alone: bool) -> tuple[str, ...]:
 
 
 def plan(runs: list[Run], gpus: int | None = None) -> str:
-    """Return a table with one line per run: its parameters and tokens, the GPUs it
-    trains on out of `gpus` (default: the visible ones), the bytes of its parameters
-    and of its optimizer state per GPU, and the share of a step its pipeline idles."""
+    """Return a table with one line per run: its parameters and tokens, its FLOPs a
+    token, the GPUs it trains on out of `gpus` (default: the visible ones), the bytes
+    of its parameters and of its optimizer state per GPU, and the share of a step its
+    pipeline idles."""
     from bux.launch import visible_gpus
 
     available = len(visible_gpus()) if gpus is None else gpus
     head = (
-        *("id", "params", "tokens", "tok/param"),
+        *("id", "params", "tokens", "tok/param", "flops/tok"),
         *("gpus", "params/gpu", "optim/gpu", "bubble"),
     )
     alone = len(runs) == 1
@@ -302,6 +316,9 @@ def _train(args: argparse.Namespace, runs: list[Run]) -> int:
         runs = _select(runs, args.index, args.only)
     except ValueError as err:
         return _error(str(err))
+    from bux.runtime import configure
+
+    configure()
     if args.command == "launch":
         from bux.launch import launch
 

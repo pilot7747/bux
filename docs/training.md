@@ -48,10 +48,10 @@ budget            = 3B
 ```
 $ bux plan examples/experiments/attention_ablation.bux
 6 runs
-id          params  tokens  tok/param  run
-4c6613d749  183M    3B      16.4       attention_ablation[mha, optimizer.lr=1e-3]
-fe14a5e39c  183M    3B      16.4       attention_ablation[mha, optimizer.lr=3e-3]
-69cdd0b96d  174M    3B      17.2       attention_ablation[gqa, optimizer.lr=1e-3]
+id          params  tokens  tok/param  flops/tok  gpus  ...  run
+4217af5bcf  183M    3B      16.4       1.33B      1     ...  attention_ablation[mha, optimizer.lr=1e-3]
+77044894a9  183M    3B      16.4       1.33B      1     ...  attention_ablation[mha, optimizer.lr=3e-3]
+86d63e1072  174M    3B      17.2       1.27B      1     ...  attention_ablation[gqa, optimizer.lr=1e-3]
 ...
 ```
 
@@ -73,7 +73,8 @@ fe14a5e39c  183M    3B      16.4       attention_ablation[mha, optimizer.lr=3e-3
 | `eval`       | `eval(data=..., every=..., batches=...)`, or `none`    | `none`         |
 | `checkpoint` | `checkpoint(every=..., keep=...)`, or `none`           | `none`         |
 | `log`        | `log(every=...)`                                       | `log`          |
-| `precision`  | `precision(compute=bfloat16)`: the dtype forward and backward compute in; parameters stay float32 | `precision`: `float32` |
+| `profile`    | `profile(start=..., steps=...)`: a trace of `steps` steps after step `start`, or `none` | `none` |
+| `precision`  | `precision(compute=bfloat16, matmuls=mxfp8)`: the dtype forward and backward compute in, parameters staying float32, and the format block projections multiply in | `precision`: `bfloat16`, `compute` |
 | `mesh`       | `mesh(data=..., fsdp=..., tensor=...)`: the device grid | `mesh`: every device on `data` |
 | `layout`     | `layout(...)`: which mesh axes each named dimension splits over | `layout` |
 | `methods`    | `methods(attention=..., moe=..., microbatches=...)`: how what communicates is computed, and the microbatches a step takes its batch in | `methods` |
@@ -83,11 +84,18 @@ editor shows them on hover and completes them, as it does for layers. In short:
 
 - `adamw(lr, b1=0.9, b2=0.95, eps, weight_decay=0.1)` decays matrices only, not norm
   scales, biases or Engram's tables.
-- `muon(lr, momentum=0.95, nesterov, ns_steps=5, weight_decay=0.1, consistent_rms=0.2,
-  adam=none)` trains the matrices inside the blocks with Muon, stacked expert weights
-  one expert at a time, and everything else (the embedding, the head, vectors) with
-  `adam`, which defaults to `adamw(lr=lr)`. With `consistent_rms=0.2` (Moonlight) one
-  learning rate suits both; `none` scales updates as Keller Jordan's Muon does.
+- `muon(lr, momentum=0.95, nesterov, ns_steps=5, ns_coefficients=jordan,
+  ns_dtype=bfloat16, weight_decay=0.1, consistent_rms=0.2, adam=none)` trains the
+  matrices inside the blocks with Muon, stacked expert weights one expert at a time,
+  and everything else (the embedding, the head, vectors) with `adam`, which defaults to
+  `adamw(lr=lr)`. With `consistent_rms=0.2` (Moonlight) one learning rate suits both;
+  `none` scales updates as Keller Jordan's Muon does. `ns_coefficients` names the
+  quintics of Newton-Schulz's iterations: `jordan`'s, the same at each, or
+  `polar_express`'s (Amsel et al., 2025), one for each, closer to orthogonal in as
+  many. Newton-Schulz runs in `ns_dtype`, bfloat16 as in Keller Jordan's Muon, and the
+  updates move between devices in it (`methods.orthogonalize`). Its result is within
+  a few percent of float32's; on a B300, 240 steps of the 1.3B dense model on packed
+  documents lose the same with either, within the difference between two float32 runs.
 - A schedule multiplies `lr`. `warmup` rises linearly over its steps. `cosine` decays to
   `final` (0.1) at the last step. `wsd` holds the peak, then cools down to `final` (0)
   over the last `decay` (0.2) of the steps, `linear`, `sqrt` (1 - sqrt(t)) or `cosine`.
@@ -112,7 +120,9 @@ checkpoints keep the bias.
 does: `indexer(..., loss_weight=1)`. Each layer that runs one adds `loss_weight` times
 KL(p ‖ softmax(I)), taken over the keys the indexer kept and averaged over the queries:
 I its scores, and p the layer's attention to those keys, summed over heads and
-normalized over them. With `block_size` (Qwen3.8 QSA) a block counts as its most
+normalized over them. p comes from the attention's logsumexp a chunk of queries at a
+time, and the indexer scores each chunk again, so neither makes t × t floats. With
+`block_size` (Qwen3.8 QSA) a block counts as its most
 attended key, and only the complete blocks kept count. In CSA (DeepSeek-V4) the keys
 are the compressed latents, and p keeps the share the window and sinks take. The
 indexer's inputs and p are detached, so this loss trains the indexer alone and the
@@ -274,40 +284,118 @@ backend, on the devices its `mesh` takes (see the
 ```
 run.bux        the run as one file: no modules, no alternatives; bux train takes it as is
 run.json       the IR
-metrics.jsonl  loss, lr, gradient norm and throughput every log.every steps, and eval losses
+metrics.jsonl  the log's metrics every log.every steps, and eval losses
 checkpoints/   model and optimizer state, with a checkpoint setting (orbax)
+profile/       a jax.profiler trace, with a profile setting
 ```
 
 The id is a hash of what the run computes: renaming a definition, reaching the same
-settings through another file or a sweep, logging, evaluating and checkpointing at
-other intervals, or splitting it over devices another way (`mesh`, `layout`,
+settings through another file or a sweep, logging, evaluating, checkpointing and
+profiling at other steps, or splitting it over devices another way (`mesh`, `layout`,
 `methods`) keeps it, and anything else changes it. So a changed run starts in a
 directory of its own, and an unchanged one started again resumes from its latest
 checkpoint, ending exactly where it would have.
+
+The log has the step's metrics: `loss` and every term of the objective, `grad_norm`
+before clipping, `lr`, `tokens` so far and `tokens_per_s` since the last log. On a GPU
+whose peak it knows (B300, B200, H200, H100, A100: dense bf16, from NVIDIA's
+datasheets), it also has `mfu`: the model's FLOPs a second over the peak of the
+mesh's GPUs. A step's FLOPs are counted once, before training, from the program of
+its loss's gradient on a batch, traced on shapes alone with remat and kernels off
+(`trainer.step_flops`, `bux/train/flops.py`): 2·m·n·k for every matrix product and
+convolution, times the length of every scan around it. So a new layer counts with
+no formula of its own, a rematerialized forward is not counted twice, and attention
+counts its t × t scores whole, as PaLM's MFU does, though a causal kernel computes
+half of them. `bux plan` shows the FLOPs a token: 7.7G for a Llama-style 1.3B at
+4096 tokens a row, 6 N of its matrices and 1.6G of attention.
+
+`profile = profile(start=20, steps=5)` traces the 5 steps after step 20 into
+`profile/`, waiting for the step before it starts and stops, for `xprof` or
+TensorBoard's profile plugin (`tensorboard --logdir runs/<run>/profile`).
 
 ## Speed on GPUs
 
 What XLA compiles slowly on a GPU runs by a kernel there, the same computation on a
 CPU by XLA; none of it is in a run's id. Each is in `bux.architecture` and falls back
-by itself where it cannot run:
+by itself where it cannot run, and all of them do inside `bux.kernels.off()` or with
+`BUX_KERNELS=off`, to debug one:
 
 | what | by | on a B300, against XLA |
 |------|----|------------------------|
-| softmax attention | `methods.attention = auto`, the default: tokamax's flash attention | 7x, and no t × t logits |
+| softmax attention | `methods.attention = auto`, the default: cuDNN's fused attention in rows of 8192 or more and with a window, else tokamax's flash attention (sinks, a soft cap) | 7x, and no t × t logits |
+| sparse attention (DSA, QSA, CSA) | `sparse`: tokamax's flash attention with the kept keys as a mask; the indexer's scores by a Pallas kernel (`scoring`), its top-k by counting | 2.6x a chunk of queries at a time, and no t × t floats |
 | linear attention, RWKV-7 | `chunkwise`: chunks of 64 positions, the state across them by a Pallas kernel (`affine_scan`) | 14-17x a scan over positions |
+| Mamba-2 | `chunkwise`, B and C a group's, the state across chunks by a matmul | 25x a scan over positions (2 × 4096 tokens, rematerialized: at 8 × 4096 the scan needs 199 GiB) |
 | KDA with `gate_lower_bound`, DeltaNet | cuDNN's fused KDA kernel (`fused_delta`) | 13x `chunkwise` |
 | MoE experts | `grouped.ragged_dot`: tokamax's Mosaic and Triton kernels | 27x `jax.lax.ragged_dot` |
 | MoE dispatch | `pick_rows`, `permuted`: gathers where XLA would scatter | 4x |
 
-Tokens a second on B300s, 8 × 4096 tokens a GPU, `precision(compute=bfloat16)`:
+Tokens a second on B300s, 8 × 4096 tokens a GPU, `precision(compute=bfloat16)`, and
+the log's `mfu`:
 
 | model (d = 2048, 16 layers) | 1 GPU | 8, `mesh(fsdp=8)` |
 |-----------------------------|-------|-------------------|
-| Llama-style, 1.3B           | 147k (about 40% MFU) | 1.14M |
-| Gated DeltaNet hybrid, `"DDDA"` | 92k | 720k |
+| Llama-style, 1.3B           | 144k, 49% MFU | 1.12M, 48% |
+| Gated DeltaNet hybrid, `"DDDA"` | 93k, 30% | 720k |
+| Mamba-2 hybrid, `"MMMA"`, 1.5B (Nemotron-H's `mamba2`) | 97k | 741k |
 | KDA hybrid, `"KKKA"`        | 58k   |                   |
-| KDA with `gate_lower_bound=-5` | 108k |                |
-| MoE, 64 experts, top 8      | 103k  | 834k              |
+| KDA with `gate_lower_bound=-5` | 110k, 36% |            |
+| MoE, 64 experts, top 8      | 102k, 35% | 834k          |
+
+Sparse attention trains at long context. A DeepSeek-V3.2-style 1B (MLA of 16 heads,
+DSA's indexer of 64 heads and top 2048 in all 16 layers, dense MLPs) on one B300, in
+bfloat16, against the same model by all t × t logits, as bux attended before `sparse`:
+
+| tokens a row × rows | t × t logits | `sparse` |
+|---------------------|--------------|----------|
+| 4096 × 2            | 27.0k tok/s, 85.6 GiB | 28.6k, 31.0 GiB |
+| 4096 × 8            | out of memory | 34.9k, 73.9 GiB |
+| 16384 × 1           | out of memory | 10.1k, 50.4 GiB |
+| 32768 × 1           | out of memory | 7.1k, 84.7 GiB |
+
+At 32k a layer's attention takes 1.4-1.9 times dense flash attention's time, and the
+indexer most of the rest: its selection 61 ms, its loss 75 ms and the loss's target
+33 ms, forward and backward.
+
+A thread loads the next two batches as a step runs (`prefetch`). With
+`methods(donate=true)` a step's new state takes the old one's memory: the 1.3B's step
+then peaks at 70.5 GiB instead of 81.1 on one GPU
+([Donation](parallelism.md#donation-methodsdonate) says why it is off by default).
+
+bux sets one XLA flag of its own (`bux/runtime.py`), for expert parallelism:
+`--xla_gpu_experimental_ragged_all_to_all_use_barrier_with_nccl=false`, without which
+NCCL's ragged all-to-all hangs. The flags that usually speed up collectives and
+scheduling changed nothing past the noise (1%) on the 1.3B on 1 and 8 GPUs, nor on
+the MoE on `mesh(fsdp=8)`: the latency-hiding scheduler, pipelined all-gathers,
+all-reduces and reduce-scatters, combine thresholds of 128 MiB, double-buffered while
+loops, command buffers off, Triton GEMMs off. FSDP over 8 GPUs gets 97% of 8 times
+one GPU's tokens already.
+
+On packed documents (`best_fit` of documents of 16 to 4000 words, GPT-2 tokens), on
+one GPU, the 1.3B trains at 145k tok/s in rows of 4096 by tokamax's kernel, and at
+139k in rows of 16384 by cuDNN's, which skips every block no query sees, where
+tokamax's, whose backward pass does every block of a row, gives 109k (random tokens:
+111k and 101k). With sinks, 142k in rows of 4096, where `auto` took xla, whose t × t
+logits did not fit. Rows of 32k over 8 GPUs: docs/parallelism.md, "Context
+parallelism".
+
+Unlike these, a low-precision matmul format changes what a run computes, so it is a
+setting, `precision(matmuls=...)` (docs/parallelism.md, "Matmul formats"). On a B300,
+cuDNN's MXFP8 GEMM runs at 1.75x bfloat16's rate (2.7-3.0 PFLOP/s at the model's
+shapes), and quantizing each operand twice, in one pass of a Pallas kernel, gives some
+of it back: an MLP projection's forward and backward take 1.3-1.35x less time, q's and
+o's 1.1x, and k's and v's, half as wide, 7% more. NVFP4 quantizes in XLA, which makes
+its projections 5-8x slower than bfloat16's; and the routed experts stay in bfloat16:
+
+| `matmuls`, 1.3B Llama-style | 1 GPU | 8, `mesh(fsdp=8)` |
+|-----------------------------|-------|-------------------|
+| `compute` (bfloat16)        | 142k  | 1.12M             |
+| `mxfp8`                     | 167k (1.18x) | 1.30M (1.16x) |
+| `nvfp4`                     | 43k   |                   |
+
+On 300 steps of packed documents, autotuning pinned, `mxfp8`'s loss is bfloat16's to
+within the noise between seeds. The MoE trains as fast in `mxfp8` as in bfloat16,
+105k: its experts are most of its matmuls.
 
 ## Launching
 
@@ -348,6 +436,15 @@ SIGTERM or Ctrl-C stops training after the step it is at, and saves that step if
 run has a `checkpoint` setting; a second signal, a second or more later, stops it at
 once. The launcher exits with 0 when every run is done, 1 when one failed, and 128 + the
 signal's number when a signal stopped it.
+
+`bux train`, `bux launch` and a sweep's workers keep what they compile in JAX's
+persistent cache, in `$XDG_CACHE_HOME/bux/jax` (`~/.cache/bux/jax`), with the picks
+of XLA's GEMM autotuner next to it: a run launched again, or the next run of a sweep
+with the same program, loads its step instead of compiling it (0.5 s instead of 29
+for the MoE above on 8 B300s), and one that differs in a flag still finds the
+autotuner's picks (17 s). `JAX_COMPILATION_CACHE_DIR` says where instead, and set
+empty turns the cache off. They also put bux's XLA flags (`bux/runtime.py`) before
+`XLA_FLAGS`, a flag that it sets already keeping its value.
 
 `--index N` trains only the run at N, from 0, in the order `bux plan` lists them, so an
 array job trains a sweep a run a task: `--index $SLURM_ARRAY_TASK_ID` on Slurm, or
@@ -442,6 +539,45 @@ trainer.fit(
 )
 ```
 
+The model gives the objective its heads' outputs, not their logits: `Model.heads`
+(`training_heads` in a training step) returns each head's input and its projection,
+a `HeadOutput` (`bux/architecture/logits.py`). The default terms, `loss`, `z_loss`
+and `mtp`, take only log Z and the target's logit at each position, which
+`logits.scores(i, offset)` gives for head i by the run's `methods.loss`:
+
+| method   | how                                                                 |
+|----------|---------------------------------------------------------------------|
+| `logits` | one matmul for every position, the logits whole in `compute`; the default |
+| `chunks` | the matmul, the logsumexp and the target's logit of at most 2 GiB of float32 logits at once, made again in the backward, the head's gradient added up in float32 |
+
+At a vocabulary of 128K, the float32 logits of 8 rows of 4096 tokens take 16 GB, and
+their gradient as much again: `chunks` is for a run that memory bounds, a large
+vocabulary and batch, or a long row, where the 9% it costs buys rows. Another method
+is a function of a head's output and the targets, `@methods.loss.register("mine")`,
+that returns their `Scores`. A term of one's own gets the same `logits`, a sequence
+that makes a head's logits once a term reads them, once for every term that does:
+`logits[0] ** 2` above makes the first head's whole, by either method.
+`Model.outputs` returns every head's logits at once.
+
+On a B300, for the dense 1.3B of 16 Llama blocks of width 2048 (vocabulary 128256,
+`bfloat16`, 8 rows of 4096 tokens), against the whole logits before the head left
+them to the objective, whose tied head multiplied in float32; the largest batch with
+`methods(donate=true)`:
+
+| head, `methods.loss` | tok/s | peak memory | largest batch |
+|----------------------|-------|-------------|---------------|
+| untied, before       | 143k  | 81.2 GiB    | 28 rows       |
+| untied, `logits`     | 145k  | 81.3 GiB    | 28 rows       |
+| untied, `chunks`     | 131k  | 62.5 GiB    | 56 rows, 137k |
+| tied, before         | 129k  | 84.4 GiB    |               |
+| tied, `logits`       | 144k  | 76.3 GiB    |               |
+| tied, `chunks`       | 134k  | 57.6 GiB    |               |
+
+`chunks` makes the logits twice, and moves them in float32. On 8 B300s under `fsdp=8`,
+8 rows each, its ratios hold (41 GiB rather than 60, 1.04M tokens a second rather than
+1.12M): each device adds its share of the head's gradient up alone, and the mesh
+reduces it once.
+
 A layer adds a term of its own from its forward, in one line:
 `report(taps, "my_loss", weight, value)` (`bux/architecture/registry.py`). The
 objective adds weight × value to the training loss and logs the values, summed over
@@ -451,6 +587,16 @@ the layers that report the name, under that name; eval leaves them out.
 overrides them changes what a step does (averaging the weights, skipping a spike) and
 keeps the loop, the hooks and checkpoints. Gradient accumulation is built in:
 `methods(microbatches=n)`.
+
+With `Trainer(..., donate=True)`, as `methods(donate=true)` makes it, a training
+step donates the model's and the optimizer's arrays: an array read from
+`trainer.model` before a step is gone after it, so a hook that keeps one keeps a
+copy (`np.asarray`). `fit` reads `data` through `prefetch` (`bux/train/data.py`),
+a thread that loads the next two batches on the host while a step runs; a run that
+resumes still reads from its step on, and an error reading a batch is raised at that
+batch. Each goes to the devices just before its step, from the training thread: one
+put there from the thread, while a step's temporaries held most of a GPU, landed
+below them and split what they left free, and the next step's no longer fit.
 
 ## Design notes
 

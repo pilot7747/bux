@@ -199,6 +199,10 @@ class MuonConfig(Config):
     momentum: float = 0.95
     nesterov: bool = True
     ns_steps: int = 5  # Newton-Schulz iterations
+    # Their quintics, by name in bux.train.optim.ns_coefficients: Keller Jordan's, the
+    # same at every iteration, or polar_express's (Amsel et al., 2025), one for each.
+    ns_coefficients: str = "jordan"
+    ns_dtype: Literal["float32", "bfloat16"] = "bfloat16"  # what Newton-Schulz runs in
     weight_decay: float = 0.1
     # Updates scaled to this RMS, as AdamW's roughly are, so that one lr suits both
     # (Moonlight: 0.2); none -> by sqrt(max(1, fan_out / fan_in)) (Keller Jordan).
@@ -288,13 +292,25 @@ class LogConfig(Config):
     every: Positive = 10
 
 
+class ProfileConfig(Config):
+    """A jax.profiler trace of `steps` steps, those after step `start`, in the run's
+    directory under profile/, which TensorBoard's profile plugin and xprof read."""
+
+    type: Literal["profile"] = "profile"
+    start: Annotated[int, Field(ge=0)] = 10
+    steps: Positive = 5
+
+
 class PrecisionConfig(Config):
-    """The dtype the forward and backward compute in. Parameters and the optimizer's
-    state stay float32, and so do norm statistics, router scores and top-k, recurrent
-    states and the loss. Unlike the three settings below, it is in the run's id."""
+    """The dtype the forward and backward compute in, and the format the projections
+    inside blocks multiply in (bux.architecture.matmuls). Parameters and the
+    optimizer's state stay float32, and so do norm statistics, router scores and
+    top-k, recurrent states and the loss. Unlike the three settings below, it is in
+    the run's id."""
 
     type: Literal["precision"] = "precision"
-    compute: Literal["float32", "bfloat16"] = "float32"
+    compute: Literal["float32", "bfloat16"] = "bfloat16"
+    matmuls: str = "compute"  # a format of bux.architecture.matmuls: mxfp8, nvfp4
 
 
 # --- Parallelism -----------------------------------------------------------------------
@@ -354,8 +370,11 @@ class MethodsConfig(Config):
     remat: Annotated[str, BeforeValidator(_named_none)] = "none"
     pipeline: str = "gpipe"
     rounds: Positive = 1  # times a circular pipeline sends a microbatch round
-    orthogonalize: str = "gspmd"  # how Muon reaches whole matrices
+    orthogonalize: str = "owner"  # how Muon reaches whole matrices
+    loss: str = "logits"  # how the loss takes a head's logits: whole, or by chunks
     microbatches: Positive = 1
+    # A step's new state takes the old one's memory: a lower peak, in fewer pieces.
+    donate: bool = False
 
 
 class TrainConfig(Config):
@@ -375,6 +394,7 @@ class TrainConfig(Config):
     eval: EvalConfig | None = None
     checkpoint: CheckpointConfig | None = None
     log: LogConfig = LogConfig()
+    profile: ProfileConfig | None = None
     precision: PrecisionConfig = PrecisionConfig()
     mesh: MeshConfig = MeshConfig()
     layout: LayoutConfig = LayoutConfig()
@@ -400,6 +420,7 @@ Setting = Annotated[
     | EvalConfig
     | CheckpointConfig
     | LogConfig
+    | ProfileConfig
     | PrecisionConfig
     | MeshConfig
     | LayoutConfig

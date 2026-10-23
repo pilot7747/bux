@@ -2,12 +2,14 @@
 
 ``run`` scans them by `jax.lax.scan` where a pass leaves the stream and the taps in
 the shapes it found them, and otherwise calls them one at a time. Each pass is
-rematerialized as a whole, as the run's `remat` says.
+rematerialized as a whole, as the run's `remat` says, and casts its own parameters to
+the dtype a step computes in (``cast``).
 """
 
 import jax
 import jax.numpy as jnp
 from flax import nnx
+from jax.typing import DTypeLike
 from jaxtyping import Array, Float
 
 from bux.architecture import pure, remat
@@ -15,9 +17,15 @@ from bux.architecture.registry import Stream, Taps
 
 
 def run(
-    graphdef: nnx.GraphDef, state: nnx.State, times: int, x: Stream, taps: Taps
+    graphdef: nnx.GraphDef,
+    state: nnx.State,
+    times: int,
+    x: Stream,
+    taps: Taps,
+    compute: DTypeLike | None = None,
 ) -> tuple[Stream, nnx.State]:
-    """Run the `times` layers that `graphdef` and the stacked `state` make on `x`.
+    """Run the `times` layers that `graphdef` and the stacked `state` make on `x`, each
+    with its parameters cast to `compute`, if given (``cast``).
 
     Return the stream, and the layers' state other than parameters as they leave it.
     The scan starts at the first layer whose pass is steady (``_steady``): the first,
@@ -27,12 +35,30 @@ def run(
     """
     done: list[nnx.State] = []
     for i in range(times):
-        if i < 2 and (carry := _steady(graphdef, _at(state, i), x, taps)) is not None:
-            x, rest = _scan(graphdef, _since(state, i), times - i, x, taps, carry)
+        layer = cast(_at(state, i), compute)
+        if i < 2 and (carry := _steady(graphdef, layer, x, taps)) is not None:
+            since = _since(state, i)
+            x, rest = _scan(graphdef, since, times - i, x, taps, carry, compute)
             return x, _join([*done, rest])
-        x, rest = _layer(graphdef, _at(state, i), x, taps)
+        x, rest = _layer(graphdef, layer, x, taps)
         done.append(jax.tree.map(lambda a: a[None], rest))
     return x, _join(done)
+
+
+def cast(state: nnx.State, dtype: DTypeLike | None) -> nnx.State:
+    """Return `state` with its floating-point parameters in `dtype`, if given. A scan
+    casts each layer's as it runs it: a copy of all the stacked ones, cast before it,
+    would stay through a training step, and so would one of their gradients."""
+    if dtype is None:
+        return state
+
+    def one(v: nnx.Variable) -> nnx.Variable:
+        x = v.get_value()
+        if isinstance(v, nnx.Param) and jnp.issubdtype(x.dtype, jnp.floating):
+            return v.replace(x.astype(dtype))
+        return v
+
+    return jax.tree.map(one, state, is_leaf=lambda v: isinstance(v, nnx.Variable))
 
 
 def _at(state: nnx.State, i: int) -> nnx.State:
@@ -66,7 +92,7 @@ def _steady(
     ):
         return None
     carry = pure.Changes(
-        None if changed.logits is None else taps.logits,
+        None if changed.heads is None else taps.heads,
         None if changed.pending_read is None else taps.pending_read,
         {k: taps[k] for k in changed.stacks},
     )
@@ -92,13 +118,19 @@ def _scan(
     x: Stream,
     taps: Taps,
     carry: pure.Changes,
+    compute: DTypeLike | None,
 ) -> tuple[Stream, nnx.State]:
-    """Run the layers by `jax.lax.scan`, carrying `x` and `carry`, each rematerialized
-    as a whole as the run's `remat` says."""
+    """Run the layers by `jax.lax.scan`, carrying `x` and `carry`, each cast to
+    `compute` and rematerialized as a whole as the run's `remat` says."""
     call = pure.Pure(graphdef, taps)
-    layer = remat.checkpoint(
-        call, prevent_cse=False
-    )  # a scan keeps XLA from merging them
+
+    def cast_call(
+        s: nnx.State, x: Stream, carry: pure.Changes
+    ) -> tuple[Stream, nnx.State, pure.Changes, list[Float[Array, ""]]]:
+        return call(cast(s, compute), x, carry)
+
+    # A scan keeps XLA from merging them.
+    layer = remat.checkpoint(cast_call, prevent_cse=False, scanned=True)
 
     def step(
         c: tuple[Stream, pure.Changes], s: nnx.State

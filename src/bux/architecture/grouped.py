@@ -17,6 +17,8 @@ import jax.numpy as jnp
 from jax.experimental import pallas as pl
 from jaxtyping import Array, Float, Int
 
+from bux import kernels
+
 try:  # tokamax's kernels, where its extra is installed (Linux)
     import tokamax
 except ImportError:
@@ -37,7 +39,7 @@ def ragged_dot(
 ) -> Float[Array, "m f"]:
     """Return the first sizes[0] rows of x times w[0], the next sizes[1] times w[1],
     and so on; rows past them come out 0."""
-    if tokamax is None and jax.default_backend() != "gpu":
+    if not kernels.gpu():
         return jax.lax.ragged_dot(x, w, sizes)
     return _kernels(*_vary_alike(x, w), sizes)
 
@@ -115,7 +117,7 @@ def _weight_grad(
 ) -> Float[Array, "g d f"]:
     """Return dW, x^T dy per group: by tokamax's Triton kernel, 1.7 times as fast as
     `contract` on a B300, where it runs."""
-    if tokamax is not None and jax.default_backend() == "gpu":
+    if tokamax is not None and kernels.gpu():
         try:
             return tokamax.ragged_dot_general(
                 x,
@@ -140,7 +142,7 @@ def contract(
     `ragged_dot`'s matrices. By a Pallas kernel on a GPU, one program per tile of a
     group's matrix; by XLA elsewhere."""
     td, tf = _tile(x.shape[1]), _tile(y.shape[1])
-    if jax.default_backend() != "gpu" or td is None or tf is None:
+    if not kernels.gpu() or td is None or tf is None:
         return jax.lax.ragged_dot_general(x, y, sizes, RAGGED_CONTRACTING)
     return _contract(x, y, sizes, td, tf)
 

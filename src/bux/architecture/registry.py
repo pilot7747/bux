@@ -6,7 +6,7 @@ A layer adds a term to the training loss from its forward, in one line:
 
 The objective adds weight * value to the loss, and logs the values, summed over the
 layers that report the name, as a metric of that name. Only a training step's forward
-(``Model.training_outputs``) collects them; elsewhere, eval included, ``report`` does
+(``Model.training_heads``) collects them; elsewhere, eval included, ``report`` does
 nothing. ``training(taps)`` says which forward it is, for a layer that skips a costly
 loss outside training, or updates state of its own as it trains (an MoE's router bias).
 """
@@ -33,6 +33,7 @@ if TYPE_CHECKING:
     # Quoted where used: jaxtyping, which checks annotations as the tests run, reads
     # them as a module loads, and embedding.py imports this one.
     from bux.architecture.embedding import Embedding
+    from bux.architecture.logits import HeadOutput
 
 # What a module takes and passes on: the input tokens into the first, then the stream.
 Stream = Shaped[Array, "*_"]
@@ -51,7 +52,7 @@ class Taps(dict[str, list]):
 
     `@name` pushes the stream onto the stack `name`, and `$name` reads its top. The
     attributes are the pass's input `tokens` and their `segments` (None when every row
-    is one document); the `logits` of every head run so far; the `losses` layers
+    is one document); the outputs of the `heads` run so far; the `losses` layers
     report, which only a `training` forward collects; how many nextn layers have run
     (`nextn_runs`); and the read coefficients the last single-pass branch computed for
     the next one (`pending_read`).
@@ -68,7 +69,7 @@ class Taps(dict[str, list]):
         super().__init__(stacks or {})
         self.tokens, self.segments, self.training = tokens, segments, training
         self.losses: list[Loss] = []
-        self.logits: list[Float[Array, "b t vocab"]] = []
+        self.heads: list[HeadOutput] = []
         self.nextn_runs = 0
         self.pending_read: Float[Array, "b t n"] | None = None
 

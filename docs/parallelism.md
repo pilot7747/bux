@@ -66,22 +66,25 @@ when Slurm, Open MPI or `JAX_NUM_PROCESSES` say so
 ([Launching](training.md#launching)). The mesh then spans every process's devices,
 and `parallel.shard_batch` builds a batch with `jax.make_array_from_callback`: every
 process makes all of it, as it depends only on the seed and the step, and puts the
-rows its own devices hold. `tests/test_launch.py` trains the smoke run as two
+rows its own devices hold, just before the step that reads it (a thread loads the
+next two on the host, `prefetch`). `tests/test_launch.py` trains the smoke run as two
 processes of 4 CPU devices each, through `jax.distributed` on localhost, as one
 process of 8 does.
 
-`bux plan` shows what each run takes before it starts: its GPUs, the bytes of its
-parameters and of its optimizer's state on each, and the share of a step its
-pipeline's stages idle ([below](#pipelines-methodspipeline)). The bytes come from
-`parallel.shardings` of the model built over a `jax.sharding.AbstractMesh`, which
-`parallel.use` takes as it does a mesh, so the plan needs no devices:
+`bux plan` shows what each run takes before it starts: its FLOPs a token
+([the log](training.md#running)), its GPUs, the bytes of its parameters and of its
+optimizer's state on each, and the share of a step its pipeline's stages idle
+([below](#pipelines-methodspipeline)). The bytes come from `parallel.shardings` of
+the model built over a `jax.sharding.AbstractMesh`, which `parallel.use` takes as it
+does a mesh, so the plan needs no devices. They are the state's alone: a step's
+activations and new state come on top.
 
 ```
 $ bux plan examples/experiments/smoke.bux 'mesh = fsdp: mesh(fsdp=8) | one: mesh(data=1)'
 2 runs
-id          params  tokens  tok/param  gpus  params/gpu  optim/gpu  bubble  run
-bbbf3ae709  156k    25.6k   0.2        8     76.2KiB     152KiB     0%      smoke[fsdp]
-bbbf3ae709  156k    25.6k   0.2        1     609KiB      1.19MiB    0%      smoke[one]
+id          params  tokens  tok/param  flops/tok  gpus  params/gpu  optim/gpu  bubble  run
+bbbf3ae709  156k    25.6k   0.2        1.03M      8     76.2KiB     152KiB     0%      smoke[fsdp]
+bbbf3ae709  156k    25.6k   0.2        1.03M      1     609KiB      1.19MiB    0%      smoke[one]
 ```
 
 ## Names
@@ -226,8 +229,10 @@ parallelism); queries, keys, values and head outputs to `(batch, seq, heads, non
 the logits to `(batch, heads, seq, none)`, the keys whole, which with `seq` over
 `context` is all-gather context parallelism.
 
-The indexer picks its top-k with a stable sort: `lax.top_k` gathers every row onto
-each device.
+The indexer picks its top-k by counting, the k-th highest score found bit by bit, which
+splits with the rows and positions: `lax.top_k` sorts, and in the global view gathers
+every row onto each device. Its scores' kernel (`bux.architecture.scoring`) is a
+`shard_map` that gives a device its rows, positions and heads, and sums the heads'.
 
 ## Context parallelism: `methods.attention`
 
@@ -246,23 +251,56 @@ methods = methods(attention=ring)
 
 | method    | what it does                                                         |
 |-----------|----------------------------------------------------------------------|
-| `auto`    | the default: `tokamax` on a GPU (7x `xla`'s speed at t = 4096 on a B300), `xla` elsewhere and for sinks, and for what only `xla` has |
+| `auto`    | the default. On a GPU, the fastest kernel that takes the call on each device's whole rows: cuDNN's in rows of 8192 positions or more and with a window, else tokamax's. With `seq` over `context`, `ulysses` where `context` divides a device's heads, else `ring`. `xla` on a CPU, and for what only `xla` has |
 | `xla`     | all t by t logits at once. With `seq` over `context` a device has its queries' rows, and every key and value: all-gather CP |
-| `ring`    | each device keeps its queries, while the keys and values go round `context` a block at a time, by `ppermute`, into an online softmax; a block wholly ahead of the queries, or a window or more behind, is skipped. Its custom VJP sends them round again with their gradients, which then go home |
-| `ulysses` | all-to-alls over `context`, from a device's positions of every head to every position of its own heads; `xla` on those; and back. `context` must divide a device's heads; kv heads it does not divide are repeated |
-| `tokamax` | tokamax's flash attention (Mosaic, then Triton, then XLA), a document from its first token on as `k_start`, split by its `q_sharding`: all-gather CP in a kernel. No sinks; Linux only (the `cuda` extra) |
+| `cudnn`   | cuDNN's fused attention (jax's) on each device's whole rows, documents in its packed layout. bfloat16 or float16, keys' and values' head dims equal and up to 256 (its packed layout gets MLA's wrong); no soft cap, no sinks, no positions over `context` |
+| `tokamax` | tokamax's flash attention, its Mosaic kernels: a document and a window as each query's first key, sinks by the logsumexp. With `seq` over `context`, a device gathers every key and value and attends with its queries in one call: all-gather CP, whose backward pass does every block. Linux only (the `cuda` extra) |
+| `ring`    | every key and value gathered once over `context`, and a flash call (tokamax's; jnp's on a CPU) for each device's block of them, merged by their logsumexps. A block no query sees is skipped: one ahead of them all, or before every query's first key, its document's or its window's. Without documents the queries go zigzag, device `i` holding chunks `i` and `2c-1-i` of `2c`, so that every device attends to as much. The backward pass runs each block's kernel backward with the final output and logsumexp, and reduce-scatters the blocks' gradients |
+| `ulysses` | all-to-alls over `context`, from a device's positions of every head to every position of its own heads; `auto`'s kernel on those whole rows; and back. `context` must divide a device's heads; kv heads it does not divide are repeated |
 
-What only `xla` has stays in the layer: a mask of the keys each query keeps (an
-indexer's top-k, CSA's compressed latents), relative bias, length scale and attention
-dropout. A layer with one of them under a method other than `auto` raises `NotImplementedError`
-naming it, as a method does for a feature of the `AttentionArgs` it lacks. The indexer's
-loss reads the attention's probabilities, which only `xla` makes; it comes with the
-indexer's top-k, so it is `xla`'s too.
+What only `xla` has stays in the layer: relative bias, length scale and attention
+dropout. A layer with one of them under a method other than `auto` raises
+`NotImplementedError` naming it, as a method does for a feature of the
+`AttentionArgs` it lacks.
 
-`ring` is a `shard_map` over `context` alone. `ulysses` is manual over every axis
-that splits q: an all-to-all in a `shard_map` of auto axes makes XLA gather every
-dimension they split, the rows too. Inside a `shard_map`, `shard` and `spec` leave
-out the axes it maps, so that a layer's constraints still hold there.
+Sparse attention (an indexer's top-k, CSA's compressed latents) attends by
+`bux.architecture.sparse` under `xla`, `tokamax` and `auto`, and raises under the
+others. Its keys come in parts (CSA's window, then its latents) that share one softmax,
+merged by their logsumexp in a custom VJP. On a GPU tokamax's flash kernel runs each
+part with the kept keys as a boolean mask: dense compute, exact, and t² bits of mask
+forward and bytes backward. Under `xla`, off a GPU, or in `bux.kernels.off()`, XLA runs
+it a chunk of queries at a time. Either way it is a `shard_map` that gives a device its
+rows, queries and heads, and every key: all-gather CP. The indexer's loss takes the
+attention's probabilities again from its logsumexp, a chunk of queries at a time.
+
+`bux.parallel.flash` has the kernels. A `Kernel` attends to a block of keys: its
+forward pass returns each query's logsumexp beside its output, and its backward pass
+takes one. Given the output and logsumexp of a larger softmax, over more blocks or a
+sink beside the keys, one block's backward pass is that softmax's gradient through
+the block, as FlashAttention-2's recomputes `P = exp(s - lse)`. So `ring` merges blocks
+by their logsumexps (`flash.merge`), and a sink folds into one, `y = o exp(lse - L)`
+with `L = logaddexp(lse, sink)`, the backward pass run with `L` (`flash.attend`).
+tokamax's kernels are one such kernel (its VJP, given the residuals `(lse, 1)`), and
+`flash.JNP` the same in jnp, all t by s logits at once, which a CPU runs: with
+`flash.TOKAMAX = flash.JNP` the tests check `tokamax`'s and `auto`'s paths too. A new
+kernel is a `flash.Kernel(forward, backward)`.
+
+cuDNN's attention in jax neither returns nor takes a logsumexp, so it runs whole rows
+only. Its packed layout has room for a static number of documents a row, and its
+backward pass takes time in proportion, and 8 bytes for each position of each head's
+channels of each document's room: `context.documents_bound` makes room for up to t / 256
+and 2^30 such numbers (16 for 8 rows of 4096 or one of 32k), and a `lax.cond` gives a
+batch with a row of more documents to tokamax. In rows of 4096 that `lax.cond` costs a
+1.3B what cuDNN gains it (145k tok/s on a B300 either way), so `auto` takes cuDNN
+from rows of 8192 on: in rows of 16384 of packed documents, 1.3x tokamax's speed.
+
+Every kernel runs in a `shard_map` manual over every axis (`context.on_devices`),
+each device on its rows and heads: XLA cannot split a kernel's call, an all-to-all in
+a `shard_map` of auto axes makes XLA gather every dimension they split, and cuDNN's
+partitioner fails beside manual axes. Kernels need `check_vma=False`, under which the
+`shard_map` sums the sinks' gradient over the devices that share them. Inside a
+`shard_map`, `shard` and `spec` leave out the axes it maps, so that a layer's
+constraints still hold there.
 
 Another method is a function:
 
@@ -279,31 +317,73 @@ def _(q, k, v, args: AttentionArgs):
     return methods.attention.find("xla")(q, k, v, args)
 ```
 
-Measured on 8 CPU devices: two windowed GQA layers (4 heads, 2 kv heads) in a
-training step on packed rows train as on one device, to 1e-6 over 3 steps, by every
-method on `context=2, tensor=2`, `context=4, fsdp=2` and `context=8` (not `ulysses`
-there: 4 heads), and none makes XLA rematerialize an array in full. The collectives of
-the compiled step (all-gathers / all-reduces / collective-permutes / all-to-alls; a
+On a B300, in bfloat16, 16 heads and 8 kv heads of 128 dims, a forward and backward
+pass (ms):
+
+| kernel    | causal, 8 rows of 4096 | causal, 32k | 13 documents, 32k | window 4096, 32k |
+|-----------|-------|------|------|------|
+| `cudnn`   | 2.82  | 12.2 | 3.3  | 5.0  |
+| `tokamax` | 3.08  | 16.0 | 14.1 | 14.5 |
+
+cuDNN skips what no query sees, forward and backward; tokamax's backward pass skips
+only what is ahead of the queries, which a window as each query's first key keeps
+(its own window mask does every block: 29.2 ms). cuDNN's room for documents costs:
+the row of 13 takes 3.3 ms with room for 16, 3.9 for 32, 5.0 for 64 and 7.4 for 128.
+
+On 8 B300s, `context=8`, one row, 6 calls in a jit to spread the ~2.5 ms a call on 8
+GPUs takes, a forward and backward pass (ms):
+
+| t, documents   | one GPU's tokamax / 8 | `ulysses` | `ring` | `tokamax` |
+|----------------|------|----------|----------|------|
+| 32k, one       | 2.06 | **2.39** | 5.24     | 5.08 |
+| 128k, one      | 31.9 | **26.0** | 38.3     | 68.9 |
+| 32k, of 2048   | 1.71 | **1.89** | 2.29     | 4.48 |
+| 128k, of 2048  | 26.0 | 27.6     | **8.06** | 57.4 |
+
+`ulysses` runs cuDNN, but past its room for documents (64 of them in a row of 128k)
+tokamax, whose backward pass does every block; `ring` skips most blocks of packed rows
+on every device. The `ring` this one replaced sent the blocks round by ppermute (~85
+GB/s on a B300 node, an all-gather ~550) into an online softmax of their logits: 33.4
+and 440 ms causal.
+
+In a model, on 8 B300s: 8 layers of `d_model = 1024`, 16 heads and 8 kv heads of 128
+dims (218M), rows of 32k over `mesh(context=8)`, `remat=full`, 8 microbatches,
+bfloat16 (tok/s):
+
+| `methods.attention` | one document a row | packed documents (46 a row) |
+|---------------------|--------------------|-----------------------------|
+| `ulysses`, `auto`   | **252k**           | **273k**                    |
+| `ring`              | 175k               | 221k                        |
+| `tokamax`           | 200k               | 211k                        |
+
+With sinks, 243k by `ulysses` (tokamax's kernel), where `auto` took `xla` at 66k;
+`ulysses` ran `xla` at 96k, and the `ring` it replaced 75k. In a model `ulysses` is
+the faster even with 45% of the batches past cuDNN's room for documents, which
+tokamax then takes, so `auto` takes it; `ring` stays the method for longer packed
+rows, as at 128k above.
+
+On 8 CPU devices, two windowed GQA layers (4 heads, 2 kv heads) with sinks and a soft
+cap train on packed rows as on one device, to 1e-5 over 3 steps, by every method on
+`context=2, tensor=2` and `context=4, fsdp=2`, and none makes XLA rematerialize an
+array in full; on `context=8` too, every method's attention and its gradients are
+`xla`'s (not `ulysses`' with 4 heads). The collectives of the compiled step of two
+windowed layers (all-gathers / all-reduces / collective-permutes / all-to-alls; a
 collective in a loop counts once):
 
-| mesh                  | `xla`        | `ring`        | `ulysses`    | `tokamax`    |
-|-----------------------|--------------|---------------|--------------|--------------|
-| `context=2, tensor=2` | 12 / 12 / 4 / 4 | 12 / 10 / 10 / 4 | 5 / 10 / 4 / 20 | 10 / 14 / 5 / 8 |
-| `context=4, fsdp=2`   | 38 / 8 / 4 / 4  | 38 / 6 / 12 / 4  | 31 / 6 / 4 / 20 | 36 / 10 / 5 / 8 |
-| `context=8`           | 11 / 4 / 4 / 4  | 4 / 2 / 12 / 4   |                 | 9 / 6 / 5 / 8   |
+| mesh                  | `xla`           | `ring`          | `ulysses`       |
+|-----------------------|-----------------|-----------------|-----------------|
+| `context=2, tensor=2` | 10 / 20 / 4 / 4 | 8 / 20 / 5 / 8  | 3 / 20 / 4 / 20 |
+| `context=4, fsdp=2`   | 31 / 8 / 4 / 4  | 29 / 8 / 5 / 8  | 24 / 8 / 4 / 20 |
+| `context=8`           | 10 / 4 / 4 / 4  | 8 / 4 / 5 / 8   |                 |
 
-`xla` gathers each layer's keys and values whole; `ring` and `ulysses` gather no
-activation but the documents' ids (int32), and FSDP's parameters. A layer adds 4
-collective-permutes under `ring` (the blocks forward; the blocks and their gradients
-backward; the gradients home), 3 on `context=2`, where the backward pass shares the
-forward's one step, and 8 all-to-alls under `ulysses`. The temp memory of
-the gradient of one attention at t = 2048 on `context=4`: `xla` 66.0 MiB, `ulysses`
-64.5 MiB (whole rows of a quarter of the heads), `ring` 21.9 MiB (two blocks of keys).
-`tokamax` here is its XLA implementation; `scripts/gpu_smoke/attention.py` runs its
-kernels, and every method, on GPUs.
-
-Not yet: zigzag load balancing (device `c - 1` of the ring attends to `c` blocks,
-device 0 to one), and overlapping each block's transfer with its compute.
+`xla` and `ring` gather each layer's keys and values whole, `ring` once forward and
+once backward, where it reduce-scatters their gradients; with documents nothing goes
+round. `ulysses` gathers no activation but the documents' ids, and adds 8 all-to-alls
+a layer. The rest are FSDP's parameters, and int32 and boolean arrays of the
+documents' starts. The temp memory of the gradient of one attention at t = 2048 on
+`context=4`: `xla` 68.5 MiB, `ulysses` 81.0 MiB (whole rows of a quarter of the heads),
+`ring` 26.5 MiB (every block of keys, and no logits).
+`scripts/gpu_smoke/attention.py` runs every method by its GPU kernels against `xla`.
 
 ## The other layers
 
@@ -350,7 +430,11 @@ Constraints:
   table every step. Engram gathers from its table the same way.
 - The logits are `(batch, seq, vocab)`, tied heads too, and the loss reduces over the
   vocabulary where it is: the log-normalizer and the target's logit are all-reduces
-  of `(b, t)`, for the loss, `z_loss` and `mtp` alike.
+  of `(b, t)`, for the loss, `z_loss` and `mtp` alike. Under `methods(loss=chunks)`
+  (`bux/architecture/logits.py`) they are made a chunk of each device's positions at
+  a time, `(batch, seq, none, vocab)` over the devices' shards; the head's kernel is
+  gathered over `fsdp` once for all the chunks, and each device adds its share of the
+  kernel's gradient up on its own, reduced once after the last chunk.
 - What the embedding, nextn and Engram return is the stream, widened or not, and
   goes through `shard_stream`.
 
@@ -461,9 +545,17 @@ what the `shard_map`s' transposes sum is float32.
 A chunk runs by `chunkwise` (`bux.architecture.chunkwise`), the form of fla's chunked
 kernels, under every method: matmuls within chunks of 64 positions, and a scan of the
 state across them, by a Pallas kernel on a GPU (`affine_scan`). `stepwise`, a scan
-over positions, is its reference. Under `scan`, the delta rule of a gate bounded at
+over positions, is its reference. With one decay a head, the state passes across the
+chunks by a matmul (SSD's state passing), and q and k may be shared by groups of heads.
+Mamba-2's selective scan runs so, as decayed linear attention with `q = C` and `k = B`
+of its groups, `v = dt x` and a log decay `dt A` a head, and `ssm.stepwise` is its
+reference; Mamba's, a decay per channel and state dim, runs by that scan over
+positions. Under `scan`, the delta rule of a gate bounded at
 -5 or above (KDA's `gate_lower_bound`, DeltaNet's none) runs by cuDNN's fused KDA
 kernel on a B200 or B300 instead (`fused_delta`); it overflows below -5.
+`scripts/gpu_smoke/recurrence.py` checks the forms against their scans on a GPU,
+whose fusions the CPU tests do not see: on a B300 one took Mamba-2's gradients for B
+and C wrong, which a plain matmul in its place does not.
 
 Not yet: a `ppermute` chain instead of the all-gather, which holds every device's
 transitions (`c` matrices `k × k` per head) on each.
@@ -591,7 +683,9 @@ On 8 B300s (`scripts/gpu_smoke/experts.py`, a small MoE), every method computes 
 one GPU does; `sorted` is the fastest there, 400k tokens a second, then `all_gather`
 and `all_to_all` (335k), then `ragged_all_to_all` (270k). On jax 0.12 NCCL's ragged
 all-to-all hangs unless XLA_FLAGS has
-`--xla_gpu_experimental_ragged_all_to_all_use_barrier_with_nccl=false`.
+`--xla_gpu_experimental_ragged_all_to_all_use_barrier_with_nccl=false`, which
+`bux train` and `bux launch` add to it, and so does `bux.runtime.configure()` in a
+script that calls it before it touches a device.
 
 ## Muon: `methods.orthogonalize`
 
@@ -601,8 +695,9 @@ method:
 
 | method   | what it does                                                                 |
 |----------|------------------------------------------------------------------------------|
-| `gspmd`  | Newton-Schulz on whatever shards the compiler gives each update; the default |
+| `gspmd`  | Newton-Schulz on whatever shards the compiler gives each update              |
 | `gather` | each update whole in a `jax.shard_map` for Newton-Schulz, and back on its parameter's shards after |
+| `owner`  | each matrix whole on one device, its owner, which runs its matrices of a shape as one batch; the default |
 
 ```
 methods = methods(orthogonalize=gather)
@@ -611,8 +706,18 @@ methods = methods(orthogonalize=gather)
 Under `gather`, a stack of matrices (the experts) is whole matrix by matrix, and its
 stacked dimension splits over the axes that frees, where they divide it: each device
 orthogonalizes its own experts. A lone matrix is whole on every device, and every
-device runs its Newton-Schulz. Owner-per-matrix schemes (Moonlight, Dion), which spread
-that work, are the next method.
+device runs its Newton-Schulz.
+
+`owner` spreads that work, as Moonlight's and Dion's distributed Muon do. Every matrix,
+a stack's one by one, has one owner. The matrices of a shape and split, from every
+update of the step, are dealt out evenly over the devices, padded with zero matrices
+to a multiple of them, so that each device does the same work, and the work of a shape
+(m·n·min(m, n) a matrix) is split evenly. One all-to-all takes each device's shards of
+them to their owners, which orthogonalize their matrices of a shape as one batched
+chain of products; another brings the results back to the parameters' shards, and an
+all-gather copies them over the axes that do not split the parameter (`data`, say).
+Under `layout(zero=1)` an update comes split by FSDP, as the optimizer's state is, and
+its matrices go back whole along FSDP's side by an all-gather, as the parameter is.
 
 A method gets every update of a step at once, so that it can choose where each runs:
 
@@ -622,25 +727,49 @@ from bux.parallel import methods
 
 @methods.orthogonalize.register("mine")
 def _(updates, dims, shardings, newton_schulz):
-    # updates: an array per Muon parameter; dims: their MuonDimensionNumbers;
-    # shardings: their parameters' NamedShardings, None outside parallel.use;
-    # newton_schulz(x, dims): optax's Newton-Schulz.
+    # updates: an array per Muon parameter, in muon's ns_dtype; dims: their
+    # MuonDimensionNumbers; shardings: their parameters' NamedShardings, None
+    # outside parallel.use; newton_schulz(x, dims): optax's, in x's dtype.
     return [newton_schulz(x, d) for x, d in zip(updates, dims)]
 ```
 
 Collectives in the compiled train step on 8 CPU devices (all-reduces / all-gathers /
-all-to-alls) for the 2-block Llama and the MoE of `tests/test_parallel.py`:
+all-to-alls) for the 2-block Llama and the MoE of `tests/test_parallel.py`, Newton-Schulz
+in float32:
 
-| model, mesh               | AdamW       | Muon, `gspmd` | Muon, `gather` |
-|---------------------------|-------------|---------------|----------------|
-| Llama, `fsdp=8`           | 21 / 24 / 0 | 72 / 84 / 0   | 21 / 38 / 0    |
-| Llama, `fsdp=4, tensor=2` | 21 / 25 / 0 | 72 / 85 / 0   | 21 / 39 / 0    |
-| MoE, `fsdp=8`             | 26 / 33 / 8 | 67 / 183 / 8  | 26 / 48 / 14   |
-| MoE, `fsdp=4, tensor=2`   | 25 / 36 / 6 | 66 / 186 / 6  | 25 / 51 / 12   |
+| model, mesh                         | AdamW       | Muon, `gspmd` | Muon, `gather` | Muon, `owner` |
+|-------------------------------------|-------------|---------------|----------------|---------------|
+| Llama, `fsdp=8`                     | 22 / 26 / 0 | 73 / 86 / 0   | 22 / 40 / 0    | 22 / 26 / 6   |
+| Llama, `fsdp=4, tensor=2`           | 34 / 33 / 0 | 133 / 213 / 0 | 34 / 61 / 0    | 34 / 33 / 16  |
+| MoE, `fsdp=8`                       | 24 / 31 / 0 | 65 / 181 / 0  | 24 / 46 / 6    | 24 / 31 / 8   |
+| MoE, `fsdp=4, tensor=2`             | 36 / 35 / 0 | 164 / 250 / 0 | 36 / 73 / 0    | 36 / 36 / 18  |
+| Llama, `fsdp=8`, `zero=1`           | 22 / 21 / 0 | 73 / 81 / 0   | 22 / 21 / 0    | 22 / 10 / 3   |
+| Llama, `fsdp=4, tensor=2`, `zero=1` | 34 / 21 / 0 | 133 / 201 / 0 | 34 / 35 / 0    | 34 / 11 / 12  |
 
 With `gather`, Muon all-reduces as often as AdamW, and adds one all-gather per matrix
 and two all-to-alls per expert stack; the optimizer's update alone does no all-reduce.
-Step times on fake CPU devices, which share one CPU, say nothing.
+With `owner`, Muon all-reduces and all-gathers as AdamW does, and adds one all-to-all
+each way for every shape and split of matrix, two where a matrix splits on both sides
+(`tensor`). Under `zero=1` its few all-gathers of whole matrices replace the one each
+parameter takes otherwise. Step times on fake CPU devices, which share one CPU, say
+nothing.
+
+On 8 B300s, `mesh(fsdp=8)`, 64 rows of 4096 tokens a step computed in bfloat16,
+thousands of tokens a second for a 1.3B dense Llama (16 layers, `d_model=2048`, 16
+query heads and 8 kv heads, a gated MLP of 5632, 128k tokens) and a 5.2B MoE of its
+shape (64 experts of 704, top 8), by `ns_dtype`:
+
+| model                | AdamW | `gspmd` | `gather` | `owner` |
+|----------------------|-------|---------|----------|---------|
+| dense, float32       | 1,147 | 856     | 849      | 1,073   |
+| dense, bfloat16      |       | 923     | 950      | 1,087   |
+| dense, `repeat=scan` |       | 863     | 938      | 935     |
+| MoE, float32         |       | 531     | 712      | 754     |
+| MoE, bfloat16        |       |         |          | 786     |
+
+The dense model's optimizer update alone takes 74 ms with `gspmd`, 73 with `gather`
+and 12 with `owner` in float32; 48, 42 and 12 in bfloat16. With `repeat=scan` (float32
+here) the stacked `layers` already split over `fsdp` under `gather`, as under `owner`.
 
 ## Repeats and remat: `methods.repeat`, `methods.remat`
 
@@ -681,27 +810,75 @@ says so.
 `remat` rematerializes in the backward pass what the forward does not keep, by a
 `jax.checkpoint` policy:
 
-| method          | what the forward keeps                                     |
-|-----------------|------------------------------------------------------------|
-| `none`          | everything: nothing is computed twice; the default         |
-| `full`          | nothing but the input of each branch or pass               |
-| `dots`          | the products of matrices                                   |
-| `dots_no_batch` | the products of matrices without batch dimensions          |
+| method               | what the forward keeps                                     |
+|----------------------|------------------------------------------------------------|
+| `none`               | everything, but in a scanned pass (below); the default     |
+| `full`               | nothing but the input of each branch or pass               |
+| `dots`               | the products of matrices                                   |
+| `dots_no_batch`      | the products of matrices without batch dimensions          |
+| `save_attention`     | the mixers' outputs, `attention` and `recurrence`          |
+| `save_qkv_attention` | those, and attention's projections, `qkv`                  |
+| `dots_attention`     | `dots_no_batch`'s, the mixers' outputs and `experts`       |
+| `offload_attention`  | the mixers' outputs, in the host's memory                  |
 
 Each residual branch outside any other is rematerialized as a whole, with the read
 and write of the residual algebra; a scanned pass is, as one; and nothing inside
 either is again. In a `.bux` file `none` is the null value, so a sweep writes the
-method as a string: `methods.remat = "none" | full`. Another policy is a function:
+method as a string: `methods.remat = "none" | full`.
+
+The last four keep what layers name (`jax.ad_checkpoint.checkpoint_name`), as
+MaxText's policies do:
+
+| name         | what it is                                                           |
+|--------------|----------------------------------------------------------------------|
+| `attention`  | softmax attention's output, and what its backward takes              |
+| `recurrence` | the same of a recurrent mixer: linear attention, the SSMs, RWKV-7    |
+| `qkv`        | attention's q, k and v projections, MLA's q and kv                   |
+| `mlp`        | an MLP's up and gate projections                                     |
+| `experts`    | the MoE's grouped products                                           |
+
+What a kernel's backward takes is no product of matrices: flash attention's takes its
+output and log-sum-exp, so under `dots` the backward runs the kernel's forward again.
+`remat.named(name, f, *args)` names f's output and everything its backward takes, so
+that a policy that keeps the name runs none of f twice; attention's method and the
+recurrent mixers' run through it. Another policy is a function:
 
 ```python
 import jax
 
 from bux.parallel import methods
 
+methods.remat.register("save_mlp")(
+    jax.checkpoint_policies.save_only_these_names("attention", "mlp")
+)
 methods.remat.register("offload")(
     jax.checkpoint_policies.offload_dot_with_no_batch_dims("device", "pinned_host")
 )
 ```
+
+A scan keeps every value its backward reads, stacked by pass. Unrolled, XLA fuses the
+elementwise ones into the ops that read them and keeps none: a norm's float32 copy of
+the stream, an MLP's activation, a token's copy for each of its experts. So under
+`none` a scanned pass keeps all but what elementwise ops and those that only move or
+retype data make (`remat.CHEAP`), and its backward computes those again
+(`remat.unfused`). Nor does a training step cast the stacked parameters to its compute
+dtype, which would keep a copy of them all, and of their gradients: each pass casts its
+own as it runs (`Scanned.compute`). On a B300, for a 1B dense model (`A^16`), a Gated
+DeltaNet hybrid (`"DDDA"^4`) and a 64-expert MoE (`E^16`), in bfloat16 on 8 rows of
+4096 tokens, the temp memory of the compiled train step, and tokens a second:
+
+| model         | memory: unrolled | scanned, before | scanned  | tokens: unrolled | scanned |
+|---------------|------------------|-----------------|----------|------------------|---------|
+| dense         | 56.2 GiB         | 90.7 GiB        | 47.3 GiB | 145k             | 138k    |
+| GDN           | 124.9 GiB        | 213.8 GiB, OOM  | 86.7 GiB | 94k              | 78k     |
+| MoE           | 95.8 GiB         | 131.7 GiB, OOM  | 80.0 GiB | 106k             | 91k     |
+| dense, fsdp=8 |                  |                 |          | 592k             | 670k    |
+
+("Before" kept every value its backward reads, and the cast copy.) On one GPU a scan
+is still slower: it copies each value it keeps into its stack and back out, where
+unrolled layers read it where it was made, and the more it keeps the more it copies:
+the GDN hybrid's float32 chunk states. On eight, one row each, it is faster, and it
+compiles 2.3 times as fast.
 
 On one CPU, for the gradient of a 24-layer Llama's forward (`d_model=64`, 8 rows of
 128 tokens), and for its first training step, which compiles it:
@@ -711,12 +888,39 @@ On one CPU, for the gradient of a 24-layer Llama's forward (`d_model=64`, 8 rows
 | `unroll` | 1.2 s           | 2.9 s             | 6.9 s            |
 | `scan`   | 0.3 s           | 0.8 s             | 0.9 s            |
 
-| remat           | temp memory, unrolled | scanned |
-|-----------------|-----------------------|---------|
-| `none`          | 328 MiB               | 326 MiB |
-| `full`          | 22 MiB                | 23 MiB  |
-| `dots`          | 133 MiB               | 138 MiB |
-| `dots_no_batch` | 79 MiB                | 82 MiB  |
+| remat                | temp memory, unrolled | scanned |
+|----------------------|-----------------------|---------|
+| `none`               | 327 MiB               | 142 MiB |
+| `full`               | 22 MiB                | 23 MiB  |
+| `dots`               | 132 MiB               | 138 MiB |
+| `dots_no_batch`      | 79 MiB                | 82 MiB  |
+| `save_attention`     | 142 MiB               | 142 MiB |
+| `save_qkv_attention` | 142 MiB               | 142 MiB |
+| `dots_attention`     | 187 MiB               | 193 MiB |
+| `offload_attention`  | 142 MiB               | 142 MiB |
+
+On a CPU, attention is `xla`'s, whose backward takes the t by t probabilities: what
+`save_attention` keeps of it is more than `dots` keeps of the whole layer, and a CPU's
+host memory is its device's. On a GPU, flash attention's backward takes q, k, v, the
+output and the log-sum-exp. On a B300, for the dense 1.3B of 16 Llama blocks of width
+2048 (vocabulary 128256, 8 rows of 4096 tokens, `bfloat16`):
+
+| remat                | tok/s   | peak memory |
+|----------------------|---------|-------------|
+| `none`               | 145,000 | 81.3 GiB    |
+| `dots`               | 134,000 | 69.8 GiB    |
+| `save_attention`     | 132,000 | 61.9 GiB    |
+| `save_qkv_attention` | 130,000 | 61.9 GiB    |
+| `dots_attention`     | 139,000 | 71.8 GiB    |
+| `offload_attention`  | 90,000  | 62.0 GiB    |
+
+`dots` runs flash attention's forward twice, and `save_attention` the matmuls of every
+layer; `dots_attention` runs neither, 4% slower than `none` in 12% less memory.
+`save_qkv_attention` keeps what `save_attention` does here: attention's backward
+takes q, k and v after RoPE, so that only a QK-norm would read the projections.
+Offloading moves more than it saves, at this size. The head's logits are the largest
+part of the rest, which `methods(loss=chunks)` leaves out
+([The trainer's blocks](training.md#the-trainers-blocks)).
 
 `Scanned.layers` holds the stacked passes, and `stacked.run(graphdef, state, times, x,
 taps)` runs any stack of them, such as a pipeline stage's share.
@@ -724,13 +928,14 @@ taps)` runs any stack of them, such as a pipeline stage's share.
 ## Precision and microbatches
 
 ```
-precision = precision(compute=bfloat16)   # in the run's id
+precision = precision(compute=float32)    # in the run's id; bfloat16 by default
 methods   = methods(microbatches=4)       # gradient accumulation: not in it
 ```
 
 Unlike the settings above, `precision` changes what a run computes, so it is in the
 run's id: `precision.compute = float32 | bfloat16` is a sweep of two runs. `compute` is
-`float32` or `bfloat16`; float16 would need loss scaling.
+`bfloat16`, the default, or `float32`; float16 would need loss scaling. `matmuls` is the format the
+projections inside blocks multiply in, `compute` unless it says `mxfp8` or `nvfp4`.
 
 ### Precision
 
@@ -748,20 +953,80 @@ Float32 islands compute from what they are given in float32, and give back its d
 | the MoE's router                                | its logits, scores and top-k, the balance loss and the bias; the weights go back to the stream's dtype |
 | `recurrence`, `delta_rule`, `selective_scan`    | the recurrent state, and its decays               |
 | `rope.rotate`                                   | the rotation                                      |
-| the objective                                   | the logits, as the loss and the z-loss take them  |
+| the head                                        | its matmul's accumulation, tied or not, and its log Z and loss; under `methods(loss=chunks)`, its logits |
 
 Softmax attention takes its softmax in float32, under every method of
-`methods.attention`. Every other matmul runs in `compute`, and the stream stays in it from the embedding to the logits,
+`methods.attention`. Every other matmul runs in `compute`, or in the format of
+`matmuls` (below), and the stream stays in `compute` from the embedding to the heads,
 which `tests/test_precision.py` checks for every family. Gradients are reduced over the
-batch axes in the dtype the backward makes them, bfloat16 for a weight's; they add up
-over microbatches in float32.
+batch axes in the dtype the backward makes them, bfloat16 for a weight's, but the head
+kernel's under `methods(loss=chunks)`, which adds up over the chunks in float32; they
+add up over microbatches in float32.
 
 XLA:CPU fails to compile a bfloat16 `psum` that a `shard_map`'s transpose makes (its
 reducer ends in a copy, which `ChangeOpDataType` cannot clone), and aborts the process.
 The MoE's `sorted` and EP methods make one on more than one device, and so do the
-pipelines; `ring`, `ulysses` and `pass_state` train in bfloat16 on CPU. The tests split
-bfloat16 runs with `methods(moe=dense)` and no pipeline. GPUs all-reduce bfloat16
-natively, which this has not been run on.
+pipelines; `ring`, `ulysses` and `pass_state` train in bfloat16 on CPU. A run that
+would make one says so before it compiles: on a CPU, such runs set
+`precision(compute=float32)`, as `laptop.bux` does, or split an MoE by
+`methods(moe=dense)`. GPUs all-reduce bfloat16 natively.
+
+### Matmul formats
+
+```
+precision = precision(compute=bfloat16, matmuls=mxfp8)
+```
+
+`matmuls` names a format of the registry in `bux.architecture.matmuls`. A block-scaled
+format quantizes the operands of all three GEMMs of y = x W, the forward's and the
+backward's two, each along what its GEMM contracts, in blocks with a scale each
+(`bux.architecture.blockscaled`):
+
+| format    | values  | a scale per                                   | and                                       |
+|-----------|---------|-----------------------------------------------|-------------------------------------------|
+| `compute` | `compute` | none                                        | the default                               |
+| `mxfp8`   | E4M3    | 32, a power of two (E8M0)                     | dy in E4M3 too, as Transformer Engine's MXFP8 recipe |
+| `nvfp4`   | E2M1    | 16 (E4M3), and the tensor (float32); W's per 16 x 16 tile, so that y and dx see the same W | dy rounded stochastically, and x and dy transformed for dW by a random Hadamard transform of 16, as NVIDIA's NVFP4 pretraining recipe |
+
+On a Blackwell GPU cuDNN's block-scaled GEMM multiplies them (`__cudnn$blockScaledDot`
+in the HLO), and for `mxfp8` a Pallas kernel quantizes each of x, W and dy and its
+transpose in one pass. Elsewhere XLA dequantizes and multiplies, which computes the
+same values, so the tests run the formats on CPU. The forward keeps what the backward
+multiplies, x^T and W in the format, rather than x and W.
+
+Every projection made by `sharding.projection` or `sharding.linear` multiplies by
+`matmuls.dot_general`, which runs the format in force: attention's q, k, v, o and
+gate; the MLPs', the shared experts' and LatentMoE's; MLA's, CSA's, the indexer's; the
+linear attentions', RWKV-7's and Mamba's; Engram's, nextn's and `linear`'s. These stay
+in `compute`: the embedding and the head, softmax attention's own matmuls and its
+relative bias, the router and the shared experts' gate, hyper-connections, norms,
+low-rank gates and decays, recurrent states, and the routed experts
+(`grouped.ragged_dot`, and `methods(moe=dense)`'s einsums). A projection whose tokens,
+inputs or outputs are not whole blocks multiplies in `compute`. On a mesh, one that
+does not split into whole blocks on every device (a multiple of the block times the
+devices) stays whole on each: so the blocks are the same on any mesh, and so is what a
+run computes, which `tests/test_precision.py` checks on `fsdp=4, tensor=2` and in a
+pipeline. NVFP4's stochastic rounding draws its noise from a hash of each element's
+index and the batch's tokens, the same on any mesh too.
+
+Under FSDP each device quantizes its part of W, so the all-gathers move float8 values
+and their scales, half of bfloat16's bytes. A projection multiplies its tokens
+flattened, rows by positions, and a split along positions is not one along the
+flattened tokens: a `ring` run on `context=2` trained 13% slower in `mxfp8` than in
+bfloat16 on B300s.
+
+A recipe is a function, and the trainer enters `matmuls.use` as it traces its steps:
+
+```python
+from bux.architecture import matmuls
+
+
+@matmuls.formats.register("mine")
+def _(lhs, rhs, dimension_numbers, **kwargs): ...  # jax.lax.dot_general's arguments
+```
+
+`matmuls.block_scaled(recipe)` makes one of a `blockscaled.Recipe`: how it quantizes x,
+W and dy, each twice.
 
 ### Microbatches
 
@@ -826,6 +1091,25 @@ eight words, byte by byte (`seq_len = 128`, `batch = 16`, `adamw(lr=3e-3)`, cosi
 | `gdn`    | 1.5034 / 1.4998 | 0.4112 / 0.4269 | 0.4205 / 0.4204 |
 | `mamba2` | 0.9262 / 0.9276 | 0.4134 / 0.4129 | 0.4211 / 0.4207 |
 
+### Donation: `methods.donate`
+
+`methods(donate=true)` donates the model's and the optimizer's arrays to the step,
+so the new state takes the old one's memory where XLA can write it in place. On one
+B300 (bf16, 8 × 4096 tokens) the step of the Llama-style 1.3B then peaks at 70.5 GiB
+instead of 81.1, and the KDA hybrid runs 3% faster. The MoE's (64 experts, top 8,
+5.2B) peaks at 153 GiB instead of 161, but XLA writes little of its state in place
+there, and its temporaries double, to 95.8 GiB in one piece of the memory: on one
+GPU, a checkpoint's few buffers in the wrong place leave no such piece, and the run
+runs out of memory. Donation also changes how XLA rounds a step a little (the
+gradient's norm by 7e-6 at the dense model's first step on a GPU, the loss by 2e-6
+at zamba2's third on a CPU), so it is off by default. With it, an array read from
+`trainer.model` before a step is gone after it; a checkpoint is safe, as orbax
+copies the state to the host before `save` returns.
+
+Either way the trainer keeps the state in the buffers it was made in
+(`parallel.shard_state` moves only what is elsewhere), and a run that resumes loads
+its checkpoint into the memory of the state it replaces.
+
 ## Pipelines: `methods.pipeline`
 
 ```
@@ -864,9 +1148,9 @@ leaves, summed over the stages to every one.
 $ bux plan examples/experiments/smoke.bux 'methods = methods(repeat=scan, microbatches=4)' \
     'mesh = one: mesh(data=1) | pp: mesh(stage=2, data=1)'
 2 runs
-id          params  tokens  tok/param  gpus  params/gpu  optim/gpu  bubble  run
-bbbf3ae709  156k    25.6k   0.2        1     609KiB      1.19MiB    0%      smoke[one]
-bbbf3ae709  156k    25.6k   0.2        2     369KiB      738KiB     20%     smoke[pp]
+id          params  tokens  tok/param  flops/tok  gpus  params/gpu  optim/gpu  bubble  run
+bbbf3ae709  156k    25.6k   0.2        1.03M      1     609KiB      1.19MiB    0%      smoke[one]
+bbbf3ae709  156k    25.6k   0.2        1.03M      2     369KiB      738KiB     20%     smoke[pp]
 ```
 
 A stage gets the stream and the taps of its rows (the tokens, the documents), split

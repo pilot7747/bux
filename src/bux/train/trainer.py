@@ -7,6 +7,7 @@ A run's directory, ``<out>/<name>-<id>``, holds:
     run.json       its IR
     metrics.jsonl  a line of metrics every `log.every` steps, and at every eval
     checkpoints/   with a `checkpoint` setting; a run there resumes from the latest
+    profile/       with a `profile` setting, a trace of its steps
 
 Its name says which alternatives it took, and its id hashes what it computes, so a
 changed setting gets a fresh directory and an unchanged one finds its checkpoints.
@@ -31,44 +32,51 @@ import jax.numpy as jnp
 import optax
 from flax import nnx
 from jax.typing import DTypeLike
-from jaxtyping import Array, Float
+from jaxtyping import Array, Float, Int32
 
-from bux import parallel
-from bux.architecture import Model
+from bux import kernels, parallel
+from bux.architecture import Model, Scanned, matmuls, remat
+from bux.architecture.logits import HeadOutput
 from bux.architecture.registry import Loss
+from bux.architecture.repeat import scanned_variables
 from bux.data.pipeline import DEFAULT_CACHE, jobs, prepare
 from bux.lang import ir
 from bux.lang.printer import run_to_source
-from bux.train.data import Batch, batches
-from bux.train.hooks import Checkpoint, Eval, Hook, Log
+from bux.train import flops
+from bux.train.data import Batch, batches, prefetch
+from bux.train.hooks import Checkpoint, Eval, Hook, Log, Profile
 from bux.train.objective import Metrics, Objective, objective, target_mask
 from bux.train.optim import Schedule, lr_multiplier, lr_schedule, optimizer
 from bux.train.sinks import JSONL, Console, LatestMetrics, Sink, is_main_process
 
 
-def forward(model: Model, batch: Batch) -> list[Float[Array, "b t vocab"]]:
-    """Return every head's logits on `batch`, each document of a row on its own."""
-    return model.outputs(jnp.asarray(batch.input_ids), jnp.asarray(batch.position_ids))
+def forward(model: Model, batch: Batch) -> list[HeadOutput]:
+    """Return every head's output on `batch`, each document of a row on its own."""
+    return model.heads(jnp.asarray(batch.input_ids), jnp.asarray(batch.position_ids))
 
 
-def training_forward(
-    model: Model, batch: Batch
-) -> tuple[list[Float[Array, "b t vocab"]], list[Loss]]:
-    """Return `forward`'s logits in a training step, and the losses layers report."""
+def training_forward(model: Model, batch: Batch) -> tuple[list[HeadOutput], list[Loss]]:
+    """Return `forward`'s outputs in a training step, and the losses layers report."""
     tokens, positions = jnp.asarray(batch.input_ids), jnp.asarray(batch.position_ids)
-    return model.training_outputs(tokens, positions)
+    return model.training_heads(tokens, positions)
 
 
 def cast[M: nnx.Module](model: M, dtype: DTypeLike) -> M:
     """Return a copy of `model` with its floating-point parameters in `dtype` and the
     rest of its state as it is. Gradients through it reach the parameters in their
-    own dtype."""
-    graphdef, params, buffers = nnx.split(model, nnx.Param, ...)
+    own dtype. A scanned repeat's stay as they are, and each pass casts its own as it
+    runs (``Scanned.compute``)."""
+    stacked = nnx.All(nnx.Param, scanned_variables(model))
+    graphdef, kept, params, buffers = nnx.split(model, stacked, nnx.Param, ...)
     params = jax.tree.map(
         lambda x: x.astype(dtype) if jnp.issubdtype(x.dtype, jnp.floating) else x,
         params,
     )
-    return nnx.merge(graphdef, params, buffers)
+    copy = nnx.merge(graphdef, kept, params, buffers)
+    for _, node in nnx.iter_graph(copy):
+        if isinstance(node, Scanned):
+            node.compute = jnp.dtype(dtype)
+    return copy
 
 
 @runtime_checkable
@@ -120,10 +128,15 @@ class Trainer:
 
     Both compute in `compute`, the model's parameters cast to it inside the loss, so
     that the parameters, their gradients and the optimizer's state stay as they are
-    (float32).
+    (float32); and the projections inside blocks multiply in the format `matmuls`
+    names (``bux.architecture.matmuls``).
 
     Made inside ``parallel.use``, it puts its state on the shardings the layout gives
     it, and every step keeps it there.
+
+    With `donate`, a training step donates the model's and the optimizer's arrays, so
+    that their new state takes the old one's memory: an array read from them before a
+    step is gone after it, and one to keep is a copy (``np.asarray``).
     """
 
     def __init__(
@@ -133,15 +146,19 @@ class Trainer:
         objective: Objective,
         *,
         compute: DTypeLike = jnp.float32,
+        matmuls: str = "compute",
         microbatches: int = 1,
+        donate: bool = False,
     ):
         self.model, self.objective = model, objective
         self.compute, self.microbatches = jnp.dtype(compute), microbatches
+        self.matmuls = matmuls
         self.optimizer = nnx.Optimizer(model, tx, wrt=nnx.Param)
         parallel.shard_state(self.model, self.optimizer)
         self.step = 0
         self.stopping = False  # set, by a signal handler say, to stop after this step
-        self._train = nnx.jit(self._train_step_on_shards)
+        donated = ("model", "optimizer") if donate else ()
+        self._train = nnx.jit(self._train_step_on_shards, donate_argnames=donated)
         self._eval = nnx.jit(self.eval_step)
 
     def _train_step_on_shards(
@@ -220,8 +237,9 @@ class Trainer:
         def loss_fn(params: nnx.State) -> tuple[Float[Array, ""], tuple[Metrics, Any]]:
             model = cast(nnx.merge(graphdef, params, buffers, copy=True), self.compute)
             model.set_attributes(update_at_step_end=True, raise_if_not_found=False)
-            logits, aux_losses = training_forward(model, batch)
-            per_token, per_row = self.objective(logits, batch, aux_losses)
+            with matmuls.use(self.matmuls, jnp.asarray(batch.input_ids)):
+                heads, aux_losses = training_forward(model, batch)
+            per_token, per_row = self.objective(heads, batch, aux_losses)
             loss = token_share * per_token.loss + row_share * per_row.loss
             metrics = _scaled(per_token.metrics, token_share)
             metrics |= _scaled(per_row.metrics, row_share)
@@ -232,8 +250,9 @@ class Trainer:
 
     def eval_step(self, model: Model, batch: Batch) -> Float[Array, ""]:
         """Return the first head's loss on `batch`, computed in `compute`."""
-        logits = forward(cast(model, self.compute), batch)
-        per_token, _ = self.objective(logits, batch)
+        with matmuls.use(self.matmuls):
+            heads = forward(cast(model, self.compute), batch)
+        per_token, _ = self.objective(heads, batch)
         return per_token.metrics["loss"]
 
     def train_on_batch(self, batch: Batch) -> Metrics:
@@ -270,16 +289,17 @@ class Trainer:
         sinks: Sequence[Sink] = (),
     ) -> None:
         """Train on `data` to step `steps`, or until `stopping` is set, after which
-        every hook's `stop` runs. After every step, the hooks due run in order, and
-        what they return goes to every sink. All of them close at the end, or when
-        training stops."""
+        every hook's `stop` runs; the next batches load as a step runs (``prefetch``).
+        After every step, the hooks due run in order, and what they return goes to
+        every sink. All of them close at the end, or when training stops."""
         with contextlib.ExitStack() as stack:
             for block in (*sinks, *hooks):
                 stack.callback(block.close)
             for hook in hooks:
                 hook.start(self)
+            loaded = stack.enter_context(contextlib.closing(prefetch(data)))
             while self.step < steps and not self.stopping:
-                metrics = self.train_on_batch(next(data))
+                metrics = self.train_on_batch(next(loaded))
                 for hook in hooks:
                     if hook.due(self.step, steps) and (scalars := hook(self, metrics)):
                         for sink in sinks:
@@ -320,23 +340,26 @@ def train(
             run.model_dump_json(indent=2), encoding="utf-8"
         )
 
+    multiplier = lr_multiplier(config.schedule, config.steps)
+    log = _log(run, lr_schedule(config.optimizer.lr, multiplier))
     with parallel.use(config.mesh, config.layout, config.methods):
         parallel.check(config.batch, config.seq_len)
+        _check_cpu_bfloat16(run)
         model = parallel.build(lambda: Model(run.arch, rngs=nnx.Rngs(config.seed)))
-        multiplier = lr_multiplier(config.schedule, config.steps)
         tx = optimizer(config.optimizer, multiplier, model, config.clip)
         trainer = Trainer(
             model,
             tx,
             objective(config.loss, run.arch),
             compute=config.precision.compute,
+            matmuls=config.precision.matmuls,
             microbatches=_accumulated(config.methods.microbatches),
+            donate=config.methods.donate,
         )
         make_batches = functools.partial(
             batches, config=config, vocab_size=vocab, cache=cache
         )
-        lr = lr_schedule(config.optimizer.lr, multiplier)
-        run_hooks = _hooks(run, trainer, folder, lr, make_batches, echo)
+        run_hooks = _hooks(run, trainer, folder, log, make_batches, echo)
         latest = LatestMetrics()
         trainer.fit(
             make_batches(config.data, start=trainer.step),
@@ -352,25 +375,90 @@ def train(
     return latest.metrics
 
 
+def _check_cpu_bfloat16(run: ir.Run) -> None:
+    """Raise where XLA:CPU would abort: it cannot compile a bfloat16 psum that a
+    shard_map's transpose makes, as the MoE's methods but `dense`, the pipelines and
+    sparse attention split over `context` do on more than one device."""
+    on, config = parallel.active(), run.train
+    if config.precision.compute != "bfloat16" or jax.default_backend() != "cpu":
+        return
+    if on is None or on.mesh.size == 1:
+        return
+    types = {layer.config.type for layer in run.arch.layers()}
+    if "moe" in types and config.methods.moe != "dense":
+        what = f"an MoE by methods(moe={config.methods.moe})"
+    elif parallel.pipeline.pipelined():
+        what = "a pipeline"
+    elif types & {"indexer", "csa"} and on.size("context") > 1:
+        what = "sparse attention split over context"
+    else:
+        return
+    raise ValueError(
+        f"XLA:CPU cannot train {what} in bfloat16 on more than one device: set "
+        "precision(compute=float32), or methods(moe=dense) for an MoE"
+    )
+
+
 def _accumulated(microbatches: int) -> int:
     """Return how many microbatches a step accumulates gradients over: one under a
     pipeline, which takes them through its stages instead."""
     return 1 if parallel.pipeline.pipelined() else microbatches
 
 
+def step_flops(run: ir.Run) -> float:
+    """Return the model FLOPs of a training step of `run`: its loss's gradient on a
+    batch, counted from its program (``flops.count``) on one device, outside any mesh,
+    with remat and kernels off, which would add work or hide it."""
+    t = run.train
+    loss = objective(t.loss, run.arch)
+
+    def gradient(
+        params: nnx.State, rest: nnx.State, ids: Int32[Array, "b t"]
+    ) -> nnx.State:
+        positions = jnp.arange(t.seq_len, dtype=jnp.int32)
+        batch = Batch(ids, jnp.broadcast_to(positions, ids.shape), ids >= 0)
+
+        def f(params: nnx.State) -> Float[Array, ""]:
+            model = nnx.merge(graphdef, params, rest, copy=True)
+            model = cast(model, t.precision.compute)
+            model.set_attributes(update_at_step_end=True, raise_if_not_found=False)
+            heads, losses = training_forward(model, batch)
+            per_token, per_row = loss(heads, batch, losses)
+            return per_token.loss + per_row.loss
+
+        return jax.grad(f)(params)
+
+    with remat.off(), kernels.off():
+        abstract = nnx.eval_shape(lambda: Model(run.arch, rngs=nnx.Rngs(t.seed)))
+        graphdef, params, rest = nnx.split(abstract, nnx.Param, ...)
+        ids = jax.ShapeDtypeStruct((t.batch, t.seq_len), jnp.int32)
+        return flops.count(gradient, params, rest, ids)
+
+
+def _log(run: ir.Run, lr: Schedule) -> Log:
+    """Return the run's log, with its MFU where the peak of its devices is known."""
+    t = run.train
+    devices = parallel.mesh(t.mesh).devices
+    each = flops.peak(devices.flat[0].device_kind)
+    most = each and each * devices.size
+    work = step_flops(run) if most else None
+    return Log(
+        every=t.log.every, lr=lr, tokens=t.batch * t.seq_len, flops=work, peak=most
+    )
+
+
 def _hooks(
     run: ir.Run,
     trainer: Trainer,
     folder: Path,
-    lr: Schedule,
+    log: Log,
     make_batches: Callable[..., Iterator[Batch]],
     echo: Callable[[str], None],
 ) -> list[Hook]:
-    """Return the run's own hooks: its log, eval and checkpoint, which resumes
-    `trainer` from the latest checkpoint in `folder` if there is one."""
+    """Return the run's own hooks: its `log`, eval, checkpoint, which resumes `trainer`
+    from the latest checkpoint in `folder` if there is one, and profile."""
     config = run.train
-    tokens = config.batch * config.seq_len
-    hooks: list[Hook] = [Log(every=config.log.every, lr=lr, tokens=tokens)]
+    hooks: list[Hook] = [log]
     if (evals := config.eval) is not None:
         held_out = functools.partial(make_batches, evals.data, held_out=True)
         hooks.append(Eval(held_out, every=evals.every, batches=evals.batches))
@@ -381,4 +469,6 @@ def _hooks(
         if checkpoint.restore(trainer):
             echo(f"{run.name}: resuming at step {trainer.step}")
         hooks.append(checkpoint)
+    if (trace := config.profile) is not None:
+        hooks.append(Profile(folder / "profile", start=trace.start, steps=trace.steps))
     return hooks

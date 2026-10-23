@@ -119,7 +119,7 @@ def test_a_train_step_moves_the_bias_eval_does_not_and_checkpoints_keep_it(tmp_p
     trainer = Trainer(model, optax.adamw(1e-3), objective(tcfg.LossConfig(), arch))
     batch = plain(tokens())
     eager = nnx.clone(model)
-    eager.training_outputs(jnp.asarray(batch.input_ids))
+    eager.training_heads(jnp.asarray(batch.input_ids))
     trainer.train_on_batch(batch)
     first = bias(model)
     assert jnp.array_equal(first, bias(eager)) and (first != 0).any()
@@ -149,20 +149,20 @@ def test_reported_losses_are_terms_of_the_training_loss_weighted_by_each_layer()
     )
     model = Model(arch, rngs=nnx.Rngs(0))
     batch = plain(tokens())
-    logits, reported = model.training_outputs(jnp.asarray(batch.input_ids))
+    heads, reported = model.training_heads(jnp.asarray(batch.input_ids))
     assert [(r.name, r.weight) for r in reported] == [
         ("balance_loss", 0.1),
         ("balance_loss", 0.3),
     ]
     a, b = (r.value for r in reported)
     obj = objective(tcfg.LossConfig(), arch)
-    per_token, per_row = obj(logits, batch, reported)
+    per_token, per_row = obj(heads, batch, reported)
     total, metrics = per_token.loss + per_row.loss, per_token.metrics | per_row.metrics
     assert set(metrics) == {"loss", "balance_loss"}
     assert jnp.isclose(metrics["balance_loss"], a + b)
     assert jnp.isclose(total, metrics["loss"] + 0.1 * a + 0.3 * b)
     with pytest.raises(ValueError, match="a layer reports 'loss'"):
-        obj(logits, batch, [Loss("loss", 1.0, a)])
+        obj(heads, batch, [Loss("loss", 1.0, a)])
 
     # A train step logs the term; eval is the cross-entropy alone.
     trainer = Trainer(model, optax.adamw(1e-3), obj)
@@ -175,9 +175,10 @@ def test_a_model_without_reporting_layers_trains_as_before():
     arch = compile(ARCH + "model = embed [norm attn] [norm ffn] norm head\n")
     model = Model(arch, rngs=nnx.Rngs(0))
     batch = plain(tokens())
-    logits, reported = model.training_outputs(jnp.asarray(batch.input_ids))
+    heads, reported = model.training_heads(jnp.asarray(batch.input_ids))
     assert reported == []
-    assert jnp.array_equal(logits[0], model.outputs(jnp.asarray(batch.input_ids))[0])
+    logits = model.outputs(jnp.asarray(batch.input_ids))[0]
+    assert jnp.array_equal(heads[0].logits(), logits)
     trainer = Trainer(model, optax.adamw(1e-3), objective(tcfg.LossConfig(), arch))
     assert set(trainer.train_on_batch(batch)) == {"loss", "grad_norm"}
 

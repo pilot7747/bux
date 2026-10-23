@@ -48,6 +48,7 @@ ONE, SCAN = "mesh(data=1)", "methods(repeat=scan)"
 TOKENS = np.random.default_rng(0).integers(0, 128, (8, 16))
 TRAIN = (
     "data = synthetic\noptimizer = adamw(lr=1e-2)\nseq_len = 16\nbatch = 8\nsteps = 4"
+    "\nprecision = precision(compute=float32)"  # XLA:CPU: no bfloat16 pipelines
 )
 
 
@@ -100,9 +101,9 @@ def _forward(model: Model, mesh: str, methods: str, training: bool = False) -> N
     which moves the state its layers change, if `training`."""
     tokens = jnp.asarray(TOKENS)
     with _use(mesh, methods):
-        nnx.jit(lambda m: m.training_outputs(tokens)[0] if training else m(tokens))(
-            model
-        )
+        nnx.jit(
+            lambda m: m.training_heads(tokens)[0][0].logits() if training else m(tokens)
+        )(model)
 
 
 # --- Against one device ----------------------------------------------------------------
@@ -149,10 +150,10 @@ def test_a_circular_pipeline_trains_as_one_device(losses):
     assert np.allclose(piped, one, atol=1e-5)
 
 
-@pytest.mark.parametrize("orthogonalize", ["gspmd", "gather"])
+@pytest.mark.parametrize("orthogonalize", ["gspmd", "gather", "owner"])
 @pytest.mark.parametrize("pipeline", ["gpipe", "circular"])
 def test_muon_trains_a_pipelined_repeat_as_one_device(losses, pipeline, orthogonalize):
-    muon, rounds = "muon(lr=0.02)", 2 if pipeline == "circular" else 1
+    muon, rounds = "muon(lr=0.02, ns_dtype=float32)", 2 if pipeline == "circular" else 1
     how = _how(4, pipeline, rounds, orthogonalize=orthogonalize)
     mesh, batch = "mesh(stage=2, fsdp=2)", "16"  # 4 microbatches over data × fsdp
     piped = losses(LLAMA, mesh=mesh, optimizer=muon, methods=how, batch=batch)
@@ -160,7 +161,7 @@ def test_muon_trains_a_pipelined_repeat_as_one_device(losses, pipeline, orthogon
     assert np.allclose(piped, one, atol=1e-5)
 
 
-@pytest.mark.parametrize("remat", ["full", "dots"])
+@pytest.mark.parametrize("remat", ["full", "dots", "save_attention"])
 def test_a_rematerialized_pipeline_trains_as_one_device(losses, remat):
     piped = losses(LLAMA, mesh="mesh(stage=2, data=1)", methods=_how(4, remat=remat))
     assert np.allclose(piped, losses(LLAMA, mesh=ONE, methods=SCAN), atol=1e-5)
@@ -191,7 +192,7 @@ def test_the_router_bias_moves_as_the_microbatches_in_a_row_would_move_it():
     micro, mesh = 4, "mesh(stage=2, data=1)"
     alone = _model(BIASED)
     for m in range(micro):
-        alone.training_outputs(jnp.asarray(TOKENS[m::micro]))
+        alone.training_heads(jnp.asarray(TOKENS[m::micro]))
     piped = _model(BIASED, mesh, _how(micro))
     _forward(piped, mesh, _how(micro), training=True)
     assert np.allclose(_bias(piped), _bias(alone), atol=1e-6)

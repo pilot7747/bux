@@ -61,11 +61,14 @@ def method(body: Body) -> Callable[..., Float[Array, "b t d"]]:
         tokens = _tokens(z, ep)
         ffn, norm = moe.config.expert, moe.expert_norm
         local = functools.partial(body, axes=ep, ffn=ffn, norm=norm)
+        # Untyped by what varies, as `sorted`'s: tokamax's kernel takes
+        # jnp.searchsorted, which fails in a typed shard_map on jax 0.12.
         return jax.shard_map(
             local,
             in_specs=(tokens, tokens, tokens, P(ep)),
             out_specs=tokens,
             axis_names=set(_axes(tokens)),
+            check_vma=False,
         )(z, idx, weights, moe.kernels())
 
     return run

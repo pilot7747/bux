@@ -2,22 +2,28 @@
 
 `Attention` is the GPT-2 and Llama layer: projections, QK-norm, RoPE, the run's
 `methods.attention` (``bux.parallel.context``), and the output projection. Two mixins
-add what needs all t by t logits, which only `xla`'s math makes: `FullLogits`
-(relative bias, length scale, attention dropout) and `Sparse` (the indexer of sparse
-attention). `build_gqa` picks the class the config needs.
+add to it: `FullLogits`, what needs all t by t logits, which only `xla`'s math makes
+(relative bias, length scale, attention dropout), and `Sparse`, the indexer of sparse
+attention, which attends by ``bux.architecture.sparse``. `build_gqa` picks the class
+the config needs.
 """
 
 from collections.abc import Sequence
+from functools import partial
+from typing import Any
 
+import jax
 import jax.numpy as jnp
 from flax import nnx
+from jax.ad_checkpoint import checkpoint_name
 from jaxtyping import Array, Bool, Float, Int
 
 from bux import config as cfg
 from bux import parallel
+from bux.architecture import remat, sparse
 from bux.architecture.conv import CausalConv
 from bux.architecture.functional import activation
-from bux.architecture.indexer import Indexer, Scores, from_stream
+from bux.architecture.indexer import Indexer, Scored, Target, from_stream
 from bux.architecture.norm import Norm
 from bux.architecture.ports import read, reads, write, writes
 from bux.architecture.registry import (
@@ -43,7 +49,6 @@ from bux.parallel.context import (
 
 Names = tuple[parallel.Name, parallel.Name]  # a projection's input and output
 SoftmaxConfig = cfg.GQAConfig | cfg.MLAConfig | cfg.CSAConfig
-KEEP_MASK = "mask of kept keys (an indexer's top-k, or CSA's compression)"
 
 
 class SoftmaxAttention(nnx.Module):
@@ -110,10 +115,22 @@ class SoftmaxAttention(nnx.Module):
         docs: Segments | None,
     ) -> Float[Array, "b t h dv"]:
         """Return every query's softmax-weighted values by the run's
-        `methods.attention`; `x` is for `FullLogits`."""
+        `methods.attention`, named `attention` with what its backward takes
+        (``remat.named``); `x` is for `FullLogits`."""
         ids = None if docs is None else docs.ids
         args = AttentionArgs(ids, self.window, self.scale, self.softcap, self._sinks())
-        return parallel.method("attention")(q, k, v, args)
+        method = parallel.method("attention")
+
+        def attend(
+            q: Float[Array, "b t h dk"],
+            k: Float[Array, "b s g dk"],
+            v: Float[Array, "b s g dv"],
+            ids: Int[Array, "b t"] | None,
+            sinks: Float[Array, " h"] | None,
+        ) -> Float[Array, "b t h dv"]:
+            return method(q, k, v, args._replace(ids=ids, sinks=sinks))
+
+        return remat.named("attention", attend, q, k, v, ids, args.sinks)
 
     def _sinks(self) -> Float[Array, " h"] | None:
         return None if self.sinks is None else self.sinks[...]
@@ -123,6 +140,7 @@ class SoftmaxAttention(nnx.Module):
     ) -> Float[Array, "b t d"]:
         """Normalize and gate the head outputs, then project them back to the width."""
         b, t, _ = x.shape
+        out = checkpoint_name(out, "attention")
         if self.out_norm is not None:
             out = self.out_norm(out)
         if self.gate is not None:
@@ -228,8 +246,10 @@ class Attention(SoftmaxAttention):
         from its kv port: slices of one projection when fused, else one each."""
         if self.qkv is not None:
             q, k = self.heads * self.head_dim, self.kv_heads * self.head_dim
-            return jnp.split(self.qkv(x), [q, q + k], axis=-1)
-        return [p(x) for p in (self.q, self.k, self.v) if p is not None]
+            qkv = checkpoint_name(self.qkv(x), "qkv")
+            return jnp.split(qkv, [q, q + k], axis=-1)
+        projections = (self.q, self.k, self.v)
+        return [checkpoint_name(p(x), "qkv") for p in projections if p is not None]
 
     def _queries(
         self, q: Float[Array, "b t _"], pos: Int[Array, "b t"] | None
@@ -327,7 +347,9 @@ class FullLogits(SoftmaxAttention):
     ) -> None:
         rel, names = config.relative_bias, ("embed", ("heads", self.heads))
         self.rel_proj = (
-            linear(width, self.heads * rel.rank, names, bias, rngs) if rel else None
+            linear(width, self.heads * rel.rank, names, bias, rngs, in_compute=True)
+            if rel
+            else None
         )
         self.rel_table = nnx.Param(jnp.zeros((rel.rank, rel.extent))) if rel else None
         self.log_scale, self.log_scale_floor = config.log_scale, config.log_scale_floor
@@ -363,12 +385,11 @@ class FullLogits(SoftmaxAttention):
         q: Float[Array, "b t h dk"],
         k: Float[Array, "b s g dk"],
         docs: Segments | None,
-        keep_mask: Bool[Array, "b t s"] | None = None,
+        mask: Bool[Array, "*b t s"] | None = None,
     ) -> Float[Array, "b h t s"]:
-        """Return the softmax over the keys the mask, and `keep_mask` if given, keep."""
-        mask = self._mask(docs, x.shape[1])
-        if keep_mask is not None:
-            mask = mask & keep_mask
+        """Return the softmax over the keys `mask` keeps, the layer's own if none."""
+        if mask is None:
+            mask = self._mask(docs, x.shape[1])
         logits = self._logits(x, q, k, docs)
         return masked_softmax(logits, mask[..., None, :, :], self._sinks())
 
@@ -440,9 +461,13 @@ class Sparse(FullLogits):
     """Sparse attention (DeepSeek-V3.2): each query attends only to the keys an
     indexer keeps. Its loss alone trains it, against the attention's probabilities.
 
-    Ports: `index` written pushes the keep mask; read uses the tap's instead of running
-    an indexer, so the layer builds none. `candidates` written pushes the candidate
-    pool; read keeps the indexer's choice inside the tap's.
+    The attention is ``sparse.attend``'s, with no t by t floats: tokamax's flash kernel
+    with the kept keys as a mask on a GPU, else XLA a chunk of queries at a time.
+    `FullLogits`' features take all t by t logits, as `xla` does.
+
+    Ports: `index` written pushes the kept keys (``sparse.Kept``); read uses the tap's
+    instead of running an indexer, so the layer builds none. `candidates` written
+    pushes the candidate pool; read keeps the indexer's choice inside the tap's.
     """
 
     indexer: Indexer | None  # which the layer builds, if it runs one
@@ -451,31 +476,66 @@ class Sparse(FullLogits):
         self,
         x: Float[Array, "b t d"],
         q: Float[Array, "b t h dk"],
-        k: Float[Array, "b s g dk"],
-        v: Float[Array, "b s g dv"],
+        parts: Sequence[sparse.Part],
         docs: Segments | None,
-        keep_mask: Bool[Array, "b t s"] | None,
-        scores: Scores | None,
+        scored: Scored | None,
         taps: Taps,
     ) -> Float[Array, "b t h dv"]:
-        """Return `_attend` over the keys each query keeps; in training, also report
-        the indexer's loss from its `scores`."""
-        require_xla(KEEP_MASK)
-        probs = self._probabilities(x, q, k, docs, keep_mask)
-        if scores is not None:
-            self._train_indexer(probs, scores, taps)
+        """Return every query's softmax-weighted values over what it attends to of
+        each part, all in one softmax; in training, also report the indexer's loss
+        from what it `scored`, against the attention to the last part."""
+        if self._feature() is not None:
+            return self._attend_logits(x, q, parts, docs, scored, taps)
+        out, lse = sparse.attend(q, parts, self._sinks(), self.scale, self.softcap)
+        if self._trains(scored, taps):
+            assert scored is not None
+            last = parts[-1]
+            xs = (q, lse, *sparse.rows(last))
+            width = q.shape[2] * last.k.shape[1]
+            self._train_indexer(scored, partial(self._target, last), xs, width, taps)
+        return out
+
+    def _target(self, part: sparse.Part, xs: tuple) -> Float[Array, "b c s"]:
+        """Return a chunk of queries' attention to the keys of `part`, given their
+        queries, logsumexp and `sparse.rows`."""
+        q, lse, span, index = jax.lax.stop_gradient(xs)
+        part = sparse.at(part, span, index)
+        return sparse.probabilities(q, part, lse, self.scale, self.softcap)
+
+    def _attend_logits(
+        self,
+        x: Float[Array, "b t d"],
+        q: Float[Array, "b t h dk"],
+        parts: Sequence[sparse.Part],
+        docs: Segments | None,
+        scored: Scored | None,
+        taps: Taps,
+    ) -> Float[Array, "b t h dv"]:
+        """Return `_attend_kept` from all t by t logits, for `FullLogits`' features."""
+        feature = self._feature()
+        assert feature is not None
+        require_xla(feature)
+        k, v = (jnp.concatenate(kv, axis=1) for kv in zip(*((p.k, p.v) for p in parts)))
+        mask = jnp.concatenate([sparse.visible(p) for p in parts], -1)
+        probs = self._probabilities(x, q, k, docs, mask)
+        if self._trains(scored, taps):
+            assert scored is not None
+            n = parts[-1].k.shape[1]
+            attention = probs[..., -n:].astype(jnp.float32).sum(1)
+            self._train_indexer(scored, lambda a: a, attention, n, taps)
         return self._values(probs, v)
 
+    def _trains(self, scored: Scored | None, taps: Taps) -> bool:
+        """Return whether the indexer learns in this forward: in training, if it ran."""
+        trained = self.indexer is not None and self.indexer.loss_weight
+        return scored is not None and bool(trained) and training(taps)
+
     def _train_indexer(
-        self, probs: Float[Array, "b h t s"], scores: Scores, taps: Taps
+        self, scored: Scored, target: Target, xs: Any, width: int, taps: Taps
     ) -> None:
-        """In a training forward, report the indexer's loss against the attention to
-        the keys it scores, which come last (CSA's after the window)."""
-        if self.indexer is None or not self.indexer.loss_weight or not training(taps):
-            return
-        n = scores.values.shape[-1]
-        attention = probs[..., -n:].astype(jnp.float32).sum(1)
-        loss = self.indexer.loss(scores, attention)
+        """Report the indexer's loss against the attention `target` gives."""
+        assert self.indexer is not None
+        loss = self.indexer.loss(scored, target, xs, width)
         report(taps, "indexer_loss", self.indexer.loss_weight, loss)
 
     def _select(
@@ -484,17 +544,17 @@ class Sparse(FullLogits):
         query: Float[Array, "b t e"],
         pos: Int[Array, "b t"] | None,
         keys: Float[Array, "b s i"] | None,
-        mask: Bool[Array, "b t s"],
+        span: sparse.Span,
         order: Int[Array, "b s"],
         taps: Taps,
-    ) -> tuple[Bool[Array, "b t s"] | None, Scores | None]:
-        """Return the keys each query keeps of those `mask` allows (the index port's,
-        or the indexer's top-k from `query` and `keys`; None for all), and the
-        indexer's scores if it ran. `order` says which key of its document each slot
-        holds, -1 for none."""
-        scores = None
+    ) -> tuple[sparse.Kept | None, Scored | None]:
+        """Return the keys each query keeps of those its `span` has (the index
+        port's, or the indexer's top-k from `query` and `keys`; None for all), and
+        what the indexer scored if it ran. `order` says which key of its document each
+        slot holds, -1 for none."""
+        scored = None
         if reads(self.ports, "index"):
-            keep_mask = read(taps, self.ports, "index")
+            kept = read(taps, self.ports, "index")
         elif self.indexer is not None:
             if keys is None:
                 raise ValueError(
@@ -504,32 +564,49 @@ class Sparse(FullLogits):
             if reads(self.ports, "candidates"):
                 candidates = read(taps, self.ports, "candidates")
             export = writes(self.ports, "candidates")
-            keep_mask, candidates, scores = self.indexer(
-                x, query, pos, keys, mask, order, candidates, export
+            kept, candidates, scored = self.indexer(
+                x, query, pos, keys, span, order, candidates, export
             )
             write(taps, self.ports, "candidates", candidates)
         else:
             return None, None
-        write(taps, self.ports, "index", keep_mask)
-        return keep_mask, scores
+        write(taps, self.ports, "index", kept)
+        return kept, scored
 
     def _select_tokens(
         self,
         x: Float[Array, "b t d"],
         query: Float[Array, "b t e"],
-        docs: Segments | None,
+        rows: Segments,
+        span: sparse.Span,
         taps: Taps,
-    ) -> tuple[Bool[Array, "b t t"] | None, Scores | None]:
+    ) -> tuple[sparse.Kept | None, Scored | None]:
         """Return `_select` for keys that are the tokens, the indexer's keys projected
         from them."""
         if self.indexer is None and not reads(self.ports, "index"):
             return None, None
-        b, t, _ = x.shape
-        pos = None if docs is None else docs.positions
-        keys = None if self.indexer is None else self.indexer.keys(x, pos)
-        mask = jnp.broadcast_to(self._mask(docs, t), (b, t, t))
-        order = documents_or_rows(docs, b, t).within
-        return self._select(x, query, pos, keys, mask, order, taps)
+        keys = None if self.indexer is None else self.indexer.keys(x, rows.positions)
+        return self._select(x, query, rows.positions, keys, span, rows.within, taps)
+
+    def _attend_tokens(
+        self,
+        x: Float[Array, "b t d"],
+        query: Float[Array, "b t e"],
+        heads: tuple[
+            Float[Array, "b t h dk"], Float[Array, "b s g dk"], Float[Array, "b s g dv"]
+        ],
+        docs: Segments | None,
+        taps: Taps,
+    ) -> Float[Array, "b t h dv"]:
+        """Return `_attend_kept` over the tokens the queries keep of their window and
+        document."""
+        q, k, v = heads
+        rows = documents_or_rows(docs, *x.shape[:2])
+        span = sparse.token_span(rows, self.window)
+        kept, scored = self._select_tokens(x, query, rows, span, taps)
+        return self._attend_kept(
+            x, q, [sparse.Part(k, v, span, None, kept)], docs, scored, taps
+        )
 
 
 class FullLogitsAttention(FullLogits, Attention):
@@ -557,10 +634,8 @@ class SparseAttention(Sparse, Attention):
     def __call__(self, x: Float[Array, "b t d"], taps: Taps) -> Float[Array, "b t d"]:
         x = shard_layer_input(x)
         docs = segments(taps)
-        q, k, v = self._heads(x, docs, taps)
-        keep_mask, scores = self._select_tokens(x, x, docs, taps)
-        out = self._attend_kept(x, q, k, v, docs, keep_mask, scores, taps)
-        return self._output(x, out)
+        heads = self._heads(x, docs, taps)
+        return self._output(x, self._attend_tokens(x, x, heads, docs, taps))
 
 
 def pick[L: SoftmaxAttention](

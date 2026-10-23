@@ -11,14 +11,15 @@ import jax
 from flax import nnx
 from jaxtyping import Array, Float
 
+from bux.architecture.logits import HeadOutput
 from bux.architecture.registry import Loss, Stream, Taps
 
 
 class Changes(NamedTuple):
-    """What a call changed of the taps: every head's logits, once one ran; the
+    """What a call changed of the taps: every head's output, once one ran; the
     single-pass read, once a branch set it; and the stacks it pushed to or popped."""
 
-    logits: list[Float[Array, "b t vocab"]] | None
+    heads: list[HeadOutput] | None
     pending_read: Float[Array, "b t n"] | None
     stacks: dict[str, list]
 
@@ -62,7 +63,7 @@ def _copy(taps: Taps, carry: Changes) -> Taps:
     local = Taps(
         stacks, tokens=taps.tokens, segments=taps.segments, training=taps.training
     )
-    local.logits = list(taps.logits if carry.logits is None else carry.logits)
+    local.heads = list(taps.heads if carry.heads is None else carry.heads)
     local.pending_read = (
         taps.pending_read if carry.pending_read is None else carry.pending_read
     )
@@ -72,10 +73,10 @@ def _copy(taps: Taps, carry: Changes) -> Taps:
 
 def _changes(taps: Taps, local: Taps, carry: Changes) -> Changes:
     """Return what a call on `local`, a copy of `taps`, changed, and what it carried."""
-    logits = carry.logits is not None or not same(taps.logits, local.logits)
+    heads = carry.heads is not None or not same(taps.heads, local.heads)
     read = carry.pending_read is not None or local.pending_read is not taps.pending_read
     return Changes(
-        local.logits if logits else None,
+        local.heads if heads else None,
         local.pending_read if read else None,
         {
             k: v
@@ -100,8 +101,8 @@ def apply(
     """Write what pure calls of `call` changed back into `taps`: the ``Changes``, the
     nextn count, and the losses each call reported, call by call."""
     taps.update(changes.stacks)
-    if changes.logits is not None:
-        taps.logits = changes.logits
+    if changes.heads is not None:
+        taps.heads = changes.heads
     if changes.pending_read is not None:
         taps.pending_read = changes.pending_read
     taps.nextn_runs = call.nextn_runs
