@@ -444,7 +444,9 @@ with the same program, loads its step instead of compiling it (0.5 s instead of 
 for the MoE above on 8 B300s), and one that differs in a flag still finds the
 autotuner's picks (17 s). `JAX_COMPILATION_CACHE_DIR` says where instead, and set
 empty turns the cache off. They also put bux's XLA flags (`bux/runtime.py`) before
-`XLA_FLAGS`, a flag that it sets already keeping its value.
+`XLA_FLAGS`, a flag that it sets already keeping its value. In a job of many hosts
+only the first writes the cache, so put it on a filesystem they all mount: bux turns
+off one that is each host's own ([Many nodes](parallelism.md#the-compile-cache)).
 
 `--index N` trains only the run at N, from 0, in the order `bux plan` lists them, so an
 array job trains a sweep a run a task: `--index $SLURM_ARRAY_TASK_ID` on Slurm, or
