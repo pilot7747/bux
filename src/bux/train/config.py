@@ -372,9 +372,8 @@ class PrecisionConfig(Config):
     last: Branches = 0
     passes: tuple[Pass, ...] = PASSES  # the GEMMs that multiply in the format
     switch: SwitchConfig | None = None
-    eval: Literal["train", "compute"] = (
-        "train"  # evaluation multiplies as training does
-    )
+    # Evaluation multiplies as training does, or in compute.
+    eval: Literal["train", "compute"] = "train"
     moments: Literal["float32", "bfloat16"] = "float32"  # the optimizer's state
 
 
