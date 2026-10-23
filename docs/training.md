@@ -217,6 +217,26 @@ precision.last = 4 | 8
 | `deepseek_v3_fp8` | `mxfp8_2d`, moments in bfloat16 | groups of 128 with float32 scales, the float32 promotion, FP8 routed experts and activations |
 | `torchtitan_mxfp8` | `mxfp8_2d` | MXFP8 routed experts, and saving a linear's input in bfloat16 |
 
+On one B300 each, the 1.3B Llama-style model trained 3000 steps of 8 x 4096 tokens of
+FineWeb-Edu (98M tokens), GEMM autotuning off. Its held-out loss at the end, in
+bfloat16 (`eval=compute`), is this much above bfloat16's of the same seed, where two
+seeds differ by 1.6%:
+
+| precision | seed 0 | seed 1 | tok/s |
+|-----------|--------|--------|-------|
+| `mxfp8` | +0.12% | -0.02% | 126k |
+| `deepseek_v3_fp8` | +0.15% | -0.03% | 127k |
+| `moments=bfloat16` | +0.07% | -0.01% | 116k |
+| `mxfp8, first=2, last=2` | +0.09% | | 127k |
+| `nvfp4` | +0.61% | | 39k |
+| `nvidia_nvfp4` | +0.38% | +0.33% | 49k |
+| `nvidia_nvfp4` and its switch at 0.82 | +0.31% | +0.26% | 49k |
+| `nvidia_nvfp4`, `last=4` | +0.46% | | 44k |
+| `nvfp4, last=0.15`, `q`, `kv` and `o` in compute | +0.34% | | 56k |
+
+NVIDIA measured 1.5% at the end of 10T tokens on a 12B, against FP8, and 0.5% with
+the switch.
+
 ## Data
 
 A batch is rows of `seq_len` tokens, each three arrays: `input_ids`, `position_ids`
@@ -475,7 +495,9 @@ Which projections multiply in `mxfp8`, on one B300 ([Precision](#precision)):
 | `nvfp4, first=2, last=8`              | 55k   | 69.8 GiB    |
 
 k and v in bfloat16 are slower, not faster: q still quantizes x, the copy all three
-shared, and k's and v's GEMMs then run at bfloat16's rate, x kept for them too.
+shared, and k's and v's GEMMs then run at bfloat16's rate, x kept for them too. Over 8
+GPUs, `mesh(fsdp=8)`, `mxfp8` and `mxfp8_2d` both train at 1.34M (bfloat16: 1.14M),
+and scanned, `first=2, last=2` at 1.20M, where `mxfp8` alone gives 1.22M.
 
 ## Launching
 
