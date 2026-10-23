@@ -23,7 +23,7 @@ from bux import parallel
 from bux.architecture.norm import Norm
 from bux.architecture.rope import rotate
 from bux.architecture.sharding import projection, shard_heads
-from bux.architecture.sparse import Kept, Span, by_rows, chunked, chunks, hits, mask
+from bux.architecture.sparse import Kept, Span, by_rows, chunked, chunks, mask
 
 # DeepSeek-V3.2's indexer keys, projected from the layer's input, are layer-normalized.
 _STREAM_KEY_NORM = cfg.NormalizationConfig(type="layernorm", bias=True)
@@ -195,13 +195,39 @@ class Indexer(nnx.Module):
         keys: Float[Array, "b s i"],
     ) -> Float[Array, "b t s"]:
         """Return every query's score for every key."""
-        b, t, _ = x.shape
         x, query = jax.lax.stop_gradient((x, query))
+        dots = jnp.einsum("bthi,bsi->bths", self._queries(query, pos), keys)
+        return self._weigh(x, dots)
+
+    def _scores_at(
+        self,
+        x: Float[Array, "b t d"],
+        query: Float[Array, "b t e"],
+        pos: Int[Array, "b t"],
+        keys: Float[Array, "b s i"],
+        index: Int[Array, "b t k"],
+    ) -> Float[Array, "b t k"]:
+        """Return each query's scores for the keys at its `index`, its kept ones."""
+        x, query = jax.lax.stop_gradient((x, query))
+        picked = jax.vmap(lambda k, i: k[i])(keys, jnp.maximum(index, 0))
+        dots = jnp.einsum("bthi,btki->bthk", self._queries(query, pos), picked)
+        return self._weigh(x, dots)
+
+    def _queries(
+        self, query: Float[Array, "b t e"], pos: Int[Array, "b t"] | None
+    ) -> Float[Array, "b t h i"]:
+        """Project, normalize and rotate the query heads."""
+        b, t, _ = query.shape
         q = self.q(query).reshape(b, t, self.heads, self.head_dim)
         if self.q_norm is not None:
             q = self.q_norm(q)
-        q = shard_heads(self._rotate(q, pos))
-        dots = jax.nn.relu(jnp.einsum("bthi,bsi->bths", q, keys)) * self.head_dim**-0.5
+        return shard_heads(self._rotate(q, pos))
+
+    def _weigh(
+        self, x: Float[Array, "b t d"], dots: Float[Array, "b t h s"]
+    ) -> Float[Array, "b t s"]:
+        """Return the heads' ReLU'd dot products summed, by the weights if learned."""
+        dots = jax.nn.relu(dots) * self.head_dim**-0.5
         if self.weights is None:
             return dots.sum(2)
         w = self.weights(x) * self.heads**-0.5
@@ -254,19 +280,20 @@ class Indexer(nnx.Module):
         heads and normalized over the kept keys, which `target` gives for a chunk of
         `xs` (arrays of (b, t, ...)), `width` elements a query. A block's p is its most
         attended key's (Qwen3.8 QSA, eqs. 17 and 20). It scores each chunk of
-        queries again, and so does its backward pass."""
-        n = scored.keys.shape[1]
+        queries' kept keys again, and so does its backward pass."""
 
         def kl(both: tuple) -> Float[Array, "b c"]:
             (x, query, pos, kept), xs = both
             p = jax.lax.stop_gradient(target(xs).astype(jnp.float32))
             if scored.block is not None:
                 p = _per_block(p, scored.block, "max")
-            scores = self.scores(x, query, pos, scored.keys).astype(jnp.float32)
-            return _kl(p, scores, hits(kept, n))
+            p = jnp.take_along_axis(p, jnp.maximum(kept, 0), axis=-1)
+            scores = self._scores_at(x, query, pos, scored.keys, kept)
+            return _kl(p, scores.astype(jnp.float32), kept >= 0)
 
         own = (scored.x, scored.query, scored.pos, scored.kept)
-        count = chunks(scored.x.shape[1], max(self.heads * n, width))
+        k = scored.kept.shape[-1] * max(self.heads, self.head_dim)
+        count = chunks(scored.x.shape[1], max(k, width))
         return chunked(jax.checkpoint(kl), (own, xs), count).mean()
 
     def _blocks(
