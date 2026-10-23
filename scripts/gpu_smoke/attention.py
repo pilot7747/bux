@@ -1,5 +1,5 @@
 """WP8 on GPUs: every method of `methods.attention` against `xla` on one GPU, on packed
-documents (a dozen a row, and more than cuDNN's packed layout takes), a window, a
+documents (a dozen a row, more than cuDNN's packed layout takes, and one), a window, a
 soft cap, sinks and GQA, forward and gradients: on whole rows on one GPU, then with
 the positions split over `context`; and the time of a forward and backward of each.
 
@@ -44,9 +44,10 @@ def documents(seed: int, n: int) -> Int[Array, "b t"]:
     return jnp.asarray(np.cumsum(starts, 1), jnp.int32)
 
 
-IDS, MANY = documents(0, 12), documents(1, 60)
+IDS, MANY, ONE = documents(0, 12), documents(1, 60), documents(2, 0)
 CASES = {
     "documents": AttentionArgs(IDS, None, D**-0.5, None, None),
+    "one_doc": AttentionArgs(ONE, None, D**-0.5, None, jnp.linspace(-1, 1, H)),
     "many_docs": AttentionArgs(MANY, None, D**-0.5, None, None),
     "window": AttentionArgs(IDS, 1000, D**-0.5, None, None),
     "causal": AttentionArgs(None, None, D**-0.5, None, None),

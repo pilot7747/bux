@@ -24,6 +24,9 @@ from bux.parallel.mesh import active
 
 AXIS = "context"
 MIN = float(jnp.finfo(jnp.float32).min)  # the logit of a masked key
+# Below, a 1.3B on a B300 trains as fast by tokamax as by cuDNN, causal, and faster
+# with packed documents, where cuDNN's fallback past its bound (a lax.cond) costs 5%.
+CUDNN_ROWS = 8192
 Body = Callable[..., Float[Array, "b t h dv"]]  # (q, k, v, rows, sinks) -> out
 
 
@@ -229,12 +232,14 @@ def whole_rows(
     args: AttentionArgs,
 ) -> Float[Array, "b t h dv"]:
     """Attend with whole rows, on one device, by the fastest kernel that takes the
-    call: cuDNN's, else tokamax's (a soft cap, sinks, float32), else `xla`."""
-    if flash.cudnn_takes(q, k, v, args.softcap, args.sinks):
+    call: cuDNN's in rows of `CUDNN_ROWS` or more and with a window, else tokamax's
+    (a soft cap, sinks, float32), else cuDNN's, else `xla`."""
+    cudnn = flash.cudnn_takes(q, k, v, args.softcap, args.sinks)
+    if cudnn and (q.shape[1] >= CUDNN_ROWS or args.window is not None):
         return _cudnn(q, k, v, args)
     if flash.tokamax_runs():
         return _flash(flash.TOKAMAX, q, k, v, args)
-    return xla(q, k, v, args)
+    return _cudnn(q, k, v, args) if cudnn else xla(q, k, v, args)
 
 
 def _flash(
@@ -257,7 +262,7 @@ def _cudnn(
     args: AttentionArgs,
 ) -> Float[Array, "b t h dv"]:
     """Attend by cuDNN, or by tokamax (else xla) for a row of more documents than
-    cuDNN's packed layout holds."""
+    cuDNN's packed layout has room for."""
     cudnn = partial(flash.cudnn, ids=args.ids, window=args.window, scale=args.scale)
     if args.ids is None:
         return cudnn(q, k, v, documents=1)
@@ -265,20 +270,20 @@ def _cudnn(
         other = partial(_flash, flash.TOKAMAX, args=args)
     else:
         other = partial(xla, args=args)
-    if not (most := documents_bound(q, v)):
+    if not (most := documents_bound(*q.shape[:3], max(q.shape[-1], v.shape[-1]))):
         return other(q, k, v)
     fits = flash.documents_in(args.ids) <= most
     return jax.lax.cond(fits, partial(cudnn, documents=most), other, q, k, v)
 
 
-def documents_bound(q: Float[Array, "b t h dk"], v: Float[Array, "b t g dv"]) -> int:
-    """Return the most documents a row that cuDNN's packed layout takes: its backward
-    pass takes time in proportion to them and the row, and 8 bytes of memory for each
-    of b documents' t positions of every head's channels. So up to t / 256, as
-    tokamax's backward takes t^2 / 2, and 2^30 such numbers (8 GiB)."""
-    b, t, h, dk = q.shape
-    most = min(t // 256, 2**30 // (b * t * h * max(dk, v.shape[-1])))
-    return max(1, 2 ** (most.bit_length() - 1)) if most > 0 else 0
+def documents_bound(b: int, t: int, h: int, d: int) -> int:
+    """Return the most documents a row that cuDNN's packed layout makes room for, in
+    b rows of t positions of h heads of d channels: its backward pass takes time in
+    proportion to the room and the row, and 8 bytes of memory for each of the room's
+    positions of every head's channels. So up to t / 256, as tokamax's backward pass
+    takes t^2 / 2, and 2^30 such numbers (8 GiB)."""
+    most = min(t // 256, 2**30 // (b * t * h * d))
+    return 2 ** (most.bit_length() - 1) if most > 0 else 0
 
 
 # --- ulysses ----------------------------------------------------------------------
@@ -293,8 +298,8 @@ def ulysses(
 ) -> Float[Array, "b t h dv"]:
     """All-to-all over `context` from a device's positions of every head to every
     position of its own heads, attend with those whole rows by the fastest kernel that
-    takes the call (`whole_rows`), and all-to-all back. Context must divide a device's
-    heads; kv heads it does not divide are repeated."""
+    takes the call (`whole_rows`), and all-to-all back. Context must divide a
+    device's heads; kv heads it does not divide are repeated."""
     if active() is None:
         return whole_rows(q, k, v, args)
     body = partial(_ulysses, args=args._replace(ids=None, sinks=None))
@@ -449,10 +454,11 @@ def auto(
     args: AttentionArgs,
 ) -> Float[Array, "b t h dv"]:
     """The default. On a GPU, the fastest kernel that takes the call on each device's
-    whole rows (`whole_rows`): cuDNN's (on a B300 1.3x tokamax's speed causal at
-    t = 32k, 4x with packed documents), else tokamax's. With `seq` over `context`,
-    `ring` for documents, else `ulysses` where context divides a device's heads.
-    `xla` where neither kernel runs, and for what only xla has."""
+    whole rows (`whole_rows`): cuDNN's in long rows or with a window (on a B300 1.3x
+    tokamax's speed causal at t = 32k, 4x with packed documents), else tokamax's,
+    which takes sinks, a soft cap and float32. With `seq` over `context`, `ulysses`
+    where context divides a device's heads, else `ring`. `xla` where neither kernel
+    runs, and for what only xla has."""
     if not (flash.tokamax_runs() or flash.cudnn_runs()):
         return xla(q, k, v, args)
     if splits_positions(q):
@@ -467,13 +473,13 @@ def _context_parallel(
     v: Float[Array, "b s g dv"],
     args: AttentionArgs,
 ) -> Float[Array, "b t h dv"]:
-    """`ring` for documents, whose blocks no query sees it skips (on 8 B300s, 2k
-    documents in rows of 128k: 3.4x ulysses' speed, as cuDNN's packed layout takes
-    too few of them); else `ulysses`, whose kernel sees whole rows (one causal
-    document a row: 1.5x ring's), where context divides a device's heads."""
+    """`ulysses`, whose kernel sees whole rows, where context divides a device's
+    heads; else `ring`. On 8 B300s, rows of 32k over context=8, a 218M model trains
+    at 273k tok/s on packed documents by ulysses and 221k by ring, at 252k and 175k
+    on rows of one document."""
     on = active()
     assert on is not None
     heads = q.shape[2] // on.size(*_axes(spec(("heads",), q.shape[2:3])[0]))
-    if args.ids is None and heads % on.size(AXIS) == 0:
+    if heads % on.size(AXIS) == 0:
         return ulysses(q, k, v, args)
     return methods.attention.find("ring")(q, k, v, args)

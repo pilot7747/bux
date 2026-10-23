@@ -83,6 +83,7 @@ CASES = {
     "mqa_softcap_window": Case(8, 1, window=6, softcap=2.0),
     "gqa_sinks": Case(4, 2, IDS, window=5, sinks=True),
     "gqa_causal_sinks_softcap": Case(4, 2, softcap=3.0, sinks=True),
+    "gqa_one_document": Case(4, 2, documents(np.tile(np.arange(T), (B, 1)))),
 }
 
 
