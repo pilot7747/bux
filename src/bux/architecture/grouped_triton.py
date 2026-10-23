@@ -9,7 +9,7 @@ columns, a row tile's column tiles one after another, so that its rows stay in L
 tile of each group's output.
 """
 
-from typing import Any, NamedTuple
+from typing import NamedTuple
 
 import jax
 import jax.numpy as jnp
@@ -62,12 +62,15 @@ def rows(
     of tiles.m rows) of group g, of b's (n, k) matrices stacked by rows, (g n, k), or
     by columns, (n, g k); the rows in no tile as they were."""
     m, k = a.values.shape
-    if stacked == "rows":
-        n, group, row = b.values.shape[0] // groups, b.values.shape[0] // groups * k, k
-    else:
-        n, group, row = b.values.shape[0], k, groups * k
+    if stacked == "rows":  # group g's matrix n rows below group g - 1's
+        n, below, right = b.values.shape[0] // groups, b.values.shape[0] // groups, 0
+    else:  # k columns to the right
+        n, below, right = b.values.shape[0], 0, k
     return jax_triton.triton_call(
-        *map(_bytes, (a.values, a.scales, b.values, b.scales)),
+        _described(a.values, tiles.m, tiles.k),
+        _bytes(a.scales),
+        _described(b.values, tiles.n, tiles.k),
+        _bytes(b.scales),
         at,
         kernel=_rows,
         out_type=jax.ShapeDtypeStruct((m, n), out),
@@ -78,8 +81,9 @@ def rows(
         m=m,
         k=k,
         n=n,
-        group=group,
-        row=row,
+        scales_row=b.scales.shape[1],
+        below=below,
+        right=right,
         tile_m=tiles.m,
         tile_n=tiles.n,
         tile_k=tiles.k,
@@ -98,8 +102,14 @@ def contract(
     (d, m), f, g = a.values.shape, b.values.shape[0], sizes.shape[0]
     ends = jnp.cumsum(sizes)
     bounds = jnp.stack([ends - sizes, ends], -1).astype(jnp.int32)
+    values = (_bytes(a.values), _bytes(b.values))
     return jax_triton.triton_call(
-        *map(_bytes, (a.values, a.scales, b.values, b.scales)),
+        _described(values[0], tiles.m, tiles.k),
+        values[0],
+        _bytes(a.scales),
+        _described(values[1], tiles.n, tiles.k),
+        values[1],
+        _bytes(b.scales),
         bounds,
         kernel=_contract,
         out_type=jax.ShapeDtypeStruct((g, d, f), out),
@@ -114,6 +124,14 @@ def contract(
         tile_n=tiles.n,
         tile_k=tiles.k,
     )
+
+
+def _described(
+    values: Shaped[Array, "r c"], rows: int, columns: int
+) -> jax_triton.TensorDescriptor:
+    """Return a TMA descriptor of `values`' bytes, a (rows, columns) tile a load, and
+    0 past its edges: Triton pipelines its loads, where it does not plain ones."""
+    return jax_triton.TensorDescriptor.from_array(_bytes(values), (rows, columns))
 
 
 QUANTIZE = Tiles(m=64, n=128, k=0, warps=4, stages=1)  # the most of each
@@ -168,7 +186,7 @@ def _bytes(x: Shaped[Array, "*s"]) -> UInt8[Array, "*s"]:
 
 
 @triton.jit
-def _in_e4m3(blocks: Any) -> tuple[Any, Any]:
+def _in_e4m3(blocks: tl.tensor) -> tuple[tl.tensor, tl.tensor]:
     """Return blocks (a, b, 32) of float32 in E4M3, each times the least power of two
     that takes its largest value to at most 448, and those powers' biased exponents
     (E8M0's bits), as ``blockscaled._mx_tile`` computes them."""
@@ -183,12 +201,12 @@ def _in_e4m3(blocks: Any) -> tuple[Any, Any]:
 
 @triton.jit
 def _quantize(
-    x: Any,
-    rows: Any,
-    values: Any,
-    scales: Any,
-    t_values: Any,
-    t_scales: Any,
+    x: tl.tensor,
+    rows: tl.tensor,
+    values: tl.tensor,
+    scales: tl.tensor,
+    t_values: tl.tensor,
+    t_scales: tl.tensor,
     r: tl.constexpr,
     c: tl.constexpr,
     tile_r: tl.constexpr,
@@ -211,47 +229,51 @@ def _quantize(
     tl.store(t_scales + cs[:, None] * (r // 32) + blocks_r[None, :], e)
 
 
-# Triton's pointers, which index and load as arrays do not, and its constants.
+# Triton's kernels: what they take is a tl.tensor, a pointer or a TMA descriptor, or
+# a constant; and they may name no global but Triton's.
 @triton.jit
 def _rows(
-    a: Any,
-    a_scales: Any,
-    b: Any,
-    b_scales: Any,
-    at: Any,
-    out: Any,
+    a: tl.tensor,
+    a_scales: tl.tensor,
+    b: tl.tensor,
+    b_scales: tl.tensor,
+    at: tl.tensor,
+    out: tl.tensor,
     m: tl.constexpr,
     k: tl.constexpr,
     n: tl.constexpr,
-    group: tl.constexpr,
-    row: tl.constexpr,
+    scales_row: tl.constexpr,
+    below: tl.constexpr,
+    right: tl.constexpr,
     tile_m: tl.constexpr,
     tile_n: tl.constexpr,
     tile_k: tl.constexpr,
 ) -> None:
     """out[r] = a[r] b[g]^T for the rows r in [lo, hi) of tile `at`, of group g, and
-    tile_n of the columns: a (m, k), b[g] (n, k) at b + g group, a row every `row`;
-    a scale per 32 along k, at a 32nd of the same offsets."""
+    tile_n of the columns. a (m, k) and b by TMA, b[g] (n, k) `below` rows and `right`
+    columns of b on from b[g - 1]; a scale per 32 along k, scales_row a row of b's.
+    What a tile reads past b[g]'s k multiplies a's 0, and past its n is not kept."""
     column, tile = tl.program_id(0), tl.program_id(1)
-    g = tl.load(at + 3 * tile).to(tl.int64)
+    g = tl.load(at + 3 * tile)
     lo = tl.load(at + 3 * tile + 1)
     hi = tl.load(at + 3 * tile + 2)
     if lo >= hi:
         return
-    rs = (lo // tile_m * tile_m + tl.arange(0, tile_m)).to(tl.int64)
+    first = lo // tile_m * tile_m
+    rs = (first + tl.arange(0, tile_m)).to(tl.int64)
     cs = (column * tile_n + tl.arange(0, tile_n)).to(tl.int64)
-    across, blocks = tl.arange(0, tile_k), tl.arange(0, tile_k // 32)
+    b_row, b_column = g * below + column * tile_n, g * right
+    blocks = tl.arange(0, tile_k // 32)
     r_in, c_in = (rs < m)[:, None], (cs < n)[:, None]
-    a_rows, a_scale_rows = a + rs[:, None] * k, a_scales + rs[:, None] * (k // 32)
-    b_rows = b + g * group + cs[:, None] * row
-    b_scale_rows = b_scales + g * (group // 32) + cs[:, None] * (row // 32)
+    a_scale_rows = a_scales + rs[:, None] * (k // 32)
+    b_scale_rows = b_scales + (g * below + cs[:, None]) * scales_row + g * right // 32
     acc = tl.zeros((tile_m, tile_n), tl.float32)
     for start in range(0, k, tile_k):
-        ks, ss = start + across, start // 32 + blocks
-        k_in, s_in = (ks < k)[None, :], (ss < k // 32)[None, :]
-        x = tl.load(a_rows + ks[None, :], mask=r_in & k_in, other=0)
+        ss = start // 32 + blocks
+        s_in = (ss < k // 32)[None, :]
+        x = a.load([first, start])
+        w = b.load([b_row, b_column + start])
         x_scales = tl.load(a_scale_rows + ss[None, :], mask=r_in & s_in, other=0)
-        w = tl.load(b_rows + ks[None, :], mask=c_in & k_in, other=0)
         w_scales = tl.load(b_scale_rows + ss[None, :], mask=c_in & s_in, other=0)
         acc = tl.dot_scaled(x, x_scales, "e4m3", w.T, w_scales, "e4m3", acc=acc)
     mine = ((rs >= lo) & (rs < hi))[:, None] & (cs < n)[None, :]
@@ -261,12 +283,14 @@ def _rows(
 
 @triton.jit
 def _contract(
-    a: Any,
-    a_scales: Any,
-    b: Any,
-    b_scales: Any,
-    bounds: Any,
-    out: Any,
+    a: tl.tensor,
+    a_values: tl.tensor,
+    a_scales: tl.tensor,
+    b: tl.tensor,
+    b_values: tl.tensor,
+    b_scales: tl.tensor,
+    bounds: tl.tensor,
+    out: tl.tensor,
     m: tl.constexpr,
     d: tl.constexpr,
     f: tl.constexpr,
@@ -275,30 +299,96 @@ def _contract(
     tile_k: tl.constexpr,
 ) -> None:
     """out[g] = a[:, lo:hi] b[:, lo:hi]^T for group g's rows [lo, hi), a tile of it:
-    a (d, m) and b (f, m), a scale per 32 along m; the rows of a block outside the
-    group count as 0."""
+    a (d, m) and b (f, m), a scale per 32 along m; the tiles of m wholly inside the
+    group by TMA, and the one it starts in and the one it ends in by plain loads that
+    take the rows outside it as 0."""
     i, j, g = tl.program_id(0), tl.program_id(1), tl.program_id(2)
     lo = tl.load(bounds + 2 * g)
     hi = tl.load(bounds + 2 * g + 1)
     ds = (i * tile_m + tl.arange(0, tile_m)).to(tl.int64)
     fs = (j * tile_n + tl.arange(0, tile_n)).to(tl.int64)
-    across, blocks = tl.arange(0, tile_k), tl.arange(0, tile_k // 32)
     d_in, f_in = (ds < d)[:, None], (fs < f)[:, None]
     acc = tl.zeros((tile_m, tile_n), tl.float32)
-    for start in range(lo // tile_k * tile_k, hi, tile_k):
-        ks, ss = start + across, start // 32 + blocks
-        k_in, s_in = ((ks >= lo) & (ks < hi))[None, :], (ss < m // 32)[None, :]
-        x = tl.load(a + ds[:, None] * m + ks[None, :], mask=d_in & k_in, other=0)
-        x_scales = tl.load(
-            a_scales + ds[:, None] * (m // 32) + ss[None, :], mask=d_in & s_in, other=0
+    whole_lo = (lo + tile_k - 1) // tile_k * tile_k
+    whole_hi = tl.maximum(hi // tile_k * tile_k, whole_lo)
+    if lo < whole_lo:
+        acc = _contract_part(
+            acc,
+            a_values,
+            a_scales,
+            b_values,
+            b_scales,
+            ds,
+            fs,
+            lo // tile_k * tile_k,
+            lo,
+            hi,
+            m,
+            d,
+            f,
+            tile_k,
         )
-        y = tl.load(b + fs[:, None] * m + ks[None, :], mask=f_in & k_in, other=0)
-        y_scales = tl.load(
-            b_scales + fs[:, None] * (m // 32) + ss[None, :], mask=f_in & s_in, other=0
-        )
+    for start in range(whole_lo, whole_hi, tile_k):
+        ss = start // 32 + tl.arange(0, tile_k // 32)
+        x = a.load([i * tile_m, start])
+        y = b.load([j * tile_n, start])
+        x_at, y_at = ds[:, None] * (m // 32), fs[:, None] * (m // 32)
+        x_scales = tl.load(a_scales + x_at + ss[None, :], mask=d_in, other=0)
+        y_scales = tl.load(b_scales + y_at + ss[None, :], mask=f_in, other=0)
         acc = tl.dot_scaled(x, x_scales, "e4m3", y.T, y_scales, "e4m3", acc=acc)
+    if whole_hi < hi:
+        acc = _contract_part(
+            acc,
+            a_values,
+            a_scales,
+            b_values,
+            b_scales,
+            ds,
+            fs,
+            whole_hi,
+            lo,
+            hi,
+            m,
+            d,
+            f,
+            tile_k,
+        )
     at = out + g.to(tl.int64) * d * f + ds[:, None] * f + fs[None, :]
     tl.store(at, acc.to(out.dtype.element_ty), mask=d_in & (fs < f)[None, :])
+
+
+@triton.jit
+def _contract_part(
+    acc: tl.tensor,
+    a: tl.tensor,
+    a_scales: tl.tensor,
+    b: tl.tensor,
+    b_scales: tl.tensor,
+    ds: tl.tensor,
+    fs: tl.tensor,
+    start: tl.tensor,
+    lo: tl.tensor,
+    hi: tl.tensor,
+    m: tl.constexpr,
+    d: tl.constexpr,
+    f: tl.constexpr,
+    tile_k: tl.constexpr,
+) -> tl.tensor:
+    """Return acc plus the tile of m from `start` of a b^T, its rows outside
+    [lo, hi) as 0: a tile that a group shares with another."""
+    ks = start + tl.arange(0, tile_k)
+    ss = start // 32 + tl.arange(0, tile_k // 32)
+    d_in, f_in = (ds < d)[:, None], (fs < f)[:, None]
+    k_in, s_in = ((ks >= lo) & (ks < hi))[None, :], (ss < m // 32)[None, :]
+    x = tl.load(a + ds[:, None] * m + ks[None, :], mask=d_in & k_in, other=0)
+    x_scales = tl.load(
+        a_scales + ds[:, None] * (m // 32) + ss[None, :], mask=d_in & s_in, other=0
+    )
+    y = tl.load(b + fs[:, None] * m + ks[None, :], mask=f_in & k_in, other=0)
+    y_scales = tl.load(
+        b_scales + fs[:, None] * (m // 32) + ss[None, :], mask=f_in & s_in, other=0
+    )
+    return tl.dot_scaled(x, x_scales, "e4m3", y.T, y_scales, "e4m3", acc=acc)
 
 
 assert MX_BLOCK == 32  # the kernels' scales, a 32nd of their values' offsets
