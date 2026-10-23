@@ -42,6 +42,8 @@ Entry = str | tuple[str, ...] | None  # one dimension of a PartitionSpec
 
 @runtime_checkable
 class Method(Protocol):
+    """What a method of `methods.tensor` is: a class of these two functions."""
+
     @staticmethod
     def project_in(
         x: Float[Array, "b t d"], linears: Sequence[nnx.Linear]
