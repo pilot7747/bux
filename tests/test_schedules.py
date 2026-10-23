@@ -9,11 +9,11 @@ import jax.numpy as jnp
 import numpy as np
 import pytest
 from flax import nnx
-from jaxtyping import Float
+from jaxtyping import Float, Shaped
 
 from bux import parallel
 from bux.__main__ import main
-from bux.architecture import Model, MoE, Scanned, pipelined
+from bux.architecture import Model, MoE, Scanned, matmuls, pipelined
 from bux.lang import compile, compile_runs
 from bux.parallel import pipeline, schedule, split
 from bux.parallel.scheduled import _rebuilt
@@ -166,7 +166,9 @@ def test_a_split_backward_takes_the_whole_ones_gradients_and_each_matmul_once(
         x, dy = (jax.random.normal(jax.random.key(i), (2, 16, 64)) for i in range(2))
         rows = pipelined.Rows(None, jnp.zeros((2, 16), jnp.int32))
 
-        def forward(p: nnx.State, x: jax.Array) -> jax.Array:
+        def forward(
+            p: nnx.State, x: Float[jax.Array, "n t d"]
+        ) -> Float[jax.Array, "n t d"]:
             if runs is None:
                 return stage(p, rest, x, rows)[0]
             taps = pipelined._stage_taps(rows, True)
@@ -179,7 +181,7 @@ def test_a_split_backward_takes_the_whole_ones_gradients_and_each_matmul_once(
         flat, tree = jax.tree.leaves(params), jax.tree.structure(params)
         residuals = jax.tree.leaves(vjp)
 
-        def backward(*args: jax.Array) -> list[jax.Array]:
+        def backward(*args: Shaped[jax.Array, "..."]) -> list[Shaped[jax.Array, "..."]]:
             p, (*r, d) = args[: len(flat)], args[len(flat) :]
             d_params, dx = _rebuilt(vjp, r, jax.tree.unflatten(tree, p))(d)
             return [*jax.tree.leaves(d_params), dx]
@@ -249,6 +251,84 @@ def test_a_rematerialized_scheduled_pipeline_trains_as_one_device(losses, name, 
     piped = losses(LLAMA, mesh="mesh(stage=2, data=1)", methods=how, batch="16")
     one = losses(LLAMA, mesh=ONE, methods=SCAN, batch="16")
     assert np.allclose(piped, one, atol=1e-5)
+
+
+@pytest.mark.parametrize("name", PIPELINES)
+@pytest.mark.parametrize("stages", ["", "[3, 5]"])
+def test_remat_of_the_first_passes_counts_them_from_each_stage_s_first(
+    losses, name, stages
+):
+    remat = "remat(save=[attention], first=1)"
+    how = _how(name, 4, remat=remat, **({"stages": stages} if stages else {}))
+    piped = losses(LLAMA, mesh="mesh(stage=2, data=1)", methods=how, batch="16")
+    one = losses(LLAMA, mesh=ONE, methods=SCAN, batch="16")
+    assert np.allclose(piped, one, atol=1e-5)
+
+
+# The first block outside the pipelined repeat, its 2 branches mxfp8's first.
+OUTSIDE = PRELUDE + "model = embed block block^8 norm head"
+FIRST = "precision(compute=float32, matmuls=mxfp8, first=2)"
+
+
+def _formats(name: str, monkeypatch) -> dict[int | None, set[str]]:
+    """The formats a training step of OUTSIDE multiplies its projections in, by the
+    branch of the model they are in, as it traces: None for the uncounted."""
+    train = TRAIN.replace("precision(compute=float32)", FIRST)
+    mesh, how = "mesh(stage=2, data=1)", _how(name, 4)
+    [run] = compile_runs(f"{OUTSIDE}\n{train}\nmesh = {mesh}\nmethods = {how}")
+    t = run.train
+    seen: dict[int | None, set[str]] = {}
+    of = matmuls.format_of
+
+    def recorded(role: str | None) -> str:
+        fmt = of(role)
+        seen.setdefault(matmuls._BRANCH.get(), set()).add(fmt)
+        return fmt
+
+    monkeypatch.setattr(matmuls, "format_of", recorded)
+    with parallel.use(t.mesh, t.layout, t.methods):
+        model = parallel.build(lambda: Model(run.arch, rngs=nnx.Rngs(0)))
+        tx = optimizer(t.optimizer, lr_multiplier(t.schedule, t.steps), model, t.clip)
+        trainer = Trainer(
+            model, tx, objective(t.loss, run.arch), matmuls=t.precision, microbatches=1
+        )
+        batch = parallel.shard_batch(plain(TOKENS))
+        trainer._train.lower(trainer.model, trainer.optimizer, batch)
+    monkeypatch.setattr(matmuls, "format_of", of)
+    return seen
+
+
+@pytest.mark.parametrize("name", PIPELINES)
+def test_the_first_branches_before_a_scheduled_pipeline_multiply_as_under_gpipe(
+    name, monkeypatch
+):
+    """gpipe numbers the stages' branches, a schedule runs them uncounted: in neither
+    are they first, so both multiply them in mxfp8, and the first block's in compute."""
+    gpipe, scheduled = _formats("gpipe", monkeypatch), _formats(name, monkeypatch)
+    assert gpipe[0] == gpipe[1] == scheduled[0] == scheduled[1] == {"compute"}
+    inside = set().union(*(f for b, f in gpipe.items() if b is not None and b >= 2))
+    assert inside == scheduled[None] == {"mxfp8"}
+
+
+@pytest.mark.parametrize("name", PIPELINES)
+@pytest.mark.parametrize("loss", ["chunks", "logits"])
+def test_the_last_stage_takes_the_loss_by_either_method_as_one_device(
+    losses, name, loss
+):
+    """By chunks, whose custom_vjp makes the head's gradient as it scores, or whole."""
+    how = _how(name, 4, loss=loss)
+    piped = losses(LLAMA, mesh="mesh(stage=2, data=1)", methods=how, batch="16")
+    one = losses(
+        LLAMA, mesh=ONE, methods=f"methods(repeat=scan, loss={loss})", batch="16"
+    )
+    assert np.allclose(piped, one, atol=1e-5)
+
+
+@pytest.mark.parametrize("name", PIPELINES)
+def test_first_branches_inside_a_scheduled_pipeline_are_an_error(losses, name):
+    given = {"precision": "precision(compute=float32, matmuls=mxfp8, first=1)"}
+    with pytest.raises(ValueError, match="fall inside a pipelined repeat"):
+        losses(LLAMA, mesh="mesh(stage=2, data=1)", methods=_how(name, 2), **given)
 
 
 @pytest.mark.parametrize("name", PIPELINES)

@@ -1,4 +1,4 @@
-"""Expert parallelism on GPUs, `ragged_all_to_all` above all, which XLA:CPU lacks
+"""Expert parallelism on GPUs, the ragged methods above all, which XLA:CPU lacks
 (WP7 of plans/parallelism.md).
 
     uv run --extra cuda python scripts/gpu_smoke/experts.py [--steps 20]
@@ -30,7 +30,7 @@ from bux.train import config as tcfg
 from bux.train.sinks import Scalars, Sink
 from bux.train.trainer import train
 
-METHODS = ["sorted", "all_gather", "all_to_all", "ragged_all_to_all"]
+METHODS = ["sorted", "all_gather", "all_to_all", "ragged_all_to_all", "ragged_tokens"]
 ONE = {"data": 1}
 ARCH = """
 d_model = 512

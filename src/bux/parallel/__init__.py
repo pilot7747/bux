@@ -49,7 +49,16 @@ from bux.parallel.settings import check, use
 
 # isort: split
 # Imported last, so that the names above exist when their methods register themselves.
-from bux.parallel import context, experts, flash, pipeline, recurrence, ring, scheduled
+from bux.parallel import (
+    context,
+    experts,
+    flash,
+    pipeline,
+    recurrence,
+    ring,
+    scheduled,
+    tensor,
+)
 
 __all__ = [
     "AXES",
@@ -81,5 +90,6 @@ __all__ = [
     "sizes",
     "spec",
     "splits",
+    "tensor",
     "use",
 ]

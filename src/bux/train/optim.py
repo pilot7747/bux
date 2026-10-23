@@ -27,7 +27,7 @@ from flax import nnx
 from jax.sharding import AbstractMesh, Mesh, NamedSharding
 from jax.sharding import PartitionSpec as P
 from jax.typing import DTypeLike
-from jaxtyping import Array, ArrayLike, Float, PyTree, Real
+from jaxtyping import Array, ArrayLike, Float, PyTree, Real, Shaped
 from optax.contrib import MuonDimensionNumbers
 from optax.contrib._muon import orthogonalize_via_newton_schulz, scale_by_shape
 
@@ -114,13 +114,47 @@ def optimizer(
     multiplier: Schedule,
     model: nnx.Module,
     clip: float | None = None,
+    moments: DTypeLike = jnp.float32,
 ) -> optax.GradientTransformation:
     """Return the update rule of `config`, its learning rate scaled by `multiplier`,
-    after clipping gradients to the global norm `clip`."""
-    tx = optimizers.build(config, multiplier, model)
+    after clipping gradients to the global norm `clip`, its moments kept in
+    `moments`."""
+    tx = kept_in(optimizers.build(config, multiplier, model), moments)
     if clip is None:
         return tx
     return optax.chain(optax.clip_by_global_norm(clip), tx)
+
+
+def kept_in(
+    tx: optax.GradientTransformation, dtype: DTypeLike
+) -> optax.GradientTransformation:
+    """Return `tx` with its state's floating-point arrays, its moments, kept in
+    `dtype` between steps and updated in float32: DeepSeek-V3's AdamW in bfloat16.
+    Rounded to nearest, bfloat16 drops a change below 2^-9 of the moment, and a moment
+    of decay b changes by 1 - b of the difference: at b2 = 0.95 a square gradient 4%
+    off the second moment moves it, at 0.999 only one 3x off."""
+    if jnp.dtype(dtype) == jnp.float32:
+        return tx
+
+    def init(params: PyTree[Float[Array, "*_"]]) -> optax.OptState:
+        return _floats_in(tx.init(params), dtype)
+
+    def update(
+        updates: PyTree[Float[Array, "*_"]],
+        state: optax.OptState,
+        params: PyTree[Float[Array, "*_"]] | None = None,
+    ) -> tuple[PyTree[Float[Array, "*_"]], optax.OptState]:
+        updates, state = tx.update(updates, _floats_in(state, jnp.float32), params)
+        return updates, _floats_in(state, dtype)
+
+    return optax.GradientTransformation(init, update)
+
+
+def _floats_in(tree: PyTree, dtype: DTypeLike) -> PyTree:
+    def cast(x: Shaped[Array, "*s"]) -> Shaped[Array, "*s"]:
+        return x.astype(dtype) if jnp.issubdtype(x.dtype, jnp.floating) else x
+
+    return jax.tree.map(cast, tree)
 
 
 def _keys(path: tuple) -> tuple:

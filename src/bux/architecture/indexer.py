@@ -7,7 +7,8 @@ keys are counted from a document's first key, so none spans two documents.
 
 It ranks a chunk of queries at a time (``sparse.chunked``), so that no t by t floats
 are made, on a GPU by ``scoring``'s kernel; it keeps each query's top-k by index
-(``sparse.Kept``), and its loss scores the kept keys of each chunk again.
+(``sparse.Kept``), named `attention.index` for a remat policy to keep, and its loss
+scores the kept keys of each chunk again.
 """
 
 from collections.abc import Callable
@@ -20,7 +21,7 @@ from jaxtyping import Array, Bool, Float, Int, Shaped, UInt
 
 from bux import config as cfg
 from bux import parallel
-from bux.architecture import scoring
+from bux.architecture import remat, scoring
 from bux.architecture.norm import Norm
 from bux.architecture.rope import rotate
 from bux.architecture.sharding import projection, shard_heads
@@ -198,14 +199,20 @@ class Indexer(nnx.Module):
         self.candidate_top_k = config.candidate_top_k
         self.loss_weight = config.loss_weight
 
-        def linear(n_in: int, n_out: int, *names: parallel.Name) -> nnx.Linear:
+        def linear(
+            n_in: int, n_out: int, role: str, *names: parallel.Name
+        ) -> nnx.Linear:
             init = parallel.named(*names)
-            return projection(n_in, n_out, use_bias=False, kernel_init=init, rngs=rngs)
+            return projection(
+                n_in, n_out, role, use_bias=False, kernel_init=init, rngs=rngs
+            )
 
         # The randomly initialized layers; reordering them changes a seed's init.
-        self.q = linear(query_width, h * i, query, ("heads", h))
-        self.k = linear(key_width, i, None, None) if key_width else None
-        self.weights = linear(width, h, "embed", "heads") if config.weighted else None
+        self.q = linear(query_width, h * i, "q", query, ("heads", h))
+        self.k = linear(key_width, i, "kv", None, None) if key_width else None
+        self.weights = (
+            linear(width, h, "q", "embed", "heads") if config.weighted else None
+        )
 
         self.q_norm = Norm(config.norm, i) if config.norm else None
         pools = config.block_size > 1  # it normalizes the blocks of keys it is given
@@ -336,6 +343,7 @@ class Indexer(nnx.Module):
         index = None if candidates is None else candidates.index
         xs, t = (x, query, pos, span, index), x.shape[1]
         index, best = chunked(pick, xs, chunks(t, self._per_query(t, s)))
+        index = remat.label("attention.index", index)
         pool = None if best is None else Kept(best, pooled)
         return Kept(index), pool, Scored(x, query, pos, keys, index)
 
@@ -408,6 +416,7 @@ class Indexer(nnx.Module):
 
         xs, t = (x, query, pos, span), x.shape[1]
         picked, own = chunked(pick, xs, chunks(t, self._per_query(t, s)))
+        picked, own = remat.label("attention.index", (picked, own))
         kept = Kept(jnp.concatenate([picked, own[..., None]], -1), block)
         return kept, Scored(x, query, pos, block_keys, picked, block)
 

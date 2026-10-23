@@ -168,7 +168,7 @@ class NextN(nnx.Module):
             self.hidden_norm = Norm(config.norm, width)
             self.copies = None if ctx.depth else copies
         self.embed_norm = Norm(config.norm, d)
-        self.proj = projection(d + width, width, use_bias=False, rngs=ctx.rngs)
+        self.proj = projection(d + width, width, "mtp", use_bias=False, rngs=ctx.rngs)
 
     def __call__(
         self, x: Float[Array, "b t *copies d"], taps: Taps

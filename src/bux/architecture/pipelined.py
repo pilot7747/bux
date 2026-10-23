@@ -140,10 +140,14 @@ class Stage:
         training: bool,
         compute: DTypeLike | None,
     ) -> "Stage":
-        """Return the stage of a round of `passes`, split as the run in force says."""
+        """Return the stage of a round of `passes`, split as the run in force says:
+        evenly, or as `methods.stages` gives them, each stage holding as many as the
+        most any runs."""
         split = pipeline.uneven()
-        runs = None if split is None else pipeline.layers_run(split)
-        return cls(graphdef, passes // pipeline.stages(), training, compute, runs)
+        if split is None:
+            return cls(graphdef, passes // pipeline.stages(), training, compute)
+        runs = pipeline.layers_run(split)
+        return cls(graphdef, max(split), training, compute, runs)
 
     def __call__(
         self, params: nnx.State, rest: nnx.State, x: Stream, rows: Rows
@@ -161,16 +165,27 @@ class Stage:
 
     def _run(self, state: nnx.State, x: Stream, taps: Taps) -> tuple[Stream, nnx.State]:
         """Run the stage's layers: those every stage runs by a scan, and the others,
-        where `runs` gives them, each by a cond (``_skipping``)."""
+        where `runs` gives them, each by a cond (``_skipping``), in runs of passes the
+        run's `remat(first=n)` treats alike, counted from the stage's first."""
         every = self.layers if self.runs is None else int(self.runs.all(0).sum())
-        head = jax.tree.map(lambda a: a[:every], state)
-        y, rest = stacked.run(self.graphdef, head, every, x, taps, self.compute)
-        if every == self.layers:
+        y, rest = stacked.run(
+            self.graphdef, _passes(state, 0, every), every, x, taps, self.compute
+        )
+        if self.runs is None or every == self.layers:
             return y, rest
-        tail = jax.tree.map(lambda a: a[every:], state)
-        runs = jnp.asarray(self.runs)[jax.lax.axis_index(pipeline.AXIS), every:]
-        y, more = _skipping(self.graphdef, tail, runs, y, taps, self.compute)
-        return y, jax.tree.map(lambda a, b: jnp.concatenate([a, b]), rest, more)
+        parts, runs = [rest], jnp.asarray(self.runs)[jax.lax.axis_index(pipeline.AXIS)]
+        for a, b in remat.spans(every, self.layers):
+            with remat.at_pass(a):
+                y, more = _skipping(
+                    self.graphdef,
+                    _passes(state, a, b),
+                    runs[a:b],
+                    y,
+                    taps,
+                    self.compute,
+                )
+            parts.append(more)
+        return y, jax.tree.map(lambda *a: jnp.concatenate(a), *parts)
 
     def report(self, taps: Taps, losses: Float[Array, "r n k"]) -> None:
         """Add each layer's losses, of values `losses`, to `taps`."""
@@ -181,6 +196,11 @@ class Stage:
                 Loss(name, weight, v)
                 for (name, weight), v in zip(self.reports, values, strict=True)
             )
+
+
+def _passes(state: nnx.State, start: int, stop: int) -> nnx.State:
+    """Return the stacked `state` of passes `start` to `stop`."""
+    return jax.tree.map(lambda a: a[start:stop], state)
 
 
 def _skipping(
@@ -197,18 +217,22 @@ def _skipping(
     alone."""
     call = pure.Pure(graphdef, taps)
 
-    def run(s: nnx.State, x: Stream) -> tuple[Stream, nnx.State, list[Array]]:
+    def run(
+        s: nnx.State, x: Stream
+    ) -> tuple[Stream, nnx.State, list[Float[Array, ""]]]:
         y, rest, _, losses = call(stacked.cast(s, compute), x, pure.NOTHING)
         return y, rest, losses
 
     layer = remat.checkpoint(run, prevent_cse=False, scanned=True)
     shapes = jax.eval_shape(layer, jax.tree.map(lambda a: a[0], state), x)
 
-    def skip(s: nnx.State, x: Stream) -> tuple[Stream, nnx.State, list[Array]]:
+    def skip(
+        s: nnx.State, x: Stream
+    ) -> tuple[Stream, nnx.State, list[Float[Array, ""]]]:
         zeros = [jnp.zeros(a.shape, a.dtype) for a in shapes[2]]
         return x, nnx.split_state(s, nnx.Param, ...)[1], zeros
 
-    def step(x: Stream, xs: tuple[nnx.State, Array]) -> tuple[Stream, tuple]:
+    def step(x: Stream, xs: tuple[nnx.State, Bool[Array, ""]]) -> tuple[Stream, tuple]:
         s, on = xs
         y, rest, losses = jax.lax.cond(on, layer, skip, s, x)
         return y, (rest, losses)

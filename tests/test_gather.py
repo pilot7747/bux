@@ -11,6 +11,7 @@ import numpy as np
 import pytest
 from flax import nnx
 from jax.sharding import PartitionSpec as P
+from jaxtyping import Float, UInt32
 
 from bux import parallel
 from bux.architecture import Model
@@ -195,7 +196,7 @@ def test_each_device_draws_its_own_rows_masks():
         rngs = nnx.Rngs(dropout=0)
         keys = nnx.state(rngs, nnx.RngKey)
 
-        def drawn(keys: nnx.State) -> jax.Array:
+        def drawn(keys: nnx.State) -> UInt32[jax.Array, "1 k"]:
             own = own_streams(keys, ("fsdp",))
             key = jax.tree.leaves(own)[0]
             return jax.random.key_data(key)[None]
@@ -277,7 +278,7 @@ def _use(mesh: str, layout: str, methods: str):
 
 def _gradients(
     mesh: str, layout: str, methods: str, precision: str = "precision(compute=float32)"
-) -> tuple[list[np.ndarray], Trainer]:
+) -> tuple[list[Float[np.ndarray, "..."]], Trainer]:
     """The gradients of LLAMA's loss on a batch, with the settings given."""
     with _use(mesh, layout, methods):
         trainer = _trainer(LLAMA, mesh, layout, methods, precision)
@@ -301,7 +302,7 @@ def _sum(moved: dict[str, int], ops: tuple[str, ...]) -> int:
     return sum(moved[op] for op in ops)
 
 
-def _in_bfloat16(a: np.ndarray) -> np.ndarray:
+def _in_bfloat16(a: Float[np.ndarray, "*s"]) -> Float[np.ndarray, "*s"]:
     return np.asarray(jnp.asarray(a).astype(jnp.bfloat16).astype(jnp.float32))
 
 

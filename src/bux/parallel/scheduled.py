@@ -45,6 +45,7 @@ SENT = ("inputs", "cotangents")  # the buffers each tick's sends are written int
 Metrics = dict[str, Float[Array, ""]]
 Stream = Shaped[Array, "n t *r"]  # one microbatch's
 Vjp = Callable[..., Any]  # a jax.vjp function: a pytree of its residuals
+Leaf = Shaped[Array, "..."]  # one of a vjp's residuals, or a gradient
 
 
 class Parts(NamedTuple):
@@ -234,7 +235,9 @@ class Ticks:
         report, the vjp that takes both back to its parameters and its input, and the
         layers' state after."""
 
-        def run(params: PyTree, x: Stream) -> tuple[tuple[Stream, Array], PyTree]:
+        def run(
+            params: PyTree, x: Stream
+        ) -> tuple[tuple[Stream, Float[Array, "l k"]], PyTree]:
             y, after, losses = self.parts.stage(params, rest, x, rows)
             return (y, losses), after
 
@@ -328,13 +331,13 @@ class Ticks:
 
     def _embed(
         self, held: Held, j: Int[Array, ""], rows: PyTree
-    ) -> tuple[Stream, list[Array], PyTree]:
+    ) -> tuple[Stream, list[Leaf], PyTree]:
         x, vjp, kept = self.embedded(held.kept, rows)
         return x, jax.tree.leaves(vjp), kept
 
     def _receive(
         self, held: Held, j: Int[Array, ""], rows: PyTree
-    ) -> tuple[Stream, list[Array], PyTree]:
+    ) -> tuple[Stream, list[Leaf], PyTree]:
         assert self.shapes is not None
         empty = [
             jnp.zeros(a.shape, a.dtype) for a in jax.tree.leaves(self.shapes.first)
@@ -383,7 +386,7 @@ class Ticks:
         d_params = jax.tree.unflatten(jax.tree.structure(self.params), flat)
         return held._replace(grads=_added(held.grads, d_params))
 
-    def _vjp(self, residuals: list[Array]) -> Vjp:
+    def _vjp(self, residuals: list[Leaf]) -> Vjp:
         """Return this stage's vjp, rebuilt from a slot's `residuals`."""
         assert self.shapes is not None
         return _rebuilt(self.shapes.stage, residuals, self.params)
@@ -398,7 +401,7 @@ class Ticks:
         residuals = jax.tree.leaves(shapes.stage)
         tree = jax.tree.structure(self.params)
 
-        def backward(*args: Array) -> list[Array]:
+        def backward(*args: Leaf) -> list[Leaf]:
             p, (*r, dy, dl) = args[: len(params)], args[len(params) :]
             vjp = _rebuilt(shapes.stage, r, jax.tree.unflatten(tree, p))
             d_params, dx = vjp((dy, dl))
@@ -497,7 +500,7 @@ def _merged(metrics: Metrics, more: Metrics) -> Metrics:
     return metrics | {k: v + metrics[k] if k in metrics else v for k, v in more.items()}
 
 
-def _rebuilt(shapes: Vjp, leaves: list[Array], unsaved: PyTree) -> VJP:
+def _rebuilt(shapes: Vjp, leaves: list[Leaf], unsaved: PyTree) -> VJP:
     """Return the vjp of the structure `shapes` from its residual `leaves`, with its
     first primal, which it did not save, put back as `unsaved`."""
     vjp = jax.tree.unflatten(jax.tree.structure(shapes), leaves)
@@ -513,7 +516,7 @@ def _rebuilt(shapes: Vjp, leaves: list[Array], unsaved: PyTree) -> VJP:
     return vjp.replace(args_res=[jax.tree.unflatten(tree, values), *vjp.args_res[1:]])
 
 
-def _shape(a: Array | jax.ShapeDtypeStruct) -> jax.ShapeDtypeStruct:
+def _shape(a: Leaf | jax.ShapeDtypeStruct) -> jax.ShapeDtypeStruct:
     return jax.ShapeDtypeStruct(a.shape, a.dtype)
 
 

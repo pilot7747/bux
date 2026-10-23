@@ -4,6 +4,7 @@ import jax
 from flax import nnx
 from jaxtyping import Array, Float, Int
 
+from bux.architecture import matmuls
 from bux.architecture.graph import build_node
 from bux.architecture.logits import HeadOutput
 from bux.architecture.registry import Context, Loss, Stream, Taps
@@ -26,6 +27,7 @@ class Model(nnx.Module):
 
     def __init__(self, arch: ir.Architecture, *, rngs: nnx.Rngs):
         self.graph = pipe_longest(build_node(arch.graph, Context(arch, rngs)))
+        self.main_branches = matmuls.main_branches(arch.graph)  # precision.last
 
     def outputs(
         self, tokens: Int[Array, "b t"], positions: Int[Array, "b t"] | None = None
@@ -60,7 +62,8 @@ class Model(nnx.Module):
         """Run the graph; return its output, and the taps it leaves."""
         docs = None if positions is None else Segments.of(positions)
         taps = Taps(tokens=tokens, segments=docs, training=training)
-        return self.graph(tokens, taps), taps
+        with matmuls.forward(self.main_branches):
+            return self.graph(tokens, taps), taps
 
     def __call__(self, tokens: Int[Array, "b t"]) -> Float[Array, "b t vocab"]:
         """Return the first head's logits: the next-token prediction."""

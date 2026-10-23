@@ -301,16 +301,81 @@ class ProfileConfig(Config):
     steps: Positive = 5
 
 
+# --- Precision ---------------------------------------------------------------------------
+# What a run computes in, and the format each projection inside a block multiplies in
+# (bux.architecture.matmuls): by the kind of projection, by the residual branch it is
+# in, and by the GEMM.
+
+# The GEMMs of a projection y = x W: y's (fprop), and the gradient's by x (dgrad) and
+# by W (wgrad).
+Pass = Literal["fprop", "dgrad", "wgrad"]
+PASSES: tuple[Pass, ...] = ("fprop", "dgrad", "wgrad")
+
+
+def _in_compute(fmt: str | None) -> str | None:
+    if fmt not in (None, "compute"):
+        raise ValueError(
+            "the routed experts multiply in compute: a grouped block-scaled GEMM is "
+            "not in bux yet"
+        )
+    return fmt
+
+
+# A number of residual branches, or a share of the model's, rounded up.
+Branches = Annotated[int, Field(ge=0)] | Annotated[float, Field(gt=0, lt=1)]
+
+
+class RolesConfig(Config):
+    """The format each kind of projection multiplies in, where it is not the
+    precision's `matmuls`; none is `matmuls`. The embedding, the head, the router and
+    softmax attention's own matmuls always stay in compute."""
+
+    type: Literal["roles"] = "roles"
+    q: str | None = None  # attention's queries and gate (gqa, mla, csa, the indexer)
+    kv: str | None = None  # attention's keys and values
+    o: str | None = None  # attention's output projection
+    mlp: str | None = None  # MLPs, the shared experts' too
+    # The routed experts, in compute until bux has a grouped block-scaled GEMM.
+    experts: Annotated[str | None, AfterValidator(_in_compute)] = None
+    latent: str | None = None  # LatentMoE's projections to and from its latent
+    recurrence: str | None = None  # the recurrent mixers' projections, but the output
+    recurrence_out: str | None = None  # their output projection, Mamba's out_proj
+    mtp: str | None = None  # nextn's projection, and every branch after the first head
+
+
+class SwitchConfig(Config):
+    """From `at` of the steps on, only `passes` multiply in the format: the end of a
+    run in a higher precision. NVIDIA's NVFP4 recipe takes fprop to bfloat16 for the
+    last 18%: passes=[dgrad, wgrad]."""
+
+    type: Literal["switch"] = "switch"
+    at: Annotated[float, Field(gt=0, lt=1)]
+    passes: tuple[Pass, ...] = ()
+
+
 class PrecisionConfig(Config):
     """The dtype the forward and backward compute in, and the format the projections
-    inside blocks multiply in (bux.architecture.matmuls). Parameters and the
-    optimizer's state stay float32, and so do norm statistics, router scores and
-    top-k, recurrent states and the loss. Unlike the three settings below, it is in
-    the run's id."""
+    inside blocks multiply in (bux.architecture.matmuls): `matmuls`, or what `roles`
+    gives a kind of projection, and compute in the `first` and `last` residual
+    branches of the model. Of each projection's GEMMs, only `passes` multiply in the
+    format. Parameters stay float32, and so do the optimizer's `moments`, unless
+    bfloat16, norm statistics, router scores and top-k, recurrent states and the loss;
+    gradients are summed over rows in `reduce`. Unlike the three settings below, it is
+    in the run's id, but for `eval`."""
 
     type: Literal["precision"] = "precision"
     compute: Literal["float32", "bfloat16"] = "bfloat16"
     matmuls: str = "compute"  # a format of bux.architecture.matmuls: mxfp8, nvfp4
+    roles: RolesConfig = RolesConfig()
+    # The residual branches outside any other, first and last before the first head,
+    # that multiply in compute: a number of them, or a share.
+    first: Branches = 0
+    last: Branches = 0
+    passes: tuple[Pass, ...] = PASSES  # the GEMMs that multiply in the format
+    switch: SwitchConfig | None = None
+    # Evaluation multiplies as training does, or in compute.
+    eval: Literal["train", "compute"] = "train"
+    moments: Literal["float32", "bfloat16"] = "float32"  # the optimizer's state
     # The dtype gradients are summed over the batch's rows in: compute, or float32 as
     # Megatron's are, which a step sums once (methods.accumulate = unreduced).
     reduce: Literal["compute", "float32"] = "compute"
@@ -364,6 +429,28 @@ def _named_none(v: object) -> object:
     return "none" if v is None else v
 
 
+def _listed(v: object) -> object:
+    """One name, as a list of one."""
+    return (v,) if isinstance(v, str) else v
+
+
+Names = Annotated[tuple[str, ...], BeforeValidator(_listed)]
+
+
+class RematConfig(Config):
+    """What a rematerialized branch or scanned pass keeps for the backward pass, by the
+    names layers give what they make (bux.architecture.remat); the backward computes
+    the rest again. A preset is a name: save_attention is remat(save=[attention,
+    recurrence])."""
+
+    type: Literal["remat"] = "remat"
+    save: Names = ()  # kept on the device: attention, qkv, mlp, dots, ...
+    offload: Names = ()  # moved to the host's memory until the backward reads them
+    # The passes of each repeat it rematerializes, from the first; the rest keep
+    # everything. None: every pass.
+    first: Annotated[int, Field(ge=0)] | None = None
+
+
 class MethodsConfig(Config):
     """How each part that communicates is computed, by the name of a function in its
     registry in bux.parallel.methods: another method is a function, not a field."""
@@ -371,16 +458,27 @@ class MethodsConfig(Config):
     type: Literal["methods"] = "methods"
     attention: str = "auto"
     moe: str = "sorted"
+    # The picks a device of all_gather or the ragged MoE methods takes, a multiple of
+    # its own; what does not fit drops, which `dropped` reports. None: all that come.
+    capacity: Annotated[float, Field(gt=0)] | None = None
     recurrence: str = "scan"
+    # What the backward pass of a recurrence by chunks reads of its chunks' states:
+    # kept from the forward pass, or computed again from its inputs, in a fourteenth
+    # of the memory and a fifth more time. The delta rule by cuDNN's kernels keeps only
+    # its inputs either way.
+    states: Literal["keep", "recompute"] = "keep"
     repeat: str = "unroll"
-    remat: Annotated[str, BeforeValidator(_named_none)] = "none"
+    # A policy by name, or as data: remat(save=[attention], first=8).
+    remat: Annotated[str | RematConfig, BeforeValidator(_named_none)] = "none"
     pipeline: str = "gpipe"
     rounds: Positive = 1  # times a circular pipeline sends a microbatch round
     # The passes of the pipelined repeat each stage runs, first to last: fewer on the
     # first and last, which run the embedding and the head. None: an even share.
     stages: list[Positive] | None = None
     orthogonalize: str = "owner"  # how Muon reaches whole matrices
-    loss: str = "logits"  # how the loss takes a head's logits: whole, or by chunks
+    loss: str = "chunks"  # how the loss takes a head's logits: by chunks, or whole
+    tensor: str = "gspmd"  # how TP's collectives meet the projections they feed
+    tensor_chunks: Positive = 2  # of each device's rows, under tensor = chunked
     microbatches: Positive = 1
     # Where a step runs its layers more than once (microbatches, a pipeline's ticks),
     # it casts and gathers the parameters FSDP splits once, or as each layer runs
@@ -461,8 +559,11 @@ Setting = Annotated[
     | LogConfig
     | ProfileConfig
     | PrecisionConfig
+    | RolesConfig
+    | SwitchConfig
     | MeshConfig
     | LayoutConfig
+    | RematConfig
     | MethodsConfig
     | CompilerConfig,
     Field(discriminator="type"),

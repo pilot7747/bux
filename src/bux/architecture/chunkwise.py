@@ -28,6 +28,7 @@ from typing import NamedTuple
 
 import jax
 import jax.numpy as jnp
+from jax.ad_checkpoint import checkpoint_name
 from jaxtyping import Array, Bool, Float, Int
 
 from bux import parallel
@@ -36,6 +37,7 @@ from bux.parallel.recurrence import Chunk, Positions, Transition
 
 SIZE = 64  # positions per chunk
 SUB = 16  # positions per block of a chunk, for a decay per key channel
+INVERSE = "recurrence.inverse"  # the name of each chunk's (I - L)^-1, which is kept
 
 Chunks = Float[Array, "b n h c _"]  # (b, n, h, C, ...): n chunks of C positions
 Grouped = Float[Array, "b n g c _"]  # chunks of g heads, or of groups of h
@@ -257,11 +259,33 @@ def _channels(
     return across + diagonal.reshape(*lead, c, c)
 
 
-def _inverse(L: Pairs, leaf: int = 16) -> Pairs:
+@jax.custom_vjp
+def _inverse(L: Pairs) -> Pairs:
+    """Return T = (I - L)^-1 of a strictly lower triangular L (`_halves`), named
+    `INVERSE`. Its backward pass needs T alone."""
+    return _inverse_forward(L)[0]
+
+
+def _inverse_forward(L: Pairs) -> tuple[Pairs, Pairs]:
+    T = checkpoint_name(_halves(L), INVERSE)
+    return T, T
+
+
+def _inverse_backward(T: Pairs, dT: Pairs) -> tuple[Pairs]:
+    """T moves by T dL T, so L's gradient is T^T dT T^T, below the diagonal: where L
+    has entries."""
+    Tt = jnp.swapaxes(T, -1, -2)
+    return (jnp.tril(_matmul(_matmul(Tt, dT), Tt), -1),)
+
+
+_inverse.defvjp(_inverse_forward, _inverse_backward)
+
+
+def _halves(L: Pairs, leaf: int = 16) -> Pairs:
     """Return (I - L)^-1 of a strictly lower triangular L, by halves: that of
     [[L1, 0], [L21, L2]] is [[T1, 0], [T2 L21 T1, T2]], down to blocks of `leaf`
-    solved one row at a time. Every product is of entries of the inverse, which stay bounded where
-    the powers of L need not (keys alike, steps near 1)."""
+    solved one row at a time. Every product is of entries of the inverse, which stay
+    bounded where the powers of L need not (keys alike, steps near 1)."""
     c = L.shape[-1]
     blocks = c // leaf
     size = leaf if c > leaf and c % leaf == 0 and blocks & (blocks - 1) == 0 else c
