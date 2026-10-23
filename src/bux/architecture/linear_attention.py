@@ -165,8 +165,11 @@ def recurrence(
 def recomputed[**A, R](f: Callable[A, R]) -> Callable[A, R]:
     """Return `f`, whose backward pass computes it again from its inputs, as fla's
     kernels do: of all it computes, it keeps only each chunk's (I - L)^-1
-    (``chunkwise.INVERSE``), a tenth of the memory the chunks' states and maps take,
-    for one more forward pass."""
+    (``chunkwise.INVERSE``), a fourteenth of the memory the chunks' states and maps
+    take, for one more forward pass. With the run's `methods.states = keep`, `f`."""
+    on = parallel.active()
+    if on is not None and on.methods.states == "keep":
+        return f
     keep = jax.checkpoint_policies.save_only_these_names(chunkwise.INVERSE)
     return jax.checkpoint(f, policy=keep)
 

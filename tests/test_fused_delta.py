@@ -67,39 +67,75 @@ def test_packed_rows_give_what_rows_do(stand_in, monkeypatch, decay, every, room
     np.testing.assert_allclose(got, _chunked(*xs, docs), atol=1e-5)
 
 
-def test_kda_runs_steep_gates_without_the_kernel(stand_in, monkeypatch):
-    """A gate below the kernel's -5 at every position of a tile, unbounded: the
-    fallback runs it, and the kernel, here a stand-in that gives nan, does not."""
-
-    def overflows(q, k, v, g, beta, cu, *, scale):
-        return jnp.full(v.shape, jnp.nan), None
-
-    monkeypatch.setattr(
-        fused_delta, "frost", types.SimpleNamespace(kimi_delta_attention=overflows)
-    )
-    docs, xs = _documents(T), _inputs(K, low=-12.0)
-    got = fused_delta.delta_rule(*xs, docs, None, _chunked)
-    np.testing.assert_allclose(got, _chunked(*xs, docs), atol=1e-5)
+def _overflows(q, k, v, g, beta, cu, *, scale):
+    """KDA's kernel as it fails: nan wherever a head's gate falls below -5."""
+    out, _ = _kernel(q, k, v, g, beta, cu, scale=scale)
+    return jnp.where((g < fused_delta.FLOOR).any(-1)[..., None], jnp.nan, out), None
 
 
-def test_kda_runs_shallow_unbounded_gates_by_the_kernel(stand_in):
-    docs, xs = _documents(20), _inputs(K, low=-3.0)
+@pytest.fixture
+def overflowing(stand_in, monkeypatch):
+    kernel = types.SimpleNamespace(kimi_delta_attention=_overflows)
+    monkeypatch.setattr(fused_delta, "frost", kernel)
+
+
+def _steep(pairs) -> tuple:
+    """`_inputs` of gates in [-3, 0], but at -12 in the (row, head) `pairs`."""
+    q, k, v, g, beta = _inputs(K, low=-3.0)
+    for row, head in pairs:
+        g = g.at[row, :, head].set(-12.0)
+    return q, k, v, g, beta
+
+
+def _loss(f, docs):
+    weights = jnp.cos(jnp.arange(B * T * H * K)).reshape(B, T, H, K)
+    return lambda *xs: (f(*xs, docs) * weights).sum()
+
+
+# No steep pair, one in a slot of one, one in two slots, and two in two.
+@pytest.mark.parametrize(
+    ("pairs", "share"),
+    [((), 1 / 4), (((1, 0),), 1 / 4), (((1, 0),), 1 / 2), (((1, 0), (0, 1)), 1 / 2)],
+)
+def test_kda_runs_the_pairs_too_steep_for_its_kernel_by_chunks(
+    overflowing, monkeypatch, pairs, share
+):
+    """Unbounded gates: the kernel runs the pairs it takes, the chunks the rest, and
+    slots for steep pairs left over add nothing, to the outputs or the gradients."""
+    monkeypatch.setattr(fused_delta, "STEEP", share)
+    docs, xs = _documents(20), _steep(pairs)
+
+    def fused(*xs):
+        return fused_delta.delta_rule(*xs, None, _chunked)
+
+    got, want = fused(*xs, docs), _chunked(*xs, docs)
+    np.testing.assert_allclose(got, want, atol=1e-5)
+    grads = [jax.grad(_loss(f, docs), argnums=range(5))(*xs) for f in (fused, _chunked)]
+    for a, b in zip(*grads, strict=True):
+        assert bool(jnp.isfinite(a).all())
+        np.testing.assert_allclose(a, b, atol=1e-4)
+
+
+def test_kda_runs_by_chunks_alone_past_its_share_of_steep_pairs(overflowing):
+    docs, xs = _documents(T), _steep([(0, 0), (1, 1)])
     got = fused_delta.delta_rule(*xs, docs, None, _chunked)
     np.testing.assert_allclose(got, _chunked(*xs, docs), atol=1e-5)
 
 
 @pytest.mark.parametrize(
-    ("gate", "fits"),
-    [(-5.0, True), (-5.1, False), (-0.1, True)],
+    ("gate", "steep"),
+    [(-5.0, False), (-5.1, True), (-0.1, False)],
     ids=["at-the-floor", "below-it", "shallow"],
 )
-def test_tiles_fit_the_kernel_where_16_positions_decay_by_at_most_exp_minus_80(
-    gate, fits
+def test_a_pair_is_steep_where_16_positions_decay_by_more_than_exp_minus_80(
+    gate, steep
 ):
     g = jnp.full((B, T, H, K), gate)
-    assert bool(fused_delta._shallow(g)) is fits
+    assert bool(fused_delta._steep(g).all()) is steep
 
 
-def test_one_steep_position_in_a_tile_is_too_steep():
+def test_one_steep_position_makes_its_pair_steep_alone():
     g = jnp.full((B, T, H, K), -0.1).at[1, 40, 0, 3].set(-100.0)
-    assert not bool(fused_delta._shallow(g))
+    np.testing.assert_array_equal(
+        fused_delta._steep(g), [[False, False], [True, False]]
+    )

@@ -10,9 +10,10 @@ cuDNN's graph of it on XLA's stream (`gated_delta_net`).
 A decay per key channel (KDA) runs by Frost's KDA kernel, through cudnn-frontend's
 own JAX call. It factors each decay through the start of a tile of 16 positions, so it
 overflows where a tile decays a channel below exp(-87): a gate bounded at -5
-(`gate_lower_bound`, Kimi K3) always fits, and any other runs by it only where every
-16 positions of the rows decay by no more than exp(-80) (`_shallow`), and by
-``chunkwise`` otherwise.
+(`gate_lower_bound`, Kimi K3) always fits it. Any other runs by it on the (row, head)
+pairs where 16 positions decay no channel by more than exp(-80), and by ``chunkwise``
+on the rest (`_patched`), up to a quarter of the pairs; past that, ``chunkwise`` runs
+it all.
 
 The kernels run on one SM100 or SM103 GPU at a time, on token-packed rows and their
 documents' bounds (cu_seqlens); on a mesh, a `shard_map` gives them each device's rows
@@ -21,6 +22,7 @@ and heads. They take heads of 64 or 128, and every position of a row: not
 """
 
 import functools
+import threading
 from collections.abc import Callable
 from typing import Any
 
@@ -109,14 +111,18 @@ def _rows(
     ids: Int[Array, "b t"],
     within: Int[Array, "b t"],
 ) -> Float[Array, "b t h dv"]:
-    """Run one device's rows by a kernel if cu_seqlens holds their documents, and its
-    gates fit it."""
-    b, t = within.shape
+    """Run one device's rows by a kernel if cu_seqlens holds their documents; with
+    gates the kernel may not take, unless more than `STEEP` of the (row, head) pairs
+    are too steep for it."""
+    b, t, h, _ = q.shape
     room = b * max(1, t * DOCS // 4096)
     fits = jnp.sum(within == 0) <= room
-    if not bounded:
-        fits &= _shallow(g)
     docs = Segments(positions, ids, within)
+    kernel = functools.partial(_kernel, room=room)
+    if not bounded:
+        steep = _steep(g)
+        fits &= jnp.sum(steep) <= _patches(b, h)
+        kernel = functools.partial(_patched, kernel, otherwise, docs, steep)
 
     def fallback(
         q: Float[Array, "b t h dk"],
@@ -128,19 +134,57 @@ def _rows(
     ) -> Float[Array, "b t h dv"]:
         return otherwise(q, k, v, g, beta, docs).astype(v.dtype)
 
-    kernel = functools.partial(_kernel, room=room)
     return jax.lax.cond(fits, kernel, fallback, q, k, v, g, beta, within)
 
 
-def _shallow(g: Float[Array, "b t h dk"]) -> Bool[Array, ""]:
-    """Return whether no `TILE` positions of a row decay a channel by more than
-    exp(TILE * FLOOR), so that no tile of KDA's kernel does: a log decay of -5 a
-    position on average, where -5.4 overflows."""
+STEEP = 1 / 4  # the share of (row, head) pairs the chunks may run for KDA's kernel
+
+
+def _patches(b: int, h: int) -> int:
+    """Return how many (row, head) pairs of b rows of h heads `_patched` runs by the
+    chunks."""
+    return max(1, int(b * h * STEEP))
+
+
+def _steep(g: Float[Array, "b t h dk"]) -> Bool[Array, "b h"]:
+    """Return the (row, head) pairs where `TILE` positions decay a channel by more
+    than exp(TILE * FLOOR), which a tile of KDA's kernel may not: a log decay of -5 a
+    position on average, where -5.4 loses precision and -5.6 overflows."""
     window, strides = (1, TILE, 1, 1), (1, 1, 1, 1)
     edges = ((0, 0), (TILE - 1, 0), (0, 0), (0, 0))
     g = g.astype(jnp.float32)
     sums = jax.lax.reduce_window(g, 0.0, jax.lax.add, window, strides, edges)
-    return jnp.min(sums) >= TILE * FLOOR
+    return jnp.min(sums, axis=(1, 3)) < TILE * FLOOR
+
+
+def _patched(
+    kernel: Rule,
+    otherwise: Rule,
+    docs: Segments,
+    steep: Bool[Array, "b h"],
+    q: Float[Array, "b t h dk"],
+    k: Float[Array, "b t h dk"],
+    v: Float[Array, "b t h dv"],
+    g: Float[Array, "b t h dk"],
+    beta: Float[Array, "b t h"],
+    within: Int[Array, "b t"],
+) -> Float[Array, "b t h dv"]:
+    """Run the kernel on every (row, head) pair, the `steep` ones with no decay, and
+    replace those by `otherwise`'s chunks, run on them alone. Slots past the steep
+    pairs run the first pair again, and add nothing."""
+    b, _, h, _ = q.shape
+    flat = jnp.nonzero(steep.reshape(-1), size=_patches(b, h), fill_value=0)[0]
+    rows, heads = flat // h, flat % h
+    used = jnp.arange(flat.size) < jnp.sum(steep)
+
+    def picked(x: Float[Array, "b t h ..."]) -> Float[Array, "n t 1 ..."]:
+        return x[rows, :, heads][:, :, None]
+
+    safe = jnp.where(steep[:, None, :, None], 0.0, g)
+    out = jnp.where(steep[:, None, :, None], 0.0, kernel(q, k, v, safe, beta, within))
+    few = Segments(*(x[rows] for x in docs))
+    patch = otherwise(*map(picked, (q, k, v, g, beta)), few)[:, :, 0]
+    return out.at[rows, :, heads].add(jnp.where(used[:, None, None], patch, 0.0))
 
 
 def _kernel(
@@ -210,17 +254,25 @@ def _graph_call(
     """Run cuDNN's graph of the node `op` on `xs`, as a callback that XLA hands its
     buffers and its stream; the graph's workspace is one more of its results."""
     shapes = tuple((x.shape, x.dtype.name) for x in xs)
-    workspace = _graph(op, shapes, 0).get_workspace_size()
+    with _ONE_AT_A_TIME:
+        workspace = _graph(op, shapes, 0).get_workspace_size()
     scratch = jax.ShapeDtypeStruct((max(workspace, 1),), jnp.uint8)
 
     def run(ctx: Any, outs: tuple[Any, ...], *ins: Any) -> None:
         device = ins[0].__dlpack_device__()[1]
-        graph = _graph(op, shapes, device)
         *outputs, workspace = outs
-        pack = dict(zip(graph.ports, (*ins, *outputs), strict=True))
-        graph.execute(pack, workspace=workspace, handle=_handle(device, ctx.stream))
+        with _ONE_AT_A_TIME:
+            graph = _graph(op, shapes, device)
+            pack = dict(zip(graph.ports, (*ins, *outputs), strict=True))
+            handle = _handle(device, ctx.stream)
+            graph.execute(pack, workspace=workspace, handle=handle)
 
     return tuple(buffer_callback(run, (*results, scratch))(*xs)[:-1])
+
+
+# XLA calls each device's callback from that device's thread, and cuDNN's graphs, and
+# the kernels they compile on their first run, are not safe to share between threads.
+_ONE_AT_A_TIME = threading.Lock()
 
 
 # Each graph's inputs, and its outputs with the input whose dtype each takes, in the
