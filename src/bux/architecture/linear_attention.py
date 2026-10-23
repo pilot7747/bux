@@ -25,7 +25,9 @@ the heads or out of them, and so does every parameter a head has: the recurrence
 on each device's own heads, with no communication.
 """
 
+import functools
 import math
+from collections.abc import Callable
 
 import jax
 import jax.numpy as jnp
@@ -148,23 +150,39 @@ def recurrence(
 
     with w = exp(log_decay), one per key channel or one per head, and S zero before
     every document; without a and b, it is decayed linear attention. It runs by the
-    run's `methods.recurrence`, in float32, named `recurrence` (``remat.named``).
-    Where b is k, as in the delta rule, the positions leave b out, (q, k, v, log
-    decay, continues, a), which ``chunkwise`` runs in half the work."""
-    batch, t = k.shape[:2]
-    continues = (
-        jnp.ones((batch, t)) if docs is None else (docs.within > 0).astype(jnp.float32)
-    )
+    run's `methods.recurrence`, in float32, named `recurrence` (``remat.named``), and
+    its backward pass computes it again from these inputs (`recomputed`). Where b is
+    k, as in the delta rule, the positions leave b out, (q, k, v, log decay,
+    continues, a), which ``chunkwise`` runs in half the work."""
     rank_one = a is not None and b is not None
     family = "the generalized delta rule" if rank_one else "decayed linear attention"
     ab = (a,) if rank_one and b is k else (a, b) if rank_one else ()
-    run = parallel.method("recurrence")
-
-    def mix(*xs: Float[Array, "b t ..."]) -> Float[Array, "b t h dv"]:
-        return run(Recurrence(family, chunk, xs))
-
-    xs = (q, k, v, log_decay, continues, *ab)
+    xs = (q, k, v, log_decay, _continues(k, docs), *ab)
+    mix = recomputed(functools.partial(_mixed, family))
     return remat.named("recurrence", mix, *xs).astype(v.dtype)
+
+
+def recomputed[**A, R](f: Callable[A, R]) -> Callable[A, R]:
+    """Return `f`, whose backward pass computes it again from its inputs, as fla's
+    kernels do: of all it computes, it keeps only each chunk's (I - L)^-1
+    (``chunkwise.INVERSE``), a tenth of the memory the chunks' states and maps take,
+    for one more forward pass."""
+    keep = jax.checkpoint_policies.save_only_these_names(chunkwise.INVERSE)
+    return jax.checkpoint(f, policy=keep)
+
+
+def _mixed(family: str, *xs: Float[Array, "b t ..."]) -> Float[Array, "b t h dv"]:
+    """Run the recurrence of the positions `xs` by the run's `methods.recurrence`."""
+    return parallel.method("recurrence")(Recurrence(family, chunk, xs))
+
+
+def _continues(
+    k: Float[Array, "b t ..."], docs: Segments | None
+) -> Float[Array, "b t"]:
+    """Return 1 where a token continues a document, and 0 where it starts one."""
+    if docs is None:
+        return jnp.ones(k.shape[:2])
+    return (docs.within > 0).astype(jnp.float32)
 
 
 def delta_rule(
@@ -181,16 +199,16 @@ def delta_rule(
 
         S_t = (I - beta_t k_t k_t^T) diag(w_t) S_{t-1} + beta_t k_t v_t^T.
 
-    That is `recurrence` with a = -w k, and beta k for both b and k, in float32.
-    Where no log decay is below `floor`, on a B200 or B300, cuDNN's fused kernel runs
-    it instead (``fused_delta``), with q, k and v in their own dtype."""
-    if fused_delta.runs(k.shape[-1], v.shape[-1], floor):
-        g = jnp.broadcast_to(log_decay, k.shape)
+    That is `recurrence` with a = -w k, and beta k for both b and k, in float32. On a
+    B200 or B300, with q, k and v of 16 bits, cuDNN's fused kernels run it instead
+    (``fused_delta``), in their dtype: where `floor`, the least log decay, bounds a
+    decay per channel at -5, or its gates turn out shallow enough."""
+    if fused_delta.runs(k.shape[-1], v.shape[-1], v.dtype):
 
         def fused(*xs: Float[Array, "b t ..."]) -> Float[Array, "b t h dv"]:
-            return fused_delta.delta_rule(*xs, docs, _chunked)
+            return fused_delta.delta_rule(*xs, docs, floor, _chunked)
 
-        return remat.named("recurrence", fused, q, k, v, g, beta)
+        return remat.named("recurrence", fused, q, k, v, log_decay, beta)
     return _chunked(q, k, v, log_decay, beta, docs)
 
 
@@ -202,10 +220,24 @@ def _chunked(
     beta: Float[Array, "b t h"],
     docs: Segments | None,
 ) -> Float[Array, "b t h dv"]:
-    """Run `delta_rule` by `recurrence`."""
-    k, log_decay = k.astype(jnp.float32), log_decay.astype(jnp.float32)
-    step = beta[..., None] * k
-    return recurrence(q, step, v, log_decay, docs, a=-jnp.exp(log_decay) * k, b=step)
+    """Run `delta_rule` by `recurrence`'s chunks, recomputed from q, k, v, the log
+    decay and beta in their own dtype: what its backward pass keeps."""
+
+    def rule(
+        q: Float[Array, "b t h dk"],
+        k: Float[Array, "b t h dk"],
+        v: Float[Array, "b t h dv"],
+        log_decay: Float[Array, "b t h #dk"],
+        beta: Float[Array, "b t h"],
+        continues: Float[Array, "b t"],
+    ) -> Float[Array, "b t h dv"]:
+        k, log_decay = k.astype(jnp.float32), log_decay.astype(jnp.float32)
+        step = beta[..., None] * k
+        a = -jnp.exp(log_decay) * k
+        return _mixed("the generalized delta rule", q, step, v, log_decay, continues, a)
+
+    xs = (q, k, v, log_decay, beta, _continues(k, docs))
+    return remat.named("recurrence", recomputed(rule), *xs).astype(v.dtype)
 
 
 def l2norm(x: Float[Array, "*lead e"], eps: float = 1e-6) -> Float[Array, "*lead e"]:
