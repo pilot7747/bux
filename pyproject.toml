@@ -75,4 +75,4 @@ mypy-init-return = true
 error-on-warning = true
 
 [tool.ty.analysis]
-allowed-unresolved-imports = ["pyspark.**", "tokamax.**", "cudnn.**"]  # the `spark` and `cuda` extras
+allowed-unresolved-imports = ["pyspark.**", "tokamax.**", "cudnn.**", "triton.**", "jax_triton.**"]  # the `spark` and `cuda` extras
