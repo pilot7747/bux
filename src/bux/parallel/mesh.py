@@ -10,6 +10,7 @@ import jax
 import numpy as np
 from jax.experimental import mesh_utils
 from jax.sharding import AbstractMesh, AxisType, Mesh
+from jaxtyping import Shaped
 
 from bux.train.config import LayoutConfig, MeshConfig, MethodsConfig
 
@@ -59,7 +60,7 @@ def mesh(config: MeshConfig) -> Mesh:
     return Mesh(grid(shape, used), AXES, axis_types=(AxisType.Auto,) * len(AXES))
 
 
-def grid(shape: dict[str, int], devices: Sequence[Any]) -> np.ndarray:
+def grid(shape: dict[str, int], devices: Sequence[Any]) -> Shaped[np.ndarray, "..."]:
     """Lay `devices` out on the axes of `shape`. On several nodes, each holds a block
     of the innermost axes (`split`), so that the outer ones span nodes; jax.make_mesh
     refuses devices of more than one node."""

@@ -33,7 +33,7 @@ import optax
 from flax import nnx
 from jax.sharding import PartitionSpec as P
 from jax.typing import DTypeLike
-from jaxtyping import Array, Float, Int32
+from jaxtyping import Array, Float, Int32, Shaped
 
 from bux import kernels, parallel
 from bux.architecture import Model, Scanned, matmuls, remat
@@ -146,7 +146,9 @@ def _add(total: Float[Array, "*s"], part: Float[Array, "*s"]) -> Float[Array, "*
 
 
 def _by_spec(
-    f: Callable[[P, Array], Array], specs: nnx.State, state: nnx.State
+    f: Callable[[P, Shaped[Array, "*s"]], Shaped[Array, "*w"]],
+    specs: nnx.State,
+    state: nnx.State,
 ) -> nnx.State:
     """Apply `f` to each variable's value of `state` and its spec in `specs`."""
     return jax.tree.map(lambda s, v: v.replace(f(s, v.get_value())), specs, state)
@@ -337,7 +339,7 @@ class Trainer:
         splits = parallel.gather.splits(params, over)
         rows = self.microbatches * _size(over)
 
-        def gathered(spec: P, x: Array) -> Array:
+        def gathered(spec: P, x: Shaped[Array, "*s"]) -> Shaped[Array, "*w"]:
             return parallel.gather.gather(spec, x.astype(self.compute))
 
         def reduced(spec: P, g: Float[Array, "*w"]) -> Float[Array, "*s"]:
