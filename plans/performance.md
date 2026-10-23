@@ -111,3 +111,43 @@ the remat names in `attention.py`, `sparse.py` and `mla.py`.
 - Keep `ir.Run.id` stable: a field at its default stays out of the id.
 - **Done when** the NVFP4 recipe trains a dense run to the bf16 loss within the
   recipe's published gap.
+
+## As built
+
+Every WP above merged into `sota`, and three more: O2 (TP's collectives beside its
+matmuls), L (the delta rule's memory and kernels) and G2 (pipeline schedules). Each
+section of `docs/` says how its piece works and what it measured.
+
+### What changed by default
+
+| setting | now | was |
+|---------|-----|-----|
+| `methods.loss` | `chunks`, with each chunk's gradients taken in the forward | `logits` |
+| `layout.fsdp` | `(fsdp, context, expert)` | `fsdp` alone |
+| `methods.gather` | `step`: microbatches gather and cast once | each layer, each microbatch |
+| `methods.accumulate` | `auto`: reduce once where the rows span processes | each microbatch |
+| a `tokens` source's order | a Feistel permutation by index | a permutation of the corpus |
+| a `synthetic` source | a seed per row | a seed per batch |
+| MFU | attention counts what a causal mask keeps | the whole t x t |
+| JAX's cache, many processes | on only where every host sees one folder | each host's own |
+
+### New settings
+
+- `compiler(preset=default | o1 | lhs | maxtext | collective_matmul, options=...)`
+- `methods(tensor=chunked)`, `methods(capacity=1.25)` with a `dropped` metric,
+  `moe=ragged_tokens`, `pipeline="1f1b" | zbh1`, `stages=[...]`, `states=recompute`
+- `remat(save=[...], offload=[...], first=n)`, and names such as `attention.in`
+- `precision(roles=..., first=, last=, passes=..., switch=..., eval=, moments=,
+  reduce=float32, dispatch=mxfp8)`, `matmuls=mxfp8_2d`, MXFP8 routed experts
+- Recipes: `nvidia_mxfp8`, `nvidia_nvfp4`, `nemotron3_nvfp4`, `deepseek_v3_fp8`,
+  `torchtitan_mxfp8`
+
+### Left open
+
+- DualPipe: designed in `docs/parallelism.md`, not built.
+- KDA with unbounded gates: cuDNN's kernel can't take them; a Pallas kernel would.
+- MXFP8 experts are slower than bf16: the Triton GEMM loads its scales by registers.
+- TransformerEngine-JAX (NCCL-EP, collective GEMM) needs a CUDA 13 build in the image.
+- The image lacks libibverbs until it is rebuilt from the new `Dockerfile`.
+- `bux plan`'s collective bytes per mesh axis, `remat=auto`, and naming the weights
+  FSDP gathers.
