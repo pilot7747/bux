@@ -203,8 +203,9 @@ def strip(node: Node, *, labels: bool = True, widths: bool = True) -> Node:
 
 # Training settings that change how a run is watched or computed, not what it computes.
 _UNCOMPUTED = {"log", "eval", "checkpoint", "profile", "mesh", "layout", "methods"}
-# Settings, and fields of settings, newer than run ids, at their defaults.
-_NEWER = {"precision": PrecisionConfig()}
+# Settings newer than run ids, as runs computed before them: in float32, which was
+# the default then.
+_NEWER = {"precision": PrecisionConfig(compute="float32")}
 # Fields of a setting newer than run ids, by what runs computed before them.
 _NEWER_FIELDS = {
     "precision": {"matmuls": "compute"},
@@ -246,7 +247,7 @@ class Run(BaseModel):
         mesh, layout or methods keep it."""
         arch = self.arch.model_copy(update={"graph": strip(self.arch.graph)})
         # A setting or a field newer than run ids is left out where it computes as runs
-        # did before it (a setting at its default), so that ids made before it resume.
+        # did before it, so that ids made before it resume.
         new = {k for k, v in _NEWER.items() if getattr(self.train, k) == v}
         dumped = self.train.model_dump(mode="json", exclude=_UNCOMPUTED | new)
         train = _without_newer_fields(dumped)

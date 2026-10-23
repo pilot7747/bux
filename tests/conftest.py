@@ -104,6 +104,9 @@ RUN = {
     "seq_len": "16",
     "batch": "8",
     "log": "log(every=1)",
+    # Splits are compared to 1e-5, which bfloat16 rounds past, and XLA:CPU cannot
+    # compile the bfloat16 psums of an MoE or a pipeline on more than one device.
+    "precision": "precision(compute=float32)",
 }
 
 

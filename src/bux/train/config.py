@@ -309,7 +309,7 @@ class PrecisionConfig(Config):
     the run's id."""
 
     type: Literal["precision"] = "precision"
-    compute: Literal["float32", "bfloat16"] = "float32"
+    compute: Literal["float32", "bfloat16"] = "bfloat16"
     matmuls: str = "compute"  # a format of bux.architecture.matmuls: mxfp8, nvfp4
 
 
@@ -370,7 +370,7 @@ class MethodsConfig(Config):
     remat: Annotated[str, BeforeValidator(_named_none)] = "none"
     pipeline: str = "gpipe"
     rounds: Positive = 1  # times a circular pipeline sends a microbatch round
-    orthogonalize: str = "gspmd"  # how Muon reaches whole matrices
+    orthogonalize: str = "owner"  # how Muon reaches whole matrices
     loss: str = "logits"  # how the loss takes a head's logits: whole, or by chunks
     microbatches: Positive = 1
     # A step's new state takes the old one's memory: a lower peak, in fewer pieces.

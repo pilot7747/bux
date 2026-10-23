@@ -74,7 +74,7 @@ id          params  tokens  tok/param  flops/tok  gpus  ...  run
 | `checkpoint` | `checkpoint(every=..., keep=...)`, or `none`           | `none`         |
 | `log`        | `log(every=...)`                                       | `log`          |
 | `profile`    | `profile(start=..., steps=...)`: a trace of `steps` steps after step `start`, or `none` | `none` |
-| `precision`  | `precision(compute=bfloat16, matmuls=mxfp8)`: the dtype forward and backward compute in, parameters staying float32, and the format block projections multiply in | `precision`: `float32`, `compute` |
+| `precision`  | `precision(compute=bfloat16, matmuls=mxfp8)`: the dtype forward and backward compute in, parameters staying float32, and the format block projections multiply in | `precision`: `bfloat16`, `compute` |
 | `mesh`       | `mesh(data=..., fsdp=..., tensor=...)`: the device grid | `mesh`: every device on `data` |
 | `layout`     | `layout(...)`: which mesh axes each named dimension splits over | `layout` |
 | `methods`    | `methods(attention=..., moe=..., microbatches=...)`: how what communicates is computed, and the microbatches a step takes its batch in | `methods` |

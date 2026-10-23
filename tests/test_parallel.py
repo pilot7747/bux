@@ -248,6 +248,7 @@ TRAIN = [
     "seq_len = 16",
     "batch = 8",
     "steps = 3",
+    "precision = precision(compute=float32)",  # splits compare to 1e-5
 ]
 
 

@@ -22,6 +22,8 @@ model = embed "DA"^2 norm head(tied=true)
 
 data      = synthetic
 optimizer = adamw(lr=1e-3)
+# XLA:CPU cannot compile the experts' and the pipeline's bfloat16 psums.
+precision = precision(compute=float32)
 seq_len   = 64
 batch     = 16
 steps     = 10

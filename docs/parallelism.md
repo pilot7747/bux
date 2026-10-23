@@ -618,12 +618,12 @@ method:
 
 | method   | what it does                                                                 |
 |----------|------------------------------------------------------------------------------|
-| `gspmd`  | Newton-Schulz on whatever shards the compiler gives each update; the default |
+| `gspmd`  | Newton-Schulz on whatever shards the compiler gives each update              |
 | `gather` | each update whole in a `jax.shard_map` for Newton-Schulz, and back on its parameter's shards after |
-| `owner`  | each matrix whole on one device, its owner, which runs its matrices of a shape as one batch |
+| `owner`  | each matrix whole on one device, its owner, which runs its matrices of a shape as one batch; the default |
 
 ```
-methods = methods(orthogonalize=owner)
+methods = methods(orthogonalize=gather)
 ```
 
 Under `gather`, a stack of matrices (the experts) is whole matrix by matrix, and its
@@ -851,13 +851,13 @@ taps)` runs any stack of them, such as a pipeline stage's share.
 ## Precision and microbatches
 
 ```
-precision = precision(compute=bfloat16)   # in the run's id
+precision = precision(compute=float32)    # in the run's id; bfloat16 by default
 methods   = methods(microbatches=4)       # gradient accumulation: not in it
 ```
 
 Unlike the settings above, `precision` changes what a run computes, so it is in the
 run's id: `precision.compute = float32 | bfloat16` is a sweep of two runs. `compute` is
-`float32` or `bfloat16`; float16 would need loss scaling. `matmuls` is the format the
+`bfloat16`, the default, or `float32`; float16 would need loss scaling. `matmuls` is the format the
 projections inside blocks multiply in, `compute` unless it says `mxfp8` or `nvfp4`.
 
 ### Precision
@@ -889,9 +889,10 @@ add up over microbatches in float32.
 XLA:CPU fails to compile a bfloat16 `psum` that a `shard_map`'s transpose makes (its
 reducer ends in a copy, which `ChangeOpDataType` cannot clone), and aborts the process.
 The MoE's `sorted` and EP methods make one on more than one device, and so do the
-pipelines; `ring`, `ulysses` and `pass_state` train in bfloat16 on CPU. The tests split
-bfloat16 runs with `methods(moe=dense)` and no pipeline. GPUs all-reduce bfloat16
-natively, which this has not been run on.
+pipelines; `ring`, `ulysses` and `pass_state` train in bfloat16 on CPU. A run that
+would make one says so before it compiles: on a CPU, such runs set
+`precision(compute=float32)`, as `laptop.bux` does, or split an MoE by
+`methods(moe=dense)`. GPUs all-reduce bfloat16 natively.
 
 ### Matmul formats
 

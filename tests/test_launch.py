@@ -304,6 +304,7 @@ def test_two_processes_train_as_one_does_and_a_signal_to_either_stops_both(tmp_p
         "mesh = mesh(fsdp=8)",
         "log = log(every=1)",
         "checkpoint = checkpoint(every=100)",
+        "precision.compute = float32",  # bfloat16 rounds apart between splits
     )
     [run] = compile_runs(SMOKE.read_text(), filename=str(SMOKE), overrides=settings)
     out = tmp_path / "two"

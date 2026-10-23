@@ -347,6 +347,7 @@ def train(
     log = _log(run, lr_schedule(config.optimizer.lr, multiplier))
     with parallel.use(config.mesh, config.layout, config.methods):
         parallel.check(config.batch, config.seq_len)
+        _check_cpu_bfloat16(run)
         model = parallel.build(lambda: Model(run.arch, rngs=nnx.Rngs(config.seed)))
         tx = optimizer(config.optimizer, multiplier, model, config.clip)
         trainer = Trainer(
@@ -375,6 +376,28 @@ def train(
             ],
         )
     return latest.metrics
+
+
+def _check_cpu_bfloat16(run: ir.Run) -> None:
+    """Raise where XLA:CPU would abort: it cannot compile a bfloat16 psum that a
+    shard_map's transpose makes, as the MoE's methods but `dense` and the pipelines do
+    on more than one device."""
+    on, config = parallel.active(), run.train
+    if config.precision.compute != "bfloat16" or jax.default_backend() != "cpu":
+        return
+    if on is None or on.mesh.size == 1:
+        return
+    moe = any(layer.config.type == "moe" for layer in run.arch.layers())
+    if moe and config.methods.moe != "dense":
+        what = f"an MoE by methods(moe={config.methods.moe})"
+    elif parallel.pipeline.pipelined():
+        what = "a pipeline"
+    else:
+        return
+    raise ValueError(
+        f"XLA:CPU cannot train {what} in bfloat16 on more than one device: set "
+        "precision(compute=float32), or methods(moe=dense) for an MoE"
+    )
 
 
 def _accumulated(microbatches: int) -> int:
