@@ -152,8 +152,6 @@ class Held(NamedTuple):
     residuals: list[Shaped[Array, "k ..."]]  # each forward's vjp, until its backward
     firsts: list[Shaped[Array, "k ..."]]  # the vjp of the part before, on stage 0
     weights: list[Shaped[Array, "k ..."]]  # what a split backward leaves W
-    lasts: list[Shaped[Array, "k ..."]]  # split: the vjp of the part after, last stage
-    later: list[Shaped[Array, "k ..."]]  # split: what its backward leaves W
     rest: PyTree  # the layers' state
     kept: PyTree  # the rest of the model's, which the part before changes
     losses: Float[Array, "l k"]  # what the layers reported, summed over microbatches
@@ -170,7 +168,6 @@ class Shapes(NamedTuple):
     x: jax.ShapeDtypeStruct
     first: VJP
     stage: VJP
-    last: VJP
     losses: jax.ShapeDtypeStruct
     metrics: dict[str, jax.ShapeDtypeStruct]
 
@@ -217,7 +214,6 @@ class Ticks:
         self.rows_apart = int(np.prod([jax.lax.axis_size(a) for a in apart]))
         self.shapes: Shapes | None = None
         self.split: split.Split | None = None
-        self.last_split: split.Split | None = None
 
     # --- The parts, on one microbatch ---------------------------------------------
 
@@ -259,27 +255,14 @@ class Ticks:
         (d_others, dy), metrics = grad(self.others, y)
         return metrics, d_others, dy
 
-    def scored_vjp(self, rows: PyTree, y: Stream) -> tuple[Metrics, Vjp]:
-        """Run the part after the repeat on the stage's output, to the loss: its
-        metrics, and the vjp that takes the loss back to the parameters outside the
-        repeat and to `y`."""
-
-        def loss(others: PyTree, y: Stream) -> tuple[Float[Array, ""], Metrics]:
-            return self.parts.last(others, self.kept, rows, y)
-
-        _, vjp, metrics = jax.vjp(
-            loss, self.others, y, has_aux=True, saveable_args=(False, True)
-        )
-        return metrics, vjp
-
     def trace(self, rest: PyTree) -> Shapes:
         """Trace the parts on microbatch 0, for the shapes of what they leave."""
 
         def parts(rest: PyTree, rows: PyTree) -> tuple:
             x, first, _ = self.embedded(self.kept, rows)
             y, losses, vjp, _ = self.staged(rest, rows, x)
-            metrics, last = self.scored_vjp(rows, y)
-            return x, first, vjp, last, losses, metrics
+            metrics, _, _ = self.scored(rows, y)
+            return x, first, vjp, losses, metrics
 
         return Shapes(*jax.eval_shape(parts, rest, _at(self.rows, 0)))
 
@@ -290,10 +273,7 @@ class Ticks:
         and the rest of the model's state, `kept`."""
         shapes = self.shapes = self.trace(rest)
         self.split = self._split() if self.table.split else None
-        self.last_split = self._split_last() if self.table.split else None
         saved = self.split.shapes if self.split else []
-        lasts = jax.tree.leaves(shapes.last) if self.split else []
-        later = self.last_split.shapes if self.last_split else []
 
         def buffer(a: jax.ShapeDtypeStruct, name: str) -> Shaped[Array, "k ..."]:
             spare = name in SENT
@@ -309,8 +289,6 @@ class Ticks:
             residuals=[buffer(a, "residuals") for a in jax.tree.leaves(shapes.stage)],
             firsts=[buffer(a, "residuals") for a in jax.tree.leaves(shapes.first)],
             weights=[buffer(a, "weights") for a in saved],
-            lasts=[buffer(a, "residuals") for a in lasts],
-            later=[buffer(a, "weights") for a in later],
             rest=rest,
             kept=kept,
             losses=zeros(shapes.losses),
@@ -346,8 +324,7 @@ class Ticks:
             losses=held.losses + losses,
             out=y,
         )
-        score = self._score if self.split is None else self._score_later
-        return jax.lax.cond(self.index == self.last, score, _keep, held, j, y)
+        return jax.lax.cond(self.index == self.last, self._score, _keep, held, j, y)
 
     def _embed(
         self, held: Held, j: Int[Array, ""], rows: PyTree
@@ -372,18 +349,11 @@ class Ticks:
             metrics=_added(held.metrics, metrics),
         )
 
-    def _score_later(self, held: Held, j: Int[Array, ""], y: Stream) -> Held:
-        metrics, vjp = self.scored_vjp(_at(self.rows, j), y)
-        lasts = _put(held.lasts, self.slot("residuals", j), jax.tree.leaves(vjp))
-        return held._replace(lasts=lasts, metrics=_added(held.metrics, metrics))
-
     def backward(self, held: Held, j: Int[Array, ""]) -> Held:
         """Take microbatch `j`'s gradient back through this stage, from its slot of
         residuals, and on the first stage on to the embedding. Where the table splits
         the backward, take the input's gradient alone, and keep what the weights'
-        needs for ``weights``: on the last stage, the head's first."""
-        if self.split is not None:
-            held = jax.lax.cond(self.index == self.last, self._unscore, _keep, held, j)
+        needs for ``weights``."""
         slot = self.slot("residuals", j)
         residuals = _at(held.residuals, slot)
         dy = _at(held.cotangents, self.slot("cotangents", j))
@@ -411,31 +381,7 @@ class Ticks:
         params = jax.tree.leaves(self.params)
         flat = self.split.weights(*params, *residuals, saved)
         d_params = jax.tree.unflatten(jax.tree.structure(self.params), flat)
-        held = held._replace(grads=_added(held.grads, d_params))
-        return jax.lax.cond(self.index == self.last, self._head, _keep, held, j)
-
-    def _unscore(self, held: Held, j: Int[Array, ""]) -> Held:
-        """Take microbatch `j`'s loss back to the stream leaving the last stage, and
-        keep what the gradient of the head's weights needs for ``_head``."""
-        assert self.last_split is not None
-        lasts = _at(held.lasts, self.slot("residuals", j))
-        one = jnp.ones((), jnp.float32)
-        (dy,), saved = self.last_split.inputs(
-            *jax.tree.leaves(self.others), *lasts, one
-        )
-        return held._replace(
-            cotangents=_put(held.cotangents, self.slot("cotangents", j), dy),
-            later=_put(held.later, self.slot("weights", j), saved),
-        )
-
-    def _head(self, held: Held, j: Int[Array, ""]) -> Held:
-        """Take microbatch `j`'s loss on to the weights of the part after the repeat."""
-        assert self.last_split is not None
-        saved = _at(held.later, self.slot("weights", j))
-        lasts = _at(held.lasts, self.slot("residuals", j))
-        flat = self.last_split.weights(*jax.tree.leaves(self.others), *lasts, saved)
-        d_others = jax.tree.unflatten(jax.tree.structure(self.others), flat)
-        return held._replace(others=_added(held.others, d_others))
+        return held._replace(grads=_added(held.grads, d_params))
 
     def _vjp(self, residuals: list[Array]) -> Vjp:
         """Return this stage's vjp, rebuilt from a slot's `residuals`."""
@@ -461,25 +407,6 @@ class Ticks:
         free = [_shape(a) for a in [*params, *residuals]]
         cotangents = [_shape(shapes.x), _shape(shapes.losses)]
         return split.split(backward, free, cotangents, weights=len(params))
-
-    def _split_last(self) -> split.Split:
-        """Return the backward of the part after the repeat split in two: the stream's
-        gradient and what the weights' needs, then the weights', which reads the
-        parameters and the slot of residuals itself."""
-        shapes = self.shapes
-        assert shapes is not None
-        others = jax.tree.leaves(self.others)
-        tree = jax.tree.structure(self.others)
-
-        def backward(*args: Array) -> list[Array]:
-            o, (*r, one) = args[: len(others)], args[len(others) :]
-            vjp = _rebuilt(shapes.last, r, jax.tree.unflatten(tree, o))
-            d_others, dy = vjp(one)
-            return [*jax.tree.leaves(d_others), dy]
-
-        free = [_shape(a) for a in [*others, *jax.tree.leaves(shapes.last)]]
-        one = jax.ShapeDtypeStruct((), jnp.float32)
-        return split.split(backward, free, [one], weights=len(others))
 
     def _unembed(self, held: Held, slot: Int[Array, ""], dx: Stream) -> Held:
         assert self.shapes is not None

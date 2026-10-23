@@ -1450,8 +1450,8 @@ number.
   on the critical path, and `W` the weights' later, in a tick the stage would idle.
   Stage s runs S − s forwards, then a backward, the weights of the microbatch s before
   it, and a forward, in turn (ZB-H1 of Qi et al., "Zero Bubble Pipeline Parallelism"):
-  every stage holds S microbatches' residuals and S of what `W` reads, and the stages
-  idle S − 1 ticks of 3M + S − 1.
+  every stage holds S microbatches' residuals, each until its `W`, and S of what `B`
+  leaves `W`, and the stages idle S − 1 ticks of 3M + S − 1.
 
 `bux.parallel.split` splits a backward by its equations: those that lead to the
 input's gradient run in `B` and hand those that lead only to the weights' the values
@@ -1476,12 +1476,55 @@ the router bias moves once a step, as under gpipe. A layer outside the repeat th
 learns from the whole batch, as an MoE's router does, is an error: it would learn a
 microbatch at a time. Gathered once and reduced once work as for gpipe: the
 parameters come in cast to `compute` and gathered, and where the rows are apart each
-device runs its own and every gradient sums over the rows' axes once, at the end. A
-forward alone, an eval's, runs gpipe's.
+device runs its own and every gradient sums over the rows' axes once, at the end. As
+every gradient sums in float32 as it leaves, `precision(reduce=float32)` is no error
+here. A forward alone, an eval's, runs gpipe's.
 
 Each kind of op runs under a `lax.cond` of its own: in one `lax.switch` of them all,
 XLA copied every buffer that one op writes and another reads in each branch, a tick
-at a time (job 1 below ran so).
+at a time, and on B300s `1f1b` on `stage=2, fsdp=4` ran at 534k tokens a second with
+a peak of 40.4 GiB so, against 673k and 24.6 GiB with a cond each.
+
+On one node of 8 B300s, the 1.3B dense model of [Gathered once](#gathered-once-reduced-once-methodsgather-methodsaccumulate)
+(16 Llama blocks, a vocabulary of 128k), 64 rows of 4096 a step in bfloat16,
+`repeat=scan, microbatches=8`, tokens a second and the peak memory of a GPU:
+
+| mesh             | `methods.pipeline`                 | tok/s | peak      |
+|------------------|------------------------------------|-------|-----------|
+| `stage=2, fsdp=4` | `gpipe`                           | 625k  | 97.8 GiB  |
+|                  | `circular`, `rounds=2`             | 643k  | 95.2 GiB  |
+|                  | `"1f1b"`                           | 673k  | 24.6 GiB  |
+|                  | `"1f1b"`, `stages=[10, 6]`         | 697k  | 33.6 GiB  |
+|                  | `"zbh1"`                           | 594k  | 28.8 GiB  |
+| `stage=4, fsdp=2` | `gpipe`                           | 508k  | 117.9 GiB |
+|                  | `circular`, `rounds=2`             | 536k  | 111.1 GiB |
+|                  | `"1f1b"`                           | 507k  | 49.5 GiB  |
+|                  | `"1f1b"`, `stages=[5, 5, 5, 1]`    | 613k  | 60.6 GiB  |
+|                  | `"zbh1"`                           | 467k  | 53.8 GiB  |
+
+The last stage runs the head, which at a vocabulary of 128k is as much work as 4.7
+blocks' forward, so with as many blocks as the others it is the slowest stage, and
+the others wait for it: in a profile of `1f1b` on `stage=2` the first stage's GPUs
+spend 124 ms of a 400 ms step waiting in a send, and the last stage's 202 ms in
+GEMMs, against the first's 137. Fewer blocks on it take that back: on 4 stages the
+head is nearly a stage's work, and `stages=[5, 5, 5, 1]` runs 21% faster than gpipe
+on half its memory. At 16 microbatches the gap grows: on `stage=4`, 652k tokens a
+second at 32.0 GiB against gpipe's 521k at 117.8 GiB, and on `stage=2, stages=[10,
+6]`, 651k at 16.9 GiB against 578k at 107.1 GiB.
+
+`zbh1` is slower here than `1f1b`, and no faster on uneven stages: `B` writes out
+what `W` reads, and `W` reads it back, and on `stage=2` a step spends 48 ms of 461 in
+copies, against 25 of 400 under `1f1b`; at 8 microbatches the bubble it saves is
+smaller than that. Splitting the head's backward too, its input's gradient into the
+last stage's `B` and its weights' into its `W`, balanced the stages but ran no faster
+(543k on `stage=2, stages=[10, 6]`, 482k on `stage=4, stages=[5, 5, 5, 1]`), and
+held the head's residuals, a microbatch's logits, in a slot of each stage, as every
+stage runs one program (113 GiB on 4 stages): so the head's backward stays whole, in
+the last stage's forward. Reduced once (`accumulate=unreduced`), `1f1b` runs as fast
+(676k on `stage=2`) and `zbh1` slower (467k). With GEMM autotuning off
+and deterministic ops, `gpipe`, `1f1b` and `zbh1`, on even stages and uneven, give
+the same loss at the first step, and within 7e-4 at the tenth, on a loss falling
+0.07 a step.
 
 ### Uneven stages: `methods.stages`
 
@@ -1509,5 +1552,4 @@ layers stack by chunk as `circular` stacks rounds, the second in the stages' rev
 order; each chunk sends its way, four ppermutes a tick; and an op `FB` runs a
 forward and a backward in one branch, where XLA's scheduler can overlap them. The
 embedding and the head then both sit on device 0, at the two ends of the V. It pays
-where an MoE's all-to-all is exposed; a dense model loses nothing to `zbh1`'s one
-chunk.
+where an MoE's all-to-all is exposed, which `1f1b` and `zbh1` do not hide.
