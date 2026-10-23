@@ -1539,35 +1539,38 @@ gathered once; else each microbatch's gradient reduces as the backward makes it,
 onto its shards, which over NVLink is faster (below). `accumulate=unreduced` where it
 would not compute the same is an error that says why.
 
-A step of 8 microbatches then moves what a step of 1 does. In the compiled step of
-`fsdp=8`, each collective counted as many times as the loops around it run
+Unreduced, a step of 8 microbatches then moves what a step of 1 does. In the compiled
+step of `fsdp=8`, each collective counted as many times as the loops around it run
 (`tests/test_gather.py`), for the dense 1.3B of `docs/training.md` on B300s, 64 rows
-of 4096:
+of 4096. On one node `accumulate=auto` reduces each microbatch (that row's loss by
+chunks):
 
 | methods                                        | all-gathers     | reduce-scatters |
 |------------------------------------------------|-----------------|-----------------|
 | `microbatches=1`                               | 66, 2.68 GiB    | 9, 2.68 GiB     |
 | `microbatches=8, gather=layer, accumulate=reduced` | 528, 21.5 GiB | 72, 21.5 GiB  |
-| `microbatches=8`                               | 66, 2.68 GiB    | 9, 2.68 GiB     |
+| `microbatches=8`, on one node                  | 66, 2.68 GiB    | 72, 25.9 GiB    |
+| `microbatches=8, accumulate=unreduced`         | 66, 2.68 GiB    | 9, 2.68 GiB     |
 | `repeat=scan, microbatches=8, gather=layer, accumulate=reduced` | 1048, 34.1 GiB | 152, 21.5 GiB |
-| `repeat=scan, microbatches=8`                  | 10, 2.68 GiB    | 7, 2.68 GiB     |
+| `repeat=scan, microbatches=8, accumulate=unreduced` | 10, 2.68 GiB | 7, 2.68 GiB     |
 
 Tokens a second and the peak memory of a GPU, on one node of 8 B300s, the same run,
-20 steps:
+20 steps, the loss by logits (by chunks, the default, `microbatches=1` takes 1122k in
+38.9 GiB):
 
 | mesh, methods                                      | tok/s | peak     |
 |----------------------------------------------------|-------|----------|
 | `fsdp=8`, `microbatches=1`                         | 1147k | 58.5 GiB |
 | `fsdp=8`, `microbatches=8, gather=layer, accumulate=reduced` | 817k | 11.9 GiB |
-| `fsdp=8`, `microbatches=8, accumulate=reduced`     | 925k  | 11.6 GiB |
-| `fsdp=8`, `microbatches=8`                         | 907k  | 15.7 GiB |
+| `fsdp=8`, `microbatches=8` (reduced each microbatch) | 925k | 11.6 GiB |
+| `fsdp=8`, `microbatches=8, accumulate=unreduced`   | 907k  | 15.7 GiB |
 | `fsdp=8`, `repeat=scan, microbatches=8, gather=layer, accumulate=reduced` | 719k | 10.2 GiB |
-| `fsdp=8`, `repeat=scan, microbatches=8`            | 803k  | 15.7 GiB |
+| `fsdp=8`, `repeat=scan, microbatches=8, accumulate=unreduced` | 803k | 15.7 GiB |
 | `fsdp=2, tensor=4`, `layout(stream=tensor)`, `microbatches=8, gather=layer, accumulate=reduced` | 647k | 11.9 GiB |
-| `fsdp=2, tensor=4`, `layout(stream=tensor)`, `microbatches=8` | 640k | 12.9 GiB |
+| `fsdp=2, tensor=4`, `layout(stream=tensor)`, `microbatches=8, accumulate=unreduced` | 640k | 12.9 GiB |
 | `stage=2, fsdp=4`, `repeat=scan, microbatches=8, gather=layer, accumulate=reduced` | 660k | 88.3 GiB |
-| `stage=2, fsdp=4`, `repeat=scan, microbatches=8, accumulate=reduced` | 640k | 97.8 GiB |
-| `stage=2, fsdp=4`, `repeat=scan, microbatches=8`   | 644k  | 97.8 GiB |
+| `stage=2, fsdp=4`, `repeat=scan, microbatches=8` (reduced each tick) | 640k | 97.8 GiB |
+| `stage=2, fsdp=4`, `repeat=scan, microbatches=8, accumulate=unreduced` | 644k | 97.8 GiB |
 
 Over NVLink, gathering once is the gain: XLA overlaps a reduce-scatter a microbatch
 with the backward, and adding up unreduced reads and writes a float32 copy of every
@@ -1582,11 +1585,11 @@ NICs, as between nodes:
 | `fsdp=8`, `microbatches=1`, `precision(reduce=float32)`            | 976k  |
 | `fsdp=8`, `microbatches=8, gather=layer, accumulate=reduced`       | 358k  |
 | `fsdp=8`, `microbatches=8, accumulate=reduced`                     | 500k  |
-| `fsdp=8`, `microbatches=8`                                         | 738k  |
+| `fsdp=8`, `microbatches=8, accumulate=unreduced`                   | 738k  |
 | `fsdp=8`, `microbatches=8`, `precision(reduce=float32)`            | 699k  |
 | `stage=2, fsdp=4`, `repeat=scan, microbatches=8, gather=layer, accumulate=reduced` | 464k |
 | `stage=2, fsdp=4`, `repeat=scan, microbatches=8, accumulate=reduced` | 521k |
-| `stage=2, fsdp=4`, `repeat=scan, microbatches=8`                   | 566k  |
+| `stage=2, fsdp=4`, `repeat=scan, microbatches=8, accumulate=unreduced` | 566k |
 
 So `gather=step` is the default, and `accumulate=auto` adds up unreduced only where the
 rows' axes span processes, as between nodes. With deterministic GEMMs the three dense runs

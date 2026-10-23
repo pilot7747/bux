@@ -481,9 +481,10 @@ where it ran at 5.85k before; at 16k, 10.2k against 8.65k. MLA keeps its latents
 34.1k in 41.2 GiB, against 30.1k in 51.5 before.
 
 A thread loads the next two batches as a step runs (`prefetch`). A step's new state
-takes the old one's memory (`methods.donate`): the 1.3B's step peaks at 70.6 GiB
-instead of 81.3 on one GPU, and it trains 36 rows a GPU, which run out of memory
-without ([Donation](parallelism.md#donation-methodsdonate)).
+takes the old one's memory (`methods.donate`): the 1.3B's step, its loss by logits,
+peaks at 70.6 GiB instead of 81.3 on one GPU (51.1 by chunks, the default), and it
+trains 36 rows a GPU, which run out of memory without
+([Donation](parallelism.md#donation-methodsdonate)).
 
 bux sets one XLA flag of its own (`bux/runtime.py`), for expert parallelism:
 `--xla_gpu_experimental_ragged_all_to_all_use_barrier_with_nccl=false`, without which
@@ -545,9 +546,10 @@ Which projections multiply in `mxfp8`, on one B300 ([Precision](#precision)):
 | `nvfp4, first=2, last=8`              | 167k  | 46.1 GiB    |
 | `nvfp4`                               | 179k  | 43.8 GiB    |
 
-The `nvfp4` rows are of a later tree, where a step donates its state: bfloat16 there
-147k in 51.1 GiB, `mxfp8` 169k in 46.9. Its first 2 and last 8 branches in bfloat16
-leave NVIDIA's recipe as fast as `mxfp8`; NVFP4 everywhere is 1.06x it.
+The other rows take the loss by logits; the `nvfp4` rows are of a later tree, which
+takes it by chunks (`methods.loss`): bfloat16 there 147k in 51.1 GiB, `mxfp8` 169k in
+46.9. Its first 2 and last 8 branches in bfloat16 leave NVIDIA's recipe as fast as
+`mxfp8`; NVFP4 everywhere is 1.06x it.
 
 k and v in bfloat16 are slower, not faster: q still quantizes x, the copy all three
 shared, and k's and v's GEMMs then run at bfloat16's rate, x kept for them too. Over 8
