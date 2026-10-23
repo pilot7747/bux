@@ -54,6 +54,9 @@ Routed = tuple[Float[Array, "b t d"], Float[Array, ""]]
 Body = Callable[..., Routed]
 # jax.lax.ragged_all_to_all's signature: another exchange is a function.
 Exchange = Callable[..., Shaped[Array, "m d"]]
+# The pieces a ragged exchange sends in, at least: XLA's one-shot kernel on a node
+# copies each with one block of 128 threads, ~90 GB/s with 64 on 8 B300s.
+PIECES = 2048
 
 
 def method(body: Body) -> Callable[..., Float[Array, "b t d"]]:
@@ -135,11 +138,17 @@ def gathered(
     norm: Rows | None,
 ) -> Routed:
     """Gather the group's tokens onto each of its devices, run each device's experts
-    on them, and reduce-scatter the sums back."""
-    first = jax.lax.axis_index(axes) * kernels[0].shape[0]
+    on them, and reduce-scatter the sums back. A device runs `methods.capacity` times
+    the picks it has, its last experts' first dropped."""
+    t, d, local = z.shape[1], z.shape[2], kernels[0].shape[0]
+    peers, first = jax.lax.axis_size(axes), jax.lax.axis_index(axes) * local
+    room = _rows(idx.size, peers, _capacity())
     group = functools.partial(jax.lax.all_gather, axis_name=axes, tiled=True)
-    y = routed(group(z), group(idx) - first, group(weights), *kernels, ffn, norm)
-    return jax.lax.psum_scatter(y, axes, tiled=True), jnp.zeros(())
+    x, picks, chosen = group(z), group(idx) - first, group(weights)
+    y, ran = _run_first(x, picks, chosen, kernels, ffn, norm, room)
+    mine = ((picks >= 0) & (picks < local)).sum()
+    summed = jax.lax.psum_scatter(y.reshape(-1, t, d), axes, tiled=True)
+    return summed, (mine - ran) / idx.size
 
 
 # --- all_to_all ------------------------------------------------------------------------
@@ -265,6 +274,34 @@ def _buffer(rows: int, like: Shaped[Array, "*s d"]) -> Shaped[Array, "rows d"]:
     return jax.lax.empty((rows, like.shape[-1]), like.dtype)
 
 
+def _in_pieces(slices: Ragged, parts: int) -> Ragged:
+    """Return the same exchange, each slice cut into `parts` pieces in a row."""
+    at = jnp.arange(parts)
+
+    def cut(sizes: Int[Array, " s"]) -> tuple[Int[Array, "s p"], Int[Array, "s p"]]:
+        piece = (sizes[:, None] + parts - 1) // parts
+        starts = jnp.minimum(at * piece, sizes[:, None])
+        return starts, jnp.minimum(piece, sizes[:, None] - starts)
+
+    starts, sizes = cut(slices.send_sizes)
+    received = cut(slices.recv_sizes)[1]
+    return Ragged(
+        (slices.input_offsets[:, None] + starts).reshape(-1),
+        sizes.reshape(-1),
+        (slices.output_offsets[:, None] + starts).reshape(-1),
+        received.reshape(-1),
+    )
+
+
+def _exchanged(
+    exchange: Exchange, x: Shaped[Array, "n e"], rows: int, slices: Ragged, axes: Axes
+) -> Shaped[Array, "rows e"]:
+    """Return what `slices` send of x, in `rows` rows. XLA's kernel copies each slice
+    with one block of threads, so the slices go in PIECES pieces in all."""
+    parts = max(1, PIECES // slices.send_sizes.size)
+    return exchange(x, _buffer(rows, x), *_in_pieces(slices, parts), axis_name=axes)
+
+
 def ragged(
     z: Float[Array, "b t d"],
     idx: Int[Array, "b t k"],
@@ -290,11 +327,10 @@ def ragged(
     slices = _slices(every, rows)
     sent = _dispatch(slices, starts[device], device)
     picks = pick_rows(z.reshape(-1, d), order, back, k)
-    arrived = exchange(picks, _buffer(rows, z), *sent, axis_name=axes)
+    arrived = _exchanged(exchange, picks, rows, sent, axes)
     made = experts(arrived, slices.kept[device].sum(1), *kernels, ffn, norm)
     theirs = jax.lax.dynamic_slice_in_dim(starts, device * local, local, axis=1)
-    combine = _combine(slices, theirs, device)
-    returned = exchange(made, _buffer(n, z), *combine, axis_name=axes)
+    returned = _exchanged(exchange, made, n, _combine(slices, theirs, device), axes)
     kept = _came_back(sent, idx.reshape(-1)[order])
     per_pick = permuted(jnp.where(kept[:, None], returned, 0), back, order)
     y = jnp.einsum("btkd,btk->btd", per_pick.reshape(*idx.shape, d), weights)
@@ -330,28 +366,26 @@ def _fit(sizes: Int[Array, " g"], rows: int) -> Int[Array, " g"]:
     return jnp.clip(rows - (jnp.cumsum(sizes) - sizes), 0, sizes)
 
 
-def _visited(
-    x: Float[Array, "v d"],
-    idx: Int[Array, "v k"],
-    weights: Float[Array, "v k"],
-    arrived: Int[Array, ""],
+def _run_first(
+    x: Float[Array, "*v d"],
+    idx: Int[Array, "*v k"],
+    weights: Float[Array, "*v k"],
     kernels: Kernels,
     ffn: cfg.MLPConfig,
     norm: Rows | None,
     room: int,
-) -> tuple[Float[Array, "v d"], Int[Array, ""]]:
-    """Return each of the first `arrived` tokens' sum of its picks' expert outputs,
-    weighted, as ``routed`` does, but of the first `room` picks by expert alone; and
-    how many picks ran."""
-    k, local = idx.shape[-1], kernels[0].shape[0]
-    came = (jnp.arange(x.shape[0]) < arrived)[:, None]
-    idx, weights = jnp.where(came, idx, local), jnp.where(came, weights, 0)
+) -> tuple[Float[Array, "m d"], Int[Array, ""]]:
+    """Return each row's sum of its picks' expert outputs, weighted, as ``routed``
+    does, but of the first `room` picks by expert alone, flat; and how many ran. A
+    pick outside the experts adds nothing, as in ``routed``."""
+    (d, k), local = (x.shape[-1], idx.shape[-1]), kernels[0].shape[0]
     order, sizes = sort_by_expert(idx, local)
     back = jnp.argsort(order)
     order, sizes = order[:room], _fit(sizes, room)
-    made = experts(pick_rows(x, order, back, k), sizes, *kernels, ffn, norm)
-    weighted = made * weights.reshape(-1)[order][:, None]
-    return sum_rows(weighted, back, order, k), sizes.sum()
+    rows = pick_rows(x.reshape(-1, d), order, back, k)
+    made = experts(rows, sizes, *kernels, ffn, norm)
+    kept = jnp.where((idx >= 0) & (idx < local), weights, 0).reshape(-1)
+    return sum_rows(made * kept[order][:, None], back, order, k), sizes.sum()
 
 
 def tokens(
@@ -383,16 +417,16 @@ def tokens(
     sent = _dispatch(slices, starts[device], device)
 
     def send(a: Shaped[Array, "n e"]) -> Shaped[Array, "rows e"]:
-        return exchange(a, _buffer(rows, a), *sent, axis_name=axes)
+        return _exchanged(exchange, a, rows, sent, axes)
 
     x = send(pick_rows(z.reshape(-1, d), order, back, k))
     choices = _picked_there(idx.reshape(-1, k), weights.reshape(-1, k), local)
     picked, chosen = (send(a[order]) for a in choices)
-    arrived = slices.kept[device].sum()
-    made, ran = _visited(x, picked, chosen, arrived, kernels, ffn, norm, room)
+    came = (jnp.arange(rows) < slices.kept[device].sum())[:, None]
+    picked, chosen = jnp.where(came, picked, local), jnp.where(came, chosen, 0)
+    made, ran = _run_first(x, picked, chosen, kernels, ffn, norm, room)
     theirs = jax.lax.dynamic_slice_in_dim(starts, device, 1, axis=1)
-    combine = _combine(slices, theirs, device)
-    returned = exchange(made, _buffer(n, z), *combine, axis_name=axes)
+    returned = _exchanged(exchange, made, n, _combine(slices, theirs, device), axes)
     gone = visit.reshape(-1)[order]  # where each visit went, sorted
     kept = (gone < peers) & _came_back(sent, gone)
     y = sum_rows(jnp.where(kept[:, None], returned, 0), back, order, k)

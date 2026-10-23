@@ -169,6 +169,15 @@ def test_the_ragged_methods_lower_on_cpu_forward_and_backward(method, exchanges)
     assert lowered.as_text().count("ragged_all_to_all") == exchanges
 
 
+def test_a_slice_in_pieces_is_sent_in_a_row_and_received_as_it_is_sent():
+    whole = experts.Ragged(*map(jnp.array, ([0, 5], [5, 2], [3, 0], [4, 1])))
+    cut = experts._in_pieces(whole, 3)
+    assert cut.input_offsets.tolist() == [0, 2, 4, 5, 6, 7]
+    assert cut.send_sizes.tolist() == [2, 2, 1, 1, 1, 0]
+    assert cut.output_offsets.tolist() == [3, 5, 7, 0, 1, 2]
+    assert cut.recv_sizes.tolist() == [2, 2, 0, 1, 0, 0]  # as the senders cut theirs
+
+
 def test_where_the_mesh_does_not_split_the_experts_a_method_sorts():
     e = layer(num_experts=6)  # expert=4 does not divide them
     x, _ = _inputs()
@@ -188,12 +197,13 @@ def test_tokens_that_do_not_split_over_the_experts_axes_are_an_error():
 
 GROUPED = "data=2, expert=4"  # two groups of 4 devices, a row of 4 tokens each
 RAGGEDS = [EMULATED, TOKENS]
+BOUNDED = ["all_gather", *RAGGEDS]  # the methods a capacity bounds
 
 
 def fits(
     idx: Int[np.ndarray, "b t k"], capacity: float, once: bool
 ) -> Bool[np.ndarray, "b t k"]:
-    """Which picks fit on GROUPED with `capacity`, as the ragged methods lay them
+    """Which picks fit on GROUPED with `capacity`, as the methods it bounds lay them
     out: on device j of a group, expert 0's picks from each of the group's devices in
     turn, then expert 1's, and so on, to `capacity` times the picks a device has.
     `once`, as ragged_tokens: of the tokens that visit it from each device in turn,
@@ -259,7 +269,7 @@ def masked(monkeypatch):
 
 
 @pytest.mark.parametrize("capacity", [0.5, 1.0])
-@pytest.mark.parametrize("method", RAGGEDS)
+@pytest.mark.parametrize("method", BOUNDED)
 def test_a_capacity_drops_the_picks_past_it_and_reports_their_share(
     masked, method, capacity
 ):
@@ -271,7 +281,7 @@ def test_a_capacity_drops_the_picks_past_it_and_reports_their_share(
     assert reported["dropped"] == pytest.approx(share)
 
 
-@pytest.mark.parametrize("method", RAGGEDS)
+@pytest.mark.parametrize("method", BOUNDED)
 def test_a_capacity_that_every_pick_fits_in_drops_none(method):
     y, grads, reported = _with_capacity(method, GROUPED, 4.0)  # all 4 peers' picks
     want, want_grads, nothing = _with_capacity("sorted", "one device", None)
