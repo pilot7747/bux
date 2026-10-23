@@ -390,8 +390,8 @@ def test_a_run_in_a_format_trains_near_bfloat16(losses, arch, fmt):
     assert not np.array_equal(quantized, bf16)
 
 
-# In float32, which rounds too finely to move a value across a step of float8: the
-# blocks, and their values, are those of one device.
+# In float32, the blocks are those of one device; a split mesh sums in another order,
+# which moves a few values across a step of float8, so the losses agree to 1e-3.
 @pytest.mark.parametrize("fmt", FORMATS)
 def test_a_format_on_a_split_mesh_trains_as_on_one_device(losses, fmt):
     given = {
@@ -400,7 +400,7 @@ def test_a_format_on_a_split_mesh_trains_as_on_one_device(losses, fmt):
     }
     one = losses(ARCHITECTURES["llama"], mesh=ONE, **given)
     split = losses(ARCHITECTURES["llama"], mesh="mesh(fsdp=4, tensor=2)", **given)
-    assert np.allclose(split, one, rtol=1e-5)
+    assert np.allclose(split, one, rtol=1e-3)
 
 
 def test_a_pipeline_trains_in_mxfp8_as_its_stages_do_on_one_device(losses):

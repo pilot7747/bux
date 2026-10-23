@@ -39,6 +39,7 @@ os.environ["XLA_FLAGS"] = runtime.xla_flags(
 
 import itertools
 import json
+import zlib
 from collections.abc import Callable, Iterator
 
 import jax
@@ -59,6 +60,18 @@ from bux.train.sinks import Sink
 from bux.train.trainer import train
 
 SPECIALS = ["<|endoftext|>", "<|im_start|>", "<|im_end|>"]
+
+
+def pytest_collection_modifyitems(config, items) -> None:
+    """With BUX_SHARD=i/n, as CI sets it, keep the tests whose id hashes to shard i of n,
+    so that n runners share the suite."""
+    shard = os.environ.get("BUX_SHARD")
+    if not shard:
+        return
+    i, n = map(int, shard.split("/"))
+    mine = [t for t in items if zlib.crc32(t.nodeid.encode()) % n == i]
+    config.hook.pytest_deselected(items=[t for t in items if t not in mine])
+    items[:] = mine
 
 
 def _byte_alphabet() -> dict[int, str]:
