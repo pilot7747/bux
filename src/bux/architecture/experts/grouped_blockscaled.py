@@ -224,7 +224,7 @@ def _contract(
 
 def dequantized(blocks: Blocks) -> Float[Array, "r c"]:
     """Return the values `blocks` hold, in float32: each times its block's scale."""
-    assert blocks.scale is None  # E4M3 with power-of-two scales: RECIPES
+    assert blocks.tensor_scale is None  # E4M3 with power-of-two scales: RECIPES
     scales = jnp.repeat(blocks.scales.astype(jnp.float32), BLOCK, axis=-1)
     return blocks.values.astype(jnp.float32) * scales
 

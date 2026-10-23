@@ -278,10 +278,10 @@ def test_nvfp4_tiles_quantize_w_as_its_transpose():
     w = jax.random.normal(jax.random.key(0), (64, 32))
 
     def dequantized(w: Float[Array, "r c"]) -> Float[Array, "r c"]:
-        q = blockscaled.nv_quantize(w, tiles=True)
+        q = nvfp4.quantize(w, tiles=True)
         scales = jnp.repeat(q.scales.astype(jnp.float32), 16, axis=1)
-        assert q.scale is not None
-        return q.values.astype(jnp.float32) * scales * q.scale
+        assert q.tensor_scale is not None
+        return q.values.astype(jnp.float32) * scales * q.tensor_scale
 
     assert jnp.array_equal(dequantized(w), dequantized(w.T).T)
     assert 0.05 < _error(dequantized(w), w) < 0.2
@@ -294,7 +294,7 @@ def test_nvfp4_rounds_gradients_stochastically_and_unbiased():
     rest = np.arange(64) % 16 != 0
 
     def values(stochastic: bool = False) -> Float[Array, "r c"]:
-        q = blockscaled.nv_quantize(x, stochastic=stochastic)
+        q = nvfp4.quantize(x, stochastic=stochastic)
         return q.values.astype(jnp.float32)[:, rest]
 
     assert jnp.unique(values()).size == 1
@@ -307,12 +307,12 @@ def test_stochastic_rounding_rounds_as_blackwells_conversion_does():
     # up to 8 bits, and its random byte add up to 1, so also where they fall just short.
     v = jnp.array([0.771353, -2.656003, -3.879317, 1.25, 1.25, 1.125, 1.125])
     byte = jnp.array([117, 88, 30, 127, 128, 191, 192])
-    rounded = blockscaled.round_stochastically(v, byte * 2.0**-8)
+    rounded = nvfp4.round_stochastically(v, byte * 2.0**-8)
     assert rounded.tolist() == [1.0, -3.0, -4.0, 1.0, 1.5, 1.0, 1.5]
 
 
 def test_the_hadamard_transform_is_orthogonal():
-    h = blockscaled.HADAMARD
+    h = nvfp4.HADAMARD
     assert np.allclose(h @ h.T, np.eye(16), atol=1e-6) and set(np.abs(h).flat) == {0.25}
 
 
@@ -349,11 +349,11 @@ def test_the_nvfp4_kernels_quantize_as_xla_does_on_any_split(spec, kind):
     with parallel.use(tcfg.MeshConfig(data=4, tensor=2)) as mesh:
         split = jax.device_put(x, NamedSharding(mesh, spec))
         kernel = jax.jit(lambda x, s: nvfp4.kernel_twice(x, s, **kind))(split, seed)
-    xla = blockscaled.nv_twice(x, seed, **kind)
+    xla = nvfp4.xla_twice(x, seed, **kind)
     for ours, theirs in zip(kernel, xla, strict=True):
         for a, b in [(ours.values, theirs.values), (ours.scales, theirs.scales)]:
             assert jnp.array_equal(a.astype(jnp.float32), b.astype(jnp.float32))
-        assert ours.scale == theirs.scale
+        assert ours.tensor_scale == theirs.tensor_scale
 
 
 def test_block_projections_multiply_in_the_format_and_the_router_and_head_in_compute():

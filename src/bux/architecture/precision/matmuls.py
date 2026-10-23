@@ -98,7 +98,7 @@ def seed() -> UInt32[Array, ""]:
 
 def _seed(tokens: Int[Array, "*s"]) -> UInt32[Array, ""]:
     positions = jnp.arange(tokens.size, dtype=jnp.uint32).reshape(tokens.shape)
-    return blockscaled.mix(tokens.astype(jnp.uint32) * (2 * positions + 1)).sum()
+    return nvfp4.mix(tokens.astype(jnp.uint32) * (2 * positions + 1)).sum()
 
 
 def late(precision: PrecisionConfig, steps: int) -> tuple[int, PrecisionConfig] | None:
