@@ -437,7 +437,7 @@ by itself where it cannot run, and all of them do inside `bux.kernels.off()` or 
 | Gated DeltaNet, DeltaNet | cuDNN's fused GDN kernel (`fused_delta`), by cuDNN's graph from a `buffer_callback`: any gate | 5x `chunkwise` |
 | KDA with `gate_lower_bound` | cuDNN's fused KDA kernel (`fused_delta`) | 10x `chunkwise` |
 | MoE experts | `grouped.ragged_dot`: tokamax's Mosaic and Triton kernels | 27x `jax.lax.ragged_dot` |
-| MoE dispatch | `pick_rows`, `permuted`: gathers where XLA would scatter | 4x |
+| MoE dispatch | `token_rows`, `permuted`: gathers where XLA would scatter | 4x |
 | NVFP4's quantizers | `nvfp4`: Pallas kernels, a pass for the largest magnitudes and one that writes both copies, rounded by Blackwell's E2M1 conversions | 3-5x |
 
 Tokens a second on B300s, 8 × 4096 tokens a GPU, `precision(compute=bfloat16)`, and

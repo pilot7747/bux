@@ -24,7 +24,7 @@ SIZES = jnp.array([70, 0, 100, 3, 77], jnp.int32)
 
 def test_the_kernel_sums_each_groups_rows():
     want = jax.lax.ragged_dot_general(X, Y, SIZES, grouped.RAGGED_CONTRACTING)
-    got = grouped._contract(X, Y, SIZES, 16, 16, interpret=True)
+    got = grouped._pallas_contract(X, Y, SIZES, 16, 16, interpret=True)
     np.testing.assert_allclose(got, want, rtol=1e-5, atol=1e-4)
 
 
@@ -32,10 +32,10 @@ def test_the_vjp_is_ragged_dots():
     def loss(f):
         return lambda x, w: jnp.sum(jnp.sin(f(x, w, SIZES)))
 
-    out = grouped._kernels(X, W, SIZES)
+    out = grouped._by_kernels(X, W, SIZES)
     np.testing.assert_allclose(out, jax.lax.ragged_dot(X, W, SIZES), atol=1e-5)
     assert bool((out[int(SIZES.sum()) :] == 0).all())
-    got = jax.grad(loss(grouped._kernels), (0, 1))(X, W)
+    got = jax.grad(loss(grouped._by_kernels), (0, 1))(X, W)
     want = jax.grad(loss(jax.lax.ragged_dot), (0, 1))(X, W)
     for a, b in zip(got, want, strict=True):
         np.testing.assert_allclose(a, b, rtol=1e-5, atol=1e-4)
