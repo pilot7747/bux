@@ -150,13 +150,7 @@ class Stage:
     ) -> tuple[Stream, nnx.State, Float[Array, "l n"]]:
         local = _stage_taps(rows, self.training)
         state = nnx.merge_state(params, rest)
-        if self.runs is None:
-            y, rest = stacked.run(
-                self.graphdef, state, self.layers, x, local, self.compute
-            )
-        else:
-            runs = jnp.asarray(self.runs)[jax.lax.axis_index(pipeline.AXIS)]
-            y, rest = _skipping(self.graphdef, state, runs, x, local, self.compute)
+        y, rest = self._run(state, x, local)
         losses = local.losses
         self.reports = [
             (a.name, a.weight) for a in losses[: len(losses) // self.layers]
@@ -164,6 +158,19 @@ class Stage:
         if not losses:
             return y, rest, jnp.zeros((self.layers, 0))
         return y, rest, jnp.stack([a.value for a in losses]).reshape(self.layers, -1)
+
+    def _run(self, state: nnx.State, x: Stream, taps: Taps) -> tuple[Stream, nnx.State]:
+        """Run the stage's layers: those every stage runs by a scan, and the others,
+        where `runs` gives them, each by a cond (``_skipping``)."""
+        every = self.layers if self.runs is None else int(self.runs.all(0).sum())
+        head = jax.tree.map(lambda a: a[:every], state)
+        y, rest = stacked.run(self.graphdef, head, every, x, taps, self.compute)
+        if every == self.layers:
+            return y, rest
+        tail = jax.tree.map(lambda a: a[every:], state)
+        runs = jnp.asarray(self.runs)[jax.lax.axis_index(pipeline.AXIS), every:]
+        y, more = _skipping(self.graphdef, tail, runs, y, taps, self.compute)
+        return y, jax.tree.map(lambda a, b: jnp.concatenate([a, b]), rest, more)
 
     def report(self, taps: Taps, losses: Float[Array, "r n k"]) -> None:
         """Add each layer's losses, of values `losses`, to `taps`."""

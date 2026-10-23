@@ -226,6 +226,7 @@ class _Cut:
     def staged(
         self, params: nnx.State, rest: nnx.State, x: Array, rows: _Micro
     ) -> tuple[Array, nnx.State, Float[Array, "l n"]]:
+        """Run a stage's share of the repeat on a microbatch, its documents apart."""
         positions, tokens = rows.batch.position_ids, rows.batch.input_ids
         local = pipelined.Rows(Segments.of(jnp.asarray(positions)), jnp.asarray(tokens))
         return self.stage(params, rest, x, local)
