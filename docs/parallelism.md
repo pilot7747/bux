@@ -966,8 +966,8 @@ Gradients add up over microbatches in float32. Over the rows' axes they are redu
 head kernel's under `methods(loss=chunks)`, which adds up over the chunks in float32);
 where a step adds its gradients up unreduced ([below](#gathered-once-reduced-once-methodsgather-methodsaccumulate)),
 each device's sum is rounded to it before the one reduction. In `float32` that
-reduction sums float32, twice the bytes, once a step; on B300s a step of one
-microbatch of the dense 1.3B trains 2% slower in it. `float32` changes what a run
+reduction sums float32, twice the bytes, once a step; on B300s, through the NICs, a
+step of the dense 1.3B trains 5% slower in it. `float32` changes what a run
 computes, so it is in the run's id, and a run that leaves `compute` keeps the id it
 had. It needs the step to add its gradients up unreduced, also at one microbatch: XLA
 reduces those of the backward in the dtype of the matmul that makes them, as it does
@@ -1150,8 +1150,25 @@ Tokens a second and the peak memory of a GPU, on one node of 8 B300s, the same r
 
 Over NVLink, gathering once is the gain: XLA overlaps a reduce-scatter a microbatch
 with the backward, and adding up unreduced reads and writes a float32 copy of every
-gradient a microbatch, as each device's own. With deterministic GEMMs the three dense
-runs of 8 microbatches end their 10 steps at 11.86792, 11.86793 (`reduced`) and
+gradient a microbatch, as each device's own. Between nodes the collectives are the
+cost. With NCCL kept off NVLink and shared memory (`NCCL_P2P_DISABLE=1
+NCCL_SHM_DISABLE=1`, and XLA's one-shot all-reduce off), every one goes through the
+NICs, as between nodes:
+
+| mesh, methods                                                      | tok/s |
+|--------------------------------------------------------------------|-------|
+| `fsdp=8`, `microbatches=1`                                         | 1030k |
+| `fsdp=8`, `microbatches=1`, `precision(reduce=float32)`            | 976k  |
+| `fsdp=8`, `microbatches=8, gather=layer, accumulate=reduced`       | 358k  |
+| `fsdp=8`, `microbatches=8, accumulate=reduced`                     | 500k  |
+| `fsdp=8`, `microbatches=8`                                         | 738k  |
+| `fsdp=8`, `microbatches=8`, `precision(reduce=float32)`            | 699k  |
+| `stage=2, fsdp=4`, `repeat=scan, microbatches=8, gather=layer, accumulate=reduced` | 464k |
+| `stage=2, fsdp=4`, `repeat=scan, microbatches=8, accumulate=reduced` | 521k |
+| `stage=2, fsdp=4`, `repeat=scan, microbatches=8`                   | 566k  |
+
+So `gather=step` and `accumulate=auto` are the defaults. With deterministic GEMMs the three dense runs
+of 8 microbatches on one node end their 10 steps at 11.86792, 11.86793 (`reduced`) and
 11.86804 (`unreduced`).
 
 The cost is memory: the gathered copy of the parameters in `compute`, and, unreduced,
