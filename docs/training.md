@@ -74,7 +74,7 @@ id          params  tokens  tok/param  flops/tok  gpus  ...  run
 | `checkpoint` | `checkpoint(every=..., keep=...)`, or `none`           | `none`         |
 | `log`        | `log(every=...)`                                       | `log`          |
 | `profile`    | `profile(start=..., steps=...)`: a trace of `steps` steps after step `start`, or `none` | `none` |
-| `precision`  | `precision(compute=bfloat16, matmuls=mxfp8)`: the dtype forward and backward compute in, parameters staying float32, and the format block projections multiply in | `precision`: `bfloat16`, `compute` |
+| `precision`  | `precision(compute=bfloat16, matmuls=mxfp8, reduce=float32)`: the dtype forward and backward compute in, parameters staying float32, the format block projections multiply in, and the dtype gradients are summed over the devices in | `precision`: `bfloat16`, `compute`, `compute` |
 | `mesh`       | `mesh(data=..., fsdp=..., tensor=...)`: the device grid | `mesh`: every device on `data` |
 | `layout`     | `layout(...)`: which mesh axes each named dimension splits over | `layout` |
 | `methods`    | `methods(attention=..., moe=..., microbatches=...)`: how what communicates is computed, and the microbatches a step takes its batch in | `methods` |
@@ -586,7 +586,10 @@ the layers that report the name, under that name; eval leaves them out.
 `train_step` and `eval_step` are what the trainer compiles, once; a subclass that
 overrides them changes what a step does (averaging the weights, skipping a spike) and
 keeps the loop, the hooks and checkpoints. Gradient accumulation is built in:
-`methods(microbatches=n)`.
+`methods(microbatches=n)`, which on a mesh gathers the parameters once a step and, where
+the rows are independent, reduces the gradients once (docs/parallelism.md, "Gathered
+once, reduced once"); `Trainer(..., gather=, accumulate=, reduce=)` takes the same
+settings.
 
 With `Trainer(..., donate=True)`, as a run's `methods.donate` makes it by default, a
 training step donates the model's and the optimizer's arrays: an array read from

@@ -379,6 +379,15 @@ def test_the_matmul_format_is_in_the_run_s_id_and_a_bfloat16_run_s_is_as_it_was(
     assert bf16.id == plain.id == "de94a2eb32"  # as before matmuls
 
 
+def test_the_reduce_dtype_is_in_the_run_s_id_and_a_run_that_leaves_it_is_as_it_was():
+    plain, f32 = compile_runs(
+        _source(f"precision = {BF16}", "precision.reduce = compute | float32")
+    )
+    assert f32.train.precision.reduce == "float32"
+    assert plain.id != f32.id and plain.name != f32.name
+    assert plain.id == "de94a2eb32"  # as before reduce
+
+
 def test_a_format_not_registered_is_an_error():
     trainer = _trainer(ARCHITECTURES["llama"], matmuls="mine")
     hint = r"no 'mine' matmul format yet; add one with @bux\.architecture\.matmuls"

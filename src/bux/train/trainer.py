@@ -225,8 +225,8 @@ class Trainer:
         self.model, self.objective = model, objective
         self.compute, self.microbatches = jnp.dtype(compute), microbatches
         self.matmuls, self.gather = matmuls, gather
-        self.reduce = jnp.dtype(compute if reduce is None else reduce)
-        self.reduces_once = self._reduces_once(model, accumulate)
+        self.reduce, self.accumulate = jnp.dtype(reduce or compute), accumulate
+        self.reduces_once = self._reduces_once(model)
         self.optimizer = nnx.Optimizer(model, tx, wrt=nnx.Param)
         parallel.shard_state(self.model, self.optimizer)
         self.step = 0
@@ -235,28 +235,30 @@ class Trainer:
         self._train = nnx.jit(self._train_step_on_shards, donate_argnames=donated)
         self._eval = nnx.jit(self.eval_step)
 
-    def _reduces_once(self, model: Model, accumulate: str) -> bool:
-        """Return whether a step adds up its gradients unreduced (``_unreduced``): as
-        `accumulate` says, and by "auto" where it has microbatches. Raise where it or
-        a `reduce` other than `compute` asks for it, but it would not compute the
-        same."""
+    def _reduces_once(self, model: Model) -> bool:
+        """Return whether a step adds up its gradients unreduced (``_unreduced``):
+        where `accumulate` or a `reduce` other than `compute` asks for it, and by
+        "auto" where the step has microbatches and that computes the same. Raise where
+        it is asked for but would not."""
         in_float32 = self.reduce != self.compute
-        asked = accumulate == "unreduced" or in_float32
-        if not parallel.gather.rows() or (accumulate == "reduced" and not asked):
+        asked = self.accumulate == "unreduced" or in_float32
+        auto = self.accumulate == "auto" and self.microbatches > 1
+        if not (asked or auto) or not parallel.gather.rows():
             return False  # with no axis splitting the rows, nothing reduces over them
-        if (why := self._why_not_unreduced(model)) is None:
-            return asked or self.microbatches > 1
-        if asked:
+        why = self._why_not_unreduced(model)
+        if why is not None and asked:
             what = (
                 f"precision(reduce={self.reduce.name}) reduces a step's gradients once"
                 if in_float32
                 else "methods(accumulate=unreduced) adds up each device's gradients"
             )
             raise ValueError(f"{what}, which {why}")
-        return False
+        return why is None
 
     def _why_not_unreduced(self, model: Model) -> str | None:
         """Return why a step could not add up its gradients unreduced, or None."""
+        if self.accumulate == "reduced":
+            return "methods(accumulate=reduced) reduces as the backward makes them"
         if parallel.pipeline.pipelined():
             return "a pipeline does not: its stages run in a shard_map of their own"
         if self.gather != "step":
@@ -294,22 +296,27 @@ class Trainer:
         elif self.microbatches > 1:
             grads, metrics, buffers = self._reduced(graphdef, params, buffers, batch)
         else:
-            used = self._pipelined(params)
-            grads, metrics, buffers = self._grads(
-                graphdef, used, buffers, batch, token_share=1.0, row_share=1.0
-            )
-            grads = _shard_state(grads)
+            grads, metrics, buffers = self._whole(graphdef, params, buffers, batch)
         nnx.update(model, buffers)
         apply_step_end_updates(model)
         return grads, metrics
 
-    def _pipelined(self, params: nnx.State) -> nnx.State:
-        """Return the parameters as a step of one microbatch uses them: under a
-        pipeline that gathers once a step, whole over FSDP's axes, in float32, as its
-        ticks add up their gradients in the dtype of what they read."""
+    def _whole(
+        self,
+        graphdef: nnx.GraphDef,
+        params: nnx.State,
+        buffers: nnx.State,
+        batch: Batch,
+    ) -> tuple[nnx.State, Metrics, nnx.State]:
+        """Return `_grads` of the whole batch at once. A pipeline that gathers once a
+        step takes the parameters whole over FSDP's axes, in float32: its ticks add up
+        their gradients in the dtype of what they read."""
         if self.gather == "step" and parallel.pipeline.pipelined():
-            return parallel.gather.whole(params)
-        return params
+            params = parallel.gather.whole(params)
+        grads, metrics, buffers = self._grads(
+            graphdef, params, buffers, batch, token_share=1.0, row_share=1.0
+        )
+        return _shard_state(grads), metrics, buffers
 
     def _gathered(self, params: nnx.State) -> nnx.State:
         """Return `params` as the microbatches use them: with `gather` "step", cast to
