@@ -640,7 +640,8 @@ def _(updates, dims, shardings, newton_schulz):
 ```
 
 Collectives in the compiled train step on 8 CPU devices (all-reduces / all-gathers /
-all-to-alls) for the 2-block Llama and the MoE of `tests/test_parallel.py`:
+all-to-alls) for the 2-block Llama and the MoE of `tests/test_parallel.py`, Newton-Schulz
+in float32:
 
 | model, mesh                         | AdamW       | Muon, `gspmd` | Muon, `gather` | Muon, `owner` |
 |-------------------------------------|-------------|---------------|----------------|---------------|
@@ -658,6 +659,23 @@ each way for every shape and split of matrix, two where a matrix splits on both 
 (`tensor`). Under `zero=1` its few all-gathers of whole matrices replace the one each
 parameter takes otherwise. Step times on fake CPU devices, which share one CPU, say
 nothing.
+
+On 8 B300s, `mesh(fsdp=8)`, 64 rows of 4096 tokens a step computed in bfloat16,
+thousands of tokens a second for a 1.3B dense Llama (16 layers, `d_model=2048`, 16
+query heads and 8 kv heads, a gated MLP of 5632, 128k tokens) and a 5.2B MoE of its
+shape (64 experts of 704, top 8), by `ns_dtype`:
+
+| model                | AdamW | `gspmd` | `gather` | `owner` |
+|----------------------|-------|---------|----------|---------|
+| dense, float32       | 1,147 | 856     | 849      | 1,073   |
+| dense, bfloat16      |       | 923     | 950      | 1,087   |
+| dense, `repeat=scan` |       | 863     | 938      | 935     |
+| MoE, float32         |       | 531     | 712      | 754     |
+| MoE, bfloat16        |       |         |          | 786     |
+
+The dense model's optimizer update alone takes 74 ms with `gspmd`, 73 with `gather`
+and 12 with `owner` in float32; 48, 42 and 12 in bfloat16. With `repeat=scan` (float32
+here) the stacked `layers` already split over `fsdp` under `gather`, as under `owner`.
 
 ## Repeats and remat: `methods.repeat`, `methods.remat`
 
