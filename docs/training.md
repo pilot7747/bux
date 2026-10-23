@@ -185,8 +185,8 @@ Four settings choose which projections, and when:
   stay in compute.
 - `first` and `last` keep that many residual branches outside any other, at the
   start and at the end of the model before its first head, in compute: a number, or
-  a share of them, rounded up (`last=0.15`). A branch is one `[...]`, so a
-  Llama-style block, `[norm attn] [norm ffn]`, is two. A scanned repeat scans apart
+  a share of them, rounded up (`last=0.15`). A branch is a `[...]` inside no other,
+  so a Llama-style block, `[norm attn] [norm ffn]`, is two. A scanned repeat scans apart
   the passes that multiply alike; a pipelined one must multiply alike throughout.
 - `passes` are the GEMMs of y = x W that multiply in the format: `fprop`, y's, and
   the gradient's by x, `dgrad`, and by W, `wgrad`. The others multiply in compute,
