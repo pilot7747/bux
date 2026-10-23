@@ -36,7 +36,12 @@ from bux.architecture.registry import (
 )
 from bux.architecture.rope import logit_gain, rotate, rotated_dims
 from bux.architecture.segments import Segments
-from bux.architecture.sharding import linear, shard_heads, shard_layer_input
+from bux.architecture.sharding import (
+    linear,
+    project_input,
+    project_output,
+    shard_heads,
+)
 from bux.lang import ir
 from bux.parallel.context import (
     AttentionArgs,
@@ -152,7 +157,7 @@ class SoftmaxAttention(nnx.Module):
     def _project(self, out: Float[Array, "b t h dv"]) -> Float[Array, "b t d"]:
         """Project the heads back to the width."""
         b, t, _, _ = out.shape
-        return self.o(out.reshape(b, t, -1))
+        return project_output(out.reshape(b, t, -1), self.o)
 
 
 class Attention(SoftmaxAttention):
@@ -216,20 +221,21 @@ class Attention(SoftmaxAttention):
         self.v_mix = nnx.Param(jnp.full(shape, 0.5)) if trained else None
 
     def __call__(self, x: Float[Array, "b t d"], taps: Taps) -> Float[Array, "b t d"]:
-        x = shard_layer_input(x)
         docs = segments(taps)
-        q, k, v = self._heads(x, docs, taps)
+        x, projected = self._projections(x)
+        q, k, v = self._heads(projected, docs, taps)
         return self._output(x, self._attend(x, q, k, v, docs))
 
     def _heads(
-        self, x: Float[Array, "b t d"], docs: Segments | None, taps: Taps
+        self, projected: list[Float[Array, "b t _"]], docs: Segments | None, taps: Taps
     ) -> tuple[
         Float[Array, "b t h dk"], Float[Array, "b s g dk"], Float[Array, "b s g dv"]
     ]:
-        """Return the queries, keys and values, with the v port's values mixed in;
-        the keys and values from the kv port if the layer reads it."""
+        """Return the queries, keys and values of the `projected` input, with the v
+        port's values mixed in; the keys and values from the kv port if the layer
+        reads it."""
         pos = None if docs is None else docs.positions
-        q, *kv = self._projections(x)
+        q, *kv = projected
         q = self._queries(q, pos)
         if kv:
             k, v = self._keys_and_values(*kv, pos, taps)
@@ -241,15 +247,20 @@ class Attention(SoftmaxAttention):
         write(taps, self.ports, "kv", (k, v))
         return q, k, v
 
-    def _projections(self, x: Float[Array, "b t d"]) -> list[Float[Array, "b t _"]]:
-        """Project the queries, then the keys and values unless the layer reads them
-        from its kv port: slices of one projection when fused, else one each."""
+    def _projections(
+        self, x: Float[Array, "b t d"]
+    ) -> tuple[Float[Array, "b t d"], list[Float[Array, "b t _"]]]:
+        """Return the input as the layer takes it (`project_input`), and its
+        projections: the queries, then the keys and values unless the layer reads them
+        from its kv port, as slices of one projection when fused, else one each."""
         if self.qkv is not None:
             q, k = self.heads * self.head_dim, self.kv_heads * self.head_dim
-            qkv = checkpoint_name(self.qkv(x), "qkv")
-            return jnp.split(qkv, [q, q + k], axis=-1)
-        projections = (self.q, self.k, self.v)
-        return [checkpoint_name(p(x), "qkv") for p in projections if p is not None]
+            x, [qkv] = project_input(x, self.qkv)
+            qkv = checkpoint_name(qkv, "qkv")
+            return x, jnp.split(qkv, [q, q + k], axis=-1)
+        projections = [p for p in (self.q, self.k, self.v) if p is not None]
+        x, projected = project_input(x, *projections)
+        return x, [checkpoint_name(p, "qkv") for p in projected]
 
     def _queries(
         self, q: Float[Array, "b t _"], pos: Int[Array, "b t"] | None
@@ -632,9 +643,9 @@ class SparseAttention(Sparse, Attention):
         )
 
     def __call__(self, x: Float[Array, "b t d"], taps: Taps) -> Float[Array, "b t d"]:
-        x = shard_layer_input(x)
         docs = segments(taps)
-        heads = self._heads(x, docs, taps)
+        x, projected = self._projections(x)
+        heads = self._heads(projected, docs, taps)
         return self._output(x, self._attend_tokens(x, x, heads, docs, taps))
 
 

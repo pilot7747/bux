@@ -47,6 +47,23 @@ def shard_layer_input(x: Float[Array, "b t d"]) -> Float[Array, "b t d"]:
     return parallel.shard(x, "batch", "seq", None)
 
 
+def project_input(
+    x: Float[Array, "b t d"], *linears: nnx.Linear
+) -> tuple[Float[Array, "b t d"], list[Float[Array, "b t _"]]]:
+    """Return a layer's input as `shard_layer_input` splits it, and its projection by
+    each of `linears`, whose kernels split by columns: by the run's `methods.tensor`,
+    which may gather the input a chunk at a time beside the matmuls."""
+    return parallel.tensor.project_in(x, linears)
+
+
+def project_output(
+    h: Float[Array, "b t f"], linear: nnx.Linear
+) -> Float[Array, "b t d"]:
+    """Return a layer's output projection, whose kernel splits by rows, by the run's
+    `methods.tensor`, which may reduce its partial sums a chunk at a time."""
+    return parallel.tensor.project_out(h, linear)
+
+
 def shard_heads(
     x: Shaped[Array, "b t h *e"], name: parallel.Name = "heads"
 ) -> Shaped[Array, "b t h *e"]:

@@ -378,6 +378,7 @@ class MethodsConfig(Config):
     rounds: Positive = 1  # times a circular pipeline sends a microbatch round
     orthogonalize: str = "owner"  # how Muon reaches whole matrices
     loss: str = "logits"  # how the loss takes a head's logits: whole, or by chunks
+    tensor: str = "gspmd"  # how TP's collectives meet the projections they feed
     microbatches: Positive = 1
     # Where a step runs its layers more than once (microbatches, a pipeline's ticks),
     # it casts and gathers the parameters FSDP splits once, or as each layer runs
