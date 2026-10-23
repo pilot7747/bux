@@ -6,7 +6,9 @@ lowers to Blackwell's block-scaled MMA.
 group has rows in (a tile two groups share runs once for each) and per tile of
 columns, a row tile's column tiles one after another, so that its rows stay in L2.
 `contract` sums the products of each group's rows of two matrices, dW: a program per
-tile of each group's output.
+tile of each group's output. Both load their values by TMA, which Triton pipelines on
+Blackwell where it does not plain loads, and their scales, rows of a few bytes, by
+plain loads. `quantized_twice` quantizes x and x^T in one pass.
 """
 
 from typing import NamedTuple
