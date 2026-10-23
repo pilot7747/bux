@@ -5,9 +5,9 @@ from flax import nnx
 from jaxtyping import Array, Float
 
 from bux import config as cfg
-from bux.architecture.functional import activation
+from bux.architecture.common.functional import activation
+from bux.architecture.common.sharding import projection
 from bux.architecture.registry import Context, Taps, register
-from bux.architecture.sharding import projection
 from bux.lang import ir
 
 

@@ -36,11 +36,13 @@ from jax.typing import DTypeLike
 from jaxtyping import Array, Float, Int32, Shaped
 
 from bux import kernels, parallel
-from bux.architecture import Model, Scanned, matmuls, pipelined, remat
+from bux.architecture import Model, Scanned
+from bux.architecture.common.segments import Segments
 from bux.architecture.logits import HeadOutput
+from bux.architecture.precision import matmuls
 from bux.architecture.registry import Loss, Stream
-from bux.architecture.repeat import scanned_variables
-from bux.architecture.segments import Segments
+from bux.architecture.repeats import pipelined, remat
+from bux.architecture.repeats.repeat import scanned_variables
 from bux.data.pipeline import DEFAULT_CACHE, jobs, prepare
 from bux.lang import ir
 from bux.lang.printer import run_to_source
@@ -294,8 +296,8 @@ class Trainer:
     Both compute in `compute`, the model's parameters cast to it inside the loss, so
     that the parameters, their gradients and the optimizer's state stay as they are
     (float32); and the projections inside blocks multiply as the precision `matmuls`
-    says, or in the format it names (``bux.architecture.matmuls``). At the step of a
-    `switch`, the steps take up its precision, and compile again.
+    says, or in the format it names (``bux.architecture.precision.matmuls``). At the
+    step of a `switch`, the steps take up its precision, and compile again.
 
     Made inside ``parallel.use``, it puts its state on the shardings the layout gives
     it, and every step keeps it there. A step that runs its layers more than once, in

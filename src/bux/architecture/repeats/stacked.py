@@ -13,8 +13,8 @@ from flax import nnx
 from jax.typing import DTypeLike
 from jaxtyping import Array, Float
 
-from bux.architecture import pure, remat
 from bux.architecture.registry import Stream, Taps
+from bux.architecture.repeats import pure, remat
 
 
 def run(

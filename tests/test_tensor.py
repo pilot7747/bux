@@ -11,7 +11,8 @@ from flax import nnx
 from jaxtyping import Array, Float, Int
 
 from bux import parallel
-from bux.architecture import Model, matmuls
+from bux.architecture import Model
+from bux.architecture.precision import matmuls
 from bux.lang import compile
 from bux.train import config as tcfg
 

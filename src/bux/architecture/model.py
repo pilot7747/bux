@@ -4,12 +4,12 @@ import jax
 from flax import nnx
 from jaxtyping import Array, Float, Int
 
-from bux.architecture import matmuls
+from bux.architecture.common.segments import Segments
 from bux.architecture.graph import build_node
 from bux.architecture.logits import HeadOutput
+from bux.architecture.precision import matmuls
 from bux.architecture.registry import Context, Loss, Stream, Taps
-from bux.architecture.repeat import pipe_longest
-from bux.architecture.segments import Segments
+from bux.architecture.repeats.repeat import pipe_longest
 from bux.lang import ir
 
 

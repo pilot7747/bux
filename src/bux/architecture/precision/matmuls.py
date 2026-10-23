@@ -18,7 +18,7 @@ head, multiply in compute, and those after it as `roles.mtp` says.
 
 A format is a dot_general by name, so a new recipe is a function:
 
-    from bux.architecture import matmuls
+    from bux.architecture.precision import matmuls
 
     @matmuls.formats.register("mine")
     def _(lhs, rhs, dimension_numbers, **kwargs): ...  # jax.lax.dot_general's
@@ -46,7 +46,7 @@ from jax.typing import DTypeLike
 from jaxtyping import Array, Float, Int, UInt32
 
 from bux import parallel
-from bux.architecture import blockscaled, nvfp4
+from bux.architecture.precision import blockscaled, nvfp4
 from bux.lang import ir
 from bux.train.config import PrecisionConfig, RolesConfig
 from bux.train.registry import Registry
@@ -54,7 +54,7 @@ from bux.train.registry import Registry
 Dimensions = jax.lax.DotDimensionNumbers
 Gemm = Callable[[Float[Array, "..."], Float[Array, "..."]], Float[Array, "..."]]
 
-formats = Registry[Any]("matmul format", "bux.architecture.matmuls.formats")
+formats = Registry[Any]("matmul format", "bux.architecture.precision.matmuls.formats")
 PRECISION = ContextVar[PrecisionConfig | None]("precision", default=None)
 _COMPUTE = PrecisionConfig()  # in force outside `use`
 SEED = ContextVar[UInt32[Array, ""] | None]("matmuls seed", default=None)

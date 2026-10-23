@@ -14,7 +14,7 @@ from bux import config as cfg
 from bux import parallel
 from bux.architecture import CausalConv, Model, Segments, Taps, num_params
 from bux.architecture.graph import ResidualBranch, Sequence
-from bux.architecture.ssm import Mamba, Mamba2, ShortConv, chunk, stepwise
+from bux.architecture.recurrent.ssm import Mamba, Mamba2, ShortConv, chunk, stepwise
 from bux.lang import compile
 from bux.parallel.recurrence import Chunked, Positions, Shared
 from bux.train import config as tcfg

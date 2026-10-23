@@ -18,12 +18,13 @@ from jaxtyping import Array, Float
 
 from bux import config as cfg
 from bux import parallel
-from bux.architecture import chunkwise, remat
-from bux.architecture.conv import CausalConv
-from bux.architecture.norm import Norm
+from bux.architecture.common.segments import Segments
+from bux.architecture.common.sharding import projection, shard_layer_input
+from bux.architecture.layers.conv import CausalConv
+from bux.architecture.layers.norm import Norm
+from bux.architecture.recurrent import chunkwise
 from bux.architecture.registry import Context, Taps, register, segments
-from bux.architecture.segments import Segments
-from bux.architecture.sharding import projection, shard_layer_input
+from bux.architecture.repeats import remat
 from bux.lang import ir
 from bux.parallel.recurrence import Chunk, Positions, Recurrence, Shared
 

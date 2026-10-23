@@ -1,8 +1,8 @@
 """Pipeline parallelism over `stage`: the methods of `methods.pipeline`.
 
 With ``mesh.stage`` above 1, the longest scanned repeat outside any other is
-pipelined (bux.architecture.pipelined): its stacked layers split over `stage`, one
-share per stage, and the rest of the model stays whole on every stage. A method runs
+pipelined (bux.architecture.repeats.pipelined): its stacked layers split over `stage`,
+one share per stage, and the rest of the model stays whole on every stage. A method runs
 them on the ``methods.microbatches`` microbatches of the batch's rows, in a shard_map
 manual over `stage` alone, each stage on its own devices:
 

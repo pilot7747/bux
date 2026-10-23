@@ -41,8 +41,8 @@ from jax.extend.core import Primitive
 from jaxtyping import Shaped
 
 from bux import parallel
-from bux.architecture import pure
 from bux.architecture.registry import Stream, Taps
+from bux.architecture.repeats import pure
 from bux.parallel import methods
 from bux.train.config import RematConfig
 

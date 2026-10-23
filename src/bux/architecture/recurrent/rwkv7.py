@@ -14,17 +14,17 @@ from jaxtyping import Array, Float
 
 from bux import config as cfg
 from bux import parallel
-from bux.architecture.linear_attention import (
+from bux.architecture.common.ports import read, write
+from bux.architecture.common.segments import Segments
+from bux.architecture.common.sharding import projection, shard_heads, shard_layer_input
+from bux.architecture.layers.norm import Norm
+from bux.architecture.recurrent.linear_attention import (
     LowRank,
     depth,
     l2norm,
     recurrence,
 )
-from bux.architecture.norm import Norm
-from bux.architecture.ports import read, write
 from bux.architecture.registry import Context, Taps, register, segments
-from bux.architecture.segments import Segments
-from bux.architecture.sharding import projection, shard_heads, shard_layer_input
 from bux.lang import ir
 
 

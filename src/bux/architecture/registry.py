@@ -26,13 +26,13 @@ from typing import (
 from flax import nnx
 from jaxtyping import Array, Float, Int, Shaped
 
-from bux.architecture.segments import Segments
+from bux.architecture.common.segments import Segments
 from bux.lang import ir
 
 if TYPE_CHECKING:
     # Quoted where used: jaxtyping, which checks annotations as the tests run, reads
     # them as a module loads, and embedding.py imports this one.
-    from bux.architecture.embedding import Embedding
+    from bux.architecture.layers.embedding import Embedding
     from bux.architecture.logits import HeadOutput
 
 # What a module takes and passes on: the input tokens into the first, then the stream.

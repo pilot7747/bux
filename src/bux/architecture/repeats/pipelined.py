@@ -26,9 +26,9 @@ from jax.typing import DTypeLike
 from jaxtyping import Array, Bool, Float, Int, Shaped
 
 from bux import parallel
-from bux.architecture import pure, remat, stacked
+from bux.architecture.common.segments import Segments
 from bux.architecture.registry import Loss, Stream, Taps
-from bux.architecture.segments import Segments
+from bux.architecture.repeats import pure, remat, stacked
 from bux.parallel import pipeline
 
 

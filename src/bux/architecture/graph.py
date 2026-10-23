@@ -15,8 +15,10 @@ from flax import nnx
 from jaxtyping import Array, Shaped
 
 from bux import parallel
-from bux.architecture import matmuls, remat, residual
+from bux.architecture import residual
+from bux.architecture.precision import matmuls
 from bux.architecture.registry import Context, Stream, Taps, build_layer
+from bux.architecture.repeats import remat
 from bux.lang import ir
 from bux.parallel import shard_stream
 

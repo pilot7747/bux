@@ -22,9 +22,9 @@ import jax.numpy as jnp
 import optax
 from jaxtyping import Array, Bool, Float, Int
 
+from bux.architecture.common.segments import Segments
 from bux.architecture.logits import HeadOutput, Scores, Sums
 from bux.architecture.registry import Loss
-from bux.architecture.segments import Segments
 from bux.lang import ir
 from bux.train import config as tcfg
 from bux.train.data import Batch

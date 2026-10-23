@@ -8,7 +8,7 @@ from jaxtyping import Array, Int
 from bux import config as cfg
 from bux.architecture import Built, Context, Embedding, Model, NextN, Taps, num_params
 from bux.architecture.graph import Sequence
-from bux.architecture.norm import Norm
+from bux.architecture.layers.norm import Norm
 from bux.architecture.residual import (
     AttentionResidual,
     GatedResidual,

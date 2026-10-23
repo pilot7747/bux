@@ -13,7 +13,9 @@ from jaxtyping import Float, Shaped
 
 from bux import parallel
 from bux.__main__ import main
-from bux.architecture import Model, MoE, Scanned, matmuls, pipelined
+from bux.architecture import Model, MoE, Scanned
+from bux.architecture.precision import matmuls
+from bux.architecture.repeats import pipelined
 from bux.lang import compile, compile_runs
 from bux.parallel import pipeline, schedule, split
 from bux.parallel.scheduled import _rebuilt

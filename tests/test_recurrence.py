@@ -15,11 +15,11 @@ from jaxtyping import Array, Float, Int
 
 from bux import parallel
 from bux.architecture import Model, Segments
-from bux.architecture.linear_attention import chunk as linear_chunk
-from bux.architecture.linear_attention import recurrence
-from bux.architecture.rwkv7 import RWKV7
-from bux.architecture.ssm import chunk as ssm_chunk
-from bux.architecture.ssm import selective_scan
+from bux.architecture.recurrent.linear_attention import chunk as linear_chunk
+from bux.architecture.recurrent.linear_attention import recurrence
+from bux.architecture.recurrent.rwkv7 import RWKV7
+from bux.architecture.recurrent.ssm import chunk as ssm_chunk
+from bux.architecture.recurrent.ssm import selective_scan
 from bux.lang import compile
 from bux.parallel.recurrence import (
     Chunk,

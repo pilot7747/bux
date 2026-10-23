@@ -18,8 +18,10 @@ from jaxtyping import Array, Bool, Float, Int, Shaped
 
 from bux import config as cfg
 from bux import parallel
-from bux.architecture import Model, Taps, blockscaled, grouped_blockscaled, matmuls
-from bux.architecture.moe import MoE, routed
+from bux.architecture import Model, Taps
+from bux.architecture.experts import grouped_blockscaled
+from bux.architecture.experts.moe import MoE, routed
+from bux.architecture.precision import blockscaled, matmuls
 from bux.lang import compile
 from bux.parallel import experts, methods
 from bux.train import config as tcfg

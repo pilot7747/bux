@@ -12,7 +12,7 @@ from bux import config as cfg
 from bux import parallel
 from bux.architecture import Model, Taps
 from bux.architecture.graph import ResidualBranch, Sequence
-from bux.architecture.linear_attention import (
+from bux.architecture.recurrent.linear_attention import (
     GatedDeltaNet,
     KimiDeltaAttention,
     LightningAttention,
@@ -21,7 +21,7 @@ from bux.architecture.linear_attention import (
     recurrence,
     slopes,
 )
-from bux.architecture.rwkv7 import RWKV7
+from bux.architecture.recurrent.rwkv7 import RWKV7
 from bux.lang import compile
 from bux.train import config as tcfg
 

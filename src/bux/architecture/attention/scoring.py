@@ -18,7 +18,7 @@ from jax.sharding import PartitionSpec as P
 from jaxtyping import Array, Float, Int
 
 from bux import kernels, parallel
-from bux.architecture.sparse import axes
+from bux.architecture.attention.sparse import axes
 
 QUERIES, KEYS = 64, 128  # the most of each a program takes
 WARPS = 4

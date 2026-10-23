@@ -23,11 +23,12 @@ from jax.typing import DTypeLike
 from jaxtyping import Array, Float, Int, UInt32
 
 from bux import kernels
-from bux.architecture import blockscaled, grouped
-from bux.architecture.blockscaled import PASSES, Blocks, Pass, Twice
+from bux.architecture.experts import grouped
+from bux.architecture.precision import blockscaled
+from bux.architecture.precision.blockscaled import PASSES, Blocks, Pass, Twice
 
 try:  # Triton's kernels, where the cuda extra is installed (Linux)
-    from bux.architecture import grouped_triton
+    from bux.architecture.experts import grouped_triton
 except ImportError:
     grouped_triton = None
 

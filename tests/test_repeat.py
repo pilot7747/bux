@@ -17,8 +17,10 @@ from jaxtyping import Float
 from optax.contrib import MuonDimensionNumbers
 
 from bux import parallel
-from bux.architecture import Model, MoE, Norm, Scanned, matmuls, remat
+from bux.architecture import Model, MoE, Norm, Scanned
 from bux.architecture.graph import Sequence
+from bux.architecture.precision import matmuls
+from bux.architecture.repeats import remat
 from bux.architecture.residual import HyperConnections
 from bux.lang import compile, compile_runs
 from bux.lang.printer import run_to_source
@@ -60,7 +62,7 @@ SCANNED = {"llama": LLAMA, "pattern": PATTERN, "hc": HC}
 ONE = "mesh(data=1)"
 MESHES = [ONE, "mesh(fsdp=8)", "mesh(fsdp=2, expert=2, tensor=2)"]
 SCAN, UNROLL = "methods(repeat=scan)", "methods(repeat=unroll)"
-# The policies that keep what layers name (bux.architecture.remat).
+# The policies that keep what layers name (bux.architecture.repeats.remat).
 NAMED = ["save_attention", "save_qkv_attention", "dots_attention", "offload_attention"]
 TOKENS = np.random.default_rng(0).integers(0, 128, (8, 16))
 TRAIN = "data = synthetic\noptimizer = adamw(lr=1e-2)\nseq_len = 16\nbatch = 8\n"

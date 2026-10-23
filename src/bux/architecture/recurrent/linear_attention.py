@@ -37,13 +37,14 @@ from jaxtyping import Array, Float
 
 from bux import config as cfg
 from bux import parallel
-from bux.architecture import chunkwise, fused_delta, remat
-from bux.architecture.conv import CausalConv
-from bux.architecture.functional import activation
-from bux.architecture.norm import Norm
+from bux.architecture.common.functional import activation
+from bux.architecture.common.segments import Segments
+from bux.architecture.common.sharding import projection, shard_heads, shard_layer_input
+from bux.architecture.layers.conv import CausalConv
+from bux.architecture.layers.norm import Norm
+from bux.architecture.recurrent import chunkwise, fused_delta
 from bux.architecture.registry import Context, Taps, register, segments
-from bux.architecture.segments import Segments
-from bux.architecture.sharding import projection, shard_heads, shard_layer_input
+from bux.architecture.repeats import remat
 from bux.lang import ir
 from bux.parallel import methods
 from bux.parallel.recurrence import Chunk, Positions, Recurrence, Shared, Transition

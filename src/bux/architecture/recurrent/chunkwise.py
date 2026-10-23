@@ -32,7 +32,7 @@ from jax.ad_checkpoint import checkpoint_name
 from jaxtyping import Array, Bool, Float, Int
 
 from bux import parallel
-from bux.architecture import affine_scan
+from bux.architecture.recurrent import affine_scan
 from bux.parallel.recurrence import Chunk, Positions, Transition
 
 SIZE = 64  # positions per chunk

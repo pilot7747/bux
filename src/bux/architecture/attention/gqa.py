@@ -4,8 +4,8 @@
 `methods.attention` (``bux.parallel.context``), and the output projection. Two mixins
 add to it: `FullLogits`, what needs all t by t logits, which only `xla`'s math makes
 (relative bias, length scale, attention dropout), and `Sparse`, the indexer of sparse
-attention, which attends by ``bux.architecture.sparse``. `build_gqa` picks the class
-the config needs.
+attention, which attends by ``bux.architecture.attention.sparse``. `build_gqa` picks the
+class the config needs.
 """
 
 from collections.abc import Sequence
@@ -20,12 +20,20 @@ from jaxtyping import Array, Bool, Float, Int
 
 from bux import config as cfg
 from bux import parallel
-from bux.architecture import remat, sparse
-from bux.architecture.conv import CausalConv
-from bux.architecture.functional import activation
-from bux.architecture.indexer import Indexer, Scored, Target, from_stream
-from bux.architecture.norm import Norm
-from bux.architecture.ports import read, reads, write, writes
+from bux.architecture.attention import sparse
+from bux.architecture.attention.indexer import Indexer, Scored, Target, from_stream
+from bux.architecture.attention.rope import logit_gain, rotate, rotated_dims
+from bux.architecture.common.functional import activation
+from bux.architecture.common.ports import read, reads, write, writes
+from bux.architecture.common.segments import Segments
+from bux.architecture.common.sharding import (
+    linear,
+    project_input,
+    project_output,
+    shard_heads,
+)
+from bux.architecture.layers.conv import CausalConv
+from bux.architecture.layers.norm import Norm
 from bux.architecture.registry import (
     Context,
     Taps,
@@ -34,14 +42,7 @@ from bux.architecture.registry import (
     segments,
     training,
 )
-from bux.architecture.rope import logit_gain, rotate, rotated_dims
-from bux.architecture.segments import Segments
-from bux.architecture.sharding import (
-    linear,
-    project_input,
-    project_output,
-    shard_heads,
-)
+from bux.architecture.repeats import remat
 from bux.lang import ir
 from bux.parallel.context import (
     AttentionArgs,

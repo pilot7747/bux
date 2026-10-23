@@ -1,8 +1,8 @@
-"""The delta rule by cuDNN's kernels (bux.architecture.fused_delta), with stand-ins for
-the kernels, which the CPU lacks: bux's own delta rule on the packed tokens, a sequence
-a document as cu_seqlens says. So what is checked is the packing: rows end to end,
-documents' bounds, rows of more documents than cu_seqlens has room for, what the
-backward pass keeps, and which gates the kernels take."""
+"""The delta rule by cuDNN's kernels (bux.architecture.recurrent.fused_delta), with
+stand-ins for the kernels, which the CPU lacks: bux's own delta rule on the packed
+tokens, a sequence a document as cu_seqlens says. So what is checked is the packing:
+rows end to end, documents' bounds, rows of more documents than cu_seqlens has room for,
+what the backward pass keeps, and which gates the kernels take."""
 
 import functools
 
@@ -11,8 +11,9 @@ import jax.numpy as jnp
 import numpy as np
 import pytest
 
-from bux.architecture import Segments, fused_delta
-from bux.architecture.linear_attention import _chunked
+from bux.architecture import Segments
+from bux.architecture.recurrent import fused_delta
+from bux.architecture.recurrent.linear_attention import _chunked
 
 B, T, H, K = 2, 64, 2, 8
 # What the kernels fall back on: the chunks, recomputed, as linear_attention passes.

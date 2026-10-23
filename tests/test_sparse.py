@@ -1,7 +1,7 @@
-"""Attention over kept keys (bux.architecture.sparse) by XLA, a chunk of queries at a
-time, against all t by t logits: values, gradients and the indexer's loss, with
-packed documents, on one device and split over the 8 CPU devices the tests have; and
-memory that grows linearly with the queries. scripts/gpu_smoke/sparse.py checks
+"""Attention over kept keys (bux.architecture.attention.sparse) by XLA, a chunk of
+queries at a time, against all t by t logits: values, gradients and the indexer's loss,
+with packed documents, on one device and split over the 8 CPU devices the tests have;
+and memory that grows linearly with the queries. scripts/gpu_smoke/sparse.py checks
 tokamax's kernel against it on a GPU."""
 
 import jax
@@ -13,9 +13,10 @@ from jaxtyping import Array, Float
 
 from bux import config as cfg
 from bux import parallel
-from bux.architecture import Model, Segments, Taps, scoring, sparse
-from bux.architecture.attention import Sparse, build_gqa
-from bux.architecture.indexer import _top
+from bux.architecture import Model, Segments, Taps
+from bux.architecture.attention import scoring, sparse
+from bux.architecture.attention.gqa import Sparse, build_gqa
+from bux.architecture.attention.indexer import _top
 from bux.lang import compile
 from bux.parallel.context import masked_softmax, scaled_logits, softcap, weighted_values
 from bux.train import config as tcfg
