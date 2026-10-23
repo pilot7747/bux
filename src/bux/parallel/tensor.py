@@ -7,12 +7,13 @@ parallelism, `layout(stream=tensor)`, the input comes split by positions over
 `tensor`: it is gathered before the input projections, and the partial sums
 reduce-scatter back to each device's positions. Without it, they all-reduce.
 
-    methods = methods(tensor=chunked)
+    methods = methods(tensor=chunked, tensor_chunks=2)
 
 `gspmd`, the default, leaves the collectives to the compiler, which puts each at the
 boundary of the matmul it feeds or drains, where the matmul waits for it. `chunked`
-splits each device's rows into `CHUNKS` chunks, in a shard_map: chunk i + 1 gathers
-while chunk i multiplies, and chunk i reduce-scatters while chunk i + 1 multiplies.
+splits each device's rows into `methods.tensor_chunks` chunks, in a shard_map: chunk
+i + 1 gathers while chunk i multiplies, and chunk i reduce-scatters while chunk i + 1
+multiplies.
 
 A method is a class of two functions: `project_in(x, linears)` returns the input as
 the layer takes it and its projection by each of `linears`, and `project_out(h,
@@ -36,7 +37,6 @@ from bux.parallel.layout import NAMES, Name, shard, spec, splits
 from bux.parallel.mesh import active
 
 AXIS = "tensor"
-CHUNKS = 4  # of each device's rows; fewer where its rows are fewer
 Entry = str | tuple[str, ...] | None  # one dimension of a PartitionSpec
 
 
@@ -170,7 +170,7 @@ def _split(x: Float[Array, "b t d"]) -> Split | None:
     if _axes(stream) not in (_axes(layer), (*_axes(layer), AXIS)):
         return None
     rows_here = x.shape[0] // on.size(*_axes(rows))
-    chunks = math.gcd(CHUNKS, rows_here)
+    chunks = math.gcd(on.methods.tensor_chunks, rows_here)
     positions = x.shape[1] // on.size(*_axes(layer))
     return Split(rows, stream, layer, chunks, rows_here // chunks * positions)
 

@@ -379,6 +379,7 @@ class MethodsConfig(Config):
     orthogonalize: str = "owner"  # how Muon reaches whole matrices
     loss: str = "logits"  # how the loss takes a head's logits: whole, or by chunks
     tensor: str = "gspmd"  # how TP's collectives meet the projections they feed
+    tensor_chunks: Positive = 2  # of each device's rows, under tensor = chunked
     microbatches: Positive = 1
     # Where a step runs its layers more than once (microbatches, a pipeline's ticks),
     # it casts and gathers the parameters FSDP splits once, or as each layer runs

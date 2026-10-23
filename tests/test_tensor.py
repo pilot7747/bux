@@ -61,15 +61,18 @@ def _loss(model: Model, tokens: Int[Array, "b t"]) -> Float[Array, ""]:
 
 
 @functools.cache
-def _outputs(method: str, mesh: str, source: str = LLAMA, fmt: str = "compute"):
+def _outputs(
+    method: str, mesh: str, source: str = LLAMA, fmt: str = "compute", chunks: int = 2
+):
     """The logits and every parameter's gradient of a loss by `method` on `mesh`, in
-    the matmul format `fmt`, on the host; and the collectives the gradient makes."""
+    the matmul format `fmt`, in `chunks` chunks under `chunked`, on the host; and the
+    collectives the gradient makes."""
     sizes, stream = (MESHES | ONE)[mesh]
     with (
         parallel.use(
             tcfg.MeshConfig.model_validate(sizes),
             tcfg.LayoutConfig.model_validate({"stream": stream}),
-            tcfg.MethodsConfig(tensor=method),
+            tcfg.MethodsConfig(tensor=method, tensor_chunks=chunks),
         ),
         matmuls.use(fmt),
     ):
@@ -92,20 +95,26 @@ def assert_close(a, b, tolerance: float = 1e-5) -> None:
     assert jax.tree.all(jax.tree.map(close, a, b))
 
 
+@pytest.mark.parametrize("chunks", [2, 4])
 @pytest.mark.parametrize("mesh", MESHES)
-def test_chunked_projections_compute_what_gspmd_s_do_with_the_same_gradients(mesh):
-    chunked, _ = _outputs("chunked", mesh)
+def test_chunked_projections_compute_what_gspmd_s_do_with_the_same_gradients(
+    mesh, chunks
+):
+    chunked, _ = _outputs("chunked", mesh, chunks=chunks)
     assert_close(chunked, _outputs("gspmd", mesh)[0])
     assert_close(chunked, _outputs("gspmd", "one device")[0])
 
 
-def test_chunked_reduces_each_projection_a_chunk_of_rows_at_a_time():
+# Chunks of a device's 4 rows: 8 make 4, and 3 one, as they must divide them.
+@pytest.mark.parametrize(("chunks", "made"), [(1, 1), (2, 2), (3, 1), (4, 4), (8, 4)])
+def test_chunked_reduces_each_projection_a_chunk_of_rows_at_a_time(chunks, made):
     """2 blocks, each with an attention and an MLP, each reduce-scattered forward and
-    its gathered input's gradient backward: 4 chunks each of a device's 4 rows."""
-    _, gspmd = _outputs("gspmd", "fsdp=2, tensor=4, sequence parallel")
-    _, chunked = _outputs("chunked", "fsdp=2, tensor=4, sequence parallel")
+    its gathered input's gradient backward, a chunk at a time."""
+    mesh = "fsdp=2, tensor=4, sequence parallel"
+    _, gspmd = _outputs("gspmd", mesh)
+    _, chunked = _outputs("chunked", mesh, chunks=chunks)
     assert gspmd["reduce-scatter"] == 0  # XLA:CPU's are all-reduces
-    assert chunked["reduce-scatter"] == 2 * 2 * 2 * 4
+    assert chunked["reduce-scatter"] == 2 * 2 * 2 * made
 
 
 @pytest.mark.parametrize("fmt", ["mxfp8", "nvfp4"])
