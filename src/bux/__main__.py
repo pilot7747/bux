@@ -174,7 +174,9 @@ def _row(run: Run, gpus: int, alone: bool) -> tuple[str, ...]:
     made = abstract(run, used)
     n = None if made is None else num_params(made[0])
     param_bytes, opt_bytes = (made and memory(run, made, used)) or (None, None)
-    idle = bubble(t.mesh.stage, t.methods.microbatches, t.methods.rounds)
+    idle = bubble(
+        t.mesh.stage, t.methods.microbatches, t.methods.rounds, t.methods.pipeline
+    )
     work = flops_per_token(run)
     return (
         run.id,

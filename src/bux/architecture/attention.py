@@ -36,7 +36,12 @@ from bux.architecture.registry import (
 )
 from bux.architecture.rope import logit_gain, rotate, rotated_dims
 from bux.architecture.segments import Segments
-from bux.architecture.sharding import linear, shard_heads, shard_layer_input
+from bux.architecture.sharding import (
+    linear,
+    project_input,
+    project_output,
+    shard_heads,
+)
 from bux.lang import ir
 from bux.parallel.context import (
     AttentionArgs,
@@ -81,7 +86,9 @@ class SoftmaxAttention(nnx.Module):
 
         # The randomly initialized layers, after the layer's own projections.
         self.gate = (
-            linear(width, gate_width, names, bias, rngs) if config.gated else None
+            linear(width, gate_width, names, bias, rngs, role="q")
+            if config.gated
+            else None
         )
         self._init_logit_layers(config, width, bias, rngs)
         self.output_dropout = (
@@ -140,7 +147,7 @@ class SoftmaxAttention(nnx.Module):
     ) -> Float[Array, "b t d"]:
         """Normalize and gate the head outputs, then project them back to the width."""
         b, t, _ = x.shape
-        out = checkpoint_name(out, "attention")
+        out = checkpoint_name(out, "attention.out")
         if self.out_norm is not None:
             out = self.out_norm(out)
         if self.gate is not None:
@@ -152,7 +159,7 @@ class SoftmaxAttention(nnx.Module):
     def _project(self, out: Float[Array, "b t h dv"]) -> Float[Array, "b t d"]:
         """Project the heads back to the width."""
         b, t, _, _ = out.shape
-        return self.o(out.reshape(b, t, -1))
+        return project_output(out.reshape(b, t, -1), self.o)
 
 
 class Attention(SoftmaxAttention):
@@ -182,10 +189,10 @@ class Attention(SoftmaxAttention):
         heads, kv_heads = ("heads", h), ("kv_heads", g)  # flattened with their dims
 
         def proj(
-            n_in: int, n_out: int, names: Names, bias: bool | None = None
+            n_in: int, n_out: int, names: Names, role: str, bias: bool | None = None
         ) -> nnx.Linear:
             bias = config.bias if bias is None else bias
-            return linear(n_in, n_out, names, bias, rngs)
+            return linear(n_in, n_out, names, bias, rngs, role=role)
 
         def conv(channels: int, size: int) -> CausalConv:
             return CausalConv(channels, size, False, rngs, channel=kv_heads)
@@ -195,12 +202,12 @@ class Attention(SoftmaxAttention):
         split = projects_kv and not config.fused_qkv
         # Fused, the split points of q, k and v do not fall on shard boundaries.
         self.qkv = (
-            proj(width, h * dk + g * (dk + dv), ("embed", None)) if fused else None
+            proj(width, h * dk + g * (dk + dv), ("embed", None), "q") if fused else None
         )
-        self.q = None if fused else proj(width, h * dk, ("embed", heads))
-        self.k = proj(width, g * dk, ("embed", kv_heads)) if split else None
-        self.v = proj(width, g * dv, ("embed", kv_heads)) if split else None
-        self.o = proj(h * dv, width, (heads, "embed"), config.output_bias)
+        self.q = None if fused else proj(width, h * dk, ("embed", heads), "q")
+        self.k = proj(width, g * dk, ("embed", kv_heads), "kv") if split else None
+        self.v = proj(width, g * dv, ("embed", kv_heads), "kv") if split else None
+        self.o = proj(h * dv, width, (heads, "embed"), "o", config.output_bias)
         size = config.kv_conv_size if projects_kv else None
         self.k_conv = conv(g * dk, size) if size else None
         self.v_conv = conv(g * dv, size) if size else None
@@ -216,20 +223,21 @@ class Attention(SoftmaxAttention):
         self.v_mix = nnx.Param(jnp.full(shape, 0.5)) if trained else None
 
     def __call__(self, x: Float[Array, "b t d"], taps: Taps) -> Float[Array, "b t d"]:
-        x = shard_layer_input(x)
         docs = segments(taps)
-        q, k, v = self._heads(x, docs, taps)
+        x, projected = self._projections(x)
+        q, k, v = self._heads(projected, docs, taps)
         return self._output(x, self._attend(x, q, k, v, docs))
 
     def _heads(
-        self, x: Float[Array, "b t d"], docs: Segments | None, taps: Taps
+        self, projected: list[Float[Array, "b t _"]], docs: Segments | None, taps: Taps
     ) -> tuple[
         Float[Array, "b t h dk"], Float[Array, "b s g dk"], Float[Array, "b s g dv"]
     ]:
-        """Return the queries, keys and values, with the v port's values mixed in;
-        the keys and values from the kv port if the layer reads it."""
+        """Return the queries, keys and values of the `projected` input, with the v
+        port's values mixed in; the keys and values from the kv port if the layer
+        reads it."""
         pos = None if docs is None else docs.positions
-        q, *kv = self._projections(x)
+        q, *kv = projected
         q = self._queries(q, pos)
         if kv:
             k, v = self._keys_and_values(*kv, pos, taps)
@@ -241,15 +249,20 @@ class Attention(SoftmaxAttention):
         write(taps, self.ports, "kv", (k, v))
         return q, k, v
 
-    def _projections(self, x: Float[Array, "b t d"]) -> list[Float[Array, "b t _"]]:
-        """Project the queries, then the keys and values unless the layer reads them
-        from its kv port: slices of one projection when fused, else one each."""
+    def _projections(
+        self, x: Float[Array, "b t d"]
+    ) -> tuple[Float[Array, "b t d"], list[Float[Array, "b t _"]]]:
+        """Return the input as the layer takes it (`project_input`), and its
+        projections: the queries, then the keys and values unless the layer reads them
+        from its kv port, as slices of one projection when fused, else one each."""
         if self.qkv is not None:
             q, k = self.heads * self.head_dim, self.kv_heads * self.head_dim
-            qkv = checkpoint_name(self.qkv(x), "qkv")
-            return jnp.split(qkv, [q, q + k], axis=-1)
-        projections = (self.q, self.k, self.v)
-        return [checkpoint_name(p(x), "qkv") for p in projections if p is not None]
+            x, [qkv] = project_input(x, self.qkv)
+            qkv = checkpoint_name(qkv, "qkv")
+            return x, jnp.split(qkv, [q, q + k], axis=-1)
+        projections = [p for p in (self.q, self.k, self.v) if p is not None]
+        x, projected = project_input(x, *projections)
+        return x, [checkpoint_name(p, "qkv") for p in projected]
 
     def _queries(
         self, q: Float[Array, "b t _"], pos: Int[Array, "b t"] | None
@@ -482,11 +495,14 @@ class Sparse(FullLogits):
         taps: Taps,
     ) -> Float[Array, "b t h dv"]:
         """Return every query's softmax-weighted values over what it attends to of
-        each part, all in one softmax; in training, also report the indexer's loss
-        from what it `scored`, against the attention to the last part."""
+        each part, all in one softmax, named `attention` (``remat.named``); in
+        training, also report the indexer's loss from what it `scored`, against the
+        attention to the last part."""
         if self._feature() is not None:
             return self._attend_logits(x, q, parts, docs, scored, taps)
-        out, lse = sparse.attend(q, parts, self._sinks(), self.scale, self.softcap)
+        # The indexer's loss reads them too, so that a policy keeps them for both.
+        q, parts = remat.label("attention.in", (q, tuple(parts)))
+        out, lse = remat.named("attention", self._sparse, q, parts, self._sinks())
         if self._trains(scored, taps):
             assert scored is not None
             last = parts[-1]
@@ -494,6 +510,16 @@ class Sparse(FullLogits):
             width = q.shape[2] * last.k.shape[1]
             self._train_indexer(scored, partial(self._target, last), xs, width, taps)
         return out
+
+    def _sparse(
+        self,
+        q: Float[Array, "b t h dk"],
+        parts: tuple[sparse.Part, ...],
+        sinks: Float[Array, " h"] | None,
+    ) -> tuple[Float[Array, "b t h dv"], Float[Array, "b t h"]]:
+        """Return ``sparse.attend``'s output and logsumexp, by the layer's scale and
+        softcap."""
+        return sparse.attend(q, parts, sinks, self.scale, self.softcap)
 
     def _target(self, part: sparse.Part, xs: tuple) -> Float[Array, "b c s"]:
         """Return a chunk of queries' attention to the keys of `part`, given their
@@ -632,9 +658,9 @@ class SparseAttention(Sparse, Attention):
         )
 
     def __call__(self, x: Float[Array, "b t d"], taps: Taps) -> Float[Array, "b t d"]:
-        x = shard_layer_input(x)
         docs = segments(taps)
-        heads = self._heads(x, docs, taps)
+        x, projected = self._projections(x)
+        heads = self._heads(projected, docs, taps)
         return self._output(x, self._attend_tokens(x, x, heads, docs, taps))
 
 

@@ -15,13 +15,16 @@ rest. Every parameter's largest whole dimension also splits over `fsdp`. Outside
     layout    names, resolved to mesh axes        named, spec, splits, shard,
                                                   shard_stream
     place     where state and batches live        shardings, build, shard_state,
-                                                  shard_batch, microbatches
+                                                  shard_batch, local_rows,
+                                                  microbatches
     methods   one registry per kind of method     method
+    gather    a step's parameters gathered once,  whole, rows, splits, gather,
+              its gradients reduced once          scatter, apart
 
 docs/parallelism.md explains them.
 """
 
-from bux.parallel import methods
+from bux.parallel import gather, methods
 from bux.parallel.layout import (
     DIMENSIONS,
     NAMES,
@@ -34,12 +37,28 @@ from bux.parallel.layout import (
 )
 from bux.parallel.mesh import AXES, active, mesh, sizes
 from bux.parallel.methods import method
-from bux.parallel.place import build, microbatches, shard_batch, shard_state, shardings
+from bux.parallel.place import (
+    build,
+    local_rows,
+    microbatches,
+    shard_batch,
+    shard_state,
+    shardings,
+)
 from bux.parallel.settings import check, use
 
 # isort: split
 # Imported last, so that the names above exist when their methods register themselves.
-from bux.parallel import context, experts, flash, pipeline, recurrence, ring
+from bux.parallel import (
+    context,
+    experts,
+    flash,
+    pipeline,
+    recurrence,
+    ring,
+    scheduled,
+    tensor,
+)
 
 __all__ = [
     "AXES",
@@ -52,6 +71,8 @@ __all__ = [
     "context",
     "experts",
     "flash",
+    "gather",
+    "local_rows",
     "mesh",
     "method",
     "methods",
@@ -60,6 +81,7 @@ __all__ = [
     "pipeline",
     "recurrence",
     "ring",
+    "scheduled",
     "shard",
     "shard_batch",
     "shard_state",
@@ -68,5 +90,6 @@ __all__ = [
     "sizes",
     "spec",
     "splits",
+    "tensor",
     "use",
 ]

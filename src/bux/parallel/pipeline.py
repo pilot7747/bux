@@ -17,6 +17,10 @@ through the stages once; ``circular`` sends them round ``methods.rounds`` times,
 stage holding a share of every round's layers, so that a stage idles
 (S − 1) / (R·M + S − 1) of a step (``bubble``).
 
+Where the step computes its rows apart (``gather.apart``), the shard_map is manual
+over the axes that split them too: each device runs its own rows, and a stage's
+gradients reduce once, as they leave it, not once a tick.
+
 A method is ``(stage, params, rest, x, rows) -> (y, rest, losses)``. ``stage`` runs a
 stage's share of a round on one microbatch; ``params`` and ``rest`` are the layers'
 parameters and other state, each leaf (rounds, layers per round, ...); ``x`` is the
@@ -31,10 +35,11 @@ from typing import NamedTuple
 
 import jax
 import jax.numpy as jnp
+import numpy as np
 from jax.sharding import PartitionSpec as P
 from jaxtyping import Array, Bool, Float, Int, PyTree, Shaped
 
-from bux.parallel import methods
+from bux.parallel import gather, methods, schedule
 from bux.parallel.mesh import Active, active
 
 AXIS = "stage"
@@ -58,8 +63,13 @@ def pipelined() -> bool:
     return stages() > 1
 
 
-def bubble(stages: int, microbatches: int, rounds: int = 1) -> float:
-    """Return the fraction of a step each stage idles: (S − 1) / (R·M + S − 1)."""
+def bubble(
+    stages: int, microbatches: int, rounds: int = 1, method: str = "gpipe"
+) -> float:
+    """Return the fraction of a step each stage idles: (S − 1) / (R·M + S − 1), or
+    for a method run by a table, as its table says (``schedule.Table.bubble``)."""
+    if method in schedule.TABLES and stages > 1:
+        return schedule.TABLES[method](stages, microbatches).bubble()
     return (stages - 1) / (rounds * microbatches + stages - 1)
 
 
@@ -70,17 +80,32 @@ def _on() -> Active:
     return on
 
 
+def uneven() -> tuple[int, ...] | None:
+    """Return the passes of the pipelined repeat each stage runs, if the run in force
+    gives them (``methods.stages``); None if they split evenly."""
+    on = active()
+    return None if on is None or on.methods.stages is None else tuple(on.methods.stages)
+
+
 def rounds(passes: int) -> int:
     """Return how many rounds the run in force pipelines a repeat of `passes` passes
-    in. Raise unless the passes split evenly over the stages of every round, and a
-    circular pipeline has at least one microbatch per stage to keep the stages busy."""
+    in. Raise unless the passes split evenly over the stages of every round, or as
+    `methods.stages` says, and a circular pipeline has at least one microbatch per
+    stage to keep the stages busy."""
     on = _on()
     s, settings = on.size(AXIS), on.methods
-    if passes % (s * settings.rounds):
+    if (split := uneven()) is not None:
+        _check_uneven(split, s, passes, settings.rounds)
+    elif passes % (s * settings.rounds):
         raise ValueError(
             f"mesh.stage = {s} pipelines the longest scanned repeat, of {passes} "
             f"passes, in methods.rounds = {settings.rounds}: make its passes a "
             f"multiple of {s * settings.rounds}"
+        )
+    if settings.rounds > 1 and settings.pipeline in schedule.TABLES:
+        raise ValueError(
+            f"methods(pipeline={settings.pipeline}) goes round the stages once, not "
+            f"methods.rounds = {settings.rounds} times"
         )
     if settings.rounds > 1 and settings.microbatches < s:
         raise ValueError(
@@ -88,6 +113,40 @@ def rounds(passes: int) -> int:
             f"methods.microbatches = {settings.microbatches} < mesh.stage = {s}"
         )
     return settings.rounds
+
+
+def _check_uneven(
+    split: tuple[int, ...], stages: int, passes: int, rounds: int
+) -> None:
+    """Raise unless `split` gives each of the `stages` passes, `passes` in all, in one
+    round."""
+    if len(split) != stages or sum(split) != passes:
+        raise ValueError(
+            f"methods.stages = {list(split)} splits {sum(split)} passes over "
+            f"{len(split)} stages, and the pipelined repeat has {passes} passes over "
+            f"mesh.stage = {stages}"
+        )
+    if rounds > 1:
+        raise ValueError("methods.stages splits one round, not methods.rounds")
+
+
+def spread(
+    stacked: Shaped[Array, "l ..."], split: tuple[int, ...]
+) -> Shaped[Array, "m ..."]:
+    """Return a stacked variable of the passes `split` gives each stage, laid out as
+    many to a stage as the most any takes: each stage's own, then copies of its
+    first, which it skips (``layers_run``)."""
+    most, start, parts = max(split), 0, []
+    for n in split:
+        own = stacked[start : start + n]
+        parts += [own, jnp.broadcast_to(own[:1], (most - n, *own.shape[1:]))]
+        start += n
+    return jnp.concatenate(parts)
+
+
+def layers_run(split: tuple[int, ...]) -> Bool[np.ndarray, "s l"]:
+    """Return which of its slots each stage runs, where `split` gives the passes."""
+    return np.arange(max(split))[None, :] < np.array(split)[:, None]
 
 
 @methods.pipeline.register("gpipe")
@@ -161,12 +220,14 @@ class Clock(NamedTuple):
                 f"{x.shape[0]} rows do not split into methods.microbatches = {m}"
             )
         rows = jax.tree.map(lambda a: _micro(a, m), rows)
+        apart = gather.rows_apart()  # the axes that split the rows, if manual here too
         by_stage = P(AXIS)  # each stage's own, on its devices
+        by_row = P(None, apart or None)  # each device's rows of every microbatch
         io, rest, losses = jax.shard_map(
-            functools.partial(_device, self, stage),
-            in_specs=(by_stage, by_stage, P(), P()),
-            out_specs=by_stage,
-            axis_names={AXIS},
+            functools.partial(_device, self, stage, apart),
+            in_specs=(by_stage, by_stage, by_row, by_row),
+            out_specs=(P(AXIS, None, apart or None), by_stage, by_stage),
+            axis_names={AXIS, *apart},
             check_vma=False,  # else nested shard_maps' gradients fail to lower
         )(_by_stage(params, s), _by_stage(rest, s), _micro(x, m), rows)
         y = jnp.sum(jnp.where(_first(io), io, 0), 0)  # the first stage's buffer
@@ -183,19 +244,26 @@ class Clock(NamedTuple):
 def _device(
     clock: Clock,
     stage: Stage,
+    apart: tuple[str, ...],
     params: PyTree,
     rest: PyTree,
     xs: Shaped[Array, "m n t *r"],
     rows: PyTree,
 ) -> tuple[Shaped[Array, "1 m n t *r"], PyTree, Float[Array, "1 rounds l k"]]:
     """Run one stage on its devices: at every tick, its share of a round on one
-    microbatch (``_tick``). The first stage's buffer ends up holding the stream."""
+    microbatch (``_tick``). The first stage's buffer ends up holding the stream.
+
+    Manual over the axes `apart` too, it runs this device's rows alone: its gradients
+    are its own, which the shard_map's transpose sums over `apart` as they leave."""
     index = jax.lax.axis_index(AXIS)
-    params, rest = _at(params, 0), _at(rest, 0)  # this stage's
+    params, before = _at(params, 0), _at(rest, 0)  # this stage's
     tick = functools.partial(_tick, clock, stage, params, rows, index)
-    carry = (jnp.zeros_like(xs[0]), xs, rest)
+    carry = (jnp.zeros_like(xs[0]), xs, gather.own_streams(before, apart))
     (_, io, rest), (losses, r) = jax.lax.scan(tick, carry, jnp.arange(clock.ticks))
-    return io[None], jax.tree.map(lambda a: a[None], rest), clock.mean(losses, r)[None]
+    rest = gather.keys_of(before, rest)
+    losses = clock.mean(losses, r)
+    losses = jax.lax.pmean(losses, apart) if apart else losses
+    return io[None], jax.tree.map(lambda a: a[None], rest), losses[None]
 
 
 def _tick(

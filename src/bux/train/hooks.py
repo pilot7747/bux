@@ -29,6 +29,7 @@ import jax
 import orbax.checkpoint as ocp
 from jaxtyping import Array, Shaped
 
+from bux.train import trace
 from bux.train.data import Batch
 from bux.train.objective import Metrics
 from bux.train.optim import Schedule
@@ -151,7 +152,10 @@ class Checkpoint(Hook):
 
 class Profile(Hook):
     """A jax.profiler trace, into `folder`, of the `steps` steps after step `start`.
-    It waits for the step before it starts and stops, so the trace holds whole steps."""
+    It waits for the step before it starts and stops, so the trace holds whole steps.
+
+    On GPUs it then reports what a step of them spent in collectives, `comm_ms`, and in
+    collectives with no compute beside them, `exposed_comm_ms` (``bux.train.trace``)."""
 
     def __init__(self, folder: Path, *, start: int, steps: int):
         self.folder, self.first, self.last = folder, start, start + steps
@@ -163,9 +167,12 @@ class Profile(Hook):
     def start(self, trainer: "Trainer") -> None:
         self._at(trainer.step)  # step 0, or the step a run resumes at
 
-    def __call__(self, trainer: "Trainer", metrics: Metrics) -> None:
+    def __call__(self, trainer: "Trainer", metrics: Metrics) -> Scalars | None:
         jax.block_until_ready(metrics)
         self._at(trainer.step)
+        if trainer.step != self.last or (file := trace.latest(self.folder)) is None:
+            return None
+        return trace.comm_ms(file, self.last - self.first)
 
     def _at(self, step: int) -> None:
         if step == self.first:

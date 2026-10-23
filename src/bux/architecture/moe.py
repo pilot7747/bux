@@ -21,6 +21,7 @@ from jaxtyping import Array, Float, Int
 
 from bux import config as cfg
 from bux import parallel
+from bux.architecture import grouped_blockscaled, matmuls
 from bux.architecture.grouped import ragged_dot
 from bux.architecture.mlp import MLP, activate
 from bux.architecture.norm import Norm
@@ -82,16 +83,37 @@ def experts(
     by expert: the first sizes[0] are expert 0's, the next sizes[1] expert 1's, and so
     on; rows past them come out 0 before `norm`. It depends on its arguments alone, so
     it runs on one device's experts in a shard_map as it does on all of them. Its
-    products are named `experts` (``remat``)."""
+    products are named `experts` (``remat``), and multiply in the experts' format
+    (``experts_format``): by ``grouped_blockscaled`` in one of its RECIPES, there up
+    and gate as one, else in compute."""
+    recipe = grouped_blockscaled.RECIPES.get(experts_format())
 
     def product(
         x: Float[Array, "n e"], w: Float[Array, "E e f"]
     ) -> Float[Array, "n f"]:
-        return checkpoint_name(ragged_dot(x, w, sizes), "experts")
+        if recipe is None or not grouped_blockscaled.fits(x, w):
+            return checkpoint_name(ragged_dot(x, w, sizes), "experts")
+        precision, seed = matmuls.in_force(), matmuls.seed()
+        y = grouped_blockscaled.ragged_dot(x, w, sizes, recipe, seed, precision.passes)
+        return checkpoint_name(y, "experts")
 
-    g = None if gate is None else product(x, gate)
-    y = product(activate(ffn, product(x, up), g), down)
+    if gate is not None and recipe is not None and grouped_blockscaled.fits(x, up):
+        # One GEMM for both: x quantizes once.
+        u, g = jnp.split(product(x, jnp.concatenate([up, gate], -1)), 2, axis=-1)
+    else:
+        u, g = product(x, up), None if gate is None else product(x, gate)
+    y = product(activate(ffn, u, g), down)
     return y if norm is None else norm(y)
+
+
+def experts_format() -> str:
+    """Return the format the routed experts multiply in, in the branch that is
+    tracing: their role's (``matmuls.format_of``), or compute where `roles.experts` is
+    none. Unlike the other roles, they take no format from `matmuls`: on B300s their
+    grouped MXFP8 GEMM trains the baseline's MoE slower than bfloat16 does."""
+    if matmuls.in_force().roles.experts is None:
+        return "compute"
+    return matmuls.format_of("experts")
 
 
 def sort_by_expert(
@@ -106,31 +128,67 @@ def sort_by_expert(
     return order, jnp.bincount(flat, length=num_experts + 1)[:num_experts]
 
 
+def _take(x: Float[Array, "m d"], at: Int[Array, " M"]) -> Float[Array, "M d"]:
+    """Return x[at], 0 where `at` is past the rows of x."""
+    return jnp.take(x, at, axis=0, mode="fill", fill_value=0)
+
+
+def _summed(
+    x: Float[Array, "m d"], back: Int[Array, " M"], k: int
+) -> Float[Array, "n d"]:
+    """Return each row's sum of the rows of its k picks, in x where `back` says."""
+    picks = _take(x, back).reshape(-1, k, x.shape[-1])
+    return jnp.sum(picks, 1, dtype=jnp.float32).astype(x.dtype)
+
+
 @partial(jax.custom_vjp, nondiff_argnums=(3,))
 def pick_rows(
-    z: Float[Array, "n d"], order: Int[Array, " m"], back: Int[Array, " m"], k: int
+    z: Float[Array, "n d"], order: Int[Array, " m"], back: Int[Array, " M"], k: int
 ) -> Float[Array, "m d"]:
-    """Return z[order // k], the rows of the picks in `order`: a permutation of the
-    m = n k picks, k per row of z, which `back` undoes. Its gradient gathers by `back`
-    and sums each row's k picks, where XLA's would scatter-add, 4 times slower on a
-    B300."""
+    """Return z[order // k], the rows of the picks in `order`: the first m of a
+    permutation of the M = n k picks, k per row of z, which `back` undoes. Its
+    gradient gathers by `back` and sums each row's k picks, where XLA's would
+    scatter-add, 4 times slower on a B300."""
     return z[order // k]
 
 
 def _pick_rows_forward(
-    z: Float[Array, "n d"], order: Int[Array, " m"], back: Int[Array, " m"], k: int
-) -> tuple[Float[Array, "m d"], Int[Array, " m"]]:
+    z: Float[Array, "n d"], order: Int[Array, " m"], back: Int[Array, " M"], k: int
+) -> tuple[Float[Array, "m d"], Int[Array, " M"]]:
     return z[order // k], back
 
 
 def _pick_rows_backward(
-    k: int, back: Int[Array, " m"], g: Float[Array, "m d"]
+    k: int, back: Int[Array, " M"], g: Float[Array, "m d"]
 ) -> tuple[Float[Array, "n d"], None, None]:
-    rows = g[back].reshape(-1, k, g.shape[-1])
-    return jnp.sum(rows, 1, dtype=jnp.float32).astype(g.dtype), None, None
+    return _summed(g, back, k), None, None
 
 
 pick_rows.defvjp(_pick_rows_forward, _pick_rows_backward)
+
+
+@partial(jax.custom_vjp, nondiff_argnums=(3,))
+def sum_rows(
+    x: Float[Array, "m d"], back: Int[Array, " M"], order: Int[Array, " m"], k: int
+) -> Float[Array, "n d"]:
+    """Return each row's sum of its k picks' rows of x, which holds the first m picks
+    in `order`: the transpose of ``pick_rows``. Its gradient gathers by `order`."""
+    return _summed(x, back, k)
+
+
+def _sum_rows_forward(
+    x: Float[Array, "m d"], back: Int[Array, " M"], order: Int[Array, " m"], k: int
+) -> tuple[Float[Array, "n d"], Int[Array, " m"]]:
+    return _summed(x, back, k), order
+
+
+def _sum_rows_backward(
+    k: int, order: Int[Array, " m"], g: Float[Array, "n d"]
+) -> tuple[Float[Array, "m d"], None, None]:
+    return g[order // k], None, None
+
+
+sum_rows.defvjp(_sum_rows_forward, _sum_rows_backward)
 
 
 @jax.custom_vjp
@@ -235,12 +293,12 @@ class MoE(nnx.Module):
         latent = config.latent_size or width
         inner = "latent" if config.latent_size else "embed"  # the width the experts see
         self.to_latent = (
-            linear(width, latent, ("embed", "latent"), False, rngs)
+            linear(width, latent, ("embed", "latent"), False, rngs, role="latent")
             if config.latent_size
             else None
         )
         self.from_latent = (
-            linear(latent, width, ("latent", "embed"), False, rngs)
+            linear(latent, width, ("latent", "embed"), False, rngs, role="latent")
             if config.latent_size
             else None
         )
@@ -264,7 +322,7 @@ class MoE(nnx.Module):
 
     def __call__(self, x: Float[Array, "b t d"], taps: Taps) -> Float[Array, "b t d"]:
         idx, weights, sinks = self._route(x, taps)
-        y = parallel.method("moe")(self, self._latent(x), idx, weights)
+        y = parallel.method("moe")(self, self._latent(x), idx, weights, taps)
         if self.latent_output_norm is not None:
             y = self.latent_output_norm(y)
         if self.from_latent is not None:
@@ -358,7 +416,7 @@ class MoE(nnx.Module):
         return y
 
 
-# --- Methods: (moe, z, idx, weights) -> the routed sum, in the experts' width -------
+# --- Methods: (moe, z, idx, weights, taps) -> the routed sum, in the experts' width -
 
 
 @methods.moe.register("dense")
@@ -367,6 +425,7 @@ def run_dense(
     z: Float[Array, "b t d"],
     idx: Int[Array, "b t k"],
     weights: Float[Array, "b t k"],
+    taps: Taps | None = None,
 ) -> Float[Array, "b t d"]:
     """Run every expert on every token and weight the outputs by the router: the
     reference. Each device runs every expert on its own tokens."""
@@ -392,6 +451,7 @@ def run_sorted(
     z: Float[Array, "b t d"],
     idx: Int[Array, "b t k"],
     weights: Float[Array, "b t k"],
+    taps: Taps | None = None,
 ) -> Float[Array, "b t d"]:
     """Run each expert on its own rows (``routed``), each device on its own tokens
     with every expert's kernels: a shard_map over the axes that split the tokens, so

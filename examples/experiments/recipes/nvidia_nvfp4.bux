@@ -1,0 +1,16 @@
+# NVIDIA's NVFP4 pretraining recipe ("Pretraining Large Language Models with NVFP4",
+# 2025; Transformer Engine's NVFP4BlockScaling): E2M1 values with an E4M3 scale per 16
+# and a float32 scale per tensor; W in 16 x 16 tiles, so that y and dx see the same W;
+# gradients rounded stochastically; and a random Hadamard transform of 16 on what dW
+# multiplies. Their 12B hybrid kept its first 2 and last 8 layers in bfloat16, each a
+# residual branch here, so a Llama-style block is two. Sweep how many:
+#
+#   use nvidia_nvfp4
+#   precision.last = 4 | 8
+#
+# Taking fprop to bfloat16 for the last 18% of the tokens cut their loss gap from 1.5%
+# to 0.5%: precision.switch = switch(at=0.82, passes=[dgrad, wgrad]).
+#
+# Left out: NVFP4 routed experts, which stay in bfloat16. On a B300 the recipe trains a
+# dense 1.3B as fast as MXFP8, its edges in bfloat16; NVFP4 everywhere 1.06x MXFP8.
+precision = precision(compute=bfloat16, matmuls=nvfp4, first=2, last=8)

@@ -32,6 +32,7 @@ remat = _registry("remat")
 pipeline = _registry("pipeline")
 orthogonalize = _registry("orthogonalize")
 loss = _registry("loss")
+tensor = _registry("tensor")
 
 REGISTRIES = {
     "attention": attention,
@@ -42,6 +43,7 @@ REGISTRIES = {
     "pipeline": pipeline,
     "orthogonalize": orthogonalize,
     "loss": loss,
+    "tensor": tensor,
 }
 
 
@@ -54,10 +56,11 @@ def method(kind: str) -> Method:
 def validate(config: MethodsConfig) -> None:
     """Raise if `config` names a method that is not registered.
 
-    An unregistered default is fine: its call site is not wired yet.
+    An unregistered default is fine: its call site is not wired yet. A method given
+    as data, as `remat(...)` is, has no name to find.
     """
     default = MethodsConfig()
     for kind, registry in REGISTRIES.items():
         name = getattr(config, kind)
-        if name != getattr(default, kind):
+        if isinstance(name, str) and name != getattr(default, kind):
             registry.find(name)

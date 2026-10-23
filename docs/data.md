@@ -173,6 +173,14 @@ mixture has `round(weight * batch)` rows of each source in every batch, by large
 remainder. So batch `i` depends only on the seed and `i`, and a run that resumes at
 step `i` reads what it would have read.
 
+The windows' order is a Feistel network over them (`data.permuted`), which says where
+any window goes without making the permutation of them all: at 10T tokens, 2.4G
+windows of 4096, the permutation would take 19 GB of every process's memory and a
+minute an epoch. `synthetic` draws each row of its stream from a seed of its own. So
+a source reads any rows alone, and in a job of many processes each reads only the rows
+of a batch that its devices hold
+([Many nodes](parallelism.md#many-nodes)).
+
 ## Design notes
 
 **Offline, once.** Packing well needs to see many documents at once, which is cheap

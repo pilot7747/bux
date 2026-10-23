@@ -1,73 +1,174 @@
-"""Rematerialization: the methods of `methods.remat`, and the calls they apply to.
+"""Rematerialization: `methods.remat`, what the forward pass keeps for the backward
+one, which computes the rest again; and the calls it applies to.
 
-A method is a jax.checkpoint policy: what the forward pass keeps for the backward one,
-which computes the rest again. `none` keeps everything, so nothing is redone, but in a
-scanned pass, which keeps all but what elementwise ops make (``unfused``). Each
-residual branch outside any other is rematerialized (``rematted``), and so is each
-scanned pass as a whole; nothing inside either is rematerialized again.
+    methods = methods(remat=remat(save=[attention, mlp], first=8))
 
-Layers name what is worth keeping (``checkpoint_name``), for the policies that keep
-it by name: `attention`, softmax attention's output and what its backward takes
-(``named``); `recurrence`, the same of the recurrent mixers; `qkv`, attention's
-projections; `mlp`, an MLP's up and gate projections; and `experts`, the MoE's.
+A policy keeps what it names in `save`, moves what it names in `offload` to the host's
+memory until the backward reads it, and computes everything else again
+(``keeping``). Each residual branch outside any other is rematerialized as a unit
+(``rematted``), and so is each scanned pass; nothing inside either is again. With
+`first`, only the first passes of each repeat are, and the rest keep everything
+(``at_pass``). A policy is also a name in `methods.remat` (``PRESETS``): `none` keeps
+everything, but in a scanned pass, which keeps all but what elementwise ops make
+(``unfused``).
+
+Layers name what is worth keeping (``checkpoint_name``):
+
+    attention.in    softmax attention's q, k and v, as its kernel takes them (``named``)
+    attention.out   its output, and what else its backward takes: the log-sum-exp
+    attention.index the keys sparse attention's indexer kept for each query
+    recurrence.in   a recurrent mixer's inputs, as its kernel takes them
+    recurrence.out  its output, and what else its backward takes: the chunks' states
+    qkv             attention's projections, MLA's latents
+    mlp             an MLP's up and gate projections
+    experts         an MoE's grouped products
+
+A name covers those under it: `attention` is all three of attention's. `dots` names
+every product of matrices, the experts' too, and `dots_no_batch` those without batch
+dimensions.
 """
 
 import contextlib
 import contextvars
+import functools
 from collections.abc import Callable, Generator
 from typing import Any
 
 import jax
 from flax import nnx
-from jax.ad_checkpoint import checkpoint_name
+from jax.ad_checkpoint import Offloadable, checkpoint_name, name_p
 from jax.extend.core import Primitive
+from jaxtyping import Shaped
 
 from bux import parallel
 from bux.architecture import pure
 from bux.architecture.registry import Stream, Taps
 from bux.parallel import methods
+from bux.train.config import RematConfig
 
+Policy = Callable[..., Any]  # of jax.checkpoint: True, False or an Offloadable
+
+# The products of matrices: jax's MXFP8 GEMM is `scaled_matmul_wrapper` as
+# jax.nn.scaled_matmul binds it, and `scaled_matmul` as blockscaled binds it inside a
+# shard_map, which jax's own policies miss.
+SCALED = frozenset({"scaled_matmul", "scaled_matmul_wrapper"})
+GEMMS = SCALED | {"dot_general", "conv_general_dilated"}
+DOTS = ("dots", "dots_no_batch")
+OFFLOAD = Offloadable(src="device", dst="pinned_host")
+
+
+def _dots(prim: Primitive, args: tuple, params: dict) -> bool:
+    return prim.name in GEMMS
+
+
+def _dots_no_batch(prim: Primitive, args: tuple, params: dict) -> bool:
+    if prim.name == "dot_general":
+        _, (lhs_batch, rhs_batch) = params["dimension_numbers"]
+        return not lhs_batch and not rhs_batch
+    return prim.name in SCALED and args[0].shape[0] == 1  # bux's GEMMs: a batch of 1
+
+
+KINDS = {"dots": _dots, "dots_no_batch": _dots_no_batch}
+
+
+def _under(name: str, scope: str) -> bool:
+    """Return whether `scope` covers `name`: it is the name, or the name starts with
+    it and a dot."""
+    return name == scope or name.startswith(scope + ".")
+
+
+def _covers(names: tuple[str, ...], prim: Primitive, args: tuple, params: dict) -> bool:
+    """Return whether `names` cover what `prim` makes: a value named one of them or
+    under one, or a product of matrices of a kind among them."""
+    if prim is name_p:
+        return any(_under(params["name"], scope) for scope in names)
+    return any(KINDS[kind](prim, args, params) for kind in names if kind in KINDS)
+
+
+@functools.cache
+def keeping(save: tuple[str, ...] = (), offload: tuple[str, ...] = ()) -> Policy:
+    """Return the policy that keeps what `save` names, moves what `offload` names to
+    the host's memory, and computes the rest again. The experts' grouped products are
+    products of matrices to `dots` and `dots_no_batch`."""
+    if set(save) & set(DOTS):
+        save = (*save, "experts")
+
+    def policy(prim: Primitive, *args: Any, **params: Any) -> bool | Offloadable:
+        if _covers(offload, prim, args, params):
+            return OFFLOAD
+        return _covers(save, prim, args, params)
+
+    return policy
+
+
+MIXERS = ("attention", "recurrence")  # what the *_attention presets keep
+PRESETS = {
+    "full": RematConfig(),
+    "dots": RematConfig(save=("dots",)),
+    "dots_no_batch": RematConfig(save=("dots_no_batch",)),
+    "save_attention": RematConfig(save=MIXERS),
+    "save_qkv_attention": RematConfig(save=(*MIXERS, "qkv")),
+    "dots_attention": RematConfig(save=("dots_no_batch", *MIXERS, "experts")),
+    "offload_attention": RematConfig(offload=MIXERS),
+}
 methods.remat.register("none")(jax.checkpoint_policies.everything_saveable)
-methods.remat.register("full")(jax.checkpoint_policies.nothing_saveable)
-methods.remat.register("dots")(jax.checkpoint_policies.dots_saveable)
-methods.remat.register("dots_no_batch")(
-    jax.checkpoint_policies.dots_with_no_batch_dims_saveable
-)
-
-MIXERS = ("attention", "recurrence")  # what the *_attention methods keep
-_names = jax.checkpoint_policies.save_only_these_names
-methods.remat.register("save_attention")(_names(*MIXERS))
-methods.remat.register("save_qkv_attention")(_names(*MIXERS, "qkv"))
-methods.remat.register("dots_attention")(
-    jax.checkpoint_policies.save_from_both_policies(
-        jax.checkpoint_policies.dots_with_no_batch_dims_saveable,
-        _names(*MIXERS, "experts"),
-    )
-)
-methods.remat.register("offload_attention")(
-    jax.checkpoint_policies.save_and_offload_only_these_names(
-        names_which_can_be_saved=[],
-        names_which_can_be_offloaded=list(MIXERS),
-        offload_src="device",
-        offload_dst="pinned_host",
-    )
-)
+for _name, _preset in PRESETS.items():
+    methods.remat.register(_name)(keeping(_preset.save, _preset.offload))
 
 # Set while a rematerialized call traces, so that what it calls is not again.
 _REMATTED = contextvars.ContextVar("rematted", default=False)
 # Set while a call traces under a policy of the run's: what `named` names, only it
 # keeps. Under `unfused`, naming would keep what it makes the backward compute again.
 _NAMING = contextvars.ContextVar("naming", default=False)
+# The pass of the outermost repeat that traces, which `first` counts; None outside.
+_PASS = contextvars.ContextVar[int | None]("pass", default=None)
 
-Policy = Callable[..., bool]
+
+def setting() -> str | RematConfig:
+    """Return the run's `methods.remat`, or none outside ``parallel.use``."""
+    on = parallel.active()
+    return on.methods.remat if on else "none"
+
+
+def _found(remat: str | RematConfig) -> Policy:
+    if isinstance(remat, str):
+        return methods.remat.find(remat)
+    return keeping(remat.save, remat.offload)
 
 
 def policy() -> Policy | None:
     """Return the run's remat policy; None where nothing rematerializes: with `none`,
-    or inside a call that does already."""
-    found = parallel.method("remat")
+    inside a call that does already, or in a pass past the run's `first`."""
+    remat = setting()
+    found = _found(remat)
     none = found is jax.checkpoint_policies.everything_saveable
-    return None if none or _REMATTED.get() else found
+    return None if none or _REMATTED.get() or _past_first(remat) else found
+
+
+def _past_first(remat: str | RematConfig) -> bool:
+    first, at = getattr(remat, "first", None), _PASS.get()
+    return first is not None and at is not None and at >= first
+
+
+@contextlib.contextmanager
+def at_pass(i: int) -> Generator[None]:
+    """Trace the block as pass i of a repeat, for `first`; inside a pass of an outer
+    repeat, as that pass still."""
+    token = _PASS.set(i) if _PASS.get() is None else None
+    try:
+        yield
+    finally:
+        if token is not None:
+            _PASS.reset(token)
+
+
+def spans(start: int, stop: int) -> list[tuple[int, int]]:
+    """Return passes start to stop of a repeat as runs that rematerialize alike: those
+    before the run's `first`, and the rest."""
+    first = getattr(setting(), "first", None)
+    if first is None or not start < first < stop:
+        return [(start, stop)]
+    return [(start, first), (first, stop)]
 
 
 @contextlib.contextmanager
@@ -102,19 +203,34 @@ def unfused(prim: Primitive, *_: object, **params: object) -> bool:
     return prim.name not in CHEAP
 
 
+def label[T](name: str, tree: T) -> T:
+    """Return `tree`, its arrays named `name` inside a call the run's policy
+    rematerializes (``named``)."""
+    if not _NAMING.get():
+        return tree
+    return jax.tree.map(lambda a: checkpoint_name(a, name), tree)
+
+
 def named[R](name: str, f: Callable[..., R], *args: Any) -> R:
-    """Return f(*args), naming its output and the residuals its backward takes
-    `name`, inside a call the run's policy rematerializes: one that keeps the name computes
-    none of f again. A kernel's residuals, as flash attention's log-sum-exp, are no
-    products of matrices, so `dots` computes such a kernel again whole. `f` closes
-    over no array but constants: jax differentiates it by `args` alone."""
+    """Return f(*args), naming what its backward takes, inside a call the run's policy
+    rematerializes: `name.in` its inputs, and `name.out` its output and what else, so
+    that a policy that keeps `name` computes none of f again. A kernel's residuals, as
+    flash attention's log-sum-exp, are no products of matrices, so `dots` computes
+    such a kernel again whole. `f` closes over no array but constants: jax
+    differentiates it by `args` alone."""
     if not _NAMING.get():
         return f(*args)
     call = jax.custom_vjp(f)
 
     def forward(*args: Any) -> tuple[R, Any]:
         out, pull = jax.vjp(f, *args)
-        return jax.tree.map(lambda a: checkpoint_name(a, name), (out, pull))
+        inputs = {id(a) for a in jax.tree.leaves(args)}
+
+        def labelled(a: Shaped[jax.Array, "*s"]) -> Shaped[jax.Array, "*s"]:
+            part = "in" if id(a) in inputs else "out"
+            return checkpoint_name(a, f"{name}.{part}")
+
+        return jax.tree.map(labelled, (out, pull))
 
     call.defvjp(forward, lambda pull, cotangent: pull(cotangent))
     return call(*args)

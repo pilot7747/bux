@@ -10,16 +10,21 @@ import jax.numpy as jnp
 import numpy as np
 import pytest
 from flax import nnx
+from jax._src.ad_checkpoint import saved_residuals
+from jax.extend.core import ClosedJaxpr, Jaxpr
+from jax.sharding import PartitionSpec as P
 from jaxtyping import Float
 from optax.contrib import MuonDimensionNumbers
 
 from bux import parallel
-from bux.architecture import Model, MoE, Norm, Scanned
+from bux.architecture import Model, MoE, Norm, Scanned, matmuls, remat
 from bux.architecture.graph import Sequence
 from bux.architecture.residual import HyperConnections
 from bux.lang import compile, compile_runs
+from bux.lang.printer import run_to_source
 from bux.parallel import methods
 from bux.parallel.context import xla
+from bux.train.config import RematConfig
 from bux.train.optim import muon_matrices, weight_decay_mask
 from bux.train.trainer import cast, directory, train
 
@@ -378,6 +383,144 @@ def test_a_policy_that_keeps_attention_runs_its_kernel_once(remat, runs):
     with _use(how):
         text = grads.lower(*args).as_text()
     assert text.count("stablehlo.cbrt") == 3 * runs  # 3 layers
+
+
+# --- Remat as data ---------------------------------------------------------------------
+
+
+def test_a_policy_is_data_that_the_language_writes_and_prints():
+    how = "methods(remat=remat(save=[attention.in, mlp], offload=qkv, first=2))"
+    [run] = compile_runs(f"{LLAMA}\n{TRAIN}steps = 1\nmethods = {how}")
+    policy = run.train.methods.remat
+    assert policy == RematConfig(
+        save=("attention.in", "mlp"), offload=("qkv",), first=2
+    )
+    assert compile_runs(run_to_source(run))[0].train.methods == run.train.methods
+
+
+def test_a_policy_as_data_keeps_what_the_preset_of_its_names_does():
+    preset = _temp(LLAMA, "methods(remat=save_qkv_attention)")
+    names = "methods(remat=remat(save=[attention, recurrence, qkv]))"
+    assert _temp(LLAMA, names) == preset > _temp(LLAMA, "methods(remat=full)")
+
+
+# Policies of every kind, rematerializing some passes and not others: the second scan
+# of single-pass mhc starts from what the first leaves in the taps.
+FIRST = [
+    "remat(first=1)",
+    "remat(save=[attention, mlp], first=2)",
+    "remat(save=dots_no_batch, offload=mlp, first=2)",
+]
+
+
+@pytest.mark.parametrize("remat", FIRST)
+@pytest.mark.parametrize("arch", ["hc", "single_pass"])
+def test_a_policy_of_the_first_passes_trains_the_same(losses, arch, remat):
+    source = {"hc": HC, "single_pass": SINGLE_PASS}[arch]
+    plain = losses(source)
+    for repeat in ("unroll", "scan"):
+        rematted = losses(source, methods=f"methods(repeat={repeat}, remat={remat})")
+        assert np.allclose(rematted, plain, atol=1e-5)
+
+
+@pytest.mark.parametrize(("repeat", "runs"), [("unroll", 4), ("scan", 3)])
+def test_a_policy_of_the_first_pass_runs_only_its_kernel_twice(repeat, runs):
+    # Unrolled, the first of 3 layers runs it twice; scanned, the first pass is a scan
+    # of its own, its body once in the forward and once in the backward, and the rest
+    # another, once.
+    how = f"methods(attention=cube_root, repeat={repeat}, remat=remat(first=1))"
+    grads, args = _gradient(LLAMA, how)
+    with _use(how):
+        text = grads.lower(*args).as_text()
+    assert text.count("stablehlo.cbrt") == runs
+
+
+def _scaled_matmuls(how: str) -> int:
+    """How many MXFP8 GEMMs the gradient of tanh(x W) takes, inside a shard_map
+    rematerialized by `how`."""
+
+    def project(
+        x: Float[jax.Array, "m k"], w: Float[jax.Array, "k n"]
+    ) -> Float[jax.Array, "m n"]:
+        return jnp.tanh(matmuls.dot_general(x, w, (((1,), (0,)), ((), ()))))
+
+    def loss(
+        x: Float[jax.Array, "m k"], w: Float[jax.Array, "k n"]
+    ) -> Float[jax.Array, ""]:
+        rematted = remat.checkpoint(project, prevent_cse=True)
+        return jax.shard_map(rematted, in_specs=P(), out_specs=P())(x, w).sum()
+
+    x = jnp.ones((64, 64))
+    with _use(f"methods(remat={how})"), matmuls.use("mxfp8", jnp.asarray(TOKENS)):
+        jaxpr = jax.make_jaxpr(jax.grad(loss, argnums=(0, 1)))(x, x)
+    return _count(jaxpr.jaxpr, "scaled_matmul")
+
+
+def test_a_dots_policy_keeps_an_mxfp8_gemm_inside_a_shard_map():
+    # There blockscaled binds jax's inner `scaled_matmul`, which jax's dots policy
+    # misses: its backward would run the forward's GEMM again for tanh's.
+    assert _scaled_matmuls("dots") == _scaled_matmuls("dots_no_batch") == 3
+    assert _scaled_matmuls("full") == 4
+
+
+def _count(jaxpr: Jaxpr, primitive: str) -> int:
+    """How many times `primitive` runs in `jaxpr`, inside the jaxprs it calls too."""
+    n = 0
+    for eqn in jaxpr.eqns:
+        n += eqn.primitive.name == primitive
+        for param in eqn.params.values():
+            for sub in param if isinstance(param, tuple | list) else (param,):
+                if isinstance(sub, ClosedJaxpr):
+                    sub = sub.jaxpr
+                if isinstance(sub, Jaxpr):
+                    n += _count(sub, primitive)
+    return n
+
+
+MLA = "mla(num_heads=4, kv_lora_rank=16, q_lora_rank=32, qk_rope_head_dim=8"
+SPARSE = PRELUDE + (
+    f"sparse = {MLA}, indexer=indexer(num_heads=2, head_dim=8, top_k=4))\n"
+    "model = embed ([norm sparse] [norm ffn])^2 norm head"
+)
+
+
+def _saved(source: str, how: str) -> tuple[str, list[tuple[tuple[int, ...], str]]]:
+    """The gradient of a training forward of `source` under `how`, as text, and what
+    its forward saves for its backward."""
+    model = _model(source, f"methods(remat={how})")
+    graphdef, params, rest = nnx.split(model, nnx.Param, ...)
+
+    def loss(params: nnx.State, rest: nnx.State) -> Float[jax.Array, ""]:
+        m = nnx.merge(graphdef, params, rest, copy=True)
+        heads, losses = m.training_heads(jnp.asarray(TOKENS))
+        return heads[0].logits().mean() + sum(loss.value for loss in losses)
+
+    with _use(f"methods(remat={how})"):
+        text = jax.jit(jax.grad(loss)).lower(params, rest).as_text()
+        saved = saved_residuals(loss, params, rest)
+    return text, [(getattr(aval, "shape", ()), what) for aval, what in saved]
+
+
+@pytest.mark.parametrize(
+    ("remat", "runs"),
+    [
+        ('"none"', 1),
+        ("full", 2),
+        ("save_attention", 1),
+        ("remat(save=[qkv, attention.out, attention.index])", 1),
+    ],
+)
+def test_a_policy_that_keeps_sparse_attention_runs_its_indexer_once(remat, runs):
+    text, _ = _saved(SPARSE, remat)
+    # The top-k of each layer's indexer counts its scores' bits by shifts.
+    assert text.count("stablehlo.shift_left") == 2 * runs
+
+
+def test_mla_keeps_its_latents_for_a_policy_that_keeps_qkv():
+    # And its backward projects the heads up from them again, as DeepSeek's does.
+    _, saved = _saved(SPARSE, "save_qkv_attention")
+    widths = {shape[-1] for shape, what in saved if "named 'qkv'" in what}
+    assert widths == {32, 16 + 8}  # the query's latent; the keys' and values' and RoPE
 
 
 # --- Checkpoints -----------------------------------------------------------------------

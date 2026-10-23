@@ -2,11 +2,13 @@
 scans over positions, on one GPU at a hybrid's shapes, 2 rows of 4096 in packed
 documents: the outputs and every input's gradient, in float32. XLA's GPU fusions
 can differ from its CPU's, which the tests run: on a B300, a grouped einsum's took
-Mamba-2's gradients for B and C wrong.
+Mamba-2's gradients for B and C wrong. Then the delta rule by cuDNN's kernels
+(``fused_delta``), in bfloat16, against its chunks in float32: GDN's at steep gates
+and spikes, KDA's at a gate bounded at -5.
 
     uv run --extra cuda python scripts/gpu_smoke/recurrence.py
 
-It exits 1 if a form differs from its scan.
+It exits 1 if a form differs from its scan, or a kernel from the chunks.
 """
 
 import sys
@@ -17,11 +19,12 @@ import jax.numpy as jnp
 import numpy as np
 from jaxtyping import Array, Float
 
-from bux.architecture import linear_attention, ssm
+from bux.architecture import Segments, linear_attention, ssm
 from bux.parallel.recurrence import Chunked, Positions, Shared
 
 B, T = 2, 4096
 TOLERANCE = 1e-4  # of each gradient's norm, in float32
+KERNEL_TOLERANCE = 2e-2  # of a kernel's, in bfloat16
 Inputs = Callable[[np.random.Generator], tuple[Positions, Shared]]
 
 
@@ -117,17 +120,75 @@ def errors(case: str) -> list[float]:
     return [float(np.linalg.norm(a - b) / np.linalg.norm(b)) for a, b in zip(got, want)]
 
 
+# The delta rule's gates: channels, the least log decay, and the floor it is bounded
+# at; a spike of the log decay every 16 positions, if any.
+KERNELS: dict[str, tuple[int, float, float | None, float | None]] = {
+    "gdn's kernel, gates to -20": (1, -20.0, None, None),
+    "gdn's kernel, spikes of -1e4": (1, -1.0, None, -1e4),
+    "kda's kernel, gates to -5": (128, -5.0, -5.0, None),
+}
+
+
+def delta_inputs(case: str) -> tuple[Float[Array, "..."], ...]:
+    """q, k and v in bfloat16, of 16 heads of 128, the log decay and beta."""
+    decay, low, _, spike = KERNELS[case]
+    rng = np.random.default_rng(list(KERNELS).index(case))
+    q, k, v = rng.normal(size=(3, B, T, 16, 128))
+    q = q / np.linalg.norm(q, axis=-1, keepdims=True) / np.sqrt(128)
+    k = k / np.linalg.norm(k, axis=-1, keepdims=True)
+    g = low / (1 + np.exp(-rng.normal(size=(B, T, 16, decay))))
+    if spike is not None:
+        g[:, 5::16] = spike
+    beta = 1 / (1 + np.exp(-rng.normal(size=(B, T, 16))))
+    qkv = (jnp.asarray(x, jnp.bfloat16) for x in (q, k, v))
+    return (*qkv, jnp.asarray(g, jnp.float32), jnp.asarray(beta, jnp.float32))
+
+
+def kernel_errors(case: str) -> list[float]:
+    """How far the delta rule by its kernels is from its chunks: the outputs, then
+    each input's gradient, as a share of its norm."""
+    floor = KERNELS[case][2]
+    positions = jnp.asarray(np.arange(T) % 1000, jnp.int32)  # a document every 1000
+    docs = Segments.of(jnp.broadcast_to(positions, (B, T)))
+
+    def kernels(*xs: Float[Array, "..."]) -> Float[Array, "b t h dv"]:
+        return linear_attention.delta_rule(*xs, docs, floor).astype(jnp.float32)
+
+    def chunks(*xs: Float[Array, "..."]) -> Float[Array, "b t h dv"]:
+        f32 = (x.astype(jnp.float32) for x in xs)
+        return linear_attention._chunked(*f32, docs)
+
+    xs = delta_inputs(case)
+    got, want = (weighted(f, xs) for f in (kernels, chunks))
+    return [float(np.linalg.norm(a - b) / np.linalg.norm(b)) for a, b in zip(got, want)]
+
+
+def weighted(f: Callable[..., Float[Array, "..."]], xs: tuple) -> list[np.ndarray]:
+    """f's outputs, and the gradients of a weighted sum of them for every input."""
+
+    def loss(*xs: Float[Array, "..."]) -> tuple[Float[Array, ""], Float[Array, "..."]]:
+        out = f(*xs)
+        return (out * jnp.cos(jnp.arange(out.size)).reshape(out.shape)).sum(), out
+
+    grads, out = jax.jit(jax.grad(loss, tuple(range(len(xs))), has_aux=True))(*xs)
+    return [np.asarray(out), *(np.asarray(g, np.float32) for g in grads)]
+
+
+def report(case: str, found: list[float], tolerance: float) -> bool:
+    """Print how far a form is from its reference; return whether within
+    `tolerance`."""
+    ok = max(found) < tolerance
+    shown = " ".join(f"{e:.1e}" for e in found)
+    print(f"{case:32} out, then grads {shown}  {'ok' if ok else 'DIFFERS'}")
+    return ok
+
+
 def main() -> None:
     jax.config.update("jax_default_matmul_precision", "highest")
     print(f"{jax.devices()[0].device_kind}, {B} x {T} tokens, float32")
-    agree = True
-    for case in CASES:
-        found = errors(case)
-        ok = max(found) < TOLERANCE
-        agree &= ok
-        shown = " ".join(f"{e:.1e}" for e in found)
-        print(f"{case:32} out, then grads {shown}  {'ok' if ok else 'DIFFERS'}")
-    sys.exit(0 if agree else 1)
+    forms = [report(case, errors(case), TOLERANCE) for case in CASES]
+    kernels = [report(c, kernel_errors(c), KERNEL_TOLERANCE) for c in KERNELS]
+    sys.exit(0 if all(forms) and all(kernels) else 1)
 
 
 if __name__ == "__main__":

@@ -19,9 +19,13 @@ ARG UBUNTU_VERSION=24.04
 FROM nvidia/cuda:${CUDA_VERSION}-base-ubuntu${UBUNTU_VERSION}
 
 # Triton (behind tokamax's "triton" kernels) compiles its launcher with the host C compiler.
+# NCCL reaches InfiniBand through libibverbs and its mlx5 provider: without them a run on
+# several nodes talks over TCP sockets, ten to twenty times slower on B300s.
 RUN apt-get update && apt-get install -y --no-install-recommends \
   build-essential \
   ca-certificates \
+  ibverbs-providers \
+  libibverbs1 \
   && rm -rf /var/lib/apt/lists/*
 
 # The CUDA 13 wheels work with any 580+ driver through minor version compatibility, so don't let

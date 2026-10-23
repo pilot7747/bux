@@ -3,7 +3,8 @@
 ``run`` scans them by `jax.lax.scan` where a pass leaves the stream and the taps in
 the shapes it found them, and otherwise calls them one at a time. Each pass is
 rematerialized as a whole, as the run's `remat` says, and casts its own parameters to
-the dtype a step computes in (``cast``).
+the dtype a step computes in (``cast``). With the run's `remat(first=n)`, the passes
+after the first n run in a scan of their own, which rematerializes none.
 """
 
 import jax
@@ -23,9 +24,11 @@ def run(
     x: Stream,
     taps: Taps,
     compute: DTypeLike | None = None,
+    start: int = 0,
 ) -> tuple[Stream, nnx.State]:
     """Run the `times` layers that `graphdef` and the stacked `state` make on `x`, each
-    with its parameters cast to `compute`, if given (``cast``).
+    with its parameters cast to `compute`, if given (``cast``): passes `start` on of
+    their repeat, as the run's `remat(first=n)` counts them.
 
     Return the stream, and the layers' state other than parameters as they leave it.
     The scan starts at the first layer whose pass is steady (``_steady``): the first,
@@ -37,12 +40,40 @@ def run(
     for i in range(times):
         layer = cast(_at(state, i), compute)
         if i < 2 and (carry := _steady(graphdef, layer, x, taps)) is not None:
-            since = _since(state, i)
-            x, rest = _scan(graphdef, since, times - i, x, taps, carry, compute)
-            return x, _join([*done, rest])
-        x, rest = _layer(graphdef, layer, x, taps)
+            passes = (start + i, start + times)
+            x, scanned = _scans(graphdef, state, passes, x, taps, carry, compute, start)
+            return x, _join([*done, *scanned])
+        with remat.at_pass(start + i):
+            x, rest = _layer(graphdef, layer, x, taps)
         done.append(jax.tree.map(lambda a: a[None], rest))
     return x, _join(done)
+
+
+def _scans(
+    graphdef: nnx.GraphDef,
+    state: nnx.State,
+    passes: tuple[int, int],
+    x: Stream,
+    taps: Taps,
+    carry: pure.Changes,
+    compute: DTypeLike | None,
+    start: int = 0,
+) -> tuple[Stream, list[nnx.State]]:
+    """Scan passes `passes[0]` to `passes[1]` of their repeat, a scan for each run of
+    them that rematerializes alike (``remat.spans``), starting from `carry`; `state`
+    holds their repeat's passes from `start` on."""
+    rests = []
+    for first, stop in remat.spans(*passes):
+        if first > passes[0]:  # from the taps the last scan left
+            layer = cast(_at(state, first - start), compute)
+            again = _steady(graphdef, layer, x, taps)
+            assert again is not None, "a pass that was steady is still"
+            carry = again
+        with remat.at_pass(first):
+            layers = _between(state, first - start, stop - start)
+            x, rest = _scan(graphdef, layers, stop - first, x, taps, carry, compute)
+        rests.append(rest)
+    return x, rests
 
 
 def cast(state: nnx.State, dtype: DTypeLike | None) -> nnx.State:
@@ -65,8 +96,8 @@ def _at(state: nnx.State, i: int) -> nnx.State:
     return jax.tree.map(lambda a: a[i], state)
 
 
-def _since(state: nnx.State, i: int) -> nnx.State:
-    return jax.tree.map(lambda a: a[i:], state)
+def _between(state: nnx.State, start: int, stop: int) -> nnx.State:
+    return jax.tree.map(lambda a: a[start:stop], state)
 
 
 def _join(parts: list[nnx.State]) -> nnx.State:

@@ -104,6 +104,24 @@ def test_the_gpu_smoke_script_compares_every_form_on_cpu(monkeypatch):
     monkeypatch.setattr(smoke, "T", 150)  # chunks of 64 and a part of one
     for case in smoke.CASES:
         assert max(smoke.errors(case)) < smoke.TOLERANCE, case
+    for case in smoke.KERNELS:  # the chunks themselves, where no kernel runs
+        assert max(smoke.kernel_errors(case)) < smoke.KERNEL_TOLERANCE, case
+
+
+@pytest.mark.parametrize("c", [8, 64])
+def test_the_inverse_differentiates_as_its_solve_does(c):
+    """(I - L)^-1 by its own backward, T^T dT T^T of T alone, against jax's of the
+    solve, row by row and by halves, below the diagonal: the solve reads zeros
+    above it too, where L has no entries."""
+    L = jnp.tril(_normal(0, B, 3, H, c, c) / c, -1)
+    weights = _normal(1, B, 3, H, c, c)
+
+    def loss(f, L):
+        return (f(L) * weights).sum()
+
+    got = jax.grad(loss, argnums=1)(chunkwise._inverse, L)
+    want = jax.grad(loss, argnums=1)(chunkwise._halves, L)
+    np.testing.assert_allclose(got, jnp.tril(want, -1), atol=1e-5, rtol=1e-5)
 
 
 def test_keys_alike_with_steps_near_one_stay_finite():

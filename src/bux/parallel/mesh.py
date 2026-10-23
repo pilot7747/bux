@@ -2,10 +2,15 @@
 
 import contextvars
 import math
+from collections.abc import Sequence
 from dataclasses import dataclass
+from typing import Any
 
 import jax
+import numpy as np
+from jax.experimental import mesh_utils
 from jax.sharding import AbstractMesh, AxisType, Mesh
+from jaxtyping import Shaped
 
 from bux.train.config import LayoutConfig, MeshConfig, MethodsConfig
 
@@ -13,6 +18,9 @@ from bux.train.config import LayoutConfig, MeshConfig, MethodsConfig
 # `data`: a pipeline's sends need the least bandwidth, and XLA nests a shard_map in a
 # pipeline's only over the axes after `stage` (bux.parallel.pipeline).
 AXES = ("stage", "data", "fsdp", "context", "expert", "tensor")
+# What tells a device's node: XLA puts the GPUs of a host, or of an NVLink domain
+# that spans hosts, in one slice.
+NODE = "slice_index"
 
 
 def sizes(config: MeshConfig, devices: int) -> dict[str, int]:
@@ -48,12 +56,61 @@ def mesh(config: MeshConfig) -> Mesh:
     the compiler propagates shardings from the parameters and a few constraints."""
     devices = jax.devices()
     shape = sizes(config, len(devices))
-    return jax.make_mesh(
-        tuple(shape.values()),
-        AXES,
-        axis_types=(AxisType.Auto,) * len(AXES),
-        devices=devices[: math.prod(shape.values())],
+    used = devices[: math.prod(shape.values())]
+    return Mesh(grid(shape, used), AXES, axis_types=(AxisType.Auto,) * len(AXES))
+
+
+def grid(shape: dict[str, int], devices: Sequence[Any]) -> Shaped[np.ndarray, "..."]:
+    """Lay `devices` out on the axes of `shape`. On several nodes, each holds a block
+    of the innermost axes (`split`), so that the outer ones span nodes; jax.make_mesh
+    refuses devices of more than one node."""
+    nodes = _nodes(devices)
+    if len(nodes) == 1:
+        return mesh_utils.create_device_mesh(tuple(shape.values()), devices)
+    within, across = split(shape, len(nodes[0]))
+    return mesh_utils.create_hybrid_device_mesh(
+        tuple(within.values()),
+        tuple(across.values()),
+        devices,
+        process_is_granule=not hasattr(devices[0], NODE),
     )
+
+
+def _nodes(devices: Sequence[Any]) -> list[list[Any]]:
+    """Group `devices` by node: by slice (a GPU's NVLink domain), or by process where
+    devices have no slice, as CPUs do."""
+    key = NODE if hasattr(devices[0], NODE) else "process_index"
+    nodes: dict[int, list[Any]] = {}
+    for d in devices:
+        nodes.setdefault(getattr(d, key), []).append(d)
+    grouped = [nodes[k] for k in sorted(nodes)]
+    if len({len(n) for n in grouped}) > 1:
+        counts = ", ".join(str(len(n)) for n in grouped)
+        raise ValueError(
+            f"mesh: its {len(devices)} devices are on nodes of {counts}; a mesh "
+            "across nodes takes as many on each"
+        )
+    return grouped
+
+
+def split(
+    shape: dict[str, int], per_node: int
+) -> tuple[dict[str, int], dict[str, int]]:
+    """Split each axis's size into its devices within a node and its nodes, filling a
+    node from the innermost axis (`tensor`) outward: data=2 × fsdp=8 on nodes of 4 is
+    fsdp=4 within each, and data=2 × fsdp=2 across."""
+    within, left = {}, per_node
+    for axis in reversed(AXES):
+        inside = min(shape[axis], left)
+        if shape[axis] % inside or left % inside:
+            raise ValueError(
+                f"mesh: {_shape(shape)} does not fill nodes of {per_node} devices "
+                f"from tensor outward: {axis}={shape[axis]} does not split into the "
+                f"{left} a node has left for it, nor they into it"
+            )
+        within[axis], left = inside, left // inside
+    within = {a: within[a] for a in AXES}
+    return within, {a: shape[a] // within[a] for a in AXES}
 
 
 @dataclass(frozen=True)

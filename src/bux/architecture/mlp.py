@@ -9,7 +9,7 @@ from bux import config as cfg
 from bux import parallel
 from bux.architecture.functional import activation, softcap
 from bux.architecture.registry import Context, Taps, register
-from bux.architecture.sharding import linear
+from bux.architecture.sharding import linear, project_input, project_output
 from bux.lang import ir
 
 
@@ -43,25 +43,28 @@ class MLP(nnx.Module):
     ):
         size = size or config.intermediate_size
         gated = config.type == "gated_mlp"
-        self.up = linear(width, size, ("embed", "mlp"), config.bias, rngs)
+        into, out_of = ("embed", "mlp"), ("mlp", "embed")
+        self.up = linear(width, size, into, config.bias, rngs, role="mlp")
         self.gate = (
-            linear(width, size, ("embed", "mlp"), config.bias, rngs) if gated else None
+            linear(width, size, into, config.bias, rngs, role="mlp") if gated else None
         )
-        self.down = linear(size, width, ("mlp", "embed"), config.bias, rngs)
+        self.down = linear(size, width, out_of, config.bias, rngs, role="mlp")
         self.config = config
         self.dropout = nnx.Dropout(config.dropout, rngs=rngs)
 
-    def hidden(self, x: Float[Array, "*lead d"]) -> Float[Array, "*lead f"]:
+    def hidden(self, x: Float[Array, "b t d"]) -> Float[Array, "b t f"]:
         """Return the hidden units the down projection takes, from the up and gate
         projections, named `mlp` (``remat``)."""
-        up = checkpoint_name(self.up(x), "mlp")
-        gate = None if self.gate is None else checkpoint_name(self.gate(x), "mlp")
+        projections = (self.up,) if self.gate is None else (self.up, self.gate)
+        _, (up, *gate) = project_input(x, *projections)
+        up = checkpoint_name(up, "mlp")
+        gate = checkpoint_name(gate[0], "mlp") if gate else None
         return shard_hidden(activate(self.config, up, gate))
 
     def __call__(
-        self, x: Float[Array, "*lead d"], taps: Taps | None = None
-    ) -> Float[Array, "*lead d"]:
-        return self.dropout(self.down(self.hidden(x)))
+        self, x: Float[Array, "b t d"], taps: Taps | None = None
+    ) -> Float[Array, "b t d"]:
+        return self.dropout(project_output(self.hidden(x), self.down))
 
 
 @register("mlp", "gated_mlp")
