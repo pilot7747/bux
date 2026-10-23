@@ -300,9 +300,9 @@ class Clock(NamedTuple):
             out_specs=(P(AXIS, None, apart or None), by_stage, by_stage),
             axis_names={AXIS, *apart},
             check_vma=False,  # else nested shard_maps' gradients fail to lower
-        )(_by_stage(params, s), _by_stage(rest, s), _micro(x, m), rows)
+        )(split_by_stage(params, s), split_by_stage(rest, s), _micro(x, m), rows)
         y = jnp.sum(jnp.where(_first(io), io, 0), 0)  # the first stage's buffer
-        return _whole(y), _by_round(rest), _by_round(losses)
+        return _whole(y), join_stages(rest), join_stages(losses)
 
     def mean(
         self, losses: Float[Array, "t l n"], rounds: Int[Array, " t"]
@@ -327,7 +327,7 @@ def _device(
     Manual over the axes `apart` too, it runs this device's rows alone: its gradients
     are its own, which the shard_map's transpose sums over `apart` as they leave."""
     index = jax.lax.axis_index(AXIS)
-    params, before = _at(params, 0), _at(rest, 0)  # this stage's
+    params, before = at(params, 0), at(rest, 0)  # this stage's
     tick = functools.partial(_tick, clock, stage, params, rows, index)
     carry = (jnp.zeros_like(xs[0]), xs, gather.own_streams(before, apart))
     (_, io, rest), (losses, r) = jax.lax.scan(tick, carry, jnp.arange(clock.ticks))
@@ -354,14 +354,14 @@ def _tick(
     Then send its output on to the next stage, the last's into the first's buffer."""
     shift, io, rest = carry
     busy, micro, r = clock.at(t - index)
-    x = jnp.where(index == 0, _at(io, t % clock.microbatches), shift)
-    before = _at(rest, r)
-    y, new, losses = stage(_at(params, r), before, x, _at(rows, micro))
+    x = jnp.where(index == 0, at(io, t % clock.microbatches), shift)
+    before = at(rest, r)
+    y, new, losses = stage(at(params, r), before, x, at(rows, micro))
     new = jax.tree.map(lambda a, b: jnp.where(busy, a, b), new, before)
-    rest = _put(rest, r, new)
+    rest = put(rest, r, new)
     shift = _rotate(y)
     back, done = (t - clock.stages + 1) % clock.microbatches, t >= clock.stages - 1
-    io = _put(io, back, jnp.where(done, shift, _at(io, back)))
+    io = put(io, back, jnp.where(done, shift, at(io, back)))
     return (shift, io, rest), (jnp.where(busy, losses, 0), r)
 
 
@@ -389,19 +389,19 @@ def _whole(a: Shaped[Array, "m n t *r"]) -> Shaped[Array, "b t *r"]:
 
 # By dynamic slices, not gathers and scatters: XLA fails to split a scatter over Auto
 # axes inside the shard_map, as a gather's gradient is.
-def _at(tree: PyTree, i: Int[Array, ""] | int) -> PyTree:
+def at(tree: PyTree, i: Int[Array, ""] | int) -> PyTree:
     """Return slice `i` of every leaf of `tree`."""
     return jax.tree.map(lambda a: jax.lax.dynamic_index_in_dim(a, i, 0, False), tree)
 
 
-def _put(tree: PyTree, i: Int[Array, ""], new: PyTree) -> PyTree:
+def put(tree: PyTree, i: Int[Array, ""], new: PyTree) -> PyTree:
     """Return `tree` with slice `i` of every leaf replaced by `new`'s."""
     return jax.tree.map(
         lambda a, v: jax.lax.dynamic_update_index_in_dim(a, v, i, 0), tree, new
     )
 
 
-def _by_stage(tree: PyTree, s: int) -> PyTree:
+def split_by_stage(tree: PyTree, s: int) -> PyTree:
     """Reshape each leaf from (rounds, layers, ...) to (s, rounds, layers / s, ...):
     for each stage, its share of every round."""
 
@@ -412,7 +412,7 @@ def _by_stage(tree: PyTree, s: int) -> PyTree:
     return jax.tree.map(split, tree)
 
 
-def _by_round(tree: PyTree) -> PyTree:
+def join_stages(tree: PyTree) -> PyTree:
     """Reshape each leaf from (s, rounds, layers / s, ...) back to (rounds, layers,
     ...)."""
 

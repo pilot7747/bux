@@ -90,9 +90,12 @@ def emulated(
 def ragged_on_cpu(monkeypatch):
     """The ragged methods under the names EMULATED and TOKENS, with the exchange
     above."""
-    for name, body in [(EMULATED, experts.ragged), (TOKENS, experts.tokens)]:
+    for name, body in [
+        (EMULATED, experts.ragged_all_to_all),
+        (TOKENS, experts.ragged_tokens),
+    ]:
         on_cpu = functools.partial(body, exchange=emulated)
-        monkeypatch.setitem(methods.moe.builders, name, experts.method(on_cpu))
+        monkeypatch.setitem(methods.moe.builders, name, experts.expert_parallel(on_cpu))
 
 
 def layer(**settings) -> MoE:
@@ -173,7 +176,7 @@ def test_the_ragged_methods_lower_on_cpu_forward_and_backward(method, exchanges)
 
 
 def test_a_slice_in_pieces_is_sent_in_a_row_and_received_as_it_is_sent():
-    whole = experts.Ragged(*map(jnp.array, ([0, 5], [5, 2], [3, 0], [4, 1])))
+    whole = experts.Plan(*map(jnp.array, ([0, 5], [5, 2], [3, 0], [4, 1])))
     cut = experts._in_pieces(whole, 3)
     assert cut.input_offsets.tolist() == [0, 2, 4, 5, 6, 7]
     assert cut.send_sizes.tolist() == [2, 2, 1, 1, 1, 0]

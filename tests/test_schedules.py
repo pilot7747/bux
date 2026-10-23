@@ -7,6 +7,7 @@ import jax
 import jax.extend
 import jax.numpy as jnp
 import numpy as np
+import optax
 import pytest
 from flax import nnx
 from jaxtyping import Float, Shaped
@@ -20,7 +21,7 @@ from bux.lang import compile, compile_runs
 from bux.parallel import pipeline, schedule, split
 from bux.train import stages
 from bux.train.data import plain
-from bux.train.objective import objective
+from bux.train.objective import Objective, objective
 from bux.train.optim import lr_multiplier, optimizer
 from bux.train.trainer import Trainer, _accumulated
 
@@ -61,15 +62,21 @@ def _run(source: str, mesh: str, methods: str):
     return run
 
 
+def _built(run) -> tuple[Model, optax.GradientTransformation, Objective]:
+    """The model of `run`, its optimizer and its objective, under the mesh in force."""
+    t = run.train
+    model = parallel.build(lambda: Model(run.arch, rngs=nnx.Rngs(0)))
+    tx = optimizer(t.optimizer, lr_multiplier(t.schedule, t.steps), model, t.clip)
+    return model, tx, objective(t.loss, run.arch)
+
+
 def _trainer(source: str, mesh: str, methods: str) -> Trainer:
     """A trainer of `source`'s model, made under `mesh` and `methods`."""
     run = _run(source, mesh, methods)
     t = run.train
     with parallel.use(t.mesh, t.layout, t.methods):
-        model = parallel.build(lambda: Model(run.arch, rngs=nnx.Rngs(0)))
-        tx = optimizer(t.optimizer, lr_multiplier(t.schedule, t.steps), model, t.clip)
+        model, tx, loss = _built(run)
         microbatches = _accumulated(t.methods.microbatches)
-        loss = objective(t.loss, run.arch)
         return Trainer(
             model, tx, loss, microbatches=microbatches, accumulate=t.methods.accumulate
         )
@@ -94,9 +101,9 @@ def _step_grads(mesh: str, methods: str) -> list[Float[np.ndarray, " n"]]:
 def test_a_table_runs_every_op_once_after_what_it_reads(name, stages, microbatches):
     table = schedule.TABLES[name](stages, microbatches)
     when: dict[tuple[str, int, int], tuple[int, int]] = {}
-    for (t, s, k), op in table._each():
-        assert (op.kind, s, op.micro) not in when
-        when[op.kind, s, op.micro] = (t, k)
+    for (t, s, lane), op in table.each_op():
+        assert (op.kind, s, op.microbatch) not in when
+        when[op.kind, s, op.microbatch] = (t, lane)
     kinds = "FBW" if table.split else "FB"
     ops = [
         (kind, s, j)
@@ -105,18 +112,18 @@ def test_a_table_runs_every_op_once_after_what_it_reads(name, stages, microbatch
         for j in range(microbatches)
     ]
     assert set(when) == set(ops)
-    for (kind, s, j), (t, k) in when.items():
+    for (kind, s, j), (t, lane) in when.items():
         if kind == "F" and s > 0:
             assert when["F", s - 1, j][0] < t  # sent at the end of an earlier tick
         if kind == "B":
-            assert when["F", s, j] < (t, k)
+            assert when["F", s, j] < (t, lane)
             assert s == stages - 1 or when["B", s + 1, j][0] < t
         if kind == "W":
-            assert when["B", s, j] < (t, k)
+            assert when["B", s, j] < (t, lane)
 
 
 def _slots(table: schedule.Table, buffer: str) -> int:
-    return int(table.slots()[buffer].max()) + 1
+    return int(table.buffer_slots()[buffer].max()) + 1
 
 
 def test_1f1b_holds_fewer_microbatches_than_gpipe_and_idles_as_much():
@@ -128,7 +135,7 @@ def test_1f1b_holds_fewer_microbatches_than_gpipe_and_idles_as_much():
 def test_zbh1_holds_a_microbatch_a_stage_and_idles_a_tick_a_stage():
     table = schedule.zero_bubble_h1(4, 8)
     assert table.ticks == 3 * 8 + 4 - 1
-    assert _slots(table, "residuals") == _slots(table, "weights") == 4
+    assert _slots(table, "residuals") == _slots(table, "saved") == 4
     assert table.bubble() == pytest.approx(3 / 27)
 
 
@@ -189,9 +196,9 @@ def test_a_split_backward_takes_the_whole_ones_gradients_and_each_matmul_once(
             d_params, dx = vjp_of(d)
             return [*jax.tree.leaves(d_params), dx]
 
-        shapes = [jax.ShapeDtypeStruct(a.shape, a.dtype) for a in [*residuals, dy]]
-        free = [jax.ShapeDtypeStruct(a.shape, a.dtype) for a in flat]
-        two = split.split(backward, free, shapes, weights=len(flat))
+        b_only = [jax.ShapeDtypeStruct(a.shape, a.dtype) for a in [*residuals, dy]]
+        shared = [jax.ShapeDtypeStruct(a.shape, a.dtype) for a in flat]
+        two = split.split(backward, shared, b_only, weight_grads=len(flat))
         (dx,), saved = two.inputs(*flat, *residuals, dy)
         got = [*two.weights(*flat, saved), dx]
         want = backward(*flat, *residuals, dy)
@@ -291,11 +298,8 @@ def _formats(name: str, monkeypatch) -> dict[int | None, set[str]]:
 
     monkeypatch.setattr(matmuls, "format_of", recorded)
     with parallel.use(t.mesh, t.layout, t.methods):
-        model = parallel.build(lambda: Model(run.arch, rngs=nnx.Rngs(0)))
-        tx = optimizer(t.optimizer, lr_multiplier(t.schedule, t.steps), model, t.clip)
-        trainer = Trainer(
-            model, tx, objective(t.loss, run.arch), matmuls=t.precision, microbatches=1
-        )
+        model, tx, loss = _built(run)
+        trainer = Trainer(model, tx, loss, matmuls=t.precision, microbatches=1)
         batch = parallel.shard_batch(plain(TOKENS))
         trainer._train.lower(trainer.model, trainer.optimizer, batch)
     monkeypatch.setattr(matmuls, "format_of", of)
@@ -415,9 +419,7 @@ def test_only_a_scheduled_pipeline_reduces_its_gradients_in_float32(name):
     run = _run(LLAMA, "mesh(stage=2, fsdp=4)", _how(name, 4))
     t = run.train
     with parallel.use(t.mesh, t.layout, t.methods):
-        model = parallel.build(lambda: Model(run.arch, rngs=nnx.Rngs(0)))
-        tx = optimizer(t.optimizer, lr_multiplier(t.schedule, t.steps), model, t.clip)
-        loss = objective(t.loss, run.arch)
+        model, tx, loss = _built(run)
 
         def make() -> Trainer:
             return Trainer(model, tx, loss, compute="bfloat16", reduce="float32")

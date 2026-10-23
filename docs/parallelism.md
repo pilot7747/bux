@@ -800,12 +800,12 @@ method can run them on one device's experts inside a `shard_map`:
   kernel on a GPU, and its Triton one for the kernels' gradient (27 times XLA's
   `jax.lax.ragged_dot` on a B300), or XLA's. Rows past `sizes.sum()` come out 0,
   before `norm`.
-- `routed(z, idx, weights, up, gate, down, ffn, norm)`: sort, `experts`, unsort. A
-  pick outside the experts of `up` adds nothing, so a device that holds experts
-  `[i, i + n)` passes `idx - i` and its own kernels. The sort and the unsort are
-  `pick_rows` and `permuted`, whose gradients gather by the inverse permutation
-  where XLA's would scatter-add. `pick_rows` also takes the first m picks alone,
-  and `sum_rows`, its transpose, sums each token's k picks' rows.
+- `routed(z, idx, weights, up, gate, down, ffn, norm)`: `sort_by_expert`, `experts`,
+  unsort. A pick outside the experts of `up` adds nothing, so a device that holds
+  experts `[i, i + n)` passes `idx - i` and its own kernels. The sort and the unsort
+  are `token_rows` and `permuted`, whose gradients gather by the inverse permutation
+  where XLA's would scatter-add. `token_rows` also takes the first m picks alone,
+  and `token_sums`, its transpose, sums each token's k picks' rows.
 
 ```python
 from bux.architecture.experts.moe import routed
@@ -929,8 +929,8 @@ all-to-all, on one node, copies each slice with one block of 128 threads, so eac
 exchange goes in 2048 pieces at least (`experts.PIECES`): on 8 B300s a slice for each
 expert of each peer moved 90 GB/s, and the pieces 600 GB/s.
 
-A method is a body that runs on one device's tokens, and `experts.method` makes it
-one of `methods.moe`:
+A method is a body that runs on one device's tokens, named as the method is in
+`bux.parallel.experts`, and `experts.expert_parallel` makes it one of `methods.moe`:
 
 ```python
 from bux.parallel import experts, methods
@@ -943,13 +943,13 @@ def mine(z, idx, weights, kernels, *, axes, ffn, norm):
     ...
 
 
-methods.moe.register("mine")(experts.method(mine))
+methods.moe.register("mine")(experts.expert_parallel(mine))
 ```
 
-`experts.ragged` and `experts.tokens` take the ragged exchange as `exchange=`, so
-another collective is a function: the tests run them on CPU through one built from
-`all_to_all`, and `scripts/gpu_smoke/experts.py` runs the real one, and every other
-method, on GPUs.
+`experts.ragged_all_to_all` and `experts.ragged_tokens` take the ragged exchange as
+`exchange=`, so another collective is a function: the tests run them on CPU through
+one built from `all_to_all`, and `scripts/gpu_smoke/experts.py` runs the real one, and
+every other method, on GPUs.
 
 Collectives in the compiled train step of the two-MoE model of
 `tests/test_experts.py` on 8 CPU devices, their number and the KiB their results take
@@ -1023,8 +1023,8 @@ The ragged methods send the tokens to their experts in MXFP8, as DeepSeek-V3 doe
 E4M3 values and a power-of-two scale per 32, d + d/32 bytes a row, 52% of bfloat16's
 at d = 2048, dequantized to the compute dtype where they arrive. What comes back, and
 the backward's two exchanges, go in compute; the gradient is the exchange's, as if the
-tokens went unquantized (`experts._in_mxfp8`). Rows that are not whole blocks go as
-they are. It changes what a run computes, so it is in the run's id.
+tokens went unquantized (`experts._sent_in_mxfp8`). Rows that are not whole blocks go
+as they are. It changes what a run computes, so it is in the run's id.
 
 On 8 B300s, for the baseline's MoE at 32k tokens a GPU and a capacity of 1.25, it trains
 at the speed of bfloat16's: `ragged_all_to_all` 545k tokens a second against 548k, and
@@ -1804,17 +1804,17 @@ ticks of a table (`bux.parallel.schedule`), and a stage keeps a microbatch's res
 from its forward to its backward alone. The forward is a `jax.vjp`, whose residuals
 are a pytree of arrays: a few microbatches' of them sit in a buffer, and the backward
 rebuilds the vjp from its slot, the stage's parameters put back, which it does not
-save with each. A table gives each stage its ops in order, a queue to each slot of a
-tick; at each tick a slot runs the next op of its queue once what the op reads is
+save with each. A table gives each stage its ops in order, a queue to each lane of a
+tick; at each tick a lane runs the next op of its queue once what the op reads is
 there, and at the tick's end a stage sends its forward's output on and its
 backward's input gradient back. The names are quoted: the DSL reads `1f1b` as a
 number.
 
-- **`1f1b`**: two slots a tick, a forward and a whole backward, each as soon as it can
+- **`1f1b`**: two lanes a tick, a forward and a whole backward, each as soon as it can
   run. Stage s holds 2(S − s) − 1 microbatches, not M + S − 1 ticks, and the stages
   idle as gpipe's do: as lockstep ticks they cannot keep the S − s of an asynchronous
   1F1B without idling longer.
-- **`zbh1`**: one slot, and the backward split in two: `B` takes the input's gradient,
+- **`zbh1`**: one lane, and the backward split in two: `B` takes the input's gradient,
   on the critical path, and `W` the weights' later, in a tick the stage would idle.
   Stage s runs S − s forwards, then a backward, the weights of the microbatch s before
   it, and a forward, in turn (ZB-H1 of Qi et al., "Zero Bubble Pipeline Parallelism"):
