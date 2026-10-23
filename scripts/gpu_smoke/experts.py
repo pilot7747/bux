@@ -23,7 +23,7 @@ import numpy as np
 from flax import nnx
 
 from bux import config as cfg
-from bux import parallel
+from bux import parallel, runtime
 from bux.architecture import MoE, Taps
 from bux.lang import compile_runs
 from bux.train import config as tcfg
@@ -105,6 +105,7 @@ def main() -> int:
     p = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     p.add_argument("--steps", type=int, default=20)
     steps = p.parse_args().steps
+    runtime.configure()  # bux's XLA flags, without which ragged_all_to_all hangs
     n = jax.device_count()
     if jax.default_backend() == "cpu" or n < 2 or n % 2:
         print(f"needs an even number of GPUs, 2 or more: found {jax.devices()}")
