@@ -806,6 +806,8 @@ backward pass at 8 × 4096 tokens of 16 heads of 128, on a B300, and what it kee
 | `states=keep` | 11.6 ms, 6.51 GiB | 28.9 ms, 7.26 GiB |
 | `states=recompute` | 14.9 ms, 0.50 GiB | 33.6 ms, 0.75 GiB |
 | by its kernel (KDA bounded at -5) | 2.5 ms | 2.9 ms |
+| by bux's kernels, any gate, `keep` | | 11.1 ms, 1.69 GiB |
+| by bux's kernels, any gate, `recompute` | | 14.2 ms, 0.63 GiB |
 
 A GLA hybrid (`"GGGA"^4`), which runs by chunks alone, trains at 84.4k tokens a second
 in 83.5 GiB with `keep`, and at 77.1k in 66.8 GiB with `recompute`; that fits 32 rows
@@ -838,10 +840,24 @@ cudnn-frontend gives it no JAX call, so a `buffer_callback` runs cuDNN's graph o
 XLA's stream, one device at a time. A decay per channel (KDA) runs by Frost's KDA
 kernel where `gate_lower_bound` bounds it at -5 or above. That kernel factors each
 decay through the start of a tile of 16 positions, so it loses precision where a tile
-decays a channel by exp(-86), and overflows at exp(-90). Unbounded, KDA runs by
-`chunkwise`: within 12 steps of bux's start, its gates are that steep in 30 to 90% of
-the (row, head) pairs of most layers, and a check that fell back from the kernel to
-the chunks left the GPU idle 12 ms a layer, on top of the chunks' 28.
+decays a channel by exp(-86), and overflows at exp(-90): within 12 steps of bux's
+start, unbounded gates are that steep in 30 to 90% of the (row, head) pairs of most
+layers.
+
+Unbounded, on any GPU, KDA runs by bux's own Pallas kernels (`pallas_delta`), exact at
+any gate. They take each pair's decay `exp(G_t - G_s)` through a position `r` between
+the two, `exp(G_t - G_r) exp(G_r - G_s)`, both factors at most 1, as a matmul: for
+blocks of 16 positions `i > j` of a chunk of 64, `r` is the end of block `j`; within a
+block, the end of the first half of the 8, 4, 2 or 1 positions the pair spans. The
+state passes from chunk to chunk in the WY form, and documents start it again, so a
+row holds any number of them. The backward pass takes the gradients by hand, a few
+blocks at a time; with `methods(states=keep)`, the default, it keeps each chunk's
+parts and the state before it from the forward pass, and with `recompute` only the
+inputs, running the forward kernels again. On a B300, at 2 × 4096 tokens in packed
+documents, with random gates down to -20 a position, spikes of -10⁴ and KDA's own
+gate as it starts, the outputs and every gradient are within 4·10⁻³ of the scan's
+over positions (as a share of each one's norm), where the chunks in float32 are
+within 1.3·10⁻³: the kernels keep the parts and states in bfloat16.
 `scripts/gpu_smoke/recurrence.py` checks the forms, and Mamba-2's recomputed, against
 their scans on a GPU, whose fusions the CPU tests do not see (on a B300 one took
 Mamba-2's gradients for B and C wrong, which a plain matmul in its place does not),
@@ -1250,6 +1266,51 @@ its picks costs little; `all_to_all`'s dispatch hides behind the experts already
 
 The exchanges name what they bring `experts.exchanged`, under `experts`, so that
 `remat=dots`, which keeps `experts`, does not exchange them again in the backward.
+
+### TransformerEngine's NCCL EP
+
+TransformerEngine (2.18 on, `transformer_engine.jax.ep`) dispatches and combines by
+NCCL EP, a DeepEP of NCCL's device API: loads and stores over NVLink in a node, RDMA
+the GPU starts (NCCL's GIN) between nodes, no NVSHMEM. A token goes once to each GPU
+that holds any of its experts, as in `ragged_tokens`, and once to each other node,
+whose NVLink takes it on; it arrives as a row for each of its experts there, grouped
+by expert, each expert's rows padded to 128. Since 2.20 one process drives all its
+node's GPUs, on a communicator TE borrows from XLA. The Docker image has it with
+`--build-arg TE=2.20.2`. No method of `methods.moe` runs on it yet.
+
+One layer's dispatch and combine at the baseline MoE's shapes (d 2048, 64 experts,
+top 8, 32k tokens a GPU, a capacity of 1.25), its experts the identity, on B300s of
+148 SMs, and what an exchange sends off a GPU (on two nodes, off its node):
+
+| GPUs | exchange | SMs | forward | forward and backward | sent |
+|------|----------|-----|---------|----------------------|------|
+| 8, a node | `ragged_all_to_all` | all | 3.95 ms | 8.20 ms | 0.94 GB, 476 GB/s |
+| | `ragged_tokens` | all | 4.73 | 9.55 | 0.64 GB, 270 GB/s |
+| | NCCL EP | 32 | 3.85 | 7.50 | 0.64 GB, 332 GB/s |
+| | NCCL EP | 64 | 3.51 | 6.80 | 0.64 GB, 364 GB/s |
+| 16, two nodes | `ragged_all_to_all` | all | 38.0 | 76.8 | 0.54 GB |
+| | `ragged_tokens` | all | 39.4 | 79.6 | 0.45 GB |
+| | NCCL EP, GIN by GDAKI | 32 | 25.6 | 80.4 | 0.13 GB |
+| | NCCL EP, GIN by a CPU proxy | 32 | 16.0 | 27.0 | 0.13 GB |
+| | the same, 256 tokens a chunk | 32 | 13.0 | 21.2 | 0.13 GB |
+
+In a node it wins by sending less, not faster: its kernels move 330 to 370 GB/s, far
+from NVLink's 900. Between nodes it sends a quarter as much over InfiniBand, and with
+`NCCL_GIN_TYPE=2 NCCL_EP_TOKENS_PER_CHUNK=256` its exchanges take 28% as long.
+
+What it takes from JAX:
+
+- Across nodes only its one-device primitives ran, per device in a `jax.shard_map`
+  as bux's methods run, with a `jax.custom_vjp` over them: its global-view ops
+  (`ep_dispatch`, `ep_combine`) hung at their first dispatch, on XLA's collective
+  stream or off it.
+- Those global-view ops run on XLA's collective stream, where on jax 0.12 a resharding
+  next to them fails to compile ("No ExecutionStreamId found"): what they take and
+  give must stay split over the experts' axis.
+- Its core library loads the NCCL that jax's GPU backend loads, so it imports after
+  `jax.devices()`.
+- An expert's rows past its picks are 0, up to its 128, but their weights are
+  garbage, as are the rows past the last expert's. It sends bfloat16 only.
 
 ## Muon: `methods.orthogonalize`
 
