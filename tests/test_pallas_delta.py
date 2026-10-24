@@ -7,6 +7,7 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 import pytest
+from conftest import kept_bytes, outputs_and_grads
 
 from bux import parallel
 from bux.architecture import Segments
@@ -46,12 +47,7 @@ def _stepwise(q, k, v, g, beta, docs):
 
 
 def _outputs_and_grads(f, xs, docs):
-    def loss(*xs):
-        out = f(*xs, docs)
-        return (out * jnp.cos(jnp.arange(out.size)).reshape(out.shape)).sum(), out
-
-    grads, out = jax.grad(loss, range(5), has_aux=True)(*xs)
-    return [out, *grads]
+    return outputs_and_grads(lambda *xs: f(*xs, docs), *xs)
 
 
 def _assert_close(got, want, tolerance):
@@ -80,14 +76,7 @@ def test_a_spike_of_minus_ten_thousand_starts_the_state_again():
 
 def _kept_bytes(xs, docs, states):
     """What the backward pass keeps, in bytes, by the run's `methods.states`."""
-
-    def kept(*xs):
-        return jax.tree.leaves(jax.vjp(lambda *x: _kernels(*x, docs), *xs)[1])
-
-    methods = tcfg.MethodsConfig(states=states)
-    with parallel.use(tcfg.MeshConfig(data=1), methods=methods):
-        shapes = jax.eval_shape(kept, *xs)
-    return sum(x.size * x.dtype.itemsize for x in shapes)
+    return kept_bytes(lambda *x: _kernels(*x, docs), *xs, states=states)
 
 
 def test_recomputed_the_backward_pass_keeps_the_inputs_alone():

@@ -124,19 +124,13 @@ def gradients(f: Chunked, xs: Positions, shared: Shared) -> list[np.ndarray]:
     continues (the fifth)."""
     learned = [i for i in range(len(xs)) if i != 4]
 
-    def loss(
-        *args: Float[Array, "..."],
-    ) -> tuple[Float[Array, ""], Float[Array, "..."]]:
+    def run(*args: Float[Array, "..."]) -> Float[Array, "..."]:
         given = list(xs)
         for i, a in zip(learned, args[: len(learned)]):
             given[i] = a
-        out = f(tuple(given), tuple(args[len(learned) :]), False).out
-        return (out * jnp.cos(jnp.arange(out.size)).reshape(out.shape)).sum(), out
+        return f(tuple(given), tuple(args[len(learned) :]), False).out
 
-    args = [xs[i] for i in learned] + list(shared)
-    grad = jax.grad(loss, tuple(range(len(args))), has_aux=True)
-    grads, out = jax.jit(grad)(*args)
-    return [np.asarray(out), *(np.asarray(g) for g in grads)]
+    return weighted(run, (*(xs[i] for i in learned), *shared))
 
 
 def errors(case: str) -> list[float]:

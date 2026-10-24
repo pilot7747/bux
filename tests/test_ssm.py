@@ -1,11 +1,13 @@
 """Mamba, Mamba-2 and LFM2's short convolution, against their references' math."""
 
+import functools
 import math
 
 import jax
 import jax.numpy as jnp
 import numpy as np
 import pytest
+from conftest import kept_bytes, outputs_and_grads
 from flax import nnx
 from jax.sharding import PartitionSpec as P
 from jaxtyping import Array, Float, Int
@@ -367,17 +369,12 @@ def scanned(decay: str, method: str, states: States) -> list[Float[Array, "..."]
     mesh."""
     args, docs = scan_inputs(decay), ssd_documents(150)
 
-    def loss(
-        *args: Float[Array, "..."],
-    ) -> tuple[Float[Array, ""], Float[Array, "b t h p"]]:
-        out = selective_scan(*args, docs)
-        return (out * jnp.cos(jnp.arange(out.size)).reshape(out.shape)).sum(), out
+    def scan(*args: Float[Array, "..."]) -> Float[Array, "b t h p"]:
+        return selective_scan(*args, docs)
 
-    grad = jax.grad(loss, argnums=tuple(range(5)), has_aux=True)
     methods = tcfg.MethodsConfig(recurrence=method, states=states)
     with parallel.use(SCAN_MESHES[method], methods=methods):
-        grads, out = jax.jit(grad)(*args)
-    return [out, *grads]
+        return jax.jit(functools.partial(outputs_and_grads, scan))(*args)
 
 
 @pytest.mark.parametrize("method", SCAN_MESHES)
@@ -402,15 +399,8 @@ def _kept_bytes(states: States) -> tuple[int, int]:
     B, C = jax.random.normal(keys[2], (2, b, t, g, n), jnp.bfloat16)
     A = -jax.random.uniform(keys[3], (h, 1), minval=1, maxval=16)
     xs = (x, dt, A, B, C)
-
-    def kept(*xs: Float[Array, "..."]) -> list[Float[Array, "..."]]:
-        return jax.tree.leaves(jax.vjp(selective_scan, *xs)[1])
-
-    methods = tcfg.MethodsConfig(states=states)
-    with parallel.use(tcfg.MeshConfig(data=1), methods=methods):
-        shapes = jax.eval_shape(kept, *xs)
     inputs = sum(x.nbytes for x in xs) + b * t * 4  # and where documents continue
-    return sum(x.size * x.dtype.itemsize for x in shapes), inputs
+    return kept_bytes(selective_scan, *xs, states=states), inputs
 
 
 def test_mamba2_recomputed_keeps_its_inputs_alone():
