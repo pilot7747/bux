@@ -826,13 +826,19 @@ FSDP the weights move to the tokens rather than the tokens to the weights.
 ### The experts in MXFP8
 
 ```
-precision = precision(roles=roles(experts=mxfp8))
+precision = precision(matmuls=mxfp8)                          # the experts too
+precision = precision(roles=roles(experts=mxfp8))             # the experts alone
+precision = precision(matmuls=mxfp8, roles=roles(experts=compute))
 ```
 
 The routed experts' role, `experts`, takes `compute`, `mxfp8` or `mxfp8_2d`
-(docs/training.md, "Precision"), and `nvfp4` is an error. Unlike the other roles, none
-is compute, not `matmuls`. On B300s MXFP8 experts train 6 to 13% faster than
-bfloat16 ones (below). In a
+(docs/training.md, "Precision"), and `nvfp4` is an error. Left out, it is `matmuls`
+where a grouped GEMM multiplies in it, `mxfp8` and `mxfp8_2d`, and compute under any
+other, as `nvfp4`: no grouped GEMM takes NVFP4 (`PrecisionConfig.experts`). On B300s
+MXFP8 experts train 6 to 13% faster than bfloat16 ones (below). An MoE run that leaves
+them to `matmuls=mxfp8` multiplied them in bfloat16 before that, so it takes the id
+of a run that names `mxfp8` for them, and a launch trains it again; a run that names
+their format keeps its id, and a model without routed experts too. In a
 format, `experts` runs up and gate as one GEMM, so that x quantizes once, and each
 GEMM by `grouped_blockscaled.ragged_dot`: every operand of the forward's GEMM and of
 the backward's two quantized along what that GEMM contracts, as a projection's are,

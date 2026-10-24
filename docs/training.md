@@ -523,8 +523,7 @@ rounded, saturated and packed by Blackwell's `cvt.rn` and `cvt.rs` (stochastic, 
 random bits a value). An MLP projection's forward and backward then take 1.07-1.1x
 less time than MXFP8's, but q's and o's 1.1x more and k's and v's 1.25x: the second
 pass, ~20 more small kernels a projection (scales for cuDNN's layout, the global
-scales) and the transform's copy, at 2-2.5 TB/s, cost more than their GEMMs save. The
-routed experts stay in bfloat16:
+scales) and the transform's copy, at 2-2.5 TB/s, cost more than their GEMMs save:
 
 | `matmuls`, 1.3B Llama-style | 1 GPU | 8, `mesh(fsdp=8)` |
 |-----------------------------|-------|-------------------|
@@ -533,8 +532,15 @@ routed experts stay in bfloat16:
 | `nvfp4`                     | 179k (1.22x), bfloat16 147k and `mxfp8` 169k beside it |   |
 
 On 300 steps of packed documents, autotuning pinned, `mxfp8`'s loss is bfloat16's to
-within the noise between seeds. The MoE trains as fast in `mxfp8` as in bfloat16,
-105k: its experts are most of its matmuls.
+within the noise between seeds. Under `mxfp8` the MoE's routed experts multiply in
+MXFP8 too, by the grouped MXFP8 GEMMs (`roles.experts`), and its other matmuls are few:
+by the benchmarks' MoE, 64 experts of 704, top 8, 8 rows of 4096 a GPU,
+
+| `precision`, the MoE | 1 GPU | 8, `mesh(fsdp=8)` |
+|----------------------|-------|-------------------|
+| `compute` (bfloat16) | 105k, 134.0 GiB | 824k, 83.8 GiB |
+| `matmuls=mxfp8, roles=roles(experts=compute)`, the experts in bfloat16 as before | 108k, 133.9 GiB | 837k, 83.5 GiB |
+| `matmuls=mxfp8` | 116k (1.10x), 119.4 GiB | 909k (1.10x), 69.1 GiB |
 
 Which projections multiply in `mxfp8`, on one B300 ([Precision](#precision)):
 
