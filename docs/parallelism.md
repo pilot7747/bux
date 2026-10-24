@@ -1674,7 +1674,11 @@ Python's lock, then XLA compiles them at once, a thread each. On 8 B300s,
 `megatron.bux`'s `nccl_ep` arm with 75% of a GPU took `save_attention` in 699 s,
 where one after another took 966 s; XLA compiled each of the four in 218-243 s side
 by side, and their tracing and lowering, a minute each, now take most of the rest
-(where a compile goes: "Speed on GPUs" in docs/training.md). JAX's cache keeps each
+(where a compile goes: "Speed on GPUs" in docs/training.md). So where the second fits,
+side by side costs the others' lowering: `sorted` with 95% took `dots_attention` in
+592 s, where `none` and it one after another would take about 400. The candidates
+compile all or none, so that every process of a run compiles the same programs, whose
+autotuning they share. JAX's cache keeps each
 for the run's next launch. A forward outside a training step keeps everything. The
 step says what it took, XLA's seconds of each candidate:
 

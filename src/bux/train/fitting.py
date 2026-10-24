@@ -7,7 +7,8 @@ compiled step says a device holds at once, its arguments, outputs and temporarie
 against a share of the device's memory (``MARGIN``), for what the analysis misses.
 In that order, the first that fits is the one that computes least again. The first
 compiles alone: where it fits, as on most devices, it is the only compile. Where it
-does not, the others compile side by side, in about the time of one. Each compile
+does not, the others all compile side by side, so that every process of a run
+compiles the same programs, whose autotuning XLA splits among them. Each compile
 goes into JAX's cache, so a run that starts again reads them back, and the step that
 fits runs as ``xla.jit`` made it, which compiles it no more.
 """
