@@ -1171,6 +1171,21 @@ and dp W^T 0.65 against 0.77; its wgrad 0.30 and 0.60 ms against 0.39 and 0.76. 
 values are within MXFP8's rounding of bux's kernels': 2% apart in the output and every
 gradient (relative Frobenius norm), each 6.6% from bfloat16's as before.
 
+megatron.bux on 8 B300s, `remat=none`, the tree before and after on the same node:
+
+| run | bux's kernels | fused |
+|-----|---------------|-------|
+| `sorted`, Megatron's batch (512 rows in 8 microbatches, `gather=layer`) | 36.1k tok/s a GPU, 229.6 GiB | 37.7k (+4.5%), 214.6 GiB |
+| `sorted`, one microbatch of 8 rows a GPU | 37.7k, 215.1 GiB | 38.5k (+2.1%), 200.3 GiB |
+| `nccl_ep`, one microbatch of 8 rows a GPU | 31.4k, 211.1 GiB | 32.4k (+3.1%), 212.7 GiB |
+
+`sorted` keeps no bfloat16 copy of all 128 experts' kernels now, so it takes 15 GiB
+less. Its compiles take 20 to 110 s more, CuTe DSL compiling each kernel in every
+process. 3000 steps of FineWeb-Edu on the baseline's MoE with experts of 768 (the
+fused kernels' shapes, one B300 a run) end within 0.08% of bux's kernels at each of
+three seeds (eval loss 4.0708, 4.0127, 4.0346 against 4.0742, 4.0099, 4.0363), which
+differ by 1.6%, at 104k tokens a second against 100k.
+
 ## Expert parallelism
 
 Five methods of `methods.moe` split the experts over the axes `layout.experts` gives
