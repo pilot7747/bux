@@ -50,7 +50,7 @@ SEED = jnp.uint32(0)
 
 def _mxfp8(a: Float[Array, "r c"]) -> Float[Array, "r c"]:
     """a in MXFP8 along its rows, and back."""
-    return grouped_blockscaled.dequantized(blockscaled.mx_quantize(a))
+    return blockscaled.dequantized(blockscaled.mx_quantize(a))
 
 
 def _in_groups(a: Float[Array, "m c"]) -> Float[Array, "m c"]:

@@ -3,44 +3,31 @@ a power-of-two scale per 32, in one pass over x (`quantized_twice`), x's rows pa
 groups as 0. The experts' GEMMs multiply them by ``grouped_mxfp8``.
 """
 
-from typing import NamedTuple
-
 import jax
 import jax.numpy as jnp
 import jax_triton
 import triton
 import triton.language as tl
-from jaxtyping import Array, Float, Int, UInt8
+from jaxtyping import Array, Float, Int
 
 from bux import jax_internals
+from bux.architecture.precision import blockscaled
 from bux.architecture.precision.blockscaled import MX_BLOCK, Blocks
 
 jax_internals.keep_triton_calls_whole()  # jax-triton's own rule fails on jax 0.12
-
-
-class Tiles(NamedTuple):
-    """The quantizer's tiles, of rows and columns, and how it runs."""
-
-    m: int
-    n: int
-    warps: int
-    stages: int
-
-
-QUANTIZE = Tiles(m=64, n=128, warps=4, stages=1)  # the most of each
 
 
 def quantized_twice(
     x: Float[Array, "r c"],
     filled: Int[Array, ""],
     columns: bool = True,
-    most: Tiles = QUANTIZE,
 ) -> tuple[Blocks, Blocks | None]:
     """Return x and, if `columns`, x^T in MXFP8, as `blockscaled.mx_twice` does, x's
-    rows from `filled` on as 0: one pass over x, a tile a program, the largest of 32
-    times a power of two up to `most`'s that x's sides are whole tiles of."""
+    rows from `filled` on as 0: one pass over x, a tile a program, in blockscaled's
+    tiles, the largest that x's sides are whole tiles of."""
     r, c = x.shape
-    tiles = most._replace(m=_tile(r, most.m), n=_tile(c, most.n))
+    tile_r = blockscaled.largest_tile(r, blockscaled.ROWS)
+    tile_c = blockscaled.largest_tile(c, blockscaled.COLUMNS)
     shapes = [((r, c), jnp.uint8), ((r, c // 32), jnp.uint8)]
     shapes += [((c, r), jnp.uint8), ((c, r // 32), jnp.uint8)] if columns else []
     values, scales, *transposed = jax_triton.triton_call(
@@ -48,32 +35,17 @@ def quantized_twice(
         filled.astype(jnp.int32).reshape(1),
         kernel=_quantize_kernel if columns else _quantize_rows_kernel,
         out_type=[jax.ShapeDtypeStruct(*s) for s in shapes],
-        grid=(r // tiles.m, c // tiles.n),
+        grid=(r // tile_r, c // tile_c),
         name="bux_mx_twice" if columns else "bux_mx_rows",
-        num_warps=tiles.warps,
-        num_stages=tiles.stages,
+        num_warps=blockscaled.WARPS,
+        num_stages=1,
         **({"r": r} if columns else {}),
         c=c,
-        tile_r=tiles.m,
-        tile_c=tiles.n,
+        tile_r=tile_r,
+        tile_c=tile_c,
     )
-    return _blocks(values, scales), _blocks(*transposed) if columns else None
-
-
-def _tile(n: int, most: int) -> int:
-    """Return the largest tile, 32 times a power of two up to `most`, that n is whole
-    tiles of."""
-    tile = most
-    while n % tile:
-        tile //= 2
-    assert tile >= 32, f"{n} is not whole blocks of 32"
-    return tile
-
-
-def _blocks(values: UInt8[Array, "r c"], exponents: UInt8[Array, "r n"]) -> Blocks:
-    as_e4m3 = jax.lax.bitcast_convert_type(values, jnp.float8_e4m3fn)
-    as_e8m0 = jax.lax.bitcast_convert_type(exponents, jnp.float8_e8m0fnu)
-    return Blocks(as_e4m3, as_e8m0, None)
+    rows = blockscaled.mx_from_bytes(values, scales)
+    return rows, blockscaled.mx_from_bytes(*transposed) if columns else None
 
 
 # Triton's kernels: what they take is a tl.tensor or a pointer, or a constant; and

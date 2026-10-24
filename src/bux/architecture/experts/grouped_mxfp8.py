@@ -462,10 +462,12 @@ def _load(tile: _Tile, load: Load, buffers: _Buffers) -> None:
         slot = tile.slot(i)
 
         @pl.when(tile.stepped + i >= tile.tiles.stages)
+        @jax.named_scope("wait for a free buffer")
         def _() -> None:
             plgpu.barrier_wait(buffers.consumed.at[slot])
 
-        load(tile, i, slot, buffers)
+        with jax.named_scope("load"):
+            load(tile, i, slot, buffers)
 
 
 def _load_rows(
@@ -591,13 +593,16 @@ def _multiply(tile: _Tile, buffers: _Buffers) -> None:
     pair = "pair" if t.sms > 1 else None
 
     @pl.when(tile.done > 1)
+    @jax.named_scope("wait for the store")
     def _() -> None:
         plgpu.barrier_wait(buffers.stored.at[tile.acc])
 
     @pl.loop(0, tile.steps)
+    @jax.named_scope("multiply")
     def _(i: Int[Array, ""]) -> None:
         slot = tile.slot(i)
-        plgpu.barrier_wait(buffers.loaded.at[slot])
+        with jax.named_scope("wait for the loads"):
+            plgpu.barrier_wait(buffers.loaded.at[slot])
         plgpu.async_copy_scales_to_tmem(
             buffers.a_scales.at[slot], buffers.a_scales_tm, pair
         )
@@ -676,7 +681,8 @@ def _store(
     `zero`), and `part` of it to memory. The accumulator is free for the MMAs again
     once it is read."""
     t, width = tile.tiles, buffers.out.shape[-1]
-    plgpu.barrier_wait(buffers.multiplied.at[tile.acc])
+    with jax.named_scope("wait for the MMAs"):
+        plgpu.barrier_wait(buffers.multiplied.at[tile.acc])
     for e in range(t.n // width):
         staged = buffers.out.at[e % 2]
         held = pl.ds(tile.acc * t.n + e * width, width)

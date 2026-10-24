@@ -51,8 +51,8 @@ def rows_off(stacked: gm.Stacked, k: int, n: int) -> float:
     a = mxfp8((1024, k), 0)
     b = mxfp8((g * n, k) if stacked == "rows" else (n, g * k), 1)
     got = gm.rows(a, b, SIZES, stacked, jnp.float32)
-    each = grouped_blockscaled._stacked(grouped_blockscaled.dequantized(b), g, stacked)
-    want = jax.lax.ragged_dot(grouped_blockscaled.dequantized(a), each, SIZES)
+    each = grouped_blockscaled._stacked(blockscaled.dequantized(b), g, stacked)
+    want = jax.lax.ragged_dot(blockscaled.dequantized(a), each, SIZES)
     return off(got, want)
 
 
@@ -60,7 +60,7 @@ def contract_off(d: int, f: int) -> float:
     """How far `contract` is from XLA's dequantized product, empty groups too."""
     a, b = mxfp8((d, 1024), 2), mxfp8((f, 1024), 3)
     got = gm.contract(a, b, SIZES, jnp.float32)
-    rows = (grouped_blockscaled.dequantized(a).T, grouped_blockscaled.dequantized(b).T)
+    rows = (blockscaled.dequantized(a).T, blockscaled.dequantized(b).T)
     want = jax.lax.ragged_dot_general(*rows, SIZES, grouped.RAGGED_CONTRACTING)
     return off(got, want)
 

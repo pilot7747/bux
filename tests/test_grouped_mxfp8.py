@@ -8,6 +8,7 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 import pytest
+from jaxtyping import Array, Float, Int
 
 from bux import kernels
 from bux.architecture.experts import grouped, grouped_blockscaled
@@ -85,7 +86,7 @@ def test_the_rows_kernel_lowers_for_a_blackwell_gpu(stacked, k, n):
     g = 8
     b = _blocks((g * n, k) if stacked == "rows" else (n, g * k))
 
-    def f(a: Blocks, b: Blocks, sizes: jax.Array) -> jax.Array:
+    def f(a: Blocks, b: Blocks, sizes: Int[Array, " g"]) -> Float[Array, "m n"]:
         return gm.rows(a, b, sizes, stacked, jnp.bfloat16)
 
     sizes = jax.ShapeDtypeStruct((g,), jnp.int32)
@@ -94,7 +95,7 @@ def test_the_rows_kernel_lowers_for_a_blackwell_gpu(stacked, k, n):
 
 @pytest.mark.parametrize("d, f", CONTRACTS)
 def test_the_contract_kernel_lowers_for_a_blackwell_gpu(d, f):
-    def fn(a: Blocks, b: Blocks, sizes: jax.Array) -> jax.Array:
+    def fn(a: Blocks, b: Blocks, sizes: Int[Array, " g"]) -> Float[Array, "g d f"]:
         return gm.contract(a, b, sizes, jnp.bfloat16)
 
     sizes = jax.ShapeDtypeStruct((8,), jnp.int32)
@@ -116,10 +117,8 @@ def test_the_rows_kernel_multiplies_as_xla_dequantized(stacked, k, n):
     a = _mxfp8((M, k), 0)
     b = _mxfp8((g * n, k) if stacked == "rows" else (n, g * k), 1)
     got = gm.rows(a, b, SIZES, stacked, jnp.float32)
-    matrices = grouped_blockscaled._stacked(
-        grouped_blockscaled.dequantized(b), g, stacked
-    )
-    want = jax.lax.ragged_dot(grouped_blockscaled.dequantized(a), matrices, SIZES)
+    matrices = grouped_blockscaled._stacked(blockscaled.dequantized(b), g, stacked)
+    want = jax.lax.ragged_dot(blockscaled.dequantized(a), matrices, SIZES)
     np.testing.assert_allclose(got, want, rtol=1e-5, atol=1e-4)
     assert (np.asarray(got)[int(SIZES.sum()) :] == 0).all()
 
@@ -129,7 +128,7 @@ def test_the_rows_kernel_multiplies_as_xla_dequantized(stacked, k, n):
 def test_the_contract_kernel_sums_as_xla_dequantized(d, f):
     a, b = _mxfp8((d, M), 2), _mxfp8((f, M), 3)
     got = gm.contract(a, b, SIZES, jnp.float32)
-    rows = (grouped_blockscaled.dequantized(a).T, grouped_blockscaled.dequantized(b).T)
+    rows = (blockscaled.dequantized(a).T, blockscaled.dequantized(b).T)
     want = jax.lax.ragged_dot_general(*rows, SIZES, grouped.RAGGED_CONTRACTING)
     np.testing.assert_allclose(got, want, rtol=1e-5, atol=1e-4)
     assert (np.asarray(got)[np.asarray(SIZES) == 0] == 0).all()

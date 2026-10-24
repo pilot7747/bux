@@ -19,7 +19,6 @@ from jaxtyping import Array, Bool, Float, Int, Shaped
 from bux import config as cfg
 from bux import parallel
 from bux.architecture import Model, Taps
-from bux.architecture.experts import grouped_blockscaled
 from bux.architecture.experts.moe import MoE, routed
 from bux.architecture.precision import blockscaled, matmuls
 from bux.lang import compile
@@ -324,7 +323,7 @@ WIDE = 64  # whole blocks of 32, which MXFP8 takes
 
 def _quantized(z: Float[Array, "*s d"]) -> Float[Array, "*s d"]:
     """z in MXFP8 and back, its gradient as z's."""
-    back = grouped_blockscaled.dequantized(blockscaled.mx_quantize(z.reshape(-1, WIDE)))
+    back = blockscaled.dequantized(blockscaled.mx_quantize(z.reshape(-1, WIDE)))
     return z + jax.lax.stop_gradient(back.reshape(z.shape) - z)
 
 

@@ -20,7 +20,6 @@ from typing import Literal
 
 import jax
 import jax.numpy as jnp
-import numpy as np
 from jax.typing import DTypeLike
 from jaxtyping import Array, Float, Int, UInt32
 
@@ -37,7 +36,6 @@ except ImportError:
 BLOCK = blockscaled.MX_BLOCK
 # The formats of ``matmuls`` that run here, by their recipes: train.config.GROUPED.
 RECIPES = {"mxfp8": blockscaled.MXFP8, "mxfp8_2d": blockscaled.MXFP8_2D}
-Dtypes = tuple[np.dtype, np.dtype, np.dtype]  # x's, W's and y's
 # An operand of a GEMM: in the format, or as it is where its pass multiplies as it is.
 Operand = Blocks | Float[Array, "m k"]
 Matrices = Blocks | Float[Array, "g k n"]
@@ -65,7 +63,7 @@ def ragged_dot(
     m, tile = x.shape[0], grouped_mxfp8.LANES
     whole = -(-m // tile) * tile
     x = jnp.pad(x, ((0, whole - m), (0, 0))) if whole > m else x
-    dtypes = (x.dtype, w.dtype, jnp.result_type(x, w))
+    dtypes = blockscaled.Dtypes(x.dtype, w.dtype, jnp.result_type(x, w))
     return _ragged(x, w, sizes, seed, recipe, dtypes, passes)[:m]
 
 
@@ -76,7 +74,7 @@ def _ragged(
     sizes: Int[Array, " g"],
     seed: UInt32[Array, ""],
     recipe: blockscaled.Recipe,
-    dtypes: Dtypes,
+    dtypes: blockscaled.Dtypes,
     passes: tuple[Pass, ...],
 ) -> Float[Array, "m n"]:
     return _forward(x, w, sizes, seed, recipe, dtypes, passes)[0]
@@ -88,20 +86,20 @@ def _forward(
     sizes: Int[Array, " g"],
     seed: UInt32[Array, ""],
     recipe: blockscaled.Recipe,
-    dtypes: Dtypes,
+    dtypes: blockscaled.Dtypes,
     passes: tuple[Pass, ...],
 ) -> tuple[Float[Array, "m n"], Saved]:
     fprop, dgrad, wgrad = (p in passes for p in PASSES)
     filled = sizes.sum()
     x_k, x_m = _twice(recipe.x, x, seed, rows=fprop, columns=wgrad, filled=filled)
     w_n, w_k = _each_twice(recipe.w, w, seed, rows=dgrad, columns=fprop)
-    y = _times(x_k, w_k, sizes, dtypes[2], stacked="columns")
+    y = _times(x_k, w_k, sizes, dtypes.y, stacked="columns")
     return y, (x_m, w_n, sizes, seed)
 
 
 def _backward(
     recipe: blockscaled.Recipe,
-    dtypes: Dtypes,
+    dtypes: blockscaled.Dtypes,
     passes: tuple[Pass, ...],
     saved: Saved,
     dy: Float[Array, "m n"],
@@ -111,8 +109,8 @@ def _backward(
     filled = sizes.sum()
     dy_n, dy_m = _twice(recipe.dy, dy, seed, rows=dgrad, columns=wgrad, filled=filled)
     w_t = w_n if isinstance(w_n, Blocks) else jnp.swapaxes(w_n, 1, 2)
-    dx = _times(dy_n, w_t, sizes, dtypes[0], stacked="rows")
-    return dx, _contract(x_m, dy_m, sizes, dtypes[1]), None, None
+    dx = _times(dy_n, w_t, sizes, dtypes.x, stacked="rows")
+    return dx, _contract(x_m, dy_m, sizes, dtypes.w), None, None
 
 
 _ragged.defvjp(_forward, _backward)
@@ -137,8 +135,8 @@ def _times(
     assert isinstance(b, Blocks)
     if grouped_mxfp8.runs():
         return grouped_mxfp8.rows(a, b, sizes, stacked, out)
-    matrices = _stacked(dequantized(b), sizes.shape[0], stacked)
-    return jax.lax.ragged_dot(dequantized(a), matrices, sizes).astype(out)
+    matrices = _stacked(blockscaled.dequantized(b), sizes.shape[0], stacked)
+    return jax.lax.ragged_dot(blockscaled.dequantized(a), matrices, sizes).astype(out)
 
 
 def _contract(
@@ -156,7 +154,7 @@ def _contract(
     assert isinstance(b, Blocks)
     if grouped_mxfp8.runs():
         return grouped_mxfp8.contract(a, b, sizes, out)
-    rows = (dequantized(a).T, dequantized(b).T)
+    rows = (blockscaled.dequantized(a).T, blockscaled.dequantized(b).T)
     dw = jax.lax.ragged_dot_general(*rows, sizes, grouped.RAGGED_CONTRACTING)
     return dw.astype(out)
 
@@ -164,13 +162,6 @@ def _contract(
 def _triton() -> bool:
     """Whether Triton's quantizer runs here."""
     return grouped_triton is not None and kernels.gpu()
-
-
-def dequantized(blocks: Blocks) -> Float[Array, "r c"]:
-    """Return the values `blocks` hold, in float32: each times its block's scale."""
-    assert blocks.tensor_scale is None  # E4M3 with power-of-two scales: RECIPES
-    scales = jnp.repeat(blocks.scales.astype(jnp.float32), BLOCK, axis=-1)
-    return blocks.values.astype(jnp.float32) * scales
 
 
 def _stacked(
