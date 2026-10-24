@@ -108,16 +108,17 @@ def bind(eqn: core.JaxprEqn, ins: Sequence[Any]) -> list[Any]:
 def rebuild_vjp(
     like: Callable[..., Any], residuals: Sequence[Any], unsaved: Any
 ) -> VJP:
-    """Return a vjp of `like`'s structure from its residuals' leaves, its first
-    primal, which jax.vjp(..., saveable_args=(False, ...)) left out, put back as
-    `unsaved`. A jax.vjp is a pytree of its residuals; what it did not save are
-    NotSaveable in its `args_res`, and what it does not need NotNeeded."""
+    """Return the vjp whose structure `like` has, from its residuals' leaves: a
+    jax.vjp is a pytree of its residuals. Its first primal, which
+    jax.vjp(..., saveable_args=(False, ...)) did not save, goes back in from
+    `unsaved`, where the vjp's `args_res` marks a leaf NotSaveable; NotNeeded marks
+    one its backward does not read."""
     vjp = jax.tree.unflatten(jax.tree.structure(like), residuals)
 
-    def sentinel(v: object) -> bool:
+    def marker(v: object) -> bool:
         return isinstance(v, NotSaveable | NotNeeded)
 
-    held, tree = jax.tree.flatten(vjp.args_res[0], is_leaf=sentinel)
+    held, tree = jax.tree.flatten(vjp.args_res[0], is_leaf=marker)
     values = [
         u if isinstance(h, NotSaveable) else h
         for h, u in zip(held, jax.tree.leaves(unsaved), strict=True)
