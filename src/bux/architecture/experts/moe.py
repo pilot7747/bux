@@ -315,10 +315,10 @@ def run_sorted(
     tokens = parallel.spec(("batch", "seq", None), z.shape)
     if not axes_of(tokens):
         return local(z, idx, weights, moe.kernels())
-    return on_each_device(local, tokens, P(), tokens)(z, idx, weights, moe.kernels())
+    return in_shard_map(local, tokens, P(), tokens)(z, idx, weights, moe.kernels())
 
 
-def on_each_device(
+def in_shard_map(
     local: Callable[..., Any], tokens: P, kernels: P, out: Any
 ) -> Callable[..., Any]:
     """Return `local` in a shard_map manual over the axes `tokens` splits: each device
@@ -393,8 +393,12 @@ def experts(
     """Run each row of `x` through its expert's FFN, then `norm`. The rows are sorted
     by expert: the first sizes[0] are expert 0's, the next sizes[1] expert 1's, and so
     on; rows past them come out 0 before `norm`. It depends on its arguments alone, so
-    it runs on one device's experts in a shard_map as it does on all of them."""
+    it runs on one device's experts in a shard_map as it does on all of them. The
+    kernels multiply in x's dtype, so that wider ones add up the gradients of several
+    calls in their own."""
     recipe = grouped_blockscaled.RECIPES.get(experts_format())
+    up, down = up.astype(x.dtype), down.astype(x.dtype)
+    gate = None if gate is None else gate.astype(x.dtype)
 
     def times(x: Float[Array, "n e"], w: Float[Array, "E e f"]) -> Float[Array, "n f"]:
         return grouped_product(x, w, sizes, recipe)
