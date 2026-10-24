@@ -19,6 +19,7 @@ from jax._src.cudnn import fused_attention_stablehlo as cudnn_fused
 from jax._src.cudnn.scaled_matmul_stablehlo import _scaled_matmul_p
 from jax.experimental import buffer_callback as callbacks
 from jax.extend import core
+from jaxtyping import Array, Float, Int, Shaped
 
 # The packages whose internals below were checked, at these versions.
 VERIFIED_ON = {
@@ -128,8 +129,12 @@ def rebuild_vjp(
 
 
 def scaled_matmul_unpartitioned(
-    a: jax.Array, b: jax.Array, a_scales: jax.Array, b_scales: jax.Array, out: Any
-) -> jax.Array:
+    a: Shaped[Array, "1 m k"],
+    b: Shaped[Array, "1 n k"],
+    a_scales: Shaped[Array, "1 m kb"],
+    b_scales: Shaped[Array, "1 n kb"],
+    out: Any,
+) -> Float[Array, "1 m n"]:
     """Return jax.nn.scaled_matmul(a, b, a_scales, b_scales) in `out` by its GEMM's
     primitive, `_scaled_matmul_p`, bound as it is: jax.nn.scaled_matmul's custom
     partitioning cannot place it inside a shard_map (blockscaled.py). Its name,
@@ -149,14 +154,14 @@ def cudnn_attention_here() -> bool:
 
 
 def cudnn_attention(
-    q: jax.Array,
-    k: jax.Array,
-    v: jax.Array,
-    lengths: jax.Array | None,
-    starts: jax.Array | None,
+    q: Float[Array, "b t h dk"],
+    k: Float[Array, "b t g dk"],
+    v: Float[Array, "b t g dv"],
+    lengths: Int[Array, "b m"] | None,
+    starts: Int[Array, "b m1"] | None,
     scale: float,
     window: int | None,
-) -> jax.Array:
+) -> Float[Array, "b t h dv"]:
     """Return cuDNN's causal attention, within `window`, and with `lengths` and
     `starts` of each row's documents each by itself (cuDNN's packed layout): by
     JAX's own call of it, as jax.nn.dot_product_attention takes no packed layout."""
@@ -178,7 +183,7 @@ def cudnn_attention(
 
 def buffer_callback(
     run: Callable[..., None], results: Sequence[jax.ShapeDtypeStruct]
-) -> Callable[..., tuple[jax.Array, ...]]:
+) -> Callable[..., tuple[Shaped[Array, "..."], ...]]:
     """Return a function of arrays that calls `run(context, outs, *ins)` with XLA's
     buffers of them, to write the `outs` of `results`' shapes in place; on a GPU,
     `context.stream` is the stream XLA runs on, and `ins[0].__dlpack_device__()` the
@@ -227,14 +232,16 @@ def tokamax_mask(*args: Any, **kwargs: Any) -> Any:
 
 def tokamax_vjp(
     op: Any,
-    lse: jax.Array,
-    out: jax.Array,
-    dout: jax.Array,
-    q: jax.Array,
-    k: jax.Array,
-    v: jax.Array,
+    lse: Float[Array, "b h t"],
+    out: Float[Array, "b t h dv"],
+    dout: Float[Array, "b t h dv"],
+    q: Float[Array, "b t h dk"],
+    k: Float[Array, "b s g dk"],
+    v: Float[Array, "b s g dv"],
     args: dict[str, Any],
-) -> tuple[jax.Array, jax.Array, jax.Array]:
+) -> tuple[
+    Float[Array, "b t h dk"], Float[Array, "b s g dk"], Float[Array, "b s g dv"]
+]:
     """Return the gradients of q, k and v by tokamax's backward kernels of `op`,
     from the forward's `out` and each row's logsumexp `lse`, as residuals (lse, 1):
     P = exp(s - lse). `args` are the forward's keyword arguments."""
