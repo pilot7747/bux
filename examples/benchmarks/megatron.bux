@@ -1,10 +1,13 @@
 # Qwen3-30B-A3B on a node of 8 GPUs, as Megatron-Bridge's performance summary
 # benchmarks it (26.06: 40,769 tokens a second a GPU on 8 B300s, MXFP8, EP=8, 8 rows
 # of 4096 a GPU): the matmuls in MXFP8, the experts sorted under FSDP, and split over
-# the GPUs by NCCL EP.
+# the GPUs by NCCL EP. Megatron's numbers route by random logits
+# (moe_router_force_load_balancing), and so does this run.
 #
 #   python scripts/benchmark.py run examples/benchmarks/megatron.bux --out new.json
 use qwen3_30b_a3b
+
+experts.random_logits = true
 
 model   = sorted:  embed block^48 norm head
         | nccl_ep: embed block^48 norm head

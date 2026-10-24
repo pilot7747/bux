@@ -135,6 +135,11 @@ class MoEConfig(Config):
     # sqrtsoftplus scores experts with sqrt(softplus(logit)) (DeepSeek-V4).
     router: Literal["softmax", "sigmoid", "sqrtsoftplus"] = "softmax"
     router_logit_scale: float = 1.0  # multiplies the logits before scoring (Muse Spark)
+    # For benchmarks: a training forward routes by random logits, N(0, 1), so that each
+    # expert takes an even share of the picks in expectation and a capacity drops few;
+    # their gradient goes to the router's own logits (Megatron-Core's
+    # moe_router_force_load_balancing).
+    random_logits: bool = False
     normalize_top_k: bool = True
     routed_scaling_factor: float = 1.0
     # Group-limited routing: pick top_k_groups of num_groups first (DeepSeek-V3).

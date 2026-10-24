@@ -105,13 +105,10 @@ def test_muon_trains_the_block_matrices_and_adam_the_rest():
         ("v", "kernel"),
         ("o", "kernel"),
         ("router", "kernel"),
-        ("up",),
-        ("gate",),
+        ("up",),  # and the gate, beside it
         ("down",),
     }
-    stacked = [
-        d for p, d in muon_matrices(m).items() if p[-1] in ("up", "gate", "down")
-    ]
+    stacked = [d for p, d in muon_matrices(m).items() if p[-1] in ("up", "down")]
     assert {(d.reduction_axis, d.output_axis) for d in stacked} == {(1, 2)}
 
 
