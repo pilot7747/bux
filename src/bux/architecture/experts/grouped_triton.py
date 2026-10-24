@@ -5,8 +5,9 @@ whole tiles of 128 along what it is in blocks along, and each tile's scales in t
 bytes of tensor memory's 512-byte tiles. x is a matrix, or a stack of them, (g, r, c),
 as each expert's W is; its rows from `filled` on quantize as 0.
 
-A program takes TILE_ROWS rows by 128 columns of x: x's blocks along its rows, and
-x^T's down x's columns, so that only the E4M3 bytes of x^T transpose.
+A program takes TILE_ROWS rows by 128 columns of x, in x's dtype: x's blocks along
+its rows, and x^T's down x's columns, so that only the E4M3 bytes of x^T transpose.
+The scaling, by a power of two, is exact in bfloat16 as in float32.
 """
 
 import jax
@@ -18,13 +19,13 @@ from jaxtyping import Array, Float, Int, UInt8
 
 from bux import jax_internals
 from bux.architecture.experts.grouped_mxfp8 import LANES, Tiled
-from bux.architecture.precision import blockscaled
 from bux.architecture.precision.blockscaled import MX_BLOCK
 
 jax_internals.keep_triton_calls_whole()  # jax-triton's own rule fails on jax 0.12
 
-# Rows of x a program takes: 3.9 TB/s on a B300 at an MoE's shapes, 1.4x 128.
-TILE_ROWS = 32
+# Rows of x a program takes, and its warps: 5.1 TB/s on a B300 at an MoE's shapes, 1.3x
+# 4 warps and 1.7x 128 rows.
+TILE_ROWS, WARPS = 32, 2
 
 
 def quantized_twice(
@@ -48,7 +49,7 @@ def quantized_twice(
         out_type=[jax.ShapeDtypeStruct(*s) for s in shapes],
         grid=(g, rt * (LANES // TILE_ROWS), ct),  # every row of each tile of 128
         name="bux_mx_twice" if columns else "bux_mx_rows",
-        num_warps=blockscaled.WARPS,
+        num_warps=WARPS,
         num_stages=1,
         r=r,
         c=c,
@@ -114,14 +115,14 @@ def _tile_of(
     c: tl.constexpr,
     tile_r: tl.constexpr,
 ) -> tuple[tl.tensor, tl.tensor, tl.tensor]:
-    """Return this program's tile of x[g] in float32, 0 past x and from `rows` on, and
-    the tile's rows and columns."""
+    """Return this program's tile of x[g], 0 past x and from `rows` on, and the tile's
+    rows and columns."""
     rs = tl.program_id(1) * tile_r + tl.arange(0, tile_r)
     cs = tl.program_id(2) * 128 + tl.arange(0, 128)
     kept = (rs < r) & (rs < tl.load(rows))
     at = x + tl.program_id(0).to(tl.int64) * r * c + rs[:, None].to(tl.int64) * c
     tile = tl.load(at + cs[None, :], mask=kept[:, None] & (cs < c)[None, :], other=0.0)
-    return tile.to(tl.float32), rs, cs
+    return tile, rs, cs
 
 
 @triton.jit
@@ -188,15 +189,15 @@ def _store_scales(
 
 @triton.jit
 def _in_e4m3(blocks: tl.tensor, axis: tl.constexpr) -> tuple[tl.tensor, tl.tensor]:
-    """Return blocks of float32 in E4M3 along `axis`, each times the least power of
-    two that takes its largest value to at most 448, and those powers' biased
-    exponents (E8M0's bits), as ``blockscaled._in_e4m3`` computes them."""
-    over = tl.max(tl.abs(blocks), axis=axis) / 448.0
+    """Return blocks in E4M3 along `axis`, each times the least power of two that
+    takes its largest value to at most 448, and those powers' biased exponents (E8M0's
+    bits), as ``blockscaled._in_e4m3`` computes them."""
+    over = tl.max(tl.abs(blocks), axis=axis).to(tl.float32) / 448.0
     bits = over.to(tl.uint32, bitcast=True)
     exponent = (bits >> 23).to(tl.int32) + ((bits & 0x7FFFFF) != 0).to(tl.int32) - 127
     exponent = tl.minimum(tl.maximum(exponent, -126), 126)
     down = ((127 - exponent).to(tl.uint32) << 23).to(tl.float32, bitcast=True)
-    scaled = blocks * tl.expand_dims(down, axis)
+    scaled = blocks * tl.expand_dims(down.to(blocks.dtype), axis)
     values = tl.clamp(scaled, -448.0, 448.0).to(tl.float8e4nv)
     return values.to(tl.uint8, bitcast=True), (exponent + 127).to(tl.uint8)
 
