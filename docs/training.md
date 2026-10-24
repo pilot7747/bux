@@ -622,8 +622,28 @@ Only scanned layers gain, under FSDP: `maxtext` trains the scanned 1.3B at 719k
 cuBLAS's GEMMs where XLA would take Triton's inside the loop
 (`--xla_gpu_enable_triton_gemm=false`) 5%; the combine thresholds, XLA's
 rematerialization and command buffers nothing. With TP the scanned layers gain nothing.
-So `default`, XLA's own options, stays the default, and a scanned FSDP run is worth
-`compiler(preset=maxtext)`.
+
+Scanned with `maxtext` against the defaults, unrolled with XLA's options, by the
+benchmarks' FSDP runs (`one_node.bux`, `two_nodes.bux`, [Benchmarks](#benchmarks)),
+20 steps, by rows of 4096 a GPU; and by the one-GPU suite, 8 rows:
+
+| run | rows a GPU | `default`, unrolled | `maxtext`, scanned |
+|-----|------------|---------------------|--------------------|
+| the 1.3B, `fsdp=8` | 1 | 443k | 691k (+56%) |
+| | 2 | 909k | 870k (−4.3%) |
+| | 4 | 1.03M | 994k (−3.9%) |
+| | 8 | 1.11M | 1.08M (−3.4%) |
+| the MoE, `fsdp=8` | 8 | 815k | 713k (−12.5%) |
+| the 1.3B, `fsdp=16`, two nodes | 1 | 699k | 1.03M (+48%) |
+| | 8 | 2.18M | 2.12M (−2.8%) |
+ONE_GPU_ROWS
+
+At a row a GPU an unrolled step waits for FSDP's gathers, and takes as long as one of
+two rows; the scan's loop, its collectives pipelined and its buffers doubled, hides
+them. From two rows a GPU the compute hides them anyway, and what the scan copies in
+and out of its stacks costs more than the loop saves. So the defaults stay: unrolled,
+with XLA's options. FSDP at a row a GPU, as a model too large for more trains, is
+worth `methods(repeat=scan)` with `compiler(preset=maxtext)`.
 
 ## Launching
 

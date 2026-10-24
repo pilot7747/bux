@@ -1258,8 +1258,9 @@ DeltaNet hybrid (`"DDDA"^4`) and a 64-expert MoE (`E^16`), in bfloat16 on 8 rows
 is still slower: it copies each value it keeps into its stack and back out, where
 unrolled layers read it where it was made, and the more it keeps the more it copies:
 the GDN hybrid's float32 chunk states. On eight, one row each, it is faster, and it
-compiles 2.3 times as fast; with `compiler(preset=maxtext)` the dense scan trains at
-719k, 15% over unrolled ([XLA's options](training.md#xlas-options-compiler)).
+compiles 2.3 times as fast; with `compiler(preset=maxtext)` the dense scan trains
+56% faster than unrolled there, and from two rows a GPU 3-4% slower, so `unroll`
+stays the default ([XLA's options](training.md#xlas-options-compiler)).
 
 On one CPU, for the gradient of a 24-layer Llama's forward (`d_model=64`, 8 rows of
 128 tokens), and for its first training step, which compiles it:
@@ -1328,7 +1329,43 @@ where `first` computes the whole layer again. With more rows a GPU:
 | `save_attention`                             | 96: 138k, 161.7      |                     | 16: 93.8k, 95.8    |
 | `full`                                       | 128: 126k, 113.2     | 32: 76.5k, 67.3     | 16: 89.6k, 83.8    |
 
-AUTO_SECTION
+### `remat=auto`, the default
+
+`auto` chooses a training step's policy as the step first compiles
+(`bux.train.fitting`). It compiles the step under `none`, `dots_attention`, `dots`,
+`save_attention` and `full` in turn, the fastest first as they train above, and keeps
+the first that fits: what XLA's analysis of the compiled step says a device holds at
+once, its arguments, outputs and temporaries, at most 97% of what the device can hold
+(its `bytes_limit`, 75% of a GPU by JAX's default). In that order the first that fits
+is the one that computes least again, so `auto` times none of them, which would cost
+steps of each. On B300s XLA's analysis was the measured peak to 0.1 GiB in every run,
+and a step of 196.7 of 200.8 GiB trained. Where `none` fits, `auto` compiles once and
+is `none`; where it does not, each candidate before the one that fits is a compile
+more, which JAX's cache keeps for the run's next launch. A forward outside a training
+step keeps everything. The step says what it took:
+
+```
+remat=auto: save_attention (none 314.4 GiB in 42s, dots_attention 288.4 GiB in 29s,
+dots 263.7 GiB in 26s, save_attention 161.7 GiB in 24s; 97% of 200.8 GiB fits)
+```
+
+On one B300, the one-GPU suite's models (`examples/benchmarks/one_gpu.bux`) at more
+rows than they take there, 15 steps, tokens a second and the peak memory:
+
+| model, rows | `none`, the default before | `auto` | `auto`'s compiles |
+|-------------|----------------------------|--------|-------------------|
+| dense, 8    | 138.7k, 51.1 GiB | `none` | 27 s |
+| dense, 64   | 142.9k, 192.6 GiB | `none` (`dots`: 137.1k, 180.2 GiB) | 35 s |
+| dense, 96   | out of memory | `save_attention`: 132.5k, 161.7 GiB (`dots_attention`, `dots`: out of memory) | 4, 121 s |
+| dense, 128  | out of memory | `full`: 123.6k, 113.2 GiB (`save_attention`, `dots`: out of memory) | 5, 148 s |
+| MoE, 16     | 106.7k, 193.3 GiB | `none` (`dots_attention`: 102.3k, 146.6 GiB) | 55 s |
+| GDN, 32     | 131.3k, 187.9 GiB | `none` (`dots_attention`: 130.3k, 149.9 GiB) | 40 s |
+
+`none` stays the fastest wherever it fits, near the device's limit too. With 90% of
+a device for the step, `auto` took `dots` for the dense model at 64 rows, 5.6%
+slower than `none` there, and `dots_attention` for the MoE at 16 and GDN at 32.
+`remat(first=n)` and the policies of names are not candidates: `auto` does not tune a
+policy, it keeps a run from running out of memory at the least cost of the presets.
 
 Offloading saves nothing unrolled, and costs a third of the speed: XLA schedules
 each layer's copy to the host inside the backward, just before the copy back, so the
