@@ -10,6 +10,8 @@ its rows, and x^T's down x's columns, so that only the E4M3 bytes of x^T transpo
 The scaling, by a power of two, is exact in bfloat16 as in float32.
 """
 
+from typing import no_type_check
+
 import jax
 import jax.numpy as jnp
 import jax_triton
@@ -69,10 +71,12 @@ def _tiled(
 
 
 # Triton's kernels: what they take is a tl.tensor or a pointer, or a constant; and
-# they may name no global but Triton's.
+# they may name no global but Triton's. Triton compiles each from its source in this
+# module's globals, so no type checker may wrap one, as the tests' import hook would.
 
 
 @triton.jit
+@no_type_check
 def _quantize_kernel(
     x: tl.tensor,
     rows: tl.tensor,
@@ -92,6 +96,7 @@ def _quantize_kernel(
 
 
 @triton.jit
+@no_type_check
 def _quantize_rows_kernel(
     x: tl.tensor,
     rows: tl.tensor,
@@ -108,6 +113,7 @@ def _quantize_rows_kernel(
 
 
 @triton.jit
+@no_type_check
 def _tile_of(
     x: tl.tensor,
     rows: tl.tensor,
@@ -126,6 +132,7 @@ def _tile_of(
 
 
 @triton.jit
+@no_type_check
 def _store_along_rows(
     tile: tl.tensor,
     values: tl.tensor,
@@ -149,6 +156,7 @@ def _store_along_rows(
 
 
 @triton.jit
+@no_type_check
 def _store_along_columns(
     tile: tl.tensor,
     values: tl.tensor,
@@ -173,6 +181,7 @@ def _store_along_columns(
 
 
 @triton.jit
+@no_type_check
 def _store_scales(
     scales: tl.tensor,
     tile: tl.tensor,
@@ -188,6 +197,7 @@ def _store_scales(
 
 
 @triton.jit
+@no_type_check
 def _in_e4m3(blocks: tl.tensor, axis: tl.constexpr) -> tuple[tl.tensor, tl.tensor]:
     """Return blocks in E4M3 along `axis`, each times the least power of two that
     takes its largest value to at most 448, and those powers' biased exponents (E8M0's
