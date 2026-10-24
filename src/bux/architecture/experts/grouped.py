@@ -20,6 +20,7 @@ from jax.experimental import pallas as pl
 from jaxtyping import Array, Float, Int
 
 from bux import kernels
+from bux.architecture.precision.blockscaled import largest_tile
 
 try:  # tokamax's kernels, where its extra is installed (Linux)
     import tokamax
@@ -114,15 +115,11 @@ def contract(
     """Return x^T y for each group of rows, as `sizes` groups them: the gradient of
     `ragged_dot`'s matrices. By a Pallas kernel on a GPU, one program per tile of a
     group's matrix; by XLA elsewhere."""
-    td, tf = _tile(x.shape[1]), _tile(y.shape[1])
-    if not kernels.gpu() or td is None or tf is None:
+    d, f = x.shape[1], y.shape[1]
+    if not kernels.gpu() or d % TILES[-1] or f % TILES[-1]:  # no tile divides them
         return jax.lax.ragged_dot_general(x, y, sizes, RAGGED_CONTRACTING)
+    td, tf = largest_tile(d, TILES), largest_tile(f, TILES)
     return _pallas_contract(x, y, sizes, td, tf)
-
-
-def _tile(n: int) -> int | None:
-    """Return the largest of TILES that divides n, if any."""
-    return next((t for t in TILES if n % t == 0), None)
 
 
 def _pallas_contract(
