@@ -36,6 +36,7 @@ import pyarrow as pa
 import pyarrow.parquet as pq
 import pytest
 from jax.extend.core import Jaxpr, JaxprEqn, jaxprs_in_params
+from jaxtyping import Array, Float, Shaped
 
 from bux import parallel
 from bux.architecture.recurrent.linear_attention import States
@@ -119,11 +120,15 @@ def count(jaxpr: Jaxpr, primitive: str) -> int:
     return sum(e.primitive.name == primitive for e, _ in equations(jaxpr))
 
 
-def outputs_and_grads(f: Callable[..., jax.Array], *args: jax.Array) -> list[jax.Array]:
+def outputs_and_grads(
+    f: Callable[..., Float[Array, "..."]], *args: Float[Array, "..."]
+) -> list[Float[Array, "..."]]:
     """f's outputs, then the gradients for each of `args` of a weighted sum of them,
     each output weighted by the cosine of its index."""
 
-    def loss(*args: jax.Array) -> tuple[jax.Array, jax.Array]:
+    def loss(
+        *args: Float[Array, "..."],
+    ) -> tuple[Float[Array, ""], Float[Array, "..."]]:
         out = f(*args)
         return (out * jnp.cos(jnp.arange(out.size)).reshape(out.shape)).sum(), out
 
@@ -131,10 +136,12 @@ def outputs_and_grads(f: Callable[..., jax.Array], *args: jax.Array) -> list[jax
     return [out, *grads]
 
 
-def kept_bytes(f: Callable[..., jax.Array], *args: jax.Array, states: States) -> int:
+def kept_bytes(
+    f: Callable[..., Float[Array, "..."]], *args: Float[Array, "..."], states: States
+) -> int:
     """The bytes f's backward pass keeps, on one device, by `methods(states=...)`."""
 
-    def kept(*args: jax.Array) -> list[jax.Array]:
+    def kept(*args: Float[Array, "..."]) -> list[Shaped[Array, "..."]]:
         return jax.tree.leaves(jax.vjp(f, *args)[1])
 
     methods = tcfg.MethodsConfig(states=states)

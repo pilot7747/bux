@@ -28,6 +28,7 @@ from bux.architecture import Model, Scanned
 from bux.architecture.common.segments import Segments
 from bux.architecture.registry import Stream, Taps
 from bux.architecture.repeats import pipelined, remat
+from bux.architecture.repeats.repeat import pipelined_repeat
 from bux.lang import ir
 from bux.parallel import pipeline, schedule
 from bux.train import flops
@@ -60,7 +61,7 @@ def _work(run: ir.Run) -> tuple[int, pipeline.Work]:
     row = _row(t.seq_len)
     with _on_stages(run), remat.off(), kernels.off():
         model = nnx.eval_shape(lambda: Model(run.arch, rngs=nnx.Rngs(t.seed)))
-        [repeat] = [m for _, m in nnx.iter_graph(model) if _pipelined(m)]
+        _, repeat = pipelined_repeat(model)
         graphdef, state = nnx.split(model)
         before = functools.partial(_before, graphdef)
         after = functools.partial(_after, graphdef, loss)
@@ -87,11 +88,6 @@ def _on_stages(run: ir.Run) -> Generator[None]:
     grid = AbstractMesh(shape, parallel.AXES, axis_types=auto)
     with parallel.use(grid, t.layout, t.methods):
         yield
-
-
-def _pipelined(module: object) -> bool:
-    """Return whether `module` is the repeat the stages pipeline."""
-    return isinstance(module, Scanned) and module.rounds > 0
 
 
 def _row(seq_len: int) -> Batch:

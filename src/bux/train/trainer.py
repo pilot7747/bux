@@ -43,7 +43,7 @@ from bux.architecture.logits import HeadOutput
 from bux.architecture.precision import matmuls
 from bux.architecture.registry import Loss, Stream
 from bux.architecture.repeats import pipelined, remat
-from bux.architecture.repeats.repeat import scanned_variables
+from bux.architecture.repeats.repeat import pipelined_repeat, scanned_variables
 from bux.data.pipeline import DEFAULT_CACHE, jobs, prepare
 from bux.lang import ir
 from bux.lang.printer import run_to_source
@@ -174,11 +174,7 @@ class _Cut:
     does not run (``pipelined.stream_into``, ``pipelined.leaving``)."""
 
     def __init__(self, model: Model, objective: Objective, rows: int):
-        [(self.path, scanned)] = [
-            (p, m)
-            for p, m in nnx.iter_graph(model)
-            if isinstance(m, Scanned) and m.rounds
-        ]
+        self.path, scanned = pipelined_repeat(model)
         self.objective, self.rows = objective, rows  # the microbatches of every device
         _check_outside(model, self._inside)
         split = nnx.split(
