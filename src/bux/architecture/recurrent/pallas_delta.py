@@ -99,9 +99,7 @@ def delta_rule(
     if rows[1] is not None:  # positions split over devices, which XLA gathers
         return otherwise(q, k, v, log_decay, beta, docs)
     specs = (rows,) * 4 + (P(*rows[:3]), P(*rows[:2]))
-    # Untyped by what varies, which the kernels' outputs do not say; nothing here
-    # communicates.
-    return jax.shard_map(_rows, in_specs=specs, out_specs=rows, check_vma=False)(*xs)
+    return kernels.per_device(_rows, specs, rows)(*xs)
 
 
 def _within(docs: Segments | None, shape: tuple[int, ...]) -> Int[Array, "b t"]:

@@ -242,7 +242,7 @@ def kernel_twice(
     decode = 1 / encode
     salt = salt_of(seed).reshape(1)
     kind = Kind(tiles, stochastic)
-    quantize = blockscaled.on_each_device(_quantize, _quantize_partitioned)
+    quantize = blockscaled.partitioned_unless_manual(_quantize, _quantize_partitioned)
     rows, row_scales, cols, col_scales = quantize(
         x, hadamard, encode, decode, salt, kind
     )
@@ -257,7 +257,9 @@ def _amaxes(
     activations."""
     if tiles:
         return jnp.abs(x).max().astype(jnp.float32).repeat(2)
-    amaxes = blockscaled.on_each_device(_amaxes_by_kernel, _amaxes_partitioned)
+    amaxes = blockscaled.partitioned_unless_manual(
+        _amaxes_by_kernel, _amaxes_partitioned
+    )
     return amaxes(x, hadamard)
 
 

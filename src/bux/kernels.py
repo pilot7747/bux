@@ -5,13 +5,15 @@ Every kernel (``affine_scan``, ``grouped``, ``fused_delta``, ``pallas_delta``,
 tokamax and cuDNN, dense and ``sparse``) asks `gpu` and falls back to XLA where it is
 false. So inside ``off``, or with BUX_KERNELS=off, everything traces by XLA: to count
 the FLOPs a kernel hides, or to debug one. A Pallas kernel called off a GPU all the
-same, as the tests call them, runs interpreted (`interpreted`).
+same, as the tests call them, runs interpreted (`interpreted`). On a mesh, which XLA
+cannot split a kernel over, `per_device` runs one on each device's part.
 """
 
 import contextlib
 import contextvars
 import os
-from collections.abc import Generator
+from collections.abc import Callable, Generator
+from typing import Any
 
 import jax
 
@@ -27,6 +29,14 @@ def interpreted() -> bool:
     """Return whether a kernel called here runs interpreted, by XLA: off a GPU, as
     the tests call them."""
     return jax.default_backend() != "gpu"
+
+
+def per_device(kernel: Callable[..., Any], ins: Any, outs: Any) -> Callable[..., Any]:
+    """Return `kernel` in a shard_map that gives it each device's part of its inputs,
+    split as the specs `ins` say, and joins its outputs as `outs` say. Nothing in it
+    communicates."""
+    # Untyped by what varies, which a kernel's outputs do not say.
+    return jax.shard_map(kernel, in_specs=ins, out_specs=outs, check_vma=False)
 
 
 @contextlib.contextmanager
