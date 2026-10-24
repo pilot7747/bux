@@ -694,7 +694,7 @@ def test_a_step_that_donates_takes_the_memory_of_the_state_it_replaces(donate):
     trainer = Trainer(model, optax.adamw(1e-3), loss, donate=donate)
     data = batches(tcfg.SyntheticConfig(), rows(tcfg.SyntheticConfig(), 2, 8), 32)
     batch = jax.device_put(next(data))
-    step = trainer._train.lower(trainer.model, trainer.optimizer, batch).compile()
+    step = trainer.lower(batch).compile()
     state = sum(x.nbytes for x in jax.tree.leaves(trainer.state()))
     memory = step.memory_analysis()
     assert memory is not None and memory.alias_size_in_bytes == donate * state

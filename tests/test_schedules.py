@@ -292,7 +292,7 @@ def _formats(name: str, monkeypatch) -> dict[int | None, set[str]]:
         model, tx, loss = _built(run)
         trainer = Trainer(model, tx, loss, matmuls=t.precision, microbatches=1)
         batch = parallel.shard_batch(plain(TOKENS))
-        trainer._train.lower(trainer.model, trainer.optimizer, batch)
+        trainer.lower(batch)
     monkeypatch.setattr(matmuls, "format_of", of)
     return seen
 

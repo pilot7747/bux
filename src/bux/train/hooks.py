@@ -92,9 +92,14 @@ class Log(Hook):
         self.flops = trainer.flops
 
     def __call__(self, trainer: "Trainer", metrics: Metrics) -> Later:
+        """Return the step's scalars, to read once the next step is launched. Its
+        learning rate is computed now, on the GPU behind this step: computed as it is
+        read, it would queue behind the next step, and reading it wait for that one
+        too, leaving the GPU nothing to run as the host launches the one after."""
+        lr = self.lr(trainer.step - 1)
         counted = trainer.work is not None
         return functools.partial(
-            self._read, metrics, trainer.step, trainer.flops, counted
+            self._read, metrics | {"lr": lr}, trainer.step, trainer.flops, counted
         )
 
     def _read(
@@ -106,7 +111,6 @@ class Log(Hook):
         now = time.perf_counter()
         steps, seconds = step - self.since, now - self.clock
         scalars |= {
-            "lr": float(self.lr(step - 1)),
             "tokens": step * self.tokens,
             "tokens_per_s": steps * self.tokens / seconds,
         }

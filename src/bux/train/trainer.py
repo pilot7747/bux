@@ -170,6 +170,61 @@ def _by_spec(
     return jax.tree.map(lambda s, v: v.replace(f(s, v.get_value())), specs, state)
 
 
+def _is_variable(x: object) -> bool:
+    return isinstance(x, nnx.Variable)
+
+
+def _variables(state: nnx.State) -> list[nnx.Variable]:
+    return jax.tree.leaves(state, is_leaf=_is_variable)
+
+
+# A variable's value: an array, or a pytree of them, as optax's MaskedNode is of none.
+Value = Any
+
+
+class _Split:
+    """The model's and the optimizer's state, split once for the training steps: the
+    structure of their graph, and its variables, whose values a step reads and
+    replaces. nnx.jit walks the graph at every call, from it to its arrays and back:
+    on a B300 node's host 20 ms a step of the 1.3B and 70 of Qwen3-30B-A3B, which the
+    GPU waits for where XLA's launch of a step returns only near its end. The graph's
+    own variables hold each step's state, so the model and the optimizer are always
+    up to date."""
+
+    def __init__(self, nodes: tuple[Model, nnx.Optimizer]):
+        self.graphdef, state = nnx.split(nodes)
+        self.variables: list[nnx.Variable] = _variables(state)
+        self.structure = jax.tree.structure(state, is_leaf=_is_variable)
+
+    def values(self) -> list[Value]:
+        """Return the variables' values, as a step takes them: raw, as nnx.split
+        gives them (bux sets no hooks on a variable's value), which reads and
+        writes 4x quicker than through the hooks."""
+        return [variable.get_raw_value() for variable in self.variables]
+
+    def take(self, values: Sequence[Value]) -> None:
+        """Have the variables hold `values`, the state a step leaves."""
+        for variable, value in zip(self.variables, values, strict=True):
+            variable.set_raw_value(value)
+
+    def merged(self, values: Sequence[Value]) -> tuple[Model, nnx.Optimizer]:
+        """Return a model and an optimizer of their own variables, which hold
+        `values`: inside a step, as it traces."""
+        own = [v.replace(x) for v, x in zip(self.variables, values, strict=True)]
+        return nnx.merge(self.graphdef, jax.tree.unflatten(self.structure, own))
+
+    def values_of(self, nodes: tuple[Model, nnx.Optimizer]) -> list[Value]:
+        """Return the values of the model's and the optimizer's variables at a step's
+        end, in the order of `values`. Raise if the step changed which they are."""
+        state = nnx.state(nodes)
+        if jax.tree.structure(state, is_leaf=_is_variable) != self.structure:
+            raise ValueError(
+                "a training step changes the values of the model's and the "
+                "optimizer's variables, but not which variables they hold"
+            )
+        return [variable.get_raw_value() for variable in _variables(state)]
+
+
 class _Micro(NamedTuple):
     """A pipeline's microbatches, each leaf (microbatches, rows, ...): the rows, and
     each row's share of the batch's target tokens."""
@@ -297,7 +352,10 @@ class Trainer:
     `train_step` and `eval_step` are compiled once, so a subclass that overrides them
     changes what a step does (keeps an average of the weights, skips a spike) and
     keeps the loop, hooks and checkpoints. They get the model and the optimizer as
-    arguments, which is how nnx.jit sees them change.
+    arguments, and what `train_step` changes of them is the step's new state. The
+    training step takes their variables' values, which the trainer keeps split
+    (``_Split``): between steps a hook may change those values, as `load` does, but
+    not which variables the model and the optimizer hold.
 
     Both compute in `compute`, the model's parameters cast to it inside the loss, so
     that the parameters, their gradients and the optimizer's state stay as they are
@@ -363,7 +421,7 @@ class Trainer:
         self.step = 0
         self.work, self.flops = work, 0.0
         self.stopping = False  # set, by a signal handler say, to stop after this step
-        self._donated = ("model", "optimizer") if donate else ()
+        self._donate = donate
         self._compiler_options = compiler_options or {}
         self._reductions = reductions
         self._compile()
@@ -373,13 +431,28 @@ class Trainer:
         `auto`, the training step chooses its policy as it first compiles
         (``fitting``)."""
         passes.use(reorder.NAME, self._reductions == "early")
+        self._split = _Split((self.model, self.optimizer))
         jit = fitting.Fitting if remat.setting() == "auto" else xla.jit
         self._train = jit(
-            self._train_step_on_shards,
+            self._on_values(self._train_step_on_shards),
             self._compiler_options,
-            donate_argnames=self._donated,
+            donate_argnums=0 if self._donate else (),
         )
         self._eval = nnx.jit(self.eval_step)
+
+    def _on_values(self, step: Callable[..., Metrics]) -> Callable[..., Any]:
+        """Return `step`, a function of the model, the optimizer and a batch, as one
+        of their variables' values (``_Split``) and the batch, which returns their
+        new values and the step's metrics."""
+        split = self._split
+
+        @functools.wraps(step)
+        def on_values(values: list[Value], batch: Batch) -> tuple[list[Value], Metrics]:
+            model, optimizer = split.merged(values)
+            metrics = step(model, optimizer, batch)
+            return split.values_of((model, optimizer)), metrics
+
+        return on_values
 
     def _reduces_once(self, model: Model) -> bool:
         """Return whether a step adds up its gradients unreduced (``_unreduced``, or a
@@ -690,11 +763,17 @@ class Trainer:
     def train_on_batch(self, batch: Batch) -> Metrics:
         """Take one training step on `batch`, and return its metrics."""
         self._switch_if_due()
-        metrics = self._train(self.model, self.optimizer, parallel.shard_batch(batch))
+        on_devices = parallel.shard_batch(batch)
+        values, metrics = self._train(self._split.values(), on_devices)
+        self._split.take(values)
         self.step += 1
         if self.work is not None:
             self.flops += self.work.of(rows_read(batch.position_ids))
         return metrics
+
+    def lower(self, batch: Batch) -> jax.stages.Lowered:
+        """Return the training step lowered for the trainer's state and `batch`."""
+        return self._train.lower(self._split.values(), batch)
 
     def _switch_if_due(self) -> None:
         if self.switch is not None and self.step >= self.switch[0]:
@@ -702,15 +781,15 @@ class Trainer:
             self._compile()
 
     def evaluate(self, batches: Iterable[Batch]) -> float:
-        """Return the mean of `eval_step` over `batches`, in eval mode."""
+        """Return the mean of `eval_step` over `batches`, in eval mode. Every batch's
+        step is launched before any loss is read, so the GPU runs one as the host
+        launches the next."""
         self.model.eval()
         try:
-            losses = [
-                float(self._eval(self.model, parallel.shard_batch(b))) for b in batches
-            ]
+            losses = [self._eval(self.model, parallel.shard_batch(b)) for b in batches]
         finally:
             self.model.train()
-        return sum(losses) / len(losses)
+        return sum(float(loss) for loss in losses) / len(losses)
 
     def state(self) -> nnx.State:
         """What a checkpoint keeps: the model's state and the optimizer's."""

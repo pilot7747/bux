@@ -95,11 +95,11 @@ def test_the_candidates_after_the_first_compile_side_by_side(monkeypatch):
     rest = threading.Barrier(len(remat.CANDIDATES) - 1, timeout=60)
     held, calls = fitting.held, []
 
-    def held_once_all_compile(lowered: object, options: dict) -> int | None:
+    def held_once_all_compile(lowered: object) -> int | None:
         calls.append(lowered)
         if len(calls) > 1:
             rest.wait()  # breaks, and fails the test, unless the rest are all here
-        return held(lowered, options)
+        return held(lowered)
 
     monkeypatch.setattr(fitting, "held", held_once_all_compile)
     step = _stepped()
