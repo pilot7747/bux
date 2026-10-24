@@ -114,15 +114,73 @@ node FSDP +5.9%, at 8 microbatches +4.8%, the MoE sorted +9.1% and by EP +6.7% (
 GiB less each), TP +2.3%, the pipeline +0.6% (1.2 GiB more); on one GPU dense +5.8%,
 MoE +6.2% (16 GiB less), MXFP8 +3.5%, NVFP4 +8.3%, the hybrids within 2.1%.
 
+## Round 2: Megatron's own workload
+
+Megatron-Bridge's config for that row (r0.5.0) trains a global batch of 512 rows of
+4096: 8 microbatches of 8 rows a GPU, EP=8, no recompute. It hides 7 of every 8 token
+exchanges by running a microbatch's forward beside the previous one's backward
+(combined 1F1B), delays the weight gradients' GEMMs under the exchanges, captures the
+whole iteration in one CUDA graph, runs the experts by cuDNN-frontend's CuTe DSL MXFP8
+grouped GEMMs with the SwiGLU in their epilogue, and attention in MXFP8. `megatron.bux`
+trains that workload now; `sorted` gathers a layer at a time, as a whole copy of the
+model does not fit beside a microbatch.
+
+At it, main trained `sorted` at 37.5k tokens a second a GPU (229.6 GiB), and `nccl_ep`
+not at all: its buffers were sized for a step. At one microbatch, `sorted`'s step took
+898 ms (768 computing, 61 of collectives alone, 69 idle), `nccl_ep`'s 1093 (688, 326,
+78).
+
+- **O, the reductions.** XLA's scheduler put every weight gradient's GEMM and
+  reduce-scatter after the backward, where they ran beside nothing, ~95 ms a
+  microbatch. `bux.train.reorder`, a pass over XLA's schedule, starts each beside the
+  next layer's backward (`compiler(reductions=early)`, the default); `bux.passes` is the
+  registry of such passes, and keys JAX's cache by them. The log reads a step's
+  metrics after the next is launched. No XLA flag or NCCL setting helped: PGLE, two
+  collectives in flight, fewer NCCL channels; symmetric buffers fail to compile beside
+  cuDNN's MXFP8 GEMMs.
+- **K, the experts.** Their SwiGLU MLP by cuDNN-frontend's CuTe DSL MXFP8 kernels
+  (`grouped_glu`, `grouped_cudnn`): the SwiGLU, the row's weight and h's quantization in
+  up's epilogue, dSwiGLU in down's dgrad. Under FSDP each GPU quantizes its own shard
+  of the experts' kernels, and gathers them in MXFP8.
+- **A, the rest of a layer.** QK-norm and RoPE in one pass each way, the dense MXFP8
+  quantizer at 4.3-4.7 TB/s, the loss's target logits gathered, the router's GEMM from
+  bfloat16. cuDNN's MXFP8 attention is 1.35x bfloat16's forward, but its backward is no
+  faster at rows of 4096: not used.
+- **E, NCCL EP.** Buffers sized by a microbatch; each backward call prepares its own
+  route, so any order of the calls computes the same; `moe_stream`'s calls start early
+  and finish late (`parts_off_the_stream` strips the stream mark the SPMD partitioner
+  copies onto their results). In turn, nothing independent sits beside an exchange,
+  and the arm gains nothing from it.
+- **S, microbatches side by side.** `methods(interleave=true)` runs each microbatch's
+  forward beside the backward of the one before, a piece of the model at a time:
+  `nccl_ep` on 12 layers +4%. Off by default: its residuals cross the scan's
+  iterations (25-30 GiB more), so 48 layers fit only with recompute.
+
+On 8 B300s, `megatron.bux` at its defaults, one node, main against the merged tree:
+
+| run | main | round 2 | of Megatron's 40,769 |
+|-----|------|---------|----------------------|
+| `sorted`, `fsdp=8` | 37,451, 229.6 GiB | **42,252**, 214.5 GiB | 104% |
+| `nccl_ep`, `expert=8` | fails | 34,715, 236.1 GiB | 85% |
+
+O's pass gave 5%, K's MLP 4.5%, A's kernels 2.6%. 3000 steps of FineWeb-Edu on the
+baseline's MoE with experts of 768 and QK-norm end within 0.12% of main at each of
+three seeds, which differ by 1.6% (mean -0.01%). The suites, main against the merged
+tree: on a node FSDP +0.9%, at 8 microbatches +6.3%, the MoE sorted +0.1% and by EP
++1.2%, TP +1.9%, the pipeline -0.0%; on one GPU dense +1.5%, MoE +1.5%, NVFP4 +2.1%,
+the others within 1% (the GDN hybrid, -4.5% side by side on other GPUs, trains at
+128.3k on one GPU in turn in both trees, and pinned to the same loss).
+
 ## Left open
 
-- The exposed collectives and idle time (114 ms), and the experts' quantizer (100).
-- NCCL EP's exchange beside the experts: XLA's schedule puts each call's done right
-  after its start, and a scheduling group a chunk fails in the backward, whose chunks
-  share the forward's ids.
-- Each weight shard quantized once, before FSDP gathers it (23 ms a step).
-- The MXFP8 experts' Mosaic kernels are lowered again at every call: about a minute of
-  each compile of this model.
+- `nccl_ep`'s exchange: hidden only beside another microbatch (`interleave`), which
+  needs a carry XLA does not copy to fit 48 layers without recompute.
+- The GPU waits for the host between steps: 165-210 ms of `sorted`'s 6.4 s step, as
+  nnx.jit walks the state before each launch.
+- ~40 ms of reductions a microbatch still alone at the end of its backward (the last
+  layers', the embedding's, the head's in float32).
+- The MXFP8 experts' Mosaic kernels are lowered again at every call, and CuTe DSL
+  compiles its kernels in every process: 20-110 s of a compile.
 
 ## Rules
 
