@@ -1164,8 +1164,8 @@ GB of experts a layer, where the exchanges move 1 GB of picks each way
 the exchanges ran again in the backward, since their results are no products; named
 for it ([below](#fp8-dispatch-precisiondispatch)), `ragged_all_to_all` trains at 515k
 tokens a second in 77.5 GiB, from 452k in 72.6. XLA's ragged all-to-all leaves an allocation inside the memory pool after the first step,
-so that a step whose temporaries take over half of it fits only once:
-`XLA_PYTHON_CLIENT_MEM_FRACTION=.95` gives the pool more room. `ragged_tokens` moves
+so that a step whose temporaries take over half of it fits only once: bux's pool of
+95% of a GPU, against JAX's 75%, gives it more room. `ragged_tokens` moves
 about 30% fewer rows when the routing is random, and half as few or fewer where a
 group limit keeps each token on half the devices (`num_groups` the size of `expert`,
 `top_k_groups` half of it), but it sends the picks and their weights besides, and

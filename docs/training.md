@@ -523,6 +523,33 @@ loops, command buffers off, Triton GEMMs off. FSDP over 8 GPUs gets 97% of 8 tim
 one GPU's tokens already. Other splits wait longer for their collectives, and the
 `compiler` setting tries XLA's options on them (below).
 
+bux also gives XLA's memory pool 95% of a GPU, where JAX gives it 75%
+(`runtime.POOL`), unless `XLA_CLIENT_MEM_FRACTION` or its old name,
+`XLA_PYTHON_CLIENT_MEM_FRACTION`, says otherwise. The rest is for what allocates
+beside the pool: the CUDA context, NCCL's buffers and NCCL EP's, which on B300s
+(268.6 GiB) took, a GPU at most:
+
+| run (`megatron.bux`, Qwen3-30B-A3B; the dense 1.3B) | beside the pool |
+|------------------------------------------------------|-----------------|
+| `sorted`, `fsdp=8`                                   | 1.9 GiB         |
+| `nccl_ep`, `expert=8`                                | 6.5 GiB         |
+| the 1.3B, `fsdp=16` over two nodes                   | 2.2 GiB         |
+| `nccl_ep`, `expert=16` over two nodes                | 9.8 GiB         |
+
+At 95% a B300's pool is 254 GiB and 14.3 GiB stay beside it; at 97%, 8.9 GiB, too
+little for NCCL EP over two nodes, whose buffers grow with a device's tokens and the
+model's width. `remat=auto` fits the step to the pool: `sorted` took `dots` at 75%
+(211k tokens a second), `dots_attention` at 95% (224k) and `none` at 97% (251k, its
+peak 250 GiB), which a run under FSDP alone can ask for with
+`XLA_CLIENT_MEM_FRACTION=.97`.
+
+A compile of `sorted`'s 48-layer step (`remat=none`) takes about 230 s on a B300's
+host: 38 s to trace it, 62 s to lower it to MLIR, and 132 s in XLA, 89 of them in its
+HLO passes and 16 in LLVM and ptxas for its 286 kernels. 88% of the lowering is the
+MXFP8 experts' Mosaic GPU kernels, lowered once a call, 0.36 s each, though every
+layer calls them at the same shapes. Creating the model compiles its
+initializers besides, once a run: 79 s.
+
 On packed documents (`best_fit` of documents of 16 to 4000 words, GPT-2 tokens), on
 one GPU, the 1.3B trains at 145k tok/s in rows of 4096 by tokamax's kernel, and at
 139k in rows of 16384 by cuDNN's, which skips every block no query sees, where

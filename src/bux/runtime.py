@@ -1,8 +1,9 @@
-"""What bux sets for JAX before it trains: XLA's flags, NCCL EP's settings, and a cache
-of compiled steps.
+"""What bux sets for JAX before it trains: XLA's flags, NCCL EP's settings, the share
+of a GPU XLA's pool takes, and a cache of compiled steps.
 
 `bux train`, `bux launch` and a sweep's workers call ``configure`` before anything
-starts a backend. A flag that XLA_FLAGS sets already keeps its value. Compiled
+starts a backend. A flag that XLA_FLAGS sets already keeps its value, and so does a
+pool's share that XLA_CLIENT_MEM_FRACTION sets, or its older name. Compiled
 programs, and on GPUs the autotuner's picks, persist in $XDG_CACHE_HOME/bux/jax
 (~/.cache/bux/jax), so a launch after the first compiles little; a
 JAX_COMPILATION_CACHE_DIR that is set says where instead, and one set empty turns the
@@ -33,6 +34,12 @@ XLA_FLAGS = (
 # default) took 3x as long for an EP layer's exchanges, and chunks of 64 1.3x.
 NCCL_DEFAULTS = {"NCCL_GIN_TYPE": "2", "NCCL_EP_TOKENS_PER_CHUNK": "256"}
 TIMEOUT_MS = 10 * 60 * 1000  # for the other processes to reach the same point
+# The share of a GPU's memory XLA's pool takes where the environment sets none, of
+# jaxlib's two names for it (the second is its old one); JAX's default is 75%. Beside
+# the pool, the CUDA context, NCCL's buffers and NCCL EP's took up to 9.8 GiB of a
+# B300 (EP over two nodes), which 95% leaves room for (14.3 GiB) and 97% does not.
+POOL = "0.95"
+POOL_VARIABLES = ("XLA_CLIENT_MEM_FRACTION", "XLA_PYTHON_CLIENT_MEM_FRACTION")
 
 
 def _name(flag: str) -> str:
@@ -52,9 +59,9 @@ def cache_dir(env: Mapping[str, str] = os.environ) -> Path:
 
 
 def configure(env: MutableMapping[str, str] = os.environ) -> None:
-    """Add bux's flags to XLA_FLAGS in `env` and NCCL EP's settings, and keep compiled
-    programs in JAX_COMPILATION_CACHE_DIR, `cache_dir` unless it is set. Workers
-    inherit them all."""
+    """Add bux's flags to XLA_FLAGS in `env`, NCCL EP's settings and the share of a
+    GPU XLA's pool takes, and keep compiled programs in JAX_COMPILATION_CACHE_DIR,
+    `cache_dir` unless it is set. Workers inherit them all."""
     env["XLA_FLAGS"] = xla_flags(env.get("XLA_FLAGS", ""))
     for name, value in NCCL_DEFAULTS.items():
         env.setdefault(name, value)
@@ -62,6 +69,8 @@ def configure(env: MutableMapping[str, str] = os.environ) -> None:
     jax.config.update(
         "jax_compilation_cache_dir", env["JAX_COMPILATION_CACHE_DIR"] or None
     )
+    if not any(name in env for name in POOL_VARIABLES):
+        env[POOL_VARIABLES[0]] = POOL
 
 
 def agree_on_cache() -> None:
