@@ -2302,17 +2302,30 @@ copies as memcpys. With no carry at all, the ticks of every microbatch unrolled 
 step, nothing is copied, but the program is n times the loop's, and XLA held 176 GiB
 for the 12 layers in 8 microbatches (124.6k tokens a second a GPU, the loop 126.7k).
 
-On 8 B300s it overlaps, but its copies cost more than it hides, and it is off by
-default. Tokens a second a GPU and the peak, the loop and interleave side by side
-on a node:
+On 8 B300s it hides NCCL EP's exchange behind the other microbatch's compute, but
+elsewhere its copies cost more than it hides, and a model that fills a GPU in a row
+does not fit: it is off by default. Tokens a second a GPU and the peak, the loop and
+interleave side by side on a node:
 
 | run | in a row | interleaved |
 |-----|----------|-------------|
+| `megatron.bux`'s `nccl_ep`, `moe_stream=true`, 12 layers, 8 microbatches of 8 rows a GPU | 115.6k, 63.7 GiB | **120.3k**, 93.1 GiB |
+| the same, NCCL EP on the compute stream | 115.7k, 64.5 GiB | 112.3k, 87.0 GiB |
+| its `sorted`, 12 layers, 8 microbatches | 123.8k, 62.0 GiB | 118.0k, 87.5 GiB |
 | `one_node.bux`'s `tp` (`repeat=unroll`, `remat=none`), 16 rows in 4 microbatches | 33.2k, 18.0 GiB | 33.5k, 19.3 GiB |
 | the same, two collectives in flight | | 34.0k, 18.1 GiB |
 | its `fsdp`, the dense 1.3B at a row a GPU a microbatch, 32 rows in 4 | 111.2k, 11.5 GiB | 93.1k, 12.6 GiB |
-| `megatron.bux`'s `sorted`, 12 layers, 8 microbatches of 8 rows a GPU | 123.8k, 62.0 GiB | 118.0k, 87.5 GiB |
-| its `nccl_ep`, `moe_stream=true`, 12 layers, 8 microbatches | 109.4k, 63.6 GiB | 110.2k, 81.6 GiB |
+
+With `moe_stream`, NCCL EP's calls run on a stream of their own, started as early as
+their inputs allow and waited for as late as their results are needed
+([On a stream of its own](#on-a-stream-of-its-own-methodsmoe_stream)), and the other
+microbatch's piece gives the scheduler compute to put beside them: at 4 microbatches
+of the 12 layers, GPU 0's step takes 1111 ms against 1152 in a row, its collectives
+199 ms beside compute and 277 exposed, from 30 and 360, though the bottom half's
+copies add 38 ms. In a row, `moe_stream` gains nothing, as no compute is left beside
+the exchange. All 48 layers at Megatron's batch, which the loop trains at 33.7k in
+234 GiB (`remat=none`), do not fit interleaved: 291 GiB at `remat=none`, and at
+`dots_attention` too, where the loop trains at 28.6k in 207.5 GiB.
 
 The overlap is real but small on a node: TP's step on GPU 0 left 39 ms of its
 collectives exposed, from 47, and unrolled 35, at 35.3k a GPU against the loop's
@@ -2324,17 +2337,14 @@ barrier on the slots and the gradients alone, so that each half's chain runs as 
 likes, TP trained at 31.2k in 24.9 GiB, against 32.2k tied, and the MoE at 104.6k in
 93.8 GiB, against 107.3k. XLA runs one collective at a time
 (`xla_gpu_experimental_parallel_collective_overlap_limit`); at 2, interleave gains,
-and the MoE's loop loses 4.5%. The 48-layer arm at Megatron's batch, which the loop
-trains at 35.8k in 230 GiB, does not fit interleaved: in slots it asked for 261 GiB,
-and the carry holds half a microbatch more.
+and the MoE's loop loses 4.5%. Nor does `sorted`'s 48-layer arm at Megatron's batch,
+which the loop trains at 35.8k in 230 GiB, fit interleaved: in slots it asked for 261
+GiB, and the carry holds half a microbatch more.
 
-NCCL EP keeps a layer's routing from its forward to its backward, so a microbatch's
-forward of a layer before the backward of the one before fails in TransformerEngine
-("no prior nvte_ep_prepare") unless `moe_stream=true` runs them as one call, which
-trains to the loop's losses; its exchange stays exposed beside the other
-microbatch's compute, as XLA's schedule puts each call's done right after its
-start. A model whose items pass each other more than the stream (a tap, an MTP
-head) is an error that says so, and so is a pipeline, which schedules its own
+Each of NCCL EP's backward calls prepares its own route from the picks the forward
+saved, so two microbatches' calls run in any order and every run above trains to the
+loop's losses. A model whose items pass each other more than the stream (a tap, an
+MTP head) is an error that says so, and so is a pipeline, which schedules its own
 microbatches. The step's program is about twice the loop's, a forward and a backward
 on each side of the loop, and compiles in about twice the time.
 
