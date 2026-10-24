@@ -274,16 +274,18 @@ def _arrays(tree: object) -> dict[str, Stored]:
     """The dtype and shape of every array of `tree`, by its path, as a checkpoint
     keeps them: a typed key as its key's data."""
 
-    def key(k: object) -> str:
-        return str(next(getattr(k, a) for a in ("key", "idx", "name") if hasattr(k, a)))
-
     def stored(x: Any) -> Stored:  # an array, or a checkpoint's metadata of one
         if jax.dtypes.issubdtype(x.dtype, jax.dtypes.prng_key):
             x = jax.eval_shape(jax.random.key_data, x)
         return str(x.dtype), tuple(x.shape)
 
     leaves = jax.tree_util.tree_leaves_with_path(tree)
-    return {"/".join(map(key, path)): stored(x) for path, x in leaves}
+    return {_named(path): stored(x) for path, x in leaves}
+
+
+def _named(path: tuple) -> str:
+    """Return a pytree path as its keys, joined by /: a name of a checkpoint's array."""
+    return jax.tree_util.keystr(path, simple=True, separator="/")
 
 
 def _check_shared(folder: Path) -> None:
