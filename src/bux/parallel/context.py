@@ -19,8 +19,8 @@ from jaxtyping import Array, Bool, Float, Int
 
 from bux.parallel import flash, methods
 from bux.parallel.flash import Keys
-from bux.parallel.layout import shard, spec
-from bux.parallel.mesh import active
+from bux.parallel.layout import as_split, axes_of, shard, spec
+from bux.parallel.mesh import active, free_axes
 from bux.train import flops
 
 AXIS = "context"
@@ -142,22 +142,10 @@ def xla(
 # --- on each device -----------------------------------------------------------------
 
 
-def _axes(split: str | tuple[str, ...] | None) -> set[str]:
-    """Return the mesh axes of one dimension of a partition spec."""
-    return set() if split is None else {split} if isinstance(split, str) else set(split)
-
-
-def _free_axes() -> set[str]:
-    """Return the axes of the run's mesh that no shard_map being traced maps."""
-    on = active()
-    assert on is not None
-    return set(on.mesh.axis_names) - set(jax.sharding.get_abstract_mesh().manual_axes)
-
-
 def splits_positions(q: Float[Array, "b t h dk"]) -> bool:
     """Return whether the run's layout splits the positions of `q` over `context`."""
     split = spec(("batch", "seq", "heads", None), q.shape)
-    return len(split) > 1 and AXIS in _axes(split[1])
+    return len(split) > 1 and AXIS in as_split(split[1])
 
 
 def _specs(
@@ -200,7 +188,7 @@ def on_devices(
         body,
         in_specs=(queries, keys, keys, P(*queries[:2]), P(queries[2])),
         out_specs=queries,
-        axis_names=_free_axes(),
+        axis_names=free_axes(),
         check_vma=False,
     )(q, k, v, rows, sinks)
 
@@ -486,7 +474,7 @@ def _context_parallel(
     on rows of one document."""
     on = active()
     assert on is not None
-    heads = q.shape[2] // on.size(*_axes(spec(("heads",), q.shape[2:3])[0]))
+    heads = q.shape[2] // on.size(*axes_of(spec(("heads",), q.shape[2:3])))
     if heads % on.size(AXIS) == 0:
         return ulysses(q, k, v, args)
     return methods.attention.find("ring")(q, k, v, args)

@@ -36,7 +36,6 @@ from bux.architecture.experts.moe import (
     Kernels,
     MoE,
     RowNorm,
-    axes_of,
     experts,
     in_range,
     in_shard_map,
@@ -50,7 +49,7 @@ from bux.architecture.precision import blockscaled, matmuls
 from bux.architecture.registry import Taps, report
 from bux.architecture.repeats import remat
 from bux.parallel import methods
-from bux.parallel.layout import spec
+from bux.parallel.layout import axes_of, spec
 from bux.parallel.mesh import active
 
 Axes = tuple[str, ...]

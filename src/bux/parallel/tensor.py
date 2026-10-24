@@ -36,11 +36,10 @@ from jaxtyping import Array, Float
 
 from bux.architecture.precision import blockscaled, matmuls
 from bux.parallel import methods
-from bux.parallel.layout import NAMES, Name, shard, spec, splits
-from bux.parallel.mesh import active
+from bux.parallel.layout import NAMES, Entry, Name, as_split, shard, spec, splits
+from bux.parallel.mesh import active, free_axes, manual_axes
 
 AXIS = "tensor"
-Entry = str | tuple[str, ...] | None  # one dimension of a PartitionSpec
 # The formats that scale each block of an operand by itself, and their blocks: a
 # device's share of whole blocks multiplies as the whole does.
 SCALED_BY_BLOCK = {"mxfp8": blockscaled.MX_BLOCK, "mxfp8_2d": blockscaled.MX_BLOCK}
@@ -169,21 +168,16 @@ def _input_split(x: Float[Array, "b t d"]) -> InputSplit | None:
     a shard_map already manual over it, or where the stream splits otherwise than the
     layer's positions and then `tensor`."""
     on = active()
-    manual = jax.sharding.get_abstract_mesh().manual_axes
-    if on is None or on.size(AXIS) == 1 or AXIS in manual:
+    if on is None or on.size(AXIS) == 1 or AXIS in manual_axes():
         return None
     rows, stream, _ = spec(("batch", "stream", None), x.shape)
     _, layer, _ = spec(("batch", "seq", None), x.shape)
-    if _axes(stream) not in (_axes(layer), (*_axes(layer), AXIS)):
+    if as_split(stream) not in (as_split(layer), (*as_split(layer), AXIS)):
         return None
-    rows_here = x.shape[0] // on.size(*_axes(rows))
+    rows_here = x.shape[0] // on.size(*as_split(rows))
     chunks = math.gcd(on.methods.tensor_chunks, rows_here)
-    positions = x.shape[1] // on.size(*_axes(layer))
+    positions = x.shape[1] // on.size(*as_split(layer))
     return InputSplit(rows, stream, layer, chunks, rows_here // chunks * positions)
-
-
-def _axes(entry: Entry) -> tuple[str, ...]:
-    return () if entry is None else (entry,) if isinstance(entry, str) else entry
 
 
 def _names(linear: nnx.Linear) -> tuple[Name, ...]:
@@ -249,14 +243,11 @@ def _shard_map(
 ) -> Callable[..., Any]:
     """`body` on each device's part, manual over every axis no shard_map being traced
     maps. Its matmuls may be kernels (MXFP8's), which need check_vma=False."""
-    on = active()
-    assert on is not None
-    free = set(on.mesh.axis_names) - set(jax.sharding.get_abstract_mesh().manual_axes)
     return jax.shard_map(
         body,
         in_specs=in_specs,
         out_specs=out_specs,
-        axis_names=free,
+        axis_names=free_axes(),
         check_vma=False,
     )
 
