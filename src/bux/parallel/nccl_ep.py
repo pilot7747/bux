@@ -14,7 +14,9 @@ hang across nodes.
 
 NCCL EP keeps its buffers outside the step, sized for the run, so ``start`` runs once
 a process before the step traces (``methods.prepare``). Under `methods.moe_stream` its
-kernels run on a stream of their own (``STREAM``), beside the compute stream's.
+kernels run on a stream of their own (``STREAM``), beside the compute stream's, each
+call started as early as its inputs allow and waited for as late as its results are
+needed (``jax_internals.on_stream``).
 """
 
 import functools
@@ -25,6 +27,7 @@ from typing import TYPE_CHECKING, Any, NamedTuple
 
 import jax
 import jax.numpy as jnp
+from jax.extend import xla as jax_xla
 from jaxtyping import Array, Bool, Float, Int, Shaped, UInt8
 
 from bux import config as cfg
@@ -41,6 +44,7 @@ from bux.parallel.experts import (
     _arrivals,
     chunk_of,
     expert_parallel,
+    in_chunks,
     token_spec,
 )
 from bux.parallel.experts import _room as experts_room
@@ -56,6 +60,14 @@ ALIGNED = 128
 # The stream NCCL EP's kernels run on under `methods.moe_stream`, one of their own:
 # XLA runs the compute stream's kernels beside them, and theirs one after another.
 STREAM = "gpu_stream:1"
+# Of NCCL EP's calls ready at once, XLA starts first those that send rows to the
+# experts (the dispatch, and the combine's gradient), then those that send them back:
+# in chunks, the next chunk's dispatch then runs beside this one's experts, not queued
+# on NCCL EP's stream behind this one's combine (``jax_internals.on_stream``).
+THERE, BACK = 1, 0
+# XLA's name of its pass before its scheduler that takes a stream's mark off the parts
+# of a stream call's results (``jax_internals.parts_off_the_stream``).
+PARTS = "nccl_ep_parts_off_the_stream"
 
 
 class Started(NamedTuple):
@@ -102,6 +114,8 @@ def start(run: "ir.Run") -> None:
         return
     _check(run, ep)
     transformer_engine()  # or say how to get it
+    if run.train.methods.moe_stream:
+        _parts_off_the_stream()
     tokens = _tokens_a_device(run, ep)
     peers = _size(ep)
     rows = _room(tokens * top_k, num_experts // peers, peers)
@@ -109,6 +123,21 @@ def start(run: "ir.Run") -> None:
     if started != wanted:
         _bootstrap(ep[0], wanted)
         started = wanted
+
+
+@functools.cache
+def _parts_off_the_stream() -> None:
+    """Have XLA run ``jax_internals.parts_off_the_stream`` before its scheduler, on
+    every program the process compiles for GPUs from now on: else each part of a
+    call's results on NCCL EP's stream waits there for the calls after it."""
+    if jax.default_backend() != "gpu":
+        return
+    jax_xla.register_hlo_module_transformation(
+        jax_internals.parts_off_the_stream,
+        name=PARTS,
+        stage=jax_xla.PipelineStage.PRE_SCHEDULER,
+        platforms="cuda",
+    )
 
 
 def _moe_shape(run: "ir.Run") -> tuple[int, int]:
@@ -149,12 +178,13 @@ def _size(axes: Axes) -> int:
 
 
 def _tokens_a_device(run: "ir.Run", ep: Axes) -> int:
-    """Return the most tokens a device sends at once: a chunk of its share of a step's
-    rows, whole, as an eval step takes them (``experts.chunk_of``); a training
-    microbatch's chunk sends no more."""
+    """Return the most tokens a device sends at once: a chunk of its share of a
+    microbatch's rows (``experts.chunk_of``). An eval step, which takes a step's rows
+    whole, sends them in pieces of that many (``nccl_ep``)."""
     t = run.train
-    shape = (t.batch, t.seq_len, run.arch.d_model)
-    return chunk_of(t.batch * t.seq_len // _size(axes_of(token_spec(shape, ep))))
+    rows = t.batch // t.methods.microbatches
+    shape = (rows, t.seq_len, run.arch.d_model)
+    return chunk_of(rows * t.seq_len // _size(axes_of(token_spec(shape, ep))))
 
 
 def _room(picks: int, local: int, peers: int) -> int:
@@ -195,6 +225,27 @@ def nccl_ep(
     idx: Int[Array, "b t k"],
     weights: Float[Array, "b t k"],
     kernels: Kernels,
+    **settings: object,
+) -> Combined:
+    """Return ``sent_once`` of a device's tokens, in as many pieces one after another
+    as NCCL EP was started for (``in_chunks``): an eval step's, a step's rows whole,
+    send more tokens than a training microbatch's."""
+    assert started is not None, "methods.prepare starts NCCL EP before a step traces"
+    tokens = z.size // z.shape[-1]
+    pieces = -(-tokens // started.tokens)
+    if tokens % pieces:
+        raise ValueError(
+            f"methods(moe=nccl_ep) sends {tokens} tokens of a device in pieces of at "
+            f"most {started.tokens}, which do not divide them"
+        )
+    return in_chunks(sent_once, pieces)(z, idx, weights, kernels, **settings)
+
+
+def sent_once(
+    z: Float[Array, "b t d"],
+    idx: Int[Array, "b t k"],
+    weights: Float[Array, "b t k"],
+    kernels: Kernels,
     *,
     axes: Axes,
     ffn: cfg.MLPConfig,
@@ -219,7 +270,7 @@ def nccl_ep(
     row_weights = jnp.where(held, sent.weights, 0)
     arrived = remat.label(EXCHANGED, sent.rows)
     made = experts(arrived, sent.sizes, row_weights, *kernels, ffn, norm)
-    y = remat.label(EXCHANGED, _combined(rows, tokens, k, sent.handle, made))
+    y = remat.label(EXCHANGED, _combined(rows, tokens, k, sent.handle, picks, made))
     return y.reshape(z.shape), 1 - arrivals.kept.sum() / (idx.size * peers)
 
 
@@ -256,6 +307,14 @@ def _picks_in(
 # --- TE's one-device primitives, each way with its gradient ------------------------
 
 
+# A route's handle: TE's prepare writes the route into it, and TE keys its own state
+# of the route by the handle's address, which a copy changes. So no handle outlives
+# the pass it is prepared in: the combine takes its dispatch's, and each call of a
+# backward a handle prepared anew from the picks its forward kept, in whatever order
+# microbatches' forwards and backwards run.
+Handle = UInt8[Array, "1 h"]
+
+
 class Dispatched(NamedTuple):
     """What arrives at a device: `rows` of the picks of its experts, sizes[l] of them
     (padded) its expert l's in turn, each pick's weight, and the `handle` that sends
@@ -263,7 +322,7 @@ class Dispatched(NamedTuple):
 
     rows: Float[Array, "r d"]
     weights: Float[Array, " r"]
-    handle: UInt8[Array, "1 h"]
+    handle: Handle
     sizes: Int[Array, " l"]
 
 
@@ -272,23 +331,40 @@ def _route(k: int) -> dict[str, int]:
     return {"top_k": k, "dispatch_output_per_expert_alignment": ALIGNED}
 
 
-def _bind(primitive: Any, *args: Shaped[Array, "..."], **params: Any) -> Any:
-    """Return TE's one-device `primitive` of `args` (``_on_its_stream``)."""
-    return _on_its_stream(lambda: _bound(primitive, *args, **params))
+def _bind(way: int, primitive: Any, *args: Shaped[Array, "..."], **params: Any) -> Any:
+    """Return TE's one-device `primitive` of `args`, which sends rows `way`, THERE
+    or BACK (``_on_its_stream``)."""
+    return _on_its_stream(lambda: _bound(primitive, *args, **params), way)
 
 
 def _bound(primitive: Any, *args: Shaped[Array, "..."], **params: Any) -> Any:
     return primitive.inner_primitive.bind(*args, **params)
 
 
-def _on_its_stream[T](run: Callable[[], T]) -> T:
+def _on_its_stream[T](run: Callable[[], T], way: int) -> T:
     """Return run(), under `methods.moe_stream` the primitives it binds on NCCL EP's
-    stream as one async call: the compute stream waits for each call where it uses its
-    results, so a call a primitive would make it wait for each one in turn."""
+    stream as one async call, which sends rows `way`: the compute stream waits for
+    each call where it uses its results, so a call a primitive would make it wait for
+    each one in turn."""
     on = active()
     if on is None or not on.methods.moe_stream:
         return run()
-    return jax_internals.on_stream(STREAM, run)
+    return jax_internals.on_stream(STREAM, run, way)
+
+
+def _prepared(k: int, idx: Int[Array, "n k"]) -> tuple[Int[Array, "1 l"], Handle]:
+    """Return TE's prepare of the `k` picks idx of each token: the rows each of this
+    device's experts takes, padded, and the handle of their route (``Handle``)."""
+    te = transformer_engine()
+    sizes, _, handle = _bound(te.EpPreparePrimitive, idx, **_route(k), is_outer=False)
+    return sizes, handle
+
+
+def _prepared_again(k: int, idx: Int[Array, "n k"], way: int) -> Handle:
+    """Return a handle of the route of the picks idx for a call of a backward, which
+    takes none from its forward (``Handle``): TE's prepare in a call of its own,
+    which XLA can start as soon as the backward starts, its picks long kept."""
+    return _on_its_stream(lambda: _prepared(k, idx)[1], way)
 
 
 @functools.partial(jax.custom_vjp, nondiff_argnums=(0, 1, 2))
@@ -314,20 +390,13 @@ def _dispatched_forward(
     x: Float[Array, "n d"],
     idx: Int[Array, "n k"],
     weights: Float[Array, "n k"],
-) -> tuple[Dispatched, UInt8[Array, "1 h"]]:
-    te = transformer_engine()
-
+) -> tuple[Dispatched, Int[Array, "n k"]]:
     def prepared_and_sent() -> tuple[
-        Float[Array, "1 r d"],
-        Float[Array, "1 r"],
-        UInt8[Array, "1 h"],
-        Int[Array, "1 l"],
+        Float[Array, "1 r d"], Float[Array, "1 r"], Handle, Int[Array, "1 l"]
     ]:
-        sizes, _, handle = _bound(
-            te.EpPreparePrimitive, idx, **_route(k), is_outer=False
-        )
+        sizes, handle = _prepared(k, idx)
         arrived, arrived_weights = _bound(
-            te.EpDispatchPrimitive,
+            transformer_engine().EpDispatchPrimitive,
             handle,
             idx,
             x,
@@ -338,17 +407,17 @@ def _dispatched_forward(
         )
         return arrived, arrived_weights, handle, sizes
 
-    arrived, arrived_weights, handle, sizes = _on_its_stream(prepared_and_sent)
-    sent = Dispatched(arrived[0], arrived_weights[0], handle, sizes[0])
-    return sent, handle
+    arrived, arrived_weights, handle, sizes = _on_its_stream(prepared_and_sent, THERE)
+    return Dispatched(arrived[0], arrived_weights[0], handle, sizes[0]), idx
 
 
 def _dispatched_backward(
-    rows: int, tokens: int, k: int, handle: UInt8[Array, "1 h"], g: Dispatched
+    rows: int, tokens: int, k: int, idx: Int[Array, "n k"], g: Dispatched
 ) -> tuple[Float[Array, "n d"], None, Float[Array, "n k"]]:
     gx, gw = _bind(
+        BACK,
         transformer_engine().EpDispatchBwdPrimitive,
-        handle,
+        _prepared_again(k, idx, BACK),
         g.rows[None],
         g.weights[None],
         **_route(k),
@@ -366,23 +435,27 @@ def _combined(
     rows: int,
     tokens: int,
     k: int,
-    handle: UInt8[Array, "1 h"],
+    handle: Handle,
+    idx: Int[Array, "n k"],
     made: Float[Array, "r d"],
 ) -> Float[Array, "n d"]:
     """Return each of this device's `tokens` tokens summed from the rows `made` of it
-    on its experts' devices, sent back by `handle` (NCCL EP's combine). Its gradient
-    sends each token's gradient to its rows the way they came."""
-    return _combined_forward(rows, tokens, k, handle, made)[0]
+    on its experts' devices, sent back by `handle`, its dispatch's of the picks `idx`
+    (NCCL EP's combine). Its gradient sends each token's gradient to its rows the way
+    they came."""
+    return _combined_forward(rows, tokens, k, handle, idx, made)[0]
 
 
 def _combined_forward(
     rows: int,
     tokens: int,
     k: int,
-    handle: UInt8[Array, "1 h"],
+    handle: Handle,
+    idx: Int[Array, "n k"],
     made: Float[Array, "r d"],
-) -> tuple[Float[Array, "n d"], UInt8[Array, "1 h"]]:
+) -> tuple[Float[Array, "n d"], Int[Array, "n k"]]:
     y = _bind(
+        BACK,
         transformer_engine().EpCombinePrimitive,
         handle,
         made[None],
@@ -390,21 +463,22 @@ def _combined_forward(
         out_leading_shape=(tokens,),
         out_partition_spec=None,
     )
-    return y, handle
+    return y, idx
 
 
 def _combined_backward(
-    rows: int, tokens: int, k: int, handle: UInt8[Array, "1 h"], g: Float[Array, "n d"]
-) -> tuple[None, Float[Array, "r d"]]:
+    rows: int, tokens: int, k: int, idx: Int[Array, "n k"], g: Float[Array, "n d"]
+) -> tuple[None, None, Float[Array, "r d"]]:
     g_made = _bind(
+        THERE,
         transformer_engine().EpCombineBwdPrimitive,
-        handle,
+        _prepared_again(k, idx, THERE),
         g,
         **_route(k),
         recv_capacity_per_rank=rows,
         is_outer=False,
     )
-    return None, g_made[0]
+    return None, None, g_made[0]
 
 
 _combined.defvjp(_combined_forward, _combined_backward)
