@@ -3,7 +3,8 @@ a power-of-two scale per 32, in one pass over x, straight into the layout that
 ``grouped_mxfp8``'s kernels load (`grouped_mxfp8.Tiled`): each copy padded by 0 to
 whole tiles of 128 along what it is in blocks along, and each tile's scales in their
 bytes of tensor memory's 512-byte tiles. x is a matrix, or a stack of them, (g, r, c),
-as each expert's W is; its rows from `filled` on quantize as 0.
+as each expert's W is; its rows from `filled` on quantize as 0. Given an index, the
+rows are x[index], each read from x where it lies: an MoE's picks, from its tokens.
 
 A program takes TILE_ROWS rows by 128 columns of x, in x's dtype: x's blocks along
 its rows, and x^T's down x's columns, so that only the E4M3 bytes of x^T transpose.
@@ -25,40 +26,45 @@ from bux.architecture.precision.blockscaled import MX_BLOCK
 
 jax_internals.keep_triton_calls_whole()  # jax-triton's own rule fails on jax 0.12
 
-# Rows of x a program takes, and its warps: 5.1 TB/s on a B300 at an MoE's shapes, 1.3x
-# 4 warps and 1.7x 128 rows.
-TILE_ROWS, WARPS = 32, 2
+# Rows of x a program takes, and its warps: 5.2 TB/s on a B300 at an MoE's shapes, 1.3x
+# 4 warps and 1.7x 128 rows; rows gathered by index, 5.8 TB/s on one warp, 1.1x two.
+TILE_ROWS, WARPS, GATHERED_WARPS = 32, 2, 1
 
 
 def quantized_twice(
     x: Float[Array, "*g r c"],
     filled: Int[Array, ""],
     columns: bool = True,
+    index: Int[Array, " m"] | None = None,
 ) -> tuple[Tiled, Tiled | None]:
     """Return x along its rows and, if `columns`, x^T along its rows, in MXFP8 as
     `blockscaled.mx_twice` quantizes them, laid out as `grouped_mxfp8.Tiled`: of x
-    (r, c), values (r, c') and (c, r'), c' and r' whole tiles of 128."""
+    (r, c), values (r, c') and (c, r'), c' and r' whole tiles of 128. Given `index`,
+    of x[index] (m, c), a matrix of x's rows."""
     stack = x if x.ndim == 3 else x[None]
-    g, r, c = stack.shape
+    g, r, c = stack.shape if index is None else (1, *index.shape, x.shape[-1])
     rt, ct = -(-r // LANES), -(-c // LANES)
     shapes = [((g, r, ct * LANES), jnp.uint8), ((g, rt, ct, 32, 16), jnp.uint8)]
     if columns:
         shapes += [((g, c, rt * LANES), jnp.uint8), ((g, ct, rt, 32, 16), jnp.uint8)]
     values, scales, *transposed = jax_triton.triton_call(
         stack,
+        jnp.zeros(1, jnp.int32) if index is None else index.astype(jnp.int32),
         filled.astype(jnp.int32).reshape(1),
         kernel=_quantize_kernel if columns else _quantize_rows_kernel,
         out_type=[jax.ShapeDtypeStruct(*s) for s in shapes],
         grid=(g, rt * (LANES // TILE_ROWS), ct),  # every row of each tile of 128
         name="bux_mx_twice" if columns else "bux_mx_rows",
-        num_warps=WARPS,
+        num_warps=WARPS if index is None else GATHERED_WARPS,
         num_stages=1,
         r=r,
         c=c,
         tile_r=TILE_ROWS,
+        gathered=index is not None,
     )
-    rows = _tiled(values, scales, x.ndim)
-    return rows, _tiled(*transposed, x.ndim) if columns else None
+    ndim = x.ndim if index is None else 2
+    rows = _tiled(values, scales, ndim)
+    return rows, _tiled(*transposed, ndim) if columns else None
 
 
 def _tiled(
@@ -79,6 +85,7 @@ def _tiled(
 @no_type_check
 def _quantize_kernel(
     x: tl.tensor,
+    index: tl.tensor,
     rows: tl.tensor,
     values: tl.tensor,
     scales: tl.tensor,
@@ -87,10 +94,11 @@ def _quantize_kernel(
     r: tl.constexpr,
     c: tl.constexpr,
     tile_r: tl.constexpr,
+    gathered: tl.constexpr,
 ) -> None:
     """A tile of x in E4M3 in blocks of 32 along its rows, and of x^T along its
     columns, x's rows from `rows` on as 0."""
-    tile, rs, cs = _tile_of(x, rows, r, c, tile_r)
+    tile, rs, cs = _tile_of(x, index, rows, r, c, tile_r, gathered)
     _store_along_rows(tile, values, scales, rs, cs, r, c, tile_r)
     _store_along_columns(tile, t_values, t_scales, rs, cs, r, c, tile_r)
 
@@ -99,16 +107,18 @@ def _quantize_kernel(
 @no_type_check
 def _quantize_rows_kernel(
     x: tl.tensor,
+    index: tl.tensor,
     rows: tl.tensor,
     values: tl.tensor,
     scales: tl.tensor,
     r: tl.constexpr,
     c: tl.constexpr,
     tile_r: tl.constexpr,
+    gathered: tl.constexpr,
 ) -> None:
     """A tile of x in E4M3 in blocks of 32 along its rows, x's rows from `rows` on as
     0."""
-    tile, rs, cs = _tile_of(x, rows, r, c, tile_r)
+    tile, rs, cs = _tile_of(x, index, rows, r, c, tile_r, gathered)
     _store_along_rows(tile, values, scales, rs, cs, r, c, tile_r)
 
 
@@ -116,17 +126,23 @@ def _quantize_rows_kernel(
 @no_type_check
 def _tile_of(
     x: tl.tensor,
+    index: tl.tensor,
     rows: tl.tensor,
     r: tl.constexpr,
     c: tl.constexpr,
     tile_r: tl.constexpr,
+    gathered: tl.constexpr,
 ) -> tuple[tl.tensor, tl.tensor, tl.tensor]:
-    """Return this program's tile of x[g], 0 past x and from `rows` on, and the tile's
-    rows and columns."""
+    """Return this program's tile of x[g], or of x[index] if `gathered`, 0 past it and
+    from `rows` on, and the tile's rows and columns."""
     rs = tl.program_id(1) * tile_r + tl.arange(0, tile_r)
     cs = tl.program_id(2) * 128 + tl.arange(0, 128)
     kept = (rs < r) & (rs < tl.load(rows))
-    at = x + tl.program_id(0).to(tl.int64) * r * c + rs[:, None].to(tl.int64) * c
+    if gathered:
+        lying = tl.load(index + rs, mask=rs < r, other=0).to(tl.int64)
+        at = x + lying[:, None] * c
+    else:
+        at = x + tl.program_id(0).to(tl.int64) * r * c + rs[:, None].to(tl.int64) * c
     tile = tl.load(at + cs[None, :], mask=kept[:, None] & (cs < c)[None, :], other=0.0)
     return tile, rs, cs
 

@@ -14,14 +14,20 @@ Blackwell GPU (``grouped_mxfp8``), MXFP8's operands quantized straight into its
 layout by Triton's kernel (``grouped_triton``); and elsewhere by XLA, which
 dequantizes and computes the same values. Each W[g] quantizes on its own. The
 recipes of E4M3 values with a power-of-two scale per 32 run here (RECIPES).
+
+An MoE's rows are its tokens' rows, each as many times as it has picks: given where
+they come from (`Picked`), Triton's quantizer reads them there, so that the rows
+themselves are never written; given the tokens they sum into (`Summed`), y is the
+tokens' sums, and the backward reads each row's dy from its token's.
 """
 
 from functools import partial
+from typing import NamedTuple
 
 import jax
 import jax.numpy as jnp
 from jax.typing import DTypeLike
-from jaxtyping import Array, Float, Int, UInt32
+from jaxtyping import Array, Float, Int, Shaped, UInt32
 
 from bux.architecture.experts import grouped, grouped_mxfp8
 from bux.architecture.precision import blockscaled
@@ -39,7 +45,35 @@ RECIPES = {"mxfp8": blockscaled.MXFP8, "mxfp8_2d": blockscaled.MXFP8_2D}
 # it or as Blocks, or as it is where its pass multiplies as it is.
 Formatted = grouped_mxfp8.Tiled | Blocks
 Operand = Formatted | Float[Array, "..."]
-Saved = tuple[Operand, Operand, Int[Array, " g"], UInt32[Array, ""]]
+
+
+class Picked(NamedTuple):
+    """Where a GEMM's rows x come from: x = tokens[index], as ``moe.token_rows``
+    gathers an MoE's picks. Where Triton's quantizer runs, it reads them from
+    `tokens`, and XLA drops the gather that made x, which nothing else reads."""
+
+    tokens: Float[Array, "n k"]
+    index: Int[Array, " m"]
+
+
+class Summed(NamedTuple):
+    """Where a GEMM's rows y go: into their tokens' sums, as ``moe.token_sums`` sums
+    an MoE's picks: row i is pick order[i], k picks a token, and a token's at
+    `inverse`. Its transpose gathers each row's dy from its token's, which Triton's
+    quantizer reads in place, as `Picked` rows."""
+
+    order: Int[Array, " m"]
+    inverse: Int[Array, "t k"]
+
+    @property
+    def index(self) -> Int[Array, " m"]:
+        """Each row's token."""
+        return self.order // self.inverse.shape[1]
+
+
+# What the backward takes of the forward: x and W, quantized as their gradients'
+# GEMMs contract them, and where y's rows were summed.
+Saved = tuple[Operand, Operand, Int[Array, " g"], UInt32[Array, ""], Summed | None]
 
 
 def fits(x: Float[Array, "m k"], w: Float[Array, "g k n"]) -> bool:
@@ -54,28 +88,55 @@ def ragged_dot(
     recipe: blockscaled.Recipe,
     seed: UInt32[Array, ""],
     passes: tuple[Pass, ...] = PASSES,
-) -> Float[Array, "m n"]:
+    picked: Picked | None = None,
+    summed: Summed | None = None,
+) -> Float[Array, "r n"]:
     """Return what `grouped.ragged_dot` does, its GEMMs in `passes` as `recipe`
-    quantizes them. Rows go in the kernels' tiles of 128 too, so x gains rows of 0
-    up to them."""
+    quantizes them: x read from where it was `picked`, and y the tokens' sums it is
+    `summed` into (t, n), if given. Rows go in the kernels' tiles of 128 too, so x
+    gains rows of 0 up to them."""
     m, tile = x.shape[0], grouped_mxfp8.LANES
     whole = -(-m // tile) * tile
-    x = jnp.pad(x, ((0, whole - m), (0, 0))) if whole > m else x
+    x = _padded(x, whole)
+    if picked is not None:
+        picked = Picked(picked.tokens, _padded(picked.index, whole))
+    if summed is not None:
+        summed = Summed(_padded(summed.order, whole), summed.inverse)
     dtypes = blockscaled.Dtypes(x.dtype, w.dtype, jnp.result_type(x, w))
-    return _ragged(x, w, sizes, seed, recipe, dtypes, passes)[:m]
+    y = _ragged(x, w, sizes, seed, picked, summed, recipe, dtypes, passes)
+    return y if summed is not None else y[:m]
 
 
-@partial(jax.custom_vjp, nondiff_argnums=(4, 5, 6))
+def _padded(a: Shaped[Array, "m ..."], rows: int) -> Shaped[Array, "r ..."]:
+    """Return `a` with rows of 0 after its own, up to `rows`."""
+    if a.shape[0] == rows:
+        return a
+    return jnp.pad(a, [(0, rows - a.shape[0])] + [(0, 0)] * (a.ndim - 1))
+
+
+def _token_sums(
+    y: Float[Array, "m n"], inverse: Int[Array, "t k"]
+) -> Float[Array, "t n"]:
+    """Return each token's sum of its k rows of y, at `inverse`, in float32: a row
+    past y's adds 0."""
+    rows = jnp.take(y, inverse.reshape(-1), axis=0, mode="fill", fill_value=0)
+    summed = jnp.sum(rows.reshape(*inverse.shape, -1), 1, dtype=jnp.float32)
+    return summed.astype(y.dtype)
+
+
+@partial(jax.custom_vjp, nondiff_argnums=(6, 7, 8))
 def _ragged(
     x: Float[Array, "m k"],
     w: Float[Array, "g k n"],
     sizes: Int[Array, " g"],
     seed: UInt32[Array, ""],
+    picked: Picked | None,
+    summed: Summed | None,
     recipe: blockscaled.Recipe,
     dtypes: blockscaled.Dtypes,
     passes: tuple[Pass, ...],
-) -> Float[Array, "m n"]:
-    return _forward(x, w, sizes, seed, recipe, dtypes, passes)[0]
+) -> Float[Array, "r n"]:
+    return _forward(x, w, sizes, seed, picked, summed, recipe, dtypes, passes)[0]
 
 
 def _forward(
@@ -83,16 +144,22 @@ def _forward(
     w: Float[Array, "g k n"],
     sizes: Int[Array, " g"],
     seed: UInt32[Array, ""],
+    picked: Picked | None,
+    summed: Summed | None,
     recipe: blockscaled.Recipe,
     dtypes: blockscaled.Dtypes,
     passes: tuple[Pass, ...],
-) -> tuple[Float[Array, "m n"], Saved]:
+) -> tuple[Float[Array, "r n"], Saved]:
     fprop, dgrad, wgrad = (p in passes for p in PASSES)
     filled = sizes.sum()
-    x_k, x_m = _twice(recipe.x, x, seed, rows=fprop, columns=wgrad, filled=filled)
+    x_k, x_m = _twice(
+        recipe.x, x, seed, rows=fprop, columns=wgrad, filled=filled, picked=picked
+    )
     w_n, w_k = _twice(recipe.w, w, seed, rows=dgrad, columns=fprop)
     y = _times(x_k, w_k, sizes, dtypes.y)
-    return y, (x_m, w_n, sizes, seed)
+    if summed is not None:
+        y = _token_sums(y, summed.inverse)
+    return y, (x_m, w_n, sizes, seed, summed)
 
 
 def _backward(
@@ -100,15 +167,21 @@ def _backward(
     dtypes: blockscaled.Dtypes,
     passes: tuple[Pass, ...],
     saved: Saved,
-    dy: Float[Array, "m n"],
-) -> tuple[Float[Array, "m k"], Float[Array, "g k n"], None, None]:
-    x_m, w_n, sizes, seed = saved
+    dy: Float[Array, "r n"],
+) -> tuple[Float[Array, "m k"], Float[Array, "g k n"], None, None, None, None]:
+    x_m, w_n, sizes, seed, summed = saved
     _, dgrad, wgrad = (p in passes for p in PASSES)
     filled = sizes.sum()
-    dy_n, dy_m = _twice(recipe.dy, dy, seed, rows=dgrad, columns=wgrad, filled=filled)
+    picked = None
+    if summed is not None:  # each row's dy is its token's, which Triton reads in place
+        picked = Picked(dy, summed.index)
+        dy = dy[summed.index]
+    dy_n, dy_m = _twice(
+        recipe.dy, dy, seed, rows=dgrad, columns=wgrad, filled=filled, picked=picked
+    )
     w_t = w_n if isinstance(w_n, Formatted) else jnp.swapaxes(w_n, 1, 2)
     dx = _times(dy_n, w_t, sizes, dtypes.x)
-    return dx, _contract(x_m, dy_m, sizes, dtypes.w), None, None
+    return dx, _contract(x_m, dy_m, sizes, dtypes.w), None, None, None, None
 
 
 _ragged.defvjp(_forward, _backward)
@@ -177,6 +250,7 @@ def _twice(
     rows: bool,
     columns: bool,
     filled: Int[Array, ""] | None = None,
+    picked: Picked | None = None,
 ) -> tuple[Operand, Operand]:
     """Return a, a matrix or each of a stack of them, in blocks along its rows if
     `rows`, and a^T in blocks along its columns if `columns`; else a, as it is. Its
@@ -185,7 +259,7 @@ def _twice(
     if not rows and not columns:
         return a, a
     filled = jnp.asarray(a.shape[-2]) if filled is None else filled
-    along_rows, along_columns = _quantized(quantize, a, seed, filled, columns)
+    along_rows, along_columns = _quantized(quantize, a, seed, filled, columns, picked)
     if not columns:
         return along_rows, a
     assert along_columns is not None
@@ -198,14 +272,18 @@ def _quantized(
     seed: UInt32[Array, ""],
     filled: Int[Array, ""],
     columns: bool,
+    picked: Picked | None = None,
 ) -> tuple[Operand, Operand | None]:
     """Return quantize(a), a's rows from `filled` on as 0: in MXFP8 on a Blackwell GPU
     by Triton's kernel, in one pass with the zeros and straight into the GEMMs'
-    layout, a^T only if `columns`; else `quantize`'s Blocks, of each matrix of a
-    stack on its own."""
+    layout, a^T only if `columns`, a's rows read from where they were `picked`; else
+    `quantize`'s Blocks, of each matrix of a stack on its own."""
     if quantize is blockscaled.mx_twice and _triton():
         assert grouped_triton is not None
-        return grouped_triton.quantized_twice(a, filled, columns)
+        if picked is None:
+            return grouped_triton.quantized_twice(a, filled, columns)
+        tokens, index = picked
+        return grouped_triton.quantized_twice(tokens, filled, columns, index)
     kept = jnp.where((jnp.arange(a.shape[-2]) < filled)[:, None], a, 0)
     if a.ndim == 2:
         return quantize(kept, seed)

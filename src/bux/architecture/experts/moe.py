@@ -354,8 +354,10 @@ def routed(
     b, t, d = z.shape
     k, n = idx.shape[-1], up.shape[0]
     order, inverse, sizes = sort_by_expert(idx, n)
-    rows = token_rows(z.reshape(b * t, d), order, inverse, k)
-    out = experts(rows, sizes, up, gate, down, ffn, norm)
+    tokens = z.reshape(b * t, d)
+    rows = token_rows(tokens, order, inverse, k)
+    picked = grouped_blockscaled.Picked(tokens, order // k)
+    out = experts(rows, sizes, up, gate, down, ffn, norm, picked)
     per_pick = permuted(out, inverse, order).reshape(b, t, k, d)
     kept = jnp.where(in_range(idx, n), weights, 0)
     return jnp.einsum("btkd,btk->btd", per_pick, kept)
@@ -384,25 +386,32 @@ def experts(
     down: Float[Array, "E f d"],
     ffn: cfg.MLPConfig,
     norm: RowNorm | None = None,
+    picked: grouped_blockscaled.Picked | None = None,
 ) -> Float[Array, "n d"]:
     """Run each row of `x` through its expert's FFN, then `norm`. The rows are sorted
     by expert: the first sizes[0] are expert 0's, the next sizes[1] expert 1's, and so
     on; rows past them come out 0 before `norm`. It depends on its arguments alone, so
     it runs on one device's experts in a shard_map as it does on all of them. The
     kernels multiply in x's dtype, so that wider ones add up the gradients of several
-    calls in their own."""
+    calls in their own. Given where x was `picked`, a format's quantizer reads it
+    there."""
     recipe = grouped_blockscaled.RECIPES.get(experts_format())
     up, down = up.astype(x.dtype), down.astype(x.dtype)
     gate = None if gate is None else gate.astype(x.dtype)
 
-    def times(x: Float[Array, "n e"], w: Float[Array, "E e f"]) -> Float[Array, "n f"]:
-        return grouped_product(x, w, sizes, recipe)
+    def times(
+        x: Float[Array, "n e"],
+        w: Float[Array, "E e f"],
+        picked: grouped_blockscaled.Picked | None = None,
+    ) -> Float[Array, "n f"]:
+        return grouped_product(x, w, sizes, recipe, picked)
 
     if gate is not None and recipe is not None and grouped_blockscaled.fits(x, up):
         # One GEMM for both: x quantizes once.
-        u, g = jnp.split(times(x, jnp.concatenate([up, gate], -1)), 2, axis=-1)
+        both = times(x, jnp.concatenate([up, gate], -1), picked)
+        u, g = jnp.split(both, 2, axis=-1)
     else:
-        u, g = times(x, up), None if gate is None else times(x, gate)
+        u, g = times(x, up, picked), None if gate is None else times(x, gate, picked)
     y = times(activate(ffn, u, g), down)
     return y if norm is None else norm(y)
 
@@ -412,14 +421,17 @@ def grouped_product(
     w: Float[Array, "E e f"],
     sizes: Int[Array, " E"],
     recipe: blockscaled.Recipe | None,
+    picked: grouped_blockscaled.Picked | None = None,
 ) -> Float[Array, "n f"]:
     """Return each expert's rows of x times its matrix of w, named `experts` for
     ``remat``: in `recipe`'s format where x and w are whole blocks of it
-    (``grouped_blockscaled``), else in compute (``grouped``)."""
+    (``grouped_blockscaled``, x read from where it was `picked`), else in compute
+    (``grouped``)."""
     if recipe is None or not grouped_blockscaled.fits(x, w):
         return checkpoint_name(ragged_dot(x, w, sizes), "experts")
     precision, seed = matmuls.in_force(), matmuls.seed()
-    y = grouped_blockscaled.ragged_dot(x, w, sizes, recipe, seed, precision.passes)
+    passes = precision.passes
+    y = grouped_blockscaled.ragged_dot(x, w, sizes, recipe, seed, passes, picked)
     return checkpoint_name(y, "experts")
 
 
