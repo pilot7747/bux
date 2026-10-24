@@ -4,8 +4,9 @@ the picks of every device in its group.
 
     all_gather         gather the group's tokens, run this device's experts on them,
                        and reduce-scatter each token's sum back
-    all_to_all         send each pick to its expert's device and back, in a buffer per
-                       peer with room for every pick: dropless
+    all_to_all         send each pick to its expert's device and back, in a buffer of
+                       one size for each peer, sorted by expert; each peer's buffer
+                       runs through the experts as it arrives
     ragged_all_to_all  send each pick to its expert's device and back, a ragged slice
                        per expert of each peer, so that the rows arrive sorted by
                        expert. XLA:CPU lacks it
@@ -14,8 +15,9 @@ the picks of every device in its group.
 
 Each is a body that runs on one device's tokens, which ``expert_parallel`` runs in a
 shard_map manual over the axes that split the tokens, so that each device sorts its
-own. Routing ran before, in the global view. `methods.capacity` bounds the rows a
-device takes (``_room``), and `precision.dispatch` has the ragged methods send the
+own, in `methods.moe_chunks` slices one after another (``in_chunks``). Routing ran
+before, in the global view. `methods.capacity` bounds the rows a device takes
+(``_room``, ``_room_each``), and `precision.dispatch` has the exchanges send the
 tokens in MXFP8.
 """
 
@@ -37,16 +39,14 @@ from bux.architecture.experts.moe import (
     axes_of,
     experts,
     in_range,
-    on_each_device,
+    in_shard_map,
     permuted,
-    routed,
     run_sorted,
     sort_by_expert,
     token_rows,
     token_sums,
 )
 from bux.architecture.precision import blockscaled, matmuls
-from bux.architecture.precision.blockscaled import Blocks, dequantized
 from bux.architecture.registry import Taps, report
 from bux.architecture.repeats import remat
 from bux.parallel import methods
@@ -62,8 +62,8 @@ Combined = tuple[Float[Array, "b t d"], Float[Array, ""]]
 Body = Callable[..., Combined]
 # jax.lax.ragged_all_to_all's signature: another exchange is a function.
 RaggedAllToAll = Callable[..., Shaped[Array, "m d"]]
-# What the ragged exchanges send and bring back, which `dots` keeps (``remat``): else
-# its backward would exchange them again.
+# What the exchanges send and bring back, which `dots` keeps (``remat``): else its
+# backward would exchange them again.
 EXCHANGED = "experts.exchanged"
 # The pieces a ragged exchange sends in, at least: XLA's one-shot kernel on a node
 # copies each with one block of 128 threads, ~90 GB/s with 64 on 8 B300s.
@@ -87,18 +87,27 @@ def expert_parallel(body: Body) -> Callable[..., Float[Array, "b t d"]]:
             return run_sorted(moe, z, idx, weights, taps)
         tokens = _token_spec(z, ep)
         ffn, norm = moe.config.expert, moe.expert_norm
+        chunked = in_chunks(body, _chunks())
 
         def local(*args: object) -> Combined:
-            y, dropped = body(*args, axes=ep, ffn=ffn, norm=norm)
+            y, dropped = chunked(*args, axes=ep, ffn=ffn, norm=norm)
             return y, jax.lax.pmean(dropped, axes_of(tokens))
 
-        each = on_each_device(local, tokens, P(ep), (tokens, P()))
+        each = in_shard_map(local, tokens, P(ep), (tokens, P()))
         y, dropped = each(z, idx, weights, moe.kernels())
         if _capacity() is not None:
             report(taps, "dropped", 0.0, dropped)
         return y
 
     return run
+
+
+def _in_float32(kernels: Kernels) -> Kernels:
+    """Return the experts' kernels in float32: where several calls of ``experts`` take
+    them, their gradients add up in float32, as one call's would."""
+    up, gate, down = kernels
+    wide = None if gate is None else gate.astype(jnp.float32)
+    return up.astype(jnp.float32), wide, down.astype(jnp.float32)
 
 
 def _token_spec(z: Float[Array, "b t d"], ep: Axes) -> P:
@@ -117,6 +126,44 @@ def _token_spec(z: Float[Array, "b t d"], ep: Axes) -> P:
     return P(rows or None, seq, None)
 
 
+# --- Chunks ----------------------------------------------------------------------------
+
+
+def _chunks() -> int:
+    """Return the run's `methods.moe_chunks`."""
+    on = active()
+    return 1 if on is None else on.methods.moe_chunks
+
+
+def in_chunks(body: Body, chunks: int) -> Body:
+    """Return `body` run on `chunks` slices of a device's tokens, each on its own, as
+    many as divide them: no slice waits for another, so one's exchange can run beside
+    another's experts."""
+    if chunks == 1:
+        return body
+
+    def run(
+        z: Float[Array, "b t d"],
+        idx: Int[Array, "b t k"],
+        weights: Float[Array, "b t k"],
+        kernels: Kernels,
+        **settings: object,
+    ) -> Combined:
+        parts = math.gcd(chunks, z.shape[0] * z.shape[1])
+        slices = zip(*(_sliced(x, parts) for x in (z, idx, weights)), strict=True)
+        wide = _in_float32(kernels)  # each slice adds its part of their gradients
+        made = [body(*s, wide, **settings) for s in slices]
+        y = jnp.concatenate([y for y, _ in made], axis=1).reshape(z.shape)
+        return y, jnp.mean(jnp.stack([dropped for _, dropped in made]))
+
+    return run
+
+
+def _sliced(x: Shaped[Array, "b t e"], parts: int) -> list[Shaped[Array, "1 m e"]]:
+    """Return x's tokens in `parts` slices in order, each a row of them."""
+    return jnp.split(x.reshape(1, -1, x.shape[-1]), parts, axis=1)
+
+
 # --- A capacity ------------------------------------------------------------------------
 
 
@@ -133,10 +180,10 @@ def _room(n: int, peers: int) -> int:
     return most if capacity is None else min(most, math.ceil(capacity * n))
 
 
-def _fit(sizes: Int[Array, " g"], room: int) -> Int[Array, " g"]:
+def _fit(sizes: Int[Array, "*p g"], room: int) -> Int[Array, "*p g"]:
     """Return how many rows of each group, the groups in turn, fit in the first
-    `room`."""
-    return jnp.clip(room - (jnp.cumsum(sizes) - sizes), 0, sizes)
+    `room` (of each row of groups)."""
+    return jnp.clip(room - (jnp.cumsum(sizes, -1) - sizes), 0, sizes)
 
 
 def _routed_within(
@@ -201,41 +248,121 @@ def all_to_all(
     ffn: cfg.MLPConfig,
     norm: RowNorm | None,
 ) -> Combined:
-    """Send each pick to its expert's device and back, in a buffer for each peer with
-    room for every pick, so that none drops. A device runs the rows it receives as
-    tokens of one pick each (``routed`` with k = 1)."""
-    d, k, local = z.shape[-1], idx.shape[-1], kernels[0].shape[0]
-    buffers = _buffers(idx, local, jax.lax.axis_size(axes))
-    rows = _swap(z.reshape(-1, d)[buffers.pick // k], axes)
-    expert = _swap(buffers.expert, axes)[..., None]
-    ones = jnp.ones(expert.shape, z.dtype)
-    out = _swap(routed(rows, expert, ones, *kernels, ffn, norm), axes)
-    per_pick = out[buffers.peer, buffers.slot].reshape(*idx.shape, d)
-    return jnp.einsum("btkd,btk->btd", per_pick, weights), jnp.zeros(())
+    """Send each pick to its expert's device and back, in a buffer for each peer, of
+    the same size for all, its picks sorted by expert: a device runs its experts on
+    each peer's buffer as it arrives. A buffer holds `methods.capacity` times a
+    peer's share of the picks, or every pick; past it a peer's last experts' picks
+    drop."""
+    d, k, n, local = z.shape[-1], idx.shape[-1], idx.size, kernels[0].shape[0]
+    peers = jax.lax.axis_size(axes)
+    buffers = _buffers(idx, local, peers, _room_each(n, peers))
+    arrived = _swapped_tokens(z.reshape(-1, d), buffers, k, axes).reshape(peers, -1, d)
+    sizes = _swap(buffers.sizes, axes)  # [i, e]: device i's rows for expert e
+    wide = _in_float32(kernels)  # each peer's rows add their part of their gradients
+    made = [experts(x, s, *wide, ffn, norm) for x, s in zip(arrived, sizes)]
+    returned = _swapped(jnp.concatenate(made), axes)
+    weighted = returned * _slot_weights(weights, buffers)
+    y = token_sums(weighted, buffers.slot, buffers.pick, k)
+    return y.reshape(z.shape), 1 - buffers.sizes.sum() / n
 
 
 class Buffers(NamedTuple):
-    """A device's n picks laid out in a buffer of n slots for each peer, [p, n]: the
-    pick in each slot (any, past the peer's picks) and its expert on that peer
-    (`local`, none, past them); and each pick's peer and slot."""
+    """A device's picks laid out in a buffer of `room` slots for each peer, sorted by
+    expert, [p * room]: the pick in each slot (any, past the peer's picks) and whether
+    one is there; each pick's slot (p * room, none, if it dropped); and sizes[p, e],
+    how many of the picks for expert e of peer p fit."""
 
-    pick: Int[Array, "p n"]
-    expert: Int[Array, "p n"]
-    peer: Int[Array, " n"]
+    pick: Int[Array, " s"]
+    used: Bool[Array, " s"]
     slot: Int[Array, " n"]
+    sizes: Int[Array, "p e"]
 
 
-def _buffers(idx: Int[Array, "b t k"], local: int, peers: int) -> Buffers:
-    """Return the buffers of the picks `idx`, of `local` experts on each of `peers`."""
-    flat, n = idx.reshape(-1), idx.size
+def _buffers(idx: Int[Array, "b t k"], local: int, peers: int, room: int) -> Buffers:
+    """Return the buffers of the picks `idx`, of `local` experts on each of `peers`,
+    with `room` slots for each peer."""
     order, inverse, sizes = sort_by_expert(idx, local * peers)
-    sent = sizes.reshape(peers, local).sum(-1)  # the picks for each peer
-    start = jnp.cumsum(sent) - sent  # where each peer's picks start, sorted
-    slot = jnp.arange(n)
-    pick = order[jnp.minimum(start[:, None] + slot, n - 1)]
-    expert = jnp.where(slot < sent[:, None], flat[pick] % local, local)
-    peer = flat // local
-    return Buffers(pick, expert, peer, inverse - start[peer])
+    sizes = sizes.reshape(peers, local)
+    sent = sizes.sum(-1)
+    starts = jnp.cumsum(sent) - sent  # where each peer's picks start, sorted
+    at = jnp.arange(room)
+    pick = order[jnp.minimum(starts[:, None] + at, idx.size - 1)].reshape(-1)
+    used = (at < sent[:, None]).reshape(-1)
+    peer = idx.reshape(-1) // local
+    at_peer = inverse - starts[peer]
+    slot = jnp.where(at_peer < room, peer * room + at_peer, peers * room)
+    return Buffers(pick, used, slot, _fit(sizes, room))
+
+
+def _swapped_tokens(
+    z: Float[Array, "n d"], buffers: Buffers, k: int, axes: Axes
+) -> Float[Array, "s d"]:
+    """Return the token row of each slot's pick (``token_rows``), swapped and named for
+    ``remat`` (`_swapped`): in MXFP8 where `precision.dispatch` says and the rows are
+    whole blocks, back in z's dtype where they arrive."""
+    if matmuls.in_force().dispatch == "compute" or z.shape[-1] % blockscaled.MX_BLOCK:
+        return _swapped(token_rows(z, buffers.pick, buffers.slot, k), axes)
+    sent = _swapped_in_mxfp8(axes, k, z, buffers.pick, buffers.slot)
+    return remat.label(EXCHANGED, sent)
+
+
+@functools.partial(jax.custom_vjp, nondiff_argnums=(0, 1))
+def _swapped_in_mxfp8(
+    axes: Axes,
+    k: int,
+    z: Float[Array, "n d"],
+    pick: Int[Array, " s"],
+    slot: Int[Array, " m"],
+) -> Float[Array, "s d"]:
+    """Return `_swapped_tokens`' rows sent in MXFP8 (`_in_mxfp8`). Its gradient is
+    ``token_rows``'s and the all-to-all's, in the gradient's dtype."""
+    arrived = _swap(_in_mxfp8(z)[pick // k], axes)
+    return _from_mxfp8(arrived, z)
+
+
+def _swapped_in_mxfp8_forward(
+    axes: Axes,
+    k: int,
+    z: Float[Array, "n d"],
+    pick: Int[Array, " s"],
+    slot: Int[Array, " m"],
+) -> tuple[Float[Array, "s d"], tuple[Int[Array, " s"], Int[Array, " m"]]]:
+    return _swapped_in_mxfp8(axes, k, z, pick, slot), (pick, slot)
+
+
+def _swapped_in_mxfp8_backward(
+    axes: Axes,
+    k: int,
+    saved: tuple[Int[Array, " s"], Int[Array, " m"]],
+    g: Float[Array, "s d"],
+) -> tuple[Float[Array, "n d"], None, None]:
+    pick, slot = saved
+    return token_sums(_swap(g, axes), slot, pick, k), None, None
+
+
+_swapped_in_mxfp8.defvjp(_swapped_in_mxfp8_forward, _swapped_in_mxfp8_backward)
+
+
+def _slot_weights(
+    weights: Float[Array, "b t k"], buffers: Buffers
+) -> Float[Array, "s 1"]:
+    """Return the router's weight of each slot's pick, 0 where there is none: by a
+    gather whose gradient gathers too, by each pick's slot (``token_rows`` of a pick
+    a row), where XLA's would scatter."""
+    picked = token_rows(weights.reshape(-1, 1), buffers.pick, buffers.slot, 1)
+    return jnp.where(buffers.used[:, None], picked, 0)
+
+
+def _room_each(n: int, peers: int) -> int:
+    """Return the slots of a buffer for each of `peers`, from a device's `n` picks:
+    `methods.capacity` times a peer's share of them, or all of them."""
+    capacity = _capacity()
+    return n if capacity is None else min(n, math.ceil(capacity * n / peers))
+
+
+def _swapped(x: Shaped[Array, "n e"], axes: Axes) -> Shaped[Array, "n e"]:
+    """Return `_swap` of x, named for ``remat``."""
+    return remat.label(EXCHANGED, _swap(x, axes))
 
 
 def _swap(x: Shaped[Array, "n ..."], axes: Axes) -> Shaped[Array, "n ..."]:
@@ -297,8 +424,8 @@ def ragged_all_to_all(
     order, inverse, sizes = sort_by_expert(idx, local * peers)
     rows = _room(n, peers)
     route = _route(sizes, rows, device, axes)
-    picks = token_rows(z.reshape(-1, d), order, inverse, k)
-    arrived = _exchanged_tokens(exchange, picks, rows, route.there, axes)
+    tokens = z.reshape(-1, d)
+    arrived = _dispatched(exchange, tokens, order, inverse, k, rows, route.there, axes)
     made = experts(arrived, route.arrivals.kept[device].sum(1), *kernels, ffn, norm)
     returned = _exchanged(exchange, made, n, route.back, axes)
     came_back = _came_back(route.there, idx.reshape(-1)[order])
@@ -383,18 +510,22 @@ def _exchanged(
     return remat.label(EXCHANGED, _sent(exchange, x, rows, plan, axes))
 
 
-def _exchanged_tokens(
+def _dispatched(
     exchange: RaggedAllToAll,
-    x: Float[Array, "n d"],
+    z: Float[Array, "n d"],
+    order: Int[Array, " m"],
+    inverse: Int[Array, " m"],
+    k: int,
     rows: int,
     plan: Plan,
     axes: Axes,
 ) -> Float[Array, "rows d"]:
-    """Return `_exchanged` of the tokens x: in MXFP8 where `precision.dispatch` says
-    and x's rows are whole blocks, back in x's dtype where they arrive."""
-    if matmuls.in_force().dispatch == "compute" or x.shape[-1] % blockscaled.MX_BLOCK:
-        return _exchanged(exchange, x, rows, plan, axes)
-    sent = _sent_in_mxfp8(exchange, rows, axes, x.shape, x, plan)
+    """Return the token row of each pick in `order` (``token_rows``), sent by `plan` in
+    `rows` rows and named for ``remat``: in MXFP8 where `precision.dispatch` says and
+    the rows are whole blocks, back in z's dtype where they arrive."""
+    if matmuls.in_force().dispatch == "compute" or z.shape[-1] % blockscaled.MX_BLOCK:
+        return _exchanged(exchange, token_rows(z, order, inverse, k), rows, plan, axes)
+    sent = _picked_in_mxfp8(exchange, rows, axes, k, z, order, inverse, plan)
     return remat.label(EXCHANGED, sent)
 
 
@@ -459,60 +590,66 @@ def _reversed(plan: Plan, axes: Axes) -> Plan:
 
 
 @functools.partial(jax.custom_vjp, nondiff_argnums=(0, 1, 2, 3))
-def _sent_in_mxfp8(
+def _picked_in_mxfp8(
     exchange: RaggedAllToAll,
     rows: int,
     axes: Axes,
-    shape: tuple[int, int],
-    x: Float[Array, "n d"],
+    k: int,
+    z: Float[Array, "n d"],
+    order: Int[Array, " m"],
+    inverse: Int[Array, " m"],
     plan: Plan,
 ) -> Float[Array, "rows d"]:
-    """Return `_sent` of x sent in MXFP8, E4M3 values and a power-of-two scale per 32:
-    a row of d + d / 32 bytes a token, about half of bfloat16's. Its gradient is
-    `_sent`'s, in the gradient's dtype."""
-    packed = _packed(blockscaled.mx_quantize(x))
-    arrived = _sent(exchange, packed, rows, plan, axes)
-    return _unpacked(arrived, shape[-1]).astype(x.dtype)
+    """Return `_dispatched`'s rows sent in MXFP8 (`_in_mxfp8`). Its gradient is
+    ``token_rows``'s and the exchange's, in the gradient's dtype."""
+    arrived = _sent(exchange, _in_mxfp8(z)[order // k], rows, plan, axes)
+    return _from_mxfp8(arrived, z)
 
 
-def _sent_in_mxfp8_forward(
+def _picked_in_mxfp8_forward(
     exchange: RaggedAllToAll,
     rows: int,
     axes: Axes,
-    shape: tuple[int, int],
-    x: Float[Array, "n d"],
+    k: int,
+    z: Float[Array, "n d"],
+    order: Int[Array, " m"],
+    inverse: Int[Array, " m"],
     plan: Plan,
-) -> tuple[Float[Array, "rows d"], Plan]:
-    return _sent_in_mxfp8(exchange, rows, axes, shape, x, plan), plan
+) -> tuple[Float[Array, "rows d"], tuple[Int[Array, " m"], Int[Array, " m"], Plan]]:
+    sent = _picked_in_mxfp8(exchange, rows, axes, k, z, order, inverse, plan)
+    return sent, (order, inverse, plan)
 
 
-def _sent_in_mxfp8_backward(
+def _picked_in_mxfp8_backward(
     exchange: RaggedAllToAll,
     rows: int,
     axes: Axes,
-    shape: tuple[int, int],
-    plan: Plan,
+    k: int,
+    saved: tuple[Int[Array, " m"], Int[Array, " m"], Plan],
     g: Float[Array, "rows d"],
-) -> tuple[Float[Array, "n d"], None]:
-    zeros = jnp.zeros(shape, g.dtype)  # what is not sent has no gradient
-    return _sent_into(exchange, g, zeros, _reversed(plan, axes), axes), None
+) -> tuple[Float[Array, "n d"], None, None, None]:
+    order, inverse, plan = saved
+    zeros = jnp.zeros((order.size, g.shape[-1]), g.dtype)  # what is not sent has none
+    picks = _sent_into(exchange, g, zeros, _reversed(plan, axes), axes)
+    return token_sums(picks, inverse, order, k), None, None, None
 
 
-_sent_in_mxfp8.defvjp(_sent_in_mxfp8_forward, _sent_in_mxfp8_backward)
+_picked_in_mxfp8.defvjp(_picked_in_mxfp8_forward, _picked_in_mxfp8_backward)
 
 
-def _packed(blocks: Blocks) -> UInt8[Array, "n e"]:
-    """Return each row of MXFP8 `blocks` as bytes: its E4M3 values, then its scales."""
-    values = jax.lax.bitcast_convert_type(blocks.values, jnp.uint8)
-    scales = jax.lax.bitcast_convert_type(blocks.scales, jnp.uint8)
-    return jnp.concatenate([values, scales], axis=-1)
+def _in_mxfp8(z: Float[Array, "n d"]) -> UInt8[Array, "n e"]:
+    """Return each token in MXFP8, as a row of bytes: E4M3 values and a power-of-two
+    scale per 32, d + d / 32 bytes, about half of bfloat16's. A token quantizes once,
+    before the rows of its k picks are picked."""
+    return blockscaled.mx_packed(blockscaled.mx_quantize(z))
 
 
-def _unpacked(packed: UInt8[Array, "m e"], d: int) -> Float[Array, "m d"]:
-    """Return the tokens of `packed`, E4M3 values then their scales, dequantized."""
-    values = jax.lax.bitcast_convert_type(packed[:, :d], jnp.float8_e4m3fn)
-    scales = jax.lax.bitcast_convert_type(packed[:, d:], jnp.float8_e8m0fnu)
-    return dequantized(Blocks(values, scales, None))
+def _from_mxfp8(
+    packed: UInt8[Array, "m e"], like: Float[Array, "n d"]
+) -> Float[Array, "m d"]:
+    """Return the rows of `_in_mxfp8` bytes, dequantized to `like`'s dtype."""
+    blocks = blockscaled.mx_unpacked(packed, like.shape[-1])
+    return blockscaled.dequantized(blocks).astype(like.dtype)
 
 
 # --- ragged_tokens ---------------------------------------------------------------------
@@ -541,8 +678,8 @@ def ragged_tokens(
     visit = _visits(idx.reshape(-1, k), local, peers)
     order, inverse, sizes = sort_by_expert(visit, peers)  # by the device visited
     route = _route(sizes, rows, device, axes)
-    tokens = token_rows(z.reshape(-1, d), order, inverse, k)
-    x = _exchanged_tokens(exchange, tokens, rows, route.there, axes)
+    tokens = z.reshape(-1, d)
+    x = _dispatched(exchange, tokens, order, inverse, k, rows, route.there, axes)
     choices = _choices_there(idx.reshape(-1, k), weights.reshape(-1, k), local)
     local_idx, local_weights = (
         _exchanged(exchange, a[order], rows, route.there, axes) for a in choices
