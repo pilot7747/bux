@@ -6,7 +6,8 @@ It compiles the step under each of remat's candidates in turn, the fastest first
 compiled step says a device holds at once, its arguments, outputs and temporaries,
 against a share of the device's memory (``MARGIN``), for what the analysis misses.
 In that order, the first that fits is the one that computes least again. Each
-compile goes into JAX's cache, so a run that starts again reads them back.
+compile goes into JAX's cache, so a run that starts again reads them back, and the
+step that fits runs as ``xla.jit`` made it, which compiles it no more.
 """
 
 import time
@@ -14,7 +15,6 @@ from collections.abc import Callable
 from typing import Any, NamedTuple
 
 import jax
-from flax import nnx
 
 from bux.architecture.repeats import remat
 from bux.train import xla
@@ -40,7 +40,7 @@ class Fitting:
 
     def __init__(self, step: Callable[..., Any], options: xla.Options, **jit: Any):
         self.step, self.options, self.jit = step, options, jit
-        self.chosen: xla.Compiled | None = None
+        self.chosen: Any = None  # the step under the policy that fits, of xla.jit
         self.policy: str | None = None
         self.tried: list[Tried] = []
 
@@ -49,9 +49,9 @@ class Fitting:
 
     def lower(self, *args: Any) -> Any:
         """Return the step lowered for `args`, under the candidate that fits."""
-        return self._fitted(args).jitted.lower(*args)
+        return self._fitted(args).lower(*args)
 
-    def _fitted(self, args: tuple) -> xla.Compiled:
+    def _fitted(self, args: tuple) -> Any:
         """Return the step under the candidate that fits, which the first call of
         `args` chooses."""
         if self.chosen is None:
@@ -59,7 +59,7 @@ class Fitting:
             _report(self.policy, self.tried)
         return self.chosen
 
-    def _first_that_fits(self, args: tuple) -> tuple[str, xla.Compiled]:
+    def _first_that_fits(self, args: tuple) -> tuple[str, Any]:
         """Return the first candidate whose step, compiled for `args`, fits, and that
         step; else the last candidate's."""
         *firsts, last = remat.CANDIDATES
@@ -69,10 +69,10 @@ class Fitting:
                 return policy, step
         return last, self._compiled(last, args)
 
-    def _compiled(self, policy: str, args: tuple) -> xla.Compiled:
-        """Return the step compiled for `args` under `policy`, and note in `tried` what
-        it holds and how long its compile took."""
-        step = xla.Compiled(nnx.jit(self._trying(policy), **self.jit), self.options)
+    def _compiled(self, policy: str, args: tuple) -> Any:
+        """Return the step under `policy`, compiled for `args`, and note in `tried`
+        what it holds and how long its compile took."""
+        step = xla.jit(self._trying(policy), self.options, **self.jit)
         start = time.perf_counter()
         holds = held(step, args)
         self.tried.append(Tried(policy, holds, time.perf_counter() - start))
@@ -88,12 +88,12 @@ class Fitting:
         return step
 
 
-def held(step: xla.Compiled, args: tuple) -> int | None:
-    """Return the bytes `step`, compiled for `args`, holds on a device at once, by
-    XLA's analysis: its arguments, its outputs but those that take an argument's
-    memory, its temporaries and its code. None if XLA could not fit it."""
+def held(step: Any, args: tuple) -> int | None:
+    """Return the bytes `step`, of ``xla.jit``, holds on a device at once compiled
+    for `args`, by XLA's analysis: its arguments, its outputs but those that take an
+    argument's memory, its temporaries and its code. None if XLA could not fit it."""
     try:
-        m = step.compile(*args).memory_analysis()
+        m = xla.compiled(step, *args).memory_analysis()
     except jax.errors.JaxRuntimeError as e:
         if "RESOURCE_EXHAUSTED" not in str(e):
             raise

@@ -180,7 +180,7 @@ Four settings choose which projections, and when:
   | `recurrence` | the linear attentions', RWKV-7's and Mamba's projections, but the output |
   | `recurrence_out` | their output projection |
   | `mtp` | nextn's projection, and every branch after the first head |
-  | `experts` | the routed experts, by a grouped GEMM: `compute`, `mxfp8` or `mxfp8_2d`; `none` is compute, not `matmuls`. In MXFP8 they train 6-13% faster than in bfloat16 on B300s (docs/parallelism.md) |
+  | `experts` | the routed experts, by a grouped GEMM: `compute`, `mxfp8` or `mxfp8_2d`; `none` is `matmuls` where it is one of those, else compute, as no grouped GEMM takes `nvfp4`. In MXFP8 they train 6-13% faster than in bfloat16 on B300s (docs/parallelism.md) |
 
   The embedding, the head, the router and softmax attention's own matmuls always
   stay in compute.
