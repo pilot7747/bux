@@ -9,18 +9,28 @@ import pytest
 from flax import nnx
 from jax.sharding import PartitionSpec as P
 from jaxtyping import Array, Float, Int
+from optax.contrib import MuonDimensionNumbers
 
 from bux import config as cfg
 from bux import parallel
 from bux.architecture import Model, Taps
-from bux.architecture.experts.moe import MoE, balance_loss, experts, routed, run_sorted
+from bux.architecture.experts.moe import (
+    MoE,
+    balance_loss,
+    experts,
+    random_logits,
+    routed,
+    run_sorted,
+)
+from bux.architecture.layers.norm import Norm
 from bux.architecture.registry import Loss
 from bux.architecture.repeats.remat import rematted
-from bux.lang import compile
+from bux.lang import compile, compile_runs
 from bux.train import config as tcfg
 from bux.train.data import plain
 from bux.train.hooks import Checkpoint
 from bux.train.objective import cross_entropy, objective
+from bux.train.optim import muon_matrices, newton_schulz, orthogonalized
 from bux.train.trainer import Trainer
 
 D = 16
@@ -107,6 +117,51 @@ def test_training_moves_the_router_bias_toward_the_experts_picked_less():
     e(x, Taps(training=True))
     assert jnp.array_equal(e.router_bias[...], 0.01 * jnp.sign(load.mean() - load))
     assert (e.router_bias[...] != 0).any()
+
+
+def test_random_logits_are_drawn_and_their_gradient_is_the_router_s():
+    logits = 100 * jax.random.normal(jax.random.key(0), (2, 3, 8))
+    key, probe = jax.random.key(1), jax.random.normal(jax.random.key(2), logits.shape)
+    drawn = jax.random.normal(key, logits.shape)
+    assert jnp.array_equal(random_logits(logits, key), drawn)
+    grad = jax.grad(lambda x: (random_logits(x, key) * probe).sum())(logits)
+    assert jnp.array_equal(grad, probe)
+
+
+def test_random_logits_route_a_training_forward_evenly_drawn_anew_each_time():
+    """A router that picks experts 0 and 1 for every token: a training forward picks
+    each of the 8 as often as any, and learns; any other forward routes by it."""
+    e = moe_layer(num_experts=8, random_logits=True)
+    e.router.kernel[...] = jnp.tile(jnp.where(jnp.arange(8) < 2, 1.0, -1.0), (D, 1))
+    x = jnp.abs(jax.random.normal(jax.random.key(1), (32, 128, D)))
+    assert set(np.unique(e._route(x)[0]).tolist()) == {0, 1}
+    first, second = (e._route(x, Taps(training=True))[0] for _ in range(2))
+    picks = np.bincount(np.asarray(first).ravel(), minlength=8)
+    assert picks.min() > 0.9 * picks.mean()  # 1024 a expert, give or take 3%
+    assert (first != second).any()
+    taps = Taps(training=True)
+    e(x, taps)
+    [balance] = taps.losses
+    assert balance.value == pytest.approx(1, abs=0.02)  # its value when even
+    grads = nnx.grad(lambda e: e(x, Taps(training=True)).sum())(e)
+    assert (grads.router.kernel[...] != 0).all()
+
+
+def test_random_logits_are_in_the_run_s_id_and_train_on_a_mesh(losses):
+    source = (
+        ARCH
+        + "experts = moe(num_experts=4, top_k=2, expert=ffn)\n"
+        + "model = embed ([norm attn] [norm experts])^2 norm head\n"
+    )
+    random = source + "experts.random_logits = true\n"
+    train = "data = synthetic\noptimizer = adamw(lr=1e-3)\nseq_len = 16\nbatch = 8\n"
+    [learned], [drawn] = (
+        compile_runs(s + train + "steps = 1") for s in (source, random)
+    )
+    assert learned.id != drawn.id
+    by_router = losses(source, mesh="mesh(fsdp=4)")
+    by_random = losses(random, mesh="mesh(fsdp=4)")
+    assert by_random[0] != by_router[0] and np.isfinite(by_random).all()
 
 
 def test_a_train_step_moves_the_bias_eval_does_not_and_checkpoints_keep_it(tmp_path):
@@ -244,15 +299,21 @@ def test_sorted_drops_no_token_when_every_token_picks_the_same_experts():
     assert jnp.allclose(run("sorted", e, x)[0], run("dense", e, x)[0], atol=1e-5)
 
 
-def test_experts_run_each_row_through_its_own_and_rows_past_them_are_zero():
+@pytest.mark.parametrize("norm", [None, RMS])
+def test_experts_run_each_row_through_its_own_times_its_weight(norm):
+    """Each row's output times its weight, after the norm, which a weight before it
+    would not change; and the rows past the experts' are 0."""
     keys = jax.random.split(jax.random.key(0), 4)
     x = jax.random.normal(keys[0], (9, D))
-    up, gate = (jax.random.normal(k, (3, D, 8)) for k in keys[1:3])
-    down = jax.random.normal(keys[3], (3, 8, D))
-    out = experts(x, jnp.array([3, 0, 4]), up, gate, down, GATED)
+    up = jax.random.normal(keys[1], (3, D, 8, 2))  # each hidden unit's up and gate
+    down = jax.random.normal(keys[2], (3, 8, D))
+    weights = jax.random.uniform(keys[3], (9,))
+    rescale = None if norm is None else Norm(norm, D)
+    out = experts(x, jnp.array([3, 0, 4]), weights, up, down, GATED, rescale)
     for row, expert in enumerate([0, 0, 0, 2, 2, 2, 2]):
-        h = jax.nn.swish(x[row] @ gate[expert]) * (x[row] @ up[expert])
-        assert jnp.allclose(out[row], h @ down[expert], rtol=1e-5, atol=1e-4)
+        h = jax.nn.swish(x[row] @ up[expert, ..., 1]) * (x[row] @ up[expert, ..., 0])
+        y = h @ down[expert] if rescale is None else rescale(h @ down[expert])
+        assert jnp.allclose(out[row], weights[row] * y, rtol=1e-5, atol=1e-4)
     assert (out[7:] == 0).all()
 
 
@@ -264,12 +325,11 @@ def test_some_of_the_experts_add_their_own_picks_and_nothing_for_the_others():
     e.expert_norm.bias[...] = jnp.ones(D)  # so that a row of zeros comes out not 0
     x = jax.random.normal(jax.random.key(1), (2, 5, D))
     z, (idx, weights, _) = e._latent(x), e._route(x)
-    up, gate, down = e.kernels()
-    assert gate is not None
+    up, down = e.kernels()
 
     def some(first: int, n: int) -> Float[Array, "b t d"]:
         mine = slice(first, first + n)
-        kernels = (up[mine], gate[mine], down[mine])
+        kernels = (up[mine], down[mine])
         return routed(z, idx - first, weights, *kernels, e.config.expert, e.expert_norm)
 
     assert jnp.allclose(some(0, 1) + some(1, 3), some(0, 4), atol=1e-5)
@@ -278,11 +338,13 @@ def test_some_of_the_experts_add_their_own_picks_and_nothing_for_the_others():
 
 @pytest.mark.parametrize(
     ("remat", "products"),
-    [("none", 9), ("full", 12), ("dots", 9), ("dots_no_batch", 9)],
+    [("none", 6), ("full", 7), ("dots", 6), ("dots_no_batch", 6)],
 )
 def test_the_dots_policies_keep_the_experts_products(remat, products):
-    """Three grouped products forward and two for each backward, for the rows and for
-    the kernels: what the policy does not keep, the backward computes again."""
+    """Two grouped products forward, up and gate as one, and two for each backward,
+    for the rows and for the kernels: what the policy does not keep, the backward
+    computes again. Nothing in the backward takes down's output, so `full` computes
+    up and gate's alone again."""
     e, x = moe_layer(), jax.random.normal(jax.random.key(1), (2, 5, D))
     graphdef, state = nnx.split(e)
 
@@ -335,9 +397,27 @@ def test_an_moe_names_its_experts_and_its_projections():
     with parallel.use(tcfg.MeshConfig(fsdp=2, expert=2, tensor=2)):
         state = nnx.state(parallel.build(lambda: MoE(c, 64, nnx.Rngs(0))))
         found = parallel.shardings(state)
-    # The experts over `expert` and their hidden units over `tensor`; FSDP splits the
-    # largest dimension left whole, over `expert` too where no dimension takes it.
-    assert found["up"].spec == found["gate"].spec == P("expert", "fsdp", "tensor")
+    # The experts over `expert` and their hidden units over `tensor`, up's and gate's
+    # alike; FSDP splits the largest dimension left whole, over `expert` too where no
+    # dimension takes it.
+    assert found["up"].spec == P("expert", "fsdp", "tensor", None)
     assert found["down"].spec == P("expert", "tensor", "fsdp")
     assert found["router"]["kernel"].spec == P(("fsdp", "expert"), None)
     assert found["to_latent"]["kernel"].spec == P(("fsdp", "expert"), None)
+
+
+@pytest.mark.parametrize("method", ["gspmd", "gather", "owner"])
+def test_muon_orthogonalizes_up_and_gate_as_two_matrices(method):
+    """As it did when they were two parameters, on one device, whichever method
+    moves them on a mesh."""
+    expert = GATED.model_copy(update={"intermediate_size": 64})
+    c = cfg.MoEConfig(num_experts=8, top_k=2, expert=expert)
+    how = tcfg.MethodsConfig(orthogonalize=method)
+    with parallel.use(tcfg.MeshConfig(fsdp=2, expert=2, tensor=2), methods=how):
+        e = parallel.build(lambda: MoE(c, 32, nnx.Rngs(0)))
+        grads = {"up": jnp.sin(e.up[...])}
+        tx = orthogonalized(5, muon_matrices(e), e)
+        together = jax.jit(tx.update)(grads, tx.init(grads))[0]["up"]
+    ns, matrices = newton_schulz(5), MuonDimensionNumbers(1, 2)
+    apart = [ns(grads["up"][..., i], matrices) for i in (0, 1)]
+    assert np.allclose(together, jnp.stack(apart, -1), atol=1e-6)

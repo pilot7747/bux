@@ -678,10 +678,10 @@ def test_experts_that_take_mxfp8_from_matmuls_have_the_id_of_those_that_name_it(
     it done."""
     mxfp8 = "precision(compute=bfloat16, matmuls=mxfp8"
     assert _moe_id(f"{mxfp8})") == _moe_id(f"{mxfp8}, roles=roles(experts=mxfp8))")
-    assert _moe_id(f"{mxfp8})") == "eba704299d"  # was 323f1a9b03
-    assert _moe_id(f"{mxfp8}, roles=roles(experts=compute))") == "7634531ac3"
-    assert _moe_id("precision(compute=bfloat16, matmuls=nvfp4)") == "cdc149c7c0"
-    assert _moe_id(BF16) == "c4987ef180"
+    assert _moe_id(f"{mxfp8})") == "24391a5e9c"
+    assert _moe_id(f"{mxfp8}, roles=roles(experts=compute))") == "1ef1947db3"
+    assert _moe_id("precision(compute=bfloat16, matmuls=nvfp4)") == "3d13f9d166"
+    assert _moe_id(BF16) == "ddb963967a"
     [dense] = compile_runs(_source(f"precision = {mxfp8})"))
     assert dense.id == "f66305703c"  # no experts: as before
 

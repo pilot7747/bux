@@ -39,7 +39,7 @@ from bux.architecture.experts.moe import (
     experts,
     in_range,
     in_shard_map,
-    permuted,
+    picked_weights,
     run_sorted,
     sort_by_expert,
     token_rows,
@@ -104,9 +104,8 @@ def expert_parallel(body: Body) -> Callable[..., Float[Array, "b t d"]]:
 def _in_float32(kernels: Kernels) -> Kernels:
     """Return the experts' kernels in float32: where several calls of ``experts`` take
     them, their gradients add up in float32, as one call's would."""
-    up, gate, down = kernels
-    wide = None if gate is None else gate.astype(jnp.float32)
-    return up.astype(jnp.float32), wide, down.astype(jnp.float32)
+    up, down = kernels
+    return up.astype(jnp.float32), down.astype(jnp.float32)
 
 
 def token_spec(shape: tuple[int, ...], ep: Axes) -> P:
@@ -214,9 +213,10 @@ def _routed_within(
     order, inverse, sizes = sort_by_expert(idx, local)
     order, sizes = order[:room], _fit(sizes, room)
     rows = token_rows(x.reshape(-1, d), order, inverse, k)
-    made = experts(rows, sizes, *kernels, ffn, norm)
-    kept = jnp.where(in_range(idx, local), weights, 0).reshape(-1)
-    return token_sums(made * kept[order][:, None], inverse, order, k), sizes.sum()
+    kept = jnp.where(in_range(idx, local), weights, 0)
+    row_weights = picked_weights(kept, order, inverse)
+    made = experts(rows, sizes, row_weights, *kernels, ffn, norm)
+    return token_sums(made, inverse, order, k), sizes.sum()
 
 
 # --- all_gather ------------------------------------------------------------------------
@@ -260,21 +260,24 @@ def all_to_all(
     ffn: cfg.MLPConfig,
     norm: RowNorm | None,
 ) -> Combined:
-    """Send each pick to its expert's device and back, in a buffer for each peer, of
-    the same size for all, its picks sorted by expert: a device runs its experts on
-    each peer's buffer as it arrives. A buffer holds `methods.capacity` times a
-    peer's share of the picks, or every pick; past it a peer's last experts' picks
-    drop."""
+    """Send each pick, with its weight, to its expert's device and back, in a buffer
+    for each peer, of the same size for all, its picks sorted by expert: a device runs
+    its experts on each peer's buffer as it arrives. A buffer holds
+    `methods.capacity` times a peer's share of the picks, or every pick; past it a
+    peer's last experts' picks drop."""
     d, k, n, local = z.shape[-1], idx.shape[-1], idx.size, kernels[0].shape[0]
     peers = jax.lax.axis_size(axes)
     buffers = _buffers(idx, local, peers, _room_each(n, peers))
     arrived = _swapped_tokens(z.reshape(-1, d), buffers, k, axes).reshape(peers, -1, d)
+    their_weights = _swapped(_slot_weights(weights, buffers), axes).reshape(peers, -1)
     sizes = _swap(buffers.sizes, axes)  # [i, e]: device i's rows for expert e
     wide = _in_float32(kernels)  # each peer's rows add their part of their gradients
-    made = [experts(x, s, *wide, ffn, norm) for x, s in zip(arrived, sizes)]
+    made = [
+        experts(x, s, w, *wide, ffn, norm)
+        for x, s, w in zip(arrived, sizes, their_weights)
+    ]
     returned = _swapped(jnp.concatenate(made), axes)
-    weighted = returned * _slot_weights(weights, buffers)
-    y = token_sums(weighted, buffers.slot, buffers.pick, k)
+    y = token_sums(returned, buffers.slot, buffers.pick, k)
     return y.reshape(z.shape), 1 - buffers.sizes.sum() / n
 
 
@@ -355,12 +358,10 @@ _swapped_in_mxfp8.defvjp(_swapped_in_mxfp8_forward, _swapped_in_mxfp8_backward)
 
 def _slot_weights(
     weights: Float[Array, "b t k"], buffers: Buffers
-) -> Float[Array, "s 1"]:
-    """Return the router's weight of each slot's pick, 0 where there is none: by a
-    gather whose gradient gathers too, by each pick's slot (``token_rows`` of a pick
-    a row), where XLA's would scatter."""
-    picked = token_rows(weights.reshape(-1, 1), buffers.pick, buffers.slot, 1)
-    return jnp.where(buffers.used[:, None], picked, 0)
+) -> Float[Array, " s"]:
+    """Return the router's weight of each slot's pick, 0 where there is none."""
+    picked = picked_weights(weights, buffers.pick, buffers.slot)
+    return jnp.where(buffers.used, picked, 0)
 
 
 def _room_each(n: int, peers: int) -> int:
@@ -370,7 +371,7 @@ def _room_each(n: int, peers: int) -> int:
     return n if capacity is None else min(n, math.ceil(capacity * n / peers))
 
 
-def _swapped(x: Shaped[Array, "n e"], axes: Axes) -> Shaped[Array, "n e"]:
+def _swapped(x: Shaped[Array, "n ..."], axes: Axes) -> Shaped[Array, "n ..."]:
     """Return `_swap` of x, named for ``remat``."""
     return remat.label(EXCHANGED, _swap(x, axes))
 
@@ -425,10 +426,11 @@ def ragged_all_to_all(
     norm: RowNorm | None,
     exchange: RaggedAllToAll = jax.lax.ragged_all_to_all,
 ) -> Combined:
-    """Send each pick to its expert's device and back, a ragged slice for each expert
-    of each peer: a device's rows arrive sorted by its experts, which run on them as
-    they are. A device takes `methods.capacity` times the rows it sends and drops the
-    rest: its last experts' picks first, and of an expert's, the last peers'."""
+    """Send each pick, with its weight, to its expert's device and back, a ragged
+    slice for each expert of each peer: a device's rows arrive sorted by its experts,
+    which run on them as they are. A device takes `methods.capacity` times the rows
+    it sends and drops the rest: its last experts' picks first, and of an expert's,
+    the last peers'."""
     d, k, n, local = z.shape[-1], idx.shape[-1], idx.size, kernels[0].shape[0]
     peers, device = jax.lax.axis_size(axes), jax.lax.axis_index(axes)
     order, inverse, sizes = sort_by_expert(idx, local * peers)
@@ -436,12 +438,16 @@ def ragged_all_to_all(
     route = _route(sizes, rows, device, axes)
     tokens = z.reshape(-1, d)
     arrived = _dispatched(exchange, tokens, order, inverse, k, rows, route.there, axes)
-    made = experts(arrived, route.arrivals.kept[device].sum(1), *kernels, ffn, norm)
+    sent_weights = picked_weights(weights, order, inverse)[:, None]
+    arrived_weights = _exchanged(exchange, sent_weights, rows, route.there, axes)
+    taken = route.arrivals.kept[device].sum(1)  # the rows each of its experts took
+    came = jnp.arange(rows) < taken.sum()  # past them, what the buffer held
+    row_weights = jnp.where(came, arrived_weights[:, 0], 0)
+    made = experts(arrived, taken, row_weights, *kernels, ffn, norm)
     returned = _exchanged(exchange, made, n, route.back, axes)
     came_back = _came_back(route.there, idx.reshape(-1)[order])
-    per_pick = permuted(jnp.where(came_back[:, None], returned, 0), inverse, order)
-    y = jnp.einsum("btkd,btk->btd", per_pick.reshape(*idx.shape, d), weights)
-    return y, 1 - route.arrivals.kept.sum() / route.counts.sum()
+    y = token_sums(jnp.where(came_back[:, None], returned, 0), inverse, order, k)
+    return y.reshape(z.shape), 1 - route.arrivals.kept.sum() / route.counts.sum()
 
 
 def _route(

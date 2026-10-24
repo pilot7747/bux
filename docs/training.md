@@ -87,10 +87,11 @@ editor shows them on hover and completes them, as it does for layers. In short:
   scales, biases or Engram's tables.
 - `muon(lr, momentum=0.95, nesterov, ns_steps=5, ns_coefficients=jordan,
   ns_dtype=bfloat16, weight_decay=0.1, consistent_rms=0.2, adam=none)` trains the
-  matrices inside the blocks with Muon, stacked expert weights one expert at a time,
-  and everything else (the embedding, the head, vectors) with `adam`, which defaults to
-  `adamw(lr=lr)`. With `consistent_rms=0.2` (Moonlight) one learning rate suits both;
-  `none` scales updates as Keller Jordan's Muon does. `ns_coefficients` names the
+  matrices inside the blocks with Muon, stacked expert weights one expert at a time
+  (an expert's up and gate apart), and everything else (the embedding, the head,
+  vectors) with `adam`, which defaults to `adamw(lr=lr)`. With `consistent_rms=0.2`
+  (Moonlight) one learning rate suits both; `none` scales updates as Keller Jordan's
+  Muon does. `ns_coefficients` names the
   quintics of Newton-Schulz's iterations: `jordan`'s, the same at each, or
   `polar_express`'s (Amsel et al., 2025), one for each, closer to orthogonal in as
   many. Newton-Schulz runs in `ns_dtype`, bfloat16 as in Keller Jordan's Muon, and the
@@ -116,6 +117,19 @@ layer adds its own, and `balance_loss` logs their sum. (transformers'
 training step moves it by `bias_update_rate` (1e-3) toward the experts picked less
 than the mean over the batch. Eval neither adds the loss nor moves the bias, and
 checkpoints keep the bias.
+
+For benchmarks, `moe(..., random_logits=true)` routes each training forward by
+logits drawn from N(0, 1), a stream of its own as dropout's, in place of the
+router's, as Megatron-Core's `moe_router_force_load_balancing` does for all its MoE
+benchmarks: every expert takes an even share of the picks in expectation, so a
+capacity drops few, whatever the data. The router still runs, and its logits take
+the drawn ones' gradient (a straight-through estimator). Eval routes by the router.
+It changes what a run computes, so it is in the run's id; `megatron.bux` sets it. On
+its random tokens the router's own routing drifts uneven, a balance loss of 1.4 to
+1.8 a layer, and `nccl_ep` at a capacity of 1.25 dropped 10 to 15% of the picks;
+by random logits the balance loss is 1.00 and it drops none, and runs 7% faster on
+8 B300s (29.6k tokens a second a GPU against 27.7k); `sorted` 1.4% (31.8k against
+31.4k).
 
 **The sparse attention indexer** learns from a loss of its own, as DeepSeek-V3.2's
 does: `indexer(..., loss_weight=1)`. Each layer that runs one adds `loss_weight` times
@@ -451,7 +465,7 @@ by itself where it cannot run, and all of them do inside `bux.kernels.off()` or 
 | KDA without | bux's Pallas kernels (`pallas_delta`): any gate, each pair's decay through a position between them | 2.6x `chunkwise` |
 | MoE experts | `grouped.ragged_dot`: tokamax's Mosaic and Triton kernels | 27x `jax.lax.ragged_dot` |
 | MoE experts in MXFP8 | `grouped_mxfp8`: Mosaic GPU kernels of tcgen05's block-scaled MMA, the scales by TMA into tensor memory (docs/parallelism.md) | 1.5-2.4x tokamax's bfloat16 GEMMs |
-| MoE dispatch | `token_rows`, `permuted`: gathers where XLA would scatter | 4x |
+| MoE dispatch | `token_rows`, `token_sums`: gathers where XLA would scatter | 4x |
 | NVFP4's quantizers | `nvfp4`: Pallas kernels, a pass for the largest magnitudes and one that writes both copies, rounded by Blackwell's E2M1 conversions | 3-5x |
 
 Tokens a second on B300s, 8 × 4096 tokens a GPU, `precision(compute=bfloat16)`, and

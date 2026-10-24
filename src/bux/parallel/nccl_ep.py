@@ -215,10 +215,11 @@ def nccl_ep(
     picks = jnp.where(kept, idx, -1).reshape(tokens, k).astype(jnp.int32)  # -1: none
     chosen = jnp.where(kept, weights, 0).reshape(tokens, k).astype(jnp.float32)
     sent = _dispatched(rows, tokens, k, z.reshape(tokens, d), picks, chosen)
-    made = experts(remat.label(EXCHANGED, sent.rows), sent.sizes, *kernels, ffn, norm)
     held = _picks_in(sent.sizes, arrivals.kept[jax.lax.axis_index(axes)].sum(-1), rows)
-    weighted = made * jnp.where(held, sent.weights, 0)[:, None].astype(made.dtype)
-    y = remat.label(EXCHANGED, _combined(rows, tokens, k, sent.handle, weighted))
+    row_weights = jnp.where(held, sent.weights, 0)
+    arrived = remat.label(EXCHANGED, sent.rows)
+    made = experts(arrived, sent.sizes, row_weights, *kernels, ffn, norm)
+    y = remat.label(EXCHANGED, _combined(rows, tokens, k, sent.handle, made))
     return y.reshape(z.shape), 1 - arrivals.kept.sum() / (idx.size * peers)
 
 

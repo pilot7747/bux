@@ -905,17 +905,23 @@ themselves is expert parallelism, a method of its own.
 Its pieces are functions of arrays alone, in `bux.architecture.experts.moe`, so that a
 method can run them on one device's experts inside a `shard_map`:
 
-- `experts(x, sizes, up, gate, down, ffn, norm)`: the expert FFN of rows sorted by
-  expert, `sizes[i]` of them expert i's, by `grouped.ragged_dot`: tokamax's Mosaic
-  kernel on a GPU, and its Triton one for the kernels' gradient (27 times XLA's
-  `jax.lax.ragged_dot` on a B300), or XLA's. Rows past `sizes.sum()` come out 0,
-  before `norm`.
-- `routed(z, idx, weights, up, gate, down, ffn, norm)`: `sort_by_expert`, `experts`,
-  unsort. A pick outside the experts of `up` adds nothing, so a device that holds
-  experts `[i, i + n)` passes `idx - i` and its own kernels. The sort and the unsort
-  are `token_rows` and `permuted`, whose gradients gather by the inverse permutation
-  where XLA's would scatter-add. `token_rows` also takes the first m picks alone,
-  and `token_sums`, its transpose, sums each token's k picks' rows.
+- `experts(x, sizes, weights, up, down, ffn, norm)`: the expert FFN of rows sorted by
+  expert, `sizes[i]` of them expert i's, each row's output times its weight, by
+  `grouped.ragged_dot`: tokamax's Mosaic kernel on a GPU, and its Triton one for the
+  kernels' gradient (27 times XLA's `jax.lax.ragged_dot` on a B300), or XLA's. Up
+  and gate are one GEMM. The weights multiply each row's hidden units, before `down`,
+  as Megatron-Core does: `down` is linear, so that is the same sum, and the weights'
+  gradient takes a row's f hidden units, where after `down` it took its d outputs,
+  1 GiB a layer of Qwen3-30B-A3B's; and the backward computes the hidden units again,
+  elementwise, from up and gate's GEMM, which it keeps for the activation's gradient
+  anyway (`weighted_units`). After `norm`, where there is one, the weights multiply
+  its output. Rows past `sizes.sum()` come out 0, before `norm`.
+- `routed(z, idx, weights, up, down, ffn, norm)`: `sort_by_expert`, `experts`, and
+  each token's sum. A pick outside the experts of `up` adds nothing, so a device that
+  holds experts `[i, i + n)` passes `idx - i` and its own kernels. The sort is
+  `token_rows`, whose gradient gathers by the inverse permutation where XLA's would
+  scatter-add, and takes the first m picks alone; `token_sums`, its transpose, sums
+  each token's k picks' rows; `picked_weights` sorts the weights with the picks.
 
 ```python
 from bux.architecture.experts.moe import routed
@@ -927,11 +933,33 @@ def _(moe, z, idx, weights, taps=None):
     return routed(z, idx, weights, *moe.kernels(), moe.config.expert, moe.expert_norm)
 ```
 
-The MoE names its parameters: the router `(embed, None)`; `up` and `gate`
-`(experts, embed, mlp)` and `down` `(experts, mlp, embed)`, with `latent` for `embed`
-in a LatentMoE; `to_latent` `(embed, latent)` and `from_latent` `(latent, embed)`.
+The MoE names its parameters: the router `(embed, None)`; `up` `(experts, embed,
+mlp, None)` and `down` `(experts, mlp, embed)`, with `latent` for `embed` in a
+LatentMoE; `to_latent` `(embed, latent)` and `from_latent` `(latent, embed)`. `up`
+holds a gated MLP's gate too, each hidden unit's up and gate columns side by side,
+`(E, d, f, 2)`: it reshapes for free to the `(E, d, 2f)` of one GEMM, and where
+`tensor` splits the hidden units, each device keeps an up column with its gate's, as
+`(E, d, 2, f)` would not. Muon orthogonalizes up and gate apart, as two matrices.
 `dense` constrains its hidden units to `(batch, seq, experts, mlp)`, so that under
 FSDP the weights move to the tokens rather than the tokens to the weights.
+
+On 8 B300s, `examples/benchmarks/megatron.bux` (Qwen3-30B-A3B, 32k tokens a GPU,
+MXFP8, routed by the router, XLA's pool at 97% of a GPU), before the weights moved
+before `down` and up and gate became one stack, and after, tokens a second a GPU and
+peak memory:
+
+| run | before | after |
+|-----|--------|-------|
+| `sorted`, `fsdp=8`, `remat=none` | 31.1k, 250.4 GiB | 31.9k, 215.0 GiB |
+| `nccl_ep`, `expert=8`, capacity 1.25, `remat=save_attention` | 21.3k, 99.6 GiB | 22.8k, 98.3 GiB |
+| the same, `remat=none` | needs 266 GiB | 27.7k, 210.7 GiB |
+
+`sorted`'s step on GPU 0 took 1075 ms against 1098: the weights' d-wide multiply, its
+transpose and reduce, and the concatenations of up and gate and of their gradient are
+gone. With GEMM autotuning off, its losses agree to 5e-5 for three steps, then drift
+apart as two runs of random tokens do. Under `remat=auto` at JAX's default pool `sorted`
+now takes `dots_attention` (158.5 GiB) where it took `dots` (179 GiB), and `nccl_ep`
+`dots` (187.4 GiB, 24.5k) where it took `save_attention` (21.7k).
 
 ### The experts in MXFP8
 
@@ -949,8 +977,8 @@ MXFP8 experts train 10 to 15% faster than bfloat16 ones (below). An MoE run that
 them to `matmuls=mxfp8` multiplied them in bfloat16 before that, so it takes the id
 of a run that names `mxfp8` for them, and a launch trains it again; a run that names
 their format keeps its id, and a model without routed experts too. In a
-format, `experts` runs up and gate as one GEMM, so that x quantizes once, and each
-GEMM by `grouped_blockscaled.ragged_dot`: every operand of the forward's GEMM and of
+format, up and gate's one GEMM quantizes x once, and each GEMM runs by
+`grouped_blockscaled.ragged_dot`: every operand of the forward's GEMM and of
 the backward's two quantized along what that GEMM contracts, as a projection's are,
 and each expert's W on its own. One pass of a Triton kernel (`grouped_triton`)
 quantizes x and x^T, zeroes the rows past the experts', which an exchange's buffer
@@ -1061,7 +1089,11 @@ Each runs in a `jax.shard_map` manual over the axes that split the tokens (those
 gathers them all onto every device. The kernels enter split over the experts' axes and
 whole over the others, so FSDP gathers a device's own experts alone; `tensor` stays
 Auto. Routing, the balance loss and the router bias run before, in the global view,
-and do not change.
+and do not change. Each pick's weight goes with it to its expert's device: gathered
+with the tokens (`all_gather`), beside its token (`all_to_all`,
+`ragged_all_to_all`), with the token's picks there (`ragged_tokens`) or in NCCL EP's
+dispatch (`nccl_ep`); `experts` weights the rows it makes, so what comes back is
+summed as it is, and nothing the backward keeps for the weights is d wide.
 
 Where no axis splits the experts (`expert=1`, or a number of experts it does not
 divide), each method is `sorted`. Experts over an axis that leaves the tokens whole,
