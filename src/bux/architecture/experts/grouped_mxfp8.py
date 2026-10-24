@@ -26,7 +26,7 @@ the MMAs of the next.
 
 import functools
 from collections.abc import Callable
-from typing import Any, Literal, NamedTuple
+from typing import Any, NamedTuple
 
 import jax
 import jax.numpy as jnp
@@ -72,9 +72,6 @@ class Tiles(NamedTuple):
 ROWS = Tiles(m=LANES, n=128, k=128, stages=7, sms=2)
 CONTRACT = Tiles(m=LANES, n=128, k=LANES, stages=7, sms=2)  # k: a tile of rows
 
-# How each group's (n, k) matrix stacks: by rows, (g n, k); by columns, (n, g k).
-Stacked = Literal["rows", "columns"]
-
 
 def runs() -> bool:
     """Whether these kernels run here: on a Blackwell GPU (sm_100 on), outside
@@ -87,25 +84,41 @@ def runs() -> bool:
 # --- The operands, as the kernels load them ---------------------------------------
 
 
+class Tiled(NamedTuple):
+    """An operand of the kernels in MXFP8, as they load it: E4M3 values (..., r, k)
+    in blocks of 32 along k, padded by 0 to whole tiles of 128 of k, and their scales
+    laid out as tcgen05's MMA takes them in tensor memory, (..., r', k / 128, 32, 16):
+    a 512-byte tile for each 128 rows by 128 of k, r' whole tiles of rows
+    (`in_tensor_memory`). Each group's matrices are a stack of them, (g, n, k)."""
+
+    values: Shaped[Array, "*s r k"]
+    scales: Shaped[Array, "*s p q 32 16"]
+
+
+def tiled(blocks: Blocks) -> Tiled:
+    """Return MXFP8 `blocks` (..., r, k) as the kernels take them, by XLA: for an
+    operand that ``grouped_triton``'s quantizer, which writes them so, did not
+    quantize."""
+    lay_out = in_tensor_memory
+    for _ in range(blocks.values.ndim - 2):
+        lay_out = jax.vmap(lay_out)
+    return Tiled(_whole_tiles_of_k(blocks.values), lay_out(blocks.scales))
+
+
 def rows(
-    a: Blocks,
-    b: Blocks,
+    a: Tiled,
+    b: Tiled,
     sizes: Int[Array, " g"],
-    stacked: Stacked,
     out: DTypeLike,
     tiles: Tiles = ROWS,
 ) -> Float[Array, "m n"]:
-    """Return a b[g]^T for each group g's rows of a, the first sizes[0] rows group
-    0's and so on, of b's (n, k) matrices `stacked`; the rows past the groups as 0."""
-    (m, k), groups = a.values.shape, sizes.shape[0]
-    matrices = _matrices(b.values, groups, stacked)
-    n = matrices.shape[1 if stacked == "rows" else 0]
-    values, matrices = _whole_tiles_of_k(a.values), _whole_tiles_of_k(matrices)
-    scales = (in_tensor_memory(a.scales), _matrix_scales(b.scales, groups, stacked))
+    """Return a b[g]^T for each group g's rows of a (m, k), the first sizes[0] rows
+    group 0's and so on, of b's matrices (g, n, k); the rows past the groups as 0."""
+    (m, k), (groups, n, _) = a.values.shape, b.values.shape
     past = jnp.maximum(m - sizes.sum(), 0)[None].astype(sizes.dtype)
     at = tiles_of(jnp.concatenate([sizes, past]), m, tiles.height)
-    kernel = _rows_kernel(m, n, k, at.shape[0], groups, stacked, jnp.dtype(out), tiles)
-    return kernel(values, matrices, *scales, at[:, 0], at[:, 1], at[:, 2])
+    kernel = _rows_kernel(m, n, k, at.shape[0], groups, jnp.dtype(out), tiles)
+    return kernel(a.values, b.values, a.scales, b.scales, at[:, 0], at[:, 1], at[:, 2])
 
 
 def tiles_of(sizes: Int[Array, " g"], m: int, tile: int) -> Int[Array, "t 3"]:
@@ -131,8 +144,8 @@ def tiles_of(sizes: Int[Array, " g"], m: int, tile: int) -> Int[Array, "t 3"]:
 
 
 def contract(
-    a: Blocks,
-    b: Blocks,
+    a: Tiled,
+    b: Tiled,
     sizes: Int[Array, " g"],
     out: DTypeLike,
     tiles: Tiles = CONTRACT,
@@ -144,36 +157,24 @@ def contract(
     ends = jnp.cumsum(sizes).astype(jnp.int32)
     starts = ends - sizes.astype(jnp.int32)
     edges = _edges(a.values, starts, ends)  # a's 0s make b's other rows add nothing
-    scales = (in_tensor_memory(a.scales), in_tensor_memory(b.scales))
     kernel = _contract_kernel(d, f, g, jnp.dtype(out), tiles)
-    return kernel(a.values, b.values, edges, *scales, starts, ends)
+    return kernel(a.values, b.values, edges, a.scales, b.scales, starts, ends)
 
 
 def in_tensor_memory(scales: Shaped[Array, "r c"]) -> Shaped[Array, "p q 32 16"]:
     """Return (r, c) scales, a row's per 32 of k, laid out as tcgen05's MMA takes
     them in tensor memory, so that TMA loads a tile's at a time: a 512-byte tile for
     each 128 rows by 4 scales (128 of k), row i's 4 at bytes (i % 32) * 16 +
-    (i // 32) * 4. Padded to whole tiles with bytes of 0, 2^-127 times values of 0:
-    E8M0 has no 0, and pads a 0 as NaN."""
+    (i // 32) * 4. Padded to whole tiles with bytes of 1, as the quantizer scales a
+    block of 0s (2^-126): E8M0 has no 0, and pads a 0 as NaN."""
     r, c = scales.shape
     p, q = -(-r // LANES), -(-c // SCALE_TILE)
     bytes_ = blockscaled.as_bytes(scales)
-    padded = jnp.pad(bytes_, ((0, p * LANES - r), (0, q * SCALE_TILE - c)))
+    padding = ((0, p * LANES - r), (0, q * SCALE_TILE - c))
+    padded = jnp.pad(bytes_, padding, constant_values=1)
     rows = _as_words(padded)  # a row's 4 scales of each tile of k, a word
     tiles = rows.reshape(p, 4, 32, q).transpose(0, 3, 2, 1)
     return _from_words(tiles, scales.dtype).reshape(p, q, 32, 16)
-
-
-def _matrices(
-    values: Shaped[Array, "r c"], groups: int, stacked: Stacked
-) -> Shaped[Array, "..."]:
-    """Return the stacked matrices' values as a view TMA loads a group's from, each
-    tile of k as long as the group's own and 0 past it: (g, n, k) by rows, (n, g, k)
-    by columns."""
-    r, c = values.shape
-    if stacked == "rows":
-        return values.reshape(groups, r // groups, c)
-    return values.reshape(r, groups, c // groups)
 
 
 def _whole_tiles_of_k(values: Shaped[Array, "*r k"]) -> Shaped[Array, "*r q"]:
@@ -185,18 +186,6 @@ def _whole_tiles_of_k(values: Shaped[Array, "*r k"]) -> Shaped[Array, "*r q"]:
     words = _as_words(values)
     padded = jnp.pad(words, [(0, 0)] * (words.ndim - 1) + [(0, pad // 4)])
     return _from_words(padded, values.dtype)
-
-
-def _matrix_scales(
-    scales: Shaped[Array, "r c"], groups: int, stacked: Stacked
-) -> Shaped[Array, "g p q 32 16"]:
-    """Return each group's scales as tensor memory takes them (`in_tensor_memory`)."""
-    r, c = scales.shape
-    if stacked == "rows":
-        each = scales.reshape(groups, r // groups, c)
-    else:
-        each = scales.reshape(r, groups, c // groups).transpose(1, 0, 2)
-    return jax.vmap(in_tensor_memory)(each)
 
 
 def _edges(
@@ -314,13 +303,12 @@ def _rows_kernel(
     k: int,
     count: int,
     groups: int,
-    stacked: Stacked,
     out: jnp.dtype,
     tiles: Tiles,
 ) -> Any:
-    """Return the kernel of `rows` for these shapes: a jax function of a's values,
-    b's, their scales, and each row tile's group, start and end; a tile of the rows
-    past the groups, of group `groups`, stores 0."""
+    """Return the kernel of `rows` for these shapes, k whole tiles: a jax function
+    of a's values, b's, their scales, and each row tile's group, start and end; a
+    tile of the rows past the groups, of group `groups`, stores 0."""
     columns = -(-n // tiles.n)
 
     def body(*refs: Any) -> None:
@@ -334,13 +322,12 @@ def _rows_kernel(
             return _Place(start < end, group, start, end, row, column, steps)
 
         load = functools.partial(
-            _load_rows, a=a, b=b, a_scales=a_scales, b_scales=b_scales, stacked=stacked
+            _load_rows, a=a, b=b, a_scales=a_scales, b_scales=b_scales
         )
         store = functools.partial(_store_rows, y=y)
         _each_tile(place, load, store, _Buffers(*scratch), tiles)
 
-    name = f"bux_mxfp8_rows_{stacked}"
-    return _launch(body, (m, n), out, count * columns, tiles, name)
+    return _launch(body, (m, n), out, count * columns, tiles, "bux_mxfp8_rows")
 
 
 @functools.cache
@@ -519,19 +506,14 @@ def _load_rows(
     b: Any,
     a_scales: Any,
     b_scales: Any,
-    stacked: Stacked,
 ) -> None:
     """Copy step i of a tile of `rows`: its rows of a, its group's matrix's tile of
     columns, and their scales, each a tile of k."""
     t = tile.tiles
     rows, columns, row_tiles, column_tiles = _spans(tile)
     ks, k_tiles = pl.ds(i * t.k, t.k), pl.ds(i * (t.k // LANES), t.k // LANES)
-    if stacked == "rows":
-        matrix = b.at[tile.group, columns, ks]
-    else:
-        matrix = b.at[columns, tile.group, ks]
     _copy(a.at[rows, ks], buffers.a, slot, buffers, t)
-    _copy(matrix, buffers.b, slot, buffers, t)
+    _copy(b.at[tile.group, columns, ks], buffers.b, slot, buffers, t)
     _copy(a_scales.at[row_tiles, k_tiles], buffers.a_scales, slot, buffers, t)
     _copy(
         b_scales.at[tile.group, column_tiles, k_tiles],
