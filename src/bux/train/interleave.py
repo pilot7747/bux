@@ -182,19 +182,21 @@ class Slots:
         self.kind = [self.shapes.index(k) for k in kinds]
         self.table, self.sizes = _assign(self.kind, len(self.shapes), microbatches)
 
-    def holding(self, residuals: list[list[Leaf]]) -> Buffers:
-        """Return the buffers holding the first microbatch's `residuals`, each piece's
-        in its slot. A buffer starts as its kind's first residual in every slot, so
-        that XLA splits it over the mesh as it splits that residual: an empty one it
-        may keep whole on every device, as it did those of the experts' kernels."""
-        firsts = [residuals[self.kind.index(k)] for k in range(len(self.sizes))]
-        buffers = [
-            [jnp.broadcast_to(a, (n, *a.shape)) for a in first]
-            for first, n in zip(firsts, self.sizes, strict=True)
-        ]
-        for p, leaves in enumerate(residuals):
-            buffers = self.write(buffers, p, int(self.table[0, p]), leaves)
-        return buffers
+    def unwritten(self) -> Buffers:
+        """Return the buffers before the first microbatch: none yet."""
+        return [[] for _ in self.sizes]
+
+    def first(self, buffers: Buffers, p: int, leaves: list[Leaf]) -> Buffers:
+        """Return `buffers` with the first microbatch's piece `p`'s residuals,
+        `leaves`, in its slot. The first piece of a kind starts its kind's buffer, as
+        its residuals in every slot, so that XLA splits it over the mesh as it splits
+        them: an empty one it may keep whole on every device, as it did those of the
+        experts' kernels."""
+        k = self.kind[p]
+        if buffers[k] or not leaves:
+            return self.write(buffers, p, int(self.table[0, p]), leaves)
+        started = [jnp.broadcast_to(a, (self.sizes[k], *a.shape)) for a in leaves]
+        return [started if j == k else b for j, b in enumerate(buffers)]
 
     def read(self, buffers: Buffers, p: int, slot: int | Int[Array, ""]) -> list[Leaf]:
         """Return piece `p`'s residuals from `slot` of its kind's buffer."""
@@ -243,10 +245,6 @@ def _reads_and_writes(slots: Slots) -> tuple[Int[Array, "m p"], Int[Array, "m p"
 
 def _leaves(vjp: Vjp) -> list[Leaf]:
     return jax.tree.leaves(vjp)
-
-
-def _signature(vjp: Vjp) -> Signature:
-    return tuple((a.shape, a.dtype) for a in _leaves(vjp))
 
 
 # --- The step --------------------------------------------------------------------------
@@ -318,11 +316,9 @@ class Step:
         model's other state after the last forward. Microbatch i's terms of the
         objective weigh `shares[i]`."""
         self.params, n = params, shares.shape[0]
-        held, metrics, forwards = self._first(
-            zeros, rest, Rows.of(_at(micro, 0), shares[0])
-        )
-        slots = Slots([_signature(f.vjp) for f in forwards], n)
-        held = held._replace(buffers=slots.holding([_leaves(f.vjp) for f in forwards]))
+        first = Rows.of(_at(micro, 0), shares[0])
+        slots = Slots(self._signatures(rest, first), n)
+        held, metrics = self._first(zeros, rest, first, slots)
         if n > 1:
             xs = (_after_first(micro), shares[1:], *_reads_and_writes(slots))
             held, later = jax.lax.scan(lambda h, x: self._ticks(h, slots, *x), held, xs)
@@ -332,20 +328,38 @@ class Step:
         held = self._last(held, slots, slots.table[n - 1])
         return held.grads, {k: v.sum() for k, v in metrics.items()}, held.rest
 
+    def _signatures(self, rest: Flat, rows: Rows) -> list[Signature]:
+        """Return the shapes of each piece's residuals on the first microbatch, traced
+        on their own (``jax.eval_shape``), for the slots before the first forward."""
+
+        def residuals() -> list[list[Leaf]]:
+            x, leaves = jnp.asarray(rows.batch.input_ids), []
+            with tracing.forward(self.main):
+                for p in range(len(self.pieces)):
+                    f = self._forward(p, rest, x, rows)
+                    x, leaves = f.y, [*leaves, _leaves(f.vjp)]
+            return leaves
+
+        shapes = jax.eval_shape(residuals)
+        return [tuple((a.shape, a.dtype) for a in piece) for piece in shapes]
+
     def _first(
-        self, zeros: Flat, rest: Flat, rows: Rows
-    ) -> tuple[Held, Metrics, list[Forward]]:
-        """Run the first microbatch forward to its loss."""
-        forwards, x, losses = [], jnp.asarray(rows.batch.input_ids), []
+        self, zeros: Flat, rest: Flat, rows: Rows, slots: Slots
+    ) -> tuple[Held, Metrics]:
+        """Run the first microbatch forward to its loss, each piece's residuals into
+        their slots before the next piece runs: else XLA may hold them all twice, as
+        made and in their slots."""
+        x, losses = jnp.asarray(rows.batch.input_ids), []
+        buffers, self.likes = slots.unwritten(), []
         with tracing.forward(self.main):
             for p in range(len(self.pieces)):
                 f = self._forward(p, rest, x, rows)
-                forwards.append(f)
-                x, rest, losses = f.y, f.rest, losses + f.losses
+                buffers = slots.first(buffers, p, _leaves(f.vjp))
+                x, buffers = jax.lax.optimization_barrier((f.y, buffers))
+                rest, losses = f.rest, losses + f.losses
+                self.likes.append(f.vjp)
             metrics, d_head, dy, rest = self._loss(rest, x, rows, losses)
-        self.likes = [f.vjp for f in forwards]
-        held = Held(_added(zeros, d_head), rest, [], dy)
-        return held, metrics, forwards
+        return Held(_added(zeros, d_head), rest, buffers, dy), metrics
 
     def _ticks(
         self,
@@ -381,12 +395,13 @@ class Step:
 
     def _last(self, held: Held, slots: Slots, table: Int[np.ndarray, " p"]) -> Held:
         """Take the last microbatch's gradient back through every piece but the head,
-        from its residuals in the slots of `table`."""
-        grads, dy = held.grads, held.dy
+        from its residuals in the slots of `table`, each piece's read once the piece
+        above is done: else XLA may copy them all out of their slots at once."""
+        grads, buffers, dy = held.grads, held.buffers, held.dy
         for q in reversed(range(len(self.pieces))):
-            residuals = slots.read(held.buffers, q, int(table[q]))
-            d_params, dy = self._backward(q, residuals, dy)
+            d_params, dy = self._backward(q, slots.read(buffers, q, int(table[q])), dy)
             grads = _added(grads, d_params)
+            dy, buffers = jax.lax.optimization_barrier((dy, buffers))
         return held._replace(grads=grads)
 
     # --- A piece's forward and backward, and the head's loss ---------------------------
