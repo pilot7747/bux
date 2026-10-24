@@ -8,7 +8,8 @@ one. After an upgrade, run it (on a GPU node too) and scripts/gpu_smoke/*.py, fi
 here what fails, and set `VERIFIED_ON` to the new versions.
 """
 
-from collections.abc import Callable, Sequence
+import functools
+from collections.abc import Callable, Iterator, Sequence
 from typing import Any
 
 import jax
@@ -18,8 +19,8 @@ from jax._src.api import VJP, NotNeeded, NotSaveable
 from jax._src.cudnn import fused_attention_stablehlo as cudnn_fused
 from jax._src.cudnn.scaled_matmul_stablehlo import _scaled_matmul_p
 from jax.experimental import buffer_callback as callbacks
-from jax.experimental.compute_on import compute_on
-from jax.extend import core
+from jax.experimental.xla_metadata import xla_metadata_call2
+from jax.extend import core, xla
 from jaxtyping import Array, Float, Int, Shaped
 
 # The packages whose internals below were checked, at these versions.
@@ -247,14 +248,142 @@ def buffer_callback(
     return callbacks.buffer_callback(run, results)
 
 
-def on_stream(stream: str, run: Callable[[], Any]) -> Any:
+def on_stream(stream: str, run: Callable[[], Any], first: int = 0) -> Any:
     """Return run(), its ops on the GPU stream `stream` ("gpu_stream:1"): XLA makes
     them one async call there, which the compute stream's kernels run beside, by
     --xla_gpu_experimental_stream_annotation (on by default). A CPU ignores it.
-    nccl_ep.py runs NCCL EP's kernels so; jax 0.10.1 named compute_on compute_on2,
-    and 0.11.1 back."""
-    on = compute_on(compute_type=stream, out_memory_spaces=jax.memory.Space.Device)
-    return on(run)()
+    nccl_ep.py runs NCCL EP's kernels so.
+
+    XLA's scheduler starts the call as soon as its inputs are ready and waits for it
+    as late as its results are needed, so that whatever else is ready runs beside it
+    (the hint force_delay_async); of such calls ready at once, a higher `first`
+    starts first (scheduler_delay_priority). jax's compute_on takes no hints. Its
+    results come off the stream as they are (``parts_off_the_stream``)."""
+    _keep_parts_off_the_stream()
+    hinted = {
+        "_xla_stream_annotation": stream.removeprefix("gpu_stream:"),
+        "inlineable": "false",
+        "scheduler_hint": "force_delay_async",
+        "scheduler_delay_priority": str(first),
+    }
+    return xla_metadata_call2(run, hinted)()
+
+
+# XLA's name of the pass below, and what marks a module that needs it.
+PARTS = "bux_stream_calls_parts_off_their_stream"
+STREAM_ATTRIBUTE = b"_xla_stream_annotation"
+# Field numbers of xla/service/hlo.proto: HloModuleProto.computations,
+# HloComputationProto.instructions, HloInstructionProto.opcode and
+# .frontend_attributes, and the entries of FrontendAttributes.map.
+COMPUTATIONS, INSTRUCTIONS, OPCODE, ATTRIBUTES, ENTRIES = 3, 2, 2, 68, 1
+LENGTH = 2  # protobuf's wire type of a length-delimited field
+
+
+@functools.cache
+def _keep_parts_off_the_stream() -> None:
+    """Have XLA run ``parts_off_the_stream`` on every module before it schedules
+    it, once a process, on a GPU."""
+    if jax.default_backend() != "gpu":
+        return
+    xla.register_hlo_module_transformation(
+        parts_off_the_stream,
+        name=PARTS,
+        stage=xla.PipelineStage.PRE_SCHEDULER,
+        platforms="cuda",
+    )
+
+
+def parts_off_the_stream(serialized: bytes) -> bytes | None:
+    """Return the module `serialized` (an HloModuleProto, before XLA schedules it)
+    with no get-tuple-element marked for a GPU stream; None where none is. In a
+    shard_map XLA's SPMD partitioner copies a stream call's attributes onto the
+    get-tuple-elements of its results, and XLA then makes each its own async call on
+    the stream, queued there behind the calls issued after it: the compute stream
+    would wait for a chunk's next dispatch before it takes this one's rows."""
+    if STREAM_ATTRIBUTE not in serialized:
+        return None
+    edited = _edited(serialized, {COMPUTATIONS: _computation})
+    return None if edited == serialized else edited
+
+
+def _computation(message: bytes) -> bytes:
+    if STREAM_ATTRIBUTE not in message:
+        return message
+    return _edited(message, {INSTRUCTIONS: _instruction})
+
+
+def _instruction(message: bytes) -> bytes:
+    if STREAM_ATTRIBUTE not in message or _opcode(message) != b"get-tuple-element":
+        return message
+    return _edited(message, {ATTRIBUTES: _attributes})
+
+
+def _attributes(message: bytes) -> bytes:
+    return _edited(message, {ENTRIES: _unless_stream})
+
+
+def _unless_stream(entry: bytes) -> bytes | None:
+    """Return an entry of a frontend attributes' map, or None for the stream's."""
+    key = next(payload for number, _, payload in _fields(entry) if number == 1)
+    return None if key == STREAM_ATTRIBUTE else entry
+
+
+def _opcode(instruction: bytes) -> bytes | None:
+    return next((p for n, _, p in _fields(instruction) if n == OPCODE), None)
+
+
+Edit = Callable[[bytes], bytes | None]
+
+
+def _edited(message: bytes, edits: dict[int, Edit]) -> bytes:
+    """Return the protobuf `message` with each length-delimited field whose number
+    has an edit replaced by the edit of its payload, or dropped where it gives None;
+    the other fields as they are."""
+    out = bytearray()
+    for number, raw, payload in _fields(message):
+        edit = edits.get(number)
+        if edit is None or payload is None:
+            out += raw
+        elif (new := edit(payload)) is not None:
+            out += _varint(number << 3 | LENGTH) + _varint(len(new)) + new
+    return bytes(out)
+
+
+def _fields(message: bytes) -> Iterator[tuple[int, bytes, bytes | None]]:
+    """Yield each field of a protobuf message: its number, its bytes, and its
+    payload where it is length-delimited."""
+    at = 0
+    while at < len(message):
+        start = at
+        tag, at = _read_varint(message, at)
+        kind, payload = tag & 7, None
+        if kind == 0:
+            _, at = _read_varint(message, at)
+        elif kind == LENGTH:
+            size, at = _read_varint(message, at)
+            payload, at = message[at : at + size], at + size
+        else:  # 64 or 32 bits
+            at += {1: 8, 5: 4}[kind]
+        yield tag >> 3, message[start:at], payload
+
+
+def _read_varint(data: bytes, at: int) -> tuple[int, int]:
+    """Return the varint at `at` in data, and where it ends."""
+    value = shift = 0
+    while True:
+        byte = data[at]
+        value, shift, at = value | (byte & 0x7F) << shift, shift + 7, at + 1
+        if byte < 0x80:
+            return value, at
+
+
+def _varint(value: int) -> bytes:
+    out = bytearray()
+    while value >= 0x80:
+        out.append(value & 0x7F | 0x80)
+        value >>= 7
+    out.append(value)
+    return bytes(out)
 
 
 def _keeps_its_inputs(

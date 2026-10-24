@@ -95,11 +95,23 @@ def _primitive(bind):
 
 @pytest.mark.parametrize("stream", [False, True])
 def test_under_moe_stream_tes_primitives_run_on_nccl_eps_stream(stream):
-    bound = jax.jit(lambda x: nccl_ep._bind(_primitive(lambda x: 2 * x), x))
+    twice = _primitive(lambda x: 2 * x)
+    bound = jax.jit(lambda x: nccl_ep._bind(nccl_ep.THERE, twice, x))
     with _use({"data": 2, "expert": 4}, stream=stream):
         lowered = bound.lower(jnp.ones(3)).as_text()
         assert (bound(jnp.ones(3)) == 2).all()
     assert ('_xla_stream_annotation = "1"' in lowered) == stream
+
+
+def test_on_its_stream_what_sends_rows_there_starts_before_what_sends_them_back():
+    def priorities(way):
+        bound = jax.jit(lambda x: nccl_ep._bind(way, _primitive(lambda x: x), x))
+        lowered = bound.lower(jnp.ones(3)).as_text()
+        return re.findall(r'scheduler_delay_priority = "(\d+)"', lowered)
+
+    with _use({"data": 2, "expert": 4}, stream=True):
+        there, back = priorities(nccl_ep.THERE), priorities(nccl_ep.BACK)
+    assert int(there[0]) > int(back[0])
 
 
 def test_a_dispatch_prepares_and_sends_in_one_call_on_nccl_eps_stream(monkeypatch):
@@ -184,7 +196,8 @@ def test_each_call_of_a_backward_prepares_its_route_where_it_runs(monkeypatch, s
     first, then, last = recorded.prepared
     used = dict(recorded.binds)
     assert used["dispatch"] is first  # the combine takes it from the dispatch's call
-    assert used["combine_bwd"] is then and used["dispatch_bwd"] is last
+    if not stream:  # else each comes out of the call of its prepare, another tracer
+        assert used["combine_bwd"] is then and used["dispatch_bwd"] is last
 
 
 def test_the_rows_that_hold_picks_are_each_experts_first():

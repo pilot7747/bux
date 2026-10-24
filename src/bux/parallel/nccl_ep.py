@@ -14,7 +14,9 @@ hang across nodes.
 
 NCCL EP keeps its buffers outside the step, sized for the run, so ``start`` runs once
 a process before the step traces (``methods.prepare``). Under `methods.moe_stream` its
-kernels run on a stream of their own (``STREAM``), beside the compute stream's.
+kernels run on a stream of their own (``STREAM``), beside the compute stream's, each
+call started as early as its inputs allow and waited for as late as its results are
+needed (``jax_internals.on_stream``).
 """
 
 import functools
@@ -57,6 +59,11 @@ ALIGNED = 128
 # The stream NCCL EP's kernels run on under `methods.moe_stream`, one of their own:
 # XLA runs the compute stream's kernels beside them, and theirs one after another.
 STREAM = "gpu_stream:1"
+# Of NCCL EP's calls ready at once, XLA starts first those that send rows to the
+# experts (the dispatch, and the combine's gradient), then those that send them back:
+# in chunks, the next chunk's dispatch then runs beside this one's experts, not queued
+# on NCCL EP's stream behind this one's combine (``jax_internals.on_stream``).
+THERE, BACK = 1, 0
 
 
 class Started(NamedTuple):
@@ -281,8 +288,8 @@ def _picks_in(
 
 # A route's handle: TE's prepare writes the route into it, and TE keys its own state
 # of the route by the handle's address, which a copy changes. So no handle outlives
-# the forward it is prepared in: the combine takes its dispatch's, and each call of
-# a backward prepares its own from the picks its forward kept, in whatever order
+# the pass it is prepared in: the combine takes its dispatch's, and each call of a
+# backward a handle prepared anew from the picks its forward kept, in whatever order
 # microbatches' forwards and backwards run.
 Handle = UInt8[Array, "1 h"]
 
@@ -303,23 +310,25 @@ def _route(k: int) -> dict[str, int]:
     return {"top_k": k, "dispatch_output_per_expert_alignment": ALIGNED}
 
 
-def _bind(primitive: Any, *args: Shaped[Array, "..."], **params: Any) -> Any:
-    """Return TE's one-device `primitive` of `args` (``_on_its_stream``)."""
-    return _on_its_stream(lambda: _bound(primitive, *args, **params))
+def _bind(way: int, primitive: Any, *args: Shaped[Array, "..."], **params: Any) -> Any:
+    """Return TE's one-device `primitive` of `args`, which sends rows `way`, THERE
+    or BACK (``_on_its_stream``)."""
+    return _on_its_stream(lambda: _bound(primitive, *args, **params), way)
 
 
 def _bound(primitive: Any, *args: Shaped[Array, "..."], **params: Any) -> Any:
     return primitive.inner_primitive.bind(*args, **params)
 
 
-def _on_its_stream[T](run: Callable[[], T]) -> T:
+def _on_its_stream[T](run: Callable[[], T], way: int) -> T:
     """Return run(), under `methods.moe_stream` the primitives it binds on NCCL EP's
-    stream as one async call: the compute stream waits for each call where it uses its
-    results, so a call a primitive would make it wait for each one in turn."""
+    stream as one async call, which sends rows `way`: the compute stream waits for
+    each call where it uses its results, so a call a primitive would make it wait for
+    each one in turn."""
     on = active()
     if on is None or not on.methods.moe_stream:
         return run()
-    return jax_internals.on_stream(STREAM, run)
+    return jax_internals.on_stream(STREAM, run, way)
 
 
 def _prepared(k: int, idx: Int[Array, "n k"]) -> tuple[Int[Array, "1 l"], Handle]:
@@ -328,6 +337,13 @@ def _prepared(k: int, idx: Int[Array, "n k"]) -> tuple[Int[Array, "1 l"], Handle
     te = transformer_engine()
     sizes, _, handle = _bound(te.EpPreparePrimitive, idx, **_route(k), is_outer=False)
     return sizes, handle
+
+
+def _prepared_again(k: int, idx: Int[Array, "n k"], way: int) -> Handle:
+    """Return a handle of the route of the picks idx for a call of a backward, which
+    takes none from its forward (``Handle``): TE's prepare in a call of its own,
+    which XLA can start as soon as the backward starts, its picks long kept."""
+    return _on_its_stream(lambda: _prepared(k, idx)[1], way)
 
 
 @functools.partial(jax.custom_vjp, nondiff_argnums=(0, 1, 2))
@@ -370,26 +386,23 @@ def _dispatched_forward(
         )
         return arrived, arrived_weights, handle, sizes
 
-    arrived, arrived_weights, handle, sizes = _on_its_stream(prepared_and_sent)
+    arrived, arrived_weights, handle, sizes = _on_its_stream(prepared_and_sent, THERE)
     return Dispatched(arrived[0], arrived_weights[0], handle, sizes[0]), idx
 
 
 def _dispatched_backward(
     rows: int, tokens: int, k: int, idx: Int[Array, "n k"], g: Dispatched
 ) -> tuple[Float[Array, "n d"], None, Float[Array, "n k"]]:
-    def prepared_and_returned() -> tuple[Float[Array, "n d"], Float[Array, "n k"]]:
-        _, handle = _prepared(k, idx)
-        return _bound(
-            transformer_engine().EpDispatchBwdPrimitive,
-            handle,
-            g.rows[None],
-            g.weights[None],
-            **_route(k),
-            out_leading_shape=(tokens,),
-            out_partition_spec=None,
-        )
-
-    gx, gw = _on_its_stream(prepared_and_returned)
+    gx, gw = _bind(
+        BACK,
+        transformer_engine().EpDispatchBwdPrimitive,
+        _prepared_again(k, idx, BACK),
+        g.rows[None],
+        g.weights[None],
+        **_route(k),
+        out_leading_shape=(tokens,),
+        out_partition_spec=None,
+    )
     return gx, None, gw
 
 
@@ -421,6 +434,7 @@ def _combined_forward(
     made: Float[Array, "r d"],
 ) -> tuple[Float[Array, "n d"], Int[Array, "n k"]]:
     y = _bind(
+        BACK,
         transformer_engine().EpCombinePrimitive,
         handle,
         made[None],
@@ -434,18 +448,16 @@ def _combined_forward(
 def _combined_backward(
     rows: int, tokens: int, k: int, idx: Int[Array, "n k"], g: Float[Array, "n d"]
 ) -> tuple[None, None, Float[Array, "r d"]]:
-    def prepared_and_sent() -> Float[Array, "1 r d"]:
-        _, handle = _prepared(k, idx)
-        return _bound(
-            transformer_engine().EpCombineBwdPrimitive,
-            handle,
-            g,
-            **_route(k),
-            recv_capacity_per_rank=rows,
-            is_outer=False,
-        )
-
-    return None, None, _on_its_stream(prepared_and_sent)[0]
+    g_made = _bind(
+        THERE,
+        transformer_engine().EpCombineBwdPrimitive,
+        _prepared_again(k, idx, THERE),
+        g,
+        **_route(k),
+        recv_capacity_per_rank=rows,
+        is_outer=False,
+    )
+    return None, None, g_made[0]
 
 
 _combined.defvjp(_combined_forward, _combined_backward)
