@@ -10,7 +10,9 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 import pytest
+from conftest import equations
 from flax import nnx
+from jaxtyping import Array, Shaped
 
 from bux import parallel
 from bux.architecture import Model
@@ -130,16 +132,22 @@ def test_a_run_interleaved_trains_as_its_microbatches_in_a_row(losses, arch):
         assert np.allclose(both, loop, atol=1e-5)
 
 
-def test_a_repeat_of_passes_alike_holds_one_microbatch_of_residuals():
-    """The embedding and four passes alike: a forward's residuals go to the slot the
-    tick before read, and the passes take four slots, as one microbatch."""
-    embed = (((16, 32), jnp.dtype("int32")),)
-    layer = (((16, 64), jnp.dtype("float32")),)
-    slots = interleave.Slots([embed, *[layer] * 4], 3)
-    assert slots.sizes == [2, 4]
-    for before, after in zip(slots.table, slots.table[1:], strict=False):
-        assert after[1:].tolist() == before[1:][::-1].tolist()
-        assert after[0] != before[0]
+def test_a_step_runs_a_tick_for_each_piece_of_each_microbatch_but_the_first():
+    """The embedding, 3 blocks and the norm before the head: 5 ticks, each ending in
+    a barrier, for each of the 3 microbatches the loop runs forward."""
+    trainer = _trainer("blocks", 4, interleave=True)
+    assert len(interleave.pieces(trainer.model)) == 6  # and the head
+    graphdef, state = nnx.split(trainer.model)
+    batch = jax.tree.map(jnp.asarray, _documents())
+
+    def gradients(state: nnx.State) -> tuple:
+        return trainer.gradients(nnx.merge(graphdef, state), batch)
+
+    jaxpr = jax.make_jaxpr(gradients)(state).jaxpr
+    runs = [
+        n for e, n in equations(jaxpr) if e.primitive.name == "optimization_barrier"
+    ]
+    assert sum(runs) == 5 * 3
 
 
 def test_a_model_whose_pieces_pass_more_than_the_stream_is_an_error():
@@ -197,6 +205,6 @@ def _documents() -> Batch:
     return Batch(ids, positions, mask)
 
 
-def _others(model: Model) -> list[jax.Array]:
+def _others(model: Model) -> list[Shaped[Array, "..."]]:
     """The model's state but its parameters: buffers, the router's, RNG counts."""
     return jax.tree.leaves(nnx.state(model, nnx.Not(nnx.Param)))

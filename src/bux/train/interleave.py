@@ -7,7 +7,7 @@ the compute just before them, and what a layer's data flow leaves nothing beside
 exposed. Here the model is cut into pieces (``pieces``): the items of its graph, each
 pass of an unrolled repeat a piece of its own, the first taking the tokens and the
 last, the head, ending in the loss. A piece's forward is a ``jax.vjp``, whose
-residuals wait in a slot (``Slots``) until its backward:
+residuals the scan carries, each piece's its own leaves, to its backward:
 
     forward of microbatch 0
     a lax.scan, for i in 0 .. n-2:
@@ -15,13 +15,15 @@ residuals wait in a slot (``Slots``) until its backward:
         the head's loss of i+1, and its gradient
     backward of microbatch n-1
 
-Each tick ends in an optimization barrier on the stream and its gradient, so XLA's
-scheduler runs one half's collectives beside the other's compute, and no tick before
-its turn: the backward frees the top pieces' residuals as the forward fills the
-bottom ones, and a step holds about one microbatch's. The barrier also takes the
-gradients of the tick before, whose reduction then runs beside this tick, and which
-are the last to read the slot this tick's forward writes. Its program is about twice
-that of a step in a row: a forward and a backward on each side of the loop.
+Each tick ends in an optimization barrier on the stream, its gradient and the
+gradients of the tick before, so XLA's scheduler runs one half's collectives beside
+the other's compute, the gradients' reduction beside the next tick, and no tick before
+its turn: the backward frees the top pieces' residuals as the forward fills the bottom
+ones. A carried leaf is written where it was read, so the top half's residuals go in
+place, after the backward of the microbatch before read them; the bottom half's are
+made before the old ones are read, and XLA copies them in at the loop's end. Its
+program is about twice that of a step in a row: a forward and a backward on each side
+of the loop.
 """
 
 import functools
@@ -32,7 +34,7 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 from flax import nnx
-from jaxtyping import Array, Float, Int, Shaped
+from jaxtyping import Array, Float, Shaped
 
 from bux import jax_internals
 from bux.architecture import Model
@@ -49,8 +51,6 @@ from bux.train.data import Batch
 Leaf = Shaped[Array, "..."]
 Flat = dict[tuple, Leaf]  # a state's arrays, by their paths in the model's
 Metrics = dict[str, Float[Array, ""]]
-Buffers = list[list[Leaf]]  # for each kind of residuals, an array of slots of each
-Signature = tuple[tuple[tuple[int, ...], Any], ...]  # residuals' shapes and dtypes
 Vjp = Callable[..., Any]  # a jax.vjp function: a pytree of its residuals
 Call = Callable[[nnx.Module, Stream, Taps], Stream]
 
@@ -165,88 +165,6 @@ def _check(taps: Taps, head: bool) -> None:
         )
 
 
-# --- Where residuals wait --------------------------------------------------------------
-
-
-class Slots:
-    """Where each piece's residuals wait for its backward: a buffer for each kind of
-    residuals (those of pieces whose residuals have the same shapes and dtypes), of
-    as many slots as a step holds of them at once (`sizes`). A forward takes the slot
-    its kind freed last, before its tick, and the backward beside it frees its own: in
-    a repeat of passes alike, each forward's residuals go where the tick before read
-    the other microbatch's (`table`, microbatch m's piece p's slot), and a step holds
-    one microbatch's."""
-
-    def __init__(self, kinds: list[Signature], microbatches: int):
-        self.shapes = list(dict.fromkeys(kinds))
-        self.kind = [self.shapes.index(k) for k in kinds]
-        self.table, self.sizes = _assign(self.kind, len(self.shapes), microbatches)
-
-    def unwritten(self) -> Buffers:
-        """Return the buffers before the first microbatch: none yet."""
-        return [[] for _ in self.sizes]
-
-    def first(self, buffers: Buffers, p: int, leaves: list[Leaf]) -> Buffers:
-        """Return `buffers` with the first microbatch's piece `p`'s residuals,
-        `leaves`, in its slot. The first piece of a kind starts its kind's buffer, as
-        its residuals in every slot, so that XLA splits it over the mesh as it splits
-        them: an empty one it may keep whole on every device, as it did those of the
-        experts' kernels."""
-        k = self.kind[p]
-        if buffers[k] or not leaves:
-            return self.write(buffers, p, int(self.table[0, p]), leaves)
-        started = [jnp.broadcast_to(a, (self.sizes[k], *a.shape)) for a in leaves]
-        return [started if j == k else b for j, b in enumerate(buffers)]
-
-    def read(self, buffers: Buffers, p: int, slot: int | Int[Array, ""]) -> list[Leaf]:
-        """Return piece `p`'s residuals from `slot` of its kind's buffer."""
-        at = jax.lax.dynamic_index_in_dim
-        return [at(b, slot, keepdims=False) for b in buffers[self.kind[p]]]
-
-    def write(
-        self, buffers: Buffers, p: int, slot: int | Int[Array, ""], leaves: list[Leaf]
-    ) -> Buffers:
-        """Return `buffers` with piece `p`'s residuals, `leaves`, in `slot`."""
-        put, k = jax.lax.dynamic_update_index_in_dim, self.kind[p]
-        written = [put(b, a, slot, 0) for b, a in zip(buffers[k], leaves, strict=True)]
-        return [written if j == k else b for j, b in enumerate(buffers)]
-
-
-def _assign(
-    kind: list[int], kinds: int, microbatches: int
-) -> tuple[Int[np.ndarray, "n p"], list[int]]:
-    """Return the slot of each microbatch's pieces, and how many each kind takes, as
-    the ticks take and free them: at each, the forward takes the last its kind freed
-    before (or a new one), and then the backward beside it frees its own."""
-    free: list[list[int]] = [[] for _ in range(kinds)]
-    sizes = [0] * kinds
-
-    def take(k: int) -> int:
-        if free[k]:
-            return free[k].pop()
-        sizes[k] += 1
-        return sizes[k] - 1
-
-    p = len(kind)
-    table = np.zeros((microbatches, p), np.int32)
-    table[0] = [take(k) for k in kind]
-    for m in range(1, microbatches):
-        for t in range(p):
-            table[m, t] = take(kind[t])
-            free[kind[p - 1 - t]].append(int(table[m - 1, p - 1 - t]))
-    return table, sizes
-
-
-def _reads_and_writes(slots: Slots) -> tuple[Int[Array, "m p"], Int[Array, "m p"]]:
-    """Return the slots each step of the loop reads, the backward's microbatch's, and
-    writes, the forward's: microbatches 0 to n-2, and 1 to n-1."""
-    return jnp.asarray(slots.table[:-1]), jnp.asarray(slots.table[1:])
-
-
-def _leaves(vjp: Vjp) -> list[Leaf]:
-    return jax.tree.leaves(vjp)
-
-
 # --- The step --------------------------------------------------------------------------
 
 
@@ -274,13 +192,13 @@ class Forward(NamedTuple):
 
 class Held(NamedTuple):
     """What a step carries from microbatch to microbatch: the gradients summed so far,
-    the model's other state as the forwards leave it, the residuals' buffers, and the
+    the model's other state as the forwards leave it, each piece's residuals, and the
     loss's gradient with respect to the stream into the head, of the microbatch whose
     backward runs next."""
 
     grads: Flat
     rest: Flat
-    buffers: Buffers
+    residuals: list[list[Leaf]]
     dy: Stream
 
 
@@ -316,93 +234,61 @@ class Step:
         model's other state after the last forward. Microbatch i's terms of the
         objective weigh `shares[i]`."""
         self.params, n = params, shares.shape[0]
-        first = Rows.of(_at(micro, 0), shares[0])
-        slots = Slots(self._signatures(rest, first), n)
-        held, metrics = self._first(zeros, rest, first, slots)
+        held, metrics = self._first(zeros, rest, Rows.of(_at(micro, 0), shares[0]))
         if n > 1:
-            xs = (_after_first(micro), shares[1:], *_reads_and_writes(slots))
-            held, later = jax.lax.scan(lambda h, x: self._ticks(h, slots, *x), held, xs)
+            xs = (_after_first(micro), shares[1:])
+            held, later = jax.lax.scan(lambda h, x: self._ticks(h, *x), held, xs)
             metrics = jax.tree.map(
                 lambda a, b: jnp.concatenate([a[None], b]), metrics, later
             )
-        held = self._last(held, slots, slots.table[n - 1])
-        return held.grads, {k: v.sum() for k, v in metrics.items()}, held.rest
+        grads = self._last(held)
+        return grads, {k: v.sum() for k, v in metrics.items()}, held.rest
 
-    def _signatures(self, rest: Flat, rows: Rows) -> list[Signature]:
-        """Return the shapes of each piece's residuals on the first microbatch, traced
-        on their own (``jax.eval_shape``), for the slots before the first forward."""
-
-        def residuals() -> list[list[Leaf]]:
-            x, leaves = jnp.asarray(rows.batch.input_ids), []
-            with tracing.forward(self.main):
-                for p in range(len(self.pieces)):
-                    f = self._forward(p, rest, x, rows)
-                    x, leaves = f.y, [*leaves, _leaves(f.vjp)]
-            return leaves
-
-        shapes = jax.eval_shape(residuals)
-        return [tuple((a.shape, a.dtype) for a in piece) for piece in shapes]
-
-    def _first(
-        self, zeros: Flat, rest: Flat, rows: Rows, slots: Slots
-    ) -> tuple[Held, Metrics]:
-        """Run the first microbatch forward to its loss, each piece's residuals into
-        their slots before the next piece runs: else XLA may hold them all twice, as
-        made and in their slots."""
-        x, losses = jnp.asarray(rows.batch.input_ids), []
-        buffers, self.likes = slots.unwritten(), []
+    def _first(self, zeros: Flat, rest: Flat, rows: Rows) -> tuple[Held, Metrics]:
+        """Run the first microbatch forward to its loss."""
+        x, losses, residuals = jnp.asarray(rows.batch.input_ids), [], []
+        self.likes = []
         with tracing.forward(self.main):
             for p in range(len(self.pieces)):
                 f = self._forward(p, rest, x, rows)
-                buffers = slots.first(buffers, p, _leaves(f.vjp))
-                x, buffers = jax.lax.optimization_barrier((f.y, buffers))
-                rest, losses = f.rest, losses + f.losses
+                x, rest, losses = f.y, f.rest, losses + f.losses
+                residuals.append(_leaves(f.vjp))
                 self.likes.append(f.vjp)
             metrics, d_head, dy, rest = self._loss(rest, x, rows, losses)
-        return Held(_added(zeros, d_head), rest, buffers, dy), metrics
+        return Held(_added(zeros, d_head), rest, residuals, dy), metrics
 
     def _ticks(
-        self,
-        held: Held,
-        slots: Slots,
-        batch: Batch,
-        share: Float[Array, ""],
-        read: Int[Array, " p"],
-        write: Int[Array, " p"],
+        self, held: Held, batch: Batch, share: Float[Array, ""]
     ) -> tuple[Held, Metrics]:
         """Run the next microbatch, `batch`, forward to its loss, each piece's beside
-        the backward of a piece of the microbatch before, from the top: their
-        residuals in the slots `read`, and the new ones into those of `write`."""
-        rows, (grads, rest, buffers, dy) = Rows.of(batch, share), held
+        the backward of a piece of the microbatch before, from the top."""
+        rows, (grads, rest, old, dy) = Rows.of(batch, share), held
         x, losses, r = jnp.asarray(rows.batch.input_ids), [], len(self.pieces)
+        new: list[list[Leaf]] = []
         before: Flat = {}  # the tick before's gradients
         with tracing.forward(self.main):
             for t in range(r):
-                q = r - 1 - t
                 f = self._forward(t, rest, x, rows)
-                d_params, dx = self._backward(q, slots.read(buffers, q, read[q]), dy)
+                d_params, dx = self._backward(r - 1 - t, old[r - 1 - t], dy)
                 # The tick's end: the next starts once both halves are done, and the
-                # forward writes its slot once what read it last, the gradients of
-                # the tick before, is reduced too.
-                done = (f.y, dx, before, buffers)
-                x, dy, before, buffers = jax.lax.optimization_barrier(done)
-                buffers = slots.write(buffers, t, write[t], _leaves(f.vjp))
+                # gradients of the tick before are reduced beside this one.
+                done = (f.y, dx, before)
+                x, dy, before = jax.lax.optimization_barrier(done)
                 grads, before = _added(grads, before), d_params
                 rest, losses = f.rest, losses + f.losses
+                new.append(_leaves(f.vjp))
             metrics, d_head, dy, rest = self._loss(rest, x, rows, losses)
         grads = _added(_added(grads, before), d_head)
-        return Held(grads, rest, buffers, dy), metrics
+        return Held(grads, rest, new, dy), metrics
 
-    def _last(self, held: Held, slots: Slots, table: Int[np.ndarray, " p"]) -> Held:
-        """Take the last microbatch's gradient back through every piece but the head,
-        from its residuals in the slots of `table`, each piece's read once the piece
-        above is done: else XLA may copy them all out of their slots at once."""
-        grads, buffers, dy = held.grads, held.buffers, held.dy
+    def _last(self, held: Held) -> Flat:
+        """Take the last microbatch's gradient back through every piece but the head:
+        the step's gradients."""
+        grads, dy = held.grads, held.dy
         for q in reversed(range(len(self.pieces))):
-            d_params, dy = self._backward(q, slots.read(buffers, q, int(table[q])), dy)
+            d_params, dy = self._backward(q, held.residuals[q], dy)
             grads = _added(grads, d_params)
-            dy, buffers = jax.lax.optimization_barrier((dy, buffers))
-        return held._replace(grads=grads)
+        return grads
 
     # --- A piece's forward and backward, and the head's loss ---------------------------
 
@@ -487,9 +373,9 @@ class Step:
 
 def _unfused[**A, R](f: Callable[A, R]) -> Callable[A, R]:
     """Return `f`, keeping all but what elementwise ops make for its backward where
-    the run's remat keeps everything (``remat.unfused``), as a scanned pass does: a
-    slot holds whatever a piece's vjp keeps, where in a step in a row XLA fuses those
-    ops into the backward's that read them."""
+    the run's remat keeps everything (``remat.unfused``), as a scanned pass does: the
+    loop carries whatever a piece's vjp keeps, where in a step in a row XLA fuses
+    those ops into the backward's that read them."""
     if remat.policy() is not None:
         return f  # each branch inside is rematerialized by the run's policy
     return jax.checkpoint(f, policy=remat.unfused, prevent_cse=False)
@@ -505,6 +391,10 @@ def _added(total: Flat, part: Flat) -> Flat:
     """Return `total` with `part` added where it has arrays, in `total`'s dtypes, as
     ``gather.added`` adds a microbatch's gradients."""
     return total | {k: total[k] + v.astype(total[k].dtype) for k, v in part.items()}
+
+
+def _leaves(vjp: Vjp) -> list[Leaf]:
+    return jax.tree.leaves(vjp)
 
 
 def _at(micro: Batch, i: int) -> Batch:
