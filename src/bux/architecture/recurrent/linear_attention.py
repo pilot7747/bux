@@ -179,9 +179,10 @@ def recomputed[**A, R](
 ) -> Callable[A, R]:
     """Return `f`, or with `states = recompute` (by default the run's), `f` whose
     backward pass computes it again from its inputs, as fla's kernels do: of all it
-    computes, it keeps only each chunk's (I - L)^-1 (``chunkwise.INVERSE``), a
-    fourteenth of the memory the chunks' states and maps take, for one more forward
-    pass. Mamba's and Mamba-2's selective scan (``ssm``) takes it too."""
+    computes, it keeps only each chunk's (I - L)^-1 (``chunkwise.INVERSE``), for one
+    more forward pass. So the delta rule keeps a fourteenth of the memory its chunks'
+    states and maps take, and Mamba-2's selective scan (``ssm``), which has no
+    inverse, a sixteenth."""
     if (states or _states()) == "keep":
         return f
     keep = jax.checkpoint_policies.save_only_these_names(chunkwise.INVERSE)

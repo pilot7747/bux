@@ -765,8 +765,9 @@ with a folder of its own, twenty minutes before it timed out.
 and its kin in `baseline.bux`: `one_gpu.bux`, the dense model, its GDN, KDA, bounded
 KDA and Mamba-2 hybrids, its MoE, and the dense one in MXFP8 and NVFP4, a GPU each;
 `one_node.bux`, FSDP at 1 and 8 microbatches, the MoE sorted and by EP, TP=8 in
-chunks and a 1f1b pipeline, on 8 GPUs; and `two_nodes.bux`, FSDP, HSDP and the MoE
-both ways, on 16. `scripts/benchmark.py` trains a suite and compares two results:
+chunks and a 1f1b pipeline, on 8 GPUs; and `two_nodes.bux`, FSDP, HSDP, the GDN
+hybrid under HSDP and the MoE both ways, on 16. `scripts/benchmark.py` trains a suite
+and compares two results:
 
 ```
 python scripts/benchmark.py run examples/benchmarks/one_gpu.bux --out new.json
@@ -816,10 +817,11 @@ one_gpu[nvfp4]     182,654    183,500  +0.5%    56.4%     43.8     43.8    -0.00
 the last log. The node's suite, one tree after the other, moved by 0.3% at most: FSDP
 1.13M, at 8 microbatches 923k, the MoE sorted 832k and by EP 540k, TP 227k and the
 pipeline 683k; the two nodes' by 1.7%: FSDP and HSDP 2.21M, the MoE sorted 1.58M and
-by EP 1.04M. A run is `slower` or `faster` when its tokens a second move by more
-than `--noise` (3%), `more memory` or `less memory` when its peak does, `loss` when
-its last loss moves by more than `--loss` (0.05), and `failed`; `compare` exits with 1
-if any run is flagged but `faster` or `less memory`.
+by EP 1.04M (and the GDN hybrid, measured once, 1.60M). A run is `slower` or `faster`
+when its tokens a second move by more than `--noise` (3%), `more memory` or `less
+memory` when its peak does, `loss` when its last loss moves by more than `--loss`
+(0.05), and `failed`; `compare` exits with 1 if any run is flagged but `faster` or
+`less memory`.
 
 XLA's GEMM autotuner picks kernels by timing them, and some kernels add in no fixed
 order, so two runs of one tree round differently: on these random tokens the MoE,

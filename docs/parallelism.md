@@ -786,6 +786,22 @@ their scans on a GPU, whose fusions the CPU tests do not see (on a B300 one took
 Mamba-2's gradients for B and C wrong, which a plain matmul in its place does not),
 and the kernels against the chunks.
 
+GDN's kernel runs on each GPU of a mesh as on one, a node or two. Where it does not
+apply, as under `pass_state`, the chunks run instead. The GDN hybrid (`"DDDA"^4`) at 8
+rows of 4096 a GPU, on B300s, in tokens a second and the busiest GPU's peak:
+
+| GDN hybrid | by its kernel | by the chunks (`pass_state`) |
+|------------|---------------|------------------------------|
+| one GPU | 127.7k, 70.6 GiB | 95.4k, 112.7 GiB |
+| a node, `fsdp=8` | 815k, 58.4 GiB | 725k, 99.6 GiB |
+| two nodes, `fsdp=16` | 1.58M, 58.0 GiB | |
+| two nodes, `data=2, fsdp=8` | 1.60M, 58.4 GiB | 1.42M, 99.6 GiB |
+| two nodes, `data=2, fsdp=4, context=2` | | 1.03M, 124.4 GiB |
+
+Two nodes train at 97% (FSDP over 16) and 98% (HSDP) of a node's tokens a second a
+GPU. The kernel's losses are the chunks' to 0.002 on a node and 0.005 on two at the
+first log, and to 0.0002 at the last of 30 steps.
+
 Not yet: a `ppermute` chain instead of the all-gather, which holds every device's
 transitions (`c` matrices `k × k` per head) on each.
 
