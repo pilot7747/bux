@@ -48,6 +48,16 @@ def test_the_scales_lie_as_tensor_memory_takes_them():
     np.testing.assert_array_equal(got, scales)
 
 
+def test_padding_k_adds_zeros_to_whole_tiles():
+    values = jax.random.normal(jax.random.key(0), (3, 5, 704)).astype(E4M3)
+    padded = gm._whole_tiles_of_k(values)
+    assert padded.shape == (3, 5, 768) and padded.dtype == values.dtype
+    np.testing.assert_array_equal(
+        padded[..., :704].astype(jnp.float32), values.astype(jnp.float32)
+    )
+    assert (padded[..., 704:].astype(jnp.float32) == 0).all()
+
+
 def test_the_scales_pad_to_whole_tiles_with_zeros():
     tiles = gm.in_tensor_memory(jnp.ones((100, 22), jnp.uint8))
     assert tiles.shape == (1, 6, 32, 16)
@@ -55,10 +65,11 @@ def test_the_scales_pad_to_whole_tiles_with_zeros():
 
 
 def test_a_groups_edges_are_its_first_and_last_tiles_with_the_rest_as_zero():
-    values = jax.random.normal(jax.random.key(0), (16, M))
+    values = jax.random.normal(jax.random.key(0), (16, M)).astype(E4M3)
     ends = jnp.cumsum(SIZES)
     starts = ends - SIZES
-    edges = np.asarray(gm._edges(values, starts, ends))
+    edges = np.asarray(gm._edges(values, starts, ends).astype(jnp.float32))
+    values = values.astype(jnp.float32)
     for g, (lo, hi) in enumerate(zip(starts.tolist(), ends.tolist(), strict=True)):
         for e, at in enumerate([lo, max(hi - 1, lo)]):
             first = at // 128 * 128

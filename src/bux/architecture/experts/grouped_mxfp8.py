@@ -10,8 +10,8 @@ Both run a program on each SM, which takes tiles of the output one after another
     rows      128 rows that a group has rows in, by `Tiles.n` columns: a tile two
               groups share runs once for each, which stores its own rows
     contract  128 rows of dW[g] by `Tiles.n` columns, over the group's rows in tiles
-              of 128: the first and last, which it may share, from copies of them
-              with the other groups' rows as 0
+              of 128: a's first and last, which it may share, from copies of them
+              with the other groups' rows as 0, so that b's add nothing
 
 Three roles share each tile's steps along what it contracts (k):
 
@@ -33,9 +33,10 @@ from jax import lax
 from jax.experimental import pallas as pl
 from jax.experimental.pallas import mosaic_gpu as plgpu
 from jax.typing import DTypeLike
-from jaxtyping import Array, Bool, Float, Int, Shaped
+from jaxtyping import Array, Bool, Float, Int, Shaped, UInt32
 
 from bux import kernels
+from bux.architecture.precision import blockscaled
 from bux.architecture.precision.blockscaled import MX_BLOCK, Blocks
 
 E8M0 = jnp.float8_e8m0fnu
@@ -112,7 +113,9 @@ def tiles_of(sizes: Int[Array, " g"], m: int, tile: int) -> Int[Array, "t 3"]:
     count = jnp.where(sizes > 0, -(-ends // tile) - first, 0)
     before = jnp.cumsum(count) - count
     at = jnp.arange(-(-m // tile) + g - 1)
-    group = jnp.minimum(jnp.searchsorted(before + count, at, side="right"), g - 1)
+    # One comparison of each tile with each group: a scan would take a kernel a step.
+    group = jnp.searchsorted(before + count, at, side="right", method="compare_all")
+    group = jnp.minimum(group, g - 1)
     index = first[group] + at - before[group]
     lo = jnp.maximum(starts[group], index * tile)
     hi = jnp.minimum(ends[group], (index + 1) * tile)
@@ -134,10 +137,10 @@ def contract(
     assert m % tiles.k == 0, f"{m} rows are not whole tiles of {tiles.k}"
     ends = jnp.cumsum(sizes).astype(jnp.int32)
     starts = ends - sizes.astype(jnp.int32)
-    edges = (_edges(a.values, starts, ends), _edges(b.values, starts, ends))
+    edges = _edges(a.values, starts, ends)  # a's 0s make b's other rows add nothing
     scales = (in_tensor_memory(a.scales), in_tensor_memory(b.scales))
     kernel = _contract_kernel(d, f, g, jnp.dtype(out), tiles)
-    return kernel(a.values, b.values, *edges, *scales, starts, ends)
+    return kernel(a.values, b.values, edges, *scales, starts, ends)
 
 
 def in_tensor_memory(scales: Shaped[Array, "r c"]) -> Shaped[Array, "p q 32 16"]:
@@ -148,8 +151,9 @@ def in_tensor_memory(scales: Shaped[Array, "r c"]) -> Shaped[Array, "p q 32 16"]
     r, c = scales.shape
     p, q = -(-r // LANES), -(-c // SCALE_TILE)
     padded = jnp.pad(scales, ((0, p * LANES - r), (0, q * SCALE_TILE - c)))
-    tiles = padded.reshape(p, 4, 32, q, SCALE_TILE).transpose(0, 3, 2, 1, 4)
-    return tiles.reshape(p, q, 32, 16)
+    rows = _as_words(padded)  # a row's 4 scales of each tile of k, a word
+    tiles = rows.reshape(p, 4, 32, q).transpose(0, 3, 2, 1)
+    return _from_words(tiles, scales.dtype).reshape(p, q, 32, 16)
 
 
 def _matrices(
@@ -168,7 +172,11 @@ def _whole_tiles_of_k(values: Shaped[Array, "*r k"]) -> Shaped[Array, "*r q"]:
     """Return the values with k padded by 0 to whole tiles of 128, which TMA loads
     in swizzled rows of 128 bytes: 0 times whatever the padded scales say."""
     pad = -values.shape[-1] % LANES
-    return jnp.pad(values, [(0, 0)] * (values.ndim - 1) + [(0, pad)]) if pad else values
+    if not pad:
+        return values
+    words = _as_words(values)
+    padded = jnp.pad(words, [(0, 0)] * (words.ndim - 1) + [(0, pad // 4)])
+    return _from_words(padded, values.dtype)
 
 
 def _matrix_scales(
@@ -188,16 +196,35 @@ def _edges(
 ) -> Shaped[Array, "g 2 r 128"]:
     """Return, for each group, the tiles of 128 of m its rows [start, end) begin
     and end in, the rows outside them as 0."""
+    words = _as_words(values)
 
     def edge(at: Int[Array, ""], start: Int[Array, ""], end: Int[Array, ""]) -> Any:
         first = at // LANES * LANES
-        tile = lax.dynamic_slice_in_dim(values, first, LANES, axis=1)
+        tile = lax.dynamic_slice_in_dim(words, first // 4, LANES // 4, axis=1)
         m = first + jnp.arange(LANES)
-        return jnp.where((m >= start) & (m < end), tile, jnp.zeros((), tile.dtype))
+        mine = jnp.where((m >= start) & (m < end), 0xFF, 0).astype(jnp.uint8)
+        return tile & _as_words(mine[None])[0]
 
     begin = jax.vmap(edge)(starts, starts, ends)
     finish = jax.vmap(edge)(jnp.maximum(ends - 1, starts), starts, ends)
-    return jnp.stack([begin, finish], 1)
+    return _from_words(jnp.stack([begin, finish], 1), values.dtype)
+
+
+def _as_words(values: Shaped[Array, "*r c"]) -> UInt32[Array, "*r w"]:
+    """Return a format's bytes, E4M3 values or E8M0 scales, 4 of a row a 32-bit word:
+    XLA copies, pads and transposes words several times as fast as bytes."""
+    *rows, c = values.shape
+    quads = blockscaled.as_bytes(values).reshape(*rows, c // 4, 4)
+    return lax.bitcast_convert_type(quads, jnp.uint32)
+
+
+def _from_words(
+    words: UInt32[Array, "*r w"], dtype: DTypeLike
+) -> Shaped[Array, "*r c"]:
+    """Return the bytes of `_as_words`' words, as `dtype`."""
+    *rows, w = words.shape
+    quads = lax.bitcast_convert_type(words, jnp.uint8).reshape(*rows, w * 4)
+    return lax.bitcast_convert_type(quads, dtype)
 
 
 # --- The kernels ---------------------------------------------------------------------
@@ -311,12 +338,12 @@ def _rows_kernel(
 @functools.cache
 def _contract_kernel(d: int, f: int, groups: int, out: jnp.dtype, tiles: Tiles) -> Any:
     """Return the kernel of `contract` for these shapes: a jax function of a's and
-    b's values, their edges, their scales, and where each group's rows start and
+    b's values, a's edges, their scales, and where each group's rows start and
     end."""
     row_tiles, columns = -(-d // tiles.height), -(-f // tiles.n)
 
     def body(*refs: Any) -> None:
-        a, b, a_edges, b_edges, a_scales, b_scales, starts, ends, y, *scratch = refs
+        a, b, edges, a_scales, b_scales, starts, ends, y, *scratch = refs
 
         def place(index: Int[Array, ""]) -> _Place:
             group = lax.div(index, row_tiles * columns)
@@ -330,8 +357,7 @@ def _contract_kernel(d: int, f: int, groups: int, out: jnp.dtype, tiles: Tiles) 
             _load_contract,
             a=a,
             b=b,
-            a_edges=a_edges,
-            b_edges=b_edges,
+            edges=edges,
             a_scales=a_scales,
             b_scales=b_scales,
         )
@@ -510,31 +536,29 @@ def _load_contract(
     buffers: _Buffers,
     a: Any,
     b: Any,
-    a_edges: Any,
-    b_edges: Any,
+    edges: Any,
     a_scales: Any,
     b_scales: Any,
 ) -> None:
     """Copy step i of a tile of `contract`: its rows of a and b in the group's
-    i-th tile of m (the first and last from their edges, the other groups' rows
-    as 0), and their scales."""
+    i-th tile of m (a's first and last from its edges, the other groups' rows as
+    0), and their scales."""
     t = tile.tiles
     rows, columns, row_tiles, column_tiles = _spans(tile)
     k_tile = tile.start // LANES + i
+    ks = pl.ds(k_tile * LANES, LANES)
     inside = (i > 0) & (i < tile.steps - 1)
     which = jnp.where(i == 0, 0, 1)
 
     @pl.when(inside)
     def _() -> None:
-        ks = pl.ds(k_tile * LANES, LANES)
         _copy(a.at[rows, ks], buffers.a, slot, buffers, t)
-        _copy(b.at[columns, ks], buffers.b, slot, buffers, t)
 
     @pl.when((i == 0) | (i == tile.steps - 1))
     def _() -> None:
-        _copy(a_edges.at[tile.group, which, rows], buffers.a, slot, buffers, t)
-        _copy(b_edges.at[tile.group, which, columns], buffers.b, slot, buffers, t)
+        _copy(edges.at[tile.group, which, rows], buffers.a, slot, buffers, t)
 
+    _copy(b.at[columns, ks], buffers.b, slot, buffers, t)
     k_tiles = pl.ds(k_tile, 1)
     _copy(a_scales.at[row_tiles, k_tiles], buffers.a_scales, slot, buffers, t)
     _copy(
