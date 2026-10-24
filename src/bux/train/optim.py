@@ -322,10 +322,12 @@ def orthogonalized(
         leaves, tree = jax.tree_util.tree_flatten_with_path(updates)
         keys = [_keys(path) for path, _ in leaves]
         shardings = shardings_by_path(model_params)
+        states = shardings_by_path(model_params, as_state=True)
         orthogonal = parallel.method("orthogonalize")(
             [x.astype(dtype) for _, x in leaves],
             [dims[k] for k in keys],
             None if shardings is None else [shardings[k] for k in keys],
+            None if states is None else [states[k] for k in keys],
             run,
         )
         cast = [y.astype(x.dtype) for y, (_, x) in zip(orthogonal, leaves, strict=True)]
@@ -378,19 +380,34 @@ def _(steps: int, safety: float = 1.01) -> Float[Array, "steps 3"]:
     )
 
 
-def shardings_by_path(params: nnx.State) -> dict[tuple, NamedSharding] | None:
+def shardings_by_path(
+    params: nnx.State, as_state: bool = False
+) -> dict[tuple, NamedSharding] | None:
     """Return the sharding of each of `params` by path under ``parallel.use``, or None
-    outside it."""
+    outside it; with `as_state`, that of the optimizer's state of each, which FSDP
+    splits under ``layout(zero=1)`` too."""
     if parallel.active() is None:
         return None
+    if as_state:
+        params = jax.tree.map(_as_state, params, is_leaf=_is_variable)
     found = jax.tree_util.tree_leaves_with_path(parallel.shardings(params))
     return {_keys(path): s for path, s in found}
 
 
+def _as_state(param: nnx.Variable) -> nnx.OptState:
+    """The optimizer's state of `param`, which takes its names."""
+    return nnx.OptState(param.get_value(), **param.get_metadata())
+
+
+def _is_variable(x: object) -> bool:
+    return isinstance(x, nnx.Variable)
+
+
 # --- How Muon reaches whole matrices: methods.orthogonalize ----------------------------
 # A method takes every update Muon orthogonalizes in a step, the dimension numbers of
-# each, the sharding of each one's parameter (None outside parallel.use), and the
-# Newton-Schulz to run; it returns the updates orthogonalized.
+# each, the sharding of each one's parameter and of its optimizer state, where the
+# update comes from (None outside parallel.use), and the Newton-Schulz to run; it
+# returns the updates orthogonalized.
 
 
 @methods.orthogonalize.register("gspmd")
@@ -398,6 +415,7 @@ def gspmd(
     updates: list[Float[Array, "*_"]],
     dims: list[MuonDimensionNumbers],
     shardings: list[NamedSharding] | None,
+    states: list[NamedSharding] | None,
     newton_schulz: NewtonSchulz,
 ) -> list[Float[Array, "*_"]]:
     """Run Newton-Schulz on whatever shards the compiler gives each update, where a
@@ -410,6 +428,7 @@ def gather(
     updates: list[Float[Array, "*_"]],
     dims: list[MuonDimensionNumbers],
     shardings: list[NamedSharding] | None,
+    states: list[NamedSharding] | None,
     newton_schulz: NewtonSchulz,
 ) -> list[Float[Array, "*_"]]:
     """Gather each update whole for Newton-Schulz, a stack matrix by matrix
@@ -417,7 +436,7 @@ def gather(
     matrix instead of the all-reduces, with the work repeated on each device that
     holds the matrix."""
     if shardings is None:
-        return gspmd(updates, dims, shardings, newton_schulz)
+        return gspmd(updates, dims, shardings, states, newton_schulz)
     return [
         _orthogonalize_gathered(x, d, s, newton_schulz)
         for x, d, s in zip(updates, dims, shardings, strict=True)
@@ -480,6 +499,7 @@ def owner(
     updates: list[Float[Array, "*_"]],
     dims: list[MuonDimensionNumbers],
     shardings: list[NamedSharding] | None,
+    states: list[NamedSharding] | None,
     newton_schulz: NewtonSchulz,
 ) -> list[Float[Array, "*_"]]:
     """Orthogonalize each matrix, a stack's one by one, whole on one device: its owner.
@@ -488,12 +508,14 @@ def owner(
     parameters' shards by another all-to-all, and an all-gather over the axes that
     copy them.
 
-    Under ``layout(zero=1)`` an update comes split as the optimizer's state is, by
-    FSDP too, and its matrices go back whole along the side FSDP split."""
-    if shardings is None:
-        return gspmd(updates, dims, shardings, newton_schulz)
+    An update comes split as the optimizer's state is (`states`), under
+    ``layout(zero=1)`` by FSDP too, and its matrices go back whole along what FSDP
+    split: a side, or a stack's experts, each device's of which it orthogonalizes as
+    they are, whole."""
+    if shardings is None or states is None:
+        return gspmd(updates, dims, shardings, states, newton_schulz)
     mesh, outs = shardings[0].mesh, [s.spec for s in shardings]
-    ins = [_state_spec(s, x.shape, d, mesh) for x, d, s in zip(updates, dims, outs)]
+    ins = [s.spec for s in states]
     plans = [
         _plan(x.shape, d, i, o, mesh) for x, d, i, o in zip(updates, dims, ins, outs)
     ]
@@ -509,32 +531,12 @@ def owner(
     )
 
 
-def _state_spec(
-    spec: P,
-    shape: tuple[int, ...],
-    dims: MuonDimensionNumbers,
-    mesh: Mesh | AbstractMesh,
-) -> P:
-    """Return where the optimizer keeps the update of a parameter of `spec`: on its
-    shards, and if FSDP does not split it (zero=1), split by FSDP too, on the longest
-    whole side of its matrices that FSDP divides, as bux.parallel.place splits it."""
-    axes = _splits(spec, len(shape))
-    n = mesh.shape["fsdp"]
-    if n == 1 or any("fsdp" in a for a in axes):
-        return spec
-    sides = sorted(_matrix_axes(dims, len(shape)))
-    whole = [i for i in sides if not axes[i] and shape[i] % n == 0]
-    if not whole:
-        return spec
-    axes[max(whole, key=lambda i: shape[i])] = ("fsdp",)
-    return partition(axes)
-
-
 class Owned(typing.NamedTuple):
     """How a device's shard of an update is a stack of matrix shards: its dimensions
     in `order` (the stacked ones, then each matrix's shorter side and its longer), the
     mesh axes that split each side, those the update is copied over, and those that
-    the update splits but its parameter does not (FSDP's under zero=1)."""
+    the update splits but its parameter does not (FSDP's under zero=1); and the
+    stacked dimensions those split, which the results gather whole."""
 
     order: tuple[int, ...]
     shape: tuple[int, int]  # a matrix's, whole
@@ -542,7 +544,8 @@ class Owned(typing.NamedTuple):
     cols: Split
     copies: Split
     state_only: Split
-    out_shape: tuple[int, ...]  # the parameter's shard
+    back_shape: tuple[int, ...]  # the shard the results come back as
+    gathers: tuple[tuple[int, Split], ...]  # a stacked dimension, the axes to gather
 
 
 def _plan(
@@ -559,16 +562,19 @@ def _plan(
         r, o = o, r
     splits, kept = _splits(spec, len(shape)), _splits(out, len(shape))
     used, sizes = {a for s in splits for a in s}, mesh.shape
+    stacked = [i for i in range(len(shape)) if i not in (r, o)]
+    back = [splits[i] if i in stacked else kept[i] for i in range(len(shape))]
     return Owned(
-        order=(*(i for i in range(len(shape)) if i not in (r, o)), r, o),
+        order=(*stacked, r, o),
         shape=(shape[r], shape[o]),
         rows=splits[r],
         cols=splits[o],
         copies=tuple(a for a, n in sizes.items() if n > 1 and a not in used),
         state_only=tuple(a for a in sizes if a in used - {a for k in kept for a in k}),
-        out_shape=tuple(
-            n // math.prod(sizes[a] for a in k) for n, k in zip(shape, kept)
+        back_shape=tuple(
+            n // math.prod(sizes[a] for a in k) for n, k in zip(shape, back)
         ),
+        gathers=tuple((i, splits[i]) for i in stacked if splits[i] and not kept[i]),
     )
 
 
@@ -608,8 +614,13 @@ def _as_stack(x: Float[Array, "*s"], p: Owned) -> Float[Array, "b m n"]:
 
 
 def _from_stack(x: Float[Array, "b m n"], p: Owned) -> Float[Array, "*s"]:
-    x = x.reshape(tuple(p.out_shape[i] for i in p.order))
-    return x.transpose(np.argsort(p.order))
+    """`_as_stack` undone, onto the parameter's shard: each stacked dimension that only
+    the optimizer's state splits gathered whole."""
+    x = x.reshape(tuple(p.back_shape[i] for i in p.order))
+    x = x.transpose(np.argsort(p.order))
+    for dim, split in p.gathers:
+        x = jax.lax.all_gather(x, split, axis=dim, tiled=True, to="invarying")
+    return x
 
 
 def _to_owners(x: Float[Array, "b m n"], p: Owned) -> Float[Array, "c M N"]:
