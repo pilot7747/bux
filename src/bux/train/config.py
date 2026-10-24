@@ -340,7 +340,8 @@ class RolesConfig(Config):
     kv: str | None = None  # attention's keys and values
     o: str | None = None  # attention's output projection
     mlp: str | None = None  # MLPs, the shared experts' too
-    # The routed experts: one of GROUPED; none is compute, not `matmuls`.
+    # The routed experts: one of GROUPED; none is `matmuls` where a grouped GEMM
+    # multiplies in it, MXFP8's, else compute (``PrecisionConfig.experts``).
     experts: Annotated[str | None, AfterValidator(_grouped)] = None
     latent: str | None = None  # LatentMoE's projections to and from its latent
     recurrence: str | None = None  # the recurrent mixers' projections, but the output
@@ -388,6 +389,13 @@ class PrecisionConfig(Config):
     # What the MoE's exchanges send tokens to their experts in: compute, or MXFP8
     # (DeepSeek-V3's FP8 dispatch); what comes back, and gradients, go in compute.
     dispatch: Literal["compute", "mxfp8"] = "compute"
+
+    def experts(self) -> str | None:
+        """Return the format the routed experts multiply in: `roles.experts`, or where
+        it is none, `matmuls` if a grouped GEMM multiplies in it; none is compute."""
+        if self.roles.experts is None and self.matmuls in GROUPED:
+            return None if self.matmuls == "compute" else self.matmuls
+        return self.roles.experts
 
 
 # --- Parallelism -----------------------------------------------------------------------
