@@ -2,6 +2,8 @@
 which NCCL EP needs. scripts/gpu_smoke/experts.py runs the rest."""
 
 import functools
+import re
+from types import SimpleNamespace
 
 import jax
 import jax.numpy as jnp
@@ -33,9 +35,12 @@ def _run(dispatch: str = "compute"):
     return compile_runs(SOURCE.format(dispatch=more))[0]
 
 
-def _use(sizes: dict[str, int]):
+def _use(sizes: dict[str, int], chunks: int = 1, stream: bool = False):
     mesh = tcfg.MeshConfig.model_validate(sizes)
-    return parallel.use(mesh, methods=tcfg.MethodsConfig(moe="nccl_ep", capacity=1.25))
+    how = tcfg.MethodsConfig(
+        moe="nccl_ep", capacity=1.25, moe_chunks=chunks, moe_stream=stream
+    )
+    return parallel.use(mesh, methods=how)
 
 
 def test_a_run_by_it_starts_it_before_its_step_traces():
@@ -66,6 +71,47 @@ def test_a_device_sends_its_share_of_a_steps_tokens():
         assert nccl_ep._tokens_a_device(_run(), ("expert",)) == 8 * 16 // 8
 
 
+def test_in_chunks_a_device_sends_a_chunk_of_its_share_at_once():
+    with _use({"data": 2, "expert": 4}, chunks=4):
+        assert nccl_ep._tokens_a_device(_run(), ("expert",)) == 8 * 16 // 8 // 4
+    with _use({"data": 2, "expert": 4}, chunks=3):  # 3 cuts 16 tokens in 1
+        assert nccl_ep._tokens_a_device(_run(), ("expert",)) == 8 * 16 // 8
+
+
+def _primitive(bind):
+    return SimpleNamespace(inner_primitive=SimpleNamespace(bind=bind))
+
+
+@pytest.mark.parametrize("stream", [False, True])
+def test_under_moe_stream_tes_primitives_run_on_nccl_eps_stream(stream):
+    bound = jax.jit(lambda x: nccl_ep._bind(_primitive(lambda x: 2 * x), x))
+    with _use({"data": 2, "expert": 4}, stream=stream):
+        lowered = bound.lower(jnp.ones(3)).as_text()
+        assert (bound(jnp.ones(3)) == 2).all()
+    assert ('_xla_stream_annotation = "1"' in lowered) == stream
+
+
+def test_a_dispatch_prepares_and_sends_in_one_call_on_nccl_eps_stream(monkeypatch):
+    def prepared(idx, **_):
+        sizes, total = jnp.ones((1, 2), jnp.int32), jnp.ones((1, 1), jnp.int32)
+        return sizes, total, jnp.ones((1, 4), jnp.uint8)
+
+    def sent(handle, idx, x, weights, *, recv_capacity_per_rank, **_):
+        rows = recv_capacity_per_rank
+        return jnp.zeros((1, rows, x.shape[-1])), jnp.zeros((1, rows))
+
+    te = SimpleNamespace(
+        EpPreparePrimitive=_primitive(prepared), EpDispatchPrimitive=_primitive(sent)
+    )
+    monkeypatch.setattr(nccl_ep, "transformer_engine", lambda: te)
+    dispatched = jax.jit(lambda *a: nccl_ep._dispatched(16, 4, 2, *a))
+    x, idx, w = jnp.ones((4, 8)), jnp.zeros((4, 2), jnp.int32), jnp.ones((4, 2))
+    with _use({"data": 2, "expert": 4}, stream=True):
+        lowered = dispatched.lower(x, idx, w).as_text()
+        assert dispatched(x, idx, w).rows.shape == (16, 8)
+    assert len(re.findall(r"call @\S+ .*_xla_stream_annotation", lowered)) == 1
+
+
 def test_the_rows_that_hold_picks_are_each_experts_first():
     sizes, picks = jnp.array([128, 256]), jnp.array([100, 130])
     held = nccl_ep._picks_in(sizes, picks, 512)
@@ -83,6 +129,7 @@ def test_nccl_eps_settings_default_and_give_way():
 # --- A token's path, by an emulation of TE's primitives that XLA:CPU runs ----------
 
 ALIGNED = 4  # TE's 128, for a few tokens
+ROWS = 128  # each dispatch's, as NCCL EP was started: more than a device below takes
 RAGGED = "ragged_by_all_to_all"  # ragged_all_to_all, through an exchange XLA:CPU runs
 EP = ("expert",)  # the experts' axis on the meshes below
 
@@ -135,7 +182,8 @@ def emulated(monkeypatch):
     monkeypatch.setattr(nccl_ep, "_dispatched", _emulated_dispatch)
     monkeypatch.setattr(nccl_ep, "_combined", _emulated_combine)
     monkeypatch.setattr(nccl_ep, "ALIGNED", ALIGNED)
-    monkeypatch.setattr(nccl_ep, "started", (0, 0, 0, 0, 0))
+    started = nccl_ep.Started(8, 2, 8, test_experts.D, ROWS)
+    monkeypatch.setattr(nccl_ep, "started", started)
     ragged = functools.partial(
         experts.ragged_all_to_all, exchange=test_experts.emulated
     )
@@ -149,6 +197,13 @@ def test_a_tokens_path_computes_what_sorted_does_with_the_same_gradients(
 ):
     one = test_experts._outputs("sorted", "one device", option)
     test_experts.assert_close(test_experts._outputs("nccl_ep", mesh, option), one)
+
+
+def test_in_chunks_a_tokens_path_computes_what_sorted_does(emulated):
+    one = test_experts._outputs("sorted", "one device", "latent, expert norm")
+    mesh = "data=2, expert=4"
+    chunked = test_experts._outputs("nccl_ep", mesh, "latent, expert norm", chunks=2)
+    test_experts.assert_close(chunked, one)
 
 
 @pytest.mark.parametrize("capacity", [0.5, 1.0])

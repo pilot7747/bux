@@ -149,7 +149,7 @@ def in_chunks(body: Body, chunks: int) -> Body:
         kernels: Kernels,
         **settings: object,
     ) -> Combined:
-        parts = math.gcd(chunks, z.shape[0] * z.shape[1])
+        parts = _parts(chunks, z.shape[0] * z.shape[1])
         slices = zip(*(_sliced(x, parts) for x in (z, idx, weights)), strict=True)
         wide = _in_float32(kernels)  # each slice adds its part of their gradients
         made = [body(*s, wide, **settings) for s in slices]
@@ -157,6 +157,18 @@ def in_chunks(body: Body, chunks: int) -> Body:
         return y, jnp.mean(jnp.stack([dropped for _, dropped in made]))
 
     return run
+
+
+def _parts(chunks: int, tokens: int) -> int:
+    """Return how many slices ``in_chunks`` cuts a device's `tokens` into: `chunks`,
+    or as many as divide them."""
+    return math.gcd(chunks, tokens)
+
+
+def chunk_of(tokens: int) -> int:
+    """Return the tokens of each slice of a device's `tokens` in the run's
+    `methods.moe_chunks` (``in_chunks``)."""
+    return tokens // _parts(_chunks(), tokens)
 
 
 def _sliced(x: Shaped[Array, "b t e"], parts: int) -> list[Shaped[Array, "1 m e"]]:
