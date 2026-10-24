@@ -11,13 +11,17 @@ defines its signature, and registers its default next to the layer that calls it
 """
 
 from collections.abc import Callable
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 from bux.parallel.mesh import active
 from bux.train.config import MethodsConfig
 from bux.train.registry import Registry
 
+if TYPE_CHECKING:
+    from bux.lang import ir
+
 Method = Callable[..., Any]
+Preparation = Callable[["ir.Run"], None]
 
 
 def _registry(kind: str) -> Registry[Any]:
@@ -45,6 +49,33 @@ REGISTRIES = {
     "loss": loss,
     "tensor": tensor,
 }
+
+
+# What a method needs done before a run's step traces, by (kind, name): as NCCL EP's
+# buffers, which live outside the program, sized for the run.
+PREPARATIONS: dict[tuple[str, str], Preparation] = {}
+
+
+def before(kind: str, name: str) -> Callable[[Preparation], Preparation]:
+    """Register `prepare(run)`, which ``prepare`` calls for a run whose method of
+    `kind` is `name`."""
+
+    def register(prepare: Preparation) -> Preparation:
+        PREPARATIONS[kind, name] = prepare
+        return prepare
+
+    return register
+
+
+def prepare(run: "ir.Run") -> None:
+    """Do what the methods in force need done before `run`'s step traces
+    (``before``). Call it inside ``use``."""
+    on = active()
+    config = on.methods if on else MethodsConfig()
+    for kind in REGISTRIES:
+        name = getattr(config, kind)
+        if isinstance(name, str) and (preparation := PREPARATIONS.get((kind, name))):
+            preparation(run)
 
 
 def method(kind: str) -> Method:
