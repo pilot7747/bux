@@ -45,9 +45,9 @@ def _sizes(per_node: int = 8, nodes: int = 2, **axes: int) -> dict[str, int]:
     return parallel.sizes(tcfg.MeshConfig.model_validate(axes), per_node * nodes)
 
 
-def _split(**axes: int) -> list[dict[str, int]]:
+def _split(nodes: int = 2, **axes: int) -> list[dict[str, int]]:
     """What a node of 8 holds of `axes`, and what spans nodes: the axes above 1."""
-    halves = split(_sizes(**axes), per_node=8)
+    halves = split(_sizes(nodes=nodes, **axes), per_node=8)
     return [{a: n for a, n in half.items() if n > 1} for half in halves]
 
 
@@ -75,6 +75,12 @@ def test_a_node_fills_from_tensor_outward_and_the_outer_axes_span_nodes():
     assert _split(data=2, fsdp=4, tensor=2) == [{"fsdp": 4, "tensor": 2}, {"data": 2}]
     assert _split(stage=2, fsdp=2, tensor=4) == [{"fsdp": 2, "tensor": 4}, {"stage": 2}]
     assert _split(fsdp=4, expert=4) == [{"fsdp": 2, "expert": 4}, {"fsdp": 2}]
+    # The four-node suite's meshes, and the eight nodes' pipeline
+    assert _split(4, fsdp=32) == [{"fsdp": 8}, {"fsdp": 4}]
+    assert _split(4, data=4, fsdp=8) == [{"fsdp": 8}, {"data": 4}]
+    assert _split(4, data=4, expert=8) == [{"expert": 8}, {"data": 4}]
+    assert _split(4, stage=4, fsdp=8) == [{"fsdp": 8}, {"stage": 4}]
+    assert _split(8, stage=4, data=2, fsdp=8) == [{"fsdp": 8}, {"stage": 4, "data": 2}]
 
 
 def test_axes_that_do_not_fill_nodes_from_tensor_outward_are_an_error():
