@@ -161,7 +161,7 @@ def recurrence(
     family = "the generalized delta rule" if rank_one else "decayed linear attention"
     ab = (a,) if rank_one and b is k else (a, b) if rank_one else ()
     xs = (q, k, v, log_decay, _continues(k, docs), *ab)
-    mix = recomputed(functools.partial(_mixed, family), _states())
+    mix = recomputed(functools.partial(_mixed, family))
     return remat.named("recurrence", mix, *xs).astype(v.dtype)
 
 
@@ -174,12 +174,15 @@ def _states() -> States:
     return on.methods.states if on else "keep"
 
 
-def recomputed[**A, R](f: Callable[A, R], states: States) -> Callable[A, R]:
-    """Return `f`, or with `states = recompute`, `f` whose backward pass computes it
-    again from its inputs, as fla's kernels do: of all it computes, it keeps only
-    each chunk's (I - L)^-1 (``chunkwise.INVERSE``), a fourteenth of the memory the
-    chunks' states and maps take, for one more forward pass."""
-    if states == "keep":
+def recomputed[**A, R](
+    f: Callable[A, R], states: States | None = None
+) -> Callable[A, R]:
+    """Return `f`, or with `states = recompute` (by default the run's), `f` whose
+    backward pass computes it again from its inputs, as fla's kernels do: of all it
+    computes, it keeps only each chunk's (I - L)^-1 (``chunkwise.INVERSE``), a
+    fourteenth of the memory the chunks' states and maps take, for one more forward
+    pass. Mamba's and Mamba-2's selective scan (``ssm``) takes it too."""
+    if (states or _states()) == "keep":
         return f
     keep = jax.checkpoint_policies.save_only_these_names(chunkwise.INVERSE)
     return jax.checkpoint(f, policy=keep)
@@ -258,7 +261,7 @@ def _chunked(
         return _mixed("the generalized delta rule", q, step, v, log_decay, continues, a)
 
     xs = (q, k, v, log_decay, beta, _continues(k, docs))
-    mix = recomputed(rule, states or _states())
+    mix = recomputed(rule, states)
     return remat.named("recurrence", mix, *xs).astype(v.dtype)
 
 
