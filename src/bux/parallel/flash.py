@@ -8,10 +8,13 @@ recomputes P = exp(s - lse). So blocks merge by their logsumexps (`merge`), and 
 folds into one (`attend`).
 
 `TOKAMAX` is tokamax's Mosaic kernels, on GPUs; `JNP` the same in jnp, all t by s
-logits at once, which a CPU runs and the tests check the rest by. `cudnn` is cuDNN's
-fused attention through jax, for whole rows: no softcap, no sinks, no logsumexp.
+logits at once, which a CPU runs and the tests check the rest by. `CUDNN` is cuDNN's
+causal kernels, for whole rows of one document. `cudnn` is cuDNN's fused attention
+through jax in its packed layout, for rows of documents: no softcap, no sinks, no
+logsumexp.
 """
 
+import os
 from collections.abc import Callable
 from functools import cache, partial
 from typing import NamedTuple
@@ -426,3 +429,62 @@ def packed_documents(
 def documents_in(ids: Int[Array, "b t"]) -> Int[Array, ""]:
     """Return the most documents a row of `ids` has."""
     return (1 + (ids[:, 1:] != ids[:, :-1]).sum(1)).max()
+
+
+# --- cuDNN's causal kernels ---------------------------------------------------------
+
+
+def cudnn_kernel_takes(
+    q: Float[Array, "b t h dk"],
+    k: Float[Array, "b t g dk"],
+    v: Float[Array, "b t g dv"],
+    keys: Keys,
+    cap: float | None,
+) -> bool:
+    """Whether `CUDNN` takes the call: whole causal rows (no first or last keys),
+    which cuDNN takes (`cudnn_takes`)."""
+    return keys == Keys(True) and cudnn_takes(q, k, v, cap, None)
+
+
+def _cudnn_forward(
+    q: Float[Array, "b t h dk"],
+    k: Float[Array, "b t g dk"],
+    v: Float[Array, "b t g dv"],
+    keys: Keys,
+    scale: float,
+    cap: float | None,
+) -> Output:
+    return jax_internals.cudnn_attention_and_lse(q, k, v, scale)
+
+
+def _cudnn_backward(
+    q: Float[Array, "b t h dk"],
+    k: Float[Array, "b t g dk"],
+    v: Float[Array, "b t g dv"],
+    out: Float[Array, "b t h dv"],
+    dout: Float[Array, "b t h dv"],
+    lse: Float[Array, "b h t"],
+    keys: Keys,
+    scale: float,
+    cap: float | None,
+) -> Grads:
+    """cuDNN's backward, or tokamax's where XLA_FLAGS asks for deterministic ops, for
+    which XLA builds cuDNN's attention backward no graph on a B300 ("No serialized
+    cuDNN graph")."""
+    if deterministic() and tokamax_runs():
+        return _tokamax_backward(q, k, v, out, dout, lse, keys, scale, cap)
+    return jax_internals.cudnn_attention_backward(q, k, v, out, dout, lse, scale)
+
+
+DETERMINISTIC = ("--xla_gpu_deterministic_ops=true", "--xla_gpu_deterministic_ops")
+
+
+def deterministic() -> bool:
+    """Whether XLA_FLAGS asks XLA for deterministic ops."""
+    flags = os.environ.get("XLA_FLAGS", "").split()
+    return any(f in flags for f in DETERMINISTIC)
+
+
+# cuDNN's causal kernels, with bux's VJP: without the room for documents of its
+# packed layout, which takes jax's call of it 8 GiB in rows of 8 x 4096 of 32 heads.
+CUDNN = Kernel(_cudnn_forward, _cudnn_backward)

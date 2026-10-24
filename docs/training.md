@@ -197,7 +197,7 @@ Four settings choose which projections, and when:
   | `experts` | the routed experts, by a grouped GEMM: `compute`, `mxfp8` or `mxfp8_2d`; `none` is `matmuls` where it is one of those, else compute, as no grouped GEMM takes `nvfp4`. In MXFP8 they train 10-15% faster than in bfloat16 on B300s (docs/parallelism.md) |
 
   The embedding, the head, the router and softmax attention's own matmuls always
-  stay in compute.
+  stay in compute ([why attention does](#softmax-attention-in-fp8)).
 - `first` and `last` keep that many residual branches outside any other, at the
   start and at the end of the model before its first head, in compute: a number, or
   a share of them, rounded up (`last=0.15`). A branch is a `[...]` inside no other,
@@ -267,6 +267,34 @@ capacity). With `roles=roles(experts=mxfp8)` and `dispatch=mxfp8` its held-out l
 it trained at 105k tokens a second against 127k by Triton's grouped GEMMs, in 75 GiB
 against 89. By `grouped_mxfp8`'s, which compute the same values, it trains faster
 than bfloat16 (docs/parallelism.md).
+
+### Softmax attention in FP8
+
+Megatron-Bridge's recipe runs softmax attention in FP8 by cuDNN
+(`fp8_dot_product_attention`); bux keeps it in compute. cuDNN's FP8 attention runs on
+B300s through jax 0.12, but no recipe that bux can run stateless trains both faster
+and as well:
+
+- Its backward gives dQ, dK and dV in E4M3 only (XLA takes no other dtype beside FP8
+  inputs), and their scales must be set before the kernel finds their amaxes.
+  Transformer Engine scales them by earlier steps' amaxes, which bux does not keep; a
+  bound safe at any step lies up to t h / g above dK's and dV's (a key that every
+  query attends to), past E4M3's range. jax 0.12 also passes that backward's scales
+  in another order than XLA reads them, which its tests, every scale 1, cannot see.
+- Its forward with a backward in bfloat16 diverges. With q, k and v at their current
+  scaling (a power of two from each one's amax), the probabilities by 1 and the
+  output by half of v's scale, then cuDNN's bfloat16 backward on q, k and v as the
+  forward rounded them, the 1.3B's gradients grew past 1e10 and to NaN within 650 to
+  1130 steps of FineWeb-Edu in all 11 runs (seeds 0 to 2, by cuDNN's backward or
+  tokamax's, subnormals kept or flushed). The backward takes the FP8 forward's
+  output, for the rows' sums of dO times it, and its logsumexp; each alone, the other
+  from bfloat16, still diverged, and with both from a bfloat16 forward of the rounded
+  inputs it trained within the noise of bfloat16 (held-out loss at 1500 steps +0.06%
+  and -0.05%, where seeds differ by 0.6%), as q, k and v rounded alone did. cuDNN's
+  FP8 backward computes those sums from its own probabilities.
+- Its forward pays only in long rows: a layer of 32 heads of 4 takes 0.82 ms to
+  bfloat16's 0.84 in 8 rows of 4096, 3.7 to 5.8 in one of 32k, and the stable
+  backward above adds a bfloat16 forward.
 
 ## Data
 
@@ -456,7 +484,7 @@ by itself where it cannot run, and all of them do inside `bux.kernels.off()` or 
 
 | what | by | on a B300, against XLA |
 |------|----|------------------------|
-| softmax attention | `methods.attention = auto`, the default: cuDNN's fused attention in rows of 8192 or more and with a window, else tokamax's flash attention (sinks, a soft cap) | 7x, and no t × t logits |
+| softmax attention | `methods.attention = auto`, the default: cuDNN's causal kernels in rows of one document, cuDNN's fused attention in rows of 8192 or more and with a window, else tokamax's flash attention (sinks, a soft cap) | 7x, and no t × t logits |
 | sparse attention (DSA, QSA, CSA) | `sparse`: tokamax's flash attention with the kept keys as a mask; the indexer's scores, its loss's picks and target by Pallas kernels (`scoring`), its top-k by counting | 2.6x a chunk of queries at a time, and no t × t floats |
 | linear attention, RWKV-7 | `chunkwise`: chunks of 64 positions, the state across them by a Pallas kernel (`affine_scan`); `methods(states=recompute)` keeps a fourteenth of the memory for the backward | 14-17x a scan over positions |
 | Mamba-2 | `chunkwise`, B and C a group's, the state across chunks by a matmul; `methods(states=recompute)` keeps a sixteenth of the memory for the backward | 25x a scan over positions (2 × 4096 tokens, rematerialized: at 8 × 4096 the scan needs 199 GiB) |
@@ -564,8 +592,10 @@ MXFP8 experts' Mosaic GPU kernels, lowered once a call, 0.36 s each, though ever
 layer calls them at the same shapes. Creating the model compiles its
 initializers besides, once a run: 79 s.
 
-On packed documents (`best_fit` of documents of 16 to 4000 words, GPT-2 tokens), on
-one GPU, the 1.3B trains at 145k tok/s in rows of 4096 by tokamax's kernel, and at
+On rows of one document (random tokens, `remat=none`), on one GPU, the 1.3B trains at
+155k tok/s by cuDNN's causal kernels and at 148k by tokamax's. On packed documents
+(`best_fit` of documents of 16 to 4000 words, GPT-2 tokens), on one GPU, the 1.3B
+trains at 145k tok/s in rows of 4096 by tokamax's kernel, and at
 139k in rows of 16384 by cuDNN's, which skips every block no query sees, where
 tokamax's, whose backward pass does every block of a row, gives 109k (random tokens:
 111k and 101k). With sinks, 142k in rows of 4096, where `auto` took xla, whose t × t

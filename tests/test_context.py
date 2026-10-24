@@ -11,6 +11,7 @@ import jax.numpy as jnp
 import numpy as np
 import optax
 import pytest
+from conftest import equations
 from flax import nnx
 from jax.extend.core import Jaxpr, Literal
 from jax.sharding import NamedSharding
@@ -274,6 +275,47 @@ def test_the_gpu_kernels_say_what_they_need_on_a_cpu():
     seen = Case(4, 2, softcap=1.0).visibility(sinks)
     with pytest.raises(NotImplementedError, match="cudnn has no softcap"):
         methods.attention.find("cudnn")(q, k, v, seen)
+
+
+@pytest.mark.parametrize(
+    "case", ["gqa_one_document", "gqa_documents", "gqa_sinks", "gqa_causal_sinks"]
+)
+def test_rows_of_one_document_take_the_causal_kernel_by_a_cond(
+    kernels, monkeypatch, case
+):
+    """cuDNN's on a GPU, jnp's here; rows of documents, or a window, tokamax's."""
+    monkeypatch.setattr(flash, "cudnn_kernel_takes", lambda *args: True)
+    monkeypatch.setattr(flash, "CUDNN", flash.JNP)
+    seen = CASES.get(case, Case(4, 2, documents(np.tile(np.arange(T), (B, 1)))))
+    seen = seen._replace(sinks=True) if case == "gqa_causal_sinks" else seen
+    out, grads = attend("xla", seen)
+    with parallel.use(MESHES[1]):
+        split_out, split_grads = attend("auto", seen)
+        q, k, v, sinks, _ = attention(seen)
+        auto = methods.attention.find("auto")
+        jaxpr = jax.make_jaxpr(lambda *x: auto(*x, seen.visibility(sinks)))(q, k, v)
+    np.testing.assert_allclose(split_out, out, atol=1e-5)
+    for split, whole in zip(split_grads, grads):
+        np.testing.assert_allclose(split, whole, atol=1e-5, rtol=1e-5)
+    conds = sum(e.primitive.name == "cond" for e, _ in equations(jaxpr.jaxpr))
+    assert conds == (seen.window is None)
+
+
+@pytest.mark.parametrize("flags", ["", "--xla_gpu_deterministic_ops=true"])
+def test_cudnn_s_backward_is_tokamax_s_under_deterministic_ops(monkeypatch, flags):
+    """XLA builds cuDNN's attention backward no graph then, on a B300."""
+    q, k, v, _, dout = attention(Case(2, 2))
+    v, dout = v[..., :D], dout[..., :D]
+    lse = jnp.zeros((B, 2, T))
+    by = {"tokamax": (q, k, v), "cudnn": (2 * q, 2 * k, 2 * v)}
+    monkeypatch.setenv("XLA_FLAGS", flags)
+    monkeypatch.setattr(flash, "tokamax_runs", lambda: True)
+    monkeypatch.setattr(flash, "_tokamax_backward", lambda *a: by["tokamax"])
+    monkeypatch.setattr(
+        flash.jax_internals, "cudnn_attention_backward", lambda *a: by["cudnn"]
+    )
+    grads = flash.CUDNN.backward(q, k, v, dout, dout, lse, flash.Keys(True), 1.0, None)
+    assert grads is by["tokamax" if flags else "cudnn"]
 
 
 # --- In a model --------------------------------------------------------------------
