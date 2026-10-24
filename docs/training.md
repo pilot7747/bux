@@ -443,7 +443,7 @@ by itself where it cannot run, and all of them do inside `bux.kernels.off()` or 
 | what | by | on a B300, against XLA |
 |------|----|------------------------|
 | softmax attention | `methods.attention = auto`, the default: cuDNN's fused attention in rows of 8192 or more and with a window, else tokamax's flash attention (sinks, a soft cap) | 7x, and no t × t logits |
-| sparse attention (DSA, QSA, CSA) | `sparse`: tokamax's flash attention with the kept keys as a mask; the indexer's scores by a Pallas kernel (`scoring`), its top-k by counting | 2.6x a chunk of queries at a time, and no t × t floats |
+| sparse attention (DSA, QSA, CSA) | `sparse`: tokamax's flash attention with the kept keys as a mask; the indexer's scores, its loss's picks and target by Pallas kernels (`scoring`), its top-k by counting | 2.6x a chunk of queries at a time, and no t × t floats |
 | linear attention, RWKV-7 | `chunkwise`: chunks of 64 positions, the state across them by a Pallas kernel (`affine_scan`); `methods(states=recompute)` keeps a fourteenth of the memory for the backward | 14-17x a scan over positions |
 | Mamba-2 | `chunkwise`, B and C a group's, the state across chunks by a matmul | 25x a scan over positions (2 × 4096 tokens, rematerialized: at 8 × 4096 the scan needs 199 GiB) |
 | Gated DeltaNet, DeltaNet | cuDNN's fused GDN kernel (`fused_delta`), by cuDNN's graph from a `buffer_callback`: any gate | 5x `chunkwise` |
@@ -479,13 +479,25 @@ bfloat16, against the same model by all t × t logits, as bux attended before `s
 | tokens a row × rows | t × t logits | `sparse` |
 |---------------------|--------------|----------|
 | 4096 × 2            | 27.0k tok/s, 85.6 GiB | 28.6k, 31.0 GiB |
-| 4096 × 8            | out of memory | 34.9k, 73.9 GiB |
-| 16384 × 1           | out of memory | 10.1k, 50.4 GiB |
-| 32768 × 1           | out of memory | 7.1k, 84.7 GiB |
+| 4096 × 8            | out of memory | 36.8k, 64.6 GiB |
+| 16384 × 1           | out of memory | 14.3k, 42.5 GiB |
+| 32768 × 1           | out of memory | 9.9k, 85.6 GiB |
+| 32768 × 1, packed documents | out of memory | 11.7k, 85.6 GiB |
+| 65536 × 1           | out of memory | 6.1k, 198 GiB |
 
-At 32k a layer's attention takes 1.4-1.9 times dense flash attention's time, and the
-indexer most of the rest: its selection 61 ms, its loss 75 ms and the loss's target
-33 ms, forward and backward. Under `methods(remat=save_attention)` the backward neither
+The indexer's loss took 60% of a step at 32k: XLA's gather of each query's 2048
+picks, their keys' gradient added by a scatter, and the attention's probabilities,
+which the backward pass took again. It takes the probabilities once now, and on a GPU
+scores the picks by Pallas kernels (`scoring.picked`), a program a query that stops
+at its last pick, whose backward pass adds the keys' gradient atomically (relaxed:
+Pallas's acquire-release adds took 1.6x the time). Before, 10.0k tokens a second at
+16k, 7.1k at 32k, 5.8k on packed documents (2.0x now: most queries of a short
+document pick few keys), 4.4k at 64k, and 8.26k at 32k for the same model with GQA's
+16 heads of 128 for MLA (11.6k now, its probabilities by a kernel too); the loss's
+probabilities, kept for the backward pass, take 9 GiB more at 32k. The log's MFU,
+which counts the keys each query sees, is 5.5% at 32k: the indexer's ranking of every
+key, its loss and its target cost far more than the attention to 2048 keys. Under
+`methods(remat=save_attention)` the backward neither
 selects the keys again nor runs the flash forward again
 ([Repeats and remat](parallelism.md#repeats-and-remat-methodsrepeat-methodsremat)):
 at 32k, 7.27k tokens a second in 39.8 GiB, as fast as no remat (7.11k, 77.9 GiB),
