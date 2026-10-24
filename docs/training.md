@@ -180,7 +180,7 @@ Four settings choose which projections, and when:
   | `recurrence` | the linear attentions', RWKV-7's and Mamba's projections, but the output |
   | `recurrence_out` | their output projection |
   | `mtp` | nextn's projection, and every branch after the first head |
-  | `experts` | the routed experts, by a grouped GEMM: `compute`, `mxfp8` or `mxfp8_2d`; `none` is compute, not `matmuls`, as theirs is slower than bfloat16's (docs/parallelism.md) |
+  | `experts` | the routed experts, by a grouped GEMM: `compute`, `mxfp8` or `mxfp8_2d`; `none` is compute, not `matmuls`. In MXFP8 they train 6-13% faster than in bfloat16 on B300s (docs/parallelism.md) |
 
   The embedding, the head, the router and softmax attention's own matmuls always
   stay in compute.
@@ -214,11 +214,11 @@ precision.last = 4 | 8
 
 | recipe | precision | left out |
 |--------|-----------|----------|
-| `nvidia_mxfp8` | Transformer Engine's MXFP8: E4M3 everywhere, gradients too | MXFP8 routed experts, which are slower in bux |
+| `nvidia_mxfp8` | Transformer Engine's MXFP8: E4M3 everywhere, gradients too, the routed experts too | |
 | `nvidia_nvfp4` | NVIDIA's NVFP4 pretraining: W in 16 x 16 tiles, dy rounded stochastically, a Hadamard transform for dW; `first=2, last=8` | NVFP4 routed experts |
 | `nemotron3_nvfp4` | NVFP4, `recurrence_out` in MXFP8, and `q`, `kv`, `o`, `latent`, `mtp` and the last 15% in bfloat16 | NVFP4 routed experts, most of its matmuls |
-| `deepseek_v3_fp8` | `mxfp8_2d`, the tokens sent to the routed experts in MXFP8, moments in bfloat16 | groups of 128 with float32 scales, the float32 promotion, FP8 routed experts, activations kept in FP8 |
-| `torchtitan_mxfp8` | `mxfp8_2d` | MXFP8 routed experts, and saving a linear's input in bfloat16 |
+| `deepseek_v3_fp8` | `mxfp8_2d`, the routed experts too, the tokens sent to them in MXFP8, moments in bfloat16 | groups of 128 with float32 scales, the float32 promotion, activations kept in FP8 |
+| `torchtitan_mxfp8` | `mxfp8_2d`, the routed experts too | saving a linear's input in bfloat16 |
 
 On one B300 each, the 1.3B Llama-style model trained 3000 steps of 8 x 4096 tokens of
 FineWeb-Edu (98M tokens), GEMM autotuning off. Its held-out loss at the end, in
@@ -250,7 +250,9 @@ The baseline's MoE (64 experts, top-8, 16 layers of `d_model` 2048) trained the 
 3000 steps on two B300s a run, its experts split over them (`ragged_all_to_all`, no
 capacity). With `roles=roles(experts=mxfp8)` and `dispatch=mxfp8` its held-out loss is
 0.13% and 0.05% below bfloat16's at seeds 0 and 1, where the seeds differ by 1.65%;
-it trains at 105k tokens a second against 127k, in 75 GiB against 89.
+it trained at 105k tokens a second against 127k by Triton's grouped GEMMs, in 75 GiB
+against 89. By `grouped_mxfp8`'s, which compute the same values, it trains faster
+than bfloat16 (docs/parallelism.md).
 
 ## Data
 
@@ -438,6 +440,7 @@ by itself where it cannot run, and all of them do inside `bux.kernels.off()` or 
 | Gated DeltaNet, DeltaNet | cuDNN's fused GDN kernel (`fused_delta`), by cuDNN's graph from a `buffer_callback`: any gate | 5x `chunkwise` |
 | KDA with `gate_lower_bound` | cuDNN's fused KDA kernel (`fused_delta`) | 10x `chunkwise` |
 | MoE experts | `grouped.ragged_dot`: tokamax's Mosaic and Triton kernels | 27x `jax.lax.ragged_dot` |
+| MoE experts in MXFP8 | `grouped_mxfp8`: Mosaic GPU kernels of tcgen05's block-scaled MMA, the scales by TMA into tensor memory (docs/parallelism.md) | 1.5-2.4x tokamax's bfloat16 GEMMs |
 | MoE dispatch | `token_rows`, `permuted`: gathers where XLA would scatter | 4x |
 | NVFP4's quantizers | `nvfp4`: Pallas kernels, a pass for the largest magnitudes and one that writes both copies, rounded by Blackwell's E2M1 conversions | 3-5x |
 
