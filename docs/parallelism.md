@@ -2071,7 +2071,9 @@ W and dy, each twice.
 ### Microbatches
 
 `methods.microbatches = n` takes each step's batch in n microbatches: a `lax.scan`
-over them inside the train step, their gradients summed in float32, and one update.
+over them inside the train step, their gradients summed in float32, and one update;
+with `interleave`, each one's forward beside the one before's backward
+([below](#side-by-side-methodsinterleave)).
 Microbatch i is rows i, i + n, i + 2n and so on (`parallel.microbatches`), so that
 every device's rows split evenly among them and none moves. `batch` must split into n
 microbatches whose rows split over the batch axes, which `parallel.check` says before
@@ -2259,23 +2261,33 @@ with offsets from a table
 (`--xla_gpu_experimental_enable_dynamic_slice_table_offsets=true`), makes the same
 copies as memcpys. With no carry at all, the ticks of every microbatch unrolled in the
 step, nothing is copied, but the program is n times the loop's, and XLA held 176 GiB
-for the 12 layers.
+for the 12 layers in 8 microbatches (124.6k tokens a second a GPU, the loop 126.7k).
 
 On 8 B300s it overlaps, but its copies cost more than it hides, and it is off by
 default. Tokens a second a GPU and the peak, the loop and interleave side by side
 on a node:
 
-INTERLEAVE_TABLE
+| run | in a row | interleaved |
+|-----|----------|-------------|
+| `one_node.bux`'s `tp` (`repeat=unroll`, `remat=none`), 16 rows in 4 microbatches | 33.2k, 18.0 GiB | 33.5k, 19.3 GiB |
+| the same, two collectives in flight | | 34.0k, 18.1 GiB |
+| its `fsdp`, the dense 1.3B at a row a GPU a microbatch, 32 rows in 4 | 111.2k, 11.5 GiB | 93.1k, 12.6 GiB |
+| `megatron.bux`'s `sorted`, 12 layers, 8 microbatches of 8 rows a GPU | 123.8k, 62.0 GiB | 118.0k, 87.5 GiB |
+| its `nccl_ep`, `moe_stream=true`, 12 layers, 8 microbatches | 109.4k, 63.6 GiB | 110.2k, 81.6 GiB |
 
-Tied a tick at a time, the halves beat XLA's own order: with the barrier on the
-gradients alone (so that each half's chain runs as XLA likes), TP trained at 31.2k in
-24.9 GiB and the MoE at 104.6k in 93.8 GiB. The overlap is real but small on a node:
-TP's step on GPU 0 left 39 ms of its collectives exposed, from 47, and unrolled 35,
-at 35.3k a GPU against the loop's 34.1k; the MoE's FSDP gathers took 50 ms less of a
-step, which slower reduce-scatters gave back. XLA runs one collective at a time
+The overlap is real but small on a node: TP's step on GPU 0 left 39 ms of its
+collectives exposed, from 47, and unrolled 35, at 35.3k a GPU against the loop's
+34.1k; the MoE's FSDP gathers took 50 ms less of a step, which slower reduce-scatters
+gave back. With the parameters gathered once a step (`gather=step`), the dense FSDP
+run has only each microbatch's reduce-scatters to hide, and the bottom half's copies
+cost more. Tied a tick at a time, the halves beat XLA's own order: in slots, with the
+barrier on the slots and the gradients alone, so that each half's chain runs as XLA
+likes, TP trained at 31.2k in 24.9 GiB, against 32.2k tied, and the MoE at 104.6k in
+93.8 GiB, against 107.3k. XLA runs one collective at a time
 (`xla_gpu_experimental_parallel_collective_overlap_limit`); at 2, interleave gains,
-and the loop of the MoE loses 4.5%. The 48-layer arm at Megatron's batch, which the
-loop trains at 35.8k in 230 GiB, does not fit interleaved.
+and the MoE's loop loses 4.5%. The 48-layer arm at Megatron's batch, which the loop
+trains at 35.8k in 230 GiB, does not fit interleaved: in slots it asked for 261 GiB,
+and the carry holds half a microbatch more.
 
 NCCL EP keeps a layer's routing from its forward to its backward, so a microbatch's
 forward of a layer before the backward of the one before fails in TransformerEngine
