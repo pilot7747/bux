@@ -45,7 +45,8 @@ from bux.train.trainer import directory, train
 
 Result = dict[str, Any]
 # The variables that give a host's index among those that train a run together, as
-# bux.launch.PROCESSES gives their number.
+# bux.launch.PROCESSES gives their number. Here, not in bux.launch: with --tree this
+# script runs on another checkout's bux, an older one too, which has no such helper.
 RANKS = ("JAX_PROCESS_ID", "SLURM_PROCID", "OMPI_COMM_WORLD_RANK")
 REGRESSIONS = {"slower", "more memory", "loss", "failed"}
 

@@ -1,4 +1,5 @@
-"""The device grid: one mesh of all six axes, and the settings `use` puts in force."""
+"""The device grid: one mesh of all six axes, the settings `use` puts in force, and
+which of its axes the shard_maps being traced map."""
 
 import contextvars
 import math
@@ -131,3 +132,18 @@ ACTIVE = contextvars.ContextVar[Active | None]("bux.parallel", default=None)
 def active() -> Active | None:
     """Return what `use` put in force, or None outside it."""
     return ACTIVE.get()
+
+
+# --- Inside a shard_map ----------------------------------------------------------------
+
+
+def manual_axes() -> frozenset[str]:
+    """Return the mesh axes that the shard_maps being traced map: none outside one."""
+    return frozenset(jax.sharding.get_abstract_mesh().manual_axes)
+
+
+def free_axes() -> set[str]:
+    """Return the axes of the run's mesh that no shard_map being traced maps."""
+    on = active()
+    assert on is not None
+    return set(on.mesh.axis_names) - manual_axes()

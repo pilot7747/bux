@@ -8,8 +8,8 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 import pytest
+from conftest import count
 from flax import nnx
-from jax.extend.core import ClosedJaxpr, Jaxpr
 from jax.sharding import NamedSharding
 from jax.sharding import PartitionSpec as P
 from jaxtyping import Array, Float
@@ -376,7 +376,7 @@ def test_block_projections_multiply_in_the_format_and_the_router_and_head_in_com
             return [head.logits() for head in heads]
 
     # The up, gate and down of 2 FFNs and of 2 MoEs' shared experts.
-    assert _count(jax.make_jaxpr(run)().jaxpr, "scaled_matmul_wrapper") == 12
+    assert count(jax.make_jaxpr(run)().jaxpr, "scaled_matmul_wrapper") == 12
 
 
 @pytest.mark.parametrize("fmt", FORMATS)
@@ -491,7 +491,7 @@ def _block_scaled(model: Model, precision: tcfg.PrecisionConfig) -> int:
         with matmuls.use(precision):
             return [head.logits() for head in forward(model, _batch())]
 
-    return _count(jax.make_jaxpr(run_forward)().jaxpr, "scaled_matmul_wrapper")
+    return count(jax.make_jaxpr(run_forward)().jaxpr, "scaled_matmul_wrapper")
 
 
 @pytest.mark.parametrize("given", QUANTIZED)
@@ -889,20 +889,6 @@ def _sizes(mesh: str) -> dict[str, int]:
     """mesh(fsdp=2, tensor=4) as {"fsdp": 2, "tensor": 4}."""
     inside = mesh.removeprefix("mesh(").removesuffix(")")
     return {k: int(v) for k, v in (kv.split("=") for kv in inside.split(", "))}
-
-
-def _count(jaxpr: Jaxpr, primitive: str) -> int:
-    """How many times `primitive` runs in `jaxpr`, inside the jaxprs it calls too."""
-    n = 0
-    for eqn in jaxpr.eqns:
-        n += eqn.primitive.name == primitive
-        for param in eqn.params.values():
-            for sub in param if isinstance(param, tuple | list) else (param,):
-                if isinstance(sub, ClosedJaxpr):
-                    sub = sub.jaxpr
-                if isinstance(sub, Jaxpr):
-                    n += _count(sub, primitive)
-    return n
 
 
 def _counts(model: Model) -> list[int]:

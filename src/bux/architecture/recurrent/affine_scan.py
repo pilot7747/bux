@@ -153,6 +153,6 @@ def _run(
             jax.ShapeDtypeStruct(start.shape, jnp.float32),
         ],
         compiler_params=plgpu.CompilerParams(num_warps=warps, num_stages=2),
-        interpret=jax.default_backend() != "gpu",
+        interpret=kernels.interpreted(),
         name="affine_scan",
     )(A.astype(maps), B.astype(jnp.float32), start)

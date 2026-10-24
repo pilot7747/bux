@@ -32,6 +32,7 @@ from bux.architecture.precision.blockscaled import (
     Shardings,
     as_bytes,
 )
+from bux.parallel.layout import axes_of
 
 BLOCK = 16
 E2M1_MAX = 6.0  # float4 E2M1's largest value
@@ -315,7 +316,7 @@ def _quantize(
         ],
         out_shape=[jax.ShapeDtypeStruct(s, jnp.uint8) for s in shapes],
         compiler_params=plgpu.CompilerParams(num_warps=WARPS, num_stages=1),
-        interpret=blockscaled.interpreted(),
+        interpret=kernels.interpreted(),
         name=f"nv_quantize_{tr}x{tc}",
     )(x, hadamard, encode, decode, salt, start)
 
@@ -398,7 +399,7 @@ def _to_e2m1(
     4 bits, as XLA lays E2M1 out: rounded to nearest even, or stochastically by
     `bits`, 32 a quad. On a GPU by Blackwell's conversions; interpreted, by their
     arithmetic."""
-    if blockscaled.interpreted():
+    if kernels.interpreted():
         if bits is not None:
             values = round_stochastically(values, _noise_of_bits(bits))
         return _pack(_e2m1_codes(values))
@@ -512,7 +513,7 @@ def _amaxes_by_kernel(
         out_specs=[pl.BlockSpec((1, 1), lambda i, j: (i, j))] * 2,
         out_shape=[each, each],
         compiler_params=plgpu.CompilerParams(num_warps=WARPS, num_stages=1),
-        interpret=blockscaled.interpreted(),
+        interpret=kernels.interpreted(),
         name=f"nv_amax_{tr}x{tc}",
     )(x, hadamard)
     return jnp.stack([rows.max(), columns.max()])
@@ -537,14 +538,6 @@ def _offset(axes: Any, size: int) -> UInt32[Array, ""]:
     return jax.lax.axis_index(axes).astype(jnp.uint32) * jnp.uint32(size)
 
 
-def _mesh_axes(spec: P) -> tuple[str, ...]:
-    """Return every mesh axis that `spec` splits over."""
-    names = []
-    for axes in spec:
-        names += [] if axes is None else [axes] if isinstance(axes, str) else list(axes)
-    return tuple(names)
-
-
 @custom_partitioning
 def _amaxes_partitioned(
     x: Float[Array, "r c"], hadamard: Float[Array, "t t"]
@@ -562,7 +555,7 @@ def _amaxes_partition(
     """Each device runs the kernel on its part of x, and the largest of theirs is
     every device's."""
     spec = P(*blockscaled.split_of(shapes[0].sharding.spec))
-    split = _mesh_axes(spec)
+    split = axes_of(spec)
 
     def amaxes(
         x: Float[Array, "r c"], hadamard: Float[Array, "t t"]

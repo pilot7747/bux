@@ -313,7 +313,7 @@ def run_sorted(
         return routed(z, idx, weights, *kernels, moe.config.expert, moe.expert_norm)
 
     tokens = parallel.spec(("batch", "seq", None), z.shape)
-    if not axes_of(tokens):
+    if not parallel.axes_of(tokens):
         return local(z, idx, weights, moe.kernels())
     return in_shard_map(local, tokens, P(), tokens)(z, idx, weights, moe.kernels())
 
@@ -330,14 +330,9 @@ def in_shard_map(
         local,
         in_specs=(tokens, tokens, tokens, kernels),
         out_specs=out,
-        axis_names=set(axes_of(tokens)),
+        axis_names=set(parallel.axes_of(tokens)),
         check_vma=False,
     )
-
-
-def axes_of(spec: P) -> tuple[str, ...]:
-    """Return the mesh axes `spec` splits over, in order."""
-    return tuple(a for s in spec if s for a in ((s,) if isinstance(s, str) else s))
 
 
 # --- A token's path: sort by expert, run the experts, sort back --------------------
@@ -431,8 +426,7 @@ def grouped_product(
 def experts_format() -> str:
     """Return the format the routed experts multiply in, in the branch that is
     tracing: their role's (``matmuls.format_of``), or compute where `roles.experts` is
-    none. Unlike the other roles, they take no format from `matmuls`: on B300s their
-    grouped MXFP8 GEMM trains the baseline's MoE slower than bfloat16 does."""
+    none. Unlike the other roles, they take no format from `matmuls`."""
     if matmuls.in_force().roles.experts is None:
         return "compute"
     return matmuls.format_of("experts")

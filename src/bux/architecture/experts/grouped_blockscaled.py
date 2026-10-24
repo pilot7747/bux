@@ -9,10 +9,10 @@ what its GEMM contracts, as a `blockscaled.Recipe` says:
 A block of rows that two groups share has one scale, and each group counts the other's
 rows as 0; rows past the groups come out 0, and add nothing to dW. Only the GEMMs in
 `passes` multiply in the format, the others by ``grouped``'s kernels, as they are. In
-the format, ``_times`` and ``_contract`` multiply by Triton's `tl.dot_scaled` on a GPU
-(``grouped_triton``), Blackwell's block-scaled MMA, and elsewhere by XLA, which
-dequantizes and computes the same values. The recipes of E4M3 values with a
-power-of-two scale per 32 run here (RECIPES).
+the format, ``_times`` and ``_contract`` multiply by tcgen05's block-scaled MMA on a
+Blackwell GPU (``grouped_mxfp8``), and elsewhere by XLA, which dequantizes and
+computes the same values. The recipes of E4M3 values with a power-of-two scale per 32
+run here (RECIPES).
 """
 
 from functools import partial
@@ -20,12 +20,11 @@ from typing import Literal
 
 import jax
 import jax.numpy as jnp
-import numpy as np
 from jax.typing import DTypeLike
 from jaxtyping import Array, Float, Int, UInt32
 
 from bux import kernels
-from bux.architecture.experts import grouped
+from bux.architecture.experts import grouped, grouped_mxfp8
 from bux.architecture.precision import blockscaled
 from bux.architecture.precision.blockscaled import PASSES, Blocks, Pass, Twice
 
@@ -37,7 +36,6 @@ except ImportError:
 BLOCK = blockscaled.MX_BLOCK
 # The formats of ``matmuls`` that run here, by their recipes: train.config.GROUPED.
 RECIPES = {"mxfp8": blockscaled.MXFP8, "mxfp8_2d": blockscaled.MXFP8_2D}
-Dtypes = tuple[np.dtype, np.dtype, np.dtype]  # x's, W's and y's
 # An operand of a GEMM: in the format, or as it is where its pass multiplies as it is.
 Operand = Blocks | Float[Array, "m k"]
 Matrices = Blocks | Float[Array, "g k n"]
@@ -60,11 +58,12 @@ def ragged_dot(
     passes: tuple[Pass, ...] = PASSES,
 ) -> Float[Array, "m n"]:
     """Return what `grouped.ragged_dot` does, its GEMMs in `passes` as `recipe`
-    quantizes them. Rows go in blocks of 32 too, so x gains rows of 0 up to them."""
-    m = x.shape[0]
-    whole = -(-m // BLOCK) * BLOCK
+    quantizes them. Rows go in the kernels' tiles of 128 too, so x gains rows of 0
+    up to them."""
+    m, tile = x.shape[0], grouped_mxfp8.LANES
+    whole = -(-m // tile) * tile
     x = jnp.pad(x, ((0, whole - m), (0, 0))) if whole > m else x
-    dtypes = (x.dtype, w.dtype, jnp.result_type(x, w))
+    dtypes = blockscaled.Dtypes(x.dtype, w.dtype, jnp.result_type(x, w))
     return _ragged(x, w, sizes, seed, recipe, dtypes, passes)[:m]
 
 
@@ -75,7 +74,7 @@ def _ragged(
     sizes: Int[Array, " g"],
     seed: UInt32[Array, ""],
     recipe: blockscaled.Recipe,
-    dtypes: Dtypes,
+    dtypes: blockscaled.Dtypes,
     passes: tuple[Pass, ...],
 ) -> Float[Array, "m n"]:
     return _forward(x, w, sizes, seed, recipe, dtypes, passes)[0]
@@ -87,20 +86,20 @@ def _forward(
     sizes: Int[Array, " g"],
     seed: UInt32[Array, ""],
     recipe: blockscaled.Recipe,
-    dtypes: Dtypes,
+    dtypes: blockscaled.Dtypes,
     passes: tuple[Pass, ...],
 ) -> tuple[Float[Array, "m n"], Saved]:
     fprop, dgrad, wgrad = (p in passes for p in PASSES)
     filled = sizes.sum()
     x_k, x_m = _twice(recipe.x, x, seed, rows=fprop, columns=wgrad, filled=filled)
     w_n, w_k = _each_twice(recipe.w, w, seed, rows=dgrad, columns=fprop)
-    y = _times(x_k, w_k, sizes, dtypes[2], stacked="columns")
+    y = _times(x_k, w_k, sizes, dtypes.y, stacked="columns")
     return y, (x_m, w_n, sizes, seed)
 
 
 def _backward(
     recipe: blockscaled.Recipe,
-    dtypes: Dtypes,
+    dtypes: blockscaled.Dtypes,
     passes: tuple[Pass, ...],
     saved: Saved,
     dy: Float[Array, "m n"],
@@ -110,8 +109,8 @@ def _backward(
     filled = sizes.sum()
     dy_n, dy_m = _twice(recipe.dy, dy, seed, rows=dgrad, columns=wgrad, filled=filled)
     w_t = w_n if isinstance(w_n, Blocks) else jnp.swapaxes(w_n, 1, 2)
-    dx = _times(dy_n, w_t, sizes, dtypes[0], stacked="rows")
-    return dx, _contract(x_m, dy_m, sizes, dtypes[1]), None, None
+    dx = _times(dy_n, w_t, sizes, dtypes.x, stacked="rows")
+    return dx, _contract(x_m, dy_m, sizes, dtypes.w), None, None
 
 
 _ragged.defvjp(_forward, _backward)
@@ -128,19 +127,16 @@ def _times(
     stacked: Stacked,
 ) -> Float[Array, "m n"]:
     """Return each group's rows of a times its matrix: in the format where both are,
-    b's (n, k) matrices `stacked` so, by Triton on a GPU, else by XLA; as they are,
-    b[g] (k, n), by ``grouped``'s kernels."""
+    b's (n, k) matrices `stacked` so, by ``grouped_mxfp8`` on a Blackwell GPU, else
+    by XLA; as they are, b[g] (k, n), by ``grouped``'s kernels."""
     if not isinstance(a, Blocks):
         assert not isinstance(b, Blocks)
         return grouped.dot(a, b, sizes).astype(out)
     assert isinstance(b, Blocks)
-    if _triton():
-        assert grouped_triton is not None
-        at = tiles_of(sizes, a.values.shape[0], grouped_triton.ROWS.m)
-        y = grouped_triton.rows(a, b, at, sizes.shape[0], stacked, out)
-        return jnp.where((jnp.arange(y.shape[0]) < sizes.sum())[:, None], y, 0)
-    matrices = _stacked(dequantized(b), sizes.shape[0], stacked)
-    return jax.lax.ragged_dot(dequantized(a), matrices, sizes).astype(out)
+    if grouped_mxfp8.runs():
+        return grouped_mxfp8.rows(a, b, sizes, stacked, out)
+    matrices = _stacked(blockscaled.dequantized(b), sizes.shape[0], stacked)
+    return jax.lax.ragged_dot(blockscaled.dequantized(a), matrices, sizes).astype(out)
 
 
 def _contract(
@@ -150,51 +146,22 @@ def _contract(
     out: DTypeLike,
 ) -> Float[Array, "g k n"]:
     """Return a^T b over each group's rows: in the format where both are, given as a^T
-    and b^T in blocks along the rows, by Triton on a GPU, else by XLA; as they are, by
-    ``grouped``'s kernels."""
+    and b^T in blocks along the rows, by ``grouped_mxfp8`` on a Blackwell GPU, else by
+    XLA; as they are, by ``grouped``'s kernels."""
     if not isinstance(a, Blocks):
         assert not isinstance(b, Blocks)
         return grouped.weight_grad(a, b, sizes).astype(out)
     assert isinstance(b, Blocks)
-    if _triton():
-        assert grouped_triton is not None
-        return grouped_triton.contract(a, b, sizes, out)
-    rows = (dequantized(a).T, dequantized(b).T)
+    if grouped_mxfp8.runs():
+        return grouped_mxfp8.contract(a, b, sizes, out)
+    rows = (blockscaled.dequantized(a).T, blockscaled.dequantized(b).T)
     dw = jax.lax.ragged_dot_general(*rows, sizes, grouped.RAGGED_CONTRACTING)
     return dw.astype(out)
 
 
 def _triton() -> bool:
-    """Whether Triton's kernels run here."""
+    """Whether Triton's quantizer runs here."""
     return grouped_triton is not None and kernels.gpu()
-
-
-def tiles_of(sizes: Int[Array, " g"], m: int, tile: int) -> Int[Array, "t 3"]:
-    """Return the tiles Triton's `rows` runs: for each tile of `tile` of the m rows
-    that a group has rows in, the group and where its rows there start and end. Then
-    (0, 0, 0) up to the most there can be: one a tile of rows, and one more a group
-    after the first."""
-    g = sizes.shape[0]
-    ends = jnp.cumsum(sizes)
-    starts = ends - sizes
-    first = starts // tile
-    count = jnp.where(sizes > 0, -(-ends // tile) - first, 0)
-    before = jnp.cumsum(count) - count
-    at = jnp.arange(-(-m // tile) + g - 1)
-    group = jnp.minimum(jnp.searchsorted(before + count, at, side="right"), g - 1)
-    index = first[group] + at - before[group]
-    lo = jnp.maximum(starts[group], index * tile)
-    hi = jnp.minimum(ends[group], (index + 1) * tile)
-    real = at < count.sum()
-    spans = [group, jnp.where(real, lo, 0), jnp.where(real, hi, 0)]
-    return jnp.stack(spans, -1).astype(jnp.int32)
-
-
-def dequantized(blocks: Blocks) -> Float[Array, "r c"]:
-    """Return the values `blocks` hold, in float32: each times its block's scale."""
-    assert blocks.tensor_scale is None  # E4M3 with power-of-two scales: RECIPES
-    scales = jnp.repeat(blocks.scales.astype(jnp.float32), BLOCK, axis=-1)
-    return blocks.values.astype(jnp.float32) * scales
 
 
 def _stacked(
