@@ -39,7 +39,7 @@ class Fitting:
     `tried` says what each took."""
 
     def __init__(self, step: Callable[..., Any], options: xla.Options, **jit: Any):
-        self.step, self.options, self.jit = step, options, jit
+        self.step, self.options, self.jit_kwargs = step, options, jit
         self.chosen: Any = None  # the step under the policy that fits, of xla.jit
         self.policy: str | None = None
         self.tried: list[Tried] = []
@@ -72,7 +72,7 @@ class Fitting:
     def _compiled(self, policy: str, args: tuple) -> Any:
         """Return the step under `policy`, compiled for `args`, and note in `tried`
         what it holds and how long its compile took."""
-        step = xla.jit(self._trying(policy), self.options, **self.jit)
+        step = xla.jit(self._trying(policy), self.options, **self.jit_kwargs)
         start = time.perf_counter()
         holds = held(step, args)
         self.tried.append(Tried(policy, holds, time.perf_counter() - start))
@@ -113,13 +113,14 @@ def capacity() -> int | None:
     return stats.get("bytes_limit")
 
 
-def fits(held: int | None) -> bool:
-    """Return whether a step that holds `held` bytes fits in a device's memory, with
-    a margin; anything fits where the device does not say how much it can hold."""
+def fits(size: int | None) -> bool:
+    """Return whether a step that holds `size` bytes on a device (``held``) fits in
+    its memory, with a margin; anything fits where the device does not say how much it
+    can hold."""
     limit = capacity()
     if limit is None:
         return True
-    return held is not None and held <= MARGIN * limit
+    return size is not None and size <= MARGIN * limit
 
 
 def _report(policy: str, tried: list[Tried]) -> None:
