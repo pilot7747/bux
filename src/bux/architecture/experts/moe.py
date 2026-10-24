@@ -24,13 +24,14 @@ import jax
 import jax.numpy as jnp
 from flax import nnx
 from jax.ad_checkpoint import checkpoint_name
+from jax.sharding import NamedSharding
 from jax.sharding import PartitionSpec as P
 from jaxtyping import Array, Bool, Float, Int, Key
 
 from bux import config as cfg
 from bux import parallel
 from bux.architecture.common.sharding import linear
-from bux.architecture.experts import grouped_blockscaled
+from bux.architecture.experts import grouped_blockscaled, grouped_glu
 from bux.architecture.experts.grouped import ragged_dot
 from bux.architecture.layers.mlp import MLP, activate
 from bux.architecture.layers.norm import Norm
@@ -326,7 +327,14 @@ def run_sorted(
     taps: Taps | None = None,
 ) -> Float[Array, "b t d"]:
     """Run each expert on its own rows (``routed``), each device on its own tokens
-    with every expert's kernels, so that no device sorts another's tokens."""
+    with every expert's kernels, so that no device sorts another's tokens. Where the
+    fused kernels run them and FSDP splits them by expert as the layer runs, each
+    device quantizes its own shard of them before they are gathered."""
+    ffn, norm = moe.config.expert, moe.expert_norm
+    tokens = parallel.spec(("batch", "seq", None), z.shape)
+    if not parallel.axes_of(tokens):
+        return routed(z, idx, weights, *moe.kernels(), ffn, norm)
+    split = _split_by_expert(moe, tokens) if fused(ffn, norm, moe.up[...]) else ()
 
     def local(
         z: Float[Array, "b t d"],
@@ -334,12 +342,37 @@ def run_sorted(
         weights: Float[Array, "b t k"],
         kernels: Kernels,
     ) -> Float[Array, "b t d"]:
-        return routed(z, idx, weights, *kernels, moe.config.expert, moe.expert_norm)
+        if not split:
+            return routed(z, idx, weights, *kernels, ffn, norm)
+        up, down, quantized = grouped_glu.gathered(*kernels, split)
+        return routed(z, idx, weights, up, down, ffn, norm, quantized)
 
-    tokens = parallel.spec(("batch", "seq", None), z.shape)
-    if not parallel.axes_of(tokens):
-        return local(z, idx, weights, moe.kernels())
-    return in_shard_map(local, tokens, P(), tokens)(z, idx, weights, moe.kernels())
+    kernels = P(split) if split else P()
+    return in_shard_map(local, tokens, kernels, tokens)(z, idx, weights, moe.kernels())
+
+
+def _split_by_expert(moe: MoE, tokens: P) -> tuple[str, ...]:
+    """Return the axes that FSDP splits the experts' kernels over by expert as a layer
+    runs them, if the tokens split over each: with one microbatch, or a layer's
+    parameters gathered as it runs (`methods.gather`)."""
+    on = parallel.active()
+    assert on is not None
+    once = on.methods.microbatches > 1 and on.methods.gather == "step"
+    if once or parallel.pipeline.pipelined():
+        return ()
+    shardings = parallel.shardings(nnx.state(moe, nnx.Param))
+    up, down = (_splits(shardings[k], ndim) for k, ndim in (("up", 4), ("down", 3)))
+    first = up[0]
+    by_expert = down[0] == first and not any(up[1:] + down[1:])
+    return first if by_expert and set(first) <= set(parallel.axes_of(tokens)) else ()
+
+
+def _splits(sharding: object, ndim: int) -> list[tuple[str, ...]]:
+    """Return the axes each of the `ndim` dimensions of an array with `sharding`
+    splits over."""
+    assert isinstance(sharding, NamedSharding)
+    entries = [*sharding.spec, *(None,) * (ndim - len(sharding.spec))]
+    return [parallel.layout.as_split(entry) for entry in entries]
 
 
 def in_shard_map(
@@ -370,10 +403,11 @@ def routed(
     down: Float[Array, "E f d"],
     ffn: cfg.MLPConfig,
     norm: RowNorm | None = None,
+    quantized: grouped_glu.Weights | None = None,
 ) -> Float[Array, "b t d"]:
     """Return each token's sum of its experts' outputs, weighted by `weights`. A pick
     outside the experts of `up` adds nothing, so that one device's experts can take
-    every pick."""
+    every pick. Given the kernels `quantized`, the fused kernels take them so."""
     b, t, d = z.shape
     k, n = idx.shape[-1], up.shape[0]
     order, inverse, sizes = sort_by_expert(idx, n)
@@ -383,7 +417,9 @@ def routed(
     row_weights = picked_weights(kept, order, inverse)
     picked = grouped_blockscaled.Picked(tokens, order // k)
     summed = grouped_blockscaled.Summed(order, inverse.reshape(b * t, k))
-    out = experts(rows, sizes, row_weights, up, down, ffn, norm, picked, summed)
+    out = experts(
+        rows, sizes, row_weights, up, down, ffn, norm, picked, summed, quantized
+    )
     return out.reshape(b, t, d)
 
 
@@ -412,6 +448,7 @@ def experts(
     norm: RowNorm | None = None,
     picked: grouped_blockscaled.Picked | None = None,
     summed: grouped_blockscaled.Summed | None = None,
+    quantized: grouped_glu.Weights | None = None,
 ) -> Float[Array, "r d"]:
     """Run each row of `x` through its expert's FFN, then `norm`, times the row's
     weight in `weights`. The rows are sorted by expert: the first sizes[0] are expert
@@ -420,7 +457,12 @@ def experts(
     shard_map as it does on all of them. The kernels multiply in x's dtype, so that
     wider ones add up the gradients of several calls in their own. Given where x was
     `picked`, a format's quantizer reads it there; given the tokens its rows are
-    `summed` into, it returns their sums."""
+    `summed` into, it returns their sums. In MXFP8 on a Blackwell GPU, cuDNN's fused
+    kernels run a SwiGLU FFN with no norm (``grouped_glu``), its kernels as they are
+    `quantized`, if they are."""
+    if fused(ffn, norm, up):
+        y = grouped_glu.mlp(x, sizes, weights, up, down, picked, summed, quantized)
+        return checkpoint_name(y, "experts")
     recipe = grouped_blockscaled.RECIPES.get(experts_format())
     n, (e, d, f, p) = x.shape[0], up.shape
     up, down = up.reshape(e, d, f * p).astype(x.dtype), down.astype(x.dtype)
@@ -440,6 +482,16 @@ def experts(
         return times(weighted_units(ffn, projected, weights), down, summed=summed)
     y = weighted(norm(times(hidden_units(ffn, projected), down)), weights)
     return y if summed is None else sums_of_tokens(y, summed)
+
+
+def fused(
+    ffn: cfg.MLPConfig, norm: RowNorm | None, up: Float[Array, "E d f p"]
+) -> bool:
+    """Return whether cuDNN's fused kernels run the experts here
+    (``grouped_glu.runs``)."""
+    recipe = grouped_blockscaled.RECIPES.get(experts_format())
+    passes = matmuls.in_force().passes
+    return norm is None and grouped_glu.runs(recipe, passes, ffn, up)
 
 
 def weighted_units(

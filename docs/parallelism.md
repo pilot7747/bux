@@ -1124,9 +1124,75 @@ dy in place took the arm from 260.3k to 269.4k tokens a second (32.5k to 33.7k a
 at the same peak, 215.0 GiB. On GPU 0 a step fell from 1067 to 1029 ms: both gathers'
 39 ms went, and the quantizer's 95 ms became 88. With the weights after down, x in
 place alone went from 254.2k to 255.0k: the gather's 25 ms went, but the FSDP
-collectives the step overlapped came out from under it. Each GPU quantizes all 128
-experts' W, 23 ms of a step; its own shard before FSDP gathers it would save 7/8 of
-that.
+collectives the step overlapped came out from under it. Each GPU quantized all 128
+experts' W, 23 ms of a step; under the fused kernels below, each quantizes its own
+shard before FSDP gathers it.
+
+### SwiGLU fused, by cuDNN
+
+On a Blackwell GPU with cudnn-frontend (the `cuda` extra), the routed experts of a
+SwiGLU FFN (`gated_mlp` of `swish`, no `limit`, `up_softcap` or `expert_norm`) in
+`mxfp8`, every pass in it, run by cuDNN's CuTe DSL kernels, through `cudnn.jax.call` on
+XLA's stream (`grouped_glu`, over `grouped_cudnn`), where their widths are whole
+tiles of 256: Qwen3-30B-A3B's 2048 and 768, but not the baseline's 704. They fuse
+what bux's kernels left to XLA:
+
+| GEMM | kernel | in its epilogue |
+|------|--------|-----------------|
+| x W, up and gate | `swiglu` | SwiGLU, times each row's weight, quantized along h's rows for down and down its columns for down's dW; the product kept for the backward |
+| h W, down | `rows` | |
+| dy W^T, down | `dswiglu` | SwiGLU's gradient at the kept product, times the row's weight, quantized both ways; the weight's gradient |
+| dp W^T, up and gate | `rows` | |
+| dW, both | `contract`, cuDNN's block-scaled wgrad | |
+
+Their tiles are 256 by 256 on a pair of SMs, where `grouped_mxfp8`'s are 256 by 128,
+and they take each expert's rows from a multiple of 256: the quantizer reads each row
+from its token where it lies and writes the padding as 0, and the tokens' sums read
+the rows back. An exchange's rows come out as they lay, by `grouped_mxfp8.rows`,
+which reads each expert's rows from its own start and packs its output: a gather each
+way otherwise. Their GLU takes each gate 32 columns before its up, where up and
+gate's stack holds them side by side: the quantizer reads W_up's pairs so, and the
+transpose of the product's gradient for up's dW writes them back. Under FSDP, where a
+layer gathers its parameters as it runs (one microbatch, or `methods(gather=layer)`),
+each GPU quantizes its own shard of the experts' kernels, and they are gathered in
+MXFP8: an eighth of the quantizer's work on `fsdp=8`, at bfloat16's bytes, and no
+bfloat16 copy of all 128 experts.
+
+One layer of Qwen3-30B-A3B's experts (128 of 768, 262144 picks; 16 of them by EP,
+327680 rows of which 262144 filled), forward and backward on a B300, by CUPTI:
+
+| | bux's kernels | fused | |
+|-|---------------|-------|-|
+| `sorted` | 6.30 ms | 5.51 ms | the GEMMs with their epilogues 3.20 against 3.43 (2.3 against 2.2 PFLOP/s); none of XLA's 0.73 ms over h and dp, nor the quantizer's of them |
+| by EP | 5.83 ms | 4.97 ms | |
+
+At these shapes cuDNN's GEMM of h W takes 0.44 ms against `grouped_mxfp8`'s 0.53,
+and dp W^T 0.65 against 0.77; its wgrad 0.30 and 0.60 ms against 0.39 and 0.76. The
+values are within MXFP8's rounding of bux's kernels': 2% apart in the output and every
+gradient (relative Frobenius norm), each 6.6% from bfloat16's as before.
+
+megatron.bux on 8 B300s, `remat=none`, the tree before and after on the same node:
+
+| run | bux's kernels | fused |
+|-----|---------------|-------|
+| `sorted`, Megatron's batch (512 rows in 8 microbatches, `gather=layer`) | 36.1k tok/s a GPU, 229.6 GiB | 37.7k (+4.5%), 214.6 GiB |
+| `sorted`, one microbatch of 8 rows a GPU | 37.7k, 215.1 GiB | 38.5k (+2.1%), 200.3 GiB |
+| `nccl_ep`, one microbatch of 8 rows a GPU | 31.4k, 211.1 GiB | 32.4k (+3.1%), 212.7 GiB |
+
+On GPU 0, at one microbatch (traced without XLA's command buffers, whose kernels the
+trace then loses), the experts' kernels and XLA's passes over h and dp take 263 ms a
+step against 319 under `sorted`, and 234 against 280 under `nccl_ep`. Beside FSDP's
+collectives cuDNN's kernels run slower than alone: `dswiglu` takes 1.13 ms against
+0.62 (0.59 under `nccl_ep`, which has none), its tiles statically scheduled where
+`grouped_mxfp8`'s take the SMs as they free. Leaving pairs of SMs to the collectives
+(`CUDNNFE_CLUSTER_OVERLAP_MARGIN`, which all of `grouped_cudnn`'s kernels heed) gains
+0.3% at Megatron's batch with 8 (two runs each, on one node) and 1.1% with 16 (one),
+and loses 2% with 32: left at 0. `sorted` keeps no bfloat16 copy of all 128 experts'
+kernels now, so it takes 15 GiB less. Its compiles take 20 to 110 s more, CuTe DSL compiling each kernel in every
+process. 3000 steps of FineWeb-Edu on the baseline's MoE with experts of 768 (the
+fused kernels' shapes, one B300 a run) end within 0.08% of bux's kernels at each of
+three seeds (eval loss 4.0708, 4.0127, 4.0346 against 4.0742, 4.0099, 4.0363), which
+differ by 1.6%, at 104k tokens a second against 100k.
 
 ## Expert parallelism
 
