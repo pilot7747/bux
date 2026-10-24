@@ -93,7 +93,7 @@ def _jnp_forward(
     seen = _seen(keys, q.shape[1], k.shape[1])
     _, logits = _logits(q, k, scale, cap)
     lse = jax.nn.logsumexp(jnp.where(seen, logits, -jnp.inf), -1)
-    p = jnp.where(seen, jnp.exp(logits - _finite(lse)[..., None]), 0)
+    p = jnp.where(seen, jnp.exp(logits - finite(lse)[..., None]), 0)
     v = jnp.repeat(v.astype(F32), q.shape[2] // v.shape[2], axis=2)
     return jnp.einsum("bhts,bshd->bthd", p, v).astype(q.dtype), lse
 
@@ -112,7 +112,7 @@ def _jnp_backward(
     g, r = k.shape[2], q.shape[2] // k.shape[2]
     raw, logits = _logits(q, k, scale, cap)
     seen = _seen(keys, q.shape[1], k.shape[1])
-    p = jnp.where(seen, jnp.exp(logits - _finite(lse)[..., None]), 0)
+    p = jnp.where(seen, jnp.exp(logits - finite(lse)[..., None]), 0)
     do, kk = dout.astype(F32), jnp.repeat(k.astype(F32), r, axis=2)
     dp = jnp.einsum("bthd,bshd->bhts", do, jnp.repeat(v.astype(F32), r, axis=2))
     ds = p * (dp - jnp.einsum("bthd,bthd->bht", do, out.astype(F32))[..., None])
@@ -132,8 +132,9 @@ def _sum_groups(x: Float[Array, "b s h e"], g: int) -> Float[Array, "b s g e"]:
     return x.reshape(b, s, g, h // g, e).sum(3)
 
 
-def _finite(lse: Float[Array, "*s"]) -> Float[Array, "*s"]:
-    """`lse` with 0 for a query that sees no key: its probabilities are 0 anyway."""
+def finite(lse: Float[Array, "*s"]) -> Float[Array, "*s"]:
+    """Return `lse` with 0 for -inf, the logsumexp of a query that sees no key: its
+    probabilities are 0 anyway."""
     return jnp.where(jnp.isfinite(lse), lse, 0.0)
 
 
@@ -196,12 +197,19 @@ def _tokamax_forward(
     scale: float,
     cap: float | None,
 ) -> Output:
-    """tokamax's residuals are the row's largest logit m and sum of exp(s - m)."""
     assert MOSAIC is not None
     args = _tokamax_args(keys, scale, cap)
     out, (m, total) = MOSAIC(q, k, v, return_residuals=True, **args)
+    return out, tokamax_lse(m, total)
+
+
+def tokamax_lse(
+    m: Float[Array, "b h t"], total: Float[Array, "b h t"]
+) -> Float[Array, "b h t"]:
+    """Return each query's logsumexp from tokamax's residuals, its row's largest
+    logit m and sum of exp(s - m): -inf for a query that sees no key."""
     some = total > 0
-    return out, jnp.where(some, m + jnp.log(jnp.where(some, total, 1)), -jnp.inf)
+    return jnp.where(some, m + jnp.log(jnp.where(some, total, 1)), -jnp.inf)
 
 
 def _tokamax_backward(
@@ -218,7 +226,7 @@ def _tokamax_backward(
     """tokamax's VJP, given the residuals (lse, 1): P = exp(s - lse)."""
     assert MOSAIC is not None
     args = _tokamax_args(keys, scale, cap)
-    return jax_internals.tokamax_vjp(MOSAIC, _finite(lse), out, dout, q, k, v, args)
+    return jax_internals.tokamax_vjp(MOSAIC, finite(lse), out, dout, q, k, v, args)
 
 
 TOKAMAX = Kernel(_tokamax_forward, _tokamax_backward)
@@ -293,7 +301,7 @@ def _share(
 ) -> Float[Array, "b t h 1"]:
     """Return the share exp(lse - total) of a part of a softmax, 0 where neither sees
     a key."""
-    share = jnp.where(jnp.isneginf(total), 0.0, jnp.exp(lse - _finite(total)))
+    share = jnp.where(jnp.isneginf(total), 0.0, jnp.exp(lse - finite(total)))
     return share.transpose(0, 2, 1)[..., None]
 
 
