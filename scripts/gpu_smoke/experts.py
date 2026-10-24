@@ -32,7 +32,13 @@ from bux.train import config as tcfg
 from bux.train.sinks import Scalars, Sink
 from bux.train.trainer import train
 
-METHODS = ["sorted", "all_gather", "all_to_all", "ragged_all_to_all", "ragged_tokens"]
+METHODS = [
+    "sorted",
+    "all_gather",
+    "all_to_all",
+    "ragged_all_to_all",
+    "ragged_tokens",
+]
 ONE = {"data": 1}
 ARCH = """
 d_model = 512

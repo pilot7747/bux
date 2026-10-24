@@ -103,14 +103,15 @@ def layer(**settings) -> MoE:
     return MoE(cfg.MoEConfig.model_validate(given), D, nnx.Rngs(0))
 
 
-def split(method: str, mesh: str, capacity: float | None = None):
-    """`parallel.use` of the mesh and layout MESHES or ONE say, `method` and
-    `capacity`."""
+def split(method: str, mesh: str, capacity: float | None = None, chunks: int = 1):
+    """`parallel.use` of the mesh and layout MESHES or ONE say, `method`, `capacity`
+    and `chunks`."""
     sizes, layout = (MESHES | ONE)[mesh]
+    how = tcfg.MethodsConfig(moe=method, capacity=capacity, moe_chunks=chunks)
     return parallel.use(
         tcfg.MeshConfig.model_validate(sizes),
         tcfg.LayoutConfig.model_validate(layout),
-        tcfg.MethodsConfig(moe=method, capacity=capacity),
+        how,
     )
 
 
@@ -125,11 +126,11 @@ def _loss(e: MoE, x: Float[Array, "b t d"], probe: Float[Array, "b t d"]):
 
 
 @functools.cache
-def _outputs(method: str, mesh: str, option: str, rows: int = 8):
+def _outputs(method: str, mesh: str, option: str, rows: int = 8, chunks: int = 1):
     """The layer's output, and the gradients of its parameters and of its input, by
-    `method` on `mesh`, on the host."""
+    `method` on `mesh` in `chunks`, on the host."""
     x, probe = _inputs(rows)
-    with split(method, mesh):
+    with split(method, mesh, chunks=chunks):
         e = parallel.build(lambda: layer(**OPTIONS[option]))
         y = nnx.jit(lambda e, x: e(x, Taps()))(e, x)
         grads = nnx.jit(nnx.grad(_loss, argnums=(0, 1)))(e, x, probe)
@@ -149,6 +150,13 @@ def test_each_method_computes_what_sorted_does_with_the_same_gradients(
 ):
     one = _outputs("sorted", "one device", option)
     assert_close(_outputs(method, mesh, option), one)
+
+
+@pytest.mark.parametrize("method", CPU)
+def test_each_method_in_chunks_computes_what_sorted_does(method):
+    one = _outputs("sorted", "one device", "latent, expert norm")
+    chunked = _outputs(method, "data=2, expert=4", "latent, expert norm", chunks=2)
+    assert_close(chunked, one)
 
 
 @pytest.mark.skipif(jax.default_backend() == "cpu", reason="XLA:CPU lacks it")
@@ -203,10 +211,38 @@ def test_tokens_that_do_not_split_over_the_experts_axes_are_an_error():
 
 GROUPED = "data=2, expert=4"  # two groups of 4 devices, a row of 4 tokens each
 RAGGEDS = [EMULATED, TOKENS]
-BOUNDED = ["all_gather", *RAGGEDS]  # the methods a capacity bounds
+BOUNDED = ["all_gather", "all_to_all", *RAGGEDS]  # the methods a capacity bounds
 
 
-def fits(
+def fits(idx: Int[np.ndarray, "b t k"], capacity: float, method: str):
+    """Which picks fit on GROUPED with `capacity`, as `method` lays them out."""
+    if method == "all_to_all":
+        return fits_each_peer(idx, capacity)
+    return fits_each_device(idx, capacity, once=method == TOKENS)
+
+
+def fits_each_peer(
+    idx: Int[np.ndarray, "b t k"], capacity: float
+) -> Bool[np.ndarray, "b t k"]:
+    """Which picks fit on GROUPED with `capacity`, as all_to_all lays them out: of
+    the picks device i of a group sends device j, expert 0's in token order, then
+    expert 1's, and so on, to `capacity` times a peer's share of i's picks."""
+    groups, peers, local = 2, 4, 2
+    picks = idx.reshape(groups, peers, -1)  # [g, i, m]
+    room = math.ceil(capacity * picks.shape[-1] / peers)
+    kept = np.zeros(picks.shape, bool)
+    for g, i, j in itertools.product(range(groups), range(peers), range(peers)):
+        mine = picks[g, i]
+        theirs = [
+            m
+            for e in range(j * local, (j + 1) * local)
+            for m in np.flatnonzero(mine == e)
+        ]
+        kept[g, i, theirs[:room]] = True
+    return kept.reshape(idx.shape)
+
+
+def fits_each_device(
     idx: Int[np.ndarray, "b t k"], capacity: float, once: bool
 ) -> Bool[np.ndarray, "b t k"]:
     """Which picks fit on GROUPED with `capacity`, as the methods it bounds lay them
@@ -258,10 +294,10 @@ def masked(monkeypatch):
     """Register "masked": `sorted` with the weights of the picks `fits` drops at 0;
     return their share."""
 
-    def using(capacity: float, once: bool) -> float:
+    def using(capacity: float, method: str) -> float:
         x, _ = _inputs()
         e = layer(**OPTIONS["gated"])
-        mask = jnp.asarray(fits(np.asarray(e._route(x)[0]), capacity, once))
+        mask = jnp.asarray(fits(np.asarray(e._route(x)[0]), capacity, method))
 
         def run(moe, z, idx, weights, taps=None):
             kept = jnp.where(mask, weights, 0)
@@ -279,7 +315,7 @@ def masked(monkeypatch):
 def test_a_capacity_drops_the_picks_past_it_and_reports_their_share(
     masked, method, capacity
 ):
-    share = masked(capacity, once=method == TOKENS)
+    share = masked(capacity, method)
     assert share > 0  # else the test tests nothing
     y, grads, reported = _with_capacity(method, GROUPED, capacity)
     want, want_grads, _ = _with_capacity("masked", "one device", None)
@@ -312,7 +348,7 @@ def test_what_the_buffers_held_before_the_exchange_never_shows(
     if capacity is None:
         want, want_grads, _ = _with_capacity("sorted", "one device", None)
     else:
-        masked(capacity, once=method == TOKENS)
+        masked(capacity, method)
         want, want_grads, _ = _with_capacity("masked", "one device", None)
     assert_close((y, grads), (want, want_grads))
 
@@ -343,7 +379,7 @@ def _dispatched(method: str, mesh: str, dispatch: Literal["compute", "mxfp8"]):
 
 
 @pytest.mark.parametrize("mesh", ["data=2, fsdp=2, expert=2", GROUPED])
-@pytest.mark.parametrize("method", RAGGEDS)
+@pytest.mark.parametrize("method", ["all_to_all", *RAGGEDS])
 def test_a_dispatch_in_mxfp8_computes_what_sorted_does_of_its_tokens_quantized(
     monkeypatch, method, mesh
 ):
@@ -360,21 +396,36 @@ def test_a_dispatch_in_mxfp8_computes_what_sorted_does_of_its_tokens_quantized(
     assert not np.allclose(got[0], _dispatched(method, mesh, "compute")[0])
 
 
-def test_a_dispatch_in_mxfp8_sends_a_byte_a_value_and_one_a_scale_of_32():
+def _sent(method: str, op: str) -> list[str]:
+    """The operand types of the exchanges `op` of the layer's gradient by `method` on
+    fsdp=2, expert=4, at WIDE, its tokens sent in MXFP8."""
     x = jax.random.normal(jax.random.key(1), (8, 4, WIDE))
     config = cfg.MoEConfig(num_experts=8, top_k=2, expert=GATED)
     precision = tcfg.PrecisionConfig(dispatch="mxfp8")
-    with split(RAGGED, "fsdp=2, expert=4"), matmuls.use(precision):
+    with split(method, "fsdp=2, expert=4"), matmuls.use(precision):
         e = parallel.build(lambda: MoE(config, WIDE, nnx.Rngs(0)))
         loss = nnx.grad(lambda e, x: e(x, Taps()).sum(), argnums=(0, 1))
         lowered = nnx.jit(loss).lower(e, x).as_text()
-    exchanges = [line for line in lowered.splitlines() if "@ragged_all_to_all" in line]
-    sent = [line.split(" : (")[1].split(",")[0] for line in exchanges]
-    # Forward, there in bytes and back; backward, both ways in float32.
-    assert sorted(sent) == sorted(
-        [f"tensor<8x{WIDE + WIDE // 32}xui8>"]
-        + ["tensor<32x64xf32>", "tensor<8x64xf32>", "tensor<32x64xf32>"]
+    exchanges = [line for line in lowered.splitlines() if op in line]
+    return sorted(
+        line.split(" : (")[1].split(",")[0].split(")")[0] for line in exchanges
     )
+
+
+BYTES = f"x{WIDE + WIDE // 32}xui8>"  # a row of bytes: its values, then its scales
+
+
+def test_a_dispatch_in_mxfp8_sends_a_byte_a_value_and_one_a_scale_of_32():
+    # Forward, there in bytes and back; backward, both ways in float32.
+    want = [f"tensor<8{BYTES}", "tensor<32x64xf32>", "tensor<8x64xf32>"]
+    assert _sent(RAGGED, "@ragged_all_to_all") == sorted([*want, "tensor<32x64xf32>"])
+
+
+def test_all_to_all_sends_its_buffers_in_mxfp8_and_their_sizes_alongside():
+    # 4 peers' buffers of 8 slots; forward, there in bytes and back; backward, both
+    # ways in float32; and how many rows of each expert each peer sent.
+    want = [f"tensor<32{BYTES}", "tensor<4x2xi32>", *["tensor<32x64xf32>"] * 3]
+    assert _sent("all_to_all", "stablehlo.all_to_all") == sorted(want)
 
 
 # --- Training --------------------------------------------------------------------------
