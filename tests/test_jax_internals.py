@@ -287,6 +287,17 @@ def test_a_buffer_callback_hands_its_run_xla_s_stream_and_device():
     assert isinstance(stream, int) and kind == 2 and device == 0  # kDLCUDA, GPU 0
 
 
+@CPU
+def test_a_run_on_a_stream_is_one_call_marked_for_it_with_its_gradient():
+    def f(x: jax.Array) -> jax.Array:
+        return jax_internals.on_stream("gpu_stream:1", lambda: jnp.sin(x) * 2).sum()
+
+    text = jax.jit(f).lower(jnp.ones(3)).as_text()
+    [call] = [line for line in text.splitlines() if " = call @" in line]
+    assert '_xla_stream_annotation = "1"' in call and 'inlineable = "false"' in call
+    np.testing.assert_allclose(jax.grad(f)(jnp.zeros(3)), [2.0, 2.0, 2.0])
+
+
 @GPU
 def test_cudnn_s_attention_attends_causally_and_by_documents():
     q, k, v = _qkv(jax.random.key(0), (2, 256, 4, 64))

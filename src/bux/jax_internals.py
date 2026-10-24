@@ -18,6 +18,7 @@ from jax._src.api import VJP, NotNeeded, NotSaveable
 from jax._src.cudnn import fused_attention_stablehlo as cudnn_fused
 from jax._src.cudnn.scaled_matmul_stablehlo import _scaled_matmul_p
 from jax.experimental import buffer_callback as callbacks
+from jax.experimental.compute_on import compute_on
 from jax.extend import core
 from jaxtyping import Array, Float, Int, Shaped
 
@@ -190,6 +191,16 @@ def buffer_callback(
     `context.stream` is the stream XLA runs on, and `ins[0].__dlpack_device__()` the
     device. fused_delta.py runs cuDNN's graphs of the delta rule so."""
     return callbacks.buffer_callback(run, results)
+
+
+def on_stream(stream: str, run: Callable[[], Any]) -> Any:
+    """Return run(), its ops on the GPU stream `stream` ("gpu_stream:1"): XLA makes
+    them one async call there, which the compute stream's kernels run beside, by
+    --xla_gpu_experimental_stream_annotation (on by default). A CPU ignores it.
+    nccl_ep.py runs NCCL EP's kernels so; jax 0.10.1 named compute_on compute_on2,
+    and 0.11.1 back."""
+    on = compute_on(compute_type=stream, out_memory_spaces=jax.memory.Space.Device)
+    return on(run)()
 
 
 def _keeps_its_inputs(

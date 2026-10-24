@@ -482,6 +482,8 @@ class MethodsConfig(Config):
     # The slices of each device's tokens that expert parallelism sends one after
     # another, so that one's exchange runs beside another's experts.
     moe_chunks: Positive = 1
+    # nccl_ep's kernels on a GPU stream of their own, beside the compute stream's.
+    moe_stream: bool = False
     recurrence: str = "scan"
     # What the backward pass of a recurrence by chunks reads of its chunks' states:
     # kept from the forward pass, or computed again from its inputs, in a fourteenth

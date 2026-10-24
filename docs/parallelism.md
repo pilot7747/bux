@@ -1209,6 +1209,11 @@ Only `all_to_all` gains from it, on 8 B300s with jax 0.12:
   buffer and runs its experts on the one it gets) hides half its time, but seven of
   them take twice as long as one all-to-all, by NCCL or by copy engines
   (`--xla_gpu_use_memcpy_local_p2p`): 394k tokens a second.
+- `nccl_ep`'s kernels can run beside the experts on a stream of their own
+  (`methods.moe_stream`, [below](#transformerengines-nccl-ep)), but XLA's schedule
+  does not put another chunk's experts beside them, and the chunks cost more than
+  they hide: megatron.bux's MoE layer forward and backward took 13.9 ms in 2 chunks
+  and 15.0 in 4, against 13.3 whole.
 
 For the baseline's MoE at 32k tokens a GPU and a capacity of 1.25, profiled, tokens a
 second and ms of a step of a GPU: all its collectives, those with no compute beside
@@ -1287,9 +1292,12 @@ by `--build-arg TE_VERSION`).
 `nccl_ep` runs TE's one-device primitives in the shard_map the other methods run in,
 a `jax.custom_vjp` each way (`parallel/nccl_ep.py`); the experts take the rows as
 they arrive, their blocks padded to 128 as they are. NCCL EP keeps its buffers
-outside the step, sized for a device's share of a step's tokens and for the rows
-`methods.capacity` lets it take, so `methods.prepare` starts it once a process before
-the step traces (`nccl_ep.start`): 25 to 60 s between two nodes. Under a capacity,
+outside the step, sized for the most tokens a device sends at once, a chunk of its
+share of a step's (`methods.moe_chunks`), and for the rows `methods.capacity` lets it
+take, so `methods.prepare` starts it once a process before the step traces
+(`nccl_ep.start`): 25 to 60 s between two nodes. Every dispatch then brings that many
+rows, a microbatch's too: NCCL EP takes no fewer, and fails with "invalid argument"
+where they are fewer. Under a capacity,
 the picks that do not fit drop before NCCL EP sends them, as `ragged_all_to_all`
 drops them (`nccl_ep._kept`): with NCCL EP's own drops, EP=16's balance loss rose to
 35 in 25 steps and its loss came off `sorted`'s. The weights of the padding are
@@ -1343,6 +1351,57 @@ top 8, 32k tokens a GPU, a capacity of 1.25), its experts the identity, on B300s
 In a node it wins by sending less, not faster: its kernels move 330 to 370 GB/s, far
 from NVLink's 900. Between nodes it sends a quarter as much over InfiniBand, and with
 `NCCL_GIN_TYPE=2 NCCL_EP_TOKENS_PER_CHUNK=256` its exchanges take 28% as long.
+
+#### On a stream of its own: `methods.moe_stream`
+
+```
+methods = methods(moe=nccl_ep, capacity=1.25, moe_stream=true)
+```
+
+NCCL EP's kernels go on the compute stream, where nothing runs beside them. With
+`moe_stream` they run on one of their own (`nccl_ep.STREAM`): jax's `compute_on`
+marks each of TE's calls, prepare and dispatch as one, and XLA makes it an async call
+there (`--xla_gpu_experimental_stream_annotation`, on by default), whose results the
+compute stream waits for where it uses them. On 8 B300s, at megatron.bux's shapes
+(EP=8, 32k tokens a GPU, a capacity of 1.25), an exchange (3.4 ms) and an independent
+grouped GEMM (2.8 ms) took 6.0 ms on one stream and 4.9 on two, and one MoE layer's
+forward and backward 12.7 ms against 13.3. megatron.bux's `nccl_ep` arm, side by side
+on a node under `remat=save_attention`:
+
+| NCCL EP's kernels | tok/s a GPU | peak | step on GPU 0 | exposed exchange |
+|-------------------|-------------|------|---------------|------------------|
+| on the compute stream | 21.2k | 99.0 GiB | 1547 ms | 489 ms |
+| on their own, `moe_stream=true` | 21.9k | 169.4 GiB | 1495-1504 ms | 410-415 ms |
+| the same, `moe_chunks=2` | 21.4k | 179.0 GiB | | |
+
+It is off by default for the memory: XLA's latency hiding scheduler starts the
+backward's recomputed dispatches early to hide them, and the step's temporaries grow
+from 55 to 125 GiB, most of them the experts' MXFP8 operands of some 80 layers' worth
+at once; `--xla_gpu_memory_limit_slop_factor=50` does not stop it (21.0k, 170.5 GiB).
+Under `remat=none`, which computes no forward again, it should not arise: untried.
+
+Chunks gain nothing yet, since XLA's schedule leaves little beside NCCL EP's calls. It
+places each call's done right after its start, but for the last before a GEMM, so the
+compute stream waits for each at once; in chunks it runs every chunk's dispatch, then
+every chunk's experts, then the combines. Neither every chunk's routing first, behind
+an optimization barrier, nor costs for the experts' kernels (`latency_metadata`)
+changes that. Scheduling groups (`_scheduling_group_id`, which jax's
+`xla_metadata_call2` can put on a stream's call too) moved one chunk's experts beside
+another's exchange in the forward (2 chunks: 6.1 ms against 6.6), but XLA rejects them
+in the backward ("annotation groups with gaps"), where a chunk's forward and backward
+share an id. The experts cannot go on a stream of their own either: tokamax's Mosaic
+GEMM fails to compile in an async call ("Parsing error" in ptxas).
+
+What NCCL EP's step holds, under `remat=none`: XLA's analysis says 266 GiB, 42.7 of them
+the parameters and the optimizer's state and 223.2 one buffer of temporaries, of which
+221.8 are live at once at the end of the forward. 148 GiB of those are the experts',
+four rows of each layer's 329,728 (at a capacity of 1.25) kept for the backward: the
+`down` GEMM's bfloat16 output (1.26 GiB a layer), `up` and `gate`'s (0.94), and the
+MXFP8 copies of the rows and of the activations that the weights' gradients take
+(0.63 and 0.24). Attention keeps 24 GiB, the dense MXFP8 matmuls 21. A capacity of 1.5
+took 2.4 GiB more under `save_attention`, 5% fewer tokens a second, and on
+megatron.bux's synthetic batch dropped as much as 1.25 from its 15th step on (8% of the
+picks a layer, its balance loss rising to 83 summed over the layers).
 
 What it takes from JAX:
 
