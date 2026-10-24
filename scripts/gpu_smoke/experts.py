@@ -5,13 +5,14 @@
 
 On every visible GPU, an even number of them, each method of methods.moe on each
 mesh: the MoE layer's output and gradients against `sorted` on one GPU, then a short
-run's losses against one GPU's, and its tokens a second. It exits 1 if the layer or
-the first loss differs by more than 1e-4, or any later loss by more than 1e-3:
-rounding differs between splits, and the top-k picks and the updates after them
-amplify it as the run goes on (examples/experiments/parallel/laptop.bux). Then the
-run with its routed experts in MXFP8 (`grouped_mxfp8`'s GEMMs), on one GPU and by
-ragged_all_to_all: within `MXFP8_TOLERANCE` of bfloat16's losses. If NCCL's
-ragged all-to-all hangs, as it was reported to on jax 0.11, try
+run's losses against one GPU's, and its tokens a second. It exits 1 if the layer
+differs by more than 1e-4, the first loss by more than `first_loss_tolerance`, or any
+later loss by more than 3e-3: rounding differs between splits, and the top-k picks
+and the updates after them amplify it as the run goes on
+(examples/experiments/parallel/laptop.bux). Then the run with its routed experts in
+MXFP8 (`grouped_mxfp8`'s GEMMs), on one GPU and by ragged_all_to_all: within
+`MXFP8_TOLERANCE` of bfloat16's losses. If NCCL's ragged all-to-all hangs, as it was
+reported to on jax 0.11, try
 XLA_FLAGS=--xla_gpu_experimental_ragged_all_to_all_use_barrier_with_nccl=false.
 """
 
@@ -52,6 +53,11 @@ EXPERT = cfg.MLPConfig(type="gated_mlp", intermediate_size=128, activation="swis
 NORM = cfg.NormalizationConfig(type="rmsnorm")
 MXFP8 = "precision(roles=roles(experts=mxfp8))"
 MXFP8_TOLERANCE = 1e-2  # of the losses, against bfloat16's: 1e-3 off on B300s
+# The methods that sum a token's picks on each device it visits, rounded to bfloat16,
+# and then add the devices' sums: they round the layer's output twice, the others
+# once. On B300s their first loss was 1.4e-4 off, the others' 3e-5; in float32 every
+# method's was one GPU's, and with those sums kept in float32 theirs was 2e-5 off.
+SUMMED_ON_EACH_DEVICE = {"all_gather", "ragged_tokens"}
 
 
 class Reports(Sink):
@@ -100,6 +106,11 @@ def run(
     return losses, speed
 
 
+def first_loss_tolerance(method: str) -> float:
+    """Return how far a run's first loss by `method` may be from one GPU's."""
+    return 3e-4 if method in SUMMED_ON_EACH_DEVICE else 1e-4
+
+
 def differs(a: list, b: list) -> float:
     """How far apart two lists of arrays or numbers are at worst, relative to the
     largest magnitude in each of `b`'s."""
@@ -129,7 +140,7 @@ def main() -> int:
             losses, speed = run(mesh, method, steps)
             first, loss = differs(losses[:1], one[:1]), differs(losses, one)
             # bfloat16, the default, rounds a run's later losses apart by up to 2e-3.
-            failed |= out > 1e-4 or first > 1e-4 or loss > 3e-3
+            failed |= out > 1e-4 or first > first_loss_tolerance(method) or loss > 3e-3
             print(
                 f"{source(mesh):28} {method:18} {speed:,.0f} tok/s; off by {out:.1e} "
                 f"in the layer, {first:.1e} in the first loss, {loss:.1e} in all",
