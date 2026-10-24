@@ -84,7 +84,7 @@ def expert_parallel(body: Body) -> Callable[..., Float[Array, "b t d"]]:
         ep = axes_of(spec(("experts",), (moe.config.num_experts,)))
         if not ep:
             return run_sorted(moe, z, idx, weights, taps)
-        tokens = _token_spec(z, ep)
+        tokens = token_spec(z.shape, ep)
         ffn, norm = moe.config.expert, moe.expert_norm
         chunked = in_chunks(body, _chunks())
 
@@ -109,18 +109,19 @@ def _in_float32(kernels: Kernels) -> Kernels:
     return up.astype(jnp.float32), wide, down.astype(jnp.float32)
 
 
-def _token_spec(z: Float[Array, "b t d"], ep: Axes) -> P:
-    """Return the tokens' spec: rows over `batch` and positions over `seq`, and rows
-    over the experts' axes `ep` too where those leave them whole."""
-    batch, seq, _ = spec(("batch", "seq", None), z.shape)
+def token_spec(shape: tuple[int, ...], ep: Axes) -> P:
+    """Return the spec of tokens of `shape` (b, t, d): rows over `batch` and positions
+    over `seq`, and rows over the experts' axes `ep` too where those leave them
+    whole."""
+    batch, seq, _ = spec(("batch", "seq", None), shape)
     taken = axes_of(P(batch, seq))
     rows = axes_of(P(batch)) + tuple(a for a in ep if a not in taken)
     on = active()
     assert on is not None  # `ep` came from a mesh
-    if z.shape[0] % on.size(*rows):
+    if shape[0] % on.size(*rows):
         raise ValueError(
             f"the experts split over {ep}, and so do the tokens: "
-            f"{z.shape[0]} rows do not split over {rows}"
+            f"{shape[0]} rows do not split over {rows}"
         )
     return P(rows or None, seq, None)
 

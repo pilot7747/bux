@@ -1039,7 +1039,7 @@ tokens of FineWeb-Edu end 0.13% and 0.05% below it, with FP8 dispatch
 
 ## Expert parallelism
 
-Four methods of `methods.moe` split the experts over the axes `layout.experts` gives
+Five methods of `methods.moe` split the experts over the axes `layout.experts` gives
 them, `expert` by default: each device holds its own experts' kernels, and runs them
 on the picks of every device of its group.
 
@@ -1054,6 +1054,7 @@ methods = methods(moe=ragged_all_to_all, capacity=1.25)
 | `all_to_all`        | each pick goes to its expert's device and back by `jax.lax.all_to_all`, in a buffer of one size for each peer, sorted by expert: a device runs its experts on each peer's buffer as it arrives, a grouped GEMM a peer |
 | `ragged_all_to_all` | each pick goes to its expert's device and back by `jax.lax.ragged_all_to_all`, a slice for each expert of each peer: a device's rows arrive sorted by its experts, which run on them as they are. XLA:CPU lacks it |
 | `ragged_tokens`     | the same, but each token goes once to each device that holds any of its experts, with its picks there, and comes back as their weighted sum: a row per device, not per pick |
+| `nccl_ep`           | each token goes once to each device that holds any of its experts, and once to each other node, by NCCL EP's kernels through TransformerEngine's JAX bindings; it arrives as a row for each of its picks there, grouped by expert: GPUs only ([below](#transformerengines-nccl-ep)) |
 
 Each runs in a `jax.shard_map` manual over the axes that split the tokens (those of
 `batch` and `seq`), not over `expert` alone: a sort of tokens split over an Auto axis
@@ -1269,14 +1270,59 @@ The exchanges name what they bring `experts.exchanged`, under `experts`, so that
 
 ### TransformerEngine's NCCL EP
 
+```
+mesh    = mesh(expert=16)                        # over two nodes
+methods = methods(moe=nccl_ep, capacity=1.25)
+```
+
 TransformerEngine (2.18 on, `transformer_engine.jax.ep`) dispatches and combines by
 NCCL EP, a DeepEP of NCCL's device API: loads and stores over NVLink in a node, RDMA
 the GPU starts (NCCL's GIN) between nodes, no NVSHMEM. A token goes once to each GPU
 that holds any of its experts, as in `ragged_tokens`, and once to each other node,
-whose NVLink takes it on; it arrives as a row for each of its experts there, grouped
-by expert, each expert's rows padded to 128. Since 2.20 one process drives all its
+whose NVLink takes it on; it arrives as a row for each of its picks there, grouped by
+expert, each expert's rows padded to 128. Since 2.20 one process drives all its
 node's GPUs, on a communicator TE borrows from XLA. The Docker image has it with
-`--build-arg TE=2.20.2`. No method of `methods.moe` runs on it yet.
+`--build-arg TE=2.20.2`.
+
+`nccl_ep` runs TE's one-device primitives in the shard_map the other methods run in,
+a `jax.custom_vjp` each way (`parallel/nccl_ep.py`); the experts take the rows as
+they arrive, their blocks padded to 128 as they are. NCCL EP keeps its buffers
+outside the step, sized for a device's share of a step's tokens and for the rows
+`methods.capacity` lets it take, so `methods.prepare` starts it once a process before
+the step traces (`nccl_ep.start`): 25 to 60 s between two nodes. Under a capacity,
+the picks that do not fit drop before NCCL EP sends them, as `ragged_all_to_all`
+drops them (`nccl_ep._kept`): with NCCL EP's own drops, EP=16's balance loss rose to
+35 in 25 steps and its loss came off `sorted`'s. The weights of the padding are
+garbage, so each expert's count of the picks kept for it says which rows hold picks.
+bux sets `NCCL_GIN_TYPE=2` and `NCCL_EP_TOKENS_PER_CHUNK=256` where the environment
+does not (`runtime.configure`). It takes one MoE shape a run, the experts over one
+axis, and bfloat16: MXFP8 dispatch is an error, as is a run without TE.
+`tests/test_nccl_ep.py` runs a token's path on CPU through an emulation of TE's
+primitives, against `sorted`, and under a capacity against `ragged_all_to_all`; on 16
+GPUs of two nodes, EP=16, a layer's output and gradients come within bfloat16's
+rounding (4e-3 to 8e-3 of the largest) of `sorted`'s dropless, and of
+`ragged_all_to_all`'s at a capacity of 1.
+
+The baseline's MoE at 32k tokens a GPU, a capacity of 1.25, by `scripts/benchmark.py`
+(`one_node.bux` and `two_nodes.bux`, their `moe` and `moe_ep`, the rest set as below):
+tokens a second, peak memory, and the loss of the 30th step of 30 (at the 5th, 12.233
+on one node and 12.222 on two, for all):
+
+| GPUs | method | mesh | tok/s | peak | loss |
+|------|--------|------|-------|------|------|
+| 8 | `sorted` | `fsdp=8` | 831k | 83.8 GiB | 11.843 |
+| | `ragged_all_to_all` | `expert=8` | 544k | 88.4 GiB | 11.842 |
+| | `nccl_ep` | `expert=8` | 615k | 89.3 GiB | 11.867 |
+| 16 | `sorted` | `data=2, fsdp=8` | 1,586k | 83.8 GiB | 11.820 |
+| | `ragged_all_to_all` | `data=2, expert=8` | 1,016k | 87.0 GiB | 11.825 |
+| | `nccl_ep` | `data=2, expert=8` | 1,192k | 89.3 GiB | 11.822 |
+| | `ragged_all_to_all` | `data=1, expert=16` | 324k | 84.4 GiB | 11.836 |
+| | `nccl_ep` | `data=1, expert=16` | 773k | 85.0 GiB | 11.844 |
+
+EP over two nodes is 2.4x as fast by `nccl_ep` as by `ragged_all_to_all`, but at 63%
+of a node's tokens a GPU; EP in a node and data across them stays the faster EP, 17%
+past `ragged_all_to_all` side by side (another pair of runs: 1,158k and 1,023k), and
+`sorted` the fastest of all at this shape.
 
 One layer's dispatch and combine at the baseline MoE's shapes (d 2048, 64 experts,
 top 8, 32k tokens a GPU, a capacity of 1.25), its experts the identity, on B300s of
@@ -1300,10 +1346,9 @@ from NVLink's 900. Between nodes it sends a quarter as much over InfiniBand, and
 
 What it takes from JAX:
 
-- Across nodes only its one-device primitives ran, per device in a `jax.shard_map`
-  as bux's methods run, with a `jax.custom_vjp` over them: its global-view ops
-  (`ep_dispatch`, `ep_combine`) hung at their first dispatch, on XLA's collective
-  stream or off it.
+- Across nodes only its one-device primitives ran, as `nccl_ep` runs them: its
+  global-view ops (`ep_dispatch`, `ep_combine`) hung at their first dispatch, on XLA's
+  collective stream or off it.
 - Those global-view ops run on XLA's collective stream, where on jax 0.12 a resharding
   next to them fails to compile ("No ExecutionStreamId found"): what they take and
   give must stay split over the experts' axis.

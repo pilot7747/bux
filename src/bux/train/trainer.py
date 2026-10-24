@@ -717,6 +717,7 @@ def train(
         parallel.check(config.batch, config.seq_len)
         _check_cpu_bfloat16(run)
         model = parallel.build(lambda: Model(run.arch, rngs=nnx.Rngs(config.seed)))
+        parallel.methods.prepare(run)
         precision = config.precision
         tx = optimizer(
             config.optimizer, multiplier, model, config.clip, precision.moments
