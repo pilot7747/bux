@@ -1,4 +1,5 @@
-"""The device grid: one mesh of all six axes, and the settings `use` puts in force."""
+"""The device grid: one mesh of all six axes, the settings `use` puts in force, and
+which of its axes the shard_maps being traced map."""
 
 import contextvars
 import math
