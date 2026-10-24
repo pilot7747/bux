@@ -8,7 +8,7 @@ import jax
 from jax.sharding import AbstractMesh, Mesh, use_abstract_mesh
 
 from bux.parallel import methods as registries
-from bux.parallel.layout import axes
+from bux.parallel.layout import split_axes
 from bux.parallel.mesh import ACTIVE, AXES, Active, active, mesh
 from bux.train.config import LayoutConfig, MeshConfig, MethodsConfig
 
@@ -38,10 +38,6 @@ def use(
         ACTIVE.reset(token)
 
 
-def _split_axes(name: str, on: Active) -> tuple[str, ...]:
-    return tuple(a for a in axes(on.layout, name) if on.size(a) > 1)
-
-
 def check(batch: int, seq_len: int) -> None:
     """Raise unless `batch` rows of `seq_len` tokens split evenly: the rows into
     `methods.microbatches`, then over the batch axes, and the positions over the seq
@@ -60,7 +56,7 @@ def check(batch: int, seq_len: int) -> None:
         ("seq_len", seq_len, "seq", 1, ""),
         ("seq_len", seq_len, "stream", 1, ""),
     ):
-        over = _split_axes(name, on)
+        over = split_axes(on, name)
         if (size // parts) % on.size(*over):
             split = " × ".join(f"{a}={on.size(a)}" for a in over)
             raise ValueError(

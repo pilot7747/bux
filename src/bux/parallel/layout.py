@@ -6,7 +6,7 @@ those of an activation with ``shard``. Outside ``use`` names do nothing, so one
 device runs as if there were none.
 """
 
-from collections.abc import Sequence
+from collections.abc import Collection, Sequence
 
 import jax
 from flax import nnx
@@ -58,6 +58,12 @@ def axes_of(spec: P) -> Split:
     return tuple(a for entry in spec for a in as_split(entry))
 
 
+def split_axes(on: Active, name: Name, skip: Collection[str] = ()) -> Split:
+    """Return the axes of `on`'s mesh that split the dimension `name`: those its
+    layout gives it, but those of size 1 and those in `skip`."""
+    return tuple(a for a in axes(on.layout, name) if on.size(a) > 1 and a not in skip)
+
+
 def resolve(names: Sequence[Name], shape: tuple[int, ...], on: Active) -> list[Split]:
     """Return the mesh axes that each dimension of an array splits over.
 
@@ -70,9 +76,7 @@ def resolve(names: Sequence[Name], shape: tuple[int, ...], on: Active) -> list[S
     used = set(manual_axes())
     splits = []
     for name, size in zip(names, shape):
-        split = tuple(
-            a for a in axes(on.layout, name) if on.size(a) > 1 and a not in used
-        )
+        split = split_axes(on, name, skip=used)
         if (name[1] if isinstance(name, tuple) else size) % on.size(*split):
             split = ()
         used.update(split)
