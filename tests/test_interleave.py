@@ -80,6 +80,24 @@ def test_interleaved_microbatches_give_the_loop_s_gradients_and_state(
 
 
 @pytest.mark.parametrize(
+    ("accumulate", "gather"), [("unreduced", "step"), ("reduced", "layer")]
+)
+def test_interleaved_microbatches_add_up_as_the_loop_s(accumulate, gather):
+    """Each device's own gradients summed once (in a shard_map over the rows' axes),
+    and the parameters gathered a layer at a time."""
+    settings = {"accumulate": accumulate, "gather": gather}
+    with parallel.use(tcfg.MeshConfig(fsdp=8)):
+        loop = _trainer("blocks", 2, **settings)
+        both = _trainer("blocks", 2, interleave=True, **settings)
+        batch = parallel.shard_batch(_documents())
+        g1, m1 = nnx.jit(loop.gradients)(loop.model, batch)
+        g2, m2 = nnx.jit(both.gradients)(both.model, batch)
+    close = jax.tree.map(lambda a, b: jnp.allclose(a, b, atol=1e-6), g1, g2)
+    assert all(jax.tree.leaves(close))
+    assert all(np.isclose(m1[k], m2[k], atol=1e-6) for k in m1)
+
+
+@pytest.mark.parametrize(
     "methods",
     [
         # MXFP8 but the first and the last branch, which the pieces number as the
@@ -149,6 +167,8 @@ def _trainer(
     source: str | None = None,
     interleave: bool = False,
     matmuls: tcfg.PrecisionConfig | str = "compute",
+    accumulate: str = "auto",
+    gather: str = "step",
 ) -> Trainer:
     text = source if source is not None else PRELUDE + MODELS[arch or "llama"]
     [run] = compile_runs(text + "\n" + TRAIN)
@@ -157,7 +177,14 @@ def _trainer(
     tx = optimizer(t.optimizer, lr_multiplier(t.schedule, t.steps), model, t.clip)
     loss = objective(t.loss, run.arch)
     return Trainer(
-        model, tx, loss, matmuls=matmuls, microbatches=n, interleave=interleave
+        model,
+        tx,
+        loss,
+        matmuls=matmuls,
+        microbatches=n,
+        interleave=interleave,
+        accumulate=accumulate,
+        gather=gather,
     )
 
 
