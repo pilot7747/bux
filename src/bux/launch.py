@@ -125,9 +125,12 @@ def join() -> None:
     if processes() == 1 or jax.distributed.is_initialized():
         return
     if "JAX_NUM_PROCESSES" in os.environ:  # jax reads JAX_COORDINATOR_ADDRESS itself
+        # The variables say all there is: no detection of a cluster, which on
+        # Kubernetes asks its API, or warns that the client to ask it is missing.
         jax.distributed.initialize(
             num_processes=int(os.environ["JAX_NUM_PROCESSES"]),
             process_id=int(os.environ["JAX_PROCESS_ID"]),
+            cluster_detection_method="deactivate",
         )
     else:
         jax.distributed.initialize()  # from Slurm's or Open MPI's environment
