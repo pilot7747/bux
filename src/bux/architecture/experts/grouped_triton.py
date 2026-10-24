@@ -4,11 +4,14 @@ a power-of-two scale per 32, in one pass over x, straight into the layout that
 whole tiles of 128 along what it is in blocks along, and each tile's scales in their
 bytes of tensor memory's 512-byte tiles. x is a matrix, or a stack of them, (g, r, c),
 as each expert's W is; its rows from `filled` on quantize as 0. Given an index, the
-rows are x[index], each read from x where it lies: an MoE's picks, from its tokens.
+rows are x[index], each read from x where it lies: an MoE's picks, from its tokens; a
+row at -1 is 0. Given `halves`, x's columns are pairs, as a gated MLP's up and gate
+lie, read as ``grouped_cudnn``'s GLU takes them (`halves_of`).
 
 A program takes TILE_ROWS rows by 128 columns of x, in x's dtype: x's blocks along
 its rows, and x^T's down x's columns, so that only the E4M3 bytes of x^T transpose.
-The scaling, by a power of two, is exact in bfloat16 as in float32.
+The scaling, by a power of two, is exact in bfloat16 as in float32. `transposed`
+transposes E4M3 bytes on their own, the GLU's halves back into pairs.
 """
 
 from typing import no_type_check
@@ -18,7 +21,7 @@ import jax.numpy as jnp
 import jax_triton
 import triton
 import triton.language as tl
-from jaxtyping import Array, Float, Int, UInt8
+from jaxtyping import Array, Float, Int, Shaped, UInt8
 
 from bux import jax_internals
 from bux.architecture.experts.grouped_mxfp8 import LANES, Tiled
@@ -29,6 +32,8 @@ jax_internals.keep_triton_calls_whole()  # jax-triton's own rule fails on jax 0.
 # Rows of x a program takes, and its warps: 5.2 TB/s on a B300 at an MoE's shapes, 1.3x
 # 4 warps and 1.7x 128 rows; rows gathered by index, 5.8 TB/s on one warp, 1.1x two.
 TILE_ROWS, WARPS, GATHERED_WARPS = 32, 2, 1
+# The tiles `transposed` takes, of 128 by 128 bytes: 1.7x tiles of 64 on a B300.
+TRANSPOSED = 128
 
 
 def quantized_twice(
@@ -36,11 +41,13 @@ def quantized_twice(
     filled: Int[Array, ""],
     columns: bool = True,
     index: Int[Array, " m"] | None = None,
+    halves: bool = False,
 ) -> tuple[Tiled, Tiled | None]:
     """Return x along its rows and, if `columns`, x^T along its rows, in MXFP8 as
     `blockscaled.mx_twice` quantizes them, laid out as `grouped_mxfp8.Tiled`: of x
     (r, c), values (r, c') and (c, r'), c' and r' whole tiles of 128. Given `index`,
-    of x[index] (m, c), a matrix of x's rows."""
+    of x[index] (m, c), a matrix of x's rows, 0 where the index is -1. With `halves`,
+    x's pairs of columns as a GLU's halves (`halves_of`)."""
     stack = x if x.ndim == 3 else x[None]
     g, r, c = stack.shape if index is None else (1, *index.shape, x.shape[-1])
     rt, ct = -(-r // LANES), -(-c // LANES)
@@ -61,6 +68,7 @@ def quantized_twice(
         c=c,
         tile_r=TILE_ROWS,
         gathered=index is not None,
+        halves=halves,
     )
     ndim = x.ndim if index is None else 2
     rows = _tiled(values, scales, ndim)
@@ -74,6 +82,29 @@ def _tiled(
     as_e4m3 = jax.lax.bitcast_convert_type(values, jnp.float8_e4m3fn)
     as_e8m0 = jax.lax.bitcast_convert_type(scales, jnp.float8_e8m0fnu)
     return Tiled(as_e4m3, as_e8m0) if ndim == 3 else Tiled(as_e4m3[0], as_e8m0[0])
+
+
+def transposed(
+    values: Shaped[Array, "r c"], pairs: bool = False
+) -> Shaped[Array, "c r"]:
+    """Return E4M3 values (r, c), c whole tiles of 128, as (c, r). With `pairs`, x's
+    columns are a GLU's halves (`halves_of`), and come out as pairs again: row 2u of
+    the result is pair u's up, row 2u + 1 its gate."""
+    r, c = values.shape
+    out = jax_triton.triton_call(
+        jax.lax.bitcast_convert_type(values, jnp.uint8),
+        kernel=_transpose_kernel,
+        out_type=jax.ShapeDtypeStruct((c, r), jnp.uint8),
+        grid=(-(-r // TRANSPOSED), c // TRANSPOSED),
+        name="bux_mx_transposed",
+        num_warps=4,
+        num_stages=1,
+        r=r,
+        c=c,
+        tile=TRANSPOSED,
+        pairs=pairs,
+    )
+    return jax.lax.bitcast_convert_type(out, values.dtype)
 
 
 # Triton's kernels: what they take is a tl.tensor or a pointer, or a constant; and
@@ -95,10 +126,11 @@ def _quantize_kernel(
     c: tl.constexpr,
     tile_r: tl.constexpr,
     gathered: tl.constexpr,
+    halves: tl.constexpr,
 ) -> None:
     """A tile of x in E4M3 in blocks of 32 along its rows, and of x^T along its
     columns, x's rows from `rows` on as 0."""
-    tile, rs, cs = _tile_of(x, index, rows, r, c, tile_r, gathered)
+    tile, rs, cs = _tile_of(x, index, rows, r, c, tile_r, gathered, halves)
     _store_along_rows(tile, values, scales, rs, cs, r, c, tile_r)
     _store_along_columns(tile, t_values, t_scales, rs, cs, r, c, tile_r)
 
@@ -115,10 +147,11 @@ def _quantize_rows_kernel(
     c: tl.constexpr,
     tile_r: tl.constexpr,
     gathered: tl.constexpr,
+    halves: tl.constexpr,
 ) -> None:
     """A tile of x in E4M3 in blocks of 32 along its rows, x's rows from `rows` on as
     0."""
-    tile, rs, cs = _tile_of(x, index, rows, r, c, tile_r, gathered)
+    tile, rs, cs = _tile_of(x, index, rows, r, c, tile_r, gathered, halves)
     _store_along_rows(tile, values, scales, rs, cs, r, c, tile_r)
 
 
@@ -132,18 +165,28 @@ def _tile_of(
     c: tl.constexpr,
     tile_r: tl.constexpr,
     gathered: tl.constexpr,
+    halves: tl.constexpr,
 ) -> tuple[tl.tensor, tl.tensor, tl.tensor]:
-    """Return this program's tile of x[g], or of x[index] if `gathered`, 0 past it and
-    from `rows` on, and the tile's rows and columns."""
+    """Return this program's tile of x[g], or of x[index] if `gathered` (0 at -1), 0
+    past it and from `rows` on, its columns read as halves if `halves`; and the tile's
+    rows and columns."""
     rs = tl.program_id(1) * tile_r + tl.arange(0, tile_r)
     cs = tl.program_id(2) * 128 + tl.arange(0, 128)
     kept = (rs < r) & (rs < tl.load(rows))
     if gathered:
-        lying = tl.load(index + rs, mask=rs < r, other=0).to(tl.int64)
-        at = x + lying[:, None] * c
+        lying = tl.load(index + rs, mask=rs < r, other=-1).to(tl.int64)
+        kept = kept & (lying >= 0)
+        at = x + tl.maximum(lying, 0)[:, None] * c
     else:
         at = x + tl.program_id(0).to(tl.int64) * r * c + rs[:, None].to(tl.int64) * c
-    tile = tl.load(at + cs[None, :], mask=kept[:, None] & (cs < c)[None, :], other=0.0)
+    read = cs
+    if (
+        halves
+    ):  # in each 64 columns, the gates of 32 pairs (their odd columns), then ups
+        read = cs // 64 * 64 + cs % 32 * 2 + (cs % 64 < 32).to(tl.int32)
+    tile = tl.load(
+        at + read[None, :], mask=kept[:, None] & (cs < c)[None, :], other=0.0
+    )
     return tile, rs, cs
 
 
@@ -226,6 +269,28 @@ def _in_e4m3(blocks: tl.tensor, axis: tl.constexpr) -> tuple[tl.tensor, tl.tenso
     scaled = blocks * tl.expand_dims(down.to(blocks.dtype), axis)
     values = tl.clamp(scaled, -448.0, 448.0).to(tl.float8e4nv)
     return values.to(tl.uint8, bitcast=True), (exponent + 127).to(tl.uint8)
+
+
+@triton.jit
+@no_type_check
+def _transpose_kernel(
+    x: tl.tensor,
+    out: tl.tensor,
+    r: tl.constexpr,
+    c: tl.constexpr,
+    tile: tl.constexpr,
+    pairs: tl.constexpr,
+) -> None:
+    """A tile of x's bytes into out transposed, x's columns written as the rows of
+    pairs they are if `pairs`: so that each copy runs along a row of both."""
+    rs = tl.program_id(0) * tile + tl.arange(0, tile)
+    cs = tl.program_id(1) * tile + tl.arange(0, tile)
+    v = tl.load(x + rs[:, None].to(tl.int64) * c + cs[None, :], mask=(rs < r)[:, None])
+    ns = cs
+    if pairs:  # in each 64 columns of halves, the gates of 32 pairs, then their ups
+        ns = cs // 64 * 64 + cs % 32 * 2 + (cs % 64 < 32).to(tl.int32)
+    at = out + ns[:, None].to(tl.int64) * r + rs[None, :]
+    tl.store(at, tl.trans(v), mask=(rs < r)[None, :])
 
 
 assert MX_BLOCK == 32  # the kernels' scales, a 32nd of their values' offsets

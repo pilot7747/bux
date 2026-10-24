@@ -296,6 +296,25 @@ and as well:
   bfloat16's 0.84 in 8 rows of 4096, 3.7 to 5.8 in one of 32k, and the stable
   backward above adds a bfloat16 forward.
 
+MXFP8 attention, which Megatron-Bridge's B300 recipe runs (E4M3 in blocks of 32 with
+a power-of-two scale a block, forward and backward), pays only in long rows too.
+cuDNN 9.27 runs it on B300s at a head dim of 128 by its graph API (`sdpa_mxfp8` and
+`sdpa_mxfp8_backward`, which XLA has no call of: a `buffer_callback` would run them,
+as it runs the GDN kernel): q and k in blocks along the head dim and v along the
+positions forward, and backward q, k, v and dO each way the backward's products
+contract them. Against bfloat16's cuDNN kernels, a layer of 32 heads of 4:
+
+| rows | forward | backward | both, quantized by XLA | error, of float32's |
+|------|---------|----------|------------------------|---------------------|
+| 8 of 4096 | 0.49 ms, 1.35x | 2.58 ms, 1.0x | 4.06 ms against 3.85 | 5% (bfloat16: 0.2%) |
+| 4 of 8192 | 1.09, 1.52x | 4.89, 1.08x | 6.51 against 6.92 | |
+| 1 of 32k | 3.98, 1.54x | 16.7, 1.15x | 21.2 against 25.2 | |
+
+On a Blackwell GPU cuDNN runs the MXFP8 backward by its deterministic algorithm
+alone, two kernels; quantizing for it and the forward takes XLA 1.0 ms a layer
+whatever the rows. Outputs and gradients are 5-7% off float32's, 9-13% with q four
+times larger.
+
 ## Data
 
 A batch is rows of `seq_len` tokens, each three arrays: `input_ids`, `position_ids`
@@ -485,6 +504,7 @@ by itself where it cannot run, and all of them do inside `bux.kernels.off()` or 
 | what | by | on a B300, against XLA |
 |------|----|------------------------|
 | softmax attention | `methods.attention = auto`, the default: cuDNN's causal kernels in rows of one document, cuDNN's fused attention in rows of 8192 or more and with a window, else tokamax's flash attention (sinks, a soft cap) | 7x, and no t × t logits |
+| QK-norm then RoPE | `norm_rope`: a Pallas kernel a pass, forward and backward, for an RMSNorm with a scale and RoPE by halves (Qwen3's, OLMo 2's) | 1.4x forward, 1.9x backward (Qwen3-30B-A3B's queries in megatron.bux's step: 0.12 and 0.24 ms a layer) |
 | sparse attention (DSA, QSA, CSA) | `sparse`: tokamax's flash attention with the kept keys as a mask; the indexer's scores, its loss's picks and target by Pallas kernels (`scoring`), its top-k by counting | 2.6x a chunk of queries at a time, and no t × t floats |
 | linear attention, RWKV-7 | `chunkwise`: chunks of 64 positions, the state across them by a Pallas kernel (`affine_scan`); `methods(states=recompute)` keeps a fourteenth of the memory for the backward | 14-17x a scan over positions |
 | Mamba-2 | `chunkwise`, B and C a group's, the state across chunks by a matmul; `methods(states=recompute)` keeps a sixteenth of the memory for the backward | 25x a scan over positions (2 × 4096 tokens, rematerialized: at 8 × 4096 the scan needs 199 GiB) |
@@ -493,6 +513,7 @@ by itself where it cannot run, and all of them do inside `bux.kernels.off()` or 
 | KDA without | bux's Pallas kernels (`pallas_delta`): any gate, each pair's decay through a position between them | 2.6x `chunkwise` |
 | MoE experts | `grouped.ragged_dot`: tokamax's Mosaic and Triton kernels | 27x `jax.lax.ragged_dot` |
 | MoE experts in MXFP8 | `grouped_mxfp8`: Mosaic GPU kernels of tcgen05's block-scaled MMA, the scales by TMA into tensor memory (docs/parallelism.md) | 1.5-2.4x tokamax's bfloat16 GEMMs |
+| MoE experts' SwiGLU in MXFP8 | `grouped_glu`: cuDNN's CuTe DSL grouped GEMMs, SwiGLU and its backward with their quantizations in the epilogues, each GPU's shard of the kernels quantized before FSDP gathers it (docs/parallelism.md) | 1.13-1.17x `grouped_mxfp8`'s layer |
 | MoE dispatch | `token_rows`, `token_sums`: gathers where XLA would scatter | 4x |
 | NVFP4's quantizers | `nvfp4`: Pallas kernels, a pass for the largest magnitudes and one that writes both copies, rounded by Blackwell's E2M1 conversions | 3-5x |
 
@@ -515,6 +536,11 @@ without it at 60.5k in 122 GiB by chunks, now 96.5k in 88 by bux's kernels. Thei
 losses over 30 steps, GEMM autotuning off, are within 1.7e-4 of the chunks' (GDN) and
 the same (KDA). On 8 GPUs the GDN kernel's callbacks run one at a time, 87% of 8 GPUs
 alone, where KDA's kernel, which cudnn-frontend calls from JAX itself, runs at 91%.
+
+The 1.3B with Qwen3's QK-norm, in MXFP8, trains 3000 steps of FineWeb-Edu by the
+norm and RoPE's kernels 3% faster than by XLA's fusions (130k tokens a second against
+126k, GEMM autotuning off), its held-out loss within 0.04% of theirs at three seeds,
+which differ by 1.9%.
 
 Sparse attention trains at long context. A DeepSeek-V3.2-style 1B (MLA of 16 heads,
 DSA's indexer of 64 heads and top 2048 in all 16 layers, dense MLPs) on one B300, in
@@ -605,9 +631,10 @@ parallelism".
 Unlike these, a low-precision matmul format changes what a run computes, so it is a
 setting, `precision(matmuls=...)` (docs/parallelism.md, "Matmul formats"). On a B300,
 cuDNN's MXFP8 GEMM runs at 1.75x bfloat16's rate (2.7-3.0 PFLOP/s at the model's
-shapes), and quantizing each operand twice, in one pass of a Pallas kernel, gives some
-of it back: an MLP projection's forward and backward take 1.3-1.35x less time, q's and
-o's 1.1x, and k's and v's, half as wide, 7% more. cuDNN's NVFP4 GEMM runs at 4.8-5.5
+shapes), and quantizing each operand twice, in one pass of a Pallas kernel (4.3-4.7
+TB/s at Qwen3-30B-A3B's projections, scaling in bfloat16), gives some of it back: an
+MLP projection's forward and backward take 1.3-1.35x less time, q's and o's 1.1x, and
+k's and v's, half as wide, 7% more. cuDNN's NVFP4 GEMM runs at 4.8-5.5
 PFLOP/s at the MLP's shapes, 1.7-1.9x MXFP8's, with a bfloat16 output that the two
 tensors' scales then rescale, in what reads it (cuDNN's own global scale is no faster,
 and takes it in bfloat16). NVFP4's quantizers are two passes of Pallas kernels over
