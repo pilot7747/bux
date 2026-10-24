@@ -508,7 +508,8 @@ class MethodsConfig(Config):
     tensor_chunks: Positive = 2  # of each device's rows, under tensor = chunked
     microbatches: Positive = 1
     # Each microbatch's forward beside the backward of the one before, a layer at a
-    # time, so that one's collectives run beside the other's compute.
+    # time, so that one's collectives run beside the other's compute. Off: on a node
+    # of B300s, the residuals it carries across the loop cost more than it hides.
     interleave: bool = False
     # Where a step runs its layers more than once (microbatches, a pipeline's ticks),
     # it casts and gathers the parameters FSDP splits once, or as each layer runs
