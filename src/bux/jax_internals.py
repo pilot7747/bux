@@ -18,6 +18,7 @@ from jax._src.api import VJP, NotNeeded, NotSaveable
 from jax._src.cudnn import fused_attention_stablehlo as cudnn_fused
 from jax._src.cudnn.scaled_matmul_stablehlo import _scaled_matmul_p
 from jax.experimental import buffer_callback as callbacks
+from jax.experimental.compute_on import compute_on
 from jax.extend import core
 from jaxtyping import Array, Float, Int, Shaped
 
@@ -182,6 +183,60 @@ def cudnn_attention(
     )
 
 
+def cudnn_attention_and_lse(
+    q: Float[Array, "b t h dk"],
+    k: Float[Array, "b t g dk"],
+    v: Float[Array, "b t g dv"],
+    scale: float,
+) -> tuple[Float[Array, "b t h dv"], Float[Array, "b h t"]]:
+    """Return cuDNN's causal attention of whole rows, and each query's logsumexp in
+    float32, which its training forward keeps for its backward: by JAX's own call of
+    it (``return_residual``), whose backward ignores the logsumexp's cotangent."""
+    return cudnn_fused.dot_product_attention(
+        q,
+        k,
+        v,
+        scale=scale,
+        mask_type=cudnn_fused.MaskType.CAUSAL,
+        return_residual=True,
+    )
+
+
+def cudnn_attention_backward(
+    q: Float[Array, "b t h dk"],
+    k: Float[Array, "b t g dk"],
+    v: Float[Array, "b t g dv"],
+    out: Float[Array, "b t h dv"],
+    dout: Float[Array, "b t h dv"],
+    lse: Float[Array, "b h t"],
+    scale: float,
+) -> tuple[
+    Float[Array, "b t h dk"], Float[Array, "b t g dk"], Float[Array, "b t g dv"]
+]:
+    """Return the gradients of q, k and v of cuDNN's causal attention of whole rows,
+    from its output and each query's logsumexp: by the primitive of JAX's backward
+    (``_dot_product_attention_bwd_rule``), which takes what its forward kept."""
+    unused = jnp.zeros(0, q.dtype)  # no bias, documents or pages
+    grads = cudnn_fused._dot_product_attention_bwd_p_wrapper.bind(
+        q,
+        k,
+        v,
+        *[unused] * 7,
+        lse,
+        out,
+        dout,
+        scale=scale,
+        seed=42,
+        dropout_rate=0.0,
+        variadic_args=(False, False),
+        mask_type=cudnn_fused.MaskType.CAUSAL,
+        layout=cudnn_fused.AttentionLayout.BTNH.value,
+        sliding_window_length=None,
+        score_mod=None,
+    )
+    return grads[0], grads[1], grads[2]
+
+
 def buffer_callback(
     run: Callable[..., None], results: Sequence[jax.ShapeDtypeStruct]
 ) -> Callable[..., tuple[Shaped[Array, "..."], ...]]:
@@ -190,6 +245,16 @@ def buffer_callback(
     `context.stream` is the stream XLA runs on, and `ins[0].__dlpack_device__()` the
     device. fused_delta.py runs cuDNN's graphs of the delta rule so."""
     return callbacks.buffer_callback(run, results)
+
+
+def on_stream(stream: str, run: Callable[[], Any]) -> Any:
+    """Return run(), its ops on the GPU stream `stream` ("gpu_stream:1"): XLA makes
+    them one async call there, which the compute stream's kernels run beside, by
+    --xla_gpu_experimental_stream_annotation (on by default). A CPU ignores it.
+    nccl_ep.py runs NCCL EP's kernels so; jax 0.10.1 named compute_on compute_on2,
+    and 0.11.1 back."""
+    on = compute_on(compute_type=stream, out_memory_spaces=jax.memory.Space.Device)
+    return on(run)()
 
 
 def _keeps_its_inputs(

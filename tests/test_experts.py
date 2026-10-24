@@ -171,9 +171,9 @@ def test_the_ragged_methods_compute_what_sorted_does(method, mesh):
 
 @pytest.mark.parametrize(
     ("method", "exchanges"),
-    # Forward: the rows there and back, and ragged_tokens' picks and weights there;
-    # backward, the transposes of all but the picks.
-    [(RAGGED, 4), ("ragged_tokens", 7)],
+    # Forward: the rows there and back, and the weights there, with ragged_tokens'
+    # picks; backward, the transposes of all but the picks.
+    [(RAGGED, 6), ("ragged_tokens", 7)],
 )
 def test_the_ragged_methods_lower_on_cpu_forward_and_backward(method, exchanges):
     """XLA:CPU cannot compile them, but they trace."""
@@ -417,15 +417,20 @@ BYTES = f"x{WIDE + WIDE // 32}xui8>"  # a row of bytes: its values, then its sca
 
 
 def test_a_dispatch_in_mxfp8_sends_a_byte_a_value_and_one_a_scale_of_32():
-    # Forward, there in bytes and back; backward, both ways in float32.
-    want = [f"tensor<8{BYTES}", "tensor<32x64xf32>", "tensor<8x64xf32>"]
-    assert _sent(RAGGED, "@ragged_all_to_all") == sorted([*want, "tensor<32x64xf32>"])
+    # Forward, there in bytes, with the weights; backward, both ways in float32, and
+    # the weights back. No gradient takes what comes back forward, so it is not sent.
+    tokens = [f"tensor<8{BYTES}", "tensor<32x64xf32>", "tensor<8x64xf32>"]
+    weights = ["tensor<8x1xf32>", "tensor<32x1xf32>"]
+    assert _sent(RAGGED, "@ragged_all_to_all") == sorted(tokens + weights)
 
 
 def test_all_to_all_sends_its_buffers_in_mxfp8_and_their_sizes_alongside():
-    # 4 peers' buffers of 8 slots; forward, there in bytes and back; backward, both
-    # ways in float32; and how many rows of each expert each peer sent.
-    want = [f"tensor<32{BYTES}", "tensor<4x2xi32>", *["tensor<32x64xf32>"] * 3]
+    # 4 peers' buffers of 8 slots; forward, there in bytes, with the weights;
+    # backward, both ways in float32, and the weights back; and how many rows of each
+    # expert each peer sent. No gradient takes what comes back forward.
+    tokens = [f"tensor<32{BYTES}", *["tensor<32x64xf32>"] * 2]
+    weights = ["tensor<32xf32>"] * 2
+    want = [*tokens, *weights, "tensor<4x2xi32>"]
     assert _sent("all_to_all", "stablehlo.all_to_all") == sorted(want)
 
 
@@ -445,10 +450,11 @@ model = embed [norm attn] [norm experts] [norm attn] [norm experts] norm head
 """
 
 
-# Of each of ARCH's 2 MoEs: forward there and back, backward the transposes; and the
-# forward's again, under a policy that keeps none of what they bring.
+# Of each of ARCH's 2 MoEs: forward the rows there and back and the weights there,
+# backward the transposes; and the forward's again, under a policy that keeps none of
+# what they bring.
 @pytest.mark.parametrize(
-    ("remat", "exchanges"), [("none", 4), ("dots", 4), ("full", 6)]
+    ("remat", "exchanges"), [("none", 6), ("dots", 6), ("full", 9)]
 )
 def test_dots_keeps_what_the_ragged_exchanges_bring_and_runs_none_again(
     remat, exchanges

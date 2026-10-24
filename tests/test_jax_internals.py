@@ -21,7 +21,7 @@ from conftest import equations
 from jax.ad_checkpoint import checkpoint_name, name_p
 from jax.extend.core import primitives
 from jax.sharding import PartitionSpec as P
-from jaxtyping import Array, Shaped
+from jaxtyping import Array, Float, Shaped
 
 from bux import jax_internals, kernels
 from bux.architecture.repeats import remat
@@ -255,7 +255,14 @@ def test_the_unpartitioned_scaled_matmul_is_jax_nn_s_in_a_shard_map():
 def test_cudnn_s_attention_takes_the_arguments_bux_passes():
     takes = inspect.signature(jax_internals.cudnn_fused.dot_product_attention)
     asked = ("q_seqlen", "kv_seqlen", "q_offsets", "kv_offsets", "scale")
-    assert set(takes.parameters) >= {*asked, "mask_type", "sliding_window_length"}
+    assert set(takes.parameters) >= {
+        *asked,
+        "mask_type",
+        "sliding_window_length",
+        "return_residual",
+    }
+    backward = jax_internals.cudnn_fused._dot_product_attention_bwd_p_wrapper
+    assert isinstance(backward, core.Primitive)
     assert {"CAUSAL", "PADDING_CAUSAL"} <= set(
         jax_internals.cudnn_fused.MaskType.__members__
     )
@@ -287,6 +294,17 @@ def test_a_buffer_callback_hands_its_run_xla_s_stream_and_device():
     assert isinstance(stream, int) and kind == 2 and device == 0  # kDLCUDA, GPU 0
 
 
+@CPU
+def test_a_run_on_a_stream_is_one_call_marked_for_it_with_its_gradient():
+    def f(x: Float[Array, " n"]) -> Float[Array, ""]:
+        return jax_internals.on_stream("gpu_stream:1", lambda: jnp.sin(x) * 2).sum()
+
+    text = jax.jit(f).lower(jnp.ones(3)).as_text()
+    [call] = [line for line in text.splitlines() if " = call @" in line]
+    assert '_xla_stream_annotation = "1"' in call and 'inlineable = "false"' in call
+    np.testing.assert_allclose(jax.grad(f)(jnp.zeros(3)), [2.0, 2.0, 2.0])
+
+
 @GPU
 def test_cudnn_s_attention_attends_causally_and_by_documents():
     q, k, v = _qkv(jax.random.key(0), (2, 256, 4, 64))
@@ -296,6 +314,29 @@ def test_cudnn_s_attention_attends_causally_and_by_documents():
     for mask, documents in ((None, (None, None)), (same, (lengths, starts))):
         out = jax_internals.cudnn_attention(q, k, v, *documents, 0.125, None)
         assert _off(out, _attention(q, k, v, mask)) < 2e-2
+
+
+@GPU
+def test_cudnn_s_attention_gives_its_logsumexp_and_takes_it_back():
+    q, k, v = _qkv(jax.random.key(3), (2, 256, 4, 64))
+    dout = jax.random.normal(jax.random.key(4), q.shape, q.dtype)
+    out, lse = jax_internals.cudnn_attention_and_lse(q, k, v, 0.125)
+    grads = jax_internals.cudnn_attention_backward(q, k, v, out, dout, lse, 0.125)
+    expected, vjp = jax.vjp(_attention, q, k, v)
+    assert lse.dtype == jnp.float32 and _off(out, expected) < 2e-2
+    np.testing.assert_allclose(lse, _logsumexp(q, k), atol=1e-2)
+    for g, e in zip(grads, vjp(dout), strict=True):
+        assert _off(g, e) < 2e-2
+
+
+def _logsumexp(q, k) -> Shaped[Array, "b h t"]:
+    """Each query's logsumexp of its causal logits at a scale of 1/8, in float32."""
+    t, rep = q.shape[1], q.shape[2] // k.shape[2]
+    k = jnp.repeat(k, rep, axis=2).astype(jnp.float32)
+    s = jnp.einsum("bthd,bshd->bhts", q.astype(jnp.float32), k) * 0.125
+    return jax.nn.logsumexp(
+        jnp.where(jnp.tril(jnp.ones((t, t), bool)), s, -jnp.inf), -1
+    )
 
 
 def _qkv(

@@ -241,8 +241,17 @@ to resolve them. The optimizer's state inherits them from the parameters it trac
    earlier dimension already uses. If their sizes don't divide the dimension (or its
    count), it stays whole: GQA's 2 kv heads under `tensor=4` are replicated, though
    their `2 * k` columns would split 4 ways.
-2. Then FSDP: the largest whole dimension that FSDP's axes divide splits over them,
-   or if none does, over as many of them as one does, from the first. FSDP's axes are
+2. Then FSDP: the first whole dimension that FSDP's axes divide splits over them,
+   or if none does, over as many of them as one does, from the first. The first, so
+   that each device's shard is whole rows of the array, which XLA gathers and
+   scatters as they lie: an expert stack splits by expert, a kernel by its inputs.
+   A dimension that its own axes do not divide comes last, as `tensor=4` does not
+   CSA's 2 output groups: the activations keep it whole too, and split as the
+   parameter, XLA rematerialized them in full. By the largest, as before, Qwen3-30B-A3B's stacks split by `embed`, and on 8
+   B300s every gather and reduce-scatter of them went through a transpose: 21.6 ms
+   of 12 layers' 314 ms step, 3.6 by expert; its 48 layers (`megatron.bux`'s
+   `sorted`) train at 257k tokens a second, from 251k, and the dense 1.3B's
+   transposes (1.7 ms a step) are gone. FSDP's axes are
    `layout.fsdp`, those of `fsdp`, `context` and `expert` that no dimension splits
    over already: the axes that would copy a dense parameter, but `data`, whose copies
    are HSDP's. So a layer with no names at all still trains under FSDP, an expert
@@ -369,9 +378,9 @@ methods = methods(attention=ring)
 
 | method    | what it does                                                         |
 |-----------|----------------------------------------------------------------------|
-| `auto`    | the default. On a GPU, the fastest kernel that takes the call on each device's whole rows: cuDNN's in rows of 8192 positions or more and with a window, else tokamax's. With `seq` over `context`, `ulysses` where `context` divides a device's heads, else `ring`. `xla` on a CPU, and for what only `xla` has |
+| `auto`    | the default. On a GPU, the fastest kernel that takes the call on each device's whole rows: cuDNN's causal kernels where each row is one document (`flash.CUDNN`, sinks too), else cuDNN's in rows of 8192 positions or more and with a window, else tokamax's. With `seq` over `context`, `ulysses` where `context` divides a device's heads, else `ring`. `xla` on a CPU, and for what only `xla` has |
 | `xla`     | all t by t logits at once. With `seq` over `context` a device has its queries' rows, and every key and value: all-gather CP |
-| `cudnn`   | cuDNN's fused attention (jax's) on each device's whole rows, documents in its packed layout. bfloat16 or float16, keys' and values' head dims equal and up to 256 (its packed layout gets MLA's wrong); no soft cap, no sinks, no positions over `context` |
+| `cudnn`   | cuDNN's fused attention (jax's) on each device's whole rows: rows of one document by its causal kernels (`flash.CUDNN`), documents in its packed layout. bfloat16 or float16, keys' and values' head dims equal and up to 256 (its packed layout gets MLA's wrong); no soft cap, no sinks, no positions over `context` |
 | `tokamax` | tokamax's flash attention, its Mosaic kernels: a document and a window as each query's first key, sinks by the logsumexp. With `seq` over `context`, a device gathers every key and value and attends with its queries in one call: all-gather CP, whose backward pass does every block. Linux only (the `cuda` extra) |
 | `ring`    | every key and value gathered once over `context`, and a flash call (tokamax's; jnp's on a CPU) for each device's block of them, merged by their logsumexps, a device's own block first, as the others' are gathered. A block no query sees is skipped: one ahead of them all, or before every query's first key, its document's or its window's. Without documents the queries go zigzag, device `i` holding chunks `i` and `2c-1-i` of `2c`, so that every device attends to as much; its own block is then a gathered one. The backward pass runs each block's kernel backward with the final output and logsumexp, on the blocks the forward pass gathered, and reduce-scatters the blocks' gradients in the keys' dtype |
 | `ulysses` | all-to-alls over `context`, from a device's positions of every head to every position of its own heads; `auto`'s kernel on those whole rows; and back. `context` must divide a device's heads; kv heads it does not divide are repeated |
@@ -407,14 +416,32 @@ tokamax's kernels are one such kernel (its VJP, given the residuals `(lse, 1)`),
 `flash.TOKAMAX = flash.JNP` the tests check `tokamax`'s and `auto`'s paths too. A new
 kernel is a `flash.Kernel(forward, backward)`.
 
-cuDNN's attention in jax neither returns nor takes a logsumexp, so it runs whole rows
-only. Its packed layout has room for a static number of documents a row, and its
-backward pass takes time in proportion, and 8 bytes for each position of each head's
-channels of each document's room: `context.documents_bound` makes room for up to t / 256
-and 2^30 such numbers (16 for 8 rows of 4096 or one of 32k), and a `lax.cond` gives a
-batch with a row of more documents to tokamax. In rows of 4096 that `lax.cond` costs a
-1.3B what cuDNN gains it (145k tok/s on a B300 either way), so `auto` takes cuDNN
-from rows of 8192 on: in rows of 16384 of packed documents, 1.3x tokamax's speed.
+cuDNN's attention in jax returns its logsumexp (`return_residual`), and its backward's
+primitive takes one: so `flash.CUDNN` is a `Kernel` of cuDNN's causal kernels, for
+whole rows with no first keys, which `flash.attend` folds sinks into. The rows of a
+run without documents have ids too, all one document, so `auto` and `cudnn` ask a
+`lax.cond` whether each row is one, and attend by `flash.CUDNN` where it is. On 8
+B300s, megatron.bux's sorted arm (`remat=none` in a pool of 97% of a GPU) trains at
+34.2k tokens a second a GPU by it and at 31.3-31.5k by tokamax, in 251 GiB either way.
+Cut to 12 blocks, it trains at 925k tokens a second by it, at 868k by tokamax, at 896k
+by cuDNN's forward and tokamax's backward, and at 885k by jax's call of cuDNN in its
+packed layout, which holds 8 GiB more, room for 8 documents a row. A layer's attention
+(32 heads of 4 kv heads) takes 0.67 ms forward and 2.2 backward by cuDNN, 1.05 and 4.5
+by tokamax, whose backward is two kernels that each recompute the probabilities. The
+1.3B (16 heads of 8) trains at 155k tokens a second on a B300 by it, 148k by tokamax,
+in the same 51 GiB; on FineWeb-Edu at 149k and 140k, to the same held-out loss after
+3000 steps (4.041 and 4.043, where seeds differ by 1.2%). Under XLA's deterministic
+ops, for which XLA builds cuDNN's attention backward no graph on a B300 ("No
+serialized cuDNN graph"), `flash.CUDNN`'s backward is tokamax's.
+
+For rows of documents cuDNN runs whole rows only. Its packed layout has room for a
+static number of documents a row, and its backward pass takes time in proportion, and
+8 bytes for each position of each head's channels of each document's room:
+`context.documents_bound` makes room for up to t / 256 and 2^30 such numbers (16 for
+8 rows of 4096 or one of 32k), and a `lax.cond` gives a batch with a row of more
+documents to tokamax. In rows of 4096 that `lax.cond` costs a 1.3B what cuDNN gains it
+(145k tok/s on a B300 either way), so `auto` takes cuDNN for documents from rows of
+8192 on: in rows of 16384 of packed documents, 1.3x tokamax's speed.
 
 Every kernel runs in a `shard_map` manual over every axis (`context.on_devices`),
 each device on its rows and heads: XLA cannot split a kernel's call, an all-to-all in
@@ -905,17 +932,23 @@ themselves is expert parallelism, a method of its own.
 Its pieces are functions of arrays alone, in `bux.architecture.experts.moe`, so that a
 method can run them on one device's experts inside a `shard_map`:
 
-- `experts(x, sizes, up, gate, down, ffn, norm)`: the expert FFN of rows sorted by
-  expert, `sizes[i]` of them expert i's, by `grouped.ragged_dot`: tokamax's Mosaic
-  kernel on a GPU, and its Triton one for the kernels' gradient (27 times XLA's
-  `jax.lax.ragged_dot` on a B300), or XLA's. Rows past `sizes.sum()` come out 0,
-  before `norm`.
-- `routed(z, idx, weights, up, gate, down, ffn, norm)`: `sort_by_expert`, `experts`,
-  unsort. A pick outside the experts of `up` adds nothing, so a device that holds
-  experts `[i, i + n)` passes `idx - i` and its own kernels. The sort and the unsort
-  are `token_rows` and `permuted`, whose gradients gather by the inverse permutation
-  where XLA's would scatter-add. `token_rows` also takes the first m picks alone,
-  and `token_sums`, its transpose, sums each token's k picks' rows.
+- `experts(x, sizes, weights, up, down, ffn, norm)`: the expert FFN of rows sorted by
+  expert, `sizes[i]` of them expert i's, each row's output times its weight, by
+  `grouped.ragged_dot`: tokamax's Mosaic kernel on a GPU, and its Triton one for the
+  kernels' gradient (27 times XLA's `jax.lax.ragged_dot` on a B300), or XLA's. Up
+  and gate are one GEMM. The weights multiply each row's hidden units, before `down`,
+  as Megatron-Core does: `down` is linear, so that is the same sum, and the weights'
+  gradient takes a row's f hidden units, where after `down` it took its d outputs,
+  1 GiB a layer of Qwen3-30B-A3B's; and the backward computes the hidden units again,
+  elementwise, from up and gate's GEMM, which it keeps for the activation's gradient
+  anyway (`weighted_units`). After `norm`, where there is one, the weights multiply
+  its output. Rows past `sizes.sum()` come out 0, before `norm`.
+- `routed(z, idx, weights, up, down, ffn, norm)`: `sort_by_expert`, `experts`, and
+  each token's sum. A pick outside the experts of `up` adds nothing, so a device that
+  holds experts `[i, i + n)` passes `idx - i` and its own kernels. The sort is
+  `token_rows`, whose gradient gathers by the inverse permutation where XLA's would
+  scatter-add, and takes the first m picks alone; `token_sums`, its transpose, sums
+  each token's k picks' rows; `picked_weights` sorts the weights with the picks.
 
 ```python
 from bux.architecture.experts.moe import routed
@@ -927,11 +960,33 @@ def _(moe, z, idx, weights, taps=None):
     return routed(z, idx, weights, *moe.kernels(), moe.config.expert, moe.expert_norm)
 ```
 
-The MoE names its parameters: the router `(embed, None)`; `up` and `gate`
-`(experts, embed, mlp)` and `down` `(experts, mlp, embed)`, with `latent` for `embed`
-in a LatentMoE; `to_latent` `(embed, latent)` and `from_latent` `(latent, embed)`.
+The MoE names its parameters: the router `(embed, None)`; `up` `(experts, embed,
+mlp, None)` and `down` `(experts, mlp, embed)`, with `latent` for `embed` in a
+LatentMoE; `to_latent` `(embed, latent)` and `from_latent` `(latent, embed)`. `up`
+holds a gated MLP's gate too, each hidden unit's up and gate columns side by side,
+`(E, d, f, 2)`: it reshapes for free to the `(E, d, 2f)` of one GEMM, and where
+`tensor` splits the hidden units, each device keeps an up column with its gate's, as
+`(E, d, 2, f)` would not. Muon orthogonalizes up and gate apart, as two matrices.
 `dense` constrains its hidden units to `(batch, seq, experts, mlp)`, so that under
 FSDP the weights move to the tokens rather than the tokens to the weights.
+
+On 8 B300s, `examples/benchmarks/megatron.bux` (Qwen3-30B-A3B, 32k tokens a GPU,
+MXFP8, routed by the router, XLA's pool at 97% of a GPU), before the weights moved
+before `down` and up and gate became one stack, and after, tokens a second a GPU and
+peak memory:
+
+| run | before | after |
+|-----|--------|-------|
+| `sorted`, `fsdp=8`, `remat=none` | 31.1k, 250.4 GiB | 31.9k, 215.0 GiB |
+| `nccl_ep`, `expert=8`, capacity 1.25, `remat=save_attention` | 21.3k, 99.6 GiB | 22.8k, 98.3 GiB |
+| the same, `remat=none` | needs 266 GiB | 27.7k, 210.7 GiB |
+
+`sorted`'s step on GPU 0 took 1075 ms against 1098: the weights' d-wide multiply, its
+transpose and reduce, and the concatenations of up and gate and of their gradient are
+gone. With GEMM autotuning off, its losses agree to 5e-5 for three steps, then drift
+apart as two runs of random tokens do. Under `remat=auto` at JAX's default pool `sorted`
+now takes `dots_attention` (158.5 GiB) where it took `dots` (179 GiB), and `nccl_ep`
+`dots` (187.4 GiB, 24.5k) where it took `save_attention` (21.7k).
 
 ### The experts in MXFP8
 
@@ -949,12 +1004,18 @@ MXFP8 experts train 10 to 15% faster than bfloat16 ones (below). An MoE run that
 them to `matmuls=mxfp8` multiplied them in bfloat16 before that, so it takes the id
 of a run that names `mxfp8` for them, and a launch trains it again; a run that names
 their format keeps its id, and a model without routed experts too. In a
-format, `experts` runs up and gate as one GEMM, so that x quantizes once, and each
-GEMM by `grouped_blockscaled.ragged_dot`: every operand of the forward's GEMM and of
+format, up and gate's one GEMM quantizes x once, and each GEMM runs by
+`grouped_blockscaled.ragged_dot`: every operand of the forward's GEMM and of
 the backward's two quantized along what that GEMM contracts, as a projection's are,
 and each expert's W on its own. One pass of a Triton kernel (`grouped_triton`)
 quantizes x and x^T, zeroes the rows past the experts', which an exchange's buffer
-leaves as they were, and writes both as the kernels below take them.
+leaves as they were, and writes both as the kernels below take them. Under `sorted`
+x's rows are the picks' token rows: given where they were picked
+(`grouped_blockscaled.Picked`), the kernel reads each from the tokens by index, so
+that the copy of them `moe.token_rows` gathers is never written (XLA drops it): 1 GiB
+a layer at 32k tokens a GPU and 8 picks a token. A GEMM whose rows sum into their
+tokens (`Summed`) returns the tokens' sums, and its backward reads each row's dy from
+its token's the same way.
 Elsewhere XLA dequantizes and multiplies, which computes the same values, so the
 tests run it on CPU. Only `passes` multiply in the format, the others by `grouped`'s
 kernels, as they are.
@@ -1037,6 +1098,36 @@ than x in bfloat16, so a run takes 14 GiB less. It trains at bfloat16's loss: 98
 tokens of FineWeb-Edu end 0.13% and 0.05% below it, with FP8 dispatch
 (docs/training.md, "Precision").
 
+At what one GPU of megatron.bux's `sorted` arm quantizes a layer (128 experts of 768,
+262144 picks), on one B300 by CUPTI, no shape is slow:
+
+| operand | shape | TB/s |
+|---------|-------|------|
+| x, read by index from 32768 tokens | 262144 × 2048 | 5.8 |
+| dy | 262144 × 2048 | 5.2 |
+| h | 262144 × 768 | 5.1 |
+| dh | 262144 × 1536 | 5.2 |
+| each expert's W of up and gate | 128 × 2048 × 1536 | 5.2 |
+| each expert's W of down | 128 × 768 × 2048 | 5.1 |
+
+x read by index takes 377 µs, where gathering it in bfloat16 took 378 and quantizing
+the copy 420. A copy that casts x and x^T to E4M3 unscaled runs at 6.5 TB/s (XLA's
+`x * 2` at 6.9), and the quantizer without its scales at 5.8: the scales' bytes, 4 a
+row of x but one of each 4 of x^T's in a program of 32 rows, and the blocks' largest
+magnitudes take the rest. Programs of 64 or 128 rows, or of 128 rows 32 at a time
+with each tile of scales in one store, more warps, other grid orders and the scaling
+in float32 were no faster.
+
+On 8 B300s, at `remat=none` with the pool at 97%, 40 steps: with the router's weights
+on the hidden units, so that down's rows sum plainly into their tokens, reading x and
+dy in place took the arm from 260.3k to 269.4k tokens a second (32.5k to 33.7k a GPU)
+at the same peak, 215.0 GiB. On GPU 0 a step fell from 1067 to 1029 ms: both gathers'
+39 ms went, and the quantizer's 95 ms became 88. With the weights after down, x in
+place alone went from 254.2k to 255.0k: the gather's 25 ms went, but the FSDP
+collectives the step overlapped came out from under it. Each GPU quantizes all 128
+experts' W, 23 ms of a step; its own shard before FSDP gathers it would save 7/8 of
+that.
+
 ## Expert parallelism
 
 Five methods of `methods.moe` split the experts over the axes `layout.experts` gives
@@ -1061,7 +1152,11 @@ Each runs in a `jax.shard_map` manual over the axes that split the tokens (those
 gathers them all onto every device. The kernels enter split over the experts' axes and
 whole over the others, so FSDP gathers a device's own experts alone; `tensor` stays
 Auto. Routing, the balance loss and the router bias run before, in the global view,
-and do not change.
+and do not change. Each pick's weight goes with it to its expert's device: gathered
+with the tokens (`all_gather`), beside its token (`all_to_all`,
+`ragged_all_to_all`), with the token's picks there (`ragged_tokens`) or in NCCL EP's
+dispatch (`nccl_ep`); `experts` weights the rows it makes, so what comes back is
+summed as it is, and nothing the backward keeps for the weights is d wide.
 
 Where no axis splits the experts (`expert=1`, or a number of experts it does not
 divide), each method is `sorted`. Experts over an axis that leaves the tokens whole,
@@ -1157,8 +1252,8 @@ GB of experts a layer, where the exchanges move 1 GB of picks each way
 the exchanges ran again in the backward, since their results are no products; named
 for it ([below](#fp8-dispatch-precisiondispatch)), `ragged_all_to_all` trains at 515k
 tokens a second in 77.5 GiB, from 452k in 72.6. XLA's ragged all-to-all leaves an allocation inside the memory pool after the first step,
-so that a step whose temporaries take over half of it fits only once:
-`XLA_PYTHON_CLIENT_MEM_FRACTION=.95` gives the pool more room. `ragged_tokens` moves
+so that a step whose temporaries take over half of it fits only once: bux's pool of
+95% of a GPU, against JAX's 75%, gives it more room. `ragged_tokens` moves
 about 30% fewer rows when the routing is random, and half as few or fewer where a
 group limit keeps each token on half the devices (`num_groups` the size of `expert`,
 `top_k_groups` half of it), but it sends the picks and their weights besides, and
@@ -1209,6 +1304,11 @@ Only `all_to_all` gains from it, on 8 B300s with jax 0.12:
   buffer and runs its experts on the one it gets) hides half its time, but seven of
   them take twice as long as one all-to-all, by NCCL or by copy engines
   (`--xla_gpu_use_memcpy_local_p2p`): 394k tokens a second.
+- `nccl_ep`'s kernels can run beside the experts on a stream of their own
+  (`methods.moe_stream`, [below](#transformerengines-nccl-ep)), but XLA's schedule
+  does not put another chunk's experts beside them, and the chunks cost more than
+  they hide: megatron.bux's MoE layer forward and backward took 13.9 ms in 2 chunks
+  and 15.0 in 4, against 13.3 whole.
 
 For the baseline's MoE at 32k tokens a GPU and a capacity of 1.25, profiled, tokens a
 second and ms of a step of a GPU: all its collectives, those with no compute beside
@@ -1287,9 +1387,12 @@ by `--build-arg TE_VERSION`).
 `nccl_ep` runs TE's one-device primitives in the shard_map the other methods run in,
 a `jax.custom_vjp` each way (`parallel/nccl_ep.py`); the experts take the rows as
 they arrive, their blocks padded to 128 as they are. NCCL EP keeps its buffers
-outside the step, sized for a device's share of a step's tokens and for the rows
-`methods.capacity` lets it take, so `methods.prepare` starts it once a process before
-the step traces (`nccl_ep.start`): 25 to 60 s between two nodes. Under a capacity,
+outside the step, sized for the most tokens a device sends at once, a chunk of its
+share of a step's (`methods.moe_chunks`), and for the rows `methods.capacity` lets it
+take, so `methods.prepare` starts it once a process before the step traces
+(`nccl_ep.start`): 25 to 60 s between two nodes. Every dispatch then brings that many
+rows, a microbatch's too: NCCL EP takes no fewer, and fails with "invalid argument"
+where they are fewer. Under a capacity,
 the picks that do not fit drop before NCCL EP sends them, as `ragged_all_to_all`
 drops them (`nccl_ep._kept`): with NCCL EP's own drops, EP=16's balance loss rose to
 35 in 25 steps and its loss came off `sorted`'s. The weights of the padding are
@@ -1344,6 +1447,57 @@ In a node it wins by sending less, not faster: its kernels move 330 to 370 GB/s,
 from NVLink's 900. Between nodes it sends a quarter as much over InfiniBand, and with
 `NCCL_GIN_TYPE=2 NCCL_EP_TOKENS_PER_CHUNK=256` its exchanges take 28% as long.
 
+#### On a stream of its own: `methods.moe_stream`
+
+```
+methods = methods(moe=nccl_ep, capacity=1.25, moe_stream=true)
+```
+
+NCCL EP's kernels go on the compute stream, where nothing runs beside them. With
+`moe_stream` they run on one of their own (`nccl_ep.STREAM`): jax's `compute_on`
+marks each of TE's calls, prepare and dispatch as one, and XLA makes it an async call
+there (`--xla_gpu_experimental_stream_annotation`, on by default), whose results the
+compute stream waits for where it uses them. On 8 B300s, at megatron.bux's shapes
+(EP=8, 32k tokens a GPU, a capacity of 1.25), an exchange (3.4 ms) and an independent
+grouped GEMM (2.8 ms) took 6.0 ms on one stream and 4.9 on two, and one MoE layer's
+forward and backward 12.7 ms against 13.3. megatron.bux's `nccl_ep` arm, side by side
+on a node under `remat=save_attention`:
+
+| NCCL EP's kernels | tok/s a GPU | peak | step on GPU 0 | exposed exchange |
+|-------------------|-------------|------|---------------|------------------|
+| on the compute stream | 21.2k | 99.0 GiB | 1547 ms | 489 ms |
+| on their own, `moe_stream=true` | 21.9k | 169.4 GiB | 1495-1504 ms | 410-415 ms |
+| the same, `moe_chunks=2` | 21.4k | 179.0 GiB | | |
+
+It is off by default for the memory: XLA's latency hiding scheduler starts the
+backward's recomputed dispatches early to hide them, and the step's temporaries grow
+from 55 to 125 GiB, most of them the experts' MXFP8 operands of some 80 layers' worth
+at once; `--xla_gpu_memory_limit_slop_factor=50` does not stop it (21.0k, 170.5 GiB).
+Under `remat=none`, which computes no forward again, it should not arise: untried.
+
+Chunks gain nothing yet, since XLA's schedule leaves little beside NCCL EP's calls. It
+places each call's done right after its start, but for the last before a GEMM, so the
+compute stream waits for each at once; in chunks it runs every chunk's dispatch, then
+every chunk's experts, then the combines. Neither every chunk's routing first, behind
+an optimization barrier, nor costs for the experts' kernels (`latency_metadata`)
+changes that. Scheduling groups (`_scheduling_group_id`, which jax's
+`xla_metadata_call2` can put on a stream's call too) moved one chunk's experts beside
+another's exchange in the forward (2 chunks: 6.1 ms against 6.6), but XLA rejects them
+in the backward ("annotation groups with gaps"), where a chunk's forward and backward
+share an id. The experts cannot go on a stream of their own either: tokamax's Mosaic
+GEMM fails to compile in an async call ("Parsing error" in ptxas).
+
+What NCCL EP's step holds, under `remat=none`: XLA's analysis says 266 GiB, 42.7 of them
+the parameters and the optimizer's state and 223.2 one buffer of temporaries, of which
+221.8 are live at once at the end of the forward. 148 GiB of those are the experts',
+four rows of each layer's 329,728 (at a capacity of 1.25) kept for the backward: the
+`down` GEMM's bfloat16 output (1.26 GiB a layer), `up` and `gate`'s (0.94), and the
+MXFP8 copies of the rows and of the activations that the weights' gradients take
+(0.63 and 0.24). Attention keeps 24 GiB, the dense MXFP8 matmuls 21. A capacity of 1.5
+took 2.4 GiB more under `save_attention`, 5% fewer tokens a second, and on
+megatron.bux's synthetic batch dropped as much as 1.25 from its 15th step on (8% of the
+picks a layer, its balance loss rising to 83 summed over the layers).
+
 What it takes from JAX:
 
 - Across nodes only its one-device primitives ran, as `nccl_ep` runs them: its
@@ -1386,8 +1540,10 @@ to a multiple of them, so that each device does the same work, and the work of a
 them to their owners, which orthogonalize their matrices of a shape as one batched
 chain of products; another brings the results back to the parameters' shards, and an
 all-gather copies them over the axes that do not split the parameter (`data`, say).
-Under `layout(zero=1)` an update comes split by FSDP, as the optimizer's state is, and
-its matrices go back whole along FSDP's side by an all-gather, as the parameter is.
+An update comes split as the optimizer's state is, under `layout(zero=1)` by FSDP too,
+and its matrices go back whole along what FSDP split by an all-gather, as the parameter
+is: a side, or a stack's experts, which each device orthogonalizes where they are, with
+no all-to-all.
 
 A method gets every update of a step at once, so that it can choose where each runs:
 
@@ -1396,10 +1552,11 @@ from bux.parallel import methods
 
 
 @methods.orthogonalize.register("mine")
-def _(updates, dims, shardings, newton_schulz):
+def _(updates, dims, shardings, states, newton_schulz):
     # updates: an array per Muon parameter, in muon's ns_dtype; dims: their
-    # MuonDimensionNumbers; shardings: their parameters' NamedShardings, None
-    # outside parallel.use; newton_schulz(x, dims): optax's, in x's dtype.
+    # MuonDimensionNumbers; shardings and states: their parameters' NamedShardings
+    # and their optimizer states', where the updates come from, None outside
+    # parallel.use; newton_schulz(x, dims): optax's, in x's dtype.
     return [newton_schulz(x, d) for x, d in zip(updates, dims)]
 ```
 
@@ -1654,20 +1811,31 @@ where `first` computes the whole layer again. With more rows a GPU:
 
 `auto` chooses a training step's policy as the step first compiles
 (`bux.train.fitting`). It compiles the step under `none`, `dots_attention`, `dots`,
-`save_attention` and `full` in turn, the fastest first as they train above, and keeps
-the first that fits: what XLA's analysis of the compiled step says a device holds at
+`save_attention` and `full`, the fastest first as they train above, and keeps the
+first that fits: what XLA's analysis of the compiled step says a device holds at
 once, its arguments, outputs and temporaries, at most 97% of what the device can hold
-(its `bytes_limit`, 75% of a GPU by JAX's default). In that order the first that fits
-is the one that computes least again, so `auto` times none of them, which would cost
-steps of each. On B300s XLA's analysis was the measured peak to 0.1 GiB in every run,
-and a step of 196.7 of 200.8 GiB trained. Where `none` fits, `auto` compiles once and
-is `none`; where it does not, each candidate before the one that fits is a compile
-more, which JAX's cache keeps for the run's next launch. A forward outside a training
-step keeps everything. The step says what it took:
+(its `bytes_limit`: 95% of a GPU, which bux gives XLA's pool, docs/training.md "Speed
+on GPUs"). In that order the first that fits is the one that computes least again, so
+`auto` times none of them, which would cost steps of each. On B300s XLA's analysis
+was the measured peak to 0.1 GiB in every run, and a step of 196.7 of 200.8 GiB
+trained. Where `none` fits, `auto` compiles once and is `none`. Where it does not,
+the other four compile side by side: each is traced and lowered in turn, which holds
+Python's lock, then XLA compiles them at once, a thread each. On 8 B300s,
+`megatron.bux`'s `nccl_ep` arm with 75% of a GPU took `save_attention` in 699 s,
+where one after another took 966 s; XLA compiled each of the four in 218-243 s side
+by side, and their tracing and lowering, a minute each, now take most of the rest
+(where a compile goes: "Speed on GPUs" in docs/training.md). So where the second fits,
+side by side costs the others' lowering: `sorted` with 95% took `dots_attention` in
+592 s, where `none` and it one after another would take about 400. The candidates
+compile all or none, so that every process of a run compiles the same programs, whose
+autotuning they share. JAX's cache keeps each
+for the run's next launch. A forward outside a training step keeps everything. The
+step says what it took, XLA's seconds of each candidate:
 
 ```
-remat=auto: save_attention (none 314.4 GiB in 42s, dots_attention 288.4 GiB in 29s,
-dots 263.7 GiB in 26s, save_attention 161.7 GiB in 24s; 97% of 200.8 GiB fits)
+remat=auto: save_attention in 699s (none 265.8 GiB in 144s, dots_attention 273.5 GiB
+in 243s, dots 249.1 GiB in 230s, save_attention 108.4 GiB in 218s, full 74.2 GiB in
+219s; 97% of 200.8 GiB fits)
 ```
 
 On one B300, the one-GPU suite's models (`examples/benchmarks/one_gpu.bux`) at more

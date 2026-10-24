@@ -87,10 +87,11 @@ editor shows them on hover and completes them, as it does for layers. In short:
   scales, biases or Engram's tables.
 - `muon(lr, momentum=0.95, nesterov, ns_steps=5, ns_coefficients=jordan,
   ns_dtype=bfloat16, weight_decay=0.1, consistent_rms=0.2, adam=none)` trains the
-  matrices inside the blocks with Muon, stacked expert weights one expert at a time,
-  and everything else (the embedding, the head, vectors) with `adam`, which defaults to
-  `adamw(lr=lr)`. With `consistent_rms=0.2` (Moonlight) one learning rate suits both;
-  `none` scales updates as Keller Jordan's Muon does. `ns_coefficients` names the
+  matrices inside the blocks with Muon, stacked expert weights one expert at a time
+  (an expert's up and gate apart), and everything else (the embedding, the head,
+  vectors) with `adam`, which defaults to `adamw(lr=lr)`. With `consistent_rms=0.2`
+  (Moonlight) one learning rate suits both; `none` scales updates as Keller Jordan's
+  Muon does. `ns_coefficients` names the
   quintics of Newton-Schulz's iterations: `jordan`'s, the same at each, or
   `polar_express`'s (Amsel et al., 2025), one for each, closer to orthogonal in as
   many. Newton-Schulz runs in `ns_dtype`, bfloat16 as in Keller Jordan's Muon, and the
@@ -116,6 +117,19 @@ layer adds its own, and `balance_loss` logs their sum. (transformers'
 training step moves it by `bias_update_rate` (1e-3) toward the experts picked less
 than the mean over the batch. Eval neither adds the loss nor moves the bias, and
 checkpoints keep the bias.
+
+For benchmarks, `moe(..., random_logits=true)` routes each training forward by
+logits drawn from N(0, 1), a stream of its own as dropout's, in place of the
+router's, as Megatron-Core's `moe_router_force_load_balancing` does for all its MoE
+benchmarks: every expert takes an even share of the picks in expectation, so a
+capacity drops few, whatever the data. The router still runs, and its logits take
+the drawn ones' gradient (a straight-through estimator). Eval routes by the router.
+It changes what a run computes, so it is in the run's id; `megatron.bux` sets it. On
+its random tokens the router's own routing drifts uneven, a balance loss of 1.4 to
+1.8 a layer, and `nccl_ep` at a capacity of 1.25 dropped 10 to 15% of the picks;
+by random logits the balance loss is 1.00 and it drops none, and runs 7% faster on
+8 B300s (29.6k tokens a second a GPU against 27.7k); `sorted` 1.4% (31.8k against
+31.4k).
 
 **The sparse attention indexer** learns from a loss of its own, as DeepSeek-V3.2's
 does: `indexer(..., loss_weight=1)`. Each layer that runs one adds `loss_weight` times
@@ -183,7 +197,7 @@ Four settings choose which projections, and when:
   | `experts` | the routed experts, by a grouped GEMM: `compute`, `mxfp8` or `mxfp8_2d`; `none` is `matmuls` where it is one of those, else compute, as no grouped GEMM takes `nvfp4`. In MXFP8 they train 10-15% faster than in bfloat16 on B300s (docs/parallelism.md) |
 
   The embedding, the head, the router and softmax attention's own matmuls always
-  stay in compute.
+  stay in compute ([why attention does](#softmax-attention-in-fp8)).
 - `first` and `last` keep that many residual branches outside any other, at the
   start and at the end of the model before its first head, in compute: a number, or
   a share of them, rounded up (`last=0.15`). A branch is a `[...]` inside no other,
@@ -253,6 +267,34 @@ capacity). With `roles=roles(experts=mxfp8)` and `dispatch=mxfp8` its held-out l
 it trained at 105k tokens a second against 127k by Triton's grouped GEMMs, in 75 GiB
 against 89. By `grouped_mxfp8`'s, which compute the same values, it trains faster
 than bfloat16 (docs/parallelism.md).
+
+### Softmax attention in FP8
+
+Megatron-Bridge's recipe runs softmax attention in FP8 by cuDNN
+(`fp8_dot_product_attention`); bux keeps it in compute. cuDNN's FP8 attention runs on
+B300s through jax 0.12, but no recipe that bux can run stateless trains both faster
+and as well:
+
+- Its backward gives dQ, dK and dV in E4M3 only (XLA takes no other dtype beside FP8
+  inputs), and their scales must be set before the kernel finds their amaxes.
+  Transformer Engine scales them by earlier steps' amaxes, which bux does not keep; a
+  bound safe at any step lies up to t h / g above dK's and dV's (a key that every
+  query attends to), past E4M3's range. jax 0.12 also passes that backward's scales
+  in another order than XLA reads them, which its tests, every scale 1, cannot see.
+- Its forward with a backward in bfloat16 diverges. With q, k and v at their current
+  scaling (a power of two from each one's amax), the probabilities by 1 and the
+  output by half of v's scale, then cuDNN's bfloat16 backward on q, k and v as the
+  forward rounded them, the 1.3B's gradients grew past 1e10 and to NaN within 650 to
+  1130 steps of FineWeb-Edu in all 11 runs (seeds 0 to 2, by cuDNN's backward or
+  tokamax's, subnormals kept or flushed). The backward takes the FP8 forward's
+  output, for the rows' sums of dO times it, and its logsumexp; each alone, the other
+  from bfloat16, still diverged, and with both from a bfloat16 forward of the rounded
+  inputs it trained within the noise of bfloat16 (held-out loss at 1500 steps +0.06%
+  and -0.05%, where seeds differ by 0.6%), as q, k and v rounded alone did. cuDNN's
+  FP8 backward computes those sums from its own probabilities.
+- Its forward pays only in long rows: a layer of 32 heads of 4 takes 0.82 ms to
+  bfloat16's 0.84 in 8 rows of 4096, 3.7 to 5.8 in one of 32k, and the stable
+  backward above adds a bfloat16 forward.
 
 ## Data
 
@@ -442,7 +484,7 @@ by itself where it cannot run, and all of them do inside `bux.kernels.off()` or 
 
 | what | by | on a B300, against XLA |
 |------|----|------------------------|
-| softmax attention | `methods.attention = auto`, the default: cuDNN's fused attention in rows of 8192 or more and with a window, else tokamax's flash attention (sinks, a soft cap) | 7x, and no t × t logits |
+| softmax attention | `methods.attention = auto`, the default: cuDNN's causal kernels in rows of one document, cuDNN's fused attention in rows of 8192 or more and with a window, else tokamax's flash attention (sinks, a soft cap) | 7x, and no t × t logits |
 | sparse attention (DSA, QSA, CSA) | `sparse`: tokamax's flash attention with the kept keys as a mask; the indexer's scores, its loss's picks and target by Pallas kernels (`scoring`), its top-k by counting | 2.6x a chunk of queries at a time, and no t × t floats |
 | linear attention, RWKV-7 | `chunkwise`: chunks of 64 positions, the state across them by a Pallas kernel (`affine_scan`); `methods(states=recompute)` keeps a fourteenth of the memory for the backward | 14-17x a scan over positions |
 | Mamba-2 | `chunkwise`, B and C a group's, the state across chunks by a matmul; `methods(states=recompute)` keeps a sixteenth of the memory for the backward | 25x a scan over positions (2 × 4096 tokens, rematerialized: at 8 × 4096 the scan needs 199 GiB) |
@@ -451,7 +493,7 @@ by itself where it cannot run, and all of them do inside `bux.kernels.off()` or 
 | KDA without | bux's Pallas kernels (`pallas_delta`): any gate, each pair's decay through a position between them | 2.6x `chunkwise` |
 | MoE experts | `grouped.ragged_dot`: tokamax's Mosaic and Triton kernels | 27x `jax.lax.ragged_dot` |
 | MoE experts in MXFP8 | `grouped_mxfp8`: Mosaic GPU kernels of tcgen05's block-scaled MMA, the scales by TMA into tensor memory (docs/parallelism.md) | 1.5-2.4x tokamax's bfloat16 GEMMs |
-| MoE dispatch | `token_rows`, `permuted`: gathers where XLA would scatter | 4x |
+| MoE dispatch | `token_rows`, `token_sums`: gathers where XLA would scatter | 4x |
 | NVFP4's quantizers | `nvfp4`: Pallas kernels, a pass for the largest magnitudes and one that writes both copies, rounded by Blackwell's E2M1 conversions | 3-5x |
 
 Tokens a second on B300s, 8 × 4096 tokens a GPU, `precision(compute=bfloat16)`, and
@@ -523,8 +565,37 @@ loops, command buffers off, Triton GEMMs off. FSDP over 8 GPUs gets 97% of 8 tim
 one GPU's tokens already. Other splits wait longer for their collectives, and the
 `compiler` setting tries XLA's options on them (below).
 
-On packed documents (`best_fit` of documents of 16 to 4000 words, GPT-2 tokens), on
-one GPU, the 1.3B trains at 145k tok/s in rows of 4096 by tokamax's kernel, and at
+bux also gives XLA's memory pool 95% of a GPU, where JAX gives it 75%
+(`runtime.POOL`), unless `XLA_CLIENT_MEM_FRACTION` or its old name,
+`XLA_PYTHON_CLIENT_MEM_FRACTION`, says otherwise. The rest is for what allocates
+beside the pool: the CUDA context, NCCL's buffers and NCCL EP's, which on B300s
+(268.6 GiB) took, a GPU at most:
+
+| run (`megatron.bux`, Qwen3-30B-A3B; the dense 1.3B) | beside the pool |
+|------------------------------------------------------|-----------------|
+| `sorted`, `fsdp=8`                                   | 1.9 GiB         |
+| `nccl_ep`, `expert=8`                                | 6.5 GiB         |
+| the 1.3B, `fsdp=16` over two nodes                   | 2.2 GiB         |
+| `nccl_ep`, `expert=16` over two nodes                | 9.8 GiB         |
+
+At 95% a B300's pool is 254 GiB and 14.3 GiB stay beside it; at 97%, 8.9 GiB, too
+little for NCCL EP over two nodes, whose buffers grow with a device's tokens and the
+model's width. `remat=auto` fits the step to the pool: Qwen3-30B-A3B's `sorted` arm
+(`megatron.bux`) took `dots` at 75% (210k tokens a second, 180 GiB) before the MoE's
+weights moved before `down`, and takes `none` at 95% now (295k, 215 GiB), as does its
+`nccl_ep` arm (246k, 211 GiB), each in one compile.
+
+A compile of `sorted`'s 48-layer step (`remat=none`) takes about 230 s on a B300's
+host: 38 s to trace it, 62 s to lower it to MLIR, and 132 s in XLA, 89 of them in its
+HLO passes and 16 in LLVM and ptxas for its 286 kernels. 88% of the lowering is the
+MXFP8 experts' Mosaic GPU kernels, lowered once a call, 0.36 s each, though every
+layer calls them at the same shapes. Creating the model compiles its
+initializers besides, once a run: 79 s.
+
+On rows of one document (random tokens, `remat=none`), on one GPU, the 1.3B trains at
+155k tok/s by cuDNN's causal kernels and at 148k by tokamax's. On packed documents
+(`best_fit` of documents of 16 to 4000 words, GPT-2 tokens), on one GPU, the 1.3B
+trains at 145k tok/s in rows of 4096 by tokamax's kernel, and at
 139k in rows of 16384 by cuDNN's, which skips every block no query sees, where
 tokamax's, whose backward pass does every block of a row, gives 109k (random tokens:
 111k and 101k). With sinks, 142k in rows of 4096, where `auto` took xla, whose t × t

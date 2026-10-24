@@ -4,12 +4,14 @@ against `jax.lax.ragged_dot` and its own gradients; and in MXFP8 (grouped_blocks
 by XLA on the CPU, against ragged_dot of the operands quantized as each GEMM contracts
 them."""
 
+from collections.abc import Callable
+
 import jax
 import jax.numpy as jnp
 import numpy as np
 from jaxtyping import Array, Float
 
-from bux.architecture.experts import grouped, grouped_blockscaled
+from bux.architecture.experts import grouped, grouped_blockscaled, moe
 from bux.architecture.precision import blockscaled
 from bux.train import config as tcfg
 
@@ -105,6 +107,60 @@ def test_mxfp8_multiplies_only_the_passes_named_in_it():
         others = outputs(_ragged(tuple(p for p in blockscaled.PASSES if p != name)))
         assert not np.allclose(every[i], exact[i], atol=1e-3)
         np.testing.assert_allclose(others[i], exact[i], rtol=1e-4, atol=1e-3)
+
+
+def test_rows_read_from_where_they_were_picked_multiply_as_the_rows_themselves():
+    """As an MoE's picks are each a token's row: the quantizer reads them from the
+    tokens on a Blackwell GPU, XLA from the rows elsewhere; the same values either
+    way, and the tokens' gradient through the gather that made the rows."""
+    tokens = jax.random.normal(jax.random.key(5), (40, D))
+    index = jax.random.randint(jax.random.key(6), (M,), 0, 40)
+
+    def outputs(picked: bool) -> list[Float[Array, "..."]]:
+        def f(t: Float[Array, "n d"], w: Float[Array, "g d f"]) -> Float[Array, "m f"]:
+            source = grouped_blockscaled.Picked(t, index) if picked else None
+            recipe, passes = blockscaled.MXFP8, blockscaled.PASSES
+            x = t[index]
+            return grouped_blockscaled.ragged_dot(
+                x, w, SIZES, recipe, SEED, passes, source
+            )
+
+        y, vjp = jax.vjp(f, tokens, W32)
+        return [y, *vjp(G32)]
+
+    for got, want in zip(outputs(True), outputs(False), strict=True):
+        np.testing.assert_array_equal(got, want)
+
+
+def test_rows_summed_into_their_tokens_multiply_as_the_sums_of_the_rows():
+    """As an MoE sums its picks' outputs into their tokens (moe.token_sums), whose
+    gradient gathers each row's from its token's: the quantizer reads it from the
+    tokens' on a Blackwell GPU, XLA from the gathered rows elsewhere."""
+    tokens, k = 40, 8
+    idx = jax.random.randint(jax.random.key(7), (tokens, k), 0, 5)
+    order, inverse, sizes = moe.sort_by_expert(idx, 5)
+    rows = jax.random.normal(jax.random.key(8), (tokens * k, D))
+    grad = jax.random.normal(jax.random.key(9), (tokens, 64))
+    recipe, passes = blockscaled.MXFP8, blockscaled.PASSES
+
+    def summed(x: Float[Array, "m d"], w: Float[Array, "g d f"]) -> Float[Array, "t f"]:
+        into = grouped_blockscaled.Summed(order, inverse.reshape(tokens, k))
+        return grouped_blockscaled.ragged_dot(
+            x, w, sizes, recipe, SEED, passes, summed=into
+        )
+
+    def then_summed(
+        x: Float[Array, "m d"], w: Float[Array, "g d f"]
+    ) -> Float[Array, "t f"]:
+        y = grouped_blockscaled.ragged_dot(x, w, sizes, recipe, SEED, passes)
+        return moe.token_sums(y, inverse, order, k)
+
+    def outputs(f: Callable[..., Float[Array, "t f"]]) -> list[Float[Array, "..."]]:
+        y, vjp = jax.vjp(f, rows, W32)
+        return [y, *vjp(grad)]
+
+    for got, want in zip(outputs(summed), outputs(then_summed), strict=True):
+        np.testing.assert_array_equal(got, want)
 
 
 def test_the_grouped_formats_are_those_the_config_allows():

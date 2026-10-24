@@ -13,19 +13,22 @@ own. Under a capacity the picks that do not fit drop before they go, as in
 hang across nodes.
 
 NCCL EP keeps its buffers outside the step, sized for the run, so ``start`` runs once
-a process before the step traces (``methods.prepare``).
+a process before the step traces (``methods.prepare``). Under `methods.moe_stream` its
+kernels run on a stream of their own (``STREAM``), beside the compute stream's.
 """
 
 import functools
 import math
+from collections.abc import Callable
 from types import ModuleType
-from typing import TYPE_CHECKING, NamedTuple
+from typing import TYPE_CHECKING, Any, NamedTuple
 
 import jax
 import jax.numpy as jnp
-from jaxtyping import Array, Bool, Float, Int, UInt8
+from jaxtyping import Array, Bool, Float, Int, Shaped, UInt8
 
 from bux import config as cfg
+from bux import jax_internals
 from bux.architecture.experts.moe import Kernels, RowNorm, experts, sort_by_expert
 from bux.architecture.precision import matmuls
 from bux.architecture.repeats import remat
@@ -36,6 +39,7 @@ from bux.parallel.experts import (
     Axes,
     Combined,
     _arrivals,
+    chunk_of,
     expert_parallel,
     token_spec,
 )
@@ -49,8 +53,24 @@ if TYPE_CHECKING:
 # Each expert's rows start at a multiple of this: NCCL EP's high-throughput kernels
 # take no less, and the experts' grouped GEMMs are content with it.
 ALIGNED = 128
-# What NCCL EP was started with in this process: experts, picks, tokens, d, rows.
-started: tuple[int, int, int, int, int] | None = None
+# The stream NCCL EP's kernels run on under `methods.moe_stream`, one of their own:
+# XLA runs the compute stream's kernels beside them, and theirs one after another.
+STREAM = "gpu_stream:1"
+
+
+class Started(NamedTuple):
+    """What NCCL EP was started with in this process: the run's experts and picks a
+    token, the most tokens a device sends at once and their width, and the rows each
+    dispatch brings a device, padded, of which NCCL EP takes no fewer."""
+
+    experts: int
+    picks: int
+    tokens: int
+    d: int
+    rows: int
+
+
+started: Started | None = None
 
 
 def transformer_engine() -> ModuleType:
@@ -85,9 +105,9 @@ def start(run: "ir.Run") -> None:
     tokens = _tokens_a_device(run, ep)
     peers = _size(ep)
     rows = _room(tokens * top_k, num_experts // peers, peers)
-    wanted = (num_experts, top_k, tokens, run.arch.d_model, rows)
+    wanted = Started(num_experts, top_k, tokens, run.arch.d_model, rows)
     if started != wanted:
-        _bootstrap(ep[0], num_experts, tokens, run.arch.d_model, rows)
+        _bootstrap(ep[0], wanted)
         started = wanted
 
 
@@ -129,11 +149,12 @@ def _size(axes: Axes) -> int:
 
 
 def _tokens_a_device(run: "ir.Run", ep: Axes) -> int:
-    """Return the most tokens a device sends at once: its share of a step's rows,
-    whole, as an eval step takes them; a training microbatch or chunk sends fewer."""
+    """Return the most tokens a device sends at once: a chunk of its share of a step's
+    rows, whole, as an eval step takes them (``experts.chunk_of``); a training
+    microbatch's chunk sends no more."""
     t = run.train
     shape = (t.batch, t.seq_len, run.arch.d_model)
-    return t.batch * t.seq_len // _size(axes_of(token_spec(shape, ep)))
+    return chunk_of(t.batch * t.seq_len // _size(axes_of(token_spec(shape, ep))))
 
 
 def _room(picks: int, local: int, peers: int) -> int:
@@ -144,9 +165,9 @@ def _room(picks: int, local: int, peers: int) -> int:
     return math.ceil(rows / ALIGNED) * ALIGNED
 
 
-def _bootstrap(axis: str, num_experts: int, tokens: int, d: int, rows: int) -> None:
+def _bootstrap(axis: str, sizes: Started) -> None:
     """Start NCCL EP's group of each line of devices along `axis`, on a communicator
-    TE takes from XLA; first stop the one before, if any."""
+    TE takes from XLA, with buffers of `sizes`; first stop the one before, if any."""
     from transformer_engine.jax.ep import ep_bootstrap, ep_finalize
     from transformer_engine.jax.sharding import MeshResource, global_shard_guard
 
@@ -158,10 +179,10 @@ def _bootstrap(axis: str, num_experts: int, tokens: int, d: int, rows: int) -> N
         ep_bootstrap(
             world_size=None,
             rank=None,
-            num_experts=num_experts,
-            max_tokens_per_rank=tokens,
-            recv_capacity_per_rank=rows,
-            hidden_dim=d,
+            num_experts=sizes.experts,
+            max_tokens_per_rank=sizes.tokens,
+            recv_capacity_per_rank=sizes.rows,
+            hidden_dim=sizes.d,
             drop_on_overflow=False,  # bux drops what does not fit first (``_kept``)
         )
 
@@ -189,15 +210,16 @@ def nccl_ep(
     if matmuls.in_force().dispatch != "compute":
         raise ValueError("methods(moe=nccl_ep) sends the tokens in bfloat16, not MXFP8")
     assert started is not None, "methods.prepare starts NCCL EP before a step traces"
-    rows = _room(idx.size, local, peers)
+    rows = started.rows  # what every dispatch brings: NCCL EP takes no fewer
     kept, arrivals = _kept(idx, local, axes)
     picks = jnp.where(kept, idx, -1).reshape(tokens, k).astype(jnp.int32)  # -1: none
     chosen = jnp.where(kept, weights, 0).reshape(tokens, k).astype(jnp.float32)
     sent = _dispatched(rows, tokens, k, z.reshape(tokens, d), picks, chosen)
-    made = experts(remat.label(EXCHANGED, sent.rows), sent.sizes, *kernels, ffn, norm)
     held = _picks_in(sent.sizes, arrivals.kept[jax.lax.axis_index(axes)].sum(-1), rows)
-    weighted = made * jnp.where(held, sent.weights, 0)[:, None].astype(made.dtype)
-    y = remat.label(EXCHANGED, _combined(rows, tokens, k, sent.handle, weighted))
+    row_weights = jnp.where(held, sent.weights, 0)
+    arrived = remat.label(EXCHANGED, sent.rows)
+    made = experts(arrived, sent.sizes, row_weights, *kernels, ffn, norm)
+    y = remat.label(EXCHANGED, _combined(rows, tokens, k, sent.handle, made))
     return y.reshape(z.shape), 1 - arrivals.kept.sum() / (idx.size * peers)
 
 
@@ -250,6 +272,25 @@ def _route(k: int) -> dict[str, int]:
     return {"top_k": k, "dispatch_output_per_expert_alignment": ALIGNED}
 
 
+def _bind(primitive: Any, *args: Shaped[Array, "..."], **params: Any) -> Any:
+    """Return TE's one-device `primitive` of `args` (``_on_its_stream``)."""
+    return _on_its_stream(lambda: _bound(primitive, *args, **params))
+
+
+def _bound(primitive: Any, *args: Shaped[Array, "..."], **params: Any) -> Any:
+    return primitive.inner_primitive.bind(*args, **params)
+
+
+def _on_its_stream[T](run: Callable[[], T]) -> T:
+    """Return run(), under `methods.moe_stream` the primitives it binds on NCCL EP's
+    stream as one async call: the compute stream waits for each call where it uses its
+    results, so a call a primitive would make it wait for each one in turn."""
+    on = active()
+    if on is None or not on.methods.moe_stream:
+        return run()
+    return jax_internals.on_stream(STREAM, run)
+
+
 @functools.partial(jax.custom_vjp, nondiff_argnums=(0, 1, 2))
 def _dispatched(
     rows: int,
@@ -275,18 +316,29 @@ def _dispatched_forward(
     weights: Float[Array, "n k"],
 ) -> tuple[Dispatched, UInt8[Array, "1 h"]]:
     te = transformer_engine()
-    sizes, _, handle = te.EpPreparePrimitive.inner_primitive.bind(
-        idx, **_route(k), is_outer=False
-    )
-    arrived, arrived_weights = te.EpDispatchPrimitive.inner_primitive.bind(
-        handle,
-        idx,
-        x,
-        weights,
-        **_route(k),
-        recv_capacity_per_rank=rows,
-        is_outer=False,
-    )
+
+    def prepared_and_sent() -> tuple[
+        Float[Array, "1 r d"],
+        Float[Array, "1 r"],
+        UInt8[Array, "1 h"],
+        Int[Array, "1 l"],
+    ]:
+        sizes, _, handle = _bound(
+            te.EpPreparePrimitive, idx, **_route(k), is_outer=False
+        )
+        arrived, arrived_weights = _bound(
+            te.EpDispatchPrimitive,
+            handle,
+            idx,
+            x,
+            weights,
+            **_route(k),
+            recv_capacity_per_rank=rows,
+            is_outer=False,
+        )
+        return arrived, arrived_weights, handle, sizes
+
+    arrived, arrived_weights, handle, sizes = _on_its_stream(prepared_and_sent)
     sent = Dispatched(arrived[0], arrived_weights[0], handle, sizes[0])
     return sent, handle
 
@@ -294,7 +346,8 @@ def _dispatched_forward(
 def _dispatched_backward(
     rows: int, tokens: int, k: int, handle: UInt8[Array, "1 h"], g: Dispatched
 ) -> tuple[Float[Array, "n d"], None, Float[Array, "n k"]]:
-    gx, gw = transformer_engine().EpDispatchBwdPrimitive.inner_primitive.bind(
+    gx, gw = _bind(
+        transformer_engine().EpDispatchBwdPrimitive,
         handle,
         g.rows[None],
         g.weights[None],
@@ -329,7 +382,8 @@ def _combined_forward(
     handle: UInt8[Array, "1 h"],
     made: Float[Array, "r d"],
 ) -> tuple[Float[Array, "n d"], UInt8[Array, "1 h"]]:
-    y = transformer_engine().EpCombinePrimitive.inner_primitive.bind(
+    y = _bind(
+        transformer_engine().EpCombinePrimitive,
         handle,
         made[None],
         **_route(k),
@@ -342,8 +396,13 @@ def _combined_forward(
 def _combined_backward(
     rows: int, tokens: int, k: int, handle: UInt8[Array, "1 h"], g: Float[Array, "n d"]
 ) -> tuple[None, Float[Array, "r d"]]:
-    g_made = transformer_engine().EpCombineBwdPrimitive.inner_primitive.bind(
-        handle, g, **_route(k), recv_capacity_per_rank=rows, is_outer=False
+    g_made = _bind(
+        transformer_engine().EpCombineBwdPrimitive,
+        handle,
+        g,
+        **_route(k),
+        recv_capacity_per_rank=rows,
+        is_outer=False,
     )
     return None, g_made[0]
 

@@ -8,12 +8,12 @@ parallelism (``bux.parallel.experts``) takes apart:
 
     sort_by_expert  the picks in order of their experts, and how many each one has
     token_rows      each pick's token row, in that order
-    experts         each row through its expert's FFN, by a grouped GEMM
-    permuted        each pick's output back in token order
-    einsum          each token's sum of its k outputs, weighted by the router
+    experts         each row through its expert's FFN, by grouped GEMMs, times its
+                    pick's weight
+    token_sums      each token's sum of its k picks' rows
 
 Shapes: b rows of t tokens of width d; E experts, k picks a token, f hidden units an
-expert.
+expert, and p projections into them: 2 for a gated MLP (up and gate), else 1.
 """
 
 from collections.abc import Callable
@@ -25,7 +25,7 @@ import jax.numpy as jnp
 from flax import nnx
 from jax.ad_checkpoint import checkpoint_name
 from jax.sharding import PartitionSpec as P
-from jaxtyping import Array, Bool, Float, Int
+from jaxtyping import Array, Bool, Float, Int, Key
 
 from bux import config as cfg
 from bux import parallel
@@ -40,10 +40,9 @@ from bux.lang import ir
 from bux.parallel import methods
 
 RowNorm = Callable[[Float[Array, "n d"]], Float[Array, "n d"]]
-# The experts' kernels, stacked: up, gate (None for an mlp) and down.
-Kernels = tuple[
-    Float[Array, "E d f"], Float[Array, "E d f"] | None, Float[Array, "E f d"]
-]
+# The experts' kernels, stacked: up, with the gate beside it in a gated MLP, and down.
+Kernels = tuple[Float[Array, "E d f p"], Float[Array, "E f d"]]
+LECUN = nnx.initializers.lecun_normal()
 
 
 class Sorted(NamedTuple):
@@ -58,7 +57,8 @@ class Sorted(NamedTuple):
 class MoE(nnx.Module):
     """Token-choice top-k experts, run by the run's method of ``methods.moe``."""
 
-    muon_axes: ClassVar = {"up": (1, 2), "gate": (1, 2), "down": (1, 2)}
+    # Up's last dimension, of up and gate, is a batch one: Muon orthogonalizes them apart.
+    muon_axes: ClassVar = {"up": (1, 2), "down": (1, 2)}
 
     def __init__(self, config: cfg.MoEConfig, width: int, rngs: nnx.Rngs):
         _check_groups(config)
@@ -92,12 +92,11 @@ class MoE(nnx.Module):
         self.latent_input_norm = _norm(config.latent_input_norm, latent)
         self.latent_output_norm = _norm(config.latent_output_norm, latent)
 
-        self.up = _stacked((n, latent, f), ("experts", inner, "mlp"), rngs)
-        self.gate = (
-            _stacked((n, latent, f), ("experts", inner, "mlp"), rngs)
-            if config.expert.type == "gated_mlp"
-            else None
-        )
+        # A gated MLP's up and gate, each hidden unit's two columns side by side,
+        # (E, d, f, 2): one GEMM makes both, and where tensor parallelism splits the
+        # hidden units, each up column stays with its gate's.
+        p = 2 if config.expert.type == "gated_mlp" else 1
+        self.up = _side_by_side(p, (n, latent, f), ("experts", inner, "mlp"), rngs)
         self.down = _stacked((n, f, latent), ("experts", "mlp", inner), rngs)
         self.expert_norm = _norm(config.expert_norm, latent)
         self.shared = _shared_experts(config, width, rngs)
@@ -106,6 +105,8 @@ class MoE(nnx.Module):
             if config.shared_expert_gate
             else None
         )
+        # The random logits' stream, as dropout keeps its own.
+        self.routing = rngs["routing"].fork() if config.random_logits else None
 
     def __call__(self, x: Float[Array, "b t d"], taps: Taps) -> Float[Array, "b t d"]:
         idx, weights, sinks = self._route(x, taps)
@@ -123,10 +124,12 @@ class MoE(nnx.Module):
     ]:
         """Return each token's top-k experts and their weights, and the shared
         experts' weights if the router scores them too. A training forward also
-        balances the experts. Scores and top-k are in float32, the weights in x's
-        dtype."""
+        balances the experts, and routes by random logits under `random_logits`.
+        Scores and top-k are in float32, the weights in x's dtype."""
         config, n = self.config, self.config.num_experts
         logits = self.router(x.astype(jnp.float32)) * config.router_logit_scale
+        if self.routing is not None and training(taps):
+            logits = random_logits(logits, self.routing())
         match config.router:
             case "softmax":
                 scores = jax.nn.softmax(logits)
@@ -177,8 +180,7 @@ class MoE(nnx.Module):
 
     def kernels(self) -> Kernels:
         """Return the routed experts' kernels as arrays."""
-        gate = None if self.gate is None else self.gate[...]
-        return self.up[...], gate, self.down[...]
+        return self.up[...], self.down[...]
 
     def _latent(self, x: Float[Array, "b t d"]) -> Float[Array, "b t l"]:
         """Return the tokens as the routed experts take them: in LatentMoE, projected
@@ -201,6 +203,16 @@ class MoE(nnx.Module):
         if self.shared_gate is not None:
             y = y * jax.nn.sigmoid(self.shared_gate(x))
         return y
+
+
+def random_logits(
+    logits: Float[Array, "b t e"], key: Key[Array, ""]
+) -> Float[Array, "b t e"]:
+    """Return logits drawn from N(0, 1) in place of `logits`, whose gradient goes to
+    `logits` as if they were those (a straight-through estimator): the router runs
+    and learns, but every expert is as likely a pick as any other."""
+    drawn = jax.random.normal(key, logits.shape, logits.dtype)
+    return drawn + (logits - jax.lax.stop_gradient(logits))  # drawn, exactly
 
 
 def _limit_groups(
@@ -244,8 +256,17 @@ def _norm(config: cfg.NormalizationConfig | None, width: int) -> Norm | None:
 def _stacked(
     shape: tuple[int, int, int], names: tuple[str, str, str], rngs: nnx.Rngs
 ) -> nnx.Param:
-    init = nnx.initializers.lecun_normal()
-    return nnx.Param(init(rngs.params(), shape), names=names)
+    return nnx.Param(LECUN(rngs.params(), shape), names=names)
+
+
+def _side_by_side(
+    p: int, shape: tuple[int, int, int], names: tuple[str, str, str], rngs: nnx.Rngs
+) -> nnx.Param:
+    """Return p stacks of matrices of `shape` (E, d, f) side by side, (E, d, f, p),
+    each drawn as ``_stacked`` draws one: LECUN takes an array's last two dimensions
+    for its matrices'."""
+    stacks = [LECUN(rngs.params(), shape) for _ in range(p)]
+    return nnx.Param(jnp.stack(stacks, axis=-1), names=(*names, None))
 
 
 def _shared_experts(config: cfg.MoEConfig, width: int, rngs: nnx.Rngs) -> MLP | None:
@@ -269,16 +290,11 @@ def run_dense(
 ) -> Float[Array, "b t d"]:
     """Run every expert on every token and weight the outputs by the router: the
     reference. Each device runs every expert on its own tokens."""
-    up, gate, down = moe.kernels()
+    up, down = moe.kernels()
     dense = dense_weights(idx, weights, moe.config.num_experts)
-
-    def project(w: Float[Array, "E d f"]) -> Float[Array, "b t E f"]:
-        h = jnp.einsum("btd,edf->btef", z, w)
-        return parallel.shard(h, "batch", "seq", "experts", "mlp")
-
-    h = activate(
-        moe.config.expert, project(up), None if gate is None else project(gate)
-    )
+    projected = jnp.einsum("btd,edfp->btefp", z, up)
+    projected = parallel.shard(projected, "batch", "seq", "experts", "mlp", None)
+    h = hidden_units(moe.config.expert, projected)
     if moe.expert_norm is None:
         return jnp.einsum("btef,efd,bte->btd", h, down, dense)
     per_expert = moe.expert_norm(jnp.einsum("btef,efd->bted", h, down))
@@ -342,8 +358,7 @@ def routed(
     z: Float[Array, "b t d"],
     idx: Int[Array, "b t k"],
     weights: Float[Array, "b t k"],
-    up: Float[Array, "E d f"],
-    gate: Float[Array, "E d f"] | None,
+    up: Float[Array, "E d f p"],
     down: Float[Array, "E f d"],
     ffn: cfg.MLPConfig,
     norm: RowNorm | None = None,
@@ -354,11 +369,14 @@ def routed(
     b, t, d = z.shape
     k, n = idx.shape[-1], up.shape[0]
     order, inverse, sizes = sort_by_expert(idx, n)
-    rows = token_rows(z.reshape(b * t, d), order, inverse, k)
-    out = experts(rows, sizes, up, gate, down, ffn, norm)
-    per_pick = permuted(out, inverse, order).reshape(b, t, k, d)
+    tokens = z.reshape(b * t, d)
+    rows = token_rows(tokens, order, inverse, k)
     kept = jnp.where(in_range(idx, n), weights, 0)
-    return jnp.einsum("btkd,btk->btd", per_pick, kept)
+    row_weights = picked_weights(kept, order, inverse)
+    picked = grouped_blockscaled.Picked(tokens, order // k)
+    summed = grouped_blockscaled.Summed(order, inverse.reshape(b * t, k))
+    out = experts(rows, sizes, row_weights, up, down, ffn, norm, picked, summed)
+    return out.reshape(b, t, d)
 
 
 def sort_by_expert(idx: Int[Array, "*n k"], num_experts: int) -> Sorted:
@@ -379,32 +397,72 @@ def in_range(idx: Int[Array, "*s"], num_experts: int) -> Bool[Array, "*s"]:
 def experts(
     x: Float[Array, "n d"],
     sizes: Int[Array, " E"],
-    up: Float[Array, "E d f"],
-    gate: Float[Array, "E d f"] | None,
+    weights: Float[Array, " n"],
+    up: Float[Array, "E d f p"],
     down: Float[Array, "E f d"],
     ffn: cfg.MLPConfig,
     norm: RowNorm | None = None,
-) -> Float[Array, "n d"]:
-    """Run each row of `x` through its expert's FFN, then `norm`. The rows are sorted
-    by expert: the first sizes[0] are expert 0's, the next sizes[1] expert 1's, and so
-    on; rows past them come out 0 before `norm`. It depends on its arguments alone, so
-    it runs on one device's experts in a shard_map as it does on all of them. The
-    kernels multiply in x's dtype, so that wider ones add up the gradients of several
-    calls in their own."""
+    picked: grouped_blockscaled.Picked | None = None,
+    summed: grouped_blockscaled.Summed | None = None,
+) -> Float[Array, "r d"]:
+    """Run each row of `x` through its expert's FFN, then `norm`, times the row's
+    weight in `weights`. The rows are sorted by expert: the first sizes[0] are expert
+    0's, the next sizes[1] expert 1's, and so on; rows past them come out 0 before
+    `norm`. It depends on its arguments alone, so it runs on one device's experts in a
+    shard_map as it does on all of them. The kernels multiply in x's dtype, so that
+    wider ones add up the gradients of several calls in their own. Given where x was
+    `picked`, a format's quantizer reads it there; given the tokens its rows are
+    `summed` into, it returns their sums."""
     recipe = grouped_blockscaled.RECIPES.get(experts_format())
-    up, down = up.astype(x.dtype), down.astype(x.dtype)
-    gate = None if gate is None else gate.astype(x.dtype)
+    n, (e, d, f, p) = x.shape[0], up.shape
+    up, down = up.reshape(e, d, f * p).astype(x.dtype), down.astype(x.dtype)
 
-    def times(x: Float[Array, "n e"], w: Float[Array, "E e f"]) -> Float[Array, "n f"]:
-        return grouped_product(x, w, sizes, recipe)
+    def times(
+        x: Float[Array, "n e"],
+        w: Float[Array, "E e f"],
+        picked: grouped_blockscaled.Picked | None = None,
+        summed: grouped_blockscaled.Summed | None = None,
+    ) -> Float[Array, "r f"]:
+        return grouped_product(x, w, sizes, recipe, picked, summed)
 
-    if gate is not None and recipe is not None and grouped_blockscaled.fits(x, up):
-        # One GEMM for both: x quantizes once.
-        u, g = jnp.split(times(x, jnp.concatenate([up, gate], -1)), 2, axis=-1)
-    else:
-        u, g = times(x, up), None if gate is None else times(x, gate)
-    y = times(activate(ffn, u, g), down)
-    return y if norm is None else norm(y)
+    projected = times(x, up, picked).reshape(n, f, p)  # up and gate by one GEMM
+    if norm is None:
+        # Weighted before `down`, which is linear: the weights' gradient then needs
+        # each row's f hidden units, not its d outputs.
+        return times(weighted_units(ffn, projected, weights), down, summed=summed)
+    y = weighted(norm(times(hidden_units(ffn, projected), down)), weights)
+    return y if summed is None else sums_of_tokens(y, summed)
+
+
+def weighted_units(
+    ffn: cfg.MLPConfig, projected: Float[Array, "n f p"], weights: Float[Array, " n"]
+) -> Float[Array, "n f"]:
+    """Return each row's hidden units times its weight. The backward computes them
+    again, elementwise, from `projected`, which the activation's gradient keeps
+    anyway: else it would keep them, for the weights' gradient, and their parts."""
+
+    def units(
+        projected: Float[Array, "n f p"], weights: Float[Array, " n"]
+    ) -> Float[Array, "n f"]:
+        return weighted(hidden_units(ffn, projected), weights)
+
+    return jax.checkpoint(units)(projected, weights)
+
+
+def hidden_units(
+    ffn: cfg.MLPConfig, projected: Float[Array, "*n f p"]
+) -> Float[Array, "*n f"]:
+    """Return the hidden units of an FFN from its p projections into each: up, and
+    for a gated MLP the gate (``activate``)."""
+    gate = projected[..., 1] if projected.shape[-1] == 2 else None
+    return activate(ffn, projected[..., 0], gate)
+
+
+def weighted(
+    x: Float[Array, "n e"], weights: Float[Array, " n"]
+) -> Float[Array, "n e"]:
+    """Return each row of x times its weight, in x's dtype."""
+    return x * weights[:, None].astype(x.dtype)
 
 
 def grouped_product(
@@ -412,15 +470,30 @@ def grouped_product(
     w: Float[Array, "E e f"],
     sizes: Int[Array, " E"],
     recipe: blockscaled.Recipe | None,
-) -> Float[Array, "n f"]:
+    picked: grouped_blockscaled.Picked | None = None,
+    summed: grouped_blockscaled.Summed | None = None,
+) -> Float[Array, "r f"]:
     """Return each expert's rows of x times its matrix of w, named `experts` for
-    ``remat``: in `recipe`'s format where x and w are whole blocks of it
-    (``grouped_blockscaled``), else in compute (``grouped``)."""
+    ``remat``, or the sums of the tokens they are `summed` into: in `recipe`'s format
+    where x and w are whole blocks of it (``grouped_blockscaled``, x read from where
+    it was `picked`), else in compute (``grouped``)."""
     if recipe is None or not grouped_blockscaled.fits(x, w):
-        return checkpoint_name(ragged_dot(x, w, sizes), "experts")
+        y = checkpoint_name(ragged_dot(x, w, sizes), "experts")
+        return y if summed is None else sums_of_tokens(y, summed)
     precision, seed = matmuls.in_force(), matmuls.seed()
-    y = grouped_blockscaled.ragged_dot(x, w, sizes, recipe, seed, precision.passes)
+    passes = precision.passes
+    y = grouped_blockscaled.ragged_dot(
+        x, w, sizes, recipe, seed, passes, picked, summed
+    )
     return checkpoint_name(y, "experts")
+
+
+def sums_of_tokens(
+    y: Float[Array, "m d"], summed: grouped_blockscaled.Summed
+) -> Float[Array, "t d"]:
+    """Return each token's sum of its rows of y, as `summed` says (``token_sums``)."""
+    tokens, k = summed.inverse.shape
+    return token_sums(y, summed.inverse.reshape(tokens * k), summed.order, k)
 
 
 def experts_format() -> str:
@@ -462,28 +535,12 @@ def _token_rows_backward(
 token_rows.defvjp(_token_rows_forward, _token_rows_backward)
 
 
-@jax.custom_vjp
-def permuted(
-    x: Float[Array, "m d"], order: Int[Array, " m"], inverse: Int[Array, " m"]
-) -> Float[Array, "m d"]:
-    """Return x[order], for a permutation `order` that `inverse` undoes. Its gradient
-    gathers by `inverse`."""
-    return x[order]
-
-
-def _permuted_forward(
-    x: Float[Array, "m d"], order: Int[Array, " m"], inverse: Int[Array, " m"]
-) -> tuple[Float[Array, "m d"], Int[Array, " m"]]:
-    return x[order], inverse
-
-
-def _permuted_backward(
-    inverse: Int[Array, " m"], g: Float[Array, "m d"]
-) -> tuple[Float[Array, "m d"], None, None]:
-    return g[inverse], None, None
-
-
-permuted.defvjp(_permuted_forward, _permuted_backward)
+def picked_weights(
+    weights: Float[Array, "*n k"], order: Int[Array, " m"], inverse: Int[Array, " M"]
+) -> Float[Array, " m"]:
+    """Return the weight of each pick in `order`, the first m of the M picks sorted,
+    which `inverse` unsorts: ``token_rows`` of a pick a row."""
+    return token_rows(weights.reshape(-1, 1), order, inverse, 1)[:, 0]
 
 
 @partial(jax.custom_vjp, nondiff_argnums=(3,))
