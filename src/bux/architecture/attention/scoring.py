@@ -24,7 +24,7 @@ from jax.experimental import pallas as pl
 from jax.sharding import PartitionSpec as P
 from jaxtyping import Array, Float, Int
 
-from bux import kernels, parallel
+from bux import jax_internals, kernels, parallel
 
 QUERIES, KEYS = 64, 128  # the most of each a program takes
 PROBABILITY_KEYS = 64  # of `probabilities`
@@ -386,6 +386,7 @@ def _picked_grads(
     each pick's share of the keys' gradient added into it atomically, in float32."""
     from jax.experimental.pallas import triton as plgpu
 
+    jax_internals.relax_pallas_atomics()
     b, t, h, i = q.shape
     s, k, bk = keys.shape[1], index.shape[-1], _block(index.shape[-1], PICKS)
     assert bk is not None
