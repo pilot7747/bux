@@ -156,27 +156,34 @@ not at all: its buffers were sized for a step. At one microbatch, `sorted`'s ste
   `nccl_ep` on 12 layers +4%. Off by default: its residuals cross the scan's
   iterations (25-30 GiB more), so 48 layers fit only with recompute.
 
+- **D, the host.** The log's learning rate queued behind the step just launched, and
+  nnx.jit walked the model's and the optimizer's graph at every call: the GPU waited
+  for the host between steps (58 ms a step of the 1.3B's 257, logging every step). A
+  step is a jax.jit over their variables' values, split once, and the log reads its
+  learning rate behind its own step: the 1.3B's GPU idles 2.2 ms a step.
+
 On 8 B300s, `megatron.bux` at its defaults, one node, main against the merged tree:
 
 | run | main | round 2 | of Megatron's 40,769 |
 |-----|------|---------|----------------------|
-| `sorted`, `fsdp=8` | 37,451, 229.6 GiB | **42,252**, 214.5 GiB | 104% |
-| `nccl_ep`, `expert=8` | fails | 34,715, 236.1 GiB | 85% |
+| `sorted`, `fsdp=8` | 37,436, 229.6 GiB | **42,391**, 214.5 GiB | 104% |
+| `nccl_ep`, `expert=8` | fails | 34,873, 236.1 GiB | 86% |
 
-O's pass gave 5%, K's MLP 4.5%, A's kernels 2.6%. 3000 steps of FineWeb-Edu on the
-baseline's MoE with experts of 768 and QK-norm end within 0.12% of main at each of
-three seeds, which differ by 1.6% (mean -0.01%). The suites, main against the merged
-tree: on a node FSDP +0.9%, at 8 microbatches +6.3%, the MoE sorted +0.1% and by EP
-+1.2%, TP +1.9%, the pipeline -0.0%; on one GPU dense +1.5%, MoE +1.5%, NVFP4 +2.1%,
-the others within 1% (the GDN hybrid, -4.5% side by side on other GPUs, trains at
-128.3k on one GPU in turn in both trees, and pinned to the same loss).
+O's pass gave 5%, K's MLP 4.5%, A's kernels 2.6%, D's 0.6%. 3000 steps of FineWeb-Edu
+on the baseline's MoE with experts of 768 and QK-norm end within 0.12% of main at each
+of three seeds, which differ by 1.6% (mean -0.01%). The suites, main against the merged
+tree before D: on a node FSDP +0.9%, at 8 microbatches +6.3%, the MoE sorted +0.1% and
+by EP +1.2%, TP +1.9%, the pipeline -0.0%; on one GPU dense +1.5%, MoE +1.5%, NVFP4
++2.1%, the others within 1% (the GDN hybrid, -4.5% side by side on other GPUs, trains
+at 128.3k on one GPU in turn in both trees, pinned to the same loss). D on its own: on
+a node FSDP +1.7%, at 8 microbatches +4.2%; on one GPU +1.2% to +7.2%.
 
 ## Left open
 
 - `nccl_ep`'s exchange: hidden only beside another microbatch (`interleave`), which
   needs a carry XLA does not copy to fit 48 layers without recompute.
-- The GPU waits for the host between steps: 165-210 ms of `sorted`'s 6.4 s step, as
-  nnx.jit walks the state before each launch.
+- An eval or a checkpoint still makes the host wait for the GPU before the next step,
+  and XLA's launch of the 30B's step waits on CUDA's full queue of kernels.
 - ~40 ms of reductions a microbatch still alone at the end of its backward (the last
   layers', the embedding's, the head's in float32).
 - The MXFP8 experts' Mosaic kernels are lowered again at every call, and CuTe DSL
