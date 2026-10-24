@@ -53,7 +53,7 @@ from bux.train.config import PrecisionConfig
 from bux.train.data import Batch, batches, prefetch
 from bux.train.hooks import Checkpoint, Eval, Hook, Log, Profile
 from bux.train.objective import Metrics, Objective, objective, target_mask
-from bux.train.optim import Schedule, lr_multiplier, lr_schedule, optimizer
+from bux.train.optim import lr_multiplier, lr_schedule, optimizer
 from bux.train.sinks import JSONL, Console, LatestMetrics, Sink, is_main_process
 
 
@@ -308,6 +308,9 @@ class Trainer:
     step is gone after it, and one to keep is a copy (``np.asarray``).
 
     The training step compiles with XLA's `compiler_options` (``bux.train.xla``).
+
+    Given the `work` of a step (``flops.Work``), `flops` adds up the model FLOPs of
+    the steps taken, each at the keys its batch's queries see, for the log's MFU.
     """
 
     def __init__(
@@ -325,6 +328,7 @@ class Trainer:
         reduce: DTypeLike | None = None,
         donate: bool = False,
         compiler_options: xla.Options | None = None,
+        work: flops.Work | None = None,
     ):
         self.model, self.objective = model, objective
         self.compute, self.microbatches = jnp.dtype(compute), microbatches
@@ -334,6 +338,7 @@ class Trainer:
         self.optimizer = nnx.Optimizer(model, tx, wrt=nnx.Param)
         parallel.shard_state(self.model, self.optimizer)
         self.step = 0
+        self.work, self.flops = work, 0.0
         self.stopping = False  # set, by a signal handler say, to stop after this step
         self._donated = ("model", "optimizer") if donate else ()
         self._compiler_options = compiler_options or {}
@@ -612,6 +617,8 @@ class Trainer:
         self._switch_if_due()
         metrics = self._train(self.model, self.optimizer, parallel.shard_batch(batch))
         self.step += 1
+        if self.work is not None:
+            self.flops += self.work.of(batch.position_ids)
         return metrics
 
     def _switch_if_due(self) -> None:
@@ -699,7 +706,10 @@ def train(
         )
 
     multiplier = lr_multiplier(config.schedule, config.steps)
-    log = _log(run, lr_schedule(config.optimizer.lr, multiplier))
+    lr, peak = lr_schedule(config.optimizer.lr, multiplier), _peak(run)
+    tokens = config.batch * config.seq_len
+    log = Log(every=config.log.every, lr=lr, tokens=tokens, peak=peak)
+    work = step_flops(run) if peak else None
     methods = stages.balanced(run)
     if methods.stages != config.methods.stages:
         echo(f"{run.name}: methods.stages = {methods.stages}")
@@ -724,6 +734,7 @@ def train(
             reduce=_reduce_dtype(config.precision),
             donate=config.methods.donate,
             compiler_options=xla.options(config.compiler),
+            work=work,
         )
         make_batches = functools.partial(
             batches, config=config, vocab_size=vocab, cache=cache
@@ -779,7 +790,7 @@ def _accumulated(microbatches: int) -> int:
     return 1 if parallel.pipeline.pipelined() else microbatches
 
 
-def step_flops(run: ir.Run) -> float:
+def step_flops(run: ir.Run) -> flops.Work:
     """Return the model FLOPs of a training step of `run`: its loss's gradient on a
     batch, counted from its program (``flops.count``) on one device, outside any mesh,
     with remat and kernels off, which would add work or hide it."""
@@ -809,16 +820,11 @@ def step_flops(run: ir.Run) -> float:
         return flops.count(gradient, params, rest, ids)
 
 
-def _log(run: ir.Run, lr: Schedule) -> Log:
-    """Return the run's log, with its MFU where the peak of its devices is known."""
-    t = run.train
-    devices = parallel.mesh(t.mesh).devices
+def _peak(run: ir.Run) -> float | None:
+    """Return the FLOPs a second of the run's devices at their peak, if known."""
+    devices = parallel.mesh(run.train.mesh).devices
     each = flops.peak(devices.flat[0].device_kind)
-    most = each and each * devices.size
-    work = step_flops(run) if most else None
-    return Log(
-        every=t.log.every, lr=lr, tokens=t.batch * t.seq_len, flops=work, peak=most
-    )
+    return each and each * devices.size
 
 
 def _hooks(

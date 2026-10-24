@@ -7,8 +7,9 @@ ppermutes). It attends to each block by a kernel's call, merging the blocks by t
 logsumexps, and skips a block no query sees: one ahead of them all, or before the
 first key of each (its document's first token, or its window's). Its own block comes
 first, from its own keys and values, while the others' are gathered. The backward pass
-runs each block's kernel backward with the final output and logsumexp, and sums each
-block's gradients onto its device.
+runs each block's kernel backward with the final output and logsumexp, on the blocks
+the forward pass gathered, and sums each block's gradients onto its device in the
+keys' dtype: in bfloat16, half the bytes of float32's.
 
 In the positions' order a row of one document balances badly: device c - 1 attends
 to c blocks, device 0 to one. So without documents or a window the queries go zigzag:
@@ -199,7 +200,7 @@ def _ring_fwd(
     out, lse = jax.lax.scan(step, state, jnp.arange(1, plan.c))[0]
     out, lse = flash.with_sinks(out, lse, sinks)
     out = out.astype(q.dtype)
-    return out, (q, k, v, start, sinks, out, lse)
+    return out, (q, ks, vs, start, sinks, out, lse)
 
 
 def _skip(
@@ -229,13 +230,14 @@ def _attend(
 
 def _ring_bwd(static: Static, saved: tuple, dout: Float[Array, "b n h dv"]) -> tuple:
     """Return the gradients of `_ring`: each block's from its kernel's backward pass
-    with the final output and logsumexp, summed onto its device at the end."""
-    q, k, v, start, sinks, out, lse = saved
+    with the final output and logsumexp, summed onto its device at the end in the
+    keys' dtype. It takes the blocks the forward pass gathered, not gathering them
+    again."""
+    q, ks, vs, start, sinks, out, lse = saved
     plan = Plan.here(q.shape[1], static.zigzag)
-    ks, vs, me = plan.blocks(k), plan.blocks(v), plan.me
+    me = plan.me
     grads = partial(static.kernel.backward, scale=static.scale, cap=static.cap)
-    mine = plan.mine(k, ks), plan.mine(v, vs)
-    dq, dk, dv = grads(q, *mine, out, dout, lse, plan.keys(me, start, True))
+    dq, dk, dv = grads(q, ks[me], vs[me], out, dout, lse, plan.keys(me, start, True))
     seen = (q, out, dout, lse, start)
     pieces = [partial(_differentiate, p, plan, grads, *seen) for p in plan.pieces()]
     branches = [_no_grads, *pieces]
@@ -251,9 +253,9 @@ def _ring_bwd(static: Static, saved: tuple, dout: Float[Array, "b n h dv"]) -> t
     dvs = jnp.zeros(vs.shape, F32).at[me].set(dv.astype(F32))
     carry = (dq.astype(F32), dks, dvs)
     dq, dks, dvs = jax.lax.scan(step, carry, jnp.arange(1, plan.c))[0]
-    dk, dv = plan.scatter(dks), plan.scatter(dvs)
+    dk, dv = plan.scatter(dks.astype(ks.dtype)), plan.scatter(dvs.astype(vs.dtype))
     dsinks = flash.sink_grads(sinks, lse, out, dout)
-    return dq.astype(q.dtype), dk.astype(k.dtype), dv.astype(v.dtype), None, dsinks
+    return dq.astype(q.dtype), dk, dv, None, dsinks
 
 
 def _no_grads(

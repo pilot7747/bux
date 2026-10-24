@@ -168,7 +168,8 @@ def test_every_method_takes_its_softmax_in_float32(kernels, method):
 @pytest.mark.parametrize(("ids", "sends"), [(IDS, False), (None, True)])
 def test_ring_gathers_the_keys_and_sends_only_zigzag_queries(ids, sends):
     """The keys and values are gathered, and nothing goes round; without documents or
-    a window the queries go zigzag and back by collective-permutes."""
+    a window the queries go zigzag and back by collective-permutes. (The documents'
+    starts, a prefix scan of their ids, send int32s round.)"""
     q, k, v, sinks, _ = attention(Case(4, 2))
     seen = Case(4, 2, ids).visibility(sinks)
     with parallel.use(tcfg.MeshConfig(context=4, fsdp=2)) as mesh:
@@ -176,8 +177,11 @@ def test_ring_gathers_the_keys_and_sends_only_zigzag_queries(ids, sends):
         q, k, v = (jax.device_put(x, put) for x in (q, k, v))
         f = jax.jit(lambda q, k, v: methods.attention.find("ring")(q, k, v, seen))
         text = f.lower(q, k, v).compile().as_text()
-    assert text is not None and ("collective-permute" in text) == sends
-    gathered = [line for line in text.splitlines() if " all-gather(" in line]
+    assert text is not None
+    lines = text.splitlines()
+    permuted = [line for line in lines if " collective-permute(" in line]
+    assert any(" f32[" in line.split("=")[1] for line in permuted) == sends
+    gathered = [line for line in lines if " all-gather(" in line]
     assert any(" f32[" in line.split("=")[1] for line in gathered)
 
 

@@ -211,6 +211,21 @@ def keep_triton_calls_whole() -> None:
     )
 
 
+def relax_pallas_atomics() -> None:
+    """Have Pallas's Triton lowering make its atomic adds relaxed, as CUDA's atomicAdd
+    is: it asks acquire-release of every one (lowering._atomic_rmw's default), which
+    sums need no more than atomicity of, and on a B300 the indexer's loss's backward
+    kernel (scoring.py), whose adds are most of it, took 1.6x the time."""
+    from jax._src.lib.triton import dialect
+    from jax._src.pallas.triton import lowering
+
+    defaults = lowering._atomic_rmw.__defaults__
+    assert defaults is not None
+    mask, _, scope = defaults
+    relaxed = dialect.MemSemantic.RELAXED
+    lowering._atomic_rmw.__defaults__ = (mask, relaxed, scope)
+
+
 def tokamax_attention(implementation: str) -> Any:
     """Return tokamax's flash attention op of `implementation` ("mosaic_gpu",
     "triton"), None without tokamax. Called with return_residuals=True, it gives

@@ -373,7 +373,7 @@ methods = methods(attention=ring)
 | `xla`     | all t by t logits at once. With `seq` over `context` a device has its queries' rows, and every key and value: all-gather CP |
 | `cudnn`   | cuDNN's fused attention (jax's) on each device's whole rows, documents in its packed layout. bfloat16 or float16, keys' and values' head dims equal and up to 256 (its packed layout gets MLA's wrong); no soft cap, no sinks, no positions over `context` |
 | `tokamax` | tokamax's flash attention, its Mosaic kernels: a document and a window as each query's first key, sinks by the logsumexp. With `seq` over `context`, a device gathers every key and value and attends with its queries in one call: all-gather CP, whose backward pass does every block. Linux only (the `cuda` extra) |
-| `ring`    | every key and value gathered once over `context`, and a flash call (tokamax's; jnp's on a CPU) for each device's block of them, merged by their logsumexps, a device's own block first, as the others' are gathered. A block no query sees is skipped: one ahead of them all, or before every query's first key, its document's or its window's. Without documents the queries go zigzag, device `i` holding chunks `i` and `2c-1-i` of `2c`, so that every device attends to as much; its own block is then a gathered one. The backward pass runs each block's kernel backward with the final output and logsumexp, and reduce-scatters the blocks' gradients |
+| `ring`    | every key and value gathered once over `context`, and a flash call (tokamax's; jnp's on a CPU) for each device's block of them, merged by their logsumexps, a device's own block first, as the others' are gathered. A block no query sees is skipped: one ahead of them all, or before every query's first key, its document's or its window's. Without documents the queries go zigzag, device `i` holding chunks `i` and `2c-1-i` of `2c`, so that every device attends to as much; its own block is then a gathered one. The backward pass runs each block's kernel backward with the final output and logsumexp, on the blocks the forward pass gathered, and reduce-scatters the blocks' gradients in the keys' dtype |
 | `ulysses` | all-to-alls over `context`, from a device's positions of every head to every position of its own heads; `auto`'s kernel on those whole rows; and back. `context` must divide a device's heads; kv heads it does not divide are repeated |
 
 What only `xla` has stays in the layer: relative bias, length scale and attention
@@ -389,7 +389,11 @@ each part with the kept keys as a boolean mask: dense compute, exact, and t² bi
 mask forward and bytes backward. Under `xla`, off a GPU, or in `bux.kernels.off()`, XLA
 runs it a chunk of queries at a time. Either way it is a `shard_map` that gives a device
 its rows, queries and heads, and every key: all-gather CP. The indexer's loss takes the
-attention's probabilities again from its logsumexp, a chunk of queries at a time.
+attention's probabilities once, from its logsumexp, a chunk of queries at a time (on a
+GPU by a kernel for heads of up to 128 dims), and scores each query's picks by Pallas
+kernels in a `shard_map` that gives a device its rows and queries and every key: a
+program a query, which stops at its last pick, and a backward pass that adds the keys'
+gradient atomically.
 
 `bux.parallel.flash` has the kernels. A `Kernel` attends to a block of keys: its
 forward pass returns each query's logsumexp beside its output, and its backward pass
@@ -481,6 +485,28 @@ tokamax then takes, so `auto` takes it; `ring` stays the method for longer packe
 rows, as at 128k above. That `ring` attends to its own block while the others' are
 gathered changes nothing past the noise in this model (223k on packed documents
 against 225k gathering it first): a layer's gather is short against its attention.
+
+At 128k tokens a row, the baseline's dense 1.3B (16 layers of `d_model = 2048`, 16
+heads and 8 kv heads of 128) over `mesh(context=8)`, a row a step, `remat=full`,
+bfloat16; packed documents of 64 to 4096 tokens (log-uniform), or one document a row
+(tok/s, the log's MFU of the keys each query sees, the busiest GPU's peak memory):
+
+| `methods.attention` | packed documents         | one document a row       |
+|---------------------|--------------------------|--------------------------|
+| `ring`              | **346k**, 12.5%, 22 GiB  | 91k, 16.1%, 22 GiB       |
+| `ulysses`, `auto`   | 227k, 8.2%, 25 GiB       | **197k**, 34.9%, 25 GiB  |
+| `tokamax`           | 123k, 4.4%, 21 GiB       |                          |
+
+They took 144k, 136k and 85k on packed documents before, and 68k and 125k on one
+document: a step took the documents' ids, and each layer their starts, by XLA's
+cumsum and cummax of the row, which at 128k over `context` take 25 and 2 ms each time,
+where a prefix scan (`jax.lax.associative_scan`) takes log2(t) steps; and `ring`'s
+backward pass gathered every block again and reduce-scattered their gradients in
+float32. On long packed
+rows `ring` is 1.5x `ulysses`, whose kernel past cuDNN's room for documents (32 a row
+of 128k on a device's 2 heads) is tokamax's, which does every block backward; `auto`
+cannot tell packed rows from rows of one document before a batch comes, so give such
+a run `methods(attention=ring)`.
 
 On 8 CPU devices, two windowed GQA layers (4 heads, 2 kv heads) with sinks and a soft
 cap train on packed rows as on one device, to 1e-5 over 3 steps, by every method on
@@ -903,15 +929,16 @@ The routed experts' role, `experts`, takes `compute`, `mxfp8` or `mxfp8_2d`
 (docs/training.md, "Precision"), and `nvfp4` is an error. Left out, it is `matmuls`
 where a grouped GEMM multiplies in it, `mxfp8` and `mxfp8_2d`, and compute under any
 other, as `nvfp4`: no grouped GEMM takes NVFP4 (`PrecisionConfig.experts`). On B300s
-MXFP8 experts train 6 to 13% faster than bfloat16 ones (below). An MoE run that leaves
+MXFP8 experts train 10 to 15% faster than bfloat16 ones (below). An MoE run that leaves
 them to `matmuls=mxfp8` multiplied them in bfloat16 before that, so it takes the id
 of a run that names `mxfp8` for them, and a launch trains it again; a run that names
 their format keeps its id, and a model without routed experts too. In a
 format, `experts` runs up and gate as one GEMM, so that x quantizes once, and each
 GEMM by `grouped_blockscaled.ragged_dot`: every operand of the forward's GEMM and of
 the backward's two quantized along what that GEMM contracts, as a projection's are,
-and each expert's W on its own. One pass of a Triton kernel quantizes x and x^T, and
-zeroes the rows past the experts', which an exchange's buffer leaves as they were.
+and each expert's W on its own. One pass of a Triton kernel (`grouped_triton`)
+quantizes x and x^T, zeroes the rows past the experts', which an exchange's buffer
+leaves as they were, and writes both as the kernels below take them.
 Elsewhere XLA dequantizes and multiplies, which computes the same values, so the
 tests run it on CPU. Only `passes` multiply in the format, the others by `grouped`'s
 kernels, as they are.
@@ -964,25 +991,33 @@ scales, rows of 4 bytes too short for TMA, through registers into tensor memory 
 every step of k.
 
 Training on B300s, side by side, GEMM autotuning off and deterministic ops, the
-experts in bfloat16, in MXFP8 by Triton's kernels as before, and by `grouped_mxfp8`
-(tokens a second, peak memory):
+experts in bfloat16, in MXFP8 by Triton's kernels as before, by `grouped_mxfp8`, and
+by it with the quantizer writing its layout (below; by `scripts/benchmark.py` on
+`examples/benchmarks`' arms, against bfloat16 in the same job), tokens a second and
+peak memory:
 
-| run | bfloat16 | MXFP8, Triton | MXFP8, `grouped_mxfp8` |
-|-----|----------|---------------|------------------------|
-| the baseline MoE, one GPU, 8 × 4096 tokens | 86.2k, 133.9 GiB | 74.2k | 91.5k (1.06x), 119.5 GiB |
-| experts of 2048, 8 layers, one GPU | 90.4k, 143.2 GiB | 75.6k | 101.7k (1.12x), 129.6 GiB |
-| `ragged_all_to_all`, `capacity=1.25`, `expert=8`, 32k tokens a GPU | 468k, 88.5 GiB | 417k | 517k (1.10x), 72.3 GiB |
-| | | | `dispatch=mxfp8`: 515k |
-| `all_to_all`, `capacity=1.25`, `expert=8`, 32k tokens a GPU | 492k, 91.4 GiB | 449k | 539k (1.10x), 78.4 GiB |
-| `sorted`, `fsdp=8`, 32k tokens a GPU | 671k, 83.9 GiB | 580k | 712k (1.06x), 69.4 GiB |
+| run | bfloat16 | MXFP8, Triton | MXFP8, `grouped_mxfp8` | quantized into its layout |
+|-----|----------|---------------|------------------------|---------------------------|
+| the baseline MoE, one GPU, 8 × 4096 tokens: one_gpu.bux's `moe` | 86.2k, 133.9 GiB | 74.2k | 91.5k (1.06x), 119.5 GiB | 95.0k (1.10x) |
+| experts of 2048, 8 layers, one GPU | 90.4k, 143.2 GiB | 75.6k | 101.7k (1.12x), 129.6 GiB | |
+| `ragged_all_to_all`, `capacity=1.25`, `expert=8`, 32k tokens a GPU: one_node.bux's `moe_ep` | 468k, 88.5 GiB | 417k | 517k (1.10x), 72.3 GiB | 539k (1.15x) |
+| | | | `dispatch=mxfp8`: 515k | |
+| `all_to_all`, `capacity=1.25`, `expert=8`, 32k tokens a GPU | 492k, 91.4 GiB | 449k | 539k (1.10x), 78.4 GiB | |
+| `sorted`, `fsdp=8`, 32k tokens a GPU: one_node.bux's `moe` | 671k, 83.9 GiB | 580k | 712k (1.06x), 69.4 GiB | 743k (1.11x) |
 
 Both MXFP8 kernels compute the same values: the runs' losses agree to the last digit
-logged, and with bfloat16's to the rounding between them. The experts' GEMMs take
-half of bfloat16's time, 3.0 ms a layer against 5.8, and the quantizer, which reads
-each operand once and writes it twice, most of what they save: an MoE layer's experts
-forward and backward take 6.1 ms against 7.3 in bfloat16, and 13.8 against 17.9 with
-experts of 2048 (`scripts/gpu_smoke/grouped_mxfp8.py`). It keeps x^T in MXFP8 for dW
-rather than x in bfloat16, so it takes 14 GiB less. It trains at bfloat16's loss: 98M
+logged, and with bfloat16's to the rounding between them; the two quantizers write
+the same bytes, and the memory is the same. The experts' GEMMs take half of
+bfloat16's time, 3.0 ms a layer against 5.8, and the quantizer 1.5 ms of what they
+save: an MoE layer's experts forward and backward take 5.0 ms against 7.3 in bfloat16
+(1.45x), and 11.8 against 19.7 with experts of 2048 (1.67x;
+`scripts/gpu_smoke/grouped_mxfp8.py`). It reads each operand once and writes it twice
+at 5.1 TB/s, k padded to whole tiles of 128 and the scales in tensor memory's tiles,
+so no pass of XLA lays them out after it. x^T's blocks run down x's columns, so that
+only its E4M3 bytes transpose, and it scales in x's dtype, by a power of two, exact.
+It took 2.2 ms a layer before, in float32, and XLA's pads and layouts 90 to 160 µs a
+call more: 6.1 ms a layer against 7.3. The experts keep x^T in MXFP8 for dW rather
+than x in bfloat16, so a run takes 14 GiB less. It trains at bfloat16's loss: 98M
 tokens of FineWeb-Edu end 0.13% and 0.05% below it, with FP8 dispatch
 (docs/training.md, "Precision").
 

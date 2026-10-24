@@ -154,12 +154,13 @@ def memory(
 
 
 def flops_per_token(run: Run) -> float | None:
-    """Return the model FLOPs a training token of `run` takes
+    """Return the model FLOPs a training token of `run` takes in rows of one document
     (``trainer.step_flops``); None if the backend lacks a layer."""
     from bux.train.trainer import step_flops
 
+    t = run.train
     try:
-        return step_flops(run) / (run.train.batch * run.train.seq_len)
+        return step_flops(run).one_document(t.seq_len) / (t.batch * t.seq_len)
     except NotImplementedError:
         return None
 

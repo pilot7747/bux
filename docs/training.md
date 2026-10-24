@@ -180,7 +180,7 @@ Four settings choose which projections, and when:
   | `recurrence` | the linear attentions', RWKV-7's and Mamba's projections, but the output |
   | `recurrence_out` | their output projection |
   | `mtp` | nextn's projection, and every branch after the first head |
-  | `experts` | the routed experts, by a grouped GEMM: `compute`, `mxfp8` or `mxfp8_2d`; `none` is `matmuls` where it is one of those, else compute, as no grouped GEMM takes `nvfp4`. In MXFP8 they train 6-13% faster than in bfloat16 on B300s (docs/parallelism.md) |
+  | `experts` | the routed experts, by a grouped GEMM: `compute`, `mxfp8` or `mxfp8_2d`; `none` is `matmuls` where it is one of those, else compute, as no grouped GEMM takes `nvfp4`. In MXFP8 they train 10-15% faster than in bfloat16 on B300s (docs/parallelism.md) |
 
   The embedding, the head, the router and softmax attention's own matmuls always
   stay in compute.
@@ -402,17 +402,26 @@ The log has the step's metrics: `loss` and every term of the objective, `grad_no
 before clipping, `lr`, `tokens` so far and `tokens_per_s` since the last log. On a GPU
 whose peak it knows (B300, B200, H200, H100, A100: dense bf16, from NVIDIA's
 datasheets), it also has `mfu`: the model's FLOPs a second over the peak of the
-mesh's GPUs. A step's FLOPs are counted once, before training, from the program of
+mesh's GPUs. The model's FLOPs are counted once, before training, from the program of
 its loss's gradient on a batch, traced on shapes alone with remat and kernels off
 (`trainer.step_flops`, `bux/train/flops.py`): 2·m·n·k for every matrix product and
-convolution, times the length of every scan around it. So a new layer counts with
-no formula of its own, and a rematerialized forward is not counted twice. Attention
-counts the share of its t × t logits that its mask keeps, (t + 1) / 2t causal and
-less with a window, as Megatron's MFU does and a flash kernel computes; not the
-documents of a packed row, which change from batch to batch. (PaLM's MFU counts them
-whole, which made bux's 10% higher at 4096 tokens a row.) `bux plan` shows the FLOPs a
-token: 6.9G for a Llama-style 1.3B at 4096 tokens a row, 6 N of its matrices and 0.8G
-of attention.
+convolution, times the length of every scan around it, each product once: what a
+backward pass computes again (jax.checkpoint's, the logits of a flash backward) counts
+none. So a new layer counts with no formula of its own.
+
+Attention counts only the keys each query sees, as Megatron's MFU does and a flash
+kernel computes. Its products over the keys of a row are counted apart (inside
+`flops.attention`), and each step counts them at the keys its batch's queries see,
+from the batch's positions (`flops.Work.of`, on the host): those of the query's own
+document up to itself, within the window, and of those no more than a sparse
+attention's top_k. Causal attention on rows of one document so counts (t + 1) / 2t of
+its t × t logits, packed documents each one's own triangle, and DSA its top_k keys a
+query in the attention, the indexer's loss and its target, with the indexer's ranking
+at every key it may pick. CSA's latents count whole. On many hosts a step counts the
+keys of the rows its host reads. (PaLM's MFU counts attention whole, which made bux's
+10% higher at 4096 tokens a row.) `bux plan` shows the FLOPs a token on rows of one
+document: 6.9G for a Llama-style 1.3B at 4096 tokens a row, 6 N of its matrices and
+0.8G of attention.
 
 `profile = profile(start=20, steps=5)` traces the 5 steps after step 20 into
 `profile/`, waiting for the step before it starts and stops, for `xprof` or
@@ -434,7 +443,7 @@ by itself where it cannot run, and all of them do inside `bux.kernels.off()` or 
 | what | by | on a B300, against XLA |
 |------|----|------------------------|
 | softmax attention | `methods.attention = auto`, the default: cuDNN's fused attention in rows of 8192 or more and with a window, else tokamax's flash attention (sinks, a soft cap) | 7x, and no t × t logits |
-| sparse attention (DSA, QSA, CSA) | `sparse`: tokamax's flash attention with the kept keys as a mask; the indexer's scores by a Pallas kernel (`scoring`), its top-k by counting | 2.6x a chunk of queries at a time, and no t × t floats |
+| sparse attention (DSA, QSA, CSA) | `sparse`: tokamax's flash attention with the kept keys as a mask; the indexer's scores, its loss's picks and target by Pallas kernels (`scoring`), its top-k by counting | 2.6x a chunk of queries at a time, and no t × t floats |
 | linear attention, RWKV-7 | `chunkwise`: chunks of 64 positions, the state across them by a Pallas kernel (`affine_scan`); `methods(states=recompute)` keeps a fourteenth of the memory for the backward | 14-17x a scan over positions |
 | Mamba-2 | `chunkwise`, B and C a group's, the state across chunks by a matmul; `methods(states=recompute)` keeps a sixteenth of the memory for the backward | 25x a scan over positions (2 × 4096 tokens, rematerialized: at 8 × 4096 the scan needs 199 GiB) |
 | Gated DeltaNet, DeltaNet | cuDNN's fused GDN kernel (`fused_delta`), by cuDNN's graph from a `buffer_callback`: any gate | 5x `chunkwise` |
@@ -470,13 +479,25 @@ bfloat16, against the same model by all t × t logits, as bux attended before `s
 | tokens a row × rows | t × t logits | `sparse` |
 |---------------------|--------------|----------|
 | 4096 × 2            | 27.0k tok/s, 85.6 GiB | 28.6k, 31.0 GiB |
-| 4096 × 8            | out of memory | 34.9k, 73.9 GiB |
-| 16384 × 1           | out of memory | 10.1k, 50.4 GiB |
-| 32768 × 1           | out of memory | 7.1k, 84.7 GiB |
+| 4096 × 8            | out of memory | 36.8k, 64.6 GiB |
+| 16384 × 1           | out of memory | 14.3k, 42.5 GiB |
+| 32768 × 1           | out of memory | 9.9k, 85.6 GiB |
+| 32768 × 1, packed documents | out of memory | 11.7k, 85.6 GiB |
+| 65536 × 1           | out of memory | 6.1k, 198 GiB |
 
-At 32k a layer's attention takes 1.4-1.9 times dense flash attention's time, and the
-indexer most of the rest: its selection 61 ms, its loss 75 ms and the loss's target
-33 ms, forward and backward. Under `methods(remat=save_attention)` the backward neither
+The indexer's loss took 60% of a step at 32k: XLA's gather of each query's 2048
+picks, their keys' gradient added by a scatter, and the attention's probabilities,
+which the backward pass took again. It takes the probabilities once now, and on a GPU
+scores the picks by Pallas kernels (`scoring.picked`), a program a query that stops
+at its last pick, whose backward pass adds the keys' gradient atomically (relaxed:
+Pallas's acquire-release adds took 1.6x the time). Before, 10.0k tokens a second at
+16k, 7.1k at 32k, 5.8k on packed documents (2.0x now: most queries of a short
+document pick few keys), 4.4k at 64k, and 8.26k at 32k for the same model with GQA's
+16 heads of 128 for MLA (11.6k now, its probabilities by a kernel too); the loss's
+probabilities, kept for the backward pass, take 9 GiB more at 32k. The log's MFU,
+which counts the keys each query sees, is 5.5% at 32k: the indexer's ranking of every
+key, its loss and its target cost far more than the attention to 2048 keys. Under
+`methods(remat=save_attention)` the backward neither
 selects the keys again nor runs the flash forward again
 ([Repeats and remat](parallelism.md#repeats-and-remat-methodsrepeat-methodsremat)):
 at 32k, 7.27k tokens a second in 39.8 GiB, as fast as no remat (7.11k, 77.9 GiB),

@@ -12,7 +12,7 @@ from flax import nnx
 from jaxtyping import Array, Float
 
 from bux import config as cfg
-from bux import parallel
+from bux import kernels, parallel
 from bux.architecture import Model, Segments, Taps
 from bux.architecture.attention import scoring, sparse
 from bux.architecture.attention.gqa import Sparse, build_gqa
@@ -20,6 +20,7 @@ from bux.architecture.attention.indexer import _top
 from bux.lang import compile
 from bux.parallel.context import masked_softmax, scaled_logits, softcap, weighted_values
 from bux.train import config as tcfg
+from bux.train import flops
 
 B, T, H, D = 2, 16, 4, 8
 # Three documents in the first row, cut mid-way, and one in the second.
@@ -236,6 +237,32 @@ def test_memory_grows_linearly_with_the_queries(monkeypatch):
     assert step_memory(2048, logits=True) > 3.5 * step_memory(1024, logits=True)
 
 
+def test_mfu_counts_the_keys_a_query_keeps_and_the_indexer_s_ranking():
+    """The attention, the indexer's loss and its target count top_k keys a query
+    (`flops.Mask`), and the indexer's ranking every key a query may pick; each product
+    once, so not the logits that the attention's backward pass computes again."""
+    top_k, heads, dims = 3, 2, 8
+    indexer = cfg.SparseIndexerConfig(num_heads=heads, head_dim=dims, top_k=top_k)
+    c = cfg.GQAConfig(num_heads=H, num_kv_heads=2, indexer=indexer)
+    graphdef, state = nnx.split(build_gqa(c, 32, (), nnx.Rngs(0)))
+
+    def loss(state, x):
+        taps = Taps(training=True)
+        y = nnx.merge(graphdef, state)(x, taps)
+        return y.sum() + taps.losses[0].value
+
+    with kernels.off():
+        work = flops.count(jax.grad(loss), state, jnp.ones((B, T, 32)))
+    attention = 2 * 2 * B * H * T * T * D  # the logits and the weighted values
+    target = 2 * B * H * T * T * D  # the logits again, for the indexer's loss
+    scores = 2 * B * T * heads * (dims + 1)  # a key's dot products, weighted
+    assert work.attention == {
+        flops.Mask(): T * scores,  # the ranking: no gradient
+        flops.Mask(top_k=top_k): 3 * attention + target,
+        flops.Mask(top_k=top_k, picks=True): 3 * top_k * scores,  # the indexer's loss
+    }
+
+
 # --- The indexer's selection ----------------------------------------------------------
 
 
@@ -267,3 +294,48 @@ def test_the_scoring_kernel_scores_as_xla_does():
     assert not got[..., 128:].any()
     passes = jax.grad(lambda q: scoring.scores(q, w, keys, end).sum())(q)
     assert not passes.any()  # no gradient, the kernel's or its inputs'
+
+
+def test_the_picked_kernels_score_and_differentiate_as_xla_does():
+    """Interpreted, as off a GPU: each query's picks, distinct and -1 past them, the
+    scores and the gradients of q, the weights and the keys (atomic adds)."""
+    t, s, h, i, k = 8, 160, 16, 16, 128  # two blocks of picks
+    key = jax.random.split(jax.random.key(0), 5)
+    q = jax.random.normal(key[0], (B, t, h, i))
+    w = jax.random.normal(key[1], (B, t, h))
+    keys = jax.random.normal(key[2], (B, s, i))
+    order = jax.random.uniform(key[3], (B, t, s)).argsort(-1)[..., :k]
+    index = jnp.where(jnp.arange(k) < 4 + 17 * jnp.arange(t)[:, None], order, -1)
+    cotangent = jax.random.normal(key[4], (B, t, k))
+
+    def xla(q, w, keys):
+        picked = jax.vmap(lambda keys, i: keys[i])(keys, jnp.maximum(index, 0))
+        dots = jnp.einsum("bthi,btki->bthk", q, picked)
+        scores = jnp.einsum("bthk,bth->btk", jax.nn.relu(dots), w)
+        return jnp.where(index >= 0, scores, 0)
+
+    def kernel(q, w, keys):
+        return scoring.picked(q, w, keys, index)
+
+    want, pull_want = jax.vjp(xla, q, w, keys)
+    got, pull = jax.vjp(kernel, q, w, keys)
+    np.testing.assert_allclose(got, want, atol=1e-4)
+    close(pull(cotangent), pull_want(cotangent))
+
+
+@pytest.mark.parametrize("cap", [None, 5.0])
+def test_the_probabilities_kernel_sums_the_heads_as_xla_does(cap):
+    """Interpreted, as off a GPU: GQA's heads, packed documents and a window; 0
+    outside each query's span."""
+    t = 64
+    rows = Segments.of(jnp.asarray([[*range(20), *range(44)], [*range(t)]]))
+    span = sparse.token_span(rows, 30)
+    key = jax.random.split(jax.random.key(0), 3)
+    q = jax.random.normal(key[0], (B, t, H, 16))
+    k = jax.random.normal(key[1], (B, t, 2, 16))
+    part = sparse.Part(k, k, span)
+    _, lse = sparse.attend(q, [part], None, SCALE, cap)
+    want = sparse.probabilities(q, part, lse, SCALE, cap)  # by XLA, off a GPU
+    got = scoring.probabilities(q, k, lse, *span, SCALE, cap)
+    np.testing.assert_allclose(got, want, atol=1e-5)
+    np.testing.assert_allclose(want.sum(-1), H, rtol=1e-5)  # a softmax a head

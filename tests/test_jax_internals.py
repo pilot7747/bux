@@ -366,6 +366,20 @@ def test_jax_triton_s_calls_survive_dead_code_elimination():
     assert any(e.primitive is call for e in kept.eqns)
 
 
+def test_pallas_s_atomic_adds_lower_relaxed():
+    """The defaults of the function Pallas's Triton lowering makes its atomics by: an
+    operation's mask, then its semantic and scope."""
+    from jax._src.lib.triton import dialect
+    from jax._src.pallas.triton import lowering
+
+    jax_internals.relax_pallas_atomics()
+    defaults = lowering._atomic_rmw.__defaults__
+    assert defaults is not None
+    mask, semantic, scope = defaults
+    assert semantic == dialect.MemSemantic.RELAXED
+    assert mask is None and scope == dialect.MemSyncScope.GPU
+
+
 # --- jax.distributed ------------------------------------------------------------------
 
 

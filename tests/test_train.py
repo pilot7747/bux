@@ -636,15 +636,15 @@ def test_a_step_s_flops_are_counted_from_its_program():
     the share of the t × t logits that a causal mask keeps, (t + 1) / 2t."""
     matrices = 2 * (2 * 64 * 64 + 2 * 64 * 32 + 3 * 64 * 256) + 64 * 512
     attention = 12 * 2 * 64 * 64 * 65 / 128  # layers, heads × head_dim, positions
-    assert step_flops(smoke()) == (6 * matrices + attention) * 8 * 64
+    assert step_flops(smoke()).one_document(64) == (6 * matrices + attention) * 8 * 64
     x, w, sizes = jnp.ones((6, 8)), jnp.ones((3, 8, 5)), jnp.array([1, 2, 3])
     grad = jax.grad(lambda x, w: jax.lax.ragged_dot(x, w, sizes).sum(), (0, 1))
-    assert flops.count(grad, x, w) == 3 * 2 * 6 * 8 * 5
+    assert flops.count(grad, x, w).fixed == 3 * 2 * 6 * 8 * 5
 
     def scan(c):
         return jax.lax.scan(lambda c, _: (c @ x.T @ x, None), c, length=5)[0]
 
-    assert flops.count(scan, jnp.ones((4, 8))) == 5 * 2 * (2 * 4 * 6 * 8)
+    assert flops.count(scan, jnp.ones((4, 8))).fixed == 5 * 2 * (2 * 4 * 6 * 8)
     depthwise = functools.partial(
         jax.lax.conv_general_dilated,
         window_strides=(1,),
@@ -652,7 +652,7 @@ def test_a_step_s_flops_are_counted_from_its_program():
         feature_group_count=6,
     )
     ones = jnp.ones((2, 6, 10)), jnp.ones((6, 1, 3))
-    assert flops.count(depthwise, *ones) == 2 * (2 * 6 * 8) * 3
+    assert flops.count(depthwise, *ones).fixed == 2 * (2 * 6 * 8) * 3
 
 
 def test_the_log_reports_mfu_where_the_devices_peak_is_known():
@@ -660,14 +660,18 @@ def test_the_log_reports_mfu_where_the_devices_peak_is_known():
     assert flops.peak("NVIDIA B300 SXM6 AC") == 2.25e15
     arch = compile(ARCH + "model = embed block norm head\n")
     loss = objective(tcfg.LossConfig(), arch)
-    trainer = Trainer(Model(arch, rngs=nnx.Rngs(0)), optax.adamw(1e-3), loss)
+    work = flops.Work(3e6, {flops.Mask(): 2e6})  # 1e6 of attention a step on rows of 8
+    model = Model(arch, rngs=nnx.Rngs(0))
+    trainer = Trainer(model, optax.adamw(1e-3), loss, work=work)
     lr = lr_multiplier(tcfg.ConstantSchedule(), 2)
     data = batches(tcfg.SyntheticConfig(), rows(tcfg.SyntheticConfig(), 2, 8), 32)
     latest = LatestMetrics()
-    log = Log(every=1, lr=lr, tokens=16, flops=4e6, peak=1e9)
+    log = Log(every=1, lr=lr, tokens=16, peak=1e9)
     trainer.fit(data, 2, hooks=[log], sinks=[latest])
     steps_per_s = latest.metrics["tokens_per_s"] / 16
-    assert latest.metrics["mfu"] == pytest.approx(steps_per_s * 4e6 / 1e9)
+    flops_per_step = 3e6 + 2e6 * (8 + 1) / (2 * 8)
+    assert trainer.flops == 2 * flops_per_step
+    assert latest.metrics["mfu"] == pytest.approx(steps_per_s * flops_per_step / 1e9)
 
 
 @pytest.mark.parametrize("donate", [False, True])
