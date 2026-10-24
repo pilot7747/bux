@@ -616,16 +616,16 @@ collectives take 14% of the step and hide all but 1.5% of it. A collective's tim
 includes the wait for its slowest peer, so on unevenly loaded devices, such as the
 ring's on packed rows, `exposed_comm_ms` swings between runs of one speed.
 
-Only scanned layers gain, under FSDP: `maxtext` trains the scanned 1.3B at 719k
-(three runs, against 656-662k), faster than the same unrolled (623k, and 572k under
-`maxtext`). Of its options, the pipelining and double buffering of `o1` give 3%, and
+Only scanned layers gain, under FSDP at a row a GPU: `maxtext` trains the scanned
+1.3B at 719k (three runs, against 656-662k), faster than the same unrolled (623k, and
+572k under `maxtext`). Of its options, the pipelining and double buffering of `o1` give 3%, and
 cuBLAS's GEMMs where XLA would take Triton's inside the loop
 (`--xla_gpu_enable_triton_gemm=false`) 5%; the combine thresholds, XLA's
 rematerialization and command buffers nothing. With TP the scanned layers gain nothing.
 
 Scanned with `maxtext` against the defaults, unrolled with XLA's options, by the
 benchmarks' FSDP runs (`one_node.bux`, `two_nodes.bux`, [Benchmarks](#benchmarks)),
-20 steps, by rows of 4096 a GPU; and by the one-GPU suite, 8 rows:
+20 steps, by rows of 4096 a GPU:
 
 | run | rows a GPU | `default`, unrolled | `maxtext`, scanned |
 |-----|------------|---------------------|--------------------|
@@ -636,7 +636,9 @@ benchmarks' FSDP runs (`one_node.bux`, `two_nodes.bux`, [Benchmarks](#benchmarks
 | the MoE, `fsdp=8` | 8 | 815k | 713k (−12.5%) |
 | the 1.3B, `fsdp=16`, two nodes | 1 | 699k | 1.03M (+48%) |
 | | 8 | 2.18M | 2.12M (−2.8%) |
-ONE_GPU_ROWS
+
+On one GPU, 8 rows, scanned with `maxtext` is slower still: the dense model by 4%,
+the MoE by 15% and the GDN hybrid by 20%, as is the GDN hybrid by 23% over `fsdp=8`.
 
 At a row a GPU an unrolled step waits for FSDP's gathers, and takes as long as one of
 two rows; the scan's loop, its collectives pipelined and its buffers doubled, hides

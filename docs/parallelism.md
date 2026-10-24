@@ -1967,7 +1967,22 @@ as its checkpoints keep the split ([Resuming](training.md#resuming)). The split 
 give every stage a pass and sum to the repeat's, in one round, else it is an error
 that says so.
 
-STAGES_TABLE
+On one node of 8 B300s, the 1.3B of the table above under `1f1b`, 8 microbatches, the
+loss by chunks, the splits about the balanced one:
+
+| mesh              | `methods.stages`            | tok/s | peak     |
+|-------------------|-----------------------------|-------|----------|
+| `stage=2, fsdp=4` | `[11, 5]`                   | 641k  | 32.5 GiB |
+|                   | `[10, 6]`, as balanced      | 682k  | 30.8 GiB |
+|                   | `[9, 7]`                    | 682k  | 29.7 GiB |
+| `stage=4, fsdp=2` | `[5, 5, 4, 2]`              | 540k  | 52.6 GiB |
+|                   | `[4, 5, 5, 2]`              | 548k  | 52.6 GiB |
+|                   | `[5, 5, 5, 1]`, as balanced | 601k  | 52.7 GiB |
+
+The balanced split is the hand-tuned one, and the fastest, on both (on 2 stages tied
+with `[9, 7]`). Its FLOPs count attention's: without them the head would be 5.6
+passes' work, and 2 stages would take `[11, 5]`, 6% slower.
+PP_DEFAULTS
 
 ### Later: DualPipe
 
