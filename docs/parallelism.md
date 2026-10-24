@@ -1540,8 +1540,10 @@ to a multiple of them, so that each device does the same work, and the work of a
 them to their owners, which orthogonalize their matrices of a shape as one batched
 chain of products; another brings the results back to the parameters' shards, and an
 all-gather copies them over the axes that do not split the parameter (`data`, say).
-Under `layout(zero=1)` an update comes split by FSDP, as the optimizer's state is, and
-its matrices go back whole along FSDP's side by an all-gather, as the parameter is.
+An update comes split as the optimizer's state is, under `layout(zero=1)` by FSDP too,
+and its matrices go back whole along what FSDP split by an all-gather, as the parameter
+is: a side, or a stack's experts, which each device orthogonalizes where they are, with
+no all-to-all.
 
 A method gets every update of a step at once, so that it can choose where each runs:
 
@@ -1550,10 +1552,11 @@ from bux.parallel import methods
 
 
 @methods.orthogonalize.register("mine")
-def _(updates, dims, shardings, newton_schulz):
+def _(updates, dims, shardings, states, newton_schulz):
     # updates: an array per Muon parameter, in muon's ns_dtype; dims: their
-    # MuonDimensionNumbers; shardings: their parameters' NamedShardings, None
-    # outside parallel.use; newton_schulz(x, dims): optax's, in x's dtype.
+    # MuonDimensionNumbers; shardings and states: their parameters' NamedShardings
+    # and their optimizer states', where the updates come from, None outside
+    # parallel.use; newton_schulz(x, dims): optax's, in x's dtype.
     return [newton_schulz(x, d) for x, d in zip(updates, dims)]
 ```
 
