@@ -865,20 +865,23 @@ wait
 python scripts/benchmark.py compare old.json new.json
 ```
 
-`compare` prints a line a run, here of one tree against itself, side by side on a
-node of 8 B300s:
+`compare` prints a line a run, here of a tree against the one before it trained KDA
+by bux's own kernels (`pallas_delta`), side by side on a node of 8 B300s:
 
 ```
-run              old tok/s  new tok/s   diff  new MFU  old GiB  new GiB  loss diff
-one_gpu[dense]     144,920    144,408  -0.4%    44.4%     51.1     51.1    -0.0001
-one_gpu[gdn]       121,571    120,504  -0.9%    37.9%     70.6     70.6    -0.0009
-one_gpu[kda]        60,217     59,961  -0.4%    18.9%    122.0    122.0    +0.0007
-one_gpu[kdab]      127,947    129,974  +1.6%    41.0%     91.4     91.4    -0.0005
-one_gpu[moe]       106,512    106,531  +0.0%    32.8%    134.0    134.0    -0.0407
-one_gpu[mamba2]     97,456     96,862  -0.6%    33.0%    122.6    122.6    +0.0002
-one_gpu[mxfp8]     169,221    167,646  -0.9%    51.5%     46.9     46.9    -0.0109
-one_gpu[nvfp4]     182,654    183,500  +0.5%    56.4%     43.8     43.8    -0.0005
+run              old tok/s  new tok/s    diff  new MFU  old GiB  new GiB  loss diff
+one_gpu[dense]     145,744    142,645   -2.1%    43.8%     51.1     51.1    +0.0004
+one_gpu[gdn]       123,164    120,909   -1.8%    38.0%     70.6     70.6    -0.0007
+one_gpu[kda]        59,425     96,273  +62.0%    30.4%    122.0     88.0    -0.0057  faster, less memory
+one_gpu[kdab]      127,287    127,309   +0.0%    40.2%     91.4     91.4    -0.0012
+one_gpu[moe]       106,900    105,503   -1.3%    32.5%    134.0    134.0    +0.0125
+one_gpu[mamba2]     95,117     95,220   +0.1%    32.4%    122.6    122.6    -0.0004
+one_gpu[mxfp8]     165,818    164,798   -0.6%    50.6%     46.9     46.9    -0.0001
+one_gpu[nvfp4]     181,715    181,760   +0.0%    55.8%     43.8     43.8    -0.0001
 ```
+
+The rest moved by noise: with the halves of the node swapped, the dense model moved
+by +2.4% where it had by -2.1%.
 
 `diff` is the change of the tokens a second, and `loss diff` the change of the loss at
 the last log. The node's suite, one tree after the other, moved by 0.3% at most: FSDP
@@ -892,7 +895,7 @@ memory` when its peak does, `loss` when its last loss moves by more than `--loss
 
 XLA's GEMM autotuner picks kernels by timing them, and some kernels add in no fixed
 order, so two runs of one tree round differently: on these random tokens the MoE,
-whose top-k picks amplify it, ended up to 0.04 apart, every other run 0.011 at most.
+whose top-k picks amplify it, ended up to 0.054 apart, every other run 0.011 at most.
 Pin `XLA_FLAGS="--xla_gpu_autotune_level=0 --xla_gpu_deterministic_ops=true"` on both
 before calling a smaller change of a loss a regression.
 

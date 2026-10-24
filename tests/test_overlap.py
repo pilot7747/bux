@@ -9,11 +9,12 @@ import pytest
 from jax.profiler import ProfileData
 from jaxtyping import Int
 
+from bux import parallel
 from bux.lang import BuxError, compile_runs
 from bux.parallel import methods
 from bux.parallel.context import AttentionArgs
 from bux.train import config as tcfg
-from bux.train import flops, trace, xla
+from bux.train import flops, trace, trainer, xla
 
 MODEL = """
 d_model = 32
@@ -198,3 +199,14 @@ def test_attention_on_packed_documents_counts_each_document_s_triangle():
     forward, _, every_key = xla_attention_flops(None)
     positions = np.tile(np.arange(4), 4)[None]  # 4 documents of 4 tokens
     assert forward.of(positions) == every_key * (4 * 10) / 16**2
+
+
+def test_mfu_counts_the_rows_this_process_read(monkeypatch):
+    """In a job of many processes, the rows of a batch that the others read are 0
+    here: as documents of a token each, they would count almost no attention."""
+    forward, _, _ = xla_attention_flops(None)
+    whole = np.tile(np.arange(16, dtype=np.int32), (4, 1))
+    read = np.where(np.arange(4)[:, None] < 2, whole, 0)  # rows 2 and 3 another's
+    monkeypatch.setattr(parallel, "local_rows", lambda rows, t: np.arange(2))
+    assert forward.of(read) < 0.6 * forward.of(whole)
+    assert forward.of(trainer.rows_read(read)) == forward.of(whole)

@@ -21,7 +21,7 @@ from bux import parallel
 from bux.architecture import Model
 from bux.lang import compile
 from bux.parallel import flash, methods
-from bux.parallel.context import AttentionArgs
+from bux.parallel.context import CUMMAX_ROWS, AttentionArgs, document_starts
 from bux.train import config as tcfg
 from bux.train.data import Batch
 from bux.train.objective import objective
@@ -251,6 +251,19 @@ def test_cudnns_packed_layout_has_where_each_document_starts_and_its_length():
     assert lengths.tolist() == [[5, 7, 4, -1], [16, -1, -1, -1]]
     assert starts.tolist() == [[0, 5, 12, -1, -1], [0, -1, -1, -1, -1]]
     assert int(flash.documents_in(IDS)) == 3
+
+
+@pytest.mark.parametrize("t", [64, CUMMAX_ROWS + 64])
+def test_documents_start_where_their_ids_change_by_cummax_or_a_prefix_scan(t):
+    """XLA's cummax in rows of up to CUMMAX_ROWS, a prefix scan in longer ones."""
+    lengths = np.random.default_rng(t).integers(1, 50, t)
+    ids = np.repeat(np.arange(t), lengths)[None, :t].astype(np.int32)  # 1-49 tokens
+    new = np.ones(ids.shape, bool)
+    new[:, 1:] = ids[:, 1:] != ids[:, :-1]
+    want = np.maximum.accumulate(np.where(new, np.arange(t), 0), axis=1)
+    assert (np.asarray(document_starts(jnp.asarray(ids))) == want).all()
+    jaxpr = jax.make_jaxpr(document_starts)(ids)
+    assert any(e.primitive.name == "cummax" for e in jaxpr.eqns) == (t <= CUMMAX_ROWS)
 
 
 def test_the_gpu_kernels_say_what_they_need_on_a_cpu():

@@ -176,3 +176,16 @@ def test_the_quantizer_writes_what_xla_lays_out_for_the_kernels(shape, filled):
             np.testing.assert_array_equal(
                 blockscaled.as_bytes(a), blockscaled.as_bytes(b)
             )
+
+
+def test_the_quantizer_s_kernels_are_left_as_written_for_triton():
+    """Triton compiles a kernel from its source in its module's globals: the import
+    hook of these tests' type checks must not wrap one in a function of its own."""
+    runtime = pytest.importorskip("triton.runtime")
+    from bux.architecture.experts import grouped_triton
+
+    found = [
+        f for f in vars(grouped_triton).values() if isinstance(f, runtime.JITFunction)
+    ]
+    assert found
+    assert all(f.fn.__globals__ is vars(grouped_triton) for f in found)

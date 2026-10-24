@@ -28,6 +28,10 @@ MIN = float(jnp.finfo(jnp.float32).min)  # the logit of a masked key
 # Below, a 1.3B on a B300 trains as fast by tokamax as by cuDNN, causal, and faster
 # with packed documents, where cuDNN's fallback past its bound (a lax.cond) costs 5%.
 CUDNN_ROWS = 8192
+# Rows up to this long find their documents' starts by XLA's cummax, longer ones by a
+# prefix scan of log2(t) steps. The cummax's work grows as t^2, 2 ms a row of 128k on
+# a B300; but in rows of 4096 the scan took a 1f1b pipeline of the 1.3B 1.6% slower.
+CUMMAX_ROWS = 8192
 Body = Callable[..., Float[Array, "b t h dv"]]  # (q, k, v, rows, sinks) -> out
 
 
@@ -190,13 +194,16 @@ def on_devices(
 
 def document_starts(ids: Int[Array, "b t"]) -> Int[Array, "b t"]:
     """Return the index of the first token of each token's document: the first key it
-    attends to. By a prefix scan of log2(t) steps, as ``Segments.of`` takes its
-    documents: XLA's cummax of a row of 128k takes 2 ms on a B300."""
+    attends to. By XLA's cummax in rows of up to `CUMMAX_ROWS`, else by a prefix scan
+    of log2(t) steps, as ``Segments.of`` takes its documents."""
     index = jnp.arange(ids.shape[1])
     new = jnp.concatenate(
         [jnp.ones_like(ids[:, :1], bool), ids[:, 1:] != ids[:, :-1]], 1
     )
-    return jax.lax.associative_scan(jnp.maximum, jnp.where(new, index, 0), axis=1)
+    starts = jnp.where(new, index, 0)
+    if ids.shape[1] <= CUMMAX_ROWS:
+        return jax.lax.cummax(starts, axis=1)
+    return jax.lax.associative_scan(jnp.maximum, starts, axis=1)
 
 
 def first_keys(args: AttentionArgs, b: int, t: int) -> Int[Array, "b t"] | None:
