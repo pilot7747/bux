@@ -68,9 +68,32 @@ COPY --chown=1000:1000 .python-version pyproject.toml uv.lock ./
 RUN --mount=type=cache,target=/home/$USERNAME/.cache/uv,uid=1000,gid=1000 \
   uv sync --locked --no-dev --extra cuda --no-install-project
 
+# TransformerEngine's JAX bindings, for NCCL EP's dispatch and combine (docs/parallelism.md,
+# "TransformerEngine's NCCL EP"), with `--build-arg TE=2.20.2`; none by default. Its core comes
+# built for CUDA 13, and loads cuRAND, which jax's wheels lack. Its JAX extension is an sdist
+# only: it compiles here against the venv's jax, by the CUDA wheels' headers and NVTX's, with
+# tools that leave after it. NCCL EP compiles its kernels the first time they run, by the `nvcc`
+# on PATH, which runs the venv's. The lock leaves all of it out, so a later `uv sync` keeps it
+# with `--inexact`, as the one below does.
+ARG TE=""
+RUN --mount=type=cache,target=/home/$USERNAME/.cache/uv,uid=1000,gid=1000 \
+  if [ -n "$TE" ]; then \
+  tools="pip pybind11 setuptools wheel nvidia-nvtx" && \
+  uv pip install $tools && \
+  NVTE_BUILD_USE_NVIDIA_WHEELS=1 NVTE_NO_LOCAL_VERSION=1 python -m pip wheel --no-cache-dir \
+  --no-build-isolation --no-deps -w /tmp/te "transformer-engine-jax==$TE" && \
+  uv pip uninstall $tools && \
+  uv pip install --no-deps "transformer-engine==$TE" "transformer-engine-cu13==$TE" \
+  "nvidia-curand>=10.4,<11" /tmp/te/*.whl && \
+  rm -rf /tmp/te && \
+  site="$(python -c 'import sysconfig; print(sysconfig.get_path("purelib"))')" && \
+  printf '#!/bin/sh\nexec %s "$@"\n' "$site/nvidia/cu13/bin/nvcc" > /opt/venv/bin/nvcc && \
+  chmod +x /opt/venv/bin/nvcc; \
+  fi
+
 COPY --chown=1000:1000 . .
 RUN --mount=type=cache,target=/home/$USERNAME/.cache/uv,uid=1000,gid=1000 \
-  uv sync --locked --no-dev --extra cuda
+  uv sync --locked --no-dev --extra cuda --inexact
 
 # Exec form, so that the launcher is PID 1 and gets the SIGTERM that stops a container, at
 # which it checkpoints the step it is at and exits.
