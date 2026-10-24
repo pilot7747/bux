@@ -730,13 +730,14 @@ heads. Mamba-2's selective scan runs so, as decayed linear attention with `q = C
 its reference; Mamba's, a decay per channel and state dim, runs by that scan over
 positions.
 
-What the backward pass of `recurrence` (and so `delta_rule` and RWKV-7) reads of its
-chunks' float32 states and maps is `methods.states`: `keep`, the default, keeps them
-from the forward pass; `recompute` computes them again, as fla's kernels do, from the
-inputs as they come (q, k and v in bfloat16 under `precision(compute=bfloat16)`) and
-each chunk's `(I - L)⁻¹`, which it keeps. That inverse's own backward, `Tᵀ dT Tᵀ` of
-`T` alone, also makes `keep` faster than before. The delta rule's forward and backward
-pass at 8 × 4096 tokens of 16 heads of 128, on a B300, and what it keeps:
+What the backward pass of `recurrence` (and so `delta_rule` and RWKV-7) and of the
+selective scan reads of its chunks' float32 states and maps is `methods.states`, which
+one helper applies to both (`linear_attention.recomputed`): `keep`, the default, keeps
+them from the forward pass; `recompute` computes them again, as fla's kernels do, from
+the inputs as they come (q, k and v in bfloat16 under `precision(compute=bfloat16)`)
+and each chunk's `(I - L)⁻¹`, which it keeps. That inverse's own backward, `Tᵀ dT Tᵀ`
+of `T` alone, also makes `keep` faster than before. The delta rule's forward and
+backward pass at 8 × 4096 tokens of 16 heads of 128, on a B300, and what it keeps:
 
 | delta rule | GDN | KDA |
 |------------|-----|-----|
@@ -748,6 +749,24 @@ pass at 8 × 4096 tokens of 16 heads of 128, on a B300, and what it keeps:
 A GLA hybrid (`"GGGA"^4`), which runs by chunks alone, trains at 84.4k tokens a second
 in 83.5 GiB with `keep`, and at 77.1k in 66.8 GiB with `recompute`; that fits 32 rows
 (78.8k, 192.2 GiB), where `keep` fits 16 (86.2k, 149.4).
+
+Mamba-2 has no inverse, so `recompute` keeps only the scan's inputs, x, dt, A, B and
+C: a sixteenth of what `keep` keeps. Its gradients are those of `keep`, bit for bit on
+CPU. The one-GPU suite's Mamba-2 hybrid (`"MMMA"^4`), rows of 4096 on a B300, in
+JAX's default share of the GPU's memory:
+
+| rows | `states=keep` | `states=recompute` |
+|------|---------------|--------------------|
+| 8    | 94.8k tok/s, 122.6 GiB | 90.7k, 75.5 GiB |
+| 12   | 100.8k, 172.5 GiB | 91.9k, 101.4 GiB |
+| 16   | 95.8k, 190.9 GiB | 91.7k, 128.1 GiB |
+| 20   | out of memory | |
+| 24   | | 92.6k, 182.5 GiB |
+| 32   | | 92.8k, 193.5 GiB |
+| 40   | | out of memory |
+
+So `recompute` fits twice the rows, at 4 to 9% fewer tokens a second, its losses
+those of `keep` to within 10⁻³.
 
 Under `scan`, on a B200 or B300, with q, k and v of 16 bits, the delta rule runs by
 cuDNN's fused kernels instead (`fused_delta`, Frost in cudnn-frontend), which keep only
@@ -762,10 +781,26 @@ decays a channel by exp(-86), and overflows at exp(-90). Unbounded, KDA runs by
 `chunkwise`: within 12 steps of bux's start, its gates are that steep in 30 to 90% of
 the (row, head) pairs of most layers, and a check that fell back from the kernel to
 the chunks left the GPU idle 12 ms a layer, on top of the chunks' 28.
-`scripts/gpu_smoke/recurrence.py` checks the forms against their scans on a GPU,
-whose fusions the CPU tests do not see (on a B300 one took Mamba-2's gradients for B
-and C wrong, which a plain matmul in its place does not), and the kernels against the
-chunks.
+`scripts/gpu_smoke/recurrence.py` checks the forms, and Mamba-2's recomputed, against
+their scans on a GPU, whose fusions the CPU tests do not see (on a B300 one took
+Mamba-2's gradients for B and C wrong, which a plain matmul in its place does not),
+and the kernels against the chunks.
+
+GDN's kernel runs on each GPU of a mesh as on one, a node or two. Where it does not
+apply, as under `pass_state`, the chunks run instead. The GDN hybrid (`"DDDA"^4`) at 8
+rows of 4096 a GPU, on B300s, in tokens a second and the busiest GPU's peak:
+
+| GDN hybrid | by its kernel | by the chunks (`pass_state`) |
+|------------|---------------|------------------------------|
+| one GPU | 127.7k, 70.6 GiB | 95.4k, 112.7 GiB |
+| a node, `fsdp=8` | 815k, 58.4 GiB | 725k, 99.6 GiB |
+| two nodes, `fsdp=16` | 1.58M, 58.0 GiB | |
+| two nodes, `data=2, fsdp=8` | 1.60M, 58.4 GiB | 1.42M, 99.6 GiB |
+| two nodes, `data=2, fsdp=4, context=2` | | 1.03M, 124.4 GiB |
+
+Two nodes train at 97% (FSDP over 16) and 98% (HSDP) of a node's tokens a second a
+GPU. The kernel's losses are the chunks' to 0.002 on a node and 0.005 on two at the
+first log, and to 0.0002 at the last of 30 steps.
 
 Not yet: a `ppermute` chain instead of the all-gather, which holds every device's
 transitions (`c` matrices `k × k` per head) on each.
