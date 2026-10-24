@@ -18,7 +18,6 @@ from jax.sharding import PartitionSpec as P
 from jaxtyping import Array, Float, Int
 
 from bux import kernels, parallel
-from bux.architecture.attention.sparse import axes
 
 QUERIES, KEYS = 64, 128  # the most of each a program takes
 WARPS = 4
@@ -42,7 +41,7 @@ def scores(
     it does not see them."""
     q, w, keys = jax.lax.stop_gradient((q, w, keys))  # nor the parameters behind them
     split = parallel.spec(("batch", "seq", "heads", None), q.shape)
-    names = axes(split)
+    names = set(parallel.axes_of(split))
     if not names:
         return _kernel(q, w, keys, end)
     heads = split[2]

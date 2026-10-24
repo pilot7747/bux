@@ -32,6 +32,7 @@ from bux.architecture.precision.blockscaled import (
     Shardings,
     as_bytes,
 )
+from bux.parallel.layout import axes_of
 
 BLOCK = 16
 E2M1_MAX = 6.0  # float4 E2M1's largest value
@@ -537,14 +538,6 @@ def _offset(axes: Any, size: int) -> UInt32[Array, ""]:
     return jax.lax.axis_index(axes).astype(jnp.uint32) * jnp.uint32(size)
 
 
-def _mesh_axes(spec: P) -> tuple[str, ...]:
-    """Return every mesh axis that `spec` splits over."""
-    names = []
-    for axes in spec:
-        names += [] if axes is None else [axes] if isinstance(axes, str) else list(axes)
-    return tuple(names)
-
-
 @custom_partitioning
 def _amaxes_partitioned(
     x: Float[Array, "r c"], hadamard: Float[Array, "t t"]
@@ -562,7 +555,7 @@ def _amaxes_partition(
     """Each device runs the kernel on its part of x, and the largest of theirs is
     every device's."""
     spec = P(*blockscaled.split_of(shapes[0].sharding.spec))
-    split = _mesh_axes(spec)
+    split = axes_of(spec)
 
     def amaxes(
         x: Float[Array, "r c"], hadamard: Float[Array, "t t"]

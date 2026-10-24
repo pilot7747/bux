@@ -35,7 +35,7 @@ from jax.sharding import PartitionSpec as P
 from jax.typing import DTypeLike
 from jaxtyping import Array, Float, Int, Shaped
 
-from bux.parallel.layout import axes
+from bux.parallel.layout import as_split, axes, axes_of, partition
 from bux.parallel.mesh import active
 from bux.parallel.place import shardings
 
@@ -88,12 +88,10 @@ def rows_span_processes() -> bool:
 def splits(params: nnx.State, over: Axes) -> nnx.State:
     """Return each parameter's spec on the axes `over`: how it splits over them."""
 
-    def kept(s: str | tuple[str, ...] | None) -> str | tuple[str, ...] | None:
-        names = () if s is None else (s,) if isinstance(s, str) else s
-        names = tuple(a for a in names if a in over)
-        return None if not names else names[0] if len(names) == 1 else names
+    def kept(spec: P) -> P:
+        return partition([tuple(a for a in as_split(e) if a in over) for e in spec])
 
-    return jax.tree.map(lambda s: P(*map(kept, s.spec)), shardings(params))
+    return jax.tree.map(lambda s: kept(s.spec), shardings(params))
 
 
 def gather(spec: P, x: Shaped[Array, "*s"]) -> Shaped[Array, "*w"]:
@@ -112,12 +110,10 @@ def scatter(
     keeping the shard that `spec` gives this device: a reduce-scatter over the axes
     of `spec`, and an all-reduce over the rest."""
     g = _summable(g.astype(dtype))
-    split = set()
     for dim, along in enumerate(spec):
         if along is not None:
             g = jax.lax.psum_scatter(g, along, scatter_dimension=dim, tiled=True)
-            split |= {along} if isinstance(along, str) else set(along)
-    rest = tuple(a for a in over if a not in split)
+    rest = tuple(a for a in over if a not in axes_of(spec))
     return (jax.lax.psum(g, rest) if rest else g).astype(dtype)
 
 

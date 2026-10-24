@@ -16,7 +16,7 @@ from jax.sharding import PartitionSpec as P
 from jaxtyping import Array, Shaped
 
 from bux.parallel.mesh import Active, active
-from bux.train.config import Axes, LayoutConfig
+from bux.train.config import LayoutConfig
 
 NAMES = "names"  # the metadata key that holds a parameter's dimension names
 LAYERS = "layers"  # the stacked dimension of a scanned repeat
@@ -26,6 +26,7 @@ DIMENSIONS = tuple(
 )
 
 Split = tuple[str, ...]  # the mesh axes one dimension splits over; () keeps it whole
+Entry = str | tuple[str, ...] | None  # one dimension of a PartitionSpec
 # A dimension's name: a string, None for no name, or (name, count) for a dimension
 # that flattens `count` of them, such as ("kv_heads", 2) for 2 kv heads of 64 dims.
 # Such a dimension splits only at the boundaries between them.
@@ -41,11 +42,20 @@ def axes(layout: LayoutConfig, name: Name) -> Split:
         return ()
     if name not in DIMENSIONS:
         raise ValueError(f"'{name}' is not a dimension; the names are {DIMENSIONS}")
-    return _split(getattr(layout, name))
+    return as_split(getattr(layout, name))
 
 
-def _split(a: Axes) -> Split:
-    return () if a is None else (a,) if isinstance(a, str) else tuple(a)
+def as_split(entry: Entry) -> Split:
+    """Return the mesh axes that one entry of a partition spec, or a dimension's
+    field of the layout, names: none, one or several."""
+    if entry is None:
+        return ()
+    return (entry,) if isinstance(entry, str) else tuple(entry)
+
+
+def axes_of(spec: P) -> Split:
+    """Return every mesh axis that `spec` splits over, in order."""
+    return tuple(a for entry in spec for a in as_split(entry))
 
 
 def resolve(names: Sequence[Name], shape: tuple[int, ...], on: Active) -> list[Split]:
@@ -78,7 +88,7 @@ def fsdp(
     one does, from the first. Never the stacked `layers` of a scanned repeat: a scan
     reads one layer at a time."""
     taken = {a for s in splits for a in s}
-    over = [a for a in _split(on.layout.fsdp) if on.size(a) > 1 and a not in taken]
+    over = [a for a in as_split(on.layout.fsdp) if on.size(a) > 1 and a not in taken]
     for k in range(len(over), 0, -1):
         if (i := _largest_whole(splits, shape, names, on.size(*over[:k]))) is not None:
             return [*splits[:i], tuple(over[:k]), *splits[i + 1 :]]

@@ -20,7 +20,7 @@ from bux import parallel
 from bux.architecture import Model
 from bux.data.pipeline import jobs, prepare
 from bux.lang import compile
-from bux.parallel.layout import fsdp
+from bux.parallel.layout import as_split, fsdp
 from bux.parallel.mesh import grid, split
 from bux.train import config as tcfg
 from bux.train.data import batches, permuted
@@ -213,17 +213,13 @@ def _splits(source: str, layout: tcfg.LayoutConfig, **mesh: int) -> list[tuple]:
         found = parallel.shardings(nnx.state(params, nnx.Param))
     variables = jax.tree.leaves(nnx.state(params, nnx.Param), is_leaf=_variable)
     return [
-        (x.get_metadata().get(parallel.NAMES), [_axes(e) for e in s.spec])
+        (x.get_metadata().get(parallel.NAMES), [set(as_split(e)) for e in s.spec])
         for x, s in zip(variables, jax.tree.leaves(found), strict=True)
     ]
 
 
 def _variable(x: object) -> bool:
     return isinstance(x, nnx.Variable)
-
-
-def _axes(entry: str | tuple[str, ...] | None) -> set[str]:
-    return set() if entry is None else {entry} if isinstance(entry, str) else set(entry)
 
 
 def test_fsdp_splits_dense_parameters_over_context_and_expert_too_and_experts_keep_theirs():

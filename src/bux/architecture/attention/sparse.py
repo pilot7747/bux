@@ -132,10 +132,10 @@ def chunks(t: int, per_query: int) -> int:
 
 def _devices(t: int) -> int:
     """Return how many devices t positions split over."""
-    on, split = parallel.active(), parallel.spec(("seq",), (t,))
-    if on is None or not split or split[0] is None:
+    on = parallel.active()
+    if on is None:
         return 1
-    return on.size(*((split[0],) if isinstance(split[0], str) else split[0]))
+    return on.size(*parallel.axes_of(parallel.spec(("seq",), (t,))))
 
 
 def chunked[R](f: Callable[[Any], R], xs: Any, n: int) -> R:
@@ -168,11 +168,6 @@ def _join(x: Shaped[Array, "chunks b c *r"]) -> Shaped[Array, "b t *r"]:
     return jnp.moveaxis(x, 0, 2).reshape(b, c * n, *x.shape[3:])
 
 
-def axes(split: P) -> set[str]:
-    """Return the mesh axes `split` splits over."""
-    return {a for d in split if d for a in ((d,) if isinstance(d, str) else d)}
-
-
 # --- attention ------------------------------------------------------------------------
 
 
@@ -196,7 +191,7 @@ def attend(
     queries and every key: all-gather context parallelism."""
     static, parts = _Static(scale, cap, _flash(q), True), tuple(parts)
     split = parallel.spec(("batch", "seq", "heads", None), q.shape)
-    names = axes(split)
+    names = set(parallel.axes_of(split))
     if parallel.active() is None or not names:
         return _attend(q, parts, sinks, static)
     parts = tuple(_heads_like(p, split, q.shape[2]) for p in parts)

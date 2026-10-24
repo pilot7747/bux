@@ -36,11 +36,10 @@ from jaxtyping import Array, Float
 
 from bux.architecture.precision import blockscaled, matmuls
 from bux.parallel import methods
-from bux.parallel.layout import NAMES, Name, shard, spec, splits
+from bux.parallel.layout import NAMES, Entry, Name, as_split, shard, spec, splits
 from bux.parallel.mesh import active
 
 AXIS = "tensor"
-Entry = str | tuple[str, ...] | None  # one dimension of a PartitionSpec
 # The formats that scale each block of an operand by itself, and their blocks: a
 # device's share of whole blocks multiplies as the whole does.
 SCALED_BY_BLOCK = {"mxfp8": blockscaled.MX_BLOCK, "mxfp8_2d": blockscaled.MX_BLOCK}
@@ -174,16 +173,12 @@ def _input_split(x: Float[Array, "b t d"]) -> InputSplit | None:
         return None
     rows, stream, _ = spec(("batch", "stream", None), x.shape)
     _, layer, _ = spec(("batch", "seq", None), x.shape)
-    if _axes(stream) not in (_axes(layer), (*_axes(layer), AXIS)):
+    if as_split(stream) not in (as_split(layer), (*as_split(layer), AXIS)):
         return None
-    rows_here = x.shape[0] // on.size(*_axes(rows))
+    rows_here = x.shape[0] // on.size(*as_split(rows))
     chunks = math.gcd(on.methods.tensor_chunks, rows_here)
-    positions = x.shape[1] // on.size(*_axes(layer))
+    positions = x.shape[1] // on.size(*as_split(layer))
     return InputSplit(rows, stream, layer, chunks, rows_here // chunks * positions)
-
-
-def _axes(entry: Entry) -> tuple[str, ...]:
-    return () if entry is None else (entry,) if isinstance(entry, str) else entry
 
 
 def _names(linear: nnx.Linear) -> tuple[Name, ...]:
