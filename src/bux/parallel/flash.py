@@ -365,7 +365,7 @@ def cudnn_runs() -> bool:
 def _cudnn_here() -> bool:
     if jax.default_backend() != "gpu" or not jax_internals.cudnn_attention_here():
         return False
-    return float(getattr(jax.devices()[0], "compute_capability", 0)) >= 9
+    return float(getattr(jax.local_devices()[0], "compute_capability", 0)) >= 9
 
 
 def cudnn_takes(

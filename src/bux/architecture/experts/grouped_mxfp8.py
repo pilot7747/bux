@@ -78,7 +78,7 @@ def runs() -> bool:
     ``kernels.off``."""
     if not kernels.gpu():
         return False
-    return float(getattr(jax.devices()[0], "compute_capability", 0)) >= 10
+    return float(getattr(jax.local_devices()[0], "compute_capability", 0)) >= 10
 
 
 # --- The operands, as the kernels load them ---------------------------------------
