@@ -7,8 +7,7 @@
 #
 # Left out: their groups of 1 x 128 and 128 x 128 with float32 scales, for MXFP8's
 # 1 x 32 and 32 x 32 with power-of-two ones; their float32 promotion every 128 of k,
-# for Hopper's FP8 accumulation, where Blackwell's accumulates in float32; FP8 routed
-# experts, which stay in bfloat16, as bux's grouped MXFP8 GEMM is slower
-# (precision.roles.experts = mxfp8_2d takes it); and the activations they keep in FP8.
+# for Hopper's FP8 accumulation, where Blackwell's accumulates in float32; and the
+# activations they keep in FP8. The routed experts multiply in MXFP8 too.
 precision = precision(compute=bfloat16, matmuls=mxfp8_2d, moments=bfloat16,
-                      dispatch=mxfp8)
+                      dispatch=mxfp8, roles=roles(experts=mxfp8_2d))

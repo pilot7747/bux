@@ -427,8 +427,7 @@ def grouped_product(
 def experts_format() -> str:
     """Return the format the routed experts multiply in, in the branch that is
     tracing: their role's (``matmuls.format_of``), or compute where `roles.experts` is
-    none. Unlike the other roles, they take no format from `matmuls`: on B300s their
-    grouped MXFP8 GEMM trains the baseline's MoE slower than bfloat16 does."""
+    none. Unlike the other roles, they take no format from `matmuls`."""
     if matmuls.in_force().roles.experts is None:
         return "compute"
     return matmuls.format_of("experts")
