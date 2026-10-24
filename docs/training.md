@@ -88,9 +88,10 @@ editor shows them on hover and completes them, as it does for layers. In short:
 - `muon(lr, momentum=0.95, nesterov, ns_steps=5, ns_coefficients=jordan,
   ns_dtype=bfloat16, weight_decay=0.1, consistent_rms=0.2, adam=none)` trains the
   matrices inside the blocks with Muon, stacked expert weights one expert at a time
-  (an expert's up and gate apart), and everything else (the embedding, the head, vectors) with `adam`, which defaults to
-  `adamw(lr=lr)`. With `consistent_rms=0.2` (Moonlight) one learning rate suits both;
-  `none` scales updates as Keller Jordan's Muon does. `ns_coefficients` names the
+  (an expert's up and gate apart), and everything else (the embedding, the head,
+  vectors) with `adam`, which defaults to `adamw(lr=lr)`. With `consistent_rms=0.2`
+  (Moonlight) one learning rate suits both; `none` scales updates as Keller Jordan's
+  Muon does. `ns_coefficients` names the
   quintics of Newton-Schulz's iterations: `jordan`'s, the same at each, or
   `polar_express`'s (Amsel et al., 2025), one for each, closer to orthogonal in as
   many. Newton-Schulz runs in `ns_dtype`, bfloat16 as in Keller Jordan's Muon, and the
@@ -123,7 +124,12 @@ router's, as Megatron-Core's `moe_router_force_load_balancing` does for all its 
 benchmarks: every expert takes an even share of the picks in expectation, so a
 capacity drops few, whatever the data. The router still runs, and its logits take
 the drawn ones' gradient (a straight-through estimator). Eval routes by the router.
-It changes what a run computes, so it is in the run's id; `megatron.bux` sets it.
+It changes what a run computes, so it is in the run's id; `megatron.bux` sets it. On
+its random tokens the router's own routing drifts uneven, a balance loss of 1.4 to
+1.8 a layer, and `nccl_ep` at a capacity of 1.25 dropped 10 to 15% of the picks;
+by random logits the balance loss is 1.00 and it drops none, and runs 7% faster on
+8 B300s (29.6k tokens a second a GPU against 27.7k); `sorted` 1.4% (31.8k against
+31.4k).
 
 **The sparse attention indexer** learns from a loss of its own, as DeepSeek-V3.2's
 does: `indexer(..., loss_weight=1)`. Each layer that runs one adds `loss_weight` times

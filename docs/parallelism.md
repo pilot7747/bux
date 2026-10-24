@@ -912,7 +912,9 @@ method can run them on one device's experts inside a `shard_map`:
   and gate are one GEMM. The weights multiply each row's hidden units, before `down`,
   as Megatron-Core does: `down` is linear, so that is the same sum, and the weights'
   gradient takes a row's f hidden units, where after `down` it took its d outputs,
-  1 GiB a layer of Qwen3-30B-A3B's. After `norm`, where there is one, they multiply
+  1 GiB a layer of Qwen3-30B-A3B's; and the backward computes the hidden units again,
+  elementwise, from up and gate's GEMM, which it keeps for the activation's gradient
+  anyway (`weighted_units`). After `norm`, where there is one, the weights multiply
   its output. Rows past `sizes.sum()` come out 0, before `norm`.
 - `routed(z, idx, weights, up, down, ffn, norm)`: `sort_by_expert`, `experts`, and
   each token's sum. A pick outside the experts of `up` adds nothing, so a device that
@@ -940,6 +942,23 @@ holds a gated MLP's gate too, each hidden unit's up and gate columns side by sid
 `(E, d, 2, f)` would not. Muon orthogonalizes up and gate apart, as two matrices.
 `dense` constrains its hidden units to `(batch, seq, experts, mlp)`, so that under
 FSDP the weights move to the tokens rather than the tokens to the weights.
+
+On 8 B300s, `examples/benchmarks/megatron.bux` (Qwen3-30B-A3B, 32k tokens a GPU,
+MXFP8, routed by the router, XLA's pool at 97% of a GPU), before the weights moved
+before `down` and up and gate became one stack, and after, tokens a second a GPU and
+peak memory:
+
+| run | before | after |
+|-----|--------|-------|
+| `sorted`, `fsdp=8`, `remat=none` | 30.6k, 250.4 GiB | 31.4k, 215.0 GiB |
+| `nccl_ep`, `expert=8`, capacity 1.25, `remat=save_attention` | 21.3k, 99.6 GiB | 22.9k, 98.3 GiB |
+| the same, `remat=none` | needs 266 GiB | 27.7k, 210.7 GiB |
+
+`sorted`'s step on GPU 0 took 1075 ms against 1098: the weights' d-wide multiply, its
+transpose and reduce, and the concatenations of up and gate and of their gradient are
+gone. With GEMM autotuning off, its losses agree to 5e-5 for three steps, then drift
+apart as two runs of random tokens do. Under `remat=auto` at JAX's default pool `sorted`
+now takes `dots_attention` (158.5 GiB) where it took `dots` (179 GiB).
 
 ### The experts in MXFP8
 

@@ -407,13 +407,13 @@ def experts(
     shard_map as it does on all of them. The kernels multiply in x's dtype, so that
     wider ones add up the gradients of several calls in their own."""
     recipe = grouped_blockscaled.RECIPES.get(experts_format())
-    up, down = up.astype(x.dtype), down.astype(x.dtype)
+    n, (e, d, f, p) = x.shape[0], up.shape
+    up, down = up.reshape(e, d, f * p).astype(x.dtype), down.astype(x.dtype)
 
     def times(x: Float[Array, "n e"], w: Float[Array, "E e f"]) -> Float[Array, "n f"]:
         return grouped_product(x, w, sizes, recipe)
 
-    n, (e, d, f, p) = x.shape[0], up.shape
-    projected = times(x, up.reshape(e, d, f * p)).reshape(n, f, p)  # one GEMM
+    projected = times(x, up).reshape(n, f, p)  # up and gate by one GEMM
     if norm is None:
         # Weighted before `down`, which is linear: the weights' gradient then needs
         # each row's f hidden units, not its d outputs.
