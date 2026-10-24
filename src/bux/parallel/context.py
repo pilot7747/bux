@@ -25,8 +25,8 @@ from bux.train import flops
 
 AXIS = "context"
 MIN = float(jnp.finfo(jnp.float32).min)  # the logit of a masked key
-# Below, a 1.3B on a B300 trains as fast by tokamax as by cuDNN, causal, and faster
-# with packed documents, where cuDNN's fallback past its bound (a lax.cond) costs 5%.
+# Below, a 1.3B on a B300 trains on packed documents as fast by tokamax as by cuDNN's
+# packed layout, whose fallback past its bound (a lax.cond) costs 5%.
 CUDNN_ROWS = 8192
 Body = Callable[..., Float[Array, "b t h dv"]]  # (q, k, v, rows, sinks) -> out
 
@@ -238,9 +238,54 @@ def whole_rows(
     args: AttentionArgs,
 ) -> Float[Array, "b t h dv"]:
     """Attend with whole rows, on one device, by the fastest kernel that takes the
-    call: cuDNN's in rows of `CUDNN_ROWS` or more and with a window, else tokamax's
-    (a soft cap, sinks), else cuDNN's; in float32, tokamax's Triton kernel, or `xla`
-    with sinks."""
+    call: `causal_kernel`'s where each row is one document, else `masked_rows`'."""
+    return by_documents(causal_kernel(q, k, v, args), masked_rows, q, k, v, args)
+
+
+def by_documents(
+    kernel: flash.Kernel | None,
+    masked: Callable[..., Float[Array, "b t h dv"]],
+    q: Float[Array, "b t h dk"],
+    k: Float[Array, "b t g dk"],
+    v: Float[Array, "b t g dv"],
+    args: AttentionArgs,
+) -> Float[Array, "b t h dv"]:
+    """Attend by `kernel`, causally, where each row is one document, else by
+    `masked(q, k, v, args)`: a lax.cond, as the rows of a run without documents have
+    ids too, all one. By `masked` alone where `kernel` is None."""
+    if kernel is None:
+        return masked(q, k, v, args)
+    causal = partial(_flash, kernel, args=args._replace(ids=None))
+    if args.ids is None:
+        return causal(q, k, v)
+    one = flash.documents_in(args.ids) == 1
+    return jax.lax.cond(one, causal, partial(masked, args=args), q, k, v)
+
+
+def causal_kernel(
+    q: Float[Array, "b t h dk"],
+    k: Float[Array, "b t g dk"],
+    v: Float[Array, "b t g dv"],
+    args: AttentionArgs,
+) -> flash.Kernel | None:
+    """Return the kernel for causal rows of one document, within no window: cuDNN's,
+    None where it does not take the call."""
+    whole = args.window is None
+    if whole and flash.cudnn_kernel_takes(q, k, v, Keys(True), args.softcap):
+        return flash.CUDNN
+    return None
+
+
+def masked_rows(
+    q: Float[Array, "b t h dk"],
+    k: Float[Array, "b t g dk"],
+    v: Float[Array, "b t g dv"],
+    args: AttentionArgs,
+) -> Float[Array, "b t h dv"]:
+    """Attend with whole rows of documents, or within a window, by the fastest kernel
+    that takes the call: cuDNN's in rows of `CUDNN_ROWS` or more and with a window,
+    else tokamax's (a soft cap, sinks), else cuDNN's; in float32, tokamax's Triton
+    kernel, or `xla` with sinks."""
     cudnn = flash.cudnn_takes(q, k, v, args.softcap, args.sinks)
     if cudnn and (q.shape[1] >= CUDNN_ROWS or args.window is not None):
         return _cudnn(q, k, v, args)
@@ -365,11 +410,11 @@ def cudnn(
     v: Float[Array, "b s g dv"],
     args: AttentionArgs,
 ) -> Float[Array, "b t h dv"]:
-    """Run cuDNN's fused attention (jax's) on each device's whole rows, documents in
-    its packed layout, which tokamax takes a row of more of (`documents_bound`).
-    bfloat16 or float16, and equal head dims of keys and values up to 256; no soft
-    cap, no sinks, and no positions over `context`: `ulysses` gives a device whole
-    rows of fewer heads."""
+    """Run cuDNN's fused attention (jax's) on each device's whole rows: rows of one
+    document by its causal kernels (`flash.CUDNN`), documents in its packed layout,
+    which tokamax takes a row of more of (`documents_bound`). bfloat16 or float16,
+    and equal head dims of keys and values up to 256; no soft cap, no sinks, and no
+    positions over `context`: `ulysses` gives a device whole rows of fewer heads."""
     for lacks, feature in (
         (args.softcap is not None, "softcap"),
         (args.sinks is not None, "sinks"),
@@ -382,8 +427,19 @@ def cudnn(
             "methods.attention = cudnn needs cuDNN on a GPU, bfloat16 or float16, "
             "and keys' and values' head dims equal, up to 256 in steps of 8"
         )
-    body = partial(_rows, args=args, attend=_cudnn)
+    body = partial(_rows, args=args, attend=_cudnn_rows)
     return on_devices(body, q, k, v, args.ids, None, seq=False)
+
+
+def _cudnn_rows(
+    q: Float[Array, "b t h dk"],
+    k: Float[Array, "b t g dk"],
+    v: Float[Array, "b t g dv"],
+    args: AttentionArgs,
+) -> Float[Array, "b t h dv"]:
+    """Run `cudnn` on a device's whole rows: by `causal_kernel`'s where each row is
+    one document, else in cuDNN's packed layout."""
+    return by_documents(causal_kernel(q, k, v, args), _cudnn, q, k, v, args)
 
 
 def _rows(
@@ -464,11 +520,12 @@ def auto(
     args: AttentionArgs,
 ) -> Float[Array, "b t h dv"]:
     """The default. On a GPU, the fastest kernel that takes the call on each device's
-    whole rows (`whole_rows`): cuDNN's in long rows or with a window (on a B300 1.3x
-    tokamax's speed causal at t = 32k, 4x with packed documents), else tokamax's,
-    which takes sinks and a soft cap; in float32 its Triton kernel, or `xla`. With `seq` over `context`, `ulysses`
-    where context divides a device's heads, else `ring`. `xla` where neither kernel
-    runs, and for what only xla has."""
+    whole rows (`whole_rows`): cuDNN's causal kernels where each row is one document
+    (with sinks too), else cuDNN's in long rows or with a window (on a B300 4x
+    tokamax's speed with packed documents), else tokamax's, which takes sinks and a
+    soft cap; in float32 its Triton kernel, or `xla`. With `seq` over `context`,
+    `ulysses` where context divides a device's heads, else `ring`. `xla` where
+    neither kernel runs, and for what only xla has."""
     if not (flash.tokamax_runs() or flash.cudnn_runs()):
         return xla(q, k, v, args)
     if splits_positions(q):

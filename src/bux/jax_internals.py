@@ -182,6 +182,60 @@ def cudnn_attention(
     )
 
 
+def cudnn_attention_and_lse(
+    q: Float[Array, "b t h dk"],
+    k: Float[Array, "b t g dk"],
+    v: Float[Array, "b t g dv"],
+    scale: float,
+) -> tuple[Float[Array, "b t h dv"], Float[Array, "b h t"]]:
+    """Return cuDNN's causal attention of whole rows, and each query's logsumexp in
+    float32, which its training forward keeps for its backward: by JAX's own call of
+    it (``return_residual``), whose backward ignores the logsumexp's cotangent."""
+    return cudnn_fused.dot_product_attention(
+        q,
+        k,
+        v,
+        scale=scale,
+        mask_type=cudnn_fused.MaskType.CAUSAL,
+        return_residual=True,
+    )
+
+
+def cudnn_attention_backward(
+    q: Float[Array, "b t h dk"],
+    k: Float[Array, "b t g dk"],
+    v: Float[Array, "b t g dv"],
+    out: Float[Array, "b t h dv"],
+    dout: Float[Array, "b t h dv"],
+    lse: Float[Array, "b h t"],
+    scale: float,
+) -> tuple[
+    Float[Array, "b t h dk"], Float[Array, "b t g dk"], Float[Array, "b t g dv"]
+]:
+    """Return the gradients of q, k and v of cuDNN's causal attention of whole rows,
+    from its output and each query's logsumexp: by the primitive of JAX's backward
+    (``_dot_product_attention_bwd_rule``), which takes what its forward kept."""
+    unused = jnp.zeros(0, q.dtype)  # no bias, documents or pages
+    grads = cudnn_fused._dot_product_attention_bwd_p_wrapper.bind(
+        q,
+        k,
+        v,
+        *[unused] * 7,
+        lse,
+        out,
+        dout,
+        scale=scale,
+        seed=42,
+        dropout_rate=0.0,
+        variadic_args=(False, False),
+        mask_type=cudnn_fused.MaskType.CAUSAL,
+        layout=cudnn_fused.AttentionLayout.BTNH.value,
+        sliding_window_length=None,
+        score_mod=None,
+    )
+    return grads[0], grads[1], grads[2]
+
+
 def buffer_callback(
     run: Callable[..., None], results: Sequence[jax.ShapeDtypeStruct]
 ) -> Callable[..., tuple[Shaped[Array, "..."], ...]]:

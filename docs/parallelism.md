@@ -369,9 +369,9 @@ methods = methods(attention=ring)
 
 | method    | what it does                                                         |
 |-----------|----------------------------------------------------------------------|
-| `auto`    | the default. On a GPU, the fastest kernel that takes the call on each device's whole rows: cuDNN's in rows of 8192 positions or more and with a window, else tokamax's. With `seq` over `context`, `ulysses` where `context` divides a device's heads, else `ring`. `xla` on a CPU, and for what only `xla` has |
+| `auto`    | the default. On a GPU, the fastest kernel that takes the call on each device's whole rows: cuDNN's causal kernels where each row is one document (`flash.CUDNN`, sinks too), else cuDNN's in rows of 8192 positions or more and with a window, else tokamax's. With `seq` over `context`, `ulysses` where `context` divides a device's heads, else `ring`. `xla` on a CPU, and for what only `xla` has |
 | `xla`     | all t by t logits at once. With `seq` over `context` a device has its queries' rows, and every key and value: all-gather CP |
-| `cudnn`   | cuDNN's fused attention (jax's) on each device's whole rows, documents in its packed layout. bfloat16 or float16, keys' and values' head dims equal and up to 256 (its packed layout gets MLA's wrong); no soft cap, no sinks, no positions over `context` |
+| `cudnn`   | cuDNN's fused attention (jax's) on each device's whole rows: rows of one document by its causal kernels (`flash.CUDNN`), documents in its packed layout. bfloat16 or float16, keys' and values' head dims equal and up to 256 (its packed layout gets MLA's wrong); no soft cap, no sinks, no positions over `context` |
 | `tokamax` | tokamax's flash attention, its Mosaic kernels: a document and a window as each query's first key, sinks by the logsumexp. With `seq` over `context`, a device gathers every key and value and attends with its queries in one call: all-gather CP, whose backward pass does every block. Linux only (the `cuda` extra) |
 | `ring`    | every key and value gathered once over `context`, and a flash call (tokamax's; jnp's on a CPU) for each device's block of them, merged by their logsumexps, a device's own block first, as the others' are gathered. A block no query sees is skipped: one ahead of them all, or before every query's first key, its document's or its window's. Without documents the queries go zigzag, device `i` holding chunks `i` and `2c-1-i` of `2c`, so that every device attends to as much; its own block is then a gathered one. The backward pass runs each block's kernel backward with the final output and logsumexp, on the blocks the forward pass gathered, and reduce-scatters the blocks' gradients in the keys' dtype |
 | `ulysses` | all-to-alls over `context`, from a device's positions of every head to every position of its own heads; `auto`'s kernel on those whole rows; and back. `context` must divide a device's heads; kv heads it does not divide are repeated |
@@ -407,14 +407,32 @@ tokamax's kernels are one such kernel (its VJP, given the residuals `(lse, 1)`),
 `flash.TOKAMAX = flash.JNP` the tests check `tokamax`'s and `auto`'s paths too. A new
 kernel is a `flash.Kernel(forward, backward)`.
 
-cuDNN's attention in jax neither returns nor takes a logsumexp, so it runs whole rows
-only. Its packed layout has room for a static number of documents a row, and its
-backward pass takes time in proportion, and 8 bytes for each position of each head's
-channels of each document's room: `context.documents_bound` makes room for up to t / 256
-and 2^30 such numbers (16 for 8 rows of 4096 or one of 32k), and a `lax.cond` gives a
-batch with a row of more documents to tokamax. In rows of 4096 that `lax.cond` costs a
-1.3B what cuDNN gains it (145k tok/s on a B300 either way), so `auto` takes cuDNN
-from rows of 8192 on: in rows of 16384 of packed documents, 1.3x tokamax's speed.
+cuDNN's attention in jax returns its logsumexp (`return_residual`), and its backward's
+primitive takes one: so `flash.CUDNN` is a `Kernel` of cuDNN's causal kernels, for
+whole rows with no first keys, which `flash.attend` folds sinks into. The rows of a
+run without documents have ids too, all one document, so `auto` and `cudnn` ask a
+`lax.cond` whether each row is one, and attend by `flash.CUDNN` where it is. On 8
+B300s, megatron.bux's sorted arm (`remat=none` in a pool of 97% of a GPU) trains at
+34.2k tokens a second a GPU by it and at 31.3-31.5k by tokamax, in 251 GiB either way.
+Cut to 12 blocks, it trains at 925k tokens a second by it, at 868k by tokamax, at 896k
+by cuDNN's forward and tokamax's backward, and at 885k by jax's call of cuDNN in its
+packed layout, which holds 8 GiB more, room for 8 documents a row. A layer's attention
+(32 heads of 4 kv heads) takes 0.67 ms forward and 2.2 backward by cuDNN, 1.05 and 4.5
+by tokamax, whose backward is two kernels that each recompute the probabilities. The
+1.3B (16 heads of 8) trains at 155k tokens a second on a B300 by it, 148k by tokamax,
+in the same 51 GiB; on FineWeb-Edu at 149k and 140k, to the same held-out loss after
+3000 steps (4.041 and 4.043, where seeds differ by 1.2%). Under XLA's deterministic
+ops, for which XLA builds cuDNN's attention backward no graph on a B300 ("No
+serialized cuDNN graph"), `flash.CUDNN`'s backward is tokamax's.
+
+For rows of documents cuDNN runs whole rows only. Its packed layout has room for a
+static number of documents a row, and its backward pass takes time in proportion, and
+8 bytes for each position of each head's channels of each document's room:
+`context.documents_bound` makes room for up to t / 256 and 2^30 such numbers (16 for
+8 rows of 4096 or one of 32k), and a `lax.cond` gives a batch with a row of more
+documents to tokamax. In rows of 4096 that `lax.cond` costs a 1.3B what cuDNN gains it
+(145k tok/s on a B300 either way), so `auto` takes cuDNN for documents from rows of
+8192 on: in rows of 16384 of packed documents, 1.3x tokamax's speed.
 
 Every kernel runs in a `shard_map` manual over every axis (`context.on_devices`),
 each device on its rows and heads: XLA cannot split a kernel's call, an all-to-all in
