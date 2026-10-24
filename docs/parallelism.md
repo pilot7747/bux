@@ -2323,9 +2323,11 @@ microbatch's piece gives the scheduler compute to put beside them: at 4 microbat
 of the 12 layers, GPU 0's step takes 1111 ms against 1152 in a row, its collectives
 199 ms beside compute and 277 exposed, from 30 and 360, though the bottom half's
 copies add 38 ms. In a row, `moe_stream` gains nothing, as no compute is left beside
-the exchange. All 48 layers at Megatron's batch, which the loop trains at 33.7k in
-234 GiB (`remat=none`), do not fit interleaved: 291 GiB at `remat=none`, and at
-`dots_attention` too, where the loop trains at 28.6k in 207.5 GiB.
+the exchange. All 48 layers at Megatron's batch, which the loop trains at 33.7-34.1k
+in 234 GiB (`remat=none`), do not fit interleaved at `remat=none` (291 GiB) or at
+`dots_attention`; at `save_attention` they train at 30.7k in 193.4 GiB, against the
+loop's 29.5k in 203.8 GiB there: interleave's gain, but not its rematerialization's
+cost.
 
 The overlap is real but small on a node: TP's step on GPU 0 left 39 ms of its
 collectives exposed, from 47, and unrolled 35, at 35.3k a GPU against the loop's
