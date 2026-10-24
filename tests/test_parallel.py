@@ -139,13 +139,15 @@ def test_names_split_over_their_axes_and_fsdp_the_first_dimension_left():
 
 class Stacks(nnx.Module):
     """Parameters as an MoE and a scanned repeat name them: experts' stacks (up and
-    gate as one, too), a kernel, and a kernel's stacked layers."""
+    gate as one, too), a kernel, a kernel's stacked layers, and CSA's 2 output groups'
+    projections."""
 
     def __init__(self):
         self.down = _param((8, 64, 16), "experts", "mlp", "embed")
         self.up_gate = _param((8, 16, 2, 64), "experts", "embed", None, "mlp")
         self.out = _param((32, 16), "heads", "embed")
         self.stacked = _param((4, 16, 64), "layers", "embed", None)
+        self.groups = _param((2, 16, 6), "heads", None, None)
 
 
 def _param(shape: tuple[int, ...], *names: str | None) -> nnx.Param:
@@ -155,7 +157,7 @@ def _param(shape: tuple[int, ...], *names: str | None) -> nnx.Param:
 def _stacks_specs(**sizes: int) -> dict:
     with use(**sizes):
         found = parallel.shardings(nnx.state(Stacks()))
-    return {name: found[name].spec for name in ("down", "up_gate", "out", "stacked")}
+    return {name: x.spec for name, x in found.items()}
 
 
 def test_fsdp_splits_the_first_whole_dimension_so_that_shards_are_whole_rows():
@@ -164,10 +166,19 @@ def test_fsdp_splits_the_first_whole_dimension_so_that_shards_are_whole_rows():
         "up_gate": P("fsdp", None, None, None),
         "out": P("fsdp", None),
         "stacked": P(None, "fsdp", None),  # never the layers a scan reads one by one
+        "groups": P(None, "fsdp", None),  # 8 do not divide 2 groups
     }
     with_ep = _stacks_specs(fsdp=2, expert=4)  # the experts over `expert`, then FSDP
     assert with_ep["down"] == P("expert", "fsdp", None)
     assert with_ep["up_gate"] == P("expert", "fsdp", None, None)
+
+
+def test_fsdp_leaves_a_dimension_its_own_axes_do_not_divide_for_another():
+    """tensor=4 does not split the 2 groups, so the activations keep them whole too."""
+    assert _stacks_specs(fsdp=2)["groups"] == P("fsdp", None, None)
+    with_tp = _stacks_specs(fsdp=2, tensor=4)
+    assert with_tp["groups"] == P(None, "fsdp", None)
+    assert with_tp["out"] == P("tensor", "fsdp")
 
 
 def test_a_dimension_its_axes_do_not_divide_stays_whole():

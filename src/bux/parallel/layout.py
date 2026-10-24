@@ -92,25 +92,36 @@ def fsdp(
     one does, from the first. The first, so that each shard is whole rows of the
     array, which XLA gathers and scatters without a transpose: an expert stack's
     experts, a kernel's inputs. Never the stacked `layers` of a scanned repeat: a scan
-    reads one layer at a time."""
+    reads one layer at a time. And one that its own axes leave whole only if no other
+    is free (``_first_whole``)."""
     taken = {a for s in splits for a in s}
     over = [a for a in as_split(on.layout.fsdp) if on.size(a) > 1 and a not in taken]
     for k in range(len(over), 0, -1):
-        if (i := _first_whole(splits, shape, names, on.size(*over[:k]))) is not None:
+        i = _first_whole(splits, shape, names, on, on.size(*over[:k]))
+        if i is not None:
             return [*splits[:i], tuple(over[:k]), *splits[i + 1 :]]
     return splits
 
 
 def _first_whole(
-    splits: list[Split], shape: tuple[int, ...], names: Sequence[Name], n: int
+    splits: list[Split],
+    shape: tuple[int, ...],
+    names: Sequence[Name],
+    on: Active,
+    n: int,
 ) -> int | None:
-    """The first dimension that nothing splits and `n` divides, but `layers`."""
-    whole = (
+    """The first dimension that nothing splits and `n` divides, but `layers`: of
+    those, first one whose name no axis of `on`'s mesh is for. Where its own axes do
+    not divide a dimension, as tensor=4 does not CSA's 2 output groups, the layer's
+    activations keep it whole too, and XLA, which would split them as the parameter
+    is to compute with it, rematerializes them."""
+    whole = [
         i
         for i, s in enumerate(splits)
         if not s and shape[i] % n == 0 and names[i] != LAYERS
-    )
-    return next(whole, None)
+    ]
+    free = [i for i in whole if not split_axes(on, names[i])]
+    return (free or whole or [None])[0]
 
 
 def partition(splits: list[Split]) -> P:

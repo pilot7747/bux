@@ -245,7 +245,9 @@ to resolve them. The optimizer's state inherits them from the parameters it trac
    or if none does, over as many of them as one does, from the first. The first, so
    that each device's shard is whole rows of the array, which XLA gathers and
    scatters as they lie: an expert stack splits by expert, a kernel by its inputs.
-   By the largest, as before, Qwen3-30B-A3B's stacks split by `embed`, and on 8
+   A dimension that its own axes do not divide comes last, as `tensor=4` does not
+   CSA's 2 output groups: the activations keep it whole too, and split as the
+   parameter, XLA rematerialized them in full. By the largest, as before, Qwen3-30B-A3B's stacks split by `embed`, and on 8
    B300s every gather and reduce-scatter of them went through a transpose: 21.6 ms
    of 12 layers' 314 ms step, 3.6 by expert; its 48 layers (`megatron.bux`'s
    `sorted`) train at 257k tokens a second, from 251k, and the dense 1.3B's
