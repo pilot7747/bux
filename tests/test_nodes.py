@@ -270,7 +270,7 @@ def test_a_dimension_that_fsdps_axes_do_not_all_divide_splits_over_the_first_few
         (),
     ]
     assert _fsdp((12, 6), fsdp=2, context=2, expert=2) == [("fsdp", "context"), ()]
-    assert _fsdp((6, 10), fsdp=2, context=2, expert=2) == [(), ("fsdp",)]
+    assert _fsdp((6, 10), fsdp=2, context=2, expert=2) == [("fsdp",), ()]
     assert _fsdp((3, 5), fsdp=2, context=2, expert=2) == [(), ()]
 
 
