@@ -299,7 +299,7 @@ def collectives(family: str, method: str) -> tuple[int, int]:
         loss = objective(tcfg.LossConfig(), arch)
         trainer = Trainer(model(family), optax.adamw(1e-3), loss)
         batch = parallel.shard_batch(packed_rows())
-        step = trainer._train.lower(trainer.model, trainer.optimizer, batch)
+        step = trainer.lower(batch)
         text = step.compile().as_text() or ""
     gathers = re.findall(r"= (\S+) all-gather(?:-start)?\(", text)
     whole = [g for g in gathers if re.match(rf"f32\[(\d+,)?{LONG}[,\]]", g)]

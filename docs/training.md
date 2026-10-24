@@ -1088,14 +1088,40 @@ returns, metrics by name, go to every sink once the next step is launched. A hoo
 that only reads the step's metrics returns a function that gives its scalars
 (`hooks.Later`), which the loop calls then: the log does, so that reading a loss
 waits for its step as the next one runs, not the GPU for the host to launch that
-one. On 8 B300s the one-node suite's 1.3B (`fsdp`), logging every step, takes 304
-ms a step so, from 332; Qwen3-30B-A3B's 6.4 s steps, logging every third, train as
-fast either way. The GPU still waits for the host at every step: XLA's launch of a
-step returns only when the GPU is nearly through it (its queue of kernels is full),
-and only then does nnx.jit walk the model's and optimizer's state for the next
-(35 ms for the 1.3B, 100 to 170 ms for Qwen3-30B-A3B), beside the next batch's rows
-stacked in the loader's thread: 45 ms of the 1.3B's 250, 165 to 210 of the 30B's
-6.4 s.
+one. The log computes its learning rate as it runs, on the GPU behind its step: one
+computed as it was read queued behind the next step, and reading it waited for that
+one too, which left the GPU nothing to run as the host launched the one after.
+
+Between two steps the host does little. A training step takes the model's and the
+optimizer's arrays as a list, of variables the trainer split once from their graph
+(`_Split` in `bux/train/trainer.py`), where nnx.jit walked the graph at every call,
+from it to its arrays and back: 20 ms a step of the 1.3B, 70 of Qwen3-30B-A3B, on a
+B300 node's host, where the list takes 18 ms of the 30B's, most of it Python freeing
+the arrays of the step before. That is time the GPU waits for where XLA's launch of a
+step returns only when the GPU is nearly through it, its queue of kernels full:
+Qwen3-30B-A3B's, of thousands of kernels and collectives, returns 100 to 170 ms
+before its step ends, and the host then has that long to launch the next. The 1.3B's,
+its kernels in CUDA graphs (XLA's command buffers), returns in 10 ms, and the host
+runs up to two steps ahead; but under the profiler, which turns command buffers off,
+its launch too returns at its step's end. Python's cycle collector, which walked what
+nnx.jit's walks made, no longer stops the host for a full collection a few steps in
+(340 ms on the 1.3B, 980 on the 30B). The GPU now waits for the host only after a
+step the host waits for, at an eval or a checkpoint. On 8 B300s, against the tree
+before:
+
+| run                                                | before            | after          |
+|----------------------------------------------------|-------------------|----------------|
+| 1.3B (one-node suite's `fsdp`), log every 5 steps  | 1.224M tok/s      | 1.245M tok/s   |
+| the same, profiled, logging every step: GPU 0 idle | 57.9 ms a step    | 2.2 ms a step  |
+| the same, profiled, log every 5 steps: GPU 0 idle  | 25.8 ms a step    | 2.1 ms a step  |
+| 1.3B in 8 microbatches (`fsdp_m8`)                 | 1.012M tok/s      | 1.054M tok/s   |
+| Qwen3-30B-A3B, megatron.bux's `sorted`             | 42.0k tok/s a GPU | 42.3k          |
+| the same, logging every step                       | 6.30 s a step     | 6.24 s         |
+| the one-GPU suite's 8 runs, a B300 each            |                   | +1.2% to +7.2% |
+
+With GEMM autotuning off and XLA's deterministic ops, both 1.3B runs train to the
+same losses as before, to the bit.
+
 When training stops early, because something set `trainer.stopping` as the launcher
 does at SIGTERM, every hook's `stop` runs, and the checkpoint hook saves the step. A
 tracker is a sink:
@@ -1187,7 +1213,11 @@ the layers that report the name, under that name; eval leaves them out.
 
 `train_step` and `eval_step` are what the trainer compiles, once; a subclass that
 overrides them changes what a step does (averaging the weights, skipping a spike) and
-keeps the loop, the hooks and checkpoints. Gradient accumulation is built in:
+keeps the loop, the hooks and checkpoints. `train_step` gets a model and an optimizer
+made in the step from the values of the trainer's variables, and its changes to them
+are the step's new state, which the trainer's model and optimizer hold after it: so a
+hook may change the values of their variables between steps (`trainer.load`,
+`nnx.update`), but not which variables they hold. Gradient accumulation is built in:
 `methods(microbatches=n)`, which on a mesh gathers the parameters once a step and, where
 the rows are independent and span hosts, reduces the gradients once (docs/parallelism.md, "Gathered
 once, reduced once"); `Trainer(..., gather=, accumulate=, reduce=)` takes the same

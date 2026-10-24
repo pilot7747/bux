@@ -16,6 +16,7 @@ import optax
 import pytest
 from conftest import corpus
 from flax import nnx
+from flax.nnx import graphlib
 from jax.sharding import PartitionSpec as P
 from jaxtyping import Array, Float
 from optax.contrib import MuonDimensionNumbers, scale_by_muon
@@ -27,7 +28,7 @@ from bux.data.pipeline import jobs
 from bux.lang import compile, compile_runs
 from bux.train import config as tcfg
 from bux.train import flops
-from bux.train.data import batches, plain, prefetch
+from bux.train.data import Batch, batches, plain, prefetch
 from bux.train.hooks import Checkpoint, Hook, Log, Profile
 from bux.train.objective import (
     Term,
@@ -694,10 +695,88 @@ def test_a_step_that_donates_takes_the_memory_of_the_state_it_replaces(donate):
     trainer = Trainer(model, optax.adamw(1e-3), loss, donate=donate)
     data = batches(tcfg.SyntheticConfig(), rows(tcfg.SyntheticConfig(), 2, 8), 32)
     batch = jax.device_put(next(data))
-    step = trainer._train.lower(trainer.model, trainer.optimizer, batch).compile()
+    step = trainer.lower(batch).compile()
     state = sum(x.nbytes for x in jax.tree.leaves(trainer.state()))
     memory = step.memory_analysis()
     assert memory is not None and memory.alias_size_in_bytes == donate * state
+
+
+def _small_trainer(trainer: type[Trainer] = Trainer) -> tuple[Trainer, Batch]:
+    arch = compile(ARCH + "model = embed block norm head\n")
+    loss = objective(tcfg.LossConfig(), arch)
+    model = Model(arch, rngs=nnx.Rngs(0))
+    data = batches(tcfg.SyntheticConfig(), rows(tcfg.SyntheticConfig(), 2, 8), 32)
+    return trainer(model, optax.adamw(1e-3), loss, donate=True), next(data)
+
+
+def test_a_step_takes_the_state_without_walking_the_model_and_leaves_it_there(
+    monkeypatch,
+):
+    trainer, batch = _small_trainer()
+    model = trainer.model
+    trainer.train_on_batch(batch)  # compiles
+    walks: list[object] = []
+    flatten = graphlib.flatten
+    monkeypatch.setattr(
+        graphlib, "flatten", lambda *a, **k: walks.append(a) or flatten(*a, **k)
+    )
+    trainer.train_on_batch(batch)
+    assert walks == []  # where nnx.jit walked the graph at every call
+    monkeypatch.undo()
+    alive = [x for x in jax.tree.leaves(nnx.state(model)) if not x.is_deleted()]
+    assert len(alive) == len(jax.tree.leaves(nnx.state(model)))  # not the donated
+
+
+def test_a_step_starts_from_the_values_a_hook_left():
+    trainer, batch = _small_trainer()
+    trainer.train_on_batch(batch)
+    params = nnx.state(trainer.model, nnx.Param)
+    nnx.update(trainer.model, jax.tree.map(jnp.zeros_like, params))
+    again, _ = _small_trainer()
+    nnx.update(again.model, jax.tree.map(jnp.zeros_like, params))
+    loss = trainer.train_on_batch(batch)["loss"]
+    assert loss == again.train_on_batch(batch)["loss"]
+
+
+def test_a_step_that_changes_which_variables_the_model_holds_is_an_error():
+    class Growing(Trainer):
+        def train_step(self, model, optimizer, batch):
+            model.extra = nnx.BatchStat(jnp.zeros(()))
+            return super().train_step(model, optimizer, batch)
+
+    trainer, batch = _small_trainer(Growing)
+    with pytest.raises(ValueError, match="not which variables they hold"):
+        trainer.train_on_batch(batch)
+
+
+def test_the_log_s_learning_rate_is_computed_at_its_step_not_as_it_is_read():
+    trainer, batch = _small_trainer()
+    asked: list[object] = []
+    log = Log(
+        every=1, lr=lambda step: asked.append(step) or jnp.asarray(0.1), tokens=16
+    )
+    log.start(trainer)
+    later = log(trainer, trainer.train_on_batch(batch))
+    assert asked == [0]  # before the next step is launched, then read
+    assert later()["lr"] == pytest.approx(0.1)
+
+
+def test_eval_launches_every_batch_before_it_reads_a_loss(monkeypatch):
+    trainer, batch = _small_trainer()
+    events: list[str] = []
+
+    class Loss:
+        def __float__(self) -> float:
+            events.append("read")
+            return 1.0
+
+    def launched(model: Model, batch: Batch) -> Loss:
+        events.append("launched")
+        return Loss()
+
+    monkeypatch.setattr(trainer, "_eval", launched)
+    assert trainer.evaluate([batch] * 3) == 1.0
+    assert events == ["launched"] * 3 + ["read"] * 3
 
 
 def test_a_run_reports_what_hooks_of_ones_own_return(tmp_path):

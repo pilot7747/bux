@@ -294,7 +294,7 @@ def _moved(
     with _use(mesh, "layout()", methods):
         trainer = _trainer(source, mesh, "layout()", methods, precision)
         batch = parallel.shard_batch(plain(TOKENS))
-        step = trainer._train.lower(trainer.model, trainer.optimizer, batch).compile()
+        step = trainer.lower(batch).compile()
         return _bytes_moved(step.as_text() or "")
 
 

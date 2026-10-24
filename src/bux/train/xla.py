@@ -18,7 +18,6 @@ from collections.abc import Callable, Mapping
 from typing import Any
 
 import jax
-from flax import nnx
 
 from bux.train.config import CompilerConfig
 
@@ -76,46 +75,7 @@ def _value(value: str | bool) -> str | bool:
 
 
 def jit(fun: Callable[..., Any], options: Options, **kwargs: Any) -> Any:
-    """Return ``nnx.jit(fun, **kwargs)``, compiled with XLA's `options`: a `Compiled`,
-    or with none what nnx.jit returns."""
-    jitted = nnx.jit(fun, **kwargs)
-    return Compiled(jitted, options) if options else jitted
-
-
-def compiled(lowered: Any, options: Options) -> Any:
-    """Return `lowered`, a function of ``jit`` lowered, compiled with XLA's `options`
-    as a call of it compiles it: the call finds the compile in JAX's caches, and
-    compiles it no more."""
-    return lowered.compile(dict(options) or None)
-
-
-class Compiled:
-    """A function of nnx.jit, compiled with XLA's `options` once for each shape and
-    dtype of the arrays it is called with: nnx.jit takes no compiler options, but what
-    it lowers compiles with them."""
-
-    def __init__(self, jitted: Any, options: Options):
-        self.jitted, self.options = jitted, dict(options)
-        self.compiled: dict[tuple, Any] = {}
-
-    def __call__(self, *args: Any) -> Any:
-        return self.compile(*args)(*args)
-
-    def lower(self, *args: Any) -> Any:
-        """Return the function lowered for `args`, as nnx.jit's lower does."""
-        return self.jitted.lower(*args)
-
-    def compile(self, *args: Any) -> Any:
-        """Return the function compiled for the shapes and dtypes of `args`, which
-        the first call of them compiles."""
-        key = _signature(args)
-        if key not in self.compiled:
-            lowered = self.jitted.lower(*args)
-            self.compiled[key] = lowered.compile(self.options)
-        return self.compiled[key]
-
-
-def _signature(args: tuple) -> tuple:
-    """The shape and dtype of every array in `args`, nnx's modules' too."""
-    leaves = jax.tree.leaves(nnx.state(args))
-    return tuple((x.shape, x.dtype) for x in leaves if hasattr(x, "shape"))
+    """Return ``jax.jit(fun, **kwargs)``, which compiles with XLA's `options`, a call of
+    it as its `lower(...).compile()`: the one finds the other's compile in JAX's
+    caches."""
+    return jax.jit(fun, compiler_options=dict(options) or None, **kwargs)

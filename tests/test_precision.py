@@ -858,7 +858,7 @@ def test_microbatches_and_bfloat16_take_less_memory():
     def temp(**settings) -> int:
         trainer = _trainer(ARCHITECTURES["llama"], **settings)
         batch = parallel.shard_batch(_batch())
-        step = trainer._train.lower(trainer.model, trainer.optimizer, batch).compile()
+        step = trainer.lower(batch).compile()
         memory = step.memory_analysis()
         assert memory is not None
         return memory.temp_size_in_bytes

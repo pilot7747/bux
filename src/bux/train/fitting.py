@@ -42,9 +42,9 @@ class Tried(NamedTuple):
 
 
 class Fitting:
-    """A training step, `step(model, optimizer, batch)`, under remat `auto`. Its first
-    call compiles it under the candidates until one fits, and runs that one, `policy`;
-    `tried` says what each took, and `seconds` how long choosing took."""
+    """A training step under remat `auto`. Its first call compiles it under the
+    candidates until one fits, and runs that one, `policy`; `tried` says what each
+    took, and `seconds` how long choosing took."""
 
     def __init__(self, step: Callable[..., Any], options: xla.Options, **jit: Any):
         self.step, self.options, self.jit_kwargs = step, options, jit
@@ -104,7 +104,7 @@ class Fitting:
         that puts the caller's settings in force again (`here`)."""
         start = time.perf_counter()
         with here():
-            holds = held(lowered, self.options)
+            holds = held(lowered)
         return Tried(policy, holds, time.perf_counter() - start)
 
     def _trying(self, policy: str) -> Callable[..., Any]:
@@ -112,9 +112,9 @@ class Fitting:
         profiles and JAX's cache show."""
 
         @functools.wraps(self.step)
-        def step(model: Any, optimizer: Any, batch: Any) -> Any:
+        def step(*args: Any) -> Any:
             with remat.trying(policy):
-                return self.step(model, optimizer, batch)
+                return self.step(*args)
 
         return step
 
@@ -129,13 +129,12 @@ def _settings_in_force() -> Callable[[], ContextManager]:
     return lambda: parallel.use(on.mesh, on.layout, on.methods)
 
 
-def held(lowered: Any, options: xla.Options) -> int | None:
+def held(lowered: Any) -> int | None:
     """Return the bytes a step of ``xla.jit``, `lowered`, holds on a device at once
-    compiled with XLA's `options`, by XLA's analysis: its arguments, its outputs but
-    those that take an argument's memory, its temporaries and its code. None if XLA
-    could not fit it."""
+    compiled, by XLA's analysis: its arguments, its outputs but those that take an
+    argument's memory, its temporaries and its code. None if XLA could not fit it."""
     try:
-        m = xla.compiled(lowered, options).memory_analysis()
+        m = lowered.compile().memory_analysis()
     except jax.errors.JaxRuntimeError as e:
         if "RESOURCE_EXHAUSTED" not in str(e):
             raise
