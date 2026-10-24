@@ -4,8 +4,9 @@ documents: the outputs and every input's gradient, in float32; Mamba-2's also wi
 its chunks computed again for the backward pass, as `methods(states=recompute)` runs
 them. XLA's GPU fusions can differ from its CPU's, which the tests run: on a B300, a
 grouped einsum's took Mamba-2's gradients for B and C wrong. Then the delta rule by
-cuDNN's kernels (``fused_delta``), in bfloat16, against its chunks in float32: GDN's
-at steep gates and spikes, KDA's at a gate bounded at -5.
+its kernels, in bfloat16, against its chunks in float32: cuDNN's (``fused_delta``),
+GDN's at steep gates and spikes and KDA's at a gate bounded at -5, and bux's own for
+KDA (``pallas_delta``) at steep gates, spikes and Kimi's own gate.
 
     uv run --extra cuda python scripts/gpu_smoke/recurrence.py
 
@@ -18,8 +19,10 @@ from collections.abc import Callable
 import jax
 import jax.numpy as jnp
 import numpy as np
+from flax import nnx
 from jaxtyping import Array, Float
 
+from bux import config as cfg
 from bux.architecture import Segments
 from bux.architecture.recurrent import linear_attention, ssm
 from bux.parallel.recurrence import Chunk, Chunked, Positions, Shared
@@ -145,25 +148,48 @@ def errors(case: str) -> list[float]:
     return [float(np.linalg.norm(a - b) / np.linalg.norm(b)) for a, b in zip(got, want)]
 
 
-# The delta rule's gates: channels, the least log decay, and the floor it is bounded
-# at; a spike of the log decay every 16 positions, if any.
-KERNELS: dict[str, tuple[int, float, float | None, float | None]] = {
-    "gdn's kernel, gates to -20": (1, -20.0, None, None),
-    "gdn's kernel, spikes of -1e4": (1, -1.0, None, -1e4),
-    "kda's kernel, gates to -5": (128, -5.0, -5.0, None),
+Gate = Callable[[np.random.Generator, int], np.ndarray]  # (rng, decays) -> log decays
+
+
+def steep(low: float, spike: float | None = None) -> Gate:
+    """Log decays in [low, 0], and `spike` every 16 positions if given."""
+
+    def gate(rng: np.random.Generator, decays: int) -> np.ndarray:
+        g = low / (1 + np.exp(-rng.normal(size=(B, T, 16, decays))))
+        if spike is not None:
+            g[:, 5::16] = spike
+        return g
+
+    return gate
+
+
+def kimi(rng: np.random.Generator, decays: int) -> np.ndarray:
+    """The log decays of KDA's own gate, -exp(A_log) softplus(f + dt_bias), as a
+    layer starts, of inputs drawn from a normal."""
+    config = cfg.KDAConfig(num_heads=16, head_dim=decays)
+    layer = linear_attention.KimiDeltaAttention(config, 256, nnx.Rngs(0))
+    return np.asarray(layer._log_decay(jnp.asarray(rng.normal(size=(B, T, 256)))))
+
+
+# The delta rule's gates: decays a head, the log decays, and their floor, if any.
+KERNELS: dict[str, tuple[int, Gate, float | None]] = {
+    "gdn's kernel, gates to -20": (1, steep(-20.0), None),
+    "gdn's kernel, spikes of -1e4": (1, steep(-1.0, -1e4), None),
+    "kda's kernel, gates to -5": (128, steep(-5.0), -5.0),
+    "kda's own kernels, gates to -20": (128, steep(-20.0), None),
+    "kda's own kernels, spikes of -1e4": (128, steep(-1.0, -1e4), None),
+    "kda's own kernels, kimi's gate": (128, kimi, None),
 }
 
 
 def delta_inputs(case: str) -> tuple[Float[Array, "..."], ...]:
     """q, k and v in bfloat16, of 16 heads of 128, the log decay and beta."""
-    decay, low, _, spike = KERNELS[case]
+    decays, gate, _ = KERNELS[case]
     rng = np.random.default_rng(list(KERNELS).index(case))
     q, k, v = rng.normal(size=(3, B, T, 16, 128))
     q = q / np.linalg.norm(q, axis=-1, keepdims=True) / np.sqrt(128)
     k = k / np.linalg.norm(k, axis=-1, keepdims=True)
-    g = low / (1 + np.exp(-rng.normal(size=(B, T, 16, decay))))
-    if spike is not None:
-        g[:, 5::16] = spike
+    g = gate(rng, decays)
     beta = 1 / (1 + np.exp(-rng.normal(size=(B, T, 16))))
     qkv = (jnp.asarray(x, jnp.bfloat16) for x in (q, k, v))
     return (*qkv, jnp.asarray(g, jnp.float32), jnp.asarray(beta, jnp.float32))

@@ -12,7 +12,7 @@ own JAX call. It factors each decay through the start of a tile of 16 positions,
 loses precision where a tile decays a channel by exp(-86), and overflows at exp(-90):
 it runs a gate bounded at -5 (`gate_lower_bound`, Kimi K3), and no other. Within 12
 steps of bux's start, KDA's unbounded gates are that steep in 30 to 90% of the (row,
-head) pairs of most layers.
+head) pairs of most layers: those run by bux's own kernels (``pallas_delta``).
 
 The kernels run on one SM100 or SM103 GPU at a time, on token-packed rows and their
 documents' bounds (cu_seqlens); on a mesh, a `shard_map` gives them each device's rows
@@ -64,8 +64,8 @@ def runs(dk: int, dv: int, dtype: Any, decays: int, floor: float | None) -> bool
 
 @functools.cache
 def _sm() -> bool:
-    """Return whether the default device is one the kernels run on."""
-    device = jax.devices()[0]
+    """Return whether this host's GPUs are ones the kernels run on."""
+    device = jax.local_devices()[0]
     return getattr(device, "compute_capability", "") in SM
 
 
