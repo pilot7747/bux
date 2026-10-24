@@ -28,7 +28,8 @@ on each device's own heads, with no communication.
 import functools
 import math
 from collections.abc import Callable
-from typing import Literal
+from types import ModuleType
+from typing import Any, Literal
 
 import jax
 import jax.numpy as jnp
@@ -42,7 +43,7 @@ from bux.architecture.common.segments import Segments
 from bux.architecture.common.sharding import projection, shard_heads, shard_layer_input
 from bux.architecture.layers.conv import CausalConv
 from bux.architecture.layers.norm import Norm
-from bux.architecture.recurrent import chunkwise, fused_delta
+from bux.architecture.recurrent import chunkwise, fused_delta, pallas_delta
 from bux.architecture.registry import Context, Taps, register, segments
 from bux.architecture.repeats import remat
 from bux.lang import ir
@@ -218,20 +219,35 @@ def delta_rule(
         S_t = (I - beta_t k_t k_t^T) diag(w_t) S_{t-1} + beta_t k_t v_t^T.
 
     That is `recurrence` with a = -w k, and beta k for both b and k, in float32. On a
-    B200 or B300, with q, k and v of 16 bits, cuDNN's fused kernels run it instead
-    (``fused_delta``), in their dtype: one decay a head at any gate, a decay per
-    channel where `floor`, the least log decay, bounds it at -5. They keep only their
-    inputs for the backward pass, and so do the chunks they fall back on, whatever
-    the run's `methods.states`."""
+    GPU, with q, k and v of 16 bits, kernels run it instead, in their dtype (`_kernels`):
+    on a B200 or B300 cuDNN's (``fused_delta``), one decay a head at any gate, and a
+    decay per channel where `floor`, the least log decay, bounds it at -5; else bux's
+    own (``pallas_delta``), a decay per channel at any gate. cuDNN's keep only their
+    inputs for the backward pass, and so do the chunks the kernels fall back on;
+    bux's keep their chunks' parts and states too by the run's `methods.states`."""
     shapes = (k.shape[-1], v.shape[-1], v.dtype, log_decay.shape[-1])
-    if fused_delta.runs(*shapes, floor):
+    kernels = _kernels(*shapes, floor)
+    if kernels is not None:
         otherwise = functools.partial(_chunked, states="recompute")
 
         def fused(*xs: Float[Array, "b t ..."]) -> Float[Array, "b t h dv"]:
-            return fused_delta.delta_rule(*xs, docs, otherwise)
+            return kernels.delta_rule(*xs, docs, otherwise)
 
         return remat.named("recurrence", fused, q, k, v, log_decay, beta)
     return _chunked(q, k, v, log_decay, beta, docs)
+
+
+def _kernels(
+    dk: int, dv: int, dtype: Any, decays: int, floor: float | None
+) -> ModuleType | None:
+    """Return the module whose kernels run a delta rule of these head dims, its q, k
+    and v of `dtype` and `decays` log decays a head, never below `floor`: none if
+    no kernel does."""
+    if fused_delta.runs(dk, dv, dtype, decays, floor):
+        return fused_delta
+    if pallas_delta.runs(dk, dv, dtype, decays):
+        return pallas_delta
+    return None
 
 
 def _chunked(

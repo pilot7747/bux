@@ -448,6 +448,7 @@ by itself where it cannot run, and all of them do inside `bux.kernels.off()` or 
 | Mamba-2 | `chunkwise`, B and C a group's, the state across chunks by a matmul; `methods(states=recompute)` keeps a sixteenth of the memory for the backward | 25x a scan over positions (2 × 4096 tokens, rematerialized: at 8 × 4096 the scan needs 199 GiB) |
 | Gated DeltaNet, DeltaNet | cuDNN's fused GDN kernel (`fused_delta`), by cuDNN's graph from a `buffer_callback`: any gate | 5x `chunkwise` |
 | KDA with `gate_lower_bound` | cuDNN's fused KDA kernel (`fused_delta`) | 10x `chunkwise` |
+| KDA without | bux's Pallas kernels (`pallas_delta`): any gate, each pair's decay through a position between them | 2.6x `chunkwise` |
 | MoE experts | `grouped.ragged_dot`: tokamax's Mosaic and Triton kernels | 27x `jax.lax.ragged_dot` |
 | MoE experts in MXFP8 | `grouped_mxfp8`: Mosaic GPU kernels of tcgen05's block-scaled MMA, the scales by TMA into tensor memory (docs/parallelism.md) | 1.5-2.4x tokamax's bfloat16 GEMMs |
 | MoE dispatch | `token_rows`, `permuted`: gathers where XLA would scatter | 4x |
@@ -461,13 +462,14 @@ the log's `mfu` (of the attention a causal mask keeps):
 | Llama-style, 1.3B           | 144k, 44% MFU | 1.12M, 43% |
 | Gated DeltaNet hybrid, `"DDDA"` | 117k, 37% | 818k |
 | Mamba-2 hybrid, `"MMMA"`, 1.5B (Nemotron-H's `mamba2`) | 97k | 741k |
-| KDA hybrid, `"KKKA"`        | 59k   |                   |
+| KDA hybrid, `"KKKA"`        | 96k, 30% |                |
 | KDA with `gate_lower_bound=-5` | 127k, 40% | 926k     |
 | MoE, 64 experts, top 8      | 102k, 31% | 834k          |
 
 The GDN hybrid trained at 93k (715k on 8) by chunks before its kernel, in 121 GiB
 where it now takes 71 (58 on 8, against 108), and so fits 24 rows (136k, 169 GiB); KDA
-with `gate_lower_bound` at 110k in 173 GiB, now 91, and 16 rows (133k, 163 GiB). Their
+with `gate_lower_bound` at 110k in 173 GiB, now 91, and 16 rows (133k, 163 GiB); KDA
+without it at 60.5k in 122 GiB by chunks, now 96.5k in 88 by bux's kernels. Their
 losses over 30 steps, GEMM autotuning off, are within 1.7e-4 of the chunks' (GDN) and
 the same (KDA). On 8 GPUs the GDN kernel's callbacks run one at a time, 87% of 8 GPUs
 alone, where KDA's kernel, which cudnn-frontend calls from JAX itself, runs at 91%.
