@@ -28,7 +28,7 @@ from jax.sharding import PartitionSpec as P
 from jaxtyping import Array, Float, Shaped
 
 from bux.parallel import methods
-from bux.parallel.layout import spec
+from bux.parallel.layout import axes_of, spec
 from bux.parallel.mesh import active
 
 Positions = tuple[Shaped[Array, "b t ..."], ...]  # what a chunk takes per position
@@ -87,7 +87,7 @@ def pass_state(r: Recurrence) -> Float[Array, "b t h dv"]:
     if tokens is None:
         return r.chunk(r.xs, r.shared, False).out
     chunks = P(tokens[1], tokens[0])  # (c, b, ...): one of c chunks per device
-    manual = set(_axes(tokens))
+    manual = set(axes_of(tokens))
     out, states, transitions, reads = jax.shard_map(
         partial(_run, r.chunk, r.family),
         in_specs=(tuple(tokens for _ in r.xs), tuple(P() for _ in r.shared)),
@@ -106,11 +106,6 @@ def _tokens(x: Shaped[Array, "b t ..."]) -> P | None:
         return None
     rows, positions = spec(("batch", "seq"), x.shape[:2])
     return None if positions is None else P(rows, positions)
-
-
-def _axes(split: P) -> set[str]:
-    """Return the mesh axes `split` splits over."""
-    return {a for s in split if s for a in ((s,) if isinstance(s, str) else s)}
 
 
 def _run(

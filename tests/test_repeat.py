@@ -9,9 +9,9 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 import pytest
+from conftest import count
 from flax import nnx
 from jax._src.ad_checkpoint import saved_residuals
-from jax.extend.core import ClosedJaxpr, Jaxpr
 from jax.sharding import PartitionSpec as P
 from jaxtyping import Float
 from optax.contrib import MuonDimensionNumbers
@@ -20,7 +20,7 @@ from bux import parallel
 from bux.architecture import Model, MoE, Norm, Scanned
 from bux.architecture.graph import Sequence
 from bux.architecture.precision import matmuls
-from bux.architecture.repeats import remat
+from bux.architecture.repeats import remat, tracing
 from bux.architecture.residual import HyperConnections
 from bux.lang import compile, compile_runs
 from bux.lang.printer import run_to_source
@@ -227,6 +227,37 @@ def test_single_pass_mhc_scans_from_the_layer_after_the_one_that_starts_its_read
     assert _scan_lengths(_model(SINGLE_PASS)) == [2]
     scanned = _logits(SINGLE_PASS, SCAN)
     assert np.allclose(scanned, _logits(SINGLE_PASS, UNROLL), atol=1e-5)
+
+
+# --- What traces -----------------------------------------------------------------------
+
+
+def _numbered() -> int:
+    with tracing.branch():
+        branch = tracing.current_branch()
+        assert branch is not None
+        return branch.number
+
+
+def test_a_run_of_passes_numbers_its_branches_as_its_first_pass_s():
+    with tracing.forward(main=8):
+        _numbered()
+        with tracing.passes(range(1, 4), each=2):
+            traced_twice = [_numbered() for _ in range(2 * 2)]
+            at = tracing.current_pass()
+        [after] = tracing.next_branches(1)
+    assert traced_twice == [1, 2, 1, 2] and at == 1 and after.number == 1 + 3 * 2
+
+
+def test_a_repeat_inside_a_pass_traces_as_that_pass():
+    with tracing.passes(range(2, 3)), tracing.passes(range(5, 7)):
+        assert tracing.current_pass() == 2
+    assert tracing.current_pass() is None
+
+
+def test_runs_cut_passes_where_they_trace_apart():
+    assert tracing.runs(8, [3, 0, 3, 8, 11]) == [range(3), range(3, 8)]
+    assert tracing.runs(4) == [range(4)]
 
 
 # --- The optimizer and the layout ------------------------------------------------------
@@ -455,7 +486,7 @@ def _scaled_matmuls(how: str) -> int:
     x = jnp.ones((64, 64))
     with _use(f"methods(remat={how})"), matmuls.use("mxfp8", jnp.asarray(TOKENS)):
         jaxpr = jax.make_jaxpr(jax.grad(loss, argnums=(0, 1)))(x, x)
-    return _count(jaxpr.jaxpr, "scaled_matmul")
+    return count(jaxpr.jaxpr, "scaled_matmul")
 
 
 def test_a_dots_policy_keeps_an_mxfp8_gemm_inside_a_shard_map():
@@ -463,20 +494,6 @@ def test_a_dots_policy_keeps_an_mxfp8_gemm_inside_a_shard_map():
     # misses: its backward would run the forward's GEMM again for tanh's.
     assert _scaled_matmuls("dots") == _scaled_matmuls("dots_no_batch") == 3
     assert _scaled_matmuls("full") == 4
-
-
-def _count(jaxpr: Jaxpr, primitive: str) -> int:
-    """How many times `primitive` runs in `jaxpr`, inside the jaxprs it calls too."""
-    n = 0
-    for eqn in jaxpr.eqns:
-        n += eqn.primitive.name == primitive
-        for param in eqn.params.values():
-            for sub in param if isinstance(param, tuple | list) else (param,):
-                if isinstance(sub, ClosedJaxpr):
-                    sub = sub.jaxpr
-                if isinstance(sub, Jaxpr):
-                    n += _count(sub, primitive)
-    return n
 
 
 MLA = "mla(num_heads=4, kv_lora_rank=16, q_lora_rank=32, qk_rope_head_dim=8"
@@ -535,7 +552,7 @@ def test_a_checkpoint_resumes_only_with_the_repeat_method_it_was_saved_with(tmp_
 
     whole = train(run("scan"), tmp_path, echo=lambda _: None)
     shutil.rmtree(directory(run("scan"), tmp_path) / "checkpoints" / "4")
-    with pytest.raises(ValueError, match=r"saved with methods\(repeat=unroll\)"):
+    with pytest.raises(ValueError, match="resumes with the methods it was saved with"):
         train(run("unroll"), tmp_path, echo=lambda _: None)
     said: list[str] = []
     resumed = train(run("scan"), tmp_path, echo=said.append)

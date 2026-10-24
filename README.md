@@ -78,7 +78,10 @@ A run splits over devices by three settings, `mesh`, `layout` and `methods`: FSD
 tensor, expert, context and pipeline parallelism, and any mix of them, from one GPU
 to many hosts. [examples/experiments/parallel/](examples/experiments/parallel/) has a
 run for each, one of them on a laptop's CPU, and the
-[parallelism guide](docs/parallelism.md) explains them.
+[parallelism guide](docs/parallelism.md) explains them. The suites in
+[examples/benchmarks/](examples/benchmarks/) measure them on one GPU, a node and two:
+`scripts/benchmark.py` trains a suite and prints how a change moved each run's speed,
+memory and loss ([Benchmarks](docs/training.md#benchmarks)).
 
 Run the CI checks (ruff, ty, and the tests) with `make`, or one of them with `make lint`,
 `make typecheck`, or `make test`. Arrays say their dtype and shape with

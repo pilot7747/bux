@@ -23,6 +23,7 @@ and checkpoints, and sinks for what the hooks return. A script can swap any of t
 import contextlib
 import functools
 import re
+import time
 from collections.abc import Callable, Iterable, Iterator, Mapping, Sequence
 from pathlib import Path
 from typing import Any, NamedTuple, Protocol, runtime_checkable
@@ -47,12 +48,12 @@ from bux.data.pipeline import DEFAULT_CACHE, jobs, prepare
 from bux.lang import ir
 from bux.lang.printer import run_to_source
 from bux.parallel.gather import Axes
-from bux.train import flops, xla
+from bux.train import fitting, flops, stages, xla
 from bux.train.config import PrecisionConfig
 from bux.train.data import Batch, batches, prefetch
 from bux.train.hooks import Checkpoint, Eval, Hook, Log, Profile
 from bux.train.objective import Metrics, Objective, objective, target_mask
-from bux.train.optim import Schedule, lr_multiplier, lr_schedule, optimizer
+from bux.train.optim import lr_multiplier, lr_schedule, optimizer
 from bux.train.sinks import JSONL, Console, LatestMetrics, Sink, is_main_process
 
 
@@ -144,10 +145,6 @@ def _cast_params(params: nnx.State, dtype: DTypeLike) -> nnx.State:
     )
 
 
-def _add(total: Float[Array, "*s"], part: Float[Array, "*s"]) -> Float[Array, "*s"]:
-    return total + part.astype(total.dtype)
-
-
 def _by_spec(
     f: Callable[[P, Shaped[Array, "*s"]], Shaped[Array, "*w"]],
     specs: nnx.State,
@@ -191,7 +188,9 @@ class _Cut:
             model, nnx.All(nnx.Param, self._inside), self._inside, nnx.Param, ...
         )
         self.graphdef, self.piped, self.rest, self.others, self.kept = split
-        self.stand_ins = jax.tree.map(_stand_in, (self.piped, self.rest))
+        self.stand_ins = jax.tree.map(
+            parallel.scheduled.stand_in, (self.piped, self.rest)
+        )
         graphdef = nnx.graphdef(scanned.layers)
         self.stage = pipelined.Stage.of(graphdef, scanned.times, True, None)
 
@@ -264,10 +263,6 @@ def _check_outside(model: nnx.Module, inside: Callable[[tuple, object], bool]) -
             )
 
 
-def _stand_in(a: Shaped[Array, "..."]) -> jax.ShapeDtypeStruct:
-    return jax.ShapeDtypeStruct(a.shape, a.dtype)
-
-
 def _under(state: nnx.State, path: tuple, rounds: int) -> nnx.State:
     """Return the part of `state` under `path`, each leaf with `rounds` in front: none
     if it has nothing there."""
@@ -313,6 +308,9 @@ class Trainer:
     step is gone after it, and one to keep is a copy (``np.asarray``).
 
     The training step compiles with XLA's `compiler_options` (``bux.train.xla``).
+
+    Given the `work` of a step (``flops.Work``), `flops` adds up the model FLOPs of
+    the steps taken, each at the keys its batch's queries see, for the log's MFU.
     """
 
     def __init__(
@@ -330,6 +328,7 @@ class Trainer:
         reduce: DTypeLike | None = None,
         donate: bool = False,
         compiler_options: xla.Options | None = None,
+        work: flops.Work | None = None,
     ):
         self.model, self.objective = model, objective
         self.compute, self.microbatches = jnp.dtype(compute), microbatches
@@ -339,14 +338,18 @@ class Trainer:
         self.optimizer = nnx.Optimizer(model, tx, wrt=nnx.Param)
         parallel.shard_state(self.model, self.optimizer)
         self.step = 0
+        self.work, self.flops = work, 0.0
         self.stopping = False  # set, by a signal handler say, to stop after this step
         self._donated = ("model", "optimizer") if donate else ()
         self._compiler_options = compiler_options or {}
         self._compile()
 
     def _compile(self) -> None:
-        """Make the compiled steps, which read `matmuls` as they trace."""
-        self._train = xla.jit(
+        """Make the compiled steps, which read `matmuls` as they trace. Under remat
+        `auto`, the training step chooses its policy as it first compiles
+        (``fitting``)."""
+        jit = fitting.Fitting if remat.setting() == "auto" else xla.jit
+        self._train = jit(
             self._train_step_on_shards,
             self._compiler_options,
             donate_argnames=self._donated,
@@ -569,7 +572,7 @@ class Trainer:
             grads, metrics, buffers = self._grads(
                 graphdef, params, buffers, microbatch, token_share, row_share=1 / rows
             )
-            return (jax.tree.map(_add, grad_sum, grads), buffers), metrics
+            return (parallel.gather.added(grad_sum, grads), buffers), metrics
 
         xs = (parallel.microbatches(batch, self.microbatches), token_shares)
         (grads, buffers), metrics = jax.lax.scan(add_microbatch, (zeros, buffers), xs)
@@ -614,6 +617,8 @@ class Trainer:
         self._switch_if_due()
         metrics = self._train(self.model, self.optimizer, parallel.shard_batch(batch))
         self.step += 1
+        if self.work is not None:
+            self.flops += self.work.of(batch.position_ids)
         return metrics
 
     def _switch_if_due(self) -> None:
@@ -701,8 +706,14 @@ def train(
         )
 
     multiplier = lr_multiplier(config.schedule, config.steps)
-    log = _log(run, lr_schedule(config.optimizer.lr, multiplier))
-    with parallel.use(config.mesh, config.layout, config.methods):
+    lr, peak = lr_schedule(config.optimizer.lr, multiplier), _peak(run)
+    tokens = config.batch * config.seq_len
+    log = Log(every=config.log.every, lr=lr, tokens=tokens, peak=peak)
+    work = step_flops(run) if peak else None
+    methods = stages.balanced(run)
+    if methods.stages != config.methods.stages:
+        echo(f"{run.name}: methods.stages = {methods.stages}")
+    with parallel.use(config.mesh, config.layout, methods):
         parallel.check(config.batch, config.seq_len)
         _check_cpu_bfloat16(run)
         model = parallel.build(lambda: Model(run.arch, rngs=nnx.Rngs(config.seed)))
@@ -723,6 +734,7 @@ def train(
             reduce=_reduce_dtype(config.precision),
             donate=config.methods.donate,
             compiler_options=xla.options(config.compiler),
+            work=work,
         )
         make_batches = functools.partial(
             batches, config=config, vocab_size=vocab, cache=cache
@@ -735,7 +747,7 @@ def train(
             hooks=[*run_hooks, *hooks],
             sinks=[
                 Console(run.name, config.steps, echo),
-                JSONL(folder / "metrics.jsonl", append=trainer.step > 0),
+                JSONL(folder / "metrics.jsonl", start=trainer.step),
                 latest,
                 *sinks,
             ],
@@ -778,7 +790,7 @@ def _accumulated(microbatches: int) -> int:
     return 1 if parallel.pipeline.pipelined() else microbatches
 
 
-def step_flops(run: ir.Run) -> float:
+def step_flops(run: ir.Run) -> flops.Work:
     """Return the model FLOPs of a training step of `run`: its loss's gradient on a
     batch, counted from its program (``flops.count``) on one device, outside any mesh,
     with remat and kernels off, which would add work or hide it."""
@@ -808,16 +820,11 @@ def step_flops(run: ir.Run) -> float:
         return flops.count(gradient, params, rest, ids)
 
 
-def _log(run: ir.Run, lr: Schedule) -> Log:
-    """Return the run's log, with its MFU where the peak of its devices is known."""
-    t = run.train
-    devices = parallel.mesh(t.mesh).devices
+def _peak(run: ir.Run) -> float | None:
+    """Return the FLOPs a second of the run's devices at their peak, if known."""
+    devices = parallel.mesh(run.train.mesh).devices
     each = flops.peak(devices.flat[0].device_kind)
-    most = each and each * devices.size
-    work = step_flops(run) if most else None
-    return Log(
-        every=t.log.every, lr=lr, tokens=t.batch * t.seq_len, flops=work, peak=most
-    )
+    return each and each * devices.size
 
 
 def _hooks(
@@ -839,8 +846,12 @@ def _hooks(
         checkpoint = Checkpoint(
             folder / "checkpoints", every=saves.every, keep=saves.keep
         )
+        start = time.perf_counter()
         if checkpoint.restore(trainer):
-            echo(f"{run.name}: resuming at step {trainer.step}")
+            seconds = time.perf_counter() - start
+            echo(
+                f"{run.name}: restored in {seconds:.1f}s, resuming at step {trainer.step}"
+            )
         hooks.append(checkpoint)
     if (trace := config.profile) is not None:
         hooks.append(Profile(folder / "profile", start=trace.start, steps=trace.steps))

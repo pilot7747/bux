@@ -30,14 +30,13 @@ import jax.numpy as jnp
 from jax.sharding import PartitionSpec as P
 from jaxtyping import Array, Float, Int, Shaped
 
-from bux import kernels, parallel
+from bux import jax_internals, kernels, parallel
 from bux.architecture.common.segments import Segments
 
 try:  # cudnn-frontend and its JAX kernels, where the cuda extra is installed (Linux)
     import cudnn
     from cudnn.frost.device import device_context
     from cudnn.linear_attention import jax_api as frost
-    from jax.experimental.buffer_callback import buffer_callback
 except ImportError:
     frost = None
 
@@ -230,7 +229,8 @@ def _graph_call(
             handle = _handle(device, ctx.stream)
             graph.execute(pack, workspace=workspace, handle=handle)
 
-    return tuple(buffer_callback(run, (*results, scratch))(*xs)[:-1])
+    call = jax_internals.buffer_callback(run, (*results, scratch))
+    return tuple(call(*xs)[:-1])
 
 
 # XLA calls each device's callback from that device's thread. Two threads must not

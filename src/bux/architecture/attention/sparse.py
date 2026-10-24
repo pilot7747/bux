@@ -23,17 +23,12 @@ import jax.numpy as jnp
 from jax.sharding import PartitionSpec as P
 from jaxtyping import Array, Bool, Float, Int, Shaped
 
-from bux import kernels, parallel
+from bux import jax_internals, kernels, parallel
+from bux.architecture.attention import scoring
 from bux.architecture.common.segments import Segments
 from bux.parallel.context import softcap
-
-try:  # tokamax's kernels, where its extra is installed (Linux)
-    from tokamax._src.ops.attention import api as flash
-    from tokamax._src.ops.attention import base as masks
-
-    MOSAIC = flash.IMPLEMENTATIONS.get("mosaic_gpu")
-except ImportError:
-    masks = MOSAIC = None
+from bux.parallel.flash import MOSAIC, finite, tokamax_lse
+from bux.train import flops
 
 KEPT = "mask of kept keys (an indexer's top-k, or CSA's compression)"
 ELEMENTS = 1 << 27  # the most a chunk of queries makes of an intermediate
@@ -137,10 +132,10 @@ def chunks(t: int, per_query: int) -> int:
 
 def _devices(t: int) -> int:
     """Return how many devices t positions split over."""
-    on, split = parallel.active(), parallel.spec(("seq",), (t,))
-    if on is None or not split or split[0] is None:
+    on = parallel.active()
+    if on is None:
         return 1
-    return on.size(*((split[0],) if isinstance(split[0], str) else split[0]))
+    return on.size(*parallel.axes_of(parallel.spec(("seq",), (t,))))
 
 
 def chunked[R](f: Callable[[Any], R], xs: Any, n: int) -> R:
@@ -173,11 +168,6 @@ def _join(x: Shaped[Array, "chunks b c *r"]) -> Shaped[Array, "b t *r"]:
     return jnp.moveaxis(x, 0, 2).reshape(b, c * n, *x.shape[3:])
 
 
-def axes(split: P) -> set[str]:
-    """Return the mesh axes `split` splits over."""
-    return {a for d in split if d for a in ((d,) if isinstance(d, str) else d)}
-
-
 # --- attention ------------------------------------------------------------------------
 
 
@@ -201,7 +191,7 @@ def attend(
     queries and every key: all-gather context parallelism."""
     static, parts = _Static(scale, cap, _flash(q), True), tuple(parts)
     split = parallel.spec(("batch", "seq", "heads", None), q.shape)
-    names = axes(split)
+    names = set(parallel.axes_of(split))
     if parallel.active() is None or not names:
         return _attend(q, parts, sinks, static)
     parts = tuple(_heads_like(p, split, q.shape[2]) for p in parts)
@@ -311,7 +301,7 @@ def _combine(
         [] if sinks is None else [jnp.broadcast_to(sinks, lses[0].shape)]
     )
     lse = jax.nn.logsumexp(jnp.stack(every).astype(F32), axis=0)
-    shares = [jnp.where(jnp.isfinite(x), jnp.exp(x - _finite(lse)), 0) for x in lses]
+    shares = [jnp.where(jnp.isfinite(x), jnp.exp(x - finite(lse)), 0) for x in lses]
     out = sum(w[..., None] * o.astype(F32) for w, o in zip(shares, outs))
     return jnp.asarray(out).astype(dtype), lse
 
@@ -354,11 +344,6 @@ def _sink_grads(
     return -(share * delta).sum((0, 1)).astype(sinks.dtype)
 
 
-def _finite(x: Float[Array, "*s"]) -> Float[Array, "*s"]:
-    """Return `x` with 0 for -inf, the logsumexp of a query that attends to nothing."""
-    return jnp.where(jnp.isfinite(x), x, 0)
-
-
 def probabilities(
     q: Float[Array, "b t h dk"],
     part: Part,
@@ -366,11 +351,52 @@ def probabilities(
     scale: float,
     cap: float | None,
 ) -> Float[Array, "b t s"]:
-    """Return each query's probability of each slot of `part`, summed over heads, in
-    the softmax whose logsumexp is `lse`; 0 for slots it does not attend to."""
-    _, logits = _logits(q, part.k, scale, cap)
+    """Return each query's probability of each slot of `part` in its span, kept or
+    not, summed over heads, in the softmax whose logsumexp is `lse`; 0 for slots
+    outside the span or that do not exist. By ``scoring``'s kernel where it runs."""
+    t, s, d = q.shape[1], part.k.shape[1], part.k.shape[-1]
+    if part.exists is None and scoring.probabilities_run(t, s, d):
+        return _probabilities_kernel(q, part, lse, scale, cap)
+    with flops.over_keys():
+        _, logits = _logits(q, part.k, scale, cap)
     p = jnp.exp(logits - _grouped(lse[..., None], part.k.shape[2]))
-    return jnp.where(visible(part)[:, None, None], p, 0).sum((1, 2))
+    seen = mask(part.span, s, part.exists)
+    return jnp.where(seen[:, None, None], p, 0).sum((1, 2))
+
+
+def _probabilities_kernel(
+    q: Float[Array, "b t h dk"],
+    part: Part,
+    lse: Float[Array, "b t h"],
+    scale: float,
+    cap: float | None,
+) -> Float[Array, "b t s"]:
+    """Return `probabilities` by ``scoring``'s kernel, in a shard_map that gives each
+    device its rows, queries and heads, and every key, and sums the heads'."""
+    run = partial(scoring.probabilities, scale=scale, cap=cap)
+    split = parallel.spec(("batch", "seq", "heads", None), q.shape)
+    names = set(parallel.axes_of(split))
+    if parallel.active() is None or not names:
+        return run(q, part.k, lse, *part.span)
+    k, heads = _heads_like(part, split, q.shape[2]).k, split[2]
+
+    def device(
+        q: Float[Array, "b t h dk"],
+        k: Float[Array, "b s g dk"],
+        lse: Float[Array, "b t h"],
+        span: Span,
+    ) -> Float[Array, "b t s"]:
+        own = run(q, k, lse, *span)
+        return own if heads is None else jax.lax.psum(own, heads)
+
+    keys, rows = _specs(part._replace(k=k), split).k, P(split[0], split[1])
+    return jax.shard_map(
+        device,
+        in_specs=(split, keys, P(*split[:3]), Span(rows, rows)),  # ty: ignore
+        out_specs=P(split[0], split[1], None),
+        axis_names=names,
+        check_vma=False,
+    )(q, k, lse, part.span)
 
 
 # --- by XLA, a chunk of queries at a time ---------------------------------------------
@@ -414,12 +440,13 @@ def _xla_fwd(
         seen = visible(at(part, span, index))[:, None, None]
         logits = jnp.where(seen, logits, -jnp.inf)
         lse = jax.nn.logsumexp(logits, axis=-1, keepdims=True)
-        p = jnp.exp(logits - _finite(lse)).astype(part.v.dtype)
+        p = jnp.exp(logits - finite(lse)).astype(part.v.dtype)
         out = jnp.einsum("bgrcs,bsgv->bgrcv", p, part.v)
         return _ungrouped(out), _ungrouped(lse)[..., 0]
 
     s, h = part.k.shape[1], q.shape[2]
-    return chunked(chunk, (q, *rows(part)), chunks(q.shape[1], h * s))
+    with flops.over_keys():
+        return chunked(chunk, (q, *rows(part)), chunks(q.shape[1], h * s))
 
 
 def _xla_bwd(
@@ -438,9 +465,10 @@ def _xla_bwd(
 
     def chunk(carry: tuple, xs: tuple) -> tuple[tuple, Float[Array, "b c h dk"]]:
         q, out, dout, lse, span, index = xs
-        raw, logits = _logits(q, k, static.scale, static.softcap)
+        with flops.recomputed():
+            raw, logits = _logits(q, k, static.scale, static.softcap)
         seen = visible(at(part, span, index))[:, None, None]
-        p = jnp.where(seen, jnp.exp(logits - _grouped(_finite(lse)[..., None], g)), 0)
+        p = jnp.where(seen, jnp.exp(logits - _grouped(finite(lse)[..., None], g)), 0)
         do, o = (_grouped(x.astype(F32), g) for x in (dout, out))
         dp = jnp.einsum("bgrcv,bsgv->bgrcs", do, v, preferred_element_type=F32)
         ds = p * (dp - (do * o).sum(-1, keepdims=True))
@@ -456,9 +484,9 @@ def _xla_bwd(
 
     zeros = jnp.zeros(k.shape, F32), jnp.zeros(v.shape, F32)
     xs = (q, out, dout, lse, *rows(part))
-    (dk, dv), dq = scanned(
-        chunk, zeros, xs, chunks(q.shape[1], q.shape[2] * k.shape[1])
-    )
+    n = chunks(q.shape[1], q.shape[2] * k.shape[1])
+    with flops.over_keys():
+        (dk, dv), dq = scanned(chunk, zeros, xs, n)
     return dq, dk.astype(k.dtype), dv.astype(v.dtype)
 
 
@@ -475,8 +503,7 @@ def _flash_fwd(
         q, part.k, part.v, return_residuals=True, **_flash_args(part, static)
     )
     seen = (l > 0).transpose(0, 2, 1)
-    lse = jnp.where(l > 0, m + jnp.log(jnp.where(l > 0, l, 1)), -jnp.inf)
-    return jnp.where(seen[..., None], out, 0), lse.transpose(0, 2, 1)
+    return jnp.where(seen[..., None], out, 0), tokamax_lse(m, l).transpose(0, 2, 1)
 
 
 def _flash_bwd(
@@ -492,18 +519,14 @@ def _flash_bwd(
     """Return a part's share of the gradients by tokamax's backward kernels, given
     the softmax's statistics: P = exp(logits - lse), and rowsum(dout * out)."""
     assert MOSAIC is not None
-    bound = MOSAIC.bind(q, part.k, part.v, **_flash_args(part, static))
-    kwargs = {n: x for n, x in bound.kwargs.items() if n != "return_residuals"}
-    lse = _finite(lse).transpose(0, 2, 1)
-    grads = MOSAIC.vjp((lse, jnp.ones_like(lse)), out, dout, *bound.args, **kwargs)
-    return grads["q"], grads["k"], grads["v"]
+    args, lse = _flash_args(part, static), finite(lse).transpose(0, 2, 1)
+    return jax_internals.tokamax_vjp(MOSAIC, lse, out, dout, q, part.k, part.v, args)
 
 
 def _flash_args(part: Part, static: _Static) -> dict[str, Any]:
     """Return tokamax's arguments for `part`: the kept and existing slots as a
     boolean mask, the span as each query's first key and, with the positions split,
     the key after its last."""
-    assert masks is not None
     keep = (
         None if part.kept is None else mask(part.span, part.k.shape[1], None, part.kept)
     )
@@ -513,7 +536,7 @@ def _flash_args(part: Part, static: _Static) -> dict[str, Any]:
         keep = exists if keep is None else keep & exists
     end = None if static.causal else part.span.end[:, None]
     return {
-        "mask": masks.Mask(
+        "mask": jax_internals.tokamax_mask(
             keep, k_start=part.span.start[:, None], k_end=end, is_causal=static.causal
         ),
         "logits_scale": static.scale,

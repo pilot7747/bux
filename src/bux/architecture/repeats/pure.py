@@ -5,6 +5,7 @@ arrays. ``Pure`` calls the module on a copy of the taps instead and returns what
 changed (``Changes``), and ``apply`` writes that back into the taps.
 """
 
+from collections.abc import Callable
 from typing import Any, NamedTuple
 
 import jax
@@ -25,6 +26,11 @@ class Changes(NamedTuple):
 
 
 NOTHING = Changes(None, None, {})
+# A ``Pure`` call, or one as a scan makes it (``stacked.scanned_pass``).
+Call = Callable[
+    [nnx.State, Stream, Changes],
+    tuple[Stream, nnx.State, Changes, list[Float[Array, ""]]],
+]
 
 
 class Pure:

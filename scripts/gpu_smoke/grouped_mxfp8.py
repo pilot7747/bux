@@ -1,0 +1,154 @@
+"""Grouped MXFP8 GEMMs on a Blackwell GPU (bux.architecture.experts.grouped_mxfp8):
+each kernel against XLA's dequantize-and-multiply, with empty groups, a group of one
+row and rows past the groups; Triton's quantizer (grouped_triton) against XLA's
+quantization, laid out for the kernels; then an MoE layer's experts, forward and
+backward, in
+MXFP8 (``grouped_blockscaled``) against bfloat16 (``grouped``), at the baseline MoE's
+shapes (64 experts, d_model 2048, intermediate 704 and 2048, 262144 picks), and the
+GPU time of each by CUPTI.
+
+    uv run --extra cuda python scripts/gpu_smoke/grouped_mxfp8.py
+
+It exits 1 if a kernel differs from XLA by more than float32's rounding, or the
+quantizer's bytes from XLA's.
+"""
+
+import sys
+from collections.abc import Callable
+
+import jax
+import jax.numpy as jnp
+import numpy as np
+from jax.experimental.mosaic.gpu import profiler
+from jaxtyping import Array, Float
+
+from bux import kernels, runtime
+from bux.architecture.experts import grouped, grouped_blockscaled, grouped_triton
+from bux.architecture.experts import grouped_mxfp8 as gm
+from bux.architecture.precision import blockscaled
+from bux.architecture.precision.blockscaled import Blocks
+
+TOLERANCE = 1e-5  # of the largest value: float32, summed in another order
+# Each kernel's cases, k not whole tiles in some: x W[g] (k, n), and dW (d, f).
+ROWS = [(256, 384), (704, 256)]
+CONTRACTS = [(256, 384), (704, 256)]
+# What the quantizer takes: rows of x, some past the groups, and each W[g].
+QUANTIZED = [((1024, 704), 900), ((4, 704, 2048), 704)]
+SIZES = jnp.array([0, 130, 1, 3, 256, 0, 300, 100], jnp.int32)  # 1024 rows
+Product = Callable[..., Float[Array, "m n"]]  # x, W and maybe sizes -> x W
+
+
+def mxfp8(shape: tuple[int, ...], seed: int) -> Blocks:
+    """Random values in MXFP8 along their rows, each matrix of a stack on its own."""
+    return quantized(jax.random.normal(jax.random.key(seed), shape))
+
+
+def quantized(x: Float[Array, "*g r c"]) -> Blocks:
+    """x in MXFP8 by XLA along its rows, each matrix of a stack on its own."""
+    if x.ndim == 3:
+        return jax.vmap(blockscaled.mx_quantize)(x)
+    return blockscaled.mx_quantize(x)
+
+
+def off(got: Float[Array, "..."], want: Float[Array, "..."]) -> float:
+    return float(jnp.abs(got - want).max() / jnp.abs(want).max())
+
+
+def rows_off(k: int, n: int) -> float:
+    """How far `rows` is from XLA's dequantized product, rows past the groups too."""
+    a, b = mxfp8((1024, k), 0), mxfp8((SIZES.shape[0], n, k), 1)
+    got = gm.rows(gm.tiled(a), gm.tiled(b), SIZES, jnp.float32)
+    each = jnp.swapaxes(jax.vmap(blockscaled.dequantized)(b), 1, 2)
+    want = jax.lax.ragged_dot(blockscaled.dequantized(a), each, SIZES)
+    return off(got, want)
+
+
+def contract_off(d: int, f: int) -> float:
+    """How far `contract` is from XLA's dequantized product, empty groups too."""
+    a, b = mxfp8((d, 1024), 2), mxfp8((f, 1024), 3)
+    got = gm.contract(gm.tiled(a), gm.tiled(b), SIZES, jnp.float32)
+    rows = (blockscaled.dequantized(a).T, blockscaled.dequantized(b).T)
+    want = jax.lax.ragged_dot_general(*rows, SIZES, grouped.RAGGED_CONTRACTING)
+    return off(got, want)
+
+
+def quantizer_differs(shape: tuple[int, ...], filled: int) -> int:
+    """How many bytes of the quantizer's copies differ from XLA's laid out so."""
+    x = jax.random.normal(jax.random.key(4), shape, jnp.bfloat16)
+    rows, columns = grouped_triton.quantized_twice(x, jnp.int32(filled))
+    assert columns is not None
+    kept = jnp.where((jnp.arange(shape[-2]) < filled)[:, None], x, 0)
+    wants = (quantized(kept), quantized(jnp.swapaxes(kept, -1, -2)))
+    differ = 0
+    for got, want in zip((rows, columns), wants, strict=True):
+        for a, b in zip(got, gm.tiled(want), strict=True):
+            differ += int((blockscaled.as_bytes(a) != blockscaled.as_bytes(b)).sum())
+    return differ
+
+
+def experts(product: Product) -> Product:
+    """An MoE's expert FFN of sorted rows: up and gate as one GEMM, then down."""
+
+    def ffn(
+        x: Float[Array, "m d"], up: Float[Array, "g d f"], down: Float[Array, "g e d"]
+    ) -> Float[Array, "m d"]:
+        u, g = jnp.split(product(x, up), 2, axis=-1)
+        return product(jax.nn.silu(u) * g, down)
+
+    return ffn
+
+
+def gpu_ms(product: Product, f: int) -> float:
+    """The GPU time of the experts' forward and backward, by CUPTI."""
+    m, d, g = 262144, 2048, 64
+    keys = jax.random.split(jax.random.key(4), 4)
+    x = jax.random.normal(keys[0], (m, d), jnp.bfloat16)
+    up = (jax.random.normal(keys[1], (g, d, 2 * f)) / d**0.5).astype(jnp.bfloat16)
+    down = (jax.random.normal(keys[2], (g, f, d)) / f**0.5).astype(jnp.bfloat16)
+    sizes = jnp.asarray(
+        np.random.default_rng(0).multinomial(m, np.ones(g) / g), jnp.int32
+    )
+    dy = jax.random.normal(keys[3], (m, d), jnp.bfloat16)
+
+    def step(x: Array, up: Array, down: Array) -> tuple[Array, ...]:
+        y, vjp = jax.vjp(experts(lambda a, w: product(a, w, sizes)), x, up, down)
+        return y, *vjp(dy)
+
+    _, times = profiler.measure(jax.jit(step), iterations=5)(x, up, down)
+    assert times is not None
+    return float(np.median(np.asarray(times)))
+
+
+def main() -> int:
+    runtime.configure()
+    if not kernels.gpu() or "B" not in jax.devices()[0].device_kind:
+        print(f"needs a Blackwell GPU: found {jax.devices()}")
+        return 1
+    worst = 0.0
+    for k, n in ROWS:
+        worst = max(worst, e := rows_off(k, n))
+        print(f"rows k {k:4} n {n:4}: off by {e:.1e}", flush=True)
+    for d, f in CONTRACTS:
+        worst = max(worst, e := contract_off(d, f))
+        print(f"contract d {d:4} f {f:4}: off by {e:.1e}", flush=True)
+    differ = 0
+    for shape, filled in QUANTIZED:
+        differ += (n := quantizer_differs(shape, filled))
+        print(f"quantizer {shape}, {filled} rows: {n} bytes differ", flush=True)
+    seed = jnp.uint32(0)
+
+    def in_mxfp8(x: Array, w: Array, sizes: Array) -> Array:
+        return grouped_blockscaled.ragged_dot(x, w, sizes, blockscaled.MXFP8, seed)
+
+    for f in (704, 2048):
+        bf16, mx = gpu_ms(grouped.ragged_dot, f), gpu_ms(in_mxfp8, f)
+        print(
+            f"experts of {f}, forward and backward: bfloat16 {bf16:.2f} ms, "
+            f"MXFP8 {mx:.2f} ms ({bf16 / mx:.2f}x)",
+            flush=True,
+        )
+    return int(worst > TOLERANCE or differ > 0)
+
+
+if __name__ == "__main__":
+    sys.exit(main())
