@@ -310,6 +310,7 @@ def _layer_outputs(mesh: dict[str, int]):
         return jax.device_get((y, grads))
 
 
+@pytest.mark.skipif(jax.device_count() < 8, reason="8 devices, as the CPU fakes")
 def test_each_device_quantizes_its_own_shard_of_the_experts_as_one_does_them_all(
     stand_in, monkeypatch
 ):
