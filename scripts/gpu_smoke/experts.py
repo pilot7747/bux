@@ -9,8 +9,8 @@ run's losses against one GPU's, and its tokens a second. It exits 1 if the layer
 the first loss differs by more than 1e-4, or any later loss by more than 1e-3:
 rounding differs between splits, and the top-k picks and the updates after them
 amplify it as the run goes on (examples/experiments/parallel/laptop.bux). Then the
-run with its routed experts in MXFP8 (Triton's grouped GEMMs, `grouped_triton`), on one
-GPU and by ragged_all_to_all: within `MXFP8_TOLERANCE` of bfloat16's losses. If NCCL's
+run with its routed experts in MXFP8 (`grouped_mxfp8`'s GEMMs), on one GPU and by
+ragged_all_to_all: within `MXFP8_TOLERANCE` of bfloat16's losses. If NCCL's
 ragged all-to-all hangs, as it was reported to on jax 0.11, try
 XLA_FLAGS=--xla_gpu_experimental_ragged_all_to_all_use_barrier_with_nccl=false.
 """

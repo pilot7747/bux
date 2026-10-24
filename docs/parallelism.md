@@ -870,15 +870,16 @@ The routed experts' role, `experts`, takes `compute`, `mxfp8` or `mxfp8_2d`
 (docs/training.md, "Precision"), and `nvfp4` is an error. Left out, it is `matmuls`
 where a grouped GEMM multiplies in it, `mxfp8` and `mxfp8_2d`, and compute under any
 other, as `nvfp4`: no grouped GEMM takes NVFP4 (`PrecisionConfig.experts`). On B300s
-MXFP8 experts train 6 to 13% faster than bfloat16 ones (below). An MoE run that leaves
+MXFP8 experts train 10 to 15% faster than bfloat16 ones (below). An MoE run that leaves
 them to `matmuls=mxfp8` multiplied them in bfloat16 before that, so it takes the id
 of a run that names `mxfp8` for them, and a launch trains it again; a run that names
 their format keeps its id, and a model without routed experts too. In a
 format, `experts` runs up and gate as one GEMM, so that x quantizes once, and each
 GEMM by `grouped_blockscaled.ragged_dot`: every operand of the forward's GEMM and of
 the backward's two quantized along what that GEMM contracts, as a projection's are,
-and each expert's W on its own. One pass of a Triton kernel quantizes x and x^T, and
-zeroes the rows past the experts', which an exchange's buffer leaves as they were.
+and each expert's W on its own. One pass of a Triton kernel (`grouped_triton`)
+quantizes x and x^T, zeroes the rows past the experts', which an exchange's buffer
+leaves as they were, and writes both as the kernels below take them.
 Elsewhere XLA dequantizes and multiplies, which computes the same values, so the
 tests run it on CPU. Only `passes` multiply in the format, the others by `grouped`'s
 kernels, as they are.
@@ -931,25 +932,33 @@ scales, rows of 4 bytes too short for TMA, through registers into tensor memory 
 every step of k.
 
 Training on B300s, side by side, GEMM autotuning off and deterministic ops, the
-experts in bfloat16, in MXFP8 by Triton's kernels as before, and by `grouped_mxfp8`
-(tokens a second, peak memory):
+experts in bfloat16, in MXFP8 by Triton's kernels as before, by `grouped_mxfp8`, and
+by it with the quantizer writing its layout (below; by `scripts/benchmark.py` on
+`examples/benchmarks`' arms, against bfloat16 in the same job), tokens a second and
+peak memory:
 
-| run | bfloat16 | MXFP8, Triton | MXFP8, `grouped_mxfp8` |
-|-----|----------|---------------|------------------------|
-| the baseline MoE, one GPU, 8 × 4096 tokens | 86.2k, 133.9 GiB | 74.2k | 91.5k (1.06x), 119.5 GiB |
-| experts of 2048, 8 layers, one GPU | 90.4k, 143.2 GiB | 75.6k | 101.7k (1.12x), 129.6 GiB |
-| `ragged_all_to_all`, `capacity=1.25`, `expert=8`, 32k tokens a GPU | 468k, 88.5 GiB | 417k | 517k (1.10x), 72.3 GiB |
-| | | | `dispatch=mxfp8`: 515k |
-| `all_to_all`, `capacity=1.25`, `expert=8`, 32k tokens a GPU | 492k, 91.4 GiB | 449k | 539k (1.10x), 78.4 GiB |
-| `sorted`, `fsdp=8`, 32k tokens a GPU | 671k, 83.9 GiB | 580k | 712k (1.06x), 69.4 GiB |
+| run | bfloat16 | MXFP8, Triton | MXFP8, `grouped_mxfp8` | quantized into its layout |
+|-----|----------|---------------|------------------------|---------------------------|
+| the baseline MoE, one GPU, 8 × 4096 tokens: one_gpu.bux's `moe` | 86.2k, 133.9 GiB | 74.2k | 91.5k (1.06x), 119.5 GiB | 95.0k (1.10x) |
+| experts of 2048, 8 layers, one GPU | 90.4k, 143.2 GiB | 75.6k | 101.7k (1.12x), 129.6 GiB | |
+| `ragged_all_to_all`, `capacity=1.25`, `expert=8`, 32k tokens a GPU: one_node.bux's `moe_ep` | 468k, 88.5 GiB | 417k | 517k (1.10x), 72.3 GiB | 539k (1.15x) |
+| | | | `dispatch=mxfp8`: 515k | |
+| `all_to_all`, `capacity=1.25`, `expert=8`, 32k tokens a GPU | 492k, 91.4 GiB | 449k | 539k (1.10x), 78.4 GiB | |
+| `sorted`, `fsdp=8`, 32k tokens a GPU: one_node.bux's `moe` | 671k, 83.9 GiB | 580k | 712k (1.06x), 69.4 GiB | 743k (1.11x) |
 
 Both MXFP8 kernels compute the same values: the runs' losses agree to the last digit
-logged, and with bfloat16's to the rounding between them. The experts' GEMMs take
-half of bfloat16's time, 3.0 ms a layer against 5.8, and the quantizer, which reads
-each operand once and writes it twice, most of what they save: an MoE layer's experts
-forward and backward take 6.1 ms against 7.3 in bfloat16, and 13.8 against 17.9 with
-experts of 2048 (`scripts/gpu_smoke/grouped_mxfp8.py`). It keeps x^T in MXFP8 for dW
-rather than x in bfloat16, so it takes 14 GiB less. It trains at bfloat16's loss: 98M
+logged, and with bfloat16's to the rounding between them; the two quantizers write
+the same bytes, and the memory is the same. The experts' GEMMs take half of
+bfloat16's time, 3.0 ms a layer against 5.8, and the quantizer 1.5 ms of what they
+save: an MoE layer's experts forward and backward take 5.0 ms against 7.3 in bfloat16
+(1.45x), and 11.8 against 19.7 with experts of 2048 (1.67x;
+`scripts/gpu_smoke/grouped_mxfp8.py`). It reads each operand once and writes it twice
+at 5.1 TB/s, k padded to whole tiles of 128 and the scales in tensor memory's tiles,
+so no pass of XLA lays them out after it. x^T's blocks run down x's columns, so that
+only its E4M3 bytes transpose, and it scales in x's dtype, by a power of two, exact.
+It took 2.2 ms a layer before, in float32, and XLA's pads and layouts 90 to 160 µs a
+call more: 6.1 ms a layer against 7.3. The experts keep x^T in MXFP8 for dW rather
+than x in bfloat16, so a run takes 14 GiB less. It trains at bfloat16's loss: 98M
 tokens of FineWeb-Edu end 0.13% and 0.05% below it, with FP8 dispatch
 (docs/training.md, "Precision").
 
