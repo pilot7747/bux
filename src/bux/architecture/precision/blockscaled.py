@@ -291,7 +291,8 @@ def _in_e4m3(
     """Return x's E4M3 values, and the biased exponents of their scales (E8M0's
     bits), in blocks of 32 along its `rows`, down its `columns` (x^T's, untransposed)
     or in 32 x 32 `tiles`. A block's scale is the least power of two that takes its
-    largest magnitude to at most 448."""
+    largest magnitude to at most 448: found in float32, and applied in x's dtype, in
+    which scaling by a power of two is as exact as in float32."""
     (r, c), b = x.shape, MX_BLOCK
     shape, axes = {
         "rows": ((r, c // b, b), 2),
@@ -299,8 +300,10 @@ def _in_e4m3(
         "tiles": ((r // b, b, c // b, b), (1, 3)),
     }[blocks]
     blocked = x.reshape(shape)
-    exponent = _ceil_log2(jnp.abs(blocked).max(axes) / E4M3_MAX)
-    scaled = blocked * jnp.expand_dims(_power_of_two(-exponent), axes)
+    largest = jnp.abs(blocked).max(axes).astype(jnp.float32)
+    exponent = _ceil_log2(largest / E4M3_MAX)
+    down = _power_of_two(-exponent).astype(x.dtype)
+    scaled = blocked * jnp.expand_dims(down, axes)
     values = jnp.clip(scaled, -E4M3_MAX, E4M3_MAX).astype(jnp.float8_e4m3fn)
     return values.reshape(r, c), (exponent + 127).astype(jnp.uint8)
 
@@ -342,10 +345,11 @@ def mx_unpacked(packed: UInt8[Array, "r e"], c: int) -> Blocks:
     return mx_from_bytes(packed[:, :c], packed[:, c:])
 
 
-# The kernel's tiles, of rows and of columns, largest first: 64 x 128 is the fastest
-# on a B300, 3.2 TB/s at an MLP's shapes, 1.4x 128 x 128.
+# The kernel's tiles, of rows and of columns, largest first, and its warps: 64 x 128
+# on 2 is the fastest on a B300, 4.3-4.7 TB/s at Qwen3-30B-A3B's projections, 1.3x
+# the same tiles on 4 warps scaling in float32.
 ROWS, COLUMNS = (64, 32), (128, 64, 32)
-WARPS = 4
+WARPS = 2
 # x's E4M3 values and exponents, then x^T's.
 MxArrays = tuple[
     Shaped[Array, "r c"], UInt8[Array, "r n"], UInt8[Array, "c r"], UInt8[Array, "c q"]
@@ -394,11 +398,11 @@ def _mx_quantize_tile(
     cols_ref: Any,
     col_exponents_ref: Any,
 ) -> None:
-    """Quantize a tile of x into its part of x's copy and of x^T's."""
-    tile = x_ref[...].astype(jnp.float32)
+    """Quantize a tile of x into its part of x's copy and of x^T's, in x's dtype."""
+    tile = x_ref[...]
     rows_ref[...], row_exponents_ref[...] = _in_e4m3(tile, "rows")
     values, exponents = _in_e4m3(tile, "columns")
-    # x^T's values transpose as bytes, a quarter of x's float32 tile.
+    # x^T's values transpose as bytes, half of x's bfloat16 tile.
     cols_ref[...] = as_bytes(values).T
     col_exponents_ref[...] = exponents.T
 

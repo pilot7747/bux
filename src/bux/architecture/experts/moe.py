@@ -128,7 +128,7 @@ class MoE(nnx.Module):
         balances the experts, and routes by random logits under `random_logits`.
         Scores and top-k are in float32, the weights in x's dtype."""
         config, n = self.config, self.config.num_experts
-        logits = self.router(x.astype(jnp.float32)) * config.router_logit_scale
+        logits = self._logits(x) * config.router_logit_scale
         if self.routing is not None and training(taps):
             logits = random_logits(logits, self.routing())
         match config.router:
@@ -152,6 +152,14 @@ class MoE(nnx.Module):
         scale = config.routed_scaling_factor
         weights, sinks = (w.astype(x.dtype) * scale for w in (weights, sinks))
         return idx, weights, sinks if sinks.shape[-1] else None
+
+    def _logits(self, x: Float[Array, "b t d"]) -> Float[Array, "b t s"]:
+        """Return the router's logits in float32: x times its kernel, both in x's
+        dtype, whose products float32 holds exactly. In bfloat16 the GEMM is one of
+        cuBLAS's: on a B300 0.03 ms for Qwen3-30B-A3B's 32k tokens, where float32
+        operands take 0.11. The backward multiplies in float32."""
+        kernel = self.router.kernel[...].astype(x.dtype)
+        return jnp.dot(x, kernel, preferred_element_type=jnp.float32)
 
     def _balance(
         self, scores: Float[Array, "b t E"], idx: Int[Array, "b t k"], taps: Taps
