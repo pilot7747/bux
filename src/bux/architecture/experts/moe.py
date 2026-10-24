@@ -30,7 +30,7 @@ from jaxtyping import Array, Bool, Float, Int, Key
 from bux import config as cfg
 from bux import parallel
 from bux.architecture.common.sharding import linear
-from bux.architecture.experts import grouped_blockscaled
+from bux.architecture.experts import grouped_blockscaled, grouped_glu
 from bux.architecture.experts.grouped import ragged_dot
 from bux.architecture.layers.mlp import MLP, activate
 from bux.architecture.layers.norm import Norm
@@ -414,6 +414,10 @@ def experts(
     `picked`, a format's quantizer reads it there; given the tokens its rows are
     `summed` into, it returns their sums."""
     recipe = grouped_blockscaled.RECIPES.get(experts_format())
+    passes = matmuls.in_force().passes
+    if norm is None and grouped_glu.runs(recipe, passes, ffn, up):
+        y = grouped_glu.mlp(x, sizes, weights, up, down, picked, summed)
+        return checkpoint_name(y, "experts")
     n, (e, d, f, p) = x.shape[0], up.shape
     up, down = up.reshape(e, d, f * p).astype(x.dtype), down.astype(x.dtype)
 
