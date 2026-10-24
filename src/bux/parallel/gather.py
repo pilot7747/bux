@@ -18,6 +18,7 @@ its own shard_map, made manual over those axes too (``apart``).
     splits               each parameter's split over them
     gather               a device's shard of a parameter, gathered whole
     scatter              a device's part of a gradient, summed over them, as a shard
+    added                a microbatch's gradients added into the step's sums
     own_streams          each device's own RNG keys, for its own rows' masks
     apart                says the step computes its rows apart, which a pipeline reads
 """
@@ -33,7 +34,7 @@ from flax import nnx
 from jax.sharding import Mesh
 from jax.sharding import PartitionSpec as P
 from jax.typing import DTypeLike
-from jaxtyping import Array, Float, Int, Shaped
+from jaxtyping import Array, Float, Int, PyTree, Shaped
 
 from bux.parallel.layout import as_split, axes, axes_of, partition
 from bux.parallel.mesh import active, manual_axes
@@ -115,6 +116,12 @@ def scatter(
             g = jax.lax.psum_scatter(g, along, scatter_dimension=dim, tiled=True)
     rest = tuple(a for a in over if a not in axes_of(spec))
     return (jax.lax.psum(g, rest) if rest else g).astype(dtype)
+
+
+def added(total: PyTree, part: PyTree) -> PyTree:
+    """Return `total` with `part` added, leaf by leaf, in `total`'s dtypes: a
+    microbatch's gradients or metrics added into the step's sums."""
+    return jax.tree.map(lambda a, b: a + b.astype(a.dtype), total, part)
 
 
 def _summable(g: Float[Array, "*s"]) -> Float[Array, "*s"]:

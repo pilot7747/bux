@@ -145,10 +145,6 @@ def _cast_params(params: nnx.State, dtype: DTypeLike) -> nnx.State:
     )
 
 
-def _add(total: Float[Array, "*s"], part: Float[Array, "*s"]) -> Float[Array, "*s"]:
-    return total + part.astype(total.dtype)
-
-
 def _by_spec(
     f: Callable[[P, Shaped[Array, "*s"]], Shaped[Array, "*w"]],
     specs: nnx.State,
@@ -568,7 +564,7 @@ class Trainer:
             grads, metrics, buffers = self._grads(
                 graphdef, params, buffers, microbatch, token_share, row_share=1 / rows
             )
-            return (jax.tree.map(_add, grad_sum, grads), buffers), metrics
+            return (parallel.gather.added(grad_sum, grads), buffers), metrics
 
         xs = (parallel.microbatches(batch, self.microbatches), token_shares)
         (grads, buffers), metrics = jax.lax.scan(add_microbatch, (zeros, buffers), xs)

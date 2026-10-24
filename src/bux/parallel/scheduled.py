@@ -383,8 +383,8 @@ class Ticks:
         metrics, d_others, dy = self.loss_gradients(at(self.rows, j), y)
         return held._replace(
             cotangents=put(held.cotangents, self.slot("cotangents", j), dy),
-            d_others=_added(held.d_others, d_others),
-            metrics=_added(held.metrics, metrics),
+            d_others=gather.added(held.d_others, d_others),
+            metrics=gather.added(held.metrics, metrics),
         )
 
     def backward(self, held: Held, j: Int[Array, ""]) -> Held:
@@ -412,7 +412,9 @@ class Ticks:
         """Take `dy` back to this stage's parameters and its input."""
         vjp = self._vjp(residuals)
         d_params, dx = vjp((dy, self._losses_cotangent()))
-        return held._replace(d_params=_added(held.d_params, d_params), to_previous=dx)
+        return held._replace(
+            d_params=gather.added(held.d_params, d_params), to_previous=dx
+        )
 
     def _input_backward(
         self, held: Held, j: Int[Array, ""], residuals: list[Leaf], dy: Stream
@@ -432,7 +434,7 @@ class Ticks:
         residuals = at(held.first_residuals, slot)
         vjp = jax_internals.rebuild_vjp(self.shapes.first, residuals, self.others)
         (d_others,) = vjp(dx)
-        return held._replace(d_others=_added(held.d_others, d_others))
+        return held._replace(d_others=gather.added(held.d_others, d_others))
 
     def weights(self, held: Held, j: Int[Array, ""]) -> Held:
         """Take microbatch `j`'s gradient on to this stage's weights, from what its
@@ -443,7 +445,7 @@ class Ticks:
         params = jax.tree.leaves(self.params)
         flat = self.split.weights(*params, *residuals, saved)
         d_params = jax.tree.unflatten(jax.tree.structure(self.params), flat)
-        return held._replace(d_params=_added(held.d_params, d_params))
+        return held._replace(d_params=gather.added(held.d_params, d_params))
 
     def _vjp(self, residuals: list[Leaf]) -> Vjp:
         """Return this stage's vjp, rebuilt from a slot's `residuals`."""
@@ -559,11 +561,6 @@ def _new_axes(tree: PyTree, n: int) -> PyTree:
     """Return each leaf of `tree` with `n` leading axes of 1, as a shard_map stacks
     what each device gives out."""
     return jax.tree.map(lambda a: a[(None,) * n], tree)
-
-
-def _added(total: PyTree, part: PyTree) -> PyTree:
-    """Add `part` to the float32 `total`, leaf by leaf."""
-    return jax.tree.map(lambda a, b: a + b.astype(a.dtype), total, part)
 
 
 def _merged(metrics: Metrics, more: Metrics) -> Metrics:
