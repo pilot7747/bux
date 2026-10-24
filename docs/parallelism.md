@@ -1388,10 +1388,14 @@ by `--build-arg TE_VERSION`).
 a `jax.custom_vjp` each way (`parallel/nccl_ep.py`); the experts take the rows as
 they arrive, their blocks padded to 128 as they are. NCCL EP keeps its buffers
 outside the step, sized for the most tokens a device sends at once, a chunk of its
-share of a step's (`methods.moe_chunks`), and for the rows `methods.capacity` lets it
-take, so `methods.prepare` starts it once a process before the step traces
-(`nccl_ep.start`): 25 to 60 s between two nodes. Every dispatch then brings that many
-rows, a microbatch's too: NCCL EP takes no fewer, and fails with "invalid argument"
+share of a microbatch's (`methods.moe_chunks`, `methods.microbatches`), and for the
+rows `methods.capacity` lets it take, so `methods.prepare` starts it once a process
+before the step traces (`nccl_ep.start`): 25 to 60 s between two nodes. An eval step,
+which takes a step's rows whole, sends them in pieces of that many, one after
+another. Sized by the step's tokens, megatron.bux's batch of 512 rows asked for a
+29 GiB staging buffer a GPU and did not start; by a microbatch's it trains at 32.2k
+tokens a second a GPU on 8 B300s (`remat=none`, 235 GiB). Every dispatch brings the
+rows it was started for: NCCL EP takes no fewer, and fails with "invalid argument"
 where they are fewer. Under a capacity,
 the picks that do not fit drop before NCCL EP sends them, as `ragged_all_to_all`
 drops them (`nccl_ep._kept`): with NCCL EP's own drops, EP=16's balance loss rose to

@@ -41,6 +41,7 @@ from bux.parallel.experts import (
     _arrivals,
     chunk_of,
     expert_parallel,
+    in_chunks,
     token_spec,
 )
 from bux.parallel.experts import _room as experts_room
@@ -149,12 +150,13 @@ def _size(axes: Axes) -> int:
 
 
 def _tokens_a_device(run: "ir.Run", ep: Axes) -> int:
-    """Return the most tokens a device sends at once: a chunk of its share of a step's
-    rows, whole, as an eval step takes them (``experts.chunk_of``); a training
-    microbatch's chunk sends no more."""
+    """Return the most tokens a device sends at once: a chunk of its share of a
+    microbatch's rows (``experts.chunk_of``). An eval step, which takes a step's rows
+    whole, sends them in pieces of that many (``nccl_ep``)."""
     t = run.train
-    shape = (t.batch, t.seq_len, run.arch.d_model)
-    return chunk_of(t.batch * t.seq_len // _size(axes_of(token_spec(shape, ep))))
+    rows = t.batch // t.methods.microbatches
+    shape = (rows, t.seq_len, run.arch.d_model)
+    return chunk_of(rows * t.seq_len // _size(axes_of(token_spec(shape, ep))))
 
 
 def _room(picks: int, local: int, peers: int) -> int:
@@ -191,6 +193,27 @@ def _bootstrap(axis: str, sizes: Started) -> None:
 
 
 def nccl_ep(
+    z: Float[Array, "b t d"],
+    idx: Int[Array, "b t k"],
+    weights: Float[Array, "b t k"],
+    kernels: Kernels,
+    **settings: object,
+) -> Combined:
+    """Return ``sent_once`` of a device's tokens, in as many pieces one after another
+    as NCCL EP was started for (``in_chunks``): an eval step's, a step's rows whole,
+    send more tokens than a training microbatch's."""
+    assert started is not None, "methods.prepare starts NCCL EP before a step traces"
+    tokens = z.size // z.shape[-1]
+    pieces = -(-tokens // started.tokens)
+    if tokens % pieces:
+        raise ValueError(
+            f"methods(moe=nccl_ep) sends {tokens} tokens of a device in pieces of at "
+            f"most {started.tokens}, which do not divide them"
+        )
+    return in_chunks(sent_once, pieces)(z, idx, weights, kernels, **settings)
+
+
+def sent_once(
     z: Float[Array, "b t d"],
     idx: Int[Array, "b t k"],
     weights: Float[Array, "b t k"],
