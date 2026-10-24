@@ -1,0 +1,14 @@
+# Qwen3-30B-A3B (Alibaba, 2025): 48 layers of GQA with a norm on queries and keys, and
+# an MoE of 128 experts of 768, the top 8 a token, with no shared expert. 30.5B
+# parameters, 3.3B of them active a token.
+d_model    = 2048
+vocab_size = 151936
+
+norm    = rmsnorm(eps=1e-6)
+attn    = gqa(num_heads=32, num_kv_heads=4, head_dim=128, qk_norm=norm,
+              rope=rope(base=1000000))
+experts = moe(num_experts=128, top_k=8, aux_loss_coef=1e-3,
+              expert=gated_mlp(intermediate_size=768, activation=swish))
+
+block = [norm attn] [norm experts]
+model = embed block^48 norm head

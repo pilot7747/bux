@@ -1,0 +1,22 @@
+# Qwen3-30B-A3B on a node of 8 GPUs, as Megatron-Bridge's performance summary
+# benchmarks it (26.06: 40,769 tokens a second a GPU on 8 B300s, MXFP8, EP=8, 8 rows
+# of 4096 a GPU): the matmuls in MXFP8, the experts sorted under FSDP, and split over
+# the GPUs by NCCL EP.
+#
+#   python scripts/benchmark.py run examples/benchmarks/megatron.bux --out new.json
+use qwen3_30b_a3b
+
+model   = sorted:  embed block^48 norm head
+        | nccl_ep: embed block^48 norm head
+mesh    = sorted:  mesh(fsdp=8)
+        | nccl_ep: mesh(expert=8)
+methods = sorted:  methods(moe=sorted)
+        | nccl_ep: methods(moe=nccl_ep, capacity=1.25)
+
+data      = synthetic
+optimizer = adamw(lr=3e-4)
+seq_len   = 4096
+batch     = 64
+steps     = 20
+log       = log(every=5)
+precision = precision(compute=bfloat16, matmuls=mxfp8)
