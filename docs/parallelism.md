@@ -950,15 +950,16 @@ peak memory:
 
 | run | before | after |
 |-----|--------|-------|
-| `sorted`, `fsdp=8`, `remat=none` | 30.6k, 250.4 GiB | 31.4k, 215.0 GiB |
-| `nccl_ep`, `expert=8`, capacity 1.25, `remat=save_attention` | 21.3k, 99.6 GiB | 22.9k, 98.3 GiB |
+| `sorted`, `fsdp=8`, `remat=none` | 31.1k, 250.4 GiB | 31.9k, 215.0 GiB |
+| `nccl_ep`, `expert=8`, capacity 1.25, `remat=save_attention` | 21.3k, 99.6 GiB | 22.8k, 98.3 GiB |
 | the same, `remat=none` | needs 266 GiB | 27.7k, 210.7 GiB |
 
 `sorted`'s step on GPU 0 took 1075 ms against 1098: the weights' d-wide multiply, its
 transpose and reduce, and the concatenations of up and gate and of their gradient are
 gone. With GEMM autotuning off, its losses agree to 5e-5 for three steps, then drift
 apart as two runs of random tokens do. Under `remat=auto` at JAX's default pool `sorted`
-now takes `dots_attention` (158.5 GiB) where it took `dots` (179 GiB).
+now takes `dots_attention` (158.5 GiB) where it took `dots` (179 GiB), and `nccl_ep`
+`dots` (187.4 GiB, 24.5k) where it took `save_attention` (21.7k).
 
 ### The experts in MXFP8
 
