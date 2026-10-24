@@ -1265,7 +1265,10 @@ bux sets `NCCL_GIN_TYPE=2` and `NCCL_EP_TOKENS_PER_CHUNK=256` where the environm
 does not (`runtime.configure`). It takes one MoE shape a run, the experts over one
 axis, and bfloat16: MXFP8 dispatch is an error, as is a run without TE.
 `tests/test_nccl_ep.py` runs a token's path on CPU through an emulation of TE's
-primitives, against `sorted`, and under a capacity against `ragged_all_to_all`.
+primitives, against `sorted`, and under a capacity against `ragged_all_to_all`; on 16
+GPUs of two nodes, EP=16, a layer's output and gradients come within bfloat16's
+rounding (4e-3 to 8e-3 of the largest) of `sorted`'s dropless, and of
+`ragged_all_to_all`'s at a capacity of 1.
 
 The baseline's MoE at 32k tokens a GPU, a capacity of 1.25, by `scripts/benchmark.py`
 (`one_node.bux` and `two_nodes.bux`, their `moe` and `moe_ep`, the rest set as below):
