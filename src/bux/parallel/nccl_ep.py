@@ -1,6 +1,6 @@
 """`methods(moe=nccl_ep)`: expert parallelism by NCCL EP, a DeepEP of NCCL's device
 API, through TransformerEngine's JAX bindings, on GPUs only (docs/parallelism.md,
-"TransformerEngine's NCCL EP"; the Docker image has them with `--build-arg TE=2.20.2`).
+"TransformerEngine's NCCL EP"; the Docker image has them).
 
 A token's path, as in ``experts.ragged_tokens``: it goes once to each device that
 holds any of its experts (and over InfiniBand once to each other node, whose NVLink
@@ -61,8 +61,8 @@ def transformer_engine() -> ModuleType:
         from transformer_engine.jax.cpp_extensions import ep
     except ImportError as e:
         raise RuntimeError(
-            "methods(moe=nccl_ep) needs TransformerEngine's JAX bindings, on GPUs: "
-            "docker build --build-arg TE=2.20.2 (docs/parallelism.md)"
+            "methods(moe=nccl_ep) needs TransformerEngine's JAX bindings, on GPUs, "
+            "which bux's Docker image has (docs/parallelism.md)"
         ) from e
     return ep
 

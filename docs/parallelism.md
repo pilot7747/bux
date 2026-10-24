@@ -1281,8 +1281,8 @@ the GPU starts (NCCL's GIN) between nodes, no NVSHMEM. A token goes once to each
 that holds any of its experts, as in `ragged_tokens`, and once to each other node,
 whose NVLink takes it on; it arrives as a row for each of its picks there, grouped by
 expert, each expert's rows padded to 128. Since 2.20 one process drives all its
-node's GPUs, on a communicator TE borrows from XLA. The Docker image has it with
-`--build-arg TE=2.20.2`.
+node's GPUs, on a communicator TE borrows from XLA. The Docker image has it (2.20.2,
+by `--build-arg TE_VERSION`).
 
 `nccl_ep` runs TE's one-device primitives in the shard_map the other methods run in,
 a `jax.custom_vjp` each way (`parallel/nccl_ep.py`); the experts take the rows as

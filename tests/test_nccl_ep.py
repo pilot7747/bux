@@ -43,7 +43,10 @@ def test_a_run_by_it_starts_it_before_its_step_traces():
 
 
 def test_without_transformer_engine_it_says_how_to_get_it():
-    with _use({"data": 2, "expert": 4}), pytest.raises(RuntimeError, match="TE=2.20.2"):
+    with (
+        _use({"data": 2, "expert": 4}),
+        pytest.raises(RuntimeError, match="Docker image has"),
+    ):
         nccl_ep.start(_run())
 
 
