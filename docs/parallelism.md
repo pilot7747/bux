@@ -773,6 +773,8 @@ backward pass at 8 × 4096 tokens of 16 heads of 128, on a B300, and what it kee
 | `states=keep` | 11.6 ms, 6.51 GiB | 28.9 ms, 7.26 GiB |
 | `states=recompute` | 14.9 ms, 0.50 GiB | 33.6 ms, 0.75 GiB |
 | by its kernel (KDA bounded at -5) | 2.5 ms | 2.9 ms |
+| by bux's kernels, any gate, `keep` | | 11.1 ms, 1.69 GiB |
+| by bux's kernels, any gate, `recompute` | | 14.2 ms, 0.63 GiB |
 
 A GLA hybrid (`"GGGA"^4`), which runs by chunks alone, trains at 84.4k tokens a second
 in 83.5 GiB with `keep`, and at 77.1k in 66.8 GiB with `recompute`; that fits 32 rows
@@ -805,10 +807,24 @@ cudnn-frontend gives it no JAX call, so a `buffer_callback` runs cuDNN's graph o
 XLA's stream, one device at a time. A decay per channel (KDA) runs by Frost's KDA
 kernel where `gate_lower_bound` bounds it at -5 or above. That kernel factors each
 decay through the start of a tile of 16 positions, so it loses precision where a tile
-decays a channel by exp(-86), and overflows at exp(-90). Unbounded, KDA runs by
-`chunkwise`: within 12 steps of bux's start, its gates are that steep in 30 to 90% of
-the (row, head) pairs of most layers, and a check that fell back from the kernel to
-the chunks left the GPU idle 12 ms a layer, on top of the chunks' 28.
+decays a channel by exp(-86), and overflows at exp(-90): within 12 steps of bux's
+start, unbounded gates are that steep in 30 to 90% of the (row, head) pairs of most
+layers.
+
+Unbounded, on any GPU, KDA runs by bux's own Pallas kernels (`pallas_delta`), exact at
+any gate. They take each pair's decay `exp(G_t - G_s)` through a position `r` between
+the two, `exp(G_t - G_r) exp(G_r - G_s)`, both factors at most 1, as a matmul: for
+blocks of 16 positions `i > j` of a chunk of 64, `r` is the end of block `j`; within a
+block, the end of the first half of the 8, 4, 2 or 1 positions the pair spans. The
+state passes from chunk to chunk in the WY form, and documents start it again, so a
+row holds any number of them. The backward pass takes the gradients by hand, a few
+blocks at a time; with `methods(states=keep)`, the default, it keeps each chunk's
+parts and the state before it from the forward pass, and with `recompute` only the
+inputs, running the forward kernels again. On a B300, at 2 × 4096 tokens in packed
+documents, with random gates down to -20 a position, spikes of -10⁴ and KDA's own
+gate as it starts, the outputs and every gradient are within 4·10⁻³ of the scan's
+over positions (as a share of each one's norm), where the chunks in float32 are
+within 1.3·10⁻³: the kernels keep the parts and states in bfloat16.
 `scripts/gpu_smoke/recurrence.py` checks the forms, and Mamba-2's recomputed, against
 their scans on a GPU, whose fusions the CPU tests do not see (on a B300 one took
 Mamba-2's gradients for B and C wrong, which a plain matmul in its place does not),
