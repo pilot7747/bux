@@ -18,7 +18,7 @@ from bux.architecture import Model, MoE, Scanned
 from bux.architecture.precision import matmuls
 from bux.architecture.repeats import pipelined, tracing
 from bux.lang import compile, compile_runs
-from bux.parallel import pipeline, schedule, scheduled, split
+from bux.parallel import pipeline, schedule, split
 from bux.train import stages
 from bux.train.data import plain
 from bux.train.objective import Objective, objective
@@ -187,8 +187,8 @@ def test_a_split_backward_takes_the_whole_ones_gradients_and_each_matmul_once(
             d_params, dx = vjp_of(d)
             return [*jax.tree.leaves(d_params), dx]
 
-        b_only = [scheduled.stand_in(a) for a in [*residuals, dy]]
-        shared = [scheduled.stand_in(a) for a in flat]
+        b_only = pipeline.stand_ins([*residuals, dy])
+        shared = pipeline.stand_ins(flat)
         two = split.split(backward, shared, b_only, weight_grads=len(flat))
         (dx,), saved = two.inputs(*flat, *residuals, dy)
         got = [*two.weights(*flat, saved), dx]

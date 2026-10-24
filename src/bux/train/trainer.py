@@ -75,11 +75,7 @@ def cast[M: nnx.Module](model: M, dtype: DTypeLike) -> M:
     runs (``Scanned.compute``)."""
     stacked = nnx.All(nnx.Param, scanned_variables(model))
     graphdef, kept, params, buffers = nnx.split(model, stacked, nnx.Param, ...)
-    params = jax.tree.map(
-        lambda x: x.astype(dtype) if jnp.issubdtype(x.dtype, jnp.floating) else x,
-        params,
-    )
-    copy = nnx.merge(graphdef, kept, params, buffers)
+    copy = nnx.merge(graphdef, kept, _cast_params(params, dtype), buffers)
     for _, node in nnx.iter_graph(copy):
         if isinstance(node, Scanned):
             node.compute = jnp.dtype(dtype)
@@ -139,6 +135,7 @@ def _shard_state(state: nnx.State) -> nnx.State:
 
 
 def _cast_params(params: nnx.State, dtype: DTypeLike) -> nnx.State:
+    """Return `params` with their floating-point arrays in `dtype`."""
     return jax.tree.map(
         lambda x: x.astype(dtype) if jnp.issubdtype(x.dtype, jnp.floating) else x,
         params,
@@ -188,9 +185,7 @@ class _Cut:
             model, nnx.All(nnx.Param, self._inside), self._inside, nnx.Param, ...
         )
         self.graphdef, self.piped, self.rest, self.others, self.kept = split
-        self.stand_ins = jax.tree.map(
-            parallel.scheduled.stand_in, (self.piped, self.rest)
-        )
+        self.stand_ins = parallel.pipeline.stand_ins((self.piped, self.rest))
         graphdef = nnx.graphdef(scanned.layers)
         self.stage = pipelined.Stage.of(graphdef, scanned.times, True, None)
 
@@ -206,7 +201,7 @@ class _Cut:
     def joined(self, layers: nnx.State, outside: nnx.State) -> nnx.State:
         """Return the model's state from the repeat's `layers`, by (rounds, layers,
         ...), and the rest of the model's."""
-        inner = jax.tree.map(lambda a: a[0], layers)
+        inner = parallel.pipeline.first(layers)  # of the one round
         return nnx.merge_state(_prefixed((*self.path, "layers"), inner), outside)
 
     def parts(self) -> "parallel.scheduled.Parts":
