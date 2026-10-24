@@ -173,9 +173,10 @@ class _Cut:
     (``parts``). The cut model holds stand-ins for the repeat's variables, which it
     does not run (``pipelined.stream_into``, ``pipelined.leaving``)."""
 
-    def __init__(self, model: Model, objective: Objective, rows: int):
+    def __init__(self, model: Model, objective: Objective, all_microbatches: int):
         self.path, scanned = pipelined_repeat(model)
-        self.objective, self.rows = objective, rows  # the microbatches of every device
+        self.objective = objective
+        self.all_microbatches = all_microbatches  # of every device
         _check_outside(model, self._inside)
         split = nnx.split(
             model, nnx.All(nnx.Param, self._inside), self._inside, nnx.Param, ...
@@ -234,9 +235,9 @@ class _Cut:
             heads, aux_losses = training_forward(self.model(others, kept), rows.batch)
         per_token, per_row = self.objective(heads, rows.batch, aux_losses)
         share = rows.shares.sum()
-        loss = share * per_token.loss + per_row.loss / self.rows
+        loss = share * per_token.loss + per_row.loss / self.all_microbatches
         metrics = _scaled(per_token.metrics, share)
-        return loss, metrics | _scaled(per_row.metrics, 1 / self.rows)
+        return loss, metrics | _scaled(per_row.metrics, 1 / self.all_microbatches)
 
 
 def _check_outside(model: nnx.Module, inside: Callable[[tuple, object], bool]) -> None:
@@ -461,7 +462,7 @@ class Trainer:
         apart = parallel.gather.rows() if self.reduces_once else ()
         model = nnx.merge(graphdef, self._gathered(params), buffers)
         model.set_attributes(update_at_step_end=True, raise_if_not_found=False)
-        cut = _Cut(model, self.objective, rows=n * _size(apart))
+        cut = _Cut(model, self.objective, all_microbatches=n * _size(apart))
         shares = parallel.microbatches(_row_shares(batch), n)
         rows = _Micro(parallel.microbatches(batch, n), shares)
         tokens = jnp.asarray(batch.input_ids)
@@ -506,7 +507,7 @@ class Trainer:
         sums reduce once, in `reduce`, each device keeping its shards."""
         over = parallel.gather.rows()
         splits = parallel.gather.splits(params, over)
-        rows = self.microbatches * _size(over)
+        all_microbatches = self.microbatches * _size(over)
 
         def gathered(spec: P, x: Shaped[Array, "*s"]) -> Shaped[Array, "*w"]:
             return parallel.gather.gather(spec, x.astype(self.compute))
@@ -525,7 +526,7 @@ class Trainer:
             shares = token_shares(batch, self.microbatches, over)
             own = parallel.gather.own_streams(buffers, over)
             grads, metrics, after = self._accumulate(
-                graphdef, whole, own, batch, zeros, shares, rows
+                graphdef, whole, own, batch, zeros, shares, all_microbatches
             )
             grads = _by_spec(reduced, splits, grads)
             after = parallel.gather.keys_of(buffers, after)
@@ -547,12 +548,13 @@ class Trainer:
         batch: Batch,
         zeros: nnx.State,
         token_shares: Float[Array, " n"],
-        rows: int,
+        all_microbatches: int,
     ) -> tuple[nnx.State, Metrics, nnx.State]:
         """Sum `_grads` over the microbatches of `batch` in a scan, into `zeros`, each
         one's per-token part scaled by its share of the batch's targets and its
-        per-row part by 1 / `rows`, the microbatches of every device: so the sums are
+        per-row part by 1 / `all_microbatches`, of every device: so the sums are
         the batch's, even when microbatches have unequal numbers of targets."""
+        row_share = 1 / all_microbatches
 
         def add_microbatch(
             carry: tuple[nnx.State, nnx.State],
@@ -561,7 +563,7 @@ class Trainer:
             grad_sum, buffers = carry
             microbatch, token_share = xs
             grads, metrics, buffers = self._grads(
-                graphdef, params, buffers, microbatch, token_share, row_share=1 / rows
+                graphdef, params, buffers, microbatch, token_share, row_share
             )
             return (parallel.gather.added(grad_sum, grads), buffers), metrics
 
