@@ -436,7 +436,7 @@ by itself where it cannot run, and all of them do inside `bux.kernels.off()` or 
 | softmax attention | `methods.attention = auto`, the default: cuDNN's fused attention in rows of 8192 or more and with a window, else tokamax's flash attention (sinks, a soft cap) | 7x, and no t × t logits |
 | sparse attention (DSA, QSA, CSA) | `sparse`: tokamax's flash attention with the kept keys as a mask; the indexer's scores by a Pallas kernel (`scoring`), its top-k by counting | 2.6x a chunk of queries at a time, and no t × t floats |
 | linear attention, RWKV-7 | `chunkwise`: chunks of 64 positions, the state across them by a Pallas kernel (`affine_scan`); `methods(states=recompute)` keeps a fourteenth of the memory for the backward | 14-17x a scan over positions |
-| Mamba-2 | `chunkwise`, B and C a group's, the state across chunks by a matmul | 25x a scan over positions (2 × 4096 tokens, rematerialized: at 8 × 4096 the scan needs 199 GiB) |
+| Mamba-2 | `chunkwise`, B and C a group's, the state across chunks by a matmul; `methods(states=recompute)` keeps a sixteenth of the memory for the backward | 25x a scan over positions (2 × 4096 tokens, rematerialized: at 8 × 4096 the scan needs 199 GiB) |
 | Gated DeltaNet, DeltaNet | cuDNN's fused GDN kernel (`fused_delta`), by cuDNN's graph from a `buffer_callback`: any gate | 5x `chunkwise` |
 | KDA with `gate_lower_bound` | cuDNN's fused KDA kernel (`fused_delta`) | 10x `chunkwise` |
 | MoE experts | `grouped.ragged_dot`: tokamax's Mosaic and Triton kernels | 27x `jax.lax.ragged_dot` |
@@ -793,8 +793,9 @@ with a folder of its own, twenty minutes before it timed out.
 and its kin in `baseline.bux`: `one_gpu.bux`, the dense model, its GDN, KDA, bounded
 KDA and Mamba-2 hybrids, its MoE, and the dense one in MXFP8 and NVFP4, a GPU each;
 `one_node.bux`, FSDP at 1 and 8 microbatches, the MoE sorted and by EP, TP=8 in
-chunks and a 1f1b pipeline, on 8 GPUs; and `two_nodes.bux`, FSDP, HSDP and the MoE
-both ways, on 16. `scripts/benchmark.py` trains a suite and compares two results:
+chunks and a 1f1b pipeline, on 8 GPUs; and `two_nodes.bux`, FSDP, HSDP, the GDN
+hybrid under HSDP and the MoE both ways, on 16. `scripts/benchmark.py` trains a suite
+and compares two results:
 
 ```
 python scripts/benchmark.py run examples/benchmarks/one_gpu.bux --out new.json
@@ -844,10 +845,11 @@ one_gpu[nvfp4]     182,654    183,500  +0.5%    56.4%     43.8     43.8    -0.00
 the last log. The node's suite, one tree after the other, moved by 0.3% at most: FSDP
 1.13M, at 8 microbatches 923k, the MoE sorted 832k and by EP 540k, TP 227k and the
 pipeline 683k; the two nodes' by 1.7%: FSDP and HSDP 2.21M, the MoE sorted 1.58M and
-by EP 1.04M. A run is `slower` or `faster` when its tokens a second move by more
-than `--noise` (3%), `more memory` or `less memory` when its peak does, `loss` when
-its last loss moves by more than `--loss` (0.05), and `failed`; `compare` exits with 1
-if any run is flagged but `faster` or `less memory`.
+by EP 1.04M (and the GDN hybrid, measured once, 1.60M). A run is `slower` or `faster`
+when its tokens a second move by more than `--noise` (3%), `more memory` or `less
+memory` when its peak does, `loss` when its last loss moves by more than `--loss`
+(0.05), and `failed`; `compare` exits with 1 if any run is flagged but `faster` or
+`less memory`.
 
 XLA's GEMM autotuner picks kernels by timing them, and some kernels add in no fixed
 order, so two runs of one tree round differently: on these random tokens the MoE,
