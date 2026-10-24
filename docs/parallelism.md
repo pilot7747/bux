@@ -2115,7 +2115,9 @@ W and dy, each twice.
 ### Microbatches
 
 `methods.microbatches = n` takes each step's batch in n microbatches: a `lax.scan`
-over them inside the train step, their gradients summed in float32, and one update.
+over them inside the train step, their gradients summed in float32, and one update;
+with `interleave`, each one's forward beside the one before's backward
+([below](#side-by-side-methodsinterleave)).
 Microbatch i is rows i, i + n, i + 2n and so on (`parallel.microbatches`), so that
 every device's rows split evenly among them and none moves. `batch` must split into n
 microbatches whose rows split over the batch axes, which `parallel.check` says before
@@ -2253,6 +2255,105 @@ The cost is memory: the gathered copy of the parameters in `compute`, and, unred
 a float32 sum of every parameter's gradient on each device, held through the step.
 `layout(zero=1)` keeps the parameters whole between steps too; with `gather=step` it
 saves no collective, and holds float32 copies where the step holds `compute`'s.
+
+### Side by side: `methods.interleave`
+
+```
+methods = methods(microbatches=8, interleave=true)
+```
+
+In a row, each of a microbatch's collectives waits on the compute just before it, and
+what the layer's data flow leaves nothing beside stays exposed: FSDP's gathers, TP's
+reductions, EP's exchanges. With `interleave`, each microbatch's forward runs beside
+the backward of the one before, a piece of the model at a time, as Megatron's
+combined 1F1B does without a pipeline (`bux.train.interleave`):
+
+```
+forward of microbatch 0
+a lax.scan, for i in 0 .. n-2:
+    tick t, for t in 0 .. r-1:  piece t's forward of i+1,  piece r-1-t's backward of i
+    the head's loss of i+1, and its gradient
+backward of microbatch n-1
+```
+
+The pieces are the items of the model's graph in a row, each pass of an unrolled
+repeat one of its own (`embed`, 48 blocks, `norm`, and the head, whose forward ends
+in the loss); a scanned repeat is one piece. A piece's forward is a `jax.vjp`, which
+keeps what the backward reads but what elementwise ops make, as a scanned pass does
+(`remat.unfused`), where the run's `remat` keeps everything. The scan carries each
+piece's residuals, as leaves of their own, to its backward in the next iteration.
+Each tick ends in an optimization barrier on the stream, its gradient and the
+gradients of the tick before, so that XLA's scheduler puts one half's collectives
+beside the other half's compute, reduces a tick's gradients beside the next, and
+runs no tick early; XLA:GPU keeps the barriers until it has scheduled the step. The
+gradients, the metrics, the router's bias and the RNG streams are the loop's
+(`tests/test_interleave.py`, on FSDP, EP and TP layouts, to float32's rounding:
+XLA:CPU rounds a microbatch inside a loop to other bits than outside one).
+
+A carried leaf is written where it was read. A top piece's residuals are read by the
+backward of the microbatch before at a tick before its forward makes the new ones, so
+XLA writes them in place; a bottom piece's new ones are made before the old ones are
+read, so XLA keeps them aside and copies them in at the loop's end. That is a copy of
+half a microbatch's residuals, and the peak holds them beside the other half: on
+megatron.bux's 12-layer cut, 25 GiB more than the loop. Slots of one buffer that
+each forward takes from the backward before it (a residual put in by a
+dynamic-update-slice and taken out by a dynamic slice) hold one microbatch's, but
+XLA copies every residual a kernel made into its slot, and out again where a kernel
+reads it: 160 ms of a step of 12 of those layers in 4 microbatches, which takes 1050
+in a row, and cuBLAS chose slower GEMMs for TP's slices. XLA's dynamic-slice fusion,
+with offsets from a table
+(`--xla_gpu_experimental_enable_dynamic_slice_table_offsets=true`), makes the same
+copies as memcpys. With no carry at all, the ticks of every microbatch unrolled in the
+step, nothing is copied, but the program is n times the loop's, and XLA held 176 GiB
+for the 12 layers in 8 microbatches (124.6k tokens a second a GPU, the loop 126.7k).
+
+On 8 B300s it hides NCCL EP's exchange behind the other microbatch's compute, but
+elsewhere its copies cost more than it hides, and a model that fills a GPU in a row
+does not fit: it is off by default. Tokens a second a GPU and the peak, the loop and
+interleave side by side on a node:
+
+| run | in a row | interleaved |
+|-----|----------|-------------|
+| `megatron.bux`'s `nccl_ep`, `moe_stream=true`, 12 layers, 8 microbatches of 8 rows a GPU | 115.6k, 63.7 GiB | **120.3k**, 93.1 GiB |
+| the same, NCCL EP on the compute stream | 115.7k, 64.5 GiB | 112.3k, 87.0 GiB |
+| its `sorted`, 12 layers, 8 microbatches | 123.8k, 62.0 GiB | 118.0k, 87.5 GiB |
+| `one_node.bux`'s `tp` (`repeat=unroll`, `remat=none`), 16 rows in 4 microbatches | 33.2k, 18.0 GiB | 33.5k, 19.3 GiB |
+| the same, two collectives in flight | | 34.0k, 18.1 GiB |
+| its `fsdp`, the dense 1.3B at a row a GPU a microbatch, 32 rows in 4 | 111.2k, 11.5 GiB | 93.1k, 12.6 GiB |
+
+With `moe_stream`, NCCL EP's calls run on a stream of their own, started as early as
+their inputs allow and waited for as late as their results are needed
+([On a stream of its own](#on-a-stream-of-its-own-methodsmoe_stream)), and the other
+microbatch's piece gives the scheduler compute to put beside them: at 4 microbatches
+of the 12 layers, GPU 0's step takes 1111 ms against 1152 in a row, its collectives
+199 ms beside compute and 277 exposed, from 30 and 360, though the bottom half's
+copies add 38 ms. In a row, `moe_stream` gains nothing, as no compute is left beside
+the exchange. All 48 layers at Megatron's batch, which the loop trains at 33.7-34.1k
+in 234 GiB (`remat=none`), do not fit interleaved at `remat=none` (291 GiB) or at
+`dots_attention`; at `save_attention` they train at 30.7k in 193.4 GiB, against the
+loop's 29.5k in 203.8 GiB there: interleave's gain, but not its rematerialization's
+cost.
+
+The overlap is real but small on a node: TP's step on GPU 0 left 39 ms of its
+collectives exposed, from 47, and unrolled 35, at 35.3k a GPU against the loop's
+34.1k; the MoE's FSDP gathers took 50 ms less of a step, which slower reduce-scatters
+gave back. With the parameters gathered once a step (`gather=step`), the dense FSDP
+run has only each microbatch's reduce-scatters to hide, and the bottom half's copies
+cost more. Tied a tick at a time, the halves beat XLA's own order: in slots, with the
+barrier on the slots and the gradients alone, so that each half's chain runs as XLA
+likes, TP trained at 31.2k in 24.9 GiB, against 32.2k tied, and the MoE at 104.6k in
+93.8 GiB, against 107.3k. XLA runs one collective at a time
+(`xla_gpu_experimental_parallel_collective_overlap_limit`); at 2, interleave gains,
+and the MoE's loop loses 4.5%. Nor does `sorted`'s 48-layer arm at Megatron's batch,
+which the loop trains at 35.8k in 230 GiB, fit interleaved: in slots it asked for 261
+GiB, and the carry holds half a microbatch more.
+
+Each of NCCL EP's backward calls prepares its own route from the picks the forward
+saved, so two microbatches' calls run in any order and every run above trains to the
+loop's losses. A model whose items pass each other more than the stream (a tap, an
+MTP head) is an error that says so, and so is a pipeline, which schedules its own
+microbatches. The step's program is about twice the loop's, a forward and a backward
+on each side of the loop, and compiles in about twice the time.
 
 ### Memory and losses
 
