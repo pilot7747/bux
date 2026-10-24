@@ -795,8 +795,10 @@ with a folder of its own, twenty minutes before it timed out.
 and its kin in `baseline.bux`: `one_gpu.bux`, the dense model, its GDN, KDA, bounded
 KDA and Mamba-2 hybrids, its MoE, and the dense one in MXFP8 and NVFP4, a GPU each;
 `one_node.bux`, FSDP at 1 and 8 microbatches, the MoE sorted and by EP, TP=8 in
-chunks and a 1f1b pipeline, on 8 GPUs; and `two_nodes.bux`, FSDP, HSDP, the GDN
-hybrid under HSDP and the MoE both ways, on 16. `scripts/benchmark.py` trains a suite
+chunks and a 1f1b pipeline, on 8 GPUs; `two_nodes.bux`, FSDP, HSDP, the GDN
+hybrid under HSDP and the MoE both ways, on 16; and `four_nodes.bux`, FSDP, HSDP, the
+MoE both ways and a pipeline of a stage a node, on 32 ([Four nodes and
+eight](parallelism.md#four-nodes-and-eight)). `scripts/benchmark.py` trains a suite
 and compares two results:
 
 ```

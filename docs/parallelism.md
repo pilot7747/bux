@@ -166,6 +166,39 @@ JAX_COMPILATION_CACHE_DIR=/shared/bux-cache \
     bux launch bench.bux 'mesh = mesh(data=2, fsdp=8)' --out /shared/runs
 ```
 
+### Four nodes and eight
+
+`examples/benchmarks/four_nodes.bux` trains the baseline on 32 GPUs of four nodes, 8
+rows of 4096 a GPU; on eight nodes the same runs took 64 GPUs and 512 rows. A GPU's
+rate is against one node's: the one-node suite's on each of four of the nodes alone,
+their mean (they spread by 4.5%). The launch is from its start to the fifth step, with
+the cache on a filesystem every node mounts, empty and then full:
+
+| run                    | mesh                      | GPUs | tok/s  | a GPU  | of one node's | launch, cold / warm |
+|------------------------|---------------------------|------|--------|--------|---------------|---------------------|
+| dense, FSDP            | `fsdp=8`                  | 8    | 1,123k | 140.4k |               | 75 s                |
+|                        | `fsdp=32`                 | 32   | 4,235k | 132.3k | 94.3%         | 74 s / 41 s         |
+|                        | `fsdp=64`                 | 64   | 7,820k | 122.2k | 87.0%         | 73 s                |
+| dense, HSDP            | `data=4, fsdp=8`          | 32   | 4,371k | 136.6k | 97.3%         | 74 s / 40 s         |
+|                        | `data=8, fsdp=8`          | 64   | 8,664k | 135.4k | 96.4%         | 77 s                |
+| MoE, sorted under HSDP | `fsdp=8`                  | 8    | 822k   | 102.7k |               | 98 s                |
+|                        | `data=4, fsdp=8`          | 32   | 3,046k | 95.2k  | 92.7%         | 105 s / 57 s        |
+|                        | `data=8, fsdp=8`          | 64   | 5,942k | 92.8k  | 90.4%         | 112 s               |
+| MoE, EP within a node  | `expert=8`                | 8    | 544k   | 68.0k  |               | 108 s               |
+|                        | `data=4, expert=8`        | 32   | 1,989k | 62.2k  | 91.4%         | 117 s / 65 s        |
+|                        | `data=8, expert=8`        | 64   | 3,932k | 61.4k  | 90.3%         | 116 s               |
+| dense, 1f1b            | `stage=4, fsdp=8`         | 32   | 2,438k | 76.2k  | 54.3%         | 68 s / 36 s         |
+|                        | `stage=4, data=2, fsdp=8` | 64   | 4,892k | 76.4k  | 54.4%         | 73 s                |
+
+HSDP gathers and reduces a parameter within a node, and adds up its gradient across
+the nodes once a step, so it keeps 96-97% of a node's rate on four nodes and on eight.
+FSDP over all the GPUs gathers every layer across the nodes, forward and backward, and
+loses more as they grow: 98% of a node's rate on two, 94% on four, 87% on eight. The
+MoE keeps 90-93% either way. A pipeline of a stage a node, here against one node's
+FSDP, keeps its rate a GPU on eight nodes, as two copies of it
+([Stages](#stages-methodsstages)). Warm, every process loads every program from the
+cache, and the launch takes half as long.
+
 ## Names
 
 A layer names the dimensions of a parameter where it makes it, and the layout says
@@ -2144,6 +2177,23 @@ On 8 stages, 8 microbatches barely fill the pipeline, whose stages idle 7 ticks 
 15: the slowest stage is in fewer ticks than the stages around it, and the even split
 is 4% faster there. With more microbatches the balanced split pays again: at 16,
 364k against even stages' 358k and gpipe's 346k; at 32, 396k against 373k and 356k.
+
+Across nodes, a stage a node: the four-node suite's pipelines, `stage=4, fsdp=8` on 32
+GPUs in 16 microbatches of 2 rows a GPU, against none on the same GPUs:
+
+| `methods`                                     | tok/s  | a GPU  | peak     |
+|-----------------------------------------------|--------|--------|----------|
+| `pipeline="gpipe"`, even                      | 1,865k | 58.3k  | 59.0 GiB |
+| `1f1b`, `stages=[4, 4, 4, 4]`                 | 1,962k | 61.3k  | 21.1 GiB |
+| `1f1b`, `stages=[5, 4, 4, 3]`                 | 2,003k | 62.6k  | 29.4 GiB |
+| `1f1b`, balanced, `[5, 5, 5, 1]`: the default | 2,438k | 76.2k  | 28.4 GiB |
+| no pipeline, `fsdp=32`                        | 4,235k | 132.3k | 37.6 GiB |
+
+The balanced split is 24% faster than even stages, as on one node (21%). A GPU of the
+pipeline trains at 76k tokens a second on four nodes and on eight, as on one node's
+`stage=4, fsdp=2` (75k): the sends between the nodes cost nothing that shows. What a
+pipeline loses against FSDP, 42% here and 47% on one node, is in its bubble, 3 ticks of
+19 idle, and in its microbatches' GEMMs, of 2 rows a GPU.
 
 ### Later: DualPipe
 

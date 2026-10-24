@@ -181,6 +181,27 @@ a source reads any rows alone, and in a job of many processes each reads only th
 of a batch that its devices hold
 ([Many nodes](parallelism.md#many-nodes)).
 
+A prepared dataset is read a row group at a time, about a million tokens, 256 rows of
+4096, and a `tokens` source a window at a time. On four nodes of 8 B300s, `fsdp=32` at
+256 rows a batch, each process read its 64 rows of a batch, on the thread that loads
+batches ahead, in:
+
+| source                                    | rows a process           | a batch    |
+|-------------------------------------------|--------------------------|------------|
+| FineWeb-Edu's first sample shard, packed  | 64 of 256, on four nodes | 11-19 ms   |
+|                                           | 256 of 256, on one       | 15 ms      |
+|                                           | 64 of 64, on one         | 1.6 ms     |
+| `tokens`, 4 shards of 1 TiB: 1.1T tokens  | 64 of 256, on four nodes | 5-6 ms     |
+|                                           | 64 of 64, on one         | 2.6-4.4 ms |
+
+A process reads the one or two row groups that hold its rows, so its 64 rows of 256
+cost what the whole batch does on one node, where at 64 rows a batch a group serves
+four batches. That does not grow with the nodes, and it is a few percent of a step,
+0.24 s. Reading added 0.1-0.3 GB to a process's memory, where the windows'
+permutation alone would take 2 GiB. The batches on the devices were, bit for bit,
+those one process reads whole, and the first step's loss on four nodes was one node's
+to the bit.
+
 ## Design notes
 
 **Offline, once.** Packing well needs to see many documents at once, which is cheap
