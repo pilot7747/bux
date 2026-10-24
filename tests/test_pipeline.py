@@ -435,7 +435,7 @@ def test_a_pipeline_resumes_on_the_stages_its_run_balanced(tmp_path):
     wide = LLAMA.replace("vocab_size = 128", "vocab_size = 4096")  # a head of 4 blocks
 
     def run(split: str | None):
-        how = _how(4, '"1f1b"', **({"stages": split} if split else {}))
+        how = _how(4, '"1f1b"', stages=split) if split else _how(4, '"1f1b"')
         every = "checkpoint = checkpoint(every=2)"
         mesh = "mesh(stage=2, data=1)"
         [r] = compile_runs(f"{wide}\n{TRAIN}\nmesh = {mesh}\nmethods = {how}\n{every}")
