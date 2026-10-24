@@ -67,7 +67,7 @@ def _work(run: ir.Run) -> tuple[int, pipeline.Work]:
         run_pass, one = _one_pass(repeat)
         x = jax.eval_shape(before, state, row)
         up_to = _of_one_document(t.seq_len, before, state, row)
-        to_loss = _of_one_document(t.seq_len, after, state, row, x)  # from the start
+        to_loss = _of_one_document(t.seq_len, after, state, row, x)  # and up_to
         each = _of_one_document(t.seq_len, run_pass, one, row, x)
     return repeat.times, pipeline.Work(up_to, each, to_loss - up_to)
 

@@ -38,6 +38,7 @@ import pytest
 from jax.extend.core import Jaxpr, JaxprEqn, jaxprs_in_params
 
 from bux import parallel
+from bux.architecture.recurrent.linear_attention import States
 from bux.lang import compile_runs
 from bux.train import config as tcfg
 from bux.train.sinks import Sink
@@ -130,7 +131,7 @@ def outputs_and_grads(f: Callable[..., jax.Array], *args: jax.Array) -> list[jax
     return [out, *grads]
 
 
-def kept_bytes(f: Callable[..., jax.Array], *args: jax.Array, states: str) -> int:
+def kept_bytes(f: Callable[..., jax.Array], *args: jax.Array, states: States) -> int:
     """The bytes f's backward pass keeps, on one device, by `methods(states=...)`."""
 
     def kept(*args: jax.Array) -> list[jax.Array]:

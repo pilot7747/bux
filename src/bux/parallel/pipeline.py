@@ -301,9 +301,7 @@ class Clock(NamedTuple):
             axis_names={AXIS, *apart},
             check_vma=False,  # else nested shard_maps' gradients fail to lower
         )(split_by_stage(params, s), split_by_stage(rest, s), _micro(x, m), rows)
-        y = jnp.sum(
-            jnp.where(_on_first_stage(io), io, 0), 0
-        )  # the first stage's buffer
+        y = jnp.sum(jnp.where(_is_first_stage(io), io, 0), 0)  # the first's buffer
         return _whole(y), join_stages(rest), join_stages(losses)
 
     def mean(
@@ -376,7 +374,7 @@ def send(y: Shaped[Array, "n t *r"], step: int = 1) -> Shaped[Array, "n t *r"]:
     return jax.lax.ppermute(y, AXIS, [(i, (i + step) % n) for i in range(n)])
 
 
-def _on_first_stage(a: Shaped[Array, "s ..."]) -> Bool[Array, "s ..."]:
+def _is_first_stage(a: Shaped[Array, "s ..."]) -> Bool[Array, "s ..."]:
     """Return whether each slice of `a` is the first stage's, broadcastable to `a`."""
     return (jnp.arange(a.shape[0]) == 0).reshape(-1, *(1,) * (a.ndim - 1))
 
