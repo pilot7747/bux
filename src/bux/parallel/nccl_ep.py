@@ -25,7 +25,7 @@ from typing import TYPE_CHECKING, Any, NamedTuple
 
 import jax
 import jax.numpy as jnp
-from jaxtyping import Array, Bool, Float, Int, UInt8
+from jaxtyping import Array, Bool, Float, Int, Shaped, UInt8
 
 from bux import config as cfg
 from bux import jax_internals
@@ -272,12 +272,12 @@ def _route(k: int) -> dict[str, int]:
     return {"top_k": k, "dispatch_output_per_expert_alignment": ALIGNED}
 
 
-def _bind(primitive: Any, *args: Array, **params: Any) -> Any:
+def _bind(primitive: Any, *args: Shaped[Array, "..."], **params: Any) -> Any:
     """Return TE's one-device `primitive` of `args` (``_on_its_stream``)."""
     return _on_its_stream(lambda: _bound(primitive, *args, **params))
 
 
-def _bound(primitive: Any, *args: Array, **params: Any) -> Any:
+def _bound(primitive: Any, *args: Shaped[Array, "..."], **params: Any) -> Any:
     return primitive.inner_primitive.bind(*args, **params)
 
 
@@ -317,7 +317,12 @@ def _dispatched_forward(
 ) -> tuple[Dispatched, UInt8[Array, "1 h"]]:
     te = transformer_engine()
 
-    def prepared_and_sent() -> tuple[Array, Array, UInt8[Array, "1 h"], Array]:
+    def prepared_and_sent() -> tuple[
+        Float[Array, "1 r d"],
+        Float[Array, "1 r"],
+        UInt8[Array, "1 h"],
+        Int[Array, "1 l"],
+    ]:
         sizes, _, handle = _bound(
             te.EpPreparePrimitive, idx, **_route(k), is_outer=False
         )

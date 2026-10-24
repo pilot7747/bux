@@ -77,7 +77,11 @@ in bfloat16 attention, and each change is measured against the tree before it.
   collectives need no transposes. XLA's pool takes 95% of a GPU by default (beside it
   B300s held at most 9.8 GiB, with NCCL EP over two nodes). `remat=auto` compiles
   `none` alone, then the other candidates side by side. The head's "cast once a
-  chunk" was each chunk's softmax gradient, not the head: nothing to change.
+  chunk" was each chunk's softmax gradient, not the head: nothing to change. Two fixes
+  the full suite found: FSDP keeps off a dimension its own axes cannot divide (CSA's
+  2 groups under `tensor=4`, which XLA rematerialized in full), and Muon's `owner`
+  takes the optimizer state's real sharding (`states`, a new argument of every
+  orthogonalize method), where it guessed it from the old rule.
 - **E:** NCCL EP takes chunks and microbatches (every dispatch into the rows it was
   started with: fewer failed with "invalid argument"); `methods(moe_stream=true)` runs
   its kernels on a stream of their own, opt-in.

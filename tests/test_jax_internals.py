@@ -21,7 +21,7 @@ from conftest import equations
 from jax.ad_checkpoint import checkpoint_name, name_p
 from jax.extend.core import primitives
 from jax.sharding import PartitionSpec as P
-from jaxtyping import Array, Shaped
+from jaxtyping import Array, Float, Shaped
 
 from bux import jax_internals, kernels
 from bux.architecture.repeats import remat
@@ -296,7 +296,7 @@ def test_a_buffer_callback_hands_its_run_xla_s_stream_and_device():
 
 @CPU
 def test_a_run_on_a_stream_is_one_call_marked_for_it_with_its_gradient():
-    def f(x: jax.Array) -> jax.Array:
+    def f(x: Float[Array, " n"]) -> Float[Array, ""]:
         return jax_internals.on_stream("gpu_stream:1", lambda: jnp.sin(x) * 2).sum()
 
     text = jax.jit(f).lower(jnp.ones(3)).as_text()
