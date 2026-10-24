@@ -49,7 +49,7 @@ from bux.data.pipeline import DEFAULT_CACHE, jobs, prepare
 from bux.lang import ir
 from bux.lang.printer import run_to_source
 from bux.parallel.gather import Axes
-from bux.train import fitting, flops, stages, xla
+from bux.train import fitting, flops, interleave, stages, xla
 from bux.train.config import PrecisionConfig
 from bux.train.data import Batch, batches, prefetch
 from bux.train.hooks import Checkpoint, Eval, Hook, Log, Profile
@@ -141,6 +141,17 @@ def _cast_params(params: nnx.State, dtype: DTypeLike) -> nnx.State:
         lambda x: x.astype(dtype) if jnp.issubdtype(x.dtype, jnp.floating) else x,
         params,
     )
+
+
+def _flat(state: nnx.State) -> dict[tuple, Shaped[Array, "..."]]:
+    """Return the arrays of `state` by their paths."""
+    return {p: v.get_value() for p, v in nnx.to_flat_state(state)}
+
+
+def _filled(state: nnx.State, values: dict[tuple, Shaped[Array, "..."]]) -> nnx.State:
+    """Return `state` holding `values`, by their paths."""
+    flat = nnx.to_flat_state(state)
+    return nnx.from_flat_state([(p, v.replace(values[p])) for p, v in flat])
 
 
 def _by_spec(
@@ -294,7 +305,9 @@ class Trainer:
     microbatches' gradients add up on each device and reduce once, in `reduce`
     (``parallel.gather``), a pipeline's in float32; with "reduced" they reduce each
     microbatch; "auto" adds them up unreduced where the rows' axes span processes,
-    and where that computes the same, as `_why_not_unreduced` says.
+    and where that computes the same, as `_why_not_unreduced` says. With
+    `interleave`, each microbatch's forward runs beside the backward of the one
+    before, a piece of the model at a time (``interleave``).
 
     With `donate`, a training step donates the model's and the optimizer's arrays, so
     that their new state takes the old one's memory: an array read from them before a
@@ -316,6 +329,7 @@ class Trainer:
         matmuls: PrecisionConfig | str = "compute",
         switch: tuple[int, PrecisionConfig] | None = None,
         microbatches: int = 1,
+        interleave: bool = False,
         gather: str = "step",
         accumulate: str = "auto",
         reduce: DTypeLike | None = None,
@@ -323,8 +337,14 @@ class Trainer:
         compiler_options: xla.Options | None = None,
         work: flops.Work | None = None,
     ):
+        if interleave and parallel.pipeline.pipelined():
+            raise ValueError(
+                "methods(interleave=true) runs a step's microbatches side by side, "
+                "and a pipeline schedules its own: keep mesh.stage = 1"
+            )
         self.model, self.objective = model, objective
         self.compute, self.microbatches = jnp.dtype(compute), microbatches
+        self.interleave = interleave
         self.matmuls, self.switch, self.gather = matmuls, switch, gather
         self.reduce, self.accumulate = jnp.dtype(reduce or compute), accumulate
         self.reduces_once = self._reduces_once(model)
@@ -554,7 +574,12 @@ class Trainer:
         """Sum `_grads` over the microbatches of `batch` in a scan, into `zeros`, each
         one's per-token part scaled by its share of the batch's targets and its
         per-row part by 1 / `all_microbatches`, of every device: so the sums are
-        the batch's, even when microbatches have unequal numbers of targets."""
+        the batch's, even when microbatches have unequal numbers of targets. With
+        `interleave`, each one's forward runs beside the one before's backward."""
+        if self.interleave and self.microbatches > 1:
+            return self._interleaved(
+                graphdef, params, buffers, batch, zeros, token_shares, all_microbatches
+            )
         row_share = 1 / all_microbatches
 
         def add_microbatch(
@@ -572,6 +597,28 @@ class Trainer:
         (grads, buffers), metrics = jax.lax.scan(add_microbatch, (zeros, buffers), xs)
         return grads, {k: v.sum() for k, v in metrics.items()}, buffers
 
+    def _interleaved(
+        self,
+        graphdef: nnx.GraphDef,
+        params: nnx.State,
+        buffers: nnx.State,
+        batch: Batch,
+        zeros: nnx.State,
+        token_shares: Float[Array, " n"],
+        all_microbatches: int,
+    ) -> tuple[nnx.State, Metrics, nnx.State]:
+        """Return `_accumulate`'s sums, each microbatch's forward run beside the
+        backward of the one before, a piece of the model at a time
+        (``interleave``)."""
+        model = nnx.merge(graphdef, params, buffers)
+        hooks = interleave.Hooks(self._training_module, self._loss)
+        step = interleave.Step(model, hooks, self.matmuls, 1 / all_microbatches)
+        micro = parallel.microbatches(batch, self.microbatches)
+        grads, metrics, after = step.gradients(
+            _flat(params), _flat(buffers), _flat(zeros), micro, token_shares
+        )
+        return _filled(zeros, grads), metrics, _filled(buffers, after)
+
     def _grads(
         self,
         graphdef: nnx.GraphDef,
@@ -586,18 +633,40 @@ class Trainer:
         share."""
 
         def loss_fn(params: nnx.State) -> tuple[Float[Array, ""], tuple[Metrics, Any]]:
-            model = cast(nnx.merge(graphdef, params, buffers, copy=True), self.compute)
-            model.set_attributes(update_at_step_end=True, raise_if_not_found=False)
+            model = self._training_module(graphdef, params, buffers)
             with matmuls.use(self.matmuls, jnp.asarray(batch.input_ids)):
                 heads, aux_losses = training_forward(model, batch)
-            per_token, per_row = self.objective(heads, batch, aux_losses)
-            loss = token_share * per_token.loss + row_share * per_row.loss
-            metrics = _scaled(per_token.metrics, token_share)
-            metrics |= _scaled(per_row.metrics, row_share)
+            loss, metrics = self._loss(heads, batch, aux_losses, token_share, row_share)
             return loss, (metrics, nnx.state(model, nnx.Not(nnx.Param)))
 
         grads, (metrics, buffers) = jax.grad(loss_fn, has_aux=True)(params)
         return grads, metrics, buffers
+
+    def _training_module[M: nnx.Module](
+        self, graphdef: nnx.GraphDef[M], params: nnx.State, buffers: nnx.State
+    ) -> M:
+        """Return the module of `graphdef` and the states, for a training step's
+        forward: its parameters cast to `compute`, its step-end updates kept for the
+        step's end."""
+        module = cast(nnx.merge(graphdef, params, buffers, copy=True), self.compute)
+        module.set_attributes(update_at_step_end=True, raise_if_not_found=False)
+        return module
+
+    def _loss(
+        self,
+        heads: Sequence[HeadOutput],
+        batch: Batch,
+        aux_losses: Sequence[Loss],
+        token_share: float | Float[Array, ""],
+        row_share: float,
+    ) -> tuple[Float[Array, ""], Metrics]:
+        """Return a microbatch's share of the step's loss, and of its metrics: the
+        objective's terms by its share of the batch's targets, and the losses layers
+        report by its share of rows."""
+        per_token, per_row = self.objective(heads, batch, aux_losses)
+        loss = token_share * per_token.loss + row_share * per_row.loss
+        metrics = _scaled(per_token.metrics, token_share)
+        return loss, metrics | _scaled(per_row.metrics, row_share)
 
     def eval_step(self, model: Model, batch: Batch) -> Float[Array, ""]:
         """Return the first head's loss on `batch`, computed in `compute`."""
@@ -724,6 +793,7 @@ def train(
             matmuls=precision,
             switch=matmuls.late(precision, config.steps),
             microbatches=_accumulated(config.methods.microbatches),
+            interleave=config.methods.interleave,
             gather=config.methods.gather,
             accumulate=config.methods.accumulate,
             reduce=_reduce_dtype(config.precision),
