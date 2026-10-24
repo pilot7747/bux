@@ -1661,20 +1661,27 @@ where `first` computes the whole layer again. With more rows a GPU:
 
 `auto` chooses a training step's policy as the step first compiles
 (`bux.train.fitting`). It compiles the step under `none`, `dots_attention`, `dots`,
-`save_attention` and `full` in turn, the fastest first as they train above, and keeps
-the first that fits: what XLA's analysis of the compiled step says a device holds at
+`save_attention` and `full`, the fastest first as they train above, and keeps the
+first that fits: what XLA's analysis of the compiled step says a device holds at
 once, its arguments, outputs and temporaries, at most 97% of what the device can hold
-(its `bytes_limit`, 75% of a GPU by JAX's default). In that order the first that fits
-is the one that computes least again, so `auto` times none of them, which would cost
-steps of each. On B300s XLA's analysis was the measured peak to 0.1 GiB in every run,
-and a step of 196.7 of 200.8 GiB trained. Where `none` fits, `auto` compiles once and
-is `none`; where it does not, each candidate before the one that fits is a compile
-more, which JAX's cache keeps for the run's next launch. A forward outside a training
-step keeps everything. The step says what it took:
+(its `bytes_limit`: 95% of a GPU, which bux gives XLA's pool, docs/training.md "Speed
+on GPUs"). In that order the first that fits is the one that computes least again, so
+`auto` times none of them, which would cost steps of each. On B300s XLA's analysis
+was the measured peak to 0.1 GiB in every run, and a step of 196.7 of 200.8 GiB
+trained. Where `none` fits, `auto` compiles once and is `none`. Where it does not,
+the other four compile side by side: each is traced and lowered in turn, which holds
+Python's lock, then XLA compiles them at once, a thread each. On 8 B300s,
+`megatron.bux`'s `nccl_ep` arm with 75% of a GPU took `save_attention` in 699 s,
+where one after another took 966 s; XLA compiled each of the four in 218-243 s side
+by side, and their tracing and lowering, a minute each, now take most of the rest
+(where a compile goes: "Speed on GPUs" in docs/training.md). JAX's cache keeps each
+for the run's next launch. A forward outside a training step keeps everything. The
+step says what it took, XLA's seconds of each candidate:
 
 ```
-remat=auto: save_attention (none 314.4 GiB in 42s, dots_attention 288.4 GiB in 29s,
-dots 263.7 GiB in 26s, save_attention 161.7 GiB in 24s; 97% of 200.8 GiB fits)
+remat=auto: save_attention in 699s (none 265.8 GiB in 144s, dots_attention 273.5 GiB
+in 243s, dots 249.1 GiB in 230s, save_attention 108.4 GiB in 218s, full 74.2 GiB in
+219s; 97% of 200.8 GiB fits)
 ```
 
 On one B300, the one-GPU suite's models (`examples/benchmarks/one_gpu.bux`) at more

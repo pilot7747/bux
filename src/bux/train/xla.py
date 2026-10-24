@@ -82,12 +82,11 @@ def jit(fun: Callable[..., Any], options: Options, **kwargs: Any) -> Any:
     return Compiled(jitted, options) if options else jitted
 
 
-def compiled(step: Any, *args: Any) -> Any:
-    """Return `step`, of ``jit``, compiled for `args`, as a call of them runs it: nnx.jit
-    finds what its lower and compile made in JAX's caches, and compiles it no more."""
-    if isinstance(step, Compiled):
-        return step.compile(*args)
-    return step.lower(*args).compile()
+def compiled(lowered: Any, options: Options) -> Any:
+    """Return `lowered`, a function of ``jit`` lowered, compiled with XLA's `options`
+    as a call of it compiles it: the call finds the compile in JAX's caches, and
+    compiles it no more."""
+    return lowered.compile(dict(options) or None)
 
 
 class Compiled:
