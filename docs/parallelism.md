@@ -1179,8 +1179,16 @@ megatron.bux on 8 B300s, `remat=none`, the tree before and after on the same nod
 | `sorted`, one microbatch of 8 rows a GPU | 37.7k, 215.1 GiB | 38.5k (+2.1%), 200.3 GiB |
 | `nccl_ep`, one microbatch of 8 rows a GPU | 31.4k, 211.1 GiB | 32.4k (+3.1%), 212.7 GiB |
 
-`sorted` keeps no bfloat16 copy of all 128 experts' kernels now, so it takes 15 GiB
-less. Its compiles take 20 to 110 s more, CuTe DSL compiling each kernel in every
+On GPU 0, at one microbatch (traced without XLA's command buffers, whose kernels the
+trace then loses), the experts' kernels and XLA's passes over h and dp take 263 ms a
+step against 319 under `sorted`, and 234 against 280 under `nccl_ep`. Beside FSDP's
+collectives cuDNN's kernels run slower than alone: `dswiglu` takes 1.13 ms against
+0.62 (0.59 under `nccl_ep`, which has none), its tiles statically scheduled where
+`grouped_mxfp8`'s take the SMs as they free. Leaving pairs of SMs to the collectives
+(`CUDNNFE_CLUSTER_OVERLAP_MARGIN`, which all of `grouped_cudnn`'s kernels heed) gains
+0.3% at Megatron's batch with 8 (two runs each, on one node) and 1.1% with 16 (one),
+and loses 2% with 32: left at 0. `sorted` keeps no bfloat16 copy of all 128 experts'
+kernels now, so it takes 15 GiB less. Its compiles take 20 to 110 s more, CuTe DSL compiling each kernel in every
 process. 3000 steps of FineWeb-Edu on the baseline's MoE with experts of 768 (the
 fused kernels' shapes, one B300 a run) end within 0.08% of bux's kernels at each of
 three seeds (eval loss 4.0708, 4.0127, 4.0346 against 4.0742, 4.0099, 4.0363), which
