@@ -1061,11 +1061,16 @@ the copy 420. A copy that casts x and x^T to E4M3 unscaled runs at 6.5 TB/s (XLA
 row of x but one of each 4 of x^T's in a program of 32 rows, and the blocks' largest
 magnitudes take the rest. Programs of 64 or 128 rows, or of 128 rows 32 at a time
 with each tile of scales in one store, more warps, other grid orders and the scaling
-in float32 were no faster. On 8 B300s, at `remat=none` with the pool at 97%, reading
-x in place took the arm from 249.8k to 251.8k tokens a second, at the same peak (250.4
-GiB): the gather's 24.6 ms a step went and the quantizer's fell from 95 to 92, but the
-FSDP collectives the step overlapped became 25 ms more exposed. Each GPU quantizes all
-128 experts' W, 23 ms of a step; its own shard before FSDP gathers it would save 7/8 of
+in float32 were no faster.
+
+On 8 B300s, at `remat=none` with the pool at 97%, 40 steps: with the router's weights
+on the hidden units, so that down's rows sum plainly into their tokens, reading x and
+dy in place took the arm from 260.3k to 269.4k tokens a second (32.5k to 33.7k a GPU)
+at the same peak, 215.0 GiB. On GPU 0 a step fell from 1067 to 1029 ms: both gathers'
+39 ms went, and the quantizer's 95 ms became 88. With the weights after down, x in
+place alone went from 254.2k to 255.0k: the gather's 25 ms went, but the FSDP
+collectives the step overlapped came out from under it. Each GPU quantizes all 128
+experts' W, 23 ms of a step; its own shard before FSDP gathers it would save 7/8 of
 that.
 
 ## Expert parallelism
