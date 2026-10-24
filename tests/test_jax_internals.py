@@ -18,6 +18,7 @@ import jax.numpy as jnp
 import numpy as np
 import pytest
 from conftest import equations
+from jax._src.lib import hlo
 from jax.ad_checkpoint import checkpoint_name, name_p
 from jax.extend.core import primitives
 from jax.sharding import PartitionSpec as P
@@ -295,14 +296,59 @@ def test_a_buffer_callback_hands_its_run_xla_s_stream_and_device():
 
 
 @CPU
-def test_a_run_on_a_stream_is_one_call_marked_for_it_with_its_gradient():
+def test_a_run_on_a_stream_is_one_call_hinted_with_its_gradient():
     def f(x: Float[Array, " n"]) -> Float[Array, ""]:
-        return jax_internals.on_stream("gpu_stream:1", lambda: jnp.sin(x) * 2).sum()
+        twice = jax_internals.on_stream("gpu_stream:1", lambda: jnp.sin(x) * 2, 3)
+        return twice.sum()
 
     text = jax.jit(f).lower(jnp.ones(3)).as_text()
     [call] = [line for line in text.splitlines() if " = call @" in line]
     assert '_xla_stream_annotation = "1"' in call and 'inlineable = "false"' in call
+    assert 'scheduler_hint = "force_delay_async"' in call
+    assert 'scheduler_delay_priority = "3"' in call
     np.testing.assert_allclose(jax.grad(f)(jnp.zeros(3)), [2.0, 2.0, 2.0])
+
+
+# A stream call of two results as XLA's SPMD partitioner leaves it in a shard_map:
+# the get-tuple-elements of its tuple marked for its stream too.
+SPLIT_CALL = """
+HloModule split
+
+%called (p: f32[4]) -> (f32[4], f32[4]) {
+  %p = f32[4]{0} parameter(0)
+  %s = f32[4]{0} sine(%p)
+  %c = f32[4]{0} cosine(%p)
+  ROOT %t = (f32[4]{0}, f32[4]{0}) tuple(%s, %c)
+}
+
+ENTRY %main (x: f32[4]) -> f32[4] {
+  %x = f32[4]{0} parameter(0)
+  %call = (f32[4]{0}, f32[4]{0}) call(%x), to_apply=%called, frontend_attributes={_xla_stream_annotation="1",inlineable="false"}
+  %g0 = f32[4]{0} get-tuple-element(%call), index=0, frontend_attributes={_xla_stream_annotation="1",inlineable="false"}
+  %g1 = f32[4]{0} get-tuple-element(%call), index=1, frontend_attributes={_xla_stream_annotation="1",inlineable="false"}
+  ROOT %out = f32[4]{0} add(%g0, %g1)
+}
+"""
+
+
+@CPU
+def test_the_parts_of_a_stream_calls_tuple_come_off_its_stream():
+    module = hlo.hlo_module_from_text(SPLIT_CALL)
+    edited = jax_internals.parts_off_the_stream(module.as_serialized_hlo_module_proto())
+    assert edited is not None
+    text = hlo.HloModule.from_serialized_hlo_module_proto(edited).to_string()
+    lines = {line.split()[0]: line for line in text.splitlines() if " = " in line}
+    assert '_xla_stream_annotation="1"' in lines["%call"]
+    for part in ("%g0", "%g1"):
+        assert "_xla_stream_annotation" not in lines[part]
+        assert 'inlineable="false"' in lines[part]
+
+
+@CPU
+def test_a_module_without_streams_is_left_as_it_is():
+    plain = SPLIT_CALL.replace("_xla_stream_annotation", "x")
+    module = hlo.hlo_module_from_text(plain).as_serialized_hlo_module_proto()
+    assert jax_internals.parts_off_the_stream(module) is None
 
 
 @GPU

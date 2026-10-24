@@ -9,8 +9,10 @@ import jax
 import jax.numpy as jnp
 import pytest
 import test_experts
+from flax import nnx
 
 from bux import parallel, runtime
+from bux.architecture import Taps
 from bux.lang import compile_runs
 from bux.parallel import experts, methods, nccl_ep
 from bux.train import config as tcfg
@@ -93,11 +95,23 @@ def _primitive(bind):
 
 @pytest.mark.parametrize("stream", [False, True])
 def test_under_moe_stream_tes_primitives_run_on_nccl_eps_stream(stream):
-    bound = jax.jit(lambda x: nccl_ep._bind(_primitive(lambda x: 2 * x), x))
+    twice = _primitive(lambda x: 2 * x)
+    bound = jax.jit(lambda x: nccl_ep._bind(nccl_ep.THERE, twice, x))
     with _use({"data": 2, "expert": 4}, stream=stream):
         lowered = bound.lower(jnp.ones(3)).as_text()
         assert (bound(jnp.ones(3)) == 2).all()
     assert ('_xla_stream_annotation = "1"' in lowered) == stream
+
+
+def test_on_its_stream_what_sends_rows_there_starts_before_what_sends_them_back():
+    def priorities(way):
+        bound = jax.jit(lambda x: nccl_ep._bind(way, _primitive(lambda x: x), x))
+        lowered = bound.lower(jnp.ones(3)).as_text()
+        return re.findall(r'scheduler_delay_priority = "(\d+)"', lowered)
+
+    with _use({"data": 2, "expert": 4}, stream=True):
+        there, back = priorities(nccl_ep.THERE), priorities(nccl_ep.BACK)
+    assert int(there[0]) > int(back[0])
 
 
 def test_a_dispatch_prepares_and_sends_in_one_call_on_nccl_eps_stream(monkeypatch):
@@ -119,6 +133,71 @@ def test_a_dispatch_prepares_and_sends_in_one_call_on_nccl_eps_stream(monkeypatc
         lowered = dispatched.lower(x, idx, w).as_text()
         assert dispatched(x, idx, w).rows.shape == (16, 8)
     assert len(re.findall(r"call @\S+ .*_xla_stream_annotation", lowered)) == 1
+
+
+class Recorded:
+    """TE's primitives as fakes of the right shapes, each bind recorded in order, by
+    name, with the handle it takes; each prepare's handle a value of its own."""
+
+    def __init__(self, rows: int, tokens: int, d: int):
+        self.rows, self.tokens, self.d, self.binds = rows, tokens, d, []
+        self.prepared = []  # the handles prepares made, in order
+
+    def te(self) -> SimpleNamespace:
+        names = ["Prepare", "Dispatch", "Combine", "DispatchBwd", "CombineBwd"]
+        return SimpleNamespace(
+            **{f"Ep{n}Primitive": _primitive(getattr(self, n.lower())) for n in names}
+        )
+
+    def prepare(self, idx, **_):
+        handle = jnp.full((1, 4), idx.sum(), jnp.uint8)
+        self.binds.append(("prepare", None))
+        self.prepared.append(handle)
+        return jnp.ones((1, 2), jnp.int32), jnp.ones((1, 1), jnp.int32), handle
+
+    def dispatch(self, handle, idx, x, weights, **_):
+        self.binds.append(("dispatch", handle))
+        return jnp.zeros((1, self.rows, self.d)) + x.sum(), jnp.ones((1, self.rows))
+
+    def combine(self, handle, made, **_):
+        self.binds.append(("combine", handle))
+        return jnp.zeros((self.tokens, self.d)) + made.sum()
+
+    def dispatchbwd(self, handle, rows, weights, **_):
+        self.binds.append(("dispatch_bwd", handle))
+        return jnp.zeros((self.tokens, self.d)) + rows.sum(), jnp.zeros(
+            (self.tokens, 2)
+        )
+
+    def combinebwd(self, handle, g, **_):
+        self.binds.append(("combine_bwd", handle))
+        return jnp.zeros((1, self.rows, self.d)) + g.sum()
+
+
+@pytest.mark.parametrize("stream", [False, True])
+def test_each_call_of_a_backward_prepares_its_route_where_it_runs(monkeypatch, stream):
+    """NCCL EP keys its state of a route by its handle's address, which a copy of a
+    microbatch's residuals changes: a backward that ran on its forward's handle
+    failed under interleaved microbatches."""
+    recorded = Recorded(rows=16, tokens=4, d=8)
+    monkeypatch.setattr(nccl_ep, "transformer_engine", recorded.te)
+
+    def loss(x, w, idx):
+        sent = nccl_ep._dispatched(16, 4, 2, x, idx, w)
+        made = sent.rows * sent.weights[:, None]
+        return nccl_ep._combined(16, 4, 2, sent.handle, idx, made).sum()
+
+    x, idx, w = jnp.ones((4, 8)), jnp.zeros((4, 2), jnp.int32), jnp.ones((4, 2))
+    with _use({"data": 2, "expert": 4}, stream=stream):
+        jax.jit(jax.grad(loss, argnums=(0, 1))).lower(x, w, idx)
+    names = [name for name, _ in recorded.binds]
+    forward = ["prepare", "dispatch", "combine"]
+    assert names == [*forward, "prepare", "combine_bwd", "prepare", "dispatch_bwd"]
+    first, then, last = recorded.prepared
+    used = dict(recorded.binds)
+    assert used["dispatch"] is first  # the combine takes it from the dispatch's call
+    if not stream:  # else each comes out of the call of its prepare, another tracer
+        assert used["combine_bwd"] is then and used["dispatch_bwd"] is last
 
 
 def test_the_rows_that_hold_picks_are_each_experts_first():
@@ -176,7 +255,7 @@ def _emulated_dispatch(rows, tokens, k, x, idx, weights):
     return nccl_ep.Dispatched(arrived, weight, handle, sizes)
 
 
-def _emulated_combine(rows, tokens, k, handle, made):
+def _emulated_combine(rows, tokens, k, handle, idx, made):
     """NCCL EP's combine: each token's sum of what its picks' rows made."""
     axes = EP
     slot, order = handle
@@ -223,6 +302,34 @@ def test_more_tokens_than_it_started_for_go_in_pieces(emulated):
     mesh = "data=2, expert=4"
     pieces = test_experts._outputs("nccl_ep", mesh, "gated", rows=rows)
     test_experts.assert_close(pieces, one)
+
+
+def test_microbatches_backward_in_any_order_take_what_one_after_another_do(emulated):
+    """Two microbatches' forwards, then their backwards last first, as a schedule of
+    overlapped microbatches runs them, against each one's forward and backward in
+    turn."""
+    x, probe = test_experts._inputs()
+    with test_experts.split("nccl_ep", "data=2, expert=4"):
+        e = parallel.build(lambda: test_experts.layer(**test_experts.OPTIONS["gated"]))
+        graphdef, state = nnx.split(e)
+
+        def layer(state, x):
+            return nnx.merge(graphdef, state)(x, Taps())
+
+        def interleaved(state, x, probe):
+            first, back_first = jax.vjp(layer, state, x)
+            second, back_second = jax.vjp(layer, state, x * 2)
+            return first, second, back_second(probe), back_first(probe)
+
+        def in_turn(state, x, probe):
+            first, back_first = jax.vjp(layer, state, x)
+            grads_first = back_first(probe)
+            second, back_second = jax.vjp(layer, state, x * 2)
+            return first, second, back_second(probe), grads_first
+
+        overlapped = jax.device_get(jax.jit(interleaved)(state, x, probe))
+        one_by_one = jax.device_get(jax.jit(in_turn)(state, x, probe))
+    test_experts.assert_close(overlapped, one_by_one)
 
 
 @pytest.mark.parametrize("capacity", [0.5, 1.0])
