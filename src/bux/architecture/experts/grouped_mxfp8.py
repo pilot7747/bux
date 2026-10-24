@@ -152,10 +152,12 @@ def in_tensor_memory(scales: Shaped[Array, "r c"]) -> Shaped[Array, "p q 32 16"]
     """Return (r, c) scales, a row's per 32 of k, laid out as tcgen05's MMA takes
     them in tensor memory, so that TMA loads a tile's at a time: a 512-byte tile for
     each 128 rows by 4 scales (128 of k), row i's 4 at bytes (i % 32) * 16 +
-    (i // 32) * 4. Padded with 0 to whole tiles: 2^-127 times values of 0."""
+    (i // 32) * 4. Padded to whole tiles with bytes of 0, 2^-127 times values of 0:
+    E8M0 has no 0, and pads a 0 as NaN."""
     r, c = scales.shape
     p, q = -(-r // LANES), -(-c // SCALE_TILE)
-    padded = jnp.pad(scales, ((0, p * LANES - r), (0, q * SCALE_TILE - c)))
+    bytes_ = blockscaled.as_bytes(scales)
+    padded = jnp.pad(bytes_, ((0, p * LANES - r), (0, q * SCALE_TILE - c)))
     rows = _as_words(padded)  # a row's 4 scales of each tile of k, a word
     tiles = rows.reshape(p, 4, 32, q).transpose(0, 3, 2, 1)
     return _from_words(tiles, scales.dtype).reshape(p, q, 32, 16)

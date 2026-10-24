@@ -58,10 +58,11 @@ def test_padding_k_adds_zeros_to_whole_tiles():
     assert (padded[..., 704:].astype(jnp.float32) == 0).all()
 
 
-def test_the_scales_pad_to_whole_tiles_with_zeros():
-    tiles = gm.in_tensor_memory(jnp.ones((100, 22), jnp.uint8))
+def test_the_scales_pad_to_whole_tiles_with_bytes_of_zero_not_nan():
+    scales = jnp.ones((100, 22), E8M0)  # 2^0, a byte of 127 each
+    tiles = blockscaled.as_bytes(gm.in_tensor_memory(scales))
     assert tiles.shape == (1, 6, 32, 16)
-    assert int(tiles.astype(jnp.int32).sum()) == 100 * 22
+    assert int(tiles.astype(jnp.int32).sum()) == 100 * 22 * 127
 
 
 def test_a_groups_edges_are_its_first_and_last_tiles_with_the_rest_as_zero():
