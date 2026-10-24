@@ -16,6 +16,7 @@ query that gathers its picks' keys, up to its last (`picked`), differentiated by
 another that adds each pick's share of the keys' gradient into it atomically.
 """
 
+from collections.abc import Callable
 from typing import Any
 
 import jax
@@ -51,28 +52,32 @@ def scores(
     it does not see them."""
     q, w, keys = jax.lax.stop_gradient((q, w, keys))  # nor the parameters behind them
     split = parallel.spec(("batch", "seq", "heads", None), q.shape)
-    names = set(parallel.axes_of(split))
-    if not names:
+    if not parallel.axes_of(split):
         return _kernel(q, w, keys, end)
+    ins = (split, P(*split[:3]), P(split[0], None, None), P(split[0], split[1]))
+    return on_own_queries(_kernel, split, ins)(q, w, keys, end)
+
+
+def on_own_queries(
+    kernel: Callable[..., Float[Array, "b t s"]], split: P, ins: tuple[Any, ...]
+) -> Callable[..., Float[Array, "b t s"]]:
+    """Return `kernel`, of each query's scores of the keys, in a shard_map manual over
+    the axes of `split`, the queries' spec (b, t, h, ...): each device scores its rows'
+    queries by its heads, its inputs split as `ins` say, and the scores sum over the
+    devices of the heads."""
     heads = split[2]
 
-    def device(
-        q: Float[Array, "b t h i"],
-        w: Float[Array, "b t h"],
-        keys: Float[Array, "b s i"],
-        end: Int[Array, "b t"],
-    ) -> Float[Array, "b t s"]:
-        own = _kernel(q, w, keys, end)
+    def device(*args: Any) -> Float[Array, "b t s"]:
+        own = kernel(*args)
         return own if heads is None else jax.lax.psum(own, heads)
 
-    rows = P(split[0], split[1])
     return jax.shard_map(
         device,
-        in_specs=(split, P(*split[:3]), P(split[0], None, None), rows),
+        in_specs=ins,
         out_specs=P(split[0], split[1], None),
-        axis_names=names,
-        check_vma=False,
-    )(q, w, keys, end)
+        axis_names=set(parallel.axes_of(split)),
+        check_vma=False,  # a kernel's outputs do not say what varies
+    )
 
 
 def _block(n: int, most: int) -> int | None:
@@ -147,7 +152,7 @@ def _kernel(
 # --- the attention's probabilities, the indexer's target ------------------------------
 
 
-def probabilities_run(t: int, s: int, d: int) -> bool:
+def probabilities_runs(t: int, s: int, d: int) -> bool:
     """Return whether `probabilities`' kernel runs: on a GPU, where blocks of a power
     of two divide the t queries and s keys, for heads of a power of two up to 128
     dims. On a B300 it takes half XLA's time at 128 (GQA's, MQA's), and 1.4 times
@@ -239,7 +244,7 @@ def probabilities(
 # --- the scores of each query's picks, for the indexer's loss -------------------------
 
 
-def picked_run(h: int, i: int, k: int) -> bool:
+def picked_runs(h: int, i: int, k: int) -> bool:
     """Return whether `picked`'s kernels run: on a GPU, for h heads and i head dims of
     a power of two, and k picks in blocks of 16 or more."""
     pow2 = all(n >= 16 and n & (n - 1) == 0 for n in (h, i))
@@ -259,17 +264,11 @@ def picked(
     into it atomically. On a mesh a `shard_map` gives each device its rows and
     queries, every head and every key."""
     split = parallel.spec(("batch", "seq", None, None), q.shape)
-    names = set(parallel.axes_of(split))
-    if not names:
+    if not parallel.axes_of(split):
         return _picked(q, w, keys, index)
     rows = P(split[0], split[1])
-    return jax.shard_map(
-        _picked,
-        in_specs=(split, P(*split[:3]), P(split[0], None, None), P(*rows, None)),
-        out_specs=P(*rows, None),
-        axis_names=names,
-        check_vma=False,
-    )(q, w, keys, index)
+    ins = (split, P(*split[:3]), P(split[0], None, None), P(*rows, None))
+    return on_own_queries(_picked, split, ins)(q, w, keys, index)
 
 
 @jax.custom_vjp

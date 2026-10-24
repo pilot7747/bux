@@ -99,9 +99,7 @@ def delta_rule(
     if rows[1] is not None:  # positions split over devices, which XLA gathers
         return otherwise(q, k, v, log_decay, beta, docs)
     specs = (rows,) * 4 + (P(*rows[:3]), P(*rows[:2]))
-    # Untyped by what varies, which the kernels' outputs do not say; nothing here
-    # communicates.
-    return jax.shard_map(_rows, in_specs=specs, out_specs=rows, check_vma=False)(*xs)
+    return kernels.per_device(_rows, specs, rows)(*xs)
 
 
 def _within(docs: Segments | None, shape: tuple[int, ...]) -> Int[Array, "b t"]:
@@ -124,11 +122,11 @@ def _rows(
     t = q.shape[1]
     q, k, v, g, beta, within = (_padded(x) for x in (q, k, v, g, beta, within))
     G = _summed(jnp.broadcast_to(g, k.shape).astype(jnp.float32))
-    out = _chunks(_kept(), q, k, v, G, beta.astype(jnp.float32), _documents(within))
+    out = _chunks(_keeps(), q, k, v, G, beta.astype(jnp.float32), _documents(within))
     return out[:, :t]
 
 
-def _kept() -> bool:
+def _keeps() -> bool:
     """Return whether the backward pass keeps the chunks' parts and states from the
     forward pass, by the run's `methods.states`: keep, outside ``parallel.use``."""
     on = parallel.active()

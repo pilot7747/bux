@@ -1,5 +1,6 @@
 """Fixtures: a tokenizer and a corpus that need no network, runs trained on 8
-devices, and the equations of a jaxpr.
+devices, the equations of a jaxpr, a function's outputs and gradients, and what its
+backward pass keeps.
 
 First, before anything starts JAX, it gets 8 CPU devices, so that the tests split runs
 over them and compare with one; and before anything imports bux, jaxtyping instruments
@@ -26,14 +27,19 @@ jaxtyping.install_import_hook(
 
 import itertools
 import json
-from collections.abc import Iterator
+from collections.abc import Callable, Iterator
 
+import jax
+import jax.numpy as jnp
 import numpy as np
 import pyarrow as pa
 import pyarrow.parquet as pq
 import pytest
 from jax.extend.core import Jaxpr, JaxprEqn, jaxprs_in_params
+from jaxtyping import Array, Float, Shaped
 
+from bux import parallel
+from bux.architecture.recurrent.linear_attention import States
 from bux.lang import compile_runs
 from bux.train import config as tcfg
 from bux.train.sinks import Sink
@@ -112,6 +118,36 @@ def equations(jaxpr: Jaxpr, times: int = 1) -> Iterator[tuple[JaxprEqn, int]]:
 def count(jaxpr: Jaxpr, primitive: str) -> int:
     """How many equations of `primitive` `jaxpr` has, in the jaxprs inside it too."""
     return sum(e.primitive.name == primitive for e, _ in equations(jaxpr))
+
+
+def outputs_and_grads(
+    f: Callable[..., Float[Array, "..."]], *args: Float[Array, "..."]
+) -> list[Float[Array, "..."]]:
+    """f's outputs, then the gradients for each of `args` of a weighted sum of them,
+    each output weighted by the cosine of its index."""
+
+    def loss(
+        *args: Float[Array, "..."],
+    ) -> tuple[Float[Array, ""], Float[Array, "..."]]:
+        out = f(*args)
+        return (out * jnp.cos(jnp.arange(out.size)).reshape(out.shape)).sum(), out
+
+    grads, out = jax.grad(loss, tuple(range(len(args))), has_aux=True)(*args)
+    return [out, *grads]
+
+
+def kept_bytes(
+    f: Callable[..., Float[Array, "..."]], *args: Float[Array, "..."], states: States
+) -> int:
+    """The bytes f's backward pass keeps, on one device, by `methods(states=...)`."""
+
+    def kept(*args: Float[Array, "..."]) -> list[Shaped[Array, "..."]]:
+        return jax.tree.leaves(jax.vjp(f, *args)[1])
+
+    methods = tcfg.MethodsConfig(states=states)
+    with parallel.use(tcfg.MeshConfig(data=1), methods=methods):
+        shapes = jax.eval_shape(kept, *args)
+    return sum(x.size * x.dtype.itemsize for x in shapes)
 
 
 # What `losses` trains with, unless the source or its settings say otherwise.

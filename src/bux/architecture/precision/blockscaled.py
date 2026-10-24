@@ -216,7 +216,7 @@ def as_bytes(x: Shaped[Array, "*s"]) -> UInt8[Array, "*s"]:
     return jax.lax.bitcast_convert_type(x, jnp.uint8)
 
 
-def on_each_device(
+def partitioned_unless_manual(
     kernel: Callable[..., Any], partitioned: Callable[..., Any]
 ) -> Callable[..., Any]:
     """Return `partitioned`, which runs `kernel` on each device's part of what it
@@ -355,7 +355,7 @@ MxArrays = tuple[
 def mx_kernel_twice(x: Float[Array, "r c"]) -> tuple[Blocks, Blocks]:
     """Return x and x^T in MXFP8 by one pass of the kernel, each device on its part
     of x; off a GPU, the kernel interpreted."""
-    quantize = on_each_device(_mx_kernel, _mx_partitioned)
+    quantize = partitioned_unless_manual(_mx_kernel, _mx_partitioned)
     rows, row_exponents, cols, col_exponents = quantize(x)
     cols = jax.lax.bitcast_convert_type(cols, jnp.float8_e4m3fn)
     return _mx_blocks(rows, row_exponents), _mx_blocks(cols, col_exponents)

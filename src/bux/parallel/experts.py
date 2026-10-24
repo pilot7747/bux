@@ -267,15 +267,13 @@ def all_to_all(
 
 
 class Buffers(NamedTuple):
-    """A device's picks laid out in a buffer of `room` slots for each peer, sorted by
-    expert, [p * room]: the pick in each slot (any, past the peer's picks) and whether
-    one is there; each pick's slot (p * room, none, if it dropped); and sizes[p, e],
-    how many of the picks for expert e of peer p fit."""
+    """A device's picks laid out in a buffer of `room` slots for each of its p peers,
+    sorted by expert: p * room slots in all."""
 
-    pick: Int[Array, " s"]
-    used: Bool[Array, " s"]
-    slot: Int[Array, " n"]
-    sizes: Int[Array, "p e"]
+    pick: Int[Array, " s"]  # the pick in each slot; any, past a peer's picks
+    used: Bool[Array, " s"]  # whether a pick is there
+    slot: Int[Array, " n"]  # each pick's slot; p * room, none, if it dropped
+    sizes: Int[Array, "p e"]  # how many of the picks for peer p's expert e fit
 
 
 def _buffers(idx: Int[Array, "b t k"], local: int, peers: int, room: int) -> Buffers:

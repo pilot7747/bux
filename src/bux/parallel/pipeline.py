@@ -301,7 +301,7 @@ class Clock(NamedTuple):
             axis_names={AXIS, *apart},
             check_vma=False,  # else nested shard_maps' gradients fail to lower
         )(split_by_stage(params, s), split_by_stage(rest, s), _micro(x, m), rows)
-        y = jnp.sum(jnp.where(_first(io), io, 0), 0)  # the first stage's buffer
+        y = jnp.sum(jnp.where(_is_first_stage(io), io, 0), 0)  # the first's buffer
         return _whole(y), join_stages(rest), join_stages(losses)
 
     def mean(
@@ -334,7 +334,7 @@ def _device(
     rest = gather.keys_of(before, rest)
     losses = clock.mean(losses, r)
     losses = jax.lax.pmean(losses, apart) if apart else losses
-    return io[None], jax.tree.map(lambda a: a[None], rest), losses[None]
+    return add_axes((io, rest, losses))  # stacked by stage, as P(AXIS) joins them
 
 
 def _tick(
@@ -359,19 +359,22 @@ def _tick(
     y, new, losses = stage(at(params, r), before, x, at(rows, micro))
     new = jax.tree.map(lambda a, b: jnp.where(busy, a, b), new, before)
     rest = put(rest, r, new)
-    shift = _rotate(y)
-    back, done = (t - clock.stages + 1) % clock.microbatches, t >= clock.stages - 1
-    io = put(io, back, jnp.where(done, shift, at(io, back)))
+    shift = send(y)
+    # From tick S - 1 on, the last stage's output arrives in the first's buffer.
+    back = (t - clock.stages + 1) % clock.microbatches
+    arrived = t >= clock.stages - 1
+    io = put(io, back, jnp.where(arrived, shift, at(io, back)))
     return (shift, io, rest), (jnp.where(busy, losses, 0), r)
 
 
-def _rotate(y: Shaped[Array, "n t *r"]) -> Shaped[Array, "n t *r"]:
-    """Send each stage's output to the next stage, the last's to the first."""
+def send(y: Shaped[Array, "n t *r"], step: int = 1) -> Shaped[Array, "n t *r"]:
+    """Send each stage's `y` to the stage `step` after it, round the ring: the last's
+    to the first, by default."""
     n = jax.lax.axis_size(AXIS)
-    return jax.lax.ppermute(y, AXIS, [(i, (i + 1) % n) for i in range(n)])
+    return jax.lax.ppermute(y, AXIS, [(i, (i + step) % n) for i in range(n)])
 
 
-def _first(a: Shaped[Array, "s ..."]) -> Bool[Array, "s ..."]:
+def _is_first_stage(a: Shaped[Array, "s ..."]) -> Bool[Array, "s ..."]:
     """Return whether each slice of `a` is the first stage's, broadcastable to `a`."""
     return (jnp.arange(a.shape[0]) == 0).reshape(-1, *(1,) * (a.ndim - 1))
 
@@ -387,6 +390,9 @@ def _whole(a: Shaped[Array, "m n t *r"]) -> Shaped[Array, "b t *r"]:
     return a.swapaxes(0, 1).reshape(a.shape[0] * a.shape[1], *a.shape[2:])
 
 
+# --- Trees of stacked arrays ---------------------------------------------------------
+
+
 # By dynamic slices, not gathers and scatters: XLA fails to split a scatter over Auto
 # axes inside the shard_map, as a gather's gradient is.
 def at(tree: PyTree, i: Int[Array, ""] | int) -> PyTree:
@@ -398,6 +404,26 @@ def put(tree: PyTree, i: Int[Array, ""], new: PyTree) -> PyTree:
     """Return `tree` with slice `i` of every leaf replaced by `new`'s."""
     return jax.tree.map(
         lambda a, v: jax.lax.dynamic_update_index_in_dim(a, v, i, 0), tree, new
+    )
+
+
+def add_axes(tree: PyTree, n: int = 1) -> PyTree:
+    """Return each leaf of `tree` with `n` leading axes of 1: a stage's, as a
+    shard_map stacks what each device gives out, or the one round's."""
+    return jax.tree.map(lambda a: a[(None,) * n], tree)
+
+
+def first(tree: PyTree) -> PyTree:
+    """Return the first slice of every leaf of `tree`: of its one round, say, or of
+    the first stage's."""
+    return jax.tree.map(lambda a: a[0], tree)
+
+
+def stand_ins(tree: PyTree, leading: int = 0) -> PyTree:
+    """Return what traces in place of each leaf of `tree`: its shape and dtype alone,
+    without its first `leading` axes, as one pass of a stack is."""
+    return jax.tree.map(
+        lambda a: jax.ShapeDtypeStruct(a.shape[leading:], a.dtype), tree
     )
 
 

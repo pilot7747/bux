@@ -218,6 +218,15 @@ def pipe_longest(root: nnx.Module) -> nnx.Module:
     return root
 
 
+def pipelined_repeat(root: nnx.Module) -> tuple[tuple, Scanned]:
+    """Return the path in `root` of the repeat that ``pipe_longest`` pipelined, and
+    the repeat."""
+    [found] = [
+        (p, m) for p, m in nnx.iter_graph(root) if isinstance(m, Scanned) and m.rounds
+    ]
+    return found
+
+
 def _outermost(root: nnx.Module) -> list[Scanned]:
     """Return `root`'s scanned repeats outside any other."""
     found = [(p, m) for p, m in nnx.iter_graph(root) if isinstance(m, Scanned)]

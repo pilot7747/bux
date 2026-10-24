@@ -22,7 +22,7 @@ import jax
 import jax.numpy as jnp
 from flax import nnx
 from jax.typing import DTypeLike
-from jaxtyping import Array, Bool, Float, Int, Shaped
+from jaxtyping import Array, Bool, Float, Int
 
 from bux import parallel
 from bux.architecture.common.segments import Segments
@@ -99,16 +99,17 @@ def run(
     to `compute`, if given. The losses they report go into `taps`, each the mean over
     microbatches. Cut there (``stream_into``, ``leaving``), it runs none of them."""
     graphdef, params, rest = nnx.split(layers, nnx.Param, ...)
-    one = jax.tree.map(lambda a: _one_pass(a, rounds), nnx.merge_state(params, rest))
+    leading = 1 if rounds == 1 else 2  # (layers, ...), or (rounds, layers, ...)
+    one = pipeline.stand_ins(nnx.merge_state(params, rest), leading)
     _check(rounds * passes, graphdef, one, x, taps, compute)
     if _CUT.get() is not None:
         return _cut(x, taps)
     if rounds == 1:
-        params, rest = jax.tree.map(lambda a: a[None], (params, rest))
+        params, rest = pipeline.add_axes((params, rest))  # the one round
     stage = Stage.of(graphdef, passes, taps.training, compute)
     rows = Rows(taps.segments, taps.tokens)
     y, rest, losses = parallel.method("pipeline")(stage, params, rest, x, rows)
-    nnx.update(layers, rest if rounds > 1 else jax.tree.map(lambda a: a[0], rest))
+    nnx.update(layers, rest if rounds > 1 else pipeline.first(rest))
     stage.report(taps, losses)
     return y
 
@@ -236,14 +237,6 @@ def _skipping(
 def _stage_taps(rows: Rows, training: bool) -> Taps:
     """Return the taps a stage starts from: its rows', collecting losses if `training`."""
     return Taps(tokens=rows.tokens, segments=rows.segments, training=training)
-
-
-def _one_pass(
-    a: Shaped[Array, "..."] | jax.ShapeDtypeStruct, rounds: int
-) -> jax.ShapeDtypeStruct:
-    """Return the shape of one pass's slice of a stacked variable, by `rounds`, or of
-    a stand-in for it."""
-    return jax.ShapeDtypeStruct(a.shape[1 if rounds == 1 else 2 :], a.dtype)
 
 
 def _check(

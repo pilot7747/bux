@@ -36,7 +36,7 @@ from jax.sharding import PartitionSpec as P
 from jax.typing import DTypeLike
 from jaxtyping import Array, Float, Int, PyTree, Shaped
 
-from bux.parallel.layout import as_split, axes, axes_of, partition
+from bux.parallel.layout import as_split, axes_of, partition, split_axes
 from bux.parallel.mesh import active, manual_axes
 from bux.parallel.place import shardings
 
@@ -55,12 +55,7 @@ def rows() -> Axes:
     """Return the axes of the run's mesh that split a batch's rows, as `layout.batch`
     gives them, but those of size 1 and those a shard_map being traced maps."""
     on = active()
-    if on is None:
-        return ()
-    manual = manual_axes()
-    return tuple(
-        a for a in axes(on.layout, "batch") if on.size(a) > 1 and a not in manual
-    )
+    return () if on is None else split_axes(on, "batch", skip=manual_axes())
 
 
 def spans_processes(processes: Int[np.ndarray, "..."], axes: tuple[int, ...]) -> bool:

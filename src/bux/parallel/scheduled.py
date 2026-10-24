@@ -34,10 +34,14 @@ from bux.parallel.pipeline import (
     AXIS,
     Out,
     Stage,
+    add_axes,
     at,
+    first,
     join_stages,
     put,
+    send,
     split_by_stage,
+    stand_ins,
 )
 from bux.parallel.schedule import BACKWARD, CODES, FORWARD, WEIGHTS
 
@@ -134,7 +138,7 @@ class Scheduled:
             kept,
             rows,
         )
-        kept = jax.tree.map(lambda a: a[0], kept)  # as the first stage leaves it
+        kept = first(kept)  # as the first stage leaves it
         return Gradients(join_stages(grads), outside, join_stages(rest), kept, metrics)
 
 
@@ -468,8 +472,8 @@ class Ticks:
             d_params, dx = vjp((dy, dl))
             return [*jax.tree.leaves(d_params), dx]
 
-        shared = [stand_in(a) for a in [*params, *residuals]]
-        cotangents = [stand_in(shapes.x), stand_in(shapes.losses)]
+        shared = stand_ins([*params, *residuals])
+        cotangents = stand_ins([shapes.x, shapes.losses])
         return split.split(backward, shared, cotangents, weight_grads=len(params))
 
     def _losses_cotangent(self) -> Losses:
@@ -511,7 +515,7 @@ class Ticks:
     def _send_and_receive(self, held: Held, now: TickInputs) -> Held:
         """Send the forward's output on and the backward's input gradient back, and
         put what arrives in the slot of the microbatch it belongs to."""
-        to_next, to_previous = _send(held.to_next, 1), _send(held.to_previous, -1)
+        to_next, to_previous = send(held.to_next, 1), send(held.to_previous, -1)
         got = self.slot("inputs", now.from_before[self.index])
         inputs = put(held.inputs, got, to_next)
         got = self.slot("cotangents", now.from_after[self.index])
@@ -535,8 +539,8 @@ class Ticks:
             summed = jax.lax.psum((d_params, d_others, metrics), self.apart)
             d_params, d_others, metrics = summed
             reported = jax.lax.pmean(reported, self.apart)
-        kept = _new_axes(kept, 1)  # stage
-        d_params, rest = _new_axes(d_params, 2), _new_axes(rest, 2)  # stage, round
+        kept = add_axes(kept)  # stage
+        d_params, rest = add_axes((d_params, rest), 2)  # stage, round
         return d_params, d_others, rest, kept, _merged(metrics, reported)
 
     def _reported(self, losses: Losses) -> Metrics:
@@ -557,23 +561,6 @@ def _float32_zeros(tree: PyTree) -> PyTree:
     return jax.tree.map(lambda a: jnp.zeros(a.shape, jnp.float32), tree)
 
 
-def _new_axes(tree: PyTree, n: int) -> PyTree:
-    """Return each leaf of `tree` with `n` leading axes of 1, as a shard_map stacks
-    what each device gives out."""
-    return jax.tree.map(lambda a: a[(None,) * n], tree)
-
-
 def _merged(metrics: Metrics, more: Metrics) -> Metrics:
     """Return `metrics` and `more`, a name both have summed."""
     return metrics | {k: v + metrics[k] if k in metrics else v for k, v in more.items()}
-
-
-def stand_in(a: Leaf | jax.ShapeDtypeStruct) -> jax.ShapeDtypeStruct:
-    """Return what traces in place of `a`: its shape and dtype alone."""
-    return jax.ShapeDtypeStruct(a.shape, a.dtype)
-
-
-def _send(y: Stream, step: int) -> Stream:
-    """Send each stage's `y` to the stage `step` after it, round the ring."""
-    n = jax.lax.axis_size(AXIS)
-    return jax.lax.ppermute(y, AXIS, [(i, (i + step) % n) for i in range(n)])

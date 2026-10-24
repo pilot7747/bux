@@ -28,6 +28,7 @@ from bux.architecture import Model, Scanned
 from bux.architecture.common.segments import Segments
 from bux.architecture.registry import Stream, Taps
 from bux.architecture.repeats import pipelined, remat
+from bux.architecture.repeats.repeat import pipelined_repeat
 from bux.lang import ir
 from bux.parallel import pipeline, schedule
 from bux.train import flops
@@ -60,14 +61,14 @@ def _work(run: ir.Run) -> tuple[int, pipeline.Work]:
     row = _row(t.seq_len)
     with _on_stages(run), remat.off(), kernels.off():
         model = nnx.eval_shape(lambda: Model(run.arch, rngs=nnx.Rngs(t.seed)))
-        [repeat] = [m for _, m in nnx.iter_graph(model) if _pipelined(m)]
+        _, repeat = pipelined_repeat(model)
         graphdef, state = nnx.split(model)
         before = functools.partial(_before, graphdef)
         after = functools.partial(_after, graphdef, loss)
-        run_pass, one = _first_pass(repeat)
+        run_pass, one = _one_pass(repeat)
         x = jax.eval_shape(before, state, row)
         up_to = _of_one_document(t.seq_len, before, state, row)
-        to_loss = _of_one_document(t.seq_len, after, state, row, x)
+        to_loss = _of_one_document(t.seq_len, after, state, row, x)  # up_to's too
         each = _of_one_document(t.seq_len, run_pass, one, row, x)
     return repeat.times, pipeline.Work(up_to, each, to_loss - up_to)
 
@@ -87,10 +88,6 @@ def _on_stages(run: ir.Run) -> Generator[None]:
     grid = AbstractMesh(shape, parallel.AXES, axis_types=auto)
     with parallel.use(grid, t.layout, t.methods):
         yield
-
-
-def _pipelined(module: object) -> bool:
-    return isinstance(module, Scanned) and module.rounds > 0
 
 
 def _row(seq_len: int) -> Batch:
@@ -118,15 +115,15 @@ def _after(
     return per_token.loss + per_row.loss
 
 
-def _first_pass(repeat: Scanned) -> tuple[functools.partial, nnx.State]:
+def _one_pass(repeat: Scanned) -> tuple[functools.partial, nnx.State]:
     """Return a function that runs a pass of the pipelined `repeat`, `(state, row, x)
     -> y`, and the shapes of a pass's state."""
     graphdef, stacked = nnx.split(repeat.layers)
-    one = jax.tree.map(lambda a: jax.ShapeDtypeStruct(a.shape[1:], a.dtype), stacked)
-    return functools.partial(_pass, graphdef), one
+    return functools.partial(_pass, graphdef), pipeline.stand_ins(stacked, 1)
 
 
 def _pass(graphdef: nnx.GraphDef, state: nnx.State, row: Batch, x: Stream) -> Stream:
+    """Return the stream after a pass of state `state` on `x`, as a stage runs it."""
     tokens, positions = jnp.asarray(row.input_ids), jnp.asarray(row.position_ids)
     taps = Taps(tokens=tokens, segments=Segments.of(positions), training=True)
     return nnx.merge(graphdef, state)(x, taps)

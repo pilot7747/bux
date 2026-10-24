@@ -4,9 +4,10 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 import pytest
+from conftest import kept_bytes
 from flax import nnx
 from jax.sharding import PartitionSpec as P
-from jaxtyping import Array, Int, Shaped
+from jaxtyping import Array, Int
 
 from bux import config as cfg
 from bux import parallel
@@ -144,15 +145,9 @@ def _kept_bytes(
     g = -jax.random.uniform(ks[3], (b, t, h, decay))
     beta = jax.nn.sigmoid(jax.random.normal(ks[4], (b, t, h)))
     xs = (q, k, v, g, beta)
-
-    def kept(*xs: Shaped[jax.Array, "..."]) -> list[Shaped[jax.Array, "..."]]:
-        return jax.tree.leaves(jax.vjp(lambda *x: delta_rule(*x, None), *xs)[1])
-
-    methods = tcfg.MethodsConfig(states=states)
-    with parallel.use(tcfg.MeshConfig(data=1), methods=methods):
-        shapes = jax.eval_shape(kept, *xs)
+    kept = kept_bytes(lambda *x: delta_rule(*x, None), *xs, states=states)
     inputs = sum(x.nbytes for x in xs) + b * t * 4  # and where documents continue
-    return sum(x.size * x.dtype.itemsize for x in shapes), inputs, b * h * t * 64 * 4
+    return kept, inputs, b * h * t * 64 * 4
 
 
 @pytest.mark.parametrize("decay", [1, 128], ids=["gdn", "kda"])
