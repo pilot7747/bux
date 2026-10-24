@@ -17,6 +17,7 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 import pytest
+from conftest import equations
 from jax.ad_checkpoint import checkpoint_name, name_p
 from jax.extend.core import primitives
 from jax.sharding import PartitionSpec as P
@@ -164,12 +165,7 @@ def test_a_cond_s_branches_are_its_functions_by_index():
 
 def _names(f, *args) -> set[str]:
     """The primitives' names in f's jaxpr, inside its calls too."""
-
-    def walk(jaxpr: core.Jaxpr) -> set[str]:
-        inner = (j for e in jaxpr.eqns for j in core.jaxprs_in_params(e.params))
-        return {e.primitive.name for e in jaxpr.eqns}.union(*map(walk, inner))
-
-    return walk(jax.make_jaxpr(f)(*args).jaxpr)
+    return {e.primitive.name for e, _ in equations(jax.make_jaxpr(f)(*args).jaxpr)}
 
 
 def test_the_primitives_bux_matches_by_name_are_jax_s():

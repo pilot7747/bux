@@ -9,9 +9,9 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 import pytest
+from conftest import count
 from flax import nnx
 from jax._src.ad_checkpoint import saved_residuals
-from jax.extend.core import ClosedJaxpr, Jaxpr
 from jax.sharding import PartitionSpec as P
 from jaxtyping import Float
 from optax.contrib import MuonDimensionNumbers
@@ -486,7 +486,7 @@ def _scaled_matmuls(how: str) -> int:
     x = jnp.ones((64, 64))
     with _use(f"methods(remat={how})"), matmuls.use("mxfp8", jnp.asarray(TOKENS)):
         jaxpr = jax.make_jaxpr(jax.grad(loss, argnums=(0, 1)))(x, x)
-    return _count(jaxpr.jaxpr, "scaled_matmul")
+    return count(jaxpr.jaxpr, "scaled_matmul")
 
 
 def test_a_dots_policy_keeps_an_mxfp8_gemm_inside_a_shard_map():
@@ -494,20 +494,6 @@ def test_a_dots_policy_keeps_an_mxfp8_gemm_inside_a_shard_map():
     # misses: its backward would run the forward's GEMM again for tanh's.
     assert _scaled_matmuls("dots") == _scaled_matmuls("dots_no_batch") == 3
     assert _scaled_matmuls("full") == 4
-
-
-def _count(jaxpr: Jaxpr, primitive: str) -> int:
-    """How many times `primitive` runs in `jaxpr`, inside the jaxprs it calls too."""
-    n = 0
-    for eqn in jaxpr.eqns:
-        n += eqn.primitive.name == primitive
-        for param in eqn.params.values():
-            for sub in param if isinstance(param, tuple | list) else (param,):
-                if isinstance(sub, ClosedJaxpr):
-                    sub = sub.jaxpr
-                if isinstance(sub, Jaxpr):
-                    n += _count(sub, primitive)
-    return n
 
 
 MLA = "mla(num_heads=4, kv_lora_rank=16, q_lora_rank=32, qk_rope_head_dim=8"

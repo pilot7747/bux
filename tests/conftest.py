@@ -1,5 +1,5 @@
-"""Fixtures: a tokenizer and a corpus that need no network, and runs trained on
-8 devices.
+"""Fixtures: a tokenizer and a corpus that need no network, runs trained on 8
+devices, and the equations of a jaxpr.
 
 First, before anything starts JAX, it gets 8 CPU devices, so that the tests split runs
 over them and compare with one; and before anything imports bux, jaxtyping instruments
@@ -26,11 +26,13 @@ jaxtyping.install_import_hook(
 
 import itertools
 import json
+from collections.abc import Iterator
 
 import numpy as np
 import pyarrow as pa
 import pyarrow.parquet as pq
 import pytest
+from jax.extend.core import Jaxpr, JaxprEqn, jaxprs_in_params
 
 from bux.lang import compile_runs
 from bux.train import config as tcfg
@@ -95,6 +97,21 @@ def corpus(folder, n=600) -> str:
         pa.table({"text": texts[n // 2 :]}), folder / "b.parquet", row_group_size=50
     )
     return str(folder / "*.parquet")
+
+
+def equations(jaxpr: Jaxpr, times: int = 1) -> Iterator[tuple[JaxprEqn, int]]:
+    """Every equation of `jaxpr` and of the jaxprs inside it, with how many times it
+    runs: a scan's body as many times as the scan's length."""
+    for e in jaxpr.eqns:
+        yield e, times
+        inner = times * e.params["length"] if e.primitive.name == "scan" else times
+        for sub in jaxprs_in_params(e.params):
+            yield from equations(sub, inner)
+
+
+def count(jaxpr: Jaxpr, primitive: str) -> int:
+    """How many equations of `primitive` `jaxpr` has, in the jaxprs inside it too."""
+    return sum(e.primitive.name == primitive for e, _ in equations(jaxpr))
 
 
 # What `losses` trains with, unless the source or its settings say otherwise.

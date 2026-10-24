@@ -4,11 +4,11 @@ one device: their tables, the backward split in two, and the runs they train."""
 from collections import Counter
 
 import jax
-import jax.extend
 import jax.numpy as jnp
 import numpy as np
 import optax
 import pytest
+from conftest import equations
 from flax import nnx
 from jaxtyping import Float, Shaped
 
@@ -143,17 +143,8 @@ def test_zbh1_holds_a_microbatch_a_stage_and_idles_a_tick_a_stage():
 
 def _dots(f, *args) -> int:
     """The matmuls `f` runs, each as many times as the scans around it."""
-
-    def count(jaxpr: jax.extend.core.Jaxpr, times: int) -> int:
-        n = 0
-        for e in jaxpr.eqns:
-            n += times * (e.primitive.name == "dot_general")
-            inner = times * e.params["length"] if e.primitive.name == "scan" else times
-            for sub in jax.extend.core.jaxprs_in_params(e.params):
-                n += count(sub, inner)
-        return n
-
-    return count(jax.make_jaxpr(f)(*args).jaxpr, 1)
+    found = equations(jax.make_jaxpr(f)(*args).jaxpr)
+    return sum(times for e, times in found if e.primitive.name == "dot_general")
 
 
 SPLITS = [("none", None), ("full", None), ("none", [True, False, True, True])]
