@@ -79,6 +79,27 @@ def test_interleaved_microbatches_give_the_loop_s_gradients_and_state(
         assert jnp.array_equal(a, b)
 
 
+@pytest.mark.parametrize(
+    "methods",
+    [
+        # MXFP8 but the first and the last branch, which the pieces number as the
+        # whole forward does: a branch in the wrong format differs by its rounding.
+        tcfg.MethodsConfig(),
+        # Each branch rematerialized inside its piece, by the run's policy.
+        tcfg.MethodsConfig(remat="dots"),
+    ],
+)
+def test_interleaved_pieces_multiply_and_rematerialize_as_the_whole_model(methods):
+    formats = tcfg.PrecisionConfig(matmuls="mxfp8", first=1, last=1)
+    with parallel.use(tcfg.MeshConfig(data=1), methods=methods):
+        loop = _trainer("blocks", 2, matmuls=formats)
+        both = _trainer("blocks", 2, interleave=True, matmuls=formats)
+        g1, _ = nnx.jit(loop.gradients)(loop.model, _documents())
+        g2, _ = nnx.jit(both.gradients)(both.model, _documents())
+    close = jax.tree.map(lambda a, b: jnp.allclose(a, b, atol=1e-6), g1, g2)
+    assert all(jax.tree.leaves(close))
+
+
 @pytest.mark.parametrize("arch", ["llama", "moe"])
 def test_a_run_interleaved_trains_as_its_microbatches_in_a_row(losses, arch):
     source = PRELUDE + MODELS[arch]
@@ -122,7 +143,12 @@ def test_a_pipeline_schedules_its_own_microbatches():
 
 
 def _trainer(
-    arch: str | None, n: int, *, source: str | None = None, interleave: bool = False
+    arch: str | None,
+    n: int,
+    *,
+    source: str | None = None,
+    interleave: bool = False,
+    matmuls: tcfg.PrecisionConfig | str = "compute",
 ) -> Trainer:
     text = source if source is not None else PRELUDE + MODELS[arch or "llama"]
     [run] = compile_runs(text + "\n" + TRAIN)
@@ -130,7 +156,9 @@ def _trainer(
     model = parallel.build(lambda: Model(run.arch, rngs=nnx.Rngs(0)))
     tx = optimizer(t.optimizer, lr_multiplier(t.schedule, t.steps), model, t.clip)
     loss = objective(t.loss, run.arch)
-    return Trainer(model, tx, loss, microbatches=n, interleave=interleave)
+    return Trainer(
+        model, tx, loss, matmuls=matmuls, microbatches=n, interleave=interleave
+    )
 
 
 def _documents() -> Batch:
