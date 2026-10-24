@@ -18,7 +18,7 @@ from jax.sharding import PartitionSpec as P
 from jaxtyping import Array, Bool, Float, Int
 
 from bux.parallel import flash, methods
-from bux.parallel.flash import Keys
+from bux.parallel.flash import Keys, per_query_head
 from bux.parallel.layout import as_split, axes_of, shard, spec
 from bux.parallel.mesh import active, free_axes
 from bux.train import flops
@@ -74,17 +74,12 @@ def shard_logits(logits: Float[Array, "b h t s"]) -> Float[Array, "b h t s"]:
     return shard(logits, "batch", "heads", "seq", None)
 
 
-def _per_query_head(kv: Float[Array, "b s g e"], heads: int) -> Float[Array, "b s h e"]:
-    """Repeat keys or values for every query head of their group."""
-    return jnp.repeat(kv, heads // kv.shape[2], axis=2)
-
-
 def scaled_logits(
     q: Float[Array, "b t h dk"], k: Float[Array, "b s g dk"], scale: float
 ) -> Float[Array, "b h t s"]:
     """Return every query's dot product with every key, times `scale`, in float32;
     the keys stay whole along their positions."""
-    k = _per_query_head(k, q.shape[2])
+    k = per_query_head(k, q.shape[2])
     logits = jnp.einsum("bthk,bshk->bhts", q, k, preferred_element_type=jnp.float32)
     return shard_logits(logits * scale)
 
@@ -118,7 +113,7 @@ def weighted_values(
     probs: Float[Array, "b h t s"], v: Float[Array, "b s g dv"]
 ) -> Float[Array, "b t h dv"]:
     """Return every query's values, weighted by its probabilities."""
-    v = _per_query_head(v, probs.shape[1])
+    v = per_query_head(v, probs.shape[1])
     return jnp.einsum("bhts,bshv->bthv", probs.astype(v.dtype), v)
 
 
@@ -160,7 +155,7 @@ def _specs(
     queries = spec(("batch", None, "heads", None), q.shape)
     keys = spec(("batch", None, "kv_heads", None), k.shape)
     if keys[2] != queries[2]:
-        k, v = (_per_query_head(x, q.shape[2]) for x in (k, v))
+        k, v = (per_query_head(x, q.shape[2]) for x in (k, v))
         keys = queries
     positions = AXIS if seq else None
     return k, v, P(queries[0], positions, queries[2]), P(keys[0], positions, keys[2])
@@ -319,7 +314,7 @@ def _ulysses(
             "heads of a device"
         )
     if g % c:
-        k, v = (jnp.repeat(x, h // g, axis=2) for x in (k, v))
+        k, v = (per_query_head(x, h) for x in (k, v))
     if ids is not None:
         ids = jax.lax.all_gather(ids, AXIS, axis=1, tiled=True)
     if sinks is not None:

@@ -54,6 +54,11 @@ class Kernel(NamedTuple):
     backward: Callable[..., Grads]
 
 
+def per_query_head(kv: Float[Array, "b s g e"], heads: int) -> Float[Array, "b s h e"]:
+    """Repeat keys or values for every query head of their group."""
+    return jnp.repeat(kv, heads // kv.shape[2], axis=2)
+
+
 # --- jnp ----------------------------------------------------------------------------
 
 
@@ -77,7 +82,7 @@ def _logits(
     cap: float | None,
 ) -> tuple[Float[Array, "b h t s"], Float[Array, "b h t s"]]:
     """Return the logits in float32, before the soft cap and after it."""
-    k = jnp.repeat(k.astype(F32), q.shape[2] // k.shape[2], axis=2)
+    k = per_query_head(k.astype(F32), q.shape[2])
     raw = jnp.einsum("bthd,bshd->bhts", q.astype(F32), k) * scale
     return raw, raw if cap is None else cap * jnp.tanh(raw / cap)
 
@@ -94,7 +99,7 @@ def _jnp_forward(
     _, logits = _logits(q, k, scale, cap)
     lse = jax.nn.logsumexp(jnp.where(seen, logits, -jnp.inf), -1)
     p = jnp.where(seen, jnp.exp(logits - finite(lse)[..., None]), 0)
-    v = jnp.repeat(v.astype(F32), q.shape[2] // v.shape[2], axis=2)
+    v = per_query_head(v.astype(F32), q.shape[2])
     return jnp.einsum("bhts,bshd->bthd", p, v).astype(q.dtype), lse
 
 
@@ -109,12 +114,12 @@ def _jnp_backward(
     scale: float,
     cap: float | None,
 ) -> Grads:
-    g, r = k.shape[2], q.shape[2] // k.shape[2]
+    g, h = k.shape[2], q.shape[2]
     raw, logits = _logits(q, k, scale, cap)
     seen = _seen(keys, q.shape[1], k.shape[1])
     p = jnp.where(seen, jnp.exp(logits - finite(lse)[..., None]), 0)
-    do, kk = dout.astype(F32), jnp.repeat(k.astype(F32), r, axis=2)
-    dp = jnp.einsum("bthd,bshd->bhts", do, jnp.repeat(v.astype(F32), r, axis=2))
+    do, kk = dout.astype(F32), per_query_head(k.astype(F32), h)
+    dp = jnp.einsum("bthd,bshd->bhts", do, per_query_head(v.astype(F32), h))
     ds = p * (dp - jnp.einsum("bthd,bthd->bht", do, out.astype(F32))[..., None])
     if cap is not None:
         ds = ds * (1 - jnp.tanh(raw / cap) ** 2)

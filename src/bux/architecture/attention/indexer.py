@@ -406,7 +406,7 @@ class Indexer(nnx.Module):
     def _picked_by_kernel(self, k: int) -> bool:
         """Return whether ``scoring``'s kernels score each query's k picks: they stop
         at its last, so a query of a short document takes few steps."""
-        return scoring.picked_run(self.heads, self.head_dim, k)
+        return scoring.picked_runs(self.heads, self.head_dim, k)
 
     def _blocks(
         self,

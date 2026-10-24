@@ -27,7 +27,7 @@ from bux import jax_internals, kernels, parallel
 from bux.architecture.attention import scoring
 from bux.architecture.common.segments import Segments
 from bux.parallel.context import softcap
-from bux.parallel.flash import MOSAIC, finite, tokamax_lse
+from bux.parallel.flash import MOSAIC, finite, per_query_head, tokamax_lse
 from bux.train import flops
 
 KEPT = "mask of kept keys (an indexer's top-k, or CSA's compression)"
@@ -234,7 +234,7 @@ def _heads_like(part: Part, split: P, heads: int) -> Part:
     keys = parallel.spec(("batch", None, "kv_heads", None), part.k.shape)
     if g == 1 or keys[2] == split[2]:
         return part
-    k, v = (jnp.repeat(x, heads // g, axis=2) for x in (part.k, part.v))
+    k, v = (per_query_head(x, heads) for x in (part.k, part.v))
     return part._replace(k=k, v=v)
 
 
@@ -355,7 +355,7 @@ def probabilities(
     not, summed over heads, in the softmax whose logsumexp is `lse`; 0 for slots
     outside the span or that do not exist. By ``scoring``'s kernel where it runs."""
     t, s, d = q.shape[1], part.k.shape[1], part.k.shape[-1]
-    if part.exists is None and scoring.probabilities_run(t, s, d):
+    if part.exists is None and scoring.probabilities_runs(t, s, d):
         return _probabilities_kernel(q, part, lse, scale, cap)
     with flops.over_keys():
         _, logits = _logits(q, part.k, scale, cap)

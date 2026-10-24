@@ -147,7 +147,7 @@ def _kernel(
 # --- the attention's probabilities, the indexer's target ------------------------------
 
 
-def probabilities_run(t: int, s: int, d: int) -> bool:
+def probabilities_runs(t: int, s: int, d: int) -> bool:
     """Return whether `probabilities`' kernel runs: on a GPU, where blocks of a power
     of two divide the t queries and s keys, for heads of a power of two up to 128
     dims. On a B300 it takes half XLA's time at 128 (GQA's, MQA's), and 1.4 times
@@ -239,7 +239,7 @@ def probabilities(
 # --- the scores of each query's picks, for the indexer's loss -------------------------
 
 
-def picked_run(h: int, i: int, k: int) -> bool:
+def picked_runs(h: int, i: int, k: int) -> bool:
     """Return whether `picked`'s kernels run: on a GPU, for h heads and i head dims of
     a power of two, and k picks in blocks of 16 or more."""
     pow2 = all(n >= 16 and n & (n - 1) == 0 for n in (h, i))
