@@ -1813,9 +1813,10 @@ What a stage holds is the residuals of as many ticks or microbatches. `circular`
 at least one microbatch per stage, and only it reads `methods.rounds`. The bubble of
 `zbh1` counts a forward, a backward of the input and one of the weights as a tick each.
 
-`1f1b` is the default: on one node of B300s it trains the 1.3B below 9-23% faster than
-`gpipe`, in half its memory or less, on the stages a run balances. It runs where
-`gpipe` does, but:
+`1f1b` is the default: on one node of B300s, on the stages a run balances, it trains
+the 1.3B below 8% faster than `gpipe` on 2 stages in half its memory, 22% faster on 4
+in a fifth less, and as fast on 8 in a seventh less ([Stages](#stages-methodsstages)).
+It runs where `gpipe` does, but:
 
 - in rounds: only `circular` goes round the stages more than once, and
   `methods(rounds=2)` under `1f1b` is an error that says so;
@@ -2056,7 +2057,20 @@ loss by chunks, the splits about the balanced one:
 The balanced split is the hand-tuned one, and the fastest, on both (on 2 stages tied
 with `[9, 7]`). Its FLOPs count attention's: without them the head would be 5.6
 passes' work, and 2 stages would take `[11, 5]`, 6% slower.
-PP_DEFAULTS
+The defaults, against `gpipe` (the default before) and against `1f1b` on even
+stages, by the one-node suite's pipeline (`examples/benchmarks/one_node.bux`, 8
+microbatches):
+
+| mesh              | `gpipe`           | `1f1b`, even      | `1f1b`, balanced: the default      |
+|-------------------|-------------------|-------------------|------------------------------------|
+| `stage=2, fsdp=4` | 629k, 60.0 GiB    | 652k, 22.2 GiB    | `[10, 6]`: 682k, 30.8 GiB          |
+| `stage=4, fsdp=2` | 491k, 65.0 GiB    | 494k, 40.8 GiB    | `[5, 5, 5, 1]`: 598k, 52.7 GiB     |
+| `stage=8`         | 320k, 83.7 GiB    | 333k, 50.1 GiB    | `[3, 2, 2, 2, 2, 2, 2, 1]`: 320k, 71.1 GiB |
+
+On 8 stages, 8 microbatches barely fill the pipeline, whose stages idle 7 ticks of
+15: the slowest stage is in fewer ticks than the stages around it, and the even split
+is 4% faster there. With more microbatches the balanced split pays again: at 16,
+364k against even stages' 358k and gpipe's 346k; at 32, 396k against 373k and 356k.
 
 ### Later: DualPipe
 
