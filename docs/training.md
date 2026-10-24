@@ -580,10 +580,10 @@ beside the pool: the CUDA context, NCCL's buffers and NCCL EP's, which on B300s
 
 At 95% a B300's pool is 254 GiB and 14.3 GiB stay beside it; at 97%, 8.9 GiB, too
 little for NCCL EP over two nodes, whose buffers grow with a device's tokens and the
-model's width. `remat=auto` fits the step to the pool: `sorted` takes `dots_attention`
-at 95% (229k tokens a second, 200 GiB), where it took `dots` at 75% (210k, 180 GiB,
-its experts split by `embed`), and `none` at 97% (257k, 250 GiB), which a run under
-FSDP alone can ask for with `XLA_CLIENT_MEM_FRACTION=.97`.
+model's width. `remat=auto` fits the step to the pool: Qwen3-30B-A3B's `sorted` arm
+(`megatron.bux`) took `dots` at 75% (210k tokens a second, 180 GiB) before the MoE's
+weights moved before `down`, and takes `none` at 95% now (295k, 215 GiB), as does its
+`nccl_ep` arm (246k, 211 GiB), each in one compile.
 
 A compile of `sorted`'s 48-layer step (`remat=none`) takes about 230 s on a B300's
 host: 38 s to trace it, 62 s to lower it to MLIR, and 132 s in XLA, 89 of them in its
