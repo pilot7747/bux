@@ -386,7 +386,7 @@ class PrecisionConfig(Config):
     # The dtype gradients are summed over the batch's rows in: compute, or float32 as
     # Megatron's are, which a step sums once (methods.accumulate = unreduced).
     reduce: Literal["compute", "float32"] = "compute"
-    # What the ragged MoE methods send tokens to their experts in: compute, or MXFP8
+    # What the MoE's exchanges send tokens to their experts in: compute, or MXFP8
     # (DeepSeek-V3's FP8 dispatch); what comes back, and gradients, go in compute.
     dispatch: Literal["compute", "mxfp8"] = "compute"
 
@@ -468,9 +468,13 @@ class MethodsConfig(Config):
     type: Literal["methods"] = "methods"
     attention: str = "auto"
     moe: str = "sorted"
-    # The picks a device of all_gather or the ragged MoE methods takes, a multiple of
-    # its own; what does not fit drops, which `dropped` reports. None: all that come.
+    # The picks a device of all_gather or the ragged MoE methods takes, or all_to_all
+    # sends each peer, a multiple of its own (of its share for a peer); what does not
+    # fit drops, which `dropped` reports. None: all that come.
     capacity: Annotated[float, Field(gt=0)] | None = None
+    # The slices of each device's tokens that expert parallelism sends one after
+    # another, so that one's exchange runs beside another's experts.
+    moe_chunks: Positive = 1
     recurrence: str = "scan"
     # What the backward pass of a recurrence by chunks reads of its chunks' states:
     # kept from the forward pass, or computed again from its inputs, in a fourteenth

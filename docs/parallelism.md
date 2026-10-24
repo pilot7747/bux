@@ -892,7 +892,7 @@ methods = methods(moe=ragged_all_to_all, capacity=1.25)
 | method              | what it does                                                  |
 |---------------------|---------------------------------------------------------------|
 | `all_gather`        | each device gathers its group's tokens, runs its own experts on them, and a `psum_scatter` brings each token its sum back |
-| `all_to_all`        | each pick goes to its expert's device and back by `jax.lax.all_to_all`, in one buffer per peer that holds every local pick, so that none drops |
+| `all_to_all`        | each pick goes to its expert's device and back by `jax.lax.all_to_all`, in a buffer of one size for each peer, sorted by expert: a device runs its experts on each peer's buffer as it arrives, a grouped GEMM a peer |
 | `ragged_all_to_all` | each pick goes to its expert's device and back by `jax.lax.ragged_all_to_all`, a slice for each expert of each peer: a device's rows arrive sorted by its experts, which run on them as they are. XLA:CPU lacks it |
 | `ragged_tokens`     | the same, but each token goes once to each device that holds any of its experts, with its picks there, and comes back as their weighted sum: a row per device, not per pick |
 
@@ -919,7 +919,10 @@ to its token. A training step reports the share of the picks dropped as `dropped
 summed over the MoE layers, as `balance_loss` is. A capacity that drops anything
 changes what a run computes, unlike the rest of `methods`, though it stays out of the
 run's id. `ragged_tokens` takes as many tokens as picks, or as many as could come, a
-token from each device. `all_to_all` has no capacity.
+token from each device. `all_to_all` bounds each of a device's buffers, one a peer,
+at `capacity` times a peer's even share of its picks (its picks over `expert`), and
+drops what does not fit there, that peer's last experts' picks first; dropless, a
+buffer holds every pick, so a device sends `expert` times the rows it has.
 
 The buffers that receive are `jax.lax.empty`: the experts make 0 of the rows past
 theirs, and the rows that do not come back are masked. XLA's one-shot ragged
@@ -955,21 +958,22 @@ on one device:
 
 | mesh                       | method       | all-gather | all-to-all | reduce-scatter | all-reduce |
 |----------------------------|--------------|------------|------------|----------------|------------|
-| `expert=8`                 | `sorted`     | 8, 392     |            |                | 2, 678     |
-|                            | `all_gather` | 10, 76     |            | 6, 8           | 2, 294     |
-|                            | `all_to_all` | 2, 8       | 10, 258    |                | 2, 294     |
-| `data=2, fsdp=2, expert=2` | `sorted`     | 54, 879    |            |                | 6, 808     |
-|                            | `all_gather` | 56, 512    |            | 6, 8           | 8, 616     |
-|                            | `all_to_all` | 48, 495    | 10, 64     |                | 8, 616     |
-| `fsdp=2, expert=4`         | `sorted`     | 54, 783    |            |                | 6, 808     |
-|                            | `all_gather` | 56, 433    |            | 6, 8           | 6, 520     |
-|                            | `all_to_all` | 48, 399    | 10, 129    |                | 6, 520     |
+| `expert=8`                 | `sorted`     | 48, 688    |            |                | 3, 678     |
+|                            | `all_gather` | 50, 372    |            | 6, 8           | 3, 294     |
+|                            | `all_to_all` | 42, 304    | 10, 256    |                | 3, 294     |
+| `data=2, fsdp=2, expert=2` | `sorted`     | 54, 880    |            |                | 7, 736     |
+|                            | `all_gather` | 56, 513    |            | 6, 8           | 8, 544     |
+|                            | `all_to_all` | 48, 496    | 10, 64     |                | 8, 544     |
+| `fsdp=2, expert=4`         | `sorted`     | 54, 784    |            |                | 5, 678     |
+|                            | `all_gather` | 56, 434    |            | 6, 8           | 6, 390     |
+|                            | `all_to_all` | 48, 400    | 10, 128    |                | 6, 390     |
 
 `sorted` gathers every expert's kernels and all-reduces their gradients; the others
 move tokens instead. Dropless with buffers of a fixed size, `all_to_all` moves
 `top_k` times the rows `all_gather` does, as every peer's buffer holds every local
-pick: it is the CPU sibling of `ragged_all_to_all`, which moves the picks alone. No
-method rematerializes anything on these meshes, nor on `fsdp=2, expert=2, tensor=2`.
+pick; under a capacity it moves `capacity` times the picks, where
+`ragged_all_to_all` moves the picks alone. No method rematerializes anything on these
+meshes, nor on `fsdp=2, expert=2, tensor=2`.
 
 On 8 B300s every method computes what one GPU does (`scripts/gpu_smoke/experts.py`,
 in float32: 7e-7 apart at most). For the baseline's MoE (`d_model` 2048, 64 experts,
@@ -981,12 +985,15 @@ in float32: 7e-7 apart at most). For the baseline's MoE (`d_model` 2048, 64 expe
 | `all_gather`, `capacity=1.25`    | `expert=8` | 612k, 89 GiB        | 515k, 65 GiB     |
 | `ragged_all_to_all`, `capacity=1.25` | `expert=8` | 550k, 88 GiB    | 515k, 78 GiB     |
 | `ragged_tokens`, `capacity=1.25` | `expert=8` | 547k, 90 GiB        | 479k, 74 GiB     |
+| `all_to_all`, `capacity=1.25`    | `expert=8` | 559k, 89 GiB        |                  |
+| the same, `moe_chunks=2`         | `expert=8` | 574k, 89 GiB        |                  |
 
 Before the by-expert slices, the capacity and the pieces, `all_to_all` and
 `ragged_all_to_all` ran out of memory at 16k tokens a GPU, and under `remat=full` at
 32k they made 72k and 25k tokens a second (now `ragged_all_to_all` dropless: 263k).
 On one node at this shape, then, `sorted` is still the fastest: its FSDP gathers 0.5
-GB of experts a layer, where the exchanges move 1 GB of picks each way. Under `dots`
+GB of experts a layer, where the exchanges move 1 GB of picks each way
+([below](#in-chunks-methodsmoe_chunks) says what bounds them). Under `dots`
 the exchanges ran again in the backward, since their results are no products; named
 for it ([below](#fp8-dispatch-precisiondispatch)), `ragged_all_to_all` trains at 515k
 tokens a second in 77.5 GiB, from 452k in 72.6. XLA's ragged all-to-all leaves an allocation inside the memory pool after the first step,
@@ -1011,27 +1018,94 @@ On jax 0.12 NCCL's ragged all-to-all hangs unless XLA_FLAGS has
 `bux train` and `bux launch` add to it, and so does `bux.runtime.configure()` in a
 script that calls it before it touches a device.
 
+### In chunks: `methods.moe_chunks`
+
+```
+methods = methods(moe=all_to_all, capacity=1.25, moe_chunks=2)
+```
+
+An EP layer waits for four exchanges: the picks there and back, and the backward's
+two. `methods.moe_chunks` cuts each device's tokens into that many slices, which a
+method runs one after another, each on its own (`experts.in_chunks`), so that the
+compiler can send one slice's picks while another slice's experts run. Where it does
+not divide a device's tokens, it takes as many slices as do. A slice's experts, and
+each peer's under `all_to_all`, add their part of the kernels' gradients, which add up
+in float32, as one call's would.
+
+Only `all_to_all` gains from it, on 8 B300s with jax 0.12:
+
+- NCCL's all-to-all, which `all_to_all` sends by, runs on its own stream on a few of
+  the SMs: beside an independent grouped GEMM the two take a fifth longer than the
+  all-to-all alone.
+- XLA's ragged all-to-all overlaps nothing. Its one-shot kernel copies in 2048 blocks
+  of threads, which take every SM, so beside a GEMM the two take as long as one after
+  the other, and in chunks a step is slower. Nor does XLA schedule for it: its latency
+  hiding scheduler, which moves collectives beside compute, runs on Hopper and
+  Blackwell only where its cost model knows every collective of a step
+  (`SolLatencyEstimator::IsSupportedForModule`), and ragged-all-to-all is none of
+  them. `compiler(preset=lhs)` runs it anyway, and at 32k tokens a GPU the step then
+  runs out of memory, in the hole the ragged exchange leaves in the pool.
+- A collective-permute a peer (in turn i each device sends the i-th after it its
+  buffer and runs its experts on the one it gets) hides half its time, but seven of
+  them take twice as long as one all-to-all, by NCCL or by copy engines
+  (`--xla_gpu_use_memcpy_local_p2p`): 394k tokens a second.
+
+For the baseline's MoE at 32k tokens a GPU and a capacity of 1.25, profiled, tokens a
+second and ms of a step of a GPU: all its collectives, those with no compute beside
+them (the log's `exposed_comm_ms`), and the experts' grouped GEMMs:
+
+| method                                      | tokens a second | collectives | exposed | experts' GEMMs |
+|---------------------------------------------|-----------------|-------------|---------|----------------|
+| `sorted`, `fsdp=8`                          | 830k            | 66          | 7       | 110            |
+| `ragged_all_to_all`                         | 546k            | 167         | 152     | 116            |
+| `all_to_all`                                | 559k            | 165         | 143     | 117            |
+| `all_to_all`, `moe_chunks=2`                | 574k            | 208         | 90      | 153            |
+| `all_to_all`, 2 microbatches, unrolled      | 562k            | 219         | 98      | 155            |
+
+The table's runs come from several nodes. Side by side on one node
+(`scripts/benchmark.py`, the one-node suite's `moe` and `moe_ep`, the latter as
+`methods` says), `sorted` trains at 835k tokens a second, `ragged_all_to_all` at 539k
+and `all_to_all` in 2 chunks at 586k, 0.70 of `sorted`.
+
+What bounds EP here is its exchange: four of 1.1 to 1.3 GB a layer a GPU, 150 ms of a
+step at NCCL's 500 GB/s, where `sorted`'s FSDP gathers 0.5 GB of experts a layer and
+reduces their gradients, 66 ms that hide behind compute. Chunks hide a third of the
+exchange, but a GEMM beside NCCL's kernels runs a third slower and gives most of it
+back: the experts' GEMMs take 153 ms rather than 117, and the step gains 3%. DeepSeek's
+two microbatches, each one's exchanges beside the other's compute (the trainer's
+microbatches unrolled rather than scanned, by hand), do no better. EP would beat
+`sorted` on one node at this shape with an exchange near NVLink's 900 GB/s, on a few
+SMs and without the capacity's padding, as DeepEP's and TransformerEngine's kernels
+send it, hidden behind the attention as well as the experts.
+
+Fewer NCCL channels, to leave the GEMMs more SMs, slow the exchange more
+(`NCCL_MAX_P2P_NCHANNELS=8`: 349k), and a high-priority stream for collectives changes
+nothing. Each chunk is a grouped GEMM a peer a layer more to compile: `moe_chunks=2`
+compiles in 5 minutes here, and 4 in more than 8.
+
 ### FP8 dispatch: `precision.dispatch`
 
 ```
 precision = precision(dispatch=mxfp8)
 ```
 
-The ragged methods send the tokens to their experts in MXFP8, as DeepSeek-V3 does:
-E4M3 values and a power-of-two scale per 32, d + d/32 bytes a row, 52% of bfloat16's
-at d = 2048, dequantized to the compute dtype where they arrive. What comes back, and
-the backward's two exchanges, go in compute; the gradient is the exchange's, as if the
-tokens went unquantized (`experts._sent_in_mxfp8`). Rows that are not whole blocks go
-as they are. It changes what a run computes, so it is in the run's id.
+The exchanges send the tokens to their experts in MXFP8, as DeepSeek-V3 does: E4M3
+values and a power-of-two scale per 32, d + d/32 bytes a row, 52% of bfloat16's at
+d = 2048, dequantized to the compute dtype where they arrive. Each token quantizes
+once, before the rows of its k picks are picked, so the quantizer reads a k-th of the
+rows and the gather writes half the bytes. What comes back, and the backward's two
+exchanges, go in compute; the gradient is the exchange's, as if the tokens went
+unquantized (`experts._picked_in_mxfp8` for the ragged methods,
+`experts._swapped_in_mxfp8` for `all_to_all`). Rows that are not whole blocks go as
+they are. It changes what a run computes, so it is in the run's id.
 
-On 8 B300s, for the baseline's MoE at 32k tokens a GPU and a capacity of 1.25, it trains
-at the speed of bfloat16's: `ragged_all_to_all` 545k tokens a second against 548k, and
-`ragged_tokens` 552k against 549k. Each dispatch takes half as long, about 0.9 ms a
-layer less, but XLA's pass that quantizes before it and the one that dequantizes after
-it cost as much. It would pay where the experts' MXFP8 GEMM took the rows as they
-arrive, and the gather that picks them quantized them.
+On 8 B300s, for the baseline's MoE at 32k tokens a GPU and a capacity of 1.25 (the
+one-node suite's `moe_ep`, side by side on one node), `ragged_all_to_all` trains at
+556k tokens a second against 539k, and `all_to_all` in 2 chunks at 589k against 586k.
+A ragged dispatch takes 17 ms a step less, and quantizing a token rather than each of
+its picks costs little; `all_to_all`'s dispatch hides behind the experts already.
 
-The ragged exchanges name what they bring `experts.exchanged`, under `experts`, so that
+The exchanges name what they bring `experts.exchanged`, under `experts`, so that
 `remat=dots`, which keeps `experts`, does not exchange them again in the backward.
 
 ## Muon: `methods.orthogonalize`
