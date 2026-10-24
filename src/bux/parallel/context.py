@@ -134,7 +134,7 @@ def xla(
     and value: all-gather context parallelism."""
     t = q.shape[1]
     mask = causal_mask(t, args.window, args.ids)[..., None, :, :]
-    with flops.visible(flops.causal_share(t, args.window)):  # for MFU
+    with flops.attention(args.window), flops.over_keys():  # for MFU
         logits = softcap(scaled_logits(q, k, args.scale), args.softcap)
         return weighted_values(masked_softmax(logits, mask, args.sinks), v)
 
@@ -195,12 +195,13 @@ def on_devices(
 
 def document_starts(ids: Int[Array, "b t"]) -> Int[Array, "b t"]:
     """Return the index of the first token of each token's document: the first key it
-    attends to."""
+    attends to. By a prefix scan of log2(t) steps, as ``Segments.of`` takes its
+    documents: XLA's cummax of a row of 128k takes 2 ms on a B300."""
     index = jnp.arange(ids.shape[1])
     new = jnp.concatenate(
         [jnp.ones_like(ids[:, :1], bool), ids[:, 1:] != ids[:, :-1]], 1
     )
-    return jax.lax.cummax(jnp.where(new, index, 0), axis=1)
+    return jax.lax.associative_scan(jnp.maximum, jnp.where(new, index, 0), axis=1)
 
 
 def first_keys(args: AttentionArgs, b: int, t: int) -> Int[Array, "b t"] | None:

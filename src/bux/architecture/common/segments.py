@@ -32,6 +32,10 @@ class Segments(NamedTuple):
         start = jnp.concatenate(
             [jnp.ones((b, 1), bool), positions[:, 1:] <= positions[:, :-1]], axis=1
         )
-        first = jax.lax.cummax(jnp.where(start, index, 0), axis=1)
-        ids = jnp.cumsum(start, axis=1, dtype=jnp.int32)
+        # Prefix scans of log2(t) steps: XLA's cummax and cumsum of a row of 128k
+        # positions split over `context` take 2 and 25 ms on a B300.
+        first = jax.lax.associative_scan(
+            jnp.maximum, jnp.where(start, index, 0), axis=1
+        )
+        ids = jax.lax.associative_scan(jnp.add, start.astype(jnp.int32), axis=1)
         return cls(positions, ids, (index - first).astype(jnp.int32))

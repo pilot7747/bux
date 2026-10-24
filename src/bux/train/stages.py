@@ -13,7 +13,8 @@ gpipe every stage runs the rest of the model, so its stages split the passes eve
 
 import contextlib
 import functools
-from collections.abc import Generator
+from collections.abc import Callable, Generator
+from typing import Any
 
 import jax
 import jax.numpy as jnp
@@ -65,10 +66,15 @@ def _work(run: ir.Run) -> tuple[int, pipeline.Work]:
         after = functools.partial(_after, graphdef, loss)
         run_pass, one = _first_pass(repeat)
         x = jax.eval_shape(before, state, row)
-        up_to = flops.count(before, state, row)
-        to_loss = flops.count(after, state, row, x)
-        each = flops.count(run_pass, one, row, x)
+        up_to = _of_one_document(t.seq_len, before, state, row)
+        to_loss = _of_one_document(t.seq_len, after, state, row, x)
+        each = _of_one_document(t.seq_len, run_pass, one, row, x)
     return repeat.times, pipeline.Work(up_to, each, to_loss - up_to)
+
+
+def _of_one_document(t: int, f: Callable[..., Any], *args: Any) -> float:
+    """Return the FLOPs of `f` on a row of `t` tokens, all of one document."""
+    return flops.count(f, *args).one_document(t)
 
 
 @contextlib.contextmanager
