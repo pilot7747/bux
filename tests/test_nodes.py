@@ -173,15 +173,14 @@ print(jax.config.jax_compilation_cache_dir)
 """
 
 
-def _kept(folders: list[Path]) -> list[str]:
-    """Where two processes, whose caches are `folders`, keep them once joined."""
+def _joined(folders: list[Path], **more: str) -> list[str]:
+    """What two processes, whose caches are `folders`, print once joined, with `more`
+    in their environment."""
     with socket.socket() as s:
         s.bind(("localhost", 0))
         port = s.getsockname()[1]
-    env = os.environ | {
-        "JAX_COORDINATOR_ADDRESS": f"localhost:{port}",
-        "JAX_NUM_PROCESSES": "2",
-    }
+    env = os.environ | more
+    env |= {"JAX_COORDINATOR_ADDRESS": f"localhost:{port}", "JAX_NUM_PROCESSES": "2"}
     workers = [
         subprocess.Popen(
             [sys.executable, "-c", JOINED],
@@ -192,7 +191,12 @@ def _kept(folders: list[Path]) -> list[str]:
         )
         for i, f in enumerate(folders)
     ]
-    return [w.communicate(timeout=120)[0].strip().split("\n")[-1] for w in workers]
+    return [w.communicate(timeout=120)[0].strip() for w in workers]
+
+
+def _kept(folders: list[Path]) -> list[str]:
+    """Where two processes, whose caches are `folders`, keep them once joined."""
+    return [printed.split("\n")[-1] for printed in _joined(folders)]
 
 
 def test_processes_keep_their_cache_only_where_it_is_one_folder_for_all(tmp_path):
@@ -200,6 +204,12 @@ def test_processes_keep_their_cache_only_where_it_is_one_folder_for_all(tmp_path
     assert _kept([one, one]) == [str(one)] * 2
     assert not list(one.iterdir())  # the marker is gone
     assert _kept([tmp_path / "a", tmp_path / "b"]) == ["None", "None"]
+
+
+def test_processes_the_variables_join_ask_no_cluster_how_to(tmp_path):
+    # As on a Kubernetes pod, where jax's detection would warn of a missing client.
+    printed = _joined([tmp_path] * 2, KUBERNETES_SERVICE_HOST="10.0.0.1")
+    assert not any("Kubernetes" in p for p in printed)
 
 
 # --- FSDP over several axes ------------------------------------------------------------
