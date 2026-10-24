@@ -1,8 +1,10 @@
 """Hooks: what the training loop does between steps, every so many of them.
 
 A hook runs after every `every` steps and after the last. What it returns, if
-anything, is scalars that go to every sink (``bux.train.sinks``). Another hook is a
-subclass:
+anything, is scalars that go to every sink (``bux.train.sinks``), or a function that
+gives them (`Later`), which the loop calls once it has launched the next step: the
+log reads a step's metrics so, which waits for that step as the next one runs, so
+that the GPU never waits for the host to launch a step. Another hook is a subclass:
 
     class WeightNorm(Hook):
         every = 100
@@ -19,6 +21,7 @@ SIGTERM), every hook's `stop` runs at the step it stopped at, and the checkpoint
 saves it.
 """
 
+import functools
 import itertools
 import random
 import shutil
@@ -42,6 +45,8 @@ from bux.train.objective import Metrics
 from bux.train.optim import Schedule
 from bux.train.sinks import Scalars
 
+Later = Callable[[], Scalars]  # a hook's scalars, read once the next step is launched
+
 if TYPE_CHECKING:
     # Quoted where used: jaxtyping, which checks annotations as the tests run, reads
     # them as a module loads, and trainer.py imports this one.
@@ -58,7 +63,7 @@ class Hook:
     def start(self, trainer: "Trainer") -> None:
         """Before the first step."""
 
-    def __call__(self, trainer: "Trainer", metrics: Metrics) -> Scalars | None:
+    def __call__(self, trainer: "Trainer", metrics: Metrics) -> Scalars | Later | None:
         """After a step that it is due at, with what the step measured."""
         raise NotImplementedError
 
@@ -86,18 +91,28 @@ class Log(Hook):
         self.clock, self.since = time.perf_counter(), trainer.step
         self.flops = trainer.flops
 
-    def __call__(self, trainer: "Trainer", metrics: Metrics) -> Scalars:
-        scalars = {k: float(v) for k, v in metrics.items()}  # waits for the step
+    def __call__(self, trainer: "Trainer", metrics: Metrics) -> Later:
+        counted = trainer.work is not None
+        return functools.partial(
+            self._read, metrics, trainer.step, trainer.flops, counted
+        )
+
+    def _read(
+        self, metrics: Metrics, step: int, flops: float, counted: bool
+    ) -> Scalars:
+        """Return the scalars of `step`, which waits for it; `flops` the trainer's
+        count then, which `counted` says it keeps."""
+        scalars = {k: float(v) for k, v in metrics.items()}
         now = time.perf_counter()
-        steps, seconds = trainer.step - self.since, now - self.clock
+        steps, seconds = step - self.since, now - self.clock
         scalars |= {
-            "lr": float(self.lr(trainer.step - 1)),
-            "tokens": trainer.step * self.tokens,
+            "lr": float(self.lr(step - 1)),
+            "tokens": step * self.tokens,
             "tokens_per_s": steps * self.tokens / seconds,
         }
-        if self.peak and trainer.work is not None:
-            scalars["mfu"] = (trainer.flops - self.flops) / seconds / self.peak
-        self.clock, self.since, self.flops = now, trainer.step, trainer.flops
+        if self.peak and counted:
+            scalars["mfu"] = (flops - self.flops) / seconds / self.peak
+        self.clock, self.since, self.flops = now, step, flops
         return scalars
 
 
@@ -183,8 +198,9 @@ class Profile(Hook):
     """A jax.profiler trace, into `folder`, of the `steps` steps after step `start`.
     It waits for the step before it starts and stops, so the trace holds whole steps.
 
-    On GPUs it then reports what a step of them spent in collectives, `comm_ms`, and in
-    collectives with no compute beside them, `exposed_comm_ms` (``bux.train.trace``)."""
+    On GPUs it then reports what a step of them spent in collectives, `comm_ms`, in
+    collectives with no compute beside them, `exposed_comm_ms`, and running nothing,
+    `idle_ms` (``bux.train.trace``)."""
 
     def __init__(self, folder: Path, *, start: int, steps: int):
         self.folder, self.first, self.last = folder, start, start + steps

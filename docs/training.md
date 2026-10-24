@@ -78,7 +78,7 @@ id          params  tokens  tok/param  flops/tok  gpus  ...  run
 | `mesh`       | `mesh(data=..., fsdp=..., tensor=...)`: the device grid | `mesh`: every device on `data` |
 | `layout`     | `layout(...)`: which mesh axes each named dimension splits over | `layout` |
 | `methods`    | `methods(attention=..., moe=..., microbatches=...)`: how what communicates is computed, and the microbatches a step takes its batch in | `methods` |
-| `compiler`   | `compiler(preset=..., options=...)`: XLA's options for the training step ([below](#xlas-options-compiler)) | `compiler`: XLA's defaults |
+| `compiler`   | `compiler(preset=..., options=..., reductions=...)`: XLA's options for the training step, and where its gradients' reductions start ([below](#xlas-options-compiler)) | `compiler`: XLA's defaults, reductions `early` |
 
 The settings of each config are pydantic fields in `bux/train/config.py`, and the
 editor shows them on hover and completes them, as it does for layers. In short:
@@ -487,12 +487,18 @@ document: 6.9G for a Llama-style 1.3B at 4096 tokens a row, 6 N of its matrices 
 `profile = profile(start=20, steps=5)` traces the 5 steps after step 20 into
 `profile/`, waiting for the step before it starts and stops, for `xprof` or
 TensorBoard's profile plugin (`tensorboard --logdir runs/<run>/profile`). On GPUs the
-log then has, at step 25, what a step of them spent in collectives, `comm_ms`, and in
+log then has, at step 25, what a step of them spent in collectives, `comm_ms`, in
 collectives with no kernel computing beside them on any stream, `exposed_comm_ms`: the
-communication the step waits for. Each is the mean of the GPUs the process traced
-(`bux/train/trace.py`): a kernel communicates if NCCL runs it or XLA's op that
-launched it is a collective, CUDA's copies neither communicate nor compute, and every
-other kernel computes.
+communication the step waits for, and running no kernel at all, `idle_ms`. Each is
+the mean of the GPUs the process traced (`bux/train/trace.py`): a kernel communicates
+if NCCL runs it or XLA's op that launched it is a collective, CUDA's copies neither
+communicate nor compute, and every other kernel computes. Most of `idle_ms` is the
+host: after a step it waited for (a logged loss, the trace's own start), a GPU waits
+for the next one's launch, 145 to 210 ms for Qwen3-30B-A3B's 48 layers on 8 B300s,
+where it waits 25 ms a step between kernels. jax.profiler runs XLA's command buffers
+(CUDA graphs) a kernel at a time as it traces; kept whole
+(`--xla_enable_command_buffers_during_profiling=true`), the step's idle and exposed
+time were the same.
 
 ## Speed on GPUs
 
@@ -693,6 +699,7 @@ and scanned, `first=2, last=2` at 1.20M, where `mxfp8` alone gives 1.22M.
 compiler = compiler(preset=o1)
 compiler = compiler(options="--xla_gpu_threshold_for_windowed_einsum_mib=0")
 compiler.preset = default | o1 | lhs | maxtext       # a sweep
+compiler = compiler(reductions=xla)                  # where XLA puts them
 ```
 
 The training step compiles with a preset's options, and the setting's own `options`
@@ -778,6 +785,54 @@ them. From two rows a GPU the compute hides them anyway, and what the scan copie
 and out of its stacks costs more than the loop saves. So the defaults stay: unrolled,
 with XLA's options. FSDP at a row a GPU, as a model too large for more trains, is
 worth `methods(repeat=scan)` with `compiler(preset=maxtext)`.
+
+#### Where the gradients' reductions start: `reductions`
+
+XLA's scheduler places a collective's done just before its result is first read, and,
+with one collective in flight, each start just above the done before it and what
+feeds only the start just above that. A gradient's reduction is read where the step
+adds it up, after the last layer's backward pass (a microbatch's sum, the optimizer's
+update), so XLA puts every weight gradient's GEMM there, each just before its
+reduction, and runs the reductions one after another beside nothing but those GEMMs:
+Qwen3-30B-A3B's `sorted` arm (`megatron.bux`, Megatron's batch of 8 microbatches,
+`fsdp=8`) waited 95 ms a microbatch, 11% of its step, for 96 reduce-scatters at the
+end of each backward pass. `compiler(reductions=early)`, the default, runs a pass
+over XLA's schedule (`bux.train.reorder`) that moves each reduction up, with the ops
+that compute for it alone (its GEMM, its operands' quantizers), to just after what
+they read, and waits for it just before the start of the second reduction after it
+(`reorder.LAG`); `xla` leaves XLA's schedule. On 8 B300s the arm trains at 41.7k
+to 42.1k tokens a second a GPU with `early` against 39.7k to 40.0k with `xla` (on two
+nodes), in the same 214.5 GiB, and its profiled step's exposed collectives drop from
+1029 ms to 726 of 6.8 s, most of what is left a microbatch's last reductions, which
+only its next microbatch could run beside. Its `nccl_ep` arm gains 0.8%, and the
+one-node suite's runs 1.1% (`fsdp`), 6.2% (`fsdp_m8`, 8 microbatches), 0.4% (`moe`),
+1.7% (`moe_ep`, `tp`) and none (`pp`), each in the same memory. Before the experts'
+kernels quantized their weights before the gather, the arm gained 5.7%, from 37.3k
+to 39.4k, at lags 2, 3 and 4 alike, and 3% less at lag 1. The pass changes the order
+of a program's ops, not what they compute: with GEMM autotuning off and XLA's
+deterministic ops its loss after 12 steps is within 0.002 of XLA's schedule's, where
+two runs of one tree without them end 0.02 apart.
+
+XLA's own flags left the reductions where they were. On the same arm before the pass
+(`remat=none`, tokens a second a GPU, on one node but for the last two rows):
+
+| XLA's flags | tok/s a GPU |
+|-------------|-------------|
+| XLA's defaults | 37.1k |
+| PGLE: JAX's, 3 profiled steps, the 85th percentile | 23.8k |
+| two collectives in flight (`--xla_gpu_experimental_parallel_collective_overlap_limit=2`) | 37.2k |
+| the same, each started as early as it can (`--xla_gpu_experimental_collective_start_as_early_as_possible=true`) | 37.2k |
+| 16 NCCL channels a collective, where XLA takes 32 of a B300's 148 SMs (`--xla_gpu_nccl_collective_max_nchannels=16`) | 35.7k |
+| NCCL's symmetric buffers, or its registered ones | fail to compile: cuDNN's MXFP8 GEMMs then miss their graphs |
+
+With 16 channels the GEMMs beside the collectives ran 3% faster and the collectives
+took half again as long; with the pass, 16 and 24 channels were 1.6-6.5% slower too.
+
+The pass is an entry of `bux.passes.PASSES`, bux's passes over XLA's HLO: each a
+function of a serialized HloModuleProto, run before or after XLA's scheduler, on every
+program the process compiles for GPUs once `passes.use(name)` turns it on; JAX's cache
+of compiled programs is keyed by the passes in use. Another is a function under
+`@passes.register(name, stage=passes.AFTER_SCHEDULING)`.
 
 ## Launching
 
@@ -1029,9 +1084,21 @@ def _(c, multiplier, model):  # a config, the schedule's multiplier, the model
 ```
 
 A hook runs after every `every` steps and after the last, and the scalars it
-returns, metrics by name, go to every sink. When training stops early, because
-something set `trainer.stopping` as the launcher does at SIGTERM, every hook's `stop`
-runs, and the checkpoint hook saves the step. A tracker is a sink:
+returns, metrics by name, go to every sink once the next step is launched. A hook
+that only reads the step's metrics returns a function that gives its scalars
+(`hooks.Later`), which the loop calls then: the log does, so that reading a loss
+waits for its step as the next one runs, not the GPU for the host to launch that
+one. On 8 B300s the one-node suite's 1.3B (`fsdp`), logging every step, takes 304
+ms a step so, from 332; Qwen3-30B-A3B's 6.4 s steps, logging every third, train as
+fast either way. The GPU still waits for the host at every step: XLA's launch of a
+step returns only when the GPU is nearly through it (its queue of kernels is full),
+and only then does nnx.jit walk the model's and optimizer's state for the next
+(35 ms for the 1.3B, 100 to 170 ms for Qwen3-30B-A3B), beside the next batch's rows
+stacked in the loader's thread: 45 ms of the 1.3B's 250, 165 to 210 of the 30B's
+6.4 s.
+When training stops early, because something set `trainer.stopping` as the launcher
+does at SIGTERM, every hook's `stop` runs, and the checkpoint hook saves the step. A
+tracker is a sink:
 
 ```python
 class WeightNorm(Hook):
