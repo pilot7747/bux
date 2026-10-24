@@ -1,4 +1,5 @@
-"""What bux sets for JAX before it trains: XLA's flags, and a cache of compiled steps.
+"""What bux sets for JAX before it trains: XLA's flags, NCCL EP's settings, and a cache
+of compiled steps.
 
 `bux train`, `bux launch` and a sweep's workers call ``configure`` before anything
 starts a backend. A flag that XLA_FLAGS sets already keeps its value. Compiled
@@ -27,6 +28,10 @@ XLA_FLAGS = (
     # Without it, ragged_all_to_all (expert parallelism's dispatch) hangs on B300s.
     "--xla_gpu_experimental_ragged_all_to_all_use_barrier_with_nccl=false",
 )
+# NCCL EP's settings (methods(moe=nccl_ep)), where the environment sets none: GIN by a
+# CPU proxy, and 256 tokens a chunk between nodes. On two B300 nodes, GDAKI (its
+# default) took 3x as long for an EP layer's exchanges, and chunks of 64 1.3x.
+NCCL_DEFAULTS = {"NCCL_GIN_TYPE": "2", "NCCL_EP_TOKENS_PER_CHUNK": "256"}
 TIMEOUT_MS = 10 * 60 * 1000  # for the other processes to reach the same point
 
 
@@ -47,9 +52,12 @@ def cache_dir(env: Mapping[str, str] = os.environ) -> Path:
 
 
 def configure(env: MutableMapping[str, str] = os.environ) -> None:
-    """Add bux's flags to XLA_FLAGS in `env`, and keep compiled programs in
-    JAX_COMPILATION_CACHE_DIR, `cache_dir` unless it is set. Workers inherit both."""
+    """Add bux's flags to XLA_FLAGS in `env` and NCCL EP's settings, and keep compiled
+    programs in JAX_COMPILATION_CACHE_DIR, `cache_dir` unless it is set. Workers
+    inherit them all."""
     env["XLA_FLAGS"] = xla_flags(env.get("XLA_FLAGS", ""))
+    for name, value in NCCL_DEFAULTS.items():
+        env.setdefault(name, value)
     env.setdefault("JAX_COMPILATION_CACHE_DIR", str(cache_dir(env)))
     jax.config.update(
         "jax_compilation_cache_dir", env["JAX_COMPILATION_CACHE_DIR"] or None
