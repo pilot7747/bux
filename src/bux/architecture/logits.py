@@ -98,6 +98,19 @@ class Scores(NamedTuple):
         logits = logits.astype(jnp.float32)
         return cls(jax.nn.logsumexp(logits, -1), _pick(logits, targets))
 
+    @classmethod
+    def of_chunk(
+        cls, logits: Float[Array, "*n vocab"], targets: Int[Array, "*n"]
+    ) -> "Scores":
+        """Return the scores of a chunk's logits, which `chunks` differentiates by
+        hand: each target's logit gathered where a device holds whole rows of them,
+        where a sum over them would take a pass of its own."""
+        if parallel.splits(("vocab",), logits.shape[-1:])[0] > 1:
+            return cls.of(logits, targets)
+        logits = logits.astype(jnp.float32)
+        target = jnp.take_along_axis(logits, targets[..., None], -1, mode="clip")
+        return cls(jax.nn.logsumexp(logits, -1), target[..., 0])
+
     def sums(self, weights: Float[Array, "*n"], z: bool) -> Sums:
         """Return their sums, each position by its weight; the z-loss's if `z`."""
         ce = jnp.sum(weights * (self.lse - self.target))
@@ -224,7 +237,7 @@ def _sums(
     def step(sums: Sums, xs: tuple) -> tuple[Sums, None]:
         x, targets, weights = xs
         logits = _shard(whole(x), None, "vocab")
-        chunk = Scores.of(logits, targets).sums(weights, z)
+        chunk = Scores.of_chunk(logits, targets).sums(weights, z)
         return jax.tree.map(jnp.add, sums, chunk), None
 
     start = Sums(jnp.zeros(()), jnp.zeros(()))
@@ -305,7 +318,7 @@ def _chunk_grads(
     cross-entropy's, and the z-loss's if `z`."""
     raw = _shard(p.matmul(x), None, "vocab")
     logits, finish = jax.vjp(p.finish, raw, bias)
-    scores = Scores.of(logits, targets)
+    scores = Scores.of_chunk(logits, targets)
     probs = jnp.exp(logits - scores.lse[..., None])
     hit = _is_target(logits, targets)
     d_ce = weights[..., None] * (probs - hit)
