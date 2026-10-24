@@ -18,7 +18,7 @@ import bux.launch
 from bux.__main__ import _bytes, _si, abstract, main, memory
 from bux.lang import compile_runs
 from bux.launch import Stop, fit, launch, need, processes, status, summary
-from bux.runtime import cache_dir, xla_flags
+from bux.runtime import POOL, cache_dir, configure, xla_flags
 from bux.train.config import MeshConfig
 from bux.train.hooks import Hook
 from bux.train.trainer import Trainer, directory, train
@@ -215,6 +215,18 @@ def test_bux_s_xla_flags_go_first_and_one_already_set_keeps_its_value():
         xla_flags(f"{ragged}=true --xla_dump_to=x") == f"{ragged}=true --xla_dump_to=x"
     )
     assert cache_dir({"XDG_CACHE_HOME": "/c"}) == Path("/c/bux/jax")
+
+
+@pytest.mark.parametrize(
+    "given",
+    [{}, {"XLA_CLIENT_MEM_FRACTION": ".5"}, {"XLA_PYTHON_CLIENT_MEM_FRACTION": ".5"}],
+)
+def test_xla_s_pool_takes_most_of_a_gpu_unless_the_environment_says(given):
+    env = {"JAX_COMPILATION_CACHE_DIR": ""} | given  # the tests' cache: off
+    configure(env)
+    pool = {k: v for k, v in env.items() if "MEM_FRACTION" in k}
+    assert pool == (given or {"XLA_CLIENT_MEM_FRACTION": POOL})
+    assert float(POOL) > 0.75  # JAX's own
 
 
 def test_a_launch_keeps_its_compiled_steps_for_the_next(tmp_path):

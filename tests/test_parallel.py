@@ -130,11 +130,44 @@ def _toy_specs(heads: int, **sizes: int) -> dict:
     }
 
 
-def test_names_split_over_their_axes_and_fsdp_the_largest_dimension_left():
+def test_names_split_over_their_axes_and_fsdp_the_first_dimension_left():
     specs = _toy_specs(heads=4, fsdp=2, tensor=4)
     assert specs["up.kernel"] == P("fsdp", "tensor")
     assert specs["up.bias"] == P("fsdp")  # unnamed: FSDP alone
     assert specs["sinks"] == P("tensor")
+
+
+class Stacks(nnx.Module):
+    """Parameters as an MoE and a scanned repeat name them: experts' stacks (up and
+    gate as one, too), a kernel, and a kernel's stacked layers."""
+
+    def __init__(self):
+        self.down = _param((8, 64, 16), "experts", "mlp", "embed")
+        self.up_gate = _param((8, 16, 2, 64), "experts", "embed", None, "mlp")
+        self.out = _param((32, 16), "heads", "embed")
+        self.stacked = _param((4, 16, 64), "layers", "embed", None)
+
+
+def _param(shape: tuple[int, ...], *names: str | None) -> nnx.Param:
+    return nnx.Param(jnp.zeros(shape), names=names)
+
+
+def _stacks_specs(**sizes: int) -> dict:
+    with use(**sizes):
+        found = parallel.shardings(nnx.state(Stacks()))
+    return {name: found[name].spec for name in ("down", "up_gate", "out", "stacked")}
+
+
+def test_fsdp_splits_the_first_whole_dimension_so_that_shards_are_whole_rows():
+    assert _stacks_specs(fsdp=8) == {
+        "down": P("fsdp", None, None),  # by expert, not by its 64 hidden units
+        "up_gate": P("fsdp", None, None, None),
+        "out": P("fsdp", None),
+        "stacked": P(None, "fsdp", None),  # never the layers a scan reads one by one
+    }
+    with_ep = _stacks_specs(fsdp=2, expert=4)  # the experts over `expert`, then FSDP
+    assert with_ep["down"] == P("expert", "fsdp", None)
+    assert with_ep["up_gate"] == P("expert", "fsdp", None, None)
 
 
 def test_a_dimension_its_axes_do_not_divide_stays_whole():
@@ -163,7 +196,7 @@ def test_zero_1_keeps_parameters_whole_and_splits_the_optimizer_state():
         for x in jax.tree.leaves(nnx.state(trainer.optimizer, nnx.OptState))
         if x.shape == kernel.shape
     ]
-    assert moments and all(spec == P(None, "fsdp") for spec in moments)
+    assert moments and all(spec == P("fsdp", None) for spec in moments)
 
 
 def test_shard_called_eagerly_moves_an_array_onto_the_mesh():

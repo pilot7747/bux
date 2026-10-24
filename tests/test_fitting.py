@@ -1,6 +1,11 @@
 """remat=auto (bux.train.fitting): a training step that keeps the first of remat's
 candidates, the fastest first, whose compiled step fits in the device's memory."""
 
+import contextlib
+import threading
+from collections.abc import Generator
+
+import jax
 import numpy as np
 from flax import nnx
 
@@ -28,6 +33,24 @@ TRAIN = (
     "\nprecision = precision(compute=float32)\nmethods = methods(remat=auto)"
 )
 TOKENS = np.random.default_rng(0).integers(0, 128, (8, 64))
+COMPILE = "/jax/core/compile/backend_compile_duration"  # jax.monitoring's event
+STEP = "jit(_train_step_on_shards)"
+
+
+@contextlib.contextmanager
+def _step_compiles() -> Generator[list[float]]:
+    """The seconds of each compile of a training step inside the block."""
+    seconds: list[float] = []
+
+    def listen(event: str, duration_secs: float, **kwargs: str | int) -> None:
+        if event == COMPILE and kwargs.get("fun_name") == STEP:
+            seconds.append(duration_secs)
+
+    jax.monitoring.register_event_duration_secs_listener(listen)
+    try:
+        yield seconds
+    finally:
+        jax.monitoring.unregister_event_duration_listener(listen)
 
 
 def _stepped() -> fitting.Fitting:
@@ -44,7 +67,9 @@ def _stepped() -> fitting.Fitting:
 
 
 def test_auto_keeps_everything_where_the_device_does_not_say_its_memory(losses):
-    auto = losses(LLAMA, methods="methods(remat=auto)")
+    with _step_compiles() as compiles:
+        auto = losses(LLAMA, methods="methods(remat=auto)")
+    assert len(compiles) == 1  # the step runs as it compiled to be tried
     none = losses(LLAMA, methods='methods(remat="none")')
     assert auto == none
     step = _stepped()  # on a CPU, whose memory is the host's
@@ -53,18 +78,37 @@ def test_auto_keeps_everything_where_the_device_does_not_say_its_memory(losses):
 
 def test_auto_takes_the_first_candidate_that_fits_or_else_the_last(monkeypatch):
     monkeypatch.setattr(fitting, "capacity", lambda: 1)  # nothing fits
-    tried = _stepped().tried
-    assert [t.policy for t in tried] == list(remat.CANDIDATES)
-    none, room = tried[0].bytes, tried[1].bytes
+    step = _stepped()
+    assert step.policy == remat.CANDIDATES[-1]
+    assert [t.policy for t in step.tried] == list(remat.CANDIDATES)
+    none, room = step.tried[0].bytes, step.tried[1].bytes
     assert none is not None and room is not None
     assert room < none  # dots_attention keeps less
     monkeypatch.setattr(fitting, "capacity", lambda: int(room / fitting.MARGIN) + 1)
     step = _stepped()
     assert step.policy == "dots_attention"
-    assert [t.policy for t in step.tried] == ["none", "dots_attention"]
+    assert [t.policy for t in step.tried] == list(remat.CANDIDATES)
+
+
+def test_the_candidates_after_the_first_compile_side_by_side(monkeypatch):
+    monkeypatch.setattr(fitting, "capacity", lambda: 1)
+    rest = threading.Barrier(len(remat.CANDIDATES) - 1, timeout=60)
+    held, calls = fitting.held, []
+
+    def held_once_all_compile(lowered: object, options: dict) -> int | None:
+        calls.append(lowered)
+        if len(calls) > 1:
+            rest.wait()  # breaks, and fails the test, unless the rest are all here
+        return held(lowered, options)
+
+    monkeypatch.setattr(fitting, "held", held_once_all_compile)
+    step = _stepped()
+    assert [t.policy for t in step.tried] == list(remat.CANDIDATES)
 
 
 def test_auto_trains_as_the_policy_it_takes(losses, monkeypatch):
     monkeypatch.setattr(fitting, "capacity", lambda: 1)
-    auto = losses(LLAMA, methods="methods(remat=auto)")
+    with _step_compiles() as compiles:
+        auto = losses(LLAMA, methods="methods(remat=auto)")
+    assert len(compiles) == len(remat.CANDIDATES)  # the last runs as it compiled
     assert auto == losses(LLAMA, methods="methods(remat=full)")

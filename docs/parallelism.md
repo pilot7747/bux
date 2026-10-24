@@ -241,8 +241,15 @@ to resolve them. The optimizer's state inherits them from the parameters it trac
    earlier dimension already uses. If their sizes don't divide the dimension (or its
    count), it stays whole: GQA's 2 kv heads under `tensor=4` are replicated, though
    their `2 * k` columns would split 4 ways.
-2. Then FSDP: the largest whole dimension that FSDP's axes divide splits over them,
-   or if none does, over as many of them as one does, from the first. FSDP's axes are
+2. Then FSDP: the first whole dimension that FSDP's axes divide splits over them,
+   or if none does, over as many of them as one does, from the first. The first, so
+   that each device's shard is whole rows of the array, which XLA gathers and
+   scatters as they lie: an expert stack splits by expert, a kernel by its inputs.
+   By the largest, as before, Qwen3-30B-A3B's stacks split by `embed`, and on 8
+   B300s every gather and reduce-scatter of them went through a transpose: 21.6 ms
+   of 12 layers' 314 ms step, 3.6 by expert; its 48 layers (`megatron.bux`'s
+   `sorted`) train at 257k tokens a second, from 251k, and the dense 1.3B's
+   transposes (1.7 ms a step) are gone. FSDP's axes are
    `layout.fsdp`, those of `fsdp`, `context` and `expert` that no dimension splits
    over already: the axes that would copy a dense parameter, but `data`, whose copies
    are HSDP's. So a layer with no names at all still trains under FSDP, an expert
@@ -1225,8 +1232,8 @@ GB of experts a layer, where the exchanges move 1 GB of picks each way
 the exchanges ran again in the backward, since their results are no products; named
 for it ([below](#fp8-dispatch-precisiondispatch)), `ragged_all_to_all` trains at 515k
 tokens a second in 77.5 GiB, from 452k in 72.6. XLA's ragged all-to-all leaves an allocation inside the memory pool after the first step,
-so that a step whose temporaries take over half of it fits only once:
-`XLA_PYTHON_CLIENT_MEM_FRACTION=.95` gives the pool more room. `ragged_tokens` moves
+so that a step whose temporaries take over half of it fits only once: bux's pool of
+95% of a GPU, against JAX's 75%, gives it more room. `ragged_tokens` moves
 about 30% fewer rows when the routing is random, and half as few or fewer where a
 group limit keeps each token on half the devices (`num_groups` the size of `expert`,
 `top_k_groups` half of it), but it sends the picks and their weights besides, and
@@ -1781,20 +1788,31 @@ where `first` computes the whole layer again. With more rows a GPU:
 
 `auto` chooses a training step's policy as the step first compiles
 (`bux.train.fitting`). It compiles the step under `none`, `dots_attention`, `dots`,
-`save_attention` and `full` in turn, the fastest first as they train above, and keeps
-the first that fits: what XLA's analysis of the compiled step says a device holds at
+`save_attention` and `full`, the fastest first as they train above, and keeps the
+first that fits: what XLA's analysis of the compiled step says a device holds at
 once, its arguments, outputs and temporaries, at most 97% of what the device can hold
-(its `bytes_limit`, 75% of a GPU by JAX's default). In that order the first that fits
-is the one that computes least again, so `auto` times none of them, which would cost
-steps of each. On B300s XLA's analysis was the measured peak to 0.1 GiB in every run,
-and a step of 196.7 of 200.8 GiB trained. Where `none` fits, `auto` compiles once and
-is `none`; where it does not, each candidate before the one that fits is a compile
-more, which JAX's cache keeps for the run's next launch. A forward outside a training
-step keeps everything. The step says what it took:
+(its `bytes_limit`: 95% of a GPU, which bux gives XLA's pool, docs/training.md "Speed
+on GPUs"). In that order the first that fits is the one that computes least again, so
+`auto` times none of them, which would cost steps of each. On B300s XLA's analysis
+was the measured peak to 0.1 GiB in every run, and a step of 196.7 of 200.8 GiB
+trained. Where `none` fits, `auto` compiles once and is `none`. Where it does not,
+the other four compile side by side: each is traced and lowered in turn, which holds
+Python's lock, then XLA compiles them at once, a thread each. On 8 B300s,
+`megatron.bux`'s `nccl_ep` arm with 75% of a GPU took `save_attention` in 699 s,
+where one after another took 966 s; XLA compiled each of the four in 218-243 s side
+by side, and their tracing and lowering, a minute each, now take most of the rest
+(where a compile goes: "Speed on GPUs" in docs/training.md). So where the second fits,
+side by side costs the others' lowering: `sorted` with 95% took `dots_attention` in
+592 s, where `none` and it one after another would take about 400. The candidates
+compile all or none, so that every process of a run compiles the same programs, whose
+autotuning they share. JAX's cache keeps each
+for the run's next launch. A forward outside a training step keeps everything. The
+step says what it took, XLA's seconds of each candidate:
 
 ```
-remat=auto: save_attention (none 314.4 GiB in 42s, dots_attention 288.4 GiB in 29s,
-dots 263.7 GiB in 26s, save_attention 161.7 GiB in 24s; 97% of 200.8 GiB fits)
+remat=auto: save_attention in 699s (none 265.8 GiB in 144s, dots_attention 273.5 GiB
+in 243s, dots 249.1 GiB in 230s, save_attention 108.4 GiB in 218s, full 74.2 GiB in
+219s; 97% of 200.8 GiB fits)
 ```
 
 On one B300, the one-GPU suite's models (`examples/benchmarks/one_gpu.bux`) at more

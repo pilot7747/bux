@@ -7,7 +7,7 @@ dimension splits over, and the methods that run the parts that communicate.
 
 Layers don't shard anything themselves: they name the dimensions of their parameters
 (``named``) and of a few activations (``shard``), and the compiler propagates the
-rest. Every parameter's largest whole dimension also splits over `fsdp`. Outside
+rest. Every parameter's first whole dimension also splits over `fsdp`. Outside
 ``use`` all of this does nothing, so one device runs as if it were not there.
 
     mesh      the device grid                     AXES, mesh, active

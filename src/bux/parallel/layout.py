@@ -87,28 +87,30 @@ def resolve(names: Sequence[Name], shape: tuple[int, ...], on: Active) -> list[S
 def fsdp(
     splits: list[Split], shape: tuple[int, ...], on: Active, names: Sequence[Name]
 ) -> list[Split]:
-    """Split the largest whole dimension over FSDP's axes (`layout.fsdp`) that no
+    """Split the first whole dimension over FSDP's axes (`layout.fsdp`) that no
     dimension splits over yet, or if none divides by them all, over as many of them as
-    one does, from the first. Never the stacked `layers` of a scanned repeat: a scan
+    one does, from the first. The first, so that each shard is whole rows of the
+    array, which XLA gathers and scatters without a transpose: an expert stack's
+    experts, a kernel's inputs. Never the stacked `layers` of a scanned repeat: a scan
     reads one layer at a time."""
     taken = {a for s in splits for a in s}
     over = [a for a in as_split(on.layout.fsdp) if on.size(a) > 1 and a not in taken]
     for k in range(len(over), 0, -1):
-        if (i := _largest_whole(splits, shape, names, on.size(*over[:k]))) is not None:
+        if (i := _first_whole(splits, shape, names, on.size(*over[:k]))) is not None:
             return [*splits[:i], tuple(over[:k]), *splits[i + 1 :]]
     return splits
 
 
-def _largest_whole(
+def _first_whole(
     splits: list[Split], shape: tuple[int, ...], names: Sequence[Name], n: int
 ) -> int | None:
-    """The largest dimension that nothing splits and `n` divides, but `layers`."""
-    whole = [
+    """The first dimension that nothing splits and `n` divides, but `layers`."""
+    whole = (
         i
         for i, s in enumerate(splits)
         if not s and shape[i] % n == 0 and names[i] != LAYERS
-    ]
-    return max(whole, key=lambda i: shape[i]) if whole else None
+    )
+    return next(whole, None)
 
 
 def partition(splits: list[Split]) -> P:
