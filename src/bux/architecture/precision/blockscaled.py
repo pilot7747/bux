@@ -32,7 +32,7 @@ from jax.typing import DTypeLike
 from jaxtyping import Array, Float, Int, Shaped, UInt8, UInt32
 
 from bux import jax_internals, kernels
-from bux.parallel.mesh import in_shard_map
+from bux.parallel.mesh import manual_axes
 from bux.train.config import PASSES, Pass
 
 E4M3_MAX = 448.0  # float8 E4M3's largest value
@@ -176,7 +176,7 @@ def scaled_matmul(a: Blocks, b: Blocks, out: DTypeLike) -> Float[Array, "m n"]:
     elsewhere dequantizes and multiplies. In a shard_map, by its primitive, which
     jax's custom partitioning cannot place there."""
     args = (a.values[None], b.values[None], a.scales[None], b.scales[None])
-    if in_shard_map():
+    if manual_axes():  # in a shard_map
         return jax_internals.scaled_matmul_unpartitioned(*args, out)[0]
     return jax.nn.scaled_matmul(*args, preferred_element_type=out)[0]
 
@@ -222,7 +222,7 @@ def on_each_device(
     """Return `partitioned`, which runs `kernel` on each device's part of what it
     takes; inside a shard_map, where each device holds its part already and custom
     partitioning cannot go, `kernel` itself."""
-    return kernel if in_shard_map() else partitioned
+    return kernel if manual_axes() else partitioned
 
 
 def split_of(spec: P) -> tuple[Any, Any]:

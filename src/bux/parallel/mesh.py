@@ -142,11 +142,6 @@ def manual_axes() -> frozenset[str]:
     return frozenset(jax.sharding.get_abstract_mesh().manual_axes)
 
 
-def in_shard_map() -> bool:
-    """Return whether this traces inside a shard_map."""
-    return bool(manual_axes())
-
-
 def free_axes() -> set[str]:
     """Return the axes of the run's mesh that no shard_map being traced maps."""
     on = active()
