@@ -878,7 +878,9 @@ intermediate 704, 262144 picks), in TFLOP/s of the GEMM's own kernel by CUPTI:
 | dW, down | 1034 | 616 | 2367 (2.3x) |
 
 and with experts of 2048, 1.7 to 2.3 times bfloat16's: 2423 to 2616 TFLOP/s against
-1139 to 1414. h W contracts 704, which TMA takes in tiles of 128, so `rows` pads it
+1139 to 1414. At `all_to_all`'s GEMMs of a peer's buffer under `expert=8`, 40960 rows
+of which 32768 its 8 experts', 1.3 to 2.7 times: 1271 (h W) to 2490 (dW, up and gate)
+against 904 to 1213. h W contracts 704, which TMA takes in tiles of 128, so `rows` pads it
 to 768 and does 9% more. Taking the tiles a row of them at a time, all its columns
 before the next row, was 1.7x slower (1623 against 2725 TFLOP/s for dh W^T at k
 4096): the rows and columns in flight then fell out of L2. Triton's kernels took the
@@ -895,6 +897,7 @@ experts in bfloat16, in MXFP8 by Triton's kernels as before, and by `grouped_mxf
 | experts of 2048, 8 layers, one GPU | 90.4k, 143.2 GiB | 75.6k | 101.7k (1.12x), 129.6 GiB |
 | `ragged_all_to_all`, `capacity=1.25`, `expert=8`, 32k tokens a GPU | 468k, 88.5 GiB | 417k | 517k (1.10x), 72.3 GiB |
 | | | | `dispatch=mxfp8`: 515k |
+| `all_to_all`, `capacity=1.25`, `expert=8`, 32k tokens a GPU | 492k, 91.4 GiB | 449k | 539k (1.10x), 78.4 GiB |
 | `sorted`, `fsdp=8`, 32k tokens a GPU | 671k, 83.9 GiB | 580k | 712k (1.06x), 69.4 GiB |
 
 Both MXFP8 kernels compute the same values: the runs' losses agree to the last digit
@@ -902,10 +905,10 @@ logged, and with bfloat16's to the rounding between them. The experts' GEMMs tak
 half of bfloat16's time, 3.0 ms a layer against 5.8, and the quantizer, which reads
 each operand once and writes it twice, most of what they save: an MoE layer's experts
 forward and backward take 6.1 ms against 7.3 in bfloat16, and 13.8 against 17.9 with
-experts of 2048 (`scripts/gpu_smoke/grouped_mxfp8.py`). It keeps x^T in MXFP8 for dW rather than x in
-bfloat16, so it takes 14 GiB less. It trains at bfloat16's loss: 98M tokens of
-FineWeb-Edu end 0.13% and 0.05% below it, with FP8 dispatch (docs/training.md,
-"Precision").
+experts of 2048 (`scripts/gpu_smoke/grouped_mxfp8.py`). It keeps x^T in MXFP8 for dW
+rather than x in bfloat16, so it takes 14 GiB less. It trains at bfloat16's loss: 98M
+tokens of FineWeb-Edu end 0.13% and 0.05% below it, with FP8 dispatch
+(docs/training.md, "Precision").
 
 ## Expert parallelism
 
