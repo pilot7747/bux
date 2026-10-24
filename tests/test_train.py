@@ -555,6 +555,21 @@ def test_a_checkpoint_restores_only_into_a_state_of_its_arrays(tmp_path):
     assert not any(x.is_deleted() for x in jax.tree.leaves(narrower.state()))
 
 
+def test_a_save_a_crash_left_unfinished_is_dropped_and_its_step_not_saved(tmp_path):
+    # Orbax's names for a step's save until it ends, which a crash leaves behind.
+    unfinished = tmp_path / "20.orbax-checkpoint-tmp" / "default.orbax-checkpoint-tmp"
+    unfinished.mkdir(parents=True)
+    arch = compile("d_model = 16\nvocab_size = 32\nmodel = embed head\n")
+    model = Model(arch, rngs=nnx.Rngs(0))
+    trainer = Trainer(model, optax.adamw(1e-3), objective(tcfg.LossConfig(), arch))
+    save = Checkpoint(tmp_path, every=10, keep=2)
+    for step in (20, 30):
+        trainer.step = step
+        save(trainer, {})
+    save.close()
+    assert [p.name for p in tmp_path.iterdir()] == ["30"]
+
+
 def test_a_profile_traces_its_steps_into_the_run_s_directory_and_keeps_its_id(
     tmp_path,
 ):

@@ -763,12 +763,12 @@ any steps it takes again, which a crash after the checkpoint left. A run's mesh,
 layout and methods are not in its id, so it resumes on another mesh or another number
 of nodes too, orbax reading each array onto the shardings the new mesh gives it.
 
-Verified on B300s, one node and two, with GEMM autotuning off and deterministic ops
-(`--xla_gpu_autotune_level=0 --xla_gpu_deterministic_ops=true`): a 0.2B Llama of 8
-layers and a 0.4B MoE (16 experts, top-2) on packed documents, in bfloat16 with
-donation, 8 rows of 2048 tokens a GPU, 30 steps with a checkpoint every 10,
-stopped through `bux launch` by SIGTERM once step 15 was logged, or by SIGKILL as a
-crash would, and launched again. Against the run trained in one go, on its mesh:
+Verified on B300s, on one node, two and four, with GEMM autotuning off and
+deterministic ops (`--xla_gpu_autotune_level=0 --xla_gpu_deterministic_ops=true`): a
+0.2B Llama of 8 layers and a 0.4B MoE (16 experts, top-2) on packed documents, in
+bfloat16 with donation, 8 rows of 2048 tokens a GPU, 30 steps with a checkpoint every
+10, stopped through `bux launch` by SIGTERM once step 15 was logged, or by SIGKILL as
+a crash would, and launched again. Against the run trained in one go, on its mesh:
 
 | saved on                                | resumed on          | at    | restore  | losses after it                 |
 |-----------------------------------------|---------------------|-------|----------|---------------------------------|
@@ -785,10 +785,22 @@ crash would, and launched again. Against the run trained in one go, on its mesh:
 | two nodes, fsdp=16                      | the same            | 21    | 1.7s     | equal                           |
 | two nodes, fsdp=16                      | one node, fsdp=8    | 21    | 2.1s     | within 2e-5 (1e-3)              |
 | one node, fsdp=8                        | two nodes, fsdp=16  | 16    | 2.0s     | within 7e-5 (1e-3)              |
+| four nodes, fsdp=32, SIGKILL twice      | the same, twice     | 10,30 | 1.9s     | equal                           |
+| four nodes, fsdp=32                     | two nodes, fsdp=16  | 10    | 2.1s     | within 7e-4 (1e-3)              |
 
 In brackets, how far apart the losses of the runs trained in one go on the two meshes
 are. On two nodes, the SIGTERM went to the second node's process alone, and both
-stopped at the same step.
+stopped at the same step. On four, 60 steps of the dense model: the third node's
+process was SIGKILLed as the others saved step 20, and they ended by themselves 70 s
+later, when the first's coordination service missed its heartbeats (`Task 2 heartbeat
+timeout`); launched again, the run resumed at 10. Then the first node's process,
+which runs that service, was SIGKILLed as they saved step 40: the others ended 9-10 s
+later, and the run resumed at 30.
+
+A save that a crash left half written (`20.orbax-checkpoint-tmp`) is deleted as the
+run starts again, and the run saves again only past its step. Orbax would save that
+step in a folder of the same name, and on four nodes the other nodes still saw it as
+the one deleted, failed to write their parts into it, and the save hung.
 
 A resume that cannot work fails before it reads the checkpoint, and says what changed:
 the arrays' paths, dtypes and shapes, and the order of a pipeline's layers in them.
@@ -818,8 +830,10 @@ with a folder of its own, twenty minutes before it timed out.
 and its kin in `baseline.bux`: `one_gpu.bux`, the dense model, its GDN, KDA, bounded
 KDA and Mamba-2 hybrids, its MoE, and the dense one in MXFP8 and NVFP4, a GPU each;
 `one_node.bux`, FSDP at 1 and 8 microbatches, the MoE sorted and by EP, TP=8 in
-chunks and a 1f1b pipeline, on 8 GPUs; and `two_nodes.bux`, FSDP, HSDP, the GDN
-hybrid under HSDP and the MoE both ways, on 16. `scripts/benchmark.py` trains a suite
+chunks and a 1f1b pipeline, on 8 GPUs; `two_nodes.bux`, FSDP, HSDP, the GDN
+hybrid under HSDP and the MoE both ways, on 16; and `four_nodes.bux`, FSDP, HSDP, the
+MoE both ways and a pipeline of a stage a node, on 32 ([Four nodes and
+eight](parallelism.md#four-nodes-and-eight)). `scripts/benchmark.py` trains a suite
 and compares two results:
 
 ```

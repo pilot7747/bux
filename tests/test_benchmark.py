@@ -38,7 +38,8 @@ def benchmark(*args: str | Path) -> subprocess.CompletedProcess[str]:
 
 
 @pytest.mark.parametrize(
-    ("suite", "gpus"), [("one_gpu", 1), ("one_node", 8), ("two_nodes", 16)]
+    ("suite", "gpus"),
+    [("one_gpu", 1), ("one_node", 8), ("two_nodes", 16), ("four_nodes", 32)],
 )
 def test_every_run_of_a_suite_takes_the_gpus_of_its_scale(suite, gpus):
     path = ROOT / "examples" / "benchmarks" / f"{suite}.bux"
