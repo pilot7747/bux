@@ -118,6 +118,19 @@ def _rows(a, b, ends):
     return _times(a, b, ends).astype(jnp.bfloat16)
 
 
+def _packed_rows(a, b, sizes, out, *, starts, height):
+    """bux's rows kernel, each group's rows of a from `starts`, its output packed."""
+    m = a.values.shape[0]
+    spans = jnp.diff(jnp.append(starts, m))  # each group's rows of a, to the next's
+    y = jax.lax.ragged_dot(_dequantized(a), jnp.swapaxes(_dequantized(b), 1, 2), spans)
+    r = jnp.arange(height)
+    ends = jnp.cumsum(sizes)
+    group = jnp.minimum(jnp.searchsorted(ends, r, side="right"), sizes.shape[0] - 1)
+    at = starts[group] + r - (ends - sizes)[group]
+    rows = jnp.where((r < ends[-1])[:, None], y[jnp.minimum(at, m - 1)], 0)
+    return rows.astype(out)
+
+
 def _contract(a, b, ends):
     if isinstance(a, Columns):
         a = Tiled(a.values.T, a.scales)
@@ -132,6 +145,8 @@ def stand_in(monkeypatch):
         quantized_twice=_quantized_twice, transposed=_transposed
     )
     monkeypatch.setattr(grouped_glu, "grouped_triton", triton)
+    packing = types.SimpleNamespace(rows=_packed_rows)
+    monkeypatch.setattr(grouped_glu, "grouped_mxfp8", packing)
     for name, kernel in [
         ("runs", lambda: True),
         ("swiglu", _swiglu),
@@ -153,7 +168,8 @@ def test_each_experts_rows_start_at_a_multiple_of_256_and_read_their_tokens():
     layout, at = grouped_glu.padded(sizes, source, picks)
     np.testing.assert_array_equal(layout.ends, [256, 256, 768, 1024])
     starts = [0, 256, 256, 768]
-    want = np.concatenate([starts[e] + np.arange(s) for e, s in enumerate(sizes)])
+    each = np.asarray(sizes)
+    want = np.concatenate([starts[e] + np.arange(s) for e, s in enumerate(each)])
     np.testing.assert_array_equal(at[:filled], want)
     assert (np.asarray(at[filled:]) == layout.source.shape[0]).all()
     reads = np.asarray(layout.source)
@@ -290,12 +306,15 @@ def _gpu_operands(m: int = 1024, groups: int = 4):
     return x, w, ends, weights
 
 
+def _values(a: Tiled | Columns) -> Float[Array, "m n"]:
+    """Return what an operand holds, rows first."""
+    if isinstance(a, Columns):
+        return _dequantized(Tiled(a.values.T, a.scales)).T
+    return _dequantized(a)
+
+
 def _same_values(got: Tiled | Columns, want: Tiled | Columns, live: int):
-    if isinstance(got, Columns):
-        got, want = Tiled(got.values.T, got.scales), Tiled(want.values.T, want.scales)
-        _close(_dequantized(got)[:, :live], _dequantized(want)[:, :live], 0.02)
-    else:
-        _close(_dequantized(got)[:live], _dequantized(want)[:live], 0.02)
+    _close(_values(got)[:live], _values(want)[:live], 0.02)
 
 
 @blackwell
@@ -335,6 +354,24 @@ def test_the_plain_kernels_compute_what_their_stand_ins_do():
     for first in (_tiled(x.T), _columns(x.astype(jnp.float32))):
         got = jax.jit(grouped_cudnn.contract)(first, dy, ends)
         _close(got, _contract(first, dy, ends), 1e-2)
+
+
+@blackwell
+def test_bux_s_rows_kernel_reads_groups_at_their_starts_and_packs_its_output():
+    x, w, ends, _ = _gpu_operands()
+    sizes = jnp.array([200, 0, 300, 1], jnp.int32)
+    starts = ends - jnp.array([256, 0, 512, 256], jnp.int32)
+    kept = jnp.zeros(x.shape[0], bool)
+    for start, size in zip(starts, sizes, strict=True):
+        kept = kept | (
+            (jnp.arange(x.shape[0]) >= start) & (jnp.arange(x.shape[0]) < start + size)
+        )
+    a, b = _tiled(jnp.where(kept[:, None], x, 0)), _tiled(w)
+    run = functools.partial(gm.rows, out=jnp.bfloat16, starts=starts, height=600)
+    got = jax.jit(run)(a, b, sizes)
+    want = _packed_rows(a, b, sizes, jnp.bfloat16, starts=starts, height=600)
+    _close(got[:501], want[:501], 1e-2)
+    assert (np.asarray(got[501:]) == 0).all()
 
 
 @blackwell

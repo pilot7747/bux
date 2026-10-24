@@ -10,7 +10,9 @@ weights quantized by Triton (``grouped_triton``). A row of ``moe.experts`` goes
               h, dy and x, dp  contract  dW_down and dW_up
 
 The kernels take each expert's rows from a multiple of 256 (`Padded`): the quantizer
-reads each row from its token where it lies, and the sums read the rows back. Their
+reads each row from its token where it lies, and the sums read the rows back. Rows
+that sum into no token, as an exchange's, come out as they lay, each expert's after
+the last's, by bux's own GEMM (``grouped_mxfp8.rows``), which packs them so. Their
 GLU takes each gate 32 columns before its up (``grouped_cudnn.halves_of``), where W_up
 holds them side by side: the quantizer reads W_up's pairs so, and the transpose of dp
 for W_up's wgrad turns them back into pairs.
@@ -23,7 +25,7 @@ import jax.numpy as jnp
 from jaxtyping import Array, Float, Int, Shaped
 
 from bux import config as cfg
-from bux.architecture.experts import grouped_blockscaled, grouped_cudnn
+from bux.architecture.experts import grouped_blockscaled, grouped_cudnn, grouped_mxfp8
 from bux.architecture.experts.grouped_cudnn import PAD
 from bux.architecture.experts.grouped_mxfp8 import Tiled
 from bux.architecture.precision import blockscaled
@@ -37,12 +39,18 @@ except ImportError:
 
 class Padded(NamedTuple):
     """Rows by expert, each expert's from a multiple of 256: the row of the tokens each
-    reads (-1: a row of 0), where each token's k rows lie among them (past them: none),
-    and where each expert's end."""
+    reads (-1: a row of 0), where each token's k rows lie among them (past them: none;
+    None: the rows are the output), where each expert's end, and how many it has."""
 
     source: Int[Array, " p"]
-    picks: Int[Array, "t k"]
+    picks: Int[Array, "t k"] | None
     ends: Int[Array, " E"]
+    sizes: Int[Array, " E"]
+
+    @property
+    def starts(self) -> Int[Array, " E"]:
+        """Where each expert's rows start."""
+        return jnp.concatenate([jnp.zeros(1, self.ends.dtype), self.ends[:-1]])
 
 
 def runs(
@@ -76,7 +84,7 @@ def mlp(
     m = x.shape[0]
     tokens = x if picked is None else picked.tokens
     source = jnp.arange(m) if picked is None else picked.index
-    picks = jnp.arange(m)[:, None] if summed is None else summed.inverse
+    picks = None if summed is None else summed.inverse
     layout, at = padded(sizes, source, picks)
     row_weights = jnp.zeros(layout.source.shape[0], jnp.float32)
     row_weights = row_weights.at[at].set(weights.astype(jnp.float32), mode="drop")
@@ -86,11 +94,14 @@ def mlp(
 
 
 def padded(
-    sizes: Int[Array, " E"], source: Int[Array, " m"], picks: Int[Array, "t k"]
+    sizes: Int[Array, " E"],
+    source: Int[Array, " m"],
+    picks: Int[Array, "t k"] | None = None,
 ) -> tuple[Padded, Int[Array, " m"]]:
     """Return the layout of m rows sorted by expert, the first sizes[0] expert 0's and
-    so on, each row reading its token from `source`, each token's at `picks`; and where
-    each row lies in it. Rows past the experts' lie nowhere."""
+    so on, each row reading its token from `source`, each token's at `picks`, if they
+    sum into tokens; and where each row lies in it. Rows past the experts' lie
+    nowhere."""
     m, groups = source.shape[0], sizes.shape[0]
     rows = (m + groups * (PAD - 1)) // PAD * PAD  # the most the padding can take
     whole = -(-sizes // PAD) * PAD
@@ -102,8 +113,11 @@ def padded(
     moved = r + jnp.repeat(later, sizes, total_repeat_length=m)
     at = jnp.where(r < sizes.sum(), moved, rows)
     reads = jnp.full(rows, -1, jnp.int32).at[at].set(source, mode="drop")
-    lying = jnp.take(at, picks, mode="fill", fill_value=rows)
-    return Padded(reads, lying.astype(jnp.int32), ends.astype(jnp.int32)), at
+    lying = None
+    if picks is not None:
+        lying = jnp.take(at, picks, mode="fill", fill_value=rows).astype(jnp.int32)
+    whole_ends, sizes = ends.astype(jnp.int32), sizes.astype(jnp.int32)
+    return Padded(reads, lying, whole_ends, sizes), at
 
 
 def _sums(y: Float[Array, "p d"], picks: Int[Array, "t k"]) -> Float[Array, "t d"]:
@@ -157,9 +171,9 @@ def _forward(
     down_dgrad, down_fprop = grouped_triton.quantized_twice(down, jnp.int32(f))
     assert x_t is not None and up_fprop is not None and down_fprop is not None
     glu = grouped_cudnn.swiglu(x, up_fprop, layout.ends, weights)
-    y = grouped_cudnn.rows(glu.h, down_fprop, layout.ends)
+    y = _outputs(glu.h, down_fprop, layout, tokens.shape[0])
     saved = (x_t, up_dgrad, down_dgrad, glu.product, glu.h_columns, weights, layout)
-    return _sums(y, layout.picks), saved
+    return y, saved
 
 
 def _backward(
@@ -177,15 +191,26 @@ def _backward(
     dy_rows, dy_t = grouped_triton.quantized_twice(dy, rows, index=layout.source)
     assert dy_t is not None
     grad = grouped_cudnn.dswiglu(dy_rows, down_dgrad, product, layout.ends, weights)
-    dx = grouped_cudnn.rows(grad.product, up_dgrad, layout.ends)
+    dx = _outputs(grad.product, up_dgrad, layout, dy.shape[0])
     d_down = grouped_cudnn.contract(h_columns, dy_t, layout.ends)
     d_up = grouped_cudnn.contract(x_t, _in_pairs(grad.product_columns), layout.ends)
     groups, d, f2 = d_up.shape
     d_up = d_up.reshape(groups, d, f2 // 2, 2)
-    return _sums(dx, layout.picks), grad.weights, d_up, d_down, None
+    return dx, grad.weights, d_up, d_down, None
 
 
 _mlp.defvjp(_forward, _backward)
+
+
+def _outputs(a: Tiled, b: Tiled, layout: Padded, height: int) -> Float[Array, "t n"]:
+    """Return each row's a b[g]^T, summed into its token, or as the rows lay: the
+    `height` of them, each expert's after the last's."""
+    if layout.picks is None:
+        starts, sizes = layout.starts, layout.sizes
+        return grouped_mxfp8.rows(
+            a, b, sizes, jnp.bfloat16, starts=starts, height=height
+        )
+    return _sums(grouped_cudnn.rows(a, b, layout.ends), layout.picks)
 
 
 def _in_pairs(product: grouped_cudnn.Columns) -> Tiled:

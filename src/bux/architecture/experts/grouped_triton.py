@@ -281,16 +281,14 @@ def _transpose_kernel(
     tile: tl.constexpr,
     pairs: tl.constexpr,
 ) -> None:
-    """A tile of x's bytes into out transposed, x's columns read as pairs if
-    `pairs`."""
+    """A tile of x's bytes into out transposed, x's columns written as the rows of
+    pairs they are if `pairs`: so that each copy runs along a row of both."""
     rs = tl.program_id(0) * tile + tl.arange(0, tile)
-    ns = tl.program_id(1) * tile + tl.arange(0, tile)
-    read = ns
-    if pairs:  # pair u's up lies 32 columns into its 64's, its gate at their start
-        read = ns // 64 * 64 + (1 - ns % 2) * 32 + ns // 2 % 32
-    v = tl.load(
-        x + rs[:, None].to(tl.int64) * c + read[None, :], mask=(rs < r)[:, None]
-    )
+    cs = tl.program_id(1) * tile + tl.arange(0, tile)
+    v = tl.load(x + rs[:, None].to(tl.int64) * c + cs[None, :], mask=(rs < r)[:, None])
+    ns = cs
+    if pairs:  # in each 64 columns of halves, the gates of 32 pairs, then their ups
+        ns = cs // 64 * 64 + cs % 32 * 2 + (cs % 64 < 32).to(tl.int32)
     at = out + ns[:, None].to(tl.int64) * r + rs[None, :]
     tl.store(at, tl.trans(v), mask=(rs < r)[None, :])
 
