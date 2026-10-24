@@ -110,7 +110,7 @@ def mlp(
     return _mlp(tokens, row_weights, up, down, layout, quantized).astype(x.dtype)
 
 
-def quantized(up: Float[Array, "E d f 2"], down: Float[Array, "E f d"]) -> Weights:
+def in_mxfp8(up: Float[Array, "E d f 2"], down: Float[Array, "E f d"]) -> Weights:
     """Return the experts' kernels in MXFP8 as the GEMMs take them, by Triton."""
     assert grouped_triton is not None
     groups, d, f, _ = up.shape
@@ -133,7 +133,7 @@ def gathered(
     gathered in MXFP8. The kernels gathered in bfloat16 carry only their gradients,
     which reduce-scatter back into shards: XLA drops their forward."""
     whole = (jax.lax.all_gather(k, axes, axis=0, tiled=True) for k in (up, down))
-    shards = quantized(jax.lax.stop_gradient(up), jax.lax.stop_gradient(down))
+    shards = in_mxfp8(jax.lax.stop_gradient(up), jax.lax.stop_gradient(down))
     return *whole, jax.tree.map(partial(_bytes_gathered, axes=axes), shards)
 
 
@@ -160,9 +160,8 @@ def padded(
     rows = (m + groups * (PAD - 1)) // PAD * PAD  # the most the padding can take
     whole = -(-sizes // PAD) * PAD
     ends = jnp.cumsum(whole)
-    later = (
-        ends - whole - (jnp.cumsum(sizes) - sizes)
-    )  # how far each expert's rows move
+    # How far each expert's rows move, from following each other to their padding.
+    later = ends - whole - (jnp.cumsum(sizes) - sizes)
     r = jnp.arange(m)
     moved = r + jnp.repeat(later, sizes, total_repeat_length=m)
     at = jnp.where(r < sizes.sum(), moved, rows)
@@ -170,8 +169,8 @@ def padded(
     lying = None
     if picks is not None:
         lying = jnp.take(at, picks, mode="fill", fill_value=rows).astype(jnp.int32)
-    whole_ends, sizes = ends.astype(jnp.int32), sizes.astype(jnp.int32)
-    return Padded(reads, lying, whole_ends, sizes), at
+    int32 = jnp.int32
+    return Padded(reads, lying, ends.astype(int32), sizes.astype(int32)), at
 
 
 def _sums(y: Float[Array, "p d"], picks: Int[Array, "t k"]) -> Float[Array, "t d"]:
@@ -220,7 +219,7 @@ def _forward(
     rows = jnp.int32(layout.source.shape[0])
     x, x_t = grouped_triton.quantized_twice(tokens, rows, index=layout.source)
     assert x_t is not None
-    w = quantized(up, down) if given is None else given
+    w = in_mxfp8(up, down) if given is None else given
     glu = grouped_cudnn.swiglu(x, w.up_fprop, layout.ends, weights)
     y = _outputs(glu.h, w.down_fprop, layout, tokens.shape[0])
     saved = (x_t, w.up_dgrad, w.down_dgrad, glu.product, glu.h_columns, weights, layout)

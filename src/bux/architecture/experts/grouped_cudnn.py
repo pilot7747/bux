@@ -18,6 +18,7 @@ written.
 """
 
 import functools
+import os
 from typing import Any, NamedTuple, no_type_check
 
 import jax
@@ -334,8 +335,12 @@ def _wgrad_kernel(groups: int) -> tuple[Any, int, int]:
 
 
 def _pairs_of_sms() -> int:
+    """Return how many pairs of SMs a kernel runs on: all of them, but as many as
+    CUDNNFE_CLUSTER_OVERLAP_MARGIN leaves to a kernel beside it, as cuDNN's fused
+    ones do."""
     assert cutlass is not None
-    return cutlass.utils.HardwareInfo().get_max_active_clusters(2)
+    margin = int(os.environ.get("CUDNNFE_CLUSTER_OVERLAP_MARGIN", "0"))
+    return cutlass.utils.HardwareInfo().get_max_active_clusters(2) - margin
 
 
 # CuTe DSL takes an adapter's annotations for its own types: these have none.
