@@ -20,7 +20,7 @@ from jaxtyping import Array, Bool, Float, Int
 from bux.parallel import flash, methods
 from bux.parallel.flash import Keys
 from bux.parallel.layout import as_split, axes_of, shard, spec
-from bux.parallel.mesh import active
+from bux.parallel.mesh import active, free_axes
 from bux.train import flops
 
 AXIS = "context"
@@ -142,13 +142,6 @@ def xla(
 # --- on each device -----------------------------------------------------------------
 
 
-def _free_axes() -> set[str]:
-    """Return the axes of the run's mesh that no shard_map being traced maps."""
-    on = active()
-    assert on is not None
-    return set(on.mesh.axis_names) - set(jax.sharding.get_abstract_mesh().manual_axes)
-
-
 def splits_positions(q: Float[Array, "b t h dk"]) -> bool:
     """Return whether the run's layout splits the positions of `q` over `context`."""
     split = spec(("batch", "seq", "heads", None), q.shape)
@@ -195,7 +188,7 @@ def on_devices(
         body,
         in_specs=(queries, keys, keys, P(*queries[:2]), P(queries[2])),
         out_specs=queries,
-        axis_names=_free_axes(),
+        axis_names=free_axes(),
         check_vma=False,
     )(q, k, v, rows, sinks)
 

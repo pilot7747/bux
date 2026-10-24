@@ -15,7 +15,7 @@ from jax.sharding import NamedSharding
 from jax.sharding import PartitionSpec as P
 from jaxtyping import Array, Shaped
 
-from bux.parallel.mesh import Active, active
+from bux.parallel.mesh import Active, active, in_shard_map, manual_axes
 from bux.train.config import LayoutConfig
 
 NAMES = "names"  # the metadata key that holds a parameter's dimension names
@@ -67,7 +67,7 @@ def resolve(names: Sequence[Name], shape: tuple[int, ...], on: Active) -> list[S
     """
     if len(names) != len(shape):
         raise ValueError(f"{len(names)} names for {len(shape)} dimensions: {names}")
-    used = set(jax.sharding.get_abstract_mesh().manual_axes)
+    used = set(manual_axes())
     splits = []
     for name, size in zip(names, shape):
         split = tuple(
@@ -135,8 +135,7 @@ def shard(x: Shaped[Array, "*s"], *names: Name) -> Shaped[Array, "*s"]:
     if (on := active()) is None:
         return x
     split = partition(resolve(names, x.shape, on))
-    manual = jax.sharding.get_abstract_mesh().manual_axes
-    if not isinstance(x, Tracer) or not manual:
+    if not isinstance(x, Tracer) or not in_shard_map():
         # So also a gradient's tracer of an array that is not on the mesh yet.
         return jax.lax.with_sharding_constraint(x, NamedSharding(on.mesh, split))
     # A bare spec is of the mesh being traced, which knows a shard_map's manual axes.

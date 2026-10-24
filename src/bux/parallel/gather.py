@@ -36,7 +36,7 @@ from jax.typing import DTypeLike
 from jaxtyping import Array, Float, Int, Shaped
 
 from bux.parallel.layout import as_split, axes, axes_of, partition
-from bux.parallel.mesh import active
+from bux.parallel.mesh import active, manual_axes
 from bux.parallel.place import shardings
 
 Axes = tuple[str, ...]
@@ -56,7 +56,7 @@ def rows() -> Axes:
     on = active()
     if on is None:
         return ()
-    manual = set(jax.sharding.get_abstract_mesh().manual_axes)
+    manual = manual_axes()
     return tuple(
         a for a in axes(on.layout, "batch") if on.size(a) > 1 and a not in manual
     )
@@ -171,5 +171,5 @@ def apart(over: Axes) -> Generator[None]:
 
 def rows_apart() -> Axes:
     """Return the axes `apart` put in force, but those a shard_map being traced maps."""
-    manual = set(jax.sharding.get_abstract_mesh().manual_axes)
+    manual = manual_axes()
     return tuple(a for a in APART.get() if a not in manual)

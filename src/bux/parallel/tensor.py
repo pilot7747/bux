@@ -37,7 +37,7 @@ from jaxtyping import Array, Float
 from bux.architecture.precision import blockscaled, matmuls
 from bux.parallel import methods
 from bux.parallel.layout import NAMES, Entry, Name, as_split, shard, spec, splits
-from bux.parallel.mesh import active
+from bux.parallel.mesh import active, free_axes, manual_axes
 
 AXIS = "tensor"
 # The formats that scale each block of an operand by itself, and their blocks: a
@@ -168,8 +168,7 @@ def _input_split(x: Float[Array, "b t d"]) -> InputSplit | None:
     a shard_map already manual over it, or where the stream splits otherwise than the
     layer's positions and then `tensor`."""
     on = active()
-    manual = jax.sharding.get_abstract_mesh().manual_axes
-    if on is None or on.size(AXIS) == 1 or AXIS in manual:
+    if on is None or on.size(AXIS) == 1 or AXIS in manual_axes():
         return None
     rows, stream, _ = spec(("batch", "stream", None), x.shape)
     _, layer, _ = spec(("batch", "seq", None), x.shape)
@@ -244,14 +243,11 @@ def _shard_map(
 ) -> Callable[..., Any]:
     """`body` on each device's part, manual over every axis no shard_map being traced
     maps. Its matmuls may be kernels (MXFP8's), which need check_vma=False."""
-    on = active()
-    assert on is not None
-    free = set(on.mesh.axis_names) - set(jax.sharding.get_abstract_mesh().manual_axes)
     return jax.shard_map(
         body,
         in_specs=in_specs,
         out_specs=out_specs,
-        axis_names=free,
+        axis_names=free_axes(),
         check_vma=False,
     )
 
