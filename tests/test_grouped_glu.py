@@ -12,15 +12,19 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 import pytest
+from flax import nnx
 from jaxtyping import Array, Float, Int
 
 from bux import config as cfg
-from bux import kernels
+from bux import kernels, parallel
+from bux.architecture import Taps
 from bux.architecture.experts import grouped, grouped_cudnn, grouped_glu, moe
 from bux.architecture.experts import grouped_mxfp8 as gm
 from bux.architecture.experts.grouped_cudnn import Columns
 from bux.architecture.experts.grouped_mxfp8 import Tiled
+from bux.architecture.experts.moe import MoE
 from bux.architecture.precision import blockscaled, matmuls
+from bux.train import config as tcfg
 
 SWIGLU = cfg.MLPConfig(type="gated_mlp", intermediate_size=256, activation="swish")
 D, F, E, K = 256, 256, 4, 2
@@ -291,6 +295,38 @@ def test_the_fused_mlp_runs_a_plain_swiglu_in_mxfp8_alone(stand_in):
     gelu = SWIGLU.model_copy(update={"activation": "gelu"})
     assert not grouped_glu.runs(blockscaled.MXFP8, passes, gelu, up)
     assert not grouped_glu.runs(blockscaled.MXFP8, passes, SWIGLU, up[:, :128])
+
+
+def _layer_outputs(mesh: dict[str, int]):
+    """An MoE layer's output and gradients by `sorted` in MXFP8, on `mesh`."""
+    x = jax.random.normal(jax.random.key(8), (8, 16, D))
+    probe = jax.random.normal(jax.random.key(9), x.shape)
+    config = cfg.MoEConfig(num_experts=8, top_k=2, expert=SWIGLU)
+    with parallel.use(tcfg.MeshConfig.model_validate(mesh)), matmuls.use("mxfp8"):
+        layer = parallel.build(lambda: MoE(config, D, nnx.Rngs(0)))
+        loss = lambda e, x: (e(x, Taps()) * probe).sum()
+        y = nnx.jit(lambda e, x: e(x, Taps()))(layer, x)
+        grads = nnx.jit(nnx.grad(loss, argnums=(0, 1)))(layer, x)
+        return jax.device_get((y, grads))
+
+
+def test_each_device_quantizes_its_own_shard_of_the_experts_as_one_does_them_all(
+    stand_in, monkeypatch
+):
+    gathered = []
+    real = grouped_glu.gathered
+    monkeypatch.setattr(
+        grouped_glu, "gathered", lambda *a: gathered.append(a[2]) or real(*a)
+    )
+    (y, grads), (y_split, grads_split) = (
+        _layer_outputs({"data": 1}),
+        _layer_outputs({"fsdp": 8}),
+    )
+    assert gathered and all(axes == ("fsdp",) for axes in gathered)
+    _close(y_split, y, 1e-6)
+    # Each device's gradients in bfloat16, summed over the devices.
+    for got, want in zip(jax.tree.leaves(grads_split), jax.tree.leaves(grads)):
+        _close(got, want, 1e-2)
 
 
 # --- On a Blackwell GPU: the kernels against the stand-ins --------------------------

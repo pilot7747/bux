@@ -16,8 +16,13 @@ the last's, by bux's own GEMM (``grouped_mxfp8.rows``), which packs them so. The
 GLU takes each gate 32 columns before its up (``grouped_cudnn.halves_of``), where W_up
 holds them side by side: the quantizer reads W_up's pairs so, and the transpose of dp
 for W_up's wgrad turns them back into pairs.
+
+Where FSDP splits the experts' kernels by expert, `gathered` quantizes each device's
+shard of them before it gathers them, in MXFP8 (`Weights`): a share of the work, and
+the bytes of bfloat16's.
 """
 
+from functools import partial
 from typing import NamedTuple
 
 import jax
@@ -53,6 +58,16 @@ class Padded(NamedTuple):
         return jnp.concatenate([jnp.zeros(1, self.ends.dtype), self.ends[:-1]])
 
 
+class Weights(NamedTuple):
+    """The experts' kernels in MXFP8 as the GEMMs take them: up's, its pairs as halves,
+    along what its dgrad and its forward contract, and down's."""
+
+    up_dgrad: Tiled
+    up_fprop: Tiled
+    down_dgrad: Tiled
+    down_fprop: Tiled
+
+
 def runs(
     recipe: blockscaled.Recipe | None,
     passes: tuple[Pass, ...],
@@ -77,10 +92,12 @@ def mlp(
     down: Float[Array, "E f d"],
     picked: grouped_blockscaled.Picked | None = None,
     summed: grouped_blockscaled.Summed | None = None,
+    quantized: Weights | None = None,
 ) -> Float[Array, "r d"]:
     """Return what ``moe.experts`` does of a SwiGLU FFN with no norm: each row of x
     through its expert's FFN times its weight, x read from the tokens where it was
-    `picked`, or the sums of the tokens it is `summed` into."""
+    `picked`, or the sums of the tokens it is `summed` into; the kernels as they are
+    `quantized`, if they are, up and down then taking only their gradients."""
     m = x.shape[0]
     tokens = x if picked is None else picked.tokens
     source = jnp.arange(m) if picked is None else picked.index
@@ -90,7 +107,44 @@ def mlp(
     row_weights = row_weights.at[at].set(weights.astype(jnp.float32), mode="drop")
     # The kernels take, and give, bfloat16.
     tokens, up, down = (a.astype(jnp.bfloat16) for a in (tokens, up, down))
-    return _mlp(tokens, row_weights, up, down, layout).astype(x.dtype)
+    return _mlp(tokens, row_weights, up, down, layout, quantized).astype(x.dtype)
+
+
+def quantized(up: Float[Array, "E d f 2"], down: Float[Array, "E f d"]) -> Weights:
+    """Return the experts' kernels in MXFP8 as the GEMMs take them, by Triton."""
+    assert grouped_triton is not None
+    groups, d, f, _ = up.shape
+    in_pairs = up.astype(jnp.bfloat16).reshape(groups, d, 2 * f)
+    up_dgrad, up_fprop = grouped_triton.quantized_twice(
+        in_pairs, jnp.int32(d), halves=True
+    )
+    down_dgrad, down_fprop = grouped_triton.quantized_twice(
+        down.astype(jnp.bfloat16), jnp.int32(f)
+    )
+    assert up_fprop is not None and down_fprop is not None
+    return Weights(up_dgrad, up_fprop, down_dgrad, down_fprop)
+
+
+def gathered(
+    up: Float[Array, "e d f 2"], down: Float[Array, "e f d"], axes: tuple[str, ...]
+) -> tuple[Float[Array, "E d f 2"], Float[Array, "E f d"], Weights]:
+    """Return a device's shards of the experts' kernels, in a shard_map manual over
+    `axes`, gathered whole over them; and quantized, each device its own shard, then
+    gathered in MXFP8. The kernels gathered in bfloat16 carry only their gradients,
+    which reduce-scatter back into shards: XLA drops their forward."""
+    whole = (jax.lax.all_gather(k, axes, axis=0, tiled=True) for k in (up, down))
+    shards = quantized(jax.lax.stop_gradient(up), jax.lax.stop_gradient(down))
+    return *whole, jax.tree.map(partial(_bytes_gathered, axes=axes), shards)
+
+
+def _bytes_gathered(
+    a: Shaped[Array, "e ..."], axes: tuple[str, ...]
+) -> Shaped[Array, "E ..."]:
+    """Return a stack of E4M3 values or E8M0 scales gathered whole over `axes`, as
+    bytes: the collectives take no 8-bit float."""
+    raw = jax.lax.bitcast_convert_type(a, jnp.uint8)
+    whole = jax.lax.all_gather(raw, axes, axis=0, tiled=True)
+    return jax.lax.bitcast_convert_type(whole, a.dtype)
 
 
 def padded(
@@ -149,8 +203,9 @@ def _mlp(
     up: Float[Array, "E d f 2"],
     down: Float[Array, "E f d"],
     layout: Padded,
+    given: Weights | None,
 ) -> Float[Array, "t d"]:
-    return _forward(tokens, weights, up, down, layout)[0]
+    return _forward(tokens, weights, up, down, layout, given)[0]
 
 
 def _forward(
@@ -159,20 +214,16 @@ def _forward(
     up: Float[Array, "E d f 2"],
     down: Float[Array, "E f d"],
     layout: Padded,
+    given: Weights | None,
 ) -> tuple[Float[Array, "t d"], Saved]:
     assert grouped_triton is not None
-    groups, d, f, _ = up.shape
     rows = jnp.int32(layout.source.shape[0])
     x, x_t = grouped_triton.quantized_twice(tokens, rows, index=layout.source)
-    in_pairs = up.reshape(groups, d, 2 * f)
-    up_dgrad, up_fprop = grouped_triton.quantized_twice(
-        in_pairs, jnp.int32(d), halves=True
-    )
-    down_dgrad, down_fprop = grouped_triton.quantized_twice(down, jnp.int32(f))
-    assert x_t is not None and up_fprop is not None and down_fprop is not None
-    glu = grouped_cudnn.swiglu(x, up_fprop, layout.ends, weights)
-    y = _outputs(glu.h, down_fprop, layout, tokens.shape[0])
-    saved = (x_t, up_dgrad, down_dgrad, glu.product, glu.h_columns, weights, layout)
+    assert x_t is not None
+    w = quantized(up, down) if given is None else given
+    glu = grouped_cudnn.swiglu(x, w.up_fprop, layout.ends, weights)
+    y = _outputs(glu.h, w.down_fprop, layout, tokens.shape[0])
+    saved = (x_t, w.up_dgrad, w.down_dgrad, glu.product, glu.h_columns, weights, layout)
     return y, saved
 
 
@@ -183,6 +234,7 @@ def _backward(
     Float[Array, " p"],
     Float[Array, "E d f 2"],
     Float[Array, "E f d"],
+    None,
     None,
 ]:
     assert grouped_triton is not None
@@ -196,7 +248,7 @@ def _backward(
     d_up = grouped_cudnn.contract(x_t, _in_pairs(grad.product_columns), layout.ends)
     groups, d, f2 = d_up.shape
     d_up = d_up.reshape(groups, d, f2 // 2, 2)
-    return dx, grad.weights, d_up, d_down, None
+    return dx, grad.weights, d_up, d_down, None, None
 
 
 _mlp.defvjp(_forward, _backward)
