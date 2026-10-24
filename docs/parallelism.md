@@ -2144,6 +2144,83 @@ a float32 sum of every parameter's gradient on each device, held through the ste
 `layout(zero=1)` keeps the parameters whole between steps too; with `gather=step` it
 saves no collective, and holds float32 copies where the step holds `compute`'s.
 
+### Side by side: `methods.interleave`
+
+```
+methods = methods(microbatches=8, interleave=true)
+```
+
+In a row, each of a microbatch's collectives waits on the compute just before it, and
+what the layer's data flow leaves nothing beside stays exposed: FSDP's gathers, TP's
+reductions, EP's exchanges. With `interleave`, each microbatch's forward runs beside
+the backward of the one before, a piece of the model at a time, as Megatron's
+combined 1F1B does without a pipeline (`bux.train.interleave`):
+
+```
+forward of microbatch 0
+a lax.scan, for i in 0 .. n-2:
+    tick t, for t in 0 .. r-1:  piece t's forward of i+1,  piece r-1-t's backward of i
+    the head's loss of i+1, and its gradient
+backward of microbatch n-1
+```
+
+The pieces are the items of the model's graph in a row, each pass of an unrolled
+repeat one of its own (`embed`, 48 blocks, `norm`, and the head, whose forward ends
+in the loss); a scanned repeat is one piece. A piece's forward is a `jax.vjp`, which
+keeps what the backward reads but what elementwise ops make, as a scanned pass does
+(`remat.unfused`), where the run's `remat` keeps everything. The scan carries each
+piece's residuals, as leaves of their own, to its backward in the next iteration.
+Each tick ends in an optimization barrier on the stream, its gradient and the
+gradients of the tick before, so that XLA's scheduler puts one half's collectives
+beside the other half's compute, reduces a tick's gradients beside the next, and
+runs no tick early; XLA:GPU keeps the barriers until it has scheduled the step. The
+gradients, the metrics, the router's bias and the RNG streams are the loop's
+(`tests/test_interleave.py`, on FSDP, EP and TP layouts, to float32's rounding:
+XLA:CPU rounds a microbatch inside a loop to other bits than outside one).
+
+A carried leaf is written where it was read. A top piece's residuals are read by the
+backward of the microbatch before at a tick before its forward makes the new ones, so
+XLA writes them in place; a bottom piece's new ones are made before the old ones are
+read, so XLA keeps them aside and copies them in at the loop's end. That is a copy of
+half a microbatch's residuals, and the peak holds them beside the other half: on
+megatron.bux's 12-layer cut, 25 GiB more than the loop. Slots of one buffer that
+each forward takes from the backward before it (a residual put in by a
+dynamic-update-slice and taken out by a dynamic slice) hold one microbatch's, but
+XLA copies every residual a kernel made into its slot, and out again where a kernel
+reads it: 160 ms of a step of 12 of those layers in 4 microbatches, which takes 1050
+in a row, and cuBLAS chose slower GEMMs for TP's slices. XLA's dynamic-slice fusion,
+with offsets from a table
+(`--xla_gpu_experimental_enable_dynamic_slice_table_offsets=true`), makes the same
+copies as memcpys. With no carry at all, the ticks of every microbatch unrolled in the
+step, nothing is copied, but the program is n times the loop's, and XLA held 176 GiB
+for the 12 layers.
+
+On 8 B300s it overlaps, but its copies cost more than it hides, and it is off by
+default. Tokens a second a GPU and the peak, the loop and interleave side by side
+on a node:
+
+INTERLEAVE_TABLE
+
+Tied a tick at a time, the halves beat XLA's own order: with the barrier on the
+gradients alone (so that each half's chain runs as XLA likes), TP trained at 31.2k in
+24.9 GiB and the MoE at 104.6k in 93.8 GiB. The overlap is real but small on a node:
+TP's step on GPU 0 left 39 ms of its collectives exposed, from 47, and unrolled 35,
+at 35.3k a GPU against the loop's 34.1k; the MoE's FSDP gathers took 50 ms less of a
+step, which slower reduce-scatters gave back. XLA runs one collective at a time
+(`xla_gpu_experimental_parallel_collective_overlap_limit`); at 2, interleave gains,
+and the loop of the MoE loses 4.5%. The 48-layer arm at Megatron's batch, which the
+loop trains at 35.8k in 230 GiB, does not fit interleaved.
+
+NCCL EP keeps a layer's routing from its forward to its backward, so a microbatch's
+forward of a layer before the backward of the one before fails in TransformerEngine
+("no prior nvte_ep_prepare") unless `moe_stream=true` runs them as one call, which
+trains to the loop's losses; its exchange stays exposed beside the other
+microbatch's compute, as XLA's schedule puts each call's done right after its
+start. A model whose items pass each other more than the stream (a tap, an MTP
+head) is an error that says so, and so is a pipeline, which schedules its own
+microbatches. The step's program is about twice the loop's, a forward and a backward
+on each side of the loop, and compiles in about twice the time.
+
 ### Memory and losses
 
 The compiled train step's temporaries on one device, for 4 Llama blocks of width 256,
