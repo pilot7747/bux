@@ -134,7 +134,7 @@ def xla(
     and value: all-gather context parallelism."""
     t = q.shape[1]
     mask = causal_mask(t, args.window, args.ids)[..., None, :, :]
-    with flops.visible(flops.causal_share(t, args.window)):  # for MFU
+    with flops.attention(args.window), flops.over_keys():  # for MFU
         logits = softcap(scaled_logits(q, k, args.scale), args.softcap)
         return weighted_values(masked_softmax(logits, mask, args.sinks), v)
 

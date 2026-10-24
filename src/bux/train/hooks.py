@@ -71,24 +71,19 @@ class Hook:
 class Log(Hook):
     """The step's metrics, with its learning rate, the tokens seen and the tokens per
     second since the last log; and `mfu`, the model FLOPs a second over the devices'
-    peak, where `flops` (a step's) and `peak` (the devices' a second) are known.
+    `peak`, where the peak is known and the trainer counts its FLOPs (`work`).
     Optax counts from 0: the step just taken is `trainer.step - 1`."""
 
     def __init__(
-        self,
-        *,
-        every: int,
-        lr: Schedule,
-        tokens: int,
-        flops: float | None = None,
-        peak: float | None = None,
+        self, *, every: int, lr: Schedule, tokens: int, peak: float | None = None
     ):
         self.every, self.lr, self.tokens = every, lr, tokens  # tokens per step
-        self.ideal = flops / peak if flops and peak else None  # a step at the peak, s
-        self.clock, self.since = time.perf_counter(), 0
+        self.peak = peak
+        self.clock, self.since, self.flops = time.perf_counter(), 0, 0.0
 
     def start(self, trainer: "Trainer") -> None:
         self.clock, self.since = time.perf_counter(), trainer.step
+        self.flops = trainer.flops
 
     def __call__(self, trainer: "Trainer", metrics: Metrics) -> Scalars:
         scalars = {k: float(v) for k, v in metrics.items()}  # waits for the step
@@ -99,9 +94,9 @@ class Log(Hook):
             "tokens": trainer.step * self.tokens,
             "tokens_per_s": steps * self.tokens / seconds,
         }
-        if self.ideal is not None:
-            scalars["mfu"] = steps * self.ideal / seconds
-        self.clock, self.since = now, trainer.step
+        if self.peak and trainer.work is not None:
+            scalars["mfu"] = (trainer.flops - self.flops) / seconds / self.peak
+        self.clock, self.since, self.flops = now, trainer.step, trainer.flops
         return scalars
 
 

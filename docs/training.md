@@ -402,17 +402,26 @@ The log has the step's metrics: `loss` and every term of the objective, `grad_no
 before clipping, `lr`, `tokens` so far and `tokens_per_s` since the last log. On a GPU
 whose peak it knows (B300, B200, H200, H100, A100: dense bf16, from NVIDIA's
 datasheets), it also has `mfu`: the model's FLOPs a second over the peak of the
-mesh's GPUs. A step's FLOPs are counted once, before training, from the program of
+mesh's GPUs. The model's FLOPs are counted once, before training, from the program of
 its loss's gradient on a batch, traced on shapes alone with remat and kernels off
 (`trainer.step_flops`, `bux/train/flops.py`): 2·m·n·k for every matrix product and
-convolution, times the length of every scan around it. So a new layer counts with
-no formula of its own, and a rematerialized forward is not counted twice. Attention
-counts the share of its t × t logits that its mask keeps, (t + 1) / 2t causal and
-less with a window, as Megatron's MFU does and a flash kernel computes; not the
-documents of a packed row, which change from batch to batch. (PaLM's MFU counts them
-whole, which made bux's 10% higher at 4096 tokens a row.) `bux plan` shows the FLOPs a
-token: 6.9G for a Llama-style 1.3B at 4096 tokens a row, 6 N of its matrices and 0.8G
-of attention.
+convolution, times the length of every scan around it, each product once: what a
+backward pass computes again (jax.checkpoint's, the logits of a flash backward) counts
+none. So a new layer counts with no formula of its own.
+
+Attention counts only the keys each query sees, as Megatron's MFU does and a flash
+kernel computes. Its products over the keys of a row are counted apart (inside
+`flops.attention`), and each step counts them at the keys its batch's queries see,
+from the batch's positions (`flops.Work.of`, on the host): those of the query's own
+document up to itself, within the window, and of those no more than a sparse
+attention's top_k. Causal attention on rows of one document so counts (t + 1) / 2t of
+its t × t logits, packed documents each one's own triangle, and DSA its top_k keys a
+query in the attention, the indexer's loss and its target, with the indexer's ranking
+at every key it may pick. CSA's latents count whole. On many hosts a step counts the
+keys of the rows its host reads. (PaLM's MFU counts attention whole, which made bux's
+10% higher at 4096 tokens a row.) `bux plan` shows the FLOPs a token on rows of one
+document: 6.9G for a Llama-style 1.3B at 4096 tokens a row, 6 N of its matrices and
+0.8G of attention.
 
 `profile = profile(start=20, steps=5)` traces the 5 steps after step 20 into
 `profile/`, waiting for the step before it starts and stops, for `xprof` or
