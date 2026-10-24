@@ -3,7 +3,7 @@ operands laid out as the kernels take them and each group's edge tiles, on the C
 the kernels lowered for a Blackwell GPU, anywhere; and on a Blackwell GPU, the
 kernels against XLA's dequantize-and-multiply, with empty groups, tiny ones and rows
 past them, and Triton's quantizer (grouped_triton) against XLA's layout of XLA's
-quantization."""
+quantization, and of rows it reads by index against their copy."""
 
 import jax
 import jax.numpy as jnp
@@ -176,6 +176,19 @@ def test_the_quantizer_writes_what_xla_lays_out_for_the_kernels(shape, filled):
             np.testing.assert_array_equal(
                 blockscaled.as_bytes(a), blockscaled.as_bytes(b)
             )
+
+
+@blackwell
+def test_the_quantizer_reads_rows_by_index_as_it_reads_their_copy():
+    from bux.architecture.experts import grouped_triton
+
+    tokens = jax.random.normal(jax.random.key(5), (300, 2048), jnp.bfloat16)
+    index = jax.random.randint(jax.random.key(6), (M,), 0, 300)
+    filled = jnp.int32(900)
+    got = grouped_triton.quantized_twice(tokens, filled, index=index)
+    want = grouped_triton.quantized_twice(tokens[index], filled)
+    for a, b in zip(jax.tree.leaves(got), jax.tree.leaves(want), strict=True):
+        np.testing.assert_array_equal(blockscaled.as_bytes(a), blockscaled.as_bytes(b))
 
 
 def test_the_quantizer_s_kernels_are_left_as_written_for_triton():

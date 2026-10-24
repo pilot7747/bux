@@ -1,11 +1,12 @@
 """Grouped MXFP8 GEMMs on a Blackwell GPU (bux.architecture.experts.grouped_mxfp8):
 each kernel against XLA's dequantize-and-multiply, with empty groups, a group of one
 row and rows past the groups; Triton's quantizer (grouped_triton) against XLA's
-quantization, laid out for the kernels; then an MoE layer's experts, forward and
-backward, in
-MXFP8 (``grouped_blockscaled``) against bfloat16 (``grouped``), at the baseline MoE's
-shapes (64 experts, d_model 2048, intermediate 704 and 2048, 262144 picks), and the
-GPU time of each by CUPTI.
+quantization, laid out for the kernels, and rows it reads by index against their copy;
+the quantizer's bandwidth at what one GPU of megatron.bux's `sorted` arm quantizes a
+layer; then an MoE layer's experts, forward and backward, in MXFP8
+(``grouped_blockscaled``) against bfloat16 (``grouped``), at the baseline MoE's shapes
+(64 experts, d_model 2048, intermediate 704 and 2048, 262144 picks), and the GPU time
+of each by CUPTI.
 
     uv run --extra cuda python scripts/gpu_smoke/grouped_mxfp8.py
 
@@ -35,6 +36,17 @@ CONTRACTS = [(256, 384), (704, 256)]
 # What the quantizer takes: rows of x, some past the groups, and each W[g].
 QUANTIZED = [((1024, 704), 900), ((4, 704, 2048), 704)]
 SIZES = jnp.array([0, 130, 1, 3, 256, 0, 300, 100], jnp.int32)  # 1024 rows
+# What one GPU of megatron.bux's `sorted` arm quantizes a layer: its 262144 picks' rows,
+# read by index from its 32768 tokens, h, dh and dy, and each expert's W.
+TOKENS = 32768
+LAYER = {
+    "x, read by index": (262144, 2048),
+    "h": (262144, 768),
+    "dh": (262144, 1536),
+    "dy": (262144, 2048),
+    "W of up and gate": (128, 2048, 1536),
+    "W of down": (128, 768, 2048),
+}
 Product = Callable[..., Float[Array, "m n"]]  # x, W and maybe sizes -> x W
 
 
@@ -86,6 +98,40 @@ def quantizer_differs(shape: tuple[int, ...], filled: int) -> int:
     return differ
 
 
+def gathered_differs(shape: tuple[int, int], filled: int) -> int:
+    """How many bytes of the quantizer's copies of rows it reads by index differ from
+    those of their copy."""
+    m, c = shape
+    tokens = jax.random.normal(jax.random.key(5), (m // 3, c), jnp.bfloat16)
+    index = jax.random.randint(jax.random.key(6), (m,), 0, m // 3)
+    got = grouped_triton.quantized_twice(tokens, jnp.int32(filled), index=index)
+    want = grouped_triton.quantized_twice(tokens[index], jnp.int32(filled))
+    pairs = zip(jax.tree.leaves(got), jax.tree.leaves(want), strict=True)
+    return sum(
+        int((blockscaled.as_bytes(a) != blockscaled.as_bytes(b)).sum())
+        for a, b in pairs
+    )
+
+
+def quantizer_tb_s(name: str, shape: tuple[int, ...]) -> float:
+    """The quantizer's bandwidth, by CUPTI: the bytes it reads and writes a second."""
+    *stack, r, c = shape
+    by_index = "index" in name
+    x = jax.random.normal(jax.random.key(7), (TOKENS, c) if by_index else shape)
+    index = jax.random.randint(jax.random.key(8), (r,), 0, TOKENS) if by_index else None
+
+    def quantize(x: Array) -> tuple[gm.Tiled, gm.Tiled | None]:
+        return grouped_triton.quantized_twice(x, jnp.int32(r), index=index)
+
+    _, times = profiler.measure(jax.jit(quantize), iterations=10)(
+        x.astype(jnp.bfloat16)
+    )
+    assert times is not None
+    g, rt, ct = int(np.prod(stack)), -(-r // gm.LANES), -(-c // gm.LANES)
+    copies = g * gm.LANES * (r * ct + c * rt) + 2 * g * rt * ct * 512
+    return (2 * g * r * c + copies) / float(np.median(np.asarray(times))) / 1e9
+
+
 def experts(product: Product) -> Product:
     """An MoE's expert FFN of sorted rows: up and gate as one GEMM, then down."""
 
@@ -135,6 +181,10 @@ def main() -> int:
     for shape, filled in QUANTIZED:
         differ += (n := quantizer_differs(shape, filled))
         print(f"quantizer {shape}, {filled} rows: {n} bytes differ", flush=True)
+    differ += (n := gathered_differs((1024, 2048), 900))
+    print(f"quantizer of rows read by index: {n} bytes differ", flush=True)
+    for name, shape in LAYER.items():
+        print(f"quantizer, {name} {shape}: {quantizer_tb_s(name, shape):.2f} TB/s")
     seed = jnp.uint32(0)
 
     def in_mxfp8(x: Array, w: Array, sizes: Array) -> Array:

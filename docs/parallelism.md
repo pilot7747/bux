@@ -982,7 +982,13 @@ format, up and gate's one GEMM quantizes x once, and each GEMM runs by
 the backward's two quantized along what that GEMM contracts, as a projection's are,
 and each expert's W on its own. One pass of a Triton kernel (`grouped_triton`)
 quantizes x and x^T, zeroes the rows past the experts', which an exchange's buffer
-leaves as they were, and writes both as the kernels below take them.
+leaves as they were, and writes both as the kernels below take them. Under `sorted`
+x's rows are the picks' token rows: given where they were picked
+(`grouped_blockscaled.Picked`), the kernel reads each from the tokens by index, so
+that the copy of them `moe.token_rows` gathers is never written (XLA drops it): 1 GiB
+a layer at 32k tokens a GPU and 8 picks a token. A GEMM whose rows sum into their
+tokens (`Summed`) returns the tokens' sums, and its backward reads each row's dy from
+its token's the same way.
 Elsewhere XLA dequantizes and multiplies, which computes the same values, so the
 tests run it on CPU. Only `passes` multiply in the format, the others by `grouped`'s
 kernels, as they are.
@@ -1064,6 +1070,36 @@ call more: 6.1 ms a layer against 7.3. The experts keep x^T in MXFP8 for dW rath
 than x in bfloat16, so a run takes 14 GiB less. It trains at bfloat16's loss: 98M
 tokens of FineWeb-Edu end 0.13% and 0.05% below it, with FP8 dispatch
 (docs/training.md, "Precision").
+
+At what one GPU of megatron.bux's `sorted` arm quantizes a layer (128 experts of 768,
+262144 picks), on one B300 by CUPTI, no shape is slow:
+
+| operand | shape | TB/s |
+|---------|-------|------|
+| x, read by index from 32768 tokens | 262144 × 2048 | 5.8 |
+| dy | 262144 × 2048 | 5.2 |
+| h | 262144 × 768 | 5.1 |
+| dh | 262144 × 1536 | 5.2 |
+| each expert's W of up and gate | 128 × 2048 × 1536 | 5.2 |
+| each expert's W of down | 128 × 768 × 2048 | 5.1 |
+
+x read by index takes 377 µs, where gathering it in bfloat16 took 378 and quantizing
+the copy 420. A copy that casts x and x^T to E4M3 unscaled runs at 6.5 TB/s (XLA's
+`x * 2` at 6.9), and the quantizer without its scales at 5.8: the scales' bytes, 4 a
+row of x but one of each 4 of x^T's in a program of 32 rows, and the blocks' largest
+magnitudes take the rest. Programs of 64 or 128 rows, or of 128 rows 32 at a time
+with each tile of scales in one store, more warps, other grid orders and the scaling
+in float32 were no faster.
+
+On 8 B300s, at `remat=none` with the pool at 97%, 40 steps: with the router's weights
+on the hidden units, so that down's rows sum plainly into their tokens, reading x and
+dy in place took the arm from 260.3k to 269.4k tokens a second (32.5k to 33.7k a GPU)
+at the same peak, 215.0 GiB. On GPU 0 a step fell from 1067 to 1029 ms: both gathers'
+39 ms went, and the quantizer's 95 ms became 88. With the weights after down, x in
+place alone went from 254.2k to 255.0k: the gather's 25 ms went, but the FSDP
+collectives the step overlapped came out from under it. Each GPU quantizes all 128
+experts' W, 23 ms of a step; its own shard before FSDP gathers it would save 7/8 of
+that.
 
 ## Expert parallelism
 

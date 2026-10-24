@@ -369,11 +369,14 @@ def routed(
     b, t, d = z.shape
     k, n = idx.shape[-1], up.shape[0]
     order, inverse, sizes = sort_by_expert(idx, n)
-    rows = token_rows(z.reshape(b * t, d), order, inverse, k)
+    tokens = z.reshape(b * t, d)
+    rows = token_rows(tokens, order, inverse, k)
     kept = jnp.where(in_range(idx, n), weights, 0)
     row_weights = picked_weights(kept, order, inverse)
-    out = experts(rows, sizes, row_weights, up, down, ffn, norm)
-    return token_sums(out, inverse, order, k).reshape(b, t, d)
+    picked = grouped_blockscaled.Picked(tokens, order // k)
+    summed = grouped_blockscaled.Summed(order, inverse.reshape(b * t, k))
+    out = experts(rows, sizes, row_weights, up, down, ffn, norm, picked, summed)
+    return out.reshape(b, t, d)
 
 
 def sort_by_expert(idx: Int[Array, "*n k"], num_experts: int) -> Sorted:
@@ -399,26 +402,36 @@ def experts(
     down: Float[Array, "E f d"],
     ffn: cfg.MLPConfig,
     norm: RowNorm | None = None,
-) -> Float[Array, "n d"]:
+    picked: grouped_blockscaled.Picked | None = None,
+    summed: grouped_blockscaled.Summed | None = None,
+) -> Float[Array, "r d"]:
     """Run each row of `x` through its expert's FFN, then `norm`, times the row's
     weight in `weights`. The rows are sorted by expert: the first sizes[0] are expert
     0's, the next sizes[1] expert 1's, and so on; rows past them come out 0 before
     `norm`. It depends on its arguments alone, so it runs on one device's experts in a
     shard_map as it does on all of them. The kernels multiply in x's dtype, so that
-    wider ones add up the gradients of several calls in their own."""
+    wider ones add up the gradients of several calls in their own. Given where x was
+    `picked`, a format's quantizer reads it there; given the tokens its rows are
+    `summed` into, it returns their sums."""
     recipe = grouped_blockscaled.RECIPES.get(experts_format())
     n, (e, d, f, p) = x.shape[0], up.shape
     up, down = up.reshape(e, d, f * p).astype(x.dtype), down.astype(x.dtype)
 
-    def times(x: Float[Array, "n e"], w: Float[Array, "E e f"]) -> Float[Array, "n f"]:
-        return grouped_product(x, w, sizes, recipe)
+    def times(
+        x: Float[Array, "n e"],
+        w: Float[Array, "E e f"],
+        picked: grouped_blockscaled.Picked | None = None,
+        summed: grouped_blockscaled.Summed | None = None,
+    ) -> Float[Array, "r f"]:
+        return grouped_product(x, w, sizes, recipe, picked, summed)
 
-    projected = times(x, up).reshape(n, f, p)  # up and gate by one GEMM
+    projected = times(x, up, picked).reshape(n, f, p)  # up and gate by one GEMM
     if norm is None:
         # Weighted before `down`, which is linear: the weights' gradient then needs
         # each row's f hidden units, not its d outputs.
-        return times(weighted_units(ffn, projected, weights), down)
-    return weighted(norm(times(hidden_units(ffn, projected), down)), weights)
+        return times(weighted_units(ffn, projected, weights), down, summed=summed)
+    y = weighted(norm(times(hidden_units(ffn, projected), down)), weights)
+    return y if summed is None else sums_of_tokens(y, summed)
 
 
 def weighted_units(
@@ -457,15 +470,30 @@ def grouped_product(
     w: Float[Array, "E e f"],
     sizes: Int[Array, " E"],
     recipe: blockscaled.Recipe | None,
-) -> Float[Array, "n f"]:
+    picked: grouped_blockscaled.Picked | None = None,
+    summed: grouped_blockscaled.Summed | None = None,
+) -> Float[Array, "r f"]:
     """Return each expert's rows of x times its matrix of w, named `experts` for
-    ``remat``: in `recipe`'s format where x and w are whole blocks of it
-    (``grouped_blockscaled``), else in compute (``grouped``)."""
+    ``remat``, or the sums of the tokens they are `summed` into: in `recipe`'s format
+    where x and w are whole blocks of it (``grouped_blockscaled``, x read from where
+    it was `picked`), else in compute (``grouped``)."""
     if recipe is None or not grouped_blockscaled.fits(x, w):
-        return checkpoint_name(ragged_dot(x, w, sizes), "experts")
+        y = checkpoint_name(ragged_dot(x, w, sizes), "experts")
+        return y if summed is None else sums_of_tokens(y, summed)
     precision, seed = matmuls.in_force(), matmuls.seed()
-    y = grouped_blockscaled.ragged_dot(x, w, sizes, recipe, seed, precision.passes)
+    passes = precision.passes
+    y = grouped_blockscaled.ragged_dot(
+        x, w, sizes, recipe, seed, passes, picked, summed
+    )
     return checkpoint_name(y, "experts")
+
+
+def sums_of_tokens(
+    y: Float[Array, "m d"], summed: grouped_blockscaled.Summed
+) -> Float[Array, "t d"]:
+    """Return each token's sum of its rows of y, as `summed` says (``token_sums``)."""
+    tokens, k = summed.inverse.shape
+    return token_sums(y, summed.inverse.reshape(tokens * k), summed.order, k)
 
 
 def experts_format() -> str:
