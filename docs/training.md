@@ -646,8 +646,10 @@ benchmarks' FSDP runs (`one_node.bux`, `two_nodes.bux`, [Benchmarks](#benchmarks
 | the 1.3B, `fsdp=16`, two nodes | 1 | 699k | 1.03M (+48%) |
 | | 8 | 2.18M | 2.12M (−2.8%) |
 
-On one GPU, 8 rows, scanned with `maxtext` is slower still: the dense model by 4%,
-the MoE by 15% and the GDN hybrid by 20%, as is the GDN hybrid by 23% over `fsdp=8`.
+On one GPU, the one-GPU suite at 8 rows, scanned with `maxtext` is slower for every
+model: the dense one by 6%, in MXFP8 and NVFP4 by 7-8%, the GDN hybrid by 7%, the
+Mamba-2 and KDA hybrids by 11%, bounded KDA by 23% and the MoE by 17%; and over
+`fsdp=8` the GDN hybrid by 23%.
 
 At a row a GPU an unrolled step waits for FSDP's gathers, and takes as long as one of
 two rows; the scan's loop, its collectives pipelined and its buffers doubled, hides
