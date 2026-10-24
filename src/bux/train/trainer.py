@@ -30,6 +30,7 @@ from typing import Any, NamedTuple, Protocol, runtime_checkable
 
 import jax
 import jax.numpy as jnp
+import numpy as np
 import optax
 from flax import nnx
 from jax.sharding import PartitionSpec as P
@@ -618,7 +619,7 @@ class Trainer:
         metrics = self._train(self.model, self.optimizer, parallel.shard_batch(batch))
         self.step += 1
         if self.work is not None:
-            self.flops += self.work.of(batch.position_ids)
+            self.flops += self.work.of(rows_read(batch.position_ids))
         return metrics
 
     def _switch_if_due(self) -> None:
@@ -788,6 +789,15 @@ def _accumulated(microbatches: int) -> int:
     """Return how many microbatches a step accumulates gradients over: one under a
     pipeline, which takes them through its stages instead."""
     return 1 if parallel.pipeline.pipelined() else microbatches
+
+
+def rows_read(
+    positions: Int32[np.ndarray | Array, "b t"],
+) -> Int32[np.ndarray | Array, "n t"]:
+    """Return the rows of a batch's `positions` that this process read: in a job of
+    many, each reads its own and the others stay 0 (``data.batches``), which would
+    count as documents of a token each."""
+    return positions[parallel.local_rows(*positions.shape)]
 
 
 def step_flops(run: ir.Run) -> flops.Work:
