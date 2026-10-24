@@ -373,30 +373,22 @@ def _probabilities_kernel(
 ) -> Float[Array, "b t s"]:
     """Return `probabilities` by ``scoring``'s kernel, in a shard_map that gives each
     device its rows, queries and heads, and every key, and sums the heads'."""
-    run = partial(scoring.probabilities, scale=scale, cap=cap)
     split = parallel.spec(("batch", "seq", "heads", None), q.shape)
-    names = set(parallel.axes_of(split))
-    if parallel.active() is None or not names:
-        return run(q, part.k, lse, *part.span)
-    k, heads = _heads_like(part, split, q.shape[2]).k, split[2]
 
-    def device(
+    def run(
         q: Float[Array, "b t h dk"],
         k: Float[Array, "b s g dk"],
         lse: Float[Array, "b t h"],
         span: Span,
     ) -> Float[Array, "b t s"]:
-        own = run(q, k, lse, *span)
-        return own if heads is None else jax.lax.psum(own, heads)
+        return scoring.probabilities(q, k, lse, *span, scale=scale, cap=cap)
 
+    if parallel.active() is None or not parallel.axes_of(split):
+        return run(q, part.k, lse, part.span)
+    k = _heads_like(part, split, q.shape[2]).k
     keys, rows = _specs(part._replace(k=k), split).k, P(split[0], split[1])
-    return jax.shard_map(
-        device,
-        in_specs=(split, keys, P(*split[:3]), Span(rows, rows)),  # ty: ignore
-        out_specs=P(split[0], split[1], None),
-        axis_names=names,
-        check_vma=False,
-    )(q, k, lse, part.span)
+    ins = (split, keys, P(*split[:3]), Span(rows, rows))  # ty: ignore
+    return scoring.on_own_queries(run, split, ins)(q, k, lse, part.span)
 
 
 # --- by XLA, a chunk of queries at a time ---------------------------------------------
