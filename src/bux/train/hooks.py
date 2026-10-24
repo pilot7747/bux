@@ -21,6 +21,7 @@ saves it.
 
 import itertools
 import random
+import shutil
 import time
 from collections.abc import Callable, Iterator, Mapping
 from pathlib import Path
@@ -122,11 +123,17 @@ class Checkpoint(Hook):
     a run resumes from one only with its arrays and their layout, else it fails before
     it reads one. Every process of a job saves its part, so `folder` must be one they
     all see: one that is not fails at once, where orbax would wait at the first save
-    for the parts it cannot see until it timed out, twenty minutes later."""
+    for the parts it cannot see until it timed out, twenty minutes later.
+
+    A save that a crash left half written is deleted as a run starts, and the run saves
+    again only past its step: orbax would save that step in a folder of the same name,
+    which another node of many may still see as the one deleted, fail to write into,
+    and hang the save."""
 
     def __init__(self, folder: Path, *, every: int, keep: int):
         self.every, self.layout = every, layout()
         _check_shared(folder.resolve())
+        self.unsaved_until = _drop_unfinished(folder.resolve())
         self.manager = ocp.CheckpointManager(
             folder.resolve(),
             options=ocp.CheckpointManagerOptions(max_to_keep=keep),
@@ -159,6 +166,8 @@ class Checkpoint(Hook):
         return _changed(saved, self.layout) or _differs(arrays, _arrays(state))
 
     def __call__(self, trainer: "Trainer", metrics: Metrics) -> None:
+        if trainer.step <= self.unsaved_until:
+            return
         state = ocp.args.StandardSave(trainer.state())
         self.manager.save(trainer.step, args=state, custom_metadata=self.layout)
 
@@ -302,6 +311,20 @@ def _check_shared(folder: Path) -> None:
             "of the files they wrote there. Each saves its part of a checkpoint into "
             "it, so put the run's directory (--out) where every node sees it"
         )
+
+
+def _drop_unfinished(folder: Path) -> int:
+    """Delete the saves that a crash left half written, on the first process, and
+    return the last of their steps, -1 if there are none, on every process once it
+    has."""
+    last = -1
+    if jax.process_index() == 0 and folder.is_dir():
+        for name in ocp.path.step.tmp_checkpoints(folder):
+            shutil.rmtree(folder / name)
+            last = max(last, int(name.split(".")[0]))  # 20.orbax-checkpoint-tmp
+    if jax.process_count() > 1:
+        last = int(multihost_utils.broadcast_one_to_all(np.int32(last)))
+    return last
 
 
 def _seen(folder: Path, pattern: str, n: int, wait: float = 10.0) -> int:
