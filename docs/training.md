@@ -536,6 +536,11 @@ losses over 30 steps, GEMM autotuning off, are within 1.7e-4 of the chunks' (GDN
 the same (KDA). On 8 GPUs the GDN kernel's callbacks run one at a time, 87% of 8 GPUs
 alone, where KDA's kernel, which cudnn-frontend calls from JAX itself, runs at 91%.
 
+The 1.3B with Qwen3's QK-norm, in MXFP8, trains 3000 steps of FineWeb-Edu by the
+norm and RoPE's kernels 3% faster than by XLA's fusions (130k tokens a second against
+126k, GEMM autotuning off), its held-out loss within 0.04% of theirs at three seeds,
+which differ by 1.9%.
+
 Sparse attention trains at long context. A DeepSeek-V3.2-style 1B (MLA of 16 heads,
 DSA's indexer of 64 heads and top 2048 in all 16 layers, dense MLPs) on one B300, in
 bfloat16, against the same model by all t × t logits, as bux attended before `sparse`:
