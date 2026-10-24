@@ -105,6 +105,9 @@ docker run --rm --gpus all -v "$PWD/data:/opt/bux/data" -v "$PWD/runs:/opt/bux/r
 docker run --rm -it --entrypoint bash bux    # a shell, or --entrypoint bux for the CLI
 ```
 
+`--build-arg TE=2.20.2` adds TransformerEngine's JAX bindings, for its expert-parallel
+dispatch and combine (docs/parallelism.md, "TransformerEngine's NCCL EP").
+
 To publish it to `ghcr.io/pilot7747/bux` for amd64 and arm64, run the Docker workflow from
 the Actions tab or with `gh workflow run docker.yml` (add `-f tag=v0.1.0` for an extra tag).
 

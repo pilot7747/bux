@@ -1234,6 +1234,51 @@ its picks costs little; `all_to_all`'s dispatch hides behind the experts already
 The exchanges name what they bring `experts.exchanged`, under `experts`, so that
 `remat=dots`, which keeps `experts`, does not exchange them again in the backward.
 
+### TransformerEngine's NCCL EP
+
+TransformerEngine (2.18 on, `transformer_engine.jax.ep`) dispatches and combines by
+NCCL EP, a DeepEP of NCCL's device API: loads and stores over NVLink in a node, RDMA
+the GPU starts (NCCL's GIN) between nodes, no NVSHMEM. A token goes once to each GPU
+that holds any of its experts, as in `ragged_tokens`, and once to each other node,
+whose NVLink takes it on; it arrives as a row for each of its experts there, grouped
+by expert, each expert's rows padded to 128. Since 2.20 one process drives all its
+node's GPUs, on a communicator TE borrows from XLA. The Docker image has it with
+`--build-arg TE=2.20.2`. No method of `methods.moe` runs on it yet.
+
+One layer's dispatch and combine at the baseline MoE's shapes (d 2048, 64 experts,
+top 8, 32k tokens a GPU, a capacity of 1.25), its experts the identity, on B300s of
+148 SMs, and what an exchange sends off a GPU (on two nodes, off its node):
+
+| GPUs | exchange | SMs | forward | forward and backward | sent |
+|------|----------|-----|---------|----------------------|------|
+| 8, a node | `ragged_all_to_all` | all | 3.95 ms | 8.20 ms | 0.94 GB, 476 GB/s |
+| | `ragged_tokens` | all | 4.73 | 9.55 | 0.64 GB, 270 GB/s |
+| | NCCL EP | 32 | 3.85 | 7.50 | 0.64 GB, 332 GB/s |
+| | NCCL EP | 64 | 3.51 | 6.80 | 0.64 GB, 364 GB/s |
+| 16, two nodes | `ragged_all_to_all` | all | 38.0 | 76.8 | 0.54 GB |
+| | `ragged_tokens` | all | 39.4 | 79.6 | 0.45 GB |
+| | NCCL EP, GIN by GDAKI | 32 | 25.6 | 80.4 | 0.13 GB |
+| | NCCL EP, GIN by a CPU proxy | 32 | 16.0 | 27.0 | 0.13 GB |
+| | the same, 256 tokens a chunk | 32 | 13.0 | 21.2 | 0.13 GB |
+
+In a node it wins by sending less, not faster: its kernels move 330 to 370 GB/s, far
+from NVLink's 900. Between nodes it sends a quarter as much over InfiniBand, and with
+`NCCL_GIN_TYPE=2 NCCL_EP_TOKENS_PER_CHUNK=256` its exchanges take 28% as long.
+
+What it takes from JAX:
+
+- Across nodes only its one-device primitives ran, per device in a `jax.shard_map`
+  as bux's methods run, with a `jax.custom_vjp` over them: its global-view ops
+  (`ep_dispatch`, `ep_combine`) hung at their first dispatch, on XLA's collective
+  stream or off it.
+- Those global-view ops run on XLA's collective stream, where on jax 0.12 a resharding
+  next to them fails to compile ("No ExecutionStreamId found"): what they take and
+  give must stay split over the experts' axis.
+- Its core library loads the NCCL that jax's GPU backend loads, so it imports after
+  `jax.devices()`.
+- An expert's rows past its picks are 0, up to its 128, but their weights are
+  garbage, as are the rows past the last expert's. It sends bfloat16 only.
+
 ## Muon: `methods.orthogonalize`
 
 Newton-Schulz takes fifteen products of each update matrix per step. On a matrix split
