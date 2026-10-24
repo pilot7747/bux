@@ -10,6 +10,7 @@ compile goes into JAX's cache, so a run that starts again reads them back, and t
 step that fits runs as ``xla.jit`` made it, which compiles it no more.
 """
 
+import functools
 import time
 from collections.abc import Callable
 from typing import Any, NamedTuple
@@ -79,8 +80,10 @@ class Fitting:
         return step
 
     def _trying(self, policy: str) -> Callable[..., Any]:
-        """Return the step, traced under `policy`."""
+        """Return the step, traced under `policy`, by the step's own name, which
+        profiles and JAX's cache show."""
 
+        @functools.wraps(self.step)
         def step(model: Any, optimizer: Any, batch: Any) -> Any:
             with remat.trying(policy):
                 return self.step(model, optimizer, batch)
