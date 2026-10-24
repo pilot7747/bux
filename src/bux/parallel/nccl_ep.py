@@ -27,11 +27,10 @@ from typing import TYPE_CHECKING, Any, NamedTuple
 
 import jax
 import jax.numpy as jnp
-from jax.extend import xla as jax_xla
 from jaxtyping import Array, Bool, Float, Int, Shaped, UInt8
 
 from bux import config as cfg
-from bux import jax_internals
+from bux import jax_internals, passes
 from bux.architecture.experts.moe import Kernels, RowNorm, experts, sort_by_expert
 from bux.architecture.precision import matmuls
 from bux.architecture.repeats import remat
@@ -65,9 +64,13 @@ STREAM = "gpu_stream:1"
 # in chunks, the next chunk's dispatch then runs beside this one's experts, not queued
 # on NCCL EP's stream behind this one's combine (``jax_internals.on_stream``).
 THERE, BACK = 1, 0
-# XLA's name of its pass before its scheduler that takes a stream's mark off the parts
-# of a stream call's results (``jax_internals.parts_off_the_stream``).
+# bux's pass before XLA's scheduler that takes a stream's mark off the parts of a
+# stream call's results (``jax_internals.parts_off_the_stream``): else each part of a
+# call's results on NCCL EP's stream waits there for the calls after it.
 PARTS = "nccl_ep_parts_off_the_stream"
+passes.register(PARTS, stage=passes.BEFORE_SCHEDULING, key="1")(
+    jax_internals.parts_off_the_stream
+)
 
 
 class Started(NamedTuple):
@@ -114,8 +117,7 @@ def start(run: "ir.Run") -> None:
         return
     _check(run, ep)
     transformer_engine()  # or say how to get it
-    if run.train.methods.moe_stream:
-        _parts_off_the_stream()
+    passes.use(PARTS, run.train.methods.moe_stream)
     tokens = _tokens_a_device(run, ep)
     peers = _size(ep)
     rows = _room(tokens * top_k, num_experts // peers, peers)
@@ -123,21 +125,6 @@ def start(run: "ir.Run") -> None:
     if started != wanted:
         _bootstrap(ep[0], wanted)
         started = wanted
-
-
-@functools.cache
-def _parts_off_the_stream() -> None:
-    """Have XLA run ``jax_internals.parts_off_the_stream`` before its scheduler, on
-    every program the process compiles for GPUs from now on: else each part of a
-    call's results on NCCL EP's stream waits there for the calls after it."""
-    if jax.default_backend() != "gpu":
-        return
-    jax_xla.register_hlo_module_transformation(
-        jax_internals.parts_off_the_stream,
-        name=PARTS,
-        stage=jax_xla.PipelineStage.PRE_SCHEDULER,
-        platforms="cuda",
-    )
 
 
 def _moe_shape(run: "ir.Run") -> tuple[int, int]:

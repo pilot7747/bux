@@ -37,7 +37,7 @@ from jax.sharding import PartitionSpec as P
 from jax.typing import DTypeLike
 from jaxtyping import Array, Float, Int32, Shaped
 
-from bux import kernels, parallel
+from bux import kernels, parallel, passes
 from bux.architecture import Model, Scanned
 from bux.architecture.common.segments import Segments
 from bux.architecture.logits import HeadOutput
@@ -49,13 +49,20 @@ from bux.data.pipeline import DEFAULT_CACHE, jobs, prepare
 from bux.lang import ir
 from bux.lang.printer import run_to_source
 from bux.parallel.gather import Axes
-from bux.train import fitting, flops, interleave, stages, xla
+from bux.train import fitting, flops, interleave, reorder, stages, xla
 from bux.train.config import PrecisionConfig
 from bux.train.data import Batch, batches, prefetch
-from bux.train.hooks import Checkpoint, Eval, Hook, Log, Profile
+from bux.train.hooks import Checkpoint, Eval, Hook, Later, Log, Profile
 from bux.train.objective import Metrics, Objective, objective, target_mask
 from bux.train.optim import lr_multiplier, lr_schedule, optimizer
-from bux.train.sinks import JSONL, Console, LatestMetrics, Sink, is_main_process
+from bux.train.sinks import (
+    JSONL,
+    Console,
+    LatestMetrics,
+    Scalars,
+    Sink,
+    is_main_process,
+)
 
 
 def forward(model: Model, batch: Batch) -> list[HeadOutput]:
@@ -313,7 +320,9 @@ class Trainer:
     that their new state takes the old one's memory: an array read from them before a
     step is gone after it, and one to keep is a copy (``np.asarray``).
 
-    The training step compiles with XLA's `compiler_options` (``bux.train.xla``).
+    The training step compiles with XLA's `compiler_options` (``bux.train.xla``), and
+    with its gradients' `reductions` started "early" (``bux.train.reorder``) or where
+    XLA puts them ("xla").
 
     Given the `work` of a step (``flops.Work``), `flops` adds up the model FLOPs of
     the steps taken, each at the keys its batch's queries see, for the log's MFU.
@@ -335,6 +344,7 @@ class Trainer:
         reduce: DTypeLike | None = None,
         donate: bool = False,
         compiler_options: xla.Options | None = None,
+        reductions: str = "early",
         work: flops.Work | None = None,
     ):
         if interleave and parallel.pipeline.pipelined():
@@ -355,12 +365,14 @@ class Trainer:
         self.stopping = False  # set, by a signal handler say, to stop after this step
         self._donated = ("model", "optimizer") if donate else ()
         self._compiler_options = compiler_options or {}
+        self._reductions = reductions
         self._compile()
 
     def _compile(self) -> None:
         """Make the compiled steps, which read `matmuls` as they trace. Under remat
         `auto`, the training step chooses its policy as it first compiles
         (``fitting``)."""
+        passes.use(reorder.NAME, self._reductions == "early")
         jit = fitting.Fitting if remat.setting() == "auto" else xla.jit
         self._train = jit(
             self._train_step_on_shards,
@@ -719,22 +731,36 @@ class Trainer:
         """Train on `data` to step `steps`, or until `stopping` is set, after which
         every hook's `stop` runs; the next batches load as a step runs (``prefetch``).
         After every step, the hooks due run in order, and what they return goes to
-        every sink. All of them close at the end, or when training stops."""
+        every sink once the next step is launched (``hooks.Later``). All of them close
+        at the end, or when training stops."""
         with contextlib.ExitStack() as stack:
             for block in (*sinks, *hooks):
                 stack.callback(block.close)
             for hook in hooks:
                 hook.start(self)
             loaded = stack.enter_context(contextlib.closing(prefetch(data)))
+            reported: list[tuple[int, Scalars | Later]] = []
             while self.step < steps and not self.stopping:
                 metrics = self.train_on_batch(next(loaded))
-                for hook in hooks:
-                    if hook.due(self.step, steps) and (scalars := hook(self, metrics)):
-                        for sink in sinks:
-                            sink.write(self.step, scalars)
+                _write(reported, sinks)  # the step before's, as this one runs
+                reported = [
+                    (self.step, out)
+                    for hook in hooks
+                    if hook.due(self.step, steps) and (out := hook(self, metrics))
+                ]
+            _write(reported, sinks)
             if self.step < steps:
                 for hook in hooks:
                     hook.stop(self)
+
+
+def _write(reported: list[tuple[int, Scalars | Later]], sinks: Sequence[Sink]) -> None:
+    """Give every sink what the hooks reported at each step, read now where it is
+    `Later`."""
+    for step, out in reported:
+        scalars = out if isinstance(out, Mapping) else out()
+        for sink in sinks:
+            sink.write(step, scalars)
 
 
 def directory(run: ir.Run, out: str | Path) -> Path:
@@ -799,6 +825,7 @@ def train(
             reduce=_reduce_dtype(config.precision),
             donate=config.methods.donate,
             compiler_options=xla.options(config.compiler),
+            reductions=config.compiler.reductions,
             work=work,
         )
         make_batches = functools.partial(

@@ -543,6 +543,9 @@ class CompilerConfig(Config):
     # --xla_gpu_threshold_for_windowed_einsum_mib=0". XLA's debug options, and jax's
     # optimization_level and memory_fitting_level.
     options: Annotated[str, AfterValidator(_flags)] = ""
+    # Where the step's gradient reductions start: early, each as its gradient is
+    # computed (bux.train.reorder, a pass over XLA's schedule); or where XLA puts them.
+    reductions: Literal["early", "xla"] = "early"
 
 
 class TrainConfig(Config):

@@ -13,10 +13,11 @@ from typing import Any
 
 import jax
 import jax.numpy as jnp
-from jax._src import distributed
+from jax._src import cache_key, distributed
 from jax._src.api import VJP, NotNeeded, NotSaveable
 from jax._src.cudnn import fused_attention_stablehlo as cudnn_fused
 from jax._src.cudnn.scaled_matmul_stablehlo import _scaled_matmul_p
+from jax._src.lib import hlo
 from jax.experimental import buffer_callback as callbacks
 from jax.experimental.xla_metadata import xla_metadata_call2
 from jax.extend import core
@@ -461,3 +462,33 @@ def key_value_store() -> Any:
     """Return jax.distributed's client, None before the processes join: its
     key_value_set and blocking_key_value_get pass strings between them."""
     return distributed.global_state.client
+
+
+# --- XLA's scheduled HLO: reorder.py changes a step's schedule ---------------------
+#
+# jaxlib's bindings of an HloModule: its schedule() and make_nonfusion_computations();
+# a schedule's sequence(computation) and set_sequence; an instruction's name, opcode,
+# operands(), users(), control_predecessors() and async_wrapped_root(). A method
+# renamed fails as the pass runs, which then leaves XLA's schedule as it was.
+
+Opcode = hlo.HloOpcode
+
+
+def hlo_module(serialized: bytes) -> Any:
+    """Return the HloModule of a serialized HloModuleProto, as XLA hands a pass of
+    jax.extend.xla; its as_serialized_hlo_module_proto() gives one back."""
+    return hlo.HloModule.from_serialized_hlo_module_proto(serialized)
+
+
+def hlo_module_from_text(text: str) -> Any:
+    """Return the HloModule that HLO's text form `text` reads as, scheduled in the
+    order of its instructions where its header says is_scheduled=true."""
+    return hlo.hlo_module_from_text(text)
+
+
+def key_compiles_by(text: str) -> None:
+    """Make `text` part of the key of every program JAX's persistent cache keeps
+    from now on (cache_key.custom_hook, which its key reads at each compile): a pass
+    of jax.extend.xla changes what a program compiles to, which the key, of XLA's
+    flags and options, does not see."""
+    cache_key.custom_hook = lambda: text  # ty: ignore

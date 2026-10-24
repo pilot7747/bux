@@ -1551,13 +1551,10 @@ stream waits for where it uses them. Two things make it overlap:
   any instruction so marked): queued there behind the calls issued after it, so the
   compute stream waited for the next chunk's dispatch before it took this chunk's
   rows, and the scheduler put every call's done right after its start.
-  `jax_internals.parts_off_the_stream`, a pass of XLA's before its scheduler
-  (`jax.extend.xla.register_hlo_module_transformation`), takes that mark off them:
-  `nccl_ep.start` has XLA run it on every program the process compiles for GPUs
-  from then on, where `moe_stream` is set. JAX's cache of compiled programs does not
-  key them by the passes XLA runs: a program with NCCL EP's stream calls that some
-  process compiled without the pass (as no run of bux does) would come back without
-  it.
+  `jax_internals.parts_off_the_stream`, one of bux's passes over XLA's HLO
+  (`bux.passes`) before its scheduler, takes that mark off them: `nccl_ep.start`
+  has XLA run it on every program the process compiles for GPUs from then on, where
+  `moe_stream` is set, and JAX's cache keys those programs by it.
 
 One MoE layer at megatron.bux's shapes (EP=8, 32k tokens a GPU, a capacity of 1.25,
 the experts by cuDNN's MXFP8 kernels) on 8 B300s, in ms:
