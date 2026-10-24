@@ -425,9 +425,10 @@ def grouped_product(
 
 def experts_format() -> str:
     """Return the format the routed experts multiply in, in the branch that is
-    tracing: their role's (``matmuls.format_of``), or compute where `roles.experts` is
-    none. Unlike the other roles, they take no format from `matmuls`."""
-    if matmuls.in_force().roles.experts is None:
+    tracing: their role's (``matmuls.format_of``), or compute where the precision
+    gives them none (``PrecisionConfig.experts``): unlike the other roles, they take
+    `matmuls` only where a grouped GEMM multiplies in it."""
+    if matmuls.in_force().experts() is None:
         return "compute"
     return matmuls.format_of("experts")
 

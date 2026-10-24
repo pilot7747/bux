@@ -268,8 +268,10 @@ change.
 
 ```python
 from bux import parallel
+from bux.train import stages
 
-with parallel.use(t.mesh, t.layout, t.methods):
+# The run's methods, with a pipeline's stages balanced as `train` balances them.
+with parallel.use(t.mesh, t.layout, stages.balanced(run)):
     model = parallel.build(lambda: Model(arch, rngs=nnx.Rngs(0)))
     trainer = Trainer(model, tx, loss)  # its state on its shardings
     trainer.train_on_batch(batch)  # the batch through parallel.shard_batch
@@ -859,13 +861,19 @@ FSDP the weights move to the tokens rather than the tokens to the weights.
 ### The experts in MXFP8
 
 ```
-precision = precision(roles=roles(experts=mxfp8))
+precision = precision(matmuls=mxfp8)                          # the experts too
+precision = precision(roles=roles(experts=mxfp8))             # the experts alone
+precision = precision(matmuls=mxfp8, roles=roles(experts=compute))
 ```
 
 The routed experts' role, `experts`, takes `compute`, `mxfp8` or `mxfp8_2d`
-(docs/training.md, "Precision"), and `nvfp4` is an error. Unlike the other roles, none
-is compute, not `matmuls`. On B300s MXFP8 experts train 6 to 13% faster than
-bfloat16 ones (below). In a
+(docs/training.md, "Precision"), and `nvfp4` is an error. Left out, it is `matmuls`
+where a grouped GEMM multiplies in it, `mxfp8` and `mxfp8_2d`, and compute under any
+other, as `nvfp4`: no grouped GEMM takes NVFP4 (`PrecisionConfig.experts`). On B300s
+MXFP8 experts train 6 to 13% faster than bfloat16 ones (below). An MoE run that leaves
+them to `matmuls=mxfp8` multiplied them in bfloat16 before that, so it takes the id
+of a run that names `mxfp8` for them, and a launch trains it again; a run that names
+their format keeps its id, and a model without routed experts too. In a
 format, `experts` runs up and gate as one GEMM, so that x quantizes once, and each
 GEMM by `grouped_blockscaled.ragged_dot`: every operand of the forward's GEMM and of
 the backward's two quantized along what that GEMM contracts, as a projection's are,
@@ -1328,7 +1336,8 @@ names of what layers make, not definitions: `save=[mlp]` is no layer type, and
 
 | method               | what the forward keeps                           | as data                      |
 |----------------------|--------------------------------------------------|------------------------------|
-| `none`               | everything, but in a scanned pass (below); the default |                        |
+| `auto`               | the first of `none`, `dots_attention`, `dots`, `save_attention` and `full` whose training step fits (below); the default | |
+| `none`               | everything, but in a scanned pass (below)        |                              |
 | `full`               | nothing but the input of each branch or pass     | `remat()`                    |
 | `dots`               | the products of matrices                         | `remat(save=dots)`           |
 | `dots_no_batch`      | the products of matrices without batch dimensions | `remat(save=dots_no_batch)` |
@@ -1396,8 +1405,9 @@ DeltaNet hybrid (`"DDDA"^4`) and a 64-expert MoE (`E^16`), in bfloat16 on 8 rows
 is still slower: it copies each value it keeps into its stack and back out, where
 unrolled layers read it where it was made, and the more it keeps the more it copies:
 the GDN hybrid's float32 chunk states. On eight, one row each, it is faster, and it
-compiles 2.3 times as fast; with `compiler(preset=maxtext)` the dense scan trains at
-719k, 15% over unrolled ([XLA's options](training.md#xlas-options-compiler)).
+compiles 2.3 times as fast; with `compiler(preset=maxtext)` the dense scan trains
+56% faster than unrolled there, and from two rows a GPU 3-4% slower, so `unroll`
+stays the default ([XLA's options](training.md#xlas-options-compiler)).
 
 On one CPU, for the gradient of a 24-layer Llama's forward (`d_model=64`, 8 rows of
 128 tokens), and for its first training step, which compiles it:
@@ -1441,7 +1451,8 @@ second and the peak memory:
 | `remat(save=[attention], first=8)`           | 133k, 40.9   |              |              |
 | `offload_attention`                          | 82.1k, 39.5  |              |              |
 
-`none` is the fastest, and the default; a policy buys rows. `dots` runs flash
+`none` is the fastest; a policy buys rows, and `auto` takes the fastest that fits
+(below). `dots` runs flash
 attention's forward twice, and `save_attention` the matmuls of every layer;
 `dots_attention` runs neither, 2% slower than `none` in 19% less memory on the dense
 model, as does `remat(save=[attention, mlp])`. A GDN layer's recurrence by chunks
@@ -1464,6 +1475,44 @@ where `first` computes the whole layer again. With more rows a GPU:
 | `remat(save=[attention, recurrence.in, mlp])` |                     | 32: 79.7k, 110.3    |                    |
 | `save_attention`                             | 96: 138k, 161.7      |                     | 16: 93.8k, 95.8    |
 | `full`                                       | 128: 126k, 113.2     | 32: 76.5k, 67.3     | 16: 89.6k, 83.8    |
+
+### `remat=auto`, the default
+
+`auto` chooses a training step's policy as the step first compiles
+(`bux.train.fitting`). It compiles the step under `none`, `dots_attention`, `dots`,
+`save_attention` and `full` in turn, the fastest first as they train above, and keeps
+the first that fits: what XLA's analysis of the compiled step says a device holds at
+once, its arguments, outputs and temporaries, at most 97% of what the device can hold
+(its `bytes_limit`, 75% of a GPU by JAX's default). In that order the first that fits
+is the one that computes least again, so `auto` times none of them, which would cost
+steps of each. On B300s XLA's analysis was the measured peak to 0.1 GiB in every run,
+and a step of 196.7 of 200.8 GiB trained. Where `none` fits, `auto` compiles once and
+is `none`; where it does not, each candidate before the one that fits is a compile
+more, which JAX's cache keeps for the run's next launch. A forward outside a training
+step keeps everything. The step says what it took:
+
+```
+remat=auto: save_attention (none 314.4 GiB in 42s, dots_attention 288.4 GiB in 29s,
+dots 263.7 GiB in 26s, save_attention 161.7 GiB in 24s; 97% of 200.8 GiB fits)
+```
+
+On one B300, the one-GPU suite's models (`examples/benchmarks/one_gpu.bux`) at more
+rows than they take there, 15 steps, tokens a second and the peak memory:
+
+| model, rows | `none`, the default before | `auto` | `auto`'s compiles |
+|-------------|----------------------------|--------|-------------------|
+| dense, 8    | 138.7k, 51.1 GiB | `none` | 27 s |
+| dense, 64   | 142.9k, 192.6 GiB | `none` (`dots`: 137.1k, 180.2 GiB) | 35 s |
+| dense, 96   | out of memory | `save_attention`: 132.5k, 161.7 GiB (`dots_attention`, `dots`: out of memory) | 4, 121 s |
+| dense, 128  | out of memory | `full`: 123.6k, 113.2 GiB (`save_attention`, `dots`: out of memory) | 5, 148 s |
+| MoE, 16     | 106.7k, 193.3 GiB | `none` (`dots_attention`: 102.3k, 146.6 GiB) | 55 s |
+| GDN, 32     | 131.3k, 187.9 GiB | `none` (`dots_attention`: 130.3k, 149.9 GiB) | 40 s |
+
+`none` stays the fastest wherever it fits, near the device's limit too. With 90% of
+a device for the step, `auto` took `dots` for the dense model at 64 rows, 5.6%
+slower than `none` there, and `dots_attention` for the MoE at 16 and GDN at 32.
+`remat(first=n)` and the policies of names are not candidates: `auto` does not tune a
+policy, it keeps a run from running out of memory at the least cost of the presets.
 
 Offloading saves nothing unrolled, and costs a third of the speed: XLA schedules
 each layer's copy to the host inside the backward, just before the copy back, so the
@@ -1799,21 +1848,23 @@ its checkpoint into the memory of the state it replaces.
 
 ```
 mesh    = mesh(stage=4, fsdp=2)
-methods = methods(repeat=scan, microbatches=8)                                # gpipe
+methods = methods(repeat=scan, microbatches=8)                     # 1f1b, stages balanced
+methods = methods(repeat=scan, microbatches=8, pipeline=gpipe)
 methods = methods(repeat=scan, microbatches=8, pipeline=circular, rounds=2)
 methods = methods(repeat=scan, microbatches=8, pipeline="zbh1")              # zero bubble
-methods = methods(repeat=scan, microbatches=8, pipeline="1f1b", stages=[5, 4, 4, 3])
+methods = methods(repeat=scan, microbatches=8, stages=[5, 4, 4, 3])
 ```
 
 With `mesh.stage` above 1, the longest scanned repeat outside any other (the first of
 several as long) is pipelined. Its stacked layers split over `stage` by a dimension
-named `stages` of the layout, one share of consecutive passes per stage. The rest of the
-model, the embedding and the head too, does not split over `stage`: under `gpipe` and
-`circular` every stage computes it, and under `1f1b` and `zbh1` the first stage runs
-the embedding and the last the head ([Schedules](#schedules-1f1b-zbh1)).
+named `stages` of the layout, one share of consecutive passes per stage, as
+`methods.stages` gives them or as a run balances them ([Stages](#stages-methodsstages)).
+The rest of the model, the embedding and the head too, does not split over `stage`:
+under `gpipe` and `circular` every stage computes it, and under `1f1b` and `zbh1` the
+first stage runs the embedding and the last the head ([Schedules](#schedules-1f1b-zbh1)).
 A model with no scanned repeat is an error that says to repeat its blocks and scan
-them, `methods(repeat=scan)`, and so is a repeat whose passes do not split over the
-stages evenly, or as `methods.stages` says ([Uneven stages](#uneven-stages-methodsstages)).
+them, `methods(repeat=scan)`, and so is a repeat of fewer passes than stages, or one
+whose passes `methods.stages` does not split.
 
 The batch's rows split into `methods.microbatches` microbatches, row `i·M + j` into
 microbatch `j`, so that each splits over the batch axes as the rows do. A method runs
@@ -1826,14 +1877,31 @@ leaves, summed over the stages to every one.
 
 | method     | each microbatch                                                   | a stage holds   | a stage idles           |
 |------------|-------------------------------------------------------------------|-----------------|-------------------------|
-| `gpipe`    | goes through the stages once; the default                         | M + S − 1 ticks | (S − 1) / (M + S − 1)   |
+| `gpipe`    | goes through the stages once                                      | M + S − 1 ticks | (S − 1) / (M + S − 1)   |
 | `circular` | goes round them `methods.rounds` times, each stage holding a share of every round's layers | R·M + S − 1 ticks | (S − 1) / (R·M + S − 1) |
-| `1f1b`     | as in gpipe, and its backward as soon as it can run               | 2S − 1          | (S − 1) / (M + S − 1)   |
+| `1f1b`     | as in gpipe, and its backward as soon as it can run; the default  | 2S − 1          | (S − 1) / (M + S − 1)   |
 | `zbh1`     | as in gpipe, its backward split in two, the weights' part where a stage would idle | S, and S of the weights' | (S − 1) / (3M + S − 1) |
 
 What a stage holds is the residuals of as many ticks or microbatches. `circular` needs
 at least one microbatch per stage, and only it reads `methods.rounds`. The bubble of
 `zbh1` counts a forward, a backward of the input and one of the weights as a tick each.
+
+`1f1b` is the default: on one node of B300s, on the stages a run balances, it trains
+the 1.3B below 8% faster than `gpipe` on 2 stages in half its memory, 22% faster on 4
+in a fifth less, and as fast on 8 in a seventh less ([Stages](#stages-methodsstages)).
+It runs where `gpipe` does, but:
+
+- in rounds: only `circular` goes round the stages more than once, and
+  `methods(rounds=2)` under `1f1b` is an error that says so;
+- where a layer outside the pipelined repeat learns from the whole batch, as an MoE's
+  router does: `1f1b` runs the layers outside the repeat a microbatch at a time, on
+  one stage, which is an error that says to use `gpipe`;
+- a forward alone, as an eval's, runs `gpipe`'s: `1f1b` is the schedule of a
+  training step's backward.
+
+With one stage nothing pipelines, and a model's MTP modules run on the last stage,
+with its head.
+
 `bux plan` shows the share of a step a stage idles, the bubble:
 
 ```
@@ -1873,10 +1941,12 @@ are independent and their axes span processes, `accumulate=auto` (or
 split the rows as well as over `stage`. A stage runs its device's rows alone, each
 tick's gradients stay its own, and the `shard_map`'s transpose sums them over those
 axes once, as they leave it, in float32. Else (`accumulate=reduced`, or an MoE) they
-reduce every tick, as the backward makes them. With `gpipe` the stacked state
-keeps the shapes and the order of `repeat=scan`'s, so a run resumes on another number
-of stages, or on none; `circular` stacks each round's layers as a repeat of its own,
-and resumes as circular with as many rounds.
+reduce every tick, as the backward makes them. On stages of as many passes each the
+stacked state keeps the shapes and the order of `repeat=scan`'s, so a run resumes on
+another number of stages, or on none; on uneven stages, as a run balances them under
+`1f1b`, it resumes on the same split ([Stages](#stages-methodsstages)); `circular`
+stacks each round's layers as a repeat of its own, and resumes as circular with as
+many rounds.
 
 Measured on 8 CPU devices, for a Llama of 8 blocks (`d_model=64`, 16 rows of 16
 tokens): how far the losses of three AdamW steps are from one device's at most, and
@@ -2016,22 +2086,64 @@ and deterministic ops, `gpipe`, `1f1b` and `zbh1`, on even stages and uneven, gi
 the same loss at the first step, and within 7e-4 at the tenth, on a loss falling
 0.07 a step.
 
-### Uneven stages: `methods.stages`
+### Stages: `methods.stages`
 
 ```
 mesh    = mesh(stage=4, fsdp=2)
-methods = methods(repeat=scan, microbatches=8, pipeline="1f1b", stages=[5, 4, 4, 3])
+methods = methods(repeat=scan, microbatches=8, stages=[5, 4, 4, 3])
 ```
 
-`methods.stages` gives each stage its passes of the pipelined repeat, first to last:
-fewer on the last, which runs the head under `1f1b` and `zbh1`. A sharding splits the
-stacked layers evenly, so each stage holds as many as the most any runs
-(`pipeline.spread`): its own, then copies of its first, which it skips by a
+`methods.stages` gives each stage its passes of the pipelined repeat, first to last.
+Left out, under `1f1b` and `zbh1` a run splits them so that its stages do as much work
+each as they can (`bux.train.stages`): the first stage runs the model up to the
+repeat too, the embedding, and the last the model after it, to the loss, the head.
+It counts the FLOPs of a row's forward (`bux.train.flops`) in a pass, before the
+repeat and after it, on the model cut at the repeat as the schedule cuts it, and
+takes the split whose slowest stage does the least, of those as slow the most even
+(`pipeline.balanced`). The embedding is a gather, no FLOPs; the 1.3B's head, at a
+vocabulary of 128k and rows of 4096, is 4.7 passes' work, so the 16 passes split
+`[10, 6]` over 2 stages, `[5, 5, 5, 1]` over 4 and `[3, 2, 2, 2, 2, 2, 2, 1]` over 8.
+`bux train` says the split it takes, and `bux plan` counts the stages' parameters by
+it. Under `gpipe` and `circular`, where every stage runs the rest of the model, the
+passes split as evenly as they go.
+
+A sharding splits the stacked layers evenly, so each stage holds as many as the most
+any runs (`pipeline.spread`): its own, then copies of its first, which it skips by a
 `lax.cond`. The copies are parameters too, with their optimizer's state, and their
 gradient is 0; a run resumes on the same split only, and on another it fails at once,
 as its checkpoints keep the split ([Resuming](training.md#resuming)). The split must
-give every stage its passes and sum to the repeat's, in one round, else it is an error
+give every stage a pass and sum to the repeat's, in one round, else it is an error
 that says so.
+
+On one node of 8 B300s, the 1.3B of the table above under `1f1b`, 8 microbatches, the
+loss by chunks, the splits about the balanced one:
+
+| mesh              | `methods.stages`            | tok/s | peak     |
+|-------------------|-----------------------------|-------|----------|
+| `stage=2, fsdp=4` | `[11, 5]`                   | 641k  | 32.5 GiB |
+|                   | `[10, 6]`, as balanced      | 682k  | 30.8 GiB |
+|                   | `[9, 7]`                    | 682k  | 29.7 GiB |
+| `stage=4, fsdp=2` | `[5, 5, 4, 2]`              | 540k  | 52.6 GiB |
+|                   | `[4, 5, 5, 2]`              | 548k  | 52.6 GiB |
+|                   | `[5, 5, 5, 1]`, as balanced | 601k  | 52.7 GiB |
+
+The balanced split is the hand-tuned one, and the fastest, on both (on 2 stages tied
+with `[9, 7]`). Its FLOPs count attention's: without them the head would be 5.6
+passes' work, and 2 stages would take `[11, 5]`, 6% slower.
+The defaults, against `gpipe` (the default before) and against `1f1b` on even
+stages, by the one-node suite's pipeline (`examples/benchmarks/one_node.bux`, 8
+microbatches):
+
+| mesh              | `gpipe`           | `1f1b`, even      | `1f1b`, balanced: the default      |
+|-------------------|-------------------|-------------------|------------------------------------|
+| `stage=2, fsdp=4` | 629k, 60.0 GiB    | 652k, 22.2 GiB    | `[10, 6]`: 682k, 30.8 GiB          |
+| `stage=4, fsdp=2` | 491k, 65.0 GiB    | 494k, 40.8 GiB    | `[5, 5, 5, 1]`: 598k, 52.7 GiB     |
+| `stage=8`         | 320k, 83.7 GiB    | 333k, 50.1 GiB    | `[3, 2, 2, 2, 2, 2, 2, 1]`: 320k, 71.1 GiB |
+
+On 8 stages, 8 microbatches barely fill the pipeline, whose stages idle 7 ticks of
+15: the slowest stage is in fewer ticks than the stages around it, and the even split
+is 4% faster there. With more microbatches the balanced split pays again: at 16,
+364k against even stages' 358k and gpipe's 346k; at 32, 396k against 373k and 356k.
 
 ### Later: DualPipe
 

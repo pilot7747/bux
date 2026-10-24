@@ -224,6 +224,18 @@ _NEWER_FIELDS = {
 _UNCOMPUTED_FIELDS = {"precision": ("eval",)}
 
 
+def _experts_as_they_run(
+    arch: "Architecture", config: TrainConfig, train: dict
+) -> dict:
+    """`train`, dumped, with the format a model's routed experts multiply in where
+    `roles` leaves it to `matmuls` (``PrecisionConfig.experts``), as they did not
+    before: so that a run whose experts now take its matmuls' format has an id of its
+    own, and a model without them keeps its own."""
+    if any(layer.config.type == "moe" for layer in arch.layers()):
+        train["precision"]["roles"]["experts"] = config.precision.experts()
+    return train
+
+
 def _without_newer_fields(train: dict) -> dict:
     """`train`, dumped, without the `_NEWER_FIELDS` that compute as runs did before,
     nor the `_UNCOMPUTED_FIELDS`."""
@@ -264,6 +276,7 @@ class Run(BaseModel):
         # A setting or a field newer than run ids is left out where it computes as runs
         # did before it, so that ids made before it resume.
         dumped = self.train.model_dump(mode="json", exclude=_UNCOMPUTED)
+        dumped = _experts_as_they_run(self.arch, self.train, dumped)
         train = _without_newer_fields(dumped)
         for setting, before in _NEWER.items():
             old = _without_newer_fields({setting: before.model_dump(mode="json")})

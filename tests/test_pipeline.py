@@ -245,6 +245,14 @@ def test_uneven_stages_train_as_one_device(losses, method, mesh, stages, microba
     assert np.allclose(piped, one, atol=1e-5)
 
 
+def test_passes_that_do_not_divide_split_as_evenly_as_they_go():
+    model = _model(PRELUDE + "model = embed block^7 norm head", "mesh(stage=4)", SCAN)
+    [scan] = _scans(model)
+    kernel = next(v for _, v in nnx.iter_graph(scan) if isinstance(v, nnx.Param))
+    assert pipeline.even(7, 4) == (2, 2, 2, 1)
+    assert (scan.times, kernel.shape[0]) == (7, 4 * 2)
+
+
 def test_uneven_stages_hold_as_many_layers_as_the_most_any_runs():
     model = _model(LLAMA, "mesh(stage=2, fsdp=2)", _how(4, stages="[3, 5]"))
     [scan] = _scans(model)
@@ -327,11 +335,19 @@ def test_a_tap_read_across_the_pipelined_repeat_is_an_error_that_names_it():
     [
         (LLAMA, "methods(repeat=unroll)", r"methods\(repeat=scan\)"),
         (PRELUDE + "model = embed block norm head", SCAN, r"methods\(repeat=scan\)"),
-        (PRELUDE + "model = embed block^6 norm head", SCAN, "a multiple of 4"),
+        (PRELUDE + "model = embed block^3 norm head", SCAN, "a pass a stage"),
+        (LLAMA, _how(2, "circular", 3), "a multiple of 12"),
         (LLAMA, _how(2, "circular", 2), "a microbatch a stage"),
         (LLAMA, _how(2, stages="[1, 2, 2, 1]"), "splits 6 passes"),
     ],
-    ids=["unrolled", "no repeat", "uneven", "too few microbatches", "wrong split"],
+    ids=[
+        "unrolled",
+        "no repeat",
+        "too few passes",
+        "uneven rounds",
+        "too few microbatches",
+        "wrong split",
+    ],
 )
 def test_a_model_that_cannot_pipeline_is_an_error_that_says_why(source, methods, error):
     with pytest.raises(ValueError, match=error):
@@ -402,4 +418,28 @@ def test_an_uneven_pipeline_resumes_with_its_split_alone(tmp_path):
         run("mesh(stage=4, data=2)", "[3, 2, 2, 1]"), tmp_path, echo=said.append
     )
     assert said[0].endswith("resuming at step 2")
+    assert resumed["loss"] == pytest.approx(whole["loss"], abs=1e-5)
+
+
+def test_a_pipeline_resumes_on_the_stages_its_run_balanced(tmp_path):
+    wide = LLAMA.replace("vocab_size = 128", "vocab_size = 4096")  # a head of 4 blocks
+
+    def run(split: str | None):
+        how = _how(4, '"1f1b"', stages=split) if split else _how(4, '"1f1b"')
+        every = "checkpoint = checkpoint(every=2)"
+        mesh = "mesh(stage=2, data=1)"
+        [r] = compile_runs(f"{wide}\n{TRAIN}\nmesh = {mesh}\nmethods = {how}\n{every}")
+        return r
+
+    said: list[str] = []
+    whole = train(run(None), tmp_path, echo=said.append)
+    assert said[0].endswith("methods.stages = [6, 2]")
+    shutil.rmtree(directory(run(None), tmp_path) / "checkpoints" / "4")
+    with pytest.raises(
+        ValueError, match=re.escape("saved with methods.stages = [6, 2]")
+    ):
+        train(run("[4, 4]"), tmp_path, echo=lambda _: None)
+    said.clear()
+    resumed = train(run(None), tmp_path, echo=said.append)
+    assert said[1].endswith("resuming at step 2")
     assert resumed["loss"] == pytest.approx(whole["loss"], abs=1e-5)

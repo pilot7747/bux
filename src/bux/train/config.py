@@ -340,7 +340,8 @@ class RolesConfig(Config):
     kv: str | None = None  # attention's keys and values
     o: str | None = None  # attention's output projection
     mlp: str | None = None  # MLPs, the shared experts' too
-    # The routed experts: one of GROUPED; none is compute, not `matmuls`.
+    # The routed experts: one of GROUPED; none is `matmuls` where a grouped GEMM
+    # multiplies in it, MXFP8's, else compute (``PrecisionConfig.experts``).
     experts: Annotated[str | None, AfterValidator(_grouped)] = None
     latent: str | None = None  # LatentMoE's projections to and from its latent
     recurrence: str | None = None  # the recurrent mixers' projections, but the output
@@ -388,6 +389,13 @@ class PrecisionConfig(Config):
     # What the MoE's exchanges send tokens to their experts in: compute, or MXFP8
     # (DeepSeek-V3's FP8 dispatch); what comes back, and gradients, go in compute.
     dispatch: Literal["compute", "mxfp8"] = "compute"
+
+    def experts(self) -> str | None:
+        """Return the format the routed experts multiply in: `roles.experts`, or where
+        it is none, `matmuls` if a grouped GEMM multiplies in it; none is compute."""
+        if self.roles.experts is None and self.matmuls in GROUPED:
+            return None if self.matmuls == "compute" else self.matmuls
+        return self.roles.experts
 
 
 # --- Parallelism -----------------------------------------------------------------------
@@ -481,12 +489,16 @@ class MethodsConfig(Config):
     # its inputs either way.
     states: Literal["keep", "recompute"] = "keep"
     repeat: str = "unroll"
-    # A policy by name, or as data: remat(save=[attention], first=8).
-    remat: Annotated[str | RematConfig, BeforeValidator(_named_none)] = "none"
-    pipeline: str = "gpipe"
+    # A policy by name, or as data: remat(save=[attention], first=8). auto: the first
+    # of none, dots_attention, dots, save_attention and full whose step fits.
+    remat: Annotated[str | RematConfig, BeforeValidator(_named_none)] = "auto"
+    # 1f1b, zbh1, gpipe or circular: 1f1b runs where gpipe does, but in rounds and
+    # where a layer outside the pipelined repeat learns from the whole batch.
+    pipeline: str = "1f1b"
     rounds: Positive = 1  # times a circular pipeline sends a microbatch round
-    # The passes of the pipelined repeat each stage runs, first to last: fewer on the
-    # first and last, which run the embedding and the head. None: an even share.
+    # The passes of the pipelined repeat each stage runs, first to last. None: under
+    # 1f1b and zbh1, the split that balances the stages' FLOPs, the embedding's on the
+    # first and the head's on the last (bux.train.stages); else as even as it goes.
     stages: list[Positive] | None = None
     orthogonalize: str = "owner"  # how Muon reaches whole matrices
     loss: str = "chunks"  # how the loss takes a head's logits: by chunks, or whole
