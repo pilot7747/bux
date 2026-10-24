@@ -1,9 +1,8 @@
 # TorchTitan's MXFP8 linears (torchao): every projection inside a block in MXFP8,
 # activations and gradients with a scale per 32 of a row, weights per 32 x 32 tile, so
-# that y and dx see the same W. The head and the router stay in bfloat16.
+# that y and dx see the same W, and the routed experts' grouped GEMMs too. The head and
+# the router stay in bfloat16.
 #
-# Left out: MXFP8 routed experts, which stay in bfloat16, as bux's grouped MXFP8 GEMM
-# is slower (precision.roles.experts = mxfp8_2d takes it); and their choice, per
-# linear, of saving its input for the backward in bfloat16 or in MXFP8, where bux
-# always saves x^T in MXFP8.
-precision = precision(compute=bfloat16, matmuls=mxfp8_2d)
+# Left out: their choice, per linear, of saving its input for the backward in bfloat16
+# or in MXFP8, where bux always saves x^T in MXFP8.
+precision = precision(compute=bfloat16, matmuls=mxfp8_2d, roles=roles(experts=mxfp8_2d))

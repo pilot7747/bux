@@ -5,10 +5,10 @@ import re
 import shutil
 
 import jax
-import jax.extend
 import jax.numpy as jnp
 import numpy as np
 import pytest
+from conftest import count, equations
 from flax import nnx
 from jaxtyping import Float
 
@@ -288,19 +288,9 @@ def test_a_pipeline_runs_microbatches_plus_stages_less_one_ticks():
 
     with _use("mesh(stage=4)", _how(8)):
         jaxpr = jax.make_jaxpr(forward)(state).jaxpr
-    assert 8 + 4 - 1 in {e.params["length"] for e in _equations(jaxpr, "scan")}
-    assert _equations(jaxpr, "ppermute")
-
-
-def _equations(jaxpr: jax.extend.core.Jaxpr, name: str) -> list:
-    """Every equation of primitive `name` in `jaxpr`, and in the jaxprs inside it."""
-    found = []
-    for e in jaxpr.eqns:
-        if e.primitive.name == name:
-            found.append(e)
-        for sub in jax.extend.core.jaxprs_in_params(e.params):
-            found += _equations(sub, name)
-    return found
+    scans = [e for e, _ in equations(jaxpr) if e.primitive.name == "scan"]
+    assert 8 + 4 - 1 in {e.params["length"] for e in scans}
+    assert count(jaxpr, "ppermute")
 
 
 def test_a_pipelined_run_needs_no_full_rematerialization(losses, involuntary):

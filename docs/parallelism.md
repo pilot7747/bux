@@ -848,19 +848,35 @@ precision = precision(roles=roles(experts=mxfp8))
 
 The routed experts' role, `experts`, takes `compute`, `mxfp8` or `mxfp8_2d`
 (docs/training.md, "Precision"), and `nvfp4` is an error. Unlike the other roles, none
-is compute, not `matmuls`: on B300s it trains slower than bfloat16 (below). In a
+is compute, not `matmuls`. On B300s MXFP8 experts train 6 to 13% faster than
+bfloat16 ones (below). In a
 format, `experts` runs up and gate as one GEMM, so that x quantizes once, and each
 GEMM by `grouped_blockscaled.ragged_dot`: every operand of the forward's GEMM and of
 the backward's two quantized along what that GEMM contracts, as a projection's are,
-and each expert's W on its own. On a GPU Triton's `tl.dot_scaled` multiplies them,
-Blackwell's block-scaled MMA, in the kernels of `grouped_triton`, which load by TMA:
-`rows` for x W and dy W^T, a program per tile of rows of each expert, and `contract`
-for dW, the tiles of rows wholly inside an expert by TMA and the two it shares with
-its neighbours by loads that take the neighbours' rows as 0. One pass of a Triton
-kernel quantizes x and x^T, and zeroes the rows past the experts', which an exchange's
-buffer leaves as they were. Elsewhere XLA dequantizes and multiplies, which computes
-the same values, so the tests run it on CPU. Only `passes` multiply in the format, the
-others by `grouped`'s kernels, as they are.
+and each expert's W on its own. One pass of a Triton kernel quantizes x and x^T, and
+zeroes the rows past the experts', which an exchange's buffer leaves as they were.
+Elsewhere XLA dequantizes and multiplies, which computes the same values, so the
+tests run it on CPU. Only `passes` multiply in the format, the others by `grouped`'s
+kernels, as they are.
+
+On a Blackwell GPU tcgen05's block-scaled MMA multiplies them, in the Mosaic GPU
+kernels of `grouped_mxfp8`: `rows` for x W and dy W^T, and `contract` for dW. A pair
+of SMs multiplies each tile, 256 rows by 128 columns, by tcgen05's MMA of two SMs,
+and each pair takes tiles one after another, in bands of 8 tiles of rows, down a
+band's rows first: the tiles in flight then share few rows of one operand and columns
+of the other, which stay in L2. Three roles share a tile's steps along k:
+
+| role | does |
+|------|------|
+| a warp | loads each step's tiles of both operands and their scales by TMA into a ring of 7 buffers, the scales laid out as tensor memory takes them, 128 rows by 4 scales a 512-byte tile |
+| a warp | copies the step's scales on into tensor memory (`tcgen05.cp`) and issues its MMAs into one of two accumulators there |
+| a warpgroup | stores the other accumulator in the output's dtype, so that a tile's store overlaps the next one's MMAs |
+
+`rows` takes the 256 rows an expert has rows in, so a tile two experts share runs
+once for each, which stores only its own rows; the rows past the experts it stores as
+0. `contract` takes an expert's rows in tiles of 128 along what dW contracts: the
+first and last of x^T, which it may share with its neighbours, from copies with their
+rows as 0, so that dy's add nothing there.
 
 Unlike a projection's, the experts' dW quantizes the rows a device has of an expert in
 blocks of 32 as they lie: a block that two experts share has one scale, and each
@@ -868,34 +884,50 @@ counts the other's rows as 0. Which rows share a block, and so dW, depend on how
 mesh splits the tokens: in float32, 3 steps on `fsdp=2, expert=4` lose within 1e-4 of
 one device's (`tests/test_precision.py`), not the same.
 
-On B300s, at the baseline MoE's shapes (d 2048, f 704, 262144 picks a GPU), it is
-slower than bfloat16. In a step of `sorted` under `fsdp=8`, its GEMMs of rows take 85
-ms (860 TFLOP/s) and of dW 59 ms (610), where tokamax's bfloat16 ones take 65 and 46,
-and the quantizer, over x, the hidden units and both gradients, each twice, 38 ms more.
-A block-scaled MMA runs at twice bfloat16's rate, but `tl.dot_scaled` takes the scales,
-rows of 4 bytes too short for TMA, through registers into tensor memory at every step
-of k. On 8 B300s at 32k tokens a GPU:
+On one B300, each GEMM of the baseline MoE's experts (64 of them, `d_model` 2048,
+intermediate 704, 262144 picks), in TFLOP/s of the GEMM's own kernel by CUPTI:
 
-| method | experts | tokens a second | peak |
-|--------|---------|-----------------|------|
-| `sorted`, `fsdp=8` | bfloat16 | 827k | 83.8 GiB |
-| | `mxfp8` | 703k | 69.4 GiB |
-| | `mxfp8`, `passes=[fprop, dgrad]` | 763k | 79.9 GiB |
-| | bfloat16, `remat=dots` | 741k | 51.9 GiB |
-| | `mxfp8`, `remat=dots` | 604k | 48.3 GiB |
-| `ragged_all_to_all`, `capacity=1.25`, `expert=8` | bfloat16 | 548k | 88.4 GiB |
-| | `mxfp8` | 477k | 73.4 GiB |
-| | `mxfp8`, `dispatch=mxfp8` | 472k | 73.4 GiB |
-| `ragged_tokens`, `capacity=1.25`, `expert=8` | bfloat16 | 549k | 90.2 GiB |
-| | `mxfp8`, `dispatch=mxfp8` | 477k | 77.4 GiB |
+| GEMM | bfloat16, tokamax | MXFP8, Triton's `tl.dot_scaled` (before) | MXFP8, `grouped_mxfp8` |
+|------|-------------------|-------------------------------------------|------------------------|
+| x W, up and gate | 1269 | 964 | 2405 (1.9x) |
+| h W, down | 1069 | 680 | 1596 (1.5x) |
+| dy W^T, down | 1213 | 908 | 2230 (1.8x) |
+| dh W^T, up and gate | 1266 | 901 | 2244 (1.8x) |
+| dW, up and gate | 1093 | 644 | 2573 (2.4x) |
+| dW, down | 1034 | 616 | 2367 (2.3x) |
 
-It keeps x^T in MXFP8 for dW rather than x in bfloat16, so it takes 14 GiB less. With
-the scales laid out as Blackwell's tensor memory takes them, 128 rows by 4 of k a
-tile, which TMA loads and `tcgen05.cp` copies on, the GEMM of rows computes the same,
-and on a B300 is 10 to 25% faster: still far from twice bfloat16's, which wants a
-warp-specialized kernel with two-CTA MMAs, as tokamax's bfloat16 one is. It trains at
-bfloat16's loss: 98M tokens of FineWeb-Edu end 0.13% and 0.05% below it, with FP8
-dispatch (docs/training.md, "Precision").
+and with experts of 2048, 1.7 to 2.3 times bfloat16's: 2423 to 2616 TFLOP/s against
+1139 to 1414. At `all_to_all`'s GEMMs of a peer's buffer under `expert=8`, 40960 rows
+of which 32768 its 8 experts', 1.3 to 2.7 times: 1271 (h W) to 2490 (dW, up and gate)
+against 904 to 1213. h W contracts 704, which TMA takes in tiles of 128, so `rows` pads it
+to 768 and does 9% more. Taking the tiles a row of them at a time, all its columns
+before the next row, was 1.7x slower (1623 against 2725 TFLOP/s for dh W^T at k
+4096): the rows and columns in flight then fell out of L2. Triton's kernels took the
+scales, rows of 4 bytes too short for TMA, through registers into tensor memory at
+every step of k.
+
+Training on B300s, side by side, GEMM autotuning off and deterministic ops, the
+experts in bfloat16, in MXFP8 by Triton's kernels as before, and by `grouped_mxfp8`
+(tokens a second, peak memory):
+
+| run | bfloat16 | MXFP8, Triton | MXFP8, `grouped_mxfp8` |
+|-----|----------|---------------|------------------------|
+| the baseline MoE, one GPU, 8 × 4096 tokens | 86.2k, 133.9 GiB | 74.2k | 91.5k (1.06x), 119.5 GiB |
+| experts of 2048, 8 layers, one GPU | 90.4k, 143.2 GiB | 75.6k | 101.7k (1.12x), 129.6 GiB |
+| `ragged_all_to_all`, `capacity=1.25`, `expert=8`, 32k tokens a GPU | 468k, 88.5 GiB | 417k | 517k (1.10x), 72.3 GiB |
+| | | | `dispatch=mxfp8`: 515k |
+| `all_to_all`, `capacity=1.25`, `expert=8`, 32k tokens a GPU | 492k, 91.4 GiB | 449k | 539k (1.10x), 78.4 GiB |
+| `sorted`, `fsdp=8`, 32k tokens a GPU | 671k, 83.9 GiB | 580k | 712k (1.06x), 69.4 GiB |
+
+Both MXFP8 kernels compute the same values: the runs' losses agree to the last digit
+logged, and with bfloat16's to the rounding between them. The experts' GEMMs take
+half of bfloat16's time, 3.0 ms a layer against 5.8, and the quantizer, which reads
+each operand once and writes it twice, most of what they save: an MoE layer's experts
+forward and backward take 6.1 ms against 7.3 in bfloat16, and 13.8 against 17.9 with
+experts of 2048 (`scripts/gpu_smoke/grouped_mxfp8.py`). It keeps x^T in MXFP8 for dW
+rather than x in bfloat16, so it takes 14 GiB less. It trains at bfloat16's loss: 98M
+tokens of FineWeb-Edu end 0.13% and 0.05% below it, with FP8 dispatch
+(docs/training.md, "Precision").
 
 ## Expert parallelism
 
