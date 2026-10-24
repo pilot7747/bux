@@ -14,9 +14,10 @@ token's index less `within`, and varlen kernels' cu_seqlens are where `ids` chan
 
 from typing import NamedTuple
 
-import jax
 import jax.numpy as jnp
 from jaxtyping import Array, Int
+
+from bux.parallel.context import running_max, running_sum
 
 
 class Segments(NamedTuple):
@@ -32,10 +33,6 @@ class Segments(NamedTuple):
         start = jnp.concatenate(
             [jnp.ones((b, 1), bool), positions[:, 1:] <= positions[:, :-1]], axis=1
         )
-        # Prefix scans of log2(t) steps: XLA's cummax and cumsum of a row of 128k
-        # positions split over `context` take 2 and 25 ms on a B300.
-        first = jax.lax.associative_scan(
-            jnp.maximum, jnp.where(start, index, 0), axis=1
-        )
-        ids = jax.lax.associative_scan(jnp.add, start.astype(jnp.int32), axis=1)
+        first = running_max(jnp.where(start, index, 0))
+        ids = running_sum(start.astype(jnp.int32))
         return cls(positions, ids, (index - first).astype(jnp.int32))
