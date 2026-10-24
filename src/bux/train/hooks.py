@@ -20,15 +20,22 @@ saves it.
 """
 
 import itertools
+import random
+import shutil
 import time
-from collections.abc import Callable, Iterator
+from collections.abc import Callable, Iterator, Mapping
 from pathlib import Path
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
 import jax
+import numpy as np
 import orbax.checkpoint as ocp
+from flax import nnx
+from jax.experimental import multihost_utils
 from jaxtyping import Array, Shaped
 
+from bux import parallel
+from bux.lang.printer import value_to_source
 from bux.train import trace
 from bux.train.data import Batch
 from bux.train.objective import Metrics
@@ -65,24 +72,19 @@ class Hook:
 class Log(Hook):
     """The step's metrics, with its learning rate, the tokens seen and the tokens per
     second since the last log; and `mfu`, the model FLOPs a second over the devices'
-    peak, where `flops` (a step's) and `peak` (the devices' a second) are known.
+    `peak`, where the peak is known and the trainer counts its FLOPs (`work`).
     Optax counts from 0: the step just taken is `trainer.step - 1`."""
 
     def __init__(
-        self,
-        *,
-        every: int,
-        lr: Schedule,
-        tokens: int,
-        flops: float | None = None,
-        peak: float | None = None,
+        self, *, every: int, lr: Schedule, tokens: int, peak: float | None = None
     ):
         self.every, self.lr, self.tokens = every, lr, tokens  # tokens per step
-        self.ideal = flops / peak if flops and peak else None  # a step at the peak, s
-        self.clock, self.since = time.perf_counter(), 0
+        self.peak = peak
+        self.clock, self.since, self.flops = time.perf_counter(), 0, 0.0
 
     def start(self, trainer: "Trainer") -> None:
         self.clock, self.since = time.perf_counter(), trainer.step
+        self.flops = trainer.flops
 
     def __call__(self, trainer: "Trainer", metrics: Metrics) -> Scalars:
         scalars = {k: float(v) for k, v in metrics.items()}  # waits for the step
@@ -93,9 +95,9 @@ class Log(Hook):
             "tokens": trainer.step * self.tokens,
             "tokens_per_s": steps * self.tokens / seconds,
         }
-        if self.ideal is not None:
-            scalars["mfu"] = steps * self.ideal / seconds
-        self.clock, self.since = now, trainer.step
+        if self.peak and trainer.work is not None:
+            scalars["mfu"] = (trainer.flops - self.flops) / seconds / self.peak
+        self.clock, self.since, self.flops = now, trainer.step, trainer.flops
         return scalars
 
 
@@ -115,10 +117,23 @@ class Eval(Hook):
 
 class Checkpoint(Hook):
     """The trainer's state, saved under `folder` at its step, and at the step training
-    stops at if it stops early; the `keep` most recent checkpoints stay."""
+    stops at if it stops early; the `keep` most recent checkpoints stay.
+
+    A checkpoint also keeps how the run in force lays out the state (``layout``), and
+    a run resumes from one only with its arrays and their layout, else it fails before
+    it reads one. Every process of a job saves its part, so `folder` must be one they
+    all see: one that is not fails at once, where orbax would wait at the first save
+    for the parts it cannot see until it timed out, twenty minutes later.
+
+    A save that a crash left half written is deleted as a run starts, and the run saves
+    again only past its step: orbax would save that step in a folder of the same name,
+    which another node of many may still see as the one deleted, fail to write into,
+    and hang the save."""
 
     def __init__(self, folder: Path, *, every: int, keep: int):
-        self.every = every
+        self.every, self.layout = every, layout()
+        _check_shared(folder.resolve())
+        self.unsaved_until = _drop_unfinished(folder.resolve())
         self.manager = ocp.CheckpointManager(
             folder.resolve(),
             options=ocp.CheckpointManagerOptions(max_to_keep=keep),
@@ -132,15 +147,29 @@ class Checkpoint(Hook):
         if (latest := self.manager.latest_step()) is None:
             return False
         state = trainer.state()
-        _fits(self.manager.item_metadata(latest), state, latest)
+        if misfit := self._misfit(latest, state):
+            raise ValueError(
+                f"the checkpoint of step {latest} does not hold this run's state: "
+                f"{misfit}. {_RESUMES_WITH}"
+            )
         shapes = jax.tree.map(_shape, state)
         jax.tree.map(lambda x: x.delete(), state)
         args = ocp.args.StandardRestore(shapes)
         trainer.load(self.manager.restore(latest, args=args), step=latest)
         return True
 
+    def _misfit(self, step: int, state: nnx.State) -> str | None:
+        """Say how the checkpoint of `step` differs from `state` and its layout, if it
+        does."""
+        saved = self.manager.metadata(step).custom_metadata
+        arrays = _arrays(self.manager.item_metadata(step))
+        return _changed(saved, self.layout) or _differs(arrays, _arrays(state))
+
     def __call__(self, trainer: "Trainer", metrics: Metrics) -> None:
-        self.manager.save(trainer.step, args=ocp.args.StandardSave(trainer.state()))
+        if trainer.step <= self.unsaved_until:
+            return
+        state = ocp.args.StandardSave(trainer.state())
+        self.manager.save(trainer.step, args=state, custom_metadata=self.layout)
 
     def stop(self, trainer: "Trainer") -> None:
         self(trainer, {})  # unless the step is saved already, which orbax skips
@@ -192,26 +221,116 @@ def _shape(x: Shaped[Array, "..."]) -> jax.ShapeDtypeStruct:
     return jax.ShapeDtypeStruct(x.shape, x.dtype, sharding=x.sharding)
 
 
-def _fits(saved: object, state: object, step: int) -> None:
-    """Raise unless the checkpoint of `step`, whose metadata is `saved`, holds the
-    variables of `state`. `methods.repeat` is not in a run's id, but it changes them:
-    `scan` stacks a repeat's passes into one."""
-    on_disk, mine = _paths(saved), _paths(state)
-    if on_disk == mine:
-        return
-    raise ValueError(
-        f"the checkpoint of step {step} does not hold this model's state: it has "
-        f"{min(on_disk - mine, default='nothing else')}, the model "
-        f"{min(mine - on_disk, default='nothing else')}. A run saved with "
-        "methods(repeat=unroll) resumes with unroll alone, and one with scan with scan"
-    )
+# The methods that a run's id leaves out but that change the arrays of its state.
+_RESUMES_WITH = (
+    "A run resumes with the methods it was saved with where they lay out its state: "
+    "repeat (unroll or scan), a circular pipeline's rounds and an uneven one's stages"
+)
 
 
-def _paths(tree: object) -> set[str]:
-    """The path of every leaf of `tree`, as a checkpoint keeps it."""
+def layout() -> dict[str, list[int] | None]:
+    """Return how the run in force lays out its state where the arrays' paths and
+    shapes do not say: the passes of an uneven pipeline's stages, which spread its
+    layers over them as no other split does (``pipeline.spread``)."""
+    on, split = parallel.active(), None
+    if on is not None and parallel.pipeline.pipelined():
+        split = on.methods.stages
+    if split is not None and len(set(split)) == 1:
+        split = None  # even, as a pipeline lays out its layers without a split
+    return {"methods.stages": None if split is None else list(split)}
 
-    def key(k: object) -> str:
-        return str(next(getattr(k, a) for a in ("key", "idx", "name") if hasattr(k, a)))
+
+def _changed(
+    saved: Mapping[str, object] | None, now: Mapping[str, object]
+) -> str | None:
+    """Say which setting of the layout `now` was another in the `saved` one, if any."""
+    for name, value in now.items():
+        if (was := (saved or {}).get(name)) != value:
+            was, value = value_to_source(was), value_to_source(value)
+            return f"it was saved with {name} = {was}, and this run has {value}"
+    return None
+
+
+# An array as a checkpoint keeps it: its dtype and shape.
+Stored = tuple[str, tuple[int, ...]]
+
+
+def _differs(saved: dict[str, Stored], mine: dict[str, Stored]) -> str | None:
+    """Say how the arrays of a checkpoint, `saved`, differ from the run's, `mine`, if
+    they do."""
+    if saved.keys() != mine.keys():
+        extra = min(saved.keys() - mine.keys(), default="nothing else")
+        missing = min(mine.keys() - saved.keys(), default="nothing else")
+        return f"it has {extra}, and this run {missing}"
+    for path in sorted(mine):
+        if saved[path] != mine[path]:
+            was, now = _typed(saved[path]), _typed(mine[path])
+            return f"its {path} is {was}, and this run's {now}"
+    return None
+
+
+def _typed(array: Stored) -> str:
+    dtype, shape = array
+    return f"{dtype}{list(shape)}"
+
+
+def _arrays(tree: object) -> dict[str, Stored]:
+    """The dtype and shape of every array of `tree`, by its path, as a checkpoint
+    keeps them: a typed key as its key's data."""
+
+    def stored(x: Any) -> Stored:  # an array, or a checkpoint's metadata of one
+        if jax.dtypes.issubdtype(x.dtype, jax.dtypes.prng_key):
+            x = jax.eval_shape(jax.random.key_data, x)
+        return str(x.dtype), tuple(x.shape)
 
     leaves = jax.tree_util.tree_leaves_with_path(tree)
-    return {"/".join(map(key, path)) for path, _ in leaves}
+    return {_named(path): stored(x) for path, x in leaves}
+
+
+def _named(path: tuple) -> str:
+    """Return a pytree path as its keys, joined by /: a name of a checkpoint's array."""
+    return jax.tree_util.keystr(path, simple=True, separator="/")
+
+
+def _check_shared(folder: Path) -> None:
+    """Raise unless the job's processes all see `folder` as one folder, which a node's
+    own disk is not: each writes a file into it, and each counts them."""
+    if (n := jax.process_count()) == 1:
+        return
+    folder.mkdir(parents=True, exist_ok=True)
+    token = int(multihost_utils.broadcast_one_to_all(np.int32(random.getrandbits(31))))
+    mine = folder / f".process-{token}-{jax.process_index()}"
+    mine.touch()
+    multihost_utils.sync_global_devices("each process wrote its file")
+    seen = _seen(folder, f".process-{token}-*", n)
+    fewest = int(multihost_utils.process_allgather(np.int32(seen)).min())
+    mine.unlink()
+    if fewest < n:
+        raise ValueError(
+            f"the {n} processes of this job do not share {folder}: one sees {fewest} "
+            "of the files they wrote there. Each saves its part of a checkpoint into "
+            "it, so put the run's directory (--out) where every node sees it"
+        )
+
+
+def _drop_unfinished(folder: Path) -> int:
+    """Delete the saves that a crash left half written, on the first process, and
+    return the last of their steps, -1 if there are none, on every process once it
+    has."""
+    last = -1
+    if jax.process_index() == 0 and folder.is_dir():
+        for name in ocp.path.step.tmp_checkpoints(folder):
+            shutil.rmtree(folder / name)
+            last = max(last, int(name.split(".")[0]))  # 20.orbax-checkpoint-tmp
+    if jax.process_count() > 1:
+        last = int(multihost_utils.broadcast_one_to_all(np.int32(last)))
+    return last
+
+
+def _seen(folder: Path, pattern: str, n: int, wait: float = 10.0) -> int:
+    """Return how many files in `folder` match `pattern`, once there are `n` or after
+    `wait` seconds: a network filesystem may show another node's file a little late."""
+    deadline = time.monotonic() + wait
+    while len(found := list(folder.glob(pattern))) < n and time.monotonic() < deadline:
+        time.sleep(0.5)
+    return len(found)

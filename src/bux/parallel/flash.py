@@ -20,16 +20,11 @@ import jax
 import jax.numpy as jnp
 from jaxtyping import Array, Bool, Float, Int
 
-from bux import kernels
+from bux import jax_internals, kernels
 
-try:  # tokamax's kernels, where its extra is installed (Linux)
-    from tokamax._src.ops.attention import api as tokamax
-    from tokamax._src.ops.attention import base as masks
-
-    MOSAIC = tokamax.IMPLEMENTATIONS.get("mosaic_gpu")
-    TRITON = tokamax.IMPLEMENTATIONS.get("triton")
-except ImportError:
-    MOSAIC = TRITON = masks = None
+# tokamax's kernels, None where its extra is not installed (it is on Linux)
+MOSAIC = jax_internals.tokamax_attention("mosaic_gpu")
+TRITON = jax_internals.tokamax_attention("triton")
 
 F32 = jnp.float32
 
@@ -59,6 +54,11 @@ class Kernel(NamedTuple):
     backward: Callable[..., Grads]
 
 
+def per_query_head(kv: Float[Array, "b s g e"], heads: int) -> Float[Array, "b s h e"]:
+    """Repeat keys or values for every query head of their group."""
+    return jnp.repeat(kv, heads // kv.shape[2], axis=2)
+
+
 # --- jnp ----------------------------------------------------------------------------
 
 
@@ -82,7 +82,7 @@ def _logits(
     cap: float | None,
 ) -> tuple[Float[Array, "b h t s"], Float[Array, "b h t s"]]:
     """Return the logits in float32, before the soft cap and after it."""
-    k = jnp.repeat(k.astype(F32), q.shape[2] // k.shape[2], axis=2)
+    k = per_query_head(k.astype(F32), q.shape[2])
     raw = jnp.einsum("bthd,bshd->bhts", q.astype(F32), k) * scale
     return raw, raw if cap is None else cap * jnp.tanh(raw / cap)
 
@@ -98,8 +98,8 @@ def _jnp_forward(
     seen = _seen(keys, q.shape[1], k.shape[1])
     _, logits = _logits(q, k, scale, cap)
     lse = jax.nn.logsumexp(jnp.where(seen, logits, -jnp.inf), -1)
-    p = jnp.where(seen, jnp.exp(logits - _finite(lse)[..., None]), 0)
-    v = jnp.repeat(v.astype(F32), q.shape[2] // v.shape[2], axis=2)
+    p = jnp.where(seen, jnp.exp(logits - finite(lse)[..., None]), 0)
+    v = per_query_head(v.astype(F32), q.shape[2])
     return jnp.einsum("bhts,bshd->bthd", p, v).astype(q.dtype), lse
 
 
@@ -114,12 +114,12 @@ def _jnp_backward(
     scale: float,
     cap: float | None,
 ) -> Grads:
-    g, r = k.shape[2], q.shape[2] // k.shape[2]
+    g, h = k.shape[2], q.shape[2]
     raw, logits = _logits(q, k, scale, cap)
     seen = _seen(keys, q.shape[1], k.shape[1])
-    p = jnp.where(seen, jnp.exp(logits - _finite(lse)[..., None]), 0)
-    do, kk = dout.astype(F32), jnp.repeat(k.astype(F32), r, axis=2)
-    dp = jnp.einsum("bthd,bshd->bhts", do, jnp.repeat(v.astype(F32), r, axis=2))
+    p = jnp.where(seen, jnp.exp(logits - finite(lse)[..., None]), 0)
+    do, kk = dout.astype(F32), per_query_head(k.astype(F32), h)
+    dp = jnp.einsum("bthd,bshd->bhts", do, per_query_head(v.astype(F32), h))
     ds = p * (dp - jnp.einsum("bthd,bthd->bht", do, out.astype(F32))[..., None])
     if cap is not None:
         ds = ds * (1 - jnp.tanh(raw / cap) ** 2)
@@ -137,8 +137,9 @@ def _sum_groups(x: Float[Array, "b s h e"], g: int) -> Float[Array, "b s g e"]:
     return x.reshape(b, s, g, h // g, e).sum(3)
 
 
-def _finite(lse: Float[Array, "*s"]) -> Float[Array, "*s"]:
-    """`lse` with 0 for a query that sees no key: its probabilities are 0 anyway."""
+def finite(lse: Float[Array, "*s"]) -> Float[Array, "*s"]:
+    """Return `lse` with 0 for -inf, the logsumexp of a query that sees no key: its
+    probabilities are 0 anyway."""
     return jnp.where(jnp.isfinite(lse), lse, 0.0)
 
 
@@ -181,9 +182,10 @@ def triton(
 
 
 def _tokamax_args(keys: Keys, scale: float, cap: float | None) -> dict:
-    assert masks is not None
     per_head = [None if x is None else x[:, None] for x in (keys.start, keys.end)]
-    mask = masks.Mask(k_start=per_head[0], k_end=per_head[1], is_causal=keys.causal)
+    mask = jax_internals.tokamax_mask(
+        k_start=per_head[0], k_end=per_head[1], is_causal=keys.causal
+    )
     return {
         "mask": mask,
         "logits_scale": scale,
@@ -200,12 +202,19 @@ def _tokamax_forward(
     scale: float,
     cap: float | None,
 ) -> Output:
-    """tokamax's residuals are the row's largest logit m and sum of exp(s - m)."""
     assert MOSAIC is not None
     args = _tokamax_args(keys, scale, cap)
     out, (m, total) = MOSAIC(q, k, v, return_residuals=True, **args)
+    return out, tokamax_lse(m, total)
+
+
+def tokamax_lse(
+    m: Float[Array, "b h t"], total: Float[Array, "b h t"]
+) -> Float[Array, "b h t"]:
+    """Return each query's logsumexp from tokamax's residuals, its row's largest
+    logit m and sum of exp(s - m): -inf for a query that sees no key."""
     some = total > 0
-    return out, jnp.where(some, m + jnp.log(jnp.where(some, total, 1)), -jnp.inf)
+    return jnp.where(some, m + jnp.log(jnp.where(some, total, 1)), -jnp.inf)
 
 
 def _tokamax_backward(
@@ -221,11 +230,8 @@ def _tokamax_backward(
 ) -> Grads:
     """tokamax's VJP, given the residuals (lse, 1): P = exp(s - lse)."""
     assert MOSAIC is not None
-    lse = _finite(lse)
-    bound = MOSAIC.bind(q, k, v, **_tokamax_args(keys, scale, cap))
-    kwargs = {n: a for n, a in bound.kwargs.items() if n != "return_residuals"}
-    grads = MOSAIC.vjp((lse, jnp.ones_like(lse)), out, dout, *bound.args, **kwargs)
-    return grads["q"], grads["k"], grads["v"]
+    args = _tokamax_args(keys, scale, cap)
+    return jax_internals.tokamax_vjp(MOSAIC, finite(lse), out, dout, q, k, v, args)
 
 
 TOKAMAX = Kernel(_tokamax_forward, _tokamax_backward)
@@ -300,7 +306,7 @@ def _share(
 ) -> Float[Array, "b t h 1"]:
     """Return the share exp(lse - total) of a part of a softmax, 0 where neither sees
     a key."""
-    share = jnp.where(jnp.isneginf(total), 0.0, jnp.exp(lse - _finite(total)))
+    share = jnp.where(jnp.isneginf(total), 0.0, jnp.exp(lse - finite(total)))
     return share.transpose(0, 2, 1)[..., None]
 
 
@@ -357,15 +363,9 @@ def cudnn_runs() -> bool:
 
 @cache
 def _cudnn_here() -> bool:
-    if jax.default_backend() != "gpu":
+    if jax.default_backend() != "gpu" or not jax_internals.cudnn_attention_here():
         return False
-    from jax._src.cudnn import fused_attention_stablehlo as fused
-
-    try:
-        fused.check_cudnn_version()
-    except RuntimeError:
-        return False
-    return float(getattr(jax.devices()[0], "compute_capability", 0)) >= 9
+    return float(getattr(jax.local_devices()[0], "compute_capability", 0)) >= 9
 
 
 def cudnn_takes(
@@ -402,25 +402,10 @@ def cudnn(
     """Return cuDNN's causal attention of whole rows, within `window`, and each of up
     to `documents` documents of a row (by `ids`) by itself, in cuDNN's packed layout:
     cuDNN skips what no query sees, forward and backward."""
-    from jax._src.cudnn import fused_attention_stablehlo as fused
-
     lengths = starts = None
-    mask = fused.MaskType.CAUSAL
     if ids is not None:
         lengths, starts = packed_documents(ids, documents)
-        mask = fused.MaskType.PADDING_CAUSAL
-    return fused.dot_product_attention(
-        q,
-        k,
-        v,
-        q_seqlen=lengths,
-        kv_seqlen=lengths,
-        q_offsets=starts,
-        kv_offsets=starts,
-        scale=scale,
-        mask_type=mask,
-        sliding_window_length=window,
-    )
+    return jax_internals.cudnn_attention(q, k, v, lengths, starts, scale, window)
 
 
 def packed_documents(

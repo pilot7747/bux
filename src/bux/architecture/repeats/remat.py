@@ -8,9 +8,10 @@ memory until the backward reads it, and computes everything else again
 (``keeping``). Each residual branch outside any other is rematerialized as a unit
 (``rematted``), and so is each scanned pass; nothing inside either is again. With
 `first`, only the first passes of each repeat are, and the rest keep everything
-(``at_pass``). A policy is also a name in `methods.remat` (``PRESETS``): `none` keeps
-everything, but in a scanned pass, which keeps all but what elementwise ops make
-(``unfused``).
+(``tracing.current_pass``). A policy is also a name in `methods.remat`
+(``PRESETS``): `none` keeps everything, but in a scanned pass, which keeps all but
+what elementwise ops make (``unfused``). `auto` is the first of ``CANDIDATES``, the
+fastest first, whose training step fits in the device's memory (bux.train.fitting).
 
 Layers name what is worth keeping (``checkpoint_name``):
 
@@ -37,12 +38,12 @@ from typing import Any
 import jax
 from flax import nnx
 from jax.ad_checkpoint import Offloadable, checkpoint_name, name_p
-from jax.extend.core import Primitive
 from jaxtyping import Shaped
 
 from bux import parallel
 from bux.architecture.registry import Stream, Taps
-from bux.architecture.repeats import pure
+from bux.architecture.repeats import pure, tracing
+from bux.jax_internals import Primitive
 from bux.parallel import methods
 from bux.train.config import RematConfig
 
@@ -115,22 +116,42 @@ methods.remat.register("none")(jax.checkpoint_policies.everything_saveable)
 for _name, _preset in PRESETS.items():
     methods.remat.register(_name)(keeping(_preset.save, _preset.offload))
 
+# What `auto` tries, the fastest first, as they train on B300s (docs/parallelism.md).
+CANDIDATES = ("none", "dots_attention", "dots", "save_attention", "full")
+# A forward outside a training step, which `auto` chooses for, keeps everything.
+methods.remat.register("auto")(jax.checkpoint_policies.everything_saveable)
+
 # Set while a rematerialized call traces, so that what it calls is not again.
 _REMATTED = contextvars.ContextVar("rematted", default=False)
+# Set while a training step traces under one of `auto`'s candidates.
+_TRYING = contextvars.ContextVar[str | None]("trying", default=None)
 # Set while a call traces under a policy of the run's: what `named` names, only it
 # keeps. Under `unfused`, naming would keep what it makes the backward compute again.
 _NAMING = contextvars.ContextVar("naming", default=False)
-# The pass of the outermost repeat that traces, which `first` counts; None outside.
-_PASS = contextvars.ContextVar[int | None]("pass", default=None)
 
 
 def setting() -> str | RematConfig:
-    """Return the run's `methods.remat`, or none outside ``parallel.use``."""
+    """Return the run's `methods.remat`, or none outside ``parallel.use``: under
+    `auto`, the candidate a training step is trying (``trying``)."""
     on = parallel.active()
-    return on.methods.remat if on else "none"
+    remat = on.methods.remat if on else "none"
+    if remat == "auto" and (candidate := _TRYING.get()) is not None:
+        return candidate
+    return remat
+
+
+@contextlib.contextmanager
+def trying(candidate: str) -> Generator[None]:
+    """Trace the block under `candidate`, where the run's remat is `auto`."""
+    token = _TRYING.set(candidate)
+    try:
+        yield
+    finally:
+        _TRYING.reset(token)
 
 
 def _found(remat: str | RematConfig) -> Policy:
+    """Return the policy `remat` names, or the one it describes."""
     if isinstance(remat, str):
         return methods.remat.find(remat)
     return keeping(remat.save, remat.offload)
@@ -146,29 +167,17 @@ def policy() -> Policy | None:
 
 
 def _past_first(remat: str | RematConfig) -> bool:
-    first, at = getattr(remat, "first", None), _PASS.get()
+    """Return whether the pass tracing comes after the run's `first`
+    (``tracing.current_pass``)."""
+    first, at = getattr(remat, "first", None), tracing.current_pass()
     return first is not None and at is not None and at >= first
 
 
-@contextlib.contextmanager
-def at_pass(i: int) -> Generator[None]:
-    """Trace the block as pass i of a repeat, for `first`; inside a pass of an outer
-    repeat, as that pass still."""
-    token = _PASS.set(i) if _PASS.get() is None else None
-    try:
-        yield
-    finally:
-        if token is not None:
-            _PASS.reset(token)
-
-
-def spans(start: int, stop: int) -> list[tuple[int, int]]:
-    """Return passes start to stop of a repeat as runs that rematerialize alike: those
-    before the run's `first`, and the rest."""
+def cuts() -> list[int]:
+    """Return where the run's `first` cuts a repeat's passes, after which they
+    rematerialize nothing (``tracing.runs``)."""
     first = getattr(setting(), "first", None)
-    if first is None or not start < first < stop:
-        return [(start, stop)]
-    return [(start, first), (first, stop)]
+    return [] if first is None else [first]
 
 
 @contextlib.contextmanager
@@ -188,8 +197,8 @@ CHEAP = frozenset(
     """abs add add_any and clamp cos div eq erf exp exp2 expm1 ge gt integer_pow
     is_finite le log log1p logistic lt max min mul ne neg not or pow rsqrt select_n
     sign sin sqrt square sub tanh xor
-    broadcast_in_dim concatenate convert_element_type copy copy_p dynamic_slice
-    expand_dims iota pad reduce_precision reshape rev slice squeeze transpose""".split()  # noqa: SIM905
+    broadcast_in_dim concatenate convert_element_type copy dynamic_slice
+    iota pad reduce_precision reshape rev slice squeeze transpose""".split()  # noqa: SIM905
 )
 
 

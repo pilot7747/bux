@@ -36,11 +36,7 @@ def states(
     if not any(split):
         return _heads(A, B)
     last = P(split[0], split[2], None, None)
-    # Untyped by what varies, which a kernel's outputs do not say; nothing here
-    # communicates.
-    return jax.shard_map(
-        _heads, in_specs=(split, split), out_specs=(split, last), check_vma=False
-    )(A, B)
+    return kernels.per_device(_heads, (split, split), (split, last))(A, B)
 
 
 def _heads(
@@ -153,6 +149,6 @@ def _run(
             jax.ShapeDtypeStruct(start.shape, jnp.float32),
         ],
         compiler_params=plgpu.CompilerParams(num_warps=warps, num_stages=2),
-        interpret=jax.default_backend() != "gpu",
+        interpret=kernels.interpreted(),
         name="affine_scan",
     )(A.astype(maps), B.astype(jnp.float32), start)

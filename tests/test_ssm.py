@@ -1,11 +1,13 @@
 """Mamba, Mamba-2 and LFM2's short convolution, against their references' math."""
 
+import functools
 import math
 
 import jax
 import jax.numpy as jnp
 import numpy as np
 import pytest
+from conftest import kept_bytes, outputs_and_grads
 from flax import nnx
 from jax.sharding import PartitionSpec as P
 from jaxtyping import Array, Float, Int
@@ -14,7 +16,15 @@ from bux import config as cfg
 from bux import parallel
 from bux.architecture import CausalConv, Model, Segments, Taps, num_params
 from bux.architecture.graph import ResidualBranch, Sequence
-from bux.architecture.recurrent.ssm import Mamba, Mamba2, ShortConv, chunk, stepwise
+from bux.architecture.recurrent.linear_attention import States
+from bux.architecture.recurrent.ssm import (
+    Mamba,
+    Mamba2,
+    ShortConv,
+    chunk,
+    selective_scan,
+    stepwise,
+)
 from bux.lang import compile
 from bux.parallel.recurrence import Chunked, Positions, Shared
 from bux.train import config as tcfg
@@ -323,6 +333,83 @@ def test_mamba2_by_chunks_differentiates_as_positions_do():
     for i, (a, b) in enumerate(zip(*grads, strict=True)):
         scale = float(jnp.abs(b).max())
         np.testing.assert_allclose(a, b, atol=2e-6 * scale, err_msg=str(i))
+
+
+# --- What the backward pass keeps: methods(states=...) ---------------------------------
+
+
+def scan_inputs(decay: str) -> tuple[Float[Array, "..."], ...]:
+    """`selective_scan`'s x, dt, A, B and C over 150 positions, as `ssd_inputs`: one
+    A a head (Mamba-2's), or one a channel and state dim (Mamba's)."""
+    (x, dt, B, C, _), (A,) = ssd_inputs(150)
+    if decay == "a_channel":
+        A = A * jnp.arange(1.0, N + 1) / N
+    return x, dt, A, B, C
+
+
+def ssd_documents(t: int) -> Segments:
+    """The documents of `ssd_inputs`: the first row's start 30 positions in and every
+    37 after; the second row is one."""
+    index = np.arange(t)
+    first = np.maximum.accumulate(np.where(index % 37 == 30, index, 0))
+    return Segments.of(jnp.asarray(np.stack([index - first, index])))
+
+
+# One device, and the positions split over context, which pass_state passes the
+# state across.
+SCAN_MESHES = {
+    "scan": tcfg.MeshConfig(data=1),
+    "pass_state": tcfg.MeshConfig(context=4, fsdp=2),
+}
+
+
+def scanned(decay: str, method: str, states: States) -> list[Float[Array, "..."]]:
+    """The selective scan's outputs, and the gradients of a weighted sum of them for
+    x, dt, A, B and C, by `methods(recurrence=method, states=states)` on the method's
+    mesh."""
+    args, docs = scan_inputs(decay), ssd_documents(150)
+
+    def scan(*args: Float[Array, "..."]) -> Float[Array, "b t h p"]:
+        return selective_scan(*args, docs)
+
+    methods = tcfg.MethodsConfig(recurrence=method, states=states)
+    with parallel.use(SCAN_MESHES[method], methods=methods):
+        return jax.jit(functools.partial(outputs_and_grads, scan))(*args)
+
+
+@pytest.mark.parametrize("method", SCAN_MESHES)
+@pytest.mark.parametrize("decay", ["a_head", "a_channel"])
+def test_the_selective_scan_recomputed_gives_what_it_does_kept(decay, method):
+    """With `states=recompute`, its backward pass computes its states again: the
+    outputs are those of `keep`, and so are the gradients, but for rounding."""
+    kept, recomputed = (scanned(decay, method, s) for s in ("keep", "recompute"))
+    np.testing.assert_array_equal(recomputed[0], kept[0])
+    for i, (a, b) in enumerate(zip(recomputed[1:], kept[1:], strict=True)):
+        scale = float(jnp.abs(b).max())
+        np.testing.assert_allclose(a, b, atol=1e-6 * scale, err_msg=str(i))
+
+
+def _kept_bytes(states: States) -> tuple[int, int]:
+    """What Mamba-2's selective scan keeps for its backward pass under
+    `methods(states=...)`, at a hybrid's shapes, and the bytes of its inputs."""
+    b, t, h, p, g, n = 1, 256, 8, 64, 2, 128
+    keys = jax.random.split(jax.random.key(0), 4)
+    x = jax.random.normal(keys[0], (b, t, h, p), jnp.bfloat16)
+    dt = jax.nn.softplus(jax.random.normal(keys[1], (b, t, h), jnp.bfloat16))
+    B, C = jax.random.normal(keys[2], (2, b, t, g, n), jnp.bfloat16)
+    A = -jax.random.uniform(keys[3], (h, 1), minval=1, maxval=16)
+    xs = (x, dt, A, B, C)
+    inputs = sum(x.nbytes for x in xs) + b * t * 4  # and where documents continue
+    return kept_bytes(selective_scan, *xs, states=states), inputs
+
+
+def test_mamba2_recomputed_keeps_its_inputs_alone():
+    """What its backward pass keeps with `states=recompute`: x, dt, A, B and C, where
+    they come in; with `states=keep`, also every chunk's states, its pairs' decays and
+    the outputs' reads, which recompute computes again."""
+    recomputed, inputs = _kept_bytes("recompute")
+    assert recomputed <= inputs
+    assert _kept_bytes("keep")[0] > 10 * recomputed
 
 
 # --- Split over devices ----------------------------------------------------------------

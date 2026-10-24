@@ -34,7 +34,7 @@ from optax.contrib._muon import orthogonalize_via_newton_schulz, scale_by_shape
 from bux import parallel
 from bux.architecture import Scanned
 from bux.parallel import methods
-from bux.parallel.layout import Split, partition
+from bux.parallel.layout import Split, as_split, partition
 from bux.train import config as tcfg
 from bux.train.registry import Registry
 
@@ -472,11 +472,7 @@ def _matrix_axes(dims: MuonDimensionNumbers, ndim: int) -> set[int]:
 
 def _splits(spec: P, ndim: int) -> list[Split]:
     """Return the mesh axes that `spec` splits each of `ndim` dimensions over."""
-    return [_mesh_axes(spec[i] if i < len(spec) else None) for i in range(ndim)]
-
-
-def _mesh_axes(entry: str | tuple[str, ...] | None) -> Split:
-    return () if entry is None else (entry,) if isinstance(entry, str) else entry
+    return [as_split(spec[i] if i < len(spec) else None) for i in range(ndim)]
 
 
 @methods.orthogonalize.register("owner")

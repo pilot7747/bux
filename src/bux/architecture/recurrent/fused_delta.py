@@ -12,7 +12,7 @@ own JAX call. It factors each decay through the start of a tile of 16 positions,
 loses precision where a tile decays a channel by exp(-86), and overflows at exp(-90):
 it runs a gate bounded at -5 (`gate_lower_bound`, Kimi K3), and no other. Within 12
 steps of bux's start, KDA's unbounded gates are that steep in 30 to 90% of the (row,
-head) pairs of most layers.
+head) pairs of most layers: those run by bux's own kernels (``pallas_delta``).
 
 The kernels run on one SM100 or SM103 GPU at a time, on token-packed rows and their
 documents' bounds (cu_seqlens); on a mesh, a `shard_map` gives them each device's rows
@@ -30,14 +30,13 @@ import jax.numpy as jnp
 from jax.sharding import PartitionSpec as P
 from jaxtyping import Array, Float, Int, Shaped
 
-from bux import kernels, parallel
+from bux import jax_internals, kernels, parallel
 from bux.architecture.common.segments import Segments
 
 try:  # cudnn-frontend and its JAX kernels, where the cuda extra is installed (Linux)
     import cudnn
     from cudnn.frost.device import device_context
     from cudnn.linear_attention import jax_api as frost
-    from jax.experimental.buffer_callback import buffer_callback
 except ImportError:
     frost = None
 
@@ -65,8 +64,8 @@ def runs(dk: int, dv: int, dtype: Any, decays: int, floor: float | None) -> bool
 
 @functools.cache
 def _sm() -> bool:
-    """Return whether the default device is one the kernels run on."""
-    device = jax.devices()[0]
+    """Return whether this host's GPUs are ones the kernels run on."""
+    device = jax.local_devices()[0]
     return getattr(device, "compute_capability", "") in SM
 
 
@@ -90,9 +89,7 @@ def delta_rule(
     if rows[1] is not None:  # positions split over devices, which XLA gathers
         return otherwise(q, k, v, log_decay, beta, docs)
     specs = (rows,) * 4 + (P(*rows[:3]),) + (P(*rows[:2]),) * 3
-    # Untyped by what varies, which the kernels' outputs do not say; nothing here
-    # communicates.
-    return jax.shard_map(rule, in_specs=specs, out_specs=rows, check_vma=False)(*xs)
+    return kernels.per_device(rule, specs, rows)(*xs)
 
 
 def _rows(
@@ -230,7 +227,8 @@ def _graph_call(
             handle = _handle(device, ctx.stream)
             graph.execute(pack, workspace=workspace, handle=handle)
 
-    return tuple(buffer_callback(run, (*results, scratch))(*xs)[:-1])
+    call = jax_internals.buffer_callback(run, (*results, scratch))
+    return tuple(call(*xs)[:-1])
 
 
 # XLA calls each device's callback from that device's thread. Two threads must not

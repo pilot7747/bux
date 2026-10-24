@@ -21,7 +21,7 @@ from bux import parallel
 from bux.architecture import Model
 from bux.lang import compile
 from bux.parallel import flash, methods
-from bux.parallel.context import AttentionArgs
+from bux.parallel.context import SCAN_ROWS, AttentionArgs, document_starts
 from bux.train import config as tcfg
 from bux.train.data import Batch
 from bux.train.objective import objective
@@ -168,7 +168,8 @@ def test_every_method_takes_its_softmax_in_float32(kernels, method):
 @pytest.mark.parametrize(("ids", "sends"), [(IDS, False), (None, True)])
 def test_ring_gathers_the_keys_and_sends_only_zigzag_queries(ids, sends):
     """The keys and values are gathered, and nothing goes round; without documents or
-    a window the queries go zigzag and back by collective-permutes."""
+    a window the queries go zigzag and back by collective-permutes. (The documents'
+    starts, a prefix scan of their ids, send int32s round.)"""
     q, k, v, sinks, _ = attention(Case(4, 2))
     seen = Case(4, 2, ids).visibility(sinks)
     with parallel.use(tcfg.MeshConfig(context=4, fsdp=2)) as mesh:
@@ -176,8 +177,11 @@ def test_ring_gathers_the_keys_and_sends_only_zigzag_queries(ids, sends):
         q, k, v = (jax.device_put(x, put) for x in (q, k, v))
         f = jax.jit(lambda q, k, v: methods.attention.find("ring")(q, k, v, seen))
         text = f.lower(q, k, v).compile().as_text()
-    assert text is not None and ("collective-permute" in text) == sends
-    gathered = [line for line in text.splitlines() if " all-gather(" in line]
+    assert text is not None
+    lines = text.splitlines()
+    permuted = [line for line in lines if " collective-permute(" in line]
+    assert any(" f32[" in line.split("=")[1] for line in permuted) == sends
+    gathered = [line for line in lines if " all-gather(" in line]
     assert any(" f32[" in line.split("=")[1] for line in gathered)
 
 
@@ -247,6 +251,19 @@ def test_cudnns_packed_layout_has_where_each_document_starts_and_its_length():
     assert lengths.tolist() == [[5, 7, 4, -1], [16, -1, -1, -1]]
     assert starts.tolist() == [[0, 5, 12, -1, -1], [0, -1, -1, -1, -1]]
     assert int(flash.documents_in(IDS)) == 3
+
+
+@pytest.mark.parametrize("t", [64, SCAN_ROWS + 64])
+def test_documents_start_where_their_ids_change_by_cummax_or_a_prefix_scan(t):
+    """XLA's cummax in rows of up to SCAN_ROWS, a prefix scan in longer ones."""
+    lengths = np.random.default_rng(t).integers(1, 50, t)
+    ids = np.repeat(np.arange(t), lengths)[None, :t].astype(np.int32)  # 1-49 tokens
+    new = np.ones(ids.shape, bool)
+    new[:, 1:] = ids[:, 1:] != ids[:, :-1]
+    want = np.maximum.accumulate(np.where(new, np.arange(t), 0), axis=1)
+    assert (np.asarray(document_starts(jnp.asarray(ids))) == want).all()
+    jaxpr = jax.make_jaxpr(document_starts)(ids)
+    assert any(e.primitive.name == "cummax" for e in jaxpr.eqns) == (t <= SCAN_ROWS)
 
 
 def test_the_gpu_kernels_say_what_they_need_on_a_cpu():

@@ -169,5 +169,4 @@ microbatch. A second launch with JAX's cache on a shared filesystem reaches step
 - MXFP8 experts are slower than bf16: the Triton GEMM loads its scales by registers.
 - TransformerEngine-JAX (NCCL-EP, collective GEMM) needs a CUDA 13 build in the image.
 - The image lacks libibverbs until it is rebuilt from the new `Dockerfile`.
-- `bux plan`'s collective bytes per mesh axis, `remat=auto`, and naming the weights
-  FSDP gathers.
+- `bux plan`'s collective bytes per mesh axis, and naming the weights FSDP gathers.

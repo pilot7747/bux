@@ -1,20 +1,19 @@
-"""Fixtures: a tokenizer and a corpus that need no network, and runs trained on
-8 devices.
+"""Fixtures: a tokenizer and a corpus that need no network, runs trained on 8
+devices, the equations of a jaxpr, a function's outputs and gradients, and what its
+backward pass keeps.
 
-First, before anything starts JAX, it gets 8 CPU devices, so that the tests split runs
-over them and compare with one; and before anything imports bux, jaxtyping instruments
-the packages that handle arrays, so that every call the tests make checks the dtype and
-shape of every array into and out of a function, with beartype taking an int where a
-float goes, as a static type checker does. (Its --jaxtyping-packages flag takes one
-package with that checker.)
+First, before anything imports bux, jaxtyping instruments the packages that handle
+arrays, so that every call the tests make checks the dtype and shape of every array
+into and out of a function, with beartype taking an int where a float goes, as a static
+type checker does. (Its --jaxtyping-packages flag takes one package with that checker.)
+Then, before anything starts JAX, it gets 8 CPU devices, so that the tests split runs
+over them and compare with one, and bux's XLA flags, as `bux train` sets them: the
+tests that need a GPU run with them too.
 """
 
 import os
 
 os.environ.setdefault("JAX_PLATFORMS", "cpu")
-os.environ["XLA_FLAGS"] = (
-    os.environ.get("XLA_FLAGS", "") + " --xla_force_host_platform_device_count=8"
-)
 os.environ.setdefault("JAX_COMPILATION_CACHE_DIR", "")  # the command line's, off
 
 import jaxtyping
@@ -24,14 +23,27 @@ jaxtyping.install_import_hook(
     "beartype.beartype(conf=beartype.BeartypeConf(is_pep484_tower=True))",
 )
 
+from bux import runtime
+
+os.environ["XLA_FLAGS"] = runtime.xla_flags(
+    os.environ.get("XLA_FLAGS", "") + " --xla_force_host_platform_device_count=8"
+)
+
 import itertools
 import json
+from collections.abc import Callable, Iterator
 
+import jax
+import jax.numpy as jnp
 import numpy as np
 import pyarrow as pa
 import pyarrow.parquet as pq
 import pytest
+from jax.extend.core import Jaxpr, JaxprEqn, jaxprs_in_params
+from jaxtyping import Array, Float, Shaped
 
+from bux import parallel
+from bux.architecture.recurrent.linear_attention import States
 from bux.lang import compile_runs
 from bux.train import config as tcfg
 from bux.train.sinks import Sink
@@ -95,6 +107,51 @@ def corpus(folder, n=600) -> str:
         pa.table({"text": texts[n // 2 :]}), folder / "b.parquet", row_group_size=50
     )
     return str(folder / "*.parquet")
+
+
+def equations(jaxpr: Jaxpr, times: int = 1) -> Iterator[tuple[JaxprEqn, int]]:
+    """Every equation of `jaxpr` and of the jaxprs inside it, with how many times it
+    runs: a scan's body as many times as the scan's length."""
+    for e in jaxpr.eqns:
+        yield e, times
+        inner = times * e.params["length"] if e.primitive.name == "scan" else times
+        for sub in jaxprs_in_params(e.params):
+            yield from equations(sub, inner)
+
+
+def count(jaxpr: Jaxpr, primitive: str) -> int:
+    """How many equations of `primitive` `jaxpr` has, in the jaxprs inside it too."""
+    return sum(e.primitive.name == primitive for e, _ in equations(jaxpr))
+
+
+def outputs_and_grads(
+    f: Callable[..., Float[Array, "..."]], *args: Float[Array, "..."]
+) -> list[Float[Array, "..."]]:
+    """f's outputs, then the gradients for each of `args` of a weighted sum of them,
+    each output weighted by the cosine of its index."""
+
+    def loss(
+        *args: Float[Array, "..."],
+    ) -> tuple[Float[Array, ""], Float[Array, "..."]]:
+        out = f(*args)
+        return (out * jnp.cos(jnp.arange(out.size)).reshape(out.shape)).sum(), out
+
+    grads, out = jax.grad(loss, tuple(range(len(args))), has_aux=True)(*args)
+    return [out, *grads]
+
+
+def kept_bytes(
+    f: Callable[..., Float[Array, "..."]], *args: Float[Array, "..."], states: States
+) -> int:
+    """The bytes f's backward pass keeps, on one device, by `methods(states=...)`."""
+
+    def kept(*args: Float[Array, "..."]) -> list[Shaped[Array, "..."]]:
+        return jax.tree.leaves(jax.vjp(f, *args)[1])
+
+    methods = tcfg.MethodsConfig(states=states)
+    with parallel.use(tcfg.MeshConfig(data=1), methods=methods):
+        shapes = jax.eval_shape(kept, *args)
+    return sum(x.size * x.dtype.itemsize for x in shapes)
 
 
 # What `losses` trains with, unless the source or its settings say otherwise.

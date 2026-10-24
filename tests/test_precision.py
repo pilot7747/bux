@@ -8,8 +8,8 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 import pytest
+from conftest import count
 from flax import nnx
-from jax.extend.core import ClosedJaxpr, Jaxpr
 from jax.sharding import NamedSharding
 from jax.sharding import PartitionSpec as P
 from jaxtyping import Array, Float
@@ -24,7 +24,7 @@ from bux.architecture.precision import blockscaled, matmuls, nvfp4
 from bux.architecture.recurrent.linear_attention import delta_rule, l2norm, recurrence
 from bux.architecture.recurrent.ssm import selective_scan
 from bux.architecture.registry import Taps
-from bux.architecture.repeats import remat
+from bux.architecture.repeats import tracing
 from bux.lang import BuxError, compile_runs
 from bux.train import config as tcfg
 from bux.train.data import Batch, plain
@@ -278,10 +278,7 @@ def test_nvfp4_tiles_quantize_w_as_its_transpose():
     w = jax.random.normal(jax.random.key(0), (64, 32))
 
     def dequantized(w: Float[Array, "r c"]) -> Float[Array, "r c"]:
-        q = blockscaled.nv_quantize(w, tiles=True)
-        scales = jnp.repeat(q.scales.astype(jnp.float32), 16, axis=1)
-        assert q.scale is not None
-        return q.values.astype(jnp.float32) * scales * q.scale
+        return blockscaled.dequantized(nvfp4.quantize(w, tiles=True))
 
     assert jnp.array_equal(dequantized(w), dequantized(w.T).T)
     assert 0.05 < _error(dequantized(w), w) < 0.2
@@ -294,7 +291,7 @@ def test_nvfp4_rounds_gradients_stochastically_and_unbiased():
     rest = np.arange(64) % 16 != 0
 
     def values(stochastic: bool = False) -> Float[Array, "r c"]:
-        q = blockscaled.nv_quantize(x, stochastic=stochastic)
+        q = nvfp4.quantize(x, stochastic=stochastic)
         return q.values.astype(jnp.float32)[:, rest]
 
     assert jnp.unique(values()).size == 1
@@ -307,12 +304,23 @@ def test_stochastic_rounding_rounds_as_blackwells_conversion_does():
     # up to 8 bits, and its random byte add up to 1, so also where they fall just short.
     v = jnp.array([0.771353, -2.656003, -3.879317, 1.25, 1.25, 1.125, 1.125])
     byte = jnp.array([117, 88, 30, 127, 128, 191, 192])
-    rounded = blockscaled.round_stochastically(v, byte * 2.0**-8)
+    rounded = nvfp4.round_stochastically(v, byte * 2.0**-8)
     assert rounded.tolist() == [1.0, -3.0, -4.0, 1.0, 1.5, 1.0, 1.5]
 
 
+def test_mxfp8_rows_pack_into_bytes_and_back():
+    x = jax.random.normal(jax.random.key(0), (8, 64)) * 3
+    blocks = blockscaled.mx_quantize(x)
+    packed = blockscaled.mx_packed(blocks)
+    assert packed.dtype == jnp.uint8 and packed.shape == (8, 64 + 2)
+    back = blockscaled.mx_unpacked(packed, 64)
+    assert jnp.array_equal(
+        blockscaled.dequantized(back), blockscaled.dequantized(blocks)
+    )
+
+
 def test_the_hadamard_transform_is_orthogonal():
-    h = blockscaled.HADAMARD
+    h = nvfp4.HADAMARD
     assert np.allclose(h @ h.T, np.eye(16), atol=1e-6) and set(np.abs(h).flat) == {0.25}
 
 
@@ -349,11 +357,11 @@ def test_the_nvfp4_kernels_quantize_as_xla_does_on_any_split(spec, kind):
     with parallel.use(tcfg.MeshConfig(data=4, tensor=2)) as mesh:
         split = jax.device_put(x, NamedSharding(mesh, spec))
         kernel = jax.jit(lambda x, s: nvfp4.kernel_twice(x, s, **kind))(split, seed)
-    xla = blockscaled.nv_twice(x, seed, **kind)
+    xla = nvfp4.xla_twice(x, seed, **kind)
     for ours, theirs in zip(kernel, xla, strict=True):
         for a, b in [(ours.values, theirs.values), (ours.scales, theirs.scales)]:
             assert jnp.array_equal(a.astype(jnp.float32), b.astype(jnp.float32))
-        assert ours.scale == theirs.scale
+        assert ours.tensor_scale == theirs.tensor_scale
 
 
 def test_block_projections_multiply_in_the_format_and_the_router_and_head_in_compute():
@@ -368,7 +376,7 @@ def test_block_projections_multiply_in_the_format_and_the_router_and_head_in_com
             return [head.logits() for head in heads]
 
     # The up, gate and down of 2 FFNs and of 2 MoEs' shared experts.
-    assert _count(jax.make_jaxpr(run)().jaxpr, "scaled_matmul_wrapper") == 12
+    assert count(jax.make_jaxpr(run)().jaxpr, "scaled_matmul_wrapper") == 12
 
 
 @pytest.mark.parametrize("fmt", FORMATS)
@@ -441,14 +449,9 @@ def test_a_format_not_registered_is_an_error():
 
 def test_mxfp8_2d_quantizes_w_as_its_transpose():
     w = jax.random.normal(jax.random.key(0), (64, 96))
-    rows, columns = blockscaled.mx_tiles_twice(w)
-
-    def dequantized(q: blockscaled.Blocks) -> Float[Array, "r c"]:
-        scales = jnp.repeat(q.scales.astype(jnp.float32), 32, axis=1)
-        return q.values.astype(jnp.float32) * scales
-
-    assert jnp.array_equal(dequantized(rows), dequantized(columns).T)
-    assert 0.01 < _error(dequantized(rows), w) < 0.06
+    rows, columns = map(blockscaled.dequantized, blockscaled.mx_tiles_twice(w))
+    assert jnp.array_equal(rows, columns.T)
+    assert 0.01 < _error(rows, w) < 0.06
 
 
 def _multiplied(passes: tuple[tcfg.Pass, ...]) -> list:
@@ -488,7 +491,7 @@ def _block_scaled(model: Model, precision: tcfg.PrecisionConfig) -> int:
         with matmuls.use(precision):
             return [head.logits() for head in forward(model, _batch())]
 
-    return _count(jax.make_jaxpr(run_forward)().jaxpr, "scaled_matmul_wrapper")
+    return count(jax.make_jaxpr(run_forward)().jaxpr, "scaled_matmul_wrapper")
 
 
 @pytest.mark.parametrize("given", QUANTIZED)
@@ -545,10 +548,10 @@ def test_branches_are_numbered_as_they_run_scanned_or_not(arch):
     methods = tcfg.MethodsConfig(repeat="scan")
     with parallel.use(tcfg.MeshConfig(data=1), methods=methods):
         model = Model(run.arch, rngs=nnx.Rngs(0))
-        with matmuls.forward(model.main_branches):
+        with tracing.forward(model.main_branches):
             model.graph(tokens, Taps(tokens=tokens))
-            ran = matmuls._COUNT.get()
-    assert ran is not None and (model.main_branches, ran.next) == (main, every)
+            [after] = tracing.next_branches(1)
+    assert (after.main, after.number) == (main, every)
 
 
 EDGES = [
@@ -568,7 +571,7 @@ def _formats_traced(
     seen, of = {}, matmuls.format_of
 
     def recorded(role: str | None) -> str:
-        seen[remat._PASS.get(), role] = fmt = of(role)
+        seen[tracing.current_pass(), role] = fmt = of(role)
         return fmt
 
     monkeypatch.setattr(matmuls, "format_of", recorded)
@@ -577,8 +580,7 @@ def _formats_traced(
         with matmuls.use(run.train.precision):
             forward(model, _batch())
     monkeypatch.setattr(matmuls, "format_of", of)
-    # A scan's trial of a pass, which never runs, traces it outside any pass.
-    return {key: fmt for key, fmt in seen.items() if key[0] is not None}
+    return seen
 
 
 @pytest.mark.parametrize(("source", "given"), EDGES)
@@ -638,14 +640,16 @@ GROUPED = {
     "roles=roles(experts=mxfp8)": 4,
     "roles=roles(experts=mxfp8_2d)": 4,
     "matmuls=nvfp4, roles=roles(experts=mxfp8)": 4,
-    "matmuls=mxfp8": 0,  # none is compute, for the experts
+    "matmuls=mxfp8": 4,  # none is matmuls, where a grouped GEMM takes it
+    "matmuls=mxfp8_2d": 4,
+    "matmuls=nvfp4": 0,  # else compute
     "matmuls=mxfp8, roles=roles(experts=compute)": 0,
     "roles=roles(experts=mxfp8), first=1": 2,  # the first MoE is the first branch
 }
 
 
 @pytest.mark.parametrize("given", GROUPED)
-def test_the_routed_experts_multiply_as_their_role_says_and_else_in_compute(
+def test_the_routed_experts_multiply_as_their_role_says_else_as_grouped_matmuls(
     monkeypatch, given
 ):
     calls, ragged_dot = [], grouped_blockscaled.ragged_dot
@@ -661,6 +665,25 @@ def test_the_routed_experts_multiply_as_their_role_says_and_else_in_compute(
     model = parallel.build(lambda: Model(run.arch, rngs=nnx.Rngs(0)))
     _block_scaled(model, run.train.precision)
     assert len(calls) == GROUPED[given]
+
+
+def _moe_id(precision: str) -> str:
+    [run] = compile_runs(_source(f"precision = {precision}", arch=ARCHITECTURES["moe"]))
+    return run.id
+
+
+def test_experts_that_take_mxfp8_from_matmuls_have_the_id_of_those_that_name_it():
+    """As they took compute before: a run that names their format keeps its id, and
+    one whose experts now multiply in MXFP8 takes a new one, as a launch must not find
+    it done."""
+    mxfp8 = "precision(compute=bfloat16, matmuls=mxfp8"
+    assert _moe_id(f"{mxfp8})") == _moe_id(f"{mxfp8}, roles=roles(experts=mxfp8))")
+    assert _moe_id(f"{mxfp8})") == "eba704299d"  # was 323f1a9b03
+    assert _moe_id(f"{mxfp8}, roles=roles(experts=compute))") == "7634531ac3"
+    assert _moe_id("precision(compute=bfloat16, matmuls=nvfp4)") == "cdc149c7c0"
+    assert _moe_id(BF16) == "c4987ef180"
+    [dense] = compile_runs(_source(f"precision = {mxfp8})"))
+    assert dense.id == "f66305703c"  # no experts: as before
 
 
 # In float32, as above; but the experts' dW quantizes in blocks of 32 of the rows each
@@ -887,20 +910,6 @@ def _sizes(mesh: str) -> dict[str, int]:
     """mesh(fsdp=2, tensor=4) as {"fsdp": 2, "tensor": 4}."""
     inside = mesh.removeprefix("mesh(").removesuffix(")")
     return {k: int(v) for k, v in (kv.split("=") for kv in inside.split(", "))}
-
-
-def _count(jaxpr: Jaxpr, primitive: str) -> int:
-    """How many times `primitive` runs in `jaxpr`, inside the jaxprs it calls too."""
-    n = 0
-    for eqn in jaxpr.eqns:
-        n += eqn.primitive.name == primitive
-        for param in eqn.params.values():
-            for sub in param if isinstance(param, tuple | list) else (param,):
-                if isinstance(sub, ClosedJaxpr):
-                    sub = sub.jaxpr
-                if isinstance(sub, Jaxpr):
-                    n += _count(sub, primitive)
-    return n
 
 
 def _counts(model: Model) -> list[int]:

@@ -7,12 +7,14 @@ import jax.numpy as jnp
 import numpy as np
 import pytest
 from jax.profiler import ProfileData
+from jaxtyping import Int
 
+from bux import parallel
 from bux.lang import BuxError, compile_runs
 from bux.parallel import methods
 from bux.parallel.context import AttentionArgs
 from bux.train import config as tcfg
-from bux.train import flops, trace, xla
+from bux.train import flops, trace, trainer, xla
 
 MODEL = """
 d_model = 32
@@ -144,28 +146,67 @@ def test_intervals_merge_and_overlap():
 # --- MFU ------------------------------------------------------------------------------
 
 
+def one_document(t: int) -> Int[np.ndarray, "1 t"]:
+    return np.arange(t)[None]
+
+
 @pytest.mark.parametrize("window", [None, 5, 16, 40])
 def test_the_causal_share_is_the_logits_a_query_sees_of_t_by_t(window):
     t = 16
     seen = np.tril(np.ones((t, t)))
     if window is not None:
         seen = np.triu(seen, -(window - 1))
-    assert flops.causal_share(t, window) == seen.sum() / t**2
+    within = flops._within(one_document(t))
+    assert flops.Mask(window).share(within) == seen.sum() / t**2
 
 
-@pytest.mark.parametrize("window", [None, 4])
-def test_attention_counts_only_what_its_mask_keeps_forward_and_backward(window):
+def test_a_mask_sees_each_document_s_own_triangle_and_at_most_its_top_k():
+    positions = np.array([[0, 1, 2, 0, 1, 2, 3, 0], [0, 1, 2, 3, 4, 5, 6, 7]])
+    within = flops._within(positions)
+    seen = np.array([[1, 2, 3, 1, 2, 3, 4, 1], [1, 2, 3, 4, 5, 6, 7, 8]])
+    assert flops.Mask().share(within) == seen.mean() / 8
+    assert flops.Mask(window=3).share(within) == np.minimum(seen, 3).mean() / 8
+    assert flops.Mask(top_k=2).share(within) == np.minimum(seen, 2).mean() / 8
+    picks = flops.Mask(top_k=2, picks=True).share(within)
+    assert picks == np.minimum(seen, 2).mean() / 2
+
+
+def xla_attention_flops(window, ids=None):
     b, t, h, g, d = 2, 16, 4, 2, 8
     q = jax.ShapeDtypeStruct((b, t, h, d), jnp.float32)
     kv = jax.ShapeDtypeStruct((b, t, g, d), jnp.float32)
-    args = AttentionArgs(None, window, d**-0.5, None, None)
+    args = AttentionArgs(ids, window, d**-0.5, None, None)
     xla = methods.attention.find("xla")
 
     def loss(q, k, v):
         return xla(q, k, v, args).sum()
 
-    logits_and_values = 2 * 2 * b * h * t * t * d
-    share = flops.causal_share(t, window)
-    assert flops.count(loss, q, kv, kv) == share * logits_and_values
     backward = jax.grad(loss, argnums=(0, 1, 2))
-    assert flops.count(backward, q, kv, kv) == 3 * share * logits_and_values
+    every_key = 2 * 2 * b * h * t * t * d  # the logits and the weighted values
+    return flops.count(loss, q, kv, kv), flops.count(backward, q, kv, kv), every_key
+
+
+@pytest.mark.parametrize("window", [None, 4])
+def test_attention_counts_only_what_its_mask_keeps_forward_and_backward(window):
+    forward, backward, every_key = xla_attention_flops(window)
+    assert forward == flops.Work(0.0, {flops.Mask(window): every_key})
+    assert backward == flops.Work(0.0, {flops.Mask(window): 3 * every_key})
+    share = flops.Mask(window).share(flops._within(one_document(16)))
+    assert forward.one_document(16) == share * every_key
+
+
+def test_attention_on_packed_documents_counts_each_document_s_triangle():
+    forward, _, every_key = xla_attention_flops(None)
+    positions = np.tile(np.arange(4), 4)[None]  # 4 documents of 4 tokens
+    assert forward.of(positions) == every_key * (4 * 10) / 16**2
+
+
+def test_mfu_counts_the_rows_this_process_read(monkeypatch):
+    """In a job of many processes, the rows of a batch that the others read are 0
+    here: as documents of a token each, they would count almost no attention."""
+    forward, _, _ = xla_attention_flops(None)
+    whole = np.tile(np.arange(16, dtype=np.int32), (4, 1))
+    read = np.where(np.arange(4)[:, None] < 2, whole, 0)  # rows 2 and 3 another's
+    monkeypatch.setattr(parallel, "local_rows", lambda rows, t: np.arange(2))
+    assert forward.of(read) < 0.6 * forward.of(whole)
+    assert forward.of(trainer.rows_read(read)) == forward.of(whole)

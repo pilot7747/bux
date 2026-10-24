@@ -52,6 +52,7 @@ from bux.parallel.context import (
     softcap,
     weighted_values,
 )
+from bux.train import flops
 
 Names = tuple[parallel.Name, parallel.Name]  # a projection's input and output
 SoftmaxConfig = cfg.GQAConfig | cfg.MLAConfig | cfg.CSAConfig
@@ -626,14 +627,23 @@ class Sparse(FullLogits):
         taps: Taps,
     ) -> Float[Array, "b t h dv"]:
         """Return `_attend_kept` over the tokens the queries keep of their window and
-        document."""
+        document. For MFU, the indexer ranks every key a query may attend to, and the
+        attention and the indexer's loss see the ones it keeps."""
         q, k, v = heads
         rows = documents_or_rows(docs, *x.shape[:2])
         span = sparse.token_span(rows, self.window)
-        kept, scored = self._select_tokens(x, query, rows, span, taps)
-        return self._attend_kept(
-            x, q, [sparse.Part(k, v, span, None, kept)], docs, scored, taps
-        )
+        with flops.attention(self.window):
+            kept, scored = self._select_tokens(x, query, rows, span, taps)
+        part = sparse.Part(k, v, span, None, kept)
+        with flops.attention(self.window, self._picks(kept)):
+            return self._attend_kept(x, q, [part], docs, scored, taps)
+
+    def _picks(self, kept: sparse.Kept | None) -> int | None:
+        """Return how many keys a query keeps at most: the indexer's top_k, or as many
+        as the index port's; None for every one."""
+        if kept is None:
+            return None
+        return kept.index.shape[-1] if self.indexer is None else self.indexer.top_k
 
 
 class FullLogitsAttention(FullLogits, Attention):

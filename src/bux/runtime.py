@@ -1,4 +1,5 @@
-"""What bux sets for JAX before it trains: XLA's flags, and a cache of compiled steps.
+"""What bux sets for JAX before it trains: XLA's flags, NCCL EP's settings, and a cache
+of compiled steps.
 
 `bux train`, `bux launch` and a sweep's workers call ``configure`` before anything
 starts a backend. A flag that XLA_FLAGS sets already keeps its value. Compiled
@@ -19,13 +20,18 @@ from collections.abc import Mapping, MutableMapping, Sequence
 from pathlib import Path
 
 import jax
-from jax._src import distributed
+
+from bux import jax_internals
 
 # GPU flags, which XLA takes on any backend and a CPU ignores.
 XLA_FLAGS = (
     # Without it, ragged_all_to_all (expert parallelism's dispatch) hangs on B300s.
     "--xla_gpu_experimental_ragged_all_to_all_use_barrier_with_nccl=false",
 )
+# NCCL EP's settings (methods(moe=nccl_ep)), where the environment sets none: GIN by a
+# CPU proxy, and 256 tokens a chunk between nodes. On two B300 nodes, GDAKI (its
+# default) took 3x as long for an EP layer's exchanges, and chunks of 64 1.3x.
+NCCL_DEFAULTS = {"NCCL_GIN_TYPE": "2", "NCCL_EP_TOKENS_PER_CHUNK": "256"}
 TIMEOUT_MS = 10 * 60 * 1000  # for the other processes to reach the same point
 
 
@@ -46,9 +52,12 @@ def cache_dir(env: Mapping[str, str] = os.environ) -> Path:
 
 
 def configure(env: MutableMapping[str, str] = os.environ) -> None:
-    """Add bux's flags to XLA_FLAGS in `env`, and keep compiled programs in
-    JAX_COMPILATION_CACHE_DIR, `cache_dir` unless it is set. Workers inherit both."""
+    """Add bux's flags to XLA_FLAGS in `env` and NCCL EP's settings, and keep compiled
+    programs in JAX_COMPILATION_CACHE_DIR, `cache_dir` unless it is set. Workers
+    inherit them all."""
     env["XLA_FLAGS"] = xla_flags(env.get("XLA_FLAGS", ""))
+    for name, value in NCCL_DEFAULTS.items():
+        env.setdefault(name, value)
     env.setdefault("JAX_COMPILATION_CACHE_DIR", str(cache_dir(env)))
     jax.config.update(
         "jax_compilation_cache_dir", env["JAX_COMPILATION_CACHE_DIR"] or None
@@ -64,12 +73,12 @@ def agree_on_cache() -> None:
     from its cache waits a day. Only the first process writes the cache, so where each
     host has one of its own, the first would load what the others compile."""
     folder = jax.config.jax_compilation_cache_dir
-    alone = (distributed.global_state.num_processes or 1) == 1
-    if alone or not folder or "://" in folder:  # gs:// and the like: one for all
+    me, n = jax_internals.processes()
+    if n == 1 or not folder or "://" in folder:  # gs:// and the like: one for all
         return
     if not shared(Path(folder)):
         jax.config.update("jax_compilation_cache_dir", None)
-        if distributed.global_state.process_id == 0:
+        if me == 0:
             warnings.warn(
                 f"JAX's cache in {folder} is this host's alone, so it is off, and "
                 "every launch compiles every program: a JAX_COMPILATION_CACHE_DIR on "
@@ -82,8 +91,8 @@ def shared(folder: Path) -> bool:
     """Whether `folder` is the same directory for every process of the job: a file
     that the first makes there, the others see. Every process calls it; they talk
     through jax.distributed's key-value store, so that nothing compiles."""
-    client = distributed.global_state.client
-    me, n = distributed.global_state.process_id, distributed.global_state.num_processes
+    client = jax_internals.key_value_store()
+    me, n = jax_internals.processes()
     assert client is not None, "the processes have not joined"
     if me == 0:
         made = f".bux-{secrets.token_hex(8)}"

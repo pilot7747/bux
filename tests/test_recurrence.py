@@ -2,6 +2,7 @@
 against `scan` on one device, with the positions split over `context` on the 8 CPU
 devices the tests have, and documents that cross the devices' chunks."""
 
+import functools
 import re
 from collections.abc import Callable
 
@@ -10,6 +11,7 @@ import jax.numpy as jnp
 import numpy as np
 import optax
 import pytest
+from conftest import outputs_and_grads
 from flax import nnx
 from jaxtyping import Array, Float, Int
 
@@ -101,15 +103,9 @@ FORMS: dict[str, tuple[Callable[..., Float[Array, "b t h v"]], tuple]] = {
 
 def _grads(
     f: Callable[..., Float[Array, "b t h v"]], args: tuple
-) -> tuple[Float[Array, "b t h v"], tuple]:
+) -> tuple[Float[Array, "b t h v"], list]:
     """f's outputs, and the gradients of a weighted sum of them for every input."""
-
-    def loss(*args):
-        out = f(*args)
-        return (out * jnp.cos(jnp.arange(out.size)).reshape(out.shape)).sum(), out
-
-    argnums = tuple(range(len(args)))
-    grads, out = jax.jit(jax.grad(loss, argnums=argnums, has_aux=True))(*args)
+    out, *grads = jax.jit(functools.partial(outputs_and_grads, f))(*args)
     return out, grads
 
 

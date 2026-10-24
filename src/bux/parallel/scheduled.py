@@ -1,30 +1,21 @@
-"""Pipelines that take each microbatch's backward through the stages by hand: the
-methods ``1f1b`` and ``zbh1`` of `methods.pipeline`, at the ticks of their tables
-(bux.parallel.schedule).
+"""Pipelines that run each microbatch's backward themselves, at the ticks of a table
+(bux.parallel.schedule): the methods ``1f1b`` and ``zbh1`` of `methods.pipeline`.
 
-gpipe and circular run the forward alone, and JAX's transpose of their scan of ticks
-is the backward: every microbatch's residuals stay until it. Here a stage runs an op
-in each slot of a tick, and keeps each microbatch's residuals only from its forward
-to its backward. The forward is a ``jax.vjp``, whose residuals are a pytree of
-arrays: a few microbatches' of them sit in a buffer (``Held``), and the backward
-rebuilds the vjp from its slot. The parameters are not saved with each, as they do
-not change in a step (``saveable_args``).
+gpipe's backward is JAX's transpose of its scan of ticks, so a stage keeps every
+microbatch's residuals until the step ends. Here a stage's forward is a ``jax.vjp``,
+whose residuals sit in a slot of a buffer (``Held``) only until the backward rebuilds
+the vjp from them. A backward needs the loss's gradient, so these pipelines take the
+whole model, cut at the pipelined repeat (``Parts``): the first stage runs the part
+before the repeat, and the last stage the part after it, to the loss. On each stage:
 
-A backward needs the gradient of the loss as soon as the last stage has run its
-microbatch forward, so these pipelines take the whole model, cut at the pipelined
-repeat (``Parts``): the first stage runs the part before the repeat (the embedding)
-on each microbatch, and the last stage the part after it (the head and the loss). A
-training step asks for the ``gradients`` (``active``); a forward alone, as an eval's,
-runs gpipe's.
+    a lax.scan over the table's ticks; at each tick,
+        each lane:  F, B or W on the lane's microbatch, each kind under a lax.cond
+        then:       a ppermute sends F's output on, and one sends B's input gradient back
 
-    a lax.scan over the table's ticks; at each, every stage runs its ops slot by slot,
-    each under a lax.cond, then sends its forward's output on and its backward's
-    input gradient back, a ppermute each way
-
-The stages' gradients add up in float32 on their own devices, and those of the parts
-before and after the repeat on the first and last stage, summed over the stages as
-they leave. Where the step computes its rows apart (``gather.apart``), each device
-runs its own rows, and every gradient sums over the rows' axes once, at the end.
+The gradients add up in float32 on each stage. Those of the parts outside the repeat
+sum over the stages as they leave, and where each device runs its own rows
+(``gather.apart``), every gradient sums over the rows' axes once, at the end. A
+forward alone, an eval's, runs gpipe's.
 """
 
 import functools
@@ -34,28 +25,45 @@ from typing import Any, NamedTuple
 import jax
 import jax.numpy as jnp
 import numpy as np
-from jax._src.api import VJP, NotNeeded, NotSaveable
 from jax.sharding import PartitionSpec as P
 from jaxtyping import Array, Float, Int, PyTree, Shaped
 
+from bux import jax_internals
 from bux.parallel import gather, methods, pipeline, schedule, split
-from bux.parallel.pipeline import AXIS, Out, Stage, _at, _by_round, _by_stage, _put
+from bux.parallel.pipeline import (
+    AXIS,
+    Out,
+    Stage,
+    add_axes,
+    at,
+    first,
+    join_stages,
+    put,
+    send,
+    split_by_stage,
+    stand_ins,
+)
+from bux.parallel.schedule import BACKWARD, CODES, FORWARD, WEIGHTS
 
-SENT = ("inputs", "cotangents")  # the buffers each tick's sends are written into
+SENT = ("inputs", "cotangents")  # the buffers what the stages send arrives in
 Metrics = dict[str, Float[Array, ""]]
 Stream = Shaped[Array, "n t *r"]  # one microbatch's
+Losses = Float[Array, "l k"]  # what a stage's layers report: (layers, reports)
 Vjp = Callable[..., Any]  # a jax.vjp function: a pytree of its residuals
 Leaf = Shaped[Array, "..."]  # one of a vjp's residuals, or a gradient
 
 
 class Parts(NamedTuple):
-    """A model cut at its pipelined repeat, as functions of arrays alone, each run on
-    one microbatch's `rows`: `first` up to the repeat, ``(others, kept, rows) -> (x,
-    kept)``; `stage`, a stage's share of the repeat (``pipeline.Stage``), whose
-    losses' names and weights `reports` gives once it has traced; and `last`, from the
-    repeat to the loss, ``(others, kept, rows, y) -> (loss, metrics)``. `others` are
-    the parameters outside the repeat, and `kept` the rest of their state, which the
-    part before the repeat may change, as dropout counts its masks."""
+    """A model cut at its pipelined repeat, each part a function of arrays alone, run
+    on one microbatch's `rows`:
+
+        first(others, kept, rows) -> (x, kept)            up to the repeat
+        stage(params, rest, x, rows) -> (y, rest, losses)  a stage's share of it
+        last(others, kept, rows, y) -> (loss, metrics)    from the repeat to the loss
+
+    `others` are the parameters outside the repeat and `kept` the rest of their state,
+    which `first` may change, as dropout counts its masks. `reports` gives the names
+    and weights of the losses the stage's layers report, once `stage` has traced."""
 
     first: Callable[[PyTree, PyTree, PyTree], tuple[Stream, PyTree]]
     stage: Stage
@@ -64,11 +72,11 @@ class Parts(NamedTuple):
 
 
 class Gradients(NamedTuple):
-    """A step of a scheduled pipeline: the gradients of the stages' parameters, each
-    leaf (rounds, layers, ...) as they came, and of the parameters outside the repeat;
-    the layers' state and the rest of the model's as the forwards leave them; and
-    the metrics, summed over the microbatches, with the means of the losses the
-    layers report."""
+    """What a step of a scheduled pipeline returns: the gradients of the stages'
+    parameters, each leaf (rounds, layers, ...), and of the parameters outside the
+    repeat; the state of the layers and of the rest of the model as the forwards
+    leave them; and the metrics, summed over the microbatches, with the means of the
+    losses the layers report."""
 
     params: PyTree
     others: PyTree
@@ -124,14 +132,14 @@ class Scheduled:
             axis_names={AXIS, *apart},
             check_vma=False,  # else nested shard_maps' gradients fail to lower
         )(
-            _by_stage(params, table.stages),
-            _by_stage(rest, table.stages),
+            split_by_stage(params, table.stages),
+            split_by_stage(rest, table.stages),
             others,
             kept,
             rows,
         )
-        kept = jax.tree.map(lambda a: a[0], kept)  # as the first stage leaves it
-        return Gradients(_by_round(grads), outside, _by_round(rest), kept, metrics)
+        kept = first(kept)  # as the first stage leaves it
+        return Gradients(join_stages(grads), outside, join_stages(rest), kept, metrics)
 
 
 def active() -> Scheduled | None:
@@ -145,32 +153,45 @@ for _name in schedule.TABLES:
 
 
 class Held(NamedTuple):
-    """What a stage holds between ticks. The buffers of what the stages send have a
-    slot more than the table needs, which takes what a tick sends nobody."""
+    """What a stage holds from tick to tick: buffers of a slot per microbatch held
+    (``schedule.Table.buffer_slots``), the state as the forwards leave it, and sums."""
 
     inputs: Shaped[Array, "k n t *r"]  # the stream the stage before sent
     cotangents: Shaped[Array, "k n t *r"]  # the gradient the stage after sent
     residuals: list[Shaped[Array, "k ..."]]  # each forward's vjp, until its backward
-    firsts: list[Shaped[Array, "k ..."]]  # the vjp of the part before, on stage 0
-    weights: list[Shaped[Array, "k ..."]]  # what a split backward leaves W
+    first_residuals: list[Shaped[Array, "k ..."]]  # the first part's, on stage 0
+    saved: list[Shaped[Array, "k ..."]]  # what a split backward saves for W
     rest: PyTree  # the layers' state
-    kept: PyTree  # the rest of the model's, which the part before changes
-    losses: Float[Array, "l k"]  # what the layers reported, summed over microbatches
-    grads: PyTree  # of the stage's parameters, in float32
-    others: PyTree  # of the parameters outside the repeat, in float32
+    kept: PyTree  # the rest of the model's, which the part before the repeat changes
+    losses: Losses  # what the layers reported, summed over microbatches
+    d_params: PyTree  # the gradient of the stage's parameters, in float32
+    d_others: PyTree  # of the parameters outside the repeat, in float32
     metrics: Metrics
-    out: Stream  # the forward's output, sent on at the tick's end
-    back: Stream  # the backward's input gradient, sent back
+    to_next: Stream  # the forward's output, sent on at the tick's end
+    to_previous: Stream  # the backward's input gradient, sent back
 
 
 class Shapes(NamedTuple):
-    """What each part leaves, traced once on microbatch 0."""
+    """What each part leaves, traced once on microbatch 0: the stream it enters the
+    repeat with, the vjps of the first part and of the stage (their residuals' shapes
+    and structure), the losses the stage's layers report, and the metrics."""
 
     x: jax.ShapeDtypeStruct
-    first: VJP
-    stage: VJP
+    first: jax_internals.VJP
+    stage: jax_internals.VJP
     losses: jax.ShapeDtypeStruct
     metrics: dict[str, jax.ShapeDtypeStruct]
+
+
+class TickInputs(NamedTuple):
+    """What a tick reads, each by stage: the code and microbatch of each lane's op
+    (``schedule.CODES``), and the microbatch that arrives from the stage before and
+    from the stage after (-1 for none)."""
+
+    codes: Int[Array, "s k"]
+    microbatches: Int[Array, "s k"]
+    from_before: Int[Array, " s"]
+    from_after: Int[Array, " s"]
 
 
 def _device(
@@ -184,17 +205,18 @@ def _device(
     rows: PyTree,
 ) -> tuple[PyTree, PyTree, PyTree, PyTree, Metrics]:
     """Run one stage's ticks of `table` on its devices."""
-    before = _at(_at(rest, 0), 0)  # this stage's, of the one round
-    ticks = Ticks(table, parts, apart, _at(_at(params, 0), 0), others, kept, rows)
+    layers = at(at(rest, 0), 0)  # this stage's, of the one round
+    params = at(at(params, 0), 0)
+    ticks = Ticks(table, parts, apart, params, layers, others, kept, rows)
     own = gather.own_streams
-    held = ticks.start(own(before, apart), own(kept, apart))
-    held, _ = jax.lax.scan(ticks.tick, held, ticks.xs())
-    return ticks.finish(held, before, kept)
+    held = ticks.start(own(layers, apart), own(kept, apart))
+    held, _ = jax.lax.scan(ticks.tick, held, ticks.tick_inputs())
+    return ticks.finish(held, layers, kept)
 
 
 class Ticks:
-    """A table's ticks on one stage's devices: the ops a slot runs (``forward``,
-    ``backward``), and the sends at the end of a tick (``tick``)."""
+    """A table's ticks on one stage's devices: the model's parts on a microbatch, the
+    ops a lane runs (``forward``, ``backward``, ``weights``), and a tick (``tick``)."""
 
     def __init__(
         self,
@@ -202,42 +224,44 @@ class Ticks:
         parts: Parts,
         apart: tuple[str, ...],
         params: PyTree,
+        rest: PyTree,
         others: PyTree,
         kept: PyTree,
         rows: PyTree,
     ):
+        """Take this stage's `params` and its layers' state `rest`, the parameters
+        outside the repeat, `others`, and the rest of their state, `kept`, and every
+        microbatch's `rows`."""
         self.table, self.parts, self.apart = table, parts, apart
         self.params, self.others, self.kept, self.rows = params, others, kept, rows
         self.index, self.last = jax.lax.axis_index(AXIS), table.stages - 1
-        slots = table.slots()
+        slots = table.buffer_slots()
         self.depth = {name: int(s.max()) + 1 for name, s in slots.items()}
         self.slots = {name: jnp.asarray(s) for name, s in slots.items()}
-        self.rows_apart = int(np.prod([jax.lax.axis_size(a) for a in apart]))
-        self.shapes: Shapes | None = None
-        self.split: split.Split | None = None
+        self.row_shards = int(np.prod([jax.lax.axis_size(a) for a in apart]))
+        self.shapes = self.trace(rest)
+        self.split = self._split_backward() if table.split else None
 
     # --- The parts, on one microbatch ---------------------------------------------
 
-    def embedded(self, kept: PyTree, rows: PyTree) -> tuple[Stream, Vjp, PyTree]:
-        """Run the part before the repeat: the stream, the vjp that takes its
-        gradient back to the parameters outside the repeat, and their other state
-        after."""
+    def first_with_vjp(self, kept: PyTree, rows: PyTree) -> tuple[Stream, Vjp, PyTree]:
+        """Run the part before the repeat: the stream it leaves, the vjp that takes
+        its gradient back to the parameters outside the repeat, and the rest of their
+        state after."""
 
         def first(others: PyTree) -> tuple[Stream, PyTree]:
             return self.parts.first(others, kept, rows)
 
         return jax.vjp(first, self.others, has_aux=True, saveable_args=(False,))
 
-    def staged(
+    def stage_with_vjp(
         self, rest: PyTree, rows: PyTree, x: Stream
-    ) -> tuple[Stream, Float[Array, "l k"], Vjp, PyTree]:
+    ) -> tuple[Stream, Losses, Vjp, PyTree]:
         """Run this stage's share of the repeat: its output, the losses its layers
         report, the vjp that takes both back to its parameters and its input, and the
         layers' state after."""
 
-        def run(
-            params: PyTree, x: Stream
-        ) -> tuple[tuple[Stream, Float[Array, "l k"]], PyTree]:
+        def run(params: PyTree, x: Stream) -> tuple[tuple[Stream, Losses], PyTree]:
             y, after, losses = self.parts.stage(params, rest, x, rows)
             return (y, losses), after
 
@@ -246,7 +270,7 @@ class Ticks:
         )
         return y, losses, vjp, after
 
-    def scored(self, rows: PyTree, y: Stream) -> tuple[Metrics, PyTree, Stream]:
+    def loss_gradients(self, rows: PyTree, y: Stream) -> tuple[Metrics, PyTree, Stream]:
         """Run the part after the repeat on the stage's output, to the loss: its
         metrics, and the loss's gradients with respect to the parameters outside the
         repeat and to `y`."""
@@ -262,217 +286,264 @@ class Ticks:
         """Trace the parts on microbatch 0, for the shapes of what they leave."""
 
         def parts(rest: PyTree, rows: PyTree) -> tuple:
-            x, first, _ = self.embedded(self.kept, rows)
-            y, losses, vjp, _ = self.staged(rest, rows, x)
-            metrics, _, _ = self.scored(rows, y)
-            return x, first, vjp, losses, metrics
+            x, first, _ = self.first_with_vjp(self.kept, rows)
+            y, losses, stage, _ = self.stage_with_vjp(rest, rows, x)
+            metrics, _, _ = self.loss_gradients(rows, y)
+            return x, first, stage, losses, metrics
 
-        return Shapes(*jax.eval_shape(parts, rest, _at(self.rows, 0)))
+        return Shapes(*jax.eval_shape(parts, rest, at(self.rows, 0)))
 
     # --- What a stage holds -------------------------------------------------------
 
     def start(self, rest: PyTree, kept: PyTree) -> Held:
-        """Return what a stage holds before its first tick, with the layers' `rest`
-        and the rest of the model's state, `kept`."""
-        shapes = self.shapes = self.trace(rest)
-        self.split = self._split() if self.table.split else None
-        saved = self.split.shapes if self.split else []
-
-        def buffer(a: jax.ShapeDtypeStruct, name: str) -> Shaped[Array, "k ..."]:
-            spare = name in SENT
-            return jnp.zeros((self.depth[name] + spare, *a.shape), a.dtype)
-
-        def zeros(tree: PyTree) -> PyTree:
-            return jax.tree.map(lambda a: jnp.zeros(a.shape, jnp.float32), tree)
-
+        """Return what a stage holds before its first tick: empty buffers, zero sums,
+        the layers' state `rest`, and the rest of the model's, `kept`."""
+        shapes = self.shapes
+        saved = self.split.saved_shapes if self.split else []
         stream = jnp.zeros(shapes.x.shape, shapes.x.dtype)
         return Held(
-            inputs=buffer(shapes.x, "inputs"),
-            cotangents=buffer(shapes.x, "cotangents"),
-            residuals=[buffer(a, "residuals") for a in jax.tree.leaves(shapes.stage)],
-            firsts=[buffer(a, "residuals") for a in jax.tree.leaves(shapes.first)],
-            weights=[buffer(a, "weights") for a in saved],
+            inputs=self._buffer("inputs", shapes.x),
+            cotangents=self._buffer("cotangents", shapes.x),
+            residuals=self._buffers("residuals", jax.tree.leaves(shapes.stage)),
+            first_residuals=self._buffers("residuals", jax.tree.leaves(shapes.first)),
+            saved=self._buffers("saved", saved),
             rest=rest,
             kept=kept,
-            losses=zeros(shapes.losses),
-            grads=zeros(self.params),
-            others=zeros(self.others),
-            metrics=zeros(shapes.metrics),
-            out=stream,
-            back=stream,
+            losses=_float32_zeros(shapes.losses),
+            d_params=_float32_zeros(self.params),
+            d_others=_float32_zeros(self.others),
+            metrics=_float32_zeros(shapes.metrics),
+            to_next=stream,
+            to_previous=stream,
         )
+
+    def _buffer(self, name: str, a: jax.ShapeDtypeStruct) -> Shaped[Array, "k ..."]:
+        """Return an empty buffer `name` of arrays like `a`, a slot for each
+        microbatch held at once. A buffer that takes what the stages send has one
+        more, spare, for what a tick sends that no microbatch's slot awaits."""
+        spare = name in SENT
+        return jnp.zeros((self.depth[name] + spare, *a.shape), a.dtype)
+
+    def _buffers(
+        self, name: str, leaves: list[jax.ShapeDtypeStruct]
+    ) -> list[Shaped[Array, "k ..."]]:
+        return [self._buffer(name, a) for a in leaves]
 
     def slot(self, buffer: str, j: Int[Array, ""]) -> Int[Array, ""]:
         """Return the slot of `buffer` that holds microbatch `j` on this stage, or
-        the spare last one where `j` is -1."""
+        the spare one where `j` is -1."""
         found = self.slots[buffer][self.index, jnp.maximum(j, 0)]
         return jnp.where(j >= 0, found, self.depth[buffer])
 
     # --- The ops ------------------------------------------------------------------
 
     def forward(self, held: Held, j: Int[Array, ""]) -> Held:
-        """Run microbatch `j` forward through this stage, from the embedding on the
-        first stage, and keep its residuals. The last stage scores it too."""
-        rows = _at(self.rows, j)
-        x, firsts, kept = jax.lax.cond(
-            self.index == 0, self._embed, self._receive, held, j, rows
+        """Run microbatch `j` forward through this stage, and keep its residuals. The
+        first stage runs the part before the repeat first, and the last stage the
+        part after it, to the loss, whose gradient it keeps for its backward."""
+        rows = at(self.rows, j)
+        x, first_residuals, kept = jax.lax.cond(
+            self.index == 0,
+            self._from_first_part,
+            self._from_stage_before,
+            held,
+            j,
+            rows,
         )
-        y, losses, vjp, rest = self.staged(held.rest, rows, x)
+        y, losses, vjp, rest = self.stage_with_vjp(held.rest, rows, x)
         slot = self.slot("residuals", j)
         held = held._replace(
-            residuals=_put(held.residuals, slot, jax.tree.leaves(vjp)),
-            firsts=_put(held.firsts, slot, firsts),
+            residuals=put(held.residuals, slot, jax.tree.leaves(vjp)),
+            first_residuals=put(held.first_residuals, slot, first_residuals),
             rest=rest,
             kept=kept,
             losses=held.losses + losses,
-            out=y,
+            to_next=y,
         )
-        return jax.lax.cond(self.index == self.last, self._score, _keep, held, j, y)
+        return jax.lax.cond(
+            self.index == self.last, self._to_the_loss, _unchanged, held, j, y
+        )
 
-    def _embed(
+    def _from_first_part(
         self, held: Held, j: Int[Array, ""], rows: PyTree
     ) -> tuple[Stream, list[Leaf], PyTree]:
-        x, vjp, kept = self.embedded(held.kept, rows)
+        """Return the stream as the part before the repeat leaves it, that part's
+        residuals, and the rest of the model's state after it."""
+        x, vjp, kept = self.first_with_vjp(held.kept, rows)
         return x, jax.tree.leaves(vjp), kept
 
-    def _receive(
+    def _from_stage_before(
         self, held: Held, j: Int[Array, ""], rows: PyTree
     ) -> tuple[Stream, list[Leaf], PyTree]:
-        assert self.shapes is not None
-        empty = [
-            jnp.zeros(a.shape, a.dtype) for a in jax.tree.leaves(self.shapes.first)
-        ]
-        return _at(held.inputs, self.slot("inputs", j)), empty, held.kept
+        """Return the stream the stage before sent, and zeros for the residuals of
+        the part before the repeat, which this stage does not run."""
+        leaves = jax.tree.leaves(self.shapes.first)
+        empty = [jnp.zeros(a.shape, a.dtype) for a in leaves]
+        return at(held.inputs, self.slot("inputs", j)), empty, held.kept
 
-    def _score(self, held: Held, j: Int[Array, ""], y: Stream) -> Held:
-        metrics, d_others, dy = self.scored(_at(self.rows, j), y)
+    def _to_the_loss(self, held: Held, j: Int[Array, ""], y: Stream) -> Held:
+        """Run the part after the repeat on `y`, and keep the loss's gradient with
+        respect to `y` for this stage's backward."""
+        metrics, d_others, dy = self.loss_gradients(at(self.rows, j), y)
         return held._replace(
-            cotangents=_put(held.cotangents, self.slot("cotangents", j), dy),
-            others=_added(held.others, d_others),
-            metrics=_added(held.metrics, metrics),
+            cotangents=put(held.cotangents, self.slot("cotangents", j), dy),
+            d_others=gather.added(held.d_others, d_others),
+            metrics=gather.added(held.metrics, metrics),
         )
 
     def backward(self, held: Held, j: Int[Array, ""]) -> Held:
         """Take microbatch `j`'s gradient back through this stage, from its slot of
-        residuals, and on the first stage on to the embedding. Where the table splits
-        the backward, take the input's gradient alone, and keep what the weights'
-        needs for ``weights``."""
+        residuals, and on the first stage on through the part before the repeat.
+        Where the table splits the backward, take the input's gradient alone (`B`),
+        and keep what the weights' (`W`) needs."""
         slot = self.slot("residuals", j)
-        residuals = _at(held.residuals, slot)
-        dy = _at(held.cotangents, self.slot("cotangents", j))
+        residuals = at(held.residuals, slot)
+        dy = at(held.cotangents, self.slot("cotangents", j))
         if self.split is None:
-            d_params, dx = self._vjp(residuals)((dy, self._losses_cotangent()))
-            held = held._replace(grads=_added(held.grads, d_params), back=dx)
+            held = self._whole_backward(held, residuals, dy)
         else:
-            args = [
-                *jax.tree.leaves(self.params),
-                *residuals,
-                dy,
-                self._losses_cotangent(),
-            ]
-            (dx,), saved = self.split.inputs(*args)
-            weights = _put(held.weights, self.slot("weights", j), saved)
-            held = held._replace(weights=weights, back=dx)
-        return jax.lax.cond(self.index == 0, self._unembed, _keep, held, slot, dx)
+            held = self._input_backward(held, j, residuals, dy)
+        return jax.lax.cond(
+            self.index == 0,
+            self._through_first_part,
+            _unchanged,
+            held,
+            slot,
+            held.to_previous,
+        )
+
+    def _whole_backward(self, held: Held, residuals: list[Leaf], dy: Stream) -> Held:
+        """Take `dy` back to this stage's parameters and its input."""
+        vjp = self._vjp(residuals)
+        d_params, dx = vjp((dy, self._losses_cotangent()))
+        return held._replace(
+            d_params=gather.added(held.d_params, d_params), to_previous=dx
+        )
+
+    def _input_backward(
+        self, held: Held, j: Int[Array, ""], residuals: list[Leaf], dy: Stream
+    ) -> Held:
+        """Take `dy` back to this stage's input alone, and keep what the gradient of
+        its weights needs in microbatch `j`'s slot of `saved`."""
+        assert self.split is not None
+        params = jax.tree.leaves(self.params)
+        cotangents = [dy, self._losses_cotangent()]
+        (dx,), saved = self.split.inputs(*params, *residuals, *cotangents)
+        saved = put(held.saved, self.slot("saved", j), saved)
+        return held._replace(saved=saved, to_previous=dx)
+
+    def _through_first_part(self, held: Held, slot: Int[Array, ""], dx: Stream) -> Held:
+        """Take `dx` on back through the part before the repeat, to the parameters
+        outside it, from its residuals in `slot`."""
+        residuals = at(held.first_residuals, slot)
+        vjp = jax_internals.rebuild_vjp(self.shapes.first, residuals, self.others)
+        (d_others,) = vjp(dx)
+        return held._replace(d_others=gather.added(held.d_others, d_others))
 
     def weights(self, held: Held, j: Int[Array, ""]) -> Held:
         """Take microbatch `j`'s gradient on to this stage's weights, from what its
-        backward kept."""
+        backward saved."""
         assert self.split is not None
-        saved = _at(held.weights, self.slot("weights", j))
-        residuals = _at(held.residuals, self.slot("residuals", j))
+        saved = at(held.saved, self.slot("saved", j))
+        residuals = at(held.residuals, self.slot("residuals", j))
         params = jax.tree.leaves(self.params)
         flat = self.split.weights(*params, *residuals, saved)
         d_params = jax.tree.unflatten(jax.tree.structure(self.params), flat)
-        return held._replace(grads=_added(held.grads, d_params))
+        return held._replace(d_params=gather.added(held.d_params, d_params))
 
     def _vjp(self, residuals: list[Leaf]) -> Vjp:
         """Return this stage's vjp, rebuilt from a slot's `residuals`."""
-        assert self.shapes is not None
-        return _rebuilt(self.shapes.stage, residuals, self.params)
+        return jax_internals.rebuild_vjp(self.shapes.stage, residuals, self.params)
 
-    def _split(self) -> split.Split:
-        """Return this stage's backward split in two: the input's gradient and what
-        the weights' needs, then the weights' (``split.split``), which reads the
-        parameters and the slot of residuals itself."""
+    def _split_backward(self) -> split.Split:
+        """Return this stage's backward split in two (``split.split``): `B`, the
+        input's gradient and what the weights' needs, and `W`, the weights'
+        gradient, which takes the parameters and the residuals again."""
         shapes = self.shapes
-        assert shapes is not None
         params = jax.tree.leaves(self.params)
         residuals = jax.tree.leaves(shapes.stage)
         tree = jax.tree.structure(self.params)
 
-        def backward(*args: Leaf) -> list[Leaf]:
+        def backward(*args: Leaf) -> list[Leaf]:  # params, residuals, dy, dl
             p, (*r, dy, dl) = args[: len(params)], args[len(params) :]
-            vjp = _rebuilt(shapes.stage, r, jax.tree.unflatten(tree, p))
+            vjp = jax_internals.rebuild_vjp(
+                shapes.stage, r, jax.tree.unflatten(tree, p)
+            )
             d_params, dx = vjp((dy, dl))
             return [*jax.tree.leaves(d_params), dx]
 
-        free = [_shape(a) for a in [*params, *residuals]]
-        cotangents = [_shape(shapes.x), _shape(shapes.losses)]
-        return split.split(backward, free, cotangents, weights=len(params))
+        shared = stand_ins([*params, *residuals])
+        cotangents = stand_ins([shapes.x, shapes.losses])
+        return split.split(backward, shared, cotangents, weight_grads=len(params))
 
-    def _unembed(self, held: Held, slot: Int[Array, ""], dx: Stream) -> Held:
-        assert self.shapes is not None
-        vjp = _rebuilt(self.shapes.first, _at(held.firsts, slot), self.others)
-        (d_others,) = vjp(dx)
-        return held._replace(others=_added(held.others, d_others))
-
-    def _losses_cotangent(self) -> Float[Array, "l k"]:
+    def _losses_cotangent(self) -> Losses:
         """Return the gradient of the step's loss with respect to the losses this
         stage's layers report for a microbatch: their weights over the microbatches
         of every device, as the loss takes their mean."""
-        assert self.shapes is not None
         weights = np.array([w for _, w in self.parts.reports()], np.float32)
-        weights /= self.table.microbatches * self.rows_apart
+        weights /= self.table.microbatches * self.row_shards
         return jnp.broadcast_to(jnp.asarray(weights), self.shapes.losses.shape)
 
     # --- Ticks --------------------------------------------------------------------
 
-    def xs(self) -> tuple[Int[Array, "t ..."], ...]:
-        """Return what the ticks read, tick by tick: each slot's op and microbatch,
-        and the microbatch each stage receives from the stage before and after."""
-        kinds, micros = self.table.codes()
-        got = [self.table.received(k) for k in (schedule.FORWARD, schedule.BACKWARD)]
-        return tuple(jnp.asarray(a) for a in (kinds, micros, *got))
+    def tick_inputs(self) -> TickInputs:
+        """Return what the ticks read, each leaf (ticks, ...)."""
+        codes, microbatches = self.table.as_arrays()
+        from_before = self.table.arrivals(FORWARD)
+        from_after = self.table.arrivals(BACKWARD)
+        arrays = (codes, microbatches, from_before, from_after)
+        return TickInputs(*(jnp.asarray(a) for a in arrays))
 
-    def tick(self, held: Held, xs: tuple[Int[Array, "..."], ...]) -> tuple[Held, None]:
-        """Run a tick: this stage's op in each slot, then the sends both ways. A slot
-        runs each kind of op its column of the table has by a cond of its own: in a
-        switch of them all, XLA would copy the buffers one op writes and another
-        reads, a tick at a time."""
-        kinds, micros, got_forward, got_backward = xs
-        ops = {1: self.forward, 2: self.backward, 3: self.weights}
-        for k in range(self.table.width):
-            op, j = kinds[self.index, k], micros[self.index, k]
-            for code in self.table.kinds_in(k):
-                held = jax.lax.cond(op == code, ops[code], _idle, held, j)
-        out, back = _send(held.out, 1), _send(held.back, -1)
-        got = self.slot("inputs", got_forward[self.index])
-        inputs = _put(held.inputs, got, out)
-        got = self.slot("cotangents", got_backward[self.index])
-        cotangents = _put(held.cotangents, got, back)
-        return held._replace(inputs=inputs, cotangents=cotangents), None
+    def tick(self, held: Held, now: TickInputs) -> tuple[Held, None]:
+        """Run a tick: this stage's op in each lane, then the sends both ways."""
+        for lane in range(self.table.lanes):
+            code, j = now.codes[self.index, lane], now.microbatches[self.index, lane]
+            held = self._run_lane(held, lane, code, j)
+        return self._send_and_receive(held, now), None
+
+    def _run_lane(
+        self, held: Held, lane: int, code: Int[Array, ""], j: Int[Array, ""]
+    ) -> Held:
+        """Run the op of `code` on microbatch `j`, by a cond for each kind of op
+        `lane` runs: in one switch of them all, XLA would copy the buffers one op
+        writes and another reads, a tick at a time."""
+        ops = {FORWARD: self.forward, BACKWARD: self.backward, WEIGHTS: self.weights}
+        for kind in self.table.kinds_in(lane):
+            held = jax.lax.cond(code == CODES[kind], ops[kind], _unchanged, held, j)
+        return held
+
+    def _send_and_receive(self, held: Held, now: TickInputs) -> Held:
+        """Send the forward's output on and the backward's input gradient back, and
+        put what arrives in the slot of the microbatch it belongs to."""
+        to_next, to_previous = send(held.to_next, 1), send(held.to_previous, -1)
+        got = self.slot("inputs", now.from_before[self.index])
+        inputs = put(held.inputs, got, to_next)
+        got = self.slot("cotangents", now.from_after[self.index])
+        cotangents = put(held.cotangents, got, to_previous)
+        return held._replace(inputs=inputs, cotangents=cotangents)
 
     def finish(
-        self, held: Held, before: PyTree, kept: PyTree
+        self, held: Held, rest: PyTree, kept: PyTree
     ) -> tuple[PyTree, PyTree, PyTree, PyTree, Metrics]:
         """Return the gradients, the state and the metrics as the shard_map gives
         them out: the parts outside the repeat summed over the stages, and everything
-        over the rows' axes, where each device ran its own rows."""
-        rest = gather.keys_of(before, held.rest)
+        over the rows' axes, where each device ran its own rows. `rest` and `kept`
+        are the state as it came in, whose RNG keys it keeps."""
+        rest = gather.keys_of(rest, held.rest)
         kept = gather.keys_of(kept, held.kept)
-        others = jax.lax.psum(held.others, AXIS)
+        d_others = jax.lax.psum(held.d_others, AXIS)
         metrics = jax.lax.psum(held.metrics, AXIS)
         reported = jax.lax.psum(self._reported(held.losses), AXIS)
-        grads = held.grads
+        d_params = held.d_params
         if self.apart:
-            grads, others, metrics = jax.lax.psum((grads, others, metrics), self.apart)
+            summed = jax.lax.psum((d_params, d_others, metrics), self.apart)
+            d_params, d_others, metrics = summed
             reported = jax.lax.pmean(reported, self.apart)
-        lift = functools.partial(jax.tree.map, lambda a: a[None, None])
-        kept = jax.tree.map(lambda a: a[None], kept)
-        return lift(grads), others, lift(rest), kept, _merged(metrics, reported)
+        kept = add_axes(kept)  # stage
+        d_params, rest = add_axes((d_params, rest), 2)  # stage, round
+        return d_params, d_others, rest, kept, _merged(metrics, reported)
 
-    def _reported(self, losses: Float[Array, "l k"]) -> Metrics:
+    def _reported(self, losses: Losses) -> Metrics:
         """Return the means over microbatches of the losses this stage's layers
         report, each name's summed over its layers."""
         means: Metrics = {}
@@ -482,45 +553,14 @@ class Ticks:
         return means
 
 
-def _idle(held: Held, j: Int[Array, ""]) -> Held:
+def _unchanged(held: Held, *_: object) -> Held:
     return held
 
 
-def _keep(held: Held, *_: object) -> Held:
-    return held
-
-
-def _added(total: PyTree, part: PyTree) -> PyTree:
-    """Add `part` to the float32 `total`, leaf by leaf."""
-    return jax.tree.map(lambda a, b: a + b.astype(a.dtype), total, part)
+def _float32_zeros(tree: PyTree) -> PyTree:
+    return jax.tree.map(lambda a: jnp.zeros(a.shape, jnp.float32), tree)
 
 
 def _merged(metrics: Metrics, more: Metrics) -> Metrics:
     """Return `metrics` and `more`, a name both have summed."""
     return metrics | {k: v + metrics[k] if k in metrics else v for k, v in more.items()}
-
-
-def _rebuilt(shapes: Vjp, leaves: list[Leaf], unsaved: PyTree) -> VJP:
-    """Return the vjp of the structure `shapes` from its residual `leaves`, with its
-    first primal, which it did not save, put back as `unsaved`."""
-    vjp = jax.tree.unflatten(jax.tree.structure(shapes), leaves)
-
-    def sentinel(v: object) -> bool:
-        return isinstance(v, NotSaveable | NotNeeded)
-
-    held, tree = jax.tree.flatten(vjp.args_res[0], is_leaf=sentinel)
-    values = [
-        u if isinstance(h, NotSaveable) else h
-        for h, u in zip(held, jax.tree.leaves(unsaved), strict=True)
-    ]
-    return vjp.replace(args_res=[jax.tree.unflatten(tree, values), *vjp.args_res[1:]])
-
-
-def _shape(a: Leaf | jax.ShapeDtypeStruct) -> jax.ShapeDtypeStruct:
-    return jax.ShapeDtypeStruct(a.shape, a.dtype)
-
-
-def _send(y: Stream, step: int) -> Stream:
-    """Send each stage's `y` to the stage `step` after it, round the ring."""
-    n = jax.lax.axis_size(AXIS)
-    return jax.lax.ppermute(y, AXIS, [(i, (i + step) % n) for i in range(n)])

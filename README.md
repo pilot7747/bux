@@ -78,7 +78,10 @@ A run splits over devices by three settings, `mesh`, `layout` and `methods`: FSD
 tensor, expert, context and pipeline parallelism, and any mix of them, from one GPU
 to many hosts. [examples/experiments/parallel/](examples/experiments/parallel/) has a
 run for each, one of them on a laptop's CPU, and the
-[parallelism guide](docs/parallelism.md) explains them.
+[parallelism guide](docs/parallelism.md) explains them. The suites in
+[examples/benchmarks/](examples/benchmarks/) measure them on one GPU, a node and two:
+`scripts/benchmark.py` trains a suite and prints how a change moved each run's speed,
+memory and loss ([Benchmarks](docs/training.md#benchmarks)).
 
 Run the CI checks (ruff, ty, and the tests) with `make`, or one of them with `make lint`,
 `make typecheck`, or `make test`. Arrays say their dtype and shape with
@@ -101,6 +104,10 @@ docker run --rm --gpus all -v "$PWD/data:/opt/bux/data" -v "$PWD/runs:/opt/bux/r
   bux examples/experiments/speedrun.bux
 docker run --rm -it --entrypoint bash bux    # a shell, or --entrypoint bux for the CLI
 ```
+
+The image has TransformerEngine's JAX bindings, for its expert-parallel dispatch and
+combine (docs/parallelism.md, "TransformerEngine's NCCL EP"); `--build-arg TE_VERSION=...`
+picks another release.
 
 To publish it to `ghcr.io/pilot7747/bux` for amd64 and arm64, run the Docker workflow from
 the Actions tab or with `gh workflow run docker.yml` (add `-f tag=v0.1.0` for an extra tag).

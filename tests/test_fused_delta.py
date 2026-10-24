@@ -20,6 +20,13 @@ B, T, H, K = 2, 64, 2, 8
 _recomputed = functools.partial(_chunked, states="recompute")
 
 
+@pytest.fixture(autouse=True)
+def full_precision():
+    """Float32's matmuls at their full precision on a GPU too, whose default is TF32."""
+    with jax.default_matmul_precision("highest"):
+        yield
+
+
 def _run(q, k, v, g, beta, cu):
     """The kernels on THD arrays, each sequence of cu its own document: GDN's for
     gates of one decay a head (n, h), else KDA's."""

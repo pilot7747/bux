@@ -6,7 +6,7 @@ those of an activation with ``shard``. Outside ``use`` names do nothing, so one
 device runs as if there were none.
 """
 
-from collections.abc import Sequence
+from collections.abc import Collection, Sequence
 
 import jax
 from flax import nnx
@@ -15,8 +15,8 @@ from jax.sharding import NamedSharding
 from jax.sharding import PartitionSpec as P
 from jaxtyping import Array, Shaped
 
-from bux.parallel.mesh import Active, active
-from bux.train.config import Axes, LayoutConfig
+from bux.parallel.mesh import Active, active, manual_axes
+from bux.train.config import LayoutConfig
 
 NAMES = "names"  # the metadata key that holds a parameter's dimension names
 LAYERS = "layers"  # the stacked dimension of a scanned repeat
@@ -26,6 +26,7 @@ DIMENSIONS = tuple(
 )
 
 Split = tuple[str, ...]  # the mesh axes one dimension splits over; () keeps it whole
+Entry = str | tuple[str, ...] | None  # one dimension of a PartitionSpec
 # A dimension's name: a string, None for no name, or (name, count) for a dimension
 # that flattens `count` of them, such as ("kv_heads", 2) for 2 kv heads of 64 dims.
 # Such a dimension splits only at the boundaries between them.
@@ -41,11 +42,26 @@ def axes(layout: LayoutConfig, name: Name) -> Split:
         return ()
     if name not in DIMENSIONS:
         raise ValueError(f"'{name}' is not a dimension; the names are {DIMENSIONS}")
-    return _split(getattr(layout, name))
+    return as_split(getattr(layout, name))
 
 
-def _split(a: Axes) -> Split:
-    return () if a is None else (a,) if isinstance(a, str) else tuple(a)
+def as_split(entry: Entry) -> Split:
+    """Return the mesh axes that one entry of a partition spec, or a dimension's
+    field of the layout, names: none, one or several."""
+    if entry is None:
+        return ()
+    return (entry,) if isinstance(entry, str) else tuple(entry)
+
+
+def axes_of(spec: P) -> Split:
+    """Return every mesh axis that `spec` splits over, in order."""
+    return tuple(a for entry in spec for a in as_split(entry))
+
+
+def split_axes(on: Active, name: Name, skip: Collection[str] = ()) -> Split:
+    """Return the axes of `on`'s mesh that split the dimension `name`: those its
+    layout gives it, but those of size 1 and those in `skip`."""
+    return tuple(a for a in axes(on.layout, name) if on.size(a) > 1 and a not in skip)
 
 
 def resolve(names: Sequence[Name], shape: tuple[int, ...], on: Active) -> list[Split]:
@@ -57,12 +73,10 @@ def resolve(names: Sequence[Name], shape: tuple[int, ...], on: Active) -> list[S
     """
     if len(names) != len(shape):
         raise ValueError(f"{len(names)} names for {len(shape)} dimensions: {names}")
-    used = set(jax.sharding.get_abstract_mesh().manual_axes)
+    used = set(manual_axes())
     splits = []
     for name, size in zip(names, shape):
-        split = tuple(
-            a for a in axes(on.layout, name) if on.size(a) > 1 and a not in used
-        )
+        split = split_axes(on, name, skip=used)
         if (name[1] if isinstance(name, tuple) else size) % on.size(*split):
             split = ()
         used.update(split)
@@ -78,7 +92,7 @@ def fsdp(
     one does, from the first. Never the stacked `layers` of a scanned repeat: a scan
     reads one layer at a time."""
     taken = {a for s in splits for a in s}
-    over = [a for a in _split(on.layout.fsdp) if on.size(a) > 1 and a not in taken]
+    over = [a for a in as_split(on.layout.fsdp) if on.size(a) > 1 and a not in taken]
     for k in range(len(over), 0, -1):
         if (i := _largest_whole(splits, shape, names, on.size(*over[:k]))) is not None:
             return [*splits[:i], tuple(over[:k]), *splits[i + 1 :]]
@@ -125,8 +139,7 @@ def shard(x: Shaped[Array, "*s"], *names: Name) -> Shaped[Array, "*s"]:
     if (on := active()) is None:
         return x
     split = partition(resolve(names, x.shape, on))
-    manual = jax.sharding.get_abstract_mesh().manual_axes
-    if not isinstance(x, Tracer) or not manual:
+    if not isinstance(x, Tracer) or not manual_axes():
         # So also a gradient's tracer of an array that is not on the mesh yet.
         return jax.lax.with_sharding_constraint(x, NamedSharding(on.mesh, split))
     # A bare spec is of the mesh being traced, which knows a shard_map's manual axes.

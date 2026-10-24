@@ -28,7 +28,7 @@ from bux.lang import compile, compile_runs
 from bux.train import config as tcfg
 from bux.train import flops
 from bux.train.data import batches, plain, prefetch
-from bux.train.hooks import Hook, Log, Profile
+from bux.train.hooks import Checkpoint, Hook, Log, Profile
 from bux.train.objective import (
     Term,
     cross_entropy,
@@ -524,7 +524,8 @@ def test_a_run_writes_its_directory_and_resumes_where_it_stopped(tmp_path):
     assert [line["step"] for line in lines if "loss" in line] == [1, 2, 3, 4, 5, 6]
     assert "eval_loss" in whole
 
-    # Lose the last checkpoint: the run resumes from step 3 and ends where it did.
+    # Lose the last checkpoint: the run resumes from step 3 and ends where it did,
+    # its metrics logged once a step, as if it had not stopped.
     shutil.rmtree(folder / "checkpoints" / "6")
     said: list[str] = []
     resumed = train(run, tmp_path, echo=said.append)
@@ -532,6 +533,41 @@ def test_a_run_writes_its_directory_and_resumes_where_it_stopped(tmp_path):
     assert (
         resumed["loss"] == whole["loss"] and resumed["grad_norm"] == whole["grad_norm"]
     )
+    again = [json.loads(line) for line in (folder / "metrics.jsonl").open()]
+    assert [line["step"] for line in again] == [line["step"] for line in lines]
+
+
+def test_a_checkpoint_restores_only_into_a_state_of_its_arrays(tmp_path):
+    def trainer(width: int) -> Trainer:
+        arch = compile(f"d_model = {width}\nvocab_size = 32\nmodel = embed head\n")
+        model = Model(arch, rngs=nnx.Rngs(0))
+        return Trainer(model, optax.adamw(1e-3), objective(tcfg.LossConfig(), arch))
+
+    save = Checkpoint(tmp_path, every=1, keep=1)
+    save(trainer(16), {})
+    save.close()
+    narrower, load = trainer(8), Checkpoint(tmp_path, every=1, keep=1)
+    with pytest.raises(
+        ValueError, match=re.escape("[32, 16], and this run's float32[32, 8]")
+    ):
+        load.restore(narrower)
+    load.close()
+    assert not any(x.is_deleted() for x in jax.tree.leaves(narrower.state()))
+
+
+def test_a_save_a_crash_left_unfinished_is_dropped_and_its_step_not_saved(tmp_path):
+    # Orbax's names for a step's save until it ends, which a crash leaves behind.
+    unfinished = tmp_path / "20.orbax-checkpoint-tmp" / "default.orbax-checkpoint-tmp"
+    unfinished.mkdir(parents=True)
+    arch = compile("d_model = 16\nvocab_size = 32\nmodel = embed head\n")
+    model = Model(arch, rngs=nnx.Rngs(0))
+    trainer = Trainer(model, optax.adamw(1e-3), objective(tcfg.LossConfig(), arch))
+    save = Checkpoint(tmp_path, every=10, keep=2)
+    for step in (20, 30):
+        trainer.step = step
+        save(trainer, {})
+    save.close()
+    assert [p.name for p in tmp_path.iterdir()] == ["30"]
 
 
 def test_a_profile_traces_its_steps_into_the_run_s_directory_and_keeps_its_id(
@@ -615,15 +651,15 @@ def test_a_step_s_flops_are_counted_from_its_program():
     the share of the t × t logits that a causal mask keeps, (t + 1) / 2t."""
     matrices = 2 * (2 * 64 * 64 + 2 * 64 * 32 + 3 * 64 * 256) + 64 * 512
     attention = 12 * 2 * 64 * 64 * 65 / 128  # layers, heads × head_dim, positions
-    assert step_flops(smoke()) == (6 * matrices + attention) * 8 * 64
+    assert step_flops(smoke()).one_document(64) == (6 * matrices + attention) * 8 * 64
     x, w, sizes = jnp.ones((6, 8)), jnp.ones((3, 8, 5)), jnp.array([1, 2, 3])
     grad = jax.grad(lambda x, w: jax.lax.ragged_dot(x, w, sizes).sum(), (0, 1))
-    assert flops.count(grad, x, w) == 3 * 2 * 6 * 8 * 5
+    assert flops.count(grad, x, w).fixed == 3 * 2 * 6 * 8 * 5
 
     def scan(c):
         return jax.lax.scan(lambda c, _: (c @ x.T @ x, None), c, length=5)[0]
 
-    assert flops.count(scan, jnp.ones((4, 8))) == 5 * 2 * (2 * 4 * 6 * 8)
+    assert flops.count(scan, jnp.ones((4, 8))).fixed == 5 * 2 * (2 * 4 * 6 * 8)
     depthwise = functools.partial(
         jax.lax.conv_general_dilated,
         window_strides=(1,),
@@ -631,7 +667,7 @@ def test_a_step_s_flops_are_counted_from_its_program():
         feature_group_count=6,
     )
     ones = jnp.ones((2, 6, 10)), jnp.ones((6, 1, 3))
-    assert flops.count(depthwise, *ones) == 2 * (2 * 6 * 8) * 3
+    assert flops.count(depthwise, *ones).fixed == 2 * (2 * 6 * 8) * 3
 
 
 def test_the_log_reports_mfu_where_the_devices_peak_is_known():
@@ -639,14 +675,18 @@ def test_the_log_reports_mfu_where_the_devices_peak_is_known():
     assert flops.peak("NVIDIA B300 SXM6 AC") == 2.25e15
     arch = compile(ARCH + "model = embed block norm head\n")
     loss = objective(tcfg.LossConfig(), arch)
-    trainer = Trainer(Model(arch, rngs=nnx.Rngs(0)), optax.adamw(1e-3), loss)
+    work = flops.Work(3e6, {flops.Mask(): 2e6})  # 1e6 of attention a step on rows of 8
+    model = Model(arch, rngs=nnx.Rngs(0))
+    trainer = Trainer(model, optax.adamw(1e-3), loss, work=work)
     lr = lr_multiplier(tcfg.ConstantSchedule(), 2)
     data = batches(tcfg.SyntheticConfig(), rows(tcfg.SyntheticConfig(), 2, 8), 32)
     latest = LatestMetrics()
-    log = Log(every=1, lr=lr, tokens=16, flops=4e6, peak=1e9)
+    log = Log(every=1, lr=lr, tokens=16, peak=1e9)
     trainer.fit(data, 2, hooks=[log], sinks=[latest])
     steps_per_s = latest.metrics["tokens_per_s"] / 16
-    assert latest.metrics["mfu"] == pytest.approx(steps_per_s * 4e6 / 1e9)
+    flops_per_step = 3e6 + 2e6 * (8 + 1) / (2 * 8)
+    assert trainer.flops == 2 * flops_per_step
+    assert latest.metrics["mfu"] == pytest.approx(steps_per_s * flops_per_step / 1e9)
 
 
 @pytest.mark.parametrize("donate", [False, True])

@@ -11,9 +11,12 @@ reduce-scatter back to each device's positions. Without it, they all-reduce.
 
 `gspmd`, the default, leaves the collectives to the compiler, which puts each at the
 boundary of the matmul it feeds or drains, where the matmul waits for it. `chunked`
-splits each device's rows into `methods.tensor_chunks` chunks, in a shard_map: chunk
-i + 1 gathers while chunk i multiplies, and chunk i reduce-scatters while chunk i + 1
-multiplies.
+splits each device's rows into `methods.tensor_chunks` chunks, in a shard_map:
+
+    project_in:   gather chunk 0 | gather chunk 1    | ...
+                                 | multiply chunk 0  | multiply chunk 1 | ...
+    project_out:  multiply chunk 0 | multiply chunk 1 | ...
+                                   | reduce chunk 0   | reduce chunk 1   | ...
 
 A method is a class of two functions: `project_in(x, linears)` returns the input as
 the layer takes it and its projection by each of `linears`, and `project_out(h,
@@ -21,7 +24,7 @@ linear)` the output projection, split as the stream is.
 """
 
 import math
-from collections.abc import Callable, Sequence
+from collections.abc import Callable, Iterable, Sequence
 from functools import partial
 from typing import Any, NamedTuple, Protocol, cast, runtime_checkable
 
@@ -33,14 +36,13 @@ from jaxtyping import Array, Float
 
 from bux.architecture.precision import blockscaled, matmuls
 from bux.parallel import methods
-from bux.parallel.layout import NAMES, Name, shard, spec, splits
-from bux.parallel.mesh import active
+from bux.parallel.layout import NAMES, Entry, Name, as_split, shard, spec, splits
+from bux.parallel.mesh import active, free_axes, manual_axes
 
 AXIS = "tensor"
-Entry = str | tuple[str, ...] | None  # one dimension of a PartitionSpec
-# The formats that scale each block of a device's share by itself alone, and their
-# blocks: a share of whole blocks multiplies as the whole does.
-LOCAL_BLOCKS = {"mxfp8": blockscaled.MX_BLOCK, "mxfp8_2d": blockscaled.MX_BLOCK}
+# The formats that scale each block of an operand by itself, and their blocks: a
+# device's share of whole blocks multiplies as the whole does.
+SCALED_BY_BLOCK = {"mxfp8": blockscaled.MX_BLOCK, "mxfp8_2d": blockscaled.MX_BLOCK}
 
 
 @runtime_checkable
@@ -100,49 +102,47 @@ class Chunked:
     """Each device's rows in chunks, in a shard_map over every axis, so that each
     chunk's collective runs beside another chunk's matmul. It is `gspmd` where there
     is nothing to overlap, where a projection splits otherwise than by `tensor`, and
-    where a device's share would multiply otherwise than the whole (`_as_whole`)."""
+    where a device's share would multiply otherwise than the whole
+    (`_multiplies_as_whole`)."""
 
     @staticmethod
     def project_in(
         x: Float[Array, "b t d"], linears: Sequence[nnx.Linear]
     ) -> tuple[Float[Array, "b t d"], list[Float[Array, "b t _"]]]:
-        split = _split(x)
+        split = _input_split(x)
         if split is None or not split.sequence_parallel:
             return GSPMD.project_in(x, linears)
-        if not all(_by_columns(linear, split) for linear in linears):
+        if not all(_splits_by_columns(linear, split) for linear in linears):
             return GSPMD.project_in(x, linears)
-        columns = [_kernel_spec(linear) for linear in linears]
-        kernels = [linear.kernel[...] for linear in linears]
-        outputs = [P(split.rows, split.layer, c[1]) for c in columns]
+        kernel_specs = [_kernel_spec(linear) for linear in linears]
+        outputs = [P(split.rows, split.layer, cols) for _, cols in kernel_specs]
         x, ys = _shard_map(
             partial(_gather_and_project, linears, split.chunks),
-            in_specs=(split.stream_spec, columns),
+            in_specs=(split.stream_spec, kernel_specs),
             out_specs=(split.layer_spec, outputs),
-        )(x, kernels)
+        )(x, [linear.kernel[...] for linear in linears])
         return x, [_biased(linear, y) for linear, y in zip(linears, ys)]
 
     @staticmethod
     def project_out(
         h: Float[Array, "b t f"], linear: nnx.Linear
     ) -> Float[Array, "b t d"]:
-        split = _split(h)
-        if split is None or not _by_rows(linear, split):
+        split = _input_split(h)
+        if split is None or not _splits_by_rows(linear, split):
             return GSPMD.project_out(h, linear)
-        body = partial(
-            _project_and_reduce, linear, split.chunks, split.sequence_parallel
-        )
         y = _shard_map(
-            body,
+            partial(_project_and_reduce, linear, split.chunks, split.sequence_parallel),
             in_specs=(P(split.rows, split.layer, AXIS), _kernel_spec(linear)),
             out_specs=split.stream_spec,
         )(h, linear.kernel[...])
         return _biased(linear, y)
 
 
-class Split(NamedTuple):
-    """How a layer's (b, t, d) input splits: its rows, its positions in the stream
-    and in the layer, the chunks each device's rows split into, and the tokens of
-    each."""
+class InputSplit(NamedTuple):
+    """How a layer's (b, t, d) input splits over the mesh: its rows; its positions as
+    the stream splits them and as the layer does, the stream's over `tensor` too
+    under sequence parallelism; and the chunks each device's rows split into, of
+    `tokens` tokens each."""
 
     rows: Entry
     stream: Entry
@@ -163,25 +163,21 @@ class Split(NamedTuple):
         return P(self.rows, self.layer, None)
 
 
-def _split(x: Float[Array, "b t d"]) -> Split | None:
-    """Return how `x` splits, or None where `tensor` does not split the layer, or the
-    stream splits otherwise than the layer's positions and then `tensor`."""
+def _input_split(x: Float[Array, "b t d"]) -> InputSplit | None:
+    """Return how `x` splits, or None where `tensor` does not split the layer, as in
+    a shard_map already manual over it, or where the stream splits otherwise than the
+    layer's positions and then `tensor`."""
     on = active()
-    manual = jax.sharding.get_abstract_mesh().manual_axes
-    if on is None or on.size(AXIS) == 1 or AXIS in manual:
+    if on is None or on.size(AXIS) == 1 or AXIS in manual_axes():
         return None
     rows, stream, _ = spec(("batch", "stream", None), x.shape)
     _, layer, _ = spec(("batch", "seq", None), x.shape)
-    if _axes(stream) not in (_axes(layer), (*_axes(layer), AXIS)):
+    if as_split(stream) not in (as_split(layer), (*as_split(layer), AXIS)):
         return None
-    rows_here = x.shape[0] // on.size(*_axes(rows))
+    rows_here = x.shape[0] // on.size(*as_split(rows))
     chunks = math.gcd(on.methods.tensor_chunks, rows_here)
-    positions = x.shape[1] // on.size(*_axes(layer))
-    return Split(rows, stream, layer, chunks, rows_here // chunks * positions)
-
-
-def _axes(entry: Entry) -> tuple[str, ...]:
-    return () if entry is None else (entry,) if isinstance(entry, str) else entry
+    positions = x.shape[1] // on.size(*as_split(layer))
+    return InputSplit(rows, stream, layer, chunks, rows_here // chunks * positions)
 
 
 def _names(linear: nnx.Linear) -> tuple[Name, ...]:
@@ -197,32 +193,34 @@ def _kernel_spec(linear: nnx.Linear) -> P:
     return spec(_names(linear), tuple(linear.kernel.shape))
 
 
-def _by_columns(linear: nnx.Linear, split: Split) -> bool:
+def _splits_by_columns(linear: nnx.Linear, split: InputSplit) -> bool:
     """Whether the kernel of `linear` splits by columns over `tensor`, or not at all,
     and a device's share multiplies as the whole does."""
     rows, columns = _kernel_spec(linear)
-    return rows is None and columns in (None, AXIS) and _as_whole(linear, split)
+    by_columns = rows is None and columns in (None, AXIS)
+    return by_columns and _multiplies_as_whole(linear, split)
 
 
-def _by_rows(linear: nnx.Linear, split: Split) -> bool:
+def _splits_by_rows(linear: nnx.Linear, split: InputSplit) -> bool:
     """Whether the kernel of `linear` splits by rows over `tensor`, and a device's
     share multiplies as the whole does."""
-    return _kernel_spec(linear) == P(AXIS, None) and _as_whole(linear, split)
+    by_rows = _kernel_spec(linear) == P(AXIS, None)
+    return by_rows and _multiplies_as_whole(linear, split)
 
 
-def _as_whole(linear: nnx.Linear, split: Split) -> bool:
+def _multiplies_as_whole(linear: nnx.Linear, split: InputSplit) -> bool:
     """Whether a chunk times a device's share of the kernel of `linear` multiplies as
     the whole does, in the format it multiplies in where it traces (`_format`):
     `compute` does, and MXFP8's where the chunk's tokens and the share are whole
-    blocks (`LOCAL_BLOCKS`). NVFP4's does not: it scales by the largest value of the
-    whole operand."""
+    blocks (`SCALED_BY_BLOCK`). NVFP4's does not: it scales by the largest value of
+    the whole operand."""
     shape = tuple(linear.kernel.shape)
     share = [n // s for n, s in zip(shape, splits(_names(linear), shape))]
     match _format(linear):
         case "compute":
             return True
-        case str(name) if name in LOCAL_BLOCKS:
-            block = LOCAL_BLOCKS[name]
+        case str(name) if name in SCALED_BY_BLOCK:
+            block = SCALED_BY_BLOCK[name]
             return all(n % block == 0 for n in (split.tokens, *share))
     return False
 
@@ -245,14 +243,11 @@ def _shard_map(
 ) -> Callable[..., Any]:
     """`body` on each device's part, manual over every axis no shard_map being traced
     maps. Its matmuls may be kernels (MXFP8's), which need check_vma=False."""
-    on = active()
-    assert on is not None
-    free = set(on.mesh.axis_names) - set(jax.sharding.get_abstract_mesh().manual_axes)
     return jax.shard_map(
         body,
         in_specs=in_specs,
         out_specs=out_specs,
-        axis_names=free,
+        axis_names=free_axes(),
         check_vma=False,
     )
 
@@ -268,24 +263,12 @@ def _gather_and_project(
 ) -> tuple[Float[Array, "b T d"], list[Float[Array, "b T _"]]]:
     """Return a device's rows gathered over `tensor` and their projections, a chunk
     of rows at a time: each chunk multiplies while the next one gathers."""
-    pieces = _gathered(jnp.split(x, chunks))
+    pieces = _in_turn(_gather, jnp.split(x, chunks))
     ys = [
         jnp.concatenate([_multiply(linear, piece, w) for piece in pieces])
         for linear, w in zip(linears, kernels)
     ]
     return jnp.concatenate(pieces), ys
-
-
-def _gathered(pieces: list[Float[Array, "c t d"]]) -> list[Float[Array, "c T d"]]:
-    """Gather each piece over `tensor` along its positions, each gather after the one
-    before: an optimization barrier ties a piece to the last one gathered, so that
-    XLA neither combines the gathers into one nor runs them side by side."""
-    gathered: list[Float[Array, "c T d"]] = []
-    for piece in pieces:
-        if gathered:
-            piece, gathered[-1] = jax.lax.optimization_barrier((piece, gathered[-1]))
-        gathered.append(jax.lax.all_gather(piece, AXIS, axis=1, tiled=True))
-    return gathered
 
 
 def _project_and_reduce(
@@ -297,22 +280,37 @@ def _project_and_reduce(
 ) -> Float[Array, "b t d"]:
     """Return the sum over `tensor` of a device's rows projected by its rows of the
     kernel, a chunk of rows at a time, reduce-scattered over its positions under
-    sequence parallelism: each chunk reduces while the next one multiplies. A barrier
-    ties a chunk's partial sum to the last one reduced, as in `_gathered`."""
-    reduced: list[Float[Array, "c t d"]] = []
-    for piece in jnp.split(h, chunks):
-        partial_sum = _multiply(linear, piece, kernel)
-        if reduced:
-            partial_sum, reduced[-1] = jax.lax.optimization_barrier(
-                (partial_sum, reduced[-1])
-            )
-        reduced.append(_reduce(partial_sum, sequence_parallel))
-    return jnp.concatenate(reduced)
+    sequence parallelism: each chunk reduces while the next one multiplies."""
+    partial_sums = (_multiply(linear, piece, kernel) for piece in jnp.split(h, chunks))
+    reduce = partial(_reduce, sequence_parallel=sequence_parallel)
+    return jnp.concatenate(_in_turn(reduce, partial_sums))
+
+
+def _in_turn(
+    collective: Callable[[Float[Array, "..."]], Float[Array, "..."]],
+    pieces: Iterable[Float[Array, "..."]],
+) -> list[Float[Array, "..."]]:
+    """Return `collective` of each of `pieces`, each after the one before: an
+    optimization barrier ties a piece to the last one done, so that XLA neither
+    combines the collectives into one nor runs them side by side."""
+    done: list[Float[Array, "..."]] = []
+    for piece in pieces:
+        if done:
+            piece, done[-1] = jax.lax.optimization_barrier((piece, done[-1]))
+        done.append(collective(piece))
+    return done
+
+
+def _gather(piece: Float[Array, "c t d"]) -> Float[Array, "c T d"]:
+    """Gather `piece` over `tensor` along its positions."""
+    return jax.lax.all_gather(piece, AXIS, axis=1, tiled=True)
 
 
 def _reduce(
     partial_sum: Float[Array, "c T d"], sequence_parallel: bool
 ) -> Float[Array, "c t d"]:
+    """Sum `partial_sum` over `tensor`, each device keeping its own positions under
+    sequence parallelism."""
     if sequence_parallel:
         return jax.lax.psum_scatter(partial_sum, AXIS, scatter_dimension=1, tiled=True)
     return jax.lax.psum(partial_sum, AXIS)

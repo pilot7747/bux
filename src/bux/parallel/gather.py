@@ -18,6 +18,7 @@ its own shard_map, made manual over those axes too (``apart``).
     splits               each parameter's split over them
     gather               a device's shard of a parameter, gathered whole
     scatter              a device's part of a gradient, summed over them, as a shard
+    added                a microbatch's gradients added into the step's sums
     own_streams          each device's own RNG keys, for its own rows' masks
     apart                says the step computes its rows apart, which a pipeline reads
 """
@@ -33,10 +34,10 @@ from flax import nnx
 from jax.sharding import Mesh
 from jax.sharding import PartitionSpec as P
 from jax.typing import DTypeLike
-from jaxtyping import Array, Float, Int, Shaped
+from jaxtyping import Array, Float, Int, PyTree, Shaped
 
-from bux.parallel.layout import axes
-from bux.parallel.mesh import active
+from bux.parallel.layout import as_split, axes_of, partition, split_axes
+from bux.parallel.mesh import active, manual_axes
 from bux.parallel.place import shardings
 
 Axes = tuple[str, ...]
@@ -54,12 +55,7 @@ def rows() -> Axes:
     """Return the axes of the run's mesh that split a batch's rows, as `layout.batch`
     gives them, but those of size 1 and those a shard_map being traced maps."""
     on = active()
-    if on is None:
-        return ()
-    manual = set(jax.sharding.get_abstract_mesh().manual_axes)
-    return tuple(
-        a for a in axes(on.layout, "batch") if on.size(a) > 1 and a not in manual
-    )
+    return () if on is None else split_axes(on, "batch", skip=manual_axes())
 
 
 def spans_processes(processes: Int[np.ndarray, "..."], axes: tuple[int, ...]) -> bool:
@@ -88,12 +84,10 @@ def rows_span_processes() -> bool:
 def splits(params: nnx.State, over: Axes) -> nnx.State:
     """Return each parameter's spec on the axes `over`: how it splits over them."""
 
-    def kept(s: str | tuple[str, ...] | None) -> str | tuple[str, ...] | None:
-        names = () if s is None else (s,) if isinstance(s, str) else s
-        names = tuple(a for a in names if a in over)
-        return None if not names else names[0] if len(names) == 1 else names
+    def kept(spec: P) -> P:
+        return partition([tuple(a for a in as_split(e) if a in over) for e in spec])
 
-    return jax.tree.map(lambda s: P(*map(kept, s.spec)), shardings(params))
+    return jax.tree.map(lambda s: kept(s.spec), shardings(params))
 
 
 def gather(spec: P, x: Shaped[Array, "*s"]) -> Shaped[Array, "*w"]:
@@ -112,13 +106,17 @@ def scatter(
     keeping the shard that `spec` gives this device: a reduce-scatter over the axes
     of `spec`, and an all-reduce over the rest."""
     g = _summable(g.astype(dtype))
-    split = set()
     for dim, along in enumerate(spec):
         if along is not None:
             g = jax.lax.psum_scatter(g, along, scatter_dimension=dim, tiled=True)
-            split |= {along} if isinstance(along, str) else set(along)
-    rest = tuple(a for a in over if a not in split)
+    rest = tuple(a for a in over if a not in axes_of(spec))
     return (jax.lax.psum(g, rest) if rest else g).astype(dtype)
+
+
+def added(total: PyTree, part: PyTree) -> PyTree:
+    """Return `total` with `part` added, leaf by leaf, in `total`'s dtypes: a
+    microbatch's gradients or metrics added into the step's sums."""
+    return jax.tree.map(lambda a, b: a + b.astype(a.dtype), total, part)
 
 
 def _summable(g: Float[Array, "*s"]) -> Float[Array, "*s"]:
@@ -175,5 +173,5 @@ def apart(over: Axes) -> Generator[None]:
 
 def rows_apart() -> Axes:
     """Return the axes `apart` put in force, but those a shard_map being traced maps."""
-    manual = set(jax.sharding.get_abstract_mesh().manual_axes)
+    manual = manual_axes()
     return tuple(a for a in APART.get() if a not in manual)

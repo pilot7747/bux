@@ -8,7 +8,9 @@ keys are counted from a document's first key, so none spans two documents.
 It ranks a chunk of queries at a time (``sparse.chunked``), so that no t by t floats
 are made, on a GPU by ``scoring``'s kernel; it keeps each query's top-k by index
 (``sparse.Kept``), named `attention.index` for a remat policy to keep, and its loss
-scores the kept keys of each chunk again.
+scores the kept keys again: on a GPU by ``scoring``'s kernels, which gather each
+query's up to its last, and its backward pass adds their gradients into the keys
+atomically.
 """
 
 from collections.abc import Callable
@@ -27,6 +29,7 @@ from bux.architecture.attention.sparse import Kept, Span, chunked, chunks, mask
 from bux.architecture.common.sharding import projection, shard_heads
 from bux.architecture.layers.norm import Norm
 from bux.architecture.repeats import remat
+from bux.train import flops
 
 # DeepSeek-V3.2's indexer keys, projected from the layer's input, are layer-normalized.
 _STREAM_KEY_NORM = cfg.NormalizationConfig(type="layernorm", bias=True)
@@ -109,6 +112,13 @@ def _top(scores: Float[Array, "b t n"], top_k: int) -> Int[Array, "b t k"]:
     room = k - above.sum(-1, keepdims=True)
     kept = (above | (tied & (jnp.cumsum(tied, -1) <= room))) & (scores > -jnp.inf)
     return _indices(kept, k)
+
+
+def _weighed(
+    dots: Float[Array, "b t h s"], weights: Float[Array, "b t h"]
+) -> Float[Array, "b t s"]:
+    """Return the heads' ReLU'd dot products, summed by their weights."""
+    return jnp.einsum("bths,bth->bts", jax.nn.relu(dots), weights)
 
 
 def _dense(k: int, n: int) -> bool:
@@ -241,8 +251,9 @@ class Indexer(nnx.Module):
     ) -> Float[Array, "b t s"]:
         """Return every query's score for every key."""
         x, query = jax.lax.stop_gradient((x, query))
-        dots = jnp.einsum("bthi,bsi->bths", self._queries(query, pos), keys)
-        return self._weigh(x, dots)
+        q, w = self._queries(query, pos), self._head_weights(x)
+        with flops.over_keys():
+            return _weighed(jnp.einsum("bthi,bsi->bths", q, keys), w)
 
     def _scores_at(
         self,
@@ -252,14 +263,18 @@ class Indexer(nnx.Module):
         keys: Float[Array, "b s i"],
         index: Int[Array, "b t k"],
     ) -> Float[Array, "b t k"]:
-        """Return each query's scores for the keys at its `index`, its kept ones. The
-        keys are gathered in float32: the gradient adds into a key once for every
-        query that keeps it, which in bfloat16 a GPU does one at a time."""
+        """Return each query's scores for the keys at its `index`, its kept ones: by
+        ``scoring``'s kernels where they run, else gathered by XLA in float32, as the
+        gradient adds into a key once for every query that keeps it, which in
+        bfloat16 a GPU does one at a time."""
         x, query = jax.lax.stop_gradient((x, query))
+        q, w = self._queries(query, pos), self._head_weights(x)
+        if self._picked_by_kernel(index.shape[-1]):
+            return scoring.picked(q, w, keys, index)
         rows = jax.vmap(lambda k, i: k[i])
         picked = rows(keys.astype(jnp.float32), jnp.maximum(index, 0))
-        dots = jnp.einsum("bthi,btki->bthk", self._queries(query, pos), picked)
-        return self._weigh(x, dots)
+        with flops.over_picks():
+            return _weighed(jnp.einsum("bthi,btki->bthk", q, picked), w)
 
     def _ranking(
         self,
@@ -293,12 +308,6 @@ class Indexer(nnx.Module):
         if self.q_norm is not None:
             q = self.q_norm(q)
         return shard_heads(self._rotate(q, pos))
-
-    def _weigh(
-        self, x: Float[Array, "b t d"], dots: Float[Array, "b t h s"]
-    ) -> Float[Array, "b t s"]:
-        """Return the heads' ReLU'd dot products summed, by the weights if learned."""
-        return jnp.einsum("bths,bth->bts", jax.nn.relu(dots), self._head_weights(x))
 
     def _head_weights(self, x: Float[Array, "b t d"]) -> Float[Array, "b t h"]:
         """Return each head's weight in a query's scores, with the head dims' scale."""
@@ -356,14 +365,17 @@ class Indexer(nnx.Module):
         heads and normalized over the kept keys, which `target` gives for a chunk of
         `xs` (arrays of (b, t, ...)), `width` elements a query. A block's p is its most
         attended key's (Qwen3.8 QSA, eqs. 17 and 20). It scores each chunk of
-        queries' kept keys again, and so does its backward pass."""
+        queries' kept keys again, and so does its backward pass; p it takes once."""
 
-        def kl(both: tuple) -> Float[Array, "b c"]:
-            (x, query, pos, kept), xs = both
-            p = jax.lax.stop_gradient(target(xs).astype(jnp.float32))
+        def kept_target(both: tuple) -> Float[Array, "b c k"]:
+            (*_, kept), xs = both
+            p = target(xs).astype(jnp.float32)
             if scored.block is not None:
                 p = _per_block(p, scored.block, "max")
-            p = jnp.take_along_axis(p, jnp.maximum(kept, 0), axis=-1)
+            return jnp.take_along_axis(p, jnp.maximum(kept, 0), axis=-1)
+
+        def kl(both: tuple) -> Float[Array, "b c"]:
+            (x, query, pos, kept), p = both
             scores = self._scores_of(x, query, pos, scored.keys, kept)
             return _kl(p, scores.astype(jnp.float32), kept >= 0)
 
@@ -371,7 +383,10 @@ class Indexer(nnx.Module):
         k, n = scored.kept.shape[-1], scored.keys.shape[1]
         per = self.heads * n if _dense(k, n) else k * max(self.heads, self.head_dim)
         count = chunks(scored.x.shape[1], max(per, width))
-        return chunked(jax.checkpoint(kl), (own, xs), count).mean()
+        p = jax.lax.stop_gradient(chunked(kept_target, (own, xs), count))
+        if not _dense(k, n) and self._picked_by_kernel(k):
+            count = 1  # its kernels make no intermediate of every head
+        return chunked(jax.checkpoint(kl), (own, p), count).mean()
 
     def _scores_of(
         self,
@@ -387,6 +402,11 @@ class Indexer(nnx.Module):
             return self._scores_at(x, query, pos, keys, index)
         every = self.scores(x, query, pos, keys)
         return jnp.take_along_axis(every, jnp.maximum(index, 0), axis=-1)
+
+    def _picked_by_kernel(self, k: int) -> bool:
+        """Return whether ``scoring``'s kernels score each query's k picks: they stop
+        at its last, so a query of a short document takes few steps."""
+        return scoring.picked_runs(self.heads, self.head_dim, k)
 
     def _blocks(
         self,

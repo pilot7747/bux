@@ -20,7 +20,7 @@ from bux import parallel
 from bux.architecture import Model
 from bux.data.pipeline import jobs, prepare
 from bux.lang import compile
-from bux.parallel.layout import fsdp
+from bux.parallel.layout import as_split, fsdp
 from bux.parallel.mesh import grid, split
 from bux.train import config as tcfg
 from bux.train.data import batches, permuted
@@ -45,9 +45,9 @@ def _sizes(per_node: int = 8, nodes: int = 2, **axes: int) -> dict[str, int]:
     return parallel.sizes(tcfg.MeshConfig.model_validate(axes), per_node * nodes)
 
 
-def _split(**axes: int) -> list[dict[str, int]]:
+def _split(nodes: int = 2, **axes: int) -> list[dict[str, int]]:
     """What a node of 8 holds of `axes`, and what spans nodes: the axes above 1."""
-    halves = split(_sizes(**axes), per_node=8)
+    halves = split(_sizes(nodes=nodes, **axes), per_node=8)
     return [{a: n for a, n in half.items() if n > 1} for half in halves]
 
 
@@ -75,6 +75,12 @@ def test_a_node_fills_from_tensor_outward_and_the_outer_axes_span_nodes():
     assert _split(data=2, fsdp=4, tensor=2) == [{"fsdp": 4, "tensor": 2}, {"data": 2}]
     assert _split(stage=2, fsdp=2, tensor=4) == [{"fsdp": 2, "tensor": 4}, {"stage": 2}]
     assert _split(fsdp=4, expert=4) == [{"fsdp": 2, "expert": 4}, {"fsdp": 2}]
+    # The four-node suite's meshes, and the eight nodes' pipeline
+    assert _split(4, fsdp=32) == [{"fsdp": 8}, {"fsdp": 4}]
+    assert _split(4, data=4, fsdp=8) == [{"fsdp": 8}, {"data": 4}]
+    assert _split(4, data=4, expert=8) == [{"expert": 8}, {"data": 4}]
+    assert _split(4, stage=4, fsdp=8) == [{"fsdp": 8}, {"stage": 4}]
+    assert _split(8, stage=4, data=2, fsdp=8) == [{"fsdp": 8}, {"stage": 4, "data": 2}]
 
 
 def test_axes_that_do_not_fill_nodes_from_tensor_outward_are_an_error():
@@ -173,15 +179,14 @@ print(jax.config.jax_compilation_cache_dir)
 """
 
 
-def _kept(folders: list[Path]) -> list[str]:
-    """Where two processes, whose caches are `folders`, keep them once joined."""
+def _joined(folders: list[Path], **more: str) -> list[str]:
+    """What two processes, whose caches are `folders`, print once joined, with `more`
+    in their environment."""
     with socket.socket() as s:
         s.bind(("localhost", 0))
         port = s.getsockname()[1]
-    env = os.environ | {
-        "JAX_COORDINATOR_ADDRESS": f"localhost:{port}",
-        "JAX_NUM_PROCESSES": "2",
-    }
+    env = os.environ | more
+    env |= {"JAX_COORDINATOR_ADDRESS": f"localhost:{port}", "JAX_NUM_PROCESSES": "2"}
     workers = [
         subprocess.Popen(
             [sys.executable, "-c", JOINED],
@@ -192,7 +197,12 @@ def _kept(folders: list[Path]) -> list[str]:
         )
         for i, f in enumerate(folders)
     ]
-    return [w.communicate(timeout=120)[0].strip().split("\n")[-1] for w in workers]
+    return [w.communicate(timeout=120)[0].strip() for w in workers]
+
+
+def _kept(folders: list[Path]) -> list[str]:
+    """Where two processes, whose caches are `folders`, keep them once joined."""
+    return [printed.split("\n")[-1] for printed in _joined(folders)]
 
 
 def test_processes_keep_their_cache_only_where_it_is_one_folder_for_all(tmp_path):
@@ -200,6 +210,12 @@ def test_processes_keep_their_cache_only_where_it_is_one_folder_for_all(tmp_path
     assert _kept([one, one]) == [str(one)] * 2
     assert not list(one.iterdir())  # the marker is gone
     assert _kept([tmp_path / "a", tmp_path / "b"]) == ["None", "None"]
+
+
+def test_processes_the_variables_join_ask_no_cluster_how_to(tmp_path):
+    # As on a Kubernetes pod, where jax's detection would warn of a missing client.
+    printed = _joined([tmp_path] * 2, KUBERNETES_SERVICE_HOST="10.0.0.1")
+    assert not any("Kubernetes" in p for p in printed)
 
 
 # --- FSDP over several axes ------------------------------------------------------------
@@ -213,17 +229,13 @@ def _splits(source: str, layout: tcfg.LayoutConfig, **mesh: int) -> list[tuple]:
         found = parallel.shardings(nnx.state(params, nnx.Param))
     variables = jax.tree.leaves(nnx.state(params, nnx.Param), is_leaf=_variable)
     return [
-        (x.get_metadata().get(parallel.NAMES), [_axes(e) for e in s.spec])
+        (x.get_metadata().get(parallel.NAMES), [set(as_split(e)) for e in s.spec])
         for x, s in zip(variables, jax.tree.leaves(found), strict=True)
     ]
 
 
 def _variable(x: object) -> bool:
     return isinstance(x, nnx.Variable)
-
-
-def _axes(entry: str | tuple[str, ...] | None) -> set[str]:
-    return set() if entry is None else {entry} if isinstance(entry, str) else set(entry)
 
 
 def test_fsdp_splits_dense_parameters_over_context_and_expert_too_and_experts_keep_theirs():

@@ -18,9 +18,9 @@ from jax.sharding import PartitionSpec as P
 from jaxtyping import Array, Bool, Float, Int
 
 from bux.parallel import flash, methods
-from bux.parallel.flash import Keys
-from bux.parallel.layout import shard, spec
-from bux.parallel.mesh import active
+from bux.parallel.flash import Keys, per_query_head
+from bux.parallel.layout import as_split, axes_of, shard, spec
+from bux.parallel.mesh import active, free_axes
 from bux.train import flops
 
 AXIS = "context"
@@ -74,17 +74,12 @@ def shard_logits(logits: Float[Array, "b h t s"]) -> Float[Array, "b h t s"]:
     return shard(logits, "batch", "heads", "seq", None)
 
 
-def _per_query_head(kv: Float[Array, "b s g e"], heads: int) -> Float[Array, "b s h e"]:
-    """Repeat keys or values for every query head of their group."""
-    return jnp.repeat(kv, heads // kv.shape[2], axis=2)
-
-
 def scaled_logits(
     q: Float[Array, "b t h dk"], k: Float[Array, "b s g dk"], scale: float
 ) -> Float[Array, "b h t s"]:
     """Return every query's dot product with every key, times `scale`, in float32;
     the keys stay whole along their positions."""
-    k = _per_query_head(k, q.shape[2])
+    k = per_query_head(k, q.shape[2])
     logits = jnp.einsum("bthk,bshk->bhts", q, k, preferred_element_type=jnp.float32)
     return shard_logits(logits * scale)
 
@@ -118,7 +113,7 @@ def weighted_values(
     probs: Float[Array, "b h t s"], v: Float[Array, "b s g dv"]
 ) -> Float[Array, "b t h dv"]:
     """Return every query's values, weighted by its probabilities."""
-    v = _per_query_head(v, probs.shape[1])
+    v = per_query_head(v, probs.shape[1])
     return jnp.einsum("bhts,bshv->bthv", probs.astype(v.dtype), v)
 
 
@@ -134,7 +129,7 @@ def xla(
     and value: all-gather context parallelism."""
     t = q.shape[1]
     mask = causal_mask(t, args.window, args.ids)[..., None, :, :]
-    with flops.visible(flops.causal_share(t, args.window)):  # for MFU
+    with flops.attention(args.window), flops.over_keys():  # for MFU
         logits = softcap(scaled_logits(q, k, args.scale), args.softcap)
         return weighted_values(masked_softmax(logits, mask, args.sinks), v)
 
@@ -142,22 +137,10 @@ def xla(
 # --- on each device -----------------------------------------------------------------
 
 
-def _axes(split: str | tuple[str, ...] | None) -> set[str]:
-    """Return the mesh axes of one dimension of a partition spec."""
-    return set() if split is None else {split} if isinstance(split, str) else set(split)
-
-
-def _free_axes() -> set[str]:
-    """Return the axes of the run's mesh that no shard_map being traced maps."""
-    on = active()
-    assert on is not None
-    return set(on.mesh.axis_names) - set(jax.sharding.get_abstract_mesh().manual_axes)
-
-
 def splits_positions(q: Float[Array, "b t h dk"]) -> bool:
     """Return whether the run's layout splits the positions of `q` over `context`."""
     split = spec(("batch", "seq", "heads", None), q.shape)
-    return len(split) > 1 and AXIS in _axes(split[1])
+    return len(split) > 1 and AXIS in as_split(split[1])
 
 
 def _specs(
@@ -172,7 +155,7 @@ def _specs(
     queries = spec(("batch", None, "heads", None), q.shape)
     keys = spec(("batch", None, "kv_heads", None), k.shape)
     if keys[2] != queries[2]:
-        k, v = (_per_query_head(x, q.shape[2]) for x in (k, v))
+        k, v = (per_query_head(x, q.shape[2]) for x in (k, v))
         keys = queries
     positions = AXIS if seq else None
     return k, v, P(queries[0], positions, queries[2]), P(keys[0], positions, keys[2])
@@ -200,9 +183,29 @@ def on_devices(
         body,
         in_specs=(queries, keys, keys, P(*queries[:2]), P(queries[2])),
         out_specs=queries,
-        axis_names=_free_axes(),
+        axis_names=free_axes(),
         check_vma=False,
     )(q, k, v, rows, sinks)
+
+
+# Rows up to this long run XLA's own cummax and cumsum, longer ones (long context, split
+# over `context`) a prefix scan of log2(t) steps. There XLA's take 2 and 25 ms a row of
+# 128k on a B300; in rows of 4096 the scan took a 1f1b pipeline of the 1.3B 1.6% slower.
+SCAN_ROWS = 8192
+
+
+def running_max(x: Int[Array, "b t"]) -> Int[Array, "b t"]:
+    """Return the largest of each row's values up to each of its tokens."""
+    if x.shape[1] <= SCAN_ROWS:
+        return jax.lax.cummax(x, axis=1)
+    return jax.lax.associative_scan(jnp.maximum, x, axis=1)
+
+
+def running_sum(x: Int[Array, "b t"]) -> Int[Array, "b t"]:
+    """Return the sum of each row's values up to each of its tokens."""
+    if x.shape[1] <= SCAN_ROWS:
+        return jnp.cumsum(x, axis=1)
+    return jax.lax.associative_scan(jnp.add, x, axis=1)
 
 
 def document_starts(ids: Int[Array, "b t"]) -> Int[Array, "b t"]:
@@ -212,7 +215,7 @@ def document_starts(ids: Int[Array, "b t"]) -> Int[Array, "b t"]:
     new = jnp.concatenate(
         [jnp.ones_like(ids[:, :1], bool), ids[:, 1:] != ids[:, :-1]], 1
     )
-    return jax.lax.cummax(jnp.where(new, index, 0), axis=1)
+    return running_max(jnp.where(new, index, 0))
 
 
 def first_keys(args: AttentionArgs, b: int, t: int) -> Int[Array, "b t"] | None:
@@ -330,7 +333,7 @@ def _ulysses(
             "heads of a device"
         )
     if g % c:
-        k, v = (jnp.repeat(x, h // g, axis=2) for x in (k, v))
+        k, v = (per_query_head(x, h) for x in (k, v))
     if ids is not None:
         ids = jax.lax.all_gather(ids, AXIS, axis=1, tiled=True)
     if sinks is not None:
@@ -486,7 +489,7 @@ def _context_parallel(
     on rows of one document."""
     on = active()
     assert on is not None
-    heads = q.shape[2] // on.size(*_axes(spec(("heads",), q.shape[2:3])[0]))
+    heads = q.shape[2] // on.size(*axes_of(spec(("heads",), q.shape[2:3])))
     if heads % on.size(AXIS) == 0:
         return ulysses(q, k, v, args)
     return methods.attention.find("ring")(q, k, v, args)

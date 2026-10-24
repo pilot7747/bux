@@ -74,7 +74,8 @@ def abstract(
 ) -> "tuple[nnx.Module, nnx.Optimizer] | None":
     """Build the run's model and optimizer from shapes alone; None if the backend
     lacks a layer. Under the run's mesh on `gpus` GPUs if it fits, with repeats
-    scanned and pipelined as the methods say, else outside any mesh.
+    scanned and pipelined as the methods say, on the stages training balances
+    (``stages.balanced``), else outside any mesh.
 
     ``graph_updates=False`` skips flax's sharding of the shapes, which under a mesh
     fails on the masked nodes in Muon's state; ``memory`` shards them itself."""
@@ -84,6 +85,7 @@ def abstract(
     from bux import parallel
     from bux.architecture import Model
     from bux.train.optim import optimizer
+    from bux.train.stages import balanced
 
     t = run.train
 
@@ -97,7 +99,7 @@ def abstract(
     try:
         if grid is None:
             return nnx.eval_shape(make, graph_updates=False)
-        with parallel.use(grid, t.layout, t.methods):
+        with parallel.use(grid, t.layout, balanced(run)):
             return nnx.eval_shape(make, graph_updates=False)
     except NotImplementedError:
         return None
@@ -152,12 +154,13 @@ def memory(
 
 
 def flops_per_token(run: Run) -> float | None:
-    """Return the model FLOPs a training token of `run` takes
+    """Return the model FLOPs a training token of `run` takes in rows of one document
     (``trainer.step_flops``); None if the backend lacks a layer."""
     from bux.train.trainer import step_flops
 
+    t = run.train
     try:
-        return step_flops(run) / (run.train.batch * run.train.seq_len)
+        return step_flops(run).one_document(t.seq_len) / (t.batch * t.seq_len)
     except NotImplementedError:
         return None
 
