@@ -10,7 +10,8 @@ memory until the backward reads it, and computes everything else again
 `first`, only the first passes of each repeat are, and the rest keep everything
 (``tracing.current_pass``). A policy is also a name in `methods.remat`
 (``PRESETS``): `none` keeps everything, but in a scanned pass, which keeps all but
-what elementwise ops make (``unfused``).
+what elementwise ops make (``unfused``). `auto` is the first of ``CANDIDATES``, the
+fastest first, whose training step fits in the device's memory (bux.train.fitting).
 
 Layers name what is worth keeping (``checkpoint_name``):
 
@@ -115,17 +116,38 @@ methods.remat.register("none")(jax.checkpoint_policies.everything_saveable)
 for _name, _preset in PRESETS.items():
     methods.remat.register(_name)(keeping(_preset.save, _preset.offload))
 
+# What `auto` tries, the fastest first, as they train on B300s (docs/parallelism.md).
+CANDIDATES = ("none", "dots_attention", "dots", "save_attention", "full")
+# A forward outside a training step, which `auto` chooses for, keeps everything.
+methods.remat.register("auto")(jax.checkpoint_policies.everything_saveable)
+
 # Set while a rematerialized call traces, so that what it calls is not again.
 _REMATTED = contextvars.ContextVar("rematted", default=False)
+# Set while a training step traces under one of `auto`'s candidates.
+_TRYING = contextvars.ContextVar[str | None]("trying", default=None)
 # Set while a call traces under a policy of the run's: what `named` names, only it
 # keeps. Under `unfused`, naming would keep what it makes the backward compute again.
 _NAMING = contextvars.ContextVar("naming", default=False)
 
 
 def setting() -> str | RematConfig:
-    """Return the run's `methods.remat`, or none outside ``parallel.use``."""
+    """Return the run's `methods.remat`, or none outside ``parallel.use``: under
+    `auto`, the candidate a training step is trying (``trying``)."""
     on = parallel.active()
-    return on.methods.remat if on else "none"
+    remat = on.methods.remat if on else "none"
+    if remat == "auto" and (candidate := _TRYING.get()) is not None:
+        return candidate
+    return remat
+
+
+@contextlib.contextmanager
+def trying(candidate: str) -> Generator[None]:
+    """Trace the block under `candidate`, where the run's remat is `auto`."""
+    token = _TRYING.set(candidate)
+    try:
+        yield
+    finally:
+        _TRYING.reset(token)
 
 
 def _found(remat: str | RematConfig) -> Policy:

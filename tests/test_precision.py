@@ -640,14 +640,16 @@ GROUPED = {
     "roles=roles(experts=mxfp8)": 4,
     "roles=roles(experts=mxfp8_2d)": 4,
     "matmuls=nvfp4, roles=roles(experts=mxfp8)": 4,
-    "matmuls=mxfp8": 0,  # none is compute, for the experts
+    "matmuls=mxfp8": 4,  # none is matmuls, where a grouped GEMM takes it
+    "matmuls=mxfp8_2d": 4,
+    "matmuls=nvfp4": 0,  # else compute
     "matmuls=mxfp8, roles=roles(experts=compute)": 0,
     "roles=roles(experts=mxfp8), first=1": 2,  # the first MoE is the first branch
 }
 
 
 @pytest.mark.parametrize("given", GROUPED)
-def test_the_routed_experts_multiply_as_their_role_says_and_else_in_compute(
+def test_the_routed_experts_multiply_as_their_role_says_else_as_grouped_matmuls(
     monkeypatch, given
 ):
     calls, ragged_dot = [], grouped_blockscaled.ragged_dot
@@ -663,6 +665,25 @@ def test_the_routed_experts_multiply_as_their_role_says_and_else_in_compute(
     model = parallel.build(lambda: Model(run.arch, rngs=nnx.Rngs(0)))
     _block_scaled(model, run.train.precision)
     assert len(calls) == GROUPED[given]
+
+
+def _moe_id(precision: str) -> str:
+    [run] = compile_runs(_source(f"precision = {precision}", arch=ARCHITECTURES["moe"]))
+    return run.id
+
+
+def test_experts_that_take_mxfp8_from_matmuls_have_the_id_of_those_that_name_it():
+    """As they took compute before: a run that names their format keeps its id, and
+    one whose experts now multiply in MXFP8 takes a new one, as a launch must not find
+    it done."""
+    mxfp8 = "precision(compute=bfloat16, matmuls=mxfp8"
+    assert _moe_id(f"{mxfp8})") == _moe_id(f"{mxfp8}, roles=roles(experts=mxfp8))")
+    assert _moe_id(f"{mxfp8})") == "eba704299d"  # was 323f1a9b03
+    assert _moe_id(f"{mxfp8}, roles=roles(experts=compute))") == "7634531ac3"
+    assert _moe_id("precision(compute=bfloat16, matmuls=nvfp4)") == "cdc149c7c0"
+    assert _moe_id(BF16) == "c4987ef180"
+    [dense] = compile_runs(_source(f"precision = {mxfp8})"))
+    assert dense.id == "f66305703c"  # no experts: as before
 
 
 # In float32, as above; but the experts' dW quantizes in blocks of 32 of the rows each

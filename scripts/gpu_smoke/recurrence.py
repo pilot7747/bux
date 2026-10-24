@@ -1,10 +1,11 @@
 """Linear attention's and Mamba-2's recurrences by chunks (``chunkwise``) against their
 scans over positions, on one GPU at a hybrid's shapes, 2 rows of 4096 in packed
-documents: the outputs and every input's gradient, in float32. XLA's GPU fusions
-can differ from its CPU's, which the tests run: on a B300, a grouped einsum's took
-Mamba-2's gradients for B and C wrong. Then the delta rule by cuDNN's kernels
-(``fused_delta``), in bfloat16, against its chunks in float32: GDN's at steep gates
-and spikes, KDA's at a gate bounded at -5.
+documents: the outputs and every input's gradient, in float32; Mamba-2's also with
+its chunks computed again for the backward pass, as `methods(states=recompute)` runs
+them. XLA's GPU fusions can differ from its CPU's, which the tests run: on a B300, a
+grouped einsum's took Mamba-2's gradients for B and C wrong. Then the delta rule by
+cuDNN's kernels (``fused_delta``), in bfloat16, against its chunks in float32: GDN's
+at steep gates and spikes, KDA's at a gate bounded at -5.
 
     uv run --extra cuda python scripts/gpu_smoke/recurrence.py
 
@@ -21,7 +22,7 @@ from jaxtyping import Array, Float
 
 from bux.architecture import Segments
 from bux.architecture.recurrent import linear_attention, ssm
-from bux.parallel.recurrence import Chunked, Positions, Shared
+from bux.parallel.recurrence import Chunk, Chunked, Positions, Shared
 
 B, T = 2, 4096
 TOLERANCE = 1e-4  # of each gradient's norm, in float32
@@ -70,6 +71,19 @@ def linear(decay: int, delta: bool) -> Inputs:
     return make
 
 
+def recomputed(f: Chunked) -> Chunked:
+    """Return `f` whose backward pass computes it again from its inputs, as
+    `methods(states=recompute)` runs it."""
+
+    def run(xs: Positions, shared: Shared, transition: bool) -> Chunk:
+        def chunk(xs: Positions, shared: Shared) -> Chunk:
+            return f(xs, shared, transition)
+
+        return linear_attention.recomputed(chunk, "recompute")(xs, shared)
+
+    return run
+
+
 CASES: dict[str, tuple[Chunked, Chunked, Inputs]] = {
     "mamba2, 64 heads in 8 groups": (ssm.chunk, ssm.stepwise, mamba2(64, 8)),
     "mamba2, 64 heads in 1 group": (ssm.chunk, ssm.stepwise, mamba2(64, 1)),
@@ -88,6 +102,16 @@ CASES: dict[str, tuple[Chunked, Chunked, Inputs]] = {
         linear_attention.chunk,
         linear_attention.stepwise,
         linear(1, True),
+    ),
+    "mamba2, 8 groups, recomputed": (
+        recomputed(ssm.chunk),
+        ssm.stepwise,
+        mamba2(64, 8),
+    ),
+    "mamba2, 1 group, recomputed": (
+        recomputed(ssm.chunk),
+        ssm.stepwise,
+        mamba2(64, 1),
     ),
 }
 

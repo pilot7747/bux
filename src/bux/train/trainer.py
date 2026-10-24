@@ -48,7 +48,7 @@ from bux.data.pipeline import DEFAULT_CACHE, jobs, prepare
 from bux.lang import ir
 from bux.lang.printer import run_to_source
 from bux.parallel.gather import Axes
-from bux.train import flops, xla
+from bux.train import fitting, flops, stages, xla
 from bux.train.config import PrecisionConfig
 from bux.train.data import Batch, batches, prefetch
 from bux.train.hooks import Checkpoint, Eval, Hook, Log, Profile
@@ -340,8 +340,11 @@ class Trainer:
         self._compile()
 
     def _compile(self) -> None:
-        """Make the compiled steps, which read `matmuls` as they trace."""
-        self._train = xla.jit(
+        """Make the compiled steps, which read `matmuls` as they trace. Under remat
+        `auto`, the training step chooses its policy as it first compiles
+        (``fitting``)."""
+        jit = fitting.Fitting if remat.setting() == "auto" else xla.jit
+        self._train = jit(
             self._train_step_on_shards,
             self._compiler_options,
             donate_argnames=self._donated,
@@ -697,7 +700,10 @@ def train(
 
     multiplier = lr_multiplier(config.schedule, config.steps)
     log = _log(run, lr_schedule(config.optimizer.lr, multiplier))
-    with parallel.use(config.mesh, config.layout, config.methods):
+    methods = stages.balanced(run)
+    if methods.stages != config.methods.stages:
+        echo(f"{run.name}: methods.stages = {methods.stages}")
+    with parallel.use(config.mesh, config.layout, methods):
         parallel.check(config.batch, config.seq_len)
         _check_cpu_bfloat16(run)
         model = parallel.build(lambda: Model(run.arch, rngs=nnx.Rngs(config.seed)))

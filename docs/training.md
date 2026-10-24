@@ -180,7 +180,7 @@ Four settings choose which projections, and when:
   | `recurrence` | the linear attentions', RWKV-7's and Mamba's projections, but the output |
   | `recurrence_out` | their output projection |
   | `mtp` | nextn's projection, and every branch after the first head |
-  | `experts` | the routed experts, by a grouped GEMM: `compute`, `mxfp8` or `mxfp8_2d`; `none` is compute, not `matmuls`. In MXFP8 they train 6-13% faster than in bfloat16 on B300s (docs/parallelism.md) |
+  | `experts` | the routed experts, by a grouped GEMM: `compute`, `mxfp8` or `mxfp8_2d`; `none` is `matmuls` where it is one of those, else compute, as no grouped GEMM takes `nvfp4`. In MXFP8 they train 6-13% faster than in bfloat16 on B300s (docs/parallelism.md) |
 
   The embedding, the head, the router and softmax attention's own matmuls always
   stay in compute.
@@ -436,7 +436,7 @@ by itself where it cannot run, and all of them do inside `bux.kernels.off()` or 
 | softmax attention | `methods.attention = auto`, the default: cuDNN's fused attention in rows of 8192 or more and with a window, else tokamax's flash attention (sinks, a soft cap) | 7x, and no t × t logits |
 | sparse attention (DSA, QSA, CSA) | `sparse`: tokamax's flash attention with the kept keys as a mask; the indexer's scores by a Pallas kernel (`scoring`), its top-k by counting | 2.6x a chunk of queries at a time, and no t × t floats |
 | linear attention, RWKV-7 | `chunkwise`: chunks of 64 positions, the state across them by a Pallas kernel (`affine_scan`); `methods(states=recompute)` keeps a fourteenth of the memory for the backward | 14-17x a scan over positions |
-| Mamba-2 | `chunkwise`, B and C a group's, the state across chunks by a matmul | 25x a scan over positions (2 × 4096 tokens, rematerialized: at 8 × 4096 the scan needs 199 GiB) |
+| Mamba-2 | `chunkwise`, B and C a group's, the state across chunks by a matmul; `methods(states=recompute)` keeps a sixteenth of the memory for the backward | 25x a scan over positions (2 × 4096 tokens, rematerialized: at 8 × 4096 the scan needs 199 GiB) |
 | Gated DeltaNet, DeltaNet | cuDNN's fused GDN kernel (`fused_delta`), by cuDNN's graph from a `buffer_callback`: any gate | 5x `chunkwise` |
 | KDA with `gate_lower_bound` | cuDNN's fused KDA kernel (`fused_delta`) | 10x `chunkwise` |
 | MoE experts | `grouped.ragged_dot`: tokamax's Mosaic and Triton kernels | 27x `jax.lax.ragged_dot` |
@@ -523,8 +523,7 @@ rounded, saturated and packed by Blackwell's `cvt.rn` and `cvt.rs` (stochastic, 
 random bits a value). An MLP projection's forward and backward then take 1.07-1.1x
 less time than MXFP8's, but q's and o's 1.1x more and k's and v's 1.25x: the second
 pass, ~20 more small kernels a projection (scales for cuDNN's layout, the global
-scales) and the transform's copy, at 2-2.5 TB/s, cost more than their GEMMs save. The
-routed experts stay in bfloat16:
+scales) and the transform's copy, at 2-2.5 TB/s, cost more than their GEMMs save:
 
 | `matmuls`, 1.3B Llama-style | 1 GPU | 8, `mesh(fsdp=8)` |
 |-----------------------------|-------|-------------------|
@@ -533,8 +532,15 @@ routed experts stay in bfloat16:
 | `nvfp4`                     | 179k (1.22x), bfloat16 147k and `mxfp8` 169k beside it |   |
 
 On 300 steps of packed documents, autotuning pinned, `mxfp8`'s loss is bfloat16's to
-within the noise between seeds. The MoE trains as fast in `mxfp8` as in bfloat16,
-105k: its experts are most of its matmuls.
+within the noise between seeds. Under `mxfp8` the MoE's routed experts multiply in
+MXFP8 too, by the grouped MXFP8 GEMMs (`roles.experts`), and its other matmuls are few:
+by the benchmarks' MoE, 64 experts of 704, top 8, 8 rows of 4096 a GPU,
+
+| `precision`, the MoE | 1 GPU | 8, `mesh(fsdp=8)` |
+|----------------------|-------|-------------------|
+| `compute` (bfloat16) | 105k, 134.0 GiB | 824k, 83.8 GiB |
+| `matmuls=mxfp8, roles=roles(experts=compute)`, the experts in bfloat16 as before | 108k, 133.9 GiB | 837k, 83.5 GiB |
+| `matmuls=mxfp8` | 116k (1.10x), 119.4 GiB | 909k (1.10x), 69.1 GiB |
 
 Which projections multiply in `mxfp8`, on one B300 ([Precision](#precision)):
 
@@ -619,14 +625,38 @@ collectives take 14% of the step and hide all but 1.5% of it. A collective's tim
 includes the wait for its slowest peer, so on unevenly loaded devices, such as the
 ring's on packed rows, `exposed_comm_ms` swings between runs of one speed.
 
-Only scanned layers gain, under FSDP: `maxtext` trains the scanned 1.3B at 719k
-(three runs, against 656-662k), faster than the same unrolled (623k, and 572k under
-`maxtext`). Of its options, the pipelining and double buffering of `o1` give 3%, and
+Only scanned layers gain, under FSDP at a row a GPU: `maxtext` trains the scanned
+1.3B at 719k (three runs, against 656-662k), faster than the same unrolled (623k, and
+572k under `maxtext`). Of its options, the pipelining and double buffering of `o1` give 3%, and
 cuBLAS's GEMMs where XLA would take Triton's inside the loop
 (`--xla_gpu_enable_triton_gemm=false`) 5%; the combine thresholds, XLA's
 rematerialization and command buffers nothing. With TP the scanned layers gain nothing.
-So `default`, XLA's own options, stays the default, and a scanned FSDP run is worth
-`compiler(preset=maxtext)`.
+
+Scanned with `maxtext` against the defaults, unrolled with XLA's options, by the
+benchmarks' FSDP runs (`one_node.bux`, `two_nodes.bux`, [Benchmarks](#benchmarks)),
+20 steps, by rows of 4096 a GPU:
+
+| run | rows a GPU | `default`, unrolled | `maxtext`, scanned |
+|-----|------------|---------------------|--------------------|
+| the 1.3B, `fsdp=8` | 1 | 443k | 691k (+56%) |
+| | 2 | 909k | 870k (−4.3%) |
+| | 4 | 1.03M | 994k (−3.9%) |
+| | 8 | 1.11M | 1.08M (−3.4%) |
+| the MoE, `fsdp=8` | 8 | 815k | 713k (−12.5%) |
+| the 1.3B, `fsdp=16`, two nodes | 1 | 699k | 1.03M (+48%) |
+| | 8 | 2.18M | 2.12M (−2.8%) |
+
+On one GPU, the one-GPU suite at 8 rows, scanned with `maxtext` is slower for every
+model: the dense one by 6%, in MXFP8 and NVFP4 by 7-8%, the GDN hybrid by 7%, the
+Mamba-2 and KDA hybrids by 11%, bounded KDA by 23% and the MoE by 17%; and over
+`fsdp=8` the GDN hybrid by 23%.
+
+At a row a GPU an unrolled step waits for FSDP's gathers, and takes as long as one of
+two rows; the scan's loop, its collectives pipelined and its buffers doubled, hides
+them. From two rows a GPU the compute hides them anyway, and what the scan copies in
+and out of its stacks costs more than the loop saves. So the defaults stay: unrolled,
+with XLA's options. FSDP at a row a GPU, as a model too large for more trains, is
+worth `methods(repeat=scan)` with `compiler(preset=maxtext)`.
 
 ## Launching
 
@@ -765,8 +795,9 @@ with a folder of its own, twenty minutes before it timed out.
 and its kin in `baseline.bux`: `one_gpu.bux`, the dense model, its GDN, KDA, bounded
 KDA and Mamba-2 hybrids, its MoE, and the dense one in MXFP8 and NVFP4, a GPU each;
 `one_node.bux`, FSDP at 1 and 8 microbatches, the MoE sorted and by EP, TP=8 in
-chunks and a 1f1b pipeline, on 8 GPUs; and `two_nodes.bux`, FSDP, HSDP and the MoE
-both ways, on 16. `scripts/benchmark.py` trains a suite and compares two results:
+chunks and a 1f1b pipeline, on 8 GPUs; and `two_nodes.bux`, FSDP, HSDP, the GDN
+hybrid under HSDP and the MoE both ways, on 16. `scripts/benchmark.py` trains a suite
+and compares two results:
 
 ```
 python scripts/benchmark.py run examples/benchmarks/one_gpu.bux --out new.json
@@ -816,10 +847,11 @@ one_gpu[nvfp4]     182,654    183,500  +0.5%    56.4%     43.8     43.8    -0.00
 the last log. The node's suite, one tree after the other, moved by 0.3% at most: FSDP
 1.13M, at 8 microbatches 923k, the MoE sorted 832k and by EP 540k, TP 227k and the
 pipeline 683k; the two nodes' by 1.7%: FSDP and HSDP 2.21M, the MoE sorted 1.58M and
-by EP 1.04M. A run is `slower` or `faster` when its tokens a second move by more
-than `--noise` (3%), `more memory` or `less memory` when its peak does, `loss` when
-its last loss moves by more than `--loss` (0.05), and `failed`; `compare` exits with 1
-if any run is flagged but `faster` or `less memory`.
+by EP 1.04M (and the GDN hybrid, measured once, 1.60M). A run is `slower` or `faster`
+when its tokens a second move by more than `--noise` (3%), `more memory` or `less
+memory` when its peak does, `loss` when its last loss moves by more than `--loss`
+(0.05), and `failed`; `compare` exits with 1 if any run is flagged but `faster` or
+`less memory`.
 
 XLA's GEMM autotuner picks kernels by timing them, and some kernels add in no fixed
 order, so two runs of one tree round differently: on these random tokens the MoE,

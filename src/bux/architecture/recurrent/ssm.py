@@ -22,7 +22,7 @@ from bux.architecture.common.segments import Segments
 from bux.architecture.common.sharding import projection, shard_layer_input
 from bux.architecture.layers.conv import CausalConv
 from bux.architecture.layers.norm import Norm
-from bux.architecture.recurrent import chunkwise
+from bux.architecture.recurrent import chunkwise, linear_attention
 from bux.architecture.registry import Context, Taps, register, segments
 from bux.architecture.repeats import remat
 from bux.lang import ir
@@ -47,7 +47,9 @@ def selective_scan(
     position at a time; Mamba-2 has one A per head (n = 1 in A), and runs by chunks
     (`chunk`). The state starts at zero, and again where a document starts. It runs by
     the run's `methods.recurrence`, in float32, the outputs in x's dtype, named
-    `recurrence` (``remat.named``)."""
+    `recurrence` (``remat.named``), its states for the backward pass kept or computed
+    again by the run's `methods.states`, as linear attention's are
+    (``linear_attention.recomputed``)."""
     b, t = x.shape[:2]
     within = jnp.ones((b, t), jnp.int32) if docs is None else docs.within
     keep = (within > 0).astype(jnp.float32)  # 0 where a document starts
@@ -56,7 +58,8 @@ def selective_scan(
     def scan(xs: Positions, shared: Shared) -> Float[Array, "b t h p"]:
         return run(Recurrence("the selective scan", chunk, xs, shared))
 
-    y = remat.named("recurrence", scan, (x, dt, B, C, keep), (A,))
+    mix = linear_attention.recomputed(scan)
+    y = remat.named("recurrence", mix, (x, dt, B, C, keep), (A,))
     return y.astype(x.dtype)
 
 
