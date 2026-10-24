@@ -323,6 +323,10 @@ def run_sorted(
     fused kernels run them and FSDP splits them by expert as the layer runs, each
     device quantizes its own shard of them before they are gathered."""
     ffn, norm = moe.config.expert, moe.expert_norm
+    tokens = parallel.spec(("batch", "seq", None), z.shape)
+    if not parallel.axes_of(tokens):
+        return routed(z, idx, weights, *moe.kernels(), ffn, norm)
+    split = _split_by_expert(moe, tokens) if fused(ffn, norm, moe.up[...]) else ()
 
     def local(
         z: Float[Array, "b t d"],
@@ -330,23 +334,13 @@ def run_sorted(
         weights: Float[Array, "b t k"],
         kernels: Kernels,
     ) -> Float[Array, "b t d"]:
-        return routed(z, idx, weights, *kernels, ffn, norm)
-
-    def from_shards(
-        z: Float[Array, "b t d"],
-        idx: Int[Array, "b t k"],
-        weights: Float[Array, "b t k"],
-        shards: Kernels,
-    ) -> Float[Array, "b t d"]:
-        up, down, quantized = grouped_glu.gathered(*shards, split)
+        if not split:
+            return routed(z, idx, weights, *kernels, ffn, norm)
+        up, down, quantized = grouped_glu.gathered(*kernels, split)
         return routed(z, idx, weights, up, down, ffn, norm, quantized)
 
-    tokens = parallel.spec(("batch", "seq", None), z.shape)
-    if not parallel.axes_of(tokens):
-        return local(z, idx, weights, moe.kernels())
-    split = _split_by_expert(moe, tokens) if fused(ffn, norm, moe.up[...]) else ()
-    run, kernels = (from_shards, P(split)) if split else (local, P())
-    return in_shard_map(run, tokens, kernels, tokens)(z, idx, weights, moe.kernels())
+    kernels = P(split) if split else P()
+    return in_shard_map(local, tokens, kernels, tokens)(z, idx, weights, moe.kernels())
 
 
 def _split_by_expert(moe: MoE, tokens: P) -> tuple[str, ...]:

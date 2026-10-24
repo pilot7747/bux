@@ -493,6 +493,7 @@ by itself where it cannot run, and all of them do inside `bux.kernels.off()` or 
 | KDA without | bux's Pallas kernels (`pallas_delta`): any gate, each pair's decay through a position between them | 2.6x `chunkwise` |
 | MoE experts | `grouped.ragged_dot`: tokamax's Mosaic and Triton kernels | 27x `jax.lax.ragged_dot` |
 | MoE experts in MXFP8 | `grouped_mxfp8`: Mosaic GPU kernels of tcgen05's block-scaled MMA, the scales by TMA into tensor memory (docs/parallelism.md) | 1.5-2.4x tokamax's bfloat16 GEMMs |
+| MoE experts' SwiGLU in MXFP8 | `grouped_glu`: cuDNN's CuTe DSL grouped GEMMs, SwiGLU and its backward with their quantizations in the epilogues, each GPU's shard of the kernels quantized before FSDP gathers it (docs/parallelism.md) | 1.13-1.17x `grouped_mxfp8`'s layer |
 | MoE dispatch | `token_rows`, `token_sums`: gathers where XLA would scatter | 4x |
 | NVFP4's quantizers | `nvfp4`: Pallas kernels, a pass for the largest magnitudes and one that writes both copies, rounded by Blackwell's E2M1 conversions | 3-5x |
 
