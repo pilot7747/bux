@@ -192,7 +192,9 @@ class _Cut:
             model, nnx.All(nnx.Param, self._inside), self._inside, nnx.Param, ...
         )
         self.graphdef, self.piped, self.rest, self.others, self.kept = split
-        self.stand_ins = jax.tree.map(_stand_in, (self.piped, self.rest))
+        self.stand_ins = jax.tree.map(
+            parallel.scheduled.stand_in, (self.piped, self.rest)
+        )
         graphdef = nnx.graphdef(scanned.layers)
         self.stage = pipelined.Stage.of(graphdef, scanned.times, True, None)
 
@@ -263,10 +265,6 @@ def _check_outside(model: nnx.Module, inside: Callable[[tuple, object], bool]) -
                 f"{type(module).__name__} at {'.'.join(map(str, path))} learns from the "
                 "whole batch: put it in the repeat, or use methods(pipeline=gpipe)"
             )
-
-
-def _stand_in(a: Shaped[Array, "..."]) -> jax.ShapeDtypeStruct:
-    return jax.ShapeDtypeStruct(a.shape, a.dtype)
 
 
 def _under(state: nnx.State, path: tuple, rounds: int) -> nnx.State:

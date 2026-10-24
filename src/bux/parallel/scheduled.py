@@ -466,8 +466,8 @@ class Ticks:
             d_params, dx = vjp((dy, dl))
             return [*jax.tree.leaves(d_params), dx]
 
-        shared = [_shape(a) for a in [*params, *residuals]]
-        cotangents = [_shape(shapes.x), _shape(shapes.losses)]
+        shared = [stand_in(a) for a in [*params, *residuals]]
+        cotangents = [stand_in(shapes.x), stand_in(shapes.losses)]
         return split.split(backward, shared, cotangents, weight_grads=len(params))
 
     def _losses_cotangent(self) -> Losses:
@@ -571,7 +571,8 @@ def _merged(metrics: Metrics, more: Metrics) -> Metrics:
     return metrics | {k: v + metrics[k] if k in metrics else v for k, v in more.items()}
 
 
-def _shape(a: Leaf | jax.ShapeDtypeStruct) -> jax.ShapeDtypeStruct:
+def stand_in(a: Leaf | jax.ShapeDtypeStruct) -> jax.ShapeDtypeStruct:
+    """Return what traces in place of `a`: its shape and dtype alone."""
     return jax.ShapeDtypeStruct(a.shape, a.dtype)
 
 
