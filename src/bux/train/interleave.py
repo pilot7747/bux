@@ -15,10 +15,12 @@ residuals wait in a slot (``Slots``) until its backward:
         the head's loss of i+1, and its gradient
     backward of microbatch n-1
 
-Each tick ends in an optimization barrier on what both of its halves made, so XLA's
+Each tick ends in an optimization barrier on the stream and its gradient, so XLA's
 scheduler runs one half's collectives beside the other's compute, and no tick before
 its turn: the backward frees the top pieces' residuals as the forward fills the
-bottom ones, and a step holds about one microbatch's. Its program is about twice
+bottom ones, and a step holds about one microbatch's. The barrier also takes the
+gradients of the tick before, whose reduction then runs beside this tick, and which
+are the last to read the slot this tick's forward writes. Its program is about twice
 that of a step in a row: a forward and a backward on each side of the loop.
 """
 
@@ -169,10 +171,11 @@ def _check(taps: Taps, head: bool) -> None:
 class Slots:
     """Where each piece's residuals wait for its backward: a buffer for each kind of
     residuals (those of pieces whose residuals have the same shapes and dtypes), of
-    as many slots as a step holds of them at once (`sizes`). A backward frees its
-    slot at its tick, and the forward beside it takes the last its kind freed: in a
-    repeat of passes alike, each forward's residuals go where its tick's backward read
-    the other microbatch's (`table`, microbatch m's piece p's slot)."""
+    as many slots as a step holds of them at once (`sizes`). A forward takes the slot
+    its kind freed last, before its tick, and the backward beside it frees its own: in
+    a repeat of passes alike, each forward's residuals go where the tick before read
+    the other microbatch's (`table`, microbatch m's piece p's slot), and a step holds
+    one microbatch's."""
 
     def __init__(self, kinds: list[Signature], microbatches: int):
         self.shapes = list(dict.fromkeys(kinds))
@@ -211,8 +214,8 @@ def _assign(
     kind: list[int], kinds: int, microbatches: int
 ) -> tuple[Int[np.ndarray, "n p"], list[int]]:
     """Return the slot of each microbatch's pieces, and how many each kind takes, as
-    the ticks free and take them: each backward's slot at its tick, and then the
-    forward's beside it takes the last its kind freed, or a new one."""
+    the ticks take and free them: at each, the forward takes the last its kind freed
+    before (or a new one), and then the backward beside it frees its own."""
     free: list[list[int]] = [[] for _ in range(kinds)]
     sizes = [0] * kinds
 
@@ -227,8 +230,8 @@ def _assign(
     table[0] = [take(k) for k in kind]
     for m in range(1, microbatches):
         for t in range(p):
-            free[kind[p - 1 - t]].append(int(table[m - 1, p - 1 - t]))
             table[m, t] = take(kind[t])
+            free[kind[p - 1 - t]].append(int(table[m - 1, p - 1 - t]))
     return table, sizes
 
 
@@ -358,19 +361,23 @@ class Step:
         residuals in the slots `read`, and the new ones into those of `write`."""
         rows, (grads, rest, buffers, dy) = Rows.of(batch, share), held
         x, losses, r = jnp.asarray(rows.batch.input_ids), [], len(self.pieces)
+        before: Flat = {}  # the tick before's gradients
         with tracing.forward(self.main):
             for t in range(r):
                 q = r - 1 - t
                 f = self._forward(t, rest, x, rows)
                 d_params, dx = self._backward(q, slots.read(buffers, q, read[q]), dy)
-                # The tick's end: the next starts once both of its halves are done,
-                # and only then does the forward's write where the backward read.
-                done = (f.y, dx, d_params, buffers)
-                x, dy, d_params, buffers = jax.lax.optimization_barrier(done)
+                # The tick's end: the next starts once both halves are done, and the
+                # forward writes its slot once what read it last, the gradients of
+                # the tick before, is reduced too.
+                done = (f.y, dx, before, buffers)
+                x, dy, before, buffers = jax.lax.optimization_barrier(done)
                 buffers = slots.write(buffers, t, write[t], _leaves(f.vjp))
-                grads, rest, losses = _added(grads, d_params), f.rest, losses + f.losses
+                grads, before = _added(grads, before), d_params
+                rest, losses = f.rest, losses + f.losses
             metrics, d_head, dy, rest = self._loss(rest, x, rows, losses)
-        return Held(_added(grads, d_head), rest, buffers, dy), metrics
+        grads = _added(_added(grads, before), d_head)
+        return Held(grads, rest, buffers, dy), metrics
 
     def _last(self, held: Held, slots: Slots, table: Int[np.ndarray, " p"]) -> Held:
         """Take the last microbatch's gradient back through every piece but the head,

@@ -114,14 +114,14 @@ def test_a_run_interleaved_trains_as_its_microbatches_in_a_row(losses, arch):
 
 def test_a_repeat_of_passes_alike_holds_one_microbatch_of_residuals():
     """The embedding and four passes alike: a forward's residuals go to the slot the
-    backward beside it read, and the passes take four slots, as one microbatch."""
+    tick before read, and the passes take four slots, as one microbatch."""
     embed = (((16, 32), jnp.dtype("int32")),)
     layer = (((16, 64), jnp.dtype("float32")),)
     slots = interleave.Slots([embed, *[layer] * 4], 3)
     assert slots.sizes == [2, 4]
     for before, after in zip(slots.table, slots.table[1:], strict=False):
-        assert after[1:4].tolist() == before[1:4][::-1].tolist()
-        assert sorted(after[1:].tolist()) == [0, 1, 2, 3]
+        assert after[1:].tolist() == before[1:][::-1].tolist()
+        assert after[0] != before[0]
 
 
 def test_a_model_whose_pieces_pass_more_than_the_stream_is_an_error():
