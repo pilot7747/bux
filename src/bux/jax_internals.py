@@ -8,7 +8,6 @@ one. After an upgrade, run it (on a GPU node too) and scripts/gpu_smoke/*.py, fi
 here what fails, and set `VERIFIED_ON` to the new versions.
 """
 
-import functools
 from collections.abc import Callable, Iterator, Sequence
 from typing import Any
 
@@ -20,7 +19,7 @@ from jax._src.cudnn import fused_attention_stablehlo as cudnn_fused
 from jax._src.cudnn.scaled_matmul_stablehlo import _scaled_matmul_p
 from jax.experimental import buffer_callback as callbacks
 from jax.experimental.xla_metadata import xla_metadata_call2
-from jax.extend import core, xla
+from jax.extend import core
 from jaxtyping import Array, Float, Int, Shaped
 
 # The packages whose internals below were checked, at these versions.
@@ -257,9 +256,9 @@ def on_stream(stream: str, run: Callable[[], Any], first: int = 0) -> Any:
     XLA's scheduler starts the call as soon as its inputs are ready and waits for it
     as late as its results are needed, so that whatever else is ready runs beside it
     (the hint force_delay_async); of such calls ready at once, a higher `first`
-    starts first (scheduler_delay_priority). jax's compute_on takes no hints. Its
-    results come off the stream as they are (``parts_off_the_stream``)."""
-    _keep_parts_off_the_stream()
+    starts first (scheduler_delay_priority). jax's compute_on takes no hints. In a
+    shard_map its results come off the stream as they are only where XLA runs
+    ``parts_off_the_stream`` before its scheduler, as nccl_ep.py has it."""
     hinted = {
         "_xla_stream_annotation": stream.removeprefix("gpu_stream:"),
         "inlineable": "false",
@@ -269,28 +268,14 @@ def on_stream(stream: str, run: Callable[[], Any], first: int = 0) -> Any:
     return xla_metadata_call2(run, hinted)()
 
 
-# XLA's name of the pass below, and what marks a module that needs it.
-PARTS = "bux_stream_calls_parts_off_their_stream"
+# What marks an instruction for a GPU stream, and a module that ``parts_off_the_stream``
+# changes.
 STREAM_ATTRIBUTE = b"_xla_stream_annotation"
 # Field numbers of xla/service/hlo.proto: HloModuleProto.computations,
 # HloComputationProto.instructions, HloInstructionProto.opcode and
 # .frontend_attributes, and the entries of FrontendAttributes.map.
 COMPUTATIONS, INSTRUCTIONS, OPCODE, ATTRIBUTES, ENTRIES = 3, 2, 2, 68, 1
 LENGTH = 2  # protobuf's wire type of a length-delimited field
-
-
-@functools.cache
-def _keep_parts_off_the_stream() -> None:
-    """Have XLA run ``parts_off_the_stream`` on every module before it schedules
-    it, once a process, on a GPU."""
-    if jax.default_backend() != "gpu":
-        return
-    xla.register_hlo_module_transformation(
-        parts_off_the_stream,
-        name=PARTS,
-        stage=xla.PipelineStage.PRE_SCHEDULER,
-        platforms="cuda",
-    )
 
 
 def parts_off_the_stream(serialized: bytes) -> bytes | None:
