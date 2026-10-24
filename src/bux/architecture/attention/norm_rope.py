@@ -3,11 +3,11 @@ queries or keys forward and one backward.
 
 XLA takes two passes forward (the norm's statistics, then the rest) and three back
 (the rotation's transpose written by halves, the norm's statistics, then the rest).
-On a GPU, Pallas Triton kernels make each one (`norm_and_rotate`): on a B300,
-Qwen3-30B-A3B's queries, 8 rows of 4096 of 32 heads of 128, take 0.10 ms a layer
-forward and 0.20 back, where XLA takes 0.16 and 0.47. They take an RMSNorm with a
-scale and no bias, and RoPE by halves of every dim; elsewhere the norm and `rotate`
-run as they are.
+On a GPU, Pallas Triton kernels make each one (`norm_and_rotate`): in megatron.bux's
+step on a B300, Qwen3-30B-A3B's queries, 8 rows of 4096 of 32 heads of 128, take
+0.12 ms a layer forward and 0.24 back, where XLA's fusions took 0.17 and 0.46. They
+take an RMSNorm with a scale and no bias, and RoPE by halves of every dim; elsewhere
+the norm and `rotate` run as they are.
 
 A program takes a few tokens, every head of each, (tokens, heads, d), and loads them
 by halves, so that dim i rotates with i + d / 2 without slicing a value. The
