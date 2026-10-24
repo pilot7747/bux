@@ -46,8 +46,8 @@ row a GPU under FSDP.
 
 ### New settings
 
-- `methods(moe=nccl_ep)`: TransformerEngine's NCCL EP, in an image built with
-  `--build-arg TE=2.20.2`. `methods(moe_chunks=n)` and `all_to_all` by sorted buffers.
+- `methods(moe=nccl_ep)`: TransformerEngine's NCCL EP, which the CUDA images now have
+  (2.20.2). `methods(moe_chunks=n)` and `all_to_all` by sorted buffers.
 - `methods(states=recompute)` for Mamba-2 and Mamba.
 
 ### Measured on B300s
@@ -80,7 +80,6 @@ read lower than the others; compare them within a row.
 - **EP still loses to `sorted`** on one node (0.74x at best): the exchange's volume
   bounds it, and NCCL EP's kernels move 330-370 GB/s there. Next: DualPipe-style
   overlap of the exchange with attention, NCCL EP's SM count as a setting.
-- **The image with TE** needs a rebuild (`--build-arg TE=2.20.2`).
 - **MXFP8 experts:** quantize in the GEMM's epilogue, with the GLU (about 0.45 ms a layer).
 - **KDA unbounded** is 96k against the bounded kernel's 131k: its pairs kernels spend
   their time in 16x16 dots; Mosaic GPU's tcgen05 would be next.
