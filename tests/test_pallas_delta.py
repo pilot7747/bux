@@ -17,6 +17,13 @@ from bux.train import config as tcfg
 B, H, K = 2, 2, 64
 
 
+@pytest.fixture(autouse=True)
+def full_precision():
+    """Float32's matmuls at their full precision on a GPU too, whose default is TF32."""
+    with jax.default_matmul_precision("highest"):
+        yield
+
+
 def _inputs(t: int, low: float, spike: float | None = None):
     """q, k, v, the log decay of every channel in [low, 0], spiking to `spike` every
     16 positions if given, and beta."""

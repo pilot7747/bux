@@ -1,20 +1,18 @@
 """Fixtures: a tokenizer and a corpus that need no network, runs trained on 8
 devices, and the equations of a jaxpr.
 
-First, before anything starts JAX, it gets 8 CPU devices, so that the tests split runs
-over them and compare with one; and before anything imports bux, jaxtyping instruments
-the packages that handle arrays, so that every call the tests make checks the dtype and
-shape of every array into and out of a function, with beartype taking an int where a
-float goes, as a static type checker does. (Its --jaxtyping-packages flag takes one
-package with that checker.)
+First, before anything imports bux, jaxtyping instruments the packages that handle
+arrays, so that every call the tests make checks the dtype and shape of every array
+into and out of a function, with beartype taking an int where a float goes, as a static
+type checker does. (Its --jaxtyping-packages flag takes one package with that checker.)
+Then, before anything starts JAX, it gets 8 CPU devices, so that the tests split runs
+over them and compare with one, and bux's XLA flags, as `bux train` sets them: the
+tests that need a GPU run with them too.
 """
 
 import os
 
 os.environ.setdefault("JAX_PLATFORMS", "cpu")
-os.environ["XLA_FLAGS"] = (
-    os.environ.get("XLA_FLAGS", "") + " --xla_force_host_platform_device_count=8"
-)
 os.environ.setdefault("JAX_COMPILATION_CACHE_DIR", "")  # the command line's, off
 
 import jaxtyping
@@ -22,6 +20,12 @@ import jaxtyping
 jaxtyping.install_import_hook(
     ["bux.architecture", "bux.data", "bux.parallel", "bux.train"],
     "beartype.beartype(conf=beartype.BeartypeConf(is_pep484_tower=True))",
+)
+
+from bux import runtime
+
+os.environ["XLA_FLAGS"] = runtime.xla_flags(
+    os.environ.get("XLA_FLAGS", "") + " --xla_force_host_platform_device_count=8"
 )
 
 import itertools

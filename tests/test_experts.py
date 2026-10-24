@@ -162,9 +162,11 @@ def test_each_method_in_chunks_computes_what_sorted_does(method):
 @pytest.mark.parametrize("mesh", MESHES)
 @pytest.mark.parametrize("method", [RAGGED, "ragged_tokens"])
 def test_the_ragged_methods_compute_what_sorted_does(method, mesh):
-    for option in OPTIONS:
-        one = _outputs("sorted", "one device", option)
-        assert_close(_outputs(method, mesh, option), one)
+    """In float32 at its full precision: a GPU's default multiplies in TF32's."""
+    with jax.default_matmul_precision("highest"):
+        for option in OPTIONS:
+            one = _outputs("sorted", "one device", option)
+            assert_close(_outputs(method, mesh, option), one)
 
 
 @pytest.mark.parametrize(
