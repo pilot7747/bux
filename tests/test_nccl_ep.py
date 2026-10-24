@@ -24,15 +24,18 @@ model = embed [norm experts] norm head
 data = synthetic
 optimizer = adamw(lr=3e-4)
 seq_len = 16
-batch = 8
+batch = {batch}
 steps = 2
 precision = precision(compute=bfloat16{dispatch})
+methods = methods(microbatches={microbatches})
 """
 
 
-def _run(dispatch: str = "compute"):
+def _run(dispatch: str = "compute", microbatches: int = 1):
     more = "" if dispatch == "compute" else f", dispatch={dispatch}"
-    return compile_runs(SOURCE.format(dispatch=more))[0]
+    batch = 8 * microbatches
+    source = SOURCE.format(dispatch=more, batch=batch, microbatches=microbatches)
+    return compile_runs(source)[0]
 
 
 def _use(sizes: dict[str, int], chunks: int = 1, stream: bool = False):
@@ -69,6 +72,12 @@ def test_where_no_axis_splits_the_experts_it_starts_nothing():
 def test_a_device_sends_its_share_of_a_steps_tokens():
     with _use({"data": 2, "expert": 4}):
         assert nccl_ep._tokens_a_device(_run(), ("expert",)) == 8 * 16 // 8
+
+
+def test_in_microbatches_a_device_sends_its_share_of_a_microbatchs_tokens():
+    with _use({"data": 2, "expert": 4}):
+        tokens = nccl_ep._tokens_a_device(_run(microbatches=2), ("expert",))
+        assert tokens == 16 * 16 // 8 // 2
 
 
 def test_in_chunks_a_device_sends_a_chunk_of_its_share_at_once():
@@ -137,7 +146,9 @@ EP = ("expert",)  # the experts' axis on the meshes below
 def _emulated_dispatch(rows, tokens, k, x, idx, weights):
     """NCCL EP's dispatch, as its rows arrive: each expert's picks from each device in
     turn, a block a local expert padded to ALIGNED with zeros, their weights garbage
-    (NaN), and the rows past the last block garbage too."""
+    (NaN), and the rows past the last block garbage too. It takes no more tokens than
+    NCCL EP was started for."""
+    assert nccl_ep.started is not None and tokens <= nccl_ep.started.tokens
     axes = EP
     peers, device = jax.lax.axis_size(axes), jax.lax.axis_index(axes)
     gathered = functools.partial(jax.lax.all_gather, axis_name=axes, tiled=True)
@@ -204,6 +215,14 @@ def test_in_chunks_a_tokens_path_computes_what_sorted_does(emulated):
     mesh = "data=2, expert=4"
     chunked = test_experts._outputs("nccl_ep", mesh, "latent, expert norm", chunks=2)
     test_experts.assert_close(chunked, one)
+
+
+def test_more_tokens_than_it_started_for_go_in_pieces(emulated):
+    rows = 32  # 16 tokens a device, which NCCL EP started for 8 of (``emulated``)
+    one = test_experts._outputs("sorted", "one device", "gated", rows=rows)
+    mesh = "data=2, expert=4"
+    pieces = test_experts._outputs("nccl_ep", mesh, "gated", rows=rows)
+    test_experts.assert_close(pieces, one)
 
 
 @pytest.mark.parametrize("capacity", [0.5, 1.0])
