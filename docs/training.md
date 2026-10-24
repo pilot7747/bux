@@ -1096,16 +1096,18 @@ Between two steps the host does little. A training step takes the model's and th
 optimizer's arrays as a list, of variables the trainer split once from their graph
 (`_Split` in `bux/train/trainer.py`), where nnx.jit walked the graph at every call,
 from it to its arrays and back: 20 ms a step of the 1.3B, 70 of Qwen3-30B-A3B, on a
-B300 node's host. That is time the GPU waits for where XLA's launch of a step returns
-only when the GPU is nearly through it, its queue of kernels full: Qwen3-30B-A3B's,
-of thousands of kernels and collectives, returns 100 to 170 ms before its step ends,
-and the host then has that long to launch the next. The 1.3B's, its kernels in CUDA
-graphs (XLA's command buffers), returns in 10 ms, and the host runs up to two steps
-ahead; but under the profiler, which turns command buffers off, its launch too
-returns at its step's end. Python's cycle collector, which walked what nnx.jit's walks
-made, no longer stops the host for a full collection a few steps in (340 ms on the
-1.3B, 980 on the 30B). The GPU now waits for the host only after a step the host
-waits for, at an eval or a checkpoint. On 8 B300s, against the tree before:
+B300 node's host, where the list takes 18 ms of the 30B's, most of it Python freeing
+the arrays of the step before. That is time the GPU waits for where XLA's launch of a
+step returns only when the GPU is nearly through it, its queue of kernels full:
+Qwen3-30B-A3B's, of thousands of kernels and collectives, returns 100 to 170 ms
+before its step ends, and the host then has that long to launch the next. The 1.3B's,
+its kernels in CUDA graphs (XLA's command buffers), returns in 10 ms, and the host
+runs up to two steps ahead; but under the profiler, which turns command buffers off,
+its launch too returns at its step's end. Python's cycle collector, which walked what
+nnx.jit's walks made, no longer stops the host for a full collection a few steps in
+(340 ms on the 1.3B, 980 on the 30B). The GPU now waits for the host only after a
+step the host waits for, at an eval or a checkpoint. On 8 B300s, against the tree
+before:
 
 | run                                                | before            | after          |
 |----------------------------------------------------|-------------------|----------------|
@@ -1114,7 +1116,11 @@ waits for, at an eval or a checkpoint. On 8 B300s, against the tree before:
 | the same, profiled, log every 5 steps: GPU 0 idle  | 25.8 ms a step    | 2.1 ms a step  |
 | 1.3B in 8 microbatches (`fsdp_m8`)                 | 1.012M tok/s      | 1.054M tok/s   |
 | Qwen3-30B-A3B, megatron.bux's `sorted`             | 42.0k tok/s a GPU | 42.3k          |
+| the same, logging every step                       | 6.30 s a step     | 6.24 s         |
 | the one-GPU suite's 8 runs, a B300 each            |                   | +1.2% to +7.2% |
+
+With GEMM autotuning off and XLA's deterministic ops, both 1.3B runs train to the
+same losses as before, to the bit.
 
 When training stops early, because something set `trainer.stopping` as the launcher
 does at SIGTERM, every hook's `stop` runs, and the checkpoint hook saves the step. A
