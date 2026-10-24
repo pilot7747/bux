@@ -316,7 +316,7 @@ def _quantize(
         ],
         out_shape=[jax.ShapeDtypeStruct(s, jnp.uint8) for s in shapes],
         compiler_params=plgpu.CompilerParams(num_warps=WARPS, num_stages=1),
-        interpret=blockscaled.interpreted(),
+        interpret=kernels.interpreted(),
         name=f"nv_quantize_{tr}x{tc}",
     )(x, hadamard, encode, decode, salt, start)
 
@@ -399,7 +399,7 @@ def _to_e2m1(
     4 bits, as XLA lays E2M1 out: rounded to nearest even, or stochastically by
     `bits`, 32 a quad. On a GPU by Blackwell's conversions; interpreted, by their
     arithmetic."""
-    if blockscaled.interpreted():
+    if kernels.interpreted():
         if bits is not None:
             values = round_stochastically(values, _noise_of_bits(bits))
         return _pack(_e2m1_codes(values))
@@ -513,7 +513,7 @@ def _amaxes_by_kernel(
         out_specs=[pl.BlockSpec((1, 1), lambda i, j: (i, j))] * 2,
         out_shape=[each, each],
         compiler_params=plgpu.CompilerParams(num_warps=WARPS, num_stages=1),
-        interpret=blockscaled.interpreted(),
+        interpret=kernels.interpreted(),
         name=f"nv_amax_{tr}x{tc}",
     )(x, hadamard)
     return jnp.stack([rows.max(), columns.max()])

@@ -205,11 +205,6 @@ def dequantized(blocks: Blocks) -> Float[Array, "r c"]:
 Shardings = tuple[NamedSharding, ...]
 
 
-def interpreted() -> bool:
-    """Whether kernels run interpreted, by XLA: off a GPU."""
-    return jax.default_backend() != "gpu"
-
-
 def largest_tile(n: int, tiles: tuple[int, ...]) -> int:
     """Return the largest of `tiles` that divides n."""
     return next(t for t in tiles if n % t == 0)
@@ -386,7 +381,7 @@ def _mx_kernel(x: Float[Array, "r c"]) -> MxArrays:
         ],
         out_shape=[jax.ShapeDtypeStruct(*s) for s in shapes],
         compiler_params=plgpu.CompilerParams(num_warps=WARPS, num_stages=1),
-        interpret=interpreted(),
+        interpret=kernels.interpreted(),
         name=f"mx_twice_{tr}x{tc}",
     )(x)
 

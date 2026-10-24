@@ -124,7 +124,7 @@ def _kernel(
         out_specs=pl.BlockSpec((None, bq, bk), lambda z, m, n: (z, m, n)),
         out_shape=jax.ShapeDtypeStruct((b, t, s), jnp.float32),
         compiler_params=plgpu.CompilerParams(num_warps=WARPS, num_stages=2),
-        interpret=jax.default_backend() != "gpu",
+        interpret=kernels.interpreted(),
         name="indexer_scores",
     )(
         end.astype(jnp.int32),
