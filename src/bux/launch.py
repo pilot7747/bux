@@ -1,25 +1,30 @@
 """The launcher, ``bux launch``: train an experiment, a .bux file of one run or a
-sweep of many, to its end, on a cluster or on a laptop.
+sweep of many, to its end, on a cluster or on a laptop::
 
-    bux launch examples/experiments/attention_ablation.bux             # all 6 runs
-    bux launch examples/experiments/attention_ablation.bux --index 3   # the fourth, in an array job
+    bux launch examples/experiments/attention_ablation.bux            # all 6 runs
+    bux launch examples/experiments/attention_ablation.bux --index 3  # the fourth
+
+``--index`` trains one run of the sweep, as each task of an array job does
+(``--index $SLURM_ARRAY_TASK_ID``). From Python, `launch` takes the runs that
+`bux.lang.compile_runs` returns.
 
 A run needs the GPUs of its mesh: the product of its axes' sizes, where an unset
 `data` is every visible GPU for a run alone and one in a sweep; a run that needs more
 than there are fails at once. The launcher prepares the datasets the other runs read,
 once. A run alone then trains in this process. A sweep trains one worker process per
-run, each on a group of free GPUs (CUDA_VISIBLE_DEVICES), the first pending run that
-fits first; without GPUs, one at a time on the default device. A worker's output goes
-to the console and to its run's train.log, and a run that fails or runs out of memory
-leaves the others training.
+run, each on a group of free GPUs (``CUDA_VISIBLE_DEVICES``), the first pending run
+that fits first; without GPUs, one at a time on the default device. A worker's output
+goes to the console and to its run's train.log, and a run that fails or runs out of
+memory leaves the others training.
 
 A run alone trains on many hosts when the environment says so: Slurm's srun, Open
-MPI's mpirun, or JAX_COORDINATOR_ADDRESS, JAX_NUM_PROCESSES and JAX_PROCESS_ID. Its
-processes join through jax.distributed; the first writes the console, status.json and
-the run's files, and all of them write checkpoints. They keep JAX's cache only where
-it is one folder for all of them (``runtime.agree_on_cache``).
+MPI's mpirun, or ``JAX_COORDINATOR_ADDRESS``, ``JAX_NUM_PROCESSES`` and
+``JAX_PROCESS_ID``. Its processes join through jax.distributed (`join`); the first
+writes the console, status.json and the run's files, and all of them write
+checkpoints. They keep JAX's cache only where it is one folder for all of them
+(`bux.runtime.agree_on_cache`).
 
-A run's directory (``bux.train.trainer``) also keeps a status.json: whether the run is
+A run's directory (`bux.train.trainer`) also keeps a status.json: whether the run is
 running, done, failed or stopped, where, on which GPUs, since when, at what step, and
 its latest metrics. A run that is done is not trained again, and one that is not
 resumes from its latest checkpoint, so launching an experiment again, after a
@@ -27,9 +32,10 @@ preemption, a crash or a fix, trains what is left of it.
 
 SIGTERM or SIGINT stops training after the current step, saving a checkpoint if the
 run has a checkpoint setting; a second signal, a second or more later, stops it at
-once. A sweep's launcher passes signals on to its workers, and a signal to any process
-of a run stops them all at the same step. The launcher exits with 0 when every run is
-done, 1 when one failed, and 128 + the signal's number when a signal stopped them.
+once (`Stop`). A sweep's launcher passes signals on to its workers, and a signal to
+any process of a run stops them all at the same step. The launcher exits with 0 when
+every run is done, 1 when one failed, and 128 + the signal's number when a signal
+stopped them.
 """
 
 import contextlib
@@ -67,17 +73,26 @@ from bux.train.hooks import Hook, Metrics
 from bux.train.sinks import LatestMetrics, is_main_process
 from bux.train.trainer import Trainer, directory, train
 
+#: The signals that stop training after the current step.
 SIGNALS = (signal.SIGTERM, signal.SIGINT)
-# A signal sooner than this after the first is the same one delivered twice: to this
-# process, and to its parent (`uv run` or `srun`, say), which passes it on.
-REPEAT = 1.0  # seconds
-# The variables that give the number of processes training one run, the first set
-# wins: the user's, Slurm's srun's, Open MPI's mpirun's.
+#: Seconds within which a second signal is the first delivered twice, and ignored.
+#:
+#: A signal goes to this process and to its parent (``uv run`` or ``srun``, say),
+#: which passes it on.
+REPEAT = 1.0
+#: The variables that give the number of processes training one run.
+#:
+#: The first set wins: the user's, Slurm's srun's, Open MPI's mpirun's.
 PROCESSES = ("JAX_NUM_PROCESSES", "SLURM_STEP_NUM_TASKS", "OMPI_COMM_WORLD_SIZE")
 
 
 def status(folder: Path) -> dict[str, Any]:
-    """Return the run's status.json in `folder`, or {} if there is none."""
+    """Return the run's status.json in `folder`, or {} if there is none.
+
+    Its fields: ``state`` (``running``, ``done``, ``failed`` or ``stopped``),
+    ``host``, ``pid``, ``gpus``, ``started`` and ``ended`` (UTC, ISO 8601),
+    ``error``, ``step`` and the latest ``metrics``.
+    """
     path = folder / "status.json"
     return json.loads(path.read_text(encoding="utf-8")) if path.exists() else {}
 
@@ -118,7 +133,12 @@ def processes(env: Mapping[str, str] = os.environ) -> int:
 
 def join() -> None:
     """Join the job's other processes through jax.distributed, if there are any, and
-    keep JAX's cache only if it is one for all of them (``runtime.agree_on_cache``).
+    keep JAX's cache only if it is one for all of them (`bux.runtime.agree_on_cache`).
+
+    With ``JAX_NUM_PROCESSES`` set, the variables say all there is: its count,
+    ``JAX_PROCESS_ID`` and ``JAX_COORDINATOR_ADDRESS`` (which JAX reads itself), with
+    no detection of a cluster. Otherwise JAX reads Slurm's or Open MPI's environment.
+    Nothing happens for a process alone, or one that has joined already.
 
     Call it before anything touches a device.
     """
@@ -151,25 +171,45 @@ def _largest(signum: int) -> Int[Array, ""]:
 class Stop(Hook):
     """Stop training after the current step at SIGTERM or SIGINT.
 
-    A second signal, or one before training starts, stops it at once with a
-    KeyboardInterrupt. A signal to any process of many stops them all after the same
-    step, once they have all seen it.
+    A second signal, a second or more after the first (`REPEAT`), or one before
+    training starts, stops it at once with a KeyboardInterrupt. A signal to any
+    process of many stops them all after the same step, once they have all seen it:
+    every step, the processes take the largest signal of any of them on the devices.
+
+    Example::
+
+        stop = Stop()
+        with stop.armed():
+            train(run, hooks=[stop])
+        stop.signal  # the signal that stopped it, or None
+
+    Attributes:
+        trainer: The trainer it stops, once training starts.
+        signal: The first signal, this process's or another's; None until then.
+        since: When the first signal came, by `time.monotonic`.
+        multiprocess: Whether other processes train the run too.
+        agreed: Every process's signal, the step before, as the devices hold it.
     """
 
     def __init__(self) -> None:
         self.trainer: Trainer | None = None
-        self.signal: int | None = None  # the first one
+        self.signal: int | None = None
         self.since = 0.0
         self.multiprocess = False
-        self.agreed: Int[Array, ""] | None = None  # every process's signal, a step ago
+        self.agreed: Int[Array, ""] | None = None
 
     def due(self, step: int, steps: int) -> bool:
+        """Run every step in a job of many processes, to agree on a stop; never for
+        a process alone, which its handler stops."""
         return self.multiprocess
 
     def start(self, trainer: Trainer) -> None:
+        """Take the trainer to stop, as training starts."""
         self.trainer, self.multiprocess = trainer, jax.process_count() > 1
 
     def __call__(self, trainer: Trainer, metrics: Metrics) -> None:
+        """After a step of many processes: stop if any of them had a signal by the
+        step before, whose largest signal the devices have computed by now."""
         # Read last step's result, ready by now, so as not to stall the step in flight.
         agreed, self.agreed = self.agreed, _largest(self.signal or 0)
         if agreed is not None and (signum := int(agreed)):
@@ -178,6 +218,8 @@ class Stop(Hook):
             trainer.stopping = True
 
     def handle(self, signum: int, frame: FrameType | None) -> None:
+        """The handler of `SIGNALS`: the first stops training after the step (for a
+        process of many, at the step they agree on), a later one at once."""
         if self.signal is None:
             self.signal, self.since = signum, time.monotonic()
             if self.trainer is None:
@@ -233,9 +275,23 @@ def train_here(
     *,
     echo: Callable[[str], None] = _print,
 ) -> int:
-    """Train `run` in this process, as `train` does, record how it went in its
-    status.json, and return the exit code. In a job of many processes, which it joins,
-    only the first prints and records."""
+    """Train `run` in this process, as `~bux.train.trainer.train` does, record how
+    it went in its status.json, and return the exit code.
+
+    It joins the job's other processes first, if there are any (`join`), and then
+    only the first prints and records. A run alone of `launch` trains so, and so
+    does each worker of a sweep.
+
+    Args:
+        run: The run.
+        out: Where run directories go.
+        cache: Where prepared datasets are.
+        echo: Where progress lines go.
+
+    Returns:
+        0 when the run is done, 1 when it failed, 128 + the signal's number when a
+        signal stopped it.
+    """
     join()
     echo = echo if is_main_process() else _quiet
     folder = directory(run, out)
@@ -372,7 +428,21 @@ def supervise(
 
     Each worker gets a group of free `gpus`, as many as its mesh needs, and the first
     pending run that fits starts first. Without GPUs, runs train one at a time on the
-    default device.
+    default device. A worker is ``python -m bux.launch FOLDER CACHE``, which trains
+    the run.json written in its run's directory, with ``CUDA_VISIBLE_DEVICES`` set to
+    its group; its output goes to `echo` and to the run's train.log. SIGTERM and
+    SIGINT are passed on to every worker, and no new one starts after them.
+
+    Args:
+        runs: The runs to train.
+        out: Where run directories go.
+        cache: Where prepared datasets are.
+        gpus: The GPUs to share out, as ``CUDA_VISIBLE_DEVICES`` names them.
+        echo: Where the workers' output and the launcher's lines go.
+
+    Returns:
+        0 when every run is done, 1 when one failed, 128 + the signal's number when a
+        signal stopped them.
     """
     slots: list[str | None] = [*gpus] or [None]  # None: the default device
     needs = [need(r.train.mesh, len(gpus), alone=False) if gpus else 1 for r in runs]
@@ -430,7 +500,16 @@ def supervise(
 
 
 def summary(runs: Sequence[ir.Run], out: str | Path) -> str:
-    """Return one line per run: its state, its step, and its latest losses."""
+    """Return one line per run: its state, its step, and its latest losses.
+
+    A sweep's launch ends with it::
+
+        3 runs: 2 done, 1 stopped
+        state    step       loss    eval loss  run
+        done     3814/3814  3.2141  3.2577     width_sweep[s]
+        done     3814/3814  3.0836  3.1302     width_sweep[m]
+        stopped  2731/3814  3.0412  3.0815     width_sweep[l]
+    """
     rows: list[tuple[str, ...]] = [("state", "step", "loss", "eval loss", "run")]
     for run in runs:
         s = status(directory(run, out))
@@ -498,10 +577,35 @@ def launch(
 ) -> int:
     """Train what is left of `runs` under `out`, and return the exit code.
 
-    First prepare the datasets they read under `cache`, with `workers` processes. A
-    run alone trains in this process, on as many of `gpus` (default: every visible
-    one) as it needs, or on many hosts if the environment says so. A sweep trains in
-    workers, each on a group of the GPUs.
+    This is ``bux launch``. Runs whose status.json says ``done`` are skipped, and
+    the others resume from their latest checkpoints. A run that needs more GPUs than
+    there are is recorded as failed at once. Then the datasets the rest read are
+    prepared under `cache`, once each, with `workers` processes. A run alone trains
+    in this process, on as many of `gpus` as it needs, or on many hosts if the
+    environment says so (`processes`); a sweep trains in workers (`supervise`), each
+    on a group of the GPUs, and ends with a table of its runs (`summary`).
+
+    Args:
+        runs: The runs of an experiment, as `bux.lang.compile_runs` returns them.
+        out: Where run directories go.
+        cache: Where prepared datasets go.
+        gpus: The GPUs to train on, as ``CUDA_VISIBLE_DEVICES`` names them; None
+            for every visible one (`visible_gpus`).
+        workers: Processes that prepare data: None for one a core.
+        echo: Where progress lines go.
+
+    Returns:
+        0 when every run is done, 1 when one failed (or many processes were given
+        a sweep), and 128 + the signal's number when a signal stopped them.
+
+    Example::
+
+        from bux.lang import compile_runs
+        from bux.launch import launch
+
+        source = open("examples/experiments/attention_ablation.bux").read()
+        runs = compile_runs(source, filename="attention_ablation.bux")
+        code = launch(runs, "runs")
     """
     todo = [run for run in runs if status(directory(run, out)).get("state") != "done"]
     if done := len(runs) - len(todo):
