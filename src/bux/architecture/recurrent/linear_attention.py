@@ -3,24 +3,32 @@ by token. Gated DeltaNet, Kimi Delta Attention, DeltaNet, GLA and Lightning are 
 and RWKV-7 is in ``rwkv7``.
 
 All of them run one recurrence (`recurrence`), over a state S of dk by dv per value
-head:
+head::
 
     S_t = diag(w_t) S_{t-1} + b_t (a_t^T S_{t-1}) + k_t v_t^T,    o_t = S_t^T q_t
 
-with a decay w_t in (0, 1] per key channel, or one per head. The b a^T term is how the
-delta rule writes over what S holds at a key (`delta_rule`), and RWKV-7 generalizes it.
-The state is zero at every document start, so a packed row gives each document what it
-gives alone.
+with a decay w_t in (0, 1] per key channel, or one per head. The ``b a^T`` term is how
+the delta rule writes over what S holds at a key (`delta_rule`), and RWKV-7
+generalizes it. The state is zero at every document start, so a packed row gives each
+document what it gives alone.
+
+The layers, each a config of `bux.config`:
+
+- ``gla``: `GatedLinearAttention`, a decay per key channel, no delta rule;
+- ``deltanet``: `DeltaNet`, the delta rule, no decay;
+- ``gdn``: `GatedDeltaNet`, the delta rule with a decay per head;
+- ``kda``: `KimiDeltaAttention`, the delta rule with a decay per key channel;
+- ``lightning``: `LightningAttention`, a fixed decay per head.
 
 Shapes: b rows, t positions, d the width, h heads (value heads, once q and k are shared
 out to them), dk and dv the head dims of keys and values.
 
 `recurrence` runs by chunks of positions (``chunkwise``, the form of fla's chunked
 kernels), and `stepwise` is its reference, a scan over positions. It runs by the run's
-`methods.recurrence`: `scan`, the default, here, and `pass_state`, which splits the
-positions over `context`, in ``bux.parallel.recurrence``.
+``methods.recurrence``: ``scan``, the default, here, and ``pass_state``, which splits
+the positions over ``context``, in `bux.parallel.recurrence`.
 
-Under tensor parallelism (``bux.parallel``) every projection splits over `heads`, into
+Under tensor parallelism (`bux.parallel`) every projection splits over ``heads``, into
 the heads or out of them, and so does every parameter a head has: the recurrence runs
 on each device's own heads, with no communication.
 """
@@ -53,8 +61,8 @@ from bux.parallel.recurrence import Chunk, Positions, Recurrence, Shared, Transi
 
 @methods.recurrence.register("scan")
 def scan(r: Recurrence) -> Float[Array, "b t h dv"]:
-    """Run every position as one chunk: the default of `methods.recurrence`. With
-    `seq` over `context`, XLA gathers them all onto every device."""
+    """``methods.recurrence = scan``, the default: run every position as one chunk.
+    With ``seq`` over ``context``, XLA gathers them all onto every device."""
     return r.chunk(r.xs, r.shared, False).out
 
 
@@ -147,17 +155,31 @@ def recurrence(
     a: Float[Array, "b t h dk"] | None = None,
     b: Float[Array, "b t h dk"] | None = None,
 ) -> Float[Array, "b t h dv"]:
-    """Return the outputs S_t^T q_t of the state
+    """Return the outputs ``S_t^T q_t`` of the state::
 
         S_t = diag(w_t) S_{t-1} + b_t (a_t^T S_{t-1}) + k_t v_t^T,
 
-    with w = exp(log_decay), one per key channel or one per head, and S zero before
-    every document; without a and b, it is decayed linear attention. It runs by the
-    run's `methods.recurrence`, in float32, named `recurrence` (``remat.named``), its
-    chunks' states for the backward pass kept or computed again by the run's
-    `methods.states` (`recomputed`). Where b is k, as in the delta rule, the positions
-    leave b out, (q, k, v, log decay, continues, a), which ``chunkwise`` runs in half
-    the work."""
+    with ``w = exp(log_decay)``, one per key channel or one per head, and S zero
+    before every document; without a and b, it is decayed linear attention. It runs
+    by the run's ``methods.recurrence``, in float32, named ``recurrence``
+    (``remat.named``), its chunks' states for the backward pass kept or computed again
+    by the run's ``methods.states`` (`recomputed`). Where b is k, as in the delta
+    rule, the positions leave b out, (q, k, v, log decay, continues, a), which
+    ``chunkwise`` runs in half the work.
+
+    Args:
+        q: The queries, ``b t h dk``.
+        k: The keys, ``b t h dk``.
+        v: The values, ``b t h dv``.
+        log_decay: log w, ``b t h dk``, or ``b t h 1`` for one decay a head; at most
+            0.
+        docs: The documents packed into the rows; None for one a row.
+        a: What the rank-one term reads of the state; None for no such term.
+        b: Where the rank-one term writes it.
+
+    Returns:
+        The outputs, ``b t h dv``, in v's dtype.
+    """
     rank_one = a is not None and b is not None
     family = "the generalized delta rule" if rank_one else "decayed linear attention"
     ab = (a,) if rank_one and b is k else (a, b) if rank_one else ()
@@ -214,17 +236,32 @@ def delta_rule(
     floor: float | None = None,
 ) -> Float[Array, "b t h dv"]:
     """Run the gated delta rule: each token decays the state, then moves what it holds
-    at k_t a step beta_t toward v_t,
+    at k_t a step beta_t toward v_t::
 
         S_t = (I - beta_t k_t k_t^T) diag(w_t) S_{t-1} + beta_t k_t v_t^T.
 
-    That is `recurrence` with a = -w k, and beta k for both b and k, in float32. On a
-    GPU, with q, k and v of 16 bits, kernels run it instead, in their dtype (`_kernels`):
-    on a B200 or B300 cuDNN's (``fused_delta``), one decay a head at any gate, and a
-    decay per channel where `floor`, the least log decay, bounds it at -5; else bux's
-    own (``pallas_delta``), a decay per channel at any gate. cuDNN's keep only their
-    inputs for the backward pass, and so do the chunks the kernels fall back on;
-    bux's keep their chunks' parts and states too by the run's `methods.states`."""
+    That is `recurrence` with ``a = -w k``, and ``beta k`` for both b and k, in
+    float32. On a GPU, with q, k and v of 16 bits, kernels run it instead, in their
+    dtype: on a B200 or B300 cuDNN's (`~bux.architecture.recurrent.fused_delta`), one
+    decay a head at any gate, and a decay per channel where `floor`, the least log
+    decay, bounds it at -5; else bux's own
+    (`~bux.architecture.recurrent.pallas_delta`), a decay per channel at any gate.
+    cuDNN's keep only their inputs for the backward pass, and so do the chunks the
+    kernels fall back on; bux's keep their chunks' parts and states too by the run's
+    ``methods.states``.
+
+    Args:
+        q: The queries, ``b t h dk``.
+        k: The keys, ``b t h dk``, L2-normalized.
+        v: The values, ``b t h dv``.
+        log_decay: log w, ``b t h dk``, or ``b t h 1`` for one decay a head.
+        beta: The step of every head at every position, in (0, 1).
+        docs: The documents packed into the rows; None for one a row.
+        floor: The least log decay the layer can give, if bounded.
+
+    Returns:
+        The outputs ``S_t^T q_t``, ``b t h dv``, in v's dtype.
+    """
     shapes = (k.shape[-1], v.shape[-1], v.dtype, log_decay.shape[-1])
     kernels = _kernels(*shapes, floor)
     if kernels is not None:
@@ -283,7 +320,7 @@ def _chunked(
 
 
 def l2norm(x: Float[Array, "*lead e"], eps: float = 1e-6) -> Float[Array, "*lead e"]:
-    """Return x over its L2 norm as fla computes it, x / sqrt(|x|^2 + eps): in
+    """Return x over its L2 norm as fla computes it, ``x / sqrt(sum(x^2) + eps)``: in
     float32, the result in x's dtype."""
     y = x.astype(jnp.float32)
     y = y * jax.lax.rsqrt(jnp.square(y).sum(-1, keepdims=True) + eps)
@@ -291,10 +328,20 @@ def l2norm(x: Float[Array, "*lead e"], eps: float = 1e-6) -> Float[Array, "*lead
 
 
 class LowRank(nnx.Module):
-    """x -> act(x A) B + c, a projection of the width through `rank` dims (`latent`),
-    with an optional activation between and bias after, its outputs named `out`.
-    `orthogonal` starts it as RWKV-7 does, A at zero and B orthogonal, scaled by 0.1;
-    otherwise A and B start as dense layers do."""
+    """``x -> act(x A) B + c``, a projection of the width through `rank` dims
+    (``latent``), with an optional activation between and bias after.
+
+    Args:
+        n_in: The width of the input.
+        rank: The dims between A and B.
+        n_out: The width of the output.
+        rngs: The random streams A and B start from.
+        activation: The activation between, by name; None for none.
+        bias: Whether to add a bias c, from 0, or where c starts.
+        orthogonal: Start it as RWKV-7 does, A at zero and B orthogonal, scaled by
+            0.1; otherwise A and B start as dense layers do.
+        out: The name of the outputs' dimension (`bux.parallel`).
+    """
 
     def __init__(
         self,
@@ -323,6 +370,7 @@ class LowRank(nnx.Module):
         self.activation = activation
 
     def __call__(self, x: Float[Array, "*lead d"]) -> Float[Array, "*lead n"]:
+        """Return ``act(x A) B + c``."""
         h = x @ self.down[...]
         if self.activation is not None:
             h = activation(self.activation, h)
@@ -397,6 +445,17 @@ class LinearAttention(nnx.Module):
     next to each other (grouped value attention, Qwen3-Next). The output norm is an
     RMSNorm of each head, or of all heads together (`norm_all_heads`), times the gate's
     activation of the input: the gated norm of Qwen3-Next and fla.
+
+    Args:
+        config: The layer's settings (`bux.config.LinearAttentionConfig`).
+        width: The width of the stream, d.
+        rngs: The random streams the parameters start from.
+        silu: SiLU q, k and v without a conv; after one, they always are.
+        gate_rank: The rank of a low-rank output gate; None for a dense one.
+        norm_all_heads: Normalize all heads' outputs together, not each on its own.
+
+    Raises:
+        ValueError: num_v_heads is not a multiple of num_heads.
     """
 
     def __init__(
@@ -483,9 +542,17 @@ class LinearAttention(nnx.Module):
 
 
 class DeltaNet(LinearAttention):
-    """DeltaNet (Schlag et al., 2021; Yang et al., 2024), as fla has it: the delta rule
-    on L2-normalized q and k, with q scaled by dk ** -0.5, and one step per value
-    head, beta = sigmoid(W_b x). Gated DeltaNet and KDA add a decay (`_log_decay`)."""
+    """DeltaNet (Schlag et al., 2021; Yang et al., 2024), ``deltanet``, as fla has it:
+    the delta rule on L2-normalized q and k, with q scaled by ``dk ** -0.5``, and one
+    step per value head, ``beta = sigmoid(W_b x)``. Gated DeltaNet and KDA add a
+    decay.
+
+    Args:
+        config: The layer's settings (`bux.config.DeltaNetConfig`).
+        width: The width of the stream, d.
+        rngs: The random streams the parameters start from.
+        gate_rank: The rank of a low-rank output gate; None for a dense one.
+    """
 
     def __init__(
         self,
@@ -499,6 +566,12 @@ class DeltaNet(LinearAttention):
         self.b = into_heads(width, self.v_heads, 1, rngs)
 
     def __call__(self, x: Float[Array, "b t d"], taps: Taps) -> Float[Array, "b t d"]:
+        """Return the mixer's output at every position of x, ``b t d``.
+
+        Args:
+            x: The stream.
+            taps: The forward pass's taps, for the documents in the rows.
+        """
         x = shard_layer_input(x)
         q, k, v = self._qkv(x, taps)
         q, k = l2norm(q) * self.head_dim**-0.5, l2norm(k)
@@ -518,12 +591,18 @@ class DeltaNet(LinearAttention):
 
 
 class GatedDeltaNet(DeltaNet):
-    """Gated DeltaNet (Yang et al., 2025), as transformers' Qwen3-Next and fla have it:
-    DeltaNet with a decay exp(g) per value head, g = -exp(A_log) softplus(W_a x +
-    dt_b), with A_log and dt_b (dt_bias) learned per value head.
+    """Gated DeltaNet (Yang et al., 2025), ``gdn``, as transformers' Qwen3-Next and fla
+    have it: DeltaNet with a decay ``exp(g)`` per value head,
+    ``g = -exp(A_log) softplus(W_a x + dt_bias)``, with A_log and dt_bias learned per
+    value head.
 
     A_log starts at the logs of draws uniform in [0.01, 16] (transformers), and dt_bias
     at Mamba's time steps (fla and the paper's code; transformers starts it at ones).
+
+    Args:
+        config: The layer's settings (`bux.config.GatedDeltaNetConfig`).
+        width: The width of the stream, d.
+        rngs: The random streams the parameters start from.
     """
 
     def __init__(self, config: cfg.GatedDeltaNetConfig, width: int, rngs: nnx.Rngs):
@@ -542,12 +621,18 @@ class GatedDeltaNet(DeltaNet):
 
 
 class KimiDeltaAttention(DeltaNet):
-    """Kimi Delta Attention (Kimi Linear, 2025), as transformers and fla have it: Gated
-    DeltaNet with a decay per key channel, g = -exp(A_log) softplus(f + dt_bias), where
-    f = W_f2 W_f1 x is a low-rank projection (`gate_rank`) and A_log is per head. With
-    a lower bound (Kimi K3, GLM-5-Next), g = lower_bound * sigmoid(exp(A_log) (f +
-    dt_bias)), and A_log starts at 0, as in fla's safe gate (K3's code starts it at
-    log U(1, 16) either way). The output gate is low rank too (`output_gate_rank`).
+    """Kimi Delta Attention (Kimi Linear, 2025), ``kda``, as transformers and fla have
+    it: Gated DeltaNet with a decay per key channel,
+    ``g = -exp(A_log) softplus(f + dt_bias)``, where ``f = W_f2 W_f1 x`` is a low-rank
+    projection (`gate_rank`) and A_log is per head. With a lower bound (Kimi K3,
+    GLM-5-Next), ``g = lower_bound * sigmoid(exp(A_log) (f + dt_bias))``, and A_log
+    starts at 0, as in fla's safe gate (K3's code starts it at ``log U(1, 16)``
+    either way). The output gate is low rank too (`output_gate_rank`).
+
+    Args:
+        config: The layer's settings (`bux.config.KDAConfig`).
+        width: The width of the stream, d.
+        rngs: The random streams the parameters start from.
     """
 
     def __init__(self, config: cfg.KDAConfig, width: int, rngs: nnx.Rngs):
@@ -576,10 +661,16 @@ class KimiDeltaAttention(DeltaNet):
 
 
 class GatedLinearAttention(LinearAttention):
-    """Gated linear attention (Yang et al., 2024), as fla has it: linear attention with
-    q scaled by dk ** -0.5 and a decay per key channel, log w = log sigmoid(f) / 16,
-    where f is a low-rank projection with a bias (`gate_rank`). Without a conv, q, k
-    and v do not go through SiLU."""
+    """Gated linear attention (Yang et al., 2024), ``gla``, as fla has it: linear
+    attention with q scaled by ``dk ** -0.5`` and a decay per key channel,
+    ``log w = log sigmoid(f) / 16``, where f is a low-rank projection with a bias
+    (`gate_rank`). Without a conv, q, k and v do not go through SiLU.
+
+    Args:
+        config: The layer's settings (`bux.config.GLAConfig`).
+        width: The width of the stream, d.
+        rngs: The random streams the parameters start from.
+    """
 
     def __init__(self, config: cfg.GLAConfig, width: int, rngs: nnx.Rngs):
         super().__init__(config, width, rngs, silu=False)
@@ -589,6 +680,12 @@ class GatedLinearAttention(LinearAttention):
         )
 
     def __call__(self, x: Float[Array, "b t d"], taps: Taps) -> Float[Array, "b t d"]:
+        """Return the mixer's output at every position of x, ``b t d``.
+
+        Args:
+            x: The stream.
+            taps: The forward pass's taps, for the documents in the rows.
+        """
         x = shard_layer_input(x)
         b, t, _ = x.shape
         q, k, v = self._qkv(x, taps)
@@ -599,18 +696,27 @@ class GatedLinearAttention(LinearAttention):
 
 
 def slopes(heads: int, layer: int, layers: int) -> Float[Array, " h"]:
-    """Return MiniMax's decay rates, s_i = 2 ** (-8 i / heads) for heads i = 1 to
-    heads, scaled by 1 - layer / (layers - 1) (and 1e-5 more, as MiniMax has it). The
-    decay is exp(-s), which leaves a plain sum of the past at the last layer."""
+    """Return MiniMax's decay rates, ``s_i = 2 ** (-8 i / heads)`` for heads i = 1 to
+    heads, scaled by ``1 - layer / (layers - 1)`` (and 1e-5 more, as MiniMax has it).
+    The decay is ``exp(-s)``, which leaves a plain sum of the past at the last
+    layer."""
     factor = 1 - layer / (layers - 1 + 1e-5) + 1e-5
     return 2 ** (-8 / heads * jnp.arange(1, heads + 1)) * factor
 
 
 class LightningAttention(LinearAttention):
-    """Lightning attention (TransNormerLLM; MiniMax-01, as transformers has it): linear
-    attention on SiLU'd q, k and v, unscaled, with a fixed decay exp(-s) per head that
-    weakens with depth (`slopes`), and one RMSNorm of all the heads together before the
-    gate."""
+    """Lightning attention (TransNormerLLM; MiniMax-01, as transformers has it),
+    ``lightning``: linear attention on SiLU'd q, k and v, unscaled, with a fixed decay
+    ``exp(-s)`` per head that weakens with depth (`slopes`), and one RMSNorm of all
+    the heads together before the gate.
+
+    Args:
+        config: The layer's settings (`bux.config.LightningAttentionConfig`).
+        width: The width of the stream, d.
+        rngs: The random streams the parameters start from.
+        layer: The layer's index among the model's token mixers, from 0.
+        layers: How many token mixers the model runs.
+    """
 
     def __init__(
         self,
@@ -627,6 +733,12 @@ class LightningAttention(LinearAttention):
         )
 
     def __call__(self, x: Float[Array, "b t d"], taps: Taps) -> Float[Array, "b t d"]:
+        """Return the mixer's output at every position of x, ``b t d``.
+
+        Args:
+            x: The stream.
+            taps: The forward pass's taps, for the documents in the rows.
+        """
         x = shard_layer_input(x)
         q, k, v = self._qkv(x, taps)
         g = jnp.broadcast_to(-self.slopes[...][:, None], (*q.shape[:3], 1))

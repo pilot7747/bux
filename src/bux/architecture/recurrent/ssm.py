@@ -38,7 +38,7 @@ def selective_scan(
     docs: Segments | None = None,
 ) -> Float[Array, "b t h p"]:
     """Run the selective scan. Each of the h heads keeps an n by p state S, and at
-    every position
+    every position::
 
         S = exp(dt A) S + B (dt x)^T,    y = S^T C,
 
@@ -49,7 +49,21 @@ def selective_scan(
     the run's `methods.recurrence`, in float32, the outputs in x's dtype, named
     `recurrence` (``remat.named``), its states for the backward pass kept or computed
     again by the run's `methods.states`, as linear attention's are
-    (``linear_attention.recomputed``)."""
+    (``linear_attention.recomputed``).
+
+    Args:
+        x: The input of every head, ``b t h p``: rows, positions, heads, channels
+            of a head.
+        dt: The time step of every head at every position.
+        A: The state matrix's diagonal, negative: ``h n`` (Mamba), or one per head,
+            ``h 1`` (Mamba-2).
+        B: What the state takes in, ``b t g n``, of each group of heads.
+        C: What the output reads of the state, ``b t g n``.
+        docs: The documents packed into the rows; None for one a row.
+
+    Returns:
+        y of every head at every position, in x's dtype.
+    """
     b, t = x.shape[:2]
     within = jnp.ones((b, t), jnp.int32) if docs is None else docs.within
     keep = (within > 0).astype(jnp.float32)  # 0 where a document starts
@@ -156,14 +170,22 @@ def shard_channels(
 
 
 class Mamba(nnx.Module):
-    """Mamba's selective SSM (Gu & Dao, 2023) as Jamba has it, with the time steps, B
-    and C RMS-normalized.
+    """Mamba's selective SSM (Gu & Dao, 2023) as Jamba has it, ``mamba``, with the
+    time steps, B and C RMS-normalized.
 
     The input projects to u and a gate z, both `expand` times the width. u is convolved
     over positions and SiLU'd, and projects to B and C, which all its channels share,
     and to a time step of rank dt_rank, projected up to one per channel. Every channel
     keeps a state of state_size, which decays at its own rate in each state dim. With
     D u added, the output is gated by SiLU(z) and projected back.
+
+    A starts as S4D-real's, ``-(1, 2, ..., n)`` in every channel, D at 1, and the
+    time steps log-uniform in ``[dt_min, dt_max]``.
+
+    Args:
+        config: Its settings (`bux.config.MambaConfig`).
+        width: The width of the stream, d.
+        rngs: The random streams the parameters start from.
     """
 
     def __init__(self, config: cfg.MambaConfig, width: int, rngs: nnx.Rngs):
@@ -199,6 +221,13 @@ class Mamba(nnx.Module):
     def __call__(
         self, x: Float[Array, "b t d"], taps: Taps | None = None
     ) -> Float[Array, "b t d"]:
+        """Return the mixer's output at every position of x, ``b t d``.
+
+        Args:
+            x: The stream.
+            taps: The forward pass's taps, for the documents in the rows; None for
+                rows of one document each.
+        """
         u, z = jnp.split(shard_fused(self.in_proj(shard_layer_input(x))), 2, axis=-1)
         u = jax.nn.silu(self.conv(u, taps))
         r, n = self.rank, self.state_size
@@ -215,15 +244,28 @@ _HEADS = ("batch", "seq", "heads")
 
 
 class Mamba2(nnx.Module):
-    """Mamba-2 (Dao & Gu, 2024), as transformers' Mamba-2, Zamba2 and Nemotron-H
-    mixers compute it.
+    """Mamba-2 (Dao & Gu, 2024), ``mamba2``, as transformers' Mamba-2, Zamba2 and
+    Nemotron-H mixers compute it.
 
     The input projects to a gate z, to u, B and C, which are convolved over positions
     together and SiLU'd, and to one time step per head. u splits into heads of
     head_dim, whose states decay by one rate per head, and B and C into num_groups
     groups that the heads share. With D u added, the output is gated by SiLU(z),
     RMS-normalized one group of heads at a time (as Mamba-2's reference, Zamba2 and
-    Nemotron-H group it) and projected back.
+    Nemotron-H group it) and projected back. The scan runs by chunks of positions,
+    as linear attention's does.
+
+    A starts at ``-a`` for a uniform in [1, 16] per head (Mamba-2's A_init_range), D
+    at 1, and the time steps log-uniform in ``[dt_min, dt_max]``.
+
+    Args:
+        config: Its settings (`bux.config.Mamba2Config`).
+        width: The width of the stream, d.
+        rngs: The random streams the parameters start from.
+
+    Raises:
+        ValueError: The inner channels do not split into heads of head_dim, or the
+            heads into num_groups groups.
     """
 
     def __init__(self, config: cfg.Mamba2Config, width: int, rngs: nnx.Rngs):
@@ -253,6 +295,13 @@ class Mamba2(nnx.Module):
     def __call__(
         self, x: Float[Array, "b t d"], taps: Taps | None = None
     ) -> Float[Array, "b t d"]:
+        """Return the mixer's output at every position of x, ``b t d``.
+
+        Args:
+            x: The stream.
+            taps: The forward pass's taps, for the documents in the rows; None for
+                rows of one document each.
+        """
         b, t, _ = x.shape
         d_inner, g, n = self.inner, self.groups, self.state_size
         x = shard_layer_input(x)
@@ -271,8 +320,15 @@ class Mamba2(nnx.Module):
 
 
 class ShortConv(nnx.Module):
-    """LFM2's double-gated short convolution: the input projects to B, C and u, and
-    the output is C times the causal convolution of B u, projected back."""
+    """LFM2's double-gated short convolution, ``short_conv`` (cf. H3, Hyena): the
+    input projects to B, C and u, each the width, and the output is
+    ``C * conv(B * u)``, the causal convolution of ``conv_size`` taps, projected back.
+
+    Args:
+        config: Its settings (`bux.config.ShortConvConfig`).
+        width: The width of the stream, d.
+        rngs: The random streams the parameters start from.
+    """
 
     def __init__(self, config: cfg.ShortConvConfig, width: int, rngs: nnx.Rngs):
         bias = config.bias
@@ -285,6 +341,13 @@ class ShortConv(nnx.Module):
     def __call__(
         self, x: Float[Array, "b t d"], taps: Taps | None = None
     ) -> Float[Array, "b t d"]:
+        """Return the mixer's output at every position of x, ``b t d``.
+
+        Args:
+            x: The stream.
+            taps: The forward pass's taps, for the documents in the rows; None for
+                rows of one document each.
+        """
         B, C, u = jnp.split(shard_fused(self.in_proj(shard_layer_input(x))), 3, axis=-1)
         return self.out_proj(shard_channels(C * self.conv(B * u, taps), "mlp"))
 

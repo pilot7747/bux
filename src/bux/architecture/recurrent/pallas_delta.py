@@ -3,27 +3,27 @@ exact at any gate, forward and backward.
 
 The positions go by chunks of 64 (`SIZE`), in blocks of 16 (`BLOCK`). Within a
 chunk, with G_t the sum of its log decays up to t, the decay from s to t is
-exp(G_t - G_s) per channel. Each pair of positions takes it through a position r
-between them, as a matmul of the two factors,
+``exp(G_t - G_s)`` per channel. Each pair of positions takes it through a position r
+between them, as a matmul of the two factors::
 
     exp(G_t - G_s) = exp(G_t - G_r) exp(G_r - G_s),
 
-both at most 1: for blocks i > j, r is the end of block j (`_across`); within a
+both at most 1: for blocks i > j, r is the end of block j (``_across``); within a
 block, the end of the first half of the 8, 4, 2 or 1 positions it is in, a level at a
-time (`_in_block`). So no exponent is positive, whatever the gate. From the state S a
-chunk starts from, ``chunkwise``'s WY form gives its outputs and the state it ends
-with,
+time (``_in_block``). So no exponent is positive, whatever the gate. From the state S
+a chunk starts from, ``chunkwise``'s WY form gives its outputs and the state it ends
+with::
 
     U = Y - W S,    o = Q S + M U,    S' = D S + K^T U,
 
-where A holds the pairs' beta_t k_t . k_s decayed (s < t), KK the same without
-beta, M the pairs' q_t . k_s decayed (s <= t), T = (I + A)^-1, and
+where A holds the pairs' ``beta_t k_t . k_s`` decayed (s < t), KK the same without
+beta, M the pairs' ``q_t . k_s`` decayed (s <= t), ``T = (I + A)^-1``, and::
 
     W = T (beta k exp(G)),   Y = T (beta v),   Q = q exp(G),
     K = k exp(G_end - G),    D = exp(G_end):
 
 the chunk's parts. A document starts the state again: no pair spans its start, and
-nothing before it reaches it. The kernels, a program each of:
+nothing before it reaches it. The kernels, a program each of::
 
     pairs        a pair of blocks: its M and KK, and a block's inverse of I + A_ii
     solves       a chunk: T from its blocks' inverses by halves, then W, Y, Q, K, D
@@ -36,10 +36,10 @@ nothing before it reaches it. The kernels, a program each of:
     back_steps   a chunk: KK's gradient by A, -T^T (dX X^T) of all the columns
     back_pairs   a block: the gradients of q, k and G by the pairs
 
-The parts and states are kept in the values' dtype. With `methods.states = keep`
-the backward pass keeps them from the forward pass, else it runs `pairs`, `solves`
-and `states` again. On a mesh, a `shard_map` gives the kernels each device's rows
-and heads.
+The parts and states are kept in the values' dtype. With ``methods.states = keep``
+the backward pass keeps them from the forward pass, else it runs ``pairs``,
+``solves`` and ``states`` again. On a mesh, a `jax.shard_map` gives the kernels each
+device's rows and heads.
 """
 
 import functools

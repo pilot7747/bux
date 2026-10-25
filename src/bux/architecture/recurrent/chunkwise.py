@@ -2,15 +2,16 @@
 matmuls within a chunk, and a scan of the state across chunks.
 
 Over a chunk from a state S_0, with G_t the sum of the log decays of its positions up
-to t, the decay from s to t is Gamma(t, s) = diag(exp(G_t - G_s)). The generalized delta
-rule (``linear_attention.recurrence``)
+to t, the decay from s to t is ``Gamma(t, s) = diag(exp(G_t - G_s))``. The generalized
+delta rule (`~bux.architecture.recurrent.linear_attention.recurrence`)::
 
     S_t = diag(w_t) S_{t-1} + b_t (a_t^T S_{t-1}) + k_t v_t^T,    o_t = S_t^T q_t,
 
-reads x_t = S_{t-1}^T a_t of the state, and the x of a chunk solve the unit lower
-triangular system (I - L) X = Ã S_0 + L_k V, with L[t, s] = a_t^T Gamma(t-1, s) b_s and
-L_k[t, s] = a_t^T Gamma(t-1, s) k_s for s < t. So X = W S_0 + U (the WY form), and the
-outputs and the state the chunk ends with are affine in S_0 too:
+reads ``x_t = S_{t-1}^T a_t`` of the state, and the x of a chunk solve the unit lower
+triangular system ``(I - L) X = Ã S_0 + L_k V``, with
+``L[t, s] = a_t^T Gamma(t-1, s) b_s`` and ``L_k[t, s] = a_t^T Gamma(t-1, s) k_s`` for
+s < t. So ``X = W S_0 + U`` (the WY form), and the outputs and the state the chunk
+ends with are affine in S_0 too::
 
     o = R S_0 + O,    S_C = A S_0 + B.
 
