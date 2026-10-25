@@ -238,7 +238,7 @@ by their hashes and keep each document seeing only itself (`doc_mask`), except
 | packing    | rows                                                                   |
 |------------|------------------------------------------------------------------------|
 | `concat`   | documents end to end, cut every `seq_len - 1` tokens: no padding, documents whole only by chance |
-| `greedy`   | whole documents in order, a row padded and closed when the next does not fit; longer ones dropped (`long=drop`) |
+| `greedy`   | whole documents in their shuffled order, a row padded and closed when the next does not fit; longer ones dropped (`long=drop`) |
 | `best_fit` | the longest first, each into the open row it leaves least room in: nearly no padding, and documents longer than a row split into pieces that fill gaps (`long=split`) |
 
 Compare them from the command line on the training split. At 128 tokens a row:
@@ -283,7 +283,8 @@ split document, overlap by a token, so that every token is a target once.
 
 A run can read several sources at once. `+` mixes them and `*` weights them, so every
 batch of `0.75 * a + 0.25 * b` has three quarters of its rows from `a`. Write a second
-source, sums written out as text, in a column named `content`:
+source, sums written out as text, in a column named `content`. Save this as
+`make_facts.py` and run it:
 
 ```python
 """Write sums as text to data/facts/, in a column named content."""

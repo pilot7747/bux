@@ -107,7 +107,8 @@ error: token_shift has no setting 'int'
 ```
 
 Training is another matter. Without a builder, the backend cannot make the module, and
-says so as it builds the model:
+says so as it builds the model. Here it trains `mine/shifted.bux`, the run you write
+in [step 4](#4-use-it), before the builder exists:
 
 ```console
 $ bux train mine/shifted.bux
@@ -312,3 +313,5 @@ A layer can do more than this one, each through the same two pieces:
   back in another layer, as `attn(v=@v1)` does.
 
 [Adding a layer](../architectures/adding-a-layer.md) covers each of these in detail.
+Next, [custom training](custom-training.md) changes the trainer the same way: a
+function or a class of your own, not a fork.

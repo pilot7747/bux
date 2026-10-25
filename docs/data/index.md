@@ -3,7 +3,9 @@
 A run trains on **rows** of `seq_len` tokens. Documents, raw text or conversations,
 become rows once, before training: a MapReduce job tokenizes them, shuffles them and
 packs them, on this machine's cores or on Spark. This section covers the sources a
-run reads, how documents are packed into rows, and the pipeline that does it.
+run reads, how documents are packed into rows, and the pipeline that does it. Read it
+to train on documents of your own; a run on random tokens or on token shards needs
+only [Sources](sources.md).
 
 ## A quick example
 

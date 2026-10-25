@@ -142,9 +142,8 @@ A run reads every source epoch after epoch:
 - a `tokens` source by windows, each epoch in a new order of all its windows;
 - `synthetic` by rows, each drawn from a seed of its own.
 
-A mixture has `round(weight · batch)` rows of each source in every batch, by largest
-remainder. So batch `i` depends only on the seed and `i`, and a run that resumes at
-step `i` reads what it would have read ([Mixtures](sources.md#mixtures)).
+A batch takes its share of rows from each source's stream in turn, so batch `i`
+depends only on the seed and `i` ([Determinism](sources.md#determinism)).
 
 ### The windows' order
 
@@ -171,9 +170,11 @@ of a batch, on the thread that loads batches ahead, in:
 | `tokens`, 4 shards of 1 TiB: 1.1T tokens | 64 of 256, on four nodes | 5-6 ms |
 | | 64 of 64, on one | 2.6-4.4 ms |
 
-A process reads the one or two row groups that hold its rows, so its 64 rows of 256
-cost what the whole batch does on one node, where at 64 rows a batch a group serves
-four batches. That does not grow with the nodes, and it is a few percent of a step,
-0.24 s. Reading added 0.1-0.3 GB to a process's memory, where the windows' permutation
-alone would take 2 GiB. The batches on the devices were, bit for bit, those one
-process reads whole, and the first step's loss on four nodes was one node's to the bit.
+- A process reads the one or two row groups that hold its rows, so its 64 rows of 256
+  cost what the whole batch does on one node. At 64 rows a batch on one node, a row
+  group serves four batches.
+- That cost does not grow with the nodes, and it is a few percent of a step (0.24 s).
+- Reading added 0.1-0.3 GB to a process's memory, where the windows' permutation
+  alone would take 2 GiB.
+- The batches on the devices were, bit for bit, those one process reads whole, and
+  the first step's loss on four nodes was one node's to the bit.
