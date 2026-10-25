@@ -85,14 +85,15 @@ trade memory, compile time or what a run computes for speed.
 ### Kernels
 
 On a GPU, bux runs attention, the recurrent mixers, the experts' GEMMs, the MoE's
-dispatch and the low-precision quantizers by kernels: 2.6x to 27x XLA's own program
-for each. They are on by default, and each falls back to XLA by itself where it cannot
-run.
+dispatch and the low-precision quantizers by kernels: 1.4x to 27x XLA's own program
+for the same computation. They are on by default, and each falls back to XLA by itself
+where it cannot run.
 
 - **Set**: nothing. `BUX_KERNELS=off` turns them all off, to debug one.
 - **Helps**: always. Check that yours run: a layer outside a kernel's conditions
-  falls back, such as a delta rule with heads of 96 dims, or attention with a soft
-  cap, which cuDNN does not take.
+  falls back. A delta rule with heads of 96 dims runs by chunks, KDA with a
+  `gate_lower_bound` below -5 by bux's slower Pallas kernels, and attention with a
+  soft cap by tokamax's kernel, which cuDNN's does not replace.
 - **Costs**: nothing; none of them is in a run's id.
 - **Measured**: [Kernels](kernels.md), which also lists when each falls back.
 
@@ -107,23 +108,17 @@ precision = precision(matmuls=mxfp8)    # every projection inside a block, the e
 use nvidia_nvfp4                        # or a recipe, a module of precision settings
 ```
 
-- **Helps**: GEMM-bound runs on B200s and B300s.
-
-  | run | bfloat16 | `mxfp8` | `nvfp4` |
-  |-----|----------|---------|---------|
-  | 1.3B, 1 GPU | 142k tok/s | 167k (1.18x) | 179k (1.22x) |
-  | 1.3B, `fsdp=8` | 1.12M | 1.30M (1.16x) | |
-  | MoE, 1 GPU | 105k, 134.0 GiB | 116k (1.10x), 119.4 GiB | |
-  | MoE, `fsdp=8` | 824k, 83.8 GiB | 909k (1.10x), 69.1 GiB | |
-
+- **Helps**: GEMM-bound runs on B200s and B300s. In `mxfp8` the dense 1.3B trains
+  1.18x as fast on one GPU and 1.16x on `fsdp=8`, and the MoE 1.10x in 15 GiB less;
+  in `nvfp4` the 1.3B trains 1.22x as fast
+  ([Low-precision matmuls](kernels.md#low-precision-matmuls) has the tables).
 - **Costs**: a format changes what a run computes, so it is in the run's id. 3000
   steps of FineWeb-Edu on the 1.3B end within the noise of bfloat16 in `mxfp8`
   (+0.12% and -0.02% at two seeds, which differ by 1.6%), and about half a percent
   above it in NVFP4 (`nvidia_nvfp4`: +0.48% and +0.56%).
 - **Narrow projections gain least.** In MXFP8, k's and v's GEMMs, half as wide, take
-  7% more time than in bfloat16, yet leaving them in bfloat16
-  (`roles=roles(kv=compute)`) is slower still; in NVFP4, q, k, v and o are slower than
-  in MXFP8.
+  7% more time than in bfloat16. Leaving them in bfloat16 (`roles=roles(kv=compute)`)
+  is slower still. In NVFP4, q, k, v and o are slower than in MXFP8.
 - **Where it does not pay**: `ring` attention on `context=2` trained 13% slower in
   `mxfp8` than in bfloat16, as its projections' tokens split along positions. Under
   TP, use `methods(tensor=chunked)` in MXFP8 ([Overlap](#overlap-of-communication)).
@@ -144,12 +139,9 @@ A step's speed grows with the rows each GPU computes, until they no longer fit.
 - **Rows a GPU** are `batch` over the GPUs the batch splits over. On one GPU they
   matter little: the 1.3B trains at 139k tokens a second at 8 rows (51.1 GiB) and 146k
   at 56 (191.2 GiB). Under FSDP they matter a lot, as a step at a row a GPU waits for
-  FSDP's gathers:
-
-  | 1.3B, `fsdp=8`, rows of 4096 a GPU | 1 | 2 | 4 | 8 |
-  |------------------------------------|---|---|---|---|
-  | tok/s | 443k | 909k | 1.03M | 1.11M |
-
+  FSDP's gathers: on `fsdp=8` the 1.3B trains at 443k tokens a second at a row a GPU,
+  909k at 2 and 1.11M at 8 ([Scanned layers under
+  FSDP](compiler.md#scanned-layers-under-fsdp)).
 - **Microbatches** (`methods(microbatches=n)`) take a step's batch in n parts, a
   gradient accumulation inside the step: the same step in less memory, but slower. The
   1.3B on `fsdp=8` at 64 rows a step trains at 1.245M tokens a second whole and 1.054M
@@ -176,14 +168,16 @@ NCCL's buffers and NCCL EP's, which on B300s (268.6 GiB) took, a GPU at most:
 | the 1.3B, `fsdp=16` over two nodes                   | 2.2 GiB         |
 | `nccl_ep`, `expert=16` over two nodes                | 9.8 GiB         |
 
-At 95% a B300's pool is 254 GiB and 14.3 GiB stay beside it; at 97%, 8.9 GiB, too
-little for NCCL EP over two nodes, whose buffers grow with a device's tokens and the
-model's width. `remat=auto` fits the step to the pool: Qwen3-30B-A3B's `sorted` arm
-took `dots` at 75% (210k tokens a second, 180 GiB) before the MoE's weights moved
-before `down`, and takes `none` at 95% now (295k, 215 GiB), as does its `nccl_ep` arm
-(246k, 211 GiB), each in one compile.
+At 95% a B300's pool is 254 GiB, and 14.3 GiB stay beside it. At 97% 8.9 GiB stay,
+too little for NCCL EP over two nodes, whose buffers grow with a device's tokens and
+the model's width.
 
-**Measured**: [Microbatches](../parallelism/microbatches.md).
+`remat=auto` fits the step to the pool. Before the MoE's weights moved before `down`,
+Qwen3-30B-A3B's `sorted` arm took `dots` in JAX's pool of 75% (210k tokens a second,
+180 GiB). Now it takes `none` at 95% (295k, 215 GiB), as does its `nccl_ep` arm (246k,
+211 GiB), each in one compile.
+
+**Measured**: [Microbatches](../parallelism/microbatches.md#measurements).
 
 (tuning-remat)=
 
@@ -202,24 +196,19 @@ methods = methods(remat=remat(save=[attention, mlp], first=8))   # or a policy a
 - **Helps**: setting it by hand rarely beats `auto`, which takes the policy that
   computes least again among those that fit. Set one to fit more rows at a known
   cost, or to skip `auto`'s extra compiles.
-- **Costs**: speed, for memory. The dense 1.3B on one GPU, 8 rows of 4096:
-
-  | `remat` | tok/s | peak |
-  |---------|-------|------|
-  | `none` | 139k | 51.1 GiB |
-  | `dots_attention` | 137k | 41.6 GiB |
-  | `dots` | 128k | 39.5 GiB |
-  | `save_attention` | 126k | 30.6 GiB |
-  | `full` | 120k | 24.5 GiB |
-
+- **Costs**: speed, for memory. The dense 1.3B on one GPU, 8 rows of 4096, trains at
+  139k tokens a second in 51.1 GiB under `none`, 137k in 41.6 under `dots_attention`
+  and 120k in 24.5 under `full`
+  ([Policies on a B300](../parallelism/remat.md#policies-on-a-b300) has every
+  policy).
 - **Recurrent mixers**: `methods(states=recompute)` makes the backward of a recurrence
   by chunks compute its chunks' states again, in a fourteenth of the memory and a fifth
-  more time: the Mamba-2 hybrid fits 32 rows instead of 16, at 4-9% fewer tokens a
+  more time. The Mamba-2 hybrid then fits 32 rows instead of 16, at 4-9% fewer tokens a
   second. Keeping only a mixer's inputs, `remat(save=[attention, recurrence.in])`,
   costs a GDN or Mamba-2 hybrid 2-3% for 59-68% less memory.
 - **Offloading** to the host's memory saves nothing unrolled, and costs a third of the
   speed: computing the values again is cheaper on a B300.
-- **Measured**: [Remat](../parallelism/remat.md).
+- **Measured**: [Remat](../parallelism/remat.md#measurements).
 
 ### Donation
 
@@ -228,14 +217,14 @@ old one's memory (`methods.donate = true`, the default).
 
 - **Helps**: memory. The 1.3B's step on one GPU, its loss by logits, peaks at 70.6 GiB
   instead of 81.3 (51.1 by chunks, the default), and trains 36 rows a GPU, which run
-  out of memory without it; the MoE's peaks at 153.5
-  GiB instead of 163.9, trains 12 rows, and survives a checkpoint every 10 steps.
+  out of memory without it. The MoE's peaks at 153.5 GiB instead of 163.9, trains 12
+  rows, and survives a checkpoint every 10 steps.
 - **Costs**: an array read from `trainer.model` before a step is gone after it, so a
   hook that keeps one keeps a copy. Donation changes how XLA rounds a step a little
   (the gradient's norm by 7e-6 at the dense model's first step): runs compared bit for
   bit donate alike.
 - **Set** `methods(donate=false)` only to debug such a hook.
-- **Measured**: [Microbatches](../parallelism/microbatches.md).
+- **Measured**: [Donation](../parallelism/microbatches.md#donation-methodsdonate).
 
 ### The loss by chunks
 
@@ -244,17 +233,12 @@ at a time, and takes each chunk's gradients in the forward. At a vocabulary of 1
 the float32 logits of 8 rows of 4096 tokens take 16 GB, and their gradient as much
 again.
 
-| 1.3B, `methods.loss` | tok/s | peak |
-|----------------------|-------|------|
-| `logits`, 1 GPU | 138k | 70.6 GiB |
-| `chunks`, 1 GPU | 139k | 51.1 GiB, and 56 rows fit (146k) |
-| `logits`, `fsdp=8` | 1.064M | 58.5 GiB |
-| `chunks`, `fsdp=8` | 1.071M | 38.9 GiB |
-
-- **Helps**: memory, at no cost in speed; the GDN hybrid and the MoE train 6% and 5%
-  faster by it than by the chunks before it.
+- **Helps**: memory, at no cost in speed. The 1.3B on one GPU peaks at 51.1 GiB by
+  chunks against 70.6 by whole logits, at 139k tokens a second against 138k, and fits
+  56 rows. On `fsdp=8` it peaks at 38.9 GiB against 58.5. The GDN hybrid and the MoE
+  train 6% and 5% faster by it than by the chunks before it.
 - **Costs**: nothing. `methods(loss=logits)` is there to compare.
-- **Measured**: [Extending the trainer](../training/extending.md).
+- **Measured**: [Loss methods](../training/extending.md#loss-methods).
 
 (tuning-mesh)=
 
@@ -271,7 +255,7 @@ add an axis only when FSDP alone cannot fit the model or its rows:
 | an MoE | `methods(moe=sorted)` under FSDP or HSDP | the baseline MoE at 831k on a node, 1,586k on two |
 | an MoE whose experts should not be gathered | `mesh(expert=8)` inside a node, `data` across | `nccl_ep` at 615k on a node, 1,192k on two |
 | long rows | `mesh(context=8)`, `methods.attention` at `auto`; `ring` for long packed rows | 128k tokens a row: `ring` 346k on packed documents, `ulysses` 197k on one document |
-| a model too large for a node, where FSDP across nodes would gather every layer between them | a pipeline of a stage a node: `mesh(stage=4, fsdp=8)`, `methods(repeat=scan, microbatches=16)` | 76k tok/s a GPU, 54% of FSDP's, on 4 nodes and on 8 |
+| a model too large for a node, where FSDP across nodes would gather every layer between them | a pipeline of a stage a node: `mesh(stage=4, fsdp=8)`, `methods(repeat=scan, microbatches=16)` | 76k tok/s a GPU on 4 nodes and on 8: 54% of one node's FSDP a GPU, 58% of FSDP's over the 4 nodes |
 
 - **FSDP over many nodes** gathers every layer across them, forward and backward, and
   loses more as they grow: 98% of a node's rate on two, 94% on four, 87% on eight.
@@ -312,23 +296,17 @@ methods = methods(moe=nccl_ep, capacity=1.25)                         # EP by NC
 methods = methods(moe=all_to_all, capacity=1.25, moe_chunks=2)        # or by XLA's
 ```
 
-The baseline's MoE (64 experts, top 8, `d_model` 2048) at 32k tokens a GPU and a
-capacity of 1.25:
+For the baseline's MoE (64 experts, top 8, `d_model` 2048) at 32k tokens a GPU and a
+capacity of 1.25, `sorted` is the fastest:
 
-| GPUs | method | mesh | tok/s |
-|------|--------|------|-------|
-| 8 | `sorted` | `fsdp=8` | **831k** |
-| | `ragged_all_to_all` | `expert=8` | 544k |
-| | `all_to_all`, `moe_chunks=2` | `expert=8` | 586k |
-| | `nccl_ep` | `expert=8` | 615k |
-| 16 | `sorted` | `data=2, fsdp=8` | **1,586k** |
-| | `ragged_all_to_all` | `data=2, expert=8` | 1,016k |
-| | `nccl_ep` | `data=2, expert=8` | 1,192k |
-| | `ragged_all_to_all` | `expert=16` | 324k |
-| | `nccl_ep` | `expert=16` | 773k |
+- on a node, 831k tokens a second under `fsdp=8`, against 615k by `nccl_ep`, 586k by
+  `all_to_all` in 2 chunks and 544k by `ragged_all_to_all` on `expert=8`;
+- on two nodes, 1,586k under HSDP, against 1,192k by `nccl_ep` with EP in each node
+  and `data` across them, and 773k by `nccl_ep` on `expert=16`.
 
 At Qwen3-30B-A3B's Megatron workload on 8 GPUs, `sorted` trains at 42.4k tokens a
-second a GPU and `nccl_ep` at 34.9k.
+second a GPU and `nccl_ep` at 34.9k. Every method's numbers are in
+[Experts](../parallelism/experts.md#one-node-and-two).
 
 - **`sorted`** is the fastest at these shapes: its FSDP gathers 0.5 GB of experts a
   layer, which hide behind compute, where an exchange moves 1.1 to 1.3 GB of picks
@@ -377,17 +355,21 @@ that could run beside them. In the order to try:
    70B's layers train 5% faster (263k against 250k); in bfloat16 about 1%, and on
    `fsdp=2, tensor=4` 3% slower.
 3. **A compiler preset** (`compiler(preset=...)`): XLA's defaults are the fastest for
-   every run measured, but two. A scanned model under FSDP at a row a GPU trains 56%
+   every run measured but one. A scanned model under FSDP at a row a GPU trains 56%
    faster with `methods(repeat=scan)` and `compiler(preset=maxtext)` (48% on two
-   nodes), and `lhs` or `o1` schedule `ragged_all_to_all`, which XLA's defaults do
-   not ([Presets](compiler.md#presets)).
+   nodes). `lhs` and `o1` also schedule `ragged_all_to_all`, which XLA's defaults do
+   not, though at a row a GPU it trained no faster for it
+   ([The presets on one node](compiler.md#the-presets-on-one-node)).
 4. **Microbatches side by side** (`methods(interleave=true)`): each microbatch's
-   forward beside the backward of the one before, as Megatron's combined 1F1B. It
-   hides NCCL EP's exchange (`nccl_ep` on 12 of Qwen3-30B-A3B's layers +4%, with
-   `moe_stream`), but holds half a microbatch more (25-30 GiB there), copies it across
-   the loop, and compiles in twice the time; the dense 1.3B under FSDP trains slower by
-   it (93.1k against 111.2k a GPU). It is off by default, and an error with a pipeline
-   or a model whose items pass each other more than the stream (a tap, an MTP head).
+   forward beside the backward of the one before, as Megatron's combined 1F1B.
+   - It hides NCCL EP's exchange: `nccl_ep` on 12 of Qwen3-30B-A3B's layers trains 4%
+     faster with it and `moe_stream`.
+   - It holds half a microbatch more (25-30 GiB there), copies it across the loop, and
+     compiles in twice the time. The dense 1.3B under FSDP trains slower by it (93.1k
+     against 111.2k a GPU).
+   - It is off by default, and an error with a pipeline or a model whose items pass
+     each other more than the stream (a tap, an MTP head)
+     ([Side by side](../parallelism/microbatches.md#side-by-side-methodsinterleave)).
 
 XLA's own flags did not help where these did: PGLE, two collectives in flight, fewer
 NCCL channels, NCCL's symmetric buffers ([What XLA's own flags
@@ -398,15 +380,16 @@ did](compiler.md#what-xlas-own-flags-did)).
 ### The host between steps
 
 A GPU idles when it waits for the host to launch its next step. Since the host fix
-(`cc9e425`), the GPU waits only after a step the host itself waits for:
+(`cc9e425`), the GPU waits only after a step the host itself waits for: an eval, a
+checkpoint, or a profile's trace as it starts and stops.
 
 - **The log** reads a step's metrics once the next step is launched, and computes its
   learning rate behind its own step. Logging every step, the 1.3B's GPU 0 idles
   2.2 ms a step, against 2.1 ms logging every 5: log as often as you like.
-- **An eval or a checkpoint** waits for its step. The launch of a large step returns
-  only when the GPU is nearly through it (Qwen3-30B-A3B's 100 to 170 ms before its
-  end), so after one the GPU waits for the next launch: 145 to 210 ms for
-  Qwen3-30B-A3B's 48 layers on 8 B300s. Space out `eval(every=...)` and
+- **An eval, a checkpoint or a trace's start and stop** waits for its step. The launch
+  of a large step returns only when the GPU is nearly through it (Qwen3-30B-A3B's 100
+  to 170 ms before its end), so after one the GPU waits for the next launch: 145 to
+  210 ms for Qwen3-30B-A3B's 48 layers on 8 B300s. Space out `eval(every=...)` and
   `checkpoint(every=...)` (1000 steps by default).
 - **The data**: a thread loads the next two batches as a step runs (`prefetch`), and
   each goes to the devices just before its step.
@@ -431,15 +414,20 @@ export JAX_COMPILATION_CACHE_DIR=                    # or no cache at all
 
 - **On many hosts** the processes must all find a program in the cache, or all
   compile it, so the cache must be one folder on a filesystem every host mounts. When
-  the processes join, bux checks that it is, and else turns it off and says so: every
-  launch then compiles everything, together. Warm, a launch of the 1.3B on two nodes
-  reaches its fifth step in 42 s, against 78 cold; the train step loads in 0.3 s where
-  it compiles in 16 s ([Multi-node](../parallelism/multi-node.md)).
+  the processes join, bux checks that it is. Where it is not, bux turns the cache off
+  and says so, and every launch then compiles everything, together. Warm, a launch of
+  the 1.3B on two nodes reaches its fifth step in 42 s, against 78 cold; the train
+  step loads in 0.3 s where it compiles in 16 s
+  ([The compile cache](../parallelism/multi-node.md#the-compile-cache)).
 - **Where a compile goes.** A compile of Qwen3-30B-A3B's `sorted` 48-layer step
-  (`remat=none`) takes about 230 s on a B300's host: 38 s to trace it, 62 s to lower
-  it to MLIR, and 132 s in XLA, 89 of them in its HLO passes and 16 in LLVM and ptxas
-  for its 286 kernels. 88% of the lowering is the MXFP8 experts' Mosaic GPU kernels,
-  lowered once a call, 0.36 s each, though every layer calls them at the same shapes.
+  (`remat=none`) takes about 230 s on a B300's host:
+
+  | stage | seconds |
+  |-------|---------|
+  | tracing the step | 38 |
+  | lowering it to MLIR | 62, 88% of it the MXFP8 experts' Mosaic GPU kernels, lowered once a call (0.36 s each), though every layer calls them at the same shapes |
+  | XLA | 132: 89 in its HLO passes, 16 in LLVM and ptxas for its 286 kernels |
+
   Creating the model compiles its initializers besides, once a run: 79 s. cuDNN's
   fused experts add 20 to 110 s, as CuTe DSL compiles its kernels in every process.
 - **`remat=auto`** compiles once where `none` fits. Where it does not, the other four

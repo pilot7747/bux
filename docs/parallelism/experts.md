@@ -162,7 +162,7 @@ by expert:
   f hidden units, where after `down` it took its d outputs: 1 GiB a layer of
   Qwen3-30B-A3B's. The backward computes the hidden units again, elementwise, from up
   and gate's GEMM, which it keeps for the activation's gradient anyway
-  (`weighted_units`).
+  (`weighted_units`; [measured](#the-routers-weights-before-down)).
 - After `norm`, where there is one, the weights multiply its output instead.
 - Rows past `sizes.sum()` come out 0, before `norm`.
 
@@ -219,27 +219,6 @@ def _(moe, z, idx, weights, taps=None):
 `methods = methods(moe=mine)` then picks it. An EP method is a body of one device's
 tokens instead ([below](#writing-your-own-ep-method)).
 
-### Measurements on 8 B300s: the router's weights before `down`
-
-`examples/benchmarks/megatron.bux` (Qwen3-30B-A3B, 32k tokens a GPU, MXFP8, routed by
-the router, XLA's pool at 97% of a GPU), before the weights moved before `down` and up
-and gate became one stack, and after. Tokens a second a GPU and peak memory:
-
-| Run | Before | After |
-|---|---|---|
-| `sorted`, `fsdp=8`, `remat=none` | 31.1k, 250.4 GiB | 31.9k, 215.0 GiB |
-| `nccl_ep`, `expert=8`, capacity 1.25, `remat=save_attention` | 21.3k, 99.6 GiB | 22.8k, 98.3 GiB |
-| the same, `remat=none` | needs 266 GiB | 27.7k, 210.7 GiB |
-
-- `sorted`'s step on GPU 0 took 1075 ms against 1098. Gone: the weights' d-wide
-  multiply, its transpose and reduce, and the concatenations of up and gate and of
-  their gradient.
-- With GEMM autotuning off, its losses agree to 5e-5 for three steps, then drift apart
-  as two runs of random tokens do.
-- Under `remat=auto` at JAX's default pool ([remat=auto](remat.md#rematauto-the-default)),
-  `sorted` now takes `dots_attention` (158.5 GiB) where it took `dots` (179 GiB), and
-  `nccl_ep` takes `dots` (187.4 GiB, 24.5k) where it took `save_attention` (21.7k).
-
 ## The experts in MXFP8
 
 Three ways to set the experts' format, one line each:
@@ -255,7 +234,7 @@ The routed experts' role, `experts`, takes `compute`, `mxfp8` or `mxfp8_2d`
 `matmuls` where a grouped GEMM multiplies in it, `mxfp8` and `mxfp8_2d`, and `compute`
 under any other format, as under `nvfp4`: no grouped GEMM takes NVFP4
 (`PrecisionConfig.experts`). On B300s MXFP8 experts train 10 to 15% faster than
-bfloat16 ones ([below](#measurements-in-training-on-b300s)).
+bfloat16 ones ([below](#in-training-on-b300s)).
 
 :::{note}
 Before this, an MoE run that left its experts to `matmuls=mxfp8` multiplied them in
@@ -319,106 +298,6 @@ counts the other's rows as 0. Which rows share a block, and so dW, depend on how
 mesh splits the tokens. In float32, 3 steps on `fsdp=2, expert=4` lose within 1e-4 of
 one device's (`tests/test_precision.py`), not the same.
 
-### Measurements on one B300: each GEMM
-
-Each GEMM of the baseline MoE's experts (64 of them, `d_model` 2048, intermediate 704,
-262144 picks), in TFLOP/s of the GEMM's own kernel by CUPTI:
-
-| GEMM | bfloat16, tokamax | MXFP8, Triton's `tl.dot_scaled` (before) | MXFP8, `grouped_mxfp8` |
-|---|---|---|---|
-| x W, up and gate | 1269 | 964 | 2405 (1.9x) |
-| h W, down | 1069 | 680 | 1596 (1.5x) |
-| dy W^T, down | 1213 | 908 | 2230 (1.8x) |
-| dh W^T, up and gate | 1266 | 901 | 2244 (1.8x) |
-| dW, up and gate | 1093 | 644 | 2573 (2.4x) |
-| dW, down | 1034 | 616 | 2367 (2.3x) |
-
-- With experts of 2048: 1.7 to 2.3 times bfloat16's, 2423 to 2616 TFLOP/s against
-  1139 to 1414.
-- At `all_to_all`'s GEMMs of a peer's buffer under `expert=8` (40960 rows, of which
-  32768 are its 8 experts'): 1.3 to 2.7 times, 1271 (h W) to 2490 (dW, up and gate)
-  against 904 to 1213.
-- h W contracts 704, which TMA takes in tiles of 128, so `rows` pads it to 768 and
-  does 9% more.
-- Taking the tiles a row of them at a time, all its columns before the next row, was
-  1.7x slower (1623 against 2725 TFLOP/s for dh W^T at k 4096): the rows and columns in
-  flight then fell out of L2.
-- Triton's kernels took the scales, rows of 4 bytes too short for TMA, through
-  registers into tensor memory at every step of k.
-
-### Measurements in training on B300s
-
-Side by side, GEMM autotuning off and deterministic ops: the experts in bfloat16, in
-MXFP8 by Triton's kernels as before, by `grouped_mxfp8`, and by it with the quantizer
-writing its layout ([below](#measurements-on-one-b300-the-quantizer)). By
-`scripts/benchmark.py` on `examples/benchmarks`' arms, against bfloat16 in the same
-job; tokens a second and peak memory:
-
-| Run | bfloat16 | MXFP8, Triton | MXFP8, `grouped_mxfp8` | quantized into its layout |
-|---|---|---|---|---|
-| the baseline MoE, one GPU, 8 × 4096 tokens: `one_gpu.bux`'s `moe` | 86.2k, 133.9 GiB | 74.2k | 91.5k (1.06x), 119.5 GiB | 95.0k (1.10x) |
-| experts of 2048, 8 layers, one GPU | 90.4k, 143.2 GiB | 75.6k | 101.7k (1.12x), 129.6 GiB | |
-| `ragged_all_to_all`, `capacity=1.25`, `expert=8`, 32k tokens a GPU: `one_node.bux`'s `moe_ep` | 468k, 88.5 GiB | 417k | 517k (1.10x), 72.3 GiB | 539k (1.15x) |
-| the same, `dispatch=mxfp8` | | | 515k | |
-| `all_to_all`, `capacity=1.25`, `expert=8`, 32k tokens a GPU | 492k, 91.4 GiB | 449k | 539k (1.10x), 78.4 GiB | |
-| `sorted`, `fsdp=8`, 32k tokens a GPU: `one_node.bux`'s `moe` | 671k, 83.9 GiB | 580k | 712k (1.06x), 69.4 GiB | 743k (1.11x) |
-
-- Both MXFP8 kernels compute the same values: the runs' losses agree to the last digit
-  logged, and with bfloat16's to the rounding between them. The two quantizers write
-  the same bytes, and the memory is the same.
-- The experts' GEMMs take half of bfloat16's time, 3.0 ms a layer against 5.8, and the
-  quantizer takes 1.5 ms of what they save. An MoE layer's experts, forward and
-  backward, take 5.0 ms against 7.3 in bfloat16 (1.45x), and 11.8 against 19.7 with
-  experts of 2048 (1.67x; `scripts/gpu_smoke/grouped_mxfp8.py`).
-- The quantizer reads each operand once and writes it twice at 5.1 TB/s, k padded to
-  whole tiles of 128 and the scales in tensor memory's tiles, so no pass of XLA lays
-  them out after it. x^T's blocks run down x's columns, so that only its E4M3 bytes
-  transpose, and it scales in x's dtype, by a power of two, exact. It took 2.2 ms a
-  layer before, in float32, and XLA's pads and layouts 90 to 160 µs a call more: 6.1
-  ms a layer against 7.3.
-- The experts keep x^T in MXFP8 for dW rather than x in bfloat16, so a run takes 14
-  GiB less.
-- It trains at bfloat16's loss: 98M tokens of FineWeb-Edu end 0.13% and 0.05% below
-  it, with FP8 dispatch ([Precision](../training/precision.md)).
-
-### Measurements on one B300: the quantizer
-
-At what one GPU of `megatron.bux`'s `sorted` arm quantizes a layer (128 experts of
-768, 262144 picks), on one B300 by CUPTI, no shape is slow:
-
-| Operand | Shape | TB/s |
-|---|---|---|
-| x, read by index from 32768 tokens | 262144 × 2048 | 5.8 |
-| dy | 262144 × 2048 | 5.2 |
-| h | 262144 × 768 | 5.1 |
-| dh | 262144 × 1536 | 5.2 |
-| each expert's W of up and gate | 128 × 2048 × 1536 | 5.2 |
-| each expert's W of down | 128 × 768 × 2048 | 5.1 |
-
-- x read by index takes 377 µs, where gathering it in bfloat16 took 378 and
-  quantizing the copy 420.
-- A copy that casts x and x^T to E4M3 unscaled runs at 6.5 TB/s (XLA's `x * 2` at
-  6.9), and the quantizer without its scales at 5.8. The scales' bytes take the rest
-  (4 a row of x, but one of each 4 of x^T's in a program of 32 rows), and so do the
-  blocks' largest magnitudes.
-- No faster: programs of 64 or 128 rows, or of 128 rows 32 at a time with each tile of
-  scales in one store; more warps; other grid orders; the scaling in float32.
-
-### Measurements on 8 B300s: x and dy read in place
-
-`megatron.bux`'s `sorted` arm at `remat=none` with the pool at 97%, 40 steps:
-
-- With the router's weights on the hidden units, so that down's rows sum plainly into
-  their tokens, reading x and dy in place took the arm from 260.3k to 269.4k tokens a
-  second (32.5k to 33.7k a GPU) at the same peak, 215.0 GiB. On GPU 0 a step fell from
-  1067 to 1029 ms: both gathers' 39 ms went, and the quantizer's 95 ms became 88.
-- With the weights after down, x in place alone went from 254.2k to 255.0k: the
-  gather's 25 ms went, but the FSDP collectives the step overlapped came out from
-  under it.
-- Each GPU quantized all 128 experts' W, 23 ms of a step. Under the fused kernels
-  ([below](#swiglu-fused-by-cudnn)), each quantizes its own shard before FSDP gathers
-  it.
-
 ## SwiGLU fused, by cuDNN
 
 On a Blackwell GPU with cudnn-frontend (the `cuda` extra), cuDNN's CuTe DSL kernels
@@ -459,48 +338,8 @@ They fuse what bux's kernels left to XLA:
   MXFP8: an eighth of the quantizer's work on `fsdp=8`, at bfloat16's bytes, and no
   bfloat16 copy of all 128 experts.
 
-### Measurements on a B300: one layer
-
-One layer of Qwen3-30B-A3B's experts (128 of 768, 262144 picks; by EP 16 of them,
-327680 rows of which 262144 are filled), forward and backward on a B300, by CUPTI:
-
-| | bux's kernels | fused | |
-|---|---|---|---|
-| `sorted` | 6.30 ms | 5.51 ms | the GEMMs with their epilogues 3.20 against 3.43 (2.3 against 2.2 PFLOP/s); none of XLA's 0.73 ms over h and dp, nor the quantizer's of them |
-| by EP | 5.83 ms | 4.97 ms | |
-
-- At these shapes cuDNN's GEMM of h W takes 0.44 ms against `grouped_mxfp8`'s 0.53,
-  and dp W^T 0.65 against 0.77; its wgrad 0.30 and 0.60 ms against 0.39 and 0.76.
-- The values are within MXFP8's rounding of bux's kernels': 2% apart in the output and
-  every gradient (relative Frobenius norm), each 6.6% from bfloat16's as before.
-
-### Measurements on 8 B300s: `megatron.bux`
-
-`remat=none`, the tree before and after on the same node:
-
-| Run | bux's kernels | fused |
-|---|---|---|
-| `sorted`, Megatron's batch (512 rows in 8 microbatches, `gather=layer`) | 36.1k tok/s a GPU, 229.6 GiB | 37.7k (+4.5%), 214.6 GiB |
-| `sorted`, one microbatch of 8 rows a GPU | 37.7k, 215.1 GiB | 38.5k (+2.1%), 200.3 GiB |
-| `nccl_ep`, one microbatch of 8 rows a GPU | 31.4k, 211.1 GiB | 32.4k (+3.1%), 212.7 GiB |
-
-- On GPU 0, at one microbatch (traced without XLA's command buffers, whose kernels the
-  trace then loses), the experts' kernels and XLA's passes over h and dp take 263 ms a
-  step against 319 under `sorted`, and 234 against 280 under `nccl_ep`.
-- Beside FSDP's collectives cuDNN's kernels run slower than alone: `dswiglu` takes
-  1.13 ms against 0.62 (0.59 under `nccl_ep`, which has none). Its tiles are
-  statically scheduled, where `grouped_mxfp8`'s take the SMs as they free.
-- Leaving pairs of SMs to the collectives (`CUDNNFE_CLUSTER_OVERLAP_MARGIN`, which all
-  of `grouped_cudnn`'s kernels heed) gains 0.3% at Megatron's batch with 8 (two runs
-  each, on one node) and 1.1% with 16 (one run), and loses 2% with 32. It is left at
-  0.
-- `sorted` keeps no bfloat16 copy of all 128 experts' kernels now, so it takes 15 GiB
-  less.
-- Its compiles take 20 to 110 s more: CuTe DSL compiles each kernel in every process.
-- 3000 steps of FineWeb-Edu on the baseline's MoE with experts of 768 (the fused
-  kernels' shapes, one B300 a run) end within 0.08% of bux's kernels at each of three
-  seeds, which differ by 1.6%: eval loss 4.0708, 4.0127 and 4.0346 against 4.0742,
-  4.0099 and 4.0363, at 104k tokens a second against 100k.
+At Megatron's batch they train Qwen3-30B-A3B's `sorted` arm 4.5% faster in 15 GiB
+less ([The fused SwiGLU](#the-fused-swiglu)).
 
 ## Expert parallelism
 
@@ -520,6 +359,9 @@ methods = methods(moe=ragged_all_to_all, capacity=1.25)
 | `ragged_all_to_all` | Each pick goes to its expert's device and back by `jax.lax.ragged_all_to_all`, a slice for each expert of each peer. A device's rows arrive sorted by its experts, which run on them as they are. XLA:CPU lacks it. |
 | `ragged_tokens` | The same, but each token goes once to each device that holds any of its experts, with its picks there, and comes back as their weighted sum: a row per device, not per pick. |
 | `nccl_ep` | Each token goes once to each device that holds any of its experts, and once to each other node, by NCCL EP's kernels through TransformerEngine's JAX bindings. It arrives as a row for each of its picks there, grouped by expert. GPUs only ([below](#transformerengines-nccl-ep)). |
+
+How fast each trains, and what bounds them on one node, is in
+[The EP methods](#the-ep-methods).
 
 ### How the EP methods run
 
@@ -597,77 +439,6 @@ slices, and runs `sorted` where no axis splits the experts.
 one built from `all_to_all`, and `scripts/gpu_smoke/experts.py` runs the real one, and
 every other method, on GPUs.
 
-### Measurements on 8 CPU devices: collectives
-
-The collectives in the compiled train step of the two-MoE model of
-`tests/test_experts.py`: their number, and the KiB their results take on one device.
-
-| Mesh | Method | all-gather | all-to-all | reduce-scatter | all-reduce |
-|---|---|---|---|---|---|
-| `expert=8` | `sorted` | 48, 688 | | | 3, 678 |
-| | `all_gather` | 50, 372 | | 6, 8 | 3, 294 |
-| | `all_to_all` | 42, 304 | 10, 256 | | 3, 294 |
-| `data=2, fsdp=2, expert=2` | `sorted` | 54, 880 | | | 7, 736 |
-| | `all_gather` | 56, 513 | | 6, 8 | 8, 544 |
-| | `all_to_all` | 48, 496 | 10, 64 | | 8, 544 |
-| `fsdp=2, expert=4` | `sorted` | 54, 784 | | | 5, 678 |
-| | `all_gather` | 56, 434 | | 6, 8 | 6, 390 |
-| | `all_to_all` | 48, 400 | 10, 128 | | 6, 390 |
-
-- `sorted` gathers every expert's kernels and all-reduces their gradients; the others
-  move tokens instead.
-- Dropless with buffers of a fixed size, `all_to_all` moves `top_k` times the rows
-  `all_gather` does, as every peer's buffer holds every local pick. Under a capacity
-  it moves `capacity` times the picks, where `ragged_all_to_all` moves the picks
-  alone.
-- No method rematerializes anything on these meshes, nor on
-  `fsdp=2, expert=2, tensor=2`.
-
-### Measurements on 8 B300s
-
-On 8 B300s every method computes what one GPU does (`scripts/gpu_smoke/experts.py`, in
-float32: 7e-7 apart at most). For the baseline's MoE (`d_model` 2048, 64 experts,
-`top_k` 8, 16 layers, `bfloat16`) on 32k tokens a GPU, tokens a second and peak
-memory:
-
-| Method | Mesh | remat `none` | remat `dots` |
-|---|---|---|---|
-| `sorted` | `fsdp=8` | 816k, 84 GiB | 737k, 52 GiB |
-| `all_gather`, `capacity=1.25` | `expert=8` | 612k, 89 GiB | 515k, 65 GiB |
-| `ragged_all_to_all`, `capacity=1.25` | `expert=8` | 550k, 88 GiB | 515k, 78 GiB |
-| `ragged_tokens`, `capacity=1.25` | `expert=8` | 547k, 90 GiB | 479k, 74 GiB |
-| `all_to_all`, `capacity=1.25` | `expert=8` | 559k, 89 GiB | |
-| the same, `moe_chunks=2` | `expert=8` | 574k, 89 GiB | |
-
-:::{tip}
-On one node at this shape, `sorted` is still the fastest: its FSDP gathers 0.5 GB of
-experts a layer, where the exchanges move 1 GB of picks each way
-([What bounds EP on one node](#what-bounds-ep-on-one-node) says what bounds them).
-:::
-
-- Before the by-expert slices, the capacity and the pieces, `all_to_all` and
-  `ragged_all_to_all` ran out of memory at 16k tokens a GPU, and under `remat=full`
-  at 32k they made 72k and 25k tokens a second (now `ragged_all_to_all` dropless:
-  263k).
-- Under `dots` the exchanges ran again in the backward, since their results are no
-  products. Named for it ([FP8 dispatch](#fp8-dispatch-precisiondispatch)),
-  `ragged_all_to_all` trains at 515k tokens a second in 77.5 GiB, from 452k in 72.6.
-- XLA's ragged all-to-all leaves an allocation inside the memory pool after the first
-  step, so a step whose temporaries take over half of it fits only once. bux's pool of
-  95% of a GPU, against JAX's 75%, gives it more room.
-- `ragged_tokens` moves about 30% fewer rows when the routing is random, and half as
-  few or fewer where a group limit keeps each token on half the devices (`num_groups`
-  the size of `expert`, `top_k_groups` half of it). But it sends the picks and their
-  weights besides, and here gains nothing.
-- At the start of a run on random tokens, a capacity of 1.25 drops 4-10% of the picks
-  a layer, and 1.5 at 16k tokens 3-4%.
-- Neither `--xla_gpu_experimental_ragged_all_to_all_use_device_kernel` nor
-  `--xla_gpu_ragged_all_to_all_mode=peer` changes the speed; `=symmetric` fails in
-  NCCL ("Window address must be suitably aligned").
-- Nor does XLA's grouped matmul catch up with tokamax's: `jax.lax.ragged_dot` trains
-  `sorted` 20 times slower, and with `--xla_gpu_experimental_use_ragged_dot_fusion`
-  (cuDNN) it fails to compile.
-
 ## In chunks: `methods.moe_chunks`
 
 ```bux
@@ -684,71 +455,8 @@ compiler can send one slice's picks while another slice's experts run.
   kernels' gradients, which add up in float32, as one call's would.
 - Each chunk is a grouped GEMM a peer a layer more to compile: for the baseline's MoE
   on 8 B300s, `moe_chunks=2` compiles in 5 minutes, and 4 in more than 8.
-
-### Why only `all_to_all` gains
-
-On 8 B300s with jax 0.12:
-
-- NCCL's all-to-all, which `all_to_all` sends by, runs on its own stream on a few of
-  the SMs: beside an independent grouped GEMM the two take a fifth longer than the
-  all-to-all alone.
-- XLA's ragged all-to-all overlaps nothing. Its one-shot kernel copies in 2048 blocks
-  of threads, which take every SM, so beside a GEMM the two take as long as one after
-  the other, and in chunks a step is slower. Nor does XLA schedule for it: its latency
-  hiding scheduler, which moves collectives beside compute, runs on Hopper and
-  Blackwell only where its cost model knows every collective of a step
-  (`SolLatencyEstimator::IsSupportedForModule`), and ragged-all-to-all is none of
-  them. `compiler(preset=lhs)` ([XLA's options](../performance/compiler.md)) runs it
-  anyway, and at 32k tokens a GPU the step then runs out of memory, in the hole the
-  ragged exchange leaves in the pool.
-- A collective-permute a peer (in turn i each device sends the i-th after it its
-  buffer and runs its experts on the one it gets) hides half its time, but seven of
-  them take twice as long as one all-to-all, by NCCL or by copy engines
-  (`--xla_gpu_use_memcpy_local_p2p`): 394k tokens a second.
-- `nccl_ep`'s kernels run beside the experts on a stream of their own
-  (`methods.moe_stream`, [below](#on-a-stream-of-its-own-methodsmoe_stream)). In 2
-  chunks the next chunk's dispatch runs beside this one's experts, and a layer's
-  forward takes 4.97 ms against 5.35 whole, but its backward gives more back (forward
-  and backward 9.55 ms against 8.07 whole).
-
-### Measurements on 8 B300s: where a step's time goes
-
-For the baseline's MoE at 32k tokens a GPU and a capacity of 1.25, profiled: tokens a
-second, and ms of a step of a GPU for all its collectives, for those with no compute
-beside them (the log's `exposed_comm_ms`), and for the experts' grouped GEMMs:
-
-| Method | Tokens a second | Collectives | Exposed | Experts' GEMMs |
-|---|---|---|---|---|
-| `sorted`, `fsdp=8` | 830k | 66 | 7 | 110 |
-| `ragged_all_to_all` | 546k | 167 | 152 | 116 |
-| `all_to_all` | 559k | 165 | 143 | 117 |
-| `all_to_all`, `moe_chunks=2` | 574k | 208 | 90 | 153 |
-| `all_to_all`, 2 microbatches, unrolled | 562k | 219 | 98 | 155 |
-
-The table's runs come from several nodes. Side by side on one node
-(`scripts/benchmark.py`, the one-node suite's `moe` and `moe_ep`, the latter as
-`methods` says), `sorted` trains at 835k tokens a second, `ragged_all_to_all` at 539k,
-and `all_to_all` in 2 chunks at 586k, 0.70 of `sorted`.
-
-### What bounds EP on one node
-
-What bounds EP here is its exchange: four of 1.1 to 1.3 GB a layer a GPU, 150 ms of a
-step at NCCL's 500 GB/s. `sorted`'s FSDP gathers 0.5 GB of experts a layer and reduces
-their gradients, 66 ms that hide behind compute.
-
-- Chunks hide a third of the exchange, but a GEMM beside NCCL's kernels runs a third
-  slower and gives most of it back: the experts' GEMMs take 153 ms rather than 117,
-  and the step gains 3%.
-- DeepSeek's two microbatches, each one's exchanges beside the other's compute (the
-  trainer's microbatches unrolled rather than scanned, by hand), do no better.
-- Fewer NCCL channels, to leave the GEMMs more SMs, slow the exchange more
-  (`NCCL_MAX_P2P_NCHANNELS=8`: 349k), and a high-priority stream for collectives
-  changes nothing.
-
-EP would beat `sorted` on one node at this shape with an exchange near NVLink's 900
-GB/s, on a few SMs and without the capacity's padding, as DeepEP's and
-TransformerEngine's kernels send it, hidden behind the attention as well as the
-experts.
+- Only `all_to_all` gains, 3% on one node
+  ([Why only `all_to_all` gains in chunks](#why-only-all_to_all-gains-in-chunks)).
 
 ## FP8 dispatch: `precision.dispatch`
 
@@ -774,18 +482,8 @@ The exchanges name what they bring `experts.exchanged`, under `experts`, so that
 `remat=dots`, which keeps `experts`, does not exchange them again in the backward
 ([Repeats and remat](remat.md)).
 
-### Measurements on 8 B300s: FP8 dispatch
-
-For the baseline's MoE at 32k tokens a GPU and a capacity of 1.25 (the one-node
-suite's `moe_ep`, side by side on one node):
-
-| Method | `dispatch=compute` | `dispatch=mxfp8` |
-|---|---|---|
-| `ragged_all_to_all` | 539k | 556k |
-| `all_to_all`, 2 chunks | 586k | 589k |
-
-A ragged dispatch takes 17 ms a step less, and quantizing a token rather than each of
-its picks costs little; `all_to_all`'s dispatch hides behind the experts already.
+On one node `ragged_all_to_all` trains at 556k tokens a second by it, against 539k
+([FP8 dispatch on 8 B300s](#fp8-dispatch-on-8-b300s)).
 
 ## TransformerEngine's NCCL EP
 
@@ -805,6 +503,9 @@ that the GPU starts (NCCL's GIN) between nodes, and no NVSHMEM.
 - Since 2.20 one process drives all its node's GPUs, on a communicator TE borrows from
   XLA.
 - The Docker image has it (2.20.2, by `--build-arg TE_VERSION`).
+- On one node it is the fastest EP (615k tokens a second for the benchmarks' MoE,
+  against `sorted`'s 831k), and over two nodes 2.4x `ragged_all_to_all`
+  ([NCCL EP](#nccl-ep)).
 
 ### How `nccl_ep` runs
 
@@ -860,69 +561,6 @@ On 16 GPUs of two nodes, EP=16, a layer's output and gradients come within bfloa
 rounding (4e-3 to 8e-3 of the largest) of `sorted`'s dropless, and of
 `ragged_all_to_all`'s at a capacity of 1.
 
-### Measurements on B300s: one node and two
-
-The baseline's MoE at 32k tokens a GPU and a capacity of 1.25, by
-`scripts/benchmark.py` (`one_node.bux` and `two_nodes.bux`, their `moe` and `moe_ep`,
-the rest set as below). Tokens a second, peak memory, and the loss of the 30th step of
-30 (at the 5th, 12.233 on one node and 12.222 on two, for all):
-
-| GPUs | Method | Mesh | tok/s | Peak | Loss |
-|---|---|---|---|---|---|
-| 8 | `sorted` | `fsdp=8` | 831k | 83.8 GiB | 11.843 |
-| | `ragged_all_to_all` | `expert=8` | 544k | 88.4 GiB | 11.842 |
-| | `nccl_ep` | `expert=8` | 615k | 89.3 GiB | 11.867 |
-| 16 | `sorted` | `data=2, fsdp=8` | 1,586k | 83.8 GiB | 11.820 |
-| | `ragged_all_to_all` | `data=2, expert=8` | 1,016k | 87.0 GiB | 11.825 |
-| | `nccl_ep` | `data=2, expert=8` | 1,192k | 89.3 GiB | 11.822 |
-| | `ragged_all_to_all` | `data=1, expert=16` | 324k | 84.4 GiB | 11.836 |
-| | `nccl_ep` | `data=1, expert=16` | 773k | 85.0 GiB | 11.844 |
-
-- EP over two nodes is 2.4x as fast by `nccl_ep` as by `ragged_all_to_all`, but at 63%
-  of a node's tokens a GPU.
-- EP in a node and data across them stays the faster EP, 17% past
-  `ragged_all_to_all` side by side (another pair of runs: 1,158k and 1,023k).
-- `sorted` is the fastest of all at this shape.
-
-### Measurements on B300s: one layer's exchange
-
-One layer's dispatch and combine at the baseline MoE's shapes (d 2048, 64 experts, top
-8, 32k tokens a GPU, a capacity of 1.25), its experts the identity, on B300s of 148
-SMs, and what an exchange sends off a GPU (on two nodes, off its node):
-
-| GPUs | Exchange | SMs | Forward | Forward and backward | Sent |
-|---|---|---|---|---|---|
-| 8, a node | `ragged_all_to_all` | all | 3.95 ms | 8.20 ms | 0.94 GB, 476 GB/s |
-| | `ragged_tokens` | all | 4.73 | 9.55 | 0.64 GB, 270 GB/s |
-| | NCCL EP | 32 | 3.85 | 7.50 | 0.64 GB, 332 GB/s |
-| | NCCL EP | 64 | 3.51 | 6.80 | 0.64 GB, 364 GB/s |
-| 16, two nodes | `ragged_all_to_all` | all | 38.0 | 76.8 | 0.54 GB |
-| | `ragged_tokens` | all | 39.4 | 79.6 | 0.45 GB |
-| | NCCL EP, GIN by GDAKI | 32 | 25.6 | 80.4 | 0.13 GB |
-| | NCCL EP, GIN by a CPU proxy | 32 | 16.0 | 27.0 | 0.13 GB |
-| | the same, 256 tokens a chunk | 32 | 13.0 | 21.2 | 0.13 GB |
-
-In a node NCCL EP wins by sending less, not faster: its kernels move 330 to 370 GB/s,
-far from NVLink's 900. Between nodes it sends a quarter as much over InfiniBand, and
-with `NCCL_GIN_TYPE=2 NCCL_EP_TOKENS_PER_CHUNK=256` its exchanges take 28% as long.
-
-### What NCCL EP's step holds
-
-Under `remat=none`, XLA's analysis says the step holds 266 GiB:
-
-- 42.7 GiB are the parameters and the optimizer's state, and 223.2 one buffer of
-  temporaries, of which 221.8 are live at once at the end of the forward.
-- 148 GiB of those are the experts': four arrays over each layer's 329,728 rows (at a
-  capacity of 1.25) kept for the backward. They are the `down` GEMM's bfloat16 output
-  (1.26 GiB a layer), `up` and `gate`'s (0.94), and the MXFP8 copies of the rows and
-  of the activations that the weights' gradients take (0.63 and 0.24).
-- Attention keeps 24 GiB, and the dense MXFP8 matmuls 21.
-
-A capacity of 1.5 took 2.4 GiB more under `save_attention`, at 5% fewer tokens a
-second. On `megatron.bux`'s synthetic batch it dropped as much as 1.25 from its 15th
-step on (8% of the picks a layer, its balance loss rising to 83 summed over the
-layers).
-
 ### What NCCL EP takes from JAX
 
 - Across nodes only its one-device primitives ran, as `nccl_ep` runs them: its
@@ -951,7 +589,7 @@ stream waits for a call's results where it uses them.
 
 :::{note}
 It stays off by default: a step of microbatches one after another gains nothing from
-it ([below](#measurements-on-8-b300s-megatronbuxs-nccl_ep-arm)). It is there for a
+it ([below](#moe_stream-in-megatronbuxs-nccl_ep-arm)). It is there for a
 schedule of overlapped microbatches, as `methods(interleave=true)` makes
 ([Side by side](microbatches.md#side-by-side-methodsinterleave)).
 :::
@@ -977,7 +615,397 @@ Two things make it overlap:
   them. Where `moe_stream` is set, `nccl_ep.start` has XLA run it on every program the
   process compiles for GPUs from then on, and JAX's cache keys those programs by it.
 
-#### Measurements on 8 B300s: one MoE layer
+## Measurements
+
+All on B300s, in October 2026, but the collectives counted on 8 CPU devices. The
+benchmarks' MoE is the baseline's: `d_model` 2048, 64 experts of 704, top 8
+([Benchmarks](../performance/benchmarks.md)).
+
+### The router's weights before `down`
+
+`examples/benchmarks/megatron.bux` (Qwen3-30B-A3B, 32k tokens a GPU, MXFP8, routed by
+the router, XLA's pool at 97% of a GPU), before the weights moved before `down` and up
+and gate became one stack, and after. Tokens a second a GPU and peak memory:
+
+| Run | Before | After |
+|---|---|---|
+| `sorted`, `fsdp=8`, `remat=none` | 31.1k, 250.4 GiB | 31.9k, 215.0 GiB |
+| `nccl_ep`, `expert=8`, capacity 1.25, `remat=save_attention` | 21.3k, 99.6 GiB | 22.8k, 98.3 GiB |
+| the same, `remat=none` | needs 266 GiB | 27.7k, 210.7 GiB |
+
+- `sorted`'s step on GPU 0 took 1075 ms against 1098. Gone: the weights' d-wide
+  multiply, its transpose and reduce, and the concatenations of up and gate and of
+  their gradient.
+- With GEMM autotuning off, its losses agree to 5e-5 for three steps, then drift apart
+  as two runs of random tokens do.
+- Under `remat=auto` at JAX's default pool ([remat=auto](remat.md#rematauto-the-default)),
+  `sorted` now takes `dots_attention` (158.5 GiB) where it took `dots` (179 GiB), and
+  `nccl_ep` takes `dots` (187.4 GiB, 24.5k) where it took `save_attention` (21.7k).
+
+### MXFP8 experts
+
+#### Each GEMM on one B300
+
+Each GEMM of the baseline MoE's experts (64 of them, `d_model` 2048, intermediate 704,
+262144 picks), in TFLOP/s of the GEMM's own kernel by CUPTI:
+
+| GEMM | bfloat16, tokamax | MXFP8, Triton's `tl.dot_scaled` (before) | MXFP8, `grouped_mxfp8` |
+|---|---|---|---|
+| x W, up and gate | 1269 | 964 | 2405 (1.9x) |
+| h W, down | 1069 | 680 | 1596 (1.5x) |
+| dy W^T, down | 1213 | 908 | 2230 (1.8x) |
+| dh W^T, up and gate | 1266 | 901 | 2244 (1.8x) |
+| dW, up and gate | 1093 | 644 | 2573 (2.4x) |
+| dW, down | 1034 | 616 | 2367 (2.3x) |
+
+- With experts of 2048: 1.7 to 2.3 times bfloat16's, 2423 to 2616 TFLOP/s against
+  1139 to 1414.
+- At `all_to_all`'s GEMMs of a peer's buffer under `expert=8` (40960 rows, of which
+  32768 are its 8 experts'): 1.3 to 2.7 times, 1271 (h W) to 2490 (dW, up and gate)
+  against 904 to 1213.
+- h W contracts 704, which TMA takes in tiles of 128, so `rows` pads it to 768 and
+  does 9% more.
+- Taking the tiles a row of them at a time, all its columns before the next row, was
+  1.7x slower (1623 against 2725 TFLOP/s for dh W^T at k 4096): the rows and columns in
+  flight then fell out of L2.
+- Triton's kernels took the scales, rows of 4 bytes too short for TMA, through
+  registers into tensor memory at every step of k.
+
+#### In training on B300s
+
+Side by side, GEMM autotuning off and deterministic ops: the experts in bfloat16, in
+MXFP8 by Triton's kernels as before, by `grouped_mxfp8`, and by it with the quantizer
+writing its layout ([below](#the-quantizer-on-one-b300)). By
+`scripts/benchmark.py` on `examples/benchmarks`' arms, against bfloat16 in the same
+job; tokens a second and peak memory:
+
+| Run | bfloat16 | MXFP8, Triton | MXFP8, `grouped_mxfp8` | quantized into its layout |
+|---|---|---|---|---|
+| the baseline MoE, one GPU, 8 × 4096 tokens: `one_gpu.bux`'s `moe` | 86.2k, 133.9 GiB | 74.2k | 91.5k (1.06x), 119.5 GiB | 95.0k (1.10x) |
+| experts of 2048, 8 layers, one GPU | 90.4k, 143.2 GiB | 75.6k | 101.7k (1.12x), 129.6 GiB | |
+| `ragged_all_to_all`, `capacity=1.25`, `expert=8`, 32k tokens a GPU: `one_node.bux`'s `moe_ep` | 468k, 88.5 GiB | 417k | 517k (1.10x), 72.3 GiB | 539k (1.15x) |
+| the same, `dispatch=mxfp8` | | | 515k | |
+| `all_to_all`, `capacity=1.25`, `expert=8`, 32k tokens a GPU | 492k, 91.4 GiB | 449k | 539k (1.10x), 78.4 GiB | |
+| `sorted`, `fsdp=8`, 32k tokens a GPU: `one_node.bux`'s `moe` | 671k, 83.9 GiB | 580k | 712k (1.06x), 69.4 GiB | 743k (1.11x) |
+
+- Both MXFP8 kernels compute the same values: the runs' losses agree to the last digit
+  logged, and with bfloat16's to the rounding between them. The two quantizers write
+  the same bytes, and the memory is the same.
+- The experts' GEMMs take half of bfloat16's time, 3.0 ms a layer against 5.8, and the
+  quantizer takes 1.5 ms of what they save. An MoE layer's experts, forward and
+  backward, take 5.0 ms against 7.3 in bfloat16 (1.45x), and 11.8 against 19.7 with
+  experts of 2048 (1.67x; `scripts/gpu_smoke/grouped_mxfp8.py`).
+- The quantizer reads each operand once and writes it twice at 5.1 TB/s, k padded to
+  whole tiles of 128 and the scales in tensor memory's tiles, so no pass of XLA lays
+  them out after it. x^T's blocks run down x's columns, so that only its E4M3 bytes
+  transpose, and it scales in x's dtype, by a power of two, exact. It took 2.2 ms a
+  layer before, in float32, and XLA's pads and layouts 90 to 160 µs a call more: 6.1
+  ms a layer against 7.3.
+- The experts keep x^T in MXFP8 for dW rather than x in bfloat16, so a run takes 14
+  GiB less.
+- It trains at bfloat16's loss: 98M tokens of FineWeb-Edu end 0.13% and 0.05% below
+  it, with FP8 dispatch ([Precision](../training/precision.md)).
+
+#### The quantizer on one B300
+
+At what one GPU of `megatron.bux`'s `sorted` arm quantizes a layer (128 experts of
+768, 262144 picks), on one B300 by CUPTI, no shape is slow:
+
+| Operand | Shape | TB/s |
+|---|---|---|
+| x, read by index from 32768 tokens | 262144 × 2048 | 5.8 |
+| dy | 262144 × 2048 | 5.2 |
+| h | 262144 × 768 | 5.1 |
+| dh | 262144 × 1536 | 5.2 |
+| each expert's W of up and gate | 128 × 2048 × 1536 | 5.2 |
+| each expert's W of down | 128 × 768 × 2048 | 5.1 |
+
+- x read by index takes 377 µs, where gathering it in bfloat16 took 378 and
+  quantizing the copy 420.
+- A copy that casts x and x^T to E4M3 unscaled runs at 6.5 TB/s (XLA's `x * 2` at
+  6.9), and the quantizer without its scales at 5.8. The scales' bytes take the rest
+  (4 a row of x, but one of each 4 of x^T's in a program of 32 rows), and so do the
+  blocks' largest magnitudes.
+- No faster: programs of 64 or 128 rows, or of 128 rows 32 at a time with each tile of
+  scales in one store; more warps; other grid orders; the scaling in float32.
+
+#### x and dy read in place, on 8 B300s
+
+`megatron.bux`'s `sorted` arm at `remat=none` with the pool at 97%, 40 steps:
+
+- With the router's weights on the hidden units, so that down's rows sum plainly into
+  their tokens, reading x and dy in place took the arm from 260.3k to 269.4k tokens a
+  second (32.5k to 33.7k a GPU) at the same peak, 215.0 GiB. On GPU 0 a step fell from
+  1067 to 1029 ms: both gathers' 39 ms went, and the quantizer's 95 ms became 88.
+- With the weights after down, x in place alone went from 254.2k to 255.0k: the
+  gather's 25 ms went, but the FSDP collectives the step overlapped came out from
+  under it.
+- Each GPU quantized all 128 experts' W, 23 ms of a step. Under the fused kernels
+  ([SwiGLU fused, by cuDNN](#swiglu-fused-by-cudnn)), each quantizes its own shard before FSDP gathers
+  it.
+
+### The fused SwiGLU
+
+#### One layer on a B300
+
+One layer of Qwen3-30B-A3B's experts (128 of 768, 262144 picks; by EP 16 of them,
+327680 rows of which 262144 are filled), forward and backward on a B300, by CUPTI:
+
+| | bux's kernels | fused | |
+|---|---|---|---|
+| `sorted` | 6.30 ms | 5.51 ms | the GEMMs with their epilogues 3.20 against 3.43 (2.3 against 2.2 PFLOP/s); none of XLA's 0.73 ms over h and dp, nor the quantizer's of them |
+| by EP | 5.83 ms | 4.97 ms | |
+
+- At these shapes cuDNN's GEMM of h W takes 0.44 ms against `grouped_mxfp8`'s 0.53,
+  and dp W^T 0.65 against 0.77; its wgrad 0.30 and 0.60 ms against 0.39 and 0.76.
+- The values are within MXFP8's rounding of bux's kernels': 2% apart in the output and
+  every gradient (relative Frobenius norm), each 6.6% from bfloat16's as before.
+
+#### `megatron.bux` on 8 B300s
+
+`remat=none`, the tree before and after on the same node:
+
+| Run | bux's kernels | fused |
+|---|---|---|
+| `sorted`, Megatron's batch (512 rows in 8 microbatches, `gather=layer`) | 36.1k tok/s a GPU, 229.6 GiB | 37.7k (+4.5%), 214.6 GiB |
+| `sorted`, one microbatch of 8 rows a GPU | 37.7k, 215.1 GiB | 38.5k (+2.1%), 200.3 GiB |
+| `nccl_ep`, one microbatch of 8 rows a GPU | 31.4k, 211.1 GiB | 32.4k (+3.1%), 212.7 GiB |
+
+- On GPU 0, at one microbatch (traced without XLA's command buffers, whose kernels the
+  trace then loses), the experts' kernels and XLA's passes over h and dp take 263 ms a
+  step against 319 under `sorted`, and 234 against 280 under `nccl_ep`.
+- Beside FSDP's collectives cuDNN's kernels run slower than alone: `dswiglu` takes
+  1.13 ms against 0.62 (0.59 under `nccl_ep`, which has none). Its tiles are
+  statically scheduled, where `grouped_mxfp8`'s take the SMs as they free.
+- Leaving pairs of SMs to the collectives (`CUDNNFE_CLUSTER_OVERLAP_MARGIN`, which all
+  of `grouped_cudnn`'s kernels heed) gains 0.3% at Megatron's batch with 8 (two runs
+  each, on one node) and 1.1% with 16 (one run), and loses 2% with 32. It is left at
+  0.
+- `sorted` keeps no bfloat16 copy of all 128 experts' kernels now, so it takes 15 GiB
+  less.
+- Its compiles take 20 to 110 s more: CuTe DSL compiles each kernel in every process.
+- 3000 steps of FineWeb-Edu on the baseline's MoE with experts of 768 (the fused
+  kernels' shapes, one B300 a run) end within 0.08% of bux's kernels at each of three
+  seeds, which differ by 1.6%: eval loss 4.0708, 4.0127 and 4.0346 against 4.0742,
+  4.0099 and 4.0363, at 104k tokens a second against 100k.
+
+### The EP methods
+
+#### Collectives on 8 CPU devices
+
+The collectives in the compiled train step of the two-MoE model of
+`tests/test_experts.py`: their number, and the KiB their results take on one device.
+
+| Mesh | Method | all-gather | all-to-all | reduce-scatter | all-reduce |
+|---|---|---|---|---|---|
+| `expert=8` | `sorted` | 48, 688 | | | 3, 678 |
+| | `all_gather` | 50, 372 | | 6, 8 | 3, 294 |
+| | `all_to_all` | 42, 304 | 10, 256 | | 3, 294 |
+| `data=2, fsdp=2, expert=2` | `sorted` | 54, 880 | | | 7, 736 |
+| | `all_gather` | 56, 513 | | 6, 8 | 8, 544 |
+| | `all_to_all` | 48, 496 | 10, 64 | | 8, 544 |
+| `fsdp=2, expert=4` | `sorted` | 54, 784 | | | 5, 678 |
+| | `all_gather` | 56, 434 | | 6, 8 | 6, 390 |
+| | `all_to_all` | 48, 400 | 10, 128 | | 6, 390 |
+
+- `sorted` gathers every expert's kernels and all-reduces their gradients; the others
+  move tokens instead.
+- Dropless with buffers of a fixed size, `all_to_all` moves `top_k` times the rows
+  `all_gather` does, as every peer's buffer holds every local pick. Under a capacity
+  it moves `capacity` times the picks, where `ragged_all_to_all` moves the picks
+  alone.
+- No method rematerializes anything on these meshes, nor on
+  `fsdp=2, expert=2, tensor=2`.
+
+#### The methods on 8 B300s
+
+On 8 B300s every method computes what one GPU does (`scripts/gpu_smoke/experts.py`, in
+float32: 7e-7 apart at most). For the baseline's MoE (`d_model` 2048, 64 experts,
+`top_k` 8, 16 layers, `bfloat16`) on 32k tokens a GPU, tokens a second and peak
+memory:
+
+| Method | Mesh | remat `none` | remat `dots` |
+|---|---|---|---|
+| `sorted` | `fsdp=8` | 816k, 84 GiB | 737k, 52 GiB |
+| `all_gather`, `capacity=1.25` | `expert=8` | 612k, 89 GiB | 515k, 65 GiB |
+| `ragged_all_to_all`, `capacity=1.25` | `expert=8` | 550k, 88 GiB | 515k, 78 GiB |
+| `ragged_tokens`, `capacity=1.25` | `expert=8` | 547k, 90 GiB | 479k, 74 GiB |
+| `all_to_all`, `capacity=1.25` | `expert=8` | 559k, 89 GiB | |
+| the same, `moe_chunks=2` | `expert=8` | 574k, 89 GiB | |
+
+:::{tip}
+On one node at this shape, `sorted` is still the fastest: its FSDP gathers 0.5 GB of
+experts a layer, where each of an EP layer's four exchanges moves 1.1 to 1.3 GB of
+picks a GPU ([What bounds EP on one node](#what-bounds-ep-on-one-node)).
+:::
+
+- Before the by-expert slices, the capacity and the pieces, `all_to_all` and
+  `ragged_all_to_all` ran out of memory at 16k tokens a GPU, and under `remat=full`
+  at 32k they made 72k and 25k tokens a second (now `ragged_all_to_all` dropless:
+  263k).
+- Under `dots` the exchanges ran again in the backward, since their results are no
+  products. Named for it ([FP8 dispatch](#fp8-dispatch-precisiondispatch)),
+  `ragged_all_to_all` trains at 515k tokens a second in 77.5 GiB, from 452k in 72.6.
+- XLA's ragged all-to-all leaves an allocation inside the memory pool after the first
+  step, so a step whose temporaries take over half of it fits only once. bux's pool of
+  95% of a GPU, against JAX's 75%, gives it more room.
+- `ragged_tokens` moves about 30% fewer rows when the routing is random, and half as
+  few or fewer where a group limit keeps each token on half the devices (`num_groups`
+  the size of `expert`, `top_k_groups` half of it). But it sends the picks and their
+  weights besides, and here gains nothing.
+- At the start of a run on random tokens, a capacity of 1.25 drops 4-10% of the picks
+  a layer, and 1.5 at 16k tokens 3-4%.
+- Neither `--xla_gpu_experimental_ragged_all_to_all_use_device_kernel` nor
+  `--xla_gpu_ragged_all_to_all_mode=peer` changes the speed; `=symmetric` fails in
+  NCCL ("Window address must be suitably aligned").
+- Nor does XLA's grouped matmul catch up with tokamax's: `jax.lax.ragged_dot` trains
+  `sorted` 20 times slower, and with `--xla_gpu_experimental_use_ragged_dot_fusion`
+  (cuDNN) it fails to compile.
+
+#### Where a step's time goes
+
+For the baseline's MoE at 32k tokens a GPU and a capacity of 1.25, profiled: tokens a
+second, and ms of a step of a GPU for all its collectives, for those with no compute
+beside them (the log's `exposed_comm_ms`), and for the experts' grouped GEMMs:
+
+| Method | Tokens a second | Collectives | Exposed | Experts' GEMMs |
+|---|---|---|---|---|
+| `sorted`, `fsdp=8` | 830k | 66 | 7 | 110 |
+| `ragged_all_to_all` | 546k | 167 | 152 | 116 |
+| `all_to_all` | 559k | 165 | 143 | 117 |
+| `all_to_all`, `moe_chunks=2` | 574k | 208 | 90 | 153 |
+| `all_to_all`, 2 microbatches, unrolled | 562k | 219 | 98 | 155 |
+
+The table's runs come from several nodes. Side by side on one node
+(`scripts/benchmark.py`, the one-node suite's `moe` and `moe_ep`, the latter as
+`methods` says), `sorted` trains at 835k tokens a second, `ragged_all_to_all` at 539k,
+and `all_to_all` in 2 chunks at 586k, 0.70 of `sorted`.
+
+#### What bounds EP on one node
+
+What bounds EP here is its exchange: four of 1.1 to 1.3 GB a layer a GPU, 150 ms of a
+step at NCCL's 500 GB/s. `sorted`'s FSDP gathers 0.5 GB of experts a layer and reduces
+their gradients, 66 ms that hide behind compute.
+
+- Chunks hide a third of the exchange, but a GEMM beside NCCL's kernels runs a third
+  slower and gives most of it back: the experts' GEMMs take 153 ms rather than 117,
+  and the step gains 3%.
+- DeepSeek's two microbatches, each one's exchanges beside the other's compute (the
+  trainer's microbatches unrolled rather than scanned, by hand), do no better.
+- Fewer NCCL channels, to leave the GEMMs more SMs, slow the exchange more
+  (`NCCL_MAX_P2P_NCHANNELS=8`: 349k), and a high-priority stream for collectives
+  changes nothing.
+
+EP would beat `sorted` on one node at this shape with an exchange near NVLink's 900
+GB/s, on a few SMs and without the capacity's padding, as DeepEP's and
+TransformerEngine's kernels send it, hidden behind the attention as well as the
+experts.
+
+#### Why only `all_to_all` gains in chunks
+
+On 8 B300s with jax 0.12:
+
+- NCCL's all-to-all, which `all_to_all` sends by, runs on its own stream on a few of
+  the SMs: beside an independent grouped GEMM the two take a fifth longer than the
+  all-to-all alone.
+- XLA's ragged all-to-all overlaps nothing. Its one-shot kernel copies in 2048 blocks
+  of threads, which take every SM, so beside a GEMM the two take as long as one after
+  the other, and in chunks a step is slower. Nor does XLA schedule for it: its latency
+  hiding scheduler, which moves collectives beside compute, runs on Hopper and
+  Blackwell only where its cost model knows every collective of a step
+  (`SolLatencyEstimator::IsSupportedForModule`), and ragged-all-to-all is none of
+  them. `compiler(preset=lhs)` ([XLA's options](../performance/compiler.md)) runs it
+  anyway, and at 32k tokens a GPU the step then runs out of memory, in the hole the
+  ragged exchange leaves in the pool.
+- A collective-permute a peer (in turn i each device sends the i-th after it its
+  buffer and runs its experts on the one it gets) hides half its time, but seven of
+  them take twice as long as one all-to-all, by NCCL or by copy engines
+  (`--xla_gpu_use_memcpy_local_p2p`): 394k tokens a second.
+- `nccl_ep`'s kernels run beside the experts on a stream of their own
+  ([On a stream of its own](#on-a-stream-of-its-own-methodsmoe_stream)). In 2
+  chunks the next chunk's dispatch runs beside this one's experts, and a layer's
+  forward takes 4.97 ms against 5.35 whole, but its backward gives more back (forward
+  and backward 9.55 ms against 8.07 whole).
+
+#### FP8 dispatch on 8 B300s
+
+For the baseline's MoE at 32k tokens a GPU and a capacity of 1.25 (the one-node
+suite's `moe_ep`, side by side on one node):
+
+| Method | `dispatch=compute` | `dispatch=mxfp8` |
+|---|---|---|
+| `ragged_all_to_all` | 539k | 556k |
+| `all_to_all`, 2 chunks | 586k | 589k |
+
+A ragged dispatch takes 17 ms a step less, and quantizing a token rather than each of
+its picks costs little; `all_to_all`'s dispatch hides behind the experts already.
+
+### NCCL EP
+
+#### One node and two
+
+The baseline's MoE at 32k tokens a GPU and a capacity of 1.25, by
+`scripts/benchmark.py` (`one_node.bux` and `two_nodes.bux`, their `moe` and `moe_ep`,
+the rest set as below). Tokens a second, peak memory, and the loss of the 30th step of
+30 (at the 5th, 12.233 on one node and 12.222 on two, for all):
+
+| GPUs | Method | Mesh | tok/s | Peak | Loss |
+|---|---|---|---|---|---|
+| 8 | `sorted` | `fsdp=8` | 831k | 83.8 GiB | 11.843 |
+| | `ragged_all_to_all` | `expert=8` | 544k | 88.4 GiB | 11.842 |
+| | `nccl_ep` | `expert=8` | 615k | 89.3 GiB | 11.867 |
+| 16 | `sorted` | `data=2, fsdp=8` | 1,586k | 83.8 GiB | 11.820 |
+| | `ragged_all_to_all` | `data=2, expert=8` | 1,016k | 87.0 GiB | 11.825 |
+| | `nccl_ep` | `data=2, expert=8` | 1,192k | 89.3 GiB | 11.822 |
+| | `ragged_all_to_all` | `data=1, expert=16` | 324k | 84.4 GiB | 11.836 |
+| | `nccl_ep` | `data=1, expert=16` | 773k | 85.0 GiB | 11.844 |
+
+- EP over two nodes is 2.4x as fast by `nccl_ep` as by `ragged_all_to_all`, but at 63%
+  of a node's tokens a GPU.
+- EP in a node and data across them stays the faster EP, 17% past
+  `ragged_all_to_all` side by side (another pair of runs: 1,158k and 1,023k).
+- `sorted` is the fastest of all at this shape.
+
+#### One layer's exchange
+
+One layer's dispatch and combine at the baseline MoE's shapes (d 2048, 64 experts, top
+8, 32k tokens a GPU, a capacity of 1.25), its experts the identity, on B300s of 148
+SMs, and what an exchange sends off a GPU (on two nodes, off its node):
+
+| GPUs | Exchange | SMs | Forward | Forward and backward | Sent |
+|---|---|---|---|---|---|
+| 8, a node | `ragged_all_to_all` | all | 3.95 ms | 8.20 ms | 0.94 GB, 476 GB/s |
+| | `ragged_tokens` | all | 4.73 | 9.55 | 0.64 GB, 270 GB/s |
+| | NCCL EP | 32 | 3.85 | 7.50 | 0.64 GB, 332 GB/s |
+| | NCCL EP | 64 | 3.51 | 6.80 | 0.64 GB, 364 GB/s |
+| 16, two nodes | `ragged_all_to_all` | all | 38.0 | 76.8 | 0.54 GB |
+| | `ragged_tokens` | all | 39.4 | 79.6 | 0.45 GB |
+| | NCCL EP, GIN by GDAKI | 32 | 25.6 | 80.4 | 0.13 GB |
+| | NCCL EP, GIN by a CPU proxy | 32 | 16.0 | 27.0 | 0.13 GB |
+| | the same, 256 tokens a chunk | 32 | 13.0 | 21.2 | 0.13 GB |
+
+In a node NCCL EP wins by sending less, not faster: its kernels move 330 to 370 GB/s,
+far from NVLink's 900. Between nodes it sends a quarter as much over InfiniBand, and
+with `NCCL_GIN_TYPE=2 NCCL_EP_TOKENS_PER_CHUNK=256` its exchanges take 28% as long.
+
+#### What NCCL EP's step holds
+
+Under `remat=none`, XLA's analysis says the step holds 266 GiB:
+
+- 42.7 GiB are the parameters and the optimizer's state, and 223.2 one buffer of
+  temporaries, of which 221.8 are live at once at the end of the forward.
+- 148 GiB of those are the experts': four arrays over each layer's 329,728 rows (at a
+  capacity of 1.25) kept for the backward. They are the `down` GEMM's bfloat16 output
+  (1.26 GiB a layer), `up` and `gate`'s (0.94), and the MXFP8 copies of the rows and
+  of the activations that the weights' gradients take (0.63 and 0.24).
+- Attention keeps 24 GiB, and the dense MXFP8 matmuls 21.
+
+A capacity of 1.5 took 2.4 GiB more under `save_attention`, at 5% fewer tokens a
+second. On `megatron.bux`'s synthetic batch it dropped as much as 1.25 from its 15th
+step on (8% of the picks a layer, its balance loss rising to 83 summed over the
+layers).
+
+#### `moe_stream`: one MoE layer
 
 One MoE layer at `megatron.bux`'s shapes (EP=8, 32k tokens a GPU, a capacity of 1.25,
 the experts by cuDNN's MXFP8 kernels), in ms:
@@ -1003,7 +1031,7 @@ the experts by cuDNN's MXFP8 kernels), in ms:
   it in the schedule. The interleaved schedule's barriers, each a tick of a piece's
   forward and a piece's backward, bound what that is.
 
-#### Measurements on 8 B300s: `megatron.bux`'s `nccl_ep` arm
+#### `moe_stream` in `megatron.bux`'s `nccl_ep` arm
 
 At Megatron's batch (512 rows of 4096, 8 microbatches one after another,
 `remat=none`), side by side:

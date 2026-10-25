@@ -158,8 +158,9 @@ unreduced where all of these hold:
 - the parameters are gathered once.
 
 Else each microbatch's gradient reduces as the backward makes it, onto its shards,
-which over NVLink is faster (below). `accumulate=unreduced` where it would not compute
-the same is an error that says why.
+which over NVLink is faster
+([below](#gathered-once-reduced-once-one-node-of-8-b300s)). `accumulate=unreduced`
+where it would not compute the same is an error that says why.
 
 ### The cost: memory
 
@@ -168,68 +169,8 @@ a float32 sum of every parameter's gradient on each device, held through the ste
 `layout(zero=1)` keeps the parameters whole between steps too; with `gather=step` it
 saves no collective, and holds float32 copies where the step holds `compute`'s.
 
-### Measurements: collectives
-
-Unreduced, a step of 8 microbatches moves what a step of 1 does. In the compiled step
-of `fsdp=8`, each collective counted as many times as the loops around it run
-(`tests/test_gather.py`), for the benchmarks' dense 1.3B
-(`examples/benchmarks/baseline.bux`) on B300s, 64 rows of 4096. On one node
-`accumulate=auto` reduces each microbatch (that row's loss by chunks):
-
-| methods | all-gathers | reduce-scatters |
-|---|---|---|
-| `microbatches=1` | 66, 2.68 GiB | 9, 2.68 GiB |
-| `microbatches=8, gather=layer, accumulate=reduced` | 528, 21.5 GiB | 72, 21.5 GiB |
-| `microbatches=8`, on one node | 66, 2.68 GiB | 72, 25.9 GiB |
-| `microbatches=8, accumulate=unreduced` | 66, 2.68 GiB | 9, 2.68 GiB |
-| `repeat=scan, microbatches=8, gather=layer, accumulate=reduced` | 1048, 34.1 GiB | 152, 21.5 GiB |
-| `repeat=scan, microbatches=8, accumulate=unreduced` | 10, 2.68 GiB | 7, 2.68 GiB |
-
-### Measurements: one node of 8 B300s
-
-Tokens a second and the peak memory of a GPU, the same run, 20 steps, the loss by
-logits (by chunks, the default, `microbatches=1` takes 1122k in 38.9 GiB):
-
-| mesh, methods | tok/s | peak |
-|---|---|---|
-| `fsdp=8`, `microbatches=1` | 1147k | 58.5 GiB |
-| `fsdp=8`, `microbatches=8, gather=layer, accumulate=reduced` | 817k | 11.9 GiB |
-| `fsdp=8`, `microbatches=8` (reduced each microbatch) | 925k | 11.6 GiB |
-| `fsdp=8`, `microbatches=8, accumulate=unreduced` | 907k | 15.7 GiB |
-| `fsdp=8`, `repeat=scan, microbatches=8, gather=layer, accumulate=reduced` | 719k | 10.2 GiB |
-| `fsdp=8`, `repeat=scan, microbatches=8, accumulate=unreduced` | 803k | 15.7 GiB |
-| `fsdp=2, tensor=4`, `layout(stream=tensor)`, `microbatches=8, gather=layer, accumulate=reduced` | 647k | 11.9 GiB |
-| `fsdp=2, tensor=4`, `layout(stream=tensor)`, `microbatches=8, accumulate=unreduced` | 640k | 12.9 GiB |
-| `stage=2, fsdp=4`, `repeat=scan, microbatches=8, gather=layer, accumulate=reduced` | 660k | 88.3 GiB |
-| `stage=2, fsdp=4`, `repeat=scan, microbatches=8` (reduced each tick) | 640k | 97.8 GiB |
-| `stage=2, fsdp=4`, `repeat=scan, microbatches=8, accumulate=unreduced` | 644k | 97.8 GiB |
-
-Over NVLink, gathering once is the gain: XLA overlaps a reduce-scatter a microbatch
-with the backward, and adding up unreduced reads and writes a float32 copy of every
-gradient a microbatch, as each device's own.
-
-### Measurements: through the NICs
-
-Between nodes the collectives are the cost. With NCCL kept off NVLink and shared
-memory (`NCCL_P2P_DISABLE=1 NCCL_SHM_DISABLE=1`, and XLA's one-shot all-reduce off),
-every collective goes through the NICs, as between nodes:
-
-| mesh, methods | tok/s |
-|---|---|
-| `fsdp=8`, `microbatches=1` | 1030k |
-| `fsdp=8`, `microbatches=1`, `precision(reduce=float32)` | 976k |
-| `fsdp=8`, `microbatches=8, gather=layer, accumulate=reduced` | 358k |
-| `fsdp=8`, `microbatches=8, accumulate=reduced` | 500k |
-| `fsdp=8`, `microbatches=8, accumulate=unreduced` | 738k |
-| `fsdp=8`, `microbatches=8`, `precision(reduce=float32)` | 699k |
-| `stage=2, fsdp=4`, `repeat=scan, microbatches=8, gather=layer, accumulate=reduced` | 464k |
-| `stage=2, fsdp=4`, `repeat=scan, microbatches=8, accumulate=reduced` | 521k |
-| `stage=2, fsdp=4`, `repeat=scan, microbatches=8, accumulate=unreduced` | 566k |
-
-So `gather=step` is the default, and `accumulate=auto` adds up unreduced only where
-the rows' axes span processes, as between nodes. With deterministic GEMMs the three
-dense runs of 8 microbatches on one node end their 10 steps at 11.86792, 11.86793
-(`reduced`) and 11.86804 (`unreduced`).
+What it saves, on one node and through the NICs, is in the
+[measurements](#gathered-once-reduced-once-collectives).
 
 (microbatches-interleave)=
 ## Side by side: `methods.interleave`
@@ -256,7 +197,7 @@ backward of microbatch n-1
 `interleave` is off by default. On 8 B300s it hides NCCL EP's exchange behind the
 other microbatch's compute, but elsewhere its copies cost more than it hides, and a
 model that fills a GPU in a row does not fit interleaved
-([Measurements](#measurements-interleaved-on-a-node)).
+({ref}`Measurements <measurements-interleaved-on-a-node>`).
 :::
 
 ### How it works
@@ -311,8 +252,103 @@ Neither alternative did better:
   nothing, but the program is n times the loop's, and XLA held 176 GiB for the 12
   layers in 8 microbatches (124.6k tokens a second a GPU, the loop 126.7k).
 
+(microbatches-donate)=
+## Donation: `methods.donate`
+
+A step donates the model's and the optimizer's arrays, so that its new state takes the
+old one's memory where XLA can write it in place. `methods(donate=false)` keeps them.
+
+```bux
+methods = methods(donate=false)
+```
+
+More fits donated. The 1.3B trains 36 rows a GPU and the MoE 12, which run out of
+memory kept. The MoE with a checkpoint every 10 steps trains, where kept it runs out
+of memory at the step after its first save
+([Donation on one B300](#donation-on-one-b300)).
+
+:::{note}
+Donation changes how XLA rounds a step a little (the gradient's norm by 7e-6 at the
+dense model's first step on a GPU, the loss by 2e-6 at zamba2's third on a CPU): runs
+compared bitwise must donate alike. An array read from `trainer.model` before a step
+is gone after it; a checkpoint is safe, as orbax copies the state to the host before
+`save` returns.
+:::
+
+Either way the trainer keeps the state in the buffers it was made in
+(`parallel.shard_state` moves only what is elsewhere), and a run that resumes loads
+its checkpoint into the memory of the state it replaces
+([Resuming](../training/launching.md#resuming)).
+
+## Measurements
+
+On B300s in October 2026, but the memory and losses on one CPU device.
+
+### Gathered once, reduced once: collectives
+
+Unreduced, a step of 8 microbatches moves what a step of 1 does. In the compiled step
+of `fsdp=8`, each collective counted as many times as the loops around it run
+(`tests/test_gather.py`), for the benchmarks' dense 1.3B
+(`examples/benchmarks/baseline.bux`) on B300s, 64 rows of 4096. On one node
+`accumulate=auto` reduces each microbatch (that row's loss by chunks):
+
+| methods | all-gathers | reduce-scatters |
+|---|---|---|
+| `microbatches=1` | 66, 2.68 GiB | 9, 2.68 GiB |
+| `microbatches=8, gather=layer, accumulate=reduced` | 528, 21.5 GiB | 72, 21.5 GiB |
+| `microbatches=8`, on one node | 66, 2.68 GiB | 72, 25.9 GiB |
+| `microbatches=8, accumulate=unreduced` | 66, 2.68 GiB | 9, 2.68 GiB |
+| `repeat=scan, microbatches=8, gather=layer, accumulate=reduced` | 1048, 34.1 GiB | 152, 21.5 GiB |
+| `repeat=scan, microbatches=8, accumulate=unreduced` | 10, 2.68 GiB | 7, 2.68 GiB |
+
+### Gathered once, reduced once: one node of 8 B300s
+
+Tokens a second and the peak memory of a GPU, the same run, 20 steps, the loss by
+logits (by chunks, the default, `microbatches=1` takes 1122k in 38.9 GiB):
+
+| mesh, methods | tok/s | peak |
+|---|---|---|
+| `fsdp=8`, `microbatches=1` | 1147k | 58.5 GiB |
+| `fsdp=8`, `microbatches=8, gather=layer, accumulate=reduced` | 817k | 11.9 GiB |
+| `fsdp=8`, `microbatches=8` (reduced each microbatch) | 925k | 11.6 GiB |
+| `fsdp=8`, `microbatches=8, accumulate=unreduced` | 907k | 15.7 GiB |
+| `fsdp=8`, `repeat=scan, microbatches=8, gather=layer, accumulate=reduced` | 719k | 10.2 GiB |
+| `fsdp=8`, `repeat=scan, microbatches=8, accumulate=unreduced` | 803k | 15.7 GiB |
+| `fsdp=2, tensor=4`, `layout(stream=tensor)`, `microbatches=8, gather=layer, accumulate=reduced` | 647k | 11.9 GiB |
+| `fsdp=2, tensor=4`, `layout(stream=tensor)`, `microbatches=8, accumulate=unreduced` | 640k | 12.9 GiB |
+| `stage=2, fsdp=4`, `repeat=scan, microbatches=8, gather=layer, accumulate=reduced` | 660k | 88.3 GiB |
+| `stage=2, fsdp=4`, `repeat=scan, microbatches=8` (reduced each tick) | 640k | 97.8 GiB |
+| `stage=2, fsdp=4`, `repeat=scan, microbatches=8, accumulate=unreduced` | 644k | 97.8 GiB |
+
+Over NVLink, gathering once is the gain: XLA overlaps a reduce-scatter a microbatch
+with the backward, and adding up unreduced reads and writes a float32 copy of every
+gradient a microbatch, as each device's own.
+
+### Gathered once, reduced once: through the NICs
+
+Between nodes the collectives are the cost. With NCCL kept off NVLink and shared
+memory (`NCCL_P2P_DISABLE=1 NCCL_SHM_DISABLE=1`, and XLA's one-shot all-reduce off),
+every collective goes through the NICs, as between nodes:
+
+| mesh, methods | tok/s |
+|---|---|
+| `fsdp=8`, `microbatches=1` | 1030k |
+| `fsdp=8`, `microbatches=1`, `precision(reduce=float32)` | 976k |
+| `fsdp=8`, `microbatches=8, gather=layer, accumulate=reduced` | 358k |
+| `fsdp=8`, `microbatches=8, accumulate=reduced` | 500k |
+| `fsdp=8`, `microbatches=8, accumulate=unreduced` | 738k |
+| `fsdp=8`, `microbatches=8`, `precision(reduce=float32)` | 699k |
+| `stage=2, fsdp=4`, `repeat=scan, microbatches=8, gather=layer, accumulate=reduced` | 464k |
+| `stage=2, fsdp=4`, `repeat=scan, microbatches=8, accumulate=reduced` | 521k |
+| `stage=2, fsdp=4`, `repeat=scan, microbatches=8, accumulate=unreduced` | 566k |
+
+So `gather=step` is the default, and `accumulate=auto` adds up unreduced only where
+the rows' axes span processes, as between nodes. With deterministic GEMMs the three
+dense runs of 8 microbatches on one node end their 10 steps at 11.86792, 11.86793
+(`reduced`) and 11.86804 (`unreduced`).
+
 (measurements-interleaved-on-a-node)=
-### Measurements: interleaved on a node
+### Side by side: interleaved on a node
 
 Tokens a second a GPU and the peak, the loop and interleave side by side on a node of
 8 B300s:
@@ -360,7 +396,7 @@ cost ([Remat](remat.md)).
   in 230 GiB, fit interleaved: in slots it asked for 261 GiB, and the carry holds half
   a microbatch more.
 
-## Memory and losses
+### Memory and losses
 
 The compiled train step's temporaries on one device, for 4 Llama blocks of width 256,
 `seq_len = 256`, `batch = 32` (`compiled.memory_analysis()`):
@@ -382,15 +418,7 @@ eight words, byte by byte (`seq_len = 128`, `batch = 16`, `adamw(lr=3e-3)`, cosi
 
 What `compute` is and where float32 stays: [Precision](precision.md).
 
-(microbatches-donate)=
-## Donation: `methods.donate`
-
-A step donates the model's and the optimizer's arrays, so that its new state takes the
-old one's memory where XLA can write it in place. `methods(donate=false)` keeps them.
-
-```bux
-methods = methods(donate=false)
-```
+### Donation on one B300
 
 On one B300 (bfloat16, 8 × 4096 tokens), the peak and the largest free piece of the
 GPU's memory after 20 steps, in GiB, and tokens a second:
@@ -401,20 +429,3 @@ GPU's memory after 20 steps, in GiB, and tokens a second:
 | MoE, 64 experts, top 8 (5.2B) | 163.9, 85.5 | 153.5, 143.1 | 103.8k / 106.2k |
 | Gated DeltaNet hybrid | 148.4, 169.8 | 140.4, 185.3 | 92.1k / 91.9k |
 | KDA, `gate_lower_bound=-5` | 183.4, 169.7 | 176.2, 185.3 | 110.9k / 114.4k |
-
-So more fits. Donated, the 1.3B trains 36 rows a GPU and the MoE 12, which run out of
-memory kept, and the MoE with a checkpoint every 10 steps trains, where kept it runs
-out of memory at the step after its first save.
-
-:::{note}
-Donation changes how XLA rounds a step a little (the gradient's norm by 7e-6 at the
-dense model's first step on a GPU, the loss by 2e-6 at zamba2's third on a CPU): runs
-compared bitwise must donate alike. An array read from `trainer.model` before a step
-is gone after it; a checkpoint is safe, as orbax copies the state to the host before
-`save` returns.
-:::
-
-Either way the trainer keeps the state in the buffers it was made in
-(`parallel.shard_state` moves only what is elsewhere), and a run that resumes loads
-its checkpoint into the memory of the state it replaces
-([Resuming](../training/launching.md#resuming)).

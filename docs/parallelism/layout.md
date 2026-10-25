@@ -121,9 +121,10 @@ What this means in practice:
 FSDP used to split a parameter by its largest dimension. Qwen3-30B-A3B's expert
 stacks then split by `embed`, and on 8 B300s every gather and reduce-scatter of them
 went through a transpose: 21.6 ms of a 12-layer cut's 314 ms step, against 3.6 ms by
-expert. By the first dimension, its 48 layers (`megatron.bux`'s `sorted`) train at
-257k tokens a second, from 251k, and the dense 1.3B's transposes (1.7 ms a step) are
-gone.
+expert. Split by the first dimension:
+
+- its 48 layers (`megatron.bux`'s `sorted`) train at 257k tokens a second, from 251k;
+- the dense 1.3B's transposes (1.7 ms a step) are gone.
 :::
 
 ### Born on their shards

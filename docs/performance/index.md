@@ -7,13 +7,13 @@ or when you change bux itself and need to show the change is not slower.
 
 ## Headline numbers
 
-All on NVIDIA B300s, in October 2026, at each run's defaults
-([Benchmarks](benchmarks.md) has the workloads, dates and commits):
+All on NVIDIA B300s, in October 2026, at each run's defaults but the precision a row
+names ([Benchmarks](benchmarks.md) has the workloads, dates and commits):
 
 | run | bux | against |
 |-----|-----|---------|
 | Qwen3-30B-A3B at Megatron-Bridge's own workload (512 rows of 4096 in 8 microbatches, MXFP8), 8 GPUs | **42,391** tokens a second a GPU | Megatron-Bridge's 40,769: **104%** |
-| a Llama-style 1.3B, one GPU, bfloat16 | 144k tokens a second, 44% MFU | 167k in MXFP8 (1.18x), 179k in NVFP4 (1.22x) |
+| a Llama-style 1.3B, one GPU, bfloat16 | 142k tokens a second, 44% MFU | 167k in MXFP8 (1.18x), 179k in NVFP4 (1.22x against 147k, a later tree's bfloat16) |
 | the same 1.3B, `mesh(fsdp=8)` on one node | 1.245M tokens a second | FSDP keeps 97% of a GPU's rate alone |
 | the same 1.3B, HSDP on eight nodes (64 GPUs) | 8,664k tokens a second | 96.4% a GPU of one node's |
 | attention, and the MoE's experts, by bux's kernels | 7x and 27x | XLA's own program |

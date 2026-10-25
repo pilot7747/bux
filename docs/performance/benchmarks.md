@@ -225,7 +225,7 @@ which differ by 1.7%.
 
 ::::{dropdown} What the second round changed (37.4k to 42.4k)
 
-At Megatron's batch, main trained `sorted` at 37.5k and `nccl_ep` not at all: NCCL
+At Megatron's batch, main trained `sorted` at 37.4k and `nccl_ep` not at all: NCCL
 EP's buffers were sized for a step. At one microbatch `sorted`'s step took 898 ms
 (768 computing, 61 of collectives alone, 69 idle), `nccl_ep`'s 1093 (688, 326, 78).
 
@@ -311,20 +311,16 @@ baseline on a node, with its measurements, is in [Parallelism](../parallelism/in
 The two-node suite on 16 B300s (the polish wave, 2026-10-24): FSDP and HSDP 2.21M, the
 MoE sorted 1.58M and by EP 1.04M, the GDN hybrid 1.60M.
 
-The 1.3B dense model, 8 rows of 4096 a GPU, the compile cache on a filesystem both
-nodes mount (2026-10-23; launch: from its start to the fifth step):
-
-| mesh                         | GPUs | tok/s     | a GPU  | of one node's | launch, cold / warm |
-|------------------------------|------|-----------|--------|---------------|---------------------|
-| `fsdp=8`                     | 8    | 1,133k    | 141.4k |               |                     |
-| `fsdp=16`                    | 16   | 2,220k    | 138.7k | 98.1%         | 78 s / 42 s         |
-| `data=2, fsdp=8` (HSDP)      | 16   | 2,238k    | 139.9k | 98.9%         | 80 s / 42 s         |
-
-The MoE at a capacity of 1.25, by the suites' `moe` and `moe_ep` (2026-10-24, the polish
-wave): `sorted` under HSDP 1,586k; EP in a node, data across (`data=2, expert=8`),
-1,016k by `ragged_all_to_all` and 1,192k by `nccl_ep`; EP over both nodes
-(`expert=16`), 324k and 773k. Its full table is in
-[Experts](../parallelism/experts.md).
+- **The dense 1.3B** (2026-10-23), 8 rows of 4096 a GPU: FSDP over both nodes,
+  `fsdp=16`, keeps 98.1% of one node's rate a GPU, and HSDP, `data=2, fsdp=8`, 98.9%.
+  With the compile cache on a filesystem both nodes mount, a launch reaches its fifth
+  step in 42 s warm, against 78-80 s cold
+  ([On B300s](../parallelism/multi-node.md#on-b300s)).
+- **The MoE** at a capacity of 1.25, by the suites' `moe` and `moe_ep` (2026-10-24, the
+  polish wave): `sorted` under HSDP 1,586k. EP in a node and data across
+  (`data=2, expert=8`): 1,016k by `ragged_all_to_all` and 1,192k by `nccl_ep`. EP over
+  both nodes (`expert=16`): 324k and 773k
+  ([One node and two](../parallelism/experts.md#one-node-and-two)).
 
 ### Four and eight nodes
 
@@ -353,23 +349,11 @@ nodes. Tokens a second, launch times and the reasons are in
 
 ### Kernel speedups
 
-Against XLA's own program for the same computation, on a B300
-([Kernels](kernels.md#the-kernels) has every kernel):
-
-| kernel | speedup |
-|--------|---------|
-| softmax attention (cuDNN, tokamax) | 7x, and no t × t logits |
-| MoE experts, tokamax's grouped GEMMs | 27x `jax.lax.ragged_dot` |
-| Mamba-2 by chunks | 25x a scan over positions |
-| linear attention by chunks | 14-17x a scan over positions |
-| KDA bounded, cuDNN's fused kernel | 10x by chunks |
-| Gated DeltaNet, cuDNN's fused kernel | 5x by chunks |
-| MoE dispatch, `token_rows` | 4x |
-| NVFP4's quantizers | 3-5x |
-| sparse attention | 2.6x |
-| KDA at any gate, bux's Pallas kernels | 2.6x by chunks |
-| QK-norm then RoPE | 1.4x forward, 1.9x backward |
-| MoE experts in MXFP8, `grouped_mxfp8` | 1.5-2.4x tokamax's bfloat16 GEMMs |
+On a B300, bux's kernels run 1.4x (QK-norm then RoPE, forward) to 27x (the MoE's
+experts, against `jax.lax.ragged_dot`) as fast as XLA's own program for the same
+computation: softmax attention 7x, Mamba-2 by chunks 25x a scan over positions, KDA
+bounded at -5 by cuDNN's kernel 10x the chunks. [The kernels](kernels.md#the-kernels)
+lists every kernel with its speedup, and when it falls back.
 
 ### Earlier waves
 
