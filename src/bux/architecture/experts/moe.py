@@ -1,16 +1,16 @@
 """Mixture of experts, with shared experts and LatentMoE projections.
 
 The router picks each token's top-k experts (``MoE._route``), and a method of
-``methods.moe`` runs them (docs/parallelism.md): "dense" runs every expert on every
-token, the reference; "sorted", the default, runs each expert on its own picks alone
-(``routed``), dropping none. A token's path through ``routed``, which expert
-parallelism (``bux.parallel.experts``) takes apart:
+``methods.moe`` runs them (:doc:`/parallelism/experts`): ``dense`` runs every expert
+on every token, the reference; ``sorted``, the default, runs each expert on its own
+picks alone (`routed`), dropping none. A token's path through `routed`, which expert
+parallelism (`bux.parallel.experts`) takes apart:
 
-    sort_by_expert  the picks in order of their experts, and how many each one has
-    token_rows      each pick's token row, in that order
-    experts         each row through its expert's FFN, by grouped GEMMs, times its
-                    pick's weight
-    token_sums      each token's sum of its k picks' rows
+1. `sort_by_expert`: the picks in order of their experts, and how many each one has.
+2. `token_rows`: each pick's token row, in that order.
+3. `experts`: each row through its expert's FFN, by grouped GEMMs, times its pick's
+   weight.
+4. `token_sums`: each token's sum of its k picks' rows.
 
 Shapes: b rows of t tokens of width d; E experts, k picks a token, f hidden units an
 expert, and p projections into them: 2 for a gated MLP (up and gate), else 1.
@@ -47,18 +47,83 @@ LECUN = nnx.initializers.lecun_normal()
 
 
 class Sorted(NamedTuple):
-    """The M flat picks sorted by expert: their `order`, its `inverse` (where each
-    pick went), and how many picks each expert has."""
+    """The M flat picks sorted by expert, as `sort_by_expert` returns them."""
 
+    #: Which pick is at each place, sorted.
     order: Int[Array, " M"]
+    #: Where each pick went, the inverse of `order`.
     inverse: Int[Array, " M"]
+    #: How many picks each expert has.
     sizes: Int[Array, " E"]
 
 
 class MoE(nnx.Module):
-    """Token-choice top-k experts, run by the run's method of ``methods.moe``."""
+    """Token-choice top-k mixture of experts, the layer ``moe``: Mixtral's,
+    DeepSeekMoE's, Qwen3-MoE's.
 
-    # Up's last dimension, of up and gate, is a batch one: Muon orthogonalizes them apart.
+    The router scores every expert for each token by its logits (``router``:
+    softmax, sigmoid, or ``sqrt(softplus)`` as DeepSeek-V4) and picks the ``top_k``
+    best. The token's output is its experts' outputs summed, each weighted by its
+    score: normalized over the top-k under ``normalize_top_k``, then times
+    ``routed_scaling_factor``. Each expert is an FFN shaped as ``expert``. Around
+    that:
+
+    - Shared experts (``num_shared_experts``) run on every token: added with weight
+      1, gated by a sigmoid under ``shared_expert_gate`` (Qwen), or weighted by the
+      router with the top-k under ``shared_expert_sink`` (Inkling).
+    - Group-limited routing (``num_groups``, ``top_k_groups``) picks among the best
+      groups of experts only (DeepSeek-V3).
+    - Load balancing: a training forward adds `balance_loss` to the loss, weighted
+      by ``aux_loss_coef``, and under ``load_balancing=aux_free`` a bias per expert
+      on the scores that pick moves toward the experts picked less
+      (`step_end_update`, DeepSeek-V3).
+    - LatentMoE (``latent_size``, Nemotron 3): the routed experts run in a narrower
+      space, between a down and an up projection.
+
+    The run's ``methods.moe`` runs the routed experts: `run_sorted`, the default,
+    `run_dense`, the reference, or a method of expert parallelism
+    (`bux.parallel.experts`). Their kernels are stacked: `up`, (E, d, f, p), each
+    hidden unit's up and gate side by side, and `down`, (E, f, d).
+
+    Example:
+        DeepSeek-V3's experts, 8 of 256 a token, with a shared one:
+
+        .. code-block:: bux
+
+            experts = moe(num_experts=256, top_k=8, num_shared_experts=1,
+                          router=sigmoid, routed_scaling_factor=2.5, num_groups=8,
+                          top_k_groups=4, load_balancing=aux_free,
+                          expert=gated_mlp(intermediate_size=2048, activation=swish))
+
+        The layer alone, in Python::
+
+            import jax.numpy as jnp
+            from flax import nnx
+
+            from bux import config as cfg
+            from bux.architecture.experts.moe import MoE
+            from bux.architecture.registry import Taps
+
+            expert = cfg.MLPConfig(
+                type="gated_mlp", intermediate_size=128, activation="swish"
+            )
+            config = cfg.MoEConfig(num_experts=8, top_k=2, expert=expert)
+            moe = MoE(config, width=64, rngs=nnx.Rngs(0))
+            y = moe(jnp.ones((2, 16, 64)), Taps())  # (2, 16, 64)
+
+    Args:
+        config: the layer's settings.
+        width: the width d of the stream it reads and writes.
+        rngs: draws the initial parameters, and under ``random_logits`` the random
+            logits.
+
+    Raises:
+        ValueError: groups of experts that cannot hold the top-k, or experts that
+            do not split into ``num_groups``.
+    """
+
+    #: The axes of each matrix of `up` and `down`. Up's last dimension, of up and
+    #: gate, is a batch one: Muon orthogonalizes them apart.
     muon_axes: ClassVar = {"up": (1, 2), "down": (1, 2)}
 
     def __init__(self, config: cfg.MoEConfig, width: int, rngs: nnx.Rngs):
@@ -110,6 +175,16 @@ class MoE(nnx.Module):
         self.routing = rngs["routing"].fork() if config.random_logits else None
 
     def __call__(self, x: Float[Array, "b t d"], taps: Taps) -> Float[Array, "b t d"]:
+        """Route each token to its experts, and sum their outputs.
+
+        Args:
+            x: the stream: b rows of t tokens, d wide.
+            taps: the forward pass's taps; a training forward collects the balance
+                loss in them, and moves the router bias.
+
+        Returns:
+            The routed and shared experts' outputs, the shape of `x`.
+        """
         idx, weights, sinks = self._route(x, taps)
         y = parallel.method("moe")(self, self._latent(x), idx, weights, taps)
         if self.latent_output_norm is not None:
@@ -179,7 +254,13 @@ class MoE(nnx.Module):
 
     def step_end_update(self) -> None:
         """Move the router bias toward the experts picked less than the mean since it
-        last moved (DeepSeek-V3), and count again from zero."""
+        last moved (DeepSeek-V3), and count again from zero.
+
+        Each expert's bias moves by ``bias_update_rate``: up if it was picked less
+        than the mean, down if more. A forward calls it itself unless the trainer
+        sets `update_at_step_end`, to call it once a step. Without ``aux_free`` it
+        does nothing.
+        """
         if self.router_bias is None or self.router_load is None:
             return
         load = self.router_load[...]
@@ -188,7 +269,8 @@ class MoE(nnx.Module):
         self.router_load[...] = jnp.zeros_like(load)
 
     def kernels(self) -> Kernels:
-        """Return the routed experts' kernels as arrays."""
+        """Return the routed experts' kernels as arrays: up (E, d, f, p) and down
+        (E, f, d)."""
         return self.up[...], self.down[...]
 
     def _latent(self, x: Float[Array, "b t d"]) -> Float[Array, "b t l"]:
@@ -239,10 +321,22 @@ def _limit_groups(
 def balance_loss(
     scores: Float[Array, "b t E"], picks: Float[Array, "b t E"], k: int, sequence: bool
 ) -> Float[Array, ""]:
-    """Return E * sum_e f_e P_e, with f_e the fraction of the top-k `picks` that are
-    expert e and P_e its mean score normalized over the experts; over the batch, or
-    per sequence and then averaged (DeepSeek-V3, eqs. 17-20). It is 1 when both are
-    uniform."""
+    """Return the balance loss ``E * sum_e f_e P_e`` (Switch; DeepSeek-V3, eqs.
+    17-20).
+
+    ``f_e`` is the fraction of the top-k picks that are expert e, and ``P_e`` its mean
+    score normalized over the experts. The loss is 1 when both are uniform.
+
+    Args:
+        scores: every token's score of every expert.
+        picks: how many of each token's picks are each expert's: its top-k, one-hot.
+        k: the picks a token.
+        sequence: whether to take f and P per sequence, then average the losses
+            (DeepSeek-V3's sequence-wise loss), rather than over the batch.
+
+    Returns:
+        The loss, a scalar.
+    """
     over = 1 if sequence else (0, 1)
     f = picks.mean(over) / k
     p = (scores / scores.sum(-1, keepdims=True)).mean(over)
@@ -298,7 +392,19 @@ def run_dense(
     taps: Taps | None = None,
 ) -> Float[Array, "b t d"]:
     """Run every expert on every token and weight the outputs by the router: the
-    reference. Each device runs every expert on its own tokens."""
+    reference. Each device runs every expert on its own tokens.
+
+    Args:
+        moe: the layer, whose experts' kernels it takes.
+        z: the tokens as the routed experts take them: b rows of t, d wide (in
+            LatentMoE, the latent width).
+        idx: each token's top-k experts.
+        weights: their weights.
+        taps: the forward pass's taps; unused.
+
+    Returns:
+        Each token's weighted sum of its experts' outputs, the shape of `z`.
+    """
     up, down = moe.kernels()
     dense = dense_weights(idx, weights, moe.config.num_experts)
     projected = jnp.einsum("btd,edfp->btefp", z, up)
@@ -326,10 +432,24 @@ def run_sorted(
     weights: Float[Array, "b t k"],
     taps: Taps | None = None,
 ) -> Float[Array, "b t d"]:
-    """Run each expert on its own rows (``routed``), each device on its own tokens
-    with every expert's kernels, so that no device sorts another's tokens. Where the
-    fused kernels run them and FSDP splits them by expert as the layer runs, each
-    device quantizes its own shard of them before they are gathered."""
+    """Run each expert on its own picks alone, dropping none: the default. Each
+    device sorts its own tokens by expert and runs them with every expert's kernels
+    (`routed`), so that no device sorts another's tokens.
+
+    Where the fused kernels run the experts (`fused`) and FSDP splits their kernels
+    by expert as the layer runs, each device quantizes its own shard of them before
+    they are gathered (`~bux.architecture.experts.grouped_glu.gathered`).
+
+    Args:
+        moe: the layer, whose experts' kernels it takes.
+        z: the tokens as the routed experts take them: b rows of t, d wide.
+        idx: each token's top-k experts.
+        weights: their weights.
+        taps: the forward pass's taps; unused.
+
+    Returns:
+        Each token's weighted sum of its experts' outputs, the shape of `z`.
+    """
     ffn, norm = moe.config.expert, moe.expert_norm
     tokens = parallel.spec(("batch", "seq", None), z.shape)
     if not parallel.axes_of(tokens):
@@ -378,9 +498,18 @@ def _splits(sharding: object, ndim: int) -> list[tuple[str, ...]]:
 def in_shard_map(
     local: Callable[..., Any], tokens: P, kernels: P, out: Any
 ) -> Callable[..., Any]:
-    """Return `local` in a shard_map manual over the axes `tokens` splits: each device
-    takes its own tokens, picks and weights, split as `tokens`, and the experts'
-    kernels, split as `kernels`; `out` splits what it returns."""
+    """Return `local` in a shard_map manual over the axes `tokens` splits.
+
+    Args:
+        local: what each device runs, of its tokens, picks, weights and the experts'
+            kernels.
+        tokens: how the tokens, the picks and the weights split.
+        kernels: how the experts' kernels split.
+        out: how what `local` returns splits.
+
+    Returns:
+        `local` on the whole arrays.
+    """
     # Untyped by what varies: tokamax's kernel takes jnp.searchsorted, which fails in
     # a shard_map on jax 0.12 where it is typed.
     return jax.shard_map(
@@ -405,9 +534,26 @@ def routed(
     norm: RowNorm | None = None,
     quantized: grouped_glu.Weights | None = None,
 ) -> Float[Array, "b t d"]:
-    """Return each token's sum of its experts' outputs, weighted by `weights`. A pick
-    outside the experts of `up` adds nothing, so that one device's experts can take
-    every pick. Given the kernels `quantized`, the fused kernels take them so."""
+    """Return each token's sum of its experts' outputs, weighted by `weights`: the
+    whole of a token's path, from `sort_by_expert` to `token_sums`.
+
+    A pick outside the experts of `up` adds nothing, so that one device's experts
+    can take every pick.
+
+    Args:
+        z: the tokens: b rows of t, d wide.
+        idx: each token's top-k experts, as indices into `up` and `down`.
+        weights: their weights.
+        up: the experts' up kernels, (E, d, f, p).
+        down: their down kernels, (E, f, d).
+        ffn: the experts' FFN settings.
+        norm: a norm of each expert's output; None for none.
+        quantized: the kernels in MXFP8, for the fused kernels to take as they
+            are; None to quantize them here.
+
+    Returns:
+        The sums, the shape of `z`.
+    """
     b, t, d = z.shape
     k, n = idx.shape[-1], up.shape[0]
     order, inverse, sizes = sort_by_expert(idx, n)
@@ -425,7 +571,15 @@ def routed(
 
 def sort_by_expert(idx: Int[Array, "*n k"], num_experts: int) -> Sorted:
     """Return the flat picks `idx` sorted by expert, each expert's in token order.
-    Picks outside [0, num_experts) sort last and count for none."""
+
+    Args:
+        idx: the picks, k a token.
+        num_experts: how many experts there are. Picks outside
+            ``[0, num_experts)`` sort last and count for none.
+
+    Returns:
+        The picks' order, its inverse, and how many picks each expert has.
+    """
     flat = idx.reshape(-1)
     flat = jnp.where(in_range(flat, num_experts), flat, num_experts)
     order = jnp.argsort(flat, stable=True)
@@ -434,7 +588,7 @@ def sort_by_expert(idx: Int[Array, "*n k"], num_experts: int) -> Sorted:
 
 
 def in_range(idx: Int[Array, "*s"], num_experts: int) -> Bool[Array, "*s"]:
-    """Return which picks are of the experts [0, num_experts)."""
+    """Return which picks are of the experts ``[0, num_experts)``."""
     return (idx >= 0) & (idx < num_experts)
 
 
@@ -451,15 +605,35 @@ def experts(
     quantized: grouped_glu.Weights | None = None,
 ) -> Float[Array, "r d"]:
     """Run each row of `x` through its expert's FFN, then `norm`, times the row's
-    weight in `weights`. The rows are sorted by expert: the first sizes[0] are expert
-    0's, the next sizes[1] expert 1's, and so on; rows past them come out 0 before
-    `norm`. It depends on its arguments alone, so it runs on one device's experts in a
-    shard_map as it does on all of them. The kernels multiply in x's dtype, so that
-    wider ones add up the gradients of several calls in their own. Given where x was
-    `picked`, a format's quantizer reads it there; given the tokens its rows are
-    `summed` into, it returns their sums. In MXFP8 on a Blackwell GPU, cuDNN's fused
-    kernels run a SwiGLU FFN with no norm (``grouped_glu``), its kernels as they are
-    `quantized`, if they are."""
+    weight.
+
+    The rows are sorted by expert: the first ``sizes[0]`` are expert 0's, the next
+    ``sizes[1]`` expert 1's, and so on; rows past them come out 0 before `norm`. It
+    depends on its arguments alone, so it runs on one device's experts in a shard_map
+    as it does on all of them. The kernels multiply in x's dtype, so that wider ones
+    add up the gradients of several calls in their own. The GEMMs are grouped:
+    block-scaled in the experts' format where it is one
+    (`~bux.architecture.experts.grouped_blockscaled`), else in compute
+    (`~bux.architecture.experts.grouped`). In MXFP8 on a Blackwell GPU, cuDNN's fused
+    kernels run a SwiGLU FFN with no norm (`~bux.architecture.experts.grouped_glu`).
+
+    Args:
+        x: the rows, sorted by expert, d wide.
+        sizes: how many rows each expert has.
+        weights: each row's weight.
+        up: the experts' up kernels, (E, d, f, p).
+        down: their down kernels, (E, f, d).
+        ffn: the experts' FFN settings.
+        norm: a norm of each expert's output; None for none.
+        picked: where the rows were gathered from, for a format's quantizer to read
+            them there; None to read `x`.
+        summed: the tokens the rows sum into; None to return the rows.
+        quantized: the kernels in MXFP8, for the fused kernels to take as they
+            are; None to quantize them here.
+
+    Returns:
+        The rows' outputs, (n, d), or with `summed` the tokens' sums, (t, d).
+    """
     if fused(ffn, norm, up):
         y = grouped_glu.mlp(x, sizes, weights, up, down, picked, summed, quantized)
         return checkpoint_name(y, "experts")
@@ -487,8 +661,8 @@ def experts(
 def fused(
     ffn: cfg.MLPConfig, norm: RowNorm | None, up: Float[Array, "E d f p"]
 ) -> bool:
-    """Return whether cuDNN's fused kernels run the experts here
-    (``grouped_glu.runs``)."""
+    """Return whether cuDNN's fused kernels run the experts here: with no norm, where
+    `~bux.architecture.experts.grouped_glu.runs` says they do."""
     recipe = grouped_blockscaled.RECIPES.get(experts_format())
     passes = matmuls.in_force().passes
     return norm is None and grouped_glu.runs(recipe, passes, ffn, up)
@@ -513,7 +687,7 @@ def hidden_units(
     ffn: cfg.MLPConfig, projected: Float[Array, "*n f p"]
 ) -> Float[Array, "*n f"]:
     """Return the hidden units of an FFN from its p projections into each: up, and
-    for a gated MLP the gate (``activate``)."""
+    for a gated MLP the gate (`~bux.architecture.layers.mlp.activate`)."""
     gate = projected[..., 1] if projected.shape[-1] == 2 else None
     return activate(ffn, projected[..., 0], gate)
 
@@ -533,10 +707,23 @@ def grouped_product(
     picked: grouped_blockscaled.Picked | None = None,
     summed: grouped_blockscaled.Summed | None = None,
 ) -> Float[Array, "r f"]:
-    """Return each expert's rows of x times its matrix of w, named `experts` for
-    ``remat``, or the sums of the tokens they are `summed` into: in `recipe`'s format
-    where x and w are whole blocks of it (``grouped_blockscaled``, x read from where
-    it was `picked`), else in compute (``grouped``)."""
+    """Return each expert's rows of x times its matrix of w, named ``experts`` for
+    remat.
+
+    Args:
+        x: the rows, sorted by expert.
+        w: the experts' matrices.
+        sizes: how many rows each expert has.
+        recipe: the block-scaled format to multiply in where x and w are whole blocks
+            of it (`~bux.architecture.experts.grouped_blockscaled`); None, or other
+            shapes, multiply in compute (`~bux.architecture.experts.grouped`).
+        picked: where the rows were gathered from, for the format's quantizer to
+            read them there; None to read `x`.
+        summed: the tokens the rows sum into; None to return the rows.
+
+    Returns:
+        The products, (n, f), or with `summed` the tokens' sums, (t, f).
+    """
     if recipe is None or not grouped_blockscaled.fits(x, w):
         y = checkpoint_name(ragged_dot(x, w, sizes), "experts")
         return y if summed is None else sums_of_tokens(y, summed)
@@ -551,16 +738,20 @@ def grouped_product(
 def sums_of_tokens(
     y: Float[Array, "m d"], summed: grouped_blockscaled.Summed
 ) -> Float[Array, "t d"]:
-    """Return each token's sum of its rows of y, as `summed` says (``token_sums``)."""
+    """Return each token's sum of its rows of y, as `summed` says (`token_sums`)."""
     tokens, k = summed.inverse.shape
     return token_sums(y, summed.inverse.reshape(tokens * k), summed.order, k)
 
 
 def experts_format() -> str:
     """Return the format the routed experts multiply in, in the branch that is
-    tracing: their role's (``matmuls.format_of``), or compute where the precision
-    gives them none (``PrecisionConfig.experts``): unlike the other roles, they take
-    `matmuls` only where a grouped GEMM multiplies in it."""
+    tracing.
+
+    It is their role's (`bux.architecture.precision.matmuls.format_of`), or compute
+    where the precision gives them none (`bux.train.config.PrecisionConfig.experts`):
+    unlike the other roles, they take ``matmuls`` only where a grouped GEMM multiplies
+    in it.
+    """
     if matmuls.in_force().experts() is None:
         return "compute"
     return matmuls.format_of("experts")
@@ -574,9 +765,20 @@ def experts_format() -> str:
 def token_rows(
     z: Float[Array, "n d"], order: Int[Array, " m"], inverse: Int[Array, " M"], k: int
 ) -> Float[Array, "m d"]:
-    """Return z[order // k], the token row of each pick in `order`: the first m of
-    the M = n k picks sorted, k a row of z, which `inverse` unsorts. Its gradient
-    sums each token's picks'."""
+    """Return ``z[order // k]``, the token row of each pick in `order`.
+
+    Its gradient sums each token's picks' by gathering by `inverse`, where XLA's
+    would scatter-add.
+
+    Args:
+        z: the tokens, n rows.
+        order: the first m of the ``M = n k`` picks, sorted.
+        inverse: where each of the M picks went, which unsorts them.
+        k: the picks a token.
+
+    Returns:
+        The picks' rows, (m, d).
+    """
     return z[order // k]
 
 
@@ -599,7 +801,7 @@ def picked_weights(
     weights: Float[Array, "*n k"], order: Int[Array, " m"], inverse: Int[Array, " M"]
 ) -> Float[Array, " m"]:
     """Return the weight of each pick in `order`, the first m of the M picks sorted,
-    which `inverse` unsorts: ``token_rows`` of a pick a row."""
+    which `inverse` unsorts: `token_rows` of a pick a row."""
     return token_rows(weights.reshape(-1, 1), order, inverse, 1)[:, 0]
 
 
@@ -607,9 +809,18 @@ def picked_weights(
 def token_sums(
     x: Float[Array, "m d"], inverse: Int[Array, " M"], order: Int[Array, " m"], k: int
 ) -> Float[Array, "n d"]:
-    """Return each token's sum of its k picks' rows of x, which holds the first m of
-    the picks `order` sorts; a pick past them adds 0. The transpose of
-    ``token_rows``: its gradient gathers by `order`."""
+    """Return each token's sum of its k picks' rows of x: the transpose of
+    `token_rows`, whose gradient gathers by `order`.
+
+    Args:
+        x: the picks' rows: the first m of the picks `order` sorts.
+        inverse: where each of the M picks went; a pick past the m rows adds 0.
+        order: the first m picks, sorted.
+        k: the picks a token.
+
+    Returns:
+        The tokens' sums, (n, d), added up in float32.
+    """
     return _sum_by_token(x, inverse, k)
 
 

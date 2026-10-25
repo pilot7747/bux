@@ -1,6 +1,7 @@
-"""Grouped block-scaled GEMMs: an MoE's experts, y = x W[g] for the rows of each group
-g as `grouped.ragged_dot` runs them, and its gradients, each operand quantized along
-what its GEMM contracts, as a `blockscaled.Recipe` says:
+"""Grouped block-scaled GEMMs: an MoE's experts, ``y = x W[g]`` for the rows of each
+group g as `bux.architecture.experts.grouped.ragged_dot` runs them, and its gradients,
+each operand quantized along what its GEMM contracts, as a
+`~bux.architecture.precision.blockscaled.Recipe` says::
 
     fprop   y  = x W[g]      x along k, each W[g] along k
     dgrad   dx = dy W[g]^T   dy along n, each W[g] along n
@@ -8,12 +9,14 @@ what its GEMM contracts, as a `blockscaled.Recipe` says:
 
 A block of rows that two groups share has one scale, and each group counts the other's
 rows as 0; rows past the groups come out 0, and add nothing to dW. Only the GEMMs in
-`passes` multiply in the format, the others by ``grouped``'s kernels, as they are. In
-the format, ``_times`` and ``_contract`` multiply by tcgen05's block-scaled MMA on a
-Blackwell GPU (``grouped_mxfp8``), MXFP8's operands quantized straight into its
-layout by Triton's kernel (``grouped_triton``); and elsewhere by XLA, which
-dequantizes and computes the same values. Each W[g] quantizes on its own. The
-recipes of E4M3 values with a power-of-two scale per 32 run here (RECIPES).
+`passes` multiply in the format, the others by `~bux.architecture.experts.grouped`'s
+kernels, as they are. In the format, ``_times`` and ``_contract`` multiply by
+tcgen05's block-scaled MMA on a Blackwell GPU
+(`~bux.architecture.experts.grouped_mxfp8`), MXFP8's operands quantized straight into
+its layout by Triton's kernel (`~bux.architecture.experts.grouped_triton`); and
+elsewhere by XLA, which dequantizes and computes the same values. Each W[g] quantizes
+on its own. The recipes of E4M3 values with a power-of-two scale per 32 run here
+(``RECIPES``).
 
 An MoE's rows are its tokens' rows, each as many times as it has picks: given where
 they come from (`Picked`), Triton's quantizer reads them there, so that the rows
@@ -48,21 +51,26 @@ Operand = Formatted | Float[Array, "..."]
 
 
 class Picked(NamedTuple):
-    """Where a GEMM's rows x come from: x = tokens[index], as ``moe.token_rows``
-    gathers an MoE's picks. Where Triton's quantizer runs, it reads them from
-    `tokens`, and XLA drops the gather that made x, which nothing else reads."""
+    """Where a GEMM's rows x come from: ``x = tokens[index]``, as
+    `bux.architecture.experts.moe.token_rows` gathers an MoE's picks. Where Triton's
+    quantizer runs, it reads them from `tokens`, and XLA drops the gather that made x,
+    which nothing else reads."""
 
+    #: The tokens the rows are gathered from.
     tokens: Float[Array, "n k"]
+    #: The token of each row.
     index: Int[Array, " m"]
 
 
 class Summed(NamedTuple):
-    """Where a GEMM's rows y go: into their tokens' sums, as ``moe.token_sums`` sums
-    an MoE's picks: row i is pick order[i], k picks a token, and a token's at
-    `inverse`. Its transpose gathers each row's dy from its token's, which Triton's
-    quantizer reads in place, as `Picked` rows."""
+    """Where a GEMM's rows y go: into their tokens' sums, as
+    `bux.architecture.experts.moe.token_sums` sums an MoE's picks. Its transpose
+    gathers each row's dy from its token's, which Triton's quantizer reads in place,
+    as `Picked` rows."""
 
+    #: The pick of each row, row i's ``order[i]``, k picks a token.
     order: Int[Array, " m"]
+    #: Where each token's k picks lie among the rows.
     inverse: Int[Array, "t k"]
 
     @property
@@ -77,7 +85,7 @@ Saved = tuple[Operand, Operand, Int[Array, " g"], UInt32[Array, ""], Summed | No
 
 
 def fits(x: Float[Array, "m k"], w: Float[Array, "g k n"]) -> bool:
-    """Whether what x W contracts, and its columns, are whole blocks."""
+    """Return whether what ``x W`` contracts, and its columns, are whole blocks."""
     return x.shape[-1] % BLOCK == 0 and w.shape[-1] % BLOCK == 0
 
 
@@ -91,10 +99,26 @@ def ragged_dot(
     picked: Picked | None = None,
     summed: Summed | None = None,
 ) -> Float[Array, "r n"]:
-    """Return what `grouped.ragged_dot` does, its GEMMs in `passes` as `recipe`
-    quantizes them: x read from where it was `picked`, and y the tokens' sums it is
-    `summed` into (t, n), if given. Rows go in the kernels' tiles of 128 too, so x
-    gains rows of 0 up to them."""
+    """Return what `bux.architecture.experts.grouped.ragged_dot` does, its GEMMs in
+    `passes` as `recipe` quantizes them.
+
+    Rows go in the kernels' tiles of 128 too, so x gains rows of 0 up to them.
+
+    Args:
+        x: the rows, m of k, sorted by group; whole blocks of k (`fits`).
+        w: the groups' matrices, (g, k, n).
+        sizes: how many rows each group has.
+        recipe: how the format quantizes x, W and dy.
+        seed: what a format that rounds stochastically draws its noise from.
+        passes: the GEMMs that multiply in the format; the others multiply as they
+            are.
+        picked: where the rows were gathered from, for Triton's quantizer to read
+            them there; None to read `x`.
+        summed: the tokens the rows sum into; None to return the rows.
+
+    Returns:
+        The products, (m, n), or with `summed` the tokens' sums, (t, n).
+    """
     m, tile = x.shape[0], grouped_mxfp8.LANES
     whole = -(-m // tile) * tile
     x = _padded(x, whole)
@@ -136,6 +160,7 @@ def _ragged(
     dtypes: blockscaled.Dtypes,
     passes: tuple[Pass, ...],
 ) -> Float[Array, "r n"]:
+    """Return `ragged_dot` of rows already in whole tiles, with its own gradients."""
     return _forward(x, w, sizes, seed, picked, summed, recipe, dtypes, passes)[0]
 
 
@@ -150,6 +175,7 @@ def _forward(
     dtypes: blockscaled.Dtypes,
     passes: tuple[Pass, ...],
 ) -> tuple[Float[Array, "r n"], Saved]:
+    """Return y by fprop, and x and W as the backward's GEMMs take them."""
     fprop, dgrad, wgrad = (p in passes for p in PASSES)
     filled = sizes.sum()
     x_k, x_m = _twice(
@@ -169,6 +195,7 @@ def _backward(
     saved: Saved,
     dy: Float[Array, "r n"],
 ) -> tuple[Float[Array, "m k"], Float[Array, "g k n"], None, None, None, None]:
+    """Return dx by dgrad and dW by wgrad."""
     x_m, w_n, sizes, seed, summed = saved
     _, dgrad, wgrad = (p in passes for p in PASSES)
     filled = sizes.sum()
