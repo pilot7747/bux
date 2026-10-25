@@ -1,15 +1,18 @@
-"""The pipeline on Spark: the map as mapInArrow, the reduce as applyInArrow.
+"""The pipeline on Spark: the map as mapInArrow, the reduce as applyInArrow::
 
     from pyspark.sql import SparkSession
-    from bux.data import spark
-    from bux.data.pipeline import Job, jobs
 
+    from bux.data import spark
+    from bux.data.pipeline import jobs
+    from bux.lang import compile_runs
+
+    [run] = compile_runs(open("examples/experiments/speedrun.bux").read())
     session = SparkSession.builder.getOrCreate()
     for job in jobs(run.train):
         spark.prepare(job, session, "s3://bucket/packed")
 
 A chunk's rows are the same as the local engine makes; which file holds them is up
-to Spark. Needs pyspark 4, which bux does not depend on.
+to Spark. Needs pyspark 4, of the ``spark`` extra (``uv sync --extra spark``).
 """
 
 import json
@@ -35,8 +38,19 @@ def _ddl(schema: pa.Schema) -> str:
 
 
 def rows(job: Job, records: DataFrame) -> tuple[DataFrame, dict]:
-    """Return the rows of `records` (a DataFrame with the source's column), and how
-    many documents and tokens they hold."""
+    """Return the rows of `records`, and how many documents and tokens they hold.
+
+    The documents are counted first, to choose the number of chunks, so they are
+    persisted between the map and the reduce.
+
+    Args:
+        job: What to make.
+        records: A DataFrame with the source's column.
+
+    Returns:
+        A DataFrame of rows in `bux.data.packing.SCHEMA`, and a dict of
+        ``docs`` and ``tokens``.
+    """
     docs = records.select(job.source.column).mapInArrow(job.map, _ddl(documents.SCHEMA))
     docs = docs.persist()
     counted = docs.agg(F.count("*"), F.sum(F.size("input_ids"))).first()
@@ -53,8 +67,19 @@ def rows(job: Job, records: DataFrame) -> tuple[DataFrame, dict]:
 
 
 def prepare(job: Job, session: SparkSession, cache: str) -> str:
-    """Write `job`'s dataset to a folder under `cache` (any URI Spark and Arrow can
-    write to), laid out as the local engine would."""
+    """Write `job`'s dataset to a folder under `cache`, laid out as the local engine
+    would: Parquet parts of rows, and a dataset.json written last.
+
+    Args:
+        job: What to prepare: one of `bux.data.pipeline.jobs`.
+        session: The Spark session that reads the source's files.
+        cache: Any URI that Spark and Arrow can write to: ``"s3://bucket/packed"``.
+
+    Returns:
+        The dataset's folder, ``cache/job.name``. Unlike the local `prepare
+        <bux.data.pipeline.prepare>`, it does not return a dataset that exists:
+        Spark's write fails on a folder that is there.
+    """
     folder = f"{cache.rstrip('/')}/{job.name}"
     out, stats = rows(job, session.read.parquet(job.source.path))
     out.write.parquet(folder)

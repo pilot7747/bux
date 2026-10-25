@@ -1,8 +1,19 @@
 """Tokenizers run by gigatoken (Rust, SIMD pretokenization): strings to ids, in bulk.
 
-The encoder never emits special tokens, like tiktoken's encode_ordinary: a web page
-that contains "<|endoftext|>" is text, not the end of a document. Only `special` and
-`markup` insert special tokens.
+The encoder never emits special tokens, like tiktoken's ``encode_ordinary``: a web
+page that contains ``"<|endoftext|>"`` is text, not the end of a document. Only
+`Tokenizer.special` and `Tokenizer.markup` insert special tokens::
+
+    import pyarrow as pa
+
+    from bux.data.tokenizer import load
+    from bux.train.config import TokenizerConfig
+
+    tok = load(TokenizerConfig(name="gpt2"))
+    ids, offsets = tok.encode(pa.array(["Hello world", "<|endoftext|>"]))
+    # ids: [15496 995 27 91 437 1659 5239 91 29], offsets: [0 2 9]
+    tok.eos  # 50256
+    tok.markup("<|endoftext|>x")  # [50256 87]
 """
 
 import functools
@@ -25,6 +36,27 @@ _SPECIAL = re.compile(r"(<\|[^|<>]+\|>)")
 
 
 class Tokenizer:
+    """A BPE tokenizer of a Hugging Face Hub repo or a tokenizer.json, by gigatoken.
+
+    The special tokens of the tokenizer.json are taken out of the encoder, so that
+    only `special` and `markup` make them, and the tokens of ``config.added`` take
+    the ids after the vocabulary. Use `load`, which makes one a config per process.
+
+    Args:
+        config: The run's ``tokenizer(...)`` setting.
+
+    Attributes:
+        specials: The special tokens' ids, by their text.
+        encoder: gigatoken's tokenizer, without the special tokens.
+        vocab_size: The ids the tokenizer makes, special and added ones included;
+            the model's ``vocab_size`` must be at least this.
+        bos: The id of ``config.bos``.
+        eos: The id of ``config.eos``.
+
+    Raises:
+        ValueError: If `config`'s bos or eos is not a special token.
+    """
+
     def __init__(self, config: tcfg.TokenizerConfig):
         spec = json.loads(to_tokenizer_json(config.name))
         added = spec.get("added_tokens") or []
@@ -41,6 +73,12 @@ class Tokenizer:
         self._markup: dict[str, Int32[np.ndarray, " ids"]] = {}
 
     def special(self, token: str) -> int:
+        """Return the id of the special token `token`, such as ``"<|im_end|>"``.
+
+        Raises:
+            ValueError: If the tokenizer has no such special token; the message says
+                to add it with ``tokenizer(added=[...])``.
+        """
         if token not in self.specials:
             raise ValueError(
                 f"the tokenizer has no special token {token!r}; add it with "
@@ -51,8 +89,15 @@ class Tokenizer:
     def encode(
         self, texts: pa.Array
     ) -> tuple[Int32[np.ndarray, " ids"], Int64[np.ndarray, " _"]]:
-        """Encode every string; return the ids end to end, and n + 1 offsets where each
-        string's ids start. Nulls encode to nothing."""
+        """Encode every string of `texts`, as text only: no special tokens.
+
+        Args:
+            texts: An Arrow array of n strings; nulls encode to nothing.
+
+        Returns:
+            The ids of all of them end to end, and n + 1 offsets into them. The
+            i-th string's ids are ``ids[offsets[i]:offsets[i + 1]]``.
+        """
         start, chars = utf8(texts)
         strings = ak.contents.ListOffsetArray(
             ak.index.Index64(start),
@@ -66,7 +111,13 @@ class Tokenizer:
         return ids[bounds[0] : bounds[-1]], bounds - bounds[0]
 
     def markup(self, text: str) -> Int32[np.ndarray, " ids"]:
-        """Encode template text, in which each <|name|> is that special token."""
+        """Encode template text, in which each ``<|name|>`` is that special token.
+
+        Each text is encoded once and kept, as templates repeat in every document.
+
+        Raises:
+            ValueError: If the text names a special token the tokenizer lacks.
+        """
         if text not in self._markup:
             self._markup[text] = self._encode_markup(text)
         return self._markup[text]
