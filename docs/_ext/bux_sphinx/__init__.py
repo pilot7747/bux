@@ -21,7 +21,7 @@ from docutils.parsers.rst.states import Inliner
 from sphinx import addnodes
 from sphinx.application import Sphinx
 
-from bux_sphinx import cli, configs, leaks, models, registries, signatures
+from bux_sphinx import cli, configs, leaks, models, registries, signatures, submodules
 from bux_sphinx.lexer import BuxLexer
 
 
@@ -66,4 +66,5 @@ def setup(app: Sphinx) -> dict[str, object]:
     app.connect("builder-inited", generate)
     signatures.setup(app)
     leaks.setup(app)
+    submodules.setup(app)
     return {"parallel_read_safe": True, "parallel_write_safe": True}
