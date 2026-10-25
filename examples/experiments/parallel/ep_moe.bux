@@ -7,7 +7,7 @@
 #   bux plan   examples/experiments/parallel/ep_moe.bux
 #   bux launch examples/experiments/parallel/ep_moe.bux     # on every host
 #
-# Every host runs the same command; docs/training.md says how they find each other.
+# Every host runs the same command; docs/training/launching.md says how they find each other.
 # all_gather runs anywhere. ragged_all_to_all sends each token to its experts' GPUs
 # alone, but runs on GPUs only: check it there with scripts/gpu_smoke/experts.py first.
 use deepseek_v3

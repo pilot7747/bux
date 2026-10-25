@@ -17,6 +17,17 @@ uv run bux check examples/architectures/gpt2.bux
 uv run bux render examples/architectures/gpt2.bux
 ```
 
+## Documentation
+
+The [documentation](docs/index.md) has a [quickstart](docs/get-started/quickstart.md),
+[tutorials](docs/tutorials/index.md), guides to the [language](docs/language/index.md),
+[architectures](docs/architectures/index.md), [training](docs/training/index.md),
+[data](docs/data/index.md) and [parallelism](docs/parallelism/index.md), a
+[performance tuning guide](docs/performance/tuning.md) with
+[benchmarks](docs/performance/benchmarks.md), and a reference of every layer and
+setting, the command line and the Python API, generated from the code. `make docs`
+builds it as Read the Docs does (`.readthedocs.yaml`), into `docs/_build/html`.
+
 ## Runs and sweeps
 
 A run is a `.bux` file that also says how to train its model. It can build on other
@@ -44,7 +55,7 @@ Every setting is checked before anything runs, at the line that wrote it, and ev
 run directory keeps the run as one self-contained `run.bux`. `bux launch` is the
 entrypoint for production: it trains each run of a sweep on its own GPUs, records how
 every run went, stops at SIGTERM with a checkpoint, and, launched again, trains only
-what is left. See the [training guide](docs/training.md).
+what is left. See the [training guide](docs/training/index.md).
 
 ## Data
 
@@ -66,22 +77,22 @@ eval      = eval(data=fineweb(split=[0.99, 1]))
 uv run bux prepare examples/experiments/speedrun.bux          # the speedrun's FineWeb, once
 ```
 
-See the [data guide](docs/data.md) for conversations, packings, and the pipeline.
+See the [data guide](docs/data/index.md) for conversations, packings, and the pipeline.
 
 Explore the [example architectures](examples/architectures/), from GPT-2 to recent
 releases grouped by model family (Cohere, DeepSeek, GLM, Inkling, Kimi, Laguna, Mellum,
 MiMo, Muse, Nemotron, Qwen), the [example experiments](examples/experiments/) that
-train them, and the [language guide](docs/language.md) for composition, residual
+train them, and the [language guide](docs/language/index.md) for composition, residual
 connections, parameter sharing, and editor support.
 
 A run splits over devices by three settings, `mesh`, `layout` and `methods`: FSDP,
 tensor, expert, context and pipeline parallelism, and any mix of them, from one GPU
 to many hosts. [examples/experiments/parallel/](examples/experiments/parallel/) has a
 run for each, one of them on a laptop's CPU, and the
-[parallelism guide](docs/parallelism.md) explains them. The suites in
+[parallelism guide](docs/parallelism/index.md) explains them. The suites in
 [examples/benchmarks/](examples/benchmarks/) measure them on one GPU, a node and two:
 `scripts/benchmark.py` trains a suite and prints how a change moved each run's speed,
-memory and loss ([Benchmarks](docs/training.md#benchmarks)).
+memory and loss ([Benchmarks](docs/performance/benchmarks.md)).
 
 Run the CI checks (ruff, ty, and the tests) with `make`, or one of them with `make lint`,
 `make typecheck`, or `make test`. Arrays say their dtype and shape with
@@ -106,7 +117,7 @@ docker run --rm -it --entrypoint bash bux    # a shell, or --entrypoint bux for 
 ```
 
 The image has TransformerEngine's JAX bindings, for its expert-parallel dispatch and
-combine (docs/parallelism.md, "TransformerEngine's NCCL EP"); `--build-arg TE_VERSION=...`
+combine ([NCCL EP](docs/parallelism/experts.md#transformerengines-nccl-ep)); `--build-arg TE_VERSION=...`
 picks another release.
 
 To publish it to `ghcr.io/pilot7747/bux` for amd64 and arm64, run the Docker workflow from
