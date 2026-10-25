@@ -1,7 +1,10 @@
 """Language server for .bux files: ``bux-lsp`` speaks LSP over stdio.
 
-Diagnostics, completion and hover come from ``bux.lang.lsp.features``; this module
-only converts between LSP positions and offsets into the source.
+Diagnostics, completion and hover come from `bux.lang.lsp.features`; this module
+only converts between LSP positions and offsets into the source. Diagnostics are
+published whenever a file opens or changes, and cleared when it closes; completion
+triggers on ``( , . = @ $ "``. Importing it without pygls (the ``lsp`` extra) exits
+with a message that says so.
 """
 
 import sys
@@ -30,6 +33,8 @@ _KINDS = {
     "keyword": lsp.CompletionItemKind.Keyword,
 }
 
+#: The pygls server, with a feature for opening, changing and closing a file
+#: (diagnostics), completion and hover.
 server = LanguageServer("bux", "0.1.0")
 
 
@@ -114,6 +119,7 @@ def _hover(ls: LanguageServer, params: lsp.HoverParams) -> lsp.Hover | None:
 
 
 def main() -> None:
+    """Serve LSP over stdin and stdout until the editor exits: ``bux-lsp``."""
     server.start_io()
 
 

@@ -15,6 +15,10 @@ Statements are ``name = expr``, ``name(param, param=default, ...) = expr`` (a ma
 ``shared name = expr``, ``name.key = expr`` (an amendment: ``name = name(key=expr)``)
 or ``use module``. A statement ends at a newline unless the next line is indented or
 a bracket is still open; ``;`` also ends one. ``#`` starts a comment.
+
+`tokenize` splits source into `Token` objects, `parse` and `parse_file` build the
+AST: a list of `Statement` objects whose bodies are `Expr` trees. Every node keeps
+its `Span`, so that a `BuxError` found later, by the compiler, points at the source.
 """
 
 import re
@@ -25,14 +29,45 @@ from decimal import Decimal
 
 @dataclass(frozen=True)
 class Span:
+    """Where something is in the source: the offsets ``source[start:end]``."""
+
     start: int
     end: int
 
     def to(self, other: Span) -> Span:
+        """Return the span from this one's start to `other`'s end."""
         return Span(self.start, other.end)
 
 
 class BuxError(Exception):
+    """A mistake in .bux source: what is wrong, where, and often how to fix it.
+
+    Every error of the language is one: syntax, unknown names, invalid settings,
+    widths that disagree, a missing module. The compiler attaches it to the file it
+    is in (`attach`), and it then prints that line with a caret under the mistake,
+    as rustc does::
+
+        error: unknown layer or block 'nrom'
+         --> tiny.bux:2:15
+          |
+        2 | model = embed nrom head
+          |               ^^^^
+          = hint: did you mean 'engram'?
+
+    Args:
+        message: What is wrong, without the ``error:`` prefix.
+        span: Where, in the source the error is attached to; None for the whole
+            file, such as a missing setting.
+        hint: How to fix it, if there is a likely fix.
+
+    Attributes:
+        message: What is wrong.
+        span: Where, as offsets into `source`.
+        hint: How to fix it, or None.
+        source: The text of the file the error is in, once attached; else None.
+        filename: The name of that file; ``"<string>"`` until attached.
+    """
+
     def __init__(self, message: str, span: Span | None = None, hint: str | None = None):
         super().__init__(message)
         self.message = message
@@ -42,6 +77,15 @@ class BuxError(Exception):
         self.filename = "<string>"
 
     def attach(self, source: str, filename: str) -> BuxError:
+        """Attach the error to the file it is in, unless it is attached already.
+
+        Args:
+            source: The file's text, which `span` indexes into.
+            filename: Its name, as errors show it.
+
+        Returns:
+            The error itself, to raise.
+        """
         if self.source is None:
             self.source, self.filename = source, filename
         return self
@@ -75,7 +119,18 @@ class BuxError(Exception):
 
 @dataclass(frozen=True)
 class Token:
-    kind: str  # NAME, NUMBER, STRING, OP, NEWLINE, EOF
+    """One token of the source.
+
+    Attributes:
+        kind: ``NAME``, ``NUMBER``, ``STRING``, ``OP``, ``NEWLINE`` or ``EOF``.
+        text: The token as written: ``128k``, ``"pattern"``.
+        span: Where it is.
+        space_before: Whether blanks or a line break precede it: ``f(x)`` is a
+            call and ``f (x)`` a composition, ``a.b`` a field and ``$t!`` a pop.
+        value: A number's value (``128k`` is 128000) or a string's contents.
+    """
+
+    kind: str
     text: str
     span: Span
     space_before: bool
@@ -112,6 +167,7 @@ _OPS = (
     ".",
     ";",
 )
+#: The language's keywords, which are not names of definitions.
 KEYWORDS = frozenset({"true", "false", "none", "shared", "_"})
 
 
@@ -177,8 +233,10 @@ def tokenize(
 ) -> list[Token]:
     """Split ``src[start:stop]`` into tokens, with spans into all of `src`.
 
-    Errors raise, unless an `errors` list is given: then they are appended to it and
-    tokenizing goes on, which editors need for half-typed source.
+    Comments and blanks make no tokens. A ``NEWLINE`` token ends each statement
+    (none inside brackets, or before an indented line), and an ``EOF`` token ends the
+    list. Errors raise, unless an `errors` list is given: then they are appended to
+    it and tokenizing goes on, which editors need for half-typed source.
     """
 
     def fail(error: BuxError) -> None:
@@ -226,52 +284,70 @@ def tokenize(
 
 @dataclass(frozen=True)
 class Expr:
+    """An expression of the AST, with its `span` in the source."""
+
     span: Span
 
 
 @dataclass(frozen=True)
 class Name(Expr):
+    """A name: a definition, a macro's parameter, a layer, or a bare string."""
+
     name: str
 
 
 @dataclass(frozen=True)
 class Lit(Expr):
+    """A literal: a number, a string, ``true``, ``false`` or ``none``."""
+
     value: int | float | str | bool | None
 
 
 @dataclass(frozen=True)
 class ListExpr(Expr):
+    """A list, ``[a, b]``: brackets with commas, or empty."""
+
     items: tuple[Expr, ...]
 
 
 @dataclass(frozen=True)
 class Identity(Expr):
-    pass
+    """The identity, ``_``."""
 
 
 @dataclass(frozen=True)
 class Tap(Expr):
+    """``@name``: push the stream onto a tap."""
+
     name: str
 
 
 @dataclass(frozen=True)
 class Ref(Expr):
+    """``$name``, or ``$name!`` (`pop`): read the top of a tap."""
+
     name: str
     pop: bool
 
 
 @dataclass(frozen=True)
 class Residual(Expr):
+    """A residual branch, ``[body]``."""
+
     body: Expr
 
 
 @dataclass(frozen=True)
 class Seq(Expr):
+    """A composition, ``a b c`` or ``a -> b -> c``."""
+
     items: tuple[Expr, ...]
 
 
 @dataclass(frozen=True)
 class BinOp(Expr):
+    """``left op right``, with `op` one of ``+ - * / // ^``."""
+
     op: str
     left: Expr
     right: Expr
@@ -279,23 +355,44 @@ class BinOp(Expr):
 
 @dataclass(frozen=True)
 class Neg(Expr):
+    """A negation, ``-operand``."""
+
     operand: Expr
 
 
 @dataclass(frozen=True)
 class Arg:
+    """One argument of a `Call`: ``k=v``, ``rope.base=v``, or a positional ``v``.
+
+    Attributes:
+        span: The whole argument.
+        key: The dotted keyword, ``("rope", "base")``; None for a positional one.
+        value: Its value.
+        key_spans: Where each part of the key is.
+    """
+
     span: Span
-    key: tuple[str, ...] | None  # dotted keyword, or None for a positional argument
+    key: tuple[str, ...] | None
     value: Expr
-    key_spans: tuple[Span, ...] = ()  # one per part of the key
+    key_spans: tuple[Span, ...] = ()
 
 
 @dataclass(frozen=True)
 class Call(Expr):
+    """A call, ``name(args)``, with no space before the bracket.
+
+    Attributes:
+        name: What it calls: a layer, a setting's config, or a macro.
+        name_span: Where `name` is.
+        args: Its arguments.
+        amend: Whether it is the body of an amendment, ``name.key = value``, which
+            calls what it amends.
+    """
+
     name: str
     name_span: Span
     args: tuple[Arg, ...]
-    amend: bool = False  # the body of `name.key = value`, which calls what it amends
+    amend: bool = False
 
 
 @dataclass(frozen=True)
@@ -304,11 +401,16 @@ class Alt(Expr):
 
     Unlabeled alternatives are an axis of their own. Labeled ones are an axis named by
     their labels, so alternatives elsewhere with the same labels are picked together.
+
+    Attributes:
+        options: The alternatives.
+        labels: One per option (``mha: a | mqa: b``), or none.
+        where: The definition and setting it is written in: ``"optimizer.lr"``.
     """
 
     options: tuple[Expr, ...]
-    labels: tuple[str, ...]  # one per option, or none
-    where: str  # the definition and setting it is written in: "optimizer.lr"
+    labels: tuple[str, ...]
+    where: str
 
 
 @dataclass(frozen=True)
@@ -322,15 +424,31 @@ class Attr(Expr):
 
 @dataclass(frozen=True)
 class Statement:
+    """A definition: ``name = expr``, a macro, a shared block or an amendment.
+
+    Attributes:
+        span: The whole statement.
+        name: What it defines.
+        name_span: Where `name` is.
+        params: A macro's parameters, ``f(a, b=1) = ...``; None for a plain
+            definition.
+        body: What it defines `name` as.
+        shared: Whether it starts with ``shared``: every use is one module.
+        defaults: A macro's parameters that have defaults, with them.
+        param_spans: Where each parameter is.
+        amends: Whether it is ``name.key = value``, whose body is an amending
+            `Call`.
+    """
+
     span: Span
     name: str
     name_span: Span
-    params: tuple[str, ...] | None  # None for plain definitions, a tuple for macros
+    params: tuple[str, ...] | None
     body: Expr
     shared: bool = False
     defaults: tuple[tuple[str, Expr], ...] = ()
     param_spans: tuple[Span, ...] = ()
-    amends: bool = False  # `name.key = value`: its body is an amending Call
+    amends: bool = False
 
 
 @dataclass(frozen=True)
@@ -677,8 +795,15 @@ class _Parser:
 
 @dataclass
 class Parsed:
-    """The result of parse_file: the definitions and the modules used. A recovering
-    parse adds the syntax errors and the names of definitions that failed to parse."""
+    """The result of `parse_file`: the definitions and the modules used.
+
+    Attributes:
+        statements: The definitions, in the order written.
+        uses: The ``use`` statements, in the order written.
+        errors: The syntax errors, from a recovering parse; else empty.
+        broken: The names of definitions that failed to parse, from a recovering
+            parse, so that their uses are not reported again.
+    """
 
     statements: list[Statement]
     uses: list[Use]
@@ -687,6 +812,26 @@ class Parsed:
 
 
 def parse(source: str) -> list[Statement]:
+    """Parse .bux source into its definitions, without evaluating anything.
+
+    The result is the syntax alone: names are not resolved and modules not loaded
+    (``use`` statements are left out; `parse_file` keeps them). `bux.lang.compile`
+    parses and compiles in one go.
+
+    Args:
+        source: The text of a ``.bux`` file.
+
+    Returns:
+        The file's statements, in the order written, with spans into `source`.
+
+    Raises:
+        BuxError: At the first syntax error.
+
+    Example::
+
+        [st.name for st in parse("a = rmsnorm\\nb = [a gqa(num_heads=2)]\\n")]
+        # ['a', 'b']
+    """
     return parse_file(source).statements
 
 
@@ -695,7 +840,8 @@ _HEADER = re.compile(r"(?:shared[ \t]+)?([A-Za-z_][A-Za-z0-9_]*)")
 
 
 def statement_start(source: str, offset: int) -> int:
-    """Return where the statement around `offset` starts, as parse_file recovers."""
+    """Return where the statement around `offset` starts, as `parse_file` recovers:
+    at the last line before it that begins in the first column."""
     return max(
         (m.start() for m in _STATEMENT_START.finditer(source, 0, offset)), default=0
     )
@@ -746,6 +892,11 @@ def _parse_each(source: str, start: int, stop: int, whole: BuxError) -> Parsed:
 
 
 def parse_recovering(source: str) -> tuple[list[Statement], list[BuxError], set[str]]:
-    """Parse as much as possible, for editors: see parse_file."""
+    """Parse as much as possible, for editors, as `parse_file` does with `recover`.
+
+    Returns:
+        The statements that parsed, the syntax errors, and the names of the
+        definitions that failed to parse.
+    """
     parsed = parse_file(source, recover=True)
     return parsed.statements, parsed.errors, parsed.broken

@@ -6,11 +6,15 @@ infer every layer's input width, check residuals and parallel branches for width
 agreement, simulate the tap stacks, and check that shared blocks are used consistently.
 
 A program can span files (``use``), and its alternatives (``a | b``) make it a sweep
-of several runs: evaluation takes one alternative of each, picked by ``choices``.
+of several runs: evaluation takes one alternative of each `Axis`.
 
-``compile`` stops at the first error. ``check`` is for editors: it recovers from
+`compile` stops at the first error. `check` is for editors: it recovers from
 syntax errors and reports every definition that fails, in every alternative.
-``compile_runs`` builds every run of a sweep, with its training settings.
+`compile_runs` builds every run of a sweep, with its training settings.
+
+The tables of names below (`TYPES`, `LAYERS`, `ACTIVATIONS`, ...) are what a
+``.bux`` file can call. They come from the config unions of `bux.config` and
+`bux.train.config`, so a config added to one is a name of the language at once.
 """
 
 import builtins
@@ -41,14 +45,33 @@ def _tags(union: object) -> dict[str, type[cfg.Config]]:
     }
 
 
+#: The layers' config classes, by the names a ``.bux`` file calls them
+#: (``gqa``, ``moe``, ...).
+#:
+#: :meta hide-value:
 LAYERS = _tags(cfg.LayerConfig)
+#: The training settings' config classes by name (``adamw``, ``wsd``, ``text``).
+#:
+#: :meta hide-value:
 TRAINING = _tags(tcfg.Setting)
+#: Every config class a ``.bux`` file can call by name, in one table.
+#:
+#: The layers, their parts (``rope``), the residual algebras and the training
+#: settings. The ``{bux}`` role of these docs links to any name in it.
+#:
+#: :meta hide-value:
 TYPES = LAYERS | _tags(cfg.SubConfig) | TRAINING
 _SOURCES = frozenset(t for t, cls in TRAINING.items() if issubclass(cls, tcfg.SOURCES))
+#: The activations, each a layer (``linear(features=h) gelu``) or a setting's value.
 ACTIVATIONS = frozenset(typing.get_args(cfg.Activation))
+#: The residual algebras that ``residual = ...`` takes, by name.
+#:
+#: :meta hide-value:
 RESIDUALS = _tags(cfg.ResidualConfig)
+#: The top-level settings of a model.
 SETTINGS = ("d_model", "vocab_size", "residual")
-# Top-level settings that make a file a run: data, optimizer, schedule, steps, ...
+#: The top-level settings that make a file a run, the fields of
+#: `bux.train.config.TrainConfig` (``data``, ``optimizer``, ``schedule``, ...).
 TRAIN_SETTINGS = tuple(tcfg.TrainConfig.model_fields)
 _RESERVED = (*SETTINGS, *TRAIN_SETTINGS, "model")
 _REQUIRED = tuple(
@@ -100,15 +123,30 @@ class _PortValue:
 @dataclass(frozen=True)
 class Axis:
     """One axis of a sweep: one ``a | b`` as written, or all the alternatives with the
-    same labels, which are picked together."""
+    same labels, which are picked together.
+
+    ``optimizer.lr = 1e-3 | 3e-3`` is an axis of its own. Labeled alternatives with
+    the same labels are one axis wherever they are written: with ``attn = mha: ... |
+    mqa: ...`` and ``optimizer.lr = mha: 1e-3 | mqa: 3e-3``, a run takes ``mha`` in
+    both places or ``mqa`` in both. `Report.axes` lists a file's axes.
+
+    Attributes:
+        key: The span of the ``a | b`` for an unlabeled axis, the set of its labels
+            for a labeled one.
+        where: The definition and setting of the first alternative met, which
+            names the runs of an unlabeled axis: ``"optimizer.lr"``.
+        options: The labels, or the alternatives as written: ``("1e-3", "3e-3")``.
+        span: Where the first alternative met is, in the joined source.
+    """
 
     key: Span | frozenset[str]
-    where: str  # the definition and setting of the first one met: "optimizer.lr"
-    options: tuple[str, ...]  # the labels, or the alternatives as written
-    span: Span  # of the first one met
+    where: str
+    options: tuple[str, ...]
+    span: Span
 
     @property
     def labeled(self) -> bool:
+        """Whether the alternatives have labels, and are picked by them."""
         return isinstance(self.key, frozenset)
 
     def pick(self, option: int) -> int | str:
@@ -1445,6 +1483,10 @@ def _check_positions(
                 )
 
 
+#: Where ``use`` finds modules.
+#:
+#: None for files on the search path (`bux.lang.modules.find`), a mapping of
+#: module names to their sources, or a `~bux.lang.modules.Loader`.
 Modules = Mapping[str, str] | modules.Loader | None
 
 
@@ -1475,12 +1517,42 @@ def compile(
     overrides: Sequence[str] = (),
     modules: Modules = None,
 ) -> ir.Architecture:
-    """Compile .bux source; `entry` names the definition to build (a whole model by default).
+    """Compile .bux source into the architecture of one definition.
 
-    `overrides` are statements from the command line, which redefine those of the file:
-    ``optimizer.lr=1e-3``. `modules` finds what ``use`` names: by default, files on the
-    search path; a mapping holds their sources by name. In a sweep, every alternative
-    takes its first option; ``compile_runs`` builds them all.
+    Every definition is evaluated, so a mistake in any of them raises, even in one
+    that `entry` does not use. In a sweep, every alternative takes its first option;
+    `compile_runs` builds them all. Training settings are evaluated but not returned:
+    a run's are in the `~bux.lang.ir.Run` that `compile_runs` returns.
+
+    Args:
+        source: The text of a ``.bux`` file.
+        entry: The definition to build: the whole model by default, or a block
+            (``entry="block"``), which then needs no ``embed`` or ``head``.
+        filename: Where `source` is from: errors name it, and ``use`` searches its
+            folder first.
+        overrides: Statements that redefine the file's own, as if written at its
+            end, as the command line gives them: ``"optimizer.lr=1e-3"``,
+            ``"steps = 2k"``, ``"use recipe"``.
+        modules: Where ``use`` finds modules (`Modules`): by default, files on the
+            search path; a mapping holds their sources by module name.
+
+    Returns:
+        The architecture of `entry`, with every layer's input width inferred.
+
+    Raises:
+        BuxError: At the first mistake: a syntax error, an unknown name, a setting
+            that a config rejects, widths that do not agree, ... It is attached to
+            the file it is in, and prints that line with a caret under the mistake.
+
+    Example::
+
+        arch = compile(
+            "d_model = 64\\n"
+            "vocab_size = 512\\n"
+            "block = [rmsnorm gqa(num_heads=4, num_kv_heads=2)]\\n"
+            "model = embed block^2 rmsnorm head\\n"
+        )
+        len(list(arch.layers()))  # 7: embed, 2 x (rmsnorm, gqa), rmsnorm, head
     """
     program = _load(source, filename, overrides, modules, recover=False)
     try:
@@ -1501,8 +1573,38 @@ def compile_runs(
     overrides: Sequence[str] = (),
     modules: Modules = None,
 ) -> list[ir.Run]:
-    """Compile every run of a file: one per combination of the alternatives it reaches,
-    the first written varying slowest. Arguments as for `compile`."""
+    """Compile every run of a file: one per combination of the alternatives it reaches.
+
+    Each combination compiles to its architecture and its training settings, the
+    first axis written varying slowest. Alternatives in definitions that the run does
+    not reach make no runs. A run is named for the file and the alternatives it took,
+    ``speedrun[mqa, optimizer.lr=0.01]``; a file without alternatives makes one run,
+    named for its stem: ``speedrun``.
+
+    Args:
+        source: The text of a ``.bux`` file that says how to train its model.
+        entry: The definition to train: ``model`` by default.
+        filename: Where `source` is from, as for `compile`. Runs are named for its
+            stem, or ``run`` for a name in angle brackets such as ``<string>``.
+        overrides: Statements that redefine the file's own, as for `compile`;
+            alternatives there (``"optimizer.lr = 0.01 | 0.03"``) make a sweep too.
+        modules: Where ``use`` finds modules, as for `compile`.
+
+    Returns:
+        The runs, in the order that ``bux plan`` lists them and ``--index`` counts.
+
+    Raises:
+        BuxError: At the first mistake in any run, or if the file sets only some of
+            ``data``, ``optimizer``, ``seq_len``, ``batch`` and ``steps``, or none
+            (a model, not a run).
+
+    Example::
+
+        # smoke.bux, with optimizer = adamw(lr=3e-3 | 1e-2)
+        runs = compile_runs(source, filename="smoke.bux")
+        [run.name for run in runs]
+        # ['smoke[optimizer.lr=3e-3]', 'smoke[optimizer.lr=1e-2]']
+    """
     program = _load(source, filename, overrides, modules, recover=False)
     runs: list[ir.Run] = []
 
@@ -1539,24 +1641,35 @@ def compile_runs(
 
 @dataclass
 class Report:
-    """The result of `check` on a source file."""
+    """The result of `check` on a source file: its errors, and what evaluated.
 
-    # The file's own statements, not those of the modules it uses.
+    Attributes:
+        statements: The file's own statements, not those of the modules it uses.
+        errors: Every error found, each attached to the file it is in, with a span
+            into that file. Empty if the file compiles.
+        arch: The architecture, only when there are no errors: then it equals what
+            `compile` returns. None also for a module, which defines no model.
+        values: The definitions that evaluated, by name: numbers, strings, lists,
+            configs or IR nodes.
+        run: The first run of the sweep, when the file is a run and has no errors.
+        axes: The sweep's axes, in the order written, when the file has a model and
+            no errors.
+        via: For every module, by its filename, the ``use`` in this file that
+            brought it in, perhaps through other modules.
+        source: Every file joined, this one first: the spans of all statements
+            index into it.
+        inherited: The definitions in effect that other files make, by name.
+        origin: The file that each of `inherited` is in, by name.
+    """
+
     statements: list[ast.Statement]
-    errors: list[BuxError]  # each attached to the file it is in, with a span into it
-    # Only when there are no errors; then it equals what compile() returns.
+    errors: list[BuxError]
     arch: ir.Architecture | None
-    # Definitions that evaluated, by name: numbers, strings, lists, configs or IR nodes.
     values: dict[str, object]
-    # The first run of the sweep, when the file is a run and has no errors.
     run: ir.Run | None = None
-    # The sweep's axes, in the order written, when the file has a model and no errors.
     axes: list[Axis] = field(default_factory=list)
-    # For every module, the `use` in this file that brought it in.
     via: dict[str, Span] = field(default_factory=dict)
-    # Every file joined, this one first: the spans of all statements index into it.
     source: str = ""
-    # The definitions in effect that other files make, by name, with their files.
     inherited: dict[str, ast.Statement] = field(default_factory=dict)
     origin: dict[str, str] = field(default_factory=dict)
 
@@ -1571,10 +1684,29 @@ def check(
 ) -> Report:
     """Compile like `compile`, but collect every error instead of raising the first.
 
-    Syntax errors lose only their own statement, each definition is checked on its
-    own, and an error is not repeated at every use of a broken definition. Every
-    alternative of a sweep is checked once, with the others at their first option.
-    A file without the entry and without d_model is a module of settings, and no error.
+    This is what editors and ``bux check`` call. Syntax errors lose only their own
+    statement, each definition is checked on its own, and an error is not repeated at
+    every use of a broken definition. Every alternative of a sweep is checked once,
+    with the others at their first option. A file without `entry` and without
+    ``d_model`` is a module of settings, and no error.
+
+    Args:
+        source: The text of a ``.bux`` file, perhaps half typed.
+        entry: The definition to build: ``model`` by default.
+        filename: Where `source` is from, as for `compile`.
+        overrides: Statements that redefine the file's own, as for `compile`.
+        modules: Where ``use`` finds modules, as for `compile`.
+
+    Returns:
+        The errors, and what evaluated. The architecture and the first run are
+        there only when there are no errors, the definitions' values always.
+
+    Example::
+
+        report = check("d_model = 64\\nmodel = embed nrom head\\n", filename="t.bux")
+        [error.message for error in report.errors]
+        # ["unknown layer or block 'nrom'"]
+        report.arch  # None
     """
     errors: list[BuxError] = []
 
@@ -1694,5 +1826,18 @@ def _public(value: object) -> object | None:
 
 
 def compile_file(path: str, *, entry: str = "model") -> ir.Architecture:
+    """Compile the .bux file at `path`, as `compile` compiles its text.
+
+    Args:
+        path: The file. Errors name it, and ``use`` searches its folder first.
+        entry: The definition to build: ``model`` by default.
+
+    Returns:
+        The architecture of `entry`.
+
+    Raises:
+        BuxError: At the first mistake in the file or in the modules it uses.
+        OSError: If the file cannot be read.
+    """
     with builtins.open(path, encoding="utf-8") as f:
         return compile(f.read(), entry=entry, filename=path)

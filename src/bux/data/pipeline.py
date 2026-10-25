@@ -1,18 +1,27 @@
 """The pipeline: a map and a reduce over Arrow record batches, which any MapReduce
-engine can run, and an engine that runs them on this machine's cores.
+engine can run, and an engine that runs them on this machine's cores::
 
     records ─map─▶ documents under random keys ─shuffle─▶ chunks ─reduce─▶ rows
 
-The map tokenizes records into documents (bux.data.documents). The shuffle groups
-them by the top bits of their keys into a power of two of chunks, each about
-`packing.chunk` tokens and a random sample. The reduce packs a chunk into rows
-(bux.data.packing). bux.data.spark runs the same two functions on Spark.
+The map (`Job.map`) tokenizes records into documents (`bux.data.documents`). The
+shuffle groups them by the top bits of their keys into a power of two of chunks
+(`Job.chunks`), each about ``packing.chunk`` tokens and a random sample. The reduce
+(`Job.reduce`) packs a chunk into rows (`bux.data.packing`). `bux.data.spark` runs
+the same two functions on Spark.
 
-A prepared dataset is a folder under a cache, named for a hash of the job:
+`prepare` runs them here, in one process per core. The map spills each task's
+documents, sorted by key, as raw arrays, about 5 bytes a token of scratch space
+next to the cache; each reduce finds its keys in every spill by bisection and maps
+in only its own documents, so that the shuffle reads every byte once.
 
-    data/packed/text-3f9a0c2e1b/
+A prepared dataset is a folder under a cache, named for a hash of the job::
+
+    data/packed/text-0c8c782640/
         part-00000.parquet ...   rows: input_ids, position_ids, loss_mask, seq_len each
         dataset.json             the job, its inputs, the parts and statistics; last
+
+The input files are not in the hash, so that a cache outlives them: delete a folder
+made from other files under the same glob by hand.
 """
 
 import contextlib
@@ -37,13 +46,37 @@ from bux.data import documents, packing
 from bux.data.tokenizer import load
 from bux.train import config as tcfg
 
-VERSION = 1  # of what a job makes from its documents; a new one prepares them again
+#: The version of what a job makes from its documents, in every dataset's hash.
+#:
+#: A new one prepares every dataset again.
+VERSION = 1
+#: Where prepared datasets go by default (``--cache``), relative to the working
+#: directory.
 DEFAULT_CACHE = Path("data/packed")
 
 
 @dataclass(frozen=True)
 class Job:
-    """What makes a dataset: documents, a tokenizer, a packing and a row length."""
+    """What makes a dataset: documents, a tokenizer, a packing and a row length.
+
+    A run reads one dataset a ``text`` or ``chat`` source (`jobs` lists them), and a
+    job's `name` hashes all of it, so two runs that read the same documents the
+    same way share one dataset, and a changed setting makes another. `map` and
+    `reduce` are the two halves of the MapReduce, for any engine to run; `prepare`
+    runs them here.
+
+    Attributes:
+        source: The documents, a ``text(...)`` or ``chat(...)`` source.
+        tokenizer: The run's tokenizer.
+        packing: The run's packing.
+        seq_len: The tokens of a row.
+
+    Example::
+
+        job = jobs(run.train)[0]
+        job.name  # 'text-0c8c782640'
+        folder = prepare(job, "data/packed")
+    """
 
     source: tcfg.TextConfig | tcfg.ChatConfig
     tokenizer: tcfg.TokenizerConfig
@@ -54,10 +87,12 @@ class Job:
     def of(
         cls, source: tcfg.TextConfig | tcfg.ChatConfig, config: tcfg.TrainConfig
     ) -> "Job":
+        """Return the job that makes `source`'s dataset for a run of `config`."""
         assert config.tokenizer is not None, "the compiler requires one for documents"
         return cls(source, config.tokenizer, config.packing, config.seq_len)
 
     def describe(self) -> dict:
+        """Return the job as JSON data, which `name` hashes and dataset.json keeps."""
         return {
             "version": VERSION,
             "source": self.source.model_dump(mode="json"),
@@ -68,16 +103,25 @@ class Job:
 
     @property
     def name(self) -> str:
+        """The name of the dataset's folder, the source's type and a hash of
+        `describe`, such as ``text-0c8c782640``."""
         blob = json.dumps(self.describe(), sort_keys=True, separators=(",", ":"))
         return f"{self.source.type}-{hashlib.sha256(blob.encode()).hexdigest()[:10]}"
 
     @property
     def group_rows(self) -> int:
-        """Return the rows per row group of the output: about a million tokens."""
+        """The rows a row group of the output holds, about a million tokens."""
         return max(1, 2**20 // self.seq_len)
 
     def map(self, records: Iterable[pa.RecordBatch]) -> Iterator[pa.RecordBatch]:
-        """Turn records into documents, one batch at a time, as Spark's mapInArrow."""
+        """Turn records into documents, one batch at a time, as Spark's mapInArrow.
+
+        Args:
+            records: Record batches with the source's column.
+
+        Returns:
+            The documents of each batch, in `bux.data.documents.SCHEMA`.
+        """
         tok = load(self.tokenizer)
         if isinstance(self.source, tcfg.TextConfig):
             return (documents.text(b, self.source, tok) for b in records)
@@ -91,8 +135,17 @@ class Job:
     def reduce(
         self, chunk: int, docs: pa.Table
     ) -> tuple[Iterator[pa.RecordBatch], Counter]:
-        """Pack a chunk's documents, in any order, into rows, one row group at a time;
-        also return statistics, complete once the rows are."""
+        """Pack a chunk's documents, in any order, into rows, one row group at a time.
+
+        Args:
+            chunk: The chunk's index, which seeds the order of its rows.
+            docs: Its documents, in `bux.data.documents.SCHEMA`.
+
+        Returns:
+            The rows, in record batches of `group_rows` in
+            `bux.data.packing.SCHEMA`, and the statistics, complete once every
+            batch is read.
+        """
         d = packing.Docs.of(docs, self.seq_len)
         plan = packing.plan(d, self.packing, self.seq_len, seed=chunk)
         rows = packing.materialize(
@@ -107,7 +160,15 @@ def shift(chunks: int) -> int:
 
 
 def jobs(config: tcfg.TrainConfig) -> list[Job]:
-    """Return the datasets a run reads, in training and evaluation, once each."""
+    """Return the datasets a run reads, in training and evaluation, once each.
+
+    Args:
+        config: The run's training settings, ``run.train``.
+
+    Returns:
+        A job for each ``text`` and ``chat`` source of ``data`` and ``eval``, mixes
+        included, in the order written; none for ``tokens`` or ``synthetic``.
+    """
     sources = tcfg.leaves(config.data)
     if config.eval:
         sources += tcfg.leaves(config.eval.data)
@@ -185,6 +246,8 @@ def _reduce(
 
 
 def summary(name: str, stats: Counter, seq_len: int, seconds: float) -> str:
+    """Return the line that `prepare` prints for a dataset: its documents, tokens and
+    rows, how full the rows are, the share of targets and the tokens cut."""
     rows = stats["rows"]
     cells = max(rows * seq_len, 1)
     return (
@@ -202,8 +265,35 @@ def prepare(
     workers: int | None = None,
     echo: Callable[[str], None] = print,
 ) -> Path:
-    """Return the folder of `job`'s dataset under `cache`, preparing it if missing
-    with `workers` processes (None: one per core; 0: this one)."""
+    """Return the folder of `job`'s dataset under `cache`, preparing it if missing.
+
+    This is ``bux prepare``, and what ``bux train`` and ``bux launch`` do first. A
+    folder with a dataset.json is done, and returned at once. Otherwise the map runs
+    a task about every 256 MiB of row groups of the files that the source's glob
+    matches, and the reduce a task a chunk, in a scratch folder under `cache`, which
+    becomes the dataset once dataset.json is written. Processes that prepare the
+    same job at once, as the tasks of an array job may, are safe: one wins, and the
+    others use its folder.
+
+    Args:
+        job: What to prepare: one of `jobs`.
+        cache: The folder of prepared datasets.
+        workers: Processes to run the tasks in: None for one per core, 0 for this
+            one alone.
+        echo: Where the summary line goes once the dataset is made.
+
+    Returns:
+        The dataset's folder, ``cache / job.name``.
+
+    Raises:
+        FileNotFoundError: If no file matches the source's path.
+
+    Example::
+
+        prepare(job)
+        # text-0c8c782640: 14,720,729 documents, 10,248,316,202 tokens -> 10,022,812
+        # rows of 1024, 99.9% filled, 99.7% targets, 0 tokens cut (175.2s)
+    """
     cache = Path(cache)
     folder = cache / job.name
     if (folder / "dataset.json").exists():

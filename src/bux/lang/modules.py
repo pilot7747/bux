@@ -1,15 +1,28 @@
 """Modules: finding what ``use`` names, and joining files into one program.
 
 A module is a .bux file, found by its name and never by a path: ``use llama3_8b``
-finds ``llama3_8b.bux``. The search looks in the folder of the file that uses it, then
-under every folder of the search path, subfolders included: the ``path`` list under
-``[tool.bux]`` in the nearest pyproject.toml, then ``BUX_PATH``. Folders organize
-files without becoming part of their names, so a name must be unique under each one.
+finds ``llama3_8b.bux``. The search (`find`) looks in the folder of the file that
+uses it, then under every folder of the search path, subfolders included:
 
-A program is the main file, the modules it uses (and the ones those use), and the
-command line's settings, as layers of definitions: modules first, in the order they
-are used, then the main file, then the command line. A layer's definitions take the
-place of the same names below it, everywhere, including inside the definitions below.
+1. the ``path`` list under ``[tool.bux]`` in the nearest pyproject.toml, relative
+   to the folder it is in;
+2. then the folders in ``BUX_PATH``, separated as in ``PATH`` (``:``, or ``;`` on
+   Windows).
+
+The first folder that has the module wins. Folders organize files without becoming
+part of their names, so a name must be unique under each one. Hidden folders,
+``__pycache__`` and ``node_modules`` are skipped. A pyproject.toml such as::
+
+    [tool.bux]
+    path = ["examples"]
+
+lets any file of the project ``use llama3_8b``, wherever it is under ``examples/``.
+
+A program (`load`) is the main file, the modules it uses (and the ones those use),
+and the command line's settings, as layers of definitions: modules first, in the
+order they are used, then the main file, then the command line. A layer's
+definitions take the place of the same names below it, everywhere, including inside
+the definitions below.
 """
 
 import difflib
@@ -23,10 +36,15 @@ from typing import cast
 from bux.lang import syntax as ast
 from bux.lang.syntax import BuxError, Span
 
+#: The filename of the command line's settings, as their errors show it.
 COMMAND_LINE = "<command line>"
 _SKIP = frozenset({"__pycache__", "node_modules"})
 
-# A module's source and filename, found by its name for the file that uses it.
+#: What finds a module, as ``loader(name, importer)``.
+#:
+#: It returns the source and filename of the module `name`, for the file
+#: `importer` that uses it, or raises a `~bux.lang.syntax.BuxError`. `find`
+#: searches files; `from_mapping` makes one over sources in memory.
 Loader = Callable[[str, str], tuple[str, str]]
 
 
@@ -76,7 +94,24 @@ def _check_name(name: str) -> None:
 
 
 def find(name: str, importer: str) -> tuple[str, str]:
-    """Return the source and filename of the module `name`: the default Loader."""
+    """Return the source and filename of the module `name`: the default `Loader`.
+
+    It searches the folder of `importer`, then the search path, as the module's
+    description says.
+
+    Args:
+        name: The module, as ``use`` names it: ``llama3_8b``, never a path.
+        importer: The filename of the file that uses it. A name in angle brackets,
+            such as ``<string>``, searches the working directory first.
+
+    Returns:
+        The module's text, and its path. The path is relative to the working
+        directory if it is under it, else absolute.
+
+    Raises:
+        BuxError: If no folder has the module (with a hint of a close name), or one
+            has two files of that name.
+    """
     known: list[str] = []
     for root, recursive in _roots(importer):
         modules = _modules(root, recursive)
@@ -105,7 +140,18 @@ def find(name: str, importer: str) -> tuple[str, str]:
 
 
 def from_mapping(modules: Mapping[str, str]) -> Loader:
-    """Return a Loader over sources held in memory, by module name."""
+    """Return a `Loader` over sources held in memory, by module name.
+
+    `bux.lang.compile` and the others make one of a mapping given as `modules`, so
+    a test or a notebook can ``use`` modules that are not files.
+
+    Args:
+        modules: Each module's source, by its name: ``{"lib": "norm = rmsnorm"}``.
+
+    Returns:
+        A loader that names each module's file ``<name>.bux``, and raises a
+        `~bux.lang.syntax.BuxError` for a name the mapping does not hold.
+    """
 
     def find_in(name: str, importer: str) -> tuple[str, str]:
         if name not in modules:
@@ -121,31 +167,51 @@ def from_mapping(modules: Mapping[str, str]) -> Loader:
 
 @dataclass(frozen=True)
 class Unit:
-    """One file of a program, at offset `start` of the joined source."""
+    """One file of a program, at offset `start` of the joined source.
+
+    Attributes:
+        filename: The file's name, as errors show it.
+        text: Its source.
+        start: Where it starts in `Program.source`.
+        via: The ``use`` in the main file that brought it in, perhaps through other
+            modules; None for the main file.
+    """
 
     filename: str
     text: str
     start: int
-    # The `use` in the main file that brought it in, perhaps through other modules.
     via: Span | None = None
 
 
 @dataclass
 class Program:
-    """Every file of a program, parsed, with the definitions in layers."""
+    """Every file of a program, parsed, with the definitions in layers.
 
-    # The files joined, the main one first, so that offsets into it are its own.
+    Attributes:
+        source: The files joined, the main one first, so that offsets into it are
+            the main file's own.
+        units: The files, the main one first, in the order they were loaded.
+        layers: The definitions, a list a layer, the lowest first: each module's,
+            then its amendments, then the main file's, then the command line's.
+        main: The main file's own statements.
+        uses: The main file's ``use`` statements.
+        errors: The errors, from a recovering load; else empty.
+        broken: The names of definitions that failed to parse.
+        incomplete: Whether a module could not be found or parsed, so that names it
+            might define are not errors.
+    """
+
     source: str
     units: list[Unit]
-    layers: list[list[ast.Statement]]  # the lowest first
-    main: list[ast.Statement]  # the main file's own statements
-    uses: list[ast.Use]  # the main file's
+    layers: list[list[ast.Statement]]
+    main: list[ast.Statement]
+    uses: list[ast.Use]
     errors: list[BuxError] = field(default_factory=list)
     broken: set[str] = field(default_factory=set)
-    # A module could not be found or parsed, so names it might define are not errors.
     incomplete: bool = False
 
     def unit(self, offset: int) -> Unit:
+        """Return the file that `offset` into `source` is in."""
         return next(u for u in reversed(self.units) if u.start <= offset)
 
     def locate(self, err: BuxError) -> BuxError:
@@ -185,10 +251,25 @@ def load(
     loader: Loader | None = None,
     recover: bool = False,
 ) -> Program:
-    """Parse a file, the modules it uses and command-line settings into a Program.
+    """Parse a file, the modules it uses and command-line settings into a `Program`.
 
-    Without `recover` the first error raises, located. With it, errors are collected
-    in ``Program.errors`` and what parses is kept, as ``check`` needs.
+    Each module is loaded once, however many files use it. Modules that the command
+    line uses (``"use recipe"``) go between the file and the command line's settings.
+
+    Args:
+        source: The main file's text.
+        filename: Its name: modules are searched for from its folder.
+        overrides: The command line's statements, which redefine the file's own.
+        loader: What finds a module: `find` by default.
+        recover: Collect errors in `Program.errors` and keep what parses, as
+            `bux.lang.check` needs, instead of raising the first.
+
+    Returns:
+        The program, with nothing evaluated yet.
+
+    Raises:
+        BuxError: Without `recover`, at the first syntax error, missing module or
+            cycle of modules that use each other, attached to its file.
     """
     linker = _Linker(source, filename, loader or find, recover)
     program = linker.program

@@ -1,9 +1,13 @@
 """Diagnostics, completion and hover for .bux source.
 
 Pure functions of the source text, so they work without an editor;
-``bux.lang.lsp.server`` only converts positions. Offsets index into the source string.
-Every call checks the file again with ``bux.lang.check``, which takes milliseconds for
-a model file.
+`bux.lang.lsp.server` only converts positions. Offsets index into the source string.
+Every call checks the file again with `bux.lang.check`, which takes milliseconds for
+a model file::
+
+    source = "d_model = 64\\nattn = gqa("
+    [c.label for c in complete(source, len(source))][:3]
+    # ['num_heads', 'num_kv_heads', 'head_dim']: gqa's settings, required first
 """
 
 import itertools
@@ -24,6 +28,8 @@ from bux.lang.syntax import Span
 
 @dataclass(frozen=True)
 class Diagnostic:
+    """An error in the file, at ``source[start:end]``, with its hint in `message`."""
+
     start: int
     end: int
     message: str
@@ -31,24 +37,52 @@ class Diagnostic:
 
 @dataclass(frozen=True)
 class Completion:
+    """One item that completion offers.
+
+    Attributes:
+        label: The name offered.
+        kind: What it is: ``setting``, ``value``, ``layer``, ``config``,
+            ``activation``, ``definition``, ``macro``, ``parameter``, ``tap`` or
+            ``keyword``.
+        detail: One line beside it: a setting's type and default, a definition's
+            value.
+        documentation: Markdown that the editor shows for it.
+        insert_text: What to insert, where it differs from `label`: ``num_heads=``.
+        sort: Editors order items by this, then by label: what fits first.
+    """
+
     label: str
-    # setting, value, layer, config, activation, definition, macro, parameter, tap, keyword
     kind: str
     detail: str = ""
     documentation: str = ""
     insert_text: str | None = None
-    sort: str = "1"  # editors order items by this, then by label
+    sort: str = "1"
 
 
 @dataclass(frozen=True)
 class Hover:
+    """What hovering shows: `markdown` on the name at ``source[start:end]``."""
+
     start: int
     end: int
     markdown: str
 
 
 def diagnostics(source: str, path: str | None = None) -> list[Diagnostic]:
-    """Return the errors in the file at `path`. Those in modules show at the `use`."""
+    """Return the errors in the file at `path`, as `bux.lang.check` finds them.
+
+    An error in a module the file uses shows at the ``use`` that brought it in, its
+    message prefixed with the module's file and line.
+
+    Args:
+        source: The file's text, as the editor has it, perhaps not saved.
+        path: Where the file is, which ``use`` searches from; None for a file not
+            saved yet.
+
+    Returns:
+        One diagnostic an error, with the hint after the message on a line of its
+        own.
+    """
     filename = path or "<string>"
     report = check(source, filename=filename)
     out = []
@@ -242,6 +276,29 @@ def _expr_class(
 
 
 def hover(source: str, offset: int, path: str | None = None) -> Hover | None:
+    """Return what to show on hovering at `offset`, if anything.
+
+    A layer or a setting's config shows its documentation and settings
+    (`bux.lang.reference.type_doc`); a setting's key its type, default and note; a
+    definition what it is written as, what it evaluates to and which module defines
+    it; a tap where it is written and read; and a bare name in a setting whether it
+    is a reference or a string.
+
+    Args:
+        source: The file's text.
+        offset: Where the pointer is, an index into `source`.
+        path: Where the file is, as for `diagnostics`.
+
+    Returns:
+        The Markdown and the span of the innermost name at `offset`, or None where
+        there is nothing to say.
+
+    Example::
+
+        source = "d_model = 64\\nnorm = rmsnorm(eps=1e-5)\\n"
+        hover(source, source.index("rmsnorm")).markdown.splitlines()[0]
+        # '**rmsnorm** — layer'
+    """
     ix = _Index(source, path)
     best: tuple[Span, tuple] | None = None
     for span, what in _occurrences(ix):
@@ -349,6 +406,23 @@ class _Open:
 
 
 def complete(source: str, offset: int, path: str | None = None) -> list[Completion]:
+    """Return what can be typed at `offset`, best first.
+
+    Inside a call, the settings of the config it calls, through definitions too
+    (``local = attn(`` offers ``gqa``'s) and dotted keys (``rope.``); after ``=``, the
+    values the setting's type allows, then definitions; a macro's parameters; after
+    ``name.``, the config's fields with their values; tap names after ``@`` and
+    ``$``; one-letter definitions inside a pattern; elsewhere, every name in scope,
+    layer and activation. Nothing on a new statement's name or in a comment.
+
+    Args:
+        source: The file's text, perhaps half typed.
+        offset: Where the cursor is, an index into `source`.
+        path: Where the file is, as for `diagnostics`.
+
+    Returns:
+        The items; editors order them by `Completion.sort`, then by label.
+    """
     before = source[:offset]
     word = _WORD.search(before)
     start = word.start() if word else offset

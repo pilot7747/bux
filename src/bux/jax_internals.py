@@ -2,10 +2,24 @@
 jax-triton's: the only module that imports or touches them.
 
 Each entry says what bux uses it for and what breaks if it changes. They held on
-the versions of `VERIFIED_ON`, and tests/test_jax_internals.py fails on any other:
-it checks each entry by what bux relies on, on a CPU, and on a GPU those that need
-one. After an upgrade, run it (on a GPU node too) and scripts/gpu_smoke/*.py, fix
-here what fails, and set `VERIFIED_ON` to the new versions.
+the versions of `VERIFIED_ON`, and ``tests/test_jax_internals.py`` fails on any
+other: it checks each entry by what bux relies on, on a CPU, and on a GPU those that
+need one. After an upgrade, run it (on a GPU node too) and ``scripts/gpu_smoke/*.py``,
+fix here what fails, and set `VERIFIED_ON` to the new versions.
+
+The entries, by what uses them:
+
+- Jaxprs (`calls_a_jaxpr`, `scan_body`, `bind`, ...): `bux.parallel.split` takes a
+  backward apart by them, and `bux.train.flops` counts them.
+- A vjp rebuilt from its residuals (`rebuild_vjp`): `bux.parallel.scheduled` keeps
+  them a microbatch apart.
+- Kernels: cuDNN's attention and scaled matmuls, XLA's buffers and streams for
+  custom calls (`buffer_callback`, `on_stream`), jax-triton's and Pallas's
+  lowering, and tokamax's flash attention.
+- jax.distributed's processes (`processes`, `key_value_store`): `bux.runtime`,
+  before anything starts a backend.
+- XLA's scheduled HLO (`hlo_module`, `key_compiles_by`): `bux.passes` and
+  `bux.train.reorder`, which changes a step's schedule.
 """
 
 from collections.abc import Callable, Iterator, Sequence
@@ -23,7 +37,7 @@ from jax.experimental.xla_metadata import xla_metadata_call2
 from jax.extend import core
 from jaxtyping import Array, Float, Int, Shaped
 
-# The packages whose internals below were checked, at these versions.
+#: The packages whose internals below were checked, at these versions.
 VERIFIED_ON = {
     "jax": "0.12.0",
     "jaxlib": "0.12.0",
@@ -39,8 +53,10 @@ VERIFIED_ON = {
 # fails loudly where it is read; a primitive renamed only stops matching, which
 # split.py and flops.py would miss in silence.
 
-Primitive = core.Primitive  # what a remat policy is called with, by each equation
-CALLS = frozenset({"jit", "remat2"})  # the primitives of jax.jit and jax.checkpoint
+#: What a remat policy is called with, by each equation.
+Primitive = core.Primitive
+#: The primitives of jax.jit and jax.checkpoint, which call a jaxpr.
+CALLS = frozenset({"jit", "remat2"})
 
 
 def calls_a_jaxpr(eqn: core.JaxprEqn) -> bool:
@@ -471,6 +487,7 @@ def key_value_store() -> Any:
 # operands(), users(), control_predecessors() and async_wrapped_root(). A method
 # renamed fails as the pass runs, which then leaves XLA's schedule as it was.
 
+#: jaxlib's enum of HLO opcodes, which an instruction's ``opcode`` is.
 Opcode = hlo.HloOpcode
 
 

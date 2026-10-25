@@ -1,11 +1,24 @@
-"""bux check|plan|prepare|train|launch|render|fmt|json FILE [SETTING=VALUE ...] [--entry NAME]
+"""The ``bux`` command line: check, plan, prepare, train and print .bux files.
+
+Usage::
+
+    bux COMMAND FILE [SETTING=VALUE ...] [--entry NAME] [options]
+
+    check     the model's layers, the run's training and the sweep's axes
+    plan      a line a run: parameters, tokens, FLOPs a token, GPUs, bytes a GPU
+    prepare   tokenize and pack the documents the runs read
+    train     train the runs in this process, one after another
+    launch    train what is left of the runs, a sweep's side by side on the GPUs
+    render    draw the model as a circuit of the residual stream
+    fmt       print the file back, a run at a time, with nothing left to resolve
+    json      print the runs' IR (or the model's) as JSON
 
 Settings after the file override the file's own, as if written at its end:
 ``bux train speedrun.bux optimizer.lr=0.03 'steps = 2k'``. Alternatives there make a
 sweep, as in a file: ``'optimizer.lr = 0.01 | 0.03'``.
 
 ``bux train`` trains the runs in this process, one after another. ``bux launch`` is
-the entrypoint for production (``bux.launch``): it trains each run of a sweep on the
+the entrypoint for production (`bux.launch`): it trains each run of a sweep on the
 GPUs its mesh needs, or a run alone on many hosts, records what each run did, trains
 again only what is not done, and stops at SIGTERM with a checkpoint. ``bux plan``
 shows what each run takes: its FLOPs a token, its GPUs, and its bytes on each.
@@ -44,6 +57,8 @@ def _bytes(n: int | None) -> str:
 
 
 def summary(arch: Architecture) -> str:
+    """Return what ``bux check`` says of a model: its settings and its layers, counted
+    by type, the most common first."""
     counts = Counter(layer.config.type for layer in arch.layers())
     head = (
         f"d_model={arch.d_model} vocab_size={arch.vocab_size} layers={counts.total()}"
@@ -54,6 +69,8 @@ def summary(arch: Architecture) -> str:
 
 
 def training(run: Run) -> str:
+    """Return what ``bux check`` says of a run's training: its steps and tokens, its
+    optimizer, schedule and data, and its tokenizer and packing if it has them."""
     t = run.train
     tokens = t.steps * t.batch * t.seq_len
     return (
@@ -364,6 +381,18 @@ def _run(
 
 
 def main(argv: list[str] | None = None) -> int:
+    """Run the command line, ``bux``, and return its exit code.
+
+    The file is checked first, with every error printed to stderr (exit 1). A file
+    with no model is a module: it says what it defines, and exits 0.
+
+    Args:
+        argv: The arguments after ``bux``; None for ``sys.argv[1:]``.
+
+    Returns:
+        0 when it succeeds, 1 on errors; ``bux launch`` returns its own (see
+        `bux.launch.launch`).
+    """
     cli = parser()
     args = cli.parse_args(argv)
     for setting in args.settings:
