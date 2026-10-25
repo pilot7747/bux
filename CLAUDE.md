@@ -41,35 +41,8 @@ its documentation is, in the same commit:
 - **Configs document themselves.** Every config in `bux/config.py` and
   `bux/train/config.py` has a docstring, and every field a comment above or beside
   it: they generate the language reference and the editor's hover
-  (`bux.lang.reference`). A new field without a comment is undocumented everywhere.
-- **Docstrings are the API reference.** Google style (`Args:`, `Returns:`,
-  `Raises:`) for what users call or extend, one accurate line for helpers; valid
-  reStructuredText (``code``, `name` links, `::` before a code block). A function
-  registered under a name says what that entry does in its first paragraph: it is
-  its row in the registries' reference.
-- **Never edit generated output** (`docs/_generated/`,
-  `docs/reference/python/generated/`): change the code it comes from.
-- **Measurements** go to `docs/performance/` or the page of what was measured, with
-  the hardware, setup and date.
-- **`make docs` passes**: it fails on any warning, such as a link to a heading that
-  was renamed or a docstring that no longer renders. CI runs it.
-
-## Documentation
-
-The docs are a Sphinx site in `docs/` (MyST Markdown, published on Read the Docs);
-`docs/development/index.md` is the guide to writing them. A change is not done until
-its documentation is, in the same commit:
-
-- **Find the page.** The table in `docs/development/index.md` ("Keeping the docs in
-  sync") maps each part of the code to its pages: `docs/language/` for the language,
-  `docs/architectures/` for layers, `docs/training/`, `docs/data/`,
-  `docs/parallelism/` (a page per method), `docs/performance/` (kernels, tuning,
-  benchmarks), `docs/reference/` (CLI, environment variables), `docs/tutorials/`.
-  Update what your change makes wrong, and add what it makes new.
-- **Configs document themselves.** Every config in `bux/config.py` and
-  `bux/train/config.py` has a docstring, and every field a comment above or beside
-  it: they generate the language reference and the editor's hover
-  (`bux.lang.reference`). A new field without a comment is undocumented everywhere.
+  (`bux.lang.reference`). A new field without a comment is undocumented everywhere,
+  and `tests/test_docs.py` fails.
 - **Docstrings are the API reference.** Google style (`Args:`, `Returns:`,
   `Raises:`) for what users call or extend, one accurate line for helpers; valid
   reStructuredText (``code``, `name` links, `::` before a code block). A function
