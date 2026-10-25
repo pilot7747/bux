@@ -1,0 +1,22 @@
+# gpt-oss-120b on eight nodes of 8 GPUs, as Megatron-Bridge's performance summary
+# benchmarks it (26.06: 18,534 tokens a second a GPU on 64 B300s, MXFP8, EP=8, a global
+# batch of 1280 rows of 4096 in microbatches of 4 rows a GPU). The experts are split
+# over a node's GPUs and their shards over the nodes, and routed by random logits as
+# Megatron's are. They go to their GPUs by NCCL EP, or by an all-to-all.
+#
+#   python scripts/benchmark.py run examples/benchmarks/megatron_gpt_oss.bux --out new.json   # on each host
+use gpt_oss_120b
+
+experts.random_logits = true
+
+mesh    = mesh(fsdp=8, expert=8)
+methods = nccl_ep:    methods(moe=nccl_ep, capacity=1.25, microbatches=5)
+        | all_to_all: methods(moe=all_to_all, capacity=1.25, microbatches=5)
+
+data      = synthetic
+optimizer = adamw(lr=3e-4)
+seq_len   = 4096
+batch     = 1280
+steps     = 12
+log       = log(every=3)
+precision = precision(compute=bfloat16, matmuls=mxfp8)

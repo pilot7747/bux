@@ -1,0 +1,26 @@
+# Nemotron 3 Super 120B-A12B on eight nodes of 8 GPUs, as Megatron-Bridge's performance
+# summary benchmarks it (26.06 on 64 B300s, EP=8, a global batch of 512 rows of 8192 in
+# microbatches of a row a GPU: 7,867 tokens a second a GPU in MXFP8, 8,131 in NVFP4).
+# The experts are split over a node's GPUs and their shards over the nodes, sent there
+# by NCCL EP and routed by random logits, as Megatron's are. The MTP module stays in
+# bfloat16. In NVFP4, attention, the latent projections and the last 14 layers do too,
+# and Mamba's output projection is in MXFP8 (Megatron's te_quant.cfg).
+#
+#   python scripts/benchmark.py run examples/benchmarks/megatron_super.bux --out new.json   # on each host
+use nemotron_3_super_120b_a12b
+
+experts.random_logits = true
+
+mesh    = mesh(fsdp=8, expert=8)
+methods = methods(moe=nccl_ep, capacity=1.25, microbatches=8)
+
+data      = synthetic
+optimizer = adamw(lr=3e-4)
+seq_len   = 8192
+batch     = 512
+steps     = 12
+log       = log(every=3)
+precision = mxfp8: precision(compute=bfloat16, matmuls=mxfp8, roles=roles(mtp=compute))
+          | nvfp4: precision(compute=bfloat16, matmuls=nvfp4, last=14,
+                             roles=roles(q=compute, kv=compute, o=compute, latent=compute,
+                                         recurrence_out=mxfp8, mtp=compute))
