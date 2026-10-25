@@ -427,7 +427,7 @@ def probabilities(
         cap: the logits' tanh soft cap; None for none.
 
     Returns:
-        The probabilities, (b, t, s): 0 for slots outside the span or that do not
+        The probabilities, (b, t, s), 0 for slots outside the span or that do not
         exist.
     """
     t, s, d = q.shape[1], part.k.shape[1], part.k.shape[-1]

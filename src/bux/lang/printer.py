@@ -316,7 +316,7 @@ def value_to_source(value: object) -> str:
             list or tuple of them.
 
     Returns:
-        The value as a ``.bux`` file writes it: ``1e-05``, ``swish``, ``none``,
+        The value as a ``.bux`` file writes it, such as ``1e-05``, ``swish``, ``none``,
         ``rope()``, ``[1, 2]``.
 
     Raises:

@@ -10,7 +10,7 @@ cuDNN's graph of it on XLA's stream (`_graph_call`).
 A decay per key channel (KDA) runs by Frost's KDA kernel, through cudnn-frontend's
 own JAX call. It factors each decay through the start of a tile of 16 positions, so it
 loses precision where a tile decays a channel by exp(-86), and overflows at exp(-90):
-it runs a gate bounded at -5 (`gate_lower_bound`, Kimi K3), and no other. Within 12
+it runs a gate bounded at -5 or above (`gate_lower_bound`, Kimi K3; `FLOOR`). Within 12
 steps of bux's start, KDA's unbounded gates are that steep in 30 to 90% of the (row,
 head) pairs of most layers: those run by bux's own kernels (``pallas_delta``).
 
@@ -42,7 +42,8 @@ except ImportError:
 
 DIMS = (64, 128)  # the head dims the kernels take
 SM = ("10.0", "10.3")  # the GPUs they run on: B200, B300
-FLOOR = -5.0  # the least log decay a channel may have, for KDA's kernel to run
+#: The least log decay a channel may have, a gate's lower bound, for KDA's kernel to run.
+FLOOR = -5.0
 # Documents a row of 4096 tokens may hold for the kernels: an empty sequence costs as
 # much as 10 tokens, so cu_seqlens has room for this many, and more go by `otherwise`.
 DOCS = 32
@@ -78,8 +79,11 @@ def delta_rule(
     docs: Segments | None,
     otherwise: Rule,
 ) -> Float[Array, "b t h dv"]:
-    """Run `linear_attention.delta_rule` by a kernel, in v's dtype, where `runs`; by
-    `otherwise` for rows of more documents than cu_seqlens holds."""
+    """Run `linear_attention.delta_rule` by cuDNN's kernel, in v's dtype.
+
+    Call it where `runs` says the kernel takes the layer. Rows with more documents
+    than the kernel's cu_seqlens holds, and positions split over devices, run by
+    `otherwise` instead."""
     docs = docs or Segments.of(jnp.broadcast_to(jnp.arange(q.shape[1]), q.shape[:2]))
     xs = (q, k, v, log_decay, beta, *docs)
     rule = functools.partial(_rows, otherwise)

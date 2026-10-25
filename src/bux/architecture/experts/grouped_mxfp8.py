@@ -124,7 +124,7 @@ def rows(
     starts: Int[Array, " g"] | None = None,
     height: int | None = None,
 ) -> Float[Array, "r n"]:
-    """Return ``a b[g]^T`` for each group g's rows of a.
+    """Return ``a @ b[g]^T`` for each group g's rows of a.
 
     Args:
         a: the rows, (m, k): the first ``sizes[0]`` group 0's, and so on.
@@ -138,7 +138,7 @@ def rows(
             without `starts`; None for m.
 
     Returns:
-        The products, (height, n): the rows past the groups as 0.
+        The products, (height, n), with the rows past the groups as 0.
     """
     (m, k), (groups, n, _) = a.values.shape, b.values.shape
     packed = jnp.cumsum(sizes) - sizes

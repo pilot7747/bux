@@ -261,7 +261,7 @@ class Indexer(nnx.Module):
                 index in the row.
 
         Returns:
-            The keys, ``head_dim`` wide: as projected if the indexer pools them in
+            The keys, ``head_dim`` wide, as projected if the indexer pools them in
             blocks, else normalized and rotated.
         """
         assert self.k is not None and self.k_norm is not None

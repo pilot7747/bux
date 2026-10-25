@@ -208,7 +208,7 @@ def probabilities(
         cap: the logits' tanh soft cap; None for none.
 
     Returns:
-        The probabilities, (b, t, s) in float32: 0 for a key outside the query's
+        The probabilities, (b, t, s) in float32, 0 for a key outside the query's
         span. They pass no gradient.
     """
     q, k, lse = jax.lax.stop_gradient((q, k, lse))

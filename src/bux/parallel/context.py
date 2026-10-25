@@ -290,7 +290,7 @@ def masked_rows(
     args: AttentionArgs,
 ) -> Float[Array, "b t h dv"]:
     """Attend with whole rows of documents, or within a window, by the fastest kernel
-    that takes the call: cuDNN's in rows of `CUDNN_ROWS` or more and with a window,
+    that takes the call: cuDNN's in rows of `CUDNN_ROWS` or more or with a window,
     else tokamax's (a soft cap, sinks), else cuDNN's; in float32, tokamax's Triton
     kernel, or `xla` with sinks."""
     cudnn = flash.cudnn_takes(q, k, v, args.softcap, args.sinks)

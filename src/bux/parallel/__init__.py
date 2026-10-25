@@ -34,9 +34,13 @@ explains them.
 
 Example::
 
+    from flax import nnx
+
     from bux import parallel
+    from bux.architecture import Model
     from bux.train.config import MeshConfig
 
+    # run: a compiled run, e.g. bux.lang.compile_runs(source)[0]
     with parallel.use(MeshConfig(fsdp=8)):
         model = parallel.build(lambda: Model(run.arch, rngs=nnx.Rngs(0)))
 """

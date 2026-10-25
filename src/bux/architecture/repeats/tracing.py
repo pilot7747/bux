@@ -3,8 +3,8 @@ which pass of a repeat. Precision asks the first, to keep the model's first and 
 branches in compute (``matmuls.format_of``), and remat the second, to rematerialize a
 repeat's first passes alone (``remat.policy``)::
 
-    with tracing.forward(main):                    # a model's forward (``Model``)
-        with tracing.branch():                     # a branch (``graph.run_branch``)
+    with tracing.forward(main):                    # a model's forward (Model)
+        with tracing.branch():                     # a branch (graph.run_branch)
             ...
         for run in tracing.runs(times, cuts):      # a repeat's passes, in runs
             with tracing.passes(run, each):        # each run traced once
