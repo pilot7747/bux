@@ -1,7 +1,7 @@
 """What a model's forward is tracing now: which residual branch outside any other, and
 which pass of a repeat. Precision asks the first, to keep the model's first and last
 branches in compute (``matmuls.format_of``), and remat the second, to rematerialize a
-repeat's first passes alone (``remat.policy``).
+repeat's first passes alone (``remat.policy``)::
 
     with tracing.forward(main):                    # a model's forward (``Model``)
         with tracing.branch():                     # a branch (``graph.run_branch``)
@@ -32,8 +32,8 @@ class Branch(NamedTuple):
     """A residual branch outside any other: its number in a forward, and the forward's
     `main` branches, those before its first head."""
 
-    number: int
-    main: int
+    number: int  #: Its number among the forward's branches outside any other.
+    main: int  #: How many of them run before the forward's first head.
 
 
 @dataclasses.dataclass

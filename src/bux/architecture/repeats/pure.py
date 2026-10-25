@@ -20,13 +20,14 @@ class Changes(NamedTuple):
     """What a call changed of the taps: every head's output, once one ran; the
     single-pass read, once a branch set it; and the stacks it pushed to or popped."""
 
-    heads: list[HeadOutput] | None
-    pending_read: Float[Array, "b t n"] | None
-    stacks: dict[str, list]
+    heads: list[HeadOutput] | None  #: Every head's output, or None if none ran.
+    pending_read: Float[Array, "b t n"] | None  #: The single-pass read, or None.
+    stacks: dict[str, list]  #: The stacks it pushed to or popped, by tap name.
 
 
 NOTHING = Changes(None, None, {})
-# A ``Pure`` call, or one as a scan makes it (``stacked.scanned_pass``).
+#: A `Pure` call, or one as a scan makes it
+#: (`~bux.architecture.repeats.stacked.scanned_pass`).
 Call = Callable[
     [nnx.State, Stream, Changes],
     tuple[Stream, nnx.State, Changes, list[Float[Array, ""]]],

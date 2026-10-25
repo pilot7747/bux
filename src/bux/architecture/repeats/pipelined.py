@@ -1,15 +1,16 @@
 """Run a scanned repeat's layers as a pipeline over the mesh's stages.
 
-With `mesh.stage` above 1, the longest scanned repeat outside any other splits its
-stacked layers over `stage` (``Scanned.pipe``), and ``run`` runs them by the run's
-pipeline method (bux.parallel.pipeline). A stage gets the stream and the rows' tokens
-and documents, split into microbatches with it, and nothing else: a pass that reads a
-tap from before the repeat, or leaves one changed for after it, is an error.
+With ``mesh.stage`` above 1, the longest scanned repeat outside any other splits its
+stacked layers over ``stage`` (`Scanned.pipe
+<bux.architecture.repeats.repeat.Scanned.pipe>`), and `run` runs them by the run's
+pipeline method (`bux.parallel.pipeline`). A stage gets the stream and the rows'
+tokens and documents, split into microbatches with it, and nothing else: a pass that
+reads a tap from before the repeat, or leaves one changed for after it, is an error.
 
 A pipeline that schedules its own backward runs the rest of the model a microbatch at
 a time, the part before the repeat on the first stage and the part after it on the
-last. Both are the model's own forward, cut at the repeat: ``stream_into`` runs it up
-to the repeat and returns the stream there, and under ``leaving`` the repeat gives
+last. Both are the model's own forward, cut at the repeat: `stream_into` runs it up
+to the repeat and returns the stream there, and under `leaving` the repeat gives
 back a stream it is handed, without running its layers.
 """
 
@@ -34,8 +35,8 @@ from bux.parallel import pipeline
 class Rows(NamedTuple):
     """What a pipeline splits into microbatches with the stream."""
 
-    segments: Segments | None
-    tokens: Int[Array, "b t"] | None
+    segments: Segments | None  #: The documents in the rows, or None.
+    tokens: Int[Array, "b t"] | None  #: The rows' input tokens, or None.
 
 
 class _Reached(Exception):
@@ -54,7 +55,14 @@ _CUT = contextvars.ContextVar[tuple[Stream | None] | None](
 
 def stream_into(forward: Callable[[], object]) -> Stream:
     """Run `forward`, a model's, up to its pipelined repeat, and return the stream
-    that enters the repeat."""
+    that enters the repeat.
+
+    Args:
+        forward: A call of the model's forward, with no arguments.
+
+    Raises:
+        ValueError: The forward has no pipelined repeat.
+    """
     token = _CUT.set((None,))
     try:
         forward()
@@ -95,9 +103,25 @@ def run(
     compute: DTypeLike | None = None,
 ) -> Stream:
     """Run `layers`, stacked by round, by the run's pipeline method: each stage runs its
-    share of a round's `passes` on one microbatch at a time (``Stage``), each pass cast
+    share of a round's `passes` on one microbatch at a time (`Stage`), each pass cast
     to `compute`, if given. The losses they report go into `taps`, each the mean over
-    microbatches. Cut there (``stream_into``, ``leaving``), it runs none of them."""
+    microbatches. Cut there (`stream_into`, `leaving`), it runs none of them.
+
+    Args:
+        layers: One pass, its variables stacked by stage (and by round).
+        passes: The passes of a round.
+        rounds: The rounds the pipeline takes them in.
+        x: The stream that enters the repeat.
+        taps: The forward pass's taps.
+        compute: The dtype each pass casts its parameters to, or None.
+
+    Returns:
+        The stream that leaves the repeat.
+
+    Raises:
+        ValueError: A pass reads a tap from before the repeat, or leaves one
+            changed for after it.
+    """
     graphdef, params, rest = nnx.split(layers, nnx.Param, ...)
     leading = 1 if rounds == 1 else 2  # (layers, ...), or (rounds, layers, ...)
     one = pipeline.stand_ins(nnx.merge_state(params, rest), leading)

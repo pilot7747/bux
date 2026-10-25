@@ -34,6 +34,14 @@ def run(
     or the second where the first starts a tap, as single-pass mhc's first branch
     starts its read. If neither is, as when every pass pushes to a tap, the layers
     run one at a time.
+
+    Args:
+        graphdef: The graph of one layer.
+        state: The layers' variables, stacked along a leading dimension.
+        times: The layers.
+        x: The stream.
+        taps: The forward pass's taps.
+        compute: The dtype each layer casts its parameters to, or None.
     """
     done: list[nnx.State] = []
     for i in range(times):
