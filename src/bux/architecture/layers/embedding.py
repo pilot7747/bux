@@ -15,8 +15,7 @@ from bux.architecture.registry import Context, Taps, positions, register
 from bux.architecture.residual import widen, widening
 from bux.lang import ir
 
-#: How a table of embeddings starts, as `flax.nnx.Embed`'s do: normal, of variance
-#: 1 / d.
+# How a table of embeddings starts, as nnx.Embed's do: normal, of variance 1 / d.
 EMBED = nnx.initializers.variance_scaling(1.0, "fan_in", "normal", out_axis=0)
 
 

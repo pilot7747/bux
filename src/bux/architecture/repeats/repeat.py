@@ -36,8 +36,8 @@ from bux.parallel.layout import LAYERS, NAMES
 
 @methods.repeat.register("unroll")
 def unroll(body: ir.Node, times: int, ctx: Context) -> nnx.Module:
-    """``methods.repeat = unroll``: build one module per pass, run in a row, each
-    traced and compiled on its own.
+    """Build one module per pass, run in a row, each traced and compiled on its own:
+    ``methods(repeat=unroll)``.
 
     Args:
         body: The repeat's body, the f of ``f^n``.
@@ -52,9 +52,9 @@ def unroll(body: ir.Node, times: int, ctx: Context) -> nnx.Module:
 
 @methods.repeat.register("scan")
 def scan(body: ir.Node, times: int, ctx: Context) -> nnx.Module:
-    """``methods.repeat = scan``: build the passes as ``unroll`` does, and stack them
-    into one `Scanned` module, run by `jax.lax.scan`, if they can be (`scannable`);
-    otherwise run them in a row.
+    """Build the passes as ``unroll`` does, and stack them into one `Scanned` module,
+    run by `jax.lax.scan`, if they can be (`scannable`); otherwise run them in a row:
+    ``methods(repeat=scan)``.
 
     Args:
         body: The repeat's body, the f of ``f^n``.

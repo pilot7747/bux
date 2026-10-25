@@ -61,8 +61,8 @@ from bux.parallel.recurrence import Chunk, Positions, Recurrence, Shared, Transi
 
 @methods.recurrence.register("scan")
 def scan(r: Recurrence) -> Float[Array, "b t h dv"]:
-    """``methods.recurrence = scan``, the default: run every position as one chunk.
-    With ``seq`` over ``context``, XLA gathers them all onto every device."""
+    """Run every position as one chunk, the default of ``methods.recurrence``. With
+    ``seq`` over ``context``, XLA gathers them all onto every device."""
     return r.chunk(r.xs, r.shared, False).out
 
 

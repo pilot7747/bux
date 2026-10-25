@@ -165,8 +165,8 @@ class HeadOutput(NamedTuple):
 def by_logits(
     head: HeadOutput, targets: Int[Array, "b t"], weights: Float[Array, "b t"], z: bool
 ) -> Sums:
-    """``methods.loss = logits``: sum the scores of the head's logits made whole, in
-    the stream's dtype, as a term that reads them makes them."""
+    """Sum the scores of the head's logits made whole, in the stream's dtype, as a
+    term that reads them makes them: ``methods(loss=logits)``."""
     return Scores.of(head.logits(), targets).sums(weights, z)
 
 
@@ -174,9 +174,9 @@ def by_logits(
 def by_chunks(
     head: HeadOutput, targets: Int[Array, "b t"], weights: Float[Array, "b t"], z: bool
 ) -> Sums:
-    """``methods.loss = chunks``, the default: sum the scores of a chunk of each
-    device's positions at a time, in float32, their gradients made with them, so that
-    the logits are never whole."""
+    """Sum the scores of a chunk of each device's positions at a time, in float32,
+    their gradients made with them, so that the logits are never whole: the default
+    of ``methods.loss``."""
     return _sums(head.projection, head.hidden, targets, weights, z)
 
 
