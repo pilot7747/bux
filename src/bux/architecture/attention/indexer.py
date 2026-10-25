@@ -5,12 +5,13 @@ Keys sit in slots along a row, in order, and `order` says which key of its docum
 each slot holds (-1 for a slot with none, as between compressed latents). Blocks of
 keys are counted from a document's first key, so none spans two documents.
 
-It ranks a chunk of queries at a time (``sparse.chunked``), so that no t by t floats
-are made, on a GPU by ``scoring``'s kernel; it keeps each query's top-k by index
-(``sparse.Kept``), named `attention.index` for a remat policy to keep, and its loss
-scores the kept keys again: on a GPU by ``scoring``'s kernels, which gather each
-query's up to its last, and its backward pass adds their gradients into the keys
-atomically.
+`Indexer` ranks a chunk of queries at a time
+(`~bux.architecture.attention.sparse.chunked`), so that no t by t floats are made: on
+a GPU by `~bux.architecture.attention.scoring`'s kernel. It keeps each query's top-k
+by index (`~bux.architecture.attention.sparse.Kept`), named ``attention.index`` for a
+remat policy to keep. Its loss scores the kept keys again: on a GPU by
+`~bux.architecture.attention.scoring`'s kernels, which gather each query's up to its
+last, and whose backward pass adds their gradients into the keys atomically.
 """
 
 from collections.abc import Callable
@@ -36,15 +37,20 @@ _STREAM_KEY_NORM = cfg.NormalizationConfig(type="layernorm", bias=True)
 
 
 class Scored(NamedTuple):
-    """What the indexer kept by its scores, for its loss to score again: its inputs,
-    the keys it scored (a block's at the block's index), and what it kept of them,
-    by index (-1 for none), with `block` (which block each key is in) blocks."""
+    """What the indexer kept by its scores, for its loss (`Indexer.loss`) to score
+    again."""
 
+    #: The layer's input, from which the indexer weighs its heads.
     x: Float[Array, "b t d"]
+    #: What the indexer projects its queries from.
     query: Float[Array, "b t e"]
+    #: Each query's position in its document.
     pos: Int[Array, "b t"]
+    #: The keys it scored; with `block`, a block's at the block's index.
     keys: Float[Array, "b s i"]
+    #: What each query kept of them, by index; -1 for none.
     kept: Int[Array, "b t k"]
+    #: Which block each key is in, if it kept blocks; else None.
     block: Int[Array, "b s"] | None = None
 
 
@@ -167,24 +173,40 @@ def _positions(
 
 
 class Indexer(nnx.Module):
-    """The lightning indexer of DeepSeek sparse attention (DSA, DeepSeek-V3.2): a small
-    attention with `num_heads` query heads and one key per slot, which scores every key
-    a query may attend to by sum_j w_j ReLU(q_j . k_s) and keeps the `top_k` best. The
-    weights w_j come from the input when it is `weighted`; else the heads are summed.
-    Its keep mask passes no gradient and its inputs are detached, so only `loss`
-    trains it, and that loss trains nothing else.
+    """The lightning indexer of DeepSeek sparse attention (DSA, DeepSeek-V3.2): it
+    picks the keys each query of a sparse attention layer attends to.
 
-    With block_size > 1 it scores blocks of keys and keeps whole ones (Qwen3.8 QSA): a
-    block's key is the mean of its keys as projected, normalized, then rotated to the
-    position of its first. A query scores the blocks it may attend to all of, and also
-    keeps the keys of its own unfinished block. It can export a candidate pool of
-    coarse blocks, and keep keys only inside one it imports (DeepSeek-V4.1).
+    A small attention with ``num_heads`` query heads and one key per slot, it scores
+    every key a query may attend to by ``sum_j w_j ReLU(q_j . k_s)`` and keeps the
+    ``top_k`` best. The weights ``w_j`` come from the input when it is ``weighted``;
+    else the heads are summed. Its keep mask passes no gradient and its inputs are
+    detached, so only `loss` trains it, and that loss trains nothing else.
 
-    `config.norm`, if set, normalizes each query head, and the keys instead of
+    With ``block_size > 1`` it scores blocks of keys and keeps whole ones (Qwen3.8
+    QSA): a block's key is the mean of its keys as projected, normalized, then rotated
+    to the position of its first. A query scores the blocks it may attend to all of,
+    and also keeps the keys of its own unfinished block. It can export a candidate
+    pool of coarse blocks, and keep keys only inside one it imports (DeepSeek-V4.1).
+
+    ``config.norm``, if set, normalizes each query head, and the keys instead of
     `key_norm`.
 
-    Its query heads split over `heads`, as the layer's do; its keys, a single head, are
-    every device's.
+    Its query heads split over ``heads``, as the layer's do; its keys, a single head,
+    are every device's.
+
+    Args:
+        config: the indexer's settings.
+        width: the width d of the layer's input, from which it weighs its heads.
+        query_width: the width of what it projects its queries from: the layer's
+            input, or its query latent.
+        key_width: the width of what it projects its keys from (`keys`); None when
+            it takes its keys from another layer, as CSA's compressed latents.
+        key_norm: the keys' norm, unless ``config.norm`` sets one.
+        rope: the RoPE settings of its queries and keys; None for none.
+        rope_dims: how many of their first dims RoPE rotates.
+        rngs: draws the initial parameters.
+        query: the name of its queries' input dimension (`bux.parallel`):
+            ``embed``, or ``latent`` for a query latent.
     """
 
     def __init__(
@@ -199,10 +221,6 @@ class Indexer(nnx.Module):
         rngs: nnx.Rngs,
         query: parallel.Name = "embed",
     ):
-        """Project queries from `query_width` wide inputs, whose dimension is `query`
-        (``bux.parallel``), and keys from `key_width` wide ones, or take keys from
-        another layer when it is None. `rope` rotates the first `rope_dims` dims of
-        both."""
         h, i = config.num_heads, config.head_dim
         self.heads, self.head_dim = h, i
         self.top_k, self.block_size = config.top_k, config.block_size
@@ -234,8 +252,18 @@ class Indexer(nnx.Module):
     def keys(
         self, source: Float[Array, "b s e"], pos: Int[Array, "b s"] | None
     ) -> Float[Array, "b s i"]:
-        """Project the indexer's keys, one per slot, from `source`: left as projected if
-        it pools them in blocks, else normalized and rotated."""
+        """Project the indexer's keys, one per slot, from `source`.
+
+        Args:
+            source: what the keys are projected from, ``key_width`` wide: the layer's
+                input, or CSA's compressed latents. It passes no gradient.
+            pos: each slot's position, which RoPE rotates its key by; None for its
+                index in the row.
+
+        Returns:
+            The keys, ``head_dim`` wide: as projected if the indexer pools them in
+            blocks, else normalized and rotated.
+        """
         assert self.k is not None and self.k_norm is not None
         k = self.k(jax.lax.stop_gradient(source))
         if self.block_size > 1:
@@ -249,7 +277,18 @@ class Indexer(nnx.Module):
         pos: Int[Array, "b t"] | None,
         keys: Float[Array, "b s i"],
     ) -> Float[Array, "b t s"]:
-        """Return every query's score for every key."""
+        """Return every query's score for every key, ``sum_j w_j ReLU(q_j . k_s)``, by
+        XLA: a t by s intermediate of every head.
+
+        Args:
+            x: the layer's input, from which the head weights come.
+            query: what the queries are projected from.
+            pos: each query's position; None for its index in the row.
+            keys: the keys, from `keys`.
+
+        Returns:
+            The scores, (b, t, s). They pass no gradient to `x` or `query`.
+        """
         x, query = jax.lax.stop_gradient((x, query))
         q, w = self._queries(query, pos), self._head_weights(x)
         with flops.over_keys():
@@ -327,9 +366,25 @@ class Indexer(nnx.Module):
         candidates: Kept | None = None,
         export_candidates: bool = False,
     ) -> tuple[Kept, Kept | None, Scored]:
-        """Return the keys each query keeps, of those of its `span` and the
-        `candidates` (if given); the candidate pool, if asked for; and what it
-        scored."""
+        """Pick the keys each query keeps: its top-k of those it may attend to.
+
+        Args:
+            x: the layer's input, b rows of t queries, d wide.
+            query: what the queries are projected from.
+            pos: each query's position in its document; None for its index in the
+                row.
+            keys: the keys, one a slot, from `keys`.
+            span: the slots each query may attend to.
+            order: which key of its document each slot holds; -1 for none.
+            candidates: a candidate pool another layer exported, which the kept keys
+                must lie inside; None for none.
+            export_candidates: whether to return a candidate pool of this indexer's.
+
+        Returns:
+            The keys each query keeps, by index (with ``block_size > 1``, whole
+            blocks); the candidate pool, if asked for, else None; and what it scored,
+            for `loss`.
+        """
         x, query = jax.lax.stop_gradient((x, query))
         pos = _positions(pos, x)
         if self.block_size > 1:
@@ -360,12 +415,26 @@ class Indexer(nnx.Module):
     def loss(
         self, scored: Scored, target: Target, xs: Any, width: int
     ) -> Float[Array, ""]:
-        """Return KL(p || softmax(I)) over what the indexer kept, averaged over the
-        queries (DeepSeek-V3.2, eq. 4): I its scores, and p the attention summed over
-        heads and normalized over the kept keys, which `target` gives for a chunk of
-        `xs` (arrays of (b, t, ...)), `width` elements a query. A block's p is its most
-        attended key's (Qwen3.8 QSA, eqs. 17 and 20). It scores each chunk of
-        queries' kept keys again, and so does its backward pass; p it takes once."""
+        """Return the indexer's loss: ``KL(p || softmax(I))`` over what it kept,
+        averaged over the queries (DeepSeek-V3.2, eq. 4).
+
+        I is the indexer's scores, and p the attention summed over heads and
+        normalized over the kept keys. A block's p is its most attended key's (Qwen3.8
+        QSA, eqs. 17 and 20). It scores each chunk of queries' kept keys again, and so
+        does its backward pass; p it takes once.
+
+        Args:
+            scored: what the indexer kept, from its call.
+            target: gives a chunk of queries' attention to the keys, from that
+                chunk of `xs`; it passes no gradient.
+            xs: what `target` takes, arrays of (b, t, ...) split into chunks of
+                queries.
+            width: the elements a query makes of `target`'s output, which sets the
+                chunks.
+
+        Returns:
+            The loss, a scalar, which trains only the indexer's parameters.
+        """
 
         def kept_target(both: tuple) -> Float[Array, "b c k"]:
             (*_, kept), xs = both
@@ -489,9 +558,24 @@ def from_stream(
     rngs: nnx.Rngs,
     query: parallel.Name = "embed",
 ) -> Indexer:
-    """Make DeepSeek-V3.2's indexer, for keys that are the tokens: its keys are
-    projected from the layer's input and layer-normalized (unless `config.norm` is
-    set), and rotated in the indexer's rope_layout whatever the layer's."""
+    """Make DeepSeek-V3.2's indexer, for keys that are the tokens.
+
+    Its keys are projected from the layer's input and layer-normalized (unless
+    ``config.norm`` is set), and rotated in the indexer's ``rope_layout`` whatever the
+    layer's.
+
+    Args:
+        config: the indexer's settings.
+        width: the width d of the layer's input.
+        query_width: the width of what it projects its queries from.
+        rope: the layer's RoPE settings; None for none.
+        rope_dims: how many of the queries' and keys' first dims RoPE rotates.
+        rngs: draws the initial parameters.
+        query: the name of its queries' input dimension, as `Indexer` takes it.
+
+    Returns:
+        The `Indexer`.
+    """
     if rope is not None:
         rope = rope.model_copy(update={"layout": config.rope_layout})
     return Indexer(
