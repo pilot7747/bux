@@ -50,11 +50,17 @@ def registries() -> list[Registry]:
     return [*found, data.sources, matmuls.formats]
 
 
+def from_tests(builder: object) -> bool:
+    """Whether a test registered `builder`, as test_repeat does a method of its own."""
+    module = getattr(builder, "__module__", "") or ""
+    return module.startswith(("test_", "tests.", "conftest"))
+
+
 def test_every_registered_builder_says_what_it_does():
     missing = [
         f"{registry.kind}: {name}"
         for registry in registries()
         for name, builder in registry.builders.items()
-        if not (name in registry.docs or inspect.getdoc(builder))
+        if not (name in registry.docs or inspect.getdoc(builder) or from_tests(builder))
     ]
     assert not missing, f"registered without a docstring: {missing}"
