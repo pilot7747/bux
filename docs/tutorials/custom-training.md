@@ -282,4 +282,5 @@ notebook's folder, so either start JupyterLab from the checkout's root, or give
 | the loop's blocks    | `Trainer(model, tx, objective).fit(batches, steps, hooks, sinks)` |
 
 [Extending the trainer](../training/extending.md) documents every block, and the
-[Python API](../reference/python/index.md) every function used here.
+[Python API](../reference/python/index.md) every function used here. Next,
+[scale out](scale-out.md) splits a run over many devices.

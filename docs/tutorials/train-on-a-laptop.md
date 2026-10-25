@@ -170,14 +170,14 @@ eval:  [(100, 6.276), (200, 6.2553)]
 ```
 
 `run.bux` is the run as one self-contained file, with no modules and no
-alternatives, which `bux train` takes as it is, and `run.json` is its IR. `checkpoints/` keeps the latest two saves
-(`checkpoint(keep=2)`, the default) as orbax checkpoints of the model's and the
-optimizer's state.
+alternatives, which `bux train` takes as it is, and `run.json` is its IR.
+`checkpoints/` keeps the latest two saves (`checkpoint(keep=2)`, the default) as orbax
+checkpoints of the model's and the optimizer's state.
 
-The id, `d48dd7d011`, is a hash of what the run computes. `log`, `eval` and
-`checkpoint` are not part of it, so changing how often the run logs, evaluates or
+The id, `d48dd7d011`, is a hash of what the run computes. `log`, `eval`, `checkpoint`
+and `profile` are not part of it, so changing how often the run logs, evaluates or
 saves keeps the id and the directory; changing `steps`, the model or the optimizer
-makes a new one.
+makes a new one ([Run ids](../training/running.md#run-ids)).
 
 ## 5. Train it again
 

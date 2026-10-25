@@ -102,12 +102,15 @@ scalars reach the sinks as one write of their own, at the step it ran.
 
 **Read later.** What a hook returns goes to the sinks once the next step is launched.
 A hook that only reads the step's metrics returns a function that gives its scalars,
-a {py:data}`~bux.train.hooks.Later`, which the loop calls then. The log does, so that
-reading a loss waits for its step as the next one runs, not the GPU for the host to
-launch that one. The log also computes its learning rate as it runs, on the GPU behind
-its step: one computed as it was read queued behind the next step, and reading it
-waited for that one too, which left the GPU nothing to run as the host launched the
-one after.
+a {py:data}`~bux.train.hooks.Later`, and the loop calls it then. The log works this
+way:
+
+- Reading a loss waits for its step, but by then the next step is running, so the GPU
+  never waits for the host to launch it.
+- The log computes its learning rate when it runs, on the GPU, right behind its step.
+  Computed when it was read instead, it would queue behind the next step, and reading
+  it would wait for that step too, which left the GPU nothing to run while the host
+  launched the one after.
 
 **Stopping.** When training stops early, because something set `trainer.stopping`, as
 the launcher does at SIGTERM, every hook's `stop` runs, and the checkpoint hook saves
@@ -215,16 +218,20 @@ head's whole, by either method. `Model.outputs` returns every head's logits at o
 
 | Method | How |
 |--------|-----|
-| `chunks` | the matmul, the logsumexp and the target's logit of at most 2 GiB of float32 logits at once, and their gradients by the kernel and the stream with them, the kernel's added up in float32: the backward only scales those. The default |
+| `chunks` | the default: the matmul, the logsumexp and the target's logit of at most 2 GiB of float32 logits at once, with their gradients by the kernel and by the stream. The kernel's gradients add up in float32, and the backward only scales them |
 | `logits` | one matmul for every position, the logits whole in `compute` |
 
 At a vocabulary of 128K, the float32 logits of 8 rows of 4096 tokens take 16 GB, and
-their gradient as much again. A sum over positions is linear in each position's term,
-so its gradient is known in the forward but for one factor, its cotangent, which the
-backward multiplies in. By chunks, a head multiplies by its vocabulary three times, as
-by whole logits, and keeps the gradients from the forward to the backward in
-`compute`, the kernel's and the stream's. Each sum keeps its own, so a z-loss costs a
-second matmul by the kernel and one by the stream.
+their gradient as much again. `chunks` never makes them all:
+
+- A sum over positions is linear in each position's term, so its gradient is known in
+  the forward pass but for one factor, its cotangent, which the backward multiplies
+  in.
+- So each chunk computes its gradients by the kernel and by the stream in the forward
+  pass, and keeps them for the backward in `compute`. A head still multiplies by its
+  vocabulary three times, as with whole logits.
+- Each sum keeps gradients of its own, so a z-loss costs a second matmul by the kernel
+  and one by the stream.
 
 Another method is a function of a head's output, the targets, their weights and
 whether to sum log Z squared, that returns their `Sums`
@@ -326,15 +333,17 @@ below them and split what they left free, and the next step's no longer fit.
 
 ## The host between steps
 
-Between two steps the host does little. A training step takes the model's and the
-optimizer's arrays as a list, of variables the trainer split once from their graph
-(`_Split` in `bux/train/trainer.py`), where `nnx.jit` walked the graph at every call,
-from it to its arrays and back: 20 ms a step of the 1.3B, 70 of Qwen3-30B-A3B, on a
-B300 node's host. The list takes 18 ms of the 30B's, most of it Python freeing the
-arrays of the step before.
+Between two steps the host does little:
 
-That is time the GPU waits for, where XLA's launch of a step returns only when the GPU
-is nearly through it, its queue of kernels full:
+- A training step takes the model's and the optimizer's arrays as a list of variables,
+  which the trainer split from their graph once (`_Split` in `bux/train/trainer.py`).
+- `nnx.jit`, which it replaced, walked the graph at every call, from it to its arrays
+  and back: 20 ms a step of the 1.3B, 70 ms of Qwen3-30B-A3B, on a B300 node's host.
+- The list takes 18 ms of the 30B's, most of it Python freeing the arrays of the step
+  before.
+
+The host's time matters because XLA's launch of a step returns only when the GPU is
+nearly through it, its queue of kernels full, and the GPU then waits for the host:
 
 - Qwen3-30B-A3B's step, of thousands of kernels and collectives, returns 100 to 170 ms
   before its step ends, and the host then has that long to launch the next.
@@ -344,8 +353,8 @@ is nearly through it, its queue of kernels full:
 
 Python's cycle collector, which walked what `nnx.jit`'s walks made, no longer stops
 the host for a full collection a few steps in (340 ms on the 1.3B, 980 on the 30B).
-The GPU now waits for the host only after a step the host waits for, at an eval or a
-checkpoint.
+The GPU now waits for the host only after a step the host waits for: at an eval, a
+checkpoint, or the start and the stop of a trace. A logged loss makes no step wait.
 
 ### Measurements
 

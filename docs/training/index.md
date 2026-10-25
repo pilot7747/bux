@@ -171,6 +171,13 @@ bfloat16, MXFP8 and NVFP4: which projections, which branches, which GEMMs.
 
 Hooks, sinks, registries, objective terms, and a `Trainer` in a script.
 :::
+
+:::{grid-item-card} Design notes
+:link: design
+:link-type: doc
+
+Why a run is a `.bux` file, and the config systems considered instead.
+:::
 ::::
 
 ```{toctree}

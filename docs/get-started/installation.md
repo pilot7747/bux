@@ -129,8 +129,8 @@ docker run --rm --entrypoint bux bux check examples/architectures/gpt2.bux  # th
 ```
 
 The launcher is the container's first process, so the SIGTERM that stops a container
-reaches it: it saves a checkpoint of the step it is at and exits
-([Launching](../training/launching.md)).
+reaches it: it finishes the step it is at, saves it if the run has a `checkpoint`
+setting, and exits ([Signals](../training/launching.md#signals)).
 
 | build argument | default  | what it picks                                        |
 |----------------|----------|------------------------------------------------------|

@@ -308,4 +308,5 @@ bux launch examples/experiments/sft.bux
 | `best_fit(long=drop)`                      | drop what does not fit a row, pack the rest   |
 
 [Sources](../data/sources.md) documents `chat` and `text` in full, and
-[Packing](../data/packing.md) the packings.
+[Packing](../data/packing.md) the packings. Next, [add a layer](add-a-layer.md) of
+your own to bux.

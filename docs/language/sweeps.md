@@ -4,7 +4,8 @@
 This page covers alternatives, `a | b`, which turn a file into a sweep of several
 runs: where they can go, how they form a grid, how runs are named, how labels zip
 axes together, which alternatives count, and how `bux check` and the editor treat
-them. For running a sweep, see [Running](../training/running.md).
+them. To train a sweep, see [Running](../training/running.md) (one run after another)
+and [Launching](../training/launching.md) (side by side on GPUs).
 
 ## Example: three attentions at two learning rates
 
@@ -35,13 +36,15 @@ attention_ablation[mqa, optimizer.lr=1e-3]
 attention_ablation[mqa, optimizer.lr=3e-3]
 ```
 
-`bux check` sums the sweep up in its last line, and `bux plan` lists every run with
-its id, size and budget:
+`bux check` sums the sweep up in its last line:
 
 ```console
 $ bux check examples/experiments/attention_ablation.bux | tail -1
 sweep: 6 runs over attn.num_kv_heads (mha | gqa | mqa) × optimizer.lr (1e-3 | 3e-3)
 ```
+
+`bux plan` lists every run with its id, size and budget
+([A sweep](../training/index.md#a-sweep) shows this one's).
 
 ## Alternatives anywhere
 

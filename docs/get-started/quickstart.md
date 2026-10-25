@@ -166,8 +166,9 @@ f5babdd0aa  156k    25.6k   0.2        984k       1     609KiB      1.19MiB    0
 Each run is named for what it took, and its directory is its name and its id.
 `smoke[optimizer.lr=3e-3]` computes what the file alone does, so it has the same id,
 `f114ac17ae`. The columns are each run's parameters, tokens, tokens a
-parameter, model FLOPs a token, GPUs, and the bytes of its parameters and of its
-optimizer's state on each GPU.
+parameter, model FLOPs a token, GPUs, the bytes of its parameters and of its
+optimizer's state on each GPU, and the share of a step a pipeline's stages idle
+(`bubble`).
 
 `bux train` trains a sweep's runs one after another; `bux launch` trains them side by
 side, a GPU each, and picks up where it stopped when launched again
