@@ -88,7 +88,7 @@ class DyTConfig(Config):
 class PositionInterpolationConfig(Config):
     """Linear RoPE interpolation (Chen et al., 2023): every rotary frequency divided by
     `factor`, so that `factor` times as many positions turn through the angles the
-    model trained on. A RoPE scaling: ``rope(scaling=pi(factor=4))``."""
+    model trained on. A RoPE scaling: ``rope(scaling=pi(factor=8))`` (Gemma 3)."""
 
     type: Literal["pi"] = "pi"
     factor: float  # How many times longer the context gets: frequencies over it.
