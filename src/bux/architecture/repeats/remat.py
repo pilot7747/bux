@@ -1,32 +1,35 @@
-"""Rematerialization: `methods.remat`, what the forward pass keeps for the backward
-one, which computes the rest again; and the calls it applies to.
+"""Rematerialization: ``methods.remat``, what the forward pass keeps for the backward
+one, which computes the rest again; and the calls it applies to::
 
     methods = methods(remat=remat(save=[attention, mlp], first=8))
 
 A policy keeps what it names in `save`, moves what it names in `offload` to the host's
 memory until the backward reads it, and computes everything else again
-(``keeping``). Each residual branch outside any other is rematerialized as a unit
-(``rematted``), and so is each scanned pass; nothing inside either is again. With
+(`keeping`). Each residual branch outside any other is rematerialized as a unit
+(`rematted`), and so is each scanned pass; nothing inside either is again. With
 `first`, only the first passes of each repeat are, and the rest keep everything
-(``tracing.current_pass``). A policy is also a name in `methods.remat`
-(``PRESETS``): `none` keeps everything, but in a scanned pass, which keeps all but
-what elementwise ops make (``unfused``). `auto` is the first of ``CANDIDATES``, the
-fastest first, whose training step fits in the device's memory (bux.train.fitting).
+(`~bux.architecture.repeats.tracing.current_pass`). A policy is also a name in
+``methods.remat`` (`PRESETS`): ``none`` keeps everything, but in a scanned pass,
+which keeps all but what elementwise ops make (`unfused`). ``auto`` is the first of
+`CANDIDATES`, the fastest first, whose training step fits in the device's memory
+(`bux.train.fitting`).
 
 Layers name what is worth keeping (``checkpoint_name``):
 
-    attention.in    softmax attention's q, k and v, as its kernel takes them (``named``)
-    attention.out   its output, and what else its backward takes: the log-sum-exp
-    attention.index the keys sparse attention's indexer kept for each query
-    recurrence.in   a recurrent mixer's inputs, as its kernel takes them
-    recurrence.out  its output, and what else its backward takes: the chunks' states
-    qkv             attention's projections, MLA's latents
-    mlp             an MLP's up and gate projections
-    experts         an MoE's grouped products
+- ``attention.in``: softmax attention's q, k and v, as its kernel takes them
+  (`named`);
+- ``attention.out``: its output, and what else its backward takes: the log-sum-exp;
+- ``attention.index``: the keys sparse attention's indexer kept for each query;
+- ``recurrence.in``: a recurrent mixer's inputs, as its kernel takes them;
+- ``recurrence.out``: its output, and what else its backward takes: the chunks'
+  states;
+- ``qkv``: attention's projections, MLA's latents;
+- ``mlp``: an MLP's up and gate projections;
+- ``experts``: an MoE's grouped products.
 
-A name covers those under it: `attention` is all three of attention's. `dots` names
-every product of matrices, the experts' too, and `dots_no_batch` those without batch
-dimensions.
+A name covers those under it: ``attention`` is all three of attention's. ``dots``
+names every product of matrices, the experts' too, and ``dots_no_batch`` those
+without batch dimensions.
 """
 
 import contextlib
@@ -99,10 +102,29 @@ def keeping(save: tuple[str, ...] = (), offload: tuple[str, ...] = ()) -> Policy
             return OFFLOAD
         return _covers(save, prim, args, params)
 
+    policy.__doc__ = _described(save, offload)  # the registries' page reads it
     return policy
 
 
+def _described(save: tuple[str, ...], offload: tuple[str, ...]) -> str:
+    """Return what a policy of `keeping` keeps, in words."""
+
+    def names(found: tuple[str, ...]) -> str:
+        return ", ".join(f"`{n}`" for n in dict.fromkeys(found))
+
+    parts = [f"keep {names(save)}"] if save else []
+    parts += [f"move {names(offload)} to the host's memory"] if offload else []
+    if not parts:
+        return "Keep nothing for the backward pass: it computes everything again."
+    text = " and ".join(parts) + " for the backward pass, and compute the rest again."
+    return text[0].upper() + text[1:]
+
+
 MIXERS = ("attention", "recurrence")  # what the *_attention presets keep
+#: The named policies of ``methods.remat`` besides ``none`` and ``auto``, each a
+#: `~bux.train.config.RematConfig`: ``full`` keeps nothing, ``dots`` the products of
+#: matrices, and the ``*_attention`` presets keep (or offload) the token mixers'
+#: inputs and outputs, with more.
 PRESETS = {
     "full": RematConfig(),
     "dots": RematConfig(save=("dots",)),
@@ -116,7 +138,8 @@ methods.remat.register("none")(jax.checkpoint_policies.everything_saveable)
 for _name, _preset in PRESETS.items():
     methods.remat.register(_name)(keeping(_preset.save, _preset.offload))
 
-# What `auto` tries, the fastest first, as they train on B300s (docs/parallelism.md).
+#: What ``methods.remat = auto`` tries, the fastest first, as they train on B300s
+#: (docs/parallelism/remat.md): it takes the first whose training step fits.
 CANDIDATES = ("none", "dots_attention", "dots", "save_attention", "full")
 # A forward outside a training step, which `auto` chooses for, keeps everything.
 methods.remat.register("auto")(jax.checkpoint_policies.everything_saveable)
@@ -221,12 +244,23 @@ def label[T](name: str, tree: T) -> T:
 
 
 def named[R](name: str, f: Callable[..., R], *args: Any) -> R:
-    """Return f(*args), naming what its backward takes, inside a call the run's policy
-    rematerializes: `name.in` its inputs, and `name.out` its output and what else, so
-    that a policy that keeps `name` computes none of f again. A kernel's residuals, as
-    flash attention's log-sum-exp, are no products of matrices, so `dots` computes
-    such a kernel again whole. `f` closes over no array but constants: jax
-    differentiates it by `args` alone."""
+    """Return ``f(*args)``, naming what its backward takes, inside a call the run's
+    policy rematerializes: ``name.in`` its inputs, and ``name.out`` its output and what
+    else, so that a policy that keeps `name` computes none of f again. A kernel's
+    residuals, as flash attention's log-sum-exp, are no products of matrices, so
+    ``dots`` computes such a kernel again whole. `f` closes over no array but
+    constants: jax differentiates it by `args` alone.
+
+    Args:
+        name: The name a policy keeps them by, as ``attention`` or ``recurrence``.
+        f: The function, a kernel's call say.
+        args: Its arguments, arrays or trees of them.
+
+    Example:
+        Softmax attention's call of the run's attention method::
+
+            out = remat.named("attention", attend, q, k, v, ids, args.sinks)
+    """
     if not _NAMING.get():
         return f(*args)
     call = jax.custom_vjp(f)
@@ -249,7 +283,15 @@ def checkpoint[**A, R](
     f: Callable[A, R], prevent_cse: bool, scanned: bool = False
 ) -> Callable[A, R]:
     """Return `f` rematerialized by the run's remat policy, or if `scanned` by
-    `unfused` where there is none; `f` itself otherwise."""
+    `unfused` where there is none; `f` itself otherwise.
+
+    Args:
+        f: A function of arrays alone, as a `~bux.architecture.repeats.pure.Pure`
+            call is.
+        prevent_cse: As `jax.checkpoint`'s; a scan needs none, since it keeps XLA
+            from merging the computations.
+        scanned: Whether `f` is a scanned pass.
+    """
     found = policy()
     if found is None and scanned and not _REMATTED.get():
         found = unfused
@@ -268,7 +310,17 @@ def checkpoint[**A, R](
 
 
 def rematted(module: nnx.Module, x: Stream, taps: Taps) -> Stream:
-    """Call `module(x, taps)`, rematerialized by the run's remat policy."""
+    """Call ``module(x, taps)``, rematerialized by the run's remat policy: as a
+    function of arrays alone, whose changes to the taps are written back after it.
+
+    Args:
+        module: A residual branch outside any other.
+        x: The stream.
+        taps: The forward pass's taps.
+
+    Returns:
+        The module's output.
+    """
     if policy() is None:
         return module(x, taps)
     graphdef, state = nnx.split(module)

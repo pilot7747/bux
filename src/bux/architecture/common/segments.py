@@ -21,9 +21,21 @@ from bux.parallel.context import running_max, running_sum
 
 
 class Segments(NamedTuple):
-    positions: Int[Array, "b t"]  # as given: what rotary and learned positions use
-    ids: Int[Array, "b t"]  # which document of its row each token is in, from 1
-    within: Int[Array, "b t"]  # how many tokens of its document come before it
+    """Where the documents packed into the rows are, in the forms layers need: one
+    array of b rows of t per form, each made once per forward pass.
+
+    Example:
+        Two documents in a row of 6, of positions ``[0, 1, 2, 0, 1, 2]``, have ids
+        ``[1, 1, 1, 2, 2, 2]`` and within ``[0, 1, 2, 0, 1, 2]``; positions that skip
+        ahead, ``[5, 6, 9]``, stay one document.
+    """
+
+    #: The positions as given: what rotary and learned positions use.
+    positions: Int[Array, "b t"]
+    #: Which document of its row each token is in, from 1.
+    ids: Int[Array, "b t"]
+    #: How many tokens of its document come before each token.
+    within: Int[Array, "b t"]
 
     @classmethod
     def of(cls, positions: Int[Array, "b t"]) -> "Segments":

@@ -1,4 +1,8 @@
-"""Dense channel mixers: mlp and gated_mlp."""
+"""Dense channel mixers: mlp and gated_mlp.
+
+Under tensor parallelism (`bux.parallel`) the hidden units split over ``mlp``: up and
+gate by columns, down by rows, as the run's ``methods.tensor`` multiplies them.
+"""
 
 import jax.numpy as jnp
 from flax import nnx
@@ -18,8 +22,9 @@ def activate(
     up: Float[Array, "*lead f"],
     gate: Float[Array, "*lead f"] | None,
 ) -> Float[Array, "*lead f"]:
-    """Return act(up), or act(gate) * up when gated; `limit` clips both (gate from
-    above only), and `up_softcap` caps up."""
+    """Return ``act(up)``, or ``act(gate) * up`` when gated; `limit` clips both (gate
+    from above only), and `up_softcap` caps up. The experts of an MoE activate by it
+    too."""
     if config.limit is not None:
         up = jnp.clip(up, -config.limit, config.limit)
     up = softcap(up, config.up_softcap)
@@ -38,6 +43,21 @@ def shard_hidden(h: Float[Array, "*lead f"]) -> Float[Array, "*lead f"]:
 
 
 class MLP(nnx.Module):
+    """A dense MLP, ``mlp``: ``down(act(up(x)))``; or a gated one, ``gated_mlp``:
+    ``down(act(gate(x)) * up(x))``, SwiGLU with ``activation=swish`` (Shazeer, 2020).
+
+    The up and gate projections are named ``mlp`` for a remat policy to keep, and
+    every projection multiplies in the format the run's precision gives the ``mlp``
+    role. Dropout, if any, is of the output.
+
+    Args:
+        config: The MLP's settings (`bux.config.MLPConfig`).
+        width: The width of the stream, d.
+        rngs: The random streams the projections start from.
+        size: The hidden units, if not the config's `intermediate_size`: an MoE's
+            shared experts run as one MLP of all their units.
+    """
+
     def __init__(
         self, config: cfg.MLPConfig, width: int, rngs: nnx.Rngs, size: int = 0
     ):
@@ -64,6 +84,7 @@ class MLP(nnx.Module):
     def __call__(
         self, x: Float[Array, "b t d"], taps: Taps | None = None
     ) -> Float[Array, "b t d"]:
+        """Return the MLP of every position of x, ``b t d``, in the stream's width."""
         return self.dropout(project_output(self.hidden(x), self.down))
 
 

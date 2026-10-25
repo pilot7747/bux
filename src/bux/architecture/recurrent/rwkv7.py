@@ -36,22 +36,35 @@ def _previous(x: Float[Array, "b t d"], docs: Segments | None) -> Float[Array, "
 
 
 class RWKV7(nnx.Module):
-    """RWKV-7 time mixing. Every projection reads the token moved toward the one before
-    it by a learned amount per channel (token shift). The state follows the generalized
-    delta rule
+    """RWKV-7 time mixing, ``rwkv7``. Every projection reads the token moved toward the
+    one before it by a learned amount per channel (token shift). The state follows the
+    generalized delta rule::
 
         S_t = (diag(w_t) - (a_t kk_t) kk_t^T) S_{t-1} + k_t v_t^T,    o_t = S_t^T r_t
 
     with kk the normalized key it removes from, a the in-context learning rate, and
-    log w = -e^-0.5 sigmoid(.) per key channel. Low-rank projections make w, a, the
-    output gate g and the value residual's mix. The output is a layer norm of each head,
-    plus a bonus (r k r_k) v per head, times g. Parameters start as RWKV-LM starts them,
-    by the layer's depth among the model's token mixers.
+    ``log w = -e^-0.5 sigmoid(.)`` per key channel. Low-rank projections make w, a,
+    the output gate g and the value residual's mix. The output is a layer norm of each
+    head, plus a bonus ``(r k r_k) v`` per head, times g. Parameters start as RWKV-LM
+    starts them, by the layer's depth among the model's token mixers.
 
-    Ports: `v` written pushes the values; read moves the values toward the tap's by a
-    learned amount per channel, from a projection of rank `v_rank`. That is RWKV-7's
-    value residual, with the first layer's values: `rwkv7(v=@v0)` first, then
-    `rwkv7(v=$v0)`.
+    Ports: ``v`` written pushes the values; read moves the values toward the tap's by
+    a learned amount per channel, from a projection of rank `v_rank`. That is RWKV-7's
+    value residual, with the first layer's values: ``rwkv7(v=@v0)`` first, then
+    ``rwkv7(v=$v0)``.
+
+    Args:
+        config: The layer's settings (`bux.config.RWKV7Config`).
+        width: The width of the stream, d.
+        ports: The taps the layer reads and writes.
+        rngs: The random streams the parameters start from.
+        layer: The layer's index among the model's token mixers, from 0.
+        layers: How many token mixers the model runs.
+
+    Raises:
+        NotImplementedError: The config sets a conv_size: RWKV-7 shifts tokens
+            instead.
+        ValueError: num_v_heads is not a multiple of num_heads.
     """
 
     def __init__(
@@ -145,6 +158,13 @@ class RWKV7(nnx.Module):
         )
 
     def __call__(self, x: Float[Array, "b t d"], taps: Taps) -> Float[Array, "b t d"]:
+        """Return the time mixing of every position of x, ``b t d``.
+
+        Args:
+            x: The stream.
+            taps: The forward pass's taps: the documents in the rows, and the v
+                port's tap.
+        """
         x = shard_layer_input(x)
         b, t, _ = x.shape
         h, hv, dk, dv = self.heads, self.v_heads, self.head_dim, self.v_head_dim

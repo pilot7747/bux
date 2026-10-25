@@ -1,11 +1,20 @@
-"""Repeats: the methods of `methods.repeat`, and the scanned module they can build.
+"""Repeats: the methods of ``methods.repeat``, and the scanned module they can build.
 
-A method builds `times` passes of a repeat's body, and the module that runs them.
-``unroll`` runs one module per pass, in a row. ``scan`` stacks the passes into one
-``Scanned`` module where it can, each variable gaining a leading `layers` dimension,
-and runs them by `jax.lax.scan` (``stacked.run``), a scan for each run of passes that
-trace alike (``tracing.runs``). With more than one `stage`, the longest scanned repeat
-outside any other is pipelined over them (``pipe_longest``).
+A method builds `times` passes of a repeat's body, ``f^n``, and the module that runs
+them:
+
+- ``unroll`` (`unroll`) runs one module per pass, in a row.
+- ``scan`` (`scan`) stacks the passes into one `Scanned` module where it can, each
+  variable gaining a leading ``layers`` dimension, and runs them by `jax.lax.scan`
+  (`~bux.architecture.repeats.stacked.run`), a scan for each run of passes that trace
+  alike (`~bux.architecture.repeats.tracing.runs`): one trace for all of them.
+
+With more than one ``stage`` in the mesh, the longest scanned repeat outside any
+other is pipelined over them (`pipe_longest`). Another method is a function of the
+repeat's body, its `times` and the build's context that returns the module::
+
+    @methods.repeat.register("mine")
+    def _(body: ir.Node, times: int, ctx: Context) -> nnx.Module: ...
 """
 
 from collections.abc import Callable
@@ -27,14 +36,34 @@ from bux.parallel.layout import LAYERS, NAMES
 
 @methods.repeat.register("unroll")
 def unroll(body: ir.Node, times: int, ctx: Context) -> nnx.Module:
-    """Build one module per pass, run in a row."""
+    """Build one module per pass, run in a row, each traced and compiled on its own:
+    ``methods(repeat=unroll)``.
+
+    Args:
+        body: The repeat's body, the f of ``f^n``.
+        times: The passes, n.
+        ctx: The build's context.
+
+    Returns:
+        The module that runs the passes.
+    """
     return Passes(_passes(body, times, ctx), branches((body,) * times, ctx))
 
 
 @methods.repeat.register("scan")
 def scan(body: ir.Node, times: int, ctx: Context) -> nnx.Module:
-    """Build the passes as ``unroll`` does, and stack them into one ``Scanned`` module
-    if they can be (``scannable``); otherwise run them in a row."""
+    """Build the passes as ``unroll`` does, and stack them into one `Scanned` module,
+    run by `jax.lax.scan`, if they can be (`scannable`); otherwise run them in a row:
+    ``methods(repeat=scan)``.
+
+    Args:
+        body: The repeat's body, the f of ``f^n``.
+        times: The passes, n.
+        ctx: The build's context.
+
+    Returns:
+        The module that runs the passes.
+    """
     passes = _passes(body, times, ctx)
     if scannable(passes):
         each = tracing.branches_of(body) if ctx.depth == 0 else 0
@@ -106,15 +135,30 @@ def _stack(passes: list[nnx.Module]) -> nnx.Module:
 
 
 class Scanned(nnx.Module):
-    """A repeat of `times` passes run as one module. `layers` is one pass whose
-    variables hold every pass's, stacked (``_stack``). A call scans them
-    (``stacked.run``), or runs them by the run's pipeline method once ``pipe`` has
-    split them over the stages. Where `compute` is set, a training step's cast of the
-    model left them as they are (``scanned_variables``), and each pass casts its own
-    to it.
+    """A repeat of `times` passes run as one module, as ``methods.repeat = scan``
+    builds it.
+
+    `layers` is one pass whose variables hold every pass's, stacked along a leading
+    ``layers`` dimension. A call scans them
+    (`~bux.architecture.repeats.stacked.run`), or runs them by the run's pipeline
+    method once `pipe` has split them over the stages. Where `compute` is set, a
+    training step's cast of the model left them as they are (`scanned_variables`),
+    and each pass casts its own to it.
 
     A pass holds `each` residual branches outside any other, or is one (`is_branch`):
-    a scan numbers them as its first pass's (``tracing.passes``)."""
+    a scan numbers them as its first pass's
+    (`~bux.architecture.repeats.tracing.passes`).
+
+    Args:
+        layers: One pass, its variables stacked.
+        times: The passes.
+        each: The residual branches outside any other a pass holds.
+        is_branch: Whether each pass is a residual branch outside any other.
+
+    Attributes:
+        rounds: The rounds a pipeline takes the passes in; 0 if none does.
+        compute: The dtype each pass casts its parameters to, or None.
+    """
 
     def __init__(
         self, layers: nnx.Module, times: int, each: int = 0, is_branch: bool = False
@@ -125,6 +169,8 @@ class Scanned(nnx.Module):
         self.compute: DTypeLike | None = None
 
     def __call__(self, x: Stream, taps: Taps) -> Stream:
+        """Run the passes on the stream x: scanned, a scan for each run of passes
+        that trace alike, or pipelined."""
         if self.rounds and pipeline.pipelined():
             return self._pipelined(x, taps)
         graphdef, state = nnx.split(self.layers)
@@ -163,7 +209,12 @@ class Scanned(nnx.Module):
         `methods.stages` gives each stage its share, as many as the most any takes
         (``pipeline.spread``), and `times` still counts the passes that run. With more,
         the passes split into `rounds` rounds, each a scanned repeat of its own, and
-        each stage holds a share of every round."""
+        each stage holds a share of every round.
+
+        Args:
+            rounds: The rounds the pipeline takes the passes in: 1, or more for an
+                interleaved schedule.
+        """
         if rounds == 1:
             self._by_stage()
         else:
@@ -205,7 +256,12 @@ def scanned_variables(root: nnx.Module) -> Callable[[tuple, object], bool]:
 
 def pipe_longest(root: nnx.Module) -> nnx.Module:
     """Pipeline `root`'s longest scanned repeat outside any other (the first of several
-    as long) if the mesh in force has stages, and return `root`."""
+    as long) if the mesh in force has stages, and return `root`.
+
+    Raises:
+        ValueError: The mesh has stages, and the model no scanned repeat to pipeline
+            over them.
+    """
     if (n := pipeline.stages()) == 1:
         return root
     if not (outer := _outermost(root)):

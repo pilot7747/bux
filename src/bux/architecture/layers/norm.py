@@ -12,6 +12,22 @@ from bux.lang import ir
 
 
 class Norm(nnx.Module):
+    """Layer normalization (Ba et al., 2016) or RMSNorm (Zhang & Sennrich, 2019) of
+    the last dimension: ``layernorm`` and ``rmsnorm``.
+
+    A layernorm centers x and divides it by its standard deviation, an rmsnorm only
+    divides it by its root mean square, both with `eps` added under the root; then
+    each multiplies by a learned gain (1 + w if `zero_centered`, or before
+    normalizing with `scale_input`) and adds a learned bias, if the config has them.
+    The statistics are in float32, the result in x's dtype. Other layers make one for
+    a norm of their own, as of each head.
+
+    Args:
+        config: The norm's settings (`bux.config.NormalizationConfig`).
+        width: The shape of the gain and the bias: the width, or more trailing
+            dimensions for one gain per head or copy, ``(heads, d)``.
+    """
+
     no_weight_decay = ("scale", "bias")
 
     def __init__(self, config: cfg.NormalizationConfig, width: int | tuple[int, ...]):
@@ -26,6 +42,16 @@ class Norm(nnx.Module):
     def __call__(
         self, x: Float[Array, "*lead d"], taps: Taps | None = None
     ) -> Float[Array, "*lead d"]:
+        """Return x normalized over its last dimension, with the gain and the bias.
+
+        Args:
+            x: The stream or what else the norm is of; only the last dimension is
+                normalized.
+            taps: The forward pass's taps, unused.
+
+        Returns:
+            The normalized x, of its shape and dtype.
+        """
         gain = None
         if self.scale is not None:
             gain = 1 + self.scale if self.zero_centered else self.scale
@@ -56,6 +82,15 @@ def _(
 
 
 class DyT(nnx.Module):
+    """Dynamic Tanh (Zhu et al., 2025), ``dyt``: ``gamma * tanh(alpha * x) + beta``,
+    a norm without statistics, with a learned scalar alpha and a learned gain gamma
+    (from 1) and bias beta (from 0) per channel.
+
+    Args:
+        c: Its settings (`bux.config.DyTConfig`): where alpha starts.
+        width: The width of the stream.
+    """
+
     no_weight_decay = ("alpha", "weight", "bias")
 
     def __init__(self, c: cfg.DyTConfig, width: int):
@@ -66,6 +101,7 @@ class DyT(nnx.Module):
     def __call__(
         self, x: Float[Array, "*lead d"], taps: Taps
     ) -> Float[Array, "*lead d"]:
+        """Return ``gamma * tanh(alpha * x) + beta``, of x's shape."""
         return jnp.tanh(self.alpha * x) * self.weight + self.bias
 
 
