@@ -1,20 +1,22 @@
-"""Block-scaled GEMMs: a projection y = x W and its gradients, each GEMM multiplying
-operands quantized in blocks along what it contracts, a scale a block. cuDNN's
-block-scaled GEMM multiplies them on a Blackwell GPU; elsewhere XLA dequantizes and
-multiplies, which computes the same values.
+"""Block-scaled GEMMs: a projection ``y = x W`` and its gradients, each GEMM
+multiplying operands quantized in blocks along what it contracts, a scale a block.
+cuDNN's block-scaled GEMM multiplies them on a Blackwell GPU; elsewhere XLA dequantizes
+and multiplies, which computes the same values.
 
-With x (m, k), W (k, n) and dy (m, n), each GEMM is a b^T, a and b both in blocks
-along their rows, which it contracts. A name says along what: `x_k` is x in blocks
-along k, `xt_m` is x^T in blocks along m.
+With x (m, k), W (k, n) and dy (m, n), each GEMM is ``a b^T``, a and b both in blocks
+along their rows, which it contracts. A name says along what: ``x_k`` is x in blocks
+along k, ``xt_m`` is x^T in blocks along m::
 
     fprop   y  = x W      x_k  wt_k^T
     dgrad   dx = dy W^T   dy_n w_n^T
     wgrad   dW = x^T dy   xt_m dyt_m^T
 
 So a `Recipe` quantizes each of x, W and dy twice: along its rows, and along its
-columns as its transpose's rows. The forward keeps xt_m and w_n for the backward. Only
-the GEMMs in `passes` multiply in the format, the others their operands as they are.
-MXFP8's recipes are here, NVFP4's in ``nvfp4``; ``matmuls`` registers a format of each.
+columns as its transpose's rows. The forward keeps ``xt_m`` and ``w_n`` for the
+backward. Only the GEMMs in ``passes`` multiply in the format, the others their
+operands as they are (`project`). MXFP8's recipes are here (`MXFP8`, `MXFP8_2D`),
+NVFP4's in `~bux.architecture.precision.nvfp4`;
+`~bux.architecture.precision.matmuls` registers a format of each.
 """
 
 from collections.abc import Callable
@@ -42,9 +44,12 @@ class Blocks(NamedTuple):
     """An (r, c) array in a block-scaled format, in blocks along its rows: its values
     times their block's scale, times the tensor's."""
 
+    #: The values, in the format's dtype (E4M3, E2M1).
     values: Shaped[Array, "r c"]
-    scales: Shaped[Array, "r n"]  # one a block
-    tensor_scale: Float[Array, ""] | None  # None for 1
+    #: The scales, one a block (E8M0, E4M3).
+    scales: Shaped[Array, "r n"]
+    #: The tensor's scale; None for 1.
+    tensor_scale: Float[Array, ""] | None
 
 
 # How a recipe quantizes an operand a, given a seed for what rounds stochastically: a
@@ -53,12 +58,23 @@ Twice = Callable[[Float[Array, "r c"], UInt32[Array, ""]], tuple[Blocks, Blocks]
 
 
 class Recipe(NamedTuple):
-    """How a format quantizes x, W and dy, each twice, in blocks of `block`: what each
-    of a GEMM's dimensions must be whole blocks of."""
+    """How a block-scaled format quantizes x, W and dy, each twice: itself and its
+    transpose, each in blocks along its rows.
 
+    Example:
+        MXFP8 for x and dy, and W's scales per 32 x 32 tile, as `MXFP8_2D` is::
+
+            Recipe(MX_BLOCK, x=mx_twice, w=mx_tiles_twice, dy=mx_twice)
+    """
+
+    #: The values a block holds, which each of a GEMM's dimensions must be whole
+    #: blocks of.
     block: int
+    #: How it quantizes x, the input.
     x: Twice
+    #: How it quantizes W, the weight.
     w: Twice
+    #: How it quantizes dy, the output's gradient.
     dy: Twice
 
 
@@ -70,7 +86,21 @@ def project(
     seed: UInt32[Array, ""],
     passes: tuple[Pass, ...] = PASSES,
 ) -> Float[Array, "*lead n"]:
-    """Return x W in `out`, its GEMMs named in `passes` as `recipe` quantizes them."""
+    """Return ``x W`` in `out`, its GEMMs named in `passes` as `recipe` quantizes
+    them, the others multiplying their operands as they are.
+
+    Args:
+        x: the input, (..., k): its leading dimensions flatten into m rows.
+        w: the weight, (k, n).
+        recipe: how the format quantizes x, W and dy.
+        out: the dtype of y.
+        seed: what a recipe that rounds stochastically draws its noise from.
+        passes: the GEMMs that multiply in the format: of ``fprop``, ``dgrad`` and
+            ``wgrad``.
+
+    Returns:
+        y, (..., n). Its gradients reach x in its dtype and W in its own.
+    """
     dtypes = Dtypes(x.dtype, w.dtype, jnp.dtype(out))
     y = _project(x.reshape(-1, x.shape[-1]), w, seed, recipe, dtypes, passes)
     return y.reshape(*x.shape[:-1], w.shape[1])
@@ -98,6 +128,7 @@ def _project(
     dtypes: Dtypes,
     passes: tuple[Pass, ...],
 ) -> Float[Array, "m n"]:
+    """Return `project` of a matrix x, with its own gradients."""
     return _forward(x, w, seed, recipe, dtypes, passes)[0]
 
 
@@ -161,7 +192,7 @@ def _times(a: Operand, b: Operand, out: DTypeLike) -> Float[Array, "m n"]:
 
 
 def gemm(a: Blocks, b: Blocks, out: DTypeLike) -> Float[Array, "m n"]:
-    """Return a b^T in `out`: the GEMM of their values by their block scales, then
+    """Return ``a b^T`` in `out`: the GEMM of their values by their block scales, then
     times their tensor scales. That rescales the GEMM's output in `out`, where XLA
     fuses it into what reads it, rather than in a float32 copy."""
     y = scaled_matmul(a, b, out)
@@ -171,8 +202,8 @@ def gemm(a: Blocks, b: Blocks, out: DTypeLike) -> Float[Array, "m n"]:
 
 
 def scaled_matmul(a: Blocks, b: Blocks, out: DTypeLike) -> Float[Array, "m n"]:
-    """Return a b^T of their values times their block scales, in `out`: by
-    jax.nn.scaled_matmul, cuDNN's block-scaled GEMM on a Blackwell GPU, which
+    """Return ``a b^T`` of their values times their block scales, in `out`: by
+    `jax.nn.scaled_matmul`, cuDNN's block-scaled GEMM on a Blackwell GPU, which
     elsewhere dequantizes and multiplies. In a shard_map, by its primitive, which
     jax's custom partitioning cannot place there."""
     args = (a.values[None], b.values[None], a.scales[None], b.scales[None])
@@ -249,8 +280,9 @@ MX_BLOCK = 32
 def mx_twice(
     x: Float[Array, "r c"], seed: UInt32[Array, ""] | None = None
 ) -> tuple[Blocks, Blocks]:
-    """Return x and x^T in MXFP8: by one pass of a kernel over x on a GPU, and by XLA
-    elsewhere. MXFP8 rounds to nearest, and needs no seed."""
+    """Return x and x^T in MXFP8, each in blocks of 32 along its rows: by one pass of
+    a kernel over x on a GPU, and by XLA elsewhere. MXFP8 rounds to nearest, and needs
+    no seed. `MXFP8`'s quantizer of each operand (a `Twice`)."""
     if not kernels.gpu():
         return mx_quantize(x), mx_quantize(x.T)
     return mx_kernel_twice(x)
@@ -268,14 +300,14 @@ def mx_tiles_twice(
     return _mx_blocks(values, rows), _mx_blocks(values.T, columns)
 
 
-# Transformer Engine's MXFP8: E4M3 for all three GEMMs, gradients too.
+#: Transformer Engine's MXFP8, E4M3 for all three GEMMs, gradients too.
 MXFP8 = Recipe(MX_BLOCK, x=mx_twice, w=mx_twice, dy=mx_twice)
-# W's scales per 32 x 32 tile, the same for y and dx (TorchTitan's).
+#: MXFP8 with W's scales per 32 x 32 tile, the same for y and dx (TorchTitan's).
 MXFP8_2D = Recipe(MX_BLOCK, x=mx_twice, w=mx_tiles_twice, dy=mx_twice)
 
 
 def mx_quantize(x: Float[Array, "r c"]) -> Blocks:
-    """Return x in MXFP8, by XLA."""
+    """Return x in MXFP8, in blocks of 32 along its rows, by XLA."""
     return _mx_blocks(*_in_e4m3(x.astype(jnp.float32), "rows"))
 
 
@@ -409,10 +441,12 @@ def _mx_quantize_tile(
 
 @custom_partitioning
 def _mx_partitioned(x: Float[Array, "r c"]) -> MxArrays:
+    """Return `_mx_kernel`'s copies, each device running it on its part of x."""
     return _mx_kernel(x)
 
 
 def _mx_infer(mesh: Mesh, shapes: tuple[Any, ...], out: Any) -> Shardings:
+    """Return how the copies split, of x as it splits."""
     return copies_shardings(mesh, shapes[0].sharding.spec)
 
 
