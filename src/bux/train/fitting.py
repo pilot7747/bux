@@ -27,8 +27,8 @@ from bux import parallel
 from bux.architecture.repeats import remat
 from bux.train import xla
 
-# Of a device's memory a step may take, by XLA's analysis: on B300s it was the peak
-# to 0.1 GiB, and steps of 98% of a device trained.
+#: Of a device's memory a step may take, by XLA's analysis: on B300s it was the peak
+#: to 0.1 GiB, and steps of 98% of a device trained.
 MARGIN = 0.97
 
 
@@ -54,6 +54,8 @@ class Fitting:
         self.seconds = 0.0
 
     def __call__(self, *args: Any) -> Any:
+        """Run the step on `args`, under the candidate that fits, which the first call
+        chooses."""
         return self._fitted(args)(*args)
 
     def lower(self, *args: Any) -> Any:

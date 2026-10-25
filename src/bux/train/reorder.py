@@ -1,7 +1,8 @@
 """bux's pass over XLA's schedule of a program, after XLA's latency-hiding scheduler:
 each reduction of a gradient (a reduce-scatter or an all-reduce) is computed and
 started as soon as what it needs is, and the program waits for it before it starts
-the `LAG`-th next.
+the `LAG`-th next. ``compiler(reductions=early)``, the default, turns it on for a
+run's training step, and ``reductions=xla`` leaves XLA's schedule as it is.
 
 XLA's scheduler places a collective's done just before its result is first read, and
 with one collective in flight each start just above the done before it, and the ops
@@ -12,10 +13,9 @@ before its reduction, one after another: the GEMMs keep their inputs until then,
 the reductions run beside nothing but each other's GEMMs. The pass moves each GEMM
 and its reduction up to where the layer's backward pass makes the GEMM's inputs. On
 8 B300s it takes Qwen3-30B-A3B under FSDP at Megatron-Bridge's batch from 40.0k to
-42.1k tokens a second a GPU (docs/training.md, "Where the gradients' reductions
-start").
+42.1k tokens a second a GPU (:doc:`/performance/compiler`).
 
-It is the pass `NAME` of bux.passes: ``passes.use(reorder.NAME)``.
+It is the pass `NAME` of `bux.passes`: ``passes.use(reorder.NAME)``.
 """
 
 import bisect
@@ -25,6 +25,7 @@ from typing import Any, NamedTuple
 from bux import jax_internals, passes
 
 Op = jax_internals.Opcode
+#: The pass's name in `bux.passes`.
 NAME = "bux_early_reductions"
 _REDUCTIONS = frozenset({Op.kReduceScatter, Op.kAllReduce})
 # What never moves up with a reduction: what communicates, copies to or from the host,
@@ -40,15 +41,25 @@ _STAYS = frozenset(
         *(Op.kRngGetAndUpdateState, Op.kAfterAll),
     }
 )
-# The reductions in flight at once: a done waits for the start of the one this many
-# further on.
+#: The reductions in flight at once: a done waits for the start of the one this many
+#: further on.
 LAG = 2
 
 
 @passes.register(NAME, stage=passes.AFTER_SCHEDULING, key=f"lag={LAG}")
 def reordered(serialized: bytes) -> bytes | None:
-    """Return the scheduled HloModuleProto `serialized` with its reductions started
-    early, or None where none moves."""
+    """Start each gradient's reduction as soon as what it needs is computed, and wait
+    for it only before the `LAG`-th next: XLA's schedule of the weight gradients'
+    GEMMs and their reductions moved up to where each layer's backward pass makes
+    their inputs.
+
+    Args:
+        serialized: A scheduled HloModuleProto, serialized.
+
+    Returns:
+        The module with its reductions started early, serialized; None where none
+        moves.
+    """
     return _reordered(jax_internals.hlo_module(serialized))
 
 

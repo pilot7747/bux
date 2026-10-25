@@ -35,8 +35,8 @@ _ATTENTION = re.compile(r"attention_mask=(\w+),(\w+)")  # its window and top_k
 _KEYS, _PICKS = "over_keys", "over_picks"
 _AGAIN = "rematted_computation"  # jax.checkpoint's scope of what it computes again
 
-# Dense bf16 tensor FLOPs a second of one device, by a name in its device_kind:
-# NVIDIA's datasheets, the SXM parts.
+#: Dense bf16 tensor FLOPs a second of one device, by a name in its device_kind:
+#: NVIDIA's datasheets, the SXM parts. The log's MFU is over these.
 PEAK = {
     "B300": 2.25e15,
     "B200": 2.25e15,

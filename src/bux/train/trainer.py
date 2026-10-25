@@ -1,7 +1,7 @@
 """Trains a compiled Run with the reference Flax NNX backend, on the devices its mesh
-takes (``bux.parallel``).
+takes (`bux.parallel`).
 
-A run's directory, ``<out>/<name>-<id>``, holds:
+A run's directory, ``<out>/<name>-<id>``, holds::
 
     run.bux        the run as one self-contained file, which `bux train` takes as is
     run.json       its IR
@@ -12,9 +12,10 @@ A run's directory, ``<out>/<name>-<id>``, holds:
 Its name says which alternatives it took, and its id hashes what it computes, so a
 changed setting gets a fresh directory and an unchanged one finds its checkpoints.
 
-``train`` puts a run together from blocks that each work alone: a ``Trainer`` (a
+`train` puts a run together from blocks that each work alone: a `Trainer` (a
 model, its optimizer and its objective), the run's batches, hooks for its log, eval
-and checkpoints, and sinks for what the hooks return. A script can swap any of them:
+and checkpoints, and sinks for what the hooks return. A script can swap any of
+them::
 
     trainer = Trainer(model, optax.adamw(1e-3), objective(run.train.loss, run.arch))
     trainer.fit(batches(...), steps=1000, hooks=[...], sinks=[Console("mine", 1000)])
@@ -66,7 +67,23 @@ from bux.train.sinks import (
 
 
 def forward(model: Model, batch: Batch) -> list[HeadOutput]:
-    """Return every head's output on `batch`, each document of a row on its own."""
+    """Return every head's output on `batch`, each document of a row on its own.
+
+    Not a training forward (`training_forward`): layers report no losses and update
+    no state of their own, as an MoE does its router bias.
+
+    Args:
+        model: The model.
+        batch: Its rows; their positions say where documents start.
+
+    Returns:
+        Each head's output in execution order. Its ``logits()`` are ``b t vocab``
+        (rows, positions, the vocabulary).
+
+    Example::
+
+        logits = forward(model, plain(ids))[0].logits()
+    """
     return model.heads(jnp.asarray(batch.input_ids), jnp.asarray(batch.position_ids))
 
 
@@ -99,7 +116,9 @@ class StepEndUpdate(Protocol):
 
     update_at_step_end: bool
 
-    def step_end_update(self) -> None: ...
+    def step_end_update(self) -> None:
+        """Apply what the step's forwards counted, once, after them all."""
+        ...
 
 
 def apply_step_end_updates(model: nnx.Module) -> None:
@@ -353,37 +372,85 @@ class Trainer:
     changes what a step does (keeps an average of the weights, skips a spike) and
     keeps the loop, hooks and checkpoints. They get the model and the optimizer as
     arguments, and what `train_step` changes of them is the step's new state. The
-    training step takes their variables' values, which the trainer keeps split
-    (``_Split``): between steps a hook may change those values, as `load` does, but
-    not which variables the model and the optimizer hold.
+    training step takes their variables' values, which the trainer keeps split:
+    between steps a hook may change those values, as `load` does, but not which
+    variables the model and the optimizer hold.
 
     Both compute in `compute`, the model's parameters cast to it inside the loss, so
     that the parameters, their gradients and the optimizer's state stay as they are
     (float32); and the projections inside blocks multiply as the precision `matmuls`
-    says, or in the format it names (``bux.architecture.precision.matmuls``). At the
+    says, or in the format it names (`bux.architecture.precision.matmuls`). At the
     step of a `switch`, the steps take up its precision, and compile again.
 
-    Made inside ``parallel.use``, it puts its state on the shardings the layout gives
-    it, and every step keeps it there. A step that runs its layers more than once, in
-    `microbatches` or a pipeline's ticks, gathers its parameters once with `gather`
-    "step", or as each layer runs with "layer". With `accumulate` "unreduced" its
-    microbatches' gradients add up on each device and reduce once, in `reduce`
-    (``parallel.gather``), a pipeline's in float32; with "reduced" they reduce each
-    microbatch; "auto" adds them up unreduced where the rows' axes span processes,
-    and where that computes the same, as `_why_not_unreduced` says. With
+    Made inside `bux.parallel.use`, it puts its state on the shardings the layout
+    gives it, and every step keeps it there. A step that runs its layers more than
+    once, in `microbatches` or a pipeline's ticks, gathers its parameters once with
+    `gather` ``"step"``, or as each layer runs with ``"layer"``. With `accumulate`
+    ``"unreduced"`` its microbatches' gradients add up on each device and reduce
+    once, in `reduce` (`bux.parallel.gather`), a pipeline's in float32; with
+    ``"reduced"`` they reduce each microbatch; ``"auto"`` adds them up unreduced
+    where the rows' axes span processes, and where that computes the same. With
     `interleave`, each microbatch's forward runs beside the backward of the one
-    before, a piece of the model at a time (``interleave``).
+    before, a piece of the model at a time (`bux.train.interleave`).
 
     With `donate`, a training step donates the model's and the optimizer's arrays, so
     that their new state takes the old one's memory: an array read from them before a
     step is gone after it, and one to keep is a copy (``np.asarray``).
 
-    The training step compiles with XLA's `compiler_options` (``bux.train.xla``), and
-    with its gradients' `reductions` started "early" (``bux.train.reorder``) or where
-    XLA puts them ("xla").
+    The training step compiles with XLA's `compiler_options` (`bux.train.xla`), and
+    with its gradients' `reductions` started ``"early"`` (`bux.train.reorder`) or
+    where XLA puts them (``"xla"``).
 
-    Given the `work` of a step (``flops.Work``), `flops` adds up the model FLOPs of
-    the steps taken, each at the keys its batch's queries see, for the log's MFU.
+    Given the `work` of a step (`bux.train.flops.Work`), `flops` adds up the model
+    FLOPs of the steps taken, each at the keys its batch's queries see, for the log's
+    MFU.
+
+    Args:
+        model: The model to train.
+        tx: The optax update rule (`bux.train.optim.optimizer`).
+        objective: What a step minimizes (`bux.train.objective.objective`).
+        compute: The dtype the forward and backward compute in.
+        matmuls: The precision whose formats the projections multiply in, or a
+            format's name for all of them.
+        switch: The step at which the steps take up another precision, and that
+            precision (`bux.architecture.precision.matmuls.late`); None for none.
+        microbatches: The microbatches a step accumulates its gradients over; 1
+            under a pipeline, which takes them through its stages.
+        interleave: Run each microbatch's forward beside the one before's backward.
+        gather: ``"step"`` or ``"layer"``: when a step gathers what FSDP splits.
+        accumulate: ``"auto"``, ``"unreduced"`` or ``"reduced"``: how microbatches'
+            gradients add up.
+        reduce: The dtype gradients are summed over the rows in; None is `compute`.
+        donate: Donate the state's arrays to each training step.
+        compiler_options: XLA's options for the training step (`bux.train.xla`).
+        reductions: ``"early"`` or ``"xla"``: where the gradients' reductions start.
+        work: A step's model FLOPs (`step_flops`), for the log's MFU; None does not
+            count them.
+
+    Attributes:
+        model: The model, whose variables hold the latest step's state.
+        optimizer: The `flax.nnx.Optimizer` that applies `tx` to the parameters.
+        step: The steps taken.
+        flops: The model FLOPs of the steps taken, where `work` is given.
+        stopping: Set it, from a signal handler say, to stop `fit` after this step.
+
+    Raises:
+        ValueError: If `interleave` is asked for under a pipeline, or `accumulate`
+            ``"unreduced"`` or a `reduce` other than `compute` where they cannot
+            compute the same as reducing each microbatch.
+
+    Example::
+
+        class SkipSpikes(Trainer):
+            def train_step(self, model, optimizer, batch):
+                grads, metrics = self.gradients(model, batch)
+                norm = optax.tree.norm(grads)
+                grads = jax.tree.map(lambda g: jnp.where(norm < 10, g, 0), grads)
+                optimizer.update(model, grads)
+                return metrics | {"grad_norm": norm}
+
+        trainer = SkipSpikes(model, tx, objective(run.train.loss, run.arch))
+        trainer.fit(data, steps=1000, sinks=[Console("mine", 1000)])
     """
 
     def __init__(
@@ -508,7 +575,20 @@ class Trainer:
         self, model: Model, optimizer: nnx.Optimizer, batch: Batch
     ) -> Metrics:
         """Take one optimizer step on `batch`, and return its metrics with
-        `grad_norm`, the gradients' norm before clipping."""
+        `grad_norm`, the gradients' norm before clipping.
+
+        It is traced and compiled once, inside the training step; override it to
+        change what a step does.
+
+        Args:
+            model: The model, its parameters the step's to change.
+            optimizer: Its optimizer, whose update is the step's new state.
+            batch: The step's rows, on the devices.
+
+        Returns:
+            The step's metrics, still on the device. They are the objective's
+            terms, the losses layers report, and `grad_norm`.
+        """
         grads, metrics = self.gradients(model, batch)
         optimizer.update(model, grads)
         return metrics | {"grad_norm": optax.tree.norm(grads)}
@@ -516,7 +596,15 @@ class Trainer:
     def gradients(self, model: Model, batch: Batch) -> tuple[nnx.State, Metrics]:
         """Return the loss's gradient on `batch` and its metrics, summed over the
         `microbatches`. The forwards update the model's buffers (its state that is not
-        a parameter) in turn, and then the step-end updates run."""
+        a parameter) in turn, and then the step-end updates run.
+
+        For a `train_step` of a subclass: it takes the gradient as the trainer's own
+        step does, by microbatches, a pipeline, or neither.
+
+        Returns:
+            The gradient of each parameter, sharded as the parameter is, and the
+            metrics of the whole batch.
+        """
         graphdef, params, buffers = nnx.split(model, nnx.Param, ...)
         if parallel.scheduled.active() is not None:
             grads, metrics, buffers = self._scheduled(graphdef, params, buffers, batch)
@@ -754,14 +842,29 @@ class Trainer:
         return loss, metrics | _scaled(per_row.metrics, row_share)
 
     def eval_step(self, model: Model, batch: Batch) -> Float[Array, ""]:
-        """Return the first head's loss on `batch`, computed in `compute`."""
+        """Return the first head's loss on `batch`, computed in `compute`, its
+        projections multiplied as the precision's `eval` says.
+
+        It is compiled once, by `evaluate`; override it to change what an evaluation
+        measures."""
         with matmuls.use(matmuls.evaluating(self.matmuls)):
             heads = forward(cast(model, self.compute), batch)
         per_token, _ = self.objective(heads, batch)
         return per_token.metrics["loss"]
 
     def train_on_batch(self, batch: Batch) -> Metrics:
-        """Take one training step on `batch`, and return its metrics."""
+        """Take one training step on `batch`, and return its metrics.
+
+        It puts the batch on the devices, runs the compiled step, which compiles at
+        its first call and at a `switch`, and counts the step and its FLOPs. It
+        returns once the step is launched: reading a metric waits for it.
+
+        Args:
+            batch: The step's rows, on the host (`bux.train.data.batches`).
+
+        Returns:
+            The step's metrics (`train_step`), still on the device.
+        """
         self._switch_if_due()
         on_devices = parallel.shard_batch(batch)
         values, metrics = self._train(self._split.values(), on_devices)
@@ -772,7 +875,9 @@ class Trainer:
         return metrics
 
     def lower(self, batch: Batch) -> jax.stages.Lowered:
-        """Return the training step lowered for the trainer's state and `batch`."""
+        """Return the training step lowered for the trainer's state and `batch`: its
+        ``compile().memory_analysis()`` says what a step holds, its ``as_text()``
+        the program."""
         return self._train.lower(self._split.values(), batch)
 
     def _switch_if_due(self) -> None:
@@ -783,7 +888,14 @@ class Trainer:
     def evaluate(self, batches: Iterable[Batch]) -> float:
         """Return the mean of `eval_step` over `batches`, in eval mode. Every batch's
         step is launched before any loss is read, so the GPU runs one as the host
-        launches the next."""
+        launches the next.
+
+        Args:
+            batches: The held-out batches, on the host; a finite number of them.
+
+        Returns:
+            The mean of their losses, each batch weighed alike.
+        """
         self.model.eval()
         try:
             losses = [self._eval(self.model, parallel.shard_batch(b)) for b in batches]
@@ -796,7 +908,12 @@ class Trainer:
         return nnx.state((self.model, self.optimizer))
 
     def load(self, state: nnx.State | Mapping[str, Any], step: int) -> None:
-        """Take up `state`, from `state()` or a checkpoint, at `step`."""
+        """Take up `state`, from `state()` or a checkpoint, at `step`.
+
+        Args:
+            state: The model's and the optimizer's state, as `state` returns it.
+            step: The steps taken at that state.
+        """
         nnx.update((self.model, self.optimizer), state)
         self.step = step
 
@@ -808,10 +925,27 @@ class Trainer:
         sinks: Sequence[Sink] = (),
     ) -> None:
         """Train on `data` to step `steps`, or until `stopping` is set, after which
-        every hook's `stop` runs; the next batches load as a step runs (``prefetch``).
-        After every step, the hooks due run in order, and what they return goes to
-        every sink once the next step is launched (``hooks.Later``). All of them close
-        at the end, or when training stops."""
+        every hook's `stop` runs; the next batches load as a step runs
+        (`bux.train.data.prefetch`). After every step, the hooks due run in order, and
+        what they return goes to every sink once the next step is launched
+        (`bux.train.hooks.Later`). All of them close at the end, or when training
+        stops.
+
+        Args:
+            data: The batches, on the host, from the trainer's step on.
+            steps: The step to train to: a resumed trainer takes ``steps - step``.
+            hooks: What runs between steps, in order (`bux.train.hooks`).
+            sinks: Where what the hooks return goes (`bux.train.sinks`).
+
+        Example::
+
+            trainer.fit(
+                batches(run.train.data, run.train, vocab, start=trainer.step),
+                steps=1000,
+                hooks=[Log(every=10, lr=lambda step: 1e-3, tokens=batch * seq_len)],
+                sinks=[Console("mine", 1000)],
+            )
+        """
         with contextlib.ExitStack() as stack:
             for block in (*sinks, *hooks):
                 stack.callback(block.close)
@@ -843,6 +977,8 @@ def _write(reported: list[tuple[int, Scalars | Later]], sinks: Sequence[Sink]) -
 
 
 def directory(run: ir.Run, out: str | Path) -> Path:
+    """Return the run's directory under `out`: ``<name>-<id>``, its name with what a
+    path cannot hold as ``_``."""
     slug = re.sub(r"[^A-Za-z0-9_.=+-]+", "_", run.name).strip("_")
     return Path(out) / f"{slug}-{run.id}"
 
@@ -859,7 +995,40 @@ def train(
     """Train `run` to its last step, writing to its directory under `out`, after
     preparing the datasets it reads under `cache`; return the latest value of every
     metric. `hooks` run after the run's own, and `sinks` get what all of them return,
-    as the console and metrics.jsonl do."""
+    as the console and metrics.jsonl do.
+
+    It is what ``bux train`` runs for each run of a file. It writes run.bux and
+    run.json into the run's directory (`directory`), builds the model on the run's
+    mesh, resumes from the latest checkpoint there if the run has a ``checkpoint``
+    setting, and trains with the run's own hooks: its log, eval, checkpoint and
+    profile.
+
+    Args:
+        run: A compiled run (`bux.lang.compile_runs`).
+        out: The folder of runs' directories.
+        cache: Where prepared datasets go and are found (`bux.data.pipeline`).
+        echo: What prints the run's lines: its log, and what it resumed from.
+        hooks: More hooks, after the run's own (`bux.train.hooks`).
+        sinks: More sinks, after the console, metrics.jsonl and the latest metrics
+            (`bux.train.sinks`).
+
+    Returns:
+        The latest value of every metric the hooks reported, by name, as `loss`,
+        `eval_loss` and `tokens_per_s`.
+
+    Raises:
+        ValueError: If the model has no vocabulary, the batch does not split over the
+            mesh and the microbatches, or a setting cannot run as asked.
+
+    Example::
+
+        from bux.lang import compile_runs
+        from bux.train.trainer import train
+
+        source = open("examples/experiments/smoke.bux").read()
+        [run] = compile_runs(source, filename="smoke.bux", overrides=["steps=10"])
+        metrics = train(run, out="runs")
+    """
     config, vocab = run.train, run.arch.vocab_size
     if vocab is None:
         raise ValueError("a model without a vocabulary cannot be trained on tokens")
@@ -972,8 +1141,24 @@ def rows_read(
 
 def step_flops(run: ir.Run) -> flops.Work:
     """Return the model FLOPs of a training step of `run`: its loss's gradient on a
-    batch, counted from its program (``flops.count``) on one device, outside any mesh,
-    with remat and kernels off, which would add work or hide it."""
+    batch, counted from its program (`bux.train.flops.count`) on one device, outside
+    any mesh, with remat and kernels off, which would add work or hide it.
+
+    Nothing runs: the step is traced on shapes alone. Attention counts only the keys
+    each query sees, so the FLOPs of a step depend on its batch's documents:
+    ``step_flops(run).of(batch.position_ids)``.
+
+    Args:
+        run: A compiled run.
+
+    Returns:
+        The step's FLOPs, those of every batch and attention's by its mask.
+
+    Example::
+
+        work = step_flops(run)
+        work.one_document(run.train.seq_len)  # a step's FLOPs, a document a row
+    """
     t = run.train
     loss = objective(t.loss, run.arch)
 

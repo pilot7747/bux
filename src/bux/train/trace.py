@@ -109,6 +109,7 @@ def merged(intervals: Intervals) -> Intervals:
 
 
 def length(intervals: Intervals) -> float:
+    """Return the total time of disjoint `intervals`."""
     return sum(end - start for start, end in intervals)
 
 

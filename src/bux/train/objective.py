@@ -1,16 +1,19 @@
 """The objective: the loss a run minimizes, as a weighted sum of named terms.
 
 A term is a function of every head's logits and the batch, and also a metric under
-its name, so another term is a name, a weight and a function:
+its name, so another term is a name, a weight and a function::
 
     obj = objective(run.train.loss, run.arch)
     obj.terms["logit_l2"] = Term(1e-4, lambda logits, batch: jnp.mean(logits[0] ** 2))
 
-A head's logits are made only when a term reads them (``Heads``). The terms here take
-only their sums over positions (``Heads.sums``), which `methods.loss = chunks` takes a
-chunk of positions at a time, and so never makes them all (``bux.architecture.logits``).
+A head's logits are made only when a term reads them (`Heads`). The terms here take
+only their sums over positions (`Heads.sums`), which ``methods.loss = chunks`` takes a
+chunk of positions at a time, and so never makes them all (`bux.architecture.logits`).
 The losses that layers report from a training forward (``report`` in
-``bux.architecture.registry``) are terms too, weighted by each layer.
+`bux.architecture.registry`) are terms too, weighted by each layer.
+
+Position t of a row predicts token t + offset, a target where it is in the loss mask
+and in t's document (`target_mask`); a term is a mean over the batch's targets.
 """
 
 from collections.abc import Callable, Sequence
@@ -29,13 +32,22 @@ from bux.lang import ir
 from bux.train import config as tcfg
 from bux.train.data import Batch
 
-Metrics = dict[str, Float[Array, ""]]  # what a step measured, still on the device
+#: What a step measured, by name: scalars, still on the device.
+Metrics = dict[str, Float[Array, ""]]
 Output = HeadOutput | Float[Array, "b t vocab"]  # a head's output, or its logits
 
 
 class Heads(Sequence):  # not Sequence[Array]: a type checker would read an item
     """Every head's logits on `batch`, in execution order, each made once a term
-    reads it. `sums` gives a head's cross-entropy and z-loss, without them."""
+    reads it. `sums` gives a head's cross-entropy and z-loss, without them.
+
+    ``heads[i]`` is head i's logits, ``b t vocab``: rows, positions, the vocabulary.
+
+    Args:
+        outputs: Each head's output (`~bux.architecture.logits.HeadOutput`), or its
+            logits.
+        batch: The rows the heads ran on.
+    """
 
     def __init__(self, outputs: Sequence[Output], batch: Batch):
         self.outputs, self.batch = list(outputs), batch
@@ -76,7 +88,11 @@ class Heads(Sequence):  # not Sequence[Array]: a type checker would read an item
 
 
 class Term(NamedTuple):
-    weight: float
+    """A term of the objective: its weight, and the function that computes it from
+    every head's logits (`Heads`) and the batch, a mean over the batch's targets.
+    The trainer scales it by each microbatch's share of the targets."""
+
+    weight: float  # what the objective multiplies it by; 0 still logs it
     fn: Callable[[Heads, Batch], Float[Array, ""]]
 
 
@@ -89,7 +105,11 @@ class Part(NamedTuple):
 
 @dataclass
 class Objective:
-    """The sum of weight * term over `terms`, and over the losses layers report."""
+    """The sum of ``weight * term`` over `terms`, and over the losses layers report.
+
+    Attributes:
+        terms: Each term by name, which is also its metric's name.
+    """
 
     terms: dict[str, Term]
 
@@ -97,8 +117,21 @@ class Objective:
         self, outputs: Sequence[Output], batch: Batch, aux_losses: Sequence[Loss] = ()
     ) -> tuple[Part, Part]:
         """Return the objective's two parts: its terms, means over target tokens, and
-        the losses layers report, means over rows, each name's values summed. Each
-        head is given as its output, or as its logits."""
+        the losses layers report, means over rows, each name's values summed.
+
+        Args:
+            outputs: Each head's output, or its logits, in execution order.
+            batch: The rows the heads ran on.
+            aux_losses: What the layers reported from a training forward.
+
+        Returns:
+            The terms' part and the reported losses' part, each its weighted sum and
+            its values by name. The trainer weighs the first by a microbatch's share of
+            the targets and the second by its share of the rows.
+
+        Raises:
+            ValueError: If a layer reports a loss under a term's name.
+        """
         heads = Heads(outputs, batch)
         metrics = {name: term.fn(heads, batch) for name, term in self.terms.items()}
         loss = jnp.zeros((), jnp.float32)
@@ -116,7 +149,24 @@ class Objective:
 def objective(config: tcfg.LossConfig, arch: ir.Architecture) -> Objective:
     """Return the loss of `config` for a model of `arch`: the first head's
     cross-entropy as `loss`, its `z_loss`, and as `mtp` the mean loss of the heads
-    that predict further ahead."""
+    that predict further ahead.
+
+    `z_loss` is a term only where ``config.z`` is not 0, and `mtp` only where the
+    model has more than one head.
+
+    Args:
+        config: The run's ``loss`` setting.
+        arch: The model, whose ``nextn`` layers say how far ahead each head predicts.
+
+    Returns:
+        The objective, whose terms a script may add to or replace.
+
+    Example::
+
+        obj = objective(run.train.loss, run.arch)
+        per_token, per_row = obj(model.heads(tokens, positions), batch)
+        per_token.metrics["loss"]  # the first head's mean cross-entropy
+    """
     offsets, z = prediction_offsets(arch), bool(config.z)
 
     def first(heads: Heads) -> Sums:
