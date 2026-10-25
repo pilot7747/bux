@@ -589,8 +589,8 @@ class MethodsConfig(Config):
     # of the memory and a fifth more time. The delta rule by cuDNN's kernels keeps only
     # its inputs either way.
     states: Literal["keep", "recompute"] = "keep"
-    # A repeat's passes: unroll, a module each; scan, stacked into one module that a
-    # loop runs, which compiles once for all of them.
+    # A repeat's passes: unroll, a module each, run in a row; scan, stacked into one
+    # module that a loop runs, where the passes can stack (else in a row).
     repeat: str = "unroll"
     # A policy by name, or as data: remat(save=[attention], first=8). auto: the first
     # of none, dots_attention, dots, save_attention and full whose step fits.
