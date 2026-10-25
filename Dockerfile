@@ -2,7 +2,7 @@
 
 # GPU image for bux: JAX on CUDA 13 for Blackwell (and Hopper), plus tokamax's Pallas kernels
 # (FlashAttention, MoE grouped matmul) and cudnn-frontend's (KDA), which tokamax's extra brings
-# (docs/training.md, Speed on GPUs), and TransformerEngine's JAX bindings (NCCL EP). CUDA, cuDNN and NCCL come from the
+# (docs/performance/kernels.md), and TransformerEngine's JAX bindings (NCCL EP). CUDA, cuDNN and NCCL come from the
 # `cuda` extra's pip wheels, pinned in uv.lock, so the base image only needs to supply the driver
 # plumbing; CUDA_VERSION should track the toolkit those wheels ship.
 #
@@ -68,7 +68,7 @@ COPY --chown=1000:1000 .python-version pyproject.toml uv.lock ./
 RUN --mount=type=cache,target=/home/$USERNAME/.cache/uv,uid=1000,gid=1000 \
   uv sync --locked --no-dev --extra cuda --no-install-project
 
-# TransformerEngine's JAX bindings, for NCCL EP's dispatch and combine (docs/parallelism.md,
+# TransformerEngine's JAX bindings, for NCCL EP's dispatch and combine (docs/parallelism/experts.md,
 # "TransformerEngine's NCCL EP"). Its core comes built for CUDA 13 (amd64 and arm64), and loads
 # cuRAND, which jax's wheels lack. Its JAX extension is an sdist only: it compiles here against
 # the venv's jax, by the CUDA wheels' headers and NVTX's, with tools that leave after it. NCCL EP

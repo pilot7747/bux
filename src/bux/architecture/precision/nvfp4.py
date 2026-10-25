@@ -3,11 +3,12 @@ row, an E4M3 scale a block and a float32 scale a tensor. W quantizes in 16 x 16 
 so that W and W^T hold the same values; dy rounds stochastically; and x^T and dy^T,
 which dW multiplies, go through a random Hadamard transform of each 16 first.
 
-`twice` quantizes an operand and its transpose (``blockscaled.Twice``): on a GPU by two
-passes of Pallas kernels (`kernel_twice`), the first for the largest magnitudes, which
-set the tensor scales, the second writing both copies, rounded by Blackwell's E2M1
-conversions; elsewhere by XLA (`xla_twice`), their reference. Off a GPU the kernels run
-interpreted, and quantize as XLA does, bit for bit.
+`twice` quantizes an operand and its transpose (a ``blockscaled.Twice``): on a GPU by
+two passes of Pallas kernels (`kernel_twice`), the first for the largest magnitudes,
+which set the tensor scales, the second writing both copies, rounded by Blackwell's
+E2M1 conversions; elsewhere by XLA (`xla_twice`), their reference. Off a GPU the
+kernels run interpreted, and quantize as XLA does, bit for bit. `NVFP4` is the recipe,
+which `~bux.architecture.precision.matmuls` registers as the format ``nvfp4``.
 """
 
 from collections.abc import Callable
@@ -44,14 +45,25 @@ def twice(
     tiles: bool = False,
     stochastic: bool = False,
 ) -> tuple[Blocks, Blocks]:
-    """Return x and x^T in NVFP4: by the kernels on a GPU, and by XLA elsewhere."""
+    """Return x and x^T in NVFP4: by the kernels on a GPU, and by XLA elsewhere.
+
+    Args:
+        x: the operand, (r, c).
+        seed: what stochastic rounding draws its noise from; None for 0.
+        tiles: whether to scale per 16 x 16 tile, the same for x and x^T, as W is.
+        stochastic: whether to round stochastically, as dy is.
+
+    Returns:
+        x and x^T, each in blocks of 16 along its rows. x^T goes through the random
+        Hadamard transform first, unless `tiles`.
+    """
     if not kernels.gpu():
         return xla_twice(x, seed, tiles, stochastic)
     return kernel_twice(x, seed, tiles, stochastic)
 
 
-# NVIDIA's pretraining recipe: W in 16 x 16 tiles, dy rounded stochastically, and the
-# operands of dW transformed.
+#: NVIDIA's pretraining recipe, W in 16 x 16 tiles, dy rounded stochastically, and the
+#: operands of dW transformed.
 NVFP4 = Recipe(
     BLOCK,
     x=twice,
@@ -92,10 +104,21 @@ def quantize(
     stochastic: bool = False,
     hadamard: bool = False,
 ) -> Blocks:
-    """Return x in NVFP4, by XLA: E2M1 values, an E4M3 scale per 16 of a row, or per
-    16 x 16 `tiles` (the same for x and x^T), and a float32 scale that takes x's
-    largest magnitude to 6 x 448. `stochastic` rounds each value up or down, unbiased,
-    by noise of `seed`; `hadamard` first transforms each 16 of a row."""
+    """Return x in NVFP4, by XLA.
+
+    Args:
+        x: the operand, (r, c).
+        seed: what stochastic rounding draws its noise from; None for 0.
+        tiles: whether to scale per 16 x 16 tile, the same for x and x^T, rather than
+            per 16 of a row.
+        stochastic: whether to round each value up or down, unbiased, by noise of
+            `seed`, rather than to nearest.
+        hadamard: whether to transform each 16 of a row first (`hadamard_rows`).
+
+    Returns:
+        E2M1 values, an E4M3 scale per block, and a float32 tensor scale that takes
+        x's largest magnitude to 6 x 448.
+    """
     x = x.astype(jnp.float32)
     if hadamard:
         x = hadamard_rows(x)
@@ -222,10 +245,11 @@ TILE_HADAMARD = np.kron(np.eye(ROWS[0] // BLOCK), HADAMARD).astype(np.float32)
 
 
 class Kind(NamedTuple):
-    """Which operand a kernel quantizes: W, in 16 x 16 `tiles`; dy, rounded
-    `stochastic`ally; else x."""
+    """Which operand a kernel quantizes: W, dy, or else x."""
 
+    #: Whether it is W, scaled per 16 x 16 tile.
     tiles: bool
+    #: Whether it is dy, rounded stochastically.
     stochastic: bool
 
 
@@ -544,10 +568,12 @@ def _offset(axes: Any, size: int) -> UInt32[Array, ""]:
 def _amaxes_partitioned(
     x: Float[Array, "r c"], hadamard: Float[Array, "t t"]
 ) -> Float[Array, "2"]:
+    """Return `_amaxes_by_kernel`, each device running it on its part of x."""
     return _amaxes_by_kernel(x, hadamard)
 
 
 def _amaxes_infer(mesh: Mesh, shapes: tuple[Any, ...], out: Any) -> NamedSharding:
+    """Return how the largest magnitudes split: every device has them."""
     return NamedSharding(mesh, P())
 
 
@@ -585,12 +611,14 @@ def _quantize_partitioned(
     salt: UInt32[Array, "1"],
     kind: Kind,
 ) -> NvArrays:
+    """Return `_quantize`'s copies, each device running it on its part of x."""
     return _quantize(x, hadamard, encode, decode, salt, kind)
 
 
 def _quantize_infer(
     kind: Kind, mesh: Mesh, shapes: tuple[Any, ...], out: Any
 ) -> Shardings:
+    """Return how the copies split, of x as it splits."""
     return blockscaled.copies_shardings(mesh, shapes[0].sharding.spec)
 
 

@@ -10,7 +10,8 @@ include them, so the reference follows the code with nothing to keep in sync by 
     models      the example architectures, from their files' header comments
     cli         ``bux --help``
 
-API signatures show their annotations as the source writes them (``signatures``).
+API signatures show their annotations and defaults as the source writes them
+(``signatures``), and no page may show the build machine's environment (``leaks``).
 """
 
 from pathlib import Path
@@ -20,7 +21,7 @@ from docutils.parsers.rst.states import Inliner
 from sphinx import addnodes
 from sphinx.application import Sphinx
 
-from bux_sphinx import cli, configs, models, registries, signatures
+from bux_sphinx import cli, configs, leaks, models, registries, signatures
 from bux_sphinx.lexer import BuxLexer
 
 
@@ -64,4 +65,5 @@ def setup(app: Sphinx) -> dict[str, object]:
     app.add_role("bux", bux_role)
     app.connect("builder-inited", generate)
     signatures.setup(app)
+    leaks.setup(app)
     return {"parallel_read_safe": True, "parallel_write_safe": True}

@@ -1,0 +1,271 @@
+# Running
+
+`bux train` trains a file's runs in its own process, one after another. This page
+covers the command, what a run writes to its directory, when two runs share an id,
+what the log measures and how it counts FLOPs, and the eval and checkpoint settings.
+To train a sweep on a cluster, or to stop and resume, see [Launching](launching.md).
+
+```console
+$ bux train examples/experiments/smoke.bux
+remat=auto: none in 1s (none 0.0 GiB in 0s)
+smoke step 10/50  loss 6.6252  lr 3.00e-03  grad 1.614  8,069 tok/s
+smoke step 20/50  loss 6.5475  lr 3.00e-03  grad 1.038  74,799 tok/s
+smoke step 30/50  loss 6.3513  lr 3.00e-03  grad 0.554  75,033 tok/s
+smoke step 40/50  loss 6.2974  lr 3.00e-03  grad 0.458  75,813 tok/s
+smoke step 50/50  loss 6.2854  lr 0.00e+00  grad 0.395  74,624 tok/s
+```
+
+The first line is `methods.remat = auto` choosing what the backward keeps
+([Remat](../parallelism/remat.md)); the first log's tokens a second include the
+compile.
+
+## `bux train`
+
+```sh
+bux train FILE [SETTING=VALUE ...] [--out DIR] [--cache DIR] [--only TEXT] [--index N]
+```
+
+| Option | Default | What it does |
+|--------|---------|--------------|
+| `SETTING=VALUE` | | statements after the file, which replace the file's own: `optimizer.lr=1e-2`, `'schedule = cosine(warmup=5)'`, `'use fineweb_wsd'` ([Modules](../language/modules.md)) |
+| `--out DIR` | `runs` | where run directories go |
+| `--cache DIR` | `data/packed` | where prepared datasets are, and go ([The cache](../data/pipeline.md#the-cache)) |
+| `--only TEXT` | | train only the runs whose name contains TEXT |
+| `--index N` | | train only the run at N, from 0, in the order `bux plan` lists them |
+
+```sh
+bux train examples/experiments/smoke.bux optimizer.lr=1e-2 'schedule = cosine(warmup=5)'
+bux train examples/experiments/attention_ablation.bux --only mqa
+```
+
+Before it trains, `bux train` prepares the datasets a run reads that the cache lacks,
+with a process a core ([The pipeline](../data/pipeline.md)). It trains on every
+device its process sees, as the run's `mesh` splits them
+([Parallelism](../parallelism/index.md)). Ctrl-C stops it at once, without saving the
+step it is at; to stop after a step and save it, train with `bux launch`
+([Signals](launching.md#signals)).
+
+The same in Python is {py:func}`bux.train.trainer.train`, which returns the latest
+value of every metric:
+
+```python
+from bux.lang import compile_runs
+from bux.train.trainer import train
+
+path = "examples/experiments/smoke.bux"
+[run] = compile_runs(open(path).read(), filename=path)
+metrics = train(run, "runs")  # {'loss': 6.2854, 'grad_norm': 0.3948, ...}
+```
+
+## The run directory
+
+A run writes to `<out>/<name>-<id>/`: its name, each run of characters other than
+letters, digits and `_.=+-` made one `_`, then its id. `smoke[optimizer.lr=1e-3]` goes
+to `runs/smoke_optimizer.lr=1e-3-e3a8d2164a/`.
+
+| File | What it holds | Written by |
+|------|---------------|------------|
+| `run.bux` | the run as one file: no modules, no alternatives. `bux train` takes it as is | `train` |
+| `run.json` | the run's IR, {py:class}`bux.lang.ir.Run` as JSON | `train` |
+| `metrics.jsonl` | a line of metrics every `log.every` steps, and at every eval | `train` |
+| `checkpoints/` | the model's and the optimizer's state, with a `checkpoint` setting (orbax) | `train` |
+| `profile/` | a `jax.profiler` trace, with a `profile` setting | `train` |
+| `status.json` | whether the run is running, done, failed or stopped, and its latest metrics | `bux launch` |
+| `train.log` | a sweep's worker's output | `bux launch` |
+
+The smoke run's `run.bux`, its settings as the compiler resolved them (`4 * d_model` is
+256 here):
+
+```bux
+# smoke, run f114ac17ae
+d_model = 64
+vocab_size = 512
+
+norm = rmsnorm
+attn = gqa(num_heads=4, num_kv_heads=2, rope=rope())
+ffn = gated_mlp(intermediate_size=256, activation=swish)
+
+block = [norm attn] [norm ffn]
+
+model = embed block^2 norm head(tied=true)
+
+data = synthetic()
+optimizer = adamw(lr=0.003)
+schedule = wsd(warmup=10)
+seq_len = 64
+batch = 8
+steps = 50
+```
+
+`bux fmt FILE` prints the same for every run of a file without training it, and
+`bux json FILE` every run's IR.
+
+## Run ids
+
+A run's id is a hash of what it computes, so a changed run starts in a directory of
+its own, and an unchanged one started again finds its checkpoints and resumes from
+the latest, ending exactly where it would have ([Resuming](launching.md#resuming)).
+
+| Keeps the id | Changes it |
+|--------------|------------|
+| renaming a definition | the architecture: any layer, setting or wiring |
+| reaching the same settings through another file, an amendment or a sweep | `data`, `tokenizer` and `packing` |
+| `log`, `eval`, `checkpoint`, `profile` | `optimizer`, `schedule`, `clip`, `loss` |
+| `mesh`, `layout`, `methods`, `compiler` | `seq_len`, `batch`, `steps`, `seed` |
+| `precision.eval` | the rest of `precision` |
+
+The first line of `bux fmt`'s output shows the id, so it shows what keeps it:
+
+```console
+$ bux fmt examples/experiments/smoke.bux | head -1
+# smoke, run f114ac17ae
+$ bux fmt examples/experiments/smoke.bux 'mesh = mesh(fsdp=2)' 'methods.remat = full' 'compiler.preset = o1' | head -1
+# smoke, run f114ac17ae
+$ bux fmt examples/experiments/smoke.bux 'checkpoint = checkpoint(every=10)' 'eval = eval(data=synthetic, every=10)' | head -1
+# smoke, run f114ac17ae
+$ bux fmt examples/experiments/smoke.bux 'optimizer.lr = 1e-2' | head -1
+# smoke, run f5babdd0aa
+$ bux fmt examples/experiments/smoke.bux seed=1 | head -1
+# smoke, run 5240ec399f
+```
+
+The sweep `'optimizer.lr = 1e-3 | 3e-3'` of the smoke run makes `smoke[optimizer.lr=3e-3]`
+with id `f114ac17ae`, the plain smoke run's: its learning rate is the file's own.
+
+:::{note}
+Since `mesh`, `layout` and `methods` are not in the id, a run resumes on another mesh
+or another number of nodes. The few methods that change how a checkpoint lays out the
+state, `methods.repeat` and a pipeline's `rounds` and `stages`, are checked when a run
+resumes ([Resuming](launching.md#resuming)).
+:::
+
+A setting or a field added after run ids existed is left out of the hash where its
+value computes as runs did before it, so that the runs of an older tree keep their
+ids and resume.
+
+## The log
+
+`log = log(every=10)`, the default, reports the step's metrics every 10 steps and at
+the last, to the console and to `metrics.jsonl`:
+
+```text
+{"step": 10, "grad_norm": 1.6137837171554565, "loss": 6.625185489654541, "lr": 0.003000000026077032, "tokens": 5120, "tokens_per_s": 8069.19861788206}
+{"step": 20, "grad_norm": 1.0376627445220947, "loss": 6.547478199005127, "lr": 0.003000000026077032, "tokens": 10240, "tokens_per_s": 74798.71367274257}
+```
+
+| Metric | What it is |
+|--------|------------|
+| `loss` | the first head's cross-entropy on the step's batch |
+| `z_loss`, `mtp` | the objective's other terms, with a z-loss or heads after the first ([The loss](optimizers.md#the-loss)) |
+| `balance_loss`, `indexer_loss`, ... | what layers report, summed over the layers that report the name ([Losses from a layer](extending.md#losses-from-a-layer)) |
+| `grad_norm` | the gradient's global norm, before clipping |
+| `lr` | the learning rate of the step just taken |
+| `tokens` | the tokens trained on so far: steps × `batch` × `seq_len` |
+| `tokens_per_s` | tokens a second since the last log |
+| `mfu` | model FLOPs a second over the devices' peak, on GPUs whose peak bux knows ([MFU](#mfu)) |
+| `eval_loss` | the held-out loss, at an eval ([Eval](#eval)) |
+| `comm_ms`, `exposed_comm_ms`, `idle_ms` | what a profiled step spent communicating and idle ([Profiling](../performance/profiling.md)) |
+
+The console shows `loss`, `lr`, `grad_norm`, `tokens_per_s`, `mfu` and `eval_loss`;
+`metrics.jsonl` has every metric. Reading a step's loss waits for that step, so the
+log reads it once the next step is launched, and the GPU never waits for the host to
+log ([The host between steps](extending.md#the-host-between-steps)).
+
+## MFU
+
+On a GPU whose peak bux knows, the log has `mfu`: the model's FLOPs a second over the
+peak of the mesh's GPUs. The peaks are dense bfloat16 tensor FLOPs a second, from
+NVIDIA's datasheets for the SXM parts ({py:data}`bux.train.flops.PEAK`):
+
+| GPU | Peak, dense bfloat16 |
+|-----|----------------------|
+| B300, B200 | 2.25 PFLOP/s |
+| H200, H100 | 989 TFLOP/s |
+| A100 | 312 TFLOP/s |
+
+### How FLOPs are counted
+
+The model's FLOPs are counted once, before training, from the program of its loss's
+gradient on a batch, traced on shapes alone with remat and kernels off
+({py:func}`bux.train.trainer.step_flops`, {py:mod}`bux.train.flops`):
+
+- 2·m·n·k for every matrix product and convolution, times the length of every scan
+  around it;
+- the larger branch of a `cond`, and a while loop's body once;
+- each product once: what a backward pass computes again (`jax.checkpoint`'s, the
+  logits of a flash backward) counts none.
+
+So a new layer counts with no formula of its own.
+
+**Attention counts only the keys each query sees**, as Megatron's MFU does and a flash
+kernel computes. Its products over the keys of a row are counted apart (inside
+`flops.attention`), and each step counts them at the keys its batch's queries see,
+from the batch's positions ({py:meth}`bux.train.flops.Work.of`, on the host): those of
+the query's own document up to itself, within the window, and of those no more than a
+sparse attention's `top_k`. So:
+
+- causal attention on rows of one document counts (t + 1) / 2t of its t × t logits;
+- packed documents count each one's own triangle;
+- DSA counts its `top_k` keys a query in the attention, the indexer's loss and its
+  target, with the indexer's ranking at every key it may pick;
+- CSA's latents count whole.
+
+On many hosts a step counts the keys of the rows its host reads. PaLM's MFU counts
+attention whole, which made bux's 10% higher at 4096 tokens a row.
+
+`bux plan` shows the FLOPs a token on rows of one document: 6.9G for a Llama-style
+1.3B at 4096 tokens a row, 6 N of its matrices and 0.8G of attention.
+
+## Eval
+
+```bux
+eval = eval(data=fineweb(split=[0.99, 1]), every=125, batches=20)
+```
+
+{bux}`eval` reports the held-out loss, `eval_loss`, every `every` steps and at the
+last:
+
+| Field | Default | What it is |
+|-------|---------|------------|
+| `data` | required | the held-out rows: any data a run takes, a mixture too |
+| `every` | `1000` | steps between evals |
+| `batches` | `10` | batches of `batch` rows each, the same ones every time |
+
+The held-out loss is the first head's cross-entropy, averaged over the batches, with
+the model in eval mode: dropout off, an MoE's router bias left as it is, and the
+losses layers report left out. It multiplies as training does, or in `compute` with
+`precision(eval=compute)` ([Precision](precision.md)).
+
+Held-out rows come from a stream of their own, drawn independently of training's. A
+`split` of the same documents is the usual held-out set: `split=[0, 0.99]` and
+`split=[0.99, 1]` are disjoint and cover everything ([Splits](../data/sources.md#splits)).
+
+## Checkpoints
+
+```bux
+checkpoint = checkpoint(every=500, keep=2)
+```
+
+{bux}`checkpoint` saves the model's state and the optimizer's under the run's
+`checkpoints/`, every `every` steps (1000 by default) and at the last, keeping the
+`keep` most recent (2). Under `bux launch` a run that stops early also saves the step
+it stopped at.
+
+A checkpoint holds everything a run needs to go on as if it had not stopped: the
+model's state (its parameters and buffers, random keys and an MoE's router bias with
+them) and the optimizer's. A run that finds checkpoints in its directory resumes from
+the latest one:
+
+```text
+smoke: restored in 0.1s, resuming at step 1500
+```
+
+[Resuming](launching.md#resuming) says what a resume keeps, how it was verified, and
+how it fails when it cannot work.
+
+## Profile
+
+`profile = profile(start=20, steps=5)` traces the 5 steps after step 20 into the run's
+`profile/`, for `xprof` or TensorBoard's profile plugin; its defaults are `start=10`
+and `steps=5`. On GPUs the log then reports what a traced step spent communicating and
+idle. [Profiling](../performance/profiling.md) covers the trace and those metrics.

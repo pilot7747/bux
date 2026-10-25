@@ -3,6 +3,10 @@
 A document's key is a hash of its content, not of where it is or how it tokenizes.
 So a split by key holds out the same documents whatever the tokenizer, and the
 documents a reduce gets, sorted by key, do not depend on the engine.
+
+`text` maps a batch of raw text and `chat` a batch of conversations, each to a
+record batch of documents in `SCHEMA`. `~bux.data.pipeline.Job.map` picks the one
+its source needs.
 """
 
 import hashlib
@@ -18,6 +22,12 @@ from jaxtyping import Bool, Int64, Integer
 from bux.data.tokenizer import Tokenizer, utf8
 from bux.train import config as tcfg
 
+#: The documents the map makes, a row each.
+#:
+#: ``key`` is 63 random bits, a hash of the content; ``input_ids`` the tokens, and
+#: ``loss_mask`` whether each is a target.
+#:
+#: :meta hide-value:
 SCHEMA = pa.schema(
     [
         ("key", pa.int64()),  # 63 random bits
@@ -29,12 +39,22 @@ SCHEMA = pa.schema(
 
 @dataclass(frozen=True)
 class Template:
-    start: str  # before the first message
-    header: str  # before each message, with its {role}
-    end: str  # after each message: the token that ends a reply, learned with it
-    sep: str = ""  # after `end`
+    """A chat template: the text around each message, special tokens as ``<|name|>``.
+
+    Attributes:
+        start: Before the first message.
+        header: Before each message, with its ``{role}``.
+        end: After each message: the token that ends a reply, learned with it.
+        sep: After `end`.
+    """
+
+    start: str
+    header: str
+    end: str
+    sep: str = ""
 
 
+#: The chat templates that ``chat(template=...)`` takes, by name.
 TEMPLATES = {
     "chatml": Template("", "<|im_start|>{role}\n", "<|im_end|>", "\n"),
     "llama3": Template(
@@ -68,6 +88,8 @@ def record_batch(
     offsets: Integer[np.ndarray, " docs+1"],
     mask: Bool[np.ndarray, " tokens"],
 ) -> pa.RecordBatch:
+    """Return documents as a record batch in `SCHEMA`: their keys, and their token ids
+    and loss masks end to end, the i-th document at ``offsets[i]:offsets[i + 1]``."""
     offsets = pa.array(offsets.astype(np.int32))
     columns = [
         pa.array(keys, pa.int64()),
@@ -80,6 +102,20 @@ def record_batch(
 def text(
     batch: pa.RecordBatch, config: tcfg.TextConfig, tok: Tokenizer
 ) -> pa.RecordBatch:
+    """Map a batch of raw text to documents, every token a target.
+
+    A row's text is a document, keyed by a hash of its bytes. Documents outside the
+    source's `split` are left out, and so are those that tokenize to nothing; the
+    others get the tokenizer's bos first and eos last where the source asks.
+
+    Args:
+        batch: Records with the source's text column.
+        config: The ``text(...)`` source.
+        tok: The run's tokenizer.
+
+    Returns:
+        The documents, in `SCHEMA`.
+    """
     texts = batch.column(config.column)
     start, chars = utf8(texts)
     keys = _keys(chars[a:b] for a, b in itertools.pairwise(start.tolist()))
@@ -107,6 +143,27 @@ def _content(message: dict) -> str:
 def chat(
     batch: pa.RecordBatch, config: tcfg.ChatConfig, tok: Tokenizer
 ) -> pa.RecordBatch:
+    """Map a batch of conversations to documents, rendered with a chat template.
+
+    A row is a conversation in the OpenAI format, a list of ``{role, content}``
+    messages, ``content`` a string or a list of ``{type, text}`` parts; it is keyed
+    by a hash of its messages. Each message is its template's header, its content,
+    the template's end and its separator. The loss mask follows `train_on`: every
+    assistant reply with the end that closes it (``"assistant"``), only the last
+    reply (``"last"``), or every token (``"all"``). A conversation with nothing to
+    learn is left out, as are those outside the source's `split`.
+
+    Args:
+        batch: Records with the source's column of messages.
+        config: The ``chat(...)`` source.
+        tok: The run's tokenizer, which must have the template's special tokens.
+
+    Returns:
+        The documents, in `SCHEMA`.
+
+    Raises:
+        ValueError: If the tokenizer lacks a special token of the template.
+    """
     conversations = batch.column(config.column).to_pylist()
     keys = _keys(json.dumps(m, sort_keys=True).encode() for m in conversations)
     keep = _in_split(keys, config.split)

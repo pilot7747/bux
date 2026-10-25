@@ -3,6 +3,10 @@
 A plan lays out the rows as pieces of documents end to end, `length` tokens per row,
 with padding as pieces of a pad region after the documents. Any range of rows is then
 one gather, so a chunk is written one row group at a time.
+
+`Docs.of` reads a chunk's documents, `plan` packs them as the run's packing says
+(``concat``, ``greedy`` or ``best_fit``), and `materialize` writes the planned rows
+in `SCHEMA`.
 """
 
 import itertools
@@ -17,6 +21,12 @@ from jaxtyping import Bool, Int, Int32, Int64, Shaped
 
 from bux.train import config as tcfg
 
+#: The rows a prepared dataset holds, each three lists of `length` values.
+#:
+#: ``input_ids`` the tokens, ``position_ids`` where each is in its document (or in
+#: the row, without a document mask), and ``loss_mask`` whether each is a target.
+#:
+#: :meta hide-value:
 SCHEMA = pa.schema(
     [
         ("input_ids", pa.list_(pa.int32())),
@@ -37,16 +47,25 @@ def flat(
 
 @dataclass(frozen=True)
 class Docs:
-    """Documents in key order, end to end, then a row of padding."""
+    """Documents in key order, end to end, then a row of padding.
+
+    Attributes:
+        ids: Every token, then `length` zeros of padding.
+        mask: Whether each is a target; the padding is not.
+        positions: Each token's position in its document, or in the padding.
+        offsets: n + 1 offsets: where each document starts, and then where the
+            padding does.
+    """
 
     ids: Int32[np.ndarray, " tokens"]
     mask: Bool[np.ndarray, " tokens"]
-    positions: Int32[np.ndarray, " tokens"]  # in its document, or in the padding
-    # n + 1: where each document starts, and then where the padding does
+    positions: Int32[np.ndarray, " tokens"]
     offsets: Int64[np.ndarray, " _"]
 
     @classmethod
     def of(cls, table: pa.Table, length: int) -> "Docs":
+        """Return the documents of `table` (in the map's schema, in any order),
+        sorted by key, with a row of `length` tokens of padding after them."""
         table = table.sort_by("key")  # whatever order an engine delivered them in
         ids, offsets = flat(table["input_ids"])
         mask, _ = flat(table["loss_mask"])
@@ -61,9 +80,23 @@ class Docs:
 
 @dataclass(frozen=True)
 class Plan:
-    starts: Int[np.ndarray, " pieces"]  # in row order
+    """The rows of a chunk, as pieces of `Docs` laid end to end.
+
+    Row ``r`` is the pieces ``rows[r]:rows[r + 1]``, which add up to `length`
+    tokens; a piece is ``starts[i]:starts[i] + lengths[i]`` of `Docs`, padding
+    included.
+
+    Attributes:
+        starts: Where each piece starts in `Docs`, in row order.
+        lengths: Each piece's tokens.
+        rows: r + 1 offsets: where each row's pieces start.
+        stats: Counts of documents, tokens, rows, padding, tokens cut and
+            documents dropped, truncated or split; `materialize` adds targets.
+    """
+
+    starts: Int[np.ndarray, " pieces"]
     lengths: Int[np.ndarray, " pieces"]
-    rows: Int[np.ndarray, " _"]  # r + 1: where each row's pieces start
+    rows: Int[np.ndarray, " _"]
     stats: Counter
 
 
@@ -158,7 +191,26 @@ def _layout(
 
 
 def plan(docs: Docs, config: tcfg.PackingConfig, length: int, seed: int) -> Plan:
-    """Plan the rows of the documents in `docs`, in a random order."""
+    """Plan the rows of the documents in `docs`, in a random order.
+
+    ``concat`` cuts the documents, end to end, into windows of `length` that
+    overlap by a token, so that every token is a target once; what does not fill a
+    window is cut. ``greedy`` and ``best_fit`` first cut documents longer than a row
+    as their `long` says (drop, truncate, or split into pieces that overlap by a
+    token), then pack the pieces into rows padded to `length`: in key order, which is
+    random, a new row whenever the next piece does not fit (``greedy``), or each into
+    the open row it leaves least room in, longest first (``best_fit``). Either closes
+    a row once it holds `max_docs` pieces.
+
+    Args:
+        docs: A chunk's documents.
+        config: The run's packing.
+        length: The tokens of a row: the run's ``seq_len``.
+        seed: Seeds the order of the rows; the pipeline passes the chunk's index.
+
+    Returns:
+        The plan, with its statistics so far.
+    """
     rng = np.random.default_rng(seed)
     tokens = int(docs.offsets[-1])
     stats = Counter(docs=len(docs.offsets) - 1, tokens=tokens)
@@ -181,7 +233,23 @@ def plan(docs: Docs, config: tcfg.PackingConfig, length: int, seed: int) -> Plan
 def materialize(
     docs: Docs, plan: Plan, length: int, doc_mask: bool, size: int
 ) -> Iterator[pa.RecordBatch]:
-    """Yield the planned rows, `size` at a time, counting targets in `plan.stats`."""
+    """Yield the planned rows, `size` at a time, counting targets in `plan.stats`.
+
+    With `doc_mask`, positions count from each document's start, and a piece that
+    continues a document starts at 0, as rows do; without it, they count from each
+    row's start. A target is a token in `mask` that is not at position 0.
+
+    Args:
+        docs: The documents that `plan` was made of.
+        plan: Their rows.
+        length: The tokens of a row.
+        doc_mask: Whether positions restart at every document (the packing's
+            ``doc_mask``).
+        size: Rows a batch: the dataset's row group.
+
+    Yields:
+        Record batches of rows in `SCHEMA`.
+    """
     for a in range(0, len(plan.rows) - 1, size):
         lo, hi = plan.rows[a], plan.rows[min(a + size, len(plan.rows) - 1)]
         starts, lengths = plan.starts[lo:hi], plan.lengths[lo:hi]

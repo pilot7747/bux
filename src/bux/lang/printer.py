@@ -4,6 +4,10 @@ Every labeled node becomes a definition, so the output reads like hand-written s
 leaf definitions, then blocks in dependency order, then the model. Macro calls are
 inlined, since the IR only keeps what they produced. ``compile(to_source(a))``
 equals ``a`` up to labels, and a run's source compiles back to a run with its id.
+
+`to_source` prints an architecture and `run_to_source` a run (``bux fmt`` prints
+either); `config_to_source` and `value_to_source` print one config or one value, as
+hovers and the language reference show them.
 """
 
 import re
@@ -230,13 +234,49 @@ class _Printer:
 
 
 def to_source(arch: ir.Architecture) -> str:
+    """Print an architecture as .bux source, which compiles back to it.
+
+    The settings come first, then a definition for each labeled leaf and block, in
+    dependency order, then the model. Settings at their defaults are left out, and
+    arithmetic shows its result (``4 * d_model`` prints as ``256``).
+
+    Args:
+        arch: What `bux.lang.compile` returned, or any architecture.
+
+    Returns:
+        The source, ending with a newline. ``compile(to_source(arch))`` equals
+        `arch` up to labels.
+
+    Example::
+
+        print(to_source(compile(open("examples/experiments/smoke.bux").read())))
+        # d_model = 64
+        # vocab_size = 512
+        #
+        # norm = rmsnorm
+        # attn = gqa(num_heads=4, num_kv_heads=2, rope=rope())
+        # ffn = gated_mlp(intermediate_size=256, activation=swish)
+        #
+        # block = [norm attn] [norm ffn]
+        #
+        # model = embed block^2 norm head(tied=true)
+    """
     return _Printer(arch).architecture()
 
 
 def run_to_source(run: ir.Run) -> str:
     """Print a run as one file: no modules, no alternatives, nothing left to resolve.
 
-    Training settings at their defaults are left out, as config settings are.
+    This is the ``run.bux`` a run's directory keeps, and what ``bux fmt`` prints for
+    each run of a sweep. A first comment names the run and its id; the architecture
+    follows as `to_source` prints it, then the training settings. Those at their
+    defaults are left out, as config settings are.
+
+    Args:
+        run: One run, as `bux.lang.compile_runs` returns them.
+
+    Returns:
+        The source, which compiles back to a run with the same id.
     """
     printer = _Printer(run.arch)
     arch = printer.architecture()
@@ -256,10 +296,30 @@ _PLAIN = ir.Architecture(d_model=1, graph=ir.Identity())
 
 
 def config_to_source(config: cfg.Config) -> str:
-    """Print one config as source, without defaults: gqa(num_heads=8, num_kv_heads=8)."""
+    """Print one config as source, without its defaults.
+
+    Args:
+        config: A layer's or a setting's config.
+
+    Returns:
+        A call such as ``gqa(num_heads=8, num_kv_heads=8)`` or ``adamw(lr=0.003)``,
+        or the bare name where every setting is at its default, ``rmsnorm``.
+    """
     return _Printer(_PLAIN).config(config)
 
 
 def value_to_source(value: object) -> str:
-    """Print a setting value as source: 1e-05, swish, none, rope(), [1, 2]."""
+    """Print a setting's value as source, as the language reference shows defaults.
+
+    Args:
+        value: A bool, None, a number, a string, a config, a mix of sources, or a
+            list or tuple of them.
+
+    Returns:
+        The value as a ``.bux`` file writes it: ``1e-05``, ``swish``, ``none``,
+        ``rope()``, ``[1, 2]``.
+
+    Raises:
+        TypeError: For a value that has no source, such as a dict.
+    """
     return _Printer(_PLAIN).value(value)

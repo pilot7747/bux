@@ -1,14 +1,18 @@
-"""Triton's quantizer of ``grouped_blockscaled``: x and x^T in MXFP8, E4M3 values with
-a power-of-two scale per 32, in one pass over x, straight into the layout that
-``grouped_mxfp8``'s kernels load (`grouped_mxfp8.Tiled`): each copy padded by 0 to
-whole tiles of 128 along what it is in blocks along, and each tile's scales in their
-bytes of tensor memory's 512-byte tiles. x is a matrix, or a stack of them, (g, r, c),
-as each expert's W is; its rows from `filled` on quantize as 0. Given an index, the
-rows are x[index], each read from x where it lies: an MoE's picks, from its tokens; a
-row at -1 is 0. Given `halves`, x's columns are pairs, as a gated MLP's up and gate
-lie, read as ``grouped_cudnn``'s GLU takes them (`halves_of`).
+"""Triton's quantizer of `~bux.architecture.experts.grouped_blockscaled`: x and x^T
+in MXFP8, E4M3 values with a power-of-two scale per 32, in one pass over x, straight
+into the layout that `~bux.architecture.experts.grouped_mxfp8`'s kernels load
+(`~bux.architecture.experts.grouped_mxfp8.Tiled`).
 
-A program takes TILE_ROWS rows by 128 columns of x, in x's dtype: x's blocks along
+Each copy is padded by 0 to whole tiles of 128 along what it is in blocks along, and
+each tile's scales lie in their bytes of tensor memory's 512-byte tiles. x is a
+matrix, or a stack of them, (g, r, c), as each expert's W is; its rows from `filled`
+on quantize as 0. Given an index, the rows are ``x[index]``, each read from x where it
+lies: an MoE's picks, from its tokens; a row at -1 is 0. Given `halves`, x's columns
+are pairs, as a gated MLP's up and gate lie, read as
+`~bux.architecture.experts.grouped_cudnn`'s GLU takes them
+(`~bux.architecture.experts.grouped_cudnn.halves_of`).
+
+A program takes ``TILE_ROWS`` rows by 128 columns of x, in x's dtype: x's blocks along
 its rows, and x^T's down x's columns, so that only the E4M3 bytes of x^T transpose.
 The scaling, by a power of two, is exact in bfloat16 as in float32. `transposed`
 transposes E4M3 bytes on their own, the GLU's halves back into pairs.
@@ -43,11 +47,23 @@ def quantized_twice(
     index: Int[Array, " m"] | None = None,
     halves: bool = False,
 ) -> tuple[Tiled, Tiled | None]:
-    """Return x along its rows and, if `columns`, x^T along its rows, in MXFP8 as
-    `blockscaled.mx_twice` quantizes them, laid out as `grouped_mxfp8.Tiled`: of x
-    (r, c), values (r, c') and (c, r'), c' and r' whole tiles of 128. Given `index`,
-    of x[index] (m, c), a matrix of x's rows, 0 where the index is -1. With `halves`,
-    x's pairs of columns as a GLU's halves (`halves_of`)."""
+    """Return x and x^T in MXFP8, each in blocks along its rows, as
+    `bux.architecture.precision.blockscaled.mx_twice` quantizes them.
+
+    Args:
+        x: a matrix (r, c), or a stack of them (g, r, c).
+        filled: the rows of x that hold values; those from it on quantize as 0.
+        columns: whether to return x^T too.
+        index: the rows of x to quantize, ``x[index]`` (m, c), a matrix of x's rows,
+            0 where the index is -1; None for x itself.
+        halves: whether x's pairs of columns go in as a GLU's halves
+            (`~bux.architecture.experts.grouped_cudnn.halves_of`).
+
+    Returns:
+        x and, if `columns`, x^T (else None), laid out as
+        `~bux.architecture.experts.grouped_mxfp8.Tiled`: of x (r, c), values (r, c')
+        and (c, r'), c' and r' whole tiles of 128.
+    """
     stack = x if x.ndim == 3 else x[None]
     g, r, c = stack.shape if index is None else (1, *index.shape, x.shape[-1])
     rt, ct = -(-r // LANES), -(-c // LANES)
@@ -87,9 +103,12 @@ def _tiled(
 def transposed(
     values: Shaped[Array, "r c"], pairs: bool = False
 ) -> Shaped[Array, "c r"]:
-    """Return E4M3 values (r, c), c whole tiles of 128, as (c, r). With `pairs`, x's
-    columns are a GLU's halves (`halves_of`), and come out as pairs again: row 2u of
-    the result is pair u's up, row 2u + 1 its gate."""
+    """Return E4M3 values (r, c), c whole tiles of 128, as (c, r).
+
+    With `pairs`, the columns are a GLU's halves
+    (`~bux.architecture.experts.grouped_cudnn.halves_of`), and come out as pairs
+    again: row 2u of the result is pair u's up, row 2u + 1 its gate.
+    """
     r, c = values.shape
     out = jax_triton.triton_call(
         jax.lax.bitcast_convert_type(values, jnp.uint8),
@@ -180,9 +199,9 @@ def _tile_of(
     else:
         at = x + tl.program_id(0).to(tl.int64) * r * c + rs[:, None].to(tl.int64) * c
     read = cs
-    if (
-        halves
-    ):  # in each 64 columns, the gates of 32 pairs (their odd columns), then ups
+    # As halves: in each 64 columns, the gates of 32 pairs (their odd columns), then
+    # their ups.
+    if halves:
         read = cs // 64 * 64 + cs % 32 * 2 + (cs % 64 < 32).to(tl.int32)
     tile = tl.load(
         at + read[None, :], mask=kept[:, None] & (cs < c)[None, :], other=0.0
@@ -249,7 +268,8 @@ def _store_scales(
     exponents: tl.tensor,
 ) -> None:
     """Store the exponents of `lines` (rows of 128) and their blocks from `first` (of
-    4) in their bytes of 512-byte tile `tile`: row i's 4 at (i % 32) * 16 + (i // 32) * 4."""
+    4) in their bytes of 512-byte tile `tile`: row i's 4 at
+    ``(i % 32) * 16 + (i // 32) * 4``."""
     blocks = first + tl.arange(0, exponents.shape[1])
     at = (lines[:, None] % 32) * 16 + (lines[:, None] // 32) * 4 + blocks[None, :]
     tl.store(scales + tile * 512 + at, exponents)

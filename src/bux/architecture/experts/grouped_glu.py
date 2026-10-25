@@ -1,7 +1,10 @@
-"""The experts' gated MLP in MXFP8 by cuDNN's fused kernels (``grouped_cudnn``) on a
-Blackwell GPU: SwiGLU, each row's weight and both quantizations of the hidden units in
-the epilogue of up's GEMM, and their gradient in that of down's dgrad; x, dy and the
-weights quantized by Triton (``grouped_triton``). A row of ``moe.experts`` goes
+"""The experts' gated MLP in MXFP8 by cuDNN's fused kernels
+(`~bux.architecture.experts.grouped_cudnn`) on a Blackwell GPU.
+
+SwiGLU, each row's weight and both quantizations of the hidden units run in the
+epilogue of up's GEMM, and their gradient in that of down's dgrad; Triton quantizes x,
+dy and the weights (`~bux.architecture.experts.grouped_triton`). A row of
+`bux.architecture.experts.moe.experts` goes through these kernels::
 
     forward   x, W_up          swiglu    h, and the product x W_up, kept
               h, W_down        rows      y, summed into its token
@@ -12,14 +15,15 @@ weights quantized by Triton (``grouped_triton``). A row of ``moe.experts`` goes
 The kernels take each expert's rows from a multiple of 256 (`Padded`): the quantizer
 reads each row from its token where it lies, and the sums read the rows back. Rows
 that sum into no token, as an exchange's, come out as they lay, each expert's after
-the last's, by bux's own GEMM (``grouped_mxfp8.rows``), which packs them so. Their
-GLU takes each gate 32 columns before its up (``grouped_cudnn.halves_of``), where W_up
-holds them side by side: the quantizer reads W_up's pairs so, and the transpose of dp
-for W_up's wgrad turns them back into pairs.
+the last's, by bux's own GEMM (`bux.architecture.experts.grouped_mxfp8.rows`), which
+packs them so. Their GLU takes each gate 32 columns before its up
+(`~bux.architecture.experts.grouped_cudnn.halves_of`), where W_up holds them side by
+side: the quantizer reads W_up's pairs so, and the transpose of dp for W_up's wgrad
+turns them back into pairs.
 
 Where FSDP splits the experts' kernels by expert, `gathered` quantizes each device's
-shard of them before it gathers them, in MXFP8 (`Weights`): a share of the work, and
-the bytes of bfloat16's.
+shard of them before it gathers them, in MXFP8 (`Weights`): each device does its share
+of the work, and the gathers move about half of bfloat16's bytes.
 """
 
 from functools import partial
@@ -43,13 +47,17 @@ except ImportError:
 
 
 class Padded(NamedTuple):
-    """Rows by expert, each expert's from a multiple of 256: the row of the tokens each
-    reads (-1: a row of 0), where each token's k rows lie among them (past them: none;
-    None: the rows are the output), where each expert's end, and how many it has."""
+    """Rows by expert, each expert's from a multiple of 256, as the kernels take
+    them."""
 
+    #: The row of the tokens each row reads; -1 for a row of 0.
     source: Int[Array, " p"]
+    #: Where each token's k rows lie among them, past them for none; None when the
+    #: rows are the output.
     picks: Int[Array, "t k"] | None
+    #: Where each expert's rows end.
     ends: Int[Array, " E"]
+    #: How many rows each expert has.
     sizes: Int[Array, " E"]
 
     @property
@@ -59,12 +67,16 @@ class Padded(NamedTuple):
 
 
 class Weights(NamedTuple):
-    """The experts' kernels in MXFP8 as the GEMMs take them: up's, its pairs as halves,
-    along what its dgrad and its forward contract, and down's."""
+    """The experts' kernels in MXFP8 as the GEMMs take them, each in blocks along what
+    its GEMM contracts; up's pairs of columns as the GLU's halves."""
 
+    #: W_up, in blocks along what its dgrad contracts.
     up_dgrad: Tiled
+    #: W_up, in blocks along what its forward contracts.
     up_fprop: Tiled
+    #: W_down, in blocks along what its dgrad contracts.
     down_dgrad: Tiled
+    #: W_down, in blocks along what its forward contracts.
     down_fprop: Tiled
 
 
@@ -74,8 +86,18 @@ def runs(
     ffn: cfg.MLPConfig,
     up: Float[Array, "E d f p"],
 ) -> bool:
-    """Whether the fused kernels run an MoE's experts here: on a Blackwell GPU, a SwiGLU
-    FFN of shapes they take, in MXFP8 in every pass."""
+    """Return whether the fused kernels run an MoE's experts here.
+
+    They do on a Blackwell GPU with cudnn-frontend and Triton, for a SwiGLU FFN with
+    no clamp or soft cap whose width and hidden units are whole tiles of 256, of at
+    most 1024 experts, in MXFP8 in every pass.
+
+    Args:
+        recipe: the experts' block-scaled format; None for compute.
+        passes: the GEMMs that multiply in the format.
+        ffn: the experts' FFN settings.
+        up: the experts' up kernels, (E, d, f, p).
+    """
     swiglu = ffn.type == "gated_mlp" and ffn.activation == "swish"
     plain = ffn.limit is None and ffn.up_softcap is None
     in_format = recipe is blockscaled.MXFP8 and set(passes) == set(PASSES)
@@ -94,10 +116,24 @@ def mlp(
     summed: grouped_blockscaled.Summed | None = None,
     quantized: Weights | None = None,
 ) -> Float[Array, "r d"]:
-    """Return what ``moe.experts`` does of a SwiGLU FFN with no norm: each row of x
-    through its expert's FFN times its weight, x read from the tokens where it was
-    `picked`, or the sums of the tokens it is `summed` into; the kernels as they are
-    `quantized`, if they are, up and down then taking only their gradients."""
+    """Return what `bux.architecture.experts.moe.experts` does of a SwiGLU FFN with no
+    norm: each row of x through its expert's FFN, times its weight.
+
+    Args:
+        x: the rows, m of d, sorted by expert.
+        sizes: how many rows each expert has.
+        weights: each row's weight.
+        up: the experts' up kernels, each hidden unit's up and gate side by side.
+        down: their down kernels.
+        picked: where the rows were gathered from, for the quantizer to read them
+            there; None to read `x`.
+        summed: the tokens the rows sum into; None to return the rows.
+        quantized: the kernels in MXFP8, for the GEMMs to take as they are, `up`
+            and `down` then taking only their gradients; None to quantize them here.
+
+    Returns:
+        The rows' outputs, (m, d), or with `summed` the tokens' sums, (t, d).
+    """
     m = x.shape[0]
     tokens = x if picked is None else picked.tokens
     source = jnp.arange(m) if picked is None else picked.index
@@ -128,10 +164,21 @@ def in_mxfp8(up: Float[Array, "E d f 2"], down: Float[Array, "E f d"]) -> Weight
 def gathered(
     up: Float[Array, "e d f 2"], down: Float[Array, "e f d"], axes: tuple[str, ...]
 ) -> tuple[Float[Array, "E d f 2"], Float[Array, "E f d"], Weights]:
-    """Return a device's shards of the experts' kernels, in a shard_map manual over
-    `axes`, gathered whole over them; and quantized, each device its own shard, then
-    gathered in MXFP8. The kernels gathered in bfloat16 carry only their gradients,
-    which reduce-scatter back into shards: XLA drops their forward."""
+    """Return the experts' kernels gathered whole from each device's shard of them,
+    both as they are and in MXFP8, each device quantizing its own shard.
+
+    The kernels gathered as they are carry only their gradients, which
+    reduce-scatter back into shards: XLA drops their forward.
+
+    Args:
+        up: a device's shard of the up kernels, its experts', in a shard_map manual
+            over `axes`.
+        down: its shard of the down kernels.
+        axes: the mesh axes FSDP splits the experts over.
+
+    Returns:
+        The whole up and down kernels, and them in MXFP8 (`Weights`).
+    """
     whole = (jax.lax.all_gather(k, axes, axis=0, tiled=True) for k in (up, down))
     shards = in_mxfp8(jax.lax.stop_gradient(up), jax.lax.stop_gradient(down))
     return *whole, jax.tree.map(partial(_bytes_gathered, axes=axes), shards)
@@ -152,10 +199,20 @@ def padded(
     source: Int[Array, " m"],
     picks: Int[Array, "t k"] | None = None,
 ) -> tuple[Padded, Int[Array, " m"]]:
-    """Return the layout of m rows sorted by expert, the first sizes[0] expert 0's and
-    so on, each row reading its token from `source`, each token's at `picks`, if they
-    sum into tokens; and where each row lies in it. Rows past the experts' lie
-    nowhere."""
+    """Return the padded layout of m rows sorted by expert, and where each row lies
+    in it.
+
+    Args:
+        sizes: how many rows each expert has: the first ``sizes[0]`` are expert 0's,
+            and so on.
+        source: the token each row reads.
+        picks: where each token's k rows are among the m, if they sum into tokens;
+            None if not.
+
+    Returns:
+        The layout, and where each row lies in it; rows past the experts' lie
+        nowhere.
+    """
     m, groups = source.shape[0], sizes.shape[0]
     rows = (m + groups * (PAD - 1)) // PAD * PAD  # the most the padding can take
     whole = -(-sizes // PAD) * PAD
@@ -204,6 +261,7 @@ def _mlp(
     layout: Padded,
     given: Weights | None,
 ) -> Float[Array, "t d"]:
+    """Return `mlp`'s output in bfloat16 by the kernels, forward and backward."""
     return _forward(tokens, weights, up, down, layout, given)[0]
 
 
@@ -215,6 +273,8 @@ def _forward(
     layout: Padded,
     given: Weights | None,
 ) -> tuple[Float[Array, "t d"], Saved]:
+    """Return the forward's output: swiglu, then down's rows; and what the backward
+    keeps."""
     assert grouped_triton is not None
     rows = jnp.int32(layout.source.shape[0])
     x, x_t = grouped_triton.quantized_twice(tokens, rows, index=layout.source)
@@ -236,6 +296,8 @@ def _backward(
     None,
     None,
 ]:
+    """Return the gradients of the tokens, the rows' weights and both kernels: by
+    dswiglu, up's rows, and two contractions."""
     assert grouped_triton is not None
     x_t, up_dgrad, down_dgrad, product, h_columns, weights, layout = saved
     rows = jnp.int32(layout.source.shape[0])

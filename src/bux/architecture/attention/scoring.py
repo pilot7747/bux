@@ -1,6 +1,7 @@
-"""The lightning indexer's scores of every key, sum_j w_j ReLU(q_j . k), with which it
-ranks them (``indexer``); and the attention's probabilities of every key, summed over
-heads, which its loss learns from (``sparse.probabilities``).
+"""The lightning indexer's scores of every key, ``sum_j w_j ReLU(q_j . k)``, with which
+it ranks them (`~bux.architecture.attention.indexer`); and the attention's
+probabilities of every key, summed over heads, which its loss learns from
+(`bux.architecture.attention.sparse.probabilities`).
 
 On a GPU a Pallas kernel computes them, one program per block of queries and of keys,
 which keeps the block's scores in registers from head to head and skips keys after
@@ -35,8 +36,9 @@ F32 = jnp.float32
 
 
 def runs(t: int, s: int, i: int) -> bool:
-    """Return whether the kernel runs: on a GPU, where blocks of a power of two
-    divide the t queries and s keys, and the head dims i are one."""
+    """Return whether `scores`' kernel runs: on a GPU, where blocks of a power of two
+    (16 or more) divide the t queries and s keys, and the i head dims are a power of
+    two, 16 or more."""
     pow2 = i >= 16 and i & (i - 1) == 0
     return kernels.gpu() and pow2 and None not in (_block(t, QUERIES), _block(s, KEYS))
 
@@ -47,9 +49,20 @@ def scores(
     keys: Float[Array, "b s i"],
     end: Int[Array, "b t"],
 ) -> Float[Array, "b t s"]:
-    """Return every query's score of every key by the kernel: sum over heads of w
-    times the ReLU'd dot product. Keys from a query's `end` on score 0 or anything:
-    it does not see them."""
+    """Return every query's score of every key by the kernel: the sum over heads of w
+    times the ReLU'd dot product.
+
+    Args:
+        q: the indexer's queries: b rows of t, h heads of i dims.
+        w: each query's head weights.
+        keys: the keys, one a slot, i wide.
+        end: the slot after each query's last; keys from it on score 0 or anything,
+            as the query does not see them.
+
+    Returns:
+        The scores, (b, t, s) in float32. They pass no gradient, nor do the
+        parameters behind them.
+    """
     q, w, keys = jax.lax.stop_gradient((q, w, keys))  # nor the parameters behind them
     split = parallel.spec(("batch", "seq", "heads", None), q.shape)
     if not parallel.axes_of(split):
@@ -61,10 +74,19 @@ def scores(
 def on_own_queries(
     kernel: Callable[..., Float[Array, "b t s"]], split: P, ins: tuple[Any, ...]
 ) -> Callable[..., Float[Array, "b t s"]]:
-    """Return `kernel`, of each query's scores of the keys, in a shard_map manual over
-    the axes of `split`, the queries' spec (b, t, h, ...): each device scores its rows'
-    queries by its heads, its inputs split as `ins` say, and the scores sum over the
-    devices of the heads."""
+    """Return `kernel` in a shard_map manual over the axes of `split`.
+
+    Each device scores its rows' queries by its heads, and the scores sum over the
+    devices of the heads.
+
+    Args:
+        kernel: what makes each query's scores of the keys, (b, t, s).
+        split: the queries' spec, (b, t, h, ...).
+        ins: how the kernel's inputs split.
+
+    Returns:
+        The kernel on the whole arrays, its scores split by rows and queries.
+    """
     heads = split[2]
 
     def device(*args: Any) -> Float[Array, "b t s"]:
@@ -154,7 +176,7 @@ def _kernel(
 
 def probabilities_runs(t: int, s: int, d: int) -> bool:
     """Return whether `probabilities`' kernel runs: on a GPU, where blocks of a power
-    of two divide the t queries and s keys, for heads of a power of two up to 128
+    of two divide the t queries and s keys, for heads of a power of two from 16 to 128
     dims. On a B300 it takes half XLA's time at 128 (GQA's, MQA's), and 1.4 times
     it at MLA's 192, padded to 256."""
     blocks = None not in (_block(t, QUERIES), _block(s, PROBABILITY_KEYS))
@@ -172,10 +194,23 @@ def probabilities(
     cap: float | None,
 ) -> Float[Array, "b t s"]:
     """Return each query's attention to each key, summed over heads, by the kernel:
-    exp(logit - lse) of each head, its logits scaled and soft-capped as the
-    attention's; 0 for a key outside the query's span, from `start` to before `end`.
-    A query head's kv head is the g-th of its group, as GQA's. It passes no
-    gradient."""
+    ``exp(logit - lse)`` of each head, its logits scaled and soft-capped as the
+    attention's.
+
+    Args:
+        q: the attention's queries: b rows of t, h heads of d dims.
+        k: its keys: s slots of g kv heads. Query head j takes kv head
+            ``j // (h / g)``, as in GQA.
+        lse: each query's logsumexp in the attention's softmax.
+        start: each query's first slot.
+        end: the slot after each query's last.
+        scale: the logits' scale.
+        cap: the logits' tanh soft cap; None for none.
+
+    Returns:
+        The probabilities, (b, t, s) in float32: 0 for a key outside the query's
+        span. They pass no gradient.
+    """
     q, k, lse = jax.lax.stop_gradient((q, k, lse))
     b, t, h, _ = q.shape
     s, g = k.shape[1], k.shape[2]
@@ -246,7 +281,8 @@ def probabilities(
 
 def picked_runs(h: int, i: int, k: int) -> bool:
     """Return whether `picked`'s kernels run: on a GPU, for h heads and i head dims of
-    a power of two, and k picks in blocks of 16 or more."""
+    a power of two (16 or more), and k picks in blocks of a power of two, 16 or
+    more."""
     pow2 = all(n >= 16 and n & (n - 1) == 0 for n in (h, i))
     return kernels.gpu() and pow2 and _block(k, PICKS) is not None
 
@@ -257,12 +293,23 @@ def picked(
     keys: Float[Array, "b s i"],
     index: Int[Array, "b t k"],
 ) -> Float[Array, "b t k"]:
-    """Return each query's scores of the keys at its `index`, its picks (-1 for none,
-    which scores 0), by the kernels: sum over heads of w times the ReLU'd dot
-    product. A program a query gathers its picks' keys, a block at a time up to its
-    last pick, and the backward pass adds each pick's share of the keys' gradient
-    into it atomically. On a mesh a `shard_map` gives each device its rows and
-    queries, every head and every key."""
+    """Return each query's scores of the keys it picked, by the kernels: the sum over
+    heads of w times the ReLU'd dot product.
+
+    A program a query gathers its picks' keys, a block at a time up to its last pick,
+    and the backward pass adds each pick's share of the keys' gradient into it
+    atomically. On a mesh a ``shard_map`` gives each device its rows and queries,
+    every head and every key.
+
+    Args:
+        q: the indexer's queries: b rows of t, h heads of i dims.
+        w: each query's head weights.
+        keys: the keys, one a slot, i wide.
+        index: each query's picks, k slots; -1 for none.
+
+    Returns:
+        The scores, (b, t, k) in float32; 0 for a pick of -1.
+    """
     split = parallel.spec(("batch", "seq", None, None), q.shape)
     if not parallel.axes_of(split):
         return _picked(q, w, keys, index)
@@ -278,6 +325,7 @@ def _picked(
     keys: Float[Array, "b s i"],
     index: Int[Array, "b t k"],
 ) -> Float[Array, "b t k"]:
+    """Return `picked` on a device's queries, forward and backward by the kernels."""
     return _picked_scores(q, w, keys, index)
 
 

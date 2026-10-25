@@ -1,4 +1,10 @@
-"""Multi-head latent attention (DeepSeek-V2/V3, Kimi K2, Kimi Linear)."""
+"""Multi-head latent attention (DeepSeek-V2/V3, Kimi K2, Kimi Linear).
+
+`MLA` is the layer ``mla``. `FullLogitsMLA` and `SparseMLA` add the features of
+`~bux.architecture.attention.gqa.FullLogits` and
+`~bux.architecture.attention.gqa.Sparse` to it, and `build_mla` picks the class a
+config needs.
+"""
 
 from collections.abc import Sequence
 
@@ -28,16 +34,38 @@ _LATENT_NORM = cfg.NormalizationConfig(type="rmsnorm")
 
 
 class MLA(SoftmaxAttention):
-    """Multi-head latent attention, as transformers' DeepseekV3Attention. Every head's
-    keys and values are projected up from one kv_lora_rank wide latent per token, and
-    its queries from one q_lora_rank wide latent (or from the input, at full rank);
-    each latent is RMS-normalized. A head's query and key have qk_nope_head_dim dims
-    of their own and qk_rope_head_dim more, which for keys all heads share and are
-    projected from the input directly. Only those are rotated, and with rope=None
-    none are (Kimi Linear's NoPE).
+    """Multi-head latent attention (MLA), the layer ``mla``: DeepSeek-V2's and V3's,
+    Kimi K2's and Kimi Linear's, as transformers' ``DeepseekV3Attention``.
 
-    Every head has keys and values of its own, so they split over `heads`; the down
-    projections make the `latent`s, which the up projections take.
+    Every head's keys and values are projected up from one ``kv_lora_rank`` wide
+    latent per token, and its queries from one ``q_lora_rank`` wide latent (or from
+    the input, at full rank); each latent is RMS-normalized. A head's query and key
+    have ``qk_nope_head_dim`` dims of their own and ``qk_rope_head_dim`` more, which
+    for keys all heads share and are projected from the input directly. Only those
+    are rotated, and with ``rope=None`` none are (Kimi Linear's NoPE). The softmax
+    scale is ``(qk_nope_head_dim + qk_rope_head_dim) ** -0.5`` unless ``scale`` sets
+    one. `build_mla` makes this class, or `FullLogitsMLA` or `SparseMLA` where the
+    config needs them.
+
+    Every head has keys and values of its own, so they split over ``heads``; the down
+    projections make the latents, split over ``latent``, which the up projections
+    take.
+
+    Example:
+        DeepSeek-V3's attention:
+
+        .. code-block:: bux
+
+            attn = mla(num_heads=128, q_lora_rank=1536, kv_lora_rank=512,
+                       rope=rope(layout=interleaved,
+                                 scaling=yarn(factor=40, original_max_len=4096,
+                                              attention_factor_on=softmax)))
+
+    Args:
+        config: the layer's settings.
+        width: the width d of the stream it reads and writes.
+        ports: the ports the source lists for it.
+        rngs: draws the initial parameters.
     """
 
     def __init__(
@@ -73,6 +101,16 @@ class MLA(SoftmaxAttention):
         self.rope = config.rope
 
     def __call__(self, x: Float[Array, "b t d"], taps: Taps) -> Float[Array, "b t d"]:
+        """Attend each position to those before it in its document, and to itself.
+
+        Args:
+            x: the stream: b rows of t positions, d wide.
+            taps: the forward pass's taps: the documents packed into the rows, which
+                no query looks across.
+
+        Returns:
+            The layer's output, the shape of `x`.
+        """
         x = shard_layer_input(x)
         docs = segments(taps)
         q, k, v = self._heads(x, self._query_input(x), docs)
@@ -124,12 +162,15 @@ class MLA(SoftmaxAttention):
 
 
 class FullLogitsMLA(FullLogits, MLA):
-    pass
+    """MLA with the logit features of `~bux.architecture.attention.gqa.FullLogits`:
+    relative bias, length scale or attention dropout. It takes `MLA`'s arguments."""
 
 
 class SparseMLA(Sparse, MLA):
-    """MLA with an indexer whose queries come from the query latent (or the input) and
-    keys from the input, as in DeepSeek-V3.2."""
+    """MLA with sparse attention's indexer (`~bux.architecture.attention.gqa.Sparse`),
+    as DeepSeek-V3.2's: its queries come from the query latent (or the input, at full
+    rank) and its keys from the input. It takes `MLA`'s arguments; ``config.indexer``
+    sets the indexer."""
 
     def __init__(
         self,
@@ -150,6 +191,16 @@ class SparseMLA(Sparse, MLA):
         )
 
     def __call__(self, x: Float[Array, "b t d"], taps: Taps) -> Float[Array, "b t d"]:
+        """Attend each position to the keys it keeps, as `MLA` does to all.
+
+        Args:
+            x: the stream: b rows of t positions, d wide.
+            taps: the forward pass's taps, as `MLA` takes them; a training forward
+                collects the indexer's loss in them.
+
+        Returns:
+            The layer's output, the shape of `x`.
+        """
         x = shard_layer_input(x)
         docs = segments(taps)
         query = self._query_input(x)
@@ -160,7 +211,18 @@ class SparseMLA(Sparse, MLA):
 def build_mla(
     config: cfg.MLAConfig, width: int, ports: Sequence[ir.Port], rngs: nnx.Rngs
 ) -> MLA:
-    """Make MLA with the features that `config` and `ports` ask for."""
+    """Make MLA with the features that `config` and `ports` ask for.
+
+    Args:
+        config: the layer's settings.
+        width: the width d of the stream it reads and writes.
+        ports: the ports the source lists for it.
+        rngs: draws the initial parameters.
+
+    Returns:
+        An `MLA`, `FullLogitsMLA` or `SparseMLA`, as
+        `~bux.architecture.attention.gqa.pick` picks.
+    """
     layer = pick(config, ports, MLA, FullLogitsMLA, SparseMLA)
     return layer(config, width, ports, rngs)
 

@@ -1,4 +1,11 @@
-"""Rotary position embeddings, with position interpolation, YaRN and Llama 3 scaling."""
+"""Rotary position embeddings (RoPE), with position interpolation, YaRN and Llama 3
+scaling.
+
+`rotate` rotates the first ``rope.fraction`` of each head's dims by the tokens'
+positions, in pairs as ``rope.layout`` says, at the inverse frequencies `frequencies`
+gives under ``rope.scaling``. The softmax attention layers rotate by it, and so does
+sparse attention's indexer.
+"""
 
 import math
 
@@ -9,21 +16,35 @@ from bux import config as cfg
 
 
 def _attention_factor(yarn: cfg.YaRNConfig) -> float:
+    """Return YaRN's attention factor: as given, else 0.1 ln(factor) + 1."""
     if yarn.attention_factor is not None:
         return yarn.attention_factor
     return 0.1 * math.log(yarn.factor) + 1 if yarn.factor > 1 else 1.0
 
 
 def rotated_dims(head_dim: int, rope: cfg.RoPEConfig | None) -> int:
-    """Return how many of a head's dims RoPE rotates, in whole pairs."""
+    """Return how many of a head's `head_dim` dims `rope` rotates, in whole pairs: 0
+    for no RoPE."""
     return 0 if rope is None else int(head_dim * rope.fraction) // 2 * 2
 
 
 def frequencies(
     rope: cfg.RoPEConfig, dims: int
 ) -> tuple[Float[Array, " pairs"], float]:
-    """Return the inverse frequencies of the `dims` rotated dims, and the factor on
-    cos and sin."""
+    """Return the inverse frequencies of the rotated dims' pairs, and the factor on
+    cos and sin.
+
+    Args:
+        rope: the RoPE settings. ``rope.scaling`` lowers the frequencies as
+            transformers computes them: position interpolation divides them all by
+            its factor; YaRN and Llama 3 divide the low ones, keep the high ones, and
+            blend between them.
+        dims: how many dims rotate, an even number.
+
+    Returns:
+        The ``dims / 2`` inverse frequencies, and YaRN's attention factor where it
+        goes on cos and sin (``attention_factor_on=rotary``), else 1.
+    """
     inv_freq = 1.0 / rope.base ** (jnp.arange(0, dims, 2) / dims)
     match rope.scaling:
         case None:
@@ -60,7 +81,8 @@ def frequencies(
 
 
 def logit_gain(rope: cfg.RoPEConfig | None) -> float:
-    """Return YaRN's attention_factor ** 2 if it goes on the softmax scale, else 1."""
+    """Return YaRN's ``attention_factor ** 2`` if it goes on the softmax scale
+    (``attention_factor_on=softmax``), else 1."""
     scaling = rope.scaling if rope is not None else None
     if isinstance(scaling, cfg.YaRNConfig) and scaling.attention_factor_on == "softmax":
         return _attention_factor(scaling) ** 2
@@ -72,8 +94,21 @@ def rotate(
     rope: cfg.RoPEConfig,
     positions: Int[Array, "b t"] | None = None,
 ) -> Float[Array, "b t h k"]:
-    """Rotate the first `fraction` of each head's dims, paired as `layout` says, by the
-    tokens' positions, or their indices: in float32, the result in x's dtype."""
+    """Rotate the first ``rope.fraction`` of each head's dims by the tokens' positions.
+
+    ``rope.layout`` pairs the dims: ``half`` rotates dim i with i + dims / 2 (GPT-NeoX,
+    Llama), ``interleaved`` dim 2i with 2i + 1 (GPT-J). The rotation computes in
+    float32.
+
+    Args:
+        x: queries or keys: b rows of t tokens, h heads of k dims.
+        rope: the RoPE settings.
+        positions: each token's position in its document; None for its index in the
+            row.
+
+    Returns:
+        `x` with its first dims rotated and the rest as they are, in x's dtype.
+    """
     dims = rotated_dims(x.shape[-1], rope)
     if dims == 0:
         return x

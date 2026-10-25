@@ -5,7 +5,7 @@
 #   bux plan   examples/experiments/parallel/tp_70b.bux
 #   bux launch examples/experiments/parallel/tp_70b.bux     # on every host
 #
-# Every host runs the same command; docs/training.md says how they find each other.
+# Every host runs the same command; docs/training/launching.md says how they find each other.
 use llama3_70b
 use fineweb_wsd
 

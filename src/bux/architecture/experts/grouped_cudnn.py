@@ -1,18 +1,20 @@
 """Grouped MXFP8 GEMMs for an MoE's experts by cuDNN-frontend's CuTe DSL kernels, on a
-Blackwell GPU, through `cudnn.jax.call` on XLA's stream: the gated MLP's SwiGLU, and
-its backward, in their epilogues. Each takes its operands as ``grouped_mxfp8.Tiled``
-(E4M3 values, their scales in tensor memory's tiles), each group's rows from a multiple
-of 256 to its `ends`, and runs tiles of 256 by 256 on pairs of SMs:
+Blackwell GPU, through ``cudnn.jax.call`` on XLA's stream: the gated MLP's SwiGLU, and
+its backward, in their epilogues.
 
-    swiglu    x W[g]^T, kept for the backward, then its SwiGLU times each row's
-              weight, h, quantized along its rows and down its columns
-    dswiglu   dy W[g] times SwiGLU's gradient at the kept product, times each row's
-              weight, quantized the same two ways; and each weight's gradient
-    rows      a b[g]^T, in bfloat16
-    contract  a^T b over each group's rows, in bfloat16
+Each takes its operands as `~bux.architecture.experts.grouped_mxfp8.Tiled` (E4M3
+values, their scales in tensor memory's tiles), each group's rows from a multiple of
+256 to its `ends`, and runs tiles of 256 by 256 on pairs of SMs:
 
-The GLU takes each gate 32 columns before its up, [32 gates | 32 ups] in each 64 of
-W[g]'s rows (`halves_of`). The epilogues write the copies down the columns as
+- `swiglu`: ``x W[g]^T``, kept for the backward, then its SwiGLU times each row's
+  weight, h, quantized along its rows and down its columns.
+- `dswiglu`: ``dy W[g]`` times SwiGLU's gradient at the kept product, times each
+  row's weight, quantized the same two ways; and each weight's gradient.
+- `rows`: ``a b[g]^T``, in bfloat16.
+- `contract`: ``a^T b`` over each group's rows, in bfloat16.
+
+The GLU takes each gate 32 columns before its up, ``[32 gates | 32 ups]`` in each 64
+of W[g]'s rows (`halves_of`). The epilogues write the copies down the columns as
 `Columns`, which `contract` takes as they lie. Rows past the last group are not
 written.
 """
@@ -50,46 +52,54 @@ E4M3, E8M0 = jnp.float8_e4m3fn, jnp.float8_e8m0fnu
 
 
 class Columns(NamedTuple):
-    """An operand in MXFP8 in blocks of 32 down its columns, as the epilogues write it:
-    E4M3 values (r, c) row-major, and the scales of their transpose (c, r) laid out as
-    `Tiled`'s, (c', r', 32, 16)."""
+    """An operand in MXFP8 in blocks of 32 down its columns, as the epilogues write
+    it."""
 
+    #: E4M3 values (r, c), row-major.
     values: Shaped[Array, "r c"]
+    #: The scales of their transpose (c, r), laid out as
+    #: `~bux.architecture.experts.grouped_mxfp8.Tiled`'s: (c', r', 32, 16).
     scales: Shaped[Array, "p q 32 16"]
 
 
 class Glu(NamedTuple):
-    """What `swiglu` returns: the product x W[g]^T, and h along its rows and down its
-    columns."""
+    """What `swiglu` returns."""
 
+    #: The product ``x W[g]^T``, in bfloat16, kept for the backward.
     product: Float[Array, "m n"]
+    #: h, SwiGLU's output times each row's weight, along its rows.
     h: Tiled
+    #: h down its columns.
     h_columns: Columns
 
 
 class GluGrad(NamedTuple):
-    """What `dswiglu` returns: the product's gradient along its rows and down its
-    columns, and each row's weight's."""
+    """What `dswiglu` returns."""
 
+    #: The product's gradient along its rows.
     product: Tiled
+    #: The product's gradient down its columns.
     product_columns: Columns
+    #: Each row's weight's gradient.
     weights: Float[Array, " m"]
 
 
 def runs() -> bool:
-    """Whether the kernels run here: on a Blackwell GPU, with cudnn-frontend."""
+    """Return whether the kernels run here: on a Blackwell GPU, with
+    cudnn-frontend."""
     return cutlass is not None and grouped_mxfp8.runs()
 
 
 def fits(d: int, f: int, groups: int) -> bool:
-    """Whether the kernels take groups of experts of width d and f hidden units: each
-    of their GEMMs whole tiles."""
+    """Return whether the kernels take `groups` experts of width d and f hidden
+    units: each of their GEMMs whole tiles of 256, and 1024 experts at most."""
     return d % TILE[1] == 0 and f % TILE[1] == 0 and groups <= 1024
 
 
 def halves_of(pairs: Int[Array, " n"]) -> Int[Array, " n"]:
-    """Return where columns of pairs, up and gate side by side (2u, 2u + 1), lie in the
-    GLU's halves: in pair u's 64 columns, 32 on for its up, at the start for its gate."""
+    """Return where columns of pairs (unit u's up at 2u, its gate at 2u + 1) lie in
+    the GLU's halves: each 32 units take 64 columns, their gates first, then their
+    ups."""
     unit, gate = pairs // 2, pairs % 2
     return unit // 32 * 64 + (1 - gate) * 32 + unit % 32
 
@@ -100,8 +110,18 @@ def halves_of(pairs: Int[Array, " n"]) -> Int[Array, " n"]:
 def swiglu(
     x: Tiled, w: Tiled, ends: Int[Array, " g"], weights: Float[Array, " m"]
 ) -> Glu:
-    """Return x W[g]^T for each group's rows of x (m, k), of W's (g, n, k) in halves,
-    and h, its SwiGLU times each row's weight, (m, n / 2)."""
+    """Return ``x W[g]^T`` for each group's rows of x, and h, its SwiGLU times each
+    row's weight.
+
+    Args:
+        x: the rows, (m, k).
+        w: each group's up kernel, (g, n, k), its rows in halves (`halves_of`).
+        ends: where each group's rows end, each starting at a multiple of 256.
+        weights: each row's weight.
+
+    Returns:
+        The product (m, n), and h (m, n / 2) along its rows and down its columns.
+    """
     m, n = x.values.shape[0], w.values.shape[1]
     ins = {
         "a": x.values,
@@ -133,9 +153,20 @@ def dswiglu(
     ends: Int[Array, " g"],
     weights: Float[Array, " m"],
 ) -> GluGrad:
-    """Return the gradient of `swiglu`'s product: dy (m, k) times each group's W[g]
-    (g, n, k) is h's, through SwiGLU at the product (m, 2n) in halves and each row's
-    weight; and each weight's gradient."""
+    """Return the gradient of `swiglu`'s product, and of each row's weight.
+
+    Args:
+        dy: the output's gradient, (m, k).
+        w: each group's down kernel, (g, n, k): dy times it, over k, is h's
+            gradient.
+        product: `swiglu`'s product, (m, 2n), in halves.
+        ends: where each group's rows end, each starting at a multiple of 256.
+        weights: each row's weight.
+
+    Returns:
+        The product's gradient along its rows and down its columns, and each row's
+        weight's gradient.
+    """
     m, n = dy.values.shape[0], w.values.shape[1]
     ins = {
         "a": dy.values,
@@ -167,7 +198,8 @@ def dswiglu(
 
 
 def rows(a: Tiled, b: Tiled, ends: Int[Array, " g"]) -> Float[Array, "m n"]:
-    """Return a b[g]^T for each group's rows of a (m, k), of b's (g, n, k)."""
+    """Return ``a b[g]^T`` for each group's rows of a (m, k), of b's (g, n, k), in
+    bfloat16; each group's rows end at `ends`, starting at a multiple of 256."""
     (m, _), (groups, n, _) = a.values.shape, b.values.shape
     kernel, mac = _gemm_kernel(groups)
     ins = (a.values, b.values, a.scales, b.scales, ends, _ones(groups))
@@ -185,8 +217,9 @@ def rows(a: Tiled, b: Tiled, ends: Int[Array, " g"]) -> Float[Array, "m n"]:
 def contract(
     a: Tiled | Columns, b: Tiled, ends: Int[Array, " g"]
 ) -> Float[Array, "g d f"]:
-    """Return a^T b over each group's rows: a (d, m) in blocks along m as `Tiled`, or
-    as `Columns` (m, d); b (f, m) as `Tiled`."""
+    """Return ``a^T b`` over each group's rows, (g, d, f) in bfloat16: a (d, m) in
+    blocks along m as `~bux.architecture.experts.grouped_mxfp8.Tiled`, or as
+    `Columns` (m, d); b (f, m) as ``Tiled``."""
     groups, f = ends.shape[0], b.values.shape[0]
     by_rows = isinstance(a, Columns)
     d = a.values.shape[1] if by_rows else a.values.shape[0]
@@ -292,6 +325,7 @@ def _call(
 
 @functools.cache
 def _jit(adapter: Any) -> Any:
+    """Return `adapter` compiled by CuTe DSL, once."""
     return cute.jit(adapter)
 
 

@@ -1,17 +1,31 @@
 """What bux sets for JAX before it trains: XLA's flags, NCCL EP's settings, the share
 of a GPU XLA's pool takes, and a cache of compiled steps.
 
-`bux train`, `bux launch` and a sweep's workers call ``configure`` before anything
-starts a backend. A flag that XLA_FLAGS sets already keeps its value, and so does a
-pool's share that XLA_CLIENT_MEM_FRACTION sets, or its older name. Compiled
-programs, and on GPUs the autotuner's picks, persist in $XDG_CACHE_HOME/bux/jax
-(~/.cache/bux/jax), so a launch after the first compiles little; a
-JAX_COMPILATION_CACHE_DIR that is set says where instead, and one set empty turns the
-cache off.
+``bux train``, ``bux launch`` and a sweep's workers call `configure` before anything
+starts a backend; a script that trains calls it first too::
 
-In a job of many processes, the processes must all find a program in the cache, or
-all compile it (``agree_on_cache``), and only the first writes it: so the cache is
-kept only where it is one folder for all of them, on a filesystem every host mounts.
+    from bux.runtime import configure
+
+    configure()  # before anything touches a device
+    train(run)
+
+What it sets, each only where the environment does not already:
+
+- ``XLA_FLAGS``: bux's flags (`XLA_FLAGS`) go before the ones given, and a flag
+  given already keeps its value.
+- ``NCCL_GIN_TYPE`` and ``NCCL_EP_TOKENS_PER_CHUNK``, for NCCL EP (`NCCL_DEFAULTS`).
+- ``XLA_CLIENT_MEM_FRACTION``, the share of a GPU's memory that XLA's pool takes:
+  95% (`POOL`), unless it or its older name ``XLA_PYTHON_CLIENT_MEM_FRACTION`` is
+  set.
+- ``JAX_COMPILATION_CACHE_DIR``: compiled programs, and on GPUs the autotuner's
+  picks, persist in ``$XDG_CACHE_HOME/bux/jax`` (``~/.cache/bux/jax``), so a launch
+  after the first compiles little. A ``JAX_COMPILATION_CACHE_DIR`` that is set says
+  where instead, and one set empty turns the cache off.
+
+Workers inherit them all. In a job of many processes, the processes must all find a
+program in the cache, or all compile it (`agree_on_cache`), and only the first writes
+it: so the cache is kept only where it is one folder for all of them, on a filesystem
+every host mounts.
 """
 
 import os
@@ -24,21 +38,26 @@ import jax
 
 from bux import jax_internals
 
-# GPU flags, which XLA takes on any backend and a CPU ignores.
-XLA_FLAGS = (
-    # Without it, ragged_all_to_all (expert parallelism's dispatch) hangs on B300s.
-    "--xla_gpu_experimental_ragged_all_to_all_use_barrier_with_nccl=false",
-)
-# NCCL EP's settings (methods(moe=nccl_ep)), where the environment sets none: GIN by a
-# CPU proxy, and 256 tokens a chunk between nodes. On two B300 nodes, GDAKI (its
-# default) took 3x as long for an EP layer's exchanges, and chunks of 64 1.3x.
+#: bux's XLA flags, which go before those of ``XLA_FLAGS``.
+#:
+#: GPU flags, which XLA takes on any backend and a CPU ignores. Without the first,
+#: ``ragged_all_to_all`` (expert parallelism's dispatch) hangs on B300s.
+XLA_FLAGS = ("--xla_gpu_experimental_ragged_all_to_all_use_barrier_with_nccl=false",)
+#: NCCL EP's settings (``methods(moe=nccl_ep)``), where the environment sets none.
+#:
+#: GIN by a CPU proxy, and 256 tokens a chunk between nodes. On two B300 nodes,
+#: GDAKI (its default) took 3x as long for an EP layer's exchanges, and chunks of
+#: 64 1.3x.
 NCCL_DEFAULTS = {"NCCL_GIN_TYPE": "2", "NCCL_EP_TOKENS_PER_CHUNK": "256"}
-TIMEOUT_MS = 10 * 60 * 1000  # for the other processes to reach the same point
-# The share of a GPU's memory XLA's pool takes where the environment sets none, of
-# jaxlib's two names for it (the second is its old one); JAX's default is 75%. Beside
-# the pool, the CUDA context, NCCL's buffers and NCCL EP's took up to 9.8 GiB of a
-# B300 (EP over two nodes), which 95% leaves room for (14.3 GiB) and 97% does not.
+#: How long, in milliseconds, a process waits for the others to reach the same point.
+TIMEOUT_MS = 10 * 60 * 1000
+#: The share of a GPU's memory XLA's pool takes where the environment sets none.
+#:
+#: JAX's default is 75%. Beside the pool, the CUDA context, NCCL's buffers and NCCL
+#: EP's took up to 9.8 GiB of a B300 (EP over two nodes), which 95% leaves room for
+#: (14.3 GiB) and 97% does not.
 POOL = "0.95"
+#: jaxlib's two names for the pool's share; the second is its old one.
 POOL_VARIABLES = ("XLA_CLIENT_MEM_FRACTION", "XLA_PYTHON_CLIENT_MEM_FRACTION")
 
 
@@ -47,21 +66,37 @@ def _name(flag: str) -> str:
 
 
 def xla_flags(given: str, defaults: Sequence[str] = XLA_FLAGS) -> str:
-    """Return the flags `given`, after those of `defaults` that they do not set."""
+    """Return the flags `given`, after those of `defaults` that they do not set.
+
+    Example::
+
+        xla_flags("--xla_gpu_autotune_level=0")
+        # '--xla_gpu_experimental_ragged_all_to_all_use_barrier_with_nccl=false
+        #  --xla_gpu_autotune_level=0'
+    """
     named = {_name(flag) for flag in given.split()}
     ours = [flag for flag in defaults if _name(flag) not in named]
     return " ".join([*ours, given]).strip()
 
 
 def cache_dir(env: Mapping[str, str] = os.environ) -> Path:
-    """Return where compiled programs persist by default."""
+    """Return where compiled programs persist by default: ``bux/jax`` under
+    ``$XDG_CACHE_HOME``, or under ``~/.cache`` if it is not set."""
     return Path(env.get("XDG_CACHE_HOME") or Path.home() / ".cache") / "bux" / "jax"
 
 
 def configure(env: MutableMapping[str, str] = os.environ) -> None:
-    """Add bux's flags to XLA_FLAGS in `env`, NCCL EP's settings and the share of a
-    GPU XLA's pool takes, and keep compiled programs in JAX_COMPILATION_CACHE_DIR,
-    `cache_dir` unless it is set. Workers inherit them all."""
+    """Set JAX's and XLA's environment for training, where it is not set already.
+
+    It adds bux's flags to ``XLA_FLAGS`` in `env`, NCCL EP's settings and the share
+    of a GPU XLA's pool takes, and keeps compiled programs in
+    ``JAX_COMPILATION_CACHE_DIR``: `cache_dir` unless it is set, and none if it is
+    set empty. Workers inherit them all. Call it before anything starts a backend:
+    XLA reads its flags and its pool's share once.
+
+    Args:
+        env: The environment to change: this process's by default.
+    """
     env["XLA_FLAGS"] = xla_flags(env.get("XLA_FLAGS", ""))
     for name, value in NCCL_DEFAULTS.items():
         env.setdefault(name, value)

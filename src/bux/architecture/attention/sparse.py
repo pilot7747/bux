@@ -4,14 +4,14 @@ no t by t floats.
 Keys sit in slots. A `Span` says which of them each query may attend to, `Kept` which
 of those it keeps, by index; a `Part` is keys and values with both. A layer's parts
 (CSA's window and its latents) share one softmax, and the sinks, merged by their
-logsumexp.
+logsumexp (`attend`).
 
 On a GPU, tokamax's flash kernel runs each part with its kept keys as a boolean mask:
 dense compute, exact, and t² bits of mask forward and bytes backward. Under
-`methods.attention = xla`, off a GPU, or inside ``bux.kernels.off()``, XLA runs it a
-chunk of queries at a time. Both return each query's logsumexp, from which the
-backward pass computes the probabilities again, as `probabilities` does for the
-indexer's loss.
+``methods.attention = xla``, off a GPU, or inside `bux.kernels.off`, XLA runs it a
+chunk of queries at a time (`chunked`). Both return each query's logsumexp, from
+which the backward pass computes the probabilities again, as `probabilities` does for
+the indexer's loss.
 """
 
 from collections.abc import Callable, Sequence
@@ -39,15 +39,19 @@ F32 = jnp.float32
 class Span(NamedTuple):
     """The slots each query may attend to: from `start` to before `end`."""
 
+    #: Each query's first slot.
     start: Int[Array, "b t"]
+    #: The slot after each query's last.
     end: Int[Array, "b t"]
 
 
 class Kept(NamedTuple):
-    """The slots each query keeps, by index; or with `block` (which block each slot is
-    in) the blocks, by the block's. -1 for none. The index port carries it."""
+    """The slots each query keeps, by index; or, with `block`, the blocks it keeps,
+    by the block's index. The ``index`` port carries it."""
 
+    #: Each query's kept slots or blocks, k at most; -1 for none.
     index: Int[Array, "b t k"]
+    #: Which block each slot is in, if it keeps blocks; else None.
     block: Int[Array, "b s"] | None = None
 
 
@@ -55,16 +59,30 @@ class Part(NamedTuple):
     """Keys and values, and the slots each query attends to: those of its span that
     exist, of those it keeps."""
 
+    #: The keys, b rows of s slots, g heads of dk dims.
     k: Float[Array, "b s g dk"]
+    #: The values, dv wide.
     v: Float[Array, "b s g dv"]
+    #: The slots each query may attend to.
     span: Span
+    #: Which slots hold a key; None for every one.
     exists: Bool[Array, "b s"] | None = None
+    #: The slots each query keeps; None for every one.
     kept: Kept | None = None
 
 
 def token_span(rows: Segments, window: int | None) -> Span:
     """Return the span of keys at the queries' positions: from the first of each
-    query's document, and fewer than `window` behind it, to itself."""
+    query's document, and fewer than `window` behind it, to itself.
+
+    Args:
+        rows: the documents packed into the rows.
+        window: how many keys a query sees at most, itself among them; None for all
+            of its document's before it.
+
+    Returns:
+        Each query's span.
+    """
     index = jnp.arange(rows.within.shape[1], dtype=jnp.int32)
     start = index - rows.within
     if window is not None:
@@ -88,7 +106,17 @@ def mask(
     kept: Kept | None = None,
 ) -> Bool[Array, "b t s"]:
     """Return which of s slots each query attends to: of its span, those that exist,
-    of those it keeps."""
+    of those it keeps.
+
+    Args:
+        span: the slots each query may attend to.
+        s: how many slots there are.
+        exists: which slots hold a key; None for every one.
+        kept: the slots, or blocks, each query keeps; None for every one.
+
+    Returns:
+        The mask, (b, t, s).
+    """
     slot = jnp.arange(s)
     seen = (slot >= span.start[..., None]) & (slot < span.end[..., None])
     if exists is not None:
@@ -123,8 +151,8 @@ def at(part: Part, span: Span, index: Int[Array, "b t k"] | None) -> Part:
 
 def chunks(t: int, per_query: int) -> int:
     """Return how many chunks to split t queries into: the fewest whose queries make
-    at most ELEMENTS elements, `per_query` each, and split over the devices as all t
-    do."""
+    at most ``ELEMENTS`` (2^27) elements, `per_query` each, and split over the devices
+    as all t do."""
     whole = t // _devices(t)
     fits = (n for n in range(1, whole) if whole % n == 0)
     return next((n for n in fits if t // n * per_query <= ELEMENTS), whole)
@@ -139,9 +167,20 @@ def _devices(t: int) -> int:
 
 
 def chunked[R](f: Callable[[Any], R], xs: Any, n: int) -> R:
-    """Return f(xs), xs and what it returns arrays of (b, t, ...), for n chunks of
-    queries one at a time: every n-th query in one, so that a chunk splits over the
-    devices as the positions do."""
+    """Return ``f(xs)``, computed for n chunks of queries one at a time.
+
+    A chunk takes every n-th query, so that it splits over the devices as the
+    positions do.
+
+    Args:
+        f: what to compute of a chunk.
+        xs: a tree of arrays of (b, t, ...), split along t.
+        n: how many chunks; 1 calls f on all of xs.
+
+    Returns:
+        What f returns, a tree of arrays of (b, t, ...), its chunks put back in
+        order.
+    """
     if n == 1:
         return f(xs)
     return jax.tree.map(_join, jax.lax.map(f, jax.tree.map(partial(_part, n=n), xs)))
@@ -150,8 +189,8 @@ def chunked[R](f: Callable[[Any], R], xs: Any, n: int) -> R:
 def scanned[C, R](
     f: Callable[[C, Any], tuple[C, R]], carry: C, xs: Any, n: int
 ) -> tuple[C, R]:
-    """Return `chunked` of f(carry, xs) -> (carry, out), the carry from chunk to
-    chunk."""
+    """Return `chunked` of ``f(carry, xs) -> (carry, out)``, the carry from chunk to
+    chunk: the last carry, and the chunks' outputs."""
     if n == 1:
         return f(carry, xs)
     carry, out = jax.lax.scan(f, carry, jax.tree.map(partial(_part, n=n), xs))
@@ -172,6 +211,8 @@ def _join(x: Shaped[Array, "chunks b c *r"]) -> Shaped[Array, "b t *r"]:
 
 
 class _Static(NamedTuple):
+    """What `attend` fixes as it traces: the logits' scale and cap, and how it runs."""
+
     scale: float
     softcap: float | None
     flash: bool  # tokamax's kernels; else XLA's chunks
@@ -186,9 +227,30 @@ def attend(
     cap: float | None,
 ) -> tuple[Float[Array, "b t h dv"], Float[Array, "b t h"]]:
     """Return every query's softmax-weighted values over the slots it attends to in
-    each part, the parts and the sinks in one softmax in float32; and each query's
-    logsumexp, which passes no gradient. With `seq` over `context` a device has its
-    queries and every key: all-gather context parallelism."""
+    each part, the parts and the sinks in one softmax in float32.
+
+    Under ``methods.attention`` ``auto`` or ``tokamax``, tokamax's flash kernel runs
+    each part on a GPU in bfloat16 or float16 whose heads are 256 dims at most; XLA
+    runs the others a chunk of queries at a time, as it runs every part under
+    ``xla``. With ``seq`` over ``context`` a device has its queries and every key:
+    all-gather context parallelism.
+
+    Args:
+        q: the queries: b rows of t, h heads of dk dims.
+        parts: the keys and values to attend to, and which slots each query sees.
+        sinks: each head's learned sink logit, which takes a share of the softmax;
+            None for none.
+        scale: the logits' scale.
+        cap: the logits' tanh soft cap; None for none.
+
+    Returns:
+        The output, (b, t, h, dv), and each query's logsumexp, (b, t, h), which passes
+        no gradient.
+
+    Raises:
+        NotImplementedError: under another ``methods.attention``, which has no mask of
+            kept keys; or under ``tokamax`` without it installed.
+    """
     static, parts = _Static(scale, cap, _flash(q), True), tuple(parts)
     split = parallel.spec(("batch", "seq", "heads", None), q.shape)
     names = set(parallel.axes_of(split))
@@ -352,8 +414,22 @@ def probabilities(
     cap: float | None,
 ) -> Float[Array, "b t s"]:
     """Return each query's probability of each slot of `part` in its span, kept or
-    not, summed over heads, in the softmax whose logsumexp is `lse`; 0 for slots
-    outside the span or that do not exist. By ``scoring``'s kernel where it runs."""
+    not, summed over heads: the target of the indexer's loss.
+
+    By `~bux.architecture.attention.scoring.probabilities`' kernel where it runs, else
+    by XLA.
+
+    Args:
+        q: the queries: b rows of t, h heads of dk dims.
+        part: the keys, and the span of slots each query sees.
+        lse: each query's logsumexp in the softmax, from `attend`.
+        scale: the logits' scale.
+        cap: the logits' tanh soft cap; None for none.
+
+    Returns:
+        The probabilities, (b, t, s): 0 for slots outside the span or that do not
+        exist.
+    """
     t, s, d = q.shape[1], part.k.shape[1], part.k.shape[-1]
     if part.exists is None and scoring.probabilities_runs(t, s, d):
         return _probabilities_kernel(q, part, lse, scale, cap)

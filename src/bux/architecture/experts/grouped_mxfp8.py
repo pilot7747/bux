@@ -1,24 +1,24 @@
 """Grouped MXFP8 GEMMs for an MoE's experts on Blackwell, by Mosaic GPU: E4M3 values
 with an E8M0 scale per 32 of what they contract, multiplied by tcgen05's block-scaled
 MMA, the scales brought by TMA into shared memory as tensor memory lays them out, and
-copied on into it by `tcgen05.cp`.
+copied on into it by ``tcgen05.cp``.
 
-`rows` multiplies each group's rows by its matrix, x W[g] and dy W[g]^T; `contract`
-sums the products of each group's rows of two matrices, dW[g] = x^T dy over them.
-Both run a program on each pair of SMs, which takes tiles of the output one after
-another, 256 rows (128 on each SM) by 128 columns, in bands (`Tiles`):
+`rows` multiplies each group's rows by its matrix, ``x W[g]`` and ``dy W[g]^T``;
+`contract` sums the products of each group's rows of two matrices, ``dW[g] = x^T dy``
+over them. Both run a program on each pair of SMs, which takes tiles of the output one
+after another, 256 rows (128 on each SM) by 128 columns, in bands (`Tiles`):
 
-    rows      a tile of the rows a group has rows in: a tile two groups share runs
-              once for each, which stores its own rows; one past the groups stores 0
-    contract  a tile of dW[g], over the group's rows in tiles of 128: a's first and
-              last, which it may share, from copies of them with the other groups'
-              rows as 0, so that b's add nothing
+- `rows`: a tile of the rows a group has rows in. A tile two groups share runs once
+  for each, which stores its own rows; one past the groups stores 0.
+- `contract`: a tile of dW[g], over the group's rows in tiles of 128. a's first and
+  last, which it may share, come from copies of them with the other groups' rows as
+  0, so that b's add nothing.
 
 Three roles share each tile's steps along what it contracts (k):
 
-    warp 0 (load):     TMA a, b and their scales into a ring of `stages` buffers
-    warp 1 (multiply): copy the scales into tensor memory, MMA into the accumulator
-    warpgroup 1:       the accumulator into the output's dtype, and to memory by TMA
+- warp 0 (load): TMA a, b and their scales into a ring of ``stages`` buffers;
+- warp 1 (multiply): copy the scales into tensor memory, MMA into the accumulator;
+- warpgroup 1 (store): the accumulator into the output's dtype, and to memory by TMA.
 
 The accumulator has two buffers in tensor memory, so the store of one tile overlaps
 the MMAs of the next.
@@ -47,20 +47,26 @@ STORE = 128  # bytes of a row the store takes at a time: the widest swizzle
 
 
 class Tiles(NamedTuple):
-    """A kernel's tiles: of rows on each SM, of columns, and of what it contracts
-    (k); how many steps along k its ring of buffers holds; on how many SMs a tile
-    runs; and in bands of how many tiles of rows the SMs take the tiles. On 2 SMs,
-    tcgen05's MMA of a pair: each holds its m rows of the tile and half of b's n,
-    and multiplies them by the other's half too. The SMs take a band's tiles down
-    its rows, then the next column of them, so that the tiles they hold at once
-    share few rows of a and columns of b, and those stay in L2: 1.7x as fast as a
-    row's columns one after another, on a B300."""
+    """A kernel's tiles, and how its programs take them.
 
+    On 2 SMs, tcgen05's MMA of a pair: each holds its m rows of the tile and half of
+    b's n, and multiplies them by the other's half too. The SMs take a band's tiles
+    down its rows, then the next column of them, so that the tiles they hold at once
+    share few rows of a and columns of b, and those stay in L2: 1.7x as fast as a
+    row's columns one after another, on a B300.
+    """
+
+    #: The rows of a tile on each SM.
     m: int
+    #: The columns of a tile.
     n: int
+    #: A step along what the kernel contracts.
     k: int
+    #: How many steps along k its ring of buffers holds.
     stages: int
+    #: On how many SMs a tile runs.
     sms: int = 1
+    #: In bands of how many tiles of rows the SMs take the tiles.
     band: int = 8
 
     @property
@@ -69,13 +75,15 @@ class Tiles(NamedTuple):
         return self.m * self.sms
 
 
+#: The tiles of `rows`, 256 rows on a pair of SMs by 128 columns, in steps of 128 of k.
 ROWS = Tiles(m=LANES, n=128, k=128, stages=7, sms=2)
-CONTRACT = Tiles(m=LANES, n=128, k=LANES, stages=7, sms=2)  # k: a tile of rows
+#: The tiles of `contract`, as `ROWS`'s, each step along k a tile of 128 rows.
+CONTRACT = Tiles(m=LANES, n=128, k=LANES, stages=7, sms=2)
 
 
 def runs() -> bool:
-    """Whether these kernels run here: on a Blackwell GPU (sm_100 on), outside
-    ``kernels.off``."""
+    """Return whether these kernels run here: on a Blackwell GPU (sm_100 on), outside
+    `bux.kernels.off`."""
     if not kernels.gpu():
         return False
     return float(getattr(jax.local_devices()[0], "compute_capability", 0)) >= 10
@@ -85,20 +93,22 @@ def runs() -> bool:
 
 
 class Tiled(NamedTuple):
-    """An operand of the kernels in MXFP8, as they load it: E4M3 values (..., r, k)
-    in blocks of 32 along k, padded by 0 to whole tiles of 128 of k, and their scales
-    laid out as tcgen05's MMA takes them in tensor memory, (..., r', k / 128, 32, 16):
-    a 512-byte tile for each 128 rows by 128 of k, r' whole tiles of rows
-    (`in_tensor_memory`). Each group's matrices are a stack of them, (g, n, k)."""
+    """An operand of the kernels in MXFP8, as they load it. Each group's matrices are a
+    stack of them, (g, n, k)."""
 
+    #: E4M3 values (..., r, k) in blocks of 32 along k, padded by 0 to whole tiles of
+    #: 128 of k.
     values: Shaped[Array, "*s r k"]
+    #: Their E8M0 scales, laid out as tcgen05's MMA takes them in tensor memory,
+    #: (..., r', k / 128, 32, 16): a 512-byte tile for each 128 rows by 128 of k, r'
+    #: whole tiles of rows (`in_tensor_memory`).
     scales: Shaped[Array, "*s p q 32 16"]
 
 
 def tiled(blocks: Blocks) -> Tiled:
     """Return MXFP8 `blocks` (..., r, k) as the kernels take them, by XLA: for an
-    operand that ``grouped_triton``'s quantizer, which writes them so, did not
-    quantize."""
+    operand that `~bux.architecture.experts.grouped_triton`'s quantizer, which writes
+    them so, did not quantize."""
     lay_out = in_tensor_memory
     for _ in range(blocks.values.ndim - 2):
         lay_out = jax.vmap(lay_out)
@@ -114,10 +124,22 @@ def rows(
     starts: Int[Array, " g"] | None = None,
     height: int | None = None,
 ) -> Float[Array, "r n"]:
-    """Return a b[g]^T for each group g's rows of a (m, k), the first sizes[0] rows
-    group 0's and so on, of b's matrices (g, n, k); the rows past the groups as 0.
-    Given `starts`, group g's rows of a start at starts[g], each a whole tile of
-    rows, and the `height` rows of the output follow each other as they would."""
+    """Return ``a b[g]^T`` for each group g's rows of a.
+
+    Args:
+        a: the rows, (m, k): the first ``sizes[0]`` group 0's, and so on.
+        b: the groups' matrices, (g, n, k).
+        sizes: how many rows each group has.
+        out: the output's dtype.
+        tiles: the kernel's tiles.
+        starts: where each group's rows of a start, each at a whole tile of rows;
+            None for each group's after the last's.
+        height: the rows of the output, which follow each other as they would
+            without `starts`; None for m.
+
+    Returns:
+        The products, (height, n): the rows past the groups as 0.
+    """
     (m, k), (groups, n, _) = a.values.shape, b.values.shape
     packed = jnp.cumsum(sizes) - sizes
     height = m if height is None else height
@@ -169,8 +191,18 @@ def contract(
     out: DTypeLike,
     tiles: Tiles = CONTRACT,
 ) -> Float[Array, "g d f"]:
-    """Return a[:, rows of g] b[:, rows of g]^T for each group g: of a (d, m) and
-    b (f, m), each in blocks along the rows m, a whole number of tiles of them."""
+    """Return ``a[:, rows of g] b[:, rows of g]^T`` for each group g: dW[g].
+
+    Args:
+        a: x^T, (d, m), in blocks along the rows m, a whole number of tiles of them.
+        b: dy^T, (f, m), likewise.
+        sizes: how many rows each group has, one after the other.
+        out: the output's dtype.
+        tiles: the kernel's tiles.
+
+    Returns:
+        Each group's product, (g, d, f).
+    """
     (d, m), f, g = a.values.shape, b.values.shape[0], sizes.shape[0]
     assert m % tiles.k == 0, f"{m} rows are not whole tiles of {tiles.k}"
     ends = jnp.cumsum(sizes).astype(jnp.int32)

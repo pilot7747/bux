@@ -1,4 +1,5 @@
-"""Compressed sparse attention (DeepSeek-V4)."""
+"""Compressed sparse attention (DeepSeek-V4): `CSA`, the layer ``csa``, and the
+compressed `Latents` its ``kv`` port carries."""
 
 from collections.abc import Sequence
 from typing import NamedTuple
@@ -29,40 +30,77 @@ from bux.lang import ir
 
 class Latents(NamedTuple):
     """Compressed latents, one slot per token: the latent of the group of
-    compress_ratio tokens that ends at a token, where one does. The kv port carries
-    them."""
+    ``compress_ratio`` tokens that ends at a token, where one does. The ``kv`` port
+    carries them."""
 
-    kv: Float[Array, "b s dk"]  # rotated: the key and the value at once
-    index: Float[Array, "b s i"] | None  # the indexer's keys, if the layer has one
-    order: Int[Array, "b s"]  # which latent of its document a slot holds; -1 for none
+    #: The latents, rotated, each the key and the value at once.
+    kv: Float[Array, "b s dk"]
+    #: The indexer's keys, if the layer has an indexer.
+    index: Float[Array, "b s i"] | None
+    #: Which latent of its document a slot holds; -1 for none.
+    order: Int[Array, "b s"]
 
 
 class CSA(Sparse):
-    """Compressed sparse attention, as DeepSeek-V4.1-Flash's inference code. A latent is
-    a head_dim wide RMS-normalized projection of a token, the key and the value of a
-    single KV head that every query head shares. Each query attends to the latents of
-    a sliding window of tokens, and to compressed latents: every compress_ratio tokens
-    of a document pooled into one, per channel under a softmax gate learned from the
-    tokens, and RMS-normalized. A compressed latent is rotated to the position of its
-    group's first token, and a query may attend to it from its group's last token on.
-    An indexer picks the top_k of them for each query; without one a query attends to
-    them all.
+    """Compressed sparse attention (CSA), the layer ``csa``: DeepSeek-V4's, as
+    DeepSeek-V4.1-Flash's inference code computes it.
 
-    Queries come from a q_lora_rank wide RMS-normalized latent, or from the input at
-    full rank. The first `rope.fraction` of each query's and latent's dims are rotated,
-    and the head outputs are rotated back by their query's position, since the values
-    were rotated with the keys. o_lora_rank makes the output projection grouped and
-    low-rank: o_groups groups of heads each projected to o_lora_rank, then mixed to the
-    width.
+    A latent is a ``head_dim`` wide RMS-normalized projection of a token, the key and
+    the value of a single KV head that every query head shares. Each query attends to
+    the latents of a sliding window of tokens, and to compressed latents: every
+    ``compress_ratio`` tokens of a document pooled into one, per channel under a
+    softmax gate learned from the tokens, and RMS-normalized. A compressed latent is
+    rotated to the position of its group's first token, and a query may attend to it
+    from its group's last token on. An indexer picks the ``top_k`` of them for each
+    query; without one a query attends to them all. With ``compress_ratio=None`` the
+    layer attends to the window alone.
 
-    Ports: `kv` written pushes the `Latents`, with the indexer's keys; read uses them
-    instead of compressing its own, and an indexer that it runs scores those keys.
-    `index` and `candidates` as for `Sparse`, over the compressed latents.
+    Queries come from a ``q_lora_rank`` wide RMS-normalized latent, or from the input
+    at full rank. The first ``rope.fraction`` of each query's and latent's dims are
+    rotated, and the head outputs are rotated back by their query's position, since
+    the values were rotated with the keys. ``o_lora_rank`` makes the output projection
+    grouped and low-rank: ``o_groups`` groups of heads each projected to
+    ``o_lora_rank``, then mixed to the width.
 
-    The window and the compressed latents are two ``sparse.Part``s of one softmax.
+    Ports, where the source lists them:
 
-    The query heads split over `heads`, and the groups of the output projection with
+    - ``kv``: written, it pushes the `Latents`, with the indexer's keys; read, the
+      layer uses them instead of compressing its own, and an indexer that it runs
+      scores those keys.
+    - ``index`` and ``candidates``: as for `~bux.architecture.attention.gqa.Sparse`,
+      over the compressed latents.
+
+    The window and the compressed latents are two parts
+    (`~bux.architecture.attention.sparse.Part`) of one softmax.
+
+    The query heads split over ``heads``, and the groups of the output projection with
     them; the latents, a single head, are every device's.
+
+    Example:
+        A layer that compresses every 2 tokens and runs the indexer, and one that
+        reuses both by its ports, as DeepSeek-V4.1-Flash's do
+        (``examples/architectures/deepseek/deepseek_v4.1_flash.bux``):
+
+        .. code-block:: bux
+
+            window = csa(num_heads=64, q_lora_rank=1280, o_lora_rank=1024, o_groups=8,
+                         sliding_window_size=128, sinks=true,
+                         rope=rope(fraction=0.125, layout=interleaved))
+            pairs  = window(compress_ratio=2, indexer=indexer(num_heads=32, top_k=512))
+            P = [norm pairs(kv=@kv, index=@topk)] [norm experts]
+            p = [norm pairs(kv=$kv, index=$topk)] [norm experts]
+
+    Args:
+        config: the layer's settings.
+        width: the width d of the stream it reads and writes.
+        ports: the ports the source lists for it.
+        rngs: draws the initial parameters.
+
+    Raises:
+        ValueError: an indexer or ports without ``compress_ratio``; ``num_heads``
+            that do not split into ``o_groups`` under ``o_lora_rank``; or ports that
+            need an indexer the layer does not run
+            (`~bux.architecture.attention.gqa.indexer_config`).
     """
 
     def __init__(
@@ -138,6 +176,18 @@ class CSA(Sparse):
         self.rope = config.rope
 
     def __call__(self, x: Float[Array, "b t d"], taps: Taps) -> Float[Array, "b t d"]:
+        """Attend each position to its window of latents and the compressed ones it
+        keeps.
+
+        Args:
+            x: the stream: b rows of t positions, d wide.
+            taps: the forward pass's taps: the documents packed into the rows, which
+                no query looks across, and the stacks the layer's ports use; a
+                training forward collects the indexer's loss in them.
+
+        Returns:
+            The layer's output, the shape of `x`.
+        """
         x = shard_layer_input(x)
         b, t, _ = x.shape
         docs = segments(taps)
