@@ -22,7 +22,8 @@ from bux import config as cfg
 from bux import parallel
 from bux.architecture.attention import sparse
 from bux.architecture.attention.indexer import Indexer, Scored, Target, from_stream
-from bux.architecture.attention.rope import logit_gain, rotate, rotated_dims
+from bux.architecture.attention.norm_rope import norm_and_rotate
+from bux.architecture.attention.rope import logit_gain, rotated_dims
 from bux.architecture.common.functional import activation
 from bux.architecture.common.ports import read, reads, write, writes
 from bux.architecture.common.segments import Segments
@@ -272,11 +273,7 @@ class Attention(SoftmaxAttention):
         """Reshape the projected queries into heads, then apply QK-norm and RoPE."""
         b, t, _ = q.shape
         q = q.reshape(b, t, self.heads, self.head_dim)
-        if self.q_norm is not None:
-            q = self.q_norm(q)
-        if self.rope is not None:
-            q = rotate(q, self.rope, pos)
-        return shard_heads(q)
+        return shard_heads(norm_and_rotate(q, self.q_norm, self.rope, pos, "heads"))
 
     def _keys_and_values(
         self,
@@ -292,10 +289,7 @@ class Attention(SoftmaxAttention):
             k, v = k + self.k_conv(k, taps), v + self.v_conv(v, taps)
         k = k.reshape(b, s, self.kv_heads, self.head_dim)
         v = v.reshape(b, s, self.kv_heads, self.v_head_dim)
-        if self.k_norm is not None:
-            k = self.k_norm(k)
-        if self.rope is not None:
-            k = rotate(k, self.rope, pos)
+        k = norm_and_rotate(k, self.k_norm, self.rope, pos, "kv_heads")
         return shard_heads(k, "kv_heads"), shard_heads(v, "kv_heads")
 
     def _mix_values(

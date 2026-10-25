@@ -507,6 +507,11 @@ class MethodsConfig(Config):
     tensor: str = "gspmd"  # how TP's collectives meet the projections they feed
     tensor_chunks: Positive = 2  # of each device's rows, under tensor = chunked
     microbatches: Positive = 1
+    # Each microbatch's forward beside the backward of the one before, a layer at a
+    # time, so that one's collectives run beside the other's compute. Off: it holds
+    # half a microbatch more and copies it across the loop, which pays only beside an
+    # exchange left exposed, as NCCL EP's with moe_stream (docs/parallelism.md).
+    interleave: bool = False
     # Where a step runs its layers more than once (microbatches, a pipeline's ticks),
     # it casts and gathers the parameters FSDP splits once, or as each layer runs
     # (ZeRO-3), which holds one layer's at a time.
@@ -538,6 +543,9 @@ class CompilerConfig(Config):
     # --xla_gpu_threshold_for_windowed_einsum_mib=0". XLA's debug options, and jax's
     # optimization_level and memory_fitting_level.
     options: Annotated[str, AfterValidator(_flags)] = ""
+    # Where the step's gradient reductions start: early, each as its gradient is
+    # computed (bux.train.reorder, a pass over XLA's schedule); or where XLA puts them.
+    reductions: Literal["early", "xla"] = "early"
 
 
 class TrainConfig(Config):

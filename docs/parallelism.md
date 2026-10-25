@@ -1124,9 +1124,75 @@ dy in place took the arm from 260.3k to 269.4k tokens a second (32.5k to 33.7k a
 at the same peak, 215.0 GiB. On GPU 0 a step fell from 1067 to 1029 ms: both gathers'
 39 ms went, and the quantizer's 95 ms became 88. With the weights after down, x in
 place alone went from 254.2k to 255.0k: the gather's 25 ms went, but the FSDP
-collectives the step overlapped came out from under it. Each GPU quantizes all 128
-experts' W, 23 ms of a step; its own shard before FSDP gathers it would save 7/8 of
-that.
+collectives the step overlapped came out from under it. Each GPU quantized all 128
+experts' W, 23 ms of a step; under the fused kernels below, each quantizes its own
+shard before FSDP gathers it.
+
+### SwiGLU fused, by cuDNN
+
+On a Blackwell GPU with cudnn-frontend (the `cuda` extra), the routed experts of a
+SwiGLU FFN (`gated_mlp` of `swish`, no `limit`, `up_softcap` or `expert_norm`) in
+`mxfp8`, every pass in it, run by cuDNN's CuTe DSL kernels, through `cudnn.jax.call` on
+XLA's stream (`grouped_glu`, over `grouped_cudnn`), where their widths are whole
+tiles of 256: Qwen3-30B-A3B's 2048 and 768, but not the baseline's 704. They fuse
+what bux's kernels left to XLA:
+
+| GEMM | kernel | in its epilogue |
+|------|--------|-----------------|
+| x W, up and gate | `swiglu` | SwiGLU, times each row's weight, quantized along h's rows for down and down its columns for down's dW; the product kept for the backward |
+| h W, down | `rows` | |
+| dy W^T, down | `dswiglu` | SwiGLU's gradient at the kept product, times the row's weight, quantized both ways; the weight's gradient |
+| dp W^T, up and gate | `rows` | |
+| dW, both | `contract`, cuDNN's block-scaled wgrad | |
+
+Their tiles are 256 by 256 on a pair of SMs, where `grouped_mxfp8`'s are 256 by 128,
+and they take each expert's rows from a multiple of 256: the quantizer reads each row
+from its token where it lies and writes the padding as 0, and the tokens' sums read
+the rows back. An exchange's rows come out as they lay, by `grouped_mxfp8.rows`,
+which reads each expert's rows from its own start and packs its output: a gather each
+way otherwise. Their GLU takes each gate 32 columns before its up, where up and
+gate's stack holds them side by side: the quantizer reads W_up's pairs so, and the
+transpose of the product's gradient for up's dW writes them back. Under FSDP, where a
+layer gathers its parameters as it runs (one microbatch, or `methods(gather=layer)`),
+each GPU quantizes its own shard of the experts' kernels, and they are gathered in
+MXFP8: an eighth of the quantizer's work on `fsdp=8`, at bfloat16's bytes, and no
+bfloat16 copy of all 128 experts.
+
+One layer of Qwen3-30B-A3B's experts (128 of 768, 262144 picks; 16 of them by EP,
+327680 rows of which 262144 filled), forward and backward on a B300, by CUPTI:
+
+| | bux's kernels | fused | |
+|-|---------------|-------|-|
+| `sorted` | 6.30 ms | 5.51 ms | the GEMMs with their epilogues 3.20 against 3.43 (2.3 against 2.2 PFLOP/s); none of XLA's 0.73 ms over h and dp, nor the quantizer's of them |
+| by EP | 5.83 ms | 4.97 ms | |
+
+At these shapes cuDNN's GEMM of h W takes 0.44 ms against `grouped_mxfp8`'s 0.53,
+and dp W^T 0.65 against 0.77; its wgrad 0.30 and 0.60 ms against 0.39 and 0.76. The
+values are within MXFP8's rounding of bux's kernels': 2% apart in the output and every
+gradient (relative Frobenius norm), each 6.6% from bfloat16's as before.
+
+megatron.bux on 8 B300s, `remat=none`, the tree before and after on the same node:
+
+| run | bux's kernels | fused |
+|-----|---------------|-------|
+| `sorted`, Megatron's batch (512 rows in 8 microbatches, `gather=layer`) | 36.1k tok/s a GPU, 229.6 GiB | 37.7k (+4.5%), 214.6 GiB |
+| `sorted`, one microbatch of 8 rows a GPU | 37.7k, 215.1 GiB | 38.5k (+2.1%), 200.3 GiB |
+| `nccl_ep`, one microbatch of 8 rows a GPU | 31.4k, 211.1 GiB | 32.4k (+3.1%), 212.7 GiB |
+
+On GPU 0, at one microbatch (traced without XLA's command buffers, whose kernels the
+trace then loses), the experts' kernels and XLA's passes over h and dp take 263 ms a
+step against 319 under `sorted`, and 234 against 280 under `nccl_ep`. Beside FSDP's
+collectives cuDNN's kernels run slower than alone: `dswiglu` takes 1.13 ms against
+0.62 (0.59 under `nccl_ep`, which has none), its tiles statically scheduled where
+`grouped_mxfp8`'s take the SMs as they free. Leaving pairs of SMs to the collectives
+(`CUDNNFE_CLUSTER_OVERLAP_MARGIN`, which all of `grouped_cudnn`'s kernels heed) gains
+0.3% at Megatron's batch with 8 (two runs each, on one node) and 1.1% with 16 (one),
+and loses 2% with 32: left at 0. `sorted` keeps no bfloat16 copy of all 128 experts'
+kernels now, so it takes 15 GiB less. Its compiles take 20 to 110 s more, CuTe DSL compiling each kernel in every
+process. 3000 steps of FineWeb-Edu on the baseline's MoE with experts of 768 (the
+fused kernels' shapes, one B300 a run) end within 0.08% of bux's kernels at each of
+three seeds (eval loss 4.0708, 4.0127, 4.0346 against 4.0742, 4.0099, 4.0363), which
+differ by 1.6%, at 104k tokens a second against 100k.
 
 ## Expert parallelism
 
@@ -1304,11 +1370,11 @@ Only `all_to_all` gains from it, on 8 B300s with jax 0.12:
   buffer and runs its experts on the one it gets) hides half its time, but seven of
   them take twice as long as one all-to-all, by NCCL or by copy engines
   (`--xla_gpu_use_memcpy_local_p2p`): 394k tokens a second.
-- `nccl_ep`'s kernels can run beside the experts on a stream of their own
-  (`methods.moe_stream`, [below](#transformerengines-nccl-ep)), but XLA's schedule
-  does not put another chunk's experts beside them, and the chunks cost more than
-  they hide: megatron.bux's MoE layer forward and backward took 13.9 ms in 2 chunks
-  and 15.0 in 4, against 13.3 whole.
+- `nccl_ep`'s kernels run beside the experts on a stream of their own
+  (`methods.moe_stream`, [below](#on-a-stream-of-its-own-methodsmoe_stream)): in 2
+  chunks the next chunk's dispatch runs beside this one's experts, and a layer's
+  forward takes 4.97 ms against 5.35 whole, but its backward gives more back
+  (forward and backward 9.55 ms against 8.07 whole).
 
 For the baseline's MoE at 32k tokens a GPU and a capacity of 1.25, profiled, tokens a
 second and ms of a step of a GPU: all its collectives, those with no compute beside
@@ -1388,11 +1454,24 @@ by `--build-arg TE_VERSION`).
 a `jax.custom_vjp` each way (`parallel/nccl_ep.py`); the experts take the rows as
 they arrive, their blocks padded to 128 as they are. NCCL EP keeps its buffers
 outside the step, sized for the most tokens a device sends at once, a chunk of its
-share of a step's (`methods.moe_chunks`), and for the rows `methods.capacity` lets it
-take, so `methods.prepare` starts it once a process before the step traces
-(`nccl_ep.start`): 25 to 60 s between two nodes. Every dispatch then brings that many
-rows, a microbatch's too: NCCL EP takes no fewer, and fails with "invalid argument"
-where they are fewer. Under a capacity,
+share of a microbatch's (`methods.moe_chunks`, `methods.microbatches`), and for the
+rows `methods.capacity` lets it take, so `methods.prepare` starts it once a process
+before the step traces (`nccl_ep.start`): 25 to 60 s between two nodes. An eval step,
+which takes a step's rows whole, sends them in pieces of that many, one after
+another. Sized by the step's tokens, megatron.bux's batch of 512 rows asked for a
+29 GiB staging buffer a GPU and did not start; by a microbatch's it trains at 32.2k
+tokens a second a GPU on 8 B300s (`remat=none`, 235 GiB). Every dispatch brings the
+rows it was started for: NCCL EP takes no fewer, and fails with "invalid argument"
+where they are fewer. TE keeps its own state of a route by the address of the
+handle its prepare writes the route into, which a copy changes, so no handle
+outlives the pass it is prepared in: the combine takes its dispatch's, and each call
+of a backward prepares the route again from the picks its forward kept (1 MiB a
+layer, where the handle is 37). A backward on its forward's handle gave wrong
+gradients, with no error, where the residuals were copied, as
+`methods(interleave=true)` keeps them (on 8 B300s, a gap of 1.0 against each
+microbatch's forward and backward in turn; now within float error, in any order of
+two microbatches' forwards and backwards). On the compute stream the backward's
+prepares cost nothing measurable (32.6k tokens a second a GPU before and after). Under a capacity,
 the picks that do not fit drop before NCCL EP sends them, as `ragged_all_to_all`
 drops them (`nccl_ep._kept`): with NCCL EP's own drops, EP=16's balance loss rose to
 35 in 25 steps and its loss came off `sorted`'s. The weights of the padding are
@@ -1454,38 +1533,70 @@ methods = methods(moe=nccl_ep, capacity=1.25, moe_stream=true)
 ```
 
 NCCL EP's kernels go on the compute stream, where nothing runs beside them. With
-`moe_stream` they run on one of their own (`nccl_ep.STREAM`): jax's `compute_on`
-marks each of TE's calls, prepare and dispatch as one, and XLA makes it an async call
-there (`--xla_gpu_experimental_stream_annotation`, on by default), whose results the
-compute stream waits for where it uses them. On 8 B300s, at megatron.bux's shapes
-(EP=8, 32k tokens a GPU, a capacity of 1.25), an exchange (3.4 ms) and an independent
-grouped GEMM (2.8 ms) took 6.0 ms on one stream and 4.9 on two, and one MoE layer's
-forward and backward 12.7 ms against 13.3. megatron.bux's `nccl_ep` arm, side by side
-on a node under `remat=save_attention`:
+`moe_stream` they run on one of their own (`nccl_ep.STREAM`): each of TE's calls
+(prepare and dispatch as one, the combine, and each backward call after a prepare of
+its own) is an async call there (`jax_internals.on_stream`;
+`--xla_gpu_experimental_stream_annotation`, on by default), whose results the compute
+stream waits for where it uses them. Two things make it overlap:
 
-| NCCL EP's kernels | tok/s a GPU | peak | step on GPU 0 | exposed exchange |
-|-------------------|-------------|------|---------------|------------------|
-| on the compute stream | 21.2k | 99.0 GiB | 1547 ms | 489 ms |
-| on their own, `moe_stream=true` | 21.9k | 169.4 GiB | 1495-1504 ms | 410-415 ms |
-| the same, `moe_chunks=2` | 21.4k | 179.0 GiB | | |
+- XLA's scheduler starts each call as soon as its inputs are ready and waits for it
+  as late as its results are needed (the call's hint `force_delay_async`); of calls
+  ready at once, those that send rows to the experts (the dispatch, the combine's
+  gradient, and a backward's prepares) start before those that send them back
+  (`scheduler_delay_priority`), so in chunks the next chunk's dispatch is not queued
+  behind this chunk's combine on NCCL EP's stream.
+- In a shard_map, XLA's SPMD partitioner copies a call's frontend attributes onto the
+  get-tuple-elements of its tuple of results, and XLA then makes each of them an
+  async call of its own on the stream (`ExplicitStreamAnnotationAsyncWrapper` takes
+  any instruction so marked): queued there behind the calls issued after it, so the
+  compute stream waited for the next chunk's dispatch before it took this chunk's
+  rows, and the scheduler put every call's done right after its start.
+  `jax_internals.parts_off_the_stream`, one of bux's passes over XLA's HLO
+  (`bux.passes`) before its scheduler, takes that mark off them: `nccl_ep.start`
+  has XLA run it on every program the process compiles for GPUs from then on, where
+  `moe_stream` is set, and JAX's cache keys those programs by it.
 
-It is off by default for the memory: XLA's latency hiding scheduler starts the
-backward's recomputed dispatches early to hide them, and the step's temporaries grow
-from 55 to 125 GiB, most of them the experts' MXFP8 operands of some 80 layers' worth
-at once; `--xla_gpu_memory_limit_slop_factor=50` does not stop it (21.0k, 170.5 GiB).
-Under `remat=none`, which computes no forward again, it should not arise: untried.
+One MoE layer at megatron.bux's shapes (EP=8, 32k tokens a GPU, a capacity of 1.25,
+the experts by cuDNN's MXFP8 kernels) on 8 B300s, in ms:
 
-Chunks gain nothing yet, since XLA's schedule leaves little beside NCCL EP's calls. It
-places each call's done right after its start, but for the last before a GEMM, so the
-compute stream waits for each at once; in chunks it runs every chunk's dispatch, then
-every chunk's experts, then the combines. Neither every chunk's routing first, behind
-an optimization barrier, nor costs for the experts' kernels (`latency_metadata`)
-changes that. Scheduling groups (`_scheduling_group_id`, which jax's
-`xla_metadata_call2` can put on a stream's call too) moved one chunk's experts beside
-another's exchange in the forward (2 chunks: 6.1 ms against 6.6), but XLA rejects them
-in the backward ("annotation groups with gaps"), where a chunk's forward and backward
-share an id. The experts cannot go on a stream of their own either: tokamax's Mosaic
-GEMM fails to compile in an async call ("Parsing error" in ptxas).
+| | compute stream | `moe_stream` | hints only | the pass only |
+|---|---|---|---|---|
+| an exchange beside an independent grouped GEMM (2.2 ms) | 5.18 | 4.30 | 4.38 | 4.64 |
+| forward | 5.37 | 5.35 | 5.36 | 5.35 |
+| forward, 2 chunks | 5.71 | 4.97 | 5.32 | 5.71 |
+| forward and backward | 9.39 | 8.07 | 8.90 | 8.18 |
+| forward and backward, 2 chunks | 10.06 | 9.55 | 9.35 | 9.83 |
+| forward and backward beside 12.6 ms of independent GEMMs | 21.66 | 20.62 | 21.52 | 20.87 |
+
+The forward of one chunk has nothing to put beside its exchange; the backward does:
+its prepares wait for nothing but the picks, and run beside the forward's experts.
+More chunks cost more than they hide here: 4 chunks take 11.29 ms forward and
+backward. The last row is what a schedule of two microbatches, one's backward beside
+the other's forward (`methods(interleave=true)`), gives the exchange: about 1 ms of a
+layer's ~6 ms of exchange hides. XLA's cost model prices the experts' and attention's
+custom calls at 10 us and an async call at 5 ms, and the hints put all that is ready
+beside the last call before it in the schedule: the interleaved schedule's barriers,
+each a tick of a piece's forward and a piece's backward, bound what that is.
+
+megatron.bux's `nccl_ep` arm at Megatron's batch (512 rows of 4096, 8 microbatches
+one after another, `remat=none`), side by side on 8 B300s:
+
+| NCCL EP's kernels | tok/s a GPU | peak |
+|-------------------|-------------|------|
+| on the compute stream, the tree before | 34.3k | 236.1 GiB |
+| on the compute stream | 34.1k | 236.1 GiB |
+| on their own, `moe_stream=true` | 34.1k | 234.2 GiB |
+| the same, `moe_chunks=2` | 33.2k | 239.1 GiB |
+
+A step of microbatches one after another gains nothing from it, and in 2 chunks it
+loses 3%: what overlaps in one layer on its own does not carry over to a step of 48,
+and why is not known yet, as jax's profiler loses most of a step's events at this
+batch. It stays off by default, for a schedule of overlapped microbatches to
+measure. XLA's own all-to-all is no alternative here: `moe=all_to_all` at a capacity
+of 1.25, the tokens sent in MXFP8, trains the arm at 26.6k tokens a second a GPU, and
+27.4k in 2 chunks (244-245 GiB), where NCCL EP took 32.2k on the same tree. With the
+routing's logits drawn at random, a capacity of 1.25 drops no pick (`dropped` 0.0
+every step), at either.
 
 What NCCL EP's step holds, under `remat=none`: XLA's analysis says 266 GiB, 42.7 of them
 the parameters and the optimizer's state and 223.2 one buffer of temporaries, of which
@@ -2001,7 +2112,9 @@ W and dy, each twice.
 ### Microbatches
 
 `methods.microbatches = n` takes each step's batch in n microbatches: a `lax.scan`
-over them inside the train step, their gradients summed in float32, and one update.
+over them inside the train step, their gradients summed in float32, and one update;
+with `interleave`, each one's forward beside the one before's backward
+([below](#side-by-side-methodsinterleave)).
 Microbatch i is rows i, i + n, i + 2n and so on (`parallel.microbatches`), so that
 every device's rows split evenly among them and none moves. `batch` must split into n
 microbatches whose rows split over the batch axes, which `parallel.check` says before
@@ -2139,6 +2252,105 @@ The cost is memory: the gathered copy of the parameters in `compute`, and, unred
 a float32 sum of every parameter's gradient on each device, held through the step.
 `layout(zero=1)` keeps the parameters whole between steps too; with `gather=step` it
 saves no collective, and holds float32 copies where the step holds `compute`'s.
+
+### Side by side: `methods.interleave`
+
+```
+methods = methods(microbatches=8, interleave=true)
+```
+
+In a row, each of a microbatch's collectives waits on the compute just before it, and
+what the layer's data flow leaves nothing beside stays exposed: FSDP's gathers, TP's
+reductions, EP's exchanges. With `interleave`, each microbatch's forward runs beside
+the backward of the one before, a piece of the model at a time, as Megatron's
+combined 1F1B does without a pipeline (`bux.train.interleave`):
+
+```
+forward of microbatch 0
+a lax.scan, for i in 0 .. n-2:
+    tick t, for t in 0 .. r-1:  piece t's forward of i+1,  piece r-1-t's backward of i
+    the head's loss of i+1, and its gradient
+backward of microbatch n-1
+```
+
+The pieces are the items of the model's graph in a row, each pass of an unrolled
+repeat one of its own (`embed`, 48 blocks, `norm`, and the head, whose forward ends
+in the loss); a scanned repeat is one piece. A piece's forward is a `jax.vjp`, which
+keeps what the backward reads but what elementwise ops make, as a scanned pass does
+(`remat.unfused`), where the run's `remat` keeps everything. The scan carries each
+piece's residuals, as leaves of their own, to its backward in the next iteration.
+Each tick ends in an optimization barrier on the stream, its gradient and the
+gradients of the tick before, so that XLA's scheduler puts one half's collectives
+beside the other half's compute, reduces a tick's gradients beside the next, and
+runs no tick early; XLA:GPU keeps the barriers until it has scheduled the step. The
+gradients, the metrics, the router's bias and the RNG streams are the loop's
+(`tests/test_interleave.py`, on FSDP, EP and TP layouts, to float32's rounding:
+XLA:CPU rounds a microbatch inside a loop to other bits than outside one).
+
+A carried leaf is written where it was read. A top piece's residuals are read by the
+backward of the microbatch before at a tick before its forward makes the new ones, so
+XLA writes them in place; a bottom piece's new ones are made before the old ones are
+read, so XLA keeps them aside and copies them in at the loop's end. That is a copy of
+half a microbatch's residuals, and the peak holds them beside the other half: on
+megatron.bux's 12-layer cut, 25 GiB more than the loop. Slots of one buffer that
+each forward takes from the backward before it (a residual put in by a
+dynamic-update-slice and taken out by a dynamic slice) hold one microbatch's, but
+XLA copies every residual a kernel made into its slot, and out again where a kernel
+reads it: 160 ms of a step of 12 of those layers in 4 microbatches, which takes 1050
+in a row, and cuBLAS chose slower GEMMs for TP's slices. XLA's dynamic-slice fusion,
+with offsets from a table
+(`--xla_gpu_experimental_enable_dynamic_slice_table_offsets=true`), makes the same
+copies as memcpys. With no carry at all, the ticks of every microbatch unrolled in the
+step, nothing is copied, but the program is n times the loop's, and XLA held 176 GiB
+for the 12 layers in 8 microbatches (124.6k tokens a second a GPU, the loop 126.7k).
+
+On 8 B300s it hides NCCL EP's exchange behind the other microbatch's compute, but
+elsewhere its copies cost more than it hides, and a model that fills a GPU in a row
+does not fit: it is off by default. Tokens a second a GPU and the peak, the loop and
+interleave side by side on a node:
+
+| run | in a row | interleaved |
+|-----|----------|-------------|
+| `megatron.bux`'s `nccl_ep`, `moe_stream=true`, 12 layers, 8 microbatches of 8 rows a GPU | 115.6k, 63.7 GiB | **120.3k**, 93.1 GiB |
+| the same, NCCL EP on the compute stream | 115.7k, 64.5 GiB | 112.3k, 87.0 GiB |
+| its `sorted`, 12 layers, 8 microbatches | 123.8k, 62.0 GiB | 118.0k, 87.5 GiB |
+| `one_node.bux`'s `tp` (`repeat=unroll`, `remat=none`), 16 rows in 4 microbatches | 33.2k, 18.0 GiB | 33.5k, 19.3 GiB |
+| the same, two collectives in flight | | 34.0k, 18.1 GiB |
+| its `fsdp`, the dense 1.3B at a row a GPU a microbatch, 32 rows in 4 | 111.2k, 11.5 GiB | 93.1k, 12.6 GiB |
+
+With `moe_stream`, NCCL EP's calls run on a stream of their own, started as early as
+their inputs allow and waited for as late as their results are needed
+([On a stream of its own](#on-a-stream-of-its-own-methodsmoe_stream)), and the other
+microbatch's piece gives the scheduler compute to put beside them: at 4 microbatches
+of the 12 layers, GPU 0's step takes 1111 ms against 1152 in a row, its collectives
+199 ms beside compute and 277 exposed, from 30 and 360, though the bottom half's
+copies add 38 ms. In a row, `moe_stream` gains nothing, as no compute is left beside
+the exchange. All 48 layers at Megatron's batch, which the loop trains at 33.7-34.1k
+in 234 GiB (`remat=none`), do not fit interleaved at `remat=none` (291 GiB) or at
+`dots_attention`; at `save_attention` they train at 30.7k in 193.4 GiB, against the
+loop's 29.5k in 203.8 GiB there: interleave's gain, but not its rematerialization's
+cost.
+
+The overlap is real but small on a node: TP's step on GPU 0 left 39 ms of its
+collectives exposed, from 47, and unrolled 35, at 35.3k a GPU against the loop's
+34.1k; the MoE's FSDP gathers took 50 ms less of a step, which slower reduce-scatters
+gave back. With the parameters gathered once a step (`gather=step`), the dense FSDP
+run has only each microbatch's reduce-scatters to hide, and the bottom half's copies
+cost more. Tied a tick at a time, the halves beat XLA's own order: in slots, with the
+barrier on the slots and the gradients alone, so that each half's chain runs as XLA
+likes, TP trained at 31.2k in 24.9 GiB, against 32.2k tied, and the MoE at 104.6k in
+93.8 GiB, against 107.3k. XLA runs one collective at a time
+(`xla_gpu_experimental_parallel_collective_overlap_limit`); at 2, interleave gains,
+and the MoE's loop loses 4.5%. Nor does `sorted`'s 48-layer arm at Megatron's batch,
+which the loop trains at 35.8k in 230 GiB, fit interleaved: in slots it asked for 261
+GiB, and the carry holds half a microbatch more.
+
+Each of NCCL EP's backward calls prepares its own route from the picks the forward
+saved, so two microbatches' calls run in any order and every run above trains to the
+loop's losses. A model whose items pass each other more than the stream (a tap, an
+MTP head) is an error that says so, and so is a pipeline, which schedules its own
+microbatches. The step's program is about twice the loop's, a forward and a backward
+on each side of the loop, and compiles in about twice the time.
 
 ### Memory and losses
 

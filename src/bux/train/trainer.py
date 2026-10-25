@@ -37,7 +37,7 @@ from jax.sharding import PartitionSpec as P
 from jax.typing import DTypeLike
 from jaxtyping import Array, Float, Int32, Shaped
 
-from bux import kernels, parallel
+from bux import kernels, parallel, passes
 from bux.architecture import Model, Scanned
 from bux.architecture.common.segments import Segments
 from bux.architecture.logits import HeadOutput
@@ -49,13 +49,20 @@ from bux.data.pipeline import DEFAULT_CACHE, jobs, prepare
 from bux.lang import ir
 from bux.lang.printer import run_to_source
 from bux.parallel.gather import Axes
-from bux.train import fitting, flops, stages, xla
+from bux.train import fitting, flops, interleave, reorder, stages, xla
 from bux.train.config import PrecisionConfig
 from bux.train.data import Batch, batches, prefetch
-from bux.train.hooks import Checkpoint, Eval, Hook, Log, Profile
+from bux.train.hooks import Checkpoint, Eval, Hook, Later, Log, Profile
 from bux.train.objective import Metrics, Objective, objective, target_mask
 from bux.train.optim import lr_multiplier, lr_schedule, optimizer
-from bux.train.sinks import JSONL, Console, LatestMetrics, Sink, is_main_process
+from bux.train.sinks import (
+    JSONL,
+    Console,
+    LatestMetrics,
+    Scalars,
+    Sink,
+    is_main_process,
+)
 
 
 def forward(model: Model, batch: Batch) -> list[HeadOutput]:
@@ -143,6 +150,17 @@ def _cast_params(params: nnx.State, dtype: DTypeLike) -> nnx.State:
     )
 
 
+def _flat(state: nnx.State) -> dict[tuple, Shaped[Array, "..."]]:
+    """Return the arrays of `state` by their paths."""
+    return {p: v.get_value() for p, v in nnx.to_flat_state(state)}
+
+
+def _filled(state: nnx.State, values: dict[tuple, Shaped[Array, "..."]]) -> nnx.State:
+    """Return `state` holding `values`, by their paths."""
+    flat = nnx.to_flat_state(state)
+    return nnx.from_flat_state([(p, v.replace(values[p])) for p, v in flat])
+
+
 def _by_spec(
     f: Callable[[P, Shaped[Array, "*s"]], Shaped[Array, "*w"]],
     specs: nnx.State,
@@ -150,6 +168,61 @@ def _by_spec(
 ) -> nnx.State:
     """Apply `f` to each variable's value of `state` and its spec in `specs`."""
     return jax.tree.map(lambda s, v: v.replace(f(s, v.get_value())), specs, state)
+
+
+def _is_variable(x: object) -> bool:
+    return isinstance(x, nnx.Variable)
+
+
+def _variables(state: nnx.State) -> list[nnx.Variable]:
+    return jax.tree.leaves(state, is_leaf=_is_variable)
+
+
+# A variable's value: an array, or a pytree of them, as optax's MaskedNode is of none.
+Value = Any
+
+
+class _Split:
+    """The model's and the optimizer's state, split once for the training steps: the
+    structure of their graph, and its variables, whose values a step reads and
+    replaces. nnx.jit walks the graph at every call, from it to its arrays and back:
+    on a B300 node's host 20 ms a step of the 1.3B and 70 of Qwen3-30B-A3B, which the
+    GPU waits for where XLA's launch of a step returns only near its end. The graph's
+    own variables hold each step's state, so the model and the optimizer are always
+    up to date."""
+
+    def __init__(self, nodes: tuple[Model, nnx.Optimizer]):
+        self.graphdef, state = nnx.split(nodes)
+        self.variables: list[nnx.Variable] = _variables(state)
+        self.structure = jax.tree.structure(state, is_leaf=_is_variable)
+
+    def values(self) -> list[Value]:
+        """Return the variables' values, as a step takes them: raw, as nnx.split
+        gives them (bux sets no hooks on a variable's value), which reads and
+        writes 4x quicker than through the hooks."""
+        return [variable.get_raw_value() for variable in self.variables]
+
+    def take(self, values: Sequence[Value]) -> None:
+        """Have the variables hold `values`, the state a step leaves."""
+        for variable, value in zip(self.variables, values, strict=True):
+            variable.set_raw_value(value)
+
+    def merged(self, values: Sequence[Value]) -> tuple[Model, nnx.Optimizer]:
+        """Return a model and an optimizer of their own variables, which hold
+        `values`: inside a step, as it traces."""
+        own = [v.replace(x) for v, x in zip(self.variables, values, strict=True)]
+        return nnx.merge(self.graphdef, jax.tree.unflatten(self.structure, own))
+
+    def values_of(self, nodes: tuple[Model, nnx.Optimizer]) -> list[Value]:
+        """Return the values of the model's and the optimizer's variables at a step's
+        end, in the order of `values`. Raise if the step changed which they are."""
+        state = nnx.state(nodes)
+        if jax.tree.structure(state, is_leaf=_is_variable) != self.structure:
+            raise ValueError(
+                "a training step changes the values of the model's and the "
+                "optimizer's variables, but not which variables they hold"
+            )
+        return [variable.get_raw_value() for variable in _variables(state)]
 
 
 class _Micro(NamedTuple):
@@ -279,7 +352,10 @@ class Trainer:
     `train_step` and `eval_step` are compiled once, so a subclass that overrides them
     changes what a step does (keeps an average of the weights, skips a spike) and
     keeps the loop, hooks and checkpoints. They get the model and the optimizer as
-    arguments, which is how nnx.jit sees them change.
+    arguments, and what `train_step` changes of them is the step's new state. The
+    training step takes their variables' values, which the trainer keeps split
+    (``_Split``): between steps a hook may change those values, as `load` does, but
+    not which variables the model and the optimizer hold.
 
     Both compute in `compute`, the model's parameters cast to it inside the loss, so
     that the parameters, their gradients and the optimizer's state stay as they are
@@ -294,13 +370,17 @@ class Trainer:
     microbatches' gradients add up on each device and reduce once, in `reduce`
     (``parallel.gather``), a pipeline's in float32; with "reduced" they reduce each
     microbatch; "auto" adds them up unreduced where the rows' axes span processes,
-    and where that computes the same, as `_why_not_unreduced` says.
+    and where that computes the same, as `_why_not_unreduced` says. With
+    `interleave`, each microbatch's forward runs beside the backward of the one
+    before, a piece of the model at a time (``interleave``).
 
     With `donate`, a training step donates the model's and the optimizer's arrays, so
     that their new state takes the old one's memory: an array read from them before a
     step is gone after it, and one to keep is a copy (``np.asarray``).
 
-    The training step compiles with XLA's `compiler_options` (``bux.train.xla``).
+    The training step compiles with XLA's `compiler_options` (``bux.train.xla``), and
+    with its gradients' `reductions` started "early" (``bux.train.reorder``) or where
+    XLA puts them ("xla").
 
     Given the `work` of a step (``flops.Work``), `flops` adds up the model FLOPs of
     the steps taken, each at the keys its batch's queries see, for the log's MFU.
@@ -316,15 +396,23 @@ class Trainer:
         matmuls: PrecisionConfig | str = "compute",
         switch: tuple[int, PrecisionConfig] | None = None,
         microbatches: int = 1,
+        interleave: bool = False,
         gather: str = "step",
         accumulate: str = "auto",
         reduce: DTypeLike | None = None,
         donate: bool = False,
         compiler_options: xla.Options | None = None,
+        reductions: str = "early",
         work: flops.Work | None = None,
     ):
+        if interleave and parallel.pipeline.pipelined():
+            raise ValueError(
+                "methods(interleave=true) runs a step's microbatches side by side, "
+                "and a pipeline schedules its own: keep mesh.stage = 1"
+            )
         self.model, self.objective = model, objective
         self.compute, self.microbatches = jnp.dtype(compute), microbatches
+        self.interleave = interleave
         self.matmuls, self.switch, self.gather = matmuls, switch, gather
         self.reduce, self.accumulate = jnp.dtype(reduce or compute), accumulate
         self.reduces_once = self._reduces_once(model)
@@ -333,21 +421,38 @@ class Trainer:
         self.step = 0
         self.work, self.flops = work, 0.0
         self.stopping = False  # set, by a signal handler say, to stop after this step
-        self._donated = ("model", "optimizer") if donate else ()
+        self._donate = donate
         self._compiler_options = compiler_options or {}
+        self._reductions = reductions
         self._compile()
 
     def _compile(self) -> None:
         """Make the compiled steps, which read `matmuls` as they trace. Under remat
         `auto`, the training step chooses its policy as it first compiles
         (``fitting``)."""
+        passes.use(reorder.NAME, self._reductions == "early")
+        self._split = _Split((self.model, self.optimizer))
         jit = fitting.Fitting if remat.setting() == "auto" else xla.jit
         self._train = jit(
-            self._train_step_on_shards,
+            self._on_values(self._train_step_on_shards),
             self._compiler_options,
-            donate_argnames=self._donated,
+            donate_argnums=0 if self._donate else (),
         )
         self._eval = nnx.jit(self.eval_step)
+
+    def _on_values(self, step: Callable[..., Metrics]) -> Callable[..., Any]:
+        """Return `step`, a function of the model, the optimizer and a batch, as one
+        of their variables' values (``_Split``) and the batch, which returns their
+        new values and the step's metrics."""
+        split = self._split
+
+        @functools.wraps(step)
+        def on_values(values: list[Value], batch: Batch) -> tuple[list[Value], Metrics]:
+            model, optimizer = split.merged(values)
+            metrics = step(model, optimizer, batch)
+            return split.values_of((model, optimizer)), metrics
+
+        return on_values
 
     def _reduces_once(self, model: Model) -> bool:
         """Return whether a step adds up its gradients unreduced (``_unreduced``, or a
@@ -554,7 +659,12 @@ class Trainer:
         """Sum `_grads` over the microbatches of `batch` in a scan, into `zeros`, each
         one's per-token part scaled by its share of the batch's targets and its
         per-row part by 1 / `all_microbatches`, of every device: so the sums are
-        the batch's, even when microbatches have unequal numbers of targets."""
+        the batch's, even when microbatches have unequal numbers of targets. With
+        `interleave`, each one's forward runs beside the one before's backward."""
+        if self.interleave and self.microbatches > 1:
+            return self._interleaved(
+                graphdef, params, buffers, batch, zeros, token_shares, all_microbatches
+            )
         row_share = 1 / all_microbatches
 
         def add_microbatch(
@@ -572,6 +682,28 @@ class Trainer:
         (grads, buffers), metrics = jax.lax.scan(add_microbatch, (zeros, buffers), xs)
         return grads, {k: v.sum() for k, v in metrics.items()}, buffers
 
+    def _interleaved(
+        self,
+        graphdef: nnx.GraphDef,
+        params: nnx.State,
+        buffers: nnx.State,
+        batch: Batch,
+        zeros: nnx.State,
+        token_shares: Float[Array, " n"],
+        all_microbatches: int,
+    ) -> tuple[nnx.State, Metrics, nnx.State]:
+        """Return `_accumulate`'s sums, each microbatch's forward run beside the
+        backward of the one before, a piece of the model at a time
+        (``interleave``)."""
+        model = nnx.merge(graphdef, params, buffers)
+        hooks = interleave.Hooks(self._training_module, self._loss)
+        step = interleave.Step(model, hooks, self.matmuls, 1 / all_microbatches)
+        micro = parallel.microbatches(batch, self.microbatches)
+        grads, metrics, after = step.gradients(
+            _flat(params), _flat(buffers), _flat(zeros), micro, token_shares
+        )
+        return _filled(zeros, grads), metrics, _filled(buffers, after)
+
     def _grads(
         self,
         graphdef: nnx.GraphDef,
@@ -586,18 +718,40 @@ class Trainer:
         share."""
 
         def loss_fn(params: nnx.State) -> tuple[Float[Array, ""], tuple[Metrics, Any]]:
-            model = cast(nnx.merge(graphdef, params, buffers, copy=True), self.compute)
-            model.set_attributes(update_at_step_end=True, raise_if_not_found=False)
+            model = self._training_module(graphdef, params, buffers)
             with matmuls.use(self.matmuls, jnp.asarray(batch.input_ids)):
                 heads, aux_losses = training_forward(model, batch)
-            per_token, per_row = self.objective(heads, batch, aux_losses)
-            loss = token_share * per_token.loss + row_share * per_row.loss
-            metrics = _scaled(per_token.metrics, token_share)
-            metrics |= _scaled(per_row.metrics, row_share)
+            loss, metrics = self._loss(heads, batch, aux_losses, token_share, row_share)
             return loss, (metrics, nnx.state(model, nnx.Not(nnx.Param)))
 
         grads, (metrics, buffers) = jax.grad(loss_fn, has_aux=True)(params)
         return grads, metrics, buffers
+
+    def _training_module[M: nnx.Module](
+        self, graphdef: nnx.GraphDef[M], params: nnx.State, buffers: nnx.State
+    ) -> M:
+        """Return the module of `graphdef` and the states, for a training step's
+        forward: its parameters cast to `compute`, its step-end updates kept for the
+        step's end."""
+        module = cast(nnx.merge(graphdef, params, buffers, copy=True), self.compute)
+        module.set_attributes(update_at_step_end=True, raise_if_not_found=False)
+        return module
+
+    def _loss(
+        self,
+        heads: Sequence[HeadOutput],
+        batch: Batch,
+        aux_losses: Sequence[Loss],
+        token_share: float | Float[Array, ""],
+        row_share: float,
+    ) -> tuple[Float[Array, ""], Metrics]:
+        """Return a microbatch's share of the step's loss, and of its metrics: the
+        objective's terms by its share of the batch's targets, and the losses layers
+        report by its share of rows."""
+        per_token, per_row = self.objective(heads, batch, aux_losses)
+        loss = token_share * per_token.loss + row_share * per_row.loss
+        metrics = _scaled(per_token.metrics, token_share)
+        return loss, metrics | _scaled(per_row.metrics, row_share)
 
     def eval_step(self, model: Model, batch: Batch) -> Float[Array, ""]:
         """Return the first head's loss on `batch`, computed in `compute`."""
@@ -609,11 +763,17 @@ class Trainer:
     def train_on_batch(self, batch: Batch) -> Metrics:
         """Take one training step on `batch`, and return its metrics."""
         self._switch_if_due()
-        metrics = self._train(self.model, self.optimizer, parallel.shard_batch(batch))
+        on_devices = parallel.shard_batch(batch)
+        values, metrics = self._train(self._split.values(), on_devices)
+        self._split.take(values)
         self.step += 1
         if self.work is not None:
             self.flops += self.work.of(rows_read(batch.position_ids))
         return metrics
+
+    def lower(self, batch: Batch) -> jax.stages.Lowered:
+        """Return the training step lowered for the trainer's state and `batch`."""
+        return self._train.lower(self._split.values(), batch)
 
     def _switch_if_due(self) -> None:
         if self.switch is not None and self.step >= self.switch[0]:
@@ -621,15 +781,15 @@ class Trainer:
             self._compile()
 
     def evaluate(self, batches: Iterable[Batch]) -> float:
-        """Return the mean of `eval_step` over `batches`, in eval mode."""
+        """Return the mean of `eval_step` over `batches`, in eval mode. Every batch's
+        step is launched before any loss is read, so the GPU runs one as the host
+        launches the next."""
         self.model.eval()
         try:
-            losses = [
-                float(self._eval(self.model, parallel.shard_batch(b))) for b in batches
-            ]
+            losses = [self._eval(self.model, parallel.shard_batch(b)) for b in batches]
         finally:
             self.model.train()
-        return sum(losses) / len(losses)
+        return sum(float(loss) for loss in losses) / len(losses)
 
     def state(self) -> nnx.State:
         """What a checkpoint keeps: the model's state and the optimizer's."""
@@ -650,22 +810,36 @@ class Trainer:
         """Train on `data` to step `steps`, or until `stopping` is set, after which
         every hook's `stop` runs; the next batches load as a step runs (``prefetch``).
         After every step, the hooks due run in order, and what they return goes to
-        every sink. All of them close at the end, or when training stops."""
+        every sink once the next step is launched (``hooks.Later``). All of them close
+        at the end, or when training stops."""
         with contextlib.ExitStack() as stack:
             for block in (*sinks, *hooks):
                 stack.callback(block.close)
             for hook in hooks:
                 hook.start(self)
             loaded = stack.enter_context(contextlib.closing(prefetch(data)))
+            reported: list[tuple[int, Scalars | Later]] = []
             while self.step < steps and not self.stopping:
                 metrics = self.train_on_batch(next(loaded))
-                for hook in hooks:
-                    if hook.due(self.step, steps) and (scalars := hook(self, metrics)):
-                        for sink in sinks:
-                            sink.write(self.step, scalars)
+                _write(reported, sinks)  # the step before's, as this one runs
+                reported = [
+                    (self.step, out)
+                    for hook in hooks
+                    if hook.due(self.step, steps) and (out := hook(self, metrics))
+                ]
+            _write(reported, sinks)
             if self.step < steps:
                 for hook in hooks:
                     hook.stop(self)
+
+
+def _write(reported: list[tuple[int, Scalars | Later]], sinks: Sequence[Sink]) -> None:
+    """Give every sink what the hooks reported at each step, read now where it is
+    `Later`."""
+    for step, out in reported:
+        scalars = out if isinstance(out, Mapping) else out()
+        for sink in sinks:
+            sink.write(step, scalars)
 
 
 def directory(run: ir.Run, out: str | Path) -> Path:
@@ -724,11 +898,13 @@ def train(
             matmuls=precision,
             switch=matmuls.late(precision, config.steps),
             microbatches=_accumulated(config.methods.microbatches),
+            interleave=config.methods.interleave,
             gather=config.methods.gather,
             accumulate=config.methods.accumulate,
             reduce=_reduce_dtype(config.precision),
             donate=config.methods.donate,
             compiler_options=xla.options(config.compiler),
+            reductions=config.compiler.reductions,
             work=work,
         )
         make_batches = functools.partial(

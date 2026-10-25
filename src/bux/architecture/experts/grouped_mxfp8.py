@@ -111,23 +111,42 @@ def rows(
     sizes: Int[Array, " g"],
     out: DTypeLike,
     tiles: Tiles = ROWS,
-) -> Float[Array, "m n"]:
+    starts: Int[Array, " g"] | None = None,
+    height: int | None = None,
+) -> Float[Array, "r n"]:
     """Return a b[g]^T for each group g's rows of a (m, k), the first sizes[0] rows
-    group 0's and so on, of b's matrices (g, n, k); the rows past the groups as 0."""
+    group 0's and so on, of b's matrices (g, n, k); the rows past the groups as 0.
+    Given `starts`, group g's rows of a start at starts[g], each a whole tile of
+    rows, and the `height` rows of the output follow each other as they would."""
     (m, k), (groups, n, _) = a.values.shape, b.values.shape
-    past = jnp.maximum(m - sizes.sum(), 0)[None].astype(sizes.dtype)
-    at = tiles_of(jnp.concatenate([sizes, past]), m, tiles.height)
-    kernel = _rows_kernel(m, n, k, at.shape[0], groups, jnp.dtype(out), tiles)
-    return kernel(a.values, b.values, a.scales, b.scales, at[:, 0], at[:, 1], at[:, 2])
+    packed = jnp.cumsum(sizes) - sizes
+    height = m if height is None else height
+    starts = packed if starts is None else starts
+    filled = sizes.sum()
+    # The rows past the groups, as a group of no matrix's, where they lie in y.
+    past = jnp.maximum(height - filled, 0).astype(sizes.dtype)
+    starts = jnp.concatenate([starts, filled[None]])
+    sizes = jnp.concatenate([sizes, past[None]])
+    down = starts - jnp.concatenate([packed, filled[None]])  # a's rows less y's
+    at = tiles_of(sizes, max(m, height), tiles.height, starts)
+    kernel = _rows_kernel(height, n, k, at.shape[0], groups, jnp.dtype(out), tiles)
+    spans = (at[:, 0], at[:, 1], at[:, 2], down.astype(jnp.int32))
+    return kernel(a.values, b.values, a.scales, b.scales, *spans)
 
 
-def tiles_of(sizes: Int[Array, " g"], m: int, tile: int) -> Int[Array, "t 3"]:
+def tiles_of(
+    sizes: Int[Array, " g"],
+    m: int,
+    tile: int,
+    starts: Int[Array, " g"] | None = None,
+) -> Int[Array, "t 3"]:
     """Return, for each tile of `tile` rows of m that a group has rows in, the group
     and where its rows there start and end; then (0, 0, 0), as many as make the most
-    there can be: one a tile of m, and one more a group but the first."""
+    there can be: one a tile of m, and one more a group but the first. Each group's
+    rows follow the last's, or start at `starts`."""
     g = sizes.shape[0]
-    ends = jnp.cumsum(sizes)
-    starts = ends - sizes
+    starts = jnp.cumsum(sizes) - sizes if starts is None else starts
+    ends = starts + sizes
     first = starts // tile
     count = jnp.where(sizes > 0, -(-ends // tile) - first, 0)
     before = jnp.cumsum(count) - count
@@ -307,12 +326,13 @@ def _rows_kernel(
     tiles: Tiles,
 ) -> Any:
     """Return the kernel of `rows` for these shapes, k whole tiles: a jax function
-    of a's values, b's, their scales, and each row tile's group, start and end; a
-    tile of the rows past the groups, of group `groups`, stores 0."""
+    of a's values, b's, their scales, each row tile's group, start and end, and how
+    many rows each group's output lies before its rows of a; a tile of the rows past
+    the groups, of group `groups`, stores 0."""
     columns = -(-n // tiles.n)
 
     def body(*refs: Any) -> None:
-        a, b, a_scales, b_scales, group_of, starts, ends, y, *scratch = refs
+        a, b, a_scales, b_scales, group_of, starts, ends, down, y, *scratch = refs
 
         def place(index: Int[Array, ""]) -> _Place:
             t, column = _in_bands(index, count, columns, tiles)
@@ -324,7 +344,7 @@ def _rows_kernel(
         load = functools.partial(
             _load_rows, a=a, b=b, a_scales=a_scales, b_scales=b_scales
         )
-        store = functools.partial(_store_rows, y=y)
+        store = functools.partial(_store_rows, y=y, down=down)
         _each_tile(place, load, store, _Buffers(*scratch), tiles)
 
     return _launch(body, (m, n), out, count * columns, tiles, "bux_mxfp8_rows")
@@ -640,16 +660,17 @@ def _multiply(tile: _Tile, buffers: _Buffers) -> None:
     plgpu.tcgen05_commit_arrive(buffers.multiplied.at[tile.acc], collective_axis=pair)
 
 
-def _store_rows(tile: _Tile, buffers: _Buffers, y: Any) -> None:
-    """Store this SM's rows of the tile that are in [start, end) to y: as 0 in a
-    tile of the rows past the groups."""
+def _store_rows(tile: _Tile, buffers: _Buffers, y: Any, down: Any) -> None:
+    """Store this SM's rows of the tile that are in [start, end) to y, `down` its
+    group's rows before them: as 0 in a tile of the rows past the groups."""
     start = jnp.maximum(tile.start, tile.first)
     count = jnp.maximum(jnp.minimum(tile.end, tile.first + tile.tiles.m) - start, 0)
+    first = tile.first - down[tile.group]
 
     def part(staged: Any, columns: pl.Slice) -> None:
         offset, size = start - tile.first, tile.tiles.m
         while size:  # by TMA copies of 128, 64, ... 1 rows
-            _store_some(staged, y, tile.first, offset, size, count & size, columns)
+            _store_some(staged, y, first, offset, size, count & size, columns)
             offset, size = offset + (count & size), size // 2
         plgpu.commit_smem_to_gmem_group()
 

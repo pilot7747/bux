@@ -70,10 +70,9 @@ def test_an_option_is_a_name_and_a_value():
 
 def test_a_step_compiled_with_options_compiles_again_for_other_shapes():
     step = xla.jit(lambda x: 2 * x, {"xla_gpu_enable_triton_gemm": False})
-    assert isinstance(step, xla.Compiled)
     np.testing.assert_array_equal(step(jnp.ones(3)), 2 * np.ones(3))
     np.testing.assert_array_equal(step(jnp.ones((2, 2))), 2 * np.ones((2, 2)))
-    assert len(step.compiled) == 2
+    assert step._cache_size() == 2
 
 
 # --- exposed communication ------------------------------------------------------------
@@ -127,8 +126,10 @@ def test_exposed_comm_is_the_collectives_time_with_no_compute_beside_them(tmp_pa
     file.write_bytes(ProfileData.text_proto_to_serialized_xspace(gpu0 + gpu1))
     assert trace.latest(tmp_path) == file
     got = trace.comm_ms(file, steps=2)
-    # GPU 0: 50 µs of collectives, 10 + 7 of them alone; GPU 1: none. A step, a GPU.
-    assert got == pytest.approx({"comm_ms": 50e-3 / 4, "exposed_comm_ms": 17e-3 / 4})
+    # GPU 0: 50 µs of collectives, 10 + 7 of them alone, and nothing from 45 to 50;
+    # GPU 1: none of either. A step, a GPU.
+    want = {"comm_ms": 50e-3 / 4, "exposed_comm_ms": 17e-3 / 4, "idle_ms": 5e-3 / 4}
+    assert got == pytest.approx(want)
 
 
 def test_a_trace_without_gpus_reports_nothing(tmp_path):

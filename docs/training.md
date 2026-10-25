@@ -78,7 +78,7 @@ id          params  tokens  tok/param  flops/tok  gpus  ...  run
 | `mesh`       | `mesh(data=..., fsdp=..., tensor=...)`: the device grid | `mesh`: every device on `data` |
 | `layout`     | `layout(...)`: which mesh axes each named dimension splits over | `layout` |
 | `methods`    | `methods(attention=..., moe=..., microbatches=...)`: how what communicates is computed, and the microbatches a step takes its batch in | `methods` |
-| `compiler`   | `compiler(preset=..., options=...)`: XLA's options for the training step ([below](#xlas-options-compiler)) | `compiler`: XLA's defaults |
+| `compiler`   | `compiler(preset=..., options=..., reductions=...)`: XLA's options for the training step, and where its gradients' reductions start ([below](#xlas-options-compiler)) | `compiler`: XLA's defaults, reductions `early` |
 
 The settings of each config are pydantic fields in `bux/train/config.py`, and the
 editor shows them on hover and completes them, as it does for layers. In short:
@@ -296,6 +296,25 @@ and as well:
   bfloat16's 0.84 in 8 rows of 4096, 3.7 to 5.8 in one of 32k, and the stable
   backward above adds a bfloat16 forward.
 
+MXFP8 attention, which Megatron-Bridge's B300 recipe runs (E4M3 in blocks of 32 with
+a power-of-two scale a block, forward and backward), pays only in long rows too.
+cuDNN 9.27 runs it on B300s at a head dim of 128 by its graph API (`sdpa_mxfp8` and
+`sdpa_mxfp8_backward`, which XLA has no call of: a `buffer_callback` would run them,
+as it runs the GDN kernel): q and k in blocks along the head dim and v along the
+positions forward, and backward q, k, v and dO each way the backward's products
+contract them. Against bfloat16's cuDNN kernels, a layer of 32 heads of 4:
+
+| rows | forward | backward | both, quantized by XLA | error, of float32's |
+|------|---------|----------|------------------------|---------------------|
+| 8 of 4096 | 0.49 ms, 1.35x | 2.58 ms, 1.0x | 4.06 ms against 3.85 | 5% (bfloat16: 0.2%) |
+| 4 of 8192 | 1.09, 1.52x | 4.89, 1.08x | 6.51 against 6.92 | |
+| 1 of 32k | 3.98, 1.54x | 16.7, 1.15x | 21.2 against 25.2 | |
+
+On a Blackwell GPU cuDNN runs the MXFP8 backward by its deterministic algorithm
+alone, two kernels; quantizing for it and the forward takes XLA 1.0 ms a layer
+whatever the rows. Outputs and gradients are 5-7% off float32's, 9-13% with q four
+times larger.
+
 ## Data
 
 A batch is rows of `seq_len` tokens, each three arrays: `input_ids`, `position_ids`
@@ -468,12 +487,18 @@ document: 6.9G for a Llama-style 1.3B at 4096 tokens a row, 6 N of its matrices 
 `profile = profile(start=20, steps=5)` traces the 5 steps after step 20 into
 `profile/`, waiting for the step before it starts and stops, for `xprof` or
 TensorBoard's profile plugin (`tensorboard --logdir runs/<run>/profile`). On GPUs the
-log then has, at step 25, what a step of them spent in collectives, `comm_ms`, and in
+log then has, at step 25, what a step of them spent in collectives, `comm_ms`, in
 collectives with no kernel computing beside them on any stream, `exposed_comm_ms`: the
-communication the step waits for. Each is the mean of the GPUs the process traced
-(`bux/train/trace.py`): a kernel communicates if NCCL runs it or XLA's op that
-launched it is a collective, CUDA's copies neither communicate nor compute, and every
-other kernel computes.
+communication the step waits for, and running no kernel at all, `idle_ms`. Each is
+the mean of the GPUs the process traced (`bux/train/trace.py`): a kernel communicates
+if NCCL runs it or XLA's op that launched it is a collective, CUDA's copies neither
+communicate nor compute, and every other kernel computes. Most of `idle_ms` is the
+host: after a step it waited for (a logged loss, the trace's own start), a GPU waits
+for the next one's launch, 145 to 210 ms for Qwen3-30B-A3B's 48 layers on 8 B300s,
+where it waits 25 ms a step between kernels. jax.profiler runs XLA's command buffers
+(CUDA graphs) a kernel at a time as it traces; kept whole
+(`--xla_enable_command_buffers_during_profiling=true`), the step's idle and exposed
+time were the same.
 
 ## Speed on GPUs
 
@@ -485,6 +510,7 @@ by itself where it cannot run, and all of them do inside `bux.kernels.off()` or 
 | what | by | on a B300, against XLA |
 |------|----|------------------------|
 | softmax attention | `methods.attention = auto`, the default: cuDNN's causal kernels in rows of one document, cuDNN's fused attention in rows of 8192 or more and with a window, else tokamax's flash attention (sinks, a soft cap) | 7x, and no t × t logits |
+| QK-norm then RoPE | `norm_rope`: a Pallas kernel a pass, forward and backward, for an RMSNorm with a scale and RoPE by halves (Qwen3's, OLMo 2's) | 1.4x forward, 1.9x backward (Qwen3-30B-A3B's queries in megatron.bux's step: 0.12 and 0.24 ms a layer) |
 | sparse attention (DSA, QSA, CSA) | `sparse`: tokamax's flash attention with the kept keys as a mask; the indexer's scores, its loss's picks and target by Pallas kernels (`scoring`), its top-k by counting | 2.6x a chunk of queries at a time, and no t × t floats |
 | linear attention, RWKV-7 | `chunkwise`: chunks of 64 positions, the state across them by a Pallas kernel (`affine_scan`); `methods(states=recompute)` keeps a fourteenth of the memory for the backward | 14-17x a scan over positions |
 | Mamba-2 | `chunkwise`, B and C a group's, the state across chunks by a matmul; `methods(states=recompute)` keeps a sixteenth of the memory for the backward | 25x a scan over positions (2 × 4096 tokens, rematerialized: at 8 × 4096 the scan needs 199 GiB) |
@@ -493,6 +519,7 @@ by itself where it cannot run, and all of them do inside `bux.kernels.off()` or 
 | KDA without | bux's Pallas kernels (`pallas_delta`): any gate, each pair's decay through a position between them | 2.6x `chunkwise` |
 | MoE experts | `grouped.ragged_dot`: tokamax's Mosaic and Triton kernels | 27x `jax.lax.ragged_dot` |
 | MoE experts in MXFP8 | `grouped_mxfp8`: Mosaic GPU kernels of tcgen05's block-scaled MMA, the scales by TMA into tensor memory (docs/parallelism.md) | 1.5-2.4x tokamax's bfloat16 GEMMs |
+| MoE experts' SwiGLU in MXFP8 | `grouped_glu`: cuDNN's CuTe DSL grouped GEMMs, SwiGLU and its backward with their quantizations in the epilogues, each GPU's shard of the kernels quantized before FSDP gathers it (docs/parallelism.md) | 1.13-1.17x `grouped_mxfp8`'s layer |
 | MoE dispatch | `token_rows`, `token_sums`: gathers where XLA would scatter | 4x |
 | NVFP4's quantizers | `nvfp4`: Pallas kernels, a pass for the largest magnitudes and one that writes both copies, rounded by Blackwell's E2M1 conversions | 3-5x |
 
@@ -515,6 +542,11 @@ without it at 60.5k in 122 GiB by chunks, now 96.5k in 88 by bux's kernels. Thei
 losses over 30 steps, GEMM autotuning off, are within 1.7e-4 of the chunks' (GDN) and
 the same (KDA). On 8 GPUs the GDN kernel's callbacks run one at a time, 87% of 8 GPUs
 alone, where KDA's kernel, which cudnn-frontend calls from JAX itself, runs at 91%.
+
+The 1.3B with Qwen3's QK-norm, in MXFP8, trains 3000 steps of FineWeb-Edu by the
+norm and RoPE's kernels 3% faster than by XLA's fusions (130k tokens a second against
+126k, GEMM autotuning off), its held-out loss within 0.04% of theirs at three seeds,
+which differ by 1.9%.
 
 Sparse attention trains at long context. A DeepSeek-V3.2-style 1B (MLA of 16 heads,
 DSA's indexer of 64 heads and top 2048 in all 16 layers, dense MLPs) on one B300, in
@@ -605,9 +637,10 @@ parallelism".
 Unlike these, a low-precision matmul format changes what a run computes, so it is a
 setting, `precision(matmuls=...)` (docs/parallelism.md, "Matmul formats"). On a B300,
 cuDNN's MXFP8 GEMM runs at 1.75x bfloat16's rate (2.7-3.0 PFLOP/s at the model's
-shapes), and quantizing each operand twice, in one pass of a Pallas kernel, gives some
-of it back: an MLP projection's forward and backward take 1.3-1.35x less time, q's and
-o's 1.1x, and k's and v's, half as wide, 7% more. cuDNN's NVFP4 GEMM runs at 4.8-5.5
+shapes), and quantizing each operand twice, in one pass of a Pallas kernel (4.3-4.7
+TB/s at Qwen3-30B-A3B's projections, scaling in bfloat16), gives some of it back: an
+MLP projection's forward and backward take 1.3-1.35x less time, q's and o's 1.1x, and
+k's and v's, half as wide, 7% more. cuDNN's NVFP4 GEMM runs at 4.8-5.5
 PFLOP/s at the MLP's shapes, 1.7-1.9x MXFP8's, with a bfloat16 output that the two
 tensors' scales then rescale, in what reads it (cuDNN's own global scale is no faster,
 and takes it in bfloat16). NVFP4's quantizers are two passes of Pallas kernels over
@@ -666,6 +699,7 @@ and scanned, `first=2, last=2` at 1.20M, where `mxfp8` alone gives 1.22M.
 compiler = compiler(preset=o1)
 compiler = compiler(options="--xla_gpu_threshold_for_windowed_einsum_mib=0")
 compiler.preset = default | o1 | lhs | maxtext       # a sweep
+compiler = compiler(reductions=xla)                  # where XLA puts them
 ```
 
 The training step compiles with a preset's options, and the setting's own `options`
@@ -751,6 +785,54 @@ them. From two rows a GPU the compute hides them anyway, and what the scan copie
 and out of its stacks costs more than the loop saves. So the defaults stay: unrolled,
 with XLA's options. FSDP at a row a GPU, as a model too large for more trains, is
 worth `methods(repeat=scan)` with `compiler(preset=maxtext)`.
+
+#### Where the gradients' reductions start: `reductions`
+
+XLA's scheduler places a collective's done just before its result is first read, and,
+with one collective in flight, each start just above the done before it and what
+feeds only the start just above that. A gradient's reduction is read where the step
+adds it up, after the last layer's backward pass (a microbatch's sum, the optimizer's
+update), so XLA puts every weight gradient's GEMM there, each just before its
+reduction, and runs the reductions one after another beside nothing but those GEMMs:
+Qwen3-30B-A3B's `sorted` arm (`megatron.bux`, Megatron's batch of 8 microbatches,
+`fsdp=8`) waited 95 ms a microbatch, 11% of its step, for 96 reduce-scatters at the
+end of each backward pass. `compiler(reductions=early)`, the default, runs a pass
+over XLA's schedule (`bux.train.reorder`) that moves each reduction up, with the ops
+that compute for it alone (its GEMM, its operands' quantizers), to just after what
+they read, and waits for it just before the start of the second reduction after it
+(`reorder.LAG`); `xla` leaves XLA's schedule. On 8 B300s the arm trains at 41.7k
+to 42.1k tokens a second a GPU with `early` against 39.7k to 40.0k with `xla` (on two
+nodes), in the same 214.5 GiB, and its profiled step's exposed collectives drop from
+1029 ms to 726 of 6.8 s, most of what is left a microbatch's last reductions, which
+only its next microbatch could run beside. Its `nccl_ep` arm gains 0.8%, and the
+one-node suite's runs 1.1% (`fsdp`), 6.2% (`fsdp_m8`, 8 microbatches), 0.4% (`moe`),
+1.7% (`moe_ep`, `tp`) and none (`pp`), each in the same memory. Before the experts'
+kernels quantized their weights before the gather, the arm gained 5.7%, from 37.3k
+to 39.4k, at lags 2, 3 and 4 alike, and 3% less at lag 1. The pass changes the order
+of a program's ops, not what they compute: with GEMM autotuning off and XLA's
+deterministic ops its loss after 12 steps is within 0.002 of XLA's schedule's, where
+two runs of one tree without them end 0.02 apart.
+
+XLA's own flags left the reductions where they were. On the same arm before the pass
+(`remat=none`, tokens a second a GPU, on one node but for the last two rows):
+
+| XLA's flags | tok/s a GPU |
+|-------------|-------------|
+| XLA's defaults | 37.1k |
+| PGLE: JAX's, 3 profiled steps, the 85th percentile | 23.8k |
+| two collectives in flight (`--xla_gpu_experimental_parallel_collective_overlap_limit=2`) | 37.2k |
+| the same, each started as early as it can (`--xla_gpu_experimental_collective_start_as_early_as_possible=true`) | 37.2k |
+| 16 NCCL channels a collective, where XLA takes 32 of a B300's 148 SMs (`--xla_gpu_nccl_collective_max_nchannels=16`) | 35.7k |
+| NCCL's symmetric buffers, or its registered ones | fail to compile: cuDNN's MXFP8 GEMMs then miss their graphs |
+
+With 16 channels the GEMMs beside the collectives ran 3% faster and the collectives
+took half again as long; with the pass, 16 and 24 channels were 1.6-6.5% slower too.
+
+The pass is an entry of `bux.passes.PASSES`, bux's passes over XLA's HLO: each a
+function of a serialized HloModuleProto, run before or after XLA's scheduler, on every
+program the process compiles for GPUs once `passes.use(name)` turns it on; JAX's cache
+of compiled programs is keyed by the passes in use. Another is a function under
+`@passes.register(name, stage=passes.AFTER_SCHEDULING)`.
 
 ## Launching
 
@@ -1002,9 +1084,47 @@ def _(c, multiplier, model):  # a config, the schedule's multiplier, the model
 ```
 
 A hook runs after every `every` steps and after the last, and the scalars it
-returns, metrics by name, go to every sink. When training stops early, because
-something set `trainer.stopping` as the launcher does at SIGTERM, every hook's `stop`
-runs, and the checkpoint hook saves the step. A tracker is a sink:
+returns, metrics by name, go to every sink once the next step is launched. A hook
+that only reads the step's metrics returns a function that gives its scalars
+(`hooks.Later`), which the loop calls then: the log does, so that reading a loss
+waits for its step as the next one runs, not the GPU for the host to launch that
+one. The log computes its learning rate as it runs, on the GPU behind its step: one
+computed as it was read queued behind the next step, and reading it waited for that
+one too, which left the GPU nothing to run as the host launched the one after.
+
+Between two steps the host does little. A training step takes the model's and the
+optimizer's arrays as a list, of variables the trainer split once from their graph
+(`_Split` in `bux/train/trainer.py`), where nnx.jit walked the graph at every call,
+from it to its arrays and back: 20 ms a step of the 1.3B, 70 of Qwen3-30B-A3B, on a
+B300 node's host, where the list takes 18 ms of the 30B's, most of it Python freeing
+the arrays of the step before. That is time the GPU waits for where XLA's launch of a
+step returns only when the GPU is nearly through it, its queue of kernels full:
+Qwen3-30B-A3B's, of thousands of kernels and collectives, returns 100 to 170 ms
+before its step ends, and the host then has that long to launch the next. The 1.3B's,
+its kernels in CUDA graphs (XLA's command buffers), returns in 10 ms, and the host
+runs up to two steps ahead; but under the profiler, which turns command buffers off,
+its launch too returns at its step's end. Python's cycle collector, which walked what
+nnx.jit's walks made, no longer stops the host for a full collection a few steps in
+(340 ms on the 1.3B, 980 on the 30B). The GPU now waits for the host only after a
+step the host waits for, at an eval or a checkpoint. On 8 B300s, against the tree
+before:
+
+| run                                                | before            | after          |
+|----------------------------------------------------|-------------------|----------------|
+| 1.3B (one-node suite's `fsdp`), log every 5 steps  | 1.224M tok/s      | 1.245M tok/s   |
+| the same, profiled, logging every step: GPU 0 idle | 57.9 ms a step    | 2.2 ms a step  |
+| the same, profiled, log every 5 steps: GPU 0 idle  | 25.8 ms a step    | 2.1 ms a step  |
+| 1.3B in 8 microbatches (`fsdp_m8`)                 | 1.012M tok/s      | 1.054M tok/s   |
+| Qwen3-30B-A3B, megatron.bux's `sorted`             | 42.0k tok/s a GPU | 42.3k          |
+| the same, logging every step                       | 6.30 s a step     | 6.24 s         |
+| the one-GPU suite's 8 runs, a B300 each            |                   | +1.2% to +7.2% |
+
+With GEMM autotuning off and XLA's deterministic ops, both 1.3B runs train to the
+same losses as before, to the bit.
+
+When training stops early, because something set `trainer.stopping` as the launcher
+does at SIGTERM, every hook's `stop` runs, and the checkpoint hook saves the step. A
+tracker is a sink:
 
 ```python
 class WeightNorm(Hook):
@@ -1093,7 +1213,11 @@ the layers that report the name, under that name; eval leaves them out.
 
 `train_step` and `eval_step` are what the trainer compiles, once; a subclass that
 overrides them changes what a step does (averaging the weights, skipping a spike) and
-keeps the loop, the hooks and checkpoints. Gradient accumulation is built in:
+keeps the loop, the hooks and checkpoints. `train_step` gets a model and an optimizer
+made in the step from the values of the trainer's variables, and its changes to them
+are the step's new state, which the trainer's model and optimizer hold after it: so a
+hook may change the values of their variables between steps (`trainer.load`,
+`nnx.update`), but not which variables they hold. Gradient accumulation is built in:
 `methods(microbatches=n)`, which on a mesh gathers the parameters once a step and, where
 the rows are independent and span hosts, reduces the gradients once (docs/parallelism.md, "Gathered
 once, reduced once"); `Trainer(..., gather=, accumulate=, reduce=)` takes the same
