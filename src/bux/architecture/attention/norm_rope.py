@@ -32,8 +32,8 @@ from bux.parallel.mesh import manual_axes
 
 F32 = jnp.float32
 Ref = Any  # a Pallas ref, which indexes and loads as an array does not
-# A program's rows (a token's head each) and warps, forward and backward: on a B300
-# 5.5 TB/s forward and 4.1 back at 32 heads; at 4 heads 5.9 and 3.9.
+# About how many rows (a token's head each) a program takes, forward and backward: on a
+# B300 5.5 TB/s forward and 4.1 back at 32 heads; at 4 heads 5.9 and 3.9.
 FORWARD_ROWS, BACKWARD_ROWS = 32, 8
 
 
@@ -44,9 +44,24 @@ def norm_and_rotate(
     positions: Int[Array, "b t"] | None,
     heads: parallel.Name,
 ) -> Float[Array, "b t h d"]:
-    """Return x's heads normalized by `norm`, then rotated by `rope` at `positions`
-    (or the tokens' indices), each if given: by the kernels where they take the call
-    (`takes`); `heads` names x's third dimension, as the layout splits it."""
+    """Return x's heads normalized by `norm`, then rotated by `rope`, each if given.
+
+    The kernels make both in one pass where they take the call (`takes`); elsewhere
+    `norm` and `~bux.architecture.attention.rope.rotate` run one after the other. On
+    a mesh each device runs the kernels on its own rows, tokens and heads.
+
+    Args:
+        x: queries or keys: b rows of t tokens, h heads of d dims.
+        norm: QK-norm, a norm of each head's d dims; None for none.
+        rope: the RoPE settings; None for no rotation.
+        positions: each token's position in its document; None for its index in the
+            row.
+        heads: the name of x's third dimension, ``heads`` or ``kv_heads``, as the
+            layout splits it (`bux.parallel`).
+
+    Returns:
+        `x` normalized and rotated, in its dtype.
+    """
     if norm is None or rope is None or not takes(x, norm, rope, heads):
         x = x if norm is None else norm(x)
         return x if rope is None else rotate(x, rope, positions)
@@ -63,9 +78,12 @@ def norm_and_rotate(
 def takes(
     x: Float[Array, "b t h d"], norm: Norm, rope: cfg.RoPEConfig, heads: parallel.Name
 ) -> bool:
-    """Whether the kernels take the call: on a GPU outside any shard_map, 16-bit x
-    whose head dim and heads on each device are powers of two, an RMSNorm with a
-    scale and no bias of the input, and RoPE by halves of every dim."""
+    """Return whether the kernels take a call of `norm_and_rotate`.
+
+    They take one on a GPU outside any shard_map, of 16-bit x whose head dim (32 to
+    256) and heads on each device are powers of two, an RMSNorm with no bias and a
+    scale after it (not ``scale_input``), and RoPE by halves of every dim.
+    """
     _, _, h, d = x.shape
     local = h // parallel.splits(("batch", "seq", heads, None), x.shape)[2]
     rms = norm.kind == "rmsnorm" and norm.scale is not None and norm.bias is None
@@ -116,6 +134,7 @@ def _fused(
     rope: cfg.RoPEConfig,
     eps: float,
 ) -> Float[Array, "b t h d"]:
+    """Return x normalized with `gain` and rotated, by the kernels, forward and back."""
     return _forward(x, gain, positions, rope, eps)[0]
 
 
@@ -126,6 +145,8 @@ def _forward(
     rope: cfg.RoPEConfig,
     eps: float,
 ) -> tuple[Float[Array, "b t h d"], tuple]:
+    """Return `_fused`'s output by the forward kernel, and what the backward keeps:
+    x, the gain and the positions."""
     b, t, h, d = x.shape
     tokens = _tokens(b * t, h, FORWARD_ROWS)
     rows, gains, angles = _blocks(h, d, tokens)

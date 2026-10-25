@@ -1,11 +1,18 @@
 """Causal grouped-query attention, and what it shares with MLA and CSA.
 
 `Attention` is the GPT-2 and Llama layer: projections, QK-norm, RoPE, the run's
-`methods.attention` (``bux.parallel.context``), and the output projection. Two mixins
-add to it: `FullLogits`, what needs all t by t logits, which only `xla`'s math makes
-(relative bias, length scale, attention dropout), and `Sparse`, the indexer of sparse
-attention, which attends by ``bux.architecture.attention.sparse``. `build_gqa` picks the
-class the config needs.
+``methods.attention`` (`bux.parallel.context`), and the output projection. Its base,
+`SoftmaxAttention`, is what every softmax attention layer shares once it has q, k and
+v. Two mixins add to them:
+
+- `FullLogits`: the features that need all t by t logits, which only ``xla``'s math
+  makes: relative bias, length scale and attention dropout.
+- `Sparse`: sparse attention's indexer, and the attention over the keys it keeps
+  (`bux.architecture.attention.sparse`).
+
+`build_gqa` picks the class the config needs: `Attention`, `FullLogitsAttention` or
+`SparseAttention`. MLA (`bux.architecture.attention.mla`) and CSA
+(`bux.architecture.attention.csa`) build on the same pieces.
 """
 
 from collections.abc import Sequence
@@ -60,12 +67,30 @@ SoftmaxConfig = cfg.GQAConfig | cfg.MLAConfig | cfg.CSAConfig
 
 
 class SoftmaxAttention(nnx.Module):
-    """What the softmax attention layers share once they have q, k and v: the scale,
-    softcap, window and sinks of the attention method, and the output's norm, gate,
-    projection and dropout. A layer makes its projections, `o` among them, first.
+    """What the softmax attention layers share once they have q, k and v.
+
+    It holds the attention method's settings (the scale, softcap, sliding window and
+    sinks) and the output's norm, gate, projection and dropout. A layer makes its own
+    projections, `o` among them, before it calls this constructor, so that a seed
+    draws them first. Its forward then makes q, k and v and calls `_attend` and
+    `_output`.
 
     Under tensor parallelism a device has whole heads: their columns of the input
     projections, their q, k, v and outputs, and their rows of `o`.
+
+    Args:
+        config: the layer's settings (`~bux.config.GQAConfig`,
+            `~bux.config.MLAConfig` or `~bux.config.CSAConfig`).
+        width: the width d of the stream the layer reads and writes.
+        heads: the query heads h.
+        kv_heads: the key and value heads g; each serves h / g query heads.
+        qk_head_dim: the head dim of queries and keys, dk. The softmax scale is
+            ``dk ** -0.5`` unless ``config.scale`` sets one.
+        v_head_dim: the head dim of values, dv.
+        bias: whether the projections made here, the gate's and the relative
+            bias's, have a bias.
+        ports: the ports the layer lists in the source.
+        rngs: draws the initial parameters.
     """
 
     o: nnx.Linear  # the output projection, which the layer makes
@@ -166,15 +191,52 @@ class SoftmaxAttention(nnx.Module):
 
 
 class Attention(SoftmaxAttention):
-    """Causal grouped-query attention: MHA when num_kv_heads == num_heads, MQA when it
-    is 1.
+    """Causal grouped-query attention (GQA), the layer ``gqa``: GPT-2's and Llama's.
 
-    Ports: `v` written pushes the values; read mixes the tap's values into the layer's,
-    as `value_residual` says (ResFormer). `kv` written pushes (k, v); read uses them
-    instead of projecting its own (cross-layer KV sharing).
+    The query heads share the key and value heads in groups: MHA when
+    ``num_kv_heads == num_heads``, MQA when it is 1. The layer projects the input to
+    q, k and v (one matrix each, or one fused under ``fused_qkv``), adds a causal conv
+    to k and v under ``kv_conv_size`` (Inkling), applies QK-norm and then RoPE, and
+    attends by the run's ``methods.attention`` (`bux.parallel.context`). The heads'
+    outputs then go through `SoftmaxAttention`'s norm, gate, output projection and
+    dropout. `build_gqa` makes this class, or `FullLogitsAttention` or
+    `SparseAttention` where the config needs them.
+
+    Ports, where the source lists them:
+
+    - ``v``: written, it pushes the values; read, it mixes the tap's values into the
+      layer's as ``value_residual`` says (ResFormer).
+    - ``kv``: written, it pushes (k, v); read, the layer uses them instead of
+      projecting its own (cross-layer KV sharing: YOCO, CLA).
 
     Shapes: b rows, t queries and s keys (the same positions), d the width, h heads and
     g kv heads, dk and dv the head dims of keys and values.
+
+    Example:
+        Llama 3 8B's attention, 32 query heads over 8 kv heads:
+
+        .. code-block:: bux
+
+            attn = gqa(num_heads=32, num_kv_heads=8, rope=rope(base=500000))
+
+        The layer alone, in Python::
+
+            import jax.numpy as jnp
+            from flax import nnx
+
+            from bux import config as cfg
+            from bux.architecture.attention.gqa import Attention
+            from bux.architecture.registry import Taps
+
+            config = cfg.GQAConfig(num_heads=4, num_kv_heads=2, rope=cfg.RoPEConfig())
+            attn = Attention(config, width=64, ports=(), rngs=nnx.Rngs(0))
+            y = attn(jnp.ones((2, 16, 64)), Taps())  # (2, 16, 64)
+
+    Args:
+        config: the layer's settings.
+        width: the width d of the stream it reads and writes.
+        ports: the ports the source lists for it, as ``gqa(kv=@kv)``.
+        rngs: draws the initial parameters.
     """
 
     def __init__(
@@ -226,6 +288,16 @@ class Attention(SoftmaxAttention):
         self.v_mix = nnx.Param(jnp.full(shape, 0.5)) if trained else None
 
     def __call__(self, x: Float[Array, "b t d"], taps: Taps) -> Float[Array, "b t d"]:
+        """Attend each position to those before it in its document, and to itself.
+
+        Args:
+            x: the stream: b rows of t positions, d wide.
+            taps: the forward pass's taps: the documents packed into the rows, which
+                no query looks across, and the stacks the layer's ports use.
+
+        Returns:
+            The layer's output, the shape of `x`.
+        """
         docs = segments(taps)
         x, projected = self._projections(x)
         q, k, v = self._heads(projected, docs, taps)
@@ -308,14 +380,32 @@ class Attention(SoftmaxAttention):
 def token_mask(
     t: int, window: int | None, docs: Segments | None
 ) -> Bool[Array, "*b t s"]:
-    """Return the causal mask of t queries over the t keys at their positions, within
-    `window` and each query's document."""
+    """Return the causal mask of t queries over the t keys at their positions.
+
+    Args:
+        t: the positions, both the queries and the keys.
+        window: how many keys a query sees at most, itself among them; None for all.
+        docs: the documents packed into the rows, which no query looks across; None
+            when each row is one.
+
+    Returns:
+        Which keys each query sees, (t, s), or (b, t, s) given `docs`.
+    """
     return causal_mask(t, window, None if docs is None else docs.ids)
 
 
 def require_xla(feature: str) -> None:
-    """Raise unless the run's attention is `xla`, the only method with `feature`, or
-    `auto`, which takes xla for it."""
+    """Raise unless the run's ``methods.attention`` is ``xla`` or ``auto``.
+
+    ``xla`` is the only method with the logit features of `FullLogits`, and ``auto``
+    takes ``xla`` for them.
+
+    Args:
+        feature: the feature's setting, which the error names.
+
+    Raises:
+        NotImplementedError: under any other method.
+    """
     on = parallel.active()
     name = on.methods.attention if on else "auto"
     if name not in ("xla", "auto"):
@@ -347,9 +437,15 @@ def _length_scale(
 
 
 class FullLogits(SoftmaxAttention):
-    """Softmax attention with features that need all t by t logits: relative bias,
-    length scale and attention dropout. It runs `xla`'s masked softmax itself, so it
-    raises under a method other than `xla` or `auto`."""
+    """Softmax attention with features that need all t by t logits.
+
+    The features: a data-dependent relative bias (``relative_bias``, Inkling), a
+    length scale on the logits (``log_scale``, Inkling) and attention dropout. With
+    any of them the layer runs ``xla``'s masked softmax itself, so it raises under a
+    method other than ``xla`` or ``auto`` (`require_xla`); without them it attends as
+    `SoftmaxAttention` does. A mixin: `FullLogitsAttention` and
+    `~bux.architecture.attention.mla.FullLogitsMLA` put it before their layer.
+    """
 
     def _init_logit_layers(
         self, config: SoftmaxConfig, width: int, bias: bool, rngs: nnx.Rngs
@@ -441,8 +537,21 @@ class FullLogits(SoftmaxAttention):
 def indexer_config(
     config: SoftmaxConfig, ports: Sequence[ir.Port]
 ) -> cfg.SparseIndexerConfig | None:
-    """Return the config of the indexer the layer runs: None when it reads its keep
-    mask from the index port instead, whatever its config says."""
+    """Return the config of the indexer the layer runs, if it runs one.
+
+    Args:
+        config: the layer's settings.
+        ports: the ports the source lists for it.
+
+    Returns:
+        ``config.indexer``; None when the layer reads its kept keys from the ``index``
+        port instead, whatever its config says.
+
+    Raises:
+        ValueError: a ``candidates`` port, or an ``index`` port it writes, without an
+            indexer that the layer runs.
+        NotImplementedError: candidate pools of an indexer with ``block_size > 1``.
+    """
     indexer = None if reads(ports, "index") else config.indexer
     needs = [
         p.name
@@ -460,23 +569,32 @@ def indexer_config(
 
 
 def documents_or_rows(docs: Segments | None, b: int, t: int) -> Segments:
-    """Return the packed documents, or one document per row."""
+    """Return the documents packed into b rows of t, or one document a row if None."""
     if docs is not None:
         return docs
     return Segments.of(jnp.broadcast_to(jnp.arange(t, dtype=jnp.int32), (b, t)))
 
 
 class Sparse(FullLogits):
-    """Sparse attention (DeepSeek-V3.2): each query attends only to the keys an
-    indexer keeps. Its loss alone trains it, against the attention's probabilities.
+    """Sparse attention (DeepSeek-V3.2's DSA): each query attends only to the keys an
+    indexer keeps.
 
-    The attention is ``sparse.attend``'s, with no t by t floats: tokamax's flash kernel
-    with the kept keys as a mask on a GPU, else XLA a chunk of queries at a time.
-    `FullLogits`' features take all t by t logits, as `xla` does.
+    The indexer (`~bux.architecture.attention.indexer.Indexer`) ranks the keys each
+    query may attend to and keeps its top-k. Its loss alone trains it, against the
+    attention's probabilities, which it reports as ``indexer_loss`` in training. The
+    attention is `bux.architecture.attention.sparse.attend`'s, with no t by t floats:
+    tokamax's flash kernel with the kept keys as a mask on a GPU, else XLA a chunk of
+    queries at a time. `FullLogits`' features take all t by t logits, as ``xla`` does.
+    A mixin: `SparseAttention`, `~bux.architecture.attention.mla.SparseMLA` and
+    `~bux.architecture.attention.csa.CSA` build on it.
 
-    Ports: `index` written pushes the kept keys (``sparse.Kept``); read uses the tap's
-    instead of running an indexer, so the layer builds none. `candidates` written
-    pushes the candidate pool; read keeps the indexer's choice inside the tap's.
+    Ports, where the source lists them:
+
+    - ``index``: written, it pushes the kept keys
+      (`~bux.architecture.attention.sparse.Kept`); read, the layer uses the tap's
+      instead of running an indexer, and builds none (GLM-5's IndexCache).
+    - ``candidates``: written, it pushes the indexer's candidate pool; read, the
+      indexer keeps keys only inside the tap's pool (DeepSeek-V4.1).
     """
 
     indexer: Indexer | None  # which the layer builds, if it runs one
@@ -641,11 +759,26 @@ class Sparse(FullLogits):
 
 
 class FullLogitsAttention(FullLogits, Attention):
-    pass
+    """GQA with the logit features of `FullLogits`: relative bias, length scale or
+    attention dropout. It takes `Attention`'s arguments."""
 
 
 class SparseAttention(Sparse, Attention):
-    """GQA with an indexer whose keys are projected from the layer's input."""
+    """GQA with sparse attention's indexer (`Sparse`), whose queries and keys are
+    projected from the layer's input, as DeepSeek-V3.2's are. It takes `Attention`'s
+    arguments; ``config.indexer`` sets the indexer.
+
+    Example:
+        Layers that run the indexer and export its top-k, each followed by three
+        that reuse it:
+
+        .. code-block:: bux
+
+            attn  = gqa(num_heads=16, num_kv_heads=4, indexer=indexer(top_k=1024))
+            first = [norm attn(index=@topk)] [norm ffn]  # runs the indexer
+            later = [norm attn(index=$topk)] [norm ffn]  # attends to its picks
+            model = embed (first later^3)^4 norm head
+    """
 
     def __init__(
         self,
@@ -663,6 +796,16 @@ class SparseAttention(Sparse, Attention):
         )
 
     def __call__(self, x: Float[Array, "b t d"], taps: Taps) -> Float[Array, "b t d"]:
+        """Attend each position to the keys it keeps, as `Attention` does to all.
+
+        Args:
+            x: the stream: b rows of t positions, d wide.
+            taps: the forward pass's taps, as `Attention` takes them; a training
+                forward collects the indexer's loss in them.
+
+        Returns:
+            The layer's output, the shape of `x`.
+        """
         docs = segments(taps)
         x, projected = self._projections(x)
         heads = self._heads(projected, docs, taps)
@@ -676,8 +819,19 @@ def pick[L: SoftmaxAttention](
     full: type[L],
     sparse: type[L],
 ) -> type[L]:
-    """Return `sparse` for an indexer or its ports, `full` for another feature that
-    needs all t by t logits, else `plain`."""
+    """Return the class of a softmax attention layer that `config` and `ports` need.
+
+    Args:
+        config: the layer's settings.
+        ports: the ports the source lists for it.
+        plain: the layer.
+        full: the layer with `FullLogits`.
+        sparse: the layer with `Sparse`.
+
+    Returns:
+        `sparse` for an indexer or its ports, `full` for another feature that needs
+        all t by t logits, else `plain`.
+    """
     sparse_ports = any(p.name in ("index", "candidates") for p in ports)
     if config.indexer is not None or sparse_ports:
         return sparse
@@ -689,7 +843,17 @@ def pick[L: SoftmaxAttention](
 def build_gqa(
     config: cfg.GQAConfig, width: int, ports: Sequence[ir.Port], rngs: nnx.Rngs
 ) -> Attention:
-    """Make GQA with the features that `config` and `ports` ask for."""
+    """Make GQA with the features that `config` and `ports` ask for.
+
+    Args:
+        config: the layer's settings.
+        width: the width d of the stream it reads and writes.
+        ports: the ports the source lists for it.
+        rngs: draws the initial parameters.
+
+    Returns:
+        An `Attention`, `FullLogitsAttention` or `SparseAttention`, as `pick` picks.
+    """
     layer = pick(config, ports, Attention, FullLogitsAttention, SparseAttention)
     return layer(config, width, ports, rngs)
 

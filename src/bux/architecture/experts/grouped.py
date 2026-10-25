@@ -1,10 +1,10 @@
 """Grouped matmuls, each group of rows by its own matrix, as an MoE's experts run:
 `jax.lax.ragged_dot`, by kernels on a GPU.
 
-    y = x W, dx = dy W^T   tokamax's Mosaic kernel where its extra is installed
-                           (Linux), its fastest on Blackwell and Hopper
-    dW = x^T dy            tokamax's Triton kernel under jit, and `contract`, a Pallas
-                           kernel here, eagerly, where jax-triton fails on jax 0.12
+- ``y = x W`` and ``dx = dy W^T``: tokamax's Mosaic kernel where its extra is
+  installed (Linux), its fastest on Blackwell and Hopper (`dot`).
+- ``dW = x^T dy``: tokamax's Triton kernel under jit, and `contract`, a Pallas kernel
+  here, eagerly, where jax-triton fails on jax 0.12 (`weight_grad`).
 
 dW contracts the ragged dimension, which the Mosaic kernel cannot. XLA's own, off a
 GPU or at shapes the kernels do not take, is 27 times slower on a B300 at an MoE's
@@ -42,8 +42,20 @@ Saved = tuple[Float[Array, "m d"], Float[Array, "g d f"], Int[Array, " g"]]
 def ragged_dot(
     x: Float[Array, "m d"], w: Float[Array, "g d f"], sizes: Int[Array, " g"]
 ) -> Float[Array, "m f"]:
-    """Return the first sizes[0] rows of x times w[0], the next sizes[1] times w[1],
-    and so on; rows past them come out 0."""
+    """Return each group of rows of x times its matrix of w: the first ``sizes[0]``
+    rows times ``w[0]``, the next ``sizes[1]`` times ``w[1]``, and so on.
+
+    `jax.lax.ragged_dot`, differentiated by the kernels on a GPU (`dot` and
+    `weight_grad`).
+
+    Args:
+        x: the rows, m of d, sorted by group.
+        w: the groups' matrices, (g, d, f).
+        sizes: how many rows each group has.
+
+    Returns:
+        The products, (m, f); rows past the groups come out 0.
+    """
     if not kernels.gpu():
         return jax.lax.ragged_dot(x, w, sizes)
     return _by_kernels(*_vary_alike(x, w), sizes)
@@ -53,6 +65,7 @@ def ragged_dot(
 def _by_kernels(
     x: Float[Array, "m d"], w: Float[Array, "g d f"], sizes: Int[Array, " g"]
 ) -> Float[Array, "m f"]:
+    """Return `ragged_dot` on a GPU, forward and backward by the kernels."""
     return dot(x, w, sizes)
 
 
@@ -92,8 +105,8 @@ def dot(
 def weight_grad(
     x: Float[Array, "m d"], dy: Float[Array, "m f"], sizes: Int[Array, " g"]
 ) -> Float[Array, "g d f"]:
-    """Return dW, x^T dy per group: by tokamax's Triton kernel, 1.7 times as fast as
-    `contract` on a B300, where it runs."""
+    """Return dW, ``x^T dy`` per group: by tokamax's Triton kernel where it runs, 1.7
+    times as fast as `contract` on a B300, else by `contract`."""
     if tokamax is not None and kernels.gpu():
         try:
             return tokamax.ragged_dot_general(
@@ -112,9 +125,20 @@ def weight_grad(
 def contract(
     x: Float[Array, "m d"], y: Float[Array, "m f"], sizes: Int[Array, " g"]
 ) -> Float[Array, "g d f"]:
-    """Return x^T y for each group of rows, as `sizes` groups them: the gradient of
-    `ragged_dot`'s matrices. By a Pallas kernel on a GPU, one program per tile of a
-    group's matrix; by XLA elsewhere."""
+    """Return ``x^T y`` for each group of rows, as `sizes` groups them: the gradient
+    of `ragged_dot`'s matrices.
+
+    By a Pallas kernel on a GPU, one program per tile of a group's matrix, where a
+    tile of 16 or more divides d and f; by XLA elsewhere.
+
+    Args:
+        x: the rows, m of d, sorted by group.
+        y: the same rows' other operand, m of f.
+        sizes: how many rows each group has.
+
+    Returns:
+        Each group's product, (g, d, f).
+    """
     d, f = x.shape[1], y.shape[1]
     if not kernels.gpu() or d % TILES[-1] or f % TILES[-1]:  # no tile divides them
         return jax.lax.ragged_dot_general(x, y, sizes, RAGGED_CONTRACTING)
