@@ -42,11 +42,11 @@ class Batch(NamedTuple):
     ``loss_mask[t + 1]`` is and token t + 1 is in t's document
     (`~bux.train.objective.target_mask`)."""
 
-    input_ids: Int32[np.ndarray | Array, "b t"]  # the tokens
-    # Where each token is in its document: a document starts at a row's first token
-    # and wherever they stop increasing.
+    input_ids: Int32[np.ndarray | Array, "b t"]  #: The tokens.
+    #: Where each token is in its document. A document starts at a row's first token
+    #: and wherever they stop increasing.
     position_ids: Int32[np.ndarray | Array, "b t"]
-    loss_mask: Bool[np.ndarray | Array, "b t"]  # whether each token is a target
+    loss_mask: Bool[np.ndarray | Array, "b t"]  #: Whether each token is a target.
 
     @classmethod
     def concat(cls, parts: Sequence["Batch"]) -> "Batch":

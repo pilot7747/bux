@@ -1,24 +1,26 @@
 """Pipeline schedules as tables: the op each stage runs at each tick, which
-bux.parallel.scheduled runs.
+`bux.parallel.scheduled` runs.
 
-An op is `F`, a microbatch's forward through a stage, or `B`, its backward. Where a
-schedule splits the backward, `B` takes the gradient of the stage's input alone and
-`W` that of its weights, later. Each stage has a queue of ops for each lane of a
-tick, and ``lockstep`` runs the queues tick by tick:
+An op is ``F``, a microbatch's forward through a stage, or ``B``, its backward.
+Where a schedule splits the backward, ``B`` takes the gradient of the stage's input
+alone and ``W`` that of its weights, later. Each stage has a queue of ops for each
+lane of a tick, and `lockstep` runs the queues tick by tick::
 
     tick t, on each stage, in each lane:  the queue's next op, if what it reads is there
     end of tick t:                        F's output goes on to the next stage,
                                           B's input gradient back to the one before
 
-    1f1b  two lanes, F and a whole B, each as soon as it can run: stage s holds
-          2(S − s) − 1 microbatches, and the stages idle as gpipe's do.
-    zbh1  one lane, B split: stage s runs S − s forwards, then a B, the W of the
-          microbatch s before it, and an F, in turn. Every stage holds S microbatches,
-          and they idle S − 1 ticks of 3M + S − 1 (ZB-H1 of Qi et al., "Zero Bubble
-          Pipeline Parallelism", 2024).
+With S stages and M microbatches, the schedules of `TABLES` are:
+
+- ``1f1b``: two lanes, F and a whole B, each as soon as it can run: stage s holds
+  2(S − s) − 1 microbatches, and the stages idle as gpipe's do.
+- ``zbh1``: one lane, B split: stage s runs S − s forwards, then a B, the W of the
+  microbatch s before it, and an F, in turn. Every stage holds S microbatches, and
+  they idle S − 1 ticks of 3M + S − 1 (ZB-H1 of Qi et al., "Zero Bubble Pipeline
+  Parallelism", 2024).
 
 A table also gives the slot of a buffer each stage keeps each microbatch in
-(``Table.buffer_slots``), and the share of a step the stages idle (``Table.bubble``).
+(`Table.buffer_slots`), and the share of a step the stages idle (`Table.bubble`).
 """
 
 from collections import deque
@@ -40,6 +42,8 @@ ARRIVAL = 1 - 1e-6  # a send at tick t arrives at t + ARRIVAL, after the tick's 
 
 
 class Op(NamedTuple):
+    """What a stage runs in a lane at a tick: an op's kind, on a microbatch."""
+
     kind: str  # FORWARD, BACKWARD or WEIGHTS
     microbatch: int
 
@@ -62,18 +66,22 @@ class Table:
 
     @property
     def ticks(self) -> int:
+        """The ticks a step takes."""
         return len(self.ops)
 
     @property
     def stages(self) -> int:
+        """The pipeline's stages."""
         return len(self.ops[0])
 
     @property
     def lanes(self) -> int:
+        """The ops a stage may run at a tick."""
         return len(self.ops[0][0])
 
     @property
     def microbatches(self) -> int:
+        """The microbatches a step runs."""
         return 1 + max(op.microbatch for _, op in self.each_op())
 
     def each_op(self) -> Iterator[tuple[Place, Op]]:
@@ -264,6 +272,8 @@ def _zbh1_queue(s: int, stages: int, microbatches: int) -> Queue:
     return ops + [Op(WEIGHTS, j) for j in lagging]
 
 
+#: The schedules by name, each a function of the stages and the microbatches; each
+#: is a method of ``methods.pipeline`` (`bux.parallel.scheduled`).
 TABLES: dict[str, Callable[[int, int], Table]] = {
     "1f1b": one_f_one_b,
     "zbh1": zero_bubble_h1,

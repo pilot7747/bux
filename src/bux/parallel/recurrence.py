@@ -1,21 +1,24 @@
-"""Context parallelism for recurrent mixers: what the methods of `methods.recurrence`
+"""Context parallelism for recurrent mixers: what the methods of ``methods.recurrence``
 take, and `pass_state`.
 
 Every recurrent mixer keeps one state S of dk by dv per head, which each position
 decays and adds to, and reads its outputs from, linearly. So a chunk of positions maps
-the state it starts from to the one it ends with by an affine map, its transition
+the state it starts from to the one it ends with by an affine map, its transition::
 
     S -> A S + B,
 
 with A one dk by dk matrix per head (the delta rule, RWKV-7), or its diagonal (GLA,
 Mamba), or a scalar (Lightning, Mamba-2), and zero across a document start; and each
-output of the chunk gains reads_t . S from the state S it starts from.
+output of the chunk gains ``reads_t · S`` from the state S it starts from.
 
 A method is ``(recurrence) -> out``: a `Recurrence` names the family and holds a
 function that runs it over a chunk of positions from a zero state (`Chunk`), with
-its inputs; `out` is the outputs (b, t, h, dv) in float32. `scan`, the default, runs
-every position as one chunk, and is in bux.architecture.recurrent.linear_attention. A
-method that cannot run a family raises NotImplementedError naming it.
+its inputs; ``out`` is the outputs ``(b, t, h, dv)`` in float32. ``scan``, the
+default, runs every position as one chunk, and is in
+`bux.architecture.recurrent.linear_attention`. A method that cannot run a family
+raises NotImplementedError naming it. With ``layout.seq`` over ``context``::
+
+    methods = methods(recurrence=pass_state)
 """
 
 from collections.abc import Callable
@@ -41,10 +44,10 @@ class Chunk(NamedTuple):
     """What a recurrence gives over a chunk of positions from a zero state; with its
     transition, also what a state it started from would add."""
 
-    out: Float[Array, "b t h dv"]  # the outputs, in float32
-    state: Float[Array, "b h dk dv"] | None  # the state it ends with: B
-    transition: Transition | None  # A
-    reads: Float[Array, "b t h dk"] | None  # out_t gains reads_t . S from a start S
+    out: Float[Array, "b t h dv"]  #: The outputs, in float32.
+    state: Float[Array, "b h dk dv"] | None  #: The state it ends with, B.
+    transition: Transition | None  #: A, the transition's matrix or its diagonal.
+    reads: Float[Array, "b t h dk"] | None  #: Output t gains ``reads_t · S`` from S.
 
 
 # (xs, shared, transition) -> Chunk: the transition and the reads only if asked for.
@@ -55,10 +58,11 @@ class Recurrence(NamedTuple):
     """What a method of `methods.recurrence` runs: `chunk` over (b, t, ...) arrays
     `xs` of positions, with `shared` whole along them."""
 
-    family: str  # what errors call it: "the selective scan"
+    family: str  #: What errors call it, as "the selective scan".
+    #: Runs a chunk of positions from a zero state, ``(xs, shared, transition)``.
     chunk: Chunked
-    xs: Positions
-    shared: Shared = ()
+    xs: Positions  #: The ``(b, t, ...)`` arrays it takes for each position.
+    shared: Shared = ()  #: What it takes whole along the positions, as parameters.
 
 
 def then(

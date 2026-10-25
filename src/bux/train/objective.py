@@ -32,7 +32,7 @@ from bux.lang import ir
 from bux.train import config as tcfg
 from bux.train.data import Batch
 
-#: What a step measured, by name: scalars, still on the device.
+#: What a step measured, by name, as scalars still on the device.
 Metrics = dict[str, Float[Array, ""]]
 Output = HeadOutput | Float[Array, "b t vocab"]  # a head's output, or its logits
 
@@ -92,15 +92,16 @@ class Term(NamedTuple):
     every head's logits (`Heads`) and the batch, a mean over the batch's targets.
     The trainer scales it by each microbatch's share of the targets."""
 
-    weight: float  # what the objective multiplies it by; 0 still logs it
+    weight: float  #: What the objective multiplies it by; 0 still logs it.
+    #: The term of every head's logits and the batch, a scalar.
     fn: Callable[[Heads, Batch], Float[Array, ""]]
 
 
 class Part(NamedTuple):
     """A part of the objective: its values' weighted sum, and each value by name."""
 
-    loss: Float[Array, ""]
-    metrics: Metrics
+    loss: Float[Array, ""]  #: The weighted sum of its values.
+    metrics: Metrics  #: Each value by name, unweighted.
 
 
 @dataclass

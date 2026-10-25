@@ -37,9 +37,26 @@ def _variable(x: object) -> bool:
 
 
 def shardings(state: nnx.State, gathered: bool = False) -> nnx.State:
-    """Return the NamedSharding of every variable of `state` on the mesh of `use`; or
-    with `gathered`, of the parameters as a step uses them: split by their names
-    alone, whole over FSDP's axes."""
+    """Return the NamedSharding of every variable of `state` on the mesh of
+    `~bux.parallel.settings.use`; or with `gathered`, of the parameters as a step
+    uses them: split by their names alone, whole over FSDP's axes.
+
+    A variable splits by its dimensions' names (`~bux.parallel.layout.spec`), then
+    its first whole dimension over FSDP's axes (``layout.fsdp``): the optimizer's
+    state always, and parameters unless ``layout.zero`` is 1.
+
+    Args:
+        state: A model's or an optimizer's state, or both; on shapes alone too.
+        gathered: The parameters' shardings as a step uses them, without FSDP.
+
+    Returns:
+        A state of the same structure, a NamedSharding for each variable.
+
+    Raises:
+        RuntimeError: Outside `~bux.parallel.settings.use`.
+        ValueError: If a variable names a dimension that is not one of the layout's,
+            with its path.
+    """
     on = active()
     if on is None:
         raise RuntimeError("shardings are of the mesh `bux.parallel.use` sets")
@@ -52,7 +69,14 @@ def shardings(state: nnx.State, gathered: bool = False) -> nnx.State:
 
 def build[M: nnx.Module](make: Callable[[], M]) -> M:
     """Return `make()`'s module with every parameter created on its shards, so that
-    none is ever whole on one device."""
+    none is ever whole on one device. Outside `~bux.parallel.settings.use` it is
+    ``make()``.
+
+    Example::
+
+        with parallel.use(MeshConfig(fsdp=8)):
+            model = parallel.build(lambda: Model(run.arch, rngs=nnx.Rngs(0)))
+    """
     if active() is None:
         return make()
     graphdef, abstract = nnx.split(nnx.eval_shape(make))
@@ -79,7 +103,7 @@ def shard_batch[T](batch: T) -> T:
     positions over `seq`.
 
     In a job of many processes, each puts the parts its own devices hold, of a batch
-    whose other rows it need not have (``local_rows``).
+    whose other rows it need not have (`local_rows`).
     """
     on = active()
     if on is None:
@@ -99,7 +123,8 @@ def _batch_sharding(shape: tuple[int, ...], on: Active) -> NamedSharding:
 
 def local_rows(rows: int, seq_len: int) -> Int[np.ndarray, " n"]:
     """Return the rows of a batch of `rows` that this process's devices hold, as
-    ``shard_batch`` splits it, in order: every row on one process or outside ``use``."""
+    `shard_batch` splits it, in order: every row on one process or outside
+    `~bux.parallel.settings.use`."""
     on = active()
     if on is None or jax.process_count() == 1 or not isinstance(on.mesh, Mesh):
         return np.arange(rows)
@@ -110,10 +135,14 @@ def local_rows(rows: int, seq_len: int) -> Int[np.ndarray, " n"]:
 
 
 def microbatches[T](batch: T, n: int) -> T:
-    """Split every (b, ...) array of `batch` into `n` microbatches, (n, b / n, ...).
+    """Split every ``(b, ...)`` array of `batch` into `n` microbatches,
+    ``(n, b / n, ...)``.
 
     Microbatch i takes rows i, i + n, i + 2n and so on, so that every device's rows
-    split evenly among them and none moves. Each shards as ``shard_batch`` does.
+    split evenly among them and none moves. Each shards as `shard_batch` does.
+
+    Raises:
+        ValueError: If `n` does not divide the rows.
     """
 
     def split(x: Shaped[Array, "b ..."]) -> Shaped[Array, "n m ..."]:

@@ -13,7 +13,7 @@ before its reduction, one after another: the GEMMs keep their inputs until then,
 the reductions run beside nothing but each other's GEMMs. The pass moves each GEMM
 and its reduction up to where the layer's backward pass makes the GEMM's inputs. On
 8 B300s it takes Qwen3-30B-A3B under FSDP at Megatron-Bridge's batch from 40.0k to
-42.1k tokens a second a GPU (:doc:`/performance/compiler`).
+42.1k tokens a second a GPU (:ref:`compiler-reductions`).
 
 It is the pass `NAME` of `bux.passes`: ``passes.use(reorder.NAME)``.
 """
@@ -41,8 +41,8 @@ _STAYS = frozenset(
         *(Op.kRngGetAndUpdateState, Op.kAfterAll),
     }
 )
-#: The reductions in flight at once: a done waits for the start of the one this many
-#: further on.
+#: The reductions in flight at once. A reduction's done waits for the start of the
+#: one this many further on.
 LAG = 2
 
 

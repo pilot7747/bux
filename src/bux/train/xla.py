@@ -33,7 +33,7 @@ _COMBINE = {
 }
 _ON = "COLLECTIVE_PIPELINING_MODE_ON"
 
-#: The presets of ``compiler(preset=...)``: XLA's options by name.
+#: The presets of ``compiler(preset=...)``, each XLA's options by name.
 PRESETS: dict[str, Options] = {
     # XLA's defaults. On Hopper and Blackwell it runs the latency hiding scheduler
     # (LHS) when every collective is one its cost model knows: ragged_all_to_all is not.

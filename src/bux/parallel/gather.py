@@ -1,26 +1,26 @@
 """A training step's parameters gathered once, and its gradients reduced once
-(bux.train.trainer).
+(`bux.train.trainer`): ``methods(gather=step)`` and ``methods(accumulate=...)``.
 
 Every axis is Auto, and XLA cannot move a collective out of a loop: a step of n
 microbatches would gather each layer's parameters as it runs, n times forward and n
-back, and reduce the gradients n times. ``whole`` gathers them once, before the
+back, and reduce the gradients n times. `whole` gathers them once, before the
 loop. Gradients reduced once need an array that each device holds a part of the sum
 of, which JAX types only on Explicit or Manual axes (``P(unreduced=...)``). So a step
 whose rows are independent runs in a shard_map manual over the axes that split them
-(``rows``): there each device gathers its shard of every parameter (``gather``), sums
+(`rows`): there each device gathers its shard of every parameter (`gather`), sums
 its own rows' gradients over the microbatches, and sums the sums over the devices
-once (``scatter``), each device keeping its shard. A pipeline's step does the same in
-its own shard_map, made manual over those axes too (``apart``).
+once (`scatter`), each device keeping its shard. A pipeline's step does the same in
+its own shard_map, made manual over those axes too (`apart`).
 
-    whole                the parameters as a step uses them, whole over FSDP's axes
-    rows                 the axes that split the batch's rows, manual in the shard_map
-    rows_span_processes  whether they cross hosts, where reducing once pays
-    splits               each parameter's split over them
-    gather               a device's shard of a parameter, gathered whole
-    scatter              a device's part of a gradient, summed over them, as a shard
-    added                a microbatch's gradients added into the step's sums
-    own_streams          each device's own RNG keys, for its own rows' masks
-    apart                says the step computes its rows apart, which a pipeline reads
+- `whole`: the parameters as a step uses them, whole over FSDP's axes.
+- `rows`: the axes that split the batch's rows, manual in the shard_map.
+- `rows_span_processes`: whether they cross hosts, where reducing once pays.
+- `splits`: each parameter's split over them.
+- `gather`: a device's shard of a parameter, gathered whole.
+- `scatter`: a device's part of a gradient, summed over them, as a shard.
+- `added`: a microbatch's gradients added into the step's sums.
+- `own_streams`: each device's own RNG keys, for its own rows' masks.
+- `apart`: says the step computes its rows apart, which a pipeline reads.
 """
 
 import contextlib
@@ -40,7 +40,7 @@ from bux.parallel.layout import as_split, axes_of, partition, split_axes
 from bux.parallel.mesh import active, manual_axes
 from bux.parallel.place import shardings
 
-Axes = tuple[str, ...]
+Axes = tuple[str, ...]  # mesh axes, by name
 
 
 def whole(params: nnx.State) -> nnx.State:
@@ -52,8 +52,9 @@ def whole(params: nnx.State) -> nnx.State:
 
 
 def rows() -> Axes:
-    """Return the axes of the run's mesh that split a batch's rows, as `layout.batch`
-    gives them, but those of size 1 and those a shard_map being traced maps."""
+    """Return the axes of the run's mesh that split a batch's rows, as
+    ``layout.batch`` gives them, but those of size 1 and those a shard_map being
+    traced maps."""
     on = active()
     return () if on is None else split_axes(on, "batch", skip=manual_axes())
 
@@ -69,7 +70,7 @@ def spans_processes(processes: Int[np.ndarray, "..."], axes: tuple[int, ...]) ->
 
 
 def rows_span_processes() -> bool:
-    """Return whether the axes that split the rows (``rows``) span more than one
+    """Return whether the axes that split the rows (`rows`) span more than one
     process of the run's mesh. Only then does a step's one reduction beat one a
     microbatch: between hosts the collectives go through the NICs, while over NVLink
     XLA hides a microbatch's behind the backward."""
@@ -121,7 +122,7 @@ def added(total: PyTree, part: PyTree) -> PyTree:
 
 def _summable(g: Float[Array, "*s"]) -> Float[Array, "*s"]:
     """Return `g` as XLA sums it: on a CPU in float32, as XLA:CPU sums a bfloat16
-    all-reduce, and aborts on one in a shard_map (docs/parallelism.md)."""
+    all-reduce, and aborts on one in a shard_map (the parallelism guide)."""
     return g.astype(jnp.float32) if jax.default_backend() == "cpu" else g
 
 

@@ -1,16 +1,17 @@
-"""A backward split in two, as a zero-bubble pipeline runs it (bux.parallel.scheduled):
-`B`, the gradient of the input, now, and `W`, that of the weights, later.
+"""A backward split in two, as a zero-bubble pipeline runs it
+(`bux.parallel.scheduled`): ``B``, the gradient of the input, now, and ``W``, that of
+the weights, later::
 
     dx, saved = two.inputs(*shared, *b_only)  # B, on the critical path
     dw = two.weights(*shared, saved)          # W, in a tick that would idle
 
-``split`` traces the backward to a jaxpr and walks it back from the outputs, giving
-each equation to the part that needs it: to `B` if the input's gradient does, else to
-`W`. `B` hands `W` what `W` reads but neither computes nor takes (``Plan.saved``), so
-that no equation runs twice. A scan or a cond that both need splits into one of each,
-as the backward of the scan over a stage's layers does: the `B` scan stacks what each
-of its passes saves, and the `W` scan reads it a pass at a time. Calls of jaxprs (jit,
-remat) are inlined first.
+`split` traces the backward to a jaxpr and walks it back from the outputs, giving
+each equation to the part that needs it: to ``B`` if the input's gradient does, else
+to ``W``. ``B`` hands ``W`` what ``W`` reads but neither computes nor takes
+(`Plan.saved`), so that no equation runs twice. A scan or a cond that both need
+splits into one of each, as the backward of the scan over a stage's layers does: the
+``B`` scan stacks what each of its passes saves, and the ``W`` scan reads it a pass
+at a time. Calls of jaxprs (jit, remat) are inlined first.
 """
 
 import functools

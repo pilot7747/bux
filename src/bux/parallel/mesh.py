@@ -1,5 +1,10 @@
-"""The device grid: one mesh of all six axes, the settings `use` puts in force, and
-which of its axes the shard_maps being traced map."""
+"""The device grid: one mesh of all six axes, the settings
+`~bux.parallel.settings.use` puts in force, and which of its axes the shard_maps
+being traced map.
+
+A run's mesh always has all of `AXES`, most of size 1: ``mesh(fsdp=8)`` on 16
+devices is ``data=2 × fsdp=8``, the rest 1.
+"""
 
 import contextvars
 import math
@@ -15,9 +20,10 @@ from jaxtyping import Shaped
 
 from bux.train.config import LayoutConfig, MeshConfig, MethodsConfig
 
-# The slowest links first, so that `tensor` stays inside a node. `stage` comes before
-# `data`: a pipeline's sends need the least bandwidth, and XLA nests a shard_map in a
-# pipeline's only over the axes after `stage` (bux.parallel.pipeline).
+#: The mesh's axes, the slowest links first, so that ``tensor`` stays inside a node.
+#: ``stage`` comes before ``data``: a pipeline's sends need the least bandwidth, and
+#: XLA nests a shard_map in a pipeline's only over the axes after ``stage``
+#: (`bux.parallel.pipeline`).
 AXES = ("stage", "data", "fsdp", "context", "expert", "tensor")
 # What tells a device's node: XLA puts the GPUs of a host, or of an NVLink domain
 # that spans hosts, in one slice.
@@ -25,7 +31,18 @@ NODE = "slice_index"
 
 
 def sizes(config: MeshConfig, devices: int) -> dict[str, int]:
-    """Return each axis's size on `devices` devices; `data` gets what the rest leave."""
+    """Return each axis's size on `devices` devices; ``data`` gets what the rest
+    leave.
+
+    Raises:
+        ValueError: If the axes other than ``data`` do not divide `devices`, or the
+            mesh needs more devices than there are.
+
+    Example::
+
+        >>> sizes(MeshConfig(fsdp=4, tensor=2), 16)
+        {'stage': 1, 'data': 2, 'fsdp': 4, 'context': 1, 'expert': 1, 'tensor': 2}
+    """
     rest = {a: getattr(config, a) for a in AXES if a != "data"}
     used = math.prod(rest.values())
     if config.data is None and devices % used:
@@ -54,7 +71,21 @@ def _shape(axis_sizes: dict[str, int]) -> str:
 
 def mesh(config: MeshConfig) -> Mesh:
     """Return the mesh `config` sets, on the first devices it needs, every axis Auto:
-    the compiler propagates shardings from the parameters and a few constraints."""
+    the compiler propagates shardings from the parameters and a few constraints.
+
+    On several nodes, each node holds a block of the innermost axes (`grid`), so
+    that ``tensor`` stays inside one and the outer axes span them.
+
+    Args:
+        config: The run's ``mesh`` setting.
+
+    Returns:
+        A mesh of `AXES`, in that order, of jax's devices.
+
+    Raises:
+        ValueError: If the axes do not fit the devices, or do not fill the nodes from
+            ``tensor`` outward.
+    """
     devices = jax.devices()
     shape = sizes(config, len(devices))
     used = devices[: math.prod(shape.values())]
@@ -116,13 +147,15 @@ def split(
 
 @dataclass(frozen=True)
 class Active:
-    """What `use` puts in force."""
+    """What `~bux.parallel.settings.use` puts in force: the mesh, the layout and
+    the methods."""
 
     mesh: Mesh | AbstractMesh
     layout: LayoutConfig
     methods: MethodsConfig
 
     def size(self, *axes: str) -> int:
+        """Return the devices `axes` span together: the product of their sizes."""
         return math.prod(self.mesh.shape[a] for a in axes)
 
 

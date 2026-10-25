@@ -1,5 +1,6 @@
 """`use`, which puts a run's mesh, layout and methods in force, and `check`, which
-raises unless its batches split into its microbatches and over the mesh."""
+raises unless its batches split into its microbatches and over the mesh. Both are
+re-exported as ``parallel.use`` and ``parallel.check``."""
 
 import contextlib
 from collections.abc import Generator
@@ -23,8 +24,29 @@ def use(
 ) -> Generator[Mesh | AbstractMesh]:
     """Train on `grid` with `layout` and `methods`.
 
-    Set the mesh for jax, and the settings that `spec`, `shard` and `method` read. On
-    an AbstractMesh, `shardings` says where state would live.
+    Set the mesh for jax, and the settings that `~bux.parallel.layout.spec`,
+    `~bux.parallel.layout.shard` and `~bux.parallel.methods.method` read. On an
+    AbstractMesh, `~bux.parallel.place.shardings` says where state would live,
+    with no devices.
+
+    Args:
+        grid: The run's ``mesh`` setting, or a mesh of the six axes of
+            `~bux.parallel.mesh.AXES`, in that order.
+        layout: Which mesh axes each named dimension splits over.
+        methods: How each part that communicates runs.
+
+    Yields:
+        The mesh.
+
+    Raises:
+        ValueError: If the mesh has other axes, or does not fit the devices.
+        NotImplementedError: If `methods` names a method that is not registered.
+
+    Example::
+
+        with parallel.use(run.train.mesh, run.train.layout, run.train.methods):
+            model = parallel.build(lambda: Model(run.arch, rngs=nnx.Rngs(0)))
+            ...
     """
     m = mesh(grid) if isinstance(grid, MeshConfig) else grid
     if tuple(m.axis_names) != AXES:
@@ -40,8 +62,12 @@ def use(
 
 def check(batch: int, seq_len: int) -> None:
     """Raise unless `batch` rows of `seq_len` tokens split evenly: the rows into
-    `methods.microbatches`, then over the batch axes, and the positions over the seq
-    and stream axes."""
+    ``methods.microbatches``, then over the batch axes, and the positions over the
+    seq and stream axes. Outside `use` it checks nothing.
+
+    Raises:
+        ValueError: If they do not, with the multiple to make them.
+    """
     on = active()
     if on is None:
         return

@@ -481,7 +481,7 @@ class PrecisionConfig(Config):
 # --- Parallelism -----------------------------------------------------------------------
 # How a run splits over devices, which changes how it computes, not what: none of
 # `mesh`, `layout` and `methods` is in the run's id. bux.parallel reads them, and the
-# parallelism guide explains them.
+# parallelism guide (docs/parallelism/index.md) explains them.
 
 Axis = Literal["data", "stage", "fsdp", "context", "expert", "tensor"]
 Axes = Axis | tuple[Axis, ...] | None  # the mesh axes a named dimension splits over
@@ -620,7 +620,8 @@ class MethodsConfig(Config):
     # Each microbatch's forward beside the backward of the one before, a layer at a
     # time, so that one's collectives run beside the other's compute. Off: it holds
     # half a microbatch more and copies it across the loop, which pays only beside an
-    # exchange left exposed, as NCCL EP's with moe_stream (the parallelism guide).
+    # exchange left exposed, as NCCL EP's with moe_stream
+    # (docs/parallelism/microbatches.md).
     interleave: bool = False
     # Where a step runs its layers more than once (microbatches, a pipeline's ticks),
     # it casts and gathers the parameters FSDP splits once, or as each layer runs

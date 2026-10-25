@@ -45,15 +45,15 @@ from bux.parallel.layout import Split, as_split, partition
 from bux.train import config as tcfg
 from bux.train.registry import Registry
 
-#: A value at each step, counted from 0: a learning rate or its multiplier.
+#: A value at each step, counted from 0, as a learning rate or its multiplier.
 Schedule = Callable[[Real[ArrayLike, ""]], Float[Array, ""]]
 # A matrix, or a stack of them as its dimension numbers say, made orthogonal.
 NewtonSchulz = Callable[[Float[Array, "*m"], MuonDimensionNumbers], Float[Array, "*m"]]
 
-#: The schedules, by the ``type`` of their config: a builder gets the config and the
+#: The schedules, by the ``type`` of their config. A builder gets the config and the
 #: run's steps, and returns the multiplier's curve after the warmup.
 schedules = Registry[Schedule]("schedule", "bux.train.optim.schedules")
-#: The optimizers, by the ``type`` of their config: a builder gets the config, the
+#: The optimizers, by the ``type`` of their config. A builder gets the config, the
 #: schedule's multiplier and the model, and returns an optax transformation.
 optimizers = Registry[optax.GradientTransformation](
     "optimizer", "bux.train.optim.optimizers"
@@ -125,7 +125,7 @@ def _(c: tcfg.CosineSchedule, steps: int) -> Schedule:
     return curve
 
 
-#: The curves of a ``wsd`` cooldown, by its ``shape``: from 1 at t = 0 to 0 at t = 1.
+#: The curves of a ``wsd`` cooldown by its ``shape``, from 1 at t = 0 to 0 at t = 1.
 COOLDOWNS: dict[str, Callable[[Float[Array, ""]], Float[Array, ""]]] = {
     "linear": lambda t: 1 - t,
     "sqrt": lambda t: 1 - jnp.sqrt(t),

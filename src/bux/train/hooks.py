@@ -46,8 +46,8 @@ from bux.train.objective import Metrics
 from bux.train.optim import Schedule
 from bux.train.sinks import Scalars
 
-#: A hook's scalars, read once the next step is launched: a function that returns
-#: them, and may wait for the step that made them.
+#: A function that returns a hook's scalars, which the loop calls once the next step
+#: is launched. It may wait for the step that made them.
 Later = Callable[[], Scalars]
 
 if TYPE_CHECKING:
