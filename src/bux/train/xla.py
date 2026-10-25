@@ -1,15 +1,17 @@
-"""XLA's options for a training step: the `compiler` setting.
+"""XLA's options for a training step: the ``compiler`` setting.
 
-A preset is a name for options, and the setting's own `options`, written as in
-XLA_FLAGS, go over its:
+A preset is a name for options, and the setting's own ``options``, written as in
+``XLA_FLAGS``, go over its:
+
+.. code-block:: bux
 
     compiler = compiler(preset=o1)
     compiler = compiler(options="--xla_gpu_threshold_for_windowed_einsum_mib=0")
 
-Options are XLA's debug options and jax's `optimization_level` and
-`memory_fitting_level`. They compile the step that takes them, over XLA_FLAGS, so a
-run's step can differ from the rest of the process's. Another preset is an entry of
-PRESETS:
+Options are XLA's debug options and jax's ``optimization_level`` and
+``memory_fitting_level``. They compile the step that takes them, over ``XLA_FLAGS``,
+so a run's step can differ from the rest of the process's. Another preset is an
+entry of `PRESETS`::
 
     xla.PRESETS["mine"] = {"xla_gpu_enable_latency_hiding_scheduler": "true"}
 """
@@ -21,7 +23,7 @@ import jax
 
 from bux.train.config import CompilerConfig
 
-Options = Mapping[str, str | bool]
+Options = Mapping[str, str | bool]  # XLA's options by name, as jax.jit takes them
 
 # Combine collectives up to this many bytes into one (MaxText's GPU recipe).
 _COMBINE = {
@@ -31,6 +33,7 @@ _COMBINE = {
 }
 _ON = "COLLECTIVE_PIPELINING_MODE_ON"
 
+#: The presets of ``compiler(preset=...)``, each XLA's options by name.
 PRESETS: dict[str, Options] = {
     # XLA's defaults. On Hopper and Blackwell it runs the latency hiding scheduler
     # (LHS) when every collective is one its cost model knows: ragged_all_to_all is not.
@@ -59,7 +62,25 @@ PRESETS: dict[str, Options] = {
 
 
 def options(config: CompilerConfig) -> dict[str, str | bool]:
-    """Return the options `config` compiles a step with: its preset's, then its own."""
+    """Return the options `config` compiles a step with: its preset's, then its own.
+
+    A value of ``true`` or ``false`` becomes a bool, which XLA reads from a string
+    only as ``True`` or ``False``.
+
+    Args:
+        config: The run's ``compiler`` setting.
+
+    Returns:
+        XLA's options by name, without their ``--``, as `jit` takes them.
+
+    Raises:
+        ValueError: If the preset is not in `PRESETS`.
+
+    Example::
+
+        >>> options(CompilerConfig(preset="lhs"))
+        {'xla_gpu_enable_latency_hiding_scheduler': True}
+    """
     if config.preset not in PRESETS:
         known = ", ".join(PRESETS)
         raise ValueError(f"compiler.preset = {config.preset} is none of {known}")
@@ -75,7 +96,14 @@ def _value(value: str | bool) -> str | bool:
 
 
 def jit(fun: Callable[..., Any], options: Options, **kwargs: Any) -> Any:
-    """Return ``jax.jit(fun, **kwargs)``, which compiles with XLA's `options`, a call of
-    it as its `lower(...).compile()`: the one finds the other's compile in JAX's
-    caches."""
+    """Return ``jax.jit(fun, **kwargs)``, which compiles with XLA's `options`.
+
+    A call of it compiles as its ``lower(...).compile()`` does, so the one finds the
+    other's compile in JAX's caches.
+
+    Args:
+        fun: The function to compile.
+        options: XLA's options, from `options`; none are XLA's defaults.
+        **kwargs: The rest of `jax.jit`'s arguments, as ``donate_argnums``.
+    """
     return jax.jit(fun, compiler_options=dict(options) or None, **kwargs)

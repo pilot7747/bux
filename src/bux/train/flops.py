@@ -35,8 +35,8 @@ _ATTENTION = re.compile(r"attention_mask=(\w+),(\w+)")  # its window and top_k
 _KEYS, _PICKS = "over_keys", "over_picks"
 _AGAIN = "rematted_computation"  # jax.checkpoint's scope of what it computes again
 
-# Dense bf16 tensor FLOPs a second of one device, by a name in its device_kind:
-# NVIDIA's datasheets, the SXM parts.
+#: Dense bf16 tensor FLOPs a second of one device, by a name in its device_kind, from
+#: NVIDIA's datasheets of the SXM parts. The log's MFU is over these.
 PEAK = {
     "B300": 2.25e15,
     "B200": 2.25e15,
@@ -52,9 +52,9 @@ class Mask(NamedTuple):
     most. Products over each query's top_k picks alone, not its row's keys, are
     `picks`."""
 
-    window: int | None = None
-    top_k: int | None = None
-    picks: bool = False
+    window: int | None = None  #: It sees no key this far behind it, or None.
+    top_k: int | None = None  #: It sees this many keys at most, or None.
+    picks: bool = False  #: Whether the products are over the picks alone.
 
     def share(self, within: Int[np.ndarray, "b t"]) -> float:
         """Return the share of a product's keys a query sees, on average over the
@@ -72,7 +72,8 @@ class Work(NamedTuple):
     """A training step's FLOPs: `fixed`, those of every batch, and attention's by
     their Mask, counted as if every query saw every key."""
 
-    fixed: float
+    fixed: float  #: The FLOPs every batch's step takes.
+    #: Attention's FLOPs by their mask, as if every query saw every key.
     attention: dict[Mask, float]
 
     def of(self, positions: Int[np.ndarray | Array, "b t"]) -> float:

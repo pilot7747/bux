@@ -1,6 +1,6 @@
-"""`methods(moe=nccl_ep)`: expert parallelism by NCCL EP, a DeepEP of NCCL's device
-API, through TransformerEngine's JAX bindings, on GPUs only (docs/parallelism.md,
-"TransformerEngine's NCCL EP"; the Docker image has them).
+"""``methods(moe=nccl_ep)``: expert parallelism by NCCL EP, a DeepEP of NCCL's device
+API, through TransformerEngine's JAX bindings, on GPUs only. bux's Docker image has
+them, and :doc:`/parallelism/experts` explains the method.
 
 A token's path, as in ``experts.ragged_tokens``: it goes once to each device that
 holds any of its experts (and over InfiniBand once to each other node, whose NVLink
@@ -12,11 +12,11 @@ own. Under a capacity the picks that do not fit drop before they go, as in
 ``expert_parallel``'s shard_map, with a custom_vjp each way: TE's global-view ops
 hang across nodes.
 
-NCCL EP keeps its buffers outside the step, sized for the run, so ``start`` runs once
-a process before the step traces (``methods.prepare``). Under `methods.moe_stream` its
-kernels run on a stream of their own (``STREAM``), beside the compute stream's, each
-call started as early as its inputs allow and waited for as late as its results are
-needed (``jax_internals.on_stream``).
+NCCL EP keeps its buffers outside the step, sized for the run, so `start` runs once
+a process before the step traces (`bux.parallel.methods.prepare`). Under
+``methods.moe_stream`` its kernels run on a stream of their own (``STREAM``), beside
+the compute stream's, each call started as early as its inputs allow and waited for
+as late as its results are needed (`bux.jax_internals.on_stream`).
 """
 
 import functools
@@ -97,7 +97,7 @@ def transformer_engine() -> ModuleType:
     except ImportError as e:
         raise RuntimeError(
             "methods(moe=nccl_ep) needs TransformerEngine's JAX bindings, on GPUs, "
-            "which bux's Docker image has (docs/parallelism.md)"
+            "which bux's Docker image has (docs/parallelism/experts.md)"
         ) from e
     return ep
 
@@ -214,9 +214,15 @@ def nccl_ep(
     kernels: Kernels,
     **settings: object,
 ) -> Combined:
-    """Return ``sent_once`` of a device's tokens, in as many pieces one after another
-    as NCCL EP was started for (``in_chunks``): an eval step's, a step's rows whole,
-    send more tokens than a training microbatch's."""
+    """Send each token once to each device that holds any of its experts, and back as
+    its picks' weighted sum, by NCCL EP's kernels (a DeepEP of NCCL's, through
+    TransformerEngine), on GPUs: rows grouped by expert as they arrive, each
+    expert's padded to a multiple of 128. ``methods.moe_stream`` runs them on a
+    stream of their own.
+
+    It runs `sent_once` of a device's tokens, in as many pieces one after another
+    as NCCL EP was started for (`~bux.parallel.experts.in_chunks`): an eval step's,
+    a step's rows whole, send more tokens than a training microbatch's."""
     assert started is not None, "methods.prepare starts NCCL EP before a step traces"
     tokens = z.size // z.shape[-1]
     pieces = -(-tokens // started.tokens)

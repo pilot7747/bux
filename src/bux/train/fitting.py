@@ -27,8 +27,8 @@ from bux import parallel
 from bux.architecture.repeats import remat
 from bux.train import xla
 
-# Of a device's memory a step may take, by XLA's analysis: on B300s it was the peak
-# to 0.1 GiB, and steps of 98% of a device trained.
+#: The share of a device's memory a step may take, by XLA's analysis. On B300s the
+#: analysis was the peak to 0.1 GiB, and steps of 98% of a device trained.
 MARGIN = 0.97
 
 
@@ -36,9 +36,9 @@ class Tried(NamedTuple):
     """A candidate the step compiled under: the bytes it holds on a device, None if
     XLA could not fit it, and the seconds XLA took to compile it."""
 
-    policy: str
-    bytes: int | None
-    seconds: float
+    policy: str  #: The remat policy's name.
+    bytes: int | None  #: What the step holds on a device; None if it does not fit.
+    seconds: float  #: How long XLA took to compile it.
 
 
 class Fitting:
@@ -54,6 +54,8 @@ class Fitting:
         self.seconds = 0.0
 
     def __call__(self, *args: Any) -> Any:
+        """Run the step on `args`, under the candidate that fits, which the first call
+        chooses."""
         return self._fitted(args)(*args)
 
     def lower(self, *args: Any) -> Any:

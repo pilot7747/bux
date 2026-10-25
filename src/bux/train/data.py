@@ -1,15 +1,18 @@
 """Batches of rows, from prepared datasets, token shards, random tokens, or mixtures.
 
-A row is seq_len tokens: input_ids, position_ids (where each token is in its
-document, so one starts wherever they stop increasing) and loss_mask (whether each
-token is a target). Every source is an endless stream of rows, each epoch in a new
-order. Batch i holds rows i * n to (i + 1) * n of each source, n of them in
-proportion to its weight, so it depends only on the seed and i: a run that resumes
+A row is ``seq_len`` tokens: ``input_ids``, ``position_ids`` (where each token is in
+its document, so one starts wherever they stop increasing) and ``loss_mask`` (whether
+each token is a target). Every source is an endless stream of rows, each epoch in a
+new order. Batch i holds rows ``i * n`` to ``(i + 1) * n`` of each source, n of them
+in proportion to its weight, so it depends only on the seed and i: a run that resumes
 at step i reads what it would have read had it never stopped. In a job of many
 processes, each reads only the rows of a batch that its devices hold.
 
-A source is found by its config's type in ``sources``. The trainer reads batches
-through ``prefetch``, which loads the next ones as a step runs.
+A source is found by its config's type in `sources`. The trainer reads batches
+through `prefetch`, which loads the next ones as a step runs::
+
+    for batch in prefetch(batches(run.train.data, run.train, run.arch.vocab_size)):
+        ...
 """
 
 import contextlib
@@ -34,15 +37,20 @@ from bux.train.registry import Registry
 
 
 class Batch(NamedTuple):
-    """Rows of tokens, numpy on the host and jax on a device. Position t predicts
-    input_ids[t + 1], a target where loss_mask[t + 1] is (``objective.target_mask``)."""
+    """Rows of tokens, numpy on the host and jax on a device, each ``b t``: rows,
+    positions. Position t predicts ``input_ids[t + 1]``, a target where
+    ``loss_mask[t + 1]`` is and token t + 1 is in t's document
+    (`~bux.train.objective.target_mask`)."""
 
-    input_ids: Int32[np.ndarray | Array, "b t"]
+    input_ids: Int32[np.ndarray | Array, "b t"]  #: The tokens.
+    #: Where each token is in its document. A document starts at a row's first token
+    #: and wherever they stop increasing.
     position_ids: Int32[np.ndarray | Array, "b t"]
-    loss_mask: Bool[np.ndarray | Array, "b t"]
+    loss_mask: Bool[np.ndarray | Array, "b t"]  #: Whether each token is a target.
 
     @classmethod
     def concat(cls, parts: Sequence["Batch"]) -> "Batch":
+        """Return the rows of `parts`, one after another, on the host."""
         return cls(*(np.concatenate(c) for c in zip(*parts, strict=True)))
 
 
@@ -54,8 +62,12 @@ def plain(ids: Integer[np.ndarray, "b t"]) -> Batch:
 
 @runtime_checkable
 class Source(Protocol):
+    """An endless stream of rows, which a builder in `sources` makes from a config.
+    A row depends only on its index and the stream's seed, so a source reads any
+    rows in any order: those of a resumed run's batches, or a process's own."""
+
     def rows(self, start: int, n: int) -> Batch:
-        """Rows `start` to `start + n` of the source's endless stream."""
+        """Return rows `start` to ``start + n`` of the source's endless stream."""
         ...
 
 
@@ -146,6 +158,8 @@ class Prepared:
         return self.last[1]
 
     def rows(self, start: int, n: int) -> Batch:
+        """Return rows `start` to ``start + n``, from the row groups in their order
+        of each epoch."""
         parts = []
         while n:
             epoch, at = divmod(start, self.total)
@@ -183,6 +197,8 @@ class Shards:
         self.seq_len, self.seed = seq_len, seed
 
     def rows(self, start: int, n: int) -> Batch:
+        """Return rows `start` to ``start + n``: windows of each epoch's permutation
+        of them (`permuted`)."""
         total = int(self.ends[-1])
         epoch, at = np.divmod(np.arange(start, start + n), total)
         windows = np.concatenate(
@@ -208,6 +224,7 @@ class Synthetic:
         self.vocab_size, self.seq_len, self.seed = vocab_size, seq_len, seed
 
     def rows(self, start: int, n: int) -> Batch:
+        """Return rows `start` to ``start + n``, each drawn from its own seed."""
         return plain(np.stack([self._row(r) for r in range(start, start + n)]))
 
     def _row(self, r: int) -> Int32[np.ndarray, " t"]:
@@ -215,8 +232,9 @@ class Synthetic:
         return rng.integers(0, self.vocab_size, self.seq_len, np.int32)
 
 
-# A source's builder gets its config, the run's settings, the model's vocabulary size,
-# where prepared datasets are, and the seed of its stream.
+#: The data sources, by the ``type`` of their config. A builder gets its config, the
+#: run's settings, the model's vocabulary size, where prepared datasets are, and the
+#: seed of its stream, and returns a `Source`.
 sources = Registry[Source]("data source", "bux.train.data.sources")
 
 
@@ -228,6 +246,8 @@ def _(
     cache: str | Path,
     seed: tuple[int, ...],
 ) -> Source:
+    """The rows bux.data prepared from the documents under the cache (`Prepared`),
+    their row groups in a new order every epoch."""
     return Prepared(Path(cache) / Job.of(c, t).name, vocab_size, t.seq_len, seed)
 
 
@@ -239,6 +259,8 @@ def _(
     cache: str | Path,
     seed: tuple[int, ...],
 ) -> Source:
+    """Windows of memory-mapped shards of token ids (`Shards`), overlapping by a
+    token, in a new order every epoch."""
     return Shards(c, t.seq_len, seed)
 
 
@@ -250,6 +272,7 @@ def _(
     cache: str | Path,
     seed: tuple[int, ...],
 ) -> Source:
+    """Uniformly random tokens over the vocabulary (`Synthetic`), a seed each row."""
     return Synthetic(vocab_size, t.seq_len, seed)
 
 
@@ -272,7 +295,21 @@ def prefetch[T](items: Iterator[T], ahead: int = 2) -> Generator[T]:
 
     It leaves the devices alone: a batch put there from another thread, as a step's
     temporaries hold most of the memory, lands below them, and the next step's no
-    longer fit in what is left above it."""
+    longer fit in what is left above it.
+
+    Args:
+        items: What to read, as batches from `batches`.
+        ahead: How many items the thread reads ahead of the caller.
+
+    Yields:
+        The items, in order.
+
+    Example::
+
+        with contextlib.closing(prefetch(batches(data, config, vocab))) as loaded:
+            for step in range(steps):
+                trainer.train_on_batch(next(loaded))
+    """
     ready: queue.Queue[T | _End] = queue.Queue(ahead)
     closed = threading.Event()
 
@@ -310,11 +347,36 @@ def batches(
     held_out: bool = False,
     rows: Sequence[int] | Int[np.ndarray, " n"] | None = None,
 ) -> Iterator[Batch]:
-    """Yield batches of `config.batch` rows of `config.seq_len` tokens from `data`,
+    """Yield batches of ``config.batch`` rows of ``config.seq_len`` tokens from `data`,
     from batch `start` on. Held-out batches are drawn independently of training's.
 
     Of each batch only `rows` are read, by default those that this process's devices
-    hold (``parallel.local_rows``), every row on one process; the others stay 0."""
+    hold (`bux.parallel.local_rows`), every row on one process; the others stay 0.
+
+    Args:
+        data: The source or mixture to read: the run's ``data``, or its eval's.
+        config: The run's settings: its ``batch``, ``seq_len``, ``seed``,
+            ``tokenizer`` and ``packing``.
+        vocab_size: The model's vocabulary, which every token id must be under.
+        cache: Where bux.data prepared `text` and `chat` datasets
+            (`bux.data.pipeline.prepare`).
+        start: The first batch: the step a run resumes at.
+        held_out: Draw the batches from a stream of their own seed, as eval does.
+        rows: The rows of each batch to read; None: this process's.
+
+    Yields:
+        Batch after batch, endlessly, on the host.
+
+    Raises:
+        ValueError: If a mixture leaves a source no row of a batch, or a token id is
+            outside the vocabulary.
+        FileNotFoundError: If a dataset is not prepared, or no shards match.
+
+    Example::
+
+        it = batches(run.train.data, run.train, run.arch.vocab_size, start=1000)
+        batch = next(it)  # the batch of step 1000
+    """
     if rows is None:
         rows = parallel.local_rows(config.batch, config.seq_len)
     return _batches(

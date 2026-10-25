@@ -1,11 +1,11 @@
-"""Flash attention kernels for the methods of `methods.attention`.
+"""Flash attention kernels for the methods of ``methods.attention``.
 
 A `Kernel` attends to one block of keys. Its forward pass returns each query's
 logsumexp beside its output, and its backward pass takes one: given the output and
 logsumexp of a larger softmax (more blocks of keys, or a sink beside them), it returns
 that softmax's gradients through its own block, as FlashAttention-2's backward pass
-recomputes P = exp(s - lse). So blocks merge by their logsumexps (`merge`), and a sink
-folds into one (`attend`).
+recomputes ``P = exp(s - lse)``. So blocks merge by their logsumexps (`merge`), and a
+sink folds into one (`attend`).
 
 `TOKAMAX` is tokamax's Mosaic kernels, on GPUs; `JNP` the same in jnp, all t by s
 logits at once, which a CPU runs and the tests check the rest by. `CUDNN` is cuDNN's
@@ -37,9 +37,9 @@ class Keys(NamedTuple):
     queries' own positions), none before `start` and none from `end` on, each query's
     index into the block's keys, if any."""
 
-    causal: bool
-    start: Int[Array, "b t"] | None = None
-    end: Int[Array, "b t"] | None = None
+    causal: bool  #: Whether a query sees no key ahead of it.
+    start: Int[Array, "b t"] | None = None  #: Each query's first key, or None.
+    end: Int[Array, "b t"] | None = None  #: Each query's key past its last, or None.
 
 
 Output = tuple[Float[Array, "b t h dv"], Float[Array, "b h t"]]
@@ -49,9 +49,10 @@ Grads = tuple[
 
 
 class Kernel(NamedTuple):
-    """`forward(q, k, v, keys, scale, cap) -> (out, lse)`, lse in float32 and -inf for
-    a query that sees no key; `backward(q, k, v, out, dout, lse, keys, scale, cap)
-    -> (dq, dk, dv)`. `cap` soft-caps the logits, if not None."""
+    """A flash attention kernel over one block of keys:
+    ``forward(q, k, v, keys, scale, cap) -> (out, lse)``, lse in float32 and -inf for
+    a query that sees no key; ``backward(q, k, v, out, dout, lse, keys, scale, cap)
+    -> (dq, dk, dv)``. ``cap`` soft-caps the logits, if not None."""
 
     forward: Callable[..., Output]
     backward: Callable[..., Grads]
@@ -146,6 +147,8 @@ def finite(lse: Float[Array, "*s"]) -> Float[Array, "*s"]:
     return jnp.where(jnp.isfinite(lse), lse, 0.0)
 
 
+#: The kernel in jnp, all t by s logits at once, which a CPU runs and the tests check
+#: the others by.
 JNP = Kernel(_jnp_forward, _jnp_backward)
 
 
@@ -237,6 +240,7 @@ def _tokamax_backward(
     return jax_internals.tokamax_vjp(MOSAIC, finite(lse), out, dout, q, k, v, args)
 
 
+#: tokamax's Mosaic kernels, on GPUs, in bfloat16 or float16 (`tokamax_takes`).
 TOKAMAX = Kernel(_tokamax_forward, _tokamax_backward)
 
 
@@ -485,6 +489,7 @@ def deterministic() -> bool:
     return any(f in flags for f in DETERMINISTIC)
 
 
-# cuDNN's causal kernels, with bux's VJP: without the room for documents of its
-# packed layout, which takes jax's call of it 8 GiB in rows of 8 x 4096 of 32 heads.
+#: cuDNN's causal kernels, with bux's VJP. They leave out the room for documents of
+#: its packed layout, which takes jax's call of it 8 GiB in rows of 8 x 4096 of 32
+#: heads.
 CUDNN = Kernel(_cudnn_forward, _cudnn_backward)

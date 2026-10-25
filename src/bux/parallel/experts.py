@@ -1,24 +1,27 @@
 """Expert parallelism: the methods of ``methods.moe`` that split the experts over the
-axes `layout.experts` gives them (`expert`), each device running its own experts on
-the picks of every device in its group.
+axes ``layout.experts`` gives them (``expert``), each device running its own experts
+on the picks of every device in its group.
 
-    all_gather         gather the group's tokens, run this device's experts on them,
-                       and reduce-scatter each token's sum back
-    all_to_all         send each pick to its expert's device and back, in a buffer of
-                       one size for each peer, sorted by expert; each peer's buffer
-                       runs through the experts as it arrives
-    ragged_all_to_all  send each pick to its expert's device and back, a ragged slice
-                       per expert of each peer, so that the rows arrive sorted by
-                       expert. XLA:CPU lacks it
-    ragged_tokens      send each token once to each device its picks are on, with
-                       those picks, and back as their weighted sum
+- `all_gather`: gather the group's tokens, run this device's experts on them, and
+  reduce-scatter each token's sum back.
+- `all_to_all`: send each pick to its expert's device and back, in a buffer of one
+  size for each peer, sorted by expert; each peer's buffer runs through the experts
+  as it arrives.
+- `ragged_all_to_all`: send each pick to its expert's device and back, a ragged
+  slice per expert of each peer, so that the rows arrive sorted by expert. XLA:CPU
+  lacks it.
+- `ragged_tokens`: send each token once to each device its picks are on, with those
+  picks, and back as their weighted sum.
+- ``nccl_ep``, in `bux.parallel.nccl_ep`: as ``ragged_tokens``, by NCCL EP's kernels.
 
-Each is a body that runs on one device's tokens, which ``expert_parallel`` runs in a
+Each is a body that runs on one device's tokens, which `expert_parallel` runs in a
 shard_map manual over the axes that split the tokens, so that each device sorts its
-own, in `methods.moe_chunks` slices one after another (``in_chunks``). Routing ran
-before, in the global view. `methods.capacity` bounds the rows a device takes
-(``_room``, ``_room_each``), and `precision.dispatch` has the exchanges send the
-tokens in MXFP8.
+own, in ``methods.moe_chunks`` slices one after another (`in_chunks`). Routing ran
+before, in the global view. ``methods.capacity`` bounds the rows a device takes, and
+``precision.dispatch`` has the exchanges send the tokens in MXFP8::
+
+    mesh    = mesh(expert=8)
+    methods = methods(moe=ragged_all_to_all, capacity=1.25, moe_chunks=2)
 """
 
 import functools
@@ -98,6 +101,7 @@ def expert_parallel(body: Body) -> Callable[..., Float[Array, "b t d"]]:
             report(taps, "dropped", 0.0, dropped)
         return y
 
+    run.__doc__ = body.__doc__  # the method's, for the registries' reference
     return run
 
 

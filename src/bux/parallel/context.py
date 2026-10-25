@@ -1,11 +1,16 @@
-"""The methods of `methods.attention`: `xla`, `ulysses`, `cudnn`, `tokamax` and `auto`,
-and bux.parallel.ring's `ring`.
+"""The methods of ``methods.attention``: `xla`, `ulysses`, `cudnn`, `tokamax` and
+`auto`, and `bux.parallel.ring`'s `~bux.parallel.ring.ring`.
 
-A method maps queries (b, t, h, dk), keys (b, s, g, dk) and values (b, s, g, dv) at
-the queries' positions to each query's softmax-weighted values (b, t, h, dv), the
-softmax in float32. `AttentionArgs` holds the mask, scale, softcap and sinks; a method
-that lacks one raises NotImplementedError naming it. The kernels are
-bux.parallel.flash's.
+A method maps queries ``(b, t, h, dk)``, keys ``(b, s, g, dk)`` and values
+``(b, s, g, dv)`` at the queries' positions to each query's softmax-weighted values
+``(b, t, h, dv)``, the softmax in float32: b rows, t queries and s keys of a row, h
+query heads and g key-value heads, dk and dv the head dims of keys and values.
+`AttentionArgs` holds the mask, scale, softcap and sinks; a method that lacks one
+raises NotImplementedError naming it. The kernels are `bux.parallel.flash`'s.
+
+Which method runs is ``methods(attention=...)``, `auto` by default::
+
+    methods = methods(attention=ring)   # with layout.seq over context
 """
 
 from collections.abc import Callable
@@ -34,11 +39,11 @@ Body = Callable[..., Float[Array, "b t h dv"]]  # (q, k, v, rows, sinks) -> out
 class AttentionArgs(NamedTuple):
     """The mask, scale, softcap and sinks that a method takes beside q, k and v."""
 
-    ids: Int[Array, "b t"] | None  # each token's document (Segments.ids), or none
-    window: int | None  # a query attends to no key `window` or more behind it
-    scale: float  # on every logit
-    softcap: float | None  # logits to softcap * tanh(logits / softcap)
-    sinks: Float[Array, " h"] | None  # a per-head logit beside the keys', on no value
+    ids: Int[Array, "b t"] | None  #: Each token's document (Segments.ids), or None.
+    window: int | None  #: A query attends to no key `window` or more behind it.
+    scale: float  #: What every logit is multiplied by.
+    softcap: float | None  #: Logits go to ``softcap * tanh(logits / softcap)``.
+    sinks: Float[Array, " h"] | None  #: A logit per head beside the keys', on no value.
 
 
 def causal_mask_at(
@@ -67,10 +72,12 @@ def causal_mask(
 
 
 def softcap(x: Float[Array, "*s"], cap: float | None) -> Float[Array, "*s"]:
+    """Return logits `x` softly capped to ``cap * tanh(x / cap)``; none leaves them."""
     return x if cap is None else cap * jnp.tanh(x / cap)
 
 
 def shard_logits(logits: Float[Array, "b h t s"]) -> Float[Array, "b h t s"]:
+    """Return `logits` split as rows, heads and queries are, the keys whole."""
     return shard(logits, "batch", "heads", "seq", None)
 
 

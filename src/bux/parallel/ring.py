@@ -1,5 +1,5 @@
-"""`ring` of `methods.attention`: context parallelism by blocks of keys, a flash
-kernel's call each (bux.parallel.flash).
+"""`ring` of ``methods.attention``: context parallelism by blocks of keys, a flash
+kernel's call each (`bux.parallel.flash`).
 
 A device keeps its n queries and gathers every device's block of n keys and values
 once (on a B300 node an all-gather moves ~6x the bytes a second of a ring's
@@ -101,6 +101,7 @@ class Plan(NamedTuple):
 
     @classmethod
     def here(cls, n: int, zigzag: bool) -> "Plan":
+        """Return the plan of this device, inside the ring's shard_map."""
         return cls(jax.lax.axis_index(AXIS), jax.lax.axis_size(AXIS), n, zigzag)
 
     def pieces(self) -> tuple[Piece, ...]:

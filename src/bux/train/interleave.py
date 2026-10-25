@@ -1,13 +1,13 @@
 """Microbatches that overlap: each one's forward runs beside the backward of the one
 before it, a piece of the model at a time, as Megatron's combined 1F1B runs them
-without a pipeline (`methods(interleave=true)`).
+without a pipeline (``methods(interleave=true)``).
 
 One after another (``Trainer._accumulate``), a microbatch's collectives each wait on
 the compute just before them, and what a layer's data flow leaves nothing beside stays
-exposed. Here the model is cut into pieces (``pieces``): the items of its graph, each
+exposed. Here the model is cut into pieces (`pieces`): the items of its graph, each
 pass of an unrolled repeat a piece of its own, the first taking the tokens and the
-last, the head, ending in the loss. A piece's forward is a ``jax.vjp``, whose
-residuals the scan carries, each piece's its own leaves, to its backward:
+last, the head, ending in the loss. A piece's forward is a `jax.vjp`, whose
+residuals the scan carries, each piece's its own leaves, to its backward::
 
     forward of microbatch 0
     a lax.scan, for i in 0 .. n-2:
@@ -177,6 +177,7 @@ class Rows(NamedTuple):
 
     @classmethod
     def of(cls, batch: Batch, share: Float[Array, ""]) -> "Rows":
+        """Return `batch`'s rows with their documents, from its positions."""
         return cls(batch, Segments.of(jnp.asarray(batch.position_ids)), share)
 
 

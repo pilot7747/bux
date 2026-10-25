@@ -1,10 +1,13 @@
-"""Pipeline parallelism over `stage`: the methods of `methods.pipeline`.
+"""Pipeline parallelism over ``stage``: the methods ``gpipe`` and ``circular`` of
+``methods.pipeline``, and what every pipeline shares (``1f1b`` and ``zbh1`` are
+`bux.parallel.scheduled`'s).
 
 With ``mesh.stage`` above 1, the longest scanned repeat outside any other is
-pipelined (bux.architecture.repeats.pipelined): its stacked layers split over `stage`,
-one share per stage (``shares``), and the rest of the model stays whole on every
-stage. A method runs them on the ``methods.microbatches`` microbatches of the batch's
-rows, in a shard_map manual over `stage` alone, each stage on its own devices:
+pipelined (`bux.architecture.repeats.pipelined`): its stacked layers split over
+``stage``, one share per stage (`shares`), and the rest of the model stays whole on
+every stage. A method runs them on the ``methods.microbatches`` microbatches of the
+batch's rows, in a shard_map manual over ``stage`` alone, each stage on its own
+devices::
 
     a lax.scan over R·M + S − 1 ticks: M microbatches through S stages, R rounds;
     at each tick, every stage runs its share of a round on one microbatch,
@@ -15,11 +18,11 @@ stage's outputs come back: there a circular round starts again, and there the st
 leaves, summed over the stages to all of them. ``gpipe`` sends every microbatch
 through the stages once; ``circular`` sends them round ``methods.rounds`` times, each
 stage holding a share of every round's layers, so that a stage idles
-(S − 1) / (R·M + S − 1) of a step (``bubble``).
+(S − 1) / (R·M + S − 1) of a step (`bubble`).
 
-Where the step computes its rows apart (``gather.apart``), the shard_map is manual
-over the axes that split them too: each device runs its own rows, and a stage's
-gradients reduce once, as they leave it, not once a tick.
+Where the step computes its rows apart (`bux.parallel.gather.apart`), the shard_map
+is manual over the axes that split them too: each device runs its own rows, and a
+stage's gradients reduce once, as they leave it, not once a tick.
 
 A method is ``(stage, params, rest, x, rows) -> (y, rest, losses)``. ``stage`` runs a
 stage's share of a round on one microbatch; ``params`` and ``rest`` are the layers'
@@ -228,7 +231,8 @@ def gpipe(
     x: Shaped[Array, "b t *r"],
     rows: PyTree,
 ) -> Out:
-    """Each microbatch through the stages once: they idle (S − 1) / (M + S − 1)."""
+    """Send each microbatch through the stages once, its backward JAX's transpose of
+    the forward: S stages idle (S − 1) / (M + S − 1) of a step of M microbatches."""
     if (n := _on().methods.rounds) > 1:
         raise ValueError(
             f"gpipe goes round the stages once, not methods.rounds = {n} times: "
@@ -245,8 +249,9 @@ def circular(
     x: Shaped[Array, "b t *r"],
     rows: PyTree,
 ) -> Out:
-    """Send each microbatch round the stages `methods.rounds` times, each round's
-    layers split over them: they idle (S − 1) / (R·M + S − 1)."""
+    """Send each microbatch round the stages ``methods.rounds`` times, each round's
+    layers split over them: S stages idle (S − 1) / (R·M + S − 1) of a step of M
+    microbatches in R rounds."""
     on = _on()
     clock = Clock(on.size(AXIS), on.methods.microbatches, on.methods.rounds)
     return clock.run(stage, params, rest, x, rows)
@@ -263,6 +268,7 @@ class Clock(NamedTuple):
 
     @property
     def ticks(self) -> int:
+        """The ticks a step takes, R·M + S − 1."""
         return self.rounds * self.microbatches + self.stages - 1
 
     def at(

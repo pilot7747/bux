@@ -1,26 +1,30 @@
-"""Tensor parallelism at a layer's edges: the methods of `methods.tensor`.
+"""Tensor parallelism at a layer's edges: the methods of ``methods.tensor``.
 
 A layer's input projections split by columns (q, k, v, an MLP's up and gate), so each
 device multiplies the whole input by its own columns. Its output projection splits by
 rows, so each device's product is a partial sum of the whole output. Under sequence
-parallelism, `layout(stream=tensor)`, the input comes split by positions over
-`tensor`: it is gathered before the input projections, and the partial sums
+parallelism, ``layout(stream=tensor)``, the input comes split by positions over
+``tensor``: it is gathered before the input projections, and the partial sums
 reduce-scatter back to each device's positions. Without it, they all-reduce.
+
+.. code-block:: bux
 
     methods = methods(tensor=chunked, tensor_chunks=2)
 
-`gspmd`, the default, leaves the collectives to the compiler, which puts each at the
-boundary of the matmul it feeds or drains, where the matmul waits for it. `chunked`
-splits each device's rows into `methods.tensor_chunks` chunks, in a shard_map:
+``gspmd`` (`GSPMD`), the default, leaves the collectives to the compiler, which puts
+each at the boundary of the matmul it feeds or drains, where the matmul waits for
+it. ``chunked`` (`Chunked`) splits each device's rows into ``methods.tensor_chunks``
+chunks, in a shard_map::
 
     project_in:   gather chunk 0 | gather chunk 1    | ...
                                  | multiply chunk 0  | multiply chunk 1 | ...
     project_out:  multiply chunk 0 | multiply chunk 1 | ...
                                    | reduce chunk 0   | reduce chunk 1   | ...
 
-A method is a class of two functions: `project_in(x, linears)` returns the input as
-the layer takes it and its projection by each of `linears`, and `project_out(h,
-linear)` the output projection, split as the stream is.
+A method is a class of two functions (`Method`): ``project_in(x, linears)`` returns
+the input as the layer takes it and its projection by each of ``linears``, and
+``project_out(h, linear)`` the output projection, split as the stream is. A layer
+calls the run's by `project_in` and `project_out`.
 """
 
 import math
@@ -47,17 +51,23 @@ SCALED_BY_BLOCK = {"mxfp8": blockscaled.MX_BLOCK, "mxfp8_2d": blockscaled.MX_BLO
 
 @runtime_checkable
 class Method(Protocol):
-    """What a method of `methods.tensor` is: a class of these two functions."""
+    """What a method of ``methods.tensor`` is: a class of these two functions."""
 
     @staticmethod
     def project_in(
         x: Float[Array, "b t d"], linears: Sequence[nnx.Linear]
-    ) -> tuple[Float[Array, "b t d"], list[Float[Array, "b t _"]]]: ...
+    ) -> tuple[Float[Array, "b t d"], list[Float[Array, "b t _"]]]:
+        """Return the layer's input `x` as the layer takes it, and its projection by
+        each of `linears`, split by columns over ``tensor``."""
+        ...
 
     @staticmethod
     def project_out(
         h: Float[Array, "b t f"], linear: nnx.Linear
-    ) -> Float[Array, "b t d"]: ...
+    ) -> Float[Array, "b t d"]:
+        """Return the output projection of `h` by `linear`, split by rows over
+        ``tensor``, summed and split as the stream is."""
+        ...
 
 
 def project_in(
@@ -80,13 +90,15 @@ def _method() -> type[Method]:
 
 @methods.tensor.register("gspmd")
 class GSPMD:
-    """The compiler's collectives: it gathers the input over `tensor` before the
+    """The compiler's collectives: it gathers the input over ``tensor`` before the
     projections, and reduces the output projection's partial sums after it."""
 
     @staticmethod
     def project_in(
         x: Float[Array, "b t d"], linears: Sequence[nnx.Linear]
     ) -> tuple[Float[Array, "b t d"], list[Float[Array, "b t _"]]]:
+        """Constrain `x` to the layer's positions and project it; the compiler
+        gathers it."""
         x = shard(x, "batch", "seq", None)
         return x, [linear(x) for linear in linears]
 
@@ -94,21 +106,25 @@ class GSPMD:
     def project_out(
         h: Float[Array, "b t f"], linear: nnx.Linear
     ) -> Float[Array, "b t d"]:
+        """Project `h`; the compiler reduces the partial sums."""
         return linear(h)
 
 
 @methods.tensor.register("chunked")
 class Chunked:
     """Each device's rows in chunks, in a shard_map over every axis, so that each
-    chunk's collective runs beside another chunk's matmul. It is `gspmd` where there
-    is nothing to overlap, where a projection splits otherwise than by `tensor`, and
-    where a device's share would multiply otherwise than the whole
-    (`_multiplies_as_whole`)."""
+    chunk's collective runs beside another chunk's matmul. It is ``gspmd`` where
+    there is nothing to overlap, where a projection splits otherwise than by
+    ``tensor``, and where a device's share would multiply otherwise than the whole:
+    in NVFP4, which scales by the largest value of the whole operand, or in MXFP8
+    where a chunk or a share is not whole blocks."""
 
     @staticmethod
     def project_in(
         x: Float[Array, "b t d"], linears: Sequence[nnx.Linear]
     ) -> tuple[Float[Array, "b t d"], list[Float[Array, "b t _"]]]:
+        """Gather each chunk of `x` over ``tensor`` beside the projection of the
+        chunk before, under sequence parallelism; else as `GSPMD`."""
         split = _input_split(x)
         if split is None or not split.sequence_parallel:
             return GSPMD.project_in(x, linears)
@@ -127,6 +143,8 @@ class Chunked:
     def project_out(
         h: Float[Array, "b t f"], linear: nnx.Linear
     ) -> Float[Array, "b t d"]:
+        """Reduce, or reduce-scatter, each chunk's partial sums over ``tensor``
+        beside the projection of the chunk after."""
         split = _input_split(h)
         if split is None or not _splits_by_rows(linear, split):
             return GSPMD.project_out(h, linear)
@@ -152,14 +170,17 @@ class InputSplit(NamedTuple):
 
     @property
     def sequence_parallel(self) -> bool:
+        """Whether the stream splits its positions over ``tensor`` too."""
         return self.stream != self.layer
 
     @property
     def stream_spec(self) -> P:
+        """The input's spec as the stream splits it."""
         return P(self.rows, self.stream, None)
 
     @property
     def layer_spec(self) -> P:
+        """The input's spec as the layer takes it."""
         return P(self.rows, self.layer, None)
 
 

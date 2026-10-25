@@ -1,9 +1,16 @@
 """Dimension names, and the mesh axes the run's layout splits each over.
 
-A layer names the dimensions of a parameter where it creates it (``named``, or
+A layer names the dimensions of a parameter where it creates it (`named`, or
 ``nnx.Param(value, names=(...))``), as bux's own metadata, which Flax ignores, and
-those of an activation with ``shard``. Outside ``use`` names do nothing, so one
-device runs as if there were none.
+those of an activation with `shard`. Outside `~bux.parallel.settings.use` names do
+nothing, so one device runs as if there were none::
+
+    self.up = nnx.Linear(d, h, kernel_init=named("embed", "mlp"), rngs=rngs)
+    y = shard(self.up(x), "batch", "seq", "mlp")
+
+The names are the fields of ``layout`` (`DIMENSIONS`): ``batch``, ``seq``,
+``stream``, ``embed``, ``vocab``, ``heads``, ``kv_heads``, ``mlp``, ``experts``,
+``latent``, ``layers`` and ``stages``.
 """
 
 from collections.abc import Collection, Sequence
@@ -18,18 +25,19 @@ from jaxtyping import Array, Shaped
 from bux.parallel.mesh import Active, active, manual_axes
 from bux.train.config import LayoutConfig
 
-NAMES = "names"  # the metadata key that holds a parameter's dimension names
+#: The metadata key that holds a parameter's dimension names.
+NAMES = "names"
 LAYERS = "layers"  # the stacked dimension of a scanned repeat
-# Every field of the layout that names a dimension.
+#: Every field of the layout that names a dimension, the names a layer may use.
 DIMENSIONS = tuple(
     n for n in LayoutConfig.model_fields if n not in ("type", "fsdp", "zero")
 )
 
 Split = tuple[str, ...]  # the mesh axes one dimension splits over; () keeps it whole
 Entry = str | tuple[str, ...] | None  # one dimension of a PartitionSpec
-# A dimension's name: a string, None for no name, or (name, count) for a dimension
-# that flattens `count` of them, such as ("kv_heads", 2) for 2 kv heads of 64 dims.
-# Such a dimension splits only at the boundaries between them.
+#: A dimension's name, None for no name, or ``(name, count)`` for a dimension that
+#: flattens `count` of them, such as ``("kv_heads", 2)`` for 2 kv heads of 64 dims.
+#: Such a dimension splits only at the boundaries between them.
 Name = str | tuple[str, int] | None
 LECUN = nnx.initializers.lecun_normal()  # nnx.Linear's kernel_init
 
@@ -91,9 +99,9 @@ def fsdp(
     dimension splits over yet, or if none divides by them all, over as many of them as
     one does, from the first. The first, so that each shard is whole rows of the
     array, which XLA gathers and scatters without a transpose: an expert stack's
-    experts, a kernel's inputs. Never the stacked `layers` of a scanned repeat: a scan
-    reads one layer at a time. And one that its own axes leave whole only if no other
-    is free (``_first_whole``)."""
+    experts, a kernel's inputs. Never the stacked ``layers`` of a scanned repeat: a
+    scan reads one layer at a time. And one that its own axes leave whole only if no
+    other is free."""
     taken = {a for s in splits for a in s}
     over = [a for a in as_split(on.layout.fsdp) if on.size(a) > 1 and a not in taken]
     for k in range(len(over), 0, -1):
@@ -125,11 +133,24 @@ def _first_whole(
 
 
 def partition(splits: list[Split]) -> P:
+    """Return the partition spec of dimensions that split over `splits`."""
     return P(*(None if not s else s[0] if len(s) == 1 else s for s in splits))
 
 
 def spec(names: Sequence[Name], shape: tuple[int, ...]) -> P:
-    """Return the partition spec of an array of `shape` whose dimensions are `names`."""
+    """Return the partition spec of an array of `shape` whose dimensions are `names`.
+
+    Each dimension splits over the axes the layout gives its name, but those of size
+    1, those an earlier dimension took, and those a shard_map being traced maps; and
+    over none if they do not divide it. Outside `~bux.parallel.settings.use` it is
+    ``P()``. Parameters split further by FSDP: `~bux.parallel.place.shardings`.
+
+    Example::
+
+        >>> with parallel.use(MeshConfig(tensor=4)):  # on 4 devices
+        ...     spec(("embed", "mlp"), (1024, 4096))
+        PartitionSpec(None, 'tensor')
+    """
     on = active()
     if on is None:
         return P()
@@ -145,9 +166,18 @@ def splits(names: Sequence[Name], shape: tuple[int, ...]) -> tuple[int, ...]:
 
 
 def shard(x: Shaped[Array, "*s"], *names: Name) -> Shaped[Array, "*s"]:
-    """Constrain `x` to split as the `names` of its dimensions say.
+    """Constrain `x` to split as the `names` of its dimensions say (`spec`).
 
-    Outside ``use`` it returns `x` as it is. Called eagerly, it moves `x` to the mesh.
+    Outside `~bux.parallel.settings.use` it returns `x` as it is. Called eagerly, it
+    moves `x` to the mesh. Inside a shard_map it splits over the axes left free.
+
+    Args:
+        x: An activation.
+        *names: A name for each of its dimensions, None for one that stays whole.
+
+    Example::
+
+        logits = shard(logits, "batch", "heads", "seq", None)
     """
     if (on := active()) is None:
         return x
@@ -168,7 +198,19 @@ def named(
     *names: Name,
     init: nnx.Initializer = LECUN,
 ) -> nnx.Initializer:
-    """Wrap `init` to name the dimensions of its parameters, for ``kernel_init=``."""
+    """Wrap `init` to name the dimensions of its parameters, for ``kernel_init=``.
+
+    Args:
+        *names: A name for each dimension of the parameter (`Name`).
+        init: The initializer to wrap: LeCun normal, as `flax.nnx.Linear`'s.
+
+    Raises:
+        ValueError: If a name is not one of `DIMENSIONS`, with or without a mesh.
+
+    Example::
+
+        nnx.Linear(d_model, heads * head_dim, kernel_init=named("embed", "heads"))
+    """
     for name in names:
         axes(LayoutConfig(), name)  # an unknown name fails here, with or without a mesh
     return nnx.with_metadata(init, names=names)  # under NAMES

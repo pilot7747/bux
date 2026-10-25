@@ -1,12 +1,13 @@
 """Pipelines that run each microbatch's backward themselves, at the ticks of a table
-(bux.parallel.schedule): the methods ``1f1b`` and ``zbh1`` of `methods.pipeline`.
+(`bux.parallel.schedule`): the methods ``1f1b`` and ``zbh1`` of ``methods.pipeline``.
 
 gpipe's backward is JAX's transpose of its scan of ticks, so a stage keeps every
-microbatch's residuals until the step ends. Here a stage's forward is a ``jax.vjp``,
-whose residuals sit in a slot of a buffer (``Held``) only until the backward rebuilds
+microbatch's residuals until the step ends. Here a stage's forward is a `jax.vjp`,
+whose residuals sit in a slot of a buffer (`Held`) only until the backward rebuilds
 the vjp from them. A backward needs the loss's gradient, so these pipelines take the
-whole model, cut at the pipelined repeat (``Parts``): the first stage runs the part
-before the repeat, and the last stage the part after it, to the loss. On each stage:
+whole model, cut at the pipelined repeat (`Parts`): the first stage runs the part
+before the repeat, and the last stage the part after it, to the loss. On each
+stage::
 
     a lax.scan over the table's ticks; at each tick,
         each lane:  F, B or W on the lane's microbatch, each kind under a lax.cond
@@ -14,8 +15,11 @@ before the repeat, and the last stage the part after it, to the loss. On each st
 
 The gradients add up in float32 on each stage. Those of the parts outside the repeat
 sum over the stages as they leave, and where each device runs its own rows
-(``gather.apart``), every gradient sums over the rows' axes once, at the end. A
-forward alone, an eval's, runs gpipe's.
+(`bux.parallel.gather.apart`), every gradient sums over the rows' axes once, at the
+end. A forward alone, an eval's, runs gpipe's::
+
+    mesh    = mesh(stage=4)
+    methods = methods(pipeline=zbh1, microbatches=8)
 """
 
 import functools
@@ -55,7 +59,7 @@ Leaf = Shaped[Array, "..."]  # one of a vjp's residuals, or a gradient
 
 class Parts(NamedTuple):
     """A model cut at its pipelined repeat, each part a function of arrays alone, run
-    on one microbatch's `rows`:
+    on one microbatch's `rows`::
 
         first(others, kept, rows) -> (x, kept)            up to the repeat
         stage(params, rest, x, rows) -> (y, rest, losses)  a stage's share of it
@@ -86,7 +90,16 @@ class Gradients(NamedTuple):
 
 
 class Scheduled:
-    """A pipeline method run by the table ``schedule.TABLES[name]``."""
+    """A pipeline that runs each microbatch's backward itself, at the ticks of the
+    table ``schedule.TABLES[name]``: ``1f1b``, a forward and a whole backward in two
+    lanes, each as soon as it can run; or ``zbh1`` (ZB-H1), the backward split so
+    that each weight gradient fills a tick the stage would idle. The first stage also
+    runs the model up to the pipelined repeat, and the last the rest of it to the
+    loss.
+
+    Args:
+        name: The table's name in `~bux.parallel.schedule.TABLES`.
+    """
 
     def __init__(self, name: str):
         self.name = name

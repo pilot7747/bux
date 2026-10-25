@@ -1,18 +1,25 @@
 """Learning-rate schedules and optimizers, built from their configs with optax.
 
-Each is found by its config's type: a schedule in ``schedules``, an optimizer in
-``optimizers``. A schedule's builder gets the config and the run's steps, and returns
+Each is found by its config's type: a schedule in `schedules`, an optimizer in
+`optimizers`. A schedule's builder gets the config and the run's steps, and returns
 its curve after the warmup; an optimizer's gets the config, the schedule's multiplier
-and the model, and returns an optax transformation.
+and the model, and returns an optax transformation. A builder registered under a
+taken name replaces bux's own::
+
+    @optimizers.register("adamw")
+    def _(c: tcfg.AdamWConfig, multiplier: Schedule, model: nnx.Module):
+        return optax.adamw(lr_schedule(c.lr, multiplier), b1=c.b1, b2=c.b2)
 
 Modules say how the optimizers treat their parameters with class attributes:
-`no_weight_decay`, `no_muon` and `muon_axes`.
+``no_weight_decay`` (names of parameters weight decay skips), ``no_muon`` (a module
+whose parameters train with AdamW under Muon) and ``muon_axes`` (each parameter's
+matrix axes, for Muon).
 
 Muon orthogonalizes its updates by the run's ``orthogonalize`` method
-(``bux.parallel.methods``): ``gspmd`` on whatever shards the compiler gives them,
+(`bux.parallel.methods`): ``gspmd`` on whatever shards the compiler gives them,
 ``gather``, each matrix whole on every device that holds it, or ``owner``, each
 matrix whole on one device. Its Newton-Schulz's coefficients are found by name in
-``ns_coefficients``, a builder that gets the number of iterations.
+`ns_coefficients`, a builder that gets the number of iterations.
 """
 
 import math
@@ -38,16 +45,22 @@ from bux.parallel.layout import Split, as_split, partition
 from bux.train import config as tcfg
 from bux.train.registry import Registry
 
-Schedule = Callable[[Real[ArrayLike, ""]], Float[Array, ""]]  # step -> value
+#: A value at each step, counted from 0, as a learning rate or its multiplier.
+Schedule = Callable[[Real[ArrayLike, ""]], Float[Array, ""]]
 # A matrix, or a stack of them as its dimension numbers say, made orthogonal.
 NewtonSchulz = Callable[[Float[Array, "*m"], MuonDimensionNumbers], Float[Array, "*m"]]
 
+#: The schedules, by the ``type`` of their config. A builder gets the config and the
+#: run's steps, and returns the multiplier's curve after the warmup.
 schedules = Registry[Schedule]("schedule", "bux.train.optim.schedules")
+#: The optimizers, by the ``type`` of their config. A builder gets the config, the
+#: schedule's multiplier and the model, and returns an optax transformation.
 optimizers = Registry[optax.GradientTransformation](
     "optimizer", "bux.train.optim.optimizers"
 )
-# Newton-Schulz's quintics a x + b x³ + c x⁵ for a number of iterations, by name: one
-# (a, b, c) for every iteration, or one for each.
+#: Newton-Schulz's quintics ``a x + b x³ + c x⁵`` for a number of iterations, by
+#: name: one (a, b, c) for every iteration, or one for each. A builder gets the
+#: number of iterations.
 ns_coefficients = Registry[Float[Array, "*steps 3"]](
     "set of Newton-Schulz coefficients", "bux.train.optim.ns_coefficients"
 )
@@ -58,7 +71,26 @@ ns_coefficients = Registry[Float[Array, "*steps 3"]](
 
 def lr_multiplier(config: tcfg.ScheduleConfig, steps: int) -> Schedule:
     """Return the multiplier of the peak learning rate, from 0 to 1, at each step of a
-    run of `steps`: a linear warmup, times the schedule's own curve."""
+    run of `steps`: a linear warmup, times the schedule's own curve.
+
+    The warmup rises from ``1 / warmup`` at step 0 to 1 at step ``warmup - 1``.
+
+    Args:
+        config: The run's ``schedule`` setting.
+        steps: The run's steps.
+
+    Returns:
+        The multiplier at each step, counted from 0.
+
+    Raises:
+        NotImplementedError: If no schedule is registered under the config's type.
+
+    Example::
+
+        >>> m = lr_multiplier(WSDSchedule(warmup=10, decay=0.2), steps=100)
+        >>> [round(float(m(s)), 2) for s in (0, 9, 50, 89, 99)]
+        [0.1, 1.0, 1.0, 0.5, 0.0]
+    """
     curve = schedules.build(config, steps)
 
     def multiplier(step: Real[ArrayLike, ""]) -> Float[Array, ""]:
@@ -70,17 +102,22 @@ def lr_multiplier(config: tcfg.ScheduleConfig, steps: int) -> Schedule:
 
 
 def lr_schedule(lr: float, multiplier: Schedule) -> Schedule:
-    """Return the learning rate at each step: the peak `lr`, scaled by `multiplier`."""
+    """Return the learning rate at each step: the peak `lr`, scaled by `multiplier`
+    (`lr_multiplier`)."""
     return lambda step: lr * multiplier(step)
 
 
 @schedules.register("constant")
 def _(c: tcfg.ConstantSchedule, steps: int) -> Schedule:
+    """The peak learning rate at every step after the warmup."""
     return lambda step: jnp.asarray(1.0)
 
 
 @schedules.register("cosine")
 def _(c: tcfg.CosineSchedule, steps: int) -> Schedule:
+    """A cosine decay from the peak after the warmup to `final` times it at the last
+    step."""
+
     def curve(step: Real[ArrayLike, ""]) -> Float[Array, ""]:
         t = jnp.clip((step + 1 - c.warmup) / max(steps - c.warmup, 1), 0, 1)
         return c.final + (1 - c.final) * 0.5 * (1 + jnp.cos(math.pi * t))
@@ -88,6 +125,7 @@ def _(c: tcfg.CosineSchedule, steps: int) -> Schedule:
     return curve
 
 
+#: The curves of a ``wsd`` cooldown by its ``shape``, from 1 at t = 0 to 0 at t = 1.
 COOLDOWNS: dict[str, Callable[[Float[Array, ""]], Float[Array, ""]]] = {
     "linear": lambda t: 1 - t,
     "sqrt": lambda t: 1 - jnp.sqrt(t),
@@ -97,6 +135,8 @@ COOLDOWNS: dict[str, Callable[[Float[Array, ""]], Float[Array, ""]]] = {
 
 @schedules.register("wsd")
 def _(c: tcfg.WSDSchedule, steps: int) -> Schedule:
+    """Warmup-stable-decay: the peak until the last `decay` of the steps, then a
+    cooldown of `shape` to `final` times the peak at the last step."""
     cooldown = c.cooldown(steps)
 
     def curve(step: Real[ArrayLike, ""]) -> Float[Array, ""]:
@@ -118,7 +158,30 @@ def optimizer(
 ) -> optax.GradientTransformation:
     """Return the update rule of `config`, its learning rate scaled by `multiplier`,
     after clipping gradients to the global norm `clip`, its moments kept in
-    `moments`."""
+    `moments`.
+
+    Args:
+        config: The run's ``optimizer`` setting, built by its builder in `optimizers`.
+        multiplier: The schedule's multiplier of the peak learning rate
+            (`lr_multiplier`).
+        model: The model it trains, whose modules say which parameters decay and
+            which Muon takes.
+        clip: The global norm gradients are clipped to; None does not clip.
+        moments: The dtype the optimizer's state is kept in between steps
+            (`kept_in`).
+
+    Returns:
+        An optax transformation of the model's parameters' gradients.
+
+    Raises:
+        NotImplementedError: If no optimizer is registered under the config's type.
+
+    Example::
+
+        multiplier = lr_multiplier(run.train.schedule, run.train.steps)
+        tx = optimizer(run.train.optimizer, multiplier, model, clip=1.0)
+        trainer = Trainer(model, tx, objective(run.train.loss, run.arch))
+    """
     tx = kept_in(optimizers.build(config, multiplier, model), moments)
     if clip is None:
         return tx
@@ -199,6 +262,8 @@ def weight_decay_mask(model: nnx.Module) -> Callable[[PyTree], PyTree[bool]]:
 def adamw(
     c: tcfg.AdamWConfig, multiplier: Schedule, model: nnx.Module
 ) -> optax.GradientTransformation:
+    """AdamW by optax, its weight decay on the matrices outside the paths modules
+    name in ``no_weight_decay`` (`weight_decay_mask`)."""
     return optax.adamw(
         lr_schedule(c.lr, multiplier),
         b1=c.b1,
@@ -236,7 +301,10 @@ def muon_matrices(model: nnx.Module) -> dict[tuple, MuonDimensionNumbers]:
 def muon(
     config: tcfg.MuonConfig, multiplier: Schedule, model: nnx.Module
 ) -> optax.GradientTransformation:
-    """Muon for `muon_matrices(model)`, and AdamW for the rest."""
+    """Muon for the matrices inside the blocks (`muon_matrices`), and AdamW (its
+    ``adam``) for the rest: Nesterov momentum, orthogonalized by Newton-Schulz by
+    the run's ``methods.orthogonalize``, scaled to ``consistent_rms``, with decoupled
+    weight decay."""
     dims = muon_matrices(model)
 
     def labels(params: PyTree[Float[Array, "*_"]]) -> PyTree[str]:
@@ -351,6 +419,8 @@ def newton_schulz(steps: int, coefficients: str = "jordan") -> NewtonSchulz:
 
 @ns_coefficients.register("jordan")
 def _(steps: int) -> Float[Array, "3"]:
+    """Keller Jordan's quintic, (3.4445, -4.7750, 2.0315), the same at every
+    iteration: optax's default."""
     return jnp.asarray((3.4445, -4.7750, 2.0315))  # Keller Jordan's, optax's default
 
 
@@ -369,7 +439,10 @@ POLAR_EXPRESS = (
 
 @ns_coefficients.register("polar_express")
 def _(steps: int, safety: float = 1.01) -> Float[Array, "steps 3"]:
-    """As its authors run it: each quintic but the last for singular values up to
+    """Polar Express (Amsel et al., 2025): a quintic for each iteration, closer to
+    orthogonal in as many; past the eighth, the last repeats.
+
+    As its authors run it: each quintic but the last for singular values up to
     `safety`, and the first for a matrix divided by `safety` times its norm, where
     optax's divides by its norm."""
     found = [POLAR_EXPRESS[min(i, len(POLAR_EXPRESS) - 1)] for i in range(steps)]
