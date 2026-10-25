@@ -191,7 +191,7 @@ not `attention`.
 2. It keeps the first that fits: what XLA's analysis of the compiled step says a
    device holds at once (its arguments, outputs, temporaries and code) is at most 97%
    of what the device can hold. That is its `bytes_limit`: 95% of a GPU, which bux
-   gives XLA's pool ([Performance tuning](../performance/tuning.md)).
+   gives XLA's pool ([Memory](../performance/tuning.md#batch-microbatches-and-memory)).
 3. Where none fits, it takes the last, `full`. Where the device does not say what it
    can hold, as a CPU does not, everything fits, and `auto` is `none`.
 
@@ -210,12 +210,14 @@ How it compiles:
 - A forward outside a training step keeps everything.
 
 On 8 B300s, `megatron.bux`'s `nccl_ep` arm with 75% of a GPU took `save_attention` in
-699 s, where one candidate after another took 966 s. XLA compiled each of the four in
-218-243 s side by side, and their tracing and lowering, a minute each, now take most
-of the rest (where a compile goes: [Performance tuning](../performance/tuning.md)). So
-where the second candidate fits, side by side costs the others' lowering: `sorted`
-with 95% took `dots_attention` in 592 s, where `none` and it one after another would
-take about 400.
+699 s, where one candidate after another took 966 s:
+
+- XLA compiled each of the four in 218-243 s, side by side.
+- Their tracing and lowering, a minute each, now take most of the rest
+  ([where a compile goes](../performance/tuning.md#compile-time-and-the-compile-cache)).
+- So where the second candidate fits, side by side costs the others' lowering:
+  `sorted` with 95% took `dots_attention` in 592 s, where `none` and it one after
+  another would take about 400.
 
 The step says what it took, and XLA's seconds of each candidate:
 
@@ -370,8 +372,10 @@ What the table says:
   on the dense model, as is `remat(save=[attention, mlp])`.
 - A GDN layer's recurrence by chunks keeps their float32 states (`recurrence.out`),
   most of what `save_attention` keeps there. Keeping its inputs alone
-  (`recurrence.in`), whose backward runs the chunked forward again, is faster than
-  `save_attention` in less than half its memory.
+  (`recurrence.in`), whose backward runs the chunked forward again, with the MLPs'
+  projections, `remat(save=[attention, recurrence.in, mlp])`, is faster than
+  `save_attention` (74.9k against 73.4k) in less than half its memory (41.0 GiB
+  against 89.9).
 - In a Mamba-2 hybrid (`"MMMA"^4`) too, `recurrence.in` in place of `recurrence` costs
   2-3% for 59-68% less memory (`save_attention` 78.5k in 99.6 GiB, against 76.4k in
   31.7). In a KDA hybrid by cuDNN's kernel, which costs more to run again, it costs

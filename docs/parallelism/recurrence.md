@@ -14,7 +14,7 @@ Use `pass_state` for long rows of a hybrid model over `context`, beside
 [ring or ulysses attention](attention.md) for its attention layers. On one device, or
 where nothing splits the positions, the two are the same.
 
-The same page covers how a recurrence runs on each device: by chunks of positions
+This page also covers how a recurrence runs on each device: by chunks of positions
 (`chunkwise`), what its backward pass keeps of them (`methods.states`), and the GPU
 kernels of the delta rule.
 
@@ -194,15 +194,16 @@ chunks they fall back on.
 :::{warning}
 Unbounded KDA gates are that steep early: within 12 steps of bux's start, they reach
 it in 30 to 90% of the (row, head) pairs of most layers. So cuDNN's KDA kernel runs
-only gates bounded at -5 (`kda(gate_lower_bound=-5)`); unbounded ones run by bux's
-own kernels, below.
+only gates bounded at -5 or above (`kda(gate_lower_bound=-5)`, or a bound nearer 0).
+Unbounded gates, and those bounded below -5, run by bux's own kernels, below.
 :::
 
 (recurrence-kda-kernels)=
 ### bux's kernels for KDA
 
-Unbounded, on any GPU, KDA runs by bux's own Pallas kernels (`pallas_delta`), exact
-at any gate, under `scan`, with q, k and v of 16 bits and heads of 64 or 128:
+Unbounded, or bounded below -5, on any GPU, KDA runs by bux's own Pallas kernels
+(`pallas_delta`), exact at any gate, under `scan`, with q, k and v of 16 bits and heads
+of 64 or 128:
 
 - They take each pair's decay `exp(G_t - G_s)` through a position `r` between the two,
   `exp(G_t - G_r) exp(G_r - G_s)`, both factors at most 1, as a matmul.

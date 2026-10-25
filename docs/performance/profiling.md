@@ -87,11 +87,11 @@ for an analysis of your own.
   to 210 ms for Qwen3-30B-A3B's 48 layers on 8 B300s, where it waits 25 ms a step
   between kernels. Logging every step, the 1.3B's GPU 0 idles 2.2 ms a step, from 57.9
   before the host fix ([The host between steps](tuning.md#the-host-between-steps)).
-- **Under the profiler, a launch returns at its step's end.** XLA's launch of a
+- **Under the profiler, a launch returns at its step's end.** XLA's launch of a large
   step returns only when the GPU is nearly through it. A small model's step, its
   kernels in CUDA graphs (XLA's command buffers), returns in 10 ms, and the host runs
-  up to two steps ahead; under the profiler, which turns command buffers off, its
-  launch too returns at its step's end.
+  up to two steps ahead. The profiler turns command buffers off, so under it the small
+  model's launch too returns at its step's end.
 - **Command buffers.** jax.profiler runs XLA's command buffers a kernel at a time as
   it traces. Kept whole (`--xla_enable_command_buffers_during_profiling=true`), the
   step's idle and exposed time were the same.
@@ -165,8 +165,8 @@ attention whole, which made bux's 10% higher at 4096 tokens a row.
 
 ### FLOPs a token in the plan
 
-`bux plan` shows the FLOPs a token on rows of one document, with no GPU: 6.9G for a
-Llama-style 1.3B at 4096 tokens a row, 6 N of its matrices and 0.8G of attention. The
+`bux plan` shows the FLOPs a token on rows of one document, with no GPU: 6.91B for a
+Llama-style 1.3B at 4096 tokens a row, 6 N of its matrices and 0.8B of attention. The
 one-GPU benchmark suite:
 
 ```console

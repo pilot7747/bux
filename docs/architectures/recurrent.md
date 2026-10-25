@@ -167,10 +167,10 @@ kda = kda(num_heads=96, head_dim=128, gate_lower_bound=-5, norm_eps=1e-5)
 ```
 
 :::{tip}
-`gate_lower_bound=-5` also decides which kernel runs on a GPU: cuDNN's fused KDA
-kernel takes only a decay bounded at -5. On a B300 it runs 10 times as fast as the
-chunks, where bux's own Pallas kernels, which take any gate, run 2.6 times as fast
-([How they run](#how-they-run)).
+`gate_lower_bound` also decides which kernel runs on a GPU: cuDNN's fused KDA kernel
+takes only a decay bounded at -5 or above, as `gate_lower_bound=-5` bounds it. On a
+B300 it runs 10 times as fast as the chunks, where bux's own Pallas kernels, which take
+any gate, run 2.6 times as fast ([How they run](#how-they-run)).
 :::
 
 ### `lightning`: lightning attention
@@ -373,8 +373,8 @@ On a GPU, kernels run the delta rule with q, k and v of 16 bits and heads of 64 
 | Layer | Kernel | Condition |
 |-------|--------|-----------|
 | `gdn`, `deltanet` | cuDNN's fused GDN kernel (`fused_delta`) | a B200 or B300; any gate |
-| `kda` with `gate_lower_bound` | cuDNN's fused KDA kernel (`fused_delta`) | a B200 or B300; a bound of -5 or above |
-| `kda` without | bux's Pallas kernels (`pallas_delta`) | any GPU; any gate |
+| `kda` with a `gate_lower_bound` of -5 or above | cuDNN's fused KDA kernel (`fused_delta`) | a B200 or B300 |
+| `kda` otherwise | bux's Pallas kernels (`pallas_delta`) | any GPU; any gate |
 | `gla`, `rwkv7` | chunks, the state across them by `affine_scan` | |
 | `lightning`, `mamba2` | chunks, the state across them by a matmul (one decay a head) | |
 | `mamba` | a scan over positions (one decay per channel and state dim) | |
@@ -382,8 +382,8 @@ On a GPU, kernels run the delta rule with q, k and v of 16 bits and heads of 64 
 cuDNN's KDA kernel factors each decay through the start of a tile of 16 positions,
 so it loses precision where a tile decays a channel by $e^{-86}$, and overflows at
 $e^{-90}$. Within 12 steps of bux's start, KDA's unbounded gates are that steep in 30
-to 90% of the (row, head) pairs of most layers, so those run by bux's kernels, which
-are exact at any gate.
+to 90% of the (row, head) pairs of most layers, so those, and gates bounded below -5,
+run by bux's kernels, which are exact at any gate.
 
 Settings that change how they run (none changes what they compute):
 

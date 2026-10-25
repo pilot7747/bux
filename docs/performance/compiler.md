@@ -12,10 +12,10 @@ scanned model under FSDP at about a row a GPU, or when you want to try an XLA fl
 on one run of a sweep.
 
 :::{tip}
-The defaults, XLA's own options (`preset=default`) and the reductions started
-early (`reductions=early`), are the fastest measured, or within the noise of the
-fastest, for every run below but one. The exception is a scanned model under FSDP at a row a GPU,
-which trains up to 56% faster with `compiler(preset=maxtext)`
+The defaults, XLA's own options (`preset=default`) and the reductions started early
+(`reductions=early`), are the fastest measured, or within the noise of the fastest,
+for every run below but one. The exception is a scanned model under FSDP at a row a
+GPU, which trains up to 56% faster with `compiler(preset=maxtext)`
 ([below](#scanned-layers-under-fsdp)).
 :::
 
@@ -35,16 +35,20 @@ compiler = compiler(reductions=xla)                  # where XLA puts them
 | `reductions` | where the gradients' reductions start: `early`, each as its gradient is computed, or `xla`, where XLA's scheduler puts them | `early` |
 
 The training step compiles with its preset's options, then the setting's own `options`
-over them. They are XLA's debug options, and jax's `optimization_level` and
-`memory_fitting_level`. `true` and `false` become booleans, which XLA takes from a
-string only as `True` or `False`; anything else goes as it is, a number or an enum's
-name. An option that is not `--name=value` is an error where it is written.
+over them:
 
-The options are the step's alone (`bux/train/xla.py`): a run's step compiles with its
-own options in a process that compiled another run's with others, and they go over
-XLA_FLAGS. Like `mesh`, `layout` and `methods`, `compiler` changes how a run computes,
-not what, and is not in its id: a sweep over presets is several runs of one id, told
-apart by their names.
+- The options are XLA's debug options, and jax's `optimization_level` and
+  `memory_fitting_level`.
+- `true` and `false` become booleans, which XLA takes from a string only as `True` or
+  `False`. Anything else goes as it is, a number or an enum's name.
+- An option that is not `--name=value` is an error where it is written.
+- The options are the step's alone (`bux/train/xla.py`), and go over XLA_FLAGS. A
+  run's step compiles with its own options even in a process that compiled another
+  run's with others.
+
+Like `mesh`, `layout` and `methods`, `compiler` changes how a run computes, not what,
+and is not in its id: a sweep over presets is several runs of one id, told apart by
+their names.
 
 ## Presets
 
@@ -81,7 +85,7 @@ device. It sets, where the environment does not:
 | what | value | why |
 |------|-------|-----|
 | XLA_FLAGS | `--xla_gpu_experimental_ragged_all_to_all_use_barrier_with_nccl=false` | without it, NCCL's ragged all-to-all (expert parallelism's dispatch) hangs on jax 0.12 |
-| `NCCL_GIN_TYPE`, `NCCL_EP_TOKENS_PER_CHUNK` | `2`, `256` | NCCL EP between nodes: GIN by a CPU proxy, 256 tokens a chunk. On two B300 nodes GDAKI, NCCL's default, took 3x as long for an EP layer's exchanges, and chunks of 64 1.3x ([MoE methods](tuning.md#moe-methods)) |
+| `NCCL_GIN_TYPE`, `NCCL_EP_TOKENS_PER_CHUNK` | `2`, `256` | NCCL EP between nodes: GIN by a CPU proxy, 256 tokens a chunk. On two B300 nodes GDAKI, NCCL's default, took 3x as long for an EP layer's exchanges, and chunks of 64 1.3x ([One layer's exchange](../parallelism/experts.md#one-layers-exchange)) |
 | `XLA_CLIENT_MEM_FRACTION` | `0.95` | XLA's memory pool ([Memory](tuning.md#batch-microbatches-and-memory)) |
 | `JAX_COMPILATION_CACHE_DIR` | `~/.cache/bux/jax` | the compile cache ([Compile time](tuning.md#compile-time-and-the-compile-cache)) |
 
@@ -99,15 +103,18 @@ wait longer for their collectives, and the presets try XLA's options on them
 
 ## Where the gradients' reductions start: `reductions`
 
-XLA's scheduler places a collective's done just before its result is first read, and,
-with one collective in flight, each start just above the done before it and what feeds
-only the start just above that. A gradient's reduction is read where the step adds it
-up, after the last layer's backward pass (a microbatch's sum, the optimizer's
-update). So XLA puts every weight gradient's GEMM there, each just before its
-reduction, and runs the reductions one after another beside nothing but those GEMMs.
-Qwen3-30B-A3B's `sorted` arm (`megatron.bux`, Megatron's batch of 8 microbatches,
-`fsdp=8`) waited 95 ms a microbatch, 11% of its step, for 96 reduce-scatters at the
-end of each backward pass.
+XLA's scheduler, with one collective in flight, places:
+
+- a collective's done just before its result is first read;
+- each collective's start just above the done before it;
+- what feeds only that start just above it.
+
+A gradient's reduction is read where the step adds it up, after the last layer's
+backward pass (a microbatch's sum, the optimizer's update). So XLA puts every weight
+gradient's GEMM there, each just before its reduction, and runs the reductions one
+after another beside nothing but those GEMMs. Qwen3-30B-A3B's `sorted` arm
+(`megatron.bux`, Megatron's batch of 8 microbatches, `fsdp=8`) waited 95 ms a
+microbatch, 11% of its step, for 96 reduce-scatters at the end of each backward pass.
 
 `compiler(reductions=early)`, the default, runs a pass over XLA's schedule
 ({py:mod}`bux.train.reorder`):
@@ -129,10 +136,12 @@ XLA's schedule's, where two runs of one tree without them end 0.02 apart.
 
 ### What it gained
 
-On 8 B300s the arm trains at 41.7k to 42.1k tokens a second a GPU with `early`, against
-39.7k to 40.0k with `xla` (on two nodes), in the same 214.5 GiB. Its profiled step's
-exposed collectives drop from 1029 ms to 726 of 6.8 s, most of what is left a
-microbatch's last reductions, which only its next microbatch could run beside.
+On a node of 8 B300s, measured on two such nodes, the arm trains at 41.7k to 42.1k
+tokens a second a GPU with `early`, against 39.7k to 40.0k with `xla`, in the same
+214.5 GiB. Its
+profiled step's exposed collectives drop from 1029 ms to 726 of 6.8 s. Most of what is
+left is a microbatch's last reductions, which only its next microbatch could run
+beside.
 
 | run | gain from `early`, same memory |
 |-----|--------------------------------|

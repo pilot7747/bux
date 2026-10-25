@@ -1,9 +1,10 @@
 # Reference
 
-The pages here are generated from the code as the documentation builds, so they are
+Most pages here are generated from the code as the documentation builds, so they are
 always the code's: the language reference from the configs' docstrings and field
 comments (the same text `bux-lsp` shows on hover), the registries from what each one
-holds, and the Python API from the docstrings.
+holds, the command line's options from its `--help`, and the Python API from the
+docstrings. The environment variables are listed by hand.
 
 ::::{grid} 1 2 2 2
 :gutter: 3

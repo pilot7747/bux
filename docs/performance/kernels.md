@@ -6,7 +6,8 @@ XLA. This page lists the kernels, says when each one falls back to XLA, and show
 to turn them all off to debug one.
 
 You need nothing to turn them on: every kernel runs by default on a GPU it supports.
-None of them is in a run's id, so a run trains the same run with or without them.
+None of them is in a run's id: with or without them a run computes the same values, up
+to rounding, and keeps its id.
 
 ## Usage
 
@@ -51,8 +52,8 @@ The speedups are against XLA's own program for the same computation, on a B300.
 | linear attention, RWKV-7 | `chunkwise`: chunks of 64 positions, the state across them by a Pallas kernel (`affine_scan`); `methods(states=recompute)` keeps a fourteenth of the memory for the backward | 14-17x a scan over positions |
 | Mamba-2 | `chunkwise`, B and C a group's, the state across chunks by a matmul; `methods(states=recompute)` keeps a sixteenth of the memory for the backward | 25x a scan over positions (2 × 4096 tokens, rematerialized: at 8 × 4096 the scan needs 199 GiB) |
 | Gated DeltaNet, DeltaNet | cuDNN's fused GDN kernel (`fused_delta`), by cuDNN's graph from a `buffer_callback`: any gate | 5x `chunkwise` |
-| KDA with `gate_lower_bound` | cuDNN's fused KDA kernel (`fused_delta`) | 10x `chunkwise` |
-| KDA without | bux's Pallas kernels (`pallas_delta`): any gate, each pair's decay through a position between them | 2.6x `chunkwise` |
+| KDA with a `gate_lower_bound` of -5 or more | cuDNN's fused KDA kernel (`fused_delta`) | 10x `chunkwise` |
+| KDA otherwise | bux's Pallas kernels (`pallas_delta`): any gate, each pair's decay through a position between them | 2.6x `chunkwise` |
 | MoE experts | `grouped.ragged_dot`: tokamax's Mosaic and Triton kernels | 27x `jax.lax.ragged_dot` |
 | MoE experts in MXFP8 | `grouped_mxfp8`: Mosaic GPU kernels of tcgen05's block-scaled MMA, the scales by TMA into tensor memory ([Experts](../parallelism/experts.md)) | 1.5-2.4x tokamax's bfloat16 GEMMs |
 | MoE experts' SwiGLU in MXFP8 | `grouped_glu`: cuDNN's CuTe DSL grouped GEMMs, SwiGLU and its backward with their quantizations in the epilogues, each GPU's shard of the kernels quantized before FSDP gathers it ([Experts](../parallelism/experts.md)) | 1.13-1.17x `grouped_mxfp8`'s layer |
@@ -138,16 +139,21 @@ the log's `mfu` (of the attention a causal mask keeps):
 
 ### The delta rule's kernels
 
-The GDN hybrid trained at 93k (715k on 8) by chunks before its kernel, in 121 GiB
-where it now takes 71 (58 on 8, against 108), and so fits 24 rows (136k, 169 GiB).
-KDA with `gate_lower_bound` trained at 110k in 173 GiB, now 91, and fits 16 rows
-(133k, 163 GiB). KDA without it trained at 60.5k in 122 GiB by chunks, now 96.5k in 88
-by bux's kernels.
+The hybrids of the one-GPU suite, 8 rows of 4096 a GPU, by chunks before their
+kernels and by the kernels now:
 
-Their losses over 30 steps, GEMM autotuning off, are within 1.7e-4 of the chunks'
-(GDN) and the same (KDA). On 8 GPUs the GDN kernel's callbacks run one at a time, 87%
-of 8 GPUs alone, where KDA's kernel, which cudnn-frontend calls from JAX itself, runs
-at 91%.
+| hybrid | by chunks | by its kernels | rows that fit now |
+|--------|-----------|----------------|-------------------|
+| GDN, one GPU | 93k, 121 GiB | 71 GiB | 24: 136k, 169 GiB |
+| GDN, 8 GPUs | 715k, 108 GiB | 58 GiB | |
+| KDA, `gate_lower_bound=-5` (cuDNN's kernel) | 110k, 173 GiB | 91 GiB | 16: 133k, 163 GiB |
+| KDA, unbounded (bux's kernels) | 60.5k, 122 GiB | 96.5k, 88 GiB | |
+
+Their losses over 30 steps, GEMM autotuning off, are within 1.7e-4 of the chunks' for
+GDN, and the same for KDA. On 8 GPUs the GDN kernel's callbacks run one at a time, at
+87% of 8 GPUs alone. KDA's kernel, which cudnn-frontend calls from JAX itself, runs at
+91%. Each layer's times are in
+[The delta rule on a B300](../parallelism/recurrence.md#the-delta-rule-on-a-b300).
 
 ### QK-norm and RoPE
 
@@ -171,8 +177,9 @@ GPU, the 1.3B trains:
 | 16384 | tokamax's, whose backward does every block of a row | 109k |
 | 4096, with sinks | tokamax's | 142k, where `auto` took `xla`, whose t × t logits did not fit |
 
-On random tokens the two rows of 16384 train at 111k and 101k. Rows of 32k over 8 GPUs
-are in [Attention](../parallelism/attention.md), under context parallelism.
+On random tokens the two rows of 16384 train at 111k and 101k. Each kernel's times, the
+same in training on 8 GPUs, and rows of 32k and 128k over 8 GPUs under context
+parallelism, are in [Attention](../parallelism/attention.md#measurements).
 
 ### Sparse attention
 
@@ -231,14 +238,18 @@ same:
   gives some of it back. An MLP projection's forward and backward take 1.3-1.35x less
   time, q's and o's 1.1x, and k's and v's, half as wide, 7% more.
 - **NVFP4.** cuDNN's NVFP4 GEMM runs at 4.8-5.5 PFLOP/s at the MLP's shapes, 1.7-1.9x
-  MXFP8's, with a bfloat16 output that the two tensors' scales then rescale, in what
-  reads it (cuDNN's own global scale is no faster, and takes it in bfloat16). NVFP4's
-  quantizers are two passes of Pallas kernels over each operand
-  ({py:mod}`bux.architecture.precision.nvfp4`): its largest magnitude and that of its
-  transpose through the Hadamard transform, then both copies at once, each value
-  rounded, saturated and packed by Blackwell's `cvt.rn` and `cvt.rs` (stochastic, 8
-  random bits a value). An MLP projection's forward and backward then take 1.07-1.1x
-  less time than MXFP8's, but q's and o's 1.1x more and k's and v's 1.25x: the second
+  MXFP8's. Its output is bfloat16, which the two tensors' scales then rescale in what
+  reads it (cuDNN's own global scale is no faster, and takes it in bfloat16).
+  NVFP4's quantizers are two passes of Pallas kernels over each operand
+  ({py:mod}`bux.architecture.precision.nvfp4`):
+
+  1. the largest magnitude of the operand, and that of its transpose through the
+     Hadamard transform;
+  2. both copies at once, each value rounded, saturated and packed by Blackwell's
+     `cvt.rn` and `cvt.rs` (stochastic, 8 random bits a value).
+
+  An MLP projection's forward and backward then take 1.07-1.1x less time than
+  MXFP8's, but q's and o's take 1.1x more and k's and v's 1.25x. There the second
   pass, ~20 more small kernels a projection (scales for cuDNN's layout, the global
   scales) and the transform's copy, at 2-2.5 TB/s, cost more than their GEMMs save.
 
@@ -276,12 +287,14 @@ Which projections multiply in `mxfp8`, on one B300
 | `nvfp4, first=2, last=8`              | 167k  | 46.1 GiB    |
 | `nvfp4`                               | 179k  | 43.8 GiB    |
 
-The other rows take the loss by logits; the `nvfp4` rows are of a later tree, which
-takes it by chunks (`methods.loss`): bfloat16 there 147k in 51.1 GiB, `mxfp8` 169k in
-46.9. Its first 2 and last 8 branches in bfloat16 leave NVIDIA's recipe as fast as
-`mxfp8`; NVFP4 everywhere is 1.06x it.
-
-k and v in bfloat16 are slower, not faster: q still quantizes x, the copy all three
-shared, and k's and v's GEMMs then run at bfloat16's rate, x kept for them too. Over 8
-GPUs, `mesh(fsdp=8)`, `mxfp8` and `mxfp8_2d` both train at 1.34M (bfloat16: 1.14M),
-and scanned, `first=2, last=2` at 1.20M, where `mxfp8` alone gives 1.22M.
+- **The `nvfp4` rows** are of a later tree, which takes the loss by chunks
+  (`methods.loss`); the other rows take it by logits. In that tree bfloat16 trains at
+  147k in 51.1 GiB, and `mxfp8` at 169k in 46.9.
+- **NVIDIA's recipe**, its first 2 and last 8 branches in bfloat16, is as fast as
+  `mxfp8`; NVFP4 everywhere is 1.06x it.
+- **k and v in bfloat16 are slower, not faster.** q still quantizes x, the copy all
+  three shared, so k's and v's GEMMs run at bfloat16's rate, and x is kept for them
+  too.
+- **Over 8 GPUs**, `mesh(fsdp=8)`, `mxfp8` and `mxfp8_2d` both train at 1.34M
+  (bfloat16: 1.14M). Scanned, `first=2, last=2` trains at 1.20M, where `mxfp8` alone
+  gives 1.22M.

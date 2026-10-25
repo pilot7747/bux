@@ -257,15 +257,17 @@ For rows of documents, cuDNN runs whole rows only, in its packed layout:
   such numbers: 16 for 8 rows of 4096, or for one of 32k.
 - A `lax.cond` gives a batch with a row of more documents to tokamax.
 
-In rows of 4096 that `lax.cond` costs a 1.3B what cuDNN gains it (145k tok/s on a B300
-either way), so `auto` takes cuDNN for documents from rows of 8192 on. In rows of
-16384 of packed documents it trains at 1.3x tokamax's speed.
+In rows of 4096 that `lax.cond` costs a 1.3B what cuDNN gains it: 145k tok/s on a B300
+either way. So `auto` takes cuDNN for documents from rows of 8192 on. In rows of 16384
+of packed documents it trains at 1.3x tokamax's speed.
 
-The documents' starts, which a step takes from their ids and each layer from those, run
-by XLA's `cummax` and `cumsum` in rows of up to 8192 positions, and by a prefix scan
-(`jax.lax.associative_scan`, log2(t) steps) in longer ones. At 128k over `context`
-XLA's take 2 and 25 ms each time; in rows of 4096 the scan took a `1f1b` pipeline of
-the 1.3B 1.6% slower.
+A step takes the documents' starts from their ids, and each layer from those:
+
+- in rows of up to 8192 positions, by XLA's `cummax` and `cumsum`;
+- in longer rows, by a prefix scan (`jax.lax.associative_scan`, log2(t) steps).
+
+At 128k over `context`, XLA's `cummax` and `cumsum` take 2 and 25 ms each time. In rows
+of 4096 the scan took a `1f1b` pipeline of the 1.3B 1.6% slower.
 
 ### Kernels on each device
 
