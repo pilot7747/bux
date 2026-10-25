@@ -8,6 +8,12 @@ from bux.parallel.context import softcap
 
 
 def activation(name: str, x: Float[Array, "*shape"]) -> Float[Array, "*shape"]:
+    """Return the activation `name` of every entry of x: one of
+    `bux.config.Activation`, ``situ`` being ``4 * tanh(x / 4) * sigmoid(x)``.
+
+    Raises:
+        ValueError: `name` is no activation.
+    """
     match name:
         case "relu":
             return jax.nn.relu(x)

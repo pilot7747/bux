@@ -42,10 +42,10 @@ def _ngram_rows(
     """Return the table rows of the n-grams of 2 to n ids ending at every position,
     one per head.
 
-    The n-gram of the last j + 1 ids hashes to XOR_{i <= j} ids[t - i] * m_i, in wrapping
-    uint32 arithmetic. Positions before the sequence, before the document (by `within`,
-    how many tokens of it come before each), or at and before the last boundary token
-    before t, count as `pad`, so that n-grams do not cross documents.
+    The n-gram of the last j + 1 ids hashes to ``XOR_{i <= j} ids[t - i] * m_i``, in
+    wrapping uint32 arithmetic. Positions before the sequence, before the document
+    (by `within`, how many tokens of it come before each), or at and before the last
+    boundary token before t, count as `pad`, so that n-grams do not cross documents.
     """
     b, t = ids.shape
     pos = jnp.arange(t)
@@ -66,10 +66,26 @@ def _ngram_rows(
 
 
 class Engram(nnx.Module):
-    """Hashed n-gram rows of the input tokens, gated by the stream and added to it. On a
-    widened stream, with an axis of copies, every copy has a key of its own, and they
-    share the value. The table's rows split as the vocabulary does (``bux.parallel``),
-    and the rest is whole."""
+    """Conditional memory (DeepSeek Engram, 2026), ``engram``: hashed n-gram rows of
+    the input tokens, gated by the stream and added to it.
+
+    Every n-gram of 2 to ``max_ngram_size`` input tokens ending at a position is
+    hashed by ``num_heads`` heads into tables of prime sizes, and the rows are
+    concatenated into e. With ``a = <norm(x), norm(W_k e)> / sqrt(d)``, it adds
+    ``u = sigmoid(sign(a) sqrt(abs(a))) W_v e`` to the stream x, and
+    ``silu(conv(norm(u)))`` with a conv. N-grams do not cross a document's start or
+    the config's boundary token.
+
+    On a widened stream, with an axis of copies, every copy has a key of its own, and
+    they share the value. The table's rows split as the vocabulary does
+    (`bux.parallel`), and the rest is whole; weight decay leaves the table alone.
+
+    Args:
+        config: Its settings (`bux.config.EngramConfig`).
+        width: The width of the stream, or ``"streams"`` for a widened one.
+        ctx: The build's context: the architecture, the random streams, and the
+            table sizes earlier engram layers took.
+    """
 
     no_weight_decay = ("table",)
 
@@ -114,6 +130,15 @@ class Engram(nnx.Module):
     def __call__(
         self, x: Float[Array, "b t *copies d"], taps: Taps
     ) -> Float[Array, "b t *copies d"]:
+        """Return the stream with the memory of the tokens before each position added.
+
+        Args:
+            x: The stream, ``b t d``, or its n copies, ``b t n d``.
+            taps: The forward pass's taps: the input tokens and their documents.
+
+        Returns:
+            The stream, of x's shape.
+        """
         tokens = taps.tokens
         assert tokens is not None
         ids, pad = tokens, self.boundary or 0

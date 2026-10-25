@@ -15,7 +15,8 @@ from bux.architecture.registry import Context, Taps, positions, register
 from bux.architecture.residual import widen, widening
 from bux.lang import ir
 
-# nnx.Embed's init.
+#: How a table of embeddings starts, as `flax.nnx.Embed`'s do: normal, of variance
+#: 1 / d.
 EMBED = nnx.initializers.variance_scaling(1.0, "fan_in", "normal", out_axis=0)
 
 
@@ -37,10 +38,25 @@ def lookup(
 
 
 class Embedding(nnx.Module):
-    """Token ids to the stream, by a table split over the vocabulary
-    (``bux.parallel``) that a tied head and nextn read from the model's first one. With
-    `copies`, for a residual algebra that widens the stream, it returns that many
-    copies of it."""
+    """The token embedding, ``embed``: token ids to the stream, by a table split over
+    the vocabulary (`bux.parallel`) that a tied head and nextn read from the model's
+    first one.
+
+    A token's row is scaled by ``sqrt(d)`` with `scale_by_sqrt_dim` (Gemma) and
+    normalized if the config has a norm (Inkling); then learned absolute positions
+    are added, if any (GPT-2), each token's position in its document, and dropout
+    applied. With `copies`, for a residual algebra that widens the stream, it returns
+    that many copies of it. Muon leaves its table to the other optimizer
+    (``no_muon``).
+
+    Args:
+        config: Its settings (`bux.config.EmbeddingConfig`).
+        vocab: The rows of the table, the architecture's ``vocab_size``.
+        d: The width of the stream, ``d_model``.
+        rngs: The random streams the tables start from, and dropout draws from.
+        copies: How many copies of the stream to return, for a widening residual
+            algebra; None for the stream alone.
+    """
 
     no_muon = True
 
@@ -68,6 +84,16 @@ class Embedding(nnx.Module):
     def __call__(
         self, tokens: Int[Array, "b t"], taps: Taps
     ) -> Float[Array, "b t *copies d"]:
+        """Return the stream that starts from the token ids.
+
+        Args:
+            tokens: The token ids, b rows of t.
+            taps: The forward pass's taps, which give the tokens' positions in their
+                documents.
+
+        Returns:
+            The embedding, ``b t d``, or ``b t n d`` in n copies.
+        """
         x = self.embed_tokens(tokens)
         if self.positions is not None:
             pos = positions(taps)
@@ -96,11 +122,22 @@ def _(
 
 
 class Head(nnx.Module):
-    """The stream to logits, split over the vocabulary: x W, or, tied, x E^T with E the
-    first embedding's token table, in the stream's dtype with float32 accumulation,
-    then the bias and the softcap. It leaves its input and its projection in the taps
-    (``HeadOutput``), from which the objective makes the logits a chunk at a time, and
-    passes the stream on."""
+    """The language-model head, ``head``: the stream to logits, split over the
+    vocabulary.
+
+    The logits are ``x W``, or, tied, ``x E^T`` with E the first embedding's token
+    table, in the stream's dtype with float32 accumulation, then the bias and the
+    softcap. The head does not make them: it leaves its input and its projection in
+    the taps (`~bux.architecture.logits.HeadOutput`), from which the objective makes
+    the logits a chunk at a time, and passes the stream on. Muon leaves its matrix to
+    the other optimizer (``no_muon``).
+
+    Args:
+        config: Its settings (`bux.config.LMHeadConfig`).
+        width: The width of the stream it reads.
+        ctx: The build's context: the vocabulary, the random streams, and the first
+            embedding a tied head reads.
+    """
 
     no_muon = True
 
@@ -131,6 +168,7 @@ class Head(nnx.Module):
         return Projection(kernel, None if bias is None else bias[...], cap)
 
     def __call__(self, x: Float[Array, "b t d"], taps: Taps) -> Float[Array, "b t d"]:
+        """Leave x and the projection in ``taps.heads``, and return x."""
         taps.heads.append(HeadOutput(x, self.projection()))
         return x
 
@@ -143,15 +181,23 @@ def _(
 
 
 class NextN(nnx.Module):
-    """Mixes the stream with the embedding of the token `offset` positions ahead, for
-    the `offset`-th nextn to run in the forward pass (shared modules run more than
-    once).
+    """Multi-token prediction's input (DeepSeek-V3), ``nextn``: the stream mixed with
+    the embedding of the token k positions ahead, ``W [norm(e); norm(h)]``, for the
+    k-th nextn to run in the forward pass (shared modules run more than once). A head
+    after it predicts one token further ahead than the one before it. The last k
+    positions, which have no token that far ahead, embed token 0.
 
     On the n copies R of a widened stream it mixes the embedding into each one,
-    W_e norm(e) + W_h norm(R)_j. norm(R) normalizes the copies together, as one vector
-    of n * d with a gain for every copy and channel, so that they keep their sizes
-    relative to each other. On one stream under an algebra that widens the stream, it
-    widens its output, as `embed` does.
+    ``W_e norm(e) + W_h norm(R)_j``. ``norm(R)`` normalizes the copies together, as
+    one vector of ``n * d`` with a gain for every copy and channel, so that they keep
+    their sizes relative to each other. On one stream under an algebra that widens
+    the stream, it widens its output, as `embed` does.
+
+    Args:
+        config: Its settings (`bux.config.NextNConfig`): the norm of its inputs.
+        width: The width of the stream it reads, or ``"streams"`` for a widened one.
+        ctx: The build's context: the first embedding, whose table it reads, the
+            residual algebra, and the random streams.
     """
 
     def __init__(
@@ -173,6 +219,17 @@ class NextN(nnx.Module):
     def __call__(
         self, x: Float[Array, "b t *copies d"], taps: Taps
     ) -> Float[Array, "b t *widened d"]:
+        """Return the stream mixed with the embedding of the tokens ahead.
+
+        Args:
+            x: The stream, ``b t d``, or its n copies, ``b t n d``.
+            taps: The forward pass's taps: the input tokens, and how many nextn
+                layers ran before this one.
+
+        Returns:
+            The mixed stream, ``b t d``; or ``b t n d``, for n copies in, or one
+            stream widened by the residual algebra.
+        """
         taps.nextn_runs += 1
         offset, tokens = taps.nextn_runs, taps.tokens
         assert tokens is not None

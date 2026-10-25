@@ -36,8 +36,24 @@ def _convolve(
 
 
 class CausalConv(nnx.Module):
-    """Depthwise causal convolution over positions, its channels named `channel`
-    (``bux.parallel``)."""
+    """Depthwise causal convolution over positions, ``conv``, and the short conv
+    inside other layers.
+
+    Each channel c of position t is ``sum_i w[i, c] x[t - (size - 1 - i) r, c]``,
+    plus a bias, for the dilation r: it sees itself and ``size - 1`` positions before
+    it, never one before its document's start. Its channels are named `channel`
+    (`bux.parallel`), which a mesh may split.
+
+    Args:
+        channels: The channels convolved, each with weights of its own.
+        size: The taps of each channel's kernel.
+        bias: Whether to add a learned bias per channel.
+        rngs: The random streams the weights start from.
+        dilation: The distance between two taps, in positions.
+        zero: Start the weights at 0, so that the conv starts as nothing.
+        channel: The name of the channels' dimension (`bux.parallel`), or None to
+            keep them whole.
+    """
 
     def __init__(
         self,
@@ -59,6 +75,13 @@ class CausalConv(nnx.Module):
     def __call__(
         self, x: Float[Array, "b t c"], taps: Taps | None = None
     ) -> Float[Array, "b t c"]:
+        """Return the convolution of x, ``b t c``: b rows of t positions, c channels.
+
+        Args:
+            x: The channels at every position.
+            taps: The forward pass's taps, for the documents in the rows; None for
+                rows of one document each.
+        """
         bias = None if self.bias is None else self.bias[...]
         return _convolve(x, self.weight[...], bias, self.dilation, taps)
 
