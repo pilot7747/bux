@@ -228,6 +228,8 @@ class Mamba2(nnx.Module):
 
     def __init__(self, config: cfg.Mamba2Config, width: int, rngs: nnx.Rngs):
         d_inner, n, g = config.expand * width, config.state_size, config.num_groups
+        if config.num_heads is not None:  # Nemotron 3 Nano: 64 heads at width 2688
+            d_inner = config.num_heads * config.head_dim
         h = d_inner // config.head_dim
         if h * config.head_dim != d_inner or h % g:
             raise ValueError(

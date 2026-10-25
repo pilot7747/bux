@@ -416,6 +416,7 @@ class Mamba2Config(StateSpaceConfig):
     type: Literal["mamba2"] = "mamba2"
     state_size: int = 128
     head_dim: int = 64
+    num_heads: int | None = None  # None -> expand * width // head_dim
     num_groups: int = 1  # groups sharing B and C, like kv heads in GQA
 
 

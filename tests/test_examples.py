@@ -138,6 +138,14 @@ SHRUNK = {
         "ssm = mamba(state_size=4)",
         "experts = moe(num_experts=4, top_k=2, expert=dense)",
     ],
+    "nemotron/nemotron_3_nano_30b_a3b.bux": [
+        "ssm = mamba2(state_size=8, head_dim=8, num_heads=6, num_groups=2)",
+        "attn = gqa(num_heads=4, num_kv_heads=2, head_dim=8)",
+        (
+            "experts = moe(num_experts=4, top_k=2, num_shared_experts=1, router=sigmoid,"
+            " load_balancing=aux_free, expert=mlp(intermediate_size=8, activation=relu2))"
+        ),
+    ],
     "nemotron/nemotron_3_ultra_550b_a55b.bux": [
         "ssm = mamba2(state_size=8, head_dim=8, num_groups=2)",
         "attn = gqa(num_heads=4, num_kv_heads=2, head_dim=8)",

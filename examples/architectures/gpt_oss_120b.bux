@@ -1,0 +1,21 @@
+# OpenAI gpt-oss-120b (2025): 36 layers of GQA, every other one in a 128-token sliding
+# window and the rest global, each head with a learned sink logit. Every layer's MoE
+# has 128 experts of 2880, 4 a token. Attention's projections have biases, and YaRN
+# stretches RoPE 32x from 4096.
+#
+# The experts here are a SwiGLU clamped at 7, which costs what gpt-oss's
+# gate * sigmoid(1.702 gate) * (up + 1) does, and they and the router have no biases.
+d_model    = 2880
+vocab_size = 201088
+
+norm    = rmsnorm(eps=1e-5)
+attn    = gqa(num_heads=64, num_kv_heads=8, head_dim=64, bias=true, sinks=true,
+              rope=rope(base=150000, scaling=yarn(factor=32, original_max_len=4096)))
+local   = attn(sliding_window_size=128)
+experts = moe(num_experts=128, top_k=4,
+              expert=gated_mlp(intermediate_size=2880, activation=swish, limit=7.0))
+
+L = [norm local] [norm experts]
+G = [norm attn] [norm experts]
+
+model = embed "LG"^18 norm head
