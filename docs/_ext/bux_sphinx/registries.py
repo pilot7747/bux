@@ -24,13 +24,17 @@ def import_all() -> None:
             continue
 
 
-def builders(registry: Mapping[str, object]) -> list[Row]:
-    """Return a row for each builder of a registry, from its docstring."""
+def builders(
+    entries: Mapping[str, object], docs: Mapping[str, str] | None = None
+) -> list[Row]:
+    """Return a row for each builder, from what it was registered with (`docs`) or
+    else its docstring. One of another library's shows no module: bux registered it."""
     rows = []
-    for name, builder in registry.items():
-        doc = inspect.getdoc(builder) or ""
+    for name, builder in entries.items():
+        module = getattr(builder, "__module__", "") or ""
+        doc = (docs or {}).get(name) or inspect.getdoc(builder) or ""
         first = doc.split("\n\n")[0].replace("\n", " ")
-        rows.append((name, getattr(builder, "__module__", "") or "", first))
+        rows.append((name, module if module.startswith("bux") else "", first))
     return rows
 
 
@@ -57,7 +61,7 @@ def registries() -> list[tuple[str, str, list[Row]]]:
         (
             f"`methods.{k}`",
             getattr(methods, k).where,
-            builders(getattr(methods, k).builders),
+            builders(getattr(methods, k).builders, getattr(methods, k).docs),
         )
         for k in kinds
     ]
@@ -68,7 +72,9 @@ def registries() -> list[tuple[str, str, list[Row]]]:
         ("Data sources", data.sources),
         ("Matmul formats", matmuls.formats),
     ]:
-        found.append((title, registry.where, builders(registry.builders)))
+        found.append(
+            (title, registry.where, builders(registry.builders, registry.docs))
+        )
     keeps = [(k, "", f"`{config_to_source(v)}`") for k, v in remat.PRESETS.items()]
     flags = [
         (k, "", " ".join(f"`{o}={v}`" for o, v in options.items()) or "XLA's defaults")

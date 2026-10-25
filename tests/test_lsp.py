@@ -57,7 +57,7 @@ def test_completes_the_settings_of_a_layer():
         if c.label == "head_dim"
     )
     assert (item.insert_text, item.detail) == ("head_dim=", "int | none = none")
-    assert item.documentation == "None -> width // num_heads"
+    assert item.documentation == "dims of each head; None -> width // num_heads"
 
 
 def test_completes_values_by_the_type_of_the_setting():
@@ -92,12 +92,19 @@ def test_hover_documents_layers_and_their_settings():
     text = hover(PRELUDE + "x = g|qa(num_heads=2, num_kv_heads=2)")
     assert text.startswith("**gqa** — layer\n\nGrouped-query attention")
     assert "- `num_kv_heads: int` (required)" in text
-    assert "- `head_dim: int | none = none` — None -> width // num_heads" in text
+    assert (
+        "- `head_dim: int | none = none` — dims of each head; None -> width // num_heads"
+        in text
+    )
     assert (
         hover(PRELUDE + "x = gqa(num_heads=2, num_kv|_heads=2)")
-        == "`num_kv_heads: int` (required)"
+        == "`num_kv_heads: int` (required) — key and value heads, each shared by a group"
+        " of query heads"
     )
-    assert hover(PRELUDE + "x = attn.num_h|eads") == "`num_heads: int` (required)"
+    assert (
+        hover(PRELUDE + "x = attn.num_h|eads")
+        == "`num_heads: int` (required) — query heads"
+    )
     # Inside its own definition a name means the builtin.
     assert hover(
         PRELUDE + "mlp = ml|p(intermediate_size=8, activation=gelu)"

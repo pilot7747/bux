@@ -82,6 +82,8 @@ def safe(value: object) -> str:
         return repr(value)
     if isinstance(value, os._Environ):
         return "os.environ"
+    if repr(value) == "<factory>":  # a dataclass field's default_factory
+        return "..."
     return getattr(value, "__name__", None) or type(value).__name__ + "(...)"
 
 

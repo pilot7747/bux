@@ -380,9 +380,9 @@ class GQAConfig(QuadraticAttentionConfig):
     ports: ClassVar[frozenset[str]] = frozenset({"v", "kv", "index"})
 
     type: Literal["gqa"] = "gqa"
-    num_heads: int
-    num_kv_heads: int
-    head_dim: int | None = None  # None -> width // num_heads
+    num_heads: int  # query heads
+    num_kv_heads: int  # key and value heads, each shared by a group of query heads
+    head_dim: int | None = None  # dims of each head; None -> width // num_heads
     # Dims of each value head; None -> head_dim (MiMo-V2: 128 against 192).
     v_head_dim: int | None = None
     # Biases on the projections of the input: q, k, v and the gate (GPT-2, Qwen2).
@@ -626,6 +626,7 @@ class Mamba2Config(StateSpaceConfig):
 
     type: Literal["mamba2"] = "mamba2"
     state_size: int = 128
+    # Channels of each head, which its state of state_size by head_dim holds.
     head_dim: int = 64
     num_groups: int = 1  # groups sharing B and C, like kv heads in GQA
 

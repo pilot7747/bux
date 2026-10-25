@@ -134,7 +134,9 @@ PRESETS = {
     "dots_attention": RematConfig(save=("dots_no_batch", *MIXERS, "experts")),
     "offload_attention": RematConfig(offload=MIXERS),
 }
-methods.remat.register("none")(jax.checkpoint_policies.everything_saveable)
+methods.remat.register("none", doc="Keep everything for the backward pass.")(
+    jax.checkpoint_policies.everything_saveable
+)
 for _name, _preset in PRESETS.items():
     methods.remat.register(_name)(keeping(_preset.save, _preset.offload))
 
@@ -142,7 +144,10 @@ for _name, _preset in PRESETS.items():
 #: (docs/parallelism/remat.md): it takes the first whose training step fits.
 CANDIDATES = ("none", "dots_attention", "dots", "save_attention", "full")
 # A forward outside a training step, which `auto` chooses for, keeps everything.
-methods.remat.register("auto")(jax.checkpoint_policies.everything_saveable)
+methods.remat.register(
+    "auto",
+    doc="The default: the first of `CANDIDATES` whose training step fits on the device.",
+)(jax.checkpoint_policies.everything_saveable)
 
 # Set while a rematerialized call traces, so that what it calls is not again.
 _REMATTED = contextvars.ContextVar("rematted", default=False)

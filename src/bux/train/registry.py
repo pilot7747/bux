@@ -41,6 +41,8 @@ class Registry[T]:
 
     Attributes:
         builders: Each builder by the tag it is registered under.
+        docs: What a builder registered with ``doc=`` does, by tag: for a builder
+            whose own docstring does not say, such as one of jax's.
 
     Example::
 
@@ -56,18 +58,25 @@ class Registry[T]:
     def __init__(self, kind: str, where: str):
         self.kind, self.where = kind, where  # what it builds, and its import path
         self.builders: dict[str, Callable[..., T]] = {}
+        self.docs: dict[str, str] = {}
 
-    def register[B: Callable[..., Any]](self, *types: str) -> Callable[[B], B]:
+    def register[B: Callable[..., Any]](
+        self, *types: str, doc: str | None = None
+    ) -> Callable[[B], B]:
         """Return a decorator that registers a builder under each of `types`,
         replacing what was there, and returns the builder as it is.
 
         Args:
             *types: The tags it builds from.
+            doc: What the builder does under these tags, where its own docstring
+                does not say; the registries' reference shows it.
         """
 
         def decorate(builder: B) -> B:
             for t in types:
                 self.builders[t] = builder
+                if doc is not None:
+                    self.docs[t] = doc
             return builder
 
         return decorate
