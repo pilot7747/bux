@@ -201,7 +201,7 @@ bux plan  examples/experiments/smoke.bux 'optimizer.lr = 1e-3 | 3e-3'  # and swe
 - Each statement is one argument: `name=value` needs no quotes, and anything with
   spaces does. A statement must contain `=` or start with `use `.
 - A module used on the command line goes above the file, so it replaces the file's
-  own definitions: `'use fineweb_wsd'` gives the smoke test the recipe's data,
+  own definitions: `'use fineweb_wsd'` gives the smoke run the recipe's data,
   optimizer, schedule and steps.
 - Errors in them point at `<command line>`:
 
@@ -249,23 +249,14 @@ What a file is depends on what it defines:
 | no `model` and no `d_model`, such as a recipe | a module | `check`, and `use` from other files |
 
 - **A file is a run once it sets any training setting**, and then it needs all the
-  required ones: `data`, `optimizer`, `seq_len`, `batch` and `steps`.
-
-  ```text
-  error: this file sets how to train, so it is a run, and a run needs data, seq_len, batch and steps
-  hint: data = text(path="data/fineweb/*.parquet")
-  ```
-
+  required ones: `data`, `optimizer`, `seq_len`, `batch` and `steps`. A missing one
+  is an error that names it and suggests a value.
 - **A module is checked on its own.** Its settings are checked against their types,
-  but a run needs a model, so `bux check` only lists what it defines:
-
-  ```console
-  $ bux check examples/experiments/recipes/fineweb_wsd.bux
-  a module: it defines tokenizer, web, code, data, packing, optimizer, schedule, loss, seq_len, batch, budget, steps, eval, checkpoint, and no model
-  ```
-
+  but a run needs a model, so `bux check` only lists what it defines.
 - **An architecture does not train**: `bux plan`, `bux train` and `bux launch` say
   `this file does not say how to train its model`. Add a recipe from the command
   line to train it: `bux train model.bux 'use fineweb_wsd'`.
 
-Every training setting and its default is in [Training settings](../training/settings.md).
+[What is required](../training/settings.md#what-is-required) shows the error and what
+`bux check` says of a module, and [Settings](../training/settings.md) lists every
+training setting and its default.

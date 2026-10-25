@@ -97,8 +97,12 @@ model and at its end before the first head. Each is a number of branches, or a s
 of them, rounded up (`last=0.15`).
 
 A branch here is a `[...]` inside no other, so a Llama-style block,
-`[norm attn] [norm ffn]`, is two. A scanned repeat scans apart the passes that
-multiply alike; a pipelined one must multiply alike throughout.
+`[norm attn] [norm ffn]`, is two. Where `first` or `last` falls inside a repeat:
+
+- a scanned repeat (`methods(repeat=scan)`) is split into runs of passes that
+  multiply alike, each scanned on its own;
+- a pipelined repeat must multiply alike in every pass, so keep `first` and `last`
+  in the repeats before or after it.
 
 ## Passes
 
@@ -138,11 +142,12 @@ NVIDIA's NVFP4 recipe does; with `passes=[]` all of it does.
 
 ## Recipes
 
-A recipe is a module in `examples/experiments/recipes/` that sets `precision`, which a
-run uses by name and amends:
+A precision recipe is a module in `examples/experiments/recipes/` that sets only
+`precision`. A run uses it by name next to a training recipe, and amends it:
 
 ```bux
 use llama3_8b
+use fineweb_wsd
 use nvidia_nvfp4
 precision.last = 4 | 8
 ```

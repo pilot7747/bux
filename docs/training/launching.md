@@ -1,10 +1,10 @@
 # Launching
 
-`bux launch` trains an experiment to its end, however often it is stopped and started
-again. It is the entrypoint for production, and the Docker image's. This page covers
-how it gives runs GPUs, what it records, how it stops, array jobs, many hosts, and
-resuming. `bux train` ([Running](running.md)) trains in its own process, which suits
-a laptop and a debugger.
+`bux launch` trains a file's runs to their end, however often it is stopped and
+started again. It is the command for a cluster, and the Docker image's entrypoint.
+This page covers how it gives runs GPUs, what it records, how it stops, array jobs,
+many hosts, and resuming. `bux train` ([Running](running.md)) trains in its own
+process, which suits a laptop and a debugger.
 
 ```sh
 bux launch examples/experiments/attention_ablation.bux             # all 6 runs, a GPU each
@@ -19,7 +19,7 @@ bux launch examples/experiments/attention_ablation.bux --index 3   # the fourth,
 | Runs of a sweep | one after another, in this process | side by side, a worker process each, on GPUs of its own |
 | A run that is done | trained again | skipped |
 | Its status | none | `status.json` in its directory |
-| SIGTERM, Ctrl-C | stop at once | stop after the step, saving it |
+| SIGTERM, Ctrl-C | stop at once, losing the step | stop after the step, saving it with a `checkpoint` setting |
 | A failed run | stops the command | leaves the others training |
 | Many hosts | no | a run alone, under `srun`, `mpirun` or `JAX_*` |
 

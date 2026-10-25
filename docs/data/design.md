@@ -22,15 +22,10 @@ A document's key is a hash of its content, not of where it is. So:
 ## Positions, not segment ids
 
 Resetting positions at every document carries the segments and the positions RoPE
-needs in one array. The model makes the rest from them once per forward pass
-({py:class}`~bux.architecture.common.segments.Segments`):
-
-- a document id per token, the segment ids that splash and Pallas flash attention
-  take in place of a t by t mask;
-- how far each token is into its document, where convolutions and the loss stop;
-- where each query's first key is, for kernels that take that (tokamax's).
-
-The `cu_seqlens` of varlen kernels are where the ids change.
+needs in one array. Everything else a kernel or a layer needs, document ids, how far
+each token is into its document, where each query's first key is, the model makes
+from them once per forward pass, none of it t × t
+([Documents stay apart](packing.md#documents-stay-apart)).
 
 ## Packings considered
 

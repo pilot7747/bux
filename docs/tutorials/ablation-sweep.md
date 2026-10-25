@@ -323,6 +323,7 @@ definition, and everything written in terms of that name follows.
 | `s: a \| m: b` twice             | one axis: the labels pick them together            |
 | `bux plan`, `bux launch`         | the runs and their sizes; train what is left of them |
 
-See [Modules](../language/modules.md) and [Sweeps](../language/sweeps.md) for the
-rules, and [Launching](../training/launching.md) for sweeps on GPUs, array jobs and
-clusters.
+Next, [your own data](your-own-data.md) replaces the random tokens with text that can
+be learned. See [Modules](../language/modules.md) and [Sweeps](../language/sweeps.md)
+for the rules, and [Launching](../training/launching.md) for sweeps on GPUs, array
+jobs and clusters.

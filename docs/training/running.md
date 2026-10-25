@@ -59,9 +59,9 @@ metrics = train(run, "runs")  # {'loss': 6.2854, 'grad_norm': 0.3948, ...}
 
 ## The run directory
 
-A run writes to `<out>/<name>-<id>/`: its name, each run of characters other than
-letters, digits and `_.=+-` made one `_`, then its id. `smoke[optimizer.lr=1e-3]` goes
-to `runs/smoke_optimizer.lr=1e-3-e3a8d2164a/`.
+A run writes to `<out>/<name>-<id>/`: its name, with each stretch of characters other
+than letters, digits and `_.=+-` made one `_` and any `_` at the ends dropped, then its
+id. `smoke[optimizer.lr=1e-3]` goes to `runs/smoke_optimizer.lr=1e-3-e3a8d2164a/`.
 
 | File | What it holds | Written by |
 |------|---------------|------------|
@@ -199,10 +199,14 @@ So a new layer counts with no formula of its own.
 
 **Attention counts only the keys each query sees**, as Megatron's MFU does and a flash
 kernel computes. Its products over the keys of a row are counted apart (inside
-`flops.attention`), and each step counts them at the keys its batch's queries see,
-from the batch's positions ({py:meth}`bux.train.flops.Work.of`, on the host): those of
-the query's own document up to itself, within the window, and of those no more than a
-sparse attention's `top_k`. So:
+`flops.attention`). Each step then counts them from its batch's positions
+({py:meth}`bux.train.flops.Work.of`, on the host), at the keys a query sees:
+
+- keys of the query's own document, up to the query itself;
+- of those, the ones within the window, for a sliding window;
+- of those, no more than a sparse attention's `top_k`.
+
+So:
 
 - causal attention on rows of one document counts (t + 1) / 2t of its t × t logits;
 - packed documents count each one's own triangle;
@@ -213,8 +217,9 @@ sparse attention's `top_k`. So:
 On many hosts a step counts the keys of the rows its host reads. PaLM's MFU counts
 attention whole, which made bux's 10% higher at 4096 tokens a row.
 
-`bux plan` shows the FLOPs a token on rows of one document: 6.9G for a Llama-style
-1.3B at 4096 tokens a row, 6 N of its matrices and 0.8G of attention.
+`bux plan` shows the FLOPs a token on rows of one document: 6.91B for the Llama-style
+1.3B of `examples/benchmarks/baseline.bux` at 4096 tokens a row, 6 N of its matrices
+and 0.8B of attention.
 
 ## Eval
 
@@ -248,8 +253,9 @@ checkpoint = checkpoint(every=500, keep=2)
 
 {bux}`checkpoint` saves the model's state and the optimizer's under the run's
 `checkpoints/`, every `every` steps (1000 by default) and at the last, keeping the
-`keep` most recent (2). Under `bux launch` a run that stops early also saves the step
-it stopped at.
+`keep` most recent (2). Under `bux launch` a run that a signal stops also saves the
+step it stopped at; under `bux train`, Ctrl-C loses the steps since the latest save
+([Signals](launching.md#signals)).
 
 A checkpoint holds everything a run needs to go on as if it had not stopped: the
 model's state (its parameters and buffers, random keys and an MoE's router bias with

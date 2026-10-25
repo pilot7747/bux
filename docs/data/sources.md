@@ -213,13 +213,14 @@ A mixture is a weighted sum of sources. `+` mixes and `*` weights:
 
 ### Determinism
 
-Every source is read in order, epoch after epoch: a prepared dataset's row groups, or
-a `tokens` source's windows, each epoch in a new order drawn from the run's seed.
+Each source is an endless stream of rows, epoch after epoch, each epoch in a new order
+drawn from the run's seed ([Reading prepared data](pipeline.md#reading-prepared-data)
+says how each kind orders its rows, and how many processes each read only their own).
 Batch `i` holds rows `i·n` to `(i + 1)·n` of each source's stream, `n` its share of
-the batch. So batch `i` of a run depends only on its seed and `i`, and a run that
-resumes at step `i` reads exactly what it would have read had it never stopped
-([Resuming](../training/launching.md#resuming)). An eval's batches are drawn from a
-stream of their own, independently of training's, and are the same at every eval.
+the batch. So:
 
-How a source reads its rows, and how many processes each read only their own, is in
-[Reading prepared data](pipeline.md#reading-prepared-data).
+- batch `i` of a run depends only on its seed and `i`;
+- a run that resumes at step `i` reads exactly what it would have read had it never
+  stopped ([Resuming](../training/launching.md#resuming));
+- an eval's batches are drawn from a stream of their own, independently of
+  training's, and are the same at every eval.
