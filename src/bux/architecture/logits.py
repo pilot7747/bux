@@ -1,25 +1,26 @@
-"""A head's output, and the two ways the loss takes its logits: `methods.loss`.
+"""A head's output, and the two ways the loss takes its logits: ``methods.loss``.
 
-A head leaves the objective its input and its projection (``HeadOutput``) rather
-than its logits, and the loss takes what it needs of them (``HeadOutput.sums``): the
-sums over positions of the cross-entropy, log Z minus the target's logit, and of log
-Z squared, each position weighted, by the run's method:
+A head leaves the objective its input and its projection (`HeadOutput`) rather than
+its logits, and the loss takes what it needs of them (`HeadOutput.sums`): the sums
+over positions of the cross-entropy, ``log Z`` minus the target's logit, and of
+``log Z`` squared, each position weighted, by the run's method:
 
-    chunks   the matmul, the logsumexp and the target's logit a chunk of positions at
-             a time, in float32, as Liger's and Apple's Cut Cross-Entropy do, and the
-             chunk's gradients with them, so that the backward only scales those: the
-             default
-    logits   one matmul for all positions, the logits whole in the stream's dtype
+- ``chunks``, the default (`by_chunks`): the matmul, the logsumexp and the target's
+  logit a chunk of positions at a time, in float32, as Liger's and Apple's Cut
+  Cross-Entropy do, and the chunk's gradients with them, so that the backward only
+  scales those.
+- ``logits`` (`by_logits`): one matmul for all positions, the logits whole in the
+  stream's dtype.
 
 At a vocabulary of 128K, the float32 logits of 8 rows of 4096 tokens take 16 GB, and
 their gradient as much again; by chunks, each device takes its own positions in
-chunks of at most `CHUNK_BYTES` of logits, which split over `vocab` as whole logits
+chunks of at most `CHUNK_BYTES` of logits, which split over ``vocab`` as whole logits
 would, and adds up its share of the head's gradient in float32, which the mesh
 reduces once, after the last chunk. A sum is linear in the positions' terms, so its
-gradient is known before the backward, but for one factor, the sum's cotangent:
-each sum keeps its own gradient, and `z` costs a second one. Another method is a
+gradient is known before the backward, but for one factor, the sum's cotangent: each
+sum keeps its own gradient, and the z-loss costs a second one. Another method is a
 function of the head's output, the targets, their weights and whether to sum the
-z-loss, that returns their `Sums`:
+z-loss, that returns their `Sums`::
 
     @methods.loss.register("mine")
     def _(head: HeadOutput, targets: Int[Array, "b t"], weights, z: bool) -> Sums: ...
@@ -38,16 +39,22 @@ from jaxtyping import Array, Bool, Float, Int, Shaped
 from bux import parallel
 from bux.parallel import methods
 
-CHUNK_BYTES = 2**31  # of float32 logits that a device makes at once
+#: The most bytes of float32 logits a device makes at once by ``chunks``, 2 GiB.
+CHUNK_BYTES = 2**31
 
 
 class Projection(NamedTuple):
-    """A head's map from the stream to logits, softcap(x W + b), from a matmul in the
-    stream's dtype accumulated in float32. A tied head's W is the embedding's table,
-    transposed. The softcap is an array, so that jax's transforms pass it through."""
+    """A head's map from the stream to logits, ``softcap(x W + b)``, from a matmul in
+    the stream's dtype accumulated in float32. A tied head's W is the embedding's
+    table, transposed. The softcap is an array, so that jax's transforms pass it
+    through.
+    """
 
+    #: W, of the width by the vocabulary.
     kernel: Float[Array, "d vocab"]
+    #: b, or None for a head without one.
     bias: Float[Array, " vocab"] | None
+    #: The cap of ``cap * tanh(logits / cap)``, or None for none.
     softcap: Float[Array, ""] | None
 
     def __call__(
@@ -76,19 +83,22 @@ class Projection(NamedTuple):
 
 
 class Sums(NamedTuple):
-    """A head's sums over positions, each weighted: of the cross-entropy, log Z minus
-    the target's logit, and of log Z squared, the z-loss; 0 where not asked for."""
+    """A head's sums over positions, each weighted: of the cross-entropy, ``log Z``
+    minus the target's logit, and of ``log Z`` squared, the z-loss; 0 where not asked
+    for.
+    """
 
-    ce: Float[Array, ""]
-    z: Float[Array, ""]
+    ce: Float[Array, ""]  #: The cross-entropy's sum.
+    z: Float[Array, ""]  #: The z-loss's sum.
 
 
 class Scores(NamedTuple):
     """What the cross-entropy and the z-loss take of the logits at each position:
-    log Z, the log of the softmax's normalizer, and the target's logit."""
+    ``log Z``, the log of the softmax's normalizer, and the target's logit.
+    """
 
-    lse: Float[Array, "*n"]
-    target: Float[Array, "*n"]
+    lse: Float[Array, "*n"]  #: ``log Z`` at each position.
+    target: Float[Array, "*n"]  #: The target's logit at each position.
 
     @classmethod
     def of(
@@ -118,10 +128,15 @@ class Scores(NamedTuple):
 
 
 class HeadOutput(NamedTuple):
-    """What a head leaves the objective: the stream it reads, and its projection."""
+    """What a head leaves the objective: the stream it reads, and its projection.
 
-    hidden: Float[Array, "b t d"]
-    projection: Projection
+    The objective takes the loss of it by `sums`, which never needs the logits whole
+    under ``methods.loss = chunks``; `logits` makes them all, for evaluation and
+    sampling.
+    """
+
+    hidden: Float[Array, "b t d"]  #: The stream the head reads.
+    projection: Projection  #: The head's map from the stream to logits.
 
     def logits(self) -> Float[Array, "b t vocab"]:
         """Return the logits, all at once, in the stream's dtype."""
@@ -131,8 +146,18 @@ class HeadOutput(NamedTuple):
     def sums(
         self, targets: Int[Array, "b t"], weights: Float[Array, "b t"], z: bool
     ) -> Sums:
-        """Return the sums of `targets`, each position by its weight, and the
-        z-loss's if `z`, by `methods.loss`."""
+        """Return the weighted sums of the cross-entropy of `targets`, and of the
+        z-loss if `z`, by the run's ``methods.loss``.
+
+        Args:
+            targets: The token each position predicts.
+            weights: What each position's terms count for: 0 for a position that
+                predicts nothing.
+            z: Whether to sum the z-loss too.
+
+        Returns:
+            The sums; ``z`` is 0 unless asked for.
+        """
         return parallel.method("loss")(self, targets, weights, z)
 
 
@@ -140,8 +165,8 @@ class HeadOutput(NamedTuple):
 def by_logits(
     head: HeadOutput, targets: Int[Array, "b t"], weights: Float[Array, "b t"], z: bool
 ) -> Sums:
-    """Sum the scores of the head's logits made whole, as a term that reads them
-    makes them."""
+    """``methods.loss = logits``: sum the scores of the head's logits made whole, in
+    the stream's dtype, as a term that reads them makes them."""
     return Scores.of(head.logits(), targets).sums(weights, z)
 
 
@@ -149,7 +174,9 @@ def by_logits(
 def by_chunks(
     head: HeadOutput, targets: Int[Array, "b t"], weights: Float[Array, "b t"], z: bool
 ) -> Sums:
-    """Sum the scores of a chunk of each device's positions at a time."""
+    """``methods.loss = chunks``, the default: sum the scores of a chunk of each
+    device's positions at a time, in float32, their gradients made with them, so that
+    the logits are never whole."""
     return _sums(head.projection, head.hidden, targets, weights, z)
 
 
@@ -167,8 +194,8 @@ def _is_target(
 
 
 class Chunks(NamedTuple):
-    """How a (b, t) of positions splits: `rows` and `seq` ways over the mesh, as
-    `batch` and `seq` split them, then each device's into `count` chunks."""
+    """How a ``(b, t)`` of positions splits: `rows` and `seq` ways over the mesh, as
+    ``batch`` and ``seq`` split them, then each device's into `count` chunks."""
 
     rows: int
     seq: int

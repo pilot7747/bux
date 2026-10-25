@@ -1,25 +1,96 @@
-"""Reference Flax NNX backend: turns an Architecture into a runnable nnx.Module.
+"""The reference Flax NNX backend: an architecture, compiled from ``.bux``, built into
+a runnable `flax.nnx.Module`.
 
-Every IR node kind maps to one small module (``graph``), and a residual branch outside
-any other is the residual algebra's (``residual``). Repeats are unrolled, or stacked
-and scanned, and pipelined over the mesh's stages (``repeats``). Layers come from a
-registry keyed by config type (``registry``), and each family of them is a package:
-``attention``, ``recurrent`` (linear attention and SSMs), ``experts`` (MoE) and
-``layers``, the rest. They are made of ``common``'s pieces, and multiply in the
-formats of ``precision``. A builder registered for a type replaces the one before it,
-so another implementation, a fused kernel say, plugs in the same way:
+`bux.lang` compiles a ``.bux`` file to a typed IR, an `~bux.lang.ir.Architecture`, and
+this package builds it into a model: `~bux.architecture.model.Model`, from tokens to
+logits, made of one small module for each node of the IR's graph. The trainer
+(`bux.train`) builds its models here, and so can a script or a notebook. It is also
+where a new layer goes: a module, and a builder registered for its config's type.
+
+Example:
+    Build a model of two pre-norm blocks and run it on a batch of tokens::
+
+        import jax.numpy as jnp
+        from flax import nnx
+
+        from bux.architecture import Model, num_params
+        from bux.lang import compile
+
+        arch = compile('''
+        d_model    = 64
+        vocab_size = 256
+        attn  = gqa(num_heads=4, num_kv_heads=2, rope=rope())
+        ffn   = gated_mlp(intermediate_size=128, activation=swish)
+        model = embed ([rmsnorm attn] [rmsnorm ffn])^2 rmsnorm head
+        ''')
+        model = Model(arch, rngs=nnx.Rngs(0))
+        logits = model(jnp.zeros((2, 16), jnp.int32))  # (2, 16, 256)
+        num_params(model)  # 106816
+
+.. rubric:: How a model is built
+
+- `~bux.architecture.graph.build_node` builds the IR's graph, one module per node
+  kind (`~bux.architecture.graph`). Nodes with the same share key (``shared`` in
+  ``.bux``) are built once and reused.
+- A layer is built by the builder registered for its config's ``type``
+  (`~bux.architecture.registry`).
+- A residual branch ``[f]`` outside any other is the residual algebra's, if the
+  architecture sets one (`~bux.architecture.residual`); otherwise, and inside
+  another branch, it is ``x + f(x)``.
+- A repeat ``f^n`` is built by the run's ``methods.repeat``: unrolled, or stacked
+  and scanned, and pipelined over the mesh's stages; each residual branch outside
+  any other is rematerialized as ``methods.remat`` says (`~bux.architecture.repeats`).
+
+.. rubric:: The layers
+
+Each family of layers is a package, made of `~bux.architecture.common`'s pieces, and
+its projections multiply in the formats of `~bux.architecture.precision`:
+
+- `~bux.architecture.attention`: softmax attention, ``gqa``, ``mla`` and ``csa``, and
+  the sparse attention indexer;
+- `~bux.architecture.recurrent`: linear attention (``gla``, ``deltanet``, ``gdn``,
+  ``kda``, ``lightning``, ``rwkv7``) and state space models (``mamba``, ``mamba2``,
+  ``short_conv``);
+- `~bux.architecture.experts`: the mixture of experts, ``moe``, and its grouped
+  matmuls;
+- `~bux.architecture.layers`: the rest, norms, MLPs, the causal conv, the embedding,
+  the head, ``nextn``, ``engram``, and ``linear``, ``act``, ``scale`` and
+  ``dropout``.
+
+The language reference documents every layer's settings
+(:doc:`/reference/language/layers`), and each layer's class what it computes.
+
+.. rubric:: Calling a module
+
+Every module is called as ``module(x, taps)``: `x` is the stream (the token ids, for
+the embedding) and `taps` the `~bux.architecture.registry.Taps` of the forward pass.
+Taps hold the stacks that ``@name`` pushes to and ``$name`` reads, and as attributes
+the pass's input tokens, the documents packed into its rows
+(`~bux.architecture.registry.segments`, `~bux.architecture.registry.positions`), the
+output of every head run so far, and, in a training step
+(`~bux.architecture.registry.training`), the losses layers add to the objective
+(`~bux.architecture.registry.report`).
+
+.. rubric:: Adding a layer
+
+A builder registered for a config's ``type`` makes its module, and replaces the one
+registered before it, so another implementation of a layer, a fused kernel say,
+plugs in the same way as a new one::
+
+    from bux.architecture import Context, register
+
 
     @register("gdn")
     def _(config: GatedDeltaNetConfig, width: int, ports: tuple[Port, ...], ctx: Context):
         return MyGatedDeltaNet(config, width, rngs=ctx.rngs)
 
-Modules are called as ``module(x, taps)``. ``Taps`` holds one forward pass's tap
-stacks, and as attributes its input tokens and their documents (``segments(taps)``),
-the output of every head run so far, and in a training step the losses layers add
-(``report``). Nodes with a share key are built once and reused.
+See `~bux.architecture.registry.register` and :doc:`/architectures/adding-a-layer`.
+
+.. rubric:: Shapes
 
 Arrays say their dtype and shape with jaxtyping, as ``x: Float[Array, "b t d"]`` for a
-stream of b rows of t positions, d wide, and the tests check them on every call.
+stream of b rows of t positions, d wide, and the tests check them on every call. A
+stream widened by a residual algebra is ``b t n d``: n copies of it.
 """
 
 # Importing the layer modules registers their layers.

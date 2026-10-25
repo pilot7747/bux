@@ -136,8 +136,6 @@ class Llama3RoPEScalingConfig(Config):
 
 
 #: The RoPE scalings, `pi`, `yarn` and `llama3`, by their ``type``.
-#:
-#: :meta hide-value:
 RoPEScalingConfig = Annotated[
     PositionInterpolationConfig | YaRNConfig | Llama3RoPEScalingConfig,
     Field(discriminator="type"),
@@ -867,9 +865,7 @@ class MergeConfig(Config):
 
 
 #: The residual algebras, `hc`, `mhc`, `gr`, `attnres` and `vpgate`, by their
-#: ``type``: the values of the top-level ``residual`` setting.
-#:
-#: :meta hide-value:
+#: ``type``, the values of the top-level ``residual`` setting.
 ResidualConfig = Annotated[
     HyperConnectionsConfig
     | GatedResidualConfig
@@ -879,10 +875,8 @@ ResidualConfig = Annotated[
 ]
 
 
-#: Every layer's config, by its ``type``: what an ``ir.Layer`` holds, and what the
-#: compiler knows layer names from.
-#:
-#: :meta hide-value:
+#: Every layer's config, by its ``type``. An ``ir.Layer`` holds one, and the
+#: compiler knows layer names from it.
 LayerConfig = Annotated[
     NormalizationConfig
     | DyTConfig
@@ -914,8 +908,6 @@ LayerConfig = Annotated[
 ]
 
 #: Configs that parametrize a layer or the model but are not layers themselves.
-#:
-#: :meta hide-value:
 SubConfig = Annotated[
     RoPEConfig
     | PositionInterpolationConfig

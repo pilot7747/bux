@@ -1,10 +1,20 @@
-"""The graph side: one small module per IR node kind, assembled by ``build_node``.
+"""The graph side: one small module per IR node kind, assembled by `build_node`.
 
-A residual branch [f] adds f(x) to the stream x. The architecture's residual algebra,
-if it sets one, replaces that for a branch outside any other (``residual``); a branch
-inside another is always the plain x + f(x). A repeat is built by the run's `repeat`
-method (``repeat``), and each branch outside any other is rematerialized as the run's
-`remat` says (``remat``).
+- ``ir.Seq``, composition: `Sequence`, the items one after another.
+- ``ir.Residual``, ``[f]``: `ResidualBranch`, ``x + f(x)``; or the residual
+  algebra's branch, if the architecture sets one and the branch is outside any
+  other (`bux.architecture.residual`). A branch inside another is always the plain
+  ``x + f(x)``.
+- ``ir.Sum`` and ``ir.Prod``, ``f + g`` and ``f * g``: `Parallel`.
+- ``ir.Neg``, ``ir.Const`` and ``ir.Identity``: `Negate`, `Constant` and `Identity`.
+- ``ir.Tap`` and ``ir.Ref``, ``@name`` and ``$name``: `TapWrite` and `TapRead`.
+- ``ir.Repeat``, ``f^n``: what the run's ``methods.repeat`` builds
+  (`bux.architecture.repeats.repeat`).
+- ``ir.Layer``: what the builder registered for its config's type builds
+  (`bux.architecture.registry`).
+
+Each residual branch outside any other is rematerialized as the run's
+``methods.remat`` says (`bux.architecture.repeats.remat`).
 """
 
 import functools
@@ -23,9 +33,18 @@ from bux.parallel import shard_stream
 
 
 class Sequence(nnx.Module):
-    """Run the items one after another. Those that are `branches` outside any other
-    are numbered, for the precision's first and last (``tracing.branch``), and
-    rematerialized as the run's `remat` says (``remat.rematted``)."""
+    """Run the items one after another: ``f g`` is ``g(f(x))``.
+
+    Those that are residual branches outside any other are numbered, for the
+    precision's first and last (`~bux.architecture.repeats.tracing.branch`), and
+    rematerialized as the run's ``methods.remat`` says
+    (`~bux.architecture.repeats.remat.rematted`).
+
+    Args:
+        items: The modules, in the order they run.
+        branches: For each item, whether it is a residual branch outside any other;
+            none of them, by default.
+    """
 
     def __init__(self, items: list[nnx.Module], branches: tuple[bool, ...] = ()):
         self.items = nnx.List(items)
@@ -44,6 +63,9 @@ def run_branch(item: nnx.Module, x: Stream, taps: Taps) -> Stream:
 
 
 class ResidualBranch(nnx.Module):
+    """``[f]``, the plain residual branch: ``x + f(x)``, the sum split as the stream
+    is (`bux.parallel.shard_stream`)."""
+
     def __init__(self, body: nnx.Module):
         self.body = body
 
@@ -52,6 +74,9 @@ class ResidualBranch(nnx.Module):
 
 
 class Parallel(nnx.Module):
+    """Branches on the same input, their outputs summed (``op="sum"``, ``f + g``) or
+    multiplied (``"prod"``, ``f * g``), left to right."""
+
     def __init__(self, branches: list[nnx.Module], op: str):
         self.branches = nnx.List(branches)
         self.op = op
@@ -64,6 +89,8 @@ class Parallel(nnx.Module):
 
 
 class Negate(nnx.Module):
+    """``-f``: the body's output, negated."""
+
     def __init__(self, body: nnx.Module):
         self.body = body
 
@@ -72,6 +99,8 @@ class Negate(nnx.Module):
 
 
 class Constant(nnx.Module):
+    """A number, as a scalar of the stream's dtype: the 0.5 of ``f * 0.5``."""
+
     def __init__(self, value: float):
         self.value = value
 
@@ -80,11 +109,15 @@ class Constant(nnx.Module):
 
 
 class Identity(nnx.Module):
+    """``_``: the stream, unchanged."""
+
     def __call__(self, x: Stream, taps: Taps) -> Stream:
         return x
 
 
 class TapWrite(nnx.Module):
+    """``@name``: push the stream onto the tap `name`, and pass it on."""
+
     def __init__(self, name: str):
         self.name = name
 
@@ -94,6 +127,9 @@ class TapWrite(nnx.Module):
 
 
 class TapRead(nnx.Module):
+    """``$name``: the top of the tap `name`, in place of the stream; with `pop`
+    (``$name!``), taken off it."""
+
     def __init__(self, name: str, pop: bool):
         self.name = name
         self.pop = pop
@@ -104,7 +140,16 @@ class TapRead(nnx.Module):
 
 
 def build_node(node: ir.Node, ctx: Context) -> nnx.Module:
-    """Build the module for `node`; a node with a share key is built once and reused."""
+    """Build the module for `node`; a node with a share key is built once and reused.
+
+    Args:
+        node: A node of an architecture's graph, and with it everything under it.
+        ctx: The build's context, which carries what the nodes built so far leave
+            for later ones.
+
+    Returns:
+        The node's module, called as ``module(x, taps)``.
+    """
     if node.share is None:
         return _build(node, ctx)
     if node.share not in ctx.shared:
