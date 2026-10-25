@@ -157,7 +157,7 @@ use llama3_8b
 
 attn.num_kv_heads = 1          # multi-query attention
 attn.rope.base    = 1e6        # dotted keys reach into nested settings
-ffn = ffn(intermediate_size=2048)   # the same, written as a definition
+ffn = ffn(intermediate_size=2048)   # as ffn.intermediate_size = 2048 would
 ```
 
 The rules:
