@@ -6,21 +6,16 @@ Every call checks the file again with ``bux.lang.check``, which takes millisecon
 a model file.
 """
 
-import inspect
 import itertools
 import re
-import types
 import typing
 from collections import Counter
 from collections.abc import Iterator
 from dataclasses import dataclass, field, replace
-from functools import cache
 from pathlib import Path
 
-from pydantic.fields import FieldInfo
-
 from bux import config as cfg
-from bux.lang import ir
+from bux.lang import ir, reference
 from bux.lang import syntax as ast
 from bux.lang.compiler import ACTIVATIONS, LAYERS, TYPES, check
 from bux.lang.printer import config_to_source, field_order, value_to_source
@@ -70,113 +65,6 @@ def diagnostics(source: str, path: str | None = None) -> list[Diagnostic]:
             span = via
         out.append(Diagnostic(span.start, span.end, message))
     return out
-
-
-# --- What the configs say about themselves ----------------------------------------
-
-_FIELD = re.compile(r"\s+(\w+)\s*:[^#]*?(?:#\s*(.*))?$")
-
-
-@cache
-def _notes(cls: type[cfg.Config]) -> dict[str, str]:
-    """Return each field's comment in bux/config.py, which documents it."""
-    notes: dict[str, str] = {}
-    for klass in reversed(cls.__mro__):
-        if not (isinstance(klass, type) and issubclass(klass, cfg.Config)):
-            continue
-        try:
-            lines = inspect.getsource(klass).splitlines()[1:]
-        except OSError, TypeError:
-            continue
-        above: list[str] = []
-        for line in lines:
-            text = line.strip()
-            if text.startswith("#"):
-                above.append(text.lstrip("#").strip())
-                continue
-            m = _FIELD.match(line)
-            note = " ".join([*above, m.group(2) or ""]).strip() if m else ""
-            if m and note and m.group(1) in klass.model_fields:
-                notes[m.group(1)] = note
-            above = []
-    return notes
-
-
-def _members(annotation: object) -> list[object]:
-    """Return a union's members, with Annotated unwrapped."""
-    origin = typing.get_origin(annotation)
-    if origin is typing.Annotated:
-        return _members(typing.get_args(annotation)[0])
-    if origin in (typing.Union, types.UnionType):
-        return [m for a in typing.get_args(annotation) for m in _members(a)]
-    return [annotation]
-
-
-def _config_classes(annotation: object) -> list[type[cfg.Config]]:
-    return [
-        m
-        for m in _members(annotation)
-        if isinstance(m, type) and issubclass(m, cfg.Config)
-    ]
-
-
-def _tags(cls: type[cfg.Config]) -> tuple[str, ...]:
-    tag = cls.model_fields.get("type")
-    return typing.get_args(tag.annotation) if tag is not None else ()
-
-
-def _type(annotation: object) -> str:
-    """Write a field's type as its values are written: int | none, relu | gelu, rope."""
-    parts = []
-    for m in _members(annotation):
-        if typing.get_origin(m) is typing.Literal:
-            parts += [str(a) for a in typing.get_args(m)]
-        elif m is type(None):
-            parts.append("none")
-        elif isinstance(m, type) and issubclass(m, cfg.Config):
-            parts += _tags(m) or [m.__name__]
-        else:
-            parts.append(getattr(m, "__name__", str(m)))
-    return " | ".join(parts)
-
-
-def _default(f: FieldInfo) -> str:
-    return value_to_source(f.get_default(call_default_factory=True))
-
-
-def _field_doc(cls: type[cfg.Config], name: str) -> str:
-    f = cls.model_fields[name]
-    text = f"`{name}: {_type(f.annotation)}"
-    text += "` (required)" if f.is_required() else f" = {_default(f)}`"
-    if note := _notes(cls).get(name):
-        text += f" — {note}"
-    return text
-
-
-def _summary(cls: type[cfg.Config]) -> str:
-    doc = cls.__dict__.get("__doc__")
-    return inspect.cleandoc(doc).split("\n")[0] if doc else ""
-
-
-@cache
-def _type_doc(name: str) -> str:
-    cls = TYPES[name]
-    parts = [f"**{name}** — {'layer' if name in LAYERS else 'setting'}"]
-    if doc := cls.__dict__.get("__doc__"):
-        parts.append(inspect.cleandoc(doc))
-    if fields := [f for f in field_order(cls) if f != "type"]:
-        parts.append("\n".join(f"- {_field_doc(cls, f)}" for f in fields))
-    if cls.ports and "Ports" not in (doc or ""):
-        parts.append("Ports: " + ", ".join(f"`{p}`" for p in sorted(cls.ports)))
-    return "\n\n".join(parts)
-
-
-def _activation_doc(name: str) -> str:
-    return (
-        f"**{name}** — activation\n\nA layer that applies it elementwise "
-        f"(`linear(features=h) {name}`), or a value for settings such as "
-        f"`activation={name}`."
-    )
 
 
 # --- The file, indexed ---------------------------------------------------------------
@@ -241,7 +129,7 @@ class _Index:
         cls = self.config_class(callee, inside)
         for part in key:
             f = cls.model_fields.get(part) if cls is not None else None
-            classes = _config_classes(f.annotation) if f is not None else []
+            classes = reference.config_classes(f.annotation) if f is not None else []
             cls = classes[0] if len(classes) == 1 else None
         return cls
 
@@ -345,7 +233,7 @@ def _expr_class(
         case ast.Attr(base=base, field=name):
             cls = _expr_class(ix, base, inside)
             f = cls.model_fields.get(name) if cls is not None else None
-            classes = _config_classes(f.annotation) if f is not None else []
+            classes = reference.config_classes(f.annotation) if f is not None else []
             return classes[0] if len(classes) == 1 else None
     return None
 
@@ -380,9 +268,9 @@ def _hover_text(ix: _Index, what: tuple) -> str | None:
                 case "definition":
                     return _definition_doc(ix, ix.defs[name])
                 case "type":
-                    return _type_doc(name)
+                    return reference.type_doc(name)
                 case "activation":
-                    return _activation_doc(name)
+                    return reference.activation_doc(name)
             if ctx.setting:
                 return f'`{name}` is not defined, so it is the string `"{name}"`'
         case ("key", callee, key, ctx):
@@ -393,11 +281,11 @@ def _hover_text(ix: _Index, what: tuple) -> str | None:
                 return f"parameter **{key[0]}** of `{ix.signature(ix.defs[callee])}`"
             cls = ix.setting_class(callee, key[:-1], ctx.statement)
             if cls is not None and key[-1] in cls.model_fields:
-                return _field_doc(cls, key[-1])
+                return reference.field_doc(cls, key[-1])
         case ("field", base, name, ctx):
             cls = _expr_class(ix, base, ctx.statement)
             if cls is not None and name in cls.model_fields:
-                return _field_doc(cls, name)
+                return reference.field_doc(cls, name)
         case ("tap", name, _):
             counts = Counter(
                 w[2] for _, w in _occurrences(ix) if w[:2] == ("tap", name)
@@ -591,12 +479,14 @@ def _setting_item(
 ) -> Completion:
     f = cls.model_fields[name]
     if not detail:
-        detail = _type(f.annotation) + ("" if f.is_required() else f" = {_default(f)}")
+        detail = reference.type_text(f.annotation) + (
+            "" if f.is_required() else f" = {reference.default_text(f)}"
+        )
     return Completion(
         name,
         "setting",
         detail=detail,
-        documentation=_notes(cls).get(name, ""),
+        documentation=reference.notes(cls).get(name, ""),
         insert_text=f"{name}=",
         sort=f"{0 if f.is_required() else 1}{i:03}",
     )
@@ -637,7 +527,7 @@ def _value_items(
     if f is None:
         return []
     items = []
-    for m in _members(f.annotation):
+    for m in reference.members(f.annotation):
         if typing.get_origin(m) is typing.Literal:
             items += [Completion(str(v), "value", sort="0") for v in typing.get_args(m)]
         elif m is bool:
@@ -646,8 +536,14 @@ def _value_items(
             items.append(Completion("none", "keyword", sort="0"))
         elif isinstance(m, type) and issubclass(m, cfg.Config):
             items += [
-                Completion(tag, "config", _summary(m), _type_doc(tag), sort="0")
-                for tag in _tags(m)
+                Completion(
+                    tag,
+                    "config",
+                    reference.summary(m),
+                    reference.type_doc(tag),
+                    sort="0",
+                )
+                for tag in reference.tags(m)
                 if tag in TYPES  # not a mix, which is written as a sum
             ]
             items += [
@@ -675,14 +571,16 @@ def _expression_items(
             Completion(
                 tag,
                 "layer" if tag in LAYERS else "config",
-                _summary(cls),
-                _type_doc(tag),
+                reference.summary(cls),
+                reference.type_doc(tag),
                 sort="2",
             )
             for tag, cls in TYPES.items()
         ]
         items += [
-            Completion(a, "activation", documentation=_activation_doc(a), sort="2")
+            Completion(
+                a, "activation", documentation=reference.activation_doc(a), sort="2"
+            )
             for a in sorted(ACTIVATIONS)
         ]
         items.append(Completion("_", "keyword", "identity", sort="3"))
@@ -715,7 +613,7 @@ def _field_items(
         value = value.config
     for part in names[1:]:
         f = cls.model_fields.get(part) if cls is not None else None
-        classes = _config_classes(f.annotation) if f is not None else []
+        classes = reference.config_classes(f.annotation) if f is not None else []
         cls = classes[0] if len(classes) == 1 else None
         value = getattr(value, part, None) if isinstance(value, cfg.Config) else None
         if isinstance(value, cfg.Config):

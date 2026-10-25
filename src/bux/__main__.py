@@ -217,11 +217,12 @@ def plan(runs: list[Run], gpus: int | None = None) -> str:
     return f"{len(runs)} run{'s' if len(runs) != 1 else ''}\n" + "\n".join(lines)
 
 
-def _parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(
+def parser() -> argparse.ArgumentParser:
+    """Return the parser of bux's command line."""
+    p = argparse.ArgumentParser(
         prog="bux", description="Compile, inspect and train .bux models and runs."
     )
-    parser.add_argument(
+    p.add_argument(
         "command",
         choices=[
             "check",
@@ -234,48 +235,48 @@ def _parser() -> argparse.ArgumentParser:
             "json",
         ],
     )
-    parser.add_argument("file")
-    parser.add_argument(
+    p.add_argument("file")
+    p.add_argument(
         "settings",
         nargs="*",
         metavar="SETTING=VALUE",
         help="statements that redefine the file's: optimizer.lr=1e-3, 'use recipe'",
     )
-    parser.add_argument(
+    p.add_argument(
         "--entry", default="model", help="definition to compile (default: model)"
     )
-    parser.add_argument(
+    p.add_argument(
         "--expand",
         action="store_true",
         help="render: draw blocks inline instead of separately",
     )
-    parser.add_argument(
+    p.add_argument(
         "--out",
         default="runs",
         help="train, launch: where run directories go (default: runs)",
     )
-    parser.add_argument(
+    p.add_argument(
         "--only",
         metavar="TEXT",
         help="train, launch: only the runs whose name contains TEXT",
     )
-    parser.add_argument(
+    p.add_argument(
         "--index",
         type=int,
         help="train, launch: only the run at INDEX, from 0, in the order bux plan lists "
         "them; $SLURM_ARRAY_TASK_ID or $JOB_COMPLETION_INDEX in an array job",
     )
-    parser.add_argument(
+    p.add_argument(
         "--cache",
         default="data/packed",
         help="prepare, train, launch: where prepared datasets go (default: data/packed)",
     )
-    parser.add_argument(
+    p.add_argument(
         "--workers",
         type=int,
         help="prepare, launch: processes that prepare data (default: one a core)",
     )
-    return parser
+    return p
 
 
 def _error(message: str) -> int:
@@ -363,11 +364,11 @@ def _run(
 
 
 def main(argv: list[str] | None = None) -> int:
-    parser = _parser()
-    args = parser.parse_args(argv)
+    cli = parser()
+    args = cli.parse_args(argv)
     for setting in args.settings:
         if "=" not in setting and not setting.startswith("use "):
-            parser.error(f"settings are name=value or 'use module', not {setting!r}")
+            cli.error(f"settings are name=value or 'use module', not {setting!r}")
     with open(args.file, encoding="utf-8") as f:
         source = f.read()
     where = {"entry": args.entry, "filename": args.file, "overrides": args.settings}

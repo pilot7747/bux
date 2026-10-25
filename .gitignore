@@ -35,3 +35,8 @@ dist/
 *.pt
 *.pth
 *.safetensors
+
+# Documentation build output, and the pages generated as it builds
+/docs/_build/
+/docs/_generated/
+/docs/reference/python/generated/

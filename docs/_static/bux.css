@@ -1,0 +1,10 @@
+/* Wide tables of settings scroll instead of squeezing their descriptions. */
+.bd-article table {
+  display: block;
+  overflow-x: auto;
+}
+
+.bd-article table td code,
+.bd-article table th code {
+  white-space: nowrap;
+}
