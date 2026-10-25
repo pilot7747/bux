@@ -1,24 +1,32 @@
-"""The architecture IR: what ``bux.lang.compile`` produces and backends consume.
+"""The architecture IR: what `bux.lang.compile` produces and backends consume.
 
-A graph is a tree of nodes, each a function of the incoming stream ``x``:
+An `Architecture` is a model's settings and its graph. A graph is a tree of nodes,
+each a function of the incoming stream ``x``::
 
-    Layer       config(x)                      a leaf from ``bux.config``
+    Layer       config(x)                      a leaf from bux.config
     Seq         items[-1](...items[0](x))      composition, left to right
-    Residual    x + body(x)                    a residual branch, ``[body]``
+    Residual    x + body(x)                    a residual branch, [body]
     Sum         sum(t(x) for t in terms)
     Prod        prod(f(x) for f in factors)    gating, or scaling by a Const
     Neg         -body(x)
     Const       value                          a scalar, only inside Sum/Prod
-    Identity    x                              ``_``
+    Identity    x                              _
     Repeat      body applied `times` times     fresh parameters each time
-    Tap         x, and pushes x onto the tap   ``@name``
-    Ref         top of the tap, ignoring x     ``$name``; ``$name!`` also pops it
+    Tap         x, and pushes x onto the tap   @name
+    Ref         top of the tap, ignoring x     $name; $name! also pops it
 
-Branches of Sum/Prod run left to right, which only matters for taps. Every Layer
-knows its input ``width``: an int, "tokens" for embeddings, or "streams" for layers
-that act on a residual stream widened by the residual algebra. Nodes with the same
-``share`` key are a single module. ``Residual`` is kept distinct from ``_ + body`` so
-that backends can swap the residual algebra (e.g. hyper-connections) for it alone.
+Branches of `Sum` and `Prod` run left to right, which only matters for taps. Every
+`Layer` knows its input `width`: an int, ``"tokens"`` for embeddings, or
+``"streams"`` for layers that act on a residual stream widened by the residual
+algebra. ``Residual`` is kept distinct from ``_ + body`` so that backends can swap
+the residual algebra (e.g. hyper-connections) for it alone.
+
+Every node also has a ``label``, the name of the definition it came from (for
+printing and diagrams), and a ``share`` key: nodes with the same key are a single
+module, with one set of parameters (``shared block = ...``). Nodes are frozen
+pydantic models, so a graph compares, hashes and serializes as data
+(``arch.model_dump_json()``, what ``bux json`` prints), and `walk`, `strip` and
+`replace_children` take one apart and put it back together.
 """
 
 import hashlib
@@ -31,7 +39,11 @@ from pydantic import BaseModel, ConfigDict, Field
 from bux.config import LayerConfig, ResidualConfig
 from bux.train.config import PrecisionConfig, TrainConfig
 
-# "streams" is a residual stream widened by the residual algebra (hc, mhc, gr, attnres).
+#: What a layer reads, as the compiler infers it.
+#:
+#: A width, ``"tokens"`` (ids, for an embedding), ``"logits"`` (after the LM head,
+#: which nothing follows), or ``"streams"``, a residual stream widened by the
+#: residual algebra (hc, mhc, gr, attnres).
 Width = int | Literal["tokens", "logits", "streams"]
 
 
@@ -44,6 +56,16 @@ class _Node(BaseModel):
 
 
 class Port(BaseModel):
+    """A layer's internal tensor, sent through a tap: ``gqa(v=@v1)``, ``gqa(v=$v1)``.
+
+    Attributes:
+        name: The port, one of the layer config's ``ports``: ``"v"``, ``"kv"``,
+            ``"index"``, ...
+        tap: The tap it goes through.
+        mode: ``"write"`` exports the tensor (``@tap``), ``"read"`` imports it
+            (``$tap``), and ``"pop"`` imports it and pops the tap (``$tap!``).
+    """
+
     model_config = ConfigDict(frozen=True, extra="forbid")
 
     name: str
@@ -52,6 +74,14 @@ class Port(BaseModel):
 
 
 class Layer(_Node):
+    """A leaf: one layer, ``config(x)``.
+
+    Attributes:
+        config: The layer's settings, one of `bux.config.LayerConfig`.
+        width: What the layer reads, as the compiler inferred it (`Width`).
+        ports: The internal tensors it exports or imports through taps.
+    """
+
     kind: Literal["layer"] = "layer"
     config: LayerConfig
     width: Width | None = None
@@ -59,61 +89,85 @@ class Layer(_Node):
 
 
 class Seq(_Node):
+    """Composition, left to right: ``a b c`` is ``c(b(a(x)))``."""
+
     kind: Literal["seq"] = "seq"
     items: tuple[Node, ...]
 
 
 class Residual(_Node):
+    """A residual branch, ``[body]``: ``x + body(x)``, or the residual algebra's."""
+
     kind: Literal["residual"] = "residual"
     body: Node
 
 
 class Sum(_Node):
+    """Parallel branches, summed: ``a + b``, and ``a - b`` with a `Neg`."""
+
     kind: Literal["sum"] = "sum"
     terms: tuple[Node, ...]
 
 
 class Prod(_Node):
+    """Parallel branches, multiplied elementwise: ``a * b`` (gating), or ``0.5 * a``."""
+
     kind: Literal["prod"] = "prod"
     factors: tuple[Node, ...]
 
 
 class Neg(_Node):
+    """Negation, ``-a``: ``-body(x)``."""
+
     kind: Literal["neg"] = "neg"
     body: Node
 
 
 class Const(_Node):
+    """A scalar `value`, only as a term of a `Sum` or a factor of a `Prod`."""
+
     kind: Literal["const"] = "const"
     value: float
 
 
 class Identity(_Node):
+    """The stream as it is, ``_``: ``x``."""
+
     kind: Literal["identity"] = "identity"
 
 
 class Repeat(_Node):
+    """``body^times``: `times` copies of `body` in sequence, each with its own
+    parameters (unless `body` is shared)."""
+
     kind: Literal["repeat"] = "repeat"
     body: Node
     times: int
 
 
 class Tap(_Node):
+    """``@name``: pushes the stream onto the tap `name`, and passes it on."""
+
     kind: Literal["tap"] = "tap"
     name: str
 
 
 class Ref(_Node):
+    """``$name``: the top of the tap `name`, ignoring the stream; ``$name!`` also
+    pops it (`pop`)."""
+
     kind: Literal["ref"] = "ref"
     name: str
     pop: bool = False
 
 
+#: Any node of a graph, told apart by its ``kind`` when it is read from JSON.
 Node = Annotated[
     Layer | Seq | Residual | Sum | Prod | Neg | Const | Identity | Repeat | Tap | Ref,
     Field(discriminator="kind"),
 ]
 
+#: Every class of node, for ``isinstance(value, NODE_TYPES)``.
 NODE_TYPES = (Layer, Seq, Residual, Sum, Prod, Neg, Const, Identity, Repeat, Tap, Ref)
 
 for _cls in NODE_TYPES:
@@ -121,11 +175,33 @@ for _cls in NODE_TYPES:
 
 
 class Architecture(BaseModel):
+    """A compiled model: its top-level settings and its graph.
+
+    `bux.lang.compile` returns one, and a backend builds it:
+    ``bux.architecture.Model(arch, rngs=nnx.Rngs(0))``. It is frozen pydantic data,
+    so it round-trips through JSON (``Architecture.model_validate_json``) and prints
+    back to source (`bux.lang.printer.to_source`).
+
+    Attributes:
+        d_model: The width of the residual stream.
+        vocab_size: The number of token ids that embeddings and heads take; None for
+            a graph with neither, such as a block compiled alone.
+        residual: The residual algebra every `Residual` merges by; None for plain
+            additive residuals.
+        graph: The model, a tree of nodes.
+
+    Example::
+
+        arch = compile(source)
+        [layer.config.type for layer in arch.layers()][:3]
+        # ['embed', 'rmsnorm', 'gqa']
+        [layer.width for layer in arch.layers()][:3]  # ['tokens', 64, 64]
+    """
+
     model_config = ConfigDict(frozen=True, extra="forbid")
 
     d_model: int
     vocab_size: int | None = None
-    # None: plain additive residuals.
     residual: ResidualConfig | None = None
     graph: Node
 
@@ -135,6 +211,7 @@ class Architecture(BaseModel):
 
 
 def children(node: Node) -> tuple[Node, ...]:
+    """Return the nodes directly inside `node`, in order; none for a leaf."""
     match node:
         case Seq(items=items):
             return items
@@ -154,6 +231,7 @@ def walk(node: Node) -> Iterator[Node]:
 
 
 def unrolled_layers(node: Node) -> Iterator[Layer]:
+    """Yield every layer under `node` in execution order, a repeat's body each time."""
     if isinstance(node, Layer):
         yield node
     elif isinstance(node, Repeat):
@@ -165,6 +243,8 @@ def unrolled_layers(node: Node) -> Iterator[Layer]:
 
 
 def replace_children(node: Node, new: tuple[Node, ...]) -> Node:
+    """Return a copy of `node` with `new` in place of its `children`, in their order;
+    a leaf as it is. With `children`, it rebuilds a tree bottom up."""
     match node:
         case Seq():
             return node.model_copy(update={"items": new})
@@ -253,25 +333,38 @@ def _without_newer_fields(train: dict) -> dict:
 class Run(BaseModel):
     """One training run: an architecture and how to train it, with every setting resolved.
 
-    This is what a run's directory keeps, next to the same as .bux source.
+    `bux.lang.compile_runs` returns one per combination of a sweep's alternatives,
+    and `bux.train.trainer.train` trains one into a directory named for its name and
+    `id`, ``runs/smoke-f114ac17ae/``. The directory keeps it as ``run.json``, and as
+    ``run.bux`` (`bux.lang.printer.run_to_source`), which compiles back to the same
+    run.
+
+    Attributes:
+        name: The file, and the alternatives it took:
+            ``speedrun[mqa, optimizer.lr=0.01]``.
+        arch: The model.
+        train: How to train it: data, optimizer, schedule, steps, mesh, ...
+        choices: The alternative taken on each axis of the sweep, in the order
+            written: ``("mqa", "optimizer.lr=0.01")``.
     """
 
     model_config = ConfigDict(frozen=True, extra="forbid")
 
-    name: (
-        str  # the file, and the alternatives it took: speedrun[mqa, optimizer.lr=0.01]
-    )
+    name: str
     arch: Architecture
     train: TrainConfig
-    # One per axis of the sweep, in the order written: "mqa", "optimizer.lr=0.01".
     choices: tuple[str, ...] = ()
 
     @property
     def id(self) -> str:
         """A hash of what the run computes, not of how it is written, watched or split
-        over devices. Renaming a definition, reaching the same settings through a sweep,
-        logging, evaluating, checkpointing or profiling at other steps, or another
-        mesh, layout, methods or compiler options keep it."""
+        over devices: ten hex digits, such as ``"f114ac17ae"``.
+
+        Renaming a definition, reaching the same settings through a sweep, logging,
+        evaluating, checkpointing or profiling at other steps, or another mesh,
+        layout, methods or compiler options keep it. So does a setting newer than run
+        ids, where it computes as runs did before it, so that their checkpoints
+        resume."""
         arch = self.arch.model_copy(update={"graph": strip(self.arch.graph)})
         # A setting or a field newer than run ids is left out where it computes as runs
         # did before it, so that ids made before it resume.

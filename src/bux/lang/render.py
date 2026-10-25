@@ -197,7 +197,32 @@ class _Renderer:
 
 
 def render(arch: ir.Architecture, *, expand: bool = False) -> str:
-    """Draw the model's circuit, then one per labeled block it uses (unless `expand`)."""
+    """Draw the model's circuit, then one per labeled block it uses (unless `expand`).
+
+    This is what ``bux render`` prints. Each drawing has the block's name above it.
+    A repeat is drawn once with its count (``┤block├×2``, or a frame marked ``×2``),
+    and parallel branches are stacked between a fork and their merge. Taps show as
+    ``@name`` and reads as ``$name``; a branch that starts by reading a tap is not
+    fed from the fork.
+
+    Args:
+        arch: The architecture to draw.
+        expand: Draw every labeled block in place, instead of as ``┤name├`` with a
+            drawing of its own below: one wide circuit (``bux render --expand``).
+
+    Returns:
+        The drawings, separated by blank lines, ending with a newline.
+
+    Example::
+
+        print(render(compile(open("examples/experiments/smoke.bux").read())))
+        # model
+        # ──embed──┤block├×2──norm──head──
+        #
+        # block
+        # ──┬────────────⊕──┬───────────⊕──
+        #   └─norm──attn─┘  └─norm──ffn─┘
+    """
     renderer = _Renderer(collapse=not expand)
     root = arch.graph.model_copy(update={"label": None})
     sections = [renderer.draw(arch.graph.label or "model", root)]
