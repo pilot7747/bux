@@ -1131,11 +1131,11 @@ shard before FSDP gathers it.
 ### SwiGLU fused, by cuDNN
 
 On a Blackwell GPU with cudnn-frontend (the `cuda` extra), the routed experts of a
-SwiGLU FFN (`gated_mlp` of `swish`, no `limit`, `up_softcap` or `expert_norm`) in
-`mxfp8`, every pass in it, run by cuDNN's CuTe DSL kernels, through `cudnn.jax.call` on
-XLA's stream (`grouped_glu`, over `grouped_cudnn`), where their widths are whole
-tiles of 256: Qwen3-30B-A3B's 2048 and 768, but not the baseline's 704. They fuse
-what bux's kernels left to XLA:
+SwiGLU FFN (`gated_mlp` of `swish`, no `limit`, `up_softcap`, `up_offset`, `bias` or
+`expert_norm`) in `mxfp8`, every pass in it, run by cuDNN's CuTe DSL kernels, through
+`cudnn.jax.call` on XLA's stream (`grouped_glu`, over `grouped_cudnn`), where their
+widths are whole tiles of 256: Qwen3-30B-A3B's 2048 and 768, but not the baseline's
+704. They fuse what bux's kernels left to XLA:
 
 | GEMM | kernel | in its epilogue |
 |------|--------|-----------------|

@@ -21,8 +21,18 @@ class Config(BaseModel):
 
 
 # situ is 4 * tanh(x / 4) * sigmoid(x): SiLU with its linear factor soft-capped (Kimi K3).
+# quick_gelu is x * sigmoid(1.702 x), GELU's sigmoid approximation (gpt-oss's gate).
 Activation = Literal[
-    "relu", "relu2", "gelu", "gelu_tanh", "swish", "sigmoid", "tanh", "softplus", "situ"
+    "relu",
+    "relu2",
+    "gelu",
+    "gelu_tanh",
+    "swish",
+    "sigmoid",
+    "tanh",
+    "softplus",
+    "situ",
+    "quick_gelu",
 ]
 
 
@@ -120,6 +130,8 @@ class MLPConfig(Config):
     # (gpt-oss, DeepSeek-V4).
     limit: float | None = None
     up_softcap: float | None = None  # tanh soft-capping of the up branch (Kimi K3)
+    # Added to a gated MLP's up branch after it is clipped: gpt-oss's up + 1.
+    up_offset: float = 0.0
 
 
 class MoEConfig(Config):
@@ -134,6 +146,8 @@ class MoEConfig(Config):
     shared_expert_gate: bool = False  # sigmoid gate on the shared expert (Qwen)
     # sqrtsoftplus scores experts with sqrt(softplus(logit)) (DeepSeek-V4).
     router: Literal["softmax", "sigmoid", "sqrtsoftplus"] = "softmax"
+    # A learned bias on the router's logits (gpt-oss), unlike aux_free's on the choice.
+    router_bias: bool = False
     router_logit_scale: float = 1.0  # multiplies the logits before scoring (Muse Spark)
     # For benchmarks: a training forward routes by random logits, N(0, 1), so that each
     # expert takes an even share of the picks in expectation and a capacity drops few;

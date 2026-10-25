@@ -6,6 +6,7 @@ import jax.numpy as jnp
 import numpy as np
 import optax
 import pytest
+from conftest import random_biases
 from flax import nnx
 from jax.sharding import PartitionSpec as P
 from jaxtyping import Array, Float, Int
@@ -15,6 +16,7 @@ from bux import config as cfg
 from bux import parallel
 from bux.architecture import Model, Taps
 from bux.architecture.experts.moe import (
+    Kernels,
     MoE,
     balance_loss,
     experts,
@@ -22,6 +24,7 @@ from bux.architecture.experts.moe import (
     routed,
     run_sorted,
 )
+from bux.architecture.layers.mlp import activate
 from bux.architecture.layers.norm import Norm
 from bux.architecture.registry import Loss
 from bux.architecture.repeats.remat import rematted
@@ -50,7 +53,7 @@ RMS = cfg.NormalizationConfig(type="rmsnorm")
 def moe_layer(**settings) -> MoE:
     given = {"num_experts": 4, "top_k": 2, "expert": GATED} | settings
     c = cfg.MoEConfig.model_validate(given)
-    return MoE(c, D, nnx.Rngs(0))
+    return random_biases(MoE(c, D, nnx.Rngs(0)))
 
 
 def first_moe(model: Model) -> MoE:
@@ -252,6 +255,18 @@ OPTIONS = {
         )
     },
     "limit": {"expert": GATED.model_copy(update={"limit": 0.3})},
+    # gpt-oss's: biases on the router and the experts, whose up branch adds 1.
+    "biased": {
+        "router_bias": True,
+        "expert": GATED.model_copy(
+            update={
+                "bias": True,
+                "activation": "quick_gelu",
+                "limit": 0.3,
+                "up_offset": 1.0,
+            }
+        ),
+    },
     "softcap": {
         "expert": GATED.model_copy(update={"activation": "situ", "up_softcap": 0.3})
     },
@@ -299,22 +314,40 @@ def test_sorted_drops_no_token_when_every_token_picks_the_same_experts():
     assert jnp.allclose(run("sorted", e, x)[0], run("dense", e, x)[0], atol=1e-5)
 
 
+@pytest.mark.parametrize("biased", [False, True])
 @pytest.mark.parametrize("norm", [None, RMS])
-def test_experts_run_each_row_through_its_own_times_its_weight(norm):
+def test_experts_run_each_row_through_its_own_times_its_weight(norm, biased):
     """Each row's output times its weight, after the norm, which a weight before it
-    would not change; and the rows past the experts' are 0."""
-    keys = jax.random.split(jax.random.key(0), 4)
+    would not change, and after its expert's biases; and the rows past the experts'
+    are 0, biases and all."""
+    keys = jax.random.split(jax.random.key(0), 6)
     x = jax.random.normal(keys[0], (9, D))
     up = jax.random.normal(keys[1], (3, D, 8, 2))  # each hidden unit's up and gate
     down = jax.random.normal(keys[2], (3, 8, D))
     weights = jax.random.uniform(keys[3], (9,))
+    up_bias = jax.random.normal(keys[4], (3, 8, 2)) if biased else jnp.zeros((3, 8, 2))
+    down_bias = jax.random.normal(keys[5], (3, D)) if biased else jnp.zeros((3, D))
     rescale = None if norm is None else Norm(norm, D)
-    out = experts(x, jnp.array([3, 0, 4]), weights, up, down, GATED, rescale)
+    kernels = Kernels(up, down, *((up_bias, down_bias) if biased else ()))
+    out = experts(x, jnp.array([3, 0, 4]), weights, kernels, GATED, rescale)
     for row, expert in enumerate([0, 0, 0, 2, 2, 2, 2]):
-        h = jax.nn.swish(x[row] @ up[expert, ..., 1]) * (x[row] @ up[expert, ..., 0])
-        y = h @ down[expert] if rescale is None else rescale(h @ down[expert])
+        u, g = (x[row] @ up[expert, ..., i] + up_bias[expert, :, i] for i in (0, 1))
+        y = jax.nn.swish(g) * u @ down[expert] + down_bias[expert]
+        y = y if rescale is None else rescale(y)
         assert jnp.allclose(out[row], weights[row] * y, rtol=1e-5, atol=1e-4)
     assert (out[7:] == 0).all()
+
+
+def test_gpt_oss_gated_units_clamp_the_gate_and_add_1_to_up():
+    """gpt-oss's experts: (clip(up, -7, 7) + 1) * g * sigmoid(1.702 g), g = min(gate,
+    7), as transformers' GptOssExperts computes them."""
+    ffn = GATED.model_copy(
+        update={"activation": "quick_gelu", "limit": 7.0, "up_offset": 1.0}
+    )
+    up, gate = 10 * jax.random.normal(jax.random.key(0), (2, 64))
+    g = jnp.minimum(gate, 7.0)
+    want = (jnp.clip(up, -7.0, 7.0) + 1) * g * jax.nn.sigmoid(1.702 * g)
+    assert jnp.allclose(activate(ffn, up, gate), want, rtol=1e-6)
 
 
 def test_some_of_the_experts_add_their_own_picks_and_nothing_for_the_others():
@@ -325,12 +358,12 @@ def test_some_of_the_experts_add_their_own_picks_and_nothing_for_the_others():
     e.expert_norm.bias[...] = jnp.ones(D)  # so that a row of zeros comes out not 0
     x = jax.random.normal(jax.random.key(1), (2, 5, D))
     z, (idx, weights, _) = e._latent(x), e._route(x)
-    up, down = e.kernels()
+    up, down, _, _ = e.kernels()
 
     def some(first: int, n: int) -> Float[Array, "b t d"]:
         mine = slice(first, first + n)
-        kernels = (up[mine], down[mine])
-        return routed(z, idx - first, weights, *kernels, e.config.expert, e.expert_norm)
+        kernels = Kernels(up[mine], down[mine])
+        return routed(z, idx - first, weights, kernels, e.config.expert, e.expert_norm)
 
     assert jnp.allclose(some(0, 1) + some(1, 3), some(0, 4), atol=1e-5)
     assert jnp.allclose(some(0, 4), run("dense", e, x)[0], atol=1e-5)

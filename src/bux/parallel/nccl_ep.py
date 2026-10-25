@@ -243,7 +243,7 @@ def sent_once(
     lie; send each output back times its pick's weight, and sum each token's. A device
     takes `methods.capacity` times the rows of a fair share, and the picks past it
     drop before they go, as in ``ragged_all_to_all``."""
-    (d, k), local = (z.shape[-1], idx.shape[-1]), kernels[0].shape[0]
+    (d, k), local = (z.shape[-1], idx.shape[-1]), kernels.up.shape[0]
     tokens, peers = z.size // d, jax.lax.axis_size(axes)
     if matmuls.in_force().dispatch != "compute":
         raise ValueError("methods(moe=nccl_ep) sends the tokens in bfloat16, not MXFP8")
@@ -256,7 +256,7 @@ def sent_once(
     held = _picks_in(sent.sizes, arrivals.kept[jax.lax.axis_index(axes)].sum(-1), rows)
     row_weights = jnp.where(held, sent.weights, 0)
     arrived = remat.label(EXCHANGED, sent.rows)
-    made = experts(arrived, sent.sizes, row_weights, *kernels, ffn, norm)
+    made = experts(arrived, sent.sizes, row_weights, kernels, ffn, norm)
     y = remat.label(EXCHANGED, _combined(rows, tokens, k, sent.handle, picks, made))
     return y.reshape(z.shape), 1 - arrivals.kept.sum() / (idx.size * peers)
 
