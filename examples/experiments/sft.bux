@@ -3,7 +3,7 @@
 # with the <|im_end|> that ends it. A conversation longer than a row is dropped
 # rather than cut; the rest are best-fit packed, each seeing only itself.
 #
-#   hf download HuggingFaceTB/smol-smoltalk --repo-type dataset --local-dir data/smol-smoltalk
+#   uvx --from huggingface_hub hf download HuggingFaceTB/smol-smoltalk --repo-type dataset --local-dir data/smol-smoltalk
 #   bux prepare examples/experiments/sft.bux
 #   bux train examples/experiments/sft.bux
 #

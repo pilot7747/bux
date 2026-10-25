@@ -1,4 +1,4 @@
-"""The lightning indexer's scores of every key, ``sum_j w_j ReLU(q_j . k)``, with which
+"""The lightning indexer's scores of every key, ``sum_j w_j ReLU(q_j·k)``, with which
 it ranks them (`~bux.architecture.attention.indexer`); and the attention's
 probabilities of every key, summed over heads, which its loss learns from
 (`bux.architecture.attention.sparse.probabilities`).

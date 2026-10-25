@@ -34,7 +34,7 @@ $ bux launch examples/experiments/attention_ablation.bux   # train them, a GPU e
 :link: get-started/index
 :link-type: doc
 
-Install bux, train a model on your laptop in a minute, and learn the four ideas the
+Install bux, train a model on your laptop in a minute, and learn the ideas the
 rest builds on.
 :::
 
