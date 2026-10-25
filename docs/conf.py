@@ -48,7 +48,9 @@ myst_heading_anchors = 4  # [text](page.md#a-heading) links, as on GitHub
 autosummary_generate = True
 autosummary_imported_members = False
 autodoc_member_order = "bysource"
-autodoc_typehints = "signature"  # as the source writes them: bux_sphinx.signatures
+# As the source writes them (bux_sphinx.signatures), a class by its name alone.
+autodoc_typehints = "signature"
+python_use_unqualified_type_names = True
 # A package documents what it defines; what it re-exports has its page where defined.
 autodoc_default_options = {
     "members": True,
@@ -69,6 +71,7 @@ napoleon_google_docstring = True
 napoleon_numpy_docstring = False
 napoleon_use_rtype = False
 napoleon_attr_annotations = True
+napoleon_include_special_with_doc = True  # __call__ says what a layer takes
 
 intersphinx_mapping = {
     "python": ("https://docs.python.org/3", None),
