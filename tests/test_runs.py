@@ -106,11 +106,32 @@ def test_an_architecture_alone_is_not_a_run():
             "'data' must be text(...), chat(...), tokens(...), synthetic(...) or a mix",
         ),
         ("schedule = wsd(warmup=90)", "the schedule takes 110 steps (90 of warmup"),
+        ("schedule = power(warmup=0.95)", "takes 105 steps (95 of warmup and 10 of"),
+        (
+            "schedule = piecewise(warmup=50, pieces=[piece(until=0.4), piece()])",
+            "the schedule takes 110 steps (50 of warmup and 60 of cooldown)",
+        ),
     ],
 )
 def test_settings_are_checked_where_they_are_written(setting, message):
     text = error(RUN + setting)
     assert message in text and setting.split(" = ")[1] in text
+
+
+def test_power_takes_a_curriculum_of_data_but_not_of_batches():
+    [run] = runs(RUN + "schedule = power\ncurriculum = phase(at=0.5, data=synthetic)")
+    assert isinstance(run.train.schedule, tcfg.PowerSchedule)
+    text = error(RUN + "schedule = power\nbatch_ramp = ramp(start=2, steps=10)")
+    assert "power counts the tokens of one batch and seq_len" in text
+
+
+def test_a_bare_name_a_setting_takes_is_that_string():
+    """cosine is a schedule, and one of the shapes wsd's cooldown takes."""
+    [run] = runs(RUN + "schedule = wsd(shape=cosine)")
+    assert run.train.schedule == tcfg.WSDSchedule(shape="cosine")
+    [run] = runs(RUN + "schedule = piecewise(pieces=[piece(to=0.5, shape=constant),])")
+    assert isinstance(schedule := run.train.schedule, tcfg.PiecewiseSchedule)
+    assert schedule.pieces == (tcfg.Piece(to=0.5, shape="constant"),)
 
 
 def test_a_run_lists_what_it_lacks():

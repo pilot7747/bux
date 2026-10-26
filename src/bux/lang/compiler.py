@@ -21,6 +21,7 @@ import builtins
 import difflib
 import operator
 import re
+import types
 import typing
 from collections.abc import Callable, Generator, Mapping, Sequence
 from contextlib import contextmanager
@@ -253,6 +254,25 @@ def _config_type(value: object) -> type[cfg.Config] | None:
         case _Builtin(name=name) if name in TYPES:
             return TYPES[name]
     return None
+
+
+def _option_of(cls: type[cfg.Config], key: tuple[str, ...], name: str) -> bool:
+    """Whether the setting `key` of `cls` takes the string `name`, of a Literal."""
+    field = cls.model_fields.get(key[0]) if len(key) == 1 else None
+    return field is not None and name in _options(field.annotation)
+
+
+def _options(annotation: object) -> tuple[object, ...]:
+    """Return the values of the Literals in `annotation`, through Annotated and
+    unions."""
+    origin = typing.get_origin(annotation)
+    if origin is typing.Literal:
+        return typing.get_args(annotation)
+    if origin is typing.Annotated:
+        return _options(typing.get_args(annotation)[0])
+    if origin in (typing.Union, types.UnionType):
+        return tuple(o for m in typing.get_args(annotation) for o in _options(m))
+    return ()
 
 
 def _is_number(value: object) -> bool:
@@ -1028,6 +1048,8 @@ class _Evaluator:
                 self.bare[arg.span] = (value.name, arg.value.span, tuple(scope))
             else:
                 self.bare.pop(arg.span, None)
+            if isinstance(value, _Builtin) and _option_of(cls, arg.key, value.name):
+                value = value.name  # wsd(shape=cosine): the option, not the config
             fields.append((arg.key, self.data(value, arg.value.span), arg.span))
         return fields, ports
 
@@ -1635,6 +1657,7 @@ def _train(
     train = tcfg.TrainConfig.model_validate(values)
     _check_schedule(train, spans)
     _check_curriculum(train, spans)
+    _check_power(train, spans)
     _check_tokenizer(train, spans)
     _check_positions(train, arch, spans)
     _check_objective(train, spans)
@@ -1677,15 +1700,16 @@ def _missing_settings(missing: list[str]) -> BuxError:
 
 def _check_schedule(train: tcfg.TrainConfig, spans: dict[str, Span]) -> None:
     schedule = train.schedule
+    warmup = tcfg.warmup_steps(schedule, train.steps)
     cooldown = (
-        schedule.cooldown(train.steps) if isinstance(schedule, tcfg.WSDSchedule) else 0
+        schedule.cooldown(train.steps) if isinstance(schedule, tcfg.COOLED) else 0
     )
-    if schedule.warmup + cooldown > train.steps:
-        what = f"{schedule.warmup} of warmup" + (
+    if warmup + cooldown > train.steps:
+        what = f"{warmup} of warmup" + (
             f" and {cooldown} of cooldown" if cooldown else ""
         )
         raise BuxError(
-            f"the schedule takes {schedule.warmup + cooldown} steps ({what}), but the "
+            f"the schedule takes {warmup + cooldown} steps ({what}), but the "
             f"run has {train.steps}",
             spans.get("schedule", spans["steps"]),
         )
@@ -1728,6 +1752,17 @@ def _check_curriculum(train: tcfg.TrainConfig, spans: dict[str, Span]) -> None:
             check(train)
         except ValueError as err:
             raise BuxError(str(err), spans.get(setting, spans["steps"])) from None
+
+
+def _check_power(train: tcfg.TrainConfig, spans: dict[str, Span]) -> None:
+    shapes = {(s.config.batch, s.config.seq_len) for s in curriculum.stretches(train)}
+    if isinstance(train.schedule, tcfg.PowerSchedule) and len(shapes) > 1:
+        raise BuxError(
+            "power counts the tokens of one batch and seq_len, and this run's "
+            "batch_ramp or curriculum changes them as it trains",
+            spans.get("schedule", spans["steps"]),
+            "keep the batch and seq_len, or take another schedule",
+        )
 
 
 def _check_tokenizer(train: tcfg.TrainConfig, spans: dict[str, Span]) -> None:
@@ -2289,8 +2324,8 @@ def _check_rungs(
         rung = BuxError(
             f"halving's first rung trains {steps} steps, and then: {err.message}",
             err.span,
-            "write what depends on the run's length in terms of steps: "
-            "schedule.warmup = steps // 10",
+            "write what depends on the run's length as a share of it: "
+            "schedule.warmup = 0.1, a tenth of its steps",
         )
         return rung.attach(err.source, err.filename) if err.source else rung
     return None

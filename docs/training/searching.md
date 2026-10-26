@@ -48,8 +48,8 @@ eval = [eval(name="web", data=web(split=[0.999, 1]), every=1k),
 objective = 0.8 * web_bpb + 0.2 * code_bpb
 
 search = search(method=gp, trials=27, halving=halving(eta=3, rungs=3))
-# A short run is the long one shrunk: its warmup too, in terms of its steps.
-schedule.warmup = steps // 6
+# A short run is the long one shrunk: its warmup too, a share of its steps.
+schedule.warmup = 0.15
 ```
 
 `bux check` says what it searches, what it minimizes and what halving trains:
@@ -72,9 +72,9 @@ a line for each search:
 $ bux plan examples/experiments/attention_search.bux
 3 runs
 id          params  tokens  tok/param  flops/tok  gpus  params/gpu  optim/gpu  bubble  run
-f6ebfe340a  183M    3B      16.4       1.61B      1     700MiB      1.37GiB    0%      attention_search[mha]
-e2e862986a  174M    3B      17.2       1.55B      1     664MiB      1.3GiB     0%      attention_search[gqa]
-4b1a17c3dd  170M    3B      17.6       1.53B      1     650MiB      1.27GiB    0%      attention_search[mqa]
+ca9068fa84  183M    3B      16.4       1.61B      1     700MiB      1.37GiB    0%      attention_search[mha]
+32060b1ec4  174M    3B      17.2       1.55B      1     664MiB      1.3GiB     0%      attention_search[gqa]
+c40914733f  170M    3B      17.6       1.53B      1     650MiB      1.27GiB    0%      attention_search[mqa]
 attention_search[mha]: 27 trials of 2 dimensions by gp, 3 rungs: about 9 runs' steps
 attention_search[gqa]: 27 trials of 2 dimensions by gp, 3 rungs: about 9 runs' steps
 attention_search[mqa]: 27 trials of 2 dimensions by gp, 3 rungs: about 9 runs' steps
@@ -208,9 +208,9 @@ earned it, a new trial at the bottom: no rung waits for the rest of it.
 
 - **Each rung is a run of its own, from scratch**, with its schedule over its own
   steps: a short run's cooldown is the long run's, shrunk, and so its objective is the
-  best that length reaches. Write what depends on the run's length in terms of
-  `steps`, as `schedule.warmup = steps // 6`; `bux check` compiles the bottom rung,
-  and says so if a warmup does not fit in it.
+  best that length reaches. Write what depends on the run's length as a share of
+  it, as `schedule.warmup = 0.15`, or in terms of `steps`; `bux check` compiles the
+  bottom rung, and says so if a warmup does not fit in it.
 - **`trials` start at the bottom**, and about `trials / eta^k` reach rung `k`: 27
   trials with three rungs of `eta=3` are 27 short runs, 9 middle ones and 3 full ones,
   about `rungs × trials / eta^(rungs - 1)` = 9 runs' steps in all.

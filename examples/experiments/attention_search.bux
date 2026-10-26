@@ -28,5 +28,5 @@ eval = [eval(name="web", data=web(split=[0.999, 1]), every=1k),
 objective = 0.8 * web_bpb + 0.2 * code_bpb
 
 search = search(method=gp, trials=27, halving=halving(eta=3, rungs=3))
-# A short run is the long one shrunk: its warmup too, in terms of its steps.
-schedule.warmup = steps // 6
+# A short run is the long one shrunk: its warmup too, a share of its steps.
+schedule.warmup = 0.15
