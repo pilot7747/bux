@@ -42,6 +42,10 @@ bux-lsp = "bux.lang.lsp.server:main"
 cuda = [
     "jax[cuda13]>=0.12.0; sys_platform == 'linux'",
     "tokamax[cuda]>=0.0.17; sys_platform == 'linux'",
+    # FlashAttention-4's CuTe DSL kernels (bux.parallel.fa4), which bux calls through
+    # cutlass.jax; its modules import torch, here its CPU build, beside jax's CUDA
+    "flash-attn-4>=4.0.0b36; sys_platform == 'linux'",
+    "torch>=2.14.1; sys_platform == 'linux'",
 ]
 lsp = [
     "pygls>=2.1.1",
@@ -53,6 +57,14 @@ spark = [
 
 [tool.uv]
 default-groups = ["dev", "docs"]  # make ci builds the docs too
+
+[tool.uv.sources]
+torch = { index = "pytorch-cpu" }
+
+[[tool.uv.index]]
+name = "pytorch-cpu"
+url = "https://download.pytorch.org/whl/cpu"
+explicit = true
 
 [build-system]
 requires = ["uv_build>=0.13.1,<0.14"]
@@ -88,4 +100,4 @@ error-on-warning = true
 extra-paths = ["docs/_ext"]  # the docs' Sphinx extension
 
 [tool.ty.analysis]
-allowed-unresolved-imports = ["pyspark.**", "tokamax.**", "cudnn.**", "cutlass.**", "triton.**", "jax_triton.**", "transformer_engine.**"]  # the `spark` and `cuda` extras, and the image's TE
+allowed-unresolved-imports = ["pyspark.**", "tokamax.**", "cudnn.**", "cutlass.**", "triton.**", "jax_triton.**", "flash_attn.**", "transformer_engine.**"]  # the `spark` and `cuda` extras, and the image's TE

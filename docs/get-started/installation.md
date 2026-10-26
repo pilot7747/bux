@@ -51,7 +51,7 @@ repeating it:
 
 | extra   | what it adds                                                         | where         |
 |---------|----------------------------------------------------------------------|---------------|
-| `cuda`  | JAX on CUDA 13 (`jax[cuda13]`) and [tokamax](https://github.com/openxla/tokamax)'s GPU kernels | Linux only    |
+| `cuda`  | JAX on CUDA 13 (`jax[cuda13]`), [tokamax](https://github.com/openxla/tokamax)'s GPU kernels, and FlashAttention-4's, with the CPU build of torch they import | Linux only    |
 | `lsp`   | pygls, which the language server `bux-lsp` runs on                   | anywhere      |
 | `spark` | PySpark and pandas, to prepare data on a Spark cluster               | anywhere      |
 
@@ -76,9 +76,9 @@ uv sync --extra cuda
 uv run python -c "import jax; print(jax.devices())"
 ```
 
-It should list one device for every GPU. bux runs its GPU kernels (cuDNN's
-attention, tokamax's flash attention and grouped matmuls, its own Pallas kernels)
-where they apply, and XLA's code everywhere else; see
+It should list one device for every GPU. bux runs its GPU kernels (cuDNN's and
+FlashAttention-4's attention, tokamax's flash attention and grouped matmuls, its own
+Pallas kernels) where they apply, and XLA's code everywhere else; see
 [Kernels](../performance/kernels.md).
 
 ## CPU only, and macOS

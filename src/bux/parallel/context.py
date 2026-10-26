@@ -1,12 +1,13 @@
-"""The methods of ``methods.attention``: `xla`, `ulysses`, `cudnn`, `tokamax` and
-`auto`, and `bux.parallel.ring`'s `~bux.parallel.ring.ring`.
+"""The methods of ``methods.attention``: `xla`, `ulysses`, `cudnn`, `tokamax`, `fa4`
+and `auto`, and `bux.parallel.ring`'s `~bux.parallel.ring.ring`.
 
 A method maps queries ``(b, t, h, dk)``, keys ``(b, s, g, dk)`` and values
 ``(b, s, g, dv)`` at the queries' positions to each query's softmax-weighted values
 ``(b, t, h, dv)``, the softmax in float32: b rows, t queries and s keys of a row, h
 query heads and g key-value heads, dk and dv the head dims of keys and values.
 `AttentionArgs` holds the mask, scale, softcap and sinks; a method that lacks one
-raises NotImplementedError naming it. The kernels are `bux.parallel.flash`'s.
+raises NotImplementedError naming it. The kernels are `bux.parallel.flash`'s and
+`bux.parallel.fa4`'s.
 
 Which method runs is ``methods(attention=...)``, `auto` by default::
 
@@ -22,7 +23,7 @@ import jax.numpy as jnp
 from jax.sharding import PartitionSpec as P
 from jaxtyping import Array, Bool, Float, Int
 
-from bux.parallel import flash, methods
+from bux.parallel import fa4, flash, methods
 from bux.parallel.flash import Keys, per_query_head
 from bux.parallel.layout import as_split, axes_of, shard, spec
 from bux.parallel.mesh import active, free_axes
@@ -276,11 +277,12 @@ def causal_kernel(
     args: AttentionArgs,
 ) -> flash.Kernel | None:
     """Return the kernel for causal rows of one document, within no window: cuDNN's,
-    None where it does not take the call."""
-    whole = args.window is None
-    if whole and flash.cudnn_kernel_takes(q, k, v, Keys(True), args.softcap):
+    else FA4's (MLA's head dims, a soft cap), None where neither takes the call."""
+    if args.window is not None:
+        return None
+    if flash.cudnn_kernel_takes(q, k, v, Keys(True), args.softcap):
         return flash.CUDNN
-    return None
+    return fa4.kernel(None) if fa4.takes(q, k, v) else None
 
 
 def masked_rows(
@@ -290,9 +292,11 @@ def masked_rows(
     args: AttentionArgs,
 ) -> Float[Array, "b t h dv"]:
     """Attend with whole rows of documents, or within a window, by the fastest kernel
-    that takes the call: cuDNN's in rows of `CUDNN_ROWS` or more or with a window,
-    else tokamax's (a soft cap, sinks), else cuDNN's; in float32, tokamax's Triton
-    kernel, or `xla` with sinks."""
+    that takes the call: FA4's (sinks, a soft cap, MLA's head dims), else cuDNN's in
+    rows of `CUDNN_ROWS` or more or with a window, else tokamax's, else cuDNN's; in
+    float32, tokamax's Triton kernel, or `xla` with sinks."""
+    if fa4.takes(q, k, v):
+        return _fa4(q, k, v, args)
     cudnn = flash.cudnn_takes(q, k, v, args.softcap, args.sinks)
     if cudnn and (q.shape[1] >= CUDNN_ROWS or args.window is not None):
         return _cudnn(q, k, v, args)
@@ -328,14 +332,36 @@ def _cudnn(
     cudnn = partial(flash.cudnn, ids=args.ids, window=args.window, scale=args.scale)
     if args.ids is None:
         return cudnn(q, k, v, documents=1)
-    if flash.tokamax_takes(q):
-        other = partial(_flash, flash.TOKAMAX, args=args)
-    else:
-        other = partial(xla, args=args)
+    other = _fallback(q, args)
     if not (most := documents_bound(*q.shape[:3], max(q.shape[-1], v.shape[-1]))):
         return other(q, k, v)
     fits = flash.documents_in(args.ids) <= most
     return jax.lax.cond(fits, partial(cudnn, documents=most), other, q, k, v)
+
+
+def _fallback(
+    q: Float[Array, "b t h dk"], args: AttentionArgs
+) -> Callable[..., Float[Array, "b t h dv"]]:
+    """Return what attends a batch of more documents than a kernel has room for:
+    tokamax's kernel, else `xla`."""
+    if flash.tokamax_takes(q):
+        return partial(_flash, flash.TOKAMAX, args=args)
+    return partial(xla, args=args)
+
+
+def _fa4(
+    q: Float[Array, "b t h dk"],
+    k: Float[Array, "b t g dk"],
+    v: Float[Array, "b t g dv"],
+    args: AttentionArgs,
+) -> Float[Array, "b t h dv"]:
+    """Attend by FA4, documents in its varlen layout, or by tokamax (else xla) for a
+    batch of more documents than it has room for (`fa4.room`), by a lax.cond."""
+    attend = partial(_flash, fa4.kernel(args.window), args=args)
+    start = first_keys(args, *q.shape[:2])
+    if start is None:
+        return attend(q, k, v)
+    return jax.lax.cond(fa4.fits(start), attend, _fallback(q, args), q, k, v)
 
 
 def documents_bound(b: int, t: int, h: int, d: int) -> int:
@@ -481,6 +507,46 @@ def tokamax(
     return gathered(flash.TOKAMAX, q, k, v, args)
 
 
+@methods.attention.register("fa4")
+def flash_attention_4(
+    q: Float[Array, "b t h dk"],
+    k: Float[Array, "b s g dk"],
+    v: Float[Array, "b s g dv"],
+    args: AttentionArgs,
+) -> Float[Array, "b t h dv"]:
+    """Run FlashAttention-4's kernels (flash-attn-4) on each device's whole rows:
+    documents in its varlen layout, which tokamax takes a batch of more of
+    (`fa4.room`), a window, a soft cap, and sinks by the logsumexp. A Blackwell GPU,
+    bfloat16 or float16, and keys' and values' head dims equal up to 128, or MLA's 192
+    and 128; no positions over `context`: `ulysses` gives a device whole rows of fewer
+    heads."""
+    if splits_positions(q):
+        raise NotImplementedError(
+            "methods.attention = fa4 has no context parallelism (ulysses runs it on "
+            "whole rows)"
+        )
+    if not fa4.takes(q, k, v):
+        raise NotImplementedError(
+            "methods.attention = fa4 needs a Blackwell GPU (SM 10.x), the cuda extra "
+            "(Linux), bfloat16 or float16, and keys' and values' head dims equal up "
+            "to 128 in steps of 8, or 192 and 128"
+        )
+    body = partial(_rows, args=args, attend=_fa4_rows)
+    return on_devices(body, q, k, v, args.ids, args.sinks, seq=False)
+
+
+def _fa4_rows(
+    q: Float[Array, "b t h dk"],
+    k: Float[Array, "b t g dk"],
+    v: Float[Array, "b t g dv"],
+    args: AttentionArgs,
+) -> Float[Array, "b t h dv"]:
+    """Run `fa4` on a device's whole rows: as they are where each row is one document
+    and there is no window, else in its varlen layout."""
+    whole = fa4.kernel(None) if args.window is None else None
+    return by_documents(whole, _fa4, q, k, v, args)
+
+
 def gathered(
     kernel: flash.Kernel,
     q: Float[Array, "b t h dk"],
@@ -528,12 +594,13 @@ def auto(
 ) -> Float[Array, "b t h dv"]:
     """The default. On a GPU, the fastest kernel that takes the call on each device's
     whole rows (`whole_rows`): cuDNN's causal kernels where each row is one document
-    (with sinks too), else cuDNN's in long rows or with a window (on a B300 4x
-    tokamax's speed with packed documents), else tokamax's, which takes sinks and a
-    soft cap; in float32 its Triton kernel, or `xla`. With `seq` over `context`,
-    `ulysses` where context divides a device's heads, else `ring`. `xla` where
-    neither kernel runs, and for what only xla has."""
-    if not (flash.tokamax_runs() or flash.cudnn_runs()):
+    (with sinks too), else FA4's (MLA's head dims, a soft cap); in rows of documents
+    or a window, FA4's (on a B300 1.2-4x tokamax's speed), else cuDNN's in long rows
+    or with a window, else tokamax's, which takes sinks and a soft cap; in float32
+    its Triton kernel, or `xla`. With `seq` over `context`, `ulysses` where context
+    divides a device's heads, else `ring`. `xla` where no kernel runs, and for what
+    only xla has."""
+    if not (flash.tokamax_runs() or flash.cudnn_runs() or fa4.runs()):
         return xla(q, k, v, args)
     if splits_positions(q):
         return _context_parallel(q, k, v, args)

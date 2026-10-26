@@ -2,11 +2,12 @@
 
 Every kernel (``affine_scan``, ``grouped``, ``fused_delta``, ``pallas_delta``,
 ``blockscaled``'s and ``nvfp4``'s quantizers, ``scoring``, and the flash attention of
-tokamax and cuDNN, dense and ``sparse``) asks `gpu` and falls back to XLA where it is
-false. So inside `off`, or with ``BUX_KERNELS=off``, everything traces by XLA: to
-count the FLOPs a kernel hides, or to debug one. A Pallas kernel called off a GPU all
-the same, as the tests call them, runs interpreted (`interpreted`). On a mesh, which
-XLA cannot split a kernel over, `per_device` runs one on each device's part.
+tokamax, cuDNN and FlashAttention-4, dense and ``sparse``) asks `gpu` and falls back
+to XLA where it is false. So inside `off`, or with ``BUX_KERNELS=off``, everything
+traces by XLA: to count the FLOPs a kernel hides, or to debug one. A Pallas kernel
+called off a GPU all the same, as the tests call them, runs interpreted
+(`interpreted`). On a mesh, which XLA cannot split a kernel over, `per_device` runs
+one on each device's part.
 
 None of this changes what a run computes, so none of it is in a run's id.
 """

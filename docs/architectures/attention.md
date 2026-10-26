@@ -615,7 +615,7 @@ of the model for it.
 ## How attention runs
 
 The layers make q, k and v; the run's `methods.attention` computes the softmax
-(`auto` by default: cuDNN's kernels and tokamax's flash attention on a GPU, `xla`
+(`auto` by default: cuDNN's kernels, FlashAttention-4's and tokamax's on a GPU, `xla`
 elsewhere). Sparse attention attends by `bux.architecture.attention.sparse`: on a
 GPU, tokamax's flash kernel with the kept keys as a mask; elsewhere, XLA a chunk of
 queries at a time; neither makes t × t floats. The indexer ranks a chunk of queries
