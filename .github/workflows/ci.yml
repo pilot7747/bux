@@ -14,11 +14,9 @@ concurrency:
 
 jobs:
   checks:
-    name: Lint and test
+    name: Lint and type check
     runs-on: ubuntu-latest
-    timeout-minutes: 120
-    env:
-      JAX_PLATFORMS: cpu
+    timeout-minutes: 30
     steps:
       - name: Check out repository
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -34,8 +32,38 @@ jobs:
       - name: Install dependencies
         run: uv sync --locked --dev
 
-      - name: Lint, type check, and test
-        run: make lint typecheck test
+      - name: Lint and type check
+        run: make lint typecheck
+
+  tests:
+    # The suite takes over two hours on one runner: four share it, by tests/conftest.py.
+    name: Tests ${{ matrix.shard }}/4
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    strategy:
+      fail-fast: false
+      matrix:
+        shard: [0, 1, 2, 3]
+    env:
+      JAX_PLATFORMS: cpu
+      BUX_SHARD: ${{ matrix.shard }}/4
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Set up uv and Python
+        uses: astral-sh/setup-uv@1c37ad07a6a961277cf70c0d37d6f313000f5884 # v10.3.0
+        with:
+          version: "0.13.1"
+          python-version: "3.14"
+          enable-cache: true
+          cache-dependency-glob: uv.lock
+
+      - name: Install dependencies
+        run: uv sync --locked --dev
+
+      - name: Test
+        run: make test
 
   docs:
     name: Documentation

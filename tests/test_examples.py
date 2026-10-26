@@ -108,6 +108,36 @@ SHRUNK = {
         ),
         f"ple = engram(head_dim=4, table_size=50, norm=norm, boundary_token={V - 1})",
     ],
+    "minimax/minimax_m3.bux": [
+        (
+            "attn = gqa(num_heads=4, num_kv_heads=2, head_dim=8, qk_norm=norm,"
+            " rope=rope(fraction=0.5))"
+        ),
+        (
+            "msa = attn(indexer=indexer(num_heads=2, head_dim=8, top_k=4, block_size=2,"
+            " pool=max, per_group=true, relu=false, weighted=false, norm=norm))"
+        ),
+        (
+            "experts = moe(num_experts=4, top_k=2, num_shared_experts=1, router=sigmoid,"
+            " routed_scaling_factor=2.0, load_balancing=aux_free,"
+            " expert=gated_mlp(intermediate_size=8, activation=quick_gelu, limit=7.0,"
+            " up_offset=1.0))"
+        ),
+    ],
+    "minimax/minimax_m3.1_flash.bux": [
+        (
+            "msa = gqa(num_heads=4, num_kv_heads=2, head_dim=8, qk_norm=norm,"
+            " rope=rope(fraction=0.5), indexer=indexer(num_heads=2, head_dim=8,"
+            " top_k=4, block_size=2, pool=max, per_group=true, relu=false,"
+            " weighted=false, norm=norm))"
+        ),
+        (
+            "experts = moe(num_experts=4, top_k=2, num_shared_experts=1, router=sigmoid,"
+            " routed_scaling_factor=2.0, load_balancing=aux_free,"
+            " expert=gated_mlp(intermediate_size=8, activation=quick_gelu, limit=7.0,"
+            " up_offset=1.0))"
+        ),
+    ],
     "muse/muse_spark_open_816b_a42b.bux": [
         (
             "attn = gqa(num_heads=4, num_kv_heads=2, head_dim=8, qk_norm=bare,"
@@ -143,6 +173,25 @@ SHRUNK = {
             "experts = moe(num_experts=4, top_k=2, num_shared_experts=2,"
             " shared_expert_sink=true, router=sigmoid, routed_scaling_factor=8,"
             " load_balancing=aux_free, expert=dense)"
+        ),
+    ],
+    # minimax_m1 and minimax_m2.x only use these two; the full-size test builds them.
+    "minimax/minimax_text_01.bux": [
+        "lightning = lightning(num_heads=2, head_dim=8)",
+        (
+            "attn = gqa(num_heads=4, num_kv_heads=2, head_dim=8,"
+            " rope=rope(base=10000000, fraction=0.5))"
+        ),
+        "experts = moe(num_experts=4, top_k=2, aux_loss_coef=1e-3, expert=dense)",
+    ],
+    "minimax/minimax_m2.bux": [
+        (
+            "attn = gqa(num_heads=4, num_kv_heads=2, head_dim=8, qk_norm=norm,"
+            " qk_norm_all_heads=true, rope=rope(base=5000000, fraction=0.5))"
+        ),
+        (
+            "experts = moe(num_experts=4, top_k=2, router=sigmoid,"
+            " load_balancing=aux_free, aux_loss_coef=1e-3, expert=dense)"
         ),
     ],
     "mhc.bux": ["attn = gqa(num_heads=4, num_kv_heads=2, rope=rope())", "ffn = dense"],

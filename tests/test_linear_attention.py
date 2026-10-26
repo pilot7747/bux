@@ -268,6 +268,50 @@ def test_lightning_decays_by_minimax_slopes_weakening_with_depth():
         assert jnp.allclose(found.slopes[...], slopes(2, layer, 4))
 
 
+def minimax_lightning(
+    attn: LightningAttention, x: jax.Array, layer: int, layers: int, block: int
+) -> jax.Array:
+    """Lightning attention as transformers' MiniMax-Text-01 computes it, by blocks of
+    positions (``MiniMaxLightningAttention``), with `attn`'s parameters."""
+    assert attn.gate is not None and attn.norm.scale is not None
+    b, t, _ = x.shape
+    h, d = attn.heads, attn.head_dim
+    q, k, v = (
+        jax.nn.silu(p(x)).reshape(b, t, h, d).transpose(0, 2, 1, 3)
+        for p in (attn.q, attn.k, attn.v)
+    )
+    factor = 1 - layer / (layers - 1 + 1e-5) + 1e-5
+    s = ((1 / 2 ** (8 / h)) ** (jnp.arange(h) + 1) * factor)[:, None, None]
+    i = jnp.arange(block) + 1
+    q_decay, k_decay = jnp.exp(-s * i[:, None]), jnp.exp(-s * (block - i[:, None]))
+    gap = i[:, None] - i[None, :]
+    diagonal = jnp.where(gap >= 0, jnp.exp(-s * gap), 0)
+    kv, out = jnp.zeros((b, h, d, d)), []
+    for start in range(0, t, block):
+        qi, ki, vi = (y[:, :, start : start + block] for y in (q, k, v))
+        m = qi.shape[2]
+        intra = (qi @ ki.swapaxes(-1, -2) * diagonal[:, :m, :m]) @ vi
+        out.append((qi * q_decay[:, :m]) @ kv + intra)
+        kv = kv * jnp.exp(-s * m) + (ki * k_decay[:, -m:]).swapaxes(-1, -2) @ vi
+    o = jnp.concatenate(out, 2).transpose(0, 2, 1, 3).reshape(b, t, h * d)
+    o = o * jax.lax.rsqrt(jnp.mean(o * o, -1, keepdims=True) + 1e-6)
+    return attn.o(jax.nn.sigmoid(attn.gate(x)) * o * attn.norm.scale[...])
+
+
+@pytest.mark.parametrize("layer", [0, 5])
+def test_lightning_is_minimax_text_01s(layer):
+    """SiLU'd q, k and v, the decays of the layer's depth (of 7 here), one RMSNorm of
+    all heads, eps 1e-6, with a gain per channel, and a sigmoid gate from the input:
+    at 10 positions, by blocks of 4 and a last one of 2."""
+    c = cfg.LightningAttentionConfig(num_heads=2, head_dim=8)
+    attn = LightningAttention(c, D, nnx.Rngs(0), layer=layer, layers=7)
+    assert attn.norm.scale is not None
+    attn.norm.scale[...] = 1 + jax.random.normal(jax.random.key(2), (16,))
+    x = jax.random.normal(jax.random.key(1), (2, 10, D))
+    expected = minimax_lightning(attn, x, layer, 7, block=4)
+    assert jnp.allclose(attn(x, Taps()), expected, atol=1e-5)
+
+
 def test_rwkv7_starts_by_depth_and_reads_values_only_through_its_port():
     m = model("rwkv7", draw=False)
     assert isinstance(m.graph, Sequence)

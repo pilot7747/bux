@@ -1,0 +1,7 @@
+# MiniMax-M2.7 (MiniMax, 2026): MiniMax's first model to take part in its own
+# evolution. During its development it updated its own memory, built skills for
+# reinforcement learning experiments and improved its own learning process from their
+# results. Its architecture is M2's, 230B parameters with 10B active a token; its
+# config raises the context from 196,608 tokens to 204,800, which no setting here
+# holds.
+use minimax_m2

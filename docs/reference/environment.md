@@ -34,6 +34,7 @@ do not.
 | `BUX_PATH` | More folders to search for the modules that `use` names, after the `path` list under `[tool.bux]` in `pyproject.toml`. Separated as in `PATH` (`:`, or `;` on Windows); subfolders are searched too. See [Modules](../language/modules.md). | unset | {py:mod}`bux.lang.modules` |
 | `BUX_KERNELS` | `off` makes every bux kernel fall back to XLA for the whole process, as {py:func}`bux.kernels.off` does for a block: to debug a kernel, or to count the FLOPs one hides. Read once, when `bux.kernels` is imported. See [Kernels](../performance/kernels.md). | unset: kernels run on GPUs | {py:mod}`bux.kernels` |
 | `BUX_PROFILER` | The tool a process runs under already, `nsys` or `ncu`: `bux launch` then runs it under no tool of its own, and {py:func}`~bux.runtime.configure` turns off XLA's command buffers and, under ncu, its pool's preallocation ({py:data}`bux.train.profilers.XLA_FLAGS`, {py:data}`~bux.train.profilers.VARIABLES`). Set it yourself to run under a command of your own, as `BUX_PROFILER=nsys nsys profile --capture-range=cudaProfilerApi ... bux launch run.bux`. See [Profiling](../performance/profiling.md#nsight-systems-and-nsight-compute). | *set by bux* in a process it runs under a `profile` setting's `nsys` or `ncu` | {py:mod}`bux.train.profilers`, {py:mod}`bux.runtime` |
+| `BUX_SHARD` | `i/n` keeps the tests whose id hashes to shard `i` of `n`, so that `n` runners share the suite. CI runs four, `0/4` to `3/4`: `BUX_SHARD=1/4 make test` runs what its second runner does. | unset: every test | `tests/conftest.py` |
 
 ## JAX and XLA
 

@@ -50,6 +50,7 @@ model = embed block^12 norm head(tied=true)
 | `bias` | `false` | biases on the input projections: q, k, v and the gate (GPT-2, Qwen2) |
 | `output_bias` | `bias` | a bias on the output projection (GPT-2 has one, Qwen2 has none) |
 | `fused_qkv` | `false` | make q, k and v with one projection and split it: the same function and init, held as one matrix (GPT-2, MiMo-V2.6-Pro) |
+| `qk_norm_all_heads` | `false` | `qk_norm` of all the heads together, not of each ([below](#qk-norm-and-output-norms)) (MiniMax-M2, OLMo 2) |
 | `rope` | `none` | rotary position embeddings ([below](#rotary-position-embeddings-rope)) |
 | `power_scale`, `power_scale_length` | `none`, `2048` | queries scaled up with a power of the position ([below](#power-scaling-at-long-range)) (Beam) |
 | `kv_conv_size` | `none` | a causal depthwise conv on keys and values, added to them: `k + conv(k)` (Inkling) |
@@ -188,7 +189,7 @@ need `compress_ratio`; `o_groups` must divide `num_heads`.
 | `gate_activation` | `sigmoid` | the gate's activation | Laguna: `softplus` |
 | `gate_head_bias` | `false` | a learned bias per head on the gate, before its activation | Beam |
 | `output_norm` | `none` | a norm of each head's output, before the gate | Muse Spark |
-| `qk_norm` | `none` | a norm of each query and key head, before RoPE | Qwen3, Gemma 3, OLMo 2 |
+| `qk_norm` | `none` | a norm of each query and key head, before RoPE | Qwen3, Gemma 3 |
 | `softcap` | `none` | `c * tanh(logits / c)` on the logits | Gemma 2 |
 | `scale` | `head_dim ** -0.5` | the logits' scale | |
 | `log_scale`, `log_scale_floor` | `none`, `8192` | logits scaled up with the log of the position | Inkling |
@@ -286,6 +287,22 @@ with gains, so that the logits are a scaled cosine
 attn = gqa(num_heads=16, num_kv_heads=16, qk_norm=rmsnorm, rope=rope(layout=interleaved))
 ```
 
+`qk_norm_all_heads=true`, a setting of `gqa`, makes it one norm of all the heads
+together instead: of the queries' `num_heads * head_dim` channels, and one of the
+keys', each with a gain per channel, before they split into heads and RoPE turns them.
+MiniMax-M2 normalizes so, as OLMo 2 does
+(`examples/architectures/minimax/minimax_m2.bux`):
+
+```bux
+norm = rmsnorm(eps=1e-6)
+attn = gqa(num_heads=48, num_kv_heads=8, head_dim=128, qk_norm=norm,
+           qk_norm_all_heads=true, rope=rope(base=5000000, fraction=0.5))
+```
+
+Under tensor parallelism each device has some of the heads, and the norm's mean
+square sums over all of them. A layer that reads its keys from the `kv` port
+normalizes its queries alone ([Ports](#sharing-between-layers-ports)).
+
 `output_norm` normalizes every head's output before the gate. Muse Spark uses both,
 without gains (`examples/architectures/muse/muse_spark_open_816b_a42b.bux`):
 
@@ -296,8 +313,8 @@ attn = gqa(num_heads=128, num_kv_heads=16, head_dim=64, qk_norm=bare,
 ```
 
 :::{note}
-On a GPU, an RMSNorm with a gain and no bias followed by RoPE in the `half` layout
-runs as one Pallas kernel a pass, forward and backward
+On a GPU, an RMSNorm of each head with a gain and no bias followed by RoPE in the
+`half` layout runs as one Pallas kernel a pass, forward and backward
 ([GPU kernels](../performance/kernels.md)).
 :::
 
@@ -535,7 +552,7 @@ I_{t,s} = \sum_j w_{t,j}\,\mathrm{ReLU}(q_{t,j} \cdot k_s),
 $$
 
 with weights $w_{t,j}$ projected from the input when `weighted=true` (DSA), or the
-same for every head otherwise.
+same for every head otherwise. With `relu=false` the dot products are plain.
 
 - Its queries come from the layer's query latent (`mla`, `csa`), or its input
   (`gqa`, and `mla` at full rank).
@@ -549,7 +566,10 @@ same for every head otherwise.
 |---------|---------|--------------|
 | `num_heads`, `head_dim` | `64`, `128` | the indexer's query heads |
 | `top_k` | `2048` | keys each query keeps |
-| `block_size` | `1` | pool keys in blocks of this many and keep whole blocks (QSA) |
+| `block_size` | `1` | keep whole blocks of this many keys, scored as `pool` says |
+| `pool` | `mean` | how a block scores: the mean of its keys (QSA), or the best score of those a query sees (MSA) |
+| `per_group` | `false` | a pick for each kv head's group of query heads, by a head of its own (MSA) |
+| `relu` | `true` | ReLU on the dot products (DSA); else plain ones (MSA) |
 | `weighted` | `true` | learned per-head weights (DSA); else a plain sum |
 | `norm` | `none` | the norm of each query head and of the keys; `none`: no query norm, and the layer's own key norm (DSA: a LayerNorm) |
 | `rope_layout` | `half` | how it pairs RoPE dims when its keys are the tokens, whatever the layer's layout (DeepSeek-V3.2: `half`, GLM-5.3: `interleaved`) |
@@ -561,12 +581,12 @@ trains it, and that loss trains nothing else.
 
 ### Blocks: QSA
 
-With `block_size=n`, the indexer mean-pools the keys in blocks of `n`, normalizes
-each block's key and rotates it to the position of the block's first key, and keeps
-the `top_k // n` best whole blocks among those the query may attend to all of. It
-also keeps the keys of the query's own unfinished block. Blocks count from a
-document's first key, so none spans two documents. Qwen3.8-Flash-Next's QSA keeps
-the best 512 blocks of 4 (`examples/architectures/qwen/qwen3.8_flash_next.bux`):
+With `block_size=n` (and `pool=mean`), the indexer mean-pools the keys in blocks of
+`n`, normalizes each block's key and rotates it to the position of the block's first
+key, and keeps the `top_k // n` best whole blocks among those the query may attend
+to all of. It also keeps the keys of the query's own unfinished block. Blocks count
+from a document's first key, so none spans two documents. Qwen3.8-Flash-Next's QSA
+keeps the best 512 blocks of 4 (`examples/architectures/qwen/qwen3.8_flash_next.bux`):
 
 ```bux
 attn = gqa(num_heads=24, num_kv_heads=2, head_dim=256, gated=true, qk_norm=norm,
@@ -574,6 +594,48 @@ attn = gqa(num_heads=24, num_kv_heads=2, head_dim=256, gated=true, qk_norm=norm,
            indexer=indexer(num_heads=4, head_dim=128, top_k=2048, block_size=4,
                            weighted=false, norm=norm))
 ```
+
+(indexer-msa)=
+### Blocks for each group: MSA
+
+MiniMax Sparse Attention (MSA, MiniMax-M3) keeps whole blocks too, but scores them
+by their keys, and picks them for each kv head's group of query heads apart:
+
+- `pool=max` scores a block by the best score of its keys the query sees, so a block
+  that the query sees part of counts too. The query always keeps its own block,
+  among the `top_k // n` it keeps.
+- `per_group=true` gives the indexer a head for each of `gqa`'s kv heads
+  (`num_heads` is the layer's `num_kv_heads`), and each head picks for its group by
+  its own scores, with `weighted=false`. The query heads of a group then attend,
+  exactly, to the keys of their group's blocks alone.
+- `relu=false` scores a key by the plain dot product, $q_r \cdot k_s / \sqrt{d}$ for
+  group $r$'s head.
+
+MiniMax-M3 keeps 16 blocks of 128 keys for each of its 4 groups of 16 query heads
+(`examples/architectures/minimax/minimax_m3.bux`):
+
+```bux
+norm = rmsnorm(zero_centered=true)
+attn = gqa(num_heads=64, num_kv_heads=4, head_dim=128, qk_norm=norm,
+           rope=rope(base=5000000, fraction=0.5))
+msa  = attn(indexer=indexer(num_heads=4, head_dim=128, top_k=2048, block_size=128,
+                            pool=max, per_group=true, relu=false, weighted=false,
+                            norm=norm))
+```
+
+`pool=max` alone keeps one pick for all heads, of their summed scores; `per_group`
+without blocks picks keys for each group. A layer that reads a per-group `index`
+needs as many kv heads as it has groups. Under tensor parallelism the indexer's
+heads and their picks split with the kv heads. On a GPU tokamax's kernel attends a
+group at a time, each with its group's mask; the indexer's scores, top-k and loss run
+by XLA, as its kernels (`scoring`'s, and cuDNN's on a B200 or B300) sum the heads'
+ReLU'd dot products and pick once for all heads. Each of `pool=max`, `per_group` and
+`relu=false` keeps an indexer off them.
+
+:::{warning}
+`per_group` is `gqa`'s alone, and with blocks it takes `pool=max`. `pool=max` on
+`csa`'s compressed latents is not implemented.
+:::
 
 ### Sharing an index: IndexCache
 
@@ -629,6 +691,12 @@ normalized over them.
   indexer scores each chunk again, so neither makes t × t floats.
 - With `block_size` (Qwen3.8 QSA), a block counts as its most attended key, and only
   the complete blocks kept count.
+- With `pool=max` or `per_group` (MiniMax MSA), it is over the tokens of the kept
+  blocks that the query sees, each key its own, and for each group apart: $p$ is
+  the attention of the group's heads, the mean of their probabilities once
+  normalized, and $I$ the group's head's scores. It is averaged over the queries and
+  the groups. A chunk of queries scores every key and takes $p$, and does both again
+  in its backward pass.
 - In CSA (DeepSeek-V4), the keys are the compressed latents, and $p$ comes from the
   layer's one softmax over the window, the latents and the sinks: it keeps the share
   the window and sinks take before it is normalized over the kept latents.
@@ -641,7 +709,8 @@ normalized over them.
 
 DeepSeek's dense warm-up is a stage with `top_k` at least `seq_len`, where attention
 is dense and the loss covers every key the query sees. bux does not freeze the rest
-of the model for it.
+of the model for it. MSA's is the same stage with MSA's settings: every block kept,
+and the loss of each group over every key.
 
 ## How attention runs
 

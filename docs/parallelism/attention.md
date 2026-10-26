@@ -148,6 +148,7 @@ output. Their parameters' names ([Names](layout.md#names)):
 | MLA, CSA | up projections `q`, `kv_b` | `(latent, heads)`; `q` is `(embed, heads)` without a query latent |
 | CSA | grouped `o_a`, by group | `(heads, none, none)` |
 | indexer | `q`, `weights` | `(latent or embed, heads)` |
+| indexer with `per_group` | `q` | `(embed, kv_heads)`: its heads, and the picks they make, split with the kv heads |
 
 Each flattened dimension names its heads with their count, `("heads", h)`, so that it
 splits only between heads ([How names resolve](layout.md#how-names-resolve)).
@@ -204,7 +205,8 @@ Sparse attention (an indexer's top-k, CSA's compressed latents) attends by
 - Its keys come in parts (CSA's window, then its latents) that share one softmax,
   merged by their logsumexp in a custom VJP.
 - On a GPU, tokamax's flash kernel runs each part with the kept keys as a boolean
-  mask: dense compute, exact, and t² bits of mask forward and bytes backward.
+  mask: dense compute, exact, and t² bits of mask forward and bytes backward. Keys
+  kept for each group (MSA) run a group at a time, each with its group's mask.
 - Under `xla`, off a GPU, or in `bux.kernels.off()`, XLA runs it a chunk of queries
   at a time.
 - Either way it is a `shard_map` that gives a device its rows, queries and heads, and
