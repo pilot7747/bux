@@ -493,6 +493,52 @@ def test_an_init_starts_every_weight_matrix_and_leaves_the_rest_alone():
     assert sorted(float(g[0]) for g in gains) == [0.25] + [1.0] * 3
 
 
+def params(m: Model) -> dict[str, Float[Array, "..."]]:
+    """Every parameter of `m`, by its path."""
+    flat = nnx.to_flat_state(nnx.state(m, nnx.Param))
+    return {"/".join(map(str, path)): x[...] for path, x in flat}
+
+
+def test_each_role_of_weight_matrix_starts_by_its_own_init():
+    body = (
+        "experts = moe(num_experts=4, top_k=2, num_shared_experts=1, expert=ffn)\n"
+        "mixer = mamba2(state_size=8, head_dim=8)\n"
+        "model = embed [norm attn] [norm experts] [norm mixer] norm head"
+    )
+    roles = "init = normal(std=0.01, embed=normal(std=1), head=zeros, out=normal(std=0.1))\n"
+    plain, drawn = params(model(body)), params(model(roles + body))
+
+    def stds(end: str) -> list[float]:  # of the parameters whose paths end so
+        return [float(x.std()) for k, x in drawn.items() if f"/{k}".endswith(f"/{end}")]
+
+    assert stds("tokens/embedding") == [pytest.approx(1, rel=0.05)]
+    assert stds("proj/kernel") == [0.0]  # the head
+    # Attention's o, the experts' and the shared one's down, Mamba-2's out.
+    outs = (
+        stds("o/kernel") + stds("down") + stds("down/kernel") + stds("out_proj/kernel")
+    )
+    assert outs == [pytest.approx(0.1, rel=0.1)] * 4
+    for end in ("q/kernel", "router/kernel", "up", "in_proj/kernel"):
+        assert stds(end) == [pytest.approx(0.01, rel=0.1)], end
+    # Mamba-2's conv, decays and time steps start their own way, whatever the init.
+    for end in ("conv/weight", "A_log", "dt_bias", "D"):
+        [key] = [k for k in plain if k.endswith(f"/{end}")]
+        assert jnp.array_equal(plain[key], drawn[key]), key
+
+
+def test_a_fan_init_takes_each_experts_fan_and_a_tables_width():
+    body = (
+        "init = fan_in(scale=2)\nexperts = moe(num_experts=16, top_k=2, expert=ffn)\n"
+        "model = embed [norm experts] norm head"
+    )
+    drawn = params(model(body))
+    [down] = [x for k, x in drawn.items() if k.endswith("/down")]
+    [table] = [x for k, x in drawn.items() if k.endswith("tokens/embedding")]
+    # Each expert's down is F wide in: of variance 2 / F, not 2 / (16 F).
+    assert jnp.isclose(down.std(), (2 / F) ** 0.5, rtol=0.05)
+    assert jnp.isclose(table.std(), (2 / D) ** 0.5, rtol=0.05)
+
+
 def test_a_gain_starts_at_gain_init_zero_centered_or_not():
     x = jax.random.normal(jax.random.key(0), (2, 8))
     plain = Norm(cfg.NormalizationConfig(type="rmsnorm"), 8)(x)

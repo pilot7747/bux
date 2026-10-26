@@ -29,7 +29,7 @@ from jax.sharding import PartitionSpec as P
 from jaxtyping import Array, Bool, Float, Int, Key
 
 from bux import config as cfg
-from bux import parallel
+from bux import initializers, parallel
 from bux.architecture import observe
 from bux.architecture.common.sharding import linear
 from bux.architecture.experts import grouped_blockscaled, grouped_glu
@@ -43,7 +43,6 @@ from bux.parallel import methods
 from bux.softmax import softmax
 
 RowNorm = Callable[[Float[Array, "n d"]], Float[Array, "n d"]]
-LECUN = nnx.initializers.lecun_normal()
 
 
 class Kernels(NamedTuple):
@@ -448,7 +447,10 @@ def _norm(config: cfg.NormalizationConfig | None, width: int) -> Norm | None:
 def _stacked(
     shape: tuple[int, int, int], names: tuple[str, str, str], rngs: nnx.Rngs
 ) -> nnx.Param:
-    return nnx.Param(parallel.default_init(LECUN)(rngs.params(), shape), names=names)
+    """Return a stack of matrices of `shape` (E, n_in, n_out), each one drawn as a
+    weight matrix of `names` starts (`bux.initializers.weight`)."""
+    init = initializers.weight(initializers.role_of(names), batch_axis=(0,))
+    return nnx.Param(init(rngs.params(), shape), names=names)
 
 
 def _zeros(shape: tuple[int, ...], names: tuple[str | None, ...]) -> nnx.Param:
@@ -459,9 +461,8 @@ def _side_by_side(
     p: int, shape: tuple[int, int, int], names: tuple[str, str, str], rngs: nnx.Rngs
 ) -> nnx.Param:
     """Return p stacks of matrices of `shape` (E, d, f) side by side, (E, d, f, p),
-    each drawn as ``_stacked`` draws one: LECUN takes an array's last two dimensions
-    for its matrices'."""
-    init = parallel.default_init(LECUN)
+    each drawn as ``_stacked`` draws one."""
+    init = initializers.weight(initializers.role_of(names), batch_axis=(0,))
     stacks = [init(rngs.params(), shape) for _ in range(p)]
     return nnx.Param(jnp.stack(stacks, axis=-1), names=(*names, None))
 

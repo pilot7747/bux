@@ -46,7 +46,7 @@ from flax import nnx
 from jaxtyping import Array, Float
 
 from bux import config as cfg
-from bux import parallel
+from bux import initializers, parallel
 from bux.architecture.common.functional import activation
 from bux.architecture.common.segments import Segments
 from bux.architecture.common.sharding import projection, shard_heads, shard_layer_input
@@ -411,7 +411,7 @@ class LowRank(nnx.Module):
             down = jnp.zeros((n_in, rank))
             up = nnx.initializers.orthogonal(gain)(rngs.params(), (rank, n_out))
         else:
-            init = parallel.default_init()
+            init = initializers.weight()
             down = init(rngs.params(), (n_in, rank))
             up = init(rngs.params(), (rank, n_out))
         self.down = nnx.Param(down, names=("embed", "latent"))

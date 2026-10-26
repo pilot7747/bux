@@ -36,7 +36,13 @@ from typing import Annotated, Any, Literal
 
 from pydantic import BaseModel, ConfigDict, Field
 
-from bux.config import LayerConfig, NormalInitConfig, ResidualConfig
+from bux.config import (
+    FanInitConfig,
+    Init,
+    LayerConfig,
+    NormalInitConfig,
+    ResidualConfig,
+)
 from bux.train.config import PrecisionConfig, TrainConfig
 
 #: What a layer reads, as the compiler infers it.
@@ -188,8 +194,7 @@ class Architecture(BaseModel):
             a graph with neither, such as a block compiled alone.
         residual: The residual algebra every `Residual` merges by; None for plain
             additive residuals.
-        init: How every weight matrix starts; None for each layer's own default,
-            LeCun normal.
+        init: How the weight matrices start, by role (`bux.config.Init`).
         graph: The model, a tree of nodes.
 
     Example::
@@ -205,7 +210,7 @@ class Architecture(BaseModel):
     d_model: int
     vocab_size: int | None = None
     residual: ResidualConfig | None = None
-    init: NormalInitConfig | None = None
+    init: Init = NormalInitConfig()
     graph: Node
 
     def layers(self) -> Iterator[Layer]:
@@ -305,8 +310,8 @@ _NEWER_FIELDS = {
 }
 # Fields of a setting that only change how a run is watched.
 _UNCOMPUTED_FIELDS = {"precision": ("eval",)}
-# Fields of a layer's settings newer than run ids, by its type, at what layers
-# computed before them.
+# Fields of a layer's settings, or of the model's init, newer than run ids, by its
+# type, at what they computed before them.
 _NEWER_LAYER_FIELDS = {
     "mlp": {"up_offset": 0.0},
     "gated_mlp": {"up_offset": 0.0},
@@ -328,9 +333,21 @@ _NEWER_LAYER_FIELDS = {
     "indexer": {"pool": "mean", "per_group": False, "relu": True},
     "layernorm": {"gain_init": 1.0},
     "rmsnorm": {"gain_init": 1.0},
+    "normal": {"embed": None, "head": None, "out": None},  # the model's init
 }
-# Settings of a model newer than run ids, at what models computed before them.
-_NEWER_SETTINGS = {"init": None}
+# How every weight matrix started before the model's `init` was a normal, and before
+# it could be set, as flax's layers start them: runs that set it keep their ids. But
+# routed experts', which started sqrt(E) times smaller, so that an MoE's id is new.
+_INIT_BEFORE = FanInitConfig(
+    type="fan_in", embed=FanInitConfig(type="fan_in", distribution="gaussian")
+)
+
+
+def _starts_as_before(arch: "Architecture") -> bool:
+    """Whether `arch`'s weights start as they did before its ``init`` could be set
+    (`_INIT_BEFORE`)."""
+    moe = any(layer.config.type == "moe" for layer in arch.layers())
+    return arch.init == _INIT_BEFORE and not moe
 
 
 def _experts_as_they_run(
@@ -420,9 +437,8 @@ class Run(BaseModel):
             if train[setting] == old[setting]:
                 del train[setting]
         dumped_arch = _without_newer_layer_fields(arch.model_dump(mode="json"))
-        for setting, before in _NEWER_SETTINGS.items():
-            if dumped_arch[setting] == before:
-                del dumped_arch[setting]
+        if _starts_as_before(self.arch):
+            del dumped_arch["init"]
         what = {"arch": dumped_arch, "train": train}
         blob = json.dumps(what, sort_keys=True, separators=(",", ":"))
         return hashlib.sha256(blob.encode()).hexdigest()[:10]

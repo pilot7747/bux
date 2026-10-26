@@ -889,25 +889,92 @@ class EngramConfig(Config):
 
 
 # --- Initialization -------------------------------------------------------------
-# How the weights start, set for the whole model by the top-level setting `init`, as
-# `init = normal(std=0.02)`. Without it, a projection or an expert starts LeCun normal,
-# of variance 1 / fan_in, and an embedding table normal of variance 1 / d_model.
+# How the weight matrices start, set for the whole model by the top-level setting
+# `init`: `normal(std=0.02)` unless the model says otherwise. The embedding tables,
+# an untied head and the projections back to the stream can each start by an init of
+# their own, as `init = normal(out=normal(std=0.02 / (2 * layers) ^ 0.5))` scales
+# the residual branches' outputs by depth (GPT-2, Megatron-LM).
+
+#: The roles of weight matrices that an init can start apart from the rest.
+INIT_ROLES = ("embed", "head", "out")
 
 
-class NormalInitConfig(Config):
-    """Every weight matrix drawn from one normal: the top-level setting
-    ``init = normal(std=0.02)`` (GPT-2), or truncated,
-    ``init = normal(std=0.5 * d_model ^ -0.5, truncate=3)`` (Trinity).
+class InitConfig(Config):
+    """How weight matrices start, by role: the base of every init. Its own settings
+    start every weight matrix that no role's init takes."""
 
-    It replaces the default of every projection, expert and embedding table. What
-    starts in a way of its own keeps it: norms' gains, biases, zero-initialized
-    outputs, Mamba's decays and time steps, RWKV-7's uniform projections."""
+    # How the embedding tables start, the tokens' and the learned positions'; a tied
+    # head reads the tokens'. None: as the rest.
+    embed: "Init | None" = None
+    # How an untied head starts; None: as the rest.
+    head: "Init | None" = None
+    # How the projections back to the stream's width start: attention's and the
+    # mixers' outputs, MLPs' and experts' down. None: as the rest.
+    out: "Init | None" = None
+
+    @model_validator(mode="after")
+    def _roles_set_no_roles(self) -> Self:
+        for role in INIT_ROLES:
+            init = getattr(self, role)
+            if init is not None and any(
+                getattr(init, r) is not None for r in INIT_ROLES
+            ):
+                raise ValueError(
+                    f"the init of '{role}' sets roles of its own; set them all on "
+                    "the model's init"
+                )
+        return self
+
+
+class NormalInitConfig(InitConfig):
+    """Weight matrices drawn from one normal, ``init = normal(std=0.02)``: the
+    default, as GPT-1 and BERT drew every weight and most open models' configs say
+    (``initializer_range``). ``normal(truncate=3)`` is OLMo 2's,
+    ``normal(std=0.006)`` DeepSeek-V3's, and ``normal(std=0.5 * d_model ^ -0.5,
+    truncate=3)`` Trinity's. Truncating does not correct the std, as PyTorch's
+    ``trunc_normal_`` does not: at 3 standard deviations it draws 0.987 of it."""
 
     type: Literal["normal"] = "normal"
-    std: Annotated[float, Field(gt=0)]  # The standard deviation, before truncation.
+    # The standard deviation, before truncation.
+    std: Annotated[float, Field(gt=0)] = 0.02
     # Values farther than this many standard deviations from 0 are drawn again;
     # None: none are.
     truncate: Annotated[float, Field(gt=0)] | None = None
+
+
+class FanInitConfig(InitConfig):
+    """Weight matrices of a variance of ``scale`` over their fan: in, ``fan_in``
+    (LeCun; He's at ``scale=2``), out, ``fan_out``, or the mean of the two,
+    ``fan_avg`` (Glorot's).
+
+    A matrix's fan in is the width of its input, and its fan out that of its output;
+    each of a stack of experts' matrices has its own. An embedding table's fans are
+    both its width, as `flax.nnx.Embed`'s are. ``fan_in(scale=1 / 3,
+    distribution=uniform)`` is PyTorch's ``nn.Linear``'s init, and
+    ``fan_in(embed=fan_in(distribution=gaussian))`` how bux started every weight
+    matrix before ``normal`` (but routed experts, then sqrt(E) times smaller)."""
+
+    type: Literal["fan_in", "fan_out", "fan_avg"]
+    scale: Annotated[float, Field(gt=0)] = 1.0  # The variance times the fan.
+    # What it draws from, at that variance: a normal truncated at 2 standard
+    # deviations (as `flax.nnx.Linear`'s), a normal, or a uniform.
+    distribution: Literal["truncated", "gaussian", "uniform"] = "truncated"
+
+
+class ZerosInitConfig(InitConfig):
+    """Weight matrices that start at 0, as a role's init: ``init = normal(out=zeros)``
+    starts every residual branch as nothing (Fixup, SkipInit), and ``head=zeros``
+    starts the logits uniform (modded-nanogpt)."""
+
+    type: Literal["zeros"] = "zeros"
+
+
+#: How weight matrices start: an init, by its ``type``.
+Init = Annotated[
+    NormalInitConfig | FanInitConfig | ZerosInitConfig, Field(discriminator="type")
+]
+for _init in (InitConfig, NormalInitConfig, FanInitConfig, ZerosInitConfig):
+    _init.model_rebuild()
 
 
 # --- Residual stream ------------------------------------------------------------
@@ -1054,6 +1121,8 @@ SubConfig = Annotated[
     | GatedResidualConfig
     | AttentionResidualConfig
     | ResidualGateConfig
-    | NormalInitConfig,
+    | NormalInitConfig
+    | FanInitConfig
+    | ZerosInitConfig,
     Field(discriminator="type"),
 ]

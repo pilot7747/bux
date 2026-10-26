@@ -7,7 +7,7 @@ from flax import nnx
 from jaxtyping import Array, Float, Int
 
 from bux import config as cfg
-from bux import parallel
+from bux import initializers, parallel
 from bux.architecture.common.sharding import linear, projection
 from bux.architecture.layers.norm import Norm
 from bux.architecture.logits import HeadOutput, Projection
@@ -15,13 +15,10 @@ from bux.architecture.registry import Context, Taps, positions, register
 from bux.architecture.residual import widen, widening
 from bux.lang import ir
 
-# How a table of embeddings starts, as nnx.Embed's do: normal, of variance 1 / d.
-EMBED = nnx.initializers.variance_scaling(1.0, "fan_in", "normal", out_axis=0)
-
 
 def _table(rows: int, d: int, row: str | None, rngs: nnx.Rngs) -> nnx.Embed:
     """Make a table of `rows` vectors of size d, its rows named `row`."""
-    init = parallel.named(row, "embed", init=parallel.default_init(EMBED))
+    init = parallel.named(row, "embed", init=initializers.weight("embed"))
     return nnx.Embed(rows, d, embedding_init=init, rngs=rngs)
 
 
@@ -148,7 +145,13 @@ class Head(nnx.Module):
             None
             if tied
             else linear(
-                width, vocab, ("embed", "vocab"), bias, ctx.rngs, in_compute=True
+                width,
+                vocab,
+                ("embed", "vocab"),
+                bias,
+                ctx.rngs,
+                in_compute=True,
+                init=initializers.weight("head"),
             )
         )
         self.bias = (

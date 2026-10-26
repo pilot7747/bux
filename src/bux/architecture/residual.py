@@ -22,6 +22,7 @@ reads the widened stream back into one, before the first layer outside a branch 
 needs one, such as the final norm.
 """
 
+import functools
 import math
 
 import jax
@@ -30,6 +31,7 @@ from flax import nnx
 from jaxtyping import Array, Float
 
 from bux import config as cfg
+from bux import initializers
 from bux.architecture.layers.norm import Norm
 from bux.architecture.registry import Context, Taps, register
 from bux.lang import ir
@@ -299,13 +301,11 @@ class GatedResidual(nnx.Module):
         self.body = body
         rmsnorm = cfg.NormalizationConfig(type="rmsnorm", eps=config.norm_eps)
         self.norm = Norm(rmsnorm, (n, d))
-        self.down = nnx.Linear(n * d, config.rank, use_bias=False, rngs=rngs)
-        self.up = nnx.Linear(config.rank, n * d, use_bias=False, rngs=rngs)
-        self.write = (
-            nnx.Linear(n * d, n, use_bias=False, rngs=rngs)
-            if body is not None
-            else None
+        linear = functools.partial(
+            nnx.Linear, use_bias=False, kernel_init=initializers.weight(), rngs=rngs
         )
+        self.down, self.up = linear(n * d, config.rank), linear(config.rank, n * d)
+        self.write = linear(n * d, n) if body is not None else None
 
     def _read(self, r: Float[Array, "b t n d"]) -> Float[Array, "b t d"]:
         """Return mean_j g_j * r_j, from the normalized streams r."""
