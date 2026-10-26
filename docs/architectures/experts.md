@@ -76,8 +76,8 @@ moves only which experts a token picks, not their weights. In order, for each to
    | `sigmoid` | $\sigma(\ell_e)$ | DeepSeek-V3, Kimi K2, Nemotron 3 |
    | `sqrtsoftplus` | $\sqrt{\mathrm{softplus}(\ell_e)}$ | DeepSeek-V4 |
 
-3. **Choice**: with `load_balancing=aux_free`, a bias per expert is added to the
-   scores that pick the top-k, and not to the weights
+3. **Choice**: with `load_balancing=aux_free` or `smebu`, a bias per expert is added
+   to the scores that pick the top-k, and not to the weights
    ([Load balancing](#load-balancing)).
 4. **Groups** (DeepSeek-V3): with `num_groups > 1`, the experts split into
    `num_groups` groups, each scored by the sum of its best two experts, and only the
@@ -211,10 +211,13 @@ experts.aux_loss_scope = sequence
 
 | Setting | Default | What it does |
 |---------|---------|--------------|
-| `load_balancing` | `aux_loss` | `aux_loss`: the balance loss alone; `aux_free`: also a bias per expert |
-| `aux_loss_coef` | `1e-2`, or `0` with `aux_free` | the weight of each layer's balance loss |
+| `load_balancing` | `aux_loss` | `aux_loss`: the balance loss alone; `aux_free`: also a bias per expert; `smebu`: the bias moved by SMEBU |
+| `aux_loss_coef` | `1e-2`, or `0` with a bias | the weight of each layer's balance loss |
 | `aux_loss_scope` | `batch` | `batch`: over the whole batch (Switch, Qwen); `sequence`: per sequence, then averaged (DeepSeek-V3) |
-| `bias_update_rate` | `1e-3` | how far `aux_free`'s bias moves a step |
+| `bias_update_rate` | `1e-3` | how far `aux_free`'s bias moves a step; SMEBU's largest move |
+| `center_bias` | `false` | `aux_free`: take the biases' mean off them after every move (Trinity Nano and Mini) |
+| `bias_softclamp` | `2` | SMEBU's $\kappa$, how soon its moves saturate |
+| `bias_momentum` | `0.5` | SMEBU's $\beta$, the decay of its moves' running average |
 
 ### The balance loss
 
@@ -248,7 +251,37 @@ microbatches and moves once, after them. The bias is state, not a parameter: no
 optimizer trains it, and checkpoints keep it.
 
 `aux_free` sets the loss's weight to 0 unless you set `aux_loss_coef`, so
-DeepSeek-V3's file sets both.
+DeepSeek-V3's file sets both. With `center_bias=true`, the biases' mean is taken off
+them after every move, so that they stay centered on 0: Trinity Nano's and Mini's
+(`examples/architectures/arcee/trinity_mini.bux`).
+
+### SMEBU
+
+`aux_free`'s sign moves every expert by the whole rate, so a bias near its balance
+keeps stepping over it. `load_balancing=smebu`, the soft-clamped momentum expert bias
+update of Trinity Large, moves the same bias by a step that shrinks as an expert's
+load $n_e$ nears the mean $\bar n$, smoothed over steps:
+
+$$
+\begin{aligned}
+\Delta_e &= \lambda \tanh\!\left(\kappa\, \frac{\bar n - n_e}{\bar n}\right),
+  \qquad \Delta_e \leftarrow \Delta_e - \tfrac{1}{E} \textstyle\sum_j \Delta_j, \\
+m_e &\leftarrow \beta\, m_e + (1 - \beta)\, \Delta_e, \qquad b_e \leftarrow b_e + m_e,
+\end{aligned}
+$$
+
+with $\lambda$ the `bias_update_rate`, $\kappa$ the `bias_softclamp` and $\beta$ the
+`bias_momentum` (Trinity's report, eqs. 23 to 28). The momentum $m$ is state beside
+the bias, which checkpoints keep. Trinity Large balances by it and by a sequence-wise
+loss of $10^{-4}$ (`examples/architectures/arcee/trinity_large.bux`):
+
+```bux
+experts = moe(num_experts=256, top_k=4, num_shared_experts=1, router=sigmoid,
+              routed_scaling_factor=2.448, load_balancing=smebu,
+              bias_update_rate=5e-4, bias_softclamp=2, bias_momentum=0.5,
+              aux_loss_coef=1e-4, aux_loss_scope=sequence,
+              expert=gated_mlp(intermediate_size=3072, activation=swish))
+```
 
 Eval neither adds the loss nor moves the bias.
 

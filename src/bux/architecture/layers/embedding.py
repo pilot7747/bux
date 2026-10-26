@@ -21,7 +21,7 @@ EMBED = nnx.initializers.variance_scaling(1.0, "fan_in", "normal", out_axis=0)
 
 def _table(rows: int, d: int, row: str | None, rngs: nnx.Rngs) -> nnx.Embed:
     """Make a table of `rows` vectors of size d, its rows named `row`."""
-    init = parallel.named(row, "embed", init=EMBED)
+    init = parallel.named(row, "embed", init=parallel.default_init(EMBED))
     return nnx.Embed(rows, d, embedding_init=init, rngs=rngs)
 
 

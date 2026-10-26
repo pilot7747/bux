@@ -89,6 +89,8 @@ class _Printer:
             settings.append(f"vocab_size = {self.arch.vocab_size}")
         if self.arch.residual is not None:
             settings.append(f"residual = {self.config(self.arch.residual)}")
+        if self.arch.init is not None:
+            settings.append(f"init = {self.config(self.arch.init)}")
         model = f"model = {self.expr(self.arch.graph, top=True)[0]}"
         sections = [settings, self.leaves, self.blocks, [model]]
         return "\n\n".join("\n".join(lines) for lines in sections if lines) + "\n"

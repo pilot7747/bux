@@ -75,7 +75,7 @@ hidden = 4 * d_model // 3                  # a number
   `false`, `none`, `shared` and `_`. It may shadow a builtin, as `mlp = mlp(...)`
   does; then every `mlp` written anywhere in the program, modules included, means
   the definition. A few names are settings with a meaning of their own: `model`,
-  `d_model`, `vocab_size`, `residual` and the training settings
+  `d_model`, `vocab_size`, `residual`, `init` and the training settings
   ([Top-level settings](values.md#top-level-settings)).
 
 A definition's name also labels what it builds: `bux render` draws a labeled block as
@@ -124,8 +124,8 @@ The rules:
   make it a macro: `'block' is a block and takes no arguments`.
 - **No recursion.** A macro that calls itself has no way to stop, and more than 64
   nested calls is an error.
-- **Reserved names.** `model`, `d_model`, `vocab_size`, `residual` and the training
-  settings cannot be macros.
+- **Reserved names.** `model`, `d_model`, `vocab_size`, `residual`, `init` and the
+  training settings cannot be macros.
 
 A macro call is labeled by its text. `bux render` draws DeepSeek-V3's
 `layer(dense)^3 layer(experts)^58` as two blocks:

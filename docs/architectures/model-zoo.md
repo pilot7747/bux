@@ -1,6 +1,6 @@
 # Model zoo
 
-The model zoo is `examples/architectures/`: 40 `.bux` files, each a model you can
+The model zoo is `examples/architectures/`: 43 `.bux` files, each a model you can
 `use` by name, shrink, sweep or train. This page says what the files are, how to use
 one, and how to add your own, then lists every model with its description, its
 layer counts and its source.
@@ -21,8 +21,8 @@ Each file transcribes a public model's configuration:
   ResFormer, nGPT, mHC and modded-nanogpt. They transcribe public configs from
   memory. Ones marked "-style" or "approximate" simplify details, so verify the
   numbers before relying on them.
-- The folders, one per model family (`cohere/`, `deepseek/`, `glm/`, `inkling/`,
-  `kimi/`, `laguna/`, `mellum/`, `mimo/`, `muse/`, `nemotron/`, `qwen/`,
+- The folders, one per model family (`arcee/`, `cohere/`, `deepseek/`, `glm/`,
+  `inkling/`, `kimi/`, `laguna/`, `mellum/`, `mimo/`, `muse/`, `nemotron/`, `qwen/`,
   `reflection/`), transcribe recent releases from their published `config.json` and
   modeling code.
 

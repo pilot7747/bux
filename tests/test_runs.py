@@ -425,6 +425,8 @@ def test_the_id_follows_what_a_run_computes():
     [
         ("ffn", "up_offset", "0.0", "1.0"),
         ("moe(num_experts=4, top_k=2, expert=ffn)", "router_bias", "false", "true"),
+        ("moe(num_experts=4, top_k=2, expert=ffn)", "center_bias", "false", "true"),
+        ("moe(num_experts=4, top_k=2, expert=ffn)", "bias_momentum", "0.5", "0.9"),
         ("mamba2(state_size=8, head_dim=8)", "num_heads", "none", "4"),
     ],
 )
@@ -442,6 +444,8 @@ def test_a_layer_field_newer_than_ids_keeps_them_where_it_computes_as_before(
     old = {
         "up_offset": "a8fa406e9b",
         "router_bias": "ba4e9ec7b8",
+        "center_bias": "ba4e9ec7b8",
+        "bias_momentum": "ba4e9ec7b8",
         "num_heads": "ccdcaff2f8",
     }
     assert run_of(None).id == run_of(before).id == old[field] != run_of(after).id

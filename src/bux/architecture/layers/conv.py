@@ -66,7 +66,7 @@ class CausalConv(nnx.Module):
         zero: bool = False,
         channel: parallel.Name = None,
     ):
-        init = nnx.initializers.zeros if zero else nnx.initializers.lecun_normal()
+        init = nnx.initializers.zeros if zero else parallel.default_init()
         weight = init(rngs.params(), (size, channels))
         self.weight = nnx.Param(weight, names=(None, channel))
         self.bias = nnx.Param(jnp.zeros(channels), names=(channel,)) if bias else None
