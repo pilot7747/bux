@@ -209,6 +209,7 @@ def reference_model(arch: Any, dtype: str) -> Any:
     from bux.export.check import perturbed
 
     model = perturbed(Model(arch, rngs=nnx.Rngs(0)), 1)
+    model.eval()  # inference: no dropout
     for path, var in nnx.iter_graph(model):
         if path and path[-1] == "router_bias" and isinstance(var, nnx.Variable):
             key = jax.random.key(len(path))

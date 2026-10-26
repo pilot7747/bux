@@ -20,6 +20,17 @@ from .plan import live, plan
 #: The kind of state each stateful layer type keeps, as vLLM's ``layer_types``.
 STATES = {"gqa": "full_attention", "mamba2": "mamba", "gdn": "linear_attention"}
 
+#: What ``config.json`` says of transformers' cache layers, which vLLM reads
+#: otherwise (a model-wide ``sliding_window`` would window every layer): the layers'
+#: own settings are in the IR.
+TRANSFORMERS_CACHE = (
+    "layer_types",
+    "num_hidden_layers",
+    "per_layer_config",
+    "sliding_window",
+    "number_of_conv_states",
+)
+
 
 class BuxConfig(PreTrainedConfig):
     """A bux architecture as vLLM loads it: ``bux`` is its IR as JSON
@@ -35,8 +46,8 @@ class BuxConfig(PreTrainedConfig):
         hidden_size: int = 0,
         **kwargs: Any,
     ):
-        kwargs.pop("layer_types", None)  # transformers' cache layers; vLLM's below
-        kwargs.pop("num_hidden_layers", None)
+        for name in TRANSFORMERS_CACHE:  # its cache layers'; vLLM's are set below
+            kwargs.pop(name, None)
         super().__init__(**kwargs)
         self.bux, self.bux_sites = bux, bux_sites
         self.vocab_size, self.hidden_size = vocab_size, hidden_size
