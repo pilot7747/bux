@@ -257,6 +257,31 @@ Before, a window-only layer went to tokamax's flash kernels, which find no tile 
 shared memory at 512 dims. At 32k a `pairs` layer's 100 ms are mostly its indexer's: the
 attention and the target take 18.
 
+DeepSeek-V4.1-Flash shrunk to one B300 (its attention, width, vocabulary and mHC
+stream; 8 of its 40 layers, one of each kind; 16 of its 384 experts; no Engram), and
+the same without its window-only layer, in bfloat16, `remat=none`. Before, the tree also
+kept mHC's stream in float32, which ran every layer in float32 (fixed beside the kernels,
+`residual._pending`); "stream" is the tree before with that fix alone:
+
+| tokens a row × rows | before | stream | now |
+|---------------------|--------|--------|-----|
+| 4096 × 4 | 3.70k tok/s, 251 GiB | | 31.7k, 166 GiB |
+| 16384 × 1 | out of memory | | 27.8k, 166 GiB |
+| 32768 × 1 | out of memory | | 26.3k, 234 GiB |
+| 16384 × 1, no window-only layer | 2.15k, 223 GiB | 3.69k, 148 GiB | 31.3k, 148 GiB |
+| 32768 × 1, no window-only layer | out of memory | 1.95k, 207 GiB | 28.6k, 208 GiB |
+
+The tree before cannot run the window-only layer with the stream in bfloat16: tokamax's
+kernels do not compile at 512 dims. At 16k the step's attention is 65 ms of 579 now,
+its experts' grouped GEMMs 136.
+
+A ~0.5B V4-style model (16 heads of 512, a window of 128 and the top 512, three of
+four layers reusing the last one's latents and picks) trained 2000 steps of FineWeb-Edu
+(8 × 4096 a step, GEMM autotuning off, deterministic ops) at 57.2k tokens a second in
+54.8 GiB by the kernels, against 25.0k in 79.2 GiB by XLA (`methods.attention = xla`
+in the tree before). Its held-out loss at four seeds is XLA's to within 0.0011 (4.4136
+against 4.4140 on average), where the seeds spread over 0.088.
+
 (kernels-matmul-formats)=
 
 ### Low-precision matmuls
