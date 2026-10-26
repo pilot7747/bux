@@ -39,7 +39,9 @@ from bux.studio.view import view
 #: A JSON object, as the API sends it.
 type Json = dict[str, Any]
 
-#: Where the page's files are.
+#: Where the page's files are: ``static/`` beside this module.
+#:
+#: :meta hide-value:
 STATIC = Path(__file__).parent / "static"
 
 #: What a file that does not exist yet starts as: a small model and its run.
@@ -407,6 +409,9 @@ class Handler(BaseHTTPRequestHandler):
 
     def send(self, status: int, data: bytes, kind: str) -> None:
         self.send_response(status)
+        if status >= 400:  # a body it refused may be unread: it ends the connection
+            self.send_header("Connection", "close")
+            self.close_connection = True
         self.send_header("Content-Type", kind)
         self.send_header("Content-Length", str(len(data)))
         self.send_header("Cache-Control", "no-store")

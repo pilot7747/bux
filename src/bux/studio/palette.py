@@ -296,12 +296,6 @@ def _(c: cfg.ActivationConfig) -> str:
     return name(c.fn)
 
 
-@titles.register("head")
-def _(c: cfg.LMHeadConfig) -> str:
-    """The output layer, tied to the embedding or not."""
-    return "Linear output layer (tied)" if c.tied else names["head"]
-
-
 # --- Chips ---------------------------------------------------------------------------
 
 
@@ -323,10 +317,10 @@ def _(c: cfg.LMHeadConfig, ctx: Context) -> list[str]:
 
 @chips.register("rmsnorm", "layernorm")
 def _(c: cfg.NormalizationConfig, ctx: Context) -> list[str]:
-    """Only what is unusual: a gain from 1 + w, none, or a bias."""
+    """Only what is unusual: a zero-centered gain, 1 + w, none, or a bias."""
     return _first(
         [
-            "1 + w" if c.zero_centered else "",
+            "zero-centered" if c.zero_centered else "",
             "no gain" if not c.affine else "",
             "bias" if c.bias else "",
         ]
