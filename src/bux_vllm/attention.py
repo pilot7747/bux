@@ -42,6 +42,7 @@ class Attention(Layer):
     def __init__(self, c: dict, width: int, site: Site):
         super().__init__()
         unsupported(c, "kv_conv_size", "indexer", "relative_bias", "log_scale")
+        unsupported(c, "power_scale", *(("gate_head_bias",) if c["gated"] else ()))
         if c["qk_norm"] and c["qk_norm_all_heads"]:
             # Its statistics would sum over every rank's heads under tensor parallelism.
             raise NotImplementedError("gqa: qk_norm_all_heads not in vLLM yet")
