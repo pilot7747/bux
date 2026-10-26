@@ -13,7 +13,9 @@ The names are the fields of ``layout`` (`DIMENSIONS`): ``batch``, ``seq``,
 ``latent``, ``layers`` and ``stages``.
 """
 
-from collections.abc import Collection, Sequence
+from collections.abc import Collection, Generator, Sequence
+from contextlib import contextmanager
+from contextvars import ContextVar
 
 import jax
 from flax import nnx
@@ -40,6 +42,8 @@ Entry = str | tuple[str, ...] | None  # one dimension of a PartitionSpec
 #: Such a dimension splits only at the boundaries between them.
 Name = str | tuple[str, int] | None
 LECUN = nnx.initializers.lecun_normal()  # nnx.Linear's kernel_init
+# What every weight matrix starts by while a model with an `init` is built.
+_INIT: ContextVar[nnx.Initializer | None] = ContextVar("init", default=None)
 
 
 def axes(layout: LayoutConfig, name: Name) -> Split:
@@ -194,15 +198,35 @@ def shard_stream(x: Shaped[Array, "b t *r"]) -> Shaped[Array, "b t *r"]:
     return shard(x, "batch", "stream", *(None,) * (x.ndim - 2))
 
 
+@contextmanager
+def initializing(init: nnx.Initializer | None) -> Generator[None]:
+    """Start every weight matrix made inside by `init`, instead of by its layer's
+    default (`default_init`): a model whose architecture sets ``init`` is built in
+    one. None keeps the layers' defaults."""
+    token = _INIT.set(init)
+    try:
+        yield
+    finally:
+        _INIT.reset(token)
+
+
+def default_init(own: nnx.Initializer = LECUN) -> nnx.Initializer:
+    """Return how a weight matrix that its layer would start by `own` starts: by the
+    init of the model being built (`initializing`) if it sets one, else by `own`."""
+    return _INIT.get() or own
+
+
 def named(
     *names: Name,
-    init: nnx.Initializer = LECUN,
+    init: nnx.Initializer | None = None,
 ) -> nnx.Initializer:
     """Wrap `init` to name the dimensions of its parameters, for ``kernel_init=``.
 
     Args:
         *names: A name for each dimension of the parameter (`Name`).
-        init: The initializer to wrap: LeCun normal, as `flax.nnx.Linear`'s.
+        init: The initializer to wrap; None for a weight matrix's default,
+            `default_init`: LeCun normal, as `flax.nnx.Linear`'s, unless the model
+            sets an ``init``.
 
     Raises:
         ValueError: If a name is not one of `DIMENSIONS`, with or without a mesh.
@@ -213,4 +237,5 @@ def named(
     """
     for name in names:
         axes(LayoutConfig(), name)  # an unknown name fails here, with or without a mesh
+    init = default_init() if init is None else init
     return nnx.with_metadata(init, names=names)  # under NAMES

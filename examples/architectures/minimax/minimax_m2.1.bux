@@ -1,0 +1,5 @@
+# MiniMax-M2.1 (MiniMax, 2025): the release after MiniMax-M2, optimized for robustness
+# in coding, tool use, instruction following and long-horizon planning, and a large
+# step over M2 in software engineering, multilingual above all. Its config is M2's,
+# and so is its architecture: 230B parameters, 10B of them active a token.
+use minimax_m2

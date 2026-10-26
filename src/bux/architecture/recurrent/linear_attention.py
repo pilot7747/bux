@@ -483,7 +483,8 @@ class LowRank(nnx.Module):
         orthogonal: Start it as RWKV-7 does, A at zero and B orthogonal, scaled by
             0.1; otherwise A and B start from `init`.
         out: The name of the outputs' dimension (`bux.parallel`).
-        init: Where A and B start, unless `orthogonal`: as dense layers do.
+        init: Where A and B start, unless `orthogonal` or the model sets an ``init``
+            (`bux.parallel.default_init`).
     """
 
     def __init__(
@@ -504,6 +505,7 @@ class LowRank(nnx.Module):
             down = jnp.zeros((n_in, rank))
             up = nnx.initializers.orthogonal(gain)(rngs.params(), (rank, n_out))
         else:
+            init = parallel.default_init(init)
             down = init(rngs.params(), (n_in, rank))
             up = init(rngs.params(), (rank, n_out))
         self.down = nnx.Param(down, names=("embed", "latent"))
@@ -525,8 +527,8 @@ def into_heads(
     width: int, heads: int, dim: int, rngs: nnx.Rngs, init: nnx.Initializer = LECUN
 ) -> nnx.Linear:
     """Make a projection of the width to `heads` heads of `dim` channels, side by
-    side, its kernel from `init`."""
-    named = parallel.named("embed", ("heads", heads), init=init)
+    side, its kernel from `init`, unless the model sets an ``init``."""
+    named = parallel.named("embed", ("heads", heads), init=parallel.default_init(init))
     return projection(
         width, heads * dim, "recurrence", use_bias=False, kernel_init=named, rngs=rngs
     )
@@ -658,7 +660,9 @@ class LinearAttention(nnx.Module):
             width,
             "recurrence_out",
             use_bias=False,
-            kernel_init=parallel.named(("heads", hv), "embed", init=init),
+            kernel_init=parallel.named(
+                ("heads", hv), "embed", init=parallel.default_init(init)
+            ),
             rngs=rngs,
         )
 

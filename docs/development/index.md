@@ -34,7 +34,9 @@ every array is annotated: write `Float[Array, "b t d"]`, not `jax.Array`. Every
 function says what it takes and returns (ruff's `ANN` rules).
 
 The whole suite takes a while on a laptop; while you work, run the files that cover
-what you changed, `uv run pytest tests/test_lang.py -q`.
+what you changed, `uv run pytest tests/test_lang.py -q`. CI splits it over four
+runners by a hash of each test's id: `BUX_SHARD=2/4 make test` runs the third one's
+share ([environment variables](../reference/environment.md#bux)).
 
 ## The code
 

@@ -67,7 +67,9 @@ compiler checks that every residual branch comes back to the width it started at
 A setting that is not a layer parametrizes one: {bux}`rope` and its scalings go in an
 attention's `rope=`, {bux}`indexer` in its `indexer=`, and the residual algebras
 (`hc`, `mhc`, `gr`, `attnres`, `vpgate`) in the top-level `residual =`, which changes
-what every `[f]` means ([Residual algebras](../language/residual-algebras.md)).
+what every `[f]` means ([Residual algebras](../language/residual-algebras.md)). The
+top-level `init =` says how every weight matrix starts
+([Initialization](layers.md#initialization)).
 
 :::{note}
 Rows can hold several packed documents. Given the positions of the tokens in their
@@ -118,7 +120,7 @@ bias.
 :link: model-zoo
 :link-type: doc
 
-36 example architectures, from GPT-2 to 2026's releases, each a file to `use`
+51 example architectures, from GPT-2 to 2026's releases, each a file to `use`
 and shrink.
 :::
 

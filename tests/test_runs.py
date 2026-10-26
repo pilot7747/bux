@@ -420,12 +420,57 @@ def test_the_id_follows_what_a_run_computes():
     assert run.id == renamed.id == watched.id != changed.id
 
 
+MOE = "moe(num_experts=4, top_k=2, expert=ffn)"
+MLA = (
+    "mla(num_heads=2, kv_lora_rank=8, qk_nope_head_dim=4, qk_rope_head_dim=4,"
+    " v_head_dim=4)"
+)
+CSA = "csa(num_heads=2, head_dim=8, sliding_window_size=4)"
+# An indexer, open for the settings after it.
+INDEXER = "indexer(num_heads=2, head_dim=8, "
+
+
 @pytest.mark.parametrize(
     ("layer", "field", "before", "after"),
     [
         ("ffn", "up_offset", "0.0", "1.0"),
-        ("moe(num_experts=4, top_k=2, expert=ffn)", "router_bias", "false", "true"),
+        (MOE, "router_bias", "false", "true"),
+        (MOE, "center_bias", "false", "true"),
+        (MOE, "bias_momentum", "0.5", "0.9"),
         ("mamba2(state_size=8, head_dim=8)", "num_heads", "none", "4"),
+        ("gqa(num_heads=2, num_kv_heads=2)", "power_scale", "none", "0.1"),
+        (
+            "gqa(num_heads=2, num_kv_heads=2, gated=true)",
+            "gate_head_bias",
+            "false",
+            "true",
+        ),
+        (
+            "gqa(num_heads=2, num_kv_heads=2, qk_norm=norm)",
+            "qk_norm_all_heads",
+            "false",
+            "true",
+        ),
+        (
+            f"gqa(num_heads=2, num_kv_heads=2, indexer={INDEXER}top_k=4))",
+            "relu",
+            "true",
+            "false",
+        ),
+        (
+            f"gqa(num_heads=2, num_kv_heads=2, indexer={INDEXER}top_k=8, block_size=4))",
+            "pool",
+            "mean",
+            "max",
+        ),
+        (
+            f"gqa(num_heads=2, num_kv_heads=2, indexer={INDEXER}top_k=4, weighted=false))",
+            "per_group",
+            "false",
+            "true",
+        ),
+        (MLA, "gate_head_bias", "false", "true"),
+        (CSA, "gate_head_bias", "false", "true"),
     ],
 )
 def test_a_layer_field_newer_than_ids_keeps_them_where_it_computes_as_before(
@@ -433,18 +478,34 @@ def test_a_layer_field_newer_than_ids_keeps_them_where_it_computes_as_before(
 ):
     def run_of(value: str | None) -> Run:
         given = "" if value is None else f"{field}={value}"
-        new = layer.replace(")", f", {given})") if "(" in layer else f"{layer}({given})"
+        # Into the first settings that close: the indexer's, inside the layer's.
+        new = (
+            layer.replace(")", f", {given})", 1)
+            if "(" in layer
+            else f"{layer}({given})"
+        )
         source = ARCH.replace("block = [norm attn] [norm ffn]", f"block = [norm {new}]")
         [run] = runs(source + TRAIN)
         return run
 
-    # The ids of main 0f0cfe2, before these fields.
+    # The ids before these fields: of main 0f0cfe2, of d4a8e27 for the attention's,
+    # and of a4268fb for the indexer's.
     old = {
-        "up_offset": "a8fa406e9b",
-        "router_bias": "ba4e9ec7b8",
-        "num_heads": "ccdcaff2f8",
-    }
-    assert run_of(None).id == run_of(before).id == old[field] != run_of(after).id
+        ("ffn", "up_offset"): "a8fa406e9b",
+        ("moe", "router_bias"): "ba4e9ec7b8",
+        ("moe", "center_bias"): "ba4e9ec7b8",
+        ("moe", "bias_momentum"): "ba4e9ec7b8",
+        ("mamba2", "num_heads"): "ccdcaff2f8",
+        ("gqa", "power_scale"): "4de8bfe6fd",
+        ("gqa", "gate_head_bias"): "370e873062",
+        ("gqa", "qk_norm_all_heads"): "9a5d6c3ed2",
+        ("mla", "gate_head_bias"): "fa0bdd5558",
+        ("csa", "gate_head_bias"): "e1e9cc3d90",
+        ("gqa", "relu"): "610bb9cf51",
+        ("gqa", "pool"): "b7e22463de",
+        ("gqa", "per_group"): "73f1c2e501",
+    }[layer.split("(")[0], field]
+    assert run_of(None).id == run_of(before).id == old != run_of(after).id
 
 
 @pytest.mark.parametrize("path", EXPERIMENTS, ids=lambda p: p.stem)

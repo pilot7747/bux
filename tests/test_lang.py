@@ -404,6 +404,15 @@ def test_residual_algebras_and_their_errors():
     assert "hc(...)" in err.message and "vpgate(...)" in err.message
 
 
+def test_init_is_a_normal_of_the_model_and_its_errors():
+    a = build("init = normal(std=0.5 * d_model ^ -0.5, truncate=3)\nmodel = embed head")
+    assert a.init == cfg.NormalInitConfig(std=0.125, truncate=3)
+    assert "init = normal(std=0.125, truncate=3.0)" in to_source(a)
+    assert build("model = embed head").init is None
+    err = error("init = 0.02\nmodel = embed head")
+    assert "'init' must be normal(...), found" in err.message
+
+
 MEMORY = "mem = engram(head_dim=4, table_size=50)\n"
 
 

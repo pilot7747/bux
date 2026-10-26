@@ -3,6 +3,7 @@ what they share with GQA (tests/test_backend.py has GQA's own); and all of them 
 by head over the 8 CPU devices the tests have, against one device."""
 
 import math
+from pathlib import Path
 
 import jax
 import jax.numpy as jnp
@@ -72,6 +73,13 @@ BODIES = {
         " indexer=small(top_k=4, block_size=2, weighted=false))\n"
         "model = embed [norm a] [norm ffn] norm head"
     ),
+    # MiniMax MSA: max-pooled blocks, a pick for each kv head's group, plain dots
+    "gqa_msa": (
+        "a = gqa(num_heads=4, num_kv_heads=2, rope=rope(fraction=0.5), sliding_window_size=7,"
+        " indexer=small(top_k=4, block_size=2, pool=max, per_group=true, relu=false,"
+        " weighted=false))\n"
+        "model = embed [norm a] [norm ffn] norm head"
+    ),
     "csa_window": "model = embed [norm window] [norm ffn] norm head",
     "csa_compressed": (
         "model = embed [norm window(compress_ratio=2, indexer=small(top_k=2))]"
@@ -121,16 +129,24 @@ def causal(t: int, window: int | None = None):
 
 
 def keeps(kept, visible):
-    """Which keys `kept` keeps, of those `visible` says each query sees."""
+    """Which keys `kept` keeps, of those `visible` says each query sees: (b, t, s), or
+    (b, t, g, s) for kept keys of each of g groups."""
     b, t, s = visible.shape
     every = sparse.Span(jnp.zeros((b, t), jnp.int32), jnp.full((b, t), s, jnp.int32))
-    return sparse.mask(every, s, None, kept) & visible
+    picked = sparse.mask(every, s, None, kept)
+    return picked & (visible if picked.ndim == 3 else visible[:, :, None])
+
+
+def per_head(groups, h):
+    """Each of h query heads' mask, its group's of (b, t, g, s), as (b, h, t, s)."""
+    return jnp.repeat(jnp.moveaxis(groups, 2, 1), h // groups.shape[2], axis=1)
 
 
 def attention_probs(q, k, scale, mask, sinks=None):
-    """softmax(q . k * scale) over the keys `mask` keeps, next to the heads' sinks."""
+    """softmax(q . k * scale) over the keys `mask` keeps, next to the heads' sinks;
+    `mask` is every head's, (b, t, s), or each head's, (b, h, t, s)."""
     logits = jnp.einsum("bthd,bshd->bhts", q, k) * scale
-    logits = jnp.where(mask[:, None], logits, -jnp.inf)
+    logits = jnp.where(mask[:, None] if mask.ndim == 3 else mask, logits, -jnp.inf)
     if sinks is not None:
         sink = jnp.broadcast_to(sinks[None, :, None, None], (*logits.shape[:3], 1))
         logits = jnp.concatenate([logits, sink], -1)
@@ -158,7 +174,7 @@ def test_layers_run_and_are_causal(body):
 
 @pytest.mark.parametrize(
     "body",
-    ["mla_indexer", "gqa_block_indexer", "csa_compressed", "csa_ports"],
+    ["mla_indexer", "gqa_block_indexer", "gqa_msa", "csa_compressed", "csa_ports"],
 )
 def test_documents_packed_in_a_row_see_only_themselves(body):
     """With an odd first document, a compressed group or an indexer's block that ran on
@@ -273,12 +289,19 @@ def mla(indexer=None):
     return build_mla(c, D, (), nnx.Rngs(0))
 
 
+MSA = {"block_size": 3, "pool": "max", "per_group": True, "relu": False}
 INDEXERS = {
     "gqa": lambda indexer: gqa(indexer=indexer),
     "gqa_blocks": lambda indexer: gqa(
         indexer=indexer and indexer.model_copy(update={"block_size": 3})
     ),
+    "gqa_msa": lambda indexer: gqa(
+        indexer=indexer and indexer.model_copy(update=MSA | {"weighted": False})
+    ),
     "mla": mla,
+    "mla_max_blocks": lambda indexer: mla(
+        indexer and indexer.model_copy(update={"block_size": 3, "pool": "max"})
+    ),
     "csa": lambda indexer: csa(
         compress_ratio=2, sliding_window_size=2, indexer=indexer
     ),
@@ -370,6 +393,139 @@ def test_qsa_keeps_the_blocks_qwen_does():
             scores = jax.nn.relu(q[row, i] @ k.T).sum(0)
             expected = expected.at[row, i, blocks[jnp.argsort(-scores)[:2]]].set(True)
     assert (keeps(selected, visible) == expected).all()
+
+
+ZERO_CENTERED = cfg.NormalizationConfig(type="rmsnorm", zero_centered=True)
+# MiniMax MSA's: one indexer head for each kv head, plain dot products, and a block's
+# best score
+GROUPS = {"per_group": True, "relu": False, "weighted": False}
+MAX_BLOCKS = {"block_size": 4, "pool": "max"}
+
+
+def msa(ports=(), window=None, **kw):
+    """MiniMax MSA's attention: gqa whose indexer has a head for each of its 2 kv
+    heads, of 16 dims, a pick of the best 2 blocks of 4 keys for each group."""
+    small = {"num_heads": 2, "head_dim": 16, "top_k": 8, "norm": ZERO_CENTERED}
+    settings = small | GROUPS | MAX_BLOCKS | kw
+    c = cfg.SparseIndexerConfig.model_validate(settings)
+    return gqa(ports, indexer=c, sliding_window_size=window)
+
+
+def msa_scores(ix, x, pos=None):
+    """MSA's scores, (b, t, g, s): each group's head's plain dot products with the keys
+    over sqrt(16), its queries and keys normalized, then their first 8 dims (the
+    layer's head dims) turned."""
+    assert ix.k is not None and ix.k_norm is not None and ix.q_norm is not None
+    b, t, _ = x.shape
+
+    def turn(a):
+        return jnp.concatenate([rotate(a[..., :8], ix.rope, pos), a[..., 8:]], -1)
+
+    q = turn(ix.q_norm(ix.q(x).reshape(b, t, 2, 16)))
+    k = turn(ix.k_norm(ix.k(x))[:, :, None])[:, :, 0]
+    return jnp.einsum("btgi,bsi->btgs", q, k) / 4
+
+
+@pytest.mark.parametrize("window", [None, 7])
+def test_msa_keeps_the_blocks_minimax_does(window):
+    """MiniMax MSA's selection as transformers' MiniMaxM3VLIndexer makes it, query by
+    query and group by group: a block of 4 keys, counted from its document's start,
+    scores the best of its keys the query sees; the query keeps its own block and the
+    best other one, 8 keys' worth, for each group apart."""
+    attn = msa(index_port("write"), window=window)
+    ix = attn.indexer
+    assert ix is not None and ix.q_norm is not None and ix.k_norm is not None
+    ix.q_norm.scale[...] = jax.random.normal(jax.random.key(3), (16,))
+    ix.k_norm.scale[...] = jax.random.normal(jax.random.key(4), (16,))
+    pos = jnp.concatenate([jnp.arange(9), jnp.arange(23) + 5])[None].repeat(2, 0)
+    x, taps = inputs(length=32), Taps(segments=Segments.of(pos))
+    attn(x, taps)
+    [selected] = taps["topk"]
+    scores = np.asarray(msa_scores(ix, x, pos))
+    doc = np.arange(32) >= 9
+    visible = np.asarray(causal(32, window)) & (doc[:, None] == doc[None])
+    block = np.where(doc, 100 + (np.arange(32) - 9) // 4, np.arange(32) // 4)
+    expected = np.zeros((2, 32, 2, 32), bool)
+    for row, i, r in np.ndindex(2, 32, 2):
+        seen = visible[row, i]
+        best = {m: scores[row, i, r][seen & (block == m)].max() for m in block[seen]}
+        others = sorted(set(best) - {block[i]}, key=lambda m: (-best[m], m))
+        for m in [block[i], *others[:1]]:
+            expected[row, i, r] |= seen & (block == m)
+    got = np.asarray(keeps(selected, jnp.asarray(visible)))
+    assert (got == expected).all()
+    assert (expected[:, :, 0] != expected[:, :, 1]).any()  # the groups pick apart
+
+
+def test_msa_attends_each_group_to_its_own_blocks():
+    """Each group of query heads attends to its own picks; with every block kept, the
+    layer is dense attention."""
+    attn = msa(index_port("write"), top_k=4, block_size=2)
+    x, taps = inputs(), Taps()
+    y = attn(x, taps)
+    selected = keeps(taps["topk"][0], causal(12))
+    i = jnp.arange(12)
+    own, other = i % 2 + 1, jnp.where(i >= 2, 2, 0)  # its block's keys, and another's
+    assert (selected.sum(-1) == (own + other)[:, None]).all()
+    assert jnp.allclose(y, gqa_reference(attn, x, per_head(selected, 4)), atol=1e-5)
+    every = msa(top_k=12, block_size=2)
+    assert jnp.allclose(every(x, Taps()), gqa()(x, Taps()), atol=1e-5)
+
+
+def test_per_group_without_blocks_keeps_each_groups_best_keys():
+    """Each group's head keeps the 3 best keys the query sees by its own scores, the
+    group attends to them, and the loss is MSA's over them."""
+    attn = msa(index_port("write"), top_k=3, block_size=1)
+    assert attn.indexer is not None
+    x, taps = inputs(), Taps(training=True)
+    y = attn(x, taps)
+    [kept], [loss] = taps["topk"], taps.losses
+    selected, seen = keeps(kept, causal(12)), causal(12)[:, :, None]
+    scores = msa_scores(attn.indexer, x)
+    best = jnp.argsort(-jnp.where(seen, scores, -jnp.inf), axis=-1)[..., :3]
+    assert (selected == jax.nn.one_hot(best, 12).sum(-2).astype(bool) & seen).all()
+    assert jnp.allclose(y, gqa_reference(attn, x, per_head(selected, 4)), atol=1e-5)
+    q, k, _ = gqa_heads(attn, x)
+    p = attention_probs(q, k, attn.scale, per_head(selected, 4))
+    p = jnp.moveaxis(p.reshape(2, 2, 2, 12, 12).mean(2), 1, 2)
+    assert jnp.allclose(loss.value, kl(p, scores, selected).mean(), atol=1e-6)
+
+
+def test_a_layer_reading_an_msa_index_attends_by_its_groups():
+    """A per-group index is read by a layer with as many kv heads alone."""
+    writer = msa(index_port("write"), top_k=4, block_size=2)
+    reader = gqa(index_port("read"))
+    x, taps = inputs(), Taps()
+    writer(x, taps)
+    selected = keeps(taps["topk"][0], causal(12))
+    h = inputs(2)
+    expected = gqa_reference(reader, h, per_head(selected, 4))
+    assert jnp.allclose(reader(h, taps), expected, atol=1e-5)
+    mha = build_gqa(
+        cfg.GQAConfig(num_heads=4, num_kv_heads=4), D, index_port("read"), nnx.Rngs(0)
+    )
+    with pytest.raises(ValueError, match="4 kv heads cannot read an index"):
+        mha(h, taps)
+
+
+def test_msa_settings_that_do_not_go_together_say_so():
+    small = {"num_heads": 2, "head_dim": 8}
+
+    def indexer(**kw):
+        return cfg.SparseIndexerConfig.model_validate(small | GROUPS | kw)
+
+    with pytest.raises(ValueError, match="set weighted=false"):
+        indexer(weighted=True)
+    with pytest.raises(ValueError, match="takes pool=max"):
+        indexer(block_size=4)
+    with pytest.raises(ValueError, match="less than one block"):
+        indexer(**MAX_BLOCKS, top_k=2)
+    with pytest.raises(ValueError, match="num_heads=2 is not 4"):
+        cfg.GQAConfig(num_heads=8, num_kv_heads=4, indexer=indexer(**MAX_BLOCKS))
+    with pytest.raises(ValueError, match="which gqa has alone"):
+        cfg.MLAConfig(num_heads=4, indexer=indexer(**MAX_BLOCKS))
+    with pytest.raises(NotImplementedError, match="max-pooled blocks"):
+        csa(compress_ratio=2, indexer=small | MAX_BLOCKS)
 
 
 def test_glms_indexer_turns_its_rope_dims_in_interleaved_pairs():
@@ -614,6 +770,42 @@ def test_qsas_loss_is_over_the_blocks_kept_each_by_its_most_attended_key():
     assert jnp.allclose(loss.value, kl(blocks, scores, kept).mean(), atol=1e-6)
 
 
+@pytest.mark.parametrize("top_k", [4, 12])
+def test_msas_loss_is_the_kl_of_each_group_over_the_keys_of_its_blocks(top_k):
+    """MiniMax MSA's: for each query and group, KL(p || softmax(I)) over the keys the
+    query sees of the blocks the group kept, p the mean of the group's heads'
+    attention and I its head's dot products over sqrt(16); averaged over the queries
+    and the groups. With every block kept, it is the dense warm-up's, over every key
+    the query sees."""
+    attn = msa(index_port("write"), top_k=top_k, block_size=2)
+    assert attn.indexer is not None
+    x, taps = inputs(), Taps(training=True)
+    attn(x, taps)
+    [kept], [loss] = taps["topk"], taps.losses
+    selected = keeps(kept, causal(12))
+    assert top_k < 12 or (selected == causal(12)[:, :, None]).all()
+    q, k, _ = gqa_heads(attn, x)
+    p = attention_probs(q, k, attn.scale, per_head(selected, 4))
+    p = jnp.moveaxis(p.reshape(2, 2, 2, 12, 12).mean(2), 1, 2)
+    scores = msa_scores(attn.indexer, x)
+    assert jnp.allclose(loss.value, kl(p, scores, selected).mean(), atol=1e-6)
+
+
+def test_the_language_modeling_loss_does_not_train_an_msa_indexer():
+    """Its picks pass no gradient: only its own loss trains it."""
+    m, t = model(BODIES["gqa_msa"]), tokens()
+
+    def lm(m):
+        [head], _ = m.training_heads(t)
+        return head.logits().mean()
+
+    grads = nnx.grad(lm)(m)
+    for path, g in jax.tree_util.tree_leaves_with_path(grads):
+        name = jax.tree_util.keystr(path)
+        assert "['indexer']" not in name or not g.any(), name
+    assert any(bool(g.any()) for g in jax.tree.leaves(grads))
+
+
 def test_csas_loss_is_against_the_attention_its_window_and_sinks_share():
     """DeepSeek-V4's: the latents' part of the attention, whose softmax the window and
     the sinks are in too, and not an attention to the latents alone."""
@@ -683,7 +875,8 @@ def indexer_loss(m, t, positions=None):
 
 
 @pytest.mark.parametrize(
-    "body", ["mla_indexer", "gqa_block_indexer", "csa_ports", "mla_index_ports"]
+    "body",
+    ["mla_indexer", "gqa_block_indexer", "gqa_msa", "csa_ports", "mla_index_ports"],
 )
 def test_the_indexer_loss_trains_the_indexers_and_nothing_else(body):
     """Their inputs are detached, and so is the attention they learn from: none of its
@@ -732,8 +925,65 @@ def test_training_on_the_indexer_loss_alone_makes_it_keep_what_attention_attends
     assert last < first / 2 and agreement() > before + 0.1
 
 
+M3 = "examples/architectures/minimax/minimax_m3.bux"
+M3_SHRUNK = [
+    f"d_model = {D}",
+    f"vocab_size = {V}",
+    (
+        "attn = gqa(num_heads=4, num_kv_heads=2, head_dim=8, qk_norm=norm,"
+        " rope=rope(fraction=0.5))"
+    ),
+    (
+        "msa = attn(indexer=indexer(num_heads=2, head_dim=8, top_k=TOP_K, block_size=2,"
+        " pool=max, per_group=true, relu=false, weighted=false, norm=norm))"
+    ),
+    (
+        "dense = gated_mlp(intermediate_size=8, activation=quick_gelu, limit=7.0,"
+        " up_offset=1.0)"
+    ),
+    (
+        "experts = moe(num_experts=4, top_k=2, num_shared_experts=1, router=sigmoid,"
+        " routed_scaling_factor=2.0, load_balancing=aux_free, expert=dense)"
+    ),
+]
+
+
+def test_minimax_m3_trains_through_its_dense_warm_up_and_then_sparse():
+    """MiniMax-M3, shrunk, in its two stages: its MSA layers keep every block of the
+    12 keys a row has, then 2 blocks of 2 keys, from the warm-up's parameters. The
+    stages differ in top_k alone, which no parameter depends on: the indexer learns
+    in the warm-up, and the sparse stage attends otherwise and trains on."""
+    path = Path(__file__).parents[1] / M3
+
+    def stage(top_k: int, state: nnx.State | None = None):
+        overrides = [s.replace("TOP_K", str(top_k)) for s in M3_SHRUNK]
+        arch = compile(path.read_text(), overrides=overrides)
+        m = Model(arch, rngs=nnx.Rngs(0))
+        if state is not None:
+            nnx.update(m, state)
+        return m, Trainer(m, optax.adam(1e-2), objective(tcfg.LossConfig(), arch))
+
+    t = tokens()
+    batch = Batch(np.asarray(t), np.tile(np.arange(12), (2, 1)), np.ones((2, 12), bool))
+    _, trainer = stage(12)
+    first = trainer.train_on_batch(batch)
+    for _ in range(8):
+        last = trainer.train_on_batch(batch)
+    assert last["indexer_loss"] < first["indexer_loss"]
+    state = nnx.state(trainer.model)
+    sparse_m, trainer = stage(4, state)
+    assert jax.tree.structure(nnx.state(sparse_m)) == jax.tree.structure(state)
+    assert not jnp.allclose(sparse_m(t), stage(12, state)[0](t), atol=1e-4)
+    metrics = [trainer.train_on_batch(batch) for _ in range(3)]
+    assert all(
+        np.isfinite(m["indexer_loss"]) and m["indexer_loss"] > 0 for m in metrics
+    )
+    assert all(np.isfinite(m["grad_norm"]) for m in metrics)
+
+
 @pytest.mark.parametrize(
-    "body", ["mla_indexer", "gqa_block_indexer", "csa_compressed", "csa_ports"]
+    "body",
+    ["mla_indexer", "gqa_block_indexer", "gqa_msa", "csa_compressed", "csa_ports"],
 )
 def test_the_indexer_loss_of_documents_packed_in_a_row_is_theirs(body):
     """Each document's queries' share of the mean, also where a query sees nothing the
@@ -816,8 +1066,18 @@ SPLIT = {
         "gqa(num_heads=4, num_kv_heads=2, gated=true, gate_head_bias=true,"
         " power_scale=0.5, power_scale_length=2)"
     ),
+    # MiniMax-M2's QK-norm of all heads together, whose mean square spans the devices
+    "qk_norm_all_heads": (
+        "gqa(num_heads=4, num_kv_heads=2, qk_norm=norm, qk_norm_all_heads=true,"
+        " rope=rope(fraction=0.5))"
+    ),
     "mla": "latent",
     "mla_indexer": "latent(indexer=small)",
+    # On tensor=4 MSA's 2 groups stay whole, and its picks are each query head's
+    "msa": (
+        "gqa(num_heads=4, num_kv_heads=2, rope=rope(), indexer=small(top_k=4,"
+        " block_size=2, pool=max, per_group=true, relu=false, weighted=false))"
+    ),
     "csa": "window(compress_ratio=2, indexer=small(top_k=2))",
 }
 # A mesh and a layout each. On tensor=4, GQA's 2 kv heads, MQA's one, the indexer's 2
@@ -854,7 +1114,7 @@ def test_attention_split_by_head_trains_the_same_and_rematerializes_nothing(
     trains_the_same(losses, involuntary, layer, BY_HEAD)
 
 
-@pytest.mark.parametrize("layer", ["gqa", "power_scale", "mla", "csa"])
+@pytest.mark.parametrize("layer", ["gqa", "power_scale", "mla", "msa", "csa"])
 def test_attention_trains_the_same_with_the_positions_split(losses, involuntary, layer):
     trains_the_same(losses, involuntary, SPLIT[layer], BY_POSITION)
 

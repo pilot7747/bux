@@ -277,6 +277,19 @@ def test_the_parameters_start_as_the_papers():
         assert 0.9 * limit < float(jnp.abs(w[...]).max()) <= limit
 
 
+def test_a_models_init_starts_every_projection_instead():
+    """A model's ``init`` (`parallel.initializing`) wins over the paper's Xavier."""
+    c = cfg.GatedDeltaNet2Config(num_heads=2, num_v_heads=4, head_dim=16, v_head_dim=8)
+    with parallel.initializing(nnx.initializers.constant(0.5)):
+        layer = GatedDeltaNet2(c, 64, nnx.Rngs(0))
+    assert isinstance(layer.gate, LowRank)
+    kernels = [
+        p.kernel for p in (layer.q, layer.k, layer.v, layer.erase, layer.write, layer.o)
+    ]
+    for w in [*kernels, layer.f.down, layer.f.up, layer.gate.down, layer.gate.up]:
+        assert (w[...] == 0.5).all()
+
+
 def test_a_lower_bound_bounds_the_decay_and_starts_A_log_at_0():
     """Of inputs large enough to reach toward the bound past the small projections."""
     layer = _layer(gate_lower_bound=-5)

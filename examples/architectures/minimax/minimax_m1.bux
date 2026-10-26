@@ -1,0 +1,7 @@
+# MiniMax-M1 (MiniMax, 2025): an open-weight reasoning model developed from
+# MiniMax-Text-01 and trained with large-scale reinforcement learning, by MiniMax's
+# CISPO, on problems from mathematics to real-world software engineering. Its
+# architecture is Text-01's: 456B parameters, 45.9B of them active a token, a softmax
+# attention layer after every seven lightning attention layers, and a native context
+# of 1M tokens. Its two checkpoints, of 40K and 80K thinking budgets, share it.
+use minimax_text_01

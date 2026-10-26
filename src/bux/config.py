@@ -15,9 +15,16 @@ A new layer is a config class here, added to `LayerConfig`, and a builder regist
 for its tag in the backend (`bux.architecture.register`).
 """
 
-from typing import Annotated, ClassVar, Literal
+from typing import Annotated, ClassVar, Literal, Self
 
-from pydantic import BaseModel, ConfigDict, Field, ValidationInfo, field_validator
+from pydantic import (
+    BaseModel,
+    ConfigDict,
+    Field,
+    ValidationInfo,
+    field_validator,
+    model_validator,
+)
 
 
 class Config(BaseModel):
@@ -75,6 +82,9 @@ class NormalizationConfig(Config):
     bias: bool = False  # A learned bias per channel, added last (GPT-2's layernorms).
     # The gain as 1 + w, with w learned from 0 (Gemma, Qwen3-Next).
     zero_centered: bool = False
+    # Where the gain starts: 1 / sqrt(layers) is Trinity's depth-scaled sandwich norm,
+    # [norm attn norm(gain_init=layers ^ -0.5)].
+    gain_init: float = 1.0
     # Multiply by the gain before normalizing, norm(w * x), not after (Muse Spark).
     scale_input: bool = False
 
@@ -253,13 +263,24 @@ class MoEConfig(Config):
     # Load balancing by a loss, a bias or both. aux_free adds a bias per expert to the
     # scores that pick the top-k, not to the weights. Every training step moves it by
     # bias_update_rate: up for experts picked less than the mean, down for those picked
-    # more (DeepSeek-V3).
-    load_balancing: Literal["aux_loss", "aux_free"] = "aux_loss"
-    # How far aux_free's bias moves each training step, for each expert.
+    # more (DeepSeek-V3). smebu moves the same bias by a step that shrinks as an expert's
+    # load nears the mean: tanh(bias_softclamp * (mean - load) / mean) times the rate,
+    # centered over the experts and averaged by a momentum of bias_momentum (Trinity).
+    load_balancing: Literal["aux_loss", "aux_free", "smebu"] = "aux_loss"
+    # How far the bias moves each training step, for each expert: aux_free's step, and
+    # SMEBU's largest (Trinity Large: 5e-4).
     bias_update_rate: Annotated[float, Field(ge=0)] = 1e-3
+    # aux_free: subtract the bias's mean after every move, so that the biases stay
+    # centered (Trinity Nano and Mini). SMEBU always centers its moves.
+    center_bias: bool = False
+    # SMEBU's kappa: how soon tanh saturates, a load off the mean by 1 / kappa of it
+    # moving the bias by 0.76 of the rate.
+    bias_softclamp: Annotated[float, Field(gt=0)] = 2.0
+    # SMEBU's beta: the decay of the moves' running average, which moves the bias.
+    bias_momentum: Annotated[float, Field(ge=0, lt=1)] = 0.5
     # Weight of each layer's balance loss, E * sum_e f_e P_e, where f_e is the fraction
     # of top-k picks that go to expert e and P_e its mean score, normalized over the
-    # experts (Switch; DeepSeek-V3, eqs. 17-20). None -> 1e-2, or 0 with aux_free. Every
+    # experts (Switch; DeepSeek-V3, eqs. 17-20). None -> 1e-2, or 0 with a bias. Every
     # layer adds its own, as in Megatron-LM. transformers pools the layers into one loss
     # and counts tokens, not picks, so its coefficient c is about c * top_k / layers.
     aux_loss_coef: Annotated[float, Field(ge=0)] | None = None
@@ -281,10 +302,11 @@ class MoEConfig(Config):
 
     @property
     def aux_loss_weight(self) -> float:
-        """`aux_loss_coef`, or its default: 0 with ``aux_free``, else 1e-2."""
+        """`aux_loss_coef`, or its default: 0 with ``aux_free`` or ``smebu``, else
+        1e-2."""
         if self.aux_loss_coef is not None:
             return self.aux_loss_coef
-        return 0.0 if self.load_balancing == "aux_free" else 1e-2
+        return 1e-2 if self.load_balancing == "aux_loss" else 0.0
 
 
 # --- Token mixers ---------------------------------------------------------------
@@ -308,15 +330,25 @@ class SparseIndexerConfig(Config):
     query may see, ``sum_j w_j ReLU(q_j . k)``, and the layer attends to the `top_k`
     best alone. A setting of softmax attention: ``mla(indexer=indexer(top_k=2048))``.
     The keep mask passes no gradient, so only the indexer's own loss trains it.
+    MiniMax Sparse Attention (MSA) is ``indexer(block_size=128, pool=max,
+    per_group=true, relu=false, weighted=false)`` on ``gqa``.
     """
 
     type: Literal["indexer"] = "indexer"
     num_heads: int = 64  # Query heads of the indexer.
     head_dim: int = 128  # Width of an indexer query head and of its keys.
     top_k: int = 2048  # Keys each query keeps (in whole blocks, with block_size).
-    # Mean-pool keys in blocks of this many and pick whole blocks, top_k keys in total,
-    # plus the query's own unfinished block (Qwen3.8 QSA).
+    # Pick whole blocks of this many keys, top_k keys in total, scored as pool says.
     block_size: int = 1
+    # How a block scores, with block_size > 1: "mean" pools its keys into one, which
+    # a query scores once it sees them all, keeping its own unfinished block beside
+    # the top_k (Qwen3.8 QSA); "max" is the best score of its keys the query sees, its
+    # own block always kept among the top_k (MiniMax MSA).
+    pool: Literal["mean", "max"] = "mean"
+    # A pick for each kv head's group of query heads, by an indexer head of its own:
+    # num_heads is the gqa layer's num_kv_heads (MiniMax MSA). Else one for all heads.
+    per_group: bool = False
+    relu: bool = True  # ReLU on each head's dot products (DSA); else the plain ones.
     weighted: bool = True  # Learned per-head score weights (DSA); else a plain sum.
     # Norm of each query head and of the keys (after block pooling). None: no query
     # norm, and the layer's own key norm (DSA: a layernorm). Qwen3.8 QSA: an rmsnorm.
@@ -332,6 +364,27 @@ class SparseIndexerConfig(Config):
     # attention over the kept keys to the softmax of its scores (DSA). 0 leaves it
     # untrained.
     loss_weight: Annotated[float, Field(ge=0)] = 1.0
+
+    @model_validator(mode="after")
+    def _selection(self) -> Self:
+        """Check the combinations of block, pool and group settings it implements."""
+        if self.per_group and self.weighted:
+            raise ValueError(
+                "indexer(per_group=true) scores each group by its own head, which no "
+                "weight sums with others: set weighted=false"
+            )
+        blocks = self.block_size > 1
+        if self.per_group and blocks and self.pool == "mean":
+            raise ValueError(
+                "indexer(per_group=true) with blocks takes pool=max: QSA's mean-pooled "
+                "blocks are one pick for all heads"
+            )
+        if blocks and self.pool == "max" and self.top_k < self.block_size:
+            raise ValueError(
+                f"indexer(pool=max) keeps top_k // block_size blocks, its own among "
+                f"them: top_k={self.top_k} is less than one block of {self.block_size}"
+            )
+        return self
 
 
 class QuadraticAttentionConfig(AttentionConfig):
@@ -358,7 +411,8 @@ class QuadraticAttentionConfig(AttentionConfig):
     gate_head_bias: bool = False
     # A norm of each head's output, before the gate (Muse); None: none.
     output_norm: NormalizationConfig | None = None
-    # Norm of each query and key head, before RoPE (Qwen3); None: none.
+    # Norm of each query and key head, before RoPE (Qwen3); gqa's qk_norm_all_heads
+    # makes it one of all the heads together. None: none.
     qk_norm: NormalizationConfig | None = None
     # Soft-capping of the logits, softcap * tanh(logits / softcap) (Gemma 2); None:
     # none.
@@ -380,6 +434,24 @@ class QuadraticAttentionConfig(AttentionConfig):
     relative_bias: RelativeBiasConfig | None = None  # A learned relative position bias.
     # A lightning indexer that picks the keys each query attends to; None: all of them.
     indexer: SparseIndexerConfig | None = None
+
+    @model_validator(mode="after")
+    def _indexer_groups(self) -> Self:
+        """Check that a per-group indexer has a head for each kv head of a gqa layer."""
+        if self.indexer is None or not self.indexer.per_group:
+            return self
+        kv, heads = getattr(self, "num_kv_heads", None), self.indexer.num_heads
+        if kv is None:
+            raise ValueError(
+                "indexer(per_group=true) picks for each kv head's group of query "
+                "heads, which gqa has alone"
+            )
+        if heads != kv:
+            raise ValueError(
+                f"indexer(per_group=true) has a head for each of the layer's {kv} kv "
+                f"heads: num_heads={heads} is not {kv}"
+            )
+        return self
 
 
 class GQAConfig(QuadraticAttentionConfig):
@@ -422,6 +494,10 @@ class GQAConfig(QuadraticAttentionConfig):
     # Make q, k and v with one projection and split it, instead of one projection
     # each: the same function and init, held as one matrix (GPT-2, MiMo-V2.6-Pro).
     fused_qkv: bool = False
+    # qk_norm over all the heads together: one norm of the queries' num_heads *
+    # head_dim channels and one of the keys', each with a gain per channel, before they
+    # split into heads (MiniMax-M2, OLMo 2). Without qk_norm it does nothing.
+    qk_norm_all_heads: bool = False
     rope: RoPEConfig | None = None  # Rotary embedding of q and k; None: no positions.
     # Queries scaled by (1 + n / power_scale_length) ** power_scale at their position n,
     # counted from 1, so that attention without RoPE stays sharp at long range (Beam's
@@ -837,6 +913,28 @@ class EngramConfig(Config):
     boundary_token: int | None = None
 
 
+# --- Initialization -------------------------------------------------------------
+# How the weights start, set for the whole model by the top-level setting `init`, as
+# `init = normal(std=0.02)`. Without it, a projection or an expert starts LeCun normal,
+# of variance 1 / fan_in, and an embedding table normal of variance 1 / d_model.
+
+
+class NormalInitConfig(Config):
+    """Every weight matrix drawn from one normal: the top-level setting
+    ``init = normal(std=0.02)`` (GPT-2), or truncated,
+    ``init = normal(std=0.5 * d_model ^ -0.5, truncate=3)`` (Trinity).
+
+    It replaces the default of every projection, expert and embedding table. What
+    starts in a way of its own keeps it: norms' gains, biases, zero-initialized
+    outputs, Mamba's decays and time steps, RWKV-7's uniform projections."""
+
+    type: Literal["normal"] = "normal"
+    std: Annotated[float, Field(gt=0)]  # The standard deviation, before truncation.
+    # Values farther than this many standard deviations from 0 are drawn again;
+    # None: none are.
+    truncate: Annotated[float, Field(gt=0)] | None = None
+
+
 # --- Residual stream ------------------------------------------------------------
 # Residual algebras: what a residual branch `[f]` does instead of `x + f(x)`, set for
 # the whole model by the top-level setting `residual`, as `residual = mhc()`. Only
@@ -981,6 +1079,7 @@ SubConfig = Annotated[
     | HyperConnectionsConfig
     | GatedResidualConfig
     | AttentionResidualConfig
-    | ResidualGateConfig,
+    | ResidualGateConfig
+    | NormalInitConfig,
     Field(discriminator="type"),
 ]

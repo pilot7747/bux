@@ -65,6 +65,8 @@ def summary(arch: Architecture) -> str:
     )
     if arch.residual is not None:
         head += f" residual={config_to_source(arch.residual)}"
+    if arch.init is not None:
+        head += f" init={config_to_source(arch.init)}"
     return head + "\n" + "  ".join(f"{t}×{n}" for t, n in counts.most_common())
 
 
