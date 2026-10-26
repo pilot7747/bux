@@ -177,10 +177,17 @@ on the same node:
 | hybrid | by chunks | by GDN-2's kernel | a layer's forward and backward |
 |--------|-----------|-------------------|--------------------------------|
 | GLA | 85.4k, 83.5 GiB | 130.7k, 66.9 GiB | 17.4 → 3.7 ms |
+| GLA, a node, `fsdp=8` | 661k, 74.3 GiB | 920k, 57.1 GiB | |
 | Lightning | 135.2k, 73.5 GiB | 142.2k, 61.4 GiB | 5.5 → 3.5 ms |
 
+On a node, GDN-2's callbacks run one GPU at a time, as GDN's do: GLA trains at 88% of
+8 GPUs alone.
+
 Their losses over 30 steps are the chunks' to 0.004 (GLA) and 0.0002 (Lightning) at
-the last log. On a B300, at 2 × 4096 tokens in packed documents, the kernel's outputs
+the last log. On FineWeb-Edu (3000 steps of 8 × 4096 tokens, GEMM autotuning off and
+XLA's deterministic ops on, seeds 0, 1 and 2), the GLA hybrid's held-out loss is
+3.9253, 3.8659 and 3.8961 by the kernel and 3.9275, 3.8722 and 3.8931 by the chunks:
+within 0.007 at each seed, where the seeds spread over 0.055. On a B300, at 2 × 4096 tokens in packed documents, the kernel's outputs
 and gradients are within 4·10⁻³ of the chunks' in float32 (as a share of each one's
 norm), at GLA's own gate, gates to -20 a position, spikes of -10⁴ and Lightning's
 decays, and the log decays' gradient within 7·10⁻³ at gates to -5: the kernel keeps

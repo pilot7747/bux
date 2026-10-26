@@ -384,7 +384,10 @@ RWKV-7's recurrence at 8 × 4096 tokens on a B300, forward and backward, by bloc
 
 The baseline's hybrid of it (`"RRRA"^4`, 32 heads of 64, 8 rows of 4096 on one B300)
 trains at 87.4k tokens a second where it trained at 45.0k, and peaks at 142.1 GiB
-where it did at 155.3, its loss at the last of 30 steps the same to 0.0004. Its
+where it did at 155.3, its loss at the last of 30 steps the same to 0.0004. On a node
+(`fsdp=8`) it trains at 690k where it trained at 354k, at 129.0 GiB where at 157.0.
+On FineWeb-Edu (1500 steps of 8 × 4096 tokens, deterministic), its held-out loss is
+4.2598 where it was 4.2611. Its
 outputs and gradients are the scan's over positions to 10⁻⁶ in float32. fla's Triton
 kernel (`chunk_rwkv7` with its lower bound, in PyTorch) takes 6.7 ms on the same
 GPU: a kernel of bux's own could take RWKV-7 further. Of the chunks' 15 ms, XLA's
