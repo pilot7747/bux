@@ -1,0 +1,33 @@
+# Beam 1.0 501B-A23B (Reflection AI, 2026): an open-weight MoE of 501B parameters with
+# 23B active, for coding and agentic work, with a 1M context. Five sliding-window
+# layers with RoPE run for every global layer, and the last layer is global too. The
+# global layers have no positional encoding: their queries are scaled up with their
+# position n instead, by (1 + n / 2048) ** 0.1. Every layer has sandwich norms and
+# QK-norm, and gates each head's output by a sigmoid with a bias per head. The first
+# three layers are dense; the rest route each token to 8 of 256 experts, none shared,
+# by sigmoid scores within the best 4 of 8 groups, balanced without an auxiliary loss.
+# The head soft-caps its logits at 30.
+#
+# Beam scales the residual stream as it grows: after k branches it is the sum of the
+# embedding and their outputs over sqrt(k + 1). Every reader of the stream normalizes
+# it first, so this is the plain sum's function up to the norms' eps, and the file
+# writes the plain sum. The speculative-decoding drafter is not described here.
+d_model    = 5120
+vocab_size = 151936
+
+norm    = rmsnorm
+attn    = gqa(num_heads=48, num_kv_heads=8, head_dim=128, qk_norm=norm,
+              gated=true, gate_head_bias=true)
+local   = attn(sliding_window_size=512, rope=rope(base=10000))
+global  = attn(power_scale=0.1, power_scale_length=2048)
+dense   = gated_mlp(intermediate_size=20480, activation=swish)
+experts = moe(num_experts=256, top_k=8, router=sigmoid, routed_scaling_factor=2.5,
+              num_groups=8, top_k_groups=4, load_balancing=aux_free,
+              expert=gated_mlp(intermediate_size=2560, activation=swish))
+
+layer(mixer, ffn=experts) = [norm mixer norm] [norm ffn norm]
+D = layer(local, dense)
+L = layer(local)
+G = layer(global)
+
+model = embed "DDDLLG" "LLLLLG"^7 "LLLG" norm head(softcap=30)

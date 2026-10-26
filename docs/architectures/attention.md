@@ -51,6 +51,7 @@ model = embed block^12 norm head(tied=true)
 | `output_bias` | `bias` | a bias on the output projection (GPT-2 has one, Qwen2 has none) |
 | `fused_qkv` | `false` | make q, k and v with one projection and split it: the same function and init, held as one matrix (GPT-2, MiMo-V2.6-Pro) |
 | `rope` | `none` | rotary position embeddings ([below](#rotary-position-embeddings-rope)) |
+| `power_scale`, `power_scale_length` | `none`, `2048` | queries scaled up with a power of the position ([below](#power-scaling-at-long-range)) (Beam) |
 | `kv_conv_size` | `none` | a causal depthwise conv on keys and values, added to them: `k + conv(k)` (Inkling) |
 | `value_residual` | `fixed` | how a layer that reads the `v` port mixes in its values ([Ports](#sharing-between-layers-ports)) |
 
@@ -185,6 +186,7 @@ need `compress_ratio`; `o_groups` must divide `num_heads`.
 | `gated` | `false` | an elementwise gate on the head outputs, before the output projection | Qwen3-Next (Qiu et al.'s G1) |
 | `gate_per_head` | `false` | one gate value per head instead | Laguna |
 | `gate_activation` | `sigmoid` | the gate's activation | Laguna: `softplus` |
+| `gate_head_bias` | `false` | a learned bias per head on the gate, before its activation | Beam |
 | `output_norm` | `none` | a norm of each head's output, before the gate | Muse Spark |
 | `qk_norm` | `none` | a norm of each query and key head, before RoPE | Qwen3, Gemma 3, OLMo 2 |
 | `softcap` | `none` | `c * tanh(logits / c)` on the logits | Gemma 2 |
@@ -256,6 +258,14 @@ main ones:
   ```bux
   attn = gqa(num_heads=64, num_kv_heads=8, head_dim=128, qk_norm=norm,
              gated=true, gate_per_head=true, gate_activation=softplus)
+  ```
+
+  Beam 1.0 adds a learned bias per head, from 0, to its elementwise sigmoid gate
+  (`examples/architectures/reflection/beam_1.0_501b_a23b.bux`):
+
+  ```bux
+  attn = gqa(num_heads=48, num_kv_heads=8, head_dim=128, qk_norm=norm,
+             gated=true, gate_head_bias=true)
   ```
 
 - **G5**, after the output projection: write the gate with the algebra, as
@@ -331,6 +341,27 @@ local = attn(num_kv_heads=16, sliding_window_size=512, relative_bias.extent=512,
 
 This is not Llama 4's temperature tuning, $1 + s \ln(1 + \lfloor n / f \rfloor)$, a
 step function on its NoPE layers.
+
+### Power scaling at long range
+
+`power_scale=p`, a setting of `gqa`, multiplies the query at position $n$ (counted
+from 1), and so its logits, by
+
+$$
+\left(1 + \frac{n}{\text{power\_scale\_length}}\right)^{p}.
+$$
+
+Beam 1.0's global layers have no RoPE and use it so that attention stays sharp as
+the context grows: by 1.07 at 2048 tokens and 1.87 at 1M
+(`examples/architectures/reflection/beam_1.0_501b_a23b.bux`):
+
+```bux
+local  = attn(sliding_window_size=512, rope=rope(base=10000))
+global = attn(power_scale=0.1, power_scale_length=2048)
+```
+
+It scales the queries, not the logits, so unlike `log_scale` it runs under every
+attention method.
 
 ## Positions
 
