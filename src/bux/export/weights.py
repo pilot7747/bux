@@ -5,7 +5,9 @@ a ``nnx.Linear``'s kernel, transposed, and an ``nnx.Embed``'s table become
 ``weight``, as do a norm's scale; any other parameter keeps its attribute's name, and
 submodules nest by theirs (``q_norm.weight``). The few variables besides parameters
 that inference reads (`STATE`) go too. An exported layer whose own layout differs
-converts its tensors after (``bux_weights``, `bux.export.hf.common`).
+converts its tensors after (``bux_weights``, `bux.export.hf.common`). A residual
+algebra's branch holds its own parameters by the same rule, its body's being its
+layers'.
 """
 
 from collections.abc import Callable, Iterator
@@ -56,7 +58,19 @@ def tensors(
         if (fn := convert(call.layer.config.type)) is not None:
             own = fn(own, call.layer.config.model_dump(mode="json"))
         out |= {f"{call.path}.{name}": array for name, array in own.items()}
+    for branch in plan.branches:
+        if branch.first:
+            module = module_at(plan.arch.graph, model.graph, branch.trail)
+            out |= {f"{branch.path}.{k}": v for k, v in _algebra(module, seen)}
     return out
+
+
+def _algebra(m: nnx.Module, seen: set[int]) -> Iterator[tuple[str, np.ndarray]]:
+    """Yield the parameters of a residual algebra's branch, by the rule, but its
+    body's, which are its layers'."""
+    for name, value in vars(m).items():
+        if name != "body":
+            yield from _attribute(value, name, seen)
 
 
 def module_at(node: ir.Node, module: Any, trail: tuple[int, ...]) -> nnx.Module:

@@ -68,21 +68,30 @@ class Block0(nn.Module):
 - **The plan** (`bux.export.plan`) places every layer in a tree of named modules: the
   model's, each repeated block's (the longest repeat is `model.layers`), and each
   shared definition's, once, at `model.shared.<key>`. A layer's path is the prefix of
-  its weights, `model.layers.3.attn.q.weight`. The plan imports neither JAX nor
-  PyTorch, so that every exporter places the layers alike.
+  its weights, `model.layers.3.attn.q.weight`. Under a residual algebra, each
+  residual branch outside any other is a module too, named by the algebra, which
+  holds the algebra's parameters: `model.layers.3.mhc.bias`. The plan imports
+  neither JAX nor PyTorch, so that every exporter places the layers alike.
 - **The code** (`bux.export.codegen`) turns each scope of the plan into a class.
   `[f]` is `x + f(x)`, `f + g` and `f * g` add and multiply their branches, `f^n`
   loops over a `ModuleList`, and `@name` and `$name` push and read the forward pass's
-  taps, as in bux.
+  taps, as in bux. Under a residual algebra, a branch outside any other is
+  `h, kept = self.mhc.read(x, ctx)`, the body on `h`, then
+  `self.mhc.write_back(kept, y)`, and the embedding's output widens, as bux's does.
+- **The heads.** The model's forward gives every head's logits with
+  `model.model(ids, all_heads=True)`, on whole sequences without a cache. Otherwise
+  it stops after the first head, as it generates: multi-token prediction after it
+  (`nextn` reads tokens ahead) costs nothing and keeps no cache.
 - **The layers** (`bux.export.hf`) are bux's, in PyTorch: one class per family of
   layer types, built from the layer's config as JSON. Their attributes mirror the
   NNX modules', so weights convert by one rule (`bux.export.weights`): a linear's
   kernel, transposed, an embedding's table and a norm's scale become `weight`.
 - **The cache.** Each call of a layer that keeps state takes the next of
   transformers' cache layers, in the order the calls run, as `config.layer_types`
-  lists them; a shared layer called three times keeps three. What one cache layer
-  needs of its own, a sliding window or a number of conv states, is in
-  `config.per_layer_config`, so that two layers keep windows of their own.
+  lists them; a shared layer called three times keeps three, and the layers
+  after the first head keep none. What one cache layer needs of its own, a
+  sliding window or a number of conv states, is in `config.per_layer_config`,
+  so that two layers keep windows of their own.
 
 ## Checking an export
 
@@ -111,7 +120,11 @@ layer or the setting.
 | `mla` | every setting, the indexer and the `index` port; keys and values cached as projected up from the latents |
 | `csa` | every setting, the indexer and its candidate pools, and the `kv`, `index` and `candidates` ports; every token's latents cached, the window a mask over them |
 | `conv` | yes, its inputs' tail kept in the cache as it decodes |
-| the graph | sequences, residual branches, sums, products, constants, repeats, taps, shared definitions; not yet residual algebras |
+| `engram` | yes, on one stream or a widened one; its last tokens and its conv's inputs' tail kept in the cache as it decodes. A token's class is its id mod `vocab_classes`, as bux makes them |
+| `nextn` | yes, on one stream or a widened one; every head's logits on whole sequences (`all_heads=True`), and skipped as the model generates |
+| `merge` | yes |
+| residual algebras | `hc`, `mhc`, `gr`, `attnres`, `vpgate`, with every setting, single-pass included |
+| the graph | sequences, residual branches, sums, products, constants, negations, repeats, taps, shared definitions |
 
 ## Softmax attention
 
