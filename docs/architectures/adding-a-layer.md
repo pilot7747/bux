@@ -309,8 +309,10 @@ q = parallel.shard(q, "batch", "seq", "heads", None)
 `parallel.named` starts a kernel as the model's `init` says, by the role its names
 give it: one whose last name is `embed` writes back to the stream, `out`
 ([Initialization](initialization.md)). Pass `init=` for a start of the layer's own,
-such as zeros or a decay; a weight matrix made by hand starts by
-`bux.initializers.weight(role)`.
+such as zeros or a decay, which it keeps whatever the model's `init`. A weight matrix
+made by hand starts by `bux.initializers.weight(role)`, and
+`bux.initializers.weight(role, own=...)` starts one the layer's own way unless the
+file sets an `init`, as Gated DeltaNet-2 starts its projections from Xavier's.
 
 The names are the fields of `layout`, a closed set; any other is an error:
 

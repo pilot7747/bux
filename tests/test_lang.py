@@ -408,9 +408,8 @@ def test_init_starts_the_model_by_role_and_its_errors():
     a = build("init = normal(std=0.5 * d_model ^ -0.5, truncate=3)\nmodel = embed head")
     assert a.init == cfg.NormalInitConfig(std=0.125, truncate=3)
     assert "init = normal(std=0.125, truncate=3.0)" in to_source(a)
-    plain = build("model = embed head")
-    assert plain.init == cfg.NormalInitConfig(std=0.02)
-    assert "init" not in to_source(plain)
+    plain = build("model = embed head")  # normal(std=0.02), but layers' own starts
+    assert plain.init is None and "init" not in to_source(plain)
     roles = build(
         "init = fan_in(scale=2, out=normal(std=0.02 / 4 ^ 0.5), head=zeros)\n"
         "model = embed head"

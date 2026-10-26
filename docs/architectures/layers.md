@@ -60,7 +60,9 @@ A norm also goes in other layers' settings: `qk_norm=norm` in attention,
 `latent_input_norm=norm` in `moe`, `norm=norm` in `nextn` and `engram`.
 
 Where the norms go is the algebra's: pre-norm `[norm attn]`, post-norm
-`[attn] norm`, sandwich `[norm attn norm]` (Gemma 2 and 3) ([Operators](../language/operators.md)).
+`[attn] norm`, sandwich `[norm attn norm]` (Gemma 2 and 3), and a norm of each
+branch's output alone, `[attn norm]` (OLMo 2 and 3)
+([Operators](../language/operators.md)).
 Trinity's sandwich norms are depth-scaled: each branch's output norm starts with a
 gain of $1 / \sqrt{L}$, for $L$ layers, so that a deep stack starts close to the
 embedding (`examples/architectures/arcee/trinity_large.bux`):

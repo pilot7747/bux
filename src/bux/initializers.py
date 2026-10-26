@@ -2,10 +2,13 @@
 role it plays.
 
 A model is built inside `initializing`, with its architecture's init
-(`bux.config.Init`), ``normal(std=0.02)`` unless it says otherwise. A layer starts a
-weight matrix by `weight`, or by `bux.parallel.named`, which takes the matrix's role
-from the names of its dimensions (`role_of`). Parameters that start in a way of their
-own, such as norms' gains, biases, short convolutions and Mamba's decays, do not ask.
+(`bux.config.Init`). A layer starts a weight matrix by `weight`, or by
+`bux.parallel.named`, which takes the matrix's role from the names of its dimensions
+(`role_of`). A model that sets no init starts every matrix from `DEFAULT`, but those
+whose layer starts them its own way (`weight`'s ``own``, as Gated DeltaNet-2's
+Xavier); one that sets an init starts them all by it. Parameters that start in a way
+of their own whatever the init, such as norms' gains, biases, short convolutions and
+Mamba's decays, do not ask.
 
 An init is a config in `bux.config`, added to `~bux.config.Init`, and a builder
 registered for its tag in `inits`, which returns the `flax.nnx` initializer that a
@@ -54,14 +57,16 @@ _DISTRIBUTIONS: dict[str, Literal["truncated_normal", "normal", "uniform"]] = {
 }
 #: The builder of each init, by its tag: the initializer it draws a matrix by.
 inits = Registry[nnx.Initializer]("init", "bux.initializers.inits")
-# The init of the model being built; a config is frozen.
-_MODEL: ContextVar[cfg.Init] = ContextVar("init", default=cfg.NormalInitConfig())  # noqa: B039
+#: How a model that sets no init starts its weight matrices.
+DEFAULT = cfg.NormalInitConfig()
+# The init of the model being built; None for none set.
+_MODEL: ContextVar[cfg.Init | None] = ContextVar("init", default=None)
 
 
 @contextmanager
-def initializing(init: cfg.Init) -> Generator[None]:
+def initializing(init: cfg.Init | None) -> Generator[None]:
     """Start every weight matrix made inside by `init`: a model is built in its
-    architecture's. Outside any, matrices start by the default, ``normal``."""
+    architecture's. None, as outside any, starts them as a model that sets none."""
     token = _MODEL.set(init)
     try:
         yield
@@ -69,21 +74,30 @@ def initializing(init: cfg.Init) -> Generator[None]:
         _MODEL.reset(token)
 
 
-def weight(role: Role = "hidden", batch_axis: tuple[int, ...] = ()) -> nnx.Initializer:
+def weight(
+    role: Role = "hidden",
+    batch_axis: tuple[int, ...] = (),
+    own: nnx.Initializer | None = None,
+) -> nnx.Initializer:
     """Return how a weight matrix of `role` starts in the model being built: by the
     init its ``init`` gives the role, if any, else by the init itself.
 
     Args:
         role: The matrix's role in the model.
         batch_axis: The axes of its array that stack matrices, as an MoE's experts.
+        own: How its layer starts it, where the model sets no init; None: as
+            `DEFAULT` does.
 
     Example::
 
         table = weight("embed")(rngs.params(), (vocab, d))
     """
     init = _MODEL.get()
-    own = None if role == "hidden" else getattr(init, role)
-    return inits.build(own or init, Matrix(role, batch_axis))
+    if init is None and own is not None:
+        return own
+    init = init or DEFAULT
+    by_role = None if role == "hidden" else getattr(init, role)
+    return inits.build(by_role or init, Matrix(role, batch_axis))
 
 
 def role_of(names: Sequence[str | tuple[str, int] | None]) -> Role:

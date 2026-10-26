@@ -1342,8 +1342,8 @@ def _compile(ev: _Evaluator, entry: str) -> ir.Architecture:
         d_model=d_model,
         vocab_size=vocab_size,
         residual=residual,
+        init=init,
         graph=graph,
-        **({} if init is None else {"init": init}),
     )
 
 

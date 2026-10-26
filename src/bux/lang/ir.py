@@ -36,13 +36,7 @@ from typing import Annotated, Any, Literal
 
 from pydantic import BaseModel, ConfigDict, Field
 
-from bux.config import (
-    FanInitConfig,
-    Init,
-    LayerConfig,
-    NormalInitConfig,
-    ResidualConfig,
-)
+from bux.config import FanInitConfig, Init, LayerConfig, ResidualConfig
 from bux.train.config import PrecisionConfig, TrainConfig
 
 #: What a layer reads, as the compiler infers it.
@@ -194,7 +188,9 @@ class Architecture(BaseModel):
             a graph with neither, such as a block compiled alone.
         residual: The residual algebra every `Residual` merges by; None for plain
             additive residuals.
-        init: How the weight matrices start, by role (`bux.config.Init`).
+        init: How the weight matrices start, by role (`bux.config.Init`); None
+            for ``normal(std=0.02)``, but where a layer starts one its own way
+            (`bux.initializers`).
         graph: The model, a tree of nodes.
 
     Example::
@@ -210,7 +206,7 @@ class Architecture(BaseModel):
     d_model: int
     vocab_size: int | None = None
     residual: ResidualConfig | None = None
-    init: Init = NormalInitConfig()
+    init: Init | None = None
     graph: Node
 
     def layers(self) -> Iterator[Layer]:
@@ -437,6 +433,8 @@ class Run(BaseModel):
             if train[setting] == old[setting]:
                 del train[setting]
         dumped_arch = _without_newer_layer_fields(arch.model_dump(mode="json"))
+        # Before, an init of None left the key out, and started weights as
+        # `_INIT_BEFORE` does: a None now, which is a normal, keeps it.
         if _starts_as_before(self.arch):
             del dumped_arch["init"]
         what = {"arch": dumped_arch, "train": train}

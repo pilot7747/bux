@@ -16,7 +16,9 @@ model  = embed [norm attn] [norm ffn]^layers norm head
 ## The default
 
 Every weight matrix starts from a normal of standard deviation 0.02: projections,
-experts, routers, embedding tables and the head. GPT-1 and BERT drew every weight so,
+experts, routers, embedding tables and the head; but Gated DeltaNet-2's, which start
+from Xavier's uniform at a gain of $2^{-2.5}$ as its paper's code does, unless the
+file sets an `init`. GPT-1 and BERT drew every weight so,
 it is the `initializer_range` of nearly every open model's config, and OLMo 2 draws
 every parameter so, truncated at 3 standard deviations. It does not follow the
 width: it is LeCun's $1 / \sqrt{d}$ for a projection from a stream of $d = 2500$;
