@@ -181,6 +181,10 @@ keeps them: a web page that mentions `<|endoftext|>` does not end there. Only `b
 A prepared dataset records its tokenizer's vocabulary size, and training fails at once
 if it is larger than the model's `vocab_size`.
 
+An eval also reads the tokenizer, for the bytes of text each token stands for, and
+reports bits per byte beside the loss ([Eval](../training/running.md#eval)).
+`tokens` data needs no tokenizer, but a run of shards that sets theirs has them too.
+
 ## Splits
 
 A document's hash is of its content: its text, or a conversation's messages. So
@@ -195,6 +199,15 @@ eval    = eval(data=fineweb(split=[0.99, 1]), every=125, batches=20)
 
 A split is also a deterministic sample: `split=[0, 0.1]` is a tenth of the documents,
 the same tenth on any machine.
+
+A held-out split of each source of a mixture is a list of evals, which measure each
+apart, by loss and bits per byte ([Several held-out sets](../training/running.md#several-held-out-sets)):
+
+```bux
+data = 0.7 * web(split=[0, 0.99]) + 0.3 * code(split=[0, 0.99])
+eval = [eval(name="web", data=web(split=[0.99, 1])),
+        eval(name="code", data=code(split=[0.99, 1]))]
+```
 
 ## Mixtures
 

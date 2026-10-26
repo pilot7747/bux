@@ -1368,6 +1368,8 @@ def _expects(annotation: object) -> str:
             kinds.append("a number")
         elif member is tcfg.MixtureConfig:
             kinds.append("a mix of sources (0.7 * web + 0.3 * code)")
+        elif typing.get_origin(member) is tuple:
+            kinds.append(f"a list of {_expects(typing.get_args(member)[0])}")
         elif isinstance(member, type) and issubclass(member, cfg.Config):
             kinds += [
                 f"{t}(...)"
@@ -1422,6 +1424,8 @@ def _train_setting(name: str, value: object, span: Span) -> object:
         if errors and errors[0]["type"].startswith(("greater", "less")):
             message = errors[0]["msg"].replace("Input should be", "must be")
             raise BuxError(f"'{name}' {message}, found {value}", span) from None
+        if errors and errors[0]["type"] == "value_error":  # the setting's own check
+            raise BuxError(str(errors[0]["ctx"]["error"]), span) from None
         found = value if _is_number(value) else _describe(value)
         raise BuxError(
             f"'{name}' must be {_expects(annotation)}, found {found}", span
@@ -1457,8 +1461,8 @@ def _check_schedule(train: tcfg.TrainConfig, spans: dict[str, Span]) -> None:
 
 
 def _check_tokenizer(train: tcfg.TrainConfig, spans: dict[str, Span]) -> None:
-    reads = {"data": train.data} | ({"eval": train.eval.data} if train.eval else {})
-    for name, data in reads.items():
+    reads = [("data", train.data)] + [("eval", e.data) for e in tcfg.evals(train)]
+    for name, data in reads:
         kinds = sorted({s.type for s in tcfg.leaves(data)} & {"text", "chat"})
         if kinds and train.tokenizer is None:
             raise BuxError(

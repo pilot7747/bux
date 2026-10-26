@@ -166,12 +166,13 @@ def jobs(config: tcfg.TrainConfig) -> list[Job]:
         config: The run's training settings, ``run.train``.
 
     Returns:
-        A job for each ``text`` and ``chat`` source of ``data`` and ``eval``, mixes
-        included, in the order written; none for ``tokens`` or ``synthetic``.
+        A job for each ``text`` and ``chat`` source of ``data`` and of every
+        ``eval``, mixes included, in the order written; none for ``tokens`` or
+        ``synthetic``.
     """
     sources = tcfg.leaves(config.data)
-    if config.eval:
-        sources += tcfg.leaves(config.eval.data)
+    for held_out in tcfg.evals(config):
+        sources += tcfg.leaves(held_out.data)
     found = (Job.of(s, config) for s in sources if isinstance(s, tcfg.DOCUMENTS))
     return list(dict.fromkeys(found))
 

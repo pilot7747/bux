@@ -110,6 +110,15 @@ class Tokenizer:
         bounds = np.asarray(out.offsets, np.int64)
         return ids[bounds[0] : bounds[-1]], bounds - bounds[0]
 
+    def token_bytes(self) -> Int32[np.ndarray, " vocab"]:
+        """Return the bytes of text each id stands for, its UTF-8 bytes; 0 for a
+        special token, which stands for none. Bits per byte divide by them."""
+        vocab = self.encoder.vocab
+        lengths = np.zeros(self.vocab_size, np.int32)
+        lengths[list(vocab)] = [len(piece) for piece in vocab.values()]
+        lengths[list(self.specials.values())] = 0
+        return lengths
+
     def markup(self, text: str) -> Int32[np.ndarray, " ids"]:
         """Encode template text, in which each ``<|name|>`` is that special token.
 

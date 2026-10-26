@@ -68,7 +68,7 @@ from bux import parallel
 from bux.data.pipeline import DEFAULT_CACHE, jobs, prepare
 from bux.lang import ir
 from bux.runtime import agree_on_cache, configure
-from bux.train.config import MeshConfig
+from bux.train.config import MeshConfig, evals
 from bux.train.hooks import Hook, Metrics
 from bux.train.sinks import LatestMetrics, is_main_process
 from bux.train.trainer import Trainer, directory, train
@@ -500,7 +500,8 @@ def supervise(
 
 
 def summary(runs: Sequence[ir.Run], out: str | Path) -> str:
-    """Return one line per run: its state, its step, and its latest losses.
+    """Return one line per run: its state, its step, and its latest losses, its
+    first eval's too.
 
     A sweep's launch ends with it::
 
@@ -514,7 +515,8 @@ def summary(runs: Sequence[ir.Run], out: str | Path) -> str:
     for run in runs:
         s = status(directory(run, out))
         m = s.get("metrics") or {}
-        losses = (f"{m[k]:.4f}" if k in m else "-" for k in ("loss", "eval_loss"))
+        names = ("loss", f"{_first_eval(run)}_loss")
+        losses = (f"{m[k]:.4f}" if k in m else "-" for k in names)
         step = f"{s.get('step', 0)}/{run.train.steps}"
         rows.append((s.get("state", "pending"), step, *losses, run.name))
     states = Counter(row[0] for row in rows[1:])
@@ -525,6 +527,11 @@ def summary(runs: Sequence[ir.Run], out: str | Path) -> str:
     ]
     head = ", ".join(f"{n} {state}" for state, n in states.most_common())
     return f"{len(runs)} runs: {head}\n" + "\n".join(lines)
+
+
+def _first_eval(run: ir.Run) -> str:
+    """Return the name of the run's first eval, whose loss the summary shows."""
+    return next((e.name for e in evals(run.train)), "eval")
 
 
 def _fitting(

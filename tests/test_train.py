@@ -28,11 +28,13 @@ from bux.data.pipeline import jobs
 from bux.lang import compile, compile_runs
 from bux.train import config as tcfg
 from bux.train import flops
+from bux.train import trainer as trainer_module
 from bux.train.data import Batch, batches, plain, prefetch
 from bux.train.hooks import Checkpoint, Hook, Log, Profile
 from bux.train.objective import (
     Term,
     cross_entropy,
+    held_out,
     objective,
     prediction_offsets,
     target_mask,
@@ -51,7 +53,7 @@ from bux.train.optim import (
     whole_matrix_spec,
 )
 from bux.train.sinks import LatestMetrics, Sink
-from bux.train.trainer import Trainer, directory, step_flops, train
+from bux.train.trainer import Trainer, directory, forward, step_flops, train
 
 SMOKE = Path(__file__).parent.parent / "examples" / "experiments" / "smoke.bux"
 
@@ -582,17 +584,42 @@ def test_a_profile_traces_its_steps_into_the_run_s_directory_and_keeps_its_id(
 
 def test_a_run_trains_on_text_that_it_prepares_first(tmp_path, byte_tokenizer):
     text = corpus(tmp_path / "corpus")
+    held = ", ".join(
+        f'eval(name="{name}", data=text(path="{text}", split=[{a}, {b}]), every=2)'
+        for name, a, b in (("near", 0.9, 0.95), ("far", 0.95, 1))
+    )
     run = smoke(
         f'tokenizer = tokenizer(name="{byte_tokenizer.name}")',
         f'data = text(path="{text}", split=[0, 0.9])',
-        f'eval = eval(data=text(path="{text}", split=[0.9, 1]), every=2, batches=1)',
+        f"eval = [{held}]",
         "steps = 2",
     )
     said: list[str] = []
     last = train(run, tmp_path / "runs", cache=tmp_path / "packed", echo=said.append)
-    assert np.isfinite(last["loss"]) and np.isfinite(last["eval_loss"])
-    assert [s.split(":")[0] for s in said[:2]] == [j.name for j in jobs(run.train)]
-    assert len(list((tmp_path / "packed").iterdir())) == 2
+    measured = ("loss", "near_loss", "near_bpb", "far_loss", "far_bpb")
+    assert all(np.isfinite(last[k]) for k in measured)
+    assert [s.split(":")[0] for s in said[:3]] == [j.name for j in jobs(run.train)]
+    assert len(list((tmp_path / "packed").iterdir())) == 3
+    assert any("near loss" in s and "near bpb" in s for s in said)
+
+
+def test_an_eval_measures_the_same_on_one_device_and_split_over_eight(
+    tmp_path, byte_tokenizer
+):
+    def measured(mesh: str) -> dict[str, float]:
+        run = smoke(
+            f'tokenizer = tokenizer(name="{byte_tokenizer.name}")',
+            "eval = eval(data=synthetic, every=2, batches=2)",
+            "steps = 2",
+            f"mesh = {mesh}",
+            "precision = precision(compute=float32)",
+        )
+        return train(run, tmp_path / str(len(mesh)), echo=lambda _: None)
+
+    # Ids past the tokenizer's 259 stand for no text, as its special ones do.
+    one, eight = measured("mesh(data=1)"), measured("mesh(data=2, tensor=2, context=2)")
+    for name in ("eval_loss", "eval_bpb"):
+        assert np.isclose(one[name], eight[name], rtol=1e-5)
 
 
 def test_muon_runs_end_to_end(tmp_path):
@@ -764,19 +791,58 @@ def test_the_log_s_learning_rate_is_computed_at_its_step_not_as_it_is_read():
 def test_eval_launches_every_batch_before_it_reads_a_loss(monkeypatch):
     trainer, batch = _small_trainer()
     events: list[str] = []
+    step, means = trainer._eval, trainer_module._means
 
-    class Loss:
-        def __float__(self) -> float:
-            events.append("read")
-            return 1.0
-
-    def launched(model: Model, batch: Batch) -> Loss:
+    def launched(*args):
         events.append("launched")
-        return Loss()
+        return step(*args)
+
+    def read(sums):
+        events.append("read")
+        return means(sums)
 
     monkeypatch.setattr(trainer, "_eval", launched)
-    assert trainer.evaluate([batch] * 3) == 1.0
-    assert events == ["launched"] * 3 + ["read"] * 3
+    monkeypatch.setattr(trainer_module, "_means", read)
+    assert set(trainer.evaluate([batch] * 3)) == {"loss"}
+    assert events == ["launched"] * 3 + ["read"]
+
+
+def test_held_out_sums_the_loss_over_targets_and_bits_over_their_bytes():
+    arch = compile(ARCH + "model = embed block norm head\n")
+    model = Model(arch, rngs=nnx.Rngs(0))
+    ids = np.arange(1, 17, dtype=np.int32).reshape(2, 8)
+    ids[1, 3] = 0  # a special token, which stands for no text
+    positions = np.array([[0, 1, 2, 3, 0, 1, 2, 3], list(range(8))], np.int32)
+    mask = np.ones(ids.shape, bool)
+    mask[1, 5] = False
+    batch = Batch(ids, positions, mask)
+    nbytes = np.where(ids == 0, 0, ids % 3 + 1).astype(np.int32)
+    [head] = forward(model, batch)
+    measured = held_out(head, batch, jnp.asarray(nbytes))
+
+    logits = head.logits()[:, :-1]
+    ce = optax.softmax_cross_entropy_with_integer_labels(logits, ids[:, 1:])
+    targets = np.asarray(target_mask(batch))
+    counted = np.where(targets, nbytes[:, 1:], 0)
+    (nats, n), (bits, size) = measured["loss"], measured["bpb"]
+    assert n == targets.sum() == 12  # 3 + 3 in documents of 4, 7 - 1 masked in one
+    assert np.isclose(nats, (ce * targets).sum())
+    assert size == counted.sum()
+    assert np.isclose(bits, (ce * (counted > 0)).sum() / np.log(2))
+
+
+def test_eval_weighs_every_target_alike_whichever_batch_it_is_in():
+    trainer, batch = _small_trainer()
+    fewer = batch._replace(loss_mask=batch.loss_mask & (np.arange(8) < 3))
+    each = [trainer.evaluate([b])["loss"] for b in (batch, fewer)]
+    targets = [int(target_mask(b).sum()) for b in (batch, fewer)]
+    both = trainer.evaluate([batch, fewer])["loss"]
+    assert targets == [14, 4]
+    assert np.isclose(both, np.dot(each, targets) / sum(targets))
+    assert not np.isclose(both, np.mean(each))
+    vocab = np.ones(32, np.int32)
+    measured = trainer.evaluate([batch, fewer], token_bytes=vocab)
+    assert np.isclose(measured["bpb"], both / np.log(2))  # a byte a token
 
 
 def test_a_run_reports_what_hooks_of_ones_own_return(tmp_path):

@@ -42,7 +42,7 @@ shows them on hover and completes them, as it does for layers
 | `seed` | an integer | `0` | the model's initial weights, the order of the data, and every random stream |
 | `clip` | a number, or `none` | `1.0` | the global norm gradients are clipped to ([Clipping](optimizers.md#clipping)) |
 | `loss` | {bux}`loss` | `loss` | the weights of the z-loss and of multi-token prediction ([The loss](optimizers.md#the-loss)) |
-| `eval` | {bux}`eval`, or `none` | `none` | a held-out loss every so many steps ([Eval](running.md#eval)) |
+| `eval` | {bux}`eval`, a list of them, or `none` | `none` | held-out loss and bits per byte every so many steps, a set each ([Eval](running.md#eval)) |
 | `checkpoint` | {bux}`checkpoint`, or `none` | `none` | saves to resume from ([Checkpoints](running.md#checkpoints)) |
 | `log` | {bux}`log` | `log` | the metrics every `every` steps, 10 by default ([The log](running.md#the-log)) |
 | `profile` | {bux}`profile`, or `none` | `none` | a trace of a few steps ([Profiling](../performance/profiling.md)) |

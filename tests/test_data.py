@@ -33,6 +33,13 @@ def test_special_tokens_in_documents_stay_text(byte_tokenizer, tok):
         tok.special("<|eot_id|>")
 
 
+def test_a_token_stands_for_its_bytes_of_text_and_a_special_one_for_none(tok):
+    lengths = tok.token_bytes()
+    assert lengths.tolist() == [1] * 256 + [0] * 3
+    ids, _ = tok.encode(pa.array(["héllo, 世界"]))
+    assert lengths[[*ids, tok.eos]].sum() == len("héllo, 世界".encode())
+
+
 def _docs(batch: pa.RecordBatch) -> list[tuple[list[int], list[bool]]]:
     return list(zip(batch["input_ids"].to_pylist(), batch["loss_mask"].to_pylist()))
 

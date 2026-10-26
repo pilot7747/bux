@@ -95,9 +95,9 @@ last. The scalars it returns, metrics by name, go to every sink:
 | `stop(trainer)` | when training stops before the last step, at the step it stopped at |
 | `close()` | after the last step, or when training stops |
 
-Hooks run in order, the run's own first: {py:class}`~bux.train.hooks.Log`,
-{py:class}`~bux.train.hooks.Eval`, {py:class}`~bux.train.hooks.Checkpoint` and
-{py:class}`~bux.train.hooks.Profile`, then those given to `train`. Each hook's
+Hooks run in order, the run's own first: {py:class}`~bux.train.hooks.Log`, an
+{py:class}`~bux.train.hooks.Eval` for each eval, {py:class}`~bux.train.hooks.Checkpoint`
+and {py:class}`~bux.train.hooks.Profile`, then those given to `train`. Each hook's
 scalars reach the sinks as one write of their own, at the step it ran.
 
 **Read later.** What a hook returns goes to the sinks once the next step is launched.
@@ -301,6 +301,14 @@ trainer's model and optimizer hold after it. So a hook may change the values of 
 variables between steps (`trainer.load`, `nnx.update`), but not which variables they
 hold: a step that does raises
 `a training step changes the values of the model's and the optimizer's variables, but not which variables they hold`.
+
+`eval_step` returns each metric as a sum over its batch and what that sum is a mean
+of, `{"loss": (nats, targets), "bpb": (bits, bytes)}`
+({py:func}`~bux.train.objective.held_out`), and
+{py:meth}`~bux.train.trainer.Trainer.evaluate` divides the sums over all the batches.
+So an eval's mean weighs every target alike, and a metric of one's own is one more
+pair: an accuracy is `(correct, targets)`. The eval hook logs each under the eval's
+name, `eval_accuracy`.
 
 ## Microbatches
 
