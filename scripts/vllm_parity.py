@@ -243,15 +243,23 @@ class placeholders:
 
     def __enter__(self) -> None:
         for kind in self.added:
-            state = self.STATES.get(kind)
             attrs: dict[str, Any] = {"__module__": "placeholder.vllm_only"}
-            if state is not None:
-                attrs["cache_type"] = staticmethod(lambda c, s=state: s)
+            if kind in self.STATES:
+                attrs["cache_type"] = staticmethod(_kind_of(self.STATES[kind]))
             self.classes[kind] = type(kind.title().replace("_", ""), (), attrs)
 
     def __exit__(self, *exc: object) -> None:
         for kind in self.added:
             del self.classes[kind]
+
+
+def _kind_of(state: str) -> Any:
+    """A placeholder's ``cache_type``: the cache layer `state` of every call."""
+
+    def cache_type(c: dict) -> str:
+        return state
+
+    return cache_type
 
 
 def _add_router_biases(model: Any, arch: Any, out: Path) -> None:
