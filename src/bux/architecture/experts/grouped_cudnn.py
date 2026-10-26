@@ -1,19 +1,22 @@
 """Grouped MXFP8 GEMMs for an MoE's experts by cuDNN-frontend's CuTe DSL kernels, on a
-Blackwell GPU, through ``cudnn.jax.call`` on XLA's stream: the gated MLP's SwiGLU, and
+Blackwell GPU, through ``cudnn.jax.call`` on XLA's stream: the experts' activation, and
 its backward, in their epilogues.
 
 Each takes its operands as `~bux.architecture.experts.grouped_mxfp8.Tiled` (E4M3
 values, their scales in tensor memory's tiles), each group's rows from a multiple of
 256 to its `ends`, and runs tiles of 256 by 256 on pairs of SMs:
 
-- `swiglu`: ``x W[g]^T``, kept for the backward, then its SwiGLU times each row's
-  weight, h, quantized along its rows and down its columns.
-- `dswiglu`: ``dy W[g]`` times SwiGLU's gradient at the kept product, times each
-  row's weight, quantized the same two ways; and each weight's gradient.
+- `activated`: ``x W[g]^T``, kept for the backward, then its activation (`Epilogue`)
+  times each row's weight, h, quantized along its rows and down its columns: by
+  cuDNN's SReLU kernel for relu(x)^2, and by its GLU kernel for SwiGLU, a clamped
+  GeGLU or SiTU-GLU.
+- `activation_grad`: ``dy W[g]`` times the activation's gradient at the kept
+  product, times each row's weight, quantized the same two ways; and each weight's
+  gradient: by cuDNN's dSReLU, dSwiGLU or dGLU kernel.
 - `rows`: ``a b[g]^T``, in bfloat16.
 - `contract`: ``a^T b`` over each group's rows, in bfloat16.
 
-The GLU takes each gate 32 columns before its up, ``[32 gates | 32 ups]`` in each 64
+A GLU takes each gate 32 columns before its up, ``[32 gates | 32 ups]`` in each 64
 of W[g]'s rows (`halves_of`). The epilogues write the copies down the columns as
 `Columns`, which `contract` takes as they lie. Rows past the last group are not
 written.
@@ -21,10 +24,11 @@ written.
 
 import functools
 import os
-from typing import Any, NamedTuple, no_type_check
+from typing import Any, Literal, NamedTuple, no_type_check
 
 import jax
 import jax.numpy as jnp
+import numpy as np
 from jaxtyping import Array, Float, Int, Shaped
 
 from bux.architecture.experts import grouped_mxfp8
@@ -33,12 +37,19 @@ from bux.architecture.experts.grouped_mxfp8 import LANES, Tiled
 try:  # cudnn-frontend and CuTe DSL, where the cuda extra is installed (Linux)
     import cutlass
     import cutlass.utils
-    from cudnn.gemm.cutedsl.grouped import canonical_jax
+    from cudnn.gemm.cutedsl.grouped import canonical, canonical_jax
+    from cudnn.gemm.cutedsl.grouped.dglu import moe_blockscaled_grouped_gemm_dglu_dbias
+    from cudnn.gemm.cutedsl.grouped.dsrelu import (
+        moe_blockscaled_grouped_gemm_dsrelu_quant as dsrelu_quant,
+    )
     from cudnn.gemm.cutedsl.grouped.dswiglu import jax_api as dswiglu_api
     from cudnn.gemm.cutedsl.grouped.dswiglu.api import GroupedGemmDswigluSm100
+    from cudnn.gemm.cutedsl.grouped.glu import moe_blockscaled_grouped_gemm_glu_bias
     from cudnn.gemm.cutedsl.grouped.moe_utils import MoEWeightMode, WGradInputOrder
     from cudnn.gemm.cutedsl.grouped.quant import grouped_gemm_quant
-    from cudnn.gemm.cutedsl.grouped.swiglu import jax_api as swiglu_api
+    from cudnn.gemm.cutedsl.grouped.srelu import (
+        moe_blockscaled_grouped_gemm_srelu_quant as srelu_quant,
+    )
     from cudnn.gemm.cutedsl.grouped.wgrad import moe_blockscaled_grouped_gemm_wgrad
     from cudnn.jax import TensorSpec, call, zeros_init
     from cutlass import cute
@@ -49,6 +60,38 @@ except ImportError:
 PAD = 256  # where each group's rows start: whole tiles of the kernels'
 TILE = (256, 256)  # the tiles of the output on a pair of SMs
 E4M3, E8M0 = jnp.float8_e4m3fn, jnp.float8_e8m0fnu
+UNCLAMPED = float(np.finfo(np.float32).max)  # a GeGLU's limit, where it has none
+
+
+class Epilogue(NamedTuple):
+    """The activation of `activated`'s epilogue, as cuDNN names it, of a GLU's gate g
+    and up u, or of one projection u:
+
+    - ``srelu``: relu(u)^2;
+    - ``swiglu``: ``g sigmoid(g) u``;
+    - ``geglu``: ``g' sigmoid(alpha g') (u' + offset)``, g' the gate capped at
+      `limit` and u' up clipped to +-limit;
+    - ``situglu``: ``4 tanh(g / 4) sigmoid(g) cap tanh(u / cap)``.
+    """
+
+    #: The activation.
+    name: Literal["srelu", "swiglu", "geglu", "situglu"]
+    #: geglu's scale of the gate inside its sigmoid.
+    alpha: float = 1.0
+    #: geglu's cap of the gate, and of up's magnitude.
+    limit: float = UNCLAMPED
+    #: geglu's offset of up.
+    offset: float = 0.0
+    #: situglu's soft cap of up.
+    cap: float = 25.0
+
+    @property
+    def gated(self) -> bool:
+        """Whether it activates a GLU: two projections, up and gate."""
+        return self.name != "srelu"
+
+
+SRELU, SWIGLU = Epilogue("srelu"), Epilogue("swiglu")
 
 
 class Columns(NamedTuple):
@@ -62,19 +105,19 @@ class Columns(NamedTuple):
     scales: Shaped[Array, "p q 32 16"]
 
 
-class Glu(NamedTuple):
-    """What `swiglu` returns."""
+class Hidden(NamedTuple):
+    """What `activated` returns."""
 
     #: The product ``x W[g]^T``, in bfloat16, kept for the backward.
     product: Float[Array, "m n"]
-    #: h, SwiGLU's output times each row's weight, along its rows.
+    #: h, the activation times each row's weight, along its rows.
     h: Tiled
     #: h down its columns.
     h_columns: Columns
 
 
-class GluGrad(NamedTuple):
-    """What `dswiglu` returns."""
+class HiddenGrad(NamedTuple):
+    """What `activation_grad` returns."""
 
     #: The product's gradient along its rows.
     product: Tiled
@@ -92,8 +135,16 @@ def runs() -> bool:
 
 def fits(d: int, f: int, groups: int) -> bool:
     """Return whether the kernels take `groups` experts of width d and f hidden
-    units: each of their GEMMs whole tiles of 256, and 1024 experts at most."""
-    return d % TILE[1] == 0 and f % TILE[1] == 0 and groups <= 1024
+    units: d whole blocks of 64 columns, as each GEMM's output must be; f whole
+    blocks of 32, which they take padded to whole tiles of 128 (`hidden_tiles`);
+    1024 experts at most."""
+    return d % 64 == 0 and f % 32 == 0 and groups <= 1024
+
+
+def hidden_tiles(f: int) -> int:
+    """Return f hidden units as the kernels take them: padded by 0 to whole tiles of
+    128, as the quantizer pads what the down projection contracts."""
+    return -(-f // LANES) * LANES
 
 
 def halves_of(pairs: Int[Array, " n"]) -> Int[Array, " n"]:
@@ -107,22 +158,29 @@ def halves_of(pairs: Int[Array, " n"]) -> Int[Array, " n"]:
 # --- The kernels ---------------------------------------------------------------------
 
 
-def swiglu(
-    x: Tiled, w: Tiled, ends: Int[Array, " g"], weights: Float[Array, " m"]
-) -> Glu:
-    """Return ``x W[g]^T`` for each group's rows of x, and h, its SwiGLU times each
-    row's weight.
+def activated(
+    x: Tiled,
+    w: Tiled,
+    ends: Int[Array, " g"],
+    weights: Float[Array, " m"],
+    epilogue: Epilogue,
+) -> Hidden:
+    """Return ``x W[g]^T`` for each group's rows of x, and h, its activation times
+    each row's weight.
 
     Args:
         x: the rows, (m, k).
-        w: each group's up kernel, (g, n, k), its rows in halves (`halves_of`).
+        w: each group's up kernel, (g, n, k); a GLU's rows in halves (`halves_of`).
         ends: where each group's rows end, each starting at a multiple of 256.
         weights: each row's weight.
+        epilogue: the activation.
 
     Returns:
-        The product (m, n), and h (m, n / 2) along its rows and down its columns.
+        The product (m, n), and h (m, n / 2) for a GLU, else (m, n), along its rows
+        and down its columns.
     """
     m, n = x.values.shape[0], w.values.shape[1]
+    width = n // 2 if epilogue.gated else n
     ins = {
         "a": x.values,
         "b": w.values,
@@ -135,38 +193,84 @@ def swiglu(
     }
     outs = {
         "c": _out((m, n), jnp.bfloat16),
-        "d": _out((m, n // 2), E4M3),
-        "d_col": _out((m, n // 2), E4M3),
-        "sfd_row": _out(canonical_jax.sf_shape(m, n // 2), E8M0),
-        "sfd_col": _out(canonical_jax.sf_shape(n // 2, m), E8M0),
+        "d": _out((m, width), E4M3),
+        "d_col": _out((m, width), E4M3),
+        "sfd_row": _out(canonical_jax.sf_shape(m, width), E8M0),
+        "sfd_col": _out(canonical_jax.sf_shape(width, m), E8M0),
     }
-    kernel, mac = swiglu_api.swiglu_plan(ins, outs, TILE, None)
-    adapter = swiglu_api.grouped_swiglu_adapter
-    product, h, h_col, h_scales, h_col_scales = _call(adapter, ins, outs, kernel, mac)
-    return Glu(product, _tiled(h, h_scales), _columns(h_col, h_col_scales))
+    groups, mac, constants = ends.shape[0], _pairs_of_sms(), _constants(epilogue)
+    if epilogue.gated:
+        kernel, adapter = _glu_kernel(groups, epilogue.name), _jit(_glu)
+    else:
+        kernel, adapter = _srelu_kernel(groups), _jit(_srelu)
+    outputs = _call(adapter, ins, outs, kernel, mac, constants=constants)
+    product, h, h_col, h_scales, h_col_scales = outputs
+    return Hidden(product, _tiled(h, h_scales), _columns(h_col, h_col_scales))
 
 
-def dswiglu(
+def activation_grad(
     dy: Tiled,
     w: Tiled,
-    product: Float[Array, "m n2"],
+    product: Float[Array, "m n"],
     ends: Int[Array, " g"],
     weights: Float[Array, " m"],
-) -> GluGrad:
-    """Return the gradient of `swiglu`'s product, and of each row's weight.
+    epilogue: Epilogue,
+) -> HiddenGrad:
+    """Return the gradient of `activated`'s product, and of each row's weight.
 
     Args:
         dy: the output's gradient, (m, k).
-        w: each group's down kernel, (g, n, k): dy times it, over k, is h's
+        w: each group's down kernel, (g, f, k): dy times it, over k, is h's
             gradient.
-        product: `swiglu`'s product, (m, 2n), in halves.
+        product: `activated`'s product, (m, 2f) in halves for a GLU, else (m, f).
         ends: where each group's rows end, each starting at a multiple of 256.
         weights: each row's weight.
+        epilogue: the activation.
 
     Returns:
         The product's gradient along its rows and down its columns, and each row's
         weight's gradient.
     """
+    if epilogue == SWIGLU:
+        return _dswiglu(dy, w, product, ends, weights)
+    m, n = product.shape
+    ins = {
+        "a": dy.values,
+        "b": w.values,
+        "c": product,
+        "sfa": dy.scales,
+        "sfb": w.scales,
+        "padded_offsets": ends,
+        "alpha": _ones(ends.shape[0]),
+        "prob": weights,
+        "norm_const": _ones(1),
+    }
+    outs = {
+        "d_row": _out((m, n), E4M3),
+        "d_col": _out((m, n), E4M3),
+        "dprob": _out((m,), jnp.float32),
+        "sfd_row": _out(canonical_jax.sf_shape(m, n), E8M0),
+        "sfd_col": _out(canonical_jax.sf_shape(n, m), E8M0),
+    }
+    groups, mac, constants = ends.shape[0], _pairs_of_sms(), _constants(epilogue)
+    if epilogue.gated:
+        kernel, adapter = _dglu_kernel(groups, epilogue.name), _jit(_dglu)
+        ins["beta"] = _ones(groups)
+    else:
+        kernel, adapter = _dsrelu_kernel(groups), _jit(_dsrelu)
+    outputs = _call(adapter, ins, outs, kernel, mac, (2,), constants)
+    rows_, columns, dweights, scales, column_scales = outputs  # dprob: atomic adds
+    return HiddenGrad(_tiled(rows_, scales), _columns(columns, column_scales), dweights)
+
+
+def _dswiglu(
+    dy: Tiled,
+    w: Tiled,
+    product: Float[Array, "m n2"],
+    ends: Int[Array, " g"],
+    weights: Float[Array, " m"],
+) -> HiddenGrad:
+    """Return `activation_grad` of SwiGLU, by cuDNN's dSwiGLU kernel."""
     m, n = dy.values.shape[0], w.values.shape[1]
     ins = {
         "a": dy.values,
@@ -194,7 +298,7 @@ def dswiglu(
     rows_, columns, dweights, scales, column_scales = _call(  # dprob: atomic adds
         adapter, ins, outs, kernel, mac, zeroed=(2,)
     )
-    return GluGrad(_tiled(rows_, scales), _columns(columns, column_scales), dweights)
+    return HiddenGrad(_tiled(rows_, scales), _columns(columns, column_scales), dweights)
 
 
 def rows(a: Tiled, b: Tiled, ends: Int[Array, " g"]) -> Float[Array, "m n"]:
@@ -215,14 +319,20 @@ def rows(a: Tiled, b: Tiled, ends: Int[Array, " g"]) -> Float[Array, "m n"]:
 
 
 def contract(
-    a: Tiled | Columns, b: Tiled, ends: Int[Array, " g"]
+    a: Tiled | Columns,
+    b: Tiled,
+    ends: Int[Array, " g"],
+    shape: tuple[int, int] | None = None,
 ) -> Float[Array, "g d f"]:
     """Return ``a^T b`` over each group's rows, (g, d, f) in bfloat16: a (d, m) in
     blocks along m as `~bux.architecture.experts.grouped_mxfp8.Tiled`, or as
-    `Columns` (m, d); b (f, m) as ``Tiled``."""
-    groups, f = ends.shape[0], b.values.shape[0]
+    `Columns` (m, d); b (f, m) as ``Tiled``. Given a smaller `shape` (d, f), the
+    kernel writes only that much of each product: its stores stop at the output's
+    edge."""
+    groups = ends.shape[0]
     by_rows = isinstance(a, Columns)
-    d = a.values.shape[1] if by_rows else a.values.shape[0]
+    whole = (a.values.shape[1] if by_rows else a.values.shape[0], b.values.shape[0])
+    d, f = whole if shape is None else shape
     kernel, mac, workspace = _wgrad_kernel(groups)
     ins = (
         a.values,
@@ -306,9 +416,11 @@ def _call(
     kernel: Any,
     mac: int,
     zeroed: tuple[int, ...] = (),
+    constants: dict[str, float] | None = None,
 ) -> Any:
     """Run a fused kernel by its adapter on row-major operands: what it adds into,
-    `zeroed` first; nothing else, which it writes where read."""
+    `zeroed` first; nothing else, which it writes where read. `constants` are the
+    adapter's own, which its compile keys on."""
     return call(
         adapter,
         output_shape_dtype=tuple(outs.values()),
@@ -317,16 +429,80 @@ def _call(
         initialized_outputs={i: zeros_init for i in zeroed} or None,
         kernel=kernel,
         mac=mac,
+        **(constants or {}),
     )(*ins.values())
 
 
-# --- The plain kernels, and their adapters, which CuTe DSL compiles ------------------
+def _constants(epilogue: Epilogue) -> dict[str, float]:
+    """Return what a GLU kernel takes of its activation; nothing for SReLU's."""
+    if not epilogue.gated:
+        return {}
+    return {
+        "alpha": epilogue.alpha,
+        "limit": epilogue.limit,
+        "offset": epilogue.offset,
+        "cap": epilogue.cap,
+    }
+
+
+# --- The kernels, which CuTe DSL compiles once for each number of groups -------------
 
 
 @functools.cache
 def _jit(adapter: Any) -> Any:
     """Return `adapter` compiled by CuTe DSL, once."""
     return cute.jit(adapter)
+
+
+def _fused(kernel_type: Any, groups: int, **options: Any) -> Any:
+    """Return a fused grouped kernel of `groups` stacked matrices in MXFP8, on pairs
+    of SMs."""
+    assert cutlass is not None
+    return kernel_type(
+        sf_vec_size=32,
+        acc_dtype=cutlass.Float32,
+        use_2cta_instrs=True,
+        mma_tiler_mn=TILE,
+        cluster_shape_mn=(2, 1),
+        vectorized_f32=False,
+        discrete_col_sfd=False,
+        expert_cnt=groups,
+        weight_mode=MoEWeightMode.DENSE,
+        **options,
+    )
+
+
+@functools.cache
+def _glu_kernel(groups: int, name: str) -> Any:
+    """Return cuDNN's GLU kernel of `name`, both quantizations of h in its epilogue."""
+    glu = moe_blockscaled_grouped_gemm_glu_bias.BlockScaledMoEGroupedGemmGluBiasKernel
+    return _fused(glu, groups, generate_sfd=True, act_func=name)
+
+
+@functools.cache
+def _dglu_kernel(groups: int, name: str) -> Any:
+    """Return cuDNN's dGLU kernel, the backward of the GLU of `name`."""
+    dglu = (
+        moe_blockscaled_grouped_gemm_dglu_dbias.BlockScaledMoEGroupedGemmDgluDbiasKernel
+    )
+    return _fused(dglu, groups, act_func=f"d{name}")
+
+
+@functools.cache
+def _srelu_kernel(groups: int) -> Any:
+    """Return cuDNN's SReLU kernel, the product and both quantizations of h out."""
+    srelu = srelu_quant.EpilogueType.SRELU.value
+    kernel = srelu_quant.BlockScaledMoEGroupedGemmQuantKernel
+    options = {"generate_sfd": True, "generate_c": True, "enable_bias": False}
+    return _fused(kernel, groups, epilogue_type=srelu, **options)
+
+
+@functools.cache
+def _dsrelu_kernel(groups: int) -> Any:
+    """Return cuDNN's dSReLU kernel, the product's gradient quantized both ways out."""
+    dsrelu = dsrelu_quant.EpilogueType.DSRELU.value
+    kernel = dsrelu_quant.BlockScaledMoEGroupedGemmQuantBwdKernel
+    return _fused(kernel, groups, generate_sfd=True, epilogue_type=dsrelu)
 
 
 @functools.cache
@@ -377,7 +553,123 @@ def _pairs_of_sms() -> int:
     return cutlass.utils.HardwareInfo().get_max_active_clusters(2) - margin
 
 
-# CuTe DSL takes an adapter's annotations for its own types: these have none.
+# --- The adapters, which CuTe DSL compiles -------------------------------------------
+# CuTe DSL takes an adapter's annotations for its own types: these have none. Each
+# takes its row-major operands, and hands them to its kernel as the kernel sees them
+# (`canonical`'s views): an (m, x) operand as (m, x, 1), a stack of matrices (g, n, k)
+# as (n, k, g), the rows' weights (m,) as (m, 1, 1). The kernels read only where the
+# scales start.
+
+
+@no_type_check
+def _srelu(stream, *operands, kernel, mac):  # noqa: ANN001, ANN002, ANN202
+    """cuDNN's SReLU kernel: c, then relu(c)^2 times each row's weight, both ways."""
+    a, b, sfa, sfb, ends, alpha, prob, norm_const, c, *written = operands
+    kernel(
+        **_grouped(stream, mac, a, b, sfa, sfb, ends, alpha),
+        **_quantized_out(norm_const, *written),
+        c=canonical.kernel_facing_mx(c),
+        bias=None,
+        prob=canonical.kernel_facing_prob(prob),
+    )
+
+
+@no_type_check
+def _dsrelu(stream, *operands, kernel, mac):  # noqa: ANN001, ANN002, ANN202
+    """cuDNN's dSReLU kernel: dy W[g] times 2 relu(c) and each row's weight, both
+    ways; and each weight's gradient."""
+    a, b, c, sfa, sfb, ends, alpha, prob, norm_const, *outputs = operands
+    d, d_col, dprob, *scales = outputs
+    per_row = canonical.kernel_facing_prob
+    kernel(
+        **_grouped(stream, mac, a, b, sfa, sfb, ends, alpha),
+        **_quantized_out(norm_const, d, d_col, *scales),
+        c=canonical.kernel_facing_mx(c),
+        prob=per_row(prob),
+        dprob=per_row(dprob),
+        dbias_tensor=None,
+        d_srelu=None,
+        sfd_col_d_srelu_tensor=None,
+    )
+
+
+@no_type_check
+def _glu(stream, *operands, kernel, mac, alpha, limit, offset, cap):  # noqa: ANN001, ANN002, ANN202
+    """cuDNN's GLU kernel: c, then its GLU times each row's weight, both ways."""
+    a, b, sfa, sfb, ends, ones, prob, norm_const, c, *written = operands
+    kernel(
+        **_grouped(stream, mac, a, b, sfa, sfb, ends, ones),
+        **_quantized_out(norm_const, *written),
+        c=canonical.kernel_facing_mx(c),
+        bias=None,
+        prob=canonical.kernel_facing_prob(prob),
+        linear_offset=cutlass.Float32(offset),
+        geglu_alpha=cutlass.Float32(alpha),
+        glu_clamp_max=cutlass.Float32(limit),
+        glu_clamp_min=cutlass.Float32(-limit),
+        situ_beta2=cutlass.Float32(cap),
+    )
+
+
+@no_type_check
+def _dglu(stream, *operands, kernel, mac, alpha, limit, offset, cap):  # noqa: ANN001, ANN002, ANN202
+    """cuDNN's dGLU kernel: dy W[g] times the GLU's gradient at c and each row's
+    weight, both ways; and each weight's gradient. Its compile takes the GLU's
+    constants."""
+    a, b, c, sfa, sfb, ends, ones, prob, norm_const, beta, *outputs = operands
+    d, d_col, dprob, *scales = outputs
+    per_row = canonical.kernel_facing_prob
+    kernel(
+        **_grouped(stream, mac, a, b, sfa, sfb, ends, ones),
+        **_quantized_out(norm_const, d, d_col, *scales),
+        c=canonical.kernel_facing_mx(c),
+        beta=beta,
+        prob=per_row(prob),
+        dprob=per_row(dprob),
+        dbias_tensor=None,
+        linear_offset=offset,
+        geglu_alpha=alpha,
+        glu_clamp_max=limit,
+        glu_clamp_min=-limit,
+        situ_beta2=cap,
+    )
+
+
+@no_type_check
+def _grouped(stream, mac, a, b, sfa, sfb, ends, alpha):  # noqa: ANN001, ANN202
+    """Return a fused kernel's operands of its GEMM, of a stack of matrices b."""
+    return {
+        "a": canonical.kernel_facing_mx(a),
+        "b": canonical.kernel_facing_b(b),
+        "sfa": sfa,
+        "sfb": sfb,
+        "n": cutlass.Int32(0),
+        "k": cutlass.Int32(0),
+        "b_stride_size": cutlass.Int64(0),
+        "b_major_mode": OperandMajorMode.K,
+        "workspace_ptr": cute.make_ptr(
+            cutlass.Uint8, 0, cute.AddressSpace.gmem, assumed_align=128
+        ),
+        "padded_offsets": ends,
+        "alpha": alpha,
+        "amax_tensor": None,
+        "max_active_clusters": mac,
+        "stream": stream,
+    }
+
+
+@no_type_check
+def _quantized_out(norm_const, d, d_col, sfd, sfd_col):  # noqa: ANN001, ANN202
+    """Return a fused kernel's output in MXFP8, along its rows and down its columns,
+    and their scales."""
+    facing = canonical.kernel_facing_mx
+    return {
+        "d": facing(d),
+        "d_col": facing(d_col),
+        "sfd_row_tensor": sfd,
+        "sfd_col_tensor": sfd_col,
+        "norm_const_tensor": norm_const,
+    }
 
 
 @no_type_check

@@ -6,16 +6,22 @@ the quantizer's bandwidth at what one GPU of megatron.bux's `sorted` arm quantiz
 layer; then an MoE layer's experts, forward and backward, in MXFP8
 (``grouped_blockscaled``) against bfloat16 (``grouped``), at the baseline MoE's shapes
 (64 experts, d_model 2048, intermediate 704 and 2048, 262144 picks), and the GPU time
-of each by CUPTI.
+of each by CUPTI. Last, the experts by cuDNN's fused kernels (``grouped_glu``), each
+activation they fuse at a model's widths, against bux's GEMMs with them off, forward
+and backward, sorted into their tokens and as an exchange's rows: hidden units padded
+(1856, 192), widths of 2880, experts with no rows.
 
     uv run --extra cuda python scripts/gpu_smoke/grouped_mxfp8.py
 
-It exits 1 if a kernel differs from XLA by more than float32's rounding, or the
-quantizer's bytes from XLA's.
+It exits 1 if a kernel differs from XLA by more than float32's rounding, the
+quantizer's bytes from XLA's, or the fused experts from bux's GEMMs by more than
+MXFP8's rounding.
 """
 
 import sys
 from collections.abc import Callable
+from typing import Any
+from unittest import mock
 
 import jax
 import jax.numpy as jnp
@@ -23,10 +29,17 @@ import numpy as np
 from jax.experimental.mosaic.gpu import profiler
 from jaxtyping import Array, Float
 
+from bux import config as cfg
 from bux import kernels, runtime
-from bux.architecture.experts import grouped, grouped_blockscaled, grouped_triton
+from bux.architecture.experts import (
+    grouped,
+    grouped_blockscaled,
+    grouped_glu,
+    grouped_triton,
+    moe,
+)
 from bux.architecture.experts import grouped_mxfp8 as gm
-from bux.architecture.precision import blockscaled
+from bux.architecture.precision import blockscaled, matmuls
 from bux.architecture.precision.blockscaled import Blocks
 
 TOLERANCE = 1e-5  # of the largest value: float32, summed in another order
@@ -165,6 +178,117 @@ def gpu_ms(product: Product, f: int) -> float:
     return float(np.median(np.asarray(times)))
 
 
+def ffn(intermediate: int, activation: cfg.Activation, **more: float) -> cfg.MLPConfig:
+    """An expert's FFN: ReLU^2's ungated, the others gated."""
+    kind = "mlp" if activation == "relu2" else "gated_mlp"
+    return cfg.MLPConfig(
+        type=kind, intermediate_size=intermediate, activation=activation, **more
+    )
+
+
+# Each activation the fused kernels take, at a model's experts' widths: the FFN, d, the
+# experts, k picks a token.
+FUSED = {
+    "Nemotron 3 Nano's relu2": (ffn(1856, "relu2"), 2688, 16, 6),
+    "Nemotron 3 Super's relu2": (ffn(2688, "relu2"), 1024, 64, 22),
+    "gpt-oss's GeGLU, unbiased": (
+        ffn(2880, "quick_gelu", limit=7.0, up_offset=1.0),
+        2880,
+        16,
+        4,
+    ),
+    "DeepSeek-V4-Flash's clamped SwiGLU": (ffn(2304, "swish", limit=10.0), 4096, 16, 6),
+    "Kimi K3's SiTU-GLU": (ffn(3072, "situ", up_softcap=25.0), 2048, 16, 8),
+    "Qwen3-30B-A3B's SwiGLU": (ffn(768, "swish"), 2048, 16, 8),
+    "relu2 of 192, padded": (ffn(192, "relu2"), 256, 8, 2),
+}
+FUSED_TOKENS = 4096
+FUSED_TOLERANCE = 0.06  # of the fused output and gradients from bux's GEMMs' (MXFP8)
+
+
+def fused_off() -> Any:
+    """Return a context in which the experts run by bux's own GEMMs."""
+    return mock.patch.object(grouped_glu, "runs", return_value=False)
+
+
+def experts_case(name: str, summed: bool) -> tuple[Callable[..., Array], list, Array]:
+    """An MoE layer's experts of FUSED[name] in MXFP8: by `moe.routed`, summed into
+    the tokens, or by `moe.experts`, as an exchange's rows lie (the last expert's
+    empty)."""
+    config, d, experts, k = FUSED[name]
+    p = 2 if config.type == "gated_mlp" else 1
+    f = config.intermediate_size
+    keys = jax.random.split(jax.random.key(9), 5)
+    up = jax.random.normal(keys[0], (experts, d, f, p)) / d**0.5
+    down = jax.random.normal(keys[1], (experts, f, d)) / f**0.5
+    if summed:
+        logits = jax.random.normal(keys[2], (FUSED_TOKENS, experts))
+        top, idx = jax.lax.top_k(logits, k)
+        weights = jax.nn.softmax(top)
+        x = jax.random.normal(keys[3], (1, FUSED_TOKENS, d))
+
+        def run(x: Array, w: Array, up: Array, down: Array) -> Array:
+            return moe.routed(x, idx[None], w[None], moe.Kernels(up, down), config)
+
+    else:
+        rows = FUSED_TOKENS * k
+        shares = np.append(np.ones(experts - 1), 0) / (experts - 1)
+        sizes = np.random.default_rng(0).multinomial(rows * 4 // 5, shares)
+        weights = jax.random.uniform(keys[2], (rows,))
+        x = jax.random.normal(keys[3], (rows, d))
+
+        def run(x: Array, w: Array, up: Array, down: Array) -> Array:
+            sorted_sizes = jnp.asarray(sizes, jnp.int32)
+            return moe.experts(x, sorted_sizes, w, moe.Kernels(up, down), config)
+
+    args = [a.astype(jnp.bfloat16) for a in (x, weights, up, down)]
+    dy = jax.random.normal(keys[4], run(*args).shape, jnp.bfloat16)
+    return run, args, dy
+
+
+def with_grads(
+    run: Callable[..., Array], args: list, dy: Array, fmt: str
+) -> list[np.ndarray]:
+    """The experts' output and every gradient, in `fmt`."""
+
+    def step(*args: Array) -> tuple[Array, ...]:
+        with matmuls.use(fmt):
+            y, vjp = jax.vjp(run, *args)
+        return y, *vjp(dy)
+
+    return [np.asarray(a, np.float32) for a in jax.jit(step)(*args)]
+
+
+def frobenius_off(got: np.ndarray, want: np.ndarray) -> float:
+    return float(np.linalg.norm(got - want) / np.linalg.norm(want))
+
+
+def fused_off_by(name: str, summed: bool) -> float:
+    """How far the fused experts are from bux's GEMMs, the worst of the output and
+    gradients; infinite where they are no nearer bfloat16's than those GEMMs, by a
+    margin, or not finite."""
+    run, args, dy = experts_case(name, summed)
+    fused = with_grads(run, args, dy, "mxfp8")
+    with fused_off():
+        before = with_grads(run, args, dy, "mxfp8")
+        exact = with_grads(run, args, dy, "compute")
+    worst = 0.0
+    for got, was, want in zip(fused, before, exact, strict=True):
+        near = frobenius_off(got, want) < 1.25 * frobenius_off(was, want) + 1e-3
+        if not (np.isfinite(got).all() and near):
+            return float("inf")
+        worst = max(worst, frobenius_off(got, was))
+    return worst
+
+
+def fused_runs(name: str) -> bool:
+    """Whether the fused kernels take FUSED[name]'s experts."""
+    config, d, experts, _ = FUSED[name]
+    p = 2 if config.type == "gated_mlp" else 1
+    up = jnp.zeros((experts, d, config.intermediate_size, p))
+    return grouped_glu.runs(blockscaled.MXFP8, blockscaled.PASSES, config, up)
+
+
 def main() -> int:
     runtime.configure()
     if not kernels.gpu() or "B" not in jax.devices()[0].device_kind:
@@ -197,7 +321,14 @@ def main() -> int:
             f"MXFP8 {mx:.2f} ms ({bf16 / mx:.2f}x)",
             flush=True,
         )
-    return int(worst > TOLERANCE or differ > 0)
+    fused = 0.0
+    for name in FUSED:
+        assert fused_runs(name), f"the fused kernels do not take {name}"
+        for summed in (True, False):
+            fused = max(fused, e := fused_off_by(name, summed))
+            lay = "summed into tokens" if summed else "as rows"
+            print(f"fused experts, {name}, {lay}: off by {e:.1e}", flush=True)
+    return int(worst > TOLERANCE or differ > 0 or fused > FUSED_TOLERANCE)
 
 
 if __name__ == "__main__":
