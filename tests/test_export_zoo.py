@@ -57,6 +57,9 @@ NEMOTRON = [
 
 #: Grouped-query attention, shrunk: a call that each entry ends with its own settings.
 ATTN = "gqa(num_heads=4, num_kv_heads=2, head_dim=8"
+#: MiniMax-M1 and the M2.x use MiniMax-Text-01's and MiniMax-M2's files, shrunk alike.
+MINIMAX_TEXT = SHRUNK["minimax/minimax_text_01.bux"]
+MINIMAX_M2 = SHRUNK["minimax/minimax_m2.bux"]
 
 #: The widths of the zoo's models that `SHRUNK` has no entry for, and `SMALL` leaves
 #: wide: their heads, hidden units and experts, as `SHRUNK` shrinks the others'.
@@ -128,6 +131,10 @@ WIDTHS = {
         "local = attn(sliding_window_size=4, rope=rope())",
         EXPERTS,
     ],
+    "minimax/minimax_m1.bux": MINIMAX_TEXT,
+    "minimax/minimax_m2.1.bux": MINIMAX_M2,
+    "minimax/minimax_m2.5.bux": MINIMAX_M2,
+    "minimax/minimax_m2.7.bux": MINIMAX_M2,
     "mellum/mellum2_12b_a2.5b_thinking.bux": [
         f"attn = {ATTN}, qk_norm=norm, rope=rope(base=500000))",
         "local = attn(sliding_window_size=4)",
@@ -177,6 +184,14 @@ DEPTHS = {
         )
     ],
     "kimi/kimi_k2.5.bux": ["model = embed layer(dense) layer(experts)^3 norm head"],
+    "minimax/minimax_text_01.bux": ['model = embed "LLLLLLLA" "LLLA" norm head'],
+    "minimax/minimax_m1.bux": ['model = embed "LLLLLLLA" "LLLA" norm head'],
+    "minimax/minimax_m2.bux": ["model = embed block^3 norm head"],
+    "minimax/minimax_m2.1.bux": ["model = embed block^3 norm head"],
+    "minimax/minimax_m2.5.bux": ["model = embed block^3 norm head"],
+    "minimax/minimax_m2.7.bux": ["model = embed block^3 norm head"],
+    "minimax/minimax_m3.bux": ["model = embed D^2 S^3 norm head"],
+    "minimax/minimax_m3.1_flash.bux": ["model = embed D^2 S^3 norm head"],
     "muse/muse_spark_open_816b_a42b.bux": [
         (
             'model = embed bare "LG" "LLLG"^2 (rmsnorm(eps=1e-5) * logit_scale)'
