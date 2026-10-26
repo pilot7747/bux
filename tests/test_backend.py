@@ -29,6 +29,7 @@ from bux.architecture import (
     num_params,
     registry,
 )
+from bux.architecture.attention import norm_rope
 from bux.architecture.attention.rope import frequencies, rotate
 from bux.architecture.experts.moe import dense_weights
 from bux.architecture.graph import Sequence
@@ -212,6 +213,87 @@ def test_the_gate_bias_adds_one_value_per_head_before_the_sigmoid():
     gate = attn.gate(x).reshape(2, 8, H, -1) + jnp.arange(H)[:, None]
     expected = attn.o((heads * jax.nn.sigmoid(gate)).reshape(2, 8, -1))
     assert jnp.allclose(attn._output(x, heads), expected, atol=1e-5)
+
+
+def qk_normed_over_all_heads() -> Attention:
+    """MiniMax-M2's attention, shrunk: QK-norm of all the heads together, with random
+    gains so that each channel's counts, and RoPE on half of each head's dims."""
+    rms = cfg.NormalizationConfig(type="rmsnorm", eps=1e-6)
+    rope = cfg.RoPEConfig(fraction=0.5)
+    attn = gqa(qk_norm=rms, qk_norm_all_heads=True, rope=rope)
+    for i, norm in enumerate(gains(attn)):
+        norm[...] = 1 + jax.random.normal(jax.random.key(i + 3), norm.shape)
+    return attn
+
+
+def gains(attn: Attention) -> tuple[nnx.Param, nnx.Param]:
+    """The gains of `attn`'s QK-norm, the queries' and the keys'."""
+    q, k = attn.q_norm, attn.k_norm
+    assert q is not None and q.scale is not None and k is not None
+    assert k.scale is not None
+    return q.scale, k.scale
+
+
+def minimax_m2_attention(attn: Attention, x: jax.Array) -> jax.Array:
+    """`attn`'s output as MiniMax-M2's modeling code computes it: the projected q and k
+    each over the RMS of all their channels, times the gain, then split into heads and
+    rotated."""
+    assert attn.q is not None and attn.k is not None and attn.v is not None
+    assert attn.rope is not None
+    b, t, _ = x.shape
+    dk = D // H
+    q_gain, k_gain = gains(attn)
+
+    def rms(y, gain):
+        return y * jax.lax.rsqrt(jnp.mean(y * y, -1, keepdims=True) + 1e-6) * gain[...]
+
+    q = rotate(rms(attn.q(x), q_gain).reshape(b, t, H, dk), attn.rope)
+    k = rotate(rms(attn.k(x), k_gain).reshape(b, t, 2, dk), attn.rope)
+    k, v = (jnp.repeat(y, H // 2, axis=2) for y in (k, attn.v(x).reshape(b, t, 2, dk)))
+    logits = jnp.einsum("bthd,bshd->bhts", q, k) * dk**-0.5
+    causal = jnp.tril(jnp.ones((t, t), bool))
+    probs = jax.nn.softmax(jnp.where(causal, logits, -jnp.inf), -1)
+    return attn.o(jnp.einsum("bhts,bshd->bthd", probs, v).reshape(b, t, -1))
+
+
+def test_qk_norm_over_all_heads_is_one_norm_of_the_queries_and_one_of_the_keys():
+    """An RMSNorm of the h * dk query channels and one of the g * dk key channels, a
+    gain each per channel, before the heads split and RoPE: forward and backward."""
+    attn = qk_normed_over_all_heads()
+    assert [g.shape for g in gains(attn)] == [(H * D // H,), (2 * D // H,)]
+    x = jax.random.normal(jax.random.key(1), (2, 8, D))
+    assert jnp.allclose(attn(x, Taps()), minimax_m2_attention(attn, x), atol=1e-5)
+    weights = jnp.cos(jnp.arange(2 * 8 * D)).reshape(2, 8, D)
+
+    def grads(f):
+        return nnx.grad(lambda m, x: (f(m, x) * weights).sum(), argnums=(0, 1))(attn, x)
+
+    got = grads(lambda m, x: m(x, Taps()))
+    want = grads(minimax_m2_attention)
+    for a, b in zip(jax.tree.leaves(got), jax.tree.leaves(want), strict=True):
+        assert jnp.allclose(a, b, atol=1e-5)
+
+
+def test_the_fused_kernel_never_takes_qk_norm_over_all_heads(monkeypatch):
+    """Its kernel normalizes each head: offered every norm, it still gets none of all
+    the heads together."""
+    monkeypatch.setattr(norm_rope, "takes", lambda *_: True)
+    attn = qk_normed_over_all_heads()
+    x = jax.random.normal(jax.random.key(1), (2, 8, D))
+    assert jnp.allclose(attn(x, Taps()), minimax_m2_attention(attn, x), atol=1e-5)
+
+
+def test_a_layer_reading_the_kv_port_normalizes_its_queries_over_all_heads():
+    """Its keys come from the port as the writer normalized them."""
+    m = model(
+        "a = attn(qk_norm=norm, qk_norm_all_heads=true)\n"
+        "model = embed [norm a(kv=@kv)] [norm a(kv=$kv)] norm head"
+    )
+    writer, reader = (x for _, x in nnx.iter_graph(m) if isinstance(x, Attention))
+    assert writer.k_norm is not None and reader.k_norm is None
+    assert reader.q_norm is not None and reader.q_norm.scale is not None
+    assert reader.q_norm.scale.shape == (D,)
+    assert bool(jnp.isfinite(m(tokens())).all())
 
 
 def test_yarn_matches_transformers():
