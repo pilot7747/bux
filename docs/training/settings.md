@@ -35,7 +35,7 @@ shows them on hover and completes them, as it does for layers
 | `tokenizer` | {bux}`tokenizer`, or `none` | `none` | the tokenizer of `text` and `chat` documents; required with them |
 | `packing` | {bux}`concat`, {bux}`greedy` or {bux}`best_fit` | `best_fit` | how documents become rows ([Packing](../data/packing.md)) |
 | `optimizer` | {bux}`adamw` or {bux}`muon` | required | the update rule ([Optimizers](optimizers.md)) |
-| `schedule` | {bux}`constant`, {bux}`cosine` or {bux}`wsd` | `constant` | what multiplies the learning rate at each step ([Schedules](optimizers.md#schedules)) |
+| `schedule` | {bux}`constant`, {bux}`cosine`, {bux}`wsd`, {bux}`linear_decay`, {bux}`multistep`, {bux}`power` or {bux}`piecewise` | `constant` | what multiplies the learning rate at each step ([Schedules](optimizers.md#schedules)) |
 | `seq_len` | an integer, at least 2 | required | tokens a row |
 | `batch` | a positive integer | required | rows a step |
 | `steps` | a positive integer | required | optimizer steps |
@@ -160,7 +160,10 @@ Some fields check their values further:
 | `roles.experts` of `precision` | `compute`, `mxfp8` or `mxfp8_2d`: the formats a grouped GEMM takes |
 | `options` of `compiler` | each option written `--name=value` |
 | `switch.at` of `precision` | strictly between 0 and 1 |
-| `decay` of `wsd` | between 0 and 1 |
+| `decay` of `wsd` and `power` | between 0 and 1 |
+| `warmup` of a schedule | a count of steps, or a share of them between 0 and 1 |
+| `phases` of `piecewise` | each ending later than the one before, the last at 1 |
+| `shape=geometric` | a cooldown or phase that starts and ends above 0 |
 
 ```console
 $ bux check examples/experiments/smoke.bux 'precision = precision(matmuls=nvfp4, roles=roles(experts=nvfp4))'
@@ -173,8 +176,9 @@ error: roles: experts: Value error, the routed experts multiply in compute, mxfp
 
 ### Settings that must fit together
 
-The warmup and the cooldown fit in the steps. The error points into the module that
-wrote the schedule:
+The warmup and the cooldown fit in the steps: the cooldown of `wsd` and `power`, and
+the phases of `piecewise` after its first, which starts at the warmup's end. The
+error points into the module that wrote the schedule:
 
 ```console
 $ bux check examples/experiments/attention_ablation.bux steps=50

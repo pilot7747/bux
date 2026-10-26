@@ -67,7 +67,7 @@ def _built(run) -> tuple[Model, optax.GradientTransformation, Objective]:
     """The model of `run`, its optimizer and its objective, under the mesh in force."""
     t = run.train
     model = parallel.build(lambda: Model(run.arch, rngs=nnx.Rngs(0)))
-    tx = optimizer(t.optimizer, lr_multiplier(t.schedule, t.steps), model, t.clip)
+    tx = optimizer(t.optimizer, lr_multiplier(t), model, t.clip)
     return model, tx, objective(t.loss, run.arch)
 
 

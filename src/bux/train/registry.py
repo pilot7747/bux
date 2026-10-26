@@ -49,10 +49,10 @@ class Registry[T]:
         schedules = Registry[Schedule]("schedule", "bux.train.optim.schedules")
 
         @schedules.register("constant")
-        def _(c: ConstantSchedule, steps: int) -> Schedule:
+        def _(c: ConstantSchedule, train: TrainConfig) -> Schedule:
             return lambda step: jnp.asarray(1.0)
 
-        curve = schedules.build(ConstantSchedule(), 1000)
+        curve = schedules.build(run.train.schedule, run.train)
     """
 
     def __init__(self, kind: str, where: str):

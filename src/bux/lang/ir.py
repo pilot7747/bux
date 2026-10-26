@@ -302,6 +302,7 @@ _NEWER_FIELDS = {
         "dispatch": "compute",
     },
     "optimizer": {"ns_coefficients": "jordan", "ns_dtype": "float32"},
+    "schedule": {"horizon": 1.0},
 }
 # Fields of a setting that only change how a run is watched.
 _UNCOMPUTED_FIELDS = {"precision": ("eval",)}

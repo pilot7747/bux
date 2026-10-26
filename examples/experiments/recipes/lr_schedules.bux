@@ -1,0 +1,115 @@
+# The learning-rate schedules of tech reports, by name, as their pretraining runs
+# describe them. Where a report gives tokens, they are shares of its run here, so
+# that a shorter run keeps the schedule's shape; warmups it gives in steps stay
+# steps. A run picks one, or sweeps several, next to its optimizer:
+#
+#   use lr_schedules
+#   schedule = deepseek_v3 | kimi_k2 | olmo_2
+#
+# Only the pretraining stage, unless said: a later stage on other data or a longer
+# context is a run of its own. Reports that state no schedule (Qwen3, Gemma 3,
+# gpt-oss, Llama 4, ...) are not here; neither is Ling 2.0's WSM, which holds the
+# peak and merges checkpoints instead of decaying.
+
+# --- Steps and chained phases -----------------------------------------------------
+
+# DeepSeek LLM (2024): 31.6% of the peak from 80% of the tokens, 10% from 90%.
+deepseek_llm = multistep(warmup=2k, at=[0.8, 0.9], factor=0.316)
+# DeepSeek-V2 (2024): times 0.316 at about 60% of the tokens and again at 90%.
+deepseek_v2 = multistep(warmup=2k, at=[0.6, 0.9], factor=0.316)
+# DeepSeek-V3 (2024), 14.8T tokens: the peak to 10T, a cosine to 10% by 14.3T, 10%
+# for 333B, then 7.3e-6 (3.3%) for the last 167B.
+deepseek_v3 = piecewise(warmup=2k,
+                        phases=[phase(until=10 / 14.8),
+                                phase(until=14.3 / 14.8, to=0.1, shape=cosine),
+                                phase(until=14.633 / 14.8),
+                                phase(to=0.033)])
+# DeepSeek-V4.1-Flash (2026), 45T tokens: the peak to 28T, a cosine to 10% by 40T,
+# held to the end.
+deepseek_v4_1 = piecewise(warmup=2k,
+                          phases=[phase(until=28 / 45),
+                                  phase(until=40 / 45, to=0.1, shape=cosine),
+                                  phase()])
+# MiniMax-Text-01 (2025), 11.4T tokens: the peak for 7.2T, cut to 65% for 3.2T after
+# its gradient norms spiked, then an exponential decay to 15% over the last 1T,
+# here one by the same factor every step.
+minimax_text_01 = piecewise(warmup=500,
+                            phases=[phase(until=7.2 / 11.4),
+                                    phase(until=10.4 / 11.4, to=0.65),
+                                    phase(to=0.15, shape=geometric)])
+# MiMo-7B (2025), 23.7T tokens over its three stages: the peak for 10.2T, a cosine to
+# 28% over 7.5T, held for 5.5T, then a cosine to 9.3% over the last 500B. Its warmup
+# is 84B tokens.
+mimo_7b = piecewise(warmup=84 / 23.7e3,
+                    phases=[phase(until=10.2 / 23.7),
+                            phase(until=17.7 / 23.7, to=0.28, shape=cosine),
+                            phase(until=23.2 / 23.7),
+                            phase(to=0.093, shape=cosine)])
+# MiMo-V2-Flash (2026), 27T tokens: the peak to 12T, then cosines to 31% by 22T, 9.4%
+# by 26T and 3.1% at the end, the last through its long-context stage. Its warmup is
+# 50B tokens.
+mimo_v2_flash = piecewise(warmup=50 / 27e3,
+                          phases=[phase(until=12 / 27),
+                                  phase(until=22 / 27, to=0.3125, shape=cosine),
+                                  phase(until=26 / 27, to=0.094, shape=cosine),
+                                  phase(to=0.031, shape=cosine)])
+# GLM-5 (2026), through mid-training: a cosine to 20% over its 28.5T tokens of
+# pretraining, then down to 5% linearly over 1.55T of mid-training. The report gives
+# no warmup length.
+glm_5 = piecewise(phases=[phase(until=28.5 / 30.05, to=0.2, shape=cosine),
+                          phase(to=0.05, shape=linear)])
+
+# --- Cosines ----------------------------------------------------------------------
+
+# Llama 3 405B (2024): a cosine to 1% of the peak. The report then anneals linearly to
+# 0 over the last 40M tokens, at 128K context.
+llama3 = cosine(warmup=8k, final=0.01)
+# Nemotron-H 8B (2025): a cosine to 1% over 15T tokens, after 8.3B of warmup.
+nemotron_h = cosine(warmup=8.3 / 15e3, final=0.01)
+# GLM-4.5 (2025): a cosine to 10%, through mid-training, instead of WSD. The report
+# gives no warmup length.
+glm_4_5 = cosine(final=0.1)
+# Trinity Large (2026): a cosine to 10%; its context extension goes on to 5%.
+trinity_large = cosine(warmup=2k, final=0.1)
+# OLMo 2 7B (2025): a cosine meant to reach 10% at 5T tokens, cut off at 4T. Its
+# mid-training then decays linearly to 0 (linear_decay).
+olmo_2 = cosine(warmup=2k, final=0.1, horizon=5 / 4)
+
+# --- Warmup-stable-decay ----------------------------------------------------------
+
+# Kimi K2 (2025), 15.5T tokens: the peak for 10T, then a cosine to 10% over 5.5T. Its
+# anneal from 2e-5 to 7e-6 over 460B tokens, of a shape the report does not give,
+# comes after.
+kimi_k2 = wsd(warmup=500, decay=5.5 / 15.5, final=0.1, shape=cosine)
+# Nemotron 3 Super (2026): 1 - sqrt to 1% over the last 5T of 25T tokens, after
+# 200B tokens of warmup.
+nemotron_3_super = wsd(warmup=200 / 25e3, decay=0.2, final=0.01, shape=sqrt)
+# Nemotron 3 Ultra (2026): the same over the last 5T of 20T tokens.
+nemotron_3_ultra = wsd(warmup=200 / 20e3, decay=0.25, final=0.01, shape=sqrt)
+# Nemotron 3 Nano (2025): to 1% over the last 5T of 25T tokens, after 8.4B of warmup.
+# The report does not give the decay's shape.
+nemotron_3_nano = wsd(warmup=8.4 / 25e3, decay=0.2, final=0.01)
+# Hymba (2024): a warmup of 1% of the steps, then from 3e-3 to 1e-5 over the last 20%.
+# The report does not give the decay's shape.
+hymba = wsd(warmup=0.01, decay=0.2, final=1e-5 / 3e-3)
+# Laguna XS.2 (2026): 1 - sqrt to 5% over the last 30% of the steps.
+laguna_xs_2 = wsd(decay=0.3, final=0.05, shape=sqrt)
+# Mellum2 (2026): warmup-hold-decay, linearly to 0 over its third data phase, 15% of
+# the steps.
+mellum2 = wsd(warmup=2k, decay=0.15)
+# SmolLM2 1.7B and SmolLM3 (2025): linearly to 0 over the last 10%.
+smollm3 = wsd(warmup=2k, decay=0.1)
+# Apertus (2025): 1 - sqrt to 10% from 13.5T of 15T tokens.
+apertus = wsd(decay=0.1, final=0.1, shape=sqrt)
+# nanochat (Karpathy, 2025): linearly to 5% over the last 65% of the steps.
+nanochat = wsd(warmup=40, decay=0.65, final=0.05)
+
+# --- Decays without a stable phase, and power laws --------------------------------
+
+# Straight to zero (Bergsma et al., 2025): linearly to 0 after a warmup of 10% of the
+# steps.
+d2z = linear_decay(warmup=0.1)
+# IBM's PowerLM (2024), as Granite 3.0 and 4.0 train: 4 · batch · tokens^-0.51, capped
+# at the optimizer's lr (theirs is 0.02, under µP), then an exponential cooldown to 0
+# over the last 10%.
+power_lm = power(a=4, b=-0.51, decay=0.1)

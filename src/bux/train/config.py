@@ -21,9 +21,10 @@ docstring and the comments on its fields are the training half of the language
 reference and what the editor shows on hover (`bux.lang.reference`).
 """
 
+import itertools
 from typing import Annotated, Literal
 
-from pydantic import AfterValidator, BeforeValidator, Field
+from pydantic import AfterValidator, BeforeValidator, Field, model_validator
 
 from bux.config import Config
 
@@ -273,20 +274,44 @@ OptimizerConfig = Annotated[AdamWConfig | MuonConfig, Field(discriminator="type"
 # A schedule multiplies the optimizer's lr at every step. Each starts with `warmup`
 # steps that rise linearly from lr / warmup at the first step to lr.
 
+# Steps of warmup, or below 1 a share of the steps, rounded to a number of them.
+Warmup = int | Annotated[float, Field(gt=0, lt=1)]
+
+# How a cooldown or a phase goes from where it starts to where it ends: sqrt is
+# 1 - sqrt(t) (Hägele et al., 2024); exp falls by e over it, moved to end where it
+# should (IBM's); geometric by the same factor every step (MiniCPM's), so it starts
+# and ends above 0; and constant is at its end from its first step.
+Shape = Literal["linear", "sqrt", "cosine", "exp", "geometric", "constant"]
+
+
+def _increasing(shares: tuple[float, ...]) -> tuple[float, ...]:
+    if any(a >= b for a, b in itertools.pairwise(shares)):
+        raise ValueError("the shares of the steps must increase")
+    return shares
+
+
+def _above_zero(shape: Shape, *ends: float) -> None:
+    if shape == "geometric" and min(ends) <= 0:
+        raise ValueError("a geometric cooldown or phase starts and ends above 0")
+
 
 class ConstantSchedule(Config):
     """The peak learning rate throughout, after the warmup."""
 
     type: Literal["constant"] = "constant"
-    warmup: int = 0  # steps of linear warmup
+    warmup: Warmup = 0  # steps of linear warmup, or a share of them below 1
 
 
 class CosineSchedule(Config):
-    """Warmup, then a cosine decay to `final` times the peak at the last step."""
+    """Warmup, then a cosine decay to `final` times the peak at the last step, or at
+    the `horizon` of the steps."""
 
     type: Literal["cosine"] = "cosine"
-    warmup: int = 0  # steps of linear warmup
+    warmup: Warmup = 0  # steps of linear warmup, or a share of them below 1
     final: float = 0.1  # the multiplier at the last step: a fraction of the peak
+    # The share of the steps the cosine reaches `final` at, rounded to a step: above
+    # 1, the run stops before it does, as OLMo 2's and 3's do; below, it holds there.
+    horizon: Annotated[float, Field(gt=0)] = 1.0
 
 
 class WSDSchedule(Config):
@@ -295,21 +320,137 @@ class WSDSchedule(Config):
     stable phase can be cooled down later, to study several run lengths at once."""
 
     type: Literal["wsd"] = "wsd"
-    warmup: int = 0  # steps of linear warmup
+    warmup: Warmup = 0  # steps of linear warmup, or a share of them below 1
     # The share of the steps the cooldown takes, rounded to a number of steps.
     decay: Annotated[float, Field(ge=0, le=1)] = 0.2
     final: float = 0.0  # the multiplier at the last step: a fraction of the peak
-    # The cooldown's curve; sqrt is 1 - sqrt(t) (Hägele et al., 2024).
-    shape: Literal["linear", "sqrt", "cosine"] = "linear"
+    shape: Shape = "linear"  # the cooldown's curve
+
+    @model_validator(mode="after")
+    def _ends(self) -> "WSDSchedule":
+        """Check that a geometric cooldown ends above 0."""
+        _above_zero(self.shape, self.final)
+        return self
 
     def cooldown(self, steps: int) -> int:
         """Return the steps of the cooldown, in a run of `steps`."""
         return round(self.decay * steps)
 
 
+class LinearDecaySchedule(Config):
+    """Warmup, then a linear decay to `final` times the peak at the last step:
+    straight to zero by default, which Bergsma et al. (2025) find best."""
+
+    type: Literal["linear_decay"] = "linear_decay"
+    warmup: Warmup = 0  # steps of linear warmup, or a share of them below 1
+    final: float = 0.0  # the multiplier at the last step: a fraction of the peak
+
+
+class MultiStepSchedule(Config):
+    """Warmup, then the peak, times `factor` from each share of the steps in `at`
+    on: DeepSeek LLM's 0.316 from 80% of the steps and again from 90%."""
+
+    type: Literal["multistep"] = "multistep"
+    warmup: Warmup = 0  # steps of linear warmup, or a share of them below 1
+    # The shares of the steps it drops at, in order, each rounded to a step.
+    at: Annotated[tuple[Fraction, ...], AfterValidator(_increasing)] = (0.8, 0.9)
+    factor: float = 0.316  # what each drop multiplies by; 0.316 is 1 / sqrt(10)
+
+
+class PowerSchedule(Config):
+    """IBM's Power scheduler (Shen et al., 2024): warmup, then `a` times the batch
+    times n to the `b`, n the tokens trained, capped at the peak; then a cooldown to
+    `final` times where it starts, over the last `decay` of the steps. The warmup
+    rises to the power law's value at the warmup's last step. The peak is the
+    optimizer's lr: the paper's is 0.02, under µP."""
+
+    type: Literal["power"] = "power"
+    warmup: Warmup = 0  # steps of linear warmup, or a share of them below 1
+    a: float = 4.0  # the power law's amplitude, for a batch of one row
+    b: float = -0.51  # its exponent, of the tokens trained
+    # The share of the steps the cooldown takes, rounded to a number of steps.
+    decay: Fraction = 0.1
+    final: float = 0.0  # the multiplier at the last step: a fraction of the start
+    shape: Shape = "exp"  # the cooldown's curve
+
+    @model_validator(mode="after")
+    def _ends(self) -> "PowerSchedule":
+        """Check that a geometric cooldown ends above 0."""
+        _above_zero(self.shape, self.final)
+        return self
+
+    def cooldown(self, steps: int) -> int:
+        """Return the steps of the cooldown, in a run of `steps`."""
+        return round(self.decay * steps)
+
+
+class Phase(Config):
+    """A phase of a `piecewise` schedule: from the multiplier the phase before ends
+    at, the peak for the first, to `to`, along `shape`, until `until` of the
+    steps."""
+
+    type: Literal["phase"] = "phase"
+    until: Fraction = 1.0  # the share of the steps it ends at, rounded to a step
+    to: float | None = None  # the multiplier it ends at; none holds where it starts
+    shape: Shape = "constant"  # how it gets there; constant is there at once
+
+
+def _in_order(phases: tuple[Phase, ...]) -> tuple[Phase, ...]:
+    if not phases or phases[-1].until != 1:
+        raise ValueError("the last phase ends at 1, the end of the run")
+    _increasing(tuple(p.until for p in phases))
+    for p, start in zip(phases, levels(phases), strict=False):
+        _above_zero(p.shape, start, start if p.to is None else p.to)
+    return phases
+
+
+def levels(phases: tuple[Phase, ...]) -> list[float]:
+    """Return the multiplier each phase starts at, then the one the last ends at."""
+    found = [1.0]
+    for p in phases:
+        found.append(found[-1] if p.to is None else p.to)
+    return found
+
+
+class PiecewiseSchedule(Config):
+    """Warmup, then `phases`, one after the other from the end of the warmup: holds,
+    decays, drops and re-warmups, as tech reports chain them. DeepSeek-V3's holds
+    the peak to 10T of its 14.8T tokens, decays along a cosine to 10% of it by
+    14.3T, holds that to 14.633T, and drops to 3.3% for the rest::
+
+        piecewise(warmup=2k, phases=[phase(until=10 / 14.8),
+                                     phase(until=14.3 / 14.8, to=0.1, shape=cosine),
+                                     phase(until=14.633 / 14.8),
+                                     phase(to=0.033)])
+    """
+
+    type: Literal["piecewise"] = "piecewise"
+    warmup: Warmup = 0  # steps of linear warmup, or a share of them below 1
+    # The phases in order, each ending later than the one before; the last at 1.
+    phases: Annotated[tuple[Phase, ...], AfterValidator(_in_order)]
+
+    def cooldown(self, steps: int) -> int:
+        """Return the steps after the first phase, in a run of `steps`."""
+        return steps - round(self.phases[0].until * steps)
+
+
 ScheduleConfig = Annotated[
-    ConstantSchedule | CosineSchedule | WSDSchedule, Field(discriminator="type")
+    ConstantSchedule
+    | CosineSchedule
+    | WSDSchedule
+    | LinearDecaySchedule
+    | MultiStepSchedule
+    | PowerSchedule
+    | PiecewiseSchedule,
+    Field(discriminator="type"),
 ]
+# The schedules with a part at their end that the warmup must leave room for.
+COOLED = (WSDSchedule, PowerSchedule, PiecewiseSchedule)
+
+
+def warmup_steps(c: ScheduleConfig, steps: int) -> int:
+    """Return the steps of the warmup of `c`, in a run of `steps`."""
+    return round(c.warmup * steps) if isinstance(c.warmup, float) else c.warmup
 
 
 # --- Loss, evaluation, checkpoints and logs ------------------------------------
@@ -797,6 +938,11 @@ Setting = Annotated[
     | ConstantSchedule
     | CosineSchedule
     | WSDSchedule
+    | LinearDecaySchedule
+    | MultiStepSchedule
+    | PowerSchedule
+    | PiecewiseSchedule
+    | Phase
     | LossConfig
     | EvalConfig
     | CheckpointConfig

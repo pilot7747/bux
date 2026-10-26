@@ -257,7 +257,7 @@ def _trainer(
     [run] = compile_runs(f"{source}\n{TRAIN}\nprecision = {precision}{settings}")
     t = run.train
     model = parallel.build(lambda: Model(run.arch, rngs=nnx.Rngs(0)))
-    tx = optimizer(t.optimizer, lr_multiplier(t.schedule, t.steps), model, t.clip)
+    tx = optimizer(t.optimizer, lr_multiplier(t), model, t.clip)
     return Trainer(
         model,
         tx,

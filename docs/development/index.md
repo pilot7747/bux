@@ -106,7 +106,7 @@ def lr_schedule(lr: float, multiplier: Schedule) -> Schedule:
 
     Example::
 
-        rate = lr_schedule(3e-3, lr_multiplier(run.train.schedule, run.train.steps))
+        rate = lr_schedule(3e-3, lr_multiplier(run.train))
     """
 ```
 

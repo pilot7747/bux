@@ -21,6 +21,7 @@ import builtins
 import difflib
 import operator
 import re
+import types
 import typing
 from collections.abc import Callable, Generator, Mapping, Sequence
 from contextlib import contextmanager
@@ -196,6 +197,25 @@ def _config_type(value: object) -> type[cfg.Config] | None:
         case _Builtin(name=name) if name in TYPES:
             return TYPES[name]
     return None
+
+
+def _option_of(cls: type[cfg.Config], key: tuple[str, ...], name: str) -> bool:
+    """Whether the setting `key` of `cls` takes the string `name`, of a Literal."""
+    field = cls.model_fields.get(key[0]) if len(key) == 1 else None
+    return field is not None and name in _options(field.annotation)
+
+
+def _options(annotation: object) -> tuple[object, ...]:
+    """Return the values of the Literals in `annotation`, through Annotated and
+    unions."""
+    origin = typing.get_origin(annotation)
+    if origin is typing.Literal:
+        return typing.get_args(annotation)
+    if origin is typing.Annotated:
+        return _options(typing.get_args(annotation)[0])
+    if origin in (typing.Union, types.UnionType):
+        return tuple(o for m in typing.get_args(annotation) for o in _options(m))
+    return ()
 
 
 def _is_number(value: object) -> bool:
@@ -438,9 +458,15 @@ class _Evaluator:
             case ast.ListExpr(items=items):
                 return [self.data(self.eval(item, scope), item.span) for item in items]
             case ast.Residual(body=body):
+                inner = self.eval(body, scope)
+                if isinstance(inner, cfg.Config) and _tag(inner) not in LAYERS:
+                    raise BuxError(
+                        f"[...] is a residual branch, and {_tag(inner)}(...) is no layer",
+                        expr.span,
+                        "a list of one is written with a comma: [x,]",
+                    )
                 return self.node(
-                    ir.Residual(body=self.graph(self.eval(body, scope), body.span)),
-                    expr.span,
+                    ir.Residual(body=self.graph(inner, body.span)), expr.span
                 )
             case ast.Seq(items=items):
                 nodes = [
@@ -813,6 +839,8 @@ class _Evaluator:
                 self.bare[arg.span] = (value.name, arg.value.span, tuple(scope))
             else:
                 self.bare.pop(arg.span, None)
+            if isinstance(value, _Builtin) and _option_of(cls, arg.key, value.name):
+                value = value.name  # wsd(shape=cosine): the option, not the config
             fields.append((arg.key, self.data(value, arg.value.span), arg.span))
         return fields, ports
 
@@ -1457,15 +1485,16 @@ def _missing_settings(missing: list[str]) -> BuxError:
 
 def _check_schedule(train: tcfg.TrainConfig, spans: dict[str, Span]) -> None:
     schedule = train.schedule
+    warmup = tcfg.warmup_steps(schedule, train.steps)
     cooldown = (
-        schedule.cooldown(train.steps) if isinstance(schedule, tcfg.WSDSchedule) else 0
+        schedule.cooldown(train.steps) if isinstance(schedule, tcfg.COOLED) else 0
     )
-    if schedule.warmup + cooldown > train.steps:
-        what = f"{schedule.warmup} of warmup" + (
+    if warmup + cooldown > train.steps:
+        what = f"{warmup} of warmup" + (
             f" and {cooldown} of cooldown" if cooldown else ""
         )
         raise BuxError(
-            f"the schedule takes {schedule.warmup + cooldown} steps ({what}), but the "
+            f"the schedule takes {warmup + cooldown} steps ({what}), but the "
             f"run has {train.steps}",
             spans.get("schedule", spans["steps"]),
         )
