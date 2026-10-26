@@ -73,7 +73,7 @@ class LastLoss(Hook):
         self.loss: float | None = None
 
     def __call__(self, trainer, metrics):
-        self.loss = trainer.evaluate([BATCH])
+        self.loss = trainer.evaluate([BATCH])["loss"]
 
 
 def loss(restored: runs.Restored) -> float:
