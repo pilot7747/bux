@@ -1,0 +1,46 @@
+{
+ "axes": [
+  {
+   "id": "a0",
+   "where": "d_model",
+   "options": [
+    "s: 512",
+    "m: 768",
+    "l: 1024"
+   ],
+   "labeled": true,
+   "span": [
+    314,
+    338
+   ],
+   "pick": 0
+  }
+ ],
+ "runs": [
+  {
+   "name": "width_sweep[s]",
+   "id": "51f29d0c4f",
+   "picks": {
+    "a0": 0
+   }
+  },
+  {
+   "name": "width_sweep[m]",
+   "id": "cdbf6ab0ca",
+   "picks": {
+    "a0": 1
+   }
+  },
+  {
+   "name": "width_sweep[l]",
+   "id": "5f39f3364f",
+   "picks": {
+    "a0": 2
+   }
+  }
+ ],
+ "total": 3,
+ "truncated": false,
+ "dimensions": [],
+ "search": null
+}

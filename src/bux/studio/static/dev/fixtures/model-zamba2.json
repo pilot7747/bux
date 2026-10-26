@@ -1,0 +1,1316 @@
+{
+ "name": "zamba2",
+ "facts": {
+  "d_model": 2048,
+  "vocab_size": 32000,
+  "layers": 109,
+  "residual": null,
+  "init": null,
+  "by_type": [
+   [
+    "rmsnorm",
+    51
+   ],
+   [
+    "mamba2",
+    38
+   ],
+   [
+    "gqa",
+    6
+   ],
+   [
+    "gated_mlp",
+    6
+   ],
+   [
+    "linear",
+    6
+   ],
+   [
+    "embed",
+    1
+   ],
+   [
+    "head",
+    1
+   ]
+  ]
+ },
+ "graph": {
+  "id": "n",
+  "kind": "seq",
+  "label": "model",
+  "shared": false,
+  "span": [
+   992,
+   997
+  ],
+  "origin": null,
+  "editable": true,
+  "items": [
+   {
+    "id": "n.0",
+    "kind": "layer",
+    "label": null,
+    "shared": false,
+    "span": [
+     1000,
+     1005
+    ],
+    "origin": null,
+    "editable": true,
+    "type": "embed",
+    "title": "Token embedding",
+    "category": "io",
+    "chips": [
+     "vocab 32k"
+    ],
+    "width": "tokens",
+    "written": [
+     1000,
+     1005
+    ],
+    "internals": null,
+    "ports": [],
+    "inserted": false
+   },
+   {
+    "id": "n.1",
+    "kind": "repeat",
+    "label": null,
+    "shared": false,
+    "span": [
+     1007,
+     1015
+    ],
+    "origin": null,
+    "editable": true,
+    "body": {
+     "id": "n.1.0",
+     "kind": "seq",
+     "label": null,
+     "shared": false,
+     "span": [
+      1007,
+      1012
+     ],
+     "origin": null,
+     "editable": true,
+     "items": [
+      {
+       "id": "n.1.0.0",
+       "kind": "repeat",
+       "label": null,
+       "shared": false,
+       "span": [
+        1007,
+        1010
+       ],
+       "origin": null,
+       "editable": true,
+       "body": {
+        "id": "n.1.0.0.0",
+        "kind": "residual",
+        "label": "m",
+        "shared": false,
+        "span": [
+         1007,
+         1008
+        ],
+        "origin": null,
+        "editable": true,
+        "body": {
+         "id": "n.1.0.0.0.0",
+         "kind": "seq",
+         "label": null,
+         "shared": false,
+         "span": [
+          901,
+          909
+         ],
+         "origin": null,
+         "editable": true,
+         "items": [
+          {
+           "id": "n.1.0.0.0.0.0",
+           "kind": "layer",
+           "label": "norm",
+           "shared": false,
+           "span": [
+            901,
+            905
+           ],
+           "origin": null,
+           "editable": true,
+           "type": "rmsnorm",
+           "title": "RMSNorm",
+           "category": "norm",
+           "chips": [],
+           "width": 2048,
+           "written": [
+            620,
+            637
+           ],
+           "internals": null,
+           "ports": [],
+           "inserted": false
+          },
+          {
+           "id": "n.1.0.0.0.0.1",
+           "kind": "layer",
+           "label": "ssm",
+           "shared": false,
+           "span": [
+            906,
+            909
+           ],
+           "origin": null,
+           "editable": true,
+           "type": "mamba2",
+           "title": "Mamba-2",
+           "category": "recurrent",
+           "chips": [
+            "state 128",
+            "expand \u00d72",
+            "head dim 64"
+           ],
+           "width": 2048,
+           "written": [
+            645,
+            667
+           ],
+           "internals": {
+            "id": "n.1.0.0.0.0.1:i",
+            "label": null,
+            "shared": false,
+            "span": null,
+            "origin": null,
+            "editable": false,
+            "kind": "seq",
+            "items": [
+             {
+              "id": "n.1.0.0.0.0.1:i.0",
+              "label": null,
+              "shared": false,
+              "span": null,
+              "origin": null,
+              "editable": false,
+              "kind": "prod",
+              "factors": [
+               {
+                "id": "n.1.0.0.0.0.1:i.0.0",
+                "label": null,
+                "shared": false,
+                "span": null,
+                "origin": null,
+                "editable": false,
+                "kind": "seq",
+                "items": [
+                 {
+                  "id": "n.1.0.0.0.0.1:i.0.0.0",
+                  "label": null,
+                  "shared": false,
+                  "span": null,
+                  "origin": null,
+                  "editable": false,
+                  "kind": "layer",
+                  "type": "linear",
+                  "title": "In projection",
+                  "category": "op",
+                  "chips": [
+                   "x, B, C, dt",
+                   "expand \u00d72"
+                  ],
+                  "width": null,
+                  "ports": [],
+                  "written": null,
+                  "internals": null
+                 },
+                 {
+                  "id": "n.1.0.0.0.0.1:i.0.0.1",
+                  "label": null,
+                  "shared": false,
+                  "span": null,
+                  "origin": null,
+                  "editable": false,
+                  "kind": "layer",
+                  "type": "short",
+                  "title": "Short conv",
+                  "category": "op",
+                  "chips": [
+                   "4 taps",
+                   "SiLU"
+                  ],
+                  "width": null,
+                  "ports": [],
+                  "written": null,
+                  "internals": null
+                 },
+                 {
+                  "id": "n.1.0.0.0.0.1:i.0.0.2",
+                  "label": null,
+                  "shared": false,
+                  "span": null,
+                  "origin": null,
+                  "editable": false,
+                  "kind": "layer",
+                  "type": "scan",
+                  "title": "SSD scan",
+                  "category": "recurrent",
+                  "chips": [
+                   "64 heads",
+                   "state 128",
+                   "1 group"
+                  ],
+                  "width": null,
+                  "ports": [],
+                  "written": null,
+                  "internals": null
+                 }
+                ]
+               },
+               {
+                "id": "n.1.0.0.0.0.1:i.0.1",
+                "label": null,
+                "shared": false,
+                "span": null,
+                "origin": null,
+                "editable": false,
+                "kind": "seq",
+                "items": [
+                 {
+                  "id": "n.1.0.0.0.0.1:i.0.1.0",
+                  "label": null,
+                  "shared": false,
+                  "span": null,
+                  "origin": null,
+                  "editable": false,
+                  "kind": "layer",
+                  "type": "linear",
+                  "title": "Linear \u2191 (z)",
+                  "category": "op",
+                  "chips": [],
+                  "width": null,
+                  "ports": [],
+                  "written": null,
+                  "internals": null
+                 },
+                 {
+                  "id": "n.1.0.0.0.0.1:i.0.1.1",
+                  "label": null,
+                  "shared": false,
+                  "span": null,
+                  "origin": null,
+                  "editable": false,
+                  "kind": "layer",
+                  "type": "act",
+                  "title": "SiLU",
+                  "category": "op",
+                  "chips": [],
+                  "width": null,
+                  "ports": [],
+                  "written": null,
+                  "internals": null
+                 }
+                ]
+               }
+              ]
+             },
+             {
+              "id": "n.1.0.0.0.0.1:i.1",
+              "label": null,
+              "shared": false,
+              "span": null,
+              "origin": null,
+              "editable": false,
+              "kind": "layer",
+              "type": "norm",
+              "title": "Group RMSNorm",
+              "category": "norm",
+              "chips": [],
+              "width": null,
+              "ports": [],
+              "written": null,
+              "internals": null
+             },
+             {
+              "id": "n.1.0.0.0.0.1:i.2",
+              "label": null,
+              "shared": false,
+              "span": null,
+              "origin": null,
+              "editable": false,
+              "kind": "layer",
+              "type": "linear",
+              "title": "Linear output",
+              "category": "op",
+              "chips": [
+               "4,096 \u2192 2,048"
+              ],
+              "width": null,
+              "ports": [],
+              "written": null,
+              "internals": null
+             }
+            ]
+           },
+           "ports": [],
+           "inserted": false
+          }
+         ]
+        }
+       },
+       "times": 5
+      },
+      {
+       "id": "n.1.0.1",
+       "kind": "residual",
+       "label": "h",
+       "shared": false,
+       "span": [
+        1011,
+        1012
+       ],
+       "origin": null,
+       "editable": true,
+       "body": {
+        "id": "n.1.0.1.0",
+        "kind": "seq",
+        "label": null,
+        "shared": false,
+        "span": [
+         948,
+         989
+        ],
+        "origin": null,
+        "editable": true,
+        "items": [
+         {
+          "id": "n.1.0.1.0.0",
+          "kind": "sum",
+          "label": null,
+          "shared": false,
+          "span": [
+           948,
+           979
+          ],
+          "origin": null,
+          "editable": true,
+          "terms": [
+           {
+            "id": "n.1.0.1.0.0.0",
+            "kind": "identity",
+            "label": null,
+            "shared": false,
+            "span": [
+             948,
+             949
+            ],
+            "origin": null,
+            "editable": true
+           },
+           {
+            "id": "n.1.0.1.0.0.1",
+            "kind": "seq",
+            "label": null,
+            "shared": false,
+            "span": [
+             952,
+             979
+            ],
+            "origin": null,
+            "editable": true,
+            "items": [
+             {
+              "id": "n.1.0.1.0.0.1.0",
+              "kind": "seq",
+              "label": "sa",
+              "shared": true,
+              "span": [
+               952,
+               954
+              ],
+              "origin": null,
+              "editable": true,
+              "items": [
+               {
+                "id": "n.1.0.1.0.0.1.0.0",
+                "kind": "layer",
+                "label": "norm",
+                "shared": false,
+                "span": [
+                 923,
+                 927
+                ],
+                "origin": null,
+                "editable": true,
+                "type": "rmsnorm",
+                "title": "RMSNorm",
+                "category": "norm",
+                "chips": [],
+                "width": 2048,
+                "written": [
+                 620,
+                 637
+                ],
+                "internals": null,
+                "ports": [],
+                "inserted": false
+               },
+               {
+                "id": "n.1.0.1.0.0.1.0.1",
+                "kind": "layer",
+                "label": "attn",
+                "shared": false,
+                "span": [
+                 928,
+                 932
+                ],
+                "origin": null,
+                "editable": true,
+                "type": "gqa",
+                "title": "Multi-head attention",
+                "category": "attention",
+                "chips": [
+                 "32 heads",
+                 "head dim 128",
+                 "RoPE 10k"
+                ],
+                "width": 2048,
+                "written": [
+                 762,
+                 836
+                ],
+                "internals": {
+                 "id": "n.1.0.1.0.0.1.0.1:i",
+                 "label": null,
+                 "shared": false,
+                 "span": null,
+                 "origin": null,
+                 "editable": false,
+                 "kind": "seq",
+                 "items": [
+                  {
+                   "id": "n.1.0.1.0.0.1.0.1:i.0",
+                   "label": null,
+                   "shared": false,
+                   "span": null,
+                   "origin": null,
+                   "editable": false,
+                   "kind": "layer",
+                   "type": "linear",
+                   "title": "Q, K, V projections",
+                   "category": "op",
+                   "chips": [
+                    "Q 32 heads",
+                    "K, V 32 heads",
+                    "head dim 128"
+                   ],
+                   "width": null,
+                   "ports": [],
+                   "written": null,
+                   "internals": null
+                  },
+                  {
+                   "id": "n.1.0.1.0.0.1.0.1:i.1",
+                   "label": null,
+                   "shared": false,
+                   "span": null,
+                   "origin": null,
+                   "editable": false,
+                   "kind": "layer",
+                   "type": "rope",
+                   "title": "RoPE",
+                   "category": "op",
+                   "chips": [
+                    "base 10k"
+                   ],
+                   "width": null,
+                   "ports": [],
+                   "written": null,
+                   "internals": null
+                  },
+                  {
+                   "id": "n.1.0.1.0.0.1.0.1:i.2",
+                   "label": null,
+                   "shared": false,
+                   "span": null,
+                   "origin": null,
+                   "editable": false,
+                   "kind": "layer",
+                   "type": "sdpa",
+                   "title": "Scaled dot-product attention",
+                   "category": "attention",
+                   "chips": [
+                    "causal"
+                   ],
+                   "width": null,
+                   "ports": [],
+                   "written": null,
+                   "internals": null
+                  },
+                  {
+                   "id": "n.1.0.1.0.0.1.0.1:i.3",
+                   "label": null,
+                   "shared": false,
+                   "span": null,
+                   "origin": null,
+                   "editable": false,
+                   "kind": "layer",
+                   "type": "linear",
+                   "title": "Linear output",
+                   "category": "op",
+                   "chips": [
+                    "4,096 \u2192 2,048"
+                   ],
+                   "width": null,
+                   "ports": [],
+                   "written": null,
+                   "internals": null
+                  }
+                 ]
+                },
+                "ports": [],
+                "inserted": false
+               },
+               {
+                "id": "n.1.0.1.0.0.1.0.2",
+                "kind": "layer",
+                "label": "norm",
+                "shared": false,
+                "span": [
+                 933,
+                 937
+                ],
+                "origin": null,
+                "editable": true,
+                "type": "rmsnorm",
+                "title": "RMSNorm",
+                "category": "norm",
+                "chips": [],
+                "width": 2048,
+                "written": [
+                 620,
+                 637
+                ],
+                "internals": null,
+                "ports": [],
+                "inserted": false
+               },
+               {
+                "id": "n.1.0.1.0.0.1.0.3",
+                "kind": "layer",
+                "label": "ffn",
+                "shared": false,
+                "span": [
+                 938,
+                 941
+                ],
+                "origin": null,
+                "editable": true,
+                "type": "gated_mlp",
+                "title": "Feed forward (GeGLU)",
+                "category": "ffn",
+                "chips": [
+                 "8,192 hidden"
+                ],
+                "width": 2048,
+                "written": [
+                 844,
+                 894
+                ],
+                "internals": {
+                 "id": "n.1.0.1.0.0.1.0.3:i",
+                 "label": null,
+                 "shared": false,
+                 "span": null,
+                 "origin": null,
+                 "editable": false,
+                 "kind": "seq",
+                 "items": [
+                  {
+                   "id": "n.1.0.1.0.0.1.0.3:i.0",
+                   "label": null,
+                   "shared": false,
+                   "span": null,
+                   "origin": null,
+                   "editable": false,
+                   "kind": "prod",
+                   "factors": [
+                    {
+                     "id": "n.1.0.1.0.0.1.0.3:i.0.0",
+                     "label": null,
+                     "shared": false,
+                     "span": null,
+                     "origin": null,
+                     "editable": false,
+                     "kind": "seq",
+                     "items": [
+                      {
+                       "id": "n.1.0.1.0.0.1.0.3:i.0.0.0",
+                       "label": null,
+                       "shared": false,
+                       "span": null,
+                       "origin": null,
+                       "editable": false,
+                       "kind": "layer",
+                       "type": "linear",
+                       "title": "Linear \u2191 (gate)",
+                       "category": "op",
+                       "chips": [
+                        "2,048 \u2192 8,192"
+                       ],
+                       "width": null,
+                       "ports": [],
+                       "written": null,
+                       "internals": null
+                      },
+                      {
+                       "id": "n.1.0.1.0.0.1.0.3:i.0.0.1",
+                       "label": null,
+                       "shared": false,
+                       "span": null,
+                       "origin": null,
+                       "editable": false,
+                       "kind": "layer",
+                       "type": "act",
+                       "title": "GELU",
+                       "category": "op",
+                       "chips": [],
+                       "width": null,
+                       "ports": [],
+                       "written": null,
+                       "internals": null
+                      }
+                     ]
+                    },
+                    {
+                     "id": "n.1.0.1.0.0.1.0.3:i.0.1",
+                     "label": null,
+                     "shared": false,
+                     "span": null,
+                     "origin": null,
+                     "editable": false,
+                     "kind": "layer",
+                     "type": "linear",
+                     "title": "Linear \u2191",
+                     "category": "op",
+                     "chips": [
+                      "2,048 \u2192 8,192"
+                     ],
+                     "width": null,
+                     "ports": [],
+                     "written": null,
+                     "internals": null
+                    }
+                   ]
+                  },
+                  {
+                   "id": "n.1.0.1.0.0.1.0.3:i.1",
+                   "label": null,
+                   "shared": false,
+                   "span": null,
+                   "origin": null,
+                   "editable": false,
+                   "kind": "layer",
+                   "type": "linear",
+                   "title": "Linear \u2193",
+                   "category": "op",
+                   "chips": [
+                    "8,192 \u2192 2,048"
+                   ],
+                   "width": null,
+                   "ports": [],
+                   "written": null,
+                   "internals": null
+                  }
+                 ]
+                },
+                "ports": [],
+                "inserted": false
+               }
+              ]
+             },
+             {
+              "id": "n.1.0.1.0.0.1.1",
+              "kind": "layer",
+              "label": null,
+              "shared": false,
+              "span": [
+               955,
+               979
+              ],
+              "origin": null,
+              "editable": true,
+              "type": "linear",
+              "title": "Linear layer",
+              "category": "op",
+              "chips": [
+               "2,048 out"
+              ],
+              "width": 2048,
+              "written": [
+               955,
+               979
+              ],
+              "internals": null,
+              "ports": [],
+              "inserted": false
+             }
+            ]
+           }
+          ]
+         },
+         {
+          "id": "n.1.0.1.0.1",
+          "kind": "layer",
+          "label": "norm",
+          "shared": false,
+          "span": [
+           981,
+           985
+          ],
+          "origin": null,
+          "editable": true,
+          "type": "rmsnorm",
+          "title": "RMSNorm",
+          "category": "norm",
+          "chips": [],
+          "width": 2048,
+          "written": [
+           620,
+           637
+          ],
+          "internals": null,
+          "ports": [],
+          "inserted": false
+         },
+         {
+          "id": "n.1.0.1.0.2",
+          "kind": "layer",
+          "label": "ssm",
+          "shared": false,
+          "span": [
+           986,
+           989
+          ],
+          "origin": null,
+          "editable": true,
+          "type": "mamba2",
+          "title": "Mamba-2",
+          "category": "recurrent",
+          "chips": [
+           "state 128",
+           "expand \u00d72",
+           "head dim 64"
+          ],
+          "width": 2048,
+          "written": [
+           645,
+           667
+          ],
+          "internals": {
+           "id": "n.1.0.1.0.2:i",
+           "label": null,
+           "shared": false,
+           "span": null,
+           "origin": null,
+           "editable": false,
+           "kind": "seq",
+           "items": [
+            {
+             "id": "n.1.0.1.0.2:i.0",
+             "label": null,
+             "shared": false,
+             "span": null,
+             "origin": null,
+             "editable": false,
+             "kind": "prod",
+             "factors": [
+              {
+               "id": "n.1.0.1.0.2:i.0.0",
+               "label": null,
+               "shared": false,
+               "span": null,
+               "origin": null,
+               "editable": false,
+               "kind": "seq",
+               "items": [
+                {
+                 "id": "n.1.0.1.0.2:i.0.0.0",
+                 "label": null,
+                 "shared": false,
+                 "span": null,
+                 "origin": null,
+                 "editable": false,
+                 "kind": "layer",
+                 "type": "linear",
+                 "title": "In projection",
+                 "category": "op",
+                 "chips": [
+                  "x, B, C, dt",
+                  "expand \u00d72"
+                 ],
+                 "width": null,
+                 "ports": [],
+                 "written": null,
+                 "internals": null
+                },
+                {
+                 "id": "n.1.0.1.0.2:i.0.0.1",
+                 "label": null,
+                 "shared": false,
+                 "span": null,
+                 "origin": null,
+                 "editable": false,
+                 "kind": "layer",
+                 "type": "short",
+                 "title": "Short conv",
+                 "category": "op",
+                 "chips": [
+                  "4 taps",
+                  "SiLU"
+                 ],
+                 "width": null,
+                 "ports": [],
+                 "written": null,
+                 "internals": null
+                },
+                {
+                 "id": "n.1.0.1.0.2:i.0.0.2",
+                 "label": null,
+                 "shared": false,
+                 "span": null,
+                 "origin": null,
+                 "editable": false,
+                 "kind": "layer",
+                 "type": "scan",
+                 "title": "SSD scan",
+                 "category": "recurrent",
+                 "chips": [
+                  "64 heads",
+                  "state 128",
+                  "1 group"
+                 ],
+                 "width": null,
+                 "ports": [],
+                 "written": null,
+                 "internals": null
+                }
+               ]
+              },
+              {
+               "id": "n.1.0.1.0.2:i.0.1",
+               "label": null,
+               "shared": false,
+               "span": null,
+               "origin": null,
+               "editable": false,
+               "kind": "seq",
+               "items": [
+                {
+                 "id": "n.1.0.1.0.2:i.0.1.0",
+                 "label": null,
+                 "shared": false,
+                 "span": null,
+                 "origin": null,
+                 "editable": false,
+                 "kind": "layer",
+                 "type": "linear",
+                 "title": "Linear \u2191 (z)",
+                 "category": "op",
+                 "chips": [],
+                 "width": null,
+                 "ports": [],
+                 "written": null,
+                 "internals": null
+                },
+                {
+                 "id": "n.1.0.1.0.2:i.0.1.1",
+                 "label": null,
+                 "shared": false,
+                 "span": null,
+                 "origin": null,
+                 "editable": false,
+                 "kind": "layer",
+                 "type": "act",
+                 "title": "SiLU",
+                 "category": "op",
+                 "chips": [],
+                 "width": null,
+                 "ports": [],
+                 "written": null,
+                 "internals": null
+                }
+               ]
+              }
+             ]
+            },
+            {
+             "id": "n.1.0.1.0.2:i.1",
+             "label": null,
+             "shared": false,
+             "span": null,
+             "origin": null,
+             "editable": false,
+             "kind": "layer",
+             "type": "norm",
+             "title": "Group RMSNorm",
+             "category": "norm",
+             "chips": [],
+             "width": null,
+             "ports": [],
+             "written": null,
+             "internals": null
+            },
+            {
+             "id": "n.1.0.1.0.2:i.2",
+             "label": null,
+             "shared": false,
+             "span": null,
+             "origin": null,
+             "editable": false,
+             "kind": "layer",
+             "type": "linear",
+             "title": "Linear output",
+             "category": "op",
+             "chips": [
+              "4,096 \u2192 2,048"
+             ],
+             "width": null,
+             "ports": [],
+             "written": null,
+             "internals": null
+            }
+           ]
+          },
+          "ports": [],
+          "inserted": false
+         }
+        ]
+       }
+      }
+     ]
+    },
+    "times": 6
+   },
+   {
+    "id": "n.2",
+    "kind": "repeat",
+    "label": null,
+    "shared": false,
+    "span": [
+     1016,
+     1019
+    ],
+    "origin": null,
+    "editable": true,
+    "body": {
+     "id": "n.2.0",
+     "kind": "residual",
+     "label": "m",
+     "shared": false,
+     "span": [
+      1016,
+      1017
+     ],
+     "origin": null,
+     "editable": true,
+     "body": {
+      "id": "n.2.0.0",
+      "kind": "seq",
+      "label": null,
+      "shared": false,
+      "span": [
+       901,
+       909
+      ],
+      "origin": null,
+      "editable": true,
+      "items": [
+       {
+        "id": "n.2.0.0.0",
+        "kind": "layer",
+        "label": "norm",
+        "shared": false,
+        "span": [
+         901,
+         905
+        ],
+        "origin": null,
+        "editable": true,
+        "type": "rmsnorm",
+        "title": "RMSNorm",
+        "category": "norm",
+        "chips": [],
+        "width": 2048,
+        "written": [
+         620,
+         637
+        ],
+        "internals": null,
+        "ports": [],
+        "inserted": false
+       },
+       {
+        "id": "n.2.0.0.1",
+        "kind": "layer",
+        "label": "ssm",
+        "shared": false,
+        "span": [
+         906,
+         909
+        ],
+        "origin": null,
+        "editable": true,
+        "type": "mamba2",
+        "title": "Mamba-2",
+        "category": "recurrent",
+        "chips": [
+         "state 128",
+         "expand \u00d72",
+         "head dim 64"
+        ],
+        "width": 2048,
+        "written": [
+         645,
+         667
+        ],
+        "internals": {
+         "id": "n.2.0.0.1:i",
+         "label": null,
+         "shared": false,
+         "span": null,
+         "origin": null,
+         "editable": false,
+         "kind": "seq",
+         "items": [
+          {
+           "id": "n.2.0.0.1:i.0",
+           "label": null,
+           "shared": false,
+           "span": null,
+           "origin": null,
+           "editable": false,
+           "kind": "prod",
+           "factors": [
+            {
+             "id": "n.2.0.0.1:i.0.0",
+             "label": null,
+             "shared": false,
+             "span": null,
+             "origin": null,
+             "editable": false,
+             "kind": "seq",
+             "items": [
+              {
+               "id": "n.2.0.0.1:i.0.0.0",
+               "label": null,
+               "shared": false,
+               "span": null,
+               "origin": null,
+               "editable": false,
+               "kind": "layer",
+               "type": "linear",
+               "title": "In projection",
+               "category": "op",
+               "chips": [
+                "x, B, C, dt",
+                "expand \u00d72"
+               ],
+               "width": null,
+               "ports": [],
+               "written": null,
+               "internals": null
+              },
+              {
+               "id": "n.2.0.0.1:i.0.0.1",
+               "label": null,
+               "shared": false,
+               "span": null,
+               "origin": null,
+               "editable": false,
+               "kind": "layer",
+               "type": "short",
+               "title": "Short conv",
+               "category": "op",
+               "chips": [
+                "4 taps",
+                "SiLU"
+               ],
+               "width": null,
+               "ports": [],
+               "written": null,
+               "internals": null
+              },
+              {
+               "id": "n.2.0.0.1:i.0.0.2",
+               "label": null,
+               "shared": false,
+               "span": null,
+               "origin": null,
+               "editable": false,
+               "kind": "layer",
+               "type": "scan",
+               "title": "SSD scan",
+               "category": "recurrent",
+               "chips": [
+                "64 heads",
+                "state 128",
+                "1 group"
+               ],
+               "width": null,
+               "ports": [],
+               "written": null,
+               "internals": null
+              }
+             ]
+            },
+            {
+             "id": "n.2.0.0.1:i.0.1",
+             "label": null,
+             "shared": false,
+             "span": null,
+             "origin": null,
+             "editable": false,
+             "kind": "seq",
+             "items": [
+              {
+               "id": "n.2.0.0.1:i.0.1.0",
+               "label": null,
+               "shared": false,
+               "span": null,
+               "origin": null,
+               "editable": false,
+               "kind": "layer",
+               "type": "linear",
+               "title": "Linear \u2191 (z)",
+               "category": "op",
+               "chips": [],
+               "width": null,
+               "ports": [],
+               "written": null,
+               "internals": null
+              },
+              {
+               "id": "n.2.0.0.1:i.0.1.1",
+               "label": null,
+               "shared": false,
+               "span": null,
+               "origin": null,
+               "editable": false,
+               "kind": "layer",
+               "type": "act",
+               "title": "SiLU",
+               "category": "op",
+               "chips": [],
+               "width": null,
+               "ports": [],
+               "written": null,
+               "internals": null
+              }
+             ]
+            }
+           ]
+          },
+          {
+           "id": "n.2.0.0.1:i.1",
+           "label": null,
+           "shared": false,
+           "span": null,
+           "origin": null,
+           "editable": false,
+           "kind": "layer",
+           "type": "norm",
+           "title": "Group RMSNorm",
+           "category": "norm",
+           "chips": [],
+           "width": null,
+           "ports": [],
+           "written": null,
+           "internals": null
+          },
+          {
+           "id": "n.2.0.0.1:i.2",
+           "label": null,
+           "shared": false,
+           "span": null,
+           "origin": null,
+           "editable": false,
+           "kind": "layer",
+           "type": "linear",
+           "title": "Linear output",
+           "category": "op",
+           "chips": [
+            "4,096 \u2192 2,048"
+           ],
+           "width": null,
+           "ports": [],
+           "written": null,
+           "internals": null
+          }
+         ]
+        },
+        "ports": [],
+        "inserted": false
+       }
+      ]
+     }
+    },
+    "times": 2
+   },
+   {
+    "id": "n.3",
+    "kind": "layer",
+    "label": "norm",
+    "shared": false,
+    "span": [
+     1020,
+     1024
+    ],
+    "origin": null,
+    "editable": true,
+    "type": "rmsnorm",
+    "title": "RMSNorm",
+    "category": "norm",
+    "chips": [],
+    "width": 2048,
+    "written": [
+     620,
+     637
+    ],
+    "internals": null,
+    "ports": [],
+    "inserted": false
+   },
+   {
+    "id": "n.4",
+    "kind": "layer",
+    "label": null,
+    "shared": false,
+    "span": [
+     1025,
+     1040
+    ],
+    "origin": null,
+    "editable": true,
+    "type": "head",
+    "title": "Linear output layer (tied)",
+    "category": "io",
+    "chips": [
+     "vocab 32k",
+     "tied"
+    ],
+    "width": 2048,
+    "written": [
+     1025,
+     1040
+    ],
+    "internals": null,
+    "ports": [],
+    "inserted": false
+   }
+  ]
+ }
+}

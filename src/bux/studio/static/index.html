@@ -1,0 +1,91 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>bux studio</title>
+  <script>
+    // The theme before the first paint, so that a dark page never flashes light.
+    document.documentElement.dataset.theme = localStorage.getItem("bux-studio-theme")
+      ?? (matchMedia("(prefers-color-scheme: dark)").matches ? "dark" : "light");
+  </script>
+  <link rel="stylesheet" href="tokens.css">
+  <link rel="stylesheet" href="app.css">
+  <script type="module" src="app.js"></script>
+</head>
+<body>
+  <header class="topbar">
+    <div class="brand" title="bux studio">
+      <svg class="mark" viewBox="0 0 20 20" aria-hidden="true">
+        <rect width="20" height="20" rx="5.5"/>
+        <path d="M8 5H6v10h2M12 5h2v10h-2"/>
+        <circle cx="10" cy="10" r="1.4"/>
+      </svg>
+      <span class="word">bux</span><span class="word-2">studio</span>
+    </div>
+    <span class="sep"></span>
+    <div class="file" id="file">
+      <span class="file-name" id="file-name">…</span>
+      <span class="dirty-dot" id="dirty" hidden></span>
+    </div>
+    <div class="runpicker" id="runpicker" hidden></div>
+    <span class="grow"></span>
+    <button class="btn" id="save" disabled title="Save the file (⌘S)">Save <kbd>⌘S</kbd></button>
+    <button class="icon-btn" id="theme"></button>
+  </header>
+
+  <div class="banners" id="banners"></div>
+
+  <main class="workspace" id="workspace">
+    <section class="pane code-pane" aria-label="Source">
+      <div class="pane-head">
+        <span class="pane-title">Source</span>
+        <span class="grow"></span>
+        <button class="icon-btn small" id="code-close" title="Hide the code (⌘\)">
+          <svg class="ico" viewBox="0 0 16 16"><rect x="1.5" y="2.5" width="13" height="11" rx="2"/><path d="M6 2.5v11"/></svg>
+        </button>
+      </div>
+      <div class="pane-body" id="editor"></div>
+    </section>
+    <div class="resizer" id="resizer" role="separator" aria-orientation="vertical" title="Drag to resize; double-click to reset"></div>
+
+    <section class="canvas" aria-label="Views">
+      <div class="canvas-head">
+        <button class="icon-btn small" id="code-toggle" title="Show the code (⌘\)">
+          <svg class="ico" viewBox="0 0 16 16"><rect x="1.5" y="2.5" width="13" height="11" rx="2"/><path d="M6 2.5v11"/></svg>
+        </button>
+        <nav class="tabs" id="tabs" role="tablist">
+          <button role="tab" data-tab="model" aria-selected="true" title="⌘1">Model</button>
+          <button role="tab" data-tab="training" title="⌘2">Training <span class="badge" hidden></span></button>
+          <button role="tab" data-tab="sweep" title="⌘3">Sweep <span class="badge" hidden></span></button>
+        </nav>
+        <span class="grow"></span>
+        <button class="icon-btn small" id="inspector-toggle" title="Show the inspector">
+          <svg class="ico" viewBox="0 0 16 16"><rect x="1.5" y="2.5" width="13" height="11" rx="2"/><path d="M10 2.5v11"/></svg>
+        </button>
+      </div>
+      <div class="canvas-body">
+        <div class="view view-model" id="view-model"><div class="canvas-empty">Loading…</div></div>
+        <div class="view view-panel" id="view-training" hidden></div>
+        <div class="view view-panel" id="view-sweep" hidden></div>
+        <div class="canvas-empty canvas-note" id="canvas-note" hidden></div>
+        <div class="errors" id="errors" hidden></div>
+      </div>
+    </section>
+
+    <section class="pane inspector-pane" aria-label="Inspector">
+      <div class="pane-head">
+        <span class="pane-title">Inspector</span>
+        <span class="grow"></span>
+        <button class="icon-btn small" id="inspector-close" title="Hide the inspector">
+          <svg class="ico" viewBox="0 0 16 16"><rect x="1.5" y="2.5" width="13" height="11" rx="2"/><path d="M10 2.5v11"/></svg>
+        </button>
+      </div>
+      <div class="pane-body" id="inspector"></div>
+    </section>
+  </main>
+
+  <footer class="statusbar" id="status"></footer>
+  <div class="toasts" id="toasts"></div>
+</body>
+</html>

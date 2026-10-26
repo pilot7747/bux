@@ -160,7 +160,9 @@ type Run = {
            tokens_text: string, varies: boolean},
   optimizer: {type: string, lr: number, text: string},
   schedule: {type: string, text: string, warmup: number,   // warmup in steps
-             regions: {name: string, start: number, stop: number}[]},  // warmup, decay...
+             regions: {name: string, start: number, stop: number}[]},
+             // names: warmup, stable, decay, drop, piece 1..n
+  // stretches' and phases' data name sources as data[].name does
   stretches: {start: number, stop: number, batch: number, seq_len: number,
               tokens_per_step: number, data: string}[],
   phases: {n: number, start: number, seq_len: number|null, batch: number|null,
@@ -176,8 +178,10 @@ type Run = {
                                 //  "logging", "precision", "parallelism", "search")
 }
 type Sweep = {
-  axes: {id: string, where: string, options: string[], labeled: boolean,
-         span: [number, number] | null, pick: number}[],
+  axes: {id: string, where: string, labeled: boolean, pick: number,
+         options: string[],          // as written at its site: "mha: 12", or "1e-3"
+         labels: string[] | null,    // a labeled axis's bare labels
+         span: [number, number] | null}[],
   runs: {name: string, id: string, picks: {[axisId: string]: number}}[],
   total: number, truncated: boolean,          // runs lists at most 256
   dimensions: {where: string, type: string, low: number|null, high: number|null,

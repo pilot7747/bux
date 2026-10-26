@@ -1,0 +1,599 @@
+{
+ "run": {
+  "name": "curriculum",
+  "id": "ad5785cd6b",
+  "budget": {
+   "steps": 80,
+   "batch": 16,
+   "seq_len": 64,
+   "tokens": 71424,
+   "tokens_text": "71.4k",
+   "varies": true
+  },
+  "optimizer": {
+   "type": "adamw",
+   "lr": 0.003,
+   "text": "adamw(lr=0.003)"
+  },
+  "schedule": {
+   "type": "wsd",
+   "text": "wsd(warmup=10)",
+   "warmup": 10,
+   "regions": [
+    {
+     "name": "warmup",
+     "start": 0,
+     "stop": 10
+    },
+    {
+     "name": "stable",
+     "start": 10,
+     "stop": 64
+    },
+    {
+     "name": "decay",
+     "start": 64,
+     "stop": 80
+    }
+   ]
+  },
+  "stretches": [
+   {
+    "start": 0,
+    "stop": 7,
+    "batch": 4,
+    "seq_len": 64,
+    "tokens_per_step": 256,
+    "data": "synthetic()"
+   },
+   {
+    "start": 7,
+    "stop": 14,
+    "batch": 8,
+    "seq_len": 64,
+    "tokens_per_step": 512,
+    "data": "synthetic()"
+   },
+   {
+    "start": 14,
+    "stop": 20,
+    "batch": 12,
+    "seq_len": 64,
+    "tokens_per_step": 768,
+    "data": "synthetic()"
+   },
+   {
+    "start": 20,
+    "stop": 40,
+    "batch": 16,
+    "seq_len": 64,
+    "tokens_per_step": 1024,
+    "data": "synthetic()"
+   },
+   {
+    "start": 40,
+    "stop": 60,
+    "batch": 8,
+    "seq_len": 128,
+    "tokens_per_step": 1024,
+    "data": "synthetic()"
+   },
+   {
+    "start": 60,
+    "stop": 80,
+    "batch": 4,
+    "seq_len": 256,
+    "tokens_per_step": 1024,
+    "data": "synthetic()"
+   }
+  ],
+  "phases": [
+   {
+    "n": 1,
+    "start": 40,
+    "seq_len": 128,
+    "batch": 8,
+    "data": null
+   },
+   {
+    "n": 2,
+    "start": 60,
+    "seq_len": 256,
+    "batch": 4,
+    "data": null
+   }
+  ],
+  "ramp": {
+   "start": 4,
+   "steps": 20,
+   "multiple": null
+  },
+  "data": [
+   {
+    "name": "synthetic()",
+    "weight": 1.0,
+    "text": "synthetic()"
+   }
+  ],
+  "evals": [],
+  "checkpoint": null,
+  "settings": [
+   {
+    "name": "seq_len",
+    "text": "64",
+    "written": true,
+    "group": "budget"
+   },
+   {
+    "name": "batch",
+    "text": "16",
+    "written": true,
+    "group": "budget"
+   },
+   {
+    "name": "batch_ramp",
+    "text": "ramp(start=4, steps=20)",
+    "written": true,
+    "group": "budget"
+   },
+   {
+    "name": "steps",
+    "text": "80",
+    "written": true,
+    "group": "budget"
+   },
+   {
+    "name": "curriculum",
+    "text": "[phase(at=0.5, seq_len=128, batch=8), phase(at=0.75, seq_len=256, batch=4)]",
+    "written": true,
+    "group": "budget"
+   },
+   {
+    "name": "seed",
+    "text": "0",
+    "written": false,
+    "group": "budget"
+   },
+   {
+    "name": "optimizer",
+    "text": "adamw(lr=0.003)",
+    "written": true,
+    "group": "optimizer"
+   },
+   {
+    "name": "schedule",
+    "text": "wsd(warmup=10)",
+    "written": true,
+    "group": "optimizer"
+   },
+   {
+    "name": "clip",
+    "text": "1.0",
+    "written": false,
+    "group": "optimizer"
+   },
+   {
+    "name": "data",
+    "text": "synthetic()",
+    "written": true,
+    "group": "data"
+   },
+   {
+    "name": "tokenizer",
+    "text": "none",
+    "written": false,
+    "group": "data"
+   },
+   {
+    "name": "packing",
+    "text": "best_fit()",
+    "written": false,
+    "group": "data"
+   },
+   {
+    "name": "loss",
+    "text": "loss()",
+    "written": false,
+    "group": "loss"
+   },
+   {
+    "name": "eval",
+    "text": "none",
+    "written": false,
+    "group": "eval"
+   },
+   {
+    "name": "checkpoint",
+    "text": "none",
+    "written": false,
+    "group": "eval"
+   },
+   {
+    "name": "objective",
+    "text": "none",
+    "written": false,
+    "group": "eval"
+   },
+   {
+    "name": "log",
+    "text": "log()",
+    "written": false,
+    "group": "logging"
+   },
+   {
+    "name": "observe",
+    "text": "none",
+    "written": false,
+    "group": "logging"
+   },
+   {
+    "name": "profile",
+    "text": "none",
+    "written": false,
+    "group": "logging"
+   },
+   {
+    "name": "precision",
+    "text": "precision()",
+    "written": false,
+    "group": "precision"
+   },
+   {
+    "name": "mesh",
+    "text": "mesh()",
+    "written": false,
+    "group": "parallelism"
+   },
+   {
+    "name": "layout",
+    "text": "layout()",
+    "written": false,
+    "group": "parallelism"
+   },
+   {
+    "name": "methods",
+    "text": "methods()",
+    "written": false,
+    "group": "parallelism"
+   },
+   {
+    "name": "compiler",
+    "text": "compiler()",
+    "written": false,
+    "group": "parallelism"
+   },
+   {
+    "name": "search",
+    "text": "search()",
+    "written": false,
+    "group": "search"
+   }
+  ]
+ },
+ "schedule": {
+  "points": [
+   [
+    0,
+    0.0003
+   ],
+   [
+    1,
+    0.0006
+   ],
+   [
+    2,
+    0.0009
+   ],
+   [
+    3,
+    0.0012
+   ],
+   [
+    4,
+    0.0015
+   ],
+   [
+    5,
+    0.0018
+   ],
+   [
+    6,
+    0.0021
+   ],
+   [
+    7,
+    0.0024
+   ],
+   [
+    8,
+    0.0027
+   ],
+   [
+    9,
+    0.003
+   ],
+   [
+    10,
+    0.003
+   ],
+   [
+    11,
+    0.003
+   ],
+   [
+    12,
+    0.003
+   ],
+   [
+    13,
+    0.003
+   ],
+   [
+    14,
+    0.003
+   ],
+   [
+    15,
+    0.003
+   ],
+   [
+    16,
+    0.003
+   ],
+   [
+    17,
+    0.003
+   ],
+   [
+    18,
+    0.003
+   ],
+   [
+    19,
+    0.003
+   ],
+   [
+    20,
+    0.003
+   ],
+   [
+    21,
+    0.003
+   ],
+   [
+    22,
+    0.003
+   ],
+   [
+    23,
+    0.003
+   ],
+   [
+    24,
+    0.003
+   ],
+   [
+    25,
+    0.003
+   ],
+   [
+    26,
+    0.003
+   ],
+   [
+    27,
+    0.003
+   ],
+   [
+    28,
+    0.003
+   ],
+   [
+    29,
+    0.003
+   ],
+   [
+    30,
+    0.003
+   ],
+   [
+    31,
+    0.003
+   ],
+   [
+    32,
+    0.003
+   ],
+   [
+    33,
+    0.003
+   ],
+   [
+    34,
+    0.003
+   ],
+   [
+    35,
+    0.003
+   ],
+   [
+    36,
+    0.003
+   ],
+   [
+    37,
+    0.003
+   ],
+   [
+    38,
+    0.003
+   ],
+   [
+    39,
+    0.003
+   ],
+   [
+    40,
+    0.003
+   ],
+   [
+    41,
+    0.003
+   ],
+   [
+    42,
+    0.003
+   ],
+   [
+    43,
+    0.003
+   ],
+   [
+    44,
+    0.003
+   ],
+   [
+    45,
+    0.003
+   ],
+   [
+    46,
+    0.003
+   ],
+   [
+    47,
+    0.003
+   ],
+   [
+    48,
+    0.003
+   ],
+   [
+    49,
+    0.003
+   ],
+   [
+    50,
+    0.003
+   ],
+   [
+    51,
+    0.003
+   ],
+   [
+    52,
+    0.003
+   ],
+   [
+    53,
+    0.003
+   ],
+   [
+    54,
+    0.003
+   ],
+   [
+    55,
+    0.003
+   ],
+   [
+    56,
+    0.003
+   ],
+   [
+    57,
+    0.003
+   ],
+   [
+    58,
+    0.003
+   ],
+   [
+    59,
+    0.003
+   ],
+   [
+    60,
+    0.003
+   ],
+   [
+    61,
+    0.003
+   ],
+   [
+    62,
+    0.003
+   ],
+   [
+    63,
+    0.003
+   ],
+   [
+    64,
+    0.002812
+   ],
+   [
+    65,
+    0.002625
+   ],
+   [
+    66,
+    0.002437
+   ],
+   [
+    67,
+    0.00225
+   ],
+   [
+    68,
+    0.002063
+   ],
+   [
+    69,
+    0.001875
+   ],
+   [
+    70,
+    0.001687
+   ],
+   [
+    71,
+    0.0015
+   ],
+   [
+    72,
+    0.001313
+   ],
+   [
+    73,
+    0.001125
+   ],
+   [
+    74,
+    0.0009375
+   ],
+   [
+    75,
+    0.00075
+   ],
+   [
+    76,
+    0.0005625
+   ],
+   [
+    77,
+    0.000375
+   ],
+   [
+    78,
+    0.0001875
+   ],
+   [
+    79,
+    0.0
+   ]
+  ],
+  "peak": 0.003,
+  "steps": 80
+ }
+}
