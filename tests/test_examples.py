@@ -233,6 +233,11 @@ SHRUNK = {
         "ssm = mamba(state_size=4)",
         "experts = moe(num_experts=4, top_k=2, expert=dense)",
     ],
+    "gated_deltanet_2.bux": [
+        "gdn2 = gdn2(num_heads=2, head_dim=8)",
+        "swa = gqa(num_heads=4, num_kv_heads=4, sliding_window_size=4, rope=rope())",
+        "ffn = dense",
+    ],
     "nemotron/nemotron_3_nano_30b_a3b.bux": [
         "ssm = mamba2(state_size=8, head_dim=8, num_heads=6, num_groups=2)",
         "attn = gqa(num_heads=4, num_kv_heads=2, head_dim=8)",

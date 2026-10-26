@@ -57,6 +57,7 @@ The speedups are against XLA's own program for the same computation, on a B300.
 | KDA with a `gate_lower_bound` of -5 or more | cuDNN's fused KDA kernel (`fused_delta`) | 10x `chunkwise` |
 | KDA otherwise | bux's Pallas kernels (`pallas_delta`): any gate, each pair's decay through a position between them | 2.6x `chunkwise` |
 | GLA, Lightning | cuDNN's fused GDN-2 kernel (`fused_delta`), by cuDNN's graph from a `buffer_callback`: its delta rule at a step of 0 is decayed linear attention | 4.7x `chunkwise` (GLA), 1.6x (Lightning) |
+| Gated DeltaNet-2 with a `gate_lower_bound` of -5 or more | cuDNN's fused GDN-2 kernel (`fused_delta`), its erase gate over the key channels and its write gate over the value channels | 8.4x `chunkwise` |
 | MoE experts | `grouped.ragged_dot`: tokamax's Mosaic and Triton kernels | 27x `jax.lax.ragged_dot` |
 | MoE experts in MXFP8 | `grouped_mxfp8`: Mosaic GPU kernels of tcgen05's block-scaled MMA, the scales by TMA into tensor memory ([Experts](../parallelism/experts.md)) | 1.5-2.4x tokamax's bfloat16 GEMMs |
 | MoE experts' activation in MXFP8 | `grouped_glu`: cuDNN's CuTe DSL grouped GEMMs, the activation (ReLU^2, SwiGLU, a clamped GeGLU, SiTU-GLU) and its backward with their quantizations in the epilogues, each GPU's shard of the kernels quantized before FSDP gathers it ([Experts](../parallelism/experts.md#activations-fused-by-cudnn)) | 1.15-1.31x `grouped_mxfp8`'s layer at Qwen3-30B-A3B's and Nemotron 3's experts, 1.04-1.15x at gpt-oss's and DeepSeek-V4-Flash's |
@@ -100,6 +101,7 @@ by XLA instead, with the same values up to rounding. Outside a GPU, and inside
 | `pallas_delta` | KDA (a decay per key channel); heads of 64 or 128 dims; bfloat16 or float16; `methods.recurrence = scan` | `chunkwise` |
 | `pallas_conv` | q, k and v side by side (`CausalConv.side_by_side`); each device's positions, and the channels, in blocks of a power of two, 16 or more; a mesh that splits nothing but the rows | XLA's form of the backward; off a GPU, autodiff's |
 | `fused_delta`'s GDN-2 (GLA, Lightning) | cudnn-frontend's develop build, which the lock pins on Linux; a B200 or B300; heads of 64 or 128 dims; bfloat16; `methods.recurrence = scan` | `chunkwise` |
+| `fused_delta`'s GDN-2 for Gated DeltaNet-2 | as for GLA and Lightning, and a `gate_lower_bound` of -5 or more | `chunkwise` |
 | `indexer_cudnn`'s top-k | a B200 or B300 with cudnn-frontend; up to 2048 picks a query | XLA counts the k-th highest score's bits |
 | `indexer_cudnn`'s loss | a B200 or B300 with cudnn-frontend; an indexer of 32 or 64 heads of 128 dims in bfloat16 (DSA's 64), its picks in multiples of 128 up to 2048 | `scoring`'s Pallas kernels, for heads and dims of powers of two; else XLA |
 | `affine_scan` | a state of k × v with k a power of two of 16 or more, and v a multiple of 32 | a scan over the chunks by XLA |
@@ -159,6 +161,8 @@ the log's `mfu` (of the attention a causal mask keeps):
 | Mamba-2 hybrid, `"MMMA"`, 1.5B (Nemotron-H's `mamba2`) | 97k | 741k |
 | KDA hybrid, `"KKKA"`        | 96k, 30% |                |
 | KDA with `gate_lower_bound=-5` | 127k, 40% | 926k     |
+| Gated DeltaNet-2 hybrid, `"GGGA"` | 58.5k, 19% |        |
+| Gated DeltaNet-2 with `gate_lower_bound=-5` | 125k, 41% | |
 | MoE, 64 experts, top 8      | 102k, 31% | 834k          |
 
 ### The delta rule's kernels
@@ -241,6 +245,61 @@ its parts in bfloat16, as cuDNN's GDN kernel does.
 RWKV-7 has no kernel yet, but its chunks take a pair's decay by one matmul now, its
 decay being bounded: its hybrid (`"RRRA"^4`) trains at 87.4k tokens a second where it
 trained at 45.0k ([RWKV-7's chunks](../parallelism/recurrence.md#rwkv-7s-chunks)).
+
+### Gated DeltaNet-2's kernel
+
+The baseline's hybrids of Gated DeltaNet-2 (`"GGGA"^4`, 16 heads of 128) and of KDA,
+8 rows of 4096 random tokens on one B300 each, 100 steps, by the chunks
+(`methods.recurrence = pass_state`) and as bux runs them, on the same node:
+
+| hybrid | by chunks | by its kernel | the recurrence's forward and backward |
+|--------|-----------|---------------|---------------------------------------|
+| GDN-2, `gate_lower_bound=-5` | 59.6k, 125.3 GiB | 125.3k, 95.0 GiB, cuDNN's GDN-2 | 29.8 → 3.6 ms |
+| GDN-2, unbounded (the paper's) | 58.5k, 125.3 GiB | by the chunks | 29.8 ms |
+| KDA, `gate_lower_bound=-5` | 61.5k, 122.0 GiB | 131.8k, 91.4 GiB, cuDNN's KDA | 28.6 → 3.2 ms |
+| KDA, unbounded | 61.0k, 122.0 GiB | 99.0k, 88.0 GiB, bux's Pallas kernels | 28.6 → 11.2 ms |
+
+A GDN-2 layer has two projections of 2048 × 2048 more than a KDA layer, for its gates:
+its hybrid trains 5% slower than KDA's by their kernels, and 3-4% by the chunks.
+
+The paper's unbounded gate runs by the chunks. By the kernel, as an experiment, its
+hybrid trained at 121.3k tokens a second on random tokens, whose gates stay mild. On
+FineWeb-Edu its gates soon decayed some tile of 16 positions past $e^{-83}$, where the
+kernel runs the whole call again by its exact path, and from step 500 it trained slower
+than the chunks (tokens a second, the median of each span of steps, seed 0; seed 1's
+within 4%):
+
+| unbounded GDN-2 hybrid | steps 20-200 | 200-500 | 500-1000 | 1000-2000 |
+|------------------------|--------------|---------|----------|-----------|
+| by the chunks | 57.3k | 57.3k | 57.2k | 57.0k |
+| by the kernel | 121.4k | 62.8k | 50.9k | 48.0k |
+
+The recurrence by the kernel takes 3.6 ms at mild gates, and by its exact path 7.0 at
+KDA's gate as it starts and 44.9 at gates of -20 a position.
+
+The paper's hybrid itself (`gated_deltanet_2.bux`: 9 GDN-2 and 9 sliding-window
+layers, 1.45B parameters with the embedding and the head), 8 rows of 4096 random tokens
+on one B300, trains at 66.0k tokens a second by the chunks, in 118.5 GiB. Bounded at -5,
+it trains at 111.8k by the kernel, in 98.7 GiB, and at 64.9k by the chunks.
+
+On a B300, at 2 × 4096 tokens in packed documents, the kernel's outputs and gradients
+are within 7.2·10⁻³ of the chunks' in float32 (as a share of each one's norm), at
+gates to -5, the layer's own, heads of 64, more documents than its room, erase gates to
+2, and at unbounded and steep gates and spikes of -10⁴, by its exact path.
+
+On FineWeb-Edu (2000 steps of 8 × 4096 tokens), the held-out losses:
+
+| hybrid | seed 0 | seed 1 |
+|--------|--------|--------|
+| GDN-2, unbounded, by the chunks | 4.0781 | 4.0223 |
+| GDN-2, unbounded, by the kernel's exact path | 4.0766 | 4.0216 |
+| GDN-2, `gate_lower_bound=-5`, by the kernel | 4.0889 | |
+| KDA, unbounded | 4.1032 | 4.0388 |
+| KDA, `gate_lower_bound=-5` | 4.1023 | |
+
+The kernel's are the chunks' to 0.0015, where the seeds spread over 0.056. GDN-2's are
+0.017 and 0.025 below KDA's, with its 100M parameters more: the paper matches the two
+in parameters, this does not.
 
 ### QK-norm and RoPE
 
