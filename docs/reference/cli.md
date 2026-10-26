@@ -10,8 +10,9 @@ file's as one more layer over it would: `optimizer.lr=1e-3`, `'use fineweb_wsd'`
 | `check` | Compile the file; print its layers by type, its training budget and its sweep. |
 | `plan` | Print every run of a sweep: its id, parameters, tokens, FLOPs a token, GPUs, and bytes a GPU. |
 | `prepare` | Tokenize and pack the documents the runs read, once ([Data](../data/index.md)). |
-| `train` | Train every run, one after another, in this process. |
+| `train` | Train every run, one after another, in this process; a search's trials too. |
 | `launch` | Train what is left of every run, each on its own GPUs, and resume after a stop ([Launching](../training/launching.md)). |
+| `results` | Print every run's state and objective, or a search's trials, the best first ([Searching](../training/searching.md)). |
 | `render` | Draw the model as a circuit diagram. |
 | `fmt` | Print the file in canonical form: every run as a file of its own. |
 | `json` | Print the IR of the model, or of every run. |

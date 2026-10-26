@@ -101,6 +101,9 @@ a7466cc107  183M    3B      16.4       1.61B      1     700MiB      1.37GiB    0
 ```
 
 `bux launch` trains them side by side, a GPU each ([Launching](launching.md)).
+With the learning rate written as `log_uniform(1e-3, 1e-2)` instead, each attention is
+a search of its own, and its best learning rate is found, not picked from two
+([Searching hyperparameters](searching.md)).
 
 ## The life of a run
 
@@ -175,6 +178,13 @@ The console and `kubectl logs`, timers, the model by layer, W&B and TensorBoard.
 `bux launch`, sweeps over GPUs, array jobs, many hosts, and resuming.
 :::
 
+:::{grid-item-card} Searching hyperparameters
+:link: searching
+:link-type: doc
+
+Dimensions, objectives, GP, TPE and quasi-random search, ASHA and Hyperband.
+:::
+
 :::{grid-item-card} Extending the trainer
 :link: extending
 :link-type: doc
@@ -199,6 +209,7 @@ precision
 running
 observing
 launching
+searching
 extending
 design
 ```

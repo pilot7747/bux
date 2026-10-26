@@ -208,13 +208,13 @@ class Search:
         )
 
     def _modeled(self) -> int:
-        """Return the highest rung with a number for more trials than dimensions,
-        plus one; else the rung with the most."""
+        """Return the highest rung with a number for at least one trial more than it
+        has dimensions; else the rung with the most."""
         counts = [
             sum(not math.isnan(t.results.get(rung, math.nan)) for t in self.trials)
             for rung in range(self.top + 1)
         ]
-        enough = [r for r, n in enumerate(counts) if n > len(self.dims.names) + 1]
+        enough = [r for r, n in enumerate(counts) if n > len(self.dims.names)]
         return enough[-1] if enough else int(np.argmax(counts))
 
     def _points(self, trials: list[Trial]) -> Float[np.ndarray, "n d"]:
