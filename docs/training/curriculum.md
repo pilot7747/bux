@@ -120,17 +120,17 @@ says how long each took, in the log after it:
 
 ```console
 $ bux train examples/experiments/curriculum.bux
-curriculum: runs/curriculum-93f3c44909, on 1 × cpu
+curriculum: runs/curriculum-ad5785cd6b, on 1 × cpu
 curriculum: 156k parameters, 80 steps = 71.4k tokens, adamw(lr=0.003), wsd(warmup=10)
 curriculum: from step 0: 16 × 64 tokens, ramped from 4 rows over the first 20 steps in 3 sizes
 curriculum: phase 1, from step 40: 8 × 128 tokens
 curriculum: phase 2, from step 60: 4 × 256 tokens
 curriculum: log every 10
 remat=auto: none in 1s (none 0.0 GiB in 0s)
-remat=auto: none in 1s (none 0.0 GiB in 1s)
-curriculum step 10/80  loss 6.7479  lr 3.00e-03  grad 1.687  2,199 tok/s  151 ms/step  data 0.1 ms  compiled in 1.4s  0:00:02 < 0:00:11
+remat=auto: none in 0s (none 0.0 GiB in 0s)
+curriculum step 10/80  loss 6.2552  lr 3.00e-03  grad 0.621  2,853 tok/s  117 ms/step  data 0.1 ms  compiled in 1.1s  0:00:01 < 0:00:08
 ...
-curriculum step 80/80  loss 6.2516  lr 0.00e+00  grad 0.238  56,112 tok/s  18 ms/step  data 0.1 ms  0:00:04 < 0:00:00
+curriculum step 80/80  loss 6.2519  lr 0.00e+00  grad 0.221  41,252 tok/s  25 ms/step  data 0.5 ms  0:00:05 < 0:00:00
 ```
 
 The log's `tokens` counts each step's own batch, so it is the tokens trained on

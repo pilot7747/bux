@@ -108,15 +108,15 @@ needs neither the devices nor the flag:
 $ bux plan examples/experiments/parallel/laptop.bux
 6 runs
 id          params  tokens  tok/param  flops/tok  gpus  params/gpu  optim/gpu  bubble  run
-90b55fa67f  497k    10.2k   0.0        1.74M      8     1.89MiB     3.79MiB    0%      laptop[dp]
-90b55fa67f  497k    10.2k   0.0        1.74M      8     243KiB      485KiB     0%      laptop[fsdp]
-90b55fa67f  497k    10.2k   0.0        1.74M      8     261KiB      521KiB     0%      laptop[tp]
-90b55fa67f  497k    10.2k   0.0        1.74M      8     243KiB      485KiB     0%      laptop[ep]
-90b55fa67f  497k    10.2k   0.0        1.74M      8     485KiB      970KiB     0%      laptop[cp]
-90b55fa67f  497k    10.2k   0.0        1.74M      8     259KiB      517KiB     20%     laptop[pp]
+8944944995  497k    10.2k   0.0        1.74M      8     1.89MiB     3.79MiB    0%      laptop[dp]
+8944944995  497k    10.2k   0.0        1.74M      8     243KiB      485KiB     0%      laptop[fsdp]
+8944944995  497k    10.2k   0.0        1.74M      8     261KiB      521KiB     0%      laptop[tp]
+8944944995  497k    10.2k   0.0        1.74M      8     243KiB      485KiB     0%      laptop[ep]
+8944944995  497k    10.2k   0.0        1.74M      8     485KiB      970KiB     0%      laptop[cp]
+8944944995  497k    10.2k   0.0        1.74M      8     259KiB      517KiB     20%     laptop[pp]
 ```
 
-- Every run has the same id, `90b55fa67f`: they compute the same thing.
+- Every run has the same id, `8944944995`: they compute the same thing.
 - `params/gpu` is what a device holds. DDP copies everything (1.89 MiB); FSDP splits
   it 8 ways (243 KiB). Under `cp`, FSDP's axes take `context` too, so the 4 context
   devices split the parameters and the 2 data copies keep them whole (485 KiB).
@@ -128,18 +128,18 @@ id          params  tokens  tok/param  flops/tok  gpus  params/gpu  optim/gpu  b
 ```console
 $ bux train examples/experiments/parallel/laptop.bux
 remat=auto: none in 1s (none 0.0 GiB in 0s)
-laptop[dp] step 10/10  loss 6.7943  lr 1.00e-03  grad 2.169  5,875 tok/s  ...
+laptop[dp] step 10/10  loss 6.2562  lr 1.00e-03  grad 0.800  5,446 tok/s  ...
 remat=auto: none in 1s (none 0.0 GiB in 0s)
-laptop[fsdp] step 10/10  loss 6.7943  lr 1.00e-03  grad 2.169  5,342 tok/s  ...
+laptop[fsdp] step 10/10  loss 6.2562  lr 1.00e-03  grad 0.800  5,143 tok/s  ...
 remat=auto: none in 1s (none 0.0 GiB in 0s)
-laptop[tp] step 10/10  loss 6.7943  lr 1.00e-03  grad 2.169  5,947 tok/s  ...
+laptop[tp] step 10/10  loss 6.2562  lr 1.00e-03  grad 0.800  5,736 tok/s  ...
 remat=auto: none in 1s (none 0.0 GiB in 0s)
-laptop[ep] step 10/10  loss 6.7943  lr 1.00e-03  grad 2.169  5,260 tok/s  ...
+laptop[ep] step 10/10  loss 6.2562  lr 1.00e-03  grad 0.800  4,872 tok/s  ...
 remat=auto: none in 1s (none 0.0 GiB in 0s)
-laptop[cp] step 10/10  loss 6.7943  lr 1.00e-03  grad 2.169  4,653 tok/s  ...
+laptop[cp] step 10/10  loss 6.2562  lr 1.00e-03  grad 0.800  4,467 tok/s  ...
 laptop[pp]: methods.stages = [1, 1]
 remat=auto: none in 1s (none 0.0 GiB in 0s)
-laptop[pp] step 10/10  loss 6.7943  lr 1.00e-03  grad 2.169  5,846 tok/s  ...
+laptop[pp] step 10/10  loss 6.2562  lr 1.00e-03  grad 0.800  5,679 tok/s  ...
 ```
 
 All six end on the same loss and gradient norm, to the digits printed. Rounding
@@ -150,12 +150,12 @@ trains into a directory of its own, as their names differ:
 
 ```console
 $ ls -1d runs/laptop*
-runs/laptop_cp-90b55fa67f
-runs/laptop_dp-90b55fa67f
-runs/laptop_ep-90b55fa67f
-runs/laptop_fsdp-90b55fa67f
-runs/laptop_pp-90b55fa67f
-runs/laptop_tp-90b55fa67f
+runs/laptop_cp-8944944995
+runs/laptop_dp-8944944995
+runs/laptop_ep-8944944995
+runs/laptop_fsdp-8944944995
+runs/laptop_pp-8944944995
+runs/laptop_tp-8944944995
 ```
 
 :::{note}
@@ -189,7 +189,7 @@ methods   = methods(repeat=scan, remat=dots, microbatches=4)
 $ bux plan examples/experiments/parallel/fsdp_8b.bux
 1 run
 id          params  tokens  tok/param  flops/tok  gpus  params/gpu  optim/gpu  bubble  run
-f0e7783cf3  8.03B   10B     1.2        48.7B      8     3.74GiB     7.48GiB    0%      fsdp_8b
+c548b8d54b  8.03B   10B     1.2        48.7B      8     3.74GiB     7.48GiB    0%      fsdp_8b
 ```
 
 **Which split is fastest?** `mesh_sweep.bux` trains a 1B Llama five ways over 8 GPUs
@@ -199,11 +199,11 @@ with one id, so you compare their `tokens_per_s` in each run's `metrics.jsonl`:
 $ bux plan examples/experiments/parallel/mesh_sweep.bux
 5 runs
 id          params  tokens  tok/param  flops/tok  gpus  params/gpu  optim/gpu  bubble  run
-1515c7682c  1.27B   13.1M   0.0        8.02B      8     4.73GiB     9.46GiB    0%      mesh_sweep[ddp]
-1515c7682c  1.27B   13.1M   0.0        8.02B      8     605MiB      1.18GiB    0%      mesh_sweep[fsdp]
-1515c7682c  1.27B   13.1M   0.0        8.02B      8     4.73GiB     1.18GiB    0%      mesh_sweep[zero1]
-1515c7682c  1.27B   13.1M   0.0        8.02B      8     1.18GiB     2.36GiB    0%      mesh_sweep[hsdp]
-1515c7682c  1.27B   13.1M   0.0        8.02B      8     605MiB      1.18GiB    0%      mesh_sweep[tp]
+03359bea6e  1.27B   13.1M   0.0        8.02B      8     4.73GiB     9.46GiB    0%      mesh_sweep[ddp]
+03359bea6e  1.27B   13.1M   0.0        8.02B      8     605MiB      1.18GiB    0%      mesh_sweep[fsdp]
+03359bea6e  1.27B   13.1M   0.0        8.02B      8     4.73GiB     1.18GiB    0%      mesh_sweep[zero1]
+03359bea6e  1.27B   13.1M   0.0        8.02B      8     1.18GiB     2.36GiB    0%      mesh_sweep[hsdp]
+03359bea6e  1.27B   13.1M   0.0        8.02B      8     605MiB      1.18GiB    0%      mesh_sweep[tp]
 ```
 
 ZeRO-1 (`layout(zero=1)`) splits only the optimizer's state, and HSDP
@@ -238,7 +238,7 @@ methods   = methods(repeat=scan, remat=full, pipeline=circular, rounds=2,
 $ bux plan examples/experiments/parallel/pp_70b.bux
 1 run
 id          params  tokens  tok/param  flops/tok  gpus  params/gpu  optim/gpu  bubble  run
-0d0f5cc6f4  70.6B   10B     0.1        429B       32    8.95GiB     17.9GiB    9%      pp_70b
+34e7f5a8ac  70.6B   10B     0.1        429B       32    8.95GiB     17.9GiB    9%      pp_70b
 ```
 
 A stage idles (S - 1) / (R·M + S - 1) = 3 / 35 of a step. `tp_70b.bux` trains the

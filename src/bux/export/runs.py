@@ -5,7 +5,7 @@ as a transformers model directory that loads as it is, its tokenizer with it.
 
     from bux.export.runs import export
 
-    export("runs/smoke-f114ac17ae", "exported/", check=True)
+    export("runs/smoke-5a4f0f7d85", "exported/", check=True)
 
 `restore` reads the run's ``run.json`` and one of its checkpoints onto this
 process's CPU, whatever mesh, layout and methods trained it: FSDP's and tensor

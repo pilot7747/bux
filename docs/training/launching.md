@@ -71,16 +71,22 @@ metrics:
   "host": "laptop",
   "pid": 6963,
   "gpus": null,
-  "started": "2026-10-25T21:22:26+00:00",
-  "ended": "2026-10-25T21:22:37+00:00",
+  "started": "2026-10-26T22:05:19+00:00",
+  "ended": "2026-10-26T22:05:30+00:00",
   "error": null,
   "step": 3000,
   "metrics": {
-    "grad_norm": 0.01157570444047451,
-    "loss": 6.238269805908203,
+    "grad_norm": 0.03431686386466026,
+    "loss": 6.238302230834961,
     "lr": 0.0,
     "tokens": 1536000,
-    "tokens_per_s": 74433.87727551661
+    "tokens_per_s": 78700.21272668002,
+    "time/step_ms": 6.505700331181288,
+    "time/data_ms": 0.009188344702124596,
+    "time/wait_ms": 0.4499139990657568,
+    "time/hooks_ms": 0.35634555481374264,
+    "time/launch_ms": 5.287754703313112,
+    "time/compile_s": 0.5438455422408879
   }
 }
 ```
@@ -94,14 +100,16 @@ smoke run on a laptop:
 $ bux launch examples/experiments/smoke.bux 'optimizer.lr = 1e-3 | 3e-3'
 training 2 runs, one at a time
 smoke[optimizer.lr=1e-3]: training on cpu of laptop with jax 0.12.0
-smoke[optimizer.lr=1e-3] step 10/50  loss 6.6755  lr 1.00e-03  grad 1.731  8,297 tok/s  ...
+smoke[optimizer.lr=1e-3]: runs/smoke_optimizer.lr=1e-3-bcdf2abce8, on 1 × cpu
 ...
-smoke[optimizer.lr=3e-3] step 50/50  loss 6.2854  lr 0.00e+00  grad 0.395  65,293 tok/s  ...
+smoke[optimizer.lr=1e-3] step 10/50  loss 6.2462  lr 1.00e-03  grad 0.623  8,526 tok/s  ...
+...
+smoke[optimizer.lr=3e-3] step 50/50  loss 6.2633  lr 0.00e+00  grad 0.418  76,501 tok/s  ...
 smoke[optimizer.lr=3e-3]: done
 2 runs: 2 done
 state  step   loss    eval loss  run
-done   50/50  6.5529  -          smoke[optimizer.lr=1e-3]
-done   50/50  6.2854  -          smoke[optimizer.lr=3e-3]
+done   50/50  6.2594  -          smoke[optimizer.lr=1e-3]
+done   50/50  6.2633  -          smoke[optimizer.lr=3e-3]
 $ bux launch examples/experiments/smoke.bux 'optimizer.lr = 1e-3 | 3e-3'
 2 of 2 runs done already
 ```
@@ -257,21 +265,24 @@ with a folder of its own, twenty minutes before it timed out.
 
 A run launched again loads its latest checkpoint and trains on as if it had not
 stopped. Here the smoke run, stretched to 3000 steps with a checkpoint every 500, is
-stopped by SIGTERM and launched again:
+stopped by SIGTERM just after step 1500 and launched again; it saves the step it
+stops at:
 
 ```console
 $ bux launch examples/experiments/smoke.bux steps=3000 'log = log(every=250)' 'checkpoint = checkpoint(every=500)'
 smoke: training on cpu of laptop with jax 0.12.0
-smoke step  250/3000  loss 6.2680  lr 3.00e-03  grad 0.277  57,335 tok/s  ...
 ...
-smoke step 1500/3000  loss 6.2421  lr 3.00e-03  grad 0.061  73,818 tok/s  ...
-smoke: stopped at step 1500 by SIGTERM; launching it again resumes it from its latest checkpoint
+smoke step  250/3000  loss 6.2383  lr 3.00e-03  grad 0.154  57,512 tok/s  ...
+...
+smoke step 1500/3000  loss 6.2417  lr 3.00e-03  grad 0.053  76,424 tok/s  ...
+smoke: stopped at step 1528 by SIGTERM; launching it again resumes it from its latest checkpoint
 $ bux launch examples/experiments/smoke.bux steps=3000 'log = log(every=250)' 'checkpoint = checkpoint(every=500)'
 smoke: training on cpu of laptop with jax 0.12.0
-smoke: restored in 0.1s, resuming at step 1500
-smoke step 1750/3000  loss 6.2392  lr 3.00e-03  grad 0.021  56,960 tok/s  ...
+smoke: restored in 0.1s, resuming at step 1528
 ...
-smoke step 3000/3000  loss 6.2383  lr 0.00e+00  grad 0.012  74,434 tok/s  ...
+smoke step 1750/3000  loss 6.2386  lr 3.00e-03  grad 0.020  56,132 tok/s  ...
+...
+smoke step 3000/3000  loss 6.2383  lr 0.00e+00  grad 0.034  78,700 tok/s  ...
 smoke: done
 ```
 

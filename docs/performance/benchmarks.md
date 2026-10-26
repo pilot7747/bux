@@ -35,17 +35,17 @@ logged every 5.
 $ bux plan examples/benchmarks/one_node.bux
 6 runs
 id          params  tokens  tok/param  flops/tok  gpus  params/gpu  optim/gpu  bubble  run
-bec9fee8c8  1.28B   7.86M   0.0        6.91B      8     611MiB      1.19GiB    0%      one_node[fsdp]
-bec9fee8c8  1.28B   7.86M   0.0        6.91B      8     611MiB      1.19GiB    0%      one_node[fsdp_m8]
-47227be352  5.16B   7.86M   0.0        6.92B      8     2.4GiB      4.8GiB     0%      one_node[moe]
-47227be352  5.16B   7.86M   0.0        6.92B      8     2.4GiB      4.8GiB     0%      one_node[moe_ep]
-4788ab297e  5.52B   983k    0.0        27.6B      8     2.57GiB     5.15GiB    0%      one_node[tp]
-bec9fee8c8  1.47B   7.86M   0.0        6.91B      8     951MiB      1.86GiB    11%     one_node[pp]
+2b8064152c  1.28B   7.86M   0.0        6.91B      8     611MiB      1.19GiB    0%      one_node[fsdp]
+2b8064152c  1.28B   7.86M   0.0        6.91B      8     611MiB      1.19GiB    0%      one_node[fsdp_m8]
+fdebd6e1ac  5.16B   7.86M   0.0        6.92B      8     2.4GiB      4.8GiB     0%      one_node[moe]
+fdebd6e1ac  5.16B   7.86M   0.0        6.92B      8     2.4GiB      4.8GiB     0%      one_node[moe_ep]
+0e1a7bf3da  5.52B   983k    0.0        27.6B      8     2.57GiB     5.15GiB    0%      one_node[tp]
+2b8064152c  1.47B   7.86M   0.0        6.91B      8     951MiB      1.86GiB    11%     one_node[pp]
 $ bux plan examples/benchmarks/megatron.bux
 2 runs
 id          params  tokens  tok/param  flops/tok  gpus  params/gpu  optim/gpu  bubble  run
-d8e4bfa9e3  30.5B   25.2M   0.0        23.1B      8     14.2GiB     28.4GiB    0%      megatron[sorted]
-d8e4bfa9e3  30.5B   25.2M   0.0        23.1B      8     14.2GiB     28.4GiB    0%      megatron[nccl_ep]
+e10546bbb2  30.5B   25.2M   0.0        23.1B      8     14.2GiB     28.4GiB    0%      megatron[sorted]
+e10546bbb2  30.5B   25.2M   0.0        23.1B      8     14.2GiB     28.4GiB    0%      megatron[nccl_ep]
 ```
 
 Runs that split the same model another way share an id, as `mesh`, `layout` and

@@ -87,18 +87,23 @@ model
 
 ```console
 $ bux train examples/experiments/smoke.bux
-remat=auto: none in 0s (none 0.0 GiB in 0s)
-smoke step 10/50  loss 6.6252  lr 3.00e-03  grad 1.614  9,176 tok/s  ...
-smoke step 20/50  loss 6.5475  lr 3.00e-03  grad 1.038  75,865 tok/s  ...
-smoke step 30/50  loss 6.3513  lr 3.00e-03  grad 0.554  73,936 tok/s  ...
-smoke step 40/50  loss 6.2974  lr 3.00e-03  grad 0.458  75,005 tok/s  ...
-smoke step 50/50  loss 6.2854  lr 0.00e+00  grad 0.395  76,099 tok/s  ...
+smoke: runs/smoke-5a4f0f7d85, on 1 × cpu
+smoke: 156k parameters, 50 steps × 8 × 64 tokens = 25.6k tokens, adamw(lr=0.003), wsd(warmup=10)
+smoke: log every 10
+remat=auto: none in 1s (none 0.0 GiB in 0s)
+smoke step 10/50  loss 6.2429  lr 3.00e-03  grad 0.607  8,097 tok/s  ...
+smoke step 20/50  loss 6.2618  lr 3.00e-03  grad 0.642  77,084 tok/s  ...
+smoke step 30/50  loss 6.2731  lr 3.00e-03  grad 0.516  75,977 tok/s  ...
+smoke step 40/50  loss 6.2478  lr 3.00e-03  grad 0.440  76,711 tok/s  ...
+smoke step 50/50  loss 6.2633  lr 0.00e+00  grad 0.418  75,557 tok/s  ...
 ```
 
-A line every 10 steps has the loss, the learning rate (the schedule's warmup, its
-peak, then its cooldown to 0), the gradient's norm before clipping, and the tokens a
-second. The first line includes the time to compile the step. The tokens are random,
-so the loss falls to log 512 = 6.24 and no lower: there is nothing more to learn.
+The first lines say where the run goes, its size and how often it logs. Then a line
+every 10 steps has the loss, the learning rate (the schedule's warmup, its peak, then
+its cooldown to 0), the gradient's norm before clipping, and the tokens a second. The
+first of them includes the time to compile the step. The tokens are random, so there
+is nothing to learn: the loss stays near log 512 = 6.24, a uniform guess's, where the
+model starts, its weights small ([Initialization](../architectures/initialization.md)).
 
 :::{note}
 The first line, `remat=auto: none`, says which rematerialization policy the step
@@ -111,11 +116,11 @@ memory ([Remat](../parallelism/remat.md)).
 The run wrote a directory under `runs/`, named for the run and its id:
 
 ```console
-$ ls runs/smoke-f114ac17ae
+$ ls runs/smoke-5a4f0f7d85
 metrics.jsonl  run.bux  run.json
-$ head -2 runs/smoke-f114ac17ae/metrics.jsonl
-{"step": 10, "grad_norm": 1.6137837171554565, "loss": 6.625185489654541, "lr": 0.003000000026077032, "tokens": 5120, "tokens_per_s": 9175.617634801478}
-{"step": 20, "grad_norm": 1.0376627445220947, "loss": 6.547478199005127, "lr": 0.003000000026077032, "tokens": 10240, "tokens_per_s": 75865.15237532384}
+$ head -2 runs/smoke-5a4f0f7d85/metrics.jsonl
+{"step": 10, "grad_norm": 0.6074022650718689, "loss": 6.2429351806640625, "lr": 0.003000000026077032, "tokens": 5120, "tokens_per_s": 8096.7231682951115, "time/step_ms": 63.23545826599002, "time/data_ms": 0.08332501165568829, "time/wait_ms": 0.00046673230826854706, "time/hooks_ms": 0.0016250181943178177, "time/launch_ms": 0.4079831298440695, "time/compile_s": 0.5281932908110321}
+{"step": 20, "grad_norm": 0.6416390538215637, "loss": 6.261777877807617, "lr": 0.003000000026077032, "tokens": 10240, "tokens_per_s": 77083.76420570571, "time/step_ms": 6.642125034704804, "time/hooks_ms": 9.541625110432506, "time/data_ms": 0.0056749675422906876, "time/launch_ms": 0.25339601561427116, "time/wait_ms": 0.02698753960430622}
 ```
 
 | file            | what it is                                                     |
@@ -124,7 +129,7 @@ $ head -2 runs/smoke-f114ac17ae/metrics.jsonl
 | `run.json`      | the run's IR: the model's graph and every training setting, as JSON |
 | `metrics.jsonl` | a line of metrics at every log, and at every eval              |
 
-The id, `f114ac17ae`, is a hash of what the run computes. Train the same file again
+The id, `5a4f0f7d85`, is a hash of what the run computes. Train the same file again
 and it lands in the same directory; change what it computes and it gets a new one.
 With a `checkpoint` setting, a run started again resumes from its latest checkpoint
 ([Train on a laptop](../tutorials/train-on-a-laptop.md)).
@@ -136,12 +141,15 @@ Train with Muon for 100 steps:
 
 ```console
 $ bux train examples/experiments/smoke.bux 'optimizer = muon(lr=0.02)' steps=100
+smoke: runs/smoke-e432405460, on 1 × cpu
+smoke: 156k parameters, 100 steps × 8 × 64 tokens = 51.2k tokens, muon(lr=0.02), wsd(warmup=10)
+smoke: log every 10
 remat=auto: none in 1s (none 0.0 GiB in 0s)
-smoke step  10/100  loss 6.5168  lr 2.00e-02  grad 1.304  6,636 tok/s  ...
-smoke step  20/100  loss 6.3315  lr 2.00e-02  grad 0.491  58,525 tok/s  ...
+smoke step  10/100  loss 6.2745  lr 2.00e-02  grad 0.600  6,170 tok/s  ...
+smoke step  20/100  loss 6.3796  lr 2.00e-02  grad 0.668  56,772 tok/s  ...
 ...
-smoke step  90/100  loss 6.2401  lr 1.00e-02  grad 0.083  57,099 tok/s  ...
-smoke step 100/100  loss 6.2359  lr 0.00e+00  grad 0.070  58,095 tok/s  ...
+smoke step  90/100  loss 6.2389  lr 1.00e-02  grad 0.060  61,506 tok/s  ...
+smoke step 100/100  loss 6.2338  lr 0.00e+00  grad 0.058  57,780 tok/s  ...
 ```
 
 Quote a statement that has spaces or parentheses. `optimizer.lr=1e-2` changes one
@@ -158,14 +166,14 @@ GPU:
 $ bux plan examples/experiments/smoke.bux 'optimizer.lr = 1e-3 | 3e-3 | 1e-2'
 3 runs
 id          params  tokens  tok/param  flops/tok  gpus  params/gpu  optim/gpu  bubble  run
-e3a8d2164a  156k    25.6k   0.2        984k       1     609KiB      1.19MiB    0%      smoke[optimizer.lr=1e-3]
-f114ac17ae  156k    25.6k   0.2        984k       1     609KiB      1.19MiB    0%      smoke[optimizer.lr=3e-3]
-f5babdd0aa  156k    25.6k   0.2        984k       1     609KiB      1.19MiB    0%      smoke[optimizer.lr=1e-2]
+bcdf2abce8  156k    25.6k   0.2        984k       1     609KiB      1.19MiB    0%      smoke[optimizer.lr=1e-3]
+5a4f0f7d85  156k    25.6k   0.2        984k       1     609KiB      1.19MiB    0%      smoke[optimizer.lr=3e-3]
+54d678be8d  156k    25.6k   0.2        984k       1     609KiB      1.19MiB    0%      smoke[optimizer.lr=1e-2]
 ```
 
 Each run is named for what it took, and its directory is its name and its id.
 `smoke[optimizer.lr=3e-3]` computes what the file alone does, so it has the same id,
-`f114ac17ae`. The columns are each run's parameters, tokens, tokens a
+`5a4f0f7d85`. The columns are each run's parameters, tokens, tokens a
 parameter, model FLOPs a token, GPUs, the bytes of its parameters and of its
 optimizer's state on each GPU, and the share of a step a pipeline's stages idle
 (`bubble`).
