@@ -24,6 +24,12 @@ import torch
 import torch.nn.functional as F
 from torch import nn
 
+#: The state that is no parameter and that bux keeps in float32 whatever it computes
+#: in, by name: a bfloat16 export keeps it in float32, in its checkpoint and as it
+#: loads (``_keep_in_fp32_modules_strict``), where a rounded router bias would flip
+#: near-tied picks of experts.
+KEEP_FLOAT32 = ["router_bias"]
+
 #: bux's activations by name (`bux.config.Activation`).
 ACTIVATIONS: dict[str, Callable[[torch.Tensor], torch.Tensor]] = {
     "relu": F.relu,

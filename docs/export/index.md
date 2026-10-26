@@ -148,6 +148,70 @@ That is about 5e-6 a `gdn` layer, on both sides alike: a deep recurrent stack pa
 1e-4 by float32's rounding alone. The tests shorten such stacks (Qwen3-Next's to 12
 blocks) rather than loosen the check.
 
+## Exporting a run
+
+`bux export` writes a trained run's model, from its latest checkpoint, as a directory
+that transformers loads as it is:
+
+```console
+$ bux export runs/smoke-f114ac17ae exported/ --check
+smoke: step 50 exported to exported, its weights in float32
+eager: logits within 5.1e-07 of bux's largest (tolerance 1e-04); greedy decoding with cache as bux, no cache as bux; a left-padded batch as its prompts alone
+sdpa: logits within 5.0e-07 of bux's largest (tolerance 1e-04); greedy decoding with cache as bux, no cache as bux; a left-padded batch as its prompts alone
+```
+
+It reads the run's `run.json` and restores a checkpoint (`--step N`, or the latest)
+on the CPU of one process, whatever mesh, layout and methods trained it: FSDP's and
+tensor parallelism's shards restore as whole arrays, and a scanned repeat's passes,
+stacked along a leading dimension or spread over a pipeline's stages, come apart
+into a module each, as `methods.repeat = unroll` builds them. The rest of the
+model's state comes with them, an MoE's router bias too. Besides the model, the
+directory holds:
+
+| File | What it is |
+|------|------------|
+| `tokenizer.json`, `tokenizer_config.json` | the run's tokenizer, a Hub repo's or its `tokenizer.json`, with its `bos`, `eos` and `added` tokens, at the ids bux gave them: `AutoTokenizer.from_pretrained(OUT)` loads it |
+| `generation_config.json` | the tokenizer's bos, eos and pad tokens for `generate`; the pad is the eos where the tokenizer has none |
+| `README.md` | a model card: the run's name, id and step, how to load it, and its `run.bux` |
+
+Its `config.json` gives the run's `seq_len` as `max_position_embeddings`, the
+longest sequence the model is known to take, which vLLM serves up to unless
+`--max-model-len` says otherwise.
+
+A run that trains without a tokenizer (on `synthetic` data, or on ids it is given)
+exports without one. The weights are in the parameters' dtype, float32 as bux keeps
+them whatever a run computes in, or in `--dtype` (`bfloat16`, `float16`). In
+Python:
+
+```python
+from bux.export.runs import export, restore
+
+done = export("runs/smoke-f114ac17ae", "exported/", dtype="bfloat16", check=True)
+done.report.check()  # raises unless the export computes what bux does
+
+restored = restore("runs/smoke-f114ac17ae", step=40)  # the run, and its bux model
+```
+
+### What the check checks
+
+`--check` runs `compare` ([Checking an export](#checking-an-export)) on the run's
+own weights, not perturbed ones, prints a line for each attention implementation,
+and fails the command if any check fails: every head's logits within 1e-4 of bux's
+largest, greedy tokens with the cache and without equal to bux's, and a left-padded
+batch decoding as each of its prompts alone.
+
+Both sides compute in float32, on the weights the directory holds: with `--dtype
+bfloat16` bux's are rounded to bfloat16 too, so that the two compute with the same
+numbers. A run that trained in bfloat16 is checked so as well. In bfloat16, two
+correct implementations would differ by bfloat16's own rounding, near 1e-2 of the
+logits, which would hide a wrong weight. In float32 only the order of operations
+differs: the smoke run's export above is within 5e-7 of bux, and its bfloat16 export
+within 6e-7 (on a Mac's CPU, 2026-10-26). 1e-4 leaves room for depth, and a misplaced
+or mistransposed weight moves the logits by far more; a deep stack of delta-rule
+layers rounds faster ([Float32 and depth](#float32-and-depth)). Greedy tokens must be
+equal: only a tie between the two top logits closer than float32's error could flip
+one.
+
 ## Softmax attention
 
 `gqa` and `mla` attend by transformers' attention interface (`eager`, `sdpa`,

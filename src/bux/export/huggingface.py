@@ -27,6 +27,7 @@ from safetensors.torch import save_file
 
 from bux.architecture import Model
 from bux.export import codegen, hf
+from bux.export.hf.common import KEEP_FLOAT32
 from bux.export.plan import Plan, plan
 from bux.export.weights import Convert, Tensors, tensors
 from bux.lang import ir
@@ -41,6 +42,7 @@ def save(
     out: Path | str,
     *,
     dtype: torch.dtype = torch.float32,
+    max_positions: int | None = None,
 ) -> Plan:
     """Write `model`, built from `arch`, to the directory `out` as a transformers model.
 
@@ -51,6 +53,9 @@ def save(
         out: The directory, made if missing; files in it of the same names are
             replaced.
         dtype: The weights' dtype in the checkpoint.
+        max_positions: The longest sequence the model is known to take, as
+            ``max_position_embeddings``, which vLLM serves up to by default; None
+            says nothing of it.
 
     Returns:
         The exported model's plan.
@@ -82,6 +87,8 @@ def save(
         "layer_types": kinds,
         **_per_layer(layers),
         "tie_word_embeddings": False,
+        "dtype": str(dtype).removeprefix("torch."),  # what dtype="auto" loads in
+        **({} if max_positions is None else {"max_position_embeddings": max_positions}),
         "bux": arch.model_dump(mode="json"),
         "bux_sites": p.sites(),
     }
@@ -131,9 +138,11 @@ def _converter(kind: str) -> Convert | None:
 
 
 def _torch(weights: Tensors, dtype: torch.dtype) -> dict[str, torch.Tensor]:
-    """Return the arrays as contiguous torch tensors, floats in `dtype`."""
+    """Return the arrays as contiguous torch tensors, floats in `dtype` but the state
+    bux keeps in float32 (``KEEP_FLOAT32``)."""
     out = {}
     for name, array in weights.items():
         t = torch.from_numpy(np.array(array, order="C"))
-        out[name] = t.to(dtype) if t.is_floating_point() else t
+        kept = name.rsplit(".", 1)[-1] in KEEP_FLOAT32
+        out[name] = t.to(dtype) if t.is_floating_point() and not kept else t
     return out

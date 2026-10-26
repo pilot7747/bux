@@ -131,7 +131,8 @@ def compare(
     tokens = jax.random.randint(
         jax.random.key(seed), (batch, length), 0, arch.vocab_size
     )
-    want = [np.asarray(y, np.float32) for y in model.outputs(tokens)]
+    outputs = nnx.jit(lambda m, t: m.outputs(t))  # a compile, not one an op
+    want = [np.asarray(y, np.float32) for y in outputs(model, tokens)]
     prompt = tokens[:1, : length // 2]
     greedy = np.asarray(_greedy(model, prompt, steps))[0].tolist()
     with tempfile.TemporaryDirectory() as tmp:
@@ -155,11 +156,14 @@ def compare(
 def _greedy(
     model: Model, prompt: Int[jax.Array, "1 t"], steps: int
 ) -> Int[jax.Array, "1 n"]:
-    """Decode greedily by full forwards of bux's model."""
-    for _ in range(steps):
-        nxt = jnp.argmax(model(prompt)[:, -1], -1)
-        prompt = jnp.concatenate([prompt, nxt[:, None]], 1)
-    return prompt
+    """Decode greedily by full forwards of bux's model, compiled once: each over the
+    whole length, the tokens not decoded yet 0, which a causal model does not read."""
+    n = prompt.shape[1]
+    ids = jnp.zeros((1, n + steps), prompt.dtype).at[:, :n].set(prompt)
+    forward = nnx.jit(lambda m, x: m(x))
+    for t in range(n, n + steps):
+        ids = ids.at[:, t].set(jnp.argmax(forward(model, ids)[:, t - 1], -1))
+    return ids
 
 
 def _load(where: Path, impl: str, experts: str | None = None) -> Any:

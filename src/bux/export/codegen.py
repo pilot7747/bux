@@ -298,6 +298,7 @@ def seen_tokens(cache: Any, t: int) -> int:
 class BuxPreTrainedModel(PreTrainedModel):
     config_class = BuxConfig
     base_model_prefix = "model"
+    _keep_in_fp32_modules_strict = KEEP_FLOAT32
     _supports_sdpa = True
     _supports_flash_attn = True
     _supports_flex_attn = True
@@ -403,7 +404,10 @@ def modeling(plan: Plan, masks: list[tuple[str, object]]) -> str:
     used = {(c.__module__.rsplit(".", 1)[1], c.__name__) for c in _used(plan)}
     imports = sorted(used | g.imports)
     lines = [f"from .{m} import {n}" for m, n in imports]
-    lines += ["from .common import Ctx, site", "from .attention import make_mask"]
+    lines += [
+        "from .common import KEEP_FLOAT32, Ctx, site",
+        "from .attention import make_mask",
+    ]
     consts = [f"{name} = {source}" for source, name in g.constants.items()]
     return "\n".join(
         [
