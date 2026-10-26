@@ -213,7 +213,7 @@ class BuxModel(Scoped):
         if arch.get("residual") is not None:
             kind = arch["residual"]["type"]
             raise NotImplementedError(f"the residual algebra {kind!r} not in vLLM yet")
-        p = plan(arch["graph"])
+        p = plan(arch)
         layers = build_layers(vllm_config, p)
         super().__init__(p.top, "model.", layers)
         self.plan = p

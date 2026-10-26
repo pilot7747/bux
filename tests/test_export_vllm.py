@@ -42,8 +42,7 @@ vllm_parity = script("vllm_parity")
 def calls(arch) -> list[tuple[str, bool]]:
     """The plugin's calls of `arch`'s layers: each module's path, and whether it is
     the module's first call."""
-    graph = arch.model_dump(mode="json")["graph"]
-    return [(c.path, c.first) for c in plan.plan(graph).calls]
+    return [(c.path, c.first) for c in plan.plan(arch.model_dump(mode="json")).calls]
 
 
 @pytest.mark.parametrize("path", EXAMPLES, ids=lambda p: p.stem)
@@ -63,7 +62,7 @@ def test_layers_after_the_first_head_are_not_live() -> None:
     arch = compile(
         source + "shared out = head\nmodel = embed block @h out $h! block out"
     )
-    live = plan.live(plan.plan(arch.model_dump(mode="json")["graph"]).calls)
+    live = plan.live(plan.plan(arch.model_dump(mode="json")).calls)
     assert [c.path for c in live][-1] == "model.shared.out"
     assert sum(c.layer["config"]["type"] == "gqa" for c in live) == 1
 

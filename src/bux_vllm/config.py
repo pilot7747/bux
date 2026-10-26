@@ -51,7 +51,7 @@ class BuxConfig(PreTrainedConfig):
         super().__init__(**kwargs)
         self.bux, self.bux_sites = bux, bux_sites
         self.vocab_size, self.hidden_size = vocab_size, hidden_size
-        calls = live(plan(bux["graph"]).calls) if bux else []
+        calls = live(plan(bux).calls) if bux else []
         self.layer_types = [
             STATES[c.layer["config"]["type"]]
             for c in calls

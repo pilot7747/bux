@@ -56,7 +56,8 @@ class Scope:
     Attributes:
         root: The node the scope computes.
         key: The shared definition the scope is, if it is one.
-        names: The attribute of each layer and repeat in it, by its `Pos`.
+        names: The attribute of each layer, repeat and residual algebra's branch in
+            it, by its `Pos`.
         blocks: The scope of each repeat's body, by the repeat's `Pos`.
     """
 
@@ -105,27 +106,54 @@ class Plan:
     calls: list[Call]
 
 
-def plan(graph: Node) -> Plan:
-    """Return the module tree of the IR graph `graph`, and the calls of its layers."""
+def plan(arch: Node) -> Plan:
+    """Return the module tree of the IR `arch` (an architecture, as JSON), and the
+    calls of its layers."""
+    graph = arch["graph"]
+    algebra = (arch.get("residual") or {}).get("type")
+    depths = _share_depths(graph, 0, {})
     shared: dict[str, Scope] = {}
     for node in walk(graph):
         key = node.get("share")
         if key is not None and key not in shared:
-            shared[key] = scope(node, key)
-    top = scope(graph, graph.get("share"), top=True)
+            shared[key] = scope(node, key, algebra=algebra, depth=depths[key])
+    top = scope(graph, graph.get("share"), top=True, algebra=algebra)
     out = Plan(top, shared, [])
     out.calls = list(_calls(out, graph, (), top, "model.", set(), True))
     return out
 
 
-def scope(root: Node, key: str | None, *, top: bool = False) -> Scope:
+def _share_depths(node: Node, depth: int, out: dict[str, int]) -> dict[str, int]:
+    """Return how many residual branches are around each shared definition's first
+    use."""
+    key = node.get("share")
+    if key is not None:
+        if key in out:
+            return out
+        out[key] = depth
+    inner = depth + (node["kind"] == "residual")
+    for child in children(node):
+        _share_depths(child, inner, out)
+    return out
+
+
+def scope(
+    root: Node,
+    key: str | None,
+    *,
+    top: bool = False,
+    algebra: str | None = None,
+    depth: int = 0,
+) -> Scope:
     """Return the scope of the module computing `root`; `key` is the shared
-    definition it is, whose root it names rather than calls. The model's scope
-    (`top`) names its repeat of the most passes ``layers``."""
+    definition it is, whose root it names rather than calls. Under a residual
+    `algebra`, a residual branch outside any other (`depth` counts those around
+    `root`) is a module too, named by it. The model's scope (`top`) names its repeat
+    of the most passes ``layers``."""
     s = Scope(root, key)
     hints: dict[Pos, str] = {}
 
-    def visit(node: Node, pos: Pos) -> None:
+    def visit(node: Node, pos: Pos, depth: int) -> None:
         if node.get("share") is not None and not (key is not None and pos == ()):
             return
         kind = node["kind"]
@@ -136,12 +164,14 @@ def scope(root: Node, key: str | None, *, top: bool = False) -> Scope:
             if body.get("share") is None:
                 label = body.get("label")
                 hints[pos] = f"{label}s" if label else "blocks"
-                s.blocks[pos] = scope(body, None)
+                s.blocks[pos] = scope(body, None, algebra=algebra, depth=depth)
         else:
+            if kind == "residual" and algebra and depth == 0:
+                hints[pos] = algebra
             for i, child in enumerate(children(node)):
-                visit(child, (*pos, i))
+                visit(child, (*pos, i), depth + (kind == "residual"))
 
-    visit(root, ())
+    visit(root, (), depth)
     if top and s.blocks and "layers" not in hints.values():
         hints[max(s.blocks, key=lambda p: at(root, p)["times"])] = "layers"
     for pos, hint in hints.items():
