@@ -290,6 +290,9 @@ _UNCOMPUTED |= {"mesh", "layout", "methods", "compiler"}  # how it splits and co
 # Settings newer than run ids, as runs computed before them: in float32, which was
 # the default then.
 _NEWER = {"precision": PrecisionConfig(compute="float32")}
+# Settings newer than run ids that are not configs, at the values runs computed with
+# before them, dumped.
+_NEWER_VALUES = {"batch_ramp": None, "curriculum": []}
 # Fields of a setting newer than run ids, by what runs computed before them.
 _NEWER_FIELDS = {
     "precision": {
@@ -418,6 +421,9 @@ class Run(BaseModel):
         for setting, before in _NEWER.items():
             old = _without_newer_fields({setting: before.model_dump(mode="json")})
             if train[setting] == old[setting]:
+                del train[setting]
+        for setting, value in _NEWER_VALUES.items():
+            if train[setting] == value:
                 del train[setting]
         dumped_arch = _without_newer_layer_fields(arch.model_dump(mode="json"))
         for setting, before in _NEWER_SETTINGS.items():

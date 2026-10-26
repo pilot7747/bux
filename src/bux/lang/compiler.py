@@ -34,6 +34,7 @@ from bux.lang import ir, modules
 from bux.lang import syntax as ast
 from bux.lang.syntax import BuxError, Span
 from bux.train import config as tcfg
+from bux.train import curriculum
 
 
 def _tags(union: object) -> dict[str, type[cfg.Config]]:
@@ -664,12 +665,15 @@ class _Evaluator:
                 return value
             case cfg.Config():
                 if _tag(value) not in LAYERS:
-                    kind = (
-                        "a training setting"
-                        if _tag(value) in TRAINING
-                        else "a setting of a layer"
+                    training = _tag(value) in TRAINING
+                    kind = "a training setting" if training else "a setting of a layer"
+                    # [x] is x's residual branch: a list of one is [x,].
+                    hint = (
+                        f"a list of one is [{_tag(value)}(...),]" if training else None
                     )
-                    raise BuxError(f"{_tag(value)}(...) is {kind}, not a layer", span)
+                    raise BuxError(
+                        f"{_tag(value)}(...) is {kind}, not a layer", span, hint
+                    )
                 config = typing.cast(cfg.LayerConfig, value)
                 return self.node(ir.Layer(config=config), span)
             case _Builtin(name=name) if name in ACTIVATIONS:
@@ -1370,7 +1374,10 @@ def _model_settings(ev: _Evaluator) -> dict[str, object]:
 def _expects(annotation: object) -> str:
     """Say how a setting of this type is written: adamw(...) or muon(...), an integer."""
     kinds = []
-    for member in typing.get_args(annotation) or (annotation,):
+    whole = typing.get_origin(annotation) is tuple  # a list, not a union
+    for member in (
+        (annotation,) if whole else typing.get_args(annotation) or (annotation,)
+    ):
         if member is type(None):
             kinds.append("none")
         elif member is int:
@@ -1416,6 +1423,7 @@ def _train(
         raise _missing_settings(missing)
     train = tcfg.TrainConfig.model_validate(values)
     _check_schedule(train, spans)
+    _check_curriculum(train, spans)
     _check_tokenizer(train, spans)
     _check_positions(train, arch, spans)
     return train
@@ -1471,8 +1479,20 @@ def _check_schedule(train: tcfg.TrainConfig, spans: dict[str, Span]) -> None:
         )
 
 
+def _check_curriculum(train: tcfg.TrainConfig, spans: dict[str, Span]) -> None:
+    for check, setting in (
+        (curriculum.check_ramp, "batch_ramp"),
+        (curriculum.check_phases, "curriculum"),
+    ):
+        try:
+            check(train)
+        except ValueError as err:
+            raise BuxError(str(err), spans.get(setting, spans["steps"])) from None
+
+
 def _check_tokenizer(train: tcfg.TrainConfig, spans: dict[str, Span]) -> None:
     reads = [("data", train.data)] + [("eval", e.data) for e in tcfg.evals(train)]
+    reads += [("curriculum", p.data) for p in train.curriculum if p.data is not None]
     for name, data in reads:
         kinds = sorted({s.type for s in tcfg.leaves(data)} & {"text", "chat"})
         if kinds and train.tokenizer is None:
@@ -1486,15 +1506,20 @@ def _check_tokenizer(train: tcfg.TrainConfig, spans: dict[str, Span]) -> None:
 def _check_positions(
     train: tcfg.TrainConfig, arch: ir.Architecture | None, spans: dict[str, Span]
 ) -> None:
+    longest = max(c.seq_len for _, c in curriculum.phases(train))
+    setting = "seq_len" if longest == train.seq_len else "curriculum"
     for layer in arch.layers() if arch is not None else ():
         if isinstance(layer.config, cfg.EmbeddingConfig):
             positions = layer.config.max_positions
-            if positions is not None and train.seq_len > positions:
+            if positions is not None and longest > positions:
+                hint = f"embed(max_positions={longest})"
+                if setting == "seq_len":
+                    hint = f"seq_len = {positions}, or {hint}"
                 raise BuxError(
-                    f"sequences of {train.seq_len} tokens are longer than the "
+                    f"sequences of {longest} tokens are longer than the "
                     f"{positions} positions the embedding learns",
-                    spans["seq_len"],
-                    f"seq_len = {positions}, or embed(max_positions={train.seq_len})",
+                    spans[setting],
+                    hint,
                 )
 
 
