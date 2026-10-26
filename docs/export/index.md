@@ -106,6 +106,21 @@ from bux.export.check import compare
 compare(arch).check()  # fresh weights, perturbed; raises unless all agree
 ```
 
+## Recurrent layers
+
+Linear attention and the state space models keep their state in transformers' cache,
+a `linear_attention` layer each (`conv` for `short_conv`), with the last inputs of
+their short convs. A prefill runs the recurrence by chunks of 64 positions, with
+matmuls within a chunk and a loop across them, as fla's chunked kernels do; a
+decoding step runs one position from the state the cache holds. Mamba's scan, one
+decay per channel and state dim, runs one position at a time, as bux runs it. All of
+it is PyTorch, in float32 whatever the model's dtype (float64 in a float64 model),
+with no kernels of fla, mamba_ssm or causal_conv1d yet.
+
+A padded token of a left-padded batch leaves the state as it was: its input is zeroed
+and its decay is 1. A model of recurrent layers alone has no attention layer to count
+the tokens its cache holds, so its first forward makes the cache, not `generate`.
+
 ## What exports
 
 A layer type exports once, as a class in `bux.export.hf`, and every architecture made
@@ -114,11 +129,15 @@ layer or the setting.
 
 | Layers | Exported |
 |--------|----------|
-| `embed`, `head`, `mlp`, `gated_mlp`, `linear`, `act`, `scale`, `dropout`, `layernorm`, `rmsnorm` | yes, but `embed(norm=...)` and the MLPs' `limit`, `up_softcap` and `up_offset` |
+| `embed`, `head`, `mlp`, `gated_mlp`, `linear`, `act`, `scale`, `dropout`, `layernorm`, `rmsnorm`, `dyt` | yes, every setting and activation |
+| `moe` | yes, every setting inference reads: the routers, group-limited routing, the aux-free bias, shared experts, LatentMoE, the expert norm, experts of either MLP type; the routed experts by transformers' experts implementations |
 | `gqa` | every setting and port: RoPE (`pi`, `llama3`, `yarn`; partial, interleaved), QK-norm, biases, fused or not, head dims, scale, sliding windows, sinks, softcap, gates, output norm, length scale, relative bias, the conv on keys and values, the indexer; `v`, `kv` and `index` ports. Dropout is training's alone |
 | `mla` | every setting, the indexer and the `index` port; keys and values cached as projected up from the latents |
 | `csa` | every setting, the indexer and its candidate pools, and the `kv`, `index` and `candidates` ports; every token's latents cached, the window a mask over them |
 | `conv` | yes, its inputs' tail kept in the cache as it decodes |
+| `gdn`, `kda`, `deltanet`, `gla`, `lightning` | yes, every setting: value heads, the short conv, the output gate and its rank, KDA's decay rank and lower bound, lightning's rates by its depth among the token mixers |
+| `rwkv7` | yes, every setting, and its `v` port (the value residual) |
+| `mamba`, `mamba2`, `short_conv` | yes, every setting; `dt_min` and `dt_max` only start training |
 | `engram` | yes, on one stream or a widened one; its last tokens and its conv's inputs' tail kept in the cache as it decodes. A token's class is its id mod `vocab_classes`, as bux makes them |
 | `nextn` | yes, on one stream or a widened one; every head's logits on whole sequences (`all_heads=True`), and skipped as the model generates |
 | `merge` | yes |
@@ -153,6 +172,27 @@ window and its compressed latents at once.
 
 The cache is transformers' `DynamicCache`; a static one
 (`cache_implementation="static"`) is not exported yet.
+
+## Mixtures of experts
+
+An exported `moe` routes as bux does: the scores and the top-k choice in float32,
+equal scores picking the lower expert, and the aux-free bias, which the checkpoint
+holds as `router_bias`, in the choice alone. Its routed experts are stacked as
+transformers' MoE models keep theirs, `gate_up_proj` (E, 2f, d), the gate's rows
+first, and `down_proj` (E, d, f), so that transformers' experts implementations run
+them:
+
+```python
+model = AutoModelForCausalLM.from_pretrained(
+    "exported/", trust_remote_code=True, experts_implementation="grouped_mm"
+)
+```
+
+`grouped_mm`, transformers' default, and `batched_mm` run every setting of the
+experts; `eager` is a loop over them, the reference. A kernel that fuses the
+activation itself (`sonicmoe`) fits SwiGLU experts alone. The settings only training
+reads are left out: the balance loss, how far the aux-free bias moves, and random
+routing.
 
 ## Serving in vLLM
 

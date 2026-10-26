@@ -8,6 +8,9 @@ position. Decoding keeps them in the layer's cache slot, a ``LinearAttentionLaye
 left, and leaves the last of them; a decoding step convolves the kept ones and its
 own. Padded tokens of a left-padded batch are zeroed first, so that they leave
 nothing in the state.
+
+A recurrent layer keeps its state in the same slot (`previous_state`, `keep_state`):
+none before its first call, a prefill, which starts from zero.
 """
 
 from __future__ import annotations
@@ -19,13 +22,42 @@ from torch import nn
 from .common import Ctx, Site
 
 
+def real_tokens(ctx: Ctx, t: int) -> torch.Tensor | None:
+    """Return 1 at the last `t` tokens transformers' mask keeps and 0 at its padding,
+    b rows of t; None without a 2D mask. Generate makes the masks of a compileable
+    cache before the model, by layer type: a recurrent layer's is that 2D mask."""
+    mask = ctx.attention_mask
+    if isinstance(mask, dict):
+        mask = mask.get("linear_attention", mask.get("conv"))
+    if mask is None or mask.ndim != 2:
+        return None
+    return mask[:, -t:]
+
+
 def without_padding(x: torch.Tensor, ctx: Ctx) -> torch.Tensor:
     """Return x, b t ..., with the tokens transformers' mask pads zeroed."""
-    mask = ctx.attention_mask
-    if mask is None or mask.ndim != 2:
+    keep = real_tokens(ctx, x.shape[1])
+    if keep is None:
         return x
-    keep = mask[:, -x.shape[1] :].to(x.dtype)
+    keep = keep.to(x.dtype)
     return x * keep.view(*keep.shape, *(1,) * (x.ndim - 2))
+
+
+def previous_state(ctx: Ctx, slot: int) -> torch.Tensor | None:
+    """Return the recurrent state the cache keeps at `slot`: None without a cache, or
+    before the layer's first call, which starts from zero."""
+    if ctx.cache is None:
+        return None
+    layer = ctx.cache.layers[slot]
+    return (
+        layer.recurrent_states[0] if layer.is_recurrent_states_initialized[0] else None
+    )
+
+
+def keep_state(ctx: Ctx, slot: int, state: torch.Tensor) -> None:
+    """Keep `state` in the cache at `slot`, for the next call; nothing without one."""
+    if ctx.cache is not None:
+        ctx.cache.update_recurrent_state(state, slot)
 
 
 class CausalConv(nn.Module):

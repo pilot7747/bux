@@ -1,8 +1,8 @@
 """Where every layer of an architecture goes in an exported model: the module tree
 that every exporter shares, so that one set of weights loads into each.
 
-It imports bux.lang and numpy alone, no JAX and no torch, so that a runtime's plugin
-can place the layers just as `bux.export` named their weights.
+It imports bux.lang, bux.config and numpy alone, no JAX and no torch, so that a
+runtime's plugin can place the layers just as `bux.export` named their weights.
 
 The model is a tree of scopes, each a module of its own (a generated class):
 
@@ -26,6 +26,7 @@ from dataclasses import dataclass, field
 
 import numpy as np
 
+from bux import config as cfg
 from bux.config import EngramConfig
 from bux.lang import ir
 
@@ -328,3 +329,16 @@ def engram_hashes(p: Plan, call: Call) -> dict:
 
 
 SITE_EXTRAS["engram"] = engram_hashes
+
+
+def mixer_depth(p: Plan, call: Call) -> dict:
+    """Return the index of `call`'s layer among the token mixers the model runs, from
+    0, and how many token mixers it runs: what
+    ``bux.architecture.recurrent.linear_attention.depth`` builds a layer by."""
+    mixers = [
+        c.path for c in p.calls if isinstance(c.layer.config, cfg.AttentionConfig)
+    ]
+    return {"layer": mixers.index(call.path), "layers": max(len(mixers), 1)}
+
+
+SITE_EXTRAS["lightning"] = mixer_depth  # its decay rates weaken with depth
