@@ -54,6 +54,7 @@ def registries() -> list[tuple[str, str, list[Row]]]:
     from bux.architecture.repeats import remat
     from bux.lang.printer import config_to_source
     from bux.parallel import methods
+    from bux.search import methods as search
     from bux.train import data, optim, profilers, xla
 
     kinds = sorted(k for k, v in vars(methods).items() if hasattr(v, "builders"))
@@ -71,6 +72,7 @@ def registries() -> list[tuple[str, str, list[Row]]]:
         ("Newton-Schulz coefficients", optim.ns_coefficients),
         ("Data sources", data.sources),
         ("Matmul formats", matmuls.formats),
+        ("Search methods", search.methods),
     ]:
         found.append(
             (title, registry.where, builders(registry.builders, registry.docs))

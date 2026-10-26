@@ -287,6 +287,7 @@ def strip(node: Node, *, labels: bool = True, widths: bool = True) -> Node:
 # Training settings that change how a run is watched or computed, not what it computes.
 _UNCOMPUTED = {"log", "eval", "checkpoint", "observe", "profile"}
 _UNCOMPUTED |= {"mesh", "layout", "methods", "compiler"}  # how it splits and compiles
+_UNCOMPUTED |= {"objective", "search"}  # how a search ranks and proposes runs
 # Settings newer than run ids, as runs computed before them: in float32, which was
 # the default then.
 _NEWER = {"precision": PrecisionConfig(compute="float32")}
