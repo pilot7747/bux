@@ -93,34 +93,6 @@ class Block0(nn.Module):
   sliding window or a number of conv states, is in `config.per_layer_config`,
   so that two layers keep windows of their own.
 
-## Checking an export
-
-`bux.export.check.compare` exports a model, loads it back with transformers, and
-compares it with bux, in float32: every head's logits, greedy decoding with the cache,
-without it and by bux's full forwards, and a left-padded batch against each of its
-prompts alone. Each exported layer is tested so (`tests/test_export*.py`).
-
-```python
-from bux.export.check import compare
-
-compare(arch).check()  # fresh weights, perturbed; raises unless all agree
-```
-
-## Recurrent layers
-
-Linear attention and the state space models keep their state in transformers' cache,
-a `linear_attention` layer each (`conv` for `short_conv`), with the last inputs of
-their short convs. A prefill runs the recurrence by chunks of 64 positions, with
-matmuls within a chunk and a loop across them, as fla's chunked kernels do; a
-decoding step runs one position from the state the cache holds. Mamba's scan, one
-decay per channel and state dim, runs one position at a time, as bux runs it. All of
-it is PyTorch, in float32 whatever the model's dtype (float64 in a float64 model),
-with no kernels of fla, mamba_ssm or causal_conv1d yet.
-
-A padded token of a left-padded batch leaves the state as it was: its input is zeroed
-and its decay is 1. A model of recurrent layers alone has no attention layer to count
-the tokens its cache holds, so its first forward makes the cache, not `generate`.
-
 ## What exports
 
 A layer type exports once, as a class in `bux.export.hf`, and every architecture made
@@ -143,6 +115,38 @@ layer or the setting.
 | `merge` | yes |
 | residual algebras | `hc`, `mhc`, `gr`, `attnres`, `vpgate`, with every setting, single-pass included |
 | the graph | sequences, residual branches, sums, products, constants, negations, repeats, taps, shared definitions |
+
+## Checking an export
+
+`bux.export.check.compare` exports a model, loads it back with transformers, and
+compares it with bux, in float32: every head's logits, greedy decoding with the cache,
+without it and by bux's full forwards, and a left-padded batch against each of its
+prompts alone. Each exported layer is tested so (`tests/test_export*.py`).
+
+```python
+from bux.export.check import compare
+
+compare(arch).check()  # fresh weights, perturbed; raises unless all agree
+```
+
+### Float32 and depth
+
+The check holds logits to 1e-4 of the largest, in float32. Float32's own rounding
+grows with depth, and through the delta rule faster than through attention. Against
+the export run in float64 (eager attention; the weights `compare` makes, seed 0,
+perturbed by 0.1; rows of 2 by 12 tokens; `d_model = 32`, a vocabulary of 64; on an
+Apple-silicon Mac's CPU, 2026-10-26), the largest relative error of any head's logits:
+
+| Model | bux in float32 | the export in float32 |
+|-------|----------------|-----------------------|
+| `gdn` blocks, 1 / 2 / 8 / 12 | 1.4e-6 / 2.0e-6 / 1.0e-5 / 1.5e-5 | 8.4e-7 / 2.2e-6 / 1.5e-5 / 1.8e-5 |
+| `gdn` blocks, 48 | 2.0e-4 | 1.6e-4 |
+| Qwen3-Next shrunk, 48 blocks (36 `gdn`) | 1.8e-4 | 2.5e-4 |
+| `gqa` blocks, 48 | 6.4e-6 | 4.1e-6 |
+
+That is about 5e-6 a `gdn` layer, on both sides alike: a deep recurrent stack passes
+1e-4 by float32's rounding alone. The tests shorten such stacks (Qwen3-Next's to 12
+blocks) rather than loosen the check.
 
 ## Softmax attention
 
@@ -193,3 +197,18 @@ experts; `eager` is a loop over them, the reference. A kernel that fuses the
 activation itself (`sonicmoe`) fits SwiGLU experts alone. The settings only training
 reads are left out: the balance loss, how far the aux-free bias moves, and random
 routing.
+
+## Recurrent layers
+
+Linear attention and the state space models keep their state in transformers' cache,
+a `linear_attention` layer each (`conv` for `short_conv`), with the last inputs of
+their short convs. A prefill runs the recurrence by chunks of 64 positions, with
+matmuls within a chunk and a loop across them, as fla's chunked kernels do; a
+decoding step runs one position from the state the cache holds. Mamba's scan, one
+decay per channel and state dim, runs one position at a time, as bux runs it. All of
+it is PyTorch, in float32 whatever the model's dtype (float64 in a float64 model),
+with no kernels of fla, mamba_ssm or causal_conv1d yet.
+
+A padded token of a left-padded batch leaves the state as it was: its input is zeroed
+and its decay is 1. A model of recurrent layers alone has no attention layer to count
+the tokens its cache holds, so its first forward makes the cache, not `generate`.
