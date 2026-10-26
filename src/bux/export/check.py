@@ -182,7 +182,7 @@ def _load(where: Path, impl: str) -> Any:
 def _heads(hf: Any, tokens: Int[np.ndarray, "b t"]) -> list[np.ndarray]:
     """Return every head's logits of transformers' run, as numpy."""
     with torch.no_grad():
-        heads, _ = hf.model(torch.from_numpy(tokens).long())
+        heads, _ = hf.model(torch.tensor(tokens, dtype=torch.long))
     return [h.float().numpy() for h in heads]
 
 
@@ -196,7 +196,7 @@ def _generate(
 ) -> list[int]:
     """Decode greedily with transformers' generate."""
     with torch.no_grad():
-        ids = torch.from_numpy(np.asarray(prompt)).long()
+        ids = torch.tensor(np.asarray(prompt), dtype=torch.long)
         out = hf.generate(
             ids,
             max_new_tokens=steps,
