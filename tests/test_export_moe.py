@@ -11,6 +11,7 @@ import numpy as np
 import pytest
 import torch
 from flax import nnx
+from jaxtyping import Int
 
 from bux.architecture import Model
 from bux.architecture.experts.moe import MoE, _limit_groups
@@ -225,7 +226,7 @@ def with_router_bias(arch: ir.Architecture, scale: float = 0.3) -> Model:
     return model
 
 
-def _routes(model: Model, arch: ir.Architecture) -> list[np.ndarray]:
+def _routes(model: Model, arch: ir.Architecture) -> list[Int[np.ndarray, "b t k"]]:
     """Each MoE's top-k picks on random tokens' embeddings, a probe of the router."""
     assert arch.d_model is not None
     x = jax.random.normal(jax.random.key(7), (2, 12, arch.d_model))

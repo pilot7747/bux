@@ -191,7 +191,9 @@ def _load(where: Path, impl: str, experts: str | None = None) -> Any:
     return model.eval()
 
 
-def _heads(hf: Any, tokens: Int[np.ndarray, "b t"]) -> list[np.ndarray]:
+def _heads(
+    hf: Any, tokens: Int[np.ndarray, "b t"]
+) -> list[Float[np.ndarray, "b t vocab"]]:
     """Return every head's logits of transformers' run, as numpy."""
     with torch.no_grad():
         heads, _ = hf.model(torch.tensor(tokens, dtype=torch.long), all_heads=True)

@@ -65,7 +65,9 @@ def tensors(
     return out
 
 
-def _algebra(m: nnx.Module, seen: set[int]) -> Iterator[tuple[str, np.ndarray]]:
+def _algebra(
+    m: nnx.Module, seen: set[int]
+) -> Iterator[tuple[str, Shaped[np.ndarray, "..."]]]:
     """Yield the parameters of a residual algebra's branch, by the rule, but its
     body's, which are its layers'."""
     for name, value in vars(m).items():
@@ -92,7 +94,9 @@ def module_at(node: ir.Node, module: Any, trail: tuple[int, ...]) -> nnx.Module:
     return module
 
 
-def _named(m: object, prefix: str, seen: set[int]) -> Iterator[tuple[str, np.ndarray]]:
+def _named(
+    m: object, prefix: str, seen: set[int]
+) -> Iterator[tuple[str, Shaped[np.ndarray, "..."]]]:
     """Yield the parameters of `m` by the rule, each module's once."""
     if id(m) in seen:
         return
@@ -119,7 +123,7 @@ def _named(m: object, prefix: str, seen: set[int]) -> Iterator[tuple[str, np.nda
 
 def _attribute(
     value: object, name: str, seen: set[int]
-) -> Iterator[tuple[str, np.ndarray]]:
+) -> Iterator[tuple[str, Shaped[np.ndarray, "..."]]]:
     """Yield the parameters an attribute holds: itself, a module's, or a list's."""
     if isinstance(value, nnx.Param):
         yield name, np.asarray(value[...])

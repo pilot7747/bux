@@ -26,6 +26,7 @@ import orbax.checkpoint as ocp
 import torch
 from flax import nnx
 from jax.sharding import AbstractMesh, AxisType, SingleDeviceSharding
+from jaxtyping import Shaped
 
 from bux import parallel
 from bux.architecture import Model
@@ -390,7 +391,7 @@ def rounded(model: Model, dtype: str) -> Model:
     and kept in their own: the weights an export in `dtype` holds."""
     graphdef, params, rest = nnx.split(model, nnx.Param, ...)
 
-    def round_to(x: jax.Array) -> jax.Array:
+    def round_to(x: Shaped[jax.Array, "*shape"]) -> Shaped[jax.Array, "*shape"]:
         if not jnp.issubdtype(x.dtype, jnp.floating):
             return x
         return x.astype(dtype).astype(x.dtype)
