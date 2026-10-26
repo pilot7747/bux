@@ -2197,6 +2197,9 @@ def check(
             parts = tuple(axis.part(axis.pick(0)) for axis in axes)
             name = _run_name(filename, parts)
             run = ir.Run(name=name, arch=arch, train=train, choices=parts)
+            if dims and (error := _check_rungs(program, entry, train)):
+                report(error)
+                run = None
     inherited = {
         name: st for name, st in ev.statements.items() if st.span.start > len(source)
     }
@@ -2243,6 +2246,29 @@ def _check_alternatives(
                     todo.append((choices, {**point, key: value}))
     assert first is not None
     return first
+
+
+def _check_rungs(
+    program: modules.Program, entry: str, train: tcfg.TrainConfig
+) -> BuxError | None:
+    """Return why the bottom rung of the run's halving does not compile, as a
+    warmup longer than its steps; None if it does, or there is no halving."""
+    if (h := train.search.halving) is None:
+        return None
+    steps = h.steps(train.steps, 0)
+    try:
+        _explore(
+            modules.extended(program, f"steps = {steps}", "<search>"), entry, {}, {}
+        )
+    except BuxError as err:
+        rung = BuxError(
+            f"halving's first rung trains {steps} steps, and then: {err.message}",
+            err.span,
+            "write what depends on the run's length in terms of steps: "
+            "schedule.warmup = steps // 10",
+        )
+        return rung.attach(err.source, err.filename) if err.source else rung
+    return None
 
 
 def _ends(space: tcfg.Distribution) -> tuple[float, ...]:

@@ -24,6 +24,7 @@ from collections.abc import Callable, Sequence
 from pathlib import Path
 
 import numpy as np
+from jaxtyping import Float
 
 from bux.lang import ir
 from bux.lang.compiler import Space as Compiled
@@ -216,7 +217,7 @@ class Search:
         enough = [r for r, n in enumerate(counts) if n > len(self.dims.names) + 1]
         return enough[-1] if enough else int(np.argmax(counts))
 
-    def _points(self, trials: list[Trial]) -> np.ndarray:
+    def _points(self, trials: list[Trial]) -> Float[np.ndarray, "n d"]:
         rows = [self.dims.encode(t.values) for t in trials]
         return np.array(rows).reshape(len(rows), len(self.dims.names))
 

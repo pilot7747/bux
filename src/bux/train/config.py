@@ -958,9 +958,8 @@ class HalvingConfig(Config):
     short run ranking trials as a long one would not."""
 
     type: Literal["halving"] = "halving"
-    eta: Annotated[int, Field(ge=2)] = (
-        3  # each rung trains the best 1/eta, eta x longer
-    )
+    # Each rung trains the best 1/eta of the one below, eta times longer.
+    eta: Annotated[int, Field(ge=2)] = 3
     # Rungs of steps, the last the run's own: steps / eta^(rungs - 1), ..., steps.
     rungs: Annotated[int, Field(ge=2)] = 3
     brackets: Positive = 1  # Hyperband's brackets: the rungs trials start at, from 0
