@@ -3,16 +3,20 @@
 chunks of queries (inside ``bux.kernels.off()``), on one GPU and with the positions
 split over 2: top-k tokens of GQA and MLA, QSA's blocks, CSA's window and latents (512
 dims, which XLA runs), on packed documents with a window, sinks and a soft cap; the
-output, the logsumexp and the gradients. Then the time of a forward and backward of
-each, and of dense flash attention, from 4k to 32k tokens.
+output, the logsumexp and the gradients. Then the indexer's kernels on a B200 or B300:
+cuDNN's top-k against XLA's, bitwise, and its loss's log-softmax and gradients. Then
+the time of a forward and backward of each, and of dense flash attention, from 4k to
+32k tokens.
 
     uv run --extra cuda python scripts/gpu_smoke/sparse.py
 
-It needs tokamax (the cuda extra), and exits 1 if the kernel differs from XLA.
+It needs tokamax and cudnn-frontend (the cuda extra), and exits 1 if a kernel differs
+from XLA.
 """
 
 import sys
 import time
+from collections.abc import Callable
 from typing import NamedTuple
 
 import jax
@@ -25,7 +29,7 @@ from jaxtyping import Array, Float
 import bux.architecture  # noqa: F401  (registers the attention methods)
 from bux import kernels, parallel
 from bux.architecture import Segments
-from bux.architecture.attention import sparse
+from bux.architecture.attention import indexer, indexer_cudnn, scoring, sparse
 from bux.parallel import methods
 from bux.parallel.context import AttentionArgs
 from bux.train import config as tcfg
@@ -220,11 +224,141 @@ def timings(name: str, case: Case) -> None:
         print(f"time {name:16} t={t:6} top 2048, ms: {shown}", flush=True)
 
 
+# --- The indexer's kernels: cuDNN's top-k and its loss's log-softmax ------------------
+
+
+class Ranked(NamedTuple):
+    """A chunk of queries' scores of every key, -inf where they don't see it."""
+
+    scores: Float[Array, "b c n"]
+    span: sparse.Span  # the queries' spans
+
+
+def ranked(t: int, c: int, b: int = 1, docs: bool = False, ties: float = 0) -> Ranked:
+    """The indexer's scores of a chunk of c queries (every t // c-th) of b rows of t,
+    by `scoring`'s kernel; rounded to multiples of `ties` (0 for none, a huge one for
+    all 0), of packed documents if `docs`."""
+    key = iter(jax.random.split(jax.random.key(1), 3))
+    q = jax.random.normal(next(key), (b, t, 64, 128), DTYPE)
+    w = jax.random.normal(next(key), (b, t, 64), DTYPE) * 0.1
+    keys = jax.random.normal(next(key), (b, t, 128), DTYPE)
+    rows = (
+        documents(b, t)
+        if docs
+        else Segments.of(jnp.broadcast_to(jnp.arange(t), (b, t)))
+    )
+    span = sparse.token_span(rows, None)
+    pick = slice(t // c - 1, None, t // c)
+    chunk = sparse.Span(span.start[:, pick], span.end[:, pick])
+    scores = jax.jit(scoring.scores)(q[:, pick], w[:, pick], keys, chunk.end)
+    if ties:
+        scores = jnp.round(scores / ties) * ties
+    return Ranked(jnp.where(sparse.mask(chunk, t), scores, -jnp.inf), chunk)
+
+
+def top_k_check(name: str, case: Ranked, k: int = 2048) -> bool:
+    """cuDNN's top-k against XLA's counting, bitwise."""
+    with kernels.off():
+        want = jax.jit(lambda s: indexer._top(s, k))(case.scores)
+    got = jax.jit(lambda s, span: indexer._top(s, k, span))(*case)
+    rows = int((got != want).any(-1).sum())
+    ok = rows == 0 and indexer_cudnn.runs(min(k, case.scores.shape[-1]))
+    print(f"top-k {name:22} k={k:4} rows differing {rows}  {'ok' if ok else 'DIFFERS'}")
+    return ok
+
+
+def picks(b: int, t: int, s: int, k: int, seed: int = 2) -> Array:
+    """Each query's k distinct picks among s keys, -1 for those after it (so some
+    before a kept one): a query at t's last slot sees every key."""
+    u = jax.random.uniform(jax.random.key(seed), (b, t, s))
+    index = jnp.argsort(u, -1)[..., :k].astype(jnp.int32)
+    at = (jnp.arange(t) + 1) * (s // t) - 1
+    return jnp.where(index <= at[None, :, None], index, -1)
+
+
+def log_softmax_check(name: str, b: int, t: int, s: int, h: int, k: int) -> bool:
+    """cuDNN's log-softmax of the picks' scores, and its gradients, against XLA's
+    gather in float32: where the picks' probability is above 1e-30."""
+    key = iter(jax.random.split(jax.random.key(3), 4))
+    q = jax.random.normal(next(key), (b, t, h, 128), DTYPE)
+    w = jax.random.normal(next(key), (b, t, h), DTYPE) * 0.1
+    keys = jax.random.normal(next(key), (b, s, 128), DTYPE)
+    index = picks(b, t, s, k)
+    d = jax.random.normal(next(key), (b, t, k)) * (index >= 0)
+
+    def xla(q: Array, w: Array, keys: Array) -> Array:
+        rows = jax.vmap(lambda k, i: k[i])(
+            keys.astype(jnp.float32), jnp.maximum(index, 0)
+        )
+        scores = jnp.einsum(
+            "bthi,btki->bthk", q, rows, preferred_element_type=jnp.float32
+        )
+        scores = jnp.einsum("bthk,bth->btk", jax.nn.relu(scores), w)
+        return jax.nn.log_softmax(jnp.where(index >= 0, scores, -jnp.inf))
+
+    def both(f: Callable[..., Array]) -> Callable[..., tuple]:
+        def run(q: Array, w: Array, keys: Array) -> tuple:
+            out, pull = jax.vjp(f, q, w, keys)
+            return out, pull(d)
+
+        return jax.jit(run)
+
+    def kernel(q: Array, w: Array, keys: Array) -> Array:
+        return indexer_cudnn.log_softmax(q, w, keys, index)
+
+    want, want_grads = both(xla)(q, w, keys)
+    got, grads = both(kernel)(q, w, keys)
+    seen = want > -69  # e^-69 = 1e-30
+    shown = [error(jnp.where(seen, got, 0), jnp.where(seen, want, 0))]
+    shown += [error(a, b) for a, b in zip(grads, want_grads, strict=True)]
+    ok = max(shown) < TOLERANCE and indexer_cudnn.takes(h, 128, k, DTYPE)
+    print(
+        f"log-softmax {name:16} log q, dq, dw, dkeys "
+        + " ".join(f"{e:.1e}" for e in shown)
+        + f"  {'ok' if ok else 'DIFFERS'}",
+        flush=True,
+    )
+    return ok
+
+
+def indexer_checks() -> list[bool]:
+    """The indexer's kernels against XLA: the top-k at 4k and 32k, on packed
+    documents, ties at 0 and at the k-th, rows that see fewer than k keys or none, k
+    that are no multiple of anything; the loss's log-softmax at 2048 picks a query
+    and the edges of what the kernels take."""
+    some = ranked(4096, 512)
+    no_key = some.scores.at[:, :7].set(-jnp.inf)[..., :3000]
+    first = jnp.zeros_like(some.span.end)
+    every, some_keys = (
+        sparse.Span(first, first + 3000),
+        sparse.Span(first, first + 1000),
+    )
+    agree = [
+        top_k_check("32k", ranked(32768, 1024)),
+        top_k_check("32k packed documents", ranked(32768, 1024, docs=True)),
+        top_k_check("32k ties at k-th", ranked(32768, 1024, ties=0.5)),
+        top_k_check("32k all 0", ranked(32768, 1024, docs=True, ties=1e30)),
+        top_k_check("4k x 8 rows", ranked(4096, 4096, b=8)),
+        top_k_check("4k k 100", ranked(4096, 512), k=100),
+        top_k_check("4k k 2047", ranked(4096, 512), k=2047),
+        top_k_check("3000 keys, 7 see none", Ranked(no_key, every)),
+        top_k_check("1000 keys < k", Ranked(no_key[..., :1000], some_keys)),
+    ]
+    agree += [
+        log_softmax_check("4k x 2, 64 heads", 2, 4096, 4096, 64, 2048),
+        log_softmax_check("32k, 1024 queries", 1, 1024, 32768, 64, 2048),
+        log_softmax_check("32 heads, 128 picks", 2, 1024, 1024, 32, 128),
+        log_softmax_check("64 heads, 512 picks", 1, 2048, 2048, 64, 512),
+    ]
+    return agree
+
+
 def main() -> None:
     gpus = jax.device_count()
     agree = [check(n, c, 1) for n, c in CASES.items()]
     if gpus >= 2:
         agree += [check(n, c, 2) for n, c in CASES.items()]
+    agree += indexer_checks()
     for name in ("gqa", "mla", "csa"):
         timings(name, CASES[name])
     sys.exit(0 if all(agree) else 1)

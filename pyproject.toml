@@ -42,6 +42,8 @@ bux-lsp = "bux.lang.lsp.server:main"
 cuda = [
     "jax[cuda13]>=0.12.0; sys_platform == 'linux'",
     "tokamax[cuda]>=0.0.17; sys_platform == 'linux'",
+    # cudnn-frontend's DSA kernels import torch, which their JAX calls never use: CPU's
+    "torch>=2.14.1; sys_platform == 'linux'",
 ]
 lsp = [
     "pygls>=2.1.1",
@@ -53,12 +55,20 @@ spark = [
 
 [tool.uv]
 default-groups = ["dev", "docs"]  # make ci builds the docs too
-# cudnn-frontend's develop build, for Frost's GDN-2 kernel (GLA, Lightning), which 1.31.0
-# lacks.
+# cudnn-frontend's develop build: Frost's GDN-2 kernel (GLA, Lightning) and the DSA
+# indexer's deterministic top-k are not in 1.31.0.
 override-dependencies = [
     "nvidia-cudnn-frontend @ https://github.com/NVIDIA/cudnn-frontend/releases/download/v1.32.0.dev76547535/nvidia_cudnn_frontend-1.32.0.dev76547535-cp314-cp314-manylinux_2_27_x86_64.manylinux_2_28_x86_64.whl ; sys_platform == 'linux' and platform_machine == 'x86_64'",
     "nvidia-cudnn-frontend @ https://github.com/NVIDIA/cudnn-frontend/releases/download/v1.32.0.dev76547535/nvidia_cudnn_frontend-1.32.0.dev76547535-cp314-cp314-manylinux_2_27_aarch64.manylinux_2_28_aarch64.whl ; sys_platform == 'linux' and platform_machine == 'aarch64'",
 ]
+
+[tool.uv.sources]
+torch = [{ index = "pytorch-cpu", marker = "sys_platform == 'linux'" }]
+
+[[tool.uv.index]]
+name = "pytorch-cpu"
+url = "https://download.pytorch.org/whl/cpu"
+explicit = true
 
 [build-system]
 requires = ["uv_build>=0.13.1,<0.14"]

@@ -159,7 +159,9 @@ The activations are constrained so:
 | queries, keys, values, head outputs | `(batch, seq, heads, none)` | each device attends with its own heads |
 | the logits | `(batch, heads, seq, none)` | the keys stay whole: with `seq` over `context`, that is all-gather CP |
 
-The indexer picks its top-k by counting: it finds the k-th highest score bit by bit,
+On a B200 or B300 the indexer picks its top-k by cuDNN's radix kernel
+(`bux.architecture.attention.indexer_cudnn`), in a `shard_map` that gives a device its
+rows and positions. Elsewhere it counts: it finds the k-th highest score bit by bit,
 which splits with the rows and positions. `lax.top_k` sorts instead (6 times slower at
 32k keys on a GPU), and in the global view it gathers every row onto each device. The
 indexer's scores' kernel (`bux.architecture.attention.scoring`) is a `shard_map` that
@@ -205,9 +207,11 @@ Sparse attention (an indexer's top-k, CSA's compressed latents) attends by
 
 The indexer's loss takes the attention's probabilities once, from its logsumexp, a
 chunk of queries at a time (on a GPU by a kernel for heads of up to 128 dims). It
-scores each query's picks by Pallas kernels in a `shard_map` that gives a device its
-rows and queries and every key: a program a query, which stops at its last pick, and a
-backward pass that adds the keys' gradient atomically.
+scores each query's picks in a `shard_map` that gives a device its rows and queries
+and every key: on a B200 or B300 by cuDNN's kernels (`indexer_cudnn`), the softmax of
+the picks' scores forward and GEMMs over blocks of 128 picks backward; on another GPU
+by Pallas kernels, a program a query, which stops at its last pick, and a backward
+pass that adds the keys' gradient atomically.
 
 ### The flash kernels: `bux.parallel.flash`
 
