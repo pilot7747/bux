@@ -1,0 +1,21 @@
+# MiniMax-M2 (MiniMax, 2025): an MoE of 230B parameters, 10B of them active a token,
+# for coding and agentic work, with a context of 196,608 tokens. All 62 layers are full
+# attention, 48 query heads over 8 key and value heads of 128, the queries twice the
+# width. QK-norm normalizes all the query heads together, and all the key heads, before
+# RoPE turns the first half of each head's dims. Every FFN is an MoE of 256 experts,
+# none shared. A token goes to the 8 whose sigmoid scores are best once a bias that
+# balances the experts' loads is added, weighted by their scores over the 8's sum.
+#
+# The config lists three multi-token prediction modules, but the checkpoint has no
+# weights for them and no published code describes them: they are not described here.
+d_model    = 3072
+vocab_size = 200064
+
+norm    = rmsnorm(eps=1e-6)
+attn    = gqa(num_heads=48, num_kv_heads=8, head_dim=128, qk_norm=norm,
+              qk_norm_all_heads=true, rope=rope(base=5000000, fraction=0.5))
+experts = moe(num_experts=256, top_k=8, router=sigmoid, load_balancing=aux_free,
+              aux_loss_coef=1e-3, expert=gated_mlp(intermediate_size=1536, activation=swish))
+
+block = [norm attn] [norm experts]
+model = embed block^62 norm head

@@ -17,7 +17,7 @@ from jaxtyping import Array, Float
 from bux import config as cfg
 from bux import kernels, parallel
 from bux.architecture import Model, Segments, Taps
-from bux.architecture.attention import indexer_cudnn, scoring, sparse
+from bux.architecture.attention import indexer_cudnn, scoring, sparse, sparse_cudnn
 from bux.architecture.attention.gqa import Sparse, build_gqa
 from bux.architecture.attention.indexer import _first, _top
 from bux.lang import compile
@@ -32,9 +32,13 @@ ROWS = Segments.of(POSITIONS)
 TINY = 1 << 9  # sparse.ELEMENTS for chunks of 2 to 8 queries
 
 
-def kept(seed: int, span: sparse.Span, top_k: int, size: int = 1) -> sparse.Kept:
-    """Each query's top_k random slots of its span, or blocks of `size` slots."""
-    scores = jax.random.uniform(jax.random.key(seed), (B, T, T // size))
+def kept(
+    seed: int, span: sparse.Span, top_k: int, size: int = 1, groups: int | None = None
+) -> sparse.Kept:
+    """Each query's top_k random slots of its span, or blocks of `size` slots; for
+    each of `groups` groups apart, if given."""
+    shape = (B, T) if groups is None else (B, T, groups)
+    scores = jax.random.uniform(jax.random.key(seed), (*shape, T // size))
     if size == 1:
         return sparse.Kept(_top(jnp.where(sparse.mask(span, T), scores, -1), top_k))
     block = jnp.broadcast_to(jnp.arange(T) // size, (B, T))
@@ -68,11 +72,12 @@ def case(name: str) -> tuple[list[sparse.Part], bool, float | None]:
         "tokens": kept(3, span, 5),
         "window": kept(3, span, 4),
         "blocks": kept(3, span, 2, size=3),
+        "groups": kept(3, span, 2, size=4, groups=g),  # MiniMax MSA's
     }[name]
     return [sparse.Part(k, v, span, None, chosen)], name == "window", None
 
 
-CASES = ["all", "tokens", "window", "blocks", "csa"]
+CASES = ["all", "tokens", "window", "blocks", "groups", "csa"]
 SCALE = D**-0.5
 
 
@@ -80,8 +85,12 @@ def reference(q, parts, sinks, cap):
     """All t by t logits, as the `xla` method takes them."""
     k, v = (jnp.concatenate(kv, axis=1) for kv in zip(*((p.k, p.v) for p in parts)))
     mask = jnp.concatenate([sparse.visible(p) for p in parts], -1)
+    if mask.ndim == 4:  # each group's, for its query heads
+        mask = jnp.repeat(jnp.moveaxis(mask, 2, 1), H // mask.shape[2], axis=1)
+    else:
+        mask = mask[:, None]
     logits = softcap(scaled_logits(q, k, SCALE), cap)
-    return weighted_values(masked_softmax(logits, mask[:, None], sinks), v)
+    return weighted_values(masked_softmax(logits, mask, sinks), v)
 
 
 def run(f, name: str):
@@ -121,6 +130,19 @@ def test_attention_over_kept_keys_is_all_logits_attention(monkeypatch, name, ele
     close(grads, want_grads)
 
 
+def test_tokamaxs_run_a_group_at_a_time_attends_as_one_run(monkeypatch):
+    """On a GPU, picks for each group run tokamax's kernels a group at a time, so
+    that each mask is a group's; here XLA's runs stand in for the kernels."""
+    monkeypatch.setattr(sparse, "ELEMENTS", TINY)
+    want_grads, want = run(kernel, "groups")
+    monkeypatch.setattr(sparse, "_flash", lambda q: True)
+    monkeypatch.setattr(sparse, "_flash_fwd", sparse._xla_fwd)
+    monkeypatch.setattr(sparse, "_flash_bwd", sparse._xla_bwd)
+    grads, out = run(kernel, "groups")
+    close(out, want)
+    close(grads, want_grads)
+
+
 def test_the_logsumexp_is_the_softmaxs_of_every_part_and_the_sinks(monkeypatch):
     monkeypatch.setattr(sparse, "ELEMENTS", TINY)
     parts, _, cap = case("csa")
@@ -142,7 +164,7 @@ MESHES = {
 
 
 @pytest.mark.parametrize("mesh", MESHES.values(), ids=MESHES.keys())
-@pytest.mark.parametrize("name", ["window", "blocks", "csa"])
+@pytest.mark.parametrize("name", ["window", "blocks", "groups", "csa"])
 def test_split_over_devices_it_attends_as_on_one(monkeypatch, name, mesh):
     """A device has its rows, queries and heads, and every key."""
     monkeypatch.setattr(sparse, "ELEMENTS", TINY)
@@ -172,6 +194,9 @@ LAYERS = {
     " indexer=small)]",
     "qsa": "[norm gqa(num_heads=4, num_kv_heads=2, rope=rope(fraction=0.5),"
     " indexer=small(top_k=4, block_size=2, weighted=false))]",
+    "msa": "[norm gqa(num_heads=4, num_kv_heads=2, rope=rope(fraction=0.5),"
+    " indexer=small(top_k=4, block_size=2, pool=max, per_group=true, relu=false,"
+    " weighted=false))]",
     "mla_ports": "[norm latent(indexer=small, index=@k)] [norm latent(index=$k)]",
     "csa_ports": "[norm window(compress_ratio=2, indexer=small(candidate_block_size=2,"
     " candidate_top_k=2), kv=@kv, candidates=@pool)]"
@@ -357,6 +382,74 @@ def test_the_kernels_unseen_keys_are_the_lowest_floats_and_none_tie():
 def test_cudnns_indexer_kernels_do_not_run_off_a_gpu():
     assert not indexer_cudnn.runs(2048)
     assert not indexer_cudnn.takes(64, 128, 2048, jnp.bfloat16)
+
+
+class Taken(Exception):
+    """A cuDNN DSA kernel was called."""
+
+
+def taken(*_):
+    raise Taken
+
+
+# MiniMax MSA's indexer settings, together and each alone
+MSA_SETTINGS = {
+    "msa": {"block_size": 2, "pool": "max", "per_group": True, "relu": False},
+    "max_blocks": {"block_size": 2, "pool": "max"},
+    "per_group": {"per_group": True, "relu": False},
+    "plain_dots": {"relu": False},
+}
+
+
+def indexed(settings: dict, x: Float[Array, "b t d"]) -> tuple:
+    """A training forward of a sparse GQA layer whose indexer has `settings`: its
+    loss and output, and the loss's gradient."""
+    weighted = not settings.get("per_group", False)
+    indexer = cfg.SparseIndexerConfig(
+        num_heads=2, head_dim=8, top_k=4, weighted=weighted, **settings
+    )
+    c = cfg.GQAConfig(
+        num_heads=H, num_kv_heads=2, rope=cfg.RoPEConfig(), indexer=indexer
+    )
+    attn = build_gqa(c, 32, (), nnx.Rngs(0))
+
+    def loss(attn):
+        taps = Taps(training=True)
+        y = attn(x, taps)
+        return taps.losses[0].value, y
+
+    return nnx.value_and_grad(loss, has_aux=True)(attn)
+
+
+@pytest.mark.parametrize("settings", MSA_SETTINGS.values(), ids=MSA_SETTINGS.keys())
+def test_cudnns_indexer_kernels_decline_msas_settings(monkeypatch, settings):
+    """With cuDNN's top-k and loss kernels said to run, an indexer with any of MSA's
+    settings picks and learns by XLA, as without them: their predicates decline it
+    (`Indexer._by_cudnn`), as they compute DSA's sums of ReLU'd heads. DSA's own
+    indexer goes to them."""
+    x = jax.random.normal(jax.random.key(0), (B, T, 32))
+    want = indexed(settings, x)
+    monkeypatch.setattr(indexer_cudnn, "runs", lambda k: True)
+    monkeypatch.setattr(indexer_cudnn, "takes", lambda *a: True)
+    monkeypatch.setattr(indexer_cudnn, "top_k", taken)
+    monkeypatch.setattr(indexer_cudnn, "log_softmax", taken)
+    close(indexed(settings, x), want)
+    with pytest.raises(Taken):
+        indexed({}, x)
+
+
+def test_cudnns_csa_kernels_decline_picks_for_each_group(monkeypatch):
+    """cuDNN's sparse attention takes latents kept by index for all heads, and not
+    MSA's picks for each group, which only gqa makes."""
+    monkeypatch.setattr(sparse_cudnn, "runs", lambda: True)
+    q = jnp.zeros((1, 8, 64, 512), jnp.bfloat16)
+    latents = jnp.zeros((1, 8, 1, 512), jnp.bfloat16)
+    span = sparse.token_span(Segments.of(jnp.arange(8)[None]), None)
+    index = jnp.zeros((1, 8, 4), jnp.int32)
+    one = sparse.Part(latents, latents, span, None, sparse.Kept(index))
+    each = one._replace(kept=sparse.Kept(index[:, :, None]))
+    assert sparse_cudnn.takes(q, [one], [None], None)
+    assert not sparse_cudnn.takes(q, [each], [None], None)
 
 
 def test_the_kept_ones_go_first():

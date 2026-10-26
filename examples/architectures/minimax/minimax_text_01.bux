@@ -1,0 +1,27 @@
+# MiniMax-Text-01 (MiniMax, 2025): 456B parameters, 45.9B of them active a token,
+# trained on contexts of 1M tokens. Seven lightning attention layers, linear attention
+# with a fixed decay per head, run for every softmax attention layer, 80 layers in all,
+# and every layer's FFN is an MoE of 32 experts, the top 2 a token by a softmax router,
+# none shared. The lightning layers' decays weaken with depth, counted over all 80
+# layers. RoPE turns the first half of each head's dims, as MiniMax's own code does
+# (transformers' port turns all of them).
+#
+# The residual is DeepNorm's, after the norms: each sublayer f normalizes the stream to
+# h and gives alpha * h + f(h), with alpha = (2 * 80) ** (1/4). MiniMax-VL-01 is this
+# model with a vision encoder, which is not described here.
+d_model    = 6144
+vocab_size = 200064
+alpha      = 3.5565588200778455
+
+norm      = rmsnorm(eps=1e-5)
+lightning = lightning(num_heads=64, head_dim=128)
+attn      = gqa(num_heads=64, num_kv_heads=8, head_dim=128,
+                rope=rope(base=10000000, fraction=0.5))
+experts   = moe(num_experts=32, top_k=2, aux_loss_coef=1e-3,
+                expert=gated_mlp(intermediate_size=9216, activation=swish))
+
+layer(mixer) = norm (_ * alpha + mixer) norm (_ * alpha + experts)
+L = layer(lightning)
+A = layer(attn)
+
+model = embed "LLLLLLLA"^10 norm head

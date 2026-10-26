@@ -243,7 +243,8 @@ class Attention(SoftmaxAttention):
     The query heads share the key and value heads in groups: MHA when
     ``num_kv_heads == num_heads``, MQA when it is 1. The layer projects the input to
     q, k and v (one matrix each, or one fused under ``fused_qkv``), adds a causal conv
-    to k and v under ``kv_conv_size`` (Inkling), applies QK-norm and then RoPE, scales
+    to k and v under ``kv_conv_size`` (Inkling), applies QK-norm (of each head, or of
+    all heads together under ``qk_norm_all_heads``: MiniMax-M2) and then RoPE, scales
     the queries by their position under ``power_scale`` (Beam), and attends by the
     run's ``methods.attention`` (`bux.parallel.context`). The heads' outputs then go
     through `SoftmaxAttention`'s norm, gate, output projection and dropout.
@@ -326,9 +327,12 @@ class Attention(SoftmaxAttention):
         self.v_conv = conv(g * dv, size) if size else None
         super().__init__(config, width, h, g, dk, dv, config.bias, ports, rngs)
 
-        qk_norm = config.qk_norm
-        self.q_norm = Norm(qk_norm, dk) if qk_norm else None
-        self.k_norm = Norm(qk_norm, dk) if qk_norm and projects_kv else None
+        qk_norm, whole = config.qk_norm, config.qk_norm_all_heads
+        self.qk_norm_all_heads = whole
+        self.q_norm = Norm(qk_norm, h * dk if whole else dk) if qk_norm else None
+        self.k_norm = (
+            Norm(qk_norm, g * dk if whole else dk) if qk_norm and projects_kv else None
+        )
         self.rope = config.rope
         self.power_scale = config.power_scale
         self.power_scale_length = config.power_scale_length
@@ -393,11 +397,10 @@ class Attention(SoftmaxAttention):
     def _queries(
         self, q: Float[Array, "b t _"], pos: Int[Array, "b t"] | None
     ) -> Float[Array, "b t h dk"]:
-        """Reshape the projected queries into heads, then apply QK-norm, RoPE and the
-        power scale."""
-        b, t, _ = q.shape
-        q = q.reshape(b, t, self.heads, self.head_dim)
-        q = norm_and_rotate(q, self.q_norm, self.rope, pos, "heads")
+        """Split the projected queries into heads with QK-norm and RoPE
+        (`_split_normed`), then apply the power scale."""
+        t = q.shape[1]
+        q = self._split_normed(q, self.heads, self.q_norm, pos, "heads")
         if self.power_scale is not None:
             at = jnp.arange(t) if pos is None else pos
             scale = _power_scale(at, self.power_scale, self.power_scale_length)
@@ -411,15 +414,33 @@ class Attention(SoftmaxAttention):
         pos: Int[Array, "b s"] | None,
         taps: Taps,
     ) -> tuple[Float[Array, "b s g dk"], Float[Array, "b s g dv"]]:
-        """Add the causal conv to the projected keys and values, reshape them into
-        heads, then apply QK-norm and RoPE to the keys."""
+        """Add the causal conv to the projected keys and values, and split them into
+        heads, the keys with QK-norm and RoPE (`_split_normed`)."""
         b, s, _ = k.shape
         if self.k_conv is not None and self.v_conv is not None:
             k, v = k + self.k_conv(k, taps), v + self.v_conv(v, taps)
-        k = k.reshape(b, s, self.kv_heads, self.head_dim)
+        k = self._split_normed(k, self.kv_heads, self.k_norm, pos, "kv_heads")
         v = v.reshape(b, s, self.kv_heads, self.v_head_dim)
-        k = norm_and_rotate(k, self.k_norm, self.rope, pos, "kv_heads")
         return shard_heads(k, "kv_heads"), shard_heads(v, "kv_heads")
+
+    def _split_normed(
+        self,
+        x: Float[Array, "b t _"],
+        heads: int,
+        norm: Norm | None,
+        pos: Int[Array, "b t"] | None,
+        name: parallel.Name,
+    ) -> Float[Array, "b t n dk"]:
+        """Split projected queries or keys into `heads` heads, then apply `norm` and
+        RoPE (`norm_and_rotate`). Under ``qk_norm_all_heads`` the norm is of all the
+        heads together, before the split: under tensor parallelism its mean square
+        sums over the devices' heads, and the fused kernel, which normalizes each
+        head, does not take it."""
+        b, t, _ = x.shape
+        if self.qk_norm_all_heads and norm is not None:
+            x, norm = norm(x), None
+        x = x.reshape(b, t, heads, self.head_dim)
+        return norm_and_rotate(x, norm, self.rope, pos, name)
 
     def _mix_values(
         self, v: Float[Array, "b s g dv"], v1: Float[Array, "b s g dv"]
@@ -555,13 +576,14 @@ class FullLogits(SoftmaxAttention):
         q: Float[Array, "b t h dk"],
         k: Float[Array, "b s g dk"],
         docs: Segments | None,
-        mask: Bool[Array, "*b t s"] | None = None,
+        mask: Bool[Array, "*b #h t s"] | None = None,
     ) -> Float[Array, "b h t s"]:
-        """Return the softmax over the keys `mask` keeps, the layer's own if none."""
+        """Return the softmax over the keys `mask` keeps of each head, the layer's
+        own if none."""
         if mask is None:
-            mask = self._mask(docs, x.shape[1])
+            mask = self._mask(docs, x.shape[1])[..., None, :, :]
         logits = self._logits(x, q, k, docs)
-        return masked_softmax(logits, mask[..., None, :, :], self._sinks())
+        return masked_softmax(logits, mask, self._sinks())
 
     def _values(
         self, probs: Float[Array, "b h t s"], v: Float[Array, "b s g dv"]
@@ -615,7 +637,8 @@ def indexer_config(
     Raises:
         ValueError: a ``candidates`` port, or an ``index`` port it writes, without an
             indexer that the layer runs.
-        NotImplementedError: candidate pools of an indexer with ``block_size > 1``.
+        NotImplementedError: candidate pools of an indexer with ``block_size > 1``;
+            max-pooled blocks of CSA's compressed latents.
     """
     indexer = None if reads(ports, "index") else config.indexer
     needs = [
@@ -628,9 +651,33 @@ def indexer_config(
             f"{config.type}: the '{needs[0]}' port needs an indexer that the layer "
             "runs: give it indexer=indexer(...), and do not read index"
         )
-    if indexer is not None and indexer.block_size > 1 and "candidates" in needs:
+    if indexer is None or indexer.block_size == 1:
+        return indexer
+    if "candidates" in needs:
         raise NotImplementedError("candidate pools of an indexer with block_size > 1")
+    if indexer.pool == "max" and config.type == "csa":
+        raise NotImplementedError(
+            "csa: max-pooled blocks (indexer(pool=max)) of compressed latents"
+        )
     return indexer
+
+
+def _per_head(seen: Bool[Array, "b t *g s"], heads: int) -> Bool[Array, "b _ t s"]:
+    """Return which keys each query sees, for all heads or for each of the `heads`,
+    each its group's."""
+    if seen.ndim == 3:
+        return seen[:, None]
+    return jnp.repeat(jnp.moveaxis(seen, 2, 1), heads // seen.shape[2], axis=1)
+
+
+def _summed(
+    probs: Float[Array, "b h t s"], groups: int | None
+) -> Float[Array, "b t *g s"]:
+    """Return the heads' probabilities summed, or summed in each of `groups` groups."""
+    if groups is None:
+        return probs.sum(1)
+    b, h, t, s = probs.shape
+    return jnp.moveaxis(probs.reshape(b, groups, h // groups, t, s).sum(2), 1, 2)
 
 
 def documents_or_rows(docs: Segments | None, b: int, t: int) -> Segments:
@@ -700,12 +747,14 @@ class Sparse(FullLogits):
         softcap."""
         return sparse.attend(q, parts, sinks, self.scale, self.softcap)
 
-    def _target(self, part: sparse.Part, xs: tuple) -> Float[Array, "b c s"]:
+    def _target(self, part: sparse.Part, xs: tuple) -> Float[Array, "b c *g s"]:
         """Return a chunk of queries' attention to the keys of `part`, given their
-        queries, logsumexp and `sparse.rows`."""
+        queries, logsumexp and `sparse.rows`: for each group if it keeps keys for
+        each."""
         q, lse, span, index = jax.lax.stop_gradient(xs)
         part = sparse.at(part, span, index)
-        return sparse.probabilities(q, part, lse, self.scale, self.softcap)
+        groups = sparse.per_group(part)
+        return sparse.probabilities(q, part, lse, self.scale, self.softcap, groups)
 
     def _attend_logits(
         self,
@@ -722,11 +771,12 @@ class Sparse(FullLogits):
         require_xla(feature)
         k, v = (jnp.concatenate(kv, axis=1) for kv in zip(*((p.k, p.v) for p in parts)))
         mask = jnp.concatenate([sparse.visible(p) for p in parts], -1)
-        probs = self._probabilities(x, q, k, docs, mask)
+        probs = self._probabilities(x, q, k, docs, _per_head(mask, self.heads))
         if self._trains(scored, taps):
             assert scored is not None
             n = parts[-1].k.shape[1]
-            attention = probs[..., -n:].astype(jnp.float32).sum(1)
+            groups = mask.shape[2] if mask.ndim == 4 else None
+            attention = _summed(probs[..., -n:].astype(jnp.float32), groups)
             self._train_indexer(scored, lambda a: a, attention, n, taps)
         return self._values(probs, v)
 
@@ -760,6 +810,7 @@ class Sparse(FullLogits):
         scored = None
         if reads(self.ports, "index"):
             kept = read(taps, self.ports, "index")
+            self._check_groups(kept)
         elif self.indexer is not None:
             if keys is None:
                 raise ValueError(
@@ -777,6 +828,15 @@ class Sparse(FullLogits):
             return None, None
         write(taps, self.ports, "index", kept)
         return kept, scored
+
+    def _check_groups(self, kept: sparse.Kept) -> None:
+        """Raise unless an index read for each group has one for each kv head."""
+        groups = kept.index.shape[2] if kept.index.ndim == 4 else None
+        if groups not in (None, self.kv_heads):
+            raise ValueError(
+                f"{self.kv_heads} kv heads cannot read an index of picks for each of "
+                f"{groups} groups (indexer(per_group=true)): give them as many"
+            )
 
     def _select_tokens(
         self,

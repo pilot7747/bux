@@ -81,7 +81,8 @@ def takes(
     """Return whether the kernels take parts whose keys are their values, CSA's
     latents: queries they take (`_takes_queries`), 2^16 of them at most on a device, a
     latent of 512 dims a slot of the queries' dtype, and the slots of each part
-    bounded: a window of them, or the ones a query keeps by index (not by block).
+    bounded: a window of them, or the ones a query keeps by index (not by block, nor
+    for each group).
 
     Args:
         q: the queries: b rows of t, h heads of d dims.
@@ -105,10 +106,11 @@ def _takes_queries(q: Float[Array, "b t h d"], cap: float | None) -> bool:
 
 def _bounded(part: sparse.Part, window: int | None) -> bool:
     """Return whether a query sees a bounded number of `part`'s slots: those it keeps
-    by index, or those of its `window`."""
+    by index for all its heads (not by block, nor for each group, as MSA's), or those
+    of its `window`."""
     if part.kept is None:
         return window is not None
-    return part.kept.block is None
+    return part.kept.block is None and not sparse.per_group(part)
 
 
 def _queries(q: Float[Array, "b t h d"]) -> int:

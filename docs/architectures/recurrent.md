@@ -193,6 +193,14 @@ plainly. One RMSNorm covers all the heads together before the gate, which is a
 mixer = lightning(num_heads=4, head_dim=64)
 ```
 
+MiniMax-Text-01 runs seven for every softmax attention layer, 80 layers in all, so
+its decays weaken over all 80 (`examples/architectures/minimax/minimax_text_01.bux`):
+
+```bux
+lightning = lightning(num_heads=64, head_dim=128)
+model = embed "LLLLLLLA"^10 norm head
+```
+
 ### `rwkv7`: RWKV-7 "Goose"
 
 RWKV-7 time mixing (Peng et al., 2025), as the RWKV-LM reference has it. Its state
