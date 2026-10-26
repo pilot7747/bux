@@ -298,26 +298,37 @@ counts the other's rows as 0. Which rows share a block, and so dW, depend on how
 mesh splits the tokens. In float32, 3 steps on `fsdp=2, expert=4` lose within 1e-4 of
 one device's (`tests/test_precision.py`), not the same.
 
-## SwiGLU fused, by cuDNN
+## Activations fused, by cuDNN
 
 On a Blackwell GPU with cudnn-frontend (the `cuda` extra), cuDNN's CuTe DSL kernels
 run the routed experts, through `cudnn.jax.call` on XLA's stream (`grouped_glu`, over
 `grouped_cudnn`), where all of these hold:
 
-- the experts are a SwiGLU FFN: `gated_mlp` of `swish`, with no `limit`,
-  `up_softcap`, `up_offset`, `bias` or `expert_norm`;
+- their activation is one of cuDNN's epilogues (`grouped_glu.epilogue`):
+
+  | The experts | cuDNN's epilogue |
+  |---|---|
+  | `mlp` of `relu2` (Nemotron 3) | SReLU, relu(u)^2 |
+  | `gated_mlp` of `swish` (Qwen3, DeepSeek-V3) | SwiGLU |
+  | `gated_mlp` of `swish` or `quick_gelu` with a `limit` or an `up_offset` (DeepSeek-V4, gpt-oss) | GeGLU, the gate times 1 or 1.702 in its sigmoid, clamped and offset as `limit` and `up_offset` say |
+  | `gated_mlp` of `situ` with an `up_softcap` (Kimi K3) | SiTU-GLU |
+
+- they have no `bias` or `expert_norm`;
 - they multiply in `mxfp8`, every pass in it;
-- their widths are whole tiles of 256: Qwen3-30B-A3B's 2048 and 768, but not the
-  baseline's 704.
+- their width is whole blocks of 64 (Nemotron 3 Nano's 2688, gpt-oss's 2880), and
+  their hidden units of 32.
+
+Hidden units that are not whole tiles of 128 run padded by units of 0, whose
+activation is 0 and whose gradients the padding drops: Nano's 1856 run as 1920.
 
 They fuse what bux's kernels left to XLA:
 
 | GEMM | Kernel | In its epilogue |
 |---|---|---|
-| x W, up and gate | `swiglu` | SwiGLU, times each row's weight, quantized along h's rows for down and down its columns for down's dW; the product kept for the backward |
+| x W, up (and gate) | `activated`: cuDNN's SReLU or GLU kernel | the activation, times each row's weight, quantized along h's rows for down and down its columns for down's dW; the product kept for the backward |
 | h W, down | `rows` | |
-| dy W^T, down | `dswiglu` | SwiGLU's gradient at the kept product, times the row's weight, quantized both ways; the weight's gradient |
-| dp W^T, up and gate | `rows` | |
+| dy W^T, down | `activation_grad`: cuDNN's dSReLU, dSwiGLU or dGLU kernel | the activation's gradient at the kept product, times the row's weight, quantized both ways; the weight's gradient |
+| dp W^T, up (and gate) | `rows` | |
 | dW, both | `contract`, cuDNN's block-scaled wgrad | |
 
 ### How the fused kernels take their rows
@@ -339,7 +350,8 @@ They fuse what bux's kernels left to XLA:
   bfloat16 copy of all 128 experts.
 
 At Megatron's batch they train Qwen3-30B-A3B's `sorted` arm 4.5% faster in 15 GiB
-less ([The fused SwiGLU](#the-fused-swiglu)).
+less ([The fused SwiGLU](#the-fused-swiglu)), and Nemotron 3 Nano's 5.1% faster in
+14 GiB less ([The fused activations](#the-fused-activations)).
 
 ## Expert parallelism
 
@@ -741,7 +753,7 @@ At what one GPU of `megatron.bux`'s `sorted` arm quantizes a layer (128 experts 
   gather's 25 ms went, but the FSDP collectives the step overlapped came out from
   under it.
 - Each GPU quantized all 128 experts' W, 23 ms of a step. Under the fused kernels
-  ([SwiGLU fused, by cuDNN](#swiglu-fused-by-cudnn)), each quantizes its own shard before FSDP gathers
+  ([Activations fused, by cuDNN](#activations-fused-by-cudnn)), each quantizes its own shard before FSDP gathers
   it.
 
 ### The fused SwiGLU
@@ -788,6 +800,68 @@ One layer of Qwen3-30B-A3B's experts (128 of 768, 262144 picks; by EP 16 of them
   kernels' shapes, one B300 a run) end within 0.08% of bux's kernels at each of three
   seeds, which differ by 1.6%: eval loss 4.0708, 4.0127 and 4.0346 against 4.0742,
   4.0099 and 4.0363, at 104k tokens a second against 100k.
+
+### The fused activations
+
+#### One layer at each model's experts on a B300
+
+One MoE layer's experts, forward and backward on a B300, by CUPTI (October 2026,
+cudnn-frontend 1.31.0): `sorted` with all the experts and a microbatch's picks, their
+kernels quantized in the layer; by EP with one GPU's experts of 8, at a capacity of
+1.25:
+
+| The experts | `sorted`: bux's kernels | fused | by EP: bux's kernels | fused |
+|---|---|---|---|---|
+| Nemotron 3 Nano: relu2, 2688 x 1856 (run as 1920); 128, 196608 picks; by EP 16 | 9.27 ms | 7.57 (1.22x) | 7.57 | 6.61 (1.15x) |
+| Nemotron 3 Super: relu2, 1024 x 2688; 512, 180224 picks; by EP 64 | 9.79 | 8.08 (1.21x) | 5.52 | 4.20 (1.31x) |
+| gpt-oss without its biases: GeGLU, 2880 x 2880 (as 2944); 128, 65536 picks; by EP 16 | 10.97 | 10.56 (1.04x) | 6.38 | 5.55 (1.15x) |
+| DeepSeek-V4-Flash: clamped SwiGLU, 5120 x 2304; 384, 98304 picks; by EP 48 | 38.47 | 35.71 (1.08x) | 13.50 | 12.38 (1.09x) |
+| Qwen3-30B-A3B: SwiGLU, 2048 x 768; 128, 262144 picks; by EP 16 | 6.36 | 5.55 (1.15x) | 5.90 | 5.01 (1.18x) |
+
+- The values are within MXFP8's rounding of bux's kernels': 0.7-2.2% apart in the
+  output and every gradient (relative Frobenius norm), and as near bfloat16's as
+  theirs (the output 5.8% from it at Nano's against 5.8%, 6.1% at gpt-oss's against
+  6.1%). Clamped, the kernels pass the gradient of a product exactly at the limit
+  whole, where bux's `jnp.clip` splits it.
+- The kernels take an N that is not whole tiles: hidden units of 1920 and outputs of
+  2688 and 2880 on tiles of 256. Tiles of 256 by 128 are slower at every one of
+  these shapes (Nano by EP 6.87 ms against 6.72, DeepSeek-V4-Flash `sorted` 43.5
+  against 35.1).
+- Where the hidden units are not whole tiles of 128, the quantizer pads the
+  weights' and the wgrads write the real units alone. Padding the kernels and
+  slicing their gradients by XLA instead took 1.6 ms of Nano's `sorted` layer, and
+  3.8 ms of gpt-oss's, which then ran slower than bux's kernels.
+- At gpt-oss's and DeepSeek-V4-Flash's few picks an expert, quantizing every
+  expert's kernels takes much of a `sorted` layer; under FSDP each GPU quantizes its
+  shard.
+
+#### Nemotron 3 on a node of B300s
+
+The tree before and after on the same node, each suite's 12 steps:
+
+- `megatron_nano.bux`'s `sorted` arm whole: all 52 layers, Megatron's batch of 512
+  rows of 8192 in 16 microbatches, `methods(gather=layer, remat=dots)` (what
+  `remat=auto` takes). Its `nccl_ep` arm runs out of memory either way.
+- `megatron_super.bux`'s `mxfp8` arm shortened to a node: 26 of its 88 layers
+  (`"MEMEMEMA" "EMEMEMEMA" "EMEMEMEME"`, 12 MoE layers, and its MTP module twice),
+  its 512 experts split over the 8 GPUs by NCCL EP (`mesh(fsdp=1, expert=8)`), a row
+  of 8192 a GPU in each of 8 microbatches as Megatron's are, `remat=none`.
+
+| Run | bux's kernels | fused |
+|---|---|---|
+| Nemotron 3 Nano, `sorted` | 32.2k tok/s a GPU, 192.6 GiB | 33.8k (+5.1%), 178.4 GiB |
+| Nemotron 3 Super, shortened, NCCL EP | 24.0k tok/s a GPU, 184.1 GiB | 24.9k (+3.9%), 186.1 GiB |
+
+Their losses agree to four digits at each logged step (11.8178 against 11.8176 at
+Nano's twelfth, 11.8454 against 11.8452 at Super's).
+
+#### Quality
+
+3000 steps of FineWeb-Edu on the baseline's MoE with ReLU^2 experts of 704 (run as
+768), one B300 a run, autotuning pinned and XLA's deterministic ops on, end within
+0.11% of bux's kernels at each of three seeds, which differ by 1.6%: eval loss
+4.1213, 4.0605 and 4.0708 against 4.1205, 4.0562 and 4.0700. With gpt-oss's GeGLU
+(clamped at 7, up offset by 1, unbiased) at one seed: 4.0802 against 4.0772.
 
 ### The EP methods
 

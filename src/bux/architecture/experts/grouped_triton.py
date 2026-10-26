@@ -3,8 +3,9 @@ in MXFP8, E4M3 values with a power-of-two scale per 32, in one pass over x, stra
 into the layout that `~bux.architecture.experts.grouped_mxfp8`'s kernels load
 (`~bux.architecture.experts.grouped_mxfp8.Tiled`).
 
-Each copy is padded by 0 to whole tiles of 128 along what it is in blocks along, and
-each tile's scales lie in their bytes of tensor memory's 512-byte tiles. x is a
+Each copy is padded by 0 to whole tiles of 128 along what it is in blocks along (and,
+given `padded`, x to more rows and columns), and each tile's scales lie in their bytes
+of tensor memory's 512-byte tiles. x is a
 matrix, or a stack of them, (g, r, c), as each expert's W is; its rows from `filled`
 on quantize as 0. Given an index, the rows are ``x[index]``, each read from x where it
 lies: an MoE's picks, from its tokens; a row at -1 is 0. Given `halves`, x's columns
@@ -46,6 +47,7 @@ def quantized_twice(
     columns: bool = True,
     index: Int[Array, " m"] | None = None,
     halves: bool = False,
+    padded: tuple[int, int] | None = None,
 ) -> tuple[Tiled, Tiled | None]:
     """Return x and x^T in MXFP8, each in blocks along its rows, as
     `bux.architecture.precision.blockscaled.mx_twice` quantizes them.
@@ -58,6 +60,8 @@ def quantized_twice(
             0 where the index is -1; None for x itself.
         halves: whether x's pairs of columns go in as a GLU's halves
             (`~bux.architecture.experts.grouped_cudnn.halves_of`).
+        padded: the rows and columns of x as the copies take it, padded by 0, if
+            more than its own; None for its own.
 
     Returns:
         x and, if `columns`, x^T (else None), laid out as
@@ -66,10 +70,14 @@ def quantized_twice(
     """
     stack = x if x.ndim == 3 else x[None]
     g, r, c = stack.shape if index is None else (1, *index.shape, x.shape[-1])
-    rt, ct = -(-r // LANES), -(-c // LANES)
-    shapes = [((g, r, ct * LANES), jnp.uint8), ((g, rt, ct, 32, 16), jnp.uint8)]
+    height, width = (r, c) if padded is None else padded
+    rt, ct = -(-height // LANES), -(-width // LANES)
+    shapes = [((g, height, ct * LANES), jnp.uint8), ((g, rt, ct, 32, 16), jnp.uint8)]
     if columns:
-        shapes += [((g, c, rt * LANES), jnp.uint8), ((g, ct, rt, 32, 16), jnp.uint8)]
+        shapes += [
+            ((g, width, rt * LANES), jnp.uint8),
+            ((g, ct, rt, 32, 16), jnp.uint8),
+        ]
     values, scales, *transposed = jax_triton.triton_call(
         stack,
         jnp.zeros(1, jnp.int32) if index is None else index.astype(jnp.int32),
@@ -82,6 +90,8 @@ def quantized_twice(
         num_stages=1,
         r=r,
         c=c,
+        height=height,
+        width=width,
         tile_r=TILE_ROWS,
         gathered=index is not None,
         halves=halves,
@@ -143,15 +153,17 @@ def _quantize_kernel(
     t_scales: tl.tensor,
     r: tl.constexpr,
     c: tl.constexpr,
+    height: tl.constexpr,
+    width: tl.constexpr,
     tile_r: tl.constexpr,
     gathered: tl.constexpr,
     halves: tl.constexpr,
 ) -> None:
-    """A tile of x in E4M3 in blocks of 32 along its rows, and of x^T along its
-    columns, x's rows from `rows` on as 0."""
+    """A tile of x, padded by 0 to (height, width), in E4M3 in blocks of 32 along its
+    rows, and of x^T along its columns, x's rows from `rows` on as 0."""
     tile, rs, cs = _tile_of(x, index, rows, r, c, tile_r, gathered, halves)
-    _store_along_rows(tile, values, scales, rs, cs, r, c, tile_r)
-    _store_along_columns(tile, t_values, t_scales, rs, cs, r, c, tile_r)
+    _store_along_rows(tile, values, scales, rs, cs, height, width, tile_r)
+    _store_along_columns(tile, t_values, t_scales, rs, cs, height, width, tile_r)
 
 
 @triton.jit
@@ -164,14 +176,16 @@ def _quantize_rows_kernel(
     scales: tl.tensor,
     r: tl.constexpr,
     c: tl.constexpr,
+    height: tl.constexpr,
+    width: tl.constexpr,
     tile_r: tl.constexpr,
     gathered: tl.constexpr,
     halves: tl.constexpr,
 ) -> None:
-    """A tile of x in E4M3 in blocks of 32 along its rows, x's rows from `rows` on as
-    0."""
+    """A tile of x, padded by 0 to (height, width), in E4M3 in blocks of 32 along its
+    rows, x's rows from `rows` on as 0."""
     tile, rs, cs = _tile_of(x, index, rows, r, c, tile_r, gathered, halves)
-    _store_along_rows(tile, values, scales, rs, cs, r, c, tile_r)
+    _store_along_rows(tile, values, scales, rs, cs, height, width, tile_r)
 
 
 @triton.jit

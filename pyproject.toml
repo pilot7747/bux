@@ -45,6 +45,12 @@ bux-lsp = "bux.lang.lsp.server:main"
 cuda = [
     "jax[cuda13]>=0.12.0; sys_platform == 'linux'",
     "tokamax[cuda]>=0.0.17; sys_platform == 'linux'",
+    # FlashAttention-4's CuTe DSL kernels (bux.parallel.fa4), which bux calls through
+    # cutlass.jax
+    "flash-attn-4>=4.0.0b36; sys_platform == 'linux'",
+    # FlashAttention-4's and cudnn-frontend's DSA modules import torch, which their JAX
+    # calls never use: its CPU build, beside jax's CUDA
+    "torch>=2.14.1; sys_platform == 'linux'",
 ]
 lsp = [
     "pygls>=2.1.1",
@@ -62,6 +68,20 @@ tensorboard = [
 
 [tool.uv]
 default-groups = ["dev", "docs"]  # make ci builds the docs too
+# cudnn-frontend's develop build: Frost's GDN-2 kernel (GLA, Lightning) and the DSA
+# indexer's deterministic top-k are not in 1.31.0.
+override-dependencies = [
+    "nvidia-cudnn-frontend @ https://github.com/NVIDIA/cudnn-frontend/releases/download/v1.32.0.dev76547535/nvidia_cudnn_frontend-1.32.0.dev76547535-cp314-cp314-manylinux_2_27_x86_64.manylinux_2_28_x86_64.whl ; sys_platform == 'linux' and platform_machine == 'x86_64'",
+    "nvidia-cudnn-frontend @ https://github.com/NVIDIA/cudnn-frontend/releases/download/v1.32.0.dev76547535/nvidia_cudnn_frontend-1.32.0.dev76547535-cp314-cp314-manylinux_2_27_aarch64.manylinux_2_28_aarch64.whl ; sys_platform == 'linux' and platform_machine == 'aarch64'",
+]
+
+[tool.uv.sources]
+torch = [{ index = "pytorch-cpu", marker = "sys_platform == 'linux'" }]
+
+[[tool.uv.index]]
+name = "pytorch-cpu"
+url = "https://download.pytorch.org/whl/cpu"
+explicit = true
 
 [build-system]
 requires = ["uv_build>=0.13.1,<0.14"]
@@ -97,4 +117,4 @@ error-on-warning = true
 extra-paths = ["docs/_ext"]  # the docs' Sphinx extension
 
 [tool.ty.analysis]
-allowed-unresolved-imports = ["pyspark.**", "tokamax.**", "cudnn.**", "cutlass.**", "triton.**", "jax_triton.**", "transformer_engine.**"]  # the `spark` and `cuda` extras, and the image's TE
+allowed-unresolved-imports = ["pyspark.**", "tokamax.**", "cudnn.**", "cutlass.**", "triton.**", "jax_triton.**", "flash_attn.**", "transformer_engine.**"]  # the `spark` and `cuda` extras, and the image's TE

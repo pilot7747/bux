@@ -14,6 +14,10 @@ it runs a gate bounded at -5 or above (`gate_lower_bound`, Kimi K3; `FLOOR`). Wi
 steps of bux's start, KDA's unbounded gates are that steep in 30 to 90% of the (row,
 head) pairs of most layers: those run by bux's own kernels (``pallas_delta``).
 
+Decayed linear attention, with no delta rule (GLA, Lightning), runs by Frost's GDN-2
+kernel (`linear`), whose ``S_t = (I - k (beta k)^T) Diag(e^g) S + k (w v)^T`` it is
+at beta 0 and w 1: in a fifth of ``chunkwise``'s time for GLA.
+
 The kernels run on one SM100 or SM103 GPU at a time, on token-packed rows and their
 documents' bounds (cu_seqlens); on a mesh, a `shard_map` gives them each device's rows
 and heads. They take heads of 64 or 128, and every position of a row: not
@@ -245,7 +249,7 @@ _ONE_AT_A_TIME = threading.Lock()
 # Each graph's inputs, and its outputs with the input whose dtype each takes, in the
 # order `_graph_call` passes their buffers.
 INPUTS = ("q", "k", "v", "g", "beta", "cu_seqlens")
-NODES = {
+NODES: dict[str, tuple[tuple[str, ...], dict[str, str]]] = {
     "gdn": (INPUTS, {"O": "v"}),
     "gdn_bwd": (
         (*INPUTS, "dO"),
@@ -295,3 +299,155 @@ def _handle(device: int, stream: int) -> Any:
     handle = _handles(device)
     cudnn.set_stream(handle=handle, stream=stream)
     return handle
+
+
+# --- Decayed linear attention: Frost's GDN-2 kernel at beta 0 and w 1 ----------------
+
+Decayed = Callable[..., Float[Array, "b t h dv"]]  # linear_attention's decayed
+# GDN-2's graphs, in `_graph_call`'s order. beta, the step of its delta rule, is 0 here,
+# and w, which scales the values it writes, 1.
+LINEAR_INPUTS = ("q", "k", "v", "g", "beta", "w", "cu_seqlens")
+NODES |= {
+    "gdn2": (LINEAR_INPUTS, {"O": "v"}),
+    "gdn2_bwd": (
+        (*LINEAR_INPUTS, "dO"),
+        {"dQ": "q", "dK": "k", "dV": "v", "dG": "g", "dBeta": "beta", "dW": "w"},
+    ),
+}
+
+
+def linear_runs(dk: int, dv: int, dtype: Any) -> bool:
+    """Return whether GDN-2's kernel runs decayed linear attention of these head dims,
+    its q, k and v of `dtype`, by the run's methods, here: bfloat16 only. Where a tile
+    of 16 positions decays a channel past exp(-83), the kernel runs all again by an
+    exact path, many times slower; in float16, past exp(-9.7)."""
+    on = parallel.active()
+    method = on.methods.recurrence if on else "scan"
+    shapes = dk in DIMS and dv in DIMS and dtype == jnp.bfloat16
+    here = kernels.gpu() and _sm()
+    return _has_gdn2() and method == "scan" and shapes and here
+
+
+def _has_gdn2() -> bool:
+    """Return whether the cudnn-frontend installed builds GDN-2's graphs: its develop
+    builds do."""
+    return frost is not None and hasattr(cudnn.pygraph, "gdn2")
+
+
+def linear(
+    q: Float[Array, "b t h dk"],
+    k: Float[Array, "b t h dk"],
+    v: Float[Array, "b t h dv"],
+    log_decay: Float[Array, "b t h #dk"],
+    docs: Segments | None,
+    otherwise: Decayed,
+) -> Float[Array, "b t h dv"]:
+    """Run `linear_attention.decayed` by GDN-2's kernel, in v's dtype.
+
+    Call it where `linear_runs` says the kernel takes the layer. Rows with more
+    documents than the kernel's cu_seqlens holds, and positions split over devices,
+    run by `otherwise` instead."""
+    docs = docs or Segments.of(jnp.broadcast_to(jnp.arange(q.shape[1]), q.shape[:2]))
+    xs = (q, k, v, log_decay, *docs)
+    rule = functools.partial(_linear_rows, otherwise)
+    if parallel.active() is None:
+        return rule(*xs)
+    rows = parallel.spec(("batch", "seq", "heads", None), q.shape)
+    if rows[1] is not None:  # positions split over devices, which XLA gathers
+        return otherwise(q, k, v, log_decay, docs)
+    specs = (rows,) * 4 + (P(*rows[:2]),) * 3
+    return kernels.per_device(rule, specs, rows)(*xs)
+
+
+def _linear_rows(
+    otherwise: Decayed,
+    q: Float[Array, "b t h dk"],
+    k: Float[Array, "b t h dk"],
+    v: Float[Array, "b t h dv"],
+    g: Float[Array, "b t h #dk"],
+    positions: Int[Array, "b t"],
+    ids: Int[Array, "b t"],
+    within: Int[Array, "b t"],
+) -> Float[Array, "b t h dv"]:
+    """Run one device's rows by GDN-2's kernel if cu_seqlens holds their documents."""
+    b, t = within.shape
+    room = b * max(1, t * DOCS // 4096)
+    docs = Segments(positions, ids, within)
+    kernel = functools.partial(_linear_kernel, room)
+
+    def fallback(
+        q: Float[Array, "b t h dk"],
+        k: Float[Array, "b t h dk"],
+        v: Float[Array, "b t h dv"],
+        g: Float[Array, "b t h #dk"],
+        within: Int[Array, "b t"],
+    ) -> Float[Array, "b t h dv"]:
+        return otherwise(q, k, v, g, docs).astype(v.dtype)
+
+    fits = jnp.sum(within == 0) <= room
+    return jax.lax.cond(fits, kernel, fallback, q, k, v, g, within)
+
+
+@functools.partial(jax.custom_vjp, nondiff_argnums=(0,))
+def _linear_kernel(
+    room: int,
+    q: Float[Array, "b t h dk"],
+    k: Float[Array, "b t h dk"],
+    v: Float[Array, "b t h dv"],
+    g: Float[Array, "b t h #dk"],
+    within: Int[Array, "b t"],
+) -> Float[Array, "b t h dv"]:
+    """Run GDN-2's kernel on the rows packed end to end, each document a sequence, in
+    `room` sequences, the last ones empty. Its backward pass keeps the rows as they
+    come."""
+    return _linear_forward(room, q, k, v, g, within)[0]
+
+
+def _linear_forward(
+    room: int, *rows: Shaped[Array, "..."]
+) -> tuple[Float[Array, "b t h dv"], Rows]:
+    tokens = _linear_packed(room, *rows)
+    out = _graph_call("gdn2", [_like(tokens[2])], *tokens)[0]
+    return out.reshape(rows[2].shape), rows
+
+
+def _linear_backward(
+    room: int, rows: Rows, d_out: Float[Array, "b t h dv"]
+) -> tuple[Shaped[Array, "..."] | None, ...]:
+    tokens = _linear_packed(room, *rows)
+    d_out = d_out.reshape(tokens[2].shape).astype(tokens[0].dtype)
+    results = [_like(x) for x in tokens[:6]]
+    dq, dk, dv, dg, *_ = _graph_call("gdn2_bwd", results, *tokens, d_out)
+    grads = (dq, dk, dv, _summed_to(dg, rows[3]))
+    return (*(d.reshape(x.shape).astype(x.dtype) for d, x in zip(grads, rows)), None)
+
+
+_linear_kernel.defvjp(_linear_forward, _linear_backward)
+
+
+def _linear_packed(
+    room: int,
+    q: Float[Array, "b t h dk"],
+    k: Float[Array, "b t h dk"],
+    v: Float[Array, "b t h dv"],
+    g: Float[Array, "b t h #dk"],
+    within: Int[Array, "b t"],
+) -> Tokens:
+    """Return GDN-2's inputs: the rows packed end to end, q, k and v in v's dtype, the
+    log decays in float32, one a head spread over the key channels, beta 0 and w 1,
+    and the documents' bounds cu_seqlens, `room` + 1 of them."""
+    b, t, h, _ = q.shape
+    q, k, v = (x.reshape(b * t, h, -1).astype(v.dtype) for x in (q, k, v))
+    gates = jnp.broadcast_to(g.reshape(b * t, h, -1).astype(jnp.float32), k.shape)
+    starts = jnp.nonzero(within.reshape(-1) == 0, size=room, fill_value=b * t)[0]
+    cu = jnp.append(starts, b * t).astype(jnp.int32)
+    return q, k, v, gates, jnp.zeros_like(k), jnp.ones_like(v), cu
+
+
+def _summed_to(
+    dg: Float[Array, "n h dk"], g: Float[Array, "b t h #dk"]
+) -> Float[Array, "b t h #dk"]:
+    """Return the gradient `dg` of every key channel's log decay as g's: summed over
+    the channels, for one decay a head."""
+    dg = dg.reshape(*g.shape[:3], -1)
+    return dg.sum(-1, keepdims=True) if g.shape[-1] == 1 else dg

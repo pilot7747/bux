@@ -663,12 +663,19 @@ of the model for it.
 ## How attention runs
 
 The layers make q, k and v; the run's `methods.attention` computes the softmax
-(`auto` by default: cuDNN's kernels and tokamax's flash attention on a GPU, `xla`
+(`auto` by default: cuDNN's kernels, FlashAttention-4's and tokamax's on a GPU, `xla`
 elsewhere). Sparse attention attends by `bux.architecture.attention.sparse`: on a
 GPU, tokamax's flash kernel with the kept keys as a mask; elsewhere, XLA a chunk of
 queries at a time; neither makes t × t floats. The indexer ranks a chunk of queries
 at a time too, and picks its top-k by counting the bits of the k-th highest score
 rather than sorting, which on a GPU is 6 times faster at 32k keys.
+
+`csa`'s latents are 512 wide, more than tokamax's kernels take. On a B200 or B300,
+cuDNN's DSA kernels (`bux.architecture.attention.sparse_cudnn`) attend each query to
+its window and the latents it keeps, and its sinks, in one softmax, forward and
+backward; the window-only layers too. Each query's list of slots holds its window's
+and its picks, so the cost is in the slots a query sees, not in the row's length. The
+indexer's loss then takes its target at the picks alone, by cuDNN's kernel too.
 
 - Methods, context parallelism and how attention splits over devices:
   [Attention](../parallelism/attention.md).
