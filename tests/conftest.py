@@ -81,9 +81,14 @@ CHATML = (
 )
 
 
-def byte_spec(skip: tuple[int, ...] = ()) -> dict:
+def byte_spec(missing: int | None = None) -> dict:
     """The tokenizer.json of a byte-level BPE without merges: every byte is the token
-    of its value, but those of `skip`, and the special tokens come after them."""
+    of its value, and the special tokens come after them. A `missing` byte has no
+    token, its id another's ("aa"), as SmolLM2's vocabulary lacks the byte 0x04."""
+    vocab = {c: b for b, c in _byte_alphabet().items()}
+    if missing is not None:
+        del vocab[_byte_alphabet()[missing]]
+        vocab["aa"] = missing
     byte_level = {"add_prefix_space": False, "trim_offsets": True, "use_regex": True}
     bpe = {"dropout": None, "unk_token": None, "fuse_unk": False}
     bpe |= {"continuing_subword_prefix": None, "end_of_word_suffix": None}
@@ -102,7 +107,7 @@ def byte_spec(skip: tuple[int, ...] = ()) -> dict:
         "decoder": {"type": "ByteLevel"} | byte_level,
         "model": {
             "type": "BPE",
-            "vocab": {c: b for b, c in _byte_alphabet().items() if b not in skip},
+            "vocab": vocab,
             "merges": [],
         }
         | bpe,

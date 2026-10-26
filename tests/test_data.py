@@ -65,7 +65,7 @@ def test_text_documents_are_wrapped_and_keyed_by_content(tok):
 def test_a_tokenizer_that_gigatoken_cannot_run_runs_on_hugging_faces(tmp_path, tok):
     # A byte-level vocabulary without the byte 0x04, which gigatoken cannot remap, as
     # SmolLM2's.
-    (tmp_path / "tokenizer.json").write_text(json.dumps(byte_spec(skip=(4,))))
+    (tmp_path / "tokenizer.json").write_text(json.dumps(byte_spec(missing=4)))
     hf = Tokenizer(tcfg.TokenizerConfig(name=str(tmp_path / "tokenizer.json")))
     assert isinstance(hf.encoder, HFTokenizers) and isinstance(tok.encoder, Gigatoken)
     texts = pa.array(["a<|endoftext|>", None, "", "é", "two  words\n"])
@@ -73,7 +73,17 @@ def test_a_tokenizer_that_gigatoken_cannot_run_runs_on_hugging_faces(tmp_path, t
         assert a.dtype == b.dtype and a.tolist() == b.tolist()
     assert hf.vocab_size == tok.vocab_size == 259
     assert hf.decode([257, *b"hi"]) == "<|im_start|>hi"
-    assert hf.token_bytes().tolist() == [1] * 4 + [0] + [1] * 251 + [0] * 3
+    assert hf.token_bytes().tolist() == [1] * 4 + [2] + [1] * 251 + [0] * 3
+
+    # A token added after the special ones keeps its id, as Qwen3's <tool_call>.
+    spec = byte_spec(missing=4)
+    spec["added_tokens"].append(spec["added_tokens"][0] | {"id": 259, "special": False})
+    spec["added_tokens"][-1]["content"] = "<think>"
+    (tmp_path / "tokenizer.json").write_text(json.dumps(spec))
+    hf = Tokenizer(tcfg.TokenizerConfig(name=str(tmp_path / "tokenizer.json")))
+    ids, _ = hf.encode(pa.array(["<think>a<|endoftext|>"]))
+    assert ids.tolist() == [259, *b"a<|endoftext|>"]
+    assert hf.vocab_size == 260 and hf.token_bytes()[259] == len("<think>")
 
 
 def _markup(tok: Tokenizer, text: str) -> list[int]:

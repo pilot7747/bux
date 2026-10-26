@@ -39,9 +39,9 @@ from bux.train import config as tcfg
 class Tokenizer:
     """A tokenizer of a Hugging Face Hub repo or a tokenizer.json.
 
-    The special tokens of the tokenizer.json are taken out of the encoder, so that
-    only `special` makes them, and the tokens of ``config.added`` take the ids after
-    the vocabulary. Use `load`, which makes one a config per process.
+    The encoder writes the special tokens of the tokenizer.json in text as text, so
+    that only `special` makes them, and the tokens of ``config.added`` take the ids
+    after the vocabulary. Use `load`, which makes one a config per process.
 
     Args:
         config: The run's ``tokenizer(...)`` setting.
@@ -49,7 +49,7 @@ class Tokenizer:
     Attributes:
         config: That setting.
         specials: The special tokens' ids, by their text.
-        encoder: What encodes text, without the special tokens: `Gigatoken`, or
+        encoder: What encodes text, special tokens as text: `Gigatoken`, or
             `HFTokenizers` for a tokenizer gigatoken cannot run (SmolLM2's).
         vocab_size: The ids the tokenizer makes, special and added ones included;
             the model's ``vocab_size`` must be at least this.
@@ -65,8 +65,7 @@ class Tokenizer:
         added = spec.get("added_tokens") or []
         self.config = config
         self.specials = {t["content"]: t["id"] for t in added if t.get("special")}
-        spec["added_tokens"] = [t for t in added if not t.get("special")]
-        self.encoder = _encoder(json.dumps(spec))
+        self.encoder = _encoder(spec)
         ends = (i + 1 for i in self.specials.values())
         self.vocab_size: int = max(self.encoder.vocab_size, *ends)
         for token in config.added:
@@ -131,8 +130,12 @@ class Gigatoken:
             whose byte-level vocabulary lacks some bytes, as SmolLM2's.
     """
 
-    def __init__(self, spec: str):
-        self.tokenizer = gigatoken.Tokenizer.from_json(spec)
+    def __init__(self, spec: dict):
+        added = spec.get("added_tokens") or []
+        text = [t for t in added if not t.get("special")]  # the special ones stay text
+        self.tokenizer = gigatoken.Tokenizer.from_json(
+            json.dumps(spec | {"added_tokens": text})
+        )
         self.vocab_size: int = self.tokenizer.vocab_size
 
     def encode(
@@ -165,8 +168,10 @@ class HFTokenizers:
     """Hugging Face's tokenizers, for what gigatoken cannot run: any tokenizer.json
     (BPE, WordPiece, Unigram), an order of magnitude slower."""
 
-    def __init__(self, spec: str):
-        self.tokenizer = tokenizers.Tokenizer.from_str(spec)
+    def __init__(self, spec: dict):
+        # Every added token stays, as it numbers them in order, whatever their ids.
+        self.tokenizer = tokenizers.Tokenizer.from_str(json.dumps(spec))
+        self.tokenizer.encode_special_tokens = True  # special tokens in text are text
         self.vocab_size: int = max(self.tokenizer.get_vocab().values()) + 1
 
     def encode(
@@ -198,11 +203,11 @@ class HFTokenizers:
         return vocab | {i: t.content.encode() for i, t in added.items()}
 
 
-#: What encodes text with the model of a tokenizer.json, its special tokens taken out.
+#: What encodes text with a tokenizer.json, its special tokens as text.
 Encoder = Gigatoken | HFTokenizers
 
 
-def _encoder(spec: str) -> Encoder:
+def _encoder(spec: dict) -> Encoder:
     """Return gigatoken's encoder of a tokenizer.json, or Hugging Face's if gigatoken
     cannot run it."""
     try:
