@@ -7,7 +7,7 @@ import pytest
 from conftest import kept_bytes
 from flax import nnx
 from jax.sharding import PartitionSpec as P
-from jaxtyping import Array, Int
+from jaxtyping import Array, Float, Int
 
 from bux import config as cfg
 from bux import parallel
@@ -269,8 +269,12 @@ def test_lightning_decays_by_minimax_slopes_weakening_with_depth():
 
 
 def minimax_lightning(
-    attn: LightningAttention, x: jax.Array, layer: int, layers: int, block: int
-) -> jax.Array:
+    attn: LightningAttention,
+    x: Float[Array, "b t d"],
+    layer: int,
+    layers: int,
+    block: int,
+) -> Float[Array, "b t d"]:
     """Lightning attention as transformers' MiniMax-Text-01 computes it, by blocks of
     positions (``MiniMaxLightningAttention``), with `attn`'s parameters."""
     assert attn.gate is not None and attn.norm.scale is not None
