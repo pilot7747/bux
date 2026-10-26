@@ -90,6 +90,18 @@ def test_power_follows_the_batch_and_tokens_then_cools_down():
     assert found[6] == 1 and found[8] < 1 and found[-1] == 0
 
 
+def test_power_follows_the_batch_and_tokens_of_a_batch_ramp():
+    """One row of 4 tokens a step for 4 steps, then two: n and the batch follow."""
+    c = tcfg.PowerSchedule(a=1, b=-0.5, decay=0)
+    ramp = tcfg.RampConfig(start=1, steps=4)
+    found = values(
+        c, 8, batch=2, seq_len=4, batch_ramp=ramp, optimizer=tcfg.AdamWConfig(lr=10)
+    )
+    small = [1 * (4 * (s + 1)) ** -0.5 / 10 for s in range(4)]
+    large = [2 * (16 + 8 * (s - 3)) ** -0.5 / 10 for s in range(4, 8)]
+    assert found == [round(m, 4) for m in small + large]
+
+
 def test_piecewise_holds_decays_and_drops_from_piece_to_piece():
     """DeepSeek-V3's shape, small: the peak, a cosine to 0.1, then 0.05 at once."""
     c = tcfg.PiecewiseSchedule(

@@ -179,9 +179,9 @@ tokens trained through step `s`, `n = (s + 1) · batch · seq_len`:
 suit any batch and number of tokens, and `lr` only caps it: the paper's is 0.02,
 under µP. The warmup rises to `p(W - 1)` and holds `p` there; over the last
 `C = round(decay · S)` steps, the cooldown goes from `p(S - C - 1)` to `final` times
-it, as `wsd`'s goes from the peak. It counts the tokens of one batch and `seq_len`, so
-for now `bux check` refuses it in a run whose `batch_ramp` or
-[curriculum](curriculum.md) changes them; one that changes only the data takes it.
+it, as `wsd`'s goes from the peak. Under a `batch_ramp` or a
+[curriculum](curriculum.md), `n` counts the tokens of each step at its own batch and
+`seq_len`, and `batch` is the step's.
 
 **Piecewise.** Piece `k` takes the steps from `b` to `e = round(until · S)`, where the
 first piece starts at `W` and every other where the one before ends. It goes from
