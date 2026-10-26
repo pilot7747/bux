@@ -206,23 +206,27 @@ weighs no more than a row of one long one.
 
 ```console
 $ bux train mine/chat.bux
-remat=auto: none in 1s (none 0.5 GiB in 0s)
-chat step 25/200  loss 2.8811  lr 2.99e-03  grad 0.936  6,491 tok/s
-chat step 50/200  loss 2.2371  lr 2.82e-03  grad 0.678  7,843 tok/s
-chat step 50/200  eval loss 2.2141
-chat step 75/200  loss 2.1074  lr 2.42e-03  grad 0.547  8,470 tok/s
-chat step 100/200  loss 2.0963  lr 1.88e-03  grad 0.604  8,024 tok/s
-chat step 100/200  eval loss 2.1153
-chat step 125/200  loss 2.0944  lr 1.30e-03  grad 0.570  8,419 tok/s
-chat step 150/200  loss 2.0535  lr 7.82e-04  grad 0.597  8,075 tok/s
-chat step 150/200  eval loss 2.0266
-chat step 175/200  loss 1.9480  lr 4.26e-04  grad 0.586  8,360 tok/s
-chat step 200/200  loss 1.8523  lr 3.00e-04  grad 0.636  8,098 tok/s
-chat step 200/200  eval loss 1.8798
+remat=auto: none in 1s (none 0.5 GiB in 1s)
+chat step 25/200  loss 2.8811  lr 2.99e-03  grad 0.936  5,921 tok/s
+chat step 50/200  loss 2.2371  lr 2.82e-03  grad 0.678  6,811 tok/s
+chat step 50/200  eval loss 2.2137  eval bpb 1.2927
+chat step 75/200  loss 2.1074  lr 2.42e-03  grad 0.547  7,679 tok/s
+chat step 100/200  loss 2.0963  lr 1.88e-03  grad 0.604  7,043 tok/s
+chat step 100/200  eval loss 2.1152  eval bpb 1.2351
+chat step 125/200  loss 2.0944  lr 1.30e-03  grad 0.570  7,571 tok/s
+chat step 150/200  loss 2.0535  lr 7.82e-04  grad 0.597  7,103 tok/s
+chat step 150/200  eval loss 2.0264  eval bpb 1.1833
+chat step 175/200  loss 1.9480  lr 4.26e-04  grad 0.586  7,185 tok/s
+chat step 200/200  loss 1.8523  lr 3.00e-04  grad 0.636  7,177 tok/s
+chat step 200/200  eval loss 1.8793  eval bpb 1.0974
 ```
 
 The loss is over the replies alone. Repeating the question is easy, and the digits of
 the sum are the hard part, which 200 steps of a tiny model only begin to learn.
+
+The eval's bits per byte, `eval bpb`, are over the held-out replies' bytes of text:
+the `<|im_end|>` that ends each stands for none, so its nats are left out
+([Eval](../training/running.md#eval)).
 
 :::{tip}
 On the command line, `'tokenizer = tokenizer(name="gpt2")'` keeps the file's
