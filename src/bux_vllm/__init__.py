@@ -4,12 +4,12 @@ cache and tensor parallelism.
 
 vLLM cannot run a checkpoint's own model code, so the plugin brings it: a model,
 ``BuxForCausalLM``, that builds any exported architecture from its ``config.json``
-(`bux.export.vllm.model`), from layers of vLLM's (`bux.export.vllm.basic`,
-``attention``, ``moe``, ``ssm``) placed where `bux.export.plan` named their weights
-(`bux.export.vllm.plan`). Like `bux.export.hf`, its files import nothing of bux, only
-torch, transformers and vLLM: it installs alone, as the package ``bux_vllm``, from
-this folder (``pip install src/bux/export/vllm``), and vLLM loads it by its entry
-point (`register`).
+(``bux_vllm.model``), from layers of vLLM's (``basic``, ``attention``, ``moe``,
+``ssm``) placed where ``bux.export.plan`` named their weights (``bux_vllm.plan``).
+It is a package of its own beside bux, not of it: like ``bux.export.hf``, its files
+import nothing of bux, only torch, transformers and vLLM, as it runs in vLLM's
+environment. It installs from this folder (``pip install src/bux_vllm``), and vLLM
+loads it by its entry point (`register`).
 """
 
 

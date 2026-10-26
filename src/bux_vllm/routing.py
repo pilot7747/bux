@@ -1,5 +1,5 @@
 """How an MoE layer routes its tokens, and its experts' weights as vLLM's fused
-kernels take them: plain PyTorch, which `bux.export.vllm.moe` hands vLLM.
+kernels take them: plain PyTorch, which `bux_vllm.moe` hands vLLM.
 
 The router runs as bux's does (`bux.architecture.experts.moe`): logits in float32,
 scored by a softmax, a sigmoid or ``sqrt(softplus)``, the aux-free bias added to the

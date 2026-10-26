@@ -1,4 +1,4 @@
-# The vLLM plugin alone, as the package bux_vllm: `pip install src/bux/export/vllm`
+# The vLLM plugin alone, as the package bux_vllm: `pip install src/bux_vllm`
 # into vLLM's environment. Its files import nothing of bux (see __init__.py).
 [project]
 name = "bux-vllm"

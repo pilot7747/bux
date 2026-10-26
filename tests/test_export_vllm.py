@@ -1,4 +1,4 @@
-"""bux's vLLM plugin (bux.export.vllm) builds what bux.export names: it places every
+"""bux's vLLM plugin (bux_vllm) builds what bux.export names: it places every
 layer of every example architecture where bux.export.plan does, imports nothing of
 bux, and reads an export's config.json as vLLM needs it. Whether vLLM then computes
 what bux does takes a GPU: scripts/vllm_parity.py checks it."""
@@ -19,8 +19,8 @@ from bux import config as cfg
 from bux.architecture.attention import rope as bux_rope
 from bux.architecture.experts.moe import MoE
 from bux.export import plan as core
-from bux.export.vllm import common, config, plan, routing
 from bux.lang import compile, compile_file
+from bux_vllm import common, config, plan, routing
 
 ROOT = Path(__file__).parent.parent
 EXAMPLES = sorted((ROOT / "examples" / "architectures").rglob("*.bux"))

@@ -1,7 +1,7 @@
 """An exported bux architecture as a vLLM model: ``BuxForCausalLM``, built from
 ``config.json`` alone.
 
-The model is the plan's tree of blocks (`bux.export.vllm.plan`): the model's, each
+The model is the plan's tree of blocks (`bux_vllm.plan`): the model's, each
 repeat's body, each shared definition's, with every layer at the path its weights
 have in the checkpoint. Its forward runs the IR graph over the batch's tokens, as
 the generated ``modeling_bux.py`` does over a batch's rows, up to the first head: it
@@ -253,7 +253,7 @@ class BuxForCausalLM(nn.Module, IsHybrid):
 
     It is a hybrid for vLLM where it has recurrent layers (``config.layer_types``
     says so), whose state's shape and dtype it gives from the config
-    (`bux.export.vllm.ssm`).
+    (`bux_vllm.ssm`).
     """
 
     is_hybrid: ClassVar = True

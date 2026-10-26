@@ -111,8 +111,8 @@ extra-paths = ["docs/_ext"]  # the docs' Sphinx extension
 
 # PyTorch declares nn.Module's forward as an attribute, which every module overrides.
 [[tool.ty.overrides]]
-include = ["src/bux/export/**", "tests/test_export*.py"]
+include = ["src/bux/export/**", "src/bux_vllm/**", "tests/test_export*.py"]
 rules = { invalid-mutable-override = "ignore" }
 
 [tool.ty.analysis]
-allowed-unresolved-imports = ["vllm.**", "pyspark.**", "tokamax.**", "cudnn.**", "cutlass.**", "triton.**", "jax_triton.**", "transformer_engine.**"]  # the `spark` and `cuda` extras, the image's TE, and vLLM (its plugin, bux.export.vllm)
+allowed-unresolved-imports = ["vllm.**", "pyspark.**", "tokamax.**", "cudnn.**", "cutlass.**", "triton.**", "jax_triton.**", "transformer_engine.**"]  # the `spark` and `cuda` extras, the image's TE, and vLLM (its plugin, bux_vllm)

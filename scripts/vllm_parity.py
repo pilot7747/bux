@@ -1,12 +1,12 @@
 """Check that vLLM computes what bux does: models exported to transformers
-(`bux.export.huggingface`) and served by bux's vLLM plugin (`bux.export.vllm`).
+(`bux.export.huggingface`) and served by bux's vLLM plugin (`bux_vllm`).
 
 bux and vLLM do not share an environment (each pins its own PyTorch), so it runs in
 three steps:
 
     # bux's environment: export each case and its prompts
     JAX_PLATFORMS=cpu python scripts/vllm_parity.py export DIR [--dtype bfloat16]
-    # vLLM's, with the plugin (pip install src/bux/export/vllm): decode them
+    # vLLM's, with the plugin (pip install src/bux_vllm): decode them
     python scripts/vllm_parity.py run DIR [--tp 2] [--eager] [--tag TAG]
     # bux's again: compare
     JAX_PLATFORMS=cpu python scripts/vllm_parity.py compare DIR [--tag TAG]

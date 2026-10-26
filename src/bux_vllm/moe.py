@@ -1,7 +1,7 @@
 """Mixtures of experts in vLLM: bux's ``moe``, its routed experts by vLLM's fused
 MoE kernels (`FusedMoEFactory`), routed by bux's own rule.
 
-The router runs as bux's does (`bux.export.vllm.routing`): vLLM takes the picks and
+The router runs as bux's does (`bux_vllm.routing`): vLLM takes the picks and
 weights from it (``custom_routing_function``) and runs the experts.
 Under tensor parallelism each rank keeps every expert's share of the hidden units,
 as vLLM splits them.

@@ -10,14 +10,16 @@ does not run a checkpoint's own code, so bux brings a plugin for it: a model,
 
 ## Installing
 
-The plugin is `bux.export.vllm`, a folder of files that import nothing of bux, only
-PyTorch, transformers and vLLM. It installs alone, as the package `bux_vllm`, into
-vLLM's environment, which need not have bux, JAX or Python 3.14:
+The plugin is a package of its own, `bux_vllm` in `src/bux_vllm/`, beside bux rather
+than in it: it runs in vLLM's environment, which need not have bux, JAX or Python
+3.14 (vLLM and bux each pin their own PyTorch), so its files import nothing of bux,
+only PyTorch, transformers and vLLM, as the files an export copies for transformers
+do. It installs alone:
 
 ```bash
-pip install vllm "bux-vllm @ git+https://github.com/pilot7747/bux#subdirectory=src/bux/export/vllm"
+pip install vllm "bux-vllm @ git+https://github.com/pilot7747/bux#subdirectory=src/bux_vllm"
 # or from a checkout
-pip install vllm ./src/bux/export/vllm
+pip install vllm ./src/bux_vllm
 ```
 
 vLLM loads it by its entry point (`vllm.general_plugins`), in every process it
@@ -54,7 +56,7 @@ for the model types it knows). A layer or setting the plugin does not run raises
 
 ## How it works
 
-- **The module tree.** `bux.export.vllm.plan` places every layer where
+- **The module tree.** `bux_vllm.plan` places every layer where
   {py:mod}`bux.export.plan` does, from the IR in `config.json` (the `bux` field), so
   a weight's name is its module's path, `model.layers.3.attn.q.weight`. A test checks
   both on every example architecture.

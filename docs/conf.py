@@ -66,7 +66,6 @@ autodoc_mock_imports = [
     "triton",
     "jax_triton",
     "transformer_engine",
-    "vllm",  # bux.export.vllm's, which runs in vLLM's environment
 ]
 napoleon_google_docstring = True
 napoleon_numpy_docstring = False
