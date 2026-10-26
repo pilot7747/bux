@@ -180,6 +180,20 @@
   "type",
   "v_head_dim"
  ],
+ "GatedDeltaNet2Config": [
+  "conv_size",
+  "gate_lower_bound",
+  "gate_rank",
+  "head_dim",
+  "negative_eigenvalues",
+  "norm_eps",
+  "num_heads",
+  "num_v_heads",
+  "output_gate",
+  "output_gate_rank",
+  "type",
+  "v_head_dim"
+ ],
  "LightningAttentionConfig": [
   "conv_size",
   "head_dim",

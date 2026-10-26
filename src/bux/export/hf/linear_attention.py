@@ -327,6 +327,7 @@ class LinearAttention(nn.Module):
         width: The width of the stream.
         silu: SiLU q, k and v without a conv; after one, they always are.
         gate_rank: The rank of a low-rank output gate; None for a dense one.
+        gate_bias: Whether a low-rank output gate adds a bias.
         norm_all_heads: Normalize all heads' outputs together, not each on its own.
     """
 
@@ -342,6 +343,7 @@ class LinearAttention(nn.Module):
         *,
         silu: bool = True,
         gate_rank: int | None = None,
+        gate_bias: bool = False,
         norm_all_heads: bool = False,
     ):
         super().__init__()
@@ -358,7 +360,7 @@ class LinearAttention(nn.Module):
         self.gate: nn.Module | None = None
         if self.gate_activation is not None:
             self.gate = (
-                LowRank(width, gate_rank, hv * dv)
+                LowRank(width, gate_rank, hv * dv, bias=gate_bias)
                 if gate_rank
                 else nn.Linear(width, hv * dv, bias=False)
             )
@@ -490,10 +492,74 @@ class KimiDeltaAttention(DeltaNet):
         b, t, _ = x.shape
         f = wide(self.f(x)) + wide(self.dt_bias)
         f = f.reshape(b, t, self.v_heads, self.head_dim)
-        rate = wide(self.A_log).exp()[:, None]
-        if self.lower_bound is not None:
-            return self.lower_bound * torch.sigmoid(rate * f)
-        return -rate * F.softplus(f)
+        return channel_decay(f, self.A_log, self.lower_bound)
+
+
+def channel_decay(
+    f: torch.Tensor, A_log: torch.Tensor, lower_bound: float | None
+) -> torch.Tensor:
+    """KDA's log decay per key channel of f, its projection plus dt_bias, b t h dk:
+    ``-exp(A_log) softplus(f)``, or ``lower_bound * sigmoid(exp(A_log) f)``, in
+    float32."""
+    rate = wide(A_log).exp()[:, None]
+    if lower_bound is not None:
+        return lower_bound * torch.sigmoid(rate * f)
+    return -rate * F.softplus(f)
+
+
+class GatedDeltaNet2(LinearAttention):
+    """bux's ``gdn2``, Gated DeltaNet-2: KDA's step split into an erase gate
+    ``b = sigmoid(W_b x)`` over the key channels (times 2 with
+    ``negative_eigenvalues``) and a write gate ``w = sigmoid(W_w x)`` over the value
+    channels, on L2-normalized q and k, q scaled by ``dk ** -0.5``::
+
+        S_t = (I - k_t (b_t * k_t)^T) diag(exp(g_t)) S_{t-1} + k_t (w_t * v_t)^T,
+
+    which `rank_one` runs (``a = -exp(g) b k``, written at k, the values ``w v``).
+    The decay is KDA's (`channel_decay`); it and b are a q/k head's, shared out to its
+    value heads as q and k are. The output gate is low rank, with a bias."""
+
+    bux_types = ("gdn2",)
+
+    def __init__(self, c: dict, width: int, site: Site | None = None):
+        dv = c["v_head_dim"] or c["head_dim"]
+        gate_rank = c["output_gate_rank"] or dv
+        super().__init__(c, width, gate_rank=gate_rank, gate_bias=True)
+        h, dk = self.heads, self.head_dim
+        self.f = LowRank(width, c["gate_rank"] or dv, h * dk)
+        self.erase = nn.Linear(width, h * dk, bias=False)
+        self.write = nn.Linear(width, self.v_heads * dv, bias=False)
+        self.lower_bound = c["gate_lower_bound"]
+        self.A_log = nn.Parameter(torch.zeros(h))
+        self.dt_bias = nn.Parameter(torch.zeros(h * dk))
+        self.erase_scale = 2.0 if c["negative_eigenvalues"] else 1.0
+
+    def mix(
+        self,
+        x: torch.Tensor,
+        q: torch.Tensor,
+        k: torch.Tensor,
+        v: torch.Tensor,
+        keep: torch.Tensor | None,
+        state: torch.Tensor | None,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        q, k = l2norm(q) * self.head_dim**-0.5, l2norm(k)
+        g, erase, write = hold(keep, *self.gates(x))
+        a = -g.exp() * erase * wide(k)
+        o, state = rank_one(q, k, write * wide(v), g, a, k, state)
+        return o.to(v.dtype), state
+
+    def gates(self, x: torch.Tensor) -> tuple[torch.Tensor, ...]:
+        """The log decay and the erase gate of each value head, b t hv dk, and its
+        write gate, b t hv dv, in float32."""
+        b, t, _ = x.shape
+        h, dk, group = self.heads, self.head_dim, self.v_heads // self.heads
+        f = (wide(self.f(x)) + wide(self.dt_bias)).reshape(b, t, h, dk)
+        g = channel_decay(f, self.A_log, self.lower_bound)
+        erase = self.erase_scale * wide(torch.sigmoid(self.erase(x)))
+        erase = erase.reshape(b, t, h, dk)
+        write = wide(torch.sigmoid(self.write(x))).reshape(b, t, self.v_heads, -1)
+        return g.repeat_interleave(group, 2), erase.repeat_interleave(group, 2), write
 
 
 class GatedLinearAttention(LinearAttention):

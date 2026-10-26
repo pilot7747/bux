@@ -108,7 +108,7 @@ layer or the setting.
 | `mla` | every setting, the indexer and the `index` port; keys and values cached as projected up from the latents |
 | `csa` | every setting, the indexer (but max-pooled blocks, which bux does not build on compressed latents either) and its candidate pools, and the `kv`, `index` and `candidates` ports; every token's latents cached, the window a mask over them |
 | `conv` | yes, its inputs' tail kept in the cache as it decodes |
-| `gdn`, `kda`, `deltanet`, `gla`, `lightning` | yes, every setting: value heads, the short conv, the output gate and its rank, KDA's decay rank and lower bound, lightning's rates by its depth among the token mixers |
+| `gdn`, `kda`, `gdn2`, `deltanet`, `gla`, `lightning` | yes, every setting: value heads, the short conv, the output gate and its rank, KDA's and GDN-2's decay rank and lower bound, GDN-2's erase and write gates and negative eigenvalues, lightning's rates by its depth among the token mixers |
 | `rwkv7` | yes, every setting, and its `v` port (the value residual) |
 | `mamba`, `mamba2`, `short_conv` | yes, every setting; `dt_min` and `dt_max` only start training |
 | `engram` | yes, on one stream or a widened one; its last tokens and its conv's inputs' tail kept in the cache as it decodes. A token's class is its id mod `vocab_classes`, as bux makes them |

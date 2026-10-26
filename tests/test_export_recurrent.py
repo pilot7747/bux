@@ -38,6 +38,7 @@ def hybrid(mixer: str) -> str:
 
 GDN = "gdn(num_heads=2, head_dim=16)"
 KDA = "kda(num_heads=2, head_dim=16)"
+GDN2 = "gdn2(num_heads=2, head_dim=16)"
 DELTANET = "deltanet(num_heads=2, head_dim=16)"
 GLA = "gla(num_heads=2, head_dim=16, gate_rank=8)"
 LIGHTNING = "lightning(num_heads=2, head_dim=16)"
@@ -62,6 +63,13 @@ MIXERS = {
     "kda lower bound": "kda(num_heads=2, head_dim=16, gate_lower_bound=-5)",
     "kda swish gate": "kda(num_heads=2, head_dim=16, output_gate=swish)",
     "kda no conv": "kda(num_heads=2, head_dim=16, conv_size=none)",
+    "gdn2": GDN2,
+    "gdn2 value heads": "gdn2(num_heads=2, num_v_heads=4, head_dim=16, v_head_dim=8)",
+    "gdn2 gate ranks": "gdn2(num_heads=2, head_dim=16, gate_rank=4, output_gate_rank=4)",
+    "gdn2 lower bound": "gdn2(num_heads=2, head_dim=16, gate_lower_bound=-5)",
+    "gdn2 negative eigenvalues": "gdn2(num_heads=2, head_dim=16, negative_eigenvalues=true)",
+    "gdn2 sigmoid gate": "gdn2(num_heads=2, head_dim=16, output_gate=sigmoid)",
+    "gdn2 no conv": "gdn2(num_heads=2, head_dim=16, conv_size=none)",
     "deltanet": DELTANET,
     "deltanet no gate": "deltanet(num_heads=2, head_dim=16, output_gate=none)",
     "deltanet value heads": "deltanet(num_heads=1, num_v_heads=2, head_dim=16)",
@@ -103,6 +111,7 @@ LENGTHS = {"shorter than the conv": (4, 6), "longer than a chunk": (160, 3)}
 DECODED = {
     "gdn": GDN,
     "kda": KDA,
+    "gdn2": GDN2,
     "deltanet": DELTANET,
     "gla": GLA,
     "lightning": LIGHTNING,
