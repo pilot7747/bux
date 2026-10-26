@@ -40,6 +40,7 @@ from bux.architecture.precision import blockscaled, matmuls
 from bux.architecture.registry import Context, Taps, register, report, training
 from bux.lang import ir
 from bux.parallel import methods
+from bux.softmax import softmax
 
 RowNorm = Callable[[Float[Array, "n d"]], Float[Array, "n d"]]
 LECUN = nnx.initializers.lecun_normal()
@@ -221,7 +222,7 @@ class MoE(nnx.Module):
             logits = random_logits(logits, self.routing())
         match config.router:
             case "softmax":
-                scores = jax.nn.softmax(logits)
+                scores = softmax(logits)
             case "sigmoid":
                 scores = jax.nn.sigmoid(logits)
             case "sqrtsoftplus":

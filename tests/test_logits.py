@@ -139,6 +139,24 @@ def test_the_loss_and_its_gradients_are_the_reference_cross_entropy(
 
 
 @pytest.mark.parametrize("loss", LOSSES)
+def test_the_loss_and_its_gradient_hold_where_float32_rounds_the_targets_p_to_1(loss):
+    # Barron et al.'s example: logits (9, -9, -9) and target 0, a margin of 18, where
+    # float32's 1 + 2e^-18 is 1. log Z - 9 is then 0, and so is p - 1.
+    e = np.exp(-18.0)
+    x = jnp.array([[[9.0, -9.0, -9.0]]])
+    head = logits.HeadOutput(x, logits.Projection(jnp.eye(3), None, None))
+    targets, weights = jnp.zeros((1, 1), jnp.int32), jnp.ones((1, 1))
+
+    def ce(x: Float[Array, "1 1 3"]) -> Float[Array, ""]:
+        return head._replace(hidden=x).sums(targets, weights, False).ce
+
+    with _use(ONE, loss):
+        value, grad = jax.jit(jax.value_and_grad(ce))(x)
+    np.testing.assert_allclose(value, 2 * e, rtol=1e-6)
+    np.testing.assert_allclose(grad[0, 0], [-2 * e, e, e], rtol=1e-6)
+
+
+@pytest.mark.parametrize("loss", LOSSES)
 @pytest.mark.parametrize("mesh", MESHES)
 @pytest.mark.parametrize("head", ["bias_softcap", "tied_bias_softcap"])
 def test_the_loss_split_over_devices_is_the_one_device_loss(

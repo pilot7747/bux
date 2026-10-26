@@ -247,7 +247,7 @@ head's whole, by either method. `Model.outputs` returns every head's logits at o
 
 | Method | How |
 |--------|-----|
-| `chunks` | the default: the matmul, the logsumexp and the target's logit of at most 2 GiB of float32 logits at once, with their gradients by the kernel and by the stream. The kernel's gradients add up in float32, and the backward only scales them |
+| `chunks` | the default: the matmul, the logsumexp of the other logits and the target's logit of at most 2 GiB of float32 logits at once, with their gradients by the kernel and by the stream. The kernel's gradients add up in float32, and the backward only scales them |
 | `logits` | one matmul for every position, the logits whole in `compute` |
 
 At a vocabulary of 128K, the float32 logits of 8 rows of 4096 tokens take 16 GB, and

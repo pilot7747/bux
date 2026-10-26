@@ -28,7 +28,6 @@ from typing import NamedTuple, overload
 import jax
 import jax.numpy as jnp
 import numpy as np
-import optax
 from jaxtyping import Array, Bool, Float, Int, Real, Shaped
 
 from bux.architecture import observe
@@ -299,10 +298,9 @@ def cross_entropy(
     """Return the mean cross-entropy of predicting token t + offset from each position
     t that has a target (`target_mask`), from logits given whole. The last `offset`
     positions are masked out rather than sliced off the logits, whose gradient would
-    then pad a copy of them."""
-    loss = optax.softmax_cross_entropy_with_integer_labels(
-        logits.astype(jnp.float32), targets_ahead(batch, offset)
-    )
+    then pad a copy of them. It keeps its gradient where float32 rounds a target's
+    probability to 1 (`~bux.architecture.logits.Scores`)."""
+    loss = Scores.of(logits, targets_ahead(batch, offset)).ce
     return _masked_mean(loss, _padded_mask(batch, offset))
 
 
