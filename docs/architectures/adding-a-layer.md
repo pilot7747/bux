@@ -405,6 +405,37 @@ values (`bux.kernels`):
 
 The kernels bux has, and what they gain: [GPU kernels](../performance/kernels.md).
 
+## Exporting
+
+A model exports to transformers ([Exporting models](../export/index.md)) once each
+of its layer types has a class in `bux.export.hf`: the layer in PyTorch, which every
+exported repo copies. Until then, exporting a model that uses it raises
+`NotImplementedError` naming it. The contract, which `bux.export.hf.common` states
+in full:
+
+- **Built from its config.** `bux_types = ("shift",)` lists the types it implements;
+  it is built as `Layer(c, width, site)`, `c` the config as JSON, and called as
+  `layer(x, ctx)`, `ctx` the pass's positions, masks, cache and taps.
+- **Named as in bux.** Its attributes mirror the NNX module's: `nn.Linear` where bux
+  has `nnx.Linear`, `nn.Embedding` for `nnx.Embed`, `Norm` for bux's norms. Then
+  `bux.export.weights` converts its weights with no code; a layer whose layout
+  differs converts its own tensors in a `bux_weights` classmethod.
+- **Every setting, or an error.** A setting it does not compute raises through
+  `unsupported(c, ...)`; it is never ignored. Settings that only matter in training
+  (dropout, a loss's weight) are, and its docstring says so.
+- **State while decoding.** A layer that keeps state says its cache's kind in
+  `cache_type(c)` and takes `ctx.cache_slot()` once a call; `hf/conv.py` is the
+  worked example, left padding included. A layer that reads attention masks lists
+  them in `masks(c)`.
+- **Runs where transformers does.** It imports only torch and transformers, each
+  other relatively, and parses on Python 3.10: transformers loads it as remote code.
+
+`check.compare(arch).check()` tests it, against bux, on perturbed weights: the same
+logits, the same greedy tokens with and without the cache, and left-padded batches as
+each prompt alone. Each family of layers has its own `tests/test_export_*.py`, and
+`tests/test_export_zoo.py` keeps a table of the zoo's models that do not export yet,
+by what they lack: a model that comes to export leaves it.
+
 ## Testing
 
 - **Shapes.** Annotate every array with its dtype and shape, as
