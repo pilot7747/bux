@@ -8,7 +8,7 @@ three steps:
     JAX_PLATFORMS=cpu python scripts/vllm_parity.py export DIR [--dtype bfloat16]
     # vLLM's, with the plugin (pip install src/bux_vllm): decode them
     python scripts/vllm_parity.py run DIR [--tp 2] [--eager] [--moe-backend triton]
-        [--tag TAG]
+        [--mamba-ssm-cache-dtype float32] [--tag TAG]
     # bux's again: compare
     JAX_PLATFORMS=cpu python scripts/vllm_parity.py compare DIR [--tag TAG]
 
@@ -19,8 +19,9 @@ recurrent state). `compare` runs bux on the same tokens, each prompt and vLLM's
 continuation, and checks every position: the token vLLM picked is bux's greedy pick
 (its log-probability within `--margin` of bux's best, 0 by default: the same token),
 and the log-probabilities agree within `--tolerance`. A greedy decode that agrees at
-every step is bux's own greedy decode. It prints a line a case, and exits with 1 if
-one disagrees.
+every step is bux's own greedy decode. In bfloat16, bux runs in it too, and vLLM may
+be off by up to twice as much as bux itself is. It prints a line a case, and exits
+with 1 if one disagrees.
 
 The cases are tiny models (d_model 128, a vocabulary of 256) of fresh weights,
 perturbed (`bux.export.check.perturbed`), one per family of layers and settings the
@@ -34,6 +35,7 @@ import json
 import os
 import subprocess
 import sys
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, ClassVar
 
@@ -134,7 +136,7 @@ CASES = {
     "mamba2": HEAD
     + ATTN
     + FFN
-    + "ssm = mamba2(state_size=16, head_dim=32)\n"
+    + "ssm = mamba2(state_size=16, head_dim=32, num_groups=2)\n"
     + "model = embed [rmsnorm ssm] [rmsnorm ffn] [rmsnorm attn] [rmsnorm ffn]"
     " [rmsnorm ssm] [rmsnorm ffn] rmsnorm head",
     "gdn": HEAD
@@ -165,6 +167,7 @@ def main() -> None:
         sub.choices[name].add_argument("--tp", type=int, default=1)
         sub.choices[name].add_argument("--eager", action="store_true")
         sub.choices[name].add_argument("--moe-backend", default="auto")
+        sub.choices[name].add_argument("--mamba-ssm-cache-dtype", default="auto")
     sub.choices["compare"].add_argument("--tolerance", type=float, default=1e-3)
     sub.choices["compare"].add_argument("--margin", type=float, default=0.0)
     args = p.parse_args()
@@ -299,6 +302,7 @@ def run_alone(args: argparse.Namespace, name: str) -> None:
     """Run case `name` in a process of its own, as each vLLM engine wants one."""
     cmd = [sys.executable, __file__, "run-one", str(args.dir), "--only", name]
     cmd += ["--tag", args.tag, "--tp", str(args.tp), "--moe-backend", args.moe_backend]
+    cmd += ["--mamba-ssm-cache-dtype", args.mamba_ssm_cache_dtype]
     subprocess.run(cmd + ["--eager"] * args.eager, check=False)
 
 
@@ -308,6 +312,7 @@ def engine(args: argparse.Namespace) -> dict:
         "tensor_parallel_size": args.tp,
         "enforce_eager": args.eager,
         "moe_backend": args.moe_backend,
+        "mamba_ssm_cache_dtype": args.mamba_ssm_cache_dtype,
     }
 
 
@@ -364,8 +369,15 @@ def _dense(rows: list[dict], vocab: int) -> np.ndarray:
 
 def compare(name: str, args: argparse.Namespace) -> bool:
     """Compare case `name`'s vLLM run with bux; print a line, return whether they
-    agree."""
+    agree.
+
+    vLLM agrees where its log-probabilities are within `--tolerance` of bux's in
+    float32, and each token it picked within `--margin` of bux's best. In a lower
+    dtype bux runs in it too (``bux.train.trainer.cast``), on the same tokens, and
+    vLLM may be off by up to twice as much as bux is from itself in float32.
+    """
     from bux.lang import compile
+    from bux.train.trainer import cast
 
     where = args.dir / name
     if not (where / f"{args.tag}.npz").exists():
@@ -374,24 +386,59 @@ def compare(name: str, args: argparse.Namespace) -> bool:
     meta = json.loads((where / "parity.json").read_text())
     run = np.load(where / f"{args.tag}.npz")
     model = reference_model(compile(CASES[name]), meta["dtype"])
-    errors, gaps, same = [], [], True
+    low = None if meta["dtype"] == "float32" else cast(model, meta["dtype"])
+    vllm, own = Agreement(), Agreement()
     for i, prompt in enumerate(meta["prompts"]):
-        tokens = run[f"tokens{i}"]
-        want = _logprobs(model, [*prompt, *tokens.tolist()])[:-1]
-        got = run[f"logprobs{i}"]
-        errors.append(float(np.abs(got - want).max()))
-        picked = want[len(prompt) - 1 :]
-        gap = picked.max(-1) - picked[np.arange(len(tokens)), tokens]
-        gaps.append(float(gap.max()))
-        same &= bool((picked.argmax(-1) == tokens).all())
-    ok = max(errors) <= args.tolerance and max(gaps) <= args.margin
-    verdict = "ok" if ok else "DIFFERS"
+        tokens, starts = run[f"tokens{i}"], len(prompt) - 1
+        sequence = [*prompt, *tokens.tolist()]
+        want = _logprobs(model, sequence)[:-1]
+        vllm.add(run[f"logprobs{i}"], want, starts, tokens)
+        if low is not None:
+            got = _logprobs(low, sequence)[:-1]
+            own.add(got, want, starts, got[starts:].argmax(-1))
+    error, gap = max(args.tolerance, 2 * own.error), max(args.margin, 2 * own.gap)
+    ok = vllm.error <= error and vllm.gap <= gap
     print(
         f"{name:12s} {args.tag:16s} {meta['dtype']:9s} max |dlogprob| "
-        f"{max(errors):.2e}  greedy {'same' if same else 'differs'} "
-        f"(worst gap {max(gaps):.2e})  {verdict}"
+        f"{vllm.error:.2e}{own.note(own.error)}  greedy "
+        f"{'same' if vllm.same else 'differs'} (worst gap {vllm.gap:.2e}"
+        f"{own.note(own.gap)})  {'ok' if ok else 'DIFFERS'}"
     )
     return ok
+
+
+@dataclass
+class Agreement:
+    """How a run's log-probabilities and picks agree with bux's in float32.
+
+    Attributes:
+        error: The largest difference of a log-probability.
+        gap: The largest gap between bux's best log-probability at a step and that
+            of the token picked.
+        same: Whether every pick is bux's.
+        seen: Whether it measured anything.
+    """
+
+    error: float = 0.0
+    gap: float = 0.0
+    same: bool = True
+    seen: bool = False
+
+    def add(
+        self, got: np.ndarray, want: np.ndarray, starts: int, picks: np.ndarray
+    ) -> None:
+        """Measure a prompt's positions: the log-probabilities `got` against `want`,
+        and the `picks` of its steps, from position `starts` on."""
+        steps = want[starts:]
+        gap = steps.max(-1) - steps[np.arange(len(picks)), picks]
+        self.error = max(self.error, float(np.abs(got - want).max()))
+        self.gap = max(self.gap, float(gap.max()))
+        self.same &= bool((steps.argmax(-1) == picks).all())
+        self.seen = True
+
+    def note(self, value: float) -> str:
+        """`value` as bux's own in the run's dtype, if measured."""
+        return f" (bux's own {value:.2e})" if self.seen else ""
 
 
 def _logprobs(model: Any, tokens: list[int]) -> np.ndarray:
