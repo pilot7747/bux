@@ -155,14 +155,14 @@ class _Names:
 
     def of(self, data: tcfg.DataConfig) -> str:
         """Return `data` by name: its own, a mixture's by its sources', else as
-        source."""
+        source, ``synthetic`` without its brackets."""
         if (found := self.name(data)) is not None:
             return found
         if isinstance(data, tcfg.MixtureConfig):
             return " + ".join(
                 f"{short(w.weight)} * {self.of(w.source)}" for w in data.sources
             )
-        return value_to_source(data)
+        return value_to_source(data).removesuffix("()")
 
     def mixture(self, data: tcfg.DataConfig) -> list[Json]:
         """Return the sources of `data`, each by name, with its weight normalized and
