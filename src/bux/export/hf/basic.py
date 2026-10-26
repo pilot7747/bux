@@ -11,7 +11,7 @@ from torch import nn
 from .common import ACTIVATIONS, Ctx, Norm, Site
 
 
-class Embedding(nn.Module):
+class TokenEmbedding(nn.Module):
     """bux's ``embed``: the token table, times sqrt(d) if asked, normalized if it has
     a norm, plus learned positions. The model's first is the one tied heads read;
     dropout, a training setting, is left out."""

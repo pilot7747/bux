@@ -35,7 +35,7 @@ Pos = tuple[int, ...]
 
 #: What a layer type's exporter adds to its layers' `Site` extras, from the plan and
 #: the call: ``SITE_EXTRAS["engram"] = lambda plan, call: {"table_sizes": ...}``.
-SITE_EXTRAS: dict[str, Callable[["Plan", "Call"], dict]] = {}
+SITE_EXTRAS: dict[str, Callable[["Plan", "LayerCall"], dict]] = {}
 
 
 @dataclass
@@ -70,7 +70,7 @@ class Scope:
 
 
 @dataclass(frozen=True)
-class Call:
+class LayerCall:
     """One call of a layer, as the model runs it.
 
     Attributes:
@@ -121,7 +121,7 @@ class Plan:
     arch: ir.Architecture
     top: Scope
     shared: dict[str, Scope]
-    calls: list[Call]
+    calls: list[LayerCall]
     branches: list[Branch] = field(default_factory=list)
 
     def stop(self) -> int | None:
@@ -135,7 +135,7 @@ class Plan:
         item = head.trail[0]
         return item if item < len(root.items) - 1 else None
 
-    def generation(self) -> list[Call]:
+    def generation(self) -> list[LayerCall]:
         """Return the calls a model runs for the first head's logits alone: those
         up to `stop`, which keep state in the cache as it generates."""
         stop = self.stop()
@@ -174,7 +174,7 @@ def plan(arch: ir.Architecture) -> Plan:
     top = scope(arch.graph, own=own, top=True, algebra=algebra)
     out = Plan(arch, top, shared, [])
     for item in _calls(out, arch.graph, (), top, (), "model.", 0, set()):
-        if isinstance(item, Call):
+        if isinstance(item, LayerCall):
             out.calls.append(item)
         else:
             out.branches.append(item)
@@ -252,7 +252,7 @@ def _calls(
     depth: int,
     seen: set[str],
     first: bool = True,
-) -> Iterator[Call | Branch]:
+) -> Iterator[LayerCall | Branch]:
     """Yield the calls of the layers and the algebra's branches under `node`, at
     `pos` in scope `s` whose modules' paths start with `prefix`."""
     key = node.share
@@ -268,7 +268,7 @@ def _calls(
     match node:
         case ir.Layer():
             path = prefix if pos == () and key is not None else prefix + s.names[pos]
-            yield Call(path.rstrip("."), node, trail, depth, first)
+            yield LayerCall(path.rstrip("."), node, trail, depth, first)
         case ir.Repeat(body=body, times=times):
             for i in range(times):
                 if body.share is not None:
@@ -310,7 +310,7 @@ def _next_primes(start: int, count: int, taken: set[int]) -> list[int]:
     return found
 
 
-def engram_hashes(p: Plan, call: Call) -> dict:
+def engram_hashes(p: Plan, call: LayerCall) -> dict:
     """Return what an engram layer hashes by, as bux builds it: the prime size of each
     n-gram size's and head's table, the least that no engram built before it took,
     and the odd multipliers of its n tokens, drawn from a seed of its index."""
@@ -331,7 +331,7 @@ def engram_hashes(p: Plan, call: Call) -> dict:
 SITE_EXTRAS["engram"] = engram_hashes
 
 
-def mixer_depth(p: Plan, call: Call) -> dict:
+def mixer_depth(p: Plan, call: LayerCall) -> dict:
     """Return the index of `call`'s layer among the token mixers the model runs, from
     0, and how many token mixers it runs: what
     ``bux.architecture.recurrent.linear_attention.depth`` builds a layer by."""

@@ -78,7 +78,7 @@ class Scope:
 
 @dataclass(frozen=True)
 class Call:
-    """One call of a layer, as the model runs it (`bux.export.plan.Call`).
+    """One call of a layer, as the model runs it (`bux.export.plan.LayerCall`).
 
     Attributes:
         path: The module's path, ``model.layers.3.attn``: the prefix of its weights.

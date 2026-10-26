@@ -30,7 +30,7 @@ def mamba_scan(
     state: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Run Mamba's selective scan one position at a time, in float32 (`wide`):
-    every channel's state ``S = exp(dt A) S + (dt x) B``, read as ``y = S . C``.
+    every channel's state ``S = exp(dt A) S + (dt x) B``, read as ``y = S @ C``.
 
     Args:
         x: The input of every channel, b t d.
