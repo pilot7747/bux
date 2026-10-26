@@ -1,0 +1,11 @@
+# SmolLM2-360M (Hugging Face, 2024): SmolLM2-135M's design at 32 layers 960 wide, with
+# 15 query heads over 5 key and value heads of 64.
+d_model    = 960
+vocab_size = 49152
+
+norm = rmsnorm(eps=1e-5)
+attn = gqa(num_heads=15, num_kv_heads=5, rope=rope(base=100000))
+ffn  = gated_mlp(intermediate_size=2560, activation=swish)
+
+block = [norm attn] [norm ffn]
+model = embed block^32 norm head(tied=true)

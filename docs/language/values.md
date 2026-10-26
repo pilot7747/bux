@@ -49,7 +49,7 @@ The names the language knows:
 
 | Kind | Names |
 |------|-------|
-| layers | `gqa`, `mla`, `csa`, `mamba`, `mamba2`, `gla`, `deltanet`, `gdn`, `kda`, `lightning`, `rwkv7`, `conv`, `short_conv`, `mlp`, `gated_mlp`, `moe`, `layernorm`, `rmsnorm`, `dyt`, `linear`, `act`, `scale`, `dropout`, `embed`, `head`, `nextn`, `engram`, `merge` |
+| layers | `gqa`, `mla`, `csa`, `mamba`, `mamba2`, `gla`, `deltanet`, `gdn`, `kda`, `gdn2`, `lightning`, `rwkv7`, `conv`, `short_conv`, `mlp`, `gated_mlp`, `moe`, `layernorm`, `rmsnorm`, `dyt`, `linear`, `act`, `scale`, `dropout`, `embed`, `head`, `nextn`, `engram`, `merge` |
 | settings of a model | `rope`, `pi`, `yarn`, `llama3`, `relbias`, `indexer`; the residual algebras `hc`, `mhc`, `gr`, `attnres`, `vpgate` |
 | training settings | `adamw`, `muon`, `wsd`, `text`, `tokenizer`, `mesh`, ... ([Training settings](../reference/language/training.md)) |
 | activations | `swish`, `gelu`, `gelu_tanh`, `relu`, `relu2`, `sigmoid`, `tanh`, `softplus`, `situ` |

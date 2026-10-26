@@ -7,7 +7,7 @@ import pytest
 from conftest import kept_bytes
 from flax import nnx
 from jax.sharding import PartitionSpec as P
-from jaxtyping import Array, Int
+from jaxtyping import Array, Float, Int
 
 from bux import config as cfg
 from bux import parallel
@@ -44,6 +44,11 @@ MIXERS = {
     "gdn_plain": "gdn(num_heads=2, head_dim=8, conv_size=none, output_gate=none)",
     "kda": "kda(num_heads=2, head_dim=8, gate_rank=4, output_gate_rank=4)",
     "kda_bounded": "kda(num_heads=2, num_v_heads=4, head_dim=8, gate_lower_bound=-5)",
+    "gdn2": "gdn2(num_heads=2, head_dim=8, gate_rank=4, output_gate_rank=4)",
+    "gdn2_gva": (
+        "gdn2(num_heads=2, num_v_heads=4, head_dim=8, v_head_dim=4,"
+        " gate_lower_bound=-5, negative_eigenvalues=true)"
+    ),
     "deltanet": "deltanet(num_heads=2, head_dim=8)",
     "gla": "gla(num_heads=2, head_dim=8, gate_rank=4)",
     "lightning": "lightning(num_heads=2, head_dim=8, v_head_dim=4)",
@@ -269,8 +274,12 @@ def test_lightning_decays_by_minimax_slopes_weakening_with_depth():
 
 
 def minimax_lightning(
-    attn: LightningAttention, x: jax.Array, layer: int, layers: int, block: int
-) -> jax.Array:
+    attn: LightningAttention,
+    x: Float[Array, "b t d"],
+    layer: int,
+    layers: int,
+    block: int,
+) -> Float[Array, "b t d"]:
     """Lightning attention as transformers' MiniMax-Text-01 computes it, by blocks of
     positions (``MiniMaxLightningAttention``), with `attn`'s parameters."""
     assert attn.gate is not None and attn.norm.scale is not None

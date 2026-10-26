@@ -1,0 +1,20 @@
+# SmolLM3-3B (Hugging Face, 2025): a Llama-style 3B with GQA, 16 query heads over 4 key
+# and value heads of 128, that drops RoPE from every fourth layer (NoPE, after Yang et
+# al., 2025) for long context. 36 layers 2048 wide, input and output embeddings tied,
+# and Llama 3.2's vocabulary of 128,256 tokens. Pretrained at 4,096 tokens, it reaches
+# 65,536 by a RoPE base raised to 5,000,000, the one here.
+#
+# Its model card extends it to 131,072 at inference by YaRN, which this file leaves out.
+d_model    = 2048
+vocab_size = 128256
+
+norm = rmsnorm(eps=1e-6)
+attn = gqa(num_heads=16, num_kv_heads=4, rope=rope(base=5000000))
+nope = attn(rope=none)
+ffn  = gated_mlp(intermediate_size=11008, activation=swish)
+
+layer(mixer) = [norm mixer] [norm ffn]
+R = layer(attn)
+N = layer(nope)
+
+model = embed "RRRN"^9 norm head(tied=true)

@@ -1,0 +1,13 @@
+# OLMo 2 13B (Allen AI, 2024): OLMo 2 7B's design at 40 layers 5120 wide with 40 heads
+# of 128.
+d_model    = 5120
+vocab_size = 100352
+
+init = normal(std=0.02, truncate=3)
+norm = rmsnorm(eps=1e-6)
+attn = gqa(num_heads=40, num_kv_heads=40, qk_norm=norm, qk_norm_all_heads=true,
+           rope=rope(base=500000))
+ffn  = gated_mlp(intermediate_size=13824, activation=swish)
+
+block = [attn norm] [ffn norm]
+model = embed block^40 norm head

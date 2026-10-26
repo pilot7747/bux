@@ -290,8 +290,8 @@ attn = gqa(num_heads=16, num_kv_heads=16, qk_norm=rmsnorm, rope=rope(layout=inte
 `qk_norm_all_heads=true`, a setting of `gqa`, makes it one norm of all the heads
 together instead: of the queries' `num_heads * head_dim` channels, and one of the
 keys', each with a gain per channel, before they split into heads and RoPE turns them.
-MiniMax-M2 normalizes so, as OLMo 2 does
-(`examples/architectures/minimax/minimax_m2.bux`):
+MiniMax-M2 normalizes so (`examples/architectures/minimax/minimax_m2.bux`), as do
+OLMo 2 and 3 (`examples/architectures/olmo/`):
 
 ```bux
 norm = rmsnorm(eps=1e-6)
@@ -414,6 +414,14 @@ local  = attn(sliding_window_size=4096)
 global = attn(rope=none)
 ```
 
+SmolLM3 drops RoPE from every fourth layer, and none of its layers has a window
+(`examples/architectures/smollm/smollm3_3b.bux`):
+
+```bux
+attn = gqa(num_heads=16, num_kv_heads=4, rope=rope(base=5000000))
+nope = attn(rope=none)
+```
+
 ### Context extensions: `pi`, `yarn`, `llama3`
 
 Each scaling divides some of the frequencies by `factor`, so that a model trained on
@@ -447,8 +455,9 @@ $0.1 \ln(\text{factor}) + 1$; set `attention_factor=1` to turn it off.
 - `softmax` (DeepSeek's MLA): the softmax scale is multiplied by its square, so all
   of q . k scales.
 
-Laguna XS 2.1's global layers widen the fast band (`beta_fast=64`), and
-Mellum2's stretch RoPE 16 times:
+Laguna XS 2.1's global layers widen the fast band (`beta_fast=64`),
+Mellum2's stretch RoPE 16 times, and Olmo 3's 8 times while its sliding-window
+layers keep theirs as they were (`examples/architectures/olmo/olmo_3_7b.bux`):
 
 ```bux
 global = attn(num_heads=48, rope=rope(base=500000, fraction=0.5,
@@ -457,6 +466,11 @@ global = attn(num_heads=48, rope=rope(base=500000, fraction=0.5,
 
 ```bux
 global = attn(rope.scaling=yarn(factor=16, original_max_len=8192))
+```
+
+```bux
+local  = attn(sliding_window_size=4096, rope=rope(base=500000))
+global = attn(rope=rope(base=500000, scaling=yarn(factor=8, original_max_len=8192)))
 ```
 
 ### Relative position bias: `relbias`

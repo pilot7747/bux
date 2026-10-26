@@ -9,7 +9,7 @@ import numpy as np
 import pytest
 from flax import nnx
 from jax.sharding import PartitionSpec as P
-from jaxtyping import Array, Int
+from jaxtyping import Array, Float, Int
 
 from bux import config as cfg
 from bux import parallel
@@ -234,7 +234,9 @@ def gains(attn: Attention) -> tuple[nnx.Param, nnx.Param]:
     return q.scale, k.scale
 
 
-def minimax_m2_attention(attn: Attention, x: jax.Array) -> jax.Array:
+def minimax_m2_attention(
+    attn: Attention, x: Float[Array, "b t d"]
+) -> Float[Array, "b t d"]:
     """`attn`'s output as MiniMax-M2's modeling code computes it: the projected q and k
     each over the RMS of all their channels, times the gain, then split into heads and
     rotated."""
