@@ -16,7 +16,7 @@ where nothing splits the positions, the two are the same.
 
 This page also covers how a recurrence runs on each device: by chunks of positions
 (`chunkwise`), what its backward pass keeps of them (`methods.states`), and the GPU
-kernels of the delta rule.
+kernels of the delta rule, GLA and Lightning.
 
 ## Turn it on
 
@@ -64,7 +64,7 @@ The methods of `methods.recurrence`:
 
 | Method | What it does |
 |---|---|
-| `scan` | The default: every position as one chunk, which `chunkwise` runs by chunks of 64 positions (or cuDNN's kernels, [below](#cudnns-delta-rule-kernels)). With `seq` over `context`, XLA gathers the sequence onto every device first. |
+| `scan` | The default: every position as one chunk, which `chunkwise` runs by chunks of 64 positions (or the GPU kernels, [below](#cudnns-delta-rule-kernels)). With `seq` over `context`, XLA gathers the sequence onto every device first. |
 | `pass_state` | Each device scans its own positions from a zero state and keeps their transition. The transitions fold, in turn, into the state each device's chunk starts from (LASP-2: XLA all-gathers them over `context`). Each device then adds to its outputs what they read of that state. |
 
 The options of `methods.states`:
@@ -77,7 +77,8 @@ The options of `methods.states`:
 :::{tip}
 `recompute` buys rows: the Mamba-2 hybrid fits twice the rows a GPU under it, at 4
 to 9% fewer tokens a second ([Measurements](#the-chunks-states-keep-or-recompute)).
-The delta rule by cuDNN's kernels keeps only its inputs either way.
+The delta rule by cuDNN's kernels, and GLA and Lightning by GDN-2's, keep only their
+inputs either way.
 :::
 
 ## Constraints and errors
@@ -85,8 +86,9 @@ The delta rule by cuDNN's kernels keeps only its inputs either way.
 - A method that cannot run a family raises `NotImplementedError` naming it. Under
   `pass_state`, a family whose chunk gives no transition raises so.
 - Where nothing splits the positions, `pass_state` is `scan`.
-- The delta rule's GPU kernels (cuDNN's and bux's) run only under `scan`. Under
-  `pass_state`, and wherever a mesh splits the positions, the chunks run instead.
+- The GPU kernels of the delta rule (cuDNN's and bux's), GLA and Lightning run only
+  under `scan`. Under `pass_state`, and wherever a mesh splits the positions, the
+  chunks run instead.
 - Under `precision(compute=bfloat16)`, `pass_state` trains on a CPU too: what the
   `shard_map`s' transposes sum is float32 ([Precision](precision.md)).
 
@@ -143,7 +145,12 @@ fla's chunked kernels, under every method:
   Pallas kernel on a GPU (`affine_scan`);
 - `stepwise`, a scan over positions, is its reference;
 - with one decay a head, the state passes across the chunks by a matmul (SSD's state
-  passing), and q and k may be shared by groups of heads.
+  passing), and q and k may be shared by groups of heads;
+- a decay per key channel takes each pair's decay through the end of a block of 16
+  positions between them, so that no exponent is positive. One bounded near 0
+  instead, as RWKV-7's (at least $-e^{-1/2}$ a position: `recurrence`'s `floor`),
+  takes it through the chunk's middle position, one matmul a pair product, its
+  exponents at most 20.
 
 Mamba-2's selective scan runs so, as decayed linear attention with `q = C` and `k = B`
 of its groups, `v = dt x` and a log decay `dt A` a head; `ssm.stepwise` is its
@@ -223,12 +230,38 @@ gradient are within 4·10⁻³ of the scan's over positions (as a share of each 
 norm), where the chunks in float32 are within 1.3·10⁻³: the kernels keep the parts
 and states in bfloat16.
 
+cuDNN's GDN-2 kernel ([below](#recurrence-gla-kernel)) runs KDA too, at its erase
+and write gates both beta, and exact at any gate: 6.9 ms a layer at KDA's gate as it
+starts. But it runs a whole call again by a slower exact path wherever a tile of 16
+positions decays a channel past $e^{-83}$, which KDA's gates soon do: the KDA hybrid
+trained at 54.6k tokens a second by it over 200 steps, and at 99.3k by bux's kernels.
+
+(recurrence-gla-kernel)=
+### GLA's and Lightning's kernel
+
+Decayed linear attention, with no delta rule, runs by cuDNN's GDN-2 kernel under
+`scan`, on a B200 or B300, with q, k and v in bfloat16 and heads of 64 or 128
+(`fused_delta.linear`, by `linear_attention.decayed`):
+
+- GDN-2's state follows
+  $S_t = (I - k_t (\beta_t \odot k_t)^\top)\, \mathrm{diag}(e^{g_t})\, S_{t-1} + k_t (w_t \odot v_t)^\top$,
+  with $g$, $\beta$ and $w$ per channel. At $\beta = 0$ and $w = 1$ it is GLA's
+  recurrence, and Lightning's with its decay a head given to every channel.
+- cudnn-frontend has it only in its develop builds, which the lock pins on Linux
+  x86-64; a run without one runs by the chunks.
+- It keeps only its inputs for the backward pass, and so do the chunks it falls back
+  on, in a row of more documents than its room (as the GDN kernel's).
+- It factors each decay through a tile of 16 positions. A tile that decays a channel
+  past $e^{-83}$ makes it run the whole call again by an exact path, the same values
+  many times slower; in float16 one past $e^{-9.7}$ would, so it takes bfloat16 alone.
+
 `scripts/gpu_smoke/recurrence.py` checks, on a GPU:
 
 - the chunked forms, and Mamba-2's recomputed, against their scans, whose GPU fusions
   the CPU tests do not see: on a B300 one took Mamba-2's gradients for B and C wrong,
   which a plain matmul in its place does not;
-- the kernels against the chunks.
+- the kernels against the chunks: GDN-2's at GLA's own gate, steep gates and spikes,
+  heads of 64, rows of more documents than its room, and Lightning's decays.
 
 ## Writing your own method
 
@@ -327,10 +360,45 @@ B300, and what it keeps:
 ("By chunks, before" is the chunks before the inverse took its own backward,
 `Tᵀ dT Tᵀ` of `T` alone, which made `keep` faster.)
 
+GLA and Lightning, at the same shapes, a decay a channel and a head:
+
+| Decayed linear attention | GLA | Lightning |
+|---|---|---|
+| by chunks (`states=keep`) | 17.4 ms | 5.5 ms |
+| by GDN-2's kernel | 3.7 ms | 3.5 ms |
+| by GDN-2's kernel, gates of -20 a position (its exact path) | 45 ms | |
+
+Their hybrids train 53% and 5% faster by it
+([Kernels](../performance/kernels.md#glas-and-lightnings-kernel)).
+
+(recurrence-rwkv7-chunks)=
+### RWKV-7's chunks
+
+RWKV-7's recurrence at 8 × 4096 tokens on a B300, forward and backward, by blocks of
+16 positions, as before, and through each chunk's middle, now:
+
+| RWKV-7 | 32 heads of 64 | 16 heads of 128 |
+|---|---|---|
+| by blocks | 58.3 ms | 49.6 ms |
+| through the chunks' middle | 15.5 ms | 16.8 ms |
+
+The baseline's hybrid of it (`"RRRA"^4`, 32 heads of 64, 8 rows of 4096 on one B300)
+trains at 87.4k tokens a second where it trained at 45.0k, and peaks at 142.1 GiB
+where it did at 155.3, its loss at the last of 30 steps the same to 0.0004. On a node
+(`fsdp=8`) it trains at 690k where it trained at 354k, at 129.0 GiB where at 157.0.
+On FineWeb-Edu (1500 steps of 8 × 4096 tokens, deterministic), its held-out loss is
+4.2598 where it was 4.2611. Its
+outputs and gradients are the scan's over positions to 10⁻⁶ in float32. fla's Triton
+kernel (`chunk_rwkv7` with its lower bound, in PyTorch) takes 6.7 ms on the same
+GPU: a kernel of bux's own could take RWKV-7 further. Of the chunks' 15 ms, XLA's
+fusions over their float32 pairs and maps (64 × 64 a chunk and head) take 7.5, and
+TF32 GEMMs of 64 × 64 6.
+
 (recurrence-keep-or-recompute)=
 ### The chunks' states: keep or recompute
 
-A GLA hybrid (`"GGGA"^4`), which runs by chunks alone, on a B300:
+A GLA hybrid (`"GGGA"^4`) on a B300, by chunks alone, as it ran before
+[its kernel](#recurrence-gla-kernel) (which keeps only its inputs either way):
 
 | `methods.states` | tok/s, memory | the rows it fits |
 |---|---|---|
@@ -374,8 +442,11 @@ rows of 4096 a GPU, on B300s, in tokens a second and the busiest GPU's peak:
 
 ## Not yet
 
-A `ppermute` chain instead of the all-gather of `pass_state`, which holds every
-device's transitions (`c` matrices `k × k` per head) on each.
+- A `ppermute` chain instead of the all-gather of `pass_state`, which holds every
+  device's transitions (`c` matrices `k × k` per head) on each.
+- A kernel for RWKV-7 ([its chunks](#recurrence-rwkv7-chunks) take 2.3 times fla's
+  Triton kernel's time), and one for Lightning's decay a head (GDN-2's takes 3.5 ms
+  a layer, fla's `chunk_simple_gla` 2.1).
 
 ## See also
 

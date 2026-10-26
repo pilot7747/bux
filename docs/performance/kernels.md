@@ -55,6 +55,7 @@ The speedups are against XLA's own program for the same computation, on a B300.
 | Gated DeltaNet, DeltaNet | cuDNN's fused GDN kernel (`fused_delta`), by cuDNN's graph from a `buffer_callback`: any gate | 5x `chunkwise` |
 | KDA with a `gate_lower_bound` of -5 or more | cuDNN's fused KDA kernel (`fused_delta`) | 10x `chunkwise` |
 | KDA otherwise | bux's Pallas kernels (`pallas_delta`): any gate, each pair's decay through a position between them | 2.6x `chunkwise` |
+| GLA, Lightning | cuDNN's fused GDN-2 kernel (`fused_delta`), by cuDNN's graph from a `buffer_callback`: its delta rule at a step of 0 is decayed linear attention | 4.7x `chunkwise` (GLA), 1.6x (Lightning) |
 | MoE experts | `grouped.ragged_dot`: tokamax's Mosaic and Triton kernels | 27x `jax.lax.ragged_dot` |
 | MoE experts in MXFP8 | `grouped_mxfp8`: Mosaic GPU kernels of tcgen05's block-scaled MMA, the scales by TMA into tensor memory ([Experts](../parallelism/experts.md)) | 1.5-2.4x tokamax's bfloat16 GEMMs |
 | MoE experts' SwiGLU in MXFP8 | `grouped_glu`: cuDNN's CuTe DSL grouped GEMMs, SwiGLU and its backward with their quantizations in the epilogues, each GPU's shard of the kernels quantized before FSDP gathers it ([Experts](../parallelism/experts.md)) | 1.13-1.17x `grouped_mxfp8`'s layer |
@@ -93,6 +94,7 @@ by XLA instead, with the same values up to rounding. Outside a GPU, and inside
 | `fused_delta` | cudnn-frontend installed; a B200 or B300 (SM 10.0, 10.3); heads of 64 or 128 dims; bfloat16 or float16; `methods.recurrence = scan`; one decay a head (GDN, DeltaNet) or KDA with `gate_lower_bound` of -5 or more | `pallas_delta` for KDA, else `chunkwise` |
 | `pallas_delta` | KDA (a decay per key channel); heads of 64 or 128 dims; bfloat16 or float16; `methods.recurrence = scan` | `chunkwise` |
 | `pallas_conv` | q, k and v side by side (`CausalConv.side_by_side`); each device's positions, and the channels, in blocks of a power of two, 16 or more; a mesh that splits nothing but the rows | XLA's form of the backward; off a GPU, autodiff's |
+| `fused_delta`'s GDN-2 (GLA, Lightning) | cudnn-frontend's develop build, which the lock pins on Linux; a B200 or B300; heads of 64 or 128 dims; bfloat16; `methods.recurrence = scan` | `chunkwise` |
 | `affine_scan` | a state of k × v with k a power of two of 16 or more, and v a multiple of 32 | a scan over the chunks by XLA |
 | `grouped.ragged_dot` | tokamax installed | `jax.lax.ragged_dot` |
 | `grouped_mxfp8` | a Blackwell GPU (compute capability 10 or more); the experts' role in `mxfp8` or `mxfp8_2d` | XLA dequantizes and multiplies |
@@ -102,7 +104,18 @@ by XLA instead, with the same values up to rounding. Outside a GPU, and inside
 
 `fused_delta` and `pallas_delta` take every position of a row: under
 `methods.recurrence = pass_state`, which splits them over `context`, the delta rule
-runs by chunks.
+runs by chunks, and so do GLA and Lightning.
+
+GDN-2's kernel factors each decay through a tile of 16 positions. Where a tile decays
+a channel past $e^{-83}$ (in float16, past $e^{-9.7}$, so it takes bfloat16 alone), it
+runs the whole call again by an exact path, the same values many times slower: GLA at
+a gate of -20 a position took 45 ms a layer, not 3.7. GLA's own gate,
+$\log \sigma(f) / 16$, needs $f$ near -83 through a whole tile for that, and
+Lightning's decays never reach it.
+
+The develop build replaces cudnn-frontend 1.31.0 on Linux x86-64 alone. Linux on ARM,
+which it has no wheel for, goes without cudnn-frontend, and its kernels
+(`fused_delta`, `grouped_glu`) fall back there as they do off Linux.
 
 ## Debugging with kernels off
 
@@ -189,6 +202,37 @@ the mean of two runs with the halves of the node swapped:
 
 Peak memory is the same, and the losses after 60 steps are within 0.003 of each
 other, as two runs of the same tree are.
+
+### GLA's and Lightning's kernel
+
+The baseline's hybrids of GLA (`"GGGA"^4`) and Lightning (`"LLLA"^4`), 16 heads of
+128, 8 rows of 4096 on one B300, by chunks before cuDNN's GDN-2 kernel and by it now,
+on the same node:
+
+| hybrid | by chunks | by GDN-2's kernel | a layer's forward and backward |
+|--------|-----------|-------------------|--------------------------------|
+| GLA | 85.4k, 83.5 GiB | 130.7k, 66.9 GiB | 17.4 → 3.7 ms |
+| GLA, a node, `fsdp=8` | 661k, 74.3 GiB | 920k, 57.1 GiB | |
+| Lightning | 135.2k, 73.5 GiB | 142.2k, 61.4 GiB | 5.5 → 3.5 ms |
+
+On a node, GDN-2's callbacks run one GPU at a time, as GDN's do: GLA trains at 88% of
+8 GPUs alone.
+
+Their losses over 30 steps are the chunks' to 0.004 (GLA) and 0.0002 (Lightning) at
+the last log. On FineWeb-Edu (3000 steps of 8 × 4096 tokens, GEMM autotuning off and
+XLA's deterministic ops on, seeds 0, 1 and 2), the GLA hybrid's held-out loss is
+3.9253, 3.8659 and 3.8961 by the kernel and 3.9275, 3.8722 and 3.8931 by the chunks:
+within 0.007 at each seed, where the seeds spread over 0.055.
+
+On a B300, at 2 × 4096 tokens in packed documents, the kernel's outputs and gradients
+are within 4·10⁻³ of the chunks' in float32 (as a share of each one's norm), at GLA's
+own gate, gates to -20 a position, spikes of -10⁴ and Lightning's
+decays, and the log decays' gradient within 7·10⁻³ at gates to -5: the kernel keeps
+its parts in bfloat16, as cuDNN's GDN kernel does.
+
+RWKV-7 has no kernel yet, but its chunks take a pair's decay by one matmul now, its
+decay being bounded: its hybrid (`"RRRA"^4`) trains at 87.4k tokens a second where it
+trained at 45.0k ([RWKV-7's chunks](../parallelism/recurrence.md#rwkv-7s-chunks)).
 
 ### QK-norm and RoPE
 
