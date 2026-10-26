@@ -296,12 +296,6 @@ def _(c: cfg.ActivationConfig) -> str:
     return name(c.fn)
 
 
-@titles.register("head")
-def _(c: cfg.LMHeadConfig) -> str:
-    """The output layer, tied to the embedding or not."""
-    return "Linear output layer (tied)" if c.tied else names["head"]
-
-
 # --- Chips ---------------------------------------------------------------------------
 
 
