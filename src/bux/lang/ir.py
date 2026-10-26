@@ -317,6 +317,7 @@ _NEWER_LAYER_FIELDS = {
         "bias_momentum": 0.5,
     },
     "mamba2": {"num_heads": None},
+    "gqa": {"gate_head_bias": False, "power_scale": None, "power_scale_length": 2048},
     "layernorm": {"gain_init": 1.0},
     "rmsnorm": {"gain_init": 1.0},
 }

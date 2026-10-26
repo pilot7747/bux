@@ -95,7 +95,7 @@ where it cannot run.
 - **Helps**: always. Check that yours run: a layer outside a kernel's conditions
   falls back. A delta rule with heads of 96 dims runs by chunks, KDA with a
   `gate_lower_bound` below -5 by bux's slower Pallas kernels, and attention with a
-  soft cap by tokamax's kernel, which cuDNN's does not replace.
+  soft cap off a Blackwell GPU by tokamax's kernel, which cuDNN's does not replace.
 - **Costs**: nothing; none of them is in a run's id.
 - **Measured**: [Kernels](kernels.md), which also lists when each falls back.
 

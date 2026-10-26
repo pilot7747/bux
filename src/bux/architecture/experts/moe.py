@@ -712,8 +712,8 @@ def experts(
     GEMMs are grouped: block-scaled in the experts' format where it is one
     (`~bux.architecture.experts.grouped_blockscaled`), else in compute
     (`~bux.architecture.experts.grouped`). In MXFP8 on a Blackwell GPU, cuDNN's fused
-    kernels run a SwiGLU FFN with no norm or bias
-    (`~bux.architecture.experts.grouped_glu`).
+    kernels run an FFN whose activation they fuse (ReLU^2, SwiGLU, a clamped GeGLU,
+    SiTU-GLU), with no norm or bias (`~bux.architecture.experts.grouped_glu`).
 
     Args:
         x: the rows, sorted by expert, d wide.
@@ -733,7 +733,7 @@ def experts(
     """
     up, down = kernels.up, kernels.down
     if fused(ffn, norm, up):
-        y = grouped_glu.mlp(x, sizes, weights, up, down, picked, summed, quantized)
+        y = grouped_glu.mlp(x, sizes, weights, up, down, ffn, picked, summed, quantized)
         return checkpoint_name(y, "experts")
     recipe = grouped_blockscaled.RECIPES.get(experts_format())
     n, (e, d, f, p) = x.shape[0], up.shape

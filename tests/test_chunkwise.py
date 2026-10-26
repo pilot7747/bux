@@ -82,6 +82,44 @@ def test_chunks_differentiate_as_positions_do(decay, rank_one, strong):
         np.testing.assert_allclose(a, b, atol=5e-5, rtol=5e-5, err_msg=str(i))
 
 
+@pytest.mark.parametrize("rank_one", [False, True], ids=["decay", "rank_one"])
+@pytest.mark.parametrize("size", [8, 64])
+def test_a_bounded_decay_factors_through_the_chunks_middle(monkeypatch, rank_one, size):
+    """A decay per channel of at least -0.7 a position, as RWKV-7's is at least
+    -e^-1/2: its pairs by one matmul each, no block's (`_channels`), and the outputs,
+    state, transition, reads and gradients those of positions."""
+    monkeypatch.setattr(chunkwise, "_channels", None)
+    xs = _inputs(K, rank_one, False)
+    got = chunkwise.chunk(xs, True, size, floor=-0.7)
+    want = stepwise(xs, (), True)
+    for name in ("out", "state", "transition", "reads"):
+        a, b = getattr(got, name), getattr(want, name)
+        np.testing.assert_allclose(a, b, atol=2e-5, rtol=2e-5, err_msg=name)
+    weights = jnp.cos(jnp.arange(B * T * H * V)).reshape(B, T, H, V)
+
+    def loss(f, *xs):
+        return (f(xs).out * weights).sum()
+
+    learned = tuple(i + 1 for i in range(len(xs)) if i != 4)
+    forms = (
+        lambda x: chunkwise.chunk(x, False, size, floor=-0.7),
+        lambda x: stepwise(x, (), False),
+    )
+    grads = [jax.grad(loss, argnums=learned)(f, *xs) for f in forms]
+    for i, (a, b) in enumerate(zip(*grads, strict=True)):
+        np.testing.assert_allclose(a, b, atol=5e-5, rtol=5e-5, err_msg=str(i))
+
+
+@pytest.mark.parametrize(
+    ("floor", "size", "factors"),
+    [(-0.61, 64, True), (-1.25, 64, True), (-1.3, 64, False), (-5.0, 64, False)],
+)
+def test_only_a_decay_near_0_factors(floor, size, factors):
+    """RWKV-7's, at least -e^-1/2, does; KDA's bounded at -5 does not, its factors'
+    exponents up to 160 past float32's."""
+    assert chunkwise._factors(floor, size) is factors
+
+
 @pytest.mark.parametrize("strong", [False, True])
 @pytest.mark.parametrize(("size", "sub"), [(4, 2), (64, 16)])
 def test_q_and_k_of_a_group_are_its_heads(strong, size, sub):

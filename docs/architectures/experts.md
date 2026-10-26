@@ -52,9 +52,9 @@ experts = moe(num_experts=128, top_k=4, router_bias=true,
 ```
 
 :::{note}
-cuDNN's fused SwiGLU kernels take no biases, offset, clamp or soft-cap, so experts
-with any of them run by bux's grouped GEMMs ([SwiGLU fused, by
-cuDNN](../parallelism/experts.md#swiglu-fused-by-cudnn)). Every `methods.moe` adds
+cuDNN's fused kernels take gpt-oss's clamp and offset as a GeGLU, but no biases, so
+these experts run by bux's grouped GEMMs ([Activations fused, by
+cuDNN](../parallelism/experts.md#activations-fused-by-cudnn)). Every `methods.moe` adds
 an expert's biases where it runs its kernels, `nccl_ep` too: on 8 B300s, gpt-oss's
 experts by each method compute what `sorted` does on one GPU, the layer within 7.7e-7
 and 12 steps' losses within 1.2e-4.

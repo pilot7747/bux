@@ -93,11 +93,13 @@ def sources(
 
 def _pending(taps: Taps, x: Float[Array, "b t n d"]) -> Float[Array, "b t n"]:
     """Return the coefficients a single-pass read uses: those the last branch computed,
-    or stream 0 alone before any branch, as DeepSeek-V4.1 starts (make_identity_pre_mix).
+    or stream 0 alone before any branch, as DeepSeek-V4.1 starts (make_identity_pre_mix),
+    in the stream's dtype: a float32 read would make every branch after it float32.
     """
     if taps.pending_read is not None:
         return taps.pending_read
-    return jnp.broadcast_to(jax.nn.one_hot(0, x.shape[2]), x.shape[:3])
+    first = jax.nn.one_hot(0, x.shape[2], dtype=x.dtype)
+    return jnp.broadcast_to(first, x.shape[:3])
 
 
 def _single_pass_read(
