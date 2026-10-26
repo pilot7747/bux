@@ -402,7 +402,7 @@ class Run(BaseModel):
 
     `bux.lang.compile_runs` returns one per combination of a sweep's alternatives,
     and `bux.train.trainer.train` trains one into a directory named for its name and
-    `id`, ``runs/smoke-f114ac17ae/``. The directory keeps it as ``run.json``, and as
+    `id`, ``runs/smoke-5a4f0f7d85/``. The directory keeps it as ``run.json``, and as
     ``run.bux`` (`bux.lang.printer.run_to_source`), which compiles back to the same
     run.
 
@@ -425,7 +425,7 @@ class Run(BaseModel):
     @property
     def id(self) -> str:
         """A hash of what the run computes, not of how it is written, watched or split
-        over devices: ten hex digits, such as ``"f114ac17ae"``.
+        over devices: ten hex digits, such as ``"5a4f0f7d85"``.
 
         Renaming a definition, reaching the same settings through a sweep, logging,
         evaluating, checkpointing or profiling at other steps, or another mesh,

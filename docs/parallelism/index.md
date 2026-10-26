@@ -159,8 +159,8 @@ on top.
 $ bux plan examples/experiments/smoke.bux 'mesh = fsdp: mesh(fsdp=8) | one: mesh(data=1)'
 2 runs
 id          params  tokens  tok/param  flops/tok  gpus  params/gpu  optim/gpu  bubble  run
-f114ac17ae  156k    25.6k   0.2        984k       8     76.2KiB     152KiB     0%      smoke[fsdp]
-f114ac17ae  156k    25.6k   0.2        984k       1     609KiB      1.19MiB    0%      smoke[one]
+5a4f0f7d85  156k    25.6k   0.2        984k       8     76.2KiB     152KiB     0%      smoke[fsdp]
+5a4f0f7d85  156k    25.6k   0.2        984k       1     609KiB      1.19MiB    0%      smoke[one]
 ```
 
 ## Methods
