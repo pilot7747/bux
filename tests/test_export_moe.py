@@ -312,8 +312,7 @@ MLA = (
 YARN = "scaling=yarn(factor=40, original_max_len=4096, attention_factor_on=softmax)"
 # Each zoo file shrunk, as tests/test_examples.py shrinks it: its experts as the file
 # has them but for their numbers and sizes, its layers not exported yet (Mamba-2,
-# KDA, a residual algebra) plain ones, and its deepest repeats cut short; the
-# multi-token heads are left out.
+# KDA) plain attention, and its deepest repeats cut short.
 ZOO = {
     "qwen/qwen3_30b_a3b.bux": [
         f"attn = {GQA}, qk_norm=norm, rope=rope(base=1000000))",
@@ -338,7 +337,6 @@ ZOO = {
         "model = embed layer(dense) layer(experts)^2 norm head",
     ],
     "kimi/kimi_k3.bux": [
-        "residual = none",
         f"kda = {GQA})",
         f"mla = {MLA}, gated=true, rope=none)",
         (
@@ -362,7 +360,6 @@ ZOO = {
         'model = embed "LG"^2 norm head',
     ],
     "muse/muse_spark_open_816b_a42b.bux": [
-        "residual = none",
         (
             f"attn = {GQA}, qk_norm=bare, scale=5.4730064863875 * 8^-0.5, gated=true,"
             " output_norm=bare)"
@@ -387,7 +384,10 @@ ZOO = {
             " shared_expert_sink=true, router=sigmoid, routed_scaling_factor=8,"
             " load_balancing=aux_free, expert=dense)"
         ),
-        'model = embed(norm=norm) "DD" "LLLG" "LG" norm logits',
+        (
+            'model = embed(norm=norm) "DD" "LLLG" "LG" norm @h logits mtp(local)'
+            " mtp(attn)"
+        ),
     ],
     "nemotron/nemotron_3_nano_30b_a3b.bux": [
         f"ssm = {GQA})",
@@ -409,7 +409,7 @@ ZOO = {
             " expert=mlp(intermediate_size=8, activation=relu2),"
             " shared_expert=mlp(intermediate_size=16, activation=relu2))"
         ),
-        'model = embed "MEMEMEMAE" "MEMEMAE" norm out',
+        'model = embed "MEMEMEMAE" "MEMEMAE" norm @h out mtp^2',
     ],
 }
 
