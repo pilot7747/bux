@@ -111,12 +111,14 @@ def pieces(model: Model) -> list[Piece]:
         )
     paths = {id(v): p for p, v in _variables(model)}
     found: list[Piece] = []
-    for item, branch in zip(graph.items, graph.branches, strict=True):
+    for item, branch, name in zip(
+        graph.items, graph.branches, graph.names, strict=True
+    ):
         if isinstance(item, Passes):
-            passes = enumerate(zip(item.items, item.branches, strict=True))
-            found += [Piece(m, paths, _pass(i, b)) for i, (m, b) in passes]
+            passes = enumerate(zip(item.items, item.branches, item.names, strict=True))
+            found += [Piece(m, paths, _pass(i, b, n)) for i, (m, b, n) in passes]
         else:
-            found.append(Piece(item, paths, _item(branch)))
+            found.append(Piece(item, paths, _item(branch, name)))
     return found
 
 
@@ -124,18 +126,19 @@ def _variables(module: nnx.Module) -> list[tuple[tuple, nnx.Variable]]:
     return [(p, v) for p, v in nnx.iter_graph(module) if isinstance(v, nnx.Variable)]
 
 
-def _item(branch: bool) -> Call:
-    """Return how an item of a sequence runs: a branch outside any other as one."""
+def _item(branch: bool, name: str | None = None) -> Call:
+    """Return how an item of a sequence runs: a branch outside any other as one,
+    observed as `name`."""
 
     def call(module: nnx.Module, x: Stream, taps: Taps) -> Stream:
-        return run_branch(module, x, taps) if branch else module(x, taps)
+        return run_branch(module, x, taps, name) if branch else module(x, taps)
 
     return call
 
 
-def _pass(i: int, branch: bool) -> Call:
+def _pass(i: int, branch: bool, name: str | None = None) -> Call:
     """Return how pass `i` of an unrolled repeat runs, as ``repeat.Passes`` runs it."""
-    item = _item(branch)
+    item = _item(branch, name)
 
     def call(module: nnx.Module, x: Stream, taps: Taps) -> Stream:
         with tracing.passes(range(i, i + 1)):

@@ -97,17 +97,17 @@ d48dd7d011  804k    205k    0.3        5.21M      1     3.07MiB     6.13MiB    0
 ```console
 $ bux train mine/tiny.bux
 remat=auto: none in 1s (none 0.1 GiB in 0s)
-tiny step 20/200  loss 6.3815  lr 3.00e-03  grad 0.621  13,138 tok/s
-tiny step 40/200  loss 6.3131  lr 3.00e-03  grad 0.418  28,251 tok/s
-tiny step 60/200  loss 6.2725  lr 3.00e-03  grad 0.360  27,732 tok/s
-tiny step 80/200  loss 6.2650  lr 3.00e-03  grad 0.347  28,332 tok/s
-tiny step 100/200  loss 6.2796  lr 3.00e-03  grad 0.343  24,213 tok/s
+tiny step  20/200  loss 6.3815  lr 3.00e-03  grad 0.621  13,138 tok/s  ...
+tiny step  40/200  loss 6.3131  lr 3.00e-03  grad 0.418  28,251 tok/s  ...
+tiny step  60/200  loss 6.2725  lr 3.00e-03  grad 0.360  27,732 tok/s  ...
+tiny step  80/200  loss 6.2650  lr 3.00e-03  grad 0.347  28,332 tok/s  ...
+tiny step 100/200  loss 6.2796  lr 3.00e-03  grad 0.343  24,213 tok/s  ...
 tiny step 100/200  eval loss 6.2760
-tiny step 120/200  loss 6.2559  lr 3.00e-03  grad 0.337  28,217 tok/s
-tiny step 140/200  loss 6.2747  lr 3.00e-03  grad 0.322  27,784 tok/s
-tiny step 160/200  loss 6.2723  lr 3.00e-03  grad 0.294  27,114 tok/s
-tiny step 180/200  loss 6.2557  lr 1.50e-03  grad 0.571  27,366 tok/s
-tiny step 200/200  loss 6.2419  lr 0.00e+00  grad 10.304  26,585 tok/s
+tiny step 120/200  loss 6.2559  lr 3.00e-03  grad 0.337  28,217 tok/s  ...
+tiny step 140/200  loss 6.2747  lr 3.00e-03  grad 0.322  27,784 tok/s  ...
+tiny step 160/200  loss 6.2723  lr 3.00e-03  grad 0.294  27,114 tok/s  ...
+tiny step 180/200  loss 6.2557  lr 1.50e-03  grad 0.571  27,366 tok/s  ...
+tiny step 200/200  loss 6.2419  lr 0.00e+00  grad 10.304  26,585 tok/s  ...
 tiny step 200/200  eval loss 6.2553
 ```
 
@@ -199,10 +199,10 @@ This time train it with `bux launch`, the launcher, which stops cleanly at a sig
 $ bux launch mine/tiny.bux steps=3000
 tiny: training on cpu of my-laptop with jax 0.12.0
 remat=auto: none in 1s (none 0.1 GiB in 0s)
-tiny step 20/3000  loss 6.3815  lr 3.00e-03  grad 0.621  13,556 tok/s
+tiny step   20/3000  loss 6.3815  lr 3.00e-03  grad 0.621  13,556 tok/s  ...
 ...
-tiny step 200/3000  loss 6.2623  lr 3.00e-03  grad 0.266  26,937 tok/s
-tiny step 200/3000  eval loss 6.2609
+tiny step  200/3000  loss 6.2623  lr 3.00e-03  grad 0.266  26,937 tok/s  ...
+tiny step  200/3000  eval loss 6.2609
 tiny: stopped at step 200 by SIGTERM; launching it again resumes it from its latest checkpoint
 ```
 
@@ -216,9 +216,9 @@ $ bux launch mine/tiny.bux steps=3000
 tiny: training on cpu of my-laptop with jax 0.12.0
 tiny: restored in 0.2s, resuming at step 200
 remat=auto: none in 1s (none 0.1 GiB in 0s)
-tiny step 220/3000  loss 6.2564  lr 3.00e-03  grad 0.274  13,897 tok/s
+tiny step  220/3000  loss 6.2564  lr 3.00e-03  grad 0.274  13,897 tok/s  ...
 ...
-tiny step 380/3000  loss 6.2461  lr 3.00e-03  grad 0.553  28,166 tok/s
+tiny step  380/3000  loss 6.2461  lr 3.00e-03  grad 0.553  28,166 tok/s  ...
 tiny: stopped at step 381 by SIGINT; launching it again resumes it from its latest checkpoint
 ```
 
@@ -230,9 +230,9 @@ $ bux launch mine/tiny.bux steps=3000
 tiny: training on cpu of my-laptop with jax 0.12.0
 tiny: restored in 0.2s, resuming at step 381
 remat=auto: none in 1s (none 0.1 GiB in 0s)
-tiny step 400/3000  loss 6.2491  lr 3.00e-03  grad 0.196  12,293 tok/s
+tiny step  400/3000  loss 6.2491  lr 3.00e-03  grad 0.196  12,293 tok/s  ...
 ...
-tiny step 3000/3000  loss 6.2384  lr 0.00e+00  grad 0.068  27,003 tok/s
+tiny step 3000/3000  loss 6.2384  lr 0.00e+00  grad 0.068  27,003 tok/s  ...
 tiny step 3000/3000  eval loss 6.2385
 tiny: done
 $ bux launch mine/tiny.bux steps=3000

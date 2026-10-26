@@ -21,6 +21,7 @@ from typing import NamedTuple
 
 import jax
 import jax.numpy as jnp
+import numpy as np
 from flax import nnx
 from jax.typing import DTypeLike
 from jaxtyping import Array, Bool, Float, Int
@@ -42,9 +43,9 @@ class Rows(NamedTuple):
 class _Reached(Exception):
     """Raised at the pipelined repeat by a forward that stops there."""
 
-    def __init__(self, x: Stream):
+    def __init__(self, x: Stream, losses: list[Loss]):
         super().__init__("the forward reached the pipelined repeat")
-        self.x = x
+        self.x, self.losses = x, losses
 
 
 # The stream the pipelined repeat gives back without running, or None to stop there.
@@ -53,12 +54,16 @@ _CUT = contextvars.ContextVar[tuple[Stream | None] | None](
 )
 
 
-def stream_into(forward: Callable[[], object]) -> Stream:
+def stream_into(
+    forward: Callable[[], object], reported: list[Loss] | None = None
+) -> Stream:
     """Run `forward`, a model's, up to its pipelined repeat, and return the stream
     that enters the repeat.
 
     Args:
         forward: A call of the model's forward, with no arguments.
+        reported: Where to put the losses the layers before the repeat reported, if
+            given.
 
     Raises:
         ValueError: The forward has no pipelined repeat.
@@ -67,6 +72,8 @@ def stream_into(forward: Callable[[], object]) -> Stream:
     try:
         forward()
     except _Reached as reached:
+        if reported is not None:
+            reported.extend(reached.losses)
         return reached.x
     finally:
         _CUT.reset(token)
@@ -89,7 +96,7 @@ def _cut(x: Stream, taps: Taps) -> Stream:
     """Stop the forward at the repeat, or give back the stream `leaving` set."""
     (y,) = _CUT.get() or (None,)
     if y is None:
-        raise _Reached(x)
+        raise _Reached(x, list(taps.losses))
     taps.losses.clear()
     return y
 
@@ -207,10 +214,13 @@ class Stage:
         return table[jax.lax.axis_index(pipeline.AXIS)]
 
     def report(self, taps: Taps, losses: Float[Array, "r n k"]) -> None:
-        """Add each layer's losses, of values `losses`, to `taps`."""
+        """Add each layer's losses, of values `losses`, to `taps`: of those a stage
+        runs, not of the copies an uneven one holds and skips (``layers_run``)."""
         if not self.reports:
             return
-        for values in losses.reshape(-1, losses.shape[-1]):
+        runs = np.tile(pipeline.layers_run(self.shares).reshape(-1), losses.shape[0])
+        rows = losses.reshape(-1, losses.shape[-1])
+        for values in (row for row, kept in zip(rows, runs, strict=True) if kept):
             taps.losses.extend(
                 Loss(name, weight, v)
                 for (name, weight), v in zip(self.reports, values, strict=True)

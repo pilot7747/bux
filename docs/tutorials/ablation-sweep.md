@@ -166,7 +166,7 @@ $ bux launch mine/ablation.bux
 training 6 runs, one at a time
 ablation[mha, optimizer.lr=1e-3]: training on cpu of my-laptop with jax 0.12.0
 remat=auto: none in 1s (none 0.1 GiB in 0s)
-ablation[mha, optimizer.lr=1e-3] step 50/300  loss 6.2760  lr 1.00e-03  grad 0.427  19,705 tok/s
+ablation[mha, optimizer.lr=1e-3] step  50/300  loss 6.2760  lr 1.00e-03  grad 0.427  19,705 tok/s  ...
 ...
 ablation[mha, optimizer.lr=1e-3] step 300/300  eval loss 6.2489
 ablation[mha, optimizer.lr=1e-3]: done

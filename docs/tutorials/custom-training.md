@@ -154,17 +154,17 @@ Put the three pieces of steps 2 to 4 in `custom.py`, and end it with:
 source = Path("mine/stories.bux").read_text()
 [run] = compile_runs(source, filename="mine/stories.bux")
 latest = train(run, "runs-custom", hooks=[WeightNorm()], sinks=[CSV("metrics.csv")])
-print({name: round(value, 4) for name, value in latest.items()})
+print({name: round(value, 4) for name, value in latest.items() if "/" not in name})
 ```
 
 ```console
 $ uv run python custom.py
 remat=auto: none in 1s (none 0.5 GiB in 1s)
-stories step 25/200  loss 1.4690  lr 3.00e-03  grad 1.233  5,721 tok/s
-stories step 50/200  loss 0.7764  lr 3.00e-03  grad 0.465  7,015 tok/s
-stories step 50/200  eval loss 0.7585  eval bpb 0.2549
+stories step  25/200  loss 1.4690  lr 3.00e-03  grad 1.233  5,721 tok/s  ...
+stories step  50/200  loss 0.7764  lr 3.00e-03  grad 0.465  7,015 tok/s  ...
+stories step  50/200  eval loss 0.7585  eval bpb 0.2549
 ...
-stories step 200/200  loss 0.7185  lr 0.00e+00  grad 0.292  7,746 tok/s
+stories step 200/200  loss 0.7185  lr 0.00e+00  grad 0.292  7,746 tok/s  ...
 stories step 200/200  eval loss 0.7300  eval bpb 0.2452
 {'grad_norm': 0.2923, 'loss': 0.7185, 'lr': 0.0, 'tokens': 204800, 'tokens_per_s': 7746.2419, 'eval_bpb': 0.2452, 'eval_loss': 0.73, 'weight_norm': 300.4004}
 $ grep weight_norm metrics.csv
@@ -225,10 +225,10 @@ print(trainer.evaluate((next(held_out) for _ in range(4)), token_bytes))
 
 ```console
 $ uv run python loop.py
-mine step 25/100  loss 3.1889  lr 1.00e-03  grad 1.401  6,732 tok/s  l2 3.0
-mine step 50/100  loss 1.1689  lr 1.00e-03  grad 0.742  8,144 tok/s  l2 7.9
-mine step 75/100  loss 0.8195  lr 1.00e-03  grad 0.422  8,221 tok/s  l2 10.3
-mine step 100/100  loss 0.7810  lr 1.00e-03  grad 0.514  7,406 tok/s  l2 11.1
+mine step  25/100  loss 3.1889  lr 1.00e-03  grad 1.401  6,732 tok/s  l2 3.0  ...
+mine step  50/100  loss 1.1689  lr 1.00e-03  grad 0.742  8,144 tok/s  l2 7.9  ...
+mine step  75/100  loss 0.8195  lr 1.00e-03  grad 0.422  8,221 tok/s  l2 10.3  ...
+mine step 100/100  loss 0.7810  lr 1.00e-03  grad 0.514  7,406 tok/s  l2 11.1  ...
 {'bpb': 0.26133263263525475, 'loss': 0.77508568701806}
 ```
 

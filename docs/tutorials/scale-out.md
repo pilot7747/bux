@@ -128,18 +128,18 @@ id          params  tokens  tok/param  flops/tok  gpus  params/gpu  optim/gpu  b
 ```console
 $ bux train examples/experiments/parallel/laptop.bux
 remat=auto: none in 1s (none 0.0 GiB in 0s)
-laptop[dp] step 10/10  loss 6.7943  lr 1.00e-03  grad 2.169  5,875 tok/s
+laptop[dp] step 10/10  loss 6.7943  lr 1.00e-03  grad 2.169  5,875 tok/s  ...
 remat=auto: none in 1s (none 0.0 GiB in 0s)
-laptop[fsdp] step 10/10  loss 6.7943  lr 1.00e-03  grad 2.169  5,342 tok/s
+laptop[fsdp] step 10/10  loss 6.7943  lr 1.00e-03  grad 2.169  5,342 tok/s  ...
 remat=auto: none in 1s (none 0.0 GiB in 0s)
-laptop[tp] step 10/10  loss 6.7943  lr 1.00e-03  grad 2.169  5,947 tok/s
+laptop[tp] step 10/10  loss 6.7943  lr 1.00e-03  grad 2.169  5,947 tok/s  ...
 remat=auto: none in 1s (none 0.0 GiB in 0s)
-laptop[ep] step 10/10  loss 6.7943  lr 1.00e-03  grad 2.169  5,260 tok/s
+laptop[ep] step 10/10  loss 6.7943  lr 1.00e-03  grad 2.169  5,260 tok/s  ...
 remat=auto: none in 1s (none 0.0 GiB in 0s)
-laptop[cp] step 10/10  loss 6.7943  lr 1.00e-03  grad 2.169  4,653 tok/s
+laptop[cp] step 10/10  loss 6.7943  lr 1.00e-03  grad 2.169  4,653 tok/s  ...
 laptop[pp]: methods.stages = [1, 1]
 remat=auto: none in 1s (none 0.0 GiB in 0s)
-laptop[pp] step 10/10  loss 6.7943  lr 1.00e-03  grad 2.169  5,846 tok/s
+laptop[pp] step 10/10  loss 6.7943  lr 1.00e-03  grad 2.169  5,846 tok/s  ...
 ```
 
 All six end on the same loss and gradient norm, to the digits printed. Rounding

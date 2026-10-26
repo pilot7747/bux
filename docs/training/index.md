@@ -46,12 +46,15 @@ $ bux plan examples/experiments/smoke.bux
 id          params  tokens  tok/param  flops/tok  gpus  params/gpu  optim/gpu  bubble  run
 f114ac17ae  156k    25.6k   0.2        984k       1     609KiB      1.19MiB    0%      smoke
 $ bux train examples/experiments/smoke.bux
+smoke: runs/smoke-f114ac17ae, on 1 × cpu
+smoke: 156k parameters, 50 steps × 8 × 64 tokens = 25.6k tokens, adamw(lr=0.003), wsd(warmup=10)
+smoke: log every 10
 remat=auto: none in 1s (none 0.0 GiB in 0s)
-smoke step 10/50  loss 6.6252  lr 3.00e-03  grad 1.614  8,069 tok/s
-smoke step 20/50  loss 6.5475  lr 3.00e-03  grad 1.038  74,799 tok/s
-smoke step 30/50  loss 6.3513  lr 3.00e-03  grad 0.554  75,033 tok/s
-smoke step 40/50  loss 6.2974  lr 3.00e-03  grad 0.458  75,813 tok/s
-smoke step 50/50  loss 6.2854  lr 0.00e+00  grad 0.395  74,624 tok/s
+smoke step 10/50  loss 6.6252  lr 3.00e-03  grad 1.614  8,345 tok/s  61 ms/step  data 0.1 ms  compiled in 0.5s  0:00:01 < 0:00:02
+smoke step 20/50  loss 6.5475  lr 3.00e-03  grad 1.038  74,690 tok/s  7 ms/step  data 0.0 ms  0:00:01 < 0:00:00
+smoke step 30/50  loss 6.3513  lr 3.00e-03  grad 0.554  74,647 tok/s  7 ms/step  data 0.0 ms  0:00:01 < 0:00:00
+smoke step 40/50  loss 6.2974  lr 3.00e-03  grad 0.458  76,317 tok/s  7 ms/step  data 0.0 ms  0:00:01 < 0:00:00
+smoke step 50/50  loss 6.2854  lr 0.00e+00  grad 0.395  76,569 tok/s  7 ms/step  data 0.0 ms  0:00:01 < 0:00:00
 ```
 
 The run's files are in `runs/smoke-f114ac17ae/`: the run as one file (`run.bux`), its
@@ -158,6 +161,13 @@ bfloat16, MXFP8 and NVFP4: which projections, which branches, which GEMMs.
 `bux train`, the run directory, run ids, the log, MFU, eval and checkpoints.
 :::
 
+:::{grid-item-card} Observing a run
+:link: observing
+:link-type: doc
+
+The console and `kubectl logs`, timers, the model by layer, W&B and TensorBoard.
+:::
+
 :::{grid-item-card} Launching
 :link: launching
 :link-type: doc
@@ -187,6 +197,7 @@ settings
 optimizers
 precision
 running
+observing
 launching
 extending
 design

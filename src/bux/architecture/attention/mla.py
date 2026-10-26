@@ -114,6 +114,7 @@ class MLA(SoftmaxAttention):
         x = shard_layer_input(x)
         docs = segments(taps)
         q, k, v = self._heads(x, self._query_input(x), docs)
+        self._observe(q, k, docs, taps)
         return self._output(x, self._attend(x, q, k, v, docs))
 
     def _query_input(self, x: Float[Array, "b t d"]) -> Float[Array, "b t e"]:

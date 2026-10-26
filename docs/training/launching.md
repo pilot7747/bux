@@ -94,9 +94,9 @@ smoke run on a laptop:
 $ bux launch examples/experiments/smoke.bux 'optimizer.lr = 1e-3 | 3e-3'
 training 2 runs, one at a time
 smoke[optimizer.lr=1e-3]: training on cpu of laptop with jax 0.12.0
-smoke[optimizer.lr=1e-3] step 10/50  loss 6.6755  lr 1.00e-03  grad 1.731  8,297 tok/s
+smoke[optimizer.lr=1e-3] step 10/50  loss 6.6755  lr 1.00e-03  grad 1.731  8,297 tok/s  ...
 ...
-smoke[optimizer.lr=3e-3] step 50/50  loss 6.2854  lr 0.00e+00  grad 0.395  65,293 tok/s
+smoke[optimizer.lr=3e-3] step 50/50  loss 6.2854  lr 0.00e+00  grad 0.395  65,293 tok/s  ...
 smoke[optimizer.lr=3e-3]: done
 2 runs: 2 done
 state  step   loss    eval loss  run
@@ -210,8 +210,8 @@ GPU:
 srun --nodes=4 --ntasks-per-node=8 bux launch speedrun.bux   # 32 GPUs, one mesh
 ```
 
-- The first process alone writes the console, `metrics.jsonl`, `status.json` and the
-  run's files, and every process writes its part of a checkpoint.
+- The first process alone writes the console, `metrics.jsonl`, `status.json`, the
+  trackers and the run's files, and every process writes its part of a checkpoint.
 - Each process reads only the rows of a batch that its devices hold
   ([Reading prepared data](../data/pipeline.md#reading-prepared-data)).
 - A signal to any of them stops them all after the same step.
@@ -252,16 +252,16 @@ stopped by SIGTERM and launched again:
 ```console
 $ bux launch examples/experiments/smoke.bux steps=3000 'log = log(every=250)' 'checkpoint = checkpoint(every=500)'
 smoke: training on cpu of laptop with jax 0.12.0
-smoke step 250/3000  loss 6.2680  lr 3.00e-03  grad 0.277  57,335 tok/s
+smoke step  250/3000  loss 6.2680  lr 3.00e-03  grad 0.277  57,335 tok/s  ...
 ...
-smoke step 1500/3000  loss 6.2421  lr 3.00e-03  grad 0.061  73,818 tok/s
+smoke step 1500/3000  loss 6.2421  lr 3.00e-03  grad 0.061  73,818 tok/s  ...
 smoke: stopped at step 1500 by SIGTERM; launching it again resumes it from its latest checkpoint
 $ bux launch examples/experiments/smoke.bux steps=3000 'log = log(every=250)' 'checkpoint = checkpoint(every=500)'
 smoke: training on cpu of laptop with jax 0.12.0
 smoke: restored in 0.1s, resuming at step 1500
-smoke step 1750/3000  loss 6.2392  lr 3.00e-03  grad 0.021  56,960 tok/s
+smoke step 1750/3000  loss 6.2392  lr 3.00e-03  grad 0.021  56,960 tok/s  ...
 ...
-smoke step 3000/3000  loss 6.2383  lr 0.00e+00  grad 0.012  74,434 tok/s
+smoke step 3000/3000  loss 6.2383  lr 0.00e+00  grad 0.012  74,434 tok/s  ...
 smoke: done
 ```
 

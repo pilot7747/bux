@@ -14,7 +14,7 @@ from jax.extend.core import ClosedJaxpr, Jaxpr
 from jaxtyping import Array, Float, Int
 
 from bux import parallel
-from bux.architecture import Model, logits
+from bux.architecture import Model, logits, observe
 from bux.lang import compile, compile_runs, ir
 from bux.train import config as tcfg
 from bux.train.data import Batch
@@ -216,6 +216,31 @@ def test_a_head_multiplies_by_the_vocabulary_three_times_by_either_method(
     with _use(ONE, loss):
         jaxpr = jax.make_jaxpr(jax.grad(of))(params)
     assert _vocab_products(jaxpr.jaxpr) == 3 * 3  # 3 heads
+
+
+@pytest.mark.parametrize("loss", LOSSES)
+def test_a_step_that_observes_has_each_head_s_z_loss_with_no_more_products(
+    chunked, loss
+):
+    # Its z-loss's gradient of the head, by chunks a second one, only where the loss
+    # weighs it: observed, it is a sum of the log Z the cross-entropy takes anyway.
+    arch, batch = _arch(HEADS["untied"]), _batch()
+    graphdef, params, rest = nnx.split(Model(arch, rngs=nnx.Rngs(0)), nnx.Param, ...)
+    obj = objective(tcfg.LossConfig(mtp=0.5), arch)
+    weighed = objective(tcfg.LossConfig(mtp=0.5, z=1.0), arch)
+
+    def of(params: nnx.State) -> tuple[Float[Array, ""], dict]:
+        model = nnx.merge(graphdef, params, rest)
+        per_token, _ = obj(model.heads(*_inputs(batch)), batch)
+        return per_token.loss, per_token.metrics
+
+    with _use(ONE, loss), observe.use():
+        jaxpr = jax.make_jaxpr(jax.grad(of, has_aux=True))(params)
+        _, metrics = of(params)
+        model = nnx.merge(graphdef, params, rest)
+        z = weighed(model.heads(*_inputs(batch)), batch)[0].metrics["z_loss"]
+    assert _vocab_products(jaxpr.jaxpr) == 3 * 3  # 3 heads, as without observing
+    assert float(metrics["z_loss/t+1"]) == pytest.approx(float(z), rel=1e-6)
 
 
 def test_chunks_give_the_loss_without_its_gradient_as_logits_do(chunked):

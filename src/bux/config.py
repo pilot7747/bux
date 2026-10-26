@@ -353,6 +353,9 @@ class QuadraticAttentionConfig(AttentionConfig):
     gated: bool = False
     gate_per_head: bool = False  # One gate value per head instead (Laguna).
     gate_activation: Activation = "sigmoid"  # Of the gate (Laguna: softplus).
+    # A learned bias per head on the gate, before its activation, shared by the head's
+    # dims and starting at 0 (Beam).
+    gate_head_bias: bool = False
     # A norm of each head's output, before the gate (Muse); None: none.
     output_norm: NormalizationConfig | None = None
     # Norm of each query and key head, before RoPE (Qwen3); None: none.
@@ -420,6 +423,11 @@ class GQAConfig(QuadraticAttentionConfig):
     # each: the same function and init, held as one matrix (GPT-2, MiMo-V2.6-Pro).
     fused_qkv: bool = False
     rope: RoPEConfig | None = None  # Rotary embedding of q and k; None: no positions.
+    # Queries scaled by (1 + n / power_scale_length) ** power_scale at their position n,
+    # counted from 1, so that attention without RoPE stays sharp at long range (Beam's
+    # global layers); None: no scaling. It scales q, so every attention method runs it.
+    power_scale: float | None = None
+    power_scale_length: int = 2048  # Where the queries' scale reaches 2 ** power_scale.
     # Causal depthwise conv on keys and values, of this many taps, added to them:
     # k + conv(k) (Inkling); None: none.
     kv_conv_size: int | None = None

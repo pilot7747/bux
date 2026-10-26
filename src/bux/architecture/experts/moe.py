@@ -30,6 +30,7 @@ from jaxtyping import Array, Bool, Float, Int, Key
 
 from bux import config as cfg
 from bux import parallel
+from bux.architecture import observe
 from bux.architecture.common.sharding import linear
 from bux.architecture.experts import grouped_blockscaled, grouped_glu
 from bux.architecture.experts.grouped import ragged_dot
@@ -233,6 +234,7 @@ class MoE(nnx.Module):
         _, idx = jax.lax.top_k(choice, config.top_k)
         if training(taps):
             self._balance(scores, idx, taps)
+            self._observe(logits, scores, idx, taps)
         weights = jnp.take_along_axis(scores, idx, axis=-1)
         if config.normalize_top_k:
             total = weights.sum(-1, keepdims=True) + sinks.sum(-1, keepdims=True)
@@ -266,6 +268,41 @@ class MoE(nnx.Module):
             self.router_load[...] = self.router_load[...] + picks.sum((0, 1))
             if not self.update_at_step_end:
                 self.step_end_update()
+
+    def _observe(
+        self,
+        logits: Float[Array, "b t s"],
+        scores: Float[Array, "b t E"],
+        idx: Int[Array, "b t k"],
+        taps: Taps,
+    ) -> None:
+        """Observe the routing, on the steps a run observes (`bux.architecture.observe`):
+
+        - ``router/max_load`` and ``router/min_load``: the most and the fewest picks
+          an expert has, over the mean, 1 when the experts are balanced;
+        - ``router/dead``: the share of experts no token picked;
+        - ``router/entropy``: the mean entropy of a token's scores, normalized over
+          the experts, over that of uniform ones: 1 uniform, 0 sure of one expert;
+        - ``router/z``: the mean of log Z² of the router's logits (ST-MoE's z-loss);
+        - ``router/balance``: the balance loss, whatever its weight (`balance_loss`);
+        - ``router/bias_std``: the spread of the router bias, with one.
+        """
+        if not observe.observing(taps):
+            return
+        n, k = scores.shape[-1], self.config.top_k
+        picks = jax.nn.one_hot(idx, n).sum(-2)
+        load = picks.sum((0, 1))
+        share = load / jnp.maximum(load.mean(), 1e-9)
+        p = scores / jnp.maximum(scores.sum(-1, keepdims=True), 1e-30)
+        entropy = -jnp.sum(p * jnp.log(jnp.maximum(p, 1e-30)), -1).mean() / jnp.log(n)
+        observe.stat(taps, "router/max_load", share.max())
+        observe.stat(taps, "router/min_load", share.min())
+        observe.stat(taps, "router/dead", jnp.mean(load == 0))
+        observe.stat(taps, "router/entropy", entropy)
+        observe.stat(taps, "router/z", jnp.mean(jax.nn.logsumexp(logits, -1) ** 2))
+        observe.stat(taps, "router/balance", balance_loss(scores, picks, k, False))
+        if self.router_bias is not None:
+            observe.stat(taps, "router/bias_std", jnp.std(self.router_bias[...]))
 
     def step_end_update(self) -> None:
         """Move the router bias toward the experts picked less than the mean since it

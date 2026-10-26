@@ -465,7 +465,10 @@ def test_heads_predict_further_ahead_after_each_nextn():
     batch = plain(tokens)
     (total, metrics), _ = objective(tcfg.LossConfig(z=1e-4), arch)(outputs, batch)
     expected = metrics["loss"] + 1e-4 * metrics["z_loss"] + 0.3 * metrics["mtp"]
-    assert jnp.allclose(total, expected) and set(metrics) == {"loss", "z_loss", "mtp"}
+    each = {f"lm_loss/t+{k}" for k in (1, 2, 3)}  # every head's, of weight 0
+    assert jnp.allclose(total, expected)
+    assert set(metrics) == {"loss", "z_loss", "mtp", *each}
+    assert metrics["lm_loss/t+1"] == metrics["loss"]
 
 
 def test_a_head_learns_only_targets_of_its_own_document_in_the_mask():

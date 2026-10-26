@@ -12,6 +12,7 @@ import jax
 from flax import nnx
 from jaxtyping import Array, Float
 
+from bux.architecture import observe
 from bux.architecture.logits import HeadOutput
 from bux.architecture.registry import Loss, Stream, Taps
 
@@ -55,7 +56,7 @@ class Pure:
     ) -> tuple[Stream, nnx.State, Changes, list[Float[Array, ""]]]:
         local = _copy(self.taps, carry)
         module = nnx.merge(self.graphdef, state)
-        y = module(x, local)
+        y = observe.run_pass(module, x, local)
         losses = local.losses
         self.reports = [(loss.name, loss.weight) for loss in losses]
         self.nextn_runs = local.nextn_runs

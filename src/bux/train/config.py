@@ -313,8 +313,8 @@ ScheduleConfig = Annotated[
 
 
 # --- Loss, evaluation, checkpoints and logs ------------------------------------
-# What a run minimizes, and what it does every so many steps: evaluate, save, log and
-# profile. None of these but the loss is in the run's id.
+# What a run minimizes, and what it does every so many steps: evaluate, save, log,
+# observe and profile. None of these but the loss is in the run's id.
 
 
 class LossConfig(Config):
@@ -387,13 +387,64 @@ class CheckpointConfig(Config):
     keep: Positive = 2  # the most recent checkpoints to keep
 
 
+class WandbConfig(Config):
+    """Weights & Biases: every metric and histogram of the run, to a run of `project`
+    named as the run is, with the run's settings as its config and its sweep's
+    choices among them. A run that resumes from a checkpoint goes on logging to the
+    W&B run it started, whose id its directory keeps (wandb_id), and W&B's own files
+    go there too. Only a job's first process logs. It needs the `wandb` extra
+    (`uv sync --extra wandb`) and a key: `wandb login`, or `WANDB_API_KEY`."""
+
+    type: Literal["wandb"] = "wandb"
+    project: str = "bux"  # the W&B project the runs go to
+    entity: str | None = None  # the team or user it is under; none: your default one
+    group: str | None = None  # none: the file's name, which a sweep's runs share
+    tags: tuple[str, ...] = ()  # tags of the W&B run, to filter runs by
+    # online: as it trains; offline: into the run's directory, for `wandb sync`
+    # later; disabled: nowhere.
+    mode: Literal["online", "offline", "disabled"] = "online"
+
+
+class TensorBoardConfig(Config):
+    """TensorBoard: every metric and histogram of the run, as event files in the
+    run's directory under tensorboard/, which `tensorboard --logdir runs` reads. A
+    run that resumes drops the events past its checkpoint. Only a job's first process
+    writes. It needs the `tensorboard` extra (`uv sync --extra tensorboard`)."""
+
+    type: Literal["tensorboard"] = "tensorboard"
+
+
+Tracker = Annotated[WandbConfig | TensorBoardConfig, Field(discriminator="type")]
+
+
 class LogConfig(Config):
     """Training metrics every `every` steps and after the last, to the console and to
-    the run's metrics.jsonl: the loss and its terms, `grad_norm`, `lr`, `tokens`,
-    `tokens_per_s`, and `mfu` on devices whose peak FLOPs bux knows."""
+    the run's metrics.jsonl, and to each of `trackers`: the loss and its terms,
+    `grad_norm`, `lr`, `tokens`, `tokens_per_s`, `mfu` on devices whose peak FLOPs
+    bux knows, the time a step takes and where the host spends it, and the device's
+    memory."""
 
     type: Literal["log"] = "log"
     every: Positive = 10  # steps between logs
+    # Where else the metrics go: `[wandb(project="ablations"), tensorboard]`.
+    trackers: tuple[Tracker, ...] = ()
+
+
+class ObserveConfig(Config):
+    """Every `every` steps, a training step that also measures the model by layer:
+    the residual stream after each branch, each attention's logits on a sample of
+    queries, each MoE's routing, each head's z-loss, and the norms of each layer's
+    gradient, parameters and update. With `histograms`, histograms of ``log2 |x|`` of
+    the stream after each branch and of each layer's gradient too. The metrics go
+    wherever the log's do, at those steps.
+
+    That step compiles apart, once more; the others run as they would without it.
+    It makes the same update as they do, and takes longer: the more so with
+    `histograms`."""
+
+    type: Literal["observe"] = "observe"
+    every: Positive = 100  # steps between the steps that observe the model
+    histograms: bool = False  # take histograms of the stream and the gradients too
 
 
 class ProfileConfig(Config):
@@ -720,7 +771,9 @@ class TrainConfig(Config):
     # under names of their own; none: no eval.
     eval: Evals = None
     checkpoint: CheckpointConfig | None = None  # saves a run resumes from; none: none
-    log: LogConfig = LogConfig()  # metrics to the console and to metrics.jsonl
+    log: LogConfig = LogConfig()  # metrics to the console, metrics.jsonl and trackers
+    # Metrics of the model by layer every so many steps; none: none.
+    observe: ObserveConfig | None = None
     profile: ProfileConfig | None = None  # a trace of a few steps; none: no trace
     precision: PrecisionConfig = PrecisionConfig()  # what the run computes in
     mesh: MeshConfig = MeshConfig()  # the device grid; by default every device on data
@@ -748,6 +801,9 @@ Setting = Annotated[
     | EvalConfig
     | CheckpointConfig
     | LogConfig
+    | WandbConfig
+    | TensorBoardConfig
+    | ObserveConfig
     | ProfileConfig
     | PrecisionConfig
     | RolesConfig

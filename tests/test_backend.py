@@ -179,6 +179,40 @@ def test_new_layer_options_run(body):
     assert logits.shape == (2, 8, V) and bool(jnp.isfinite(logits).all())
 
 
+def gqa(**kw) -> Attention:
+    config = cfg.GQAConfig(num_heads=H, num_kv_heads=2, **kw)
+    return Attention(config, D, (), nnx.Rngs(0))
+
+
+def test_the_power_scale_sharpens_each_query_by_its_position():
+    """Query n's logits, n counted from 1, are scaled by (1 + n / length) ** power:
+    those of a layer whose softmax scale is that much larger, at that query. Packed,
+    n is the query's position in its document."""
+    x = jax.random.normal(jax.random.key(1), (2, 8, D))
+    scaled = gqa(power_scale=0.5, power_scale_length=2)
+    out = scaled(x, Taps())
+    for n in range(8):
+        factor = (1 + (n + 1) / 2) ** 0.5
+        sharper = gqa(scale=factor * (D // H) ** -0.5)(x, Taps())
+        assert jnp.allclose(out[:, n], sharper[:, n], atol=1e-5)
+    positions = jnp.concatenate([jnp.arange(3), jnp.arange(5)])[None].repeat(2, 0)
+    packed = scaled(x, Taps(segments=Segments.of(positions)))
+    assert jnp.allclose(packed[:, 3:], scaled(x[:, 3:], Taps()), atol=1e-5)
+
+
+def test_the_gate_bias_adds_one_value_per_head_before_the_sigmoid():
+    attn = gqa(gated=True, gate_head_bias=True)
+    x = jax.random.normal(jax.random.key(1), (2, 8, D))
+    assert attn.gate is not None and attn.gate_bias is not None
+    assert gqa(gate_head_bias=True).gate_bias is None  # no gate, no bias
+    assert jnp.allclose(attn(x, Taps()), gqa(gated=True)(x, Taps()))  # from 0
+    attn.gate_bias[...] = jnp.arange(H, dtype=jnp.float32)
+    heads = jax.random.normal(jax.random.key(2), (2, 8, H, D // H))
+    gate = attn.gate(x).reshape(2, 8, H, -1) + jnp.arange(H)[:, None]
+    expected = attn.o((heads * jax.nn.sigmoid(gate)).reshape(2, 8, -1))
+    assert jnp.allclose(attn._output(x, heads), expected, atol=1e-5)
+
+
 def test_yarn_matches_transformers():
     # Laguna XS 2.1 full attention: 64 of 128 dims rotated, correction range [7, 18];
     # the expected values come from transformers' _compute_yarn_parameters.
