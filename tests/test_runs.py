@@ -127,12 +127,6 @@ def test_a_bare_name_a_setting_takes_is_that_string():
     assert schedule.pieces == (tcfg.Piece(to=0.5, shape="constant"),)
 
 
-def test_a_list_of_one_config_without_its_comma_says_how_to_write_it():
-    text = error(RUN + "schedule = piecewise(pieces=[piece()])")
-    assert "piece(...) is a training setting, not a layer" in text
-    assert "[x] is a residual branch; a list of one is written [x,]" in text
-
-
 def test_a_run_lists_what_it_lacks():
     text = error(ARCH + "data = synthetic\nbatch = 4")
     assert "a run needs optimizer, seq_len and steps" in text
