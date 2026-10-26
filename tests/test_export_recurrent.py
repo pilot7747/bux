@@ -153,20 +153,22 @@ def test_rwkv7_value_residual_exports() -> None:
     check.compare(compile(source)).check()
 
 
-# Zoo models shrunk as tests/test_examples.py shrinks them; layers not exported yet
-# (gated attention, MLA, sliding windows and ports of gqa, MoE, MTP) are swapped for
-# plain gqa, MLPs and a second head.
-PLAIN = "gqa(num_heads=4, num_kv_heads=2, head_dim=8"
+# Zoo models shrunk as tests/test_examples.py shrinks them; the layers not exported
+# yet (MoE, MTP) are swapped for MLPs and a second head.
+GQA = "gqa(num_heads=4, num_kv_heads=2, head_dim=8"
 ZOO = {
     "qwen3_next.bux": [
         "delta = gdn(num_heads=2, num_v_heads=4, head_dim=8)",
-        f"attn = {PLAIN}, qk_norm=norm, rope=rope(fraction=0.25))",
+        f"attn = {GQA}, gated=true, qk_norm=norm, rope=rope(base=10000000, fraction=0.25))",
         "experts = dense",
         "mtp = $h A norm out",
     ],
     "kimi_linear.bux": [
         "kda = kda(num_heads=2, head_dim=8, output_gate_rank=8, norm_eps=1e-5)",
-        f"mla = {PLAIN}, rope=none)",
+        (
+            "mla = mla(num_heads=2, kv_lora_rank=8, qk_nope_head_dim=4,"
+            " qk_rope_head_dim=4, v_head_dim=4, rope=none)"
+        ),
         "experts = dense",
     ],
     "zamba2.bux": [
@@ -176,17 +178,17 @@ ZOO = {
     ],
     "nemotron/nemotron_3_nano_30b_a3b.bux": [
         "ssm = mamba2(state_size=8, head_dim=8, num_heads=6, num_groups=2)",
-        f"attn = {PLAIN})",
+        f"attn = {GQA})",
         "experts = mlp(intermediate_size=8, activation=relu2)",
     ],
-    "jamba.bux": [f"attn = {PLAIN})", "ssm = mamba(state_size=4)", "experts = dense"],
+    "jamba.bux": [f"attn = {GQA})", "ssm = mamba(state_size=4)", "experts = dense"],
     "hymba.bux": [
-        f"local = {PLAIN}, rope=rope(base=74535))",
+        (
+            f"local = {GQA}, v_head_dim=16, fused_qkv=true, sliding_window_size=4,"
+            " rope=rope(base=74535))"
+        ),
         "ssm = mamba(state_size=4)",
         "ffn = dense",
-        "W = layer(local)",
-        "S = layer(local)",
-        "R = layer(local)",
     ],
 }
 
