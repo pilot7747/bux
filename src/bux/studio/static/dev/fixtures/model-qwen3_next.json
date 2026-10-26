@@ -42,7 +42,10 @@
   "kind": "seq",
   "label": "model",
   "shared": false,
-  "span": null,
+  "span": [
+   843,
+   848
+  ],
   "origin": null,
   "editable": true,
   "items": [
@@ -51,20 +54,25 @@
     "kind": "layer",
     "label": null,
     "shared": false,
-    "span": null,
+    "span": [
+     851,
+     856
+    ],
     "origin": null,
     "editable": true,
     "type": "embed",
     "title": "Token embedding",
     "category": "io",
-    "chips": [],
+    "chips": [
+     "vocab 152k"
+    ],
     "width": "tokens",
-    "ports": [],
     "written": [
-     0,
-     6
+     851,
+     856
     ],
     "internals": null,
+    "ports": [],
     "inserted": false
    },
    {
@@ -72,7 +80,10 @@
     "kind": "repeat",
     "label": null,
     "shared": false,
-    "span": null,
+    "span": [
+     857,
+     866
+    ],
     "origin": null,
     "editable": true,
     "body": {
@@ -80,7 +91,10 @@
      "kind": "seq",
      "label": null,
      "shared": false,
-     "span": null,
+     "span": [
+      857,
+      863
+     ],
      "origin": null,
      "editable": true,
      "items": [
@@ -89,16 +103,22 @@
        "kind": "seq",
        "label": "D",
        "shared": false,
-       "span": null,
+       "span": [
+        858,
+        859
+       ],
        "origin": null,
-       "editable": true,
+       "editable": false,
        "items": [
         {
          "id": "n.1.0.0.0",
          "kind": "residual",
          "label": null,
          "shared": false,
-         "span": null,
+         "span": [
+          725,
+          737
+         ],
          "origin": null,
          "editable": true,
          "body": {
@@ -106,7 +126,10 @@
           "kind": "seq",
           "label": null,
           "shared": false,
-          "span": null,
+          "span": [
+           726,
+           736
+          ],
           "origin": null,
           "editable": true,
           "items": [
@@ -115,22 +138,25 @@
             "kind": "layer",
             "label": "norm",
             "shared": false,
-            "span": null,
+            "span": [
+             726,
+             730
+            ],
             "origin": null,
             "editable": true,
             "type": "rmsnorm",
             "title": "RMSNorm",
             "category": "norm",
             "chips": [
-             "zero-centered"
+             "1 + w"
             ],
             "width": 2048,
-            "ports": [],
             "written": [
-             10,
-             16
+             303,
+             330
             ],
             "internals": null,
+            "ports": [],
             "inserted": false
            },
            {
@@ -138,7 +164,10 @@
             "kind": "layer",
             "label": "delta",
             "shared": false,
-            "span": null,
+            "span": [
+             731,
+             736
+            ],
             "origin": null,
             "editable": true,
             "type": "gdn",
@@ -146,15 +175,209 @@
             "category": "recurrent",
             "chips": [
              "16 heads",
+             "32 V heads",
              "head dim 128"
             ],
             "width": 2048,
-            "ports": [],
             "written": [
-             20,
-             26
+             341,
+             388
             ],
-            "internals": null,
+            "internals": {
+             "id": "n.1.0.0.0.0.1:i",
+             "label": null,
+             "shared": false,
+             "span": null,
+             "origin": null,
+             "editable": false,
+             "kind": "seq",
+             "items": [
+              {
+               "id": "n.1.0.0.0.0.1:i.0",
+               "label": null,
+               "shared": false,
+               "span": null,
+               "origin": null,
+               "editable": false,
+               "kind": "prod",
+               "factors": [
+                {
+                 "id": "n.1.0.0.0.0.1:i.0.0",
+                 "label": null,
+                 "shared": false,
+                 "span": null,
+                 "origin": null,
+                 "editable": false,
+                 "kind": "seq",
+                 "items": [
+                  {
+                   "id": "n.1.0.0.0.0.1:i.0.0.0",
+                   "label": null,
+                   "shared": false,
+                   "span": null,
+                   "origin": null,
+                   "editable": false,
+                   "kind": "layer",
+                   "type": "linear",
+                   "title": "Q, K, V projections",
+                   "category": "op",
+                   "chips": [
+                    "Q, K 16 heads",
+                    "V 32 heads",
+                    "head dim 128"
+                   ],
+                   "width": null,
+                   "ports": [],
+                   "written": null,
+                   "internals": null
+                  },
+                  {
+                   "id": "n.1.0.0.0.0.1:i.0.0.1",
+                   "label": null,
+                   "shared": false,
+                   "span": null,
+                   "origin": null,
+                   "editable": false,
+                   "kind": "layer",
+                   "type": "short",
+                   "title": "Short conv",
+                   "category": "op",
+                   "chips": [
+                    "4 taps",
+                    "SiLU"
+                   ],
+                   "width": null,
+                   "ports": [],
+                   "written": null,
+                   "internals": null
+                  },
+                  {
+                   "id": "n.1.0.0.0.0.1:i.0.0.2",
+                   "label": null,
+                   "shared": false,
+                   "span": null,
+                   "origin": null,
+                   "editable": false,
+                   "kind": "layer",
+                   "type": "l2",
+                   "title": "L2 norm",
+                   "category": "norm",
+                   "chips": [
+                    "q, k"
+                   ],
+                   "width": null,
+                   "ports": [],
+                   "written": null,
+                   "internals": null
+                  },
+                  {
+                   "id": "n.1.0.0.0.0.1:i.0.0.3",
+                   "label": null,
+                   "shared": false,
+                   "span": null,
+                   "origin": null,
+                   "editable": false,
+                   "kind": "layer",
+                   "type": "rule",
+                   "title": "Gated delta rule",
+                   "category": "recurrent",
+                   "chips": [
+                    "state 128 \u00d7 128",
+                    "decay per head"
+                   ],
+                   "width": null,
+                   "ports": [],
+                   "written": null,
+                   "internals": null
+                  },
+                  {
+                   "id": "n.1.0.0.0.0.1:i.0.0.4",
+                   "label": null,
+                   "shared": false,
+                   "span": null,
+                   "origin": null,
+                   "editable": false,
+                   "kind": "layer",
+                   "type": "norm",
+                   "title": "Output norm",
+                   "category": "norm",
+                   "chips": [],
+                   "width": null,
+                   "ports": [],
+                   "written": null,
+                   "internals": null
+                  }
+                 ]
+                },
+                {
+                 "id": "n.1.0.0.0.0.1:i.0.1",
+                 "label": null,
+                 "shared": false,
+                 "span": null,
+                 "origin": null,
+                 "editable": false,
+                 "kind": "seq",
+                 "items": [
+                  {
+                   "id": "n.1.0.0.0.0.1:i.0.1.0",
+                   "label": null,
+                   "shared": false,
+                   "span": null,
+                   "origin": null,
+                   "editable": false,
+                   "kind": "layer",
+                   "type": "linear",
+                   "title": "Linear \u2191 (gate)",
+                   "category": "op",
+                   "chips": [],
+                   "width": null,
+                   "ports": [],
+                   "written": null,
+                   "internals": null
+                  },
+                  {
+                   "id": "n.1.0.0.0.0.1:i.0.1.1",
+                   "label": null,
+                   "shared": false,
+                   "span": null,
+                   "origin": null,
+                   "editable": false,
+                   "kind": "layer",
+                   "type": "act",
+                   "title": "SiLU",
+                   "category": "op",
+                   "chips": [],
+                   "width": null,
+                   "ports": [],
+                   "written": null,
+                   "internals": null
+                  }
+                 ]
+                }
+               ]
+              },
+              {
+               "id": "n.1.0.0.0.0.1:i.1",
+               "label": null,
+               "shared": false,
+               "span": null,
+               "origin": null,
+               "editable": false,
+               "kind": "layer",
+               "type": "linear",
+               "title": "Linear output",
+               "category": "op",
+               "chips": [
+                "4,096 \u2192 2,048"
+               ],
+               "width": null,
+               "ports": [],
+               "written": null,
+               "internals": null
+              }
+             ]
+            },
+            "ports": [],
             "inserted": false
            }
           ]
@@ -165,7 +388,10 @@
          "kind": "residual",
          "label": null,
          "shared": false,
-         "span": null,
+         "span": [
+          738,
+          752
+         ],
          "origin": null,
          "editable": true,
          "body": {
@@ -173,7 +399,10 @@
           "kind": "seq",
           "label": null,
           "shared": false,
-          "span": null,
+          "span": [
+           739,
+           751
+          ],
           "origin": null,
           "editable": true,
           "items": [
@@ -182,22 +411,25 @@
             "kind": "layer",
             "label": "norm",
             "shared": false,
-            "span": null,
+            "span": [
+             739,
+             743
+            ],
             "origin": null,
             "editable": true,
             "type": "rmsnorm",
             "title": "RMSNorm",
             "category": "norm",
             "chips": [
-             "zero-centered"
+             "1 + w"
             ],
             "width": 2048,
-            "ports": [],
             "written": [
-             10,
-             16
+             303,
+             330
             ],
             "internals": null,
+            "ports": [],
             "inserted": false
            },
            {
@@ -205,25 +437,27 @@
             "kind": "layer",
             "label": "experts",
             "shared": false,
-            "span": null,
+            "span": [
+             744,
+             751
+            ],
             "origin": null,
             "editable": true,
             "type": "moe",
             "title": "Mixture of experts",
             "category": "experts",
             "chips": [
-             "512 experts, top 10",
-             "1 shared",
-             "512 hidden"
+             "512 experts \u00b7 top 10 \u00b7 1 shared",
+             "512 hidden",
+             "softmax"
             ],
             "width": 2048,
-            "ports": [],
             "written": [
-             30,
-             36
+             538,
+             708
             ],
             "internals": {
-             "id": "n.1.0.0.1.0.1/i",
+             "id": "n.1.0.0.1.0.1:i",
              "label": null,
              "shared": false,
              "span": null,
@@ -232,69 +466,348 @@
              "kind": "sum",
              "terms": [
               {
-               "id": "n.1.0.0.1.0.1/i.0",
+               "id": "n.1.0.0.1.0.1:i.0",
                "label": null,
                "shared": false,
                "span": null,
                "origin": null,
                "editable": false,
-               "kind": "prod",
-               "factors": [
+               "kind": "seq",
+               "items": [
                 {
-                 "id": "n.1.0.0.1.0.1/i.0.0",
+                 "id": "n.1.0.0.1.0.1:i.0.0",
                  "label": null,
                  "shared": false,
                  "span": null,
                  "origin": null,
                  "editable": false,
-                 "kind": "layer",
-                 "type": "routed experts",
-                 "title": "Routed experts",
-                 "category": "ffn",
-                 "chips": [
-                  "512 \u00d7 SwiGLU, 512"
-                 ],
-                 "ports": [],
-                 "written": null
+                 "kind": "prod",
+                 "factors": [
+                  {
+                   "id": "n.1.0.0.1.0.1:i.0.0.0",
+                   "label": null,
+                   "shared": false,
+                   "span": null,
+                   "origin": null,
+                   "editable": false,
+                   "kind": "layer",
+                   "type": "experts",
+                   "title": "Routed experts",
+                   "category": "ffn",
+                   "chips": [
+                    "\u00d7512",
+                    "SwiGLU \u00b7 512 hidden"
+                   ],
+                   "width": null,
+                   "ports": [],
+                   "written": null,
+                   "internals": {
+                    "id": "n.1.0.0.1.0.1:i.0.0.0:i",
+                    "label": null,
+                    "shared": false,
+                    "span": null,
+                    "origin": null,
+                    "editable": false,
+                    "kind": "seq",
+                    "items": [
+                     {
+                      "id": "n.1.0.0.1.0.1:i.0.0.0:i.0",
+                      "label": null,
+                      "shared": false,
+                      "span": null,
+                      "origin": null,
+                      "editable": false,
+                      "kind": "prod",
+                      "factors": [
+                       {
+                        "id": "n.1.0.0.1.0.1:i.0.0.0:i.0.0",
+                        "label": null,
+                        "shared": false,
+                        "span": null,
+                        "origin": null,
+                        "editable": false,
+                        "kind": "seq",
+                        "items": [
+                         {
+                          "id": "n.1.0.0.1.0.1:i.0.0.0:i.0.0.0",
+                          "label": null,
+                          "shared": false,
+                          "span": null,
+                          "origin": null,
+                          "editable": false,
+                          "kind": "layer",
+                          "type": "linear",
+                          "title": "Linear \u2191 (gate)",
+                          "category": "op",
+                          "chips": [
+                           "2,048 \u2192 512"
+                          ],
+                          "width": null,
+                          "ports": [],
+                          "written": null,
+                          "internals": null
+                         },
+                         {
+                          "id": "n.1.0.0.1.0.1:i.0.0.0:i.0.0.1",
+                          "label": null,
+                          "shared": false,
+                          "span": null,
+                          "origin": null,
+                          "editable": false,
+                          "kind": "layer",
+                          "type": "act",
+                          "title": "SiLU",
+                          "category": "op",
+                          "chips": [],
+                          "width": null,
+                          "ports": [],
+                          "written": null,
+                          "internals": null
+                         }
+                        ]
+                       },
+                       {
+                        "id": "n.1.0.0.1.0.1:i.0.0.0:i.0.1",
+                        "label": null,
+                        "shared": false,
+                        "span": null,
+                        "origin": null,
+                        "editable": false,
+                        "kind": "layer",
+                        "type": "linear",
+                        "title": "Linear \u2191",
+                        "category": "op",
+                        "chips": [
+                         "2,048 \u2192 512"
+                        ],
+                        "width": null,
+                        "ports": [],
+                        "written": null,
+                        "internals": null
+                       }
+                      ]
+                     },
+                     {
+                      "id": "n.1.0.0.1.0.1:i.0.0.0:i.1",
+                      "label": null,
+                      "shared": false,
+                      "span": null,
+                      "origin": null,
+                      "editable": false,
+                      "kind": "layer",
+                      "type": "linear",
+                      "title": "Linear \u2193",
+                      "category": "op",
+                      "chips": [
+                       "512 \u2192 2,048"
+                      ],
+                      "width": null,
+                      "ports": [],
+                      "written": null,
+                      "internals": null
+                     }
+                    ]
+                   }
+                  },
+                  {
+                   "id": "n.1.0.0.1.0.1:i.0.0.1",
+                   "label": null,
+                   "shared": false,
+                   "span": null,
+                   "origin": null,
+                   "editable": false,
+                   "kind": "seq",
+                   "items": [
+                    {
+                     "id": "n.1.0.0.1.0.1:i.0.0.1.0",
+                     "label": null,
+                     "shared": false,
+                     "span": null,
+                     "origin": null,
+                     "editable": false,
+                     "kind": "layer",
+                     "type": "router",
+                     "title": "Router",
+                     "category": "op",
+                     "chips": [
+                      "2048 \u2192 512",
+                      "softmax"
+                     ],
+                     "width": null,
+                     "ports": [],
+                     "written": null,
+                     "internals": null
+                    },
+                    {
+                     "id": "n.1.0.0.1.0.1:i.0.0.1.1",
+                     "label": null,
+                     "shared": false,
+                     "span": null,
+                     "origin": null,
+                     "editable": false,
+                     "kind": "layer",
+                     "type": "topk",
+                     "title": "Top-k",
+                     "category": "op",
+                     "chips": [
+                      "top 10"
+                     ],
+                     "width": null,
+                     "ports": [],
+                     "written": null,
+                     "internals": null
+                    }
+                   ]
+                  }
+                 ]
                 },
                 {
-                 "id": "n.1.0.0.1.0.1/i.0.1",
+                 "id": "n.1.0.0.1.0.1:i.0.1",
                  "label": null,
                  "shared": false,
                  "span": null,
                  "origin": null,
                  "editable": false,
                  "kind": "layer",
-                 "type": "router",
-                 "title": "Router",
+                 "type": "weighted",
+                 "title": "Weighted sum",
                  "category": "op",
-                 "chips": [
-                  "softmax, top 10"
-                 ],
+                 "chips": [],
+                 "width": null,
                  "ports": [],
-                 "written": null
+                 "written": null,
+                 "internals": null
                 }
                ]
               },
               {
-               "id": "n.1.0.0.1.0.1/i.1",
+               "id": "n.1.0.0.1.0.1:i.1",
                "label": null,
                "shared": false,
                "span": null,
                "origin": null,
                "editable": false,
                "kind": "layer",
-               "type": "shared expert",
+               "type": "shared",
                "title": "Shared expert",
                "category": "ffn",
                "chips": [
-                "SwiGLU, 512"
+                "1 \u00d7 512 hidden"
                ],
+               "width": null,
                "ports": [],
-               "written": null
+               "written": null,
+               "internals": {
+                "id": "n.1.0.0.1.0.1:i.1:i",
+                "label": null,
+                "shared": false,
+                "span": null,
+                "origin": null,
+                "editable": false,
+                "kind": "seq",
+                "items": [
+                 {
+                  "id": "n.1.0.0.1.0.1:i.1:i.0",
+                  "label": null,
+                  "shared": false,
+                  "span": null,
+                  "origin": null,
+                  "editable": false,
+                  "kind": "prod",
+                  "factors": [
+                   {
+                    "id": "n.1.0.0.1.0.1:i.1:i.0.0",
+                    "label": null,
+                    "shared": false,
+                    "span": null,
+                    "origin": null,
+                    "editable": false,
+                    "kind": "seq",
+                    "items": [
+                     {
+                      "id": "n.1.0.0.1.0.1:i.1:i.0.0.0",
+                      "label": null,
+                      "shared": false,
+                      "span": null,
+                      "origin": null,
+                      "editable": false,
+                      "kind": "layer",
+                      "type": "linear",
+                      "title": "Linear \u2191 (gate)",
+                      "category": "op",
+                      "chips": [
+                       "2,048 \u2192 512"
+                      ],
+                      "width": null,
+                      "ports": [],
+                      "written": null,
+                      "internals": null
+                     },
+                     {
+                      "id": "n.1.0.0.1.0.1:i.1:i.0.0.1",
+                      "label": null,
+                      "shared": false,
+                      "span": null,
+                      "origin": null,
+                      "editable": false,
+                      "kind": "layer",
+                      "type": "act",
+                      "title": "SiLU",
+                      "category": "op",
+                      "chips": [],
+                      "width": null,
+                      "ports": [],
+                      "written": null,
+                      "internals": null
+                     }
+                    ]
+                   },
+                   {
+                    "id": "n.1.0.0.1.0.1:i.1:i.0.1",
+                    "label": null,
+                    "shared": false,
+                    "span": null,
+                    "origin": null,
+                    "editable": false,
+                    "kind": "layer",
+                    "type": "linear",
+                    "title": "Linear \u2191",
+                    "category": "op",
+                    "chips": [
+                     "2,048 \u2192 512"
+                    ],
+                    "width": null,
+                    "ports": [],
+                    "written": null,
+                    "internals": null
+                   }
+                  ]
+                 },
+                 {
+                  "id": "n.1.0.0.1.0.1:i.1:i.1",
+                  "label": null,
+                  "shared": false,
+                  "span": null,
+                  "origin": null,
+                  "editable": false,
+                  "kind": "layer",
+                  "type": "linear",
+                  "title": "Linear \u2193",
+                  "category": "op",
+                  "chips": [
+                   "512 \u2192 2,048"
+                  ],
+                  "width": null,
+                  "ports": [],
+                  "written": null,
+                  "internals": null
+                 }
+                ]
+               }
               }
              ]
             },
+            "ports": [],
             "inserted": false
            }
           ]
@@ -307,16 +820,22 @@
        "kind": "seq",
        "label": "D",
        "shared": false,
-       "span": null,
+       "span": [
+        859,
+        860
+       ],
        "origin": null,
-       "editable": true,
+       "editable": false,
        "items": [
         {
          "id": "n.1.0.1.0",
          "kind": "residual",
          "label": null,
          "shared": false,
-         "span": null,
+         "span": [
+          725,
+          737
+         ],
          "origin": null,
          "editable": true,
          "body": {
@@ -324,7 +843,10 @@
           "kind": "seq",
           "label": null,
           "shared": false,
-          "span": null,
+          "span": [
+           726,
+           736
+          ],
           "origin": null,
           "editable": true,
           "items": [
@@ -333,22 +855,25 @@
             "kind": "layer",
             "label": "norm",
             "shared": false,
-            "span": null,
+            "span": [
+             726,
+             730
+            ],
             "origin": null,
             "editable": true,
             "type": "rmsnorm",
             "title": "RMSNorm",
             "category": "norm",
             "chips": [
-             "zero-centered"
+             "1 + w"
             ],
             "width": 2048,
-            "ports": [],
             "written": [
-             10,
-             16
+             303,
+             330
             ],
             "internals": null,
+            "ports": [],
             "inserted": false
            },
            {
@@ -356,7 +881,10 @@
             "kind": "layer",
             "label": "delta",
             "shared": false,
-            "span": null,
+            "span": [
+             731,
+             736
+            ],
             "origin": null,
             "editable": true,
             "type": "gdn",
@@ -364,15 +892,209 @@
             "category": "recurrent",
             "chips": [
              "16 heads",
+             "32 V heads",
              "head dim 128"
             ],
             "width": 2048,
-            "ports": [],
             "written": [
-             20,
-             26
+             341,
+             388
             ],
-            "internals": null,
+            "internals": {
+             "id": "n.1.0.1.0.0.1:i",
+             "label": null,
+             "shared": false,
+             "span": null,
+             "origin": null,
+             "editable": false,
+             "kind": "seq",
+             "items": [
+              {
+               "id": "n.1.0.1.0.0.1:i.0",
+               "label": null,
+               "shared": false,
+               "span": null,
+               "origin": null,
+               "editable": false,
+               "kind": "prod",
+               "factors": [
+                {
+                 "id": "n.1.0.1.0.0.1:i.0.0",
+                 "label": null,
+                 "shared": false,
+                 "span": null,
+                 "origin": null,
+                 "editable": false,
+                 "kind": "seq",
+                 "items": [
+                  {
+                   "id": "n.1.0.1.0.0.1:i.0.0.0",
+                   "label": null,
+                   "shared": false,
+                   "span": null,
+                   "origin": null,
+                   "editable": false,
+                   "kind": "layer",
+                   "type": "linear",
+                   "title": "Q, K, V projections",
+                   "category": "op",
+                   "chips": [
+                    "Q, K 16 heads",
+                    "V 32 heads",
+                    "head dim 128"
+                   ],
+                   "width": null,
+                   "ports": [],
+                   "written": null,
+                   "internals": null
+                  },
+                  {
+                   "id": "n.1.0.1.0.0.1:i.0.0.1",
+                   "label": null,
+                   "shared": false,
+                   "span": null,
+                   "origin": null,
+                   "editable": false,
+                   "kind": "layer",
+                   "type": "short",
+                   "title": "Short conv",
+                   "category": "op",
+                   "chips": [
+                    "4 taps",
+                    "SiLU"
+                   ],
+                   "width": null,
+                   "ports": [],
+                   "written": null,
+                   "internals": null
+                  },
+                  {
+                   "id": "n.1.0.1.0.0.1:i.0.0.2",
+                   "label": null,
+                   "shared": false,
+                   "span": null,
+                   "origin": null,
+                   "editable": false,
+                   "kind": "layer",
+                   "type": "l2",
+                   "title": "L2 norm",
+                   "category": "norm",
+                   "chips": [
+                    "q, k"
+                   ],
+                   "width": null,
+                   "ports": [],
+                   "written": null,
+                   "internals": null
+                  },
+                  {
+                   "id": "n.1.0.1.0.0.1:i.0.0.3",
+                   "label": null,
+                   "shared": false,
+                   "span": null,
+                   "origin": null,
+                   "editable": false,
+                   "kind": "layer",
+                   "type": "rule",
+                   "title": "Gated delta rule",
+                   "category": "recurrent",
+                   "chips": [
+                    "state 128 \u00d7 128",
+                    "decay per head"
+                   ],
+                   "width": null,
+                   "ports": [],
+                   "written": null,
+                   "internals": null
+                  },
+                  {
+                   "id": "n.1.0.1.0.0.1:i.0.0.4",
+                   "label": null,
+                   "shared": false,
+                   "span": null,
+                   "origin": null,
+                   "editable": false,
+                   "kind": "layer",
+                   "type": "norm",
+                   "title": "Output norm",
+                   "category": "norm",
+                   "chips": [],
+                   "width": null,
+                   "ports": [],
+                   "written": null,
+                   "internals": null
+                  }
+                 ]
+                },
+                {
+                 "id": "n.1.0.1.0.0.1:i.0.1",
+                 "label": null,
+                 "shared": false,
+                 "span": null,
+                 "origin": null,
+                 "editable": false,
+                 "kind": "seq",
+                 "items": [
+                  {
+                   "id": "n.1.0.1.0.0.1:i.0.1.0",
+                   "label": null,
+                   "shared": false,
+                   "span": null,
+                   "origin": null,
+                   "editable": false,
+                   "kind": "layer",
+                   "type": "linear",
+                   "title": "Linear \u2191 (gate)",
+                   "category": "op",
+                   "chips": [],
+                   "width": null,
+                   "ports": [],
+                   "written": null,
+                   "internals": null
+                  },
+                  {
+                   "id": "n.1.0.1.0.0.1:i.0.1.1",
+                   "label": null,
+                   "shared": false,
+                   "span": null,
+                   "origin": null,
+                   "editable": false,
+                   "kind": "layer",
+                   "type": "act",
+                   "title": "SiLU",
+                   "category": "op",
+                   "chips": [],
+                   "width": null,
+                   "ports": [],
+                   "written": null,
+                   "internals": null
+                  }
+                 ]
+                }
+               ]
+              },
+              {
+               "id": "n.1.0.1.0.0.1:i.1",
+               "label": null,
+               "shared": false,
+               "span": null,
+               "origin": null,
+               "editable": false,
+               "kind": "layer",
+               "type": "linear",
+               "title": "Linear output",
+               "category": "op",
+               "chips": [
+                "4,096 \u2192 2,048"
+               ],
+               "width": null,
+               "ports": [],
+               "written": null,
+               "internals": null
+              }
+             ]
+            },
+            "ports": [],
             "inserted": false
            }
           ]
@@ -383,7 +1105,10 @@
          "kind": "residual",
          "label": null,
          "shared": false,
-         "span": null,
+         "span": [
+          738,
+          752
+         ],
          "origin": null,
          "editable": true,
          "body": {
@@ -391,7 +1116,10 @@
           "kind": "seq",
           "label": null,
           "shared": false,
-          "span": null,
+          "span": [
+           739,
+           751
+          ],
           "origin": null,
           "editable": true,
           "items": [
@@ -400,22 +1128,25 @@
             "kind": "layer",
             "label": "norm",
             "shared": false,
-            "span": null,
+            "span": [
+             739,
+             743
+            ],
             "origin": null,
             "editable": true,
             "type": "rmsnorm",
             "title": "RMSNorm",
             "category": "norm",
             "chips": [
-             "zero-centered"
+             "1 + w"
             ],
             "width": 2048,
-            "ports": [],
             "written": [
-             10,
-             16
+             303,
+             330
             ],
             "internals": null,
+            "ports": [],
             "inserted": false
            },
            {
@@ -423,25 +1154,27 @@
             "kind": "layer",
             "label": "experts",
             "shared": false,
-            "span": null,
+            "span": [
+             744,
+             751
+            ],
             "origin": null,
             "editable": true,
             "type": "moe",
             "title": "Mixture of experts",
             "category": "experts",
             "chips": [
-             "512 experts, top 10",
-             "1 shared",
-             "512 hidden"
+             "512 experts \u00b7 top 10 \u00b7 1 shared",
+             "512 hidden",
+             "softmax"
             ],
             "width": 2048,
-            "ports": [],
             "written": [
-             30,
-             36
+             538,
+             708
             ],
             "internals": {
-             "id": "n.1.0.1.1.0.1/i",
+             "id": "n.1.0.1.1.0.1:i",
              "label": null,
              "shared": false,
              "span": null,
@@ -450,69 +1183,348 @@
              "kind": "sum",
              "terms": [
               {
-               "id": "n.1.0.1.1.0.1/i.0",
+               "id": "n.1.0.1.1.0.1:i.0",
                "label": null,
                "shared": false,
                "span": null,
                "origin": null,
                "editable": false,
-               "kind": "prod",
-               "factors": [
+               "kind": "seq",
+               "items": [
                 {
-                 "id": "n.1.0.1.1.0.1/i.0.0",
+                 "id": "n.1.0.1.1.0.1:i.0.0",
                  "label": null,
                  "shared": false,
                  "span": null,
                  "origin": null,
                  "editable": false,
-                 "kind": "layer",
-                 "type": "routed experts",
-                 "title": "Routed experts",
-                 "category": "ffn",
-                 "chips": [
-                  "512 \u00d7 SwiGLU, 512"
-                 ],
-                 "ports": [],
-                 "written": null
+                 "kind": "prod",
+                 "factors": [
+                  {
+                   "id": "n.1.0.1.1.0.1:i.0.0.0",
+                   "label": null,
+                   "shared": false,
+                   "span": null,
+                   "origin": null,
+                   "editable": false,
+                   "kind": "layer",
+                   "type": "experts",
+                   "title": "Routed experts",
+                   "category": "ffn",
+                   "chips": [
+                    "\u00d7512",
+                    "SwiGLU \u00b7 512 hidden"
+                   ],
+                   "width": null,
+                   "ports": [],
+                   "written": null,
+                   "internals": {
+                    "id": "n.1.0.1.1.0.1:i.0.0.0:i",
+                    "label": null,
+                    "shared": false,
+                    "span": null,
+                    "origin": null,
+                    "editable": false,
+                    "kind": "seq",
+                    "items": [
+                     {
+                      "id": "n.1.0.1.1.0.1:i.0.0.0:i.0",
+                      "label": null,
+                      "shared": false,
+                      "span": null,
+                      "origin": null,
+                      "editable": false,
+                      "kind": "prod",
+                      "factors": [
+                       {
+                        "id": "n.1.0.1.1.0.1:i.0.0.0:i.0.0",
+                        "label": null,
+                        "shared": false,
+                        "span": null,
+                        "origin": null,
+                        "editable": false,
+                        "kind": "seq",
+                        "items": [
+                         {
+                          "id": "n.1.0.1.1.0.1:i.0.0.0:i.0.0.0",
+                          "label": null,
+                          "shared": false,
+                          "span": null,
+                          "origin": null,
+                          "editable": false,
+                          "kind": "layer",
+                          "type": "linear",
+                          "title": "Linear \u2191 (gate)",
+                          "category": "op",
+                          "chips": [
+                           "2,048 \u2192 512"
+                          ],
+                          "width": null,
+                          "ports": [],
+                          "written": null,
+                          "internals": null
+                         },
+                         {
+                          "id": "n.1.0.1.1.0.1:i.0.0.0:i.0.0.1",
+                          "label": null,
+                          "shared": false,
+                          "span": null,
+                          "origin": null,
+                          "editable": false,
+                          "kind": "layer",
+                          "type": "act",
+                          "title": "SiLU",
+                          "category": "op",
+                          "chips": [],
+                          "width": null,
+                          "ports": [],
+                          "written": null,
+                          "internals": null
+                         }
+                        ]
+                       },
+                       {
+                        "id": "n.1.0.1.1.0.1:i.0.0.0:i.0.1",
+                        "label": null,
+                        "shared": false,
+                        "span": null,
+                        "origin": null,
+                        "editable": false,
+                        "kind": "layer",
+                        "type": "linear",
+                        "title": "Linear \u2191",
+                        "category": "op",
+                        "chips": [
+                         "2,048 \u2192 512"
+                        ],
+                        "width": null,
+                        "ports": [],
+                        "written": null,
+                        "internals": null
+                       }
+                      ]
+                     },
+                     {
+                      "id": "n.1.0.1.1.0.1:i.0.0.0:i.1",
+                      "label": null,
+                      "shared": false,
+                      "span": null,
+                      "origin": null,
+                      "editable": false,
+                      "kind": "layer",
+                      "type": "linear",
+                      "title": "Linear \u2193",
+                      "category": "op",
+                      "chips": [
+                       "512 \u2192 2,048"
+                      ],
+                      "width": null,
+                      "ports": [],
+                      "written": null,
+                      "internals": null
+                     }
+                    ]
+                   }
+                  },
+                  {
+                   "id": "n.1.0.1.1.0.1:i.0.0.1",
+                   "label": null,
+                   "shared": false,
+                   "span": null,
+                   "origin": null,
+                   "editable": false,
+                   "kind": "seq",
+                   "items": [
+                    {
+                     "id": "n.1.0.1.1.0.1:i.0.0.1.0",
+                     "label": null,
+                     "shared": false,
+                     "span": null,
+                     "origin": null,
+                     "editable": false,
+                     "kind": "layer",
+                     "type": "router",
+                     "title": "Router",
+                     "category": "op",
+                     "chips": [
+                      "2048 \u2192 512",
+                      "softmax"
+                     ],
+                     "width": null,
+                     "ports": [],
+                     "written": null,
+                     "internals": null
+                    },
+                    {
+                     "id": "n.1.0.1.1.0.1:i.0.0.1.1",
+                     "label": null,
+                     "shared": false,
+                     "span": null,
+                     "origin": null,
+                     "editable": false,
+                     "kind": "layer",
+                     "type": "topk",
+                     "title": "Top-k",
+                     "category": "op",
+                     "chips": [
+                      "top 10"
+                     ],
+                     "width": null,
+                     "ports": [],
+                     "written": null,
+                     "internals": null
+                    }
+                   ]
+                  }
+                 ]
                 },
                 {
-                 "id": "n.1.0.1.1.0.1/i.0.1",
+                 "id": "n.1.0.1.1.0.1:i.0.1",
                  "label": null,
                  "shared": false,
                  "span": null,
                  "origin": null,
                  "editable": false,
                  "kind": "layer",
-                 "type": "router",
-                 "title": "Router",
+                 "type": "weighted",
+                 "title": "Weighted sum",
                  "category": "op",
-                 "chips": [
-                  "softmax, top 10"
-                 ],
+                 "chips": [],
+                 "width": null,
                  "ports": [],
-                 "written": null
+                 "written": null,
+                 "internals": null
                 }
                ]
               },
               {
-               "id": "n.1.0.1.1.0.1/i.1",
+               "id": "n.1.0.1.1.0.1:i.1",
                "label": null,
                "shared": false,
                "span": null,
                "origin": null,
                "editable": false,
                "kind": "layer",
-               "type": "shared expert",
+               "type": "shared",
                "title": "Shared expert",
                "category": "ffn",
                "chips": [
-                "SwiGLU, 512"
+                "1 \u00d7 512 hidden"
                ],
+               "width": null,
                "ports": [],
-               "written": null
+               "written": null,
+               "internals": {
+                "id": "n.1.0.1.1.0.1:i.1:i",
+                "label": null,
+                "shared": false,
+                "span": null,
+                "origin": null,
+                "editable": false,
+                "kind": "seq",
+                "items": [
+                 {
+                  "id": "n.1.0.1.1.0.1:i.1:i.0",
+                  "label": null,
+                  "shared": false,
+                  "span": null,
+                  "origin": null,
+                  "editable": false,
+                  "kind": "prod",
+                  "factors": [
+                   {
+                    "id": "n.1.0.1.1.0.1:i.1:i.0.0",
+                    "label": null,
+                    "shared": false,
+                    "span": null,
+                    "origin": null,
+                    "editable": false,
+                    "kind": "seq",
+                    "items": [
+                     {
+                      "id": "n.1.0.1.1.0.1:i.1:i.0.0.0",
+                      "label": null,
+                      "shared": false,
+                      "span": null,
+                      "origin": null,
+                      "editable": false,
+                      "kind": "layer",
+                      "type": "linear",
+                      "title": "Linear \u2191 (gate)",
+                      "category": "op",
+                      "chips": [
+                       "2,048 \u2192 512"
+                      ],
+                      "width": null,
+                      "ports": [],
+                      "written": null,
+                      "internals": null
+                     },
+                     {
+                      "id": "n.1.0.1.1.0.1:i.1:i.0.0.1",
+                      "label": null,
+                      "shared": false,
+                      "span": null,
+                      "origin": null,
+                      "editable": false,
+                      "kind": "layer",
+                      "type": "act",
+                      "title": "SiLU",
+                      "category": "op",
+                      "chips": [],
+                      "width": null,
+                      "ports": [],
+                      "written": null,
+                      "internals": null
+                     }
+                    ]
+                   },
+                   {
+                    "id": "n.1.0.1.1.0.1:i.1:i.0.1",
+                    "label": null,
+                    "shared": false,
+                    "span": null,
+                    "origin": null,
+                    "editable": false,
+                    "kind": "layer",
+                    "type": "linear",
+                    "title": "Linear \u2191",
+                    "category": "op",
+                    "chips": [
+                     "2,048 \u2192 512"
+                    ],
+                    "width": null,
+                    "ports": [],
+                    "written": null,
+                    "internals": null
+                   }
+                  ]
+                 },
+                 {
+                  "id": "n.1.0.1.1.0.1:i.1:i.1",
+                  "label": null,
+                  "shared": false,
+                  "span": null,
+                  "origin": null,
+                  "editable": false,
+                  "kind": "layer",
+                  "type": "linear",
+                  "title": "Linear \u2193",
+                  "category": "op",
+                  "chips": [
+                   "512 \u2192 2,048"
+                  ],
+                  "width": null,
+                  "ports": [],
+                  "written": null,
+                  "internals": null
+                 }
+                ]
+               }
               }
              ]
             },
+            "ports": [],
             "inserted": false
            }
           ]
@@ -525,16 +1537,22 @@
        "kind": "seq",
        "label": "D",
        "shared": false,
-       "span": null,
+       "span": [
+        860,
+        861
+       ],
        "origin": null,
-       "editable": true,
+       "editable": false,
        "items": [
         {
          "id": "n.1.0.2.0",
          "kind": "residual",
          "label": null,
          "shared": false,
-         "span": null,
+         "span": [
+          725,
+          737
+         ],
          "origin": null,
          "editable": true,
          "body": {
@@ -542,7 +1560,10 @@
           "kind": "seq",
           "label": null,
           "shared": false,
-          "span": null,
+          "span": [
+           726,
+           736
+          ],
           "origin": null,
           "editable": true,
           "items": [
@@ -551,22 +1572,25 @@
             "kind": "layer",
             "label": "norm",
             "shared": false,
-            "span": null,
+            "span": [
+             726,
+             730
+            ],
             "origin": null,
             "editable": true,
             "type": "rmsnorm",
             "title": "RMSNorm",
             "category": "norm",
             "chips": [
-             "zero-centered"
+             "1 + w"
             ],
             "width": 2048,
-            "ports": [],
             "written": [
-             10,
-             16
+             303,
+             330
             ],
             "internals": null,
+            "ports": [],
             "inserted": false
            },
            {
@@ -574,7 +1598,10 @@
             "kind": "layer",
             "label": "delta",
             "shared": false,
-            "span": null,
+            "span": [
+             731,
+             736
+            ],
             "origin": null,
             "editable": true,
             "type": "gdn",
@@ -582,15 +1609,209 @@
             "category": "recurrent",
             "chips": [
              "16 heads",
+             "32 V heads",
              "head dim 128"
             ],
             "width": 2048,
-            "ports": [],
             "written": [
-             20,
-             26
+             341,
+             388
             ],
-            "internals": null,
+            "internals": {
+             "id": "n.1.0.2.0.0.1:i",
+             "label": null,
+             "shared": false,
+             "span": null,
+             "origin": null,
+             "editable": false,
+             "kind": "seq",
+             "items": [
+              {
+               "id": "n.1.0.2.0.0.1:i.0",
+               "label": null,
+               "shared": false,
+               "span": null,
+               "origin": null,
+               "editable": false,
+               "kind": "prod",
+               "factors": [
+                {
+                 "id": "n.1.0.2.0.0.1:i.0.0",
+                 "label": null,
+                 "shared": false,
+                 "span": null,
+                 "origin": null,
+                 "editable": false,
+                 "kind": "seq",
+                 "items": [
+                  {
+                   "id": "n.1.0.2.0.0.1:i.0.0.0",
+                   "label": null,
+                   "shared": false,
+                   "span": null,
+                   "origin": null,
+                   "editable": false,
+                   "kind": "layer",
+                   "type": "linear",
+                   "title": "Q, K, V projections",
+                   "category": "op",
+                   "chips": [
+                    "Q, K 16 heads",
+                    "V 32 heads",
+                    "head dim 128"
+                   ],
+                   "width": null,
+                   "ports": [],
+                   "written": null,
+                   "internals": null
+                  },
+                  {
+                   "id": "n.1.0.2.0.0.1:i.0.0.1",
+                   "label": null,
+                   "shared": false,
+                   "span": null,
+                   "origin": null,
+                   "editable": false,
+                   "kind": "layer",
+                   "type": "short",
+                   "title": "Short conv",
+                   "category": "op",
+                   "chips": [
+                    "4 taps",
+                    "SiLU"
+                   ],
+                   "width": null,
+                   "ports": [],
+                   "written": null,
+                   "internals": null
+                  },
+                  {
+                   "id": "n.1.0.2.0.0.1:i.0.0.2",
+                   "label": null,
+                   "shared": false,
+                   "span": null,
+                   "origin": null,
+                   "editable": false,
+                   "kind": "layer",
+                   "type": "l2",
+                   "title": "L2 norm",
+                   "category": "norm",
+                   "chips": [
+                    "q, k"
+                   ],
+                   "width": null,
+                   "ports": [],
+                   "written": null,
+                   "internals": null
+                  },
+                  {
+                   "id": "n.1.0.2.0.0.1:i.0.0.3",
+                   "label": null,
+                   "shared": false,
+                   "span": null,
+                   "origin": null,
+                   "editable": false,
+                   "kind": "layer",
+                   "type": "rule",
+                   "title": "Gated delta rule",
+                   "category": "recurrent",
+                   "chips": [
+                    "state 128 \u00d7 128",
+                    "decay per head"
+                   ],
+                   "width": null,
+                   "ports": [],
+                   "written": null,
+                   "internals": null
+                  },
+                  {
+                   "id": "n.1.0.2.0.0.1:i.0.0.4",
+                   "label": null,
+                   "shared": false,
+                   "span": null,
+                   "origin": null,
+                   "editable": false,
+                   "kind": "layer",
+                   "type": "norm",
+                   "title": "Output norm",
+                   "category": "norm",
+                   "chips": [],
+                   "width": null,
+                   "ports": [],
+                   "written": null,
+                   "internals": null
+                  }
+                 ]
+                },
+                {
+                 "id": "n.1.0.2.0.0.1:i.0.1",
+                 "label": null,
+                 "shared": false,
+                 "span": null,
+                 "origin": null,
+                 "editable": false,
+                 "kind": "seq",
+                 "items": [
+                  {
+                   "id": "n.1.0.2.0.0.1:i.0.1.0",
+                   "label": null,
+                   "shared": false,
+                   "span": null,
+                   "origin": null,
+                   "editable": false,
+                   "kind": "layer",
+                   "type": "linear",
+                   "title": "Linear \u2191 (gate)",
+                   "category": "op",
+                   "chips": [],
+                   "width": null,
+                   "ports": [],
+                   "written": null,
+                   "internals": null
+                  },
+                  {
+                   "id": "n.1.0.2.0.0.1:i.0.1.1",
+                   "label": null,
+                   "shared": false,
+                   "span": null,
+                   "origin": null,
+                   "editable": false,
+                   "kind": "layer",
+                   "type": "act",
+                   "title": "SiLU",
+                   "category": "op",
+                   "chips": [],
+                   "width": null,
+                   "ports": [],
+                   "written": null,
+                   "internals": null
+                  }
+                 ]
+                }
+               ]
+              },
+              {
+               "id": "n.1.0.2.0.0.1:i.1",
+               "label": null,
+               "shared": false,
+               "span": null,
+               "origin": null,
+               "editable": false,
+               "kind": "layer",
+               "type": "linear",
+               "title": "Linear output",
+               "category": "op",
+               "chips": [
+                "4,096 \u2192 2,048"
+               ],
+               "width": null,
+               "ports": [],
+               "written": null,
+               "internals": null
+              }
+             ]
+            },
+            "ports": [],
             "inserted": false
            }
           ]
@@ -601,7 +1822,10 @@
          "kind": "residual",
          "label": null,
          "shared": false,
-         "span": null,
+         "span": [
+          738,
+          752
+         ],
          "origin": null,
          "editable": true,
          "body": {
@@ -609,7 +1833,10 @@
           "kind": "seq",
           "label": null,
           "shared": false,
-          "span": null,
+          "span": [
+           739,
+           751
+          ],
           "origin": null,
           "editable": true,
           "items": [
@@ -618,22 +1845,25 @@
             "kind": "layer",
             "label": "norm",
             "shared": false,
-            "span": null,
+            "span": [
+             739,
+             743
+            ],
             "origin": null,
             "editable": true,
             "type": "rmsnorm",
             "title": "RMSNorm",
             "category": "norm",
             "chips": [
-             "zero-centered"
+             "1 + w"
             ],
             "width": 2048,
-            "ports": [],
             "written": [
-             10,
-             16
+             303,
+             330
             ],
             "internals": null,
+            "ports": [],
             "inserted": false
            },
            {
@@ -641,25 +1871,27 @@
             "kind": "layer",
             "label": "experts",
             "shared": false,
-            "span": null,
+            "span": [
+             744,
+             751
+            ],
             "origin": null,
             "editable": true,
             "type": "moe",
             "title": "Mixture of experts",
             "category": "experts",
             "chips": [
-             "512 experts, top 10",
-             "1 shared",
-             "512 hidden"
+             "512 experts \u00b7 top 10 \u00b7 1 shared",
+             "512 hidden",
+             "softmax"
             ],
             "width": 2048,
-            "ports": [],
             "written": [
-             30,
-             36
+             538,
+             708
             ],
             "internals": {
-             "id": "n.1.0.2.1.0.1/i",
+             "id": "n.1.0.2.1.0.1:i",
              "label": null,
              "shared": false,
              "span": null,
@@ -668,69 +1900,348 @@
              "kind": "sum",
              "terms": [
               {
-               "id": "n.1.0.2.1.0.1/i.0",
+               "id": "n.1.0.2.1.0.1:i.0",
                "label": null,
                "shared": false,
                "span": null,
                "origin": null,
                "editable": false,
-               "kind": "prod",
-               "factors": [
+               "kind": "seq",
+               "items": [
                 {
-                 "id": "n.1.0.2.1.0.1/i.0.0",
+                 "id": "n.1.0.2.1.0.1:i.0.0",
                  "label": null,
                  "shared": false,
                  "span": null,
                  "origin": null,
                  "editable": false,
-                 "kind": "layer",
-                 "type": "routed experts",
-                 "title": "Routed experts",
-                 "category": "ffn",
-                 "chips": [
-                  "512 \u00d7 SwiGLU, 512"
-                 ],
-                 "ports": [],
-                 "written": null
+                 "kind": "prod",
+                 "factors": [
+                  {
+                   "id": "n.1.0.2.1.0.1:i.0.0.0",
+                   "label": null,
+                   "shared": false,
+                   "span": null,
+                   "origin": null,
+                   "editable": false,
+                   "kind": "layer",
+                   "type": "experts",
+                   "title": "Routed experts",
+                   "category": "ffn",
+                   "chips": [
+                    "\u00d7512",
+                    "SwiGLU \u00b7 512 hidden"
+                   ],
+                   "width": null,
+                   "ports": [],
+                   "written": null,
+                   "internals": {
+                    "id": "n.1.0.2.1.0.1:i.0.0.0:i",
+                    "label": null,
+                    "shared": false,
+                    "span": null,
+                    "origin": null,
+                    "editable": false,
+                    "kind": "seq",
+                    "items": [
+                     {
+                      "id": "n.1.0.2.1.0.1:i.0.0.0:i.0",
+                      "label": null,
+                      "shared": false,
+                      "span": null,
+                      "origin": null,
+                      "editable": false,
+                      "kind": "prod",
+                      "factors": [
+                       {
+                        "id": "n.1.0.2.1.0.1:i.0.0.0:i.0.0",
+                        "label": null,
+                        "shared": false,
+                        "span": null,
+                        "origin": null,
+                        "editable": false,
+                        "kind": "seq",
+                        "items": [
+                         {
+                          "id": "n.1.0.2.1.0.1:i.0.0.0:i.0.0.0",
+                          "label": null,
+                          "shared": false,
+                          "span": null,
+                          "origin": null,
+                          "editable": false,
+                          "kind": "layer",
+                          "type": "linear",
+                          "title": "Linear \u2191 (gate)",
+                          "category": "op",
+                          "chips": [
+                           "2,048 \u2192 512"
+                          ],
+                          "width": null,
+                          "ports": [],
+                          "written": null,
+                          "internals": null
+                         },
+                         {
+                          "id": "n.1.0.2.1.0.1:i.0.0.0:i.0.0.1",
+                          "label": null,
+                          "shared": false,
+                          "span": null,
+                          "origin": null,
+                          "editable": false,
+                          "kind": "layer",
+                          "type": "act",
+                          "title": "SiLU",
+                          "category": "op",
+                          "chips": [],
+                          "width": null,
+                          "ports": [],
+                          "written": null,
+                          "internals": null
+                         }
+                        ]
+                       },
+                       {
+                        "id": "n.1.0.2.1.0.1:i.0.0.0:i.0.1",
+                        "label": null,
+                        "shared": false,
+                        "span": null,
+                        "origin": null,
+                        "editable": false,
+                        "kind": "layer",
+                        "type": "linear",
+                        "title": "Linear \u2191",
+                        "category": "op",
+                        "chips": [
+                         "2,048 \u2192 512"
+                        ],
+                        "width": null,
+                        "ports": [],
+                        "written": null,
+                        "internals": null
+                       }
+                      ]
+                     },
+                     {
+                      "id": "n.1.0.2.1.0.1:i.0.0.0:i.1",
+                      "label": null,
+                      "shared": false,
+                      "span": null,
+                      "origin": null,
+                      "editable": false,
+                      "kind": "layer",
+                      "type": "linear",
+                      "title": "Linear \u2193",
+                      "category": "op",
+                      "chips": [
+                       "512 \u2192 2,048"
+                      ],
+                      "width": null,
+                      "ports": [],
+                      "written": null,
+                      "internals": null
+                     }
+                    ]
+                   }
+                  },
+                  {
+                   "id": "n.1.0.2.1.0.1:i.0.0.1",
+                   "label": null,
+                   "shared": false,
+                   "span": null,
+                   "origin": null,
+                   "editable": false,
+                   "kind": "seq",
+                   "items": [
+                    {
+                     "id": "n.1.0.2.1.0.1:i.0.0.1.0",
+                     "label": null,
+                     "shared": false,
+                     "span": null,
+                     "origin": null,
+                     "editable": false,
+                     "kind": "layer",
+                     "type": "router",
+                     "title": "Router",
+                     "category": "op",
+                     "chips": [
+                      "2048 \u2192 512",
+                      "softmax"
+                     ],
+                     "width": null,
+                     "ports": [],
+                     "written": null,
+                     "internals": null
+                    },
+                    {
+                     "id": "n.1.0.2.1.0.1:i.0.0.1.1",
+                     "label": null,
+                     "shared": false,
+                     "span": null,
+                     "origin": null,
+                     "editable": false,
+                     "kind": "layer",
+                     "type": "topk",
+                     "title": "Top-k",
+                     "category": "op",
+                     "chips": [
+                      "top 10"
+                     ],
+                     "width": null,
+                     "ports": [],
+                     "written": null,
+                     "internals": null
+                    }
+                   ]
+                  }
+                 ]
                 },
                 {
-                 "id": "n.1.0.2.1.0.1/i.0.1",
+                 "id": "n.1.0.2.1.0.1:i.0.1",
                  "label": null,
                  "shared": false,
                  "span": null,
                  "origin": null,
                  "editable": false,
                  "kind": "layer",
-                 "type": "router",
-                 "title": "Router",
+                 "type": "weighted",
+                 "title": "Weighted sum",
                  "category": "op",
-                 "chips": [
-                  "softmax, top 10"
-                 ],
+                 "chips": [],
+                 "width": null,
                  "ports": [],
-                 "written": null
+                 "written": null,
+                 "internals": null
                 }
                ]
               },
               {
-               "id": "n.1.0.2.1.0.1/i.1",
+               "id": "n.1.0.2.1.0.1:i.1",
                "label": null,
                "shared": false,
                "span": null,
                "origin": null,
                "editable": false,
                "kind": "layer",
-               "type": "shared expert",
+               "type": "shared",
                "title": "Shared expert",
                "category": "ffn",
                "chips": [
-                "SwiGLU, 512"
+                "1 \u00d7 512 hidden"
                ],
+               "width": null,
                "ports": [],
-               "written": null
+               "written": null,
+               "internals": {
+                "id": "n.1.0.2.1.0.1:i.1:i",
+                "label": null,
+                "shared": false,
+                "span": null,
+                "origin": null,
+                "editable": false,
+                "kind": "seq",
+                "items": [
+                 {
+                  "id": "n.1.0.2.1.0.1:i.1:i.0",
+                  "label": null,
+                  "shared": false,
+                  "span": null,
+                  "origin": null,
+                  "editable": false,
+                  "kind": "prod",
+                  "factors": [
+                   {
+                    "id": "n.1.0.2.1.0.1:i.1:i.0.0",
+                    "label": null,
+                    "shared": false,
+                    "span": null,
+                    "origin": null,
+                    "editable": false,
+                    "kind": "seq",
+                    "items": [
+                     {
+                      "id": "n.1.0.2.1.0.1:i.1:i.0.0.0",
+                      "label": null,
+                      "shared": false,
+                      "span": null,
+                      "origin": null,
+                      "editable": false,
+                      "kind": "layer",
+                      "type": "linear",
+                      "title": "Linear \u2191 (gate)",
+                      "category": "op",
+                      "chips": [
+                       "2,048 \u2192 512"
+                      ],
+                      "width": null,
+                      "ports": [],
+                      "written": null,
+                      "internals": null
+                     },
+                     {
+                      "id": "n.1.0.2.1.0.1:i.1:i.0.0.1",
+                      "label": null,
+                      "shared": false,
+                      "span": null,
+                      "origin": null,
+                      "editable": false,
+                      "kind": "layer",
+                      "type": "act",
+                      "title": "SiLU",
+                      "category": "op",
+                      "chips": [],
+                      "width": null,
+                      "ports": [],
+                      "written": null,
+                      "internals": null
+                     }
+                    ]
+                   },
+                   {
+                    "id": "n.1.0.2.1.0.1:i.1:i.0.1",
+                    "label": null,
+                    "shared": false,
+                    "span": null,
+                    "origin": null,
+                    "editable": false,
+                    "kind": "layer",
+                    "type": "linear",
+                    "title": "Linear \u2191",
+                    "category": "op",
+                    "chips": [
+                     "2,048 \u2192 512"
+                    ],
+                    "width": null,
+                    "ports": [],
+                    "written": null,
+                    "internals": null
+                   }
+                  ]
+                 },
+                 {
+                  "id": "n.1.0.2.1.0.1:i.1:i.1",
+                  "label": null,
+                  "shared": false,
+                  "span": null,
+                  "origin": null,
+                  "editable": false,
+                  "kind": "layer",
+                  "type": "linear",
+                  "title": "Linear \u2193",
+                  "category": "op",
+                  "chips": [
+                   "512 \u2192 2,048"
+                  ],
+                  "width": null,
+                  "ports": [],
+                  "written": null,
+                  "internals": null
+                 }
+                ]
+               }
               }
              ]
             },
+            "ports": [],
             "inserted": false
            }
           ]
@@ -743,16 +2254,22 @@
        "kind": "seq",
        "label": "A",
        "shared": false,
-       "span": null,
+       "span": [
+        861,
+        862
+       ],
        "origin": null,
-       "editable": true,
+       "editable": false,
        "items": [
         {
          "id": "n.1.0.3.0",
          "kind": "residual",
          "label": null,
          "shared": false,
-         "span": null,
+         "span": [
+          725,
+          737
+         ],
          "origin": null,
          "editable": true,
          "body": {
@@ -760,7 +2277,10 @@
           "kind": "seq",
           "label": null,
           "shared": false,
-          "span": null,
+          "span": [
+           726,
+           736
+          ],
           "origin": null,
           "editable": true,
           "items": [
@@ -769,22 +2289,25 @@
             "kind": "layer",
             "label": "norm",
             "shared": false,
-            "span": null,
+            "span": [
+             726,
+             730
+            ],
             "origin": null,
             "editable": true,
             "type": "rmsnorm",
             "title": "RMSNorm",
             "category": "norm",
             "chips": [
-             "zero-centered"
+             "1 + w"
             ],
             "width": 2048,
-            "ports": [],
             "written": [
-             10,
-             16
+             303,
+             330
             ],
             "internals": null,
+            "ports": [],
             "inserted": false
            },
            {
@@ -792,7 +2315,10 @@
             "kind": "layer",
             "label": "attn",
             "shared": false,
-            "span": null,
+            "span": [
+             731,
+             736
+            ],
             "origin": null,
             "editable": true,
             "type": "gqa",
@@ -801,16 +2327,190 @@
             "chips": [
              "16 heads",
              "2 KV heads",
-             "gated",
-             "RoPE 10M, 25%"
+             "head dim 256",
+             "RoPE 10M \u00b7 25%"
             ],
             "width": 2048,
-            "ports": [],
             "written": [
-             40,
-             46
+             399,
+             527
             ],
-            "internals": null,
+            "internals": {
+             "id": "n.1.0.3.0.0.1:i",
+             "label": null,
+             "shared": false,
+             "span": null,
+             "origin": null,
+             "editable": false,
+             "kind": "seq",
+             "items": [
+              {
+               "id": "n.1.0.3.0.0.1:i.0",
+               "label": null,
+               "shared": false,
+               "span": null,
+               "origin": null,
+               "editable": false,
+               "kind": "prod",
+               "factors": [
+                {
+                 "id": "n.1.0.3.0.0.1:i.0.0",
+                 "label": null,
+                 "shared": false,
+                 "span": null,
+                 "origin": null,
+                 "editable": false,
+                 "kind": "seq",
+                 "items": [
+                  {
+                   "id": "n.1.0.3.0.0.1:i.0.0.0",
+                   "label": null,
+                   "shared": false,
+                   "span": null,
+                   "origin": null,
+                   "editable": false,
+                   "kind": "layer",
+                   "type": "linear",
+                   "title": "Q, K, V projections",
+                   "category": "op",
+                   "chips": [
+                    "Q 16 heads",
+                    "K, V 2 heads",
+                    "head dim 256"
+                   ],
+                   "width": null,
+                   "ports": [],
+                   "written": null,
+                   "internals": null
+                  },
+                  {
+                   "id": "n.1.0.3.0.0.1:i.0.0.1",
+                   "label": null,
+                   "shared": false,
+                   "span": null,
+                   "origin": null,
+                   "editable": false,
+                   "kind": "layer",
+                   "type": "norm",
+                   "title": "QK-norm",
+                   "category": "norm",
+                   "chips": [
+                    "RMSNorm"
+                   ],
+                   "width": null,
+                   "ports": [],
+                   "written": null,
+                   "internals": null
+                  },
+                  {
+                   "id": "n.1.0.3.0.0.1:i.0.0.2",
+                   "label": null,
+                   "shared": false,
+                   "span": null,
+                   "origin": null,
+                   "editable": false,
+                   "kind": "layer",
+                   "type": "rope",
+                   "title": "RoPE",
+                   "category": "op",
+                   "chips": [
+                    "base 10M"
+                   ],
+                   "width": null,
+                   "ports": [],
+                   "written": null,
+                   "internals": null
+                  },
+                  {
+                   "id": "n.1.0.3.0.0.1:i.0.0.3",
+                   "label": null,
+                   "shared": false,
+                   "span": null,
+                   "origin": null,
+                   "editable": false,
+                   "kind": "layer",
+                   "type": "sdpa",
+                   "title": "Scaled dot-product attention",
+                   "category": "attention",
+                   "chips": [
+                    "causal"
+                   ],
+                   "width": null,
+                   "ports": [],
+                   "written": null,
+                   "internals": null
+                  }
+                 ]
+                },
+                {
+                 "id": "n.1.0.3.0.0.1:i.0.1",
+                 "label": null,
+                 "shared": false,
+                 "span": null,
+                 "origin": null,
+                 "editable": false,
+                 "kind": "seq",
+                 "items": [
+                  {
+                   "id": "n.1.0.3.0.0.1:i.0.1.0",
+                   "label": null,
+                   "shared": false,
+                   "span": null,
+                   "origin": null,
+                   "editable": false,
+                   "kind": "layer",
+                   "type": "linear",
+                   "title": "Linear \u2191 (gate)",
+                   "category": "op",
+                   "chips": [],
+                   "width": null,
+                   "ports": [],
+                   "written": null,
+                   "internals": null
+                  },
+                  {
+                   "id": "n.1.0.3.0.0.1:i.0.1.1",
+                   "label": null,
+                   "shared": false,
+                   "span": null,
+                   "origin": null,
+                   "editable": false,
+                   "kind": "layer",
+                   "type": "act",
+                   "title": "Sigmoid",
+                   "category": "op",
+                   "chips": [],
+                   "width": null,
+                   "ports": [],
+                   "written": null,
+                   "internals": null
+                  }
+                 ]
+                }
+               ]
+              },
+              {
+               "id": "n.1.0.3.0.0.1:i.1",
+               "label": null,
+               "shared": false,
+               "span": null,
+               "origin": null,
+               "editable": false,
+               "kind": "layer",
+               "type": "linear",
+               "title": "Linear output",
+               "category": "op",
+               "chips": [
+                "4,096 \u2192 2,048"
+               ],
+               "width": null,
+               "ports": [],
+               "written": null,
+               "internals": null
+              }
+             ]
+            },
+            "ports": [],
             "inserted": false
            }
           ]
@@ -821,7 +2521,10 @@
          "kind": "residual",
          "label": null,
          "shared": false,
-         "span": null,
+         "span": [
+          738,
+          752
+         ],
          "origin": null,
          "editable": true,
          "body": {
@@ -829,7 +2532,10 @@
           "kind": "seq",
           "label": null,
           "shared": false,
-          "span": null,
+          "span": [
+           739,
+           751
+          ],
           "origin": null,
           "editable": true,
           "items": [
@@ -838,22 +2544,25 @@
             "kind": "layer",
             "label": "norm",
             "shared": false,
-            "span": null,
+            "span": [
+             739,
+             743
+            ],
             "origin": null,
             "editable": true,
             "type": "rmsnorm",
             "title": "RMSNorm",
             "category": "norm",
             "chips": [
-             "zero-centered"
+             "1 + w"
             ],
             "width": 2048,
-            "ports": [],
             "written": [
-             10,
-             16
+             303,
+             330
             ],
             "internals": null,
+            "ports": [],
             "inserted": false
            },
            {
@@ -861,25 +2570,27 @@
             "kind": "layer",
             "label": "experts",
             "shared": false,
-            "span": null,
+            "span": [
+             744,
+             751
+            ],
             "origin": null,
             "editable": true,
             "type": "moe",
             "title": "Mixture of experts",
             "category": "experts",
             "chips": [
-             "512 experts, top 10",
-             "1 shared",
-             "512 hidden"
+             "512 experts \u00b7 top 10 \u00b7 1 shared",
+             "512 hidden",
+             "softmax"
             ],
             "width": 2048,
-            "ports": [],
             "written": [
-             30,
-             36
+             538,
+             708
             ],
             "internals": {
-             "id": "n.1.0.3.1.0.1/i",
+             "id": "n.1.0.3.1.0.1:i",
              "label": null,
              "shared": false,
              "span": null,
@@ -888,69 +2599,348 @@
              "kind": "sum",
              "terms": [
               {
-               "id": "n.1.0.3.1.0.1/i.0",
+               "id": "n.1.0.3.1.0.1:i.0",
                "label": null,
                "shared": false,
                "span": null,
                "origin": null,
                "editable": false,
-               "kind": "prod",
-               "factors": [
+               "kind": "seq",
+               "items": [
                 {
-                 "id": "n.1.0.3.1.0.1/i.0.0",
+                 "id": "n.1.0.3.1.0.1:i.0.0",
                  "label": null,
                  "shared": false,
                  "span": null,
                  "origin": null,
                  "editable": false,
-                 "kind": "layer",
-                 "type": "routed experts",
-                 "title": "Routed experts",
-                 "category": "ffn",
-                 "chips": [
-                  "512 \u00d7 SwiGLU, 512"
-                 ],
-                 "ports": [],
-                 "written": null
+                 "kind": "prod",
+                 "factors": [
+                  {
+                   "id": "n.1.0.3.1.0.1:i.0.0.0",
+                   "label": null,
+                   "shared": false,
+                   "span": null,
+                   "origin": null,
+                   "editable": false,
+                   "kind": "layer",
+                   "type": "experts",
+                   "title": "Routed experts",
+                   "category": "ffn",
+                   "chips": [
+                    "\u00d7512",
+                    "SwiGLU \u00b7 512 hidden"
+                   ],
+                   "width": null,
+                   "ports": [],
+                   "written": null,
+                   "internals": {
+                    "id": "n.1.0.3.1.0.1:i.0.0.0:i",
+                    "label": null,
+                    "shared": false,
+                    "span": null,
+                    "origin": null,
+                    "editable": false,
+                    "kind": "seq",
+                    "items": [
+                     {
+                      "id": "n.1.0.3.1.0.1:i.0.0.0:i.0",
+                      "label": null,
+                      "shared": false,
+                      "span": null,
+                      "origin": null,
+                      "editable": false,
+                      "kind": "prod",
+                      "factors": [
+                       {
+                        "id": "n.1.0.3.1.0.1:i.0.0.0:i.0.0",
+                        "label": null,
+                        "shared": false,
+                        "span": null,
+                        "origin": null,
+                        "editable": false,
+                        "kind": "seq",
+                        "items": [
+                         {
+                          "id": "n.1.0.3.1.0.1:i.0.0.0:i.0.0.0",
+                          "label": null,
+                          "shared": false,
+                          "span": null,
+                          "origin": null,
+                          "editable": false,
+                          "kind": "layer",
+                          "type": "linear",
+                          "title": "Linear \u2191 (gate)",
+                          "category": "op",
+                          "chips": [
+                           "2,048 \u2192 512"
+                          ],
+                          "width": null,
+                          "ports": [],
+                          "written": null,
+                          "internals": null
+                         },
+                         {
+                          "id": "n.1.0.3.1.0.1:i.0.0.0:i.0.0.1",
+                          "label": null,
+                          "shared": false,
+                          "span": null,
+                          "origin": null,
+                          "editable": false,
+                          "kind": "layer",
+                          "type": "act",
+                          "title": "SiLU",
+                          "category": "op",
+                          "chips": [],
+                          "width": null,
+                          "ports": [],
+                          "written": null,
+                          "internals": null
+                         }
+                        ]
+                       },
+                       {
+                        "id": "n.1.0.3.1.0.1:i.0.0.0:i.0.1",
+                        "label": null,
+                        "shared": false,
+                        "span": null,
+                        "origin": null,
+                        "editable": false,
+                        "kind": "layer",
+                        "type": "linear",
+                        "title": "Linear \u2191",
+                        "category": "op",
+                        "chips": [
+                         "2,048 \u2192 512"
+                        ],
+                        "width": null,
+                        "ports": [],
+                        "written": null,
+                        "internals": null
+                       }
+                      ]
+                     },
+                     {
+                      "id": "n.1.0.3.1.0.1:i.0.0.0:i.1",
+                      "label": null,
+                      "shared": false,
+                      "span": null,
+                      "origin": null,
+                      "editable": false,
+                      "kind": "layer",
+                      "type": "linear",
+                      "title": "Linear \u2193",
+                      "category": "op",
+                      "chips": [
+                       "512 \u2192 2,048"
+                      ],
+                      "width": null,
+                      "ports": [],
+                      "written": null,
+                      "internals": null
+                     }
+                    ]
+                   }
+                  },
+                  {
+                   "id": "n.1.0.3.1.0.1:i.0.0.1",
+                   "label": null,
+                   "shared": false,
+                   "span": null,
+                   "origin": null,
+                   "editable": false,
+                   "kind": "seq",
+                   "items": [
+                    {
+                     "id": "n.1.0.3.1.0.1:i.0.0.1.0",
+                     "label": null,
+                     "shared": false,
+                     "span": null,
+                     "origin": null,
+                     "editable": false,
+                     "kind": "layer",
+                     "type": "router",
+                     "title": "Router",
+                     "category": "op",
+                     "chips": [
+                      "2048 \u2192 512",
+                      "softmax"
+                     ],
+                     "width": null,
+                     "ports": [],
+                     "written": null,
+                     "internals": null
+                    },
+                    {
+                     "id": "n.1.0.3.1.0.1:i.0.0.1.1",
+                     "label": null,
+                     "shared": false,
+                     "span": null,
+                     "origin": null,
+                     "editable": false,
+                     "kind": "layer",
+                     "type": "topk",
+                     "title": "Top-k",
+                     "category": "op",
+                     "chips": [
+                      "top 10"
+                     ],
+                     "width": null,
+                     "ports": [],
+                     "written": null,
+                     "internals": null
+                    }
+                   ]
+                  }
+                 ]
                 },
                 {
-                 "id": "n.1.0.3.1.0.1/i.0.1",
+                 "id": "n.1.0.3.1.0.1:i.0.1",
                  "label": null,
                  "shared": false,
                  "span": null,
                  "origin": null,
                  "editable": false,
                  "kind": "layer",
-                 "type": "router",
-                 "title": "Router",
+                 "type": "weighted",
+                 "title": "Weighted sum",
                  "category": "op",
-                 "chips": [
-                  "softmax, top 10"
-                 ],
+                 "chips": [],
+                 "width": null,
                  "ports": [],
-                 "written": null
+                 "written": null,
+                 "internals": null
                 }
                ]
               },
               {
-               "id": "n.1.0.3.1.0.1/i.1",
+               "id": "n.1.0.3.1.0.1:i.1",
                "label": null,
                "shared": false,
                "span": null,
                "origin": null,
                "editable": false,
                "kind": "layer",
-               "type": "shared expert",
+               "type": "shared",
                "title": "Shared expert",
                "category": "ffn",
                "chips": [
-                "SwiGLU, 512"
+                "1 \u00d7 512 hidden"
                ],
+               "width": null,
                "ports": [],
-               "written": null
+               "written": null,
+               "internals": {
+                "id": "n.1.0.3.1.0.1:i.1:i",
+                "label": null,
+                "shared": false,
+                "span": null,
+                "origin": null,
+                "editable": false,
+                "kind": "seq",
+                "items": [
+                 {
+                  "id": "n.1.0.3.1.0.1:i.1:i.0",
+                  "label": null,
+                  "shared": false,
+                  "span": null,
+                  "origin": null,
+                  "editable": false,
+                  "kind": "prod",
+                  "factors": [
+                   {
+                    "id": "n.1.0.3.1.0.1:i.1:i.0.0",
+                    "label": null,
+                    "shared": false,
+                    "span": null,
+                    "origin": null,
+                    "editable": false,
+                    "kind": "seq",
+                    "items": [
+                     {
+                      "id": "n.1.0.3.1.0.1:i.1:i.0.0.0",
+                      "label": null,
+                      "shared": false,
+                      "span": null,
+                      "origin": null,
+                      "editable": false,
+                      "kind": "layer",
+                      "type": "linear",
+                      "title": "Linear \u2191 (gate)",
+                      "category": "op",
+                      "chips": [
+                       "2,048 \u2192 512"
+                      ],
+                      "width": null,
+                      "ports": [],
+                      "written": null,
+                      "internals": null
+                     },
+                     {
+                      "id": "n.1.0.3.1.0.1:i.1:i.0.0.1",
+                      "label": null,
+                      "shared": false,
+                      "span": null,
+                      "origin": null,
+                      "editable": false,
+                      "kind": "layer",
+                      "type": "act",
+                      "title": "SiLU",
+                      "category": "op",
+                      "chips": [],
+                      "width": null,
+                      "ports": [],
+                      "written": null,
+                      "internals": null
+                     }
+                    ]
+                   },
+                   {
+                    "id": "n.1.0.3.1.0.1:i.1:i.0.1",
+                    "label": null,
+                    "shared": false,
+                    "span": null,
+                    "origin": null,
+                    "editable": false,
+                    "kind": "layer",
+                    "type": "linear",
+                    "title": "Linear \u2191",
+                    "category": "op",
+                    "chips": [
+                     "2,048 \u2192 512"
+                    ],
+                    "width": null,
+                    "ports": [],
+                    "written": null,
+                    "internals": null
+                   }
+                  ]
+                 },
+                 {
+                  "id": "n.1.0.3.1.0.1:i.1:i.1",
+                  "label": null,
+                  "shared": false,
+                  "span": null,
+                  "origin": null,
+                  "editable": false,
+                  "kind": "layer",
+                  "type": "linear",
+                  "title": "Linear \u2193",
+                  "category": "op",
+                  "chips": [
+                   "512 \u2192 2,048"
+                  ],
+                  "width": null,
+                  "ports": [],
+                  "written": null,
+                  "internals": null
+                 }
+                ]
+               }
               }
              ]
             },
+            "ports": [],
             "inserted": false
            }
           ]
@@ -967,22 +2957,25 @@
     "kind": "layer",
     "label": "norm",
     "shared": false,
-    "span": null,
+    "span": [
+     867,
+     871
+    ],
     "origin": null,
     "editable": true,
     "type": "rmsnorm",
     "title": "RMSNorm",
     "category": "norm",
     "chips": [
-     "zero-centered"
+     "1 + w"
     ],
     "width": 2048,
-    "ports": [],
     "written": [
-     10,
-     16
+     303,
+     330
     ],
     "internals": null,
+    "ports": [],
     "inserted": false
    },
    {
@@ -990,31 +2983,38 @@
     "kind": "tap",
     "label": null,
     "shared": false,
-    "span": null,
+    "span": [
+     872,
+     874
+    ],
     "origin": null,
     "editable": true,
-    "name": "h",
-    "pop": false
+    "name": "h"
    },
    {
     "id": "n.4",
     "kind": "layer",
     "label": "out",
     "shared": true,
-    "span": null,
+    "span": [
+     875,
+     878
+    ],
     "origin": null,
     "editable": true,
     "type": "head",
     "title": "Linear output layer",
     "category": "io",
-    "chips": [],
+    "chips": [
+     "vocab 152k"
+    ],
     "width": 2048,
-    "ports": [],
     "written": [
-     50,
-     56
+     800,
+     804
     ],
     "internals": null,
+    "ports": [],
     "inserted": false
    },
    {
@@ -1022,7 +3022,10 @@
     "kind": "seq",
     "label": "mtp",
     "shared": false,
-    "span": null,
+    "span": [
+     879,
+     882
+    ],
     "origin": null,
     "editable": true,
     "items": [
@@ -1031,7 +3034,10 @@
       "kind": "ref",
       "label": null,
       "shared": false,
-      "span": null,
+      "span": [
+       811,
+       813
+      ],
       "origin": null,
       "editable": true,
       "name": "h",
@@ -1042,20 +3048,23 @@
       "kind": "layer",
       "label": null,
       "shared": false,
-      "span": null,
+      "span": [
+       814,
+       830
+      ],
       "origin": null,
       "editable": true,
       "type": "nextn",
-      "title": "Next-token projection",
+      "title": "Multi-token prediction",
       "category": "io",
       "chips": [],
       "width": 2048,
-      "ports": [],
       "written": [
-       60,
-       66
+       814,
+       830
       ],
       "internals": null,
+      "ports": [],
       "inserted": false
      },
      {
@@ -1063,7 +3072,10 @@
       "kind": "seq",
       "label": "A",
       "shared": false,
-      "span": null,
+      "span": [
+       831,
+       832
+      ],
       "origin": null,
       "editable": true,
       "items": [
@@ -1072,7 +3084,10 @@
         "kind": "residual",
         "label": null,
         "shared": false,
-        "span": null,
+        "span": [
+         725,
+         737
+        ],
         "origin": null,
         "editable": true,
         "body": {
@@ -1080,7 +3095,10 @@
          "kind": "seq",
          "label": null,
          "shared": false,
-         "span": null,
+         "span": [
+          726,
+          736
+         ],
          "origin": null,
          "editable": true,
          "items": [
@@ -1089,22 +3107,25 @@
            "kind": "layer",
            "label": "norm",
            "shared": false,
-           "span": null,
+           "span": [
+            726,
+            730
+           ],
            "origin": null,
            "editable": true,
            "type": "rmsnorm",
            "title": "RMSNorm",
            "category": "norm",
            "chips": [
-            "zero-centered"
+            "1 + w"
            ],
            "width": 2048,
-           "ports": [],
            "written": [
-            10,
-            16
+            303,
+            330
            ],
            "internals": null,
+           "ports": [],
            "inserted": false
           },
           {
@@ -1112,7 +3133,10 @@
            "kind": "layer",
            "label": "attn",
            "shared": false,
-           "span": null,
+           "span": [
+            731,
+            736
+           ],
            "origin": null,
            "editable": true,
            "type": "gqa",
@@ -1121,16 +3145,190 @@
            "chips": [
             "16 heads",
             "2 KV heads",
-            "gated",
-            "RoPE 10M, 25%"
+            "head dim 256",
+            "RoPE 10M \u00b7 25%"
            ],
            "width": 2048,
-           "ports": [],
            "written": [
-            40,
-            46
+            399,
+            527
            ],
-           "internals": null,
+           "internals": {
+            "id": "n.5.2.0.0.1:i",
+            "label": null,
+            "shared": false,
+            "span": null,
+            "origin": null,
+            "editable": false,
+            "kind": "seq",
+            "items": [
+             {
+              "id": "n.5.2.0.0.1:i.0",
+              "label": null,
+              "shared": false,
+              "span": null,
+              "origin": null,
+              "editable": false,
+              "kind": "prod",
+              "factors": [
+               {
+                "id": "n.5.2.0.0.1:i.0.0",
+                "label": null,
+                "shared": false,
+                "span": null,
+                "origin": null,
+                "editable": false,
+                "kind": "seq",
+                "items": [
+                 {
+                  "id": "n.5.2.0.0.1:i.0.0.0",
+                  "label": null,
+                  "shared": false,
+                  "span": null,
+                  "origin": null,
+                  "editable": false,
+                  "kind": "layer",
+                  "type": "linear",
+                  "title": "Q, K, V projections",
+                  "category": "op",
+                  "chips": [
+                   "Q 16 heads",
+                   "K, V 2 heads",
+                   "head dim 256"
+                  ],
+                  "width": null,
+                  "ports": [],
+                  "written": null,
+                  "internals": null
+                 },
+                 {
+                  "id": "n.5.2.0.0.1:i.0.0.1",
+                  "label": null,
+                  "shared": false,
+                  "span": null,
+                  "origin": null,
+                  "editable": false,
+                  "kind": "layer",
+                  "type": "norm",
+                  "title": "QK-norm",
+                  "category": "norm",
+                  "chips": [
+                   "RMSNorm"
+                  ],
+                  "width": null,
+                  "ports": [],
+                  "written": null,
+                  "internals": null
+                 },
+                 {
+                  "id": "n.5.2.0.0.1:i.0.0.2",
+                  "label": null,
+                  "shared": false,
+                  "span": null,
+                  "origin": null,
+                  "editable": false,
+                  "kind": "layer",
+                  "type": "rope",
+                  "title": "RoPE",
+                  "category": "op",
+                  "chips": [
+                   "base 10M"
+                  ],
+                  "width": null,
+                  "ports": [],
+                  "written": null,
+                  "internals": null
+                 },
+                 {
+                  "id": "n.5.2.0.0.1:i.0.0.3",
+                  "label": null,
+                  "shared": false,
+                  "span": null,
+                  "origin": null,
+                  "editable": false,
+                  "kind": "layer",
+                  "type": "sdpa",
+                  "title": "Scaled dot-product attention",
+                  "category": "attention",
+                  "chips": [
+                   "causal"
+                  ],
+                  "width": null,
+                  "ports": [],
+                  "written": null,
+                  "internals": null
+                 }
+                ]
+               },
+               {
+                "id": "n.5.2.0.0.1:i.0.1",
+                "label": null,
+                "shared": false,
+                "span": null,
+                "origin": null,
+                "editable": false,
+                "kind": "seq",
+                "items": [
+                 {
+                  "id": "n.5.2.0.0.1:i.0.1.0",
+                  "label": null,
+                  "shared": false,
+                  "span": null,
+                  "origin": null,
+                  "editable": false,
+                  "kind": "layer",
+                  "type": "linear",
+                  "title": "Linear \u2191 (gate)",
+                  "category": "op",
+                  "chips": [],
+                  "width": null,
+                  "ports": [],
+                  "written": null,
+                  "internals": null
+                 },
+                 {
+                  "id": "n.5.2.0.0.1:i.0.1.1",
+                  "label": null,
+                  "shared": false,
+                  "span": null,
+                  "origin": null,
+                  "editable": false,
+                  "kind": "layer",
+                  "type": "act",
+                  "title": "Sigmoid",
+                  "category": "op",
+                  "chips": [],
+                  "width": null,
+                  "ports": [],
+                  "written": null,
+                  "internals": null
+                 }
+                ]
+               }
+              ]
+             },
+             {
+              "id": "n.5.2.0.0.1:i.1",
+              "label": null,
+              "shared": false,
+              "span": null,
+              "origin": null,
+              "editable": false,
+              "kind": "layer",
+              "type": "linear",
+              "title": "Linear output",
+              "category": "op",
+              "chips": [
+               "4,096 \u2192 2,048"
+              ],
+              "width": null,
+              "ports": [],
+              "written": null,
+              "internals": null
+             }
+            ]
+           },
+           "ports": [],
            "inserted": false
           }
          ]
@@ -1141,7 +3339,10 @@
         "kind": "residual",
         "label": null,
         "shared": false,
-        "span": null,
+        "span": [
+         738,
+         752
+        ],
         "origin": null,
         "editable": true,
         "body": {
@@ -1149,7 +3350,10 @@
          "kind": "seq",
          "label": null,
          "shared": false,
-         "span": null,
+         "span": [
+          739,
+          751
+         ],
          "origin": null,
          "editable": true,
          "items": [
@@ -1158,22 +3362,25 @@
            "kind": "layer",
            "label": "norm",
            "shared": false,
-           "span": null,
+           "span": [
+            739,
+            743
+           ],
            "origin": null,
            "editable": true,
            "type": "rmsnorm",
            "title": "RMSNorm",
            "category": "norm",
            "chips": [
-            "zero-centered"
+            "1 + w"
            ],
            "width": 2048,
-           "ports": [],
            "written": [
-            10,
-            16
+            303,
+            330
            ],
            "internals": null,
+           "ports": [],
            "inserted": false
           },
           {
@@ -1181,25 +3388,27 @@
            "kind": "layer",
            "label": "experts",
            "shared": false,
-           "span": null,
+           "span": [
+            744,
+            751
+           ],
            "origin": null,
            "editable": true,
            "type": "moe",
            "title": "Mixture of experts",
            "category": "experts",
            "chips": [
-            "512 experts, top 10",
-            "1 shared",
-            "512 hidden"
+            "512 experts \u00b7 top 10 \u00b7 1 shared",
+            "512 hidden",
+            "softmax"
            ],
            "width": 2048,
-           "ports": [],
            "written": [
-            30,
-            36
+            538,
+            708
            ],
            "internals": {
-            "id": "n.5.2.1.0.1/i",
+            "id": "n.5.2.1.0.1:i",
             "label": null,
             "shared": false,
             "span": null,
@@ -1208,69 +3417,348 @@
             "kind": "sum",
             "terms": [
              {
-              "id": "n.5.2.1.0.1/i.0",
+              "id": "n.5.2.1.0.1:i.0",
               "label": null,
               "shared": false,
               "span": null,
               "origin": null,
               "editable": false,
-              "kind": "prod",
-              "factors": [
+              "kind": "seq",
+              "items": [
                {
-                "id": "n.5.2.1.0.1/i.0.0",
+                "id": "n.5.2.1.0.1:i.0.0",
                 "label": null,
                 "shared": false,
                 "span": null,
                 "origin": null,
                 "editable": false,
-                "kind": "layer",
-                "type": "routed experts",
-                "title": "Routed experts",
-                "category": "ffn",
-                "chips": [
-                 "512 \u00d7 SwiGLU, 512"
-                ],
-                "ports": [],
-                "written": null
+                "kind": "prod",
+                "factors": [
+                 {
+                  "id": "n.5.2.1.0.1:i.0.0.0",
+                  "label": null,
+                  "shared": false,
+                  "span": null,
+                  "origin": null,
+                  "editable": false,
+                  "kind": "layer",
+                  "type": "experts",
+                  "title": "Routed experts",
+                  "category": "ffn",
+                  "chips": [
+                   "\u00d7512",
+                   "SwiGLU \u00b7 512 hidden"
+                  ],
+                  "width": null,
+                  "ports": [],
+                  "written": null,
+                  "internals": {
+                   "id": "n.5.2.1.0.1:i.0.0.0:i",
+                   "label": null,
+                   "shared": false,
+                   "span": null,
+                   "origin": null,
+                   "editable": false,
+                   "kind": "seq",
+                   "items": [
+                    {
+                     "id": "n.5.2.1.0.1:i.0.0.0:i.0",
+                     "label": null,
+                     "shared": false,
+                     "span": null,
+                     "origin": null,
+                     "editable": false,
+                     "kind": "prod",
+                     "factors": [
+                      {
+                       "id": "n.5.2.1.0.1:i.0.0.0:i.0.0",
+                       "label": null,
+                       "shared": false,
+                       "span": null,
+                       "origin": null,
+                       "editable": false,
+                       "kind": "seq",
+                       "items": [
+                        {
+                         "id": "n.5.2.1.0.1:i.0.0.0:i.0.0.0",
+                         "label": null,
+                         "shared": false,
+                         "span": null,
+                         "origin": null,
+                         "editable": false,
+                         "kind": "layer",
+                         "type": "linear",
+                         "title": "Linear \u2191 (gate)",
+                         "category": "op",
+                         "chips": [
+                          "2,048 \u2192 512"
+                         ],
+                         "width": null,
+                         "ports": [],
+                         "written": null,
+                         "internals": null
+                        },
+                        {
+                         "id": "n.5.2.1.0.1:i.0.0.0:i.0.0.1",
+                         "label": null,
+                         "shared": false,
+                         "span": null,
+                         "origin": null,
+                         "editable": false,
+                         "kind": "layer",
+                         "type": "act",
+                         "title": "SiLU",
+                         "category": "op",
+                         "chips": [],
+                         "width": null,
+                         "ports": [],
+                         "written": null,
+                         "internals": null
+                        }
+                       ]
+                      },
+                      {
+                       "id": "n.5.2.1.0.1:i.0.0.0:i.0.1",
+                       "label": null,
+                       "shared": false,
+                       "span": null,
+                       "origin": null,
+                       "editable": false,
+                       "kind": "layer",
+                       "type": "linear",
+                       "title": "Linear \u2191",
+                       "category": "op",
+                       "chips": [
+                        "2,048 \u2192 512"
+                       ],
+                       "width": null,
+                       "ports": [],
+                       "written": null,
+                       "internals": null
+                      }
+                     ]
+                    },
+                    {
+                     "id": "n.5.2.1.0.1:i.0.0.0:i.1",
+                     "label": null,
+                     "shared": false,
+                     "span": null,
+                     "origin": null,
+                     "editable": false,
+                     "kind": "layer",
+                     "type": "linear",
+                     "title": "Linear \u2193",
+                     "category": "op",
+                     "chips": [
+                      "512 \u2192 2,048"
+                     ],
+                     "width": null,
+                     "ports": [],
+                     "written": null,
+                     "internals": null
+                    }
+                   ]
+                  }
+                 },
+                 {
+                  "id": "n.5.2.1.0.1:i.0.0.1",
+                  "label": null,
+                  "shared": false,
+                  "span": null,
+                  "origin": null,
+                  "editable": false,
+                  "kind": "seq",
+                  "items": [
+                   {
+                    "id": "n.5.2.1.0.1:i.0.0.1.0",
+                    "label": null,
+                    "shared": false,
+                    "span": null,
+                    "origin": null,
+                    "editable": false,
+                    "kind": "layer",
+                    "type": "router",
+                    "title": "Router",
+                    "category": "op",
+                    "chips": [
+                     "2048 \u2192 512",
+                     "softmax"
+                    ],
+                    "width": null,
+                    "ports": [],
+                    "written": null,
+                    "internals": null
+                   },
+                   {
+                    "id": "n.5.2.1.0.1:i.0.0.1.1",
+                    "label": null,
+                    "shared": false,
+                    "span": null,
+                    "origin": null,
+                    "editable": false,
+                    "kind": "layer",
+                    "type": "topk",
+                    "title": "Top-k",
+                    "category": "op",
+                    "chips": [
+                     "top 10"
+                    ],
+                    "width": null,
+                    "ports": [],
+                    "written": null,
+                    "internals": null
+                   }
+                  ]
+                 }
+                ]
                },
                {
-                "id": "n.5.2.1.0.1/i.0.1",
+                "id": "n.5.2.1.0.1:i.0.1",
                 "label": null,
                 "shared": false,
                 "span": null,
                 "origin": null,
                 "editable": false,
                 "kind": "layer",
-                "type": "router",
-                "title": "Router",
+                "type": "weighted",
+                "title": "Weighted sum",
                 "category": "op",
-                "chips": [
-                 "softmax, top 10"
-                ],
+                "chips": [],
+                "width": null,
                 "ports": [],
-                "written": null
+                "written": null,
+                "internals": null
                }
               ]
              },
              {
-              "id": "n.5.2.1.0.1/i.1",
+              "id": "n.5.2.1.0.1:i.1",
               "label": null,
               "shared": false,
               "span": null,
               "origin": null,
               "editable": false,
               "kind": "layer",
-              "type": "shared expert",
+              "type": "shared",
               "title": "Shared expert",
               "category": "ffn",
               "chips": [
-               "SwiGLU, 512"
+               "1 \u00d7 512 hidden"
               ],
+              "width": null,
               "ports": [],
-              "written": null
+              "written": null,
+              "internals": {
+               "id": "n.5.2.1.0.1:i.1:i",
+               "label": null,
+               "shared": false,
+               "span": null,
+               "origin": null,
+               "editable": false,
+               "kind": "seq",
+               "items": [
+                {
+                 "id": "n.5.2.1.0.1:i.1:i.0",
+                 "label": null,
+                 "shared": false,
+                 "span": null,
+                 "origin": null,
+                 "editable": false,
+                 "kind": "prod",
+                 "factors": [
+                  {
+                   "id": "n.5.2.1.0.1:i.1:i.0.0",
+                   "label": null,
+                   "shared": false,
+                   "span": null,
+                   "origin": null,
+                   "editable": false,
+                   "kind": "seq",
+                   "items": [
+                    {
+                     "id": "n.5.2.1.0.1:i.1:i.0.0.0",
+                     "label": null,
+                     "shared": false,
+                     "span": null,
+                     "origin": null,
+                     "editable": false,
+                     "kind": "layer",
+                     "type": "linear",
+                     "title": "Linear \u2191 (gate)",
+                     "category": "op",
+                     "chips": [
+                      "2,048 \u2192 512"
+                     ],
+                     "width": null,
+                     "ports": [],
+                     "written": null,
+                     "internals": null
+                    },
+                    {
+                     "id": "n.5.2.1.0.1:i.1:i.0.0.1",
+                     "label": null,
+                     "shared": false,
+                     "span": null,
+                     "origin": null,
+                     "editable": false,
+                     "kind": "layer",
+                     "type": "act",
+                     "title": "SiLU",
+                     "category": "op",
+                     "chips": [],
+                     "width": null,
+                     "ports": [],
+                     "written": null,
+                     "internals": null
+                    }
+                   ]
+                  },
+                  {
+                   "id": "n.5.2.1.0.1:i.1:i.0.1",
+                   "label": null,
+                   "shared": false,
+                   "span": null,
+                   "origin": null,
+                   "editable": false,
+                   "kind": "layer",
+                   "type": "linear",
+                   "title": "Linear \u2191",
+                   "category": "op",
+                   "chips": [
+                    "2,048 \u2192 512"
+                   ],
+                   "width": null,
+                   "ports": [],
+                   "written": null,
+                   "internals": null
+                  }
+                 ]
+                },
+                {
+                 "id": "n.5.2.1.0.1:i.1:i.1",
+                 "label": null,
+                 "shared": false,
+                 "span": null,
+                 "origin": null,
+                 "editable": false,
+                 "kind": "layer",
+                 "type": "linear",
+                 "title": "Linear \u2193",
+                 "category": "op",
+                 "chips": [
+                  "512 \u2192 2,048"
+                 ],
+                 "width": null,
+                 "ports": [],
+                 "written": null,
+                 "internals": null
+                }
+               ]
+              }
              }
             ]
            },
+           "ports": [],
            "inserted": false
           }
          ]
@@ -1283,22 +3771,25 @@
       "kind": "layer",
       "label": "norm",
       "shared": false,
-      "span": null,
+      "span": [
+       833,
+       837
+      ],
       "origin": null,
       "editable": true,
       "type": "rmsnorm",
       "title": "RMSNorm",
       "category": "norm",
       "chips": [
-       "zero-centered"
+       "1 + w"
       ],
       "width": 2048,
-      "ports": [],
       "written": [
-       10,
-       16
+       303,
+       330
       ],
       "internals": null,
+      "ports": [],
       "inserted": false
      },
      {
@@ -1306,20 +3797,25 @@
       "kind": "layer",
       "label": "out",
       "shared": true,
-      "span": null,
+      "span": [
+       838,
+       841
+      ],
       "origin": null,
       "editable": true,
       "type": "head",
       "title": "Linear output layer",
       "category": "io",
-      "chips": [],
+      "chips": [
+       "vocab 152k"
+      ],
       "width": 2048,
-      "ports": [],
       "written": [
-       50,
-       56
+       800,
+       804
       ],
       "internals": null,
+      "ports": [],
       "inserted": false
      }
     ]

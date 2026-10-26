@@ -53,6 +53,7 @@ export class Ink {
     this.zooms = zooms; // ids of the boxes whose internals are open
     this.back = [];
     this.front = [];
+    this.leaders = []; // under every panel, so a zoom's leaders pass behind the zoom it starts in
     this.over = [];
     this.thin = [];
     this.wide = new Map(); // background -> path data of widened wires on it
@@ -60,6 +61,7 @@ export class Ink {
     this.rects = new Map(); // id -> {x, y, w, h} of what can be selected
     this.nodes = new Map(); // id -> the node drawn there
     this.extents = []; // [x0, y0, x1, y1] of what is drawn
+    this.inside = new Map(); // id -> {node, box} of what the zoom panels hold
   }
 
   line(d, wide, bg) {
@@ -104,6 +106,7 @@ export class Ink {
       lanes,
       el("path", { class: "dg-arrow", d: this.heads.join("") }),
       el("g", { class: "dg-front" }, this.front.join("")),
+      el("path", { class: "dg-leader", d: this.leaders.join("") }),
       el("g", { class: "dg-over" }, this.over.join("")),
     ].join("");
   }
@@ -427,23 +430,23 @@ export function drawPanel(frame, node, box, at, ink) {
   const { w, h } = panelSize(frame);
   const { x, y } = at;
   const right = box.x + box.w;
-  const leaders = path().M(right, box.y).L(x, y).M(right, box.y + box.h).L(x, y + h);
-  ink.over.push(el("path", { class: "dg-leader", d: leaders }));
+  ink.leaders.push(path().M(right, box.y).L(x, y).M(right, box.y + box.h).L(x, y + h));
   const card = el("rect", { class: "dg-panel", x, y, width: w, height: h, rx: G.cont.radius });
   const title = text("dg-panel-title", x + PANEL.pad, y + PANEL.title / 2 + 3, `Inside: ${node.title ?? node.type}`);
-  const inside = panelBody(frame, x + PANEL.pad + (w - 2 * PANEL.pad - frame.r + frame.l) / 2, y, h);
-  const s = card + title + panelClose(node, x + w - 26, y + 8) + inside;
+  const sub = panelBody(frame, x + PANEL.pad + (w - 2 * PANEL.pad - frame.r + frame.l) / 2, y, h, ink.zooms);
+  const s = card + title + panelClose(node, x + w - 26, y + 8) + sub.svg();
   ink.over.push(el("g", { class: "dg-zoom-panel", "data-panel": node.id }, s));
   ink.extent(x, y, x + w, y + h);
+  for (const [id, n] of sub.nodes) ink.inside.set(id, { node: n, box: sub.rects.get(id) });
 }
 
-function panelBody(frame, spine, y, h) {
-  const sub = new Ink(0, new Set());
+function panelBody(frame, spine, y, h, zooms) {
+  const sub = new Ink(0, zooms);
   const top = y + PANEL.title + PANEL.stub;
   draw(frame, spine, top, sub, { bg: "surface", tail: false });
   rise(sub, spine, y + h - PANEL.pad / 2, top + frame.h, false, "surface", takesArrow(frame));
   rise(sub, spine, top, y + PANEL.title, false, "surface", false);
-  return sub.svg();
+  return sub;
 }
 
 function panelClose(node, x, y) {
@@ -456,19 +459,29 @@ function panelClose(node, x, y) {
 
 const HEADER = { pad: 16, name: 34, row: 21, gap: 18 };
 const num = (v) => (typeof v === "number" ? v.toLocaleString("en-US") : v);
+const SHELL = new Set(["params", "params_text", "flops_per_token", "context"]); // what the shell sets
 
-/** The header's rows: [name, value as text, whether it is unknown yet]. */
+/** 1.6e10 -> "16G", as a count of FLOPs is read. */
+function si(v) {
+  if (typeof v !== "number") return v;
+  const [k, unit] = [[1e12, "T"], [1e9, "G"], [1e6, "M"], [1e3, "k"]].find(([k]) => v >= k) ?? [1, ""];
+  return `${(v / k).toPrecision(3).replace(/\.?0+$/, "")}${unit}`;
+}
+
+/** The header's rows: [name, value as text, whether it is unknown yet]. The
+    shell's facts are params (or params_text), context and flops_per_token. */
 function headerRows(model, facts) {
   const f = model.facts ?? {};
   const rows = [
-    ["Parameters", facts.params],
-    ["Context", facts.context],
+    ["Parameters", facts.params_text ?? si(facts.params)],
+    ["Context", num(facts.context)],
     ["d_model", num(f.d_model)],
     ["Vocabulary", num(f.vocab_size)],
     ["Layers", num(f.layers)],
     ["Residual", f.residual ?? "x + f(x)"],
   ];
-  for (const [k, v] of Object.entries(facts)) if (k !== "params" && k !== "context") rows.push([k, v]);
+  if (facts.flops_per_token != null) rows.splice(2, 0, ["FLOPs / token", si(facts.flops_per_token)]);
+  for (const [k, v] of Object.entries(facts)) if (!SHELL.has(k) && v != null) rows.push([k, v]);
   return rows.map(([k, v]) => (v == null || v === "" ? [k, "—", true] : [k, String(v), false]));
 }
 

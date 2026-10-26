@@ -207,12 +207,7 @@ svg.ico, svg.mark { width: 16px; height: 16px; fill: none; stroke: currentColor;
 
 .canvas-body { position: relative; flex: 1; min-height: 0; }
 .view { position: absolute; inset: 0; overflow: auto; }
-.view-model {
-  overflow: hidden;
-  background-color: var(--canvas);
-  background-image: radial-gradient(var(--canvas-dot) 1px, transparent 1.2px);
-  background-size: 18px 18px;
-}
+.view-model { overflow: hidden; background-color: var(--canvas); }  /* the diagram draws its dot grid */
 .canvas-empty { display: grid; place-items: center; height: 100%; color: var(--text-3); }
 .canvas-note { position: absolute; inset: 0; z-index: 5; background: var(--canvas); }
 

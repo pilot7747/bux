@@ -105,8 +105,9 @@ export class Diagram {
     return rasterize(this.exportSVG(), scale);
   }
 
-  /** Facts for the header card beyond the model's own: {params: "8.03B",
-      context: "8,192"}, or any other name -> value; null removes one. */
+  /** Facts for the header card beyond the model's own: what /api/plan answers
+      ({params, params_text, flops_per_token}) and the run's context, or any
+      other name -> value; null removes one. */
   setFacts(facts) {
     for (const [k, v] of Object.entries(facts)) {
       if (v == null) delete this.facts[k];
@@ -153,6 +154,7 @@ export class Diagram {
     const font = (name, fallback) => css.getPropertyValue(name).trim() || fallback;
     setFonts(font("--font-ui", "sans-serif"), font("--font-mono", "monospace"));
     this.el.classList.add("dg-host");
+    if (getComputedStyle(this.el).position === "static") this.el.style.position = "relative";
     this.el.tabIndex = 0;
     this.svg = document.createElementNS(SVG_NS, "svg");
     this.svg.classList.add("dg-svg");
@@ -179,13 +181,19 @@ export class Diagram {
     if (after) this.moveTo({ ...this.view, x: this.view.x + before.x - after.x, y: this.view.y + before.y + before.h - after.y - after.h });
   }
 
+  /** The open zooms, a zoom's own zooms after it. */
   drawPanels(ink) {
-    for (const id of this.zooms) {
-      const node = ink.nodes.get(id);
-      const box = ink.rects.get(id);
-      if (!node?.internals || !box) continue;
-      const frame = planInternals(node);
-      drawPanel(frame, node, box, placePanel(box, panelSize(frame), ink.extents), ink);
+    const drawn = new Set();
+    for (let more = true; more; ) {
+      more = false;
+      for (const id of this.zooms) {
+        const { node, box } = ink.inside.get(id) ?? { node: ink.nodes.get(id), box: ink.rects.get(id) };
+        if (drawn.has(id) || !node?.internals || !box) continue;
+        const frame = planInternals(node);
+        drawPanel(frame, node, box, placePanel(box, panelSize(frame), ink.extents), ink);
+        drawn.add(id);
+        more = true;
+      }
     }
   }
 
@@ -215,6 +223,7 @@ export class Diagram {
       folded card or container that holds it. */
   drawnId(id) {
     if (!id || !this.ink) return null;
+    if (id.includes(":i")) return this.drawnId(id.slice(0, id.indexOf(":i")));
     if (this.ink.rects.has(id)) return id;
     for (const [alias, first] of this.plan.aliases) {
       if (id.startsWith(`${alias}.`) || id === alias) return this.drawnId(first + id.slice(alias.length));
