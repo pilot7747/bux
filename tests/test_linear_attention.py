@@ -224,9 +224,10 @@ def test_grouped_value_heads_share_each_qk_head():
 
 
 def test_kda_decay_is_bounded_below_with_a_lower_bound():
+    """Of inputs large enough to reach toward the bound past the small projections."""
     c = cfg.KDAConfig(num_heads=2, head_dim=8, gate_lower_bound=-5)
     kda = KimiDeltaAttention(c, D, nnx.Rngs(0))
-    g = kda._log_decay(3 * jax.random.normal(jax.random.key(0), (2, 6, D)))
+    g = kda._log_decay(1000 * jax.random.normal(jax.random.key(0), (2, 6, D)))
     assert g.shape == (2, 6, 2, 8)
     assert bool(((g >= -5) & (g <= 0)).all())
     assert float(g.min()) < -4.5  # it reaches toward the bound
