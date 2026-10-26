@@ -14,9 +14,11 @@ import numpy as np
 import pytest
 from flax import nnx
 
-from bux import parallel
-from bux.architecture import Model, Segments
+from bux import config as cfg
+from bux import kernels, parallel
+from bux.architecture import Model, Segments, Taps
 from bux.architecture.attention import sparse, sparse_cudnn
+from bux.architecture.attention.csa import CSA
 from bux.architecture.attention.indexer import _top
 from bux.lang import compile
 from bux.train import config as tcfg
@@ -256,8 +258,29 @@ def test_a_csa_layer_trains_by_the_kernels_as_by_xla(monkeypatch):
     """Its window-only and compressed layers, the indexer's loss and every gradient."""
     lm, indexer, grads = trained()
     traced = emulate(monkeypatch)
+    monkeypatch.setattr(CSA, "_wide", lambda self, q: True)  # as on a GPU
     got_lm, got_indexer, got_grads = trained()
-    assert set(traced) == {"forward", "backward", "score"}
+    assert traced["forward"] >= 2 and traced["backward"] >= 2 and traced["score"]
     assert indexer > 0 and np.isclose(got_indexer, indexer, atol=1e-6)
     assert np.isclose(got_lm, lm, atol=1e-6)
     close(got_grads, grads, atol=1e-5)
+
+
+def test_wide_window_heads_on_a_gpu_attend_by_xla_s_chunks_without_the_kernels(
+    monkeypatch,
+):
+    """Where cuDNN's kernels do not run, a window-only layer's 512 dims, which the dense
+    kernels do not take, go to `sparse.attend`'s chunks of queries on a GPU: the
+    values of the attention method's XLA."""
+    config = cfg.CSAConfig(
+        num_heads=4, q_lora_rank=12, sliding_window_size=3, sinks=True
+    )
+    layer = CSA(config, 32, (), nnx.Rngs(0))
+    x = jax.random.normal(jax.random.key(1), (B, T, 32))
+    want = layer(x, Taps(segments=ROWS))
+    attend, calls = sparse.attend, []
+    monkeypatch.setattr(kernels, "gpu", lambda: True)
+    monkeypatch.setattr(sparse, "attend", lambda *a: calls.append(1) or attend(*a))
+    got = layer(x, Taps(segments=ROWS))
+    assert calls and not sparse_cudnn.runs()  # no cudnn-frontend here
+    np.testing.assert_allclose(got, want, atol=1e-5)

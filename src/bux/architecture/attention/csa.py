@@ -10,7 +10,7 @@ from flax import nnx
 from jaxtyping import Array, Float, Int
 
 from bux import config as cfg
-from bux import parallel
+from bux import kernels, parallel
 from bux.architecture.attention import sparse, sparse_cudnn
 from bux.architecture.attention.gqa import (
     Names,
@@ -230,12 +230,21 @@ class CSA(Sparse):
         rows: Segments,
         docs: Segments | None,
     ) -> Float[Array, "b t h dk"]:
-        """Return each query's attention to its window of latents alone: by cuDNN's
-        DSA kernels where they take it, else by the run's attention method."""
+        """Return each query's attention to its window of latents alone: by
+        `sparse.attend` (cuDNN's DSA kernels where they take it, else XLA's chunks)
+        where `_wide` says the run's dense kernels would not take it, else by the
+        run's attention method."""
         window = (sparse.Part(kv, kv, sparse.token_span(rows, self.window)),)
-        if self._feature() is not None or not self._kernels_take(q, window):
+        if self._feature() is not None or not self._wide(q):
             return self._attend(x, q, kv, kv, docs)
         return remat.named("attention", self._sparse, q, window, self._sinks())[0]
+
+    def _wide(self, q: Float[Array, "b t h dk"]) -> bool:
+        """Return whether the heads are wider than the dense kernels of
+        ``methods.attention = auto`` take on a GPU (256 dims, as CSA's 512 are)."""
+        on = parallel.active()
+        auto = (on.methods.attention if on else "auto") == "auto"
+        return auto and kernels.gpu() and q.shape[-1] > sparse.HEAD_DIMS
 
     def _sparse(
         self,
