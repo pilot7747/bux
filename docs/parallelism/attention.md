@@ -355,8 +355,9 @@ forward and backward pass, in ms:
 | 32k, of 2048 | 1.71 | **1.89** | 2.29 | 4.48 |
 | 128k, of 2048 | 26.0 | 27.6 | **8.06** | 57.4 |
 
-- `ulysses` runs cuDNN, but past its room for documents (64 of them in a row of 128k)
-  tokamax, whose backward pass does every block.
+- `ulysses` runs cuDNN, and tokamax past cuDNN's room for documents, whose backward
+  pass does every block. In a row of 128k that room is 64 documents for a device's
+  one head of 128, and 32 for two (`context.documents_bound`).
 - `ring` skips most blocks of packed rows on every device.
 - The `ring` this one replaced sent the blocks round by `ppermute` (~85 GB/s on a B300
   node, where an all-gather moves ~550) into an online softmax of their logits: 33.4
