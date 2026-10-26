@@ -113,9 +113,18 @@ class Tokenizer:
             out.append(self.encoder.decode(run) if name is None else name * len(run))
         return "".join(out)
 
+    def token_bytes(self) -> Int32[np.ndarray, " vocab"]:
+        """Return the bytes of text each id stands for, its UTF-8 bytes; 0 for a
+        special token, which stands for none. Bits per byte divide by them."""
+        vocab = self.encoder.vocab
+        lengths = np.zeros(self.vocab_size, np.int32)
+        lengths[list(vocab)] = [len(piece) for piece in vocab.values()]
+        lengths[list(self.specials.values())] = 0
+        return lengths
+
 
 class Gigatoken:
-    """gigatoken's BPE, at gigabytes a second.
+    """gigatoken's BPE, at hundreds of megabytes a second.
 
     Raises:
         RuntimeError: If gigatoken cannot run the tokenizer: one that is not BPE, or
@@ -146,6 +155,11 @@ class Gigatoken:
         """Return the text of `ids`, none of them special."""
         return self.tokenizer.decode(ids).decode(errors="replace")
 
+    @functools.cached_property
+    def vocab(self) -> dict[int, bytes]:
+        """Each id's bytes of text."""
+        return self.tokenizer.vocab
+
 
 class HFTokenizers:
     """Hugging Face's tokenizers, for what gigatoken cannot run: any tokenizer.json
@@ -170,6 +184,19 @@ class HFTokenizers:
         """Return the text of `ids`, none of them special."""
         return self.tokenizer.decode(ids, skip_special_tokens=False)
 
+    @functools.cached_property
+    def vocab(self) -> dict[int, bytes]:
+        """Each id's bytes of text: exactly for a byte-level vocabulary, by GPT-2's
+        alphabet, and for any other as its decoder writes the token alone."""
+        added = self.tokenizer.get_added_tokens_decoder()  # text, as written
+        pieces = self.tokenizer.get_vocab(with_added_tokens=False)
+        if isinstance(self.tokenizer.decoder, tokenizers.decoders.ByteLevel):
+            byte = {c: b for b, c in _byte_alphabet().items()}
+            vocab = {i: bytes(byte[c] for c in p) for p, i in pieces.items()}
+        else:
+            vocab = {i: self.tokenizer.decode([i]).encode() for i in pieces.values()}
+        return vocab | {i: t.content.encode() for i, t in added.items()}
+
 
 #: What encodes text with the model of a tokenizer.json, its special tokens taken out.
 Encoder = Gigatoken | HFTokenizers
@@ -182,6 +209,14 @@ def _encoder(spec: str) -> Encoder:
         return Gigatoken(spec)
     except RuntimeError:
         return HFTokenizers(spec)
+
+
+def _byte_alphabet() -> dict[int, str]:
+    """GPT-2's byte-level alphabet: a printable character for every byte."""
+    printable = [*range(33, 127), *range(161, 173), *range(174, 256)]
+    rest = [b for b in range(256) if b not in printable]
+    chars = printable + [256 + i for i in range(len(rest))]
+    return {b: chr(c) for b, c in zip(printable + rest, chars, strict=True)}
 
 
 def utf8(

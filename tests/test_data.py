@@ -34,6 +34,13 @@ def test_special_tokens_in_documents_stay_text(byte_tokenizer, tok):
         tok.special("<|eot_id|>")
 
 
+def test_a_token_stands_for_its_bytes_of_text_and_a_special_one_for_none(tok):
+    lengths = tok.token_bytes()
+    assert lengths.tolist() == [1] * 256 + [0] * 3
+    ids, _ = tok.encode(pa.array(["héllo, 世界"]))
+    assert lengths[[*ids, tok.eos]].sum() == len("héllo, 世界".encode())
+
+
 def _docs(batch: pa.RecordBatch) -> list[tuple[list[int], list[bool]]]:
     return list(zip(batch["input_ids"].to_pylist(), batch["loss_mask"].to_pylist()))
 
@@ -66,6 +73,7 @@ def test_a_tokenizer_that_gigatoken_cannot_run_runs_on_hugging_faces(tmp_path, t
         assert a.dtype == b.dtype and a.tolist() == b.tolist()
     assert hf.vocab_size == tok.vocab_size == 259
     assert hf.decode([257, *b"hi"]) == "<|im_start|>hi"
+    assert hf.token_bytes().tolist() == [1] * 4 + [0] + [1] * 251 + [0] * 3
 
 
 def _markup(tok: Tokenizer, text: str) -> list[int]:
