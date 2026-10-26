@@ -459,15 +459,9 @@ class _Evaluator:
             case ast.ListExpr(items=items):
                 return [self.data(self.eval(item, scope), item.span) for item in items]
             case ast.Residual(body=body):
-                inner = self.eval(body, scope)
-                if isinstance(inner, cfg.Config) and _tag(inner) not in LAYERS:
-                    raise BuxError(
-                        f"[...] is a residual branch, and {_tag(inner)}(...) is no layer",
-                        expr.span,
-                        "a list of one is written with a comma: [x,]",
-                    )
                 return self.node(
-                    ir.Residual(body=self.graph(inner, body.span)), expr.span
+                    ir.Residual(body=self.graph(self.eval(body, scope), body.span)),
+                    expr.span,
                 )
             case ast.Seq(items=items):
                 nodes = [
