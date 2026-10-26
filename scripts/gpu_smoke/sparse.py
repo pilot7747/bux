@@ -1,12 +1,12 @@
 """Sparse attention on GPUs: tokamax's flash kernel with the kept keys as a mask
 (``bux.architecture.attention.sparse`` under `methods.attention = auto`) against XLA's
 chunks of queries (inside ``bux.kernels.off()``), on one GPU and with the positions
-split over 2: top-k tokens of GQA and MLA, QSA's blocks, CSA's window and latents (512
-dims, which XLA runs), on packed documents with a window, sinks and a soft cap; the
-output, the logsumexp and the gradients. Then the indexer's kernels on a B200 or B300:
-cuDNN's top-k against XLA's, bitwise, and its loss's log-softmax and gradients. Then
-the time of a forward and backward of each, and of dense flash attention, from 4k to
-32k tokens.
+split over 2: top-k tokens of GQA and MLA, QSA's blocks, MSA's blocks for each kv
+group (a group at a time), CSA's window and latents (512 dims, which XLA runs), on
+packed documents with a window, sinks and a soft cap; the output, the logsumexp and
+the gradients. Then the indexer's kernels on a B200 or B300: cuDNN's top-k against
+XLA's, bitwise, and its loss's log-softmax and gradients. Then the time of a forward
+and backward of each, and of dense flash attention, from 4k to 32k tokens.
 
 On a B200 or B300, cuDNN's DSA kernels (``sparse_cudnn``) against XLA the same way:
 CSA's window and compressed latents at DeepSeek-V4.1-Flash's shapes and at the edges
@@ -60,12 +60,14 @@ class Case(NamedTuple):
     csa: bool = False  # a window part, then latents every other slot
     sinks: bool = False
     softcap: float | None = None
+    groups: bool = False  # MSA's blocks, picked for each kv head's group
 
 
 CASES = {
     "gqa": Case(16, 8, 128, 128, 512),
     "gqa_window_sinks": Case(16, 8, 128, 128, 512, window=1000, sinks=True, softcap=30),
     "qsa_blocks": Case(16, 2, 128, 128, 512, block=4),
+    "msa_groups": Case(16, 4, 128, 128, 512, block=128, groups=True),
     "mla": Case(16, 16, 192, 128, 512),
     "csa": Case(16, 1, 512, 512, 256, window=128, csa=True, sinks=True),
     "csa_128": Case(16, 1, 128, 128, 256, window=128, csa=True, sinks=True),
@@ -83,18 +85,19 @@ def documents(b: int, t: int, seed: int = 0) -> Segments:
     return Segments.of(jnp.asarray(positions))
 
 
-def kept(b: int, t: int, top_k: int, block: int, seed: int) -> sparse.Kept:
+def kept(
+    b: int, t: int, top_k: int, block: int, seed: int, groups: int | None = None
+) -> sparse.Kept:
     """Each query's top_k random slots at or before it (with repeats), or random
-    blocks and its own; the span cuts them down to its document's."""
-    n = top_k // block
-    u = jax.random.uniform(jax.random.key(seed), (b, t, n))
-    upto = jnp.arange(t)[None, :, None] // block + 1
-    index = jnp.floor(u * upto).astype(jnp.int32)
+    blocks and its own, for each of `groups` groups if given; the span cuts them down
+    to its document's."""
+    n, lead = top_k // block, (b, t) if groups is None else (b, t, groups)
+    u = jax.random.uniform(jax.random.key(seed), (*lead, n))
+    at = jnp.arange(t, dtype=jnp.int32).reshape(1, t, *(1,) * (len(lead) - 1))
+    index = jnp.floor(u * (at // block + 1)).astype(jnp.int32)
     if block == 1:
         return sparse.Kept(index)
-    own = jnp.broadcast_to(
-        jnp.arange(t, dtype=jnp.int32)[None, :, None] // block, (b, t, 1)
-    )
+    own = jnp.broadcast_to(at // block, (*lead, 1))
     blocks = jnp.broadcast_to(jnp.arange(t, dtype=jnp.int32) // block, (b, t))
     return sparse.Kept(jnp.concatenate([index, own], -1), blocks)
 
@@ -103,7 +106,8 @@ def parts(case: Case, rows: Segments, keys: Keys) -> list[sparse.Part]:
     """The case's parts, of the given keys and values."""
     b, t = rows.ids.shape
     span = sparse.token_span(rows, None if case.csa else case.window)
-    chosen = kept(b, t, case.top_k, case.block, seed=3)
+    groups = case.kv_heads if case.groups else None
+    chosen = kept(b, t, case.top_k, case.block, seed=3, groups=groups)
     if not case.csa:
         return [sparse.Part(*keys[0], span, None, chosen)]
     window = sparse.Part(*keys[0], sparse.token_span(rows, case.window))

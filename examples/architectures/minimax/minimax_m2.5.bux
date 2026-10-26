@@ -1,0 +1,6 @@
+# MiniMax-M2.5 (MiniMax, 2026): a model of the M2 series trained extensively with
+# reinforcement learning in hundreds of thousands of real-world environments, for
+# coding, agentic tool use and search, and office work; it runs SWE-Bench Verified 37%
+# faster than M2.1. Its config is M2's, and so is its architecture: 230B parameters,
+# 10B of them active a token.
+use minimax_m2
