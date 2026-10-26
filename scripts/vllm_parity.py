@@ -95,6 +95,15 @@ CASES = {
     + "model = embed @x0 block^3 [rmsnorm (attn - 0.5 * ffn)]"
     " [$x0 scale(init=0.1, per_channel=true)] linear(features=128) gelu"
     " rmsnorm head",
+    "extras": HEAD
+    + "attn = gqa(num_heads=4, num_kv_heads=2, gated=true, fused_qkv=true,"
+    " output_norm=rmsnorm, rope=rope())\n"
+    + "laguna = gqa(num_heads=4, num_kv_heads=2, gated=true, gate_per_head=true,"
+    " gate_activation=softplus, rope=rope())\n"
+    + "ffn = gated_mlp(intermediate_size=256, activation=swish, limit=1, up_offset=1)\n"
+    + "capped = mlp(intermediate_size=256, activation=relu2, up_softcap=2)\n"
+    + "model = embed(norm=rmsnorm) [rmsnorm attn] [rmsnorm ffn] [rmsnorm laguna]"
+    " [rmsnorm capped] rmsnorm head",
     "moe": HEAD
     + ATTN
     + EXPERT
@@ -124,7 +133,7 @@ CASES = {
     " [rmsnorm ssm] [rmsnorm ffn] rmsnorm head",
     "gdn": HEAD
     + "attn = gqa(num_heads=4, num_kv_heads=2, qk_norm=rmsnorm(zero_centered=true),"
-    " rope=rope(fraction=0.25))\n"
+    " gated=true, rope=rope(fraction=0.25))\n"
     + FFN
     + "delta = gdn(num_heads=2, num_v_heads=4, head_dim=32)\n"
     + "model = embed [rmsnorm delta] [rmsnorm ffn] [rmsnorm delta] [rmsnorm ffn]"

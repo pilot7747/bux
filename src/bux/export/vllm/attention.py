@@ -7,9 +7,14 @@ import torch
 from torch import nn
 from vllm.distributed import get_tensor_model_parallel_world_size
 from vllm.model_executor.layers.attention import Attention as PagedAttention
-from vllm.model_executor.layers.linear import QKVParallelLinear, RowParallelLinear
+from vllm.model_executor.layers.linear import (
+    ColumnParallelLinear,
+    QKVParallelLinear,
+    RowParallelLinear,
+)
 
 from .common import (
+    ACTIVATIONS,
     Ctx,
     Layer,
     Norm,
@@ -24,8 +29,8 @@ from .common import (
 class Attention(Layer):
     """bux's ``gqa``: q, k and v by one column-parallel projection, QK-norm then
     RoPE (in float32, as bux), causal softmax attention with its sliding window,
-    soft-capping and sinks by vLLM's attention layer, and the row-parallel output
-    projection.
+    soft-capping and sinks by vLLM's attention layer, each head's output norm and
+    gate, and the row-parallel output projection.
 
     Each call of the layer keeps a KV cache of its own: a shared layer that runs
     three times makes three of vLLM's attention layers, over the same weights.
@@ -36,20 +41,15 @@ class Attention(Layer):
 
     def __init__(self, c: dict, width: int, site: Site):
         super().__init__()
-        unsupported(
-            c,
-            *("fused_qkv", "gated", "kv_conv_size", "indexer", "relative_bias"),
-            *("log_scale", "output_norm"),
-        )
+        unsupported(c, "kv_conv_size", "indexer", "relative_bias", "log_scale")
         if site.ports:
             raise NotImplementedError("gqa: ports not in vLLM yet")
         tp = get_tensor_model_parallel_world_size()
         h, g = c["num_heads"], c["num_kv_heads"]
         dk = c["head_dim"] or width // h
         dv = c["v_head_dim"] or dk
-        self.path, self.dk, self.dv = site.path, dk, dv
+        self.path, self.dk, self.dv, self.fused = site.path, dk, dv, c["fused_qkv"]
         self.h, self.g = h // tp, max(1, g // tp)  # this rank's
-        out_bias = c["bias"] if c["output_bias"] is None else c["output_bias"]
         self.qkv = QKVParallelLinear(
             width,
             dk,
@@ -60,18 +60,17 @@ class Attention(Layer):
             return_bias=False,
             prefix=f"{site.path}.qkv",
         )
+        self._gate(c, width, h * dv, site.path)
+        out_bias = c["bias"] if c["output_bias"] is None else c["output_bias"]
         self.o = RowParallelLinear(
             h * dv, width, bias=out_bias, return_bias=False, prefix=f"{site.path}.o"
         )
-        qk = c["qk_norm"]
+        qk, out = c["qk_norm"], c["output_norm"]
         self.q_norm = Norm(qk, dk) if qk else None
         self.k_norm = Norm(qk, dk) if qk else None
+        self.out_norm = Norm(out, dv) if out else None
         self.rope = Rope(c["rope"], dk) if c["rope"] else None
-        self.sinks = None
-        if c["sinks"]:  # in float32, as bux's softmax takes them
-            sinks = torch.empty(self.h, dtype=torch.float32)
-            self.sinks = nn.Parameter(sinks, requires_grad=False)
-            self.sinks.weight_loader = sharded_loader(0)  # ty: ignore[unresolved-attribute]
+        self.sinks = _sinks(self.h) if c["sinks"] else None
         scale = (c["scale"] or dk**-0.5) * logit_gain(c["rope"])
         self.caches = nn.ModuleList(
             PagedAttention(
@@ -89,14 +88,28 @@ class Attention(Layer):
             for name in site.caches
         )
 
+    def _gate(self, c: dict, width: int, heads_dv: int, path: str) -> None:
+        """Make the gate on the heads' outputs, ``act(W_g x)``, a value a channel or
+        a head (``gate_per_head``), column-parallel by head; None without one."""
+        self.gate = None
+        self.gate_activation = ACTIVATIONS[c["gate_activation"]]
+        if c["gated"]:
+            n = c["num_heads"] if c["gate_per_head"] else heads_dv
+            self.gate = ColumnParallelLinear(
+                width, n, bias=c["bias"], return_bias=False, prefix=f"{path}.gate"
+            )
+
     def targets(self) -> dict[str, tuple[nn.Parameter, tuple]]:
         out: dict[str, tuple[nn.Parameter, tuple]] = {}
         for kind in ("weight", "bias"):
             if (fused := getattr(self.qkv, kind)) is not None:
-                out |= {f"{s}.{kind}": (fused, (s,)) for s in "qkv"}
-            if (o := getattr(self.o, kind)) is not None:
-                out[f"o.{kind}"] = (o, ())
-        for name in ("q_norm", "k_norm"):
+                shards = {"qkv": None} if self.fused else {s: s for s in "qkv"}
+                out |= {f"{n}.{kind}": (fused, (s,)) for n, s in shards.items()}
+            for name in ("gate", "o"):
+                layer = getattr(self, name)
+                if layer is not None and getattr(layer, kind) is not None:
+                    out[f"{name}.{kind}"] = (getattr(layer, kind), ())
+        for name in ("q_norm", "k_norm", "out_norm"):
             if (norm := getattr(self, name)) is not None:
                 out |= {f"{name}.{k}": v for k, v in norm.targets().items()}
         if self.sinks is not None:
@@ -115,5 +128,21 @@ class Attention(Layer):
             q, k = self.rope(q, ctx.positions), self.rope(k, ctx.positions)
         attend = self.caches[ctx.call(self.path)]
         q, k = q.reshape(t, -1).contiguous(), k.reshape(t, -1).contiguous()
-        out = attend(q, k, v.contiguous())
-        return self.o(out)
+        out = attend(q, k, v.contiguous()).view(t, self.h, self.dv)
+        return self.o(self._gated(x, out).reshape(t, -1))
+
+    def _gated(self, x: torch.Tensor, out: torch.Tensor) -> torch.Tensor:
+        """The heads' outputs, (T, h, dv), normalized and gated."""
+        if self.out_norm is not None:
+            out = self.out_norm(out)
+        if self.gate is None:
+            return out
+        gate = self.gate_activation(self.gate(x))
+        return out * gate.view(out.shape[0], self.h, -1)
+
+
+def _sinks(heads: int) -> nn.Parameter:
+    """This rank's heads' sink logits, in float32 as bux's softmax takes them."""
+    sinks = nn.Parameter(torch.empty(heads, dtype=torch.float32), requires_grad=False)
+    sinks.weight_loader = sharded_loader(0)  # ty: ignore[unresolved-attribute]
+    return sinks

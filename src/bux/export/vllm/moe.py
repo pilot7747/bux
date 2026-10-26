@@ -153,37 +153,18 @@ class MoE(Layer):
         return out
 
     def load(self, name: str, tensor: torch.Tensor) -> list[nn.Parameter]:
-        if name in ("up", "down", "up_bias", "down_bias"):
-            return self.load_experts(name, tensor)
-        return super().load(name, tensor)
-
-    def load_experts(self, name: str, tensor: torch.Tensor) -> list[nn.Parameter]:
-        """Load bux's stacked experts, ``up`` (E, d, f, p) with each hidden unit's up
-        and gate side by side, and ``down`` (E, f, d), and their biases, into
-        vLLM's w13 (gate then up) and w2, expert by expert."""
+        shards = expert_shards(name, tensor, self.gated)
+        if shards is None:
+            return super().load(name, tensor)
         routed = self.experts.routed_experts
-        param = routed.w2_bias if name == "down_bias" else routed.w2_weight
-        if name.startswith("up"):
-            param = routed.w13_bias if name == "up_bias" else routed.w13_weight
-        for e in range(tensor.shape[0]):
-            for shard, w in self.shards(name, tensor[e]):
-                where = f"experts.{e}.{shard}.{'bias' if 'bias' in name else 'weight'}"
-                routed.weight_loader(param, w.contiguous(), where, shard, e)
+        bias = name.endswith("bias")
+        stem = "w2" if shards[0][0] == "w2" else "w13"
+        param = getattr(routed, f"{stem}_{'bias' if bias else 'weight'}")
+        for shard, stacked in shards:
+            for e in range(stacked.shape[0]):
+                where = f"experts.{e}.{shard}.{'bias' if bias else 'weight'}"
+                routed.weight_loader(param, stacked[e].contiguous(), where, shard, e)
         return [param]
-
-    def shards(self, name: str, w: torch.Tensor) -> list[tuple[str, torch.Tensor]]:
-        """One expert's tensor `name` as vLLM's shards, in its (out, in) layout:
-        w1 the gate, w3 up, w2 down."""
-        if name == "down":
-            return [("w2", w.T)]
-        if name == "down_bias":
-            return [("w2", w)]
-        weight = name == "up"
-        up = w[..., 0].T if weight else w[..., 0]
-        if not self.gated:
-            return [("w1", up)]
-        gate = w[..., 1].T if weight else w[..., 1]
-        return [("w1", gate), ("w3", up)]
 
     def forward(self, x: torch.Tensor, ctx: Ctx | None = None) -> torch.Tensor:
         logits = F.linear(x.float(), self.router_weight.float())
@@ -196,3 +177,32 @@ class MoE(Layer):
                 shared = shared * torch.sigmoid(self.shared_gate(x))
             y = y + shared
         return y
+
+
+def expert_shards(
+    name: str, t: torch.Tensor, gated: bool
+) -> list[tuple[str, torch.Tensor]] | None:
+    """The routed experts' tensor `name` as vLLM's shards, stacked by expert in its
+    (out, in) layout (w1 the gate, w3 up, w2 down); None for another weight.
+
+    It reads bux's layout, ``up`` (E, d, f, p) with each hidden unit's up and gate
+    side by side and ``down`` (E, f, d), and transformers', ``experts.gate_up_proj``
+    (E, 2f, d), the gate first, or ``experts.up_proj`` (E, f, d), and
+    ``experts.down_proj`` (E, d, f); and their biases alike."""
+    match name:
+        case "up" | "up_bias":
+            up = t[..., 0].transpose(1, 2) if name == "up" else t[..., 0]
+            if not gated:
+                return [("w1", up)]
+            gate = t[..., 1].transpose(1, 2) if name == "up" else t[..., 1]
+            return [("w1", gate), ("w3", up)]
+        case "down":
+            return [("w2", t.transpose(1, 2))]
+        case "down_bias" | "experts.down_proj" | "experts.down_proj_bias":
+            return [("w2", t)]
+        case "experts.up_proj" | "experts.up_proj_bias":
+            return [("w1", t)]
+        case "experts.gate_up_proj" | "experts.gate_up_proj_bias":
+            gate, up = t.chunk(2, 1)
+            return [("w1", gate), ("w3", up)]
+    return None

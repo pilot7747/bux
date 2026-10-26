@@ -23,19 +23,18 @@ from vllm.model_executor.layers.vocab_parallel_embedding import (
     VocabParallelEmbedding,
 )
 
-from .common import ACTIVATIONS, Ctx, Layer, Site, unsupported
+from .common import ACTIVATIONS, Ctx, Layer, Norm, Site
 
 
 class Embedding(Layer):
-    """bux's ``embed``: the token table, split by vocabulary, times sqrt(d) if asked,
-    plus learned positions. The model's first is the one tied heads read, and the one
-    vLLM's ``inputs_embeds`` stand for."""
+    """bux's ``embed``: the token table, split by vocabulary, times sqrt(d) if asked
+    and normalized if asked, plus learned positions. The model's first is the one
+    tied heads read, and the one vLLM's ``inputs_embeds`` stand for."""
 
     bux_types = ("embed",)
 
     def __init__(self, c: dict, width: Any, site: Site):
         super().__init__()
-        unsupported(c, "norm")
         vocab, d = site.config.vocab_size, site.config.hidden_size
         self.tokens = VocabParallelEmbedding(vocab, d, prefix=f"{site.path}.tokens")
         most = c["max_positions"]
@@ -43,17 +42,21 @@ class Embedding(Layer):
             nn.Parameter(torch.empty(most, d), requires_grad=False) if most else None
         )
         self.multiplier = d**0.5 if c["scale_by_sqrt_dim"] else 1.0
+        self.norm = Norm(c["norm"], d) if c["norm"] else None
 
     def targets(self) -> dict[str, tuple[nn.Parameter, tuple]]:
         out = {"tokens.weight": (self.tokens.weight, ())}
         if self.positions is not None:
             out["positions.weight"] = (self.positions, ())
+        if self.norm is not None:
+            out |= {f"norm.{k}": v for k, v in self.norm.targets().items()}
         return out
 
     def embed(self, ids: torch.Tensor) -> torch.Tensor:
-        """The tokens' rows of the table, times the multiplier."""
+        """The tokens' rows of the table, times the multiplier, normalized."""
         x = self.tokens(ids)
-        return x if self.multiplier == 1.0 else x * self.multiplier
+        x = x if self.multiplier == 1.0 else x * self.multiplier
+        return x if self.norm is None else self.norm(x)
 
     def forward(self, ids: torch.Tensor, ctx: Ctx) -> torch.Tensor:
         given = None
@@ -101,7 +104,9 @@ class Head(Layer):
 
 class MLP(Layer):
     """bux's ``mlp`` and ``gated_mlp``: ``down(act(up x))``, or
-    ``down(act(gate x) * up x)``, gate and up as one column-parallel projection.
+    ``down(act(gate x) * (up x + up_offset))``, gate and up as one column-parallel
+    projection; `limit` clips both (the gate from above only), and `up_softcap`
+    caps up, as `bux.architecture.layers.mlp.activate` does.
 
     Args:
         size: Hidden units in place of the config's, as an MoE's shared experts take
@@ -114,9 +119,9 @@ class MLP(Layer):
         self, c: dict, width: int, site: Site | None = None, size: int | None = None
     ):
         super().__init__()
-        unsupported(c, "limit", "up_softcap", "up_offset")
         n, bias = size or c["intermediate_size"], c["bias"]
         self.act = ACTIVATIONS[c["activation"]]
+        self.limit, self.cap, self.offset = c["limit"], c["up_softcap"], c["up_offset"]
         self.gated = c["type"] == "gated_mlp"
         prefix = site.path if site is not None else ""
         if self.gated:
@@ -146,12 +151,19 @@ class MLP(Layer):
         return out
 
     def hidden(self, x: torch.Tensor) -> torch.Tensor:
-        """The hidden units of x: ``act(up x)``, or ``act(gate x) * up x``."""
+        """The hidden units of x: ``act(up x)``, or ``act(gate x) * up x``, clipped,
+        capped and offset."""
         h = self.up(x)
-        if not self.gated:
-            return self.act(h)
-        gate, up = h.chunk(2, -1)
-        return self.act(gate) * up
+        gate, up = h.chunk(2, -1) if self.gated else (None, h)
+        if self.limit is not None:
+            up = up.clamp(-self.limit, self.limit)
+        if self.cap is not None:
+            up = self.cap * torch.tanh(up / self.cap)
+        if gate is None:
+            return self.act(up)
+        if self.limit is not None:
+            gate = gate.clamp(max=self.limit)
+        return self.act(gate) * (up + self.offset)
 
     def forward(self, x: torch.Tensor, ctx: Ctx | None = None) -> torch.Tensor:
         return self.down(self.hidden(x))

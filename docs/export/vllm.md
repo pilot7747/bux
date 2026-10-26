@@ -70,10 +70,10 @@ for the model types it knows). A layer or setting the plugin does not run raises
 
 | Layers | In vLLM |
 |--------|---------|
-| `embed`, `head` | yes, the vocabulary split over ranks; tied or not, a bias, soft-capping; not `embed(norm=...)` |
-| `rmsnorm`, `layernorm`, `mlp`, `gated_mlp`, `linear`, `act`, `scale`, `dropout` | yes, but the MLPs' `limit`, `up_softcap` and `up_offset` |
-| `gqa` | RoPE (`pi`, `llama3`, `yarn`), QK-norm, GQA and MQA, biases, sliding windows, soft-capping, sinks, its scale; not yet `gated`, `fused_qkv`, `output_norm` or ports |
-| `moe` | softmax, sigmoid and `sqrtsoftplus` routers, groups, the aux-free bias, shared experts and their gate, gated and plain experts (`swish`, `gelu`, `gelu_tanh`, `relu2`); not LatentMoE, `expert_norm` or `shared_expert_sink` |
+| `embed`, `head` | yes, the vocabulary split over ranks: learned positions, `scale_by_sqrt_dim`, `norm`; tied or not, a bias, soft-capping |
+| `rmsnorm`, `layernorm`, `mlp`, `gated_mlp`, `linear`, `act`, `scale`, `dropout` | yes, with the MLPs' `limit`, `up_softcap` and `up_offset` |
+| `gqa` | RoPE (`pi`, `llama3`, `yarn`), QK-norm, GQA and MQA, biases, `fused_qkv`, sliding windows, soft-capping, sinks, its scale, `gated` (a gate a channel or a head), `output_norm`; not yet `kv_conv_size`, an indexer, a relative bias, `log_scale` or ports |
+| `moe` | softmax, sigmoid and `sqrtsoftplus` routers, `router_logit_scale`, groups, the aux-free bias, a router bias, shared experts and their gate, gated and plain experts (`swish`, `gelu`, `gelu_tanh`, `relu2`); not yet LatentMoE, `expert_norm`, `shared_expert_sink`, or the experts' `limit`, `up_softcap` and `up_offset` |
 | `mamba2`, `gdn` | yes, by vLLM's layers, one type and shape of them a model |
 | the graph | everything but residual algebras; a shared MoE or recurrent layer runs once a pass |
 
