@@ -136,6 +136,9 @@ class MoE(Layer):
         bias = name.endswith("bias")
         stem = "w2" if shards[0][0] == "w2" else "w13"
         param = getattr(routed, f"{stem}_{'bias' if bias else 'weight'}")
+        rank = self.experts.moe_config.moe_parallel_config.tp_rank
+        if bias and stem == "w2" and rank != 0:  # the ranks' outputs sum: one adds it
+            shards = [(shard, torch.zeros_like(t)) for shard, t in shards]
         for shard, stacked in shards:
             for e in range(stacked.shape[0]):
                 where = f"experts.{e}.{shard}.{'bias' if bias else 'weight'}"
