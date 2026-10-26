@@ -1,0 +1,13 @@
+# OLMo 2 1B (Allen AI, 2025): the smallest OLMo 2, released after the others, OLMo 2
+# 7B's design at 16 layers 2048 wide with 16 heads of 128.
+d_model    = 2048
+vocab_size = 100352
+
+init = normal(std=0.02, truncate=3)
+norm = rmsnorm(eps=1e-6)
+attn = gqa(num_heads=16, num_kv_heads=16, qk_norm=norm, qk_norm_all_heads=true,
+           rope=rope(base=500000))
+ffn  = gated_mlp(intermediate_size=8192, activation=swish)
+
+block = [attn norm] [ffn norm]
+model = embed block^16 norm head
