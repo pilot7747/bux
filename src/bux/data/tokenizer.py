@@ -191,8 +191,8 @@ class HFTokenizers:
 
     @functools.cached_property
     def vocab(self) -> dict[int, bytes]:
-        """Each id's bytes of text: exactly for a byte-level vocabulary, by GPT-2's
-        alphabet, and for any other as its decoder writes the token alone."""
+        """Each id's bytes of text, exactly for a byte-level vocabulary (by GPT-2's
+        alphabet), and for any other as its decoder writes the token alone."""
         added = self.tokenizer.get_added_tokens_decoder()  # text, as written
         pieces = self.tokenizer.get_vocab(with_added_tokens=False)
         if isinstance(self.tokenizer.decoder, tokenizers.decoders.ByteLevel):
