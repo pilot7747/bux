@@ -26,6 +26,7 @@ from bux.parallel import flash, methods
 from bux.parallel.flash import Keys, per_query_head
 from bux.parallel.layout import as_split, axes_of, shard, spec
 from bux.parallel.mesh import active, free_axes
+from bux.softmax import softmax
 from bux.train import flops
 
 AXIS = "context"
@@ -100,7 +101,7 @@ def masked_softmax(
     any, in float32; a query that keeps no key gets zeros."""
     logits = jnp.where(mask, logits.astype(jnp.float32), MIN)
     if sinks is None:
-        probs = jax.nn.softmax(logits)
+        probs = softmax(logits)
     else:
         probs = _softmax_with_sinks(logits, sinks.astype(jnp.float32))
     return jnp.where(mask, probs, 0)
@@ -113,7 +114,7 @@ def _softmax_with_sinks(
     of the probability and attends to nothing."""
     b, h, t, _ = logits.shape
     sink = jnp.broadcast_to(sinks[None, :, None, None], (b, h, t, 1))
-    return jax.nn.softmax(jnp.concatenate([logits, sink], -1))[..., :-1]
+    return softmax(jnp.concatenate([logits, sink], -1))[..., :-1]
 
 
 def weighted_values(
