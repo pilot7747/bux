@@ -153,16 +153,19 @@ def test_rwkv7_value_residual_exports() -> None:
     check.compare(compile(source)).check()
 
 
-# Zoo models shrunk as tests/test_examples.py shrinks them; their MoE, not exported
-# yet, swapped for MLPs. Qwen3-Next makes 3 passes of its 12: through 36 gdn layers,
-# float32's own rounding reaches 2e-4 of the logits, bux's and the export's alike
-# (measured against the export in float64), past the check's 1e-4.
+# Zoo models shrunk as tests/test_examples.py shrinks them, their MoE to 4 experts.
+# Qwen3-Next makes 3 passes of its 12: through 36 gdn layers, float32's own rounding
+# reaches 2e-4 of the logits, bux's and the export's alike (measured against the
+# export in float64), past the check's 1e-4.
 GQA = "gqa(num_heads=4, num_kv_heads=2, head_dim=8"
 ZOO = {
     "qwen3_next.bux": [
         "delta = gdn(num_heads=2, num_v_heads=4, head_dim=8)",
         f"attn = {GQA}, gated=true, qk_norm=norm, rope=rope(base=10000000, fraction=0.25))",
-        "experts = dense",
+        (
+            "experts = moe(num_experts=4, top_k=2, num_shared_experts=1,"
+            " shared_expert_gate=true, expert=dense)"
+        ),
         'model = embed "DDDA"^3 norm @h out mtp',
     ],
     "kimi_linear.bux": [
@@ -171,7 +174,10 @@ ZOO = {
             "mla = mla(num_heads=2, kv_lora_rank=8, qk_nope_head_dim=4,"
             " qk_rope_head_dim=4, v_head_dim=4, rope=none)"
         ),
-        "experts = dense",
+        (
+            "experts = moe(num_experts=4, top_k=2, num_shared_experts=1, router=sigmoid,"
+            " routed_scaling_factor=2.446, load_balancing=aux_free, expert=dense)"
+        ),
     ],
     "zamba2.bux": [
         "ssm = mamba2(state_size=8, head_dim=8)",
@@ -181,9 +187,16 @@ ZOO = {
     "nemotron/nemotron_3_nano_30b_a3b.bux": [
         "ssm = mamba2(state_size=8, head_dim=8, num_heads=6, num_groups=2)",
         f"attn = {GQA})",
-        "experts = mlp(intermediate_size=8, activation=relu2)",
+        (
+            "experts = moe(num_experts=4, top_k=2, num_shared_experts=1, router=sigmoid,"
+            " load_balancing=aux_free, expert=mlp(intermediate_size=8, activation=relu2))"
+        ),
     ],
-    "jamba.bux": [f"attn = {GQA})", "ssm = mamba(state_size=4)", "experts = dense"],
+    "jamba.bux": [
+        f"attn = {GQA})",
+        "ssm = mamba(state_size=4)",
+        "experts = moe(num_experts=4, top_k=2, normalize_top_k=false, expert=dense)",
+    ],
     "hymba.bux": [
         (
             f"local = {GQA}, v_head_dim=16, fused_qkv=true, sliding_window_size=4,"
