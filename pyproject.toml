@@ -8,12 +8,14 @@ dependencies = [
     "gigatoken>=0.10.0,<0.11",
     "jax>=0.12.0",
     "jaxtyping>=0.3.11",
+    "jinja2>=3.1.6",
     "matplotlib>=3.11.2",
     "numpy>=2.5.4",
     "optax>=0.2.8",
     "orbax-checkpoint>=0.12.8",
     "pyarrow>=26.0.0",
     "pydantic>=2.14.1",
+    "tokenizers>=0.23.3",
     "tomlkit>=0.15.2",
 ]
 
@@ -24,6 +26,7 @@ dev = [
     "pygls>=2.1.1",
     "pytest>=9.1.1",
     "ruff>=0.17.1",
+    "tensorboardx>=2.6",
     "ty>=0.0.89",
 ]
 # Exporting to transformers, and checking an export against bux: `bux export`.
@@ -54,6 +57,12 @@ export = [
 cuda = [
     "jax[cuda13]>=0.12.0; sys_platform == 'linux'",
     "tokamax[cuda]>=0.0.17; sys_platform == 'linux'",
+    # FlashAttention-4's CuTe DSL kernels (bux.parallel.fa4), which bux calls through
+    # cutlass.jax
+    "flash-attn-4>=4.0.0b36; sys_platform == 'linux'",
+    # FlashAttention-4's and cudnn-frontend's DSA modules import torch, which their JAX
+    # calls never use: its CPU build, beside jax's CUDA
+    "torch>=2.14.1; sys_platform == 'linux'",
 ]
 lsp = [
     "pygls>=2.1.1",
@@ -62,19 +71,31 @@ spark = [
     "pandas>=2.2,<3",
     "pyspark>=4.2",
 ]
+wandb = [
+    "wandb>=0.22",
+]
+tensorboard = [
+    "tensorboardx>=2.6",
+]
 
 [tool.uv]
 default-groups = ["dev", "docs", "export"]  # make ci builds the docs and checks exports
+# cudnn-frontend's develop build: Frost's GDN-2 kernel (GLA, Lightning) and the DSA
+# indexer's deterministic top-k are not in 1.31.0.
+override-dependencies = [
+    "nvidia-cudnn-frontend @ https://github.com/NVIDIA/cudnn-frontend/releases/download/v1.32.0.dev76547535/nvidia_cudnn_frontend-1.32.0.dev76547535-cp314-cp314-manylinux_2_27_x86_64.manylinux_2_28_x86_64.whl ; sys_platform == 'linux' and platform_machine == 'x86_64'",
+    "nvidia-cudnn-frontend @ https://github.com/NVIDIA/cudnn-frontend/releases/download/v1.32.0.dev76547535/nvidia_cudnn_frontend-1.32.0.dev76547535-cp314-cp314-manylinux_2_27_aarch64.manylinux_2_28_aarch64.whl ; sys_platform == 'linux' and platform_machine == 'aarch64'",
+]
 
-# PyTorch only runs exported models in tests and checks, on the CPU: its CPU wheels
-# spare CI the CUDA ones.
+# PyTorch's CPU build on Linux: exports run on the CPU in tests and checks, and the
+# cuda extra's kernels only import it.
+[tool.uv.sources]
+torch = [{ index = "pytorch-cpu", marker = "sys_platform == 'linux'" }]
+
 [[tool.uv.index]]
 name = "pytorch-cpu"
 url = "https://download.pytorch.org/whl/cpu"
 explicit = true
-
-[tool.uv.sources]
-torch = [{ index = "pytorch-cpu" }]
 
 [build-system]
 requires = ["uv_build>=0.13.1,<0.14"]
@@ -115,4 +136,4 @@ include = ["src/bux/export/**", "src/bux_vllm/**", "tests/test_export*.py"]
 rules = { invalid-mutable-override = "ignore" }
 
 [tool.ty.analysis]
-allowed-unresolved-imports = ["vllm.**", "pyspark.**", "tokamax.**", "cudnn.**", "cutlass.**", "triton.**", "jax_triton.**", "transformer_engine.**"]  # the `spark` and `cuda` extras, the image's TE, and vLLM (its plugin, bux_vllm)
+allowed-unresolved-imports = ["vllm.**", "pyspark.**", "tokamax.**", "cudnn.**", "cutlass.**", "triton.**", "jax_triton.**", "flash_attn.**", "transformer_engine.**"]  # the `spark` and `cuda` extras, the image's TE, and vLLM (its plugin, bux_vllm)

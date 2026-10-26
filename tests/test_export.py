@@ -3,10 +3,13 @@ same greedy tokens with and without the cache, and left-padded batches as each r
 alone."""
 
 import ast
+import json
+import typing
 from pathlib import Path
 
 import pytest
 
+from bux import config as cfg
 from bux.export import check, codegen, hf
 from bux.export.plan import plan
 from bux.lang import compile
@@ -95,3 +98,22 @@ def test_layer_files_run_where_transformers_does(path: Path) -> None:
             assert not (node.module or "").startswith("bux"), node.module
         if isinstance(node, ast.Import):
             assert not any(a.name.startswith("bux") for a in node.names)
+
+
+# Every setting of every config the export knows: a config that gains one fails
+# test_every_setting_is_known_to_the_export, so that no setting goes unexported unseen.
+SETTINGS = Path(__file__).with_name("export_settings.json")
+
+
+def test_every_setting_is_known_to_the_export() -> None:
+    configs = (*typing.get_args(typing.get_args(cfg.LayerConfig)[0]),)
+    configs += typing.get_args(typing.get_args(cfg.SubConfig)[0])
+    known = json.loads(SETTINGS.read_text())
+    for c in configs:
+        new = set(c.model_fields) - set(known.get(c.__name__, ()))
+        gone = set(known.get(c.__name__, ())) - set(c.model_fields)
+        assert not new and not gone, (
+            f"{c.__name__} gained {sorted(new)} and lost {sorted(gone)}: export the "
+            "new settings in bux.export.hf (or refuse them there with unsupported), "
+            f"then update {SETTINGS.name}"
+        )

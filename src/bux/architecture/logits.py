@@ -5,10 +5,10 @@ its logits, and the loss takes what it needs of them (`HeadOutput.sums`): the su
 over positions of the cross-entropy, ``log Z`` minus the target's logit, and of
 ``log Z`` squared, each position weighted, by the run's method:
 
-- ``chunks``, the default (`by_chunks`): the matmul, the logsumexp and the target's
-  logit a chunk of positions at a time, in float32, as Liger's and Apple's Cut
-  Cross-Entropy do, and the chunk's gradients with them, so that the backward only
-  scales those.
+- ``chunks``, the default (`by_chunks`): the matmul, the logsumexp of the other logits
+  and the target's logit a chunk of positions at a time, in float32, as Liger's and
+  Apple's Cut Cross-Entropy do, and the chunk's gradients with them, so that the
+  backward only scales those.
 - ``logits`` (`by_logits`): one matmul for all positions, the logits whole in the
   stream's dtype.
 
@@ -37,6 +37,7 @@ from jax.typing import DTypeLike
 from jaxtyping import Array, Bool, Float, Int, Shaped
 
 from bux import parallel
+from bux.architecture import observe
 from bux.parallel import methods
 
 #: The most bytes of float32 logits a device makes at once by ``chunks``, 2 GiB.
@@ -85,7 +86,9 @@ class Projection(NamedTuple):
 class Sums(NamedTuple):
     """A head's sums over positions, each weighted: of the cross-entropy, ``log Z``
     minus the target's logit, and of ``log Z`` squared, the z-loss; 0 where not asked
-    for.
+    for, but in a forward that observes (`bux.architecture.observe`), which measures
+    it all the same. Its gradient is there only where asked for: ``chunks`` makes the
+    z-loss's gradient of the head, a second one, only then.
     """
 
     ce: Float[Array, ""]  #: The cross-entropy's sum.
@@ -93,12 +96,17 @@ class Sums(NamedTuple):
 
 
 class Scores(NamedTuple):
-    """What the cross-entropy and the z-loss take of the logits at each position:
-    ``log Z``, the log of the softmax's normalizer, and the target's logit.
+    """What the cross-entropy and the z-loss take of the logits at each position: the
+    target's logit, and the logsumexp of the others'.
+
+    Kept apart, they keep the loss and its gradient where float32 rounds the target's
+    probability to 1, past a margin of about 16.6 (`bux.softmax`): the cross-entropy is
+    ``softplus(others - target)``, not ``log Z - target``, which is then 0, and the
+    target's gradient is ``-sigmoid(others - target)``, not ``p - 1``.
     """
 
-    lse: Float[Array, "*n"]  #: ``log Z`` at each position.
     target: Float[Array, "*n"]  #: The target's logit at each position.
+    others: Float[Array, "*n"]  #: The logsumexp of the other logits at each position.
 
     @classmethod
     def of(
@@ -106,7 +114,7 @@ class Scores(NamedTuple):
     ) -> "Scores":
         """Return the scores of logits given whole, in float32."""
         logits = logits.astype(jnp.float32)
-        return cls(jax.nn.logsumexp(logits, -1), _pick(logits, targets))
+        return cls(_pick(logits, targets), _others(logits, targets))
 
     @classmethod
     def of_chunk(
@@ -119,12 +127,29 @@ class Scores(NamedTuple):
             return cls.of(logits, targets)
         logits = logits.astype(jnp.float32)
         target = jnp.take_along_axis(logits, targets[..., None], -1, mode="clip")
-        return cls(jax.nn.logsumexp(logits, -1), target[..., 0])
+        return cls(target[..., 0], _others(logits, targets))
+
+    @property
+    def ce(self) -> Float[Array, "*n"]:
+        """The cross-entropy at each position, ``log Z`` minus the target's logit."""
+        return jax.nn.softplus(self.others - self.target)
+
+    @property
+    def lse(self) -> Float[Array, "*n"]:
+        """``log Z`` at each position, the log of the softmax's normalizer."""
+        return jnp.logaddexp(self.target, self.others)
+
+    @property
+    def miss(self) -> Float[Array, "*n"]:
+        """1 minus the target's probability at each position, from the others'."""
+        return jax.nn.sigmoid(self.others - self.target)
 
     def sums(self, weights: Float[Array, "*n"], z: bool) -> Sums:
-        """Return their sums, each position by its weight; the z-loss's if `z`."""
-        ce = jnp.sum(weights * (self.lse - self.target))
-        return Sums(ce, jnp.sum(weights * self.lse**2) if z else jnp.zeros(()))
+        """Return their sums, each position by its weight; the z-loss's if `z`, or in
+        a forward that observes, which takes it from ``log Z`` for free."""
+        ce = jnp.sum(weights * self.ce)
+        measured = z or observe.active() is not None
+        return Sums(ce, jnp.sum(weights * self.lse**2) if measured else jnp.zeros(()))
 
 
 class HeadOutput(NamedTuple):
@@ -185,6 +210,16 @@ def _pick(
 ) -> Float[Array, "*n"]:
     """Return each target's logit: a sum over the vocabulary, as it splits."""
     return jnp.sum(jnp.where(_is_target(logits, targets), logits, 0), -1)
+
+
+def _others(
+    logits: Float[Array, "*n vocab"], targets: Int[Array, "*n"]
+) -> Float[Array, "*n"]:
+    """Return the logsumexp of every logit but the target's, shifted by the largest of
+    all, the target's too, as a max that left it out would cost a mask."""
+    top = jax.lax.stop_gradient(jnp.max(logits, -1, keepdims=True))
+    e = jnp.where(_is_target(logits, targets), 0, jnp.exp(logits - top))
+    return top[..., 0] + jnp.log(jnp.sum(e, -1))
 
 
 def _is_target(
@@ -346,12 +381,14 @@ def _chunk_grads(
     raw = _shard(p.matmul(x), None, "vocab")
     logits, finish = jax.vjp(p.finish, raw, bias)
     scores = Scores.of_chunk(logits, targets)
-    probs = jnp.exp(logits - scores.lse[..., None])
+    lse = scores.lse
+    probs = jnp.exp(logits - lse[..., None])
     hit = _is_target(logits, targets)
-    d_ce = weights[..., None] * (probs - hit)
+    # p - 1 at the target is minus its miss, which does not round to 0 (`Scores`)
+    d_ce = weights[..., None] * jnp.where(hit, -scores.miss[..., None], probs)
     d_logits = [d_ce]
     if z:
-        d_logits.append((2 * weights * scores.lse)[..., None] * probs)
+        d_logits.append((2 * weights * lse)[..., None] * probs)
     grads = [_chunk_grad(p, finish, x, d) for d in d_logits]
     return scores.sums(weights, z), grads
 

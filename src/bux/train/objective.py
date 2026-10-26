@@ -10,21 +10,27 @@ A head's logits are made only when a term reads them (`Heads`). The terms here t
 only their sums over positions (`Heads.sums`), which ``methods.loss = chunks`` takes a
 chunk of positions at a time, and so never makes them all (`bux.architecture.logits`).
 The losses that layers report from a training forward (``report`` in
-`bux.architecture.registry`) are terms too, weighted by each layer.
+`bux.architecture.registry`) are terms too, weighted by each layer; what they
+observe on the steps a run observes is metrics alone, by layer
+(`bux.architecture.observe`). So are the objective's `Objective.observed` terms.
 
 Position t of a row predicts token t + offset, a target where it is in the loss mask
 and in t's document (`target_mask`); a term is a mean over the batch's targets.
+
+An eval measures the first head as sums over a batch (`held_out`), whose means over
+many batches weigh each target alike.
 """
 
 from collections.abc import Callable, Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import NamedTuple, overload
 
 import jax
 import jax.numpy as jnp
-import optax
-from jaxtyping import Array, Bool, Float, Int
+import numpy as np
+from jaxtyping import Array, Bool, Float, Int, Real, Shaped
 
+from bux.architecture import observe
 from bux.architecture.common.segments import Segments
 from bux.architecture.logits import HeadOutput, Scores, Sums
 from bux.architecture.registry import Loss
@@ -34,6 +40,9 @@ from bux.train.data import Batch
 
 #: What a step measured, by name, as scalars still on the device.
 Metrics = dict[str, Float[Array, ""]]
+#: An eval's metric on a batch: a sum, and what it is a mean of, so that its mean over
+#: batches is the sum of the first over the sum of the second.
+Ratio = tuple[Float[Array, ""], Real[Array, ""]]
 Output = HeadOutput | Float[Array, "b t vocab"]  # a head's output, or its logits
 
 
@@ -75,7 +84,9 @@ class Heads(Sequence):  # not Sequence[Array]: a type checker would read an item
         """Return head i's mean cross-entropy of predicting token t + offset at each
         position t with a target (`target_mask`), and its mean log Z squared there if
         `z`, by the run's `methods.loss` (``HeadOutput.sums``). Ask for both at once:
-        each call takes the head's logits again."""
+        each call takes the head's logits again. A forward that observes
+        (`bux.architecture.observe`) has the z-loss's sum either way, without its
+        gradient (`~bux.architecture.logits.Sums`)."""
         if (i, offset, z) not in self._sums:
             out, targets = self.outputs[i], targets_ahead(self.batch, offset)
             weights = mean_weights(self.batch, offset)
@@ -110,15 +121,24 @@ class Objective:
 
     Attributes:
         terms: Each term by name, which is also its metric's name.
+        offset: How far ahead the first head predicts: the targets of `loss`, and
+            of an eval (`held_out`).
+        observed: Metrics of the heads that only a forward that observes
+            (`bux.architecture.observe`) computes, by name; their weights are not
+            read.
     """
 
     terms: dict[str, Term]
+    offset: int = 1
+    observed: dict[str, Term] = field(default_factory=dict)
 
     def __call__(
         self, outputs: Sequence[Output], batch: Batch, aux_losses: Sequence[Loss] = ()
     ) -> tuple[Part, Part]:
         """Return the objective's two parts: its terms, means over target tokens, and
-        the losses layers report, means over rows, each name's values summed.
+        the losses layers report, means over rows, each name's values summed. In a
+        forward that observes, the first has the `observed` terms too, and the second
+        what the layers observed, by layer (`bux.architecture.observe.named`).
 
         Args:
             outputs: Each head's output, or its logits, in execution order.
@@ -138,13 +158,23 @@ class Objective:
         loss = jnp.zeros((), jnp.float32)
         for name, term in self.terms.items():
             loss = loss + term.weight * metrics[name]
+        if observe.active() is not None:
+            metrics |= {k: term.fn(heads, batch) for k, term in self.observed.items()}
         aux_loss, aux_metrics = jnp.zeros((), jnp.float32), {}
-        for name, weight, value in aux_losses:
+        for name, weight, value in reported(aux_losses):
             if name in self.terms:
                 raise ValueError(f"a layer reports {name!r}, a term of the objective")
             aux_metrics[name] = aux_metrics.get(name, 0) + value
             aux_loss = aux_loss + weight * value
+        aux_metrics |= observe.named(
+            a for a in aux_losses if observe.is_observed(a.name)
+        )
         return Part(loss, metrics), Part(aux_loss, aux_metrics)
+
+
+def reported(losses: Sequence[Loss]) -> list[Loss]:
+    """Return the losses of `losses`, without the values layers observed."""
+    return [a for a in losses if not observe.is_observed(a.name)]
 
 
 def objective(config: tcfg.LossConfig, arch: ir.Architecture) -> Objective:
@@ -153,7 +183,10 @@ def objective(config: tcfg.LossConfig, arch: ir.Architecture) -> Objective:
     that predict further ahead.
 
     `z_loss` is a term only where ``config.z`` is not 0, and `mtp` only where the
-    model has more than one head.
+    model has more than one head. With more than one, every head's cross-entropy is
+    a term of weight 0 too, by how far ahead it predicts: ``lm_loss/t+1`` (the
+    first's, `loss`), ``lm_loss/t+2``, ... And a forward that observes measures every
+    head's z-loss, ``z_loss/t+1``, ... (`Objective.observed`).
 
     Args:
         config: The run's ``loss`` setting.
@@ -184,7 +217,31 @@ def objective(config: tcfg.LossConfig, arch: ir.Architecture) -> Objective:
             return jnp.mean(jnp.stack(losses))
 
         terms["mtp"] = Term(config.mtp, mtp)
-    return Objective(terms)
+        heads = _ahead_of(offsets)  # the first's z as `loss` asks, so it computes once
+        terms |= {
+            f"lm_loss/{a}": Term(0.0, _ce(i, o, z and not i)) for i, o, a in heads
+        }
+    each = _ahead_of(offsets)  # as the loss asks for them, which has the z-loss's sums
+    observed = {f"z_loss/{a}": Term(0.0, _z(i, o, z and not i)) for i, o, a in each}
+    return Objective(terms, offsets[0], observed)
+
+
+def _ahead_of(offsets: Sequence[int]) -> list[tuple[int, int, str]]:
+    """Return each head, how far ahead it predicts, and what its metrics are named
+    by: ``t+2``, or ``t+2.1`` for the second head as far ahead as another."""
+    names = [
+        f"t+{o}" if offsets.count(o) == 1 else f"t+{o}.{i}"
+        for i, o in enumerate(offsets)
+    ]
+    return list(zip(range(len(offsets)), offsets, names, strict=True))
+
+
+def _ce(i: int, offset: int, z: bool) -> Callable[[Heads, Batch], Float[Array, ""]]:
+    return lambda heads, _: heads.sums(i, offset, z).ce
+
+
+def _z(i: int, offset: int, z: bool) -> Callable[[Heads, Batch], Float[Array, ""]]:
+    return lambda heads, _: jax.lax.stop_gradient(heads.sums(i, offset, z).z)
 
 
 def prediction_offsets(arch: ir.Architecture) -> list[int]:
@@ -208,7 +265,13 @@ def target_mask(batch: Batch, offset: int = 1) -> Bool[Array, "b _"]:
 
 def targets_ahead(batch: Batch, offset: int = 1) -> Int[Array, "b t"]:
     """Return token t + offset at each position t, and 0 at the last `offset`."""
-    return jnp.pad(jnp.asarray(batch.input_ids)[:, offset:], ((0, 0), (0, offset)))
+    return _ahead(batch.input_ids, offset)
+
+
+def _ahead(x: Shaped[np.ndarray | Array, "b t"], offset: int) -> Shaped[Array, "b t"]:
+    """Return `x` at position t + offset at each position t, and 0 at the last
+    `offset`."""
+    return jnp.pad(jnp.asarray(x)[:, offset:], ((0, 0), (0, offset)))
 
 
 def _padded_mask(batch: Batch, offset: int) -> Bool[Array, "b t"]:
@@ -235,10 +298,9 @@ def cross_entropy(
     """Return the mean cross-entropy of predicting token t + offset from each position
     t that has a target (`target_mask`), from logits given whole. The last `offset`
     positions are masked out rather than sliced off the logits, whose gradient would
-    then pad a copy of them."""
-    loss = optax.softmax_cross_entropy_with_integer_labels(
-        logits.astype(jnp.float32), targets_ahead(batch, offset)
-    )
+    then pad a copy of them. It keeps its gradient where float32 rounds a target's
+    probability to 1 (`~bux.architecture.logits.Scores`)."""
+    loss = Scores.of(logits, targets_ahead(batch, offset)).ce
     return _masked_mean(loss, _padded_mask(batch, offset))
 
 
@@ -249,3 +311,36 @@ def z_loss(
     over the first positions of each row that `mask` covers, or over all of them."""
     z = jax.nn.logsumexp(logits.astype(jnp.float32), axis=-1) ** 2
     return jnp.mean(z) if mask is None else _masked_mean(z[:, : mask.shape[1]], mask)
+
+
+def held_out(
+    head: HeadOutput,
+    batch: Batch,
+    nbytes: Int[np.ndarray | Array, "b t"] | None = None,
+    offset: int = 1,
+) -> dict[str, Ratio]:
+    """Return what an eval measures of `head` on `batch`, each as a sum and what it
+    is a mean of: its cross-entropy, `loss`, over the targets, and given each token's
+    bytes of text, its bits per byte, `bpb`.
+
+    `bpb` sums the nats of the targets that stand for text, in bits, over their
+    bytes: a special token stands for none, so it leaves it out, as nanochat does.
+
+    Args:
+        head: The head's output on `batch`.
+        batch: The rows the head ran on.
+        nbytes: The bytes of text each token of `batch` stands for
+            (``Tokenizer.token_bytes``); None leaves `bpb` out.
+        offset: How far ahead the head predicts.
+
+    Returns:
+        ``{"loss": (nats, targets)}``, and ``"bpb": (bits, bytes)`` given `nbytes`.
+    """
+    targets, mask = targets_ahead(batch, offset), _padded_mask(batch, offset)
+    loss = head.sums(targets, mask.astype(jnp.float32), False).ce
+    out = {"loss": (loss, jnp.sum(mask))}
+    if nbytes is not None:
+        counted = jnp.where(mask, _ahead(nbytes, offset), 0)
+        nats = head.sums(targets, (counted > 0).astype(jnp.float32), False).ce
+        out["bpb"] = (nats / np.log(2), jnp.sum(counted))
+    return out

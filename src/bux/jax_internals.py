@@ -43,7 +43,7 @@ VERIFIED_ON = {
     "jaxlib": "0.12.0",
     "jax-triton": "0.4.1",
     "tokamax": "0.0.17",
-    "nvidia-cudnn-frontend": "1.31.0",
+    "nvidia-cudnn-frontend": "1.32.0.dev76547535",
 }
 
 

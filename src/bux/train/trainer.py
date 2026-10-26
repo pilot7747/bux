@@ -6,8 +6,12 @@ A run's directory, ``<out>/<name>-<id>``, holds::
     run.bux        the run as one self-contained file, which `bux train` takes as is
     run.json       its IR
     metrics.jsonl  a line of metrics every `log.every` steps, and at every eval
+    histograms.jsonl  with observe(histograms=true), the histograms of each step
+                   that observes the model
     checkpoints/   with a `checkpoint` setting; a run there resumes from the latest
-    profile/       with a `profile` setting, a trace of its steps
+    profile/       with a `profile` setting, a trace or report of its steps
+    tensorboard/   with a tensorboard tracker, its event files
+    wandb/         with a wandb tracker, its files, and wandb_id, the W&B run's id
 
 Its name says which alternatives it took, and its id hashes what it computes, so a
 changed setting gets a fresh directory and an unchanged one finds its checkpoints.
@@ -23,9 +27,10 @@ them::
 
 import contextlib
 import functools
+import math
 import re
 import time
-from collections.abc import Callable, Iterable, Iterator, Mapping, Sequence
+from collections.abc import Callable, Generator, Iterable, Iterator, Mapping, Sequence
 from pathlib import Path
 from typing import Any, NamedTuple, Protocol, runtime_checkable
 
@@ -39,22 +44,41 @@ from jax.typing import DTypeLike
 from jaxtyping import Array, Float, Int32, Shaped
 
 from bux import kernels, parallel, passes
-from bux.architecture import Model, Scanned
+from bux.architecture import Model, Scanned, num_params
+from bux.architecture import observe as observing
 from bux.architecture.common.segments import Segments
 from bux.architecture.logits import HeadOutput
 from bux.architecture.precision import matmuls
 from bux.architecture.registry import Loss, Stream
 from bux.architecture.repeats import pipelined, remat
 from bux.architecture.repeats.repeat import pipelined_repeat, scanned_variables
+from bux.data import tokenizer
 from bux.data.pipeline import DEFAULT_CACHE, jobs, prepare
 from bux.lang import ir
-from bux.lang.printer import run_to_source
+from bux.lang.printer import config_to_source, run_to_source
 from bux.parallel.gather import Axes
-from bux.train import fitting, flops, interleave, reorder, stages, xla
-from bux.train.config import PrecisionConfig
+from bux.train import (
+    fitting,
+    flops,
+    interleave,
+    observe,
+    reorder,
+    stages,
+    trackers,
+    xla,
+)
+from bux.train.config import PrecisionConfig, TrainConfig, evals
 from bux.train.data import Batch, batches, prefetch
 from bux.train.hooks import Checkpoint, Eval, Hook, Later, Log, Profile
-from bux.train.objective import Metrics, Objective, objective, target_mask
+from bux.train.objective import (
+    Metrics,
+    Objective,
+    Ratio,
+    held_out,
+    objective,
+    reported,
+    target_mask,
+)
 from bux.train.optim import lr_multiplier, lr_schedule, optimizer
 from bux.train.sinks import (
     JSONL,
@@ -62,6 +86,7 @@ from bux.train.sinks import (
     LatestMetrics,
     Scalars,
     Sink,
+    echo,
     is_main_process,
 )
 
@@ -278,6 +303,10 @@ class _Cut:
         self.stand_ins = parallel.pipeline.stand_ins((self.piped, self.rest))
         graphdef = nnx.graphdef(scanned.layers)
         self.stage = pipelined.Stage.of(graphdef, scanned.times, True, None)
+        # The names of what the layers before the repeat observe, and those after it,
+        # once `first` and `last` have traced.
+        self.before: list[str] = []
+        self.after: list[str] = []
 
     def _inside(self, path: tuple, _: object) -> bool:
         return path[: len(self.path)] == self.path
@@ -296,7 +325,11 @@ class _Cut:
 
     def parts(self) -> "parallel.scheduled.Parts":
         return parallel.scheduled.Parts(
-            self.first, self.staged, self.last, lambda: self.stage.reports
+            self.first,
+            self.staged,
+            self.last,
+            lambda: self.stage.reports,
+            self.observed,
         )
 
     def model(self, others: nnx.State, kept: nnx.State) -> Model:
@@ -307,8 +340,9 @@ class _Cut:
     ) -> tuple[Stream, nnx.State]:
         """Run a microbatch up to the repeat: the stream there, and the state of the
         layers before it as they leave it."""
-        model = self.model(others, kept)
-        x = pipelined.stream_into(lambda: training_forward(model, rows.batch))
+        model, before = self.model(others, kept), []
+        x = pipelined.stream_into(lambda: training_forward(model, rows.batch), before)
+        self.before = [a.name for a in before if observing.is_observed(a.name)]
         return x, nnx.state(model, nnx.All(nnx.Not(nnx.Param), nnx.Not(self._inside)))
 
     def staged(
@@ -326,11 +360,40 @@ class _Cut:
         the step's loss, and that of its metrics."""
         with pipelined.leaving(y):
             heads, aux_losses = training_forward(self.model(others, kept), rows.batch)
-        per_token, per_row = self.objective(heads, rows.batch, aux_losses)
+        per_token, per_row = self.objective(heads, rows.batch, reported(aux_losses))
+        observed = [a for a in aux_losses if observing.is_observed(a.name)]
+        self.after = [a.name for a in observed]
         share = rows.shares.sum()
         loss = share * per_token.loss + per_row.loss / self.all_microbatches
         metrics = _scaled(per_token.metrics, share)
-        return loss, metrics | _scaled(per_row.metrics, 1 / self.all_microbatches)
+        rows_metrics = per_row.metrics | self._numbered(observed, "after")
+        return loss, metrics | _scaled(rows_metrics, 1 / self.all_microbatches)
+
+    def observed(self, values: Float[Array, "n k"], names: list[str]) -> Metrics:
+        """Return what the repeat's layers observed (``Parts.observed``), named as the
+        whole model numbers them, a pass's slot of every stage a row of `values`: of
+        the slots the stages run, not those an uneven one skips."""
+        runs = parallel.pipeline.layers_run(self.stage.shares).reshape(-1)
+        losses = [
+            Loss(name, 0.0, v)
+            for row, kept in zip(values, runs, strict=True)
+            if kept
+            for name, v in zip(names, row, strict=True)
+        ]
+        return self._numbered(losses, "repeat")
+
+    def _numbered(self, losses: list[Loss], part: str) -> Metrics:
+        """Return what the layers of `part` of the model observed, `losses`, named as
+        a forward of the whole model numbers them (`bux.train.observe.numbered`).
+        Nothing gets the values of the layers before the repeat, whose forward stops
+        there; they are numbered all the same."""
+        per_pass = [n for n, _ in self.stage.reports if observing.is_observed(n)]
+        parts = {
+            "before": self.before,
+            "repeat": per_pass * sum(self.stage.shares),
+            "after": self.after,
+        }
+        return observe.numbered(parts, part, losses)
 
 
 def _check_outside(model: nnx.Module, inside: Callable[[tuple, object], bool]) -> None:
@@ -405,6 +468,12 @@ class Trainer:
     FLOPs of the steps taken, each at the keys its batch's queries see, for the log's
     MFU.
 
+    Every `observe_every` steps, the step is one compiled apart that also measures the
+    model by layer (`bux.train.observe`): its forward, gradient, parameters and
+    update, and with `histograms`, histograms of the stream and of the gradient.
+    The others run as they would without it. `timers` keeps the seconds the host
+    spends in each part of the loop (`Timers`).
+
     Args:
         model: The model to train.
         tx: The optax update rule (`bux.train.optim.optimizer`).
@@ -426,6 +495,9 @@ class Trainer:
         reductions: ``"early"`` or ``"xla"``: where the gradients' reductions start.
         work: A step's model FLOPs (`step_flops`), for the log's MFU; None does not
             count them.
+        observe_every: The steps between those that observe the model; None for
+            none.
+        histograms: Whether those steps take histograms too.
 
     Attributes:
         model: The model, whose variables hold the latest step's state.
@@ -433,6 +505,8 @@ class Trainer:
         step: The steps taken.
         flops: The model FLOPs of the steps taken, where `work` is given.
         stopping: Set it, from a signal handler say, to stop `fit` after this step.
+        timers: The seconds the host spent in each part of the loop, since the log
+            last read them.
 
     Raises:
         ValueError: If `interleave` is asked for under a pipeline, or `accumulate`
@@ -471,6 +545,8 @@ class Trainer:
         compiler_options: xla.Options | None = None,
         reductions: str = "early",
         work: flops.Work | None = None,
+        observe_every: int | None = None,
+        histograms: bool = False,
     ):
         if interleave and parallel.pipeline.pipelined():
             raise ValueError(
@@ -487,6 +563,9 @@ class Trainer:
         parallel.shard_state(self.model, self.optimizer)
         self.step = 0
         self.work, self.flops = work, 0.0
+        self.observe_every, self.histograms = observe_every, histograms
+        self.layers = observe.layers(model) if observe_every else {}
+        self.timers = Timers()
         self.stopping = False  # set, by a signal handler say, to stop after this step
         self._donate = donate
         self._compiler_options = compiler_options or {}
@@ -505,7 +584,43 @@ class Trainer:
             self._compiler_options,
             donate_argnums=0 if self._donate else (),
         )
+        self._observed: Any = None  # compiled at the first step that observes
+        self._launched: set[bool] = set()  # which steps have compiled: observed or not
         self._eval = nnx.jit(self.eval_step)
+
+    def observes(self, step: int) -> bool:
+        """Return whether the step that takes the trainer to `step` observes the
+        model (`bux.train.observe`): every `observe_every` steps."""
+        every = self.observe_every
+        return every is not None and step % every == 0
+
+    def _observed_step(self) -> Any:
+        """Return the compiled step that observes, made at its first call: under remat
+        `auto`, under the policy the other step chose, or one it chooses itself."""
+        if self._observed is None:
+            step = self._on_values(self._observe_on_shards)
+            chosen = getattr(self._train, "policy", None)
+            if chosen is not None:
+                step = _with_policy(chosen, step)
+            auto = remat.setting() == "auto" and chosen is None
+            self._observed = (fitting.Fitting if auto else xla.jit)(
+                step, self._compiler_options, donate_argnums=0 if self._donate else ()
+            )
+        return self._observed
+
+    def _observe_on_shards(
+        self, model: Model, optimizer: nnx.Optimizer, batch: Batch
+    ) -> Metrics:
+        """Take `train_step` as a step that observes does: with its forward observed,
+        and what it measures of the gradient, the parameters and the update, by
+        layer (`bux.train.observe.params`)."""
+        before = nnx.to_pure_dict(nnx.state(model, nnx.Param))
+        with observe.observing(self.histograms) as recorded:
+            optimizer.tx = recorded.wrap(optimizer.tx)
+            metrics = self._train_step_on_shards(model, optimizer, batch)
+        grads, updates = recorded.grads, recorded.updates
+        measured = observe.params(self.layers, before, grads, updates, self.histograms)
+        return metrics | measured
 
     def _on_values(self, step: Callable[..., Metrics]) -> Callable[..., Any]:
         """Return `step`, a function of the model, the optimizer and a batch, as one
@@ -616,6 +731,7 @@ class Trainer:
             grads, metrics, buffers = self._whole(graphdef, params, buffers, batch)
         nnx.update(model, buffers)
         apply_step_end_updates(model)
+        observe.record_grads(grads)
         return grads, metrics
 
     def _whole(
@@ -841,23 +957,31 @@ class Trainer:
         metrics = _scaled(per_token.metrics, token_share)
         return loss, metrics | _scaled(per_row.metrics, row_share)
 
-    def eval_step(self, model: Model, batch: Batch) -> Float[Array, ""]:
-        """Return the first head's loss on `batch`, computed in `compute`, its
-        projections multiplied as the precision's `eval` says.
+    def eval_step(
+        self,
+        model: Model,
+        batch: Batch,
+        nbytes: Int32[np.ndarray | Array, "b t"] | None = None,
+    ) -> dict[str, Ratio]:
+        """Return what an eval measures of the first head on `batch`, each metric a
+        sum and what it is a mean of (`bux.train.objective.held_out`): its loss, and
+        given each token's bytes of text, `nbytes`, its bits per byte. It computes in
+        `compute`, its projections multiplied as the precision's `eval` says.
 
         It is compiled once, by `evaluate`; override it to change what an evaluation
-        measures."""
+        measures: every name it returns is a metric."""
         with matmuls.use(matmuls.evaluating(self.matmuls)):
             heads = forward(cast(model, self.compute), batch)
-        per_token, _ = self.objective(heads, batch)
-        return per_token.metrics["loss"]
+        return held_out(heads[0], batch, nbytes, self.objective.offset)
 
     def train_on_batch(self, batch: Batch) -> Metrics:
         """Take one training step on `batch`, and return its metrics.
 
         It puts the batch on the devices, runs the compiled step, which compiles at
-        its first call and at a `switch`, and counts the step and its FLOPs. It
-        returns once the step is launched: reading a metric waits for it.
+        its first call and at a `switch`, and counts the step and its FLOPs. Every
+        `observe_every` steps it runs the step that observes instead. It returns once
+        the step is launched: reading a metric waits for it. `timers` counts the time
+        it took as ``launch``, or as ``compile`` where the step compiled.
 
         Args:
             batch: The step's rows, on the host (`bux.train.data.batches`).
@@ -866,8 +990,13 @@ class Trainer:
             The step's metrics (`train_step`), still on the device.
         """
         self._switch_if_due()
+        observes = self.observes(self.step + 1)
+        step = self._observed_step() if observes else self._train
         on_devices = parallel.shard_batch(batch)
-        values, metrics = self._train(self._split.values(), on_devices)
+        part = "launch" if observes in self._launched else "compile"
+        with self.timers(part):
+            values, metrics = step(self._split.values(), on_devices)
+        self._launched.add(observes)
         self._split.take(values)
         self.step += 1
         if self.work is not None:
@@ -885,23 +1014,41 @@ class Trainer:
             self.matmuls, self.switch = self.switch[1], None
             self._compile()
 
-    def evaluate(self, batches: Iterable[Batch]) -> float:
-        """Return the mean of `eval_step` over `batches`, in eval mode. Every batch's
-        step is launched before any loss is read, so the GPU runs one as the host
-        launches the next.
+    def evaluate(
+        self,
+        batches: Iterable[Batch],
+        token_bytes: Int32[np.ndarray, " vocab"] | None = None,
+    ) -> dict[str, float]:
+        """Return the mean of each metric of `eval_step` over `batches`, in eval mode:
+        the first head's `loss`, and given each token id's bytes of text, its bits
+        per byte, `bpb`. A mean weighs every target alike, whichever batch it is in.
+        Every batch's step is launched before any is read, so the GPU runs one as the
+        host launches the next.
 
         Args:
             batches: The held-out batches, on the host; a finite number of them.
+            token_bytes: The bytes of text each id of the model's vocabulary stands
+                for (``Tokenizer.token_bytes``); None leaves `bpb` out.
 
         Returns:
-            The mean of their losses, each batch weighed alike.
+            Each metric's mean, by name; NaN for a mean of nothing.
+
+        Example::
+
+            held_out = batches(eval_data, run.train, vocab, held_out=True)
+            trainer.evaluate(itertools.islice(held_out, 10))  # {"loss": 3.21}
         """
         self.model.eval()
         try:
-            losses = [self._eval(self.model, parallel.shard_batch(b)) for b in batches]
+            sums = [
+                self._eval(
+                    self.model, *parallel.shard_batch(_with_bytes(b, token_bytes))
+                )
+                for b in batches
+            ]
         finally:
             self.model.train()
-        return sum(float(loss) for loss in losses) / len(losses)
+        return _means(sums)
 
     def state(self) -> nnx.State:
         """What a checkpoint keeps: the model's state and the optimizer's."""
@@ -929,7 +1076,9 @@ class Trainer:
         (`bux.train.data.prefetch`). After every step, the hooks due run in order, and
         what they return goes to every sink once the next step is launched
         (`bux.train.hooks.Later`). All of them close at the end, or when training
-        stops.
+        stops. `timers` counts the host's time waiting for batches (``data``), in
+        hooks (``hooks``), and reading what they return, which waits for the step
+        before (``wait``).
 
         Args:
             data: The batches, on the host, from the trainer's step on.
@@ -954,26 +1103,85 @@ class Trainer:
             loaded = stack.enter_context(contextlib.closing(prefetch(data)))
             reported: list[tuple[int, Scalars | Later]] = []
             while self.step < steps and not self.stopping:
-                metrics = self.train_on_batch(next(loaded))
-                _write(reported, sinks)  # the step before's, as this one runs
-                reported = [
-                    (self.step, out)
-                    for hook in hooks
-                    if hook.due(self.step, steps) and (out := hook(self, metrics))
-                ]
+                with self.timers("data"):
+                    batch = next(loaded)
+                metrics = self.train_on_batch(batch)
+                with self.timers("wait"):
+                    _write(reported, sinks)  # the step before's, as this one runs
+                with self.timers("hooks"):
+                    reported = [
+                        (self.step, out)
+                        for hook in hooks
+                        if hook.due(self.step, steps) and (out := hook(self, metrics))
+                    ]
             _write(reported, sinks)
             if self.step < steps:
                 for hook in hooks:
                     hook.stop(self)
 
 
+def _with_bytes(
+    batch: Batch, token_bytes: Int32[np.ndarray, " vocab"] | None
+) -> tuple[Batch, Int32[np.ndarray, "b t"] | None]:
+    """Return `batch`, and the bytes of text each of its tokens stands for."""
+    return batch, None if token_bytes is None else token_bytes[batch.input_ids]
+
+
+def _means(sums: Sequence[Mapping[str, Ratio]]) -> dict[str, float]:
+    """Return each metric's sums added up over the batches, the first over the
+    second: a mean over all of them. Reading them waits for each batch's step."""
+    means = {}
+    for name in sums[0]:
+        total, count = (sum(float(s[name][i]) for s in sums) for i in (0, 1))
+        means[name] = total / count if count else math.nan
+    return means
+
+
 def _write(reported: list[tuple[int, Scalars | Later]], sinks: Sequence[Sink]) -> None:
     """Give every sink what the hooks reported at each step, read now where it is
-    `Later`."""
+    `Later`: the histograms whose bins it holds apart (`Sink.histograms`)."""
     for step, out in reported:
-        scalars = out if isinstance(out, Mapping) else out()
+        scalars, histograms = observe.histograms_of(
+            out if isinstance(out, Mapping) else out()
+        )
         for sink in sinks:
             sink.write(step, scalars)
+            if histograms:
+                sink.histograms(step, histograms)
+
+
+def _with_policy(policy: str, step: Callable[..., Any]) -> Callable[..., Any]:
+    """Return `step`, traced under the remat `policy`, by its own name."""
+
+    @functools.wraps(step)
+    def under(*args: Any) -> Any:
+        with remat.trying(policy):
+            return step(*args)
+
+    return under
+
+
+class Timers:
+    """The seconds the host spends in each part of the training loop, by name, since
+    they were last read: ``with trainer.timers("data"): ...``."""
+
+    def __init__(self) -> None:
+        self.seconds: dict[str, float] = {}
+
+    @contextlib.contextmanager
+    def __call__(self, name: str) -> Generator[None]:
+        """Count the block's time as `name`'s."""
+        start = time.perf_counter()
+        try:
+            yield
+        finally:
+            spent = time.perf_counter() - start
+            self.seconds[name] = self.seconds.get(name, 0.0) + spent
+
+    def read(self) -> dict[str, float]:
+        """Return the seconds by name since the last read, and count from zero."""
+        seconds, self.seconds = self.seconds, {}
+        return seconds
 
 
 def directory(run: ir.Run, out: str | Path) -> Path:
@@ -988,7 +1196,7 @@ def train(
     out: str | Path = "runs",
     *,
     cache: str | Path = DEFAULT_CACHE,
-    echo: Callable[[str], None] = print,
+    echo: Callable[[str], None] = echo,
     hooks: Sequence[Hook] = (),
     sinks: Sequence[Sink] = (),
 ) -> dict[str, float]:
@@ -1000,21 +1208,25 @@ def train(
     It is what ``bux train`` runs for each run of a file. It writes run.bux and
     run.json into the run's directory (`directory`), builds the model on the run's
     mesh, resumes from the latest checkpoint there if the run has a ``checkpoint``
-    setting, and trains with the run's own hooks: its log, eval, checkpoint and
-    profile.
+    setting, and trains with the run's own hooks: its log, evals, checkpoint and
+    profile; every ``observe.every`` steps with a step that observes the model
+    (`bux.train.observe`). Its sinks are the console, metrics.jsonl (and
+    histograms.jsonl) and the latest metrics, then the ``log.trackers``
+    (`bux.train.trackers`).
 
     Args:
         run: A compiled run (`bux.lang.compile_runs`).
         out: The folder of runs' directories.
         cache: Where prepared datasets go and are found (`bux.data.pipeline`).
-        echo: What prints the run's lines: its log, and what it resumed from.
+        echo: What prints the run's lines: what it trains, what it resumed from,
+            and its log; each flushed as it is printed, by default.
         hooks: More hooks, after the run's own (`bux.train.hooks`).
         sinks: More sinks, after the console, metrics.jsonl and the latest metrics
             (`bux.train.sinks`).
 
     Returns:
         The latest value of every metric the hooks reported, by name, as `loss`,
-        `eval_loss` and `tokens_per_s`.
+        `eval_loss`, `eval_bpb` and `tokens_per_s`.
 
     Raises:
         ValueError: If the model has no vocabulary, the batch does not split over the
@@ -1075,24 +1287,62 @@ def train(
             compiler_options=xla.options(config.compiler),
             reductions=config.compiler.reductions,
             work=work,
+            observe_every=None if config.observe is None else config.observe.every,
+            histograms=config.observe is not None and config.observe.histograms,
         )
         make_batches = functools.partial(
             batches, config=config, vocab_size=vocab, cache=cache
         )
         run_hooks = _hooks(run, trainer, folder, log, make_batches, echo)
-        latest = LatestMetrics()
+        for line in _about(run, folder, trainer):
+            echo(f"{run.name}: {line}")
+        latest, start = LatestMetrics(), trainer.step
+        histograms = folder / "histograms.jsonl"
         trainer.fit(
-            make_batches(config.data, start=trainer.step),
+            make_batches(config.data, start=start),
             config.steps,
             hooks=[*run_hooks, *hooks],
             sinks=[
-                Console(run.name, config.steps, echo),
-                JSONL(folder / "metrics.jsonl", start=trainer.step),
+                Console(run.name, config.steps, echo, _formats(config)),
+                JSONL(folder / "metrics.jsonl", start=start, histograms=histograms),
                 latest,
+                *trackers.build(run, folder, start),
                 *sinks,
             ],
         )
     return latest.metrics
+
+
+def _about(run: ir.Run, folder: Path, trainer: Trainer) -> list[str]:
+    """Return the lines that say what a run trains, before it does: where it writes,
+    its model, its steps and tokens, and what it logs and saves."""
+    t = run.train
+    tokens = t.steps * t.batch * t.seq_len
+    devices = parallel.mesh(t.mesh).devices
+    params = _si(num_params(trainer.model))
+    how = f"{config_to_source(t.optimizer)}, {config_to_source(t.schedule)}"
+    steps = f"{t.steps:,} steps × {t.batch} × {t.seq_len} tokens = {_si(tokens)} tokens"
+    lines = [
+        f"{folder}, on {devices.size} × {devices.flat[0].device_kind}",
+        f"{params} parameters, {steps}, {how}",
+    ]
+    watched = [f"log every {t.log.every}"]
+    if t.observe is not None:
+        more = " with histograms" if t.observe.histograms else ""
+        watched.append(f"observe every {t.observe.every}{more}")
+    watched += [f"{e.name} every {e.every}" for e in evals(t)]
+    if t.checkpoint is not None:
+        watched.append(f"checkpoint every {t.checkpoint.every}")
+    watched += [config_to_source(c) for c in t.log.trackers]
+    return [*lines, ", ".join(watched)]
+
+
+def _si(n: float) -> str:
+    """Return `n` with an SI suffix, as ``bux plan`` shows it: 1.3B, 25.6k."""
+    for suffix, scale in (("", 1), ("k", 1e3), ("M", 1e6), ("B", 1e9)):
+        if "e" not in (shown := f"{n / scale:.3g}"):
+            return shown + suffix
+    return f"{n / 1e12:.3g}T"
 
 
 def _check_cpu_bfloat16(run: ir.Run) -> None:
@@ -1200,13 +1450,23 @@ def _hooks(
     make_batches: Callable[..., Iterator[Batch]],
     echo: Callable[[str], None],
 ) -> list[Hook]:
-    """Return the run's own hooks: its `log`, eval, checkpoint, which resumes `trainer`
+    """Return the run's own hooks: its `log`, evals, checkpoint, which resumes `trainer`
     from the latest checkpoint in `folder` if there is one, and profile."""
     config = run.train
     hooks: list[Hook] = [log]
-    if (evals := config.eval) is not None:
-        held_out = functools.partial(make_batches, evals.data, held_out=True)
-        hooks.append(Eval(held_out, every=evals.every, batches=evals.batches))
+    sets = evals(config)
+    token_bytes = _token_bytes(config, run.arch.vocab_size) if sets else None
+    for e in sets:
+        data = functools.partial(make_batches, e.data, held_out=True)
+        hooks.append(
+            Eval(
+                data,
+                every=e.every,
+                batches=e.batches,
+                name=e.name,
+                token_bytes=token_bytes,
+            )
+        )
     if (saves := config.checkpoint) is not None:
         checkpoint = Checkpoint(
             folder / "checkpoints", every=saves.every, keep=saves.keep
@@ -1219,5 +1479,28 @@ def _hooks(
             )
         hooks.append(checkpoint)
     if (trace := config.profile) is not None:
-        hooks.append(Profile(folder / "profile", start=trace.start, steps=trace.steps))
+        profile = Profile(
+            folder / "profile", start=trace.start, steps=trace.steps, tool=trace.tool
+        )
+        hooks.append(profile)
     return hooks
+
+
+def _token_bytes(
+    config: TrainConfig, vocab_size: int | None
+) -> Int32[np.ndarray, " vocab"] | None:
+    """Return the bytes of text each id of the model's vocabulary stands for, by the
+    run's tokenizer, 0 past its ids; None without a tokenizer."""
+    if config.tokenizer is None:
+        return None
+    lengths = tokenizer.load(config.tokenizer).token_bytes()
+    return np.pad(lengths, (0, max(0, (vocab_size or 0) - len(lengths))))
+
+
+def _formats(config: TrainConfig) -> dict[str, str]:
+    """Return the metrics the console shows, `Console.FORMATS` and each eval's."""
+    formats = dict(Console.FORMATS)
+    for e in evals(config):
+        formats[f"{e.name}_loss"] = f"{e.name} loss {{:.4f}}"
+        formats[f"{e.name}_bpb"] = f"{e.name} bpb {{:.4f}}"
+    return formats

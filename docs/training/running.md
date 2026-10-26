@@ -7,17 +7,22 @@ To train a sweep on a cluster, or to stop and resume, see [Launching](launching.
 
 ```console
 $ bux train examples/experiments/smoke.bux
+smoke: runs/smoke-f114ac17ae, on 1 × cpu
+smoke: 156k parameters, 50 steps × 8 × 64 tokens = 25.6k tokens, adamw(lr=0.003), wsd(warmup=10)
+smoke: log every 10
 remat=auto: none in 1s (none 0.0 GiB in 0s)
-smoke step 10/50  loss 6.6252  lr 3.00e-03  grad 1.614  8,069 tok/s
-smoke step 20/50  loss 6.5475  lr 3.00e-03  grad 1.038  74,799 tok/s
-smoke step 30/50  loss 6.3513  lr 3.00e-03  grad 0.554  75,033 tok/s
-smoke step 40/50  loss 6.2974  lr 3.00e-03  grad 0.458  75,813 tok/s
-smoke step 50/50  loss 6.2854  lr 0.00e+00  grad 0.395  74,624 tok/s
+smoke step 10/50  loss 6.6252  lr 3.00e-03  grad 1.614  8,345 tok/s  61 ms/step  data 0.1 ms  compiled in 0.5s  0:00:01 < 0:00:02
+smoke step 20/50  loss 6.5475  lr 3.00e-03  grad 1.038  74,690 tok/s  7 ms/step  data 0.0 ms  0:00:01 < 0:00:00
+smoke step 30/50  loss 6.3513  lr 3.00e-03  grad 0.554  74,647 tok/s  7 ms/step  data 0.0 ms  0:00:01 < 0:00:00
+smoke step 40/50  loss 6.2974  lr 3.00e-03  grad 0.458  76,317 tok/s  7 ms/step  data 0.0 ms  0:00:01 < 0:00:00
+smoke step 50/50  loss 6.2854  lr 0.00e+00  grad 0.395  76,569 tok/s  7 ms/step  data 0.0 ms  0:00:01 < 0:00:00
 ```
 
-The first line is `methods.remat = auto` choosing what the backward keeps
-([Remat](../parallelism/remat.md)); the first log's tokens a second include the
-compile.
+The first lines say where the run writes, its model and its tokens, and what it
+logs; then `methods.remat = auto` chooses what the backward keeps
+([Remat](../parallelism/remat.md)). The first log's tokens a second include the
+compile, and each log ends with the time since the start and the time left
+([The console](observing.md#the-console)).
 
 ## `bux train`
 
@@ -67,9 +72,11 @@ id. `smoke[optimizer.lr=1e-3]` goes to `runs/smoke_optimizer.lr=1e-3-e3a8d2164a/
 |------|---------------|------------|
 | `run.bux` | the run as one file: no modules, no alternatives. `bux train` takes it as is | `train` |
 | `run.json` | the run's IR, {py:class}`bux.lang.ir.Run` as JSON | `train` |
-| `metrics.jsonl` | a line of metrics every `log.every` steps, and at every eval | `train` |
+| `metrics.jsonl` | a line of metrics every `log.every` steps, at every eval, and at every step that observes the model | `train` |
+| `histograms.jsonl` | with `observe(histograms=true)`, the histograms of each step that observes the model ([Observing a run](observing.md)) | `train` |
 | `checkpoints/` | the model's and the optimizer's state, with a `checkpoint` setting (orbax) | `train` |
-| `profile/` | a `jax.profiler` trace, with a `profile` setting | `train` |
+| `profile/` | a `jax.profiler` trace, or an nsys or ncu report, with a `profile` setting | `train`, or the tool |
+| `tensorboard/`, `wandb/`, `wandb_id` | a tracker's files ([Trackers](observing.md#trackers)) | `train` |
 | `status.json` | whether the run is running, done, failed or stopped, and its latest metrics | `bux launch` |
 | `train.log` | a sweep's worker's output | `bux launch` |
 
@@ -163,11 +170,11 @@ the last, to the console and to `metrics.jsonl`:
 | `tokens` | the tokens trained on so far: steps × `batch` × `seq_len` |
 | `tokens_per_s` | tokens a second since the last log |
 | `mfu` | model FLOPs a second over the devices' peak, on GPUs whose peak bux knows ([MFU](#mfu)) |
-| `eval_loss` | the held-out loss, at an eval ([Eval](#eval)) |
+| `eval_loss`, `eval_bpb` | the held-out loss and bits per byte, at an eval; `<name>_loss` and `<name>_bpb` for an eval of that name ([Eval](#eval)) |
 | `comm_ms`, `exposed_comm_ms`, `idle_ms` | what a profiled step spent communicating and idle ([Profiling](../performance/profiling.md)) |
 
-The console shows `loss`, `lr`, `grad_norm`, `tokens_per_s`, `mfu` and `eval_loss`;
-`metrics.jsonl` has every metric. Reading a step's loss waits for that step, so the
+The console shows `loss`, `lr`, `grad_norm`, `tokens_per_s`, `mfu` and each eval's
+loss and bits per byte; `metrics.jsonl` has every metric. Reading a step's loss waits for that step, so the
 log reads it once the next step is launched, and the GPU never waits for the host to
 log ([The host between steps](extending.md#the-host-between-steps)).
 
@@ -227,23 +234,52 @@ and 0.8B of attention.
 eval = eval(data=fineweb(split=[0.99, 1]), every=125, batches=20)
 ```
 
-{bux}`eval` reports the held-out loss, `eval_loss`, every `every` steps and at the
-last:
+{bux}`eval` measures the model on held-out rows every `every` steps and at the last:
+`eval_loss`, the first head's cross-entropy, and `eval_bpb`, its bits per byte, where
+the run has a `tokenizer`.
 
 | Field | Default | What it is |
 |-------|---------|------------|
+| `name` | `eval` | what its metrics' names start with |
 | `data` | required | the held-out rows: any data a run takes, a mixture too |
 | `every` | `1000` | steps between evals |
 | `batches` | `10` | batches of `batch` rows each, the same ones every time |
 
-The held-out loss is the first head's cross-entropy, averaged over the batches, with
-the model in eval mode: dropout off, an MoE's router bias left as it is, and the
+An eval is a training step's forward on packed rows, with no backward. Each batch
+sums what it measures over its targets, and the eval adds the sums up:
+
+- **The loss** is the cross-entropy's sum over all the batches' targets, over their
+  number. Every target counts alike, as in training: a batch with fewer of them, with
+  more padding or more of a chat's prompts, counts for less.
+- **Bits per byte** are the same targets' nats over the bytes of text they stand for,
+  in bits: `Σ nats / (ln 2 · Σ bytes)`. A token stands for its UTF-8 bytes in the
+  tokenizer's vocabulary, so bits per byte compare across tokenizers, which the loss
+  does not. A special token (`<|endoftext|>`, `<|im_end|>`) stands for no text, so
+  bits per byte leave its loss out, as nanochat's do. `tokens` data has them where the
+  run's `tokenizer` is the one its shards were made with.
+
+The model is in eval mode: dropout off, an MoE's router bias left as it is, and the
 losses layers report left out. It multiplies as training does, or in `compute` with
 `precision(eval=compute)` ([Precision](precision.md)).
 
 Held-out rows come from a stream of their own, drawn independently of training's. A
 `split` of the same documents is the usual held-out set: `split=[0, 0.99]` and
 `split=[0.99, 1]` are disjoint and cover everything ([Splits](../data/sources.md#splits)).
+
+### Several held-out sets
+
+`eval` also takes a list of evals, each a held-out set under a name of its own:
+
+```bux
+data = 0.8 * web(split=[0, 0.99]) + 0.2 * code(split=[0, 0.99])
+eval = [eval(name="web", data=web(split=[0.99, 1]), every=500),
+        eval(name="code", data=code(split=[0.99, 1]), every=500)]
+```
+
+This run logs `web_loss`, `web_bpb`, `code_loss` and `code_bpb`, and the console
+shows each eval on a line of its own. An eval of a mixture measures the mixture as a
+whole; to measure each source, give each an eval. `bux launch`'s summary shows the
+first eval's loss.
 
 ## Checkpoints
 
@@ -274,4 +310,6 @@ how it fails when it cannot work.
 `profile = profile(start=20, steps=5)` traces the 5 steps after step 20 into the run's
 `profile/`, for `xprof` or TensorBoard's profile plugin; its defaults are `start=10`
 and `steps=5`. On GPUs the log then reports what a traced step spent communicating and
-idle. [Profiling](../performance/profiling.md) covers the trace and those metrics.
+idle. With `tool=nsys` or `tool=ncu`, `bux launch` runs the run under Nsight Systems
+or Nsight Compute, whose report of those steps goes there instead.
+[Profiling](../performance/profiling.md) covers the traces and those metrics.

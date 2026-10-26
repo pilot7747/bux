@@ -1,0 +1,350 @@
+{
+ "NormalizationConfig": [
+  "affine",
+  "bias",
+  "eps",
+  "scale_input",
+  "type",
+  "zero_centered"
+ ],
+ "DyTConfig": [
+  "alpha_init",
+  "type"
+ ],
+ "MLPConfig": [
+  "activation",
+  "bias",
+  "dropout",
+  "intermediate_size",
+  "limit",
+  "type",
+  "up_offset",
+  "up_softcap"
+ ],
+ "MoEConfig": [
+  "aux_loss_coef",
+  "aux_loss_scope",
+  "bias_update_rate",
+  "expert",
+  "expert_norm",
+  "latent_input_norm",
+  "latent_output_norm",
+  "latent_size",
+  "load_balancing",
+  "normalize_top_k",
+  "num_experts",
+  "num_groups",
+  "num_shared_experts",
+  "random_logits",
+  "routed_scaling_factor",
+  "router",
+  "router_bias",
+  "router_logit_scale",
+  "shared_expert",
+  "shared_expert_gate",
+  "shared_expert_sink",
+  "top_k",
+  "top_k_groups",
+  "type"
+ ],
+ "GQAConfig": [
+  "attention_dropout",
+  "bias",
+  "fused_qkv",
+  "gate_activation",
+  "gate_head_bias",
+  "gate_per_head",
+  "gated",
+  "head_dim",
+  "indexer",
+  "kv_conv_size",
+  "log_scale",
+  "log_scale_floor",
+  "num_heads",
+  "num_kv_heads",
+  "output_bias",
+  "output_dropout",
+  "output_norm",
+  "power_scale",
+  "power_scale_length",
+  "qk_norm",
+  "relative_bias",
+  "rope",
+  "scale",
+  "sinks",
+  "sliding_window_size",
+  "softcap",
+  "type",
+  "v_head_dim",
+  "value_residual"
+ ],
+ "MLAConfig": [
+  "attention_dropout",
+  "gate_activation",
+  "gate_head_bias",
+  "gate_per_head",
+  "gated",
+  "indexer",
+  "kv_lora_rank",
+  "log_scale",
+  "log_scale_floor",
+  "num_heads",
+  "output_dropout",
+  "output_norm",
+  "q_lora_rank",
+  "qk_nope_head_dim",
+  "qk_norm",
+  "qk_rope_head_dim",
+  "relative_bias",
+  "rope",
+  "scale",
+  "sinks",
+  "sliding_window_size",
+  "softcap",
+  "type",
+  "v_head_dim"
+ ],
+ "CSAConfig": [
+  "attention_dropout",
+  "compress_ratio",
+  "gate_activation",
+  "gate_head_bias",
+  "gate_per_head",
+  "gated",
+  "head_dim",
+  "indexer",
+  "latent_norm",
+  "log_scale",
+  "log_scale_floor",
+  "num_heads",
+  "o_groups",
+  "o_lora_rank",
+  "output_dropout",
+  "output_norm",
+  "q_lora_rank",
+  "qk_norm",
+  "relative_bias",
+  "rope",
+  "scale",
+  "sinks",
+  "sliding_window_size",
+  "softcap",
+  "type"
+ ],
+ "GLAConfig": [
+  "conv_size",
+  "gate_rank",
+  "head_dim",
+  "norm_eps",
+  "num_heads",
+  "num_v_heads",
+  "output_gate",
+  "type",
+  "v_head_dim"
+ ],
+ "DeltaNetConfig": [
+  "conv_size",
+  "head_dim",
+  "norm_eps",
+  "num_heads",
+  "num_v_heads",
+  "output_gate",
+  "type",
+  "v_head_dim"
+ ],
+ "GatedDeltaNetConfig": [
+  "conv_size",
+  "head_dim",
+  "norm_eps",
+  "num_heads",
+  "num_v_heads",
+  "output_gate",
+  "type",
+  "v_head_dim"
+ ],
+ "KDAConfig": [
+  "conv_size",
+  "gate_lower_bound",
+  "gate_rank",
+  "head_dim",
+  "norm_eps",
+  "num_heads",
+  "num_v_heads",
+  "output_gate",
+  "output_gate_rank",
+  "type",
+  "v_head_dim"
+ ],
+ "LightningAttentionConfig": [
+  "conv_size",
+  "head_dim",
+  "norm_eps",
+  "num_heads",
+  "num_v_heads",
+  "output_gate",
+  "type",
+  "v_head_dim"
+ ],
+ "RWKV7Config": [
+  "a_rank",
+  "conv_size",
+  "decay_rank",
+  "gate_rank",
+  "head_dim",
+  "norm_eps",
+  "num_heads",
+  "num_v_heads",
+  "output_gate",
+  "type",
+  "v_head_dim",
+  "v_rank"
+ ],
+ "MambaConfig": [
+  "conv_size",
+  "dt_max",
+  "dt_min",
+  "dt_rank",
+  "expand",
+  "state_size",
+  "type"
+ ],
+ "Mamba2Config": [
+  "conv_size",
+  "dt_max",
+  "dt_min",
+  "expand",
+  "head_dim",
+  "num_groups",
+  "num_heads",
+  "state_size",
+  "type"
+ ],
+ "ConvConfig": [
+  "bias",
+  "size",
+  "type"
+ ],
+ "ShortConvConfig": [
+  "bias",
+  "conv_size",
+  "type"
+ ],
+ "LinearConfig": [
+  "bias",
+  "features",
+  "type"
+ ],
+ "ActivationConfig": [
+  "fn",
+  "type"
+ ],
+ "ScaleConfig": [
+  "init",
+  "per_channel",
+  "type"
+ ],
+ "DropoutConfig": [
+  "rate",
+  "type"
+ ],
+ "EmbeddingConfig": [
+  "dropout",
+  "max_positions",
+  "norm",
+  "scale_by_sqrt_dim",
+  "type"
+ ],
+ "LMHeadConfig": [
+  "bias",
+  "softcap",
+  "tied",
+  "type"
+ ],
+ "NextNConfig": [
+  "norm",
+  "type"
+ ],
+ "EngramConfig": [
+  "boundary_token",
+  "conv_size",
+  "head_dim",
+  "max_ngram_size",
+  "norm",
+  "num_heads",
+  "table_size",
+  "type",
+  "vocab_classes"
+ ],
+ "MergeConfig": [
+  "type"
+ ],
+ "RoPEConfig": [
+  "base",
+  "fraction",
+  "layout",
+  "scaling",
+  "type"
+ ],
+ "PositionInterpolationConfig": [
+  "factor",
+  "type"
+ ],
+ "YaRNConfig": [
+  "attention_factor",
+  "attention_factor_on",
+  "beta_fast",
+  "beta_slow",
+  "factor",
+  "original_max_len",
+  "type"
+ ],
+ "Llama3RoPEScalingConfig": [
+  "factor",
+  "high_freq_factor",
+  "low_freq_factor",
+  "original_max_len",
+  "type"
+ ],
+ "RelativeBiasConfig": [
+  "extent",
+  "rank",
+  "type"
+ ],
+ "SparseIndexerConfig": [
+  "block_size",
+  "candidate_block_size",
+  "candidate_top_k",
+  "head_dim",
+  "loss_weight",
+  "norm",
+  "num_heads",
+  "rope_layout",
+  "top_k",
+  "type",
+  "weighted"
+ ],
+ "HyperConnectionsConfig": [
+  "dynamic",
+  "expansion",
+  "norm_eps",
+  "single_pass",
+  "sinkhorn_iters",
+  "type"
+ ],
+ "GatedResidualConfig": [
+  "expansion",
+  "norm_eps",
+  "rank",
+  "type"
+ ],
+ "AttentionResidualConfig": [
+  "block_size",
+  "norm_eps",
+  "type"
+ ],
+ "ResidualGateConfig": [
+  "eps",
+  "temperature",
+  "type"
+ ]
+}

@@ -65,9 +65,10 @@ is a method of `methods.attention`, a field of {bux}`methods`:
 | Method | What it does |
 |---|---|
 | `auto` | The default. See [below](#auto-the-default). |
-| `xla` | All t by t logits at once, the reference. With `seq` over `context`, a device has its queries' rows of the logits and every key and value: all-gather CP. |
+| `xla` | All t by t logits at once, the reference, by {py:func}`bux.softmax.softmax`. With `seq` over `context`, a device has its queries' rows of the logits and every key and value: all-gather CP. |
 | `cudnn` | cuDNN's fused attention (jax's) on each device's whole rows: rows of one document by its causal kernels (`flash.CUDNN`), documents in its packed layout. |
 | `tokamax` | tokamax's flash attention, its Mosaic kernels: a document and a window as each query's first key, sinks by the logsumexp. With `seq` over `context`, a device gathers every key and value and attends with its queries in one call: all-gather CP, whose backward pass does every block. |
+| `fa4` | FlashAttention-4's kernels on each device's whole rows: documents in its varlen layout, a window, a soft cap, sinks by the logsumexp. See [FlashAttention-4's kernels](#attention-fa4). |
 | `ring` | Every key and value gathered once over `context`, and a flash call for each device's block of them, merged by their logsumexps. Blocks no query sees are skipped. See [Ring](#ring). |
 | `ulysses` | All-to-alls over `context`, from a device's positions of every head to every position of its own heads; `auto`'s kernel on those whole rows; and back. |
 
@@ -78,10 +79,13 @@ On a GPU, `auto` takes the fastest kernel that runs the call on each device's wh
 rows:
 
 1. cuDNN's causal kernels where each row is one document (`flash.CUDNN`), sinks too;
-2. else cuDNN's packed layout, in rows of 8192 positions or more, or with a window;
-3. else tokamax's kernel, which takes sinks and a soft cap;
-4. in float32, tokamax's Triton kernel where there are no sinks;
-5. else cuDNN where it takes the call, else `xla`.
+   FlashAttention-4's there for what they do not take: MLA's head dims, a soft cap;
+2. else, in rows of documents or with a window, FlashAttention-4's (`fa4`), which
+   takes sinks, a soft cap and MLA's head dims;
+3. else cuDNN's packed layout, in rows of 8192 positions or more, or with a window;
+4. else tokamax's kernel, which takes sinks and a soft cap;
+5. in float32, tokamax's Triton kernel where there are no sinks;
+6. else cuDNN where it takes the call, else `xla`.
 
 With `seq` over `context`, `auto` runs `ulysses` where `context` divides a device's
 heads, else `ring`. On a CPU, where neither kernel runs, it is `xla`, and it is `xla`
@@ -111,6 +115,7 @@ too for what only `xla` has ([below](#constraints-and-errors)).
 | `xla` | everything | |
 | `cudnn` | bfloat16 or float16; keys' and values' head dims equal, up to 256 in steps of 8 (its packed layout gets MLA's wrong) | `NotImplementedError` for a soft cap, sinks, positions over `context` (`ulysses` gives it whole rows), or a call it cannot take |
 | `tokamax` | a GPU, the `cuda` extra (Linux only), bfloat16 or float16 | `NotImplementedError` otherwise |
+| `fa4` | a Blackwell GPU (SM 10.x), the `cuda` extra, bfloat16 or float16; keys' and values' head dims equal, up to 128 in steps of 8, or 192 and 128 (MLA) | `NotImplementedError` for positions over `context` (`ulysses` gives it whole rows), or a call it cannot take |
 | `ulysses` | `context` dividing a device's heads; kv heads it does not divide are repeated | `ValueError` naming both counts |
 | `ring` | documents, a window, a soft cap and sinks; tokamax's kernel on a GPU, jnp's on a CPU | |
 
@@ -159,7 +164,9 @@ The activations are constrained so:
 | queries, keys, values, head outputs | `(batch, seq, heads, none)` | each device attends with its own heads |
 | the logits | `(batch, heads, seq, none)` | the keys stay whole: with `seq` over `context`, that is all-gather CP |
 
-The indexer picks its top-k by counting: it finds the k-th highest score bit by bit,
+On a B200 or B300 the indexer picks its top-k by cuDNN's radix kernel
+(`bux.architecture.attention.indexer_cudnn`), in a `shard_map` that gives a device its
+rows and positions. Elsewhere it counts: it finds the k-th highest score bit by bit,
 which splits with the rows and positions. `lax.top_k` sorts instead (6 times slower at
 32k keys on a GPU), and in the global view it gathers every row onto each device. The
 indexer's scores' kernel (`bux.architecture.attention.scoring`) is a `shard_map` that
@@ -202,12 +209,18 @@ Sparse attention (an indexer's top-k, CSA's compressed latents) attends by
   at a time.
 - Either way it is a `shard_map` that gives a device its rows, queries and heads, and
   every key: all-gather CP.
+- CSA's latents, 512 wide, run by cuDNN's DSA kernels on a B200 or B300 in the same
+  `shard_map` (`bux.architecture.attention.sparse_cudnn`), a device's heads 64 a call.
+  The indexer's target at its picks takes every head: under tensor parallelism it
+  runs by XLA.
 
 The indexer's loss takes the attention's probabilities once, from its logsumexp, a
 chunk of queries at a time (on a GPU by a kernel for heads of up to 128 dims). It
-scores each query's picks by Pallas kernels in a `shard_map` that gives a device its
-rows and queries and every key: a program a query, which stops at its last pick, and a
-backward pass that adds the keys' gradient atomically.
+scores each query's picks in a `shard_map` that gives a device its rows and queries
+and every key: on a B200 or B300 by cuDNN's kernels (`indexer_cudnn`), the softmax of
+the picks' scores forward and GEMMs over blocks of 128 picks backward; on another GPU
+by Pallas kernels, a program a query, which stops at its last pick, and a backward
+pass that adds the keys' gradient atomically.
 
 ### The flash kernels: `bux.parallel.flash`
 
@@ -228,6 +241,7 @@ one, `y = o exp(lse - L)` with `L = logaddexp(lse, sink)`, the backward pass run
 | `flash.TOKAMAX` | tokamax's kernels (its VJP, given the residuals `(lse, 1)`) |
 | `flash.JNP` | the same in jnp, all t by s logits at once, which a CPU runs: with `flash.TOKAMAX = flash.JNP` the tests check `tokamax`'s and `auto`'s paths too |
 | `flash.CUDNN` | cuDNN's causal kernels, for whole rows with no first keys |
+| `fa4.kernel(window)` | FlashAttention-4's kernels, for whole rows or the documents of each query's first key, within a window ([below](#attention-fa4)) |
 
 A new kernel is a `flash.Kernel(forward, backward)`.
 
@@ -258,8 +272,9 @@ For rows of documents, cuDNN runs whole rows only, in its packed layout:
 - A `lax.cond` gives a batch with a row of more documents to tokamax.
 
 In rows of 4096 that `lax.cond` costs a 1.3B what cuDNN gains it: 145k tok/s on a B300
-either way. So `auto` takes cuDNN for documents from rows of 8192 on. In rows of 16384
-of packed documents it trains at 1.3x tokamax's speed.
+either way. So where FlashAttention-4's kernels do not run, `auto` takes cuDNN for
+documents from rows of 8192 on. In rows of 16384 of packed documents it trains at 1.3x
+tokamax's speed.
 
 A step takes the documents' starts from their ids, and each layer from those:
 
@@ -268,6 +283,32 @@ A step takes the documents' starts from their ids, and each layer from those:
 
 At 128k over `context`, XLA's `cummax` and `cumsum` take 2 and 25 ms each time. In rows
 of 4096 the scan took a `1f1b` pipeline of the 1.3B 1.6% slower.
+
+(attention-fa4)=
+### FlashAttention-4's kernels
+
+`bux.parallel.fa4` runs [FlashAttention-4](https://github.com/Dao-AILab/flash-attention)'s
+CuTe DSL kernels for Blackwell (flash-attn-4, in the `cuda` extra) from JAX:
+`cutlass.jax.cutlass_call` compiles each the first time a call needs it, and runs it on
+XLA's stream. `fa4.kernel(window)` is a `flash.Kernel`, so sinks fold into its
+logsumexp as into the others'.
+
+- The forward pass is one kernel. The backward pass is four: each query's `dO . O`,
+  then the main kernel, which adds dQ (and GQA's dK and dV) into float32, then one for
+  each of those that rounds it.
+- Rows of documents go in FA4's varlen layout: the rows end to end, and where each
+  document starts (cu_seqlens). A document starts where a query's first key is itself,
+  which a window's first key never is.
+- cu_seqlens has room for 16 documents a row of 4096 (`fa4.room`). Each empty one
+  costs the kernels about 4 µs a layer, forward and backward. A `lax.cond` gives a
+  batch of more documents to tokamax.
+- Rows of one document, with no window, go as they are: no cu_seqlens.
+- Under XLA's deterministic ops the main backward kernel orders its adds by
+  semaphores, so its gradients repeat bitwise.
+- Its modules import torch, the `cuda` extra's CPU build, so they load where a call
+  first needs them, and bring no CUDA beside JAX's.
+- CuTe DSL compiles its kernels in every process, which JAX's compilation cache does
+  not keep: 15 to 25 s more before a run's first step.
 
 ### Kernels on each device
 
@@ -342,6 +383,50 @@ The 1.3B (16 heads of 8 kv heads) trains at 155k tokens a second on a B300 by
 `flash.CUDNN` and at 148k by tokamax, in the same 51 GiB. On FineWeb-Edu it trains at
 149k and 140k, to the same held-out loss after 3000 steps: 4.041 and 4.043, where
 seeds differ by 1.2%.
+
+### FlashAttention-4 against cuDNN and tokamax
+
+A layer's forward and backward pass on one B300, in bfloat16, in ms (the least of 30),
+the documents' ids an argument of the step as in training. The 1.3B's heads (16 of 8
+kv heads of 128), MLA's (16 of 192 and 128) and gpt-oss's (64 of 8 kv heads of 64, a
+sink a head, a window of 128 in the local layers); documents of 16 to 4000 tokens
+(log-uniform), and of 1000 to 16000 in "long":
+
+| Rows | `cudnn` | `tokamax` | `fa4` | `auto` before it | `auto` |
+|---|---|---|---|---|---|
+| 8 of 4096, one document | **2.36** | 2.80 | 2.57 | 2.50 | 2.52 |
+| 8 of 4096, 53 documents | 2.78 | 3.30 | **2.31** | 3.34 | 2.39 |
+| 8 of 4096, 53 documents, window 1024 | 2.55 | 3.23 | **2.18** | 2.69 | 2.13 |
+| 8 of 4096, 53 documents, soft cap 30 | | 4.50 | **4.26** | 4.63 | 4.14 |
+| 2 of 16k, 39 documents | 8.15 | 7.65 | **2.35** | 8.10 | 2.36 |
+| 2 of 16k, 7 long documents | 4.60 | 8.23 | **3.95** | 4.75 | 4.08 |
+| 1 of 32k, 39 documents | 13.9 | 13.1 | **2.57** | 14.0 | 2.61 |
+| 1 of 32k, 7 long documents | 5.11 | 14.2 | **4.33** | 5.18 | 4.55 |
+| MLA, 8 of 4096, one document | | 4.06 | **3.30** | 4.06 | 3.10 |
+| MLA, 8 of 4096, 53 documents | | 3.82 | **2.58** | 3.97 | 2.66 |
+| gpt-oss global, 4 of 4096, 25 documents | | 5.05 | **2.49** | 5.27 | 2.69 |
+| gpt-oss local, 4 of 4096, 25 documents | | 4.93 | **2.07** | 5.02 | 1.94 |
+| gpt-oss global, 4 of 4096, one document | | 5.41 | 3.25 | 3.40, cuDNN's | 2.99, cuDNN's |
+| gpt-oss local, 4 of 4096, one document | | 4.92 | **1.97** | 4.96 | 1.67 |
+
+- FA4 needs no room for documents a row, as cuDNN's packed layout does, and skips
+  every block no query sees backward as well as forward: a fifth of tokamax's time in
+  a row of 32k of 39 documents, past cuDNN's room for 16.
+- Its backward pass adds a kv head's query heads' dK and dV into float32: 1.5x cuDNN's
+  on whole rows of the 1.3B. So cuDNN's causal kernels keep rows of one document
+  where they take them, sinks too.
+- Its soft cap is a `tanh` in its forward pass, which then takes nearly three times
+  as long.
+- Times differ by up to 10% between processes: `auto` is `fa4` or `cudnn` here.
+
+In training, these run on packed documents at 4% to 26% more tokens a second
+([Kernels](../performance/kernels.md#softmax-attention)). Under XLA's deterministic
+ops two runs of the 1.3B and of the MLA model train to the same bits of every loss of
+10 steps, and the first step's loss is the tree before's to 2e-6 (the 1.3B) and 9e-6
+(MLA). On FineWeb-Edu, 3000 steps of 8 rows of 4096 under deterministic ops, the 1.3B
+trains to the same held-out loss by FA4 as by tokamax before it, to three decimals, at
+seeds 0, 1 and 2 (4.038, 3.970, 4.004), where the seeds differ by 1.7%; the MLA model
+to 4.040 either way.
 
 ### Context parallelism on 8 B300s
 

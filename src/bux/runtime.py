@@ -17,6 +17,8 @@ What it sets, each only where the environment does not already:
 - ``XLA_CLIENT_MEM_FRACTION``, the share of a GPU's memory that XLA's pool takes:
   95% (`POOL`), unless it or its older name ``XLA_PYTHON_CLIENT_MEM_FRACTION`` is
   set.
+- Under nsys or ncu (``BUX_PROFILER``), the tool's flags and variables
+  (`bux.train.profilers.XLA_FLAGS`, `bux.train.profilers.VARIABLES`).
 - ``JAX_COMPILATION_CACHE_DIR``: compiled programs, and on GPUs the autotuner's
   picks, persist in ``$XDG_CACHE_HOME/bux/jax`` (``~/.cache/bux/jax``), so a launch
   after the first compiles little. A ``JAX_COMPILATION_CACHE_DIR`` that is set says
@@ -37,6 +39,7 @@ from pathlib import Path
 import jax
 
 from bux import jax_internals
+from bux.train import profilers
 
 #: bux's XLA flags, which go before those of ``XLA_FLAGS``.
 #:
@@ -88,17 +91,19 @@ def cache_dir(env: Mapping[str, str] = os.environ) -> Path:
 def configure(env: MutableMapping[str, str] = os.environ) -> None:
     """Set JAX's and XLA's environment for training, where it is not set already.
 
-    It adds bux's flags to ``XLA_FLAGS`` in `env`, NCCL EP's settings and the share
-    of a GPU XLA's pool takes, and keeps compiled programs in
-    ``JAX_COMPILATION_CACHE_DIR``: `cache_dir` unless it is set, and none if it is
-    set empty. Workers inherit them all. Call it before anything starts a backend:
+    It adds bux's flags to ``XLA_FLAGS`` in `env`, NCCL EP's settings, the share of a
+    GPU XLA's pool takes and, under nsys or ncu, the tool's settings, and keeps
+    compiled programs in ``JAX_COMPILATION_CACHE_DIR``: `cache_dir` unless it is set,
+    and none if it is set empty. Workers inherit them all. Call it before anything starts a backend:
     XLA reads its flags and its pool's share once.
 
     Args:
         env: The environment to change: this process's by default.
     """
-    env["XLA_FLAGS"] = xla_flags(env.get("XLA_FLAGS", ""))
-    for name, value in NCCL_DEFAULTS.items():
+    tool = env.get(profilers.VARIABLE, "")
+    flags = (*XLA_FLAGS, *profilers.XLA_FLAGS.get(tool, ()))
+    env["XLA_FLAGS"] = xla_flags(env.get("XLA_FLAGS", ""), flags)
+    for name, value in {**NCCL_DEFAULTS, **profilers.VARIABLES.get(tool, {})}.items():
         env.setdefault(name, value)
     env.setdefault("JAX_COMPILATION_CACHE_DIR", str(cache_dir(env)))
     jax.config.update(

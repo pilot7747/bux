@@ -2,7 +2,7 @@
 compressed `Latents` its ``kv`` port carries."""
 
 from collections.abc import Sequence
-from typing import NamedTuple
+from typing import Any, NamedTuple
 
 import jax
 import jax.numpy as jnp
@@ -10,22 +10,24 @@ from flax import nnx
 from jaxtyping import Array, Float, Int
 
 from bux import config as cfg
-from bux import parallel
-from bux.architecture.attention import sparse
+from bux import kernels, parallel
+from bux.architecture.attention import sparse, sparse_cudnn
 from bux.architecture.attention.gqa import (
     Names,
     Sparse,
     documents_or_rows,
     indexer_config,
 )
-from bux.architecture.attention.indexer import Indexer
+from bux.architecture.attention.indexer import Indexer, Scored, Target
 from bux.architecture.attention.rope import frequencies, rotate, rotated_dims
 from bux.architecture.common.ports import read, reads, write
 from bux.architecture.common.segments import Segments
 from bux.architecture.common.sharding import linear, shard_heads, shard_layer_input
 from bux.architecture.layers.norm import Norm
-from bux.architecture.registry import Context, Taps, register, segments
+from bux.architecture.registry import Context, Taps, register, report, segments
+from bux.architecture.repeats import remat
 from bux.lang import ir
+from bux.softmax import softmax
 
 
 class Latents(NamedTuple):
@@ -71,7 +73,10 @@ class CSA(Sparse):
       over the compressed latents.
 
     The window and the compressed latents are two parts
-    (`~bux.architecture.attention.sparse.Part`) of one softmax.
+    (`~bux.architecture.attention.sparse.Part`) of one softmax. On a B200 or B300,
+    cuDNN's DSA kernels run them, and the window-only layers, where they take them
+    (`~bux.architecture.attention.sparse_cudnn.takes`): 512 dims, in 16 bits. They
+    score the indexer's target at its picks too.
 
     The query heads split over ``heads``, and the groups of the output projection with
     them; the latents, a single head, are every device's.
@@ -201,7 +206,7 @@ class CSA(Sparse):
         q = shard_heads(self._rotate(q, rows.positions))
         kv = self._rotate(self.kv_norm(self.kv(x))[:, :, None], rows.positions)
         if self.compress_ratio is None:
-            out = self._attend(x, q, kv, kv, docs)
+            out = self._attend_window(x, q, kv, rows, docs)
         else:
             if reads(self.ports, "kv"):
                 latents = read(taps, self.ports, "kv")
@@ -218,6 +223,85 @@ class CSA(Sparse):
             out = self._attend_kept(x, q, [window, compressed], docs, scored, taps)
         return self._output(x, self._unrotate(out, rows.positions))
 
+    def _attend_window(
+        self,
+        x: Float[Array, "b t d"],
+        q: Float[Array, "b t h dk"],
+        kv: Float[Array, "b t 1 dk"],
+        rows: Segments,
+        docs: Segments | None,
+    ) -> Float[Array, "b t h dk"]:
+        """Return each query's attention to its window of latents alone: by
+        `sparse.attend` (cuDNN's DSA kernels where they take it, else XLA's chunks)
+        where `_wide` says the run's dense kernels would not take it, else by the
+        run's attention method."""
+        window = (sparse.Part(kv, kv, sparse.token_span(rows, self.window)),)
+        if self._feature() is not None or not self._wide(q):
+            return self._attend(x, q, kv, kv, docs)
+        return remat.named("attention", self._sparse, q, window, self._sinks())[0]
+
+    def _wide(self, q: Float[Array, "b t h dk"]) -> bool:
+        """Return whether the heads are wider than the dense kernels of
+        ``methods.attention = auto`` take on a GPU (256 dims, as CSA's 512 are)."""
+        on = parallel.active()
+        auto = (on.methods.attention if on else "auto") == "auto"
+        return auto and kernels.gpu() and q.shape[-1] > sparse.HEAD_DIMS
+
+    def _sparse(
+        self,
+        q: Float[Array, "b t h dk"],
+        parts: tuple[sparse.Part, ...],
+        sinks: Float[Array, " h"] | None,
+    ) -> tuple[Float[Array, "b t h dk"], Float[Array, "b t h"]]:
+        """Return `sparse.attend`'s output and logsumexp: by cuDNN's DSA kernels
+        where they take the parts."""
+        if not self._kernels_take(q, parts):
+            return super()._sparse(q, parts, sinks)
+        windows = self._windows(parts)
+        return sparse_cudnn.attend(q, parts, sinks, self.scale, windows)
+
+    def _kernels_take(
+        self, q: Float[Array, "b t h dk"], parts: Sequence[sparse.Part]
+    ) -> bool:
+        """Return whether cuDNN's DSA kernels take the parts (`sparse_cudnn.takes`)."""
+        windows = self._windows(parts)
+        return sparse_cudnn.takes(q, parts, windows, self.softcap)
+
+    def _windows(self, parts: Sequence[sparse.Part]) -> tuple[int | None, ...]:
+        """Return each part's window: the layer's for the first, the latents of the
+        tokens; none for the compressed ones, kept by index."""
+        return (self.window, None)[: len(parts)]
+
+    def _target(self, part: sparse.Part, xs: tuple) -> Float[Array, "b c k"]:
+        """Return a chunk of queries' attention to the latents of `part`: to those
+        they keep, by cuDNN's kernel, where it scores them (`_scores_picks`); else to
+        every one."""
+        if not self._scores_picks(xs[0]):
+            return super()._target(part, xs)
+        q, lse, span, index = jax.lax.stop_gradient(xs)
+        kept = sparse.at(part, span, index)
+        return sparse_cudnn.probabilities(q, kept, lse, self.scale)
+
+    def _train_indexer(
+        self, scored: Scored, target: Target, xs: Any, width: int, taps: Taps
+    ) -> None:
+        """Report the indexer's loss against the attention `target` gives: to the
+        latents each query keeps where cuDNN's kernel scores them. `FullLogits`'
+        features give it all t by t probabilities."""
+        if self._feature() is not None or not self._scores_picks(xs[0]):
+            return super()._train_indexer(scored, target, xs, width, taps)
+        assert self.indexer is not None
+        picks = scored.kept.shape[-1]
+        loss = self.indexer.loss(scored, target, xs, picks, picks=True)
+        report(taps, "indexer_loss", self.indexer.loss_weight, loss)
+
+    def _scores_picks(self, q: Float[Array, "b t h dk"]) -> bool:
+        """Return whether cuDNN's kernel scores the indexer's target at its picks
+        (`sparse_cudnn.probabilities_take`): latents it keeps one by one, not in
+        blocks."""
+        by_one = self.indexer is not None and self.indexer.block_size == 1
+        return by_one and sparse_cudnn.probabilities_take(q, self.softcap)
+
     def _compress(self, x: Float[Array, "b t d"], rows: Segments) -> Latents:
         """Return this layer's compressed latents, with its indexer's keys if it runs
         one."""
@@ -232,7 +316,7 @@ class CSA(Sparse):
             kv = jnp.pad(kv, pad)
             kv = jnp.stack([kv[:, i : i + t] for i in range(r)], axis=2)
             gate = jnp.stack([gate[:, i : i + t] for i in range(r)], axis=2)
-            kv = (kv * jax.nn.softmax(gate, axis=2)).sum(2)
+            kv = (kv * softmax(gate, axis=2)).sum(2)
         # Split as positions, not as the norm's scale: FSDP may split that by `context`.
         latent = parallel.shard(self.compress_norm(kv), "batch", "seq", None)
         first = rows.positions[:, jnp.maximum(jnp.arange(t) - (r - 1), 0)]

@@ -15,6 +15,7 @@ MapReduce engine can run::
   this machine's cores (`~bux.data.pipeline.prepare`).
 - `bux.data.spark` runs the same two functions on Spark.
 - `bux.data.tokenizer` runs a Hugging Face tokenizer, in bulk.
+- `bux.data.templates` renders conversations with a tokenizer's chat template.
 
 ``bux train`` and ``bux launch`` prepare what a run reads if it is missing, and
 ``bux prepare`` does it ahead. In Python, a run's jobs come from its settings::

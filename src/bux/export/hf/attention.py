@@ -329,6 +329,8 @@ class SoftmaxAttention(nn.Module):
         gate_width = heads if c["gate_per_head"] else heads * dv
         self.gate = nn.Linear(width, gate_width, bias=bias) if c["gated"] else None
         self.gate_activation = ACTIVATIONS[c["gate_activation"]]
+        head_bias = c["gated"] and c["gate_head_bias"]
+        self.gate_bias = nn.Parameter(torch.zeros(heads)) if head_bias else None
         rel = c["relative_bias"]
         self.rel_proj = (
             nn.Linear(width, heads * rel["rank"], bias=bias) if rel else None
@@ -475,7 +477,10 @@ class SoftmaxAttention(nn.Module):
         if self.out_norm is not None:
             out = self.out_norm(out)
         if self.gate is not None:
-            out = out * self.gate_activation(self.gate(x)).view(b, t, self.h, -1)
+            gate = self.gate(x).view(b, t, self.h, -1)
+            if self.gate_bias is not None:
+                gate = gate + self.gate_bias.to(gate.dtype)[:, None]
+            out = out * self.gate_activation(gate)
         return self.project(out)
 
     def project(self, out: torch.Tensor) -> torch.Tensor:
@@ -520,6 +525,7 @@ class Attention(SoftmaxAttention):
         self.q_norm = Norm(qk, dk) if qk else None
         self.k_norm = Norm(qk, dk) if qk and not self.reads_kv else None
         self.rope = Rope(c["rope"], dk) if c["rope"] else None
+        self.power_scale = c["power_scale"], c["power_scale_length"]
         self.value_residual = c["value_residual"]
         trained = reads(site.ports, "v") and self.value_residual != "fixed"
         shape = (2,) if self.value_residual == "learned" else ()
@@ -578,12 +584,20 @@ class Attention(SoftmaxAttention):
         return [self.q(x), *kv]
 
     def _queries(self, q: torch.Tensor, ctx: Ctx) -> torch.Tensor:
-        """Reshape the projected queries into heads, then apply QK-norm and RoPE."""
+        """Reshape the projected queries into heads, then apply QK-norm, RoPE and the
+        power scale."""
         b, t, _ = q.shape
         q = q.view(b, t, self.h, self.dk)
         if self.q_norm is not None:
             q = self.q_norm(q)
-        return q if self.rope is None else self.rope(q, ctx.positions)
+        if self.rope is not None:
+            q = self.rope(q, ctx.positions)
+        power, length = self.power_scale
+        if power is None:
+            return q
+        # (1 + n / length) ** power at the query's position n, counted from 1.
+        scale = torch.exp(power * torch.log1p((ctx.positions + 1) / length))
+        return (q * scale[..., None, None]).to(q.dtype)
 
     def _keys_and_values(
         self, k: torch.Tensor, v: torch.Tensor, ctx: Ctx, slot: int

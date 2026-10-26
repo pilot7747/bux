@@ -48,6 +48,15 @@ sys.exit(main(sys.argv[1:]))
 """
 
 
+# nsys, as far as the launcher sees it: it says how it was called, and runs the command
+# after its own arguments.
+NSYS = """#!/bin/sh
+echo "$BUX_PROFILER $*" >> "$(dirname "$0")/calls.txt"
+while [ "$1" = profile ] || [ "${1#-}" != "$1" ]; do shift; done
+exec "$@"
+"""
+
+
 def smoke(*overrides: str):
     settings = ("schedule.warmup = 1", "steps = 6", *overrides)
     return compile_runs(SMOKE.read_text(), filename=str(SMOKE), overrides=settings)
@@ -204,6 +213,63 @@ def test_a_run_alone_trains_on_the_gpus_it_needs(tmp_path, monkeypatch):
     assert "cpu (GPU 4,5) of " in said[0]
 
 
+# --- Profilers -------------------------------------------------------------------------
+
+
+@pytest.fixture
+def nsys(tmp_path, monkeypatch) -> Path:
+    """A fake nsys and ncu first on PATH; return the file where they say how they were
+    called."""
+    folder = tmp_path / "bin"
+    folder.mkdir()
+    for tool in ("nsys", "ncu"):
+        (folder / tool).write_text(NSYS)
+        (folder / tool).chmod(0o755)
+    monkeypatch.setenv("PATH", f"{folder}{os.pathsep}{os.environ['PATH']}")
+    monkeypatch.delenv("BUX_PROFILER", raising=False)
+    return folder / "calls.txt"
+
+
+def test_a_run_alone_with_nsys_launches_again_under_it(tmp_path, nsys):
+    profile = "profile = profile(start=1, steps=1, tool=nsys)"
+    settings = ["steps=2", "schedule.warmup=1", profile]
+    command = [sys.executable, "-m", "bux", "launch", str(SMOKE), *settings]
+    command += ["--out", str(tmp_path)]
+    done = subprocess.run(command, check=False, capture_output=True, text=True)
+    assert done.returncode == 0, done.stdout + done.stderr
+    [run] = compile_runs(SMOKE.read_text(), filename=str(SMOKE), overrides=settings)
+    folder = directory(run, tmp_path)
+    [call] = nsys.read_text().splitlines()
+    assert call.startswith("nsys profile --capture-range=cudaProfilerApi")
+    assert f"--output={folder / 'profile' / '%h.%p'} {sys.executable} -m bux" in call
+    assert status(folder)["state"] == "done"
+
+
+def test_a_sweeps_workers_with_nsys_train_under_it(tmp_path, nsys):
+    runs = smoke("seed = 0 | 1", "profile = profile(start=1, steps=1, tool=nsys)")
+    assert launch(runs, tmp_path, gpus=["0", "1"], echo=lambda _: None) == 0
+    calls = nsys.read_text()
+    for run in runs:
+        assert f"-m bux.launch {directory(run, tmp_path)} " in calls
+
+
+def test_a_run_whose_profiler_is_missing_fails_at_once(tmp_path, monkeypatch):
+    [run] = smoke("profile = profile(tool=nsys)")
+    monkeypatch.setenv("PATH", str(tmp_path))
+    said: list[str] = []
+    assert launch([run], tmp_path, gpus=[], echo=said.append) == 1
+    assert said == ["smoke: failed before training: profile: nsys is not on PATH"]
+
+
+def test_ncu_profiles_a_run_of_one_gpu_and_one_of_two_fails_at_once(tmp_path, nsys):
+    [run] = smoke("profile = profile(tool=ncu)")
+    said: list[str] = []
+    assert launch([run], tmp_path, gpus=["0", "1"], echo=said.append) == 1
+    one = "profile: ncu profiles one GPU, not 2: give the run one"
+    assert said == [f"smoke: failed before training: {one}"]
+    assert not nsys.exists()  # nor did it start under ncu
+
+
 # --- XLA -------------------------------------------------------------------------------
 
 
@@ -227,6 +293,20 @@ def test_xla_s_pool_takes_most_of_a_gpu_unless_the_environment_says(given):
     pool = {k: v for k, v in env.items() if "MEM_FRACTION" in k}
     assert pool == (given or {"XLA_CLIENT_MEM_FRACTION": POOL})
     assert float(POOL) > 0.75  # JAX's own
+
+
+def test_under_nsys_or_ncu_xla_runs_no_command_buffers_and_ncu_takes_memory_late():
+    buffers = "--xla_gpu_enable_command_buffer"
+    ncu = {"JAX_COMPILATION_CACHE_DIR": "", "BUX_PROFILER": "ncu"}
+    configure(ncu)
+    assert f"{buffers}=" in ncu["XLA_FLAGS"].split()
+    assert ncu["XLA_PYTHON_CLIENT_PREALLOCATE"] == "false"
+    nsys = {"JAX_COMPILATION_CACHE_DIR": "", "BUX_PROFILER": "nsys"}
+    nsys["XLA_FLAGS"] = f"{buffers}=FUSION"  # a flag set keeps its value
+    configure(nsys)
+    assert f"{buffers}=FUSION" in nsys["XLA_FLAGS"].split()
+    assert f"{buffers}=" not in nsys["XLA_FLAGS"].split()
+    assert "XLA_PYTHON_CLIENT_PREALLOCATE" not in nsys
 
 
 def test_a_launch_keeps_its_compiled_steps_for_the_next(tmp_path):

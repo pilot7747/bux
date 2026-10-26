@@ -34,6 +34,7 @@ call against them.
 | {py:mod}`bux.parallel` | The mesh, the layout, and the methods of each kind of parallelism |
 | {py:mod}`bux.data` | Tokenizing, shuffling and packing documents into rows |
 | {py:mod}`bux.launch` | The launcher: sweeps over GPUs, status, signals, many hosts |
+| {py:mod}`bux.softmax` | A softmax and log-softmax whose gradients hold where a float rounds a probability to 1 |
 | {py:mod}`bux.runtime` | The process's JAX and XLA settings, and the compile cache |
 | {py:mod}`bux.kernels` | Turning GPU kernels off, to debug one |
 | {py:mod}`bux.passes` | bux's passes over XLA's HLO |
@@ -52,6 +53,7 @@ call against them.
    bux.parallel
    bux.data
    bux.launch
+   bux.softmax
    bux.runtime
    bux.kernels
    bux.passes

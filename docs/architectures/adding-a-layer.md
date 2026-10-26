@@ -240,6 +240,7 @@ functions of `bux.architecture`, which accept `taps=None` too:
 | `positions(taps)` | each token's position in its document, or `None` |
 | `training(taps)` | whether this is a training step's forward |
 | `report(taps, name, weight, value)` | adds `weight * value` to the training loss |
+| `observe.stat(taps, name, value)` | logs `value` by layer on the steps a run observes ([Observing a run](../training/observing.md)) |
 
 `taps.tokens` holds the input tokens, which `engram` and `nextn` read.
 
@@ -265,6 +266,20 @@ The objective adds `weight * value` to the loss, and logs the values, summed ove
 layers that report the name, as a metric of that name. Only a training step's forward
 collects them; elsewhere, eval included, `report` does nothing. Check
 `training(taps)` to skip a costly loss outside training.
+
+### What a layer observes
+
+A value worth watching, a gate's mean or a router's load, is one line too:
+
+```python
+from bux.architecture import observe
+
+observe.stat(taps, "mine/gate_mean", gate.mean())
+```
+
+It is logged by layer, `mine/gate_mean/attn.03`, on the steps a run's `observe` setting
+picks, with no gradient, and the other steps hold no code of it. Work only an
+observation needs goes under `if observe.observing(taps):`.
 
 ### State that is not trained by gradients
 

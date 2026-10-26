@@ -24,8 +24,8 @@ import jax.numpy as jnp
 from flax import nnx
 from jax.typing import DTypeLike
 
-from bux.architecture import residual
-from bux.architecture.graph import Sequence, branches, build_node, run_branch
+from bux.architecture import observe, residual
+from bux.architecture.graph import Sequence, branches, build_node, names, run_branch
 from bux.architecture.precision import matmuls
 from bux.architecture.registry import Context, Stream, Taps
 from bux.architecture.repeats import pipelined, remat, stacked, tracing
@@ -47,7 +47,8 @@ def unroll(body: ir.Node, times: int, ctx: Context) -> nnx.Module:
     Returns:
         The module that runs the passes.
     """
-    return Passes(_passes(body, times, ctx), branches((body,) * times, ctx))
+    bodies = (body,) * times
+    return Passes(_passes(body, times, ctx), branches(bodies, ctx), names(bodies, ctx))
 
 
 @methods.repeat.register("scan")
@@ -68,8 +69,10 @@ def scan(body: ir.Node, times: int, ctx: Context) -> nnx.Module:
     if scannable(passes):
         each = tracing.branches_of(body) if ctx.depth == 0 else 0
         [is_branch] = branches((body,), ctx)
-        return Scanned(_stack(passes), len(passes), each, is_branch)
-    return Passes(passes, branches((body,) * times, ctx))
+        name = observe.item_name(body, is_branch)
+        return Scanned(_stack(passes), len(passes), each, is_branch, name)
+    bodies = (body,) * times
+    return Passes(passes, branches(bodies, ctx), names(bodies, ctx))
 
 
 def _passes(body: ir.Node, times: int, ctx: Context) -> list[nnx.Module]:
@@ -82,9 +85,10 @@ class Passes(Sequence):
     branch outside any other runs as one (``graph.run_branch``)."""
 
     def __call__(self, x: Stream, taps: Taps) -> Stream:
-        for i, (item, branch) in enumerate(zip(self.items, self.branches, strict=True)):
+        items = zip(self.items, self.branches, self.names, strict=True)
+        for i, (item, branch, name) in enumerate(items):
             with tracing.passes(range(i, i + 1)):
-                x = run_branch(item, x, taps) if branch else item(x, taps)
+                x = run_branch(item, x, taps, name) if branch else item(x, taps)
         return x
 
 
@@ -154,6 +158,8 @@ class Scanned(nnx.Module):
         times: The passes.
         each: The residual branches outside any other a pass holds.
         is_branch: Whether each pass is a residual branch outside any other.
+        name: What a pass's metrics are named by, if it is a branch or a layer
+            (`~bux.architecture.observe.item_name`); None if its items are named.
 
     Attributes:
         rounds: The rounds a pipeline takes the passes in; 0 if none does.
@@ -161,18 +167,36 @@ class Scanned(nnx.Module):
     """
 
     def __init__(
-        self, layers: nnx.Module, times: int, each: int = 0, is_branch: bool = False
+        self,
+        layers: nnx.Module,
+        times: int,
+        each: int = 0,
+        is_branch: bool = False,
+        name: str | None = None,
     ):
         self.times, self.layers = times, layers
-        self.each, self.is_branch = each, is_branch
+        self.each, self.is_branch, self.name = each, is_branch, name
         self.rounds = 0  # the rounds a pipeline takes them in; 0 if none does
         self.compute: DTypeLike | None = None
 
     def __call__(self, x: Stream, taps: Taps) -> Stream:
         """Run the passes on the stream x: scanned, a scan for each run of passes
         that trace alike, or pipelined."""
-        if self.rounds and pipeline.pipelined():
-            return self._pipelined(x, taps)
+        with observe.passes(self.branch_name()):
+            if self.rounds and pipeline.pipelined():
+                return self._pipelined(x, taps)
+            return self._scanned(x, taps)
+
+    def branch_name(self) -> str | None:
+        """Return the name a pass is observed by if each is a branch outside any
+        other; else None. A pipeline of rounds runs the passes of the repeat inside
+        it, a round's."""
+        if isinstance(self.layers, Scanned):
+            piped = self.rounds and pipeline.pipelined()
+            return self.layers.branch_name() if piped else None
+        return self.name if self.is_branch else None
+
+    def _scanned(self, x: Stream, taps: Taps) -> Stream:
         graphdef, state = nnx.split(self.layers)
         rests = []
         for run in self._runs():
@@ -237,8 +261,9 @@ class Scanned(nnx.Module):
             names = v.get_metadata()[NAMES][1:]
             v.set_value(v.get_value().reshape(rounds, n, *v.shape[1:]))
             v.set_metadata(names=(LAYERS, pipeline.STAGES, *names))
-        self.layers = Scanned(self.layers, n, self.each, self.is_branch)
+        self.layers = Scanned(self.layers, n, self.each, self.is_branch, self.name)
         self.times, self.each, self.is_branch = rounds, n * self.each, False
+        self.name = None
 
     def _round(self) -> tuple[nnx.Module, int]:
         """Return one pass of a pipelined repeat, its variables stacked by round, and

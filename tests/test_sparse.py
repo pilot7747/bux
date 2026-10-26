@@ -1,8 +1,11 @@
 """Attention over kept keys (bux.architecture.attention.sparse) by XLA, a chunk of
 queries at a time, against all t by t logits: values, gradients and the indexer's loss,
 with packed documents, on one device and split over the 8 CPU devices the tests have;
-and memory that grows linearly with the queries. scripts/gpu_smoke/sparse.py checks
-tokamax's kernel against it on a GPU."""
+and memory that grows linearly with the queries; the indexer's routes to cuDNN's
+kernels, which lax and XLA stand in for here. scripts/gpu_smoke/sparse.py checks
+tokamax's kernel and cuDNN's against it on a GPU."""
+
+import contextlib
 
 import jax
 import jax.numpy as jnp
@@ -14,9 +17,9 @@ from jaxtyping import Array, Float
 from bux import config as cfg
 from bux import kernels, parallel
 from bux.architecture import Model, Segments, Taps
-from bux.architecture.attention import scoring, sparse
+from bux.architecture.attention import indexer_cudnn, scoring, sparse
 from bux.architecture.attention.gqa import Sparse, build_gqa
-from bux.architecture.attention.indexer import _top
+from bux.architecture.attention.indexer import _first, _top
 from bux.lang import compile
 from bux.parallel.context import masked_softmax, scaled_logits, softcap, weighted_values
 from bux.train import config as tcfg
@@ -209,6 +212,31 @@ def test_a_layer_trains_as_by_all_t_by_t_logits(monkeypatch, layers):
     close(grads, want_grads)
 
 
+def picked_log_softmax(q, w, keys, index):
+    """cuDNN's log-softmax of each query's picks' scores, by XLA: 0 for a query with
+    no pick, and clipped at log(tiny), as the kernels give it."""
+    rows = jax.vmap(lambda k, i: k[i])(keys, jnp.maximum(index, 0))
+    dots = jax.nn.relu(jnp.einsum("bthi,btki->bthk", q, rows))
+    scores = jnp.where(index >= 0, jnp.einsum("bthk,bth->btk", dots, w), -1e30)
+    p = jnp.where(index >= 0, jax.nn.softmax(scores), 0)
+    return jnp.log(jnp.maximum(p, indexer_cudnn.TINY))
+
+
+@pytest.mark.parametrize("layers", ["gqa", "mla_ports"])
+def test_the_loss_by_cudnns_kernels_trains_as_by_xla(monkeypatch, layers):
+    """With the kernels (by XLA here), 4 queries' picks at a time: the indexer's loss
+    and every gradient."""
+    monkeypatch.setattr(sparse, "ELEMENTS", TINY)
+    want_lm, want_indexer, want_grads = trained(LAYERS[layers], logits=False)
+    monkeypatch.setattr("bux.architecture.attention.indexer.LOSS_PICKS", B * 4 * 3)
+    monkeypatch.setattr(indexer_cudnn, "takes", lambda *a: True)
+    monkeypatch.setattr(indexer_cudnn, "log_softmax", picked_log_softmax)
+    lm, indexer, grads = trained(LAYERS[layers], logits=False)
+    assert indexer > 0 and np.isclose(indexer, want_indexer, atol=1e-6)
+    assert np.isclose(lm, want_lm, atol=1e-6)
+    close(grads, want_grads)
+
+
 def step_memory(t: int, logits: bool = False) -> int:
     """The temporary bytes of a sparse GQA layer's training forward and backward on t
     tokens, its indexer's loss with it."""
@@ -278,6 +306,62 @@ def test_the_indexers_top_k_keeps_what_lax_top_k_does(seed):
         want = jnp.where(values > -jnp.inf, index, -1)
         got = _top(jnp.asarray(scores), k)
         assert np.array_equal(np.sort(got, -1), np.sort(want, -1)), k
+
+
+def radix(rows, lengths, k):
+    """cuDNN's top-k kernel by lax: each row's k highest of its first `lengths`
+    slots, the first of equal ones, in order of index; -1 and -inf past a short row."""
+    inside = jnp.arange(rows.shape[-1]) < lengths[:, None]
+    values, picks = jax.lax.top_k(jnp.where(inside, rows, -jnp.inf), k)
+    order = jnp.argsort(jnp.where(values > -jnp.inf, picks, rows.shape[-1]), -1)
+    picks, values = (jnp.take_along_axis(a, order, -1) for a in (picks, values))
+    return jnp.where(values > -jnp.inf, picks, -1), values
+
+
+@pytest.mark.parametrize("rows", [None, 5], ids=["all", "5 at a time"])
+@pytest.mark.parametrize("mesh", [None, tcfg.MeshConfig(data=2, context=4)])
+def test_the_kernels_top_k_keeps_what_xla_does(monkeypatch, mesh, rows):
+    """With cuDNN's kernel (by lax here): unseen keys never kept, though fewer than
+    k are seen; ties at 0 and at the k-th; spans of k slots or fewer, and empty ones,
+    by no kernel; a query's end before the last slot; rows a few at a time, as past
+    what the kernel's scratch indexes."""
+    rng = np.random.default_rng(0)
+    scores = rng.normal(size=(2, 8, 96)).astype(np.float32)
+    scores[rng.random(scores.shape) < 0.3] = 0.0
+    scores[rng.random(scores.shape) < 0.1] = -np.inf  # keys a query does not see
+    start = np.broadcast_to(np.arange(8) % 2 * 50, (2, 8)).astype(np.int32)
+    end = np.broadcast_to(np.arange(8) * 12 + 12, (2, 8)).astype(np.int32)
+    slot = np.arange(96)
+    scores[(slot < start[..., None]) | (slot >= end[..., None])] = -np.inf
+    scores, span = (
+        jnp.asarray(scores),
+        sparse.Span(jnp.asarray(start), jnp.asarray(end)),
+    )
+    want = {k: _top(scores, k) for k in (1, 7, 30, 64, 96)}
+    monkeypatch.setattr(indexer_cudnn, "runs", lambda k: True)
+    monkeypatch.setattr(indexer_cudnn, "_radix_rows", radix)
+    if rows:
+        monkeypatch.setattr(indexer_cudnn, "SCRATCH", 2**31 // (96 * rows))
+    with parallel.use(mesh) if mesh else contextlib.nullcontext():
+        for k, top in want.items():
+            got = jax.jit(_top, static_argnums=1)(scores, k, span)
+            np.testing.assert_array_equal(got, top)
+
+
+def test_the_kernels_unseen_keys_are_the_lowest_floats_and_none_tie():
+    unseen = np.asarray(indexer_cudnn._unseen(1000))
+    assert np.isfinite(unseen).all() and (np.diff(unseen) > 0).all()
+    assert unseen[0] == np.finfo(np.float32).min and unseen[-1] < -3.3e38
+
+
+def test_cudnns_indexer_kernels_do_not_run_off_a_gpu():
+    assert not indexer_cudnn.runs(2048)
+    assert not indexer_cudnn.takes(64, 128, 2048, jnp.bfloat16)
+
+
+def test_the_kept_ones_go_first():
+    index = jnp.asarray([[[3, -1, 5, -1, 7], [-1, -1, -1, -1, 2]]])
+    assert _first(index).tolist() == [[[3, 5, 7, -1, -1], [2, -1, -1, -1, -1]]]
 
 
 def test_the_scoring_kernel_scores_as_xla_does():

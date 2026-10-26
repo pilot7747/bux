@@ -69,7 +69,8 @@ the pass's input tokens, the documents packed into its rows
 (`~bux.architecture.registry.segments`, `~bux.architecture.registry.positions`), the
 output of every head run so far, and, in a training step
 (`~bux.architecture.registry.training`), the losses layers add to the objective
-(`~bux.architecture.registry.report`).
+(`~bux.architecture.registry.report`) and what they observe on the steps a run
+observes (`bux.architecture.observe`).
 
 .. rubric:: Adding a layer
 

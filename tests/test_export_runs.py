@@ -207,9 +207,13 @@ def test_the_tokenizer_loads_from_the_export_as_bux_encodes(
     for i, text in enumerate(texts):
         want = ids[offsets[i] : offsets[i + 1]].tolist()
         assert theirs(text, add_special_tokens=False).input_ids == want
-    # Special tokens in text are text to bux's encoder, and markup to both.
+    # Special tokens in text are text to bux's encoder; transformers' gives each the
+    # id bux's `special` does.
     template = "<|im_start|>user\nhi<|im_end|><|tool|><|call|>"
-    want = ours.markup(template).tolist()
+    text, _ = ours.encode(pa.array(["user\nhi"]))
+    after = ("<|im_end|>", "<|tool|>", "<|call|>")
+    want = [ours.special("<|im_start|>"), *text.tolist()]
+    want += [ours.special(token) for token in after]
     assert theirs(template, add_special_tokens=False).input_ids == want
     assert want[0] == 257 and want[-3:] == [258, 259, 260]
     generation = GenerationConfig.from_pretrained(out)

@@ -63,6 +63,11 @@ GQA_SETTINGS = {
     "fused qkv": GQA + ", fused_qkv=true, bias=true)",
     "biases": GQA + ", bias=true, output_bias=false)",
     "scale": GQA + ", scale=0.3)",
+    "gate head bias": GQA + ", gated=true, gate_head_bias=true)",
+    "gate head bias, per head": GQA
+    + ", gated=true, gate_per_head=true, gate_head_bias=true)",
+    "power scale": "gqa(num_heads=4, num_kv_heads=2, power_scale=0.5, "
+    "power_scale_length=4)",
     "log scale": GQA + ", log_scale=0.5, log_scale_floor=2)",
     "relative bias": GQA + ", relative_bias=relbias(rank=4, extent=5))",
     "yarn": "gqa(num_heads=4, num_kv_heads=2, rope=rope(scaling=yarn(factor=4,"

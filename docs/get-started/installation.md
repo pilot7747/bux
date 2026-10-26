@@ -35,7 +35,7 @@ source .venv/bin/activate
 ## What gets installed
 
 `uv sync` installs bux's dependencies (JAX, Flax, optax, orbax, pydantic, pyarrow,
-gigatoken, ...) and two dependency groups that `pyproject.toml` makes default:
+gigatoken, Hugging Face's tokenizers, ...) and two dependency groups that `pyproject.toml` makes default:
 
 | group  | what it has                                                       | skip it with  |
 |--------|-------------------------------------------------------------------|---------------|
@@ -51,7 +51,7 @@ repeating it:
 
 | extra   | what it adds                                                         | where         |
 |---------|----------------------------------------------------------------------|---------------|
-| `cuda`  | JAX on CUDA 13 (`jax[cuda13]`) and [tokamax](https://github.com/openxla/tokamax)'s GPU kernels | Linux only    |
+| `cuda`  | JAX on CUDA 13 (`jax[cuda13]`), [tokamax](https://github.com/openxla/tokamax)'s GPU kernels and FlashAttention-4's, cudnn-frontend's develop build, and the CPU build of PyTorch, which FlashAttention-4 and cuDNN's DSA kernels import | Linux only    |
 | `lsp`   | pygls, which the language server `bux-lsp` runs on                   | anywhere      |
 | `spark` | PySpark and pandas, to prepare data on a Spark cluster               | anywhere      |
 
@@ -76,9 +76,9 @@ uv sync --extra cuda
 uv run python -c "import jax; print(jax.devices())"
 ```
 
-It should list one device for every GPU. bux runs its GPU kernels (cuDNN's
-attention, tokamax's flash attention and grouped matmuls, its own Pallas kernels)
-where they apply, and XLA's code everywhere else; see
+It should list one device for every GPU. bux runs its GPU kernels (cuDNN's and
+FlashAttention-4's attention, tokamax's flash attention and grouped matmuls, its own
+Pallas kernels) where they apply, and XLA's code everywhere else; see
 [Kernels](../performance/kernels.md).
 
 ## CPU only, and macOS
@@ -142,7 +142,9 @@ docker build --build-arg TE_VERSION=2.20.2 -t bux .
 ```
 
 The image also has libibverbs and its mlx5 provider, through which NCCL reaches
-InfiniBand between nodes ([Many nodes](../parallelism/multi-node.md)).
+InfiniBand between nodes ([Many nodes](../parallelism/multi-node.md)), and NVIDIA's
+profilers, Nsight Systems' `nsys` and Nsight Compute's `ncu`, which a `profile`
+setting's `tool=nsys` and `tool=ncu` run under ([Profiling](../performance/profiling.md#nsight-systems-and-nsight-compute)).
 
 ### The published image
 
@@ -174,11 +176,11 @@ uv run bux train examples/experiments/smoke.bux
 ```console
 $ uv run bux train examples/experiments/smoke.bux
 remat=auto: none in 0s (none 0.0 GiB in 0s)
-smoke step 10/50  loss 6.6252  lr 3.00e-03  grad 1.614  9,176 tok/s
-smoke step 20/50  loss 6.5475  lr 3.00e-03  grad 1.038  75,865 tok/s
-smoke step 30/50  loss 6.3513  lr 3.00e-03  grad 0.554  73,936 tok/s
-smoke step 40/50  loss 6.2974  lr 3.00e-03  grad 0.458  75,005 tok/s
-smoke step 50/50  loss 6.2854  lr 0.00e+00  grad 0.395  76,099 tok/s
+smoke step 10/50  loss 6.6252  lr 3.00e-03  grad 1.614  9,176 tok/s  ...
+smoke step 20/50  loss 6.5475  lr 3.00e-03  grad 1.038  75,865 tok/s  ...
+smoke step 30/50  loss 6.3513  lr 3.00e-03  grad 0.554  73,936 tok/s  ...
+smoke step 40/50  loss 6.2974  lr 3.00e-03  grad 0.458  75,005 tok/s  ...
+smoke step 50/50  loss 6.2854  lr 0.00e+00  grad 0.395  76,099 tok/s  ...
 ```
 
 To run the checks CI runs (ruff, ty, the tests and the docs), use `make`, or one of

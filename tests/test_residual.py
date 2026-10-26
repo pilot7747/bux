@@ -20,6 +20,7 @@ from bux.architecture.residual import (
     sources,
 )
 from bux.lang import compile
+from bux.train.trainer import cast
 
 D, V = 32, 64
 
@@ -220,6 +221,17 @@ def test_single_pass_mhc_is_deepseek_v4_1s():
     m = model("mhc(single_pass=true)", "model = embed [norm attn] [norm ffn] norm head")
     merge = top(m)[3]
     assert isinstance(merge, Merge) and merge.reader is None and num_params(merge) == 0
+
+
+def test_a_single_pass_stream_stays_in_its_dtype():
+    """The first branch reads stream 0 alone in the stream's dtype: a float32 read
+    would turn every branch after it to float32 under bfloat16 parameters."""
+    c = cfg.HyperConnectionsConfig(type="mhc", single_pass=True)
+    branches = [ManifoldHyperConnections(c, D, Zero()) for _ in range(2)]
+    y, taps = jnp.ones((2, 8, 4, D), jnp.bfloat16), Taps()
+    for branch in branches:
+        y = cast(branch, jnp.bfloat16)(y, taps)  # as the trainer casts a model
+    assert y.dtype == jnp.bfloat16
 
 
 def test_mhc_without_dynamic_has_static_coefficients():

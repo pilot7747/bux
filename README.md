@@ -58,13 +58,27 @@ entrypoint for production: it trains each run of a sweep on its own GPUs, record
 every run went, stops at SIGTERM with a checkpoint, and, launched again, trains only
 what is left. See the [training guide](docs/training/index.md).
 
+A run logs each head's loss, its throughput and MFU, where a step's time goes and the
+device's memory, to the console (plain lines that `kubectl logs` reads), to
+`metrics.jsonl`, and to W&B or TensorBoard. `observe = observe(every=100)` adds the
+model by layer: the residual stream, attention logits, MoE routing, and each layer's
+gradient, weights and update, on those steps alone
+([Observing a run](docs/training/observing.md)):
+
+```
+log     = log(every=10, trackers=[wandb(project="ablations"), tensorboard])
+observe = observe(every=100, histograms=true)
+```
+
 ## Data
 
 Documents, raw text or chat conversations in the OpenAI format, are Parquet files.
-A MapReduce job tokenizes them with [gigatoken](https://github.com/marcelroed/gigatoken),
-shuffles them, and packs them into rows of `input_ids`, `position_ids` and
-`loss_mask`, densely (`concat`), whole (`greedy`), or best-fit (`best_fit`), on this
-machine's cores or on Spark. Documents packed into a row see only themselves.
+A MapReduce job renders conversations with the tokenizer's own chat template,
+tokenizes them with [gigatoken](https://github.com/marcelroed/gigatoken) (Hugging
+Face's tokenizers for one gigatoken cannot run), shuffles them, and packs them into
+rows of `input_ids`, `position_ids` and `loss_mask`, densely (`concat`), whole
+(`greedy`), or best-fit (`best_fit`), on this machine's cores or on Spark. Documents
+packed into a row see only themselves.
 
 ```
 tokenizer = tokenizer(name="gpt2")
@@ -82,9 +96,10 @@ See the [data guide](docs/data/index.md) for conversations, packings, and the pi
 
 Explore the [example architectures](examples/architectures/), from GPT-2 to recent
 releases grouped by model family (Cohere, DeepSeek, GLM, Inkling, Kimi, Laguna, Mellum,
-MiMo, Muse, Nemotron, Qwen), the [example experiments](examples/experiments/) that
-train them, and the [language guide](docs/language/index.md) for composition, residual
-connections, parameter sharing, and editor support.
+MiMo, Muse, Nemotron, Qwen, Reflection), the
+[example experiments](examples/experiments/) that train them, and the
+[language guide](docs/language/index.md) for composition, residual connections,
+parameter sharing, and editor support.
 
 A run splits over devices by three settings, `mesh`, `layout` and `methods`: FSDP,
 tensor, expert, context and pipeline parallelism, and any mix of them, from one GPU
@@ -119,7 +134,8 @@ docker run --rm -it --entrypoint bash bux    # a shell, or --entrypoint bux for 
 
 The image has TransformerEngine's JAX bindings, for its expert-parallel dispatch and
 combine ([NCCL EP](docs/parallelism/experts.md#transformerengines-nccl-ep)); `--build-arg TE_VERSION=...`
-picks another release.
+picks another release. It has W&B and TensorBoard for `log.trackers`: pass
+`-e WANDB_API_KEY` to log to W&B.
 
 To publish it to `ghcr.io/pilot7747/bux` for amd64 and arm64, run the Docker workflow from
 the Actions tab or with `gh workflow run docker.yml` (add `-f tag=v0.1.0` for an extra tag).

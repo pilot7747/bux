@@ -14,7 +14,7 @@ from jax.extend.core import ClosedJaxpr, Jaxpr
 from jaxtyping import Array, Float, Int
 
 from bux import parallel
-from bux.architecture import Model, logits
+from bux.architecture import Model, logits, observe
 from bux.lang import compile, compile_runs, ir
 from bux.train import config as tcfg
 from bux.train.data import Batch
@@ -139,6 +139,24 @@ def test_the_loss_and_its_gradients_are_the_reference_cross_entropy(
 
 
 @pytest.mark.parametrize("loss", LOSSES)
+def test_the_loss_and_its_gradient_hold_where_float32_rounds_the_targets_p_to_1(loss):
+    # Barron et al.'s example: logits (9, -9, -9) and target 0, a margin of 18, where
+    # float32's 1 + 2e^-18 is 1. log Z - 9 is then 0, and so is p - 1.
+    e = np.exp(-18.0)
+    x = jnp.array([[[9.0, -9.0, -9.0]]])
+    head = logits.HeadOutput(x, logits.Projection(jnp.eye(3), None, None))
+    targets, weights = jnp.zeros((1, 1), jnp.int32), jnp.ones((1, 1))
+
+    def ce(x: Float[Array, "1 1 3"]) -> Float[Array, ""]:
+        return head._replace(hidden=x).sums(targets, weights, False).ce
+
+    with _use(ONE, loss):
+        value, grad = jax.jit(jax.value_and_grad(ce))(x)
+    np.testing.assert_allclose(value, 2 * e, rtol=1e-6)
+    np.testing.assert_allclose(grad[0, 0], [-2 * e, e, e], rtol=1e-6)
+
+
+@pytest.mark.parametrize("loss", LOSSES)
 @pytest.mark.parametrize("mesh", MESHES)
 @pytest.mark.parametrize("head", ["bias_softcap", "tied_bias_softcap"])
 def test_the_loss_split_over_devices_is_the_one_device_loss(
@@ -198,6 +216,31 @@ def test_a_head_multiplies_by_the_vocabulary_three_times_by_either_method(
     with _use(ONE, loss):
         jaxpr = jax.make_jaxpr(jax.grad(of))(params)
     assert _vocab_products(jaxpr.jaxpr) == 3 * 3  # 3 heads
+
+
+@pytest.mark.parametrize("loss", LOSSES)
+def test_a_step_that_observes_has_each_head_s_z_loss_with_no_more_products(
+    chunked, loss
+):
+    # Its z-loss's gradient of the head, by chunks a second one, only where the loss
+    # weighs it: observed, it is a sum of the log Z the cross-entropy takes anyway.
+    arch, batch = _arch(HEADS["untied"]), _batch()
+    graphdef, params, rest = nnx.split(Model(arch, rngs=nnx.Rngs(0)), nnx.Param, ...)
+    obj = objective(tcfg.LossConfig(mtp=0.5), arch)
+    weighed = objective(tcfg.LossConfig(mtp=0.5, z=1.0), arch)
+
+    def of(params: nnx.State) -> tuple[Float[Array, ""], dict]:
+        model = nnx.merge(graphdef, params, rest)
+        per_token, _ = obj(model.heads(*_inputs(batch)), batch)
+        return per_token.loss, per_token.metrics
+
+    with _use(ONE, loss), observe.use():
+        jaxpr = jax.make_jaxpr(jax.grad(of, has_aux=True))(params)
+        _, metrics = of(params)
+        model = nnx.merge(graphdef, params, rest)
+        z = weighed(model.heads(*_inputs(batch)), batch)[0].metrics["z_loss"]
+    assert _vocab_products(jaxpr.jaxpr) == 3 * 3  # 3 heads, as without observing
+    assert float(metrics["z_loss/t+1"]) == pytest.approx(float(z), rel=1e-6)
 
 
 def test_chunks_give_the_loss_without_its_gradient_as_logits_do(chunked):

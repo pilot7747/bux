@@ -195,12 +195,12 @@ block = [norm shift attn] [norm ffn]
 ```console
 $ bux train mine/shifted.bux
 remat=auto: none in 1s (none 0.5 GiB in 0s)
-shifted step 25/200  loss 2.2135  lr 3.00e-03  grad 3.427  5,649 tok/s
-shifted step 50/200  loss 0.8024  lr 3.00e-03  grad 0.551  7,612 tok/s
-shifted step 50/200  eval loss 0.7792
+shifted step  25/200  loss 2.2135  lr 3.00e-03  grad 3.427  5,649 tok/s  ...
+shifted step  50/200  loss 0.8024  lr 3.00e-03  grad 0.551  7,612 tok/s  ...
+shifted step  50/200  eval loss 0.7793  eval bpb 0.2633
 ...
-shifted step 200/200  loss 0.7181  lr 0.00e+00  grad 0.265  7,591 tok/s
-shifted step 200/200  eval loss 0.7299
+shifted step 200/200  loss 0.7181  lr 0.00e+00  grad 0.265  7,591 tok/s  ...
+shifted step 200/200  eval loss 0.7299  eval bpb 0.2455
 ```
 
 Nothing else had to know about the new layer: the trainer, the optimizer's weight

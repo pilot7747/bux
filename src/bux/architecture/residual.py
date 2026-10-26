@@ -34,6 +34,7 @@ from bux.architecture.layers.norm import Norm
 from bux.architecture.registry import Context, Taps, register
 from bux.lang import ir
 from bux.parallel import shard_stream
+from bux.softmax import softmax
 
 # In Sinkhorn's sums and added to mhc's read: DeepSeek-V4's hc_eps.
 _EPS = 1e-6
@@ -64,7 +65,7 @@ def sinkhorn(
     DeepSeek-V4 computes it: a softmax over every row, the columns divided by their
     sums, then ``iters - 1`` more rounds of rows and columns. Row j is what stream j
     gives the others; the columns, what each stream receives, are normalized last."""
-    m = jax.nn.softmax(logits, -1) + _EPS
+    m = softmax(logits, -1) + _EPS
     m = m / (m.sum(-2, keepdims=True) + _EPS)
     for _ in range(iters - 1):
         m = m / (m.sum(-1, keepdims=True) + _EPS)
@@ -92,11 +93,13 @@ def sources(
 
 def _pending(taps: Taps, x: Float[Array, "b t n d"]) -> Float[Array, "b t n"]:
     """Return the coefficients a single-pass read uses: those the last branch computed,
-    or stream 0 alone before any branch, as DeepSeek-V4.1 starts (make_identity_pre_mix).
+    or stream 0 alone before any branch, as DeepSeek-V4.1 starts (make_identity_pre_mix),
+    in the stream's dtype: a float32 read would make every branch after it float32.
     """
     if taps.pending_read is not None:
         return taps.pending_read
-    return jnp.broadcast_to(jax.nn.one_hot(0, x.shape[2]), x.shape[:3])
+    first = jax.nn.one_hot(0, x.shape[2], dtype=x.dtype)
+    return jnp.broadcast_to(first, x.shape[:3])
 
 
 def _single_pass_read(
@@ -357,7 +360,7 @@ class AttentionResidual(nnx.Module):
         outputs so far: the softmax-weighted sum of its sources."""
         v = sources(x, self.block_size)
         scores = jnp.einsum("btmd,d->btm", self.key_norm(v), self.query[...])
-        return jnp.einsum("btm,btmd->btd", jax.nn.softmax(scores, -1), v)
+        return jnp.einsum("btm,btmd->btd", softmax(scores, -1), v)
 
     def __call__(
         self, x: Float[Array, "b t s d"], taps: Taps

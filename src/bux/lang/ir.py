@@ -282,7 +282,7 @@ def strip(node: Node, *, labels: bool = True, widths: bool = True) -> Node:
 
 
 # Training settings that change how a run is watched or computed, not what it computes.
-_UNCOMPUTED = {"log", "eval", "checkpoint", "profile"}
+_UNCOMPUTED = {"log", "eval", "checkpoint", "observe", "profile"}
 _UNCOMPUTED |= {"mesh", "layout", "methods", "compiler"}  # how it splits and compiles
 # Settings newer than run ids, as runs computed before them: in float32, which was
 # the default then.
@@ -309,6 +309,7 @@ _NEWER_LAYER_FIELDS = {
     "gated_mlp": {"up_offset": 0.0},
     "moe": {"router_bias": False},
     "mamba2": {"num_heads": None},
+    "gqa": {"gate_head_bias": False, "power_scale": None, "power_scale_length": 2048},
 }
 
 
