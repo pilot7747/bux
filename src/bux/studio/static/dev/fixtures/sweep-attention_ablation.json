@@ -1,0 +1,87 @@
+{
+ "axes": [
+  {
+   "id": "a0",
+   "where": "attn.num_kv_heads",
+   "options": [
+    "mha: 12",
+    "gqa: 4",
+    "mqa: 1"
+   ],
+   "labeled": true,
+   "span": [
+    643,
+    663
+   ],
+   "pick": 0
+  },
+  {
+   "id": "a1",
+   "where": "optimizer.lr",
+   "options": [
+    "1e-3",
+    "3e-3"
+   ],
+   "labeled": false,
+   "span": [
+    684,
+    695
+   ],
+   "pick": 0
+  }
+ ],
+ "runs": [
+  {
+   "name": "attention_ablation[mha, optimizer.lr=1e-3]",
+   "id": "1678540f7c",
+   "picks": {
+    "a0": 0,
+    "a1": 0
+   }
+  },
+  {
+   "name": "attention_ablation[mha, optimizer.lr=3e-3]",
+   "id": "e1f8a6438d",
+   "picks": {
+    "a0": 0,
+    "a1": 1
+   }
+  },
+  {
+   "name": "attention_ablation[gqa, optimizer.lr=1e-3]",
+   "id": "ab996b07f8",
+   "picks": {
+    "a0": 1,
+    "a1": 0
+   }
+  },
+  {
+   "name": "attention_ablation[gqa, optimizer.lr=3e-3]",
+   "id": "9ff4aff263",
+   "picks": {
+    "a0": 1,
+    "a1": 1
+   }
+  },
+  {
+   "name": "attention_ablation[mqa, optimizer.lr=1e-3]",
+   "id": "eb97f05b72",
+   "picks": {
+    "a0": 2,
+    "a1": 0
+   }
+  },
+  {
+   "name": "attention_ablation[mqa, optimizer.lr=3e-3]",
+   "id": "96becee690",
+   "picks": {
+    "a0": 2,
+    "a1": 1
+   }
+  }
+ ],
+ "total": 6,
+ "truncated": false,
+ "dimensions": [],
+ "search": null
+}
