@@ -13,7 +13,7 @@ import pytest
 from flax import nnx
 
 from bux import config as cfg
-from bux import parallel
+from bux import initializers, parallel
 from bux.architecture import Segments, Taps
 from bux.architecture.recurrent import fused_delta, linear_attention
 from bux.architecture.recurrent.linear_attention import (
@@ -278,16 +278,17 @@ def test_the_parameters_start_as_the_papers():
 
 
 def test_a_models_init_starts_every_projection_instead():
-    """A model's ``init`` (`parallel.initializing`) wins over the paper's Xavier."""
+    """A model's ``init`` (`initializers.initializing`) wins over the paper's Xavier."""
     c = cfg.GatedDeltaNet2Config(num_heads=2, num_v_heads=4, head_dim=16, v_head_dim=8)
-    with parallel.initializing(nnx.initializers.constant(0.5)):
+    with initializers.initializing(cfg.NormalInitConfig(out=cfg.ZerosInitConfig())):
         layer = GatedDeltaNet2(c, 64, nnx.Rngs(0))
+    assert (layer.o.kernel[...] == 0).all()
     assert isinstance(layer.gate, LowRank)
     kernels = [
         p.kernel for p in (layer.q, layer.k, layer.v, layer.erase, layer.write, layer.o)
     ]
-    for w in [*kernels, layer.f.down, layer.f.up, layer.gate.down, layer.gate.up]:
-        assert (w[...] == 0.5).all()
+    for w in [*kernels[:-1], layer.f.down, layer.f.up, layer.gate.down, layer.gate.up]:
+        assert jnp.isclose(w[...].std(), 0.02, rtol=0.2)
 
 
 def test_a_lower_bound_bounds_the_decay_and_starts_A_log_at_0():

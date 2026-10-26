@@ -49,7 +49,7 @@ def section(title: str, where: str, rows: list[Row]) -> str:
 def registries() -> list[tuple[str, str, list[Row]]]:
     """Return every registry: a title, its import path and its rows."""
     import_all()
-    from bux import passes
+    from bux import initializers, passes
     from bux.architecture.precision import matmuls
     from bux.architecture.repeats import remat
     from bux.lang.printer import config_to_source
@@ -70,8 +70,10 @@ def registries() -> list[tuple[str, str, list[Row]]]:
         ("Optimizers", optim.optimizers),
         ("Schedules", optim.schedules),
         ("Newton-Schulz coefficients", optim.ns_coefficients),
+        ("Newton-Schulz algorithms", optim.ns_algorithms),
         ("Data sources", data.sources),
         ("Matmul formats", matmuls.formats),
+        ("Inits", initializers.inits),
         ("Search methods", search.methods),
     ]:
         found.append(

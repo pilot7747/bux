@@ -157,7 +157,8 @@ class CausalConv(nnx.Module):
         bias: Whether to add a learned bias per channel.
         rngs: The random streams the weights start from.
         dilation: The distance between two taps, in positions.
-        zero: Start the weights at 0, so that the conv starts as nothing.
+        zero: Start the weights at 0, so that the conv starts as nothing; else
+            they start LeCun normal over the taps, whatever the model's ``init``.
         channel: The name of the channels' dimension (`bux.parallel`), or None to
             keep them whole.
     """
@@ -173,7 +174,7 @@ class CausalConv(nnx.Module):
         zero: bool = False,
         channel: parallel.Name = None,
     ):
-        init = nnx.initializers.zeros if zero else parallel.default_init()
+        init = nnx.initializers.zeros if zero else nnx.initializers.lecun_normal()
         weight = init(rngs.params(), (size, channels))
         self.weight = nnx.Param(weight, names=(None, channel))
         self.bias = nnx.Param(jnp.zeros(channels), names=(channel,)) if bias else None

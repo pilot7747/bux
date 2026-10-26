@@ -36,7 +36,7 @@ from typing import Annotated, Any, Literal
 
 from pydantic import BaseModel, ConfigDict, Field
 
-from bux.config import LayerConfig, NormalInitConfig, ResidualConfig
+from bux.config import FanInitConfig, Init, LayerConfig, ResidualConfig
 from bux.train.config import PrecisionConfig, TrainConfig
 
 #: What a layer reads, as the compiler infers it.
@@ -188,8 +188,9 @@ class Architecture(BaseModel):
             a graph with neither, such as a block compiled alone.
         residual: The residual algebra every `Residual` merges by; None for plain
             additive residuals.
-        init: How every weight matrix starts; None for each layer's own default,
-            LeCun normal.
+        init: How the weight matrices start, by role (`bux.config.Init`); None
+            for ``normal(std=0.02)``, but where a layer starts one its own way
+            (`bux.initializers`).
         graph: The model, a tree of nodes.
 
     Example::
@@ -205,7 +206,7 @@ class Architecture(BaseModel):
     d_model: int
     vocab_size: int | None = None
     residual: ResidualConfig | None = None
-    init: NormalInitConfig | None = None
+    init: Init | None = None
     graph: Node
 
     def layers(self) -> Iterator[Layer]:
@@ -305,13 +306,18 @@ _NEWER_FIELDS = {
         "moments": "float32",
         "dispatch": "compute",
     },
-    "optimizer": {"ns_coefficients": "jordan", "ns_dtype": "float32"},
+    "optimizer": {
+        "ns_coefficients": "jordan",
+        "ns_dtype": "float32",
+        "ns_algorithm": "standard",
+        "ns_restarts": None,
+    },
     "schedule": {"horizon": 1.0},
 }
 # Fields of a setting that only change how a run is watched.
 _UNCOMPUTED_FIELDS = {"precision": ("eval",)}
-# Fields of a layer's settings newer than run ids, by its type, at what layers
-# computed before them.
+# Fields of a layer's settings, or of the model's init, newer than run ids, by its
+# type, at what they computed before them.
 _NEWER_LAYER_FIELDS = {
     "mlp": {"up_offset": 0.0},
     "gated_mlp": {"up_offset": 0.0},
@@ -333,9 +339,21 @@ _NEWER_LAYER_FIELDS = {
     "indexer": {"pool": "mean", "per_group": False, "relu": True},
     "layernorm": {"gain_init": 1.0},
     "rmsnorm": {"gain_init": 1.0},
+    "normal": {"embed": None, "head": None, "out": None},  # the model's init
 }
-# Settings of a model newer than run ids, at what models computed before them.
-_NEWER_SETTINGS = {"init": None}
+# How every weight matrix started before the model's `init` was a normal, and before
+# it could be set, as flax's layers start them: runs that set it keep their ids. But
+# routed experts', which started sqrt(E) times smaller, so that an MoE's id is new.
+_INIT_BEFORE = FanInitConfig(
+    type="fan_in", embed=FanInitConfig(type="fan_in", distribution="gaussian")
+)
+
+
+def _starts_as_before(arch: "Architecture") -> bool:
+    """Whether `arch`'s weights start as they did before its ``init`` could be set
+    (`_INIT_BEFORE`)."""
+    moe = any(layer.config.type == "moe" for layer in arch.layers())
+    return arch.init == _INIT_BEFORE and not moe
 
 
 def _experts_as_they_run(
@@ -356,7 +374,7 @@ def _without_newer_fields(train: dict) -> dict:
     for setting, fields in _NEWER_FIELDS.items():
         given = train.get(setting) or {}
         for field, before in fields.items():
-            if given.get(field) == before:
+            if field in given and given[field] == before:
                 del given[field]
     for setting, names in _UNCOMPUTED_FIELDS.items():
         for name in names:
@@ -384,7 +402,7 @@ class Run(BaseModel):
 
     `bux.lang.compile_runs` returns one per combination of a sweep's alternatives,
     and `bux.train.trainer.train` trains one into a directory named for its name and
-    `id`, ``runs/smoke-f114ac17ae/``. The directory keeps it as ``run.json``, and as
+    `id`, ``runs/smoke-5a4f0f7d85/``. The directory keeps it as ``run.json``, and as
     ``run.bux`` (`bux.lang.printer.run_to_source`), which compiles back to the same
     run.
 
@@ -407,7 +425,7 @@ class Run(BaseModel):
     @property
     def id(self) -> str:
         """A hash of what the run computes, not of how it is written, watched or split
-        over devices: ten hex digits, such as ``"f114ac17ae"``.
+        over devices: ten hex digits, such as ``"5a4f0f7d85"``.
 
         Renaming a definition, reaching the same settings through a sweep, logging,
         evaluating, checkpointing or profiling at other steps, or another mesh,
@@ -428,9 +446,10 @@ class Run(BaseModel):
             if train[setting] == value:
                 del train[setting]
         dumped_arch = _without_newer_layer_fields(arch.model_dump(mode="json"))
-        for setting, before in _NEWER_SETTINGS.items():
-            if dumped_arch[setting] == before:
-                del dumped_arch[setting]
+        # Before, an init of None left the key out, and started weights as
+        # `_INIT_BEFORE` does: a None now, which is a normal, keeps it.
+        if _starts_as_before(self.arch):
+            del dumped_arch["init"]
         what = {"arch": dumped_arch, "train": train}
         blob = json.dumps(what, sort_keys=True, separators=(",", ":"))
         return hashlib.sha256(blob.encode()).hexdigest()[:10]

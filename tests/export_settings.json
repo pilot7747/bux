@@ -370,8 +370,25 @@
   "type"
  ],
  "NormalInitConfig": [
+  "embed",
+  "head",
+  "out",
   "std",
   "truncate",
+  "type"
+ ],
+ "FanInitConfig": [
+  "distribution",
+  "embed",
+  "head",
+  "out",
+  "scale",
+  "type"
+ ],
+ "ZerosInitConfig": [
+  "embed",
+  "head",
+  "out",
   "type"
  ]
 }

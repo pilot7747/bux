@@ -11,7 +11,7 @@ and, when a file sets any training setting, make it a run.
 | `d_model` | `int` | required | the width of the residual stream |
 | `vocab_size` | `int` | required with `embed` or `head` | the vocabulary `embed` and `head` take |
 | `residual` | `hc \| mhc \| gr \| attnres \| vpgate \| none` | `none` | the residual algebra: what `[f]` means ([Residual algebras](../../language/residual-algebras.md)) |
-| `init` | `normal \| none` | `none` | how every weight matrix starts; `none`: LeCun normal ([Initialization](../../architectures/layers.md#initialization)) |
+| `init` | `normal \| fan_in \| fan_out \| fan_avg \| zeros \| none` | `none` | how the weight matrices start, by role; `none`: from `normal(std=0.02)`, but where a layer starts them its own way ([Initialization](../../architectures/initialization.md)) |
 
 ## The run
 

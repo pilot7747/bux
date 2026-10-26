@@ -47,7 +47,8 @@ def registries() -> list[Registry]:
     from bux.train import data, optim
 
     found = [v for v in vars(methods).values() if isinstance(v, Registry)]
-    found += [optim.optimizers, optim.schedules, optim.ns_coefficients]
+    found += [optim.optimizers, optim.schedules]
+    found += [optim.ns_coefficients, optim.ns_algorithms]
     return [*found, data.sources, matmuls.formats, search.methods]
 
 

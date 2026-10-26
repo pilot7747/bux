@@ -36,17 +36,17 @@ jobs:
         run: make lint typecheck
 
   tests:
-    # The suite takes over two hours on one runner: four share it, by tests/conftest.py.
-    name: Tests ${{ matrix.shard }}/4
+    # The suite takes over three hours on one runner: six share it, by tests/conftest.py.
+    name: Tests ${{ matrix.shard }}/6
     runs-on: ubuntu-latest
     timeout-minutes: 90
     strategy:
       fail-fast: false
       matrix:
-        shard: [0, 1, 2, 3]
+        shard: [0, 1, 2, 3, 4, 5]
     env:
       JAX_PLATFORMS: cpu
-      BUX_SHARD: ${{ matrix.shard }}/4
+      BUX_SHARD: ${{ matrix.shard }}/6
     steps:
       - name: Check out repository
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1

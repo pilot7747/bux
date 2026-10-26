@@ -404,13 +404,27 @@ def test_residual_algebras_and_their_errors():
     assert "hc(...)" in err.message and "vpgate(...)" in err.message
 
 
-def test_init_is_a_normal_of_the_model_and_its_errors():
+def test_init_starts_the_model_by_role_and_its_errors():
     a = build("init = normal(std=0.5 * d_model ^ -0.5, truncate=3)\nmodel = embed head")
     assert a.init == cfg.NormalInitConfig(std=0.125, truncate=3)
     assert "init = normal(std=0.125, truncate=3.0)" in to_source(a)
-    assert build("model = embed head").init is None
+    plain = build("model = embed head")  # normal(std=0.02), but layers' own starts
+    assert plain.init is None and "init" not in to_source(plain)
+    roles = build(
+        "init = fan_in(scale=2, out=normal(std=0.02 / 4 ^ 0.5), head=zeros)\n"
+        "model = embed head"
+    )
+    assert roles.init == cfg.FanInitConfig(
+        type="fan_in",
+        scale=2,
+        out=cfg.NormalInitConfig(std=0.01),
+        head=cfg.ZerosInitConfig(),
+    )
+    assert compile(to_source(roles)).init == roles.init
     err = error("init = 0.02\nmodel = embed head")
-    assert "'init' must be normal(...), found" in err.message
+    assert "'init' must be normal(...) or fan_in(...)" in err.message
+    err = error("init = normal(out=normal(head=zeros))\nmodel = embed head")
+    assert "the init of 'out' sets roles of its own" in err.message
 
 
 MEMORY = "mem = engram(head_dim=4, table_size=50)\n"

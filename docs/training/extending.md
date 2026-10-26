@@ -71,6 +71,7 @@ def _(c, multiplier, model):  # its config, the schedule's multiplier, the model
 | {py:data}`bux.train.optim.optimizers` | the config, the schedule's multiplier (a function of the step), the model | an optax transformation |
 | {py:data}`bux.train.optim.schedules` | the config, the run's training settings (its steps, batch and peak `lr`) | the curve after the warmup, a function of the step |
 | {py:data}`bux.train.optim.ns_coefficients` | the number of Newton-Schulz iterations | an array of `(a, b, c)`, one, or one an iteration |
+| {py:data}`bux.train.optim.ns_algorithms` | the number of iterations, their `(a, b, c)`, the iterations to restart after (or none) | a function of a matrix, or a stack of them as its `MuonDimensionNumbers` say, that orthogonalizes each |
 | {py:data}`bux.train.data.sources` | the config, the run's settings, the vocabulary's size, the cache, a seed | a {py:class}`~bux.train.data.Source`: `rows(start, n)` of its endless stream |
 | {py:data}`bux.train.trackers.trackers` | the config, the run, its directory, the step it starts at | a {py:class}`~bux.train.sinks.Sink` ([Sinks](#sinks)) |
 | `bux.parallel.methods.loss` | a head's output, its targets, their weights, whether to sum log Z² | the head's `Sums` ([Loss methods](#loss-methods)) |
@@ -79,9 +80,9 @@ def _(c, multiplier, model):  # its config, the schedule's multiplier, the model
 A new optimizer, schedule or source also needs its config in `bux/train/config.py`,
 where the compiler and the editor find it: a pydantic class with a `type` tag, in the
 union of its setting (`OptimizerConfig`, say) and in `Setting`, the union of the
-configs a file calls by name. Newton-Schulz's coefficients, a loss method and a matmul
-format are names in a string field (`muon.ns_coefficients`, `methods.loss`,
-`precision.matmuls`), and need no config. The names each
+configs a file calls by name. Newton-Schulz's coefficients and algorithm, a loss
+method and a matmul format are names in a string field (`muon.ns_coefficients`,
+`muon.ns_algorithm`, `methods.loss`, `precision.matmuls`), and need no config. The names each
 registry holds are listed in [Registries](../reference/language/registries.md).
 
 ## Hooks
@@ -201,8 +202,8 @@ trainer.fit(
 ```
 
 ```text
-mine step 10/20  loss 6.6509  lr 1.00e-03  grad 1.681  12,024 tok/s  ...
-mine step 20/20  loss 6.6194  lr 1.00e-03  grad 1.573  108,656 tok/s  ...
+mine step 10/20  loss 6.2466  lr 1.00e-03  grad 0.622  9,229 tok/s  ...
+mine step 20/20  loss 6.2498  lr 1.00e-03  grad 0.623  62,206 tok/s  ...
 ```
 
 {py:meth}`~bux.train.trainer.Trainer.fit` trains to step `steps`, or until

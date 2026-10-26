@@ -7,15 +7,15 @@ To train a sweep on a cluster, or to stop and resume, see [Launching](launching.
 
 ```console
 $ bux train examples/experiments/smoke.bux
-smoke: runs/smoke-f114ac17ae, on 1 × cpu
+smoke: runs/smoke-5a4f0f7d85, on 1 × cpu
 smoke: 156k parameters, 50 steps × 8 × 64 tokens = 25.6k tokens, adamw(lr=0.003), wsd(warmup=10)
 smoke: log every 10
 remat=auto: none in 1s (none 0.0 GiB in 0s)
-smoke step 10/50  loss 6.6252  lr 3.00e-03  grad 1.614  8,345 tok/s  61 ms/step  data 0.1 ms  compiled in 0.5s  0:00:01 < 0:00:02
-smoke step 20/50  loss 6.5475  lr 3.00e-03  grad 1.038  74,690 tok/s  7 ms/step  data 0.0 ms  0:00:01 < 0:00:00
-smoke step 30/50  loss 6.3513  lr 3.00e-03  grad 0.554  74,647 tok/s  7 ms/step  data 0.0 ms  0:00:01 < 0:00:00
-smoke step 40/50  loss 6.2974  lr 3.00e-03  grad 0.458  76,317 tok/s  7 ms/step  data 0.0 ms  0:00:01 < 0:00:00
-smoke step 50/50  loss 6.2854  lr 0.00e+00  grad 0.395  76,569 tok/s  7 ms/step  data 0.0 ms  0:00:01 < 0:00:00
+smoke step 10/50  loss 6.2429  lr 3.00e-03  grad 0.607  7,844 tok/s  65 ms/step  data 0.1 ms  compiled in 0.5s  0:00:01 < 0:00:03
+smoke step 20/50  loss 6.2618  lr 3.00e-03  grad 0.642  77,133 tok/s  7 ms/step  data 0.0 ms  0:00:01 < 0:00:00
+smoke step 30/50  loss 6.2731  lr 3.00e-03  grad 0.516  77,903 tok/s  7 ms/step  data 0.0 ms  0:00:01 < 0:00:00
+smoke step 40/50  loss 6.2478  lr 3.00e-03  grad 0.440  77,802 tok/s  7 ms/step  data 0.0 ms  0:00:01 < 0:00:00
+smoke step 50/50  loss 6.2633  lr 0.00e+00  grad 0.418  74,244 tok/s  7 ms/step  data 0.0 ms  0:00:01 < 0:00:00
 ```
 
 The first lines say where the run writes, its model and its tokens, and what it
@@ -59,14 +59,14 @@ from bux.train.trainer import train
 
 path = "examples/experiments/smoke.bux"
 [run] = compile_runs(open(path).read(), filename=path)
-metrics = train(run, "runs")  # {'loss': 6.2854, 'grad_norm': 0.3948, ...}
+metrics = train(run, "runs")  # {'loss': 6.2633, 'grad_norm': 0.4177, ...}
 ```
 
 ## The run directory
 
 A run writes to `<out>/<name>-<id>/`: its name, with each stretch of characters other
 than letters, digits and `_.=+-` made one `_` and any `_` at the ends dropped, then its
-id. `smoke[optimizer.lr=1e-3]` goes to `runs/smoke_optimizer.lr=1e-3-e3a8d2164a/`.
+id. `smoke[optimizer.lr=1e-3]` goes to `runs/smoke_optimizer.lr=1e-3-bcdf2abce8/`.
 
 | File | What it holds | Written by |
 |------|---------------|------------|
@@ -84,7 +84,7 @@ The smoke run's `run.bux`, its settings as the compiler resolved them (`4 * d_mo
 256 here):
 
 ```bux
-# smoke, run f114ac17ae
+# smoke, run 5a4f0f7d85
 d_model = 64
 vocab_size = 512
 
@@ -125,19 +125,19 @@ The first line of `bux fmt`'s output shows the id, so it shows what keeps it:
 
 ```console
 $ bux fmt examples/experiments/smoke.bux | head -1
-# smoke, run f114ac17ae
+# smoke, run 5a4f0f7d85
 $ bux fmt examples/experiments/smoke.bux 'mesh = mesh(fsdp=2)' 'methods.remat = full' 'compiler.preset = o1' | head -1
-# smoke, run f114ac17ae
+# smoke, run 5a4f0f7d85
 $ bux fmt examples/experiments/smoke.bux 'checkpoint = checkpoint(every=10)' 'eval = eval(data=synthetic, every=10)' | head -1
-# smoke, run f114ac17ae
+# smoke, run 5a4f0f7d85
 $ bux fmt examples/experiments/smoke.bux 'optimizer.lr = 1e-2' | head -1
-# smoke, run f5babdd0aa
+# smoke, run 54d678be8d
 $ bux fmt examples/experiments/smoke.bux seed=1 | head -1
-# smoke, run 5240ec399f
+# smoke, run 9d2a4a5bf8
 ```
 
 The sweep `'optimizer.lr = 1e-3 | 3e-3'` of the smoke run makes `smoke[optimizer.lr=3e-3]`
-with id `f114ac17ae`, the plain smoke run's: its learning rate is the file's own.
+with id `5a4f0f7d85`, the plain smoke run's: its learning rate is the file's own.
 
 :::{note}
 Since `mesh`, `layout` and `methods` are not in the id, a run resumes on another mesh
@@ -156,8 +156,8 @@ ids and resume.
 the last, to the console and to `metrics.jsonl`:
 
 ```text
-{"step": 10, "grad_norm": 1.6137837171554565, "loss": 6.625185489654541, "lr": 0.003000000026077032, "tokens": 5120, "tokens_per_s": 8069.19861788206}
-{"step": 20, "grad_norm": 1.0376627445220947, "loss": 6.547478199005127, "lr": 0.003000000026077032, "tokens": 10240, "tokens_per_s": 74798.71367274257}
+{"step": 10, "grad_norm": 0.6074022650718689, "loss": 6.2429351806640625, "lr": 0.003000000026077032, "tokens": 5120, "tokens_per_s": 7844.047464570489, "time/step_ms": 65.27242502197623, "time/data_ms": 0.08244607597589493, "time/wait_ms": 0.00047925859689712524, "time/hooks_ms": 0.0015832018107175827, "time/launch_ms": 0.3369542770087719, "time/compile_s": 0.5486519997939467}
+{"step": 20, "grad_norm": 0.6416390538215637, "loss": 6.261777877807617, "lr": 0.003000000026077032, "tokens": 10240, "tokens_per_s": 77132.63393675412, "time/step_ms": 6.637916713953018, "time/hooks_ms": 9.552074875682592, "time/data_ms": 0.006195856258273125, "time/launch_ms": 0.21903333254158497, "time/wait_ms": 0.03154585137963295}
 ```
 
 | Metric | What it is |

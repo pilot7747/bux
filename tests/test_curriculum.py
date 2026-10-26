@@ -73,7 +73,11 @@ def test_a_batch_ramp_grows_linearly_in_multiples_of_its_start():
 
 
 def test_a_run_without_them_keeps_its_id_and_one_with_them_prints_back_to_its_own():
-    [plain_smoke] = compile_runs(SMOKE.read_text(), filename=str(SMOKE))
+    # As every weight started before the default init was a normal.
+    before = "init = fan_in(embed=fan_in(distribution=gaussian))"
+    [plain_smoke] = compile_runs(
+        SMOKE.read_text(), filename=str(SMOKE), overrides=(before,)
+    )
     assert plain_smoke.id == "f114ac17ae"  # as before either setting was
     run = smoke(
         "batch_ramp = ramp(start=2, steps=10, multiple=4)",

@@ -84,7 +84,7 @@ class Console(Sink):
     the metrics it has a format for, in their order, and a log's ends with the time
     since the console was made and the time left at the latest step's pace::
 
-        smoke step 30/50  loss 6.3513  lr 3.00e-03  grad 0.554  74,647 tok/s  7 ms/step  data 0.0 ms  0:00:01 < 0:00:00
+        smoke step 30/50  loss 6.2731  lr 3.00e-03  grad 0.516  75,977 tok/s  7 ms/step  data 0.0 ms  0:00:01 < 0:00:00
 
     A step that observed the model adds a line of its worst layers (`summary`), and
     a loss or a gradient that is not finite ends its line with a warning.

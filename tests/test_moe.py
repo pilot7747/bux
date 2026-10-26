@@ -448,9 +448,13 @@ def test_sorted_is_the_default_method():
 
 # --- Split over devices ----------------------------------------------------------------
 
+# Weights large next to adamw's first steps at 1e-2, of about 0.01 each: from 0.02,
+# two experts' scores come within rounding of each other by the third step, and a
+# split breaks the tie the other way.
 SPLIT = """
 d_model = 64
 vocab_size = 128
+init = normal(std=0.1)
 norm = rmsnorm
 rescale = rmsnorm(eps=1e-8, zero_centered=true, scale_input=true)
 attn = gqa(num_heads=4, num_kv_heads=2, rope=rope())
@@ -500,7 +504,7 @@ def test_muon_orthogonalizes_up_and_gate_as_two_matrices(method):
     with parallel.use(tcfg.MeshConfig(fsdp=2, expert=2, tensor=2), methods=how):
         e = parallel.build(lambda: MoE(c, 32, nnx.Rngs(0)))
         grads = {"up": jnp.sin(e.up[...])}
-        tx = orthogonalized(5, muon_matrices(e), e)
+        tx = orthogonalized(newton_schulz(5), muon_matrices(e), e)
         together = jax.jit(tx.update)(grads, tx.init(grads))[0]["up"]
     ns, matrices = newton_schulz(5), MuonDimensionNumbers(1, 2)
     apart = [ns(grads["up"][..., i], matrices) for i in (0, 1)]

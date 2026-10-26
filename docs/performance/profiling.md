@@ -302,14 +302,14 @@ one-GPU benchmark suite:
 $ bux plan examples/benchmarks/one_gpu.bux
 8 runs
 id          params  tokens  tok/param  flops/tok  gpus  params/gpu  optim/gpu  bubble  run
-41870be720  1.28B   983k    0.0        6.91B      1     4.77GiB     9.54GiB    0%      one_gpu[dense]
-a045f7c793  1.38B   983k    0.0        7.07B      1     5.15GiB     10.3GiB    0%      one_gpu[gdn]
-6e5cb35f5a  1.39B   983k    0.0        7.11B      1     5.17GiB     10.3GiB    0%      one_gpu[kda]
-23163abafa  1.39B   983k    0.0        7.11B      1     5.17GiB     10.3GiB    0%      one_gpu[kdab]
-3371d4b4f4  5.16B   983k    0.0        6.92B      1     19.2GiB     38.4GiB    0%      one_gpu[moe]
-936c7c9d30  1.48B   983k    0.0        7.66B      1     5.53GiB     11.1GiB    0%      one_gpu[mamba2]
-7b9acf4aa2  1.28B   983k    0.0        6.91B      1     4.77GiB     9.54GiB    0%      one_gpu[mxfp8]
-4f66d8a674  1.28B   983k    0.0        6.91B      1     4.77GiB     9.54GiB    0%      one_gpu[nvfp4]
+3325455d32  1.28B   983k    0.0        6.91B      1     4.77GiB     9.54GiB    0%      one_gpu[dense]
+ef0e9714f9  1.38B   983k    0.0        7.07B      1     5.15GiB     10.3GiB    0%      one_gpu[gdn]
+55623706de  1.39B   983k    0.0        7.11B      1     5.17GiB     10.3GiB    0%      one_gpu[kda]
+78132651eb  1.39B   983k    0.0        7.11B      1     5.17GiB     10.3GiB    0%      one_gpu[kdab]
+ffb822d7e6  5.16B   983k    0.0        6.92B      1     19.2GiB     38.4GiB    0%      one_gpu[moe]
+f882fa43f8  1.48B   983k    0.0        7.66B      1     5.53GiB     11.1GiB    0%      one_gpu[mamba2]
+22a58b5a6d  1.28B   983k    0.0        6.91B      1     4.77GiB     9.54GiB    0%      one_gpu[mxfp8]
+5fb3d8d3cb  1.28B   983k    0.0        6.91B      1     4.77GiB     9.54GiB    0%      one_gpu[nvfp4]
 ```
 
 Multiply the FLOPs a token by `tokens_per_s` and divide by the peak of all the run's

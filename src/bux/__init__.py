@@ -5,6 +5,7 @@ to train it; ``bux train FILE`` trains it. The packages, in the order a run uses
 
 - `bux.lang`: the language, compiled to a typed IR (no JAX).
 - `bux.config`: the layers' configs.
+- `bux.initializers`: how weight matrices start, by the model's ``init``.
 - `bux.architecture`: the Flax NNX backend that builds a model from the IR.
 - `bux.data`: documents tokenized and packed into rows.
 - `bux.train`: the trainer, its settings, optimizers and hooks.

@@ -70,6 +70,10 @@ ACTIVATIONS = frozenset(typing.get_args(cfg.Activation))
 #:
 #: :meta hide-value:
 RESIDUALS = _tags(cfg.ResidualConfig)
+#: The inits that ``init = ...`` takes, by name.
+#:
+#: :meta hide-value:
+INITS = _tags(cfg.Init)
 #: The top-level settings of a model.
 SETTINGS = ("d_model", "vocab_size", "residual", "init")
 #: The top-level settings that make a file a run, the fields of
@@ -1559,7 +1563,7 @@ def _compile(ev: _Evaluator, entry: str) -> ir.Architecture:
     d_model = typing.cast(int | None, settings["d_model"])
     vocab_size = typing.cast(int | None, settings["vocab_size"])
     residual = typing.cast(cfg.ResidualConfig | None, settings["residual"])
-    init = typing.cast(cfg.NormalInitConfig | None, settings["init"])
+    init = typing.cast(cfg.Init | None, settings["init"])
     if d_model is None:
         if ev.incomplete:
             raise _Reported()
@@ -1587,7 +1591,10 @@ _SETTING_TYPES: dict[str, tuple[tuple[type, ...], str]] = {
         tuple(RESIDUALS.values()),
         " or ".join(f"{t}(...)" for t in RESIDUALS),
     ),
-    "init": ((cfg.NormalInitConfig,), "normal(...)"),
+    "init": (
+        tuple(INITS.values()),
+        " or ".join(f"{t}(...)" for t in INITS),
+    ),
 }
 
 
