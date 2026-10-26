@@ -30,6 +30,8 @@ WIRINGS = {
     + FFN
     + "model = embed(max_positions=32) [layernorm(bias=true) ffn] "
     "linear(features=64) gelu layernorm head(bias=true, softcap=30)",
+    "nested repeats": BLOCK
+    + "model = embed ([rmsnorm attn] [rmsnorm ffn]^2)^2 rmsnorm head",
     "conv": BLOCK
     + "model = embed [conv(size=3, bias=true)] block [rmsnorm conv] rmsnorm head",
     "rope scalings": HEAD
