@@ -48,7 +48,7 @@ The speedups are against XLA's own program for the same computation, on a B300.
 |------|----|------------------------|
 | softmax attention | `methods.attention = auto`, the default: cuDNN's causal kernels in rows of one document, cuDNN's fused attention in rows of 8192 or more and with a window, else tokamax's flash attention (sinks, a soft cap) | 7x, and no t × t logits |
 | QK-norm then RoPE | `norm_rope`: a Pallas kernel a pass, forward and backward, for an RMSNorm with a scale and RoPE by halves (Qwen3's, OLMo 2's) | 1.4x forward, 1.9x backward (Qwen3-30B-A3B's queries in megatron.bux's step: 0.12 and 0.24 ms a layer) |
-| sparse attention (DSA, QSA, CSA) | `sparse`: tokamax's flash attention with the kept keys as a mask; the indexer's scores, its loss's picks and target by Pallas kernels (`scoring`), its top-k by counting | 2.6x a chunk of queries at a time, and no t × t floats |
+| sparse attention (DSA, QSA, CSA) | `sparse`: tokamax's flash attention with the kept keys as a mask; the indexer's scores and its loss's target by Pallas kernels (`scoring`); its top-k and its loss's scores of the picks by cuDNN's DSA kernels (`indexer_cudnn`) | 2.6x a chunk of queries at a time, and no t × t floats; at 32k the indexer's selection 3.6x, its loss's picks 5.2x, the DSA 1B's step 1.8x |
 | linear attention, RWKV-7 | `chunkwise`: chunks of 64 positions, the state across them by a Pallas kernel (`affine_scan`); `methods(states=recompute)` keeps a fourteenth of the memory for the backward | 14-17x a scan over positions |
 | Mamba-2 | `chunkwise`, B and C a group's, the state across chunks by a matmul; `methods(states=recompute)` keeps a sixteenth of the memory for the backward | 25x a scan over positions (2 × 4096 tokens, rematerialized: at 8 × 4096 the scan needs 199 GiB) |
 | Gated DeltaNet, DeltaNet | cuDNN's fused GDN kernel (`fused_delta`), by cuDNN's graph from a `buffer_callback`: any gate | 5x `chunkwise` |
@@ -67,7 +67,7 @@ Where they live:
 |--------|--------|
 | flash attention, cuDNN's and tokamax's | {py:mod}`bux.parallel.flash` |
 | `norm_rope` | {py:mod}`bux.architecture.attention.norm_rope` |
-| `sparse`, `scoring` | {py:mod}`bux.architecture.attention.sparse`, {py:mod}`bux.architecture.attention.scoring` |
+| `sparse`, `scoring`, `indexer_cudnn` | {py:mod}`bux.architecture.attention.sparse`, {py:mod}`bux.architecture.attention.scoring`, {py:mod}`bux.architecture.attention.indexer_cudnn` |
 | `chunkwise`, `affine_scan` | {py:mod}`bux.architecture.recurrent.chunkwise`, {py:mod}`bux.architecture.recurrent.affine_scan` |
 | `fused_delta`, `pallas_delta` | {py:mod}`bux.architecture.recurrent.fused_delta`, {py:mod}`bux.architecture.recurrent.pallas_delta` |
 | `grouped`, `grouped_mxfp8`, `grouped_glu` | {py:mod}`bux.architecture.experts.grouped`, {py:mod}`bux.architecture.experts.grouped_mxfp8`, {py:mod}`bux.architecture.experts.grouped_glu` |
@@ -90,6 +90,8 @@ by XLA instead, with the same values up to rounding. Outside a GPU, and inside
 | `norm_rope` | an RMSNorm with a scale and no bias, RoPE by halves of every dim; 16-bit inputs; a head dim that is a power of two from 32 to 256, and a power of two of heads on each device; outside any `shard_map` | the norm and `rotate` by XLA |
 | `fused_delta` | cudnn-frontend installed; a B200 or B300 (SM 10.0, 10.3); heads of 64 or 128 dims; bfloat16 or float16; `methods.recurrence = scan`; one decay a head (GDN, DeltaNet) or KDA with `gate_lower_bound` of -5 or more | `pallas_delta` for KDA, else `chunkwise` |
 | `pallas_delta` | KDA (a decay per key channel); heads of 64 or 128 dims; bfloat16 or float16; `methods.recurrence = scan` | `chunkwise` |
+| `indexer_cudnn`'s top-k | a B200 or B300 with cudnn-frontend; up to 2048 picks a query | XLA counts the k-th highest score's bits |
+| `indexer_cudnn`'s loss | a B200 or B300 with cudnn-frontend; an indexer of 32 or 64 heads of 128 dims in bfloat16 (DSA's 64), its picks in multiples of 128 up to 2048 | `scoring`'s Pallas kernels, for heads and dims of powers of two; else XLA |
 | `affine_scan` | a state of k × v with k a power of two of 16 or more, and v a multiple of 32 | a scan over the chunks by XLA |
 | `grouped.ragged_dot` | tokamax installed | `jax.lax.ragged_dot` |
 | `grouped_mxfp8` | a Blackwell GPU (compute capability 10 or more); the experts' role in `mxfp8` or `mxfp8_2d` | XLA dequantizes and multiplies |
@@ -189,38 +191,81 @@ bfloat16, against the same model by all t × t logits, as bux attended before `s
 
 | tokens a row × rows | t × t logits | `sparse` |
 |---------------------|--------------|----------|
-| 4096 × 2            | 27.0k tok/s, 85.6 GiB | 28.6k, 31.0 GiB |
-| 4096 × 8            | out of memory | 36.8k, 64.6 GiB |
-| 16384 × 1           | out of memory | 14.3k, 42.5 GiB |
-| 32768 × 1           | out of memory | 9.9k, 85.6 GiB |
-| 32768 × 1, packed documents | out of memory | 11.7k, 85.6 GiB |
-| 65536 × 1           | out of memory | 6.1k, 198 GiB |
+| 4096 × 2            | 27.0k tok/s, 85.6 GiB | 54.2k, 26.4 GiB |
+| 4096 × 8            | out of memory | 56.4k, 63.3 GiB |
+| 16384 × 1           | out of memory | 29.1k, 42.5 GiB |
+| 32768 × 1           | out of memory | 18.0k, 80.5 GiB |
+| 32768 × 1, packed documents | out of memory | 20.5k, 80.5 GiB |
+| 65536 × 1           | out of memory | 10.4k, 187 GiB |
+
+The indexer's parts of a layer at 32k, one row, before cuDNN's kernels
+(`indexer_cudnn`) and with them:
+
+| part of a layer | before | with cuDNN's kernels |
+|-----------------|--------|----------------------|
+| the indexer's selection: its scores (Pallas, 12.2 ms) and top-k | 58.4 ms | 16.1 |
+| the same on packed documents | 58.5 | 14.2 |
+| its loss's scores of each query's 2048 picks, forward and backward | 55.0 | 10.6 |
+| the same on packed documents | 38.2 | 9.9 |
 
 ::::{dropdown} How the indexer's loss got fast
 
 The indexer's loss took 60% of a step at 32k: XLA's gather of each query's 2048
 picks, their keys' gradient added by a scatter, and the attention's probabilities,
-which the backward pass took again. It takes the probabilities once now, and on a GPU
-scores the picks by Pallas kernels (`scoring.picked`): a program a query that stops at
-its last pick, whose backward pass adds the keys' gradient atomically (relaxed:
-Pallas's acquire-release adds took 1.6x the time).
+which the backward pass took again. It takes the probabilities once now, and scored
+the picks by Pallas kernels (`scoring.picked`, still on a GPU but a B200 or B300): a
+program a query that stops at its last pick, whose backward pass adds the keys'
+gradient atomically (relaxed: Pallas's acquire-release adds took 1.6x the time).
 
 Before, the model trained at 10.0k tokens a second at 16k, 7.1k at 32k, 5.8k on packed
-documents (2.0x now: most queries of a short document pick few keys) and 4.4k at 64k.
-The same model with GQA's 16 heads of 128 for MLA trained at 8.26k at 32k (11.6k now,
+documents (2.0x then: most queries of a short document pick few keys) and 4.4k at 64k.
+The same model with GQA's 16 heads of 128 for MLA trained at 8.26k at 32k (11.7k then,
 its probabilities by a kernel too). The loss's probabilities, kept for the backward
 pass, take 9 GiB more at 32k.
 
-The log's MFU, which counts the keys each query sees, is 5.5% at 32k: the indexer's
-ranking of every key, its loss and its target cost far more than the attention to
-2048 keys.
+Then cuDNN's DSA kernels took the indexer's top-k and its loss's scores of the picks
+(`indexer_cudnn`), on the same node as the numbers before them:
+
+| tokens a row × rows | Pallas and XLA's counting | cuDNN's kernels |
+|---------------------|---------------------------|-----------------|
+| 4096 × 2            | 35.6k tok/s, 26.1 GiB     | 54.2k, 26.4 GiB |
+| 4096 × 8            | 38.7k, 64.5 GiB           | 56.4k, 63.3 GiB |
+| 16384 × 1           | 15.0k, 42.5 GiB           | 29.1k, 42.5 GiB |
+| 32768 × 1           | 9.99k, 85.7 GiB           | 18.0k, 80.5 GiB |
+| 32768 × 1, packed documents | 12.0k, 85.7 GiB   | 20.5k, 80.5 GiB |
+| 32768 × 1, GQA's 16 heads of 128 | 11.7k, 77.4 GiB | 24.4k, 73.8 GiB |
+| 65536 × 1           | 6.13k, 198 GiB            | 10.4k, 187 GiB  |
+
+XLA's top-k counted the k-th highest score's bits in 32 passes over every row and
+scattered the kept slots into place: 46 ms of a layer's 58 at 32k, where cuDNN's
+radix kernel takes 2.8. A key a query does not see goes into it as one of the lowest
+floats, not as -inf: the kernel picks among ties at the k-th one at a time, and the
+row of a short document, which sees fewer keys than it keeps, tied at -inf (packed
+documents took 5x one document's time). A query whose span holds no more slots than
+it keeps keeps all it sees without the kernel.
+
+The loss's backward added each pick's share of the keys' gradient atomically, 48 ms
+of its 55: cuDNN's indexer backward gathers a block of 128 picks' keys by TMA, runs
+its GEMMs on tensor cores and adds the keys' gradient by bulk reductions, in 8.8. Its
+gradient of the scores rounds to bfloat16 before the GEMMs (4e-3 of the largest
+gradient, against the float32 Pallas kernels'). They take 2^23 picks at a time,
+8 chunks of a row of 32k (`indexer.LOSS_PICKS`): in one chunk XLA kept 10 GiB more
+alive at 4096 × 8 and 5 at 32k, for 2-3% less time. On FineWeb-Edu, a 0.4B DSA model
+that keeps 512 of 4096 keys reaches the same held-out loss after 2000 steps (65M
+tokens) as by the Pallas kernels, within 0.0024 at each of 4 seeds, which spread over
+0.068. A step at 32k took 3.31 s on the GPU, and takes 1.83.
+
+The log's MFU, which counts the keys each query sees, is 10.0% at 32k: the indexer's
+ranking of every key and the loss's target cost far more than the attention to 2048
+keys.
 
 Under `methods(remat=save_attention)` the backward neither selects the keys again nor
-runs the flash forward again ([Remat](../parallelism/remat.md)): at 32k, 7.27k tokens
-a second in 39.8 GiB, as fast as no remat (7.11k, 77.9 GiB), where it ran at 5.85k
-before; at 16k, 10.2k against 8.65k. MLA keeps its latents for `save_qkv_attention`,
-not the heads' projections up from them: at 8 rows of 4096, 34.1k in 41.2 GiB, against
-30.1k in 51.5 before.
+runs the flash forward again ([Remat](../parallelism/remat.md)): at 32k, 13.2k tokens
+a second in 68.8 GiB, against 18.0k without remat (9.08k in 66.6 GiB before cuDNN's
+kernels). When the model trained at 7.11k without remat (77.9 GiB), it trained as fast
+under it, 7.27k in 39.8 GiB, where it ran at 5.85k before; at 16k, 10.2k against
+8.65k. MLA keeps its latents for `save_qkv_attention`, not the heads' projections up
+from them: at 8 rows of 4096, 34.1k in 41.2 GiB, against 30.1k in 51.5 before.
 ::::
 
 (kernels-matmul-formats)=
