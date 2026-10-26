@@ -126,7 +126,9 @@ def _block_sums(
         weights = [w_ref[i, :].astype(F32) for i in range(size)]
         start = pl.program_id(0) * rows  # outside the loop, as interpreting takes it
 
-        def run(j: Int[Array, ""], sums: tuple[Array, ...]) -> tuple[Array, ...]:
+        def run(
+            j: Int[Array, ""], sums: tuple[Float[Array, "s c"], ...]
+        ) -> tuple[Float[Array, "s c"], ...]:
             first = start + j * step
             x = x_ref[pl.ds(first, step), :].astype(F32)
             dx = jnp.zeros((step, columns), F32)
