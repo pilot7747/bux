@@ -13,6 +13,7 @@ names ([Benchmarks](benchmarks.md) has the workloads, dates and commits):
 | run | bux | against |
 |-----|-----|---------|
 | Qwen3-30B-A3B at Megatron-Bridge's own workload (512 rows of 4096 in 8 microbatches, MXFP8), 8 GPUs | **42,391** tokens a second a GPU | Megatron-Bridge's 40,769: **104%** |
+| Megatron-Bridge's other workloads: Nemotron 3 Nano (8 GPUs), gpt-oss-120b and Nemotron 3 Super (64), Llama 3 8B (8) | 86%, 89%, 62-68% of Megatron-Bridge's | Llama 3 8B: 111% of its B200 number ([details](benchmarks.md#megatron-bridges-other-workloads)) |
 | a Llama-style 1.3B, one GPU, bfloat16 | 142k tokens a second, 44% MFU | 167k in MXFP8 (1.18x), 179k in NVFP4 (1.22x against 147k, a later tree's bfloat16) |
 | the same 1.3B, `mesh(fsdp=8)` on one node | 1.245M tokens a second | FSDP keeps 97% of a GPU's rate alone |
 | the same 1.3B, HSDP on eight nodes (64 GPUs) | 8,664k tokens a second | 96.4% a GPU of one node's |

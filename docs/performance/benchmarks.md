@@ -11,7 +11,7 @@ model like yours before you start.
 
 ## The suites
 
-Every suite but `megatron.bux` uses `baseline.bux`: a Llama-style 1.3B (`d_model`
+Every suite but the `megatron*.bux` ones uses `baseline.bux`: a Llama-style 1.3B (`d_model`
 2048, 16 layers, a vocabulary of 128256, GQA of 16 heads and 8 kv heads, a gated MLP of
 5632), its hybrids with Gated DeltaNet, KDA and Mamba-2, and its MoE (64 experts of
 704, top 8), on random tokens in rows of 4096, 8 rows a GPU, in bfloat16, for 30 steps
@@ -24,6 +24,10 @@ logged every 5.
 | `two_nodes.bux` | 16 | `fsdp` (`fsdp=16`); `hsdp` (`data=2, fsdp=8`); `gdn`, the GDN hybrid under HSDP; `moe`, sorted under HSDP; `moe_ep`, by EP within a node (`data=2, expert=8`) |
 | `four_nodes.bux` | 32 | `fsdp` (`fsdp=32`); `hsdp` (`data=4, fsdp=8`); `moe` and `moe_ep` as on two nodes; `pp`, a stage a node (`stage=4, fsdp=8`) in 16 microbatches, 1f1b on the stages it balances (`[5, 5, 5, 1]`); `pp_even` on `[4, 4, 4, 4]`; `gpipe` |
 | `megatron.bux` | 8 | Qwen3-30B-A3B at Megatron-Bridge's workload, MXFP8, routed by random logits: `sorted` (`fsdp=8`, 8 microbatches, `gather=layer`) and `nccl_ep` (`expert=8`, a capacity of 1.25, 8 microbatches) |
+| `megatron_nano.bux` | 8 | Nemotron 3 Nano 30B-A3B at Megatron-Bridge's workload (512 rows of 8192, 4 a GPU a microbatch), MXFP8, random logits: `sorted` (`fsdp=8`, `gather=layer`) and `nccl_ep` (`expert=8`, a capacity of 1.25) |
+| `megatron_llama3_8b.bux` | 8 | Llama 3 8B at Megatron-Bridge's B300 recipe (128 rows of 8192, 4 a GPU a microbatch), MXFP8: `fsdp` and `zero1` (the optimizer's state alone split, as Megatron's distributed optimizer splits it) |
+| `megatron_gpt_oss.bux` | 64 | gpt-oss-120b at Megatron-Bridge's workload (1280 rows of 4096, 4 a GPU a microbatch), MXFP8, random logits, the experts over a node's GPUs and their shards over the nodes (`fsdp=8, expert=8`): `nccl_ep` and `all_to_all`, at a capacity of 1.25 |
+| `megatron_super.bux` | 64 | Nemotron 3 Super 120B-A12B at Megatron-Bridge's workload (512 rows of 8192, a row a GPU a microbatch), `fsdp=8, expert=8` by NCCL EP, random logits, its MTP module in bfloat16: `mxfp8`, and `nvfp4` as Megatron's recipe quantizes it |
 
 `bux plan` shows each run's size and split before it trains:
 
@@ -253,6 +257,57 @@ backward (the last layers', the embedding's, the head's in float32); and the MXF
 experts' Mosaic kernels are lowered again at every call, and CuTe DSL compiles its
 kernels in every process: 20-110 s of a compile.
 ::::
+
+(megatron-other-workloads)=
+
+### Megatron-Bridge's other workloads
+
+The same performance summary (26.06) has four more B300 rows that fit on 8 or 64 GPUs.
+`examples/benchmarks/megatron_*.bux` train them as Megatron-Bridge's configs do: its
+global batch, microbatch and rows, EP=8, every layer in MXFP8 (its performance script
+turns off the bfloat16 first and last layers), and the routing forced even by random
+logits. On B300s, on 2026-10-25, from `main` at `0f0cfe2` with these suites and their
+models (merged at `2daa850`), tokens a second a GPU:
+
+| model, GPUs | Megatron-Bridge | bux's run | bux | of Megatron's | peak | `remat=auto` took |
+|-------------|-----------------|-----------|-----|---------------|------|-------------------|
+| Nemotron 3 Nano 30B-A3B, 8 | 37,316 | `sorted`, `fsdp=8` | **31,912** | **86%** | 192 GiB | `dots` |
+| | | `nccl_ep`, `expert=8` | out of memory at its first step | | | |
+| gpt-oss-120b, 64 | 18,534 | `nccl_ep`, `fsdp=8, expert=8` | **16,581** | **89%** | 151 GiB | `none` |
+| | | `all_to_all` | 16,042 | 87% | 161 GiB | `none` |
+| Nemotron 3 Super 120B-A12B, 64 | 7,867 in MXFP8 | `mxfp8`, NCCL EP | **5,317** | **68%** | 240 GiB | `dots` |
+| | 8,131 in NVFP4 | `nvfp4` | 5,049 | 62% | 240 GiB | `dots` |
+| Llama 3 8B, 8 | 29,521 on 8 B200s | `fsdp=8` | **32,749** | **111%** | 174 GiB | |
+| | | `zero1` | out of memory | | | |
+
+- **Llama 3 8B**: Megatron-Bridge publishes no B300 number for it. Its B200 number
+  (25.11, MXFP8) is the comparison, as a B200's dense FP8 peak is a B300's; in FP8
+  with current scaling it trains at 30,624 there.
+- **gpt-oss-120b** was measured before its routed experts took their biases
+  (`28356a9`): without them, and with its activation approximated by a SwiGLU
+  clamped at 7. It now trains as `gpt_oss_120b.bux` describes it
+  ([its experts](../architectures/experts.md#what-it-computes)).
+- **Nemotron 3 Super**'s two MTP depths, sharing one module, run in bfloat16. In NVFP4,
+  as Megatron's quantization config has it, attention, the latent projections and the
+  last 14 layers do too, and Mamba's output projection is in MXFP8.
+- **The models are the same size.** bux's FLOPs a token against what Megatron's
+  numbers imply: gpt-oss-120b 32.7G against 32.6G, Super 85.9G against 84.8G, Llama 3
+  8B 51.5G against 51.45G, Nano 20.9G against 22.3G (they count Mamba differently).
+- Vocabularies are those of the models' published configs: gpt-oss's 201,088.
+
+Left open:
+
+- **An MoE across nodes reduces its experts' gradients every microbatch.** A router
+  learns from the whole batch, so `methods.accumulate` is `reduced` there, and each
+  microbatch reduce-scatters the experts' gradients between nodes, where Megatron does
+  it once a step ([Gathered once, reduced
+  once](../parallelism/microbatches.md#gathered-once-reduced-once-methodsgather-methodsaccumulate)).
+  That is likely much of Super's gap.
+- **Nano's `nccl_ep` runs out of memory**: `remat=auto` estimates its step without
+  NCCL EP's own buffers, which at rows of 8192 do not fit beside `none`.
+- **The last log's `tokens_per_s` read too high** in these runs, since the host stopped
+  waiting for the GPU between steps (Nano's 376k against the median's 255k): read
+  the median of the logs after the first, as `scripts/benchmark.py` does.
 
 ### One GPU
 

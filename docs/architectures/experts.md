@@ -39,11 +39,32 @@ experts = moe(num_experts=384, top_k=6, num_shared_experts=1, router=sqrtsoftplu
               expert=gated_mlp(intermediate_size=2304, activation=swish, limit=10))
 ```
 
+With `bias=true` in `expert`, every routed expert has biases of its own on its up,
+gate and down projections. They are not weight-decayed. gpt-oss-120b's experts have
+them, and are SwiGLUs of its own: a `quick_gelu` gate, $g\,\sigma(1.702\, g)$, capped
+at 7, times `up` clipped to $\pm 7$ plus 1 (`up_offset`), with a bias on the router's
+logits too (`examples/architectures/gpt_oss_120b.bux`):
+
+```bux
+experts = moe(num_experts=128, top_k=4, router_bias=true,
+              expert=gated_mlp(intermediate_size=2880, activation=quick_gelu,
+                               bias=true, limit=7.0, up_offset=1.0))
+```
+
+:::{note}
+cuDNN's fused SwiGLU kernels take no biases, offset, clamp or soft-cap, so experts
+with any of them run by bux's grouped GEMMs ([SwiGLU fused, by
+cuDNN](../parallelism/experts.md#swiglu-fused-by-cudnn)). Every `methods.moe` adds
+an expert's biases where it runs its kernels, `nccl_ep` too: on 8 B300s, gpt-oss's
+experts by each method compute what `sorted` does on one GPU, the layer within 7.7e-7
+and 12 steps' losses within 1.2e-4.
+:::
+
 ## Routing
 
-The router is a linear layer of the width to the experts, with a bias only under
-`router_bias=true` (gpt-oss). In order,
-for each token:
+The router is a linear layer of the width to the experts, with a bias, learned, only
+under `router_bias=true` (gpt-oss). It differs from `aux_free`'s bias (below), which
+moves only which experts a token picks, not their weights. In order, for each token:
 
 1. **Logits**: $x W_r$, in float32, times `router_logit_scale` (Muse Spark scales them
    by $\sqrt{256 / d}$).

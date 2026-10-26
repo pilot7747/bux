@@ -94,7 +94,7 @@ with `gelu_tanh` GeGLU.
 | `dropout` | `0` | dropout on the output | |
 | `limit` | `none` | clamped SwiGLU: the gate input capped at `limit`, the up branch at $\pm$`limit` | gpt-oss, DeepSeek-V4 |
 | `up_softcap` | `none` | $c \tanh(u / c)$ on the up branch | Kimi K3 |
-| `up_offset` | `0` | added to a gated MLP's up branch after it is clipped | gpt-oss |
+| `up_offset` | `0` | added to a gated MLP's up branch after it is clipped | gpt-oss ([its experts](experts.md#what-it-computes)) |
 
 Llama 3 and DeepSeek-V4.1-Flash:
 

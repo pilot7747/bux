@@ -128,6 +128,20 @@ share. Subclassing `AttentionConfig` marks a layer as a token mixer, which the
 layers that start their parameters by depth among the model's token mixers count
 (`lightning`, `rwkv7`).
 
+Fields that must agree with each other are checked by a validator on the config,
+whose error the compiler reports at the setting: `gqa`'s `num_kv_heads` must divide
+its `num_heads`.
+
+### A new field on an existing layer
+
+A run's id hashes its layers' settings, so a field added to a layer would change the
+id of every run that uses it, and a run of the tree before could not resume. Give the
+field a default that computes as the layer did before it, and list that default in
+`bux.lang.ir._NEWER_LAYER_FIELDS`: a field at that value is left out of the id. That
+is how `up_offset` (0), `router_bias` (false) and `mamba2`'s `num_heads` (none) came
+in, and every run of `examples/` kept its id ([Run ids](../training/running.md#run-ids)).
+A training setting's new field goes in `_NEWER_FIELDS` the same way.
+
 ### Ports
 
 A layer that passes internal tensors to other layers lists its ports:
