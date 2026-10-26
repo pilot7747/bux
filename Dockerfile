@@ -2,7 +2,8 @@
 
 # GPU image for bux: JAX on CUDA 13 for Blackwell (and Hopper), plus tokamax's Pallas kernels
 # (FlashAttention, MoE grouped matmul) and cudnn-frontend's (KDA), which tokamax's extra brings
-# (docs/performance/kernels.md), and TransformerEngine's JAX bindings (NCCL EP). CUDA, cuDNN and NCCL come from the
+# (docs/performance/kernels.md), TransformerEngine's JAX bindings (NCCL EP), and W&B and
+# TensorBoard for log.trackers. CUDA, cuDNN and NCCL come from the
 # `cuda` extra's pip wheels, pinned in uv.lock, so the base image only needs to supply the driver
 # plumbing; CUDA_VERSION should track the toolkit those wheels ship.
 #
@@ -59,6 +60,10 @@ ENV PATH="/opt/venv/bin:${PATH}"
 # `uv run` would otherwise re-sync to the default dependencies and drop the cuda extra.
 ENV UV_NO_SYNC=1
 
+# Every line out as it is printed, a library's and a traceback's too, so that `kubectl logs`
+# shows the run as it goes; bux flushes its own lines either way.
+ENV PYTHONUNBUFFERED=1
+
 # Numeric, so k8s can enforce runAsNonRoot without an explicit runAsUser.
 USER 1000:1000
 WORKDIR /opt/bux
@@ -66,7 +71,7 @@ WORKDIR /opt/bux
 # Dependencies first, so editing the source does not invalidate the install layer.
 COPY --chown=1000:1000 .python-version pyproject.toml uv.lock ./
 RUN --mount=type=cache,target=/home/$USERNAME/.cache/uv,uid=1000,gid=1000 \
-  uv sync --locked --no-dev --extra cuda --no-install-project
+  uv sync --locked --no-dev --extra cuda --extra wandb --extra tensorboard --no-install-project
 
 # TransformerEngine's JAX bindings, for NCCL EP's dispatch and combine (docs/parallelism/experts.md,
 # "TransformerEngine's NCCL EP"). Its core comes built for CUDA 13 (amd64 and arm64), and loads
@@ -90,7 +95,7 @@ RUN --mount=type=cache,target=/home/$USERNAME/.cache/uv,uid=1000,gid=1000 \
 
 COPY --chown=1000:1000 . .
 RUN --mount=type=cache,target=/home/$USERNAME/.cache/uv,uid=1000,gid=1000 \
-  uv sync --locked --no-dev --extra cuda --inexact
+  uv sync --locked --no-dev --extra cuda --extra wandb --extra tensorboard --inexact
 
 # Exec form, so that the launcher is PID 1 and gets the SIGTERM that stops a container, at
 # which it checkpoints the step it is at and exits.

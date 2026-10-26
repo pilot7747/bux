@@ -37,6 +37,7 @@ from jax.typing import DTypeLike
 from jaxtyping import Array, Bool, Float, Int, Shaped
 
 from bux import parallel
+from bux.architecture import observe
 from bux.parallel import methods
 
 #: The most bytes of float32 logits a device makes at once by ``chunks``, 2 GiB.
@@ -85,7 +86,9 @@ class Projection(NamedTuple):
 class Sums(NamedTuple):
     """A head's sums over positions, each weighted: of the cross-entropy, ``log Z``
     minus the target's logit, and of ``log Z`` squared, the z-loss; 0 where not asked
-    for.
+    for, but in a forward that observes (`bux.architecture.observe`), which measures
+    it all the same. Its gradient is there only where asked for: ``chunks`` makes the
+    z-loss's gradient of the head, a second one, only then.
     """
 
     ce: Float[Array, ""]  #: The cross-entropy's sum.
@@ -122,9 +125,11 @@ class Scores(NamedTuple):
         return cls(jax.nn.logsumexp(logits, -1), target[..., 0])
 
     def sums(self, weights: Float[Array, "*n"], z: bool) -> Sums:
-        """Return their sums, each position by its weight; the z-loss's if `z`."""
+        """Return their sums, each position by its weight; the z-loss's if `z`, or in
+        a forward that observes, which takes it from ``log Z`` for free."""
         ce = jnp.sum(weights * (self.lse - self.target))
-        return Sums(ce, jnp.sum(weights * self.lse**2) if z else jnp.zeros(()))
+        measured = z or observe.active() is not None
+        return Sums(ce, jnp.sum(weights * self.lse**2) if measured else jnp.zeros(()))
 
 
 class HeadOutput(NamedTuple):

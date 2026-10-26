@@ -32,11 +32,12 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
 import jax
+import jax.numpy as jnp
 import numpy as np
 import orbax.checkpoint as ocp
 from flax import nnx
 from jax.experimental import multihost_utils
-from jaxtyping import Array, Shaped
+from jaxtyping import Array, Float, Shaped
 
 from bux import parallel
 from bux.lang.printer import value_to_source
@@ -103,6 +104,17 @@ class Log(Hook):
     (``Trainer.work``). Optax counts from 0: the step just taken is
     ``trainer.step - 1``.
 
+    Since the last log, too: the wall time a step, ``time/step_ms``; the host's in
+    each part of the loop, a step (``Trainer.timers``): ``time/data_ms`` waiting for
+    batches, ``time/launch_ms`` launching steps, ``time/hooks_ms`` in hooks and
+    ``time/wait_ms`` waiting for the step before; and ``time/compile_s``, the
+    seconds compiling, where a step compiled. Where the device says, its memory in
+    use, ``mem/gib``, and the most it has held, ``mem/peak_gib``: of the process's
+    device that holds most.
+
+    It also logs the steps that observe the model (``Trainer.observes``), whose
+    metrics by layer are among the step's (`bux.train.observe`).
+
     Args:
         every: The steps between logs.
         lr: The learning rate at each step, from 0 (`bux.train.optim.lr_schedule`).
@@ -117,39 +129,98 @@ class Log(Hook):
         self.every, self.lr, self.tokens = every, lr, tokens  # tokens per step
         self.peak = peak
         self.clock, self.since, self.flops = time.perf_counter(), 0, 0.0
+        self.trainer: "Trainer | None" = None
+
+    def due(self, step: int, steps: int) -> bool:
+        """Return whether the log runs after `step`: every `every` steps, after the
+        last, and after a step that observed the model."""
+        observed = self.trainer is not None and self.trainer.observes(step)
+        return super().due(step, steps) or observed
 
     def start(self, trainer: "Trainer") -> None:
         """Start the clock and the counts at the trainer's step."""
         self.clock, self.since = time.perf_counter(), trainer.step
-        self.flops = trainer.flops
+        self.flops, self.trainer = trainer.flops, trainer
+        trainer.timers.read()  # what came before training: the restore, say
 
     def __call__(self, trainer: "Trainer", metrics: Metrics) -> Later:
         """Return the step's scalars, to read once the next step is launched. Its
         learning rate is computed now, on the GPU behind this step: computed as it is
         read, it would queue behind the next step, and reading it wait for that one
-        too, leaving the GPU nothing to run as the host launches the one after."""
-        lr = self.lr(trainer.step - 1)
+        too, leaving the GPU nothing to run as the host launches the one after. So
+        are the metrics stacked into one array, which reads in one copy: read one by
+        one, the thousands of a step that observes took the host 300 ms."""
+        values = metrics | {"lr": self.lr(trainer.step - 1)}
+        stacked = _stacked(tuple(values.values()))
         counted = trainer.work is not None
+        timers = trainer.timers.read()
         return functools.partial(
-            self._read, metrics | {"lr": lr}, trainer.step, trainer.flops, counted
+            self._read,
+            list(values),
+            stacked,
+            trainer.step,
+            trainer.flops,
+            counted,
+            timers,
         )
 
     def _read(
-        self, metrics: Metrics, step: int, flops: float, counted: bool
+        self,
+        names: list[str],
+        stacked: Float[Array, " n"],
+        step: int,
+        flops: float,
+        counted: bool,
+        timers: Mapping[str, float],
     ) -> Scalars:
-        """Return the scalars of `step`, which waits for it; `flops` the trainer's
-        count then, which `counted` says it keeps."""
-        scalars = {k: float(v) for k, v in metrics.items()}
+        """Return the scalars of `step`, which waits for it: the metrics `names`, in
+        `stacked`; `flops` the trainer's count then, which `counted` says it keeps,
+        and `timers` its seconds by part of the loop since the last log."""
+        read = np.asarray(stacked).tolist()
+        scalars = dict(zip(names, read, strict=True))
         now = time.perf_counter()
         steps, seconds = step - self.since, now - self.clock
         scalars |= {
             "tokens": step * self.tokens,
             "tokens_per_s": steps * self.tokens / seconds,
+            "time/step_ms": 1000 * seconds / steps,
         }
         if self.peak and counted:
             scalars["mfu"] = (flops - self.flops) / seconds / self.peak
+        scalars |= _per_step(timers, steps) | memory()
         self.clock, self.since, self.flops = now, step, flops
         return scalars
+
+
+@jax.jit
+def _stacked(values: tuple[Float[Array, ""], ...]) -> Float[Array, " n"]:
+    """Return a step's metrics in one array, in float32."""
+    return jnp.stack([jnp.asarray(v, jnp.float32) for v in values])
+
+
+def _per_step(timers: Mapping[str, float], steps: int) -> dict[str, float]:
+    """Return the host's milliseconds a step in each part of the loop, of `timers`'
+    seconds over `steps`; the seconds compiling as they are."""
+    out = {
+        f"time/{k}_ms": 1000 * s / steps for k, s in timers.items() if k != "compile"
+    }
+    if "compile" in timers:
+        out["time/compile_s"] = timers["compile"]
+    return out
+
+
+def memory() -> dict[str, float]:
+    """Return the memory in use on the process's device that holds most, and the most
+    it has held, in GiB: ``mem/gib`` and ``mem/peak_gib``; none where the devices do
+    not say, as a CPU's."""
+    stats = [s for d in jax.local_devices() if (s := d.memory_stats())]
+    if not stats:
+        return {}
+    most = max(stats, key=lambda s: s.get("bytes_in_use", 0))
+    out = {"mem/gib": most.get("bytes_in_use", 0) / 2**30}
+    if "peak_bytes_in_use" in most:
+        out["mem/peak_gib"] = most["peak_bytes_in_use"] / 2**30
+    return out
 
 
 class Eval(Hook):

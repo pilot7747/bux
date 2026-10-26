@@ -212,17 +212,17 @@ weighs no more than a row of one long one.
 ```console
 $ bux train mine/chat.bux
 remat=auto: none in 1s (none 0.5 GiB in 0s)
-chat step 25/200  loss 2.8811  lr 2.99e-03  grad 0.936  6,491 tok/s
-chat step 50/200  loss 2.2371  lr 2.82e-03  grad 0.678  7,843 tok/s
-chat step 50/200  eval loss 2.2141
-chat step 75/200  loss 2.1074  lr 2.42e-03  grad 0.547  8,470 tok/s
-chat step 100/200  loss 2.0963  lr 1.88e-03  grad 0.604  8,024 tok/s
+chat step  25/200  loss 2.8811  lr 2.99e-03  grad 0.936  6,491 tok/s  ...
+chat step  50/200  loss 2.2371  lr 2.82e-03  grad 0.678  7,843 tok/s  ...
+chat step  50/200  eval loss 2.2141
+chat step  75/200  loss 2.1074  lr 2.42e-03  grad 0.547  8,470 tok/s  ...
+chat step 100/200  loss 2.0963  lr 1.88e-03  grad 0.604  8,024 tok/s  ...
 chat step 100/200  eval loss 2.1153
-chat step 125/200  loss 2.0944  lr 1.30e-03  grad 0.570  8,419 tok/s
-chat step 150/200  loss 2.0535  lr 7.82e-04  grad 0.597  8,075 tok/s
+chat step 125/200  loss 2.0944  lr 1.30e-03  grad 0.570  8,419 tok/s  ...
+chat step 150/200  loss 2.0535  lr 7.82e-04  grad 0.597  8,075 tok/s  ...
 chat step 150/200  eval loss 2.0266
-chat step 175/200  loss 1.9480  lr 4.26e-04  grad 0.586  8,360 tok/s
-chat step 200/200  loss 1.8523  lr 3.00e-04  grad 0.636  8,098 tok/s
+chat step 175/200  loss 1.9480  lr 4.26e-04  grad 0.586  8,360 tok/s  ...
+chat step 200/200  loss 1.8523  lr 3.00e-04  grad 0.636  8,098 tok/s  ...
 chat step 200/200  eval loss 1.8798
 ```
 

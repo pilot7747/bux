@@ -14,7 +14,8 @@
   (`bux.architecture.registry`).
 
 Each residual branch outside any other is rematerialized as the run's
-``methods.remat`` says (`bux.architecture.repeats.remat`).
+``methods.remat`` says (`bux.architecture.repeats.remat`), and observed by its name
+on the steps a run observes (`bux.architecture.observe`).
 """
 
 import functools
@@ -25,7 +26,7 @@ from flax import nnx
 from jaxtyping import Array, Shaped
 
 from bux import parallel
-from bux.architecture import residual
+from bux.architecture import observe, residual
 from bux.architecture.registry import Context, Stream, Taps, build_layer
 from bux.architecture.repeats import remat, tracing
 from bux.lang import ir
@@ -36,30 +37,46 @@ class Sequence(nnx.Module):
     """Run the items one after another: ``f g`` is ``g(f(x))``.
 
     Those that are residual branches outside any other are numbered, for the
-    precision's first and last (`~bux.architecture.repeats.tracing.branch`), and
+    precision's first and last (`~bux.architecture.repeats.tracing.branch`),
     rematerialized as the run's ``methods.remat`` says
-    (`~bux.architecture.repeats.remat.rematted`).
+    (`~bux.architecture.repeats.remat.rematted`), and observed by their names.
 
     Args:
         items: The modules, in the order they run.
         branches: For each item, whether it is a residual branch outside any other;
             none of them, by default.
+        names: For each item, what its metrics are named by
+            (`~bux.architecture.observe.item_name`): a branch's and a layer's, None
+            for an item whose own items are named; none, by default.
     """
 
-    def __init__(self, items: list[nnx.Module], branches: tuple[bool, ...] = ()):
+    def __init__(
+        self,
+        items: list[nnx.Module],
+        branches: tuple[bool, ...] = (),
+        names: tuple[str | None, ...] = (),
+    ):
         self.items = nnx.List(items)
         self.branches = branches or (False,) * len(items)
+        self.names = names or (None,) * len(items)
 
     def __call__(self, x: Stream, taps: Taps) -> Stream:
-        for item, branch in zip(self.items, self.branches, strict=True):
-            x = run_branch(item, x, taps) if branch else item(x, taps)
+        for item, branch, name in zip(
+            self.items, self.branches, self.names, strict=True
+        ):
+            x = run_branch(item, x, taps, name) if branch else item(x, taps)
         return x
 
 
-def run_branch(item: nnx.Module, x: Stream, taps: Taps) -> Stream:
-    """Run a residual branch outside any other: numbered, and rematerialized."""
-    with tracing.branch():
-        return remat.rematted(item, x, taps)
+def run_branch(
+    item: nnx.Module, x: Stream, taps: Taps, name: str | None = None
+) -> Stream:
+    """Run a residual branch outside any other: numbered, rematerialized, and
+    observed as `name` (`bux.architecture.observe.stream`)."""
+    with tracing.branch(), observe.branch(name):
+        y = remat.rematted(item, x, taps)
+        observe.stream(taps, x, y)
+    return y
 
 
 class ResidualBranch(nnx.Module):
@@ -163,7 +180,7 @@ def _build(node: ir.Node, ctx: Context) -> nnx.Module:
             return build_layer(node, ctx)
         case ir.Seq(items=items):
             built = [build_node(item, ctx) for item in items]
-            return Sequence(built, branches(items, ctx))
+            return Sequence(built, branches(items, ctx), names(items, ctx))
         case ir.Residual(body=body):
             return _residual(body, ctx)
         case ir.Sum(terms=terms):
@@ -200,3 +217,10 @@ def _residual(body: ir.Node, ctx: Context) -> nnx.Module:
 def branches(nodes: tuple[ir.Node, ...], ctx: Context) -> tuple[bool, ...]:
     """Return which of `nodes`, in a row, are residual branches outside any other."""
     return tuple(isinstance(n, ir.Residual) and ctx.depth == 0 for n in nodes)
+
+
+def names(nodes: tuple[ir.Node, ...], ctx: Context) -> tuple[str | None, ...]:
+    """Return what the metrics of each of `nodes`, in a row, are named by
+    (`bux.architecture.observe.item_name`)."""
+    flags = branches(nodes, ctx)
+    return tuple(observe.item_name(n, b) for n, b in zip(nodes, flags, strict=True))

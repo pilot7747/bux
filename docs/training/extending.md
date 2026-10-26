@@ -40,6 +40,7 @@ train(run, hooks=[WeightNorm()])  # metrics.jsonl gets weight_norm every 10 step
 | `Trainer` | {py:mod}`bux.train.trainer` | the model, its optimizer and objective; the compiled steps | override {py:meth}`~bux.train.trainer.Trainer.train_step` |
 | hooks | {py:mod}`bux.train.hooks` | what happens every `every` steps: log, eval, save, profile | `train(run, hooks=[...])` |
 | sinks | {py:mod}`bux.train.sinks` | where what hooks report goes: the console, `metrics.jsonl` | `train(run, sinks=[...])` |
+| trackers | {py:mod}`bux.train.trackers` | the sinks `log.trackers` names: W&B, TensorBoard | register a builder in {py:data}`~bux.train.trackers.trackers` |
 
 ## Registries
 
@@ -71,6 +72,7 @@ def _(c, multiplier, model):  # its config, the schedule's multiplier, the model
 | {py:data}`bux.train.optim.schedules` | the config, the run's steps | the curve after the warmup, a function of the step |
 | {py:data}`bux.train.optim.ns_coefficients` | the number of Newton-Schulz iterations | an array of `(a, b, c)`, one, or one an iteration |
 | {py:data}`bux.train.data.sources` | the config, the run's settings, the vocabulary's size, the cache, a seed | a {py:class}`~bux.train.data.Source`: `rows(start, n)` of its endless stream |
+| {py:data}`bux.train.trackers.trackers` | the config, the run, its directory, the step it starts at | a {py:class}`~bux.train.sinks.Sink` ([Sinks](#sinks)) |
 | `bux.parallel.methods.loss` | a head's output, its targets, their weights, whether to sum log Z² | the head's `Sums` ([Loss methods](#loss-methods)) |
 | `bux.architecture.precision.matmuls.formats` | `jax.lax.dot_general`'s arguments | the product, in the format ([Precision](precision.md)) |
 
@@ -119,32 +121,59 @@ the step.
 ## Sinks
 
 A {py:class}`~bux.train.sinks.Sink` is where scalars go: the console
-({py:class}`~bux.train.sinks.Console`) and `metrics.jsonl`
-({py:class}`~bux.train.sinks.JSONL`) are sinks, and so is a tracker:
+({py:class}`~bux.train.sinks.Console`), `metrics.jsonl`
+({py:class}`~bux.train.sinks.JSONL`) and the trackers
+({py:class}`~bux.train.trackers.Wandb`, {py:class}`~bux.train.trackers.TensorBoard`)
+are sinks. `write` takes a step's scalars, and `histograms` the histograms of a step
+that observed the model ([Observing a run](observing.md)):
 
 ```python
-import wandb
-
 from bux.train.sinks import Sink
 
 
-class Wandb(Sink):
-    def __init__(self, run):
-        self.run = wandb.init(project="bux", name=run.name, config=run.model_dump())
-
+class Printed(Sink):
     def write(self, step, scalars):
-        self.run.log(scalars, step=step)
+        print(step, scalars.get("loss"))
 
-    def close(self):
-        self.run.finish()
+    def histograms(self, step, histograms):  # by name: shares of log2 |x| bins
+        print(step, sorted(histograms))
 
 
-train(run, hooks=[WeightNorm()], sinks=[Wandb(run)])
+train(run, hooks=[WeightNorm()], sinks=[Printed()])
+```
+
+A tracker that `log.trackers` names is a sink and a builder registered for its config's
+type in {py:data}`~bux.train.trackers.trackers`, with its config, a `type` tag, among
+the `Tracker` types of `bux/train/config.py`:
+
+```python
+from bux.train.trackers import trackers
+
+
+@trackers.register("mlflow")
+def _(c, run, folder, start):  # its config, the run, its directory, the first step
+    return MLflow(c, run)
 ```
 
 In a job of many processes every process computes all scalars, and only the first
 writes them. A sink of your own that writes checks
 {py:func}`~bux.train.sinks.is_main_process`.
+
+## Timers
+
+`trainer.timers` keeps the seconds the host spends in each part of the loop, by name,
+which the log reports a step as `time/<name>_ms` ([Observing a run](observing.md#what-every-log-has)).
+The loop counts `data`, `launch`, `compile`, `wait` and `hooks`; a hook of your own
+counts its own:
+
+```python
+class Slow(Hook):
+    every = 10
+
+    def __call__(self, trainer, metrics):
+        with trainer.timers("slow"):  # the log's time/slow_ms
+            sum(range(10**6))
+```
 
 ## A Trainer in a script
 
@@ -172,8 +201,8 @@ trainer.fit(
 ```
 
 ```text
-mine step 10/20  loss 6.6509  lr 1.00e-03  grad 1.681  12,024 tok/s
-mine step 20/20  loss 6.6194  lr 1.00e-03  grad 1.573  108,656 tok/s
+mine step 10/20  loss 6.6509  lr 1.00e-03  grad 1.681  12,024 tok/s  ...
+mine step 20/20  loss 6.6194  lr 1.00e-03  grad 1.573  108,656 tok/s  ...
 ```
 
 {py:meth}`~bux.train.trainer.Trainer.fit` trains to step `steps`, or until
@@ -280,6 +309,23 @@ over the layers that report the name, under that name. An MoE's `balance_loss` a
 sparse attention indexer's `indexer_loss` are reported so. Eval leaves them out, and a
 name that is also a term of the objective is an error. How to write a layer is in
 [Adding a layer](../architectures/adding-a-layer.md).
+
+## Observing from a layer
+
+A layer observes a value of its forward for the steps a run observes, in one line,
+{py:func}`bux.architecture.observe.stat`:
+
+```python
+from bux.architecture import observe
+
+observe.stat(taps, "mine/gate_mean", gate.mean())
+```
+
+It does nothing on the other steps, which then hold no code of it; on those that
+observe, it is logged by layer, `mine/gate_mean/attn.03`, with no gradient and no
+weight in the loss. An MoE's `router/*` and an attention's `attn/*` are observed so
+([Observing a run](observing.md)). A value leaves the forward as a reported loss of
+weight 0 does, so it gets out of scans, remat and pipelines as losses do.
 
 ## Overriding a step
 

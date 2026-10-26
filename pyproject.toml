@@ -24,6 +24,7 @@ dev = [
     "pygls>=2.1.1",
     "pytest>=9.1.1",
     "ruff>=0.17.1",
+    "tensorboardx>=2.6",
     "ty>=0.0.89",
 ]
 docs = [
@@ -49,6 +50,12 @@ lsp = [
 spark = [
     "pandas>=2.2,<3",
     "pyspark>=4.2",
+]
+wandb = [
+    "wandb>=0.22",
+]
+tensorboard = [
+    "tensorboardx>=2.6",
 ]
 
 [tool.uv]

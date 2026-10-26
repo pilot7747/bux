@@ -160,11 +160,11 @@ print({name: round(value, 4) for name, value in latest.items()})
 ```console
 $ uv run python custom.py
 remat=auto: none in 1s (none 0.5 GiB in 1s)
-stories step 25/200  loss 1.4690  lr 3.00e-03  grad 1.233  5,721 tok/s
-stories step 50/200  loss 0.7764  lr 3.00e-03  grad 0.465  7,015 tok/s
-stories step 50/200  eval loss 0.7585
+stories step  25/200  loss 1.4690  lr 3.00e-03  grad 1.233  5,721 tok/s  ...
+stories step  50/200  loss 0.7764  lr 3.00e-03  grad 0.465  7,015 tok/s  ...
+stories step  50/200  eval loss 0.7585
 ...
-stories step 200/200  loss 0.7185  lr 0.00e+00  grad 0.292  7,746 tok/s
+stories step 200/200  loss 0.7185  lr 0.00e+00  grad 0.292  7,746 tok/s  ...
 stories step 200/200  eval loss 0.7300
 {'grad_norm': 0.2923, 'loss': 0.7185, 'lr': 0.0, 'tokens': 204800, 'tokens_per_s': 7746.2419, 'eval_loss': 0.73, 'weight_norm': 300.4004}
 $ grep weight_norm metrics.csv
@@ -223,10 +223,10 @@ print("held-out loss", trainer.evaluate(next(held_out) for _ in range(4)))
 
 ```console
 $ uv run python loop.py
-mine step 25/100  loss 3.1889  lr 1.00e-03  grad 1.401  6,732 tok/s  l2 3.0
-mine step 50/100  loss 1.1689  lr 1.00e-03  grad 0.742  8,144 tok/s  l2 7.9
-mine step 75/100  loss 0.8195  lr 1.00e-03  grad 0.422  8,221 tok/s  l2 10.3
-mine step 100/100  loss 0.7810  lr 1.00e-03  grad 0.514  7,406 tok/s  l2 11.1
+mine step  25/100  loss 3.1889  lr 1.00e-03  grad 1.401  6,732 tok/s  l2 3.0  ...
+mine step  50/100  loss 1.1689  lr 1.00e-03  grad 0.742  8,144 tok/s  l2 7.9  ...
+mine step  75/100  loss 0.8195  lr 1.00e-03  grad 0.422  8,221 tok/s  l2 10.3  ...
+mine step 100/100  loss 0.7810  lr 1.00e-03  grad 0.514  7,406 tok/s  l2 11.1  ...
 held-out loss 0.7751138806343079
 ```
 

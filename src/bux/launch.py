@@ -91,7 +91,8 @@ def status(folder: Path) -> dict[str, Any]:
 
     Its fields: ``state`` (``running``, ``done``, ``failed`` or ``stopped``),
     ``host``, ``pid``, ``gpus``, ``started`` and ``ended`` (UTC, ISO 8601),
-    ``error``, ``step`` and the latest ``metrics``.
+    ``error``, ``step`` and the latest ``metrics``, but those of a layer
+    (``act/rms/attn.03``), which metrics.jsonl keeps.
     """
     path = folder / "status.json"
     return json.loads(path.read_text(encoding="utf-8")) if path.exists() else {}
@@ -322,8 +323,8 @@ def train_here(
     fields: dict[str, Any] = {"state": state, "ended": _now(), "error": error}
     if stop.trainer is not None:
         fields["step"] = stop.trainer.step
-    if latest.metrics:
-        fields["metrics"] = latest.metrics
+    if metrics := {k: v for k, v in latest.metrics.items() if k.count("/") < 2}:
+        fields["metrics"] = metrics
     record(folder, **fields)
     echo(f"{run.name}: {message}")
     return code

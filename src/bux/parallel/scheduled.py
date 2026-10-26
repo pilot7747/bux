@@ -33,6 +33,7 @@ from jax.sharding import PartitionSpec as P
 from jaxtyping import Array, Float, Int, PyTree, Shaped
 
 from bux import jax_internals
+from bux.architecture import observe
 from bux.parallel import gather, methods, pipeline, schedule, split
 from bux.parallel.pipeline import (
     AXIS,
@@ -67,12 +68,16 @@ class Parts(NamedTuple):
 
     `others` are the parameters outside the repeat and `kept` the rest of their state,
     which `first` may change, as dropout counts its masks. `reports` gives the names
-    and weights of the losses the stage's layers report, once `stage` has traced."""
+    and weights of the losses the stage's layers report, once `stage` has traced;
+    `observed`, given the values the repeat's layers observed, a pass's slot of every
+    stage a row, and their names, those values by their metrics' names
+    (``bux.architecture.observe``)."""
 
     first: Callable[[PyTree, PyTree, PyTree], tuple[Stream, PyTree]]
     stage: Stage
     last: Callable[[PyTree, PyTree, PyTree, Stream], tuple[Float[Array, ""], Metrics]]
     reports: Callable[[], list[tuple[str, float]]]
+    observed: Callable[[Float[Array, "n k"], list[str]], Metrics] | None = None
 
 
 class Gradients(NamedTuple):
@@ -547,6 +552,7 @@ class Ticks:
         d_others = jax.lax.psum(held.d_others, AXIS)
         metrics = jax.lax.psum(held.metrics, AXIS)
         reported = jax.lax.psum(self._reported(held.losses), AXIS)
+        reported |= self._observed(held.losses)
         d_params = held.d_params
         if self.apart:
             summed = jax.lax.psum((d_params, d_others, metrics), self.apart)
@@ -558,12 +564,26 @@ class Ticks:
 
     def _reported(self, losses: Losses) -> Metrics:
         """Return the means over microbatches of the losses this stage's layers
-        report, each name's summed over its layers."""
+        report, each name's summed over its layers. What they observe is left out:
+        `_observed` names them."""
         means: Metrics = {}
         for i, (name, _) in enumerate(self.parts.reports()):
+            if observe.is_observed(name):
+                continue
             total = losses[:, i].sum() / self.table.microbatches
             means[name] = means.get(name, jnp.zeros((), jnp.float32)) + total
         return means
+
+    def _observed(self, losses: Losses) -> Metrics:
+        """Return the means over microbatches of what the repeat's layers observed,
+        every stage's, by their metrics' names (``Parts.observed``)."""
+        reports = self.parts.reports()
+        at = [i for i, (name, _) in enumerate(reports) if observe.is_observed(name)]
+        if not at or self.parts.observed is None:
+            return {}
+        mine = losses[:, np.asarray(at)] / self.table.microbatches
+        every = jax.lax.all_gather(mine, AXIS).reshape(-1, len(at))
+        return self.parts.observed(every, [reports[i][0] for i in at])
 
 
 def _unchanged(held: Held, *_: object) -> Held:

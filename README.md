@@ -58,6 +58,18 @@ entrypoint for production: it trains each run of a sweep on its own GPUs, record
 every run went, stops at SIGTERM with a checkpoint, and, launched again, trains only
 what is left. See the [training guide](docs/training/index.md).
 
+A run logs each head's loss, its throughput and MFU, where a step's time goes and the
+device's memory, to the console (plain lines that `kubectl logs` reads), to
+`metrics.jsonl`, and to W&B or TensorBoard. `observe = observe(every=100)` adds the
+model by layer: the residual stream, attention logits, MoE routing, and each layer's
+gradient, weights and update, on those steps alone
+([Observing a run](docs/training/observing.md)):
+
+```
+log     = log(every=10, trackers=[wandb(project="ablations"), tensorboard])
+observe = observe(every=100, histograms=true)
+```
+
 ## Data
 
 Documents, raw text or chat conversations in the OpenAI format, are Parquet files.
@@ -119,7 +131,8 @@ docker run --rm -it --entrypoint bash bux    # a shell, or --entrypoint bux for 
 
 The image has TransformerEngine's JAX bindings, for its expert-parallel dispatch and
 combine ([NCCL EP](docs/parallelism/experts.md#transformerengines-nccl-ep)); `--build-arg TE_VERSION=...`
-picks another release.
+picks another release. It has W&B and TensorBoard for `log.trackers`: pass
+`-e WANDB_API_KEY` to log to W&B.
 
 To publish it to `ghcr.io/pilot7747/bux` for amd64 and arm64, run the Docker workflow from
 the Actions tab or with `gh workflow run docker.yml` (add `-f tag=v0.1.0` for an extra tag).

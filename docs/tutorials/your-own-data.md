@@ -210,17 +210,17 @@ sees the one packed before it.
 ```console
 $ bux train mine/stories.bux
 remat=auto: none in 1s (none 0.5 GiB in 0s)
-stories step 25/200  loss 1.6177  lr 3.00e-03  grad 1.168  6,423 tok/s
-stories step 50/200  loss 0.8029  lr 3.00e-03  grad 0.606  7,615 tok/s
-stories step 50/200  eval loss 0.7767
-stories step 75/200  loss 0.7538  lr 3.00e-03  grad 0.349  8,194 tok/s
-stories step 100/200  loss 0.7697  lr 3.00e-03  grad 0.516  7,836 tok/s
+stories step  25/200  loss 1.6177  lr 3.00e-03  grad 1.168  6,423 tok/s  ...
+stories step  50/200  loss 0.8029  lr 3.00e-03  grad 0.606  7,615 tok/s  ...
+stories step  50/200  eval loss 0.7767
+stories step  75/200  loss 0.7538  lr 3.00e-03  grad 0.349  8,194 tok/s  ...
+stories step 100/200  loss 0.7697  lr 3.00e-03  grad 0.516  7,836 tok/s  ...
 stories step 100/200  eval loss 0.7449
-stories step 125/200  loss 0.7407  lr 3.00e-03  grad 0.367  8,417 tok/s
-stories step 150/200  loss 0.7477  lr 3.00e-03  grad 0.317  7,944 tok/s
+stories step 125/200  loss 0.7407  lr 3.00e-03  grad 0.367  8,417 tok/s  ...
+stories step 150/200  loss 0.7477  lr 3.00e-03  grad 0.317  7,944 tok/s  ...
 stories step 150/200  eval loss 0.7410
-stories step 175/200  loss 0.7432  lr 1.88e-03  grad 0.365  8,305 tok/s
-stories step 200/200  loss 0.7189  lr 0.00e+00  grad 0.261  7,976 tok/s
+stories step 175/200  loss 0.7432  lr 1.88e-03  grad 0.365  8,305 tok/s  ...
+stories step 200/200  loss 0.7189  lr 0.00e+00  grad 0.261  7,976 tok/s  ...
 stories step 200/200  eval loss 0.7292
 ```
 
@@ -323,11 +323,11 @@ eval  = eval(data=stories(split=[0.95, 1]), every=50, batches=4)
 $ bux train mine/mixed.bux
 text-9fab7efe63: 3,000 documents, 21,000 tokens -> 167 rows of 128, 98.2% filled, 84.2% targets, 0 tokens cut (0.5s)
 remat=auto: none in 1s (none 0.5 GiB in 0s)
-mixed step 25/200  loss 2.0186  lr 3.00e-03  grad 1.066  6,204 tok/s
-mixed step 50/200  loss 1.0552  lr 3.00e-03  grad 0.479  7,192 tok/s
-mixed step 50/200  eval loss 0.7869
+mixed step  25/200  loss 2.0186  lr 3.00e-03  grad 1.066  6,204 tok/s  ...
+mixed step  50/200  loss 1.0552  lr 3.00e-03  grad 0.479  7,192 tok/s  ...
+mixed step  50/200  eval loss 0.7869
 ...
-mixed step 200/200  loss 0.9300  lr 0.00e+00  grad 0.254  7,976 tok/s
+mixed step 200/200  loss 0.9300  lr 0.00e+00  grad 0.254  7,976 tok/s  ...
 mixed step 200/200  eval loss 0.7337
 ```
 

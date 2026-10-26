@@ -27,6 +27,7 @@ from jaxtyping import Array, Bool, Float, Int
 
 from bux import config as cfg
 from bux import parallel
+from bux.architecture import observe
 from bux.architecture.attention import sparse
 from bux.architecture.attention.indexer import Indexer, Scored, Target, from_stream
 from bux.architecture.attention.norm_rope import norm_and_rotate
@@ -55,6 +56,7 @@ from bux.lang import ir
 from bux.parallel.context import (
     AttentionArgs,
     causal_mask,
+    causal_mask_at,
     masked_softmax,
     scaled_logits,
     softcap,
@@ -64,6 +66,7 @@ from bux.train import flops
 
 Names = tuple[parallel.Name, parallel.Name]  # a projection's input and output
 SoftmaxConfig = cfg.GQAConfig | cfg.MLAConfig | cfg.CSAConfig
+SAMPLED = 16  # the queries of a row whose logits a step that observes looks at
 
 
 class SoftmaxAttention(nnx.Module):
@@ -169,6 +172,43 @@ class SoftmaxAttention(nnx.Module):
 
     def _sinks(self) -> Float[Array, " h"] | None:
         return None if self.sinks is None else self.sinks[...]
+
+    def _observe(
+        self,
+        q: Float[Array, "b t h dk"],
+        k: Float[Array, "b s g dk"],
+        docs: Segments | None,
+        taps: Taps,
+    ) -> None:
+        """Observe the logits of `SAMPLED` queries a row, the last of each stretch
+        of t / SAMPLED, on the steps a run observes (`bux.architecture.observe`):
+
+        - ``attn/logit_max``: the largest logit of a key a query sees, softcapped;
+        - ``attn/entropy``: the mean entropy of a query's softmax over that of a
+          uniform one over the keys it sees: 1 uniform, 0 on one key (entropy
+          collapse).
+
+        They leave out a relative bias and a length scale, and are not taken under
+        context parallelism, whose keys the sample would gather.
+        """
+        on = parallel.active()
+        if not observe.observing(taps) or (on is not None and on.size("context") > 1):
+            return
+        t, s = q.shape[1], k.shape[1]
+        n = min(SAMPLED, t)
+        at = jnp.arange(n) * (t // n) + t // n - 1
+        ids = None if docs is None else (docs.ids[:, at], docs.ids)
+        mask = causal_mask_at(self.window, at, jnp.arange(s), ids)
+        mask = mask if mask.ndim == 2 else mask[:, None]  # b 1 n s, as the logits
+        logits = softcap(scaled_logits(q[:, at], k, self.scale), self.softcap)
+        probs = masked_softmax(logits, mask, self._sinks())
+        seen = jnp.broadcast_to(mask, logits.shape).sum(-1)
+        entropy = -jnp.sum(probs * jnp.log(jnp.maximum(probs, 1e-30)), -1)
+        many = seen > 1
+        uniform = jnp.log(jnp.maximum(seen, 2).astype(jnp.float32))
+        share = jnp.where(many, entropy / uniform, 0).sum() / jnp.maximum(many.sum(), 1)
+        observe.stat(taps, "attn/logit_max", jnp.where(mask, logits, -jnp.inf).max())
+        observe.stat(taps, "attn/entropy", share)
 
     def _output(
         self, x: Float[Array, "b t d"], out: Float[Array, "b t h dv"]
@@ -301,6 +341,7 @@ class Attention(SoftmaxAttention):
         docs = segments(taps)
         x, projected = self._projections(x)
         q, k, v = self._heads(projected, docs, taps)
+        self._observe(q, k, docs, taps)
         return self._output(x, self._attend(x, q, k, v, docs))
 
     def _heads(
