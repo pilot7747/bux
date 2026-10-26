@@ -11,7 +11,7 @@ from bux.architecture import Model
 from bux.architecture.layers.engram import Engram
 from bux.architecture.layers.mlp import MLP
 from bux.export import check
-from bux.export.huggingface import cache_types
+from bux.export.huggingface import cache_layers
 from bux.export.plan import engram_hashes, plan
 from bux.export.weights import module_at
 from bux.lang import compile, ir
@@ -243,7 +243,7 @@ def test_generating_skips_multi_token_prediction() -> None:
     assert p.stop() is not None
     attention = [c for c in p.calls if c.layer.config.type == "gqa"]
     assert len(attention) == 4
-    assert cache_types(p) == ["full_attention"] * 2
+    assert [kind for kind, _ in cache_layers(p)] == ["full_attention"] * 2
 
 
 def test_algebra_branches_hold_their_parameters() -> None:
