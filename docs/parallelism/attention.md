@@ -202,6 +202,10 @@ Sparse attention (an indexer's top-k, CSA's compressed latents) attends by
   at a time.
 - Either way it is a `shard_map` that gives a device its rows, queries and heads, and
   every key: all-gather CP.
+- CSA's latents, 512 wide, run by cuDNN's DSA kernels on a B200 or B300 in the same
+  `shard_map` (`bux.architecture.attention.sparse_cudnn`), a device's heads 64 a call.
+  The indexer's target at its picks takes every head: under tensor parallelism it
+  runs by XLA.
 
 The indexer's loss takes the attention's probabilities once, from its logsumexp, a
 chunk of queries at a time (on a GPU by a kernel for heads of up to 128 dims). It

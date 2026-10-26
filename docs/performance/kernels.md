@@ -49,6 +49,7 @@ The speedups are against XLA's own program for the same computation, on a B300.
 | softmax attention | `methods.attention = auto`, the default: cuDNN's causal kernels in rows of one document, cuDNN's fused attention in rows of 8192 or more and with a window, else tokamax's flash attention (sinks, a soft cap) | 7x, and no t × t logits |
 | QK-norm then RoPE | `norm_rope`: a Pallas kernel a pass, forward and backward, for an RMSNorm with a scale and RoPE by halves (Qwen3's, OLMo 2's) | 1.4x forward, 1.9x backward (Qwen3-30B-A3B's queries in megatron.bux's step: 0.12 and 0.24 ms a layer) |
 | sparse attention (DSA, QSA, CSA) | `sparse`: tokamax's flash attention with the kept keys as a mask; the indexer's scores, its loss's picks and target by Pallas kernels (`scoring`), its top-k by counting | 2.6x a chunk of queries at a time, and no t × t floats |
+| CSA's attention (DeepSeek-V4) | `sparse_cudnn`: cuDNN's DSA kernels (CuTe DSL), each query's window and kept latents and the sinks in one softmax, forward and backward; the indexer's target at its picks | 15x at 4k tokens, 55x at 16k, forward and backward; the target 6x and 31x |
 | linear attention, RWKV-7 | `chunkwise`: chunks of 64 positions, the state across them by a Pallas kernel (`affine_scan`); `methods(states=recompute)` keeps a fourteenth of the memory for the backward | 14-17x a scan over positions |
 | Mamba-2 | `chunkwise`, B and C a group's, the state across chunks by a matmul; `methods(states=recompute)` keeps a sixteenth of the memory for the backward | 25x a scan over positions (2 × 4096 tokens, rematerialized: at 8 × 4096 the scan needs 199 GiB) |
 | Gated DeltaNet, DeltaNet | cuDNN's fused GDN kernel (`fused_delta`), by cuDNN's graph from a `buffer_callback`: any gate | 5x `chunkwise` |
@@ -68,6 +69,7 @@ Where they live:
 | flash attention, cuDNN's and tokamax's | {py:mod}`bux.parallel.flash` |
 | `norm_rope` | {py:mod}`bux.architecture.attention.norm_rope` |
 | `sparse`, `scoring` | {py:mod}`bux.architecture.attention.sparse`, {py:mod}`bux.architecture.attention.scoring` |
+| `sparse_cudnn` | {py:mod}`bux.architecture.attention.sparse_cudnn` |
 | `chunkwise`, `affine_scan` | {py:mod}`bux.architecture.recurrent.chunkwise`, {py:mod}`bux.architecture.recurrent.affine_scan` |
 | `fused_delta`, `pallas_delta` | {py:mod}`bux.architecture.recurrent.fused_delta`, {py:mod}`bux.architecture.recurrent.pallas_delta` |
 | `grouped`, `grouped_mxfp8`, `grouped_glu` | {py:mod}`bux.architecture.experts.grouped`, {py:mod}`bux.architecture.experts.grouped_mxfp8`, {py:mod}`bux.architecture.experts.grouped_glu` |
@@ -93,6 +95,7 @@ by XLA instead, with the same values up to rounding. Outside a GPU, and inside
 | `affine_scan` | a state of k × v with k a power of two of 16 or more, and v a multiple of 32 | a scan over the chunks by XLA |
 | `grouped.ragged_dot` | tokamax installed | `jax.lax.ragged_dot` |
 | `grouped_mxfp8` | a Blackwell GPU (compute capability 10 or more); the experts' role in `mxfp8` or `mxfp8_2d` | XLA dequantizes and multiplies |
+| `sparse_cudnn` | a B200 or B300 (SM 10.0, 10.3) with cudnn-frontend; `methods.attention = auto`; a CSA layer, its latents 512 wide; bfloat16 or float16; no soft cap; a window (`sliding_window_size`) and latents kept by an indexer one by one (not `block_size > 1`); 2^16 queries a device at most. Any heads: 64 a call, the last padded. The indexer's target: bfloat16, its heads not split over devices, 128 at most | `sparse`; a window-only layer, `methods.attention` |
 | `grouped_glu` | a Blackwell GPU with cudnn-frontend; a SwiGLU FFN (`gated_mlp` of `swish`, no `limit`, `up_softcap`, `up_offset`, `bias` or `expert_norm`); `mxfp8` in every pass; widths in whole tiles of 256 (Qwen3-30B-A3B's 2048 and 768, not the baseline's 704) | `grouped_mxfp8` |
 | `blockscaled`'s and `nvfp4`'s quantizers | a GPU | XLA quantizes |
 | the block-scaled GEMMs (cuDNN's, `__cudnn$blockScaledDot`) | a Blackwell GPU | XLA dequantizes and multiplies, which computes the same values |
@@ -222,6 +225,37 @@ before; at 16k, 10.2k against 8.65k. MLA keeps its latents for `save_qkv_attenti
 not the heads' projections up from them: at 8 rows of 4096, 34.1k in 41.2 GiB, against
 30.1k in 51.5 before.
 ::::
+
+### CSA by cuDNN's DSA kernels
+
+DeepSeek-V4.1-Flash's CSA attention on one B300, forward and backward: 64 heads of a
+512-wide latent, each query's window of 128 latents and its top 512 compressed ones (a
+latent every two tokens), and sinks, on rows of a dozen documents. Before, XLA's chunks
+of queries (`sparse`), which compute every slot of a row; now cuDNN's kernels, which
+gather the 640 a query sees. And the indexer's target, by XLA at every latent before,
+at the picks now:
+
+| tokens | attention before | now | target before | now |
+|--------|------------------|-----|---------------|-----|
+| 4096   | 35.4 ms | 2.44 ms (15x) | 4.18 ms | 0.72 ms (6x) |
+| 16384  | 543 ms  | 9.86 ms (55x) | 51.7 ms | 1.68 ms (31x) |
+| 32768  |         | 15.8 ms       |         | 2.48 ms |
+
+NVIDIA's own times of the two kernels alone on a GB300 are 1.82, 7.05 and 14.2 ms
+(cudnn-frontend's `benchmark/dsa`).
+
+A whole layer, d_model 5120, forward and backward in bfloat16 with its compression,
+indexer and the indexer's loss (V4.1's `pairs`), and a window-only one:
+
+| tokens | `pairs` before | now | window-only before | now |
+|--------|----------------|-----|--------------------|-----|
+| 4 × 4096 | 166 ms, 15.6 GiB  | 24.7 ms, 4.4 GiB | does not compile | 12.7 ms, 4.2 GiB |
+| 16384    | 613 ms, 8.1 GiB   | 35.3 ms, 4.4 GiB | does not compile | 12.5 ms |
+| 32768    | 2408 ms, 15.4 GiB | 100 ms, 8.8 GiB  | does not compile | 24.8 ms |
+
+Before, a window-only layer went to tokamax's flash kernels, which find no tile that fits
+shared memory at 512 dims. At 32k a `pairs` layer's 100 ms are mostly its indexer's: the
+attention and the target take 18.
 
 (kernels-matmul-formats)=
 

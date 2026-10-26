@@ -413,7 +413,7 @@ class Indexer(nnx.Module):
         return Kept(index), pool, Scored(x, query, pos, keys, index)
 
     def loss(
-        self, scored: Scored, target: Target, xs: Any, width: int
+        self, scored: Scored, target: Target, xs: Any, width: int, picks: bool = False
     ) -> Float[Array, ""]:
         """Return the indexer's loss: ``KL(p || softmax(I))`` over what it kept,
         averaged over the queries (DeepSeek-V3.2, eq. 4).
@@ -431,6 +431,8 @@ class Indexer(nnx.Module):
                 queries.
             width: the elements a query makes of `target`'s output, which sets the
                 chunks.
+            picks: whether `target` gives the attention to each query's kept keys,
+                in their order, rather than to every key (CSA's, by cuDNN's kernel).
 
         Returns:
             The loss, a scalar, which trains only the indexer's parameters.
@@ -439,6 +441,8 @@ class Indexer(nnx.Module):
         def kept_target(both: tuple) -> Float[Array, "b c k"]:
             (*_, kept), xs = both
             p = target(xs).astype(jnp.float32)
+            if picks:
+                return p
             if scored.block is not None:
                 p = _per_block(p, scored.block, "max")
             return jnp.take_along_axis(p, jnp.maximum(kept, 0), axis=-1)
