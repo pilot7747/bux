@@ -59,7 +59,7 @@ from collections import Counter
 from collections.abc import Callable, Generator, Mapping, Sequence
 from pathlib import Path
 from types import FrameType
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 import jax
 import jax.numpy as jnp
@@ -72,11 +72,16 @@ from bux import parallel
 from bux.data.pipeline import DEFAULT_CACHE, jobs, prepare
 from bux.lang import ir
 from bux.runtime import agree_on_cache, configure
+from bux.train import config as tcfg
 from bux.train import profilers
 from bux.train.config import MeshConfig, evals
 from bux.train.hooks import Hook, Metrics
 from bux.train.sinks import LatestMetrics, is_main_process
 from bux.train.trainer import Trainer, directory, train
+
+if TYPE_CHECKING:
+    from bux.lang.compiler import Space
+    from bux.search.search import Searches
 
 #: The signals that stop training after the current step.
 SIGNALS = (signal.SIGTERM, signal.SIGINT)
@@ -375,6 +380,37 @@ def fit[S](needs: Sequence[int], free: Sequence[S]) -> tuple[int, list[S]] | Non
     return None
 
 
+class Queue:
+    """The runs that `supervise` trains: the first pending one that fits in the free
+    GPUs starts first (`fit`). A search's (`bux.search.search.Searches`) proposes
+    each run as it can start, from how the others went.
+
+    Args:
+        runs: The runs, in order.
+    """
+
+    def __init__(self, runs: Sequence[ir.Run]):
+        self.pending = list(runs)
+
+    def take[S](
+        self, free: Sequence[S], needs: Callable[[ir.Run], int]
+    ) -> tuple[ir.Run, list[S]] | None:
+        """Return the next run to start on some of the `free` GPUs, and the group it
+        gets; None if none can start now.
+
+        Args:
+            free: The free GPUs, or a slot for the default device.
+            needs: How many of them a run needs.
+        """
+        if (found := fit([needs(run) for run in self.pending], free)) is None:
+            return None
+        i, group = found
+        return self.pending.pop(i), group
+
+    def ended(self, run: ir.Run) -> None:
+        """Take note that the worker of `run` ended, as its status.json says."""
+
+
 def _spawn(
     run: ir.Run, out: str | Path, cache: str | Path, gpus: list[str]
 ) -> subprocess.Popen[str]:
@@ -424,7 +460,7 @@ def _ended(
 
 
 def supervise(
-    runs: Sequence[ir.Run],
+    runs: Sequence[ir.Run] | Queue,
     out: str | Path,
     cache: str | Path,
     gpus: Sequence[str],
@@ -434,14 +470,14 @@ def supervise(
     """Train `runs` in workers and return the exit code.
 
     Each worker gets a group of free `gpus`, as many as its mesh needs, and the first
-    pending run that fits starts first. Without GPUs, runs train one at a time on the
-    default device. A worker is ``python -m bux.launch FOLDER CACHE``, which trains
+    pending run that fits starts first, or the one a `Queue` gives next. Without
+    GPUs, runs train one at a time on the default device. A worker is ``python -m bux.launch FOLDER CACHE``, which trains
     the run.json written in its run's directory, with ``CUDA_VISIBLE_DEVICES`` set to
     its group; its output goes to `echo` and to the run's train.log. SIGTERM and
     SIGINT are passed on to every worker, and no new one starts after them.
 
     Args:
-        runs: The runs to train.
+        runs: The runs to train, or a queue of them, which hears of each end.
         out: Where run directories go.
         cache: Where prepared datasets are.
         gpus: The GPUs to share out, as ``CUDA_VISIBLE_DEVICES`` names them.
@@ -452,8 +488,12 @@ def supervise(
         signal stopped them.
     """
     slots: list[str | None] = [*gpus] or [None]  # None: the default device
-    needs = [need(r.train.mesh, len(gpus), alone=False) if gpus else 1 for r in runs]
-    pending, free = list(zip(runs, needs)), list(slots)
+    todo = runs if isinstance(runs, Queue) else Queue(runs)
+
+    def needs(run: ir.Run) -> int:
+        return need(run.train.mesh, len(gpus), alone=False) if gpus else 1
+
+    free = list(slots)
     active: dict[subprocess.Popen[str], tuple[ir.Run, list[str | None]]] = {}
     ended: queue.Queue[subprocess.Popen[str]] = queue.Queue()
     lock = threading.Lock()
@@ -481,10 +521,9 @@ def supervise(
 
     previous = {s: signal.signal(s, forward) for s in SIGNALS}
     try:
-        while pending or active:
-            while not signals and (found := fit([n for _, n in pending], free)):
-                i, group = found
-                run = pending.pop(i)[0]
+        while True:
+            while not signals and (taken := todo.take(free, needs)):
+                run, group = taken
                 free = [s for s in free if s not in group]
                 worker = _spawn(run, out, cache, [g for g in group if g is not None])
                 active[worker] = run, group
@@ -497,7 +536,9 @@ def supervise(
             worker = ended.get()
             run, group = active.pop(worker)
             free = [s for s in slots if s in free or s in group]
-            if message := _ended(run, out, worker.returncode, signals):
+            message = _ended(run, out, worker.returncode, signals)
+            todo.ended(run)
+            if message:
                 failed = True
                 say(message)
     finally:
@@ -508,7 +549,7 @@ def supervise(
 
 def summary(runs: Sequence[ir.Run], out: str | Path) -> str:
     """Return one line per run: its state, its step, and its latest losses, its
-    first eval's too.
+    first eval's too; and where a run sets its ``objective``, every run's.
 
     A sweep's launch ends with it::
 
@@ -518,22 +559,36 @@ def summary(runs: Sequence[ir.Run], out: str | Path) -> str:
         done     3814/3814  3.0836  3.1302     width_sweep[m]
         stopped  2731/3814  3.0412  3.0815     width_sweep[l]
     """
-    rows: list[tuple[str, ...]] = [("state", "step", "loss", "eval loss", "run")]
+    ranked = any(run.train.objective is not None for run in runs)
+    head = ("state", "step", "loss", "eval loss", *(("objective",) if ranked else ()))
+    rows: list[tuple[str, ...]] = [(*head, "run")]
     for run in runs:
-        s = status(directory(run, out))
+        folder = directory(run, out)
+        s = status(folder)
         m = s.get("metrics") or {}
         names = ("loss", f"{_first_eval(run)}_loss")
-        losses = (f"{m[k]:.4f}" if k in m else "-" for k in names)
+        losses = [f"{m[k]:.4f}" if k in m else "-" for k in names]
+        if ranked:
+            losses.append(_objective(run, folder, s.get("state")))
         step = f"{s.get('step', 0)}/{run.train.steps}"
         rows.append((s.get("state", "pending"), step, *losses, run.name))
     states = Counter(row[0] for row in rows[1:])
-    widths = [max(len(row[i]) for row in rows) for i in range(4)]
+    widths = [max(len(row[i]) for row in rows) for i in range(len(head))]
     lines = [
-        "  ".join(c.ljust(w) for c, w in zip(row, widths)) + "  " + row[4]
+        "  ".join(c.ljust(w) for c, w in zip(row, widths)) + "  " + row[-1]
         for row in rows
     ]
     head = ", ".join(f"{n} {state}" for state, n in states.most_common())
     return f"{len(runs)} runs: {head}\n" + "\n".join(lines)
+
+
+def _objective(run: ir.Run, folder: Path, state: str | None) -> str:
+    """Return the objective of a run that is done (`bux.search.search.objective`),
+    as the summary shows it; else "-"."""
+    from bux.search.search import objective
+
+    value = objective(tcfg.objective(run.train), folder) if state == "done" else None
+    return "-" if value is None or math.isnan(value) else f"{value:.4f}"
 
 
 def _first_eval(run: ir.Run) -> str:
@@ -679,6 +734,83 @@ def launch(
     code = supervise(fits, out, cache, available, echo=echo)
     echo(summary(runs, out))
     return code or int(len(fits) < len(todo))
+
+
+def search(
+    spaces: Sequence["Space"],
+    out: str | Path = "runs",
+    *,
+    cache: str | Path = DEFAULT_CACHE,
+    gpus: Sequence[str] | None = None,
+    workers: int | None = None,
+    here: bool = False,
+    echo: Callable[[str], None] = _print,
+) -> int:
+    """Search each of `spaces`, a run of a file and the dimensions of its search, and
+    return the exit code.
+
+    This is ``bux launch`` of a file with dimensions, and with `here`, ``bux
+    train``'s. Each search (`bux.search.search.Search`) proposes its trials as GPUs
+    free up, and the searches take turns; a run without dimensions is a search of
+    one trial, itself. Workers train the trials side by side, each on the GPUs its
+    mesh needs (`supervise`); with `here`, they train in this process, one after
+    another. It ends with each search's table of trials, the best first.
+
+    Args:
+        spaces: The runs of a file with their dimensions, as
+            `bux.lang.compile_spaces` returns them.
+        out: Where run directories go, and the searches' own.
+        cache: Where prepared datasets go.
+        gpus: The GPUs to train on, as ``CUDA_VISIBLE_DEVICES`` names them; None
+            for every visible one (`visible_gpus`).
+        workers: Processes that prepare data: None for one a core.
+        here: Train in this process, as ``bux train`` does.
+        echo: Where progress lines go.
+
+    Returns:
+        0 when the searches are done, 1 if none of their trials has an objective
+        that is a number, and 128 + the signal's number when a signal stopped them.
+    """
+    from bux.search.search import Search, Searches
+
+    if processes() > 1:
+        echo("a search trains many runs, each on one host: launch it on one")
+        return 1
+    available = [] if here else list(visible_gpus() if gpus is None else gpus)
+    runs = [space.run for space in spaces]
+    if not (fits := _fitting(runs, out, available, echo)):
+        return 1
+    if (code := _prepare(fits, cache, workers, echo)) is not None:
+        return code
+    searches = Searches([Search(s, out, echo) for s in spaces if s.run in fits])
+    if here:
+        code = _search_here(searches, out, cache, echo)
+    else:
+        where = f" on GPUs {','.join(available)}" if available else ", one at a time"
+        names = ", ".join(search.space.run.name for search in searches.searches)
+        echo(f"searching {names}{where}")
+        code = supervise(searches, out, cache, available, echo=echo)
+    echo(searches.summary())
+    if code >= 128:
+        return code
+    return int(not any(s.best() for s in searches.searches))
+
+
+def _search_here(
+    searches: "Searches",
+    out: str | Path,
+    cache: str | Path,
+    echo: Callable[[str], None],
+) -> int:
+    """Train the trials of `searches` in this process, one after another; return
+    128 + the signal's number if one stopped them, else 0."""
+    while (taken := searches.take([None], lambda run: 1)) is not None:
+        run, _ = taken
+        code = train_here(run, out, cache, echo=echo)
+        searches.ended(run)
+        if code >= 128:
+            return code
+    return 0
 
 
 if __name__ == "__main__":  # a sweep's worker: python -m bux.launch FOLDER CACHE

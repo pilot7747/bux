@@ -775,7 +775,7 @@ class _Range(Config):
     def _increasing(self) -> "_Range":
         low, high = getattr(self, "low"), getattr(self, "high")  # noqa: B009
         if not low < high:
-            raise ValueError(f"{getattr(self, 'type')}(low, high) needs low < high")
+            raise ValueError("low must be less than high")
         return self
 
 
@@ -886,11 +886,20 @@ class RandomSearch(Config):
     type: Literal["random"] = "random"
 
 
+class HaltonSearch(Config):
+    """Quasi-random search: the points of a scrambled Halton sequence, which cover the
+    space more evenly than random ones, with no clumps and no gaps, however many
+    trials there are, and need nothing of each other's results. What the Deep
+    Learning Tuning Playbook (Godbole et al., 2023) explores a space with, and what
+    `tpe` and `gp` start with."""
+
+    type: Literal["halton"] = "halton"
+
+
 class SobolSearch(Config):
-    """Quasi-random search: the points of a scrambled Sobol sequence, which cover the
-    space more evenly than random ones, with no clumps and no gaps, and need nothing
-    of each other's results. What the Deep Learning Tuning Playbook (Godbole et al.,
-    2023) explores a space with."""
+    """Quasi-random search: the points of a scrambled Sobol sequence, evenest of all
+    when the trials are a power of two, 8, 16 or 32: other counts lose its balance
+    (Owen, 2020), and `halton` suits them."""
 
     type: Literal["sobol"] = "sobol"
 
@@ -930,7 +939,8 @@ class GPSearch(Config):
 
 
 SearchMethod = Annotated[
-    RandomSearch | SobolSearch | TPESearch | GPSearch, Field(discriminator="type")
+    RandomSearch | HaltonSearch | SobolSearch | TPESearch | GPSearch,
+    Field(discriminator="type"),
 ]
 
 
@@ -948,7 +958,9 @@ class HalvingConfig(Config):
     short run ranking trials as a long one would not."""
 
     type: Literal["halving"] = "halving"
-    eta: Annotated[int, Field(ge=2)] = 3  # each rung trains the best 1/eta, eta x longer
+    eta: Annotated[int, Field(ge=2)] = (
+        3  # each rung trains the best 1/eta, eta x longer
+    )
     # Rungs of steps, the last the run's own: steps / eta^(rungs - 1), ..., steps.
     rungs: Annotated[int, Field(ge=2)] = 3
     brackets: Positive = 1  # Hyperband's brackets: the rungs trials start at, from 0
@@ -976,7 +988,7 @@ class SearchConfig(Config):
     launched again goes on where it stopped, and one given more trials adds them."""
 
     type: Literal["search"] = "search"
-    method: SearchMethod = TPESearch()  # how the next trial is proposed
+    method: SearchMethod = GPSearch()  # how the next trial is proposed
     trials: Positive = 16  # the points it tries, at the bottom rung with halving
     # Trials at once, at most; none: as many as the GPUs hold.
     parallel: Positive | None = None
@@ -1078,6 +1090,7 @@ Setting = Annotated[
     | IntUniformConfig
     | ChoiceConfig
     | RandomSearch
+    | HaltonSearch
     | SobolSearch
     | TPESearch
     | GPSearch

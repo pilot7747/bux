@@ -77,9 +77,14 @@ def generator(history: History) -> np.random.Generator:
 
 
 def quasi_random(space: Space, seed: int, index: int) -> Point:
-    """Return point `index`, from 0, of a scrambled Sobol sequence that `seed`
-    scrambles: what `sobol` proposes, and the model-based methods at first."""
-    engine = qmc.Sobol(len(space.names), scramble=True, rng=seed)
+    """Return point `index`, from 0, of a scrambled Halton sequence that `seed`
+    scrambles: what `halton` proposes, and the model-based methods at first. It
+    extends a point at a time, as trials that start whenever a GPU frees up need."""
+    return _nth(qmc.Halton(len(space.names), scramble=True, rng=seed), space, index)
+
+
+def _nth(engine: qmc.QMCEngine, space: Space, index: int) -> Point:
+    """Return point `index` of `engine`'s sequence, as coordinates of `space`."""
     if index:
         engine.fast_forward(index)
     return space.from_unit(engine.random(1)[0])
@@ -91,8 +96,16 @@ def _random(c: tcfg.RandomSearch, space: Space, history: History) -> Point:
     return space.from_unit(generator(history).random(len(space.names)))
 
 
-@methods.register("sobol")
-def _sobol(c: tcfg.SobolSearch, space: Space, history: History) -> Point:
-    """The next point of a scrambled Sobol sequence (`quasi_random`), which the
+@methods.register("halton")
+def _halton(c: tcfg.HaltonSearch, space: Space, history: History) -> Point:
+    """The next point of a scrambled Halton sequence (`quasi_random`), which the
     search's seed scrambles."""
     return quasi_random(space, history.seed, history.proposed)
+
+
+@methods.register("sobol")
+def _sobol(c: tcfg.SobolSearch, space: Space, history: History) -> Point:
+    """The next point of a scrambled Sobol sequence, which the search's seed
+    scrambles."""
+    engine = qmc.Sobol(len(space.names), scramble=True, rng=history.seed)
+    return _nth(engine, space, history.proposed)
