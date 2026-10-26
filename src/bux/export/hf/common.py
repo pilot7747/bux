@@ -92,6 +92,10 @@ class Ctx:
         heads: The logits of every head run so far.
         embedding: The model's first embedding, which tied heads and nextn read.
         shared: The modules of shared definitions, by their key.
+        nextn_runs: How many nextn layers have run: the next looks one token further
+            ahead.
+        pending_read: The read coefficients, b t n, the last single-pass hc or mhc
+            branch computed for the next one; None before the first.
     """
 
     def __init__(
@@ -110,6 +114,8 @@ class Ctx:
         self.embedding: Any = None
         self.dtype: torch.dtype = torch.float32  # the model's, which sets them
         self.config: Any = None
+        self.nextn_runs = 0
+        self.pending_read: torch.Tensor | None = None
         self._masks, self._made, self._slots = masks, {}, 0
 
     def push(self, name: str, x: Any) -> Any:

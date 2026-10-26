@@ -153,15 +153,14 @@ def test_rwkv7_value_residual_exports() -> None:
     check.compare(compile(source)).check()
 
 
-# Zoo models shrunk as tests/test_examples.py shrinks them; the layers not exported
-# yet (MoE, MTP) are swapped for MLPs and a second head.
+# Zoo models shrunk as tests/test_examples.py shrinks them; their MoE, not exported
+# yet, swapped for MLPs.
 GQA = "gqa(num_heads=4, num_kv_heads=2, head_dim=8"
 ZOO = {
     "qwen3_next.bux": [
         "delta = gdn(num_heads=2, num_v_heads=4, head_dim=8)",
         f"attn = {GQA}, gated=true, qk_norm=norm, rope=rope(base=10000000, fraction=0.25))",
         "experts = dense",
-        "mtp = $h A norm out",
     ],
     "kimi_linear.bux": [
         "kda = kda(num_heads=2, head_dim=8, output_gate_rank=8, norm_eps=1e-5)",

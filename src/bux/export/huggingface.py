@@ -98,10 +98,11 @@ _CACHE_DEFAULTS = {"sliding_window": None, "number_of_conv_states": 1}
 
 
 def cache_layers(p: Plan) -> list[tuple[str, dict]]:
-    """Return the kind of each cache layer, in the order the calls that keep state run,
-    and what its config sets for it alone (`bux.export.codegen.cache_layer`), with
-    settings of `_CACHE_DEFAULTS` (a sliding window, conv states)."""
-    layers = (codegen.cache_layer(call.layer) for call in p.calls)
+    """Return the kind of each cache layer, in the order the calls that keep state run
+    as the model generates (`Plan.generation`), and what its config sets for it alone
+    (`bux.export.codegen.cache_layer`), with settings of `_CACHE_DEFAULTS` (a sliding
+    window, conv states)."""
+    layers = (codegen.cache_layer(call.layer) for call in p.generation())
     return [layer for layer in layers if layer is not None]
 
 
