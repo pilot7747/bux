@@ -555,13 +555,14 @@ class FullLogits(SoftmaxAttention):
         q: Float[Array, "b t h dk"],
         k: Float[Array, "b s g dk"],
         docs: Segments | None,
-        mask: Bool[Array, "*b t s"] | None = None,
+        mask: Bool[Array, "*b #h t s"] | None = None,
     ) -> Float[Array, "b h t s"]:
-        """Return the softmax over the keys `mask` keeps, the layer's own if none."""
+        """Return the softmax over the keys `mask` keeps of each head, the layer's
+        own if none."""
         if mask is None:
-            mask = self._mask(docs, x.shape[1])
+            mask = self._mask(docs, x.shape[1])[..., None, :, :]
         logits = self._logits(x, q, k, docs)
-        return masked_softmax(logits, mask[..., None, :, :], self._sinks())
+        return masked_softmax(logits, mask, self._sinks())
 
     def _values(
         self, probs: Float[Array, "b h t s"], v: Float[Array, "b s g dv"]
@@ -615,7 +616,8 @@ def indexer_config(
     Raises:
         ValueError: a ``candidates`` port, or an ``index`` port it writes, without an
             indexer that the layer runs.
-        NotImplementedError: candidate pools of an indexer with ``block_size > 1``.
+        NotImplementedError: candidate pools of an indexer with ``block_size > 1``;
+            max-pooled blocks of CSA's compressed latents.
     """
     indexer = None if reads(ports, "index") else config.indexer
     needs = [
@@ -628,9 +630,33 @@ def indexer_config(
             f"{config.type}: the '{needs[0]}' port needs an indexer that the layer "
             "runs: give it indexer=indexer(...), and do not read index"
         )
-    if indexer is not None and indexer.block_size > 1 and "candidates" in needs:
+    if indexer is None or indexer.block_size == 1:
+        return indexer
+    if "candidates" in needs:
         raise NotImplementedError("candidate pools of an indexer with block_size > 1")
+    if indexer.pool == "max" and config.type == "csa":
+        raise NotImplementedError(
+            "csa: max-pooled blocks (indexer(pool=max)) of compressed latents"
+        )
     return indexer
+
+
+def _per_head(seen: Bool[Array, "b t *g s"], heads: int) -> Bool[Array, "b _ t s"]:
+    """Return which keys each query sees, for all heads or for each of the `heads`,
+    each its group's."""
+    if seen.ndim == 3:
+        return seen[:, None]
+    return jnp.repeat(jnp.moveaxis(seen, 2, 1), heads // seen.shape[2], axis=1)
+
+
+def _summed(
+    probs: Float[Array, "b h t s"], groups: int | None
+) -> Float[Array, "b t *g s"]:
+    """Return the heads' probabilities summed, or summed in each of `groups` groups."""
+    if groups is None:
+        return probs.sum(1)
+    b, h, t, s = probs.shape
+    return jnp.moveaxis(probs.reshape(b, groups, h // groups, t, s).sum(2), 1, 2)
 
 
 def documents_or_rows(docs: Segments | None, b: int, t: int) -> Segments:
@@ -700,12 +726,14 @@ class Sparse(FullLogits):
         softcap."""
         return sparse.attend(q, parts, sinks, self.scale, self.softcap)
 
-    def _target(self, part: sparse.Part, xs: tuple) -> Float[Array, "b c s"]:
+    def _target(self, part: sparse.Part, xs: tuple) -> Float[Array, "b c *g s"]:
         """Return a chunk of queries' attention to the keys of `part`, given their
-        queries, logsumexp and `sparse.rows`."""
+        queries, logsumexp and `sparse.rows`: for each group if it keeps keys for
+        each."""
         q, lse, span, index = jax.lax.stop_gradient(xs)
         part = sparse.at(part, span, index)
-        return sparse.probabilities(q, part, lse, self.scale, self.softcap)
+        groups = sparse.per_group(part)
+        return sparse.probabilities(q, part, lse, self.scale, self.softcap, groups)
 
     def _attend_logits(
         self,
@@ -722,11 +750,12 @@ class Sparse(FullLogits):
         require_xla(feature)
         k, v = (jnp.concatenate(kv, axis=1) for kv in zip(*((p.k, p.v) for p in parts)))
         mask = jnp.concatenate([sparse.visible(p) for p in parts], -1)
-        probs = self._probabilities(x, q, k, docs, mask)
+        probs = self._probabilities(x, q, k, docs, _per_head(mask, self.heads))
         if self._trains(scored, taps):
             assert scored is not None
             n = parts[-1].k.shape[1]
-            attention = probs[..., -n:].astype(jnp.float32).sum(1)
+            groups = mask.shape[2] if mask.ndim == 4 else None
+            attention = _summed(probs[..., -n:].astype(jnp.float32), groups)
             self._train_indexer(scored, lambda a: a, attention, n, taps)
         return self._values(probs, v)
 
@@ -760,6 +789,7 @@ class Sparse(FullLogits):
         scored = None
         if reads(self.ports, "index"):
             kept = read(taps, self.ports, "index")
+            self._check_groups(kept)
         elif self.indexer is not None:
             if keys is None:
                 raise ValueError(
@@ -777,6 +807,15 @@ class Sparse(FullLogits):
             return None, None
         write(taps, self.ports, "index", kept)
         return kept, scored
+
+    def _check_groups(self, kept: sparse.Kept) -> None:
+        """Raise unless an index read for each group has one for each kv head."""
+        groups = kept.index.shape[2] if kept.index.ndim == 4 else None
+        if groups not in (None, self.kv_heads):
+            raise ValueError(
+                f"{self.kv_heads} kv heads cannot read an index of picks for each of "
+                f"{groups} groups (indexer(per_group=true)): give them as many"
+            )
 
     def _select_tokens(
         self,

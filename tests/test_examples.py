@@ -108,6 +108,40 @@ SHRUNK = {
         ),
         f"ple = engram(head_dim=4, table_size=50, norm=norm, boundary_token={V - 1})",
     ],
+    "minimax/minimax_m3.bux": [
+        (
+            "attn = gqa(num_heads=4, num_kv_heads=2, head_dim=8, qk_norm=norm,"
+            " rope=rope(fraction=0.5))"
+        ),
+        (
+            "msa = attn(indexer=indexer(num_heads=2, head_dim=8, top_k=4, block_size=2,"
+            " pool=max, per_group=true, relu=false, weighted=false, norm=norm))"
+        ),
+        (
+            "dense = gated_mlp(intermediate_size=8, activation=quick_gelu, limit=7.0,"
+            " up_offset=1.0)"
+        ),
+        (
+            "experts = moe(num_experts=4, top_k=2, num_shared_experts=1, router=sigmoid,"
+            " routed_scaling_factor=2.0, load_balancing=aux_free, expert=dense)"
+        ),
+    ],
+    "minimax/minimax_m3.1_flash.bux": [
+        (
+            "msa = gqa(num_heads=4, num_kv_heads=2, head_dim=8, qk_norm=norm,"
+            " rope=rope(fraction=0.5), indexer=indexer(num_heads=2, head_dim=8,"
+            " top_k=4, block_size=2, pool=max, per_group=true, relu=false,"
+            " weighted=false, norm=norm))"
+        ),
+        (
+            "dense = gated_mlp(intermediate_size=8, activation=quick_gelu, limit=7.0,"
+            " up_offset=1.0)"
+        ),
+        (
+            "experts = moe(num_experts=4, top_k=2, num_shared_experts=1, router=sigmoid,"
+            " routed_scaling_factor=2.0, load_balancing=aux_free, expert=dense)"
+        ),
+    ],
     "muse/muse_spark_open_816b_a42b.bux": [
         (
             "attn = gqa(num_heads=4, num_kv_heads=2, head_dim=8, qk_norm=bare,"

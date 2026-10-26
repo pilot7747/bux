@@ -3,7 +3,9 @@ attends to, and its loss.
 
 Keys sit in slots along a row, in order, and `order` says which key of its document
 each slot holds (-1 for a slot with none, as between compressed latents). Blocks of
-keys are counted from a document's first key, so none spans two documents.
+keys are counted from a document's first key, so none spans two documents. With
+``per_group`` a query picks for each kv head's group of query heads apart, and its
+scores and picks have a group axis, ``(b, t, g, ...)``, after the queries'.
 
 `Indexer` ranks a chunk of queries at a time
 (`~bux.architecture.attention.sparse.chunked`), so that no t by t floats are made: on
@@ -47,22 +49,25 @@ class Scored(NamedTuple):
     query: Float[Array, "b t e"]
     #: Each query's position in its document.
     pos: Int[Array, "b t"]
-    #: The keys it scored; with `block`, a block's at the block's index.
+    #: The keys it scored; with `block` and mean pooling, a block's at its index.
     keys: Float[Array, "b s i"]
-    #: What each query kept of them, by index; -1 for none.
-    kept: Int[Array, "b t k"]
+    #: What each query kept of them, by index, for each group if per group; -1 for
+    #: none.
+    kept: Int[Array, "b t *g k"]
     #: Which block each key is in, if it kept blocks; else None.
     block: Int[Array, "b s"] | None = None
+    #: The slots each query may attend to, for a loss over its kept keys' tokens.
+    span: Span | None = None
 
 
-Target = Callable[[Any], Float[Array, "b c s"]]  # a chunk's attention to the keys
+Target = Callable[[Any], Float[Array, "b c *g s"]]  # a chunk's attention to the keys
 
 
 def _kl(
-    target: Float[Array, "b t n"],
-    scores: Float[Array, "b t n"],
-    mask: Bool[Array, "b t n"],
-) -> Float[Array, "b t"]:
+    target: Float[Array, "b t *g n"],
+    scores: Float[Array, "b t *g n"],
+    mask: Bool[Array, "b t *g n"],
+) -> Float[Array, "b t *g"]:
     """Return every query's KL(target || softmax(scores)) over the slots `mask` keeps,
     the target normalized over them: 0 for a query with none, as 0 log 0 is."""
     p = jnp.where(mask, target, 0)
@@ -84,21 +89,30 @@ def _groups(order: Int[Array, "b s"], size: int) -> Int[Array, "b s"]:
 
 
 def _per_block(
-    values: Shaped[Array, "b t s"],
+    values: Shaped[Array, "b t *g s"],
     block: Int[Array, "b s"],
     reduce: Literal["sum", "max"],
-) -> Shaped[Array, "b t s"]:
+) -> Shaped[Array, "b t *g s"]:
     """Return every query's sum or maximum of the values of each block's slots, at the
     block's index; -inf for the maximum of a block with none."""
     op = jax.ops.segment_sum if reduce == "sum" else jax.ops.segment_max
 
-    def row(v: Shaped[Array, "t s"], ids: Int[Array, " s"]) -> Shaped[Array, "t s"]:
-        return op(v.T, ids, num_segments=v.shape[-1]).T
+    def row(v: Shaped[Array, "*t s"], ids: Int[Array, " s"]) -> Shaped[Array, "*t s"]:
+        by_slot = jnp.moveaxis(v, -1, 0)
+        return jnp.moveaxis(op(by_slot, ids, num_segments=v.shape[-1]), 0, -1)
 
     return jax.vmap(row)(values, block)
 
 
-def _top(scores: Float[Array, "b t n"], top_k: int) -> Int[Array, "b t k"]:
+def _like(
+    seen: Bool[Array, "b t s"], scores: Shaped[Array, "b t *g s"]
+) -> Bool[Array, "b t ... s"]:
+    """Return `seen`, of every query, with the group axis of `scores` if it has one,
+    of size 1."""
+    return seen if scores.ndim == seen.ndim else seen[:, :, None]
+
+
+def _top(scores: Float[Array, "b t *g n"], top_k: int) -> Int[Array, "b t *g k"]:
     """Return the indices of each query's top_k highest scores, of those above -inf,
     in order of index, and -1 past them; of equal ones, the first.
 
@@ -109,7 +123,7 @@ def _top(scores: Float[Array, "b t n"], top_k: int) -> Int[Array, "b t k"]:
     k = min(top_k, scores.shape[-1])
     key = _ordered(scores)
 
-    def bit(i: Int[Array, ""], kth: UInt[Array, "b t"]) -> UInt[Array, "b t"]:
+    def bit(i: Int[Array, ""], kth: UInt[Array, "b t *g"]) -> UInt[Array, "b t *g"]:
         higher = kth | (jnp.uint32(1) << (31 - i).astype(jnp.uint32))
         enough = (key >= higher[..., None]).sum(-1) >= k
         return jnp.where(enough, higher, kth)
@@ -122,10 +136,10 @@ def _top(scores: Float[Array, "b t n"], top_k: int) -> Int[Array, "b t k"]:
 
 
 def _weighed(
-    dots: Float[Array, "b t h s"], weights: Float[Array, "b t h"]
+    dots: Float[Array, "b t h s"], weights: Float[Array, "b t h"], relu: bool = True
 ) -> Float[Array, "b t s"]:
-    """Return the heads' ReLU'd dot products, summed by their weights."""
-    return jnp.einsum("bths,bth->bts", jax.nn.relu(dots), weights)
+    """Return the heads' dot products, ReLU'd if `relu`, summed by their weights."""
+    return jnp.einsum("bths,bth->bts", jax.nn.relu(dots) if relu else dots, weights)
 
 
 def _dense(k: int, n: int) -> bool:
@@ -142,7 +156,7 @@ def _ordered(x: Float[Array, "*s"]) -> UInt[Array, "*s"]:
     return jnp.where(u >> 31 == 1, ~u, u | jnp.uint32(1 << 31))
 
 
-def _indices(kept: Bool[Array, "b t n"], k: int) -> Int[Array, "b t k"]:
+def _indices(kept: Bool[Array, "b t *g n"], k: int) -> Int[Array, "b t *g k"]:
     """Return the indices of each row's (at most) k kept slots, -1 past them."""
     n = kept.shape[-1]
     slot = jnp.where(kept, jnp.cumsum(kept, -1) - 1, k)
@@ -151,7 +165,9 @@ def _indices(kept: Bool[Array, "b t n"], k: int) -> Int[Array, "b t k"]:
         index = jnp.arange(n, dtype=jnp.int32)
         return jnp.full(k + 1, -1, jnp.int32).at[slot].set(index)[:k]
 
-    return jax.vmap(jax.vmap(row))(slot)
+    for _ in range(kept.ndim - 1):
+        row = jax.vmap(row)
+    return row(slot)
 
 
 def _newest(seen: Bool[Array, "b t s"], block: Int[Array, "b s"]) -> Int[Array, "b t"]:
@@ -183,17 +199,24 @@ class Indexer(nnx.Module):
     else the heads are summed. Its keep mask passes no gradient and its inputs are
     detached, so only `loss` trains it, and that loss trains nothing else.
 
-    With ``block_size > 1`` it scores blocks of keys and keeps whole ones (Qwen3.8
-    QSA): a block's key is the mean of its keys as projected, normalized, then rotated
-    to the position of its first. A query scores the blocks it may attend to all of,
-    and also keeps the keys of its own unfinished block. It can export a candidate
-    pool of coarse blocks, and keep keys only inside one it imports (DeepSeek-V4.1).
+    With ``block_size > 1`` it scores blocks of keys and keeps whole ones. Pooled by
+    their mean (Qwen3.8 QSA), a block's key is the mean of its keys as projected,
+    normalized, then rotated to the position of its first; a query scores the blocks
+    it may attend to all of, and also keeps the keys of its own unfinished block.
+    Pooled by their max (MiniMax MSA), a block scores the best of its keys the query
+    may attend to, and the query keeps its own block among its ``top_k //
+    block_size``. It can export a candidate pool of coarse blocks, and keep keys only
+    inside one it imports (DeepSeek-V4.1).
+
+    Without ``relu`` the dot products are plain. With ``per_group`` each of its heads
+    picks for the group of the layer's query heads that share a kv head, by its own
+    scores, unweighted (MiniMax MSA).
 
     ``config.norm``, if set, normalizes each query head, and the keys instead of
     `key_norm`.
 
-    Its query heads split over ``heads``, as the layer's do; its keys, a single head,
-    are every device's.
+    Its query heads split over ``heads``, as the layer's do, or ``kv_heads`` with
+    ``per_group``; its keys, a single head, are every device's.
 
     Args:
         config: the indexer's settings.
@@ -225,6 +248,9 @@ class Indexer(nnx.Module):
         h, i = config.num_heads, config.head_dim
         self.heads, self.head_dim = h, i
         self.top_k, self.block_size = config.top_k, config.block_size
+        self.max_pool = config.block_size > 1 and config.pool == "max"
+        self.per_group, self.relu = config.per_group, config.relu
+        self.split: parallel.Name = "kv_heads" if config.per_group else "heads"
         self.candidate_block_size = config.candidate_block_size
         self.candidate_top_k = config.candidate_top_k
         self.loss_weight = config.loss_weight
@@ -238,14 +264,14 @@ class Indexer(nnx.Module):
             )
 
         # The randomly initialized layers; reordering them changes a seed's init.
-        self.q = linear(query_width, h * i, "q", query, ("heads", h))
+        self.q = linear(query_width, h * i, "q", query, (self.split, h))
         self.k = linear(key_width, i, "kv", None, None) if key_width else None
         self.weights = (
             linear(width, h, "q", "embed", "heads") if config.weighted else None
         )
 
         self.q_norm = Norm(config.norm, i) if config.norm else None
-        pools = config.block_size > 1  # it normalizes the blocks of keys it is given
+        pools = self._mean_blocks()  # it normalizes the blocks of keys it is given
         self.k_norm = Norm(config.norm or key_norm, i) if key_width or pools else None
         self.rope = None if rope is None else rope.model_copy(update={"fraction": 1.0})
         self.rope_dims = min(rope_dims, i) // 2 * 2
@@ -262,12 +288,12 @@ class Indexer(nnx.Module):
                 index in the row.
 
         Returns:
-            The keys, ``head_dim`` wide, as projected if the indexer pools them in
-            blocks, else normalized and rotated.
+            The keys, ``head_dim`` wide, as projected if the indexer mean-pools them
+            in blocks, else normalized and rotated.
         """
         assert self.k is not None and self.k_norm is not None
         k = self.k(jax.lax.stop_gradient(source))
-        if self.block_size > 1:
+        if self._mean_blocks():
             return k
         return self._rotate(self.k_norm(k)[:, :, None], pos)[:, :, 0]
 
@@ -277,9 +303,10 @@ class Indexer(nnx.Module):
         query: Float[Array, "b t e"],
         pos: Int[Array, "b t"] | None,
         keys: Float[Array, "b s i"],
-    ) -> Float[Array, "b t s"]:
+    ) -> Float[Array, "b t *g s"]:
         """Return every query's score for every key, ``sum_j w_j ReLU(q_j . k_s)``, by
-        XLA: a t by s intermediate of every head.
+        XLA: a t by s intermediate of every head. Without ``relu`` the dot products
+        are plain; with ``per_group`` each head's are the scores of its group.
 
         Args:
             x: the layer's input, from which the head weights come.
@@ -288,12 +315,16 @@ class Indexer(nnx.Module):
             keys: the keys, from `keys`.
 
         Returns:
-            The scores, (b, t, s). They pass no gradient to `x` or `query`.
+            The scores, (b, t, s), or (b, t, g, s) for g groups with ``per_group``.
+            They pass no gradient to `x` or `query`.
         """
         x, query = jax.lax.stop_gradient((x, query))
         q, w = self._queries(query, pos), self._head_weights(x)
         with flops.over_keys():
-            return _weighed(jnp.einsum("bthi,bsi->bths", q, keys), w)
+            dots = jnp.einsum("bthi,bsi->bths", q, keys)
+            if self.per_group:
+                return (jax.nn.relu(dots) if self.relu else dots) * w[..., None]
+            return _weighed(dots, w, self.relu)
 
     def _scores_at(
         self,
@@ -314,7 +345,7 @@ class Indexer(nnx.Module):
         rows = jax.vmap(lambda k, i: k[i])
         picked = rows(keys.astype(jnp.float32), jnp.maximum(index, 0))
         with flops.over_picks():
-            return _weighed(jnp.einsum("bthi,btki->bthk", q, picked), w)
+            return _weighed(jnp.einsum("bthi,btki->bthk", q, picked), w, self.relu)
 
     def _ranking(
         self,
@@ -323,21 +354,29 @@ class Indexer(nnx.Module):
         pos: Int[Array, "b t"],
         keys: Float[Array, "b s i"],
         end: Int[Array, "b t"],
-    ) -> Float[Array, "b t s"]:
+    ) -> Float[Array, "b t *g s"]:
         """Return the scores that rank the keys, passing no gradient: by
         ``scoring``'s kernel where it runs. Keys from a query's `end` on score
         anything."""
         x, query, keys = jax.lax.stop_gradient((x, query, keys))
-        if not scoring.runs(x.shape[1], keys.shape[1], self.head_dim):
+        if not self._ranked_by_kernel(x.shape[1], keys.shape[1]):
             return self.scores(x, query, pos, keys)
         q, w = self._queries(query, pos), self._head_weights(x)
         return scoring.scores(q, w, keys, end)
 
+    def _ranked_by_kernel(self, t: int, s: int) -> bool:
+        """Return whether ``scoring``'s kernel ranks s keys for t queries: it sums the
+        heads' ReLU'd dot products, as a pick for all heads with ``relu`` does."""
+        sums = self.relu and not self.per_group
+        return sums and scoring.runs(t, s, self.head_dim)
+
     def _per_query(self, t: int, s: int) -> int:
         """Return the elements a query makes in the largest intermediate of ranking s
-        keys: those of every head unless the kernel runs."""
-        kernel = scoring.runs(t, s, self.head_dim)
-        return (4 if kernel else self.heads + 4) * s
+        keys: those of every head unless the kernel runs, and its picks' for each
+        group."""
+        groups = self.heads if self.per_group else 1
+        kernel = self._ranked_by_kernel(t, s)
+        return (4 * groups if kernel else self.heads + 4 * groups) * s
 
     def _queries(
         self, query: Float[Array, "b t e"], pos: Int[Array, "b t"] | None
@@ -347,7 +386,7 @@ class Indexer(nnx.Module):
         q = self.q(query).reshape(b, t, self.heads, self.head_dim)
         if self.q_norm is not None:
             q = self.q_norm(q)
-        return shard_heads(self._rotate(q, pos))
+        return shard_heads(self._rotate(q, pos), self.split)
 
     def _head_weights(self, x: Float[Array, "b t d"]) -> Float[Array, "b t h"]:
         """Return each head's weight in a query's scores, with the head dims' scale."""
@@ -383,25 +422,28 @@ class Indexer(nnx.Module):
 
         Returns:
             The keys each query keeps, by index (with ``block_size > 1``, whole
-            blocks); the candidate pool, if asked for, else None; and what it scored,
-            for `loss`.
+            blocks), for each group with ``per_group``; the candidate pool, if asked
+            for, else None; and what it scored, for `loss`.
         """
         x, query = jax.lax.stop_gradient((x, query))
         pos = _positions(pos, x)
         if self.block_size > 1:
-            kept, scored = self._blocks(x, query, pos, keys, span, order)
+            blocks = self._max_blocks if self.max_pool else self._blocks
+            kept, scored = blocks(x, query, pos, keys, span, order)
             return kept, None, scored
         s, exists = keys.shape[1], order >= 0
         ranked_keys = jax.lax.stop_gradient(keys)
         pooled = _groups(order, self.candidate_block_size)
         among = None if candidates is None else candidates.block
 
-        def pick(xs: tuple) -> tuple[Int[Array, "b c k"], Int[Array, "b c p"] | None]:
+        def pick(
+            xs: tuple,
+        ) -> tuple[Int[Array, "b c *g k"], Int[Array, "b c p"] | None]:
             x, query, pos, span, index = xs
             inside = None if index is None else Kept(index, among)
             seen = mask(span, s, exists, inside)
             scores = self._ranking(x, query, pos, ranked_keys, span.end)
-            ranked = jnp.where(seen, scores, -jnp.inf)
+            ranked = jnp.where(_like(seen, scores), scores, -jnp.inf)
             if not export_candidates:
                 return _top(ranked, self.top_k), None
             return _top(ranked, self.top_k), self._candidates(ranked, pooled)
@@ -411,7 +453,7 @@ class Indexer(nnx.Module):
         index, best = chunked(pick, xs, chunks(t, self._per_query(t, s)))
         index = remat.label("attention.index", index)
         pool = None if best is None else Kept(best, pooled)
-        return Kept(index), pool, Scored(x, query, pos, keys, index)
+        return Kept(index), pool, Scored(x, query, pos, keys, index, span=span)
 
     def loss(
         self, scored: Scored, target: Target, xs: Any, width: int
@@ -422,12 +464,15 @@ class Indexer(nnx.Module):
         I is the indexer's scores, and p the attention summed over heads and
         normalized over the kept keys. A block's p is its most attended key's (Qwen3.8
         QSA, eqs. 17 and 20). It scores each chunk of queries' kept keys again, and so
-        does its backward pass; p it takes once.
+        does its backward pass; p it takes once. With ``per_group`` or max-pooled
+        blocks, the loss is over each kept key the query sees, for each group
+        (MiniMax MSA).
 
         Args:
             scored: what the indexer kept, from its call.
             target: gives a chunk of queries' attention to the keys, from that
-                chunk of `xs`; it passes no gradient.
+                chunk of `xs`, for each group with ``per_group``; it passes no
+                gradient.
             xs: what `target` takes, arrays of (b, t, ...) split into chunks of
                 queries.
             width: the elements a query makes of `target`'s output, which sets the
@@ -436,6 +481,8 @@ class Indexer(nnx.Module):
         Returns:
             The loss, a scalar, which trains only the indexer's parameters.
         """
+        if self.per_group or self.max_pool:
+            return self._token_loss(scored, target, xs, width)
 
         def kept_target(both: tuple) -> Float[Array, "b c k"]:
             (*_, kept), xs = both
@@ -473,10 +520,40 @@ class Indexer(nnx.Module):
         every = self.scores(x, query, pos, keys)
         return jnp.take_along_axis(every, jnp.maximum(index, 0), axis=-1)
 
+    def _token_loss(
+        self, scored: Scored, target: Target, xs: Any, width: int
+    ) -> Float[Array, ""]:
+        """Return `loss` over the keys the query sees of those it kept, each its own
+        token, for each group with ``per_group``, averaged over the queries and the
+        groups (MiniMax MSA).
+
+        p is the attention to them summed over the group's heads (every head without
+        groups), the mean of their probabilities once normalized. A chunk of queries
+        scores every key and takes p, and does both again in its backward pass, so
+        that no t by t floats are kept.
+        """
+        assert scored.span is not None
+        s = scored.keys.shape[1]
+
+        def kl(both: tuple) -> Float[Array, "b c *g"]:
+            (x, query, pos, kept, span), xs = both
+            p = jax.lax.stop_gradient(target(xs)).astype(jnp.float32)
+            scores = self.scores(x, query, pos, scored.keys).astype(jnp.float32)
+            return _kl(p, scores, mask(span, s, None, Kept(kept, scored.block)))
+
+        own = (scored.x, scored.query, scored.pos, scored.kept, scored.span)
+        count = chunks(scored.x.shape[1], max(width, self.heads * s))
+        return chunked(jax.checkpoint(kl), (own, xs), count).mean()
+
+    def _mean_blocks(self) -> bool:
+        """Return whether it pools the keys in blocks by their mean (Qwen3.8 QSA)."""
+        return self.block_size > 1 and not self.max_pool
+
     def _picked_by_kernel(self, k: int) -> bool:
         """Return whether ``scoring``'s kernels score each query's k picks: they stop
-        at its last, so a query of a short document takes few steps."""
-        return scoring.picked_runs(self.heads, self.head_dim, k)
+        at its last, so a query of a short document takes few steps. They ReLU the
+        dot products."""
+        return self.relu and scoring.picked_runs(self.heads, self.head_dim, k)
 
     def _blocks(
         self,
@@ -510,6 +587,37 @@ class Indexer(nnx.Module):
         picked, own = remat.label("attention.index", (picked, own))
         kept = Kept(jnp.concatenate([picked, own[..., None]], -1), block)
         return kept, Scored(x, query, pos, block_keys, picked, block)
+
+    def _max_blocks(
+        self,
+        x: Float[Array, "b t d"],
+        query: Float[Array, "b t e"],
+        pos: Int[Array, "b t"],
+        keys: Float[Array, "b s i"],
+        span: Span,
+        order: Int[Array, "b s"],
+    ) -> tuple[Kept, Scored]:
+        """Keep whole blocks of block_size keys, each scored by the best of its keys
+        the span has: the query's own block and the best others, top_k // block_size
+        in all, for each group with ``per_group`` (MiniMax MSA). Return them, and what
+        it scored."""
+        s, size = keys.shape[1], self.block_size
+        block = _groups(order, size)
+        exists, ranked_keys = order >= 0, jax.lax.stop_gradient(keys)
+
+        def pick(xs: tuple) -> Int[Array, "b c *g k"]:
+            x, query, pos, span = xs
+            seen = mask(span, s, exists)
+            scores = self._ranking(x, query, pos, ranked_keys, span.end)
+            scores = jnp.where(_like(seen, scores), scores, -jnp.inf)
+            best = _per_block(scores, block, "max")
+            own = jnp.arange(s) == _newest(seen, block)[..., None]
+            return _top(jnp.where(_like(own, best), jnp.inf, best), self.top_k // size)
+
+        xs, t = (x, query, pos, span), x.shape[1]
+        kept = chunked(pick, xs, chunks(t, self._per_query(t, s)))
+        kept = remat.label("attention.index", kept)
+        return Kept(kept, block), Scored(x, query, pos, keys, kept, block, span)
 
     def _block_keys(
         self,

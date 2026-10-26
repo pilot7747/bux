@@ -29,9 +29,13 @@ ROWS = Segments.of(POSITIONS)
 TINY = 1 << 9  # sparse.ELEMENTS for chunks of 2 to 8 queries
 
 
-def kept(seed: int, span: sparse.Span, top_k: int, size: int = 1) -> sparse.Kept:
-    """Each query's top_k random slots of its span, or blocks of `size` slots."""
-    scores = jax.random.uniform(jax.random.key(seed), (B, T, T // size))
+def kept(
+    seed: int, span: sparse.Span, top_k: int, size: int = 1, groups: int | None = None
+) -> sparse.Kept:
+    """Each query's top_k random slots of its span, or blocks of `size` slots; for
+    each of `groups` groups apart, if given."""
+    shape = (B, T) if groups is None else (B, T, groups)
+    scores = jax.random.uniform(jax.random.key(seed), (*shape, T // size))
     if size == 1:
         return sparse.Kept(_top(jnp.where(sparse.mask(span, T), scores, -1), top_k))
     block = jnp.broadcast_to(jnp.arange(T) // size, (B, T))
@@ -65,11 +69,12 @@ def case(name: str) -> tuple[list[sparse.Part], bool, float | None]:
         "tokens": kept(3, span, 5),
         "window": kept(3, span, 4),
         "blocks": kept(3, span, 2, size=3),
+        "groups": kept(3, span, 2, size=4, groups=g),  # MiniMax MSA's
     }[name]
     return [sparse.Part(k, v, span, None, chosen)], name == "window", None
 
 
-CASES = ["all", "tokens", "window", "blocks", "csa"]
+CASES = ["all", "tokens", "window", "blocks", "groups", "csa"]
 SCALE = D**-0.5
 
 
@@ -77,8 +82,12 @@ def reference(q, parts, sinks, cap):
     """All t by t logits, as the `xla` method takes them."""
     k, v = (jnp.concatenate(kv, axis=1) for kv in zip(*((p.k, p.v) for p in parts)))
     mask = jnp.concatenate([sparse.visible(p) for p in parts], -1)
+    if mask.ndim == 4:  # each group's, for its query heads
+        mask = jnp.repeat(jnp.moveaxis(mask, 2, 1), H // mask.shape[2], axis=1)
+    else:
+        mask = mask[:, None]
     logits = softcap(scaled_logits(q, k, SCALE), cap)
-    return weighted_values(masked_softmax(logits, mask[:, None], sinks), v)
+    return weighted_values(masked_softmax(logits, mask, sinks), v)
 
 
 def run(f, name: str):
@@ -118,6 +127,19 @@ def test_attention_over_kept_keys_is_all_logits_attention(monkeypatch, name, ele
     close(grads, want_grads)
 
 
+def test_tokamaxs_run_a_group_at_a_time_attends_as_one_run(monkeypatch):
+    """On a GPU, picks for each group run tokamax's kernels a group at a time, so
+    that each mask is a group's; here XLA's runs stand in for the kernels."""
+    monkeypatch.setattr(sparse, "ELEMENTS", TINY)
+    want_grads, want = run(kernel, "groups")
+    monkeypatch.setattr(sparse, "_flash", lambda q: True)
+    monkeypatch.setattr(sparse, "_flash_fwd", sparse._xla_fwd)
+    monkeypatch.setattr(sparse, "_flash_bwd", sparse._xla_bwd)
+    grads, out = run(kernel, "groups")
+    close(out, want)
+    close(grads, want_grads)
+
+
 def test_the_logsumexp_is_the_softmaxs_of_every_part_and_the_sinks(monkeypatch):
     monkeypatch.setattr(sparse, "ELEMENTS", TINY)
     parts, _, cap = case("csa")
@@ -139,7 +161,7 @@ MESHES = {
 
 
 @pytest.mark.parametrize("mesh", MESHES.values(), ids=MESHES.keys())
-@pytest.mark.parametrize("name", ["window", "blocks", "csa"])
+@pytest.mark.parametrize("name", ["window", "blocks", "groups", "csa"])
 def test_split_over_devices_it_attends_as_on_one(monkeypatch, name, mesh):
     """A device has its rows, queries and heads, and every key."""
     monkeypatch.setattr(sparse, "ELEMENTS", TINY)
@@ -169,6 +191,9 @@ LAYERS = {
     " indexer=small)]",
     "qsa": "[norm gqa(num_heads=4, num_kv_heads=2, rope=rope(fraction=0.5),"
     " indexer=small(top_k=4, block_size=2, weighted=false))]",
+    "msa": "[norm gqa(num_heads=4, num_kv_heads=2, rope=rope(fraction=0.5),"
+    " indexer=small(top_k=4, block_size=2, pool=max, per_group=true, relu=false,"
+    " weighted=false))]",
     "mla_ports": "[norm latent(indexer=small, index=@k)] [norm latent(index=$k)]",
     "csa_ports": "[norm window(compress_ratio=2, indexer=small(candidate_block_size=2,"
     " candidate_top_k=2), kv=@kv, candidates=@pool)]"

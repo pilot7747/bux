@@ -1,0 +1,34 @@
+# MiniMax-M3 (MiniMax, 2026): the language model of a natively multimodal MoE of
+# ~428B parameters with ~23B active and a 1M context. 60 layers of GQA, 64 query heads
+# over 4 kv heads of 128, with QK-norm per head and RoPE on the first half of each
+# head. From layer 3 on, attention is sparse: MiniMax Sparse Attention (MSA). An
+# indexer with one head for each kv head scores every key a query may see by a plain
+# dot product, and takes each block of 128 keys' best score; the 16 query heads of each
+# kv head then attend to that group's best 16 blocks (2048 keys) alone, the query's own
+# block always among them. A KL loss trains the indexer towards each group's attention.
+# The first three FFNs are dense; the rest route each token to 4 of 128 experts by
+# sigmoid scores, balanced by a bias and their weights scaled by 2, beside a shared
+# expert. Every norm is a zero-centered RMSNorm.
+#
+# Every MLP's hidden units are (clip(up, +-7) + 1) * g * sigmoid(1.702 g), the gate g
+# capped at 7. The vision encoder and its projector are not described, nor are the 7
+# MTP modules the config lists, which have no released weights.
+d_model    = 6144
+vocab_size = 200064
+
+norm    = rmsnorm(zero_centered=true)
+attn    = gqa(num_heads=64, num_kv_heads=4, head_dim=128, qk_norm=norm,
+              rope=rope(base=5000000, fraction=0.5))
+msa     = attn(indexer=indexer(num_heads=4, head_dim=128, top_k=2048, block_size=128,
+                               pool=max, per_group=true, relu=false, weighted=false,
+                               norm=norm))
+dense   = gated_mlp(intermediate_size=12288, activation=quick_gelu, limit=7.0,
+                    up_offset=1.0)
+experts = moe(num_experts=128, top_k=4, num_shared_experts=1, router=sigmoid,
+              routed_scaling_factor=2.0, load_balancing=aux_free,
+              expert=dense(intermediate_size=3072))
+
+D = [norm attn] [norm dense]
+S = [norm msa] [norm experts]
+
+model = embed D^3 S^57 norm head

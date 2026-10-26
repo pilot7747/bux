@@ -15,9 +15,16 @@ A new layer is a config class here, added to `LayerConfig`, and a builder regist
 for its tag in the backend (`bux.architecture.register`).
 """
 
-from typing import Annotated, ClassVar, Literal
+from typing import Annotated, ClassVar, Literal, Self
 
-from pydantic import BaseModel, ConfigDict, Field, ValidationInfo, field_validator
+from pydantic import (
+    BaseModel,
+    ConfigDict,
+    Field,
+    ValidationInfo,
+    field_validator,
+    model_validator,
+)
 
 
 class Config(BaseModel):
@@ -308,15 +315,25 @@ class SparseIndexerConfig(Config):
     query may see, ``sum_j w_j ReLU(q_j . k)``, and the layer attends to the `top_k`
     best alone. A setting of softmax attention: ``mla(indexer=indexer(top_k=2048))``.
     The keep mask passes no gradient, so only the indexer's own loss trains it.
+    MiniMax Sparse Attention (MSA) is ``indexer(block_size=128, pool=max,
+    per_group=true, relu=false, weighted=false)`` on ``gqa``.
     """
 
     type: Literal["indexer"] = "indexer"
     num_heads: int = 64  # Query heads of the indexer.
     head_dim: int = 128  # Width of an indexer query head and of its keys.
     top_k: int = 2048  # Keys each query keeps (in whole blocks, with block_size).
-    # Mean-pool keys in blocks of this many and pick whole blocks, top_k keys in total,
-    # plus the query's own unfinished block (Qwen3.8 QSA).
+    # Pick whole blocks of this many keys, top_k keys in total, scored as pool says.
     block_size: int = 1
+    # How a block scores, with block_size > 1: "mean" pools its keys into one, which
+    # a query scores once it sees them all, keeping its own unfinished block beside
+    # the top_k (Qwen3.8 QSA); "max" is the best score of its keys the query sees, its
+    # own block always kept among the top_k (MiniMax MSA).
+    pool: Literal["mean", "max"] = "mean"
+    # A pick for each kv head's group of query heads, by an indexer head of its own:
+    # num_heads is the gqa layer's num_kv_heads (MiniMax MSA). Else one for all heads.
+    per_group: bool = False
+    relu: bool = True  # ReLU on each head's dot products (DSA); else the plain ones.
     weighted: bool = True  # Learned per-head score weights (DSA); else a plain sum.
     # Norm of each query head and of the keys (after block pooling). None: no query
     # norm, and the layer's own key norm (DSA: a layernorm). Qwen3.8 QSA: an rmsnorm.
@@ -332,6 +349,27 @@ class SparseIndexerConfig(Config):
     # attention over the kept keys to the softmax of its scores (DSA). 0 leaves it
     # untrained.
     loss_weight: Annotated[float, Field(ge=0)] = 1.0
+
+    @model_validator(mode="after")
+    def _selection(self) -> Self:
+        """Check the combinations of block, pool and group settings it implements."""
+        if self.per_group and self.weighted:
+            raise ValueError(
+                "indexer(per_group=true) scores each group by its own head, which no "
+                "weight sums with others: set weighted=false"
+            )
+        blocks = self.block_size > 1
+        if self.per_group and blocks and self.pool == "mean":
+            raise ValueError(
+                "indexer(per_group=true) with blocks takes pool=max: QSA's mean-pooled "
+                "blocks are one pick for all heads"
+            )
+        if blocks and self.pool == "max" and self.top_k < self.block_size:
+            raise ValueError(
+                f"indexer(pool=max) keeps top_k // block_size blocks, its own among "
+                f"them: top_k={self.top_k} is less than one block of {self.block_size}"
+            )
+        return self
 
 
 class QuadraticAttentionConfig(AttentionConfig):
@@ -380,6 +418,24 @@ class QuadraticAttentionConfig(AttentionConfig):
     relative_bias: RelativeBiasConfig | None = None  # A learned relative position bias.
     # A lightning indexer that picks the keys each query attends to; None: all of them.
     indexer: SparseIndexerConfig | None = None
+
+    @model_validator(mode="after")
+    def _indexer_groups(self) -> Self:
+        """Check that a per-group indexer has a head for each kv head of a gqa layer."""
+        if self.indexer is None or not self.indexer.per_group:
+            return self
+        kv, heads = getattr(self, "num_kv_heads", None), self.indexer.num_heads
+        if kv is None:
+            raise ValueError(
+                "indexer(per_group=true) picks for each kv head's group of query "
+                "heads, which gqa has alone"
+            )
+        if heads != kv:
+            raise ValueError(
+                f"indexer(per_group=true) has a head for each of the layer's {kv} kv "
+                f"heads: num_heads={heads} is not {kv}"
+            )
+        return self
 
 
 class GQAConfig(QuadraticAttentionConfig):

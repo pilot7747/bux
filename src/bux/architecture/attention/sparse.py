@@ -2,9 +2,9 @@
 no t by t floats.
 
 Keys sit in slots. A `Span` says which of them each query may attend to, `Kept` which
-of those it keeps, by index; a `Part` is keys and values with both. A layer's parts
-(CSA's window and its latents) share one softmax, and the sinks, merged by their
-logsumexp (`attend`).
+of those it keeps, by index, for all heads or for each kv head's group of them; a
+`Part` is keys and values with both. A layer's parts (CSA's window and its latents)
+share one softmax, and the sinks, merged by their logsumexp (`attend`).
 
 On a GPU, tokamax's flash kernel runs each part with its kept keys as a boolean mask:
 dense compute, exact, and t² bits of mask forward and bytes backward. Under
@@ -49,8 +49,9 @@ class Kept(NamedTuple):
     """The slots each query keeps, by index; or, with `block`, the blocks it keeps,
     by the block's index. The ``index`` port carries it."""
 
-    #: Each query's kept slots or blocks, k at most; -1 for none.
-    index: Int[Array, "b t k"]
+    #: Each query's kept slots or blocks, k at most, for all its heads or, with a
+    #: group axis, for each kv head's group of them; -1 for none.
+    index: Int[Array, "b t *g k"]
     #: Which block each slot is in, if it keeps blocks; else None.
     block: Int[Array, "b s"] | None = None
 
@@ -90,13 +91,15 @@ def token_span(rows: Segments, window: int | None) -> Span:
     return Span(start, jnp.broadcast_to(index + 1, start.shape))
 
 
-def hits(index: Int[Array, "b t k"], n: int) -> Bool[Array, "b t n"]:
+def hits(index: Int[Array, "b t *g k"], n: int) -> Bool[Array, "b t *g n"]:
     """Return which of n slots, or blocks, each query's `index` holds."""
 
     def row(i: Int[Array, " k"]) -> Bool[Array, " n"]:
         return jnp.zeros(n + 1, bool).at[jnp.where(i >= 0, i, n)].set(True)[:n]
 
-    return jax.vmap(jax.vmap(row))(index)
+    for _ in range(index.ndim - 1):
+        row = jax.vmap(row)
+    return row(index)
 
 
 def mask(
@@ -104,7 +107,7 @@ def mask(
     s: int,
     exists: Bool[Array, "b s"] | None = None,
     kept: Kept | None = None,
-) -> Bool[Array, "b t s"]:
+) -> Bool[Array, "b t *g s"]:
     """Return which of s slots each query attends to: of its span, those that exist,
     of those it keeps.
 
@@ -115,7 +118,7 @@ def mask(
         kept: the slots, or blocks, each query keeps; None for every one.
 
     Returns:
-        The mask, (b, t, s).
+        The mask, (b, t, s), or (b, t, g, s) where `kept` has g groups.
     """
     slot = jnp.arange(s)
     seen = (slot >= span.start[..., None]) & (slot < span.end[..., None])
@@ -125,22 +128,28 @@ def mask(
         return seen
     hit = hits(kept.index, s)
     if kept.block is not None:
-        block = jnp.broadcast_to(kept.block[:, None], hit.shape)
-        hit = jnp.take_along_axis(hit, block, axis=-1)
-    return seen & hit
+        block = kept.block[:, None] if hit.ndim == 3 else kept.block[:, None, None]
+        hit = jnp.take_along_axis(hit, jnp.broadcast_to(block, hit.shape), axis=-1)
+    return (seen if hit.ndim == seen.ndim else seen[:, :, None]) & hit
 
 
-def visible(part: Part) -> Bool[Array, "b t s"]:
-    """Return which slots of `part` each query attends to."""
+def visible(part: Part) -> Bool[Array, "b t *g s"]:
+    """Return which slots of `part` each query attends to, for each group if it
+    keeps them for each."""
     return mask(part.span, part.k.shape[1], part.exists, part.kept)
 
 
-def rows(part: Part) -> tuple[Span, Int[Array, "b t k"] | None]:
+def per_group(part: Part) -> bool:
+    """Return whether `part` keeps slots for each kv head's group of query heads."""
+    return part.kept is not None and part.kept.index.ndim == 4
+
+
+def rows(part: Part) -> tuple[Span, Int[Array, "b t *g k"] | None]:
     """Return what `part` has for each query: its span, and the index it keeps."""
     return part.span, None if part.kept is None else part.kept.index
 
 
-def at(part: Part, span: Span, index: Int[Array, "b t k"] | None) -> Part:
+def at(part: Part, span: Span, index: Int[Array, "b t *g k"] | None) -> Part:
     """Return `part` for some of its queries, given their `rows`."""
     kept = None if part.kept is None or index is None else Kept(index, part.kept.block)
     return part._replace(span=span, kept=kept)
@@ -291,25 +300,31 @@ def _flash(q: Float[Array, "b t h dk"]) -> bool:
 
 def _heads_like(part: Part, split: P, heads: int) -> Part:
     """Return `part`, its kv heads repeated if they split otherwise than the queries'
-    and there is more than one."""
+    and there is more than one, and its picks for each group with them."""
     g = part.k.shape[2]
     keys = parallel.spec(("batch", None, "kv_heads", None), part.k.shape)
     if g == 1 or keys[2] == split[2]:
         return part
     k, v = (per_query_head(x, heads) for x in (part.k, part.v))
+    if per_group(part):
+        assert part.kept is not None
+        index = jnp.repeat(part.kept.index, heads // g, axis=2)
+        part = part._replace(kept=part.kept._replace(index=index))
     return part._replace(k=k, v=v)
 
 
 def _specs(part: Part, split: P) -> Part:
     """Return how a device's share of `part` splits: its rows of everything, its
-    queries of what each query has, and its heads; every key."""
+    queries of what each query has, and its heads, with their groups' picks; every
+    key."""
     batch, seq, heads = split[:3]
     keys = P(batch, None, heads if part.k.shape[2] > 1 else None, None)
     queries, slots = P(batch, seq), P(batch, None)
     kept = None
     if part.kept is not None:
         block = None if part.kept.block is None else slots
-        kept = Kept(P(batch, seq, None), block)  # ty: ignore
+        index = P(batch, seq, keys[2], None) if per_group(part) else P(batch, seq, None)
+        kept = Kept(index, block)  # ty: ignore
     exists = None if part.exists is None else slots
     return Part(keys, keys, Span(queries, queries), exists, kept)  # ty: ignore
 
@@ -342,11 +357,56 @@ def _forward(
 
 def _runs(part: Part, static: _Static) -> tuple[Callable, Callable]:
     """Return the forward and backward of `part`: tokamax's, for heads it takes (its
-    kernels run out of shared memory past 256 dims, as CSA's 512 do), else XLA's. A
-    part's forward and backward are each exact alone."""
+    kernels run out of shared memory past 256 dims, as CSA's 512 do), a group at a
+    time if it keeps slots for each; else XLA's. A part's forward and backward are
+    each exact alone."""
     if static.flash and max(part.k.shape[-1], part.v.shape[-1]) <= HEAD_DIMS:
-        return _flash_fwd, _flash_bwd
+        flash = _flash_fwd, _flash_bwd
+        return by_group(*flash) if per_group(part) else flash
     return _xla_fwd, _xla_bwd
+
+
+def by_group(fwd: Callable, bwd: Callable) -> tuple[Callable, Callable]:
+    """Return `fwd` and `bwd` of a part run on each kv head's group of query heads
+    alone, with that group's kv head and picks, their heads joined: so that
+    tokamax's mask is a group's, t by s, and not every query head's."""
+
+    def forward(
+        q: Float[Array, "b t h dk"], part: Part, static: _Static
+    ) -> tuple[Float[Array, "b t h dv"], Float[Array, "b t h"]]:
+        outs, lses = zip(*(fwd(*pair, static) for pair in _each_group(q, part)))
+        return jnp.concatenate(outs, 2), jnp.concatenate(lses, 2)
+
+    def backward(
+        q: Float[Array, "b t h dk"],
+        part: Part,
+        out: Float[Array, "b t h dv"],
+        dout: Float[Array, "b t h dv"],
+        lse: Float[Array, "b t h"],
+        static: _Static,
+    ) -> tuple[
+        Float[Array, "b t h dk"], Float[Array, "b s g dk"], Float[Array, "b s g dv"]
+    ]:
+        g = part.k.shape[2]
+        heads = [jnp.split(x, g, axis=2) for x in (out, dout, lse)]
+        pairs = _each_group(q, part)
+        grads = [bwd(*pair, *rest, static) for pair, *rest in zip(pairs, *heads)]
+        dq, dk, dv = (jnp.concatenate(d, 2) for d in zip(*grads))
+        return dq, dk, dv
+
+    return forward, backward
+
+
+def _each_group(q: Float[Array, "b t h dk"], part: Part) -> list[tuple[Any, Part]]:
+    """Return each kv head's group of query heads, and `part` for that group alone."""
+    assert part.kept is not None
+    g = part.k.shape[2]
+    qs, ks, vs = (jnp.split(x, g, axis=2) for x in (q, part.k, part.v))
+    picks = [part.kept._replace(index=part.kept.index[:, :, j]) for j in range(g)]
+    return [
+        (q, part._replace(k=k, v=v, kept=kept))
+        for q, k, v, kept in zip(qs, ks, vs, picks)
+    ]
 
 
 def _combine(
@@ -412,7 +472,8 @@ def probabilities(
     lse: Float[Array, "b t h"],
     scale: float,
     cap: float | None,
-) -> Float[Array, "b t s"]:
+    groups: bool = False,
+) -> Float[Array, "b t *g s"]:
     """Return each query's probability of each slot of `part` in its span, kept or
     not, summed over heads: the target of the indexer's loss.
 
@@ -425,19 +486,20 @@ def probabilities(
         lse: each query's logsumexp in the softmax, from `attend`.
         scale: the logits' scale.
         cap: the logits' tanh soft cap; None for none.
+        groups: whether to sum each kv head's group of query heads apart, by XLA.
 
     Returns:
-        The probabilities, (b, t, s), 0 for slots outside the span or that do not
-        exist.
+        The probabilities, (b, t, s), or (b, t, g, s) for g groups; 0 for slots
+        outside the span or that do not exist.
     """
     t, s, d = q.shape[1], part.k.shape[1], part.k.shape[-1]
-    if part.exists is None and scoring.probabilities_runs(t, s, d):
+    if not groups and part.exists is None and scoring.probabilities_runs(t, s, d):
         return _probabilities_kernel(q, part, lse, scale, cap)
     with flops.over_keys():
         _, logits = _logits(q, part.k, scale, cap)
     p = jnp.exp(logits - _grouped(lse[..., None], part.k.shape[2]))
-    seen = mask(part.span, s, part.exists)
-    return jnp.where(seen[:, None, None], p, 0).sum((1, 2))
+    p = jnp.where(mask(part.span, s, part.exists)[:, None, None], p, 0)
+    return jnp.moveaxis(p.sum(2), 1, 2) if groups else p.sum((1, 2))
 
 
 def _probabilities_kernel(
@@ -481,6 +543,14 @@ def _ungrouped(x: Shaped[Array, "b g r t e"]) -> Shaped[Array, "b t h e"]:
     return x.transpose(0, 3, 1, 2, 4).reshape(b, t, g * r, e)
 
 
+def _by_group(seen: Bool[Array, "b t *g s"]) -> Bool[Array, "b _ 1 t s"]:
+    """Return which slots each query sees, laid out as `_grouped` lays out the heads:
+    for all of them, or for each group."""
+    if seen.ndim == 3:
+        return seen[:, None, None]
+    return jnp.moveaxis(seen, 2, 1)[:, :, None]
+
+
 def _logits(
     q: Float[Array, "b t h dk"],
     k: Float[Array, "b s g dk"],
@@ -505,7 +575,7 @@ def _xla_fwd(
     ) -> tuple[Float[Array, "b c h dv"], Float[Array, "b c h"]]:
         q, span, index = xs
         _, logits = _logits(q, part.k, static.scale, static.softcap)
-        seen = visible(at(part, span, index))[:, None, None]
+        seen = _by_group(visible(at(part, span, index)))
         logits = jnp.where(seen, logits, -jnp.inf)
         lse = jax.nn.logsumexp(logits, axis=-1, keepdims=True)
         p = jnp.exp(logits - finite(lse)).astype(part.v.dtype)
@@ -535,7 +605,7 @@ def _xla_bwd(
         q, out, dout, lse, span, index = xs
         with flops.recomputed():
             raw, logits = _logits(q, k, static.scale, static.softcap)
-        seen = visible(at(part, span, index))[:, None, None]
+        seen = _by_group(visible(at(part, span, index)))
         p = jnp.where(seen, jnp.exp(logits - _grouped(finite(lse)[..., None], g)), 0)
         do, o = (_grouped(x.astype(F32), g) for x in (dout, out))
         dp = jnp.einsum("bgrcv,bsgv->bgrcs", do, v, preferred_element_type=F32)
