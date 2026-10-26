@@ -16,6 +16,6 @@ proposes the next as one ends; the search keeps them in its directory, so a sear
 launched again goes on where it stopped.
 """
 
-from bux.search import methods, tpe
+from bux.search import gp, methods, tpe
 
-__all__ = ["methods", "tpe"]
+__all__ = ["gp", "methods", "tpe"]
