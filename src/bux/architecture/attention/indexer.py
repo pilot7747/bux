@@ -30,6 +30,7 @@ from bux.architecture.attention.sparse import Kept, Span, chunked, chunks, mask
 from bux.architecture.common.sharding import projection, shard_heads
 from bux.architecture.layers.norm import Norm
 from bux.architecture.repeats import remat
+from bux.softmax import log_softmax
 from bux.train import flops
 
 # DeepSeek-V3.2's indexer keys, projected from the layer's input, are layer-normalized.
@@ -66,7 +67,7 @@ def _kl(
     the target normalized over them: 0 for a query with none, as 0 log 0 is."""
     p = jnp.where(mask, target, 0)
     p = p / jnp.maximum(p.sum(-1, keepdims=True), jnp.finfo(p.dtype).tiny)
-    log_q = jax.nn.log_softmax(jnp.where(mask, scores, jnp.finfo(scores.dtype).min))
+    log_q = log_softmax(jnp.where(mask, scores, jnp.finfo(scores.dtype).min))
     log_p = jnp.log(jnp.where(p > 0, p, 1))
     return jnp.where(p > 0, p * (log_p - log_q), 0).sum(-1)
 

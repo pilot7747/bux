@@ -65,7 +65,7 @@ is a method of `methods.attention`, a field of {bux}`methods`:
 | Method | What it does |
 |---|---|
 | `auto` | The default. See [below](#auto-the-default). |
-| `xla` | All t by t logits at once, the reference. With `seq` over `context`, a device has its queries' rows of the logits and every key and value: all-gather CP. |
+| `xla` | All t by t logits at once, the reference, by {py:func}`bux.softmax.softmax`. With `seq` over `context`, a device has its queries' rows of the logits and every key and value: all-gather CP. |
 | `cudnn` | cuDNN's fused attention (jax's) on each device's whole rows: rows of one document by its causal kernels (`flash.CUDNN`), documents in its packed layout. |
 | `tokamax` | tokamax's flash attention, its Mosaic kernels: a document and a window as each query's first key, sinks by the logsumexp. With `seq` over `context`, a device gathers every key and value and attends with its queries in one call: all-gather CP, whose backward pass does every block. |
 | `ring` | Every key and value gathered once over `context`, and a flash call for each device's block of them, merged by their logsumexps. Blocks no query sees are skipped. See [Ring](#ring). |
