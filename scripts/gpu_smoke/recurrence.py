@@ -6,10 +6,13 @@ them, and RWKV-7's with its bounded decay through each chunk's middle. XLA's GPU
 grouped einsum's took Mamba-2's gradients for B and C wrong. Then the delta rule by
 its kernels, in bfloat16, against its chunks in float32: cuDNN's (``fused_delta``),
 GDN's at steep gates and spikes and KDA's at a gate bounded at -5, and bux's own for
-KDA (``pallas_delta``) at steep gates, spikes and Kimi's own gate. Last, decayed
+KDA (``pallas_delta``) at steep gates, spikes and Kimi's own gate. Then decayed
 linear attention by cuDNN's GDN-2 kernel against its chunks: GLA's own gate, steep
 gates, spikes, heads of 64, rows of more documents than the kernel takes, and
-Lightning's decays.
+Lightning's decays. Last, Gated DeltaNet-2 by the same kernel against its chunks: at
+gates bounded at -5, as the layer gives it them, and its own gate as it starts, heads
+of 64, more documents, erase gates up to 2, and steep gates and spikes, which take its
+exact path.
 
     uv run --extra cuda python scripts/gpu_smoke/recurrence.py
 
@@ -276,6 +279,79 @@ def decayed_errors(case: str) -> list[float]:
     return [float(np.linalg.norm(a - b) / np.linalg.norm(b)) for a, b in zip(got, want)]
 
 
+Gates = Callable[[np.random.Generator, int], tuple[np.ndarray, ...]]  # g, b and w
+
+
+def drawn(gate: Gate, erase: float = 1.0) -> Gates:
+    """Log decays by `gate`, and erase and write gates, sigmoids of a normal, the
+    erase gate's times `erase`."""
+
+    def gates(rng: np.random.Generator, dim: int) -> tuple[np.ndarray, ...]:
+        b, w = 1 / (1 + np.exp(-rng.normal(size=(2, B, T, 16, dim))))
+        return gate(rng, dim), erase * b, w
+
+    return gates
+
+
+def gdn2(bound: float | None) -> Gates:
+    """The gates of a gdn2 layer, bounded below at `bound`, as it starts, of inputs
+    drawn from a normal."""
+
+    def gates(rng: np.random.Generator, dim: int) -> tuple[np.ndarray, ...]:
+        config = cfg.GatedDeltaNet2Config(
+            num_heads=16, head_dim=dim, gate_lower_bound=bound
+        )
+        layer = linear_attention.GatedDeltaNet2(config, 256, nnx.Rngs(0))
+        x = jnp.asarray(rng.normal(size=(B, T, 256)), jnp.float32)
+        return tuple(np.asarray(y) for y in layer._gates(x))
+
+    return gates
+
+
+# Gated DeltaNet-2 by GDN-2's kernel: the head dim, the gates, and a document every so
+# many positions. Unbounded and steep gates take its exact path, which the layer
+# leaves to the chunks.
+GATED: dict[str, tuple[int, Gates, int]] = {
+    "gdn2 by gdn-2, gates to -5": (128, drawn(steep(-5.0)), 1000),
+    "gdn2 by gdn-2, its own gate": (128, gdn2(-5.0), 1000),
+    "gdn2 by gdn-2, heads of 64": (64, drawn(steep(-5.0)), 1000),
+    "gdn2 by gdn-2, more documents": (128, drawn(steep(-5.0)), 41),
+    "gdn2 by gdn-2, erase gates to 2": (128, drawn(steep(-5.0), 2.0), 1000),
+    "gdn2 by gdn-2, unbounded": (128, gdn2(None), 1000),
+    "gdn2 by gdn-2, gates to -20": (128, drawn(steep(-20.0)), 1000),
+    "gdn2 by gdn-2, spikes of -1e4": (128, drawn(steep(-1.0, -1e4)), 1000),
+}
+
+
+def gated_errors(case: str) -> list[float]:
+    """How far Gated DeltaNet-2 by GDN-2's kernel is from its chunks: the outputs,
+    then each input's gradient, as a share of its norm. More documents a row than the
+    kernel's room run by the chunks."""
+    dim, gates, every = GATED[case]
+    rng = np.random.default_rng(list(GATED).index(case))
+    positions = jnp.asarray(np.arange(T) % every, jnp.int32)
+    docs = Segments.of(jnp.broadcast_to(positions, (B, T)))
+    q, k, v = rng.normal(size=(3, B, T, 16, dim))
+    q = q / np.linalg.norm(q, axis=-1, keepdims=True) / np.sqrt(dim)
+    k = k / np.linalg.norm(k, axis=-1, keepdims=True)
+    g, erase, write = gates(rng, dim)
+    qkv = (jnp.asarray(x, jnp.bfloat16) for x in (q, k, v))
+    bw = (jnp.asarray(x, jnp.bfloat16) for x in (erase, write))
+    xs = (*qkv, jnp.asarray(g, jnp.float32), *bw)
+    assert fused_delta.gated_runs(dim, dim, jnp.bfloat16, fused_delta.FLOOR)
+    otherwise = partial(linear_attention._gated_chunked, states="recompute")
+
+    def kernel(*xs: Float[Array, "..."]) -> Float[Array, "b t h dv"]:
+        return fused_delta.gated(*xs, docs, otherwise).astype(jnp.float32)
+
+    def chunks(*xs: Float[Array, "..."]) -> Float[Array, "b t h dv"]:
+        f32 = (x.astype(jnp.float32) for x in xs)
+        return linear_attention._gated_chunked(*f32, docs)
+
+    got, want = (weighted(f, xs) for f in (kernel, chunks))
+    return [float(np.linalg.norm(a - b) / np.linalg.norm(b)) for a, b in zip(got, want)]
+
+
 def weighted(f: Callable[..., Float[Array, "..."]], xs: tuple) -> list[np.ndarray]:
     """f's outputs, and the gradients of a weighted sum of them for every input."""
 
@@ -302,6 +378,7 @@ def main() -> None:
     forms = [report(case, errors(case), TOLERANCE) for case in CASES]
     kernels = [report(c, kernel_errors(c), KERNEL_TOLERANCE) for c in KERNELS]
     kernels += [report(c, decayed_errors(c), KERNEL_TOLERANCE) for c in DECAYED]
+    kernels += [report(c, gated_errors(c), KERNEL_TOLERANCE) for c in GATED]
     sys.exit(0 if all(forms) and all(kernels) else 1)
 
 

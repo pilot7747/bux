@@ -1,0 +1,14 @@
+# OLMo 2 32B (Allen AI, 2025): the largest OLMo 2 and the only one with GQA, 40 query
+# heads over 8 key and value heads of 128, at 64 layers 5120 wide. The rest is OLMo 2
+# 7B's design.
+d_model    = 5120
+vocab_size = 100352
+
+init = normal(std=0.02, truncate=3)
+norm = rmsnorm(eps=1e-6)
+attn = gqa(num_heads=40, num_kv_heads=8, qk_norm=norm, qk_norm_all_heads=true,
+           rope=rope(base=500000))
+ffn  = gated_mlp(intermediate_size=27648, activation=swish)
+
+block = [attn norm] [ffn norm]
+model = embed block^64 norm head

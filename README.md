@@ -95,8 +95,8 @@ uv run bux prepare examples/experiments/speedrun.bux          # the speedrun's F
 See the [data guide](docs/data/index.md) for conversations, packings, and the pipeline.
 
 Explore the [example architectures](examples/architectures/), from GPT-2 to recent
-releases grouped by model family (Cohere, DeepSeek, GLM, Inkling, Kimi, Laguna, Mellum,
-MiMo, MiniMax, Muse, Nemotron, Qwen, Reflection), the
+releases grouped by model family (Arcee, Cohere, DeepSeek, GLM, Inkling, Kimi, Laguna,
+Mellum, MiMo, MiniMax, Muse, Nemotron, OLMo, Qwen, Reflection, SmolLM), the
 [example experiments](examples/experiments/) that train them, and the
 [language guide](docs/language/index.md) for composition, residual connections,
 parameter sharing, and editor support.
