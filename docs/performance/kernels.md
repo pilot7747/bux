@@ -46,7 +46,7 @@ The speedups are against XLA's own program for the same computation, on a B300.
 
 | what | by | on a B300, against XLA |
 |------|----|------------------------|
-| softmax attention | `methods.attention = auto`, the default: cuDNN's causal kernels in rows of one document, cuDNN's fused attention in rows of 8192 or more and with a window, else tokamax's flash attention (sinks, a soft cap) | 7x, and no t × t logits |
+| softmax attention | `methods.attention = auto`, the default: cuDNN's causal kernels in rows of one document; FlashAttention-4's (CuTe DSL) in rows of documents or with a window, with sinks, a soft cap, and for MLA's head dims; where it does not run, cuDNN's fused attention in rows of 8192 or more and with a window, else tokamax's flash attention | 7x, and no t × t logits |
 | QK-norm then RoPE | `norm_rope`: a Pallas kernel a pass, forward and backward, for an RMSNorm with a scale and RoPE by halves (Qwen3's, OLMo 2's) | 1.4x forward, 1.9x backward (Qwen3-30B-A3B's queries in megatron.bux's step: 0.12 and 0.24 ms a layer) |
 | sparse attention (DSA, QSA, CSA) | `sparse`: tokamax's flash attention with the kept keys as a mask; the indexer's scores and its loss's target by Pallas kernels (`scoring`); its top-k and its loss's scores of the picks by cuDNN's DSA kernels (`indexer_cudnn`) | 2.6x a chunk of queries at a time, and no t × t floats; at 32k the indexer's selection 3.6x, its loss's picks 5.2x, the DSA 1B's step 1.8x |
 | CSA's attention (DeepSeek-V4) | `sparse_cudnn`: cuDNN's DSA kernels (CuTe DSL), each query's window and kept latents and the sinks in one softmax, forward and backward; the indexer's target at its picks | 15x at 4k tokens, 55x at 16k, forward and backward; the target 6x and 31x |
@@ -69,6 +69,7 @@ Where they live:
 | kernel | module |
 |--------|--------|
 | flash attention, cuDNN's and tokamax's | {py:mod}`bux.parallel.flash` |
+| FlashAttention-4's | {py:mod}`bux.parallel.fa4` |
 | `norm_rope` | {py:mod}`bux.architecture.attention.norm_rope` |
 | `sparse`, `scoring`, `indexer_cudnn` | {py:mod}`bux.architecture.attention.sparse`, {py:mod}`bux.architecture.attention.scoring`, {py:mod}`bux.architecture.attention.indexer_cudnn` |
 | `sparse_cudnn` | {py:mod}`bux.architecture.attention.sparse_cudnn` |
@@ -87,8 +88,10 @@ by XLA instead, with the same values up to rounding. Outside a GPU, and inside
 
 | kernel | runs where | else |
 |--------|------------|------|
-| cuDNN's attention, any | a GPU of compute capability 9 or more with cuDNN; bfloat16 or float16; key and value head dims equal, up to 256, in steps of 8; no soft cap | tokamax's |
-| cuDNN's causal kernels (`flash.CUDNN`) | a row is one document (a `lax.cond` asks, as every run's rows have ids); no window. Sinks fold in by the logsumexp | cuDNN's packed layout, or tokamax's |
+| FlashAttention-4's (`fa4`) | a Blackwell GPU (SM 10.x) with flash-attn-4 (the `cuda` extra); bfloat16 or float16; key and value head dims equal, up to 128, in steps of 8, or 192 and 128 (MLA); whole rows (under `context`, `ulysses` gives it them) | cuDNN's, else tokamax's |
+| FlashAttention-4's varlen layout, rows of documents | no more documents in a device's rows than its room (`fa4.room`: 16 a row of 4096) | tokamax's, by a `lax.cond` |
+| cuDNN's attention, any | a GPU of compute capability 9 or more with cuDNN; bfloat16 or float16; key and value head dims equal, up to 256, in steps of 8; no soft cap | FlashAttention-4's, else tokamax's |
+| cuDNN's causal kernels (`flash.CUDNN`) | a row is one document (a `lax.cond` asks, as every run's rows have ids); no window. Sinks fold in by the logsumexp | FlashAttention-4's, cuDNN's packed layout, or tokamax's |
 | cuDNN's packed layout, rows of documents | rows of 8192 or more, or a window; no sinks; no more documents a row than its room (`context.documents_bound`: up to t / 256) | tokamax's, by a `lax.cond` |
 | cuDNN's attention backward | XLA's deterministic ops off (under them XLA builds it no graph on a B300) | tokamax's backward |
 | tokamax's flash attention | Linux, the `cuda` extra; bfloat16 or float16 | in float32 tokamax's Triton kernel; else XLA's t × t logits (`xla`) |
@@ -252,18 +255,30 @@ On rows of one document (random tokens, `remat=none`), on one GPU, the 1.3B trai
 155k tok/s by cuDNN's causal kernels and at 148k by tokamax's.
 
 On packed documents (`best_fit` of documents of 16 to 4000 words, GPT-2 tokens), on one
-GPU, the 1.3B trains:
+GPU, the 1.3B trained at 145k tok/s by tokamax's kernels in rows of 4096, and in rows
+of 16384 at 139k by cuDNN's packed layout, which skips every block no query sees, and
+at 109k by tokamax's, whose backward does every block of a row. FlashAttention-4's
+kernels skip every block no query sees, forward and backward, and take sinks, a soft
+cap and MLA's head dims. The runs before them and by them, on the same B300, 30 steps
+a GPU each:
 
-| rows | kernel | tok/s |
-|------|--------|-------|
-| 4096 | tokamax's | 145k |
-| 16384 | cuDNN's, which skips every block no query sees | 139k |
-| 16384 | tokamax's, whose backward does every block of a row | 109k |
-| 4096, with sinks | tokamax's | 142k, where `auto` took `xla`, whose t × t logits did not fit |
+| run | before | by FlashAttention-4 | peak memory |
+|-----|--------|---------------------|-------------|
+| the 1.3B, rows of 4096 | 143k, tokamax's | 151k, +5% | 51.1 GiB either way |
+| the 1.3B with a sink a head, rows of 4096 | 144k, tokamax's | 150k, +4% | 51.1 GiB either way |
+| the 1.3B, rows of 16384 | 123k, cuDNN's packed layout, tokamax's past its room | 149k, +21% | 58.5 → 51.1 GiB |
+| MLA (16 heads of 192 and 128), rows of 4096 | 132k, tokamax's | 138k, +5% | 59.8 GiB either way |
+| gpt-oss's attention (64 heads of 8 kv heads of 64, sinks, every other layer in a window of 128), rows of 4096 | 101k, tokamax's | 127k, +26% | 57.6 → 55.5 GiB |
 
-On random tokens the two rows of 16384 train at 111k and 101k. Each kernel's times, the
-same in training on 8 GPUs, and rows of 32k and 128k over 8 GPUs under context
-parallelism, are in [Attention](../parallelism/attention.md#measurements).
+On random tokens, rows of one document, the MLA model trains at 131k by tokamax's
+kernels and at 135k by FlashAttention-4's (+4%), and gpt-oss's attention at 112k and
+127k (+14%), its windows by FlashAttention-4's and the rest by cuDNN's. The 1.3B,
+cuDNN's either way, trains at 152k and 150k, the same within the noise.
+
+In rows of 16384 of random tokens the 1.3B trains at 111k by cuDNN's and 101k by
+tokamax's. Each kernel's times, the same in training on 8 GPUs, and rows of 32k and
+128k over 8 GPUs under context parallelism, are in
+[Attention](../parallelism/attention.md#measurements).
 
 ### Sparse attention
 

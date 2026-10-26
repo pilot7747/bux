@@ -42,7 +42,11 @@ bux-lsp = "bux.lang.lsp.server:main"
 cuda = [
     "jax[cuda13]>=0.12.0; sys_platform == 'linux'",
     "tokamax[cuda]>=0.0.17; sys_platform == 'linux'",
-    # cudnn-frontend's DSA kernels import torch, which their JAX calls never use: CPU's
+    # FlashAttention-4's CuTe DSL kernels (bux.parallel.fa4), which bux calls through
+    # cutlass.jax
+    "flash-attn-4>=4.0.0b36; sys_platform == 'linux'",
+    # FlashAttention-4's and cudnn-frontend's DSA modules import torch, which their JAX
+    # calls never use: its CPU build, beside jax's CUDA
     "torch>=2.14.1; sys_platform == 'linux'",
 ]
 lsp = [
@@ -104,4 +108,4 @@ error-on-warning = true
 extra-paths = ["docs/_ext"]  # the docs' Sphinx extension
 
 [tool.ty.analysis]
-allowed-unresolved-imports = ["pyspark.**", "tokamax.**", "cudnn.**", "cutlass.**", "triton.**", "jax_triton.**", "transformer_engine.**"]  # the `spark` and `cuda` extras, and the image's TE
+allowed-unresolved-imports = ["pyspark.**", "tokamax.**", "cudnn.**", "cutlass.**", "triton.**", "jax_triton.**", "flash_attn.**", "transformer_engine.**"]  # the `spark` and `cuda` extras, and the image's TE
