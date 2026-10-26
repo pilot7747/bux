@@ -10,5 +10,6 @@ to train it; ``bux train FILE`` trains it. The packages, in the order a run uses
 - `bux.train`: the trainer, its settings, optimizers and hooks.
 - `bux.parallel`: the mesh, and every kind of parallelism.
 - `bux.launch`: sweeps over GPUs, many hosts, status and signals.
+- `bux.softmax`: a softmax whose gradients hold where a float rounds it to 1.
 - `bux.runtime`, `bux.kernels`, `bux.passes`, `bux.jax_internals`: JAX and XLA.
 """

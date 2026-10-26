@@ -15,9 +15,9 @@ that the GPU never waits for the host to launch a step. Another hook is a subcla
 
     train(run, hooks=[WeightNorm()])
 
-A run's own hooks are `Log`, `Eval`, `Checkpoint` and `Profile`, made from its
-``log``, ``eval``, ``checkpoint`` and ``profile`` settings. Hooks run in order, so
-the run's own see a step first. When training stops early (``Trainer.stopping``,
+A run's own hooks are `Log`, an `Eval` for each of its evals, `Checkpoint` and
+`Profile`, made from its ``log``, ``eval``, ``checkpoint`` and ``profile`` settings.
+Hooks run in order, so the run's own see a step first. When training stops early (``Trainer.stopping``,
 which the launcher sets at SIGTERM), every hook's `Hook.stop` runs at the step it
 stopped at, and the checkpoint hook saves it.
 """
@@ -36,11 +36,11 @@ import numpy as np
 import orbax.checkpoint as ocp
 from flax import nnx
 from jax.experimental import multihost_utils
-from jaxtyping import Array, Shaped
+from jaxtyping import Array, Int32, Shaped
 
 from bux import parallel
 from bux.lang.printer import value_to_source
-from bux.train import trace
+from bux.train import profilers, trace
 from bux.train.data import Batch
 from bux.train.objective import Metrics
 from bux.train.optim import Schedule
@@ -153,30 +153,43 @@ class Log(Hook):
 
 
 class Eval(Hook):
-    """Held-out loss: the first head's, over the first `batches` batches of `data`,
-    the same ones every time, as `eval_loss` (``Trainer.evaluate``).
+    """Held-out metrics over the first `batches` batches of `data`, the same ones
+    every time (``Trainer.evaluate``): the first head's loss, as ``<name>_loss``, and
+    given each token id's bytes of text, its bits per byte, ``<name>_bpb``.
 
     Args:
         data: A function that returns the held-out batches from the first, each time
             it is called.
         every: The steps between evaluations.
         batches: The batches an evaluation reads.
+        name: What the metrics' names start with.
+        token_bytes: The bytes of text each id of the model's vocabulary stands for
+            (``Tokenizer.token_bytes``); None leaves out bits per byte.
 
     Example::
 
         held_out = functools.partial(batches, eval_data, config, vocab, held_out=True)
-        train(run, hooks=[Eval(held_out, every=500, batches=20)])
+        train(run, hooks=[Eval(held_out, every=500, batches=20, name="val")])
     """
 
     def __init__(
-        self, data: Callable[[], Iterator[Batch]], *, every: int, batches: int
+        self,
+        data: Callable[[], Iterator[Batch]],
+        *,
+        every: int,
+        batches: int,
+        name: str = "eval",
+        token_bytes: Int32[np.ndarray, " vocab"] | None = None,
     ):
         self.data, self.every, self.batches = data, every, batches
+        self.name, self.token_bytes = name, token_bytes
 
     def __call__(self, trainer: "Trainer", metrics: Metrics) -> Scalars:
-        """Return ``{"eval_loss": ...}``, the trainer's mean loss on the batches."""
+        """Return the trainer's means on the batches, each under the eval's name:
+        ``{"eval_loss": ..., "eval_bpb": ...}``."""
         held_out = itertools.islice(self.data(), self.batches)
-        return {"eval_loss": trainer.evaluate(held_out)}
+        means = trainer.evaluate(held_out, self.token_bytes)
+        return {f"{self.name}_{k}": v for k, v in means.items()}
 
 
 class Checkpoint(Hook):
@@ -271,22 +284,25 @@ class Checkpoint(Hook):
 
 
 class Profile(Hook):
-    """A jax.profiler trace, into `folder`, of the `steps` steps after step `start`.
-    It waits for the step before it starts and stops, so the trace holds whole steps.
+    """A trace of the `steps` steps after step `start`: jax.profiler's, into `folder`,
+    or the capture of the tool the process runs under, nsys or ncu
+    (`bux.train.profilers`). It waits for the step before it starts and stops, so the
+    trace holds whole steps.
 
-    On GPUs it then reports what a step of them spent in collectives, `comm_ms`, in
-    collectives with no compute beside them, `exposed_comm_ms`, and running nothing,
-    `idle_ms` (`bux.train.trace`).
+    On GPUs, jax.profiler's then reports what a step of them spent in collectives,
+    `comm_ms`, in collectives with no compute beside them, `exposed_comm_ms`, and
+    running nothing, `idle_ms` (`bux.train.trace`).
 
     Args:
         folder: Where jax.profiler writes the trace.
         start: The step after which the trace starts.
         steps: The steps it traces.
+        tool: What traces: ``jax``, or the tool the process runs under.
     """
 
-    def __init__(self, folder: Path, *, start: int, steps: int):
+    def __init__(self, folder: Path, *, start: int, steps: int, tool: str = "jax"):
         self.folder, self.first, self.last = folder, start, start + steps
-        self.tracing = False
+        self.tool, self.tracing = tool, False
 
     def due(self, step: int, steps: int) -> bool:
         """Return whether `step` is the one the trace starts or stops after."""
@@ -301,13 +317,15 @@ class Profile(Hook):
         return what the steps spent in communication, on GPUs."""
         jax.block_until_ready(metrics)
         self._at(trainer.step)
-        if trainer.step != self.last or (file := trace.latest(self.folder)) is None:
+        if trainer.step != self.last or self.tool != "jax":
+            return None
+        if (file := trace.latest(self.folder)) is None:
             return None
         return trace.comm_ms(file, self.last - self.first)
 
     def _at(self, step: int) -> None:
         if step == self.first:
-            jax.profiler.start_trace(self.folder)
+            profilers.start(self.tool, self.folder)
             self.tracing = True
         else:
             self.close()
@@ -315,7 +333,7 @@ class Profile(Hook):
     def close(self) -> None:
         """Stop the trace if it is running."""
         if self.tracing:
-            jax.profiler.stop_trace()
+            profilers.stop(self.tool)
             self.tracing = False
 
 

@@ -2,7 +2,8 @@
 
 # GPU image for bux: JAX on CUDA 13 for Blackwell (and Hopper), plus tokamax's Pallas kernels
 # (FlashAttention, MoE grouped matmul) and cudnn-frontend's (KDA), which tokamax's extra brings
-# (docs/performance/kernels.md), and TransformerEngine's JAX bindings (NCCL EP). CUDA, cuDNN and NCCL come from the
+# (docs/performance/kernels.md), TransformerEngine's JAX bindings (NCCL EP), and the Nsight profilers,
+# nsys and ncu (docs/performance/profiling.md). CUDA, cuDNN and NCCL come from the
 # `cuda` extra's pip wheels, pinned in uv.lock, so the base image only needs to supply the driver
 # plumbing; CUDA_VERSION should track the toolkit those wheels ship.
 #
@@ -26,6 +27,20 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
   ca-certificates \
   ibverbs-providers \
   libibverbs1 \
+  && rm -rf /var/lib/apt/lists/*
+
+# Nsight Systems' CLI and Nsight Compute, for `profile(tool=nsys)` and `profile(tool=ncu)`
+# (docs/performance/profiling.md): nsys from NVIDIA's devtools repository, signed by its own key,
+# and ncu from the CUDA repository the base image has, for the base image's toolkit.
+ADD https://developer.download.nvidia.com/devtools/repos/ubuntu2404/amd64/nvidia.pub \
+  /usr/share/keyrings/nvidia-devtools.asc
+RUN chmod 644 /usr/share/keyrings/nvidia-devtools.asc && \
+  echo "deb [signed-by=/usr/share/keyrings/nvidia-devtools.asc]" \
+  "https://developer.download.nvidia.com/devtools/repos/ubuntu2404/$(dpkg --print-architecture) /" \
+  > /etc/apt/sources.list.d/nvidia-devtools.list && \
+  apt-get update && apt-get install -y --no-install-recommends \
+  nsight-systems-cli \
+  "cuda-nsight-compute-$(echo $CUDA_VERSION | cut -d. -f1,2 | tr . -)" \
   && rm -rf /var/lib/apt/lists/*
 
 # The CUDA 13 wheels work with any 580+ driver through minor version compatibility, so don't let

@@ -136,8 +136,9 @@ def test_parameters_gradients_and_the_optimizer_state_stay_float32():
 
 
 def test_eval_computes_in_bfloat16_near_float32():
-    f32 = _trainer(ARCHITECTURES["llama"]).evaluate([_batch()])
+    f32 = _trainer(ARCHITECTURES["llama"]).evaluate([_batch()])["loss"]
     bf16 = _trainer(ARCHITECTURES["llama"], compute=jnp.bfloat16).evaluate([_batch()])
+    bf16 = bf16["loss"]
     assert bf16 == pytest.approx(f32, rel=1e-2) and bf16 != f32
 
 
@@ -714,7 +715,7 @@ def test_evaluation_in_compute_evaluates_as_compute_does():
     def evaluated(precision: tcfg.PrecisionConfig | str) -> float:
         llama = ARCHITECTURES["llama"]
         trainer = _trainer(llama, compute=jnp.bfloat16, matmuls=precision)
-        return trainer.evaluate([_batch()])
+        return trainer.evaluate([_batch()])["loss"]
 
     mxfp8 = tcfg.PrecisionConfig(matmuls="mxfp8")
     in_compute = mxfp8.model_copy(update={"eval": "compute"})
