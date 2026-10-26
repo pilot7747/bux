@@ -177,7 +177,9 @@ def test_a_rematerialized_pipeline_trains_as_one_device(losses, remat):
 
 def test_a_pipelined_residual_algebra_trains_as_one_device(losses):
     piped = losses(HC, mesh="mesh(stage=4, tensor=2)", methods=_how(4))
-    assert np.allclose(piped, losses(HC, mesh=ONE, methods=SCAN), atol=1e-5)
+    # The losses part from the second step, by float32's rounding of the first update,
+    # more on x86 than on arm64: by 7.5e-5 on CI's runners.
+    assert np.allclose(piped, losses(HC, mesh=ONE, methods=SCAN), atol=2e-4)
 
 
 def test_a_pipelined_moe_reports_the_mean_of_its_microbatches_losses(losses):

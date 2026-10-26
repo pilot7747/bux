@@ -52,12 +52,13 @@ ONE = {"one device": ({"data": 1}, "context")}
 MX = tcfg.PrecisionConfig(matmuls="mxfp8")
 # Precisions; the branches of LLAMA (of 4) that chunked splits into chunks, as a
 # projection whose share would multiply otherwise than the whole stays gspmd's; and
-# how near its gradients come. Where NVFP4 takes a gradient that a chunked branch
-# summed otherwise in its last bits, its 2-bit mantissa moves some values a step.
+# how near its logits and gradients come. Where a quantized format takes a value that
+# a chunked branch summed otherwise in its last bits, as x86 does more often than
+# arm64, its mantissa (MXFP8's 3 bits, NVFP4's 2) moves some values a step.
 PRECISIONS = {
     "compute": (tcfg.PrecisionConfig(), 4, 1e-5),
-    "mxfp8": (MX, 4, 1e-5),
-    "mxfp8_2d": (tcfg.PrecisionConfig(matmuls="mxfp8_2d"), 4, 1e-5),
+    "mxfp8": (MX, 4, 1e-3),
+    "mxfp8_2d": (tcfg.PrecisionConfig(matmuls="mxfp8_2d"), 4, 1e-3),
     "nvfp4": (tcfg.PrecisionConfig(matmuls="nvfp4"), 0, 1e-5),
     "mxfp8, the MLPs nvfp4": (
         MX.model_copy(update={"roles": tcfg.RolesConfig(mlp="nvfp4")}),
@@ -115,10 +116,13 @@ def _outputs(
 
 
 def assert_close(a, b, tolerance: float = 1e-5) -> None:
-    def close(x: Float[np.ndarray, "*s"], y: Float[np.ndarray, "*s"]) -> bool:
-        return np.allclose(x, y, atol=tolerance * max(1.0, np.abs(y).max()))
+    def off(x: Float[np.ndarray, "*s"], y: Float[np.ndarray, "*s"]) -> float:
+        """`x`'s farthest value from `y`'s, over what np.allclose allows: 1 at most."""
+        allowed = tolerance * max(1.0, np.abs(y).max()) + 1e-5 * np.abs(y)
+        return float(np.max(np.abs(x - y) / allowed))
 
-    assert jax.tree.all(jax.tree.map(close, a, b))
+    worst = float(np.max(jax.tree.leaves(jax.tree.map(off, a, b))))
+    assert worst <= 1, f"{worst:.3g} times as far apart as {tolerance:g} allows"
 
 
 @pytest.mark.parametrize("chunks", [1, 2, 4])
@@ -158,7 +162,7 @@ def test_each_projection_by_chunks_multiplies_as_it_does_whole_in_its_format(
     wide = "init = fan_in\n" + WIDE
     (logits, grads), counts = _outputs("chunked", mesh, wide, precision)
     (whole_logits, whole_grads), _ = _outputs("gspmd", mesh, wide, precision)
-    assert_close(logits, whole_logits)
+    assert_close(logits, whole_logits, tolerance)
     assert_close(grads, whole_grads, tolerance)
     # Each chunked branch reduce-scatters its output forward and its input's gradient
     # backward, in 2 chunks.
