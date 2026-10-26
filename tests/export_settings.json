@@ -3,6 +3,7 @@
   "affine",
   "bias",
   "eps",
+  "gain_init",
   "scale_input",
   "type",
   "zero_centered"
@@ -24,7 +25,10 @@
  "MoEConfig": [
   "aux_loss_coef",
   "aux_loss_scope",
+  "bias_momentum",
+  "bias_softclamp",
   "bias_update_rate",
+  "center_bias",
   "expert",
   "expert_norm",
   "latent_input_norm",
@@ -345,6 +349,11 @@
  "ResidualGateConfig": [
   "eps",
   "temperature",
+  "type"
+ ],
+ "NormalInitConfig": [
+  "std",
+  "truncate",
   "type"
  ]
 }

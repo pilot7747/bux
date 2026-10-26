@@ -61,6 +61,14 @@ ATTN = "gqa(num_heads=4, num_kv_heads=2, head_dim=8"
 #: The widths of the zoo's models that `SHRUNK` has no entry for, and `SMALL` leaves
 #: wide: their heads, hidden units and experts, as `SHRUNK` shrinks the others'.
 WIDTHS = {
+    "arcee/trinity_mini.bux": [
+        "attn = gqa(num_heads=4, num_kv_heads=2, head_dim=8, qk_norm=norm, gated=true)",
+        (
+            "experts = moe(num_experts=4, top_k=2, num_shared_experts=1, router=sigmoid,"
+            " routed_scaling_factor=2.826, load_balancing=aux_free, center_bias=true,"
+            " expert=dense)"
+        ),
+    ],
     "llama3_8b.bux": [f"attn = {ATTN}, rope=rope(base=500000))", "ffn = dense"],
     "llama3_70b.bux": [f"attn = {ATTN}, rope=rope(base=500000))", "ffn = dense"],
     "gemma3_4b.bux": [
