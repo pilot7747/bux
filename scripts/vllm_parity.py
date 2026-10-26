@@ -7,7 +7,8 @@ three steps:
     # bux's environment: export each case and its prompts
     JAX_PLATFORMS=cpu python scripts/vllm_parity.py export DIR [--dtype bfloat16]
     # vLLM's, with the plugin (pip install src/bux_vllm): decode them
-    python scripts/vllm_parity.py run DIR [--tp 2] [--eager] [--tag TAG]
+    python scripts/vllm_parity.py run DIR [--tp 2] [--eager] [--moe-backend triton]
+        [--tag TAG]
     # bux's again: compare
     JAX_PLATFORMS=cpu python scripts/vllm_parity.py compare DIR [--tag TAG]
 
@@ -163,6 +164,7 @@ def main() -> None:
     for name in ("run", "run-one"):
         sub.choices[name].add_argument("--tp", type=int, default=1)
         sub.choices[name].add_argument("--eager", action="store_true")
+        sub.choices[name].add_argument("--moe-backend", default="auto")
     sub.choices["compare"].add_argument("--tolerance", type=float, default=1e-3)
     sub.choices["compare"].add_argument("--margin", type=float, default=0.0)
     args = p.parse_args()
@@ -175,7 +177,7 @@ def main() -> None:
             for name in cases:
                 run_alone(args, name)
         case "run-one":
-            run(args.dir / cases[0], args.tag, args.tp, args.eager)
+            run(args.dir / cases[0], args.tag, engine(args))
         case "compare":
             bad = [n for n in cases if not compare(n, args)]
             sys.exit(1 if bad else 0)
@@ -296,13 +298,23 @@ def _add_router_biases(model: Any, arch: Any, out: Path) -> None:
 def run_alone(args: argparse.Namespace, name: str) -> None:
     """Run case `name` in a process of its own, as each vLLM engine wants one."""
     cmd = [sys.executable, __file__, "run-one", str(args.dir), "--only", name]
-    cmd += ["--tag", args.tag, "--tp", str(args.tp)] + ["--eager"] * args.eager
-    subprocess.run(cmd, check=False)
+    cmd += ["--tag", args.tag, "--tp", str(args.tp), "--moe-backend", args.moe_backend]
+    subprocess.run(cmd + ["--eager"] * args.eager, check=False)
 
 
-def run(where: Path, tag: str, tp: int, eager: bool) -> None:
-    """Decode the prompts of the export at `where` greedily with vLLM; keep the
-    tokens and every position's log-probabilities in ``<tag>.npz``."""
+def engine(args: argparse.Namespace) -> dict:
+    """vLLM's engine arguments the command line sets."""
+    return {
+        "tensor_parallel_size": args.tp,
+        "enforce_eager": args.eager,
+        "moe_backend": args.moe_backend,
+    }
+
+
+def run(where: Path, tag: str, engine: dict) -> None:
+    """Decode the prompts of the export at `where` greedily with vLLM, its engine
+    made with the arguments `engine`; keep the tokens and every position's
+    log-probabilities in ``<tag>.npz``."""
     from vllm import LLM, SamplingParams
     from vllm.inputs import TokensPrompt
 
@@ -311,13 +323,12 @@ def run(where: Path, tag: str, tp: int, eager: bool) -> None:
     llm = LLM(
         model=str(where),
         dtype=meta["dtype"],
-        tensor_parallel_size=tp,
         skip_tokenizer_init=True,
         max_model_len=MAX_LEN,
         max_logprobs=vocab,
-        enforce_eager=eager,
         gpu_memory_utilization=0.5,
         seed=0,
+        **engine,
     )
     params = SamplingParams(
         temperature=0.0,
