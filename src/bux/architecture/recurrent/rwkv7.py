@@ -27,6 +27,10 @@ from bux.architecture.recurrent.linear_attention import (
 from bux.architecture.registry import Context, Taps, register, segments
 from bux.lang import ir
 
+# The least log decay, -e^-0.5 sigmoid's bound: so small that the chunks take a pair's
+# decay per channel by one matmul (``chunkwise``).
+FLOOR = -math.exp(-0.5)
+
 
 def _previous(x: Float[Array, "b t d"], docs: Segments | None) -> Float[Array, "b t d"]:
     """Return every token's predecessor in its document, zero at a document's
@@ -177,7 +181,7 @@ class RWKV7(nnx.Module):
             mix = jax.nn.sigmoid(self.v_mix(xv)).reshape(v.shape)
             v = v + (read(taps, self.ports, "v") - v) * mix
         write(taps, self.ports, "v", v)
-        log_w = -math.exp(-0.5) * jax.nn.sigmoid(self.w(xw))
+        log_w = FLOOR * jax.nn.sigmoid(self.w(xw))
         a = jax.nn.sigmoid(self.a(xa))
         kk = k * self.k_k
         k = k * (1 + (a - 1) * self.k_a)
@@ -188,7 +192,8 @@ class RWKV7(nnx.Module):
 
         r, k, log_w, a, kk = map(split, (r, k, log_w, a, kk))
         kk = l2norm(kk, eps=1e-12)
-        o = shard_heads(recurrence(r, k, v, log_w, docs, a=-kk, b=kk * a))
+        o = recurrence(r, k, v, log_w, docs, a=-kk, b=kk * a, floor=FLOOR)
+        o = shard_heads(o)
         o = self.norm(o) + (r * k * self.r_k).sum(-1, keepdims=True) * v
         o = o.reshape(b, t, -1)
         if self.g is not None:

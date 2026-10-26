@@ -11,7 +11,10 @@ dense compute, exact, and t² bits of mask forward and bytes backward. Under
 ``methods.attention = xla``, off a GPU, or inside `bux.kernels.off`, XLA runs it a
 chunk of queries at a time (`chunked`). Both return each query's logsumexp, from
 which the backward pass computes the probabilities again, as `probabilities` does for
-the indexer's loss.
+the indexer's loss. CSA's latents, 512 wide, which tokamax's kernels do not take, run
+by cuDNN's DSA kernels on a B200 or B300 where they take them
+(`~bux.architecture.attention.sparse_cudnn`), on each device's queries as here
+(`on_devices`).
 """
 
 from collections.abc import Callable, Sequence
@@ -49,8 +52,8 @@ class Kept(NamedTuple):
     """The slots each query keeps, by index; or, with `block`, the blocks it keeps,
     by the block's index. The ``index`` port carries it."""
 
-    #: Each query's kept slots or blocks, k at most, for all its heads or, with a
-    #: group axis, for each kv head's group of them; -1 for none.
+    #: Each query's kept slots or blocks, each once, k at most, for all its heads or,
+    #: with a group axis, for each kv head's group of them; -1 for none.
     index: Int[Array, "b t *g k"]
     #: Which block each slot is in, if it keeps blocks; else None.
     block: Int[Array, "b s"] | None = None
@@ -260,15 +263,40 @@ def attend(
         NotImplementedError: under another ``methods.attention``, which has no mask of
             kept keys; or under ``tokamax`` without it installed.
     """
-    static, parts = _Static(scale, cap, _flash(q), True), tuple(parts)
+    static = _Static(scale, cap, _flash(q), True)
+
+    def run(
+        q: Float[Array, "b t h dk"],
+        parts: tuple[Part, ...],
+        sinks: Float[Array, " h"] | None,
+        causal: bool,
+    ) -> tuple[Float[Array, "b t h dv"], Float[Array, "b t h"]]:
+        return _attend(q, parts, sinks, static._replace(causal=causal))
+
+    return on_devices(run, q, tuple(parts), sinks)
+
+
+Run = Callable[..., tuple[Float[Array, "b t h dv"], Float[Array, "b t h"]]]
+
+
+def on_devices(
+    run: Run,
+    q: Float[Array, "b t h dk"],
+    parts: tuple[Part, ...],
+    sinks: Float[Array, " h"] | None,
+) -> tuple[Float[Array, "b t h dv"], Float[Array, "b t h"]]:
+    """Return ``run(q, parts, sinks, causal)``, `attend`'s output and logsumexp, on
+    each device's rows, queries and heads, and every key, in a shard_map where the
+    mesh splits them. `causal` says whether a device's queries are at the keys'
+    slots, as when the positions are not split."""
     split = parallel.spec(("batch", "seq", "heads", None), q.shape)
     names = set(parallel.axes_of(split))
     if parallel.active() is None or not names:
-        return _attend(q, parts, sinks, static)
+        return run(q, parts, sinks, True)
     parts = tuple(_heads_like(p, split, q.shape[2]) for p in parts)
-    static = static._replace(causal=split[1] is None)
+    causal = split[1] is None
     return jax.shard_map(
-        lambda q, parts, sinks: _attend(q, parts, sinks, static),
+        lambda q, parts, sinks: run(q, parts, sinks, causal),
         in_specs=(
             split,
             tuple(_specs(p, split) for p in parts),

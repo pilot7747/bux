@@ -21,7 +21,8 @@ before a document's start reaches it.
 
 No exponent here is positive: a decay per key channel factors through the end of a
 block of `SUB` positions between s and t, and within a block it is taken one pair at a
-time.
+time. A decay bounded below, as RWKV-7's is, factors through the chunk's middle
+position instead, one matmul a pair product, its exponents positive but small.
 """
 
 from functools import partial
@@ -39,6 +40,10 @@ from bux.parallel.recurrence import Chunk, Positions, Transition
 SIZE = 64  # positions per chunk
 SUB = 16  # positions per block of a chunk, for a decay per key channel
 INVERSE = "recurrence.inverse"  # the name of each chunk's (I - L)^-1, which is kept
+# The most a chunk may decay a channel, as a log, for its pairs to factor through its
+# middle position: a factor's exponent is at most half of it, and exp(80) is finite
+# in float32.
+FACTORED = 80.0
 
 Chunks = Float[Array, "b n h c _"]  # (b, n, h, C, ...): n chunks of C positions
 Grouped = Float[Array, "b n g c _"]  # chunks of g heads, or of groups of h
@@ -47,13 +52,21 @@ States = Float[Array, "b n h dk dv"]  # one state per chunk
 Maps = Float[Array, "b n h dk dk"] | Float[Array, "b n h _"]  # A per chunk, or diagonal
 
 
-def chunk(xs: Positions, transition: bool, size: int = SIZE, sub: int = SUB) -> Chunk:
+def chunk(
+    xs: Positions,
+    transition: bool,
+    size: int = SIZE,
+    sub: int = SUB,
+    floor: float | None = None,
+) -> Chunk:
     """Run ``linear_attention.chunk``'s `xs` (q, k, v, log decay, continues, and a
     and b if any) from a zero state, in float32, by chunks of `size` positions; with
     `transition`, also return its map of a start state, and the reads. The delta
     rule's xs have a and no b, which is k: `_delta` takes them in half the work. With
     one decay a head and no a or b, q and k may be of fewer heads than v, each shared
-    by a group of them, as Mamba-2's C and B: `_scalar` takes them."""
+    by a group of them, as Mamba-2's C and B: `_scalar` takes them. `floor`, the
+    least log decay a position can have, if bounded, lets a decay per channel factor
+    through each chunk's middle (`_factored`)."""
     delta = len(xs) == 6
     xs = tuple(shard_whole_positions(x) for x in xs)
     q, k, v, g, *ab = (_split(x.astype(jnp.float32), size) for x in xs[:4] + xs[5:])
@@ -64,11 +77,18 @@ def chunk(xs: Positions, transition: bool, size: int = SIZE, sub: int = SUB) -> 
     else:
         affine = _delta if delta else _affine
         ab = ab[: 1 if delta else 2]
-        R, O, A, B = affine(q, k, v, g, seg, *ab, sub=min(sub, size))
+        blocks = None if _factors(floor, size) else min(sub, size)
+        R, O, A, B = affine(q, k, v, g, seg, *ab, sub=blocks)
         out, state, P, reads = _across(R, O, A, B, transition)
     t = xs[0].shape[1]
     reads = None if reads is None else shard_whole_positions(_merge(reads, t))
     return Chunk(shard_whole_positions(_merge(out, t)), state, P, reads)
+
+
+def _factors(floor: float | None, size: int) -> bool:
+    """Return whether a decay of at least `floor` a position factors through the
+    middle of a chunk of `size` positions (`FACTORED`)."""
+    return floor is not None and -floor * size <= FACTORED
 
 
 def shard_whole_positions(x: Float[Array, "b t *e"]) -> Float[Array, "b t *e"]:
@@ -121,11 +141,12 @@ def _affine(
     a: Chunks | None = None,
     b: Chunks | None = None,
     *,
-    sub: int,
+    sub: int | None,
 ) -> tuple[Chunks, Chunks, Maps, States]:
     """Return each chunk's R, O, A and B: its outputs R S_0 + O and end state
     A S_0 + B from a start state S_0, where `seg` counts the documents started by each
-    position. A is a matrix with a and b, else its diagonal (of dk, or of 1)."""
+    position. A is a matrix with a and b, else its diagonal (of dk, or of 1). `sub`
+    is `_pairwise`'s."""
     G, before, end, reach, same, tail = _decays(g, seg)
     qd = jnp.where(reach, q * jnp.exp(G), 0)  # Gamma(t, 0) q_t
     kd = jnp.where(tail, k * jnp.exp(end - G), 0)  # Gamma(C, s) k_s
@@ -151,7 +172,7 @@ def _delta(
     seg: Float[Array, "b n 1 c"],
     a: Chunks,
     *,
-    sub: int,
+    sub: int | None,
 ) -> tuple[Chunks, Chunks, Maps, States]:
     """Compute `_affine` where b is k: L_k = L, so U = T L V = T V - V, and the
     outputs and the end state read the chunk's values through T alone, O = M T V and
@@ -216,11 +237,13 @@ def _pairwise(
     gy: Chunks,
     same: Bool[Array, "b n 1 c c"],
     strict: bool,
-    sub: int,
+    sub: int | None,
 ) -> Pairs:
     """Return sum_c x[t, c] y[s, c] exp(gx[t, c] - gy[s, c]) for s before t (or at t,
     unless `strict`) of the `same` document, else 0; gx <= gy at every such pair. With
-    one decay per head, x and y may be of groups of gx's heads."""
+    one decay per head, x and y may be of groups of gx's heads. A decay per channel
+    goes by blocks of `sub` positions (`_channels`), or with `sub` None, bounded,
+    through the chunk's middle (`_factored`)."""
     c = x.shape[-2]
     index = jnp.arange(c)
     lower = index[:, None] > index[None, :] if strict else index[:, None] >= index
@@ -228,7 +251,21 @@ def _pairwise(
     if gx.shape[-1] == 1:  # one decay per head: a matmul, then the decays
         gap = jnp.where(visible, gx - jnp.swapaxes(gy, -1, -2), -jnp.inf)
         return _shared(x @ jnp.swapaxes(y, -1, -2), gx.shape[2]) * jnp.exp(gap)
+    if sub is None:
+        return jnp.where(visible, _factored(x, y, gx, gy), 0)
     return jnp.where(visible, _channels(x, y, gx, gy, lower, sub), 0)
+
+
+def _factored(x: Chunks, y: Chunks, gx: Chunks, gy: Chunks) -> Pairs:
+    """Compute `_pairwise` for a decay per key channel that `_factors`, at every pair:
+    one matmul of x decayed from the chunk's middle position and y to it, by
+    exp(gx - G_mid) and exp(G_mid - gy), whose product is the pair's decay."""
+    c = x.shape[-2]
+    # The pairs do not depend on G_mid, so neither do their gradients.
+    middle = jax.lax.stop_gradient(gy[..., c // 2 : c // 2 + 1, :])
+    left = x * jnp.exp(gx - middle)
+    right = y * jnp.exp(middle - gy)
+    return left @ jnp.swapaxes(right, -1, -2)
 
 
 def _shared(x: Float[Array, "b n g ..."], heads: int) -> Float[Array, "b n h ..."]:

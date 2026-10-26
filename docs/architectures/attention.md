@@ -627,8 +627,10 @@ msa  = attn(indexer=indexer(num_heads=4, head_dim=128, top_k=2048, block_size=12
 without blocks picks keys for each group. A layer that reads a per-group `index`
 needs as many kv heads as it has groups. Under tensor parallelism the indexer's
 heads and their picks split with the kv heads. On a GPU tokamax's kernel attends a
-group at a time, each with its group's mask; the indexer's scores and its loss run by
-XLA, as its kernels sum the heads' ReLU'd dot products.
+group at a time, each with its group's mask; the indexer's scores, top-k and loss run
+by XLA, as its kernels (`scoring`'s, and cuDNN's on a B200 or B300) sum the heads'
+ReLU'd dot products and pick once for all heads. Each of `pool=max`, `per_group` and
+`relu=false` keeps an indexer off them.
 
 :::{warning}
 `per_group` is `gqa`'s alone, and with blocks it takes `pool=max`. `pool=max` on
@@ -713,12 +715,19 @@ and the loss of each group over every key.
 ## How attention runs
 
 The layers make q, k and v; the run's `methods.attention` computes the softmax
-(`auto` by default: cuDNN's kernels and tokamax's flash attention on a GPU, `xla`
+(`auto` by default: cuDNN's kernels, FlashAttention-4's and tokamax's on a GPU, `xla`
 elsewhere). Sparse attention attends by `bux.architecture.attention.sparse`: on a
 GPU, tokamax's flash kernel with the kept keys as a mask; elsewhere, XLA a chunk of
 queries at a time; neither makes t × t floats. The indexer ranks a chunk of queries
 at a time too, and picks its top-k by counting the bits of the k-th highest score
 rather than sorting, which on a GPU is 6 times faster at 32k keys.
+
+`csa`'s latents are 512 wide, more than tokamax's kernels take. On a B200 or B300,
+cuDNN's DSA kernels (`bux.architecture.attention.sparse_cudnn`) attend each query to
+its window and the latents it keeps, and its sinks, in one softmax, forward and
+backward; the window-only layers too. Each query's list of slots holds its window's
+and its picks, so the cost is in the slots a query sees, not in the row's length. The
+indexer's loss then takes its target at the picks alone, by cuDNN's kernel too.
 
 - Methods, context parallelism and how attention splits over devices:
   [Attention](../parallelism/attention.md).

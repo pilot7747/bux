@@ -10,10 +10,12 @@ scores and picks have a group axis, ``(b, t, g, ...)``, after the queries'.
 `Indexer` ranks a chunk of queries at a time
 (`~bux.architecture.attention.sparse.chunked`), so that no t by t floats are made: on
 a GPU by `~bux.architecture.attention.scoring`'s kernel. It keeps each query's top-k
-by index (`~bux.architecture.attention.sparse.Kept`), named ``attention.index`` for a
-remat policy to keep. Its loss scores the kept keys again: on a GPU by
-`~bux.architecture.attention.scoring`'s kernels, which gather each query's up to its
-last, and whose backward pass adds their gradients into the keys atomically.
+by index (`~bux.architecture.attention.sparse.Kept`), on a B200 or B300 by cuDNN's
+radix kernel (`~bux.architecture.attention.indexer_cudnn`), named ``attention.index``
+for a remat policy to keep. Its loss scores the kept keys again: on a B200 or B300 by
+cuDNN's kernels; on another GPU by `~bux.architecture.attention.scoring`'s, which
+gather each query's up to its last, and whose backward pass adds their gradients into
+the keys atomically.
 """
 
 from collections.abc import Callable
@@ -26,9 +28,16 @@ from jaxtyping import Array, Bool, Float, Int, Shaped, UInt
 
 from bux import config as cfg
 from bux import parallel
-from bux.architecture.attention import scoring, sparse
+from bux.architecture.attention import indexer_cudnn, scoring, sparse
 from bux.architecture.attention.rope import rotate
-from bux.architecture.attention.sparse import Kept, Span, chunked, chunks, mask
+from bux.architecture.attention.sparse import (
+    ELEMENTS,
+    Kept,
+    Span,
+    chunked,
+    chunks,
+    mask,
+)
 from bux.architecture.common.sharding import projection, shard_heads
 from bux.architecture.layers.norm import Norm
 from bux.architecture.repeats import remat
@@ -37,6 +46,9 @@ from bux.train import flops
 
 # DeepSeek-V3.2's indexer keys, projected from the layer's input, are layer-normalized.
 _STREAM_KEY_NORM = cfg.NormalizationConfig(type="layernorm", bias=True)
+# The most picks of a chunk of queries the loss's cuDNN kernels take: in bigger chunks
+# XLA keeps up to 10 GiB more alive (4096 x 8 rows) for 3% less time.
+LOSS_PICKS = 1 << 23
 
 
 class Scored(NamedTuple):
@@ -65,14 +77,14 @@ Target = Callable[[Any], Float[Array, "b c *g s"]]  # a chunk's attention to the
 
 def _kl(
     target: Float[Array, "b t *g n"],
-    scores: Float[Array, "b t *g n"],
+    log_q: Float[Array, "b t *g n"],
     mask: Bool[Array, "b t *g n"],
 ) -> Float[Array, "b t *g"]:
-    """Return every query's KL(target || softmax(scores)) over the slots `mask` keeps,
-    the target normalized over them: 0 for a query with none, as 0 log 0 is."""
+    """Return every query's KL(target || q) over the slots `mask` keeps, q's log
+    `log_q`, the target normalized over them: 0 for a query with none, as 0 log 0
+    is."""
     p = jnp.where(mask, target, 0)
     p = p / jnp.maximum(p.sum(-1, keepdims=True), jnp.finfo(p.dtype).tiny)
-    log_q = log_softmax(jnp.where(mask, scores, jnp.finfo(scores.dtype).min))
     log_p = jnp.log(jnp.where(p > 0, p, 1))
     return jnp.where(p > 0, p * (log_p - log_q), 0).sum(-1)
 
@@ -117,15 +129,29 @@ def _like(
     return seen if scores.ndim == seen.ndim else seen[:, :, None]
 
 
-def _top(scores: Float[Array, "b t *g n"], top_k: int) -> Int[Array, "b t *g k"]:
+def _top(
+    scores: Float[Array, "b t *g n"],
+    top_k: int,
+    span: Span | None = None,
+    cudnn: bool = True,
+) -> Int[Array, "b t *g k"]:
     """Return the indices of each query's top_k highest scores, of those above -inf,
-    in order of index, and -1 past them; of equal ones, the first.
+    in order of index, and -1 past them; of equal ones, the first. No score is above
+    -inf outside a query's `span` (None: every slot's).
 
-    It finds the k-th highest by its bits, one count of those at least as high a bit,
-    and keeps those above it and the first of those equal to it. XLA's top-k sorts
-    every row on a GPU, 6 times slower at 32k keys, and in the global view gathers
-    every row onto each device."""
-    k = min(top_k, scores.shape[-1])
+    On a B200 or B300 cuDNN's kernel keeps them (`indexer_cudnn`), where `cudnn`
+    says it may: not for MSA's picks (`Indexer._by_cudnn`). Else XLA finds
+    the k-th highest by its bits, one count of those at least as high a bit, and
+    keeps those above it and the first of those equal to it: XLA's top-k sorts every
+    row on a GPU, 6 times slower at 32k keys, and in the global view gathers every
+    row onto each device."""
+    n = scores.shape[-1]
+    k = min(top_k, n)
+    if cudnn and indexer_cudnn.runs(k):
+        rows = scores.shape[:-1]
+        every = Span(jnp.zeros(rows, jnp.int32), jnp.full(rows, n, jnp.int32))
+        start, end = every if span is None else span
+        return _first(indexer_cudnn.top_k(scores, start, end, k))
     key = _ordered(scores)
 
     def bit(i: Int[Array, ""], kth: UInt[Array, "b t *g"]) -> UInt[Array, "b t *g"]:
@@ -173,6 +199,12 @@ def _indices(kept: Bool[Array, "b t *g n"], k: int) -> Int[Array, "b t *g k"]:
     for _ in range(kept.ndim - 1):
         row = jax.vmap(row)
     return row(slot)
+
+
+def _first(index: Int[Array, "b t k"]) -> Int[Array, "b t k"]:
+    """Return each row's indices but -1 first, in their order, then the -1s."""
+    at = _indices(index >= 0, index.shape[-1])
+    return jnp.where(at >= 0, jnp.take_along_axis(index, jnp.maximum(at, 0), -1), -1)
 
 
 def _newest(seen: Bool[Array, "b t s"], block: Int[Array, "b s"]) -> Int[Array, "b t"]:
@@ -449,9 +481,10 @@ class Indexer(nnx.Module):
             seen = mask(span, s, exists, inside)
             scores = self._ranking(x, query, pos, ranked_keys, span.end)
             ranked = jnp.where(_like(seen, scores), scores, -jnp.inf)
+            top = _top(ranked, self.top_k, span, self._by_cudnn())
             if not export_candidates:
-                return _top(ranked, self.top_k), None
-            return _top(ranked, self.top_k), self._candidates(ranked, pooled)
+                return top, None
+            return top, self._candidates(ranked, pooled)
 
         index = None if candidates is None else candidates.index
         xs, t = (x, query, pos, span, index), x.shape[1]
@@ -461,7 +494,7 @@ class Indexer(nnx.Module):
         return Kept(index), pool, Scored(x, query, pos, keys, index, span=span)
 
     def loss(
-        self, scored: Scored, target: Target, xs: Any, width: int
+        self, scored: Scored, target: Target, xs: Any, width: int, picks: bool = False
     ) -> Float[Array, ""]:
         """Return the indexer's loss: ``KL(p || softmax(I))`` over what it kept,
         averaged over the queries (DeepSeek-V3.2, eq. 4).
@@ -482,6 +515,8 @@ class Indexer(nnx.Module):
                 queries.
             width: the elements a query makes of `target`'s output, which sets the
                 chunks.
+            picks: whether `target` gives the attention to each query's kept keys,
+                in their order, rather than to every key (CSA's, by cuDNN's kernel).
 
         Returns:
             The loss, a scalar, which trains only the indexer's parameters.
@@ -492,23 +527,63 @@ class Indexer(nnx.Module):
         def kept_target(both: tuple) -> Float[Array, "b c k"]:
             (*_, kept), xs = both
             p = target(xs).astype(jnp.float32)
+            if picks:
+                return p
             if scored.block is not None:
                 p = _per_block(p, scored.block, "max")
             return jnp.take_along_axis(p, jnp.maximum(kept, 0), axis=-1)
 
         def kl(both: tuple) -> Float[Array, "b c"]:
             (x, query, pos, kept), p = both
-            scores = self._scores_of(x, query, pos, scored.keys, kept)
-            return _kl(p, scores.astype(jnp.float32), kept >= 0)
+            log_q = self._log_predicted(x, query, pos, scored.keys, kept)
+            return _kl(p, log_q, kept >= 0)
 
         own = (scored.x, scored.query, scored.pos, scored.kept)
+        b, t, _ = scored.x.shape
         k, n = scored.kept.shape[-1], scored.keys.shape[1]
-        per = self.heads * n if _dense(k, n) else k * max(self.heads, self.head_dim)
-        count = chunks(scored.x.shape[1], max(per, width))
+        cudnn = self._loss_by_cudnn(k, scored.keys.dtype)
+        dense = _dense(k, n) and not cudnn
+        per = self.heads * n if dense else k * max(self.heads, self.head_dim)
+        count = chunks(t, max(per, width))
         p = jax.lax.stop_gradient(chunked(kept_target, (own, xs), count))
-        if not _dense(k, n) and self._picked_by_kernel(k):
+        if cudnn:
+            count = chunks(t, b * k * ELEMENTS // LOSS_PICKS)
+        elif not dense and self._picked_by_kernel(k):
             count = 1  # its kernels make no intermediate of every head
         return chunked(jax.checkpoint(kl), (own, p), count).mean()
+
+    def _log_predicted(
+        self,
+        x: Float[Array, "b t d"],
+        query: Float[Array, "b t e"],
+        pos: Int[Array, "b t"],
+        keys: Float[Array, "b s i"],
+        index: Int[Array, "b t k"],
+    ) -> Float[Array, "b t k"]:
+        """Return each query's log-softmax of its scores for its kept keys: by
+        cuDNN's kernels where they take them, else of `_scores_of`'s scores."""
+        if not self._loss_by_cudnn(index.shape[-1], keys.dtype):
+            scores = self._scores_of(x, query, pos, keys, index).astype(jnp.float32)
+            unkept = jnp.finfo(jnp.float32).min
+            return log_softmax(jnp.where(index >= 0, scores, unkept))
+        x, query = jax.lax.stop_gradient((x, query))
+        q, w = self._queries(query, pos), self._head_weights(x)
+        return indexer_cudnn.log_softmax(q.astype(keys.dtype), w, keys, index)
+
+    def _loss_by_cudnn(self, k: int, dtype: Any) -> bool:
+        """Return whether cuDNN's kernels score each query's k picks, of keys in
+        `dtype`, for the loss, where `_by_cudnn` lets them: on a B200 or B300, faster
+        than both ``scoring``'s kernels and scoring every key (`_dense`)."""
+        if not self._by_cudnn():
+            return False
+        return indexer_cudnn.takes(self.heads, self.head_dim, k, dtype)
+
+    def _by_cudnn(self) -> bool:
+        """Return whether cuDNN's DSA kernels may pick and score for it
+        (`indexer_cudnn`): one pick for all heads, of ReLU'd dot products, as DSA's
+        and QSA's. MSA's settings (``pool=max``, ``per_group``, ``relu=false``) run
+        by XLA."""
+        return self.relu and not (self.per_group or self.max_pool)
 
     def _scores_of(
         self,
@@ -544,7 +619,9 @@ class Indexer(nnx.Module):
             (x, query, pos, kept, span), xs = both
             p = jax.lax.stop_gradient(target(xs)).astype(jnp.float32)
             scores = self.scores(x, query, pos, scored.keys).astype(jnp.float32)
-            return _kl(p, scores, mask(span, s, None, Kept(kept, scored.block)))
+            over = mask(span, s, None, Kept(kept, scored.block))
+            unkept = jnp.finfo(jnp.float32).min
+            return _kl(p, log_softmax(jnp.where(over, scores, unkept)), over)
 
         own = (scored.x, scored.query, scored.pos, scored.kept, scored.span)
         count = chunks(scored.x.shape[1], max(width, self.heads * s))
@@ -582,7 +659,8 @@ class Indexer(nnx.Module):
             seen = mask(span, s, exists)
             full = _per_block(seen.astype(jnp.int32), block, "sum") == size
             scores = self._ranking(x, query, pos, ranked_keys, span.end)
-            picked = _top(jnp.where(full, scores, -jnp.inf), self.top_k // size)
+            blocks = jnp.where(full, scores, -jnp.inf)
+            picked = _top(blocks, self.top_k // size, cudnn=self._by_cudnn())
             own = _newest(seen, block)
             unfinished = ~jnp.take_along_axis(full, jnp.maximum(own, 0)[..., None], -1)
             return picked, jnp.where(unfinished[..., 0], own, -1)
@@ -617,7 +695,8 @@ class Indexer(nnx.Module):
             scores = jnp.where(_like(seen, scores), scores, -jnp.inf)
             best = _per_block(scores, block, "max")
             own = jnp.arange(s) == _newest(seen, block)[..., None]
-            return _top(jnp.where(_like(own, best), jnp.inf, best), self.top_k // size)
+            best = jnp.where(_like(own, best), jnp.inf, best)
+            return _top(best, self.top_k // size, cudnn=self._by_cudnn())
 
         xs, t = (x, query, pos, span), x.shape[1]
         kept = chunked(pick, xs, chunks(t, self._per_query(t, s)))
@@ -651,7 +730,7 @@ class Indexer(nnx.Module):
         s = ranked.shape[-1]
         newest = jnp.arange(s) == _newest(ranked > -jnp.inf, block)[..., None]
         best = jnp.where(newest, jnp.inf, _per_block(ranked, block, "max"))
-        return _top(best, self.candidate_top_k)
+        return _top(best, self.candidate_top_k, cudnn=self._by_cudnn())
 
     def _rotate(
         self, x: Float[Array, "b t h i"], pos: Int[Array, "b t"] | None
