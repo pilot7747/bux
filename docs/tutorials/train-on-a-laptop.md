@@ -89,7 +89,7 @@ device.
 $ bux plan mine/tiny.bux
 1 run
 id          params  tokens  tok/param  flops/tok  gpus  params/gpu  optim/gpu  bubble  run
-d48dd7d011  804k    205k    0.3        5.21M      1     3.07MiB     6.13MiB    0%      tiny
+03fd980fa4  804k    205k    0.3        5.21M      1     3.07MiB     6.13MiB    0%      tiny
 ```
 
 ## 3. Train it
@@ -97,18 +97,18 @@ d48dd7d011  804k    205k    0.3        5.21M      1     3.07MiB     6.13MiB    0
 ```console
 $ bux train mine/tiny.bux
 remat=auto: none in 1s (none 0.1 GiB in 0s)
-tiny step  20/200  loss 6.3815  lr 3.00e-03  grad 0.621  13,138 tok/s  ...
-tiny step  40/200  loss 6.3131  lr 3.00e-03  grad 0.418  28,251 tok/s  ...
-tiny step  60/200  loss 6.2725  lr 3.00e-03  grad 0.360  27,732 tok/s  ...
-tiny step  80/200  loss 6.2650  lr 3.00e-03  grad 0.347  28,332 tok/s  ...
-tiny step 100/200  loss 6.2796  lr 3.00e-03  grad 0.343  24,213 tok/s  ...
-tiny step 100/200  eval loss 6.2760
-tiny step 120/200  loss 6.2559  lr 3.00e-03  grad 0.337  28,217 tok/s  ...
-tiny step 140/200  loss 6.2747  lr 3.00e-03  grad 0.322  27,784 tok/s  ...
-tiny step 160/200  loss 6.2723  lr 3.00e-03  grad 0.294  27,114 tok/s  ...
-tiny step 180/200  loss 6.2557  lr 1.50e-03  grad 0.571  27,366 tok/s  ...
-tiny step 200/200  loss 6.2419  lr 0.00e+00  grad 10.304  26,585 tok/s  ...
-tiny step 200/200  eval loss 6.2553
+tiny step  20/200  loss 6.2661  lr 3.00e-03  grad 0.431  12,490 tok/s  ...
+tiny step  40/200  loss 6.2865  lr 3.00e-03  grad 0.392  27,794 tok/s  ...
+tiny step  60/200  loss 6.2649  lr 3.00e-03  grad 0.336  27,235 tok/s  ...
+tiny step  80/200  loss 6.2586  lr 3.00e-03  grad 0.314  28,131 tok/s  ...
+tiny step 100/200  loss 6.2554  lr 3.00e-03  grad 0.289  24,026 tok/s  ...
+tiny step 100/200  eval loss 6.2547
+tiny step 120/200  loss 6.2480  lr 3.00e-03  grad 0.288  28,623 tok/s  ...
+tiny step 140/200  loss 6.2529  lr 3.00e-03  grad 0.258  28,497 tok/s  ...
+tiny step 160/200  loss 6.2507  lr 3.00e-03  grad 0.224  27,512 tok/s  ...
+tiny step 180/200  loss 6.2482  lr 1.50e-03  grad 0.220  28,045 tok/s  ...
+tiny step 200/200  loss 6.2414  lr 0.00e+00  grad 0.198  26,312 tok/s  ...
+tiny step 200/200  eval loss 6.2442
 ```
 
 How to read it:
@@ -127,9 +127,11 @@ How to read it:
   `mfu` ([Running](../training/running.md)).
 
 :::{note}
-The tokens are uniformly random, so no model can predict them: the loss falls to
-log 512 = 6.238 and stops there. That is all a synthetic run shows, that the model
-trains; [Your own data](your-own-data.md) trains on text that can be learned.
+The tokens are uniformly random, so no model can predict them: the loss can do no
+better than log 512 = 6.238. The model starts close to it, as its small initial
+weights rate every token about alike, and stays near it. That is all a synthetic run
+shows, that the model trains; [Your own data](your-own-data.md) trains on text that
+can be learned.
 :::
 
 ## 4. Read the run's directory
@@ -137,16 +139,16 @@ trains; [Your own data](your-own-data.md) trains on text that can be learned.
 The run wrote everything into `runs/<name>-<id>/`:
 
 ```console
-$ ls runs/tiny-d48dd7d011 runs/tiny-d48dd7d011/checkpoints
-runs/tiny-d48dd7d011:
+$ ls runs/tiny-03fd980fa4 runs/tiny-03fd980fa4/checkpoints
+runs/tiny-03fd980fa4:
 checkpoints  metrics.jsonl  run.bux  run.json
 
-runs/tiny-d48dd7d011/checkpoints:
+runs/tiny-03fd980fa4/checkpoints:
 150  200
-$ tail -n 3 runs/tiny-d48dd7d011/metrics.jsonl
-{"step": 180, "grad_norm": 0.5706921815872192, "loss": 6.255720615386963, "lr": 0.001500000013038516, "tokens": 184320, "tokens_per_s": 27366.093675823613}
-{"step": 200, "grad_norm": 10.303742408752441, "loss": 6.241860866546631, "lr": 0.0, "tokens": 204800, "tokens_per_s": 26584.77769143028}
-{"step": 200, "eval_loss": 6.255273342132568}
+$ tail -n 3 runs/tiny-03fd980fa4/metrics.jsonl
+{"step": 180, "grad_norm": 0.21968576312065125, "loss": 6.248171806335449, "lr": 0.001500000013038516, "tokens": 184320, "tokens_per_s": 28045.151606350915, "time/step_ms": 36.51254998985678, "time/hooks_ms": 0.18775835633277893, "time/data_ms": 0.06164780352264643, "time/launch_ms": 0.26434597093611956, "time/wait_ms": 16.812118771485984}
+{"step": 200, "grad_norm": 0.19841767847537994, "loss": 6.2413811683654785, "lr": 0.0, "tokens": 204800, "tokens_per_s": 26311.946447066046, "time/step_ms": 38.917683344334364, "time/hooks_ms": 3.074050019495189, "time/data_ms": 0.007931049913167953, "time/launch_ms": 2.047497918829322, "time/wait_ms": 30.99251459352672}
+{"step": 200, "eval_loss": 6.244220763679564}
 ```
 
 `metrics.jsonl` has a line at every log, with every metric the console shows and more
@@ -155,7 +157,7 @@ $ tail -n 3 runs/tiny-d48dd7d011/metrics.jsonl
 ```python
 import json
 
-with open("runs/tiny-d48dd7d011/metrics.jsonl") as f:
+with open("runs/tiny-03fd980fa4/metrics.jsonl") as f:
     lines = [json.loads(line) for line in f]
 
 train = [(m["step"], round(m["loss"], 4)) for m in lines if "loss" in m]
@@ -165,8 +167,8 @@ print("eval: ", evals)
 ```
 
 ```text
-train: (20, 6.3815) ... (200, 6.2419)
-eval:  [(100, 6.276), (200, 6.2553)]
+train: (20, 6.2661) ... (200, 6.2414)
+eval:  [(100, 6.2547), (200, 6.2442)]
 ```
 
 `run.bux` is the run as one self-contained file, with no modules and no
@@ -174,7 +176,7 @@ alternatives, which `bux train` takes as it is, and `run.json` is its IR.
 `checkpoints/` keeps the latest two saves (`checkpoint(keep=2)`, the default) as orbax
 checkpoints of the model's and the optimizer's state.
 
-The id, `d48dd7d011`, is a hash of what the run computes. `log`, `eval`, `checkpoint`
+The id, `03fd980fa4`, is a hash of what the run computes. `log`, `eval`, `checkpoint`
 and `profile` are not part of it, so changing how often the run logs, evaluates or
 saves keeps the id and the directory; changing `steps`, the model or the optimizer
 makes a new one ([Run ids](../training/running.md#run-ids)).
@@ -199,10 +201,10 @@ This time train it with `bux launch`, the launcher, which stops cleanly at a sig
 $ bux launch mine/tiny.bux steps=3000
 tiny: training on cpu of my-laptop with jax 0.12.0
 remat=auto: none in 1s (none 0.1 GiB in 0s)
-tiny step   20/3000  loss 6.3815  lr 3.00e-03  grad 0.621  13,556 tok/s  ...
+tiny step   20/3000  loss 6.2661  lr 3.00e-03  grad 0.431  13,739 tok/s  ...
 ...
-tiny step  200/3000  loss 6.2623  lr 3.00e-03  grad 0.266  26,937 tok/s  ...
-tiny step  200/3000  eval loss 6.2609
+tiny step  200/3000  loss 6.2391  lr 3.00e-03  grad 0.184  20,782 tok/s  ...
+tiny step  200/3000  eval loss 6.2445
 tiny: stopped at step 200 by SIGTERM; launching it again resumes it from its latest checkpoint
 ```
 
@@ -216,9 +218,9 @@ $ bux launch mine/tiny.bux steps=3000
 tiny: training on cpu of my-laptop with jax 0.12.0
 tiny: restored in 0.2s, resuming at step 200
 remat=auto: none in 1s (none 0.1 GiB in 0s)
-tiny step  220/3000  loss 6.2564  lr 3.00e-03  grad 0.274  13,897 tok/s  ...
+tiny step  220/3000  loss 6.2423  lr 3.00e-03  grad 0.182  13,979 tok/s  ...
 ...
-tiny step  380/3000  loss 6.2461  lr 3.00e-03  grad 0.553  28,166 tok/s  ...
+tiny step  380/3000  loss 6.2369  lr 3.00e-03  grad 0.057  28,461 tok/s  ...
 tiny: stopped at step 381 by SIGINT; launching it again resumes it from its latest checkpoint
 ```
 
@@ -230,10 +232,10 @@ $ bux launch mine/tiny.bux steps=3000
 tiny: training on cpu of my-laptop with jax 0.12.0
 tiny: restored in 0.2s, resuming at step 381
 remat=auto: none in 1s (none 0.1 GiB in 0s)
-tiny step  400/3000  loss 6.2491  lr 3.00e-03  grad 0.196  12,293 tok/s  ...
+tiny step  400/3000  loss 6.2418  lr 3.00e-03  grad 0.050  12,838 tok/s  ...
 ...
-tiny step 3000/3000  loss 6.2384  lr 0.00e+00  grad 0.068  27,003 tok/s  ...
-tiny step 3000/3000  eval loss 6.2385
+tiny step 3000/3000  loss 6.2379  lr 0.00e+00  grad 0.009  23,432 tok/s  ...
+tiny step 3000/3000  eval loss 6.2381
 tiny: done
 $ bux launch mine/tiny.bux steps=3000
 1 of 1 run done already
@@ -248,23 +250,29 @@ a crash left behind.
 The launcher also writes a `status.json` into the run's directory:
 
 ```console
-$ cat runs/tiny-002cbdb08a/status.json
+$ cat runs/tiny-8512f5ea23/status.json
 {
   "state": "stopped",
   "host": "my-laptop",
-  "pid": 8710,
+  "pid": 11497,
   "gpus": null,
-  "started": "2026-10-25T21:23:33+00:00",
-  "ended": "2026-10-25T21:23:42+00:00",
+  "started": "2026-10-26T22:18:31+00:00",
+  "ended": "2026-10-26T22:18:40+00:00",
   "error": null,
   "step": 200,
   "metrics": {
-    "grad_norm": 0.26626190543174744,
-    "loss": 6.2623291015625,
+    "grad_norm": 0.1838468313217163,
+    "loss": 6.2391252517700195,
     "lr": 0.003000000026077032,
     "tokens": 204800,
-    "tokens_per_s": 26937.06913439296,
-    "eval_loss": 6.2608559131622314
+    "tokens_per_s": 20782.199157402632,
+    "time/step_ms": 49.27293749060482,
+    "time/data_ms": 0.006591668352484703,
+    "time/wait_ms": 36.901853955350816,
+    "time/hooks_ms": 4.563564620912075,
+    "time/launch_ms": 3.234362485818565,
+    "time/compile_s": 0.719407457858324,
+    "eval_loss": 6.2445220947265625
   }
 }
 ```

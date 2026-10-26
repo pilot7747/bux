@@ -108,7 +108,7 @@ used and nothing to vary, which shows what each one inherited:
 
 ```console
 $ bux fmt mine/ablation.bux
-# ablation[mha, optimizer.lr=1e-3], run b7fd6a32fc
+# ablation[mha, optimizer.lr=1e-3], run f1814da7d1
 d_model = 128
 vocab_size = 512
 
@@ -130,7 +130,7 @@ eval = eval(data=synthetic(), every=150, batches=4)
 checkpoint = checkpoint(every=100)
 log = log(every=50)
 
-# ablation[mha, optimizer.lr=3e-3], run 7ee3f17cdf
+# ablation[mha, optimizer.lr=3e-3], run 39f756c12c
 ...
 ```
 
@@ -143,12 +143,12 @@ says changed.
 $ bux plan mine/ablation.bux
 6 runs
 id          params  tokens  tok/param  flops/tok  gpus  params/gpu  optim/gpu  bubble  run
-b7fd6a32fc  870k    307k    0.4        5.61M      1     3.32MiB     6.63MiB    0%      ablation[mha, optimizer.lr=1e-3]
-7ee3f17cdf  870k    307k    0.4        5.61M      1     3.32MiB     6.63MiB    0%      ablation[mha, optimizer.lr=3e-3]
-ef19a555dc  804k    307k    0.4        5.21M      1     3.07MiB     6.13MiB    0%      ablation[gqa, optimizer.lr=1e-3]
-1fcb527c0f  804k    307k    0.4        5.21M      1     3.07MiB     6.13MiB    0%      ablation[gqa, optimizer.lr=3e-3]
-42918e57df  771k    307k    0.4        5.02M      1     2.94MiB     5.88MiB    0%      ablation[mqa, optimizer.lr=1e-3]
-0a4226c3c2  771k    307k    0.4        5.02M      1     2.94MiB     5.88MiB    0%      ablation[mqa, optimizer.lr=3e-3]
+f1814da7d1  870k    307k    0.4        5.61M      1     3.32MiB     6.63MiB    0%      ablation[mha, optimizer.lr=1e-3]
+39f756c12c  870k    307k    0.4        5.61M      1     3.32MiB     6.63MiB    0%      ablation[mha, optimizer.lr=3e-3]
+b247174ad8  804k    307k    0.4        5.21M      1     3.07MiB     6.13MiB    0%      ablation[gqa, optimizer.lr=1e-3]
+b42eb5ba19  804k    307k    0.4        5.21M      1     3.07MiB     6.13MiB    0%      ablation[gqa, optimizer.lr=3e-3]
+0282510df4  771k    307k    0.4        5.02M      1     2.94MiB     5.88MiB    0%      ablation[mqa, optimizer.lr=1e-3]
+f355634194  771k    307k    0.4        5.02M      1     2.94MiB     5.88MiB    0%      ablation[mqa, optimizer.lr=3e-3]
 ```
 
 The runs are in grid order, the first axis written varying slowest. Each is named
@@ -166,21 +166,21 @@ $ bux launch mine/ablation.bux
 training 6 runs, one at a time
 ablation[mha, optimizer.lr=1e-3]: training on cpu of my-laptop with jax 0.12.0
 remat=auto: none in 1s (none 0.1 GiB in 0s)
-ablation[mha, optimizer.lr=1e-3] step  50/300  loss 6.2760  lr 1.00e-03  grad 0.427  19,705 tok/s  ...
+ablation[mha, optimizer.lr=1e-3] step  50/300  loss 6.2541  lr 1.00e-03  grad 0.413  18,054 tok/s  ...
 ...
-ablation[mha, optimizer.lr=1e-3] step 300/300  eval loss 6.2489
+ablation[mha, optimizer.lr=1e-3] step 300/300  eval loss 6.2444
 ablation[mha, optimizer.lr=1e-3]: done
 ablation[mha, optimizer.lr=3e-3]: training on cpu of my-laptop with jax 0.12.0
 ...
 ablation[mqa, optimizer.lr=3e-3]: done
 6 runs: 6 done
 state  step     loss    eval loss  run
-done   300/300  6.2379  6.2489     ablation[mha, optimizer.lr=1e-3]
-done   300/300  6.2463  6.2451     ablation[mha, optimizer.lr=3e-3]
-done   300/300  6.2381  6.2485     ablation[gqa, optimizer.lr=1e-3]
-done   300/300  6.2396  6.2480     ablation[gqa, optimizer.lr=3e-3]
-done   300/300  6.2384  6.2496     ablation[mqa, optimizer.lr=1e-3]
-done   300/300  6.2401  6.2471     ablation[mqa, optimizer.lr=3e-3]
+done   300/300  6.2362  6.2444     ablation[mha, optimizer.lr=1e-3]
+done   300/300  6.2363  6.2416     ablation[mha, optimizer.lr=3e-3]
+done   300/300  6.2367  6.2436     ablation[gqa, optimizer.lr=1e-3]
+done   300/300  6.2358  6.2424     ablation[gqa, optimizer.lr=3e-3]
+done   300/300  6.2361  6.2444     ablation[mqa, optimizer.lr=1e-3]
+done   300/300  6.2363  6.2437     ablation[mqa, optimizer.lr=3e-3]
 ```
 
 The table at the end has each run's state, its step, and its latest loss and eval
@@ -209,12 +209,12 @@ Each run has its own directory, `runs/<name>-<id>/`, with its `run.json` and its
 
 ```console
 $ ls -1d runs/ablation*
-runs/ablation_gqa_optimizer.lr=1e-3-ef19a555dc
-runs/ablation_gqa_optimizer.lr=3e-3-1fcb527c0f
-runs/ablation_mha_optimizer.lr=1e-3-b7fd6a32fc
-runs/ablation_mha_optimizer.lr=3e-3-7ee3f17cdf
-runs/ablation_mqa_optimizer.lr=1e-3-42918e57df
-runs/ablation_mqa_optimizer.lr=3e-3-0a4226c3c2
+runs/ablation_gqa_optimizer.lr=1e-3-b247174ad8
+runs/ablation_gqa_optimizer.lr=3e-3-b42eb5ba19
+runs/ablation_mha_optimizer.lr=1e-3-f1814da7d1
+runs/ablation_mha_optimizer.lr=3e-3-39f756c12c
+runs/ablation_mqa_optimizer.lr=1e-3-0282510df4
+runs/ablation_mqa_optimizer.lr=3e-3-f355634194
 ```
 
 A few lines of Python collect the final eval loss of each:
@@ -231,12 +231,12 @@ for folder in sorted(Path("runs").glob("ablation*")):
 ```
 
 ```text
-ablation[gqa, optimizer.lr=1e-3]    final eval loss 6.2485
-ablation[gqa, optimizer.lr=3e-3]    final eval loss 6.2480
-ablation[mha, optimizer.lr=1e-3]    final eval loss 6.2489
-ablation[mha, optimizer.lr=3e-3]    final eval loss 6.2451
-ablation[mqa, optimizer.lr=1e-3]    final eval loss 6.2496
-ablation[mqa, optimizer.lr=3e-3]    final eval loss 6.2471
+ablation[gqa, optimizer.lr=1e-3]    final eval loss 6.2436
+ablation[gqa, optimizer.lr=3e-3]    final eval loss 6.2424
+ablation[mha, optimizer.lr=1e-3]    final eval loss 6.2444
+ablation[mha, optimizer.lr=3e-3]    final eval loss 6.2416
+ablation[mqa, optimizer.lr=1e-3]    final eval loss 6.2444
+ablation[mqa, optimizer.lr=3e-3]    final eval loss 6.2437
 ```
 
 Every line also has `tokens` and `tokens_per_s`, so the same loop plots loss against
@@ -273,9 +273,9 @@ sweep: 3 runs over d_model (s | m | l)
 $ bux plan mine/widths.bux
 3 runs
 id          params  tokens  tok/param  flops/tok  gpus  params/gpu  optim/gpu  bubble  run
-36952f44fa  213k    307k    1.4        1.47M      1     832KiB      1.63MiB    0%      widths[s]
-ff1c7fb09f  787k    307k    0.4        5.11M      1     3MiB        6MiB       0%      widths[m]
-3ffae7a2dd  1.72M   307k    0.2        10.9M      1     6.57MiB     13.1MiB    0%      widths[l]
+20e418e39e  213k    307k    1.4        1.47M      1     832KiB      1.63MiB    0%      widths[s]
+6264630896  787k    307k    0.4        5.11M      1     3MiB        6MiB       0%      widths[m]
+46db229743  1.72M   307k    0.2        10.9M      1     6.57MiB     13.1MiB    0%      widths[l]
 ```
 
 Alternatives that share some labels but not all are an error, as a forgotten one

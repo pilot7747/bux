@@ -195,12 +195,12 @@ block = [norm shift attn] [norm ffn]
 ```console
 $ bux train mine/shifted.bux
 remat=auto: none in 1s (none 0.5 GiB in 0s)
-shifted step  25/200  loss 2.2135  lr 3.00e-03  grad 3.427  5,649 tok/s  ...
-shifted step  50/200  loss 0.8024  lr 3.00e-03  grad 0.551  7,612 tok/s  ...
-shifted step  50/200  eval loss 0.7793  eval bpb 0.2633
+shifted step  25/200  loss 3.1846  lr 3.00e-03  grad 3.360  6,024 tok/s  ...
+shifted step  50/200  loss 1.0497  lr 3.00e-03  grad 1.216  8,470 tok/s  ...
+shifted step  50/200  eval loss 0.9955  eval bpb 0.3356
 ...
-shifted step 200/200  loss 0.7181  lr 0.00e+00  grad 0.265  7,591 tok/s  ...
-shifted step 200/200  eval loss 0.7299  eval bpb 0.2455
+shifted step 200/200  loss 0.7190  lr 0.00e+00  grad 0.281  8,734 tok/s  ...
+shifted step 200/200  eval loss 0.7290  eval bpb 0.2446
 ```
 
 Nothing else had to know about the new layer: the trainer, the optimizer's weight
@@ -214,8 +214,8 @@ without the shift:
 $ bux plan mine/shifted.bux 'shift = off: _ | on: token_shift'
 2 runs
 id          params  tokens  tok/param  flops/tok  gpus  params/gpu  optim/gpu  bubble  run
-00edf52242  7.18M   205k    0.0        43.5M      1     27.4MiB     54.8MiB    0%      shifted[off]
-9dae7a4e31  7.18M   205k    0.0        43.5M      1     27.4MiB     54.8MiB    0%      shifted[on]
+4815eac6e1  7.18M   205k    0.0        43.5M      1     27.4MiB     54.8MiB    0%      shifted[off]
+e1ecb0c84f  7.18M   205k    0.0        43.5M      1     27.4MiB     54.8MiB    0%      shifted[on]
 ```
 
 `shifted[on]` has the id of the run you trained: `token_shift` with its default is
