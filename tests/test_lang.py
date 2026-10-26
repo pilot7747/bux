@@ -418,10 +418,13 @@ def test_engram_is_bare_and_adds_to_every_stream():
 def test_widened_streams_are_read_back_once():
     mhc = "residual = mhc(expansion=4)\n"
     assert "twice" in error(MEMORY + "model = embed [mem] head").message
-    assert (
-        "read back into one"
-        in error(mhc + "model = embed [attn] norm [ffn] head").message
+    err = error(mhc + "model = embed [attn] norm [ffn] head")
+    assert "read back into one" in err.message and "engram and nextn" in (
+        err.hint or ""
     )
+    # attnres keeps the outputs so far, not copies: engram and nextn need one stream.
+    err = error("residual = attnres\nmodel = embed [attn] norm [ffn] head")
+    assert "read back into one" in err.message and "engram" not in (err.hint or "")
     assert "there is none here" in error("model = embed merge head").message
     err = error(mhc + "model = embed @x0 [norm attn] [$x0 scale] head")
     assert "only exists outside residual branches" in err.message

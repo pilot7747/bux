@@ -1131,8 +1131,8 @@ class _Lowering:
                 raise self.error(
                     "a residual branch needs the widened residual stream, but "
                     "it was read back into one before this",
-                    "only branches, taps, engram and nextn keep it; save it "
-                    "with @h and go on from $h",
+                    f"only branches, taps{', engram and nextn' if self.copies else ''}"
+                    " keep it; save it with @h and go on from $h",
                 )
             inner = self.d_model
         elif not isinstance(width, int):
