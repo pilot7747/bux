@@ -51,6 +51,7 @@ The speedups are against XLA's own program for the same computation, on a B300.
 | sparse attention (DSA, QSA, CSA) | `sparse`: tokamax's flash attention with the kept keys as a mask; the indexer's scores, its loss's picks and target by Pallas kernels (`scoring`), its top-k by counting | 2.6x a chunk of queries at a time, and no t × t floats |
 | linear attention, RWKV-7 | `chunkwise`: chunks of 64 positions, the state across them by a Pallas kernel (`affine_scan`); `methods(states=recompute)` keeps a fourteenth of the memory for the backward | 14-17x a scan over positions |
 | Mamba-2 | `chunkwise`, B and C a group's, the state across chunks by a matmul; `methods(states=recompute)` keeps a sixteenth of the memory for the backward | 25x a scan over positions (2 × 4096 tokens, rematerialized: at 8 × 4096 the scan needs 199 GiB) |
+| a short conv's backward: `conv`, `short_conv`, Mamba's, Mamba-2's, and the q, k and v of GDN, KDA and DeltaNet | `pallas_conv` for q, k and v, laid out channels last: a Pallas kernel, the gradients of x, the weights and the bias in one pass over x and dy. The others by XLA, every gradient from dy shifted ahead as in the kernel | 2x on q, k and v; 4x on Mamba-2's, by XLA |
 | Gated DeltaNet, DeltaNet | cuDNN's fused GDN kernel (`fused_delta`), by cuDNN's graph from a `buffer_callback`: any gate | 5x `chunkwise` |
 | KDA with a `gate_lower_bound` of -5 or more | cuDNN's fused KDA kernel (`fused_delta`) | 10x `chunkwise` |
 | KDA otherwise | bux's Pallas kernels (`pallas_delta`): any gate, each pair's decay through a position between them | 2.6x `chunkwise` |
@@ -70,6 +71,7 @@ Where they live:
 | `sparse`, `scoring` | {py:mod}`bux.architecture.attention.sparse`, {py:mod}`bux.architecture.attention.scoring` |
 | `chunkwise`, `affine_scan` | {py:mod}`bux.architecture.recurrent.chunkwise`, {py:mod}`bux.architecture.recurrent.affine_scan` |
 | `fused_delta`, `pallas_delta` | {py:mod}`bux.architecture.recurrent.fused_delta`, {py:mod}`bux.architecture.recurrent.pallas_delta` |
+| `pallas_conv`, and XLA's form | {py:mod}`bux.architecture.layers.pallas_conv`, {py:mod}`bux.architecture.layers.conv` |
 | `grouped`, `grouped_mxfp8`, `grouped_glu` | {py:mod}`bux.architecture.experts.grouped`, {py:mod}`bux.architecture.experts.grouped_mxfp8`, {py:mod}`bux.architecture.experts.grouped_glu` |
 | `token_rows`, `token_sums` | {py:mod}`bux.architecture.experts.moe` |
 | `blockscaled`, `nvfp4` | {py:mod}`bux.architecture.precision.blockscaled`, {py:mod}`bux.architecture.precision.nvfp4` |
@@ -90,6 +92,7 @@ by XLA instead, with the same values up to rounding. Outside a GPU, and inside
 | `norm_rope` | an RMSNorm with a scale and no bias, RoPE by halves of every dim; 16-bit inputs; a head dim that is a power of two from 32 to 256, and a power of two of heads on each device; outside any `shard_map` | the norm and `rotate` by XLA |
 | `fused_delta` | cudnn-frontend installed; a B200 or B300 (SM 10.0, 10.3); heads of 64 or 128 dims; bfloat16 or float16; `methods.recurrence = scan`; one decay a head (GDN, DeltaNet) or KDA with `gate_lower_bound` of -5 or more | `pallas_delta` for KDA, else `chunkwise` |
 | `pallas_delta` | KDA (a decay per key channel); heads of 64 or 128 dims; bfloat16 or float16; `methods.recurrence = scan` | `chunkwise` |
+| `pallas_conv` | q, k and v side by side (`CausalConv.side_by_side`); each device's positions, and the channels, in blocks of a power of two, 16 or more; a mesh that splits nothing but the rows | XLA's form of the backward; off a GPU, autodiff's |
 | `affine_scan` | a state of k × v with k a power of two of 16 or more, and v a multiple of 32 | a scan over the chunks by XLA |
 | `grouped.ragged_dot` | tokamax installed | `jax.lax.ragged_dot` |
 | `grouped_mxfp8` | a Blackwell GPU (compute capability 10 or more); the experts' role in `mxfp8` or `mxfp8_2d` | XLA dequantizes and multiplies |
@@ -154,6 +157,38 @@ GDN, and the same for KDA. On 8 GPUs the GDN kernel's callbacks run one at a tim
 87% of 8 GPUs alone. KDA's kernel, which cudnn-frontend calls from JAX itself, runs at
 91%. Each layer's times are in
 [The delta rule on a B300](../parallelism/recurrence.md#the-delta-rule-on-a-b300).
+
+### Short convolutions
+
+A short conv's backward pass, one layer's, at the one-GPU suite's shapes (8 rows of
+4096 in packed documents, 4 taps), with x laid out as XLA lays out each layer's:
+
+| conv | autodiff, before | XLA's form | `pallas_conv` |
+|------|------------------|------------|---------------|
+| Mamba-2's, 6144 channels, laid out first | 1.65 ms | 0.41 ms | 0.42 ms, and 0.39 ms of transposes |
+| GDN's q, 2048 channels, laid out last | 0.31 ms | 0.29 ms | 0.16 ms |
+
+Autodiff takes the weights' gradient from x shifted back, a sum over positions XLA
+runs at a quarter of the speed of the same sum from dy shifted ahead where the
+channels come first, as in Mamba-2's layer. Where they come last, as in q, k and v,
+XLA runs either sum slowly, and the kernel reads x and dy once, at 2.6-2.9 TB/s. So
+on a GPU `side_by_side`'s parts go to the kernel, which takes x channels last, and
+every other conv to XLA's form, but in rows without documents, where autodiff is as
+fast. Off a GPU autodiff runs. Both forms' gradients are within bfloat16's rounding
+of autodiff's in float32 (`scripts/gpu_smoke/conv.py`).
+
+The hybrids of the one-GPU suite, 60 steps, before and after on the same node, each
+the mean of two runs with the halves of the node swapped:
+
+| hybrid | before | after | the conv's backward, ms a step |
+|--------|--------|-------|--------------------------------|
+| Mamba-2, `"MMMA"` | 95.7k | 99.8k (+4.3%) | 24.8 → 6.6, by XLA's form |
+| GDN, `"DDDA"` | 132.3k | 135.8k (+2.7%) | 14.7 → 6.8 |
+| KDA, `"KKKA"` | 98.2k | 99.8k (+1.5%) | 11.9 → 6.0 |
+| KDA, `gate_lower_bound=-5` | 131.4k | 134.2k (+2.1%) | |
+
+Peak memory is the same, and the losses after 60 steps are within 0.003 of each
+other, as two runs of the same tree are.
 
 ### QK-norm and RoPE
 
