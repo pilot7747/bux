@@ -317,6 +317,7 @@ _NEWER_LAYER_FIELDS = {
     },
     "mla": {"gate_head_bias": False},
     "csa": {"gate_head_bias": False},
+    "indexer": {"pool": "mean", "per_group": False, "relu": True},
 }
 
 
