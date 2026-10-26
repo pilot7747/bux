@@ -106,6 +106,21 @@ from bux.export.check import compare
 compare(arch).check()  # fresh weights, perturbed; raises unless all agree
 ```
 
+## Recurrent layers
+
+Linear attention and the state space models keep their state in transformers' cache,
+a `linear_attention` layer each (`conv` for `short_conv`), with the last inputs of
+their short convs. A prefill runs the recurrence by chunks of 64 positions, with
+matmuls within a chunk and a loop across them, as fla's chunked kernels do; a
+decoding step runs one position from the state the cache holds. Mamba's scan, one
+decay per channel and state dim, runs one position at a time, as bux runs it. All of
+it is PyTorch, in float32 whatever the model's dtype (float64 in a float64 model),
+with no kernels of fla, mamba_ssm or causal_conv1d yet.
+
+A padded token of a left-padded batch leaves the state as it was: its input is zeroed
+and its decay is 1. A model of recurrent layers alone has no attention layer to count
+the tokens its cache holds, so its first forward makes the cache, not `generate`.
+
 ## What exports
 
 A layer type exports once, as a class in `bux.export.hf`, and every architecture made
@@ -120,6 +135,9 @@ layer or the setting.
 | `mla` | every setting, the indexer and the `index` port; keys and values cached as projected up from the latents |
 | `csa` | every setting, the indexer and its candidate pools, and the `kv`, `index` and `candidates` ports; every token's latents cached, the window a mask over them |
 | `conv` | yes, its inputs' tail kept in the cache as it decodes |
+| `gdn`, `kda`, `deltanet`, `gla`, `lightning` | yes, every setting: value heads, the short conv, the output gate and its rank, KDA's decay rank and lower bound, lightning's rates by its depth among the token mixers |
+| `rwkv7` | yes, every setting, and its `v` port (the value residual) |
+| `mamba`, `mamba2`, `short_conv` | yes, every setting; `dt_min` and `dt_max` only start training |
 | `engram` | yes, on one stream or a widened one; its last tokens and its conv's inputs' tail kept in the cache as it decodes. A token's class is its id mod `vocab_classes`, as bux makes them |
 | `nextn` | yes, on one stream or a widened one; every head's logits on whole sequences (`all_heads=True`), and skipped as the model generates |
 | `merge` | yes |

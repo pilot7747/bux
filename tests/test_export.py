@@ -76,7 +76,9 @@ def test_a_config_constant_never_hides_a_layer_class() -> None:
     assert "MLP_1 = {" in code and "MLP(MLP_1, 64" in code
 
 
-def test_a_layer_not_exported_yet_says_which() -> None:
+def test_a_layer_not_exported_yet_says_which(monkeypatch: pytest.MonkeyPatch) -> None:
+    classes = {k: v for k, v in codegen.layer_classes().items() if k != "deltanet"}
+    monkeypatch.setattr(codegen, "layer_classes", lambda: classes)
     source = HEAD + "model = embed [rmsnorm deltanet(num_heads=2, head_dim=16)] head"
     with pytest.raises(NotImplementedError, match="deltanet"):
         codegen.modeling(plan(compile(source)), [])
