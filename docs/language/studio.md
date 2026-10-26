@@ -73,9 +73,14 @@ through the compiler again before the page draws it.
   amendment in your file, `attn.num_heads = 12`.
 - One letter of a pattern string, `"DDDA"`, cannot be changed alone. Change the
   definition it names, or the whole pattern.
+- The negation that `a - b` writes is written as `b` alone, so it cannot be
+  wrapped, repeated or followed by a layer without `b`. Write `a + -b` for that.
+- Editing an axis of the sweep rewrites only the alternatives you changed. The
+  others keep their lines, alignment and comments.
 - Saving is explicit (Cmd-S or Ctrl-S). The studio writes the file in one step, and
   refuses to write it if the file changed on disk since the page loaded it, as
-  another editor's save would. The page then offers what is on disk.
+  another editor's save would. The page then offers what is on disk. The file
+  keeps its line endings, `\r\n` too.
 
 ## Safety
 
@@ -162,6 +167,9 @@ The server's endpoints, all JSON, each with the token in `X-Bux-Token`:
 | `POST /api/plan` | the model's parameters and its FLOPs per token, as `bux plan` counts them (JAX) |
 | `POST /api/complete`, `/api/hover` | completion and hover at an offset |
 | `POST /api/save` | writes the file; `409` with what is on disk if it changed there |
+
+Offsets, in requests and replies, count UTF-16 code units, as the page's JavaScript
+does: past an emoji they are one more than Python's string indices.
 
 ## Speed
 

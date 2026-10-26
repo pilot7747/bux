@@ -19,6 +19,7 @@ an amendment of this file (``attn.num_kv_heads = 1``) for one written in a modul
 import re
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass
+from difflib import SequenceMatcher
 
 from bux import config as cfg
 from bux.lang import ir
@@ -49,6 +50,7 @@ from bux.studio.targets import (
     extent,
     find,
     grouped,
+    labeled,
     levels,
     node_at,
     place,
@@ -63,6 +65,11 @@ __all__ = ["EditError", "apply"]
 ALT, SUM, PROD, SEQ, UNARY, POWER, ATOM = range(7)
 _LABELED = re.compile(r"\s*([A-Za-z_][A-Za-z0-9_]*)\s*:\s*(.*?)\s*\Z", re.DOTALL)
 _HEAD = re.compile(r"[ \t]*(?:shared[ \t]+)?[A-Za-z_][\w.]*?([ \t]*)=(?!=)")
+# What separates the items of a list: of a call's arguments, a composition, a sweep.
+_COMMA, _ARROW, _BAR = map(re.compile, (r"[ \t]*,", r"[ \t]*(?:->|→)", r"[ \t]*\|"))
+_NOTE = re.compile(r"[ \t]*#[^\n]*")  # a comment that ends a line
+_REST = re.compile(r"[ \t]*(?:#[^\n]*)?(?:\n|\Z)")  # nothing more on the line, but one
+_SEMICOLON = re.compile(r"[ \t]*;[ \t]*")
 
 
 @dataclass(frozen=True)
@@ -251,20 +258,26 @@ def _write_into(f: File, level: Written, key: tuple[str, ...], value: str) -> Sp
 
 def _insert_arg(source: str, call: ast.Call, arg: str) -> Splice:
     """Add `arg` after the last argument of `call`: on a line of its own where the
-    last one has its own line, before a trailing comma."""
+    last one has its own line, before a trailing comma, after the last one's comment."""
     if not call.args:
         return Splice(call.span.end - 1, call.span.end - 1, arg)
     last = _arg_span(source, call.args[-1])
-    tail = source[last.end : call.span.end - 1]
-    comma = tail.find(",") if tail.lstrip().startswith(",") else -1
     line = source.rfind("\n", 0, last.start) + 1
     indent = source[line : last.start]
     if indent.strip():  # the arguments share lines
         return Splice(last.end, last.end, f", {arg}")
-    if comma >= 0:
-        at = last.end + comma + 1
-        return Splice(at, at, f"\n{indent}{arg},")
-    return Splice(last.end, last.end, f",\n{indent}{arg}")
+    if comma := _COMMA.match(source, last.end):
+        return _after_item(source, comma.end(), "", f"\n{indent}{arg},")
+    return _after_item(source, last.end, ",", f"\n{indent}{arg}")
+
+
+def _after_item(source: str, end: int, glue: str, text: str) -> Splice:
+    """Return the splice that puts `glue` right after an item that ends at `end`, and
+    `text` after the comment that ends the item's line, if it has one."""
+    note = _NOTE.match(source, end)
+    if note is None:
+        return Splice(end, end, glue + text)
+    return Splice(end, note.end(), glue + source[end : note.end()] + text)
 
 
 def _remove_arg(f: File, site: Site) -> list[Splice]:
@@ -297,12 +310,51 @@ def _remove_args(source: str, call: ast.Call, gone: list[ast.Arg]) -> list[Splic
         j = i
         while j + 1 < len(args) and out[j + 1]:
             j += 1
-        if j + 1 < len(args):  # an argument follows: up to it
-            splices.append(Splice(args[i].start, args[j + 1].start, ""))
-        else:  # the last ones: from the one before
-            splices.append(Splice(args[i - 1].end, args[j].end, ""))
+        splices += _cut(source, args, i, j, _COMMA)
         i = j + 1
     return splices
+
+
+def _cut(
+    source: str, spans: list[Span], i: int, j: int, sep: re.Pattern
+) -> list[Splice]:
+    """Remove the items `i` to `j` of a list written at `spans`, and a separator beside
+    them, `sep`: on one line, the blanks to a neighbor; on lines of their own, those
+    lines. A comment goes with the item whose line it ends."""
+    first, last = spans[i], spans[j]
+    before = spans[i - 1].end if i > 0 else None
+    after = spans[j + 1].start if j + 1 < len(spans) else None
+    if after is not None and "\n" not in source[last.end : after]:
+        return [Splice(first.start, after, "")]
+    end = m.end() if (m := sep.match(source, last.end)) else last.end
+    note = _NOTE.match(source, end)
+    if before is not None and "\n" not in source[before : first.start]:
+        if note is None:
+            return [Splice(before, last.end, "")]
+        if after is not None:  # the next item comes up to its line
+            return [Splice(first.start, after, "")]
+        return [Splice(before, note.end(), "")]
+    start = _line_start(source, first.start)
+    if source[start : first.start].strip():  # behind a separator, or the definition
+        if after is not None:
+            return [Splice(first.start, after, "")]
+        assert before is not None
+        if not _REST.match(source, end):  # a bracket follows: the line stays
+            lead = (
+                start
+                + len(source[start : first.start])
+                - len(source[start : first.start].lstrip())
+            )
+            return [Splice(lead, end, "")]
+        gap = source.rfind("\n", before, first.start)
+        return [Splice(gap, note.end() if note else end, "")]
+    splices = []
+    lasts = after is None and before is not None and end == last.end
+    if lasts and (m := sep.match(source, before)):  # the separator before them
+        splices.append(Splice(before, m.end(), ""))
+    if rest := _REST.match(source, end):
+        return [*splices, Splice(start, rest.end(), "")]
+    return [*splices, Splice(first.start, end, "")]  # a bracket follows them
 
 
 # --- Statements ------------------------------------------------------------------------
@@ -331,12 +383,22 @@ def _remove_statement(source: str, st: ast.Statement) -> Splice:
     start, end = _line_start(source, span.start), _line_end(source, span.end)
     rest = source[span.end : end].strip()
     if source[start : span.start].strip() or (rest and not rest.startswith("#")):
-        return Splice.at(span, "")
+        return _remove_inline(source, span, start)
     end = min(end + 1, len(source))
     # Between blank lines, or last after one, it takes one of them along.
     if source[:start].endswith("\n\n") and (end == len(source) or source[end] == "\n"):
         start -= 1
     return Splice(start, end, "")
+
+
+def _remove_inline(source: str, span: Span, line: int) -> Splice:
+    """Remove a statement that shares its line, which starts at `line`, with the
+    ``;`` that separates it from the one beside it."""
+    if m := _SEMICOLON.match(source, span.end):
+        return Splice(span.start, m.end(), "")
+    if m := re.search(r"[ \t]*;[ \t]*\Z", source[line : span.start]):
+        return Splice(line + m.start(), span.end, "")
+    return Splice.at(span, "")
 
 
 def _column(source: str, st: ast.Statement) -> int | None:
@@ -583,10 +645,11 @@ def _text(f: File, expr: ast.Expr) -> str:
 
 
 def _insert(f: File, op: dict) -> list[Splice]:
-    found = expression(f, str(_field(op, "node")))
-    where = _field(op, "where")
+    node, where = str(_field(op, "node")), _field(op, "where")
     if where not in ("before", "after"):
         raise EditError("insert where: before or after")
+    # Before -b, ``a - c b`` is as good as ``a + c (-b)``; after it, not.
+    found = _whole(f, node) if where == "after" else expression(f, node)
     new = _snippet(str(_field(op, "text")))
     expr, parent, source = found.expr, found.parent, f.source
     span = extent(source, expr)
@@ -619,25 +682,12 @@ def _delete(f: File, op: dict) -> list[Splice]:
     found = expression(f, str(_field(op, "node")))
     expr, parent, source = found.expr, found.parent, f.source
     if isinstance(parent, ast.Seq):
-        return [_delete_item(source, parent, expr)]
+        spans = [extent(source, item) for item in parent.items]
+        i = next(k for k, item in enumerate(parent.items) if item is expr)
+        return _cut(source, spans, i, i, _ARROW)
     if isinstance(parent, ast.BinOp) and parent.op in ("+", "-", "*"):
         return [_delete_operand(f, found)]
     raise EditError(f"this is the only part of {_what(parent)}: delete that instead")
-
-
-def _delete_item(source: str, seq: ast.Seq, expr: ast.Expr) -> Splice:
-    """Remove an item of a composition, with the space (or arrow) beside it: the one
-    after it where it starts a line of its own, else the one before."""
-    spans = [extent(source, item) for item in seq.items]
-    i = next(k for k, item in enumerate(seq.items) if item is expr)
-    if i == 0:
-        return Splice(spans[0].start, spans[1].start, "")
-    before = source[spans[i - 1].end : spans[i].start]
-    if i + 1 < len(spans):
-        after = source[spans[i].end : spans[i + 1].start]
-        if "\n" in before and "\n" not in after:
-            return Splice(spans[i].start, spans[i + 1].start, "")
-    return Splice(spans[i - 1].end, spans[i].end, "")
 
 
 def _delete_operand(f: File, found: Located) -> Splice:
@@ -673,8 +723,24 @@ def _what(parent: ast.Statement | ast.Expr) -> str:
     return "what it is in"
 
 
+def _whole(f: File, node: str) -> Located:
+    """Return the expression that `node` is written as, to change it whole: not the
+    negation that ``a - b`` writes, whose text is b's.
+
+    Raises:
+        EditError: For that negation, as `expression` does.
+    """
+    found = expression(f, node)
+    if isinstance(node_at(f, node), ir.Neg) and not isinstance(found.expr, ast.Neg):
+        raise EditError(
+            "this negation is the - of a - b, written as b alone: write it a + -b "
+            "to change it, or change b"
+        )
+    return found
+
+
 def _wrap(f: File, op: dict) -> list[Splice]:
-    found = expression(f, str(_field(op, "node")))
+    found = _whole(f, str(_field(op, "node")))
     inner = bare(f.source, found.expr)
     text = f.source[inner.start : inner.end]
     return [Splice.at(extent(f.source, found.expr), f"[{text}]")]
@@ -701,6 +767,9 @@ def _repeat(f: File, op: dict) -> list[Splice]:
 def _repeat_node(f: File, node_id: str, times: int) -> list[Splice]:
     if times < 1:
         raise EditError("a repeat count is a positive integer")
+    if isinstance(node_at(f, node_id), ir.Const):
+        raise EditError("a number is not repeated: set it, or repeat what it scales")
+    _whole(f, node_id)
     written = count(f, node_id)
     if written is not None:
         return _set_times(f, written, times)
@@ -743,21 +812,19 @@ def _retype(f: File, op: dict) -> list[Splice]:
         return [Splice.at(found.expr.span, tag)]
     root = chain[-1]
     f.require_local(root.span, "this layer's type")
-    if root.call is None:
-        return [Splice.at(root.span, tag)]
-    if tag in ACTIVATIONS:
-        return [Splice.at(root.call.span, tag)]
-    cls = LAYERS[tag]
-    splices = [Splice.at(root.call.name_span, tag)]
-    for level in chain:
+    whole = root.call is None or tag in ACTIVATIONS  # the call goes, or there is none
+    name = root.span if whole or root.call is None else root.call.name_span
+    cls = None if tag in ACTIVATIONS else LAYERS[tag]
+    known = set(cls.model_fields) | set(cls.ports) if cls is not None else set()
+    splices = [Splice.at(name, tag)]
+    for level in chain[:-1] if whole else chain:
         if level.call is not None and f.local(level.span):
-            splices += _drop_unknown(f, level.call, cls)
+            splices += _drop_unknown(f, level.call, known)
     return splices
 
 
-def _drop_unknown(f: File, call: ast.Call, cls: type[cfg.Config]) -> list[Splice]:
-    """Remove the arguments of `call` that `cls` does not take."""
-    known = set(cls.model_fields) | set(cls.ports)
+def _drop_unknown(f: File, call: ast.Call, known: set[str]) -> list[Splice]:
+    """Remove the arguments of `call` that are not among the settings `known`."""
     gone = [arg for arg in call.args if arg.key is not None and arg.key[0] not in known]
     if not gone:
         return []
@@ -792,16 +859,115 @@ def _axis(f: File, op: dict) -> list[Splice]:
             f"place: change them in each"
         )
     if len(texts) == 1:
-        m = _LABELED.match(texts[0])
-        new = _snippet(m.group(2) if m else texts[0])
-    else:
-        if any(labels) and not all(labels):
-            raise EditError("label every alternative or none of them")
-        new = _Snippet(" | ".join(texts), ALT)
-    need = slot(found.parent, found.expr)
-    first = _leads(found.parent, found.expr)
-    span = extent(f.source, found.expr)
-    return [Splice.at(span, fit(new.text, new.prec, need, first=first))]
+        return _end_sweep(f, found, texts[0])
+    if any(labels) and not all(labels):
+        raise EditError("label every alternative or none of them")
+    return _rewrite(f.source, found.expr, texts)
+
+
+def _end_sweep(f: File, found: Located, text: str) -> list[Splice]:
+    """Replace the alternatives at `found` with the one `text`; one of them kept as
+    it is keeps the comments it has, and so do its brackets."""
+    alt, source = found.expr, f.source
+    assert isinstance(alt, ast.Alt)
+    m = _LABELED.match(text)
+    new = _snippet(m.group(2) if m else text)
+    span = extent(source, alt)
+    [k] = _matched(source, alt, [text])
+    if k is None or "#" not in f.text(span):
+        need, first = slot(found.parent, alt), _leads(found.parent, alt)
+        return [Splice.at(span, fit(new.text, new.prec, need, first=first))]
+    spans, n = _option_spans(source, alt), len(alt.options)
+    splices = _cut(source, spans, 0, k - 1, _BAR) if k > 0 else []
+    splices += _cut(source, spans, k + 1, n - 1, _BAR) if k + 1 < n else []
+    if alt.labels:  # its label goes
+        splices.append(Splice(spans[k].start, extent(source, alt.options[k]).start, ""))
+    return splices
+
+
+def _rewrite(source: str, alt: ast.Alt, texts: list[str]) -> list[Splice]:
+    """Make the options of `alt` `texts`: each new or changed one where it is
+    written, each gone one with its line, and the rest as they are."""
+    spans = _option_spans(source, alt)
+    old = list(range(len(spans)))
+    new = [
+        k if k is not None else (j,) for j, k in enumerate(_matched(source, alt, texts))
+    ]
+    splices = []
+    matcher = SequenceMatcher(None, old, new, autojunk=False)
+    for kind, i1, i2, j1, j2 in matcher.get_opcodes():
+        if kind == "equal":
+            continue
+        m = min(i2 - i1, j2 - j1)
+        for i, j in zip(range(i1, i1 + m), range(j1, j1 + m), strict=True):
+            splices.append(Splice.at(spans[i], _option(texts[j])))
+        if i2 - i1 > m:
+            splices += _cut(source, spans, i1 + m, i2 - 1, _BAR)
+        if j2 - j1 > m:
+            added = [_option(t) for t in texts[j1 + m : j2]]
+            splices.append(_add_options(source, spans, i1 + m - 1, added))
+    return splices
+
+
+def _option(text: str) -> str:
+    """Return an option as source that reads back as one option: ``(a | b)``."""
+    m = _LABELED.match(text)
+    new = _snippet(m.group(2) if m else text)
+    value = fit(new.text, new.prec, SUM)
+    return f"{m.group(1)}: {value}" if m else value
+
+
+def _option_spans(source: str, alt: ast.Alt) -> list[Span]:
+    """Return where each option of `alt` is written, its label and brackets included."""
+    spans = [extent(source, o) for o in alt.options]
+    if not alt.labels:
+        return spans
+    return [Span(labeled(source, s.start), s.end) for s in spans]
+
+
+def _matched(source: str, alt: ast.Alt, texts: list[str]) -> list[int | None]:
+    """Return which option of `alt` each of `texts` is, if any: as written, or as the
+    page's sweep shows it, its blanks squeezed."""
+    labels = alt.labels or (None,) * len(alt.options)
+    known = []
+    for label, o in zip(labels, alt.options, strict=True):
+        written = {_squeezed(source, s) for s in (o.span, extent(source, o))}
+        known.append({f"{label}: {t}" if label else t for t in written})
+    found, used = [], set()
+    for text in texts:
+        squeezed = " ".join(text.split())
+        k = next(
+            (k for k, ks in enumerate(known) if k not in used and squeezed in ks), None
+        )
+        used.add(k)
+        found.append(k)
+    return found
+
+
+def _squeezed(source: str, span: Span) -> str:
+    return " ".join(source[span.start : span.end].split())
+
+
+def _add_options(source: str, spans: list[Span], k: int, texts: list[str]) -> Splice:
+    """Return the splice that adds the options `texts` after option `k` (before the
+    first, for -1), as the alternatives beside it are separated: on lines of their
+    own, ``| b`` or ``a |``, or on the same line."""
+    if k < 0:
+        return Splice(spans[0].start, spans[0].start, "".join(f"{t} | " for t in texts))
+    gap = (
+        source[spans[k - 1].end : spans[k].start]
+        if k
+        else source[spans[0].end : spans[1].start]
+    )
+    if "\n" not in gap:
+        return Splice(spans[k].end, spans[k].end, "".join(gap + t for t in texts))
+    line = gap[gap.rfind("\n") + 1 :]
+    if "|" in line:
+        return _after_item(
+            source, spans[k].end, "", "".join(f"\n{line}{t}" for t in texts)
+        )
+    lines = f" |\n{line}".join(texts)
+    return _after_item(source, spans[k].end, " |", f"\n{line}{lines}")
 
 
 def _sites(f: File, labels: object) -> int:

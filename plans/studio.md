@@ -91,7 +91,9 @@ amendment in this file). Merges the compiler inserts have no span.
 `http://127.0.0.1:PORT/?t=TOKEN`. Every `/api/*` call carries header `X-Bux-Token:
 TOKEN` (a random token per session, so another web page cannot write the file). All
 bodies and replies are JSON. `picks` selects a run of the sweep: `{axisId: option}`
-(missing axes take option 0). Offsets are into the source the client sent.
+(missing axes take option 0). Offsets are into the source the client sent, in
+UTF-16 code units as JavaScript's strings count them; the server converts them
+from and to Python's code points, which differ past a character such as an emoji.
 
 | Endpoint | Body | Reply |
 |---|---|---|
@@ -104,7 +106,7 @@ bodies and replies are JSON. `picks` selects a run of the sweep: `{axisId: optio
 | `POST /api/plan` | `{source, picks}` | `{params, params_text, flops_per_token}` (JAX, lazily) |
 | `POST /api/complete` | `{source, offset}` | `[{label, kind, detail, documentation, insert_text}]` |
 | `POST /api/hover` | `{source, offset}` | `{start, end, markdown}` or `null` |
-| `POST /api/save` | `{source, mtime}` | `{mtime}`; 409 `{source, mtime}` if the file changed on disk |
+| `POST /api/save` | `{source, mtime}` | `{mtime}`; 409 `{source, mtime}` if the file changed on disk (`source` null: deleted). Keeps the file's line endings; makes its folder |
 
 ### View
 

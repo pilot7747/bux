@@ -17,7 +17,7 @@ import pytest
 from bux.__main__ import studio_parser
 from bux.studio import server as studio_server
 from bux.studio import training
-from bux.studio.server import TEMPLATE, Server, Studio, bind
+from bux.studio.server import TEMPLATE, Server, Studio, Units, bind
 
 EXAMPLES = Path(__file__).parent.parent / "examples"
 SOURCE = (EXAMPLES / "experiments/smoke.bux").read_text()
@@ -285,3 +285,81 @@ def test_the_page_names_only_files_that_ship():
     files = {n for item in named for n in ((item,) if isinstance(item, str) else item)}
     assert {"app.js", "diagram.js", "training.js", "sweep.js", "panels.css"} <= files
     assert [f for f in sorted(files) if not (static / f).is_file()] == []
+
+
+def serving(path: Path, static: Path) -> tuple[Server, Client]:
+    server = Server(("127.0.0.1", 0), Studio(path), static)
+    threading.Thread(target=server.serve_forever, args=(0.05,), daemon=True).start()
+    return server, Client(server)
+
+
+def test_saving_keeps_the_files_line_endings(client, file):
+    file.write_bytes(SOURCE.replace("\n", "\r\n").encode())
+    session = client.call("/api/session")[1]
+    assert session["source"] == SOURCE  # the page's text has \n, as a textarea's
+    edited = SOURCE.replace("steps     = 50", "steps     = 60")
+    body = {"source": edited, "mtime": session["mtime"]}
+    assert client.call("/api/save", body)[0] == 200
+    assert file.read_bytes() == edited.replace("\n", "\r\n").encode()
+
+
+def test_a_save_after_the_file_was_deleted_asks_first(client, file):
+    mtime = client.call("/api/session")[1]["mtime"]
+    file.unlink()
+    status, body, _ = client.call("/api/save", {"source": "# one\n", "mtime": mtime})
+    assert (status, body) == (409, {"source": None, "mtime": None})
+    assert not file.exists()
+    assert client.call("/api/save", {"source": "# one\n", "mtime": None})[0] == 200
+    assert file.read_text() == "# one\n"
+
+
+def test_the_first_save_makes_the_files_folder(tmp_path, static):
+    path = tmp_path / "new" / "deeper" / "model.bux"
+    server, client = serving(path, static)
+    try:
+        status, saved, _ = client.call("/api/save", {"source": TEMPLATE, "mtime": None})
+        assert status == 200 and path.read_text() == TEMPLATE
+        assert saved["mtime"] == path.stat().st_mtime
+    finally:
+        server.shutdown()
+        server.server_close()
+
+
+def utf16(text: str, start: int, end: int) -> str:
+    """Return ``text.slice(start, end)`` as the page's JavaScript reads it."""
+    return text.encode("utf-16-le")[2 * start : 2 * end].decode("utf-16-le")
+
+
+def test_offsets_count_as_the_pages_strings_do(client):
+    # JavaScript counts an emoji as two: every offset after one is the page's.
+    source = SOURCE.replace("# ", "# 🙂 ", 1)
+    v = client.call("/api/view", {"source": source, "picks": {}})[1]
+    norm = v["model"]["graph"]["items"][2]  # block^2 norm head
+    assert utf16(source, *norm["span"]) == "norm"
+    assert utf16(source, *norm["written"]) == "rmsnorm"
+    at = norm["written"][0] + 3
+    status, hover, _ = client.call("/api/hover", {"source": source, "offset": at})
+    assert status == 200 and utf16(source, hover["start"], hover["end"]) == "rmsnorm"
+    bad = source.replace("block^2", "blokc^2")
+    [error] = client.call("/api/view", {"source": bad, "picks": {}})[1]["errors"]
+    assert utf16(bad, error["start"], error["end"]) == "blokc"
+    assert error["col"] == len("model = embed b")
+    units = Units("a🙂b")
+    assert [units.page(i) for i in range(4)] == [0, 1, 3, 4]
+    assert [units.python(u) for u in range(5)] == [0, 1, 1, 2, 3]
+    assert units.error({"start": 2, "end": 3, "col": 3}) == {
+        "start": 3,
+        "end": 4,
+        "col": 4,
+    }
+    typed = source + "attn2 = gqa("
+    body = {"source": typed, "offset": len(typed.encode("utf-16-le")) // 2}
+    assert client.call("/api/complete", body)[1][0]["label"] == "num_heads"
+    body = {"source": source, "picks": {}, "target": {"node": "n.2"}}
+    form = client.call("/api/inspect", body)[1]
+    assert utf16(source, *form["where"]["span"]) == "rmsnorm"
+    # An edit names no offsets: it splices the text it is sent, emoji and all.
+    op = {"op": "set", "target": {"node": "n.2"}, "key": "eps", "value": "1e-6"}
+    body = {"source": source, "picks": {}, "ops": [op]}
+    edited = client.call("/api/edit", body)[1]["source"]
+    assert edited == source.replace("= rmsnorm", "= rmsnorm(eps=1e-6)", 1)

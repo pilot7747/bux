@@ -523,3 +523,139 @@ def test_a_whole_item_of_a_list():
     assert new == changed(
         CURRICULUM, "phase(at=0.75, seq_len=256, batch=4)", "phase(at=0.8, seq_len=256)"
     )
+
+
+# --- Comments and layout survive -------------------------------------------------------
+
+INIT = EXAMPLES / "experiments/init_ablation.bux"
+SCHEDULES = EXAMPLES / "experiments/schedule_sweep.bux"
+NGPT = EXAMPLES / "architectures/ngpt.bux"
+
+
+def attn(call: str) -> str:
+    return f"{BASE}attn = gqa({call})\nmodel = embed [rmsnorm attn] head\n"
+
+
+@pytest.mark.parametrize(
+    ("call", "key", "value", "new"),
+    [
+        ("num_heads=4,\n    num_kv_heads=2  # kv\n", "head_dim", "8", "num_heads=4,\n    num_kv_heads=2,  # kv\n    head_dim=8\n"),
+        ("\n    num_heads=4,  # q\n    num_kv_heads=2,  # kv\n", "head_dim", "8", "\n    num_heads=4,  # q\n    num_kv_heads=2,  # kv\n    head_dim=8,\n"),
+        ("num_heads=4,  # q\n    num_kv_heads=2,  # kv\n    head_dim=8  # hd\n", "head_dim", None, "num_heads=4,  # q\n    num_kv_heads=2  # kv\n"),
+        ("num_heads=4, num_kv_heads=2,  # kv\n    head_dim=8", "head_dim", None, "num_heads=4, num_kv_heads=2  # kv\n    "),
+        ("\n    num_heads=4,\n    head_dim=8,\n    # two groups\n    num_kv_heads=2,\n", "head_dim", None, "\n    num_heads=4,\n    # two groups\n    num_kv_heads=2,\n"),
+        ("\n    head_dim=8,  # hd\n    num_heads=4,  # q\n    num_kv_heads=2,\n", "head_dim", None, "\n    num_heads=4,  # q\n    num_kv_heads=2,\n"),
+        ("num_heads=4, head_dim=8,  # hd\n    num_kv_heads=2", "head_dim", None, "num_heads=4, num_kv_heads=2"),
+        ("num_heads=4, num_kv_heads=2, head_dim=8  # hd\n", "head_dim", None, "num_heads=4, num_kv_heads=2\n"),
+    ],
+)  # fmt: skip
+def test_comments_stay_with_their_arguments(call, key, value, new):
+    assert on(attn(call), set_("n.1.0.1", key, value)) == attn(new)
+
+
+SEQ = "model = embed  # in\n        rmsnorm  # first\n        gelu  # second\n        head  # out\n"
+
+
+@pytest.mark.parametrize(
+    ("model", "node", "result"),
+    [
+        (SEQ, "n.1", "model = embed  # in\n        gelu  # second\n        head  # out\n"),
+        (SEQ, "n.3", "model = embed  # in\n        rmsnorm  # first\n        gelu  # second\n"),
+        ("model = embed  # in\n     -> rmsnorm  # norm\n     -> head\n", "n.2", "model = embed  # in\n     -> rmsnorm  # norm\n"),
+        ("model = embed ->\n        rmsnorm ->\n        head\n", "n.2", "model = embed ->\n        rmsnorm\n"),
+        ("b = [rmsnorm  # pre-norm\n     gelu]\nmodel = embed b head\n", "n.1.0.1", "b = [rmsnorm  # pre-norm\n     ]\nmodel = embed b head\n"),
+        ("b = [gelu\n     -> rmsnorm  # norm\n     -> gelu]\nmodel = embed b head\n", "n.1.0.2", "b = [gelu\n     -> rmsnorm  # norm\n     ]\nmodel = embed b head\n"),
+    ],
+)  # fmt: skip
+def test_comments_stay_with_their_items(model, node, result):
+    assert on(BASE + model, delete(node)) == BASE + result
+
+
+def test_statements_on_one_line_lose_their_semicolon():
+    text = (
+        attn("num_heads=4, num_kv_heads=2")
+        + "attn.num_kv_heads = 1; attn.num_heads = 8\n"
+    )
+    assert on(text, set_("n.1.0.1", "num_kv_heads", None)) == text.replace(
+        "attn.num_kv_heads = 1; ", ""
+    )
+    assert on(text, set_("n.1.0.1", "num_heads", None)) == text.replace(
+        "; attn.num_heads = 8", ""
+    )
+
+
+def test_an_axis_keeps_its_lines_and_the_options_it_keeps():
+    options = [
+        "normal: normal",
+        "olmo2: normal(truncate=3)",
+        "gpt2: normal(out=normal(std=0.02 / (2 * layers) ^ 0.5))",
+        "lecun: fan_in",
+        "zero_out: normal(out=zeros)",
+    ]
+    labels = "gpt2|lecun|normal|olmo2|zero_out"
+    dropped = [o for o in options if not o.startswith("lecun")]
+    expected = changed(INIT, "\n     | lecun: fan_in", "")
+    assert edit(INIT, axis(labels, *dropped)) == expected
+    olmo2 = [o.replace("truncate=3", "truncate=2") for o in options]
+    assert edit(INIT, axis(labels, *olmo2)) == changed(INIT, "truncate=3", "truncate=2")
+    added = edit(INIT, axis(labels, *options, "small: normal(std=0.01)"))
+    assert added == changed(
+        INIT, "zero_out: normal(out=zeros)\n", "zero_out: normal(out=zeros)\n     | small: normal(std=0.01)\n"
+    )  # fmt: skip
+    where = "schedule=wsd(warmup=1k, decay=0.2, shape=sqrt)|deepseek_v3|kimi_k2|olmo_2|d2z|deepseek_llm"
+    schedules = where.removeprefix("schedule=").split("|")
+    assert edit(SCHEDULES, axis(where, *schedules, "wsd")) == changed(
+        SCHEDULES, "| d2z | deepseek_llm\n", "| d2z | deepseek_llm | wsd\n"
+    )
+
+
+def test_an_axis_keeps_comments_and_nested_alternatives():
+    text = (
+        f"{BASE}model = embed [rmsnorm gqa(num_heads=4, num_kv_heads=2)] head\n"
+        "data = synthetic\noptimizer = adamw(lr=1e-3  # small\n    | 3e-3  # big\n    )\n"
+        "seq_len = 16\nbatch = 2\nsteps = 2\n"
+    )
+    lr = "optimizer.lr=1e-3|3e-3"
+    # One left ends the sweep; the option kept keeps its comment.
+    assert on(text, axis(lr, "1e-3")) == text.replace("\n    | 3e-3  # big", "")
+    assert on(text, axis(lr, "1e-3", "3e-3", "1e-2")) == text.replace(
+        "# big\n", "# big\n    | 1e-2\n"
+    )
+    assert on(text, axis(lr, "3e-3")) == text.replace("1e-3  # small\n    | ", "")
+    nested = text.replace("[rmsnorm gqa", "(rmsnorm | (gelu | swish)) [rmsnorm gqa")
+    alts = "model=rmsnorm|gelu | swish"  # as the view writes the option: gelu | swish
+    assert on(nested, axis(alts, "rmsnorm", "gelu | swish", "relu")) == nested.replace(
+        "(gelu | swish))", "(gelu | swish) | relu)"
+    )
+    assert on(nested, axis(alts, "rmsnorm", "gelu | relu")) == nested.replace(
+        "(gelu | swish))", "(gelu | relu))"
+    )
+
+
+# --- What an op means ------------------------------------------------------------------
+
+
+def test_the_negation_of_a_minus_b_is_not_edited_inside_b():
+    # block = [(attn unit - _) step] ...: n.2.0.0.0.0.1 is the -_ of attn unit - _
+    neg = "n.2.0.0.0.0.1"
+    ops = [insert(neg, "after", "gelu"), {"op": "wrap", "node": neg}]
+    for op in [*ops, {"op": "repeat", "node": neg, "times": 2}]:
+        with pytest.raises(EditError, match="a - b"):
+            edit(NGPT, op)
+    assert edit(NGPT, {"op": "wrap", "node": f"{neg}.0"}) == changed(
+        NGPT, "(attn unit - _)", "(attn unit - [_])"
+    )  # the _ itself, inside the negation
+
+
+def test_a_number_is_not_repeated():
+    text = BASE + "model = embed [gelu * 0.5] head\n"
+    with pytest.raises(EditError, match="number"):
+        on(text, {"op": "repeat", "node": "n.1.0.1", "times": 3})
+
+
+def test_a_retype_to_an_activation_drops_the_settings_written_after():
+    text = attn("num_heads=4, num_kv_heads=2") + "attn.num_kv_heads = 1  # mqa\n"
+    retype = {"op": "retype", "node": "n.1.0.1", "type": "swish"}
+    assert on(text, retype) == attn("num_heads=4, num_kv_heads=2").replace(
+        "gqa(num_heads=4, num_kv_heads=2)", "swish"
+    )
