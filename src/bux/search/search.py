@@ -92,16 +92,16 @@ class Search:
     def key(self) -> str:
         """Ten hex digits of a hash of what it searches and how."""
         what = {
-            "dimensions": {n: d.model_dump() for n, d in zip(*self._dims())},
+            "dimensions": {
+                name: dim.model_dump()
+                for name, dim in zip(self.dims.names, self.dims.dims, strict=True)
+            },
             "method": self.config.method.model_dump(),
             "halving": self.config.halving and self.config.halving.model_dump(),
             "seed": self.config.seed,
         }
         blob = json.dumps(what, sort_keys=True, separators=(",", ":"))
         return hashlib.sha256(blob.encode()).hexdigest()[:10]
-
-    def _dims(self) -> tuple[tuple[str, ...], tuple[tcfg.Distribution, ...]]:
-        return self.dims.names, self.dims.dims
 
     @property
     def budget(self) -> int:
