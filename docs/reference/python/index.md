@@ -29,6 +29,7 @@ call against them.
 | {py:mod}`bux.lang` | The `.bux` language: parser, compiler, IR, printer, renderer, modules, editor support |
 | {py:mod}`bux.config` | The layers' configs, as plain pydantic data |
 | {py:mod}`bux.architecture` | The reference Flax NNX backend: layers, kernels, residual algebras, repeats |
+| {py:mod}`bux.export` | Exporting models to transformers, with their weights, and checking them |
 | {py:mod}`bux.train` | Training configs, the trainer, optimizers, objectives, hooks, sinks |
 | {py:mod}`bux.parallel` | The mesh, the layout, and the methods of each kind of parallelism |
 | {py:mod}`bux.data` | Tokenizing, shuffling and packing documents into rows |
@@ -48,6 +49,7 @@ call against them.
    bux.lang
    bux.config
    bux.architecture
+   bux.export
    bux.train
    bux.parallel
    bux.data

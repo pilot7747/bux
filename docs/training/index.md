@@ -150,6 +150,13 @@ Every training setting, what is required, and the checks before anything runs.
 AdamW and Muon, warmup, cosine and WSD, clipping, and the loss.
 :::
 
+:::{grid-item-card} Curriculum and batch ramps
+:link: curriculum
+:link-type: doc
+
+Phases that change seq_len, batch or data from a step on, and a batch that ramps up.
+:::
+
 :::{grid-item-card} Precision
 :link: precision
 :link-type: doc
@@ -205,6 +212,7 @@ Why a run is a `.bux` file, and the config systems considered instead.
 
 settings
 optimizers
+curriculum
 precision
 running
 observing

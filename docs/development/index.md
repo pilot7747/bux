@@ -149,6 +149,8 @@ A change to bux is done when its documentation is. Update, in the same change:
 | data: sources, tokenizer, packing, the pipeline | `docs/data/` |
 | parallelism: mesh, layout, a method | the page in `docs/parallelism/` for it |
 | a kernel, a default that changes speed, new measurements | `docs/performance/` (kernels, tuning, benchmarks), with hardware and date |
+| an exported layer, or the exporter | `docs/export/`, its table of what exports, and `tests/test_export*.py` |
+| a layer of the vLLM plugin (`bux_vllm`) | `docs/export/vllm.md`'s table of what runs, and `scripts/vllm_parity.py`'s cases |
 | an environment variable | `docs/reference/environment.md` |
 | an example architecture | its header comment (the zoo regenerates) and `tests/test_examples.py` |
 | an example run or recipe | the tutorial or guide that uses it |
