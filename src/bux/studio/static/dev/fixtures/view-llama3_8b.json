@@ -1,0 +1,464 @@
+{
+ "source": "# Llama 3 8B (Meta, 2024): the reference pre-norm decoder.\nd_model    = 4096\nvocab_size = 128256\n\nnorm = rmsnorm(eps=1e-5)\nattn = gqa(num_heads=32, num_kv_heads=8, rope=rope(base=500000))\nffn  = gated_mlp(intermediate_size=14336, activation=swish)\n\nblock = [norm attn] [norm ffn]\nmodel = embed block^32 norm head\n",
+ "path": "examples/architectures/llama3_8b.bux",
+ "ok": true,
+ "errors": [],
+ "model": {
+  "name": "llama3_8b",
+  "facts": {
+   "d_model": 4096,
+   "vocab_size": 128256,
+   "layers": 131,
+   "residual": null,
+   "init": null,
+   "by_type": [
+    [
+     "rmsnorm",
+     65
+    ],
+    [
+     "gqa",
+     32
+    ],
+    [
+     "gated_mlp",
+     32
+    ],
+    [
+     "embed",
+     1
+    ],
+    [
+     "head",
+     1
+    ]
+   ]
+  },
+  "graph": {
+   "id": "n",
+   "kind": "seq",
+   "label": "model",
+   "shared": false,
+   "span": [
+    288,
+    312
+   ],
+   "origin": null,
+   "editable": true,
+   "items": [
+    {
+     "id": "n.0",
+     "kind": "layer",
+     "label": null,
+     "shared": false,
+     "span": [
+      288,
+      293
+     ],
+     "origin": null,
+     "editable": true,
+     "type": "embed",
+     "title": "Token embedding",
+     "category": "io",
+     "chips": [],
+     "width": "tokens",
+     "ports": [],
+     "written": null,
+     "internals": null,
+     "inserted": false
+    },
+    {
+     "id": "n.1",
+     "kind": "repeat",
+     "label": null,
+     "shared": false,
+     "span": [
+      294,
+      302
+     ],
+     "origin": null,
+     "editable": true,
+     "body": {
+      "id": "n.1.0",
+      "kind": "seq",
+      "label": "block",
+      "shared": false,
+      "span": [
+       294,
+       299
+      ],
+      "origin": null,
+      "editable": true,
+      "items": [
+       {
+        "id": "n.1.0.0",
+        "kind": "residual",
+        "label": null,
+        "shared": false,
+        "span": [
+         257,
+         268
+        ],
+        "origin": null,
+        "editable": true,
+        "body": {
+         "id": "n.1.0.0.0",
+         "kind": "seq",
+         "label": null,
+         "shared": false,
+         "span": [
+          258,
+          267
+         ],
+         "origin": null,
+         "editable": true,
+         "items": [
+          {
+           "id": "n.1.0.0.0.0",
+           "kind": "layer",
+           "label": "norm",
+           "shared": false,
+           "span": [
+            258,
+            262
+           ],
+           "origin": null,
+           "editable": true,
+           "type": "rmsnorm",
+           "title": "RMSNorm",
+           "category": "norm",
+           "chips": [],
+           "width": 4096,
+           "ports": [],
+           "written": [
+            105,
+            122
+           ],
+           "internals": null,
+           "inserted": false
+          },
+          {
+           "id": "n.1.0.0.0.1",
+           "kind": "layer",
+           "label": "attn",
+           "shared": false,
+           "span": [
+            263,
+            267
+           ],
+           "origin": null,
+           "editable": true,
+           "type": "gqa",
+           "title": "Grouped-query attention",
+           "category": "attention",
+           "chips": [
+            "32 heads",
+            "8 KV heads",
+            "RoPE 500k"
+           ],
+           "width": 4096,
+           "ports": [],
+           "written": [
+            130,
+            187
+           ],
+           "internals": null,
+           "inserted": false
+          }
+         ]
+        }
+       },
+       {
+        "id": "n.1.0.1",
+        "kind": "residual",
+        "label": null,
+        "shared": false,
+        "span": [
+         269,
+         279
+        ],
+        "origin": null,
+        "editable": true,
+        "body": {
+         "id": "n.1.0.1.0",
+         "kind": "seq",
+         "label": null,
+         "shared": false,
+         "span": [
+          270,
+          278
+         ],
+         "origin": null,
+         "editable": true,
+         "items": [
+          {
+           "id": "n.1.0.1.0.0",
+           "kind": "layer",
+           "label": "norm",
+           "shared": false,
+           "span": [
+            270,
+            274
+           ],
+           "origin": null,
+           "editable": true,
+           "type": "rmsnorm",
+           "title": "RMSNorm",
+           "category": "norm",
+           "chips": [],
+           "width": 4096,
+           "ports": [],
+           "written": [
+            105,
+            122
+           ],
+           "internals": null,
+           "inserted": false
+          },
+          {
+           "id": "n.1.0.1.0.1",
+           "kind": "layer",
+           "label": "ffn",
+           "shared": false,
+           "span": [
+            275,
+            278
+           ],
+           "origin": null,
+           "editable": true,
+           "type": "gated_mlp",
+           "title": "Gated feed-forward",
+           "category": "ffn",
+           "chips": [
+            "14,336 hidden",
+            "swish"
+           ],
+           "width": 4096,
+           "ports": [],
+           "written": [
+            195,
+            247
+           ],
+           "internals": {
+            "id": "n.1.0.1.0.1~",
+            "kind": "seq",
+            "label": null,
+            "shared": false,
+            "span": null,
+            "origin": null,
+            "editable": false,
+            "items": [
+             {
+              "id": "n.1.0.1.0.1~p",
+              "kind": "prod",
+              "label": null,
+              "shared": false,
+              "span": null,
+              "origin": null,
+              "editable": false,
+              "factors": [
+               {
+                "id": "n.1.0.1.0.1~g",
+                "kind": "seq",
+                "label": null,
+                "shared": false,
+                "span": null,
+                "origin": null,
+                "editable": false,
+                "items": [
+                 {
+                  "id": "n.1.0.1.0.1~g0",
+                  "kind": "layer",
+                  "label": null,
+                  "shared": false,
+                  "span": null,
+                  "origin": null,
+                  "editable": false,
+                  "type": "linear",
+                  "title": "Linear",
+                  "category": "op",
+                  "chips": [
+                   "\u2192 14,336"
+                  ]
+                 },
+                 {
+                  "id": "n.1.0.1.0.1~a",
+                  "kind": "layer",
+                  "label": null,
+                  "shared": false,
+                  "span": null,
+                  "origin": null,
+                  "editable": false,
+                  "type": "swish",
+                  "title": "swish",
+                  "category": "op",
+                  "chips": []
+                 }
+                ]
+               },
+               {
+                "id": "n.1.0.1.0.1~u",
+                "kind": "layer",
+                "label": null,
+                "shared": false,
+                "span": null,
+                "origin": null,
+                "editable": false,
+                "type": "linear",
+                "title": "Linear",
+                "category": "op",
+                "chips": [
+                 "\u2192 14,336"
+                ]
+               }
+              ]
+             },
+             {
+              "id": "n.1.0.1.0.1~d",
+              "kind": "layer",
+              "label": null,
+              "shared": false,
+              "span": null,
+              "origin": null,
+              "editable": false,
+              "type": "linear",
+              "title": "Linear",
+              "category": "op",
+              "chips": [
+               "\u2192 4,096"
+              ]
+             }
+            ]
+           },
+           "inserted": false
+          }
+         ]
+        }
+       }
+      ]
+     },
+     "times": 32
+    },
+    {
+     "id": "n.2",
+     "kind": "layer",
+     "label": "norm",
+     "shared": false,
+     "span": [
+      303,
+      307
+     ],
+     "origin": null,
+     "editable": true,
+     "type": "rmsnorm",
+     "title": "RMSNorm",
+     "category": "norm",
+     "chips": [],
+     "width": 4096,
+     "ports": [],
+     "written": [
+      105,
+      122
+     ],
+     "internals": null,
+     "inserted": false
+    },
+    {
+     "id": "n.3",
+     "kind": "layer",
+     "label": null,
+     "shared": false,
+     "span": [
+      308,
+      312
+     ],
+     "origin": null,
+     "editable": true,
+     "type": "head",
+     "title": "Output head",
+     "category": "io",
+     "chips": [],
+     "width": 4096,
+     "ports": [],
+     "written": null,
+     "internals": null,
+     "inserted": false
+    }
+   ]
+  }
+ },
+ "run": null,
+ "sweep": {
+  "axes": [],
+  "runs": [],
+  "total": 0,
+  "truncated": false,
+  "dimensions": [],
+  "search": null
+ },
+ "outline": [
+  {
+   "name": "d_model",
+   "kind": "value",
+   "span": [
+    59,
+    76
+   ],
+   "origin": null
+  },
+  {
+   "name": "vocab_size",
+   "kind": "value",
+   "span": [
+    77,
+    96
+   ],
+   "origin": null
+  },
+  {
+   "name": "norm",
+   "kind": "layer",
+   "span": [
+    98,
+    122
+   ],
+   "origin": null
+  },
+  {
+   "name": "attn",
+   "kind": "layer",
+   "span": [
+    123,
+    187
+   ],
+   "origin": null
+  },
+  {
+   "name": "ffn",
+   "kind": "layer",
+   "span": [
+    188,
+    247
+   ],
+   "origin": null
+  },
+  {
+   "name": "block",
+   "kind": "block",
+   "span": [
+    249,
+    279
+   ],
+   "origin": null
+  },
+  {
+   "name": "model",
+   "kind": "block",
+   "span": [
+    280,
+    312
+   ],
+   "origin": null
+  }
+ ]
+}

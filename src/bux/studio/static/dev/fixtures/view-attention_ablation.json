@@ -1,0 +1,785 @@
+{
+ "source": "# MHA, GQA or MQA, at which learning rate? Six runs of a 12-layer Llama, in one file.\n#\n#   bux plan  examples/experiments/attention_ablation.bux\n#   bux train examples/experiments/attention_ablation.bux --only mqa\n#\n# The architecture and the recipe come from other files, by name. Definitions here\n# take the place of theirs everywhere, so llama3_8b's `block` picks up this `attn`.\nuse llama3_8b\nuse fineweb_wsd\n\n# Llama 3 8B, scaled down.\nd_model = 768\nffn.intermediate_size = 2048\nmodel = embed block^12 norm head(tied=true)\n\n# Three attentions, crossed with two learning rates: 3 \u00d7 2 runs.\nattn.num_heads    = 12\nattn.num_kv_heads = mha: 12 | gqa: 4 | mqa: 1\noptimizer.lr      = 1e-3 | 3e-3\n\nbudget = 3B\n",
+ "path": "examples/experiments/attention_ablation.bux",
+ "ok": true,
+ "errors": [],
+ "model": {
+  "name": "attention_ablation",
+  "facts": {
+   "d_model": 768,
+   "vocab_size": 128256,
+   "layers": 51,
+   "residual": null,
+   "init": null,
+   "by_type": [
+    [
+     "rmsnorm",
+     25
+    ],
+    [
+     "gqa",
+     12
+    ],
+    [
+     "gated_mlp",
+     12
+    ],
+    [
+     "embed",
+     1
+    ],
+    [
+     "head",
+     1
+    ]
+   ]
+  },
+  "graph": {
+   "id": "n",
+   "kind": "seq",
+   "label": "model",
+   "shared": false,
+   "span": [
+    493,
+    528
+   ],
+   "origin": null,
+   "editable": true,
+   "items": [
+    {
+     "id": "n.0",
+     "kind": "layer",
+     "label": null,
+     "shared": false,
+     "span": [
+      493,
+      498
+     ],
+     "origin": null,
+     "editable": true,
+     "type": "embed",
+     "title": "Token embedding",
+     "category": "io",
+     "chips": [],
+     "width": "tokens",
+     "ports": [],
+     "written": null,
+     "internals": null,
+     "inserted": false
+    },
+    {
+     "id": "n.1",
+     "kind": "repeat",
+     "label": null,
+     "shared": false,
+     "span": [
+      499,
+      507
+     ],
+     "origin": null,
+     "editable": true,
+     "body": {
+      "id": "n.1.0",
+      "kind": "seq",
+      "label": "block",
+      "shared": false,
+      "span": [
+       499,
+       504
+      ],
+      "origin": null,
+      "editable": true,
+      "items": [
+       {
+        "id": "n.1.0.0",
+        "kind": "residual",
+        "label": null,
+        "shared": false,
+        "span": null,
+        "origin": null,
+        "editable": false,
+        "body": {
+         "id": "n.1.0.0.0",
+         "kind": "seq",
+         "label": null,
+         "shared": false,
+         "span": null,
+         "origin": null,
+         "editable": false,
+         "items": [
+          {
+           "id": "n.1.0.0.0.0",
+           "kind": "layer",
+           "label": "norm",
+           "shared": false,
+           "span": null,
+           "origin": "llama3_8b",
+           "editable": false,
+           "type": "rmsnorm",
+           "title": "RMSNorm",
+           "category": "norm",
+           "chips": [],
+           "width": 768,
+           "ports": [],
+           "written": null,
+           "internals": null,
+           "inserted": false
+          },
+          {
+           "id": "n.1.0.0.0.1",
+           "kind": "layer",
+           "label": "attn",
+           "shared": false,
+           "span": null,
+           "origin": null,
+           "editable": false,
+           "type": "gqa",
+           "title": "Grouped-query attention",
+           "category": "attention",
+           "chips": [
+            "12 heads",
+            "RoPE 500k"
+           ],
+           "width": 768,
+           "ports": [],
+           "written": [
+            618,
+            663
+           ],
+           "internals": null,
+           "inserted": false
+          }
+         ]
+        }
+       },
+       {
+        "id": "n.1.0.1",
+        "kind": "residual",
+        "label": null,
+        "shared": false,
+        "span": null,
+        "origin": null,
+        "editable": false,
+        "body": {
+         "id": "n.1.0.1.0",
+         "kind": "seq",
+         "label": null,
+         "shared": false,
+         "span": null,
+         "origin": null,
+         "editable": false,
+         "items": [
+          {
+           "id": "n.1.0.1.0.0",
+           "kind": "layer",
+           "label": "norm",
+           "shared": false,
+           "span": null,
+           "origin": "llama3_8b",
+           "editable": false,
+           "type": "rmsnorm",
+           "title": "RMSNorm",
+           "category": "norm",
+           "chips": [],
+           "width": 768,
+           "ports": [],
+           "written": null,
+           "internals": null,
+           "inserted": false
+          },
+          {
+           "id": "n.1.0.1.0.1",
+           "kind": "layer",
+           "label": "ffn",
+           "shared": false,
+           "span": null,
+           "origin": null,
+           "editable": false,
+           "type": "gated_mlp",
+           "title": "Gated feed-forward",
+           "category": "ffn",
+           "chips": [
+            "2,048 hidden",
+            "swish"
+           ],
+           "width": 768,
+           "ports": [],
+           "written": [
+            456,
+            484
+           ],
+           "internals": {
+            "id": "n.1.0.1.0.1~",
+            "kind": "seq",
+            "label": null,
+            "shared": false,
+            "span": null,
+            "origin": null,
+            "editable": false,
+            "items": [
+             {
+              "id": "n.1.0.1.0.1~p",
+              "kind": "prod",
+              "label": null,
+              "shared": false,
+              "span": null,
+              "origin": null,
+              "editable": false,
+              "factors": [
+               {
+                "id": "n.1.0.1.0.1~g",
+                "kind": "seq",
+                "label": null,
+                "shared": false,
+                "span": null,
+                "origin": null,
+                "editable": false,
+                "items": [
+                 {
+                  "id": "n.1.0.1.0.1~g0",
+                  "kind": "layer",
+                  "label": null,
+                  "shared": false,
+                  "span": null,
+                  "origin": null,
+                  "editable": false,
+                  "type": "linear",
+                  "title": "Linear",
+                  "category": "op",
+                  "chips": [
+                   "\u2192 2,048"
+                  ]
+                 },
+                 {
+                  "id": "n.1.0.1.0.1~a",
+                  "kind": "layer",
+                  "label": null,
+                  "shared": false,
+                  "span": null,
+                  "origin": null,
+                  "editable": false,
+                  "type": "swish",
+                  "title": "swish",
+                  "category": "op",
+                  "chips": []
+                 }
+                ]
+               },
+               {
+                "id": "n.1.0.1.0.1~u",
+                "kind": "layer",
+                "label": null,
+                "shared": false,
+                "span": null,
+                "origin": null,
+                "editable": false,
+                "type": "linear",
+                "title": "Linear",
+                "category": "op",
+                "chips": [
+                 "\u2192 2,048"
+                ]
+               }
+              ]
+             },
+             {
+              "id": "n.1.0.1.0.1~d",
+              "kind": "layer",
+              "label": null,
+              "shared": false,
+              "span": null,
+              "origin": null,
+              "editable": false,
+              "type": "linear",
+              "title": "Linear",
+              "category": "op",
+              "chips": [
+               "\u2192 768"
+              ]
+             }
+            ]
+           },
+           "inserted": false
+          }
+         ]
+        }
+       }
+      ]
+     },
+     "times": 12
+    },
+    {
+     "id": "n.2",
+     "kind": "layer",
+     "label": "norm",
+     "shared": false,
+     "span": [
+      508,
+      512
+     ],
+     "origin": null,
+     "editable": true,
+     "type": "rmsnorm",
+     "title": "RMSNorm",
+     "category": "norm",
+     "chips": [],
+     "width": 768,
+     "ports": [],
+     "written": null,
+     "internals": null,
+     "inserted": false
+    },
+    {
+     "id": "n.3",
+     "kind": "layer",
+     "label": null,
+     "shared": false,
+     "span": [
+      513,
+      528
+     ],
+     "origin": null,
+     "editable": true,
+     "type": "head",
+     "title": "Output head",
+     "category": "io",
+     "chips": [
+      "tied"
+     ],
+     "width": 768,
+     "ports": [],
+     "written": [
+      513,
+      528
+     ],
+     "internals": null,
+     "inserted": false
+    }
+   ]
+  }
+ },
+ "run": {
+  "name": "attention_ablation[mha, optimizer.lr=1e-3]",
+  "id": "1678540f7c",
+  "budget": {
+   "steps": 5722,
+   "batch": 256,
+   "seq_len": 2048,
+   "tokens": 2999975936,
+   "tokens_text": "3B",
+   "varies": false
+  },
+  "optimizer": {
+   "type": "adamw",
+   "lr": 0.001,
+   "text": "adamw(lr=0.001)"
+  },
+  "schedule": {
+   "type": "wsd",
+   "text": "wsd(warmup=1000, shape=sqrt)",
+   "warmup": 1000,
+   "regions": [
+    {
+     "name": "warmup",
+     "start": 0,
+     "stop": 1000
+    },
+    {
+     "name": "stable",
+     "start": 1000,
+     "stop": 4578
+    },
+    {
+     "name": "decay",
+     "start": 4578,
+     "stop": 5722
+    }
+   ]
+  },
+  "stretches": [
+   {
+    "start": 0,
+    "stop": 5722,
+    "batch": 256,
+    "seq_len": 2048,
+    "tokens_per_step": 524288,
+    "data": "0.8 * text(path=\"data/fineweb-edu/*.parquet\", bos=true, split=[0.0, 0.999]) + 0.2 * text(path=\"data/stack-edu/*.parquet\", column=content, bos=true)"
+   }
+  ],
+  "phases": [],
+  "ramp": null,
+  "data": [
+   {
+    "name": "fineweb-edu",
+    "weight": 0.8,
+    "text": "text(path=\"data/fineweb-edu/*.parquet\", bos=true, split=[0.0, 0.999])"
+   },
+   {
+    "name": "stack-edu",
+    "weight": 0.2,
+    "text": "text(path=\"data/stack-edu/*.parquet\", column=content, bos=true)"
+   }
+  ],
+  "evals": [
+   {
+    "name": "eval",
+    "every": 1000
+   }
+  ],
+  "checkpoint": {
+   "every": 2000
+  },
+  "settings": [
+   {
+    "name": "steps",
+    "text": "5722",
+    "written": false,
+    "group": "budget"
+   },
+   {
+    "name": "batch",
+    "text": "256",
+    "written": false,
+    "group": "budget"
+   },
+   {
+    "name": "seq_len",
+    "text": "2048",
+    "written": false,
+    "group": "budget"
+   },
+   {
+    "name": "batch_ramp",
+    "text": "none",
+    "written": false,
+    "group": "budget"
+   },
+   {
+    "name": "curriculum",
+    "text": "[]",
+    "written": false,
+    "group": "budget"
+   },
+   {
+    "name": "optimizer",
+    "text": "adamw(lr=0.001)",
+    "written": true,
+    "group": "optimizer"
+   },
+   {
+    "name": "schedule",
+    "text": "wsd(warmup=1000, shape=sqrt)",
+    "written": false,
+    "group": "optimizer"
+   },
+   {
+    "name": "clip",
+    "text": "1.0",
+    "written": false,
+    "group": "optimizer"
+   },
+   {
+    "name": "data",
+    "text": "0.8 * text(path=\"data/fineweb-edu/*.parquet\", bos=true, split=[0.0, 0.999]) + 0.2 * text(path=\"data/stack-edu/*.parquet\", column=content, bos=true)",
+    "written": false,
+    "group": "data"
+   },
+   {
+    "name": "tokenizer",
+    "text": "tokenizer(name=\"unsloth/Meta-Llama-3.1-8B\", bos=\"<|begin_of_text|>\", eos=\"<|end_of_text|>\")",
+    "written": false,
+    "group": "data"
+   },
+   {
+    "name": "packing",
+    "text": "best_fit()",
+    "written": false,
+    "group": "data"
+   },
+   {
+    "name": "loss",
+    "text": "loss(z=0.0001)",
+    "written": false,
+    "group": "loss"
+   },
+   {
+    "name": "eval",
+    "text": "eval(data=text(path=\"data/fineweb-edu/*.parquet\", bos=true, split=[0.999, 1.0]))",
+    "written": false,
+    "group": "eval"
+   },
+   {
+    "name": "checkpoint",
+    "text": "checkpoint(every=2000)",
+    "written": false,
+    "group": "logging"
+   },
+   {
+    "name": "log",
+    "text": "log()",
+    "written": false,
+    "group": "logging"
+   },
+   {
+    "name": "observe",
+    "text": "none",
+    "written": false,
+    "group": "logging"
+   },
+   {
+    "name": "profile",
+    "text": "none",
+    "written": false,
+    "group": "logging"
+   },
+   {
+    "name": "precision",
+    "text": "precision()",
+    "written": false,
+    "group": "precision"
+   },
+   {
+    "name": "mesh",
+    "text": "mesh()",
+    "written": false,
+    "group": "parallelism"
+   },
+   {
+    "name": "layout",
+    "text": "layout()",
+    "written": false,
+    "group": "parallelism"
+   },
+   {
+    "name": "methods",
+    "text": "methods()",
+    "written": false,
+    "group": "parallelism"
+   },
+   {
+    "name": "compiler",
+    "text": "compiler()",
+    "written": false,
+    "group": "parallelism"
+   },
+   {
+    "name": "objective",
+    "text": "none",
+    "written": false,
+    "group": "search"
+   },
+   {
+    "name": "search",
+    "text": "search()",
+    "written": false,
+    "group": "search"
+   }
+  ]
+ },
+ "sweep": {
+  "axes": [
+   {
+    "id": "mha|gqa|mqa",
+    "where": "attn.num_kv_heads",
+    "options": [
+     "mha",
+     "gqa",
+     "mqa"
+    ],
+    "labeled": true,
+    "span": [
+     643,
+     663
+    ],
+    "pick": 0
+   },
+   {
+    "id": "optimizer.lr",
+    "where": "optimizer.lr",
+    "options": [
+     "1e-3",
+     "3e-3"
+    ],
+    "labeled": false,
+    "span": [
+     684,
+     695
+    ],
+    "pick": 0
+   }
+  ],
+  "runs": [
+   {
+    "name": "attention_ablation[mha, optimizer.lr=1e-3]",
+    "id": "1678540f7c",
+    "picks": {
+     "mha|gqa|mqa": 0,
+     "optimizer.lr": 0
+    }
+   },
+   {
+    "name": "attention_ablation[mha, optimizer.lr=3e-3]",
+    "id": "e1f8a6438d",
+    "picks": {
+     "mha|gqa|mqa": 0,
+     "optimizer.lr": 1
+    }
+   },
+   {
+    "name": "attention_ablation[gqa, optimizer.lr=1e-3]",
+    "id": "ab996b07f8",
+    "picks": {
+     "mha|gqa|mqa": 1,
+     "optimizer.lr": 0
+    }
+   },
+   {
+    "name": "attention_ablation[gqa, optimizer.lr=3e-3]",
+    "id": "9ff4aff263",
+    "picks": {
+     "mha|gqa|mqa": 1,
+     "optimizer.lr": 1
+    }
+   },
+   {
+    "name": "attention_ablation[mqa, optimizer.lr=1e-3]",
+    "id": "eb97f05b72",
+    "picks": {
+     "mha|gqa|mqa": 2,
+     "optimizer.lr": 0
+    }
+   },
+   {
+    "name": "attention_ablation[mqa, optimizer.lr=3e-3]",
+    "id": "96becee690",
+    "picks": {
+     "mha|gqa|mqa": 2,
+     "optimizer.lr": 1
+    }
+   }
+  ],
+  "total": 6,
+  "truncated": false,
+  "dimensions": [],
+  "search": null
+ },
+ "outline": [
+  {
+   "name": "d_model",
+   "kind": "value",
+   "span": [
+    442,
+    455
+   ],
+   "origin": null
+  },
+  {
+   "name": "model",
+   "kind": "block",
+   "span": [
+    485,
+    528
+   ],
+   "origin": null
+  },
+  {
+   "name": "budget",
+   "kind": "setting",
+   "span": [
+    697,
+    708
+   ],
+   "origin": null
+  },
+  {
+   "name": "vocab_size",
+   "kind": "value",
+   "span": null,
+   "origin": "llama3_8b"
+  },
+  {
+   "name": "norm",
+   "kind": "layer",
+   "span": null,
+   "origin": "llama3_8b"
+  },
+  {
+   "name": "block",
+   "kind": "block",
+   "span": null,
+   "origin": "llama3_8b"
+  },
+  {
+   "name": "tokenizer",
+   "kind": "setting",
+   "span": null,
+   "origin": "fineweb_wsd"
+  },
+  {
+   "name": "web",
+   "kind": "value",
+   "span": null,
+   "origin": "fineweb_wsd"
+  },
+  {
+   "name": "code",
+   "kind": "value",
+   "span": null,
+   "origin": "fineweb_wsd"
+  },
+  {
+   "name": "data",
+   "kind": "setting",
+   "span": null,
+   "origin": "fineweb_wsd"
+  },
+  {
+   "name": "packing",
+   "kind": "setting",
+   "span": null,
+   "origin": "fineweb_wsd"
+  },
+  {
+   "name": "schedule",
+   "kind": "setting",
+   "span": null,
+   "origin": "fineweb_wsd"
+  },
+  {
+   "name": "loss",
+   "kind": "setting",
+   "span": null,
+   "origin": "fineweb_wsd"
+  },
+  {
+   "name": "seq_len",
+   "kind": "setting",
+   "span": null,
+   "origin": "fineweb_wsd"
+  },
+  {
+   "name": "batch",
+   "kind": "setting",
+   "span": null,
+   "origin": "fineweb_wsd"
+  },
+  {
+   "name": "steps",
+   "kind": "setting",
+   "span": null,
+   "origin": "fineweb_wsd"
+  },
+  {
+   "name": "eval",
+   "kind": "setting",
+   "span": null,
+   "origin": "fineweb_wsd"
+  },
+  {
+   "name": "checkpoint",
+   "kind": "setting",
+   "span": null,
+   "origin": "fineweb_wsd"
+  }
+ ]
+}
