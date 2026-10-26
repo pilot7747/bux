@@ -185,9 +185,10 @@ name in the `bux.search.methods.methods` registry
 | `random` | uniformly random points | a baseline |
 
 `gp` and `tpe` start with quasi-random trials (`startup`: 5 and 10), then fit their
-model to every trial that has an objective. A trial still training counts too: `gp`
-at its prediction for it (the kriging believer) and `tpe` among the worse (the
-constant liar), so the trials that start together differ.
+model to every trial that has an objective. A trial still training, or with halving
+one trained only at a rung below the one they model, counts too: `gp` at its
+prediction for it (the kriging believer) and `tpe` among the worse (the constant
+liar), so trials that start together differ, and none is proposed twice.
 
 Which to use: the Deep Learning Tuning Playbook (Godbole et al., 2023) explores a new
 space with quasi-random search, which needs nothing of the trials' results and shows
@@ -225,7 +226,6 @@ longer (Bjorck et al., 2025). Halving keeps the choice at the full length, where
 best trial is ranked, but it can drop a good low learning rate at the bottom rung.
 Hyperband's authors recommend an `eta` of 3 or 4.
 
-(training-a-search)=
 ## Training a search
 
 | | `bux train` | `bux launch` |
@@ -242,11 +242,44 @@ table, the best first, and `bux results FILE` prints it again at any time, witho
 training. Settings on the command line change it as they change a run:
 `bux launch tune.bux 'search.trials = 32'`.
 
-This is a search on a laptop's CPU, random tokens and a learning rate, with halving:
+A search can come from the command line, as any setting can. This one tunes the
+learning rate of `smoke.bux` on a laptop's CPU, by the default `gp`, with two rungs:
+17 steps, then the run's 50. The first trials are quasi-random, and each trains as a
+run of its own:
 
-```{literalinclude} ../_static/search-laptop.txt
-:language: console
+```console
+$ bux train examples/experiments/smoke.bux 'optimizer.lr = log_uniform(1e-3, 1e-1)' 'search = search(trials=9, halving=halving(rungs=2))'
+smoke[optimizer.lr=0.026, steps=17]: training on cpu of my-laptop with jax 0.12.0
+smoke[optimizer.lr=0.026, steps=17]: runs/smoke_optimizer.lr=0.026_steps=17-800fc885cd, on 1 × cpu
+smoke[optimizer.lr=0.026, steps=17]: 156k parameters, 17 steps × 8 × 64 tokens = 8.7k tokens, adamw(lr=0.026), wsd(warmup=10)
+smoke[optimizer.lr=0.026, steps=17]: log every 10
+remat=auto: none in 0s (none 0.0 GiB in 0s)
+smoke[optimizer.lr=0.026, steps=17] step 10/17  loss 6.4257  lr 2.60e-02  grad 0.501  9,175 tok/s  56 ms/step  data 0.1 ms  compiled in 0.5s  0:00:01 < 0:00:00
+smoke[optimizer.lr=0.026, steps=17] step 17/17  loss 6.4664  lr 0.00e+00  grad 0.379  77,486 tok/s  7 ms/step  data 0.0 ms  0:00:01 < 0:00:00
+smoke[optimizer.lr=0.026, steps=17]: done
+...
+smoke[optimizer.lr=0.0821]: runs/smoke_optimizer.lr=0.0821-2bf6d62a7f, on 1 × cpu
+smoke[optimizer.lr=0.0821]: 156k parameters, 50 steps × 8 × 64 tokens = 25.6k tokens, adamw(lr=0.0821), wsd(warmup=10)
+...
+search smoke: 9 of 9 trials; objective = loss; best 6.2399, trial 2
+trial  rung  objective  run
+2      1/1   6.2399     smoke[optimizer.lr=0.0821]
+5      1/1   6.2461     smoke[optimizer.lr=0.1]
+4      1/1   6.2929     smoke[optimizer.lr=0.0146]
+3      1/1   6.2969     smoke[optimizer.lr=0.00821]
+7      0/1   6.4497     smoke[optimizer.lr=0.0691, steps=17]
+0      0/1   6.4664     smoke[optimizer.lr=0.026, steps=17]
+6      0/1   6.4809     smoke[optimizer.lr=0.0594, steps=17]
+1      0/1   6.6377     smoke[optimizer.lr=0.0026, steps=17]
+8      0/1   6.7785     smoke[optimizer.lr=1e-3, steps=17]
 ```
+
+Nine trials trained 17 steps, and the four that earned it the full 50: 13 runs, a
+few seconds each. The table lists each trial at the highest rung it reached, the best
+first. The smoke run has no eval, so its objective is the training loss. On random
+tokens every loss tends to log 512 ≈ 6.24, and the best learning rates are the ones
+that get there fastest; trial 5 sits at the dimension's upper end, so on real data
+the next step would be to widen it ([Doing it well](#doing-it-well)).
 
 ## The search directory
 

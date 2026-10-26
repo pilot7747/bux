@@ -194,14 +194,15 @@ class Search:
 
     def history(self) -> methods.History:
         """Return what its method knows: the trials' objectives at the highest rung
-        where enough of them have one (BOHB's rule, Falkner et al., 2018), and the
-        trials training."""
+        where enough of them have one (BOHB's rule, Falkner et al., 2018), failed
+        where they failed lower; and as pending, the trials training or tried only
+        lower, so that it proposes none of them again."""
         rung = self._modeled()
-        done = [t for t in self.trials if rung in t.results]
-        pending = [t for t in self.trials if t.running is not None]
+        done = [t for t in self.trials if rung in t.results or _failed(t)]
+        pending = [t for t in self.trials if t.started and t not in done]
         return methods.History(
             points=self._points(done),
-            values=np.array([t.results[rung] for t in done], dtype=np.float64),
+            values=np.array([t.results.get(rung, math.nan) for t in done]),
             pending=self._points(pending),
             proposed=len(self.trials),
             seed=self.config.seed,
@@ -281,6 +282,11 @@ class Search:
         return str(t.number), f"{rung}/{self.top}", shown, name
 
 
+def _failed(t: Trial) -> bool:
+    """Whether the highest rung `t` finished has no number: it failed there."""
+    return t.top is not None and math.isnan(t.top[1])
+
+
 def _rank(t: Trial) -> tuple[float, float, int]:
     """The order of the table: the highest rung first, then the least objective."""
     if t.top is None:
@@ -291,7 +297,7 @@ def _rank(t: Trial) -> tuple[float, float, int]:
 
 def _states(trials: list[Trial]) -> str:
     running = sum(t.running is not None for t in trials)
-    failed = sum(t.top is not None and math.isnan(t.top[1]) for t in trials)
+    failed = sum(map(_failed, trials))
     said = [f"{running} training"] if running else []
     said += [f"{failed} failed"] if failed else []
     return f" ({', '.join(said)})" if said else ""
