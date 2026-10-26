@@ -15,7 +15,7 @@ from jax.sharding import NamedSharding
 from jax.sharding import PartitionSpec as P
 
 from bux import config as cfg
-from bux import parallel
+from bux import initializers, parallel
 from bux.architecture import Attention, Indexer, Model, MoE, Segments, Taps, num_params
 from bux.architecture.attention import sparse
 from bux.architecture.attention.csa import CSA
@@ -811,7 +811,9 @@ def test_csas_loss_is_against_the_attention_its_window_and_sinks_share():
     the sinks are in too, and not an attention to the latents alone."""
     c = cfg.SparseIndexerConfig(num_heads=2, head_dim=8, top_k=2)
     ports = tuple(ir.Port(name=n, tap=n, mode="write") for n in ("kv", "index"))
-    attn = csa(ports, compress_ratio=2, sliding_window_size=3, indexer=c)
+    # LeCun's weights, of attention far enough from uniform that the two part.
+    with initializers.initializing(cfg.FanInitConfig(type="fan_in")):
+        attn = csa(ports, compress_ratio=2, sliding_window_size=3, indexer=c)
     ix = attn.indexer
     assert ix is not None and attn.q_a is not None and attn.q_a_norm is not None
     assert attn.rope is not None and attn.sinks is not None

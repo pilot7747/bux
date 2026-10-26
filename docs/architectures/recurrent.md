@@ -193,7 +193,8 @@ q and k head's, shared out to its value heads as q and k are; $w$ is a value hea
 `negative_eigenvalues=true` doubles the erase gate, into $(0, 2)$. See {bux}`gdn2`.
 
 It starts as the paper's code does: every projection from Xavier's uniform at a gain of
-$2^{-2.5}$, the output gate low rank (`output_gate_rank`, by default `v_head_dim`) with
+$2^{-2.5}$, unless the file sets an `init` ([Initialization](initialization.md)), the
+output gate low rank (`output_gate_rank`, by default `v_head_dim`) with
 a bias from 0, `A_log` at $\log U(1, 16)$ and `dt_bias` at Mamba's time steps. Its
 output norm's gate is a `swish`, the paper's SiLU (fla's port has a `sigmoid`), and
 `norm_eps` is `1e-5`.

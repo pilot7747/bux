@@ -68,8 +68,8 @@ A setting that is not a layer parametrizes one: {bux}`rope` and its scalings go 
 attention's `rope=`, {bux}`indexer` in its `indexer=`, and the residual algebras
 (`hc`, `mhc`, `gr`, `attnres`, `vpgate`) in the top-level `residual =`, which changes
 what every `[f]` means ([Residual algebras](../language/residual-algebras.md)). The
-top-level `init =` says how every weight matrix starts
-([Initialization](layers.md#initialization)).
+top-level `init =` says how the weight matrices start
+([Initialization](initialization.md)).
 
 :::{note}
 Rows can hold several packed documents. Given the positions of the tokens in their
@@ -164,6 +164,7 @@ attention
 recurrent
 experts
 layers
+initialization
 model-zoo
 ir-and-backends
 adding-a-layer

@@ -1,0 +1,26 @@
+# Which init? Five runs of a 12-layer Llama, in one file: the default, every weight
+# matrix from a normal of 0.02 (GPT-2, Megatron-LM); OLMo 2's, truncated at 3 sigma;
+# GPT-2's, with the residual branches' outputs scaled down by depth; LeCun's fan-in,
+# bux's default before; and the branches' outputs at zero, so that the model starts as
+# its embedding and head alone.
+#
+#   bux plan  examples/experiments/init_ablation.bux
+#   bux train examples/experiments/init_ablation.bux --only gpt2
+use llama3_8b
+use fineweb_wsd
+
+# Llama 3 8B, scaled down.
+d_model = 768
+layers  = 12
+ffn.intermediate_size = 2048
+attn.num_heads    = 12
+attn.num_kv_heads = 4
+model = embed block^layers norm head(tied=true)
+
+init = normal: normal
+     | olmo2: normal(truncate=3)
+     | gpt2: normal(out=normal(std=0.02 / (2 * layers) ^ 0.5))
+     | lecun: fan_in
+     | zero_out: normal(out=zeros)
+
+budget = 3B

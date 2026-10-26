@@ -49,7 +49,7 @@ from flax import nnx
 from jaxtyping import Array, Float
 
 from bux import config as cfg
-from bux import parallel
+from bux import initializers, parallel
 from bux.architecture.common.functional import activation
 from bux.architecture.common.segments import Segments
 from bux.architecture.common.sharding import projection, shard_heads, shard_layer_input
@@ -62,7 +62,6 @@ from bux.lang import ir
 from bux.parallel import methods
 from bux.parallel.recurrence import Chunk, Positions, Recurrence, Shared, Transition
 
-LECUN = nnx.initializers.lecun_normal()  # where the layers' projections start
 # Xavier's uniform at a gain of 2^-2.5, a variance of 2^-5 over the fans' mean: where
 # Gated DeltaNet-2's projections start.
 XAVIER = nnx.initializers.variance_scaling(2**-5, "fan_avg", "uniform")
@@ -483,8 +482,8 @@ class LowRank(nnx.Module):
         orthogonal: Start it as RWKV-7 does, A at zero and B orthogonal, scaled by
             0.1; otherwise A and B start from `init`.
         out: The name of the outputs' dimension (`bux.parallel`).
-        init: Where A and B start, unless `orthogonal` or the model sets an ``init``
-            (`bux.parallel.default_init`).
+        init: Where A and B start if the model sets no ``init``
+            (`bux.initializers.weight`); None: as a weight matrix starts.
     """
 
     def __init__(
@@ -498,14 +497,14 @@ class LowRank(nnx.Module):
         bias: Float[Array, " n"] | bool = False,
         orthogonal: bool = False,
         out: parallel.Name = None,
-        init: nnx.Initializer = LECUN,
+        init: nnx.Initializer | None = None,
     ):
         if orthogonal:
             gain = 0.1 * max(1.0, math.sqrt(rank / n_out))
             down = jnp.zeros((n_in, rank))
             up = nnx.initializers.orthogonal(gain)(rngs.params(), (rank, n_out))
         else:
-            init = parallel.default_init(init)
+            init = initializers.weight(own=init)
             down = init(rngs.params(), (n_in, rank))
             up = init(rngs.params(), (rank, n_out))
         self.down = nnx.Param(down, names=("embed", "latent"))
@@ -524,11 +523,17 @@ class LowRank(nnx.Module):
 
 
 def into_heads(
-    width: int, heads: int, dim: int, rngs: nnx.Rngs, init: nnx.Initializer = LECUN
+    width: int,
+    heads: int,
+    dim: int,
+    rngs: nnx.Rngs,
+    init: nnx.Initializer | None = None,
 ) -> nnx.Linear:
     """Make a projection of the width to `heads` heads of `dim` channels, side by
-    side, its kernel from `init`, unless the model sets an ``init``."""
-    named = parallel.named("embed", ("heads", heads), init=parallel.default_init(init))
+    side, its kernel from `init` if the model sets no ``init``; None: as a weight
+    matrix starts."""
+    start = initializers.weight(own=init)
+    named = parallel.named("embed", ("heads", heads), init=start)
     return projection(
         width, heads * dim, "recurrence", use_bias=False, kernel_init=named, rngs=rngs
     )
@@ -601,7 +606,8 @@ class LinearAttention(nnx.Module):
         gate_rank: The rank of a low-rank output gate; None for a dense one.
         gate_bias: Add a bias, from 0, to a low-rank output gate.
         norm_all_heads: Normalize all heads' outputs together, not each on its own.
-        init: Where the projections' kernels start.
+        init: Where the projections' kernels start if the model sets no ``init``
+            (`bux.initializers.weight`); None: as weight matrices start.
 
     Raises:
         ValueError: num_v_heads is not a multiple of num_heads.
@@ -617,7 +623,7 @@ class LinearAttention(nnx.Module):
         gate_rank: int | None = None,
         gate_bias: bool = False,
         norm_all_heads: bool = False,
-        init: nnx.Initializer = LECUN,
+        init: nnx.Initializer | None = None,
     ):
         h, hv = config.num_heads, config.num_v_heads or config.num_heads
         if hv % h:
@@ -661,7 +667,7 @@ class LinearAttention(nnx.Module):
             "recurrence_out",
             use_bias=False,
             kernel_init=parallel.named(
-                ("heads", hv), "embed", init=parallel.default_init(init)
+                ("heads", hv), "embed", init=initializers.weight("out", own=init)
             ),
             rngs=rngs,
         )
@@ -848,8 +854,8 @@ class GatedDeltaNet2(LinearAttention):
     q and k are.
 
     Every projection starts from Xavier's uniform at a gain of 2^-2.5 (`XAVIER`), its
-    bias at 0, as the paper's code starts them; the output gate is low rank, with a
-    bias. The paper gates the output norm by SiLU, fla's port by a sigmoid
+    bias at 0, as the paper's code starts them, unless the model sets an ``init``;
+    the output gate is low rank, with a bias. The paper gates the output norm by SiLU, fla's port by a sigmoid
     (`output_gate`).
 
     Args:

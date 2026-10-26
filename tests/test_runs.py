@@ -33,6 +33,9 @@ batch = 4
 steps = 100
 """
 
+# How every weight matrix started before the default init was a normal.
+LECUN = "init = fan_in(embed=fan_in(distribution=gaussian))\n"
+
 MODULES = {"arch": ARCH, "recipe": TRAIN}
 # A run made of the two, which the source after it redefines.
 RUN = "use arch\nuse recipe\n"
@@ -434,6 +437,15 @@ def test_the_id_follows_what_a_run_computes():
     assert run.id == renamed.id == watched.id != changed.id
 
 
+def test_runs_that_start_as_before_the_normal_init_keep_their_ids_but_moes():
+    [normal] = runs(ARCH + TRAIN)
+    [before] = runs(LECUN + ARCH + TRAIN)
+    assert before.id == "b26aa7149f" != normal.id  # main 7ffc128's
+    # Routed experts started sqrt(E) times smaller then, so an MoE's id is new.
+    moe = ARCH.replace("[norm ffn]", "[norm moe(num_experts=4, top_k=2, expert=ffn)]")
+    assert runs(LECUN + moe + TRAIN)[0].id != "ba4e9ec7b8"
+
+
 MOE = "moe(num_experts=4, top_k=2, expert=ffn)"
 MLA = (
     "mla(num_heads=2, kv_lora_rank=8, qk_nope_head_dim=4, qk_rope_head_dim=4,"
@@ -498,17 +510,19 @@ def test_a_layer_field_newer_than_ids_keeps_them_where_it_computes_as_before(
             if "(" in layer
             else f"{layer}({given})"
         )
-        source = ARCH.replace("block = [norm attn] [norm ffn]", f"block = [norm {new}]")
+        block = f"block = [norm {new}]"
+        source = LECUN + ARCH.replace("block = [norm attn] [norm ffn]", block)
         [run] = runs(source + TRAIN)
         return run
 
     # The ids before these fields: of main 0f0cfe2, of d4a8e27 for the attention's,
-    # and of a4268fb for the indexer's.
+    # and of a4268fb for the indexer's; the MoE's since its experts start by their
+    # own fan in (init).
     old = {
         ("ffn", "up_offset"): "a8fa406e9b",
-        ("moe", "router_bias"): "ba4e9ec7b8",
-        ("moe", "center_bias"): "ba4e9ec7b8",
-        ("moe", "bias_momentum"): "ba4e9ec7b8",
+        ("moe", "router_bias"): "087eeedead",
+        ("moe", "center_bias"): "087eeedead",
+        ("moe", "bias_momentum"): "087eeedead",
         ("mamba2", "num_heads"): "ccdcaff2f8",
         ("gqa", "power_scale"): "4de8bfe6fd",
         ("gqa", "gate_head_bias"): "370e873062",
@@ -539,6 +553,7 @@ def test_experiments_sweep_as_documented():
         return len(compile_runs(path.read_text(), filename=str(path)))
 
     assert count("attention_ablation") == 6 and count("width_sweep") == 3
+    assert count("init_ablation") == 5
 
 
 # --- Editor support -------------------------------------------------------------------------

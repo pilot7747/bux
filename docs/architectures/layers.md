@@ -326,19 +326,8 @@ one stream, such as the final norm, and `bux fmt` prints it. See
 
 ## Initialization
 
-Every weight matrix starts LeCun normal unless the model says otherwise: a
-projection's of variance $1 / \text{fan\_in}$, truncated at 2 standard deviations, as
-`flax.nnx.Linear`'s, an expert's the same, and an embedding table's of variance
-$1 / d$. The top-level setting `init` replaces all of them with one normal
-({bux}`normal`), truncated at `truncate` standard deviations if it says so. Trinity
-draws every weight from a normal of $0.5 / \sqrt{d}$, truncated at 3, which is
-DeepSeek-V3's 0.006 at its width of 7168:
-
-```bux
-init = normal(std=0.5 * d_model ^ -0.5, truncate=3)
-```
-
-What starts in a way of its own keeps it: norms' gains (`gain_init`), biases,
-zero-initialized outputs and connections, Mamba's and the linear attentions' decays
-and time steps, RWKV-7's uniform projections, Engram's tables. The run's `seed` draws
-them all.
+Every weight matrix starts from a normal of 0.02 unless the top-level setting `init`
+says otherwise, and the embedding tables, an untied head and the residual branches'
+outputs can each start their own way. Norms' gains (`gain_init`), biases, short
+convolutions, Mamba's decays and the residual algebras' connections keep their own.
+See [Initialization](initialization.md).

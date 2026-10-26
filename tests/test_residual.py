@@ -143,8 +143,10 @@ def test_mtp_engram_and_taps_run(residual, body):
 )
 def test_at_init_an_algebra_is_the_pre_norm_residual(residual):
     """hc as the paper initializes it, and mhc, attnres and vpgate as they are here,
-    start as the pre-norm residual with the same weights (they take no random init)."""
-    body = "model = embed ([norm attn] [norm ffn])^3 norm head"
+    start as the pre-norm residual with the same weights (they take no random init).
+    Up to the norms' eps, which weighs on the copies of a widened stream apart: it
+    shows on embeddings as small as the default init's."""
+    body = "norm.eps = 1e-12\nmodel = embed ([norm attn] [norm ffn])^3 norm head"
     t = tokens()
     assert jnp.allclose(model(residual, body)(t), model(None, body)(t), atol=1e-4)
 

@@ -448,9 +448,13 @@ def test_sorted_is_the_default_method():
 
 # --- Split over devices ----------------------------------------------------------------
 
+# Weights large next to adamw's first steps at 1e-2, of about 0.01 each: from 0.02,
+# two experts' scores come within rounding of each other by the third step, and a
+# split breaks the tie the other way.
 SPLIT = """
 d_model = 64
 vocab_size = 128
+init = normal(std=0.1)
 norm = rmsnorm
 rescale = rmsnorm(eps=1e-8, zero_centered=true, scale_input=true)
 attn = gqa(num_heads=4, num_kv_heads=2, rope=rope())
