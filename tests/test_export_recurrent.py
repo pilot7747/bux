@@ -217,9 +217,16 @@ ZOO = {
 }
 
 
+# Whole zoo stacks round in float32 by their depth and by the CPU: Kimi Linear's (27
+# token mixers), on an Apple-silicon Mac, has bux and the export each within 5e-5 of
+# the export run in float64, but an x86 runner put them 1.8e-4 apart. Their layers'
+# own cases above hold 1e-4; these hold 1e-3, their greedy tokens still bux's exactly.
+ZOO_TOLERANCE = 1e-3
+
+
 @pytest.mark.parametrize("path", ZOO, ids=ZOO.keys())
 def test_zoo_models_export(path: str) -> None:
     overrides = [*SMALL.strip().splitlines(), *ZOO[path]]
     arch = compile((ROOT / path).read_text(), overrides=overrides)
     assert arch.vocab_size == V
-    check.compare(arch).check()
+    check.compare(arch, tolerance=ZOO_TOLERANCE).check()

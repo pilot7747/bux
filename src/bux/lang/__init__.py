@@ -62,8 +62,8 @@ alternatives it took, and an `~bux.lang.ir.Run.id` that hashes what it computes:
 
     source = open("examples/experiments/smoke.bux").read()
     for run in compile_runs(source, filename="smoke.bux"):
-        print(run.name, run.id)  # smoke f114ac17ae
-        train(run)  # into runs/smoke-f114ac17ae/
+        print(run.name, run.id)  # smoke 5a4f0f7d85
+        train(run)  # into runs/smoke-5a4f0f7d85/
 
 With ``optimizer = adamw(lr=3e-3 | 1e-2)`` in the file, the same loop prints two
 runs, ``smoke[optimizer.lr=3e-3]`` and ``smoke[optimizer.lr=1e-2]``.

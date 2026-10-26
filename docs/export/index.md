@@ -149,16 +149,22 @@ That is about 5e-6 a `gdn` layer, on both sides alike: a deep recurrent stack pa
 1e-4 by float32's rounding alone. The tests shorten such stacks (Qwen3-Next's to 12
 blocks) rather than loosen the check.
 
+The rounding differs by CPU too. Kimi Linear's shrunk zoo model (27 token mixers) has
+bux and the export each within 5e-5 of the export in float64 on the Mac, and 3.1e-5
+apart; an x86 CI runner put them 1.8e-4 apart (2026-10-26). So the tests of whole zoo
+models hold their logits to 1e-3, and each layer's own cases to 1e-4; greedy tokens
+and padded batches must match bux exactly in both.
+
 ## Exporting a run
 
 `bux export` writes a trained run's model, from its latest checkpoint, as a directory
 that transformers loads as it is:
 
 ```console
-$ bux export runs/smoke-f114ac17ae exported/ --check
+$ bux export runs/smoke-5a4f0f7d85 exported/ --check
 smoke: step 50 exported to exported, its weights in float32
-eager: logits within 5.1e-07 of bux's largest (tolerance 1e-04); greedy decoding with cache as bux, no cache as bux; a left-padded batch as its prompts alone
-sdpa: logits within 5.0e-07 of bux's largest (tolerance 1e-04); greedy decoding with cache as bux, no cache as bux; a left-padded batch as its prompts alone
+eager: logits within 2.9e-07 of bux's largest (tolerance 1e-04); greedy decoding with cache as bux, no cache as bux; a left-padded batch as its prompts alone
+sdpa: logits within 2.9e-07 of bux's largest (tolerance 1e-04); greedy decoding with cache as bux, no cache as bux; a left-padded batch as its prompts alone
 ```
 
 It reads the run's `run.json` and restores a checkpoint (`--step N`, or the latest)
@@ -187,10 +193,10 @@ Python:
 ```python
 from bux.export.runs import export, restore
 
-done = export("runs/smoke-f114ac17ae", "exported/", dtype="bfloat16", check=True)
+done = export("runs/smoke-5a4f0f7d85", "exported/", dtype="bfloat16", check=True)
 done.report.check()  # raises unless the export computes what bux does
 
-restored = restore("runs/smoke-f114ac17ae", step=40)  # the run, and its bux model
+restored = restore("runs/smoke-5a4f0f7d85", step=40)  # the run, and its bux model
 ```
 
 ### What the check checks
@@ -206,8 +212,8 @@ bfloat16` bux's are rounded to bfloat16 too, so that the two compute with the sa
 numbers. A run that trained in bfloat16 is checked so as well. In bfloat16, two
 correct implementations would differ by bfloat16's own rounding, near 1e-2 of the
 logits, which would hide a wrong weight. In float32 only the order of operations
-differs: the smoke run's export above is within 5e-7 of bux, and its bfloat16 export
-within 6e-7 (on a Mac's CPU, 2026-10-26). 1e-4 leaves room for depth, and a misplaced
+differs: the smoke run's export above is within 3e-7 of bux, and so is its bfloat16
+export (on a Mac's CPU, 2026-10-26, at the normal init). 1e-4 leaves room for depth, and a misplaced
 or mistransposed weight moves the logits by far more; a deep stack of delta-rule
 layers rounds faster ([Float32 and depth](#float32-and-depth)). Greedy tokens must be
 equal: only a tie between the two top logits closer than float32's error could flip

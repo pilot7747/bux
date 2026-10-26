@@ -86,12 +86,12 @@ and `bux plan` shows its six runs, one id for all, as they compute the same:
 $ bux plan examples/experiments/parallel/laptop.bux
 6 runs
 id          params  tokens  tok/param  flops/tok  gpus  params/gpu  optim/gpu  bubble  run
-90b55fa67f  497k    10.2k   0.0        1.74M      8     1.89MiB     3.79MiB    0%      laptop[dp]
-90b55fa67f  497k    10.2k   0.0        1.74M      8     243KiB      485KiB     0%      laptop[fsdp]
-90b55fa67f  497k    10.2k   0.0        1.74M      8     261KiB      521KiB     0%      laptop[tp]
-90b55fa67f  497k    10.2k   0.0        1.74M      8     243KiB      485KiB     0%      laptop[ep]
-90b55fa67f  497k    10.2k   0.0        1.74M      8     485KiB      970KiB     0%      laptop[cp]
-90b55fa67f  497k    10.2k   0.0        1.74M      8     259KiB      517KiB     20%     laptop[pp]
+8944944995  497k    10.2k   0.0        1.74M      8     1.89MiB     3.79MiB    0%      laptop[dp]
+8944944995  497k    10.2k   0.0        1.74M      8     243KiB      485KiB     0%      laptop[fsdp]
+8944944995  497k    10.2k   0.0        1.74M      8     261KiB      521KiB     0%      laptop[tp]
+8944944995  497k    10.2k   0.0        1.74M      8     243KiB      485KiB     0%      laptop[ep]
+8944944995  497k    10.2k   0.0        1.74M      8     485KiB      970KiB     0%      laptop[cp]
+8944944995  497k    10.2k   0.0        1.74M      8     259KiB      517KiB     20%     laptop[pp]
 ```
 
 ## The mesh
@@ -159,8 +159,8 @@ on top.
 $ bux plan examples/experiments/smoke.bux 'mesh = fsdp: mesh(fsdp=8) | one: mesh(data=1)'
 2 runs
 id          params  tokens  tok/param  flops/tok  gpus  params/gpu  optim/gpu  bubble  run
-f114ac17ae  156k    25.6k   0.2        984k       8     76.2KiB     152KiB     0%      smoke[fsdp]
-f114ac17ae  156k    25.6k   0.2        984k       1     609KiB      1.19MiB    0%      smoke[one]
+5a4f0f7d85  156k    25.6k   0.2        984k       8     76.2KiB     152KiB     0%      smoke[fsdp]
+5a4f0f7d85  156k    25.6k   0.2        984k       1     609KiB      1.19MiB    0%      smoke[one]
 ```
 
 ## Methods

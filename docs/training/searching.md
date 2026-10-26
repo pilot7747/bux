@@ -72,9 +72,9 @@ a line for each search:
 $ bux plan examples/experiments/attention_search.bux
 3 runs
 id          params  tokens  tok/param  flops/tok  gpus  params/gpu  optim/gpu  bubble  run
-ca9068fa84  183M    3B      16.4       1.61B      1     700MiB      1.37GiB    0%      attention_search[mha]
-32060b1ec4  174M    3B      17.2       1.55B      1     664MiB      1.3GiB     0%      attention_search[gqa]
-c40914733f  170M    3B      17.6       1.53B      1     650MiB      1.27GiB    0%      attention_search[mqa]
+27b626130f  183M    3B      16.4       1.61B      1     700MiB      1.37GiB    0%      attention_search[mha]
+b16db24d21  174M    3B      17.2       1.55B      1     664MiB      1.3GiB     0%      attention_search[gqa]
+3a7f26f452  170M    3B      17.6       1.53B      1     650MiB      1.27GiB    0%      attention_search[mqa]
 attention_search[mha]: 27 trials of 2 dimensions by gp, 3 rungs: about 9 runs' steps
 attention_search[gqa]: 27 trials of 2 dimensions by gp, 3 rungs: about 9 runs' steps
 attention_search[mqa]: 27 trials of 2 dimensions by gp, 3 rungs: about 9 runs' steps
@@ -250,36 +250,37 @@ run of its own:
 ```console
 $ bux train examples/experiments/smoke.bux 'optimizer.lr = log_uniform(1e-3, 1e-1)' 'search = search(trials=9, halving=halving(rungs=2))'
 smoke[optimizer.lr=0.026, steps=17]: training on cpu of my-laptop with jax 0.12.0
-smoke[optimizer.lr=0.026, steps=17]: runs/smoke_optimizer.lr=0.026_steps=17-800fc885cd, on 1 × cpu
+smoke[optimizer.lr=0.026, steps=17]: runs/smoke_optimizer.lr=0.026_steps=17-bb7efd8065, on 1 × cpu
 smoke[optimizer.lr=0.026, steps=17]: 156k parameters, 17 steps × 8 × 64 tokens = 8.7k tokens, adamw(lr=0.026), wsd(warmup=10)
 smoke[optimizer.lr=0.026, steps=17]: log every 10
 remat=auto: none in 0s (none 0.0 GiB in 0s)
-smoke[optimizer.lr=0.026, steps=17] step 10/17  loss 6.4257  lr 2.60e-02  grad 0.501  9,175 tok/s  56 ms/step  data 0.1 ms  compiled in 0.5s  0:00:01 < 0:00:00
-smoke[optimizer.lr=0.026, steps=17] step 17/17  loss 6.4664  lr 0.00e+00  grad 0.379  77,486 tok/s  7 ms/step  data 0.0 ms  0:00:01 < 0:00:00
+smoke[optimizer.lr=0.026, steps=17] step 10/17  loss 6.3674  lr 2.60e-02  grad 0.453  7,977 tok/s  64 ms/step  data 1.4 ms  compiled in 0.5s  0:00:01 < 0:00:00
+smoke[optimizer.lr=0.026, steps=17] step 17/17  loss 6.4086  lr 0.00e+00  grad 0.394  70,488 tok/s  7 ms/step  data 0.0 ms  0:00:01 < 0:00:00
 smoke[optimizer.lr=0.026, steps=17]: done
 ...
-smoke[optimizer.lr=0.0821]: runs/smoke_optimizer.lr=0.0821-2bf6d62a7f, on 1 × cpu
-smoke[optimizer.lr=0.0821]: 156k parameters, 50 steps × 8 × 64 tokens = 25.6k tokens, adamw(lr=0.0821), wsd(warmup=10)
+smoke[optimizer.lr=0.00109]: runs/smoke_optimizer.lr=0.00109-2974712d5c, on 1 × cpu
+smoke[optimizer.lr=0.00109]: 156k parameters, 50 steps × 8 × 64 tokens = 25.6k tokens, adamw(lr=0.00109), wsd(warmup=10)
 ...
-search smoke: 9 of 9 trials; objective = loss; best 6.2399, trial 2
+search smoke: 9 of 9 trials; objective = loss; best 6.2600, trial 8
 trial  rung  objective  run
-2      1/1   6.2399     smoke[optimizer.lr=0.0821]
-5      1/1   6.2461     smoke[optimizer.lr=0.1]
-4      1/1   6.2929     smoke[optimizer.lr=0.0146]
-3      1/1   6.2969     smoke[optimizer.lr=0.00821]
-7      0/1   6.4497     smoke[optimizer.lr=0.0691, steps=17]
-0      0/1   6.4664     smoke[optimizer.lr=0.026, steps=17]
-6      0/1   6.4809     smoke[optimizer.lr=0.0594, steps=17]
-1      0/1   6.6377     smoke[optimizer.lr=0.0026, steps=17]
-8      0/1   6.7785     smoke[optimizer.lr=1e-3, steps=17]
+8      1/1   6.2600     smoke[optimizer.lr=0.00109]
+6      1/1   6.2625     smoke[optimizer.lr=0.00233]
+1      1/1   6.2625     smoke[optimizer.lr=0.0026]
+7      1/1   6.2633     smoke[optimizer.lr=0.0017]
+5      1/1   6.2677     smoke[optimizer.lr=0.00385]
+3      0/1   6.2786     smoke[optimizer.lr=0.00821, steps=17]
+4      0/1   6.2964     smoke[optimizer.lr=0.0146, steps=17]
+0      0/1   6.4086     smoke[optimizer.lr=0.026, steps=17]
+2      0/1   6.4199     smoke[optimizer.lr=0.0821, steps=17]
 ```
 
-Nine trials trained 17 steps, and the four that earned it the full 50: 13 runs, a
+Nine trials trained 17 steps, and the five that earned it the full 50: 14 runs, a
 few seconds each. The table lists each trial at the highest rung it reached, the best
 first. The smoke run has no eval, so its objective is the training loss. On random
-tokens every loss tends to log 512 ≈ 6.24, and the best learning rates are the ones
-that get there fastest; trial 5 sits at the dimension's upper end, so on real data
-the next step would be to widen it ([Doing it well](#doing-it-well)).
+tokens every loss tends to log 512 ≈ 6.24, near where a run at bux's default init
+starts, and the best learning rates are the ones that stray from it least; trial 8
+sits near the dimension's lower end, so on real data the next step would be to widen
+it ([Doing it well](#doing-it-well)).
 
 ## The search directory
 

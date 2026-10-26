@@ -202,8 +202,8 @@ $ bux plan examples/experiments/smoke.bux 'methods = methods(repeat=scan, microb
     'mesh = one: mesh(data=1) | pp: mesh(stage=2, data=1)'
 2 runs
 id          params  tokens  tok/param  flops/tok  gpus  params/gpu  optim/gpu  bubble  run
-f114ac17ae  156k    25.6k   0.2        984k       1     609KiB      1.19MiB    0%      smoke[one]
-f114ac17ae  156k    25.6k   0.2        984k       2     369KiB      738KiB     20%     smoke[pp]
+5a4f0f7d85  156k    25.6k   0.2        984k       1     609KiB      1.19MiB    0%      smoke[one]
+5a4f0f7d85  156k    25.6k   0.2        984k       2     369KiB      738KiB     20%     smoke[pp]
 ```
 
 Two stages and four microbatches under `1f1b` idle (S − 1) / (M + S − 1) = 1 / 5 of a
