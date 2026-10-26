@@ -209,6 +209,24 @@ SHRUNK = {
             " load_balancing=aux_free, aux_loss_coef=1e-3, expert=dense)"
         ),
     ],
+    # The other OLMo files differ in sizes alone and SmolLM2 is a Llama; the full-size
+    # test builds them.
+    "olmo/olmo_2_1b.bux": [
+        "attn.num_heads = 4",
+        "attn.num_kv_heads = 2",
+        "ffn = dense",
+    ],
+    "olmo/olmo_3_7b.bux": [
+        "attn.num_heads = 4",
+        "attn.num_kv_heads = 2",
+        "local.sliding_window_size = 4",
+        "ffn = dense",
+    ],
+    "smollm/smollm3_3b.bux": [
+        "attn.num_heads = 4",
+        "attn.num_kv_heads = 2",
+        "ffn = dense",
+    ],
     "mhc.bux": ["attn = gqa(num_heads=4, num_kv_heads=2, rope=rope())", "ffn = dense"],
     "jamba.bux": [
         "attn = gqa(num_heads=4, num_kv_heads=2)",

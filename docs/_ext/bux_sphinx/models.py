@@ -9,7 +9,12 @@ from pathlib import Path
 from bux.__main__ import summary
 from bux.lang import compile_file
 
-_FAMILIES = {"": "Classics and primitives", "minimax": "MiniMax"}
+_FAMILIES = {
+    "": "Classics and primitives",
+    "minimax": "MiniMax",
+    "olmo": "OLMo",
+    "smollm": "SmolLM",
+}
 
 
 def header(path: Path) -> str:
