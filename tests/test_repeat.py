@@ -158,10 +158,13 @@ def test_a_scanned_repeat_casts_each_pass_as_it_runs_it(arch):
     assert y.dtype == jnp.bfloat16 and jnp.array_equal(y, z)
 
 
+@pytest.mark.parametrize("algorithm", ["standard", "gram"])
 @pytest.mark.parametrize("orthogonalize", ["gspmd", "gather", "owner"])
 @pytest.mark.parametrize("mesh", [ONE, "mesh(fsdp=8)"])
-def test_muon_trains_a_scanned_repeat_as_the_unrolled_one(losses, mesh, orthogonalize):
-    muon = "muon(lr=0.02, ns_dtype=float32)"
+def test_muon_trains_a_scanned_repeat_as_the_unrolled_one(
+    losses, mesh, orthogonalize, algorithm
+):
+    muon = f"muon(lr=0.02, ns_dtype=float32, ns_algorithm={algorithm})"
     how = f"methods(repeat=scan, orthogonalize={orthogonalize})"
     scanned = losses(MOE, mesh=mesh, optimizer=muon, methods=how)
     assert np.allclose(scanned, losses(MOE, optimizer=muon), atol=1e-5)

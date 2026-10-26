@@ -62,6 +62,8 @@ iterations, for the matrices inside the blocks, and AdamW for every other parame
 | `nesterov` | `true` | Nesterov's look-ahead |
 | `ns_steps` | `5` | Newton-Schulz iterations |
 | `ns_coefficients` | `jordan` | the quintics of the iterations, by name |
+| `ns_algorithm` | `standard` | how it iterates: `standard`, or `gram`, on each matrix's Gram matrix |
+| `ns_restarts` | `none` | the iterations after which `gram` restarts; `none` is 2, 5, 8, ... |
 | `ns_dtype` | `bfloat16` | the dtype Newton-Schulz runs in: `bfloat16` or `float32` |
 | `weight_decay` | `0.1` | decoupled weight decay of the matrices, times the learning rate |
 | `consistent_rms` | `0.2` | the RMS updates are scaled to, or `none` |
@@ -111,6 +113,65 @@ either, within the difference between two float32 runs.
 
 How each matrix reaches a device whole for Newton-Schulz, when FSDP or tensor
 parallelism splits it, is `methods.orthogonalize` ([Muon](../parallelism/muon.md)).
+
+### Gram Newton-Schulz
+
+```bux
+optimizer = muon(lr=0.02, ns_algorithm=gram)
+optimizer = muon(lr=0.02, ns_algorithm=gram, ns_coefficients=polar_express, ns_steps=8)
+```
+
+`ns_algorithm` names how Newton-Schulz iterates, from
+{py:data}`bux.train.optim.ns_algorithms`:
+
+| Name | How |
+|------|-----|
+| `standard` | optax's: the quintics of the matrix itself, three products an iteration, two of them by the matrix |
+| `gram` | Gram Newton-Schulz (Zhang, Amsel, Chen and Dao, 2026): the same quintics, on the Gram matrix of each matrix's shorter side |
+
+An iteration's quintic `a X + b (XXᵀ)X + c (XXᵀ)²X` is a polynomial of the Gram matrix
+`R = XXᵀ` times X. For an m×n matrix with m ≤ n, `gram` forms R once, iterates on
+m×m matrices (`Z = bR + cR²`, `Q ← Q(Z + aI)`, `R ← (Z + aI)R(Z + aI)`) and
+multiplies by X only at the end, and at its restarts: `QX`, the same orthogonalized
+matrix. The standard iteration multiplies by X twice an iteration. The further a
+matrix is from square, the more that saves. At 5 iterations, counting every product
+whole (XLA has no symmetric products), a Llama's MLP matrices (n ≈ 2.7m) take 22%
+fewer multiply-adds, a matrix four times as wide a third fewer, eight times 46%.
+Where it would not save any, below n = 1.5m and on square matrices, `gram` runs the
+standard iteration.
+
+Under `gspmd`, a product by a matrix split along its longer side (FSDP's) is an
+all-reduce, so `gram` all-reduces less there too. Under `gather` and `owner` it runs
+on whole matrices, as the standard iteration does. Nothing about how matrices move
+changes ([Muon](../parallelism/muon.md)).
+
+**Rounding.** The Gram matrix of a matrix near low rank has eigenvalues near zero,
+which rounding makes a little negative. Iterated on R, these grow until they blow
+up. So `gram` restarts: after each iteration in `ns_restarts` it multiplies X by
+the Q so far, forms R anew and starts Q again from I. That takes two more products by
+the matrix. Its authors restart five iterations once, after the second. `none`, the
+default, restarts after the second and every third after it (2, 5, 8, ...).
+Measured on CPU (2026-10-26) on 192×768 matrices of the authors' test spectra
+(decaying to 1e-9, or half zero), in bfloat16 and at 4 to 12 iterations of either
+quintic, that keeps the largest singular value within 0.07 of the standard
+iteration's. A single restart after the second drifts at six iterations and blows
+up from seven, past 10³ at eight. `ns_restarts=2` or `ns_restarts=[2, 4]` sets them.
+
+In a 16-bit `ns_dtype`, `gram` normalizes in float32 and iterates in float16, as
+its authors do: bfloat16's 8 bits round the Gram matrix too coarsely. Its updates
+still move between devices in `ns_dtype`. Each `a` is added in float32 before the
+product is rounded, as a GEMM's epilogue adds: `Z + aI` rounded to 16 bits loses it,
+and a product rounded before `a` is added loses what cancels, which blows up eight
+iterations of Polar Express. The Gram matrix squares the condition number, so for an
+orthogonalization that needs more digits than Muon's do, use `standard` in float32.
+
+On a B300, `gram` runs Newton-Schulz 1.05 to 1.4 times as fast as `standard` on
+matrices 2.75 to 8 times as wide as tall, and up to 12% slower at twice as wide. It
+is 6 to 8 times nearer float32's result than `standard` in bfloat16, and trains to
+the same loss. Muon's step and the run barely change: by `owner`, Newton-Schulz is a
+few milliseconds of a step. The authors' twice-as-fast needs symmetric GEMM kernels
+with fused epilogues, which XLA does not have
+([measurements](../parallelism/muon.md#gram-newton-schulz-on-b300s)).
 
 ## Schedules
 

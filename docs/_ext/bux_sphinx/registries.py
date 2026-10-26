@@ -70,6 +70,7 @@ def registries() -> list[tuple[str, str, list[Row]]]:
         ("Optimizers", optim.optimizers),
         ("Schedules", optim.schedules),
         ("Newton-Schulz coefficients", optim.ns_coefficients),
+        ("Newton-Schulz algorithms", optim.ns_algorithms),
         ("Data sources", data.sources),
         ("Matmul formats", matmuls.formats),
         ("Search methods", search.methods),

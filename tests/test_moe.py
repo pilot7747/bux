@@ -500,7 +500,7 @@ def test_muon_orthogonalizes_up_and_gate_as_two_matrices(method):
     with parallel.use(tcfg.MeshConfig(fsdp=2, expert=2, tensor=2), methods=how):
         e = parallel.build(lambda: MoE(c, 32, nnx.Rngs(0)))
         grads = {"up": jnp.sin(e.up[...])}
-        tx = orthogonalized(5, muon_matrices(e), e)
+        tx = orthogonalized(newton_schulz(5), muon_matrices(e), e)
         together = jax.jit(tx.update)(grads, tx.init(grads))[0]["up"]
     ns, matrices = newton_schulz(5), MuonDimensionNumbers(1, 2)
     apart = [ns(grads["up"][..., i], matrices) for i in (0, 1)]

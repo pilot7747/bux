@@ -305,7 +305,12 @@ _NEWER_FIELDS = {
         "moments": "float32",
         "dispatch": "compute",
     },
-    "optimizer": {"ns_coefficients": "jordan", "ns_dtype": "float32"},
+    "optimizer": {
+        "ns_coefficients": "jordan",
+        "ns_dtype": "float32",
+        "ns_algorithm": "standard",
+        "ns_restarts": None,
+    },
     "schedule": {"horizon": 1.0},
 }
 # Fields of a setting that only change how a run is watched.
@@ -356,7 +361,7 @@ def _without_newer_fields(train: dict) -> dict:
     for setting, fields in _NEWER_FIELDS.items():
         given = train.get(setting) or {}
         for field, before in fields.items():
-            if given.get(field) == before:
+            if field in given and given[field] == before:
                 del given[field]
     for setting, names in _UNCOMPUTED_FIELDS.items():
         for name in names:
