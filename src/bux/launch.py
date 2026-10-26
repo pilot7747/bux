@@ -610,11 +610,14 @@ def _fitting(
     out: str | Path,
     gpus: Sequence[str],
     echo: Callable[[str], None],
+    *,
+    alone: bool | None = None,
 ) -> list[ir.Run]:
-    """Return the runs that can train on `gpus` (`_unfit`); record the others failed."""
+    """Return the runs that can train on `gpus` (`_unfit`), each `alone` or in a
+    sweep, by default as there are; record the others failed."""
     fits = []
     for run in runs:
-        if (error := _unfit(run, gpus, alone=len(runs) == 1)) is None:
+        if (error := _unfit(run, gpus, alone=_alone(alone, runs))) is None:
             fits.append(run)
             continue
         folder = directory(run, out)
@@ -622,6 +625,10 @@ def _fitting(
         record(folder, state="failed", started=_now(), ended=_now(), error=error)
         echo(f"{run.name}: failed before training: {error}")
     return fits
+
+
+def _alone(alone: bool | None, runs: Sequence[ir.Run]) -> bool:
+    return len(runs) == 1 if alone is None else alone
 
 
 def _profiler(run: ir.Run, out: str | Path) -> list[str]:
@@ -778,7 +785,7 @@ def search(
         return 1
     available = [] if here else list(visible_gpus() if gpus is None else gpus)
     runs = [space.run for space in spaces]
-    if not (fits := _fitting(runs, out, available, echo)):
+    if not (fits := _fitting(runs, out, available, echo, alone=False)):
         return 1
     if (code := _prepare(fits, cache, workers, echo)) is not None:
         return code

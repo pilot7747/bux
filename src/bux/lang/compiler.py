@@ -1916,13 +1916,7 @@ class Space:
             [f] = _explore(program, self.entry, point, self.choices)
         except BuxError as err:
             raise program.locate(err) from None
-        names = {d.key: name for name, d in dims.items()}
-        more = tuple(
-            replace(d, where=names.get(d.key, d.where)).part(
-                point.get(d.key, middle(d.space))
-            )
-            for d in f.dims
-        )
+        more = tuple(d.part(point.get(d.key, middle(d.space))) for d in f.dims)
         return _run(f, self.filename, more + ((f"steps={steps}",) if steps else ()))
 
 
