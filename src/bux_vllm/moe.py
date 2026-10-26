@@ -19,7 +19,8 @@ from .basic import MLP
 from .common import Ctx, Layer, Site, unsupported
 from .routing import Router, expert_shards
 
-#: vLLM's MoE activations, by a bux expert's type and activation.
+#: vLLM's MoE activations, by a bux expert's type and activation, without a limit
+#: or an offset.
 ACTIVATIONS = {
     ("gated_mlp", "swish"): "silu",
     ("gated_mlp", "gelu"): "gelu",
@@ -30,6 +31,34 @@ ACTIVATIONS = {
     ("mlp", "gelu_tanh"): "gelu_tanh_no_mul",
     ("mlp", "relu2"): "relu2_no_mul",
 }
+
+#: The gate's activation ``x sigmoid(alpha x)``, by its name, of vLLM's clamped
+#: SwiGLU: ``act(min(gate, limit)) * (clip(up, limit) + offset)``.
+SIGMOID_GATES = {"swish": 1.0, "quick_gelu": 1.702}
+FLOAT32_MAX = 3.4028234e38  # a limit that clips nothing
+
+
+def experts_activation(expert: dict) -> dict:
+    """vLLM's activation of the routed experts `expert` (an MLP's config), with its
+    clamp and offset, as `FusedMoEFactory`'s arguments.
+
+    Raises:
+        NotImplementedError: vLLM has no such activation.
+    """
+    unsupported(expert, "up_softcap")
+    kind = (expert["type"], expert["activation"])
+    clamped = expert["limit"] is not None or expert["up_offset"]
+    if not clamped and kind in ACTIVATIONS:
+        return {"activation": ACTIVATIONS[kind]}
+    if kind[0] != "gated_mlp" or kind[1] not in SIGMOID_GATES:
+        raise NotImplementedError(f"moe: {kind} experts, so clamped, not in vLLM yet")
+    limit = FLOAT32_MAX if expert["limit"] is None else expert["limit"]
+    return {
+        "activation": "swigluoai_uninterleave",  # gate then up, as w13 holds them
+        "swiglu_limit": limit,
+        "swiglu_alpha": SIGMOID_GATES[kind[1]],
+        "swiglu_beta": expert["up_offset"],
+    }
 
 
 class MoE(Layer):
@@ -52,10 +81,6 @@ class MoE(Layer):
             "expert_norm",
         )
         expert = c["expert"]
-        unsupported(expert, "limit", "up_softcap", "up_offset")
-        kind = (expert["type"], expert["activation"])
-        if kind not in ACTIVATIONS:
-            raise NotImplementedError(f"moe: {kind} experts not in vLLM yet")
         n, self.gated = c["num_experts"], expert["type"] == "gated_mlp"
         self.router = Router(c)
         weight = torch.empty(n, width)
@@ -73,7 +98,7 @@ class MoE(Layer):
             renormalize=c["normalize_top_k"],
             prefix=f"{site.path}.experts",
             custom_routing_function=self.router,
-            activation=ACTIVATIONS[kind],
+            **experts_activation(expert),
             has_bias=expert["bias"],
             router_logits_dtype=torch.float32,
             # vLLM's names of the shards, which a non-gated MoE has no up of

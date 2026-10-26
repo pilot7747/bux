@@ -49,6 +49,11 @@ llm = LLM(
 print(llm.generate("The capital of France is", SamplingParams(max_tokens=8)))
 ```
 
+vLLM runs a model in one dtype, float32 as well as bfloat16, but for its Gated
+DeltaNet kernels, which take bfloat16 alone. A recurrent layer's state is in the
+model's dtype, unless `--mamba-ssm-cache-dtype float32` keeps it in float32, as bux
+does.
+
 The model's output is its first head: layers after it, a multi-token prediction
 module's, are not built, and vLLM skips their weights (it drafts tokens by MTP only
 for the model types it knows). A layer or setting the plugin does not run raises
@@ -81,7 +86,7 @@ for the model types it knows). A layer or setting the plugin does not run raises
 | `embed`, `head` | yes, the vocabulary split over ranks: learned positions, `scale_by_sqrt_dim`, `norm`; tied or not, a bias, soft-capping |
 | `rmsnorm`, `layernorm`, `mlp`, `gated_mlp`, `linear`, `act`, `scale`, `dropout` | yes, with the MLPs' `limit`, `up_softcap` and `up_offset` |
 | `gqa` | RoPE (`pi`, `llama3`, `yarn`), QK-norm, GQA and MQA, biases, `fused_qkv`, sliding windows, soft-capping, sinks, its scale, `gated` (a gate a channel or a head), `output_norm`; not yet `kv_conv_size`, an indexer, a relative bias, `log_scale` or ports |
-| `moe` | softmax, sigmoid and `sqrtsoftplus` routers, `router_logit_scale`, groups, the aux-free bias, a router bias, shared experts and their gate, gated and plain experts (`swish`, `gelu`, `gelu_tanh`, `relu2`); not yet LatentMoE, `expert_norm`, `shared_expert_sink`, or the experts' `limit`, `up_softcap` and `up_offset` |
+| `moe` | softmax, sigmoid and `sqrtsoftplus` routers, `router_logit_scale`, groups, the aux-free bias, a router bias, shared experts and their gate, gated and plain experts (`swish`, `gelu`, `gelu_tanh`, `relu2`), with biases, and a `limit` and an `up_offset` of `swish` and `quick_gelu` gates (gpt-oss's); not yet LatentMoE, `expert_norm`, `shared_expert_sink` or the experts' `up_softcap` |
 | `mamba2`, `gdn` | yes, by vLLM's layers, one type and shape of them a model |
 | the graph | everything but residual algebras; a shared MoE or recurrent layer runs once a pass |
 
