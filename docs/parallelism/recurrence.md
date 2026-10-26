@@ -247,8 +247,8 @@ Decayed linear attention, with no delta rule, runs by cuDNN's GDN-2 kernel under
   $S_t = (I - k_t (\beta_t \odot k_t)^\top)\, \mathrm{diag}(e^{g_t})\, S_{t-1} + k_t (w_t \odot v_t)^\top$,
   with $g$, $\beta$ and $w$ per channel. At $\beta = 0$ and $w = 1$ it is GLA's
   recurrence, and Lightning's with its decay a head given to every channel.
-- cudnn-frontend has it only in its develop builds, which the lock pins on Linux
-  x86-64; a run without one runs by the chunks.
+- cudnn-frontend has it only in its develop builds, which the lock pins on Linux;
+  a run without one runs by the chunks.
 - It keeps only its inputs for the backward pass, and so do the chunks it falls back
   on, in a row of more documents than its room (as the GDN kernel's).
 - It factors each decay through a tile of 16 positions. A tile that decays a channel

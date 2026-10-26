@@ -113,9 +113,8 @@ a gate of -20 a position took 45 ms a layer, not 3.7. GLA's own gate,
 $\log \sigma(f) / 16$, needs $f$ near -83 through a whole tile for that, and
 Lightning's decays never reach it.
 
-The develop build replaces cudnn-frontend 1.31.0 on Linux x86-64 alone. Linux on ARM,
-which it has no wheel for, goes without cudnn-frontend, and its kernels
-(`fused_delta`, `grouped_glu`) fall back there as they do off Linux.
+The lock pins cudnn-frontend's develop build (1.32.0.dev76547535) in place of 1.31.0,
+as a wheel from its GitHub release, on Linux for x86-64 and ARM.
 
 ## Debugging with kernels off
 
