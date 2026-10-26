@@ -305,68 +305,89 @@ SMALL = [
     "dense = gated_mlp(intermediate_size=8, activation=swish)",
 ]
 GQA = "gqa(num_heads=4, num_kv_heads=2, head_dim=8"
-# Each zoo file shrunk, its attention a plain gqa where its own is not exported yet,
-# and its experts as the file has them but for their numbers and sizes.
+MLA = (
+    "mla(num_heads=2, q_lora_rank=8, kv_lora_rank=8, qk_nope_head_dim=4,"
+    " qk_rope_head_dim=4, v_head_dim=4"
+)
+YARN = "scaling=yarn(factor=40, original_max_len=4096, attention_factor_on=softmax)"
+# Each zoo file shrunk, as tests/test_examples.py shrinks it: its experts as the file
+# has them but for their numbers and sizes, its layers not exported yet (Mamba-2,
+# KDA, a residual algebra) plain ones, and its deepest repeats cut short; the
+# multi-token heads are left out.
 ZOO = {
     "qwen/qwen3_30b_a3b.bux": [
         f"attn = {GQA}, qk_norm=norm, rope=rope(base=1000000))",
         "experts = moe(num_experts=8, top_k=2, expert=dense)",
+        "model = embed block^3 norm head",
     ],
     "deepseek_v3.bux": [
-        f"attn = {GQA}, rope=rope(layout=interleaved))",
+        f"attn = {MLA}, rope=rope(layout=interleaved, {YARN}))",
         (
             "experts = moe(num_experts=8, top_k=2, num_shared_experts=1, router=sigmoid,"
             " routed_scaling_factor=2.5, num_groups=4, top_k_groups=2,"
             " load_balancing=aux_free, expert=dense)"
         ),
+        "model = embed layer(dense) layer(experts)^2 norm head",
     ],
     "kimi/kimi_k2.5.bux": [
-        f"attn = {GQA}, rope=rope(base=50000, layout=interleaved))",
+        f"attn = {MLA}, rope=rope(base=50000, layout=interleaved, {YARN}))",
         (
             "experts = moe(num_experts=8, top_k=2, num_shared_experts=1, router=sigmoid,"
             " routed_scaling_factor=2.827, load_balancing=aux_free, expert=dense)"
         ),
+        "model = embed layer(dense) layer(experts)^2 norm head",
     ],
     "kimi/kimi_k3.bux": [
         "residual = none",
         f"kda = {GQA})",
-        f"mla = {GQA})",
-        "dense = gated_mlp(intermediate_size=8, activation=situ, up_softcap=25)",
+        f"mla = {MLA}, gated=true, rope=none)",
         (
             "experts = moe(num_experts=8, top_k=2, num_shared_experts=2, router=sigmoid,"
             " load_balancing=aux_free, latent_size=16, latent_output_norm=norm,"
             " expert=gated_mlp(intermediate_size=8, activation=situ, up_softcap=25))"
         ),
+        'model = embed "FKKA" "KKKA" "A" norm head',
     ],
     "gpt_oss_120b.bux": [
-        f"attn = {GQA}, bias=true)",
-        "local = attn",
+        (
+            f"attn = {GQA}, bias=true, sinks=true,"
+            " rope=rope(base=150000, scaling=yarn(factor=32, original_max_len=4096)))"
+        ),
+        "local = attn(sliding_window_size=4)",
         (
             "experts = moe(num_experts=8, top_k=2, router_bias=true,"
             " expert=gated_mlp(intermediate_size=8, activation=quick_gelu, bias=true,"
             " limit=7.0, up_offset=1.0))"
         ),
+        'model = embed "LG"^2 norm head',
     ],
     "muse/muse_spark_open_816b_a42b.bux": [
         "residual = none",
-        f"attn = {GQA}, qk_norm=bare)",
-        "local = attn(rope=rope(base=500000))",
+        (
+            f"attn = {GQA}, qk_norm=bare, scale=5.4730064863875 * 8^-0.5, gated=true,"
+            " output_norm=bare)"
+        ),
+        "local = attn(sliding_window_size=4, rope=rope(base=500000))",
         (
             "experts = moe(num_experts=8, top_k=2, load_balancing=aux_free,"
             " router=sigmoid, router_logit_scale=logit_scale, latent_size=16,"
             " latent_input_norm=norm, expert_norm=rescale,"
             " expert=gated_mlp(intermediate_size=8, activation=swish))"
         ),
+        'model = embed bare "LG" "LLLG" (rmsnorm(eps=1e-5) * logit_scale) head(softcap=20)',
     ],
     "inkling/inkling.bux": [
-        f"attn = {GQA}, qk_norm=norm, scale=1 / 8)",
-        "local = attn",
+        (
+            f"attn = {GQA}, qk_norm=norm, scale=1 / 8, kv_conv_size=4,"
+            " relative_bias=relbias(rank=2, extent=8), log_scale=0.1, log_scale_floor=4)"
+        ),
+        "local = attn(sliding_window_size=4, relative_bias.extent=4, log_scale=none)",
         (
             "experts = moe(num_experts=8, top_k=2, num_shared_experts=2,"
             " shared_expert_sink=true, router=sigmoid, routed_scaling_factor=8,"
             " load_balancing=aux_free, expert=dense)"
         ),
-        'model = embed(norm=norm) "DD" "LLLG" "LLLLLG"^10 norm logits',
+        'model = embed(norm=norm) "DD" "LLLG" "LG" norm logits',
     ],
     "nemotron/nemotron_3_nano_30b_a3b.bux": [
         f"ssm = {GQA})",
@@ -377,6 +398,7 @@ ZOO = {
             " expert=mlp(intermediate_size=8, activation=relu2),"
             " shared_expert=mlp(intermediate_size=16, activation=relu2))"
         ),
+        'model = embed "MEMEMA" "EMEMEMA" norm head',
     ],
     "nemotron/nemotron_3_ultra_550b_a55b.bux": [
         f"ssm = {GQA})",
@@ -387,7 +409,7 @@ ZOO = {
             " expert=mlp(intermediate_size=8, activation=relu2),"
             " shared_expert=mlp(intermediate_size=16, activation=relu2))"
         ),
-        'model = embed ("MEMEMEMAE" "MEMEMAE" "MEMEMEMAE")^4 "MEMEMEME" norm out',
+        'model = embed "MEMEMEMAE" "MEMEMAE" norm out',
     ],
 }
 
