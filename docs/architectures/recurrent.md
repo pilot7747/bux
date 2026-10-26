@@ -1,8 +1,8 @@
 # Linear attention and state-space models
 
 This page covers bux's recurrent token mixers: linear attention (`gla`, `deltanet`,
-`gdn`, `kda`, `lightning`), RWKV-7 (`rwkv7`), the state-space models `mamba` and
-`mamba2`, and the short convolutions `conv` and `short_conv`. Each keeps a state
+`gdn`, `kda`, `gdn2`, `lightning`), RWKV-7 (`rwkv7`), the state-space models `mamba`
+and `mamba2`, and the short convolutions `conv` and `short_conv`. Each keeps a state
 that it updates token by token, so its cost grows linearly with the sequence. Read it
 to choose a mixer, to see the recurrence a setting changes, or to build a hybrid with
 softmax attention.
@@ -26,6 +26,7 @@ model = embed "DDDA"^12 norm @h out mtp
 | [`deltanet`](#deltanet) | delta rule | none | Schlag et al., 2021; Yang et al., 2024 |
 | [`gdn`](#gdn-gated-deltanet) | delta rule | per head, data-dependent | Yang et al., 2025; Qwen3-Next |
 | [`kda`](#kda-kimi-delta-attention) | delta rule | per key channel, data-dependent | Kimi Linear, 2025 |
+| [`gdn2`](#gdn2-gated-deltanet-2) | delta rule, erasing and writing by gates per channel | per key channel, data-dependent | Hatamizadeh et al., 2026 |
 | [`lightning`](#lightning-lightning-attention) | add $k v^\top$ | per head, fixed | TransNormerLLM; MiniMax-01 |
 | [`rwkv7`](#rwkv7-rwkv-7-goose) | generalized delta rule | per key channel, data-dependent | Peng et al., 2025 |
 | [`mamba`](#mamba-selective-ssm) | selective scan | per channel and state dim | Gu and Dao, 2023; Jamba |
@@ -55,7 +56,7 @@ $q$, $k$, $v$, $w$, $a$ and $b$ from the input.
 
 ### What they share
 
-`gla`, `deltanet`, `gdn`, `kda`, `lightning` and `rwkv7` take these settings
+`gla`, `deltanet`, `gdn`, `kda`, `gdn2`, `lightning` and `rwkv7` take these settings
 (`LinearAttentionConfig`):
 
 | Setting | Default | What it does |
@@ -171,6 +172,43 @@ kda = kda(num_heads=96, head_dim=128, gate_lower_bound=-5, norm_eps=1e-5)
 takes only a decay bounded at -5 or above, as `gate_lower_bound=-5` bounds it. On a
 B300 it runs 10 times as fast as the chunks, where bux's own Pallas kernels, which take
 any gate, run 2.6 times as fast ([How they run](#how-they-run)).
+:::
+
+### `gdn2`: Gated DeltaNet-2
+
+Gated DeltaNet-2 (Hatamizadeh et al., 2026), as the paper's code and fla have it: KDA
+whose step $\beta_t$, which both erases and writes, becomes two gates per channel, an
+erase gate $b_t$ over the key channels and a write gate $w_t$ over the value channels,
+
+$$
+S_t = \left(I - k_t (b_t \odot k_t)^\top\right) \mathrm{diag}(e^{g_t})\, S_{t-1}
+  + k_t (w_t \odot v_t)^\top,
+\qquad b_t = \sigma(W_b x_t),\quad w_t = \sigma(W_w x_t),
+$$
+
+with KDA's decay per key channel, $g_t = -e^{A_{\log}}\, \mathrm{softplus}(f_t +
+\text{dt\_bias})$ of a low-rank $f_t$ (`gate_rank`, by default `v_head_dim`), and the
+same `gate_lower_bound`. At $b_t = w_t = \beta_t$ it is KDA. $g$, $b$ and `A_log` are a
+q and k head's, shared out to its value heads as q and k are; $w$ is a value head's.
+`negative_eigenvalues=true` doubles the erase gate, into $(0, 2)$. See {bux}`gdn2`.
+
+It starts as the paper's code does: every projection from Xavier's uniform at a gain of
+$2^{-2.5}$, the output gate low rank (`output_gate_rank`, by default `v_head_dim`) with
+a bias from 0, `A_log` at $\log U(1, 16)$ and `dt_bias` at Mamba's time steps. Its
+output norm's gate is a `swish`, the paper's SiLU (fla's port has a `sigmoid`), and
+`norm_eps` is `1e-5`.
+
+The paper's hybrid, a `gdn2` layer before each sliding-window attention layer
+(`examples/architectures/gated_deltanet_2.bux`):
+
+```bux
+gdn2 = gdn2(num_heads=16, head_dim=128)
+```
+
+:::{tip}
+`gate_lower_bound=-5` lets cuDNN's GDN-2 kernel run the layer on a B200 or B300, 8.4
+times as fast as the chunks; the baseline's hybrid of it trains 2.1 times as fast. The
+paper's unbounded gate runs by the chunks ([How they run](#how-they-run)).
 :::
 
 ### `lightning`: lightning attention
@@ -319,6 +357,7 @@ The zoo's:
 | Qwen3-Next, Qwen3.8 | three `gdn` for every gated `gqa`, `"DDDA"^12` | `qwen3_next.bux`, `qwen/qwen3.8_27b.bux` |
 | Kimi Linear | three `kda` for every NoPE `mla`, `"FKKA" "KKKA"^5 "KKA"` | `kimi_linear.bux` |
 | Kimi K3 | the same at 93 layers, under attention residuals | `kimi/kimi_k3.bux` |
+| Gated DeltaNet-2 | `gdn2` and sliding-window `gqa` alternating, `"NS"^9` | `gated_deltanet_2.bux` |
 | Jamba | `mamba` with one `gqa` in eight, MoE every other layer, `"mMmM aMmM"^4` | `jamba.bux` |
 | Nemotron 3 | `mamba2` and MoE layers alternating, attention every 7 to 9 | `nemotron/nemotron_3_ultra_550b_a55b.bux` |
 | Zamba2 | `mamba2`, and one `shared` transformer block before every sixth | `zamba2.bux` |
@@ -378,6 +417,8 @@ and heads of 64 or 128, under `methods.recurrence = scan`:
 | `gdn`, `deltanet` | cuDNN's fused GDN kernel (`fused_delta`) | a B200 or B300; any gate |
 | `kda` with a `gate_lower_bound` of -5 or above | cuDNN's fused KDA kernel (`fused_delta`) | a B200 or B300 |
 | `kda` otherwise | bux's Pallas kernels (`pallas_delta`) | any GPU; any gate |
+| `gdn2` with a `gate_lower_bound` of -5 or above | cuDNN's fused GDN-2 kernel (`fused_delta`) | a B200 or B300; bfloat16 |
+| `gdn2` otherwise | chunks | |
 | `gla`, `lightning` | cuDNN's fused GDN-2 kernel (`fused_delta`), its delta rule at a step of 0 | a B200 or B300; bfloat16 |
 | `rwkv7` | chunks, a pair product one matmul (its decay is bounded), the state across them by `affine_scan` | |
 | `mamba2` | chunks, the state across them by a matmul (one decay a head) | |
@@ -388,6 +429,11 @@ so it loses precision where a tile decays a channel by $e^{-86}$, and overflows 
 $e^{-90}$. Within 12 steps of bux's start, KDA's unbounded gates are that steep in 30
 to 90% of the (row, head) pairs of most layers, so those, and gates bounded below -5,
 run by bux's kernels, which are exact at any gate.
+
+cuDNN's GDN-2 kernel factors its decays the same way, but is exact at any gate: where a
+tile decays a channel past $e^{-83}$ it runs the whole call again by a slower exact
+path. Unbounded gates soon take it there, as KDA's do, so `gdn2` runs by the kernel only
+with a `gate_lower_bound` of -5 or above, which keeps a tile within $e^{-80}$.
 
 Settings that change how they run (none changes what they compute):
 

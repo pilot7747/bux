@@ -1,6 +1,6 @@
 """Linear attention: token mixers with one matrix-valued state per head, updated token
-by token. Gated DeltaNet, Kimi Delta Attention, DeltaNet, GLA and Lightning are here,
-and RWKV-7 is in ``rwkv7``.
+by token. Gated DeltaNet, Kimi Delta Attention, Gated DeltaNet-2, DeltaNet, GLA and
+Lightning are here, and RWKV-7 is in ``rwkv7``.
 
 All of them run one recurrence (`recurrence`), over a state S of dk by dv per value
 head::
@@ -18,6 +18,8 @@ The layers, each a config of `bux.config`:
 - ``deltanet``: `DeltaNet`, the delta rule, no decay;
 - ``gdn``: `GatedDeltaNet`, the delta rule with a decay per head;
 - ``kda``: `KimiDeltaAttention`, the delta rule with a decay per key channel;
+- ``gdn2``: `GatedDeltaNet2`, KDA whose step is two gates per channel, an erase and a
+  write gate;
 - ``lightning``: `LightningAttention`, a fixed decay per head.
 
 Shapes: b rows, t positions, d the width, h heads (value heads, once q and k are shared
@@ -27,7 +29,8 @@ out to them), dk and dv the head dims of keys and values.
 kernels), and `stepwise` is its reference, a scan over positions. It runs by the run's
 ``methods.recurrence``: ``scan``, the default, here, and ``pass_state``, which splits
 the positions over ``context``, in `bux.parallel.recurrence`. On a GPU, kernels run
-the delta rule (`delta_rule`) and decayed linear attention (`decayed`) instead.
+the delta rule (`delta_rule`, `gated_delta_2`) and decayed linear attention
+(`decayed`) instead.
 
 Under tensor parallelism (`bux.parallel`) every projection splits over ``heads``, into
 the heads or out of them, and so does every parameter a head has: the recurrence runs
@@ -58,6 +61,11 @@ from bux.architecture.repeats import remat
 from bux.lang import ir
 from bux.parallel import methods
 from bux.parallel.recurrence import Chunk, Positions, Recurrence, Shared, Transition
+
+LECUN = nnx.initializers.lecun_normal()  # where the layers' projections start
+# Xavier's uniform at a gain of 2^-2.5, a variance of 2^-5 over the fans' mean: where
+# Gated DeltaNet-2's projections start.
+XAVIER = nnx.initializers.variance_scaling(2**-5, "fan_avg", "uniform")
 
 
 @methods.recurrence.register("scan")
@@ -370,6 +378,89 @@ def _chunked(
     return remat.named("recurrence", mix, *xs).astype(v.dtype)
 
 
+def gated_delta_2(
+    q: Float[Array, "b t h dk"],
+    k: Float[Array, "b t h dk"],
+    v: Float[Array, "b t h dv"],
+    log_decay: Float[Array, "b t h dk"],
+    erase: Float[Array, "b t h dk"],
+    write: Float[Array, "b t h dv"],
+    docs: Segments | None,
+    floor: float | None = None,
+) -> Float[Array, "b t h dv"]:
+    """Run Gated DeltaNet-2's delta rule: each token decays the state, takes away what
+    it reads there along ``b_t * k_t``, and writes ``w_t * v_t`` in its place at k_t::
+
+        S_t = (I - k_t (b_t * k_t)^T) diag(exp(g_t)) S_{t-1} + k_t (w_t * v_t)^T,
+
+    with the erase gate b over the key channels and the write gate w over the value
+    channels. That is `recurrence` reading ``a = -exp(g) * b * k`` of the state, which
+    it writes at k, and the values ``w * v``, in float32; at b = w = beta it is
+    `delta_rule`'s. On a B200 or B300, with q, k and v in bfloat16, heads of 64 or
+    128 and `floor`, the least log decay, at -5 or above, cuDNN's GDN-2 kernel runs it
+    instead (`~bux.architecture.recurrent.fused_delta`), keeping only its inputs for
+    the backward pass, as the chunks it falls back on do.
+
+    Args:
+        q: The queries, ``b t h dk``.
+        k: The keys, ``b t h dk``, L2-normalized.
+        v: The values, ``b t h dv``.
+        log_decay: g, the log decay of each key channel, ``b t h dk``; at most 0.
+        erase: The erase gate b, ``b t h dk``.
+        write: The write gate w, ``b t h dv``.
+        docs: The documents packed into the rows; None for one a row.
+        floor: The least log decay the layer can give, if bounded.
+
+    Returns:
+        The outputs ``S_t^T q_t``, ``b t h dv``, in v's dtype.
+    """
+    chunked = functools.partial(_gated_chunked, floor=floor)
+    if not fused_delta.gated_runs(k.shape[-1], v.shape[-1], v.dtype, floor):
+        return chunked(q, k, v, log_decay, erase, write, docs)
+    otherwise = functools.partial(chunked, states="recompute")
+
+    def fused(*xs: Float[Array, "b t ..."]) -> Float[Array, "b t h dv"]:
+        return fused_delta.gated(*xs, docs, otherwise)
+
+    return remat.named("recurrence", fused, q, k, v, log_decay, erase, write)
+
+
+def _gated_chunked(
+    q: Float[Array, "b t h dk"],
+    k: Float[Array, "b t h dk"],
+    v: Float[Array, "b t h dv"],
+    log_decay: Float[Array, "b t h dk"],
+    erase: Float[Array, "b t h dk"],
+    write: Float[Array, "b t h dv"],
+    docs: Segments | None,
+    *,
+    floor: float | None = None,
+    states: States | None = None,
+) -> Float[Array, "b t h dv"]:
+    """Run `gated_delta_2` by `recurrence`'s chunks, which with `states = recompute`
+    (by default the run's) keep its inputs, in their own dtype, for the backward
+    pass."""
+
+    def rule(
+        q: Float[Array, "b t h dk"],
+        k: Float[Array, "b t h dk"],
+        v: Float[Array, "b t h dv"],
+        log_decay: Float[Array, "b t h dk"],
+        erase: Float[Array, "b t h dk"],
+        write: Float[Array, "b t h dv"],
+        continues: Float[Array, "b t"],
+    ) -> Float[Array, "b t h dv"]:
+        k, log_decay = k.astype(jnp.float32), log_decay.astype(jnp.float32)
+        a = -jnp.exp(log_decay) * erase * k
+        written = write * v.astype(jnp.float32)
+        family = "the generalized delta rule"
+        return _mixed(family, floor, q, k, written, log_decay, continues, a)
+
+    xs = (q, k, v, log_decay, erase, write, _continues(k, docs))
+    mix = recomputed(rule, states)
+    return remat.named("recurrence", mix, *xs).astype(v.dtype)
+
+
 def l2norm(x: Float[Array, "*lead e"], eps: float = 1e-6) -> Float[Array, "*lead e"]:
     """Return x over its L2 norm as fla computes it, ``x / sqrt(sum(x^2) + eps)``: in
     float32, the result in x's dtype."""
@@ -390,8 +481,9 @@ class LowRank(nnx.Module):
         activation: The activation between, by name; None for none.
         bias: Whether to add a bias c, from 0, or where c starts.
         orthogonal: Start it as RWKV-7 does, A at zero and B orthogonal, scaled by
-            0.1; otherwise A and B start as dense layers do.
+            0.1; otherwise A and B start from `init`.
         out: The name of the outputs' dimension (`bux.parallel`).
+        init: Where A and B start, unless `orthogonal`: as dense layers do.
     """
 
     def __init__(
@@ -405,13 +497,13 @@ class LowRank(nnx.Module):
         bias: Float[Array, " n"] | bool = False,
         orthogonal: bool = False,
         out: parallel.Name = None,
+        init: nnx.Initializer = LECUN,
     ):
         if orthogonal:
             gain = 0.1 * max(1.0, math.sqrt(rank / n_out))
             down = jnp.zeros((n_in, rank))
             up = nnx.initializers.orthogonal(gain)(rngs.params(), (rank, n_out))
         else:
-            init = nnx.initializers.lecun_normal()
             down = init(rngs.params(), (n_in, rank))
             up = init(rngs.params(), (rank, n_out))
         self.down = nnx.Param(down, names=("embed", "latent"))
@@ -429,12 +521,14 @@ class LowRank(nnx.Module):
         return y if self.bias is None else y + self.bias[...]
 
 
-def into_heads(width: int, heads: int, dim: int, rngs: nnx.Rngs) -> nnx.Linear:
+def into_heads(
+    width: int, heads: int, dim: int, rngs: nnx.Rngs, init: nnx.Initializer = LECUN
+) -> nnx.Linear:
     """Make a projection of the width to `heads` heads of `dim` channels, side by
-    side."""
-    init = parallel.named("embed", ("heads", heads))
+    side, its kernel from `init`."""
+    named = parallel.named("embed", ("heads", heads), init=init)
     return projection(
-        width, heads * dim, "recurrence", use_bias=False, kernel_init=init, rngs=rngs
+        width, heads * dim, "recurrence", use_bias=False, kernel_init=named, rngs=rngs
     )
 
 
@@ -503,7 +597,9 @@ class LinearAttention(nnx.Module):
         rngs: The random streams the parameters start from.
         silu: SiLU q, k and v without a conv; after one, they always are.
         gate_rank: The rank of a low-rank output gate; None for a dense one.
+        gate_bias: Add a bias, from 0, to a low-rank output gate.
         norm_all_heads: Normalize all heads' outputs together, not each on its own.
+        init: Where the projections' kernels start.
 
     Raises:
         ValueError: num_v_heads is not a multiple of num_heads.
@@ -517,7 +613,9 @@ class LinearAttention(nnx.Module):
         *,
         silu: bool = True,
         gate_rank: int | None = None,
+        gate_bias: bool = False,
         norm_all_heads: bool = False,
+        init: nnx.Initializer = LECUN,
     ):
         h, hv = config.num_heads, config.num_v_heads or config.num_heads
         if hv % h:
@@ -526,9 +624,9 @@ class LinearAttention(nnx.Module):
         self.heads, self.v_heads, self.head_dim, self.v_head_dim = h, hv, dk, dv
 
         self.q, self.k, self.v = (
-            into_heads(width, h, dk, rngs),
-            into_heads(width, h, dk, rngs),
-            into_heads(width, hv, dv, rngs),
+            into_heads(width, h, dk, rngs, init),
+            into_heads(width, h, dk, rngs, init),
+            into_heads(width, hv, dv, rngs, init),
         )
         # One conv over q, k and v side by side, which it convolves apart.
         size = config.conv_size
@@ -540,9 +638,17 @@ class LinearAttention(nnx.Module):
         self.gate = (
             None
             if config.output_gate is None
-            else LowRank(width, gate_rank, hv * dv, rngs, out=("heads", hv))
+            else LowRank(
+                width,
+                gate_rank,
+                hv * dv,
+                rngs,
+                bias=gate_bias,
+                out=("heads", hv),
+                init=init,
+            )
             if gate_rank
-            else into_heads(width, hv, dv, rngs)
+            else into_heads(width, hv, dv, rngs, init)
         )
         self.norm_all_heads = norm_all_heads
         rms = cfg.NormalizationConfig(type="rmsnorm", eps=config.norm_eps)
@@ -552,7 +658,7 @@ class LinearAttention(nnx.Module):
             width,
             "recurrence_out",
             use_bias=False,
-            kernel_init=parallel.named(("heads", hv), "embed"),
+            kernel_init=parallel.named(("heads", hv), "embed", init=init),
             rngs=rngs,
         )
 
@@ -569,14 +675,15 @@ class LinearAttention(nnx.Module):
             q, k, v = map(jax.nn.silu, self.conv.side_by_side((q, k, v), taps))
         elif self.silu:
             q, k, v = map(jax.nn.silu, (q, k, v))
-        group = self.v_heads // self.heads
         q, k = (
-            jnp.repeat(
-                shard_heads(y.reshape(b, t, self.heads, self.head_dim)), group, axis=2
-            )
+            self._per_value_head(y.reshape(b, t, self.heads, self.head_dim))
             for y in (q, k)
         )
         return q, k, shard_heads(v.reshape(b, t, self.v_heads, self.v_head_dim))
+
+    def _per_value_head(self, y: Float[Array, "b t h e"]) -> Float[Array, "b t hv e"]:
+        """Share each q/k head's y out to its group of value heads."""
+        return jnp.repeat(shard_heads(y), self.v_heads // self.heads, axis=2)
 
     def _output(
         self, x: Float[Array, "b t d"], o: Float[Array, "b t h dv"]
@@ -691,24 +798,105 @@ class KimiDeltaAttention(DeltaNet):
         hv, dk, rank = self.v_heads, self.head_dim, config.gate_rank
         self.f = LowRank(width, rank or dk, hv * dk, rngs, out=("heads", hv))
         self.lower_bound = config.gate_lower_bound
-        self.A_log = nnx.Param(
-            _log_uniform(rngs, hv, 1, 16)
-            if config.gate_lower_bound is None
-            else jnp.zeros(hv),
-            names=("heads",),
-        )
-        self.dt_bias = nnx.Param(_dt_bias(rngs, hv * dk), names=(("heads", hv),))
+        self.A_log, self.dt_bias = _channel_rates(rngs, hv, dk, self.lower_bound)
 
     def _log_decay(self, x: Float[Array, "b t d"]) -> Float[Array, "b t h dk"]:
         b, t, _ = x.shape
         f = (self.f(x) + self.dt_bias[...]).reshape(b, t, self.v_heads, self.head_dim)
-        rate = jnp.exp(self.A_log[...])[:, None]
-        if self.lower_bound is not None:
-            return self.lower_bound * jax.nn.sigmoid(rate * f)
-        return -rate * jax.nn.softplus(f)
+        return _channel_decay(f, self.A_log[...], self.lower_bound)
 
     def _floor(self) -> float | None:
         return self.lower_bound
+
+
+def _channel_rates(
+    rngs: nnx.Rngs, heads: int, dk: int, lower_bound: float | None
+) -> tuple[nnx.Param, nnx.Param]:
+    """Return KDA's A_log, one a head, and dt_bias, one a key channel: A_log at
+    ``log U(1, 16)``, or at 0 for a decay bounded below, as fla's safe gate starts it,
+    and dt_bias at Mamba's time steps."""
+    unbounded = lower_bound is None
+    rates = _log_uniform(rngs, heads, 1, 16) if unbounded else jnp.zeros(heads)
+    A_log = nnx.Param(rates, names=("heads",))
+    dt_bias = nnx.Param(_dt_bias(rngs, heads * dk), names=(("heads", heads),))
+    return A_log, dt_bias
+
+
+def _channel_decay(
+    f: Float[Array, "b t h dk"], A_log: Float[Array, " h"], lower_bound: float | None
+) -> Float[Array, "b t h dk"]:
+    """Return KDA's log decay per key channel of ``f`` (its projection plus dt_bias):
+    ``-exp(A_log) softplus(f)``, or with a lower bound
+    ``lower_bound * sigmoid(exp(A_log) f)``."""
+    rate = jnp.exp(A_log)[:, None]
+    if lower_bound is not None:
+        return lower_bound * jax.nn.sigmoid(rate * f)
+    return -rate * jax.nn.softplus(f)
+
+
+class GatedDeltaNet2(LinearAttention):
+    """Gated DeltaNet-2 (Hatamizadeh et al., 2026), ``gdn2``, as the paper's code and
+    fla have it: KDA whose step beta, which erases and writes alike, becomes two gates
+    of channels, ``b = sigmoid(W_b x)`` over the keys' and ``w = sigmoid(W_w x)`` over
+    the values' (`gated_delta_2`), on L2-normalized q and k, q scaled by
+    ``dk ** -0.5``. The decay is KDA's, per key channel, of a low-rank projection
+    (`gate_rank`); it, b and A_log are a q/k head's, shared out to its value heads as
+    q and k are.
+
+    Every projection starts from Xavier's uniform at a gain of 2^-2.5 (`XAVIER`), its
+    bias at 0, as the paper's code starts them; the output gate is low rank, with a
+    bias. The paper gates the output norm by SiLU, fla's port by a sigmoid
+    (`output_gate`).
+
+    Args:
+        config: The layer's settings (`bux.config.GatedDeltaNet2Config`).
+        width: The width of the stream, d.
+        rngs: The random streams the parameters start from.
+    """
+
+    def __init__(self, config: cfg.GatedDeltaNet2Config, width: int, rngs: nnx.Rngs):
+        dv = config.v_head_dim or config.head_dim
+        gate_rank = config.output_gate_rank or dv
+        super().__init__(
+            config, width, rngs, gate_rank=gate_rank, gate_bias=True, init=XAVIER
+        )
+        h, dk, hv = self.heads, self.head_dim, self.v_heads
+        rank = config.gate_rank or dv
+        self.f = LowRank(width, rank, h * dk, rngs, out=("heads", h), init=XAVIER)
+        self.erase = into_heads(width, h, dk, rngs, XAVIER)
+        self.write = into_heads(width, hv, dv, rngs, XAVIER)
+        self.lower_bound = config.gate_lower_bound
+        self.A_log, self.dt_bias = _channel_rates(rngs, h, dk, self.lower_bound)
+        self.erase_scale = 2.0 if config.negative_eigenvalues else 1.0
+
+    def __call__(self, x: Float[Array, "b t d"], taps: Taps) -> Float[Array, "b t d"]:
+        """Return the mixer's output at every position of x, ``b t d``.
+
+        Args:
+            x: The stream.
+            taps: The forward pass's taps, for the documents in the rows.
+        """
+        x = shard_layer_input(x)
+        q, k, v = self._qkv(x, taps)
+        q, k = l2norm(q) * self.head_dim**-0.5, l2norm(k)
+        g, erase, write = self._gates(x)
+        o = gated_delta_2(q, k, v, g, erase, write, segments(taps), self.lower_bound)
+        return self._output(x, o)
+
+    def _gates(
+        self, x: Float[Array, "b t d"]
+    ) -> tuple[
+        Float[Array, "b t h dk"], Float[Array, "b t h dk"], Float[Array, "b t h dv"]
+    ]:
+        """Return the log decay and the erase gate of every value head, and its write
+        gate."""
+        b, t, _ = x.shape
+        h, dk = self.heads, self.head_dim
+        f = (self.f(x) + self.dt_bias[...]).reshape(b, t, h, dk)
+        g = _channel_decay(f, self.A_log[...], self.lower_bound)
+        erase = self.erase_scale * jax.nn.sigmoid(self.erase(x).reshape(b, t, h, dk))
+        write = jax.nn.sigmoid(self.write(x)).reshape(b, t, self.v_heads, -1)
+        return self._per_value_head(g), self._per_value_head(erase), shard_heads(write)
 
 
 class GatedLinearAttention(LinearAttention):
@@ -815,6 +1003,13 @@ def _(
     c: cfg.KDAConfig, width: int, ports: tuple[ir.Port, ...], ctx: Context
 ) -> KimiDeltaAttention:
     return KimiDeltaAttention(c, width, ctx.rngs)
+
+
+@register("gdn2")
+def _(
+    c: cfg.GatedDeltaNet2Config, width: int, ports: tuple[ir.Port, ...], ctx: Context
+) -> GatedDeltaNet2:
+    return GatedDeltaNet2(c, width, ctx.rngs)
 
 
 @register("gla")

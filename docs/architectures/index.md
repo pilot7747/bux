@@ -54,7 +54,7 @@ Read the model left to right:
 
 | Role | What it does | Layers |
 |------|--------------|--------|
-| Token mixer | mixes positions, causally | [`gqa`, `mla`, `csa`](attention.md); [`gla`, `deltanet`, `gdn`, `kda`, `lightning`, `rwkv7`](recurrent.md); [`mamba`, `mamba2`, `conv`, `short_conv`](recurrent.md#state-space-models-and-convolutions) |
+| Token mixer | mixes positions, causally | [`gqa`, `mla`, `csa`](attention.md); [`gla`, `deltanet`, `gdn`, `kda`, `gdn2`, `lightning`, `rwkv7`](recurrent.md); [`mamba`, `mamba2`, `conv`, `short_conv`](recurrent.md#state-space-models-and-convolutions) |
 | Channel mixer | transforms each position | [`mlp`, `gated_mlp`](layers.md#mlps); [`moe`](experts.md) |
 | Normalization | rescales each position | [`rmsnorm`, `layernorm`, `dyt`](layers.md#normalization) |
 | Input and output | tokens in, logits out | [`embed`, `head`, `nextn`, `engram`](layers.md#embeddings-and-heads) |
@@ -94,7 +94,7 @@ scalings, shared keys and values, and sparse attention by an indexer.
 :link: recurrent
 :link-type: doc
 
-`gla`, `deltanet`, `gdn`, `kda`, `lightning`, `rwkv7`, `mamba`, `mamba2`, `conv`
+`gla`, `deltanet`, `gdn`, `kda`, `gdn2`, `lightning`, `rwkv7`, `mamba`, `mamba2`, `conv`
 and `short_conv`: the recurrence each computes, and hybrids with attention.
 :::
 
@@ -144,7 +144,7 @@ precision roles, remat names and kernels.
 | Layer | Page |
 |-------|------|
 | `gqa`, `mla`, `csa` | [Softmax attention](attention.md) |
-| `gla`, `deltanet`, `gdn`, `kda`, `lightning`, `rwkv7` | [Linear attention](recurrent.md#linear-attention) |
+| `gla`, `deltanet`, `gdn`, `kda`, `gdn2`, `lightning`, `rwkv7` | [Linear attention](recurrent.md#linear-attention) |
 | `mamba`, `mamba2`, `conv`, `short_conv` | [State-space models and convolutions](recurrent.md#state-space-models-and-convolutions) |
 | `moe` | [Mixture of experts](experts.md) |
 | `layernorm`, `rmsnorm`, `dyt` | [Normalization](layers.md#normalization) |

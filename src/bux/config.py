@@ -573,6 +573,31 @@ class KDAConfig(LinearAttentionConfig):
     gate_lower_bound: float | None = None
 
 
+class GatedDeltaNet2Config(LinearAttentionConfig):
+    """Gated DeltaNet-2 (Hatamizadeh et al., 2026): KDA's erase and write decoupled.
+
+    KDA's step beta, which both erases and writes, becomes two gates per channel, the
+    sigmoids of projections of the input: an erase gate b over the key channels and a
+    write gate w over the value channels,
+    ``S_t = (I - k_t (b_t * k_t)^T) diag(exp(g_t)) S_{t-1} + k_t (w_t * v_t)^T``, with
+    KDA's decay g per key channel. As the paper's code has it:
+    ``gdn2(num_heads=16, head_dim=128)``.
+    """
+
+    type: Literal["gdn2"] = "gdn2"
+    gate_rank: int | None = None  # Rank of the decay's projection; None -> v_head_dim.
+    # Rank of the output gate's projection, which has a bias; None -> v_head_dim.
+    output_gate_rank: int | None = None
+    norm_eps: float = 1e-5
+    # The erase gate times 2, in (0, 2), so that the state's map may have negative
+    # eigenvalues (fla's allow_neg_eigval; Grazzi et al., 2025).
+    negative_eigenvalues: bool = False
+    # Bounded decay lower_bound * sigmoid(.), in (lower_bound, 0), instead of
+    # -exp(A) * softplus(.); None: unbounded, as the paper's. At -5 or above, cuDNN's
+    # GDN-2 kernel runs the layer on a B200 or B300, else bux's chunks do.
+    gate_lower_bound: float | None = None
+
+
 class LightningAttentionConfig(LinearAttentionConfig):
     """Lightning attention (TransNormerLLM, MiniMax-01): a fixed decay per head.
 
@@ -926,6 +951,7 @@ LayerConfig = Annotated[
     | DeltaNetConfig
     | GatedDeltaNetConfig
     | KDAConfig
+    | GatedDeltaNet2Config
     | LightningAttentionConfig
     | RWKV7Config
     | MambaConfig
