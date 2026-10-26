@@ -1,0 +1,29 @@
+# Trinity Mini (Arcee AI, 2025): a 26B MoE with 3B active, 8 of 128 experts a token
+# beside a shared one, trained on 10T tokens with Muon. Trinity Large's architecture
+# at a smaller size: three sliding-window layers with RoPE per NoPE global layer, all
+# gated and QK-normed, sandwich norms whose output gains start at 1 / sqrt(32), and
+# every weight from a normal of 0.5 / sqrt(d_model) truncated at 3 sigma. Its router
+# bias moves by aux-loss-free sign steps, re-centered after each; the first two
+# layers are dense.
+d_model    = 2048
+vocab_size = 200192
+layers     = 32
+
+init    = normal(std=0.5 * d_model ^ -0.5, truncate=3)
+norm    = rmsnorm(eps=1e-5)
+post    = norm(gain_init=layers ^ -0.5)
+attn    = gqa(num_heads=32, num_kv_heads=4, head_dim=128, qk_norm=norm, gated=true)
+local   = attn(sliding_window_size=2048, rope=rope(base=10000))
+global  = attn
+dense   = gated_mlp(intermediate_size=6144, activation=swish)
+experts = moe(num_experts=128, top_k=8, num_shared_experts=1, router=sigmoid,
+              routed_scaling_factor=2.826, load_balancing=aux_free,
+              bias_update_rate=1e-3, center_bias=true,
+              expert=gated_mlp(intermediate_size=1024, activation=swish))
+
+layer(mixer, ffn=experts) = [norm mixer post] [norm ffn post]
+l = layer(local, dense)
+L = layer(local)
+G = layer(global)
+
+model = embed(scale_by_sqrt_dim=true) "ll" "LG" "LLLG"^7 norm head

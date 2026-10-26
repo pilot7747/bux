@@ -139,8 +139,8 @@ See [Running](../training/running.md) and [Launching](../training/launching.md).
 ## The IR
 
 The compiler turns a file into plain pydantic data, with no JAX in sight:
-`bux.lang.compile` gives an `Architecture` (`d_model`, `vocab_size`, `residual` and a
-graph of 11 node kinds), and `bux.lang.compile_runs` gives a `Run` per combination of
+`bux.lang.compile` gives an `Architecture` (`d_model`, `vocab_size`, `residual`,
+`init` and a graph of 11 node kinds), and `bux.lang.compile_runs` gives a `Run` per combination of
 alternatives, with its `TrainConfig`. A backend turns the graph into code; bux's own,
 in `bux.architecture`, is a Flax NNX module per node kind.
 

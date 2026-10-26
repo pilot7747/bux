@@ -233,6 +233,7 @@ definitions you use elsewhere:
 | `d_model` | an integer: the width of the residual stream | required |
 | `vocab_size` | an integer: the vocabulary of `embed` and `head` | required when the model has an `embed` or a `head` |
 | `residual` | `hc(...)`, `mhc(...)`, `gr(...)`, `attnres(...)` or `vpgate(...)` | the residual algebra ([Residual algebras](residual-algebras.md)) |
+| `init` | `normal(...)` | how every weight matrix starts ([Initialization](../architectures/layers.md#initialization)) |
 | `data`, `optimizer`, `seq_len`, `batch`, `steps`, ... | training settings | setting any of them makes the file a run ([Training settings](../training/settings.md)) |
 
 Settings are definitions, so arithmetic, field reads and suffixes work on them, and

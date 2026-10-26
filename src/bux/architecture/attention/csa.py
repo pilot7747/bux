@@ -142,7 +142,7 @@ class CSA(Sparse):
         self.compress_kv = proj(width, d, "kv") if compresses else None
         pooled = compresses and r is not None and r > 1
         self.compress_gate = proj(width, d, "kv") if pooled else None
-        init = nnx.initializers.lecun_normal(batch_axis=(0,))
+        init = parallel.default_init(nnx.initializers.lecun_normal(batch_axis=(0,)))
         self.o_a = (
             nnx.Param(
                 init(rngs.params(), (groups, h * d // groups, rank)),
