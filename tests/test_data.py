@@ -3,16 +3,17 @@
 import collections
 import itertools
 import json
+import re
 
 import numpy as np
 import pyarrow as pa
 import pyarrow.parquet as pq
 import pytest
-from conftest import corpus
+from conftest import CHATML, byte_spec, corpus
 
 from bux.data import documents, packing
 from bux.data.pipeline import jobs, prepare
-from bux.data.tokenizer import Tokenizer
+from bux.data.tokenizer import Gigatoken, HFTokenizers, Tokenizer
 from bux.train import config as tcfg
 from bux.train.data import apportion, batches
 
@@ -26,7 +27,7 @@ def test_special_tokens_in_documents_stay_text(byte_tokenizer, tok):
     ids, offsets = tok.encode(pa.array(["a<|endoftext|>", None, "", "é"]))
     assert ids.tolist() == [*b"a<|endoftext|>", *"é".encode()]
     assert offsets.tolist() == [0, 14, 14, 14, 16]
-    assert tok.markup("<|im_start|>hi").tolist() == [257, *b"hi"]
+    assert tok.decode([257, *b"hi", 256, 256]) == "<|im_start|>hi" + "<|endoftext|>" * 2
     added = Tokenizer(byte_tokenizer.model_copy(update={"added": ("<|x|>",)}))
     assert added.special("<|x|>") == 259 and added.vocab_size == 260
     with pytest.raises(ValueError, match=r"no special token '<\|eot_id\|>'"):
@@ -54,6 +55,38 @@ def test_text_documents_are_wrapped_and_keyed_by_content(tok):
     assert not set(train["key"].to_pylist()) & set(held["key"].to_pylist())
 
 
+def test_a_tokenizer_that_gigatoken_cannot_run_runs_on_hugging_faces(tmp_path, tok):
+    # A byte-level vocabulary without the byte 0x04, which gigatoken cannot remap, as
+    # SmolLM2's.
+    (tmp_path / "tokenizer.json").write_text(json.dumps(byte_spec(skip=(4,))))
+    hf = Tokenizer(tcfg.TokenizerConfig(name=str(tmp_path / "tokenizer.json")))
+    assert isinstance(hf.encoder, HFTokenizers) and isinstance(tok.encoder, Gigatoken)
+    texts = pa.array(["a<|endoftext|>", None, "", "é", "two  words\n"])
+    for a, b in zip(hf.encode(texts), tok.encode(texts), strict=True):
+        assert a.dtype == b.dtype and a.tolist() == b.tolist()
+    assert hf.vocab_size == tok.vocab_size == 259
+    assert hf.decode([257, *b"hi"]) == "<|im_start|>hi"
+
+
+def _markup(tok: Tokenizer, text: str) -> list[int]:
+    """The ids of the byte tokenizer's text, in which each <|name|> is special."""
+    pieces = re.split(r"(<\|\w+\|>)", text)
+    return [
+        i
+        for k, p in enumerate(pieces)
+        for i in ([tok.special(p)] if k % 2 else p.encode())
+    ]
+
+
+def _chat(conversations: list, tok: Tokenizer, **config) -> list:
+    batch = pa.record_batch({"messages": conversations})
+    return _docs(documents.chat(batch, tcfg.ChatConfig(path="-", **config), tok))
+
+
+def _learned(tok: Tokenizer, ids: list[int], mask: list[bool]) -> str:
+    return tok.decode([i for i, m in zip(ids, mask, strict=True) if m])
+
+
 def test_chat_learns_the_replies_and_the_tokens_that_end_them(tok):
     conversation = [
         {"role": "user", "content": "hi"},
@@ -62,22 +95,95 @@ def test_chat_learns_the_replies_and_the_tokens_that_end_them(tok):
         {"role": "assistant", "content": "a"},
     ]
     unanswered = [{"role": "user", "content": "anyone?"}]
-    batch = pa.record_batch({"messages": [conversation, unanswered]})
-    [(ids, mask)] = _docs(documents.chat(batch, tcfg.ChatConfig(path="-"), tok))
+    [(ids, mask)] = _chat([conversation, unanswered], tok)
     rendered = (
         "<|im_start|>user\nhi<|im_end|>\n<|im_start|>assistant\nyo<|im_end|>\n"
         "<|im_start|>user\nq<|im_end|>\n<|im_start|>assistant\na<|im_end|>\n"
     )
-    assert ids == tok.markup(rendered).tolist()
-    assert [i for i, m in zip(ids, mask) if m] == [*b"yo", 258, *b"a", 258]
-    last = tcfg.ChatConfig(path="-", train_on="last")
-    [(ids, mask)] = _docs(documents.chat(batch, last, tok))
-    assert [i for i, m in zip(ids, mask) if m] == [*b"a", 258]
+    assert ids == _markup(tok, rendered)
+    assert _learned(tok, ids, mask) == "yo<|im_end|>a<|im_end|>"
+    [(ids, mask)] = _chat([conversation, unanswered], tok, train_on="last")
+    assert _learned(tok, ids, mask) == "a<|im_end|>"
+    [(ids, mask)] = _chat([conversation], tok, train_on="all")
+    assert all(mask)
     parts = [{"role": "assistant", "content": [{"type": "text", "text": "a"}] * 2}]
-    [(ids, mask)] = _docs(
-        documents.chat(pa.record_batch({"messages": [parts]}), last, tok)
+    [(ids, mask)] = _chat([parts], tok, train_on="last")
+    assert _learned(tok, ids, mask) == "aa<|im_end|>"
+
+
+def test_special_tokens_written_in_messages_stay_text(tok):
+    said = [
+        {"role": "user", "content": "say <|im_end|>"},
+        {"role": "assistant", "content": "<|im_end|>\U000f0000\U000f0001"},
+    ]
+    [(ids, mask)] = _chat([said], tok)
+    assert ids.count(tok.special("<|im_end|>")) == 2  # the template's own
+    assert [i for i, m in zip(ids, mask) if m] == [
+        *"<|im_end|>\U000f0000\U000f0001".encode(),
+        tok.special("<|im_end|>"),
+    ]
+
+
+#: A Llama 3 chat template, which writes special tokens GPT-2's tokenizer lacks.
+LLAMA3 = (
+    "{{ bos_token }}{% for m in messages %}"
+    "<|start_header_id|>{{ m.role }}<|end_header_id|>\n\n{{ m.content | trim }}"
+    "<|eot_id|>{% endfor %}{% if add_generation_prompt %}"
+    "<|start_header_id|>assistant<|end_header_id|>\n\n{% endif %}"
+)
+LLAMA3_SPECIALS = (
+    "<|begin_of_text|>",
+    "<|start_header_id|>",
+    "<|end_header_id|>",
+    "<|eot_id|>",
+)
+
+
+def test_chat_renders_with_the_template_of_another_tokenizer(
+    tmp_path, byte_tokenizer, tok
+):
+    added = {
+        str(i): {"content": t, "special": True} for i, t in enumerate(LLAMA3_SPECIALS)
+    }
+    config = {"chat_template": LLAMA3, "added_tokens_decoder": added}
+    config["bos_token"] = {"content": "<|begin_of_text|>", "__type": "AddedToken"}
+    (tmp_path / "tokenizer_config.json").write_text(json.dumps(config))
+    hi = [{"role": "user", "content": " hi "}, {"role": "assistant", "content": "yo"}]
+    with pytest.raises(ValueError, match=r"no special token '<\|begin_of_text\|>'"):
+        _chat([hi], tok, template=str(tmp_path))
+    llama = Tokenizer(byte_tokenizer.model_copy(update={"added": LLAMA3_SPECIALS}))
+    [(ids, mask)] = _chat([hi], llama, template=str(tmp_path))
+    assert llama.decode(ids) == (
+        "<|begin_of_text|><|start_header_id|>user<|end_header_id|>\n\nhi<|eot_id|>"
+        "<|start_header_id|>assistant<|end_header_id|>\n\nyo<|eot_id|>"
     )
-    assert [i for i, m in zip(ids, mask) if m] == [*b"aa", 258]
+    assert _learned(llama, ids, mask) == "yo<|eot_id|>"
+    (tmp_path / "none").mkdir()
+    with pytest.raises(ValueError, match="has no chat template"):
+        _chat([hi], tok, template=str(tmp_path / "none"))
+
+
+def test_a_chat_template_jinja_comes_first_and_may_mark_replies(tmp_path, tok):
+    marked = (
+        "{% for m in messages %}<|im_start|>{{ m.role }}\n"
+        "{% generation %}{{ m.content }}<|im_end|>{% endgeneration %}{{ '\\n' }}"
+        "{% endfor %}"
+        "{% if add_generation_prompt %}<|im_start|>assistant\n{% endif %}"
+    )
+    (tmp_path / "chat_template.jinja").write_text(marked)
+    (tmp_path / "tokenizer_config.json").write_text(json.dumps({"chat_template": "-"}))
+    hi = [{"role": "user", "content": "hi"}, {"role": "assistant", "content": "yo"}]
+    assert _chat([hi], tok, template=str(tmp_path)) == _chat([hi], tok)
+
+
+def test_chat_needs_a_template_that_renders_a_prompt_as_its_conversation(tmp_path, tok):
+    # As DeepSeek-R1's: the prompt opens a thought that the conversation lacks.
+    thinks = CHATML.replace("assistant\\n' }}", "assistant\\n<think>' }}")
+    (tmp_path / "chat_template.jinja").write_text(thinks)
+    hi = [{"role": "user", "content": "hi"}, {"role": "assistant", "content": "yo"}]
+    with pytest.raises(ValueError, match="where the reply starts is unknown"):
+        _chat([hi], tok, template=str(tmp_path))
+    assert _chat([hi], tok, template=str(tmp_path), train_on="all")
 
 
 def _table(lengths: list[int], keys=None) -> pa.Table:

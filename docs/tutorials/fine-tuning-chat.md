@@ -77,7 +77,8 @@ Create `mine/chat.bux`:
 
 ```bux
 # Supervised fine-tuning data: conversations rendered with ChatML, learned where the
-# assistant speaks. GPT-2 has no ChatML tokens, so they are added after its vocabulary.
+# assistant speaks. GPT-2 has no chat template, so this borrows SmolLM's, and none of
+# ChatML's tokens, so they are added after its vocabulary.
 d_model    = 128
 vocab_size = 50304                 # 50257 + 2 added tokens fit under the padding
 
@@ -88,7 +89,7 @@ block = [norm attn] [norm ffn]
 model = embed block^4 norm head(tied=true)
 
 tokenizer = tokenizer(name="gpt2", added=["<|im_start|>", "<|im_end|>"])
-chats     = chat(path="data/chats/*.parquet", template=chatml)
+chats     = chat(path="data/chats/*.parquet", template="HuggingFaceTB/SmolLM-135M-Instruct")
 packing   = best_fit(long=drop)    # a conversation cut short may lose its answer
 
 data      = chats(split=[0, 0.95])
@@ -104,13 +105,14 @@ log       = log(every=25)
 
 What is new:
 
-- `chat(path=..., template=chatml)` ({bux}`chat`) renders each conversation with a
-  template: `chatml` (Qwen, SmolLM) or `llama3`. The column is `messages` unless you
-  say `column="..."`.
+- `chat(path=..., template=...)` ({bux}`chat`) renders each conversation with a
+  Hugging Face tokenizer's chat template, as transformers does: the run's tokenizer's
+  own, or another's. GPT-2's has none, so `template` borrows SmolLM's, which is
+  ChatML. The column is `messages` unless you say `column="..."`.
 - A template writes special tokens, which the tokenizer must have. GPT-2 has none of
   ChatML's, so `added` appends them after its vocabulary, as ids 50257 and 50258;
-  `vocab_size = 50304` has room for them. A tokenizer that has them already, as
-  Qwen3's and SmolLM2's do, needs no `added`.
+  `vocab_size = 50304` has room for them. A tokenizer with a chat template of its own,
+  as Qwen3's and SmolLM2's, needs neither `template` nor `added`.
 - `best_fit(long=drop)` drops a conversation longer than a row rather than split it,
   as a split one may lose its answer. Conversations shorter than a row are packed
   together, each seeing only itself.
@@ -121,10 +123,10 @@ What is new:
 
 ```console
 $ bux prepare mine/chat.bux
-chat-9fdb6d0034: 2,843 documents, 155,873 tokens -> 1,417 rows of 128, 85.9% filled, 21.9% targets, 0 tokens cut (0.6s)
-data/packed/chat-9fdb6d0034
-chat-3b9539c43f: 158 documents, 8,851 tokens -> 83 rows of 128, 83.3% filled, 21.3% targets, 0 tokens cut (0.5s)
-data/packed/chat-3b9539c43f
+chat-afec86b5be: 2,843 documents, 155,873 tokens -> 1,417 rows of 128, 85.9% filled, 21.9% targets, 0 tokens cut (0.6s)
+data/packed/chat-afec86b5be
+chat-719b1bd2be: 158 documents, 8,851 tokens -> 83 rows of 128, 83.3% filled, 21.3% targets, 0 tokens cut (0.5s)
+data/packed/chat-719b1bd2be
 ```
 
 Only 21.9% of the tokens are targets: the replies. To see which, decode the first
@@ -142,19 +144,12 @@ from bux.data.tokenizer import load
 from bux.train.config import TokenizerConfig
 
 tok = load(TokenizerConfig(name="gpt2", added=("<|im_start|>", "<|im_end|>")))
-specials = {i: s for s, i in tok.specials.items()}
-
-
-def text(ids: list[int]) -> str:
-    return "".join(specials.get(i) or tok.encoder.decode([i]).decode() for i in ids)
-
-
-rows = pq.read_table("data/packed/chat-9fdb6d0034/part-00000.parquet")
+rows = pq.read_table("data/packed/chat-afec86b5be/part-00000.parquet")
 row = rows.slice(0, 1).to_pylist()[0]
 end = row["position_ids"].index(0, 1)  # where the second conversation starts
 pairs = zip(row["input_ids"][:end], row["loss_mask"][:end], strict=True)
 for learned, run in itertools.groupby(pairs, key=lambda pair: pair[1]):
-    shown = text([i for i, _ in run])
+    shown = tok.decode([i for i, _ in run])
     print(f"[{shown}]" if learned else shown, end="")
 ```
 
@@ -193,10 +188,10 @@ user's turns are context only.
 
 ```console
 $ bux prepare mine/chat.bux chats.train_on=last
-chat-6cd35c8f00: 2,843 documents, 155,873 tokens -> 1,417 rows of 128, 85.9% filled, 11.0% targets, 0 tokens cut (0.6s)
+chat-6a5600ec5e: 2,843 documents, 155,873 tokens -> 1,417 rows of 128, 85.9% filled, 11.0% targets, 0 tokens cut (0.6s)
 ...
 $ bux prepare mine/chat.bux chats.train_on=all
-chat-448f85876a: 2,843 documents, 155,873 tokens -> 1,417 rows of 128, 85.9% filled, 84.4% targets, 0 tokens cut (0.6s)
+chat-e83ed8581f: 2,843 documents, 155,873 tokens -> 1,417 rows of 128, 85.9% filled, 84.4% targets, 0 tokens cut (0.6s)
 ...
 ```
 
@@ -242,7 +237,7 @@ then preparing fails at once, as it should:
 `examples/experiments/sft.bux` is the same recipe at a useful size: a 12-layer,
 Qwen3-shaped model trained from scratch on
 [SmolTalk](https://huggingface.co/datasets/HuggingFaceTB/smol-smoltalk), in Qwen3's
-tokens, which have ChatML's special tokens already. Without its header comment:
+tokens, rendered with Qwen3's own chat template. Without its header comment:
 
 ```bux
 use llama3_8b
@@ -256,7 +251,7 @@ ffn.intermediate_size = 1536
 model = embed block^12 norm head(tied=true)
 
 tokenizer = tokenizer(name="Qwen/Qwen3-0.6B")
-smoltalk  = chat(path="data/smol-smoltalk/data/train-*.parquet", template=chatml)
+smoltalk  = chat(path="data/smol-smoltalk/data/train-*.parquet")
 packing   = best_fit(long=drop)
 
 data      = smoltalk(split=[0, 0.99])
@@ -284,7 +279,7 @@ tokenizer=tokenizer(name="Qwen/Qwen3-0.6B") packing=best_fit(long=drop)
 $ bux plan examples/experiments/sft.bux
 1 run
 id          params  tokens  tok/param  flops/tok  gpus  params/gpu  optim/gpu  bubble  run
-e3b7bfb457  114M    131M    1.1        759M       1     435MiB      870MiB     0%      sft
+b96ed37410  114M    131M    1.1        759M       1     435MiB      870MiB     0%      sft
 ```
 
 To train it, download the data with the Hugging Face CLI (from the `huggingface_hub`
@@ -302,7 +297,7 @@ bux launch examples/experiments/sft.bux
 
 | you wrote                                  | it does                                       |
 |--------------------------------------------|-----------------------------------------------|
-| `chat(path=..., template=chatml)`          | conversations in the OpenAI format, rendered with ChatML |
+| `chat(path=..., template=...)`             | conversations in the OpenAI format, rendered with a tokenizer's chat template |
 | `tokenizer(..., added=[...])`              | special tokens after the vocabulary, for a template it lacks |
 | `train_on=assistant`, `last`, `all`        | which messages are targets                    |
 | `best_fit(long=drop)`                      | drop what does not fit a row, pack the rest   |

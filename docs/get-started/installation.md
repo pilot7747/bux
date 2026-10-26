@@ -35,7 +35,7 @@ source .venv/bin/activate
 ## What gets installed
 
 `uv sync` installs bux's dependencies (JAX, Flax, optax, orbax, pydantic, pyarrow,
-gigatoken, ...) and two dependency groups that `pyproject.toml` makes default:
+gigatoken, Hugging Face's tokenizers, ...) and two dependency groups that `pyproject.toml` makes default:
 
 | group  | what it has                                                       | skip it with  |
 |--------|-------------------------------------------------------------------|---------------|

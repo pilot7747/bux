@@ -73,34 +73,52 @@ def _byte_alphabet() -> dict[int, str]:
     }
 
 
-@pytest.fixture(scope="session")
-def byte_tokenizer(tmp_path_factory) -> tcfg.TokenizerConfig:
-    """A byte-level BPE without merges: every byte is the token of its value, and the
-    special tokens come after them."""
-    spec = {
+#: SmolLM-135M-Instruct's chat template: ChatML, a message at a time.
+CHATML = (
+    "{% for message in messages %}{{'<|im_start|>' + message['role'] + '\\n' + "
+    "message['content'] + '<|im_end|>' + '\\n'}}{% endfor %}"
+    "{% if add_generation_prompt %}{{ '<|im_start|>assistant\\n' }}{% endif %}"
+)
+
+
+def byte_spec(skip: tuple[int, ...] = ()) -> dict:
+    """The tokenizer.json of a byte-level BPE without merges: every byte is the token
+    of its value, but those of `skip`, and the special tokens come after them."""
+    byte_level = {"add_prefix_space": False, "trim_offsets": True, "use_regex": True}
+    bpe = {"dropout": None, "unk_token": None, "fuse_unk": False}
+    bpe |= {"continuing_subword_prefix": None, "end_of_word_suffix": None}
+    return {
         "version": "1.0",
+        "truncation": None,
+        "padding": None,
         "added_tokens": [
             {"id": 256 + i, "content": s, "special": True, "normalized": False}
             | {"single_word": False, "lstrip": False, "rstrip": False}
             for i, s in enumerate(SPECIALS)
         ],
         "normalizer": None,
-        "pre_tokenizer": {
-            "type": "ByteLevel",
-            "add_prefix_space": False,
-            "use_regex": True,
-        },
+        "pre_tokenizer": {"type": "ByteLevel"} | byte_level,
         "post_processor": None,
-        "decoder": {"type": "ByteLevel"},
+        "decoder": {"type": "ByteLevel"} | byte_level,
         "model": {
             "type": "BPE",
-            "vocab": {c: b for b, c in _byte_alphabet().items()},
+            "vocab": {c: b for b, c in _byte_alphabet().items() if b not in skip},
             "merges": [],
-        },
+        }
+        | bpe,
     }
-    path = tmp_path_factory.mktemp("tokenizer") / "tokenizer.json"
-    path.write_text(json.dumps(spec))
-    return tcfg.TokenizerConfig(name=str(path))
+
+
+@pytest.fixture(scope="session")
+def byte_tokenizer(tmp_path_factory) -> tcfg.TokenizerConfig:
+    """The byte-level BPE of `byte_spec`, beside a tokenizer_config.json whose chat
+    template is ChatML, as a Hub repo has them."""
+    folder = tmp_path_factory.mktemp("tokenizer")
+    (folder / "tokenizer.json").write_text(json.dumps(byte_spec()))
+    added = {256 + i: {"content": s, "special": True} for i, s in enumerate(SPECIALS)}
+    config = {"chat_template": CHATML, "added_tokens_decoder": added}
+    (folder / "tokenizer_config.json").write_text(json.dumps(config))
+    return tcfg.TokenizerConfig(name=str(folder / "tokenizer.json"))
 
 
 def corpus(folder, n=600) -> str:

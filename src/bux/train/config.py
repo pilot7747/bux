@@ -74,15 +74,19 @@ class ChatConfig(Config):
     of Parquet files, `content` a string or a list of `{type: text, text}` parts,
     rendered with a chat template and tokenized by the run's `tokenizer`.
 
-    The loss is on the replies `train_on` picks, each with the token that ends it
-    (`<|im_end|>`, `<|eot_id|>`), so that the model learns to stop. A conversation
-    with nothing to learn is dropped. Like `text`, it is prepared once into rows by
-    the run's `packing`."""
+    The template is a Hugging Face tokenizer's Jinja chat template, rendered as
+    transformers renders it: the run's tokenizer's own, or another's. The loss is on
+    the replies `train_on` picks, each from where the template's prompt for it ends
+    through the special token that ends it (`<|im_end|>`, `<|eot_id|>`), so that the
+    model learns to stop. A conversation with nothing to learn is dropped. Like
+    `text`, it is prepared once into rows by the run's `packing`."""
 
     type: Literal["chat"] = "chat"
     path: str  # a glob of Parquet files, relative to the working directory
     column: str = "messages"  # the column that holds each conversation's messages
-    template: Literal["chatml", "llama3"] = "chatml"  # chatml: Qwen's, SmolLM's
+    # The Hub repo or folder whose chat template renders the conversations, as
+    # "HuggingFaceTB/SmolLM-135M-Instruct"; none: the tokenizer's own.
+    template: str | None = None
     # assistant: every reply; last: the last reply alone; all: every token, prompts
     # and template too.
     train_on: Literal["assistant", "last", "all"] = "assistant"
@@ -142,8 +146,9 @@ DataConfig = Annotated[
 
 
 class TokenizerConfig(Config):
-    """A BPE tokenizer, run by gigatoken: a Hugging Face Hub repo or a
-    `tokenizer.json`. `text` and `chat` data need one.
+    """A Hugging Face tokenizer: a Hub repo or a `tokenizer.json`, run by gigatoken,
+    or by Hugging Face's tokenizers where gigatoken cannot run it (SmolLM2's, or one
+    that is not BPE). `text` and `chat` data need one.
 
     Special tokens written in documents stay text, as tiktoken's `encode_ordinary`
     keeps them: a web page that mentions `<|endoftext|>` does not end there. Only
