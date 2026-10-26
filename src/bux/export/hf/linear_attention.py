@@ -129,6 +129,23 @@ def decayed(
     return _by_chunks(_decayed_chunk, (q, k, v, log_decay), v, state)
 
 
+def rank_one(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    log_decay: torch.Tensor,
+    a: torch.Tensor,
+    b: torch.Tensor,
+    state: torch.Tensor | None = None,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Run bux's recurrence with its rank-one term, ``S_t = diag(w_t) S_{t-1} + b_t
+    (a_t^T S_{t-1}) + k_t v_t^T``, from `state`: one position as `recurrence` runs
+    it, more by chunks. Shapes as `recurrence`'s; returns its outputs and state."""
+    if q.shape[1] == 1:
+        return recurrence(q, k, v, log_decay, state, a, b)
+    return _by_chunks(_rank_one_chunk, (q, k, v, log_decay, a, b), v, state)
+
+
 def _zero_state(k: torch.Tensor, v: torch.Tensor) -> torch.Tensor:
     """Return the state of no positions, b h dk dv, in float32."""
     b, _, h, dk = k.shape
@@ -161,13 +178,16 @@ def _by_chunks(
     return out.to(v.dtype), s
 
 
-def _pairwise(G: torch.Tensor) -> torch.Tensor:
+def _pairwise(G: torch.Tensor, before: torch.Tensor | None = None) -> torch.Tensor:
     """Return the decays ``exp(G_t - G_s)`` from position s to t of a chunk, b h c c
-    e, 0 where s is after t, from the cumulative log decays G, b h c e. No exponent
-    is positive."""
+    e, 0 where s is after t, from the cumulative log decays G, b h c e; with
+    `before`, G up to the position before each, the decays ``exp(before_t - G_s)``,
+    0 where s is not before t. No exponent is positive."""
     c = G.shape[-2]
-    after = torch.ones(c, c, dtype=torch.bool, device=G.device).triu(1)
-    diff = G[..., :, None, :] - G[..., None, :, :]
+    to = G if before is None else before
+    after = torch.ones(c, c, dtype=torch.bool, device=G.device)
+    after = after.triu(1 if before is None else 0)
+    diff = to[..., :, None, :] - G[..., None, :, :]
     return diff.masked_fill(after[..., None], float("-inf")).exp()
 
 
@@ -226,6 +246,34 @@ def _delta_chunk(
     u = w - kc @ s
     out = (q * G.exp()) @ s + _inner(q, k, D) @ u
     return out, _carry(s, k, G, u)
+
+
+def _rank_one_chunk(
+    s: torch.Tensor,
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    g: torch.Tensor,
+    a: torch.Tensor,
+    b: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Run `rank_one` over one chunk from the state s: its outputs and last state.
+
+    What each position reads of the state before it, ``x_t = a_t^T S_{t-1}``,
+    solves ``(I - L) X = (A exp(G')) S + L_k V``, with ``L[t, s] = a_t^T
+    diag(exp(G'_t - G_s)) b_s`` below the diagonal (L_k with k_s), for G' the log
+    decay up to the position before t (``chunkwise``'s form in bux).
+    """
+    G = g.cumsum(-2)
+    before = G - g
+    D, R = _pairwise(G), _pairwise(G, before)
+    eye = torch.eye(k.shape[-2], dtype=k.dtype, device=k.device)
+    rhs = (a * before.exp()) @ s + _inner(a, k, R) @ v
+    system = eye - _inner(a, b, R)
+    x = torch.linalg.solve_triangular(system, rhs, upper=False, unitriangular=True)
+    out = (q * G.exp()) @ s + _inner(q, b, D) @ x + _inner(q, k, D) @ v
+    last = (G[..., -1:, :] - G).exp()
+    return out, _carry(s, b, G, x) + (k * last).transpose(-1, -2) @ v
 
 
 class LowRank(nn.Module):

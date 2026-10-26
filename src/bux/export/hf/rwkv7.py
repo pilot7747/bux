@@ -1,7 +1,7 @@
 """RWKV-7 time mixing, exported: bux's ``rwkv7``.
 
 Its state is linear attention's, by the generalized delta rule
-(``linear_attention.recurrence``, one position at a time). Its token shift reads the
+(``linear_attention.rank_one``, by chunks in a prefill). Its token shift reads the
 token before, which decoding keeps in the layer's cache slot as a conv state of one
 position, beside the recurrent state.
 """
@@ -15,7 +15,7 @@ from torch import nn
 
 from .common import Ctx, Norm, Site
 from .conv import keep_state, previous_state, real_tokens, without_padding
-from .linear_attention import LowRank, hold, l2norm, recurrence
+from .linear_attention import LowRank, hold, l2norm, rank_one
 
 
 class RWKV7(nn.Module):
@@ -98,7 +98,7 @@ class RWKV7(nn.Module):
         kk = l2norm(kk, eps=1e-12)
         written, log_w, step = hold(real_tokens(ctx, t), k, log_w, kk * a)
         state = previous_state(ctx, slot)
-        o, state = recurrence(r, written, v, log_w, state, -kk, step)
+        o, state = rank_one(r, written, v, log_w, -kk, step, state)
         keep_state(ctx, slot, state)
         o = self.norm(o) + (r * k * self.r_k).sum(-1, keepdim=True) * v
         o = o.reshape(b, t, -1)
