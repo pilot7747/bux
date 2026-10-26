@@ -83,7 +83,8 @@ rows:
 2. else, in rows of documents or with a window, FlashAttention-4's (`fa4`), which
    takes sinks, a soft cap and MLA's head dims;
 3. else cuDNN's packed layout, in rows of 8192 positions or more, or with a window;
-4. else tokamax's kernel, which takes sinks and a soft cap;
+4. else tokamax's kernel, which takes sinks and a soft cap, in heads of up to 128
+   channels (past that its SM100 backward does not fit in shared memory);
 5. in float32, tokamax's Triton kernel where there are no sinks;
 6. else cuDNN where it takes the call, else `xla`.
 
@@ -114,7 +115,7 @@ too for what only `xla` has ([below](#constraints-and-errors)).
 |---|---|---|
 | `xla` | everything | |
 | `cudnn` | bfloat16 or float16; keys' and values' head dims equal, up to 256 in steps of 8 (its packed layout gets MLA's wrong) | `NotImplementedError` for a soft cap, sinks, positions over `context` (`ulysses` gives it whole rows), or a call it cannot take |
-| `tokamax` | a GPU, the `cuda` extra (Linux only), bfloat16 or float16 | `NotImplementedError` otherwise |
+| `tokamax` | a GPU, the `cuda` extra (Linux only), bfloat16 or float16; on a B300, heads of up to 128 channels to train (`auto` passes wider ones by) | `NotImplementedError` otherwise; a wider head's backward fails to compile, out of shared memory |
 | `fa4` | a Blackwell GPU (SM 10.x), the `cuda` extra, bfloat16 or float16; keys' and values' head dims equal, up to 128 in steps of 8, or 192 and 128 (MLA) | `NotImplementedError` for positions over `context` (`ulysses` gives it whole rows), or a call it cannot take |
 | `ulysses` | `context` dividing a device's heads; kv heads it does not divide are repeated | `ValueError` naming both counts |
 | `ring` | documents, a window, a soft cap and sinks; tokamax's kernel on a GPU, jnp's on a CPU | |

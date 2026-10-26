@@ -38,7 +38,7 @@ _NOT_COPIED = {"__init__.py"}
 
 def save(
     arch: ir.Architecture,
-    model: Model,
+    model: Model | None,
     out: Path | str,
     *,
     dtype: torch.dtype = torch.float32,
@@ -49,7 +49,8 @@ def save(
     Args:
         arch: The architecture.
         model: Its bux model, whose weights to export, built with ``methods.repeat``
-            ``unroll``.
+            ``unroll``; None writes no weights, for vLLM to time the architecture
+            on random ones (``load_format="dummy"``).
         out: The directory, made if missing; files in it of the same names are
             replaced.
         dtype: The weights' dtype in the checkpoint.
@@ -93,6 +94,8 @@ def save(
         "bux_sites": p.sites(),
     }
     (out / "config.json").write_text(json.dumps(config, indent=2) + "\n")
+    if model is None:
+        return p
     weights = tensors(p, model, _converter)
     save_file(
         _torch(weights, dtype), out / "model.safetensors", metadata={"format": "pt"}

@@ -529,7 +529,10 @@ class EvalConfig(Config):
     """Held-out loss every `every` steps and after the last, over the same `batches`
     batches of `data` each time: the first head's mean cross-entropy over their
     targets, logged as `eval_loss`, and with a `tokenizer`, its bits per byte,
-    `eval_bpb`. A batch has the run's `batch` rows of `seq_len` tokens.
+    `eval_bpb`. A batch has the run's `batch` rows of `seq_len` tokens, before any
+    phase of its curriculum, or the eval's own: `eval(name="long", data=long,
+    seq_len=16k, batch=16)` holds a model to long rows, as a long-context phase
+    trains on.
 
     Bits per byte compare across tokenizers: the targets' nats over their bytes of
     text, in bits. A special token stands for no text, so they leave it out.
@@ -549,6 +552,8 @@ class EvalConfig(Config):
     data: DataConfig  # a source or a mixture, as `data` takes
     every: Positive = 1000  # steps between evaluations
     batches: Positive = 10  # batches an evaluation reads, the same ones each time
+    seq_len: Positive | None = None  # tokens a row; none: the run's seq_len
+    batch: Positive | None = None  # rows a batch; none: the run's batch
 
 
 def _each(evals: EvalConfig | tuple[EvalConfig, ...] | None) -> tuple[EvalConfig, ...]:
@@ -1317,6 +1322,13 @@ def leaves(c: DataConfig) -> tuple[Source, ...]:
 def evals(t: TrainConfig) -> tuple[EvalConfig, ...]:
     """Return the run's evals, in order: none, one, or those of its list."""
     return _each(t.eval)
+
+
+def evaluated(t: TrainConfig, e: EvalConfig) -> TrainConfig:
+    """Return `t` with the shape of eval `e`'s batches: its `seq_len` and `batch`
+    where it sets them."""
+    shape = {k: v for k in ("seq_len", "batch") if (v := getattr(e, k)) is not None}
+    return t.model_copy(update=shape) if shape else t
 
 
 def objective(t: TrainConfig) -> ObjectiveConfig:

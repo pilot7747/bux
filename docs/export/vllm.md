@@ -22,6 +22,10 @@ pip install vllm "bux-vllm @ git+https://github.com/pilot7747/bux#subdirectory=s
 pip install vllm ./src/bux_vllm
 ```
 
+With uv, install it from outside the checkout (`uv pip install --python VENV vllm
+/path/to/bux/src/bux_vllm`): inside it, `uv pip` takes bux's own `[tool.uv]` settings,
+whose pinned cudnn-frontend wheel is for Python 3.14 alone, and fails on vLLM's 3.12.
+
 vLLM loads it by its entry point (`vllm.general_plugins`), in every process it
 starts: it registers the config of `model_type` `bux`, so that no remote code runs,
 and the model class `BuxForCausalLM`.
@@ -58,6 +62,15 @@ The model's output is its first head: layers after it, a multi-token prediction
 module's, are not built, and vLLM skips their weights (it drafts tokens by MTP only
 for the model types it knows). A layer or setting the plugin does not run raises
 `NotImplementedError` as the model is built, naming it.
+
+On a B300 (SM 10.3), vLLM 0.32 picks FlashInfer's CUTLASS kernels for an MoE, which
+it compiles the first time it runs, and the build fails ("ninja: build stopped",
+in TensorRT-LLM's `MoeGemmRunner`; 2026-10-26). Pick vLLM's Triton kernels instead:
+`--moe-backend triton`, or `moe_backend="triton"` among the engine's arguments.
+
+An export of a `.bux` file has no weights ([Exporting an
+architecture](index.md#exporting-an-architecture)); vLLM serves it on random ones,
+`--load-format dummy`, to time it.
 
 ## How it works
 

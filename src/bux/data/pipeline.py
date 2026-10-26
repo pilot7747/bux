@@ -168,11 +168,15 @@ def jobs(config: tcfg.TrainConfig) -> list[Job]:
 
     Returns:
         A job for each ``text`` and ``chat`` source of ``data``, of each phase of the
-        ``curriculum`` at its seq_len, and of every ``eval``, mixes included, in the
-        order written; none for ``tokens`` or ``synthetic``.
+        ``curriculum`` at its seq_len, and of every ``eval`` at its own, mixes
+        included, in the order written; none for ``tokens`` or ``synthetic``.
     """
     read = [(s, c) for _, c in curriculum.phases(config) for s in tcfg.leaves(c.data)]
-    read += [(s, config) for e in tcfg.evals(config) for s in tcfg.leaves(e.data)]
+    read += [
+        (s, tcfg.evaluated(config, e))
+        for e in tcfg.evals(config)
+        for s in tcfg.leaves(e.data)
+    ]
     found = (Job.of(s, c) for s, c in read if isinstance(s, tcfg.DOCUMENTS))
     return list(dict.fromkeys(found))
 

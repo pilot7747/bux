@@ -15,6 +15,7 @@ Usage::
     json      print the runs' IR (or the model's) as JSON
 
     bux export RUN_DIR OUT [--step N] [--dtype DTYPE] [--check]
+    bux export FILE.bux OUT [SETTING=VALUE ...] [--entry NAME]
 
 Settings after the file override the file's own, as if written at its end:
 ``bux train speedrun.bux optimizer.lr=0.03 'steps = 2k'``. Alternatives there make a
@@ -30,8 +31,10 @@ A file with dimensions, ``optimizer.lr = log_uniform(1e-4, 1e-2)``, is a search
 (`bux.search`): ``bux train`` and ``bux launch`` train its trials, a run each, and
 ``bux results`` prints them, the best first.
 
-``bux export`` takes a trained run's directory, not a file, and writes its model as a
-transformers model directory (`bux.export.runs`).
+``bux export`` takes a trained run's directory and writes its model as a transformers
+model directory (`bux.export.runs`). Given a ``.bux`` file, it writes the file's model
+without weights, which vLLM serves on random ones (``--load-format dummy``): to time
+an architecture before training it.
 """
 
 import argparse
@@ -387,12 +390,24 @@ def export_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(
         prog="bux export",
         description="Write a trained run's model as a transformers model directory: "
-        "its code, its weights, its tokenizer and a model card.",
+        "its code, its weights, its tokenizer and a model card. Given a .bux file, "
+        "write its model's code and config alone, without weights.",
     )
     p.add_argument(
-        "run", metavar="RUN_DIR", help="the run's directory: runs/<name>-<id>"
+        "run",
+        metavar="RUN_DIR",
+        help="the run's directory, runs/<name>-<id>; or a .bux file",
     )
     p.add_argument("out", metavar="OUT", help="the directory to write")
+    p.add_argument(
+        "settings",
+        nargs="*",
+        metavar="SETTING=VALUE",
+        help="a .bux file's: statements that redefine the file's own",
+    )
+    p.add_argument(
+        "--entry", default="model", help="a .bux file's definition (default: model)"
+    )
     p.add_argument(
         "--step",
         type=int,
@@ -414,6 +429,10 @@ def export_parser() -> argparse.ArgumentParser:
 
 
 def _export(args: argparse.Namespace) -> int:
+    if args.run.endswith(".bux"):
+        return _export_file(args)
+    if args.settings:
+        return _error("bux export: settings go with a .bux file, not a run")
     from transformers.utils import logging
 
     from bux.export.runs import describe, export
@@ -436,6 +455,34 @@ def _export(args: argparse.Namespace) -> int:
         done.report.check()
     except AssertionError as err:
         return _error(f"bux export: the export disagrees with bux: {err}")
+    return 0
+
+
+def _export_file(args: argparse.Namespace) -> int:
+    if args.step is not None or args.check:
+        return _error("bux export: a .bux file has no weights to --step or --check")
+    import torch
+
+    from bux.export.huggingface import save
+    from bux.lang import compile
+
+    with open(args.run, encoding="utf-8") as f:
+        source = f.read()
+    try:
+        arch = compile(
+            source, entry=args.entry, filename=args.run, overrides=args.settings
+        )
+        save(arch, None, args.out, dtype=getattr(torch, args.dtype or "bfloat16"))
+    except BuxError as err:
+        return _error(str(err))
+    except NotImplementedError as err:
+        return _error(f"bux export: {err}")
+    from flax import nnx
+
+    from bux.architecture import Model, num_params
+
+    n = num_params(nnx.eval_shape(lambda: Model(arch, rngs=nnx.Rngs(0))))
+    print(f"{args.run}: {_si(n)} parameters exported to {args.out}, without weights")
     return 0
 
 

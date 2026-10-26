@@ -213,6 +213,25 @@ layers rounds faster ([Float32 and depth](#float32-and-depth)). Greedy tokens mu
 equal: only a tie between the two top logits closer than float32's error could flip
 one.
 
+## Exporting an architecture
+
+Given a `.bux` file, `bux export` writes the file's model as an export with no
+weights: its code and its `config.json`, no `model.safetensors`. vLLM serves it on
+random weights (`--load-format dummy`), so an architecture's speed can be measured at
+any size before anything is trained. Settings after `OUT` change the file's as they
+do for `bux train`:
+
+```console
+$ bux export examples/experiments/old_vs_new/new_2026.bux exported/new-3072 'd_model = 3072'
+examples/experiments/old_vs_new/new_2026.bux: 91.1B parameters exported to exported/new-3072, without weights
+```
+
+The config's `dtype` is bfloat16, or `--dtype`; `--entry` exports another definition,
+as for `bux check`. The model is never built, only its shapes, so a model of a hundred
+billion parameters exports in seconds on a laptop. The tutorial
+[Old against new at the same serving cost](../tutorials/old-vs-new.md) times a
+family of widths so.
+
 ## Softmax attention
 
 `gqa` and `mla` attend by transformers' attention interface (`eager`, `sdpa`,
