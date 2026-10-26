@@ -129,34 +129,31 @@ def plan(arch: ir.Architecture) -> Plan:
 
 def scope(root: ir.Node, *, own: bool, top: bool = False) -> Scope:
     """Return the scope of the module computing `root`: `own` says whether `root` is
-    the shared node the scope is for, rather than a call of it."""
+    the shared node the scope is for, rather than a call of it. The model's scope
+    (`top`) names its repeat of the most passes ``layers``."""
     s = Scope(root)
+    hints: dict[Pos, str] = {}
 
     def visit(node: ir.Node, pos: Pos) -> None:
         if node.share is not None and not (own and pos == ()):
             return
         match node:
             case ir.Layer():
-                s.names[pos] = s.name(node.label or node.config.type)
+                hints[pos] = node.label or node.config.type
             case ir.Repeat(body=body):
                 if body.share is None:
-                    s.names[pos] = s.name(f"{body.label}s" if body.label else "blocks")
+                    hints[pos] = f"{body.label}s" if body.label else "blocks"
                     s.blocks[pos] = scope(body, own=False)
             case _:
                 for i, child in enumerate(ir.children(node)):
                     visit(child, (*pos, i))
 
     visit(root, ())
-    if top:
-        _name_layers(s)
+    if top and s.blocks and "layers" not in hints.values():
+        hints[max(s.blocks, key=lambda p: _passes(root, p))] = "layers"
+    for pos, hint in hints.items():
+        s.names[pos] = s.name(hint)
     return s
-
-
-def _name_layers(s: Scope) -> None:
-    """Name the scope's repeat of the most passes ``layers``."""
-    repeats = [p for p in s.blocks if p in s.names]
-    if repeats and "layers" not in s.names.values():
-        s.names[max(repeats, key=lambda p: _passes(s.root, p))] = "layers"
 
 
 def _passes(root: ir.Node, pos: Pos) -> int:

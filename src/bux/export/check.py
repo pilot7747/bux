@@ -188,7 +188,7 @@ def _load(where: Path, impl: str, experts: str | None = None) -> Any:
 def _heads(hf: Any, tokens: Int[np.ndarray, "b t"]) -> list[np.ndarray]:
     """Return every head's logits of transformers' run, as numpy."""
     with torch.no_grad():
-        heads, _ = hf.model(torch.from_numpy(tokens).long())
+        heads, _ = hf.model(torch.tensor(tokens, dtype=torch.long))
     return [h.float().numpy() for h in heads]
 
 
@@ -200,11 +200,13 @@ def _relative(got: Float[np.ndarray, "..."], want: Float[np.ndarray, "..."]) -> 
 def _generate(
     hf: Any, prompt: Int[jax.Array, "1 t"], steps: int, cache: bool
 ) -> list[int]:
-    """Decode greedily with transformers' generate."""
+    """Decode greedily with transformers' generate. The mask is given: without one,
+    generate would take the prompt's tokens 0, the pad token, for padding."""
     with torch.no_grad():
-        ids = torch.from_numpy(np.asarray(prompt)).long()
+        ids = torch.tensor(np.asarray(prompt), dtype=torch.long)
         out = hf.generate(
             ids,
+            attention_mask=torch.ones_like(ids),
             max_new_tokens=steps,
             do_sample=False,
             use_cache=cache,
@@ -233,8 +235,10 @@ def _padded(hf: Any, tokens: Int[np.ndarray, "b t"], length: int, steps: int) ->
             pad_token_id=0,
         )
         for i, row in enumerate(rows):
+            ids = torch.from_numpy(row[None].astype(np.int64))
             alone = hf.generate(
-                torch.from_numpy(row[None].astype(np.int64)),
+                ids,
+                attention_mask=torch.ones_like(ids),
                 max_new_tokens=steps,
                 do_sample=False,
                 eos_token_id=None,
