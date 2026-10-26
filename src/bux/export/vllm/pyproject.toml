@@ -1,0 +1,19 @@
+# The vLLM plugin alone, as the package bux_vllm: `pip install src/bux/export/vllm`
+# into vLLM's environment. Its files import nothing of bux (see __init__.py).
+[project]
+name = "bux-vllm"
+version = "0.1.0"
+description = "Serve models exported by bux in vLLM"
+requires-python = ">=3.10"
+dependencies = ["vllm>=0.32"]
+
+[project.entry-points."vllm.general_plugins"]
+bux = "bux_vllm:register"
+
+[build-system]
+requires = ["setuptools>=69"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools]
+packages = ["bux_vllm"]
+package-dir = { bux_vllm = "." }

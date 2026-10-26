@@ -1,0 +1,374 @@
+"""Check that vLLM computes what bux does: models exported to transformers
+(`bux.export.huggingface`) and served by bux's vLLM plugin (`bux.export.vllm`).
+
+bux and vLLM do not share an environment (each pins its own PyTorch), so it runs in
+three steps:
+
+    # bux's environment: export each case and its prompts
+    JAX_PLATFORMS=cpu python scripts/vllm_parity.py export DIR [--dtype bfloat16]
+    # vLLM's, with the plugin (pip install src/bux/export/vllm): decode them
+    python scripts/vllm_parity.py run DIR [--tp 2] [--eager] [--tag TAG]
+    # bux's again: compare
+    JAX_PLATFORMS=cpu python scripts/vllm_parity.py compare DIR [--tag TAG]
+
+`run` decodes every case's prompts greedily in one batch of different lengths and
+keeps vLLM's log-probabilities of the whole vocabulary at every position: the
+prompts' (prefill) and each generated token's (decoding, by the KV cache or the
+recurrent state). `compare` runs bux on the same tokens, each prompt and vLLM's
+continuation, and checks every position: the token vLLM picked is bux's greedy pick
+(its log-probability within `--margin` of bux's best, 0 by default: the same token),
+and the log-probabilities agree within `--tolerance`. A greedy decode that agrees at
+every step is bux's own greedy decode. It prints a line a case, and exits with 1 if
+one disagrees.
+
+The cases are tiny models (d_model 128, a vocabulary of 256) of fresh weights,
+perturbed (`bux.export.check.perturbed`), one per family of layers and settings the
+plugin runs; `--only` picks some by name. In bfloat16 the export's weights are
+bfloat16, and bux computes in float32 from the same rounded weights, so that the
+difference is vLLM's arithmetic alone.
+"""
+
+import argparse
+import json
+import os
+import subprocess
+import sys
+from pathlib import Path
+from typing import Any, ClassVar
+
+import numpy as np
+
+HEAD = "d_model = 128\nvocab_size = 256\n"
+FFN = "ffn = gated_mlp(intermediate_size=256, activation=swish)\n"
+ATTN = "attn = gqa(num_heads=4, num_kv_heads=2, rope=rope())\n"
+BLOCK = "block = [rmsnorm attn] [rmsnorm ffn]\n"
+LLAMA = HEAD + ATTN + FFN + BLOCK
+EXPERT = "dense = gated_mlp(intermediate_size=64, activation=swish)\n"
+MOE_BLOCK = "block = [rmsnorm attn] [rmsnorm experts]\n"
+
+#: The cases, by name: a model each, as bux source.
+CASES = {
+    "llama": LLAMA + "model = embed block^2 rmsnorm head",
+    "qwen3": HEAD
+    + "attn = gqa(num_heads=4, num_kv_heads=2, qk_norm=rmsnorm, rope=rope(base=1e6))\n"
+    + FFN
+    + BLOCK
+    + "model = embed block^2 rmsnorm head(tied=true)",
+    "gpt2": HEAD
+    + "attn = gqa(num_heads=4, num_kv_heads=4, bias=true)\n"
+    + "ffn = mlp(intermediate_size=256, activation=gelu, bias=true)\n"
+    + "block = [layernorm(bias=true) attn] [layernorm(bias=true) ffn]\n"
+    + "model = embed(max_positions=128) block^2 layernorm(bias=true) head(tied=true)",
+    "rope": HEAD
+    + FFN
+    + "a = gqa(num_heads=4, num_kv_heads=1, rope=rope(fraction=0.5, layout=interleaved,"
+    " scaling=pi(factor=4)))\n"
+    + "b = gqa(num_heads=4, num_kv_heads=2, rope=rope(base=500000,"
+    " scaling=llama3(factor=8, original_max_len=16)))\n"
+    + "c = gqa(num_heads=4, num_kv_heads=2, rope=rope(scaling=yarn(factor=4,"
+    " original_max_len=16)))\n"
+    + "e = gqa(num_heads=4, num_kv_heads=2, rope=rope(scaling=yarn(factor=4,"
+    " original_max_len=16, attention_factor_on=softmax)))\n"
+    + "model = embed [rmsnorm a] [rmsnorm b] [rmsnorm ffn] [rmsnorm c] [rmsnorm e]"
+    " rmsnorm head",
+    "gemma": HEAD
+    + "ffn = gated_mlp(intermediate_size=256, activation=gelu_tanh)\n"
+    + "attn = gqa(num_heads=4, num_kv_heads=2, qk_norm=rmsnorm(zero_centered=true),"
+    " softcap=50, rope=rope())\n"
+    + "local = attn(sliding_window_size=8)\n"
+    + "norm = rmsnorm(zero_centered=true)\n"
+    + "block = [norm local norm] [norm ffn norm] [norm attn norm] [norm ffn norm]\n"
+    + "model = embed(scale_by_sqrt_dim=true) block^2 norm head(tied=true, softcap=30)",
+    "gpt-oss": HEAD
+    + FFN
+    + "attn = gqa(num_heads=4, num_kv_heads=2, sinks=true, bias=true,"
+    " output_bias=false, rope=rope())\n"
+    + "local = attn(sliding_window_size=8)\n"
+    + "model = embed [rmsnorm local] [rmsnorm ffn] [rmsnorm attn] [rmsnorm ffn]"
+    " rmsnorm head",
+    "mqa": HEAD
+    + "attn = gqa(num_heads=2, num_kv_heads=1, head_dim=64, rope=rope())\n"
+    + FFN
+    + BLOCK
+    + "model = embed block^2 rmsnorm head(bias=true)",
+    "graph": LLAMA.replace("block =", "shared block =")
+    + "model = embed @x0 block^3 [rmsnorm (attn - 0.5 * ffn)]"
+    " [$x0 scale(init=0.1, per_channel=true)] linear(features=128) gelu"
+    " rmsnorm head",
+    "moe": HEAD
+    + ATTN
+    + EXPERT
+    + "experts = moe(num_experts=8, top_k=2, num_shared_experts=1,"
+    " shared_expert_gate=true, normalize_top_k=false, expert=dense)\n"
+    + MOE_BLOCK
+    + "model = embed block^2 rmsnorm head",
+    "moe-grouped": HEAD
+    + ATTN
+    + EXPERT
+    + "experts = moe(num_experts=8, top_k=2, num_shared_experts=1, router=sigmoid,"
+    " routed_scaling_factor=2.5, num_groups=4, top_k_groups=2,"
+    " load_balancing=aux_free, expert=dense)\n"
+    + MOE_BLOCK
+    + "model = embed block^2 rmsnorm head",
+    "moe-relu2": HEAD
+    + ATTN
+    + "experts = moe(num_experts=8, top_k=2, router=sqrtsoftplus,"
+    " expert=mlp(intermediate_size=64, activation=relu2))\n"
+    + MOE_BLOCK
+    + "model = embed block^2 rmsnorm head",
+    "mamba2": HEAD
+    + ATTN
+    + FFN
+    + "ssm = mamba2(state_size=16, head_dim=32)\n"
+    + "model = embed [rmsnorm ssm] [rmsnorm ffn] [rmsnorm attn] [rmsnorm ffn]"
+    " [rmsnorm ssm] [rmsnorm ffn] rmsnorm head",
+    "gdn": HEAD
+    + "attn = gqa(num_heads=4, num_kv_heads=2, qk_norm=rmsnorm(zero_centered=true),"
+    " rope=rope(fraction=0.25))\n"
+    + FFN
+    + "delta = gdn(num_heads=2, num_v_heads=4, head_dim=32)\n"
+    + "model = embed [rmsnorm delta] [rmsnorm ffn] [rmsnorm delta] [rmsnorm ffn]"
+    " [rmsnorm attn] [rmsnorm ffn] rmsnorm head",
+}
+
+LENGTHS = (3, 17, 40, 64)  # the prompts', in one batch: within and past a window
+STEPS = 16  # tokens decoded after each
+MAX_LEN = 128
+
+
+def main() -> None:
+    """Parse the command line and run its step."""
+    p = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
+    sub = p.add_subparsers(dest="step", required=True)
+    for name in ("export", "run", "compare", "run-one"):
+        s = sub.add_parser(name)
+        s.add_argument("dir", type=Path)
+        s.add_argument("--only", nargs="*", default=None)
+        s.add_argument("--tag", default="vllm")
+    sub.choices["export"].add_argument("--dtype", default="float32")
+    for name in ("run", "run-one"):
+        sub.choices[name].add_argument("--tp", type=int, default=1)
+        sub.choices[name].add_argument("--eager", action="store_true")
+    sub.choices["compare"].add_argument("--tolerance", type=float, default=1e-3)
+    sub.choices["compare"].add_argument("--margin", type=float, default=0.0)
+    args = p.parse_args()
+    cases = [c for c in CASES if args.only is None or c in args.only]
+    match args.step:
+        case "export":
+            for name in cases:
+                export(name, args.dir / name, args.dtype)
+        case "run":
+            for name in cases:
+                run_alone(args, name)
+        case "run-one":
+            run(args.dir / cases[0], args.tag, args.tp, args.eager)
+        case "compare":
+            bad = [n for n in cases if not compare(n, args)]
+            sys.exit(1 if bad else 0)
+
+
+# --- export, in bux's environment ---------------------------------------------------
+
+
+def export(name: str, out: Path, dtype: str) -> None:
+    """Export case `name`'s model to `out` in `dtype`, with its prompts."""
+    import torch
+
+    from bux.export.huggingface import save
+    from bux.lang import compile
+
+    arch = compile(CASES[name])
+    model = reference_model(arch, dtype)
+    with placeholders(arch):
+        save(arch, model, out, dtype=getattr(torch, dtype))
+    _add_router_biases(model, arch, out)
+    rng = np.random.default_rng(0)
+    prompts = [rng.integers(0, arch.vocab_size, n).tolist() for n in LENGTHS]
+    meta = {"name": name, "dtype": dtype, "prompts": prompts, "steps": STEPS}
+    (out / "parity.json").write_text(json.dumps(meta))
+    print(f"exported {name} to {out}")
+
+
+def reference_model(arch: Any, dtype: str) -> Any:
+    """Return bux's model of `arch`: fresh weights, perturbed, with the aux-free
+    biases drawn too, all rounded to `dtype` (but kept in float32)."""
+    import jax
+    import jax.numpy as jnp
+    from flax import nnx
+
+    from bux.architecture import Model
+    from bux.export.check import perturbed
+
+    model = perturbed(Model(arch, rngs=nnx.Rngs(0)), 1)
+    for path, var in nnx.iter_graph(model):
+        if path and path[-1] == "router_bias" and isinstance(var, nnx.Variable):
+            key = jax.random.key(len(path))
+            var[...] = 0.1 * jax.random.normal(key, var[...].shape)
+    state = nnx.state(model, nnx.Variable)
+    rounded = jax.tree.map(
+        lambda x: (
+            x.astype(getattr(jnp, dtype)).astype(x.dtype)
+            if jnp.issubdtype(x.dtype, jnp.floating)
+            else x
+        ),
+        state,
+    )
+    nnx.update(model, rounded)
+    return model
+
+
+class placeholders:
+    """Stand in for the transformers classes of layers that only the vLLM plugin
+    exports so far, so that `save` writes their weights by the generic rule: their
+    ``modeling_bux.py`` does not run, but vLLM does not read it."""
+
+    STATES: ClassVar = {"mamba2": "mamba", "gdn": "linear_attention"}
+
+    def __init__(self, arch: Any):
+        from bux.export import codegen
+
+        self.classes = codegen.layer_classes()
+        kinds = {layer.config.type for layer in arch.layers()}
+        self.added = [k for k in kinds if k not in self.classes]
+
+    def __enter__(self) -> None:
+        for kind in self.added:
+            state = self.STATES.get(kind)
+            attrs: dict[str, Any] = {"__module__": "placeholder.vllm_only"}
+            if state is not None:
+                attrs["cache_type"] = staticmethod(lambda c, s=state: s)
+            self.classes[kind] = type(kind.title().replace("_", ""), (), attrs)
+
+    def __exit__(self, *exc: object) -> None:
+        for kind in self.added:
+            del self.classes[kind]
+
+
+def _add_router_biases(model: Any, arch: Any, out: Path) -> None:
+    """Add the aux-free router biases to the export's weights if `save` left them
+    out (they are not parameters), as ``<moe>.router_bias``."""
+    import torch
+    from safetensors.torch import load_file, save_file
+
+    from bux.export.plan import plan
+    from bux.export.weights import module_at
+
+    file = out / "model.safetensors"
+    weights = load_file(file)
+    dtype = next(iter(weights.values())).dtype
+    added = {}
+    for call in (c for c in plan(arch).calls if c.first):
+        module = module_at(arch.graph, model.graph, call.trail)
+        bias = getattr(module, "router_bias", None)
+        name = f"{call.path}.router_bias"
+        if bias is not None and name not in weights:
+            added[name] = torch.from_numpy(np.array(bias[...])).to(dtype)
+    if added:
+        save_file(weights | added, file, metadata={"format": "pt"})
+
+
+# --- run, in vLLM's environment ------------------------------------------------------
+
+
+def run_alone(args: argparse.Namespace, name: str) -> None:
+    """Run case `name` in a process of its own, as each vLLM engine wants one."""
+    cmd = [sys.executable, __file__, "run-one", str(args.dir), "--only", name]
+    cmd += ["--tag", args.tag, "--tp", str(args.tp)] + ["--eager"] * args.eager
+    subprocess.run(cmd, check=False)
+
+
+def run(where: Path, tag: str, tp: int, eager: bool) -> None:
+    """Decode the prompts of the export at `where` greedily with vLLM; keep the
+    tokens and every position's log-probabilities in ``<tag>.npz``."""
+    from vllm import LLM, SamplingParams
+    from vllm.inputs import TokensPrompt
+
+    meta = json.loads((where / "parity.json").read_text())
+    vocab = json.loads((where / "config.json").read_text())["vocab_size"]
+    llm = LLM(
+        model=str(where),
+        dtype=meta["dtype"],
+        tensor_parallel_size=tp,
+        skip_tokenizer_init=True,
+        max_model_len=MAX_LEN,
+        max_logprobs=vocab,
+        enforce_eager=eager,
+        gpu_memory_utilization=0.5,
+        seed=0,
+    )
+    params = SamplingParams(
+        temperature=0.0,
+        max_tokens=meta["steps"],
+        logprobs=vocab,
+        prompt_logprobs=vocab,
+        ignore_eos=True,
+        detokenize=False,
+    )
+    prompts = [TokensPrompt(prompt_token_ids=p) for p in meta["prompts"]]
+    outs = llm.generate(prompts, params)
+    arrays = {}
+    for i, out in enumerate(outs):
+        gen = out.outputs[0]
+        rows = [*out.prompt_logprobs[1:], *gen.logprobs]
+        arrays[f"tokens{i}"] = np.array(gen.token_ids)
+        arrays[f"logprobs{i}"] = _dense(rows, vocab)
+    np.savez(where / f"{tag}.npz", **arrays)
+    print(f"ran {meta['name']}: {tag}, {len(outs)} prompts")
+
+
+def _dense(rows: list[dict], vocab: int) -> np.ndarray:
+    """vLLM's log-probabilities of each position, by token, as an array."""
+    out = np.full((len(rows), vocab), -np.inf, np.float32)
+    for i, row in enumerate(rows):
+        for token, lp in row.items():
+            out[i, token] = lp.logprob
+    return out
+
+
+# --- compare, in bux's environment ---------------------------------------------------
+
+
+def compare(name: str, args: argparse.Namespace) -> bool:
+    """Compare case `name`'s vLLM run with bux; print a line, return whether they
+    agree."""
+    from bux.lang import compile
+
+    where = args.dir / name
+    if not (where / f"{args.tag}.npz").exists():
+        print(f"{name:12s} {args.tag:16s} no run")
+        return False
+    meta = json.loads((where / "parity.json").read_text())
+    run = np.load(where / f"{args.tag}.npz")
+    model = reference_model(compile(CASES[name]), meta["dtype"])
+    errors, gaps, same = [], [], True
+    for i, prompt in enumerate(meta["prompts"]):
+        tokens = run[f"tokens{i}"]
+        want = _logprobs(model, [*prompt, *tokens.tolist()])[:-1]
+        got = run[f"logprobs{i}"]
+        errors.append(float(np.abs(got - want).max()))
+        picked = want[len(prompt) - 1 :]
+        gap = picked.max(-1) - picked[np.arange(len(tokens)), tokens]
+        gaps.append(float(gap.max()))
+        same &= bool((picked.argmax(-1) == tokens).all())
+    ok = max(errors) <= args.tolerance and max(gaps) <= args.margin
+    verdict = "ok" if ok else "DIFFERS"
+    print(
+        f"{name:12s} {args.tag:16s} {meta['dtype']:9s} max |dlogprob| "
+        f"{max(errors):.2e}  greedy {'same' if same else 'differs'} "
+        f"(worst gap {max(gaps):.2e})  {verdict}"
+    )
+    return ok
+
+
+def _logprobs(model: Any, tokens: list[int]) -> np.ndarray:
+    """bux's log-probabilities of every position of `tokens`, in float32."""
+    import jax
+    import jax.numpy as jnp
+
+    logits = model(jnp.asarray([tokens]))[0].astype(jnp.float32)
+    return np.asarray(jax.nn.log_softmax(logits, -1))
+
+
+if __name__ == "__main__":
+    os.environ.setdefault("TOKENIZERS_PARALLELISM", "false")
+    main()
