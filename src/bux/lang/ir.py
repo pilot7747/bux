@@ -309,6 +309,7 @@ _NEWER_LAYER_FIELDS = {
     "gated_mlp": {"up_offset": 0.0},
     "moe": {"router_bias": False},
     "mamba2": {"num_heads": None},
+    "gqa": {"gate_head_bias": False, "power_scale": None, "power_scale_length": 2048},
 }
 
 
