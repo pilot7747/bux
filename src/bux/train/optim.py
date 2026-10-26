@@ -493,7 +493,7 @@ def gram(
             return fallback(x, dims)
         y = _normalized(matrices)
         for run in runs:
-            y = _times(_gram_run(_times(y, y.mT), run), y)
+            y = _gram_run(y @ y.mT, run) @ y
         y = y.astype(x.dtype)
         return back(y if wide else y.mT)
 
@@ -521,32 +521,30 @@ def _gram_run(
 ) -> Float[Array, "b m m"]:
     """Return the Q of a run of Gram iterations from the Gram matrix `r`, from Q = I:
     with ``Z = b R + c R²``, ``Q ← Q Z + a Q`` and ``R ← (Z + a I) R (Z + a I)``,
-    Zhang et al.'s stabilized iteration, which adds each ``a`` in float32, where Z
-    rounded with it would lose it."""
+    Zhang et al.'s stabilized iteration. It adds each ``a`` in float32 before the
+    product rounds: Z rounded with ``a I`` would lose it, and a product rounded
+    before ``a`` is added would lose what cancels."""
     (a, b, c), *rest = quintics
-    z = _times(r, r, c, r, b)
+    z = (r @ r) * c.astype(r.dtype) + r * b.astype(r.dtype)
     q = (z + a * jnp.eye(r.shape[-1], dtype=jnp.float32)).astype(r.dtype)
     for next_a, b, c in rest:
-        rz = _times(r, z, 1.0, r, a)
-        r = _times(z, rz, 1.0, rz, a)
-        a, z = next_a, _times(r, r, c, r, b)
-        q = _times(q, z, 1.0, q, a)
+        rz = _plus(r, z, r, a)
+        r = _plus(z, rz, rz, a)
+        a, z = next_a, (r @ r) * c.astype(r.dtype) + r * b.astype(r.dtype)
+        q = _plus(q, z, q, a)
     return q
 
 
-def _times(
+def _plus(
     x: Float[Array, "*b m k"],
     y: Float[Array, "*b k n"],
-    scale: Float[ArrayLike, ""] = 1.0,
-    plus: Float[Array, "*b m n"] | None = None,
-    by: Float[ArrayLike, ""] = 0.0,
+    plus: Float[Array, "*b m n"],
+    by: Float[ArrayLike, ""],
 ) -> Float[Array, "*b m n"]:
-    """``scale x y + by plus``, summed in float32 and rounded to x's dtype once, as a
-    GEMM's epilogue adds."""
-    xy = jnp.matmul(x, y, preferred_element_type=jnp.float32) * scale
-    if plus is not None:
-        xy = xy + plus.astype(jnp.float32) * by
-    return xy.astype(x.dtype)
+    """``x y + by plus``, summed in float32 and rounded to x's dtype once, as a GEMM's
+    epilogue adds."""
+    xy = jnp.matmul(x, y, preferred_element_type=jnp.float32)
+    return (xy + plus.astype(jnp.float32) * by).astype(x.dtype)
 
 
 @ns_coefficients.register("jordan")

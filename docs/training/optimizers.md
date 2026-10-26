@@ -153,7 +153,7 @@ the matrix. Its authors restart five iterations once, after the second. `none`, 
 default, restarts after the second and every third after it (2, 5, 8, ...).
 Measured on CPU (2026-10-26) on 192×768 matrices of the authors' test spectra
 (decaying to 1e-9, or half zero), in bfloat16 and at 4 to 12 iterations of either
-quintic, that keeps the largest singular value within 0.06 of the standard
+quintic, that keeps the largest singular value within 0.07 of the standard
 iteration's. A single restart after the second drifts at six iterations and blows
 up from seven, past 10³ at eight. `ns_restarts=2` or `ns_restarts=[2, 4]` sets them.
 
