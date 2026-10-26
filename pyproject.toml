@@ -15,6 +15,7 @@ dependencies = [
     "orbax-checkpoint>=0.12.8",
     "pyarrow>=26.0.0",
     "pydantic>=2.14.1",
+    "scipy>=1.18.1",
     "tokenizers>=0.23.3",
     "tomlkit>=0.15.2",
 ]
@@ -29,6 +30,12 @@ dev = [
     "tensorboardx>=2.6",
     "ty>=0.0.89",
 ]
+# Exporting to transformers, and checking an export against bux: `bux export`.
+export = [
+    "safetensors>=0.6",
+    "torch>=2.14",
+    "transformers>=5.20",
+]
 docs = [
     "myst-parser>=5.1.0",
     "pydata-sphinx-theme>=0.23.0",
@@ -42,6 +49,12 @@ bux = "bux.__main__:main"
 bux-lsp = "bux.lang.lsp.server:main"
 
 [project.optional-dependencies]
+# What `bux export` needs: models export to transformers and are checked in PyTorch.
+export = [
+    "safetensors>=0.6",
+    "torch>=2.14",
+    "transformers>=5.20",
+]
 cuda = [
     "jax[cuda13]>=0.12.0; sys_platform == 'linux'",
     "tokamax[cuda]>=0.0.17; sys_platform == 'linux'",
@@ -67,7 +80,7 @@ tensorboard = [
 ]
 
 [tool.uv]
-default-groups = ["dev", "docs"]  # make ci builds the docs too
+default-groups = ["dev", "docs", "export"]  # make ci builds the docs and checks exports
 # cudnn-frontend's develop build: Frost's GDN-2 kernel (GLA, Lightning) and the DSA
 # indexer's deterministic top-k are not in 1.31.0.
 override-dependencies = [
@@ -75,6 +88,8 @@ override-dependencies = [
     "nvidia-cudnn-frontend @ https://github.com/NVIDIA/cudnn-frontend/releases/download/v1.32.0.dev76547535/nvidia_cudnn_frontend-1.32.0.dev76547535-cp314-cp314-manylinux_2_27_aarch64.manylinux_2_28_aarch64.whl ; sys_platform == 'linux' and platform_machine == 'aarch64'",
 ]
 
+# PyTorch's CPU build on Linux: exports run on the CPU in tests and checks, and the
+# cuda extra's kernels only import it.
 [tool.uv.sources]
 torch = [{ index = "pytorch-cpu", marker = "sys_platform == 'linux'" }]
 
@@ -116,5 +131,10 @@ error-on-warning = true
 [tool.ty.environment]
 extra-paths = ["docs/_ext"]  # the docs' Sphinx extension
 
+# PyTorch declares nn.Module's forward as an attribute, which every module overrides.
+[[tool.ty.overrides]]
+include = ["src/bux/export/**", "src/bux_vllm/**", "tests/test_export*.py"]
+rules = { invalid-mutable-override = "ignore" }
+
 [tool.ty.analysis]
-allowed-unresolved-imports = ["pyspark.**", "tokamax.**", "cudnn.**", "cutlass.**", "triton.**", "jax_triton.**", "flash_attn.**", "transformer_engine.**"]  # the `spark` and `cuda` extras, and the image's TE
+allowed-unresolved-imports = ["vllm.**", "pyspark.**", "tokamax.**", "cudnn.**", "cutlass.**", "triton.**", "jax_triton.**", "flash_attn.**", "transformer_engine.**"]  # the `spark` and `cuda` extras, the image's TE, and vLLM (its plugin, bux_vllm)

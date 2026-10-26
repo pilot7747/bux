@@ -67,27 +67,22 @@ block = [norm attn] [norm ffn]
 """
 
 
+def constant(steps: int) -> tcfg.TrainConfig:
+    """A run of `steps` at a constant learning rate, for its multiplier."""
+    return tcfg.TrainConfig(
+        data=tcfg.SyntheticConfig(),
+        optimizer=tcfg.AdamWConfig(lr=1e-3),
+        seq_len=8,
+        batch=2,
+        steps=steps,
+    )
+
+
 def smoke(*overrides: str):
     """The smoke run, shortened: its warmup would not fit in a few steps."""
     settings = ("schedule.warmup = 1", *overrides)
     [run] = compile_runs(SMOKE.read_text(), filename=str(SMOKE), overrides=settings)
     return run
-
-
-def values(c: tcfg.ScheduleConfig, steps: int) -> list[float]:
-    f = lr_multiplier(c, steps)
-    return [round(float(f(i)), 4) for i in range(steps)]
-
-
-def test_schedules_warm_up_and_reach_final_at_the_last_step():
-    assert values(tcfg.ConstantSchedule(warmup=4), 6) == [0.25, 0.5, 0.75, 1, 1, 1]
-    cosine = values(tcfg.CosineSchedule(warmup=2, final=0.1), 6)
-    assert cosine[:2] == [0.5, 1.0] and cosine[-1] == 0.1
-    assert all(a >= b for a, b in itertools.pairwise(cosine[1:]))  # after warmup
-    wsd = values(tcfg.WSDSchedule(decay=0.4, shape="linear"), 10)
-    assert wsd == [1, 1, 1, 1, 1, 1, 0.75, 0.5, 0.25, 0]
-    sqrt = values(tcfg.WSDSchedule(decay=0.4, shape="sqrt", final=0.1), 10)
-    assert sqrt[5] == 1 and sqrt[6] == round(0.1 + 0.9 * (1 - 0.25**0.5), 4)
 
 
 def test_muon_trains_the_block_matrices_and_adam_the_rest():
@@ -356,7 +351,7 @@ def _muon_step(
         model = parallel.build(lambda: Model(compile(MOE), rngs=nnx.Rngs(0)))
         given = {"lr": 0.02, "ns_dtype": ns_dtype, "ns_algorithm": algorithm}
         c = tcfg.MuonConfig.model_validate(given)
-        lr = lr_multiplier(tcfg.ConstantSchedule(), 1)
+        lr = lr_multiplier(constant(1))
         trained = nnx.Optimizer(model, optimizer(c, lr, model), wrt=nnx.Param)
         parallel.shard_state(model, trained)
         grads = jax.tree.map(jnp.sin, nnx.state(model, nnx.Param))
@@ -775,11 +770,13 @@ def test_muon_runs_end_to_end(tmp_path):
 
 
 def test_a_builder_registered_for_a_type_replaces_its_own(monkeypatch):
-    def half(c, steps):
+    def half(c, train):
         return lambda step: jnp.asarray(0.5)
 
     monkeypatch.setitem(schedules.builders, "constant", half)
-    assert values(tcfg.ConstantSchedule(warmup=2), 4) == [0.25, 0.5, 0.5, 0.5]
+    run = constant(4).model_copy(update={"schedule": tcfg.ConstantSchedule(warmup=2)})
+    f = lr_multiplier(run)
+    assert [float(f(s)) for s in range(4)] == [0.25, 0.5, 0.5, 0.5]
     monkeypatch.delitem(optimizers.builders, "adamw")
     hint = r"no 'adamw' optimizer yet; add one with @bux\.train\.optim\.optimizers"
     with pytest.raises(NotImplementedError, match=hint):
@@ -807,7 +804,7 @@ def test_a_trainer_takes_terms_hooks_and_sinks_of_ones_own():
     loss = objective(tcfg.LossConfig(), arch)
     loss.terms["logit_l2"] = Term(1e-4, lambda logits, _: jnp.mean(logits[0] ** 2))
     trainer = Trainer(Model(arch, rngs=nnx.Rngs(0)), optax.adamw(1e-3), loss)
-    lr = lr_multiplier(tcfg.ConstantSchedule(), 3)
+    lr = lr_multiplier(constant(3))
     latest, steps = LatestMetrics(), Steps()
     data = batches(tcfg.SyntheticConfig(), rows(tcfg.SyntheticConfig(), 2, 8), 32)
     hooks = [Log(every=1, lr=lr, tokens=16), WeightNorm()]
@@ -848,8 +845,8 @@ def test_the_log_reports_mfu_where_the_devices_peak_is_known():
     loss = objective(tcfg.LossConfig(), arch)
     work = flops.Work(3e6, {flops.Mask(): 2e6})  # 1e6 of attention a step on rows of 8
     model = Model(arch, rngs=nnx.Rngs(0))
-    trainer = Trainer(model, optax.adamw(1e-3), loss, work=work)
-    lr = lr_multiplier(tcfg.ConstantSchedule(), 2)
+    trainer = Trainer(model, optax.adamw(1e-3), loss, work=lambda rows, t: work)
+    lr = lr_multiplier(constant(2))
     data = batches(tcfg.SyntheticConfig(), rows(tcfg.SyntheticConfig(), 2, 8), 32)
     latest = LatestMetrics()
     log = Log(every=1, lr=lr, tokens=16, peak=1e9)

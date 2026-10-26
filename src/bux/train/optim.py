@@ -1,10 +1,10 @@
 """Learning-rate schedules and optimizers, built from their configs with optax.
 
 Each is found by its config's type: a schedule in `schedules`, an optimizer in
-`optimizers`. A schedule's builder gets the config and the run's steps, and returns
-its curve after the warmup; an optimizer's gets the config, the schedule's multiplier
-and the model, and returns an optax transformation. A builder registered under a
-taken name replaces bux's own::
+`optimizers`. A schedule's builder gets the config and the run's training settings,
+and returns its curve after the warmup; an optimizer's gets the config, the
+schedule's multiplier and the model, and returns an optax transformation. A builder
+registered under a taken name replaces bux's own::
 
     @optimizers.register("adamw")
     def _(c: tcfg.AdamWConfig, multiplier: Schedule, model: nnx.Module):
@@ -49,6 +49,7 @@ from bux.architecture import Scanned
 from bux.parallel import methods
 from bux.parallel.layout import Split, as_split, partition
 from bux.train import config as tcfg
+from bux.train import curriculum
 from bux.train.registry import Registry
 
 #: A value at each step, counted from 0, as a learning rate or its multiplier.
@@ -57,7 +58,8 @@ Schedule = Callable[[Real[ArrayLike, ""]], Float[Array, ""]]
 NewtonSchulz = Callable[[Float[Array, "*m"], MuonDimensionNumbers], Float[Array, "*m"]]
 
 #: The schedules, by the ``type`` of their config. A builder gets the config and the
-#: run's steps, and returns the multiplier's curve after the warmup.
+#: run's training settings (its steps, batch and peak), and returns the multiplier's
+#: curve after the warmup.
 schedules = Registry[Schedule]("schedule", "bux.train.optim.schedules")
 #: The optimizers, by the ``type`` of their config. A builder gets the config, the
 #: schedule's multiplier and the model, and returns an optax transformation.
@@ -81,33 +83,34 @@ ns_algorithms = Registry[NewtonSchulz](
 # --- Schedules --------------------------------------------------------------------------
 
 
-def lr_multiplier(config: tcfg.ScheduleConfig, steps: int) -> Schedule:
+def lr_multiplier(train: tcfg.TrainConfig) -> Schedule:
     """Return the multiplier of the peak learning rate, from 0 to 1, at each step of a
-    run of `steps`: a linear warmup, times the schedule's own curve.
+    run: a linear warmup, times the curve of its schedule.
 
     The warmup rises from ``1 / warmup`` at step 0 to 1 at step ``warmup - 1``.
 
     Args:
-        config: The run's ``schedule`` setting.
-        steps: The run's steps.
+        train: The run's training settings: its ``schedule``, built by its builder
+            in `schedules`, and the ``steps``, batch and peak it is built for.
 
     Returns:
         The multiplier at each step, counted from 0.
 
     Raises:
-        NotImplementedError: If no schedule is registered under the config's type.
+        NotImplementedError: If no schedule is registered under the schedule's type.
 
     Example::
 
-        >>> m = lr_multiplier(WSDSchedule(warmup=10, decay=0.2), steps=100)
+        >>> m = lr_multiplier(run.train)  # schedule = wsd(warmup=0.1), steps = 100
         >>> [round(float(m(s)), 2) for s in (0, 9, 50, 89, 99)]
         [0.1, 1.0, 1.0, 0.5, 0.0]
     """
-    curve = schedules.build(config, steps)
+    curve = schedules.build(train.schedule, train)
+    warmup = tcfg.warmup_steps(train.schedule, train.steps)
 
     def multiplier(step: Real[ArrayLike, ""]) -> Float[Array, ""]:
         step = jnp.asarray(step, jnp.float32)
-        warm = jnp.minimum((step + 1) / config.warmup, 1.0) if config.warmup else 1.0
+        warm = jnp.minimum((step + 1) / warmup, 1.0) if warmup else 1.0
         return jnp.asarray(warm * curve(step))
 
     return multiplier
@@ -119,41 +122,129 @@ def lr_schedule(lr: float, multiplier: Schedule) -> Schedule:
     return lambda step: lr * multiplier(step)
 
 
+#: The curves of a cooldown or a piece by its ``shape``, from 1 at t = 0 to 0 at
+#: t = 1. ``exp`` is IBM's: an exponential that falls by e over the cooldown, moved
+#: to end at 0. ``geometric`` is not one of them: it depends on where it ends.
+SHAPES: dict[str, Callable[[Float[Array, ""]], Float[Array, ""]]] = {
+    "linear": lambda t: 1 - t,
+    "sqrt": lambda t: 1 - jnp.sqrt(t),
+    "cosine": lambda t: 0.5 * (1 + jnp.cos(math.pi * t)),
+    "exp": lambda t: (jnp.exp(-t) - math.exp(-1)) / (1 - math.exp(-1)),
+    "constant": lambda t: jnp.where(t > 0, 0.0, 1.0),
+}
+
+
+def _through(step: Real[ArrayLike, ""], start: int, length: int) -> Float[Array, ""]:
+    """Return how far `step` is through the `length` steps from `start`: 0 before
+    them, 1 at the last of them."""
+    return jnp.clip((step + 1 - start) / max(length, 1), 0, 1)
+
+
+def _toward(
+    start: float, end: float, shape: tcfg.Shape, t: Float[Array, ""]
+) -> Float[Array, ""]:
+    """Return the multiplier `t` of the way from `start` to `end` along `shape`."""
+    if shape == "geometric":
+        return start * (end / start) ** t
+    return end + (start - end) * SHAPES[shape](t)
+
+
 @schedules.register("constant")
-def _(c: tcfg.ConstantSchedule, steps: int) -> Schedule:
+def _(c: tcfg.ConstantSchedule, train: tcfg.TrainConfig) -> Schedule:
     """The peak learning rate at every step after the warmup."""
     return lambda step: jnp.asarray(1.0)
 
 
 @schedules.register("cosine")
-def _(c: tcfg.CosineSchedule, steps: int) -> Schedule:
+def _(c: tcfg.CosineSchedule, train: tcfg.TrainConfig) -> Schedule:
     """A cosine decay from the peak after the warmup to `final` times it at the last
-    step."""
+    step, or at the `horizon` of the steps."""
+    steps, warmup = round(c.horizon * train.steps), tcfg.warmup_steps(c, train.steps)
 
     def curve(step: Real[ArrayLike, ""]) -> Float[Array, ""]:
-        t = jnp.clip((step + 1 - c.warmup) / max(steps - c.warmup, 1), 0, 1)
+        t = jnp.clip((step + 1 - warmup) / max(steps - warmup, 1), 0, 1)
         return c.final + (1 - c.final) * 0.5 * (1 + jnp.cos(math.pi * t))
 
     return curve
 
 
-#: The curves of a ``wsd`` cooldown by its ``shape``, from 1 at t = 0 to 0 at t = 1.
-COOLDOWNS: dict[str, Callable[[Float[Array, ""]], Float[Array, ""]]] = {
-    "linear": lambda t: 1 - t,
-    "sqrt": lambda t: 1 - jnp.sqrt(t),
-    "cosine": lambda t: 0.5 * (1 + jnp.cos(math.pi * t)),
-}
-
-
 @schedules.register("wsd")
-def _(c: tcfg.WSDSchedule, steps: int) -> Schedule:
+def _(c: tcfg.WSDSchedule, train: tcfg.TrainConfig) -> Schedule:
     """Warmup-stable-decay: the peak until the last `decay` of the steps, then a
     cooldown of `shape` to `final` times the peak at the last step."""
-    cooldown = c.cooldown(steps)
+    cooldown = c.cooldown(train.steps)
+    start = train.steps - cooldown
+    return lambda step: _toward(1.0, c.final, c.shape, _through(step, start, cooldown))
+
+
+@schedules.register("linear_decay")
+def _(c: tcfg.LinearDecaySchedule, train: tcfg.TrainConfig) -> Schedule:
+    """A linear decay from the peak after the warmup to `final` times it at the last
+    step."""
+    warmup = tcfg.warmup_steps(c, train.steps)
+    length = train.steps - warmup
+    return lambda step: _toward(1.0, c.final, "linear", _through(step, warmup, length))
+
+
+@schedules.register("multistep")
+def _(c: tcfg.MultiStepSchedule, train: tcfg.TrainConfig) -> Schedule:
+    """The peak, times `factor` from each of the steps at the shares `at` of the run
+    on."""
+    drops = jnp.asarray([round(a * train.steps) for a in c.at], jnp.float32)
+    return lambda step: jnp.asarray(c.factor) ** jnp.sum(step >= drops)
+
+
+@schedules.register("power")
+def _(c: tcfg.PowerSchedule, train: tcfg.TrainConfig) -> Schedule:
+    """IBM's Power scheduler: `a` times the step's batch times the tokens trained to
+    the `b`, over the peak and at most 1, held through the warmup at its last step's;
+    then a cooldown of `shape` from where it is to `final` times that. The tokens and
+    the batch follow the run's batch ramp and curriculum."""
+    cooldown = c.cooldown(train.steps)
+    start, warmup = train.steps - cooldown, tcfg.warmup_steps(c, train.steps)
+    parts = curriculum.stretches(train)
+    each = [s.config.batch * s.config.seq_len for s in parts]  # tokens a step
+    through = itertools.accumulate(
+        (s.stop - s.start) * n for s, n in zip(parts, each, strict=True)
+    )
+    firsts = jnp.asarray([s.start for s in parts], jnp.float32)
+    rows = jnp.asarray([s.config.batch for s in parts], jnp.float32)
+    tokens = jnp.asarray(each, jnp.float32)
+    before = jnp.asarray([0, *list(through)[:-1]], jnp.float32)
+
+    def power(step: Float[Array, ""]) -> Float[Array, ""]:
+        step = jnp.clip(step, warmup - 1, start - 1)
+        k = jnp.searchsorted(firsts, step, side="right") - 1
+        n = before[k] + (step - firsts[k] + 1) * tokens[k]
+        return jnp.minimum(c.a * rows[k] * n**c.b / train.optimizer.lr, 1.0)
 
     def curve(step: Real[ArrayLike, ""]) -> Float[Array, ""]:
-        t = jnp.clip((step + 1 - (steps - cooldown)) / max(cooldown, 1), 0, 1)
-        return c.final + (1 - c.final) * COOLDOWNS[c.shape](t)
+        step = jnp.asarray(step, jnp.float32)
+        return power(step) * _toward(
+            1.0, c.final, c.shape, _through(step, start, cooldown)
+        )
+
+    return curve
+
+
+@schedules.register("piecewise")
+def _(c: tcfg.PiecewiseSchedule, train: tcfg.TrainConfig) -> Schedule:
+    """Its pieces one after the other from the end of the warmup, each from where the
+    one before ends, the first from the peak, to its `to` along its `shape`."""
+    ends = [round(p.until * train.steps) for p in c.pieces]
+    starts = [tcfg.warmup_steps(c, train.steps), *ends[:-1]]
+    values = tcfg.levels(c.pieces)
+
+    def curve(step: Real[ArrayLike, ""]) -> Float[Array, ""]:
+        step = jnp.asarray(step, jnp.float32)
+        each = [
+            _toward(values[k], values[k + 1], p.shape, _through(step, b, e - b))
+            for k, (p, b, e) in enumerate(zip(c.pieces, starts, ends, strict=True))
+        ]
+        found = each[0]
+        for b, value in zip(starts[1:], each[1:], strict=True):
+            found = jnp.where(step >= b, value, found)
+        return found
 
     return curve
 
@@ -190,7 +281,7 @@ def optimizer(
 
     Example::
 
-        multiplier = lr_multiplier(run.train.schedule, run.train.steps)
+        multiplier = lr_multiplier(run.train)
         tx = optimizer(run.train.optimizer, multiplier, model, clip=1.0)
         trainer = Trainer(model, tx, objective(run.train.loss, run.arch))
     """

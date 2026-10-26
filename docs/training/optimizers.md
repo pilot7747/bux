@@ -14,7 +14,7 @@ loss      = loss(z=1e-4)
 | Setting | Takes | Default |
 |---------|-------|---------|
 | `optimizer` | {bux}`adamw` or {bux}`muon` | required |
-| `schedule` | {bux}`constant`, {bux}`cosine` or {bux}`wsd` | `constant` |
+| `schedule` | {bux}`constant`, {bux}`cosine`, {bux}`wsd`, {bux}`linear_decay`, {bux}`multistep`, {bux}`power` or {bux}`piecewise` | `constant` |
 | `clip` | a global norm, or `none` | `1.0` |
 | `loss` | {bux}`loss` | `loss(z=0, mtp=0.3)` |
 
@@ -175,27 +175,34 @@ with fused epilogues, which XLA does not have
 
 ## Schedules
 
-A schedule multiplies the optimizer's `lr`. Each takes a linear `warmup` of some
-steps, then a curve of its own, and the multiplier at a step is their product:
+A schedule multiplies the optimizer's `lr`. Each takes a linear `warmup`, then a
+curve of its own, and the multiplier at a step is their product. `warmup` is a number
+of steps, or below 1 a share of them: `warmup=0.01` is 1% of the steps.
 
 | Schedule | Fields | After the warmup |
 |----------|--------|------------------|
 | {bux}`constant` | `warmup=0` | the peak, to the end |
-| {bux}`cosine` | `warmup=0`, `final=0.1` | a cosine decay to `final` times the peak at the last step |
+| {bux}`cosine` | `warmup=0`, `final=0.1`, `horizon=1` | a cosine decay to `final` times the peak at the last step, or at the `horizon` of the steps |
 | {bux}`wsd` | `warmup=0`, `decay=0.2`, `final=0`, `shape=linear` | the peak, then a cooldown to `final` times the peak over the last `decay` of the steps |
+| {bux}`linear_decay` | `warmup=0`, `final=0` | a linear decay to `final` times the peak at the last step |
+| {bux}`multistep` | `warmup=0`, `at=[0.8, 0.9]`, `factor=0.316` | the peak, times `factor` from each share of the steps in `at` on |
+| {bux}`power` | `warmup=0`, `a=4`, `b=-0.51`, `decay=0.1`, `final=0`, `shape=exp` | a power law in the tokens trained, capped at the peak, then a cooldown |
+| {bux}`piecewise` | `warmup=0`, `pieces` | {bux}`piece` after piece: holds, decays, drops and re-warmups |
 
 ### The curves exactly
 
 Steps count from 0, the first step, to `steps - 1`, the last; write `s` for a step, `S`
-for `steps` and `W` for `warmup`.
+for `steps` and `W` for the steps of the warmup: `warmup`, or `round(warmup · S)`
+for a share.
 
 **Warmup.** The multiplier rises linearly from `1 / W` at step 0 to 1 at step `W - 1`:
 `min((s + 1) / W, 1)`. With `warmup=0` there is none.
 
-**Cosine.** From the end of the warmup, `t = clip((s + 1 - W) / (S - W), 0, 1)` runs
-from 0 to 1 at the last step, and the multiplier is
+**Cosine.** From the end of the warmup, `t = clip((s + 1 - W) / (H - W), 0, 1)`, with
+`H = round(horizon · S)`, runs from 0 to 1 at step `H - 1`, and the multiplier is
 `final + (1 - final) · ½ (1 + cos πt)`: the peak at the end of the warmup, `final` at
-the last step.
+the last step. With `horizon` above 1 the run stops before the cosine reaches
+`final`, as OLMo 2's and OLMo 3's do; below 1 it holds `final` from step `H - 1` on.
 
 **Warmup-stable-decay.** WSD (Hu et al., 2024) holds the peak, then cools down over
 the last `C = round(decay · S)` steps. There
@@ -207,17 +214,106 @@ multiplier is `final + (1 - final) · f(t)`, with `f` by `shape`:
 | `linear` | `1 - t` |
 | `sqrt` | `1 - √t` (Hägele et al., 2024) |
 | `cosine` | `½ (1 + cos πt)` |
+| `exp` | `(e^-t - e^-1) / (1 - e^-1)`: it falls by e over the cooldown, moved to end at 0, as IBM's does |
+| `constant` | 0 from the cooldown's first step: `final` at once |
+
+`shape=geometric` is no `f`: the multiplier is `final^t`, falling by the same factor
+at every step, as MiniCPM's exponential decay does, so its `final` must be above 0.
 
 So the last step of `cosine` and of `wsd` takes `final` times the peak: `wsd`'s
 default `final=0` takes a last step at a learning rate of 0, which the log shows as
 `lr 0.00e+00` at the end of the smoke run. Checkpoints from WSD's stable phase can be
 cooled down later, to study several run lengths at once.
 
+**Linear decay.** `linear_decay` decays from the end of the warmup:
+`t = clip((s + 1 - W) / (S - W), 0, 1)` and the multiplier is
+`final + (1 - final) · (1 - t)`. With `final=0` it goes straight to zero, which
+Bergsma et al. (2025) find better than cosine and WSD.
+
+**Multistep.** The multiplier is `factor^k`, where `k` counts the shares `a` in `at`
+with `s >= round(a · S)`. DeepSeek LLM drops to 31.6% of the peak at 80% of its
+tokens and to 10% at 90%: `multistep(warmup=2k, at=[0.8, 0.9], factor=0.316)`.
+
+**Power.** IBM's Power scheduler (Shen et al., 2024) sets the learning rate from the
+tokens trained through step `s`, `n = (s + 1) · batch · seq_len`:
+`p(s) = min(1, a · batch · n^b / lr)`, with `lr` the optimizer's peak. So `a` and `b`
+suit any batch and number of tokens, and `lr` only caps it: the paper's is 0.02,
+under µP. The warmup rises to `p(W - 1)` and holds `p` there; over the last
+`C = round(decay · S)` steps, the cooldown goes from `p(S - C - 1)` to `final` times
+it, as `wsd`'s goes from the peak. Under a `batch_ramp` or a
+[curriculum](curriculum.md), `n` counts the tokens of each step at its own batch and
+`seq_len`, and `batch` is the step's.
+
+**Piecewise.** Piece `k` takes the steps from `b` to `e = round(until · S)`, where the
+first piece starts at `W` and every other where the one before ends. It goes from
+the multiplier `m` the piece before ended at (the peak, for the first) to its `to`
+(or stays at `m` with `to=none`) along its `shape`: `to + (m - to) · f(t)`, with
+`t = clip((s + 1 - b) / (e - b), 0, 1)`, and `m · (to / m)^t` for `geometric`. A
+piece's default `shape=constant` is at `to` from its first step. DeepSeek-V3 holds
+the peak to 10T of its 14.8T tokens, decays along a cosine to 10% by 14.3T, holds
+that to 14.633T and drops to 3.3% for the rest:
+
+```bux
+schedule = piecewise(warmup=2k, pieces=[piece(until=10 / 14.8),
+                                        piece(until=14.3 / 14.8, to=0.1, shape=cosine),
+                                        piece(until=14.633 / 14.8),
+                                        piece(to=0.033)])
+```
+
 :::{note}
 The warmup and the cooldown must fit in the steps: `bux check` fails a run whose
-`warmup + round(decay · steps)` exceeds `steps`, at the line of the schedule
-([Checks](settings.md#checks)).
+warmup and cooldown, `round(decay · steps)` for `wsd` and `power`, take more than
+`steps`, and a `piecewise` whose warmup ends after its first piece, at the line of
+the schedule ([Checks](settings.md#checks)).
 :::
+
+### Schedules from tech reports
+
+`examples/experiments/recipes/lr_schedules.bux` defines the pretraining schedules of
+25 tech reports by name (`deepseek_v3`, `kimi_k2`, `olmo_2`, ...), with what each
+leaves out. A run uses one, or sweeps them, next to its own optimizer, as
+`examples/experiments/schedule_sweep.bux` does:
+
+```bux
+use lr_schedules
+schedule = deepseek_v3 | kimi_k2 | olmo_2 | d2z
+```
+
+Where a report gives tokens, the recipe has shares of its run, so a shorter run keeps
+the shape. As of October 2026, the reports use these shapes:
+
+| Shape | Reports | In bux |
+|-------|---------|--------|
+| Cosine, to 1-10% where given | Llama 3 405B, Nemotron-H, GLM-4.5, Trinity Large, Kimi K3 | `cosine(final=0.01)` |
+| Cosine cut off before its end | OLMo 2, OLMo 3 | `cosine(warmup=2k, horizon=5 / 4)` |
+| WSD, linear | SmolLM2, SmolLM3, Mellum2, Marin 32B, nanochat (to 5%) | `wsd(warmup=2k, decay=0.1)` |
+| WSD, `1 - √t` | Nemotron 3 Super and Ultra, Laguna XS.2, Apertus | `wsd(decay=0.2, final=0.01, shape=sqrt)` |
+| WSD, cosine | Kimi K2 | `wsd(warmup=500, decay=5.5 / 15.5, final=0.1, shape=cosine)` |
+| WSD, exponential | MiniCPM, halving every 5000 steps | `wsd(decay=0.1, final=0.5 ^ (0.1 * steps / 5000), shape=geometric)` |
+| Linear from the warmup | Straight to zero (D2Z), OLMo's mid-training, Phi-4 (its end not given) | `linear_decay(warmup=0.1)` |
+| Steps of 0.316 | DeepSeek LLM, DeepSeek-V2 | `multistep(warmup=2k, at=[0.6, 0.9])` |
+| A power law in tokens | PowerLM, Granite 3.0 and 4.0 | `power(decay=0.1)` |
+| Chained phases | DeepSeek-V3 and V4.1, MiMo-7B and V2-Flash, MiniMax-Text-01, GLM-5 | `piecewise(pieces=[...])` |
+| A re-warmup | Moonlight, Marin 8B, Trinity's context extension | a rising `piece(to=0.24, shape=linear)` |
+
+Moonlight's, whose re-warmup is 100 steps long, is written in a run that knows its
+steps:
+
+```bux
+# A cosine to 10% by 5.2T of 5.7T tokens, back up to 24% in 100 steps, then
+# linearly to 0.
+schedule = piecewise(warmup=2k, pieces=[piece(until=5.2 / 5.7, to=0.1, shape=cosine),
+                                        piece(until=5.2 / 5.7 + 100 / steps, to=0.238,
+                                              shape=linear),
+                                        piece(to=0, shape=linear)])
+```
+
+Not in bux: Ling 2.0's WSM, which holds the peak and merges checkpoints instead of
+decaying; WSD-S's repeated cooldowns, which are as many pieces; Zamba's exponential
+anneal, whose time constant differs from `exp`'s; and modded-nanogpt's multipliers
+that step with its batch size. A long-context stage at the final learning rate is a
+run of its own at `constant`. Qwen3, Gemma 3 and 4, gpt-oss, Llama 4, Jamba, Kimi
+K2.5, MiniMax-M2 and M3, Inkling and Beam state no schedule.
 
 The log's `lr` is the learning rate of the step just taken. A new schedule is a
 function registered under its name ([Registries](extending.md#registries)).

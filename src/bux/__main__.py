@@ -9,9 +9,12 @@ Usage::
     prepare   tokenize and pack the documents the runs read
     train     train the runs in this process, one after another
     launch    train what is left of the runs, a sweep's side by side on the GPUs
+    results   the runs' states and objectives, a search's trials the best first
     render    draw the model as a circuit of the residual stream
     fmt       print the file back, a run at a time, with nothing left to resolve
     json      print the runs' IR (or the model's) as JSON
+
+    bux export RUN_DIR OUT [--step N] [--dtype DTYPE] [--check]
 
 Settings after the file override the file's own, as if written at its end:
 ``bux train speedrun.bux optimizer.lr=0.03 'steps = 2k'``. Alternatives there make a
@@ -22,6 +25,13 @@ the entrypoint for production (`bux.launch`): it trains each run of a sweep on t
 GPUs its mesh needs, or a run alone on many hosts, records what each run did, trains
 again only what is not done, and stops at SIGTERM with a checkpoint. ``bux plan``
 shows what each run takes: its FLOPs a token, its GPUs, and its bytes on each.
+
+A file with dimensions, ``optimizer.lr = log_uniform(1e-4, 1e-2)``, is a search
+(`bux.search`): ``bux train`` and ``bux launch`` train its trials, a run each, and
+``bux results`` prints them, the best first.
+
+``bux export`` takes a trained run's directory, not a file, and writes its model as a
+transformers model directory (`bux.export.runs`).
 """
 
 import argparse
@@ -31,9 +41,13 @@ import sys
 from collections import Counter
 from typing import TYPE_CHECKING
 
-from bux.lang import Architecture, BuxError, Report, Run, check, compile_runs
+from bux.lang import Architecture, BuxError, Report, Run, Space, check, compile_spaces
+from bux.lang.compiler import Dimension, short
 from bux.lang.printer import config_to_source, run_to_source, to_source, value_to_source
 from bux.lang.render import render
+from bux.train import config as cfg
+from bux.train import curriculum
+from bux.train.config import TrainConfig
 
 if TYPE_CHECKING:  # imported where used: jax and the backend are slow to import
     from flax import nnx
@@ -72,11 +86,13 @@ def summary(arch: Architecture) -> str:
 
 def training(run: Run) -> str:
     """Return what ``bux check`` says of a run's training: its steps and tokens, its
-    optimizer, schedule and data, and its tokenizer and packing if it has them."""
+    phases, its optimizer, schedule and data, and its tokenizer and packing if it has
+    them."""
     t = run.train
-    tokens = t.steps * t.batch * t.seq_len
+    shape = "" if curriculum.varies(t) else f" × {t.batch} × {t.seq_len} tokens"
+    phases = "".join(f"{line}\n" for line in curriculum.lines(t))
     return (
-        f"{t.steps:,} steps × {t.batch} × {t.seq_len} tokens = {_si(tokens)} tokens\n"
+        f"{t.steps:,} steps{shape} = {_si(_tokens(t))} tokens\n{phases}"
         f"optimizer={config_to_source(t.optimizer)} "
         f"schedule={config_to_source(t.schedule)}\n"
         f"data={value_to_source(t.data)}"
@@ -86,6 +102,44 @@ def training(run: Run) -> str:
         if t.tokenizer is not None
         else ""
     )
+
+
+def dimension(dim: Dimension) -> str:
+    """Return a dimension as ``bux check`` shows it, its bounds in order:
+    ``optimizer.lr (log_uniform(1e-4, 0.01))``."""
+    match dim.space:
+        case cfg.ChoiceConfig(options=options):
+            written = ", ".join(options)
+        case cfg.IntUniformConfig(low=low, high=high, log=log):
+            written = f"{low}, {high}" + (", log=true" if log else "")
+        case space:
+            written = f"{short(space.low)}, {short(space.high)}"
+    return f"{dim.where} ({dim.space.type}({written}))"
+
+
+def searching(run: Run, dims: list[Dimension]) -> str:
+    """Return what ``bux check`` says of a run's search: its method and trials, its
+    dimensions, its objective, and its rungs of steps with halving."""
+    from bux.search import halving
+
+    search = run.train.search
+    line = f"search: {config_to_source(search.method)}, {search.trials} trials over "
+    line += " × ".join(map(dimension, dims))
+    line += f"\nobjective = {value_to_source(cfg.objective(run.train))}"
+    if (h := search.halving) is not None:
+        rungs = [
+            halving.steps(h, run.train.steps, r) or run.train.steps
+            for r in range(h.rungs)
+        ]
+        worth = h.rungs * search.trials / h.eta ** (h.rungs - 1)
+        line += f"\nhalving: rungs of {', '.join(map(_si, rungs))} steps, eta {h.eta}"
+        line += f", about {worth:.3g} runs' steps in all"
+    return line
+
+
+def _tokens(t: TrainConfig) -> int:
+    """Return the tokens of a run's steps, phase by phase."""
+    return curriculum.tokens(curriculum.stretches(t), t.steps)
 
 
 def abstract(
@@ -174,14 +228,21 @@ def memory(
 
 def flops_per_token(run: Run) -> float | None:
     """Return the model FLOPs a training token of `run` takes in rows of one document
-    (``trainer.step_flops``); None if the backend lacks a layer."""
+    (``trainer.step_flops``), averaged over the seq_len of its phases by their
+    tokens; None if the backend lacks a layer."""
     from bux.train.trainer import step_flops
 
     t = run.train
+    tokens: Counter[int] = Counter()  # by seq_len
+    for s in curriculum.stretches(t):
+        tokens[s.config.seq_len] += (
+            (s.stop - s.start) * s.config.batch * s.config.seq_len
+        )
     try:
-        return step_flops(run).one_document(t.seq_len) / (t.batch * t.seq_len)
+        each = {n: step_flops(run, t.batch, n).one_document(n) for n in tokens}
     except NotImplementedError:
         return None
+    return sum(each[n] / (t.batch * n) * k for n, k in tokens.items()) / tokens.total()
 
 
 def _row(run: Run, gpus: int, alone: bool) -> tuple[str, ...]:
@@ -191,7 +252,7 @@ def _row(run: Run, gpus: int, alone: bool) -> tuple[str, ...]:
     from bux.parallel.pipeline import bubble
 
     t = run.train
-    tokens = t.steps * t.batch * t.seq_len
+    tokens = _tokens(t)
     used = need(t.mesh, gpus, alone=alone)
     made = abstract(run, used)
     n = None if made is None else num_params(made[0])
@@ -236,10 +297,32 @@ def plan(runs: list[Run], gpus: int | None = None) -> str:
     return f"{len(runs)} run{'s' if len(runs) != 1 else ''}\n" + "\n".join(lines)
 
 
+def plan_searches(spaces: list[Space]) -> str:
+    """Return a line for each run with dimensions: its search's trials, dimensions
+    and method, and with halving, how many runs' steps they take in all."""
+    lines = []
+    for space in spaces:
+        if not space.dimensions:
+            continue
+        search = space.run.train.search
+        line = f"{space.run.name}: {search.trials} trials of "
+        line += (
+            f"{len(space.dimensions)} dimensions by {config_to_source(search.method)}"
+        )
+        if (h := search.halving) is not None:
+            worth = h.rungs * search.trials / h.eta ** (h.rungs - 1)
+            line += f", {h.rungs} rungs: about {worth:.3g} runs' steps"
+        lines.append(line)
+    return "\n".join(lines)
+
+
 def parser() -> argparse.ArgumentParser:
     """Return the parser of bux's command line."""
     p = argparse.ArgumentParser(
-        prog="bux", description="Compile, inspect and train .bux models and runs."
+        prog="bux",
+        description="Compile, inspect and train .bux models and runs.",
+        epilog="bux export RUN_DIR OUT writes a trained run as a transformers model: "
+        "bux export --help",
     )
     p.add_argument(
         "command",
@@ -249,6 +332,7 @@ def parser() -> argparse.ArgumentParser:
             "prepare",
             "train",
             "launch",
+            "results",
             "render",
             "fmt",
             "json",
@@ -272,18 +356,18 @@ def parser() -> argparse.ArgumentParser:
     p.add_argument(
         "--out",
         default="runs",
-        help="train, launch: where run directories go (default: runs)",
+        help="train, launch, results: where run directories go (default: runs)",
     )
     p.add_argument(
         "--only",
         metavar="TEXT",
-        help="train, launch: only the runs whose name contains TEXT",
+        help="train, launch, results: only the runs whose name contains TEXT",
     )
     p.add_argument(
         "--index",
         type=int,
-        help="train, launch: only the run at INDEX, from 0, in the order bux plan lists "
-        "them; $SLURM_ARRAY_TASK_ID or $JOB_COMPLETION_INDEX in an array job",
+        help="train, launch, results: only the run at INDEX, from 0, in the order bux "
+        "plan lists them; $SLURM_ARRAY_TASK_ID or $JOB_COMPLETION_INDEX in an array job",
     )
     p.add_argument(
         "--cache",
@@ -298,6 +382,63 @@ def parser() -> argparse.ArgumentParser:
     return p
 
 
+def export_parser() -> argparse.ArgumentParser:
+    """Return the parser of ``bux export``."""
+    p = argparse.ArgumentParser(
+        prog="bux export",
+        description="Write a trained run's model as a transformers model directory: "
+        "its code, its weights, its tokenizer and a model card.",
+    )
+    p.add_argument(
+        "run", metavar="RUN_DIR", help="the run's directory: runs/<name>-<id>"
+    )
+    p.add_argument("out", metavar="OUT", help="the directory to write")
+    p.add_argument(
+        "--step",
+        type=int,
+        metavar="N",
+        help="the checkpoint's step (default: the latest)",
+    )
+    p.add_argument(
+        "--dtype",
+        choices=["float32", "bfloat16", "float16"],
+        help="the weights' dtype (default: the parameters', float32)",
+    )
+    p.add_argument(
+        "--check",
+        action="store_true",
+        help="compare the export with bux on the run's weights, in float32, and fail "
+        "if they disagree",
+    )
+    return p
+
+
+def _export(args: argparse.Namespace) -> int:
+    from transformers.utils import logging
+
+    from bux.export.runs import describe, export
+
+    logging.disable_progress_bar()  # a bar each time --check loads the export
+    try:
+        done = export(
+            args.run, args.out, step=args.step, dtype=args.dtype, check=args.check
+        )
+    except (FileNotFoundError, ValueError, NotImplementedError) as err:
+        return _error(f"bux export: {err}")
+    run, step = done.restored.run, done.restored.step
+    print(
+        f"{run.name}: step {step} exported to {done.out}, its weights in {done.dtype}"
+    )
+    if done.report is None:
+        return 0
+    print(describe(done.report))
+    try:
+        done.report.check()
+    except AssertionError as err:
+        return _error(f"bux export: the export disagrees with bux: {err}")
+    return 0
+
+
 def _error(message: str) -> int:
     print(message, file=sys.stderr)
     return 1
@@ -307,6 +448,8 @@ def _check(report: Report, arch: Architecture, runs: list[Run]) -> None:
     print(summary(arch))
     if report.run is not None:
         print(training(report.run))
+        if report.dimensions:
+            print(searching(report.run, report.dimensions))
     if len(runs) > 1:
         taken = {part for run in runs for part in run.choices}
         live = [
@@ -329,27 +472,35 @@ def _prepare(runs: list[Run], cache: str, workers: int | None) -> int:
     return 0
 
 
-def _select(runs: list[Run], index: int | None, only: str | None) -> list[Run]:
+def _select(spaces: list[Space], index: int | None, only: str | None) -> list[Space]:
     if index is not None:
-        if not 0 <= index < len(runs):
-            s = "s" if len(runs) != 1 else ""
-            raise ValueError(f"--index {index}, but the file makes {len(runs)} run{s}")
-        runs = runs[index : index + 1]
+        if not 0 <= index < len(spaces):
+            n, s = len(spaces), "s" if len(spaces) != 1 else ""
+            raise ValueError(f"--index {index}, but the file makes {n} run{s}")
+        spaces = spaces[index : index + 1]
     if only is not None:
-        runs = [run for run in runs if only in run.name]
-        if not runs:
+        spaces = [space for space in spaces if only in space.run.name]
+        if not spaces:
             raise ValueError(f"no run's name contains {only!r}")
-    return runs
+    return spaces
 
 
-def _train(args: argparse.Namespace, runs: list[Run]) -> int:
+def _train(args: argparse.Namespace, spaces: list[Space]) -> int:
     try:
-        runs = _select(runs, args.index, args.only)
+        spaces = _select(spaces, args.index, args.only)
     except ValueError as err:
         return _error(str(err))
     from bux.runtime import configure
 
     configure()
+    runs = [space.run for space in spaces]
+    if any(space.dimensions for space in spaces):
+        from bux.launch import search
+
+        here = args.command == "train"
+        return search(
+            spaces, args.out, cache=args.cache, workers=args.workers, here=here
+        )
     if args.command == "launch":
         from bux.launch import launch
 
@@ -361,20 +512,42 @@ def _train(args: argparse.Namespace, runs: list[Run]) -> int:
     return 0
 
 
+def _results(args: argparse.Namespace, spaces: list[Space]) -> int:
+    try:
+        spaces = _select(spaces, args.index, args.only)
+    except ValueError as err:
+        return _error(str(err))
+    from bux.launch import summary
+
+    if not any(space.dimensions for space in spaces):
+        print(summary([space.run for space in spaces], args.out))
+        return 0
+    from bux.search.search import Search, Searches
+
+    searches = Searches([Search(space, args.out) for space in spaces])
+    print(searches.summary())
+    return 0
+
+
 def _run(
-    args: argparse.Namespace, report: Report, arch: Architecture, runs: list[Run]
+    args: argparse.Namespace, report: Report, arch: Architecture, spaces: list[Space]
 ) -> int:
+    runs = [space.run for space in spaces]
     match args.command:
         case "check":
             _check(report, arch, runs)
-        case "plan" | "train" | "launch" if not runs:
+        case "plan" | "train" | "launch" | "results" if not runs:
             return _error("this file does not say how to train its model")
         case "plan":
             print(plan(runs))
+            if searches := plan_searches(spaces):
+                print(searches)
         case "prepare":
             return _prepare(runs, args.cache, args.workers)
         case "train" | "launch":
-            return _train(args, runs)
+            return _train(args, spaces)
+        case "results":
+            return _results(args, spaces)
         case "render":
             print(render(arch, expand=args.expand), end="")
         case "fmt":
@@ -401,6 +574,9 @@ def main(argv: list[str] | None = None) -> int:
         0 when it succeeds, 1 on errors; ``bux launch`` returns its own (see
         `bux.launch.launch`).
     """
+    argv = sys.argv[1:] if argv is None else argv
+    if argv[:1] == ["export"]:
+        return _export(export_parser().parse_args(argv[1:]))
     cli = parser()
     args = cli.parse_args(argv)
     for setting in args.settings:
@@ -417,10 +593,10 @@ def main(argv: list[str] | None = None) -> int:
         print(f"a module: it defines {defined or 'nothing'}, and no model")
         return 0
     try:
-        runs = compile_runs(source, **where) if report.run is not None else []
+        spaces = compile_spaces(source, **where) if report.run is not None else []
     except BuxError as err:
         return _error(str(err))
-    return _run(args, report, report.arch, runs)
+    return _run(args, report, report.arch, spaces)
 
 
 if __name__ == "__main__":

@@ -21,9 +21,11 @@ docstring and the comments on its fields are the training half of the language
 reference and what the editor shows on hover (`bux.lang.reference`).
 """
 
+import itertools
+import math
 from typing import Annotated, Literal
 
-from pydantic import AfterValidator, BeforeValidator, Field
+from pydantic import AfterValidator, BeforeValidator, Field, model_validator
 
 from bux.config import Config
 
@@ -285,20 +287,44 @@ OptimizerConfig = Annotated[AdamWConfig | MuonConfig, Field(discriminator="type"
 # A schedule multiplies the optimizer's lr at every step. Each starts with `warmup`
 # steps that rise linearly from lr / warmup at the first step to lr.
 
+# Steps of warmup, or below 1 a share of the steps, rounded to a number of them.
+Warmup = int | Annotated[float, Field(gt=0, lt=1)]
+
+# How a cooldown or a piece goes from where it starts to where it ends: sqrt is
+# 1 - sqrt(t) (Hägele et al., 2024); exp falls by e over it, moved to end where it
+# should (IBM's); geometric by the same factor every step (MiniCPM's), so it starts
+# and ends above 0; and constant is at its end from its first step.
+Shape = Literal["linear", "sqrt", "cosine", "exp", "geometric", "constant"]
+
+
+def _increasing(shares: tuple[float, ...]) -> tuple[float, ...]:
+    if any(a >= b for a, b in itertools.pairwise(shares)):
+        raise ValueError("the shares of the steps must increase")
+    return shares
+
+
+def _above_zero(shape: Shape, *ends: float) -> None:
+    if shape == "geometric" and min(ends) <= 0:
+        raise ValueError("a geometric cooldown or piece starts and ends above 0")
+
 
 class ConstantSchedule(Config):
     """The peak learning rate throughout, after the warmup."""
 
     type: Literal["constant"] = "constant"
-    warmup: int = 0  # steps of linear warmup
+    warmup: Warmup = 0  # steps of linear warmup, or a share of them below 1
 
 
 class CosineSchedule(Config):
-    """Warmup, then a cosine decay to `final` times the peak at the last step."""
+    """Warmup, then a cosine decay to `final` times the peak at the last step, or at
+    the `horizon` of the steps."""
 
     type: Literal["cosine"] = "cosine"
-    warmup: int = 0  # steps of linear warmup
+    warmup: Warmup = 0  # steps of linear warmup, or a share of them below 1
     final: float = 0.1  # the multiplier at the last step: a fraction of the peak
+    # The share of the steps the cosine reaches `final` at, rounded to a step: above
+    # 1, the run stops before it does, as OLMo 2's and 3's do; below, it holds there.
+    horizon: Annotated[float, Field(gt=0)] = 1.0
 
 
 class WSDSchedule(Config):
@@ -307,21 +333,191 @@ class WSDSchedule(Config):
     stable phase can be cooled down later, to study several run lengths at once."""
 
     type: Literal["wsd"] = "wsd"
-    warmup: int = 0  # steps of linear warmup
+    warmup: Warmup = 0  # steps of linear warmup, or a share of them below 1
     # The share of the steps the cooldown takes, rounded to a number of steps.
     decay: Annotated[float, Field(ge=0, le=1)] = 0.2
     final: float = 0.0  # the multiplier at the last step: a fraction of the peak
-    # The cooldown's curve; sqrt is 1 - sqrt(t) (Hägele et al., 2024).
-    shape: Literal["linear", "sqrt", "cosine"] = "linear"
+    shape: Shape = "linear"  # the cooldown's curve
+
+    @model_validator(mode="after")
+    def _ends(self) -> "WSDSchedule":
+        """Check that a geometric cooldown ends above 0."""
+        _above_zero(self.shape, self.final)
+        return self
 
     def cooldown(self, steps: int) -> int:
         """Return the steps of the cooldown, in a run of `steps`."""
         return round(self.decay * steps)
 
 
+class LinearDecaySchedule(Config):
+    """Warmup, then a linear decay to `final` times the peak at the last step:
+    straight to zero by default, which Bergsma et al. (2025) find best."""
+
+    type: Literal["linear_decay"] = "linear_decay"
+    warmup: Warmup = 0  # steps of linear warmup, or a share of them below 1
+    final: float = 0.0  # the multiplier at the last step: a fraction of the peak
+
+
+class MultiStepSchedule(Config):
+    """Warmup, then the peak, times `factor` from each share of the steps in `at`
+    on: DeepSeek LLM's 0.316 from 80% of the steps and again from 90%."""
+
+    type: Literal["multistep"] = "multistep"
+    warmup: Warmup = 0  # steps of linear warmup, or a share of them below 1
+    # The shares of the steps it drops at, in order, each rounded to a step.
+    at: Annotated[tuple[Fraction, ...], AfterValidator(_increasing)] = (0.8, 0.9)
+    factor: float = 0.316  # what each drop multiplies by; 0.316 is 1 / sqrt(10)
+
+
+class PowerSchedule(Config):
+    """IBM's Power scheduler (Shen et al., 2024): warmup, then `a` times the batch
+    times n to the `b`, n the tokens trained, capped at the peak; then a cooldown to
+    `final` times where it starts, over the last `decay` of the steps. The warmup
+    rises to the power law's value at the warmup's last step. The peak is the
+    optimizer's lr: the paper's is 0.02, under µP."""
+
+    type: Literal["power"] = "power"
+    warmup: Warmup = 0  # steps of linear warmup, or a share of them below 1
+    a: float = 4.0  # the power law's amplitude, for a batch of one row
+    b: float = -0.51  # its exponent, of the tokens trained
+    # The share of the steps the cooldown takes, rounded to a number of steps.
+    decay: Fraction = 0.1
+    final: float = 0.0  # the multiplier at the last step: a fraction of the start
+    shape: Shape = "exp"  # the cooldown's curve
+
+    @model_validator(mode="after")
+    def _ends(self) -> "PowerSchedule":
+        """Check that a geometric cooldown ends above 0."""
+        _above_zero(self.shape, self.final)
+        return self
+
+    def cooldown(self, steps: int) -> int:
+        """Return the steps of the cooldown, in a run of `steps`."""
+        return round(self.decay * steps)
+
+
+class Piece(Config):
+    """A piece of a `piecewise` schedule: from the multiplier the piece before ends
+    at, the peak for the first, to `to`, along `shape`, until `until` of the
+    steps."""
+
+    type: Literal["piece"] = "piece"
+    until: Fraction = 1.0  # the share of the steps it ends at, rounded to a step
+    to: float | None = None  # the multiplier it ends at; none holds where it starts
+    shape: Shape = "constant"  # how it gets there; constant is there at once
+
+
+def _in_order(pieces: tuple[Piece, ...]) -> tuple[Piece, ...]:
+    if not pieces or pieces[-1].until != 1:
+        raise ValueError("the last piece ends at 1, the end of the run")
+    _increasing(tuple(p.until for p in pieces))
+    for p, start in zip(pieces, levels(pieces), strict=False):
+        _above_zero(p.shape, start, start if p.to is None else p.to)
+    return pieces
+
+
+def levels(pieces: tuple[Piece, ...]) -> list[float]:
+    """Return the multiplier each piece starts at, then the one the last ends at."""
+    found = [1.0]
+    for p in pieces:
+        found.append(found[-1] if p.to is None else p.to)
+    return found
+
+
+class PiecewiseSchedule(Config):
+    """Warmup, then `pieces`, one after the other from the end of the warmup: holds,
+    decays, drops and re-warmups, as tech reports chain them. DeepSeek-V3's holds
+    the peak to 10T of its 14.8T tokens, decays along a cosine to 10% of it by
+    14.3T, holds that to 14.633T, and drops to 3.3% for the rest::
+
+        piecewise(warmup=2k, pieces=[piece(until=10 / 14.8),
+                                     piece(until=14.3 / 14.8, to=0.1, shape=cosine),
+                                     piece(until=14.633 / 14.8),
+                                     piece(to=0.033)])
+    """
+
+    type: Literal["piecewise"] = "piecewise"
+    warmup: Warmup = 0  # steps of linear warmup, or a share of them below 1
+    # The pieces in order, each ending later than the one before; the last at 1.
+    pieces: Annotated[tuple[Piece, ...], AfterValidator(_in_order)]
+
+    def cooldown(self, steps: int) -> int:
+        """Return the steps after the first piece, in a run of `steps`."""
+        return steps - round(self.pieces[0].until * steps)
+
+
 ScheduleConfig = Annotated[
-    ConstantSchedule | CosineSchedule | WSDSchedule, Field(discriminator="type")
+    ConstantSchedule
+    | CosineSchedule
+    | WSDSchedule
+    | LinearDecaySchedule
+    | MultiStepSchedule
+    | PowerSchedule
+    | PiecewiseSchedule,
+    Field(discriminator="type"),
 ]
+# The schedules with a part at their end that the warmup must leave room for.
+COOLED = (WSDSchedule, PowerSchedule, PiecewiseSchedule)
+
+
+def warmup_steps(c: ScheduleConfig, steps: int) -> int:
+    """Return the steps of the warmup of `c`, in a run of `steps`."""
+    return round(c.warmup * steps) if isinstance(c.warmup, float) else c.warmup
+
+
+# --- Curriculum and ramps ---------------------------------------------------------------
+# What a run reads can change as it trains: each phase of a `curriculum` takes rows of
+# another `seq_len`, another `batch` or other `data` from a step on, and a `batch_ramp`
+# grows the batch over the first steps. The steps compile again at every new shape of
+# batch (bux.train.curriculum).
+
+# A step, or a share of the steps below 1, rounded to a step.
+At = Annotated[int, Field(gt=0)] | Annotated[float, Field(gt=0, lt=1)]
+
+
+class PhaseConfig(Config):
+    """From step `at` on, rows of `seq_len` tokens, `batch` of them a step, from
+    `data`, each as the phase before where it is none: the run's own settings before
+    the first phase. ``phase(at=0.9, seq_len=8192, batch=64, data=long)`` reads the
+    last tenth of the run at 8k tokens a row from `long`.
+
+    A source goes on, from one phase to the next, from the row it stopped at, where
+    it is read at the same `seq_len`; at another, it is a dataset of its own, which
+    starts from its first row. An eval reads rows of the run's own `seq_len` and
+    `batch`, whichever phase it is in."""
+
+    type: Literal["phase"] = "phase"
+    at: At  # the step it starts at, or a share of the steps: 0.9 starts the last tenth
+    # Tokens per row; none: as before.
+    seq_len: Annotated[int, Field(ge=2)] | None = None
+    batch: Positive | None = None  # rows per step; none: as before
+    data: DataConfig | None = None  # a source or a mixture; none: as before
+
+    def start(self, steps: int) -> int:
+        """Return the step it starts at, in a run of `steps`."""
+        return round(self.at * steps) if isinstance(self.at, float) else self.at
+
+
+class RampConfig(Config):
+    """A batch that grows from `start` rows at the first step to the run's `batch`
+    over `steps` steps, as GPT-3's and DeepSeek-V3's do: linearly, rounded down to a
+    multiple of `multiple`, and never below `start`. Each batch size it takes
+    compiles the step again, so a coarser `multiple` compiles fewer."""
+
+    type: Literal["ramp"] = "ramp"
+    start: Positive  # rows per step at the first step
+    steps: Positive  # the steps it takes to reach the run's batch
+    multiple: Positive | None = None  # of the batch sizes it takes; none: `start`
+
+
+def _phases(v: object) -> object:
+    """One phase, as a list of one."""
+    return (v,) if isinstance(v, PhaseConfig) else v
+
+
+# A phase, or a list of them in the order they start.
+Phases = Annotated[tuple[PhaseConfig, ...], BeforeValidator(_phases)]
 
 
 # --- Loss, evaluation, checkpoints and logs ------------------------------------
@@ -758,6 +954,271 @@ class CompilerConfig(Config):
     reductions: Literal["early", "xla"] = "early"
 
 
+# --- Search ----------------------------------------------------------------------------
+# A setting written as a distribution, `optimizer.lr = log_uniform(1e-4, 1e-2)`, is a
+# dimension of a search (bux.search): each trial of the search is a run that takes a
+# value of it, which the search's method proposes, and the search keeps the trial whose
+# objective is least. Outside a search, as `bux check` and `bux plan` show a run, a
+# dimension takes its middle value: halfway along its scale, or its first option.
+
+#: The significant digits of a value a trial takes, which name its run exactly.
+DIGITS = 3
+
+
+def significant(x: float) -> float:
+    """Return `x` to `DIGITS` significant digits."""
+    return float(f"{x:.{DIGITS}g}")
+
+
+class _Range(Config):
+    """A dimension between two bounds, `low` < `high`, which its subclasses declare."""
+
+    @model_validator(mode="after")
+    def _increasing(self) -> "_Range":
+        low, high = getattr(self, "low"), getattr(self, "high")  # noqa: B009
+        if not low < high:
+            raise ValueError("low must be less than high")
+        return self
+
+
+class UniformConfig(_Range):
+    """A dimension of a search: a number between `low` and `high`, uniformly, as
+    ``optimizer.weight_decay = uniform(0, 0.2)``. Its bounds can be written in order,
+    without their names."""
+
+    type: Literal["uniform"] = "uniform"
+    low: float  # the least value
+    high: float  # the greatest value
+
+    def value(self, u: float) -> float:
+        """Return the value a fraction `u` of the way from `low` to `high`."""
+        return significant(self.low + u * (self.high - self.low))
+
+    def unit(self, x: float) -> float:
+        """Return how far `x` is from `low` to `high`, as a fraction: `value`'s inverse."""
+        return (x - self.low) / (self.high - self.low)
+
+
+class LogUniformConfig(_Range):
+    """A dimension of a search: a number between `low` and `high`, uniformly on a log
+    scale, as a learning rate is searched: ``optimizer.lr = log_uniform(1e-4, 1e-2)``.
+    Its middle is the geometric mean."""
+
+    type: Literal["log_uniform"] = "log_uniform"
+    low: Annotated[float, Field(gt=0)]  # the least value, above 0
+    high: float  # the greatest value
+
+    def value(self, u: float) -> float:
+        """Return the value a fraction `u` of the way from `low` to `high`, in logs."""
+        return significant(self.low * (self.high / self.low) ** u)
+
+    def unit(self, x: float) -> float:
+        """Return how far `x` is from `low` to `high` in logs: `value`'s inverse."""
+        return math.log(x / self.low) / math.log(self.high / self.low)
+
+
+class IntUniformConfig(_Range):
+    """A dimension of a search: an integer from `low` to `high`, both included,
+    uniformly, or on a log scale with `log`: ``schedule.warmup = int_uniform(100, 2k,
+    log=true)``. For a few values that must divide others, as a number of heads,
+    `choice` lists them."""
+
+    type: Literal["int_uniform"] = "int_uniform"
+    low: int  # the least value
+    high: int  # the greatest value
+    log: bool = False  # uniform on a log scale, for 0 < low
+
+    def value(self, u: float) -> int:
+        """Return the integer nearest to a fraction `u` of the way from `low` to
+        `high`, each integer as likely, or in logs with `log`."""
+        if self.log:
+            # Each integer takes the stretch of the log scale nearest to it.
+            low, high = math.log(self.low - 0.5), math.log(self.high + 0.5)
+            x = math.exp(low + u * (high - low))
+        else:
+            x = self.low - 0.5 + u * (self.high - self.low + 1)
+        return min(max(round(x), self.low), self.high)
+
+    def unit(self, x: float) -> float:
+        """Return the fraction of the way from `low` to `high` at the middle of the
+        stretch that `x` takes: `value`'s inverse."""
+        if self.log:
+            low, high = math.log(self.low - 0.5), math.log(self.high + 0.5)
+            return (math.log(x) - low) / (high - low)
+        return (x - self.low + 0.5) / (self.high - self.low + 1)
+
+    @model_validator(mode="after")
+    def _positive_if_log(self) -> "IntUniformConfig":
+        if self.log and self.low < 1:
+            raise ValueError("int_uniform(log=true) needs low >= 1")
+        return self
+
+
+class ChoiceConfig(Config):
+    """A dimension of a search: one of its options, each as likely, which can be any
+    values, settings or blocks: ``ffn.activation = choice(swish, gelu)``, or with
+    names, ``block = choice(pre=[norm attn] [norm ffn], par=[norm (attn + ffn)])``,
+    which name the trials that take them. Where ``a | b`` is an axis of a sweep, a
+    search over each of its runs, a choice is the search's to make."""
+
+    type: Literal["choice"] = "choice"
+    # The options' names, or the options as written: "swish", "gelu".
+    options: Annotated[tuple[str, ...], Field(min_length=2)]
+
+    def value(self, u: float) -> int:
+        """Return the index of the option a fraction `u` of the way along them."""
+        return min(int(u * len(self.options)), len(self.options) - 1)
+
+    def unit(self, x: int) -> float:
+        """Return the middle of the stretch of option `x`: `value`'s inverse."""
+        return (x + 0.5) / len(self.options)
+
+
+Distribution = Annotated[
+    UniformConfig | LogUniformConfig | IntUniformConfig | ChoiceConfig,
+    Field(discriminator="type"),
+]
+
+
+class RandomSearch(Config):
+    """Random search (Bergstra & Bengio, 2012): every trial a point drawn at random,
+    each dimension on its own scale. A baseline that is hard to beat in few
+    dimensions, and whose trials need nothing of each other."""
+
+    type: Literal["random"] = "random"
+
+
+class HaltonSearch(Config):
+    """Quasi-random search: the points of a scrambled Halton sequence, which cover the
+    space more evenly than random ones, with no clumps and no gaps, however many
+    trials there are, and need nothing of each other's results. What the Deep
+    Learning Tuning Playbook (Godbole et al., 2023) explores a space with, and what
+    `tpe` and `gp` start with."""
+
+    type: Literal["halton"] = "halton"
+
+
+class SobolSearch(Config):
+    """Quasi-random search: the points of a scrambled Sobol sequence, evenest of all
+    when the trials are a power of two, 8, 16 or 32: other counts lose its balance
+    (Owen, 2020), and `halton` suits them."""
+
+    type: Literal["sobol"] = "sobol"
+
+
+class TPESearch(Config):
+    """The tree-structured Parzen estimator (Bergstra et al., 2011), as Optuna's: after
+    `startup` quasi-random trials, the trials are split into the best ``gamma`` of
+    them and the rest, a density is fit to each, and of `candidates` points drawn
+    from the best's, the one most likely under it and least under the rest's is
+    tried. Trials still training count among the rest, so that trials at once differ.
+    It handles choices and many dimensions well, and costs nothing to fit."""
+
+    type: Literal["tpe"] = "tpe"
+    startup: Positive = 10  # quasi-random trials before the densities propose
+    candidates: Positive = 24  # points drawn from the best's density, to pick from
+    # The share of the trials that are the best: ceil(gamma * n), at most 25.
+    gamma: Annotated[float, Field(gt=0, lt=1)] = 0.1
+    # One density over every dimension, which sees how they interact; or one each.
+    multivariate: bool = True
+
+
+class GPSearch(Config):
+    """Bayesian optimization with a Gaussian process (Snoek et al., 2012), as BoTorch's
+    and Vizier's: after `startup` quasi-random trials, a GP with a Matérn-5/2 kernel,
+    a length scale for each dimension, is fit to the trials' objectives, and the point
+    of most expected improvement over the best (log EI, Ament et al., 2023) is tried.
+    Trials still training count as done at the GP's prediction for them (the kriging
+    believer), so that trials at once differ. The most of each trial in few
+    dimensions, for runs that take long."""
+
+    type: Literal["gp"] = "gp"
+    startup: Positive = 5  # quasi-random trials before the GP proposes
+    # What the next point maximizes: expected improvement, in logs, or the upper
+    # confidence bound of the improvement, mean + beta * deviation.
+    acquisition: Literal["log_ei", "ucb"] = "log_ei"
+    beta: Annotated[float, Field(gt=0)] = 2.0  # ucb's weight of the deviation
+
+
+SearchMethod = Annotated[
+    RandomSearch | HaltonSearch | SobolSearch | TPESearch | GPSearch,
+    Field(discriminator="type"),
+]
+
+
+class HalvingConfig(Config):
+    """Asynchronous successive halving (ASHA; Li et al., 2020): every trial trains a
+    short run first, the bottom rung, and the best ``1 / eta`` of each rung train
+    again, `eta` times longer, up to the run's own steps. A GPU that frees up takes
+    the next trial up, if a rung has one, else a new trial at the bottom. Each rung
+    is a run of its own, from scratch, with its schedule over its own steps: so a
+    short run's warmup and decay are the long run's, shrunk, and its objective is
+    the run's at that length.
+
+    With `brackets` above 1 it is Hyperband (Li et al., 2018): the trials take turns
+    starting at the bottom rung, the one above, and so on, which hedges against a
+    short run ranking trials as a long one would not."""
+
+    type: Literal["halving"] = "halving"
+    # Each rung trains the best 1/eta of the one below, eta times longer.
+    eta: Annotated[int, Field(ge=2)] = 3
+    # Rungs of steps, the last the run's own: steps / eta^(rungs - 1), ..., steps.
+    rungs: Annotated[int, Field(ge=2)] = 3
+    brackets: Positive = 1  # Hyperband's brackets: the rungs trials start at, from 0
+
+    @model_validator(mode="after")
+    def _brackets(self) -> "HalvingConfig":
+        if self.brackets > self.rungs:
+            raise ValueError("halving needs brackets <= rungs")
+        return self
+
+    def steps(self, steps: int, rung: int) -> int:
+        """Return the steps of `rung`, from 0, of a run of `steps`."""
+        return max(1, round(steps / self.eta ** (self.rungs - 1 - rung)))
+
+
+class SearchConfig(Config):
+    """How a run with dimensions (`uniform`, `log_uniform`, `int_uniform`, `choice`)
+    is searched: `trials` points, each a run of its own, proposed by `method`, ranked
+    by the run's `objective`. Each run of a sweep is a search of its own, so
+    ``attn.num_kv_heads = 1 | 4`` with ``optimizer.lr = log_uniform(1e-4, 1e-2)`` tunes
+    the learning rate of each attention apart, and compares them at their best.
+
+    `bux launch` trains the trials side by side, a GPU group each, and proposes the
+    next as one ends. The search keeps its trials in its own directory, so a search
+    launched again goes on where it stopped, and one given more trials adds them."""
+
+    type: Literal["search"] = "search"
+    method: SearchMethod = GPSearch()  # how the next trial is proposed
+    trials: Positive = 16  # the points it tries, at the bottom rung with halving
+    # Trials at once, at most; none: as many as the GPUs hold.
+    parallel: Positive | None = None
+    # Short runs first, and only the best trained to the end; none: every trial all.
+    halving: HalvingConfig | None = None
+    seed: int = 0  # of the proposals, not of the runs, which keep the run's own
+
+
+class Term(Config):
+    """A term of an objective: a metric and its weight, ``0.7 * web_bpb``."""
+
+    metric: str  # a metric the run logs, as metrics.jsonl names it
+    weight: float  # what its value is multiplied by
+
+
+class ObjectiveConfig(Config):
+    """What a search minimizes, and what ranks the runs of a sweep: a weighted sum of
+    metrics a run logs, each at its latest value, written as one:
+    ``objective = 0.7 * web_bpb + 0.3 * code_bpb``, ``(web_bpb + code_bpb) / 2``, or
+    ``-tokens_per_s`` for the most tokens a second. Its names are the metrics, not
+    definitions, but for a definition of a number: ``w = 0.7`` makes ``w * web_bpb +
+    (1 - w) * code_bpb`` the same. A metric with a slash is a string,
+    ``"time/step_ms"``."""
+
+    type: Literal["objective"] = "objective"
+    terms: Annotated[tuple[Term, ...], Field(min_length=1)]  # the metrics, weighted
+    constant: float = 0.0  # added to the sum, which changes no ranking
+
+
 class TrainConfig(Config):
     """The training settings of a run: one field per top-level setting of a .bux file.
     A file that sets any of them is a run, and needs the required ones: `data`,
@@ -770,7 +1231,12 @@ class TrainConfig(Config):
     schedule: ScheduleConfig = ConstantSchedule()  # the learning rate's multiplier
     seq_len: Annotated[int, Field(ge=2)]  # tokens per row
     batch: Positive  # rows per step, over all devices
+    # A smaller batch at the first steps, which grows to `batch`; none: none.
+    batch_ramp: RampConfig | None = None
     steps: Positive  # optimizer steps
+    # Phases that each change seq_len, batch or data from a step on: a phase, or a list
+    # of them; [] is none.
+    curriculum: Phases = ()
     seed: int = 0  # of the model's initialization and of the data's order
     clip: float | None = 1.0  # clip gradients to this global norm; none disables it
     loss: LossConfig = LossConfig()  # the loss's terms and their weights
@@ -787,6 +1253,11 @@ class TrainConfig(Config):
     layout: LayoutConfig = LayoutConfig()  # which axes each named dimension splits over
     methods: MethodsConfig = MethodsConfig()  # how what communicates is computed
     compiler: CompilerConfig = CompilerConfig()  # XLA's options for the training step
+    # What a search minimizes and a sweep's table ranks by: a weighted sum of metrics,
+    # 0.7 * web_bpb + 0.3 * code_bpb; none: the first eval's bpb, else its loss, else
+    # the training loss.
+    objective: ObjectiveConfig | None = None
+    search: SearchConfig = SearchConfig()  # how a run with dimensions is searched
 
 
 # The configs a .bux file calls by name, besides layers and their settings.
@@ -804,6 +1275,13 @@ Setting = Annotated[
     | ConstantSchedule
     | CosineSchedule
     | WSDSchedule
+    | LinearDecaySchedule
+    | MultiStepSchedule
+    | PowerSchedule
+    | PiecewiseSchedule
+    | Piece
+    | PhaseConfig
+    | RampConfig
     | LossConfig
     | EvalConfig
     | CheckpointConfig
@@ -819,7 +1297,18 @@ Setting = Annotated[
     | LayoutConfig
     | RematConfig
     | MethodsConfig
-    | CompilerConfig,
+    | CompilerConfig
+    | UniformConfig
+    | LogUniformConfig
+    | IntUniformConfig
+    | ChoiceConfig
+    | RandomSearch
+    | HaltonSearch
+    | SobolSearch
+    | TPESearch
+    | GPSearch
+    | HalvingConfig
+    | SearchConfig,
     Field(discriminator="type"),
 ]
 
@@ -835,3 +1324,16 @@ def leaves(c: DataConfig) -> tuple[Source, ...]:
 def evals(t: TrainConfig) -> tuple[EvalConfig, ...]:
     """Return the run's evals, in order: none, one, or those of its list."""
     return _each(t.eval)
+
+
+def objective(t: TrainConfig) -> ObjectiveConfig:
+    """Return the run's objective: its own, or the first eval's bits per byte where
+    it has a tokenizer, else that eval's loss, else the training loss."""
+    if t.objective is not None:
+        return t.objective
+    first = next(iter(evals(t)), None)
+    if first is None:
+        metric = "loss"
+    else:
+        metric = f"{first.name}_{'bpb' if t.tokenizer is not None else 'loss'}"
+    return ObjectiveConfig(terms=(Term(metric=metric, weight=1.0),))

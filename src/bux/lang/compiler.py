@@ -21,6 +21,7 @@ import builtins
 import difflib
 import operator
 import re
+import types
 import typing
 from collections.abc import Callable, Generator, Mapping, Sequence
 from contextlib import contextmanager
@@ -34,6 +35,7 @@ from bux.lang import ir, modules
 from bux.lang import syntax as ast
 from bux.lang.syntax import BuxError, Span
 from bux.train import config as tcfg
+from bux.train import curriculum
 
 
 def _tags(union: object) -> dict[str, type[cfg.Config]]:
@@ -160,6 +162,62 @@ class Axis:
         return f"{self.where}={self.options[pick]}"
 
 
+#: The distributions a search's dimensions are written as, by name: ``uniform``,
+#: ``log_uniform``, ``int_uniform`` and ``choice``.
+#:
+#: :meta hide-value:
+DISTRIBUTIONS = _tags(tcfg.Distribution)
+# What a distribution's positional arguments are: uniform(0, 0.2) is low=0, high=0.2.
+_BOUNDS = ("low", "high")
+
+
+@dataclass(frozen=True)
+class Dimension:
+    """One dimension of a search: a distribution as written, ``log_uniform(1e-4,
+    1e-2)``, of which each trial takes a value. A macro's takes the same value at
+    every call, as its alternatives do.
+
+    Attributes:
+        key: Its span in the joined source, by which a point gives it a value.
+        where: The definition and setting it is written in, which names the trials
+            that take its values: ``"optimizer.lr"``.
+        space: The distribution: its bounds, or a choice's options.
+    """
+
+    key: Span
+    where: str
+    space: (
+        tcfg.UniformConfig
+        | tcfg.LogUniformConfig
+        | tcfg.IntUniformConfig
+        | (tcfg.ChoiceConfig)
+    )
+
+    def part(self, value: float) -> str:
+        """Return how a trial that took `value` is named: ``optimizer.lr=3.16e-4``,
+        or for a choice, by its option: ``block=par``."""
+        match self.space:
+            case tcfg.ChoiceConfig(options=options):
+                return f"{self.where}={options[int(value)]}"
+            case tcfg.IntUniformConfig():
+                return f"{self.where}={int(value)}"
+        return f"{self.where}={short(value)}"
+
+
+def middle(space: tcfg.Distribution) -> float:
+    """Return what a dimension takes outside a search: the value halfway along its
+    scale, or a choice's first option, 0."""
+    return 0 if isinstance(space, tcfg.ChoiceConfig) else space.value(0.5)
+
+
+def short(x: float) -> str:
+    """Return `x` as briefly as it reads back the same: ``3.16e-4``, ``0.05``."""
+    mantissa, power = f"{x:.{tcfg.DIGITS - 1}e}".split("e")
+    mantissa = mantissa.rstrip("0").rstrip(".")
+    written = (repr(float(x)).removesuffix(".0"), f"{mantissa}e{int(power)}")
+    return min((w for w in written if float(w) == x), key=len, default=repr(x))
+
+
 class _Reported(BuxError):
     """A repeat, at a use, of an error already reported; check() drops it."""
 
@@ -198,9 +256,32 @@ def _config_type(value: object) -> type[cfg.Config] | None:
     return None
 
 
+def _option_of(cls: type[cfg.Config], key: tuple[str, ...], name: str) -> bool:
+    """Whether the setting `key` of `cls` takes the string `name`, of a Literal."""
+    field = cls.model_fields.get(key[0]) if len(key) == 1 else None
+    return field is not None and name in _options(field.annotation)
+
+
+def _options(annotation: object) -> tuple[object, ...]:
+    """Return the values of the Literals in `annotation`, through Annotated and
+    unions."""
+    origin = typing.get_origin(annotation)
+    if origin is typing.Literal:
+        return typing.get_args(annotation)
+    if origin is typing.Annotated:
+        return _options(typing.get_args(annotation)[0])
+    if origin in (typing.Union, types.UnionType):
+        return tuple(o for m in typing.get_args(annotation) for o in _options(m))
+    return ()
+
+
 def _is_number(value: object) -> bool:
     value = _unwrap(value)
     return isinstance(value, int | float) and not isinstance(value, bool)
+
+
+def _scaled(weights: dict[str, float], by: float) -> dict[str, float]:
+    return {k: by * w for k, w in weights.items()}
 
 
 def _activation(name: str) -> cfg.ActivationConfig:
@@ -275,9 +356,12 @@ class _Evaluator:
         *,
         report: Callable[[BuxError], None] | None = None,
         choices: Mapping[Span | frozenset[str], int | str] | None = None,
+        point: Mapping[Span, float] | None = None,
     ):
         """`report` collects statement errors instead of raising them, for check().
-        `choices` picks alternatives by Axis key; the others take their first."""
+        `choices` picks alternatives by Axis key; the others take their first.
+        `point` gives dimensions their values by Dimension key, a choice the index of
+        its option; the others take their middle."""
         self.source = program.source
         # Names of definitions that failed to parse, whose uses are not errors.
         self.broken = set(program.broken)
@@ -298,6 +382,8 @@ class _Evaluator:
         self.depth = 0
         self.choices = dict(choices or {})
         self.axes: dict[Span | frozenset[str], Axis] = {}  # met so far, in order
+        self.point = dict(point or {})
+        self.dims: dict[Span, Dimension] = {}  # met so far, in order
         # Source spans of graph nodes, for errors found while lowering. The list keeps
         # the nodes alive so that their ids stay unique.
         self.node_spans: dict[int, Span] = {}
@@ -351,7 +437,11 @@ class _Evaluator:
             self.evaluating.append(name)
             self.levels.append(level)
             try:
-                value = self.eval(st.body, {})
+                value = (
+                    self.objective(st.body)
+                    if name == "objective"
+                    else self.eval(st.body, {})
+                )
             finally:
                 self.evaluating.pop()
                 self.levels.pop()
@@ -664,12 +754,15 @@ class _Evaluator:
                 return value
             case cfg.Config():
                 if _tag(value) not in LAYERS:
-                    kind = (
-                        "a training setting"
-                        if _tag(value) in TRAINING
-                        else "a setting of a layer"
+                    training = _tag(value) in TRAINING
+                    kind = "a training setting" if training else "a setting of a layer"
+                    # [x] is x's residual branch: a list of one is [x,].
+                    hint = (
+                        f"a list of one is [{_tag(value)}(...),]" if training else None
                     )
-                    raise BuxError(f"{_tag(value)}(...) is {kind}, not a layer", span)
+                    raise BuxError(
+                        f"{_tag(value)}(...) is {kind}, not a layer", span, hint
+                    )
                 config = typing.cast(cfg.LayerConfig, value)
                 return self.node(ir.Layer(config=config), span)
             case _Builtin(name=name) if name in ACTIVATIONS:
@@ -735,6 +828,8 @@ class _Evaluator:
         match callee:
             case _Macro(statement=st):
                 return self.apply(st, expr, scope)
+            case _Builtin(name=name) if name in DISTRIBUTIONS:
+                return self.dimension(expr, scope)
             case _Builtin(name=name) if name in TYPES:
                 fields, ports = self.arguments(expr, scope, TYPES[name])
                 config = self.construct(name, fields, expr.span)
@@ -760,6 +855,146 @@ class _Evaluator:
             case _Bare(name=name):
                 raise self.unknown(name, expr.name_span, called=True)
         raise self.not_callable(expr, callee)
+
+    # --- Search dimensions and objectives ---------------------------------------------
+
+    def dimension(self, expr: ast.Call, scope: dict[str, object]) -> object:
+        """Return the value that `point` gives the dimension `expr`, or its middle; of
+        a choice, the option it picks, evaluated."""
+        options: list[ast.Arg] = []
+        if expr.name == "choice":
+            options = list(expr.args)
+            space: tcfg.Distribution = self.choice(expr)
+        else:
+            fields = self.bounds(expr, scope)
+            space = typing.cast(
+                tcfg.Distribution, self.construct(expr.name, fields, expr.span)
+            )
+        met = self.dims.get(expr.span)
+        if met is None:
+            self.dims[expr.span] = Dimension(expr.span, expr.where or expr.name, space)
+        elif met.space != space:
+            raise BuxError(
+                "a dimension takes one value wherever it is used, so its bounds "
+                "cannot change with a macro's arguments",
+                expr.span,
+            )
+        value = self.point.get(expr.span, middle(space))
+        if options:
+            return self.eval(options[int(value)].value, scope)
+        return value
+
+    def choice(self, expr: ast.Call) -> tcfg.ChoiceConfig:
+        """Return the options of ``choice(a, b)`` as written, or by their names,
+        ``choice(pre=..., par=...)``."""
+        keys = [arg.key for arg in expr.args]
+        if any(keys) and not all(keys):
+            raise BuxError("name every option of a choice or none of them", expr.span)
+        if any(key is not None and len(key) > 1 for key in keys):
+            raise BuxError(
+                "an option's name is one word: choice(pre=..., par=...)", expr.span
+            )
+        names = [
+            key[0] if key else self.text(a.value.span)
+            for key, a in zip(keys, expr.args)
+        ]
+        if len(names) < 2:
+            raise BuxError(
+                "a choice needs two options or more", expr.span, "choice(swish, gelu)"
+            )
+        if len(set(names)) < len(names):
+            raise BuxError("two options of a choice are the same", expr.span)
+        return tcfg.ChoiceConfig(options=tuple(names))
+
+    def bounds(self, expr: ast.Call, scope: dict[str, object]) -> _Fields:
+        """Return a distribution's settings, its first two given in order as `low` and
+        `high`: uniform(0, 0.2)."""
+        positional = [arg for arg in expr.args if arg.key is None]
+        if len(positional) > len(_BOUNDS) or (
+            positional and expr.args[: len(positional)] != tuple(positional)
+        ):
+            raise BuxError(
+                f"{expr.name} takes low and high in order, then settings by name",
+                (positional[-1] if positional else expr).span,
+            )
+        named = ast.Call(
+            expr.span,
+            expr.name,
+            expr.name_span,
+            tuple(
+                ast.Arg(arg.span, (key,), arg.value, (arg.span,))
+                for key, arg in zip(_BOUNDS, positional)
+            )
+            + expr.args[len(positional) :],
+        )
+        fields, _ = self.arguments(named, scope, DISTRIBUTIONS[expr.name])
+        return fields
+
+    def objective(self, expr: ast.Expr) -> tcfg.ObjectiveConfig:
+        """Read an objective as written: a weighted sum of metrics, whose names are
+        the metrics, but for definitions of numbers."""
+        weights = self.linear(expr)
+        constant = weights.pop("", 0.0)
+        if not weights:
+            raise BuxError(
+                "an objective is a weighted sum of metrics, but this has none",
+                expr.span,
+                "objective = 0.7 * web_bpb + 0.3 * code_bpb",
+            )
+        terms = tuple(tcfg.Term(metric=m, weight=w) for m, w in weights.items())
+        return tcfg.ObjectiveConfig(terms=terms, constant=constant)
+
+    def linear(self, expr: ast.Expr) -> dict[str, float]:
+        """Return the weight of each metric in `expr`, and of "" its constant."""
+        match expr:
+            case ast.Lit(value=bool()):
+                pass
+            case ast.Lit(value=int() | float() as value):
+                return {"": float(value)}
+            case ast.Lit(value=str() as metric):
+                return {metric: 1.0}
+            case ast.Name(name=name):
+                value = (
+                    self.lookup(name, expr.span, {})
+                    if name in self.statements and name != "objective"
+                    else None
+                )
+                if _is_number(value):
+                    return {"": float(typing.cast(float, _unwrap(value)))}
+                return {name: 1.0}
+            case ast.Neg(operand=operand):
+                return _scaled(self.linear(operand), -1.0)
+            case ast.Alt():
+                return self.linear(self.choose(expr))
+            case ast.BinOp(op="+" | "-" as op, left=left, right=right):
+                a, b = self.linear(left), self.linear(right)
+                sign = 1.0 if op == "+" else -1.0
+                return {k: a.get(k, 0.0) + sign * b.get(k, 0.0) for k in a | b}
+            case ast.BinOp(op="*", left=left, right=right):
+                a, b = self.linear(left), self.linear(right)
+                if set(a) <= {""}:
+                    return _scaled(b, a.get("", 0.0))
+                if set(b) <= {""}:
+                    return _scaled(a, b.get("", 0.0))
+                raise BuxError(
+                    "an objective weights metrics by numbers, not by other metrics",
+                    expr.span,
+                )
+            case ast.BinOp(op="/", left=left, right=right):
+                divisor = self.linear(right)
+                if not set(divisor) <= {""}:
+                    raise BuxError(
+                        "an objective divides metrics by numbers, not by metrics",
+                        right.span,
+                    )
+                if not divisor.get("", 0.0):
+                    raise BuxError("division by zero", right.span)
+                return _scaled(self.linear(left), 1 / divisor[""])
+        raise BuxError(
+            "an objective is a weighted sum of metrics",
+            expr.span,
+            "objective = 0.7 * web_bpb + 0.3 * code_bpb",
+        )
 
     def amended(self, base: object, fields: _Fields, span: Span) -> cfg.Config:
         """Return the config `base` with `fields` set; a bare type, as in
@@ -813,6 +1048,8 @@ class _Evaluator:
                 self.bare[arg.span] = (value.name, arg.value.span, tuple(scope))
             else:
                 self.bare.pop(arg.span, None)
+            if isinstance(value, _Builtin) and _option_of(cls, arg.key, value.name):
+                value = value.name  # wsd(shape=cosine): the option, not the config
             fields.append((arg.key, self.data(value, arg.value.span), arg.span))
         return fields, ports
 
@@ -1370,7 +1607,10 @@ def _model_settings(ev: _Evaluator) -> dict[str, object]:
 def _expects(annotation: object) -> str:
     """Say how a setting of this type is written: adamw(...) or muon(...), an integer."""
     kinds = []
-    for member in typing.get_args(annotation) or (annotation,):
+    whole = typing.get_origin(annotation) is tuple  # a list, not a union
+    for member in (
+        (annotation,) if whole else typing.get_args(annotation) or (annotation,)
+    ):
         if member is type(None):
             kinds.append("none")
         elif member is int:
@@ -1416,8 +1656,10 @@ def _train(
         raise _missing_settings(missing)
     train = tcfg.TrainConfig.model_validate(values)
     _check_schedule(train, spans)
+    _check_curriculum(train, spans)
     _check_tokenizer(train, spans)
     _check_positions(train, arch, spans)
+    _check_objective(train, spans)
     return train
 
 
@@ -1457,22 +1699,63 @@ def _missing_settings(missing: list[str]) -> BuxError:
 
 def _check_schedule(train: tcfg.TrainConfig, spans: dict[str, Span]) -> None:
     schedule = train.schedule
+    warmup = tcfg.warmup_steps(schedule, train.steps)
     cooldown = (
-        schedule.cooldown(train.steps) if isinstance(schedule, tcfg.WSDSchedule) else 0
+        schedule.cooldown(train.steps) if isinstance(schedule, tcfg.COOLED) else 0
     )
-    if schedule.warmup + cooldown > train.steps:
-        what = f"{schedule.warmup} of warmup" + (
+    if warmup + cooldown > train.steps:
+        what = f"{warmup} of warmup" + (
             f" and {cooldown} of cooldown" if cooldown else ""
         )
         raise BuxError(
-            f"the schedule takes {schedule.warmup + cooldown} steps ({what}), but the "
+            f"the schedule takes {warmup + cooldown} steps ({what}), but the "
             f"run has {train.steps}",
             spans.get("schedule", spans["steps"]),
         )
 
 
+def _check_objective(train: tcfg.TrainConfig, spans: dict[str, Span]) -> None:
+    """An objective's metrics of an eval, ``web_bpb`` or ``web_loss``, are those of
+    the run's evals: bits per byte need a tokenizer."""
+    if train.objective is None:
+        return
+    logged = {f"{e.name}_loss" for e in tcfg.evals(train)}
+    if train.tokenizer is not None:
+        logged |= {f"{e.name}_bpb" for e in tcfg.evals(train)}
+    names = [e.name for e in tcfg.evals(train)]
+    for term in train.objective.terms:
+        metric = term.metric
+        evaluated = metric.endswith("_bpb") or metric.removesuffix("_loss") in names
+        if metric in logged or not evaluated:
+            continue
+        if metric.endswith("_bpb") and metric.removesuffix("_bpb") in names:
+            message = (
+                f"the objective reads {metric}, but bits per byte need a tokenizer"
+            )
+            raise BuxError(message, spans["objective"], "tokenizer = tokenizer(...)")
+        close = difflib.get_close_matches(metric, sorted(logged), n=1)
+        listed = ", ".join(sorted(logged)) or "none, as the run has no eval"
+        raise BuxError(
+            f"the objective reads {metric}, but no eval logs it; they log {listed}",
+            spans["objective"],
+            f"did you mean '{close[0]}'?" if close else "eval(name=..., data=...)",
+        )
+
+
+def _check_curriculum(train: tcfg.TrainConfig, spans: dict[str, Span]) -> None:
+    for check, setting in (
+        (curriculum.check_ramp, "batch_ramp"),
+        (curriculum.check_phases, "curriculum"),
+    ):
+        try:
+            check(train)
+        except ValueError as err:
+            raise BuxError(str(err), spans.get(setting, spans["steps"])) from None
+
+
 def _check_tokenizer(train: tcfg.TrainConfig, spans: dict[str, Span]) -> None:
     reads = [("data", train.data)] + [("eval", e.data) for e in tcfg.evals(train)]
+    reads += [("curriculum", p.data) for p in train.curriculum if p.data is not None]
     for name, data in reads:
         kinds = sorted({s.type for s in tcfg.leaves(data)} & {"text", "chat"})
         if kinds and train.tokenizer is None:
@@ -1486,15 +1769,20 @@ def _check_tokenizer(train: tcfg.TrainConfig, spans: dict[str, Span]) -> None:
 def _check_positions(
     train: tcfg.TrainConfig, arch: ir.Architecture | None, spans: dict[str, Span]
 ) -> None:
+    longest = max(c.seq_len for _, c in curriculum.phases(train))
+    setting = "seq_len" if longest == train.seq_len else "curriculum"
     for layer in arch.layers() if arch is not None else ():
         if isinstance(layer.config, cfg.EmbeddingConfig):
             positions = layer.config.max_positions
-            if positions is not None and train.seq_len > positions:
+            if positions is not None and longest > positions:
+                hint = f"embed(max_positions={longest})"
+                if setting == "seq_len":
+                    hint = f"seq_len = {positions}, or {hint}"
                 raise BuxError(
-                    f"sequences of {train.seq_len} tokens are longer than the "
+                    f"sequences of {longest} tokens are longer than the "
                     f"{positions} positions the embedding learns",
-                    spans["seq_len"],
-                    f"seq_len = {positions}, or embed(max_positions={train.seq_len})",
+                    spans[setting],
+                    hint,
                 )
 
 
@@ -1621,17 +1909,165 @@ def compile_runs(
         # ['smoke[optimizer.lr=3e-3]', 'smoke[optimizer.lr=1e-2]']
     """
     program = _load(source, filename, overrides, modules, recover=False)
+    return [_run(f, filename) for f in _explore(program, entry)]
+
+
+@dataclass(frozen=True)
+class Space:
+    """A run of a file and the dimensions of its search: what `compile_spaces`
+    returns, one per run of the sweep. Its `trial` is the run at a point of them.
+
+    Attributes:
+        run: The run, with every dimension at its middle.
+        dimensions: The dimensions it reaches, in the order met, by their names: the
+            setting they are written in, ``"optimizer.lr"``, and ``#2`` after a
+            second of the same. Those that only an option of a choice reaches are
+            among them.
+
+    Example::
+
+        # tune.bux, with optimizer.lr = log_uniform(1e-4, 1e-2)
+        [space] = compile_spaces(source, filename="tune.bux")
+        list(space.dimensions)  # ['optimizer.lr']
+        space.trial({"optimizer.lr": 3e-4}).name  # 'tune[optimizer.lr=3e-4]'
+    """
+
+    run: ir.Run
+    dimensions: dict[str, Dimension]
+    program: modules.Program = field(repr=False)
+    entry: str = field(repr=False)
+    filename: str = field(repr=False)
+    choices: dict[Span | frozenset[str], int | str] = field(repr=False)
+
+    def trial(self, values: Mapping[str, float], steps: int | None = None) -> ir.Run:
+        """Return the run at the point `values`, and with `steps` if given.
+
+        Args:
+            values: A value of each dimension, by name; of a choice, the index of
+                its option. A dimension left out takes its middle.
+            steps: The run's steps, as if the command line ended with
+                ``steps = N``, for a rung of a search's halving.
+
+        Returns:
+            The run, named for the alternatives it took, the value of each dimension
+            it reached, and its steps: ``tune[optimizer.lr=3e-4, steps=111]``.
+
+        Raises:
+            BuxError: If a value makes a setting invalid.
+        """
+        program = self.program
+        if steps is not None:
+            program = modules.extended(program, f"steps = {steps}", "<search>")
+        dims = self.dimensions
+        point = {dims[name].key: _typed(dims[name], v) for name, v in values.items()}
+        try:
+            [f] = _explore(program, self.entry, point, self.choices)
+        except BuxError as err:
+            raise program.locate(err) from None
+        more = tuple(d.part(point.get(d.key, middle(d.space))) for d in f.dims)
+        return _run(f, self.filename, more + ((f"steps={steps}",) if steps else ()))
+
+
+def compile_spaces(
+    source: str,
+    *,
+    entry: str = "model",
+    filename: str = "<string>",
+    overrides: Sequence[str] = (),
+    modules: Modules = None,
+) -> list[Space]:
+    """Compile every run of a file with the dimensions of its search: one `Space` per
+    combination of the alternatives it reaches, as `compile_runs` compiles its runs.
+
+    A run without dimensions has none, and its trial is the run itself. The
+    arguments are those of `compile_runs`.
+
+    Returns:
+        The spaces, in the order of `compile_runs`'s runs, which are their `run`.
+
+    Raises:
+        BuxError: At the first mistake, as `compile_runs` raises, or one that an
+            option of a choice makes.
+    """
+    program = _load(source, filename, overrides, modules, recover=False)
+    spaces = []
+    for f in _explore(program, entry):
+        dims = _dimensions(program, entry, f)
+        spaces.append(
+            Space(_run(f, filename), dims, program, entry, filename, f.choices)
+        )
+    return spaces
+
+
+def _dimensions(
+    program: modules.Program, entry: str, f: _Explored
+) -> dict[str, Dimension]:
+    """Return the dimensions the run of `f` reaches, those that an option of a choice
+    reaches too, each option tried once, by their names (`Space.dimensions`)."""
+    met = {d.key: d for d in f.dims}
+    # Each choice, with the point that reached it: a choice inside an option of
+    # another is reached only where that one takes it.
+    todo = [(d, {}) for d in f.dims if isinstance(d.space, tcfg.ChoiceConfig)]
+    while todo:
+        choice, base = todo.pop(0)
+        options = typing.cast(tcfg.ChoiceConfig, choice.space).options
+        for option in range(1, len(options)):
+            point = {**base, choice.key: option}
+            try:
+                [g] = _explore(program, entry, point, f.choices)
+            except BuxError as err:
+                raise program.locate(err) from None
+            for d in g.dims:
+                if d.key not in met:
+                    met[d.key] = d
+                    if isinstance(d.space, tcfg.ChoiceConfig):
+                        todo.append((d, point))
+    named: dict[str, Dimension] = {}
+    for d in met.values():
+        name, n = d.where, 1
+        while name in named:
+            n += 1
+            name = f"{d.where}#{n}"
+        named[name] = d
+    return named
+
+
+def _typed(dim: Dimension, value: float) -> float:
+    """Return `value` as `dim` takes it: an integer, or a choice's index."""
+    if isinstance(dim.space, tcfg.IntUniformConfig | tcfg.ChoiceConfig):
+        return int(value)
+    return float(value)
+
+
+def _run(f: _Explored, filename: str, more: tuple[str, ...] = ()) -> ir.Run:
+    """Return the run that `f` compiled to, named for the alternatives it took and
+    for `more`."""
+    parts = tuple(axis.part(f.choices[axis.key]) for axis in f.reached) + more
+    name = _run_name(filename, parts)
+    return ir.Run(name=name, arch=f.arch, train=f.train, choices=parts)
+
+
+def _explore(
+    program: modules.Program,
+    entry: str,
+    point: Mapping[Span, float] | None = None,
+    choices: Mapping[Span | frozenset[str], int | str] | None = None,
+) -> list[_Explored]:
+    """Compile every combination of the alternatives `program` reaches, with its
+    dimensions at `point`, but for those alike (`_without_if_alike`); given
+    `choices`, the one run that takes them."""
     found: list[_Explored] = []
 
     def explore(choices: dict[Span | frozenset[str], int | str]) -> None:
-        ev = _Evaluator(program, choices=choices)
+        ev = _Evaluator(program, choices=choices, point=point)
         arch = _compile(ev, entry)
         train = _train(ev, arch, require=True)
         # The axes met so far are those the run depends on; the rest are in
-        # definitions that it does not use.
+        # definitions that it does not use. So are its dimensions.
         reached = sorted(ev.axes.values(), key=lambda axis: axis.span.start)
+        dims = list(ev.dims.values())
         free = [axis for axis in reached if axis.key not in choices]
-        if free:
+        if free and fixed is None:
             for option in range(len(free[0].options)):
                 explore({**choices, free[0].key: free[0].pick(option)})
             return
@@ -1643,20 +2079,20 @@ def compile_runs(
                 "this file does not say how to train its model",
                 hint="a run sets data, optimizer, seq_len, batch and steps",
             )
-        found.append(_Explored(choices, reached, arch, train))
+        found.append(_Explored(choices, reached, arch, train, dims))
 
+    fixed = None if choices is None else dict(choices)
     try:
-        explore({})
+        explore(fixed or {})
     except BuxError as err:
         raise program.locate(err) from None
+    if fixed is not None:  # the axes a space dropped as alike take their first
+        for f in found:
+            f.reached = [axis for axis in f.reached if axis.key in fixed]
+        return found
     for axis in {e.key: e for f in found for e in f.reached}.values():
         found = _without_if_alike(found, axis)
-    runs = []
-    for f in found:
-        parts = tuple(axis.part(f.choices[axis.key]) for axis in f.reached)
-        name = _run_name(filename, parts)
-        runs.append(ir.Run(name=name, arch=f.arch, train=f.train, choices=parts))
-    return runs
+    return found
 
 
 @dataclass
@@ -1667,6 +2103,12 @@ class _Explored:
     reached: list[Axis]  # the axes it met, in the order written
     arch: ir.Architecture
     train: tcfg.TrainConfig
+    dims: list[Dimension] = field(default_factory=list)  # the dimensions it met
+
+    def same(self, other: _Explored) -> bool:
+        """Whether it computes what `other` does, and searches the same space."""
+        mine = (self.arch, self.train, [d.space for d in self.dims])
+        return mine == (other.arch, other.train, [d.space for d in other.dims])
 
 
 def _without_if_alike(found: list[_Explored], axis: Axis) -> list[_Explored]:
@@ -1682,8 +2124,7 @@ def _without_if_alike(found: list[_Explored], axis: Axis) -> list[_Explored]:
     # The runs of a group differ in this axis alone, one for each alternative; an
     # axis nested in another's alternative has groups of one, which prove nothing.
     alike = all(
-        len(group) == len(axis.options)
-        and all((f.arch, f.train) == (group[0].arch, group[0].train) for f in group)
+        len(group) == len(axis.options) and all(f.same(group[0]) for f in group)
         for group in groups.values()
     )
     if not groups or not alike:
@@ -1715,6 +2156,8 @@ class Report:
         run: The first run of the sweep, when the file is a run and has no errors.
         axes: The sweep's axes, in the order written, when the file has a model and
             no errors.
+        dimensions: The first run's search dimensions, in the order met, when the
+            file has a model and no errors.
         via: For every module, by its filename, the ``use`` in this file that
             brought it in, perhaps through other modules.
         source: Every file joined, this one first: the spans of all statements
@@ -1729,6 +2172,7 @@ class Report:
     values: dict[str, object]
     run: ir.Run | None = None
     axes: list[Axis] = field(default_factory=list)
+    dimensions: list[Dimension] = field(default_factory=list)
     via: dict[str, Span] = field(default_factory=dict)
     source: str = ""
     inherited: dict[str, ast.Statement] = field(default_factory=dict)
@@ -1793,13 +2237,17 @@ def check(
     }
     clean = not errors
     axes: list[Axis] = []
+    dims: list[Dimension] = []
     run = None
     if clean and arch is not None:
-        axes = _reached_axes(program, entry)
+        axes, dims = _reached(program, entry)
         if train is not None:
             parts = tuple(axis.part(axis.pick(0)) for axis in axes)
             name = _run_name(filename, parts)
             run = ir.Run(name=name, arch=arch, train=train, choices=parts)
+            if dims and (error := _check_rungs(program, entry, train)):
+                report(error)
+                run = None
     inherited = {
         name: st for name, st in ev.statements.items() if st.span.start > len(source)
     }
@@ -1810,6 +2258,7 @@ def check(
         values=values,
         run=run,
         axes=axes,
+        dimensions=dims,
         via={u.filename: u.via for u in program.units[1:] if u.via is not None},
         source=program.source,
         inherited=inherited,
@@ -1824,20 +2273,58 @@ def _check_alternatives(
 ) -> tuple[_Evaluator, ir.Architecture | None, tcfg.TrainConfig | None]:
     first: tuple[_Evaluator, ir.Architecture | None, tcfg.TrainConfig | None] | None
     first = None
-    todo: list[dict[Span | frozenset[str], int | str]] = [{}]
-    seen: set[tuple[Span | frozenset[str], int | str]] = set()
+    todo: list[tuple[dict[Span | frozenset[str], int | str], dict[Span, float]]]
+    todo = [({}, {})]
+    seen: set[tuple[Span | frozenset[str], float | str]] = set()
     while todo:
-        choices = todo.pop(0)
-        ev = _Evaluator(program, report=report, choices=choices)
+        choices, point = todo.pop(0)
+        ev = _Evaluator(program, report=report, choices=choices, point=point)
         arch, train = _check_once(ev, entry, report)
         first = first or (ev, arch, train)
         for key, axis in ev.axes.items():
             for option in range(1, len(axis.options)):
                 if (key, axis.pick(option)) not in seen:
                     seen.add((key, axis.pick(option)))
-                    todo.append({**choices, key: axis.pick(option)})
+                    todo.append(({**choices, key: axis.pick(option)}, point))
+        # A dimension is checked at both ends, and a choice at every option.
+        for key, dim in ev.dims.items():
+            for value in _ends(dim.space):
+                if (key, value) not in seen:
+                    seen.add((key, value))
+                    todo.append((choices, {**point, key: value}))
     assert first is not None
     return first
+
+
+def _check_rungs(
+    program: modules.Program, entry: str, train: tcfg.TrainConfig
+) -> BuxError | None:
+    """Return why the bottom rung of the run's halving does not compile, as a
+    warmup longer than its steps; None if it does, or there is no halving."""
+    if (h := train.search.halving) is None:
+        return None
+    steps = h.steps(train.steps, 0)
+    try:
+        _explore(
+            modules.extended(program, f"steps = {steps}", "<search>"), entry, {}, {}
+        )
+    except BuxError as err:
+        rung = BuxError(
+            f"halving's first rung trains {steps} steps, and then: {err.message}",
+            err.span,
+            "write what depends on the run's length as a share of it: "
+            "schedule.warmup = 0.1, a tenth of its steps",
+        )
+        return rung.attach(err.source, err.filename) if err.source else rung
+    return None
+
+
+def _ends(space: tcfg.Distribution) -> tuple[float, ...]:
+    """Return the values of a dimension that `check` tries, besides its middle: its
+    least and greatest, or a choice's other options."""
+    if isinstance(space, tcfg.ChoiceConfig):
+        return tuple(range(1, len(space.options)))
+    return space.value(0), space.value(1)
 
 
 def _check_once(
@@ -1862,12 +2349,15 @@ def _check_once(
     return arch, train
 
 
-def _reached_axes(program: modules.Program, entry: str) -> list[Axis]:
+def _reached(
+    program: modules.Program, entry: str
+) -> tuple[list[Axis], list[Dimension]]:
     # The sweep's axes are those the run reaches, which evaluating every definition,
-    # as check does, does not tell apart from the others.
+    # as check does, does not tell apart from the others; so are its dimensions.
     ev = _Evaluator(program)
     _train(ev, _compile(ev, entry), require=True)
-    return sorted(ev.axes.values(), key=lambda axis: axis.span.start)
+    axes = sorted(ev.axes.values(), key=lambda axis: axis.span.start)
+    return axes, list(ev.dims.values())
 
 
 def _public(value: object) -> object | None:

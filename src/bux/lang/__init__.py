@@ -68,6 +68,18 @@ alternatives it took, and an `~bux.lang.ir.Run.id` that hashes what it computes:
 With ``optimizer = adamw(lr=3e-3 | 1e-2)`` in the file, the same loop prints two
 runs, ``smoke[optimizer.lr=3e-3]`` and ``smoke[optimizer.lr=1e-2]``.
 
+.. rubric:: Compile a search
+
+A setting written as a distribution, ``optimizer.lr = log_uniform(1e-4, 1e-2)``, is a
+dimension of a search (`bux.search`). `compile_spaces` returns a `~compiler.Space`
+for each run, with the dimensions it reaches, and its `~compiler.Space.trial` is the
+run at a point of them::
+
+    from bux.lang import compile_spaces
+
+    [space] = compile_spaces(source, filename="tune.bux")
+    space.trial({"optimizer.lr": 3e-4}).name  # tune[optimizer.lr=3e-4]
+
 .. rubric:: Check a file, as an editor does
 
 `check` compiles like `compile`, but recovers from errors and collects all of them
@@ -139,17 +151,30 @@ Source flows through the modules in this order:
 
     ~compiler.compile
     ~compiler.compile_runs
+    ~compiler.compile_spaces
     ~compiler.compile_file
     ~compiler.check
     ~compiler.Report
     ~compiler.Axis
+    ~compiler.Space
+    ~compiler.Dimension
     ~ir.Architecture
     ~ir.Run
     ~syntax.parse
     ~syntax.BuxError
 """
 
-from bux.lang.compiler import Axis, Report, check, compile, compile_file, compile_runs
+from bux.lang.compiler import (
+    Axis,
+    Dimension,
+    Report,
+    Space,
+    check,
+    compile,
+    compile_file,
+    compile_runs,
+    compile_spaces,
+)
 from bux.lang.ir import Architecture, Run
 from bux.lang.syntax import BuxError, parse
 
@@ -157,11 +182,14 @@ __all__ = [
     "Architecture",
     "Axis",
     "BuxError",
+    "Dimension",
     "Report",
     "Run",
+    "Space",
     "check",
     "compile",
     "compile_file",
     "compile_runs",
+    "compile_spaces",
     "parse",
 ]

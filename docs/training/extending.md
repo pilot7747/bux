@@ -69,7 +69,7 @@ def _(c, multiplier, model):  # its config, the schedule's multiplier, the model
 | Registry | A builder gets | And returns |
 |----------|----------------|-------------|
 | {py:data}`bux.train.optim.optimizers` | the config, the schedule's multiplier (a function of the step), the model | an optax transformation |
-| {py:data}`bux.train.optim.schedules` | the config, the run's steps | the curve after the warmup, a function of the step |
+| {py:data}`bux.train.optim.schedules` | the config, the run's training settings (its steps, batch and peak `lr`) | the curve after the warmup, a function of the step |
 | {py:data}`bux.train.optim.ns_coefficients` | the number of Newton-Schulz iterations | an array of `(a, b, c)`, one, or one an iteration |
 | {py:data}`bux.train.optim.ns_algorithms` | the number of iterations, their `(a, b, c)`, the iterations to restart after (or none) | a function of a matrix, or a stack of them as its `MuonDimensionNumbers` say, that orthogonalizes each |
 | {py:data}`bux.train.data.sources` | the config, the run's settings, the vocabulary's size, the cache, a seed | a {py:class}`~bux.train.data.Source`: `rows(start, n)` of its endless stream |
@@ -208,7 +208,12 @@ mine step 20/20  loss 6.6194  lr 1.00e-03  grad 1.573  108,656 tok/s  ...
 
 {py:meth}`~bux.train.trainer.Trainer.fit` trains to step `steps`, or until
 `trainer.stopping` is set. {py:func}`~bux.train.data.batches` yields the run's
-batches from batch `start` on, so a script that resumes reads what it would have.
+batches from batch `start` on, so a script that resumes reads what it would have;
+{py:func}`~bux.train.data.training_batches` follows the run's curriculum and batch
+ramp too, and the trainer compiles again at each new shape
+([Curriculum](curriculum.md)). `Log` takes the tokens of a step, or a function of a
+step count that gives the tokens of so many steps
+({py:func}`bux.train.curriculum.tokens`).
 `Trainer(..., compute=, matmuls=, microbatches=, donate=, ...)` takes what the run's
 `precision` and `methods` give `train`; made inside `bux.parallel.use`, it puts its
 state on the mesh ([In a script](../parallelism/index.md#in-a-script)).

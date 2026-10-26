@@ -19,7 +19,14 @@ from bux.architecture.attention.rope import rotate
 from bux.train.objective import z_loss
 
 ROOT = Path(__file__).parents[1]
-FILES = sorted([*ROOT.glob("src/bux/**/*.py"), *ROOT.glob("tests/*.py")])
+# The PyTorch layers an export copies into its repo import nothing but torch and
+# transformers (bux.export.hf), so they say no jaxtyping dtypes.
+COPIED = ROOT / "src/bux/export/hf"
+FILES = sorted(
+    f
+    for f in [*ROOT.glob("src/bux/**/*.py"), *ROOT.glob("tests/*.py")]
+    if COPIED not in f.parents
+)
 # Array types, which annotations put in a dtype of jaxtyping's, Float[Array, "b t d"]:
 # by name, or as attributes of these modules (jax.Array, np.ndarray, ...).
 ARRAYS = {"Array", "ArrayLike", "ndarray", "NDArray"}
