@@ -30,6 +30,8 @@ WIRINGS = {
     + FFN
     + "model = embed(max_positions=32) [layernorm(bias=true) ffn] "
     "linear(features=64) gelu layernorm head(bias=true, softcap=30)",
+    "nested repeats": BLOCK
+    + "model = embed ([rmsnorm attn] [rmsnorm ffn]^2)^2 rmsnorm head",
     "conv": BLOCK
     + "model = embed [conv(size=3, bias=true)] block [rmsnorm conv] rmsnorm head",
     "rope scalings": HEAD
@@ -66,6 +68,12 @@ def test_a_shared_module_is_called_from_each_use() -> None:
     attn = [c for c in p.calls if c.layer.config.type == "gqa"]
     assert [c.path for c in attn] == ["model.shared.block.attn"] * 3
     assert [c.first for c in attn] == [True, False, False]
+
+
+def test_a_config_constant_never_hides_a_layer_class() -> None:
+    source = HEAD + FFN.replace("ffn =", "mlp =") + "model = embed [rmsnorm mlp] head"
+    code = codegen.modeling(plan(compile(source)), [])
+    assert "MLP_1 = {" in code and "MLP(MLP_1, 64" in code
 
 
 def test_a_layer_not_exported_yet_says_which() -> None:

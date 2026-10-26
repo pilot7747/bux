@@ -109,7 +109,8 @@ def compare(
 
     Args:
         arch: The architecture.
-        model: Its bux model; None for fresh weights, perturbed (`perturbed`).
+        model: Its bux model, which it puts in eval mode; None for fresh weights,
+            perturbed (`perturbed`).
         implementations: transformers' attention implementations to run it by.
         experts: transformers' experts implementation to run an MoE's routed experts
             by (``eager``, ``grouped_mm``, ...); None for its default.
@@ -125,6 +126,7 @@ def compare(
     """
     if model is None:
         model = perturbed(Model(arch, rngs=nnx.Rngs(seed)), seed + 1)
+    model.eval()  # inference: no dropout, as the export has none
     assert arch.vocab_size is not None, "an export needs a vocabulary"
     tokens = jax.random.randint(
         jax.random.key(seed), (batch, length), 0, arch.vocab_size
