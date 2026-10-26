@@ -56,7 +56,7 @@ The speedups are against XLA's own program for the same computation, on a B300.
 | KDA otherwise | bux's Pallas kernels (`pallas_delta`): any gate, each pair's decay through a position between them | 2.6x `chunkwise` |
 | MoE experts | `grouped.ragged_dot`: tokamax's Mosaic and Triton kernels | 27x `jax.lax.ragged_dot` |
 | MoE experts in MXFP8 | `grouped_mxfp8`: Mosaic GPU kernels of tcgen05's block-scaled MMA, the scales by TMA into tensor memory ([Experts](../parallelism/experts.md)) | 1.5-2.4x tokamax's bfloat16 GEMMs |
-| MoE experts' SwiGLU in MXFP8 | `grouped_glu`: cuDNN's CuTe DSL grouped GEMMs, SwiGLU and its backward with their quantizations in the epilogues, each GPU's shard of the kernels quantized before FSDP gathers it ([Experts](../parallelism/experts.md)) | 1.13-1.17x `grouped_mxfp8`'s layer |
+| MoE experts' activation in MXFP8 | `grouped_glu`: cuDNN's CuTe DSL grouped GEMMs, the activation (ReLU^2, SwiGLU, a clamped GeGLU, SiTU-GLU) and its backward with their quantizations in the epilogues, each GPU's shard of the kernels quantized before FSDP gathers it ([Experts](../parallelism/experts.md#activations-fused-by-cudnn)) | 1.15-1.31x `grouped_mxfp8`'s layer at Qwen3-30B-A3B's and Nemotron 3's experts, 1.04-1.15x at gpt-oss's and DeepSeek-V4-Flash's |
 | MoE dispatch | `token_rows`, `token_sums`: gathers where XLA would scatter | 4x |
 | MXFP8's quantizer | `blockscaled`: a Pallas kernel that quantizes an operand both ways in one pass | 4.3-4.7 TB/s at Qwen3-30B-A3B's projections |
 | NVFP4's quantizers | `nvfp4`: Pallas kernels, a pass for the largest magnitudes and one that writes both copies, rounded by Blackwell's E2M1 conversions | 3-5x |
@@ -93,7 +93,7 @@ by XLA instead, with the same values up to rounding. Outside a GPU, and inside
 | `affine_scan` | a state of k × v with k a power of two of 16 or more, and v a multiple of 32 | a scan over the chunks by XLA |
 | `grouped.ragged_dot` | tokamax installed | `jax.lax.ragged_dot` |
 | `grouped_mxfp8` | a Blackwell GPU (compute capability 10 or more); the experts' role in `mxfp8` or `mxfp8_2d` | XLA dequantizes and multiplies |
-| `grouped_glu` | a Blackwell GPU with cudnn-frontend; a SwiGLU FFN (`gated_mlp` of `swish`, no `limit`, `up_softcap`, `up_offset`, `bias` or `expert_norm`); `mxfp8` in every pass; widths in whole tiles of 256 (Qwen3-30B-A3B's 2048 and 768, not the baseline's 704) | `grouped_mxfp8` |
+| `grouped_glu` | a Blackwell GPU with cudnn-frontend; an activation cuDNN fuses: `mlp` of `relu2`, `gated_mlp` of `swish` or `quick_gelu` (with or without `limit` and `up_offset`), or of `situ` with an `up_softcap`; no `bias` or `expert_norm`; `mxfp8` in every pass; a width of whole blocks of 64, hidden units of 32 (padded to whole tiles of 128) | `grouped_mxfp8` |
 | `blockscaled`'s and `nvfp4`'s quantizers | a GPU | XLA quantizes |
 | the block-scaled GEMMs (cuDNN's, `__cudnn$blockScaledDot`) | a Blackwell GPU | XLA dequantizes and multiplies, which computes the same values |
 
@@ -237,6 +237,14 @@ same:
   Pallas kernel (4.3-4.7 TB/s at Qwen3-30B-A3B's projections, scaling in bfloat16),
   gives some of it back. An MLP projection's forward and backward take 1.3-1.35x less
   time, q's and o's 1.1x, and k's and v's, half as wide, 7% more.
+
+  A dense SwiGLU fused with the quantizer would gain little, so bux leaves it to XLA.
+  Backward, one Pallas pass that reads dh, up and gate and writes both gradients in
+  MXFP8 both ways took 0.63 ms at the 1.3B's 8 × 4096 rows and 5632 hidden units, at
+  its best tiles, against 0.62 for XLA's fusion and the quantizer over each gradient
+  (3 TB/s against the quantizer's 4.5). Forward, such a pass would save XLA's write
+  of h and the quantizer's read of it: 0.74 GB, at most 0.15 ms a layer, 1% of the
+  step.
 - **NVFP4.** cuDNN's NVFP4 GEMM runs at 4.8-5.5 PFLOP/s at the MLP's shapes, 1.7-1.9x
   MXFP8's. Its output is bfloat16, which the two tensors' scales then rescale in what
   reads it (cuDNN's own global scale is no faster, and takes it in bfloat16).

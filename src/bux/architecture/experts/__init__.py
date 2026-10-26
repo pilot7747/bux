@@ -9,7 +9,7 @@
   on a Blackwell GPU.
 - `~bux.architecture.experts.grouped_triton`: Triton's MXFP8 quantizer, into those
   kernels' layout.
-- `~bux.architecture.experts.grouped_glu`: a SwiGLU FFN's whole, fused, by cuDNN's
-  kernels on a Blackwell GPU.
+- `~bux.architecture.experts.grouped_glu`: an FFN's whole, its activation fused, by
+  cuDNN's kernels on a Blackwell GPU.
 - `~bux.architecture.experts.grouped_cudnn`: those cuDNN kernels.
 """
