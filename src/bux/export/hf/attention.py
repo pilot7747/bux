@@ -285,6 +285,15 @@ def cache_layer(c: dict, ports: list) -> tuple[str, dict] | None:
     return kind, {"sliding_window": window, **conv}
 
 
+def per_head(kept: torch.Tensor, heads: int) -> torch.Tensor:
+    """Return which keys each query keeps, b 1 t s for all heads, from b t s; or
+    b h t s for each of the `heads`, its kv head's group's, from b t g s (bux's
+    ``_per_head``)."""
+    if kept.ndim == 3:
+        return kept[:, None]
+    return kept.transpose(1, 2).repeat_interleave(heads // kept.shape[2], 1)
+
+
 def computes_logits(c: dict) -> bool:
     """Whether the layer computes its softmax (`softmax_attention`): a setting needs
     the logits that transformers' attention implementations do not all take."""
@@ -380,8 +389,9 @@ class SoftmaxAttention(nn.Module):
     def kept(
         self, x: torch.Tensor, query: torch.Tensor, ctx: Ctx, kv: KV
     ) -> torch.Tensor | None:
-        """Return which keys of `kv` each query keeps, b t s: the ``index`` port's, or
-        the indexer's top-k (from `query` and the input `x`); None for all."""
+        """Return which keys of `kv` each query keeps, b t s, or b t g s for each kv
+        head's group of query heads: the ``index`` port's, or the indexer's top-k
+        (from `query` and the input `x`); None for all."""
         if reads(self.ports, "index"):
             kept = self.read(ctx, "index")
         elif self.indexer is not None:
@@ -408,7 +418,7 @@ class SoftmaxAttention(nn.Module):
         q = q.transpose(1, 2)
         if self.computes_logits or kept is not None or self._foreign(kv, ctx):
             mask = ctx.mask("dense", (kv.slot, self.window))
-            keep = mask.keep if kept is None else mask.keep & kept[:, None]
+            keep = mask.keep if kept is None else mask.keep & per_head(kept, self.h)
             bias, gain = self._relative_bias(x, mask.offsets), self._length_scale(ctx)
             return softmax_attention(
                 q, kv.k, kv.v, keep, self.scale, self.softcap, self.sinks, bias, gain
@@ -500,8 +510,9 @@ def check_reader(c: dict, ports: list) -> None:
 
 class Attention(SoftmaxAttention):
     """bux's ``gqa``, every setting: q, k and v projections (one each, or fused), a
-    causal conv on k and v, QK-norm then RoPE, and its ports: ``v`` (value residual),
-    ``kv`` (cross-layer KV sharing) and ``index`` (an indexer's kept keys).
+    causal conv on k and v, QK-norm (of each head, or of all heads together under
+    ``qk_norm_all_heads``) then RoPE, and its ports: ``v`` (value residual), ``kv``
+    (cross-layer KV sharing) and ``index`` (an indexer's kept keys).
 
     A layer that reads ``kv`` attends to the writer's keys and values as the writer's
     cache layer keeps them, all of them while decoding, and keeps none of its own; it
@@ -521,9 +532,10 @@ class Attention(SoftmaxAttention):
         if self.reads_kv:
             check_reader(c, site.ports)
         self._projections(c, width, h, g, dk, dv)
-        qk = c["qk_norm"]
-        self.q_norm = Norm(qk, dk) if qk else None
-        self.k_norm = Norm(qk, dk) if qk and not self.reads_kv else None
+        qk, self.all_heads = c["qk_norm"], c["qk_norm_all_heads"]
+        q_width, k_width = (h * dk, g * dk) if self.all_heads else (dk, dk)
+        self.q_norm = Norm(qk, q_width) if qk else None
+        self.k_norm = Norm(qk, k_width) if qk and not self.reads_kv else None
         self.rope = Rope(c["rope"], dk) if c["rope"] else None
         self.power_scale = c["power_scale"], c["power_scale_length"]
         self.value_residual = c["value_residual"]
@@ -584,12 +596,9 @@ class Attention(SoftmaxAttention):
         return [self.q(x), *kv]
 
     def _queries(self, q: torch.Tensor, ctx: Ctx) -> torch.Tensor:
-        """Reshape the projected queries into heads, then apply QK-norm, RoPE and the
-        power scale."""
-        b, t, _ = q.shape
-        q = q.view(b, t, self.h, self.dk)
-        if self.q_norm is not None:
-            q = self.q_norm(q)
+        """Split the projected queries into heads with QK-norm (`_split_normed`),
+        then apply RoPE and the power scale."""
+        q = self._split_normed(q, self.h, self.q_norm)
         if self.rope is not None:
             q = self.rope(q, ctx.positions)
         power, length = self.power_scale
@@ -603,15 +612,25 @@ class Attention(SoftmaxAttention):
         self, k: torch.Tensor, v: torch.Tensor, ctx: Ctx, slot: int
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """Add the causal conv to the projected keys and values (its states 0 and 1 in
-        the cache layer `slot`), reshape them into heads, then apply QK-norm and RoPE
-        to the keys."""
+        the cache layer `slot`), split them into heads, the keys with QK-norm
+        (`_split_normed`), then apply RoPE to the keys."""
         b, t, _ = k.shape
         if self.k_conv is not None and self.v_conv is not None:
             k, v = k + self.k_conv(k, ctx, slot, 0), v + self.v_conv(v, ctx, slot, 1)
-        k, v = k.view(b, t, self.g, self.dk), v.view(b, t, self.g, self.dv)
-        if self.k_norm is not None:
-            k = self.k_norm(k)
+        k, v = self._split_normed(k, self.g, self.k_norm), v.view(b, t, self.g, self.dv)
         return (k if self.rope is None else self.rope(k, ctx.positions)), v
+
+    def _split_normed(
+        self, x: torch.Tensor, heads: int, norm: Norm | None
+    ) -> torch.Tensor:
+        """Split projected queries or keys, b t _, into `heads` heads, normalized by
+        `norm`: each head, or all of them together before the split under
+        ``qk_norm_all_heads``."""
+        b, t, _ = x.shape
+        if self.all_heads and norm is not None:
+            x, norm = norm(x), None
+        x = x.view(b, t, heads, self.dk)
+        return x if norm is None else norm(x)
 
     def _mix_values(self, v: torch.Tensor, v1: torch.Tensor) -> torch.Tensor:
         """The value residual a v + b v1: a = b = 0.5 fixed, both learned, or a learned

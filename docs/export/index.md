@@ -103,9 +103,10 @@ layer or the setting.
 |--------|----------|
 | `embed`, `head`, `mlp`, `gated_mlp`, `linear`, `act`, `scale`, `dropout`, `layernorm`, `rmsnorm`, `dyt` | yes, every setting and activation |
 | `moe` | yes, every setting inference reads: the routers, group-limited routing, the aux-free bias, shared experts, LatentMoE, the expert norm, experts of either MLP type; the routed experts by transformers' experts implementations |
-| `gqa` | every setting and port: RoPE (`pi`, `llama3`, `yarn`; partial, interleaved), QK-norm, biases, fused or not, head dims, scale, sliding windows, sinks, softcap, gates, output norm, length scale, relative bias, the conv on keys and values, the indexer; `v`, `kv` and `index` ports. Dropout is training's alone |
+| `gqa` | every setting and port: RoPE (`pi`, `llama3`, `yarn`; partial, interleaved), QK-norm of each head or of all heads together, biases, fused or not, head dims, scale, sliding windows, sinks, softcap, gates, output norm, length scale, relative bias, the conv on keys and values, the indexer; `v`, `kv` and `index` ports. Dropout is training's alone |
+| `indexer` | every setting inference reads: DSA's top-k keys, QSA's mean-pooled blocks, MSA's max-pooled blocks and picks for each kv head's group, plain dot products or ReLU'd, weighted or summed; its loss is training's alone |
 | `mla` | every setting, the indexer and the `index` port; keys and values cached as projected up from the latents |
-| `csa` | every setting, the indexer and its candidate pools, and the `kv`, `index` and `candidates` ports; every token's latents cached, the window a mask over them |
+| `csa` | every setting, the indexer (but max-pooled blocks, which bux does not build on compressed latents either) and its candidate pools, and the `kv`, `index` and `candidates` ports; every token's latents cached, the window a mask over them |
 | `conv` | yes, its inputs' tail kept in the cache as it decodes |
 | `gdn`, `kda`, `deltanet`, `gla`, `lightning` | yes, every setting: value heads, the short conv, the output gate and its rank, KDA's decay rank and lower bound, lightning's rates by its depth among the token mixers |
 | `rwkv7` | yes, every setting, and its `v` port (the value residual) |
@@ -232,7 +233,17 @@ window and its compressed latents at once.
   `indexed_attention` cache layer, so that each decoding step ranks every key before
   it. What a layer keeps is a mask over its cached keys, which the `index` port
   passes on; a sparse layer keeps every key, which the mask indexes, and applies its
-  window to them.
+  window to them. Ties rank as in bux: by the floats' bits, the first of equal ones.
+- **Blocks of keys.** With `block_size > 1` the indexer keeps whole blocks, counted
+  from a document's first key. Mean-pooled (`pool=mean`, Qwen3.8 QSA), the cache
+  keeps the keys as projected, and each step pools them again; a query also keeps
+  its own unfinished block. Max-pooled (`pool=max`, MiniMax MSA), the cache keeps
+  each key normalized and rotated, as without blocks, and each step scores a block
+  by the best of its keys the query sees, its own block always among the
+  `top_k // block_size`.
+- **Picks for each group.** With `per_group=true` each indexer head picks for its kv
+  head's group of query heads (MSA): the mask is b t g s, and each query head
+  attends to its group's keys, through the `index` port too.
 - **Compressed sparse attention.** A `csa` layer's cache layer keeps every token's
   latent as its keys and, as its values, the compressed latent the token ends, with
   the indexer's key of it; its conv state keeps the last tokens that the next

@@ -5,10 +5,12 @@ It picks the keys each query of a sparse attention layer attends to: its top-k b
 ``sum_j w_j ReLU(q_j . k_s)``, of the keys its mask lets it see, ranked as bux ranks
 them (by the floats' bits, the first of equal ones). Its keys are kept in the layer's
 cache, an ``indexed_attention`` layer (``cache.update_indexer``), so that a decoding
-step ranks every key before it. With ``block_size > 1`` it keeps whole blocks of keys
-(Qwen3.8 QSA), from the keys as projected, which it pools again at each step. What it
-keeps is a mask, b t s, over the keys the layer's cache returns: what the ``index``
-port carries. Its loss is training's alone, and is left out.
+step ranks every key before it. With ``block_size > 1`` it keeps whole blocks of keys:
+mean-pooled (Qwen3.8 QSA), from the keys as projected, which it pools again at each
+step; or each scored by its best key (MiniMax MSA), from the keys as for single ones.
+What it keeps is a mask, b t s, or b t g s for each kv head's group of query heads
+with ``per_group``, over the keys the layer's cache returns: what the ``index`` port
+carries. Its loss is training's alone, and is left out.
 """
 
 from __future__ import annotations
@@ -41,18 +43,25 @@ def ordered(x: torch.Tensor) -> torch.Tensor:
 
 def top(scores: torch.Tensor, seen: torch.Tensor, k: int) -> torch.Tensor:
     """Return which of the last axis' entries each row keeps: its k highest scores of
-    those `seen`, the first of equal ones, as bux's ``_top``."""
+    those `seen` (which broadcasts to the scores), the first of equal ones, as bux's
+    ``_top``."""
     k = min(k, scores.shape[-1])
     key = torch.where(seen, ordered(scores), -1)
     best = key.sort(dim=-1, descending=True, stable=True).indices[..., :k]
-    return torch.zeros_like(seen).scatter(-1, best, True) & seen
+    return torch.zeros_like(key, dtype=torch.bool).scatter(-1, best, True) & seen
+
+
+def along(block: torch.Tensor, x: torch.Tensor) -> torch.Tensor:
+    """Return `block`, b s, which block each slot is in, expanded to x, b t s or
+    b t g s."""
+    b, s = block.shape
+    return block.view(b, *[1] * (x.ndim - 2), s).expand_as(x)
 
 
 def per_block(x: torch.Tensor, block: torch.Tensor) -> torch.Tensor:
     """Return the sums of x, b t s, over each block's slots, at the block's index;
     `block`, b s, says which block each slot is in."""
-    index = block[:, None].expand_as(x)
-    return torch.zeros_like(x).scatter_add(-1, index, x)
+    return torch.zeros_like(x).scatter_add(-1, along(block, x), x)
 
 
 def key_positions(ctx: Ctx, s: int) -> torch.Tensor:
@@ -75,22 +84,34 @@ def groups(order: torch.Tensor, size: int) -> tuple[torch.Tensor, torch.Tensor]:
 
 
 def per_block_max(x: torch.Tensor, block: torch.Tensor) -> torch.Tensor:
-    """Return the maxima of x, b t s, over each block's slots, at the block's index;
-    -inf for a block with none."""
-    index = block[:, None].expand_as(x)
+    """Return the maxima of x, b t s or b t g s, over each block's slots, at the
+    block's index; -inf for a block with none."""
     out = torch.full_like(x, -torch.inf)
-    return out.scatter_reduce(-1, index, x, reduce="amax", include_self=True)
+    return out.scatter_reduce(-1, along(block, x), x, reduce="amax", include_self=True)
 
 
 def by_slot(blocks: torch.Tensor, block: torch.Tensor) -> torch.Tensor:
-    """Return, for each slot, b t s, whether its block is among `blocks`, b t s by the
-    blocks' index."""
-    return blocks.gather(-1, block[:, None].expand_as(blocks))
+    """Return, for each slot, b t s or b t g s, whether its block is among `blocks`,
+    by the blocks' index."""
+    return blocks.gather(-1, along(block, blocks))
+
+
+def newest(seen: torch.Tensor, block: torch.Tensor) -> torch.Tensor:
+    """Return, by the blocks' index, b t s, the block of the newest key each query
+    sees: none for a query that sees none (bux's ``_newest``)."""
+    s = seen.shape[-1]
+    last = torch.where(seen, torch.arange(s, device=seen.device), -1).argmax(-1)
+    own = torch.zeros_like(seen).scatter(-1, block.gather(1, last)[..., None], True)
+    return own & seen.any(-1, keepdim=True)
 
 
 class Indexer(nn.Module):
     """bux's ``Indexer``: for keys that are the tokens (``from_stream``, the default),
     or keys the layer gives it (CSA's compressed latents).
+
+    Without ``relu`` its dot products are plain. With ``per_group`` each of its heads
+    picks for its kv head's group of the layer's query heads, by that head's scores
+    alone (MiniMax MSA): its picks have a group axis, b t g s.
 
     Args:
         c: The indexer's config (``SparseIndexerConfig``), as JSON.
@@ -105,6 +126,10 @@ class Indexer(nn.Module):
         key_norm: The keys' norm, unless ``c["norm"]`` sets one.
         layout: How it pairs the rotated dims; None for ``c["rope_layout"]``, as for
             keys that are the tokens.
+
+    Raises:
+        NotImplementedError: Max-pooled blocks of keys another layer gives it, which
+            bux does not build either.
     """
 
     def __init__(
@@ -122,6 +147,12 @@ class Indexer(nn.Module):
         h, i = c["num_heads"], c["head_dim"]
         self.heads, self.head_dim = h, i
         self.top_k, self.block_size = c["top_k"], c["block_size"]
+        self.max_pool = self.block_size > 1 and c["pool"] == "max"
+        self.per_group, self.relu = c["per_group"], c["relu"]
+        if self.max_pool and key_width != -1:
+            raise NotImplementedError(
+                "max-pooled blocks (indexer(pool=max)) of another layer's keys"
+            )
         self.pool_size, self.pool_top_k = (
             c["candidate_block_size"],
             c["candidate_top_k"],
@@ -131,8 +162,7 @@ class Indexer(nn.Module):
         self.k = nn.Linear(key_width, i, bias=False) if key_width else None
         self.weights = nn.Linear(width, h, bias=False) if c["weighted"] else None
         self.q_norm = Norm(c["norm"], i) if c["norm"] else None
-        pools = self.block_size > 1
-        has_norm = key_width or pools
+        has_norm = key_width or self._mean_blocks()
         self.k_norm = Norm(c["norm"] or key_norm, i) if has_norm else None
         n = min(rope_dims, i) // 2 * 2
         own = None
@@ -151,7 +181,8 @@ class Indexer(nn.Module):
         inside: torch.Tensor | None = None,
         pool: bool = False,
     ) -> tuple[torch.Tensor, torch.Tensor | None]:
-        """Return which keys each query keeps, b t s, and its candidate pool if asked.
+        """Return which keys each query keeps, b t s (b t g s with ``per_group``),
+        and its candidate pool if asked.
 
         Args:
             x: The layer's input, b t d.
@@ -167,37 +198,40 @@ class Indexer(nn.Module):
                 its best key, and the block of the newest key a query sees.
         """
         q, w = self._queries(query, positions), self._head_weights(x)
+        if self.max_pool:
+            return self._max_blocks(q, w, keys, seen, order), None
         if self.block_size > 1:
             return self._blocks(q, w, keys, seen, order), None
         seen = seen if inside is None else seen & inside
         scores = self._scores(q, w, keys)
-        kept = top(scores, seen, self.top_k)
+        kept = top(scores, self._like(seen, scores), self.top_k)
         if not pool:
             return kept, None
         return kept, self._pool(scores.masked_fill(~seen, -torch.inf), seen, order)
 
     def keys(self, x: torch.Tensor, positions: torch.Tensor) -> torch.Tensor:
-        """Project its keys, b s i, from x: as projected if it keeps blocks, else
-        normalized and rotated by the positions."""
+        """Project its keys, b s i, from x: as projected if it mean-pools blocks of
+        them, else normalized and rotated by the positions."""
         assert self.k is not None and self.k_norm is not None
         k = self.k(x)
-        if self.block_size > 1:
+        if self._mean_blocks():
             return k
         return self._rotate(self.k_norm(k)[:, :, None], positions)[:, :, 0]
+
+    def _mean_blocks(self) -> bool:
+        """Whether it pools blocks of keys by their mean (Qwen3.8 QSA)."""
+        return self.block_size > 1 and not self.max_pool
+
+    def _like(self, seen: torch.Tensor, scores: torch.Tensor) -> torch.Tensor:
+        """`seen`, b t s, with a group axis of 1 if `scores` have one."""
+        return seen if scores.ndim == seen.ndim else seen[:, :, None]
 
     def _pool(
         self, ranked: torch.Tensor, seen: torch.Tensor, order: torch.Tensor
     ) -> torch.Tensor:
         """The candidate pool, b t s: bux's ``_candidates``, as a mask of slots."""
         block, _ = groups(order, self.pool_size)
-        s = seen.shape[-1]
-        last = torch.where(seen, torch.arange(s, device=seen.device), -1).argmax(-1)
-        newest = torch.zeros_like(seen).scatter(
-            -1, block.gather(1, last)[..., None], True
-        )
-        best = per_block_max(ranked, block).masked_fill(
-            newest & seen.any(-1, True), torch.inf
-        )
+        best = per_block_max(ranked, block).masked_fill(newest(seen, block), torch.inf)
         return by_slot(top(best, best > -torch.inf, self.pool_top_k), block)
 
     def _queries(self, query: torch.Tensor, positions: torch.Tensor) -> torch.Tensor:
@@ -220,9 +254,15 @@ class Indexer(nn.Module):
     def _scores(
         self, q: torch.Tensor, w: torch.Tensor, keys: torch.Tensor
     ) -> torch.Tensor:
-        """Every query's score of every key, ``sum_j w_j ReLU(q_j . k_s)``, b t s."""
+        """Every query's score of every key, ``sum_j w_j ReLU(q_j . k_s)``, b t s;
+        without ``relu`` of the plain dot products; with ``per_group`` each head's
+        ``w_j ReLU(q_j . k_s)``, b t g s."""
         dots = torch.einsum("bthi,bsi->bths", q, keys)
-        return torch.einsum("bths,bth->bts", dots.relu(), w)
+        if self.relu:
+            dots = dots.relu()
+        if self.per_group:
+            return dots * w[..., None]
+        return torch.einsum("bths,bth->bts", dots, w)
 
     def _rotate(self, x: torch.Tensor, positions: torch.Tensor) -> torch.Tensor:
         """Rotate the first dims of x, b t h i, by the positions."""
@@ -244,13 +284,26 @@ class Indexer(nn.Module):
         scores = self._scores(q, w, self._block_keys(keys, order, block, starts))
         full = per_block(seen.long(), block) == size
         picked = top(scores, full, self.top_k // size)
-        last = torch.where(seen, torch.arange(seen.shape[-1], device=seen.device), -1)
-        own = block.gather(1, last.argmax(-1).clamp(min=0))  # b t
-        unfinished = ~full.gather(-1, own[..., None]) & seen.any(-1, keepdim=True)
-        picked = picked | (
-            torch.zeros_like(picked).scatter(-1, own[..., None], True) & unfinished
-        )
-        return by_slot(picked, block)
+        return by_slot(picked | (newest(seen, block) & ~full), block)
+
+    def _max_blocks(
+        self,
+        q: torch.Tensor,
+        w: torch.Tensor,
+        keys: torch.Tensor,
+        seen: torch.Tensor,
+        order: torch.Tensor,
+    ) -> torch.Tensor:
+        """Keep whole blocks of block_size keys, each scored by the best of its keys
+        a query sees: its own block and the best others, top_k // block_size in all,
+        for each group with ``per_group`` (MiniMax MSA)."""
+        block, _ = groups(order, self.block_size)
+        scores = self._scores(q, w, keys)
+        unseen = ~self._like(seen, scores)
+        best = per_block_max(scores.masked_fill(unseen, -torch.inf), block)
+        best = best.masked_fill(self._like(newest(seen, block), best), torch.inf)
+        kept = top(best, best > -torch.inf, self.top_k // self.block_size)
+        return by_slot(kept, block)
 
     def _block_keys(
         self, keys: torch.Tensor, order: torch.Tensor, block: torch.Tensor, starts: Any

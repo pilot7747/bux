@@ -1,9 +1,9 @@
 """Softmax attention exports compute what bux does (bux.export.hf.attention, mla,
-sparse): every setting of gqa and mla, their ports, the sparse indexer, and the zoo's
-models that use them, shrunk.
+sparse): every setting of gqa and mla, their ports, the sparse indexer (DSA's, QSA's
+and MiniMax's MSA), and the zoo's models that use them, shrunk.
 
 Each case decodes 6 tokens after a prompt of 6, so that windows of 3 to 5, convs of
-3 taps and an indexer's top 4 all cross what one step sees."""
+3 taps, an indexer's top 4 and its blocks of 2 all cross what one step sees."""
 
 from pathlib import Path
 
@@ -20,6 +20,12 @@ MLA = (
     " qk_rope_head_dim=8, v_head_dim=8"
 )
 INDEXER = "indexer=indexer(num_heads=2, head_dim=8, top_k=4"
+#: MiniMax Sparse Attention's indexer, for GQA's 2 kv heads: blocks of 2 keys by their
+#: best plain dot product, 2 blocks for each kv head's group, its own among them.
+MSA = (
+    "indexer=indexer(num_heads=2, head_dim=8, top_k=4, block_size=2, pool=max,"
+    " per_group=true, relu=false, weighted=false, norm=rmsnorm(zero_centered=true)"
+)
 
 
 def stack(attn: str, depth: int = 2) -> str:
@@ -60,6 +66,11 @@ GQA_SETTINGS = {
     + ", gated=true, gate_per_head=true, gate_activation=softplus)",
     "output norm": GQA + ", output_norm=rmsnorm(zero_centered=true))",
     "qk norm": GQA + ", qk_norm=layernorm(bias=true))",
+    "qk norm of all heads": GQA + ", qk_norm=rmsnorm, qk_norm_all_heads=true)",
+    "qk norm of all heads, mqa, fused, conv": "gqa(num_heads=4, num_kv_heads=1,"
+    " qk_norm=layernorm(bias=true), qk_norm_all_heads=true, fused_qkv=true,"
+    " kv_conv_size=2, rope=rope(fraction=0.5))",
+    "all heads without qk norm": GQA + ", qk_norm_all_heads=true)",
     "fused qkv": GQA + ", fused_qkv=true, bias=true)",
     "biases": GQA + ", bias=true, output_bias=false)",
     "scale": GQA + ", scale=0.3)",
@@ -126,6 +137,11 @@ PORTS = {
         "attn(kv=@kv)",
         "attn(kv=$kv!)",
     ),
+    "kv sharing, qk norm of all heads": wired(
+        GQA + ", qk_norm=rmsnorm(zero_centered=true), qk_norm_all_heads=true)",
+        "attn(kv=@kv)",
+        "attn(kv=$kv!)",
+    ),
     "kv sharing, windows": wired(
         GQA + ", sliding_window_size=4, fused_qkv=true)",
         "attn(kv=@kv)",
@@ -187,7 +203,32 @@ SPARSE = {
     + f", {INDEXER}, block_size=3, weighted=false, norm=rmsnorm))",
     "window, sinks": GQA + f", sliding_window_size=5, sinks=true, {INDEXER}))",
     "relative bias": GQA + f", relative_bias=relbias(rank=2, extent=4), {INDEXER}))",
+    "plain dots": GQA + f", {INDEXER}, relu=false))",
+    "plain dots, plain sum": GQA + f", {INDEXER}, relu=false, weighted=false))",
+    "mean blocks, plain dots": GQA + f", {INDEXER}, block_size=2, relu=false))",
+    "max blocks": GQA + f", {INDEXER}, block_size=2, pool=max))",
+    "max blocks of 3, plain": GQA + ", indexer=indexer(num_heads=2, head_dim=8,"
+    " top_k=6, block_size=3, pool=max, relu=false, weighted=false, norm=rmsnorm))",
+    "max blocks, its own alone": GQA + ", indexer=indexer(num_heads=2, head_dim=8,"
+    " top_k=3, block_size=2, pool=max))",
+    "per group": GQA + f", {INDEXER}, per_group=true, weighted=false))",
+    "per group, plain dots, max without blocks": GQA
+    + f", {INDEXER}, per_group=true, relu=false, weighted=false, pool=max))",
+    "per group, mqa": "gqa(num_heads=4, num_kv_heads=1, rope=rope(), indexer=indexer("
+    "num_heads=1, head_dim=8, top_k=4, per_group=true, weighted=false))",
+    "per group, max blocks": GQA
+    + f", {INDEXER}, block_size=2, pool=max, per_group=true, weighted=false))",
+    "msa": GQA + f", qk_norm=rmsnorm(zero_centered=true), {MSA}))",
+    "msa, window, sinks": GQA + f", sliding_window_size=5, sinks=true, {MSA}))",
+    "msa, relative bias, softcap": GQA
+    + f", relative_bias=relbias(rank=2, extent=4), softcap=2.0, {MSA}))",
+    "msa, qk norm of all heads": GQA
+    + f", qk_norm=rmsnorm, qk_norm_all_heads=true, {MSA}))",
+    "msa, 3 query heads a group": "gqa(num_heads=6, num_kv_heads=2, head_dim=8,"
+    f" rope=rope(fraction=0.5), {MSA}))",
     "mla": MLA + f", {INDEXER}))",
+    "mla, max blocks, plain dots": MLA
+    + f", {INDEXER}, block_size=2, pool=max, relu=false))",
     "mla, full-rank queries": "mla(num_heads=4, kv_lora_rank=16, qk_nope_head_dim=8,"
     " qk_rope_head_dim=8, v_head_dim=8, indexer=indexer(num_heads=2, head_dim=4, top_k=4))",
 }
@@ -196,6 +237,21 @@ SPARSE = {
 @pytest.mark.parametrize("attn", SPARSE.values(), ids=SPARSE.keys())
 def test_sparse_attention(attn: str) -> None:
     check.compare(compile(stack(attn))).check()
+
+
+LONG = {
+    "msa": GQA + ", indexer=indexer(num_heads=2, head_dim=8, top_k=6, block_size=3,"
+    " pool=max, per_group=true, relu=false, weighted=false))",
+    "max blocks, window": GQA + ", sliding_window_size=7, indexer=indexer(num_heads=2,"
+    " head_dim=8, top_k=6, block_size=3, pool=max))",
+}
+
+
+@pytest.mark.parametrize("attn", LONG.values(), ids=LONG.keys())
+def test_max_blocks_decode_past_their_picks(attn: str) -> None:
+    """24 tokens, the last 12 decoded: 8 blocks of 3, of which a query keeps 2, its
+    own among them, as its own block fills and the next starts."""
+    check.compare(compile(stack(attn)), length=24, steps=12).check()
 
 
 INDEX_PORT = {
@@ -216,6 +272,12 @@ INDEX_PORT = {
         "attn(index=@topk)",
         "attn(index=$topk)",
         "attn(index=$topk)",
+    ),
+    "gqa, msa": wired(
+        GQA + f", {MSA}))",
+        "attn(index=@topk)",
+        "attn(index=$topk, num_heads=6, head_dim=8)",
+        "attn(index=$topk!, sliding_window_size=4)",
     ),
 }
 
@@ -243,6 +305,8 @@ CSA_SETTINGS = {
     "compressed": CSA + ", compress_ratio=2)",
     "compressed, indexer": CSA + f", compress_ratio=2, {SMALL_INDEXER}))",
     "single, indexer": CSA + f", compress_ratio=1, {SMALL_INDEXER}, weighted=false))",
+    "compressed, indexer of plain dots": CSA
+    + f", compress_ratio=2, {SMALL_INDEXER}, relu=false))",
     "compressed by 3, yarn, qk norm, softcap": "csa(num_heads=4, head_dim=16,"
     " sliding_window_size=5, compress_ratio=3, qk_norm=rmsnorm, softcap=3.0,"
     " rope=rope(fraction=0.5, scaling=yarn(factor=4, original_max_len=8)))",
@@ -378,6 +442,26 @@ ZOO = {
         "local = attn(sliding_window_size=4, relative_bias.extent=4, log_scale=none)",
         "experts = dense",
         'model = embed "DD" "LLLG" norm logits',
+    ],
+    "minimax/minimax_m2.bux": [
+        (
+            "attn = gqa(num_heads=4, num_kv_heads=2, head_dim=8, qk_norm=norm,"
+            " qk_norm_all_heads=true, rope=rope(base=5000000, fraction=0.5))"
+        ),
+        "experts = dense",
+        "model = embed block^2 norm head",
+    ],
+    "minimax/minimax_m3.bux": [
+        (
+            "attn = gqa(num_heads=4, num_kv_heads=2, head_dim=8, qk_norm=norm,"
+            " rope=rope(base=5000000, fraction=0.5))"
+        ),
+        (
+            "msa = attn(indexer=indexer(num_heads=2, head_dim=8, top_k=4, block_size=2,"
+            " pool=max, per_group=true, relu=false, weighted=false, norm=norm))"
+        ),
+        "experts = dense",
+        "model = embed D S^2 norm head",
     ],
     "deepseek/deepseek_v4.1_flash.bux": [
         "residual = none",

@@ -43,6 +43,9 @@ class Attention(Layer):
         super().__init__()
         unsupported(c, "kv_conv_size", "indexer", "relative_bias", "log_scale")
         unsupported(c, "power_scale", *(("gate_head_bias",) if c["gated"] else ()))
+        if c["qk_norm"] and c["qk_norm_all_heads"]:
+            # Its statistics would sum over every rank's heads under tensor parallelism.
+            raise NotImplementedError("gqa: qk_norm_all_heads not in vLLM yet")
         if site.ports:
             raise NotImplementedError("gqa: ports not in vLLM yet")
         tp = get_tensor_model_parallel_world_size()
