@@ -27,7 +27,7 @@ DATA = [
     if p.stem not in ("__init__", "spark")
 ]
 jaxtyping.install_import_hook(
-    ["bux.architecture", *DATA, "bux.parallel", "bux.train"],
+    ["bux.architecture", *DATA, "bux.parallel", "bux.search", "bux.train"],
     "beartype.beartype(conf=beartype.BeartypeConf(is_pep484_tower=True))",
 )
 
