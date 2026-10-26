@@ -249,6 +249,10 @@ def test_the_same_rows_on_spark(tmp_path, byte_tokenizer):
     )
     try:
         remote = spark.prepare(job, session, str(tmp_path / "spark"))
+        # Prepared, it is returned at once; half written, it is written again.
+        assert spark.prepare(job, session, str(tmp_path / "spark")) == remote
+        (tmp_path / "spark" / job.name / "dataset.json").unlink()
+        assert spark.prepare(job, session, str(tmp_path / "spark")) == remote
     finally:
         session.stop()
 

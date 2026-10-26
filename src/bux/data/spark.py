@@ -76,14 +76,16 @@ def prepare(job: Job, session: SparkSession, cache: str) -> str:
         cache: Any URI that Spark and Arrow can write to: ``"s3://bucket/packed"``.
 
     Returns:
-        The dataset's folder, ``cache/job.name``. Unlike the local `prepare
-        <bux.data.pipeline.prepare>`, it does not return a dataset that exists:
-        Spark's write fails on a folder that is there.
+        The dataset's folder, ``cache/job.name``. As the local `prepare
+        <bux.data.pipeline.prepare>` does, it returns a dataset prepared before at
+        once, and writes over the parts that a write which failed left.
     """
     folder = f"{cache.rstrip('/')}/{job.name}"
-    out, stats = rows(job, session.read.parquet(job.source.path))
-    out.write.parquet(folder)
     fs, path = pyarrow.fs.FileSystem.from_uri(folder)
+    if fs.get_file_info(f"{path}/dataset.json").type != pyarrow.fs.FileType.NotFound:
+        return folder  # dataset.json is written last: the dataset is whole
+    out, stats = rows(job, session.read.parquet(job.source.path))
+    out.write.mode("overwrite").parquet(folder)
     listed = fs.get_file_info(pyarrow.fs.FileSelector(path))
     parts = sorted(i.base_name for i in listed if i.base_name.endswith(".parquet"))
     meta = {"job": job.describe(), "files": [job.source.path], "parts": parts} | {

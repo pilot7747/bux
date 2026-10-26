@@ -12,14 +12,22 @@ tests that need a GPU run with them too.
 """
 
 import os
+from pathlib import Path
 
 os.environ.setdefault("JAX_PLATFORMS", "cpu")
 os.environ.setdefault("JAX_COMPILATION_CACHE_DIR", "")  # the command line's, off
 
 import jaxtyping
 
+# Every module of bux.data but spark, whose functions Spark pickles for its workers:
+# a checked function's wrapper neither pickles nor shows Spark its arguments.
+DATA = [
+    f"bux.data.{p.stem}"
+    for p in Path(__file__).parents[1].joinpath("src", "bux", "data").glob("*.py")
+    if p.stem not in ("__init__", "spark")
+]
 jaxtyping.install_import_hook(
-    ["bux.architecture", "bux.data", "bux.parallel", "bux.train"],
+    ["bux.architecture", *DATA, "bux.parallel", "bux.train"],
     "beartype.beartype(conf=beartype.BeartypeConf(is_pep484_tower=True))",
 )
 
