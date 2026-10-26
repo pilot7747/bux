@@ -212,3 +212,15 @@ with no kernels of fla, mamba_ssm or causal_conv1d yet.
 A padded token of a left-padded batch leaves the state as it was: its input is zeroed
 and its decay is 1. A model of recurrent layers alone has no attention layer to count
 the tokens its cache holds, so its first forward makes the cache, not `generate`.
+
+## Serving in vLLM
+
+The same checkpoint runs in vLLM as a native model, by bux's plugin, with vLLM's
+paged attention, fused MoE kernels, Mamba cache and tensor parallelism:
+[Serving in vLLM](vllm.md).
+
+```{toctree}
+:hidden:
+
+vllm
+```
