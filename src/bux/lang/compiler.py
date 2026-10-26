@@ -377,7 +377,7 @@ class _Evaluator:
             if level > 0:
                 return self.definition(name, level - 1)
             if name not in TYPES and name not in ACTIVATIONS:
-                if self.chain[name][level].amends and self.incomplete:
+                if self.incomplete:  # the module that failed may have defined it
                     raise _Reported()
                 if self.chain[name][level].amends:
                     raise BuxError(

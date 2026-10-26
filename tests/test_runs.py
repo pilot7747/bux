@@ -177,6 +177,13 @@ def test_module_errors(source, message):
     assert message in str(info.value)
 
 
+def test_a_missing_module_is_its_only_error():
+    # ffn = ffn(...) means the missing module's ffn, not a cycle.
+    source = "use archh\nffn = ffn(intermediate_size=8)\nattn.num_heads = 2"
+    report = check(source, filename="exp.bux", modules=MODULES)
+    assert [e.message for e in report.errors] == ["no module named 'archh'"]
+
+
 def test_modules_are_found_on_the_search_path(tmp_path, monkeypatch):
     (tmp_path / "zoo" / "family").mkdir(parents=True)
     (tmp_path / "zoo" / "family" / "tiny.bux").write_text(ARCH)
