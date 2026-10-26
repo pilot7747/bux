@@ -69,10 +69,11 @@ def expert_shards(
     (out, in) layout (w1 the gate, w3 up, w2 down); None for another weight.
 
     It reads bux's layout, ``up`` (E, d, f, p) with each hidden unit's up and gate
-    side by side and ``down`` (E, f, d), and transformers', ``experts.gate_up_proj``
-    (E, 2f, d), the gate first, or ``experts.up_proj`` (E, f, d), and
-    ``experts.down_proj`` (E, d, f); and their biases alike."""
-    match name:
+    side by side and ``down`` (E, f, d), and transformers', the export's
+    (`bux.export.hf.moe`): ``experts.gate_up_proj`` (E, 2f, d), the gate first, or
+    ``experts.up_proj`` (E, f, d), and ``experts.down_proj`` (E, d, f); and their
+    biases alike."""
+    match name.removeprefix("experts."):
         case "up" | "up_bias":
             up = t[..., 0].transpose(1, 2) if name == "up" else t[..., 0]
             if not gated:
@@ -81,11 +82,11 @@ def expert_shards(
             return [("w1", gate), ("w3", up)]
         case "down":
             return [("w2", t.transpose(1, 2))]
-        case "down_bias" | "experts.down_proj" | "experts.down_proj_bias":
+        case "down_bias" | "down_proj" | "down_proj_bias":
             return [("w2", t)]
-        case "experts.up_proj" | "experts.up_proj_bias":
+        case "up_proj" | "up_proj_bias":
             return [("w1", t)]
-        case "experts.gate_up_proj" | "experts.gate_up_proj_bias":
+        case "gate_up_proj" | "gate_up_proj_bias":
             gate, up = t.chunk(2, 1)
             return [("w1", gate), ("w3", up)]
     return None
