@@ -154,13 +154,16 @@ def test_rwkv7_value_residual_exports() -> None:
 
 
 # Zoo models shrunk as tests/test_examples.py shrinks them; their MoE, not exported
-# yet, swapped for MLPs.
+# yet, swapped for MLPs. Qwen3-Next makes 3 passes of its 12: through 36 gdn layers,
+# float32's own rounding reaches 2e-4 of the logits, bux's and the export's alike
+# (measured against the export in float64), past the check's 1e-4.
 GQA = "gqa(num_heads=4, num_kv_heads=2, head_dim=8"
 ZOO = {
     "qwen3_next.bux": [
         "delta = gdn(num_heads=2, num_v_heads=4, head_dim=8)",
         f"attn = {GQA}, gated=true, qk_norm=norm, rope=rope(base=10000000, fraction=0.25))",
         "experts = dense",
+        'model = embed "DDDA"^3 norm @h out mtp',
     ],
     "kimi_linear.bux": [
         "kda = kda(num_heads=2, head_dim=8, output_gate_rank=8, norm_eps=1e-5)",
