@@ -114,7 +114,8 @@ their short convs. A prefill runs the recurrence by chunks of 64 positions, with
 matmuls within a chunk and a loop across them, as fla's chunked kernels do; a
 decoding step runs one position from the state the cache holds. Mamba's scan, one
 decay per channel and state dim, runs one position at a time, as bux runs it. All of
-it is PyTorch in float32, with no kernels of fla, mamba_ssm or causal_conv1d yet.
+it is PyTorch, in float32 whatever the model's dtype (float64 in a float64 model),
+with no kernels of fla, mamba_ssm or causal_conv1d yet.
 
 A padded token of a left-padded batch leaves the state as it was: its input is zeroed
 and its decay is 1. A model of recurrent layers alone has no attention layer to count

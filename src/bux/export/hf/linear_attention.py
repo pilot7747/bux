@@ -39,10 +39,15 @@ def rmsnorm(eps: float) -> dict:
     }
 
 
+def wide(x: torch.Tensor) -> torch.Tensor:
+    """Return x in float32, or in its own dtype where that is wider."""
+    return x.to(torch.promote_types(x.dtype, torch.float32))
+
+
 def l2norm(x: torch.Tensor, eps: float = 1e-6) -> torch.Tensor:
     """Return x over its L2 norm as bux and fla compute it, ``x / sqrt(sum(x^2) +
-    eps)``, in float32; the result in x's dtype."""
-    y = x.float()
+    eps)``, in float32 (`wide`); the result in x's dtype."""
+    y = wide(x)
     return (y * torch.rsqrt(y.square().sum(-1, keepdim=True) + eps)).to(x.dtype)
 
 
@@ -65,7 +70,8 @@ def recurrence(
     a: torch.Tensor | None = None,
     b: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    """Run bux's recurrence one position at a time, from `state`, in float32.
+    """Run bux's recurrence one position at a time, from `state`, in float32
+    (`wide`).
 
     Args:
         q: The queries, b t h dk.
@@ -79,14 +85,14 @@ def recurrence(
     Returns:
         The outputs, b t h dv in v's dtype, and the last state, in float32.
     """
-    q, k, w, vs = q.float(), k.float(), log_decay.float().exp(), v.float()
-    s = _zero_state(k, v) if state is None else state.float()
+    q, k, w, vs = wide(q), wide(k), wide(log_decay).exp(), wide(v)
+    s = _zero_state(k, v) if state is None else wide(state)
     outs = []
     for t in range(k.shape[1]):
         new = w[:, t, ..., None] * s
         if a is not None and b is not None:
-            read = torch.einsum("bhk,bhkv->bhv", a[:, t].float(), s)
-            new = new + b[:, t, ..., None].float() * read[..., None, :]
+            read = torch.einsum("bhk,bhkv->bhv", wide(a[:, t]), s)
+            new = new + wide(b[:, t, ..., None]) * read[..., None, :]
         s = new + k[:, t, ..., None] * vs[:, t, ..., None, :]
         outs.append(torch.einsum("bhk,bhkv->bhv", q[:, t], s))
     return torch.stack(outs, 1).to(v.dtype), s
@@ -108,8 +114,8 @@ def delta_rule(
     chunks. Shapes as `recurrence`'s, and beta b t h; returns its outputs and state.
     """
     if q.shape[1] == 1:
-        step = beta.float()[..., None] * k.float()
-        a = -log_decay.float().exp() * k.float()
+        step = wide(beta)[..., None] * wide(k)
+        a = -wide(log_decay).exp() * wide(k)
         return recurrence(q, step, v, log_decay, state, a, step)
     return _by_chunks(_delta_chunk, (q, k, v, log_decay, beta), v, state)
 
@@ -147,15 +153,16 @@ def rank_one(
 
 
 def _zero_state(k: torch.Tensor, v: torch.Tensor) -> torch.Tensor:
-    """Return the state of no positions, b h dk dv, in float32."""
+    """Return the state of no positions, b h dk dv, in float32 (`wide`)."""
     b, _, h, dk = k.shape
-    return torch.zeros(b, h, dk, v.shape[-1], dtype=torch.float32, device=k.device)
+    dtype = torch.promote_types(k.dtype, torch.float32)
+    return torch.zeros(b, h, dk, v.shape[-1], dtype=dtype, device=k.device)
 
 
 def _chunked(x: torch.Tensor) -> torch.Tensor:
-    """Return x, b t h ..., as b h n c ... in float32: n chunks of c positions, the
-    last padded with zeros, which leave a state as it was."""
-    x = x.float().transpose(1, 2)
+    """Return x, b t h ..., as b h n c ... in float32 (`wide`): n chunks of c
+    positions, the last padded with zeros, which leave a state as it was."""
+    x = wide(x).transpose(1, 2)
     x = F.pad(x, (0, 0) * (x.ndim - 3) + (0, -x.shape[2] % CHUNK))
     return x.reshape(*x.shape[:2], -1, CHUNK, *x.shape[3:])
 
@@ -169,7 +176,7 @@ def _by_chunks(
     """Run `chunk` over the chunks of the positions `xs`, carrying the state."""
     t = v.shape[1]
     parts = [_chunked(x) for x in xs]
-    s = _zero_state(xs[1], v) if state is None else state.float()
+    s = _zero_state(xs[1], v) if state is None else wide(state)
     outs = []
     for i in range(parts[0].shape[2]):
         out, s = chunk(s, *(x[:, :, i] for x in parts))
@@ -459,8 +466,8 @@ class GatedDeltaNet(DeltaNet):
         self.dt_bias = nn.Parameter(torch.zeros(self.v_heads))
 
     def log_decay(self, x: torch.Tensor) -> torch.Tensor:
-        rate = F.softplus(self.a(x).float() + self.dt_bias.float())
-        return (-self.A_log.float().exp() * rate)[..., None]
+        rate = F.softplus(wide(self.a(x)) + wide(self.dt_bias))
+        return (-wide(self.A_log).exp() * rate)[..., None]
 
 
 class KimiDeltaAttention(DeltaNet):
@@ -481,9 +488,9 @@ class KimiDeltaAttention(DeltaNet):
 
     def log_decay(self, x: torch.Tensor) -> torch.Tensor:
         b, t, _ = x.shape
-        f = self.f(x).float() + self.dt_bias.float()
+        f = wide(self.f(x)) + wide(self.dt_bias)
         f = f.reshape(b, t, self.v_heads, self.head_dim)
-        rate = self.A_log.float().exp()[:, None]
+        rate = wide(self.A_log).exp()[:, None]
         if self.lower_bound is not None:
             return self.lower_bound * torch.sigmoid(rate * f)
         return -rate * F.softplus(f)
@@ -509,7 +516,7 @@ class GatedLinearAttention(LinearAttention):
         keep: torch.Tensor | None,
         state: torch.Tensor | None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        f = self.f(x).float().reshape(*k.shape)
+        f = wide(self.f(x)).reshape(*k.shape)
         k, g = hold(keep, k, F.logsigmoid(f) / 16)
         return decayed(q * self.head_dim**-0.5, k, v, g, state)
 

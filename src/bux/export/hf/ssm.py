@@ -18,7 +18,7 @@ from torch import nn
 
 from .common import Ctx, Norm, Site
 from .conv import CausalConv, keep_state, previous_state, real_tokens, without_padding
-from .linear_attention import decayed, hold, rmsnorm
+from .linear_attention import decayed, hold, rmsnorm, wide
 
 
 def mamba_scan(
@@ -29,8 +29,8 @@ def mamba_scan(
     C: torch.Tensor,
     state: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    """Run Mamba's selective scan one position at a time, in float32: every channel's
-    state ``S = exp(dt A) S + (dt x) B``, read as ``y = S . C``.
+    """Run Mamba's selective scan one position at a time, in float32 (`wide`):
+    every channel's state ``S = exp(dt A) S + (dt x) B``, read as ``y = S . C``.
 
     Args:
         x: The input of every channel, b t d.
@@ -43,9 +43,9 @@ def mamba_scan(
     Returns:
         y, b t d in x's dtype, and the last state, in float32.
     """
-    xs, dt, A, B, C = x.float(), dt.float(), A.float(), B.float(), C.float()
+    xs, dt, A, B, C = wide(x), wide(dt), wide(A), wide(B), wide(C)
     b, t, d = xs.shape
-    s = torch.zeros(b, d, A.shape[-1], device=x.device) if state is None else state
+    s = xs.new_zeros(b, d, A.shape[-1]) if state is None else wide(state)
     ys = []
     for i in range(t):
         s = (dt[:, i, :, None] * A).exp() * s
@@ -93,7 +93,7 @@ class Mamba(nn.Module):
         )
         dt = F.softplus(self.dt_norm(dt) @ self.dt_proj + self.dt_bias)
         (dt,) = hold(real_tokens(ctx, x.shape[1]), dt)
-        A = -self.A_log.float().exp()
+        A = -wide(self.A_log).exp()
         y, state = mamba_scan(
             u, dt, A, self.b_norm(B), self.c_norm(C), previous_state(ctx, slot)
         )
@@ -140,11 +140,11 @@ class Mamba2(nn.Module):
         u, B, C = ubc.split([d, g * n, g * n], -1)
         u = u.reshape(b, t, h, self.head_dim)
         B, C = (y.reshape(b, t, g, n).repeat_interleave(h // g, 2) for y in (B, C))
-        dt = F.softplus(dt.float() + self.dt_bias.float())
+        dt = F.softplus(wide(dt) + wide(self.dt_bias))
         (dt,) = hold(real_tokens(ctx, t), dt)
-        A = -self.A_log.float().exp()
+        A = -wide(self.A_log).exp()
         state = previous_state(ctx, slot)
-        y, state = decayed(C, B, dt[..., None] * u.float(), (dt * A)[..., None], state)
+        y, state = decayed(C, B, dt[..., None] * wide(u), (dt * A)[..., None], state)
         keep_state(ctx, slot, state)
         y = (y.to(u.dtype) + u * self.D[:, None]).reshape(b, t, d) * F.silu(z)
         y = self.norm(y.reshape(b, t, g, -1)).reshape(b, t, d)
