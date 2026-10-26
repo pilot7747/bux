@@ -145,6 +145,25 @@ SHRUNK = {
             " load_balancing=aux_free, expert=dense)"
         ),
     ],
+    # minimax_m1 and minimax_m2.x only use these two; the full-size test builds them.
+    "minimax/minimax_text_01.bux": [
+        "lightning = lightning(num_heads=2, head_dim=8)",
+        (
+            "attn = gqa(num_heads=4, num_kv_heads=2, head_dim=8,"
+            " rope=rope(base=10000000, fraction=0.5))"
+        ),
+        "experts = moe(num_experts=4, top_k=2, aux_loss_coef=1e-3, expert=dense)",
+    ],
+    "minimax/minimax_m2.bux": [
+        (
+            "attn = gqa(num_heads=4, num_kv_heads=2, head_dim=8, qk_norm=norm,"
+            " qk_norm_all_heads=true, rope=rope(base=5000000, fraction=0.5))"
+        ),
+        (
+            "experts = moe(num_experts=4, top_k=2, router=sigmoid,"
+            " load_balancing=aux_free, aux_loss_coef=1e-3, expert=dense)"
+        ),
+    ],
     "mhc.bux": ["attn = gqa(num_heads=4, num_kv_heads=2, rope=rope())", "ffn = dense"],
     "jamba.bux": [
         "attn = gqa(num_heads=4, num_kv_heads=2)",
