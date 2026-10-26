@@ -212,22 +212,27 @@ $ bux train mine/stories.bux
 remat=auto: none in 1s (none 0.5 GiB in 0s)
 stories step  25/200  loss 1.6177  lr 3.00e-03  grad 1.168  6,423 tok/s  ...
 stories step  50/200  loss 0.8029  lr 3.00e-03  grad 0.606  7,615 tok/s  ...
-stories step  50/200  eval loss 0.7767
+stories step  50/200  eval loss 0.7767  eval bpb 0.2621
 stories step  75/200  loss 0.7538  lr 3.00e-03  grad 0.349  8,194 tok/s  ...
 stories step 100/200  loss 0.7697  lr 3.00e-03  grad 0.516  7,836 tok/s  ...
-stories step 100/200  eval loss 0.7449
+stories step 100/200  eval loss 0.7449  eval bpb 0.2507
 stories step 125/200  loss 0.7407  lr 3.00e-03  grad 0.367  8,417 tok/s  ...
 stories step 150/200  loss 0.7477  lr 3.00e-03  grad 0.317  7,944 tok/s  ...
-stories step 150/200  eval loss 0.7410
+stories step 150/200  eval loss 0.7409  eval bpb 0.2469
 stories step 175/200  loss 0.7432  lr 1.88e-03  grad 0.365  8,305 tok/s  ...
 stories step 200/200  loss 0.7189  lr 0.00e+00  grad 0.261  7,976 tok/s  ...
-stories step 200/200  eval loss 0.7292
+stories step 200/200  eval loss 0.7293  eval bpb 0.2447
 ```
 
 This time the loss falls far below the random-token runs': the stories are mostly
 predictable, and the held-out stories, which the model never trained on, score as
 well as the training ones. The run is slower than the 512-token one because the head
 now projects to 50,304 logits a token.
+
+The eval also reports bits per byte, `eval bpb`: the held-out stories' nats over their
+bytes of text, in bits. A GPT-2 token here is about four bytes, so 0.73 nats a token
+are 0.24 bits a byte; unlike the loss, the number compares with a run in another
+tokenizer's tokens ([Eval](../training/running.md#eval)).
 
 ## 6. Choose a packing
 

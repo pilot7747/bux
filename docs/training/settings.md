@@ -42,11 +42,11 @@ shows them on hover and completes them, as it does for layers
 | `seed` | an integer | `0` | the model's initial weights, the order of the data, and every random stream |
 | `clip` | a number, or `none` | `1.0` | the global norm gradients are clipped to ([Clipping](optimizers.md#clipping)) |
 | `loss` | {bux}`loss` | `loss` | the weights of the z-loss and of multi-token prediction ([The loss](optimizers.md#the-loss)) |
-| `eval` | {bux}`eval`, or `none` | `none` | a held-out loss every so many steps ([Eval](running.md#eval)) |
+| `eval` | {bux}`eval`, a list of them, or `none` | `none` | held-out loss and bits per byte every so many steps, a set each ([Eval](running.md#eval)) |
 | `checkpoint` | {bux}`checkpoint`, or `none` | `none` | saves to resume from ([Checkpoints](running.md#checkpoints)) |
 | `log` | {bux}`log` | `log` | the metrics every `every` steps, 10 by default, and the trackers they go to ([The log](running.md#the-log), [Trackers](observing.md#trackers)) |
 | `observe` | {bux}`observe`, or `none` | `none` | the model by layer every so many steps ([Observing a run](observing.md)) |
-| `profile` | {bux}`profile`, or `none` | `none` | a trace of a few steps ([Profiling](../performance/profiling.md)) |
+| `profile` | {bux}`profile`, or `none` | `none` | a trace of a few steps, by jax.profiler, nsys or ncu ([Profiling](../performance/profiling.md)) |
 | `precision` | {bux}`precision` | `precision` | the dtype a run computes in, and the formats its matmuls take ([Precision](precision.md)) |
 | `mesh` | {bux}`mesh` | `mesh` | the device grid; unset, every device on `data` ([Parallelism](../parallelism/index.md)) |
 | `layout` | {bux}`layout` | `layout` | which mesh axes each named dimension splits over ([Layout](../parallelism/layout.md)) |

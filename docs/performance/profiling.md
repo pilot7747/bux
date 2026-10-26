@@ -1,9 +1,10 @@
 # Profiling
 
 This page covers how to see where a training step's time goes: the {bux}`profile`
-setting, the trace it writes, the three numbers bux reads from that trace
-(`comm_ms`, `exposed_comm_ms` and `idle_ms`), how bux counts a model's FLOPs for
-`mfu`, and how to tell from all of these what a step waits for.
+setting, the traces it takes (jax.profiler's, Nsight Systems' and Nsight Compute's),
+the three numbers bux reads from jax.profiler's (`comm_ms`, `exposed_comm_ms` and
+`idle_ms`), how bux counts a model's FLOPs for `mfu`, and how to tell from all of
+these what a step waits for.
 
 Profile a run when its `tokens_per_s` or `mfu` is lower than you expect, before you
 change anything ([the tuning workflow](tuning.md#the-workflow)).
@@ -11,19 +12,32 @@ change anything ([the tuning workflow](tuning.md#the-workflow)).
 ## Usage
 
 ```bux
-profile = profile(start=20, steps=5)
+profile = profile(start=20, steps=5)             # jax.profiler
+profile = profile(start=20, steps=5, tool=nsys)  # Nsight Systems
+profile = profile(start=20, steps=1, tool=ncu)   # Nsight Compute
 ```
 
 | field   | what it is | default |
 |---------|------------|---------|
 | `start` | the step after which the trace starts | `10` |
 | `steps` | how many steps it traces | `5` |
+| `tool` | what traces them: `jax`, `nsys` or `ncu` | `jax` |
+| `options` | more flags for nsys or ncu | `""` |
 
-The run traces the 5 steps after step 20 with `jax.profiler` into `profile/` in its
-directory. It waits for the step before it starts and before it stops, so the trace
-holds whole steps. Profiling at other steps keeps the run's id.
+The run traces the 5 steps after step 20 into `profile/` in its directory. It waits
+for the step before it starts and before it stops, so the trace holds whole steps.
+Profiling at other steps, or with another tool, keeps the run's id.
 
-Open the trace in xprof, or in TensorBoard's profile plugin:
+| tool | what it records | in `profile/` | open it with |
+|------|-----------------|---------------|--------------|
+| `jax` | the host's threads, every GPU's streams and XLA's ops; and [`comm_ms`, `exposed_comm_ms`, `idle_ms`](#profiling-metrics) | `plugins/profile/<time>/<host>.xplane.pb` | xprof, TensorBoard |
+| `nsys` | a timeline of every GPU's kernels, CUDA's calls and NVTX's ranges | `<host>.<pid>.nsys-rep` | Nsight Systems, `nsys stats` |
+| `ncu` | each kernel's counters: its throughput, occupancy, stalls | `<host>.<pid>.ncu-repz` | Nsight Compute, `ncu --import` |
+
+jax.profiler runs in the training process. nsys and ncu run it:
+[Nsight Systems and Nsight Compute](#nsight-systems-and-nsight-compute) says how.
+
+Open jax.profiler's trace in xprof, or in TensorBoard's profile plugin:
 
 ```sh
 tensorboard --logdir runs/<run>/profile
@@ -110,6 +124,121 @@ threads. Three things answer most questions:
   reduce-scatter, an expert parallelism exchange.
 - **The longest computing kernels** say what a step spends its time in: attention,
   the experts' GEMMs, a quantizer, a copy XLA inserted.
+
+## Nsight Systems and Nsight Compute
+
+`tool=nsys` takes Nsight Systems' timeline of the steps, and `tool=ncu` Nsight
+Compute's counters of each kernel in them. Both are NVIDIA's profilers, which run the
+training process; `bux launch` starts it under them:
+
+- **A run alone** starts its process again under the tool, with the same command,
+  before it does anything else. On many hosts each process does, and writes a report
+  of its own.
+- **A sweep's runs** each start their worker under it.
+
+The tool records nothing until step `start` is done. The `profile` hook then calls
+CUDA's `cudaProfilerStart`, and `cudaProfilerStop` after `steps` steps. The commands
+are {py:data}`bux.train.profilers.TOOLS`:
+
+```sh
+nsys profile --capture-range=cudaProfilerApi --capture-range-end=stop \
+    --cuda-graph-trace=node --trace=cuda,nvtx,cublas,cudnn \
+    --force-overwrite=true --output=runs/<run>/profile/%h.%p  <the command>
+ncu --profile-from-start=off --target-processes=all --force-overwrite \
+    --export=runs/<run>/profile/%h.%p  <the command>
+```
+
+`options` adds flags of the tool's own after them:
+
+```bux
+profile = profile(start=20, steps=5, tool=nsys, options="--cuda-memory-usage=true")
+profile = profile(start=20, steps=1, tool=ncu, options="--launch-count=20")
+```
+
+A process under either tool sets `BUX_PROFILER` to its name, and bux then changes two
+things in it ({py:data}`bux.train.profilers.XLA_FLAGS`,
+{py:data}`~bux.train.profilers.VARIABLES`), each unless your environment sets it:
+
+- **XLA runs no command buffers** (`--xla_gpu_enable_command_buffer=`, before your
+  `XLA_FLAGS`), as jax.profiler turns them off while it traces: `one_node.bux`'s
+  `fsdp` arm trains 1.5% slower without them. With them, both tools crashed
+  processes of 8 GPUs in CUDA's calls that make and free the CUDA graphs that
+  command buffers are: nsys 3 of 4 runs of that arm, at exit or as they trained
+  (exit 139), and ncu all 3 runs of 8 GPUs.
+- **Under ncu, XLA takes memory as it needs it** (`XLA_PYTHON_CLIENT_PREALLOCATE=false`),
+  not 95% of each GPU at once. ncu saves and restores that memory around each pass of
+  each kernel it replays: with all of it taken, a kernel of the smoke run took 3
+  minutes.
+
+### What nsys records
+
+On B300s, with Nsight Systems 2026.5 and jax 0.12 (2026-10-26):
+
+- **Every GPU of the process, from one capture.** Three steps of `one_node.bux`'s
+  `fsdp` arm on 8 B300s hold 1627 kernels a GPU a step, NCCL's, cuDNN's and cuBLAS's
+  by name.
+- **XLA's NVTX ranges.** Each run of a program is an `XlaModule` range named by the
+  step (`XlaModule:#hlo_module=jit__train_step_on_shards,...`), each op in it a
+  `Thunk` range with its `hlo_op`, and cuBLAS and NCCL add their calls'.
+  jax.profiler's annotations are no NVTX ranges, so they do not show.
+- **A traced step is nearly as fast.** A traced step of that run took 228 ms, and
+  223 ms untraced. Without command buffers, which bux turns off under nsys, the run
+  trains at 1.175M tokens a second, against 1.193M with them.
+- **The capture's start and stop take time.** On that run, the start took about 23 s,
+  and the stop 75 to 90 s, while nsys wrote its report of about 20 MB:
+  `cudaProfilerStop` returns once it is written. The log's `tokens_per_s` reads low
+  at the two logs around the traced steps (55k and 17k tokens a second, from 1.17M).
+- **A signal reaches the run through nsys.** SIGTERM to the launcher stops the run
+  after its step, as without nsys, and the launcher exits with 143.
+
+`nsys stats --report cuda_gpu_kern_sum <report>` lists the kernels by their time,
+and `nsys export --type sqlite <report>` writes the report as a database to query.
+The three that took longest in that run, a GPU a step:
+
+| kernel | what it is | ms |
+|--------|------------|----|
+| `ncclDevKernel_AllGather_RING` | FSDP's parameters' all-gathers | 33.8 |
+| `cudnn_generated_fort_native_sdpa_...` | cuDNN's attention, a kernel a layer | 21.0 |
+| `ncclDevKernel_ReduceScatter_bf16_RING` | FSDP's gradients' reduce-scatter | 18.9 |
+
+A collective's time includes its wait for the slowest GPU. cuBLAS's GEMMs
+(`nvjet_sm103_...`) come in many shapes, each a line of its own.
+
+### What ncu records
+
+On B300s, with Nsight Compute 2026.3 and jax 0.12 (2026-10-26):
+
+- **Each kernel, one at a time.** ncu replays each kernel it profiles, a pass for
+  each group of its counters (10 for its default set), and restores the memory the
+  kernel may write before each pass. A step of the smoke run on a B300, 174
+  kernels, took under two minutes.
+- **Name the kernels.** A step of a large model runs thousands of kernels:
+  `options="--kernel-name=regex:nvjet --launch-count=4"` profiles the first 4 of
+  cuBLAS's GEMMs (`nvjet_...`), and `steps=1` keeps to one step.
+- **One GPU a process.** ncu runs one kernel at a time, and a step's collectives
+  over many GPUs need theirs to run together: on 8 B300s, ncu hung at a step of
+  `one_node.bux`'s `fsdp` arm, and failed to save a data-parallel step's memory for
+  its replay. So a launch records a run of more GPUs under ncu as failed, at once
+  (`profile: ncu profiles one GPU, not 8: give the run one`): give it one with
+  `mesh = mesh(data=1)`, its other axes 1.
+- **Its report** is compressed (`.ncu-repz`).
+  `ncu --import <report> --print-summary per-kernel` prints each kernel's counters,
+  and Nsight Compute opens it.
+
+### Running them yourself
+
+- **The tool must be on `PATH`.** The [Docker image](../get-started/installation.md#docker)
+  has both. A launch records a run whose tool it cannot find as failed, at once:
+  `smoke: failed before training: profile: nsys is not on PATH`.
+- **`bux train` runs under no tool.** Run it under one yourself, with `BUX_PROFILER`
+  set for bux's changes, and the `profile` hook starts and stops the capture as it
+  does under `bux launch`:
+  `BUX_PROFILER=nsys nsys profile --capture-range=cudaProfilerApi --capture-range-end=stop bux train run.bux`.
+- **A command of your own.** With `BUX_PROFILER` set to the tool, `bux launch` starts
+  no tool of its own:
+  `BUX_PROFILER=nsys nsys profile --capture-range=cudaProfilerApi <flags> bux launch run.bux`.
+- **Another tool** is an entry of {py:data}`~bux.train.profilers.TOOLS`, in a script
+  that adds it before it launches ({py:mod}`bux.train.profilers`).
 
 (mfu-and-flops)=
 

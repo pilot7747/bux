@@ -73,10 +73,12 @@ observe = observe(every=100, histograms=true)
 ## Data
 
 Documents, raw text or chat conversations in the OpenAI format, are Parquet files.
-A MapReduce job tokenizes them with [gigatoken](https://github.com/marcelroed/gigatoken),
-shuffles them, and packs them into rows of `input_ids`, `position_ids` and
-`loss_mask`, densely (`concat`), whole (`greedy`), or best-fit (`best_fit`), on this
-machine's cores or on Spark. Documents packed into a row see only themselves.
+A MapReduce job renders conversations with the tokenizer's own chat template,
+tokenizes them with [gigatoken](https://github.com/marcelroed/gigatoken) (Hugging
+Face's tokenizers for one gigatoken cannot run), shuffles them, and packs them into
+rows of `input_ids`, `position_ids` and `loss_mask`, densely (`concat`), whole
+(`greedy`), or best-fit (`best_fit`), on this machine's cores or on Spark. Documents
+packed into a row see only themselves.
 
 ```
 tokenizer = tokenizer(name="gpt2")

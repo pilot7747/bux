@@ -106,6 +106,7 @@ class Console(Sink):
         "tokens_per_s": "{:,.0f} tok/s",
         "mfu": "mfu {:.1%}",
         "eval_loss": "eval loss {:.4f}",
+        "eval_bpb": "eval bpb {:.4f}",
         "time/step_ms": "{:.0f} ms/step",
         "time/data_ms": "data {:.1f} ms",
         "mem/peak_gib": "mem {:.1f} GiB",

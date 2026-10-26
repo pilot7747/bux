@@ -10,7 +10,8 @@ do one thing and can each be replaced:
   function.
 - `bux.train.trainer`: `~bux.train.trainer.Trainer` compiles a step and runs the
   loop; a subclass overrides ``train_step``.
-- `bux.train.hooks`: what the loop does every so many steps: log, eval, checkpoint.
+- `bux.train.hooks`: what the loop does every so many steps: log, eval, checkpoint,
+  profile (by jax.profiler, nsys or ncu: `bux.train.profilers`).
 - `bux.train.sinks`: where what the hooks report goes: the console, metrics.jsonl.
 - `bux.train.trackers`: the sinks a run's ``log.trackers`` names: W&B, TensorBoard.
 - `bux.train.observe`: the steps that measure the model by layer, every
