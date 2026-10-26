@@ -4,6 +4,8 @@ import jax
 from flax import nnx
 from jaxtyping import Array, Float, Int
 
+from bux import config as cfg
+from bux import parallel
 from bux.architecture.common.segments import Segments
 from bux.architecture.graph import build_node
 from bux.architecture.logits import HeadOutput
@@ -25,7 +27,9 @@ class Model(nnx.Module):
     embedded on its own (`~bux.architecture.common.segments.Segments`).
 
     Under a mesh with more than one pipeline stage (`bux.parallel`), building the
-    model pipelines its longest scanned repeat over the stages.
+    model pipelines its longest scanned repeat over the stages. An architecture's
+    ``init`` starts every weight matrix in place of its layer's default
+    (`initializer`).
 
     Args:
         arch: The architecture to build, as `bux.lang.compile` makes it.
@@ -46,7 +50,8 @@ class Model(nnx.Module):
     """
 
     def __init__(self, arch: ir.Architecture, *, rngs: nnx.Rngs):
-        self.graph = pipe_longest(build_node(arch.graph, Context(arch, rngs)))
+        with parallel.initializing(initializer(arch.init)):
+            self.graph = pipe_longest(build_node(arch.graph, Context(arch, rngs)))
         self.main_branches = tracing.main_branches(arch.graph)  # precision.last
 
     def outputs(
@@ -128,6 +133,22 @@ class Model(nnx.Module):
             The logits over the vocabulary at every position.
         """
         return self.outputs(tokens)[0]
+
+
+def initializer(init: cfg.NormalInitConfig | None) -> nnx.Initializer | None:
+    """Return what an architecture's ``init`` draws weight matrices from; None for
+    none, which leaves each layer's default.
+
+    Args:
+        init: The architecture's ``init``: a normal, truncated at ``truncate``
+            standard deviations if it says so.
+    """
+    if init is None:
+        return None
+    if init.truncate is None:
+        return nnx.initializers.normal(init.std)
+    bound = init.truncate
+    return nnx.initializers.truncated_normal(init.std, lower=-bound, upper=bound)
 
 
 def num_params(module: nnx.Module) -> int:

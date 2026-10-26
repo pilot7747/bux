@@ -69,7 +69,7 @@ ACTIVATIONS = frozenset(typing.get_args(cfg.Activation))
 #: :meta hide-value:
 RESIDUALS = _tags(cfg.ResidualConfig)
 #: The top-level settings of a model.
-SETTINGS = ("d_model", "vocab_size", "residual")
+SETTINGS = ("d_model", "vocab_size", "residual", "init")
 #: The top-level settings that make a file a run, the fields of
 #: `bux.train.config.TrainConfig` (``data``, ``optimizer``, ``schedule``, ...).
 TRAIN_SETTINGS = tuple(tcfg.TrainConfig.model_fields)
@@ -1322,6 +1322,7 @@ def _compile(ev: _Evaluator, entry: str) -> ir.Architecture:
     d_model = typing.cast(int | None, settings["d_model"])
     vocab_size = typing.cast(int | None, settings["vocab_size"])
     residual = typing.cast(cfg.ResidualConfig | None, settings["residual"])
+    init = typing.cast(cfg.NormalInitConfig | None, settings["init"])
     if d_model is None:
         if ev.incomplete:
             raise _Reported()
@@ -1334,23 +1335,33 @@ def _compile(ev: _Evaluator, entry: str) -> ir.Architecture:
             raise _Reported()
         raise BuxError("'vocab_size' is not defined", hint="vocab_size = 32000")
     return ir.Architecture(
-        d_model=d_model, vocab_size=vocab_size, residual=residual, graph=graph
+        d_model=d_model,
+        vocab_size=vocab_size,
+        residual=residual,
+        init=init,
+        graph=graph,
     )
+
+
+# What each top-level setting of a model takes, and how that is written, where it is
+# not an integer.
+_SETTING_TYPES: dict[str, tuple[tuple[type, ...], str]] = {
+    "residual": (
+        tuple(RESIDUALS.values()),
+        " or ".join(f"{t}(...)" for t in RESIDUALS),
+    ),
+    "init": ((cfg.NormalInitConfig,), "normal(...)"),
+}
 
 
 def _model_settings(ev: _Evaluator) -> dict[str, object]:
     settings = {}
     for name in SETTINGS:
         value, span = ev.setting(name)
-        expected = tuple(RESIDUALS.values()) if name == "residual" else int
+        expected, kind = _SETTING_TYPES.get(name, ((int,), "an integer"))
         if value is not None and (
             not isinstance(value, expected) or isinstance(value, bool)
         ):
-            kind = (
-                " or ".join(f"{t}(...)" for t in RESIDUALS)
-                if name == "residual"
-                else "an integer"
-            )
             raise BuxError(f"'{name}' must be {kind}, found {_describe(value)}", span)
         settings[name] = value
     return settings

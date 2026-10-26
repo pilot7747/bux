@@ -1,0 +1,34 @@
+# Trinity Large (Arcee AI, 2026): a 400B MoE with 13B active, 4 of 256 experts a
+# token beside a shared one, trained on 17T tokens with Muon. Three sliding-window
+# layers with RoPE per global layer with none (NoPE), all with QK-norm and a sigmoid
+# gate on every head's output. Every layer is sandwich-normed, the output norms'
+# gains starting at 1 / sqrt(60); the embedding is scaled by sqrt(d_model); and every
+# weight starts from a normal of 0.5 / sqrt(d_model), truncated at 3 sigma. The router
+# picks by sigmoid score plus a bias that SMEBU balances, and a sequence-wise loss of
+# 1e-4 balances too. The first six layers are dense.
+#
+# SMEBU's rate is the report's 5e-4; the config.json's load_balance_coeff is 5e-5.
+d_model    = 3072
+vocab_size = 200192
+layers     = 60
+
+init    = normal(std=0.5 * d_model ^ -0.5, truncate=3)
+norm    = rmsnorm(eps=1e-5)
+post    = norm(gain_init=layers ^ -0.5)
+attn    = gqa(num_heads=48, num_kv_heads=8, head_dim=128, qk_norm=norm, gated=true)
+local   = attn(sliding_window_size=4096, rope=rope(base=10000))
+global  = attn
+dense   = gated_mlp(intermediate_size=12288, activation=swish)
+experts = moe(num_experts=256, top_k=4, num_shared_experts=1, router=sigmoid,
+              routed_scaling_factor=2.448, load_balancing=smebu,
+              bias_update_rate=5e-4, bias_softclamp=2, bias_momentum=0.5,
+              aux_loss_coef=1e-4, aux_loss_scope=sequence,
+              expert=gated_mlp(intermediate_size=3072, activation=swish))
+
+layer(mixer, ffn=experts) = [norm mixer post] [norm ffn post]
+l = layer(local, dense)
+g = layer(global, dense)
+L = layer(local)
+G = layer(global)
+
+model = embed(scale_by_sqrt_dim=true) "lllgll" "LG" "LLLG"^13 norm head

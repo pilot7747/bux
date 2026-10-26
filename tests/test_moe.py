@@ -23,6 +23,7 @@ from bux.architecture.experts.moe import (
     random_logits,
     routed,
     run_sorted,
+    smebu_move,
 )
 from bux.architecture.layers.mlp import activate
 from bux.architecture.layers.norm import Norm
@@ -120,6 +121,56 @@ def test_training_moves_the_router_bias_toward_the_experts_picked_less():
     e(x, Taps(training=True))
     assert jnp.array_equal(e.router_bias[...], 0.01 * jnp.sign(load.mean() - load))
     assert (e.router_bias[...] != 0).any()
+
+
+def test_a_centered_aux_free_bias_keeps_a_mean_of_zero():
+    e = moe_layer(router="sigmoid", load_balancing="aux_free", center_bias=True)
+    assert e.router_bias is not None
+    x = jax.random.normal(jax.random.key(1), (4, 8, D))
+    idx, _, _ = e._route(x)
+    load = jax.nn.one_hot(idx, 4).sum((0, 1, 2))
+    e(x, Taps(training=True))
+    step = 1e-3 * jnp.sign(load.mean() - load)
+    assert jnp.allclose(e.router_bias[...], step - step.mean())
+    assert jnp.isclose(e.router_bias[...].mean(), 0, atol=1e-9)
+
+
+def test_smebu_moves_the_bias_by_its_centered_soft_clamped_momentum():
+    """Trinity's eqs. 23-28, a training step at a time."""
+    e = moe_layer(
+        router="sigmoid",
+        load_balancing="smebu",
+        bias_update_rate=0.01,
+        bias_softclamp=3,
+        bias_momentum=0.6,
+    )
+    assert e.config.aux_loss_weight == 0
+    assert e.router_bias is not None and e.router_momentum is not None
+    x = jax.random.normal(jax.random.key(1), (4, 8, D))
+    b = m = jnp.zeros(4)
+    for _ in range(3):
+        idx, _, _ = e._route(x)  # by the bias so far
+        n = jax.nn.one_hot(idx, 4).sum((0, 1, 2))
+        move = 0.01 * jnp.tanh(3 * (n.mean() - n) / n.mean())
+        m = 0.6 * m + 0.4 * (move - move.mean())
+        b = b + m
+        e(x, Taps(training=True))
+        assert jnp.allclose(e.router_momentum[...], m, atol=1e-8)
+        assert jnp.allclose(e.router_bias[...], b, atol=1e-8)
+    assert (b != 0).any() and jnp.isclose(b.mean(), 0, atol=1e-8)
+
+
+def test_smebu_leaves_an_expert_at_the_mean_load_and_each_layer_on_its_own():
+    c = cfg.MoEConfig(num_experts=4, top_k=2, expert=GATED, load_balancing="smebu")
+    load = jnp.array([4.0, 4.0, 2.0, 6.0])  # the mean is 4
+    expected = 1e-3 * jnp.tanh(2 * jnp.array([0.0, 0.0, 0.5, -0.5]))
+    assert jnp.allclose(smebu_move(load, c), expected)
+    # A scanned repeat's layers, stacked: each centered on its own.
+    stacked = smebu_move(jnp.stack([load, jnp.array([8.0, 0.0, 0.0, 0.0])]), c)
+    assert jnp.allclose(stacked[0], expected)
+    assert jnp.allclose(stacked[1].mean(), 0, atol=1e-9)
+    # No picks moves nothing, rather than by 0 / 0.
+    assert (smebu_move(jnp.zeros(4), c) == 0).all()
 
 
 def test_random_logits_are_drawn_and_their_gradient_is_the_router_s():

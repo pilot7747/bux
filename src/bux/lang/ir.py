@@ -36,7 +36,7 @@ from typing import Annotated, Any, Literal
 
 from pydantic import BaseModel, ConfigDict, Field
 
-from bux.config import LayerConfig, ResidualConfig
+from bux.config import LayerConfig, NormalInitConfig, ResidualConfig
 from bux.train.config import PrecisionConfig, TrainConfig
 
 #: What a layer reads, as the compiler infers it.
@@ -188,6 +188,8 @@ class Architecture(BaseModel):
             a graph with neither, such as a block compiled alone.
         residual: The residual algebra every `Residual` merges by; None for plain
             additive residuals.
+        init: How every weight matrix starts; None for each layer's own default,
+            LeCun normal.
         graph: The model, a tree of nodes.
 
     Example::
@@ -203,6 +205,7 @@ class Architecture(BaseModel):
     d_model: int
     vocab_size: int | None = None
     residual: ResidualConfig | None = None
+    init: NormalInitConfig | None = None
     graph: Node
 
     def layers(self) -> Iterator[Layer]:
@@ -307,10 +310,21 @@ _UNCOMPUTED_FIELDS = {"precision": ("eval",)}
 _NEWER_LAYER_FIELDS = {
     "mlp": {"up_offset": 0.0},
     "gated_mlp": {"up_offset": 0.0},
-    "moe": {"router_bias": False},
+    "moe": {
+        "router_bias": False,
+        "center_bias": False,
+        "bias_softclamp": 2.0,
+        "bias_momentum": 0.5,
+    },
     "mamba2": {"num_heads": None},
     "gqa": {"gate_head_bias": False, "power_scale": None, "power_scale_length": 2048},
+    "mla": {"gate_head_bias": False},
+    "csa": {"gate_head_bias": False},
+    "layernorm": {"gain_init": 1.0},
+    "rmsnorm": {"gain_init": 1.0},
 }
+# Settings of a model newer than run ids, at what models computed before them.
+_NEWER_SETTINGS = {"init": None}
 
 
 def _experts_as_they_run(
@@ -400,6 +414,9 @@ class Run(BaseModel):
             if train[setting] == old[setting]:
                 del train[setting]
         dumped_arch = _without_newer_layer_fields(arch.model_dump(mode="json"))
+        for setting, before in _NEWER_SETTINGS.items():
+            if dumped_arch[setting] == before:
+                del dumped_arch[setting]
         what = {"arch": dumped_arch, "train": train}
         blob = json.dumps(what, sort_keys=True, separators=(",", ":"))
         return hashlib.sha256(blob.encode()).hexdigest()[:10]

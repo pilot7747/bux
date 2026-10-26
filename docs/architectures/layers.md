@@ -2,8 +2,9 @@
 
 This page covers the layers outside the token-mixer families: normalization, MLPs,
 the embedding and the heads, multi-token prediction's `nextn`, Engram's memory, and
-the elementwise layers the algebra composes. Read it to configure the parts of a
-block around its mixers, or to build a layer out of primitives.
+the elementwise layers the algebra composes, then how the weights start. Read it to
+configure the parts of a block around its mixers, or to build a layer out of
+primitives.
 
 ```bux
 # GPT-2 small: LayerNorm with biases, a GELU MLP with biases, learned positions,
@@ -37,6 +38,7 @@ The statistics are in float32, whatever the run computes in.
 | `bias` | `false` | the bias $b$ (LayerNorm) | GPT-2 |
 | `zero_centered` | `false` | the gain as $1 + w$, $w$ starting at 0 | Gemma, Qwen3-Next |
 | `scale_input` | `false` | scale before normalizing, $\mathrm{norm}(g \odot x)$ | Muse Spark |
+| `gain_init` | `1` | where the gain $g$ starts | Trinity |
 
 A definition makes a norm once and uses it everywhere; each use has its own
 parameters. Gemma 3 and Qwen3-Next use zero-centered gains:
@@ -59,6 +61,17 @@ A norm also goes in other layers' settings: `qk_norm=norm` in attention,
 
 Where the norms go is the algebra's: pre-norm `[norm attn]`, post-norm
 `[attn] norm`, sandwich `[norm attn norm]` (Gemma 2 and 3) ([Operators](../language/operators.md)).
+Trinity's sandwich norms are depth-scaled: each branch's output norm starts with a
+gain of $1 / \sqrt{L}$, for $L$ layers, so that a deep stack starts close to the
+embedding (`examples/architectures/arcee/trinity_large.bux`):
+
+```bux
+layers = 60
+norm   = rmsnorm(eps=1e-5)
+post   = norm(gain_init=layers ^ -0.5)
+
+layer(mixer, ffn=experts) = [norm mixer post] [norm ffn post]
+```
 
 ### `dyt`: Dynamic Tanh
 
@@ -308,3 +321,22 @@ the read the algebra does for a branch, without the write ({bux}`merge`). You ra
 write it: the compiler puts one before the first layer outside a branch that needs
 one stream, such as the final norm, and `bux fmt` prints it. See
 [Residual algebras](../language/residual-algebras.md).
+
+## Initialization
+
+Every weight matrix starts LeCun normal unless the model says otherwise: a
+projection's of variance $1 / \text{fan\_in}$, truncated at 2 standard deviations, as
+`flax.nnx.Linear`'s, an expert's the same, and an embedding table's of variance
+$1 / d$. The top-level setting `init` replaces all of them with one normal
+({bux}`normal`), truncated at `truncate` standard deviations if it says so. Trinity
+draws every weight from a normal of $0.5 / \sqrt{d}$, truncated at 3, which is
+DeepSeek-V3's 0.006 at its width of 7168:
+
+```bux
+init = normal(std=0.5 * d_model ^ -0.5, truncate=3)
+```
+
+What starts in a way of its own keeps it: norms' gains (`gain_init`), biases,
+zero-initialized outputs and connections, Mamba's and the linear attentions' decays
+and time steps, RWKV-7's uniform projections, Engram's tables. The run's `seed` draws
+them all.

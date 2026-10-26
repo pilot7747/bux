@@ -420,12 +420,24 @@ def test_the_id_follows_what_a_run_computes():
     assert run.id == renamed.id == watched.id != changed.id
 
 
+MOE = "moe(num_experts=4, top_k=2, expert=ffn)"
+MLA = (
+    "mla(num_heads=2, kv_lora_rank=8, qk_nope_head_dim=4, qk_rope_head_dim=4,"
+    " v_head_dim=4)"
+)
+CSA = "csa(num_heads=2, head_dim=8, sliding_window_size=4)"
+
+
 @pytest.mark.parametrize(
     ("layer", "field", "before", "after"),
     [
         ("ffn", "up_offset", "0.0", "1.0"),
-        ("moe(num_experts=4, top_k=2, expert=ffn)", "router_bias", "false", "true"),
+        (MOE, "router_bias", "false", "true"),
+        (MOE, "center_bias", "false", "true"),
+        (MOE, "bias_momentum", "0.5", "0.9"),
         ("mamba2(state_size=8, head_dim=8)", "num_heads", "none", "4"),
+        (MLA, "gate_head_bias", "false", "true"),
+        (CSA, "gate_head_bias", "false", "true"),
     ],
 )
 def test_a_layer_field_newer_than_ids_keeps_them_where_it_computes_as_before(
@@ -438,13 +450,15 @@ def test_a_layer_field_newer_than_ids_keeps_them_where_it_computes_as_before(
         [run] = runs(source + TRAIN)
         return run
 
-    # The ids of main 0f0cfe2, before these fields.
+    # The ids before these fields: of main 0f0cfe2, and of 788e525 for gate_head_bias.
     old = {
-        "up_offset": "a8fa406e9b",
-        "router_bias": "ba4e9ec7b8",
-        "num_heads": "ccdcaff2f8",
-    }
-    assert run_of(None).id == run_of(before).id == old[field] != run_of(after).id
+        "ffn": "a8fa406e9b",
+        "moe": "ba4e9ec7b8",
+        "mamba2": "ccdcaff2f8",
+        "mla": "fa0bdd5558",
+        "csa": "e1e9cc3d90",
+    }[layer.split("(")[0]]
+    assert run_of(None).id == run_of(before).id == old != run_of(after).id
 
 
 @pytest.mark.parametrize("path", EXPERIMENTS, ids=lambda p: p.stem)

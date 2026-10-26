@@ -145,6 +145,21 @@ SHRUNK = {
             " load_balancing=aux_free, expert=dense)"
         ),
     ],
+    "arcee/trinity_large.bux": [
+        "attn = gqa(num_heads=4, num_kv_heads=2, head_dim=8, qk_norm=norm, gated=true)",
+        (
+            "experts = moe(num_experts=4, top_k=2, num_shared_experts=1, router=sigmoid,"
+            " routed_scaling_factor=2.448, load_balancing=smebu, aux_loss_coef=1e-4,"
+            " aux_loss_scope=sequence, expert=dense)"
+        ),
+    ],
+    "arcee/trinity_nano.bux": [
+        "attn = gqa(num_heads=4, num_kv_heads=2, head_dim=8, qk_norm=norm, gated=true)",
+        (
+            "experts = moe(num_experts=4, top_k=2, num_shared_experts=1, router=sigmoid,"
+            " load_balancing=aux_free, center_bias=true, expert=dense)"
+        ),
+    ],
     "mhc.bux": ["attn = gqa(num_heads=4, num_kv_heads=2, rope=rope())", "ffn = dense"],
     "jamba.bux": [
         "attn = gqa(num_heads=4, num_kv_heads=2)",

@@ -19,7 +19,8 @@ The package re-exports its modules' public names, as ``parallel.use``:
 - `bux.parallel.mesh`, the device grid: ``AXES``, ``mesh``, ``active``.
 - `bux.parallel.settings`, the run's settings in force: ``use``, ``check``.
 - `bux.parallel.layout`, names resolved to mesh axes: ``named``, ``spec``,
-  ``splits``, ``shard``, ``shard_stream``, ``axes_of``.
+  ``splits``, ``shard``, ``shard_stream``, ``axes_of``; and the init a named weight
+  starts by, ``default_init``, ``initializing``.
 - `bux.parallel.place`, where state and batches live: ``shardings``, ``build``,
   ``shard_state``, ``shard_batch``, ``local_rows``, ``microbatches``.
 - `bux.parallel.methods`, one registry per kind of method: ``method``.
@@ -51,6 +52,8 @@ from bux.parallel.layout import (
     NAMES,
     Name,
     axes_of,
+    default_init,
+    initializing,
     named,
     shard,
     shard_stream,
@@ -93,9 +96,11 @@ __all__ = [
     "build",
     "check",
     "context",
+    "default_init",
     "experts",
     "flash",
     "gather",
+    "initializing",
     "local_rows",
     "mesh",
     "method",

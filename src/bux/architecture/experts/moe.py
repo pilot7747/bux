@@ -86,7 +86,8 @@ class MoE(nnx.Module):
     - Load balancing: a training forward adds `balance_loss` to the loss, weighted
       by ``aux_loss_coef``, and under ``load_balancing=aux_free`` a bias per expert
       on the scores that pick moves toward the experts picked less
-      (`step_end_update`, DeepSeek-V3).
+      (`step_end_update`, DeepSeek-V3), or under ``smebu`` by `smebu_move`, averaged
+      by a momentum (Trinity).
     - LatentMoE (``latent_size``, Nemotron 3): the routed experts run in a narrower
       space, between a down and an up projection.
 
@@ -146,11 +147,14 @@ class MoE(nnx.Module):
         self.router = linear(
             width, n + sinks, ("embed", None), config.router_bias, rngs, in_compute=True
         )
-        aux_free = config.load_balancing == "aux_free"
-        self.router_bias = nnx.Variable(jnp.zeros(n)) if aux_free else None
+        by_bias = config.load_balancing != "aux_loss"
+        self.router_bias = nnx.Variable(jnp.zeros(n)) if by_bias else None
         # The picks of each expert since the bias last moved; with `update_at_step_end`
         # set (by the trainer), the bias moves in `step_end_update`, once per step.
-        self.router_load = nnx.Variable(jnp.zeros(n)) if aux_free else None
+        self.router_load = nnx.Variable(jnp.zeros(n)) if by_bias else None
+        # SMEBU's running average of the bias's moves, which moves the bias.
+        smebu = config.load_balancing == "smebu"
+        self.router_momentum = nnx.Variable(jnp.zeros(n)) if smebu else None
         self.update_at_step_end = False
 
         # LatentMoE: the routed experts work between these two projections.
@@ -306,18 +310,30 @@ class MoE(nnx.Module):
 
     def step_end_update(self) -> None:
         """Move the router bias toward the experts picked less than the mean since it
-        last moved (DeepSeek-V3), and count again from zero.
+        last moved, and count again from zero.
 
-        Each expert's bias moves by ``bias_update_rate``: up if it was picked less
-        than the mean, down if more. A forward calls it itself unless the trainer
-        sets `update_at_step_end`, to call it once a step. Without ``aux_free`` it
-        does nothing.
+        Under ``aux_free`` (DeepSeek-V3) each expert's bias moves by
+        ``bias_update_rate``: up if it was picked less than the mean, down if more;
+        with ``center_bias``, the biases' mean is then taken off them. Under
+        ``smebu`` (Trinity) the bias moves by the running average of `smebu_move`,
+        of momentum ``bias_momentum``. A forward calls it itself unless the trainer
+        sets `update_at_step_end`, to call it once a step. Without a bias it does
+        nothing.
         """
         if self.router_bias is None or self.router_load is None:
             return
-        load = self.router_load[...]
-        step = self.config.bias_update_rate * jnp.sign(load.mean() - load)
-        self.router_bias[...] = self.router_bias[...] + step
+        config, load = self.config, self.router_load[...]
+        if self.router_momentum is None:
+            step = config.bias_update_rate * jnp.sign(load.mean() - load)
+            bias = self.router_bias[...] + step
+            if config.center_bias:
+                bias = bias - bias.mean(-1, keepdims=True)
+        else:
+            beta = config.bias_momentum
+            m = beta * self.router_momentum[...] + (1 - beta) * smebu_move(load, config)
+            self.router_momentum[...] = m
+            bias = self.router_bias[...] + m
+        self.router_bias[...] = bias
         self.router_load[...] = jnp.zeros_like(load)
 
     def kernels(self) -> Kernels:
@@ -347,6 +363,26 @@ class MoE(nnx.Module):
         if self.shared_gate is not None:
             y = y * jax.nn.sigmoid(self.shared_gate(x))
         return y
+
+
+def smebu_move(
+    load: Float[Array, "*l E"], config: cfg.MoEConfig
+) -> Float[Array, "*l E"]:
+    """Return SMEBU's move of the router bias, by the experts' loads (Trinity, eqs.
+    23-26): each expert's shortfall of the mean load, as a fraction of the mean,
+    soft-clamped by ``tanh(bias_softclamp * .)``, times ``bias_update_rate``, and
+    centered over the experts. An expert at the mean load moves by 0, where
+    aux_free's sign always moves it by the whole rate.
+
+    Args:
+        load: how many picks each expert had since the bias last moved; a layer's
+            each, for the layers of a scanned repeat.
+        config: the layer's settings.
+    """
+    mean = load.mean(-1, keepdims=True)
+    shortfall = (mean - load) / jnp.where(mean > 0, mean, 1.0)
+    move = config.bias_update_rate * jnp.tanh(config.bias_softclamp * shortfall)
+    return move - move.mean(-1, keepdims=True)
 
 
 def random_logits(
@@ -412,7 +448,7 @@ def _norm(config: cfg.NormalizationConfig | None, width: int) -> Norm | None:
 def _stacked(
     shape: tuple[int, int, int], names: tuple[str, str, str], rngs: nnx.Rngs
 ) -> nnx.Param:
-    return nnx.Param(LECUN(rngs.params(), shape), names=names)
+    return nnx.Param(parallel.default_init(LECUN)(rngs.params(), shape), names=names)
 
 
 def _zeros(shape: tuple[int, ...], names: tuple[str | None, ...]) -> nnx.Param:
@@ -425,7 +461,8 @@ def _side_by_side(
     """Return p stacks of matrices of `shape` (E, d, f) side by side, (E, d, f, p),
     each drawn as ``_stacked`` draws one: LECUN takes an array's last two dimensions
     for its matrices'."""
-    stacks = [LECUN(rngs.params(), shape) for _ in range(p)]
+    init = parallel.default_init(LECUN)
+    stacks = [init(rngs.params(), shape) for _ in range(p)]
     return nnx.Param(jnp.stack(stacks, axis=-1), names=(*names, None))
 
 
