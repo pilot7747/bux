@@ -18,8 +18,8 @@ def activate(
     up: Float[Array, "*lead f"],
     gate: Float[Array, "*lead f"] | None,
 ) -> Float[Array, "*lead f"]:
-    """Return act(up), or act(gate) * up when gated; `limit` clips both (gate from
-    above only), and `up_softcap` caps up."""
+    """Return act(up), or act(gate) * (up + up_offset) when gated; `limit` clips both
+    (gate from above only), and `up_softcap` caps up."""
     if config.limit is not None:
         up = jnp.clip(up, -config.limit, config.limit)
     up = softcap(up, config.up_softcap)
@@ -27,7 +27,7 @@ def activate(
         return activation(config.activation, up)
     if config.limit is not None:
         gate = jnp.minimum(gate, config.limit)
-    return activation(config.activation, gate) * up
+    return activation(config.activation, gate) * (up + config.up_offset)
 
 
 def shard_hidden(h: Float[Array, "*lead f"]) -> Float[Array, "*lead f"]:

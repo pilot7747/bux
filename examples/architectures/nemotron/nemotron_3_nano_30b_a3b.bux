@@ -1,0 +1,25 @@
+# NVIDIA Nemotron 3 Nano 30B-A3B (2025): the smallest Nemotron 3 hybrid. Each of its 52
+# layers is a single mixer in a pre-norm residual: 23 Mamba-2, 23 MoE and 6 attention,
+# with no positional encoding anywhere. The Mamba-2 layers have 64 heads of 64, which
+# is not a whole multiple of the 2688 width.
+#
+# The MoE has 128 ReLU^2 experts of 1856, 6 active and scaled by 2.5, beside a shared
+# expert of 3712. A sigmoid router with a bias per expert picks them, and a
+# sequence-wise balance loss of 1e-4 also applies.
+d_model    = 2688
+vocab_size = 131072
+
+norm    = rmsnorm(eps=1e-5)
+ssm     = mamba2(state_size=128, head_dim=64, num_heads=64, num_groups=8)
+attn    = gqa(num_heads=32, num_kv_heads=2, head_dim=128)
+experts = moe(num_experts=128, top_k=6, num_shared_experts=1, router=sigmoid,
+              routed_scaling_factor=2.5, load_balancing=aux_free,
+              aux_loss_coef=1e-4, aux_loss_scope=sequence,
+              expert=mlp(intermediate_size=1856, activation=relu2),
+              shared_expert=mlp(intermediate_size=3712, activation=relu2))
+
+M = [norm ssm]
+E = [norm experts]
+A = [norm attn]
+
+model = embed "MEMEMA" "EMEMEMA"^4 "EMEMEMEMA" "EMEMEMEME" norm head

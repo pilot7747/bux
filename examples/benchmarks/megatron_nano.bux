@@ -1,0 +1,24 @@
+# Nemotron 3 Nano 30B-A3B on a node of 8 GPUs, as Megatron-Bridge's performance summary
+# benchmarks it (26.06: 37,316 tokens a second a GPU on 8 B300s, MXFP8, EP=8, a global
+# batch of 512 rows of 8192 in microbatches of 4 rows a GPU). Every matmul is in MXFP8,
+# since Megatron's MXFP8 recipe keeps no layer in bfloat16. The experts are sorted
+# under FSDP, or split over the GPUs by NCCL EP, and routed by random logits as
+# Megatron's are.
+#
+#   python scripts/benchmark.py run examples/benchmarks/megatron_nano.bux --out new.json
+use nemotron_3_nano_30b_a3b
+
+experts.random_logits = true
+
+mesh    = sorted:  mesh(fsdp=8)
+        | nccl_ep: mesh(expert=8)
+methods = sorted:  methods(moe=sorted, microbatches=16, gather=layer)
+        | nccl_ep: methods(moe=nccl_ep, capacity=1.25, microbatches=16)
+
+data      = synthetic
+optimizer = adamw(lr=3e-4)
+seq_len   = 8192
+batch     = 512
+steps     = 12
+log       = log(every=3)
+precision = precision(compute=bfloat16, matmuls=mxfp8)

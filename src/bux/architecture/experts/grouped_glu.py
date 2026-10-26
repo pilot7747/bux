@@ -77,7 +77,8 @@ def runs(
     """Whether the fused kernels run an MoE's experts here: on a Blackwell GPU, a SwiGLU
     FFN of shapes they take, in MXFP8 in every pass."""
     swiglu = ffn.type == "gated_mlp" and ffn.activation == "swish"
-    plain = ffn.limit is None and ffn.up_softcap is None
+    plain = ffn.limit is None and ffn.up_softcap is None and not ffn.up_offset
+    plain = plain and not ffn.bias
     in_format = recipe is blockscaled.MXFP8 and set(passes) == set(PASSES)
     groups, d, f, _ = up.shape
     here = grouped_triton is not None and grouped_cudnn.runs()

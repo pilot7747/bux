@@ -1,0 +1,20 @@
+# Llama 3 8B on a node of 8 GPUs, as Megatron-Bridge's B300 recipe trains it: a global
+# batch of 128 rows of 8192 in microbatches of 4 rows a GPU, in MXFP8. Megatron
+# publishes no B300 number for it; on 8 B200s, whose dense FP8 peak is a B300's, it
+# trains at 29,521 tokens a second a GPU in MXFP8 (25.11). Its parameters split by FSDP,
+# or only its optimizer's state, as Megatron's distributed optimizer splits it.
+#
+#   python scripts/benchmark.py run examples/benchmarks/megatron_llama3_8b.bux --out new.json
+use llama3_8b
+
+mesh    = mesh(fsdp=8)
+layout  = fsdp: layout | zero1: layout(zero=1)
+methods = methods(microbatches=4)
+
+data      = synthetic
+optimizer = adamw(lr=3e-4)
+seq_len   = 8192
+batch     = 128
+steps     = 12
+log       = log(every=3)
+precision = precision(compute=bfloat16, matmuls=mxfp8)

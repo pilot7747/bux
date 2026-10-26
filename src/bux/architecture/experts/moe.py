@@ -41,9 +41,17 @@ from bux.lang import ir
 from bux.parallel import methods
 
 RowNorm = Callable[[Float[Array, "n d"]], Float[Array, "n d"]]
-# The experts' kernels, stacked: up, with the gate beside it in a gated MLP, and down.
-Kernels = tuple[Float[Array, "E d f p"], Float[Array, "E f d"]]
 LECUN = nnx.initializers.lecun_normal()
+
+
+class Kernels(NamedTuple):
+    """The experts' kernels, stacked: up, with the gate beside it in a gated MLP, and
+    down; and their biases, where the experts have them."""
+
+    up: Float[Array, "E d f p"]
+    down: Float[Array, "E f d"]
+    up_bias: Float[Array, "E f p"] | None = None
+    down_bias: Float[Array, "E d"] | None = None
 
 
 class Sorted(NamedTuple):
@@ -60,6 +68,7 @@ class MoE(nnx.Module):
 
     # Up's last dimension, of up and gate, is a batch one: Muon orthogonalizes them apart.
     muon_axes: ClassVar = {"up": (1, 2), "down": (1, 2)}
+    no_weight_decay: ClassVar = ("up_bias", "down_bias")  # stacks, but of vectors
 
     def __init__(self, config: cfg.MoEConfig, width: int, rngs: nnx.Rngs):
         _check_groups(config)
@@ -68,7 +77,7 @@ class MoE(nnx.Module):
         # With shared_expert_sink, the router scores the shared experts too, last.
         sinks = config.num_shared_experts if config.shared_expert_sink else 0
         self.router = linear(
-            width, n + sinks, ("embed", None), False, rngs, in_compute=True
+            width, n + sinks, ("embed", None), config.router_bias, rngs, in_compute=True
         )
         aux_free = config.load_balancing == "aux_free"
         self.router_bias = nnx.Variable(jnp.zeros(n)) if aux_free else None
@@ -99,6 +108,9 @@ class MoE(nnx.Module):
         p = 2 if config.expert.type == "gated_mlp" else 1
         self.up = _side_by_side(p, (n, latent, f), ("experts", inner, "mlp"), rngs)
         self.down = _stacked((n, f, latent), ("experts", "mlp", inner), rngs)
+        biased = config.expert.bias
+        self.up_bias = _zeros((n, f, p), ("experts", "mlp", None)) if biased else None
+        self.down_bias = _zeros((n, latent), ("experts", inner)) if biased else None
         self.expert_norm = _norm(config.expert_norm, latent)
         self.shared = _shared_experts(config, width, rngs)
         self.shared_gate = (
@@ -159,7 +171,9 @@ class MoE(nnx.Module):
         cuBLAS's: on a B300 0.03 ms for Qwen3-30B-A3B's 32k tokens, where float32
         operands take 0.11. The backward multiplies in float32."""
         kernel = self.router.kernel[...].astype(x.dtype)
-        return jnp.dot(x, kernel, preferred_element_type=jnp.float32)
+        logits = jnp.dot(x, kernel, preferred_element_type=jnp.float32)
+        bias = self.router.bias
+        return logits if bias is None else logits + bias[...].astype(jnp.float32)
 
     def _balance(
         self, scores: Float[Array, "b t E"], idx: Int[Array, "b t k"], taps: Taps
@@ -188,8 +202,9 @@ class MoE(nnx.Module):
         self.router_load[...] = jnp.zeros_like(load)
 
     def kernels(self) -> Kernels:
-        """Return the routed experts' kernels as arrays."""
-        return self.up[...], self.down[...]
+        """Return the routed experts' kernels, and their biases, as arrays."""
+        biases = (None if b is None else b[...] for b in (self.up_bias, self.down_bias))
+        return Kernels(self.up[...], self.down[...], *biases)
 
     def _latent(self, x: Float[Array, "b t d"]) -> Float[Array, "b t l"]:
         """Return the tokens as the routed experts take them: in LatentMoE, projected
@@ -268,6 +283,10 @@ def _stacked(
     return nnx.Param(LECUN(rngs.params(), shape), names=names)
 
 
+def _zeros(shape: tuple[int, ...], names: tuple[str | None, ...]) -> nnx.Param:
+    return nnx.Param(jnp.zeros(shape), names=names)
+
+
 def _side_by_side(
     p: int, shape: tuple[int, int, int], names: tuple[str, str, str], rngs: nnx.Rngs
 ) -> nnx.Param:
@@ -299,14 +318,20 @@ def run_dense(
 ) -> Float[Array, "b t d"]:
     """Run every expert on every token and weight the outputs by the router: the
     reference. Each device runs every expert on its own tokens."""
-    up, down = moe.kernels()
+    up, down, up_bias, down_bias = moe.kernels()
     dense = dense_weights(idx, weights, moe.config.num_experts)
     projected = jnp.einsum("btd,edfp->btefp", z, up)
+    if up_bias is not None:
+        projected = projected + up_bias
     projected = parallel.shard(projected, "batch", "seq", "experts", "mlp", None)
     h = hidden_units(moe.config.expert, projected)
-    if moe.expert_norm is None:
+    if moe.expert_norm is None and down_bias is None:
         return jnp.einsum("btef,efd,bte->btd", h, down, dense)
-    per_expert = moe.expert_norm(jnp.einsum("btef,efd->bted", h, down))
+    per_expert = jnp.einsum("btef,efd->bted", h, down)
+    if down_bias is not None:
+        per_expert = per_expert + down_bias
+    if moe.expert_norm is not None:
+        per_expert = moe.expert_norm(per_expert)
     return jnp.einsum("bted,bte->btd", per_expert, dense)
 
 
@@ -333,7 +358,7 @@ def run_sorted(
     ffn, norm = moe.config.expert, moe.expert_norm
     tokens = parallel.spec(("batch", "seq", None), z.shape)
     if not parallel.axes_of(tokens):
-        return routed(z, idx, weights, *moe.kernels(), ffn, norm)
+        return routed(z, idx, weights, moe.kernels(), ffn, norm)
     split = _split_by_expert(moe, tokens) if fused(ffn, norm, moe.up[...]) else ()
 
     def local(
@@ -343,9 +368,9 @@ def run_sorted(
         kernels: Kernels,
     ) -> Float[Array, "b t d"]:
         if not split:
-            return routed(z, idx, weights, *kernels, ffn, norm)
-        up, down, quantized = grouped_glu.gathered(*kernels, split)
-        return routed(z, idx, weights, up, down, ffn, norm, quantized)
+            return routed(z, idx, weights, kernels, ffn, norm)
+        up, down, quantized = grouped_glu.gathered(kernels.up, kernels.down, split)
+        return routed(z, idx, weights, Kernels(up, down), ffn, norm, quantized)
 
     kernels = P(split) if split else P()
     return in_shard_map(local, tokens, kernels, tokens)(z, idx, weights, moe.kernels())
@@ -399,17 +424,16 @@ def routed(
     z: Float[Array, "b t d"],
     idx: Int[Array, "b t k"],
     weights: Float[Array, "b t k"],
-    up: Float[Array, "E d f p"],
-    down: Float[Array, "E f d"],
+    kernels: Kernels,
     ffn: cfg.MLPConfig,
     norm: RowNorm | None = None,
     quantized: grouped_glu.Weights | None = None,
 ) -> Float[Array, "b t d"]:
     """Return each token's sum of its experts' outputs, weighted by `weights`. A pick
-    outside the experts of `up` adds nothing, so that one device's experts can take
-    every pick. Given the kernels `quantized`, the fused kernels take them so."""
+    outside the experts of `kernels` adds nothing, so that one device's experts can
+    take every pick. Given the kernels `quantized`, the fused kernels take them so."""
     b, t, d = z.shape
-    k, n = idx.shape[-1], up.shape[0]
+    k, n = idx.shape[-1], kernels.up.shape[0]
     order, inverse, sizes = sort_by_expert(idx, n)
     tokens = z.reshape(b * t, d)
     rows = token_rows(tokens, order, inverse, k)
@@ -418,7 +442,7 @@ def routed(
     picked = grouped_blockscaled.Picked(tokens, order // k)
     summed = grouped_blockscaled.Summed(order, inverse.reshape(b * t, k))
     out = experts(
-        rows, sizes, row_weights, up, down, ffn, norm, picked, summed, quantized
+        rows, sizes, row_weights, kernels, ffn, norm, picked, summed, quantized
     )
     return out.reshape(b, t, d)
 
@@ -442,8 +466,7 @@ def experts(
     x: Float[Array, "n d"],
     sizes: Int[Array, " E"],
     weights: Float[Array, " n"],
-    up: Float[Array, "E d f p"],
-    down: Float[Array, "E f d"],
+    kernels: Kernels,
     ffn: cfg.MLPConfig,
     norm: RowNorm | None = None,
     picked: grouped_blockscaled.Picked | None = None,
@@ -453,19 +476,23 @@ def experts(
     """Run each row of `x` through its expert's FFN, then `norm`, times the row's
     weight in `weights`. The rows are sorted by expert: the first sizes[0] are expert
     0's, the next sizes[1] expert 1's, and so on; rows past them come out 0 before
-    `norm`. It depends on its arguments alone, so it runs on one device's experts in a
-    shard_map as it does on all of them. The kernels multiply in x's dtype, so that
-    wider ones add up the gradients of several calls in their own. Given where x was
-    `picked`, a format's quantizer reads it there; given the tokens its rows are
-    `summed` into, it returns their sums. In MXFP8 on a Blackwell GPU, cuDNN's fused
-    kernels run a SwiGLU FFN with no norm (``grouped_glu``), its kernels as they are
-    `quantized`, if they are."""
+    `norm`, with no bias. It depends on its arguments alone, so it runs on one
+    device's experts in a shard_map as it does on all of them. The kernels and biases
+    multiply in x's dtype, so that wider ones add up the gradients of several calls in
+    their own. Given where x was `picked`, a format's quantizer reads it there; given
+    the tokens its rows are `summed` into, it returns their sums. In MXFP8 on a
+    Blackwell GPU, cuDNN's fused kernels run a SwiGLU FFN with no norm or bias
+    (``grouped_glu``), its kernels as they are `quantized`, if they are."""
+    up, down = kernels.up, kernels.down
     if fused(ffn, norm, up):
         y = grouped_glu.mlp(x, sizes, weights, up, down, picked, summed, quantized)
         return checkpoint_name(y, "experts")
     recipe = grouped_blockscaled.RECIPES.get(experts_format())
     n, (e, d, f, p) = x.shape[0], up.shape
     up, down = up.reshape(e, d, f * p).astype(x.dtype), down.astype(x.dtype)
+
+    def bias(b: Float[Array, "E ..."] | None) -> Float[Array, "n _"] | None:
+        return None if b is None else by_expert(b.reshape(e, -1), sizes, n, x.dtype)
 
     def times(
         x: Float[Array, "n e"],
@@ -475,13 +502,33 @@ def experts(
     ) -> Float[Array, "r f"]:
         return grouped_product(x, w, sizes, recipe, picked, summed)
 
-    projected = times(x, up, picked).reshape(n, f, p)  # up and gate by one GEMM
+    projected = times(x, up, picked)  # up and gate by one GEMM
+    if (up_bias := bias(kernels.up_bias)) is not None:
+        projected = projected + up_bias
+    projected, down_bias = projected.reshape(n, f, p), bias(kernels.down_bias)
     if norm is None:
         # Weighted before `down`, which is linear: the weights' gradient then needs
-        # each row's f hidden units, not its d outputs.
-        return times(weighted_units(ffn, projected, weights), down, summed=summed)
-    y = weighted(norm(times(hidden_units(ffn, projected), down)), weights)
+        # each row's f hidden units, not its d outputs. Its bias adds, weighted, after.
+        y = times(weighted_units(ffn, projected, weights), down, summed=summed)
+        if down_bias is None:
+            return y
+        b = weighted(down_bias, weights)
+        return y + (b if summed is None else sums_of_tokens(b, summed))
+    y = times(hidden_units(ffn, projected), down)
+    y = weighted(norm(y if down_bias is None else y + down_bias), weights)
     return y if summed is None else sums_of_tokens(y, summed)
+
+
+def by_expert(
+    b: Float[Array, "E c"], sizes: Int[Array, " E"], rows: int, dtype: Any
+) -> Float[Array, "n c"]:
+    """Return each row's expert's row of b, in `dtype`: the first sizes[0] rows b[0],
+    the next sizes[1] b[1], and so on, and 0 past them. By a one-hot matmul, whose
+    gradient sums each expert's rows by another, where a gather's would scatter-add."""
+    at, ends = jnp.arange(rows)[:, None], jnp.cumsum(sizes)
+    one_hot = ((at >= ends - sizes) & (at < ends)).astype(dtype)
+    product = jnp.dot(one_hot, b.astype(dtype), preferred_element_type=jnp.float32)
+    return product.astype(dtype)
 
 
 def fused(
