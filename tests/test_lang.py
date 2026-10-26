@@ -237,6 +237,11 @@ def test_field_access_reads_settings():
     err = error("x = attn.num_head\nmodel = embed head")
     assert err.message == "gqa has no setting 'num_head'"
     assert err.hint == "did you mean 'num_heads'?"
+    # Each key and value head serves a group of the query heads.
+    err = error("x = gqa(num_heads=32, num_kv_heads=12)\nmodel = embed [x] head")
+    assert "12 key and value heads do not divide 32 query heads" in err.message
+    assert err.span is not None and err.source is not None
+    assert err.source[err.span.start : err.span.end] == "num_kv_heads=12"
     assert (
         "only layers and settings"
         in error("b = [attn]\nx = b.a\nmodel = embed head").message

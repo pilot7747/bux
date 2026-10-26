@@ -17,7 +17,7 @@ for its tag in the backend (`bux.architecture.register`).
 
 from typing import Annotated, ClassVar, Literal
 
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, ValidationInfo, field_validator
 
 
 class Config(BaseModel):
@@ -383,6 +383,18 @@ class GQAConfig(QuadraticAttentionConfig):
     num_heads: int  # query heads
     num_kv_heads: int  # key and value heads, each shared by a group of query heads
     head_dim: int | None = None  # dims of each head; None -> width // num_heads
+
+    @field_validator("num_kv_heads")
+    @classmethod
+    def _groups(cls, kv: int, info: ValidationInfo) -> int:
+        """Check that the query heads split into a group for each key and value head."""
+        heads = info.data.get("num_heads")
+        if kv < 1 or (heads is not None and heads % kv):
+            raise ValueError(
+                f"{kv} key and value heads do not divide {heads} query heads"
+            )
+        return kv
+
     # Dims of each value head; None -> head_dim (MiMo-V2: 128 against 192).
     v_head_dim: int | None = None
     # Biases on the projections of the input: q, k, v and the gate (GPT-2, Qwen2).
