@@ -17,7 +17,6 @@ The directory holds:
     hf_model = AutoModelForCausalLM.from_pretrained("out/", trust_remote_code=True)
 """
 
-import inspect
 import json
 import shutil
 from pathlib import Path
@@ -100,25 +99,10 @@ _CACHE_DEFAULTS = {"sliding_window": None, "number_of_conv_states": 1}
 
 def cache_layers(p: Plan) -> list[tuple[str, dict]]:
     """Return the kind of each cache layer, in the order the calls that keep state run,
-    and what its config sets for it alone (``per_layer_config``).
-
-    A layer class's ``cache_type(c)``, or ``cache_type(c, ports)`` where its ports
-    decide (as ``[name, tap, mode]``), returns the kind, ``(kind, settings)`` with
-    settings of `_CACHE_DEFAULTS` (a sliding window, conv states), or None for a call
-    that keeps no state.
-    """
-    out = []
-    for call in p.calls:
-        fn = getattr(codegen.layer_class(call.layer), "cache_type", None)
-        if fn is None:
-            continue
-        c = call.layer.config.model_dump(mode="json")
-        ports = [[port.name, port.tap, port.mode] for port in call.layer.ports]
-        takes_ports = len(inspect.signature(fn).parameters) > 1
-        kind = fn(c, ports) if takes_ports else fn(c)
-        if kind is not None:
-            out.append(tuple(kind) if isinstance(kind, tuple | list) else (kind, {}))
-    return out
+    and what its config sets for it alone (`bux.export.codegen.cache_layer`), with
+    settings of `_CACHE_DEFAULTS` (a sliding window, conv states)."""
+    layers = (codegen.cache_layer(call.layer) for call in p.calls)
+    return [layer for layer in layers if layer is not None]
 
 
 def _per_layer(layers: list[tuple[str, dict]]) -> dict:

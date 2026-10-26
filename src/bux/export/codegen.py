@@ -10,6 +10,7 @@ and reads of the pass's taps, and a shared definition as a call of
 """
 
 import importlib
+import inspect
 import pkgutil
 import pprint
 from dataclasses import dataclass, field
@@ -341,12 +342,29 @@ def _used(plan: Plan) -> set[type]:
     return {layer_class(call.layer) for call in plan.calls}
 
 
+def cache_layer(layer: ir.Layer) -> tuple[str, dict] | None:
+    """Return the kind of the cache layer each call of `layer` keeps, and what the
+    config sets for it alone (``per_layer_config``), or None for none.
+
+    Its class's ``cache_type(c)``, or ``cache_type(c, ports)`` where its ports decide
+    (as ``[name, tap, mode]``), returns the kind, ``(kind, settings)``, or None.
+    """
+    fn = getattr(layer_class(layer), "cache_type", None)
+    if fn is None:
+        return None
+    c = layer.config.model_dump(mode="json")
+    ports = [[port.name, port.tap, port.mode] for port in layer.ports]
+    kind = fn(c, ports) if len(inspect.signature(fn).parameters) > 1 else fn(c)
+    if kind is None or isinstance(kind, tuple | list):
+        return None if kind is None else (kind[0], dict(kind[1]))
+    return kind, {}
+
+
 def _counts_tokens(plan: Plan) -> bool:
     """Whether a cache layer of the model counts the tokens it holds: an attention
     layer's does, a recurrent layer's (``conv``, ``linear_attention``) does not."""
     for call in plan.calls:
-        fn = getattr(layer_class(call.layer), "cache_type", None)
-        kind = fn(call.layer.config.model_dump(mode="json")) if fn else None
-        if kind not in (None, "conv", "linear_attention"):
+        kept = cache_layer(call.layer)
+        if kept is not None and kept[0] not in ("conv", "linear_attention"):
             return True
     return False
