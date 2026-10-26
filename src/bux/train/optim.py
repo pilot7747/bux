@@ -22,6 +22,7 @@ matrix whole on one device. Its Newton-Schulz's coefficients are found by name i
 `ns_coefficients`, a builder that gets the number of iterations.
 """
 
+import itertools
 import math
 import typing
 from collections.abc import Callable, Sequence
@@ -43,6 +44,7 @@ from bux.architecture import Scanned
 from bux.parallel import methods
 from bux.parallel.layout import Split, as_split, partition
 from bux.train import config as tcfg
+from bux.train import curriculum
 from bux.train.registry import Registry
 
 #: A value at each step, counted from 0, as a learning rate or its multiplier.
@@ -183,15 +185,27 @@ def _(c: tcfg.MultiStepSchedule, train: tcfg.TrainConfig) -> Schedule:
 
 @schedules.register("power")
 def _(c: tcfg.PowerSchedule, train: tcfg.TrainConfig) -> Schedule:
-    """IBM's Power scheduler: `a` times the batch times the tokens trained to the
-    `b`, over the peak and at most 1, held through the warmup at its last step's;
-    then a cooldown of `shape` from where it is to `final` times that."""
-    cooldown, tokens = c.cooldown(train.steps), train.batch * train.seq_len
+    """IBM's Power scheduler: `a` times the step's batch times the tokens trained to
+    the `b`, over the peak and at most 1, held through the warmup at its last step's;
+    then a cooldown of `shape` from where it is to `final` times that. The tokens and
+    the batch follow the run's batch ramp and curriculum."""
+    cooldown = c.cooldown(train.steps)
     start, warmup = train.steps - cooldown, tcfg.warmup_steps(c, train.steps)
+    parts = curriculum.stretches(train)
+    each = [s.config.batch * s.config.seq_len for s in parts]  # tokens a step
+    through = itertools.accumulate(
+        (s.stop - s.start) * n for s, n in zip(parts, each, strict=True)
+    )
+    firsts = jnp.asarray([s.start for s in parts], jnp.float32)
+    rows = jnp.asarray([s.config.batch for s in parts], jnp.float32)
+    tokens = jnp.asarray(each, jnp.float32)
+    before = jnp.asarray([0, *list(through)[:-1]], jnp.float32)
 
     def power(step: Float[Array, ""]) -> Float[Array, ""]:
-        n = (jnp.clip(step, warmup - 1, start - 1) + 1) * tokens
-        return jnp.minimum(c.a * train.batch * n**c.b / train.optimizer.lr, 1.0)
+        step = jnp.clip(step, warmup - 1, start - 1)
+        k = jnp.searchsorted(firsts, step, side="right") - 1
+        n = before[k] + (step - firsts[k] + 1) * tokens[k]
+        return jnp.minimum(c.a * rows[k] * n**c.b / train.optimizer.lr, 1.0)
 
     def curve(step: Real[ArrayLike, ""]) -> Float[Array, ""]:
         step = jnp.asarray(step, jnp.float32)

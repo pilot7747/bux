@@ -1657,7 +1657,6 @@ def _train(
     train = tcfg.TrainConfig.model_validate(values)
     _check_schedule(train, spans)
     _check_curriculum(train, spans)
-    _check_power(train, spans)
     _check_tokenizer(train, spans)
     _check_positions(train, arch, spans)
     _check_objective(train, spans)
@@ -1752,17 +1751,6 @@ def _check_curriculum(train: tcfg.TrainConfig, spans: dict[str, Span]) -> None:
             check(train)
         except ValueError as err:
             raise BuxError(str(err), spans.get(setting, spans["steps"])) from None
-
-
-def _check_power(train: tcfg.TrainConfig, spans: dict[str, Span]) -> None:
-    shapes = {(s.config.batch, s.config.seq_len) for s in curriculum.stretches(train)}
-    if isinstance(train.schedule, tcfg.PowerSchedule) and len(shapes) > 1:
-        raise BuxError(
-            "power counts the tokens of one batch and seq_len, and this run's "
-            "batch_ramp or curriculum changes them as it trains",
-            spans.get("schedule", spans["steps"]),
-            "keep the batch and seq_len, or take another schedule",
-        )
 
 
 def _check_tokenizer(train: tcfg.TrainConfig, spans: dict[str, Span]) -> None:
