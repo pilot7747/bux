@@ -34,6 +34,8 @@ from typing import TYPE_CHECKING
 from bux.lang import Architecture, BuxError, Report, Run, check, compile_runs
 from bux.lang.printer import config_to_source, run_to_source, to_source, value_to_source
 from bux.lang.render import render
+from bux.train import curriculum
+from bux.train.config import TrainConfig
 
 if TYPE_CHECKING:  # imported where used: jax and the backend are slow to import
     from flax import nnx
@@ -72,11 +74,13 @@ def summary(arch: Architecture) -> str:
 
 def training(run: Run) -> str:
     """Return what ``bux check`` says of a run's training: its steps and tokens, its
-    optimizer, schedule and data, and its tokenizer and packing if it has them."""
+    phases, its optimizer, schedule and data, and its tokenizer and packing if it has
+    them."""
     t = run.train
-    tokens = t.steps * t.batch * t.seq_len
+    shape = "" if curriculum.varies(t) else f" × {t.batch} × {t.seq_len} tokens"
+    phases = "".join(f"{line}\n" for line in curriculum.lines(t))
     return (
-        f"{t.steps:,} steps × {t.batch} × {t.seq_len} tokens = {_si(tokens)} tokens\n"
+        f"{t.steps:,} steps{shape} = {_si(_tokens(t))} tokens\n{phases}"
         f"optimizer={config_to_source(t.optimizer)} "
         f"schedule={config_to_source(t.schedule)}\n"
         f"data={value_to_source(t.data)}"
@@ -86,6 +90,11 @@ def training(run: Run) -> str:
         if t.tokenizer is not None
         else ""
     )
+
+
+def _tokens(t: TrainConfig) -> int:
+    """Return the tokens of a run's steps, phase by phase."""
+    return curriculum.tokens(curriculum.stretches(t), t.steps)
 
 
 def abstract(
@@ -174,14 +183,21 @@ def memory(
 
 def flops_per_token(run: Run) -> float | None:
     """Return the model FLOPs a training token of `run` takes in rows of one document
-    (``trainer.step_flops``); None if the backend lacks a layer."""
+    (``trainer.step_flops``), averaged over the seq_len of its phases by their
+    tokens; None if the backend lacks a layer."""
     from bux.train.trainer import step_flops
 
     t = run.train
+    tokens: Counter[int] = Counter()  # by seq_len
+    for s in curriculum.stretches(t):
+        tokens[s.config.seq_len] += (
+            (s.stop - s.start) * s.config.batch * s.config.seq_len
+        )
     try:
-        return step_flops(run).one_document(t.seq_len) / (t.batch * t.seq_len)
+        each = {n: step_flops(run, t.batch, n).one_document(n) for n in tokens}
     except NotImplementedError:
         return None
+    return sum(each[n] / (t.batch * n) * k for n, k in tokens.items()) / tokens.total()
 
 
 def _row(run: Run, gpus: int, alone: bool) -> tuple[str, ...]:
@@ -191,7 +207,7 @@ def _row(run: Run, gpus: int, alone: bool) -> tuple[str, ...]:
     from bux.parallel.pipeline import bubble
 
     t = run.train
-    tokens = t.steps * t.batch * t.seq_len
+    tokens = _tokens(t)
     used = need(t.mesh, gpus, alone=alone)
     made = abstract(run, used)
     n = None if made is None else num_params(made[0])

@@ -167,7 +167,7 @@ the last, to the console and to `metrics.jsonl`:
 | `balance_loss`, `indexer_loss`, ... | what layers report, summed over the layers that report the name ([Losses from a layer](extending.md#losses-from-a-layer)) |
 | `grad_norm` | the gradient's global norm, before clipping |
 | `lr` | the learning rate of the step just taken |
-| `tokens` | the tokens trained on so far: steps × `batch` × `seq_len` |
+| `tokens` | the tokens trained on so far: steps × `batch` × `seq_len`, each step at its own under a curriculum or a batch ramp ([Curriculum](curriculum.md)) |
 | `tokens_per_s` | tokens a second since the last log |
 | `mfu` | model FLOPs a second over the devices' peak, on GPUs whose peak bux knows ([MFU](#mfu)) |
 | `eval_loss`, `eval_bpb` | the held-out loss and bits per byte, at an eval; `<name>_loss` and `<name>_bpb` for an eval of that name ([Eval](#eval)) |

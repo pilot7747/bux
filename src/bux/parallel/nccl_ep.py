@@ -49,9 +49,11 @@ from bux.parallel.experts import (
 from bux.parallel.experts import _room as experts_room
 from bux.parallel.layout import axes_of, spec
 from bux.parallel.mesh import active
+from bux.train import curriculum
 
 if TYPE_CHECKING:
     from bux.lang import ir
+    from bux.train.config import TrainConfig
 
 # Each expert's rows start at a multiple of this: NCCL EP's high-throughput kernels
 # take no less, and the experts' grouped GEMMs are content with it.
@@ -166,12 +168,17 @@ def _size(axes: Axes) -> int:
 
 def _tokens_a_device(run: "ir.Run", ep: Axes) -> int:
     """Return the most tokens a device sends at once: a chunk of its share of a
-    microbatch's rows (``experts.chunk_of``). An eval step, which takes a step's rows
+    microbatch's rows (``experts.chunk_of``), in the stretch of the run whose batches
+    are the largest (`bux.train.curriculum`). An eval step, which takes a step's rows
     whole, sends them in pieces of that many (``nccl_ep``)."""
-    t = run.train
-    rows = t.batch // t.methods.microbatches
-    shape = (rows, t.seq_len, run.arch.d_model)
-    return chunk_of(rows * t.seq_len // _size(axes_of(token_spec(shape, ep))))
+    microbatches = run.train.methods.microbatches
+
+    def of(t: "TrainConfig") -> int:
+        rows = t.batch // microbatches
+        shape = (rows, t.seq_len, run.arch.d_model)
+        return chunk_of(rows * t.seq_len // _size(axes_of(token_spec(shape, ep))))
+
+    return max(of(s.config) for s in curriculum.stretches(run.train))
 
 
 def _room(picks: int, local: int, peers: int) -> int:

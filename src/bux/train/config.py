@@ -312,6 +312,60 @@ ScheduleConfig = Annotated[
 ]
 
 
+# --- Curriculum and ramps ---------------------------------------------------------------
+# What a run reads can change as it trains: each phase of a `curriculum` takes rows of
+# another `seq_len`, another `batch` or other `data` from a step on, and a `batch_ramp`
+# grows the batch over the first steps. The steps compile again at every new shape of
+# batch (bux.train.curriculum).
+
+# A step, or a share of the steps below 1, rounded to a step.
+At = Annotated[int, Field(gt=0)] | Annotated[float, Field(gt=0, lt=1)]
+
+
+class PhaseConfig(Config):
+    """From step `at` on, rows of `seq_len` tokens, `batch` of them a step, from
+    `data`, each as the phase before where it is none: the run's own settings before
+    the first phase. ``phase(at=0.9, seq_len=8192, batch=64, data=long)`` reads the
+    last tenth of the run at 8k tokens a row from `long`.
+
+    A source goes on, from one phase to the next, from the row it stopped at, where
+    it is read at the same `seq_len`; at another, it is a dataset of its own, which
+    starts from its first row. An eval reads rows of the run's own `seq_len` and
+    `batch`, whichever phase it is in."""
+
+    type: Literal["phase"] = "phase"
+    at: At  # the step it starts at, or a share of the steps: 0.9 starts the last tenth
+    # Tokens per row; none: as before.
+    seq_len: Annotated[int, Field(ge=2)] | None = None
+    batch: Positive | None = None  # rows per step; none: as before
+    data: DataConfig | None = None  # a source or a mixture; none: as before
+
+    def start(self, steps: int) -> int:
+        """Return the step it starts at, in a run of `steps`."""
+        return round(self.at * steps) if isinstance(self.at, float) else self.at
+
+
+class RampConfig(Config):
+    """A batch that grows from `start` rows at the first step to the run's `batch`
+    over `steps` steps, as GPT-3's and DeepSeek-V3's do: linearly, rounded down to a
+    multiple of `multiple`, and never below `start`. Each batch size it takes
+    compiles the step again, so a coarser `multiple` compiles fewer."""
+
+    type: Literal["ramp"] = "ramp"
+    start: Positive  # rows per step at the first step
+    steps: Positive  # the steps it takes to reach the run's batch
+    multiple: Positive | None = None  # of the batch sizes it takes; none: `start`
+
+
+def _phases(v: object) -> object:
+    """One phase, as a list of one."""
+    return (v,) if isinstance(v, PhaseConfig) else v
+
+
+# A phase, or a list of them in the order they start.
+Phases = Annotated[tuple[PhaseConfig, ...], BeforeValidator(_phases)]
+
+
 # --- Loss, evaluation, checkpoints and logs ------------------------------------
 # What a run minimizes, and what it does every so many steps: evaluate, save, log,
 # observe and profile. None of these but the loss is in the run's id.
@@ -763,7 +817,12 @@ class TrainConfig(Config):
     schedule: ScheduleConfig = ConstantSchedule()  # the learning rate's multiplier
     seq_len: Annotated[int, Field(ge=2)]  # tokens per row
     batch: Positive  # rows per step, over all devices
+    # A smaller batch at the first steps, which grows to `batch`; none: none.
+    batch_ramp: RampConfig | None = None
     steps: Positive  # optimizer steps
+    # Phases that each change seq_len, batch or data from a step on: a phase, or a list
+    # of them; [] is none.
+    curriculum: Phases = ()
     seed: int = 0  # of the model's initialization and of the data's order
     clip: float | None = 1.0  # clip gradients to this global norm; none disables it
     loss: LossConfig = LossConfig()  # the loss's terms and their weights
@@ -797,6 +856,8 @@ Setting = Annotated[
     | ConstantSchedule
     | CosineSchedule
     | WSDSchedule
+    | PhaseConfig
+    | RampConfig
     | LossConfig
     | EvalConfig
     | CheckpointConfig
