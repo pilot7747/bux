@@ -13,6 +13,8 @@ Usage::
     fmt       print the file back, a run at a time, with nothing left to resolve
     json      print the runs' IR (or the model's) as JSON
 
+    bux export RUN_DIR OUT [--step N] [--dtype DTYPE] [--check]
+
 Settings after the file override the file's own, as if written at its end:
 ``bux train speedrun.bux optimizer.lr=0.03 'steps = 2k'``. Alternatives there make a
 sweep, as in a file: ``'optimizer.lr = 0.01 | 0.03'``.
@@ -22,6 +24,8 @@ the entrypoint for production (`bux.launch`): it trains each run of a sweep on t
 GPUs its mesh needs, or a run alone on many hosts, records what each run did, trains
 again only what is not done, and stops at SIGTERM with a checkpoint. ``bux plan``
 shows what each run takes: its FLOPs a token, its GPUs, and its bytes on each.
+``bux export`` takes a trained run's directory, not a file, and writes its model as a
+transformers model directory (`bux.export.runs`).
 """
 
 import argparse
@@ -255,7 +259,10 @@ def plan(runs: list[Run], gpus: int | None = None) -> str:
 def parser() -> argparse.ArgumentParser:
     """Return the parser of bux's command line."""
     p = argparse.ArgumentParser(
-        prog="bux", description="Compile, inspect and train .bux models and runs."
+        prog="bux",
+        description="Compile, inspect and train .bux models and runs.",
+        epilog="bux export RUN_DIR OUT writes a trained run as a transformers model: "
+        "bux export --help",
     )
     p.add_argument(
         "command",
@@ -312,6 +319,63 @@ def parser() -> argparse.ArgumentParser:
         help="prepare, launch: processes that prepare data (default: one a core)",
     )
     return p
+
+
+def export_parser() -> argparse.ArgumentParser:
+    """Return the parser of ``bux export``."""
+    p = argparse.ArgumentParser(
+        prog="bux export",
+        description="Write a trained run's model as a transformers model directory: "
+        "its code, its weights, its tokenizer and a model card.",
+    )
+    p.add_argument(
+        "run", metavar="RUN_DIR", help="the run's directory: runs/<name>-<id>"
+    )
+    p.add_argument("out", metavar="OUT", help="the directory to write")
+    p.add_argument(
+        "--step",
+        type=int,
+        metavar="N",
+        help="the checkpoint's step (default: the latest)",
+    )
+    p.add_argument(
+        "--dtype",
+        choices=["float32", "bfloat16", "float16"],
+        help="the weights' dtype (default: the parameters', float32)",
+    )
+    p.add_argument(
+        "--check",
+        action="store_true",
+        help="compare the export with bux on the run's weights, in float32, and fail "
+        "if they disagree",
+    )
+    return p
+
+
+def _export(args: argparse.Namespace) -> int:
+    from transformers.utils import logging
+
+    from bux.export.runs import describe, export
+
+    logging.disable_progress_bar()  # a bar each time --check loads the export
+    try:
+        done = export(
+            args.run, args.out, step=args.step, dtype=args.dtype, check=args.check
+        )
+    except (FileNotFoundError, ValueError, NotImplementedError) as err:
+        return _error(f"bux export: {err}")
+    run, step = done.restored.run, done.restored.step
+    print(
+        f"{run.name}: step {step} exported to {done.out}, its weights in {done.dtype}"
+    )
+    if done.report is None:
+        return 0
+    print(describe(done.report))
+    try:
+        done.report.check()
+    except AssertionError as err:
+        return _error(f"bux export: the export disagrees with bux: {err}")
+    return 0
 
 
 def _error(message: str) -> int:
@@ -417,6 +481,9 @@ def main(argv: list[str] | None = None) -> int:
         0 when it succeeds, 1 on errors; ``bux launch`` returns its own (see
         `bux.launch.launch`).
     """
+    argv = sys.argv[1:] if argv is None else argv
+    if argv[:1] == ["export"]:
+        return _export(export_parser().parse_args(argv[1:]))
     cli = parser()
     args = cli.parse_args(argv)
     for setting in args.settings:
