@@ -145,6 +145,7 @@ A change to bux is done when its documentation is. Update, in the same change:
 | the language: syntax, semantics, errors | `docs/language/`, and `grammar.md` for syntax |
 | a command or flag | `docs/reference/cli.md`'s table, and the guide that uses it (`training/running.md`, `training/launching.md`) |
 | training: trainer, hooks, sinks, objective, optimizers, checkpoints | `docs/training/`, and the docstrings of what changed |
+| search: dimensions, objectives, methods, halving (`bux.search`) | `docs/training/searching.md`, and `docs/language/sweeps.md` for the syntax |
 | data: sources, tokenizer, packing, the pipeline | `docs/data/` |
 | parallelism: mesh, layout, a method | the page in `docs/parallelism/` for it |
 | a kernel, a default that changes speed, new measurements | `docs/performance/` (kernels, tuning, benchmarks), with hardware and date |

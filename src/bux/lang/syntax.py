@@ -387,12 +387,15 @@ class Call(Expr):
         args: Its arguments.
         amend: Whether it is the body of an amendment, ``name.key = value``, which
             calls what it amends.
+        where: The definition and setting it is written in, ``"optimizer.lr"``,
+            which names the trials of a search's dimension.
     """
 
     name: str
     name_span: Span
     args: tuple[Arg, ...]
     amend: bool = False
+    where: str = ""
 
 
 @dataclass(frozen=True)
@@ -755,6 +758,7 @@ class _Parser:
     # call := NAME "(" [ arg { "," arg } [","] ] ")"   with no space before "("
     def call(self, name: Token) -> Call:
         self.expect("(")
+        where = ".".join(self.context)
         args = []
         while not self.at(")"):
             start = self.peek().span
@@ -778,7 +782,7 @@ class _Parser:
                 break
             self.next()
         end = self.expect(")").span
-        return Call(name.span.to(end), name.text, name.span, tuple(args))
+        return Call(name.span.to(end), name.text, name.span, tuple(args), where=where)
 
     def is_keyword(self) -> bool:
         i = 0

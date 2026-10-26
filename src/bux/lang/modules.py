@@ -286,6 +286,29 @@ def load(
     return program
 
 
+def extended(program: Program, text: str, name: str) -> Program:
+    """Return `program` with the statements of `text` on top, as if the command line
+    ended with them, and every span of the rest as it was.
+
+    Args:
+        program: A program, loaded without `recover`.
+        text: Statements without ``use``: ``"steps = 300"``.
+        name: What errors in them call their file.
+
+    Raises:
+        BuxError: At a syntax error in `text`.
+    """
+    start = len(program.source) + 1
+    source = program.source + "\n" + text
+    parsed = ast.parse_file(source, start, len(source))
+    return replace(
+        program,
+        source=source,
+        units=[*program.units, Unit(name, text, start)],
+        layers=[*program.layers, *_layers(parsed.statements)],
+    )
+
+
 def _file_key(name: str) -> str:
     """Return which file `name` is, however written."""
     return name if name.startswith("<") else str(Path(name).resolve())

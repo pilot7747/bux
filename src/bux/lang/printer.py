@@ -187,7 +187,7 @@ class _Printer:
     ) -> str:
         if isinstance(config, cfg.ActivationConfig) and not extra and not as_value:
             return config.fn
-        if isinstance(config, tcfg.MixtureConfig):
+        if isinstance(config, tcfg.MixtureConfig | tcfg.ObjectiveConfig):
             return self.value(config)
         args = []
         fields = type(config).model_fields
@@ -225,6 +225,8 @@ class _Printer:
                 return " + ".join(
                     f"{w.weight!r} * {self.value(w.source)}" for w in sources
                 )
+            case tcfg.ObjectiveConfig():
+                return _objective(v)
             case cfg.Config():
                 return self.leaf_names.get(v.model_dump_json()) or self.config(
                     v, as_value=True
@@ -233,6 +235,22 @@ class _Printer:
                 items = [self.value(x) for x in v]
                 return f"[{items[0]},]" if len(items) == 1 else f"[{', '.join(items)}]"
         raise TypeError(f"cannot print {v!r}")
+
+
+def _objective(objective: tcfg.ObjectiveConfig) -> str:
+    """Print an objective as the weighted sum it is written as: ``0.7 * web_bpb + 0.3
+    * code_bpb``, ``-tokens_per_s``."""
+    text = ""
+    for term in objective.terms:
+        name = term.metric if _IDENT.match(term.metric) else f'"{term.metric}"'
+        weight = abs(term.weight)
+        scaled = name if weight == 1 else f"{weight!r} * {name}"
+        sign = "-" if term.weight < 0 else "+"
+        text += f" {sign} {scaled}" if text else ("-" if sign == "-" else "") + scaled
+    if objective.constant:
+        sign = "-" if objective.constant < 0 else "+"
+        text += f" {sign} {abs(objective.constant)!r}"
+    return text
 
 
 def to_source(arch: ir.Architecture) -> str:

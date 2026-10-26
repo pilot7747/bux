@@ -22,6 +22,7 @@ reference and what the editor shows on hover (`bux.lang.reference`).
 """
 
 import itertools
+import math
 from typing import Annotated, Literal
 
 from pydantic import AfterValidator, BeforeValidator, Field, model_validator
@@ -946,6 +947,271 @@ class CompilerConfig(Config):
     reductions: Literal["early", "xla"] = "early"
 
 
+# --- Search ----------------------------------------------------------------------------
+# A setting written as a distribution, `optimizer.lr = log_uniform(1e-4, 1e-2)`, is a
+# dimension of a search (bux.search): each trial of the search is a run that takes a
+# value of it, which the search's method proposes, and the search keeps the trial whose
+# objective is least. Outside a search, as `bux check` and `bux plan` show a run, a
+# dimension takes its middle value: halfway along its scale, or its first option.
+
+#: The significant digits of a value a trial takes, which name its run exactly.
+DIGITS = 3
+
+
+def significant(x: float) -> float:
+    """Return `x` to `DIGITS` significant digits."""
+    return float(f"{x:.{DIGITS}g}")
+
+
+class _Range(Config):
+    """A dimension between two bounds, `low` < `high`, which its subclasses declare."""
+
+    @model_validator(mode="after")
+    def _increasing(self) -> "_Range":
+        low, high = getattr(self, "low"), getattr(self, "high")  # noqa: B009
+        if not low < high:
+            raise ValueError("low must be less than high")
+        return self
+
+
+class UniformConfig(_Range):
+    """A dimension of a search: a number between `low` and `high`, uniformly, as
+    ``optimizer.weight_decay = uniform(0, 0.2)``. Its bounds can be written in order,
+    without their names."""
+
+    type: Literal["uniform"] = "uniform"
+    low: float  # the least value
+    high: float  # the greatest value
+
+    def value(self, u: float) -> float:
+        """Return the value a fraction `u` of the way from `low` to `high`."""
+        return significant(self.low + u * (self.high - self.low))
+
+    def unit(self, x: float) -> float:
+        """Return how far `x` is from `low` to `high`, as a fraction: `value`'s inverse."""
+        return (x - self.low) / (self.high - self.low)
+
+
+class LogUniformConfig(_Range):
+    """A dimension of a search: a number between `low` and `high`, uniformly on a log
+    scale, as a learning rate is searched: ``optimizer.lr = log_uniform(1e-4, 1e-2)``.
+    Its middle is the geometric mean."""
+
+    type: Literal["log_uniform"] = "log_uniform"
+    low: Annotated[float, Field(gt=0)]  # the least value, above 0
+    high: float  # the greatest value
+
+    def value(self, u: float) -> float:
+        """Return the value a fraction `u` of the way from `low` to `high`, in logs."""
+        return significant(self.low * (self.high / self.low) ** u)
+
+    def unit(self, x: float) -> float:
+        """Return how far `x` is from `low` to `high` in logs: `value`'s inverse."""
+        return math.log(x / self.low) / math.log(self.high / self.low)
+
+
+class IntUniformConfig(_Range):
+    """A dimension of a search: an integer from `low` to `high`, both included,
+    uniformly, or on a log scale with `log`: ``schedule.warmup = int_uniform(100, 2k,
+    log=true)``. For a few values that must divide others, as a number of heads,
+    `choice` lists them."""
+
+    type: Literal["int_uniform"] = "int_uniform"
+    low: int  # the least value
+    high: int  # the greatest value
+    log: bool = False  # uniform on a log scale, for 0 < low
+
+    def value(self, u: float) -> int:
+        """Return the integer nearest to a fraction `u` of the way from `low` to
+        `high`, each integer as likely, or in logs with `log`."""
+        if self.log:
+            # Each integer takes the stretch of the log scale nearest to it.
+            low, high = math.log(self.low - 0.5), math.log(self.high + 0.5)
+            x = math.exp(low + u * (high - low))
+        else:
+            x = self.low - 0.5 + u * (self.high - self.low + 1)
+        return min(max(round(x), self.low), self.high)
+
+    def unit(self, x: float) -> float:
+        """Return the fraction of the way from `low` to `high` at the middle of the
+        stretch that `x` takes: `value`'s inverse."""
+        if self.log:
+            low, high = math.log(self.low - 0.5), math.log(self.high + 0.5)
+            return (math.log(x) - low) / (high - low)
+        return (x - self.low + 0.5) / (self.high - self.low + 1)
+
+    @model_validator(mode="after")
+    def _positive_if_log(self) -> "IntUniformConfig":
+        if self.log and self.low < 1:
+            raise ValueError("int_uniform(log=true) needs low >= 1")
+        return self
+
+
+class ChoiceConfig(Config):
+    """A dimension of a search: one of its options, each as likely, which can be any
+    values, settings or blocks: ``ffn.activation = choice(swish, gelu)``, or with
+    names, ``block = choice(pre=[norm attn] [norm ffn], par=[norm (attn + ffn)])``,
+    which name the trials that take them. Where ``a | b`` is an axis of a sweep, a
+    search over each of its runs, a choice is the search's to make."""
+
+    type: Literal["choice"] = "choice"
+    # The options' names, or the options as written: "swish", "gelu".
+    options: Annotated[tuple[str, ...], Field(min_length=2)]
+
+    def value(self, u: float) -> int:
+        """Return the index of the option a fraction `u` of the way along them."""
+        return min(int(u * len(self.options)), len(self.options) - 1)
+
+    def unit(self, x: int) -> float:
+        """Return the middle of the stretch of option `x`: `value`'s inverse."""
+        return (x + 0.5) / len(self.options)
+
+
+Distribution = Annotated[
+    UniformConfig | LogUniformConfig | IntUniformConfig | ChoiceConfig,
+    Field(discriminator="type"),
+]
+
+
+class RandomSearch(Config):
+    """Random search (Bergstra & Bengio, 2012): every trial a point drawn at random,
+    each dimension on its own scale. A baseline that is hard to beat in few
+    dimensions, and whose trials need nothing of each other."""
+
+    type: Literal["random"] = "random"
+
+
+class HaltonSearch(Config):
+    """Quasi-random search: the points of a scrambled Halton sequence, which cover the
+    space more evenly than random ones, with no clumps and no gaps, however many
+    trials there are, and need nothing of each other's results. What the Deep
+    Learning Tuning Playbook (Godbole et al., 2023) explores a space with, and what
+    `tpe` and `gp` start with."""
+
+    type: Literal["halton"] = "halton"
+
+
+class SobolSearch(Config):
+    """Quasi-random search: the points of a scrambled Sobol sequence, evenest of all
+    when the trials are a power of two, 8, 16 or 32: other counts lose its balance
+    (Owen, 2020), and `halton` suits them."""
+
+    type: Literal["sobol"] = "sobol"
+
+
+class TPESearch(Config):
+    """The tree-structured Parzen estimator (Bergstra et al., 2011), as Optuna's: after
+    `startup` quasi-random trials, the trials are split into the best ``gamma`` of
+    them and the rest, a density is fit to each, and of `candidates` points drawn
+    from the best's, the one most likely under it and least under the rest's is
+    tried. Trials still training count among the rest, so that trials at once differ.
+    It handles choices and many dimensions well, and costs nothing to fit."""
+
+    type: Literal["tpe"] = "tpe"
+    startup: Positive = 10  # quasi-random trials before the densities propose
+    candidates: Positive = 24  # points drawn from the best's density, to pick from
+    # The share of the trials that are the best: ceil(gamma * n), at most 25.
+    gamma: Annotated[float, Field(gt=0, lt=1)] = 0.1
+    # One density over every dimension, which sees how they interact; or one each.
+    multivariate: bool = True
+
+
+class GPSearch(Config):
+    """Bayesian optimization with a Gaussian process (Snoek et al., 2012), as BoTorch's
+    and Vizier's: after `startup` quasi-random trials, a GP with a Matérn-5/2 kernel,
+    a length scale for each dimension, is fit to the trials' objectives, and the point
+    of most expected improvement over the best (log EI, Ament et al., 2023) is tried.
+    Trials still training count as done at the GP's prediction for them (the kriging
+    believer), so that trials at once differ. The most of each trial in few
+    dimensions, for runs that take long."""
+
+    type: Literal["gp"] = "gp"
+    startup: Positive = 5  # quasi-random trials before the GP proposes
+    # What the next point maximizes: expected improvement, in logs, or the upper
+    # confidence bound of the improvement, mean + beta * deviation.
+    acquisition: Literal["log_ei", "ucb"] = "log_ei"
+    beta: Annotated[float, Field(gt=0)] = 2.0  # ucb's weight of the deviation
+
+
+SearchMethod = Annotated[
+    RandomSearch | HaltonSearch | SobolSearch | TPESearch | GPSearch,
+    Field(discriminator="type"),
+]
+
+
+class HalvingConfig(Config):
+    """Asynchronous successive halving (ASHA; Li et al., 2020): every trial trains a
+    short run first, the bottom rung, and the best ``1 / eta`` of each rung train
+    again, `eta` times longer, up to the run's own steps. A GPU that frees up takes
+    the next trial up, if a rung has one, else a new trial at the bottom. Each rung
+    is a run of its own, from scratch, with its schedule over its own steps: so a
+    short run's warmup and decay are the long run's, shrunk, and its objective is
+    the run's at that length.
+
+    With `brackets` above 1 it is Hyperband (Li et al., 2018): the trials take turns
+    starting at the bottom rung, the one above, and so on, which hedges against a
+    short run ranking trials as a long one would not."""
+
+    type: Literal["halving"] = "halving"
+    # Each rung trains the best 1/eta of the one below, eta times longer.
+    eta: Annotated[int, Field(ge=2)] = 3
+    # Rungs of steps, the last the run's own: steps / eta^(rungs - 1), ..., steps.
+    rungs: Annotated[int, Field(ge=2)] = 3
+    brackets: Positive = 1  # Hyperband's brackets: the rungs trials start at, from 0
+
+    @model_validator(mode="after")
+    def _brackets(self) -> "HalvingConfig":
+        if self.brackets > self.rungs:
+            raise ValueError("halving needs brackets <= rungs")
+        return self
+
+    def steps(self, steps: int, rung: int) -> int:
+        """Return the steps of `rung`, from 0, of a run of `steps`."""
+        return max(1, round(steps / self.eta ** (self.rungs - 1 - rung)))
+
+
+class SearchConfig(Config):
+    """How a run with dimensions (`uniform`, `log_uniform`, `int_uniform`, `choice`)
+    is searched: `trials` points, each a run of its own, proposed by `method`, ranked
+    by the run's `objective`. Each run of a sweep is a search of its own, so
+    ``attn.num_kv_heads = 1 | 4`` with ``optimizer.lr = log_uniform(1e-4, 1e-2)`` tunes
+    the learning rate of each attention apart, and compares them at their best.
+
+    `bux launch` trains the trials side by side, a GPU group each, and proposes the
+    next as one ends. The search keeps its trials in its own directory, so a search
+    launched again goes on where it stopped, and one given more trials adds them."""
+
+    type: Literal["search"] = "search"
+    method: SearchMethod = GPSearch()  # how the next trial is proposed
+    trials: Positive = 16  # the points it tries, at the bottom rung with halving
+    # Trials at once, at most; none: as many as the GPUs hold.
+    parallel: Positive | None = None
+    # Short runs first, and only the best trained to the end; none: every trial all.
+    halving: HalvingConfig | None = None
+    seed: int = 0  # of the proposals, not of the runs, which keep the run's own
+
+
+class Term(Config):
+    """A term of an objective: a metric and its weight, ``0.7 * web_bpb``."""
+
+    metric: str  # a metric the run logs, as metrics.jsonl names it
+    weight: float  # what its value is multiplied by
+
+
+class ObjectiveConfig(Config):
+    """What a search minimizes, and what ranks the runs of a sweep: a weighted sum of
+    metrics a run logs, each at its latest value, written as one:
+    ``objective = 0.7 * web_bpb + 0.3 * code_bpb``, ``(web_bpb + code_bpb) / 2``, or
+    ``-tokens_per_s`` for the most tokens a second. Its names are the metrics, not
+    definitions, but for a definition of a number: ``w = 0.7`` makes ``w * web_bpb +
+    (1 - w) * code_bpb`` the same. A metric with a slash is a string,
+    ``"time/step_ms"``."""
+
+    type: Literal["objective"] = "objective"
+    terms: Annotated[tuple[Term, ...], Field(min_length=1)]  # the metrics, weighted
+    constant: float = 0.0  # added to the sum, which changes no ranking
+
+
 class TrainConfig(Config):
     """The training settings of a run: one field per top-level setting of a .bux file.
     A file that sets any of them is a run, and needs the required ones: `data`,
@@ -980,6 +1246,11 @@ class TrainConfig(Config):
     layout: LayoutConfig = LayoutConfig()  # which axes each named dimension splits over
     methods: MethodsConfig = MethodsConfig()  # how what communicates is computed
     compiler: CompilerConfig = CompilerConfig()  # XLA's options for the training step
+    # What a search minimizes and a sweep's table ranks by: a weighted sum of metrics,
+    # 0.7 * web_bpb + 0.3 * code_bpb; none: the first eval's bpb, else its loss, else
+    # the training loss.
+    objective: ObjectiveConfig | None = None
+    search: SearchConfig = SearchConfig()  # how a run with dimensions is searched
 
 
 # The configs a .bux file calls by name, besides layers and their settings.
@@ -1019,7 +1290,18 @@ Setting = Annotated[
     | LayoutConfig
     | RematConfig
     | MethodsConfig
-    | CompilerConfig,
+    | CompilerConfig
+    | UniformConfig
+    | LogUniformConfig
+    | IntUniformConfig
+    | ChoiceConfig
+    | RandomSearch
+    | HaltonSearch
+    | SobolSearch
+    | TPESearch
+    | GPSearch
+    | HalvingConfig
+    | SearchConfig,
     Field(discriminator="type"),
 ]
 
@@ -1035,3 +1317,16 @@ def leaves(c: DataConfig) -> tuple[Source, ...]:
 def evals(t: TrainConfig) -> tuple[EvalConfig, ...]:
     """Return the run's evals, in order: none, one, or those of its list."""
     return _each(t.eval)
+
+
+def objective(t: TrainConfig) -> ObjectiveConfig:
+    """Return the run's objective: its own, or the first eval's bits per byte where
+    it has a tokenizer, else that eval's loss, else the training loss."""
+    if t.objective is not None:
+        return t.objective
+    first = next(iter(evals(t)), None)
+    if first is None:
+        metric = "loss"
+    else:
+        metric = f"{first.name}_{'bpb' if t.tokenizer is not None else 'loss'}"
+    return ObjectiveConfig(terms=(Term(metric=metric, weight=1.0),))
