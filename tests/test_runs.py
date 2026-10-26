@@ -379,6 +379,33 @@ def test_the_id_follows_what_a_run_computes():
     assert run.id == renamed.id == watched.id != changed.id
 
 
+@pytest.mark.parametrize(
+    ("layer", "field", "before", "after"),
+    [
+        ("ffn", "up_offset", "0.0", "1.0"),
+        ("moe(num_experts=4, top_k=2, expert=ffn)", "router_bias", "false", "true"),
+        ("mamba2(state_size=8, head_dim=8)", "num_heads", "none", "4"),
+    ],
+)
+def test_a_layer_field_newer_than_ids_keeps_them_where_it_computes_as_before(
+    layer, field, before, after
+):
+    def run_of(value: str | None) -> Run:
+        given = "" if value is None else f"{field}={value}"
+        new = layer.replace(")", f", {given})") if "(" in layer else f"{layer}({given})"
+        source = ARCH.replace("block = [norm attn] [norm ffn]", f"block = [norm {new}]")
+        [run] = runs(source + TRAIN)
+        return run
+
+    # The ids of main 0f0cfe2, before these fields.
+    old = {
+        "up_offset": "a8fa406e9b",
+        "router_bias": "ba4e9ec7b8",
+        "num_heads": "ccdcaff2f8",
+    }
+    assert run_of(None).id == run_of(before).id == old[field] != run_of(after).id
+
+
 @pytest.mark.parametrize("path", EXPERIMENTS, ids=lambda p: p.stem)
 def test_experiments_compile_and_print_back_to_the_same_runs(path):
     report = check(path.read_text(), filename=str(path))

@@ -32,7 +32,7 @@ pydantic models, so a graph compares, hashes and serializes as data
 import hashlib
 import json
 from collections.abc import Iterator
-from typing import Annotated, Literal
+from typing import Annotated, Any, Literal
 
 from pydantic import BaseModel, ConfigDict, Field
 
@@ -302,6 +302,14 @@ _NEWER_FIELDS = {
 }
 # Fields of a setting that only change how a run is watched.
 _UNCOMPUTED_FIELDS = {"precision": ("eval",)}
+# Fields of a layer's settings newer than run ids, by its type, at what layers
+# computed before them.
+_NEWER_LAYER_FIELDS = {
+    "mlp": {"up_offset": 0.0},
+    "gated_mlp": {"up_offset": 0.0},
+    "moe": {"router_bias": False},
+    "mamba2": {"num_heads": None},
+}
 
 
 def _experts_as_they_run(
@@ -328,6 +336,21 @@ def _without_newer_fields(train: dict) -> dict:
         for name in names:
             (train.get(setting) or {}).pop(name, None)
     return train
+
+
+def _without_newer_layer_fields(node: Any) -> Any:
+    """`node`, part of an architecture dumped, without the `_NEWER_LAYER_FIELDS` that
+    compute as layers did before, at any depth: an MoE's experts are inside it."""
+    if isinstance(node, list):
+        return [_without_newer_layer_fields(n) for n in node]
+    if not isinstance(node, dict):
+        return node
+    before = _NEWER_LAYER_FIELDS.get(node.get("type"), {})
+    return {
+        k: _without_newer_layer_fields(v)
+        for k, v in node.items()
+        if not (k in before and v == before[k])
+    }
 
 
 class Run(BaseModel):
@@ -375,6 +398,7 @@ class Run(BaseModel):
             old = _without_newer_fields({setting: before.model_dump(mode="json")})
             if train[setting] == old[setting]:
                 del train[setting]
-        what = {"arch": arch.model_dump(mode="json"), "train": train}
+        dumped_arch = _without_newer_layer_fields(arch.model_dump(mode="json"))
+        what = {"arch": dumped_arch, "train": train}
         blob = json.dumps(what, sort_keys=True, separators=(",", ":"))
         return hashlib.sha256(blob.encode()).hexdigest()[:10]

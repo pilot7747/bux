@@ -13,6 +13,7 @@ import jax.numpy as jnp
 import numpy as np
 import optax
 import pytest
+from conftest import random_biases
 from flax import nnx
 from jaxtyping import Array, Bool, Float, Int, Shaped
 
@@ -40,6 +41,18 @@ OPTIONS = {
         "latent_output_norm": RMS,
         # With a bias, a row of zeros comes out not 0: the buffers' padding shows.
         "expert_norm": cfg.NormalizationConfig(type="layernorm", bias=True),
+    },
+    # gpt-oss's: biases on the router and the experts, whose up branch adds 1.
+    "biased": {
+        "router_bias": True,
+        "expert": GATED.model_copy(
+            update={
+                "bias": True,
+                "activation": "quick_gelu",
+                "limit": 0.3,
+                "up_offset": 1.0,
+            }
+        ),
     },
 }
 # Mesh sizes and layout: expert=2 and 4, with data and fsdp; and the experts over
@@ -99,7 +112,7 @@ def ragged_on_cpu(monkeypatch):
 
 def layer(**settings) -> MoE:
     given = {"num_experts": 8, "top_k": 2, "expert": GATED} | settings
-    return MoE(cfg.MoEConfig.model_validate(given), D, nnx.Rngs(0))
+    return random_biases(MoE(cfg.MoEConfig.model_validate(given), D, nnx.Rngs(0)))
 
 
 def split(method: str, mesh: str, capacity: float | None = None, chunks: int = 1):
@@ -303,7 +316,7 @@ def masked(monkeypatch):
         def run(moe, z, idx, weights, taps=None):
             kept = jnp.where(mask, weights, 0)
             kernels, ffn = moe.kernels(), moe.config.expert
-            return routed(z, idx, kept, *kernels, ffn, moe.expert_norm)
+            return routed(z, idx, kept, kernels, ffn, moe.expert_norm)
 
         monkeypatch.setitem(methods.moe.builders, "masked", run)
         return float(1 - mask.mean())
@@ -388,7 +401,7 @@ def test_a_dispatch_in_mxfp8_computes_what_sorted_does_of_its_tokens_quantized(
 
     def run(moe, z, idx, weights, taps=None):
         kernels, ffn = moe.kernels(), moe.config.expert
-        return routed(_quantized(z), idx, weights, *kernels, ffn, moe.expert_norm)
+        return routed(_quantized(z), idx, weights, kernels, ffn, moe.expert_norm)
 
     monkeypatch.setitem(methods.moe.builders, "quantized", run)
     want = _dispatched("quantized", "one device", "compute")

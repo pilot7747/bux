@@ -305,7 +305,7 @@ run the routed experts, through `cudnn.jax.call` on XLA's stream (`grouped_glu`,
 `grouped_cudnn`), where all of these hold:
 
 - the experts are a SwiGLU FFN: `gated_mlp` of `swish`, with no `limit`,
-  `up_softcap` or `expert_norm`;
+  `up_softcap`, `up_offset`, `bias` or `expert_norm`;
 - they multiply in `mxfp8`, every pass in it;
 - their widths are whole tiles of 256: Qwen3-30B-A3B's 2048 and 768, but not the
   baseline's 704.

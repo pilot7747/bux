@@ -36,10 +36,21 @@ class Config(BaseModel):
 
 #: The activations a layer or a setting can name, bare (``linear(features=h) gelu``)
 #: or as ``act(fn=gelu)``. ``relu2`` is ReLU squared, ``gelu`` is exact and
-#: ``gelu_tanh`` its tanh approximation, ``swish`` is SiLU, and ``situ`` is
-#: ``4 * tanh(x / 4) * sigmoid(x)``: SiLU with its linear factor soft-capped (Kimi K3).
+#: ``gelu_tanh`` its tanh approximation, ``swish`` is SiLU, ``situ`` is
+#: ``4 * tanh(x / 4) * sigmoid(x)``, SiLU with its linear factor soft-capped (Kimi K3),
+#: and ``quick_gelu`` is ``x * sigmoid(1.702 x)``, GELU's sigmoid approximation
+#: (gpt-oss's gate).
 Activation = Literal[
-    "relu", "relu2", "gelu", "gelu_tanh", "swish", "sigmoid", "tanh", "softplus", "situ"
+    "relu",
+    "relu2",
+    "gelu",
+    "gelu_tanh",
+    "swish",
+    "sigmoid",
+    "tanh",
+    "softplus",
+    "situ",
+    "quick_gelu",
 ]
 
 
@@ -193,6 +204,8 @@ class MLPConfig(Config):
     limit: float | None = None
     # Soft-capping of the up branch, cap * tanh(up / cap) (Kimi K3); None: none.
     up_softcap: float | None = None
+    # Added to a gated MLP's up branch after it is clipped: gpt-oss's up + 1.
+    up_offset: float = 0.0
 
 
 class MoEConfig(Config):
@@ -221,6 +234,8 @@ class MoEConfig(Config):
     # How the router scores the experts from its logits: by a softmax over them, a
     # sigmoid each (DeepSeek-V3), or sqrt(softplus(logit)) each (DeepSeek-V4).
     router: Literal["softmax", "sigmoid", "sqrtsoftplus"] = "softmax"
+    # A learned bias on the router's logits (gpt-oss), unlike aux_free's on the choice.
+    router_bias: bool = False
     router_logit_scale: float = 1.0  # Multiplies the logits before scoring (Muse Spark)
     # For benchmarks: a training forward routes by random logits, N(0, 1), so that each
     # expert takes an even share of the picks in expectation and a capacity drops few;
@@ -629,8 +644,8 @@ class MambaConfig(StateSpaceConfig):
 class Mamba2Config(StateSpaceConfig):
     """Mamba-2 / SSD (Dao & Gu, 2024): a scalar decay per head (Zamba2, Nemotron-H).
 
-    The inner channels split into heads of `head_dim` channels each, whose states
-    decay by one rate per head. B and C are shared by the heads of each of
+    The inner channels, `expand` times the width or `num_heads` heads, split into
+    heads of `head_dim` channels each, whose states decay by one rate per head. B and C are shared by the heads of each of
     `num_groups` groups, as keys are by the query heads of a group in GQA. The output
     is gated by SiLU(z) and RMS-normalized a group of heads at a time:
     ``mamba2(state_size=128)``.
@@ -640,6 +655,7 @@ class Mamba2Config(StateSpaceConfig):
     state_size: int = 128
     # Channels of each head, which its state of state_size by head_dim holds.
     head_dim: int = 64
+    num_heads: int | None = None  # None -> expand * width // head_dim
     num_groups: int = 1  # groups sharing B and C, like kv heads in GQA
 
 

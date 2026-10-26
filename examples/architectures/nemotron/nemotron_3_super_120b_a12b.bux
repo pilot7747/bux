@@ -1,0 +1,27 @@
+# NVIDIA Nemotron 3 Super 120B-A12B (2026): the Nemotron 3 hybrid at 88 layers. Each layer
+# is a single mixer in a pre-norm residual: 40 Mamba-2, 40 MoE and 8 attention, with no
+# positional encoding anywhere.
+#
+# LatentMoE: the 512 ReLU^2 experts (22 active) work in a 1024-wide latent space, while
+# the router and the shared expert see the full 4096. One MTP module (an attention and a
+# MoE layer) runs twice with the same weights, to predict 2 and 3 tokens ahead.
+d_model    = 4096
+vocab_size = 131072
+
+norm    = rmsnorm(eps=1e-5)
+ssm     = mamba2(state_size=128, head_dim=64, num_groups=8)
+attn    = gqa(num_heads=32, num_kv_heads=2, head_dim=128)
+experts = moe(num_experts=512, top_k=22, num_shared_experts=1, router=sigmoid,
+              routed_scaling_factor=5.0, load_balancing=aux_free, latent_size=1024,
+              expert=mlp(intermediate_size=2688, activation=relu2),
+              shared_expert=mlp(intermediate_size=5376, activation=relu2))
+
+M = [norm ssm]
+E = [norm experts]
+A = [norm attn]
+
+shared out = head
+shared mtp = $h! nextn(norm=norm) A E norm @h out
+
+model = embed "MEMEMEMA" "EMEMEMEMA"^2 "EMEMEMEMEMA"^4 "EMEMEMEMA" "EMEMEMEME"
+        norm @h out mtp^2

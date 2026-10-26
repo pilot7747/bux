@@ -47,6 +47,7 @@ import numpy as np
 import pyarrow as pa
 import pyarrow.parquet as pq
 import pytest
+from flax import nnx
 from jax.extend.core import Jaxpr, JaxprEqn, jaxprs_in_params
 from jaxtyping import Array, Float, Shaped
 
@@ -146,6 +147,16 @@ def outputs_and_grads(
 
     grads, out = jax.grad(loss, tuple(range(len(args))), has_aux=True)(*args)
     return [out, *grads]
+
+
+def random_biases[M: nnx.Module](module: M) -> M:
+    """Return `module` with every bias at random, small: at their init, 0, they would
+    show nothing a test could check."""
+    keys = iter(jax.random.split(jax.random.key(7), 64))
+    for path, param in nnx.iter_graph(module):
+        if isinstance(param, nnx.Param) and path and "bias" in str(path[-1]):
+            param[...] = 0.1 * jax.random.normal(next(keys), param[...].shape)
+    return module
 
 
 def kept_bytes(

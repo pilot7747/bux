@@ -93,7 +93,7 @@ by XLA instead, with the same values up to rounding. Outside a GPU, and inside
 | `affine_scan` | a state of k × v with k a power of two of 16 or more, and v a multiple of 32 | a scan over the chunks by XLA |
 | `grouped.ragged_dot` | tokamax installed | `jax.lax.ragged_dot` |
 | `grouped_mxfp8` | a Blackwell GPU (compute capability 10 or more); the experts' role in `mxfp8` or `mxfp8_2d` | XLA dequantizes and multiplies |
-| `grouped_glu` | a Blackwell GPU with cudnn-frontend; a SwiGLU FFN (`gated_mlp` of `swish`, no `limit`, `up_softcap` or `expert_norm`); `mxfp8` in every pass; widths in whole tiles of 256 (Qwen3-30B-A3B's 2048 and 768, not the baseline's 704) | `grouped_mxfp8` |
+| `grouped_glu` | a Blackwell GPU with cudnn-frontend; a SwiGLU FFN (`gated_mlp` of `swish`, no `limit`, `up_softcap`, `up_offset`, `bias` or `expert_norm`); `mxfp8` in every pass; widths in whole tiles of 256 (Qwen3-30B-A3B's 2048 and 768, not the baseline's 704) | `grouped_mxfp8` |
 | `blockscaled`'s and `nvfp4`'s quantizers | a GPU | XLA quantizes |
 | the block-scaled GEMMs (cuDNN's, `__cudnn$blockScaledDot`) | a Blackwell GPU | XLA dequantizes and multiplies, which computes the same values |
 

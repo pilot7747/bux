@@ -106,10 +106,9 @@ def expert_parallel(body: Body) -> Callable[..., Float[Array, "b t d"]]:
 
 
 def _in_float32(kernels: Kernels) -> Kernels:
-    """Return the experts' kernels in float32: where several calls of ``experts`` take
-    them, their gradients add up in float32, as one call's would."""
-    up, down = kernels
-    return up.astype(jnp.float32), down.astype(jnp.float32)
+    """Return the experts' kernels and biases in float32: where several calls of
+    ``experts`` take them, their gradients add up in float32, as one call's would."""
+    return jax.tree.map(lambda a: a.astype(jnp.float32), kernels)
 
 
 def token_spec(shape: tuple[int, ...], ep: Axes) -> P:
@@ -213,13 +212,13 @@ def _routed_within(
     """Return each row's sum of its picks' expert outputs, weighted, as ``routed``
     does, but of the first `room` picks by expert alone, flat; and how many ran. A
     pick outside the experts adds nothing, as in ``routed``."""
-    (d, k), local = (x.shape[-1], idx.shape[-1]), kernels[0].shape[0]
+    (d, k), local = (x.shape[-1], idx.shape[-1]), kernels.up.shape[0]
     order, inverse, sizes = sort_by_expert(idx, local)
     order, sizes = order[:room], _fit(sizes, room)
     rows = token_rows(x.reshape(-1, d), order, inverse, k)
     kept = jnp.where(in_range(idx, local), weights, 0)
     row_weights = picked_weights(kept, order, inverse)
-    made = experts(rows, sizes, row_weights, *kernels, ffn, norm)
+    made = experts(rows, sizes, row_weights, kernels, ffn, norm)
     return token_sums(made, inverse, order, k), sizes.sum()
 
 
@@ -239,7 +238,7 @@ def all_gather(
     """Gather the group's tokens onto each of its devices, run this device's experts
     on them, and reduce-scatter each token's sum back to its own device. A device runs
     `methods.capacity` times the picks it has, its last experts' first dropped."""
-    t, d, local = z.shape[1], z.shape[2], kernels[0].shape[0]
+    t, d, local = z.shape[1], z.shape[2], kernels.up.shape[0]
     peers, first = jax.lax.axis_size(axes), jax.lax.axis_index(axes) * local
     gather = functools.partial(jax.lax.all_gather, axis_name=axes, tiled=True)
     group_z, group_weights = gather(z), gather(weights)
@@ -269,7 +268,7 @@ def all_to_all(
     its experts on each peer's buffer as it arrives. A buffer holds
     `methods.capacity` times a peer's share of the picks, or every pick; past it a
     peer's last experts' picks drop."""
-    d, k, n, local = z.shape[-1], idx.shape[-1], idx.size, kernels[0].shape[0]
+    d, k, n, local = z.shape[-1], idx.shape[-1], idx.size, kernels.up.shape[0]
     peers = jax.lax.axis_size(axes)
     buffers = _buffers(idx, local, peers, _room_each(n, peers))
     arrived = _swapped_tokens(z.reshape(-1, d), buffers, k, axes).reshape(peers, -1, d)
@@ -277,7 +276,7 @@ def all_to_all(
     sizes = _swap(buffers.sizes, axes)  # [i, e]: device i's rows for expert e
     wide = _in_float32(kernels)  # each peer's rows add their part of their gradients
     made = [
-        experts(x, s, w, *wide, ffn, norm)
+        experts(x, s, w, wide, ffn, norm)
         for x, s, w in zip(arrived, sizes, their_weights)
     ]
     returned = _swapped(jnp.concatenate(made), axes)
@@ -435,7 +434,7 @@ def ragged_all_to_all(
     which run on them as they are. A device takes `methods.capacity` times the rows
     it sends and drops the rest: its last experts' picks first, and of an expert's,
     the last peers'."""
-    d, k, n, local = z.shape[-1], idx.shape[-1], idx.size, kernels[0].shape[0]
+    d, k, n, local = z.shape[-1], idx.shape[-1], idx.size, kernels.up.shape[0]
     peers, device = jax.lax.axis_size(axes), jax.lax.axis_index(axes)
     order, inverse, sizes = sort_by_expert(idx, local * peers)
     rows = _room(n, peers)
@@ -447,7 +446,7 @@ def ragged_all_to_all(
     taken = route.arrivals.kept[device].sum(1)  # the rows each of its experts took
     came = jnp.arange(rows) < taken.sum()  # past them, what the buffer held
     row_weights = jnp.where(came, arrived_weights[:, 0], 0)
-    made = experts(arrived, taken, row_weights, *kernels, ffn, norm)
+    made = experts(arrived, taken, row_weights, kernels, ffn, norm)
     returned = _exchanged(exchange, made, n, route.back, axes)
     came_back = _came_back(route.there, idx.reshape(-1)[order])
     y = token_sums(jnp.where(came_back[:, None], returned, 0), inverse, order, k)
@@ -691,7 +690,7 @@ def ragged_tokens(
     pick, as ``ragged_all_to_all`` sends. A device runs `methods.capacity` times the
     picks it has, and drops the rest as ``ragged_all_to_all`` does; it takes as many
     tokens, or the most that could come, a token from each device."""
-    d, k, n, local = z.shape[-1], idx.shape[-1], idx.size, kernels[0].shape[0]
+    d, k, n, local = z.shape[-1], idx.shape[-1], idx.size, kernels.up.shape[0]
     peers, device = jax.lax.axis_size(axes), jax.lax.axis_index(axes)
     room = _room(n, peers)  # the picks a device runs
     rows = min(room, peers * n // k)  # the tokens it takes: a token visits it once

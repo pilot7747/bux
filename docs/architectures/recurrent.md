@@ -276,11 +276,13 @@ RMS-normalized one group of heads at a time, and projected back. See {bux}`mamba
 |---------|---------|--------------|
 | `state_size` | `128` | the state dims of each head |
 | `head_dim` | `64` | the channels of a head |
+| `num_heads` | `none` | heads; `none`: `expand * width // head_dim` |
 | `num_groups` | `1` | groups of heads that share $B$ and $C$ |
 | `expand`, `conv_size`, `dt_min`, `dt_max` | `2`, `4`, `1e-3`, `1e-1` | as `mamba`'s |
 
 `expand * width` must split into heads of `head_dim`, and the heads into
-`num_groups`. Nemotron 3's (`examples/architectures/nemotron/nemotron_3_ultra_550b_a55b.bux`):
+`num_groups`. Where no whole `expand` gives a model's heads, set `num_heads`:
+Nemotron 3 Nano has 64 heads of 64 at a width of 2688. Nemotron 3's (`examples/architectures/nemotron/nemotron_3_ultra_550b_a55b.bux`):
 
 ```bux
 ssm = mamba2(state_size=128, head_dim=64, num_groups=8)

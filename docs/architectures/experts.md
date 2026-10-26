@@ -41,7 +41,8 @@ experts = moe(num_experts=384, top_k=6, num_shared_experts=1, router=sqrtsoftplu
 
 ## Routing
 
-The router is a linear layer of the width to the experts, without a bias. In order,
+The router is a linear layer of the width to the experts, with a bias only under
+`router_bias=true` (gpt-oss). In order,
 for each token:
 
 1. **Logits**: $x W_r$, in float32, times `router_logit_scale` (Muse Spark scales them

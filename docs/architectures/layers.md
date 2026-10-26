@@ -94,6 +94,7 @@ with `gelu_tanh` GeGLU.
 | `dropout` | `0` | dropout on the output | |
 | `limit` | `none` | clamped SwiGLU: the gate input capped at `limit`, the up branch at $\pm$`limit` | gpt-oss, DeepSeek-V4 |
 | `up_softcap` | `none` | $c \tanh(u / c)$ on the up branch | Kimi K3 |
+| `up_offset` | `0` | added to a gated MLP's up branch after it is clipped | gpt-oss |
 
 Llama 3 and DeepSeek-V4.1-Flash:
 
@@ -135,6 +136,7 @@ An activation is a value of `activation=` and also a layer on its own:
 | `tanh` | $\tanh(x)$ |
 | `softplus` | $\ln(1 + e^x)$ |
 | `situ` | $4 \tanh(x / 4)\, \sigma(x)$: SiLU with its linear factor soft-capped (Kimi K3) |
+| `quick_gelu` | $x\, \sigma(1.702 x)$: GELU's sigmoid approximation (gpt-oss's gate) |
 
 ## Embeddings and heads
 

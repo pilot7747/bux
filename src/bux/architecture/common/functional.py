@@ -23,6 +23,8 @@ def activation(name: str, x: Float[Array, "*shape"]) -> Float[Array, "*shape"]:
             return jax.nn.gelu(x, approximate=False)
         case "gelu_tanh":
             return jax.nn.gelu(x, approximate=True)
+        case "quick_gelu":
+            return x * jax.nn.sigmoid(1.702 * x)
         case "swish":
             return jax.nn.swish(x)
         case "sigmoid":

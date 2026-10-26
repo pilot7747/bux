@@ -99,7 +99,8 @@ def runs(
         up: the experts' up kernels, (E, d, f, p).
     """
     swiglu = ffn.type == "gated_mlp" and ffn.activation == "swish"
-    plain = ffn.limit is None and ffn.up_softcap is None
+    plain = ffn.limit is None and ffn.up_softcap is None and not ffn.up_offset
+    plain = plain and not ffn.bias
     in_format = recipe is blockscaled.MXFP8 and set(passes) == set(PASSES)
     groups, d, f, _ = up.shape
     here = grouped_triton is not None and grouped_cudnn.runs()

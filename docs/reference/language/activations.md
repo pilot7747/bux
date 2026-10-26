@@ -7,4 +7,5 @@ and a value for settings that take one, `gated_mlp(activation=swish)`.
 ```
 
 `situ` is `4 * tanh(x / 4) * sigmoid(x)`: SiLU with its linear factor soft-capped
-(Kimi K3). `relu2` is the square of ReLU.
+(Kimi K3). `relu2` is the square of ReLU. `quick_gelu` is `x * sigmoid(1.702 x)`,
+GELU's sigmoid approximation (gpt-oss's gate).

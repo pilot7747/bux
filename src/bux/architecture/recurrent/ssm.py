@@ -248,8 +248,8 @@ class Mamba2(nnx.Module):
     Nemotron-H mixers compute it.
 
     The input projects to a gate z, to u, B and C, which are convolved over positions
-    together and SiLU'd, and to one time step per head. u splits into heads of
-    head_dim, whose states decay by one rate per head, and B and C into num_groups
+    together and SiLU'd, and to one time step per head. u, ``expand`` times the
+    width or ``num_heads`` heads wide, splits into heads of head_dim, whose states decay by one rate per head, and B and C into num_groups
     groups that the heads share. With D u added, the output is gated by SiLU(z),
     RMS-normalized one group of heads at a time (as Mamba-2's reference, Zamba2 and
     Nemotron-H group it) and projected back. The scan runs by chunks of positions,
@@ -270,6 +270,8 @@ class Mamba2(nnx.Module):
 
     def __init__(self, config: cfg.Mamba2Config, width: int, rngs: nnx.Rngs):
         d_inner, n, g = config.expand * width, config.state_size, config.num_groups
+        if config.num_heads is not None:  # Nemotron 3 Nano: 64 heads at width 2688
+            d_inner = config.num_heads * config.head_dim
         h = d_inner // config.head_dim
         if h * config.head_dim != d_inner or h % g:
             raise ValueError(

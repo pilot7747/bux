@@ -219,7 +219,8 @@ def _sorted_case(tokens: int = 64):
 
     def run(precision, z, weights, up, down):
         with matmuls.use(precision):
-            return moe.routed(z[None], idx[None], weights[None], up, down, SWIGLU)[0]
+            kernels = moe.Kernels(up, down)
+            return moe.routed(z[None], idx[None], weights[None], kernels, SWIGLU)[0]
 
     return run, (z, weights, up, down), dy
 
@@ -236,7 +237,7 @@ def _rows_case(rows: int = 96, filled: int = 80):
 
     def run(precision, x, weights, up, down):
         with matmuls.use(precision):
-            return moe.experts(x, sizes, weights, up, down, SWIGLU)
+            return moe.experts(x, sizes, weights, moe.Kernels(up, down), SWIGLU)
 
     return run, (x, weights, up, down), dy
 
