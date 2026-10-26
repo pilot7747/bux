@@ -97,6 +97,13 @@ The tuning guide, GPU kernels, XLA's options, profiling, and benchmarks against
 Megatron-Bridge.
 :::
 
+:::{grid-item-card} {octicon}`package` Exporting
+:link: export/index
+:link-type: doc
+
+A model and its weights as transformers code of its own, checked against bux.
+:::
+
 :::{grid-item-card} {octicon}`book` Reference
 :link: reference/index
 :link-type: doc
@@ -117,6 +124,7 @@ training/index
 data/index
 parallelism/index
 performance/index
+export/index
 reference/index
 development/index
 ```

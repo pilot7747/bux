@@ -26,6 +26,12 @@ dev = [
     "ruff>=0.17.1",
     "ty>=0.0.89",
 ]
+# Exporting to transformers, and checking an export against bux: `bux export`.
+export = [
+    "safetensors>=0.6",
+    "torch>=2.14",
+    "transformers>=5.20",
+]
 docs = [
     "myst-parser>=5.1.0",
     "pydata-sphinx-theme>=0.23.0",
@@ -39,6 +45,12 @@ bux = "bux.__main__:main"
 bux-lsp = "bux.lang.lsp.server:main"
 
 [project.optional-dependencies]
+# What `bux export` needs: models export to transformers and are checked in PyTorch.
+export = [
+    "safetensors>=0.6",
+    "torch>=2.14",
+    "transformers>=5.20",
+]
 cuda = [
     "jax[cuda13]>=0.12.0; sys_platform == 'linux'",
     "tokamax[cuda]>=0.0.17; sys_platform == 'linux'",
@@ -52,7 +64,17 @@ spark = [
 ]
 
 [tool.uv]
-default-groups = ["dev", "docs"]  # make ci builds the docs too
+default-groups = ["dev", "docs", "export"]  # make ci builds the docs and checks exports
+
+# PyTorch only runs exported models in tests and checks, on the CPU: its CPU wheels
+# spare CI the CUDA ones.
+[[tool.uv.index]]
+name = "pytorch-cpu"
+url = "https://download.pytorch.org/whl/cpu"
+explicit = true
+
+[tool.uv.sources]
+torch = [{ index = "pytorch-cpu" }]
 
 [build-system]
 requires = ["uv_build>=0.13.1,<0.14"]
@@ -86,6 +108,11 @@ error-on-warning = true
 
 [tool.ty.environment]
 extra-paths = ["docs/_ext"]  # the docs' Sphinx extension
+
+# PyTorch declares nn.Module's forward as an attribute, which every module overrides.
+[[tool.ty.overrides]]
+include = ["src/bux/export/**", "tests/test_export*.py"]
+rules = { invalid-mutable-override = "ignore" }
 
 [tool.ty.analysis]
 allowed-unresolved-imports = ["pyspark.**", "tokamax.**", "cudnn.**", "cutlass.**", "triton.**", "jax_triton.**", "transformer_engine.**"]  # the `spark` and `cuda` extras, and the image's TE
