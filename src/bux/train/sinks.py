@@ -76,6 +76,7 @@ class Console(Sink):
         "tokens_per_s": "{:,.0f} tok/s",
         "mfu": "mfu {:.1%}",
         "eval_loss": "eval loss {:.4f}",
+        "eval_bpb": "eval bpb {:.4f}",
     }
 
     def __init__(

@@ -5,6 +5,7 @@ from pathlib import Path
 import pytest
 
 from bux import config as cfg
+from bux.data.pipeline import jobs
 from bux.lang import BuxError, Run, check, compile, compile_runs
 from bux.lang.lsp import features
 from bux.lang.printer import run_to_source
@@ -366,6 +367,46 @@ def test_data_mixes_as_a_weighted_sum():
 def test_mixture_errors(data, message):
     source = RUN + f'web = tokens(path="w")\ndata = {data}'
     assert message in error(source)
+
+
+# --- Evals ---------------------------------------------------------------------------------
+
+
+def test_a_run_evaluates_one_held_out_set_or_a_list_of_named_ones():
+    source = RUN + 'tokenizer = tokenizer(name="gpt2")\nweb = text(path="w")\n'
+    [one] = runs(source + "eval = eval(data=web(split=[0.99, 1]))")
+    named = (
+        'eval(name="web", data=web(split=[0.99, 1])), eval(name=noise, data=synthetic)'
+    )
+    [many] = runs(source + f"eval = [{named}]")
+    assert [e.name for e in tcfg.evals(one.train)] == ["eval"]
+    assert [(e.name, e.data.type) for e in tcfg.evals(many.train)] == [
+        ("web", "text"),
+        ("noise", "synthetic"),
+    ]
+    assert [job.source.split for job in jobs(many.train)] == [(0.99, 1.0)]
+    assert one.id == many.id == runs(source)[0].id  # evals only watch a run
+    for run in (one, many):
+        [again] = compile_runs(run_to_source(run))
+        assert again.train == run.train
+
+
+@pytest.mark.parametrize(
+    ("evals", "message"),
+    [
+        (
+            "[eval(data=synthetic), eval(data=synthetic, every=5)]",
+            'each eval needs a name of its own: eval(name="web", ...)',
+        ),
+        (
+            "[eval(name=a, data=synthetic), eval(name=b, data=web)]",
+            "text data is tokenized, so the run needs a tokenizer",
+        ),
+        ("3", "'eval' must be eval(...), a list of eval(...) or none, found 3"),
+    ],
+)
+def test_eval_errors(evals, message):
+    assert message in error(RUN + f'web = text(path="w")\neval = {evals}')
 
 
 # --- Identity and printing -------------------------------------------------------------------

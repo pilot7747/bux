@@ -15,9 +15,9 @@ that the GPU never waits for the host to launch a step. Another hook is a subcla
 
     train(run, hooks=[WeightNorm()])
 
-A run's own hooks are `Log`, `Eval`, `Checkpoint` and `Profile`, made from its
-``log``, ``eval``, ``checkpoint`` and ``profile`` settings. Hooks run in order, so
-the run's own see a step first. When training stops early (``Trainer.stopping``,
+A run's own hooks are `Log`, an `Eval` for each of its evals, `Checkpoint` and
+`Profile`, made from its ``log``, ``eval``, ``checkpoint`` and ``profile`` settings.
+Hooks run in order, so the run's own see a step first. When training stops early (``Trainer.stopping``,
 which the launcher sets at SIGTERM), every hook's `Hook.stop` runs at the step it
 stopped at, and the checkpoint hook saves it.
 """
@@ -36,7 +36,7 @@ import numpy as np
 import orbax.checkpoint as ocp
 from flax import nnx
 from jax.experimental import multihost_utils
-from jaxtyping import Array, Shaped
+from jaxtyping import Array, Int32, Shaped
 
 from bux import parallel
 from bux.lang.printer import value_to_source
@@ -153,30 +153,43 @@ class Log(Hook):
 
 
 class Eval(Hook):
-    """Held-out loss: the first head's, over the first `batches` batches of `data`,
-    the same ones every time, as `eval_loss` (``Trainer.evaluate``).
+    """Held-out metrics over the first `batches` batches of `data`, the same ones
+    every time (``Trainer.evaluate``): the first head's loss, as ``<name>_loss``, and
+    given each token id's bytes of text, its bits per byte, ``<name>_bpb``.
 
     Args:
         data: A function that returns the held-out batches from the first, each time
             it is called.
         every: The steps between evaluations.
         batches: The batches an evaluation reads.
+        name: What the metrics' names start with.
+        token_bytes: The bytes of text each id of the model's vocabulary stands for
+            (``Tokenizer.token_bytes``); None leaves out bits per byte.
 
     Example::
 
         held_out = functools.partial(batches, eval_data, config, vocab, held_out=True)
-        train(run, hooks=[Eval(held_out, every=500, batches=20)])
+        train(run, hooks=[Eval(held_out, every=500, batches=20, name="val")])
     """
 
     def __init__(
-        self, data: Callable[[], Iterator[Batch]], *, every: int, batches: int
+        self,
+        data: Callable[[], Iterator[Batch]],
+        *,
+        every: int,
+        batches: int,
+        name: str = "eval",
+        token_bytes: Int32[np.ndarray, " vocab"] | None = None,
     ):
         self.data, self.every, self.batches = data, every, batches
+        self.name, self.token_bytes = name, token_bytes
 
     def __call__(self, trainer: "Trainer", metrics: Metrics) -> Scalars:
-        """Return ``{"eval_loss": ...}``, the trainer's mean loss on the batches."""
+        """Return the trainer's means on the batches, each under the eval's name:
+        ``{"eval_loss": ..., "eval_bpb": ...}``."""
         held_out = itertools.islice(self.data(), self.batches)
-        return {"eval_loss": trainer.evaluate(held_out)}
+        means = trainer.evaluate(held_out, self.token_bytes)
+        return {f"{self.name}_{k}": v for k, v in means.items()}
 
 
 class Checkpoint(Hook):

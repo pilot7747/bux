@@ -1,7 +1,7 @@
 # Supervised fine-tuning data: conversations in the OpenAI format, rendered with
-# ChatML in Qwen3's tokens, and learned only where the assistant speaks, each reply
-# with the <|im_end|> that ends it. A conversation longer than a row is dropped
-# rather than cut; the rest are best-fit packed, each seeing only itself.
+# Qwen3's chat template in its tokens, and learned only where the assistant speaks,
+# each reply with the <|im_end|> that ends it. A conversation longer than a row is
+# dropped rather than cut; the rest are best-fit packed, each seeing only itself.
 #
 #   uvx --from huggingface_hub hf download HuggingFaceTB/smol-smoltalk --repo-type dataset --local-dir data/smol-smoltalk
 #   bux prepare examples/experiments/sft.bux
@@ -19,7 +19,7 @@ ffn.intermediate_size = 1536
 model = embed block^12 norm head(tied=true)
 
 tokenizer = tokenizer(name="Qwen/Qwen3-0.6B")
-smoltalk  = chat(path="data/smol-smoltalk/data/train-*.parquet", template=chatml)
+smoltalk  = chat(path="data/smol-smoltalk/data/train-*.parquet")
 packing   = best_fit(long=drop)
 
 data      = smoltalk(split=[0, 0.99])

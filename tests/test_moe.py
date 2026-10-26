@@ -227,7 +227,7 @@ def test_reported_losses_are_terms_of_the_training_loss_weighted_by_each_layer()
     trainer = Trainer(model, optax.adamw(1e-3), obj)
     assert "balance_loss" in trainer.train_on_batch(batch)
     ce = cross_entropy(model.outputs(jnp.asarray(batch.input_ids))[0], batch)
-    assert np.isclose(trainer.evaluate([batch]), float(ce), rtol=1e-5)
+    assert np.isclose(trainer.evaluate([batch])["loss"], float(ce), rtol=1e-5)
 
 
 def test_a_model_without_reporting_layers_trains_as_before():

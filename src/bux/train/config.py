@@ -74,15 +74,19 @@ class ChatConfig(Config):
     of Parquet files, `content` a string or a list of `{type: text, text}` parts,
     rendered with a chat template and tokenized by the run's `tokenizer`.
 
-    The loss is on the replies `train_on` picks, each with the token that ends it
-    (`<|im_end|>`, `<|eot_id|>`), so that the model learns to stop. A conversation
-    with nothing to learn is dropped. Like `text`, it is prepared once into rows by
-    the run's `packing`."""
+    The template is a Hugging Face tokenizer's Jinja chat template, rendered as
+    transformers renders it: the run's tokenizer's own, or another's. The loss is on
+    the replies `train_on` picks, each from where the template's prompt for it ends
+    through the special token that ends it (`<|im_end|>`, `<|eot_id|>`), so that the
+    model learns to stop. A conversation with nothing to learn is dropped. Like
+    `text`, it is prepared once into rows by the run's `packing`."""
 
     type: Literal["chat"] = "chat"
     path: str  # a glob of Parquet files, relative to the working directory
     column: str = "messages"  # the column that holds each conversation's messages
-    template: Literal["chatml", "llama3"] = "chatml"  # chatml: Qwen's, SmolLM's
+    # The Hub repo or folder whose chat template renders the conversations, as
+    # "HuggingFaceTB/SmolLM-135M-Instruct"; none: the tokenizer's own.
+    template: str | None = None
     # assistant: every reply; last: the last reply alone; all: every token, prompts
     # and template too.
     train_on: Literal["assistant", "last", "all"] = "assistant"
@@ -142,8 +146,9 @@ DataConfig = Annotated[
 
 
 class TokenizerConfig(Config):
-    """A BPE tokenizer, run by gigatoken: a Hugging Face Hub repo or a
-    `tokenizer.json`. `text` and `chat` data need one.
+    """A Hugging Face tokenizer: a Hub repo or a `tokenizer.json`, run by gigatoken,
+    or by Hugging Face's tokenizers where gigatoken cannot run it (SmolLM2's, or one
+    that is not BPE). `text` and `chat` data need one.
 
     Special tokens written in documents stay text, as tiktoken's `encode_ordinary`
     keeps them: a web page that mentions `<|endoftext|>` does not end there. Only
@@ -325,18 +330,46 @@ class LossConfig(Config):
 
 
 class EvalConfig(Config):
-    """Held-out loss every `every` steps and after the last: the first head's mean
-    cross-entropy over the same `batches` batches of `data` each time, logged as
-    `eval_loss`. A batch has the run's `batch` rows of `seq_len` tokens.
+    """Held-out loss every `every` steps and after the last, over the same `batches`
+    batches of `data` each time: the first head's mean cross-entropy over their
+    targets, logged as `eval_loss`, and with a `tokenizer`, its bits per byte,
+    `eval_bpb`. A batch has the run's `batch` rows of `seq_len` tokens.
+
+    Bits per byte compare across tokenizers: the targets' nats over their bytes of
+    text, in bits. A special token stands for no text, so they leave it out.
+
+    A run takes a list of them, a held-out set each under a name of its own, which
+    its metrics start with: `eval = [eval(name="web", data=web(split=[0.99, 1])),
+    eval(name="code", data=code(split=[0.99, 1]))]` logs `web_loss`, `web_bpb`,
+    `code_loss` and `code_bpb`.
 
     Held-out batches are a stream of their own seed, not other documents: hold
     documents out of training by their hash, as `eval(data=web(split=[0.99, 1]))`
     beside `data = web(split=[0, 0.99])`."""
 
     type: Literal["eval"] = "eval"
+    # What its metrics' names start with: eval_loss, eval_bpb.
+    name: Annotated[str, Field(min_length=1)] = "eval"
     data: DataConfig  # a source or a mixture, as `data` takes
     every: Positive = 1000  # steps between evaluations
     batches: Positive = 10  # batches an evaluation reads, the same ones each time
+
+
+def _each(evals: EvalConfig | tuple[EvalConfig, ...] | None) -> tuple[EvalConfig, ...]:
+    return () if evals is None else evals if isinstance(evals, tuple) else (evals,)
+
+
+def _apart(
+    evals: EvalConfig | tuple[EvalConfig, ...] | None,
+) -> EvalConfig | tuple[EvalConfig, ...] | None:
+    names = [e.name for e in _each(evals)]
+    if len(set(names)) < len(names):
+        raise ValueError('each eval needs a name of its own: eval(name="web", ...)')
+    return evals
+
+
+# An eval, a list of them under names of their own, or none.
+Evals = Annotated[EvalConfig | tuple[EvalConfig, ...] | None, AfterValidator(_apart)]
 
 
 class CheckpointConfig(Config):
@@ -683,7 +716,9 @@ class TrainConfig(Config):
     seed: int = 0  # of the model's initialization and of the data's order
     clip: float | None = 1.0  # clip gradients to this global norm; none disables it
     loss: LossConfig = LossConfig()  # the loss's terms and their weights
-    eval: EvalConfig | None = None  # held-out loss every so many steps; none: no eval
+    # Held-out loss and bits per byte every so many steps: an eval, or a list of them
+    # under names of their own; none: no eval.
+    eval: Evals = None
     checkpoint: CheckpointConfig | None = None  # saves a run resumes from; none: none
     log: LogConfig = LogConfig()  # metrics to the console and to metrics.jsonl
     profile: ProfileConfig | None = None  # a trace of a few steps; none: no trace
@@ -732,3 +767,8 @@ DOCUMENTS = (TextConfig, ChatConfig)
 def leaves(c: DataConfig) -> tuple[Source, ...]:
     """Return the sources of `c`, a mixture's in order."""
     return tuple(w.source for w in c.sources) if isinstance(c, MixtureConfig) else (c,)
+
+
+def evals(t: TrainConfig) -> tuple[EvalConfig, ...]:
+    """Return the run's evals, in order: none, one, or those of its list."""
+    return _each(t.eval)
