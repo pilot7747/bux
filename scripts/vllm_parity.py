@@ -19,15 +19,16 @@ recurrent state). `compare` runs bux on the same tokens, each prompt and vLLM's
 continuation, and checks every position: the token vLLM picked is bux's greedy pick
 (its log-probability within `--margin` of bux's best, 0 by default: the same token),
 and the log-probabilities agree within `--tolerance`. A greedy decode that agrees at
-every step is bux's own greedy decode. In bfloat16, bux runs in it too, and vLLM may
-be off by up to twice as much as bux itself is. It prints a line a case, and exits
-with 1 if one disagrees.
+every step is bux's own greedy decode. It prints a line a case, and exits with 1 if
+one disagrees.
 
 The cases are tiny models (d_model 128, a vocabulary of 256) of fresh weights,
 perturbed (`bux.export.check.perturbed`), one per family of layers and settings the
 plugin runs; `--only` picks some by name. In bfloat16 the export's weights are
-bfloat16, and bux computes in float32 from the same rounded weights, so that the
-difference is vLLM's arithmetic alone.
+bfloat16, and bux's reference computes in float32 from the same rounded weights, so
+that the difference is vLLM's arithmetic alone; bux computes in bfloat16 too, and
+vLLM may be off by up to twice as much as bux is from itself, and break near ties
+that close either way.
 """
 
 import argparse
@@ -374,7 +375,9 @@ def compare(name: str, args: argparse.Namespace) -> bool:
     vLLM agrees where its log-probabilities are within `--tolerance` of bux's in
     float32, and each token it picked within `--margin` of bux's best. In a lower
     dtype bux runs in it too (``bux.train.trainer.cast``), on the same tokens, and
-    vLLM may be off by up to twice as much as bux is from itself in float32.
+    vLLM may be off by up to twice as much as bux is from itself in float32; and it
+    may pick a token whose log-probability is that far, bux's own error, from the
+    best, as a near tie two such runs may break either way.
     """
     from bux.lang import compile
     from bux.train.trainer import cast
@@ -396,7 +399,7 @@ def compare(name: str, args: argparse.Namespace) -> bool:
         if low is not None:
             got = _logprobs(low, sequence)[:-1]
             own.add(got, want, starts, got[starts:].argmax(-1))
-    error, gap = max(args.tolerance, 2 * own.error), max(args.margin, 2 * own.gap)
+    error, gap = max(args.tolerance, 2 * own.error), max(args.margin, own.error)
     ok = vllm.error <= error and vllm.gap <= gap
     print(
         f"{name:12s} {args.tag:16s} {meta['dtype']:9s} max |dlogprob| "
