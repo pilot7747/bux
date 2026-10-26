@@ -308,6 +308,12 @@ class BuxPreTrainedModel(PreTrainedModel):
         if hasattr(module, "reset"):
             module.reset()
 
+    @classmethod
+    def _can_set_experts_implementation(cls) -> bool:
+        """The routed experts (moe.py) take transformers' experts implementations,
+        which it looks for in this file alone."""
+        return True
+
 
 class BuxModel(BuxPreTrainedModel):
     """bux: the graph of the architecture, from token ids to the heads' logits: every
