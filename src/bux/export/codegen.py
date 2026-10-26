@@ -33,6 +33,14 @@ def layer_classes() -> dict[str, type]:
     return out
 
 
+def _module_names() -> set[str]:
+    """Return the names the generated module defines or imports besides the configs'
+    constants, which a constant must not shadow: a layer labelled ``mlp`` would
+    hide the class ``MLP``."""
+    classes = {cls.__name__ for cls in layer_classes().values()}
+    return classes | {"MASKS", "COUNTS_TOKENS", "Ctx", "BuxConfig"}
+
+
 def layer_class(layer: ir.Layer) -> type:
     """Return the exported class of `layer`'s type.
 
@@ -76,7 +84,7 @@ class Generator:
         if source not in self.constants:
             hint = (layer.label or layer.config.type).upper()
             hint = hint if hint.isidentifier() else layer.config.type.upper()
-            taken = set(self.constants.values())
+            taken = set(self.constants.values()) | _module_names()
             name, i = hint, 1
             while name in taken:
                 name, i = f"{hint}_{i}", i + 1

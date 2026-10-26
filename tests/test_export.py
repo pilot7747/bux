@@ -70,6 +70,12 @@ def test_a_shared_module_is_called_from_each_use() -> None:
     assert [c.first for c in attn] == [True, False, False]
 
 
+def test_a_config_constant_never_hides_a_layer_class() -> None:
+    source = HEAD + FFN.replace("ffn =", "mlp =") + "model = embed [rmsnorm mlp] head"
+    code = codegen.modeling(plan(compile(source)), [])
+    assert "MLP_1 = {" in code and "MLP(MLP_1, 64" in code
+
+
 def test_a_layer_not_exported_yet_says_which() -> None:
     source = HEAD + "model = embed [rmsnorm deltanet(num_heads=2, head_dim=16)] head"
     with pytest.raises(NotImplementedError, match="deltanet"):
