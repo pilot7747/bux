@@ -40,18 +40,14 @@ NEWEST = 25
 
 class Parzen(NamedTuple):
     """A Parzen estimator over a space's coordinates: a mixture of kernels, one at
-    each point it was fit to and the prior last, each a product over the dimensions.
+    each point it was fit to and the prior last, each a product over the dimensions."""
 
-    Attributes:
-        weights: Each kernel's weight; they sum to 1.
-        mu: Each kernel's center in each number's coordinate.
-        sigma: Its width there, before the truncation to [0, 1].
-        probs: Each kernel's probability of each option, a matrix for each choice.
-    """
-
-    weights: Float[np.ndarray, " k"]
-    mu: Float[np.ndarray, "k p"]
-    sigma: Float[np.ndarray, "k p"]
+    weights: Float[np.ndarray, " k"]  #: Each kernel's weight; they sum to 1.
+    mu: Float[np.ndarray, "k p"]  #: Each kernel's center in each number's coordinate.
+    sigma: Float[
+        np.ndarray, "k p"
+    ]  #: Its width there, before the truncation to [0, 1].
+    #: Each kernel's probability of each option, a matrix for each choice.
     probs: tuple[Float[np.ndarray, "k _"], ...]
 
 

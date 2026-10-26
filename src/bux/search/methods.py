@@ -29,22 +29,16 @@ Point = Float[np.ndarray, " d"]
 
 
 class History(NamedTuple):
-    """What a search knows when it proposes a trial.
+    """What a search knows when it proposes a trial."""
 
-    Attributes:
-        points: The coordinates of the trials it has an objective of.
-        values: Their objectives, the lower the better; NaN for a trial that failed
-            or whose objective is not a number, as a run that diverged.
-        pending: The coordinates of the trials still training.
-        proposed: How many trials it proposed before this one, all of them.
-        seed: The search's seed (``search.seed``).
-    """
-
+    #: The coordinates of the trials it has an objective of.
     points: Float[np.ndarray, "n d"]
+    #: Their objectives, the lower the better; NaN for a trial that failed or whose
+    #: objective is not a number, as a run that diverged.
     values: Float[np.ndarray, " n"]
-    pending: Float[np.ndarray, "m d"]
-    proposed: int
-    seed: int = 0
+    pending: Float[np.ndarray, "m d"]  #: The coordinates of the trials still training.
+    proposed: int  #: How many trials it proposed before this one, all of them.
+    seed: int = 0  #: The search's seed (``search.seed``).
 
 
 #: The methods, by the ``type`` of their config. A builder gets the config, the

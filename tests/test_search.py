@@ -330,6 +330,16 @@ def test_a_trial_already_done_is_read_not_trained_again(tmp_path):
     assert second != run and t.trials[0].results == {0: 4.0}
 
 
+def test_a_search_trains_at_most_its_parallel_trials_at_once(tmp_path):
+    source = SOURCE + "search = search(method=halton, trials=4, parallel=2)\n"
+    s = Search(spaces(source)[0], tmp_path)
+    first, second = started(s), started(s)
+    assert s.next() is None
+    ended(first, tmp_path, eval_loss=1.0)
+    s.ended(first)
+    assert started(s) not in (first, second)
+
+
 def test_an_objective_is_read_from_the_latest_metrics(tmp_path):
     (tmp_path / "metrics.jsonl").write_text(
         '{"step": 1, "loss": 3.0, "a_loss": 9.0}\n{"step": 2, "loss": 2.0}\n'
