@@ -26,7 +26,8 @@ out to them), dk and dv the head dims of keys and values.
 `recurrence` runs by chunks of positions (``chunkwise``, the form of fla's chunked
 kernels), and `stepwise` is its reference, a scan over positions. It runs by the run's
 ``methods.recurrence``: ``scan``, the default, here, and ``pass_state``, which splits
-the positions over ``context``, in `bux.parallel.recurrence`.
+the positions over ``context``, in `bux.parallel.recurrence`. On a GPU, kernels run
+the delta rule (`delta_rule`) and decayed linear attention (`decayed`) instead.
 
 Under tensor parallelism (`bux.parallel`) every projection splits over ``heads``, into
 the heads or out of them, and so does every parameter a head has: the recurrence runs
@@ -146,6 +147,9 @@ def stepwise(xs: Positions, shared: Shared, transition: bool) -> Chunk:
     return Chunk(out, state, P, None if reads is None else jnp.moveaxis(reads, 0, 1))
 
 
+States = Literal["keep", "recompute"]  # what a recurrence's backward pass reads
+
+
 def recurrence(
     q: Float[Array, "b t h dk"],
     k: Float[Array, "b t h dk"],
@@ -154,6 +158,8 @@ def recurrence(
     docs: Segments | None,
     a: Float[Array, "b t h dk"] | None = None,
     b: Float[Array, "b t h dk"] | None = None,
+    *,
+    states: States | None = None,
 ) -> Float[Array, "b t h dv"]:
     """Return the outputs ``S_t^T q_t`` of the state::
 
@@ -163,9 +169,9 @@ def recurrence(
     before every document; without a and b, it is decayed linear attention. It runs
     by the run's ``methods.recurrence``, in float32, named ``recurrence``
     (``remat.named``), its chunks' states for the backward pass kept or computed again
-    by the run's ``methods.states`` (`recomputed`). Where b is k, as in the delta
-    rule, the positions leave b out, (q, k, v, log decay, continues, a), which
-    ``chunkwise`` runs in half the work.
+    by `states`, by default the run's ``methods.states`` (`recomputed`). Where b is
+    k, as in the delta rule, the positions leave b out, (q, k, v, log decay,
+    continues, a), which ``chunkwise`` runs in half the work.
 
     Args:
         q: The queries, ``b t h dk``.
@@ -176,6 +182,8 @@ def recurrence(
         docs: The documents packed into the rows; None for one a row.
         a: What the rank-one term reads of the state; None for no such term.
         b: Where the rank-one term writes it.
+        states: Keep the chunks' states for the backward pass, or recompute them;
+            None for the run's ``methods.states``.
 
     Returns:
         The outputs, ``b t h dv``, in v's dtype.
@@ -184,11 +192,43 @@ def recurrence(
     family = "the generalized delta rule" if rank_one else "decayed linear attention"
     ab = (a,) if rank_one and b is k else (a, b) if rank_one else ()
     xs = (q, k, v, log_decay, _continues(k, docs), *ab)
-    mix = recomputed(functools.partial(_mixed, family))
+    mix = recomputed(functools.partial(_mixed, family), states)
     return remat.named("recurrence", mix, *xs).astype(v.dtype)
 
 
-States = Literal["keep", "recompute"]  # what a recurrence's backward pass reads
+def decayed(
+    q: Float[Array, "b t h dk"],
+    k: Float[Array, "b t h dk"],
+    v: Float[Array, "b t h dv"],
+    log_decay: Float[Array, "b t h #dk"],
+    docs: Segments | None,
+) -> Float[Array, "b t h dv"]:
+    """Run decayed linear attention, `recurrence` without a rank-one term::
+
+        S_t = diag(w_t) S_{t-1} + k_t v_t^T,    o_t = S_t^T q_t.
+
+    On a B200 or B300, with q, k and v in bfloat16 and heads of 64 or 128, cuDNN's
+    GDN-2 kernel runs it instead (`~bux.architecture.recurrent.fused_delta`), keeping
+    only its inputs for the backward pass, as the chunks it falls back on do.
+
+    Args:
+        q: The queries, ``b t h dk``.
+        k: The keys, ``b t h dk``.
+        v: The values, ``b t h dv``.
+        log_decay: log w, ``b t h dk``, or ``b t h 1`` for one decay a head.
+        docs: The documents packed into the rows; None for one a row.
+
+    Returns:
+        The outputs ``S_t^T q_t``, ``b t h dv``, in v's dtype.
+    """
+    if not fused_delta.linear_runs(k.shape[-1], v.shape[-1], v.dtype):
+        return recurrence(q, k, v, log_decay, docs)
+    otherwise = functools.partial(recurrence, states="recompute")
+
+    def fused(*xs: Float[Array, "b t ..."]) -> Float[Array, "b t h dv"]:
+        return fused_delta.linear(*xs, docs, otherwise)
+
+    return remat.named("recurrence", fused, q, k, v, log_decay)
 
 
 def _states() -> States:
@@ -691,7 +731,7 @@ class GatedLinearAttention(LinearAttention):
         q, k, v = self._qkv(x, taps)
         f = self.f(x).reshape(b, t, self.v_heads, self.head_dim)
         g = shard_heads(jax.nn.log_sigmoid(f) / 16)
-        o = recurrence(q * self.head_dim**-0.5, k, v, g, segments(taps))
+        o = decayed(q * self.head_dim**-0.5, k, v, g, segments(taps))
         return self._output(x, o)
 
 
@@ -742,7 +782,7 @@ class LightningAttention(LinearAttention):
         x = shard_layer_input(x)
         q, k, v = self._qkv(x, taps)
         g = jnp.broadcast_to(-self.slopes[...][:, None], (*q.shape[:3], 1))
-        return self._output(x, recurrence(q, k, v, g, segments(taps)))
+        return self._output(x, decayed(q, k, v, g, segments(taps)))
 
 
 @register("deltanet")

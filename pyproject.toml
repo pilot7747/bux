@@ -53,6 +53,8 @@ spark = [
 
 [tool.uv]
 default-groups = ["dev", "docs"]  # make ci builds the docs too
+# cudnn-frontend's develop build: Frost's GDN-2 kernel (fused_delta) is not released yet.
+override-dependencies = ["nvidia-cudnn-frontend @ https://github.com/NVIDIA/cudnn-frontend/releases/download/v1.32.0.dev76547535/nvidia_cudnn_frontend-1.32.0.dev76547535-cp314-cp314-manylinux_2_27_x86_64.manylinux_2_28_x86_64.whl ; sys_platform == 'linux' and platform_machine == 'x86_64'"]
 
 [build-system]
 requires = ["uv_build>=0.13.1,<0.14"]

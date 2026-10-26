@@ -6,7 +6,10 @@ them. XLA's GPU fusions can differ from its CPU's, which the tests run: on a B30
 grouped einsum's took Mamba-2's gradients for B and C wrong. Then the delta rule by
 its kernels, in bfloat16, against its chunks in float32: cuDNN's (``fused_delta``),
 GDN's at steep gates and spikes and KDA's at a gate bounded at -5, and bux's own for
-KDA (``pallas_delta``) at steep gates, spikes and Kimi's own gate.
+KDA (``pallas_delta``) at steep gates, spikes and Kimi's own gate. Last, decayed
+linear attention by cuDNN's GDN-2 kernel against its chunks: GLA's own gate, steep
+gates, spikes, heads of 64, rows of more documents than the kernel takes, and
+Lightning's decays.
 
     uv run --extra cuda python scripts/gpu_smoke/recurrence.py
 
@@ -24,7 +27,7 @@ from jaxtyping import Array, Float
 
 from bux import config as cfg
 from bux.architecture import Segments
-from bux.architecture.recurrent import linear_attention, ssm
+from bux.architecture.recurrent import fused_delta, linear_attention, ssm
 from bux.parallel.recurrence import Chunk, Chunked, Positions, Shared
 
 B, T = 2, 4096
@@ -208,6 +211,54 @@ def kernel_errors(case: str) -> list[float]:
     return [float(np.linalg.norm(a - b) / np.linalg.norm(b)) for a, b in zip(got, want)]
 
 
+def gla(rng: np.random.Generator, decays: int) -> np.ndarray:
+    """The log decays of GLA's own gate, log sigmoid(f) / 16, of f from a normal."""
+    return -np.logaddexp(0, -2 * rng.normal(size=(B, T, 16, decays))) / 16
+
+
+def lightning(rng: np.random.Generator, decays: int) -> np.ndarray:
+    """The log decays of Lightning's first layer of 16, a head each."""
+    slopes = np.asarray(linear_attention.slopes(16, 0, 16))[:, None]
+    return np.broadcast_to(-slopes, (B, T, 16, decays))
+
+
+# Decayed linear attention by GDN-2's kernel: head dims, decays a head, the log decays,
+# and a document every so many positions.
+DECAYED: dict[str, tuple[int, int, Gate, int]] = {
+    "gla by gdn-2, its own gate": (128, 128, gla, 1000),
+    "gla by gdn-2, heads of 64": (64, 64, gla, 1000),
+    "gla by gdn-2, gates to -5": (128, 128, steep(-5.0), 1000),
+    "gla by gdn-2, gates to -20": (128, 128, steep(-20.0), 1000),
+    "gla by gdn-2, spikes of -1e4": (128, 128, steep(-1.0, -1e4), 1000),
+    "gla by gdn-2, more documents": (128, 128, gla, 41),
+    "lightning by gdn-2": (128, 1, lightning, 1000),
+}
+
+
+def decayed_errors(case: str) -> list[float]:
+    """How far decayed linear attention by GDN-2's kernel is from its chunks: the
+    outputs, then each input's gradient, as a share of its norm. More documents a row
+    than the kernel's room run by the chunks."""
+    dim, decays, gate, every = DECAYED[case]
+    rng = np.random.default_rng(list(DECAYED).index(case))
+    positions = jnp.asarray(np.arange(T) % every, jnp.int32)
+    docs = Segments.of(jnp.broadcast_to(positions, (B, T)))
+    q, k, v = rng.normal(size=(3, B, T, 16, dim))
+    qkv = (jnp.asarray(x, jnp.bfloat16) for x in (q / np.sqrt(dim), k, v))
+    xs = (*qkv, jnp.asarray(gate(rng, decays), jnp.float32))
+    assert fused_delta.linear_runs(dim, dim, jnp.bfloat16)
+
+    def kernel(*xs: Float[Array, "..."]) -> Float[Array, "b t h dv"]:
+        return linear_attention.decayed(*xs, docs).astype(jnp.float32)
+
+    def chunks(*xs: Float[Array, "..."]) -> Float[Array, "b t h dv"]:
+        q, k, v, g = (x.astype(jnp.float32) for x in xs)
+        return linear_attention.recurrence(q, k, v, g, docs)
+
+    got, want = (weighted(f, xs) for f in (kernel, chunks))
+    return [float(np.linalg.norm(a - b) / np.linalg.norm(b)) for a, b in zip(got, want)]
+
+
 def weighted(f: Callable[..., Float[Array, "..."]], xs: tuple) -> list[np.ndarray]:
     """f's outputs, and the gradients of a weighted sum of them for every input."""
 
@@ -233,6 +284,7 @@ def main() -> None:
     print(f"{jax.devices()[0].device_kind}, {B} x {T} tokens, float32")
     forms = [report(case, errors(case), TOLERANCE) for case in CASES]
     kernels = [report(c, kernel_errors(c), KERNEL_TOLERANCE) for c in KERNELS]
+    kernels += [report(c, decayed_errors(c), KERNEL_TOLERANCE) for c in DECAYED]
     sys.exit(0 if all(forms) and all(kernels) else 1)
 
 

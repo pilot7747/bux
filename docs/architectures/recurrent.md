@@ -369,16 +369,17 @@ state across chunks. Every chunk's maps come from matmuls over all chunks at onc
 exponent in it is positive, whatever the gate. Recurrent states are float32,
 whatever the run computes in.
 
-On a GPU, kernels run the delta rule with q, k and v of 16 bits and heads of 64 or
-128, under `methods.recurrence = scan`:
+On a GPU, kernels run the delta rule, GLA and Lightning with q, k and v of 16 bits
+and heads of 64 or 128, under `methods.recurrence = scan`:
 
 | Layer | Kernel | Condition |
 |-------|--------|-----------|
 | `gdn`, `deltanet` | cuDNN's fused GDN kernel (`fused_delta`) | a B200 or B300; any gate |
 | `kda` with a `gate_lower_bound` of -5 or above | cuDNN's fused KDA kernel (`fused_delta`) | a B200 or B300 |
 | `kda` otherwise | bux's Pallas kernels (`pallas_delta`) | any GPU; any gate |
-| `gla`, `rwkv7` | chunks, the state across them by `affine_scan` | |
-| `lightning`, `mamba2` | chunks, the state across them by a matmul (one decay a head) | |
+| `gla`, `lightning` | cuDNN's fused GDN-2 kernel (`fused_delta`), its delta rule at a step of 0 | a B200 or B300; bfloat16 |
+| `rwkv7` | chunks, the state across them by `affine_scan` | |
+| `mamba2` | chunks, the state across them by a matmul (one decay a head) | |
 | `mamba` | a scan over positions (one decay per channel and state dim) | |
 
 cuDNN's KDA kernel factors each decay through the start of a tile of 16 positions,
