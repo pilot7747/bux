@@ -163,8 +163,9 @@ The alternatives of a sweep stay a grid, and each run of it is a search of its o
 over the dimensions it reaches. So `attn.num_kv_heads = mha: 12 | gqa: 4 | mqa: 1`
 with `optimizer.lr = log_uniform(1e-4, 1e-2)` compares three attentions, each at its
 best learning rate, which is the fair comparison when the best learning rate moves
-with the architecture (Wen et al., 2025, found optimizer rankings that flip unless
-each is tuned apart). The searches take turns at the GPUs.
+with the architecture: comparisons against a baseline tuned less carefully overstate
+the differences (Wen et al., 2025, for optimizers). The searches take turns at the
+GPUs.
 
 To let the search choose the attention too, write it as a dimension:
 `attn.num_kv_heads = choice(12, 4, 1)`.
@@ -222,8 +223,7 @@ earned it, a new trial at the bottom: no rung waits for the rest of it.
 A short run favors a high learning rate: the best learning rate falls as a run gets
 longer (Bjorck et al., 2025). Halving keeps the choice at the full length, where the
 best trial is ranked, but it can drop a good low learning rate at the bottom rung.
-`eta=3` and a bottom rung of a ninth to a twenty-seventh of the tokens are the
-literature's defaults.
+Hyperband's authors recommend an `eta` of 3 or 4.
 
 (training-a-search)=
 ## Training a search
@@ -261,8 +261,8 @@ The key hashes what the search is over and how: its dimensions, `method`, `halvi
 and `seed`. So:
 
 - **A search launched again goes on where it stopped.** Its done trials are read, a
-  trial that a signal stopped resumes from its checkpoint, and the method proposes
-  the rest as it would have.
+  trial that a signal stopped trains again, from its checkpoint if it has a
+  `checkpoint` setting, and the method proposes the rest from all of them.
 - **More `trials` add trials** to the same search.
 - **Another space, method or seed is a search of its own**, in a directory of its
   own; a trial at a point another search trained already is read from its run.

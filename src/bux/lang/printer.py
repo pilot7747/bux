@@ -187,7 +187,7 @@ class _Printer:
     ) -> str:
         if isinstance(config, cfg.ActivationConfig) and not extra and not as_value:
             return config.fn
-        if isinstance(config, tcfg.MixtureConfig):
+        if isinstance(config, tcfg.MixtureConfig | tcfg.ObjectiveConfig):
             return self.value(config)
         args = []
         fields = type(config).model_fields

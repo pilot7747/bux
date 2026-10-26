@@ -10,6 +10,7 @@ import pytest
 
 from bux.__main__ import main
 from bux.lang import Space, check, compile_runs, compile_spaces, ir
+from bux.lang.lsp import features
 from bux.lang.printer import run_to_source
 from bux.launch import Queue, search, status, summary
 from bux.search import halving
@@ -178,6 +179,14 @@ def test_an_objective_is_a_weighted_sum_of_metrics_and_prints_as_one():
 )
 def test_an_objective_reads_only_what_the_run_logs(objective, message):
     assert message in error(SOURCE + f"objective = {objective}\n")
+
+
+def test_the_editor_shows_a_dimension_and_an_objective_on_hover():
+    source = SOURCE + "objective = 0.5 * eval_loss + 0.5 * loss\n"
+    shown = features.hover(source, source.index("log_uniform") + 1)
+    assert shown is not None and "A dimension of a search" in shown.markdown
+    shown = features.hover(source, source.index("objective =") + 1)
+    assert shown is not None and "0.5 * eval_loss + 0.5 * loss" in shown.markdown
 
 
 def test_neither_the_search_nor_the_objective_is_in_a_runs_id():
