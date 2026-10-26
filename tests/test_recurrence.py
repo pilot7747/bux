@@ -240,11 +240,14 @@ def logits_and_grads(m: Model) -> tuple[Float[Array, "b t vocab"], list]:
 
 
 def assert_rounds_alike(split: Float[Array, "..."], whole: Float[Array, "..."]) -> None:
-    """`split` is `whole` to 5e-5 of its largest entry: as float32 sums of many
+    """`split` is `whole` to 2e-4 of its largest entry: as float32 sums of many
     terms round, a gradient's taken over every position, and the chunks'
-    (``chunkwise``) in other orders on each device's positions than on all."""
+    (``chunkwise``) in other orders on each device's positions than on all. An x86
+    CPU sums otherwise: KDA's gradients came 5.8e-5 apart on GitHub's runners at
+    LeCun's weights (main 5a1d896), where an x86 node keeps every family within 5e-6
+    at today's."""
     scale = float(jnp.abs(whole).max())
-    np.testing.assert_allclose(split, whole, atol=5e-5 * scale)
+    np.testing.assert_allclose(split, whole, atol=2e-4 * scale)
 
 
 @pytest.mark.parametrize("family", FAMILIES)
