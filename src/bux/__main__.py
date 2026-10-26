@@ -306,7 +306,13 @@ def _check(report: Report, arch: Architecture, runs: list[Run]) -> None:
     if report.run is not None:
         print(training(report.run))
     if len(runs) > 1:
-        axes = " × ".join(f"{a.where} ({' | '.join(a.options)})" for a in report.axes)
+        taken = {part for run in runs for part in run.choices}
+        live = [
+            a
+            for a in report.axes
+            if any(a.part(a.pick(i)) in taken for i in range(len(a.options)))
+        ]
+        axes = " × ".join(f"{a.where} ({' | '.join(a.options)})" for a in live)
         print(f"sweep: {len(runs)} runs over {axes}")
 
 

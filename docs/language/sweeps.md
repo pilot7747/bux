@@ -138,14 +138,10 @@ Only alternatives that a run reaches make runs:
 - **A macro takes the same alternative at every call.** `layer(mixer) = [norm mixer
   scale(init=0.5 | 1.0)] [norm ffn]` is two runs however often `layer` is called:
   every layer takes 0.5, or every layer 1.0.
-
-:::{warning}
-An amendment builds on the definition below it, so it keeps that definition's
-alternatives, even of the key it sets. `bux train attention_ablation.bux
-'optimizer.lr = 1e-2'` is still six runs: each pair is the same run, at 1e-2, named
-`optimizer.lr=1e-3` and `optimizer.lr=3e-3`. To pin a swept setting, redefine the
-whole definition: `'optimizer = adamw(lr=1e-2, weight_decay=0.1)'` is three runs.
-:::
+- **An alternative whose choice changes no run is not an axis.** An amendment
+  over a swept setting overrides it: `bux train attention_ablation.bux
+  'optimizer.lr = 1e-2'` is three runs at 1e-2, named for the attention alone. The
+  axis is dropped where every run it would make is the same as its first.
 
 ## Checking a sweep
 

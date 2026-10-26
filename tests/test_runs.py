@@ -227,7 +227,8 @@ def test_an_amendment_reaches_a_layer_or_setting_defined_by_a_bare_type():
     assert layer(run, cfg.GQAConfig).num_kv_heads == 1
     swept = ARCH + TRAIN + "methods = a: methods | b: methods(microbatches=4)"
     amended = runs(swept, overrides=["methods = methods(microbatches=2)"])
-    assert [r.train.methods.microbatches for r in amended] == [2, 2]
+    # Both alternatives compute the same run now, so they make one.
+    assert [r.train.methods.microbatches for r in amended] == [2]
 
 
 @pytest.mark.parametrize(
@@ -290,6 +291,16 @@ def test_only_the_alternatives_a_run_reaches_make_runs():
     ) == ["exp"]
     nested = runs(RUN + "seed = 0 | (10 | 20)")
     assert [r.train.seed for r in nested] == [0, 10, 20]
+
+
+def test_an_alternative_a_later_amendment_overrides_makes_no_runs():
+    swept = RUN + "optimizer.lr = 1e-3 | 3e-3\nseed = 1 | 2"
+    [one, two] = runs(swept, overrides=["optimizer.lr = 1e-2"])
+    assert (one.name, two.name) == ("exp[seed=1]", "exp[seed=2]")
+    assert one.train.optimizer.lr == two.train.optimizer.lr == 1e-2
+    # Alternatives that compute the same run elsewhere still make runs where they differ.
+    labeled = RUN + "d_model = s: 16 | l: 32\noptimizer.lr = s: 1e-3 | l: 1e-3"
+    assert names(labeled) == ["exp[s]", "exp[l]"]
 
 
 def test_a_macro_takes_the_same_alternative_at_every_call():

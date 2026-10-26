@@ -1606,7 +1606,7 @@ def compile_runs(
         # ['smoke[optimizer.lr=3e-3]', 'smoke[optimizer.lr=1e-2]']
     """
     program = _load(source, filename, overrides, modules, recover=False)
-    runs: list[ir.Run] = []
+    found: list[_Explored] = []
 
     def explore(choices: dict[Span | frozenset[str], int | str]) -> None:
         ev = _Evaluator(program, choices=choices)
@@ -1628,15 +1628,61 @@ def compile_runs(
                 "this file does not say how to train its model",
                 hint="a run sets data, optimizer, seq_len, batch and steps",
             )
-        parts = tuple(axis.part(choices[axis.key]) for axis in reached)
-        name = _run_name(filename, parts)
-        runs.append(ir.Run(name=name, arch=arch, train=train, choices=parts))
+        found.append(_Explored(choices, reached, arch, train))
 
     try:
         explore({})
     except BuxError as err:
         raise program.locate(err) from None
+    for axis in {e.key: e for f in found for e in f.reached}.values():
+        found = _without_if_alike(found, axis)
+    runs = []
+    for f in found:
+        parts = tuple(axis.part(f.choices[axis.key]) for axis in f.reached)
+        name = _run_name(filename, parts)
+        runs.append(ir.Run(name=name, arch=f.arch, train=f.train, choices=parts))
     return runs
+
+
+@dataclass
+class _Explored:
+    """One combination of a sweep's alternatives, and the run it compiles to."""
+
+    choices: dict[Span | frozenset[str], int | str]
+    reached: list[Axis]  # the axes it met, in the order written
+    arch: ir.Architecture
+    train: tcfg.TrainConfig
+
+
+def _without_if_alike(found: list[_Explored], axis: Axis) -> list[_Explored]:
+    """Drop `axis` where no run depends on which of its alternatives it takes, as one
+    that a later amendment overrides (``optimizer.lr = 1e-2`` on the command line,
+    over a file's ``optimizer.lr = 1e-3 | 3e-3``): its runs but those of its first
+    alternative, and its part of their names."""
+    groups: dict[frozenset[object], list[_Explored]] = {}
+    for f in found:
+        if axis.key in f.choices:
+            rest = frozenset((k, v) for k, v in f.choices.items() if k != axis.key)
+            groups.setdefault(rest, []).append(f)
+    # The runs of a group differ in this axis alone, one for each alternative; an
+    # axis nested in another's alternative has groups of one, which prove nothing.
+    alike = all(
+        len(group) == len(axis.options)
+        and all((f.arch, f.train) == (group[0].arch, group[0].train) for f in group)
+        for group in groups.values()
+    )
+    if not groups or not alike:
+        return found
+    first = axis.pick(0)
+    return [
+        replace(
+            f,
+            choices={k: v for k, v in f.choices.items() if k != axis.key},
+            reached=[a for a in f.reached if a.key != axis.key],
+        )
+        for f in found
+        if f.choices.get(axis.key, first) == first
+    ]
 
 
 @dataclass
