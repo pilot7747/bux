@@ -97,6 +97,7 @@ def compare(
     model: Model | None = None,
     *,
     implementations: tuple[str, ...] = ("eager", "sdpa"),
+    experts: str | None = None,
     batch: int = 2,
     length: int = 12,
     steps: int = 6,
@@ -110,6 +111,8 @@ def compare(
         arch: The architecture.
         model: Its bux model; None for fresh weights, perturbed (`perturbed`).
         implementations: transformers' attention implementations to run it by.
+        experts: transformers' experts implementation to run an MoE's routed experts
+            by (``eager``, ``grouped_mm``, ...); None for its default.
         batch: Rows of the batch the logits are compared on.
         length: Tokens in each row.
         steps: Tokens to decode greedily after a prompt of half the length.
@@ -134,7 +137,7 @@ def compare(
         save(arch, model, where)
         report = Report(tolerance=tolerance)
         for impl in implementations:
-            hf = _load(where, impl)
+            hf = _load(where, impl, experts)
             got = _heads(hf, np.asarray(tokens))
             error = max(_relative(g, w) for g, w in zip(got, want, strict=True))
             runs = {
@@ -157,8 +160,9 @@ def _greedy(
     return prompt
 
 
-def _load(where: Path, impl: str) -> Any:
-    """Load the export at `where` with transformers, in float32.
+def _load(where: Path, impl: str, experts: str | None = None) -> Any:
+    """Load the export at `where` with transformers, in float32, by the attention
+    implementation `impl` and the experts implementation `experts`.
 
     Raises:
         AssertionError: A weight of the checkpoint or of the model has no match;
@@ -166,12 +170,14 @@ def _load(where: Path, impl: str) -> Any:
     """
     from transformers import AutoModelForCausalLM  # slow to import
 
+    chosen = {} if experts is None else {"experts_implementation": experts}
     loaded: Any = AutoModelForCausalLM.from_pretrained(
         where,
         trust_remote_code=True,
         dtype=torch.float32,
         attn_implementation=impl,
         output_loading_info=True,
+        **chosen,
     )
     model, info = loaded
     unmatched = {k: v for k, v in info.items() if k != "error_msgs" and v}

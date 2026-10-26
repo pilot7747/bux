@@ -103,7 +103,29 @@ layer or the setting.
 
 | Layers | Exported |
 |--------|----------|
-| `embed`, `head`, `mlp`, `gated_mlp`, `linear`, `act`, `scale`, `dropout`, `layernorm`, `rmsnorm` | yes, but `embed(norm=...)` and the MLPs' `limit`, `up_softcap` and `up_offset` |
+| `embed`, `head`, `mlp`, `gated_mlp`, `linear`, `act`, `scale`, `dropout`, `layernorm`, `rmsnorm`, `dyt` | yes, every setting and activation |
+| `moe` | yes, every setting inference reads: the routers, group-limited routing, the aux-free bias, shared experts, LatentMoE, the expert norm, experts of either MLP type; the routed experts by transformers' experts implementations |
 | `gqa` | RoPE (`pi`, `llama3`), QK-norm, GQA, biases, its scale; not yet its other settings or ports |
 | `conv` | yes, its inputs' tail kept in the cache as it decodes |
 | the graph | sequences, residual branches, sums, products, constants, repeats, taps, shared definitions; not yet residual algebras |
+
+### Mixtures of experts
+
+An exported `moe` routes as bux does: the scores and the top-k choice in float32,
+equal scores picking the lower expert, and the aux-free bias, which the checkpoint
+holds as `router_bias`, in the choice alone. Its routed experts are stacked as
+transformers' MoE models keep theirs, `gate_up_proj` (E, 2f, d), the gate's rows
+first, and `down_proj` (E, d, f), so that transformers' experts implementations run
+them:
+
+```python
+model = AutoModelForCausalLM.from_pretrained(
+    "exported/", trust_remote_code=True, experts_implementation="grouped_mm"
+)
+```
+
+`grouped_mm`, transformers' default, and `batched_mm` run every setting of the
+experts; `eager` is a loop over them, the reference. A kernel that fuses the
+activation itself (`sonicmoe`) fits SwiGLU experts alone. The settings only training
+reads are left out: the balance loss, how far the aux-free bias moves, and random
+routing.

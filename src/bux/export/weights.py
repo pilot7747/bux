@@ -3,8 +3,9 @@
 Each exported layer mirrors its NNX module's attributes, so one rule names them all:
 a ``nnx.Linear``'s kernel, transposed, and an ``nnx.Embed``'s table become
 ``weight``, as do a norm's scale; any other parameter keeps its attribute's name, and
-submodules nest by theirs (``q_norm.weight``). An exported layer whose own layout
-differs converts its tensors after (``bux_weights``, `bux.export.hf.common`).
+submodules nest by theirs (``q_norm.weight``). The few variables besides parameters
+that inference reads (`STATE`) go too. An exported layer whose own layout differs
+converts its tensors after (``bux_weights``, `bux.export.hf.common`).
 """
 
 from collections.abc import Callable, Iterator
@@ -15,12 +16,17 @@ from flax import nnx
 from jaxtyping import Shaped
 
 from bux.architecture import Model
+from bux.architecture.experts.moe import MoE
 from bux.architecture.layers.norm import Norm
 from bux.export.plan import Plan
 from bux.lang import ir
 
 #: A layer's tensors, by their names under its module.
 Tensors = dict[str, Shaped[np.ndarray, "..."]]
+
+#: Variables besides parameters that inference reads, by module class: an MoE's
+#: aux-free bias, which picks its experts.
+STATE: dict[type, tuple[str, ...]] = {MoE: ("router_bias",)}
 
 #: Converts a layer's tensors to its exported layout: ``(tensors, config) -> tensors``.
 Convert = Callable[[Tensors, dict], Tensors]
@@ -89,8 +95,12 @@ def _named(m: object, prefix: str, seen: set[int]) -> Iterator[tuple[str, np.nda
                 if p is not None:
                     yield f"{prefix}{name}", np.asarray(p[...])
         case _:
+            state = STATE.get(type(m), ())
             for name, value in vars(m).items():
-                yield from _attribute(value, f"{prefix}{name}", seen)
+                if name in state and isinstance(value, nnx.Variable):
+                    yield f"{prefix}{name}", np.asarray(value[...])
+                else:
+                    yield from _attribute(value, f"{prefix}{name}", seen)
 
 
 def _attribute(
