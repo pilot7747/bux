@@ -66,7 +66,9 @@ three minutes on 16 cores of a laptop ([Data](index.md#a-quick-example)).
 A prepared dataset is a folder named for a hash of what made it: the documents'
 source setting, the tokenizer, the packing and `seq_len`. So a run finds the one it
 needs, a changed setting makes another, and a cache can be shared by runs and copied
-between machines:
+between machines. A curriculum's phase that reads documents at another `seq_len`
+reads a dataset of its own, which `bux prepare` makes with the rest
+([What each phase reads](../training/curriculum.md#what-each-phase-reads)):
 
 ```text
 data/packed/text-0c8c782640/

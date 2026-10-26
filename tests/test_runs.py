@@ -118,6 +118,13 @@ def test_settings_are_checked_where_they_are_written(setting, message):
     assert message in text and setting.split(" = ")[1] in text
 
 
+def test_power_takes_a_curriculum_of_data_but_not_of_batches():
+    [run] = runs(RUN + "schedule = power\ncurriculum = phase(at=0.5, data=synthetic)")
+    assert isinstance(run.train.schedule, tcfg.PowerSchedule)
+    text = error(RUN + "schedule = power\nbatch_ramp = ramp(start=2, steps=10)")
+    assert "power counts the tokens of one batch and seq_len" in text
+
+
 def test_a_bare_name_a_setting_takes_is_that_string():
     """cosine is a schedule, and one of the shapes wsd's cooldown takes."""
     [run] = runs(RUN + "schedule = wsd(shape=cosine)")

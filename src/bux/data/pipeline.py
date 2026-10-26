@@ -45,6 +45,7 @@ import pyarrow.parquet as pq
 from bux.data import documents, packing
 from bux.data.tokenizer import load
 from bux.train import config as tcfg
+from bux.train import curriculum
 
 #: The version of what a job makes from its documents, in every dataset's hash.
 #:
@@ -166,14 +167,13 @@ def jobs(config: tcfg.TrainConfig) -> list[Job]:
         config: The run's training settings, ``run.train``.
 
     Returns:
-        A job for each ``text`` and ``chat`` source of ``data`` and of every
-        ``eval``, mixes included, in the order written; none for ``tokens`` or
-        ``synthetic``.
+        A job for each ``text`` and ``chat`` source of ``data``, of each phase of the
+        ``curriculum`` at its seq_len, and of every ``eval``, mixes included, in the
+        order written; none for ``tokens`` or ``synthetic``.
     """
-    sources = tcfg.leaves(config.data)
-    for held_out in tcfg.evals(config):
-        sources += tcfg.leaves(held_out.data)
-    found = (Job.of(s, config) for s in sources if isinstance(s, tcfg.DOCUMENTS))
+    read = [(s, c) for _, c in curriculum.phases(config) for s in tcfg.leaves(c.data)]
+    read += [(s, config) for e in tcfg.evals(config) for s in tcfg.leaves(e.data)]
+    found = (Job.of(s, c) for s, c in read if isinstance(s, tcfg.DOCUMENTS))
     return list(dict.fromkeys(found))
 
 
