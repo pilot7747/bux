@@ -222,6 +222,9 @@ type Op =
   | {op: "wrap", node: string}            // f  ->  [f]
   | {op: "unwrap", node: string}          // [f] ->  f
   | {op: "retype", node: string, type: string}
+  | {op: "axis", axis: string, options: string[]}
+        // rewrite a sweep axis's `a | b` (sweep.axes[].id) with these alternatives,
+        // each source text, labeled ones as "mqa: 1"; one option ends the sweep there
 ```
 
 `edits.apply(source, ops, *, picks, path) -> str` and
