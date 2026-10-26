@@ -11,7 +11,7 @@
 # gpt-oss, Llama 4, ...) are not here; neither is Ling 2.0's WSM, which holds the
 # peak and merges checkpoints instead of decaying.
 
-# --- Steps and chained phases -----------------------------------------------------
+# --- Steps and chained pieces -----------------------------------------------------
 
 # DeepSeek LLM (2024): 31.6% of the peak from 80% of the tokens, 10% from 90%.
 deepseek_llm = multistep(warmup=2k, at=[0.8, 0.9], factor=0.316)
@@ -20,44 +20,44 @@ deepseek_v2 = multistep(warmup=2k, at=[0.6, 0.9], factor=0.316)
 # DeepSeek-V3 (2024), 14.8T tokens: the peak to 10T, a cosine to 10% by 14.3T, 10%
 # for 333B, then 7.3e-6 (3.3%) for the last 167B.
 deepseek_v3 = piecewise(warmup=2k,
-                        phases=[phase(until=10 / 14.8),
-                                phase(until=14.3 / 14.8, to=0.1, shape=cosine),
-                                phase(until=14.633 / 14.8),
-                                phase(to=0.033)])
+                        pieces=[piece(until=10 / 14.8),
+                                piece(until=14.3 / 14.8, to=0.1, shape=cosine),
+                                piece(until=14.633 / 14.8),
+                                piece(to=0.033)])
 # DeepSeek-V4.1-Flash (2026), 45T tokens: the peak to 28T, a cosine to 10% by 40T,
 # held to the end.
 deepseek_v4_1 = piecewise(warmup=2k,
-                          phases=[phase(until=28 / 45),
-                                  phase(until=40 / 45, to=0.1, shape=cosine),
-                                  phase()])
+                          pieces=[piece(until=28 / 45),
+                                  piece(until=40 / 45, to=0.1, shape=cosine),
+                                  piece()])
 # MiniMax-Text-01 (2025), 11.4T tokens: the peak for 7.2T, cut to 65% for 3.2T after
 # its gradient norms spiked, then an exponential decay to 15% over the last 1T,
 # here one by the same factor every step.
 minimax_text_01 = piecewise(warmup=500,
-                            phases=[phase(until=7.2 / 11.4),
-                                    phase(until=10.4 / 11.4, to=0.65),
-                                    phase(to=0.15, shape=geometric)])
+                            pieces=[piece(until=7.2 / 11.4),
+                                    piece(until=10.4 / 11.4, to=0.65),
+                                    piece(to=0.15, shape=geometric)])
 # MiMo-7B (2025), 23.7T tokens over its three stages: the peak for 10.2T, a cosine to
 # 28% over 7.5T, held for 5.5T, then a cosine to 9.3% over the last 500B. Its warmup
 # is 84B tokens.
 mimo_7b = piecewise(warmup=84 / 23.7e3,
-                    phases=[phase(until=10.2 / 23.7),
-                            phase(until=17.7 / 23.7, to=0.28, shape=cosine),
-                            phase(until=23.2 / 23.7),
-                            phase(to=0.093, shape=cosine)])
+                    pieces=[piece(until=10.2 / 23.7),
+                            piece(until=17.7 / 23.7, to=0.28, shape=cosine),
+                            piece(until=23.2 / 23.7),
+                            piece(to=0.093, shape=cosine)])
 # MiMo-V2-Flash (2026), 27T tokens: the peak to 12T, then cosines to 31% by 22T, 9.4%
 # by 26T and 3.1% at the end, the last through its long-context stage. Its warmup is
 # 50B tokens.
 mimo_v2_flash = piecewise(warmup=50 / 27e3,
-                          phases=[phase(until=12 / 27),
-                                  phase(until=22 / 27, to=0.3125, shape=cosine),
-                                  phase(until=26 / 27, to=0.094, shape=cosine),
-                                  phase(to=0.031, shape=cosine)])
+                          pieces=[piece(until=12 / 27),
+                                  piece(until=22 / 27, to=0.3125, shape=cosine),
+                                  piece(until=26 / 27, to=0.094, shape=cosine),
+                                  piece(to=0.031, shape=cosine)])
 # GLM-5 (2026), through mid-training: a cosine to 20% over its 28.5T tokens of
 # pretraining, then down to 5% linearly over 1.55T of mid-training. The report gives
 # no warmup length.
-glm_5 = piecewise(phases=[phase(until=28.5 / 30.05, to=0.2, shape=cosine),
-                          phase(to=0.05, shape=linear)])
+glm_5 = piecewise(pieces=[piece(until=28.5 / 30.05, to=0.2, shape=cosine),
+                          piece(to=0.05, shape=linear)])
 
 # --- Cosines ----------------------------------------------------------------------
 

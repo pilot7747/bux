@@ -126,7 +126,7 @@ of steps, or below 1 a share of them: `warmup=0.01` is 1% of the steps.
 | {bux}`linear_decay` | `warmup=0`, `final=0` | a linear decay to `final` times the peak at the last step |
 | {bux}`multistep` | `warmup=0`, `at=[0.8, 0.9]`, `factor=0.316` | the peak, times `factor` from each share of the steps in `at` on |
 | {bux}`power` | `warmup=0`, `a=4`, `b=-0.51`, `decay=0.1`, `final=0`, `shape=exp` | a power law in the tokens trained, capped at the peak, then a cooldown |
-| {bux}`piecewise` | `warmup=0`, `phases` | {bux}`phase` after phase: holds, decays, drops and re-warmups |
+| {bux}`piecewise` | `warmup=0`, `pieces` | {bux}`piece` after piece: holds, decays, drops and re-warmups |
 
 ### The curves exactly
 
@@ -181,26 +181,26 @@ under µP. The warmup rises to `p(W - 1)` and holds `p` there; over the last
 `C = round(decay · S)` steps, the cooldown goes from `p(S - C - 1)` to `final` times
 it, as `wsd`'s goes from the peak.
 
-**Piecewise.** Phase `k` takes the steps from `b` to `e = round(until · S)`, where the
-first phase starts at `W` and every other where the one before ends. It goes from
-the multiplier `m` the phase before ended at (the peak, for the first) to its `to`
+**Piecewise.** Piece `k` takes the steps from `b` to `e = round(until · S)`, where the
+first piece starts at `W` and every other where the one before ends. It goes from
+the multiplier `m` the piece before ended at (the peak, for the first) to its `to`
 (or stays at `m` with `to=none`) along its `shape`: `to + (m - to) · f(t)`, with
 `t = clip((s + 1 - b) / (e - b), 0, 1)`, and `m · (to / m)^t` for `geometric`. A
-phase's default `shape=constant` is at `to` from its first step. DeepSeek-V3 holds
+piece's default `shape=constant` is at `to` from its first step. DeepSeek-V3 holds
 the peak to 10T of its 14.8T tokens, decays along a cosine to 10% by 14.3T, holds
 that to 14.633T and drops to 3.3% for the rest:
 
 ```bux
-schedule = piecewise(warmup=2k, phases=[phase(until=10 / 14.8),
-                                        phase(until=14.3 / 14.8, to=0.1, shape=cosine),
-                                        phase(until=14.633 / 14.8),
-                                        phase(to=0.033)])
+schedule = piecewise(warmup=2k, pieces=[piece(until=10 / 14.8),
+                                        piece(until=14.3 / 14.8, to=0.1, shape=cosine),
+                                        piece(until=14.633 / 14.8),
+                                        piece(to=0.033)])
 ```
 
 :::{note}
 The warmup and the cooldown must fit in the steps: `bux check` fails a run whose
 warmup and cooldown, `round(decay · steps)` for `wsd` and `power`, take more than
-`steps`, and a `piecewise` whose warmup ends after its first phase, at the line of
+`steps`, and a `piecewise` whose warmup ends after its first piece, at the line of
 the schedule ([Checks](settings.md#checks)).
 :::
 
@@ -230,8 +230,8 @@ the shape. As of October 2026, the reports use these shapes:
 | Linear from the warmup | Straight to zero (D2Z), OLMo's mid-training, Phi-4 (its end not given) | `linear_decay(warmup=0.1)` |
 | Steps of 0.316 | DeepSeek LLM, DeepSeek-V2 | `multistep(warmup=2k, at=[0.6, 0.9])` |
 | A power law in tokens | PowerLM, Granite 3.0 and 4.0 | `power(decay=0.1)` |
-| Chained phases | DeepSeek-V3 and V4.1, MiMo-7B and V2-Flash, MiniMax-Text-01, GLM-5 | `piecewise(phases=[...])` |
-| A re-warmup | Moonlight, Marin 8B, Trinity's context extension | a rising `phase(to=0.24, shape=linear)` |
+| Chained phases | DeepSeek-V3 and V4.1, MiMo-7B and V2-Flash, MiniMax-Text-01, GLM-5 | `piecewise(pieces=[...])` |
+| A re-warmup | Moonlight, Marin 8B, Trinity's context extension | a rising `piece(to=0.24, shape=linear)` |
 
 Moonlight's, whose re-warmup is 100 steps long, is written in a run that knows its
 steps:
@@ -239,14 +239,14 @@ steps:
 ```bux
 # A cosine to 10% by 5.2T of 5.7T tokens, back up to 24% in 100 steps, then
 # linearly to 0.
-schedule = piecewise(warmup=2k, phases=[phase(until=5.2 / 5.7, to=0.1, shape=cosine),
-                                        phase(until=5.2 / 5.7 + 100 / steps, to=0.238,
+schedule = piecewise(warmup=2k, pieces=[piece(until=5.2 / 5.7, to=0.1, shape=cosine),
+                                        piece(until=5.2 / 5.7 + 100 / steps, to=0.238,
                                               shape=linear),
-                                        phase(to=0, shape=linear)])
+                                        piece(to=0, shape=linear)])
 ```
 
 Not in bux: Ling 2.0's WSM, which holds the peak and merges checkpoints instead of
-decaying; WSD-S's repeated cooldowns, which are as many phases; Zamba's exponential
+decaying; WSD-S's repeated cooldowns, which are as many pieces; Zamba's exponential
 anneal, whose time constant differs from `exp`'s; and modded-nanogpt's multipliers
 that step with its batch size. A long-context stage at the final learning rate is a
 run of its own at `constant`. Qwen3, Gemma 3 and 4, gpt-oss, Llama 4, Jamba, Kimi

@@ -108,7 +108,7 @@ def test_an_architecture_alone_is_not_a_run():
         ("schedule = wsd(warmup=90)", "the schedule takes 110 steps (90 of warmup"),
         ("schedule = power(warmup=0.95)", "takes 105 steps (95 of warmup and 10 of"),
         (
-            "schedule = piecewise(warmup=50, phases=[phase(until=0.4), phase()])",
+            "schedule = piecewise(warmup=50, pieces=[piece(until=0.4), piece()])",
             "the schedule takes 110 steps (50 of warmup and 60 of cooldown)",
         ),
     ],
@@ -122,14 +122,14 @@ def test_a_bare_name_a_setting_takes_is_that_string():
     """cosine is a schedule, and one of the shapes wsd's cooldown takes."""
     [run] = runs(RUN + "schedule = wsd(shape=cosine)")
     assert run.train.schedule == tcfg.WSDSchedule(shape="cosine")
-    [run] = runs(RUN + "schedule = piecewise(phases=[phase(to=0.5, shape=constant),])")
+    [run] = runs(RUN + "schedule = piecewise(pieces=[piece(to=0.5, shape=constant),])")
     assert isinstance(schedule := run.train.schedule, tcfg.PiecewiseSchedule)
-    assert schedule.phases == (tcfg.Phase(to=0.5, shape="constant"),)
+    assert schedule.pieces == (tcfg.Piece(to=0.5, shape="constant"),)
 
 
 def test_a_list_of_one_config_without_its_comma_says_how_to_write_it():
-    text = error(RUN + "schedule = piecewise(phases=[phase()])")
-    assert "[...] is a residual branch, and phase(...) is no layer" in text
+    text = error(RUN + "schedule = piecewise(pieces=[piece()])")
+    assert "[...] is a residual branch, and piece(...) is no layer" in text
     assert "a list of one is written with a comma: [x,]" in text
 
 

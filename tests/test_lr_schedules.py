@@ -90,45 +90,45 @@ def test_power_follows_the_batch_and_tokens_then_cools_down():
     assert found[6] == 1 and found[8] < 1 and found[-1] == 0
 
 
-def test_piecewise_holds_decays_and_drops_from_phase_to_phase():
+def test_piecewise_holds_decays_and_drops_from_piece_to_piece():
     """DeepSeek-V3's shape, small: the peak, a cosine to 0.1, then 0.05 at once."""
     c = tcfg.PiecewiseSchedule(
         warmup=2,
-        phases=(
-            tcfg.Phase(until=0.4),
-            tcfg.Phase(until=0.8, to=0.1, shape="cosine"),
-            tcfg.Phase(to=0.05),
+        pieces=(
+            tcfg.Piece(until=0.4),
+            tcfg.Piece(until=0.8, to=0.1, shape="cosine"),
+            tcfg.Piece(to=0.05),
         ),
     )
     cosine = [0.1 + 0.9 * 0.5 * (1 + math.cos(math.pi * t / 4)) for t in (1, 2, 3, 4)]
     assert values(c, 10) == [0.5, 1, 1, 1, *(round(m, 4) for m in cosine), 0.05, 0.05]
 
 
-def test_a_phase_can_warm_up_again():
-    phases = (tcfg.Phase(until=0.5, to=0.2), tcfg.Phase(to=0.6, shape="linear"))
-    found = values(tcfg.PiecewiseSchedule(phases=phases), 8)
+def test_a_piece_can_warm_up_again():
+    pieces = (tcfg.Piece(until=0.5, to=0.2), tcfg.Piece(to=0.6, shape="linear"))
+    found = values(tcfg.PiecewiseSchedule(pieces=pieces), 8)
     assert found == [0.2, 0.2, 0.2, 0.2, 0.3, 0.4, 0.5, 0.6]
 
 
 @pytest.mark.parametrize(
     ("make", "message"),
     [
-        (lambda: tcfg.Phase(until=1.5), "less than or equal to 1"),
+        (lambda: tcfg.Piece(until=1.5), "less than or equal to 1"),
         (
-            lambda: tcfg.PiecewiseSchedule(phases=(tcfg.Phase(until=0.5),)),
-            "the last phase ends at 1",
+            lambda: tcfg.PiecewiseSchedule(pieces=(tcfg.Piece(until=0.5),)),
+            "the last piece ends at 1",
         ),
         (
             lambda: tcfg.PiecewiseSchedule(
-                phases=(tcfg.Phase(until=0.6), tcfg.Phase(until=0.4), tcfg.Phase())
+                pieces=(tcfg.Piece(until=0.6), tcfg.Piece(until=0.4), tcfg.Piece())
             ),
             "the shares of the steps must increase",
         ),
         (
             lambda: tcfg.PiecewiseSchedule(
-                phases=(
-                    tcfg.Phase(until=0.5, to=0),
-                    tcfg.Phase(to=0.1, shape="geometric"),
+                pieces=(
+                    tcfg.Piece(until=0.5, to=0),
+                    tcfg.Piece(to=0.1, shape="geometric"),
                 )
             ),
             "starts and ends above 0",

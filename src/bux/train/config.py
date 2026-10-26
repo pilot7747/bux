@@ -277,7 +277,7 @@ OptimizerConfig = Annotated[AdamWConfig | MuonConfig, Field(discriminator="type"
 # Steps of warmup, or below 1 a share of the steps, rounded to a number of them.
 Warmup = int | Annotated[float, Field(gt=0, lt=1)]
 
-# How a cooldown or a phase goes from where it starts to where it ends: sqrt is
+# How a cooldown or a piece goes from where it starts to where it ends: sqrt is
 # 1 - sqrt(t) (Hägele et al., 2024); exp falls by e over it, moved to end where it
 # should (IBM's); geometric by the same factor every step (MiniCPM's), so it starts
 # and ends above 0; and constant is at its end from its first step.
@@ -292,7 +292,7 @@ def _increasing(shares: tuple[float, ...]) -> tuple[float, ...]:
 
 def _above_zero(shape: Shape, *ends: float) -> None:
     if shape == "geometric" and min(ends) <= 0:
-        raise ValueError("a geometric cooldown or phase starts and ends above 0")
+        raise ValueError("a geometric cooldown or piece starts and ends above 0")
 
 
 class ConstantSchedule(Config):
@@ -384,54 +384,54 @@ class PowerSchedule(Config):
         return round(self.decay * steps)
 
 
-class Phase(Config):
-    """A phase of a `piecewise` schedule: from the multiplier the phase before ends
+class Piece(Config):
+    """A piece of a `piecewise` schedule: from the multiplier the piece before ends
     at, the peak for the first, to `to`, along `shape`, until `until` of the
     steps."""
 
-    type: Literal["phase"] = "phase"
+    type: Literal["piece"] = "piece"
     until: Fraction = 1.0  # the share of the steps it ends at, rounded to a step
     to: float | None = None  # the multiplier it ends at; none holds where it starts
     shape: Shape = "constant"  # how it gets there; constant is there at once
 
 
-def _in_order(phases: tuple[Phase, ...]) -> tuple[Phase, ...]:
-    if not phases or phases[-1].until != 1:
-        raise ValueError("the last phase ends at 1, the end of the run")
-    _increasing(tuple(p.until for p in phases))
-    for p, start in zip(phases, levels(phases), strict=False):
+def _in_order(pieces: tuple[Piece, ...]) -> tuple[Piece, ...]:
+    if not pieces or pieces[-1].until != 1:
+        raise ValueError("the last piece ends at 1, the end of the run")
+    _increasing(tuple(p.until for p in pieces))
+    for p, start in zip(pieces, levels(pieces), strict=False):
         _above_zero(p.shape, start, start if p.to is None else p.to)
-    return phases
+    return pieces
 
 
-def levels(phases: tuple[Phase, ...]) -> list[float]:
-    """Return the multiplier each phase starts at, then the one the last ends at."""
+def levels(pieces: tuple[Piece, ...]) -> list[float]:
+    """Return the multiplier each piece starts at, then the one the last ends at."""
     found = [1.0]
-    for p in phases:
+    for p in pieces:
         found.append(found[-1] if p.to is None else p.to)
     return found
 
 
 class PiecewiseSchedule(Config):
-    """Warmup, then `phases`, one after the other from the end of the warmup: holds,
+    """Warmup, then `pieces`, one after the other from the end of the warmup: holds,
     decays, drops and re-warmups, as tech reports chain them. DeepSeek-V3's holds
     the peak to 10T of its 14.8T tokens, decays along a cosine to 10% of it by
     14.3T, holds that to 14.633T, and drops to 3.3% for the rest::
 
-        piecewise(warmup=2k, phases=[phase(until=10 / 14.8),
-                                     phase(until=14.3 / 14.8, to=0.1, shape=cosine),
-                                     phase(until=14.633 / 14.8),
-                                     phase(to=0.033)])
+        piecewise(warmup=2k, pieces=[piece(until=10 / 14.8),
+                                     piece(until=14.3 / 14.8, to=0.1, shape=cosine),
+                                     piece(until=14.633 / 14.8),
+                                     piece(to=0.033)])
     """
 
     type: Literal["piecewise"] = "piecewise"
     warmup: Warmup = 0  # steps of linear warmup, or a share of them below 1
-    # The phases in order, each ending later than the one before; the last at 1.
-    phases: Annotated[tuple[Phase, ...], AfterValidator(_in_order)]
+    # The pieces in order, each ending later than the one before; the last at 1.
+    pieces: Annotated[tuple[Piece, ...], AfterValidator(_in_order)]
 
     def cooldown(self, steps: int) -> int:
-        """Return the steps after the first phase, in a run of `steps`."""
-        return steps - round(self.phases[0].until * steps)
+        """Return the steps after the first piece, in a run of `steps`."""
+        return steps - round(self.pieces[0].until * steps)
 
 
 ScheduleConfig = Annotated[
@@ -942,7 +942,7 @@ Setting = Annotated[
     | MultiStepSchedule
     | PowerSchedule
     | PiecewiseSchedule
-    | Phase
+    | Piece
     | LossConfig
     | EvalConfig
     | CheckpointConfig

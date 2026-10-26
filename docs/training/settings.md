@@ -162,8 +162,8 @@ Some fields check their values further:
 | `switch.at` of `precision` | strictly between 0 and 1 |
 | `decay` of `wsd` and `power` | between 0 and 1 |
 | `warmup` of a schedule | a count of steps, or a share of them between 0 and 1 |
-| `phases` of `piecewise` | each ending later than the one before, the last at 1 |
-| `shape=geometric` | a cooldown or phase that starts and ends above 0 |
+| `pieces` of `piecewise` | each ending later than the one before, the last at 1 |
+| `shape=geometric` | a cooldown or piece that starts and ends above 0 |
 
 ```console
 $ bux check examples/experiments/smoke.bux 'precision = precision(matmuls=nvfp4, roles=roles(experts=nvfp4))'
@@ -177,7 +177,7 @@ error: roles: experts: Value error, the routed experts multiply in compute, mxfp
 ### Settings that must fit together
 
 The warmup and the cooldown fit in the steps: the cooldown of `wsd` and `power`, and
-the phases of `piecewise` after its first, which starts at the warmup's end. The
+the pieces of `piecewise` after its first, which starts at the warmup's end. The
 error points into the module that wrote the schedule:
 
 ```console

@@ -109,7 +109,7 @@ def lr_schedule(lr: float, multiplier: Schedule) -> Schedule:
     return lambda step: lr * multiplier(step)
 
 
-#: The curves of a cooldown or a phase by its ``shape``, from 1 at t = 0 to 0 at
+#: The curves of a cooldown or a piece by its ``shape``, from 1 at t = 0 to 0 at
 #: t = 1. ``exp`` is IBM's: an exponential that falls by e over the cooldown, moved
 #: to end at 0. ``geometric`` is not one of them: it depends on where it ends.
 SHAPES: dict[str, Callable[[Float[Array, ""]], Float[Array, ""]]] = {
@@ -204,17 +204,17 @@ def _(c: tcfg.PowerSchedule, train: tcfg.TrainConfig) -> Schedule:
 
 @schedules.register("piecewise")
 def _(c: tcfg.PiecewiseSchedule, train: tcfg.TrainConfig) -> Schedule:
-    """Its phases one after the other from the end of the warmup, each from where the
+    """Its pieces one after the other from the end of the warmup, each from where the
     one before ends, the first from the peak, to its `to` along its `shape`."""
-    ends = [round(p.until * train.steps) for p in c.phases]
+    ends = [round(p.until * train.steps) for p in c.pieces]
     starts = [tcfg.warmup_steps(c, train.steps), *ends[:-1]]
-    values = tcfg.levels(c.phases)
+    values = tcfg.levels(c.pieces)
 
     def curve(step: Real[ArrayLike, ""]) -> Float[Array, ""]:
         step = jnp.asarray(step, jnp.float32)
         each = [
             _toward(values[k], values[k + 1], p.shape, _through(step, b, e - b))
-            for k, (p, b, e) in enumerate(zip(c.phases, starts, ends, strict=True))
+            for k, (p, b, e) in enumerate(zip(c.pieces, starts, ends, strict=True))
         ]
         found = each[0]
         for b, value in zip(starts[1:], each[1:], strict=True):
