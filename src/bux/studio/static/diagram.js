@@ -58,8 +58,8 @@ export class Diagram {
     this.drawHeader(ink);
     this.content.innerHTML = ink.svg();
     this.ink = ink;
-    if (!this.fitted) this.fit();
-    this.fitted = true;
+    this.tap = null;
+    this.fitted ||= this.fit();
     this.paint();
     this.renderMs = performance.now() - start;
   }
@@ -76,13 +76,14 @@ export class Diagram {
     this.el.classList.toggle("dg-dim", !!dim);
   }
 
-  /** Fits the whole figure in view. */
+  /** Fits the whole figure in view; false while the diagram has no size. */
   fit(animate = false) {
-    if (!this.ink) return;
-    const b = this.ink.bounds();
     const { width, height } = this.el.getBoundingClientRect();
+    if (!this.ink || !width || !height) return false;
+    const b = this.ink.bounds();
     const k = clamp(Math.min((width - 2 * ZOOM.pad) / b.w, (height - 2 * ZOOM.pad) / b.h), ZOOM.min, ZOOM.fit);
     this.moveTo({ k, x: (width - b.w * k) / 2 - b.x * k, y: (height - b.h * k) / 2 - b.y * k }, animate);
+    return true;
   }
 
   /** A standalone SVG of the figure, styles inlined, without the editing marks. */
@@ -99,6 +100,11 @@ export class Diagram {
     return `<svg xmlns="${SVG_NS}" width="${w}" height="${h}" viewBox="${x} ${y} ${w} ${h}">${rect}${clone.innerHTML}</svg>`;
   }
 
+  /** The exported SVG as a PNG Blob, `scale` pixels per unit. */
+  exportPNG(scale = 2) {
+    return rasterize(this.exportSVG(), scale);
+  }
+
   /** Facts for the header card beyond the model's own: {params: "8.03B",
       context: "8,192"}, or any other name -> value; null removes one. */
   setFacts(facts) {
@@ -109,10 +115,11 @@ export class Diagram {
     if (this.model) this.render(this.model);
   }
 
-  /** Opens or closes the block `key` ("D#0": its label, then which occurrence). */
-  setOpen(key, open = !this.plan?.open.get(key)) {
+  /** Opens or closes the block `key` ("D#0": its label, then which occurrence),
+      keeping `anchor` (a node id) where it is on screen. */
+  setOpen(key, open = !this.plan?.open.get(key), anchor = this.selected) {
     this.folds.keys.set(key, open);
-    this.rerender();
+    this.rerender(anchor);
   }
 
   expandAll() {
@@ -292,18 +299,23 @@ export class Diagram {
     svg.addEventListener("pointerdown", (e) => this.down(e));
     svg.addEventListener("pointermove", (e) => this.drag(e));
     svg.addEventListener("pointerup", (e) => this.up(e));
+    svg.addEventListener("pointercancel", (e) => this.up(e));
     svg.addEventListener("click", (e) => this.click(e));
     svg.addEventListener("dblclick", (e) => this.dblclick(e));
     svg.addEventListener("pointerover", (e) => this.over(e));
     svg.addEventListener("pointerleave", () => this.hoverLater(null));
     this.el.addEventListener("wheel", (e) => this.wheel(e), { passive: false });
     this.el.addEventListener("keydown", (e) => this.key(e));
-    new ResizeObserver(() => this.ui.toolbar.place()).observe(this.el);
+    new ResizeObserver(() => {
+      this.fitted ||= this.fit();
+      this.ui.toolbar.place();
+    }).observe(this.el);
   }
 
   down(e) {
     if (e.button !== 0) return;
     this.el.focus({ preventScroll: true });
+    this.panned = false;
     this.press = { x: e.clientX, y: e.clientY, view: { ...this.view }, id: e.pointerId, panning: false };
   }
 
@@ -335,15 +347,16 @@ export class Diagram {
     const zoom = t.closest("[data-zoom]");
     if (zoom) return this.setInternals(zoom.dataset.zoom);
     const toggle = t.closest("[data-toggle]");
-    if (toggle) return this.setOpen(toggle.dataset.toggle);
-    this.choose(t.closest("[data-id]")?.dataset.id ?? null);
+    const id = t.closest("[data-panel]")?.dataset.panel ?? t.closest("[data-id]")?.dataset.id ?? null;
+    if (toggle) return this.setOpen(toggle.dataset.toggle, undefined, id);
+    this.choose(id);
   }
 
   dblclick(e) {
     const repeat = e.target.closest("[data-repeat]");
     if (repeat) return this.ui.count.open(repeat, repeat.dataset.repeat);
     const card = e.target.closest("[data-key]");
-    if (card) this.setOpen(card.dataset.key, true);
+    if (card) this.setOpen(card.dataset.key, true, card.dataset.id);
   }
 
   /** A selection by the user: drawn, and reported. */
@@ -354,7 +367,7 @@ export class Diagram {
 
   over(e) {
     this.hotTap(e.target.closest("[data-tap]")?.dataset.tap ?? null);
-    const id = e.target.closest("[data-id]")?.dataset.id ?? null;
+    const id = e.target.closest("[data-panel]")?.dataset.panel ?? e.target.closest("[data-id]")?.dataset.id;
     if (id) this.hover(id);
     else this.hoverLater(null);
   }

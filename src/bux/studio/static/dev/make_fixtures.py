@@ -13,6 +13,7 @@ import json
 import re
 import subprocess
 import sys
+import tempfile
 from collections import Counter
 from collections.abc import Iterator
 from itertools import count
@@ -38,6 +39,17 @@ FIXTURES = {
     "qwen3_8_flash_next": "qwen/qwen3.8_flash_next.bux",
     "nemotron_super": "nemotron/nemotron_3_super_120b_a12b.bux",
 }
+# Shapes no example has: a weighted skip, a scaled branch less a tap, a negation.
+ODD = """
+d_model    = 64
+vocab_size = 100
+norm = rmsnorm
+attn = gqa(num_heads=4, num_kv_heads=4)
+ffn  = mlp(intermediate_size=256, activation=gelu)
+deep = (_ * 2.0 + attn) norm
+gate = [norm (ffn * 0.5 - $x0)]
+model = embed @x0 deep gate [-attn] (norm ffn)^2 norm head
+"""
 
 CATEGORY = {
     "embed": "io", "head": "io", "nextn": "io",
@@ -299,14 +311,19 @@ def compile_json(path: Path) -> Json:
     return json.loads(subprocess.run(command, capture_output=True, check=True).stdout)
 
 
+def write(name: str, data: Json) -> None:
+    (HERE / f"model-{name}.json").write_text(json.dumps(data, indent=1) + "\n")
+    print(f"model-{name}.json")
+
+
 def main() -> None:
     HERE.mkdir(exist_ok=True)
     for name, file in FIXTURES.items():
-        data = model(
-            re.sub(r"\.bux$", "", Path(file).name), compile_json(EXAMPLES / file)
-        )
-        (HERE / f"model-{name}.json").write_text(json.dumps(data, indent=1) + "\n")
-        print(f"model-{name}.json")
+        stem = re.sub(r"\.bux$", "", Path(file).name)
+        write(name, model(stem, compile_json(EXAMPLES / file)))
+    with tempfile.TemporaryDirectory() as tmp:
+        (Path(tmp) / "odd.bux").write_text(ODD)
+        write("odd", model("odd", compile_json(Path(tmp) / "odd.bux")))
 
 
 if __name__ == "__main__":

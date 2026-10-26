@@ -31,11 +31,11 @@
 /* URL parameters, so that a headless screenshot can show any state:
    fixture=llama3_8b   theme=dark   bare=1 (no bar)   dim=1   facts=1
    select=n.1.0.0.0.1   hover=ID (its toolbar)   fold=open|closed   open=D#1,F#2   close=D#0
-   zoom=ID,ID (internals)   palette=ID (the insert palette)   view=k,x,y   center=ID&k=1   bench=1 */
+   zoom=ID,ID (internals)   palette=ID (the insert palette)   view=k,x,y   center=ID&k=1   bench=1   checks=1   export=1 (the exported SVG, as an image) */
 import { Diagram } from "../diagram.js";
 
 const FIXTURES = ["llama3_8b", "qwen3_next", "hymba", "mhc", "deepseek_v3", "gpt2", "ngpt",
-                  "modded_nanogpt", "primitives", "resformer", "zamba2", "qwen3_8_flash_next", "nemotron_super"];
+                  "modded_nanogpt", "primitives", "resformer", "zamba2", "qwen3_8_flash_next", "nemotron_super", "odd"];
 const PALETTE = [
   ["rmsnorm", "norm", "RMSNorm", "rmsnorm"], ["layernorm", "norm", "LayerNorm", "layernorm"],
   ["gqa", "attention", "Grouped-query attention", "gqa(num_heads=8, num_kv_heads=2, rope=rope())"],
@@ -93,6 +93,16 @@ function center(id, k) {
   diagram.applyView({ k, x: width / 2 - (r.x + r.w / 2) * k, y: height / 2 - (r.y + r.h / 2) * k });
 }
 if (q.get("checks")) (await import("./diagram-checks.js")).runChecks(diagram, model);
+if (q.get("export")) showExport(diagram.exportSVG());
+
+/** Replaces the page by the exported SVG as an image: it must stand alone. */
+function showExport(svg) {
+  const img = new Image();
+  img.src = `data:image/svg+xml;charset=utf-8,${encodeURIComponent(svg)}`;
+  img.style.cssText = "max-width: 100%; max-height: 100%; display: block; margin: auto";
+  document.body.replaceChildren(img);
+  document.body.style.background = "#888";
+}
 if (q.get("bench")) {
   const times = [];
   for (let i = 0; i < 20; i++) { diagram.render(model); times.push(diagram.renderMs); }

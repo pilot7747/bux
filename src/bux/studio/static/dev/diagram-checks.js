@@ -118,6 +118,14 @@ const CHECKS = {
     const ok = !doc.querySelector("parsererror") && svg.includes("Grouped-query attention");
     return ok && !/data-|class=|var\(--/.test(svg) && !svg.includes("dg-zoom");
   },
+  "png export": async () => {
+    const png = await diagram.exportPNG(1);
+    return png?.type === "image/png" && png.size > 10000;
+  },
+  "odd graphs render": () => {
+    for (const graph of ODD) diagram.render({ name: "odd", facts: {}, graph });
+    return diagram.content.querySelectorAll(".dg-box").length > 0;
+  },
   "hovering a tap lights its namesakes": async () => {
     const model = await (await fetch("fixtures/model-qwen3_next.json")).json();
     diagram.folds = { mode: null, keys: new Map() };
@@ -134,6 +142,16 @@ const CHECKS = {
     return diagram.drawnId("n.5.2.1.0.1") === "n.5.2";
   },
 };
+
+const L = (id, type, extra = {}) => ({ id, kind: "layer", label: null, type, editable: true, ...extra });
+const ODD = [
+  L("n", "gqa"),
+  { id: "n", kind: "seq", items: [L("n.0", "rmsnorm"), { id: "n.1", kind: "identity" }] },
+  { id: "n", kind: "sum", terms: [{ id: "n.0", kind: "const", value: 1 }, L("n.1", "mlp"), { id: "n.2", kind: "neg", body: { id: "n.2.0", kind: "ref", name: "h" } }] },
+  { id: "n", kind: "prod", factors: [{ id: "n.0", kind: "identity" }, { id: "n.1", kind: "const", value: 0.5 }] },
+  { id: "n", kind: "seq", items: [L("n.0", "head"), L("n.1", "mlp"), { id: "n.2", kind: "repeat", times: 2, body: { id: "n.2.0", kind: "tap", name: "x" } }] },
+  { id: "n", kind: "seq", label: "model", items: [{ id: "n.0", kind: "residual", body: { id: "n.0.0", kind: "seq", label: "b", items: [L("n.0.0.0", "gqa")] } }] },
+];
 
 export async function runChecks(d, model) {
   diagram = d;

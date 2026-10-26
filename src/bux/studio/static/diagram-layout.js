@@ -195,7 +195,7 @@ function cardText(node, times) {
   const label = node.label;
   const count = times > 1 ? `×${times}` : "";
   const head = 14 + measure(label, FONT.card) + (count ? 6 + measure(count, FONT.times) : 0);
-  const about = summary(node);
+  const about = node.shared ? `shared · ${summary(node)}` : summary(node);
   const inner = Math.max(head, measure(about, FONT.chip));
   const h = 2 * G.box.padY + G.box.title + (about ? G.box.meta : 0);
   return { label, count, about, w: Math.max(G.box.minW, inner + 2 * G.box.padX), h };
@@ -210,7 +210,7 @@ function portTags(node) {
   });
 }
 
-const fmt = (value) => (Number.isInteger(value) ? value.toFixed(1) : String(value));
+const fmt = (value) => String(value);
 
 // ---------------------------------------------------------------- planning
 
@@ -247,8 +247,10 @@ class Planner {
     const c = { col: this.ns, wide: false, depth: 0 };
     const top = graph.kind === "seq" ? this.seq(graph.items, c) : this.chain([this.inner(graph, c)]);
     const segs = top.t === "cols" ? top.segs : [top];
-    if (segs[0].fed) segs[0].items.unshift(pill(firstIsEmbed(graph) ? "Tokens" : "Input"));
+    const tokens = firstIsEmbed(graph);
+    if (segs[0].fed) segs[0].items.unshift(pill(tokens ? "Tokens" : "Input"));
     for (const seg of segs) if (endsInHead(seg)) seg.items.push(pill("Logits"));
+    if (!tokens && !endsInHead(segs.at(-1))) segs.at(-1).items.push(pill("Output"));
     return top;
   }
 
@@ -297,7 +299,8 @@ class Planner {
   /** A column of frames; one that ignores its input starts a column of its own. */
   chain(frames) {
     const segs = [];
-    for (const f of frames) {
+    const solid = frames.filter((f) => f.t !== "wire");
+    for (const f of solid.length ? solid : frames.slice(0, 1)) {
       if (!segs.length || (!f.fed && segs.at(-1).length)) segs.push([]);
       segs.at(-1).push(f);
     }
@@ -351,12 +354,15 @@ class Planner {
     const text = cardText(node, times);
     this.widen(c.col, text.w);
     const out = { wideIn: c.wide, wideOut: this.wideAfter(node, c.wide) };
-    return { t: "card", node, repeat, key, times, text, col: c.col, fed: !startsWithRef(node), ...out };
+    const ports = [...new Map([...layers(node)].flatMap(portTags).map((p) => [p.text, p])).values()];
+    return { t: "card", node, repeat, key, times, text, col: c.col, ports, fed: !startsWithRef(node), ...out };
   }
 
+  /** `[f]`; a branch that reads a tap, `[$h f]`, is drawn beside the stream. */
   residual(node, c) {
-    const body = this.build(node.body, { ...c, wide: false });
-    if (!body.fed) return this.branches(node, [wire(false), body], "sum", c);
+    const side = startsWithRef(node.body);
+    const body = this.build(node.body, { ...c, wide: false, col: side ? `${node.id}:1` : c.col });
+    if (side) return this.branches(node, [wire(false), body], "sum", c);
     return { t: "res", node, body, fed: true, ...stream(c.wide) };
   }
 
@@ -558,7 +564,8 @@ function lift(f) {
 
 function sizeCont(f, widths) {
   const body = size(f.body, widths);
-  const captionW = f.caption ? 16 + measure(f.caption, FONT.caption) + 14 : 0;
+  const note = f.node.shared ? 6 + measure("shared", FONT.chip) : 0;
+  const captionW = f.caption ? 16 + measure(f.caption, FONT.caption) + note + 14 : 0;
   const badge = f.times > 1 ? G.cont.badge : G.cont.pad;
   f.padL = Math.max(badge, captionW - body.l);
   f.padT = f.caption ? G.cont.caption : G.cont.pad;

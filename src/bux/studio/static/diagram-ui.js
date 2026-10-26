@@ -67,11 +67,11 @@ export class Toolbar {
     const node = id && this.d.ink?.nodes.get(id);
     if (!node?.editable) {
       this.el.hidden = true;
-      this.id = null;
+      this.id = this.node = null;
       return;
     }
-    if (id !== this.id) this.fill(node);
-    this.id = id;
+    if (node !== this.node) this.fill(node);
+    Object.assign(this, { id, node });
     this.el.hidden = false;
     this.place();
   }
@@ -94,10 +94,10 @@ export class Toolbar {
     if (this.el.hidden || !this.id) return;
     const r = this.d.screenRect(this.id);
     if (!r) return void (this.el.hidden = true);
-    const w = this.el.offsetWidth;
+    const [w, h] = [this.el.offsetWidth, this.el.offsetHeight];
     const small = r.w < 40;
-    const left = small ? r.x + r.w + 6 : r.x + r.w - w;
-    const top = small ? r.y + r.h / 2 - this.el.offsetHeight / 2 : r.y - this.el.offsetHeight - 6;
+    const left = small ? r.x + r.w + 6 : r.x + r.w - w - 6;
+    const top = small ? r.y + r.h / 2 - h / 2 : r.y - h + 6;
     this.el.style.transform = `translate(${Math.round(left)}px, ${Math.round(top)}px)`;
   }
 }

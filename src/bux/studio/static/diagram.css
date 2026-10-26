@@ -76,6 +76,8 @@
 .dg-fill-canvas { fill: var(--canvas); }
 .dg-caption { cursor: pointer; }
 .dg-caption-text { font: 500 11.5px var(--font-mono); fill: var(--text-2); }
+.dg-caption-note { font: 400 11px var(--font-ui); fill: var(--text-3); }
+.dg-zoom-panel .dg-hit { cursor: default; }
 .dg-caption-hit { fill: transparent; }
 .dg-caption:hover .dg-caption-hit, .dg-card-toggle:hover .dg-caption-hit { fill: var(--surface-2); }
 .dg-chevron { fill: none; stroke: var(--text-3); stroke-width: 1.4px; stroke-linecap: round; stroke-linejoin: round; }
@@ -129,7 +131,8 @@
   border-radius: var(--radius-md);
   box-shadow: var(--shadow-md);
 }
-.dg-toolbar { display: flex; gap: 2px; padding: 3px; z-index: 3; }
+.dg-toolbar { display: flex; gap: 1px; padding: 2px; z-index: 3; }
+.dg-toolbar .dg-btn { min-width: 24px; height: 24px; padding: 0 4px; }
 .dg-toolbar[hidden], .dg-palette[hidden], .dg-count[hidden] { display: none; }
 .dg-btn {
   display: inline-flex;
