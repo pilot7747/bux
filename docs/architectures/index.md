@@ -120,7 +120,7 @@ bias.
 :link: model-zoo
 :link-type: doc
 
-51 example architectures, from GPT-2 to 2026's releases, each a file to `use`
+61 example architectures, from GPT-2 to 2026's releases, each a file to `use`
 and shrink.
 :::
 

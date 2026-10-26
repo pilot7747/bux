@@ -1,0 +1,12 @@
+# SmolLM2-1.7B (Hugging Face, 2024): the largest SmolLM2, 24 layers 2048 wide with 32
+# heads of 64, keys and values included, and a RoPE base of 130,000 against the
+# smaller ones' 100,000. The rest is SmolLM2-135M's design.
+d_model    = 2048
+vocab_size = 49152
+
+norm = rmsnorm(eps=1e-5)
+attn = gqa(num_heads=32, num_kv_heads=32, rope=rope(base=130000))
+ffn  = gated_mlp(intermediate_size=8192, activation=swish)
+
+block = [norm attn] [norm ffn]
+model = embed block^24 norm head(tied=true)
