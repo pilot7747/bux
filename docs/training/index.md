@@ -44,20 +44,20 @@ data=synthetic()
 $ bux plan examples/experiments/smoke.bux
 1 run
 id          params  tokens  tok/param  flops/tok  gpus  params/gpu  optim/gpu  bubble  run
-f114ac17ae  156k    25.6k   0.2        984k       1     609KiB      1.19MiB    0%      smoke
+5a4f0f7d85  156k    25.6k   0.2        984k       1     609KiB      1.19MiB    0%      smoke
 $ bux train examples/experiments/smoke.bux
-smoke: runs/smoke-f114ac17ae, on 1 × cpu
+smoke: runs/smoke-5a4f0f7d85, on 1 × cpu
 smoke: 156k parameters, 50 steps × 8 × 64 tokens = 25.6k tokens, adamw(lr=0.003), wsd(warmup=10)
 smoke: log every 10
 remat=auto: none in 1s (none 0.0 GiB in 0s)
-smoke step 10/50  loss 6.6252  lr 3.00e-03  grad 1.614  8,345 tok/s  61 ms/step  data 0.1 ms  compiled in 0.5s  0:00:01 < 0:00:02
-smoke step 20/50  loss 6.5475  lr 3.00e-03  grad 1.038  74,690 tok/s  7 ms/step  data 0.0 ms  0:00:01 < 0:00:00
-smoke step 30/50  loss 6.3513  lr 3.00e-03  grad 0.554  74,647 tok/s  7 ms/step  data 0.0 ms  0:00:01 < 0:00:00
-smoke step 40/50  loss 6.2974  lr 3.00e-03  grad 0.458  76,317 tok/s  7 ms/step  data 0.0 ms  0:00:01 < 0:00:00
-smoke step 50/50  loss 6.2854  lr 0.00e+00  grad 0.395  76,569 tok/s  7 ms/step  data 0.0 ms  0:00:01 < 0:00:00
+smoke step 10/50  loss 6.2429  lr 3.00e-03  grad 0.607  7,844 tok/s  65 ms/step  data 0.1 ms  compiled in 0.5s  0:00:01 < 0:00:03
+smoke step 20/50  loss 6.2618  lr 3.00e-03  grad 0.642  77,133 tok/s  7 ms/step  data 0.0 ms  0:00:01 < 0:00:00
+smoke step 30/50  loss 6.2731  lr 3.00e-03  grad 0.516  77,903 tok/s  7 ms/step  data 0.0 ms  0:00:01 < 0:00:00
+smoke step 40/50  loss 6.2478  lr 3.00e-03  grad 0.440  77,802 tok/s  7 ms/step  data 0.0 ms  0:00:01 < 0:00:00
+smoke step 50/50  loss 6.2633  lr 0.00e+00  grad 0.418  74,244 tok/s  7 ms/step  data 0.0 ms  0:00:01 < 0:00:00
 ```
 
-The run's files are in `runs/smoke-f114ac17ae/`: the run as one file (`run.bux`), its
+The run's files are in `runs/smoke-5a4f0f7d85/`: the run as one file (`run.bux`), its
 IR (`run.json`) and its metrics (`metrics.jsonl`) ([The run
 directory](running.md#the-run-directory)).
 
@@ -92,12 +92,12 @@ budget            = 3B
 $ bux plan examples/experiments/attention_ablation.bux
 6 runs
 id          params  tokens  tok/param  flops/tok  gpus  params/gpu  optim/gpu  bubble  run
-dfa3cc90cb  183M    3B      16.4       1.61B      1     700MiB      1.37GiB    0%      attention_ablation[mha, optimizer.lr=1e-3]
-a7466cc107  183M    3B      16.4       1.61B      1     700MiB      1.37GiB    0%      attention_ablation[mha, optimizer.lr=3e-3]
-213eda14fc  174M    3B      17.2       1.55B      1     664MiB      1.3GiB     0%      attention_ablation[gqa, optimizer.lr=1e-3]
-8ddb04cb25  174M    3B      17.2       1.55B      1     664MiB      1.3GiB     0%      attention_ablation[gqa, optimizer.lr=3e-3]
-14a82152a9  170M    3B      17.6       1.53B      1     650MiB      1.27GiB    0%      attention_ablation[mqa, optimizer.lr=1e-3]
-4beac6f186  170M    3B      17.6       1.53B      1     650MiB      1.27GiB    0%      attention_ablation[mqa, optimizer.lr=3e-3]
+1678540f7c  183M    3B      16.4       1.61B      1     700MiB      1.37GiB    0%      attention_ablation[mha, optimizer.lr=1e-3]
+e1f8a6438d  183M    3B      16.4       1.61B      1     700MiB      1.37GiB    0%      attention_ablation[mha, optimizer.lr=3e-3]
+ab996b07f8  174M    3B      17.2       1.55B      1     664MiB      1.3GiB     0%      attention_ablation[gqa, optimizer.lr=1e-3]
+9ff4aff263  174M    3B      17.2       1.55B      1     664MiB      1.3GiB     0%      attention_ablation[gqa, optimizer.lr=3e-3]
+eb97f05b72  170M    3B      17.6       1.53B      1     650MiB      1.27GiB    0%      attention_ablation[mqa, optimizer.lr=1e-3]
+96becee690  170M    3B      17.6       1.53B      1     650MiB      1.27GiB    0%      attention_ablation[mqa, optimizer.lr=3e-3]
 ```
 
 `bux launch` trains them side by side, a GPU each ([Launching](launching.md)).

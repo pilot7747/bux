@@ -12,14 +12,14 @@ weights and update. Those are the metrics that tell what an architecture does wr
 `bux train examples/experiments/smoke.bux 'observe = observe(every=20)' steps=40`:
 
 ```text
-smoke: runs/smoke-88bbb0e5ca, on 1 × cpu
+smoke: runs/smoke-f3237709a1, on 1 × cpu
 smoke: 156k parameters, 40 steps × 8 × 64 tokens = 20.5k tokens, adamw(lr=0.003), wsd(warmup=10)
 smoke: log every 10, observe every 20
 remat=auto: none in 1s (none 0.0 GiB in 0s)
-smoke step 10/40  loss 6.6252  lr 3.00e-03  grad 1.614  7,971 tok/s  64 ms/step  data 0.1 ms  compiled in 0.6s  0:00:01 < 0:00:02
-smoke step 20/40  loss 6.5475  lr 3.00e-03  grad 1.038  8,307 tok/s  62 ms/step  data 0.0 ms  compiled in 0.6s  0:00:01 < 0:00:01
-smoke step 20/40  observed  rms 0.41-1.63 (ffn.01)  max|x| 3.16-6.46 (ffn.01)  kurtosis 1.06-1.5 (ffn.01)  logit 4.9-4.96 (attn.01)  attn entropy 0.87-0.90 (attn.00)  grad 1.05e-01-5.87e-01 (embed.00)  update/param 2.85e-03-6.84e-03 (embed.00)
-smoke step 30/40  loss 6.3513  lr 3.00e-03  grad 0.554  39,375 tok/s  13 ms/step  data 0.1 ms  0:00:01 < 0:00:00
+smoke step 10/40  loss 6.2429  lr 3.00e-03  grad 0.607  7,894 tok/s  65 ms/step  data 0.1 ms  compiled in 0.5s  0:00:01 < 0:00:02
+smoke step 20/40  loss 6.2618  lr 3.00e-03  grad 0.642  8,412 tok/s  61 ms/step  data 0.0 ms  compiled in 0.6s  0:00:01 < 0:00:01
+smoke step 20/40  observed  rms 0.0266-0.0675 (ffn.01)  max|x| 0.179-0.444 (ffn.01)  kurtosis 1.03-1.44 (attn.01)  logit 0.154-0.176 (attn.00)  attn entropy 1.00-1.00 (attn.00)  grad 1.02e-02-5.44e-01 (embed.00)  update/param 1.61e-03-3.35e-02 (embed.00)
+smoke step 30/40  loss 6.2731  lr 3.00e-03  grad 0.516  78,030 tok/s  7 ms/step  data 0.0 ms  0:00:01 < 0:00:00
 ```
 
 - The first lines say where the run writes, on what, its model and its tokens, and
@@ -197,7 +197,7 @@ config's type ([Sinks](extending.md#sinks)).
 ```python
 import pandas as pd
 
-m = pd.read_json("runs/smoke-88bbb0e5ca/metrics.jsonl", lines=True).set_index("step")
+m = pd.read_json("runs/smoke-f3237709a1/metrics.jsonl", lines=True).set_index("step")
 m["loss"].plot()
 m.filter(like="act/rms/").dropna().T  # the stream's rms by layer, at each observed step
 ```
