@@ -1,0 +1,601 @@
+{
+ "name": "zamba2",
+ "facts": {
+  "d_model": 2048,
+  "vocab_size": 32000,
+  "layers": 109,
+  "residual": null,
+  "init": null,
+  "by_type": [
+   [
+    "rmsnorm",
+    51
+   ],
+   [
+    "mamba2",
+    38
+   ],
+   [
+    "gqa",
+    6
+   ],
+   [
+    "gated_mlp",
+    6
+   ],
+   [
+    "linear",
+    6
+   ],
+   [
+    "embed",
+    1
+   ],
+   [
+    "head",
+    1
+   ]
+  ]
+ },
+ "graph": {
+  "id": "n",
+  "kind": "seq",
+  "label": "model",
+  "shared": false,
+  "span": null,
+  "origin": null,
+  "editable": true,
+  "items": [
+   {
+    "id": "n.0",
+    "kind": "layer",
+    "label": null,
+    "shared": false,
+    "span": null,
+    "origin": null,
+    "editable": true,
+    "type": "embed",
+    "title": "Token embedding",
+    "category": "io",
+    "chips": [],
+    "width": "tokens",
+    "ports": [],
+    "written": [
+     0,
+     6
+    ],
+    "internals": null,
+    "inserted": false
+   },
+   {
+    "id": "n.1",
+    "kind": "repeat",
+    "label": null,
+    "shared": false,
+    "span": null,
+    "origin": null,
+    "editable": true,
+    "body": {
+     "id": "n.1.0",
+     "kind": "seq",
+     "label": null,
+     "shared": false,
+     "span": null,
+     "origin": null,
+     "editable": true,
+     "items": [
+      {
+       "id": "n.1.0.0",
+       "kind": "repeat",
+       "label": null,
+       "shared": false,
+       "span": null,
+       "origin": null,
+       "editable": true,
+       "body": {
+        "id": "n.1.0.0.0",
+        "kind": "residual",
+        "label": "m",
+        "shared": false,
+        "span": null,
+        "origin": null,
+        "editable": true,
+        "body": {
+         "id": "n.1.0.0.0.0",
+         "kind": "seq",
+         "label": null,
+         "shared": false,
+         "span": null,
+         "origin": null,
+         "editable": true,
+         "items": [
+          {
+           "id": "n.1.0.0.0.0.0",
+           "kind": "layer",
+           "label": "norm",
+           "shared": false,
+           "span": null,
+           "origin": null,
+           "editable": true,
+           "type": "rmsnorm",
+           "title": "RMSNorm",
+           "category": "norm",
+           "chips": [],
+           "width": 2048,
+           "ports": [],
+           "written": [
+            10,
+            16
+           ],
+           "internals": null,
+           "inserted": false
+          },
+          {
+           "id": "n.1.0.0.0.0.1",
+           "kind": "layer",
+           "label": "ssm",
+           "shared": false,
+           "span": null,
+           "origin": null,
+           "editable": true,
+           "type": "mamba2",
+           "title": "Mamba-2",
+           "category": "recurrent",
+           "chips": [
+            "state 128"
+           ],
+           "width": 2048,
+           "ports": [],
+           "written": [
+            20,
+            26
+           ],
+           "internals": null,
+           "inserted": false
+          }
+         ]
+        }
+       },
+       "times": 5
+      },
+      {
+       "id": "n.1.0.1",
+       "kind": "residual",
+       "label": "h",
+       "shared": false,
+       "span": null,
+       "origin": null,
+       "editable": true,
+       "body": {
+        "id": "n.1.0.1.0",
+        "kind": "seq",
+        "label": null,
+        "shared": false,
+        "span": null,
+        "origin": null,
+        "editable": true,
+        "items": [
+         {
+          "id": "n.1.0.1.0.0",
+          "kind": "sum",
+          "label": null,
+          "shared": false,
+          "span": null,
+          "origin": null,
+          "editable": true,
+          "terms": [
+           {
+            "id": "n.1.0.1.0.0.0",
+            "kind": "identity",
+            "label": null,
+            "shared": false,
+            "span": null,
+            "origin": null,
+            "editable": true
+           },
+           {
+            "id": "n.1.0.1.0.0.1",
+            "kind": "seq",
+            "label": null,
+            "shared": false,
+            "span": null,
+            "origin": null,
+            "editable": true,
+            "items": [
+             {
+              "id": "n.1.0.1.0.0.1.0",
+              "kind": "seq",
+              "label": "sa",
+              "shared": true,
+              "span": null,
+              "origin": null,
+              "editable": true,
+              "items": [
+               {
+                "id": "n.1.0.1.0.0.1.0.0",
+                "kind": "layer",
+                "label": "norm",
+                "shared": false,
+                "span": null,
+                "origin": null,
+                "editable": true,
+                "type": "rmsnorm",
+                "title": "RMSNorm",
+                "category": "norm",
+                "chips": [],
+                "width": 2048,
+                "ports": [],
+                "written": [
+                 10,
+                 16
+                ],
+                "internals": null,
+                "inserted": false
+               },
+               {
+                "id": "n.1.0.1.0.0.1.0.1",
+                "kind": "layer",
+                "label": "attn",
+                "shared": false,
+                "span": null,
+                "origin": null,
+                "editable": true,
+                "type": "gqa",
+                "title": "Multi-head attention",
+                "category": "attention",
+                "chips": [
+                 "32 heads",
+                 "RoPE 10k"
+                ],
+                "width": 2048,
+                "ports": [],
+                "written": [
+                 30,
+                 36
+                ],
+                "internals": null,
+                "inserted": false
+               },
+               {
+                "id": "n.1.0.1.0.0.1.0.2",
+                "kind": "layer",
+                "label": "norm",
+                "shared": false,
+                "span": null,
+                "origin": null,
+                "editable": true,
+                "type": "rmsnorm",
+                "title": "RMSNorm",
+                "category": "norm",
+                "chips": [],
+                "width": 2048,
+                "ports": [],
+                "written": [
+                 10,
+                 16
+                ],
+                "internals": null,
+                "inserted": false
+               },
+               {
+                "id": "n.1.0.1.0.0.1.0.3",
+                "kind": "layer",
+                "label": "ffn",
+                "shared": false,
+                "span": null,
+                "origin": null,
+                "editable": true,
+                "type": "gated_mlp",
+                "title": "Feed forward (GeGLU)",
+                "category": "ffn",
+                "chips": [
+                 "8,192 hidden"
+                ],
+                "width": 2048,
+                "ports": [],
+                "written": [
+                 40,
+                 46
+                ],
+                "internals": {
+                 "id": "n.1.0.1.0.0.1.0.3/i",
+                 "label": null,
+                 "shared": false,
+                 "span": null,
+                 "origin": null,
+                 "editable": false,
+                 "kind": "seq",
+                 "items": [
+                  {
+                   "id": "n.1.0.1.0.0.1.0.3/i.0",
+                   "label": null,
+                   "shared": false,
+                   "span": null,
+                   "origin": null,
+                   "editable": false,
+                   "kind": "prod",
+                   "factors": [
+                    {
+                     "id": "n.1.0.1.0.0.1.0.3/i.0.0",
+                     "label": null,
+                     "shared": false,
+                     "span": null,
+                     "origin": null,
+                     "editable": false,
+                     "kind": "seq",
+                     "items": [
+                      {
+                       "id": "n.1.0.1.0.0.1.0.3/i.0.0.0",
+                       "label": null,
+                       "shared": false,
+                       "span": null,
+                       "origin": null,
+                       "editable": false,
+                       "kind": "layer",
+                       "type": "linear",
+                       "title": "Linear",
+                       "category": "op",
+                       "chips": [
+                        "2,048 \u2192 8,192"
+                       ],
+                       "ports": [],
+                       "written": null
+                      },
+                      {
+                       "id": "n.1.0.1.0.0.1.0.3/i.0.0.1",
+                       "label": null,
+                       "shared": false,
+                       "span": null,
+                       "origin": null,
+                       "editable": false,
+                       "kind": "layer",
+                       "type": "gelu",
+                       "title": "GELU",
+                       "category": "op",
+                       "chips": [],
+                       "ports": [],
+                       "written": null
+                      }
+                     ]
+                    },
+                    {
+                     "id": "n.1.0.1.0.0.1.0.3/i.0.1",
+                     "label": null,
+                     "shared": false,
+                     "span": null,
+                     "origin": null,
+                     "editable": false,
+                     "kind": "layer",
+                     "type": "linear",
+                     "title": "Linear",
+                     "category": "op",
+                     "chips": [
+                      "2,048 \u2192 8,192"
+                     ],
+                     "ports": [],
+                     "written": null
+                    }
+                   ]
+                  },
+                  {
+                   "id": "n.1.0.1.0.0.1.0.3/i.1",
+                   "label": null,
+                   "shared": false,
+                   "span": null,
+                   "origin": null,
+                   "editable": false,
+                   "kind": "layer",
+                   "type": "linear",
+                   "title": "Linear",
+                   "category": "op",
+                   "chips": [
+                    "8,192 \u2192 2,048"
+                   ],
+                   "ports": [],
+                   "written": null
+                  }
+                 ]
+                },
+                "inserted": false
+               }
+              ]
+             },
+             {
+              "id": "n.1.0.1.0.0.1.1",
+              "kind": "layer",
+              "label": null,
+              "shared": false,
+              "span": null,
+              "origin": null,
+              "editable": true,
+              "type": "linear",
+              "title": "Linear",
+              "category": "op",
+              "chips": [
+               "\u2192 2,048"
+              ],
+              "width": 2048,
+              "ports": [],
+              "written": [
+               50,
+               56
+              ],
+              "internals": null,
+              "inserted": false
+             }
+            ]
+           }
+          ]
+         },
+         {
+          "id": "n.1.0.1.0.1",
+          "kind": "layer",
+          "label": "norm",
+          "shared": false,
+          "span": null,
+          "origin": null,
+          "editable": true,
+          "type": "rmsnorm",
+          "title": "RMSNorm",
+          "category": "norm",
+          "chips": [],
+          "width": 2048,
+          "ports": [],
+          "written": [
+           10,
+           16
+          ],
+          "internals": null,
+          "inserted": false
+         },
+         {
+          "id": "n.1.0.1.0.2",
+          "kind": "layer",
+          "label": "ssm",
+          "shared": false,
+          "span": null,
+          "origin": null,
+          "editable": true,
+          "type": "mamba2",
+          "title": "Mamba-2",
+          "category": "recurrent",
+          "chips": [
+           "state 128"
+          ],
+          "width": 2048,
+          "ports": [],
+          "written": [
+           20,
+           26
+          ],
+          "internals": null,
+          "inserted": false
+         }
+        ]
+       }
+      }
+     ]
+    },
+    "times": 6
+   },
+   {
+    "id": "n.2",
+    "kind": "repeat",
+    "label": null,
+    "shared": false,
+    "span": null,
+    "origin": null,
+    "editable": true,
+    "body": {
+     "id": "n.2.0",
+     "kind": "residual",
+     "label": "m",
+     "shared": false,
+     "span": null,
+     "origin": null,
+     "editable": true,
+     "body": {
+      "id": "n.2.0.0",
+      "kind": "seq",
+      "label": null,
+      "shared": false,
+      "span": null,
+      "origin": null,
+      "editable": true,
+      "items": [
+       {
+        "id": "n.2.0.0.0",
+        "kind": "layer",
+        "label": "norm",
+        "shared": false,
+        "span": null,
+        "origin": null,
+        "editable": true,
+        "type": "rmsnorm",
+        "title": "RMSNorm",
+        "category": "norm",
+        "chips": [],
+        "width": 2048,
+        "ports": [],
+        "written": [
+         10,
+         16
+        ],
+        "internals": null,
+        "inserted": false
+       },
+       {
+        "id": "n.2.0.0.1",
+        "kind": "layer",
+        "label": "ssm",
+        "shared": false,
+        "span": null,
+        "origin": null,
+        "editable": true,
+        "type": "mamba2",
+        "title": "Mamba-2",
+        "category": "recurrent",
+        "chips": [
+         "state 128"
+        ],
+        "width": 2048,
+        "ports": [],
+        "written": [
+         20,
+         26
+        ],
+        "internals": null,
+        "inserted": false
+       }
+      ]
+     }
+    },
+    "times": 2
+   },
+   {
+    "id": "n.3",
+    "kind": "layer",
+    "label": "norm",
+    "shared": false,
+    "span": null,
+    "origin": null,
+    "editable": true,
+    "type": "rmsnorm",
+    "title": "RMSNorm",
+    "category": "norm",
+    "chips": [],
+    "width": 2048,
+    "ports": [],
+    "written": [
+     10,
+     16
+    ],
+    "internals": null,
+    "inserted": false
+   },
+   {
+    "id": "n.4",
+    "kind": "layer",
+    "label": null,
+    "shared": false,
+    "span": null,
+    "origin": null,
+    "editable": true,
+    "type": "head",
+    "title": "Linear output layer",
+    "category": "io",
+    "chips": [
+     "tied"
+    ],
+    "width": 2048,
+    "ports": [],
+    "written": [
+     60,
+     66
+    ],
+    "internals": null,
+    "inserted": false
+   }
+  ]
+ }
+}
