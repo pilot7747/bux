@@ -28,6 +28,9 @@ from vllm.model_executor.layers.mamba.mamba_utils import (
 from .common import Ctx, Layer, Site
 from .plan import live, plan
 
+#: The recurrent layer types, which keep their state in vLLM's Mamba cache.
+RECURRENT = ("mamba2", "gdn")
+
 
 def mamba2_dims(c: dict, width: int) -> tuple[int, int]:
     """Mamba-2's inner channels and heads, as `bux.architecture.recurrent.ssm`
@@ -165,20 +168,12 @@ def _recurrent(config: Any) -> tuple[str, dict, int] | None:
         NotImplementedError: Its recurrent layers differ.
     """
     calls = live(plan(config.bux["graph"]).calls)
-    found = {
-        (n["config"]["type"], repr(n["config"]), n["width"])
-        for n in (c.layer for c in calls)
-        if n["config"]["type"] in ("mamba2", "gdn")
-    }
-    if len(found) > 1:
+    layers = [c.layer for c in calls if c.layer["config"]["type"] in RECURRENT]
+    if len({repr((n["config"], n["width"])) for n in layers}) > 1:
         raise NotImplementedError("recurrent layers of several shapes not in vLLM yet")
-    if not found:
+    if not layers:
         return None
-    kind, _, width = found.pop()
-    c = next(
-        n["config"] for n in (c.layer for c in calls) if n["config"]["type"] == kind
-    )
-    return kind, c, width
+    return layers[0]["config"]["type"], layers[0]["config"], layers[0]["width"]
 
 
 def state_shapes(vllm_config: Any) -> tuple:
