@@ -108,7 +108,7 @@ layer or the setting.
 | `embed`, `head`, `mlp`, `gated_mlp`, `linear`, `act`, `scale`, `dropout`, `layernorm`, `rmsnorm` | yes, but `embed(norm=...)` and the MLPs' `limit`, `up_softcap` and `up_offset` |
 | `gqa` | every setting and port: RoPE (`pi`, `llama3`, `yarn`; partial, interleaved), QK-norm, biases, fused or not, head dims, scale, sliding windows, sinks, softcap, gates, output norm, length scale, relative bias, the conv on keys and values, the indexer; `v`, `kv` and `index` ports. Dropout is training's alone |
 | `mla` | every setting, the indexer and the `index` port; keys and values cached as projected up from the latents |
-| `csa` | not yet |
+| `csa` | every setting, the indexer and its candidate pools, and the `kv`, `index` and `candidates` ports; every token's latents cached, the window a mask over them |
 | `conv` | yes, its inputs' tail kept in the cache as it decodes |
 | the graph | sequences, residual branches, sums, products, constants, repeats, taps, shared definitions; not yet residual algebras |
 
@@ -119,7 +119,8 @@ layer or the setting.
 Where a setting needs the logits (sinks, a softcap, a relative bias, a length scale,
 an indexer's kept keys), the layer computes the softmax itself, in float32 as bux
 does, whichever implementation the model loads with: sdpa and flash attention would
-drop the sinks, and sdpa has no softcap.
+drop the sinks, and sdpa has no softcap. `csa` always computes its own, over its
+window and its compressed latents at once.
 
 - **Windows.** A layer with `sliding_window_size` keeps that many keys in a
   `sliding_attention` cache layer, its window its own, and reads the mask of its
@@ -132,3 +133,10 @@ drop the sinks, and sdpa has no softcap.
   it. What a layer keeps is a mask over its cached keys, which the `index` port
   passes on; a sparse layer keeps every key, which the mask indexes, and applies its
   window to them.
+- **Compressed sparse attention.** A `csa` layer's cache layer keeps every token's
+  latent as its keys and, as its values, the compressed latent the token ends, with
+  the indexer's key of it; its conv state keeps the last tokens that the next
+  compressed latent pools (a `hybrid` layer).
+
+The cache is transformers' `DynamicCache`; a static one
+(`cache_implementation="static"`) is not exported yet.
