@@ -133,12 +133,12 @@ An iteration's quintic `a X + b (XXᵀ)X + c (XXᵀ)²X` is a polynomial of the 
 `R = XXᵀ` times X. For an m×n matrix with m ≤ n, `gram` forms R once, iterates on
 m×m matrices (`Z = bR + cR²`, `Q ← Q(Z + aI)`, `R ← (Z + aI)R(Z + aI)`) and
 multiplies by X only at the end, and at its restarts: `QX`, the same orthogonalized
-matrix. The standard
-iteration multiplies by X twice an iteration. The further a matrix is from square,
-the more that saves. At 5 iterations, counting every product whole (XLA has no
-symmetric products), a Llama's MLP matrices (n ≈ 2.7m) take 22% fewer multiply-adds,
-a matrix four times as wide a third fewer, eight times 46%. Where it would not save
-any, below n = 1.5m and on square matrices, `gram` runs the standard iteration.
+matrix. The standard iteration multiplies by X twice an iteration. The further a
+matrix is from square, the more that saves. At 5 iterations, counting every product
+whole (XLA has no symmetric products), a Llama's MLP matrices (n ≈ 2.7m) take 22%
+fewer multiply-adds, a matrix four times as wide a third fewer, eight times 46%.
+Where it would not save any, below n = 1.5m and on square matrices, `gram` runs the
+standard iteration.
 
 Under `gspmd`, a product by a matrix split along its longer side (FSDP's) is an
 all-reduce, so `gram` all-reduces less there too. Under `gather` and `owner` it runs
@@ -160,9 +160,18 @@ up from seven, past 10³ at eight. `ns_restarts=2` or `ns_restarts=[2, 4]` sets 
 In a 16-bit `ns_dtype`, `gram` normalizes in float32 and iterates in float16, as
 its authors do: bfloat16's 8 bits round the Gram matrix too coarsely. Its updates
 still move between devices in `ns_dtype`. Each `a` is added in float32 before the
-product is rounded, as a GEMM's epilogue adds, since `Z + aI` rounded to 16 bits loses
-it. The Gram matrix squares the condition number, so for an orthogonalization that
-needs more digits than Muon's do, use `standard` in float32.
+product is rounded, as a GEMM's epilogue adds: `Z + aI` rounded to 16 bits loses it,
+and a product rounded before `a` is added loses what cancels, which blows up eight
+iterations of Polar Express. The Gram matrix squares the condition number, so for an
+orthogonalization that needs more digits than Muon's do, use `standard` in float32.
+
+On a B300, `gram` runs Newton-Schulz 1.05 to 1.4 times as fast as `standard` on
+matrices 2.75 to 8 times as wide as tall, and up to 12% slower at twice as wide. It
+is 6 to 8 times nearer float32's result than `standard` in bfloat16, and trains to
+the same loss. Muon's step and the run barely change: by `owner`, Newton-Schulz is a
+few milliseconds of a step. The authors' twice-as-fast needs symmetric GEMM kernels
+with fused epilogues, which XLA does not have
+([measurements](../parallelism/muon.md#gram-newton-schulz-on-b300s)).
 
 ## Schedules
 

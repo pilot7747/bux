@@ -140,3 +140,51 @@ The dense model's optimizer update alone takes 74 ms with `gspmd`, 73 with `gath
 and 12 with `owner` in float32; 48, 42 and 12 in bfloat16. With `repeat=scan`
 (float32 here) the stacked `layers` already split over `fsdp` under `gather`, as under
 `owner`.
+
+### Gram Newton-Schulz on B300s
+
+`ns_algorithm=gram` against `standard`, 5 iterations, `ns_dtype=bfloat16`, on one node
+of 8 B300 SXM6s, jax 0.12.0, 2026-10-26.
+
+**Newton-Schulz alone, one GPU.** Milliseconds a call (the median of 20) for a stack
+of the matrices of the 1.3B Llama and the MoE above, and of Kimi K2 (the 216 experts
+of 2048×7168 dealt over 8 devices, and its largest matrix), by Keller Jordan's
+quintic:
+
+| Matrices | Stack × m × n | `standard` | `gram` | |
+|---|---|---|---|---|
+| Llama's q, o | 32 × 2048 × 2048 | 7.54 | 7.53 | the standard: square |
+| Llama's k, v | 32 × 2048 × 1024 | 2.56 | 2.90 | 0.88× |
+| Llama's up, gate | 32 × 2048 × 5632 | 15.03 | 13.33 | 1.13× |
+| Llama's down | 16 × 5632 × 2048 | 7.66 | 6.81 | 1.12× |
+| MoE's experts | 1024 × 704 × 2048 | 30.74 | 29.18 | 1.05× |
+| Kimi K2's experts | 27 × 2048 × 7168 | 15.42 | 12.33 | 1.25× |
+| Kimi K2's largest | 1 × 7168 × 18432 | 16.69 | 13.90 | 1.20× |
+| eight times as wide | 16 × 1024 × 8192 | 3.55 | 2.62 | 1.36× |
+
+Polar Express's quintics take about the same, but for k and v, 2.65 → 2.64. The
+speedups are below what the products saved predict (a third fewer at n = 4m, 46% at
+8m). XLA computes every product whole, with no symmetric GEMM. And the three products
+an iteration that add `a` in float32 take a pass of their own over a float32 result.
+On the up and gate projections, Gram's products alone take 8.2 ms. Summed in 16 bits,
+as a GEMM's epilogue would, they take 12.5 ms in all, but that blows up on CPU, where
+each operation rounds. Its authors' fused symmetric kernels make it up to twice as
+fast.
+
+**Accuracy.** Iterating in float16, `gram`'s result is within 0.4-0.6% of float32's
+standard iteration (relative Frobenius norm, Gaussian matrices), the standard in
+bfloat16 within 3-5%.
+
+**Muon's optimizer update alone**, `mesh(fsdp=8)`, ms a step: dense 57.4 → 58.0 by
+`gspmd`, 42.0 → 42.0 by `gather`, 13.6 → 13.4 by `owner`; MoE 37.2 → 37.2, 30.9 →
+32.1, 20.1 → 19.3. Under `owner` each device orthogonalizes an eighth of the
+matrices, and Newton-Schulz is a few milliseconds of the update.
+
+**End to end**, as the throughput table above: dense 1,135,636 → 1,139,894 tokens a
+second, MoE 823,556 → 828,208, within the runs' noise.
+
+**Loss.** The dense model on packed documents (the docs.bux of the bfloat16
+comparison above), one GPU each, `muon(lr=0.02)`, `wsd(warmup=30)`, 200 steps: the
+loss at the last step is 3.9290 by `standard`, 3.9292 by `gram`, 3.9291 by
+`standard` in float32, and 3.9472 by `standard` from another seed. With 8 iterations
+of Polar Express, two restarts, `standard` reaches 3.9303 and `gram` 3.9309.
