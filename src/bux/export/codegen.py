@@ -90,11 +90,13 @@ class Generator:
 
     def scope(self, s: Scope, name: str, doc: str) -> str:
         """Generate the class `name` of the scope `s`; return its name."""
+        index = len(self.classes)
+        self.classes.append("")  # its place, so that a repeat inside is named after
         c = _Class()
         out = self.emit(s.root, "x", (), s, c, 0)
         init = "\n        ".join(c.init) or "pass"
         body = "\n        ".join([*c.body, f"return {out}"])
-        self.classes.append(
+        self.classes[index] = (
             f"class {name}(nn.Module):\n"
             f'    """bux: {doc}."""\n\n'
             f"    def __init__(self, config: BuxConfig, prefix: str):\n"
@@ -206,6 +208,16 @@ from .configuration_bux import BuxConfig
 '''
 
 MODEL = '''
+def seen_tokens(cache: Any, t: int) -> int:
+    """Return how many tokens `cache` holds before the t of this forward: as its
+    attention layers count them, or, where it has none, as the model counts them."""
+    if cache is None or COUNTS_TOKENS:
+        return 0 if cache is None else cache.get_seq_length()
+    seen = getattr(cache, "bux_seen", 0)
+    cache.bux_seen = seen + t
+    return seen
+
+
 class BuxPreTrainedModel(PreTrainedModel):
     config_class = BuxConfig
     base_model_prefix = "model"
@@ -242,8 +254,8 @@ class BuxModel(BuxPreTrainedModel):
         b, t = input_ids.shape
         if use_cache and past_key_values is None:
             past_key_values = DynamicCache(config=self.config)
+        seen = seen_tokens(past_key_values, t)
         if position_ids is None:
-            seen = past_key_values.get_seq_length() if past_key_values is not None else 0
             position_ids = torch.arange(seen, seen + t, device=input_ids.device)
             position_ids = position_ids[None].expand(b, t)
         ctx = Ctx(input_ids, position_ids, attention_mask, past_key_values, self.shared, make_mask)
@@ -262,6 +274,13 @@ class BuxForCausalLM(BuxPreTrainedModel, GenerationMixin):
         super().__init__(config)
         self.model = BuxModel(config)
         self.post_init()
+
+    @classmethod
+    def _supports_default_dynamic_cache(cls) -> bool:
+        """Whether generate may make the cache: not where no cache layer is an
+        attention layer's, which would know how many tokens it holds; the model's
+        first forward makes it then."""
+        return COUNTS_TOKENS
 
     def forward(
         self,
@@ -309,6 +328,7 @@ def modeling(plan: Plan, masks: list[tuple[str, object]]) -> str:
             "",
             "\n\n".join(consts),
             f"MASKS = {masks!r}",
+            f"COUNTS_TOKENS = {_counts_tokens(plan)!r}",
             "",
             "\n\n".join(g.classes),
             code,
@@ -319,3 +339,14 @@ def modeling(plan: Plan, masks: list[tuple[str, object]]) -> str:
 def _used(plan: Plan) -> set[type]:
     """Return the exported classes of every layer in `plan`."""
     return {layer_class(call.layer) for call in plan.calls}
+
+
+def _counts_tokens(plan: Plan) -> bool:
+    """Whether a cache layer of the model counts the tokens it holds: an attention
+    layer's does, a recurrent layer's (``conv``, ``linear_attention``) does not."""
+    for call in plan.calls:
+        fn = getattr(layer_class(call.layer), "cache_type", None)
+        kind = fn(call.layer.config.model_dump(mode="json")) if fn else None
+        if kind not in (None, "conv", "linear_attention"):
+            return True
+    return False
