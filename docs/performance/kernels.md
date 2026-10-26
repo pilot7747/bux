@@ -59,7 +59,7 @@ The speedups are against XLA's own program for the same computation, on a B300.
 | MoE experts' SwiGLU in MXFP8 | `grouped_glu`: cuDNN's CuTe DSL grouped GEMMs, SwiGLU and its backward with their quantizations in the epilogues, each GPU's shard of the kernels quantized before FSDP gathers it ([Experts](../parallelism/experts.md)) | 1.13-1.17x `grouped_mxfp8`'s layer |
 | MoE dispatch | `token_rows`, `token_sums`: gathers where XLA would scatter | 4x |
 | MXFP8's quantizer | `blockscaled`: a Pallas kernel that quantizes an operand both ways in one pass | 4.3-4.7 TB/s at Qwen3-30B-A3B's projections |
-| NVFP4's quantizers | `nvfp4`: Pallas kernels, a pass for the largest magnitudes and one that writes both copies, rounded by Blackwell's E2M1 conversions | 3-5x |
+| NVFP4's quantizers | `nvfp4_te`: Transformer Engine's kernels, a pass for the largest magnitudes, then its NVFP4 cast and its Hadamard GEMM fused with the cast; else `nvfp4`: Pallas kernels, a pass for the largest magnitudes and one that writes both copies, rounded by Blackwell's E2M1 conversions | 3-5x; TE's 1.25-1.5x bux's Pallas kernels |
 
 Where they live:
 
@@ -72,7 +72,7 @@ Where they live:
 | `fused_delta`, `pallas_delta` | {py:mod}`bux.architecture.recurrent.fused_delta`, {py:mod}`bux.architecture.recurrent.pallas_delta` |
 | `grouped`, `grouped_mxfp8`, `grouped_glu` | {py:mod}`bux.architecture.experts.grouped`, {py:mod}`bux.architecture.experts.grouped_mxfp8`, {py:mod}`bux.architecture.experts.grouped_glu` |
 | `token_rows`, `token_sums` | {py:mod}`bux.architecture.experts.moe` |
-| `blockscaled`, `nvfp4` | {py:mod}`bux.architecture.precision.blockscaled`, {py:mod}`bux.architecture.precision.nvfp4` |
+| `blockscaled`, `nvfp4`, `nvfp4_te` | {py:mod}`bux.architecture.precision.blockscaled`, {py:mod}`bux.architecture.precision.nvfp4`, {py:mod}`bux.architecture.precision.nvfp4_te` |
 
 ## When a kernel falls back
 
@@ -94,6 +94,7 @@ by XLA instead, with the same values up to rounding. Outside a GPU, and inside
 | `grouped.ragged_dot` | tokamax installed | `jax.lax.ragged_dot` |
 | `grouped_mxfp8` | a Blackwell GPU (compute capability 10 or more); the experts' role in `mxfp8` or `mxfp8_2d` | XLA dequantizes and multiplies |
 | `grouped_glu` | a Blackwell GPU with cudnn-frontend; a SwiGLU FFN (`gated_mlp` of `swish`, no `limit`, `up_softcap`, `up_offset`, `bias` or `expert_norm`); `mxfp8` in every pass; widths in whole tiles of 256 (Qwen3-30B-A3B's 2048 and 768, not the baseline's 704) | `grouped_mxfp8` |
+| `nvfp4_te` | a B200 or B300 with Transformer Engine's JAX bindings (bux's image); bfloat16 operands of whole tiles of 64 x 128 on each device (a split whose parts are not keeps the dimension whole); of x and dy, 8192 rows or more for each device of the mesh (`nvfp4_te.ROWS`) | `nvfp4`'s Pallas kernels |
 | `blockscaled`'s and `nvfp4`'s quantizers | a GPU | XLA quantizes |
 | the block-scaled GEMMs (cuDNN's, `__cudnn$blockScaledDot`) | a Blackwell GPU | XLA dequantizes and multiplies, which computes the same values |
 
@@ -107,7 +108,7 @@ runs by chunks.
    causes it.
 2. Run the GPU smoke test of the kernel's family, which checks its kernels against
    XLA: `scripts/gpu_smoke/attention.py`, `experts.py`, `grouped_mxfp8.py`,
-   `recurrence.py` or `sparse.py`.
+   `nvfp4.py`, `recurrence.py` or `sparse.py`.
 3. To compare two trees' losses, pin XLA's autotuning and deterministic ops
    ([Benchmarks](benchmarks.md#noise-and-determinism)): under XLA's deterministic
    ops, cuDNN's attention backward is tokamax's.
@@ -240,18 +241,24 @@ same:
 - **NVFP4.** cuDNN's NVFP4 GEMM runs at 4.8-5.5 PFLOP/s at the MLP's shapes, 1.7-1.9x
   MXFP8's. Its output is bfloat16, which the two tensors' scales then rescale in what
   reads it (cuDNN's own global scale is no faster, and takes it in bfloat16).
-  NVFP4's quantizers are two passes of Pallas kernels over each operand
-  ({py:mod}`bux.architecture.precision.nvfp4`):
+  NVFP4's quantizers are Transformer Engine's kernels where TE is installed
+  ({py:mod}`bux.architecture.precision.nvfp4_te`): its amax kernel finds the largest
+  magnitude of the operand and that of its transpose through the Hadamard transform
+  in one pass, then one call of its cast writes both copies, the transpose's by a
+  Hadamard GEMM on the tensor cores fused with the cast. Elsewhere, and for x and dy
+  of fewer than 8192 rows a device, they are two passes of bux's Pallas kernels over
+  each operand ({py:mod}`bux.architecture.precision.nvfp4`):
 
   1. the largest magnitude of the operand, and that of its transpose through the
      Hadamard transform;
   2. both copies at once, each value rounded, saturated and packed by Blackwell's
      `cvt.rn` and `cvt.rs` (stochastic, 8 random bits a value).
 
-  An MLP projection's forward and backward then take 1.07-1.1x less time than
-  MXFP8's, but q's and o's take 1.1x more and k's and v's 1.25x. There the second
-  pass, ~20 more small kernels a projection (scales for cuDNN's layout, the global
-  scales) and the transform's copy, at 2-2.5 TB/s, cost more than their GEMMs save.
+  By TE's kernels an MLP projection's forward and backward take 1.17x less time than
+  MXFP8's, but q's and o's still take 1.08x more and k's and v's 1.25x: ~20 small
+  kernels a projection (scales for cuDNN's layout, the global scales) cost more there
+  than the GEMMs save. [Quantizing NVFP4 by Transformer Engine](#quantizing-nvfp4-by-transformer-engine)
+  has the measurements.
 
 | `matmuls`, 1.3B Llama-style | 1 GPU | 8, `mesh(fsdp=8)` |
 |-----------------------------|-------|-------------------|
@@ -298,3 +305,43 @@ Which projections multiply in `mxfp8`, on one B300
 - **Over 8 GPUs**, `mesh(fsdp=8)`, `mxfp8` and `mxfp8_2d` both train at 1.34M
   (bfloat16: 1.14M). Scanned, `first=2, last=2` trains at 1.20M, where `mxfp8` alone
   gives 1.22M.
+
+#### Quantizing NVFP4 by Transformer Engine
+
+TE's kernels (TE 2.20.2) against bux's Pallas ones, on the same B300s, October 26. Each
+operand of the 1.3B's projections, 32768 rows, both copies with the largest magnitudes,
+by CUPTI:
+
+| operand | TE | Pallas |
+|---------|----|--------|
+| x, 2048 columns | 98 µs | 129 µs (1.31x) |
+| x, 5632 | 223 µs | 330 µs (1.48x) |
+| x, 1024 | 46 µs | 68 µs (1.48x) |
+| dy, 2048, rounded stochastically | 118 µs | 147 µs (1.25x) |
+| dy, 5632 | 271 µs | 376 µs (1.39x) |
+
+A projection's forward and backward, 32768 rows, takes 0.910 ms against 1.052 for the
+MLP's up and gate, 0.881 against 1.021 for its down, 0.474 against 0.540 for q and o,
+and 0.345 against 0.391 for k and v (MXFP8's: 1.069, 1.002, 0.437, 0.275), in 25
+kernels against 33. The one-GPU suite's `nvfp4` arm quantizes in 28.4 ms of a 168 ms
+step against 35.7 of 172:
+
+| `nvfp4`, 1.3B, tokens a second | Pallas | TE |
+|--------------------------------|--------|----|
+| 1 GPU, 8 rows of 4096 | 201k | 206k (1.02x) |
+| 8 GPUs, `mesh(fsdp=8)`, 8 rows a GPU | 1.52M | 1.56M (1.03x) |
+| 8 GPUs, 4 rows a GPU | 1.38M | 1.42M (1.02x) |
+| 8 GPUs, 2 rows a GPU | 1.16M | 1.17M (1.01x) |
+
+in the same memory. Below 8192 rows a device TE's casts cost more than they save:
+each is a few more graph nodes (its amaxes zeroed, their copies), which a step of few
+tokens waits on. At a row of 4096 one GPU trained 2% slower by them, and 8 under FSDP
+23% slower, their devices waiting on each other at each operand's largest magnitude;
+so there `nvfp4` quantizes x and dy by the Pallas kernels (`nvfp4_te.ROWS`), and
+trains as fast as before (129k on one GPU, 825k on 8). The one-GPU rows are the means
+of ten pairs of 60 steps, the trees on the same GPUs in turn.
+
+TE's GEMM (`te_gemm_v2_ffi`, cuBLASLt) runs the same nvjet kernels as cuDNN's at the
+same speed. It applies the tensor scales in its epilogue, which XLA otherwise fuses
+into what reads the product, and its scales' swizzles are no faster than XLA's, so
+bux keeps cuDNN's (measured GEMM by GEMM, not in a step).

@@ -170,7 +170,10 @@ checks on `fsdp=4, tensor=2` and in a pipeline.
 
 NVFP4's stochastic rounding draws its noise from a hash of each group of 4 elements'
 index and the batch's tokens, 8 bits an element: the same on any mesh too. NVFP4's
-kernels each take the place of their device's part in the whole.
+kernels each take the place of their device's part in the whole. Transformer Engine's
+kernels, which quantize NVFP4 on a B200 or B300 where TE is installed, draw Philox's
+noise of the seed and each device's part instead: alike on another mesh in its
+distribution, not in its values.
 
 ### Formats under FSDP and context parallelism
 

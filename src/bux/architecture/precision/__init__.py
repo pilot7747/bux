@@ -5,4 +5,6 @@
 - `~bux.architecture.precision.blockscaled`: block-scaled GEMMs, and MXFP8's
   quantizers.
 - `~bux.architecture.precision.nvfp4`: NVFP4's quantizers.
+- `~bux.architecture.precision.nvfp4_te`: NVFP4's quantizers by Transformer Engine's
+  kernels, where it is installed.
 """
