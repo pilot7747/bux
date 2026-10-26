@@ -218,6 +218,12 @@ def _options(annotation: object) -> tuple[object, ...]:
     return ()
 
 
+def _not_a_layer(c: cfg.Config, span: Span, hint: str | None = None) -> BuxError:
+    """Return the error of a config that is not a layer where a layer goes."""
+    kind = "a training setting" if _tag(c) in TRAINING else "a setting of a layer"
+    return BuxError(f"{_tag(c)}(...) is {kind}, not a layer", span, hint)
+
+
 def _is_number(value: object) -> bool:
     value = _unwrap(value)
     return isinstance(value, int | float) and not isinstance(value, bool)
@@ -460,11 +466,8 @@ class _Evaluator:
             case ast.Residual(body=body):
                 inner = self.eval(body, scope)
                 if isinstance(inner, cfg.Config) and _tag(inner) not in LAYERS:
-                    raise BuxError(
-                        f"[...] is a residual branch, and {_tag(inner)}(...) is no layer",
-                        expr.span,
-                        "a list of one is written with a comma: [x,]",
-                    )
+                    hint = "[x] is a residual branch; a list of one is written [x,]"
+                    raise _not_a_layer(inner, body.span, hint)
                 return self.node(
                     ir.Residual(body=self.graph(inner, body.span)), expr.span
                 )
@@ -690,12 +693,7 @@ class _Evaluator:
                 return value
             case cfg.Config():
                 if _tag(value) not in LAYERS:
-                    kind = (
-                        "a training setting"
-                        if _tag(value) in TRAINING
-                        else "a setting of a layer"
-                    )
-                    raise BuxError(f"{_tag(value)}(...) is {kind}, not a layer", span)
+                    raise _not_a_layer(value, span)
                 config = typing.cast(cfg.LayerConfig, value)
                 return self.node(ir.Layer(config=config), span)
             case _Builtin(name=name) if name in ACTIVATIONS:
