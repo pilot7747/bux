@@ -109,8 +109,9 @@ const CHECKS = {
     return JSON.stringify(diagram.view) === before;
   },
   "facts fill the header": () => {
-    diagram.setFacts({ params: "8.03B", context: "8,192" });
-    return diagram.content.querySelector(".dg-header").textContent.includes("8.03B");
+    diagram.setFacts({ params: 8030261248, params_text: "8.03B", flops_per_token: 4.8e10, context: 8192 });
+    const header = diagram.content.querySelector(".dg-header").textContent;
+    return header.includes("8.03B") && header.includes("48G") && header.includes("8,192");
   },
   "export is standalone": () => {
     const svg = diagram.exportSVG();
@@ -136,6 +137,10 @@ const CHECKS = {
   "select finds a block folded into a run": () => {
     diagram.select("n.1.0.2.0.0.1");
     return diagram.drawnId("n.1.0.2.0.0.1") === "n.1.0.0.0.0.1" && $(".dg-ring") !== null;
+  },
+  "an internals id selects its box": () => {
+    diagram.select("n.1.0.0.0.0.1:i.0.1");
+    return diagram.drawnId("n.1.0.0.0.0.1:i.0.1") === "n.1.0.0.0.0.1";
   },
   "select finds what a folded card holds": () => {
     diagram.select("n.5.2.1.0.1");

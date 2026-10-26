@@ -49,6 +49,7 @@ const PALETTE = [
   ["swish", "op", "SiLU", "swish"], ["sigmoid", "op", "Sigmoid", "sigmoid"], ["dropout", "op", "Dropout", "dropout(rate=0.1)"],
 ].map(([name, category, title, template]) => ({ name, kind: "layer", category, title, doc: `${title}.`, template }));
 
+const FACTS = { params: 8030261248, params_text: "8.03B", flops_per_token: 4.8e10, context: 8192 };
 const q = new URLSearchParams(location.search);
 const list = (key) => (q.get(key) ?? "").split(",").filter(Boolean);
 const root = document.documentElement;
@@ -70,7 +71,7 @@ for (const f of FIXTURES) select.append(new Option(f, f, false, f === name));
 select.onchange = () => { q.set("fixture", select.value); location.search = q; };
 document.getElementById("theme").onclick = () => { root.dataset.theme = root.dataset.theme === "dark" ? "light" : "dark"; };
 document.getElementById("dim").onclick = (e) => diagram.setDim(e.target.classList.toggle("on"));
-document.getElementById("facts").onclick = () => diagram.setFacts({ params: "8.03B", context: "8,192" });
+document.getElementById("facts").onclick = () => diagram.setFacts(FACTS);
 
 const model = await (await fetch(`fixtures/model-${name}.json`)).json();
 if (q.get("fold") === "open") diagram.folds.mode = "open";
@@ -78,7 +79,7 @@ if (q.get("fold") === "closed") diagram.folds.mode = "closed";
 for (const key of list("open")) diagram.folds.keys.set(key, true);
 for (const key of list("close")) diagram.folds.keys.set(key, false);
 for (const id of list("zoom")) diagram.zooms.add(id);
-if (q.get("facts")) diagram.facts = { params: "8.03B", context: "8,192" };
+if (q.get("facts")) diagram.facts = { ...FACTS };
 diagram.render(model);
 document.getElementById("ms").textContent = `${diagram.renderMs.toFixed(1)} ms`;
 if (q.get("view")) diagram.applyView(Object.fromEntries(q.get("view").split(",").map(Number).map((v, i) => [["k", "x", "y"][i], v])));
