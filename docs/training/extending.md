@@ -207,7 +207,12 @@ mine step 20/20  loss 6.6194  lr 1.00e-03  grad 1.573  108,656 tok/s  ...
 
 {py:meth}`~bux.train.trainer.Trainer.fit` trains to step `steps`, or until
 `trainer.stopping` is set. {py:func}`~bux.train.data.batches` yields the run's
-batches from batch `start` on, so a script that resumes reads what it would have.
+batches from batch `start` on, so a script that resumes reads what it would have;
+{py:func}`~bux.train.data.training_batches` follows the run's curriculum and batch
+ramp too, and the trainer compiles again at each new shape
+([Curriculum](curriculum.md)). `Log` takes the tokens of a step, or a function of a
+step count that gives the tokens of so many steps
+({py:func}`bux.train.curriculum.tokens`).
 `Trainer(..., compute=, matmuls=, microbatches=, donate=, ...)` takes what the run's
 `precision` and `methods` give `train`; made inside `bux.parallel.use`, it puts its
 state on the mesh ([In a script](../parallelism/index.md#in-a-script)).

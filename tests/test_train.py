@@ -726,7 +726,7 @@ def test_the_log_reports_mfu_where_the_devices_peak_is_known():
     loss = objective(tcfg.LossConfig(), arch)
     work = flops.Work(3e6, {flops.Mask(): 2e6})  # 1e6 of attention a step on rows of 8
     model = Model(arch, rngs=nnx.Rngs(0))
-    trainer = Trainer(model, optax.adamw(1e-3), loss, work=work)
+    trainer = Trainer(model, optax.adamw(1e-3), loss, work=lambda rows, t: work)
     lr = lr_multiplier(constant(2))
     data = batches(tcfg.SyntheticConfig(), rows(tcfg.SyntheticConfig(), 2, 8), 32)
     latest = LatestMetrics()
