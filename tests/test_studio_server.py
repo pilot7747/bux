@@ -363,3 +363,8 @@ def test_offsets_count_as_the_pages_strings_do(client):
     body = {"source": source, "picks": {}, "ops": [op]}
     edited = client.call("/api/edit", body)[1]["source"]
     assert edited == source.replace("= rmsnorm", "= rmsnorm(eps=1e-6)", 1)
+
+
+def test_a_deleted_file_is_not_answered_with_the_template(client, file):
+    file.unlink()
+    assert client.call("/api/file?source=1")[1] == {"mtime": None, "source": None}

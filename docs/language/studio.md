@@ -100,7 +100,8 @@ through the compiler again before the page draws it.
   others keep their lines, alignment and comments.
 - Saving is explicit (Cmd-S or Ctrl-S). The studio writes the file in one step, and
   refuses to write it if the file changed on disk since the page loaded it, as
-  another editor's save would. The page then offers what is on disk. The file
+  another editor's save would. The page then offers what is on disk. If the file is deleted on disk, the page keeps
+  its text, unsaved, and a save writes it again. The file
   keeps its line endings, `\r\n` too.
 
 ## Safety

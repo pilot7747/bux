@@ -387,6 +387,7 @@ async function poll() {
 
 async function diskChanged() {
   const disk = await api("/api/file?source=1");
+  if (disk.mtime === null) return deleted();
   if (disk.source === state.saved) return void (state.mtime = disk.mtime);
   if (!dirty()) return loadDisk(disk.source, disk.mtime);
   state.ignored = disk.mtime;
@@ -397,6 +398,13 @@ async function diskChanged() {
       { label: "Keep mine", primary: true, run: () => (state.mtime = disk.mtime) },
     ],
   });
+}
+
+/** The file is gone from disk: keep the text, unsaved, and say a save writes it again. */
+function deleted() {
+  Object.assign(state, { saved: null, mtime: null, ignored: null });
+  showDirty();
+  banner($("banners"), { id: "disk", message: "The file was deleted on disk. Saving writes it again." });
 }
 
 function loadDisk(source, mtime) {

@@ -135,10 +135,12 @@ class Studio:
 
     def file(self, body: Json, query: dict[str, str]) -> Json:
         """``GET /api/file``: when the file last changed, and its text with
-        ``?source=1``."""
-        found: Json = {"mtime": self.mtime()}
+        ``?source=1``; both null for a file that is not on disk, not the
+        template, so that a page whose file was deleted keeps its text."""
+        mtime = self.mtime()
+        found: Json = {"mtime": mtime}
         if query.get("source") == "1":
-            found["source"] = self.source()
+            found["source"] = None if mtime is None else self.source()
         return found
 
     def save(self, body: Json, query: dict[str, str]) -> Json:
