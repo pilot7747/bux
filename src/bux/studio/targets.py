@@ -367,8 +367,7 @@ def bare(source: str, expr: ast.Expr) -> Span:
     match expr:
         case ast.Alt(options=options, labels=labels):
             first = extent(source, options[0]).start
-            if labels and (m := _LABEL.search(source, max(0, first - 256), first)):
-                first = m.start()
+            first = labeled(source, first) if labels else first
             return Span(first, extent(source, options[-1]).end)
         case ast.BinOp(left=left, right=right):
             return Span(extent(source, left).start, extent(source, right).end)
@@ -379,6 +378,13 @@ def bare(source: str, expr: ast.Expr) -> Span:
         case ast.Attr(base=base):
             return Span(extent(source, base).start, expr.span.end)
     return expr.span
+
+
+def labeled(source: str, start: int) -> int:
+    """Return where the label of an alternative that starts at `start` starts:
+    ``mqa: 1``; `start` if it has none."""
+    m = _LABEL.search(source, max(0, start - 256), start)
+    return m.start() if m else start
 
 
 def _before(source: str, i: int) -> int:

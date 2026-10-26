@@ -11,6 +11,7 @@ reads from its URL, so that no other page the browser has open can read or write
 file; the ``Host`` header must name this machine, against DNS rebinding.
 """
 
+import bisect
 import importlib
 import json
 import os
@@ -160,11 +161,17 @@ class Studio:
 
     def view(self, body: Json, query: dict[str, str]) -> Json:
         """``POST /api/view``: the plan's ``View`` of the text, the run picked."""
-        return view(_text(body, "source"), _picks(body), path=self.where)
+        source = _text(body, "source")
+        units = Units(source)
+        found = units.spans(view(source, _picks(body), path=self.where))
+        found["errors"] = [e | units.error(e) for e in found["errors"]]
+        return found
 
     def complete(self, body: Json, query: dict[str, str]) -> list[Json]:
         """``POST /api/complete``: what completion offers at the offset."""
-        items = features.complete(_text(body, "source"), _offset(body), self.where)
+        source = _text(body, "source")
+        offset = Units(source).python(_offset(body))
+        items = features.complete(source, offset, self.where)
         items = sorted(items, key=lambda c: (c.sort, c.label))
         return [
             {
@@ -179,10 +186,13 @@ class Studio:
 
     def hover(self, body: Json, query: dict[str, str]) -> Json | None:
         """``POST /api/hover``: what hovering the offset shows, or null."""
-        found = features.hover(_text(body, "source"), _offset(body), self.where)
+        source = _text(body, "source")
+        units = Units(source)
+        found = features.hover(source, units.python(_offset(body)), self.where)
         if found is None:
             return None
-        return {"start": found.start, "end": found.end, "markdown": found.markdown}
+        start, end = units.page(found.start), units.page(found.end)
+        return {"start": start, "end": end, "markdown": found.markdown}
 
     def inspect(self, body: Json, query: dict[str, str]) -> Json:
         """``POST /api/inspect``: the inspector's form of a target."""
@@ -190,12 +200,12 @@ class Studio:
         target = body.get("target")
         if not isinstance(target, dict):
             raise _bad("target is an object: {node}, {setting} or {model}")
+        source = _text(body, "source")
         try:
-            return forms.inspect(
-                _text(body, "source"), target, picks=_picks(body), path=self.where
-            )
+            form = forms.inspect(source, target, picks=_picks(body), path=self.where)
         except (error, BuxError) as err:
             raise _bad(_message(err)) from None
+        return Units(source).spans(form)
 
     def edit(self, body: Json, query: dict[str, str]) -> Json:
         """``POST /api/edit``: the text with the ops applied."""
@@ -234,6 +244,56 @@ class Studio:
             if key not in self._cache:
                 self._cache[key] = work(t)
             return self._cache[key]
+
+
+class Units:
+    """Offsets into a text as the page counts them, in UTF-16 code units, and as
+    Python does, in code points. They differ past a character outside the BMP, such
+    as an emoji, which the page counts as two.
+
+    Args:
+        text: The text the offsets are into.
+    """
+
+    def __init__(self, text: str):
+        self.wide = [i for i, c in enumerate(text) if ord(c) > 0xFFFF]
+        self.units = [i + k for k, i in enumerate(self.wide)]
+
+    def page(self, i: int) -> int:
+        """Return the page's offset of the code point at `i`."""
+        return i + bisect.bisect_left(self.wide, i)
+
+    def python(self, u: int) -> int:
+        """Return the code point at the page's offset `u`."""
+        return u - bisect.bisect_left(self.units, u)
+
+    def spans(self, reply: Any) -> Any:
+        """Return `reply` with each ``span`` and ``written`` pair in it, at any
+        depth, in the page's units."""
+        if not self.wide or not isinstance(reply, dict | list):
+            return reply
+        if isinstance(reply, list):
+            return [self.spans(v) for v in reply]
+        out = {k: self.spans(v) for k, v in reply.items()}
+        for key in ("span", "written"):
+            if _pair(out.get(key)):
+                out[key] = [self.page(i) for i in out[key]]
+        return out
+
+    def error(self, e: Json) -> Json:
+        """Return the start, end and column of the view's error `e` in the page's
+        units."""
+        line = e["start"] - e["col"] + 1
+        col = self.page(e["start"]) - self.page(line) + 1
+        return {"start": self.page(e["start"]), "end": self.page(e["end"]), "col": col}
+
+
+def _pair(value: object) -> bool:
+    return (
+        isinstance(value, list)
+        and len(value) == 2
+        and all(isinstance(i, int) and not isinstance(i, bool) for i in value)
+    )
 
 
 def _context(source: str, filename: str) -> palette.Context:
@@ -290,18 +350,27 @@ def _picks(body: Json) -> dict[str, int]:
 
 def _write(path: Path, source: str) -> None:
     """Write `source` over `path` at once: to a file beside it, then in its place,
-    keeping its permissions."""
+    keeping its permissions and its line endings, and making its folder."""
     mode = path.stat().st_mode if path.exists() else None
+    newline = _newline(path) if mode is not None else "\n"
+    path.parent.mkdir(parents=True, exist_ok=True)
     fd, temp = tempfile.mkstemp(dir=path.parent, prefix=f".{path.name}.", suffix=".tmp")
     try:
-        with os.fdopen(fd, "w", encoding="utf-8", newline="") as f:
-            f.write(source)
+        with os.fdopen(fd, "w", encoding="utf-8", newline=newline) as f:
+            f.write(source.replace("\r\n", "\n"))
         if mode is not None:
             os.chmod(temp, mode)
         os.replace(temp, path)
     except BaseException:
         Path(temp).unlink(missing_ok=True)
         raise
+
+
+def _newline(path: Path) -> str:
+    """Return the line ending of the file at `path`, as its first line ends."""
+    data = path.read_bytes()
+    end = data.find(b"\n")
+    return "\r\n" if end > 0 and data[end - 1 : end] == b"\r" else "\n"
 
 
 # --- Routing ---------------------------------------------------------------------------
