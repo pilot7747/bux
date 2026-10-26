@@ -1,8 +1,8 @@
 """Where every layer of an architecture goes in an exported model: the module tree
 that every exporter shares, so that one set of weights loads into each.
 
-It imports bux.lang alone, no JAX and no torch, so that a runtime's plugin can place
-the layers just as `bux.export` named their weights.
+It imports bux.lang and bux.config alone, no JAX and no torch, so that a runtime's
+plugin can place the layers just as `bux.export` named their weights.
 
 The model is a tree of scopes, each a module of its own (a generated class):
 
@@ -21,6 +21,7 @@ from collections import Counter
 from collections.abc import Callable, Iterator
 from dataclasses import dataclass, field
 
+from bux import config as cfg
 from bux.lang import ir
 
 #: A node's place in its scope: the child indices from the scope's root to it.
@@ -216,3 +217,16 @@ def _calls(
                 yield from _calls(
                     p, child, (*pos, i), s, (*trail, i), prefix, inside, seen, first
                 )
+
+
+def mixer_depth(p: Plan, call: Call) -> dict:
+    """Return the index of `call`'s layer among the token mixers the model runs, from
+    0, and how many token mixers it runs: what
+    ``bux.architecture.recurrent.linear_attention.depth`` builds a layer by."""
+    mixers = [
+        c.path for c in p.calls if isinstance(c.layer.config, cfg.AttentionConfig)
+    ]
+    return {"layer": mixers.index(call.path), "layers": max(len(mixers), 1)}
+
+
+SITE_EXTRAS["lightning"] = mixer_depth  # its decay rates weaken with depth

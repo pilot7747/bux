@@ -68,7 +68,9 @@ def test_a_shared_module_is_called_from_each_use() -> None:
     assert [c.first for c in attn] == [True, False, False]
 
 
-def test_a_layer_not_exported_yet_says_which() -> None:
+def test_a_layer_not_exported_yet_says_which(monkeypatch: pytest.MonkeyPatch) -> None:
+    classes = {k: v for k, v in codegen.layer_classes().items() if k != "deltanet"}
+    monkeypatch.setattr(codegen, "layer_classes", lambda: classes)
     source = HEAD + "model = embed [rmsnorm deltanet(num_heads=2, head_dim=16)] head"
     with pytest.raises(NotImplementedError, match="deltanet"):
         codegen.modeling(plan(compile(source)), [])

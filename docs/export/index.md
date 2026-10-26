@@ -95,6 +95,20 @@ from bux.export.check import compare
 compare(arch).check()  # fresh weights, perturbed; raises unless all agree
 ```
 
+## Recurrent layers
+
+Linear attention and the state space models keep their state in transformers' cache,
+a `linear_attention` layer each (`conv` for `short_conv`), with the last inputs of
+their short convs. A prefill runs the recurrence by chunks of 64 positions, with
+matmuls within a chunk and a loop across them, as fla's chunked kernels do; a
+decoding step runs one position from the state the cache holds. Mamba's scan, one
+decay per channel and state dim, runs one position at a time, as bux runs it. All of
+it is PyTorch in float32, with no kernels of fla, mamba_ssm or causal_conv1d yet.
+
+A padded token of a left-padded batch leaves the state as it was: its input is zeroed
+and its decay is 1. A model of recurrent layers alone has no attention layer to count
+the tokens its cache holds, so its first forward makes the cache, not `generate`.
+
 ## What exports
 
 A layer type exports once, as a class in `bux.export.hf`, and every architecture made
@@ -106,4 +120,7 @@ layer or the setting.
 | `embed`, `head`, `mlp`, `gated_mlp`, `linear`, `act`, `scale`, `dropout`, `layernorm`, `rmsnorm` | yes, but `embed(norm=...)` and the MLPs' `limit`, `up_softcap` and `up_offset` |
 | `gqa` | RoPE (`pi`, `llama3`), QK-norm, GQA, biases, its scale; not yet its other settings or ports |
 | `conv` | yes, its inputs' tail kept in the cache as it decodes |
+| `gdn`, `kda`, `deltanet`, `gla`, `lightning` | yes, every setting: value heads, the short conv, the output gate and its rank, KDA's decay rank and lower bound, lightning's rates by its depth among the token mixers |
+| `rwkv7` | yes, every setting, and its `v` port (the value residual) |
+| `mamba`, `mamba2`, `short_conv` | yes, every setting; `dt_min` and `dt_max` only start training |
 | the graph | sequences, residual branches, sums, products, constants, repeats, taps, shared definitions; not yet residual algebras |
