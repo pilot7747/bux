@@ -119,6 +119,19 @@ SHRUNK = {
             " latent_input_norm=norm, expert_norm=rescale, expert=dense)"
         ),
     ],
+    "reflection/beam_1.0_501b_a23b.bux": [
+        (
+            "attn = gqa(num_heads=4, num_kv_heads=2, head_dim=8, qk_norm=norm,"
+            " gated=true, gate_head_bias=true)"
+        ),
+        "local = attn(sliding_window_size=4, rope=rope(base=10000))",
+        "global = attn(power_scale=0.1, power_scale_length=2)",
+        (
+            "experts = moe(num_experts=4, top_k=2, router=sigmoid,"
+            " routed_scaling_factor=2.5, num_groups=2, top_k_groups=1,"
+            " load_balancing=aux_free, expert=dense)"
+        ),
+    ],
     "inkling/inkling.bux": [
         (
             "attn = gqa(num_heads=4, num_kv_heads=2, head_dim=8, qk_norm=norm,"

@@ -96,9 +96,10 @@ See the [data guide](docs/data/index.md) for conversations, packings, and the pi
 
 Explore the [example architectures](examples/architectures/), from GPT-2 to recent
 releases grouped by model family (Cohere, DeepSeek, GLM, Inkling, Kimi, Laguna, Mellum,
-MiMo, Muse, Nemotron, Qwen), the [example experiments](examples/experiments/) that
-train them, and the [language guide](docs/language/index.md) for composition, residual
-connections, parameter sharing, and editor support.
+MiMo, Muse, Nemotron, Qwen, Reflection), the
+[example experiments](examples/experiments/) that train them, and the
+[language guide](docs/language/index.md) for composition, residual connections,
+parameter sharing, and editor support.
 
 A run splits over devices by three settings, `mesh`, `layout` and `methods`: FSDP,
 tensor, expert, context and pipeline parallelism, and any mix of them, from one GPU

@@ -134,6 +134,10 @@ class SoftmaxAttention(nnx.Module):
         self.sinks = (
             nnx.Param(jnp.zeros(heads), names=("heads",)) if config.sinks else None
         )
+        gate_bias = config.gated and config.gate_head_bias
+        self.gate_bias = (
+            nnx.Param(jnp.zeros(heads), names=("heads",)) if gate_bias else None
+        )
         self.out_norm = (
             Norm(config.output_norm, v_head_dim) if config.output_norm else None
         )
@@ -213,14 +217,17 @@ class SoftmaxAttention(nnx.Module):
     def _output(
         self, x: Float[Array, "b t d"], out: Float[Array, "b t h dv"]
     ) -> Float[Array, "b t d"]:
-        """Normalize and gate the head outputs, then project them back to the width."""
+        """Normalize and gate the head outputs (the gate plus its bias per head, if
+        any), then project them back to the width."""
         b, t, _ = x.shape
         out = checkpoint_name(out, "attention.out")
         if self.out_norm is not None:
             out = self.out_norm(out)
         if self.gate is not None:
-            gate = activation(self.gate_activation, self.gate(x))
-            out = out * gate.reshape(b, t, self.heads, -1)
+            gate = self.gate(x).reshape(b, t, self.heads, -1)
+            if self.gate_bias is not None:
+                gate = gate + self.gate_bias[...].astype(gate.dtype)[:, None]
+            out = out * activation(self.gate_activation, gate)
         y = self._project(shard_heads(out))
         return y if self.output_dropout is None else self.output_dropout(y)
 
@@ -236,11 +243,12 @@ class Attention(SoftmaxAttention):
     The query heads share the key and value heads in groups: MHA when
     ``num_kv_heads == num_heads``, MQA when it is 1. The layer projects the input to
     q, k and v (one matrix each, or one fused under ``fused_qkv``), adds a causal conv
-    to k and v under ``kv_conv_size`` (Inkling), applies QK-norm and then RoPE, and
-    attends by the run's ``methods.attention`` (`bux.parallel.context`). The heads'
-    outputs then go through `SoftmaxAttention`'s norm, gate, output projection and
-    dropout. `build_gqa` makes this class, or `FullLogitsAttention` or
-    `SparseAttention` where the config needs them.
+    to k and v under ``kv_conv_size`` (Inkling), applies QK-norm and then RoPE, scales
+    the queries by their position under ``power_scale`` (Beam), and attends by the
+    run's ``methods.attention`` (`bux.parallel.context`). The heads' outputs then go
+    through `SoftmaxAttention`'s norm, gate, output projection and dropout.
+    `build_gqa` makes this class, or `FullLogitsAttention` or `SparseAttention` where
+    the config needs them.
 
     Ports, where the source lists them:
 
@@ -322,6 +330,8 @@ class Attention(SoftmaxAttention):
         self.q_norm = Norm(qk_norm, dk) if qk_norm else None
         self.k_norm = Norm(qk_norm, dk) if qk_norm and projects_kv else None
         self.rope = config.rope
+        self.power_scale = config.power_scale
+        self.power_scale_length = config.power_scale_length
         self.value_residual = config.value_residual
         shape = (2,) if config.value_residual == "learned" else ()
         trained = reads(ports, "v") and config.value_residual != "fixed"
@@ -383,10 +393,16 @@ class Attention(SoftmaxAttention):
     def _queries(
         self, q: Float[Array, "b t _"], pos: Int[Array, "b t"] | None
     ) -> Float[Array, "b t h dk"]:
-        """Reshape the projected queries into heads, then apply QK-norm and RoPE."""
+        """Reshape the projected queries into heads, then apply QK-norm, RoPE and the
+        power scale."""
         b, t, _ = q.shape
         q = q.reshape(b, t, self.heads, self.head_dim)
-        return shard_heads(norm_and_rotate(q, self.q_norm, self.rope, pos, "heads"))
+        q = norm_and_rotate(q, self.q_norm, self.rope, pos, "heads")
+        if self.power_scale is not None:
+            at = jnp.arange(t) if pos is None else pos
+            scale = _power_scale(at, self.power_scale, self.power_scale_length)
+            q = (q * scale).astype(q.dtype)
+        return shard_heads(q)
 
     def _keys_and_values(
         self,
@@ -466,6 +482,14 @@ def _relative_bias(
     rows = table[:, jnp.clip(offset, 0, extent - 1)]
     near = (offset >= 0) & (offset < extent)
     return jnp.einsum("bthr,rts->bhts", r, rows) * near
+
+
+def _power_scale(
+    pos: Int[Array, "*lead t"], power: float, length: int
+) -> Float[Array, "*lead t 1 1"]:
+    """Return the factor on each query for its position n, counted from 1:
+    (1 + n / length) ** power, in float32."""
+    return jnp.exp(power * jnp.log1p((pos + 1) / length))[..., None, None]
 
 
 def _length_scale(

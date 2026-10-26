@@ -811,6 +811,11 @@ SPLIT = {
         "gqa(num_heads=4, num_kv_heads=2, rope=rope(), gated=true, sinks=true,"
         " kv_conv_size=3, relative_bias=relbias(rank=2, extent=4))"
     ),
+    # Beam's global layers: queries scaled by their position, a gate bias per head
+    "power_scale": (
+        "gqa(num_heads=4, num_kv_heads=2, gated=true, gate_head_bias=true,"
+        " power_scale=0.5, power_scale_length=2)"
+    ),
     "mla": "latent",
     "mla_indexer": "latent(indexer=small)",
     "csa": "window(compress_ratio=2, indexer=small(top_k=2))",
@@ -849,7 +854,7 @@ def test_attention_split_by_head_trains_the_same_and_rematerializes_nothing(
     trains_the_same(losses, involuntary, layer, BY_HEAD)
 
 
-@pytest.mark.parametrize("layer", ["gqa", "mla", "csa"])
+@pytest.mark.parametrize("layer", ["gqa", "power_scale", "mla", "csa"])
 def test_attention_trains_the_same_with_the_positions_split(losses, involuntary, layer):
     trains_the_same(losses, involuntary, SPLIT[layer], BY_POSITION)
 
