@@ -42,6 +42,7 @@ MOE = PRELUDE + EXPERTS + "model = embed ([norm attn] [norm experts])^4 norm hea
 BIASED = MOE.replace(
     "top_k=2,", "top_k=2, load_balancing=aux_free, bias_update_rate=0.01,"
 )
+SMEBU = BIASED.replace("aux_free", "smebu")
 ONE, SCAN = "mesh(data=1)", "methods(repeat=scan)"
 TOKENS = np.random.default_rng(0).integers(0, 128, (16, 16))
 TRAIN = (
@@ -342,10 +343,12 @@ def _bias(model: Model) -> Float[np.ndarray, "layers experts"]:
     return np.asarray(moe.router_bias[...])
 
 
-def _stepped_bias(mesh: str, methods: str) -> Float[np.ndarray, "layers experts"]:
-    """The router bias of BIASED's model after a training step on TOKENS."""
-    trainer = _trainer(BIASED, mesh, methods)
-    t = _run(BIASED, mesh, methods).train
+def _stepped_bias(
+    mesh: str, methods: str, source: str = BIASED
+) -> Float[np.ndarray, "layers experts"]:
+    """The router bias of `source`'s model after a training step on TOKENS."""
+    trainer = _trainer(source, mesh, methods)
+    t = _run(source, mesh, methods).train
     with parallel.use(t.mesh, t.layout, t.methods):
         trainer.train_on_batch(plain(TOKENS))
     return _bias(trainer.model)
@@ -356,6 +359,13 @@ def test_a_scheduled_step_moves_the_router_bias_once_from_the_whole_batch(name):
     whole = _stepped_bias(ONE, SCAN)
     piped = _stepped_bias("mesh(stage=2, data=1)", _how(name, 4))
     assert np.abs(whole).max() > 0 and np.allclose(piped, whole, atol=1e-6)
+
+
+def test_smebu_moves_each_scanned_layer_s_bias_on_its_own_and_once_a_step():
+    whole = _stepped_bias(ONE, SCAN, SMEBU)
+    piped = _stepped_bias("mesh(stage=2, data=1)", _how("1f1b", 4), SMEBU)
+    assert np.abs(whole).max() > 0 and np.allclose(piped, whole, atol=1e-6)
+    assert np.allclose(whole.mean(-1), 0, atol=1e-7)  # each layer's centered
 
 
 # --- The default, and the stages that balance its work ---------------------------------

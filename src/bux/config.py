@@ -82,6 +82,9 @@ class NormalizationConfig(Config):
     bias: bool = False  # A learned bias per channel, added last (GPT-2's layernorms).
     # The gain as 1 + w, with w learned from 0 (Gemma, Qwen3-Next).
     zero_centered: bool = False
+    # Where the gain starts: 1 / sqrt(layers) is Trinity's depth-scaled sandwich norm,
+    # [norm attn norm(gain_init=layers ^ -0.5)].
+    gain_init: float = 1.0
     # Multiply by the gain before normalizing, norm(w * x), not after (Muse Spark).
     scale_input: bool = False
 
@@ -260,13 +263,24 @@ class MoEConfig(Config):
     # Load balancing by a loss, a bias or both. aux_free adds a bias per expert to the
     # scores that pick the top-k, not to the weights. Every training step moves it by
     # bias_update_rate: up for experts picked less than the mean, down for those picked
-    # more (DeepSeek-V3).
-    load_balancing: Literal["aux_loss", "aux_free"] = "aux_loss"
-    # How far aux_free's bias moves each training step, for each expert.
+    # more (DeepSeek-V3). smebu moves the same bias by a step that shrinks as an expert's
+    # load nears the mean: tanh(bias_softclamp * (mean - load) / mean) times the rate,
+    # centered over the experts and averaged by a momentum of bias_momentum (Trinity).
+    load_balancing: Literal["aux_loss", "aux_free", "smebu"] = "aux_loss"
+    # How far the bias moves each training step, for each expert: aux_free's step, and
+    # SMEBU's largest (Trinity Large: 5e-4).
     bias_update_rate: Annotated[float, Field(ge=0)] = 1e-3
+    # aux_free: subtract the bias's mean after every move, so that the biases stay
+    # centered (Trinity Nano and Mini). SMEBU always centers its moves.
+    center_bias: bool = False
+    # SMEBU's kappa: how soon tanh saturates, a load off the mean by 1 / kappa of it
+    # moving the bias by 0.76 of the rate.
+    bias_softclamp: Annotated[float, Field(gt=0)] = 2.0
+    # SMEBU's beta: the decay of the moves' running average, which moves the bias.
+    bias_momentum: Annotated[float, Field(ge=0, lt=1)] = 0.5
     # Weight of each layer's balance loss, E * sum_e f_e P_e, where f_e is the fraction
     # of top-k picks that go to expert e and P_e its mean score, normalized over the
-    # experts (Switch; DeepSeek-V3, eqs. 17-20). None -> 1e-2, or 0 with aux_free. Every
+    # experts (Switch; DeepSeek-V3, eqs. 17-20). None -> 1e-2, or 0 with a bias. Every
     # layer adds its own, as in Megatron-LM. transformers pools the layers into one loss
     # and counts tokens, not picks, so its coefficient c is about c * top_k / layers.
     aux_loss_coef: Annotated[float, Field(ge=0)] | None = None
@@ -288,10 +302,11 @@ class MoEConfig(Config):
 
     @property
     def aux_loss_weight(self) -> float:
-        """`aux_loss_coef`, or its default: 0 with ``aux_free``, else 1e-2."""
+        """`aux_loss_coef`, or its default: 0 with ``aux_free`` or ``smebu``, else
+        1e-2."""
         if self.aux_loss_coef is not None:
             return self.aux_loss_coef
-        return 0.0 if self.load_balancing == "aux_free" else 1e-2
+        return 1e-2 if self.load_balancing == "aux_loss" else 0.0
 
 
 # --- Token mixers ---------------------------------------------------------------
@@ -873,6 +888,28 @@ class EngramConfig(Config):
     boundary_token: int | None = None
 
 
+# --- Initialization -------------------------------------------------------------
+# How the weights start, set for the whole model by the top-level setting `init`, as
+# `init = normal(std=0.02)`. Without it, a projection or an expert starts LeCun normal,
+# of variance 1 / fan_in, and an embedding table normal of variance 1 / d_model.
+
+
+class NormalInitConfig(Config):
+    """Every weight matrix drawn from one normal: the top-level setting
+    ``init = normal(std=0.02)`` (GPT-2), or truncated,
+    ``init = normal(std=0.5 * d_model ^ -0.5, truncate=3)`` (Trinity).
+
+    It replaces the default of every projection, expert and embedding table. What
+    starts in a way of its own keeps it: norms' gains, biases, zero-initialized
+    outputs, Mamba's decays and time steps, RWKV-7's uniform projections."""
+
+    type: Literal["normal"] = "normal"
+    std: Annotated[float, Field(gt=0)]  # The standard deviation, before truncation.
+    # Values farther than this many standard deviations from 0 are drawn again;
+    # None: none are.
+    truncate: Annotated[float, Field(gt=0)] | None = None
+
+
 # --- Residual stream ------------------------------------------------------------
 # Residual algebras: what a residual branch `[f]` does instead of `x + f(x)`, set for
 # the whole model by the top-level setting `residual`, as `residual = mhc()`. Only
@@ -1016,6 +1053,7 @@ SubConfig = Annotated[
     | HyperConnectionsConfig
     | GatedResidualConfig
     | AttentionResidualConfig
-    | ResidualGateConfig,
+    | ResidualGateConfig
+    | NormalInitConfig,
     Field(discriminator="type"),
 ]

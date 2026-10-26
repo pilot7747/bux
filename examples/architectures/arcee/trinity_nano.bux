@@ -1,0 +1,28 @@
+# Trinity Nano (Arcee AI, 2025): a 6B MoE with 1B active, Trinity Mini made narrow and
+# deep: 56 layers 1024 wide, 8 query heads in each, and 8 of 128 experts of 256 hidden
+# units a token beside a shared one. The rest is Mini's: sliding-window RoPE and NoPE
+# global layers 3:1, gated and QK-normed, sandwich norms whose output gains start at
+# 1 / sqrt(56), every weight from a normal of 0.5 / sqrt(d_model) truncated at 3
+# sigma, and a re-centered aux-loss-free router bias. The first two layers are dense.
+d_model    = 1024
+vocab_size = 200192
+layers     = 56
+
+init    = normal(std=0.5 * d_model ^ -0.5, truncate=3)
+norm    = rmsnorm(eps=1e-5)
+post    = norm(gain_init=layers ^ -0.5)
+attn    = gqa(num_heads=8, num_kv_heads=2, head_dim=128, qk_norm=norm, gated=true)
+local   = attn(sliding_window_size=2048, rope=rope(base=10000))
+global  = attn
+dense   = gated_mlp(intermediate_size=3072, activation=swish)
+experts = moe(num_experts=128, top_k=8, num_shared_experts=1, router=sigmoid,
+              routed_scaling_factor=2.826, load_balancing=aux_free,
+              bias_update_rate=1e-3, center_bias=true,
+              expert=gated_mlp(intermediate_size=256, activation=swish))
+
+layer(mixer, ffn=experts) = [norm mixer post] [norm ffn post]
+l = layer(local, dense)
+L = layer(local)
+G = layer(global)
+
+model = embed(scale_by_sqrt_dim=true) "ll" "LG" "LLLG"^13 norm head

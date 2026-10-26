@@ -411,7 +411,7 @@ class LowRank(nnx.Module):
             down = jnp.zeros((n_in, rank))
             up = nnx.initializers.orthogonal(gain)(rngs.params(), (rank, n_out))
         else:
-            init = nnx.initializers.lecun_normal()
+            init = parallel.default_init()
             down = init(rngs.params(), (n_in, rank))
             up = init(rngs.params(), (rank, n_out))
         self.down = nnx.Param(down, names=("embed", "latent"))

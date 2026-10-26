@@ -18,7 +18,8 @@ class Norm(nnx.Module):
     A layernorm centers x and divides it by its standard deviation, an rmsnorm only
     divides it by its root mean square, both with `eps` added under the root; then
     each multiplies by a learned gain (1 + w if `zero_centered`, or before
-    normalizing with `scale_input`) and adds a learned bias, if the config has them.
+    normalizing with `scale_input`), which starts at `gain_init`, and adds a learned
+    bias, if the config has them.
     The statistics are in float32, the result in x's dtype. Other layers make one for
     a norm of their own, as of each head.
 
@@ -35,8 +36,11 @@ class Norm(nnx.Module):
         self.eps = config.eps
         self.zero_centered = config.zero_centered
         self.scale_input = config.scale_input
-        init = jnp.zeros if config.zero_centered else jnp.ones
-        self.scale = nnx.Param(init(width)) if config.affine else None
+        start = config.gain_init - 1 if config.zero_centered else config.gain_init
+        # float32, as jnp.ones: a weakly typed gain would turn strong at its first
+        # update, and the step compile again.
+        gain = jnp.full(width, start, jnp.float32)
+        self.scale = nnx.Param(gain) if config.affine else None
         self.bias = nnx.Param(jnp.zeros(width)) if config.bias else None
 
     def __call__(

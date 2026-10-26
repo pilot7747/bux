@@ -194,7 +194,7 @@ The `Context` holds:
 
 | Attribute | What it is |
 |-----------|-----------|
-| `arch` | the whole `Architecture`: `d_model`, `vocab_size`, `residual` |
+| `arch` | the whole `Architecture`: `d_model`, `vocab_size`, `residual`, `init` |
 | `rngs` | the `nnx.Rngs` that draw the initial parameters |
 | `depth` | the residual branches around the layer |
 | `built` | what earlier layers left: `count` of layers built by type, the first `embedding` (which tied heads and `nextn` read), the `primes` Engram's tables took |
@@ -305,6 +305,11 @@ self.sinks = nnx.Param(jnp.zeros(h), names=("heads",))
 
 q = parallel.shard(q, "batch", "seq", "heads", None)
 ```
+
+`parallel.named` starts a kernel by the model's `init` if it sets one, else by LeCun
+normal ([Initialization](layers.md#initialization)). Pass `init=` for a start of the
+layer's own, such as zeros; a weight matrix made by hand starts by
+`parallel.default_init(own)`, which is `own` unless the model sets an `init`.
 
 The names are the fields of `layout`, a closed set; any other is an error:
 

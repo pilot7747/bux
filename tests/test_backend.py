@@ -23,6 +23,7 @@ from bux.architecture import (
     Model,
     MoE,
     NextN,
+    Norm,
     Segments,
     Taps,
     num_params,
@@ -465,6 +466,39 @@ def test_fused_qkv_is_the_three_projections_side_by_side():
     # Reading its keys and values from a kv port, it projects only queries.
     read = attn(True, (ir.Port(name="kv", tap="kv", mode="read"),))
     assert read.qkv is None and read.q is not None
+
+
+def test_an_init_starts_every_weight_matrix_and_leaves_the_rest_alone():
+    body = (
+        "experts = moe(num_experts=4, top_k=2, num_shared_experts=1, expert=ffn)\n"
+        "model = embed [norm attn norm(gain_init=0.25)] [norm experts] norm head"
+    )
+    plain = nnx.state(model(body), nnx.Param)
+    drawn = nnx.state(model("init = normal(std=0.01, truncate=2)\n" + body), nnx.Param)
+    weights = []
+    for (path, a), (_, b) in zip(nnx.to_flat_state(plain), nnx.to_flat_state(drawn)):
+        if b.ndim < 2:  # norms' gains and biases: as without an init
+            assert jnp.array_equal(a[...], b[...]), path
+            continue
+        assert float(jnp.abs(b[...]).max()) <= 0.02, path
+        weights.append(b[...].ravel())
+    # The embedding, q k v o, the router, the experts' up and down, the shared
+    # expert's gate up and down, the head.
+    assert len(weights) == 12
+    # A normal of 0.01 truncated at 2 sigma has a deviation of 0.88 of 0.01.
+    assert jnp.isclose(jnp.concatenate(weights).std(), 0.0088, rtol=0.05)
+    gains = [x[...] for p, x in nnx.to_flat_state(drawn) if p[-1] == "scale"]
+    assert sorted(float(g[0]) for g in gains) == [0.25] + [1.0] * 3
+
+
+def test_a_gain_starts_at_gain_init_zero_centered_or_not():
+    x = jax.random.normal(jax.random.key(0), (2, 8))
+    plain = Norm(cfg.NormalizationConfig(type="rmsnorm"), 8)(x)
+    for zero_centered in (False, True):
+        c = cfg.NormalizationConfig(
+            type="rmsnorm", gain_init=0.5, zero_centered=zero_centered
+        )
+        assert jnp.allclose(Norm(c, 8)(x), 0.5 * plain)
 
 
 def test_output_bias_follows_bias_unless_set():
