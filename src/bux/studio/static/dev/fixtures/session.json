@@ -1,0 +1,320 @@
+{
+ "path": "examples/architectures/llama3_8b.bux",
+ "name": "llama3_8b.bux",
+ "source": "# Llama 3 8B (Meta, 2024): the reference pre-norm decoder.\nd_model    = 4096\nvocab_size = 128256\n\nnorm = rmsnorm(eps=1e-5)\nattn = gqa(num_heads=32, num_kv_heads=8, rope=rope(base=500000))\nffn  = gated_mlp(intermediate_size=14336, activation=swish)\n\nblock = [norm attn] [norm ffn]\nmodel = embed block^32 norm head\n",
+ "mtime": 1761480000.0,
+ "palette": [
+  {
+   "name": "act",
+   "kind": "layer",
+   "category": "op",
+   "title": "Act",
+   "doc": "An activation, applied elementwise. Usually written bare, by its name:",
+   "template": "act(fn=)"
+  },
+  {
+   "name": "conv",
+   "kind": "layer",
+   "category": "op",
+   "title": "Conv",
+   "doc": "Causal depthwise convolution over positions, with no gate or activation. As a",
+   "template": "conv"
+  },
+  {
+   "name": "csa",
+   "kind": "layer",
+   "category": "attention",
+   "title": "Compressed sparse attention",
+   "doc": "Compressed sparse attention (DeepSeek-V4): every query head attends to a sliding",
+   "template": "csa(num_heads=)"
+  },
+  {
+   "name": "deltanet",
+   "kind": "layer",
+   "category": "recurrent",
+   "title": "DeltaNet",
+   "doc": "DeltaNet: the delta rule (Schlag et al., 2021; Yang et al., 2024).",
+   "template": "deltanet(num_heads=, head_dim=)"
+  },
+  {
+   "name": "dropout",
+   "kind": "layer",
+   "category": "op",
+   "title": "Dropout",
+   "doc": "Dropout of the stream, in training: ``[norm attn dropout(rate=0.1)]``.",
+   "template": "dropout(rate=)"
+  },
+  {
+   "name": "dyt",
+   "kind": "layer",
+   "category": "norm",
+   "title": "Dynamic tanh",
+   "doc": "Dynamic Tanh (Zhu et al., 2025), a norm without statistics:",
+   "template": "dyt"
+  },
+  {
+   "name": "embed",
+   "kind": "layer",
+   "category": "io",
+   "title": "Token embedding",
+   "doc": "The token embedding: token ids to the stream, by a table of `vocab_size` rows",
+   "template": "embed"
+  },
+  {
+   "name": "engram",
+   "kind": "layer",
+   "category": "experts",
+   "title": "Engram memory",
+   "doc": "Conditional memory (DeepSeek Engram, 2026): hashed n-gram embeddings of the input",
+   "template": "engram(head_dim=, table_size=)"
+  },
+  {
+   "name": "gated_mlp",
+   "kind": "layer",
+   "category": "ffn",
+   "title": "Gated feed-forward",
+   "doc": "A dense MLP, ``mlp``, or a gated one, ``gated_mlp`` (GLU variants; Shazeer,",
+   "template": "gated_mlp(type=, intermediate_size=, activation=)"
+  },
+  {
+   "name": "gdn",
+   "kind": "layer",
+   "category": "recurrent",
+   "title": "Gated DeltaNet",
+   "doc": "Gated DeltaNet: the delta rule with a scalar per-head decay (Yang et al., 2025).",
+   "template": "gdn(num_heads=, head_dim=)"
+  },
+  {
+   "name": "gdn2",
+   "kind": "layer",
+   "category": "recurrent",
+   "title": "Gated DeltaNet-2",
+   "doc": "Gated DeltaNet-2 (Hatamizadeh et al., 2026): KDA's erase and write decoupled.",
+   "template": "gdn2(num_heads=, head_dim=)"
+  },
+  {
+   "name": "gla",
+   "kind": "layer",
+   "category": "recurrent",
+   "title": "Gated linear attention",
+   "doc": "Gated linear attention (Yang et al., 2024): a data-dependent decay per channel.",
+   "template": "gla(num_heads=, head_dim=)"
+  },
+  {
+   "name": "gqa",
+   "kind": "layer",
+   "category": "attention",
+   "title": "Grouped-query attention",
+   "doc": "Grouped-query attention; MHA when num_kv_heads == num_heads, MQA when it is 1.",
+   "template": "gqa(num_heads=, num_kv_heads=)"
+  },
+  {
+   "name": "head",
+   "kind": "layer",
+   "category": "io",
+   "title": "Output head",
+   "doc": "The language-model head: the stream to logits over the vocabulary,",
+   "template": "head"
+  },
+  {
+   "name": "kda",
+   "kind": "layer",
+   "category": "recurrent",
+   "title": "Kimi delta attention",
+   "doc": "Kimi Delta Attention (Kimi Linear, 2025): Gated DeltaNet, a decay per channel.",
+   "template": "kda(num_heads=, head_dim=)"
+  },
+  {
+   "name": "layernorm",
+   "kind": "layer",
+   "category": "norm",
+   "title": "LayerNorm",
+   "doc": "Layer normalization (Ba et al., 2016) or RMSNorm (Zhang & Sennrich, 2019).",
+   "template": "layernorm(type=)"
+  },
+  {
+   "name": "lightning",
+   "kind": "layer",
+   "category": "recurrent",
+   "title": "Lightning attention",
+   "doc": "Lightning attention (TransNormerLLM, MiniMax-01): a fixed decay per head.",
+   "template": "lightning(num_heads=, head_dim=)"
+  },
+  {
+   "name": "linear",
+   "kind": "layer",
+   "category": "op",
+   "title": "Linear",
+   "doc": "A dense projection to `features` channels, ``x W + b``: with embed and head, the",
+   "template": "linear(features=)"
+  },
+  {
+   "name": "mamba",
+   "kind": "layer",
+   "category": "recurrent",
+   "title": "Mamba",
+   "doc": "Selective SSM with a diagonal state matrix (Gu & Dao, 2023), as in Jamba.",
+   "template": "mamba"
+  },
+  {
+   "name": "mamba2",
+   "kind": "layer",
+   "category": "recurrent",
+   "title": "Mamba-2",
+   "doc": "Mamba-2 / SSD (Dao & Gu, 2024): a scalar decay per head (Zamba2, Nemotron-H).",
+   "template": "mamba2"
+  },
+  {
+   "name": "merge",
+   "kind": "layer",
+   "category": "op",
+   "title": "Merge",
+   "doc": "Reads a widened residual stream back into one (hc, mhc, gr, attnres).",
+   "template": "merge"
+  },
+  {
+   "name": "mla",
+   "kind": "layer",
+   "category": "attention",
+   "title": "Multi-head latent attention",
+   "doc": "Multi-head latent attention (DeepSeek-V2/V3, Kimi K2, Kimi Linear).",
+   "template": "mla(num_heads=)"
+  },
+  {
+   "name": "mlp",
+   "kind": "layer",
+   "category": "ffn",
+   "title": "Feed-forward",
+   "doc": "A dense MLP, ``mlp``, or a gated one, ``gated_mlp`` (GLU variants; Shazeer,",
+   "template": "mlp(type=, intermediate_size=, activation=)"
+  },
+  {
+   "name": "moe",
+   "kind": "layer",
+   "category": "experts",
+   "title": "Mixture of experts",
+   "doc": "Token-choice top-k mixture of experts (Mixtral, DeepSeekMoE, Qwen3-MoE).",
+   "template": "moe(num_experts=, top_k=, expert=)"
+  },
+  {
+   "name": "nextn",
+   "kind": "layer",
+   "category": "io",
+   "title": "Next-token embedding",
+   "doc": "Multi-token prediction input (DeepSeek-V3): ``h -> W [norm(e_{i+k}); norm(h)]``.",
+   "template": "nextn"
+  },
+  {
+   "name": "rmsnorm",
+   "kind": "layer",
+   "category": "norm",
+   "title": "RMSNorm",
+   "doc": "Layer normalization (Ba et al., 2016) or RMSNorm (Zhang & Sennrich, 2019).",
+   "template": "rmsnorm(type=)"
+  },
+  {
+   "name": "rwkv7",
+   "kind": "layer",
+   "category": "recurrent",
+   "title": "RWKV-7",
+   "doc": "RWKV-7 \"Goose\" time mixing (Peng et al., 2025): a generalized delta rule.",
+   "template": "rwkv7(num_heads=, head_dim=)"
+  },
+  {
+   "name": "scale",
+   "kind": "layer",
+   "category": "op",
+   "title": "Scale",
+   "doc": "A learnable multiplier: ReZero, LayerScale, residual lambdas.",
+   "template": "scale"
+  },
+  {
+   "name": "short_conv",
+   "kind": "layer",
+   "category": "op",
+   "title": "Short conv",
+   "doc": "Double-gated short causal convolution (LFM2; cf. H3, Hyena).",
+   "template": "short_conv"
+  },
+  {
+   "name": "gelu",
+   "kind": "activation",
+   "category": "op",
+   "title": "gelu",
+   "doc": "The gelu activation, elementwise.",
+   "template": "gelu"
+  },
+  {
+   "name": "gelu_tanh",
+   "kind": "activation",
+   "category": "op",
+   "title": "gelu_tanh",
+   "doc": "The gelu_tanh activation, elementwise.",
+   "template": "gelu_tanh"
+  },
+  {
+   "name": "quick_gelu",
+   "kind": "activation",
+   "category": "op",
+   "title": "quick_gelu",
+   "doc": "The quick_gelu activation, elementwise.",
+   "template": "quick_gelu"
+  },
+  {
+   "name": "relu",
+   "kind": "activation",
+   "category": "op",
+   "title": "relu",
+   "doc": "The relu activation, elementwise.",
+   "template": "relu"
+  },
+  {
+   "name": "relu2",
+   "kind": "activation",
+   "category": "op",
+   "title": "relu2",
+   "doc": "The relu2 activation, elementwise.",
+   "template": "relu2"
+  },
+  {
+   "name": "sigmoid",
+   "kind": "activation",
+   "category": "op",
+   "title": "sigmoid",
+   "doc": "The sigmoid activation, elementwise.",
+   "template": "sigmoid"
+  },
+  {
+   "name": "situ",
+   "kind": "activation",
+   "category": "op",
+   "title": "situ",
+   "doc": "The situ activation, elementwise.",
+   "template": "situ"
+  },
+  {
+   "name": "softplus",
+   "kind": "activation",
+   "category": "op",
+   "title": "softplus",
+   "doc": "The softplus activation, elementwise.",
+   "template": "softplus"
+  },
+  {
+   "name": "swish",
+   "kind": "activation",
+   "category": "op",
+   "title": "swish",
+   "doc": "The swish activation, elementwise.",
+   "template": "swish"
+  },
+  {
+   "name": "tanh",
+   "kind": "activation",
+   "category": "op",
+   "title": "tanh",
+   "doc": "The tanh activation, elementwise.",
+   "template": "tanh"
+  }
+ ]
+}
