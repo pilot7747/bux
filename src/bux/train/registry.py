@@ -14,8 +14,9 @@ optimizer is a function, not a fork::
 
 A new tag needs its config in `bux.train.config` too, where the compiler finds it.
 The registries of training are `bux.train.optim.schedules`,
-`bux.train.optim.optimizers`, `bux.train.optim.ns_coefficients` and
-`bux.train.data.sources`; `bux.parallel.methods` holds one per kind of method.
+`bux.train.optim.optimizers`, `bux.train.optim.ns_coefficients`,
+`bux.train.optim.ns_algorithms` and `bux.train.data.sources`; `bux.parallel.methods`
+holds one per kind of method.
 """
 
 from collections.abc import Callable

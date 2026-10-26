@@ -19,9 +19,11 @@ Muon orthogonalizes its updates by the run's ``orthogonalize`` method
 (`bux.parallel.methods`): ``gspmd`` on whatever shards the compiler gives them,
 ``gather``, each matrix whole on every device that holds it, or ``owner``, each
 matrix whole on one device. Its Newton-Schulz's coefficients are found by name in
-`ns_coefficients`, a builder that gets the number of iterations.
+`ns_coefficients`, a builder that gets the number of iterations, and how it iterates
+in `ns_algorithms`: the standard iteration, or Gram's.
 """
 
+import itertools
 import math
 import typing
 from collections.abc import Callable, Sequence
@@ -36,7 +38,11 @@ from jax.sharding import PartitionSpec as P
 from jax.typing import DTypeLike
 from jaxtyping import Array, ArrayLike, Float, PyTree, Real, Shaped
 from optax.contrib import MuonDimensionNumbers
-from optax.contrib._muon import orthogonalize_via_newton_schulz, scale_by_shape
+from optax.contrib._muon import (
+    _compute_muon_reshape,
+    orthogonalize_via_newton_schulz,
+    scale_by_shape,
+)
 
 from bux import parallel
 from bux.architecture import Scanned
@@ -63,6 +69,12 @@ optimizers = Registry[optax.GradientTransformation](
 #: number of iterations.
 ns_coefficients = Registry[Float[Array, "*steps 3"]](
     "set of Newton-Schulz coefficients", "bux.train.optim.ns_coefficients"
+)
+#: Newton-Schulz's ways to iterate, by name. A builder gets the number of
+#: iterations, their quintics (from `ns_coefficients`) and the iterations after
+#: which Gram's restarts, and returns the `NewtonSchulz`.
+ns_algorithms = Registry[NewtonSchulz](
+    "Newton-Schulz algorithm", "bux.train.optim.ns_algorithms"
 )
 
 
@@ -316,15 +328,15 @@ def muon(
     def shapes(updates: PyTree[Float[Array, "*_"]]) -> PyTree[MuonDimensionNumbers]:
         return jax.tree_util.tree_map_with_path(lambda p, _: dims[_keys(p)], updates)
 
+    ns = newton_schulz(
+        config.ns_steps,
+        config.ns_coefficients,
+        config.ns_algorithm,
+        config.ns_restarts,
+    )
     rule = optax.chain(
         momentum(config.momentum, config.nesterov),
-        orthogonalized(
-            config.ns_steps,
-            dims,
-            model,
-            coefficients=config.ns_coefficients,
-            dtype=config.ns_dtype,
-        ),
+        orthogonalized(ns, dims, model, dtype=config.ns_dtype),
         scale_by_shape(
             weight_dimension_numbers=shapes, consistent_rms=config.consistent_rms
         ),
@@ -369,19 +381,16 @@ def momentum(beta: float, nesterov: bool) -> optax.GradientTransformation:
 
 
 def orthogonalized(
-    steps: int,
+    newton_schulz: NewtonSchulz,
     dims: dict[tuple, MuonDimensionNumbers],
     model: nnx.Module,
-    coefficients: str = "jordan",
     dtype: DTypeLike = jnp.float32,
 ) -> optax.GradientTransformation:
     """Orthogonalize each update, a matrix or a stack of them as `dims` says by path,
-    with `steps` Newton-Schulz iterations of the quintics `coefficients` names, in
-    `dtype`, by the run's `orthogonalize` method. The method gets all of a step's
-    updates at once, so it can choose where each runs, and gets them in `dtype`, so
-    that what it moves is in it too."""
+    by `newton_schulz` (`newton_schulz`), in `dtype`, by the run's `orthogonalize`
+    method. The method gets all of a step's updates at once, so it can choose where
+    each runs, and gets them in `dtype`, so that what it moves is in it too."""
     model_params = nnx.state(model, nnx.Param)  # whose shardings the updates take
-    run = newton_schulz(steps, coefficients)
 
     def update(
         updates: PyTree[Float[Array, "*_"]],
@@ -396,7 +405,7 @@ def orthogonalized(
             [dims[k] for k in keys],
             None if shardings is None else [shardings[k] for k in keys],
             None if states is None else [states[k] for k in keys],
-            run,
+            newton_schulz,
         )
         cast = [y.astype(x.dtype) for y, (_, x) in zip(orthogonal, leaves, strict=True)]
         return jax.tree.unflatten(tree, cast)
@@ -404,17 +413,140 @@ def orthogonalized(
     return optax.stateless(update)
 
 
-def newton_schulz(steps: int, coefficients: str = "jordan") -> NewtonSchulz:
-    """Return optax's Newton-Schulz, with `steps` iterations of the quintics
-    `coefficients` names, in the dtype of the matrix it gets."""
+def newton_schulz(
+    steps: int,
+    coefficients: str = "jordan",
+    algorithm: str = "standard",
+    restarts: Sequence[int] | None = None,
+) -> NewtonSchulz:
+    """Return the Newton-Schulz that `algorithm` names in `ns_algorithms`, with
+    `steps` iterations of the quintics `coefficients` names in `ns_coefficients`,
+    for a matrix in the dtype it returns it in.
+
+    Args:
+        steps: The number of iterations.
+        coefficients: The name of their quintics.
+        algorithm: How it iterates: ``standard`` or ``gram``.
+        restarts: The iterations after which ``gram`` restarts; None, its own.
+
+    Returns:
+        A function of a matrix, or a stack of them as its dimension numbers say,
+        that orthogonalizes each.
+
+    Raises:
+        NotImplementedError: If either name is not registered.
+    """
     coeffs = ns_coefficients.find(coefficients)(steps)
+    return ns_algorithms.find(algorithm)(steps, coeffs, restarts)
+
+
+@ns_algorithms.register("standard")
+def standard(
+    steps: int,
+    coefficients: Float[Array, "*steps 3"],
+    restarts: Sequence[int] | None = None,
+) -> NewtonSchulz:
+    """optax's iteration of the quintics on the matrix itself: three products an
+    iteration, two of them by the matrix. It has no restarts."""
 
     def orthogonal(
         x: Float[Array, "*m"], dims: MuonDimensionNumbers
     ) -> Float[Array, "*m"]:
-        return orthogonalize_via_newton_schulz(x, coeffs, steps, dimension_numbers=dims)
+        return orthogonalize_via_newton_schulz(
+            x, coefficients, steps, dimension_numbers=dims
+        )
 
     return orthogonal
+
+
+@ns_algorithms.register("gram")
+def gram(
+    steps: int,
+    coefficients: Float[Array, "*steps 3"],
+    restarts: Sequence[int] | None = None,
+) -> NewtonSchulz:
+    """Gram Newton-Schulz (Zhang, Amsel, Chen and Dao, 2026): the same quintics,
+    iterated on the Gram matrix of the matrix's shorter side, with products by the
+    matrix only to start, at each restart and at the end. It restarts from the
+    matrix so far after each iteration in `restarts`, before the Gram matrix's
+    rounding grows: by default after the second and every third after it (2, 5, 8,
+    ...), which keeps 4 to 12 iterations of either quintic about as near orthogonal
+    as the standard's. On a matrix too near square for Gram's to save products, it
+    runs the standard iteration.
+
+    It normalizes in float32 and iterates a matrix of 16 bits in float16, as its
+    authors do: bfloat16 rounds the Gram matrix too coarsely."""
+    quintics = jnp.broadcast_to(coefficients, (steps, 3))
+    restarts = range(2, steps, 3) if restarts is None else restarts
+    ends = [0, *sorted({i for i in restarts if 0 < i < steps}), steps]
+    runs = [quintics[i:j] for i, j in itertools.pairwise(ends)]
+    fallback = standard(steps, coefficients)
+
+    def orthogonal(
+        x: Float[Array, "*m"], dims: MuonDimensionNumbers
+    ) -> Float[Array, "*m"]:
+        flat, back = _compute_muon_reshape(x, dims)
+        matrices = flat(x)
+        wide = matrices.shape[-2] <= matrices.shape[-1]
+        matrices = matrices if wide else matrices.mT
+        if not _gram_saves(*matrices.shape[-2:], steps, len(runs)):
+            return fallback(x, dims)
+        y = _normalized(matrices)
+        for run in runs:
+            y = _times(_gram_run(_times(y, y.mT), run), y)
+        y = y.astype(x.dtype)
+        return back(y if wide else y.mT)
+
+    return orthogonal
+
+
+def _gram_saves(m: int, n: int, steps: int, runs: int) -> bool:
+    """Whether `runs` of Gram's iterations of an m×n matrix, m ≤ n, multiply less
+    than the standard iteration's ``steps (m³ + 2 m²n)``, every product computed
+    whole: each run takes ``4 length - 3`` products of m×m matrices, and two by the
+    matrix."""
+    return (4 * steps - 3 * runs) * m + 2 * runs * n < steps * (m + 2 * n)
+
+
+def _normalized(x: Float[Array, "b m n"]) -> Float[Array, "b m n"]:
+    """Each matrix of `x` over its Frobenius norm, in float32, then in what Gram's
+    iteration runs in: float16 for 16 bits."""
+    dtype = jnp.float16 if jnp.finfo(x.dtype).bits == 16 else x.dtype
+    x = x.astype(jnp.promote_types(x.dtype, jnp.float32))
+    return (x / (jnp.linalg.norm(x, axis=(-2, -1), keepdims=True) + 1e-8)).astype(dtype)
+
+
+def _gram_run(
+    r: Float[Array, "b m m"], quintics: Float[Array, "steps 3"]
+) -> Float[Array, "b m m"]:
+    """Return the Q of a run of Gram iterations from the Gram matrix `r`, from Q = I:
+    with ``Z = b R + c R²``, ``Q ← Q Z + a Q`` and ``R ← (Z + a I) R (Z + a I)``,
+    Zhang et al.'s stabilized iteration, which adds each ``a`` in float32, where Z
+    rounded with it would lose it."""
+    (a, b, c), *rest = quintics
+    z = _times(r, r, c, r, b)
+    q = (z + a * jnp.eye(r.shape[-1], dtype=jnp.float32)).astype(r.dtype)
+    for next_a, b, c in rest:
+        rz = _times(r, z, 1.0, r, a)
+        r = _times(z, rz, 1.0, rz, a)
+        a, z = next_a, _times(r, r, c, r, b)
+        q = _times(q, z, 1.0, q, a)
+    return q
+
+
+def _times(
+    x: Float[Array, "*b m k"],
+    y: Float[Array, "*b k n"],
+    scale: Float[ArrayLike, ""] = 1.0,
+    plus: Float[Array, "*b m n"] | None = None,
+    by: Float[ArrayLike, ""] = 0.0,
+) -> Float[Array, "*b m n"]:
+    """``scale x y + by plus``, summed in float32 and rounded to x's dtype once, as a
+    GEMM's epilogue adds."""
+    xy = jnp.matmul(x, y, preferred_element_type=jnp.float32) * scale
+    if plus is not None:
+        xy = xy + plus.astype(jnp.float32) * by
+    return xy.astype(x.dtype)
 
 
 @ns_coefficients.register("jordan")

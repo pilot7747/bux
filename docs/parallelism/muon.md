@@ -40,7 +40,11 @@ Leave `orthogonalize` out to get `owner`.
 | `owner` | The default. Each matrix whole on one device, its owner, which runs its matrices of a shape as one batch. |
 
 `muon`'s own `ns_dtype` (`bfloat16` by default, or `float32`) is the dtype
-Newton-Schulz runs in, under every method.
+Newton-Schulz runs in and the updates move in, under every method. Its
+`ns_algorithm=gram` ([Gram Newton-Schulz](../training/optimizers.md#gram-newton-schulz))
+works under every method too: it changes how a whole matrix is orthogonalized, not
+how matrices move. Under `gspmd` it all-reduces less: at 5 iterations it takes four
+products by the matrix, where the standard iteration takes ten.
 
 ## How it works
 
@@ -83,7 +87,7 @@ def _(updates, dims, shardings, states, newton_schulz):
     # updates: an array per Muon parameter, in muon's ns_dtype; dims: their
     # MuonDimensionNumbers; shardings and states: their parameters' NamedShardings
     # and their optimizer states', where the updates come from, None outside
-    # parallel.use; newton_schulz(x, dims): optax's, in x's dtype.
+    # parallel.use; newton_schulz(x, dims): muon's ns_algorithm, in x's dtype.
     return [newton_schulz(x, d) for x, d in zip(updates, dims)]
 ```
 

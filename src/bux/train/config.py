@@ -31,6 +31,11 @@ Positive = Annotated[int, Field(gt=0)]
 Fraction = Annotated[float, Field(ge=0, le=1)]
 
 
+def _listed(v: object) -> object:
+    """One value, a name or a number, as a list of one."""
+    return (v,) if isinstance(v, str | int) else v
+
+
 # --- Data ---------------------------------------------------------------------------
 # A source is an endless stream of rows of `seq_len` tokens: `input_ids`,
 # `position_ids` (where each token is in its document, so one starts wherever they
@@ -257,6 +262,13 @@ class MuonConfig(Config):
     # Their quintics, by name in bux.train.optim.ns_coefficients: Keller Jordan's, the
     # same at every iteration, or polar_express's (Amsel et al., 2025), one for each.
     ns_coefficients: str = "jordan"
+    # How it iterates, by name in bux.train.optim.ns_algorithms: standard, optax's, or
+    # gram, on the Gram matrix of each matrix's shorter side (Zhang et al., 2026),
+    # with fewer products the further a matrix is from square.
+    ns_algorithm: str = "standard"
+    # The iterations after which gram restarts from the matrix so far, before rounding
+    # grows; none: after the second and every third after it, 2, 5, 8, ...
+    ns_restarts: Annotated[tuple[Positive, ...], BeforeValidator(_listed)] | None = None
     # What Newton-Schulz runs in, and what the updates move between devices in.
     ns_dtype: Literal["float32", "bfloat16"] = "bfloat16"
     weight_decay: float = 0.1  # decoupled, of its matrices, times the learning rate
@@ -625,11 +637,6 @@ class LayoutConfig(Config):
 def _named_none(v: object) -> object:
     """A method named none, which a .bux file writes as its none."""
     return "none" if v is None else v
-
-
-def _listed(v: object) -> object:
-    """One name, as a list of one."""
-    return (v,) if isinstance(v, str) else v
 
 
 Names = Annotated[tuple[str, ...], BeforeValidator(_listed)]
