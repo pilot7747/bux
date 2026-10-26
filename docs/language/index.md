@@ -121,6 +121,7 @@ The command line takes the same statements. See [Modules and amendments](modules
 runs, one for each combination:
 
 ```bux
+attn.num_heads    = 12
 attn.num_kv_heads = mha: 12 | gqa: 4 | mqa: 1
 optimizer.lr      = 1e-3 | 3e-3                 # 3 × 2 = 6 runs
 ```

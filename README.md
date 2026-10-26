@@ -40,7 +40,8 @@ use fineweb_wsd                    # a recipe: data mix, optimizer, schedule
 d_model = 768
 model   = embed block^12 norm head(tied=true)
 
-attn.num_kv_heads = mha: 12 | gqa: 4 | mqa: 1   # llama3_8b's block picks this up
+attn.num_heads    = 12                          # llama3_8b's block picks these up
+attn.num_kv_heads = mha: 12 | gqa: 4 | mqa: 1
 optimizer.lr      = 1e-3 | 3e-3                 # 3 × 2 = 6 runs
 ```
 
