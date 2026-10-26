@@ -26,8 +26,9 @@ and the model class `BuxForCausalLM`.
 
 ## Serving
 
-An export has no tokenizer: give vLLM the one the model was trained with, and the
-dtype to run in.
+An export has no tokenizer: give vLLM the one the model was trained with, the dtype
+to run in, and the longest sequence to serve. Only learned positions bound a bux
+model's context, so vLLM assumes 2048 tokens unless told otherwise.
 
 ```bash
 vllm serve exported/ --tokenizer meta-llama/Llama-3.1-8B --dtype bfloat16 \
@@ -37,7 +38,12 @@ vllm serve exported/ --tokenizer meta-llama/Llama-3.1-8B --dtype bfloat16 \
 ```python
 from vllm import LLM, SamplingParams
 
-llm = LLM(model="exported/", tokenizer="meta-llama/Llama-3.1-8B", dtype="bfloat16")
+llm = LLM(
+    model="exported/",
+    tokenizer="meta-llama/Llama-3.1-8B",
+    dtype="bfloat16",
+    max_model_len=8192,
+)
 print(llm.generate("The capital of France is", SamplingParams(max_tokens=8)))
 ```
 
