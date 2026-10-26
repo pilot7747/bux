@@ -60,10 +60,22 @@ ATTN = "gqa(num_heads=4, num_kv_heads=2, head_dim=8"
 #: MiniMax-M1 and the M2.x use MiniMax-Text-01's and MiniMax-M2's files, shrunk alike.
 MINIMAX_TEXT = SHRUNK["minimax/minimax_text_01.bux"]
 MINIMAX_M2 = SHRUNK["minimax/minimax_m2.bux"]
+#: OLMo 2's, Olmo 3's and SmolLM's other sizes name their layers as the one each
+#: family has in `SHRUNK`, and shrink alike.
+OLMO_2 = SHRUNK["olmo/olmo_2_1b.bux"]
+OLMO_3 = SHRUNK["olmo/olmo_3_7b.bux"]
+SMOLLM = SHRUNK["smollm/smollm3_3b.bux"]
 
 #: The widths of the zoo's models that `SHRUNK` has no entry for, and `SMALL` leaves
 #: wide: their heads, hidden units and experts, as `SHRUNK` shrinks the others'.
 WIDTHS = {
+    "olmo/olmo_2_7b.bux": OLMO_2,
+    "olmo/olmo_2_13b.bux": OLMO_2,
+    "olmo/olmo_2_32b.bux": OLMO_2,
+    "olmo/olmo_3_32b.bux": OLMO_3,
+    "smollm/smollm2_135m.bux": SMOLLM,
+    "smollm/smollm2_360m.bux": SMOLLM,
+    "smollm/smollm2_1.7b.bux": SMOLLM,
     "arcee/trinity_mini.bux": [
         "attn = gqa(num_heads=4, num_kv_heads=2, head_dim=8, qk_norm=norm, gated=true)",
         (
@@ -177,6 +189,15 @@ WIDTHS = {
 #: alike, which over the files' dozens of layers passes compare's 1e-4 where both are
 #: right (docs/export/index.md, "Float32 and depth").
 DEPTHS = {
+    **{
+        f"olmo/olmo_2_{size}.bux": ["model = embed block^3 norm head"]
+        for size in ("7b", "13b", "32b")
+    },
+    "olmo/olmo_3_32b.bux": ['model = embed "LLLG"^2 norm head'],
+    **{
+        f"smollm/smollm2_{size}.bux": ["model = embed block^3 norm head(tied=true)"]
+        for size in ("135m", "360m", "1.7b")
+    },
     "deepseek_v3.bux": ["model = embed layer(dense)^2 layer(experts)^3 norm head"],
     "deepseek/deepseek_r1.bux": [f"model = embed {DEEPSEEK} norm @h out mtp"],
     "deepseek/deepseek_v3.2.bux": [f"model = embed {DEEPSEEK} norm @h out mtp"],
