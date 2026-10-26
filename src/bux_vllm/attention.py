@@ -42,6 +42,7 @@ class Attention(Layer):
     def __init__(self, c: dict, width: int, site: Site):
         super().__init__()
         unsupported(c, "kv_conv_size", "indexer", "relative_bias", "log_scale")
+        unsupported(c, "power_scale", *(("gate_head_bias",) if c["gated"] else ()))
         if site.ports:
             raise NotImplementedError("gqa: ports not in vLLM yet")
         tp = get_tensor_model_parallel_world_size()
