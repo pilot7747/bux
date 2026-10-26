@@ -239,9 +239,14 @@ def test_moe_combinations_export(name: str) -> None:
     check.compare(arch, with_router_bias(arch), experts="eager").check()
 
 
-def test_the_aux_free_bias_picks_the_experts() -> None:
+# The load balancings that move a bias, which picks the experts (Trinity's smebu too).
+BIASES = ["aux_free", "aux_free, center_bias=true", "smebu, bias_softclamp=3.0"]
+
+
+@pytest.mark.parametrize("balancing", BIASES)
+def test_the_load_balancing_bias_picks_the_experts(balancing: str) -> None:
     """The bias changes which experts bux picks, and the export picks the same."""
-    arch = compile(experts("router=sigmoid, load_balancing=aux_free"))
+    arch = compile(experts(f"router=sigmoid, load_balancing={balancing}"))
     model = with_router_bias(arch)
     unbiased = check.perturbed(Model(arch, rngs=nnx.Rngs(0)), 1)
     changed = [

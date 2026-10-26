@@ -152,7 +152,7 @@ class Ctx:
 class Norm(nn.Module):
     """bux's ``layernorm`` and ``rmsnorm``: statistics in float32, the result in x's
     dtype, a gain (1 + w when zero-centered; before normalizing with scale_input)
-    and a bias."""
+    and a bias. ``gain_init`` only starts training."""
 
     bux_types = ("layernorm", "rmsnorm")
 

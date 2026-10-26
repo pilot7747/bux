@@ -127,9 +127,10 @@ class MoE(nn.Module):
     Scores and the top-k choice are in float32, the router's logits from x and its
     kernel in x's dtype, as bux makes them; equal scores pick the lower expert, as
     bux's top-k does. Settings that only matter in training are left out: the
-    balance loss (``aux_loss_coef``, ``aux_loss_scope``), how far the aux-free bias
-    moves (``bias_update_rate``; the bias itself is a buffer, ``router_bias``),
-    ``random_logits``, and dropout.
+    balance loss (``aux_loss_coef``, ``aux_loss_scope``), how the load-balancing bias
+    moves (``bias_update_rate``, ``center_bias``, SMEBU's ``bias_softclamp`` and
+    ``bias_momentum``; the bias itself is a buffer, ``router_bias``, which ``aux_free``
+    and ``smebu`` both add to the scores that choose), ``random_logits``, and dropout.
     """
 
     bux_types = ("moe",)
@@ -140,8 +141,8 @@ class MoE(nn.Module):
         self.config, n = c, c["num_experts"]
         sinks = c["num_shared_experts"] if c["shared_expert_sink"] else 0
         self.router = nn.Linear(width, n + sinks, bias=c["router_bias"])
-        aux_free = c["load_balancing"] == "aux_free"
-        self.register_buffer("router_bias", torch.zeros(n) if aux_free else None)
+        by_bias = c["load_balancing"] != "aux_loss"  # aux_free, smebu
+        self.register_buffer("router_bias", torch.zeros(n) if by_bias else None)
         latent = c["latent_size"] or width
         lat = c["latent_size"] is not None
         self.to_latent = nn.Linear(width, latent, bias=False) if lat else None

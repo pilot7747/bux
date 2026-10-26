@@ -21,9 +21,9 @@ class Router(nn.Module):
     def __init__(self, c: dict):
         super().__init__()
         self.c = c
-        aux_free = c["load_balancing"] == "aux_free"
+        by_bias = c["load_balancing"] != "aux_loss"  # aux_free, smebu
         bias = torch.zeros(c["num_experts"], dtype=torch.float32)
-        self.bias = nn.Parameter(bias, requires_grad=False) if aux_free else None
+        self.bias = nn.Parameter(bias, requires_grad=False) if by_bias else None
 
     def scores(self, logits: torch.Tensor) -> torch.Tensor:
         """Every expert's score of each token, from its logits, in float32."""

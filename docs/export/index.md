@@ -102,7 +102,7 @@ layer or the setting.
 | Layers | Exported |
 |--------|----------|
 | `embed`, `head`, `mlp`, `gated_mlp`, `linear`, `act`, `scale`, `dropout`, `layernorm`, `rmsnorm`, `dyt` | yes, every setting and activation |
-| `moe` | yes, every setting inference reads: the routers, group-limited routing, the aux-free bias, shared experts, LatentMoE, the expert norm, experts of either MLP type; the routed experts by transformers' experts implementations |
+| `moe` | yes, every setting inference reads: the routers, group-limited routing, the load-balancing bias (`aux_free`, `smebu`), shared experts, LatentMoE, the expert norm, experts of either MLP type; the routed experts by transformers' experts implementations |
 | `gqa` | every setting and port: RoPE (`pi`, `llama3`, `yarn`; partial, interleaved), QK-norm of each head or of all heads together, biases, fused or not, head dims, scale, sliding windows, sinks, softcap, gates, output norm, length scale, relative bias, the conv on keys and values, the indexer; `v`, `kv` and `index` ports. Dropout is training's alone |
 | `indexer` | every setting inference reads: DSA's top-k keys, QSA's mean-pooled blocks, MSA's max-pooled blocks and picks for each kv head's group, plain dot products or ReLU'd, weighted or summed; its loss is training's alone |
 | `mla` | every setting, the indexer and the `index` port; keys and values cached as projected up from the latents |
@@ -255,8 +255,8 @@ The cache is transformers' `DynamicCache`; a static one
 ## Mixtures of experts
 
 An exported `moe` routes as bux does: the scores and the top-k choice in float32,
-equal scores picking the lower expert, and the aux-free bias, which the checkpoint
-holds as `router_bias`, in the choice alone. Its routed experts are stacked as
+equal scores picking the lower expert, and the load-balancing bias of `aux_free`
+or `smebu`, which the checkpoint holds as `router_bias`, in the choice alone. Its routed experts are stacked as
 transformers' MoE models keep theirs, `gate_up_proj` (E, 2f, d), the gate's rows
 first, and `down_proj` (E, d, f), so that transformers' experts implementations run
 them:
@@ -270,8 +270,8 @@ model = AutoModelForCausalLM.from_pretrained(
 `grouped_mm`, transformers' default, and `batched_mm` run every setting of the
 experts; `eager` is a loop over them, the reference. A kernel that fuses the
 activation itself (`sonicmoe`) fits SwiGLU experts alone. The settings only training
-reads are left out: the balance loss, how far the aux-free bias moves, and random
-routing.
+reads are left out: the balance loss, how the bias moves (its rate, `center_bias`,
+SMEBU's soft clamp and momentum), and random routing.
 
 ## Recurrent layers
 
