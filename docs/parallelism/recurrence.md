@@ -77,8 +77,8 @@ The options of `methods.states`:
 :::{tip}
 `recompute` buys rows: the Mamba-2 hybrid fits twice the rows a GPU under it, at 4
 to 9% fewer tokens a second ([Measurements](#the-chunks-states-keep-or-recompute)).
-The delta rule by cuDNN's kernels, and GLA and Lightning by GDN-2's, keep only their
-inputs either way.
+The delta rule by cuDNN's kernels, and GLA, Lightning and Gated DeltaNet-2 by GDN-2's,
+keep only their inputs either way.
 :::
 
 ## Constraints and errors
@@ -86,9 +86,9 @@ inputs either way.
 - A method that cannot run a family raises `NotImplementedError` naming it. Under
   `pass_state`, a family whose chunk gives no transition raises so.
 - Where nothing splits the positions, `pass_state` is `scan`.
-- The GPU kernels of the delta rule (cuDNN's and bux's), GLA and Lightning run only
-  under `scan`. Under `pass_state`, and wherever a mesh splits the positions, the
-  chunks run instead.
+- The GPU kernels of the delta rule (cuDNN's and bux's), GLA, Lightning and Gated
+  DeltaNet-2 run only under `scan`. Under `pass_state`, and wherever a mesh splits the
+  positions, the chunks run instead.
 - Under `precision(compute=bfloat16)`, `pass_state` trains on a CPU too: what the
   `shard_map`s' transposes sum is float32 ([Precision](precision.md)).
 
@@ -263,6 +263,28 @@ Decayed linear attention, with no delta rule, runs by cuDNN's GDN-2 kernel under
 - the kernels against the chunks: GDN-2's at GLA's own gate, steep gates and spikes,
   heads of 64, rows of more documents than its room, and Lightning's decays.
 
+(recurrence-gdn2-kernel)=
+### Gated DeltaNet-2's kernel
+
+Gated DeltaNet-2 (`gdn2`) runs by the same kernel, its erase gate as GDN-2's $\beta$
+and its write gate as $w$ (`fused_delta.gated`, by `linear_attention.gated_delta_2`),
+under `scan`, on a B200 or B300, with q, k and v in bfloat16, heads of 64 or 128, and
+its decay bounded at -5 or above (`gate_lower_bound`):
+
+- Bounded so, a tile of 16 positions decays a channel by $e^{-80}$ at most, short of
+  the kernel's exact path.
+- The paper's unbounded gate runs by the chunks. Trained on text, such gates soon
+  decay some tile past $e^{-83}$, and the kernel then runs each call twice: on
+  FineWeb-Edu it trained twice as fast as the chunks for 200 steps, and 16% slower
+  from step 1000 ([Kernels](../performance/kernels.md#gated-deltanet-2s-kernel)).
+- The gates go to the kernel in bfloat16, and come back so.
+- It keeps only its inputs for the backward pass, and so do the chunks it falls back on
+  in a row of more documents than its room.
+
+`scripts/gpu_smoke/recurrence.py` checks it against the chunks at gates bounded at -5
+and the layer's own, heads of 64, more documents than its room, erase gates up to 2,
+and at unbounded and steep gates and spikes, which take its exact path.
+
 ## Writing your own method
 
 A method of `methods.recurrence` is a function `(recurrence) -> out`, the outputs
@@ -370,6 +392,19 @@ GLA and Lightning, at the same shapes, a decay a channel and a head:
 
 Their hybrids train 53% and 5% faster by it
 ([Kernels](../performance/kernels.md#glas-and-lightnings-kernel)).
+
+Gated DeltaNet-2 at the same shapes, its gates in bfloat16, against KDA:
+
+| Gated DeltaNet-2 | forward and backward |
+|---|---|
+| by chunks, `states=keep` | 29.8 ms (KDA: 28.6) |
+| by chunks, `states=recompute` | 34.6 ms |
+| by GDN-2's kernel, gates bounded at -5 | 3.6 ms (KDA by its kernel: 3.2) |
+| by GDN-2's kernel, KDA's gate as it starts (its exact path) | 7.0 ms |
+| by GDN-2's kernel, gates of -20 a position (its exact path) | 44.9 ms |
+
+Its hybrid bounded at -5 trains 2.1 times as fast by the kernel as by the chunks
+([Kernels](../performance/kernels.md#gated-deltanet-2s-kernel)).
 
 (recurrence-rwkv7-chunks)=
 ### RWKV-7's chunks

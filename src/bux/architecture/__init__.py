@@ -49,8 +49,8 @@ its projections multiply in the formats of `~bux.architecture.precision`:
 - `~bux.architecture.attention`: softmax attention, ``gqa``, ``mla`` and ``csa``, and
   the sparse attention indexer;
 - `~bux.architecture.recurrent`: linear attention (``gla``, ``deltanet``, ``gdn``,
-  ``kda``, ``lightning``, ``rwkv7``) and state space models (``mamba``, ``mamba2``,
-  ``short_conv``);
+  ``kda``, ``gdn2``, ``lightning``, ``rwkv7``) and state space models (``mamba``,
+  ``mamba2``, ``short_conv``);
 - `~bux.architecture.experts`: the mixture of experts, ``moe``, and its grouped
   matmuls;
 - `~bux.architecture.layers`: the rest, norms, MLPs, the causal conv, the embedding,

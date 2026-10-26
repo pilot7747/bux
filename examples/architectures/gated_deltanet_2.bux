@@ -1,0 +1,18 @@
+# Gated DeltaNet-2 1.3B (NVIDIA, 2026), the paper's hybrid: 9 Gated DeltaNet-2 layers,
+# each followed by a sliding-window attention layer, every mixer by a SwiGLU MLP. The
+# attention has 18 heads of 128 with RoPE, each query seeing itself and the 2047 keys
+# before it. 1.30B parameters besides the embedding and the head, as the paper's code
+# counts them. The paper's recurrent-only model is "N"^18 with MLPs of 6208.
+d_model    = 2304
+vocab_size = 32000
+
+norm = rmsnorm(eps=1e-5)
+gdn2 = gdn2(num_heads=16, head_dim=128)
+swa  = gqa(num_heads=18, num_kv_heads=18, sliding_window_size=2048, rope=rope())
+ffn  = gated_mlp(intermediate_size=6784, activation=swish)
+
+layer(mixer) = [norm mixer] [norm ffn]
+N = layer(gdn2)
+S = layer(swa)
+
+model = embed "NS"^9 norm head
