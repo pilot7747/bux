@@ -201,6 +201,7 @@ expressions. So `norm attn + ffn` means `(norm attn) + ffn`, and a gate written
 [norm attn] [norm ffn]                       # pre-norm (Llama, GPT-2)
 [attn] norm [ffn] norm                       # post-norm (original Transformer)
 [norm attn norm] [norm ffn norm]             # sandwich norm (Gemma 2/3)
+[attn norm] [ffn norm]                       # each branch's output normed (OLMo 2/3)
 [norm (attn + ffn)]                          # parallel block (GPT-J, PaLM)
 [norm (attn norm scale + ssm norm scale)]    # hybrid heads (Hymba)
 [norm attn scale(init=0)]                    # ReZero; scale(per_channel=true) for LayerScale

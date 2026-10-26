@@ -44,6 +44,11 @@ MIXERS = {
     "gdn_plain": "gdn(num_heads=2, head_dim=8, conv_size=none, output_gate=none)",
     "kda": "kda(num_heads=2, head_dim=8, gate_rank=4, output_gate_rank=4)",
     "kda_bounded": "kda(num_heads=2, num_v_heads=4, head_dim=8, gate_lower_bound=-5)",
+    "gdn2": "gdn2(num_heads=2, head_dim=8, gate_rank=4, output_gate_rank=4)",
+    "gdn2_gva": (
+        "gdn2(num_heads=2, num_v_heads=4, head_dim=8, v_head_dim=4,"
+        " gate_lower_bound=-5, negative_eigenvalues=true)"
+    ),
     "deltanet": "deltanet(num_heads=2, head_dim=8)",
     "gla": "gla(num_heads=2, head_dim=8, gate_rank=4)",
     "lightning": "lightning(num_heads=2, head_dim=8, v_head_dim=4)",

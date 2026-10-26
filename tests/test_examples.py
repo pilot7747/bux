@@ -209,11 +209,34 @@ SHRUNK = {
             " load_balancing=aux_free, aux_loss_coef=1e-3, expert=dense)"
         ),
     ],
+    # The other OLMo files differ in sizes alone and SmolLM2 is a Llama; the full-size
+    # test builds them.
+    "olmo/olmo_2_1b.bux": [
+        "attn.num_heads = 4",
+        "attn.num_kv_heads = 2",
+        "ffn = dense",
+    ],
+    "olmo/olmo_3_7b.bux": [
+        "attn.num_heads = 4",
+        "attn.num_kv_heads = 2",
+        "local.sliding_window_size = 4",
+        "ffn = dense",
+    ],
+    "smollm/smollm3_3b.bux": [
+        "attn.num_heads = 4",
+        "attn.num_kv_heads = 2",
+        "ffn = dense",
+    ],
     "mhc.bux": ["attn = gqa(num_heads=4, num_kv_heads=2, rope=rope())", "ffn = dense"],
     "jamba.bux": [
         "attn = gqa(num_heads=4, num_kv_heads=2)",
         "ssm = mamba(state_size=4)",
         "experts = moe(num_experts=4, top_k=2, expert=dense)",
+    ],
+    "gated_deltanet_2.bux": [
+        "gdn2 = gdn2(num_heads=2, head_dim=8)",
+        "swa = gqa(num_heads=4, num_kv_heads=4, sliding_window_size=4, rope=rope())",
+        "ffn = dense",
     ],
     "nemotron/nemotron_3_nano_30b_a3b.bux": [
         "ssm = mamba2(state_size=8, head_dim=8, num_heads=6, num_groups=2)",

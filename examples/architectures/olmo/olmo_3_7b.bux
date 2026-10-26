@@ -1,0 +1,22 @@
+# Olmo 3 7B (Allen AI, 2025): OLMo 2 7B with sliding-window attention in three layers
+# of every four, each query seeing 4,096 keys, and a context of 65,536 tokens. Its
+# global layers stretch RoPE 8 times by YaRN, from the 8,192 tokens it was pretrained
+# at, while the windowed ones keep it as it was. Olmo 3 7B Think and Instruct, and Olmo
+# 3.1's 7B RL-Zero models, are post-trained from this base.
+#
+# The vocabulary is dolma2's 100,278 tokens, unpadded.
+d_model    = 4096
+vocab_size = 100278
+
+init   = normal(std=0.02, truncate=3)
+norm   = rmsnorm(eps=1e-6)
+attn   = gqa(num_heads=32, num_kv_heads=32, qk_norm=norm, qk_norm_all_heads=true)
+local  = attn(sliding_window_size=4096, rope=rope(base=500000))
+global = attn(rope=rope(base=500000, scaling=yarn(factor=8, original_max_len=8192)))
+ffn    = gated_mlp(intermediate_size=11008, activation=swish)
+
+layer(mixer) = [mixer norm] [ffn norm]
+L = layer(local)
+G = layer(global)
+
+model = embed "LLLG"^8 norm head

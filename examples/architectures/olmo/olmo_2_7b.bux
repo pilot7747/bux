@@ -1,0 +1,19 @@
+# OLMo 2 7B (Allen AI, 2024): a fully open Llama-style decoder, its weights, data, code
+# and checkpoints all published, made stabler to train in three ways. Each branch's
+# output is normalized before it joins the stream, x + norm(f(x)), instead of its input;
+# QK-norm normalizes all the query heads together, and all the key heads; and every
+# weight starts from a normal of 0.02 cut at 3 sigma. 32 layers of 32 heads, no
+# biases, untied embeddings and a context of 4,096 tokens.
+#
+# The vocabulary is dolma2's, cl100k's 100,278 tokens padded to 100,352.
+d_model    = 4096
+vocab_size = 100352
+
+init = normal(std=0.02, truncate=3)
+norm = rmsnorm(eps=1e-6)
+attn = gqa(num_heads=32, num_kv_heads=32, qk_norm=norm, qk_norm_all_heads=true,
+           rope=rope(base=500000))
+ffn  = gated_mlp(intermediate_size=11008, activation=swish)
+
+block = [attn norm] [ffn norm]
+model = embed block^32 norm head
