@@ -27,6 +27,7 @@ from bux.architecture.layers.norm import Norm
 from bux.architecture.registry import Context, Taps, register, report, segments
 from bux.architecture.repeats import remat
 from bux.lang import ir
+from bux.softmax import softmax
 
 
 class Latents(NamedTuple):
@@ -315,7 +316,7 @@ class CSA(Sparse):
             kv = jnp.pad(kv, pad)
             kv = jnp.stack([kv[:, i : i + t] for i in range(r)], axis=2)
             gate = jnp.stack([gate[:, i : i + t] for i in range(r)], axis=2)
-            kv = (kv * jax.nn.softmax(gate, axis=2)).sum(2)
+            kv = (kv * softmax(gate, axis=2)).sum(2)
         # Split as positions, not as the norm's scale: FSDP may split that by `context`.
         latent = parallel.shard(self.compress_norm(kv), "batch", "seq", None)
         first = rows.positions[:, jnp.maximum(jnp.arange(t) - (r - 1), 0)]

@@ -39,6 +39,7 @@ from bux.architecture.attention.sparse import (
 from bux.architecture.common.sharding import projection, shard_heads
 from bux.architecture.layers.norm import Norm
 from bux.architecture.repeats import remat
+from bux.softmax import log_softmax
 from bux.train import flops
 
 # DeepSeek-V3.2's indexer keys, projected from the layer's input, are layer-normalized.
@@ -508,7 +509,7 @@ class Indexer(nnx.Module):
         if not self._loss_by_cudnn(index.shape[-1], keys.dtype):
             scores = self._scores_of(x, query, pos, keys, index).astype(jnp.float32)
             unkept = jnp.finfo(jnp.float32).min
-            return jax.nn.log_softmax(jnp.where(index >= 0, scores, unkept))
+            return log_softmax(jnp.where(index >= 0, scores, unkept))
         x, query = jax.lax.stop_gradient((x, query))
         q, w = self._queries(query, pos), self._head_weights(x)
         return indexer_cudnn.log_softmax(q.astype(keys.dtype), w, keys, index)

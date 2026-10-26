@@ -162,11 +162,11 @@ $ uv run python custom.py
 remat=auto: none in 1s (none 0.5 GiB in 1s)
 stories step 25/200  loss 1.4690  lr 3.00e-03  grad 1.233  5,721 tok/s
 stories step 50/200  loss 0.7764  lr 3.00e-03  grad 0.465  7,015 tok/s
-stories step 50/200  eval loss 0.7585
+stories step 50/200  eval loss 0.7585  eval bpb 0.2549
 ...
 stories step 200/200  loss 0.7185  lr 0.00e+00  grad 0.292  7,746 tok/s
-stories step 200/200  eval loss 0.7300
-{'grad_norm': 0.2923, 'loss': 0.7185, 'lr': 0.0, 'tokens': 204800, 'tokens_per_s': 7746.2419, 'eval_loss': 0.73, 'weight_norm': 300.4004}
+stories step 200/200  eval loss 0.7300  eval bpb 0.2452
+{'grad_norm': 0.2923, 'loss': 0.7185, 'lr': 0.0, 'tokens': 204800, 'tokens_per_s': 7746.2419, 'eval_bpb': 0.2452, 'eval_loss': 0.73, 'weight_norm': 300.4004}
 $ grep weight_norm metrics.csv
 50,weight_norm,285.788818359375
 100,weight_norm,292.6636657714844
@@ -197,6 +197,7 @@ import optax
 from flax import nnx
 
 from bux.architecture import Model
+from bux.data.tokenizer import load
 from bux.lang import compile_runs
 from bux.train.data import batches
 from bux.train.hooks import Log
@@ -218,7 +219,8 @@ trainer.fit(
     sinks=[Console("mine", 100, formats=Console.FORMATS | {"logit_l2": "l2 {:.1f}"})],
 )
 held_out = batches(t.eval.data, t, run.arch.vocab_size, held_out=True)
-print("held-out loss", trainer.evaluate(next(held_out) for _ in range(4)))
+token_bytes = load(t.tokenizer).token_bytes()  # each token's bytes, for bits per byte
+print(trainer.evaluate((next(held_out) for _ in range(4)), token_bytes))
 ```
 
 ```console
@@ -227,7 +229,7 @@ mine step 25/100  loss 3.1889  lr 1.00e-03  grad 1.401  6,732 tok/s  l2 3.0
 mine step 50/100  loss 1.1689  lr 1.00e-03  grad 0.742  8,144 tok/s  l2 7.9
 mine step 75/100  loss 0.8195  lr 1.00e-03  grad 0.422  8,221 tok/s  l2 10.3
 mine step 100/100  loss 0.7810  lr 1.00e-03  grad 0.514  7,406 tok/s  l2 11.1
-held-out loss 0.7751138806343079
+{'bpb': 0.26133263263525475, 'loss': 0.77508568701806}
 ```
 
 What the pieces are:
@@ -239,6 +241,9 @@ What the pieces are:
   logits whole, only because a term reads them.
 - `batches(data, config, vocab_size)` streams the run's batches; `held_out=True`
   draws them apart from training's.
+- `trainer.evaluate(batches, token_bytes)` returns the first head's mean loss over
+  the batches' targets and, given each token's bytes of text
+  (`Tokenizer.token_bytes`), its bits per byte.
 - `Log` turns the step's metrics into the log's scalars, with the learning rate it is
   given and the tokens a step; `Console` prints them.
 - The `Trainer` computes in float32 unless you pass `compute=jnp.bfloat16`, and does

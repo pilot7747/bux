@@ -15,7 +15,7 @@ or beside its field. Link to an entry from any page with ``{bux}`gqa` ``.
 | [Layers and model settings](layers.md) | norms, positional encodings, MLPs and MoE, attention, linear attention and SSMs, elementwise layers, residual algebras |
 | [Training settings](training.md) | data sources, packings, optimizers, schedules, loss, eval, checkpoints, precision, mesh, layout, methods, compiler |
 | [Activations](activations.md) | the activation names, as layers and as values |
-| [Registries](registries.md) | the names each registry knows: methods, optimizers, schedules, data sources, matmul formats, presets and passes |
+| [Registries](registries.md) | the names each registry knows: methods, optimizers, schedules, data sources, matmul formats, presets, passes and profilers |
 
 ```{toctree}
 :hidden:

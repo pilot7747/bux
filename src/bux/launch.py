@@ -17,6 +17,10 @@ that fits first; without GPUs, one at a time on the default device. A worker's o
 goes to the console and to its run's train.log, and a run that fails or runs out of
 memory leaves the others training.
 
+A run whose ``profile`` setting names nsys or ncu trains under that tool
+(`bux.train.profilers`): a sweep's worker starts under it, and a run alone's process
+starts again under it, with the same command, before it does anything else.
+
 A run alone trains on many hosts when the environment says so: Slurm's srun, Open
 MPI's mpirun, or ``JAX_COORDINATOR_ADDRESS``, ``JAX_NUM_PROCESSES`` and
 ``JAX_PROCESS_ID``. Its processes join through jax.distributed (`join`); the first
@@ -68,7 +72,8 @@ from bux import parallel
 from bux.data.pipeline import DEFAULT_CACHE, jobs, prepare
 from bux.lang import ir
 from bux.runtime import agree_on_cache, configure
-from bux.train.config import MeshConfig
+from bux.train import profilers
+from bux.train.config import MeshConfig, evals
 from bux.train.hooks import Hook, Metrics
 from bux.train.sinks import LatestMetrics, is_main_process
 from bux.train.trainer import Trainer, directory, train
@@ -374,7 +379,7 @@ def _spawn(
 ) -> subprocess.Popen[str]:
     """Start a worker that trains `run` on `gpus`, or on the default device if there
     are none, from its run.json: the run as the launcher compiled it, whatever the
-    files say by now."""
+    files say by now. A run with nsys or ncu trains under it."""
     folder = directory(run, out)
     folder.mkdir(parents=True, exist_ok=True)
     (folder / "run.json").write_text(run.model_dump_json(indent=2), encoding="utf-8")
@@ -387,8 +392,9 @@ def _spawn(
         error=None,
     )
     env = os.environ | ({"CUDA_VISIBLE_DEVICES": ",".join(gpus)} if gpus else {})
+    worker = [sys.executable, "-u", "-m", "bux.launch", str(folder), str(cache)]
     return subprocess.Popen(
-        [sys.executable, "-u", "-m", "bux.launch", str(folder), str(cache)],
+        [*_profiler(run, out), *worker],
         stdout=subprocess.PIPE,
         stderr=subprocess.STDOUT,
         text=True,
@@ -500,7 +506,8 @@ def supervise(
 
 
 def summary(runs: Sequence[ir.Run], out: str | Path) -> str:
-    """Return one line per run: its state, its step, and its latest losses.
+    """Return one line per run: its state, its step, and its latest losses, its
+    first eval's too.
 
     A sweep's launch ends with it::
 
@@ -514,7 +521,8 @@ def summary(runs: Sequence[ir.Run], out: str | Path) -> str:
     for run in runs:
         s = status(directory(run, out))
         m = s.get("metrics") or {}
-        losses = (f"{m[k]:.4f}" if k in m else "-" for k in ("loss", "eval_loss"))
+        names = ("loss", f"{_first_eval(run)}_loss")
+        losses = (f"{m[k]:.4f}" if k in m else "-" for k in names)
         step = f"{s.get('step', 0)}/{run.train.steps}"
         rows.append((s.get("state", "pending"), step, *losses, run.name))
     states = Counter(row[0] for row in rows[1:])
@@ -527,25 +535,56 @@ def summary(runs: Sequence[ir.Run], out: str | Path) -> str:
     return f"{len(runs)} runs: {head}\n" + "\n".join(lines)
 
 
+def _first_eval(run: ir.Run) -> str:
+    """Return the name of the run's first eval, whose loss the summary shows."""
+    return next((e.name for e in evals(run.train)), "eval")
+
+
+def _unfit(run: ir.Run, gpus: Sequence[str], *, alone: bool) -> str | None:
+    """Return why `run` cannot train on `gpus`: it needs more, or its profiler cannot
+    profile it; None if it can."""
+    n = need(run.train.mesh, len(gpus), alone=alone)
+    if gpus and n > len(gpus):
+        return f"mesh: needs {n} GPUs, but there are {len(gpus)}"
+    return profilers.unfit(run.train.profile, n if gpus else 1)
+
+
 def _fitting(
     runs: Sequence[ir.Run],
     out: str | Path,
     gpus: Sequence[str],
     echo: Callable[[str], None],
 ) -> list[ir.Run]:
-    """Return the runs that need no more GPUs than `gpus`; record the others failed."""
+    """Return the runs that can train on `gpus` (`_unfit`); record the others failed."""
     fits = []
     for run in runs:
-        n = need(run.train.mesh, len(gpus), alone=len(runs) == 1)
-        if gpus and n > len(gpus):
-            error = f"mesh: needs {n} GPUs, but there are {len(gpus)}"
-            folder = directory(run, out)
-            folder.mkdir(parents=True, exist_ok=True)
-            record(folder, state="failed", started=_now(), ended=_now(), error=error)
-            echo(f"{run.name}: failed before training: {error}")
-        else:
+        if (error := _unfit(run, gpus, alone=len(runs) == 1)) is None:
             fits.append(run)
+            continue
+        folder = directory(run, out)
+        folder.mkdir(parents=True, exist_ok=True)
+        record(folder, state="failed", started=_now(), ended=_now(), error=error)
+        echo(f"{run.name}: failed before training: {error}")
     return fits
+
+
+def _profiler(run: ir.Run, out: str | Path) -> list[str]:
+    """Return the command that runs `run`'s process under its profiler, if it has one
+    the process does not run under yet (`bux.train.profilers.command`), and make the
+    folder its report goes to."""
+    tool = profilers.command(run.train.profile, folder := directory(run, out))
+    if tool:
+        (folder / "profile").mkdir(parents=True, exist_ok=True)
+    return tool
+
+
+def _rerun_under_profiler(run: ir.Run, out: str | Path, gpus: Sequence[str]) -> None:
+    """Start this process again, the same command, under the profiler of `run`, a run
+    alone on `gpus`, if it can train there and the process is not under it yet."""
+    if _unfit(run, gpus, alone=True) is None and (tool := _profiler(run, out)):
+        sys.stdout.flush()
+        sys.stderr.flush()
+        os.execvp(tool[0], [*tool, sys.executable, *sys.orig_argv[1:]])
 
 
 def _prepare(
@@ -578,12 +617,14 @@ def launch(
     """Train what is left of `runs` under `out`, and return the exit code.
 
     This is ``bux launch``. Runs whose status.json says ``done`` are skipped, and
-    the others resume from their latest checkpoints. A run that needs more GPUs than
-    there are is recorded as failed at once. Then the datasets the rest read are
-    prepared under `cache`, once each, with `workers` processes. A run alone trains
-    in this process, on as many of `gpus` as it needs, or on many hosts if the
-    environment says so (`processes`); a sweep trains in workers (`supervise`), each
-    on a group of the GPUs, and ends with a table of its runs (`summary`).
+    the others resume from their latest checkpoints. A run alone whose ``profile``
+    names nsys or ncu starts this process again under it first. A run that needs more
+    GPUs than there are, or a profiler that is not installed, is recorded as failed
+    at once. Then the datasets the rest read are prepared under `cache`, once each,
+    with `workers` processes. A run alone trains in this process, on as many of
+    `gpus` as it needs, or on many hosts if the environment says so (`processes`); a
+    sweep trains in workers (`supervise`), each on a group of the GPUs, and ends with
+    a table of its runs (`summary`).
 
     Args:
         runs: The runs of an experiment, as `bux.lang.compile_runs` returns them.
@@ -608,18 +649,21 @@ def launch(
         code = launch(runs, "runs")
     """
     todo = [run for run in runs if status(directory(run, out)).get("state") != "done"]
+    # In a job of many processes, each has the GPUs jax.distributed gives it.
+    nproc = processes()
+    available = [] if nproc > 1 else list(visible_gpus() if gpus is None else gpus)
+    if len(todo) == 1:  # before anything starts a backend
+        _rerun_under_profiler(todo[0], out, available)
     if done := len(runs) - len(todo):
         echo(f"{done} of {len(runs)} run{'s' if len(runs) != 1 else ''} done already")
     if not todo:
         return 0
-    if (nproc := processes()) > 1:
+    if nproc > 1:
         if len(todo) > 1:
             echo(f"{nproc} processes train one run, not {len(todo)}: use --index")
             return 1
         join()
         echo = echo if is_main_process() else _quiet
-    # In a job of many processes, each has the GPUs jax.distributed gives it.
-    available = [] if nproc > 1 else list(visible_gpus() if gpus is None else gpus)
     if not (fits := _fitting(todo, out, available, echo)):
         return 1
     if (code := _prepare(fits, cache, workers, echo)) is not None:

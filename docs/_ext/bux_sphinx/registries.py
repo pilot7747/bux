@@ -54,7 +54,7 @@ def registries() -> list[tuple[str, str, list[Row]]]:
     from bux.architecture.repeats import remat
     from bux.lang.printer import config_to_source
     from bux.parallel import methods
-    from bux.train import data, optim, xla
+    from bux.train import data, optim, profilers, xla
 
     kinds = sorted(k for k, v in vars(methods).items() if hasattr(v, "builders"))
     found = [
@@ -80,9 +80,11 @@ def registries() -> list[tuple[str, str, list[Row]]]:
         (k, "", " ".join(f"`{o}={v}`" for o, v in options.items()) or "XLA's defaults")
         for k, options in xla.PRESETS.items()
     ]
+    tools = [(k, "", f"`{' '.join(c)}`") for k, c in profilers.TOOLS.items()]
     found += [
         ("Remat presets", "bux.architecture.repeats.remat.PRESETS", keeps),
         ("Compiler presets", "bux.train.xla.PRESETS", flags),
+        ("Profilers", "bux.train.profilers.TOOLS", tools),
         (
             "HLO passes",
             "bux.passes.PASSES",

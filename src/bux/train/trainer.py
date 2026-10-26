@@ -7,7 +7,7 @@ A run's directory, ``<out>/<name>-<id>``, holds::
     run.json       its IR
     metrics.jsonl  a line of metrics every `log.every` steps, and at every eval
     checkpoints/   with a `checkpoint` setting; a run there resumes from the latest
-    profile/       with a `profile` setting, a trace of its steps
+    profile/       with a `profile` setting, a trace or report of its steps
 
 Its name says which alternatives it took, and its id hashes what it computes, so a
 changed setting gets a fresh directory and an unchanged one finds its checkpoints.
@@ -23,6 +23,7 @@ them::
 
 import contextlib
 import functools
+import math
 import re
 import time
 from collections.abc import Callable, Iterable, Iterator, Mapping, Sequence
@@ -46,15 +47,23 @@ from bux.architecture.precision import matmuls
 from bux.architecture.registry import Loss, Stream
 from bux.architecture.repeats import pipelined, remat
 from bux.architecture.repeats.repeat import pipelined_repeat, scanned_variables
+from bux.data import tokenizer
 from bux.data.pipeline import DEFAULT_CACHE, jobs, prepare
 from bux.lang import ir
 from bux.lang.printer import run_to_source
 from bux.parallel.gather import Axes
 from bux.train import fitting, flops, interleave, reorder, stages, xla
-from bux.train.config import PrecisionConfig
+from bux.train.config import PrecisionConfig, TrainConfig, evals
 from bux.train.data import Batch, batches, prefetch
 from bux.train.hooks import Checkpoint, Eval, Hook, Later, Log, Profile
-from bux.train.objective import Metrics, Objective, objective, target_mask
+from bux.train.objective import (
+    Metrics,
+    Objective,
+    Ratio,
+    held_out,
+    objective,
+    target_mask,
+)
 from bux.train.optim import lr_multiplier, lr_schedule, optimizer
 from bux.train.sinks import (
     JSONL,
@@ -841,16 +850,22 @@ class Trainer:
         metrics = _scaled(per_token.metrics, token_share)
         return loss, metrics | _scaled(per_row.metrics, row_share)
 
-    def eval_step(self, model: Model, batch: Batch) -> Float[Array, ""]:
-        """Return the first head's loss on `batch`, computed in `compute`, its
-        projections multiplied as the precision's `eval` says.
+    def eval_step(
+        self,
+        model: Model,
+        batch: Batch,
+        nbytes: Int32[np.ndarray | Array, "b t"] | None = None,
+    ) -> dict[str, Ratio]:
+        """Return what an eval measures of the first head on `batch`, each metric a
+        sum and what it is a mean of (`bux.train.objective.held_out`): its loss, and
+        given each token's bytes of text, `nbytes`, its bits per byte. It computes in
+        `compute`, its projections multiplied as the precision's `eval` says.
 
         It is compiled once, by `evaluate`; override it to change what an evaluation
-        measures."""
+        measures: every name it returns is a metric."""
         with matmuls.use(matmuls.evaluating(self.matmuls)):
             heads = forward(cast(model, self.compute), batch)
-        per_token, _ = self.objective(heads, batch)
-        return per_token.metrics["loss"]
+        return held_out(heads[0], batch, nbytes, self.objective.offset)
 
     def train_on_batch(self, batch: Batch) -> Metrics:
         """Take one training step on `batch`, and return its metrics.
@@ -885,23 +900,41 @@ class Trainer:
             self.matmuls, self.switch = self.switch[1], None
             self._compile()
 
-    def evaluate(self, batches: Iterable[Batch]) -> float:
-        """Return the mean of `eval_step` over `batches`, in eval mode. Every batch's
-        step is launched before any loss is read, so the GPU runs one as the host
-        launches the next.
+    def evaluate(
+        self,
+        batches: Iterable[Batch],
+        token_bytes: Int32[np.ndarray, " vocab"] | None = None,
+    ) -> dict[str, float]:
+        """Return the mean of each metric of `eval_step` over `batches`, in eval mode:
+        the first head's `loss`, and given each token id's bytes of text, its bits
+        per byte, `bpb`. A mean weighs every target alike, whichever batch it is in.
+        Every batch's step is launched before any is read, so the GPU runs one as the
+        host launches the next.
 
         Args:
             batches: The held-out batches, on the host; a finite number of them.
+            token_bytes: The bytes of text each id of the model's vocabulary stands
+                for (``Tokenizer.token_bytes``); None leaves `bpb` out.
 
         Returns:
-            The mean of their losses, each batch weighed alike.
+            Each metric's mean, by name; NaN for a mean of nothing.
+
+        Example::
+
+            held_out = batches(eval_data, run.train, vocab, held_out=True)
+            trainer.evaluate(itertools.islice(held_out, 10))  # {"loss": 3.21}
         """
         self.model.eval()
         try:
-            losses = [self._eval(self.model, parallel.shard_batch(b)) for b in batches]
+            sums = [
+                self._eval(
+                    self.model, *parallel.shard_batch(_with_bytes(b, token_bytes))
+                )
+                for b in batches
+            ]
         finally:
             self.model.train()
-        return sum(float(loss) for loss in losses) / len(losses)
+        return _means(sums)
 
     def state(self) -> nnx.State:
         """What a checkpoint keeps: the model's state and the optimizer's."""
@@ -967,6 +1000,23 @@ class Trainer:
                     hook.stop(self)
 
 
+def _with_bytes(
+    batch: Batch, token_bytes: Int32[np.ndarray, " vocab"] | None
+) -> tuple[Batch, Int32[np.ndarray, "b t"] | None]:
+    """Return `batch`, and the bytes of text each of its tokens stands for."""
+    return batch, None if token_bytes is None else token_bytes[batch.input_ids]
+
+
+def _means(sums: Sequence[Mapping[str, Ratio]]) -> dict[str, float]:
+    """Return each metric's sums added up over the batches, the first over the
+    second: a mean over all of them. Reading them waits for each batch's step."""
+    means = {}
+    for name in sums[0]:
+        total, count = (sum(float(s[name][i]) for s in sums) for i in (0, 1))
+        means[name] = total / count if count else math.nan
+    return means
+
+
 def _write(reported: list[tuple[int, Scalars | Later]], sinks: Sequence[Sink]) -> None:
     """Give every sink what the hooks reported at each step, read now where it is
     `Later`."""
@@ -1000,7 +1050,7 @@ def train(
     It is what ``bux train`` runs for each run of a file. It writes run.bux and
     run.json into the run's directory (`directory`), builds the model on the run's
     mesh, resumes from the latest checkpoint there if the run has a ``checkpoint``
-    setting, and trains with the run's own hooks: its log, eval, checkpoint and
+    setting, and trains with the run's own hooks: its log, evals, checkpoint and
     profile.
 
     Args:
@@ -1014,7 +1064,7 @@ def train(
 
     Returns:
         The latest value of every metric the hooks reported, by name, as `loss`,
-        `eval_loss` and `tokens_per_s`.
+        `eval_loss`, `eval_bpb` and `tokens_per_s`.
 
     Raises:
         ValueError: If the model has no vocabulary, the batch does not split over the
@@ -1086,7 +1136,7 @@ def train(
             config.steps,
             hooks=[*run_hooks, *hooks],
             sinks=[
-                Console(run.name, config.steps, echo),
+                Console(run.name, config.steps, echo, _formats(config)),
                 JSONL(folder / "metrics.jsonl", start=trainer.step),
                 latest,
                 *sinks,
@@ -1200,13 +1250,23 @@ def _hooks(
     make_batches: Callable[..., Iterator[Batch]],
     echo: Callable[[str], None],
 ) -> list[Hook]:
-    """Return the run's own hooks: its `log`, eval, checkpoint, which resumes `trainer`
+    """Return the run's own hooks: its `log`, evals, checkpoint, which resumes `trainer`
     from the latest checkpoint in `folder` if there is one, and profile."""
     config = run.train
     hooks: list[Hook] = [log]
-    if (evals := config.eval) is not None:
-        held_out = functools.partial(make_batches, evals.data, held_out=True)
-        hooks.append(Eval(held_out, every=evals.every, batches=evals.batches))
+    sets = evals(config)
+    token_bytes = _token_bytes(config, run.arch.vocab_size) if sets else None
+    for e in sets:
+        data = functools.partial(make_batches, e.data, held_out=True)
+        hooks.append(
+            Eval(
+                data,
+                every=e.every,
+                batches=e.batches,
+                name=e.name,
+                token_bytes=token_bytes,
+            )
+        )
     if (saves := config.checkpoint) is not None:
         checkpoint = Checkpoint(
             folder / "checkpoints", every=saves.every, keep=saves.keep
@@ -1219,5 +1279,28 @@ def _hooks(
             )
         hooks.append(checkpoint)
     if (trace := config.profile) is not None:
-        hooks.append(Profile(folder / "profile", start=trace.start, steps=trace.steps))
+        profile = Profile(
+            folder / "profile", start=trace.start, steps=trace.steps, tool=trace.tool
+        )
+        hooks.append(profile)
     return hooks
+
+
+def _token_bytes(
+    config: TrainConfig, vocab_size: int | None
+) -> Int32[np.ndarray, " vocab"] | None:
+    """Return the bytes of text each id of the model's vocabulary stands for, by the
+    run's tokenizer, 0 past its ids; None without a tokenizer."""
+    if config.tokenizer is None:
+        return None
+    lengths = tokenizer.load(config.tokenizer).token_bytes()
+    return np.pad(lengths, (0, max(0, (vocab_size or 0) - len(lengths))))
+
+
+def _formats(config: TrainConfig) -> dict[str, str]:
+    """Return the metrics the console shows, `Console.FORMATS` and each eval's."""
+    formats = dict(Console.FORMATS)
+    for e in evals(config):
+        formats[f"{e.name}_loss"] = f"{e.name} loss {{:.4f}}"
+        formats[f"{e.name}_bpb"] = f"{e.name} bpb {{:.4f}}"
+    return formats

@@ -26,11 +26,13 @@ bux launch examples/experiments/attention_ablation.bux --index 3   # the fourth,
 ## What it does
 
 1. It skips the runs whose `status.json` says `done`.
-2. It checks that each run's mesh fits the GPUs it has, and records one that does not
-   as failed, at once.
+2. It checks that each run's mesh fits the GPUs it has, and that the tool its
+   `profile` names is installed, and records one that fails either as failed, at once.
 3. It prepares the datasets the runs read, once each ([Data](../data/index.md)).
 4. A run alone then trains in the launcher's process, on the first GPUs it needs.
-   A sweep trains in workers, a process a run.
+   A sweep trains in workers, a process a run. A run whose `profile` names nsys or
+   ncu trains under it: a run alone's process starts again under the tool first,
+   and a worker starts under it ([Profiling](../performance/profiling.md#nsight-systems-and-nsight-compute)).
 5. A sweep ends with a table of its runs.
 
 ## GPUs and workers

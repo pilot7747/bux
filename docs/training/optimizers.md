@@ -184,7 +184,9 @@ Each head predicts one token further ahead for every `nextn` before it, so a mod
 with heads after its first predicts several tokens at each position
 ([Several outputs](../language/outputs.md)). Every term is a mean over the target
 tokens of the batch, not over rows, so a row of many short replies weighs no more than
-a row of one long one ([Rows](../data/index.md#rows)).
+a row of one long one ([Rows](../data/index.md#rows)). The cross-entropy keeps its
+gradient where float32 rounds a target's probability to 1
+([Softmax and cross-entropy at large margins](precision.md#softmax-and-cross-entropy-at-large-margins)).
 
 The log has each term by name: `loss`, the first head's cross-entropy alone, then
 `z_loss` with a z-loss and `mtp` with heads after the first. Layers add terms of

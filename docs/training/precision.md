@@ -147,6 +147,62 @@ NVIDIA's NVFP4 recipe does; with `passes=[]` all of it does.
   as Megatron does. It needs the step to add its gradients up unreduced
   ([Gradient reductions](../parallelism/precision.md#gradient-reductions-precisionreduce)).
 
+## Softmax and cross-entropy at large margins
+
+A softmax's largest probability is 1 / (1 + e^-m), where the margin m is the largest
+logit minus the logsumexp of the others. Past m of about 16.6 in float32 (5.5 in
+bfloat16), 1 + e^-m rounds to 1. The cross-entropy of a target that wins by that much
+is then 0, and so is its gradient by the target's logit, p - 1. The other logits'
+gradients are not 0, so the gradient no longer sums to 0. Barron et al. (2026, "A Fix
+for Softmax and Cross-Entropy") trace the loss spikes of Adam's slingshot effect to
+this, and fix it by never adding e^-m to 1. bux takes their fix:
+
+- **The loss.** Each position's cross-entropy is `softplus(others - target)`, from the
+  target's logit and the logsumexp of the other logits, and the target's gradient is
+  `-sigmoid(others - target)`, by either `methods.loss`
+  ({py:class}`~bux.architecture.logits.Scores`). The z-loss's log Z is their
+  `logaddexp`.
+- **Every other softmax that a layer differentiates**, through {py:mod}`bux.softmax`:
+  the MoE router's, CSA's gate, mHC's Sinkhorn and attnres, the indexer's KL, and
+  attention by `xla`. Its softmax is jax's in the forward. Its backward first takes
+  the largest entry's cotangent from every entry's, which changes nothing but that
+  entry's term of the sum, now 0. Its log-softmax at the largest entry is `-log1p`
+  of the others' mass.
+
+A layer of your own takes them from there:
+
+```python
+from bux.softmax import log_softmax, softmax
+```
+
+Flash attention keeps jax's rounding: cuDNN's and tokamax's kernels, and the ring and
+sparse attention built on them. Their backward recomputes P = exp(s - lse) a block of
+keys at a time, and the fix needs what they do not return: each query's largest key,
+and the sum of its row of dS over every block.
+
+**What it costs**, on B300s on 2026-10-26, against main before the fix and jax's
+softmax, each pair on one GPU in turn. End to end it is 0.05% to 0.42% fewer tokens a
+second: 60 steps of 8 x 4096 random tokens on one GPU a run, the 1.3B dense model
+(-0.13%, and -0.32% again), a 5.2B MoE of 64 experts (-0.32%), and the 1.3B with DSA
+(-0.42%), CSA (-0.05%) or mHC (-0.31%) for its attention or residual. The loss of 8 x
+4096 tokens, its value and its gradients by x and W, three times each, is the same to
+six digits:
+
+| | before | after |
+|---|---|---|
+| loss by `chunks`, `d_model` 2048, vocabulary 128K | 46.6 ms | 46.9 ms (+0.8%) |
+| the same with a z-loss | 73.4 ms | 73.7 ms (+0.5%) |
+| loss by `chunks`, `d_model` 4096, vocabulary 152K | 103.1 ms | 103.3 ms (+0.2%) |
+| loss by `logits`, either size | | -1.8% to +0.3% |
+| softmax forward and backward, (8, 16, 2048, 2048) | 2.50 ms | 2.07 ms |
+| the same, (8, 4096, 2048) | 0.355 ms | 0.337 ms |
+| the same, CSA's gate: 4 entries, not the last axis | 0.378 ms | 0.505 ms |
+| log-softmax forward and backward, (8, 4096, 2048) | 0.371 ms | 0.387 ms |
+
+The softmax's forward is jax's to the bit. A mask in the loss's max, rather than its
+sum alone, cost 0.3 points more; the softmax backward's sums in one variadic reduce
+made it 2.6x slower than jax's.
+
 ## Recipes
 
 A precision recipe is a module in `examples/experiments/recipes/` that sets only
