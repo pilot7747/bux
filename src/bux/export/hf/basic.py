@@ -26,9 +26,13 @@ class Embedding(nn.Module):
         self.positions = nn.Embedding(most, d) if most else None
         self.multiplier = d**0.5 if c["scale_by_sqrt_dim"] else 1.0
 
+    def embed_tokens(self, ids: torch.Tensor) -> torch.Tensor:
+        """Return the token embedding, scaled: what nextn reads."""
+        return self.tokens(ids) * self.multiplier
+
     def forward(self, ids: torch.Tensor, ctx: Ctx) -> torch.Tensor:
         ctx.embedding = ctx.embedding or self
-        x = self.tokens(ids) * self.multiplier
+        x = self.embed_tokens(ids)
         return x if self.positions is None else x + self.positions(ctx.positions)
 
 
