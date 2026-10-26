@@ -182,7 +182,7 @@ def _load(where: Path, impl: str) -> Any:
 def _heads(hf: Any, tokens: Int[np.ndarray, "b t"]) -> list[np.ndarray]:
     """Return every head's logits of transformers' run, as numpy."""
     with torch.no_grad():
-        heads, _ = hf.model(torch.tensor(tokens, dtype=torch.long))
+        heads, _ = hf.model(torch.tensor(tokens, dtype=torch.long), all_heads=True)
     return [h.float().numpy() for h in heads]
 
 

@@ -92,9 +92,10 @@ def save(
 
 
 def cache_types(p: Plan) -> list[str]:
-    """Return the kind of each cache layer, in the order the calls that keep state run."""
+    """Return the kind of each cache layer, in the order the calls that keep state run
+    as the model generates (`Plan.generation`)."""
     kinds = []
-    for call in p.calls:
+    for call in p.generation():
         cls = codegen.layer_class(call.layer)
         fn = getattr(cls, "cache_type", None)
         kind = fn(call.layer.config.model_dump(mode="json")) if fn else None
