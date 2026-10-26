@@ -42,8 +42,8 @@ try:  # cudnn-frontend and CuTe DSL, where the cuda extra is installed (Linux)
     from cudnn.gemm.cutedsl.grouped.dsrelu import (
         moe_blockscaled_grouped_gemm_dsrelu_quant as dsrelu_quant,
     )
+    from cudnn.gemm.cutedsl.grouped.dswiglu import grouped_gemm_dswiglu_quant
     from cudnn.gemm.cutedsl.grouped.dswiglu import jax_api as dswiglu_api
-    from cudnn.gemm.cutedsl.grouped.dswiglu.api import GroupedGemmDswigluSm100
     from cudnn.gemm.cutedsl.grouped.glu import moe_blockscaled_grouped_gemm_glu_bias
     from cudnn.gemm.cutedsl.grouped.moe_utils import MoEWeightMode, WGradInputOrder
     from cudnn.gemm.cutedsl.grouped.quant import grouped_gemm_quant
@@ -291,9 +291,7 @@ def _dswiglu(
         "sfd_row": _out(canonical_jax.sf_shape(m, 2 * n), E8M0),
         "sfd_col": _out(canonical_jax.sf_shape(2 * n, m), E8M0),
     }
-    kernel, mac = canonical_jax.grouped_plan(
-        GroupedGemmDswigluSm100, ins, outs, mma_tiler_mn=TILE, cluster_shape_mn=None
-    )
+    kernel, mac = _dswiglu_kernel(ends.shape[0]), _pairs_of_sms()
     adapter = dswiglu_api.grouped_dswiglu_adapter
     rows_, columns, dweights, scales, column_scales = _call(  # dprob: atomic adds
         adapter, ins, outs, kernel, mac, zeroed=(2,)
@@ -486,6 +484,24 @@ def _dglu_kernel(groups: int, name: str) -> Any:
         moe_blockscaled_grouped_gemm_dglu_dbias.BlockScaledMoEGroupedGemmDgluDbiasKernel
     )
     return _fused(dglu, groups, act_func=f"d{name}")
+
+
+@functools.cache
+def _dswiglu_kernel(groups: int) -> Any:
+    """Return cuDNN's dSwiGLU kernel, as its JAX API plans it, but built here: that
+    plan asks torch for the GPU wherever torch is imported, and torch may not see it."""
+    assert cutlass is not None
+    kernel = grouped_gemm_dswiglu_quant.BlockScaledContiguousGroupedGemmKernel
+    return kernel(
+        sf_vec_size=32,
+        acc_dtype=cutlass.Float32,
+        use_2cta_instrs=True,
+        mma_tiler_mn=TILE,
+        cluster_shape_mn=(2, 1),
+        vectorized_f32=False,
+        discrete_col_sfd=False,
+        expert_cnt=groups,
+    )
 
 
 @functools.cache
