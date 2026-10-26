@@ -243,7 +243,8 @@ class Attention(SoftmaxAttention):
     The query heads share the key and value heads in groups: MHA when
     ``num_kv_heads == num_heads``, MQA when it is 1. The layer projects the input to
     q, k and v (one matrix each, or one fused under ``fused_qkv``), adds a causal conv
-    to k and v under ``kv_conv_size`` (Inkling), applies QK-norm and then RoPE, scales
+    to k and v under ``kv_conv_size`` (Inkling), applies QK-norm (of each head, or of
+    all heads together under ``qk_norm_all_heads``: MiniMax-M2) and then RoPE, scales
     the queries by their position under ``power_scale`` (Beam), and attends by the
     run's ``methods.attention`` (`bux.parallel.context`). The heads' outputs then go
     through `SoftmaxAttention`'s norm, gate, output projection and dropout.
@@ -326,9 +327,12 @@ class Attention(SoftmaxAttention):
         self.v_conv = conv(g * dv, size) if size else None
         super().__init__(config, width, h, g, dk, dv, config.bias, ports, rngs)
 
-        qk_norm = config.qk_norm
-        self.q_norm = Norm(qk_norm, dk) if qk_norm else None
-        self.k_norm = Norm(qk_norm, dk) if qk_norm and projects_kv else None
+        qk_norm, whole = config.qk_norm, config.qk_norm_all_heads
+        self.qk_norm_all_heads = whole
+        self.q_norm = Norm(qk_norm, h * dk if whole else dk) if qk_norm else None
+        self.k_norm = (
+            Norm(qk_norm, g * dk if whole else dk) if qk_norm and projects_kv else None
+        )
         self.rope = config.rope
         self.power_scale = config.power_scale
         self.power_scale_length = config.power_scale_length
@@ -393,11 +397,10 @@ class Attention(SoftmaxAttention):
     def _queries(
         self, q: Float[Array, "b t _"], pos: Int[Array, "b t"] | None
     ) -> Float[Array, "b t h dk"]:
-        """Reshape the projected queries into heads, then apply QK-norm, RoPE and the
-        power scale."""
-        b, t, _ = q.shape
-        q = q.reshape(b, t, self.heads, self.head_dim)
-        q = norm_and_rotate(q, self.q_norm, self.rope, pos, "heads")
+        """Split the projected queries into heads with QK-norm and RoPE
+        (`_split_normed`), then apply the power scale."""
+        t = q.shape[1]
+        q = self._split_normed(q, self.heads, self.q_norm, pos, "heads")
         if self.power_scale is not None:
             at = jnp.arange(t) if pos is None else pos
             scale = _power_scale(at, self.power_scale, self.power_scale_length)
@@ -411,15 +414,33 @@ class Attention(SoftmaxAttention):
         pos: Int[Array, "b s"] | None,
         taps: Taps,
     ) -> tuple[Float[Array, "b s g dk"], Float[Array, "b s g dv"]]:
-        """Add the causal conv to the projected keys and values, reshape them into
-        heads, then apply QK-norm and RoPE to the keys."""
+        """Add the causal conv to the projected keys and values, and split them into
+        heads, the keys with QK-norm and RoPE (`_split_normed`)."""
         b, s, _ = k.shape
         if self.k_conv is not None and self.v_conv is not None:
             k, v = k + self.k_conv(k, taps), v + self.v_conv(v, taps)
-        k = k.reshape(b, s, self.kv_heads, self.head_dim)
+        k = self._split_normed(k, self.kv_heads, self.k_norm, pos, "kv_heads")
         v = v.reshape(b, s, self.kv_heads, self.v_head_dim)
-        k = norm_and_rotate(k, self.k_norm, self.rope, pos, "kv_heads")
         return shard_heads(k, "kv_heads"), shard_heads(v, "kv_heads")
+
+    def _split_normed(
+        self,
+        x: Float[Array, "b t _"],
+        heads: int,
+        norm: Norm | None,
+        pos: Int[Array, "b t"] | None,
+        name: parallel.Name,
+    ) -> Float[Array, "b t n dk"]:
+        """Split projected queries or keys into `heads` heads, then apply `norm` and
+        RoPE (`norm_and_rotate`). Under ``qk_norm_all_heads`` the norm is of all the
+        heads together, before the split: under tensor parallelism its mean square
+        sums over the devices' heads, and the fused kernel, which normalizes each
+        head, does not take it."""
+        b, t, _ = x.shape
+        if self.qk_norm_all_heads and norm is not None:
+            x, norm = norm(x), None
+        x = x.reshape(b, t, heads, self.head_dim)
+        return norm_and_rotate(x, norm, self.rope, pos, name)
 
     def _mix_values(
         self, v: Float[Array, "b s g dv"], v1: Float[Array, "b s g dv"]

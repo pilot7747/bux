@@ -1047,6 +1047,11 @@ SPLIT = {
         "gqa(num_heads=4, num_kv_heads=2, gated=true, gate_head_bias=true,"
         " power_scale=0.5, power_scale_length=2)"
     ),
+    # MiniMax-M2's QK-norm of all heads together, whose mean square spans the devices
+    "qk_norm_all_heads": (
+        "gqa(num_heads=4, num_kv_heads=2, qk_norm=norm, qk_norm_all_heads=true,"
+        " rope=rope(fraction=0.5))"
+    ),
     "mla": "latent",
     "mla_indexer": "latent(indexer=small)",
     # On tensor=4 MSA's 2 groups stay whole, and its picks are each query head's

@@ -50,6 +50,7 @@ model = embed block^12 norm head(tied=true)
 | `bias` | `false` | biases on the input projections: q, k, v and the gate (GPT-2, Qwen2) |
 | `output_bias` | `bias` | a bias on the output projection (GPT-2 has one, Qwen2 has none) |
 | `fused_qkv` | `false` | make q, k and v with one projection and split it: the same function and init, held as one matrix (GPT-2, MiMo-V2.6-Pro) |
+| `qk_norm_all_heads` | `false` | `qk_norm` of all the heads together, not of each ([below](#qk-norm-and-output-norms)) (MiniMax-M2, OLMo 2) |
 | `rope` | `none` | rotary position embeddings ([below](#rotary-position-embeddings-rope)) |
 | `power_scale`, `power_scale_length` | `none`, `2048` | queries scaled up with a power of the position ([below](#power-scaling-at-long-range)) (Beam) |
 | `kv_conv_size` | `none` | a causal depthwise conv on keys and values, added to them: `k + conv(k)` (Inkling) |
@@ -188,7 +189,7 @@ need `compress_ratio`; `o_groups` must divide `num_heads`.
 | `gate_activation` | `sigmoid` | the gate's activation | Laguna: `softplus` |
 | `gate_head_bias` | `false` | a learned bias per head on the gate, before its activation | Beam |
 | `output_norm` | `none` | a norm of each head's output, before the gate | Muse Spark |
-| `qk_norm` | `none` | a norm of each query and key head, before RoPE | Qwen3, Gemma 3, OLMo 2 |
+| `qk_norm` | `none` | a norm of each query and key head, before RoPE | Qwen3, Gemma 3 |
 | `softcap` | `none` | `c * tanh(logits / c)` on the logits | Gemma 2 |
 | `scale` | `head_dim ** -0.5` | the logits' scale | |
 | `log_scale`, `log_scale_floor` | `none`, `8192` | logits scaled up with the log of the position | Inkling |
@@ -286,6 +287,22 @@ with gains, so that the logits are a scaled cosine
 attn = gqa(num_heads=16, num_kv_heads=16, qk_norm=rmsnorm, rope=rope(layout=interleaved))
 ```
 
+`qk_norm_all_heads=true`, a setting of `gqa`, makes it one norm of all the heads
+together instead: of the queries' `num_heads * head_dim` channels, and one of the
+keys', each with a gain per channel, before they split into heads and RoPE turns them.
+MiniMax-M2 normalizes so, as OLMo 2 does
+(`examples/architectures/minimax/minimax_m2.bux`):
+
+```bux
+norm = rmsnorm(eps=1e-6)
+attn = gqa(num_heads=48, num_kv_heads=8, head_dim=128, qk_norm=norm,
+           qk_norm_all_heads=true, rope=rope(base=5000000, fraction=0.5))
+```
+
+Under tensor parallelism each device has some of the heads, and the norm's mean
+square sums over all of them. A layer that reads its keys from the `kv` port
+normalizes its queries alone ([Ports](#sharing-between-layers-ports)).
+
 `output_norm` normalizes every head's output before the gate. Muse Spark uses both,
 without gains (`examples/architectures/muse/muse_spark_open_816b_a42b.bux`):
 
@@ -296,8 +313,8 @@ attn = gqa(num_heads=128, num_kv_heads=16, head_dim=64, qk_norm=bare,
 ```
 
 :::{note}
-On a GPU, an RMSNorm with a gain and no bias followed by RoPE in the `half` layout
-runs as one Pallas kernel a pass, forward and backward
+On a GPU, an RMSNorm of each head with a gain and no bias followed by RoPE in the
+`half` layout runs as one Pallas kernel a pass, forward and backward
 ([GPU kernels](../performance/kernels.md)).
 :::
 

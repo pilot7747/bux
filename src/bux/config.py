@@ -396,7 +396,8 @@ class QuadraticAttentionConfig(AttentionConfig):
     gate_head_bias: bool = False
     # A norm of each head's output, before the gate (Muse); None: none.
     output_norm: NormalizationConfig | None = None
-    # Norm of each query and key head, before RoPE (Qwen3); None: none.
+    # Norm of each query and key head, before RoPE (Qwen3); gqa's qk_norm_all_heads
+    # makes it one of all the heads together. None: none.
     qk_norm: NormalizationConfig | None = None
     # Soft-capping of the logits, softcap * tanh(logits / softcap) (Gemma 2); None:
     # none.
@@ -478,6 +479,10 @@ class GQAConfig(QuadraticAttentionConfig):
     # Make q, k and v with one projection and split it, instead of one projection
     # each: the same function and init, held as one matrix (GPT-2, MiMo-V2.6-Pro).
     fused_qkv: bool = False
+    # qk_norm over all the heads together: one norm of the queries' num_heads *
+    # head_dim channels and one of the keys', each with a gain per channel, before they
+    # split into heads (MiniMax-M2, OLMo 2). Without qk_norm it does nothing.
+    qk_norm_all_heads: bool = False
     rope: RoPEConfig | None = None  # Rotary embedding of q and k; None: no positions.
     # Queries scaled by (1 + n / power_scale_length) ** power_scale at their position n,
     # counted from 1, so that attention without RoPE stays sharp at long range (Beam's
