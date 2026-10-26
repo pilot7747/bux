@@ -418,17 +418,17 @@ def test_a_pipeline_trains_in_mxfp8_as_its_stages_do_on_one_device(losses):
 
 def test_the_matmul_format_is_in_the_run_s_id_and_a_bfloat16_run_s_is_as_it_was():
     plain, mxfp8 = compile_runs(
-        _source(f"precision = {BF16}", "precision.matmuls = compute | mxfp8")
+        _source(f"precision = {BF16}", "precision.matmuls = compute | mxfp8", arch=OLD)
     )
     assert mxfp8.train.precision.matmuls == "mxfp8"
     assert plain.id != mxfp8.id and plain.name != mxfp8.name
-    [bf16] = compile_runs(_source(f"precision = {BF16}"))
+    [bf16] = compile_runs(_source(f"precision = {BF16}", arch=OLD))
     assert bf16.id == plain.id == "de94a2eb32"  # as before matmuls
 
 
 def test_the_reduce_dtype_is_in_the_run_s_id_and_a_run_that_leaves_it_is_as_it_was():
     plain, f32 = compile_runs(
-        _source(f"precision = {BF16}", "precision.reduce = compute | float32")
+        _source(f"precision = {BF16}", "precision.reduce = compute | float32", arch=OLD)
     )
     assert f32.train.precision.reduce == "float32"
     assert plain.id != f32.id and plain.name != f32.name
@@ -679,11 +679,12 @@ def test_experts_that_take_mxfp8_from_matmuls_have_the_id_of_those_that_name_it(
     it done."""
     mxfp8 = "precision(compute=bfloat16, matmuls=mxfp8"
     assert _moe_id(f"{mxfp8})") == _moe_id(f"{mxfp8}, roles=roles(experts=mxfp8))")
-    assert _moe_id(f"{mxfp8})") == "24391a5e9c"
-    assert _moe_id(f"{mxfp8}, roles=roles(experts=compute))") == "1ef1947db3"
-    assert _moe_id("precision(compute=bfloat16, matmuls=nvfp4)") == "3d13f9d166"
-    assert _moe_id(BF16) == "ddb963967a"
-    [dense] = compile_runs(_source(f"precision = {mxfp8})"))
+    # The MoE's ids since its weights start from the default normal.
+    assert _moe_id(f"{mxfp8})") == "bdcce93100"
+    assert _moe_id(f"{mxfp8}, roles=roles(experts=compute))") == "8621603114"
+    assert _moe_id("precision(compute=bfloat16, matmuls=nvfp4)") == "57df881446"
+    assert _moe_id(BF16) == "ed5cd2a755"
+    [dense] = compile_runs(_source(f"precision = {mxfp8})", arch=OLD))
     assert dense.id == "f66305703c"  # no experts: as before
 
 
@@ -879,6 +880,11 @@ TRAIN = [
     "batch = 8",
     "steps = 3",
 ]
+
+
+# The llama as every weight matrix started before the default init was a normal, of
+# the run ids before it.
+OLD = "init = fan_in(embed=fan_in(distribution=gaussian))\n" + ARCHITECTURES["llama"]
 
 
 def _source(*settings: str, arch: str = ARCHITECTURES["llama"]) -> str:
