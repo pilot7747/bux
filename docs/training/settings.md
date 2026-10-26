@@ -45,7 +45,7 @@ shows them on hover and completes them, as it does for layers
 | `eval` | {bux}`eval`, or `none` | `none` | a held-out loss every so many steps ([Eval](running.md#eval)) |
 | `checkpoint` | {bux}`checkpoint`, or `none` | `none` | saves to resume from ([Checkpoints](running.md#checkpoints)) |
 | `log` | {bux}`log` | `log` | the metrics every `every` steps, 10 by default ([The log](running.md#the-log)) |
-| `profile` | {bux}`profile`, or `none` | `none` | a trace of a few steps ([Profiling](../performance/profiling.md)) |
+| `profile` | {bux}`profile`, or `none` | `none` | a trace of a few steps, by jax.profiler, nsys or ncu ([Profiling](../performance/profiling.md)) |
 | `precision` | {bux}`precision` | `precision` | the dtype a run computes in, and the formats its matmuls take ([Precision](precision.md)) |
 | `mesh` | {bux}`mesh` | `mesh` | the device grid; unset, every device on `data` ([Parallelism](../parallelism/index.md)) |
 | `layout` | {bux}`layout` | `layout` | which mesh axes each named dimension splits over ([Layout](../parallelism/layout.md)) |

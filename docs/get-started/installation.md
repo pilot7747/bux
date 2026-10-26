@@ -142,7 +142,9 @@ docker build --build-arg TE_VERSION=2.20.2 -t bux .
 ```
 
 The image also has libibverbs and its mlx5 provider, through which NCCL reaches
-InfiniBand between nodes ([Many nodes](../parallelism/multi-node.md)).
+InfiniBand between nodes ([Many nodes](../parallelism/multi-node.md)), and NVIDIA's
+profilers, Nsight Systems' `nsys` and Nsight Compute's `ncu`, which a `profile`
+setting's `tool=nsys` and `tool=ncu` run under ([Profiling](../performance/profiling.md#nsight-systems-and-nsight-compute)).
 
 ### The published image
 

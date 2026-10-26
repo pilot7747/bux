@@ -7,7 +7,7 @@ A run's directory, ``<out>/<name>-<id>``, holds::
     run.json       its IR
     metrics.jsonl  a line of metrics every `log.every` steps, and at every eval
     checkpoints/   with a `checkpoint` setting; a run there resumes from the latest
-    profile/       with a `profile` setting, a trace of its steps
+    profile/       with a `profile` setting, a trace or report of its steps
 
 Its name says which alternatives it took, and its id hashes what it computes, so a
 changed setting gets a fresh directory and an unchanged one finds its checkpoints.
@@ -1219,5 +1219,8 @@ def _hooks(
             )
         hooks.append(checkpoint)
     if (trace := config.profile) is not None:
-        hooks.append(Profile(folder / "profile", start=trace.start, steps=trace.steps))
+        profile = Profile(
+            folder / "profile", start=trace.start, steps=trace.steps, tool=trace.tool
+        )
+        hooks.append(profile)
     return hooks

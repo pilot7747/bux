@@ -69,7 +69,7 @@ id. `smoke[optimizer.lr=1e-3]` goes to `runs/smoke_optimizer.lr=1e-3-e3a8d2164a/
 | `run.json` | the run's IR, {py:class}`bux.lang.ir.Run` as JSON | `train` |
 | `metrics.jsonl` | a line of metrics every `log.every` steps, and at every eval | `train` |
 | `checkpoints/` | the model's and the optimizer's state, with a `checkpoint` setting (orbax) | `train` |
-| `profile/` | a `jax.profiler` trace, with a `profile` setting | `train` |
+| `profile/` | a `jax.profiler` trace, or an nsys or ncu report, with a `profile` setting | `train`, or the tool |
 | `status.json` | whether the run is running, done, failed or stopped, and its latest metrics | `bux launch` |
 | `train.log` | a sweep's worker's output | `bux launch` |
 
@@ -274,4 +274,6 @@ how it fails when it cannot work.
 `profile = profile(start=20, steps=5)` traces the 5 steps after step 20 into the run's
 `profile/`, for `xprof` or TensorBoard's profile plugin; its defaults are `start=10`
 and `steps=5`. On GPUs the log then reports what a traced step spent communicating and
-idle. [Profiling](../performance/profiling.md) covers the trace and those metrics.
+idle. With `tool=nsys` or `tool=ncu`, `bux launch` runs the run under Nsight Systems
+or Nsight Compute, whose report of those steps goes there instead.
+[Profiling](../performance/profiling.md) covers the traces and those metrics.

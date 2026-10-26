@@ -48,7 +48,9 @@ profile = profile(start=20, steps=5)
 At step 25 the log then has `comm_ms`, `exposed_comm_ms` and `idle_ms`: what a step
 spent in collectives, in collectives with nothing computing beside them, and running
 nothing. [Profiling](profiling.md#finding-what-a-step-waits-for) says which lever each
-points to.
+points to. For NVIDIA's own timeline, or a kernel's counters, `tool=nsys` or
+`tool=ncu` takes Nsight's report instead
+([Nsight Systems and Nsight Compute](profiling.md#nsight-systems-and-nsight-compute)).
 
 ### 3. Change one thing
 

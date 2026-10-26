@@ -27,7 +27,7 @@ from bux.architecture import Model
 from bux.data.pipeline import jobs
 from bux.lang import compile, compile_runs
 from bux.train import config as tcfg
-from bux.train import flops
+from bux.train import flops, profilers
 from bux.train.data import Batch, batches, plain, prefetch
 from bux.train.hooks import Checkpoint, Hook, Log, Profile
 from bux.train.objective import (
@@ -578,6 +578,30 @@ def test_a_profile_traces_its_steps_into_the_run_s_directory_and_keeps_its_id(
     assert len(list(traces)) == 1
     hook = Profile(tmp_path, start=1, steps=2)
     assert [s for s in range(1, 5) if hook.due(s, 4)] == [1, 3]
+
+
+def test_a_profile_by_nsys_captures_nothing_off_gpus_and_writes_no_trace(tmp_path):
+    run = smoke("steps = 3", "profile = profile(start=1, steps=1, tool=nsys)")
+    last = train(run, tmp_path, echo=lambda _: None)
+    assert "comm_ms" not in last
+    assert not list((directory(run, tmp_path) / "profile").rglob("*.xplane.pb"))
+
+
+def test_nsys_and_ncu_run_a_process_under_their_command(tmp_path, monkeypatch):
+    monkeypatch.delenv(profilers.VARIABLE, raising=False)
+    nsys = tcfg.ProfileConfig(tool="nsys", options="--cuda-memory-usage=true")
+    tool = profilers.command(nsys, tmp_path)
+    assert tool[:4] == ["env", "BUX_PROFILER=nsys", "nsys", "profile"]
+    assert f"--output={tmp_path / 'profile' / '%h.%p'}" in tool
+    assert tool[-1] == "--cuda-memory-usage=true"
+    ncu = profilers.command(tcfg.ProfileConfig(tool="ncu"), tmp_path)
+    assert ncu[2:4] == ["ncu", "--profile-from-start=off"]
+    assert profilers.command(tcfg.ProfileConfig(), tmp_path) == []  # jax: in it
+    assert profilers.unfit(tcfg.ProfileConfig(tool="perf")) == (
+        "profile: no tool 'perf'; there are jax, nsys, ncu"
+    )
+    monkeypatch.setenv(profilers.VARIABLE, "nsys")  # under it already
+    assert profilers.command(nsys, tmp_path) == []
 
 
 def test_a_run_trains_on_text_that_it_prepares_first(tmp_path, byte_tokenizer):

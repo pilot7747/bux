@@ -40,7 +40,7 @@ from jaxtyping import Array, Shaped
 
 from bux import parallel
 from bux.lang.printer import value_to_source
-from bux.train import trace
+from bux.train import profilers, trace
 from bux.train.data import Batch
 from bux.train.objective import Metrics
 from bux.train.optim import Schedule
@@ -271,22 +271,25 @@ class Checkpoint(Hook):
 
 
 class Profile(Hook):
-    """A jax.profiler trace, into `folder`, of the `steps` steps after step `start`.
-    It waits for the step before it starts and stops, so the trace holds whole steps.
+    """A trace of the `steps` steps after step `start`: jax.profiler's, into `folder`,
+    or the capture of the tool the process runs under, nsys or ncu
+    (`bux.train.profilers`). It waits for the step before it starts and stops, so the
+    trace holds whole steps.
 
-    On GPUs it then reports what a step of them spent in collectives, `comm_ms`, in
-    collectives with no compute beside them, `exposed_comm_ms`, and running nothing,
-    `idle_ms` (`bux.train.trace`).
+    On GPUs, jax.profiler's then reports what a step of them spent in collectives,
+    `comm_ms`, in collectives with no compute beside them, `exposed_comm_ms`, and
+    running nothing, `idle_ms` (`bux.train.trace`).
 
     Args:
         folder: Where jax.profiler writes the trace.
         start: The step after which the trace starts.
         steps: The steps it traces.
+        tool: What traces: ``jax``, or the tool the process runs under.
     """
 
-    def __init__(self, folder: Path, *, start: int, steps: int):
+    def __init__(self, folder: Path, *, start: int, steps: int, tool: str = "jax"):
         self.folder, self.first, self.last = folder, start, start + steps
-        self.tracing = False
+        self.tool, self.tracing = tool, False
 
     def due(self, step: int, steps: int) -> bool:
         """Return whether `step` is the one the trace starts or stops after."""
@@ -301,13 +304,15 @@ class Profile(Hook):
         return what the steps spent in communication, on GPUs."""
         jax.block_until_ready(metrics)
         self._at(trainer.step)
-        if trainer.step != self.last or (file := trace.latest(self.folder)) is None:
+        if trainer.step != self.last or self.tool != "jax":
+            return None
+        if (file := trace.latest(self.folder)) is None:
             return None
         return trace.comm_ms(file, self.last - self.first)
 
     def _at(self, step: int) -> None:
         if step == self.first:
-            jax.profiler.start_trace(self.folder)
+            profilers.start(self.tool, self.folder)
             self.tracing = True
         else:
             self.close()
@@ -315,7 +320,7 @@ class Profile(Hook):
     def close(self) -> None:
         """Stop the trace if it is running."""
         if self.tracing:
-            jax.profiler.stop_trace()
+            profilers.stop(self.tool)
             self.tracing = False
 
 

@@ -364,14 +364,22 @@ class LogConfig(Config):
 
 
 class ProfileConfig(Config):
-    """A jax.profiler trace of `steps` steps, those after step `start`, in the run's
-    directory under profile/, which TensorBoard's profile plugin and xprof read. On
-    GPUs it also logs what a step spent in collectives (`comm_ms`), in collectives with
-    no compute beside them (`exposed_comm_ms`), and running nothing (`idle_ms`)."""
+    """A trace of `steps` steps, those after step `start`, in the run's directory under
+    profile/. jax.profiler's, by default, is for TensorBoard's profile plugin and
+    xprof; on GPUs it also logs what a step spent in collectives (`comm_ms`), in
+    collectives with no compute beside them (`exposed_comm_ms`), and running nothing
+    (`idle_ms`). nsys's and ncu's are the Nsight reports of a process that bux launch
+    runs under the tool (bux.train.profilers)."""
 
     type: Literal["profile"] = "profile"
     start: Annotated[int, Field(ge=0)] = 10  # the step after which the trace starts
     steps: Positive = 5  # the steps it traces
+    # What traces them, by name in bux.train.profilers: jax (jax.profiler), nsys
+    # (Nsight Systems) or ncu (Nsight Compute)
+    tool: str = "jax"
+    # More flags for nsys or ncu, as its command line writes them:
+    # "--cuda-memory-usage=true"
+    options: str = ""
 
 
 # --- Precision ---------------------------------------------------------------------------
