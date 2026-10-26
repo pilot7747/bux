@@ -1,0 +1,318 @@
+{
+ "name": "gpt2",
+ "facts": {
+  "d_model": 768,
+  "vocab_size": 50257,
+  "layers": 51,
+  "residual": null,
+  "init": null,
+  "by_type": [
+   [
+    "layernorm",
+    25
+   ],
+   [
+    "gqa",
+    12
+   ],
+   [
+    "mlp",
+    12
+   ],
+   [
+    "embed",
+    1
+   ],
+   [
+    "head",
+    1
+   ]
+  ]
+ },
+ "graph": {
+  "id": "n",
+  "kind": "seq",
+  "label": "model",
+  "shared": false,
+  "span": null,
+  "origin": null,
+  "editable": true,
+  "items": [
+   {
+    "id": "n.0",
+    "kind": "layer",
+    "label": null,
+    "shared": false,
+    "span": null,
+    "origin": null,
+    "editable": true,
+    "type": "embed",
+    "title": "Token embedding",
+    "category": "io",
+    "chips": [
+     "1,024 positions"
+    ],
+    "width": "tokens",
+    "ports": [],
+    "written": [
+     0,
+     6
+    ],
+    "internals": null,
+    "inserted": false
+   },
+   {
+    "id": "n.1",
+    "kind": "repeat",
+    "label": null,
+    "shared": false,
+    "span": null,
+    "origin": null,
+    "editable": true,
+    "body": {
+     "id": "n.1.0",
+     "kind": "seq",
+     "label": "block",
+     "shared": false,
+     "span": null,
+     "origin": null,
+     "editable": true,
+     "items": [
+      {
+       "id": "n.1.0.0",
+       "kind": "residual",
+       "label": null,
+       "shared": false,
+       "span": null,
+       "origin": null,
+       "editable": true,
+       "body": {
+        "id": "n.1.0.0.0",
+        "kind": "seq",
+        "label": null,
+        "shared": false,
+        "span": null,
+        "origin": null,
+        "editable": true,
+        "items": [
+         {
+          "id": "n.1.0.0.0.0",
+          "kind": "layer",
+          "label": "norm",
+          "shared": false,
+          "span": null,
+          "origin": null,
+          "editable": true,
+          "type": "layernorm",
+          "title": "LayerNorm",
+          "category": "norm",
+          "chips": [],
+          "width": 768,
+          "ports": [],
+          "written": [
+           10,
+           16
+          ],
+          "internals": null,
+          "inserted": false
+         },
+         {
+          "id": "n.1.0.0.0.1",
+          "kind": "layer",
+          "label": "attn",
+          "shared": false,
+          "span": null,
+          "origin": null,
+          "editable": true,
+          "type": "gqa",
+          "title": "Multi-head attention",
+          "category": "attention",
+          "chips": [
+           "12 heads"
+          ],
+          "width": 768,
+          "ports": [],
+          "written": [
+           20,
+           26
+          ],
+          "internals": null,
+          "inserted": false
+         }
+        ]
+       }
+      },
+      {
+       "id": "n.1.0.1",
+       "kind": "residual",
+       "label": null,
+       "shared": false,
+       "span": null,
+       "origin": null,
+       "editable": true,
+       "body": {
+        "id": "n.1.0.1.0",
+        "kind": "seq",
+        "label": null,
+        "shared": false,
+        "span": null,
+        "origin": null,
+        "editable": true,
+        "items": [
+         {
+          "id": "n.1.0.1.0.0",
+          "kind": "layer",
+          "label": "norm",
+          "shared": false,
+          "span": null,
+          "origin": null,
+          "editable": true,
+          "type": "layernorm",
+          "title": "LayerNorm",
+          "category": "norm",
+          "chips": [],
+          "width": 768,
+          "ports": [],
+          "written": [
+           10,
+           16
+          ],
+          "internals": null,
+          "inserted": false
+         },
+         {
+          "id": "n.1.0.1.0.1",
+          "kind": "layer",
+          "label": "ffn",
+          "shared": false,
+          "span": null,
+          "origin": null,
+          "editable": true,
+          "type": "mlp",
+          "title": "Feed forward (GELU (tanh))",
+          "category": "ffn",
+          "chips": [
+           "3,072 hidden"
+          ],
+          "width": 768,
+          "ports": [],
+          "written": [
+           30,
+           36
+          ],
+          "internals": {
+           "id": "n.1.0.1.0.1/i",
+           "label": null,
+           "shared": false,
+           "span": null,
+           "origin": null,
+           "editable": false,
+           "kind": "seq",
+           "items": [
+            {
+             "id": "n.1.0.1.0.1/i.0",
+             "label": null,
+             "shared": false,
+             "span": null,
+             "origin": null,
+             "editable": false,
+             "kind": "layer",
+             "type": "linear",
+             "title": "Linear",
+             "category": "op",
+             "chips": [
+              "768 \u2192 3,072"
+             ],
+             "ports": [],
+             "written": null
+            },
+            {
+             "id": "n.1.0.1.0.1/i.1",
+             "label": null,
+             "shared": false,
+             "span": null,
+             "origin": null,
+             "editable": false,
+             "kind": "layer",
+             "type": "gelu (tanh)",
+             "title": "GELU (tanh)",
+             "category": "op",
+             "chips": [],
+             "ports": [],
+             "written": null
+            },
+            {
+             "id": "n.1.0.1.0.1/i.2",
+             "label": null,
+             "shared": false,
+             "span": null,
+             "origin": null,
+             "editable": false,
+             "kind": "layer",
+             "type": "linear",
+             "title": "Linear",
+             "category": "op",
+             "chips": [
+              "3,072 \u2192 768"
+             ],
+             "ports": [],
+             "written": null
+            }
+           ]
+          },
+          "inserted": false
+         }
+        ]
+       }
+      }
+     ]
+    },
+    "times": 12
+   },
+   {
+    "id": "n.2",
+    "kind": "layer",
+    "label": "norm",
+    "shared": false,
+    "span": null,
+    "origin": null,
+    "editable": true,
+    "type": "layernorm",
+    "title": "LayerNorm",
+    "category": "norm",
+    "chips": [],
+    "width": 768,
+    "ports": [],
+    "written": [
+     10,
+     16
+    ],
+    "internals": null,
+    "inserted": false
+   },
+   {
+    "id": "n.3",
+    "kind": "layer",
+    "label": null,
+    "shared": false,
+    "span": null,
+    "origin": null,
+    "editable": true,
+    "type": "head",
+    "title": "Linear output layer",
+    "category": "io",
+    "chips": [
+     "tied"
+    ],
+    "width": 768,
+    "ports": [],
+    "written": [
+     40,
+     46
+    ],
+    "internals": null,
+    "inserted": false
+   }
+  ]
+ }
+}

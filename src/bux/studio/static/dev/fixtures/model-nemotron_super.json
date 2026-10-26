@@ -1,0 +1,4978 @@
+{
+ "name": "nemotron_3_super_120b_a12b",
+ "facts": {
+  "d_model": 4096,
+  "vocab_size": 131072,
+  "layers": 193,
+  "residual": null,
+  "init": null,
+  "by_type": [
+   [
+    "rmsnorm",
+    95
+   ],
+   [
+    "moe",
+    42
+   ],
+   [
+    "mamba2",
+    40
+   ],
+   [
+    "gqa",
+    10
+   ],
+   [
+    "head",
+    3
+   ],
+   [
+    "nextn",
+    2
+   ],
+   [
+    "embed",
+    1
+   ]
+  ]
+ },
+ "graph": {
+  "id": "n",
+  "kind": "seq",
+  "label": "model",
+  "shared": false,
+  "span": null,
+  "origin": null,
+  "editable": true,
+  "items": [
+   {
+    "id": "n.0",
+    "kind": "layer",
+    "label": null,
+    "shared": false,
+    "span": null,
+    "origin": null,
+    "editable": true,
+    "type": "embed",
+    "title": "Token embedding",
+    "category": "io",
+    "chips": [],
+    "width": "tokens",
+    "ports": [],
+    "written": [
+     0,
+     6
+    ],
+    "internals": null,
+    "inserted": false
+   },
+   {
+    "id": "n.1",
+    "kind": "residual",
+    "label": "M",
+    "shared": false,
+    "span": null,
+    "origin": null,
+    "editable": true,
+    "body": {
+     "id": "n.1.0",
+     "kind": "seq",
+     "label": null,
+     "shared": false,
+     "span": null,
+     "origin": null,
+     "editable": true,
+     "items": [
+      {
+       "id": "n.1.0.0",
+       "kind": "layer",
+       "label": "norm",
+       "shared": false,
+       "span": null,
+       "origin": null,
+       "editable": true,
+       "type": "rmsnorm",
+       "title": "RMSNorm",
+       "category": "norm",
+       "chips": [],
+       "width": 4096,
+       "ports": [],
+       "written": [
+        10,
+        16
+       ],
+       "internals": null,
+       "inserted": false
+      },
+      {
+       "id": "n.1.0.1",
+       "kind": "layer",
+       "label": "ssm",
+       "shared": false,
+       "span": null,
+       "origin": null,
+       "editable": true,
+       "type": "mamba2",
+       "title": "Mamba-2",
+       "category": "recurrent",
+       "chips": [
+        "state 128"
+       ],
+       "width": 4096,
+       "ports": [],
+       "written": [
+        20,
+        26
+       ],
+       "internals": null,
+       "inserted": false
+      }
+     ]
+    }
+   },
+   {
+    "id": "n.2",
+    "kind": "residual",
+    "label": "E",
+    "shared": false,
+    "span": null,
+    "origin": null,
+    "editable": true,
+    "body": {
+     "id": "n.2.0",
+     "kind": "seq",
+     "label": null,
+     "shared": false,
+     "span": null,
+     "origin": null,
+     "editable": true,
+     "items": [
+      {
+       "id": "n.2.0.0",
+       "kind": "layer",
+       "label": "norm",
+       "shared": false,
+       "span": null,
+       "origin": null,
+       "editable": true,
+       "type": "rmsnorm",
+       "title": "RMSNorm",
+       "category": "norm",
+       "chips": [],
+       "width": 4096,
+       "ports": [],
+       "written": [
+        10,
+        16
+       ],
+       "internals": null,
+       "inserted": false
+      },
+      {
+       "id": "n.2.0.1",
+       "kind": "layer",
+       "label": "experts",
+       "shared": false,
+       "span": null,
+       "origin": null,
+       "editable": true,
+       "type": "moe",
+       "title": "Mixture of experts",
+       "category": "experts",
+       "chips": [
+        "512 experts, top 22",
+        "1 shared",
+        "2,688 hidden"
+       ],
+       "width": 4096,
+       "ports": [],
+       "written": [
+        30,
+        36
+       ],
+       "internals": {
+        "id": "n.2.0.1/i",
+        "label": null,
+        "shared": false,
+        "span": null,
+        "origin": null,
+        "editable": false,
+        "kind": "sum",
+        "terms": [
+         {
+          "id": "n.2.0.1/i.0",
+          "label": null,
+          "shared": false,
+          "span": null,
+          "origin": null,
+          "editable": false,
+          "kind": "prod",
+          "factors": [
+           {
+            "id": "n.2.0.1/i.0.0",
+            "label": null,
+            "shared": false,
+            "span": null,
+            "origin": null,
+            "editable": false,
+            "kind": "layer",
+            "type": "routed experts",
+            "title": "Routed experts",
+            "category": "ffn",
+            "chips": [
+             "512 \u00d7 GLU, 2,688"
+            ],
+            "ports": [],
+            "written": null
+           },
+           {
+            "id": "n.2.0.1/i.0.1",
+            "label": null,
+            "shared": false,
+            "span": null,
+            "origin": null,
+            "editable": false,
+            "kind": "layer",
+            "type": "router",
+            "title": "Router",
+            "category": "op",
+            "chips": [
+             "sigmoid, top 22"
+            ],
+            "ports": [],
+            "written": null
+           }
+          ]
+         },
+         {
+          "id": "n.2.0.1/i.1",
+          "label": null,
+          "shared": false,
+          "span": null,
+          "origin": null,
+          "editable": false,
+          "kind": "layer",
+          "type": "shared expert",
+          "title": "Shared expert",
+          "category": "ffn",
+          "chips": [
+           "GLU, 2,688"
+          ],
+          "ports": [],
+          "written": null
+         }
+        ]
+       },
+       "inserted": false
+      }
+     ]
+    }
+   },
+   {
+    "id": "n.3",
+    "kind": "residual",
+    "label": "M",
+    "shared": false,
+    "span": null,
+    "origin": null,
+    "editable": true,
+    "body": {
+     "id": "n.3.0",
+     "kind": "seq",
+     "label": null,
+     "shared": false,
+     "span": null,
+     "origin": null,
+     "editable": true,
+     "items": [
+      {
+       "id": "n.3.0.0",
+       "kind": "layer",
+       "label": "norm",
+       "shared": false,
+       "span": null,
+       "origin": null,
+       "editable": true,
+       "type": "rmsnorm",
+       "title": "RMSNorm",
+       "category": "norm",
+       "chips": [],
+       "width": 4096,
+       "ports": [],
+       "written": [
+        10,
+        16
+       ],
+       "internals": null,
+       "inserted": false
+      },
+      {
+       "id": "n.3.0.1",
+       "kind": "layer",
+       "label": "ssm",
+       "shared": false,
+       "span": null,
+       "origin": null,
+       "editable": true,
+       "type": "mamba2",
+       "title": "Mamba-2",
+       "category": "recurrent",
+       "chips": [
+        "state 128"
+       ],
+       "width": 4096,
+       "ports": [],
+       "written": [
+        20,
+        26
+       ],
+       "internals": null,
+       "inserted": false
+      }
+     ]
+    }
+   },
+   {
+    "id": "n.4",
+    "kind": "residual",
+    "label": "E",
+    "shared": false,
+    "span": null,
+    "origin": null,
+    "editable": true,
+    "body": {
+     "id": "n.4.0",
+     "kind": "seq",
+     "label": null,
+     "shared": false,
+     "span": null,
+     "origin": null,
+     "editable": true,
+     "items": [
+      {
+       "id": "n.4.0.0",
+       "kind": "layer",
+       "label": "norm",
+       "shared": false,
+       "span": null,
+       "origin": null,
+       "editable": true,
+       "type": "rmsnorm",
+       "title": "RMSNorm",
+       "category": "norm",
+       "chips": [],
+       "width": 4096,
+       "ports": [],
+       "written": [
+        10,
+        16
+       ],
+       "internals": null,
+       "inserted": false
+      },
+      {
+       "id": "n.4.0.1",
+       "kind": "layer",
+       "label": "experts",
+       "shared": false,
+       "span": null,
+       "origin": null,
+       "editable": true,
+       "type": "moe",
+       "title": "Mixture of experts",
+       "category": "experts",
+       "chips": [
+        "512 experts, top 22",
+        "1 shared",
+        "2,688 hidden"
+       ],
+       "width": 4096,
+       "ports": [],
+       "written": [
+        30,
+        36
+       ],
+       "internals": {
+        "id": "n.4.0.1/i",
+        "label": null,
+        "shared": false,
+        "span": null,
+        "origin": null,
+        "editable": false,
+        "kind": "sum",
+        "terms": [
+         {
+          "id": "n.4.0.1/i.0",
+          "label": null,
+          "shared": false,
+          "span": null,
+          "origin": null,
+          "editable": false,
+          "kind": "prod",
+          "factors": [
+           {
+            "id": "n.4.0.1/i.0.0",
+            "label": null,
+            "shared": false,
+            "span": null,
+            "origin": null,
+            "editable": false,
+            "kind": "layer",
+            "type": "routed experts",
+            "title": "Routed experts",
+            "category": "ffn",
+            "chips": [
+             "512 \u00d7 GLU, 2,688"
+            ],
+            "ports": [],
+            "written": null
+           },
+           {
+            "id": "n.4.0.1/i.0.1",
+            "label": null,
+            "shared": false,
+            "span": null,
+            "origin": null,
+            "editable": false,
+            "kind": "layer",
+            "type": "router",
+            "title": "Router",
+            "category": "op",
+            "chips": [
+             "sigmoid, top 22"
+            ],
+            "ports": [],
+            "written": null
+           }
+          ]
+         },
+         {
+          "id": "n.4.0.1/i.1",
+          "label": null,
+          "shared": false,
+          "span": null,
+          "origin": null,
+          "editable": false,
+          "kind": "layer",
+          "type": "shared expert",
+          "title": "Shared expert",
+          "category": "ffn",
+          "chips": [
+           "GLU, 2,688"
+          ],
+          "ports": [],
+          "written": null
+         }
+        ]
+       },
+       "inserted": false
+      }
+     ]
+    }
+   },
+   {
+    "id": "n.5",
+    "kind": "residual",
+    "label": "M",
+    "shared": false,
+    "span": null,
+    "origin": null,
+    "editable": true,
+    "body": {
+     "id": "n.5.0",
+     "kind": "seq",
+     "label": null,
+     "shared": false,
+     "span": null,
+     "origin": null,
+     "editable": true,
+     "items": [
+      {
+       "id": "n.5.0.0",
+       "kind": "layer",
+       "label": "norm",
+       "shared": false,
+       "span": null,
+       "origin": null,
+       "editable": true,
+       "type": "rmsnorm",
+       "title": "RMSNorm",
+       "category": "norm",
+       "chips": [],
+       "width": 4096,
+       "ports": [],
+       "written": [
+        10,
+        16
+       ],
+       "internals": null,
+       "inserted": false
+      },
+      {
+       "id": "n.5.0.1",
+       "kind": "layer",
+       "label": "ssm",
+       "shared": false,
+       "span": null,
+       "origin": null,
+       "editable": true,
+       "type": "mamba2",
+       "title": "Mamba-2",
+       "category": "recurrent",
+       "chips": [
+        "state 128"
+       ],
+       "width": 4096,
+       "ports": [],
+       "written": [
+        20,
+        26
+       ],
+       "internals": null,
+       "inserted": false
+      }
+     ]
+    }
+   },
+   {
+    "id": "n.6",
+    "kind": "residual",
+    "label": "E",
+    "shared": false,
+    "span": null,
+    "origin": null,
+    "editable": true,
+    "body": {
+     "id": "n.6.0",
+     "kind": "seq",
+     "label": null,
+     "shared": false,
+     "span": null,
+     "origin": null,
+     "editable": true,
+     "items": [
+      {
+       "id": "n.6.0.0",
+       "kind": "layer",
+       "label": "norm",
+       "shared": false,
+       "span": null,
+       "origin": null,
+       "editable": true,
+       "type": "rmsnorm",
+       "title": "RMSNorm",
+       "category": "norm",
+       "chips": [],
+       "width": 4096,
+       "ports": [],
+       "written": [
+        10,
+        16
+       ],
+       "internals": null,
+       "inserted": false
+      },
+      {
+       "id": "n.6.0.1",
+       "kind": "layer",
+       "label": "experts",
+       "shared": false,
+       "span": null,
+       "origin": null,
+       "editable": true,
+       "type": "moe",
+       "title": "Mixture of experts",
+       "category": "experts",
+       "chips": [
+        "512 experts, top 22",
+        "1 shared",
+        "2,688 hidden"
+       ],
+       "width": 4096,
+       "ports": [],
+       "written": [
+        30,
+        36
+       ],
+       "internals": {
+        "id": "n.6.0.1/i",
+        "label": null,
+        "shared": false,
+        "span": null,
+        "origin": null,
+        "editable": false,
+        "kind": "sum",
+        "terms": [
+         {
+          "id": "n.6.0.1/i.0",
+          "label": null,
+          "shared": false,
+          "span": null,
+          "origin": null,
+          "editable": false,
+          "kind": "prod",
+          "factors": [
+           {
+            "id": "n.6.0.1/i.0.0",
+            "label": null,
+            "shared": false,
+            "span": null,
+            "origin": null,
+            "editable": false,
+            "kind": "layer",
+            "type": "routed experts",
+            "title": "Routed experts",
+            "category": "ffn",
+            "chips": [
+             "512 \u00d7 GLU, 2,688"
+            ],
+            "ports": [],
+            "written": null
+           },
+           {
+            "id": "n.6.0.1/i.0.1",
+            "label": null,
+            "shared": false,
+            "span": null,
+            "origin": null,
+            "editable": false,
+            "kind": "layer",
+            "type": "router",
+            "title": "Router",
+            "category": "op",
+            "chips": [
+             "sigmoid, top 22"
+            ],
+            "ports": [],
+            "written": null
+           }
+          ]
+         },
+         {
+          "id": "n.6.0.1/i.1",
+          "label": null,
+          "shared": false,
+          "span": null,
+          "origin": null,
+          "editable": false,
+          "kind": "layer",
+          "type": "shared expert",
+          "title": "Shared expert",
+          "category": "ffn",
+          "chips": [
+           "GLU, 2,688"
+          ],
+          "ports": [],
+          "written": null
+         }
+        ]
+       },
+       "inserted": false
+      }
+     ]
+    }
+   },
+   {
+    "id": "n.7",
+    "kind": "residual",
+    "label": "M",
+    "shared": false,
+    "span": null,
+    "origin": null,
+    "editable": true,
+    "body": {
+     "id": "n.7.0",
+     "kind": "seq",
+     "label": null,
+     "shared": false,
+     "span": null,
+     "origin": null,
+     "editable": true,
+     "items": [
+      {
+       "id": "n.7.0.0",
+       "kind": "layer",
+       "label": "norm",
+       "shared": false,
+       "span": null,
+       "origin": null,
+       "editable": true,
+       "type": "rmsnorm",
+       "title": "RMSNorm",
+       "category": "norm",
+       "chips": [],
+       "width": 4096,
+       "ports": [],
+       "written": [
+        10,
+        16
+       ],
+       "internals": null,
+       "inserted": false
+      },
+      {
+       "id": "n.7.0.1",
+       "kind": "layer",
+       "label": "ssm",
+       "shared": false,
+       "span": null,
+       "origin": null,
+       "editable": true,
+       "type": "mamba2",
+       "title": "Mamba-2",
+       "category": "recurrent",
+       "chips": [
+        "state 128"
+       ],
+       "width": 4096,
+       "ports": [],
+       "written": [
+        20,
+        26
+       ],
+       "internals": null,
+       "inserted": false
+      }
+     ]
+    }
+   },
+   {
+    "id": "n.8",
+    "kind": "residual",
+    "label": "A",
+    "shared": false,
+    "span": null,
+    "origin": null,
+    "editable": true,
+    "body": {
+     "id": "n.8.0",
+     "kind": "seq",
+     "label": null,
+     "shared": false,
+     "span": null,
+     "origin": null,
+     "editable": true,
+     "items": [
+      {
+       "id": "n.8.0.0",
+       "kind": "layer",
+       "label": "norm",
+       "shared": false,
+       "span": null,
+       "origin": null,
+       "editable": true,
+       "type": "rmsnorm",
+       "title": "RMSNorm",
+       "category": "norm",
+       "chips": [],
+       "width": 4096,
+       "ports": [],
+       "written": [
+        10,
+        16
+       ],
+       "internals": null,
+       "inserted": false
+      },
+      {
+       "id": "n.8.0.1",
+       "kind": "layer",
+       "label": "attn",
+       "shared": false,
+       "span": null,
+       "origin": null,
+       "editable": true,
+       "type": "gqa",
+       "title": "Grouped-query attention",
+       "category": "attention",
+       "chips": [
+        "32 heads",
+        "2 KV heads"
+       ],
+       "width": 4096,
+       "ports": [],
+       "written": [
+        40,
+        46
+       ],
+       "internals": null,
+       "inserted": false
+      }
+     ]
+    }
+   },
+   {
+    "id": "n.9",
+    "kind": "repeat",
+    "label": null,
+    "shared": false,
+    "span": null,
+    "origin": null,
+    "editable": true,
+    "body": {
+     "id": "n.9.0",
+     "kind": "seq",
+     "label": null,
+     "shared": false,
+     "span": null,
+     "origin": null,
+     "editable": true,
+     "items": [
+      {
+       "id": "n.9.0.0",
+       "kind": "residual",
+       "label": "E",
+       "shared": false,
+       "span": null,
+       "origin": null,
+       "editable": true,
+       "body": {
+        "id": "n.9.0.0.0",
+        "kind": "seq",
+        "label": null,
+        "shared": false,
+        "span": null,
+        "origin": null,
+        "editable": true,
+        "items": [
+         {
+          "id": "n.9.0.0.0.0",
+          "kind": "layer",
+          "label": "norm",
+          "shared": false,
+          "span": null,
+          "origin": null,
+          "editable": true,
+          "type": "rmsnorm",
+          "title": "RMSNorm",
+          "category": "norm",
+          "chips": [],
+          "width": 4096,
+          "ports": [],
+          "written": [
+           10,
+           16
+          ],
+          "internals": null,
+          "inserted": false
+         },
+         {
+          "id": "n.9.0.0.0.1",
+          "kind": "layer",
+          "label": "experts",
+          "shared": false,
+          "span": null,
+          "origin": null,
+          "editable": true,
+          "type": "moe",
+          "title": "Mixture of experts",
+          "category": "experts",
+          "chips": [
+           "512 experts, top 22",
+           "1 shared",
+           "2,688 hidden"
+          ],
+          "width": 4096,
+          "ports": [],
+          "written": [
+           30,
+           36
+          ],
+          "internals": {
+           "id": "n.9.0.0.0.1/i",
+           "label": null,
+           "shared": false,
+           "span": null,
+           "origin": null,
+           "editable": false,
+           "kind": "sum",
+           "terms": [
+            {
+             "id": "n.9.0.0.0.1/i.0",
+             "label": null,
+             "shared": false,
+             "span": null,
+             "origin": null,
+             "editable": false,
+             "kind": "prod",
+             "factors": [
+              {
+               "id": "n.9.0.0.0.1/i.0.0",
+               "label": null,
+               "shared": false,
+               "span": null,
+               "origin": null,
+               "editable": false,
+               "kind": "layer",
+               "type": "routed experts",
+               "title": "Routed experts",
+               "category": "ffn",
+               "chips": [
+                "512 \u00d7 GLU, 2,688"
+               ],
+               "ports": [],
+               "written": null
+              },
+              {
+               "id": "n.9.0.0.0.1/i.0.1",
+               "label": null,
+               "shared": false,
+               "span": null,
+               "origin": null,
+               "editable": false,
+               "kind": "layer",
+               "type": "router",
+               "title": "Router",
+               "category": "op",
+               "chips": [
+                "sigmoid, top 22"
+               ],
+               "ports": [],
+               "written": null
+              }
+             ]
+            },
+            {
+             "id": "n.9.0.0.0.1/i.1",
+             "label": null,
+             "shared": false,
+             "span": null,
+             "origin": null,
+             "editable": false,
+             "kind": "layer",
+             "type": "shared expert",
+             "title": "Shared expert",
+             "category": "ffn",
+             "chips": [
+              "GLU, 2,688"
+             ],
+             "ports": [],
+             "written": null
+            }
+           ]
+          },
+          "inserted": false
+         }
+        ]
+       }
+      },
+      {
+       "id": "n.9.0.1",
+       "kind": "residual",
+       "label": "M",
+       "shared": false,
+       "span": null,
+       "origin": null,
+       "editable": true,
+       "body": {
+        "id": "n.9.0.1.0",
+        "kind": "seq",
+        "label": null,
+        "shared": false,
+        "span": null,
+        "origin": null,
+        "editable": true,
+        "items": [
+         {
+          "id": "n.9.0.1.0.0",
+          "kind": "layer",
+          "label": "norm",
+          "shared": false,
+          "span": null,
+          "origin": null,
+          "editable": true,
+          "type": "rmsnorm",
+          "title": "RMSNorm",
+          "category": "norm",
+          "chips": [],
+          "width": 4096,
+          "ports": [],
+          "written": [
+           10,
+           16
+          ],
+          "internals": null,
+          "inserted": false
+         },
+         {
+          "id": "n.9.0.1.0.1",
+          "kind": "layer",
+          "label": "ssm",
+          "shared": false,
+          "span": null,
+          "origin": null,
+          "editable": true,
+          "type": "mamba2",
+          "title": "Mamba-2",
+          "category": "recurrent",
+          "chips": [
+           "state 128"
+          ],
+          "width": 4096,
+          "ports": [],
+          "written": [
+           20,
+           26
+          ],
+          "internals": null,
+          "inserted": false
+         }
+        ]
+       }
+      },
+      {
+       "id": "n.9.0.2",
+       "kind": "residual",
+       "label": "E",
+       "shared": false,
+       "span": null,
+       "origin": null,
+       "editable": true,
+       "body": {
+        "id": "n.9.0.2.0",
+        "kind": "seq",
+        "label": null,
+        "shared": false,
+        "span": null,
+        "origin": null,
+        "editable": true,
+        "items": [
+         {
+          "id": "n.9.0.2.0.0",
+          "kind": "layer",
+          "label": "norm",
+          "shared": false,
+          "span": null,
+          "origin": null,
+          "editable": true,
+          "type": "rmsnorm",
+          "title": "RMSNorm",
+          "category": "norm",
+          "chips": [],
+          "width": 4096,
+          "ports": [],
+          "written": [
+           10,
+           16
+          ],
+          "internals": null,
+          "inserted": false
+         },
+         {
+          "id": "n.9.0.2.0.1",
+          "kind": "layer",
+          "label": "experts",
+          "shared": false,
+          "span": null,
+          "origin": null,
+          "editable": true,
+          "type": "moe",
+          "title": "Mixture of experts",
+          "category": "experts",
+          "chips": [
+           "512 experts, top 22",
+           "1 shared",
+           "2,688 hidden"
+          ],
+          "width": 4096,
+          "ports": [],
+          "written": [
+           30,
+           36
+          ],
+          "internals": {
+           "id": "n.9.0.2.0.1/i",
+           "label": null,
+           "shared": false,
+           "span": null,
+           "origin": null,
+           "editable": false,
+           "kind": "sum",
+           "terms": [
+            {
+             "id": "n.9.0.2.0.1/i.0",
+             "label": null,
+             "shared": false,
+             "span": null,
+             "origin": null,
+             "editable": false,
+             "kind": "prod",
+             "factors": [
+              {
+               "id": "n.9.0.2.0.1/i.0.0",
+               "label": null,
+               "shared": false,
+               "span": null,
+               "origin": null,
+               "editable": false,
+               "kind": "layer",
+               "type": "routed experts",
+               "title": "Routed experts",
+               "category": "ffn",
+               "chips": [
+                "512 \u00d7 GLU, 2,688"
+               ],
+               "ports": [],
+               "written": null
+              },
+              {
+               "id": "n.9.0.2.0.1/i.0.1",
+               "label": null,
+               "shared": false,
+               "span": null,
+               "origin": null,
+               "editable": false,
+               "kind": "layer",
+               "type": "router",
+               "title": "Router",
+               "category": "op",
+               "chips": [
+                "sigmoid, top 22"
+               ],
+               "ports": [],
+               "written": null
+              }
+             ]
+            },
+            {
+             "id": "n.9.0.2.0.1/i.1",
+             "label": null,
+             "shared": false,
+             "span": null,
+             "origin": null,
+             "editable": false,
+             "kind": "layer",
+             "type": "shared expert",
+             "title": "Shared expert",
+             "category": "ffn",
+             "chips": [
+              "GLU, 2,688"
+             ],
+             "ports": [],
+             "written": null
+            }
+           ]
+          },
+          "inserted": false
+         }
+        ]
+       }
+      },
+      {
+       "id": "n.9.0.3",
+       "kind": "residual",
+       "label": "M",
+       "shared": false,
+       "span": null,
+       "origin": null,
+       "editable": true,
+       "body": {
+        "id": "n.9.0.3.0",
+        "kind": "seq",
+        "label": null,
+        "shared": false,
+        "span": null,
+        "origin": null,
+        "editable": true,
+        "items": [
+         {
+          "id": "n.9.0.3.0.0",
+          "kind": "layer",
+          "label": "norm",
+          "shared": false,
+          "span": null,
+          "origin": null,
+          "editable": true,
+          "type": "rmsnorm",
+          "title": "RMSNorm",
+          "category": "norm",
+          "chips": [],
+          "width": 4096,
+          "ports": [],
+          "written": [
+           10,
+           16
+          ],
+          "internals": null,
+          "inserted": false
+         },
+         {
+          "id": "n.9.0.3.0.1",
+          "kind": "layer",
+          "label": "ssm",
+          "shared": false,
+          "span": null,
+          "origin": null,
+          "editable": true,
+          "type": "mamba2",
+          "title": "Mamba-2",
+          "category": "recurrent",
+          "chips": [
+           "state 128"
+          ],
+          "width": 4096,
+          "ports": [],
+          "written": [
+           20,
+           26
+          ],
+          "internals": null,
+          "inserted": false
+         }
+        ]
+       }
+      },
+      {
+       "id": "n.9.0.4",
+       "kind": "residual",
+       "label": "E",
+       "shared": false,
+       "span": null,
+       "origin": null,
+       "editable": true,
+       "body": {
+        "id": "n.9.0.4.0",
+        "kind": "seq",
+        "label": null,
+        "shared": false,
+        "span": null,
+        "origin": null,
+        "editable": true,
+        "items": [
+         {
+          "id": "n.9.0.4.0.0",
+          "kind": "layer",
+          "label": "norm",
+          "shared": false,
+          "span": null,
+          "origin": null,
+          "editable": true,
+          "type": "rmsnorm",
+          "title": "RMSNorm",
+          "category": "norm",
+          "chips": [],
+          "width": 4096,
+          "ports": [],
+          "written": [
+           10,
+           16
+          ],
+          "internals": null,
+          "inserted": false
+         },
+         {
+          "id": "n.9.0.4.0.1",
+          "kind": "layer",
+          "label": "experts",
+          "shared": false,
+          "span": null,
+          "origin": null,
+          "editable": true,
+          "type": "moe",
+          "title": "Mixture of experts",
+          "category": "experts",
+          "chips": [
+           "512 experts, top 22",
+           "1 shared",
+           "2,688 hidden"
+          ],
+          "width": 4096,
+          "ports": [],
+          "written": [
+           30,
+           36
+          ],
+          "internals": {
+           "id": "n.9.0.4.0.1/i",
+           "label": null,
+           "shared": false,
+           "span": null,
+           "origin": null,
+           "editable": false,
+           "kind": "sum",
+           "terms": [
+            {
+             "id": "n.9.0.4.0.1/i.0",
+             "label": null,
+             "shared": false,
+             "span": null,
+             "origin": null,
+             "editable": false,
+             "kind": "prod",
+             "factors": [
+              {
+               "id": "n.9.0.4.0.1/i.0.0",
+               "label": null,
+               "shared": false,
+               "span": null,
+               "origin": null,
+               "editable": false,
+               "kind": "layer",
+               "type": "routed experts",
+               "title": "Routed experts",
+               "category": "ffn",
+               "chips": [
+                "512 \u00d7 GLU, 2,688"
+               ],
+               "ports": [],
+               "written": null
+              },
+              {
+               "id": "n.9.0.4.0.1/i.0.1",
+               "label": null,
+               "shared": false,
+               "span": null,
+               "origin": null,
+               "editable": false,
+               "kind": "layer",
+               "type": "router",
+               "title": "Router",
+               "category": "op",
+               "chips": [
+                "sigmoid, top 22"
+               ],
+               "ports": [],
+               "written": null
+              }
+             ]
+            },
+            {
+             "id": "n.9.0.4.0.1/i.1",
+             "label": null,
+             "shared": false,
+             "span": null,
+             "origin": null,
+             "editable": false,
+             "kind": "layer",
+             "type": "shared expert",
+             "title": "Shared expert",
+             "category": "ffn",
+             "chips": [
+              "GLU, 2,688"
+             ],
+             "ports": [],
+             "written": null
+            }
+           ]
+          },
+          "inserted": false
+         }
+        ]
+       }
+      },
+      {
+       "id": "n.9.0.5",
+       "kind": "residual",
+       "label": "M",
+       "shared": false,
+       "span": null,
+       "origin": null,
+       "editable": true,
+       "body": {
+        "id": "n.9.0.5.0",
+        "kind": "seq",
+        "label": null,
+        "shared": false,
+        "span": null,
+        "origin": null,
+        "editable": true,
+        "items": [
+         {
+          "id": "n.9.0.5.0.0",
+          "kind": "layer",
+          "label": "norm",
+          "shared": false,
+          "span": null,
+          "origin": null,
+          "editable": true,
+          "type": "rmsnorm",
+          "title": "RMSNorm",
+          "category": "norm",
+          "chips": [],
+          "width": 4096,
+          "ports": [],
+          "written": [
+           10,
+           16
+          ],
+          "internals": null,
+          "inserted": false
+         },
+         {
+          "id": "n.9.0.5.0.1",
+          "kind": "layer",
+          "label": "ssm",
+          "shared": false,
+          "span": null,
+          "origin": null,
+          "editable": true,
+          "type": "mamba2",
+          "title": "Mamba-2",
+          "category": "recurrent",
+          "chips": [
+           "state 128"
+          ],
+          "width": 4096,
+          "ports": [],
+          "written": [
+           20,
+           26
+          ],
+          "internals": null,
+          "inserted": false
+         }
+        ]
+       }
+      },
+      {
+       "id": "n.9.0.6",
+       "kind": "residual",
+       "label": "E",
+       "shared": false,
+       "span": null,
+       "origin": null,
+       "editable": true,
+       "body": {
+        "id": "n.9.0.6.0",
+        "kind": "seq",
+        "label": null,
+        "shared": false,
+        "span": null,
+        "origin": null,
+        "editable": true,
+        "items": [
+         {
+          "id": "n.9.0.6.0.0",
+          "kind": "layer",
+          "label": "norm",
+          "shared": false,
+          "span": null,
+          "origin": null,
+          "editable": true,
+          "type": "rmsnorm",
+          "title": "RMSNorm",
+          "category": "norm",
+          "chips": [],
+          "width": 4096,
+          "ports": [],
+          "written": [
+           10,
+           16
+          ],
+          "internals": null,
+          "inserted": false
+         },
+         {
+          "id": "n.9.0.6.0.1",
+          "kind": "layer",
+          "label": "experts",
+          "shared": false,
+          "span": null,
+          "origin": null,
+          "editable": true,
+          "type": "moe",
+          "title": "Mixture of experts",
+          "category": "experts",
+          "chips": [
+           "512 experts, top 22",
+           "1 shared",
+           "2,688 hidden"
+          ],
+          "width": 4096,
+          "ports": [],
+          "written": [
+           30,
+           36
+          ],
+          "internals": {
+           "id": "n.9.0.6.0.1/i",
+           "label": null,
+           "shared": false,
+           "span": null,
+           "origin": null,
+           "editable": false,
+           "kind": "sum",
+           "terms": [
+            {
+             "id": "n.9.0.6.0.1/i.0",
+             "label": null,
+             "shared": false,
+             "span": null,
+             "origin": null,
+             "editable": false,
+             "kind": "prod",
+             "factors": [
+              {
+               "id": "n.9.0.6.0.1/i.0.0",
+               "label": null,
+               "shared": false,
+               "span": null,
+               "origin": null,
+               "editable": false,
+               "kind": "layer",
+               "type": "routed experts",
+               "title": "Routed experts",
+               "category": "ffn",
+               "chips": [
+                "512 \u00d7 GLU, 2,688"
+               ],
+               "ports": [],
+               "written": null
+              },
+              {
+               "id": "n.9.0.6.0.1/i.0.1",
+               "label": null,
+               "shared": false,
+               "span": null,
+               "origin": null,
+               "editable": false,
+               "kind": "layer",
+               "type": "router",
+               "title": "Router",
+               "category": "op",
+               "chips": [
+                "sigmoid, top 22"
+               ],
+               "ports": [],
+               "written": null
+              }
+             ]
+            },
+            {
+             "id": "n.9.0.6.0.1/i.1",
+             "label": null,
+             "shared": false,
+             "span": null,
+             "origin": null,
+             "editable": false,
+             "kind": "layer",
+             "type": "shared expert",
+             "title": "Shared expert",
+             "category": "ffn",
+             "chips": [
+              "GLU, 2,688"
+             ],
+             "ports": [],
+             "written": null
+            }
+           ]
+          },
+          "inserted": false
+         }
+        ]
+       }
+      },
+      {
+       "id": "n.9.0.7",
+       "kind": "residual",
+       "label": "M",
+       "shared": false,
+       "span": null,
+       "origin": null,
+       "editable": true,
+       "body": {
+        "id": "n.9.0.7.0",
+        "kind": "seq",
+        "label": null,
+        "shared": false,
+        "span": null,
+        "origin": null,
+        "editable": true,
+        "items": [
+         {
+          "id": "n.9.0.7.0.0",
+          "kind": "layer",
+          "label": "norm",
+          "shared": false,
+          "span": null,
+          "origin": null,
+          "editable": true,
+          "type": "rmsnorm",
+          "title": "RMSNorm",
+          "category": "norm",
+          "chips": [],
+          "width": 4096,
+          "ports": [],
+          "written": [
+           10,
+           16
+          ],
+          "internals": null,
+          "inserted": false
+         },
+         {
+          "id": "n.9.0.7.0.1",
+          "kind": "layer",
+          "label": "ssm",
+          "shared": false,
+          "span": null,
+          "origin": null,
+          "editable": true,
+          "type": "mamba2",
+          "title": "Mamba-2",
+          "category": "recurrent",
+          "chips": [
+           "state 128"
+          ],
+          "width": 4096,
+          "ports": [],
+          "written": [
+           20,
+           26
+          ],
+          "internals": null,
+          "inserted": false
+         }
+        ]
+       }
+      },
+      {
+       "id": "n.9.0.8",
+       "kind": "residual",
+       "label": "A",
+       "shared": false,
+       "span": null,
+       "origin": null,
+       "editable": true,
+       "body": {
+        "id": "n.9.0.8.0",
+        "kind": "seq",
+        "label": null,
+        "shared": false,
+        "span": null,
+        "origin": null,
+        "editable": true,
+        "items": [
+         {
+          "id": "n.9.0.8.0.0",
+          "kind": "layer",
+          "label": "norm",
+          "shared": false,
+          "span": null,
+          "origin": null,
+          "editable": true,
+          "type": "rmsnorm",
+          "title": "RMSNorm",
+          "category": "norm",
+          "chips": [],
+          "width": 4096,
+          "ports": [],
+          "written": [
+           10,
+           16
+          ],
+          "internals": null,
+          "inserted": false
+         },
+         {
+          "id": "n.9.0.8.0.1",
+          "kind": "layer",
+          "label": "attn",
+          "shared": false,
+          "span": null,
+          "origin": null,
+          "editable": true,
+          "type": "gqa",
+          "title": "Grouped-query attention",
+          "category": "attention",
+          "chips": [
+           "32 heads",
+           "2 KV heads"
+          ],
+          "width": 4096,
+          "ports": [],
+          "written": [
+           40,
+           46
+          ],
+          "internals": null,
+          "inserted": false
+         }
+        ]
+       }
+      }
+     ]
+    },
+    "times": 2
+   },
+   {
+    "id": "n.10",
+    "kind": "repeat",
+    "label": null,
+    "shared": false,
+    "span": null,
+    "origin": null,
+    "editable": true,
+    "body": {
+     "id": "n.10.0",
+     "kind": "seq",
+     "label": null,
+     "shared": false,
+     "span": null,
+     "origin": null,
+     "editable": true,
+     "items": [
+      {
+       "id": "n.10.0.0",
+       "kind": "residual",
+       "label": "E",
+       "shared": false,
+       "span": null,
+       "origin": null,
+       "editable": true,
+       "body": {
+        "id": "n.10.0.0.0",
+        "kind": "seq",
+        "label": null,
+        "shared": false,
+        "span": null,
+        "origin": null,
+        "editable": true,
+        "items": [
+         {
+          "id": "n.10.0.0.0.0",
+          "kind": "layer",
+          "label": "norm",
+          "shared": false,
+          "span": null,
+          "origin": null,
+          "editable": true,
+          "type": "rmsnorm",
+          "title": "RMSNorm",
+          "category": "norm",
+          "chips": [],
+          "width": 4096,
+          "ports": [],
+          "written": [
+           10,
+           16
+          ],
+          "internals": null,
+          "inserted": false
+         },
+         {
+          "id": "n.10.0.0.0.1",
+          "kind": "layer",
+          "label": "experts",
+          "shared": false,
+          "span": null,
+          "origin": null,
+          "editable": true,
+          "type": "moe",
+          "title": "Mixture of experts",
+          "category": "experts",
+          "chips": [
+           "512 experts, top 22",
+           "1 shared",
+           "2,688 hidden"
+          ],
+          "width": 4096,
+          "ports": [],
+          "written": [
+           30,
+           36
+          ],
+          "internals": {
+           "id": "n.10.0.0.0.1/i",
+           "label": null,
+           "shared": false,
+           "span": null,
+           "origin": null,
+           "editable": false,
+           "kind": "sum",
+           "terms": [
+            {
+             "id": "n.10.0.0.0.1/i.0",
+             "label": null,
+             "shared": false,
+             "span": null,
+             "origin": null,
+             "editable": false,
+             "kind": "prod",
+             "factors": [
+              {
+               "id": "n.10.0.0.0.1/i.0.0",
+               "label": null,
+               "shared": false,
+               "span": null,
+               "origin": null,
+               "editable": false,
+               "kind": "layer",
+               "type": "routed experts",
+               "title": "Routed experts",
+               "category": "ffn",
+               "chips": [
+                "512 \u00d7 GLU, 2,688"
+               ],
+               "ports": [],
+               "written": null
+              },
+              {
+               "id": "n.10.0.0.0.1/i.0.1",
+               "label": null,
+               "shared": false,
+               "span": null,
+               "origin": null,
+               "editable": false,
+               "kind": "layer",
+               "type": "router",
+               "title": "Router",
+               "category": "op",
+               "chips": [
+                "sigmoid, top 22"
+               ],
+               "ports": [],
+               "written": null
+              }
+             ]
+            },
+            {
+             "id": "n.10.0.0.0.1/i.1",
+             "label": null,
+             "shared": false,
+             "span": null,
+             "origin": null,
+             "editable": false,
+             "kind": "layer",
+             "type": "shared expert",
+             "title": "Shared expert",
+             "category": "ffn",
+             "chips": [
+              "GLU, 2,688"
+             ],
+             "ports": [],
+             "written": null
+            }
+           ]
+          },
+          "inserted": false
+         }
+        ]
+       }
+      },
+      {
+       "id": "n.10.0.1",
+       "kind": "residual",
+       "label": "M",
+       "shared": false,
+       "span": null,
+       "origin": null,
+       "editable": true,
+       "body": {
+        "id": "n.10.0.1.0",
+        "kind": "seq",
+        "label": null,
+        "shared": false,
+        "span": null,
+        "origin": null,
+        "editable": true,
+        "items": [
+         {
+          "id": "n.10.0.1.0.0",
+          "kind": "layer",
+          "label": "norm",
+          "shared": false,
+          "span": null,
+          "origin": null,
+          "editable": true,
+          "type": "rmsnorm",
+          "title": "RMSNorm",
+          "category": "norm",
+          "chips": [],
+          "width": 4096,
+          "ports": [],
+          "written": [
+           10,
+           16
+          ],
+          "internals": null,
+          "inserted": false
+         },
+         {
+          "id": "n.10.0.1.0.1",
+          "kind": "layer",
+          "label": "ssm",
+          "shared": false,
+          "span": null,
+          "origin": null,
+          "editable": true,
+          "type": "mamba2",
+          "title": "Mamba-2",
+          "category": "recurrent",
+          "chips": [
+           "state 128"
+          ],
+          "width": 4096,
+          "ports": [],
+          "written": [
+           20,
+           26
+          ],
+          "internals": null,
+          "inserted": false
+         }
+        ]
+       }
+      },
+      {
+       "id": "n.10.0.2",
+       "kind": "residual",
+       "label": "E",
+       "shared": false,
+       "span": null,
+       "origin": null,
+       "editable": true,
+       "body": {
+        "id": "n.10.0.2.0",
+        "kind": "seq",
+        "label": null,
+        "shared": false,
+        "span": null,
+        "origin": null,
+        "editable": true,
+        "items": [
+         {
+          "id": "n.10.0.2.0.0",
+          "kind": "layer",
+          "label": "norm",
+          "shared": false,
+          "span": null,
+          "origin": null,
+          "editable": true,
+          "type": "rmsnorm",
+          "title": "RMSNorm",
+          "category": "norm",
+          "chips": [],
+          "width": 4096,
+          "ports": [],
+          "written": [
+           10,
+           16
+          ],
+          "internals": null,
+          "inserted": false
+         },
+         {
+          "id": "n.10.0.2.0.1",
+          "kind": "layer",
+          "label": "experts",
+          "shared": false,
+          "span": null,
+          "origin": null,
+          "editable": true,
+          "type": "moe",
+          "title": "Mixture of experts",
+          "category": "experts",
+          "chips": [
+           "512 experts, top 22",
+           "1 shared",
+           "2,688 hidden"
+          ],
+          "width": 4096,
+          "ports": [],
+          "written": [
+           30,
+           36
+          ],
+          "internals": {
+           "id": "n.10.0.2.0.1/i",
+           "label": null,
+           "shared": false,
+           "span": null,
+           "origin": null,
+           "editable": false,
+           "kind": "sum",
+           "terms": [
+            {
+             "id": "n.10.0.2.0.1/i.0",
+             "label": null,
+             "shared": false,
+             "span": null,
+             "origin": null,
+             "editable": false,
+             "kind": "prod",
+             "factors": [
+              {
+               "id": "n.10.0.2.0.1/i.0.0",
+               "label": null,
+               "shared": false,
+               "span": null,
+               "origin": null,
+               "editable": false,
+               "kind": "layer",
+               "type": "routed experts",
+               "title": "Routed experts",
+               "category": "ffn",
+               "chips": [
+                "512 \u00d7 GLU, 2,688"
+               ],
+               "ports": [],
+               "written": null
+              },
+              {
+               "id": "n.10.0.2.0.1/i.0.1",
+               "label": null,
+               "shared": false,
+               "span": null,
+               "origin": null,
+               "editable": false,
+               "kind": "layer",
+               "type": "router",
+               "title": "Router",
+               "category": "op",
+               "chips": [
+                "sigmoid, top 22"
+               ],
+               "ports": [],
+               "written": null
+              }
+             ]
+            },
+            {
+             "id": "n.10.0.2.0.1/i.1",
+             "label": null,
+             "shared": false,
+             "span": null,
+             "origin": null,
+             "editable": false,
+             "kind": "layer",
+             "type": "shared expert",
+             "title": "Shared expert",
+             "category": "ffn",
+             "chips": [
+              "GLU, 2,688"
+             ],
+             "ports": [],
+             "written": null
+            }
+           ]
+          },
+          "inserted": false
+         }
+        ]
+       }
+      },
+      {
+       "id": "n.10.0.3",
+       "kind": "residual",
+       "label": "M",
+       "shared": false,
+       "span": null,
+       "origin": null,
+       "editable": true,
+       "body": {
+        "id": "n.10.0.3.0",
+        "kind": "seq",
+        "label": null,
+        "shared": false,
+        "span": null,
+        "origin": null,
+        "editable": true,
+        "items": [
+         {
+          "id": "n.10.0.3.0.0",
+          "kind": "layer",
+          "label": "norm",
+          "shared": false,
+          "span": null,
+          "origin": null,
+          "editable": true,
+          "type": "rmsnorm",
+          "title": "RMSNorm",
+          "category": "norm",
+          "chips": [],
+          "width": 4096,
+          "ports": [],
+          "written": [
+           10,
+           16
+          ],
+          "internals": null,
+          "inserted": false
+         },
+         {
+          "id": "n.10.0.3.0.1",
+          "kind": "layer",
+          "label": "ssm",
+          "shared": false,
+          "span": null,
+          "origin": null,
+          "editable": true,
+          "type": "mamba2",
+          "title": "Mamba-2",
+          "category": "recurrent",
+          "chips": [
+           "state 128"
+          ],
+          "width": 4096,
+          "ports": [],
+          "written": [
+           20,
+           26
+          ],
+          "internals": null,
+          "inserted": false
+         }
+        ]
+       }
+      },
+      {
+       "id": "n.10.0.4",
+       "kind": "residual",
+       "label": "E",
+       "shared": false,
+       "span": null,
+       "origin": null,
+       "editable": true,
+       "body": {
+        "id": "n.10.0.4.0",
+        "kind": "seq",
+        "label": null,
+        "shared": false,
+        "span": null,
+        "origin": null,
+        "editable": true,
+        "items": [
+         {
+          "id": "n.10.0.4.0.0",
+          "kind": "layer",
+          "label": "norm",
+          "shared": false,
+          "span": null,
+          "origin": null,
+          "editable": true,
+          "type": "rmsnorm",
+          "title": "RMSNorm",
+          "category": "norm",
+          "chips": [],
+          "width": 4096,
+          "ports": [],
+          "written": [
+           10,
+           16
+          ],
+          "internals": null,
+          "inserted": false
+         },
+         {
+          "id": "n.10.0.4.0.1",
+          "kind": "layer",
+          "label": "experts",
+          "shared": false,
+          "span": null,
+          "origin": null,
+          "editable": true,
+          "type": "moe",
+          "title": "Mixture of experts",
+          "category": "experts",
+          "chips": [
+           "512 experts, top 22",
+           "1 shared",
+           "2,688 hidden"
+          ],
+          "width": 4096,
+          "ports": [],
+          "written": [
+           30,
+           36
+          ],
+          "internals": {
+           "id": "n.10.0.4.0.1/i",
+           "label": null,
+           "shared": false,
+           "span": null,
+           "origin": null,
+           "editable": false,
+           "kind": "sum",
+           "terms": [
+            {
+             "id": "n.10.0.4.0.1/i.0",
+             "label": null,
+             "shared": false,
+             "span": null,
+             "origin": null,
+             "editable": false,
+             "kind": "prod",
+             "factors": [
+              {
+               "id": "n.10.0.4.0.1/i.0.0",
+               "label": null,
+               "shared": false,
+               "span": null,
+               "origin": null,
+               "editable": false,
+               "kind": "layer",
+               "type": "routed experts",
+               "title": "Routed experts",
+               "category": "ffn",
+               "chips": [
+                "512 \u00d7 GLU, 2,688"
+               ],
+               "ports": [],
+               "written": null
+              },
+              {
+               "id": "n.10.0.4.0.1/i.0.1",
+               "label": null,
+               "shared": false,
+               "span": null,
+               "origin": null,
+               "editable": false,
+               "kind": "layer",
+               "type": "router",
+               "title": "Router",
+               "category": "op",
+               "chips": [
+                "sigmoid, top 22"
+               ],
+               "ports": [],
+               "written": null
+              }
+             ]
+            },
+            {
+             "id": "n.10.0.4.0.1/i.1",
+             "label": null,
+             "shared": false,
+             "span": null,
+             "origin": null,
+             "editable": false,
+             "kind": "layer",
+             "type": "shared expert",
+             "title": "Shared expert",
+             "category": "ffn",
+             "chips": [
+              "GLU, 2,688"
+             ],
+             "ports": [],
+             "written": null
+            }
+           ]
+          },
+          "inserted": false
+         }
+        ]
+       }
+      },
+      {
+       "id": "n.10.0.5",
+       "kind": "residual",
+       "label": "M",
+       "shared": false,
+       "span": null,
+       "origin": null,
+       "editable": true,
+       "body": {
+        "id": "n.10.0.5.0",
+        "kind": "seq",
+        "label": null,
+        "shared": false,
+        "span": null,
+        "origin": null,
+        "editable": true,
+        "items": [
+         {
+          "id": "n.10.0.5.0.0",
+          "kind": "layer",
+          "label": "norm",
+          "shared": false,
+          "span": null,
+          "origin": null,
+          "editable": true,
+          "type": "rmsnorm",
+          "title": "RMSNorm",
+          "category": "norm",
+          "chips": [],
+          "width": 4096,
+          "ports": [],
+          "written": [
+           10,
+           16
+          ],
+          "internals": null,
+          "inserted": false
+         },
+         {
+          "id": "n.10.0.5.0.1",
+          "kind": "layer",
+          "label": "ssm",
+          "shared": false,
+          "span": null,
+          "origin": null,
+          "editable": true,
+          "type": "mamba2",
+          "title": "Mamba-2",
+          "category": "recurrent",
+          "chips": [
+           "state 128"
+          ],
+          "width": 4096,
+          "ports": [],
+          "written": [
+           20,
+           26
+          ],
+          "internals": null,
+          "inserted": false
+         }
+        ]
+       }
+      },
+      {
+       "id": "n.10.0.6",
+       "kind": "residual",
+       "label": "E",
+       "shared": false,
+       "span": null,
+       "origin": null,
+       "editable": true,
+       "body": {
+        "id": "n.10.0.6.0",
+        "kind": "seq",
+        "label": null,
+        "shared": false,
+        "span": null,
+        "origin": null,
+        "editable": true,
+        "items": [
+         {
+          "id": "n.10.0.6.0.0",
+          "kind": "layer",
+          "label": "norm",
+          "shared": false,
+          "span": null,
+          "origin": null,
+          "editable": true,
+          "type": "rmsnorm",
+          "title": "RMSNorm",
+          "category": "norm",
+          "chips": [],
+          "width": 4096,
+          "ports": [],
+          "written": [
+           10,
+           16
+          ],
+          "internals": null,
+          "inserted": false
+         },
+         {
+          "id": "n.10.0.6.0.1",
+          "kind": "layer",
+          "label": "experts",
+          "shared": false,
+          "span": null,
+          "origin": null,
+          "editable": true,
+          "type": "moe",
+          "title": "Mixture of experts",
+          "category": "experts",
+          "chips": [
+           "512 experts, top 22",
+           "1 shared",
+           "2,688 hidden"
+          ],
+          "width": 4096,
+          "ports": [],
+          "written": [
+           30,
+           36
+          ],
+          "internals": {
+           "id": "n.10.0.6.0.1/i",
+           "label": null,
+           "shared": false,
+           "span": null,
+           "origin": null,
+           "editable": false,
+           "kind": "sum",
+           "terms": [
+            {
+             "id": "n.10.0.6.0.1/i.0",
+             "label": null,
+             "shared": false,
+             "span": null,
+             "origin": null,
+             "editable": false,
+             "kind": "prod",
+             "factors": [
+              {
+               "id": "n.10.0.6.0.1/i.0.0",
+               "label": null,
+               "shared": false,
+               "span": null,
+               "origin": null,
+               "editable": false,
+               "kind": "layer",
+               "type": "routed experts",
+               "title": "Routed experts",
+               "category": "ffn",
+               "chips": [
+                "512 \u00d7 GLU, 2,688"
+               ],
+               "ports": [],
+               "written": null
+              },
+              {
+               "id": "n.10.0.6.0.1/i.0.1",
+               "label": null,
+               "shared": false,
+               "span": null,
+               "origin": null,
+               "editable": false,
+               "kind": "layer",
+               "type": "router",
+               "title": "Router",
+               "category": "op",
+               "chips": [
+                "sigmoid, top 22"
+               ],
+               "ports": [],
+               "written": null
+              }
+             ]
+            },
+            {
+             "id": "n.10.0.6.0.1/i.1",
+             "label": null,
+             "shared": false,
+             "span": null,
+             "origin": null,
+             "editable": false,
+             "kind": "layer",
+             "type": "shared expert",
+             "title": "Shared expert",
+             "category": "ffn",
+             "chips": [
+              "GLU, 2,688"
+             ],
+             "ports": [],
+             "written": null
+            }
+           ]
+          },
+          "inserted": false
+         }
+        ]
+       }
+      },
+      {
+       "id": "n.10.0.7",
+       "kind": "residual",
+       "label": "M",
+       "shared": false,
+       "span": null,
+       "origin": null,
+       "editable": true,
+       "body": {
+        "id": "n.10.0.7.0",
+        "kind": "seq",
+        "label": null,
+        "shared": false,
+        "span": null,
+        "origin": null,
+        "editable": true,
+        "items": [
+         {
+          "id": "n.10.0.7.0.0",
+          "kind": "layer",
+          "label": "norm",
+          "shared": false,
+          "span": null,
+          "origin": null,
+          "editable": true,
+          "type": "rmsnorm",
+          "title": "RMSNorm",
+          "category": "norm",
+          "chips": [],
+          "width": 4096,
+          "ports": [],
+          "written": [
+           10,
+           16
+          ],
+          "internals": null,
+          "inserted": false
+         },
+         {
+          "id": "n.10.0.7.0.1",
+          "kind": "layer",
+          "label": "ssm",
+          "shared": false,
+          "span": null,
+          "origin": null,
+          "editable": true,
+          "type": "mamba2",
+          "title": "Mamba-2",
+          "category": "recurrent",
+          "chips": [
+           "state 128"
+          ],
+          "width": 4096,
+          "ports": [],
+          "written": [
+           20,
+           26
+          ],
+          "internals": null,
+          "inserted": false
+         }
+        ]
+       }
+      },
+      {
+       "id": "n.10.0.8",
+       "kind": "residual",
+       "label": "E",
+       "shared": false,
+       "span": null,
+       "origin": null,
+       "editable": true,
+       "body": {
+        "id": "n.10.0.8.0",
+        "kind": "seq",
+        "label": null,
+        "shared": false,
+        "span": null,
+        "origin": null,
+        "editable": true,
+        "items": [
+         {
+          "id": "n.10.0.8.0.0",
+          "kind": "layer",
+          "label": "norm",
+          "shared": false,
+          "span": null,
+          "origin": null,
+          "editable": true,
+          "type": "rmsnorm",
+          "title": "RMSNorm",
+          "category": "norm",
+          "chips": [],
+          "width": 4096,
+          "ports": [],
+          "written": [
+           10,
+           16
+          ],
+          "internals": null,
+          "inserted": false
+         },
+         {
+          "id": "n.10.0.8.0.1",
+          "kind": "layer",
+          "label": "experts",
+          "shared": false,
+          "span": null,
+          "origin": null,
+          "editable": true,
+          "type": "moe",
+          "title": "Mixture of experts",
+          "category": "experts",
+          "chips": [
+           "512 experts, top 22",
+           "1 shared",
+           "2,688 hidden"
+          ],
+          "width": 4096,
+          "ports": [],
+          "written": [
+           30,
+           36
+          ],
+          "internals": {
+           "id": "n.10.0.8.0.1/i",
+           "label": null,
+           "shared": false,
+           "span": null,
+           "origin": null,
+           "editable": false,
+           "kind": "sum",
+           "terms": [
+            {
+             "id": "n.10.0.8.0.1/i.0",
+             "label": null,
+             "shared": false,
+             "span": null,
+             "origin": null,
+             "editable": false,
+             "kind": "prod",
+             "factors": [
+              {
+               "id": "n.10.0.8.0.1/i.0.0",
+               "label": null,
+               "shared": false,
+               "span": null,
+               "origin": null,
+               "editable": false,
+               "kind": "layer",
+               "type": "routed experts",
+               "title": "Routed experts",
+               "category": "ffn",
+               "chips": [
+                "512 \u00d7 GLU, 2,688"
+               ],
+               "ports": [],
+               "written": null
+              },
+              {
+               "id": "n.10.0.8.0.1/i.0.1",
+               "label": null,
+               "shared": false,
+               "span": null,
+               "origin": null,
+               "editable": false,
+               "kind": "layer",
+               "type": "router",
+               "title": "Router",
+               "category": "op",
+               "chips": [
+                "sigmoid, top 22"
+               ],
+               "ports": [],
+               "written": null
+              }
+             ]
+            },
+            {
+             "id": "n.10.0.8.0.1/i.1",
+             "label": null,
+             "shared": false,
+             "span": null,
+             "origin": null,
+             "editable": false,
+             "kind": "layer",
+             "type": "shared expert",
+             "title": "Shared expert",
+             "category": "ffn",
+             "chips": [
+              "GLU, 2,688"
+             ],
+             "ports": [],
+             "written": null
+            }
+           ]
+          },
+          "inserted": false
+         }
+        ]
+       }
+      },
+      {
+       "id": "n.10.0.9",
+       "kind": "residual",
+       "label": "M",
+       "shared": false,
+       "span": null,
+       "origin": null,
+       "editable": true,
+       "body": {
+        "id": "n.10.0.9.0",
+        "kind": "seq",
+        "label": null,
+        "shared": false,
+        "span": null,
+        "origin": null,
+        "editable": true,
+        "items": [
+         {
+          "id": "n.10.0.9.0.0",
+          "kind": "layer",
+          "label": "norm",
+          "shared": false,
+          "span": null,
+          "origin": null,
+          "editable": true,
+          "type": "rmsnorm",
+          "title": "RMSNorm",
+          "category": "norm",
+          "chips": [],
+          "width": 4096,
+          "ports": [],
+          "written": [
+           10,
+           16
+          ],
+          "internals": null,
+          "inserted": false
+         },
+         {
+          "id": "n.10.0.9.0.1",
+          "kind": "layer",
+          "label": "ssm",
+          "shared": false,
+          "span": null,
+          "origin": null,
+          "editable": true,
+          "type": "mamba2",
+          "title": "Mamba-2",
+          "category": "recurrent",
+          "chips": [
+           "state 128"
+          ],
+          "width": 4096,
+          "ports": [],
+          "written": [
+           20,
+           26
+          ],
+          "internals": null,
+          "inserted": false
+         }
+        ]
+       }
+      },
+      {
+       "id": "n.10.0.10",
+       "kind": "residual",
+       "label": "A",
+       "shared": false,
+       "span": null,
+       "origin": null,
+       "editable": true,
+       "body": {
+        "id": "n.10.0.10.0",
+        "kind": "seq",
+        "label": null,
+        "shared": false,
+        "span": null,
+        "origin": null,
+        "editable": true,
+        "items": [
+         {
+          "id": "n.10.0.10.0.0",
+          "kind": "layer",
+          "label": "norm",
+          "shared": false,
+          "span": null,
+          "origin": null,
+          "editable": true,
+          "type": "rmsnorm",
+          "title": "RMSNorm",
+          "category": "norm",
+          "chips": [],
+          "width": 4096,
+          "ports": [],
+          "written": [
+           10,
+           16
+          ],
+          "internals": null,
+          "inserted": false
+         },
+         {
+          "id": "n.10.0.10.0.1",
+          "kind": "layer",
+          "label": "attn",
+          "shared": false,
+          "span": null,
+          "origin": null,
+          "editable": true,
+          "type": "gqa",
+          "title": "Grouped-query attention",
+          "category": "attention",
+          "chips": [
+           "32 heads",
+           "2 KV heads"
+          ],
+          "width": 4096,
+          "ports": [],
+          "written": [
+           40,
+           46
+          ],
+          "internals": null,
+          "inserted": false
+         }
+        ]
+       }
+      }
+     ]
+    },
+    "times": 4
+   },
+   {
+    "id": "n.11",
+    "kind": "residual",
+    "label": "E",
+    "shared": false,
+    "span": null,
+    "origin": null,
+    "editable": true,
+    "body": {
+     "id": "n.11.0",
+     "kind": "seq",
+     "label": null,
+     "shared": false,
+     "span": null,
+     "origin": null,
+     "editable": true,
+     "items": [
+      {
+       "id": "n.11.0.0",
+       "kind": "layer",
+       "label": "norm",
+       "shared": false,
+       "span": null,
+       "origin": null,
+       "editable": true,
+       "type": "rmsnorm",
+       "title": "RMSNorm",
+       "category": "norm",
+       "chips": [],
+       "width": 4096,
+       "ports": [],
+       "written": [
+        10,
+        16
+       ],
+       "internals": null,
+       "inserted": false
+      },
+      {
+       "id": "n.11.0.1",
+       "kind": "layer",
+       "label": "experts",
+       "shared": false,
+       "span": null,
+       "origin": null,
+       "editable": true,
+       "type": "moe",
+       "title": "Mixture of experts",
+       "category": "experts",
+       "chips": [
+        "512 experts, top 22",
+        "1 shared",
+        "2,688 hidden"
+       ],
+       "width": 4096,
+       "ports": [],
+       "written": [
+        30,
+        36
+       ],
+       "internals": {
+        "id": "n.11.0.1/i",
+        "label": null,
+        "shared": false,
+        "span": null,
+        "origin": null,
+        "editable": false,
+        "kind": "sum",
+        "terms": [
+         {
+          "id": "n.11.0.1/i.0",
+          "label": null,
+          "shared": false,
+          "span": null,
+          "origin": null,
+          "editable": false,
+          "kind": "prod",
+          "factors": [
+           {
+            "id": "n.11.0.1/i.0.0",
+            "label": null,
+            "shared": false,
+            "span": null,
+            "origin": null,
+            "editable": false,
+            "kind": "layer",
+            "type": "routed experts",
+            "title": "Routed experts",
+            "category": "ffn",
+            "chips": [
+             "512 \u00d7 GLU, 2,688"
+            ],
+            "ports": [],
+            "written": null
+           },
+           {
+            "id": "n.11.0.1/i.0.1",
+            "label": null,
+            "shared": false,
+            "span": null,
+            "origin": null,
+            "editable": false,
+            "kind": "layer",
+            "type": "router",
+            "title": "Router",
+            "category": "op",
+            "chips": [
+             "sigmoid, top 22"
+            ],
+            "ports": [],
+            "written": null
+           }
+          ]
+         },
+         {
+          "id": "n.11.0.1/i.1",
+          "label": null,
+          "shared": false,
+          "span": null,
+          "origin": null,
+          "editable": false,
+          "kind": "layer",
+          "type": "shared expert",
+          "title": "Shared expert",
+          "category": "ffn",
+          "chips": [
+           "GLU, 2,688"
+          ],
+          "ports": [],
+          "written": null
+         }
+        ]
+       },
+       "inserted": false
+      }
+     ]
+    }
+   },
+   {
+    "id": "n.12",
+    "kind": "residual",
+    "label": "M",
+    "shared": false,
+    "span": null,
+    "origin": null,
+    "editable": true,
+    "body": {
+     "id": "n.12.0",
+     "kind": "seq",
+     "label": null,
+     "shared": false,
+     "span": null,
+     "origin": null,
+     "editable": true,
+     "items": [
+      {
+       "id": "n.12.0.0",
+       "kind": "layer",
+       "label": "norm",
+       "shared": false,
+       "span": null,
+       "origin": null,
+       "editable": true,
+       "type": "rmsnorm",
+       "title": "RMSNorm",
+       "category": "norm",
+       "chips": [],
+       "width": 4096,
+       "ports": [],
+       "written": [
+        10,
+        16
+       ],
+       "internals": null,
+       "inserted": false
+      },
+      {
+       "id": "n.12.0.1",
+       "kind": "layer",
+       "label": "ssm",
+       "shared": false,
+       "span": null,
+       "origin": null,
+       "editable": true,
+       "type": "mamba2",
+       "title": "Mamba-2",
+       "category": "recurrent",
+       "chips": [
+        "state 128"
+       ],
+       "width": 4096,
+       "ports": [],
+       "written": [
+        20,
+        26
+       ],
+       "internals": null,
+       "inserted": false
+      }
+     ]
+    }
+   },
+   {
+    "id": "n.13",
+    "kind": "residual",
+    "label": "E",
+    "shared": false,
+    "span": null,
+    "origin": null,
+    "editable": true,
+    "body": {
+     "id": "n.13.0",
+     "kind": "seq",
+     "label": null,
+     "shared": false,
+     "span": null,
+     "origin": null,
+     "editable": true,
+     "items": [
+      {
+       "id": "n.13.0.0",
+       "kind": "layer",
+       "label": "norm",
+       "shared": false,
+       "span": null,
+       "origin": null,
+       "editable": true,
+       "type": "rmsnorm",
+       "title": "RMSNorm",
+       "category": "norm",
+       "chips": [],
+       "width": 4096,
+       "ports": [],
+       "written": [
+        10,
+        16
+       ],
+       "internals": null,
+       "inserted": false
+      },
+      {
+       "id": "n.13.0.1",
+       "kind": "layer",
+       "label": "experts",
+       "shared": false,
+       "span": null,
+       "origin": null,
+       "editable": true,
+       "type": "moe",
+       "title": "Mixture of experts",
+       "category": "experts",
+       "chips": [
+        "512 experts, top 22",
+        "1 shared",
+        "2,688 hidden"
+       ],
+       "width": 4096,
+       "ports": [],
+       "written": [
+        30,
+        36
+       ],
+       "internals": {
+        "id": "n.13.0.1/i",
+        "label": null,
+        "shared": false,
+        "span": null,
+        "origin": null,
+        "editable": false,
+        "kind": "sum",
+        "terms": [
+         {
+          "id": "n.13.0.1/i.0",
+          "label": null,
+          "shared": false,
+          "span": null,
+          "origin": null,
+          "editable": false,
+          "kind": "prod",
+          "factors": [
+           {
+            "id": "n.13.0.1/i.0.0",
+            "label": null,
+            "shared": false,
+            "span": null,
+            "origin": null,
+            "editable": false,
+            "kind": "layer",
+            "type": "routed experts",
+            "title": "Routed experts",
+            "category": "ffn",
+            "chips": [
+             "512 \u00d7 GLU, 2,688"
+            ],
+            "ports": [],
+            "written": null
+           },
+           {
+            "id": "n.13.0.1/i.0.1",
+            "label": null,
+            "shared": false,
+            "span": null,
+            "origin": null,
+            "editable": false,
+            "kind": "layer",
+            "type": "router",
+            "title": "Router",
+            "category": "op",
+            "chips": [
+             "sigmoid, top 22"
+            ],
+            "ports": [],
+            "written": null
+           }
+          ]
+         },
+         {
+          "id": "n.13.0.1/i.1",
+          "label": null,
+          "shared": false,
+          "span": null,
+          "origin": null,
+          "editable": false,
+          "kind": "layer",
+          "type": "shared expert",
+          "title": "Shared expert",
+          "category": "ffn",
+          "chips": [
+           "GLU, 2,688"
+          ],
+          "ports": [],
+          "written": null
+         }
+        ]
+       },
+       "inserted": false
+      }
+     ]
+    }
+   },
+   {
+    "id": "n.14",
+    "kind": "residual",
+    "label": "M",
+    "shared": false,
+    "span": null,
+    "origin": null,
+    "editable": true,
+    "body": {
+     "id": "n.14.0",
+     "kind": "seq",
+     "label": null,
+     "shared": false,
+     "span": null,
+     "origin": null,
+     "editable": true,
+     "items": [
+      {
+       "id": "n.14.0.0",
+       "kind": "layer",
+       "label": "norm",
+       "shared": false,
+       "span": null,
+       "origin": null,
+       "editable": true,
+       "type": "rmsnorm",
+       "title": "RMSNorm",
+       "category": "norm",
+       "chips": [],
+       "width": 4096,
+       "ports": [],
+       "written": [
+        10,
+        16
+       ],
+       "internals": null,
+       "inserted": false
+      },
+      {
+       "id": "n.14.0.1",
+       "kind": "layer",
+       "label": "ssm",
+       "shared": false,
+       "span": null,
+       "origin": null,
+       "editable": true,
+       "type": "mamba2",
+       "title": "Mamba-2",
+       "category": "recurrent",
+       "chips": [
+        "state 128"
+       ],
+       "width": 4096,
+       "ports": [],
+       "written": [
+        20,
+        26
+       ],
+       "internals": null,
+       "inserted": false
+      }
+     ]
+    }
+   },
+   {
+    "id": "n.15",
+    "kind": "residual",
+    "label": "E",
+    "shared": false,
+    "span": null,
+    "origin": null,
+    "editable": true,
+    "body": {
+     "id": "n.15.0",
+     "kind": "seq",
+     "label": null,
+     "shared": false,
+     "span": null,
+     "origin": null,
+     "editable": true,
+     "items": [
+      {
+       "id": "n.15.0.0",
+       "kind": "layer",
+       "label": "norm",
+       "shared": false,
+       "span": null,
+       "origin": null,
+       "editable": true,
+       "type": "rmsnorm",
+       "title": "RMSNorm",
+       "category": "norm",
+       "chips": [],
+       "width": 4096,
+       "ports": [],
+       "written": [
+        10,
+        16
+       ],
+       "internals": null,
+       "inserted": false
+      },
+      {
+       "id": "n.15.0.1",
+       "kind": "layer",
+       "label": "experts",
+       "shared": false,
+       "span": null,
+       "origin": null,
+       "editable": true,
+       "type": "moe",
+       "title": "Mixture of experts",
+       "category": "experts",
+       "chips": [
+        "512 experts, top 22",
+        "1 shared",
+        "2,688 hidden"
+       ],
+       "width": 4096,
+       "ports": [],
+       "written": [
+        30,
+        36
+       ],
+       "internals": {
+        "id": "n.15.0.1/i",
+        "label": null,
+        "shared": false,
+        "span": null,
+        "origin": null,
+        "editable": false,
+        "kind": "sum",
+        "terms": [
+         {
+          "id": "n.15.0.1/i.0",
+          "label": null,
+          "shared": false,
+          "span": null,
+          "origin": null,
+          "editable": false,
+          "kind": "prod",
+          "factors": [
+           {
+            "id": "n.15.0.1/i.0.0",
+            "label": null,
+            "shared": false,
+            "span": null,
+            "origin": null,
+            "editable": false,
+            "kind": "layer",
+            "type": "routed experts",
+            "title": "Routed experts",
+            "category": "ffn",
+            "chips": [
+             "512 \u00d7 GLU, 2,688"
+            ],
+            "ports": [],
+            "written": null
+           },
+           {
+            "id": "n.15.0.1/i.0.1",
+            "label": null,
+            "shared": false,
+            "span": null,
+            "origin": null,
+            "editable": false,
+            "kind": "layer",
+            "type": "router",
+            "title": "Router",
+            "category": "op",
+            "chips": [
+             "sigmoid, top 22"
+            ],
+            "ports": [],
+            "written": null
+           }
+          ]
+         },
+         {
+          "id": "n.15.0.1/i.1",
+          "label": null,
+          "shared": false,
+          "span": null,
+          "origin": null,
+          "editable": false,
+          "kind": "layer",
+          "type": "shared expert",
+          "title": "Shared expert",
+          "category": "ffn",
+          "chips": [
+           "GLU, 2,688"
+          ],
+          "ports": [],
+          "written": null
+         }
+        ]
+       },
+       "inserted": false
+      }
+     ]
+    }
+   },
+   {
+    "id": "n.16",
+    "kind": "residual",
+    "label": "M",
+    "shared": false,
+    "span": null,
+    "origin": null,
+    "editable": true,
+    "body": {
+     "id": "n.16.0",
+     "kind": "seq",
+     "label": null,
+     "shared": false,
+     "span": null,
+     "origin": null,
+     "editable": true,
+     "items": [
+      {
+       "id": "n.16.0.0",
+       "kind": "layer",
+       "label": "norm",
+       "shared": false,
+       "span": null,
+       "origin": null,
+       "editable": true,
+       "type": "rmsnorm",
+       "title": "RMSNorm",
+       "category": "norm",
+       "chips": [],
+       "width": 4096,
+       "ports": [],
+       "written": [
+        10,
+        16
+       ],
+       "internals": null,
+       "inserted": false
+      },
+      {
+       "id": "n.16.0.1",
+       "kind": "layer",
+       "label": "ssm",
+       "shared": false,
+       "span": null,
+       "origin": null,
+       "editable": true,
+       "type": "mamba2",
+       "title": "Mamba-2",
+       "category": "recurrent",
+       "chips": [
+        "state 128"
+       ],
+       "width": 4096,
+       "ports": [],
+       "written": [
+        20,
+        26
+       ],
+       "internals": null,
+       "inserted": false
+      }
+     ]
+    }
+   },
+   {
+    "id": "n.17",
+    "kind": "residual",
+    "label": "E",
+    "shared": false,
+    "span": null,
+    "origin": null,
+    "editable": true,
+    "body": {
+     "id": "n.17.0",
+     "kind": "seq",
+     "label": null,
+     "shared": false,
+     "span": null,
+     "origin": null,
+     "editable": true,
+     "items": [
+      {
+       "id": "n.17.0.0",
+       "kind": "layer",
+       "label": "norm",
+       "shared": false,
+       "span": null,
+       "origin": null,
+       "editable": true,
+       "type": "rmsnorm",
+       "title": "RMSNorm",
+       "category": "norm",
+       "chips": [],
+       "width": 4096,
+       "ports": [],
+       "written": [
+        10,
+        16
+       ],
+       "internals": null,
+       "inserted": false
+      },
+      {
+       "id": "n.17.0.1",
+       "kind": "layer",
+       "label": "experts",
+       "shared": false,
+       "span": null,
+       "origin": null,
+       "editable": true,
+       "type": "moe",
+       "title": "Mixture of experts",
+       "category": "experts",
+       "chips": [
+        "512 experts, top 22",
+        "1 shared",
+        "2,688 hidden"
+       ],
+       "width": 4096,
+       "ports": [],
+       "written": [
+        30,
+        36
+       ],
+       "internals": {
+        "id": "n.17.0.1/i",
+        "label": null,
+        "shared": false,
+        "span": null,
+        "origin": null,
+        "editable": false,
+        "kind": "sum",
+        "terms": [
+         {
+          "id": "n.17.0.1/i.0",
+          "label": null,
+          "shared": false,
+          "span": null,
+          "origin": null,
+          "editable": false,
+          "kind": "prod",
+          "factors": [
+           {
+            "id": "n.17.0.1/i.0.0",
+            "label": null,
+            "shared": false,
+            "span": null,
+            "origin": null,
+            "editable": false,
+            "kind": "layer",
+            "type": "routed experts",
+            "title": "Routed experts",
+            "category": "ffn",
+            "chips": [
+             "512 \u00d7 GLU, 2,688"
+            ],
+            "ports": [],
+            "written": null
+           },
+           {
+            "id": "n.17.0.1/i.0.1",
+            "label": null,
+            "shared": false,
+            "span": null,
+            "origin": null,
+            "editable": false,
+            "kind": "layer",
+            "type": "router",
+            "title": "Router",
+            "category": "op",
+            "chips": [
+             "sigmoid, top 22"
+            ],
+            "ports": [],
+            "written": null
+           }
+          ]
+         },
+         {
+          "id": "n.17.0.1/i.1",
+          "label": null,
+          "shared": false,
+          "span": null,
+          "origin": null,
+          "editable": false,
+          "kind": "layer",
+          "type": "shared expert",
+          "title": "Shared expert",
+          "category": "ffn",
+          "chips": [
+           "GLU, 2,688"
+          ],
+          "ports": [],
+          "written": null
+         }
+        ]
+       },
+       "inserted": false
+      }
+     ]
+    }
+   },
+   {
+    "id": "n.18",
+    "kind": "residual",
+    "label": "M",
+    "shared": false,
+    "span": null,
+    "origin": null,
+    "editable": true,
+    "body": {
+     "id": "n.18.0",
+     "kind": "seq",
+     "label": null,
+     "shared": false,
+     "span": null,
+     "origin": null,
+     "editable": true,
+     "items": [
+      {
+       "id": "n.18.0.0",
+       "kind": "layer",
+       "label": "norm",
+       "shared": false,
+       "span": null,
+       "origin": null,
+       "editable": true,
+       "type": "rmsnorm",
+       "title": "RMSNorm",
+       "category": "norm",
+       "chips": [],
+       "width": 4096,
+       "ports": [],
+       "written": [
+        10,
+        16
+       ],
+       "internals": null,
+       "inserted": false
+      },
+      {
+       "id": "n.18.0.1",
+       "kind": "layer",
+       "label": "ssm",
+       "shared": false,
+       "span": null,
+       "origin": null,
+       "editable": true,
+       "type": "mamba2",
+       "title": "Mamba-2",
+       "category": "recurrent",
+       "chips": [
+        "state 128"
+       ],
+       "width": 4096,
+       "ports": [],
+       "written": [
+        20,
+        26
+       ],
+       "internals": null,
+       "inserted": false
+      }
+     ]
+    }
+   },
+   {
+    "id": "n.19",
+    "kind": "residual",
+    "label": "A",
+    "shared": false,
+    "span": null,
+    "origin": null,
+    "editable": true,
+    "body": {
+     "id": "n.19.0",
+     "kind": "seq",
+     "label": null,
+     "shared": false,
+     "span": null,
+     "origin": null,
+     "editable": true,
+     "items": [
+      {
+       "id": "n.19.0.0",
+       "kind": "layer",
+       "label": "norm",
+       "shared": false,
+       "span": null,
+       "origin": null,
+       "editable": true,
+       "type": "rmsnorm",
+       "title": "RMSNorm",
+       "category": "norm",
+       "chips": [],
+       "width": 4096,
+       "ports": [],
+       "written": [
+        10,
+        16
+       ],
+       "internals": null,
+       "inserted": false
+      },
+      {
+       "id": "n.19.0.1",
+       "kind": "layer",
+       "label": "attn",
+       "shared": false,
+       "span": null,
+       "origin": null,
+       "editable": true,
+       "type": "gqa",
+       "title": "Grouped-query attention",
+       "category": "attention",
+       "chips": [
+        "32 heads",
+        "2 KV heads"
+       ],
+       "width": 4096,
+       "ports": [],
+       "written": [
+        40,
+        46
+       ],
+       "internals": null,
+       "inserted": false
+      }
+     ]
+    }
+   },
+   {
+    "id": "n.20",
+    "kind": "residual",
+    "label": "E",
+    "shared": false,
+    "span": null,
+    "origin": null,
+    "editable": true,
+    "body": {
+     "id": "n.20.0",
+     "kind": "seq",
+     "label": null,
+     "shared": false,
+     "span": null,
+     "origin": null,
+     "editable": true,
+     "items": [
+      {
+       "id": "n.20.0.0",
+       "kind": "layer",
+       "label": "norm",
+       "shared": false,
+       "span": null,
+       "origin": null,
+       "editable": true,
+       "type": "rmsnorm",
+       "title": "RMSNorm",
+       "category": "norm",
+       "chips": [],
+       "width": 4096,
+       "ports": [],
+       "written": [
+        10,
+        16
+       ],
+       "internals": null,
+       "inserted": false
+      },
+      {
+       "id": "n.20.0.1",
+       "kind": "layer",
+       "label": "experts",
+       "shared": false,
+       "span": null,
+       "origin": null,
+       "editable": true,
+       "type": "moe",
+       "title": "Mixture of experts",
+       "category": "experts",
+       "chips": [
+        "512 experts, top 22",
+        "1 shared",
+        "2,688 hidden"
+       ],
+       "width": 4096,
+       "ports": [],
+       "written": [
+        30,
+        36
+       ],
+       "internals": {
+        "id": "n.20.0.1/i",
+        "label": null,
+        "shared": false,
+        "span": null,
+        "origin": null,
+        "editable": false,
+        "kind": "sum",
+        "terms": [
+         {
+          "id": "n.20.0.1/i.0",
+          "label": null,
+          "shared": false,
+          "span": null,
+          "origin": null,
+          "editable": false,
+          "kind": "prod",
+          "factors": [
+           {
+            "id": "n.20.0.1/i.0.0",
+            "label": null,
+            "shared": false,
+            "span": null,
+            "origin": null,
+            "editable": false,
+            "kind": "layer",
+            "type": "routed experts",
+            "title": "Routed experts",
+            "category": "ffn",
+            "chips": [
+             "512 \u00d7 GLU, 2,688"
+            ],
+            "ports": [],
+            "written": null
+           },
+           {
+            "id": "n.20.0.1/i.0.1",
+            "label": null,
+            "shared": false,
+            "span": null,
+            "origin": null,
+            "editable": false,
+            "kind": "layer",
+            "type": "router",
+            "title": "Router",
+            "category": "op",
+            "chips": [
+             "sigmoid, top 22"
+            ],
+            "ports": [],
+            "written": null
+           }
+          ]
+         },
+         {
+          "id": "n.20.0.1/i.1",
+          "label": null,
+          "shared": false,
+          "span": null,
+          "origin": null,
+          "editable": false,
+          "kind": "layer",
+          "type": "shared expert",
+          "title": "Shared expert",
+          "category": "ffn",
+          "chips": [
+           "GLU, 2,688"
+          ],
+          "ports": [],
+          "written": null
+         }
+        ]
+       },
+       "inserted": false
+      }
+     ]
+    }
+   },
+   {
+    "id": "n.21",
+    "kind": "residual",
+    "label": "M",
+    "shared": false,
+    "span": null,
+    "origin": null,
+    "editable": true,
+    "body": {
+     "id": "n.21.0",
+     "kind": "seq",
+     "label": null,
+     "shared": false,
+     "span": null,
+     "origin": null,
+     "editable": true,
+     "items": [
+      {
+       "id": "n.21.0.0",
+       "kind": "layer",
+       "label": "norm",
+       "shared": false,
+       "span": null,
+       "origin": null,
+       "editable": true,
+       "type": "rmsnorm",
+       "title": "RMSNorm",
+       "category": "norm",
+       "chips": [],
+       "width": 4096,
+       "ports": [],
+       "written": [
+        10,
+        16
+       ],
+       "internals": null,
+       "inserted": false
+      },
+      {
+       "id": "n.21.0.1",
+       "kind": "layer",
+       "label": "ssm",
+       "shared": false,
+       "span": null,
+       "origin": null,
+       "editable": true,
+       "type": "mamba2",
+       "title": "Mamba-2",
+       "category": "recurrent",
+       "chips": [
+        "state 128"
+       ],
+       "width": 4096,
+       "ports": [],
+       "written": [
+        20,
+        26
+       ],
+       "internals": null,
+       "inserted": false
+      }
+     ]
+    }
+   },
+   {
+    "id": "n.22",
+    "kind": "residual",
+    "label": "E",
+    "shared": false,
+    "span": null,
+    "origin": null,
+    "editable": true,
+    "body": {
+     "id": "n.22.0",
+     "kind": "seq",
+     "label": null,
+     "shared": false,
+     "span": null,
+     "origin": null,
+     "editable": true,
+     "items": [
+      {
+       "id": "n.22.0.0",
+       "kind": "layer",
+       "label": "norm",
+       "shared": false,
+       "span": null,
+       "origin": null,
+       "editable": true,
+       "type": "rmsnorm",
+       "title": "RMSNorm",
+       "category": "norm",
+       "chips": [],
+       "width": 4096,
+       "ports": [],
+       "written": [
+        10,
+        16
+       ],
+       "internals": null,
+       "inserted": false
+      },
+      {
+       "id": "n.22.0.1",
+       "kind": "layer",
+       "label": "experts",
+       "shared": false,
+       "span": null,
+       "origin": null,
+       "editable": true,
+       "type": "moe",
+       "title": "Mixture of experts",
+       "category": "experts",
+       "chips": [
+        "512 experts, top 22",
+        "1 shared",
+        "2,688 hidden"
+       ],
+       "width": 4096,
+       "ports": [],
+       "written": [
+        30,
+        36
+       ],
+       "internals": {
+        "id": "n.22.0.1/i",
+        "label": null,
+        "shared": false,
+        "span": null,
+        "origin": null,
+        "editable": false,
+        "kind": "sum",
+        "terms": [
+         {
+          "id": "n.22.0.1/i.0",
+          "label": null,
+          "shared": false,
+          "span": null,
+          "origin": null,
+          "editable": false,
+          "kind": "prod",
+          "factors": [
+           {
+            "id": "n.22.0.1/i.0.0",
+            "label": null,
+            "shared": false,
+            "span": null,
+            "origin": null,
+            "editable": false,
+            "kind": "layer",
+            "type": "routed experts",
+            "title": "Routed experts",
+            "category": "ffn",
+            "chips": [
+             "512 \u00d7 GLU, 2,688"
+            ],
+            "ports": [],
+            "written": null
+           },
+           {
+            "id": "n.22.0.1/i.0.1",
+            "label": null,
+            "shared": false,
+            "span": null,
+            "origin": null,
+            "editable": false,
+            "kind": "layer",
+            "type": "router",
+            "title": "Router",
+            "category": "op",
+            "chips": [
+             "sigmoid, top 22"
+            ],
+            "ports": [],
+            "written": null
+           }
+          ]
+         },
+         {
+          "id": "n.22.0.1/i.1",
+          "label": null,
+          "shared": false,
+          "span": null,
+          "origin": null,
+          "editable": false,
+          "kind": "layer",
+          "type": "shared expert",
+          "title": "Shared expert",
+          "category": "ffn",
+          "chips": [
+           "GLU, 2,688"
+          ],
+          "ports": [],
+          "written": null
+         }
+        ]
+       },
+       "inserted": false
+      }
+     ]
+    }
+   },
+   {
+    "id": "n.23",
+    "kind": "residual",
+    "label": "M",
+    "shared": false,
+    "span": null,
+    "origin": null,
+    "editable": true,
+    "body": {
+     "id": "n.23.0",
+     "kind": "seq",
+     "label": null,
+     "shared": false,
+     "span": null,
+     "origin": null,
+     "editable": true,
+     "items": [
+      {
+       "id": "n.23.0.0",
+       "kind": "layer",
+       "label": "norm",
+       "shared": false,
+       "span": null,
+       "origin": null,
+       "editable": true,
+       "type": "rmsnorm",
+       "title": "RMSNorm",
+       "category": "norm",
+       "chips": [],
+       "width": 4096,
+       "ports": [],
+       "written": [
+        10,
+        16
+       ],
+       "internals": null,
+       "inserted": false
+      },
+      {
+       "id": "n.23.0.1",
+       "kind": "layer",
+       "label": "ssm",
+       "shared": false,
+       "span": null,
+       "origin": null,
+       "editable": true,
+       "type": "mamba2",
+       "title": "Mamba-2",
+       "category": "recurrent",
+       "chips": [
+        "state 128"
+       ],
+       "width": 4096,
+       "ports": [],
+       "written": [
+        20,
+        26
+       ],
+       "internals": null,
+       "inserted": false
+      }
+     ]
+    }
+   },
+   {
+    "id": "n.24",
+    "kind": "residual",
+    "label": "E",
+    "shared": false,
+    "span": null,
+    "origin": null,
+    "editable": true,
+    "body": {
+     "id": "n.24.0",
+     "kind": "seq",
+     "label": null,
+     "shared": false,
+     "span": null,
+     "origin": null,
+     "editable": true,
+     "items": [
+      {
+       "id": "n.24.0.0",
+       "kind": "layer",
+       "label": "norm",
+       "shared": false,
+       "span": null,
+       "origin": null,
+       "editable": true,
+       "type": "rmsnorm",
+       "title": "RMSNorm",
+       "category": "norm",
+       "chips": [],
+       "width": 4096,
+       "ports": [],
+       "written": [
+        10,
+        16
+       ],
+       "internals": null,
+       "inserted": false
+      },
+      {
+       "id": "n.24.0.1",
+       "kind": "layer",
+       "label": "experts",
+       "shared": false,
+       "span": null,
+       "origin": null,
+       "editable": true,
+       "type": "moe",
+       "title": "Mixture of experts",
+       "category": "experts",
+       "chips": [
+        "512 experts, top 22",
+        "1 shared",
+        "2,688 hidden"
+       ],
+       "width": 4096,
+       "ports": [],
+       "written": [
+        30,
+        36
+       ],
+       "internals": {
+        "id": "n.24.0.1/i",
+        "label": null,
+        "shared": false,
+        "span": null,
+        "origin": null,
+        "editable": false,
+        "kind": "sum",
+        "terms": [
+         {
+          "id": "n.24.0.1/i.0",
+          "label": null,
+          "shared": false,
+          "span": null,
+          "origin": null,
+          "editable": false,
+          "kind": "prod",
+          "factors": [
+           {
+            "id": "n.24.0.1/i.0.0",
+            "label": null,
+            "shared": false,
+            "span": null,
+            "origin": null,
+            "editable": false,
+            "kind": "layer",
+            "type": "routed experts",
+            "title": "Routed experts",
+            "category": "ffn",
+            "chips": [
+             "512 \u00d7 GLU, 2,688"
+            ],
+            "ports": [],
+            "written": null
+           },
+           {
+            "id": "n.24.0.1/i.0.1",
+            "label": null,
+            "shared": false,
+            "span": null,
+            "origin": null,
+            "editable": false,
+            "kind": "layer",
+            "type": "router",
+            "title": "Router",
+            "category": "op",
+            "chips": [
+             "sigmoid, top 22"
+            ],
+            "ports": [],
+            "written": null
+           }
+          ]
+         },
+         {
+          "id": "n.24.0.1/i.1",
+          "label": null,
+          "shared": false,
+          "span": null,
+          "origin": null,
+          "editable": false,
+          "kind": "layer",
+          "type": "shared expert",
+          "title": "Shared expert",
+          "category": "ffn",
+          "chips": [
+           "GLU, 2,688"
+          ],
+          "ports": [],
+          "written": null
+         }
+        ]
+       },
+       "inserted": false
+      }
+     ]
+    }
+   },
+   {
+    "id": "n.25",
+    "kind": "residual",
+    "label": "M",
+    "shared": false,
+    "span": null,
+    "origin": null,
+    "editable": true,
+    "body": {
+     "id": "n.25.0",
+     "kind": "seq",
+     "label": null,
+     "shared": false,
+     "span": null,
+     "origin": null,
+     "editable": true,
+     "items": [
+      {
+       "id": "n.25.0.0",
+       "kind": "layer",
+       "label": "norm",
+       "shared": false,
+       "span": null,
+       "origin": null,
+       "editable": true,
+       "type": "rmsnorm",
+       "title": "RMSNorm",
+       "category": "norm",
+       "chips": [],
+       "width": 4096,
+       "ports": [],
+       "written": [
+        10,
+        16
+       ],
+       "internals": null,
+       "inserted": false
+      },
+      {
+       "id": "n.25.0.1",
+       "kind": "layer",
+       "label": "ssm",
+       "shared": false,
+       "span": null,
+       "origin": null,
+       "editable": true,
+       "type": "mamba2",
+       "title": "Mamba-2",
+       "category": "recurrent",
+       "chips": [
+        "state 128"
+       ],
+       "width": 4096,
+       "ports": [],
+       "written": [
+        20,
+        26
+       ],
+       "internals": null,
+       "inserted": false
+      }
+     ]
+    }
+   },
+   {
+    "id": "n.26",
+    "kind": "residual",
+    "label": "E",
+    "shared": false,
+    "span": null,
+    "origin": null,
+    "editable": true,
+    "body": {
+     "id": "n.26.0",
+     "kind": "seq",
+     "label": null,
+     "shared": false,
+     "span": null,
+     "origin": null,
+     "editable": true,
+     "items": [
+      {
+       "id": "n.26.0.0",
+       "kind": "layer",
+       "label": "norm",
+       "shared": false,
+       "span": null,
+       "origin": null,
+       "editable": true,
+       "type": "rmsnorm",
+       "title": "RMSNorm",
+       "category": "norm",
+       "chips": [],
+       "width": 4096,
+       "ports": [],
+       "written": [
+        10,
+        16
+       ],
+       "internals": null,
+       "inserted": false
+      },
+      {
+       "id": "n.26.0.1",
+       "kind": "layer",
+       "label": "experts",
+       "shared": false,
+       "span": null,
+       "origin": null,
+       "editable": true,
+       "type": "moe",
+       "title": "Mixture of experts",
+       "category": "experts",
+       "chips": [
+        "512 experts, top 22",
+        "1 shared",
+        "2,688 hidden"
+       ],
+       "width": 4096,
+       "ports": [],
+       "written": [
+        30,
+        36
+       ],
+       "internals": {
+        "id": "n.26.0.1/i",
+        "label": null,
+        "shared": false,
+        "span": null,
+        "origin": null,
+        "editable": false,
+        "kind": "sum",
+        "terms": [
+         {
+          "id": "n.26.0.1/i.0",
+          "label": null,
+          "shared": false,
+          "span": null,
+          "origin": null,
+          "editable": false,
+          "kind": "prod",
+          "factors": [
+           {
+            "id": "n.26.0.1/i.0.0",
+            "label": null,
+            "shared": false,
+            "span": null,
+            "origin": null,
+            "editable": false,
+            "kind": "layer",
+            "type": "routed experts",
+            "title": "Routed experts",
+            "category": "ffn",
+            "chips": [
+             "512 \u00d7 GLU, 2,688"
+            ],
+            "ports": [],
+            "written": null
+           },
+           {
+            "id": "n.26.0.1/i.0.1",
+            "label": null,
+            "shared": false,
+            "span": null,
+            "origin": null,
+            "editable": false,
+            "kind": "layer",
+            "type": "router",
+            "title": "Router",
+            "category": "op",
+            "chips": [
+             "sigmoid, top 22"
+            ],
+            "ports": [],
+            "written": null
+           }
+          ]
+         },
+         {
+          "id": "n.26.0.1/i.1",
+          "label": null,
+          "shared": false,
+          "span": null,
+          "origin": null,
+          "editable": false,
+          "kind": "layer",
+          "type": "shared expert",
+          "title": "Shared expert",
+          "category": "ffn",
+          "chips": [
+           "GLU, 2,688"
+          ],
+          "ports": [],
+          "written": null
+         }
+        ]
+       },
+       "inserted": false
+      }
+     ]
+    }
+   },
+   {
+    "id": "n.27",
+    "kind": "residual",
+    "label": "M",
+    "shared": false,
+    "span": null,
+    "origin": null,
+    "editable": true,
+    "body": {
+     "id": "n.27.0",
+     "kind": "seq",
+     "label": null,
+     "shared": false,
+     "span": null,
+     "origin": null,
+     "editable": true,
+     "items": [
+      {
+       "id": "n.27.0.0",
+       "kind": "layer",
+       "label": "norm",
+       "shared": false,
+       "span": null,
+       "origin": null,
+       "editable": true,
+       "type": "rmsnorm",
+       "title": "RMSNorm",
+       "category": "norm",
+       "chips": [],
+       "width": 4096,
+       "ports": [],
+       "written": [
+        10,
+        16
+       ],
+       "internals": null,
+       "inserted": false
+      },
+      {
+       "id": "n.27.0.1",
+       "kind": "layer",
+       "label": "ssm",
+       "shared": false,
+       "span": null,
+       "origin": null,
+       "editable": true,
+       "type": "mamba2",
+       "title": "Mamba-2",
+       "category": "recurrent",
+       "chips": [
+        "state 128"
+       ],
+       "width": 4096,
+       "ports": [],
+       "written": [
+        20,
+        26
+       ],
+       "internals": null,
+       "inserted": false
+      }
+     ]
+    }
+   },
+   {
+    "id": "n.28",
+    "kind": "residual",
+    "label": "E",
+    "shared": false,
+    "span": null,
+    "origin": null,
+    "editable": true,
+    "body": {
+     "id": "n.28.0",
+     "kind": "seq",
+     "label": null,
+     "shared": false,
+     "span": null,
+     "origin": null,
+     "editable": true,
+     "items": [
+      {
+       "id": "n.28.0.0",
+       "kind": "layer",
+       "label": "norm",
+       "shared": false,
+       "span": null,
+       "origin": null,
+       "editable": true,
+       "type": "rmsnorm",
+       "title": "RMSNorm",
+       "category": "norm",
+       "chips": [],
+       "width": 4096,
+       "ports": [],
+       "written": [
+        10,
+        16
+       ],
+       "internals": null,
+       "inserted": false
+      },
+      {
+       "id": "n.28.0.1",
+       "kind": "layer",
+       "label": "experts",
+       "shared": false,
+       "span": null,
+       "origin": null,
+       "editable": true,
+       "type": "moe",
+       "title": "Mixture of experts",
+       "category": "experts",
+       "chips": [
+        "512 experts, top 22",
+        "1 shared",
+        "2,688 hidden"
+       ],
+       "width": 4096,
+       "ports": [],
+       "written": [
+        30,
+        36
+       ],
+       "internals": {
+        "id": "n.28.0.1/i",
+        "label": null,
+        "shared": false,
+        "span": null,
+        "origin": null,
+        "editable": false,
+        "kind": "sum",
+        "terms": [
+         {
+          "id": "n.28.0.1/i.0",
+          "label": null,
+          "shared": false,
+          "span": null,
+          "origin": null,
+          "editable": false,
+          "kind": "prod",
+          "factors": [
+           {
+            "id": "n.28.0.1/i.0.0",
+            "label": null,
+            "shared": false,
+            "span": null,
+            "origin": null,
+            "editable": false,
+            "kind": "layer",
+            "type": "routed experts",
+            "title": "Routed experts",
+            "category": "ffn",
+            "chips": [
+             "512 \u00d7 GLU, 2,688"
+            ],
+            "ports": [],
+            "written": null
+           },
+           {
+            "id": "n.28.0.1/i.0.1",
+            "label": null,
+            "shared": false,
+            "span": null,
+            "origin": null,
+            "editable": false,
+            "kind": "layer",
+            "type": "router",
+            "title": "Router",
+            "category": "op",
+            "chips": [
+             "sigmoid, top 22"
+            ],
+            "ports": [],
+            "written": null
+           }
+          ]
+         },
+         {
+          "id": "n.28.0.1/i.1",
+          "label": null,
+          "shared": false,
+          "span": null,
+          "origin": null,
+          "editable": false,
+          "kind": "layer",
+          "type": "shared expert",
+          "title": "Shared expert",
+          "category": "ffn",
+          "chips": [
+           "GLU, 2,688"
+          ],
+          "ports": [],
+          "written": null
+         }
+        ]
+       },
+       "inserted": false
+      }
+     ]
+    }
+   },
+   {
+    "id": "n.29",
+    "kind": "layer",
+    "label": "norm",
+    "shared": false,
+    "span": null,
+    "origin": null,
+    "editable": true,
+    "type": "rmsnorm",
+    "title": "RMSNorm",
+    "category": "norm",
+    "chips": [],
+    "width": 4096,
+    "ports": [],
+    "written": [
+     10,
+     16
+    ],
+    "internals": null,
+    "inserted": false
+   },
+   {
+    "id": "n.30",
+    "kind": "tap",
+    "label": null,
+    "shared": false,
+    "span": null,
+    "origin": null,
+    "editable": true,
+    "name": "h",
+    "pop": false
+   },
+   {
+    "id": "n.31",
+    "kind": "layer",
+    "label": "out",
+    "shared": true,
+    "span": null,
+    "origin": null,
+    "editable": true,
+    "type": "head",
+    "title": "Linear output layer",
+    "category": "io",
+    "chips": [],
+    "width": 4096,
+    "ports": [],
+    "written": [
+     50,
+     56
+    ],
+    "internals": null,
+    "inserted": false
+   },
+   {
+    "id": "n.32",
+    "kind": "repeat",
+    "label": null,
+    "shared": false,
+    "span": null,
+    "origin": null,
+    "editable": true,
+    "body": {
+     "id": "n.32.0",
+     "kind": "seq",
+     "label": "mtp",
+     "shared": true,
+     "span": null,
+     "origin": null,
+     "editable": true,
+     "items": [
+      {
+       "id": "n.32.0.0",
+       "kind": "ref",
+       "label": null,
+       "shared": false,
+       "span": null,
+       "origin": null,
+       "editable": true,
+       "name": "h",
+       "pop": true
+      },
+      {
+       "id": "n.32.0.1",
+       "kind": "layer",
+       "label": null,
+       "shared": false,
+       "span": null,
+       "origin": null,
+       "editable": true,
+       "type": "nextn",
+       "title": "Next-token projection",
+       "category": "io",
+       "chips": [],
+       "width": 4096,
+       "ports": [],
+       "written": [
+        60,
+        66
+       ],
+       "internals": null,
+       "inserted": false
+      },
+      {
+       "id": "n.32.0.2",
+       "kind": "residual",
+       "label": "A",
+       "shared": false,
+       "span": null,
+       "origin": null,
+       "editable": true,
+       "body": {
+        "id": "n.32.0.2.0",
+        "kind": "seq",
+        "label": null,
+        "shared": false,
+        "span": null,
+        "origin": null,
+        "editable": true,
+        "items": [
+         {
+          "id": "n.32.0.2.0.0",
+          "kind": "layer",
+          "label": "norm",
+          "shared": false,
+          "span": null,
+          "origin": null,
+          "editable": true,
+          "type": "rmsnorm",
+          "title": "RMSNorm",
+          "category": "norm",
+          "chips": [],
+          "width": 4096,
+          "ports": [],
+          "written": [
+           10,
+           16
+          ],
+          "internals": null,
+          "inserted": false
+         },
+         {
+          "id": "n.32.0.2.0.1",
+          "kind": "layer",
+          "label": "attn",
+          "shared": false,
+          "span": null,
+          "origin": null,
+          "editable": true,
+          "type": "gqa",
+          "title": "Grouped-query attention",
+          "category": "attention",
+          "chips": [
+           "32 heads",
+           "2 KV heads"
+          ],
+          "width": 4096,
+          "ports": [],
+          "written": [
+           40,
+           46
+          ],
+          "internals": null,
+          "inserted": false
+         }
+        ]
+       }
+      },
+      {
+       "id": "n.32.0.3",
+       "kind": "residual",
+       "label": "E",
+       "shared": false,
+       "span": null,
+       "origin": null,
+       "editable": true,
+       "body": {
+        "id": "n.32.0.3.0",
+        "kind": "seq",
+        "label": null,
+        "shared": false,
+        "span": null,
+        "origin": null,
+        "editable": true,
+        "items": [
+         {
+          "id": "n.32.0.3.0.0",
+          "kind": "layer",
+          "label": "norm",
+          "shared": false,
+          "span": null,
+          "origin": null,
+          "editable": true,
+          "type": "rmsnorm",
+          "title": "RMSNorm",
+          "category": "norm",
+          "chips": [],
+          "width": 4096,
+          "ports": [],
+          "written": [
+           10,
+           16
+          ],
+          "internals": null,
+          "inserted": false
+         },
+         {
+          "id": "n.32.0.3.0.1",
+          "kind": "layer",
+          "label": "experts",
+          "shared": false,
+          "span": null,
+          "origin": null,
+          "editable": true,
+          "type": "moe",
+          "title": "Mixture of experts",
+          "category": "experts",
+          "chips": [
+           "512 experts, top 22",
+           "1 shared",
+           "2,688 hidden"
+          ],
+          "width": 4096,
+          "ports": [],
+          "written": [
+           30,
+           36
+          ],
+          "internals": {
+           "id": "n.32.0.3.0.1/i",
+           "label": null,
+           "shared": false,
+           "span": null,
+           "origin": null,
+           "editable": false,
+           "kind": "sum",
+           "terms": [
+            {
+             "id": "n.32.0.3.0.1/i.0",
+             "label": null,
+             "shared": false,
+             "span": null,
+             "origin": null,
+             "editable": false,
+             "kind": "prod",
+             "factors": [
+              {
+               "id": "n.32.0.3.0.1/i.0.0",
+               "label": null,
+               "shared": false,
+               "span": null,
+               "origin": null,
+               "editable": false,
+               "kind": "layer",
+               "type": "routed experts",
+               "title": "Routed experts",
+               "category": "ffn",
+               "chips": [
+                "512 \u00d7 GLU, 2,688"
+               ],
+               "ports": [],
+               "written": null
+              },
+              {
+               "id": "n.32.0.3.0.1/i.0.1",
+               "label": null,
+               "shared": false,
+               "span": null,
+               "origin": null,
+               "editable": false,
+               "kind": "layer",
+               "type": "router",
+               "title": "Router",
+               "category": "op",
+               "chips": [
+                "sigmoid, top 22"
+               ],
+               "ports": [],
+               "written": null
+              }
+             ]
+            },
+            {
+             "id": "n.32.0.3.0.1/i.1",
+             "label": null,
+             "shared": false,
+             "span": null,
+             "origin": null,
+             "editable": false,
+             "kind": "layer",
+             "type": "shared expert",
+             "title": "Shared expert",
+             "category": "ffn",
+             "chips": [
+              "GLU, 2,688"
+             ],
+             "ports": [],
+             "written": null
+            }
+           ]
+          },
+          "inserted": false
+         }
+        ]
+       }
+      },
+      {
+       "id": "n.32.0.4",
+       "kind": "layer",
+       "label": "norm",
+       "shared": false,
+       "span": null,
+       "origin": null,
+       "editable": true,
+       "type": "rmsnorm",
+       "title": "RMSNorm",
+       "category": "norm",
+       "chips": [],
+       "width": 4096,
+       "ports": [],
+       "written": [
+        10,
+        16
+       ],
+       "internals": null,
+       "inserted": false
+      },
+      {
+       "id": "n.32.0.5",
+       "kind": "tap",
+       "label": null,
+       "shared": false,
+       "span": null,
+       "origin": null,
+       "editable": true,
+       "name": "h",
+       "pop": false
+      },
+      {
+       "id": "n.32.0.6",
+       "kind": "layer",
+       "label": "out",
+       "shared": true,
+       "span": null,
+       "origin": null,
+       "editable": true,
+       "type": "head",
+       "title": "Linear output layer",
+       "category": "io",
+       "chips": [],
+       "width": 4096,
+       "ports": [],
+       "written": [
+        50,
+        56
+       ],
+       "internals": null,
+       "inserted": false
+      }
+     ]
+    },
+    "times": 2
+   }
+  ]
+ }
+}

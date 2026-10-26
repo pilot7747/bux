@@ -1,0 +1,106 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>bux studio: diagram harness</title>
+<link rel="stylesheet" href="../tokens.css">
+<link rel="stylesheet" href="../diagram.css">
+<style>
+  html, body { margin: 0; height: 100%; background: var(--bg); color: var(--text); font: 13px var(--font-ui); }
+  .bar { position: absolute; inset: 0 0 auto 0; height: 40px; display: flex; align-items: center; gap: 12px;
+         padding: 0 12px; border-bottom: 1px solid var(--border); background: var(--surface); }
+  .bar select, .bar button { font: inherit; color: inherit; background: var(--surface-2); border: 1px solid var(--border);
+                             border-radius: var(--radius-sm); padding: 3px 8px; }
+  .bar .log { margin-left: auto; color: var(--text-3); font: 11px var(--font-mono); white-space: nowrap; overflow: hidden; }
+  #canvas { position: absolute; inset: 40px 0 0 0; }
+  body.bare .bar { display: none; }
+  body.bare #canvas { inset: 0; }
+</style>
+</head>
+<body>
+<div class="bar">
+  <select id="fixture"></select>
+  <button id="theme">Theme</button>
+  <button id="dim">Dim</button>
+  <button id="facts">Facts</button>
+  <span id="ms"></span>
+  <span class="log" id="log"></span>
+</div>
+<div id="canvas"></div>
+<script type="module">
+/* URL parameters, so that a headless screenshot can show any state:
+   fixture=llama3_8b   theme=dark   bare=1 (no bar)   dim=1   facts=1
+   select=n.1.0.0.0.1   hover=ID (its toolbar)   fold=open|closed   open=D#1,F#2   close=D#0
+   zoom=ID,ID (internals)   palette=ID (the insert palette)   view=k,x,y   center=ID&k=1   bench=1 */
+import { Diagram } from "../diagram.js";
+
+const FIXTURES = ["llama3_8b", "qwen3_next", "hymba", "mhc", "deepseek_v3", "gpt2", "ngpt",
+                  "modded_nanogpt", "primitives", "resformer", "zamba2", "qwen3_8_flash_next", "nemotron_super"];
+const PALETTE = [
+  ["rmsnorm", "norm", "RMSNorm", "rmsnorm"], ["layernorm", "norm", "LayerNorm", "layernorm"],
+  ["gqa", "attention", "Grouped-query attention", "gqa(num_heads=8, num_kv_heads=2, rope=rope())"],
+  ["mla", "attention", "Multi-head latent attention", "mla(num_heads=16, kv_lora_rank=512)"],
+  ["gdn", "recurrent", "Gated DeltaNet", "gdn(num_heads=16, head_dim=128)"],
+  ["mamba2", "recurrent", "Mamba-2", "mamba2(state_size=128)"], ["kda", "recurrent", "Kimi delta attention", "kda(num_heads=16)"],
+  ["gated_mlp", "ffn", "Feed forward (gated)", "gated_mlp(intermediate_size=4 * d_model)"],
+  ["mlp", "ffn", "Feed forward", "mlp(intermediate_size=4 * d_model)"],
+  ["moe", "experts", "Mixture of experts", "moe(num_experts=64, top_k=8, expert=gated_mlp(intermediate_size=512))"],
+  ["scale", "op", "Scale", "scale"], ["linear", "op", "Linear", "linear(features=d_model)"],
+  ["swish", "op", "SiLU", "swish"], ["sigmoid", "op", "Sigmoid", "sigmoid"], ["dropout", "op", "Dropout", "dropout(rate=0.1)"],
+].map(([name, category, title, template]) => ({ name, kind: "layer", category, title, doc: `${title}.`, template }));
+
+const q = new URLSearchParams(location.search);
+const list = (key) => (q.get(key) ?? "").split(",").filter(Boolean);
+const root = document.documentElement;
+const log = (text) => { document.getElementById("log").textContent = text; console.log(text); };
+if (q.get("theme")) root.dataset.theme = q.get("theme");
+if (q.get("bare")) document.body.classList.add("bare");
+
+const diagram = new Diagram(document.getElementById("canvas"), {
+  onSelect: (id) => log(`select ${id}`),
+  onHover: (id) => id && log(`hover ${id}`),
+  onAction: (op) => log(`action ${JSON.stringify(op)}`),
+  palette: PALETTE,
+});
+window.diagram = diagram;
+
+const name = q.get("fixture") ?? "llama3_8b";
+const select = document.getElementById("fixture");
+for (const f of FIXTURES) select.append(new Option(f, f, false, f === name));
+select.onchange = () => { q.set("fixture", select.value); location.search = q; };
+document.getElementById("theme").onclick = () => { root.dataset.theme = root.dataset.theme === "dark" ? "light" : "dark"; };
+document.getElementById("dim").onclick = (e) => diagram.setDim(e.target.classList.toggle("on"));
+document.getElementById("facts").onclick = () => diagram.setFacts({ params: "8.03B", context: "8,192" });
+
+const model = await (await fetch(`fixtures/model-${name}.json`)).json();
+if (q.get("fold") === "open") diagram.folds.mode = "open";
+if (q.get("fold") === "closed") diagram.folds.mode = "closed";
+for (const key of list("open")) diagram.folds.keys.set(key, true);
+for (const key of list("close")) diagram.folds.keys.set(key, false);
+for (const id of list("zoom")) diagram.zooms.add(id);
+if (q.get("facts")) diagram.facts = { params: "8.03B", context: "8,192" };
+diagram.render(model);
+document.getElementById("ms").textContent = `${diagram.renderMs.toFixed(1)} ms`;
+if (q.get("view")) diagram.applyView(Object.fromEntries(q.get("view").split(",").map(Number).map((v, i) => [["k", "x", "y"][i], v])));
+if (q.get("center")) center(q.get("center"), Number(q.get("k") ?? 1));
+if (q.get("select")) diagram.select(q.get("select"));
+if (q.get("hover")) diagram.hover(q.get("hover"));
+if (q.get("palette")) diagram.openPalette(q.get("palette"));
+if (q.get("dim")) diagram.setDim(true);
+function center(id, k) {
+  const r = diagram.ink.rects.get(diagram.drawnId(id));
+  const { width, height } = diagram.el.getBoundingClientRect();
+  diagram.applyView({ k, x: width / 2 - (r.x + r.w / 2) * k, y: height / 2 - (r.y + r.h / 2) * k });
+}
+if (q.get("checks")) (await import("./diagram-checks.js")).runChecks(diagram, model);
+if (q.get("bench")) {
+  const times = [];
+  for (let i = 0; i < 20; i++) { diagram.render(model); times.push(diagram.renderMs); }
+  times.sort((a, b) => a - b);
+  const text = `${name}: median ${times[10].toFixed(1)} ms, max ${times[19].toFixed(1)} ms, ${diagram.content.querySelectorAll("*").length} elements`;
+  document.getElementById("ms").textContent = text;
+  console.log(`bench ${text}`);
+}
+</script>
+</body>
+</html>
