@@ -112,7 +112,9 @@ numbers-only arithmetic: `0.8 * web + 0.2 * code` is a weighted mix
 A name that nothing defines, and that is not a builtin, is a string when it is the
 value of a setting. So enumerated settings need no quotes: `layout=interleaved`,
 `load_balancing=aux_free`. Activation names are strings in the same way:
-`router=sigmoid`, `activation=swish`.
+`router=sigmoid`, `activation=swish`. So is a builtin config's name where the setting
+takes it as one of its options: `cosine` is a schedule, but `wsd(shape=cosine)` is
+the cooldown's shape.
 
 Where a setting wants something other than a string, or in arithmetic, an undefined
 name is a typo, and the compiler reports it as an unknown name with a suggestion:

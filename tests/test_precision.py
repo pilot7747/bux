@@ -748,7 +748,7 @@ def test_moments_in_bfloat16_train_near_float32(losses):
 
     [run] = compile_runs(_source())
     model = parallel.build(lambda: Model(run.arch, rngs=nnx.Rngs(0)))
-    multiplier = lr_multiplier(run.train.schedule, run.train.steps)
+    multiplier = lr_multiplier(run.train)
     tx = optimizer(run.train.optimizer, multiplier, model, moments=jnp.bfloat16)
     state = nnx.state(nnx.Optimizer(model, tx, wrt=nnx.Param), nnx.OptState)
     floats = [
@@ -890,7 +890,7 @@ def _trainer(arch: str, **settings) -> Trainer:
     [run] = compile_runs(_source(arch=arch))
     t = run.train
     model = parallel.build(lambda: Model(run.arch, rngs=nnx.Rngs(0)))
-    tx = optimizer(t.optimizer, lr_multiplier(t.schedule, t.steps), model, t.clip)
+    tx = optimizer(t.optimizer, lr_multiplier(t), model, t.clip)
     return Trainer(model, tx, objective(t.loss, run.arch), **settings)
 
 

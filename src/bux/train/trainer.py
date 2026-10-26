@@ -1269,7 +1269,7 @@ def train(
             run.model_dump_json(indent=2), encoding="utf-8"
         )
 
-    multiplier = lr_multiplier(config.schedule, config.steps)
+    multiplier = lr_multiplier(config)
     lr, peak = lr_schedule(config.optimizer.lr, multiplier), _peak(run)
     stretches = curriculum.stretches(config)
     tokens = functools.partial(curriculum.tokens, stretches)

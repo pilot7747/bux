@@ -69,7 +69,7 @@ def _(c, multiplier, model):  # its config, the schedule's multiplier, the model
 | Registry | A builder gets | And returns |
 |----------|----------------|-------------|
 | {py:data}`bux.train.optim.optimizers` | the config, the schedule's multiplier (a function of the step), the model | an optax transformation |
-| {py:data}`bux.train.optim.schedules` | the config, the run's steps | the curve after the warmup, a function of the step |
+| {py:data}`bux.train.optim.schedules` | the config, the run's training settings (its steps, batch and peak `lr`) | the curve after the warmup, a function of the step |
 | {py:data}`bux.train.optim.ns_coefficients` | the number of Newton-Schulz iterations | an array of `(a, b, c)`, one, or one an iteration |
 | {py:data}`bux.train.data.sources` | the config, the run's settings, the vocabulary's size, the cache, a seed | a {py:class}`~bux.train.data.Source`: `rows(start, n)` of its endless stream |
 | {py:data}`bux.train.trackers.trackers` | the config, the run, its directory, the step it starts at | a {py:class}`~bux.train.sinks.Sink` ([Sinks](#sinks)) |

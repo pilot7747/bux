@@ -59,7 +59,7 @@ def _stepped() -> fitting.Fitting:
     t = run.train
     with parallel.use(t.mesh, t.layout, t.methods):
         model = Model(run.arch, rngs=nnx.Rngs(0))
-        tx = optimizer(t.optimizer, lr_multiplier(t.schedule, t.steps), model, t.clip)
+        tx = optimizer(t.optimizer, lr_multiplier(t), model, t.clip)
         trainer = Trainer(model, tx, objective(t.loss, run.arch))
         trainer.train_on_batch(plain(TOKENS))
     assert isinstance(trainer._train, fitting.Fitting)
