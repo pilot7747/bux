@@ -1,0 +1,13 @@
+# SmolLM2-135M (Hugging Face, 2024): a Llama made deep and narrow to run on devices, 30
+# layers 576 wide with 9 query heads over 3 key and value heads of 64, its input and
+# output embeddings tied. The vocabulary is SmolLM's own 49,152 tokens, and the context
+# 8,192.
+d_model    = 576
+vocab_size = 49152
+
+norm = rmsnorm(eps=1e-5)
+attn = gqa(num_heads=9, num_kv_heads=3, rope=rope(base=100000))
+ffn  = gated_mlp(intermediate_size=1536, activation=swish)
+
+block = [norm attn] [norm ffn]
+model = embed block^30 norm head(tied=true)

@@ -14,9 +14,12 @@ it runs a gate bounded at -5 or above (`gate_lower_bound`, Kimi K3; `FLOOR`). Wi
 steps of bux's start, KDA's unbounded gates are that steep in 30 to 90% of the (row,
 head) pairs of most layers: those run by bux's own kernels (``pallas_delta``).
 
-Decayed linear attention, with no delta rule (GLA, Lightning), runs by Frost's GDN-2
-kernel (`linear`), whose ``S_t = (I - k (beta k)^T) Diag(e^g) S + k (w v)^T`` it is
-at beta 0 and w 1: in a fifth of ``chunkwise``'s time for GLA.
+Gated DeltaNet-2, ``S_t = (I - k (beta k)^T) Diag(e^g) S + k (w v)^T`` with an
+erase gate beta per key channel and a write gate w per value channel, runs by Frost's
+GDN-2 kernel (`gated`), which factors its decays as the KDA kernel does: at a gate
+bounded at `FLOOR` or above. So does decayed linear attention, with no delta rule
+(GLA, Lightning), which it is at beta 0 and w 1 (`linear`): in a fifth of
+``chunkwise``'s time for GLA.
 
 The kernels run on one SM100 or SM103 GPU at a time, on token-packed rows and their
 documents' bounds (cu_seqlens); on a mesh, a `shard_map` gives them each device's rows
@@ -27,7 +30,7 @@ and heads. They take heads of 64 or 128, and every position of a row: not
 import functools
 import threading
 from collections.abc import Callable
-from typing import Any
+from typing import Any, NamedTuple
 
 import jax
 import jax.numpy as jnp
@@ -301,16 +304,17 @@ def _handle(device: int, stream: int) -> Any:
     return handle
 
 
-# --- Decayed linear attention: Frost's GDN-2 kernel at beta 0 and w 1 ----------------
+# --- Gated DeltaNet-2, and decayed linear attention: Frost's GDN-2 kernel -----------
 
+Gated = Callable[..., Float[Array, "b t h dv"]]  # linear_attention's gated_delta_2
 Decayed = Callable[..., Float[Array, "b t h dv"]]  # linear_attention's decayed
-# GDN-2's graphs, in `_graph_call`'s order. beta, the step of its delta rule, is 0 here,
-# and w, which scales the values it writes, 1.
-LINEAR_INPUTS = ("q", "k", "v", "g", "beta", "w", "cu_seqlens")
+# GDN-2's graphs, in `_graph_call`'s order: beta is its erase gate, over the key
+# channels, and w its write gate, over the value channels.
+GDN2_INPUTS = ("q", "k", "v", "g", "beta", "w", "cu_seqlens")
 NODES |= {
-    "gdn2": (LINEAR_INPUTS, {"O": "v"}),
+    "gdn2": (GDN2_INPUTS, {"O": "v"}),
     "gdn2_bwd": (
-        (*LINEAR_INPUTS, "dO"),
+        (*GDN2_INPUTS, "dO"),
         {"dQ": "q", "dK": "k", "dV": "v", "dG": "g", "dBeta": "beta", "dW": "w"},
     ),
 }
@@ -328,10 +332,50 @@ def linear_runs(dk: int, dv: int, dtype: Any) -> bool:
     return _has_gdn2() and method == "scan" and shapes and here
 
 
+def gated_runs(dk: int, dv: int, dtype: Any, floor: float | None) -> bool:
+    """Return whether GDN-2's kernel runs Gated DeltaNet-2 of these head dims, its q,
+    k and v of `dtype`, its log decays never below `floor`: where it runs decayed
+    linear attention (`linear_runs`), at a floor of `FLOOR` or above, which keeps
+    every tile of 16 positions off its exact path. Trained on text, unbounded gates
+    soon decay some tile past it, as KDA's do, and the kernel then runs each call
+    again by that path, slower than the chunks."""
+    bounded = floor is not None and floor >= FLOOR
+    return bounded and linear_runs(dk, dv, dtype)
+
+
 def _has_gdn2() -> bool:
     """Return whether the cudnn-frontend installed builds GDN-2's graphs: its develop
     builds do."""
     return frost is not None and hasattr(cudnn.pygraph, "gdn2")
+
+
+def gated(
+    q: Float[Array, "b t h dk"],
+    k: Float[Array, "b t h dk"],
+    v: Float[Array, "b t h dv"],
+    log_decay: Float[Array, "b t h #dk"],
+    erase: Float[Array, "b t h dk"] | None,
+    write: Float[Array, "b t h dv"] | None,
+    docs: Segments | None,
+    otherwise: Gated,
+) -> Float[Array, "b t h dv"]:
+    """Run `linear_attention.gated_delta_2` by GDN-2's kernel, in v's dtype. With no
+    erase gate, which is then 0, and no write gate, then 1, it is decayed linear
+    attention (`linear`).
+
+    Call it where `gated_runs` says the kernel takes the layer. Rows with more
+    documents than the kernel's cu_seqlens holds, and positions split over devices,
+    run by `otherwise` instead."""
+    docs = docs or Segments.of(jnp.broadcast_to(jnp.arange(q.shape[1]), q.shape[:2]))
+    xs = (q, k, v, log_decay, erase, write, *docs)
+    rule = functools.partial(_gated_rows, otherwise)
+    if parallel.active() is None:
+        return rule(*xs)
+    rows = parallel.spec(("batch", "seq", "heads", None), q.shape)
+    if rows[1] is not None:  # positions split over devices, which XLA gathers
+        return otherwise(q, k, v, log_decay, erase, write, docs)
+    specs = (rows,) * 6 + (P(*rows[:2]),) * 3
+    return kernels.per_device(rule, specs, rows)(*xs)
 
 
 def linear(
@@ -342,29 +386,35 @@ def linear(
     docs: Segments | None,
     otherwise: Decayed,
 ) -> Float[Array, "b t h dv"]:
-    """Run `linear_attention.decayed` by GDN-2's kernel, in v's dtype.
+    """Run `linear_attention.decayed` by GDN-2's kernel, in v's dtype: `gated` with
+    no erase or write gate.
 
     Call it where `linear_runs` says the kernel takes the layer. Rows with more
     documents than the kernel's cu_seqlens holds, and positions split over devices,
     run by `otherwise` instead."""
-    docs = docs or Segments.of(jnp.broadcast_to(jnp.arange(q.shape[1]), q.shape[:2]))
-    xs = (q, k, v, log_decay, *docs)
-    rule = functools.partial(_linear_rows, otherwise)
-    if parallel.active() is None:
-        return rule(*xs)
-    rows = parallel.spec(("batch", "seq", "heads", None), q.shape)
-    if rows[1] is not None:  # positions split over devices, which XLA gathers
-        return otherwise(q, k, v, log_decay, docs)
-    specs = (rows,) * 4 + (P(*rows[:2]),) * 3
-    return kernels.per_device(rule, specs, rows)(*xs)
+
+    def ungated(
+        q: Float[Array, "b t h dk"],
+        k: Float[Array, "b t h dk"],
+        v: Float[Array, "b t h dv"],
+        g: Float[Array, "b t h #dk"],
+        erase: None,
+        write: None,
+        docs: Segments,
+    ) -> Float[Array, "b t h dv"]:
+        return otherwise(q, k, v, g, docs)
+
+    return gated(q, k, v, log_decay, None, None, docs, ungated)
 
 
-def _linear_rows(
-    otherwise: Decayed,
+def _gated_rows(
+    otherwise: Gated,
     q: Float[Array, "b t h dk"],
     k: Float[Array, "b t h dk"],
     v: Float[Array, "b t h dv"],
     g: Float[Array, "b t h #dk"],
+    erase: Float[Array, "b t h dk"] | None,
+    write: Float[Array, "b t h dv"] | None,
     positions: Int[Array, "b t"],
     ids: Int[Array, "b t"],
     within: Int[Array, "b t"],
@@ -373,75 +423,114 @@ def _linear_rows(
     b, t = within.shape
     room = b * max(1, t * DOCS // 4096)
     docs = Segments(positions, ids, within)
-    kernel = functools.partial(_linear_kernel, room)
+    kernel = functools.partial(_gated_kernel, room)
 
     def fallback(
         q: Float[Array, "b t h dk"],
         k: Float[Array, "b t h dk"],
         v: Float[Array, "b t h dv"],
         g: Float[Array, "b t h #dk"],
+        erase: Float[Array, "b t h dk"] | None,
+        write: Float[Array, "b t h dv"] | None,
         within: Int[Array, "b t"],
     ) -> Float[Array, "b t h dv"]:
-        return otherwise(q, k, v, g, docs).astype(v.dtype)
+        return otherwise(q, k, v, g, erase, write, docs).astype(v.dtype)
 
     fits = jnp.sum(within == 0) <= room
-    return jax.lax.cond(fits, kernel, fallback, q, k, v, g, within)
+    return jax.lax.cond(fits, kernel, fallback, q, k, v, g, erase, write, within)
+
+
+class _GatedRows(NamedTuple):
+    """GDN-2's inputs as the layer gives them, which its backward pass keeps."""
+
+    q: Float[Array, "b t h dk"]
+    k: Float[Array, "b t h dk"]
+    v: Float[Array, "b t h dv"]
+    g: Float[Array, "b t h #dk"]
+    erase: Float[Array, "b t h dk"] | None
+    write: Float[Array, "b t h dv"] | None
+    within: Int[Array, "b t"]
 
 
 @functools.partial(jax.custom_vjp, nondiff_argnums=(0,))
-def _linear_kernel(
+def _gated_kernel(
     room: int,
     q: Float[Array, "b t h dk"],
     k: Float[Array, "b t h dk"],
     v: Float[Array, "b t h dv"],
     g: Float[Array, "b t h #dk"],
+    erase: Float[Array, "b t h dk"] | None,
+    write: Float[Array, "b t h dv"] | None,
     within: Int[Array, "b t"],
 ) -> Float[Array, "b t h dv"]:
     """Run GDN-2's kernel on the rows packed end to end, each document a sequence, in
     `room` sequences, the last ones empty. Its backward pass keeps the rows as they
     come."""
-    return _linear_forward(room, q, k, v, g, within)[0]
+    return _gated_forward(room, q, k, v, g, erase, write, within)[0]
 
 
-def _linear_forward(
-    room: int, *rows: Shaped[Array, "..."]
-) -> tuple[Float[Array, "b t h dv"], Rows]:
-    tokens = _linear_packed(room, *rows)
-    out = _graph_call("gdn2", [_like(tokens[2])], *tokens)[0]
-    return out.reshape(rows[2].shape), rows
-
-
-def _linear_backward(
-    room: int, rows: Rows, d_out: Float[Array, "b t h dv"]
-) -> tuple[Shaped[Array, "..."] | None, ...]:
-    tokens = _linear_packed(room, *rows)
-    d_out = d_out.reshape(tokens[2].shape).astype(tokens[0].dtype)
-    results = [_like(x) for x in tokens[:6]]
-    dq, dk, dv, dg, *_ = _graph_call("gdn2_bwd", results, *tokens, d_out)
-    grads = (dq, dk, dv, _summed_to(dg, rows[3]))
-    return (*(d.reshape(x.shape).astype(x.dtype) for d, x in zip(grads, rows)), None)
-
-
-_linear_kernel.defvjp(_linear_forward, _linear_backward)
-
-
-def _linear_packed(
+def _gated_forward(
     room: int,
     q: Float[Array, "b t h dk"],
     k: Float[Array, "b t h dk"],
     v: Float[Array, "b t h dv"],
     g: Float[Array, "b t h #dk"],
+    erase: Float[Array, "b t h dk"] | None,
+    write: Float[Array, "b t h dv"] | None,
     within: Int[Array, "b t"],
-) -> Tokens:
-    """Return GDN-2's inputs: the rows packed end to end, q, k and v in v's dtype, the
-    log decays in float32, one a head spread over the key channels, beta 0 and w 1,
-    and the documents' bounds cu_seqlens, `room` + 1 of them."""
-    b, t, h, _ = q.shape
-    q, k, v = (x.reshape(b * t, h, -1).astype(v.dtype) for x in (q, k, v))
-    gates = jnp.broadcast_to(g.reshape(b * t, h, -1).astype(jnp.float32), k.shape)
-    starts = jnp.nonzero(within.reshape(-1) == 0, size=room, fill_value=b * t)[0]
+) -> tuple[Float[Array, "b t h dv"], _GatedRows]:
+    rows = _GatedRows(q, k, v, g, erase, write, within)
+    tokens = _gated_packed(room, rows)
+    out = _graph_call("gdn2", [_like(tokens[2])], *tokens)[0]
+    return out.reshape(rows.v.shape), rows
+
+
+def _gated_backward(
+    room: int, rows: _GatedRows, d_out: Float[Array, "b t h dv"]
+) -> tuple[Shaped[Array, "..."] | None, ...]:
+    tokens = _gated_packed(room, rows)
+    d_out = d_out.reshape(tokens[2].shape).astype(tokens[0].dtype)
+    results = [_like(x) for x in tokens[:6]]
+    dq, dk, dv, dg, d_erase, d_write = _graph_call("gdn2_bwd", results, *tokens, d_out)
+    grads = (dq, dk, dv, _summed_to(dg, rows.g), d_erase, d_write)
+    return (*(_shaped(d, x) for d, x in zip(grads, rows)), None)
+
+
+_gated_kernel.defvjp(_gated_forward, _gated_backward)
+
+
+def _gated_packed(room: int, rows: _GatedRows) -> Tokens:
+    """Return GDN-2's inputs: the rows packed end to end, q, k, v and the gates in v's
+    dtype, the log decays in float32, one a head spread over the key channels, an
+    erase gate of 0 and a write gate of 1 where there is none, and the documents'
+    bounds cu_seqlens, `room` + 1 of them."""
+    b, t, h, _ = rows.q.shape
+    dtype = rows.v.dtype
+    q, k, v = (x.reshape(b * t, h, -1).astype(dtype) for x in rows[:3])
+    g = rows.g.reshape(b * t, h, -1).astype(jnp.float32)
+    erase = _packed_gate(rows.erase, k, 0.0)
+    write = _packed_gate(rows.write, v, 1.0)
+    within = rows.within.reshape(-1)
+    starts = jnp.nonzero(within == 0, size=room, fill_value=b * t)[0]
     cu = jnp.append(starts, b * t).astype(jnp.int32)
-    return q, k, v, gates, jnp.zeros_like(k), jnp.ones_like(v), cu
+    return q, k, v, jnp.broadcast_to(g, k.shape), erase, write, cu
+
+
+def _packed_gate(
+    x: Float[Array, "b t h e"] | None, like: Float[Array, "n h e"], fill: float
+) -> Float[Array, "n h e"]:
+    """Return the gate `x` packed as `like` is, or `fill` everywhere for no gate."""
+    if x is None:
+        return jnp.full_like(like, fill)
+    return x.reshape(like.shape).astype(like.dtype)
+
+
+def _shaped(
+    d: Shaped[Array, "n ..."], x: Shaped[Array, "b t ..."] | None
+) -> Shaped[Array, "b t ..."] | None:
+    """Return the gradient `d` of the packed tokens as x's, of its shape and dtype; none
+    for no x."""
+    return None if x is None else d.reshape(x.shape).astype(x.dtype)
 
 
 def _summed_to(
