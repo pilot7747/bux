@@ -5,16 +5,19 @@ its document, so one starts wherever they stop increasing) and ``loss_mask`` (wh
 each token is a target). Every source is an endless stream of rows, each epoch in a
 new order. Batch i holds rows ``i * n`` to ``(i + 1) * n`` of each source, n of them
 in proportion to its weight, so it depends only on the seed and i: a run that resumes
-at step i reads what it would have read had it never stopped. In a job of many
-processes, each reads only the rows of a batch that its devices hold.
+at step i reads what it would have read had it never stopped. Where the run's
+curriculum or batch ramp change its batches, each stretch of steps reads on from
+where the stretches before it left each source (`training_batches`). In a job of
+many processes, each reads only the rows of a batch that its devices hold.
 
 A source is found by its config's type in `sources`. The trainer reads batches
 through `prefetch`, which loads the next ones as a step runs::
 
-    for batch in prefetch(batches(run.train.data, run.train, run.arch.vocab_size)):
+    for batch in prefetch(training_batches(run.train, run.arch.vocab_size)):
         ...
 """
 
+import bisect
 import contextlib
 import functools
 import glob
@@ -33,6 +36,8 @@ from jaxtyping import Array, Bool, Int, Int32, Integer, UInt64
 from bux import parallel
 from bux.data.pipeline import DEFAULT_CACHE, Job
 from bux.train import config as tcfg
+from bux.train import curriculum
+from bux.train.curriculum import Stretch
 from bux.train.registry import Registry
 
 
@@ -352,6 +357,7 @@ def batches(
 
     Of each batch only `rows` are read, by default those that this process's devices
     hold (`bux.parallel.local_rows`), every row on one process; the others stay 0.
+    The run's ``curriculum`` and ``batch_ramp`` are `training_batches`' to follow.
 
     Args:
         data: The source or mixture to read: the run's ``data``, or its eval's.
@@ -377,41 +383,124 @@ def batches(
         it = batches(run.train.data, run.train, run.arch.vocab_size, start=1000)
         batch = next(it)  # the batch of step 1000
     """
+    whole = Stretch(0, config.steps, config.model_copy(update={"data": data}))
+    plans = _plans([whole])
     if rows is None:
         rows = parallel.local_rows(config.batch, config.seq_len)
-    return _batches(
-        data, config, vocab_size, cache, start, held_out, np.asarray(rows, np.int64)
-    )
+    own = [np.asarray(rows, np.int64)]
+    return _batches(plans, own, vocab_size, cache, start, held_out)
+
+
+def training_batches(
+    config: tcfg.TrainConfig,
+    vocab_size: int,
+    *,
+    cache: str | Path = DEFAULT_CACHE,
+    start: int = 0,
+) -> Iterator[Batch]:
+    """Yield a run's training batches from step `start` on, each of the seq_len, batch
+    and data of its stretch of the run (`bux.train.curriculum.stretches`): those of
+    `batches` of ``config.data``, where the run has no curriculum and no batch ramp.
+
+    A source read at the same seq_len in two stretches goes on in the second from
+    the row it stopped at in the first, so that a phase that only changes the batch
+    or adds a source repeats no row. Each process reads its own rows of each batch.
+
+    Args:
+        config: The run's settings, ``run.train``.
+        vocab_size: The model's vocabulary, which every token id must be under.
+        cache: Where bux.data prepared `text` and `chat` datasets.
+        start: The step a run resumes at.
+
+    Yields:
+        Batch after batch, on the host: past the run's last step, the last
+        stretch's, endlessly.
+
+    Raises:
+        ValueError: As `batches`, for a batch of any stretch.
+        FileNotFoundError: If a dataset of any stretch is not prepared.
+    """
+    plans = _plans(curriculum.stretches(config))
+    own = [parallel.local_rows(p.config.batch, p.config.seq_len) for p in plans]
+    return _batches(plans, own, vocab_size, cache, start, held_out=False)
+
+
+class _Plan(NamedTuple):
+    """How the batches of a stretch, from step `start` under `config`, read their
+    sources: by the number of each part's stream, its rows a batch, and the rows it
+    gave the stretches before."""
+
+    start: int  # the stretch's first step
+    config: tcfg.TrainConfig  # its settings
+    streams: list[int]  # the number of each part's stream, which seeds it
+    counts: list[int]  # the rows a batch takes from each
+    before: list[int]  # the rows each gave the stretches before this one
+
+
+def _parts(data: tcfg.DataConfig) -> tuple[tcfg.Weighted, ...]:
+    if isinstance(data, tcfg.MixtureConfig):
+        return data.sources
+    return (tcfg.Weighted(weight=1, source=data),)
+
+
+def _plans(stretches: Sequence[Stretch]) -> list[_Plan]:
+    """Return how each stretch reads its sources. A stream is a source read at a
+    seq_len, one for each time a mixture names it, numbered in the order the
+    stretches first read them: a run of one stretch numbers them as its mixture
+    does."""
+    numbers: dict[tuple[str, int, int], int] = {}
+    given: dict[int, int] = {}
+    plans = []
+    for s in stretches:
+        parts, c = _parts(s.config.data), s.config
+        counts = apportion([p.weight for p in parts], c.batch)
+        for p, n in zip(parts, counts, strict=True):
+            if not n:
+                share = p.weight / sum(q.weight for q in parts)
+                where = f" (from step {s.start})" if s.start else ""
+                raise ValueError(
+                    f"a batch of {c.batch} rows{where} has no room for a source of "
+                    f"weight {share:.3g}"
+                )
+        keys = [p.source.model_dump_json() for p in parts]
+        ids = [
+            numbers.setdefault((key, c.seq_len, keys[:k].count(key)), len(numbers))
+            for k, key in enumerate(keys)
+        ]
+        before = [given.get(n, 0) for n in ids]
+        plans.append(_Plan(s.start, c, ids, counts, before))
+        for n, count in zip(ids, counts, strict=True):
+            given[n] = given.get(n, 0) + count * (s.stop - s.start)
+    return plans
 
 
 def _batches(
-    data: tcfg.DataConfig,
-    config: tcfg.TrainConfig,
+    plans: Sequence[_Plan],
+    own: Sequence[Int[np.ndarray, " _"]],  # each of its own length
     vocab_size: int,
     cache: str | Path,
     start: int,
     held_out: bool,
-    rows: Int[np.ndarray, " n"],
 ) -> Iterator[Batch]:
-    parts = (
-        data.sources
-        if isinstance(data, tcfg.MixtureConfig)
-        else (tcfg.Weighted(weight=1, source=data),)
-    )
-    counts = apportion([p.weight for p in parts], config.batch)
-    for p, n in zip(parts, counts, strict=True):
-        if not n:
-            raise ValueError(
-                f"a batch of {config.batch} rows has no room for a source of weight "
-                f"{p.weight / sum(q.weight for q in parts):.3g}"
-            )
-    seed = (config.seed, int(held_out))
-    streams = [
-        sources.build(p.source, config, vocab_size, cache, (*seed, k))
-        for k, p in enumerate(parts)
-    ]
+    """Yield batch after batch from `start` on, by `plans`, of which this process reads
+    `own` rows of each plan's: found by the caller, under the mesh in force, which the
+    thread that reads the batches (`prefetch`) is not under."""
+    seed = (plans[0].config.seed, int(held_out))
+    streams: dict[int, Source] = {}
+    for plan in plans:
+        for n, p in zip(plan.streams, _parts(plan.config.data), strict=True):
+            if n not in streams:
+                streams[n] = sources.build(
+                    p.source, plan.config, vocab_size, cache, (*seed, n)
+                )
+    starts = [plan.start for plan in plans]
     for i in itertools.count(start):
-        batch = _read(streams, counts, i, rows, config.seq_len)
+        k = bisect.bisect_right(starts, i) - 1
+        plan = plans[k]
+        at = i - plan.start
+        firsts = [b + at * n for b, n in zip(plan.before, plan.counts, strict=True)]
+        parts = [streams[n] for n in plan.streams]
+        batch = _read(parts, plan.counts, firsts, own[k], plan.config.seq_len)
         if (top := int(batch.input_ids.max())) >= vocab_size:
             raise ValueError(
                 f"token id {top} is outside the vocabulary of {vocab_size}"
@@ -422,21 +511,21 @@ def _batches(
 def _read(
     streams: Sequence[Source],
     counts: Sequence[int],
-    i: int,
+    firsts: Sequence[int],
     rows: Int[np.ndarray, " n"],
     seq_len: int,
 ) -> Batch:
-    """Batch i, `counts[k]` rows of each stream in turn, of which only `rows` are read;
-    the others stay 0."""
+    """A batch of `counts[k]` rows of each stream in turn, from its row `firsts[k]`, of
+    which only `rows` are read; the others stay 0."""
     shape = (sum(counts), seq_len)
     batch = Batch(
         np.zeros(shape, np.int32), np.zeros(shape, np.int32), np.zeros(shape, bool)
     )
     first = 0  # the stream's first row in the batch
-    for stream, n in zip(streams, counts, strict=True):
+    for stream, n, start in zip(streams, counts, firsts, strict=True):
         own = rows[(first <= rows) & (rows < first + n)] - first
         for at, m in _runs(own):
-            for whole, part in zip(batch, stream.rows(i * n + at, m), strict=True):
+            for whole, part in zip(batch, stream.rows(start + at, m), strict=True):
                 whole[first + at : first + at + m] = part
         first += n
     return batch

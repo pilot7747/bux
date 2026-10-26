@@ -232,8 +232,8 @@ class MoEConfig(Config):
     type: Literal["moe"] = "moe"
     num_experts: int  # Routed experts.
     top_k: int  # Routed experts each token goes through.
-    # Each routed expert: its type, intermediate_size and activation, and limit and
-    # up_softcap. Routed experts have no bias or dropout.
+    # Each routed expert: its type, intermediate_size and activation, its limit,
+    # up_softcap and up_offset, and its biases. Routed experts have no dropout.
     expert: MLPConfig
     # Experts every token goes through, run as one MLP of num_shared_experts times
     # the shared expert's intermediate_size.

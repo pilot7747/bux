@@ -30,10 +30,12 @@ call against them.
 | {py:mod}`bux.config` | The layers' configs, as plain pydantic data |
 | {py:mod}`bux.initializers` | How weight matrices start, by the model's `init` and each one's role |
 | {py:mod}`bux.architecture` | The reference Flax NNX backend: layers, kernels, residual algebras, repeats |
+| {py:mod}`bux.export` | Exporting models to transformers, with their weights, and checking them |
 | {py:mod}`bux.train` | Training configs, the trainer, optimizers, objectives, hooks, sinks |
 | {py:mod}`bux.parallel` | The mesh, the layout, and the methods of each kind of parallelism |
 | {py:mod}`bux.data` | Tokenizing, shuffling and packing documents into rows |
 | {py:mod}`bux.launch` | The launcher: sweeps over GPUs, status, signals, many hosts |
+| {py:mod}`bux.search` | Hyperparameter search: dimensions' coordinates, GP, TPE and quasi-random methods, halving, a search's trials |
 | {py:mod}`bux.softmax` | A softmax and log-softmax whose gradients hold where a float rounds a probability to 1 |
 | {py:mod}`bux.runtime` | The process's JAX and XLA settings, and the compile cache |
 | {py:mod}`bux.kernels` | Turning GPU kernels off, to debug one |
@@ -49,10 +51,12 @@ call against them.
    bux.config
    bux.initializers
    bux.architecture
+   bux.export
    bux.train
    bux.parallel
    bux.data
    bux.launch
+   bux.search
    bux.softmax
    bux.runtime
    bux.kernels

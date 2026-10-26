@@ -43,11 +43,13 @@ def registries() -> list[Registry]:
             continue
     from bux.architecture.precision import matmuls
     from bux.parallel import methods
+    from bux.search import methods as search
     from bux.train import data, optim
 
     found = [v for v in vars(methods).values() if isinstance(v, Registry)]
-    found += [optim.optimizers, optim.schedules, optim.ns_coefficients]
-    return [*found, data.sources, matmuls.formats]
+    found += [optim.optimizers, optim.schedules]
+    found += [optim.ns_coefficients, optim.ns_algorithms]
+    return [*found, data.sources, matmuls.formats, search.methods]
 
 
 def from_tests(builder: object) -> bool:

@@ -266,3 +266,7 @@ the batch. So:
   stopped ([Resuming](../training/launching.md#resuming));
 - an eval's batches are drawn from a stream of their own, independently of
   training's, and are the same at every eval.
+
+Under a curriculum or a batch ramp, `n` changes from one stretch of steps to the next,
+and each source goes on from the row the stretches before left it at, where it is
+read at the same `seq_len` ([What each phase reads](../training/curriculum.md#what-each-phase-reads)).

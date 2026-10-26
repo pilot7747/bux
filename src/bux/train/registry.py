@@ -14,8 +14,9 @@ optimizer is a function, not a fork::
 
 A new tag needs its config in `bux.train.config` too, where the compiler finds it.
 The registries of training are `bux.train.optim.schedules`,
-`bux.train.optim.optimizers`, `bux.train.optim.ns_coefficients` and
-`bux.train.data.sources`; `bux.parallel.methods` holds one per kind of method.
+`bux.train.optim.optimizers`, `bux.train.optim.ns_coefficients`,
+`bux.train.optim.ns_algorithms` and `bux.train.data.sources`; `bux.parallel.methods`
+holds one per kind of method.
 """
 
 from collections.abc import Callable
@@ -49,10 +50,10 @@ class Registry[T]:
         schedules = Registry[Schedule]("schedule", "bux.train.optim.schedules")
 
         @schedules.register("constant")
-        def _(c: ConstantSchedule, steps: int) -> Schedule:
+        def _(c: ConstantSchedule, train: TrainConfig) -> Schedule:
             return lambda step: jnp.asarray(1.0)
 
-        curve = schedules.build(ConstantSchedule(), 1000)
+        curve = schedules.build(run.train.schedule, run.train)
     """
 
     def __init__(self, kind: str, where: str):

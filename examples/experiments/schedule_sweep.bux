@@ -1,0 +1,17 @@
+# A schedule ablation: one model and budget, under the learning-rate schedules of
+# five tech reports, from examples/experiments/recipes/lr_schedules.bux, and the
+# recipe's own 1 - sqrt WSD. Their pieces are shares of the run, so they follow the
+# budget's steps.
+use llama3_8b
+use fineweb_wsd
+use lr_schedules
+
+d_model = 768
+ffn.intermediate_size = 2048
+attn.num_heads    = 12
+attn.num_kv_heads = 4
+model = embed block^12 norm head(tied=true)
+
+schedule = wsd(warmup=1k, decay=0.2, shape=sqrt) | deepseek_v3 | kimi_k2 | olmo_2
+         | d2z | deepseek_llm
+budget = 3B

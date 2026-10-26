@@ -82,6 +82,13 @@ def test_in_microbatches_a_device_sends_its_share_of_a_microbatchs_tokens():
         assert tokens == 16 * 16 // 8 // 2
 
 
+def test_a_device_has_room_for_the_largest_steps_of_a_curriculum():
+    source = SOURCE.format(dispatch="", batch=8, microbatches=1)
+    [run] = compile_runs(source + "curriculum = phase(at=1, seq_len=32)\n")
+    with _use({"data": 2, "expert": 4}):
+        assert nccl_ep._tokens_a_device(run, ("expert",)) == 8 * 32 // 8
+
+
 def test_in_chunks_a_device_sends_a_chunk_of_its_share_at_once():
     with _use({"data": 2, "expert": 4}, chunks=4):
         assert nccl_ep._tokens_a_device(_run(), ("expert",)) == 8 * 16 // 8 // 4

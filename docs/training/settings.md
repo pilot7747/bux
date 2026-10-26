@@ -35,10 +35,12 @@ shows them on hover and completes them, as it does for layers
 | `tokenizer` | {bux}`tokenizer`, or `none` | `none` | the tokenizer of `text` and `chat` documents; required with them |
 | `packing` | {bux}`concat`, {bux}`greedy` or {bux}`best_fit` | `best_fit` | how documents become rows ([Packing](../data/packing.md)) |
 | `optimizer` | {bux}`adamw` or {bux}`muon` | required | the update rule ([Optimizers](optimizers.md)) |
-| `schedule` | {bux}`constant`, {bux}`cosine` or {bux}`wsd` | `constant` | what multiplies the learning rate at each step ([Schedules](optimizers.md#schedules)) |
+| `schedule` | {bux}`constant`, {bux}`cosine`, {bux}`wsd`, {bux}`linear_decay`, {bux}`multistep`, {bux}`power` or {bux}`piecewise` | `constant` | what multiplies the learning rate at each step ([Schedules](optimizers.md#schedules)) |
 | `seq_len` | an integer, at least 2 | required | tokens a row |
 | `batch` | a positive integer | required | rows a step |
+| `batch_ramp` | {bux}`ramp`, or `none` | `none` | a smaller batch at the first step that grows to `batch` ([Batch ramps](curriculum.md#batch-ramps)) |
 | `steps` | a positive integer | required | optimizer steps |
+| `curriculum` | {bux}`phase`, or a list of them | `[]` | phases that change `seq_len`, `batch` or `data` from a step on ([Curriculum](curriculum.md)) |
 | `seed` | an integer | `0` | the model's initial weights, the order of the data, and every random stream |
 | `clip` | a number, or `none` | `1.0` | the global norm gradients are clipped to ([Clipping](optimizers.md#clipping)) |
 | `loss` | {bux}`loss` | `loss` | the weights of the z-loss and of multi-token prediction ([The loss](optimizers.md#the-loss)) |
@@ -160,7 +162,11 @@ Some fields check their values further:
 | `roles.experts` of `precision` | `compute`, `mxfp8` or `mxfp8_2d`: the formats a grouped GEMM takes |
 | `options` of `compiler` | each option written `--name=value` |
 | `switch.at` of `precision` | strictly between 0 and 1 |
-| `decay` of `wsd` | between 0 and 1 |
+| `decay` of `wsd` and `power` | between 0 and 1 |
+| `warmup` of a schedule | a count of steps, or a share of them between 0 and 1 |
+| `pieces` of `piecewise` | each ending later than the one before, the last at 1 |
+| `shape=geometric` | a cooldown or piece that starts and ends above 0 |
+| `at` of `phase` | a step above 0, or a share strictly between 0 and 1 |
 
 ```console
 $ bux check examples/experiments/smoke.bux 'precision = precision(matmuls=nvfp4, roles=roles(experts=nvfp4))'
@@ -173,8 +179,9 @@ error: roles: experts: Value error, the routed experts multiply in compute, mxfp
 
 ### Settings that must fit together
 
-The warmup and the cooldown fit in the steps. The error points into the module that
-wrote the schedule:
+The warmup and the cooldown fit in the steps: the cooldown of `wsd` and `power`, and
+the pieces of `piecewise` after its first, which starts at the warmup's end. The
+error points into the module that wrote the schedule:
 
 ```console
 $ bux check examples/experiments/attention_ablation.bux steps=50
@@ -185,7 +192,10 @@ error: the schedule takes 1010 steps (1000 of warmup and 10 of cooldown), but th
    |             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
 ```
 
-`text` and `chat` documents, in `data` or in `eval`, need a tokenizer:
+A curriculum's phases start in order inside the run, and a batch ramp grows to the
+run's batch before any phase sets another ([Checks](curriculum.md#checks)).
+
+`text` and `chat` documents, in `data`, in `eval` or in a phase, need a tokenizer:
 
 ```console
 $ bux check notok.bux

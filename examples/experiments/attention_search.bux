@@ -1,0 +1,32 @@
+# MHA, GQA or MQA, each at its own best learning rate and weight decay? A search of
+# 27 trials for each attention, by a Gaussian process, short runs first: every trial
+# trains a ninth of the tokens, the best third of them a third, the best of those all.
+#
+#   bux check  examples/experiments/attention_search.bux
+#   bux launch examples/experiments/attention_search.bux
+#   bux results examples/experiments/attention_search.bux
+use llama3_8b
+use fineweb_wsd
+
+d_model = 768
+ffn.intermediate_size = 2048
+model = embed block^12 norm head(tied=true)
+
+attn.num_heads    = 12
+attn.num_kv_heads = mha: 12 | gqa: 4 | mqa: 1
+budget            = 3B
+
+# The dimensions of each search.
+optimizer.lr           = log_uniform(1e-4, 1e-2)
+optimizer.weight_decay = uniform(0, 0.2)
+
+# Held-out web text and code, and what the search minimizes: their bits per byte,
+# weighted as the data is.
+data = 0.8 * web(split=[0, 0.999]) + 0.2 * code(split=[0, 0.999])
+eval = [eval(name="web", data=web(split=[0.999, 1]), every=1k),
+        eval(name="code", data=code(split=[0.999, 1]), every=1k)]
+objective = 0.8 * web_bpb + 0.2 * code_bpb
+
+search = search(method=gp, trials=27, halving=halving(eta=3, rungs=3))
+# A short run is the long one shrunk: its warmup too, a share of its steps.
+schedule.warmup = 0.15

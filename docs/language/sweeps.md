@@ -143,11 +143,30 @@ Only alternatives that a run reaches make runs:
   'optimizer.lr = 1e-2'` is three runs at 1e-2, named for the attention alone. The
   axis is dropped where every run it would make is the same as its first.
 
+## Dimensions: a search instead of a grid
+
+An alternative is one value of an axis, and a sweep trains them all. A distribution
+is a dimension of a search, whose method picks the values its trials take, from how
+the trials before them did ([Searching hyperparameters](../training/searching.md)):
+
+```bux
+optimizer.lr           = log_uniform(1e-4, 1e-2)   # a number on a log scale
+optimizer.weight_decay = uniform(0, 0.2)           # a number
+schedule.warmup        = int_uniform(100, 2k)      # an integer
+ffn.activation         = choice(swish, gelu)       # an option: values, settings or blocks
+objective              = 0.8 * web_bpb + 0.2 * code_bpb
+```
+
+A dimension is named as an unlabeled alternative is, by where it is written, and a
+macro's takes the same value at every call. A file with both is a search for each run
+of its sweep: `attn.num_kv_heads = mha: 12 | mqa: 1` with a dimension is two searches.
+Outside a search, `bux check`, `bux plan` and `bux fmt` show a dimension at its middle.
+
 ## Checking a sweep
 
 `bux check` and the editor check every alternative once, with the others at their
-first. So an error in any alternative is reported, without compiling every
-combination:
+first, and every dimension at both its ends. So an error in any alternative is
+reported, without compiling every combination:
 
 ```text
 error: gqa: num_kv_heads: Input should be a valid integer, got a number with a fractional part

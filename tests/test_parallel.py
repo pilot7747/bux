@@ -70,9 +70,11 @@ def test_a_run_trains_the_same_split_over_devices(losses, arch, mesh):
     assert np.allclose(losses(source, mesh=mesh), losses(source, mesh=ONE), atol=1e-5)
 
 
+@pytest.mark.parametrize("algorithm", ["standard", "gram"])
 @pytest.mark.parametrize("mesh", MESHES)
-def test_muon_trains_the_same_split_over_devices(losses, mesh):
-    muon = "muon(lr=0.02, ns_dtype=float32)"  # bfloat16 rounds a split apart
+def test_muon_trains_the_same_split_over_devices(losses, mesh, algorithm):
+    # bfloat16 rounds a split apart
+    muon = f"muon(lr=0.02, ns_dtype=float32, ns_algorithm={algorithm})"
     one = losses(ARCHITECTURES["moe"], mesh=ONE, optimizer=muon)
     split = losses(ARCHITECTURES["moe"], mesh=mesh, optimizer=muon)
     assert np.allclose(split, one, atol=1e-5)
@@ -316,7 +318,7 @@ def _run(arch: str, *settings: str):
 def _trainer(run):
     t = run.train
     model = parallel.build(lambda: Model(run.arch, rngs=nnx.Rngs(0)))
-    tx = optimizer(t.optimizer, lr_multiplier(t.schedule, t.steps), model, t.clip)
+    tx = optimizer(t.optimizer, lr_multiplier(t), model, t.clip)
     return Trainer(model, tx, objective(t.loss, run.arch))
 
 

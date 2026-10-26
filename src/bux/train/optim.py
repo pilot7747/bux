@@ -1,10 +1,10 @@
 """Learning-rate schedules and optimizers, built from their configs with optax.
 
 Each is found by its config's type: a schedule in `schedules`, an optimizer in
-`optimizers`. A schedule's builder gets the config and the run's steps, and returns
-its curve after the warmup; an optimizer's gets the config, the schedule's multiplier
-and the model, and returns an optax transformation. A builder registered under a
-taken name replaces bux's own::
+`optimizers`. A schedule's builder gets the config and the run's training settings,
+and returns its curve after the warmup; an optimizer's gets the config, the
+schedule's multiplier and the model, and returns an optax transformation. A builder
+registered under a taken name replaces bux's own::
 
     @optimizers.register("adamw")
     def _(c: tcfg.AdamWConfig, multiplier: Schedule, model: nnx.Module):
@@ -19,9 +19,11 @@ Muon orthogonalizes its updates by the run's ``orthogonalize`` method
 (`bux.parallel.methods`): ``gspmd`` on whatever shards the compiler gives them,
 ``gather``, each matrix whole on every device that holds it, or ``owner``, each
 matrix whole on one device. Its Newton-Schulz's coefficients are found by name in
-`ns_coefficients`, a builder that gets the number of iterations.
+`ns_coefficients`, a builder that gets the number of iterations, and how it iterates
+in `ns_algorithms`: the standard iteration, or Gram's.
 """
 
+import itertools
 import math
 import typing
 from collections.abc import Callable, Sequence
@@ -36,13 +38,18 @@ from jax.sharding import PartitionSpec as P
 from jax.typing import DTypeLike
 from jaxtyping import Array, ArrayLike, Float, PyTree, Real, Shaped
 from optax.contrib import MuonDimensionNumbers
-from optax.contrib._muon import orthogonalize_via_newton_schulz, scale_by_shape
+from optax.contrib._muon import (
+    _compute_muon_reshape,
+    orthogonalize_via_newton_schulz,
+    scale_by_shape,
+)
 
 from bux import parallel
 from bux.architecture import Scanned
 from bux.parallel import methods
 from bux.parallel.layout import Split, as_split, partition
 from bux.train import config as tcfg
+from bux.train import curriculum
 from bux.train.registry import Registry
 
 #: A value at each step, counted from 0, as a learning rate or its multiplier.
@@ -51,7 +58,8 @@ Schedule = Callable[[Real[ArrayLike, ""]], Float[Array, ""]]
 NewtonSchulz = Callable[[Float[Array, "*m"], MuonDimensionNumbers], Float[Array, "*m"]]
 
 #: The schedules, by the ``type`` of their config. A builder gets the config and the
-#: run's steps, and returns the multiplier's curve after the warmup.
+#: run's training settings (its steps, batch and peak), and returns the multiplier's
+#: curve after the warmup.
 schedules = Registry[Schedule]("schedule", "bux.train.optim.schedules")
 #: The optimizers, by the ``type`` of their config. A builder gets the config, the
 #: schedule's multiplier and the model, and returns an optax transformation.
@@ -64,38 +72,45 @@ optimizers = Registry[optax.GradientTransformation](
 ns_coefficients = Registry[Float[Array, "*steps 3"]](
     "set of Newton-Schulz coefficients", "bux.train.optim.ns_coefficients"
 )
+#: Newton-Schulz's ways to iterate, by name. A builder gets the number of
+#: iterations, their quintics (from `ns_coefficients`) and the iterations after
+#: which Gram's restarts, and returns the `NewtonSchulz`.
+ns_algorithms = Registry[NewtonSchulz](
+    "Newton-Schulz algorithm", "bux.train.optim.ns_algorithms"
+)
 
 
 # --- Schedules --------------------------------------------------------------------------
 
 
-def lr_multiplier(config: tcfg.ScheduleConfig, steps: int) -> Schedule:
+def lr_multiplier(train: tcfg.TrainConfig) -> Schedule:
     """Return the multiplier of the peak learning rate, from 0 to 1, at each step of a
-    run of `steps`: a linear warmup, times the schedule's own curve.
+    run: a linear warmup, times the curve of its schedule.
 
     The warmup rises from ``1 / warmup`` at step 0 to 1 at step ``warmup - 1``.
 
     Args:
-        config: The run's ``schedule`` setting.
-        steps: The run's steps.
+        train: The run's training settings: its ``schedule``, built by its builder
+            in `schedules`, and the ``steps``, batch and peak it is built for.
 
     Returns:
         The multiplier at each step, counted from 0.
 
     Raises:
-        NotImplementedError: If no schedule is registered under the config's type.
+        NotImplementedError: If no schedule is registered under the schedule's type.
 
     Example::
 
-        >>> m = lr_multiplier(WSDSchedule(warmup=10, decay=0.2), steps=100)
+        >>> m = lr_multiplier(run.train)  # schedule = wsd(warmup=0.1), steps = 100
         >>> [round(float(m(s)), 2) for s in (0, 9, 50, 89, 99)]
         [0.1, 1.0, 1.0, 0.5, 0.0]
     """
-    curve = schedules.build(config, steps)
+    curve = schedules.build(train.schedule, train)
+    warmup = tcfg.warmup_steps(train.schedule, train.steps)
 
     def multiplier(step: Real[ArrayLike, ""]) -> Float[Array, ""]:
         step = jnp.asarray(step, jnp.float32)
-        warm = jnp.minimum((step + 1) / config.warmup, 1.0) if config.warmup else 1.0
+        warm = jnp.minimum((step + 1) / warmup, 1.0) if warmup else 1.0
         return jnp.asarray(warm * curve(step))
 
     return multiplier
@@ -107,41 +122,129 @@ def lr_schedule(lr: float, multiplier: Schedule) -> Schedule:
     return lambda step: lr * multiplier(step)
 
 
+#: The curves of a cooldown or a piece by its ``shape``, from 1 at t = 0 to 0 at
+#: t = 1. ``exp`` is IBM's: an exponential that falls by e over the cooldown, moved
+#: to end at 0. ``geometric`` is not one of them: it depends on where it ends.
+SHAPES: dict[str, Callable[[Float[Array, ""]], Float[Array, ""]]] = {
+    "linear": lambda t: 1 - t,
+    "sqrt": lambda t: 1 - jnp.sqrt(t),
+    "cosine": lambda t: 0.5 * (1 + jnp.cos(math.pi * t)),
+    "exp": lambda t: (jnp.exp(-t) - math.exp(-1)) / (1 - math.exp(-1)),
+    "constant": lambda t: jnp.where(t > 0, 0.0, 1.0),
+}
+
+
+def _through(step: Real[ArrayLike, ""], start: int, length: int) -> Float[Array, ""]:
+    """Return how far `step` is through the `length` steps from `start`: 0 before
+    them, 1 at the last of them."""
+    return jnp.clip((step + 1 - start) / max(length, 1), 0, 1)
+
+
+def _toward(
+    start: float, end: float, shape: tcfg.Shape, t: Float[Array, ""]
+) -> Float[Array, ""]:
+    """Return the multiplier `t` of the way from `start` to `end` along `shape`."""
+    if shape == "geometric":
+        return start * (end / start) ** t
+    return end + (start - end) * SHAPES[shape](t)
+
+
 @schedules.register("constant")
-def _(c: tcfg.ConstantSchedule, steps: int) -> Schedule:
+def _(c: tcfg.ConstantSchedule, train: tcfg.TrainConfig) -> Schedule:
     """The peak learning rate at every step after the warmup."""
     return lambda step: jnp.asarray(1.0)
 
 
 @schedules.register("cosine")
-def _(c: tcfg.CosineSchedule, steps: int) -> Schedule:
+def _(c: tcfg.CosineSchedule, train: tcfg.TrainConfig) -> Schedule:
     """A cosine decay from the peak after the warmup to `final` times it at the last
-    step."""
+    step, or at the `horizon` of the steps."""
+    steps, warmup = round(c.horizon * train.steps), tcfg.warmup_steps(c, train.steps)
 
     def curve(step: Real[ArrayLike, ""]) -> Float[Array, ""]:
-        t = jnp.clip((step + 1 - c.warmup) / max(steps - c.warmup, 1), 0, 1)
+        t = jnp.clip((step + 1 - warmup) / max(steps - warmup, 1), 0, 1)
         return c.final + (1 - c.final) * 0.5 * (1 + jnp.cos(math.pi * t))
 
     return curve
 
 
-#: The curves of a ``wsd`` cooldown by its ``shape``, from 1 at t = 0 to 0 at t = 1.
-COOLDOWNS: dict[str, Callable[[Float[Array, ""]], Float[Array, ""]]] = {
-    "linear": lambda t: 1 - t,
-    "sqrt": lambda t: 1 - jnp.sqrt(t),
-    "cosine": lambda t: 0.5 * (1 + jnp.cos(math.pi * t)),
-}
-
-
 @schedules.register("wsd")
-def _(c: tcfg.WSDSchedule, steps: int) -> Schedule:
+def _(c: tcfg.WSDSchedule, train: tcfg.TrainConfig) -> Schedule:
     """Warmup-stable-decay: the peak until the last `decay` of the steps, then a
     cooldown of `shape` to `final` times the peak at the last step."""
-    cooldown = c.cooldown(steps)
+    cooldown = c.cooldown(train.steps)
+    start = train.steps - cooldown
+    return lambda step: _toward(1.0, c.final, c.shape, _through(step, start, cooldown))
+
+
+@schedules.register("linear_decay")
+def _(c: tcfg.LinearDecaySchedule, train: tcfg.TrainConfig) -> Schedule:
+    """A linear decay from the peak after the warmup to `final` times it at the last
+    step."""
+    warmup = tcfg.warmup_steps(c, train.steps)
+    length = train.steps - warmup
+    return lambda step: _toward(1.0, c.final, "linear", _through(step, warmup, length))
+
+
+@schedules.register("multistep")
+def _(c: tcfg.MultiStepSchedule, train: tcfg.TrainConfig) -> Schedule:
+    """The peak, times `factor` from each of the steps at the shares `at` of the run
+    on."""
+    drops = jnp.asarray([round(a * train.steps) for a in c.at], jnp.float32)
+    return lambda step: jnp.asarray(c.factor) ** jnp.sum(step >= drops)
+
+
+@schedules.register("power")
+def _(c: tcfg.PowerSchedule, train: tcfg.TrainConfig) -> Schedule:
+    """IBM's Power scheduler: `a` times the step's batch times the tokens trained to
+    the `b`, over the peak and at most 1, held through the warmup at its last step's;
+    then a cooldown of `shape` from where it is to `final` times that. The tokens and
+    the batch follow the run's batch ramp and curriculum."""
+    cooldown = c.cooldown(train.steps)
+    start, warmup = train.steps - cooldown, tcfg.warmup_steps(c, train.steps)
+    parts = curriculum.stretches(train)
+    each = [s.config.batch * s.config.seq_len for s in parts]  # tokens a step
+    through = itertools.accumulate(
+        (s.stop - s.start) * n for s, n in zip(parts, each, strict=True)
+    )
+    firsts = jnp.asarray([s.start for s in parts], jnp.float32)
+    rows = jnp.asarray([s.config.batch for s in parts], jnp.float32)
+    tokens = jnp.asarray(each, jnp.float32)
+    before = jnp.asarray([0, *list(through)[:-1]], jnp.float32)
+
+    def power(step: Float[Array, ""]) -> Float[Array, ""]:
+        step = jnp.clip(step, warmup - 1, start - 1)
+        k = jnp.searchsorted(firsts, step, side="right") - 1
+        n = before[k] + (step - firsts[k] + 1) * tokens[k]
+        return jnp.minimum(c.a * rows[k] * n**c.b / train.optimizer.lr, 1.0)
 
     def curve(step: Real[ArrayLike, ""]) -> Float[Array, ""]:
-        t = jnp.clip((step + 1 - (steps - cooldown)) / max(cooldown, 1), 0, 1)
-        return c.final + (1 - c.final) * COOLDOWNS[c.shape](t)
+        step = jnp.asarray(step, jnp.float32)
+        return power(step) * _toward(
+            1.0, c.final, c.shape, _through(step, start, cooldown)
+        )
+
+    return curve
+
+
+@schedules.register("piecewise")
+def _(c: tcfg.PiecewiseSchedule, train: tcfg.TrainConfig) -> Schedule:
+    """Its pieces one after the other from the end of the warmup, each from where the
+    one before ends, the first from the peak, to its `to` along its `shape`."""
+    ends = [round(p.until * train.steps) for p in c.pieces]
+    starts = [tcfg.warmup_steps(c, train.steps), *ends[:-1]]
+    values = tcfg.levels(c.pieces)
+
+    def curve(step: Real[ArrayLike, ""]) -> Float[Array, ""]:
+        step = jnp.asarray(step, jnp.float32)
+        each = [
+            _toward(values[k], values[k + 1], p.shape, _through(step, b, e - b))
+            for k, (p, b, e) in enumerate(zip(c.pieces, starts, ends, strict=True))
+        ]
+        found = each[0]
+        for b, value in zip(starts[1:], each[1:], strict=True):
+            found = jnp.where(step >= b, value, found)
+        return found
 
     return curve
 
@@ -178,7 +281,7 @@ def optimizer(
 
     Example::
 
-        multiplier = lr_multiplier(run.train.schedule, run.train.steps)
+        multiplier = lr_multiplier(run.train)
         tx = optimizer(run.train.optimizer, multiplier, model, clip=1.0)
         trainer = Trainer(model, tx, objective(run.train.loss, run.arch))
     """
@@ -316,15 +419,15 @@ def muon(
     def shapes(updates: PyTree[Float[Array, "*_"]]) -> PyTree[MuonDimensionNumbers]:
         return jax.tree_util.tree_map_with_path(lambda p, _: dims[_keys(p)], updates)
 
+    ns = newton_schulz(
+        config.ns_steps,
+        config.ns_coefficients,
+        config.ns_algorithm,
+        config.ns_restarts,
+    )
     rule = optax.chain(
         momentum(config.momentum, config.nesterov),
-        orthogonalized(
-            config.ns_steps,
-            dims,
-            model,
-            coefficients=config.ns_coefficients,
-            dtype=config.ns_dtype,
-        ),
+        orthogonalized(ns, dims, model, dtype=config.ns_dtype),
         scale_by_shape(
             weight_dimension_numbers=shapes, consistent_rms=config.consistent_rms
         ),
@@ -369,19 +472,16 @@ def momentum(beta: float, nesterov: bool) -> optax.GradientTransformation:
 
 
 def orthogonalized(
-    steps: int,
+    newton_schulz: NewtonSchulz,
     dims: dict[tuple, MuonDimensionNumbers],
     model: nnx.Module,
-    coefficients: str = "jordan",
     dtype: DTypeLike = jnp.float32,
 ) -> optax.GradientTransformation:
     """Orthogonalize each update, a matrix or a stack of them as `dims` says by path,
-    with `steps` Newton-Schulz iterations of the quintics `coefficients` names, in
-    `dtype`, by the run's `orthogonalize` method. The method gets all of a step's
-    updates at once, so it can choose where each runs, and gets them in `dtype`, so
-    that what it moves is in it too."""
+    by `newton_schulz` (`newton_schulz`), in `dtype`, by the run's `orthogonalize`
+    method. The method gets all of a step's updates at once, so it can choose where
+    each runs, and gets them in `dtype`, so that what it moves is in it too."""
     model_params = nnx.state(model, nnx.Param)  # whose shardings the updates take
-    run = newton_schulz(steps, coefficients)
 
     def update(
         updates: PyTree[Float[Array, "*_"]],
@@ -396,7 +496,7 @@ def orthogonalized(
             [dims[k] for k in keys],
             None if shardings is None else [shardings[k] for k in keys],
             None if states is None else [states[k] for k in keys],
-            run,
+            newton_schulz,
         )
         cast = [y.astype(x.dtype) for y, (_, x) in zip(orthogonal, leaves, strict=True)]
         return jax.tree.unflatten(tree, cast)
@@ -404,17 +504,138 @@ def orthogonalized(
     return optax.stateless(update)
 
 
-def newton_schulz(steps: int, coefficients: str = "jordan") -> NewtonSchulz:
-    """Return optax's Newton-Schulz, with `steps` iterations of the quintics
-    `coefficients` names, in the dtype of the matrix it gets."""
+def newton_schulz(
+    steps: int,
+    coefficients: str = "jordan",
+    algorithm: str = "standard",
+    restarts: Sequence[int] | None = None,
+) -> NewtonSchulz:
+    """Return the Newton-Schulz that `algorithm` names in `ns_algorithms`, with
+    `steps` iterations of the quintics `coefficients` names in `ns_coefficients`,
+    for a matrix in the dtype it returns it in.
+
+    Args:
+        steps: The number of iterations.
+        coefficients: The name of their quintics.
+        algorithm: How it iterates: ``standard`` or ``gram``.
+        restarts: The iterations after which ``gram`` restarts; None, its own.
+
+    Returns:
+        A function of a matrix, or a stack of them as its dimension numbers say,
+        that orthogonalizes each.
+
+    Raises:
+        NotImplementedError: If either name is not registered.
+    """
     coeffs = ns_coefficients.find(coefficients)(steps)
+    return ns_algorithms.find(algorithm)(steps, coeffs, restarts)
+
+
+@ns_algorithms.register("standard")
+def standard(
+    steps: int,
+    coefficients: Float[Array, "*steps 3"],
+    restarts: Sequence[int] | None = None,
+) -> NewtonSchulz:
+    """optax's iteration of the quintics on the matrix itself: three products an
+    iteration, two of them by the matrix. It has no restarts."""
 
     def orthogonal(
         x: Float[Array, "*m"], dims: MuonDimensionNumbers
     ) -> Float[Array, "*m"]:
-        return orthogonalize_via_newton_schulz(x, coeffs, steps, dimension_numbers=dims)
+        return orthogonalize_via_newton_schulz(
+            x, coefficients, steps, dimension_numbers=dims
+        )
 
     return orthogonal
+
+
+@ns_algorithms.register("gram")
+def gram(
+    steps: int,
+    coefficients: Float[Array, "*steps 3"],
+    restarts: Sequence[int] | None = None,
+) -> NewtonSchulz:
+    """Gram Newton-Schulz (Zhang, Amsel, Chen and Dao, 2026): the same quintics,
+    iterated on the Gram matrix of the matrix's shorter side, with products by the
+    matrix only to start, at each restart and at the end. It restarts from the
+    matrix so far after each iteration in `restarts`, before the Gram matrix's
+    rounding grows: by default after the second and every third after it (2, 5, 8,
+    ...), which keeps 4 to 12 iterations of either quintic about as near orthogonal
+    as the standard's. On a matrix too near square for Gram's to save products, it
+    runs the standard iteration.
+
+    It normalizes in float32 and iterates a matrix of 16 bits in float16, as its
+    authors do: bfloat16 rounds the Gram matrix too coarsely."""
+    quintics = jnp.broadcast_to(coefficients, (steps, 3))
+    restarts = range(2, steps, 3) if restarts is None else restarts
+    ends = [0, *sorted({i for i in restarts if 0 < i < steps}), steps]
+    runs = [quintics[i:j] for i, j in itertools.pairwise(ends)]
+    fallback = standard(steps, coefficients)
+
+    def orthogonal(
+        x: Float[Array, "*m"], dims: MuonDimensionNumbers
+    ) -> Float[Array, "*m"]:
+        flat, back = _compute_muon_reshape(x, dims)
+        matrices = flat(x)
+        wide = matrices.shape[-2] <= matrices.shape[-1]
+        matrices = matrices if wide else matrices.mT
+        if not _gram_saves(*matrices.shape[-2:], steps, len(runs)):
+            return fallback(x, dims)
+        y = _normalized(matrices)
+        for run in runs:
+            y = _gram_run(y @ y.mT, run) @ y
+        y = y.astype(x.dtype)
+        return back(y if wide else y.mT)
+
+    return orthogonal
+
+
+def _gram_saves(m: int, n: int, steps: int, runs: int) -> bool:
+    """Whether `runs` of Gram's iterations of an m×n matrix, m ≤ n, multiply less
+    than the standard iteration's ``steps (m³ + 2 m²n)``, every product computed
+    whole: each run takes ``4 length - 3`` products of m×m matrices, and two by the
+    matrix."""
+    return (4 * steps - 3 * runs) * m + 2 * runs * n < steps * (m + 2 * n)
+
+
+def _normalized(x: Float[Array, "b m n"]) -> Float[Array, "b m n"]:
+    """Each matrix of `x` over its Frobenius norm, in float32, then in what Gram's
+    iteration runs in: float16 for 16 bits."""
+    dtype = jnp.float16 if jnp.finfo(x.dtype).bits == 16 else x.dtype
+    x = x.astype(jnp.promote_types(x.dtype, jnp.float32))
+    return (x / (jnp.linalg.norm(x, axis=(-2, -1), keepdims=True) + 1e-8)).astype(dtype)
+
+
+def _gram_run(
+    r: Float[Array, "b m m"], quintics: Float[Array, "steps 3"]
+) -> Float[Array, "b m m"]:
+    """Return the Q of a run of Gram iterations from the Gram matrix `r`, from Q = I:
+    with ``Z = b R + c R²``, ``Q ← Q Z + a Q`` and ``R ← (Z + a I) R (Z + a I)``,
+    Zhang et al.'s stabilized iteration. It adds each ``a`` in float32 before the
+    product rounds: Z rounded with ``a I`` would lose it, and a product rounded
+    before ``a`` is added would lose what cancels."""
+    (a, b, c), *rest = quintics
+    z = (r @ r) * c.astype(r.dtype) + r * b.astype(r.dtype)
+    q = (z + a * jnp.eye(r.shape[-1], dtype=jnp.float32)).astype(r.dtype)
+    for next_a, b, c in rest:
+        rz = _plus(r, z, r, a)
+        r = _plus(z, rz, rz, a)
+        a, z = next_a, (r @ r) * c.astype(r.dtype) + r * b.astype(r.dtype)
+        q = _plus(q, z, q, a)
+    return q
+
+
+def _plus(
+    x: Float[Array, "*b m k"],
+    y: Float[Array, "*b k n"],
+    plus: Float[Array, "*b m n"],
+    by: Float[ArrayLike, ""],
+) -> Float[Array, "*b m n"]:
+    """``x y + by plus``, summed in float32 and rounded to x's dtype once, as a GEMM's
+    epilogue adds."""
+    xy = jnp.matmul(x, y, preferred_element_type=jnp.float32)
+    return (xy + plus.astype(jnp.float32) * by).astype(x.dtype)
 
 
 @ns_coefficients.register("jordan")

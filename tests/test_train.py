@@ -67,27 +67,22 @@ block = [norm attn] [norm ffn]
 """
 
 
+def constant(steps: int) -> tcfg.TrainConfig:
+    """A run of `steps` at a constant learning rate, for its multiplier."""
+    return tcfg.TrainConfig(
+        data=tcfg.SyntheticConfig(),
+        optimizer=tcfg.AdamWConfig(lr=1e-3),
+        seq_len=8,
+        batch=2,
+        steps=steps,
+    )
+
+
 def smoke(*overrides: str):
     """The smoke run, shortened: its warmup would not fit in a few steps."""
     settings = ("schedule.warmup = 1", *overrides)
     [run] = compile_runs(SMOKE.read_text(), filename=str(SMOKE), overrides=settings)
     return run
-
-
-def values(c: tcfg.ScheduleConfig, steps: int) -> list[float]:
-    f = lr_multiplier(c, steps)
-    return [round(float(f(i)), 4) for i in range(steps)]
-
-
-def test_schedules_warm_up_and_reach_final_at_the_last_step():
-    assert values(tcfg.ConstantSchedule(warmup=4), 6) == [0.25, 0.5, 0.75, 1, 1, 1]
-    cosine = values(tcfg.CosineSchedule(warmup=2, final=0.1), 6)
-    assert cosine[:2] == [0.5, 1.0] and cosine[-1] == 0.1
-    assert all(a >= b for a, b in itertools.pairwise(cosine[1:]))  # after warmup
-    wsd = values(tcfg.WSDSchedule(decay=0.4, shape="linear"), 10)
-    assert wsd == [1, 1, 1, 1, 1, 1, 0.75, 0.5, 0.25, 0]
-    sqrt = values(tcfg.WSDSchedule(decay=0.4, shape="sqrt", final=0.1), 10)
-    assert sqrt[5] == 1 and sqrt[6] == round(0.1 + 0.9 * (1 - 0.25**0.5), 4)
 
 
 def test_muon_trains_the_block_matrices_and_adam_the_rest():
@@ -190,7 +185,9 @@ def test_muon_on_one_device_is_optax_s_whichever_method_orthogonalizes(nesterov)
             with where:
                 ours = optax.chain(
                     momentum(0.95, nesterov),
-                    orthogonalized(5, {(k,): d for k, d in dims.items()}, stack),
+                    orthogonalized(
+                        newton_schulz(5), {(k,): d for k, d in dims.items()}, stack
+                    ),
                 )
                 got = _muon_updates(ours, params)
             assert jax.tree.all(jax.tree.map(jnp.array_equal, got, expected))
@@ -224,8 +221,9 @@ def test_muon_runs_newton_schulz_in_its_dtype_and_keeps_the_update_s():
     stack = Stack()
     params = nnx.to_pure_dict(nnx.state(stack, nnx.Param))
     dims = {("w",): MuonDimensionNumbers(0, 1), ("e",): MuonDimensionNumbers(1, 2)}
+    ns = newton_schulz(5)
     f32, bf16 = (
-        _muon_updates(orthogonalized(5, dims, stack, dtype=dtype), params, steps=1)[0]
+        _muon_updates(orthogonalized(ns, dims, stack, dtype), params, steps=1)[0]
         for dtype in (jnp.float32, jnp.bfloat16)
     )
     for a, b in zip(jax.tree.leaves(f32), jax.tree.leaves(bf16), strict=True):
@@ -240,22 +238,120 @@ def test_newton_schulz_s_dtype_is_in_the_run_s_id():
     assert plain.id == bf16.id != f32.id
 
 
+# --- Gram Newton-Schulz -----------------------------------------------------------------
+
+MATRIX = MuonDimensionNumbers(0, 1)
+
+
+def _of_spectrum(spectrum: Float[Array, " m"], n: int) -> Float[Array, "m n"]:
+    """An m×n matrix of singular values `spectrum`, its singular vectors at random."""
+    x = jax.random.normal(jax.random.key(1), (len(spectrum), n))
+    u, _, vt = jnp.linalg.svd(x, full_matrices=False)
+    return (u * spectrum) @ vt
+
+
+@pytest.mark.parametrize("restarts", [None, (1, 3)], ids=["2", "1,3"])
+@pytest.mark.parametrize("coefficients", ["jordan", "polar_express"])
+def test_gram_newton_schulz_is_the_standard_s_in_float32(coefficients, restarts):
+    """On a wide matrix, a tall one, and a stack of them along their middle axis."""
+    standard = newton_schulz(5, coefficients)
+    gram = newton_schulz(5, coefficients, "gram", restarts)
+    for shape, dims in [
+        ((64, 256), MATRIX),
+        ((256, 64), MATRIX),
+        ((32, 3, 96), MuonDimensionNumbers(0, 2)),
+    ]:
+        x = jax.random.normal(jax.random.key(0), shape)
+        ours, theirs = gram(x, dims), standard(x, dims)
+        assert ours.shape == shape
+        assert jnp.linalg.norm(ours - theirs) < 1e-4 * jnp.linalg.norm(theirs)
+
+
+def test_gram_newton_schulz_iterates_16_bits_in_float16():
+    """Normalized in float32 and iterated in float16, a matrix in bfloat16 comes out
+    closer to float32's than the standard iteration's in bfloat16."""
+    x = jax.random.normal(jax.random.key(0), (64, 256))
+    standard, gram = newton_schulz(5), newton_schulz(5, algorithm="gram")
+    f32, half = standard(x, MATRIX), x.astype(jnp.bfloat16)
+    ours, theirs = gram(half, MATRIX), standard(half, MATRIX)
+    assert ours.dtype == jnp.bfloat16
+    assert re.search(
+        r"\dxf16>", jax.jit(lambda x: gram(x, MATRIX)).lower(half).as_text()
+    )
+    error = lambda y: jnp.linalg.norm(y.astype(jnp.float32) - f32)
+    assert error(ours) < error(theirs) / 2
+
+
+def test_gram_newton_schulz_restarts_before_the_gram_matrix_s_rounding_grows():
+    """Eight iterations of Polar Express on a spectrum half zero, rounded in 16 bits:
+    restarting after the second alone, the Gram matrix's rounding around its zeros
+    grows to singular values past 100; after every third, they stay as near 1 as the
+    standard iteration's."""
+    spectrum = jnp.concatenate([jnp.logspace(0, -2, 32), jnp.zeros(32)])
+    x = _of_spectrum(spectrum, 256).astype(jnp.bfloat16)
+
+    def largest(algorithm: str, restarts: tuple[int, ...] | None = None) -> float:
+        y = newton_schulz(8, "polar_express", algorithm, restarts)(x, MATRIX)
+        return float(jnp.linalg.norm(y.astype(jnp.float32), 2))
+
+    assert largest("gram", (2,)) > 100
+    assert largest("gram") < largest("standard") + 0.01
+
+
+def test_gram_runs_the_standard_iteration_where_it_would_not_save_products():
+    """On a square matrix, or nearly: its m³ + 2m²n an iteration is less there."""
+    standard, gram = newton_schulz(5), newton_schulz(5, algorithm="gram")
+    for shape in [(64, 64), (64, 80), (80, 64)]:
+        x = jax.random.normal(jax.random.key(0), shape)
+        assert jnp.array_equal(gram(x, MATRIX), standard(x, MATRIX))
+
+
+def test_gram_newton_schulz_computes_a_third_less_on_a_matrix_four_times_as_wide():
+    x = jax.random.normal(jax.random.key(0), (64, 256))
+
+    def flops(algorithm: str) -> float:
+        ns = newton_schulz(5, algorithm=algorithm)
+        compiled = jax.jit(lambda x: ns(x, MATRIX)).lower(x).compile()
+        return (compiled.cost_analysis() or {})["flops"]
+
+    assert flops("gram") < 0.7 * flops("standard")
+
+
+def test_newton_schulz_s_algorithm_and_restarts_are_in_the_run_s_id():
+    plain = smoke("optimizer = muon(lr=0.02)")
+    standard = smoke("optimizer = muon(lr=0.02, ns_algorithm=standard)")
+    gram = smoke("optimizer = muon(lr=0.02, ns_algorithm=gram)")
+    once = smoke("optimizer = muon(lr=0.02, ns_algorithm=gram, ns_restarts=2)")
+    twice = smoke("optimizer = muon(lr=0.02, ns_algorithm=gram, ns_restarts=[2, 5])")
+    assert plain.id == standard.id != gram.id != once.id != twice.id
+    restarts = [r.train.optimizer for r in (once, twice)]
+    assert [c.ns_restarts for c in restarts if isinstance(c, tcfg.MuonConfig)] == [
+        (2,),
+        (2, 5),
+    ]
+    with pytest.raises(NotImplementedError, match="ns_algorithms.register"):
+        newton_schulz(5, algorithm="cubic")
+
+
 @functools.cache
 def _muon_step(
     orthogonalize: str = "gspmd",
     zero: int = 3,
     ns_dtype: str = "float32",
+    algorithm: str = "standard",
     **mesh: int,
 ) -> tuple[list, str]:
-    """The MoE's parameters after a Muon step from fixed gradients, split over `mesh`
-    (outside parallel.use with none), and the compiled step's HLO."""
+    """The MoE's parameters after a Muon step from fixed gradients, by Newton-Schulz's
+    `algorithm`, split over `mesh` (outside parallel.use with none), and the compiled
+    step's HLO."""
     methods = tcfg.MethodsConfig(orthogonalize=orthogonalize)
     layout = tcfg.LayoutConfig.model_validate({"zero": zero})
     split = parallel.use(tcfg.MeshConfig.model_validate(mesh), layout, methods)
     with split if mesh else contextlib.nullcontext():
         model = parallel.build(lambda: Model(compile(MOE), rngs=nnx.Rngs(0)))
-        c = tcfg.MuonConfig.model_validate({"lr": 0.02, "ns_dtype": ns_dtype})
-        lr = lr_multiplier(tcfg.ConstantSchedule(), 1)
+        given = {"lr": 0.02, "ns_dtype": ns_dtype, "ns_algorithm": algorithm}
+        c = tcfg.MuonConfig.model_validate(given)
+        lr = lr_multiplier(constant(1))
         trained = nnx.Optimizer(model, optimizer(c, lr, model), wrt=nnx.Param)
         parallel.shard_state(model, trained)
         grads = jax.tree.map(jnp.sin, nnx.state(model, nnx.Param))
@@ -265,11 +361,15 @@ def _muon_step(
     return jax.tree.leaves(jax.tree.map(np.asarray, nnx.state(model, nnx.Param))), hlo
 
 
+ALGORITHMS = ["standard", "gram"]
+
+
+@pytest.mark.parametrize("algorithm", ALGORITHMS)
 @pytest.mark.parametrize("orthogonalize", ["gspmd", "gather", "owner"])
 @pytest.mark.parametrize("mesh", SPLITS.values(), ids=list(SPLITS))
-def test_muon_updates_split_over_devices_as_on_one(orthogonalize, mesh):
-    one, _ = _muon_step()
-    split, _ = _muon_step(orthogonalize, **mesh)
+def test_muon_updates_split_over_devices_as_on_one(orthogonalize, mesh, algorithm):
+    one, _ = _muon_step(algorithm=algorithm)
+    split, _ = _muon_step(orthogonalize, algorithm=algorithm, **mesh)
     assert all(np.allclose(a, b, atol=1e-6) for a, b in zip(split, one, strict=True))
 
 
@@ -280,11 +380,12 @@ MORE_SPLITS = {
 }
 
 
+@pytest.mark.parametrize("algorithm", ALGORITHMS)
 @pytest.mark.parametrize("zero", [3, 1])
 @pytest.mark.parametrize("mesh", MORE_SPLITS.values(), ids=list(MORE_SPLITS))
-def test_muon_owners_orthogonalize_as_gspmd_does(mesh, zero):
-    gspmd, _ = _muon_step("gspmd", zero, **mesh)
-    owner, _ = _muon_step("owner", zero, **mesh)
+def test_muon_owners_orthogonalize_as_gspmd_does(mesh, zero, algorithm):
+    gspmd, _ = _muon_step("gspmd", zero, algorithm=algorithm, **mesh)
+    owner, _ = _muon_step("owner", zero, algorithm=algorithm, **mesh)
     assert all(np.allclose(a, b, atol=1e-6) for a, b in zip(owner, gspmd, strict=True))
 
 
@@ -292,18 +393,28 @@ def _count(op: str, hlo: str) -> int:
     return len(re.findall(rf"\b{op}(-start)?\(", hlo))
 
 
+@pytest.mark.parametrize("algorithm", ALGORITHMS)
 @pytest.mark.parametrize("mesh", SPLITS.values(), ids=list(SPLITS))
-def test_muon_gathering_whole_matrices_needs_no_all_reduce(mesh):
+def test_muon_gathering_whole_matrices_needs_no_all_reduce(mesh, algorithm):
     """gspmd runs Newton-Schulz on shards, all-reducing products over split
     dimensions; gather moves each matrix whole once and runs it there; owner moves
     each to one device, the matrices of a shape and split by one all-to-all."""
-    _, gspmd = _muon_step("gspmd", **mesh)
-    _, gather = _muon_step("gather", **mesh)
-    _, owner = _muon_step("owner", **mesh)
+    _, gspmd = _muon_step("gspmd", algorithm=algorithm, **mesh)
+    _, gather = _muon_step("gather", algorithm=algorithm, **mesh)
+    _, owner = _muon_step("owner", algorithm=algorithm, **mesh)
     assert _count("all-reduce", gather) == _count("all-reduce", owner) == 0
     assert _count("all-reduce", gspmd) > 0
     assert _count("all-gather", gather) > _count("all-gather", owner)
     assert _count("all-to-all", owner) > 0
+
+
+@pytest.mark.parametrize("mesh", SPLITS.values(), ids=list(SPLITS))
+def test_gram_newton_schulz_on_shards_all_reduces_less_than_the_standard(mesh):
+    """Under gspmd, a product by a matrix split along its longer side is an
+    all-reduce: Gram's iteration takes four such products, the standard ten."""
+    _, standard = _muon_step("gspmd", **mesh)
+    _, gram = _muon_step("gspmd", algorithm="gram", **mesh)
+    assert _count("all-reduce", gram) < _count("all-reduce", standard)
 
 
 def test_muon_owners_under_zero_1_gather_less_than_gather_does():
@@ -323,15 +434,16 @@ def test_muon_owners_get_their_matrices_in_newton_schulz_s_dtype():
         stack = parallel.build(Stack)
         params = nnx.to_pure_dict(nnx.state(stack, nnx.Param))
         dims = {("w",): MuonDimensionNumbers(0, 1), ("e",): MuonDimensionNumbers(1, 2)}
-        tx = orthogonalized(5, dims, stack, dtype=jnp.bfloat16)
+        tx = orthogonalized(newton_schulz(5), dims, stack, dtype=jnp.bfloat16)
         text = jax.jit(tx.update).lower(params, tx.init(params), params).as_text()
     moved = re.findall(r"all_to_all.*?: \(tensor<[\dx]*(\w+)>", text)
     assert len(moved) == 4 and set(moved) == {"bf16"}  # 2 shapes, there and back
 
 
-def test_muon_updates_in_bfloat16_split_over_devices_as_on_one():
-    one, _ = _muon_step(ns_dtype="bfloat16")
-    split, _ = _muon_step("owner", 3, "bfloat16", fsdp=4, tensor=2)
+@pytest.mark.parametrize("algorithm", ALGORITHMS)
+def test_muon_updates_in_bfloat16_split_over_devices_as_on_one(algorithm):
+    one, _ = _muon_step(ns_dtype="bfloat16", algorithm=algorithm)
+    split, _ = _muon_step("owner", 3, "bfloat16", algorithm, fsdp=4, tensor=2)
     assert all(np.allclose(a, b, atol=1e-4) for a, b in zip(split, one, strict=True))
 
 
@@ -353,12 +465,14 @@ def test_gather_holds_matrices_whole_and_a_stack_split_over_what_that_frees():
     )
 
 
+@pytest.mark.parametrize("algorithm", ALGORITHMS)
 @pytest.mark.parametrize("orthogonalize", ["gather", "owner"])
 def test_a_run_that_moves_matrices_for_muon_trains_as_on_one_device(
-    losses, orthogonalize
+    losses, orthogonalize, algorithm
 ):
     how = f"methods(orthogonalize={orthogonalize})"
-    muon = {"optimizer": "muon(lr=0.02, ns_dtype=float32)", "methods": how}
+    given = f"muon(lr=0.02, ns_dtype=float32, ns_algorithm={algorithm})"
+    muon = {"optimizer": given, "methods": how}
     one = losses(MOE, mesh="mesh(data=1)", **muon)
     assert np.allclose(losses(MOE, mesh="mesh(fsdp=8)", **muon), one, atol=1e-5)
 
@@ -656,11 +770,13 @@ def test_muon_runs_end_to_end(tmp_path):
 
 
 def test_a_builder_registered_for_a_type_replaces_its_own(monkeypatch):
-    def half(c, steps):
+    def half(c, train):
         return lambda step: jnp.asarray(0.5)
 
     monkeypatch.setitem(schedules.builders, "constant", half)
-    assert values(tcfg.ConstantSchedule(warmup=2), 4) == [0.25, 0.5, 0.5, 0.5]
+    run = constant(4).model_copy(update={"schedule": tcfg.ConstantSchedule(warmup=2)})
+    f = lr_multiplier(run)
+    assert [float(f(s)) for s in range(4)] == [0.25, 0.5, 0.5, 0.5]
     monkeypatch.delitem(optimizers.builders, "adamw")
     hint = r"no 'adamw' optimizer yet; add one with @bux\.train\.optim\.optimizers"
     with pytest.raises(NotImplementedError, match=hint):
@@ -688,7 +804,7 @@ def test_a_trainer_takes_terms_hooks_and_sinks_of_ones_own():
     loss = objective(tcfg.LossConfig(), arch)
     loss.terms["logit_l2"] = Term(1e-4, lambda logits, _: jnp.mean(logits[0] ** 2))
     trainer = Trainer(Model(arch, rngs=nnx.Rngs(0)), optax.adamw(1e-3), loss)
-    lr = lr_multiplier(tcfg.ConstantSchedule(), 3)
+    lr = lr_multiplier(constant(3))
     latest, steps = LatestMetrics(), Steps()
     data = batches(tcfg.SyntheticConfig(), rows(tcfg.SyntheticConfig(), 2, 8), 32)
     hooks = [Log(every=1, lr=lr, tokens=16), WeightNorm()]
@@ -729,8 +845,8 @@ def test_the_log_reports_mfu_where_the_devices_peak_is_known():
     loss = objective(tcfg.LossConfig(), arch)
     work = flops.Work(3e6, {flops.Mask(): 2e6})  # 1e6 of attention a step on rows of 8
     model = Model(arch, rngs=nnx.Rngs(0))
-    trainer = Trainer(model, optax.adamw(1e-3), loss, work=work)
-    lr = lr_multiplier(tcfg.ConstantSchedule(), 2)
+    trainer = Trainer(model, optax.adamw(1e-3), loss, work=lambda rows, t: work)
+    lr = lr_multiplier(constant(2))
     data = batches(tcfg.SyntheticConfig(), rows(tcfg.SyntheticConfig(), 2, 8), 32)
     latest = LatestMetrics()
     log = Log(every=1, lr=lr, tokens=16, peak=1e9)

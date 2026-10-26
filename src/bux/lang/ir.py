@@ -288,9 +288,13 @@ def strip(node: Node, *, labels: bool = True, widths: bool = True) -> Node:
 # Training settings that change how a run is watched or computed, not what it computes.
 _UNCOMPUTED = {"log", "eval", "checkpoint", "observe", "profile"}
 _UNCOMPUTED |= {"mesh", "layout", "methods", "compiler"}  # how it splits and compiles
+_UNCOMPUTED |= {"objective", "search"}  # how a search ranks and proposes runs
 # Settings newer than run ids, as runs computed before them: in float32, which was
 # the default then.
 _NEWER = {"precision": PrecisionConfig(compute="float32")}
+# Settings newer than run ids that are not configs, at the values runs computed with
+# before them, dumped.
+_NEWER_VALUES = {"batch_ramp": None, "curriculum": []}
 # Fields of a setting newer than run ids, by what runs computed before them.
 _NEWER_FIELDS = {
     "precision": {
@@ -302,7 +306,13 @@ _NEWER_FIELDS = {
         "moments": "float32",
         "dispatch": "compute",
     },
-    "optimizer": {"ns_coefficients": "jordan", "ns_dtype": "float32"},
+    "optimizer": {
+        "ns_coefficients": "jordan",
+        "ns_dtype": "float32",
+        "ns_algorithm": "standard",
+        "ns_restarts": None,
+    },
+    "schedule": {"horizon": 1.0},
 }
 # Fields of a setting that only change how a run is watched.
 _UNCOMPUTED_FIELDS = {"precision": ("eval",)}
@@ -364,7 +374,7 @@ def _without_newer_fields(train: dict) -> dict:
     for setting, fields in _NEWER_FIELDS.items():
         given = train.get(setting) or {}
         for field, before in fields.items():
-            if given.get(field) == before:
+            if field in given and given[field] == before:
                 del given[field]
     for setting, names in _UNCOMPUTED_FIELDS.items():
         for name in names:
@@ -431,6 +441,9 @@ class Run(BaseModel):
         for setting, before in _NEWER.items():
             old = _without_newer_fields({setting: before.model_dump(mode="json")})
             if train[setting] == old[setting]:
+                del train[setting]
+        for setting, value in _NEWER_VALUES.items():
+            if train[setting] == value:
                 del train[setting]
         dumped_arch = _without_newer_layer_fields(arch.model_dump(mode="json"))
         # Before, an init of None left the key out, and started weights as

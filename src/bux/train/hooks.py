@@ -118,16 +118,26 @@ class Log(Hook):
     Args:
         every: The steps between logs.
         lr: The learning rate at each step, from 0 (`bux.train.optim.lr_schedule`).
-        tokens: The tokens a step takes: ``batch * seq_len``.
+        tokens: The tokens a step takes, ``batch * seq_len``; or, where steps take
+            batches of other shapes, a function that returns the tokens of a run's
+            first n steps (`bux.train.curriculum.tokens`).
         peak: The FLOPs a second of all the run's devices at their peak, or None
             where it is not known, which leaves `mfu` out.
     """
 
     def __init__(
-        self, *, every: int, lr: Schedule, tokens: int, peak: float | None = None
+        self,
+        *,
+        every: int,
+        lr: Schedule,
+        tokens: int | Callable[[int], int],
+        peak: float | None = None,
     ):
-        self.every, self.lr, self.tokens = every, lr, tokens  # tokens per step
-        self.peak = peak
+        self.every, self.lr, self.peak = every, lr, peak
+        # The tokens of the first n steps.
+        self.tokens = (
+            functools.partial(_times, tokens) if isinstance(tokens, int) else tokens
+        )
         self.clock, self.since, self.flops = time.perf_counter(), 0, 0.0
         self.trainer: "Trainer | None" = None
 
@@ -181,8 +191,8 @@ class Log(Hook):
         now = time.perf_counter()
         steps, seconds = step - self.since, now - self.clock
         scalars |= {
-            "tokens": step * self.tokens,
-            "tokens_per_s": steps * self.tokens / seconds,
+            "tokens": self.tokens(step),
+            "tokens_per_s": (self.tokens(step) - self.tokens(self.since)) / seconds,
             "time/step_ms": 1000 * seconds / steps,
         }
         if self.peak and counted:
@@ -190,6 +200,11 @@ class Log(Hook):
         scalars |= _per_step(timers, steps) | memory()
         self.clock, self.since, self.flops = now, step, flops
         return scalars
+
+
+def _times(tokens: int, steps: int) -> int:
+    """Return the tokens of `steps` steps of `tokens` each."""
+    return tokens * steps
 
 
 @jax.jit

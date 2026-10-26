@@ -58,6 +58,17 @@ entrypoint for production: it trains each run of a sweep on its own GPUs, record
 every run went, stops at SIGTERM with a checkpoint, and, launched again, trains only
 what is left. See the [training guide](docs/training/index.md).
 
+A setting written as a distribution makes a hyperparameter search: each run of the
+sweep is a search of its own, whose trials a Gaussian process, TPE or quasi-random
+search proposes, short runs first with ASHA, ranked by an objective of your own
+([Searching hyperparameters](docs/training/searching.md)):
+
+```
+optimizer.lr = log_uniform(1e-4, 1e-2)
+objective    = 0.8 * web_bpb + 0.2 * code_bpb
+search       = search(method=gp, trials=27, halving=halving(eta=3, rungs=3))
+```
+
 A run logs each head's loss, its throughput and MFU, where a step's time goes and the
 device's memory, to the console (plain lines that `kubectl logs` reads), to
 `metrics.jsonl`, and to W&B or TensorBoard. `observe = observe(every=100)` adds the

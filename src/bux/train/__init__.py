@@ -5,6 +5,8 @@ can import it. The rest trains a compiled `bux.lang.ir.Run`, out of blocks that 
 do one thing and can each be replaced:
 
 - `bux.train.data`: batches of rows from the run's sources; a source per config type.
+- `bux.train.curriculum`: the stretches of a run's steps, each of one shape and one
+  data, that its curriculum's phases and its batch ramp make.
 - `bux.train.optim`: learning-rate schedules and optimizers; one per config type.
 - `bux.train.objective`: the loss, a weighted sum of named terms; a term is a
   function.

@@ -152,6 +152,16 @@ picks (17 s).
   filesystem they all mount: bux turns off one that is each host's own, and says so
   ([The compile cache](../parallelism/multi-node.md#the-compile-cache)).
 
+## Searches
+
+A file with dimensions is a search for each of its runs
+([Searching hyperparameters](searching.md)). `bux launch` trains its trials as it
+trains a sweep, a worker each on the GPUs its mesh needs, and proposes each trial
+when GPUs free up, from the trials done and those still training. A search launched
+again goes on where it stopped: its trials are in its own directory, and a trial
+that is done is read, not trained again. A search trains many runs, so it launches on
+one host: an array job's `--index` takes one of a sweep's searches.
+
 ## Array jobs
 
 `--index N` trains only the run at N, from 0, in the order `bux plan` lists them. So

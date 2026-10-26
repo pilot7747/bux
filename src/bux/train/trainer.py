@@ -58,6 +58,7 @@ from bux.lang import ir
 from bux.lang.printer import config_to_source, run_to_source
 from bux.parallel.gather import Axes
 from bux.train import (
+    curriculum,
     fitting,
     flops,
     interleave,
@@ -68,7 +69,7 @@ from bux.train import (
     xla,
 )
 from bux.train.config import PrecisionConfig, TrainConfig, evals
-from bux.train.data import Batch, batches, prefetch
+from bux.train.data import Batch, batches, prefetch, training_batches
 from bux.train.hooks import Checkpoint, Eval, Hook, Later, Log, Profile
 from bux.train.objective import (
     Metrics,
@@ -443,7 +444,10 @@ class Trainer:
     that the parameters, their gradients and the optimizer's state stay as they are
     (float32); and the projections inside blocks multiply as the precision `matmuls`
     says, or in the format it names (`bux.architecture.precision.matmuls`). At the
-    step of a `switch`, the steps take up its precision, and compile again.
+    step of a `switch`, the steps take up its precision, and compile again; so they
+    do at a batch of a new shape, as a curriculum's phase or a batch ramp makes, and
+    under remat `auto` choose their policy again, for a longer row may not fit under
+    the one before's.
 
     Made inside `bux.parallel.use`, it puts its state on the shardings the layout
     gives it, and every step keeps it there. A step that runs its layers more than
@@ -464,9 +468,9 @@ class Trainer:
     with its gradients' `reductions` started ``"early"`` (`bux.train.reorder`) or
     where XLA puts them (``"xla"``).
 
-    Given the `work` of a step (`bux.train.flops.Work`), `flops` adds up the model
-    FLOPs of the steps taken, each at the keys its batch's queries see, for the log's
-    MFU.
+    Given the `work` of a step at each shape of batch (`bux.train.flops.Work`),
+    `flops` adds up the model FLOPs of the steps taken, each at the keys its batch's
+    queries see, for the log's MFU.
 
     Every `observe_every` steps, the step is one compiled apart that also measures the
     model by layer (`bux.train.observe`): its forward, gradient, parameters and
@@ -493,8 +497,8 @@ class Trainer:
         donate: Donate the state's arrays to each training step.
         compiler_options: XLA's options for the training step (`bux.train.xla`).
         reductions: ``"early"`` or ``"xla"``: where the gradients' reductions start.
-        work: A step's model FLOPs (`step_flops`), for the log's MFU; None does not
-            count them.
+        work: A step's model FLOPs on a batch of so many rows of so many tokens
+            (`step_flops`), for the log's MFU; None does not count them.
         observe_every: The steps between those that observe the model; None for
             none.
         histograms: Whether those steps take histograms too.
@@ -544,7 +548,7 @@ class Trainer:
         donate: bool = False,
         compiler_options: xla.Options | None = None,
         reductions: str = "early",
-        work: flops.Work | None = None,
+        work: Callable[[int, int], flops.Work] | None = None,
         observe_every: int | None = None,
         histograms: bool = False,
     ):
@@ -570,6 +574,7 @@ class Trainer:
         self._donate = donate
         self._compiler_options = compiler_options or {}
         self._reductions = reductions
+        self._shape: tuple[int, ...] | None = None  # of the batches the steps took
         self._compile()
 
     def _compile(self) -> None:
@@ -978,10 +983,11 @@ class Trainer:
         """Take one training step on `batch`, and return its metrics.
 
         It puts the batch on the devices, runs the compiled step, which compiles at
-        its first call and at a `switch`, and counts the step and its FLOPs. Every
-        `observe_every` steps it runs the step that observes instead. It returns once
-        the step is launched: reading a metric waits for it. `timers` counts the time
-        it took as ``launch``, or as ``compile`` where the step compiled.
+        its first call, at a `switch` and at a batch of a new shape, and counts the
+        step and its FLOPs. Every `observe_every` steps it runs the step that
+        observes instead. It returns once the step is launched: reading a metric
+        waits for it. `timers` counts the time it took as ``launch``, or as
+        ``compile`` where the step compiled.
 
         Args:
             batch: The step's rows, on the host (`bux.train.data.batches`).
@@ -990,6 +996,7 @@ class Trainer:
             The step's metrics (`train_step`), still on the device.
         """
         self._switch_if_due()
+        self._compile_if_reshaped(batch.input_ids.shape)
         observes = self.observes(self.step + 1)
         step = self._observed_step() if observes else self._train
         on_devices = parallel.shard_batch(batch)
@@ -1000,7 +1007,8 @@ class Trainer:
         self._split.take(values)
         self.step += 1
         if self.work is not None:
-            self.flops += self.work.of(rows_read(batch.position_ids))
+            work = self.work(*batch.position_ids.shape)
+            self.flops += work.of(rows_read(batch.position_ids))
         return metrics
 
     def lower(self, batch: Batch) -> jax.stages.Lowered:
@@ -1013,6 +1021,13 @@ class Trainer:
         if self.switch is not None and self.step >= self.switch[0]:
             self.matmuls, self.switch = self.switch[1], None
             self._compile()
+
+    def _compile_if_reshaped(self, shape: tuple[int, ...]) -> None:
+        """Make the steps again for batches of a new `shape`: under remat `auto`, so
+        that they choose the policy that fits it."""
+        if self._shape is not None and shape != self._shape:
+            self._compile()
+        self._shape = shape
 
     def evaluate(
         self,
@@ -1254,16 +1269,17 @@ def train(
             run.model_dump_json(indent=2), encoding="utf-8"
         )
 
-    multiplier = lr_multiplier(config.schedule, config.steps)
+    multiplier = lr_multiplier(config)
     lr, peak = lr_schedule(config.optimizer.lr, multiplier), _peak(run)
-    tokens = config.batch * config.seq_len
+    stretches = curriculum.stretches(config)
+    tokens = functools.partial(curriculum.tokens, stretches)
     log = Log(every=config.log.every, lr=lr, tokens=tokens, peak=peak)
-    work = step_flops(run) if peak else None
+    work = functools.cache(functools.partial(step_flops, run)) if peak else None
     methods = stages.balanced(run)
     if methods.stages != config.methods.stages:
         echo(f"{run.name}: methods.stages = {methods.stages}")
     with parallel.use(config.mesh, config.layout, methods):
-        parallel.check(config.batch, config.seq_len)
+        _check_shapes(stretches)
         _check_cpu_bfloat16(run)
         model = parallel.build(lambda: Model(run.arch, rngs=nnx.Rngs(config.seed)))
         parallel.methods.prepare(run)
@@ -1299,7 +1315,7 @@ def train(
         latest, start = LatestMetrics(), trainer.step
         histograms = folder / "histograms.jsonl"
         trainer.fit(
-            make_batches(config.data, start=start),
+            training_batches(config, vocab, cache=cache, start=start),
             config.steps,
             hooks=[*run_hooks, *hooks],
             sinks=[
@@ -1315,16 +1331,17 @@ def train(
 
 def _about(run: ir.Run, folder: Path, trainer: Trainer) -> list[str]:
     """Return the lines that say what a run trains, before it does: where it writes,
-    its model, its steps and tokens, and what it logs and saves."""
+    its model, its steps and tokens, its phases, and what it logs and saves."""
     t = run.train
-    tokens = t.steps * t.batch * t.seq_len
     devices = parallel.mesh(t.mesh).devices
     params = _si(num_params(trainer.model))
     how = f"{config_to_source(t.optimizer)}, {config_to_source(t.schedule)}"
-    steps = f"{t.steps:,} steps × {t.batch} × {t.seq_len} tokens = {_si(tokens)} tokens"
+    tokens = _si(curriculum.tokens(curriculum.stretches(t), t.steps))
+    shape = "" if curriculum.varies(t) else f" × {t.batch} × {t.seq_len} tokens"
     lines = [
         f"{folder}, on {devices.size} × {devices.flat[0].device_kind}",
-        f"{params} parameters, {steps}, {how}",
+        f"{params} parameters, {t.steps:,} steps{shape} = {tokens} tokens, {how}",
+        *curriculum.lines(t),
     ]
     watched = [f"log every {t.log.every}"]
     if t.observe is not None:
@@ -1369,6 +1386,19 @@ def _check_cpu_bfloat16(run: ir.Run) -> None:
     )
 
 
+def _check_shapes(stretches: Sequence[curriculum.Stretch]) -> None:
+    """Raise unless every shape of batch the run takes splits over the mesh and the
+    microbatches (``parallel.check``), saying from which step where it is not the
+    first's."""
+    for s in stretches:
+        try:
+            parallel.check(s.config.batch, s.config.seq_len)
+        except ValueError as e:
+            raise ValueError(
+                f"from step {s.start}, {e}" if s.start else str(e)
+            ) from None
+
+
 def _reduce_dtype(precision: PrecisionConfig) -> str:
     """Return the dtype `precision` sums gradients over the batch's rows in."""
     return precision.compute if precision.reduce == "compute" else precision.reduce
@@ -1389,7 +1419,9 @@ def rows_read(
     return positions[parallel.local_rows(*positions.shape)]
 
 
-def step_flops(run: ir.Run) -> flops.Work:
+def step_flops(
+    run: ir.Run, rows: int | None = None, seq_len: int | None = None
+) -> flops.Work:
     """Return the model FLOPs of a training step of `run`: its loss's gradient on a
     batch, counted from its program (`bux.train.flops.count`) on one device, outside
     any mesh, with remat and kernels off, which would add work or hide it.
@@ -1400,6 +1432,8 @@ def step_flops(run: ir.Run) -> flops.Work:
 
     Args:
         run: A compiled run.
+        rows: The batch's rows; None: the run's ``batch``.
+        seq_len: The tokens of each; None: the run's ``seq_len``.
 
     Returns:
         The step's FLOPs, those of every batch and attention's by its mask.
@@ -1410,12 +1444,13 @@ def step_flops(run: ir.Run) -> flops.Work:
         work.one_document(run.train.seq_len)  # a step's FLOPs, a document a row
     """
     t = run.train
+    rows, length = rows or t.batch, seq_len or t.seq_len
     loss = objective(t.loss, run.arch)
 
     def gradient(
         params: nnx.State, rest: nnx.State, ids: Int32[Array, "b t"]
     ) -> nnx.State:
-        positions = jnp.arange(t.seq_len, dtype=jnp.int32)
+        positions = jnp.arange(length, dtype=jnp.int32)
         batch = Batch(ids, jnp.broadcast_to(positions, ids.shape), ids >= 0)
 
         def f(params: nnx.State) -> Float[Array, ""]:
@@ -1431,7 +1466,7 @@ def step_flops(run: ir.Run) -> flops.Work:
     with remat.off(), kernels.off():
         abstract = nnx.eval_shape(lambda: Model(run.arch, rngs=nnx.Rngs(t.seed)))
         graphdef, params, rest = nnx.split(abstract, nnx.Param, ...)
-        ids = jax.ShapeDtypeStruct((t.batch, t.seq_len), jnp.int32)
+        ids = jax.ShapeDtypeStruct((rows, length), jnp.int32)
         return flops.count(gradient, params, rest, ids)
 
 
