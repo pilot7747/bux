@@ -12,6 +12,16 @@ $ bux studio examples/experiments/attention_ablation.bux
 bux studio: /home/me/bux/examples/experiments/attention_ablation.bux at http://127.0.0.1:8765/?t=8Jc...
 ```
 
+```{figure} ../_static/studio/studio.png
+:alt: bux studio on attention_ablation.bux: the source on the left, the model in the
+:     middle with its attention selected, and that layer's settings on the right.
+
+`examples/experiments/attention_ablation.bux` in the studio, its `mha` run picked.
+The source highlights where the selected attention's settings are written, the two
+amendments of `attn`, and the inspector shows the sweep's alternatives of
+`num_kv_heads`.
+```
+
 The studio needs no npm and no internet connection, and it adds no dependencies.
 Python's standard library serves the page, and the page is plain ES modules, SVG and
 CSS that ship with bux.
@@ -53,7 +63,7 @@ as [`bux check`](tooling.md#bux-check) reports them, and dims the drawing.
   chips ("32 heads", "8 KV heads", "RoPE 500k"), and the name of its definition.
   Feed-forwards, mixtures of experts, attention, Gated DeltaNet and Mamba-2 open
   into what is inside them. A card gives the model's width, vocabulary, layers and
-  parameters.
+  parameters. The diagram exports as SVG or PNG, as below.
 - **Training**: the run's budget in steps and tokens, the learning rate over the
   steps with its warmup, stable and decay parts marked, the stretches of its
   curriculum and batch ramp, its data mixture by the names the file gives its
@@ -61,6 +71,17 @@ as [`bux check`](tooling.md#bux-check) reports them, and dims the drawing.
 - **Sweep**: the axes of `a | b`, each with its options as written, the runs they
   make, and a search's dimensions. Picking a run redraws the model and the training
   as that run has them.
+
+```{figure} ../_static/studio/qwen3_next.svg
+:alt: Qwen3-Next drawn by bux studio: twelve repeats of three Gated DeltaNet blocks
+:     and one attention block, each with a mixture of experts, then the head and a
+:     multi-token prediction layer fed from the tap @h.
+:width: 520px
+
+`examples/architectures/qwen3_next.bux`, exported from the studio as SVG. `"DDDA"^12`
+is a container `×12` with `D` folded `×3`; the multi-token prediction layer reads the
+stream saved by `@h`.
+```
 
 ## Editing
 
