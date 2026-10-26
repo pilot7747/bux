@@ -107,6 +107,7 @@ class _Named:
 @dataclass(frozen=True)
 class _Builtin:
     name: str  # a config type tag or an activation
+    span: Span | None = field(default=None, compare=False)  # where it is written
 
 
 @dataclass(frozen=True)
@@ -206,6 +207,26 @@ class Dimension:
             case tcfg.IntUniformConfig():
                 return f"{self.where}={int(value)}"
         return f"{self.where}={short(value)}"
+
+
+@dataclass(frozen=True, eq=False)
+class Written:
+    """Where a config is written: the call that makes it, or the bare name of its
+    type, in the joined source of a `Trace`.
+
+    Attributes:
+        config: The config it describes.
+        span: The call, ``gqa(num_heads=8)``, or the bare name, ``rmsnorm``.
+        call: The call; None for a bare name.
+        base: Where the config that this call amends is written: for
+            ``attn.num_kv_heads = 1``, the ``gqa(...)`` that ``attn`` was. None for
+            a call of a type, or of a definition that is a bare type.
+    """
+
+    config: cfg.Config
+    span: Span
+    call: ast.Call | None = None
+    base: Written | None = None
 
 
 def middle(space: tcfg.Distribution) -> float:
@@ -392,6 +413,8 @@ class _Evaluator:
         # the nodes alive so that their ids stay unique.
         self.node_spans: dict[int, Span] = {}
         self._alive: list[object] = []
+        # Where each config that a call or a bare name made is written, by its id.
+        self.written: dict[int, Written] = {}
         # Settings given as an undefined bare name, which became a string: arg span ->
         # (name, its span, names in scope), reported as unknown names if invalid.
         self.bare: dict[Span, tuple[str, Span, tuple[str, ...]]] = {}
@@ -424,6 +447,14 @@ class _Evaluator:
 
     def text(self, span: Span) -> str:
         return " ".join(self.source[span.start : span.end].split())
+
+    def wrote(
+        self, config: object, span: Span, call: ast.Call | None, base: object = None
+    ) -> None:
+        """Record where `config` is written: by `call`, amending `base`, or bare."""
+        if isinstance(config, cfg.Config):
+            amends = self.written.get(id(base)) if base is not None else None
+            self.written[id(config)] = Written(config, span, call, amends)
 
     # --- Names ------------------------------------------------------------------
 
@@ -482,7 +513,7 @@ class _Evaluator:
                 cycle = self.evaluating[self.evaluating.index(name) :] + [name]
                 raise BuxError(f"definition cycle: {' -> '.join(cycle)}", span)
         if name in TYPES or name in ACTIVATIONS:
-            return _Builtin(name)
+            return _Builtin(name, span)
         return _Bare(name)
 
     def unknown(
@@ -683,7 +714,7 @@ class _Evaluator:
             value = _unwrap(value)
             # The bare name of a kind of source is one with its defaults: web + synthetic.
             if isinstance(value, _Builtin) and value.name in _SOURCES:
-                return self.construct(value.name, [], side.span)
+                return self.bare_type(value, side.span)
             return value
 
         a, b = operand(left, expr.left), operand(right, expr.right)
@@ -772,7 +803,7 @@ class _Evaluator:
             case _Builtin(name=name) if name in ACTIVATIONS:
                 return self.graph(_activation(name), span)
             case _Builtin(name=name):
-                return self.graph(self.construct(name, [], span), span)
+                return self.graph(self.bare_type(value, span), span)
             case str():
                 return self.pattern(value, span)
             case _Bare(name=name):
@@ -818,7 +849,7 @@ class _Evaluator:
             case _Named(value=inner):
                 return self.data(inner, span)
             case _Builtin(name=name):
-                return name if name in ACTIVATIONS else self.construct(name, [], span)
+                return name if name in ACTIVATIONS else self.bare_type(value, span)
             case _Bare(name=name):
                 return name
             case None | bool() | int() | float() | str() | list() | cfg.Config():
@@ -837,6 +868,7 @@ class _Evaluator:
             case _Builtin(name=name) if name in TYPES:
                 fields, ports = self.arguments(expr, scope, TYPES[name])
                 config = self.construct(name, fields, expr.span)
+                self.wrote(config, expr.span, expr)
                 return self.with_ports(config, ports, None, None, expr.span)
             case _Named(label=label, share=share) if cls := _config_type(
                 base := _unwrap(callee)
@@ -844,6 +876,8 @@ class _Evaluator:
                 fields, ports = self.arguments(expr, scope, cls)
                 if not fields:
                     config = self.amended(base, fields, expr.span)
+                    if config is not base:  # a bare type, called: norm()
+                        self.wrote(config, expr.span, expr)
                     return self.with_ports(config, ports, label, share, expr.span)
                 # An amendment redefines a shared layer, which stays one module.
                 if share and not expr.amend:
@@ -853,6 +887,7 @@ class _Evaluator:
                         "define a separate layer",
                     )
                 config = self.amended(base, fields, expr.span)
+                self.wrote(config, expr.span, expr, base)
                 return self.with_ports(
                     config, ports, self.text(expr.span), None, expr.span
                 )
@@ -1094,6 +1129,12 @@ class _Evaluator:
             span,
         )
 
+    def bare_type(self, builtin: _Builtin, span: Span) -> cfg.Config:
+        """Return the config a bare type makes, ``rmsnorm``, written where it is."""
+        config = self.construct(builtin.name, [], span)
+        self.wrote(config, builtin.span or span, None)
+        return config
+
     def construct(self, tag: str, fields: _Fields, span: Span) -> cfg.Config:
         data: dict = {"type": tag}
         for key, value, arg_span in fields:
@@ -1302,6 +1343,8 @@ class _Lowering:
                     typed, out = self._lower(node, width)
             else:
                 typed, out = self._lower(node, width)
+            if span is not None:
+                self.ev.node(typed, span)
             if node.share is not None:
                 first = self.shared.setdefault(node.share, typed)
                 if ir.strip(first, widths=False) != ir.strip(typed, widths=False):
@@ -1495,6 +1538,8 @@ class _Lowering:
             # The layer needs one stream: read the widened one back into one first.
             merge = ir.Layer(config=cfg.MergeConfig(), width="streams")
             typed, out = self.layer(node, self.d_model)
+            if (span := self.ev.node_spans.get(id(node))) is not None:
+                self.ev.node(typed, span)
             return ir.Seq(items=(merge, typed)), out
         out = self.layer_output(config, width)
         self.connect(node.ports)
@@ -2004,6 +2049,113 @@ def compile_spaces(
             Space(_run(f, filename), dims, program, entry, filename, f.choices)
         )
     return spaces
+
+
+@dataclass(frozen=True)
+class Trace:
+    """A model, or one run of a sweep, with where each part of it is written: what an
+    editor needs to draw a file and to change it where the file says what it
+    changes (``bux studio``). `trace` returns one.
+
+    Attributes:
+        program: The file and the modules it uses: ``program.source`` joins them,
+            this file first, and every span here indexes into it.
+        arch: The architecture of the entry.
+        train: The run's training settings; None for a model that is not a run.
+        axes: The axes of the sweep that this run meets, in the order written.
+        dimensions: The dimensions of the search that it meets, in the order met.
+        nodes: Where each node of ``arch.graph`` is written, by its path: the
+            indices of the children down to it, by `bux.lang.ir.children`. The root
+            is ``()``. A merge that the compiler inserted has none.
+        statements: The definition in effect for each name, in any of the files.
+    """
+
+    program: modules.Program
+    arch: ir.Architecture
+    train: tcfg.TrainConfig | None
+    axes: list[Axis]
+    dimensions: list[Dimension]
+    nodes: dict[tuple[int, ...], Span]
+    statements: dict[str, ast.Statement]
+    found: dict[int, Written] = field(repr=False)
+
+    def written(self, config: cfg.Config) -> Written | None:
+        """Return where `config` is written, for a config of `arch` or `train` at
+        any depth (``attn.rope`` too); None for one the compiler made, such as a
+        default, or one an amendment copied without changing it."""
+        found = self.found.get(id(config))
+        return found if found is not None and found.config is config else None
+
+
+def trace(
+    source: str,
+    *,
+    choices: Mapping[Span | frozenset[str], int | str] | None = None,
+    point: Mapping[Span, float] | None = None,
+    entry: str = "model",
+    filename: str = "<string>",
+    overrides: Sequence[str] = (),
+    modules: Modules = None,
+) -> Trace:
+    """Compile a model, or the run of a sweep that `choices` picks, and say where each
+    of its nodes and configs is written.
+
+    Errors are found with `check`; this compiles what it checked, as `compile` does,
+    keeping the spans the compiler otherwise drops.
+
+    Args:
+        source: The text of a ``.bux`` file.
+        choices: The alternative each axis takes, by its `Axis.key`: what
+            `Axis.pick` returns. The axes left out take their first.
+        point: The value each dimension takes, by its `Dimension.key`; those left
+            out take their middle.
+        entry: The definition to build, as for `compile`.
+        filename: Where `source` is from, as for `compile`.
+        overrides: Statements that redefine the file's own, as for `compile`.
+        modules: Where ``use`` finds modules, as for `compile`.
+
+    Returns:
+        The architecture and the run's settings, with where their parts are written.
+
+    Raises:
+        BuxError: At the first mistake, as `compile` raises.
+
+    Example::
+
+        t = trace("d_model = 64\\nmodel = rmsnorm gqa(num_heads=4, num_kv_heads=2)\\n")
+        attn = t.arch.graph.items[1]
+        t.nodes[(1,)]  # Span(23, 54): gqa(num_heads=4, num_kv_heads=2)
+        t.written(attn.config).call.args[0].key  # ('num_heads',)
+    """
+    program = _load(source, filename, overrides, modules, recover=False)
+    try:
+        ev = _Evaluator(program, choices=choices, point=point)
+        arch = _compile(ev, entry)
+        train = _train(ev, arch, require=True)
+    except BuxError as err:
+        raise program.locate(err) from None
+    return Trace(
+        program=program,
+        arch=arch,
+        train=train,
+        axes=sorted(ev.axes.values(), key=lambda axis: axis.span.start),
+        dimensions=list(ev.dims.values()),
+        nodes=_paths(arch.graph, ev.node_spans),
+        statements=dict(ev.statements),
+        found=ev.written,
+    )
+
+
+def _paths(graph: ir.Node, spans: dict[int, Span]) -> dict[tuple[int, ...], Span]:
+    """Return the span of each node of `graph` that has one, by its path."""
+    found: dict[tuple[int, ...], Span] = {}
+    todo: list[tuple[ir.Node, tuple[int, ...]]] = [(graph, ())]
+    while todo:
+        node, path = todo.pop()
+        if (span := spans.get(id(node))) is not None:
+            found[path] = span
+        todo += [(c, (*path, k)) for k, c in enumerate(ir.children(node))]
+    return found
 
 
 def _dimensions(

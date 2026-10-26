@@ -6,7 +6,9 @@ it, `bux check`, `bux render`, `bux fmt` and `bux json`; the format of the error
 they report; and the language server `bux-lsp`, which brings the same checks,
 completion and hover into your editor. None of these import JAX, so they answer in
 well under a second. Training commands are in [Running](../training/running.md), and
-every option is in the [command-line reference](../reference/cli.md).
+every option is in the [command-line reference](../reference/cli.md). To see a file
+drawn as a diagram, and to edit its model, training and sweep in a browser, use
+[bux studio](studio.md).
 
 ## Commands
 

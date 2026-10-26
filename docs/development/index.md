@@ -49,6 +49,7 @@ share ([environment variables](../reference/environment.md#bux)).
 | `src/bux/parallel/` | the mesh, the layout, and a registry of methods per kind of parallelism |
 | `src/bux/data/` | tokenizing, shuffling and packing documents into rows, locally or on Spark |
 | `src/bux/launch.py`, `__main__.py` | the launcher and the command line |
+| `src/bux/studio/` | `bux studio`: its server, view model, registries of how layers are drawn, and the page in `static/` |
 | `examples/architectures/` | the model zoo; `tests/test_examples.py` trains a shrunk copy of each |
 | `examples/experiments/` | runs, sweeps and recipes; `examples/benchmarks/` the benchmark suites |
 | `scripts/benchmark.py` | trains a suite and compares two results ([Benchmarks](../performance/benchmarks.md)) |
@@ -144,6 +145,7 @@ A change to bux is done when its documentation is. Update, in the same change:
 | a layer's or setting's config | its docstring and field comments (the reference regenerates), and the guide page that explains it |
 | the language: syntax, semantics, errors | `docs/language/`, and `grammar.md` for syntax |
 | a command or flag | `docs/reference/cli.md`'s table, and the guide that uses it (`training/running.md`, `training/launching.md`) |
+| the studio: its server, view model, palette or internals (`bux.studio`) | `docs/language/studio.md`, and the plan's JSON contract in `plans/studio.md` that the page is coded against |
 | training: trainer, hooks, sinks, objective, optimizers, checkpoints | `docs/training/`, and the docstrings of what changed |
 | search: dimensions, objectives, methods, halving (`bux.search`) | `docs/training/searching.md`, and `docs/language/sweeps.md` for the syntax |
 | data: sources, tokenizer, packing, the pipeline | `docs/data/` |

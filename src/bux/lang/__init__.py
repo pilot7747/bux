@@ -94,6 +94,16 @@ the first run. ``bux check`` and the language server (`bux.lang.lsp`) use it::
     if report.arch is not None:  # no errors
         print(len(report.axes), "axes")
 
+`trace` then compiles the run of the sweep that an editor picked, and says where each
+node and config of it is written, so that an edit lands where the file says what it
+changes (``bux studio``)::
+
+    from bux.lang import trace
+
+    t = trace(source, choices={report.axes[0].key: 1})  # its second alternative
+    t.nodes[()]  # the span of `model`: the root of t.arch.graph
+    t.written(t.train.optimizer).span  # the span of adamw(...)
+
 .. rubric:: Errors
 
 Every mistake in source is a `BuxError`, with a message, a span into the file, and
@@ -155,6 +165,9 @@ Source flows through the modules in this order:
     ~compiler.compile_file
     ~compiler.check
     ~compiler.Report
+    ~compiler.trace
+    ~compiler.Trace
+    ~compiler.Written
     ~compiler.Axis
     ~compiler.Space
     ~compiler.Dimension
@@ -169,11 +182,14 @@ from bux.lang.compiler import (
     Dimension,
     Report,
     Space,
+    Trace,
+    Written,
     check,
     compile,
     compile_file,
     compile_runs,
     compile_spaces,
+    trace,
 )
 from bux.lang.ir import Architecture, Run
 from bux.lang.syntax import BuxError, parse
@@ -186,10 +202,13 @@ __all__ = [
     "Report",
     "Run",
     "Space",
+    "Trace",
+    "Written",
     "check",
     "compile",
     "compile_file",
     "compile_runs",
     "compile_spaces",
     "parse",
+    "trace",
 ]

@@ -3,7 +3,8 @@
 `bux COMMAND FILE [SETTING=VALUE ...] [options]` compiles a `.bux` file and does one
 thing with it. Every command takes statements after the file, which redefine the
 file's as one more layer over it would: `optimizer.lr=1e-3`, `'use fineweb_wsd'`,
-`'optimizer.lr = 1e-3 | 3e-3'`. `bux export` takes a trained run's directory instead.
+`'optimizer.lr = 1e-3 | 3e-3'`. `bux export` takes a trained run's directory instead,
+and `bux studio` takes the file alone.
 
 | Command | What it does |
 |---------|--------------|
@@ -17,6 +18,7 @@ file's as one more layer over it would: `optimizer.lr=1e-3`, `'use fineweb_wsd'`
 | `fmt` | Print the file in canonical form: every run as a file of its own. |
 | `json` | Print the IR of the model, or of every run. |
 | `export` | Write a trained run's model as a transformers model directory, and check it against bux ([Exporting a run](../export/index.md#exporting-a-run)). |
+| `studio` | Serve a page that draws the file's model, training and sweep, and edits them in the file ([bux studio](../language/studio.md)). |
 
 `bux-lsp` is the language server ([Editor support](../language/tooling.md)).
 
@@ -36,6 +38,22 @@ bux export RUN_DIR OUT [--step N] [--dtype DTYPE] [--check]
 
 It needs the `export` extra (PyTorch, transformers, safetensors). A model with a
 layer that is not exported yet fails with the layer's name, exit 1.
+
+## `bux studio`
+
+```sh
+bux studio FILE [--port PORT] [--host HOST] [--no-browser]
+```
+
+| Option | Default | What it does |
+|--------|---------|--------------|
+| `FILE` | | the `.bux` file to show and edit; if it does not exist, the page starts from a template and the first save creates it |
+| `--port PORT` | `8765` | the port to try first; if it is taken, the next few are tried |
+| `--host HOST` | `127.0.0.1` | the address to listen on |
+| `--no-browser` | | print the page's URL, with its token, and open no browser; over SSH no browser opens anyway, and the `ssh -L` command to forward the port is printed |
+
+It runs until interrupted (Ctrl-C), with JAX on the CPU unless `JAX_PLATFORMS` says
+otherwise.
 
 ## `bux --help`
 
