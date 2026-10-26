@@ -236,7 +236,8 @@ async function plan() {
   Object.assign(state, { plan: reply, planKey: key, planning: false });
   showStatus();
   const context = state.good?.run?.budget?.seq_len ?? null;
-  if (reply) ui.diagram.setFacts?.({ params: reply.params, params_text: reply.params_text, flops_per_token: reply.flops_per_token, context });
+  const shown = context === null ? null : context.toLocaleString("en-US");
+  if (reply) ui.diagram.setFacts?.({ params: reply.params_text, context: shown });
 }
 
 // --- Selection: the code and the diagram, linked -------------------------------------------

@@ -37,7 +37,7 @@ code, kbd, .mono { font-family: var(--font-mono); font-variant-ligatures: none; 
 [hidden] { display: none !important; }
 .grow { flex: 1; }
 
-svg { width: 16px; height: 16px; fill: none; stroke: currentColor; stroke-width: 1.4; stroke-linecap: round; stroke-linejoin: round; }
+svg.ico, svg.mark { width: 16px; height: 16px; fill: none; stroke: currentColor; stroke-width: 1.4; stroke-linecap: round; stroke-linejoin: round; }
 .icon { display: inline-flex; flex: none; }
 .icon svg { width: 14px; height: 14px; }
 

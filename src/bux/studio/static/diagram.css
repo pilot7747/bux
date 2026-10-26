@@ -1,8 +1,8 @@
 /* The model diagram (diagram.js). Every color comes from tokens.css; the fonts
    and sizes of its texts match FONT in diagram-layout.js, which measures them. */
 
+/* The page positions and sizes the host; the diagram fills it. */
 .dg-host {
-  position: relative;
   overflow: hidden;
   outline: none;
   user-select: none;
