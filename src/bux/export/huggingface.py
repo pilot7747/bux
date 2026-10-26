@@ -17,6 +17,7 @@ The directory holds:
     hf_model = AutoModelForCausalLM.from_pretrained("out/", trust_remote_code=True)
 """
 
+import inspect
 import json
 import shutil
 from pathlib import Path
@@ -61,7 +62,8 @@ def save(
     p = plan(arch)
     out = Path(out)
     out.mkdir(parents=True, exist_ok=True)
-    kinds = cache_types(p)
+    layers = cache_layers(p)
+    kinds = [kind for kind, _ in layers]
     masks = sorted({m for call in p.calls for m in _masks(call.layer)}, key=repr)
     (out / "modeling_bux.py").write_text(codegen.modeling(p, masks))
     for f in Path(hf.__path__[0]).glob("*.py"):
@@ -79,6 +81,7 @@ def save(
         "hidden_size": arch.d_model,
         "num_hidden_layers": len(kinds),
         "layer_types": kinds,
+        **_per_layer(layers),
         "tie_word_embeddings": False,
         "bux": arch.model_dump(mode="json"),
         "bux_sites": p.sites(),
@@ -91,16 +94,43 @@ def save(
     return p
 
 
-def cache_types(p: Plan) -> list[str]:
-    """Return the kind of each cache layer, in the order the calls that keep state run."""
-    kinds = []
+#: transformers' defaults of what a cache layer's config may set for it alone.
+_CACHE_DEFAULTS = {"sliding_window": None, "number_of_conv_states": 1}
+
+
+def cache_layers(p: Plan) -> list[tuple[str, dict]]:
+    """Return the kind of each cache layer, in the order the calls that keep state run,
+    and what its config sets for it alone (``per_layer_config``).
+
+    A layer class's ``cache_type(c)``, or ``cache_type(c, ports)`` where its ports
+    decide (as ``[name, tap, mode]``), returns the kind, ``(kind, settings)`` with
+    settings of `_CACHE_DEFAULTS` (a sliding window, conv states), or None for a call
+    that keeps no state.
+    """
+    out = []
     for call in p.calls:
-        cls = codegen.layer_class(call.layer)
-        fn = getattr(cls, "cache_type", None)
-        kind = fn(call.layer.config.model_dump(mode="json")) if fn else None
+        fn = getattr(codegen.layer_class(call.layer), "cache_type", None)
+        if fn is None:
+            continue
+        c = call.layer.config.model_dump(mode="json")
+        ports = [[port.name, port.tap, port.mode] for port in call.layer.ports]
+        takes_ports = len(inspect.signature(fn).parameters) > 1
+        kind = fn(c, ports) if takes_ports else fn(c)
         if kind is not None:
-            kinds.append(kind)
-    return kinds
+            out.append(tuple(kind) if isinstance(kind, tuple | list) else (kind, {}))
+    return out
+
+
+def _per_layer(layers: list[tuple[str, dict]]) -> dict:
+    """Return the config's settings of single cache layers: ``per_layer_config``, by
+    the layer's index, and transformers' default of each for the others."""
+    overrides = {i: settings for i, (_, settings) in enumerate(layers) if settings}
+    if not overrides:
+        return {}
+    names = {name for settings in overrides.values() for name in settings}
+    return {n: _CACHE_DEFAULTS[n] for n in sorted(names)} | {
+        "per_layer_config": overrides
+    }
 
 
 def _masks(layer: ir.Layer) -> list[tuple[str, object]]:
