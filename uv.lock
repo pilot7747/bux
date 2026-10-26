@@ -428,6 +428,7 @@ dependencies = [
     { name = "orbax-checkpoint" },
     { name = "pyarrow" },
     { name = "pydantic" },
+    { name = "scipy" },
     { name = "tokenizers" },
     { name = "tomlkit" },
 ]
@@ -490,6 +491,7 @@ requires-dist = [
     { name = "pydantic", specifier = ">=2.14.1" },
     { name = "pygls", marker = "extra == 'lsp'", specifier = ">=2.1.1" },
     { name = "pyspark", marker = "extra == 'spark'", specifier = ">=4.2" },
+    { name = "scipy", specifier = ">=1.18.1" },
     { name = "tensorboardx", marker = "extra == 'tensorboard'", specifier = ">=2.6" },
     { name = "tokamax", extras = ["cuda"], marker = "sys_platform == 'linux' and extra == 'cuda'", specifier = ">=0.0.17" },
     { name = "tokenizers", specifier = ">=0.23.3" },
