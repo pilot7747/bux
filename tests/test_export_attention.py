@@ -226,6 +226,52 @@ def test_an_indexer_beside_a_conv_says_so() -> None:
         check.compare(compile(source))
 
 
+CSA = (
+    "csa(num_heads=4, head_dim=16, sliding_window_size=4, sinks=true,"
+    " rope=rope(fraction=0.25, layout=interleaved)"
+)
+SMALL_INDEXER = "indexer=indexer(num_heads=2, head_dim=8, top_k=3"
+CSA_SETTINGS = {
+    "window": CSA + ")",
+    "no window, low-rank queries and output": "csa(num_heads=4, head_dim=16,"
+    " q_lora_rank=8, o_lora_rank=4, o_groups=2, rope=rope(fraction=0.5))",
+    "compressed": CSA + ", compress_ratio=2)",
+    "compressed, indexer": CSA + f", compress_ratio=2, {SMALL_INDEXER}))",
+    "single, indexer": CSA + f", compress_ratio=1, {SMALL_INDEXER}, weighted=false))",
+    "compressed by 3, yarn, qk norm, softcap": "csa(num_heads=4, head_dim=16,"
+    " sliding_window_size=5, compress_ratio=3, qk_norm=rmsnorm, softcap=3.0,"
+    " rope=rope(fraction=0.5, scaling=yarn(factor=4, original_max_len=8)))",
+    "relative bias, log scale, gate": CSA + ", compress_ratio=2, gated=true,"
+    " relative_bias=relbias(rank=2, extent=4), log_scale=0.5, log_scale_floor=2)",
+    "indexer blocks": CSA + f", compress_ratio=1, {SMALL_INDEXER}, block_size=2))",
+}
+
+
+@pytest.mark.parametrize("attn", CSA_SETTINGS.values(), ids=CSA_SETTINGS.keys())
+def test_csa_settings(attn: str) -> None:
+    check.compare(compile(stack(attn))).check()
+
+
+# DeepSeek-V4.1's wiring: layers that compress and index, layers that reuse both, and
+# a candidate pool that later indexers choose within.
+CSA_PORTS = (
+    HEAD
+    + FFN
+    + f"pairs = {CSA}, compress_ratio=2, q_lora_rank=8, {SMALL_INDEXER}))\n"
+    + "single = pairs(compress_ratio=1, indexer.candidate_block_size=2,"
+    " indexer.candidate_top_k=2)\n"
+    + "block(mixer) = [rmsnorm mixer] [rmsnorm ffn]\n"
+    + "model = embed block(pairs(kv=@kv, index=@topk)) block(pairs(kv=$kv,"
+    " index=$topk)) block(single(kv=@kv, index=@topk, candidates=@pool))"
+    " block(single(kv=$kv, index=$topk)) block(single(kv=$kv, index=@topk,"
+    " candidates=$pool)) rmsnorm head"
+)
+
+
+def test_csa_ports() -> None:
+    check.compare(compile(CSA_PORTS)).check()
+
+
 # The zoo's models that use these layers, shrunk as tests/test_examples.py shrinks
 # them, their other layers made dense ones (MoE, Mamba, Gated DeltaNet), and their
 # deepest repeats cut short; the multi-token heads are left out.
@@ -327,6 +373,21 @@ ZOO = {
         "local = attn(sliding_window_size=4, relative_bias.extent=4, log_scale=none)",
         "experts = dense",
         'model = embed "DD" "LLLG" norm logits',
+    ],
+    "deepseek/deepseek_v4.1_flash.bux": [
+        "residual = none",
+        "memory = dense",
+        (
+            "window = csa(num_heads=4, head_dim=16, q_lora_rank=8, o_lora_rank=4,"
+            " o_groups=2, sliding_window_size=4, sinks=true, latent_norm=norm,"
+            " rope=rope(fraction=0.125, layout=interleaved))"
+        ),
+        (
+            "pairs = window(compress_ratio=2, rope=far, indexer=indexer(num_heads=2,"
+            " head_dim=8, top_k=3, candidate_block_size=2, candidate_top_k=2))"
+        ),
+        "experts = dense",
+        'model = embed W memory W "Ppp" "Ssss" "Isss" norm head',
     ],
 }
 

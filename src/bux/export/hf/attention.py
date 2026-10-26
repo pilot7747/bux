@@ -30,7 +30,7 @@ from transformers.modeling_utils import ALL_ATTENTION_FUNCTIONS
 from .common import ACTIVATIONS, Ctx, Norm, Site
 from .conv import CausalConv
 from .rope import Rope, logit_gain, rotated_dims
-from .sparse import Indexer
+from .sparse import Indexer, key_positions
 
 __all__ = ["Attention", "Rope", "SoftmaxAttention", "make_mask", "softmax_attention"]
 
@@ -344,7 +344,7 @@ class SoftmaxAttention(nn.Module):
         self.out_norm = Norm(out_norm, dv) if out_norm else None
         self.computes_logits = computes_logits(c)
         # The cache layer it keeps, or would keep if it did not read the kv port's.
-        own = cache_layer(c, [p for p in site.ports if p[0] != "kv"])
+        own = type(self).cache_type(c, [p for p in site.ports if p[0] != "kv"])
         sliding = own is not None and own[0] in FAMILIES["sliding_attention"]
         self.kind = "sliding_attention" if sliding else "full_attention"
         self.cache_window = self.window if self.kind == "sliding_attention" else None
@@ -384,7 +384,11 @@ class SoftmaxAttention(nn.Module):
             kept = self.read(ctx, "index")
         elif self.indexer is not None:
             seen = ctx.mask("dense", (kv.slot, self.window)).keep[:, 0]
-            kept = self.indexer(x, query, ctx, kv.slot, seen)
+            keys = self.indexer.keys(x, ctx.positions)
+            if ctx.cache is not None and kv.slot is not None:
+                keys = ctx.cache.update_indexer(keys, kv.slot)
+            order = key_positions(ctx, keys.shape[1])
+            kept, _ = self.indexer(x, query, ctx.positions, keys, seen, order)
         else:
             return None
         self.write(ctx, "index", kept)
@@ -472,7 +476,11 @@ class SoftmaxAttention(nn.Module):
             out = self.out_norm(out)
         if self.gate is not None:
             out = out * self.gate_activation(self.gate(x)).view(b, t, self.h, -1)
-        return self.o(out.reshape(b, t, -1))
+        return self.project(out)
+
+    def project(self, out: torch.Tensor) -> torch.Tensor:
+        """Project the heads' outputs, b t h dv, back to the width."""
+        return self.o(out.flatten(2))
 
 
 def check_reader(c: dict, ports: list) -> None:
