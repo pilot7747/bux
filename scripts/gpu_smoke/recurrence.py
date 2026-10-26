@@ -2,7 +2,7 @@
 scans over positions, on one GPU at a hybrid's shapes, 2 rows of 4096 in packed
 documents: the outputs and every input's gradient, in float32; Mamba-2's also with
 its chunks computed again for the backward pass, as `methods(states=recompute)` runs
-them. XLA's GPU fusions can differ from its CPU's, which the tests run: on a B300, a
+them, and RWKV-7's with its bounded decay through each chunk's middle. XLA's GPU fusions can differ from its CPU's, which the tests run: on a B300, a
 grouped einsum's took Mamba-2's gradients for B and C wrong. Then the delta rule by
 its kernels, in bfloat16, against its chunks in float32: cuDNN's (``fused_delta``),
 GDN's at steep gates and spikes and KDA's at a gate bounded at -5, and bux's own for
@@ -18,6 +18,7 @@ It exits 1 if a form differs from its scan, or a kernel from the chunks.
 
 import sys
 from collections.abc import Callable
+from functools import partial
 
 import jax
 import jax.numpy as jnp
@@ -27,7 +28,7 @@ from jaxtyping import Array, Float
 
 from bux import config as cfg
 from bux.architecture import Segments
-from bux.architecture.recurrent import fused_delta, linear_attention, ssm
+from bux.architecture.recurrent import fused_delta, linear_attention, rwkv7, ssm
 from bux.parallel.recurrence import Chunk, Chunked, Positions, Shared
 
 B, T = 2, 4096
@@ -77,6 +78,17 @@ def linear(decay: int, delta: bool) -> Inputs:
     return make
 
 
+def rwkv(rng: np.random.Generator) -> tuple[Positions, Shared]:
+    """r, k, v, log decay and continues of 32 heads of 64, and a and b, as RWKV-7
+    gives them: its log decay at least `rwkv7.FLOOR`."""
+    r, k, v, kk = rng.normal(size=(4, B, T, 32, 64))
+    g = rwkv7.FLOOR / (1 + np.exp(-rng.normal(size=(B, T, 32, 64))))
+    kk = kk / np.linalg.norm(kk, axis=-1, keepdims=True)
+    rate = 1 / (1 + np.exp(-rng.normal(size=(B, T, 32, 64))))
+    xs = (jnp.asarray(x, jnp.float32) for x in (r, 0.3 * k, v, g))
+    return (*xs, documents(rng), jnp.asarray(-kk), jnp.asarray(kk * rate)), ()
+
+
 def recomputed(f: Chunked) -> Chunked:
     """Return `f` whose backward pass computes it again from its inputs, as
     `methods(states=recompute)` runs it."""
@@ -108,6 +120,11 @@ CASES: dict[str, tuple[Chunked, Chunked, Inputs]] = {
         linear_attention.chunk,
         linear_attention.stepwise,
         linear(1, True),
+    ),
+    "rwkv-7, its decay bounded": (
+        partial(linear_attention.chunk, floor=rwkv7.FLOOR),
+        linear_attention.stepwise,
+        rwkv,
     ),
     "mamba2, 8 groups, recomputed": (
         recomputed(ssm.chunk),

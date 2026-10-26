@@ -121,12 +121,15 @@ def _identity(
     return jnp.ones_like(like, shape=shape)
 
 
-def chunk(xs: Positions, shared: Shared, transition: bool) -> Chunk:
+def chunk(
+    xs: Positions, shared: Shared, transition: bool, floor: float | None = None
+) -> Chunk:
     """Run `recurrence` over a chunk of positions from a zero state, in float32: by
     smaller chunks, with matmuls within each and a scan across them (``chunkwise``).
     With `transition`, also return the product P of every position's diag(w) + b a^T
-    (its diagonal without a and b), and each output's reads P^T q."""
-    return chunkwise.chunk(xs, transition)
+    (its diagonal without a and b), and each output's reads P^T q. `floor` is the
+    least log decay, if bounded."""
+    return chunkwise.chunk(xs, transition, floor=floor)
 
 
 def stepwise(xs: Positions, shared: Shared, transition: bool) -> Chunk:
@@ -159,6 +162,7 @@ def recurrence(
     a: Float[Array, "b t h dk"] | None = None,
     b: Float[Array, "b t h dk"] | None = None,
     *,
+    floor: float | None = None,
     states: States | None = None,
 ) -> Float[Array, "b t h dv"]:
     """Return the outputs ``S_t^T q_t`` of the state::
@@ -182,6 +186,8 @@ def recurrence(
         docs: The documents packed into the rows; None for one a row.
         a: What the rank-one term reads of the state; None for no such term.
         b: Where the rank-one term writes it.
+        floor: The least log decay, if bounded: near enough 0, as RWKV-7's, the
+            chunks take a decay per channel by fewer, larger matmuls.
         states: Keep the chunks' states for the backward pass, or recompute them;
             None for the run's ``methods.states``.
 
@@ -192,7 +198,7 @@ def recurrence(
     family = "the generalized delta rule" if rank_one else "decayed linear attention"
     ab = (a,) if rank_one and b is k else (a, b) if rank_one else ()
     xs = (q, k, v, log_decay, _continues(k, docs), *ab)
-    mix = recomputed(functools.partial(_mixed, family), states)
+    mix = recomputed(functools.partial(_mixed, family, floor), states)
     return remat.named("recurrence", mix, *xs).astype(v.dtype)
 
 
@@ -252,9 +258,13 @@ def recomputed[**A, R](
     return jax.checkpoint(f, policy=keep)
 
 
-def _mixed(family: str, *xs: Float[Array, "b t ..."]) -> Float[Array, "b t h dv"]:
-    """Run the recurrence of the positions `xs` by the run's `methods.recurrence`."""
-    return parallel.method("recurrence")(Recurrence(family, chunk, xs))
+def _mixed(
+    family: str, floor: float | None, *xs: Float[Array, "b t ..."]
+) -> Float[Array, "b t h dv"]:
+    """Run the recurrence of the positions `xs`, its log decays at least `floor`, by
+    the run's `methods.recurrence`."""
+    chunked = functools.partial(chunk, floor=floor)
+    return parallel.method("recurrence")(Recurrence(family, chunked, xs))
 
 
 def _continues(
@@ -352,7 +362,8 @@ def _chunked(
         k, log_decay = k.astype(jnp.float32), log_decay.astype(jnp.float32)
         step = beta[..., None] * k
         a = -jnp.exp(log_decay) * k
-        return _mixed("the generalized delta rule", q, step, v, log_decay, continues, a)
+        family = "the generalized delta rule"
+        return _mixed(family, None, q, step, v, log_decay, continues, a)
 
     xs = (q, k, v, log_decay, beta, _continues(k, docs))
     mix = recomputed(rule, states)

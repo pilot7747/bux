@@ -185,6 +185,11 @@ and gradients are within 4·10⁻³ of the chunks' in float32 (as a share of eac
 norm), at GLA's own gate, gates to -20 a position, spikes of -10⁴ and Lightning's
 decays, and the log decays' gradient within 7·10⁻³ at gates to -5: the kernel keeps
 its parts in bfloat16, as cuDNN's GDN kernel does.
+
+RWKV-7 has no kernel yet, but its chunks take a pair's decay by one matmul now, its
+decay being bounded: its hybrid (`"RRRA"^4`) trains at 87.4k tokens a second where it
+trained at 45.0k ([RWKV-7's chunks](../parallelism/recurrence.md#rwkv-7s-chunks)).
+
 ### QK-norm and RoPE
 
 The 1.3B with Qwen3's QK-norm, in MXFP8, trains 3000 steps of FineWeb-Edu by the norm

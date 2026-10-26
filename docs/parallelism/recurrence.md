@@ -145,7 +145,12 @@ fla's chunked kernels, under every method:
   Pallas kernel on a GPU (`affine_scan`);
 - `stepwise`, a scan over positions, is its reference;
 - with one decay a head, the state passes across the chunks by a matmul (SSD's state
-  passing), and q and k may be shared by groups of heads.
+  passing), and q and k may be shared by groups of heads;
+- a decay per key channel takes each pair's decay through the end of a block of 16
+  positions between them, so that no exponent is positive. One bounded near 0
+  instead, as RWKV-7's (at least $-e^{-1/2}$ a position: `recurrence`'s `floor`),
+  takes it through the chunk's middle position, one matmul a pair product, its
+  exponents at most 20.
 
 Mamba-2's selective scan runs so, as decayed linear attention with `q = C` and `k = B`
 of its groups, `v = dt x` and a log decay `dt A` a head; `ssm.stepwise` is its
@@ -366,6 +371,26 @@ GLA and Lightning, at the same shapes, a decay a channel and a head:
 Their hybrids train 53% and 5% faster by it
 ([Kernels](../performance/kernels.md#glas-and-lightnings-kernel)).
 
+(recurrence-rwkv7-chunks)=
+### RWKV-7's chunks
+
+RWKV-7's recurrence at 8 × 4096 tokens on a B300, forward and backward, by blocks of
+16 positions, as before, and through each chunk's middle, now:
+
+| RWKV-7 | 32 heads of 64 | 16 heads of 128 |
+|---|---|---|
+| by blocks | 58.3 ms | 49.6 ms |
+| through the chunks' middle | 15.5 ms | 16.8 ms |
+
+The baseline's hybrid of it (`"RRRA"^4`, 32 heads of 64, 8 rows of 4096 on one B300)
+trains at 87.4k tokens a second where it trained at 45.0k, and peaks at 142.1 GiB
+where it did at 155.3, its loss at the last of 30 steps the same to 0.0004. Its
+outputs and gradients are the scan's over positions to 10⁻⁶ in float32. fla's Triton
+kernel (`chunk_rwkv7` with its lower bound, in PyTorch) takes 6.7 ms on the same
+GPU: a kernel of bux's own could take RWKV-7 further. Of the chunks' 15 ms, XLA's
+fusions over their float32 pairs and maps (64 × 64 a chunk and head) take 7.5, and
+TF32 GEMMs of 64 × 64 6.
+
 (recurrence-keep-or-recompute)=
 ### The chunks' states: keep or recompute
 
@@ -416,8 +441,9 @@ rows of 4096 a GPU, on B300s, in tokens a second and the busiest GPU's peak:
 
 - A `ppermute` chain instead of the all-gather of `pass_state`, which holds every
   device's transitions (`c` matrices `k × k` per head) on each.
-- A kernel for Lightning's decay a head: GDN-2's takes 3.5 ms a layer, fla's
-  `chunk_simple_gla` 2.1.
+- A kernel for RWKV-7 ([its chunks](#recurrence-rwkv7-chunks) take 2.3 times fla's
+  Triton kernel's time), and one for Lightning's decay a head (GDN-2's takes 3.5 ms
+  a layer, fla's `chunk_simple_gla` 2.1).
 
 ## See also
 
