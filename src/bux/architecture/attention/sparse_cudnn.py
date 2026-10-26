@@ -17,12 +17,8 @@ queries and heads and every slot, and `probabilities` the target.
 """
 
 import functools
-import importlib
-import importlib.util
-import sys
 from collections.abc import Sequence
 from functools import partial
-from types import ModuleType
 from typing import Any, no_type_check
 
 import jax
@@ -44,31 +40,19 @@ TARGET_DTYPES = (jnp.bfloat16,)  # the target's
 F32 = jnp.float32
 
 
-def _kernels(name: str) -> ModuleType:
-    """Import cudnn-frontend's module of DSA kernels `name`, past its package's
-    ``__init__`` if that needs torch, which bux does not install: the kernels do
-    not."""
-    try:
-        return importlib.import_module(name)
-    except ModuleNotFoundError as error:
-        if error.name != "torch":
-            raise
-    package = name.rpartition(".")[0]
-    spec = importlib.util.find_spec(package)
-    assert spec is not None
-    sys.modules[package] = importlib.util.module_from_spec(spec)
-    return importlib.import_module(name)
-
-
 try:  # cudnn-frontend and CuTe DSL, where the cuda extra is installed (Linux)
     import cutlass
+    from cudnn.deepseek_sparse_attention.score_recompute import (
+        sparse_score_recompute_sm100 as _scores,
+    )
+    from cudnn.deepseek_sparse_attention.sparse_attention_backward import (
+        dsa_bwd_sm100 as _backward,
+    )
+    from cudnn.deepseek_sparse_attention.sparse_attention_forward import (
+        dsa_fwd_sm100_head64 as _forward,
+    )
     from cudnn.jax import call, zeros_init
     from cutlass import cute
-
-    _DSA = "cudnn.deepseek_sparse_attention"
-    _forward = _kernels(f"{_DSA}.sparse_attention_forward.dsa_fwd_sm100_head64")
-    _backward = _kernels(f"{_DSA}.sparse_attention_backward.dsa_bwd_sm100")
-    _scores = _kernels(f"{_DSA}.score_recompute.sparse_score_recompute_sm100")
 except ImportError:
     cutlass = None
 
