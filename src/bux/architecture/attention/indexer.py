@@ -26,7 +26,7 @@ from jaxtyping import Array, Bool, Float, Int, Shaped, UInt
 
 from bux import config as cfg
 from bux import parallel
-from bux.architecture.attention import scoring
+from bux.architecture.attention import scoring, sparse
 from bux.architecture.attention.rope import rotate
 from bux.architecture.attention.sparse import Kept, Span, chunked, chunks, mask
 from bux.architecture.common.sharding import projection, shard_heads
@@ -57,7 +57,7 @@ class Scored(NamedTuple):
     #: Which block each key is in, if it kept blocks; else None.
     block: Int[Array, "b s"] | None = None
     #: The slots each query may attend to, for a loss over its kept keys' tokens.
-    span: Span | None = None
+    span: sparse.Span | None = None
 
 
 Target = Callable[[Any], Float[Array, "b c *g s"]]  # a chunk's attention to the keys
@@ -94,12 +94,17 @@ def _per_block(
     reduce: Literal["sum", "max"],
 ) -> Shaped[Array, "b t *g s"]:
     """Return every query's sum or maximum of the values of each block's slots, at the
-    block's index; -inf for the maximum of a block with none."""
+    block's index; -inf for the maximum of a block with none. A group axis joins the
+    queries' for it: with the groups an axis of their own, XLA rematerializes the
+    segment op in full under context parallelism."""
+    if values.ndim == 4:
+        b, t, g, s = values.shape
+        joined = _per_block(values.reshape(b, t * g, s), block, reduce)
+        return joined.reshape(b, t, g, s)
     op = jax.ops.segment_sum if reduce == "sum" else jax.ops.segment_max
 
-    def row(v: Shaped[Array, "*t s"], ids: Int[Array, " s"]) -> Shaped[Array, "*t s"]:
-        by_slot = jnp.moveaxis(v, -1, 0)
-        return jnp.moveaxis(op(by_slot, ids, num_segments=v.shape[-1]), 0, -1)
+    def row(v: Shaped[Array, "t s"], ids: Int[Array, " s"]) -> Shaped[Array, "t s"]:
+        return op(v.T, ids, num_segments=v.shape[-1]).T
 
     return jax.vmap(row)(values, block)
 

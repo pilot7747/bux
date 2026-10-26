@@ -472,6 +472,25 @@ def test_msa_attends_each_group_to_its_own_blocks():
     assert jnp.allclose(every(x, Taps()), gqa()(x, Taps()), atol=1e-5)
 
 
+def test_per_group_without_blocks_keeps_each_groups_best_keys():
+    """Each group's head keeps the 3 best keys the query sees by its own scores, the
+    group attends to them, and the loss is MSA's over them."""
+    attn = msa(index_port("write"), top_k=3, block_size=1)
+    assert attn.indexer is not None
+    x, taps = inputs(), Taps(training=True)
+    y = attn(x, taps)
+    [kept], [loss] = taps["topk"], taps.losses
+    selected, seen = keeps(kept, causal(12)), causal(12)[:, :, None]
+    scores = msa_scores(attn.indexer, x)
+    best = jnp.argsort(-jnp.where(seen, scores, -jnp.inf), axis=-1)[..., :3]
+    assert (selected == jax.nn.one_hot(best, 12).sum(-2).astype(bool) & seen).all()
+    assert jnp.allclose(y, gqa_reference(attn, x, per_head(selected, 4)), atol=1e-5)
+    q, k, _ = gqa_heads(attn, x)
+    p = attention_probs(q, k, attn.scale, per_head(selected, 4))
+    p = jnp.moveaxis(p.reshape(2, 2, 2, 12, 12).mean(2), 1, 2)
+    assert jnp.allclose(loss.value, kl(p, scores, selected).mean(), atol=1e-6)
+
+
 def test_a_layer_reading_an_msa_index_attends_by_its_groups():
     """A per-group index is read by a layer with as many kv heads alone."""
     writer = msa(index_port("write"), top_k=4, block_size=2)

@@ -118,12 +118,10 @@ SHRUNK = {
             " pool=max, per_group=true, relu=false, weighted=false, norm=norm))"
         ),
         (
-            "dense = gated_mlp(intermediate_size=8, activation=quick_gelu, limit=7.0,"
-            " up_offset=1.0)"
-        ),
-        (
             "experts = moe(num_experts=4, top_k=2, num_shared_experts=1, router=sigmoid,"
-            " routed_scaling_factor=2.0, load_balancing=aux_free, expert=dense)"
+            " routed_scaling_factor=2.0, load_balancing=aux_free,"
+            " expert=gated_mlp(intermediate_size=8, activation=quick_gelu, limit=7.0,"
+            " up_offset=1.0))"
         ),
     ],
     "minimax/minimax_m3.1_flash.bux": [
@@ -134,12 +132,10 @@ SHRUNK = {
             " weighted=false, norm=norm))"
         ),
         (
-            "dense = gated_mlp(intermediate_size=8, activation=quick_gelu, limit=7.0,"
-            " up_offset=1.0)"
-        ),
-        (
             "experts = moe(num_experts=4, top_k=2, num_shared_experts=1, router=sigmoid,"
-            " routed_scaling_factor=2.0, load_balancing=aux_free, expert=dense)"
+            " routed_scaling_factor=2.0, load_balancing=aux_free,"
+            " expert=gated_mlp(intermediate_size=8, activation=quick_gelu, limit=7.0,"
+            " up_offset=1.0))"
         ),
     ],
     "muse/muse_spark_open_816b_a42b.bux": [
