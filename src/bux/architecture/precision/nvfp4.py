@@ -4,11 +4,13 @@ so that W and W^T hold the same values; dy rounds stochastically; and x^T and dy
 which dW multiplies, go through a random Hadamard transform of each 16 first.
 
 `twice` quantizes an operand and its transpose (a ``blockscaled.Twice``): on a GPU by
-two passes of Pallas kernels (`kernel_twice`), the first for the largest magnitudes,
-which set the tensor scales, the second writing both copies, rounded by Blackwell's
-E2M1 conversions; elsewhere by XLA (`xla_twice`), their reference. Off a GPU the
-kernels run interpreted, and quantize as XLA does, bit for bit. `NVFP4` is the recipe,
-which `~bux.architecture.precision.matmuls` registers as the format ``nvfp4``.
+Transformer Engine's kernels where they take it
+(`~bux.architecture.precision.nvfp4_te`), else by two passes of Pallas kernels
+(`kernel_twice`), the first for the largest magnitudes, which set the tensor scales,
+the second writing both copies, rounded by Blackwell's E2M1 conversions; elsewhere by
+XLA (`xla_twice`), their reference. Off a GPU the Pallas kernels run interpreted, and
+quantize as XLA does, bit for bit. `NVFP4` is the recipe, which
+`~bux.architecture.precision.matmuls` registers as the format ``nvfp4``.
 """
 
 from collections.abc import Callable
@@ -45,7 +47,8 @@ def twice(
     tiles: bool = False,
     stochastic: bool = False,
 ) -> tuple[Blocks, Blocks]:
-    """Return x and x^T in NVFP4: by the kernels on a GPU, and by XLA elsewhere.
+    """Return x and x^T in NVFP4: on a GPU by TE's kernels where they take x, else by
+    bux's; by XLA elsewhere.
 
     Args:
         x: the operand, (r, c).
@@ -59,6 +62,10 @@ def twice(
     """
     if not kernels.gpu():
         return xla_twice(x, seed, tiles, stochastic)
+    from bux.architecture.precision import nvfp4_te  # which builds on this module
+
+    if nvfp4_te.takes(x, tiles):
+        return nvfp4_te.twice(x, seed, tiles, stochastic)
     return kernel_twice(x, seed, tiles, stochastic)
 
 
@@ -81,8 +88,8 @@ NVFP4 = Recipe(
 # Hadamard matrix, (-1)^popcount(i & j), its rows' signs drawn once.
 _I = np.arange(BLOCK)
 _SYLVESTER = (-1.0) ** np.bitwise_count(_I[:, None] & _I[None, :])
-_SIGNS = np.random.default_rng(0).choice([-1.0, 1.0], BLOCK)
-HADAMARD = (_SIGNS[:, None] * _SYLVESTER / 4).astype(np.float32)
+SIGNS = np.random.default_rng(0).choice([-1.0, 1.0], BLOCK)  # of HADAMARD's rows
+HADAMARD = (SIGNS[:, None] * _SYLVESTER / 4).astype(np.float32)
 
 
 def xla_twice(
@@ -556,7 +563,7 @@ def _amax_tile(x_ref: Any, hadamard_ref: Any, rows_ref: Any, cols_ref: Any) -> N
 # --- On a mesh: each device on its part of x ------------------------------------------
 
 
-def _offset(axes: Any, size: int) -> UInt32[Array, ""]:
+def part_start(axes: Any, size: int) -> UInt32[Array, ""]:
     """Return where this device's part starts along a dimension split over `axes`
     into parts of `size`."""
     if axes is None:
@@ -637,7 +644,7 @@ def _quantize_partition(
         decode: Float[Array, "2"],
         salt: UInt32[Array, "1"],
     ) -> NvArrays:
-        start = jnp.stack([_offset(r, x.shape[0]), _offset(c, x.shape[1])])
+        start = jnp.stack([part_start(r, x.shape[0]), part_start(c, x.shape[1])])
         return _quantize(x, hadamard, encode, decode, salt, kind, start, whole)
 
     everywhere = NamedSharding(mesh, P())

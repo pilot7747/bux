@@ -55,6 +55,13 @@ and multiplies, which computes the same values, so a format trains on a CPU too.
 format is a function, so a new one is registered under its name
 ([Matmul formats](../parallelism/precision.md#matmul-formats)).
 
+On a B200 or B300 with Transformer Engine (bux's Docker image has it), `nvfp4`
+quantizes by TE's kernels where each device has 8192 rows of x or more, as NVIDIA's
+recipe quantizes: they round the Hadamard transform to bfloat16 before they quantize
+it, and draw dy's stochastic rounding from noise of their own. So about a value in a
+hundred of x^T's lands a step from where bux's own kernels, which quantize elsewhere,
+put it ([Low-precision matmuls](../performance/kernels.md#low-precision-matmuls)).
+
 The embedding, the head, the router and softmax attention's own matmuls always stay in
 `compute` ([why attention does](#softmax-attention-in-fp8)).
 
@@ -189,8 +196,12 @@ seeds differ by 1.6%:
 | `nvfp4, last=0.15`, `q`, `kv` and `o` in compute † | +0.34% | | 56k |
 
 NVIDIA measured 1.5% at the end of 10T tokens on a 12B, against FP8, and 0.5% with the
-switch. NVFP4 quantizes by its kernels here; bfloat16's losses beside them were 4.0383
-and 3.9696.
+switch. NVFP4 quantizes by bux's Pallas kernels here; bfloat16's losses beside them
+were 4.0383 and 3.9696.
+
+By Transformer Engine's kernels, which quantize `nvfp4` on B300s now, the same `nvfp4`
+runs end at 4.0678, 4.0025 and 4.0214 at seeds 0, 1 and 2, against 4.0683, 3.9988 and
+4.0260 by the Pallas kernels: 0.11% apart at most, where the seeds differ by 1.7%.
 
 The rows marked † quantized by XLA, which on a GPU folds the cast to E4M3 and back: it
 scaled each block's values by its scale unrounded, and the GEMM by the rounded one, up
