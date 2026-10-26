@@ -474,13 +474,13 @@ function headerRows(model, facts) {
   const f = model.facts ?? {};
   const rows = [
     ["Parameters", facts.params_text ?? si(facts.params)],
-    ["Context", num(facts.context)],
     ["d_model", num(f.d_model)],
     ["Vocabulary", num(f.vocab_size)],
     ["Layers", num(f.layers)],
     ["Residual", f.residual ?? "x + f(x)"],
   ];
-  if (facts.flops_per_token != null) rows.splice(2, 0, ["FLOPs / token", si(facts.flops_per_token)]);
+  if (facts.context != null) rows.splice(1, 0, ["Context", num(facts.context)]);  // a run's seq_len
+  if (facts.flops_per_token != null) rows.splice(1, 0, ["FLOPs / token", si(facts.flops_per_token)]);
   for (const [k, v] of Object.entries(facts)) if (!SHELL.has(k) && v != null) rows.push([k, v]);
   return rows.map(([k, v]) => (v == null || v === "" ? [k, "—", true] : [k, String(v), false]));
 }

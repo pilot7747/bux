@@ -3,6 +3,7 @@
 import http.client
 import json
 import os
+import re
 import socket
 import sys
 import threading
@@ -272,3 +273,15 @@ def test_the_command_line(monkeypatch, file, capsys):
     assert main(["studio", str(file), "--port", "0"]) == 0
     out = capsys.readouterr().out
     assert served["url"] in out and "ssh -L" in out and not opened
+
+
+def test_the_page_names_only_files_that_ship():
+    static = studio_server.STATIC
+    named = re.findall(r'(?:href|src)="([\w.-]+)"', (static / "index.html").read_text())
+    for script in static.glob("*.js"):
+        text = script.read_text()
+        named += re.findall(r'(?:from|import)\s*\(?\s*"\./([\w.-]+)"', text)
+        named += re.findall(r'load\("\./([\w.-]+)", "([\w.-]+)"\)', text)
+    files = {n for item in named for n in ((item,) if isinstance(item, str) else item)}
+    assert {"app.js", "diagram.js", "training.js", "sweep.js", "panels.css"} <= files
+    assert [f for f in sorted(files) if not (static / f).is_file()] == []
