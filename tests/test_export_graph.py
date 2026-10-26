@@ -5,7 +5,7 @@ and the graph's edge cases, alone and in the zoo's models that use them, shrunk.
 import numpy as np
 import pytest
 from flax import nnx
-from test_examples import ROOT, SMALL
+from test_examples import INDEXER, MLA, ROOT, SHRUNK, SMALL, YARN
 
 from bux.architecture import Model
 from bux.architecture.layers.engram import Engram
@@ -165,70 +165,64 @@ def test_graph_edge_cases_export(source: str) -> None:
     check.compare(compile(source)).check()
 
 
-#: Zoo models that use these constructs, shrunk as tests/test_examples.py does, their
-#: layers that do not export yet swapped for gqa and gated_mlp.
+#: Zoo models that use these constructs, shrunk as tests/test_examples.py does: its
+#: SHRUNK lines, or these. Other agents' layers that do not export yet (MoE, the
+#: recurrent mixers) are swapped (`SWAPS`).
 GQA = "gqa(num_heads=4, num_kv_heads=2, head_dim=8, rope=rope(fraction=0.5))"
 ZOO = {
-    "mhc.bux": ["attn = gqa(num_heads=4, num_kv_heads=2, rope=rope())", "ffn = dense"],
-    "deepseek/deepseek_v4.1_flash.bux": [
-        "memory = engram(head_dim=4, table_size=50, conv_size=none, vocab_classes=40)",
-        f"window = {GQA}",
-        "pairs = window",
-        "single = window",
-        "experts = dense",
-        *(f"{name} = layer(window)" for name in ("P", "p", "S", "s", "I")),
-    ],
-    "qwen/qwen3.8_flash_next.bux": [
-        "residual = gr(expansion=4, rank=4)",
-        f"delta = {GQA}",
-        f"attn = {GQA}",
-        "experts = dense",
-        "ple = engram(head_dim=4, table_size=50, norm=norm, boundary_token=63)",
-    ],
-    "kimi/kimi_k3.bux": [
-        f"kda = {GQA}",
-        f"mla = {GQA}",
-        "experts = dense",
-    ],
-    "muse/muse_spark_open_816b_a42b.bux": [
-        f"attn = {GQA}",
-        f"local = {GQA}",
-        "experts = dense",
-    ],
-    "deepseek/deepseek_v3.2.bux": [f"attn = {GQA}", "experts = dense"],
-    "glm/glm_5.3.bux": [
-        f"attn = {GQA}",
-        "experts = dense",
-        "A = layer(attn, dense)",
-        "F = layer(attn)",
-        "S = layer(attn)",
-    ],
+    "mhc.bux": [],
+    "deepseek/deepseek_v4.1_flash.bux": [],
+    "qwen/qwen3.8_flash_next.bux": [],
+    "kimi/kimi_k3.bux": [],
+    "muse/muse_spark_open_816b_a42b.bux": [],
+    "glm/glm_5.3.bux": [],
+    "deepseek/deepseek_v3.2.bux": [f"attn = {MLA}{YARN}{INDEXER})"],
     "nemotron/nemotron_3_super_120b_a12b.bux": [
-        f"ssm = {GQA}",
-        f"attn = {GQA}",
+        "attn = gqa(num_heads=4, num_kv_heads=2, head_dim=8)",
         "experts = mlp(intermediate_size=8, activation=relu2)",
     ],
-    "mimo/mimo_v2.6_pro.bux": [f"attn = {GQA}", f"local = {GQA}", "experts = dense"],
+    "mimo/mimo_v2.6_pro.bux": [
+        (
+            "attn = gqa(num_heads=4, num_kv_heads=2, head_dim=12, v_head_dim=8,"
+            " fused_qkv=true, rope=rope(base=10000000, fraction=0.334))"
+        ),
+        "local = attn(sliding_window_size=4, sinks=true, rope.base=10000)",
+    ],
     "cohere/command_a_plus_05_2026.bux": [
-        f"local = {GQA}",
-        f"global = {GQA}",
+        (
+            "attn = gqa(num_heads=4, num_kv_heads=2, head_dim=8,"
+            " rope=rope(layout=interleaved))"
+        ),
+        "local = attn(sliding_window_size=4)",
         "experts = dense * 0.5",
     ],
-    "ngpt.bux": ["attn = gqa(num_heads=4, num_kv_heads=4, qk_norm=rmsnorm)"],
+    "ngpt.bux": [
+        (
+            "attn = gqa(num_heads=4, num_kv_heads=4, qk_norm=rmsnorm,"
+            " rope=rope(layout=interleaved))"
+        ),
+        "ffn = dense",
+    ],
     "modded_nanogpt.bux": [
         (
-            "attn = gqa(num_heads=2, num_kv_heads=2, head_dim=8, qk_norm=norm,"
-            " scale=0.12, rope=rope(base=1024, fraction=0.5))"
+            "attn = gqa(num_heads=2, num_kv_heads=2, head_dim=8, fused_qkv=true,"
+            " qk_norm=norm, scale=0.12, rope=rope(base=1024, fraction=0.5))"
         ),
         "ffn = mlp(intermediate_size=8, activation=relu2)",
     ],
 }
+#: What the layers no export implements yet become, by the name they are defined as.
+SWAPS = {"experts": "dense", "delta": GQA, "kda": GQA, "ssm": GQA}
 
 
 def small(name: str) -> ir.Architecture:
-    """Return the zoo model `name`, shrunk, its layers swapped as `ZOO` says."""
-    overrides = [*SMALL.strip().splitlines(), *ZOO[name]]
-    return compile((ROOT / name).read_text(), overrides=overrides)
+    """Return the zoo model `name`, shrunk, its layers swapped as `SWAPS` says: of
+    the lines that define a name, the last."""
+    source = (ROOT / name).read_text()
+    swaps = [f"{n} = {layer}" for n, layer in SWAPS.items() if f"\n{n} " in source]
+    lines = [*SMALL.strip().splitlines(), *SHRUNK.get(name, []), *swaps, *ZOO[name]]
+    overrides = {line.split("=", 1)[0].strip(): line for line in lines}
+    return compile(source, overrides=list(overrides.values()))
 
 
 @pytest.mark.parametrize("name", ZOO)
