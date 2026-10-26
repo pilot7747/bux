@@ -149,6 +149,12 @@ That is about 5e-6 a `gdn` layer, on both sides alike: a deep recurrent stack pa
 1e-4 by float32's rounding alone. The tests shorten such stacks (Qwen3-Next's to 12
 blocks) rather than loosen the check.
 
+The rounding differs by CPU too. Kimi Linear's shrunk zoo model (27 token mixers) has
+bux and the export each within 5e-5 of the export in float64 on the Mac, and 3.1e-5
+apart; an x86 CI runner put them 1.8e-4 apart (2026-10-26). So the tests of whole zoo
+models hold their logits to 1e-3, and each layer's own cases to 1e-4; greedy tokens
+and padded batches must match bux exactly in both.
+
 ## Exporting a run
 
 `bux export` writes a trained run's model, from its latest checkpoint, as a directory
