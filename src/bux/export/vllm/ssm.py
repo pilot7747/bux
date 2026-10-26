@@ -126,7 +126,7 @@ class GatedDeltaNet(Layer):
             output_gate_type=c["output_gate"],
         )
         self.mixer = QwenGatedDeltaNetAttention(
-            config,  # ty: ignore[invalid-argument-type]
+            config,
             site.vllm_config,
             prefix=site.caches[0],
         )

@@ -162,7 +162,7 @@ def _calls(
     """Yield the calls of the layers under `node`, at `pos` in scope `s` whose
     modules' paths start with `prefix`."""
     key = node.get("share")
-    if is_call(p, s, node, pos):
+    if key is not None and not (s is p.shared.get(key) and pos == ()):
         again = key in seen
         seen.add(key)
         path = f"model.shared.{key}"

@@ -114,9 +114,8 @@ def _class(call: Call) -> type[Layer]:
     return layer_classes()[kind]
 
 
-class Block(nn.Module):
-    """A scope of the plan as a module: its layers and repeats by their names, which
-    runs the scope's graph."""
+class Scoped(nn.Module):
+    """A module of a scope of the plan: its layers and repeats by their names."""
 
     def __init__(self, scope: Scope, prefix: str, layers: dict[str, nn.Module]):
         super().__init__()
@@ -135,11 +134,15 @@ class Block(nn.Module):
             else:
                 self.add_module(name, layers[prefix + name])
 
+
+class Block(Scoped):
+    """A repeat's body or a shared definition: its scope's graph on the stream."""
+
     def forward(self, x: torch.Tensor, ctx: Ctx) -> torch.Tensor:
         return run(self, self.scope.root, (), x, ctx)
 
 
-def run(block: Block, node: Node, pos: Pos, x: Any, ctx: Ctx) -> Any:
+def run(block: Scoped, node: Node, pos: Pos, x: Any, ctx: Ctx) -> Any:
     """Run `node`, at `pos` in `block`'s scope, on `x`: nothing once the first head
     has run."""
     if ctx.hidden is not None:
@@ -174,7 +177,7 @@ LEAVES: dict[str, Any] = {
 }
 
 
-def _repeat(block: Block, node: Node, pos: Pos, x: Any, ctx: Ctx) -> Any:
+def _repeat(block: Scoped, node: Node, pos: Pos, x: Any, ctx: Ctx) -> Any:
     """``body^n``: its blocks one after another, or a shared body n times."""
     key = node["body"].get("share")
     if key is not None:
@@ -195,7 +198,7 @@ def _repeat(block: Block, node: Node, pos: Pos, x: Any, ctx: Ctx) -> Any:
         "inputs_embeds": 0,
     }
 )
-class BuxModel(Block):
+class BuxModel(Scoped):
     """The model's block, at ``model``: every layer, and the graph from token ids to
     the first head's input.
 
@@ -214,7 +217,7 @@ class BuxModel(Block):
         layers = build_layers(vllm_config, p)
         super().__init__(p.top, "model.", layers)
         self.plan = p
-        self.layers_by_path = layers  # not modules of their own: the blocks hold them
+        self.layers_by_path: dict[str, Any] = layers  # the blocks hold them
         self.shared = nn.ModuleDict(
             {
                 key: layers[f"model.shared.{key}"]

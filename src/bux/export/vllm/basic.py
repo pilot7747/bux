@@ -56,9 +56,9 @@ class Embedding(Layer):
         return x if self.multiplier == 1.0 else x * self.multiplier
 
     def forward(self, ids: torch.Tensor, ctx: Ctx) -> torch.Tensor:
-        first = ctx.embedding is None
-        ctx.embedding = ctx.embedding or self
-        given = ctx.inputs_embeds if first else None
+        given = None
+        if ctx.embedding is None:  # the model's first: vLLM's inputs_embeds are its
+            ctx.embedding, given = self, ctx.inputs_embeds
         x = self.embed(ids) if given is None else given
         return x if self.positions is None else x + self.positions[ctx.positions]
 

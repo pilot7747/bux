@@ -125,6 +125,8 @@ class MoE(Layer):
             activation=ACTIVATIONS[kind],
             has_bias=expert["bias"],
             router_logits_dtype=torch.float32,
+            # vLLM's names of the shards, which a non-gated MoE has no up of
+            ckpt_names=("gate_proj", "down_proj", "up_proj" if self.gated else None),
         )
         self.shared = None
         if c["num_shared_experts"]:

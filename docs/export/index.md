@@ -107,3 +107,15 @@ layer or the setting.
 | `gqa` | RoPE (`pi`, `llama3`), QK-norm, GQA, biases, its scale; not yet its other settings or ports |
 | `conv` | yes, its inputs' tail kept in the cache as it decodes |
 | the graph | sequences, residual branches, sums, products, constants, repeats, taps, shared definitions; not yet residual algebras |
+
+## Serving in vLLM
+
+The same checkpoint runs in vLLM as a native model, by bux's plugin, with vLLM's
+paged attention, fused MoE kernels, Mamba cache and tensor parallelism:
+[Serving in vLLM](vllm.md).
+
+```{toctree}
+:hidden:
+
+vllm
+```

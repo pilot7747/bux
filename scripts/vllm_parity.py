@@ -306,7 +306,7 @@ def run(where: Path, tag: str, tp: int, eager: bool) -> None:
     )
     prompts = [TokensPrompt(prompt_token_ids=p) for p in meta["prompts"]]
     outs = llm.generate(prompts, params)
-    arrays = {}
+    arrays: dict[str, Any] = {}
     for i, out in enumerate(outs):
         gen = out.outputs[0]
         rows = [*out.prompt_logprobs[1:], *gen.logprobs]
