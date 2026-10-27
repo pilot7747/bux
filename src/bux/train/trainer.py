@@ -1019,7 +1019,10 @@ class Trainer:
         step and its FLOPs. Every `observe_every` steps it runs the step that
         observes instead. It returns once the step is launched: reading a metric
         waits for it. `timers` counts the time it took as ``launch``, or as
-        ``compile`` where the step compiled.
+        ``compile`` where the step compiled. A step that compiled it waits for, as
+        ``wait``: one that cannot run, out of memory say, raises here and by its own
+        name, where it would raise at the next read of its metrics and by the name of
+        the program that read them, as the log's stack of them.
 
         Args:
             batch: The step's rows, on the host (`bux.train.data.batches`).
@@ -1038,6 +1041,9 @@ class Trainer:
             values, metrics = step(self._split.values(), on_devices)
         self._launched.add(observes)
         self._split.take(values)
+        if part == "compile":
+            with self.timers("wait"):
+                jax.block_until_ready(metrics)
         self.step += 1
         if self.work is not None:
             work = self.work(*batch.position_ids.shape)

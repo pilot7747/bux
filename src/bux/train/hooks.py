@@ -108,10 +108,10 @@ class Log(Hook):
     Since the last log, too: the wall time a step, ``time/step_ms``; the host's in
     each part of the loop, a step (``Trainer.timers``): ``time/data_ms`` waiting for
     batches, ``time/launch_ms`` launching steps, ``time/hooks_ms`` in hooks and
-    ``time/wait_ms`` waiting for the step before; and ``time/compile_s``, the
-    seconds compiling, where a step compiled. Where the device says, its memory in
-    use, ``mem/gib``, and the most it has held, ``mem/peak_gib``: of the process's
-    device that holds most.
+    ``time/wait_ms`` waiting for the step before, or for one that compiled; and
+    ``time/compile_s``, the seconds compiling, where a step compiled. Where the
+    device says, its memory in use, ``mem/gib``, and the most it has held,
+    ``mem/peak_gib``: of the process's device that holds most.
 
     It also logs the steps that observe the model (``Trainer.observes``), whose
     metrics by layer are among the step's (`bux.train.observe`).

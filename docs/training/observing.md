@@ -47,7 +47,7 @@ out the layers, and `grep '!!'` the steps that went wrong. The Docker image sets
 | `time/step_ms` | the wall time per step since the last log |
 | `time/data_ms` | the host's time per step waiting for the next batch |
 | `time/launch_ms` | the host's time per step launching it |
-| `time/wait_ms` | the host's time per step waiting for the step before to finish, to read its metrics |
+| `time/wait_ms` | the host's time per step waiting for the step before to finish, to read its metrics, and for a step that compiled |
 | `time/hooks_ms` | the host's time per step in hooks: evals, checkpoints |
 | `time/compile_s` | the seconds spent compiling since the last log, where a step compiled |
 | `mem/gib`, `mem/peak_gib` | on GPUs, the memory in use on the process's fullest device, and the most it has held |

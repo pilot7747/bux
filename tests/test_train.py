@@ -958,6 +958,23 @@ def test_a_step_takes_the_state_without_walking_the_model_and_leaves_it_there(
     assert len(alive) == len(jax.tree.leaves(nnx.state(model)))  # not the donated
 
 
+def test_a_step_that_compiled_is_waited_for_so_that_its_failure_raises_there(
+    monkeypatch,
+):
+    # On a GPU, a step that runs out of memory fails as it runs, and its error comes
+    # from the next program that reads its outputs, by that one's name: the log's.
+    trainer, batch = _small_trainer()
+    waited: list[object] = []
+    wait = jax.block_until_ready
+    monkeypatch.setattr(jax, "block_until_ready", lambda x: waited.append(x) or wait(x))
+    first = trainer.train_on_batch(batch)  # compiles
+    assert len(waited) == 1 and waited[0] is first
+    assert set(trainer.timers.read()) == {"compile", "wait"}
+    trainer.train_on_batch(batch)
+    assert len(waited) == 1  # the steps after are launched, not waited for
+    assert set(trainer.timers.read()) == {"launch"}
+
+
 def test_a_step_starts_from_the_values_a_hook_left():
     trainer, batch = _small_trainer()
     trainer.train_on_batch(batch)
