@@ -180,7 +180,8 @@ hint: d_model = 4096
 **Every command reports all the errors it finds**, not just the first:
 
 - a syntax error loses only its own statement: a statement starts at each line
-  that begins in the first column, so an unclosed bracket costs one definition;
+  that begins in the first column, unless the line is inside a bracket still open
+  and does not parse on its own, so an unclosed bracket costs one definition;
 - each definition is checked on its own;
 - an error is not repeated at every use of a broken definition;
 - every alternative of a sweep is checked ([Checking a sweep](sweeps.md#checking-a-sweep)).

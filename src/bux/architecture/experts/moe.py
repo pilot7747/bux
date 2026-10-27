@@ -126,10 +126,6 @@ class MoE(nnx.Module):
         width: the width d of the stream it reads and writes.
         rngs: draws the initial parameters, and under ``random_logits`` the random
             logits.
-
-    Raises:
-        ValueError: groups of experts that cannot hold the top-k, or experts that
-            do not split into ``num_groups``.
     """
 
     #: The axes of each matrix of `up` and `down`. Up's last dimension, of up and
@@ -138,7 +134,6 @@ class MoE(nnx.Module):
     no_weight_decay: ClassVar = ("up_bias", "down_bias")  # stacks, but of vectors
 
     def __init__(self, config: cfg.MoEConfig, width: int, rngs: nnx.Rngs):
-        _check_groups(config)
         n, f = config.num_experts, config.expert.intermediate_size
         self.config = config
         # With shared_expert_sink, the router scores the shared experts too, last.
@@ -429,15 +424,6 @@ def balance_loss(
     f = picks.mean(over) / k
     p = (scores / scores.sum(-1, keepdims=True)).mean(over)
     return scores.shape[-1] * (f * p).sum(-1).mean()
-
-
-def _check_groups(config: cfg.MoEConfig) -> None:
-    n, groups, picked = config.num_experts, config.num_groups, config.top_k_groups
-    if n % groups or config.top_k > picked * (n // groups):
-        raise ValueError(
-            f"{groups} groups of {n} experts, {picked} of them picked, cannot hold "
-            f"the top {config.top_k}"
-        )
 
 
 def _norm(config: cfg.NormalizationConfig | None, width: int) -> Norm | None:

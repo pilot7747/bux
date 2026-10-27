@@ -107,15 +107,17 @@ experts = moe(num_experts=16, top_k=2, normalize_top_k=false, aux_loss_coef=1e-3
 ```
 
 :::{note}
-`num_groups` must divide `num_experts`, and the `top_k_groups` groups must hold at
-least `top_k` experts; the layer raises otherwise.
+`num_groups` must divide `num_experts`, `top_k_groups` be at most `num_groups`, and
+the `top_k_groups` groups must hold at least `top_k` experts; `bux check` says so
+otherwise.
 :::
 
 ## Shared experts
 
 `num_shared_experts=n` adds `n` experts that every token goes through, with weight 1
 (DeepSeekMoE). They run as one MLP of `n` times the expert's hidden units, of
-`shared_expert`'s shape, or `expert`'s when it is `none`.
+`shared_expert`'s shape, or `expert`'s when it is `none`. The settings after
+`num_shared_experts` need some: with none, setting them is an error.
 
 | Setting | Default | What it does | From |
 |---------|---------|--------------|------|

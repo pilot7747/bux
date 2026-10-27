@@ -56,7 +56,7 @@ Their settings, with defaults:
 
 | Setting | Of | Default | Meaning |
 |---------|----|---------|---------|
-| `expansion` | `hc`, `mhc`, `gr` | 4 | streams |
+| `expansion` | `hc`, `mhc`, `gr` | 4 | streams; 2 or more for `hc` and `mhc` |
 | `dynamic` | `hc`, `mhc` | `true` | coefficients that depend on the stream, else static ones |
 | `sinkhorn_iters` | `mhc` | 20 | Sinkhorn iterations |
 | `single_pass` | `hc`, `mhc` | `false` | see below |

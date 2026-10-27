@@ -162,9 +162,7 @@ class _Index:
         """Return the class whose fields follow `callee(key.`: RoPEConfig for gqa(rope."""
         cls = self.config_class(callee, inside)
         for part in key:
-            f = cls.model_fields.get(part) if cls is not None else None
-            classes = reference.config_classes(f.annotation) if f is not None else []
-            cls = classes[0] if len(classes) == 1 else None
+            cls = _field_class(cls, part)
         return cls
 
     def signature(self, st: ast.Statement) -> str:
@@ -265,11 +263,15 @@ def _expr_class(
         case ast.Name(name=name) | ast.Call(name=name):
             return ix.config_class(name, inside)
         case ast.Attr(base=base, field=name):
-            cls = _expr_class(ix, base, inside)
-            f = cls.model_fields.get(name) if cls is not None else None
-            classes = reference.config_classes(f.annotation) if f is not None else []
-            return classes[0] if len(classes) == 1 else None
+            return _field_class(_expr_class(ix, base, inside), name)
     return None
+
+
+def _field_class(cls: type[cfg.Config] | None, name: str) -> type[cfg.Config] | None:
+    """Return the config class that the field `name` of `cls` takes, if just one."""
+    f = cls.model_fields.get(name) if cls is not None else None
+    classes = reference.config_classes(f.annotation) if f is not None else []
+    return classes[0] if len(classes) == 1 else None
 
 
 # --- Hover -----------------------------------------------------------------------------
@@ -427,14 +429,16 @@ def complete(source: str, offset: int, path: str | None = None) -> list[Completi
     word = _WORD.search(before)
     start = word.start() if word else offset
     line = before[before.rfind("\n") + 1 : start]
-    if not line or "#" in _STRINGS.sub("", line):
+    stmt_start = ast.statement_start(source, start)
+    # A line in the first column starts a statement, but inside a bracket left open.
+    new = not line and not ast.unclosed(source, stmt_start, start)
+    if new or "#" in _STRINGS.sub("", line):
         return []  # a new statement's name, or a comment
     if line.endswith(("@", "$")):
         return _tap_items(source, start)
     ix = _Index(source, path)
-    stmt_start = ast.statement_start(source, start)
-    current = _current(ix, stmt_start)
     tokens = ast.tokenize(source, stmt_start, start, errors=[])[:-1]
+    current = _current(ix, _head(tokens, stmt_start, start))
     last = tokens[-1] if tokens else None
     if (
         last is not None
@@ -473,6 +477,20 @@ def _names_before_dot(tokens: list[ast.Token]) -> list[str]:
         if name.space_before or i < 2 or tokens[i - 2].text != ".":
             break
     return names
+
+
+def _head(tokens: list[ast.Token], stmt_start: int, start: int) -> int:
+    """Return where the statement being typed starts: after the last ``;`` outside
+    brackets, if any (`start`, the cursor's word, if nothing follows it)."""
+    head, depth = stmt_start, 0
+    for i, tok in enumerate(tokens):
+        if tok.kind == "OP" and tok.text in ("(", "["):
+            depth += 1
+        elif tok.kind == "OP" and tok.text in (")", "]"):
+            depth = max(0, depth - 1)
+        elif tok.kind == "OP" and tok.text == ";" and depth == 0:
+            head = tokens[i + 1].span.start if i + 1 < len(tokens) else start
+    return head
 
 
 def _current(ix: _Index, stmt_start: int) -> ast.Statement | None:
@@ -603,7 +621,7 @@ def _value_items(
     items = []
     for m in reference.members(f.annotation):
         if typing.get_origin(m) is typing.Literal:
-            items += [Completion(str(v), "value", sort="0") for v in typing.get_args(m)]
+            items += [_option_item(ix, v) for v in typing.get_args(m)]
         elif m is bool:
             items += [Completion(b, "keyword", sort="0") for b in ("true", "false")]
         elif m is type(None):
@@ -627,6 +645,16 @@ def _value_items(
                 and ix.config_class(name, current) is m
             ]
     return items
+
+
+def _option_item(ix: _Index, option: object) -> Completion:
+    """Return an option of a setting, quoted where a bare name would be a definition:
+    in a run, ``batch`` is its batch size, not the option ``"batch"``."""
+    text = str(option)
+    quoted = isinstance(option, str) and text in ix.defs
+    return Completion(
+        text, "value", insert_text=f'"{text}"' if quoted else None, sort="0"
+    )
 
 
 def _expression_items(
@@ -686,9 +714,7 @@ def _field_items(
     if isinstance(value, ir.Layer):
         value = value.config
     for part in names[1:]:
-        f = cls.model_fields.get(part) if cls is not None else None
-        classes = reference.config_classes(f.annotation) if f is not None else []
-        cls = classes[0] if len(classes) == 1 else None
+        cls = _field_class(cls, part)
         value = getattr(value, part, None) if isinstance(value, cfg.Config) else None
         if isinstance(value, cfg.Config):
             cls = type(value)

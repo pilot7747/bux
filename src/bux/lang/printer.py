@@ -7,7 +7,8 @@ equals ``a`` up to labels, and a run's source compiles back to a run with its id
 
 `to_source` prints an architecture and `run_to_source` a run (``bux fmt`` prints
 either); `config_to_source` and `value_to_source` print one config or one value, as
-hovers and the language reference show them.
+hovers and the language reference show them, and `port_to_source` a layer's port, as
+``bux render`` draws it.
 """
 
 import re
@@ -21,7 +22,7 @@ from bux.lang.compiler import ACTIVATIONS, SETTINGS, TRAIN_SETTINGS, TYPES
 from bux.lang.syntax import KEYWORDS
 from bux.train import config as tcfg
 
-_IDENT = re.compile(r"[A-Za-z][A-Za-z0-9_]*\Z")
+_IDENT = re.compile(r"[A-Za-z_][A-Za-z0-9_]*\Z")
 SUM, PROD, SEQ, UNARY, POWER, ATOM = range(6)
 
 
@@ -56,29 +57,26 @@ class _Printer:
         self.arch = arch
         # Definitions may not shadow builtins or settings, so that inline configs and
         # bare strings keep their meaning.
-        taken = (
-            {*SETTINGS, *TRAIN_SETTINGS, "model"} | KEYWORDS | set(TYPES) | ACTIVATIONS
-        )
+        settings = {*SETTINGS, *TRAIN_SETTINGS, "model"}
+        taken = settings | KEYWORDS | set(TYPES) | ACTIVATIONS
         self.names: dict[str, str] = {}
+        # Settings equal to a leaf definition print as its name: qk_norm=norm.
+        self.leaf_names: dict[str, str] = {}
         for node in ir.walk(arch.graph):
             if node is arch.graph or node.label is None or not _IDENT.match(node.label):
                 continue
             key = _key(node)
-            if key not in self.names:
-                name, i = node.label, 2
-                while name in taken:
-                    name, i = f"{node.label}_{i}", i + 1
-                taken.add(name)
-                self.names[key] = name
-        self.defined = set(self.names.values())
-        # Settings equal to a leaf definition print as its name: qk_norm=norm.
-        self.leaf_names = {
-            node.config.model_dump_json(): self.names[_key(node)]
-            for node in ir.walk(arch.graph)
-            if isinstance(node, ir.Layer)
-            and node.share is None
-            and _key(node) in self.names
-        }
+            if key in self.names:
+                continue
+            name, i = node.label, 2
+            while name in taken:
+                name, i = f"{node.label}_{i}", i + 1
+            taken.add(name)
+            self.names[key] = name
+            if isinstance(node, ir.Layer) and node.share is None:
+                self.leaf_names[node.config.model_dump_json()] = name
+        # What the source defines, which a bare string would name instead: data.
+        self.defined = set(self.names.values()) | settings
         self.emitted: set[str] = set()
         self.leaves: list[str] = []
         self.blocks: list[str] = []
@@ -172,11 +170,7 @@ class _Printer:
         return text if prec >= min_prec else f"({text})"
 
     def ports(self, node: ir.Layer) -> list[str]:
-        sigil = {"write": "@", "read": "$", "pop": "$"}
-        return [
-            f"{p.name}={sigil[p.mode]}{p.tap}{'!' if p.mode == 'pop' else ''}"
-            for p in node.ports
-        ]
+        return [port_to_source(p) for p in node.ports]
 
     def config(
         self,
@@ -242,7 +236,8 @@ def _objective(objective: tcfg.ObjectiveConfig) -> str:
     * code_bpb``, ``-tokens_per_s``."""
     text = ""
     for term in objective.terms:
-        name = term.metric if _IDENT.match(term.metric) else f'"{term.metric}"'
+        bare = _IDENT.match(term.metric) and term.metric not in KEYWORDS
+        name = term.metric if bare else f'"{term.metric}"'
         weight = abs(term.weight)
         scaled = name if weight == 1 else f"{weight!r} * {name}"
         sign = "-" if term.weight < 0 else "+"
@@ -309,6 +304,19 @@ def run_to_source(run: ir.Run) -> str:
         != fields[name].get_default(call_default_factory=True)
     ]
     return f"# {run.name}, run {run.id}\n{arch}\n" + "\n".join(settings) + "\n"
+
+
+def port_to_source(port: ir.Port) -> str:
+    """Print a layer's port as its call writes it.
+
+    Args:
+        port: A port of an `~bux.lang.ir.Layer`.
+
+    Returns:
+        ``v=@v1`` for a write, ``v=$v1`` for a read, ``v=$v1!`` for a pop.
+    """
+    sigil = "@" if port.mode == "write" else "$"
+    return f"{port.name}={sigil}{port.tap}{'!' if port.mode == 'pop' else ''}"
 
 
 # A printer with no definitions to refer to, so that values print in full.

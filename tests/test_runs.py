@@ -532,8 +532,9 @@ INDEXER = "indexer(num_heads=2, head_dim=8, "
             "false",
             "true",
         ),
-        (MLA, "gate_head_bias", "false", "true"),
-        (CSA, "gate_head_bias", "false", "true"),
+        # With the gate it biases, which they have not by default.
+        (MLA, "gate_head_bias", "false", "true, gated=true"),
+        (CSA, "gate_head_bias", "false", "true, gated=true"),
     ],
 )
 def test_a_layer_field_newer_than_ids_keeps_them_where_it_computes_as_before(
@@ -571,6 +572,14 @@ def test_a_layer_field_newer_than_ids_keeps_them_where_it_computes_as_before(
         ("gqa", "per_group"): "73f1c2e501",
     }[layer.split("(")[0], field]
     assert run_of(None).id == run_of(before).id == old != run_of(after).id
+
+
+def test_strings_that_name_a_setting_print_quoted():
+    """A bare `data` would be the run's data, not the mesh axis."""
+    [run] = runs(RUN + 'layout.batch = ["data", "expert"]')
+    assert 'layout(batch=["data", expert])' in run_to_source(run)
+    [again] = compile_runs(run_to_source(run))
+    assert again.train == run.train
 
 
 @pytest.mark.parametrize("path", EXPERIMENTS, ids=lambda p: p.stem)
@@ -616,6 +625,15 @@ def test_editor_knows_inherited_definitions(tmp_path):
         for c in features.complete(source + "x = attn(num_", len(source) + 13, path)
     ]
     assert labels[:2] == ["num_heads", "num_kv_heads"]
+
+
+def test_editor_quotes_an_option_that_names_a_definition():
+    source = (
+        ARCH + TRAIN + "e = moe(num_experts=4, top_k=2, expert=ffn, aux_loss_scope="
+    )
+    items = {c.label: c for c in features.complete(source, len(source))}
+    assert items["batch"].insert_text == '"batch"'  # a bare batch is the batch size
+    assert items["sequence"].insert_text is None
 
 
 @pytest.mark.parametrize("path", EXPERIMENTS[::2], ids=lambda p: p.stem)

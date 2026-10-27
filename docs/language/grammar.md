@@ -41,8 +41,9 @@ num_kv_heads=2)
 | operator | `->` `→` `//` `\|` `:` `+` `-` `*` `/` `^` `=` `,` `(` `)` `[` `]` `@` `$` `!` `.` `;` | |
 | comment | `#` to the end of the line | `# pre-norm` |
 
-- **Numbers.** A number has digits before any `.`, so `.5` and `1.` are not numbers.
-  One with a `.` or an exponent is a float; otherwise it is an integer. The suffix
+- **Numbers.** A number has digits before any `.`, so `.5` and `1.` are not numbers,
+  and a `_` goes between two digits, so `1_` and `1__000` are errors. One with a `.`
+  or an exponent is a float; otherwise it is an integer. The suffix
   `k` or `K`, `M`, `B` or `T` multiplies by 10^3, 10^6, 10^9 or 10^12 exactly, and
   must end the token: `4kv` is the number `4` and the name `kv`
   ([Numbers and suffixes](values.md#numbers-and-suffixes)).
@@ -59,7 +60,7 @@ Four constructs need their punctuation right after a name, with no space:
 |---------|-------|--------------|
 | `norm(eps=1e-5)` | a call: `norm` configured | `norm (attn + ffn)`: `norm`, then a group |
 | `layer(mixer) = ...` | a macro | `layer (mixer) = ...` is an error |
-| `attn.num_heads`, `attn.num_heads = 8` | a field read, an amendment | `attn .num_heads` is an error |
+| `attn.num_heads`, `attn.num_heads = 8`, `gqa(rope.base=1e6)` | a field read, an amendment, a dotted key | `attn .num_heads` and `attn. num_heads` are errors |
 | `$h!` | read and pop | `$h !` is an error |
 
 A `-` between two items is a subtraction whatever the spacing: `f -g` is `f - g`. Only
