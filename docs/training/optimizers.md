@@ -322,7 +322,8 @@ function registered under its name ([Registries](extending.md#registries)).
 
 `clip = 1.0`, the default, scales the gradient down to a global norm of 1 wherever its
 norm is larger, before the optimizer sees it (`optax.clip_by_global_norm`). `clip =
-none` turns it off. The log's `grad_norm` is the norm before clipping.
+none` turns it off; `clip = 0`, which some frameworks take for off, is an error, as
+a norm of 0 would leave the optimizer no gradient. The log's `grad_norm` is the norm before clipping.
 
 ## The loss
 

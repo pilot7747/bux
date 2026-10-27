@@ -244,7 +244,7 @@ the run has a `tokenizer`.
 | `data` | required | the held-out rows: any data a run takes, a mixture too |
 | `every` | `1000` | steps between evals |
 | `batches` | `10` | batches of `batch` rows each, the same ones every time |
-| `seq_len` | `none` | tokens a row; none: the run's `seq_len` |
+| `seq_len` | `none` | tokens a row, at least 2; none: the run's `seq_len` |
 | `batch` | `none` | rows a batch; none: the run's `batch` |
 
 An eval is a training step's forward on packed rows, with no backward. Each batch
