@@ -35,6 +35,8 @@ The **2022 family** is the decoder of OPT, GPT-NeoX and Pythia, in
 `examples/experiments/old_vs_new/old_2022.bux`:
 
 ```bux
+use agentic_code
+
 d_model    = 4096
 vocab_size = 50304                       # GPT-NeoX's 50277 tokens, padded
 
@@ -46,6 +48,11 @@ block = [norm attn] [norm ffn]
 
 layers = d_model // 128
 model  = embed block^layers norm head
+
+budget       = 129B
+batch        = 1792
+optimizer.lr = 1.5e-3
+mesh         = mesh(fsdp=8)
 ```
 
 Multi-head attention (as many key and value heads as query heads), RoPE at base 10k on
@@ -57,6 +64,8 @@ The **2026 family** is laid out as Qwen3-Next is, in
 `examples/experiments/old_vs_new/new_2026.bux`:
 
 ```bux
+use agentic_code
+
 d_model    = 3072
 vocab_size = 50304
 
@@ -74,6 +83,11 @@ A = layer(attn)
 
 groups = d_model // 256
 model  = embed "DDDA"^groups norm head
+
+budget       = 131B
+batch        = 1792
+optimizer.lr = 2.6e-3
+mesh         = mesh(fsdp=64)
 ```
 
 Three Gated DeltaNet layers to one attention layer; the attention has 2 key and value
@@ -82,16 +96,38 @@ after each mixer a mixture of 256 experts a quarter of the width wide, 8 of them
 shared one for every token, as DeepSeek-V3 splits its experts. A layer for every 64 of
 the width.
 
-Both read the same tokenizer, GPT-NeoX's, so that only the architecture differs (bits
-per byte would compare across tokenizers anyway), and both start from bux's default
-init, every weight matrix from a normal of 0.02, as OPT and Qwen do
-([Initialization](../architectures/initialization.md)). `bux check` reads either:
+Each family file is also its target's run: the recipe of step 3 (`use agentic_code`),
+20 tokens for every parameter a token goes through, a batch by the law of step 5, and
+the learning rate step 4 finds. The ladders of step 5 use the files and set each of
+these for every rung. Both read the same tokenizer, GPT-NeoX's, so that only the
+architecture differs (bits per byte would compare across tokenizers anyway), and both
+start from bux's default init, every weight matrix from a normal of 0.02, as OPT and
+Qwen do ([Initialization](../architectures/initialization.md)). `bux check` reads
+either:
 
 ```console
 $ bux check examples/experiments/old_vs_new/new_2026.bux
 d_model=3072 vocab_size=50304 layers=195
 rmsnorm×97  moe×48  gdn×36  gqa×12  embed×1  head×1
+35,694 steps = 131B tokens
+from step 0: 1792 × 2048 tokens
+phase 1, from step 32,125: 224 × 16384 tokens, data=0.5 * text(path="data/stack-edu/repos/train/*.parquet") + 0.3 * text(path="data/stack-edu/files/train/*.parquet") + 0.2 * text(path="data/fineweb-edu/sample/10BT/*.parquet", split=[0.0, 0.999])
+optimizer=adamw(lr=0.0026) schedule=wsd(warmup=0.05, shape=sqrt)
+data=0.6 * text(path="data/stack-edu/files/train/*.parquet") + 0.4 * text(path="data/fineweb-edu/sample/10BT/*.parquet", split=[0.0, 0.999])
+tokenizer=tokenizer(name="EleutherAI/gpt-neox-20b") packing=best_fit
 ```
+
+`bux plan` prices the two targets' training:
+
+```console
+$ bux plan examples/experiments/old_vs_new/old_2022.bux | tail -1
+056601a566  6.86B   129B    18.8       43.5B      8     3.19GiB     6.39GiB    0%      old_2022
+$ bux plan examples/experiments/old_vs_new/new_2026.bux | tail -1
+3354471942  91.1B   131B    1.4        43.7B      64    5.3GiB      10.6GiB    0%      new_2026
+```
+
+43.5B and 43.7B FLOPs a token: the two cost the same to train a token, as they pass it
+through as many parameters. Neither trains here; the ladders stand in for them.
 
 What a token costs is not what a model holds. The script `fit.py` of step 6 counts
 both, the parameters a token goes through (an MoE's routed experts by 8 of 256)

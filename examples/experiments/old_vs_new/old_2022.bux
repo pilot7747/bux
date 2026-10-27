@@ -4,6 +4,8 @@
 # an untied head. One number sizes it, the width: a layer for each 128 of it, and a
 # head of 128 for each 128, so that d_model = 4096 is OPT-6.7B's shape, 32 layers of
 # 32 heads, 6.4B parameters besides the embeddings.
+use agentic_code
+
 d_model    = 4096
 vocab_size = 50304                       # GPT-NeoX's 50277 tokens, padded
 
@@ -15,3 +17,12 @@ block = [norm attn] [norm ffn]
 
 layers = d_model // 128
 model  = embed block^layers norm head
+
+# The target as it would train: 20 tokens for each of its 6.44B parameters besides the
+# embeddings, a batch by DeepSeek LLM's law (3.7M tokens), the learning rate the 2022
+# ladder's searches found, its parameters and AdamW's split over a node by FSDP.
+# old_ladder.bux sizes it down and sets each of these for its rungs.
+budget       = 129B
+batch        = 1792
+optimizer.lr = 1.5e-3
+mesh         = mesh(fsdp=8)
