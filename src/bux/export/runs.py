@@ -36,7 +36,8 @@ from bux.export.check import Report, compare
 from bux.export.plan import plan
 from bux.lang import ir
 from bux.lang.printer import run_to_source
-from bux.train import hooks
+from bux.train import curriculum, hooks
+from bux.train.config import TrainConfig
 from bux.train.stages import balanced
 
 #: The name of the model's part of a checkpoint, which keeps
@@ -51,13 +52,20 @@ class Restored:
     Attributes:
         run: The run, from its ``run.json``.
         model: Its model, built with ``methods.repeat`` ``unroll``, in eval mode, its
-            state the checkpoint's, on this process's CPU.
+            state the checkpoint's, on this process's CPU, as it computes at `step`
+            (`arch`).
         step: The checkpoint's step.
     """
 
     run: ir.Run
     model: Model
     step: int
+
+    @property
+    def arch(self) -> ir.Architecture:
+        """The model as it computes at `step`: with the RoPE a curriculum's phase
+        sets from then on (`bux.lang.ir.Run.arch_at`)."""
+        return self.run.arch_at(self.step)
 
 
 @dataclass(frozen=True)
@@ -109,9 +117,10 @@ def restore(folder: Path | str, step: int | None = None) -> Restored:
     with jax.default_device(cpu), _manager(folder / "checkpoints") as manager:
         step = _step(manager, step, folder)
         layout = _layout(run, manager.metadata(step).custom_metadata or {})
-        trained = as_trained(run, layout)
+        at = run.model_copy(update={"arch": run.arch_at(step)})
+        trained = as_trained(at, layout)
         nnx.update(trained, _read(manager, step, nnx.state(trained), cpu))
-        model = unrolled(run, trained, layout)
+        model = unrolled(at, trained, layout)
     model.eval()
     return Restored(run, model, step)
 
@@ -302,9 +311,9 @@ def export(
     check: bool = False,
 ) -> Exported:
     """Write the model of the run in `folder`, from its checkpoint of `step`, to `out`
-    as a transformers model directory that loads as it is: the model
-    (`bux.export.huggingface.save`), its ``max_position_embeddings`` the run's
-    ``seq_len``, the run's tokenizer and generation config
+    as a transformers model directory that loads as it is: the model as it computes
+    at that step (`Restored.arch`), its ``max_position_embeddings`` the longest rows
+    the run trained on by then, the run's tokenizer and generation config
     (`bux.export.tokenizer.save`), and a model card, ``README.md``.
 
     With `check`, the export is compared with bux (`bux.export.check.compare`) on the
@@ -332,10 +341,10 @@ def export(
         plan(read_run(folder).arch), []
     )  # a missing layer, before a restore
     restored = restore(folder, step)
-    run, model, out = restored.run, restored.model, Path(out)
+    run, arch, model, out = restored.run, restored.arch, restored.model, Path(out)
     dtype = dtype or param_dtype(model)
-    torch_dtype, length = getattr(torch, dtype), run.train.seq_len
-    huggingface.save(run.arch, model, out, dtype=torch_dtype, max_positions=length)
+    torch_dtype, length = getattr(torch, dtype), _longest(run.train, restored.step)
+    huggingface.save(arch, model, out, dtype=torch_dtype, max_positions=length)
     if (config := run.train.tokenizer) is not None:
         assert run.arch.vocab_size is not None, "a run has a vocabulary"
         tokenizer.save(config, out, run.arch.vocab_size)
@@ -343,8 +352,13 @@ def export(
     report = None
     if check:
         with jax.default_device(jax.devices("cpu")[0]):
-            report = compare(run.arch, rounded(model, dtype))
+            report = compare(arch, rounded(model, dtype))
     return Exported(restored, out, dtype, report)
+
+
+def _longest(t: TrainConfig, step: int) -> int:
+    """Return the longest rows a run of `t` trained on in its first `step` steps."""
+    return max(c.seq_len for start, c in curriculum.phases(t) if start < max(step, 1))
 
 
 def _source(folder: Path | str) -> str:

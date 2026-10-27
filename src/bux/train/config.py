@@ -27,7 +27,7 @@ from typing import Annotated, Literal
 
 from pydantic import AfterValidator, BeforeValidator, Field, model_validator
 
-from bux.config import Config
+from bux.config import Config, RoPEScalingConfig
 
 Positive = Annotated[int, Field(gt=0)]
 Fraction = Annotated[float, Field(ge=0, le=1)]
@@ -480,9 +480,9 @@ def warmup_steps(c: ScheduleConfig, steps: int) -> int:
 
 # --- Curriculum and ramps ---------------------------------------------------------------
 # What a run reads can change as it trains: each phase of a `curriculum` takes rows of
-# another `seq_len`, another `batch` or other `data` from a step on, and a `batch_ramp`
-# grows the batch over the first steps. The steps compile again at every new shape of
-# batch (bux.train.curriculum).
+# another `seq_len`, another `batch` or other `data` from a step on, and its full
+# attention another RoPE; a `batch_ramp` grows the batch over the first steps. The
+# steps compile again at every new shape of batch and RoPE (bux.train.curriculum).
 
 # A step, or a share of the steps below 1, rounded to a step.
 At = Annotated[int, Field(gt=0)] | Annotated[float, Field(gt=0, lt=1)]
@@ -497,7 +497,14 @@ class PhaseConfig(Config):
     A source goes on, from one phase to the next, from the row it stopped at, where
     it is read at the same `seq_len`; at another, it is a dataset of its own, which
     starts from its first row. An eval reads rows of the run's own `seq_len` and
-    `batch`, whichever phase it is in."""
+    `batch`, whichever phase it is in.
+
+    `rope_scaling` and `rope_base` extend the context as DeepSeek-V3 and Qwen do:
+    from the phase's first step on, every attention layer that rotates and has no
+    `sliding_window_size` takes them in place of its own, as does its indexer; so do
+    the evals made from that step on, and an export of a checkpoint from then.
+    ``phase(at=0.9, seq_len=16384, rope_scaling=yarn(factor=8, original_max_len=2048))``
+    trains the last tenth at 16k tokens with YaRN."""
 
     type: Literal["phase"] = "phase"
     at: At  # the step it starts at, or a share of the steps: 0.9 starts the last tenth
@@ -505,6 +512,11 @@ class PhaseConfig(Config):
     seq_len: Annotated[int, Field(ge=2)] | None = None
     batch: Positive | None = None  # rows per step; none: as before
     data: DataConfig | None = None  # a source or a mixture; none: as before
+    # The RoPE scaling of full-attention layers (yarn, pi, llama3); none: as before.
+    rope_scaling: RoPEScalingConfig | None = None
+    # The RoPE base of full-attention layers, raised for long context (Llama 3's
+    # ABF); none: as before.
+    rope_base: Annotated[float, Field(gt=0)] | None = None
 
     def start(self, steps: int) -> int:
         """Return the step it starts at, in a run of `steps`."""
