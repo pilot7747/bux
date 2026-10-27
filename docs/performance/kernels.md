@@ -196,9 +196,9 @@ is bounded, and its hybrid (`"RRRA"^4`) trains at 87.4k tokens/s
 - Over 30 steps, the last loss by the kernel matches the chunks' to 0.004 (GLA) and
   0.0002 (Lightning).
 - On FineWeb-Edu (3000 steps of 8 × 4096 tokens, GEMM autotuning off, XLA's
-  deterministic ops on), the GLA hybrid's held-out loss at seeds 0, 1 and 2 is
-  3.9253, 3.8659 and 3.8961 by the kernel, and 3.9275, 3.8722 and 3.8931 by the
-  chunks: within 0.007 at each seed, where the seeds spread over 0.055.
+  deterministic ops on), the GLA hybrid's held-out loss by the kernel is within
+  0.007 of the chunks' at each of seeds 0, 1 and 2, where the seeds spread over
+  0.055.
 - At 2 × 4096 tokens in packed documents, the kernel's outputs and gradients are within
   4·10⁻³ of the chunks' in float32 (as a share of each one's norm), at GLA's own gate,
   gates down to -20 per position, spikes of -10⁴, and Lightning's decays. The log
