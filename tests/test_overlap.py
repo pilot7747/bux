@@ -2,6 +2,8 @@
 collectives run alone in a profiler's trace (bux.train.trace), and MFU that counts the
 attention a mask keeps (bux.train.flops)."""
 
+import os
+
 import jax
 import jax.numpy as jnp
 import numpy as np
@@ -130,6 +132,20 @@ def test_exposed_comm_is_the_collectives_time_with_no_compute_beside_them(tmp_pa
     # GPU 1: none of either. A step, a GPU.
     want = {"comm_ms": 50e-3 / 4, "exposed_comm_ms": 17e-3 / 4, "idle_ms": 5e-3 / 4}
     assert got == pytest.approx(want)
+
+
+def test_a_host_reads_its_own_trace_not_a_newer_one_of_another_host(tmp_path):
+    """Every host of a job writes plugins/profile/<time>/<host>.xplane.pb into the
+    run's directory: one reads its own, while another may still be writing."""
+    mine, theirs = (
+        tmp_path / t / f"{h}.xplane.pb" for t, h in [("1", "a"), ("2", "b")]
+    )
+    for when, file in enumerate((mine, theirs)):  # theirs is newer
+        file.parent.mkdir()
+        file.write_bytes(b"")
+        os.utime(file, (when, when))
+    assert trace.latest(tmp_path, "a") == mine
+    assert trace.latest(tmp_path) == theirs and trace.latest(tmp_path, "c") is None
 
 
 def test_a_trace_without_gpus_reports_nothing(tmp_path):
