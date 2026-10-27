@@ -108,8 +108,8 @@ only a tie between the two top logits closer than float32's error could flip one
 
 Given a `.bux` file instead of a run, `bux export` writes the file's model without
 weights: its code and `config.json`, but no `model.safetensors` (it removes one an
-earlier export left in `OUT`). vLLM serves it on
-random weights (`--load-format dummy`), so you can measure an architecture's speed
+earlier export left in `OUT`). vLLM serves it on random weights
+(`--load-format dummy`), so you can measure an architecture's speed
 at any size before training anything. Settings after `OUT` redefine the file's, as
 they do for `bux train`:
 
