@@ -349,6 +349,31 @@ def test_a_search_trains_at_most_its_parallel_trials_at_once(tmp_path):
     assert started(s) not in (first, second)
 
 
+def test_trials_at_the_same_point_are_one_run_trained_once(tmp_path):
+    source = SOURCE.replace("log_uniform(1e-4, 1e-2)", "1e-3")
+    source += "ffn.activation = choice(swish, gelu)\n"
+    s = Search(spaces(source + "search = search(method=halton, trials=4)\n")[0], tmp_path)
+    runs = [run for _ in range(4) if (run := s.next()) is not None]
+    assert len(s.trials) == 4 and len({r.id for r in runs}) == len(runs) == 2
+    for run in runs:
+        ended(run, tmp_path, eval_loss=1.0)
+        s.ended(run)
+    assert [t.results for t in s.trials] == [{0: 1.0}] * 4
+
+
+def test_searches_that_propose_the_same_run_train_it_once(tmp_path):
+    first, second = (
+        Search(spaces(SOURCE + f"search = search(method={m}, trials=1)\n")[0], tmp_path)
+        for m in ("halton", "tpe")  # tpe starts at halton's points
+    )
+    queue = Searches([first, second])
+    taken = queue.take(["0", "1"], lambda run: 1)
+    assert taken is not None and queue.take(["1"], lambda run: 1) is None
+    ended(taken[0], tmp_path, eval_loss=2.0)
+    queue.ended(taken[0])
+    assert first.trials[0].results == second.trials[0].results == {0: 2.0}
+
+
 def test_an_objective_is_read_from_the_latest_metrics(tmp_path):
     (tmp_path / "metrics.jsonl").write_text(
         '{"step": 1, "loss": 3.0, "a_loss": 9.0}\n{"step": 2, "loss": 2.0}\n'
