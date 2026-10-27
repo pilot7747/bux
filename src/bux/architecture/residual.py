@@ -123,7 +123,7 @@ class _Dynamic(nnx.Module):
         layernorm = cfg.NormalizationConfig(type="layernorm", affine=False, eps=eps)
         self.norm = Norm(layernorm, d)
         self.proj = nnx.Param(jnp.zeros((d, columns)))
-        self.scale = nnx.Param(jnp.asarray(0.01))
+        self.scale = nnx.Param(jnp.asarray(0.01, jnp.float32))
 
     def __call__(self, x: Float[Array, "b t n d"]) -> Float[Array, "b t n k"]:
         return self.scale[...] * jnp.tanh(self.norm(x) @ self.proj[...])
@@ -226,11 +226,13 @@ class ManifoldHyperConnections(nnx.Module):
         n, write = config.expansion, body is not None
         self.body, self.single_pass = body, config.single_pass
         self.iters, self.norm_eps = config.sinkhorn_iters, config.norm_eps
-        pre = jnp.full(n, -math.log(max(n - 1, 1)))  # sigmoid(b_pre) = 1 / n
+        # sigmoid(b_pre) = 1 / n; float32, as every parameter here: a weakly typed one
+        # would turn strong at its first update, and the step compile again.
+        pre = jnp.full(n, -math.log(max(n - 1, 1)), jnp.float32)
         res = -8.0 * (1 - jnp.eye(n))
         bias = jnp.concatenate([pre, jnp.zeros(n), res.reshape(-1)]) if write else pre
         proj = jnp.zeros((n * d, bias.shape[0]))
-        scale = jnp.full(3 if write else 1, 0.01)
+        scale = jnp.full(3 if write else 1, 0.01, jnp.float32)
         self.proj = nnx.Param(proj) if config.dynamic else None  # W
         self.scale = nnx.Param(scale) if config.dynamic else None  # a
         self.bias = nnx.Param(bias)  # b
@@ -392,7 +394,8 @@ class ResidualGate(nnx.Module):
         self, config: cfg.ResidualGateConfig, d: int, index: int, body: nnx.Module
     ):
         b = 1 / math.sqrt(index + 2)
-        self.gate = nnx.Param(jnp.full(d, config.temperature * math.log(b / (1 - b))))
+        gate = config.temperature * math.log(b / (1 - b))
+        self.gate = nnx.Param(jnp.full(d, gate, jnp.float32))
         self.temperature, self.eps = config.temperature, config.eps
         self.body = body
 

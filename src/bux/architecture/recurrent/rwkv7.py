@@ -150,8 +150,9 @@ class RWKV7(nnx.Module):
             else None
         )
         self.k_k = nnx.Param(0.71 - linear * 0.1, names=(("heads", h),))
-        self.k_a = nnx.Param(jnp.full(nk, 1.02), names=(("heads", h),))
-        self.r_k = nnx.Param(jnp.full((hv, dk), -0.04), names=("heads", None))
+        self.k_a = nnx.Param(jnp.full(nk, 1.02, jnp.float32), names=(("heads", h),))
+        r_k = jnp.full((hv, dk), -0.04, jnp.float32)
+        self.r_k = nnx.Param(r_k, names=("heads", None))
         group = cfg.NormalizationConfig(
             type="layernorm", bias=True, eps=dv * config.norm_eps
         )
