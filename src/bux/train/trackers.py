@@ -11,6 +11,8 @@ with its config in `bux.train.config`, among the ``Tracker`` types.
 """
 
 import importlib
+import secrets
+import string
 from collections.abc import Mapping
 from pathlib import Path
 from types import ModuleType
@@ -71,7 +73,7 @@ class Wandb(Sink):
             group=config.group or run.name.split("[")[0],
             name=run.name,
             tags=list(config.tags),
-            id=_run_id(folder / "wandb_id", start, self.wandb),
+            id=_run_id(folder / "wandb_id", start),
             resume="allow",
             dir=str(folder),
             mode=config.mode,
@@ -98,12 +100,13 @@ class Wandb(Sink):
             self.run.finish()
 
 
-def _run_id(path: Path, start: int, wandb: ModuleType) -> str:
+def _run_id(path: Path, start: int) -> str:
     """Return the W&B run's id: the one `path` keeps for a run that resumes, else a
-    new one, which `path` keeps from now on."""
+    new one of 8 lowercase letters and digits, as W&B makes them, which `path` keeps
+    from now on. (wandb 0.31 no longer has ``wandb.util.generate_id``.)"""
     if start and path.exists():
         return path.read_text(encoding="utf-8").strip()
-    made = wandb.util.generate_id()
+    made = "".join(secrets.choice(string.ascii_lowercase + string.digits) for _ in range(8))
     path.write_text(made + "\n", encoding="utf-8")
     return made
 
