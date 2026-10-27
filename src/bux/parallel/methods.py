@@ -133,8 +133,22 @@ def method(kind: str) -> Method:
         attend = parallel.method("attention")
         out = attend(q, k, v, args)
     """
+    return REGISTRIES[kind].find(choice(kind))
+
+
+def choice(kind: str) -> Any:
+    """Return the run's setting of the ``methods`` field `kind`, a method's name or
+    another choice, or its default outside `~bux.parallel.settings.use`.
+
+    Args:
+        kind: A field of ``methods``.
+
+    Example::
+
+        recompute = parallel.choice("states") == "recompute"
+    """
     on = active()
-    return REGISTRIES[kind].find(getattr(on.methods if on else MethodsConfig(), kind))
+    return getattr(on.methods if on else MethodsConfig(), kind)
 
 
 def validate(config: MethodsConfig) -> None:

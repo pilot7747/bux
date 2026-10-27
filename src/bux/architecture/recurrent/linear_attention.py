@@ -50,7 +50,7 @@ from jaxtyping import Array, Float
 
 from bux import config as cfg
 from bux import initializers, parallel
-from bux.architecture.common.functional import activation
+from bux.architecture.common.functional import activation, time_step_bias
 from bux.architecture.common.segments import Segments
 from bux.architecture.common.sharding import projection, shard_heads, shard_layer_input
 from bux.architecture.layers.conv import CausalConv
@@ -158,6 +158,8 @@ def stepwise(xs: Positions, shared: Shared, transition: bool) -> Chunk:
 
 
 States = Literal["keep", "recompute"]  # what a recurrence's backward pass reads
+# A gate of the delta rule's: one a channel, or one a head.
+Gate = Float[Array, "b t h _"] | Float[Array, "b t h"]
 
 
 def recurrence(
@@ -244,12 +246,6 @@ def decayed(
     return remat.named("recurrence", fused, q, k, v, log_decay)
 
 
-def _states() -> States:
-    """Return the run's `methods.states`, or keep outside ``parallel.use``."""
-    on = parallel.active()
-    return on.methods.states if on else "keep"
-
-
 def recomputed[**A, R](
     f: Callable[A, R], states: States | None = None
 ) -> Callable[A, R]:
@@ -259,7 +255,7 @@ def recomputed[**A, R](
     more forward pass. So the delta rule keeps a fourteenth of the memory its chunks'
     states and maps take, and Mamba-2's selective scan (``ssm``), which has no
     inverse, a sixteenth."""
-    if (states or _states()) == "keep":
+    if (states or parallel.choice("states")) == "keep":
         return f
     keep = jax.checkpoint_policies.save_only_these_names(chunkwise.INVERSE)
     return jax.checkpoint(f, policy=keep)
@@ -321,14 +317,15 @@ def delta_rule(
     """
     shapes = (k.shape[-1], v.shape[-1], v.dtype, log_decay.shape[-1])
     kernels = _kernels(*shapes, floor)
+    chunked = functools.partial(_chunked, floor=floor)
     if kernels is not None:
-        otherwise = functools.partial(_chunked, states="recompute")
+        otherwise = functools.partial(chunked, states="recompute")
 
         def fused(*xs: Float[Array, "b t ..."]) -> Float[Array, "b t h dv"]:
             return kernels.delta_rule(*xs, docs, otherwise)
 
         return remat.named("recurrence", fused, q, k, v, log_decay, beta)
-    return _chunked(q, k, v, log_decay, beta, docs)
+    return chunked(q, k, v, log_decay, beta, docs)
 
 
 def _kernels(
@@ -352,29 +349,15 @@ def _chunked(
     beta: Float[Array, "b t h"],
     docs: Segments | None,
     *,
+    floor: float | None = None,
     states: States | None = None,
 ) -> Float[Array, "b t h dv"]:
-    """Run `delta_rule` by `recurrence`'s chunks, which with `states = recompute` (by
-    default the run's) keep q, k, v, the log decay and beta, in their own dtype, for
-    the backward pass."""
-
-    def rule(
-        q: Float[Array, "b t h dk"],
-        k: Float[Array, "b t h dk"],
-        v: Float[Array, "b t h dv"],
-        log_decay: Float[Array, "b t h #dk"],
-        beta: Float[Array, "b t h"],
-        continues: Float[Array, "b t"],
-    ) -> Float[Array, "b t h dv"]:
-        k, log_decay = k.astype(jnp.float32), log_decay.astype(jnp.float32)
-        step = beta[..., None] * k
-        a = -jnp.exp(log_decay) * k
-        family = "the generalized delta rule"
-        return _mixed(family, None, q, step, v, log_decay, continues, a)
-
-    xs = (q, k, v, log_decay, beta, _continues(k, docs))
-    mix = recomputed(rule, states)
-    return remat.named("recurrence", mix, *xs).astype(v.dtype)
+    """Run `delta_rule` by `gated_delta_2`'s chunks, both gates beta, which with
+    `states = recompute` (by default the run's) keep q, k, v, the log decay and beta,
+    in their own dtype, for the backward pass."""
+    return _gated_chunked(
+        q, k, v, log_decay, beta, beta, docs, floor=floor, states=states
+    )
 
 
 def gated_delta_2(
@@ -428,28 +411,29 @@ def _gated_chunked(
     q: Float[Array, "b t h dk"],
     k: Float[Array, "b t h dk"],
     v: Float[Array, "b t h dv"],
-    log_decay: Float[Array, "b t h dk"],
-    erase: Float[Array, "b t h dk"],
-    write: Float[Array, "b t h dv"],
+    log_decay: Float[Array, "b t h #dk"],
+    erase: Gate,
+    write: Gate,
     docs: Segments | None,
     *,
     floor: float | None = None,
     states: States | None = None,
 ) -> Float[Array, "b t h dv"]:
-    """Run `gated_delta_2` by `recurrence`'s chunks, which with `states = recompute`
-    (by default the run's) keep its inputs, in their own dtype, for the backward
-    pass."""
+    """Run `gated_delta_2` by `recurrence`'s chunks, its gates per channel or one a
+    head (`delta_rule`'s beta, of ``b t h``), which with `states = recompute` (by
+    default the run's) keep its inputs, in their own dtype, for the backward pass."""
 
     def rule(
         q: Float[Array, "b t h dk"],
         k: Float[Array, "b t h dk"],
         v: Float[Array, "b t h dv"],
-        log_decay: Float[Array, "b t h dk"],
-        erase: Float[Array, "b t h dk"],
-        write: Float[Array, "b t h dv"],
+        log_decay: Float[Array, "b t h #dk"],
+        erase: Gate,
+        write: Gate,
         continues: Float[Array, "b t"],
     ) -> Float[Array, "b t h dv"]:
         k, log_decay = k.astype(jnp.float32), log_decay.astype(jnp.float32)
+        erase, write = (x[..., None] if x.ndim == 3 else x for x in (erase, write))
         a = -jnp.exp(log_decay) * erase * k
         written = write * v.astype(jnp.float32)
         family = "the generalized delta rule"
@@ -537,16 +521,6 @@ def into_heads(
     return projection(
         width, heads * dim, "recurrence", use_bias=False, kernel_init=named, rngs=rngs
     )
-
-
-def _dt_bias(rngs: nnx.Rngs, n: int) -> Float[Array, " n"]:
-    """Return softplus^-1 of time steps log-uniform in [1e-3, 0.1], floored at 1e-4:
-    how Mamba starts its time steps, and fla the dt_bias of Gated DeltaNet and KDA."""
-    log_dt = jax.random.uniform(
-        rngs.params(), (n,), minval=math.log(1e-3), maxval=math.log(0.1)
-    )
-    dt = jnp.maximum(jnp.exp(log_dt), 1e-4)
-    return dt + jnp.log(-jnp.expm1(-dt))
 
 
 def _log_uniform(rngs: nnx.Rngs, n: int, low: float, high: float) -> Float[Array, " n"]:
@@ -778,7 +752,7 @@ class GatedDeltaNet(DeltaNet):
         hv = self.v_heads
         self.a = into_heads(width, hv, 1, rngs)
         self.A_log = nnx.Param(_log_uniform(rngs, hv, 0.01, 16), names=("heads",))
-        self.dt_bias = nnx.Param(_dt_bias(rngs, hv), names=("heads",))
+        self.dt_bias = nnx.Param(time_step_bias(rngs.params(), hv), names=("heads",))
 
     def _log_decay(self, x: Float[Array, "b t d"]) -> Float[Array, "b t h 1"]:
         rate = jax.nn.softplus(self.a(x).astype(jnp.float32) + self.dt_bias[...])
@@ -829,7 +803,9 @@ def _channel_rates(
     unbounded = lower_bound is None
     rates = _log_uniform(rngs, heads, 1, 16) if unbounded else jnp.zeros(heads)
     A_log = nnx.Param(rates, names=("heads",))
-    dt_bias = nnx.Param(_dt_bias(rngs, heads * dk), names=(("heads", heads),))
+    dt_bias = nnx.Param(
+        time_step_bias(rngs.params(), heads * dk), names=(("heads", heads),)
+    )
     return A_log, dt_bias
 
 

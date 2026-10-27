@@ -18,6 +18,7 @@ from jaxtyping import Array, Float
 
 from bux import config as cfg
 from bux import parallel
+from bux.architecture.common.functional import time_step_bias
 from bux.architecture.common.segments import Segments
 from bux.architecture.common.sharding import projection, shard_layer_input
 from bux.architecture.layers.conv import CausalConv
@@ -134,17 +135,6 @@ def stepwise(xs: Positions, shared: Shared, transition: bool) -> Chunk:
     return Chunk(y, state, P, None if reads is None else jnp.moveaxis(reads, 0, 1))
 
 
-def _dt_bias(
-    config: cfg.StateSpaceConfig, size: int, rngs: nnx.Rngs
-) -> Float[Array, " size"]:
-    """Return the time step bias as Mamba initializes it: softplus^-1 of steps
-    log-uniform between dt_min and dt_max, floored at 1e-4."""
-    low, high = math.log(config.dt_min), math.log(config.dt_max)
-    dt = jnp.exp(jax.random.uniform(rngs.params(), (size,), minval=low, maxval=high))
-    dt = jnp.maximum(dt, 1e-4)
-    return dt + jnp.log(-jnp.expm1(-dt))
-
-
 def _out(
     n: int, width: int, name: parallel.Name, bias: bool, rngs: nnx.Rngs
 ) -> nnx.Linear:
@@ -211,7 +201,8 @@ class Mamba(nnx.Module):
             rngs.params(), (r, d_inner), minval=-(r**-0.5), maxval=r**-0.5
         )
         self.dt_proj = nnx.Param(dt_proj, names=(None, "mlp"))
-        self.dt_bias = nnx.Param(_dt_bias(config, d_inner, rngs), names=("mlp",))
+        steps = time_step_bias(rngs.params(), d_inner, config.dt_min, config.dt_max)
+        self.dt_bias = nnx.Param(steps, names=("mlp",))
         norm = cfg.NormalizationConfig(type="rmsnorm", eps=1e-6)
         self.dt_norm = Norm(norm, r)
         self.b_norm, self.c_norm = Norm(norm, n), Norm(norm, n)
@@ -292,7 +283,8 @@ class Mamba2(nnx.Module):
         )
         # Over u, B and C side by side, as the projection gives them: whole.
         self.conv = CausalConv(d_inner + 2 * g * n, config.conv_size, True, rngs)
-        self.dt_bias = nnx.Param(_dt_bias(config, h, rngs), names=("heads",))
+        steps = time_step_bias(rngs.params(), h, config.dt_min, config.dt_max)
+        self.dt_bias = nnx.Param(steps, names=("heads",))
         # A = -a, with a uniform in [1, 16] per head (Mamba-2's A_init_range).
         a = jax.random.uniform(rngs.params(), (h,), minval=1.0, maxval=16.0)
         self.A_log = nnx.Param(jnp.log(a), names=("heads",))

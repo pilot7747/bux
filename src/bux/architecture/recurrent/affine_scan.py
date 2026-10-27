@@ -106,15 +106,10 @@ _kernel_states.defvjp(_forward, _backward)
 
 
 def _run(
-    A: Maps,
-    B: Adds,
-    start: Float[Array, "z k v"],
-    block: int = BLOCK,
-    warps: int = WARPS,
-    maps: Any = jnp.float32,
+    A: Maps, B: Adds, start: Float[Array, "z k v"]
 ) -> tuple[Adds, Float[Array, "z k v"]]:
-    """Run the kernel, one program per chain and `block` columns, from `start`, the
-    maps read in `maps`; interpreted off a GPU, as tests run it."""
+    """Run the kernel, one program per chain and `BLOCK` columns, from `start`, in
+    float32; interpreted off a GPU, as tests run it."""
     from jax.experimental.pallas import triton as plgpu
 
     z, n, k, _ = A.shape
@@ -133,11 +128,11 @@ def _run(
         S = start_ref[...].astype(jnp.float32)
         last_ref[...] = jax.lax.fori_loop(0, n, step, S).astype(last_ref.dtype)
 
-    chain = pl.BlockSpec((None, n, k, block), lambda i, j: (i, 0, 0, j))
-    state = pl.BlockSpec((None, k, block), lambda i, j: (i, 0, j))
+    chain = pl.BlockSpec((None, n, k, BLOCK), lambda i, j: (i, 0, 0, j))
+    state = pl.BlockSpec((None, k, BLOCK), lambda i, j: (i, 0, j))
     return pl.pallas_call(
         kernel,
-        grid=(z, v // block),
+        grid=(z, v // BLOCK),
         in_specs=[
             pl.BlockSpec((None, n, k, k), lambda i, j: (i, 0, 0, 0)),
             chain,
@@ -148,7 +143,7 @@ def _run(
             jax.ShapeDtypeStruct(B.shape, jnp.float32),
             jax.ShapeDtypeStruct(start.shape, jnp.float32),
         ],
-        compiler_params=plgpu.CompilerParams(num_warps=warps, num_stages=2),
+        compiler_params=plgpu.CompilerParams(num_warps=WARPS, num_stages=2),
         interpret=kernels.interpreted(),
         name="affine_scan",
-    )(A.astype(maps), B.astype(jnp.float32), start)
+    )(A.astype(jnp.float32), B.astype(jnp.float32), start)
