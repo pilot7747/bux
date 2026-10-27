@@ -299,8 +299,10 @@ eval = [eval(name="code", data=code_eval),
 ```
 
 `bux prepare` packs the held-out documents at the eval's `seq_len`, and the run checks
-before it trains that the eval's rows split over its mesh, as a phase's must. The
-eval's step compiles once more, for its shape.
+before it trains that the eval's rows split over its mesh, as a phase's must. Unlike
+a step, an eval runs its batch whole, so its rows need not split into
+`methods.microbatches`, except under a pipeline, which takes them in microbatches.
+The eval's step compiles once more, for its shape.
 
 ## Checkpoints
 

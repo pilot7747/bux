@@ -324,6 +324,23 @@ def test_an_eval_of_its_own_shape_prepares_its_rows_and_reads_them(tmp_path):
     assert [line["step"] for line in lines if "long_loss" in line] == [2, 4]
 
 
+def test_an_eval_runs_its_batch_whole_but_in_a_pipeline_s_microbatches(tmp_path):
+    """On the tests' 8 devices, an eval's 8 rows split over the mesh, which a step's 2
+    microbatches of 4 would not; under a pipeline, its 4 microbatches of 2 do not."""
+    long = 'eval = eval(name="long", data=synthetic, every=2, seq_len=128, batch=8)'
+    run = smoke("steps = 2", "batch = 16", "methods = methods(microbatches=2)", long)
+    assert "long_loss" in train(run, tmp_path, echo=lambda _: None)
+    piped = smoke(
+        long,
+        "batch = 16",
+        "mesh = mesh(stage=2)",
+        "methods = methods(repeat=scan, pipeline=gpipe, microbatches=4)",
+        "precision = precision(compute=float32)",
+    )
+    with pytest.raises(ValueError, match="eval long: batch = 8 does not split over"):
+        train(piped, tmp_path, echo=lambda _: None)
+
+
 def test_an_eval_of_its_own_shape_must_split_over_the_mesh(tmp_path):
     """On the tests' 8 devices, an eval's 4 rows do not split: before anything runs."""
     run = smoke('eval = eval(name="long", data=synthetic, seq_len=128, batch=4)')

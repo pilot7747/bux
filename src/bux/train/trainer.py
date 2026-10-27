@@ -1402,7 +1402,8 @@ def _eval_shape(t: TrainConfig, e: EvalConfig) -> str:
 def _check_shapes(stretches: Sequence[curriculum.Stretch], config: TrainConfig) -> None:
     """Raise unless every shape of batch the run takes, and each eval of a shape of
     its own, splits over the mesh and the microbatches (``parallel.check``), saying
-    from which step, or which eval, where it is not the first's."""
+    from which step, or which eval, where it is not the first's. An eval runs its
+    batch whole, except under a pipeline, which takes it in microbatches."""
     for s in stretches:
         try:
             parallel.check(s.config.batch, s.config.seq_len)
@@ -1410,12 +1411,13 @@ def _check_shapes(stretches: Sequence[curriculum.Stretch], config: TrainConfig) 
             raise ValueError(
                 f"from step {s.start}, {e}" if s.start else str(e)
             ) from None
+    microbatches = None if parallel.pipeline.pipelined() else 1  # an eval's
     for e in evals(config):
         shape = evaluated(config, e)
         if shape is config:
             continue
         try:
-            parallel.check(shape.batch, shape.seq_len)
+            parallel.check(shape.batch, shape.seq_len, microbatches)
         except ValueError as err:
             raise ValueError(f"eval {e.name}: {err}") from None
 
