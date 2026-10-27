@@ -85,6 +85,7 @@ combination of alternatives. A {py:class}`bux.lang.ir.Run` holds:
 - `arch`: its `Architecture`;
 - `train`: its training settings ({py:class}`bux.train.config.TrainConfig`);
 - `choices`: what it took along each axis of the sweep;
+- `axes`: the name of each axis, the setting its first alternative is written at;
 - `id`: a hash of what the run computes, not of how it is written, watched or split
   over devices ([Running](../training/running.md)).
 

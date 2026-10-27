@@ -451,6 +451,8 @@ class Run(BaseModel):
         train: How to train it: data, optimizer, schedule, steps, mesh, ...
         choices: The alternative taken on each axis of the sweep, in the order
             written: ``("mqa", "optimizer.lr=0.01")``.
+        axes: The name of each of those axes: the definition and setting its first
+            alternative is written at, ``("attn", "optimizer.lr")``.
     """
 
     model_config = ConfigDict(frozen=True, extra="forbid")
@@ -459,6 +461,7 @@ class Run(BaseModel):
     arch: Architecture
     train: TrainConfig
     choices: tuple[str, ...] = ()
+    axes: tuple[str, ...] = ()
 
     def arch_at(self, step: int) -> Architecture:
         """Return the model as it computes at `step`, in the step that takes the run

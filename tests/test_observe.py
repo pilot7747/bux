@@ -352,6 +352,30 @@ def test_wandb_logs_a_run_s_metrics_and_resumes_the_w_b_run_it_started(
     assert ids[0] == ids[1] != ids[2] and all(len(i) == 8 for i in ids)
 
 
+def test_wandb_names_each_axis_counts_parameters_and_logs_the_objective(
+    tmp_path, monkeypatch
+):
+    calls = fake_wandb(monkeypatch)
+    sweep = source(
+        MOE,
+        variant="a: 1 | b: 2",
+        seed="variant",
+        optimizer="adamw(lr=1e-3 | 3e-3)",
+        eval='[eval(name="code", data=synthetic), eval(name="repo", data=synthetic)]',
+        objective="0.5 * code_loss + 0.25 * repo_loss + 1",
+    )
+    run = compile_runs(sweep, filename="pos.bux")[-1]
+    sink = Wandb(WandbConfig(), run, tmp_path, start=0)
+    config = calls.init[0]["config"]
+    assert config["axes"] == {"variant": "b", "optimizer.lr": "3e-3"}
+    # Two MoEs of 4 experts, each a token takes 2 of: half of 2 × (4096 + 2048) idle.
+    assert config["params"] - config["active_params"] == 6144
+    for scalars in ({"loss": 3.0}, {"code_loss": 2.0}, {"repo_loss": 4.0}, {"loss": 1}):
+        sink.write(1, scalars)
+    logged = [data.get("objective") for _, data in calls.logged]
+    assert logged == [None, None, 0.5 * 2 + 0.25 * 4 + 1, None]
+
+
 def events(folder) -> list:
     """The events of the TensorBoard files in `folder`, in order: records of a
     length, its checksum, an Event and its checksum."""

@@ -18,6 +18,9 @@ from pathlib import Path
 from types import ModuleType
 from typing import Any
 
+from flax import nnx
+
+from bux.architecture import Model, active_params, num_params
 from bux.lang import ir
 from bux.lang.printer import run_to_source
 from bux.train import config as tcfg
@@ -48,7 +51,10 @@ def _module(name: str, extra: str) -> ModuleType:
 
 class Wandb(Sink):
     """Weights & Biases (`bux.train.config.WandbConfig`): a W&B run for the run,
-    named as it is, in a group of its file's runs, with its settings as its config.
+    named as it is, in a group of its file's runs, with its settings as its config
+    (`settings`). A run with an ``objective`` setting logs its value too, as
+    ``objective``, at each log that updates one of its metrics, once each has one.
+
     A run that resumes goes on with the W&B run it started, whose id its directory
     keeps in wandb_id; a fresh one starts a W&B run of its own. Unlike metrics.jsonl
     and TensorBoard's events, the W&B run keeps the steps that a crash logged past the
@@ -64,6 +70,8 @@ class Wandb(Sink):
 
     def __init__(self, config: tcfg.WandbConfig, run: ir.Run, folder: Path, start: int):
         self.run: Any = None
+        self.goal = run.train.objective
+        self.latest: dict[str, float] = {}  # each term's latest value
         if not is_main_process():
             return
         self.wandb = _module("wandb", "wandb")
@@ -81,9 +89,26 @@ class Wandb(Sink):
         )
 
     def write(self, step: int, scalars: Scalars) -> None:
-        """Log `scalars` at `step`."""
-        if self.run is not None:
-            self.run.log(dict(scalars), step=step)
+        """Log `scalars` at `step`, and the objective if they update it."""
+        if self.run is None:
+            return
+        logged = dict(scalars)
+        if (value := self.objective(scalars)) is not None:
+            logged["objective"] = value
+        self.run.log(logged, step=step)
+
+    def objective(self, scalars: Scalars) -> float | None:
+        """Return the objective with the metrics in `scalars`, each term at its
+        latest value; None without an objective, if they update none of its terms,
+        or if one has no value yet."""
+        if self.goal is None:
+            return None
+        terms = {t.metric for t in self.goal.terms}
+        self.latest |= {k: v for k, v in scalars.items() if k in terms}
+        if terms.isdisjoint(scalars) or len(self.latest) < len(terms):
+            return None
+        weighted = (t.weight * self.latest[t.metric] for t in self.goal.terms)
+        return self.goal.constant + sum(weighted)
 
     def histograms(self, step: int, histograms: Mapping[str, Histogram]) -> None:
         """Log each histogram at `step`, as W&B's, over ``log2 |x|``."""
@@ -112,16 +137,39 @@ def _run_id(path: Path, start: int) -> str:
 
 
 def settings(run: ir.Run) -> dict[str, Any]:
-    """Return a tracker's config of `run`: its id, its sweep's choices, its training
-    settings, its model's settings but its graph, and the run as one .bux file."""
-    arch = run.arch.model_dump(mode="json", exclude={"graph"})
+    """Return a tracker's config of `run`: its id, its sweep's choices and what each
+    axis took (`axes`), its parameters and those a token goes through
+    (`bux.architecture.model.active_params`), its training settings, its model's settings
+    but its graph, and the run as one .bux file."""
+    model = nnx.eval_shape(
+        lambda: Model(run.arch, rngs=nnx.Rngs(0)), graph_updates=False
+    )
     return {
         "id": run.id,
         "choices": list(run.choices),
+        "axes": axes(run),
+        "params": num_params(model),
+        "active_params": active_params(model),
         "train": run.train.model_dump(mode="json"),
-        "arch": arch,
+        "arch": run.arch.model_dump(mode="json", exclude={"graph"}),
         "source": run_to_source(run),
     }
+
+
+def axes(run: ir.Run) -> dict[str, str]:
+    """Return what `run` took on each axis of its sweep, by the axis's name
+    (`bux.lang.ir.Run.axes`): its label, or its value as written,
+    ``{"variant": "rope", "optimizer.lr": "2e-3"}``. Axes that share a name are
+    numbered after the first: ``optimizer.lr#2``."""
+    taken: dict[str, str] = {}
+    # A run made without the names of its axes has none.
+    for name, part in zip(run.axes, run.choices, strict=False):
+        key, n = name, 1
+        while key in taken:
+            n += 1
+            key = f"{name}#{n}"
+        taken[key] = part.removeprefix(f"{name}=")
+    return taken
 
 
 class TensorBoard(Sink):
