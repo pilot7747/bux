@@ -7,7 +7,8 @@ equals ``a`` up to labels, and a run's source compiles back to a run with its id
 
 `to_source` prints an architecture and `run_to_source` a run (``bux fmt`` prints
 either); `config_to_source` and `value_to_source` print one config or one value, as
-hovers and the language reference show them.
+hovers and the language reference show them, and `port_to_source` a layer's port, as
+``bux render`` draws it.
 """
 
 import re
@@ -169,11 +170,7 @@ class _Printer:
         return text if prec >= min_prec else f"({text})"
 
     def ports(self, node: ir.Layer) -> list[str]:
-        sigil = {"write": "@", "read": "$", "pop": "$"}
-        return [
-            f"{p.name}={sigil[p.mode]}{p.tap}{'!' if p.mode == 'pop' else ''}"
-            for p in node.ports
-        ]
+        return [port_to_source(p) for p in node.ports]
 
     def config(
         self,
@@ -307,6 +304,19 @@ def run_to_source(run: ir.Run) -> str:
         != fields[name].get_default(call_default_factory=True)
     ]
     return f"# {run.name}, run {run.id}\n{arch}\n" + "\n".join(settings) + "\n"
+
+
+def port_to_source(port: ir.Port) -> str:
+    """Print a layer's port as its call writes it.
+
+    Args:
+        port: A port of an `~bux.lang.ir.Layer`.
+
+    Returns:
+        ``v=@v1`` for a write, ``v=$v1`` for a read, ``v=$v1!`` for a pop.
+    """
+    sigil = "@" if port.mode == "write" else "$"
+    return f"{port.name}={sigil}{port.tap}{'!' if port.mode == 'pop' else ''}"
 
 
 # A printer with no definitions to refer to, so that values print in full.

@@ -85,6 +85,13 @@ def test_completes_names_parameters_fields_taps_and_pattern_letters():
     assert labels(PRELUDE + "|") == []  # a new statement's name
 
 
+def test_completes_in_a_bracket_left_open_and_after_a_semicolon():
+    # A line in the first column inside a bracket still open goes on with the call.
+    assert "num_kv_heads" in labels(PRELUDE + "x = gqa(num_heads=2,\nnum_kv|")
+    got = labels(PRELUDE + "f(x) = [x]; g(y) = [norm |")  # g's parameters, not f's
+    assert "y" in got and "x" not in got
+
+
 # --- Hover --------------------------------------------------------------------------
 
 

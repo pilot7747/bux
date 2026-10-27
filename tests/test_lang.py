@@ -107,6 +107,18 @@ def test_call_needs_adjacent_paren():
     )
 
 
+def test_numbers_and_dotted_names_take_no_stray_underscore_or_space():
+    for body, message in [
+        ("x = 1_", "a number's '_' goes between two digits: 1_000"),
+        ("x = 1__0", "a number's '_' goes between two digits: 1_000"),
+        ("attn. num_heads = 4", "expected a setting name right after '.', found"),
+        ("x = attn. num_heads", "expected a setting name right after '.', found"),
+        ("x = gqa(rope. base=1)", "expected a field name right after '.', found"),
+        ("x = gqa(rope .base=1)", "expected '=', found '.'"),
+    ]:
+        assert error(body).message.startswith(message), body
+
+
 def test_continuation_lines_comments_and_semicolons():
     a = compile(
         """
@@ -322,6 +334,15 @@ def test_check_reports_every_error_and_recovers_from_syntax_errors():
     ]
 
 
+def test_a_syntax_error_spares_a_call_continued_in_the_first_column():
+    report = check(
+        PRELUDE + "a = gqa(num_heads=2,\nnum_kv_heads=2)\nbad = (norm\n"
+        "model = embed [norm a] head\n"
+    )
+    assert [e.message for e in report.errors] == ["expected ')', found end of input"]
+    assert report.values["a"] == cfg.GQAConfig(num_heads=2, num_kv_heads=2)
+
+
 def test_integer_factor_is_rejected_with_a_hint():
     err = error("model = embed ([attn] * 3) head")
     assert "ambiguous" in err.message and "^3" in (err.hint or "")
@@ -532,6 +553,18 @@ def test_render_draws_residual_branches_under_the_stream():
         "──┬────────────⊕──┬────────────────⊕──\n"
         "  └─norm──attn─┘  └─norm──┬─attn─⊕─┘\n"
         "                          └─ffn──┘\n"
+    )
+
+
+def test_render_draws_two_blocks_of_one_label_apart_and_pops_as_written():
+    arch = build(
+        "inner(f) = [norm f]\nouter(g) = inner(g) scale\n"
+        "model = embed outer(attn) outer(ffn) head"
+    )
+    drawn = render(arch)
+    assert "┤inner(g)_2├" in drawn and "norm──ffn" in drawn
+    assert "attn(v=$v!)" in render(
+        build("model = embed [attn(v=@v)] [attn(v=$v!)] head")
     )
 
 

@@ -589,6 +589,15 @@ def test_editor_knows_inherited_definitions(tmp_path):
     assert labels[:2] == ["num_heads", "num_kv_heads"]
 
 
+def test_editor_quotes_an_option_that_names_a_definition():
+    source = (
+        ARCH + TRAIN + "e = moe(num_experts=4, top_k=2, expert=ffn, aux_loss_scope="
+    )
+    items = {c.label: c for c in features.complete(source, len(source))}
+    assert items["batch"].insert_text == '"batch"'  # a bare batch is the batch size
+    assert items["sequence"].insert_text is None
+
+
 @pytest.mark.parametrize("path", EXPERIMENTS[::2], ids=lambda p: p.stem)
 def test_features_never_fail_on_runs_while_typing(path):
     text, name = path.read_text(), str(path)
