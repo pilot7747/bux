@@ -1,19 +1,20 @@
 # Add a layer
 
-In this tutorial you add a new layer to bux and use it in a `.bux` file: a **token
-shift**, which mixes each token's stream with the token before it, as RWKV does. You
-write its config, which the compiler, the editor and the docs read, and its builder,
-which makes the Flax module that runs it. Then you train with it, sweep it on and
-off, see its documentation on hover, and test it.
+Add a new layer to bux and use it from a `.bux` file. The layer is a **token shift**,
+which mixes each token's stream with the token before it, as RWKV does. By the end
+you will have trained a model with it, swept it on and off, seen its documentation on
+hover in your editor, and tested it.
 
 A layer is two pieces of Python in bux's source, so you edit your checkout:
 
 | piece   | where                                   | what it does                                    |
 |---------|-----------------------------------------|-------------------------------------------------|
-| config  | `src/bux/config.py`, in the `LayerConfig` union | its name in the language and its settings, checked as pydantic fields |
-| builder | a module under `src/bux/architecture/`, registered with `@register` | makes the module that computes it |
+| config  | `src/bux/config.py`, in the `LayerConfig` union | its name in the language and its settings, checked as pydantic fields; the compiler, the editor and the docs read it |
+| builder | a module under `src/bux/architecture/`, registered with `@register` | makes the Flax module that computes it |
 
-It builds on [Your own data](your-own-data.md), whose stories run it trains.
+It uses two files from earlier tutorials: `mine/tiny.bux` from
+[Train on a laptop](train-on-a-laptop.md) and `mine/stories.bux` from
+[Your own data](your-own-data.md).
 [Adding a layer](../architectures/adding-a-layer.md) is the reference for everything
 a layer can do.
 
@@ -25,13 +26,13 @@ $$
 y_t = (1 - \mu) \, x_t + \mu \, x_{t-1},
 $$
 
-and a document's first token has nothing before it, so there $x_{t-1}$ is 0. Packed
-rows hold several documents, so "the token before" must stop at a document's start.
-It keeps the stream's width, so it can go anywhere in a block:
-`[norm token_shift attn]`.
+where $x_{t-1}$ is 0 at a document's first token, which has nothing before it.
+Packed rows hold several documents, so "the token before" must stop at each
+document's start. The layer keeps the stream's width, so it can go anywhere in a
+block: `[norm token_shift attn]`.
 
-Before you write anything, the compiler does not know the name, and says what a new
-layer needs:
+Before you write anything, the compiler does not know the name, and its error says
+what a new layer needs:
 
 ```console
 $ bux check mine/tiny.bux 'shift = token_shift(init=0.5)'
@@ -45,10 +46,10 @@ error: unknown layer or block 'token_shift'
 
 ## 2. Write its config
 
-A config is a pydantic class with a `type` tag, which is its name in the language. Its
-docstring says what it is, and the comment beside or above each field says what the
-field does. In `src/bux/config.py`, next to the other sequence mixers (after
-`ShortConvConfig`), add:
+A config is a pydantic class with a `type` tag, which is the layer's name in the
+language. Its docstring says what the layer is, and the comment beside or above each
+field says what the field does. In `src/bux/config.py`, next to the other sequence
+mixers (after `ShortConvConfig`), add:
 
 ```python
 class TokenShiftConfig(Config):
@@ -59,9 +60,9 @@ class TokenShiftConfig(Config):
     init: float = 0.5  # the share mu that every channel starts at
 ```
 
-Then add it to the `LayerConfig` union, further down the same file. The union is
-where the compiler learns layer names, and what the IR, checkpoints, run ids, the
-printer and the editor read configs by:
+Then add it to the `LayerConfig` union, further down the same file. The compiler
+learns layer names from the union, and the IR, checkpoints, run ids, the printer and
+the editor all read configs through it:
 
 ```python
 LayerConfig = Annotated[
@@ -94,7 +95,8 @@ block
   └─norm──token_shift──attn─┘  └─norm──ffn─┘
 ```
 
-Its settings are checked against the schema, with suggestions, like every layer's:
+Its settings are checked against the schema, with suggestions, like those of every
+other layer:
 
 ```console
 $ bux check mine/tiny.bux 'shift = token_shift(int=0.9)'
@@ -106,9 +108,9 @@ error: token_shift has no setting 'int'
   = hint: did you mean 'init'?
 ```
 
-Training is another matter. Without a builder, the backend cannot make the module, and
-says so as it builds the model. Here it trains `mine/shifted.bux`, the run you write
-in [step 4](#4-use-it), before the builder exists:
+Training is another matter. Without a builder, the backend cannot make the module,
+and says so when it builds the model. Here is `mine/shifted.bux`, the run you write
+in [step 4](#4-use-it), trained before the builder exists:
 
 ```console
 $ bux train mine/shifted.bux
@@ -118,10 +120,11 @@ NotImplementedError: the reference backend has no 'token_shift' layer yet; add o
 
 ## 3. Write its builder
 
-A builder takes the layer's config, the width of the stream it reads, the taps it
-reads and writes (its ports), and a `Context` with the whole architecture and the
-`rngs` for initial parameters. It returns a Flax NNX module, which the model calls as
-`module(x, taps)`. Create `src/bux/architecture/layers/shift.py`:
+A builder takes four arguments: the layer's config, the width of the stream it
+reads, the taps it reads and writes (its ports), and a `Context` with the whole
+architecture and the `rngs` for initial parameters. It returns a Flax NNX module,
+which the model calls as `module(x, taps)`. Create
+`src/bux/architecture/layers/shift.py`:
 
 ```python
 """Token shift: each channel mixes in the token before, within its document."""
@@ -155,17 +158,17 @@ def _(
     return TokenShift(c, width)
 ```
 
-- `segments(taps)` says where the documents of a packed batch are, made once a
-  forward pass from the batch's positions. `within` counts the tokens of a token's
-  document before it, so `within > 0` is false exactly at a document's start. It is
-  `None` when every row is one document.
+- `segments(taps)` says where the documents of a packed batch are. It is computed
+  once per forward pass from the batch's positions, and is `None` when every row is
+  one document. `within` counts the tokens before each token in its document, so
+  `within > 0` is false exactly at a document's start.
 - `x + mu * (before - x)` is $(1 - \mu) x_t + \mu x_{t-1}$.
 - The annotations say each array's dtype and shape (`"b t d"`: rows, positions,
   width); bux's tests check them on every call.
 
-A builder registers when its module is imported, and `bux.architecture` imports bux's
-own. In `src/bux/architecture/__init__.py`, import it next to the other layers, and
-add `"TokenShift"` to `__all__`:
+A builder registers when its module is imported, and `bux.architecture` imports all
+of bux's own. In `src/bux/architecture/__init__.py`, import the new module next to
+the other layers, and add `"TokenShift"` to `__all__`:
 
 ```python
 from bux.architecture.layers.norm import DyT, Norm
@@ -173,10 +176,10 @@ from bux.architecture.layers.shift import TokenShift
 ```
 
 :::{note}
-Registering a builder for a type that has one already replaces bux's own, so another
-implementation of a layer, a fused kernel say, plugs in the same way. A *new* type
-always needs its config in `bux/config.py`: the union is a pydantic discriminated
-union that the IR and the compiler fix as they load.
+Registering a builder for a type that already has one replaces bux's own, so another
+implementation of a layer, such as a fused kernel, plugs in the same way. A *new*
+type always needs its config in `bux/config.py`: the union is a pydantic
+discriminated union, fixed when the IR and the compiler load.
 :::
 
 ## 4. Use it
@@ -203,9 +206,9 @@ shifted step 200/200  loss 0.7190  lr 0.00e+00  grad 0.281  8,734 tok/s  ...
 shifted step 200/200  eval loss 0.7290  eval bpb 0.2446
 ```
 
-Nothing else had to know about the new layer: the trainer, the optimizer's weight
-decay (which skips vectors such as `mu`), checkpoints, `bux plan`'s parameter and
-FLOP counts, and the run's id all follow from the config and the module.
+Nothing else had to know about the new layer. The trainer, the optimizer's weight
+decay (which skips vectors such as `mu`), checkpoints, the parameter and FLOP counts
+of `bux plan`, and the run's id all follow from the config and the module.
 
 To ablate it, make it an alternative. `_` is the identity, so `off` is the block
 without the shift:
@@ -223,9 +226,9 @@ the same as `token_shift(init=0.5)`.
 
 ## 5. See it in the editor
 
-`bux-lsp` documents a layer on hover from its config: the docstring, and each field
-with its type, its default and its comment. Hover over `token_shift` in
-`mine/shifted.bux` and it shows:
+`bux-lsp` builds a layer's hover documentation from its config: the docstring, and
+each field with its type, default and comment. Hover over `token_shift` in
+`mine/shifted.bux` to see:
 
 ```text
 **token_shift** — layer
@@ -237,9 +240,9 @@ mu, as (1 - mu) x[t] + mu x[t - 1]. A document's first token has none before it.
 ```
 
 Completion offers `init` inside `token_shift(`, and errors appear as you type
-([Tooling](../language/tooling.md)). The [language reference](../reference/language/layers.md)
-of these docs is generated from the same docstring and comments, so the layer is
-documented there too.
+([Tooling](../language/tooling.md)). The
+[language reference](../reference/language/layers.md) is generated from the same
+docstring and comments, so the layer is documented there too.
 
 The editor's features are plain functions, so you can call them yourself:
 
@@ -291,27 +294,30 @@ $ uv run pytest -q tests/test_token_shift.py
 2 passed in 2.01s
 ```
 
-The tests run on 8 CPU devices (`tests/conftest.py`) with every array's annotation
-checked. Run `make lint typecheck` too: ruff and ty check the new code as they check
-the rest.
+The tests run on 8 CPU devices (`tests/conftest.py`), with every array's annotation
+checked. Run `make lint typecheck` too: ruff and ty check the new code like the rest.
 
-## 7. Where to go from here
+## 7. Go further
 
-A layer can do more than this one, each through the same two pieces:
+A layer can do more than this one, all through the same two pieces:
 
 - **Settings that are other configs**, such as `rope=rope(...)` or a nested
   `expert=gated_mlp(...)`, are pydantic fields of those types.
 - **Optimizer treatment**: class attributes on the module say how optimizers treat
-  its parameters: `no_weight_decay` names parameters to skip in weight decay whatever
+  its parameters. `no_weight_decay` names parameters to skip in weight decay whatever
   their shape, and `no_muon` keeps a module's matrices out of Muon.
-- **Parallelism**: a parameter's dimensions take names, `nnx.Param(..., names=("heads",))`,
-  which the run's `layout` splits over the mesh. A layer with no names trains under
-  FSDP; names matter for tensor and expert parallelism ([Layout](../parallelism/layout.md)).
-- **A loss of its own**: `report(taps, "my_loss", weight, value)` in the forward adds
+- **Parallelism**: a parameter's dimensions take names,
+  `nnx.Param(..., names=("heads",))`, which the run's `layout` splits over the mesh.
+  A layer with no names trains under FSDP; names matter for tensor and expert
+  parallelism ([Layout](../parallelism/layout.md)).
+- **Its own loss term**: `report(taps, "my_loss", weight, value)` in the forward adds
   `weight * value` to the training loss and logs it ([Custom training](custom-training.md)).
 - **Ports**: a config's `ports` let it export an internal tensor to a tap, and read it
   back in another layer, as `attn(v=@v1)` does.
 
-[Adding a layer](../architectures/adding-a-layer.md) covers each of these in detail.
-Next, [custom training](custom-training.md) changes the trainer the same way: a
-function or a class of your own, not a fork.
+## Next steps
+
+- [Custom training](custom-training.md): change the trainer the same way, with a
+  function or a class of your own instead of a fork.
+- [Adding a layer](../architectures/adding-a-layer.md): each of the features above in
+  detail.
