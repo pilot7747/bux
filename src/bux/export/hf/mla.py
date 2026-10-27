@@ -7,19 +7,12 @@ import torch
 from torch import nn
 
 from .attention import SoftmaxAttention, reads
-from .common import Ctx, Norm, Site
+from .common import Ctx, Norm, Site, norm_config
 from .rope import Rope, rotated_dims
 from .sparse import Indexer
 
 #: The norm of MLA's query and key-value latents.
-LATENT_NORM = {
-    "type": "rmsnorm",
-    "eps": 1e-06,
-    "affine": True,
-    "bias": False,
-    "zero_centered": False,
-    "scale_input": False,
-}
+LATENT_NORM = norm_config("rmsnorm")
 
 
 class LatentAttention(SoftmaxAttention):

@@ -36,7 +36,7 @@ class Engram(nn.Module):
     bux_types = ("engram",)
 
     @staticmethod
-    def cache_type(c: dict) -> str:
+    def cache_type(c: dict, ports: list) -> str:
         """The cache layer it keeps, as ``config.layer_types`` names it."""
         return "conv"
 

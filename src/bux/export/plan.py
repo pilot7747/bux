@@ -20,7 +20,6 @@ module's path, which is also the prefix of its weights.
 
 import keyword
 import math
-from collections import Counter
 from collections.abc import Callable, Iterator
 from dataclasses import dataclass, field
 
@@ -194,22 +193,16 @@ class Plan:
         return [c for c in self.calls if stop is None or c.trail[: len(stop)] <= stop]
 
     def sites(self) -> dict[str, dict]:
-        """Return each module's site, by its path: its depth, how many layers of its
-        type run before it, its ports, and its type's `SITE_EXTRAS`."""
-        seen: Counter[str] = Counter()
+        """Return each module's site, by its path: its depth, its ports, and its
+        type's `SITE_EXTRAS`."""
         out = {}
-        for call in self.calls:
-            if not call.first:
-                continue
-            kind = call.layer.config.type
-            hook = SITE_EXTRAS.get(kind)
+        for call in (c for c in self.calls if c.first):
+            hook = SITE_EXTRAS.get(call.layer.config.type)
             out[call.path] = {
                 "depth": call.depth,
-                "nth": seen[kind],
                 "ports": [[p.name, p.tap, p.mode] for p in call.layer.ports],
                 "extra": hook(self, call) if hook else {},
             }
-            seen[kind] += 1
         return out
 
 

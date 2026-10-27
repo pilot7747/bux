@@ -17,7 +17,6 @@ generating needs none of what comes after, such as multi-token prediction.
 """
 
 import importlib
-import inspect
 import pkgutil
 import pprint
 from dataclasses import dataclass, field
@@ -431,15 +430,14 @@ def cache_layer(layer: ir.Layer) -> tuple[str, dict] | None:
     """Return the kind of the cache layer each call of `layer` keeps, and what the
     config sets for it alone (``per_layer_config``), or None for none.
 
-    Its class's ``cache_type(c)``, or ``cache_type(c, ports)`` where its ports decide
-    (as ``[name, tap, mode]``), returns the kind, ``(kind, settings)``, or None.
+    Its class's ``cache_type(c, ports)``, of its config and its ports (as ``[name,
+    tap, mode]``), returns the kind, ``(kind, settings)``, or None.
     """
     fn = getattr(layer_class(layer), "cache_type", None)
     if fn is None:
         return None
     c = layer.config.model_dump(mode="json")
-    ports = [[port.name, port.tap, port.mode] for port in layer.ports]
-    kind = fn(c, ports) if len(inspect.signature(fn).parameters) > 1 else fn(c)
+    kind = fn(c, [[port.name, port.tap, port.mode] for port in layer.ports])
     if kind is None or isinstance(kind, tuple | list):
         return None if kind is None else (kind[0], dict(kind[1]))
     return kind, {}
