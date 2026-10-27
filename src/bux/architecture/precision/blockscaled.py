@@ -275,15 +275,18 @@ def copies_shardings(mesh: Mesh, spec: P) -> Shardings:
 # OCP's MX format: E4M3 values in blocks of 32, a power-of-two scale (E8M0) a block.
 
 MX_BLOCK = 32
+# The compute capability the kernel needs, for Triton's E4M3: Ada's and Hopper's on.
+MX_CAPABILITY = 8.9
 
 
 def mx_twice(
     x: Float[Array, "r c"], seed: UInt32[Array, ""] | None = None
 ) -> tuple[Blocks, Blocks]:
     """Return x and x^T in MXFP8, each in blocks of 32 along its rows: by one pass of
-    a kernel over x on a GPU, and by XLA elsewhere. MXFP8 rounds to nearest, and needs
-    no seed. `MXFP8`'s quantizer of each operand (a `Twice`)."""
-    if not kernels.gpu():
+    a kernel over x on a GPU of `MX_CAPABILITY` or more, and by XLA elsewhere. MXFP8
+    rounds to nearest, and needs no seed. `MXFP8`'s quantizer of each operand (a
+    `Twice`)."""
+    if not kernels.gpu() or kernels.capability() < MX_CAPABILITY:
         return mx_quantize(x), mx_quantize(x.T)
     return mx_kernel_twice(x)
 
