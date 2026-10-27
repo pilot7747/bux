@@ -210,7 +210,7 @@ def _config_fields(
         editable, note = _editable(f, found, top, amend)
         nested = (
             _config_fields(f, value, top, amend, key, shown)
-            if isinstance(value, cfg.Config)
+            if isinstance(value, cfg.Config) and not isinstance(value, _WHOLE)
             else None
         )
         out.append(
