@@ -143,6 +143,25 @@ def test_tokamaxs_run_a_group_at_a_time_attends_as_one_run(monkeypatch):
     close(grads, want_grads)
 
 
+@pytest.mark.parametrize("dims", [(128, 128), (192, 128), (256, 256)])
+def test_tokamax_takes_the_heads_dense_attention_gives_it(monkeypatch, dims):
+    """On a GPU, a part runs by tokamax's kernel in heads dense attention gives it, up
+    to `flash.TOKAMAX_HEAD_DIM` (its backward finds no tiling for heads of 256 on a
+    B300); wider ones (MLA's 192, Qwen3.8's 256) run by XLA."""
+    monkeypatch.setattr(kernels, "gpu", lambda: True)
+    monkeypatch.setattr(sparse, "MOSAIC", object())
+    monkeypatch.setattr(parallel.flash, "MOSAIC", object())
+    dk, dv = dims
+    q = jnp.zeros((1, T, H, dk), jnp.bfloat16)
+    k = jnp.zeros((1, T, 2, dk), jnp.bfloat16)
+    v = k[..., :dv]
+    part = sparse.Part(k, v, sparse.token_span(Segments.of(POSITIONS[:1]), None))
+    forward, _ = sparse._runs(part, sparse._Static(SCALE, None, sparse._flash(q), True))
+    dense = parallel.flash.tokamax_takes(q) and parallel.flash.tokamax_takes(v)
+    assert (forward is sparse._flash_fwd) == dense
+    assert (forward is sparse._xla_fwd) == (not dense)
+
+
 def test_the_logsumexp_is_the_softmaxs_of_every_part_and_the_sinks(monkeypatch):
     monkeypatch.setattr(sparse, "ELEMENTS", TINY)
     parts, _, cap = case("csa")

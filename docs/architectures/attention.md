@@ -731,8 +731,9 @@ and the loss of each group over every key.
 The layers make q, k and v; the run's `methods.attention` computes the softmax
 (`auto` by default: cuDNN's kernels, FlashAttention-4's and tokamax's on a GPU, `xla`
 elsewhere). Sparse attention attends by `bux.architecture.attention.sparse`: on a
-GPU, tokamax's flash kernel with the kept keys as a mask; elsewhere, XLA a chunk of
-queries at a time; neither makes t × t floats. The indexer ranks a chunk of queries
+GPU, tokamax's flash kernel with the kept keys as a mask, for heads of up to 128
+dims; elsewhere and for wider heads, XLA a chunk of queries at a time; neither makes
+t × t floats. The indexer ranks a chunk of queries
 at a time too, and picks its top-k by counting the bits of the k-th highest score
 rather than sorting, which on a GPU is 6 times faster at 32k keys.
 

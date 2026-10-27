@@ -207,9 +207,12 @@ Sparse attention (an indexer's top-k, CSA's compressed latents) attends by
   merged by their logsumexp in a custom VJP.
 - On a GPU, tokamax's flash kernel runs each part with the kept keys as a boolean
   mask: dense compute, exact, and t² bits of mask forward and bytes backward. Keys
-  kept for each group (MSA) run a group at a time, each with its group's mask.
-- Under `xla`, off a GPU, or in `bux.kernels.off()`, XLA runs it a chunk of queries
-  at a time.
+  kept for each group (MSA) run a group at a time, each with its group's mask. It
+  takes heads of up to 128 dims (`flash.TOKAMAX_HEAD_DIM`), dense attention's
+  limit: on a B300 its backward finds no tiling for heads of 256. Sparse attention
+  under this limit has not been run on a GPU.
+- Under `xla`, off a GPU, in `bux.kernels.off()`, or for wider heads (Qwen3.8's
+  and GLM-5.3's 256, MLA's 192), XLA runs it a chunk of queries at a time.
 - Either way it is a `shard_map` that gives a device its rows, queries and heads, and
   every key: all-gather CP.
 - CSA's latents, 512 wide, run by cuDNN's DSA kernels on a B200 or B300 in the same
