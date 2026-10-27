@@ -19,8 +19,7 @@ curriculum = [phase(at=0.8, data=0.5 * web + 0.5 * math),
 | `curriculum` | a {bux}`phase`, or a list of them in the order they start | `[]`, none |
 | `batch_ramp` | a {bux}`ramp`, or `none` | `none` |
 
-Both are in the run's id, so a run with either is a run of its own; a run with
-neither keeps the id it had before they existed ([Run ids](running.md#run-ids)).
+Both change what a run reads, so both are in its id ([Run ids](running.md#run-ids)).
 
 ## Phases
 
@@ -28,8 +27,8 @@ neither keeps the id it had before they existed ([Run ids](running.md#run-ids)).
 curriculum = phase(at=0.9, seq_len=8192, batch=128)
 ```
 
-A {bux}`phase` starts at step `at`, and from then on sets what it names; what it
-leaves out stays as the phase before had it, and before the first phase the run's own
+A {bux}`phase` starts at step `at` and from then on sets what it names. What it
+leaves out stays as the phase before had it; before the first phase, the run's own
 settings are in force.
 
 | Field | Default | What it is |
@@ -43,8 +42,8 @@ A list of phases goes in the order they start. A phase may be written alone; a l
 of one is `[phase(...),]`, since `[phase(...)]` is a residual branch
 ([Values](../language/values.md#values)).
 
-**A sequence-length ramp-up** is phases of longer rows. With fewer rows a step, a step
-keeps its tokens, as in `examples/experiments/curriculum.bux`:
+**A sequence-length ramp-up** is a series of phases with longer rows. With fewer
+rows per step, each step keeps its tokens, as in `examples/experiments/curriculum.bux`:
 
 ```bux
 seq_len    = 64
@@ -67,9 +66,9 @@ optimizer=adamw(lr=0.003) schedule=wsd(warmup=10)
 data=synthetic()
 ```
 
-A gradual sequence-length warmup, a new length every few steps, would compile as
-many steps and prepare as many datasets as it has lengths (below), so bux takes it
-as phases, a few lengths each a stretch of the run.
+A gradual sequence-length warmup, with a new length every few steps, would compile
+one step and prepare one dataset per length ([Compiles](#compiles)). So bux writes it
+as a few phases, each a stretch of the run at one length.
 
 ## Batch ramps
 
@@ -79,9 +78,9 @@ batch_ramp = ramp(start=3072, steps=30k)
 ```
 
 A {bux}`ramp` grows the batch from `start` rows at the first step to the run's
-`batch` at step `steps`: linearly, rounded down to a multiple of `multiple`
-(`start` unless set), and never below `start`. The ramp above takes 3072, 6144,
-9216 and 12288 rows, each for a quarter of its 30k steps, then 15360.
+`batch` at step `steps`: linearly, rounded down to a multiple of `multiple` (`start`
+unless set), and never below `start`. The ramp above takes 3072, 6144, 9216 and 12288
+rows, each for a quarter of its 30k steps, then 15360.
 
 | Field | Default | What it is |
 |-------|---------|------------|
@@ -89,36 +88,37 @@ A {bux}`ramp` grows the batch from `start` rows at the first step to the run's
 | `steps` | required | the steps it takes to reach the run's batch |
 | `multiple` | `none` | of the batch sizes it takes; none: `start` |
 
-Every batch size compiles the step once more, so a coarse `multiple` compiles fewer.
-The ramp leaves the learning rate to the schedule, whatever the batch: one that warms
-up over the ramp is `schedule = wsd(warmup=30k)`.
+Every batch size compiles the step once more, so a coarser `multiple` compiles
+fewer. The ramp leaves the learning rate to the schedule, whatever the batch; to warm
+up over the ramp, write `schedule = wsd(warmup=30k)`.
 
 ## What each phase reads
 
-Each stretch of steps of one shape and one data reads its batches as a run of its own
-would ({py:func}`bux.train.data.training_batches`), from where the stretches before
-it left each source:
+Each stretch of steps with one shape and one data reads its batches as a separate
+run would ({py:func}`bux.train.data.training_batches`), starting where the stretches
+before it left each source:
 
 - a source read at the same `seq_len` goes on from the row it stopped at, so a ramp,
   a phase that only changes the batch, and a phase that mixes in a new source repeat
-  no row of it;
-- a source at another `seq_len` is a dataset of its own, which starts from its first
-  row: `text` and `chat` documents are packed once for each `seq_len`, and `bux
-  prepare` and `bux train` prepare every phase's
+  none of its rows;
+- a source at another `seq_len` is a separate dataset, which starts from its first
+  row: `text` and `chat` documents are packed once per `seq_len`, and `bux prepare`
+  and `bux train` prepare every phase's
   ([The pipeline](../data/pipeline.md));
 - a run that resumes at step `i` reads what it would have had it never stopped
   ([Determinism](../data/sources.md#determinism)).
 
 An eval reads rows of the run's own `seq_len` and `batch`, whichever phase it is in,
-so its loss compares across phases; one that sets its own reads those
-([Long rows](running.md#long-rows)), as an eval of the long rows a long-context phase
-trains on.
+so its loss compares across phases. An eval that sets its own reads those instead
+([Long rows](running.md#long-rows)): use one to measure the long rows a long-context
+phase trains on.
 
 ## Compiles
 
-The step compiles again wherever the shape of its batch changes. Under `methods(remat=auto)` it chooses its policy again, as a longer row may not fit
-under the one before's ([Remat](../parallelism/remat.md)). The console's `compiled in`
-says how long each took, in the log after it:
+The step compiles again wherever the shape of its batch changes. Under
+`methods(remat=auto)` it also chooses its remat policy again, since a longer row may
+not fit under the previous one ([Remat](../parallelism/remat.md)). The console's
+`compiled in`, in the log after each compile, says how long it took:
 
 ```console
 $ bux train examples/experiments/curriculum.bux
@@ -135,11 +135,11 @@ curriculum step 10/80  loss 6.2552  lr 3.00e-03  grad 0.621  2,853 tok/s  117 ms
 curriculum step 80/80  loss 6.2519  lr 0.00e+00  grad 0.221  41,252 tok/s  25 ms/step  data 0.5 ms  0:00:05 < 0:00:00
 ```
 
-The log's `tokens` counts each step's own batch, so it is the tokens trained on
-through every phase, and `tokens_per_s` the tokens of the steps since the last log
-over their time. The MFU counts each step's FLOPs at its own shape
-([MFU](running.md#mfu)), and `bux plan`'s FLOPs a token average over the phases'
-`seq_len` by their tokens.
+The log's `tokens` counts each step at its own batch, so it is the tokens trained
+on through every phase, and `tokens_per_s` is the tokens of the steps since the last
+log over their time. The MFU counts each step's FLOPs at its own shape
+([MFU](running.md#mfu)), and `bux plan`'s FLOPs per token average over the phases'
+`seq_len`, weighted by their tokens.
 
 ## Checks
 
@@ -164,13 +164,13 @@ error: phase 1 sets the batch at step 40, before the batch ramp is over at step 
 | A phase's `text` and `chat` data have a tokenizer, and its rows fit a learned positional embedding | as for the run's own ([Checks](settings.md#checks)) |
 
 When the run starts, every shape it takes must split over the mesh and the
-microbatches, and every source of each phase's mixture have a row in its batch; an
-error after the first stretch says from which step:
+microbatches, and every source of each phase's mixture must have a row in its batch.
+An error after the first stretch says from which step:
 `from step 40, batch = 8 does not split over layout.batch, data=16: make it a multiple of 16, or change mesh or layout`.
 
 ## In Python
 
-{py:func}`bux.train.curriculum.stretches` cuts a run's steps into the stretches of one
+{py:func}`bux.train.curriculum.stretches` cuts a run's steps into stretches of one
 shape and one data, each with the run's settings as they are then:
 
 ```python
@@ -180,6 +180,6 @@ for s in stretches(run.train):
     print(s.start, s.stop, s.config.batch, s.config.seq_len)
 ```
 
-A {py:class}`~bux.train.trainer.Trainer` in a script trains on
-{py:func}`~bux.train.data.training_batches` to follow them, and compiles again at
-each new shape on its own ([A Trainer in a script](extending.md#a-trainer-in-a-script)).
+A {py:class}`~bux.train.trainer.Trainer` in a script follows them when it trains
+on {py:func}`~bux.train.data.training_batches`, and compiles again at each new shape
+by itself ([A Trainer in a script](extending.md#a-trainer-in-a-script)).

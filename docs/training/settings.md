@@ -1,10 +1,10 @@
 # Settings
 
-A run's training settings are top-level definitions with reserved names, next to
-`d_model` and `model`. This page lists every one, says which are required, and shows
-the checks bux runs on them before anything trains. The
-[language reference](../reference/language/training.md) has every field of every
-setting, generated from the code.
+A run's training settings are top-level definitions with reserved names, written next
+to `d_model` and `model`. This page lists every one, says which are required, and
+shows the checks bux runs on them before anything trains. Every field of every setting
+is in the [language reference](../reference/language/training.md), generated from the
+code.
 
 ```bux
 tokenizer = tokenizer(name="gpt2")
@@ -17,14 +17,15 @@ batch     = 256
 steps     = 10B // (batch * seq_len)
 ```
 
-A setting's value is a config called by name, as a layer is (`muon(lr=0.02)`), or a
-number. Settings are definitions, so arithmetic, reads of other settings and the
-number suffixes `k`, `M`, `B` and `T` work on them: `steps = 10B // (batch * seq_len)`
-([Values](../language/values.md)). A file changes one field of a setting it got from
-another file with an amendment, `optimizer.lr = 3e-3` ([Modules](../language/modules.md)).
+A setting's value is a number, or a config called by name the way a layer is
+(`muon(lr=0.02)`). Settings are definitions, so arithmetic, reads of other settings
+and the suffixes `k`, `M`, `B` and `T` all work: `steps = 10B // (batch * seq_len)`
+([Values](../language/values.md)). To change one field of a setting that comes from
+another file, write an amendment: `optimizer.lr = 3e-3`
+([Modules](../language/modules.md)).
 
-Each config's fields are pydantic fields in `bux/train/config.py`, and the editor
-shows them on hover and completes them, as it does for layers
+Each config is a pydantic class in `bux/train/config.py`. The editor completes its
+fields and documents them on hover, as it does for layers
 ([Editor support](../language/tooling.md)).
 
 ## Every setting
@@ -36,43 +37,49 @@ shows them on hover and completes them, as it does for layers
 | `packing` | {bux}`concat`, {bux}`greedy` or {bux}`best_fit` | `best_fit` | how documents become rows ([Packing](../data/packing.md)) |
 | `optimizer` | {bux}`adamw` or {bux}`muon` | required | the update rule ([Optimizers](optimizers.md)) |
 | `schedule` | {bux}`constant`, {bux}`cosine`, {bux}`wsd`, {bux}`linear_decay`, {bux}`multistep`, {bux}`power` or {bux}`piecewise` | `constant` | what multiplies the learning rate at each step ([Schedules](optimizers.md#schedules)) |
-| `seq_len` | an integer, at least 2 | required | tokens a row |
-| `batch` | a positive integer | required | rows a step |
+| `seq_len` | an integer, at least 2 | required | tokens per row |
+| `batch` | a positive integer | required | rows per step, over all devices |
 | `batch_ramp` | {bux}`ramp`, or `none` | `none` | a smaller batch at the first step that grows to `batch` ([Batch ramps](curriculum.md#batch-ramps)) |
 | `steps` | a positive integer | required | optimizer steps |
 | `curriculum` | {bux}`phase`, or a list of them | `[]` | phases that change `seq_len`, `batch` or `data` from a step on ([Curriculum](curriculum.md)) |
 | `seed` | an integer | `0` | the model's initial weights, the order of the data, and every random stream |
 | `clip` | a number, or `none` | `1.0` | the global norm gradients are clipped to ([Clipping](optimizers.md#clipping)) |
 | `loss` | {bux}`loss` | `loss` | the weights of the z-loss and of multi-token prediction ([The loss](optimizers.md#the-loss)) |
-| `eval` | {bux}`eval`, a list of them, or `none` | `none` | held-out loss and bits per byte every so many steps, a set each ([Eval](running.md#eval)) |
-| `checkpoint` | {bux}`checkpoint`, or `none` | `none` | saves to resume from ([Checkpoints](running.md#checkpoints)) |
-| `log` | {bux}`log` | `log` | the metrics every `every` steps, 10 by default, and the trackers they go to ([The log](running.md#the-log), [Trackers](observing.md#trackers)) |
-| `observe` | {bux}`observe`, or `none` | `none` | the model by layer every so many steps ([Observing a run](observing.md)) |
+| `eval` | {bux}`eval`, a list of them, or `none` | `none` | held-out loss and bits per byte every so many steps, one held-out set per eval ([Eval](running.md#eval)) |
+| `checkpoint` | {bux}`checkpoint`, or `none` | `none` | saves a run resumes from ([Checkpoints](running.md#checkpoints)) |
+| `log` | {bux}`log` | `log` | the metrics every `every` steps (10 by default), and the trackers they go to ([The log](running.md#the-log), [Trackers](observing.md#trackers)) |
+| `observe` | {bux}`observe`, or `none` | `none` | the model layer by layer every so many steps ([Observing a run](observing.md)) |
 | `profile` | {bux}`profile`, or `none` | `none` | a trace of a few steps, by jax.profiler, nsys or ncu ([Profiling](../performance/profiling.md)) |
 | `precision` | {bux}`precision` | `precision` | the dtype a run computes in, and the formats its matmuls take ([Precision](precision.md)) |
 | `mesh` | {bux}`mesh` | `mesh` | the device grid; unset, every device on `data` ([Parallelism](../parallelism/index.md)) |
 | `layout` | {bux}`layout` | `layout` | which mesh axes each named dimension splits over ([Layout](../parallelism/layout.md)) |
 | `methods` | {bux}`methods` | `methods` | how each part that communicates is computed, remat and microbatches ([Parallelism](../parallelism/index.md)) |
-| `compiler` | {bux}`compiler` | `compiler` | XLA's options for the step, and where its gradients' reductions start ([XLA's options](../performance/compiler.md)) |
+| `compiler` | {bux}`compiler` | `compiler` | XLA's options for the step, and where its gradient reductions start ([XLA's options](../performance/compiler.md)) |
+| `objective` | a weighted sum of metrics, `0.8 * web_bpb + 0.2 * code_bpb`, or `none` | `none` | what a search minimizes and a sweep's summary ranks by ([The objective](searching.md#the-objective)) |
+| `search` | {bux}`search` | `search` | how a run with dimensions is searched ([Searching hyperparameters](searching.md)) |
 
 The architecture's own settings, `model`, `d_model`, `vocab_size` and `residual`, are
 in [Top-level settings](../reference/language/top-level.md).
 
 :::{note}
-`mesh`, `layout`, `methods` and `compiler` change how a run computes, not what, and
-`log`, `observe`, `eval`, `checkpoint` and `profile` only watch it. None of the nine is
-in the run's id, so a run resumes under other values of them
+Some settings never change what a run computes, so they are not in its id:
+
+- `mesh`, `layout`, `methods` and `compiler` change *how* it computes;
+- `log`, `observe`, `eval`, `checkpoint` and `profile` only watch it;
+- `objective` and `search` rank and propose runs.
+
+A run therefore resumes under other values of any of them
 ([Run ids](running.md#run-ids)).
 :::
 
 ## What is required
 
 A run needs five settings: `data`, `optimizer`, `seq_len`, `batch` and `steps`. Its
-model needs `model`, `d_model`, and `vocab_size` when it has an `embed` or a `head`.
-Every other setting has a default.
+model needs `model` and `d_model`, plus `vocab_size` when it has an `embed` or a
+`head`. Every other setting has a default.
 
-A file is a **run** once it sets any training setting, and then it needs all five.
-This `missing.bux` sets two:
+A file becomes a **run** as soon as it sets any training setting, and then it needs
+all five. This `missing.bux` sets two:
 
 ```bux
 d_model    = 64
@@ -89,31 +96,31 @@ error: this file sets how to train, so it is a run, and a run needs seq_len, bat
 hint: seq_len = 1024
 ```
 
-A file with no `model` is a **module**: a piece that runs build on by name, such as
-the recipe `examples/experiments/recipes/fineweb_wsd.bux`, which sets the data, the
-optimizer and the schedule but has no model. `bux check` checks a module on its own,
-its settings against their types, and says what it defines:
+A file with no `model` is a **module**: a piece that runs build on by name. The recipe
+`examples/experiments/recipes/fineweb_wsd.bux`, for example, sets the data, the
+optimizer and the schedule, but no model. `bux check` checks a module on its own and
+says what it defines:
 
 ```console
 $ bux check examples/experiments/recipes/fineweb_wsd.bux
 a module: it defines tokenizer, web, code, data, packing, optimizer, schedule, loss, seq_len, batch, budget, steps, eval, checkpoint, and no model
 ```
 
-A run uses it, `use fineweb_wsd`, next to an architecture
-([Modules](../language/modules.md)). `budget` there is no setting: it is a definition
-of the recipe's own, which its `steps` reads.
+A run takes it with `use fineweb_wsd`, next to an architecture
+([Modules](../language/modules.md)). `budget` is not a setting: it is the recipe's own
+definition, which its `steps` reads.
 
 ## Checks
 
-Before anything runs, the compiler checks each setting against its type, where it is
-written, and that the settings fit together. `bux check`, `bux plan`, `bux train`,
-`bux launch` and the editor all run the same checks, and every error points at the
-line that caused it, in whichever file wrote it.
+Before anything runs, the compiler checks each setting against its type and range,
+and checks that the settings fit together. `bux check`, `bux plan`, `bux train`,
+`bux launch` and the editor all run the same checks. Every error points at the line
+that caused it, in whichever file wrote it.
 
 ### Types and ranges
 
-Each setting takes the configs its row above lists, and each field of a config its
-type:
+Each setting takes the configs its row above lists, and each field of a config takes
+its own type:
 
 ```console
 $ bux check examples/experiments/smoke.bux 'optimizer = cosine'
@@ -142,7 +149,7 @@ error: wsd: decay: Input should be less than or equal to 1
   |                ^^^^^^^^^
 ```
 
-A field a config does not have is an error, with the nearest name it does have:
+A misspelled field is an error that suggests the nearest real one:
 
 ```console
 $ bux check examples/experiments/smoke.bux 'optimizer = adamw(lr=3e-3, weight_dacay=0.1)'
@@ -163,7 +170,7 @@ Some fields check their values further:
 | `options` of `compiler` | each option written `--name=value` |
 | `switch.at` of `precision` | strictly between 0 and 1 |
 | `decay` of `wsd` and `power` | between 0 and 1 |
-| `warmup` of a schedule | a count of steps, or a share of them between 0 and 1 |
+| `warmup` of a schedule | a number of steps, or a share of them between 0 and 1 |
 | `pieces` of `piecewise` | each ending later than the one before, the last at 1 |
 | `shape=geometric` | a cooldown or piece that starts and ends above 0 |
 | `at` of `phase` | a step above 0, or a share strictly between 0 and 1 |
@@ -179,9 +186,9 @@ error: roles: experts: Value error, the routed experts multiply in compute, mxfp
 
 ### Settings that must fit together
 
-The warmup and the cooldown fit in the steps: the cooldown of `wsd` and `power`, and
-the pieces of `piecewise` after its first, which starts at the warmup's end. The
-error points into the module that wrote the schedule:
+The warmup and the cooldown must fit in the steps. The cooldown is that of `wsd` and
+`power`, or the pieces of `piecewise` after its first, which starts where the warmup
+ends. The error points into the module that wrote the schedule:
 
 ```console
 $ bux check examples/experiments/attention_ablation.bux steps=50
@@ -192,10 +199,11 @@ error: the schedule takes 1010 steps (1000 of warmup and 10 of cooldown), but th
    |             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
 ```
 
-A curriculum's phases start in order inside the run, and a batch ramp grows to the
-run's batch before any phase sets another ([Checks](curriculum.md#checks)).
+A curriculum's phases must start in order inside the run, and a batch ramp must reach
+the run's batch before any phase sets another ([Checks](curriculum.md#checks)).
 
-`text` and `chat` documents, in `data`, in `eval` or in a phase, need a tokenizer:
+`text` and `chat` documents need a tokenizer, whether in `data`, in `eval` or in a
+phase:
 
 ```console
 $ bux check notok.bux
@@ -207,7 +215,7 @@ error: text data is tokenized, so the run needs a tokenizer
   = hint: tokenizer = tokenizer(name="gpt2")
 ```
 
-Rows fit in the positions a learned positional embedding has:
+Rows must fit in the positions a learned positional embedding has:
 
 ```console
 $ bux check positions.bux
@@ -219,13 +227,13 @@ error: sequences of 2048 tokens are longer than the 1024 positions the embedding
   = hint: seq_len = 1024, or embed(max_positions=2048)
 ```
 
-In a sweep, `bux check` and the editor check every alternative once, with the others
-at their first ([Sweeps](../language/sweeps.md)).
+In a sweep, `bux check` and the editor check every alternative once, with the other
+axes at their first alternative ([Sweeps](../language/sweeps.md)).
 
 ### Checks when a run starts
 
-A few checks need the devices or the data, so they run when training starts, before
-the model is built or the step compiles:
+A few checks need the devices or the data. They run when training starts, before the
+model is built or the step compiles:
 
 | What | The error says |
 |------|----------------|
@@ -237,14 +245,13 @@ the model is built or the step compiles:
 | A prepared dataset's tokens fit the model's vocabulary | `data/packed/text-... is in 50257 tokens, more than the model's vocab_size of 32000` |
 | A glob of documents or shards matches files | `no files match 'data/web/*.parquet'` |
 
-`bux launch` checks the mesh of every run against the GPUs it has before it starts
-any, and records a run that needs more as failed
-([Launching](launching.md#gpus-and-workers)).
+`bux launch` checks every run's mesh against its GPUs before it starts any, and
+records a run that needs more as failed ([Launching](launching.md#gpus-and-workers)).
 
-## What a run is in Python
+## A run in Python
 
 `bux.lang.compile_runs(source)` returns a {py:class}`bux.lang.ir.Run` for every run a
-file makes: its {py:class}`bux.lang.ir.Architecture`, its
+file makes. Each holds its {py:class}`bux.lang.ir.Architecture`, its
 {py:class}`bux.train.config.TrainConfig` (one field per setting on this page), its
 name, and the alternatives it took. All of it is plain pydantic data, and
 {py:func}`bux.train.trainer.train` trains it:

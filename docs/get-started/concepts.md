@@ -129,11 +129,12 @@ checkpoints/   with a checkpoint setting
 status.json    with bux launch: running, done, failed or stopped, and where
 ```
 
-The id ignores how a run is written, watched or split: renaming a definition,
-reaching the same settings another way, `log`, `eval`, `checkpoint`, `profile`,
-`mesh`, `layout`, `methods` and `compiler` all keep it. Anything else changes it. So a
-changed run starts fresh in a directory of its own, and an unchanged one started
-again resumes from its latest checkpoint, even on another mesh.
+The id ignores how a run is written, watched, split or searched. Renaming a
+definition, reaching the same settings another way, and the settings `log`, `eval`,
+`checkpoint`, `observe`, `profile`, `mesh`, `layout`, `methods`, `compiler`,
+`objective` and `search` all keep it; anything else changes it. So a changed run
+starts fresh in its own directory, and an unchanged one, restarted, resumes from its
+latest checkpoint, even on another mesh.
 
 See [Running](../training/running.md) and [Launching](../training/launching.md).
 
