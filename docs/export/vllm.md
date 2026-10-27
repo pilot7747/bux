@@ -75,9 +75,9 @@ architecture](index.md#exporting-an-architecture)); vLLM serves it on random one
 ## How it works
 
 - **The module tree.** `bux_vllm.plan` places every layer where
-  {py:mod}`bux.export.plan` does, from the IR in `config.json` (the `bux` field), so
-  a weight's name is its module's path, `model.layers.3.attn.q.weight`. A test checks
-  both on every example architecture.
+  {py:mod}`bux.export.plan` does, from the IR in `config.json` (the `bux` field) and
+  the names no module takes (`bux_reserved`), so a weight's name is its module's path,
+  `model.layers.3.attn.q.weight`. A test checks both on every example architecture.
 - **The graph.** The model runs the IR as the generated `modeling_bux.py` does, over
   the batch's tokens side by side as vLLM schedules them: residual branches, sums,
   products, repeats, taps and shared definitions. vLLM compiles it with

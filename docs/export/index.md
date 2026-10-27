@@ -34,7 +34,7 @@ model = AutoModelForCausalLM.from_pretrained("exported/", trust_remote_code=True
 
 | File | What it is |
 |------|------------|
-| `config.json` | the IR, each layer's site, the cache layers' kinds, and the `auto_map` that points transformers at the code |
+| `config.json` | the IR, each layer's site, the cache layers' kinds, the names no module takes (`bux_reserved`), and the `auto_map` that points transformers at the code |
 | `modeling_bux.py` | the architecture's graph, generated: a class per repeated block, a line per node |
 | `common.py`, `attention.py`, ... | bux's layers in PyTorch, the same files for every model (`bux.export.hf`) |
 | `configuration_bux.py` | the config's class |
@@ -70,8 +70,11 @@ class Block0(nn.Module):
   shared definition's, once, at `model.shared.<key>`. A layer's path is the prefix of
   its weights, `model.layers.3.attn.q.weight`. Under a residual algebra, each
   residual branch outside any other is a module too, named by the algebra, which
-  holds the algebra's parameters: `model.layers.3.mhc.bias`. The plan imports
-  neither JAX nor PyTorch, so that every exporter places the layers alike.
+  holds the algebra's parameters: `model.layers.3.mhc.bias`. A label that torch's
+  or transformers' module classes have as an attribute (`forward`, `config`,
+  `training`) takes a suffix, `forward_1`, by the names
+  {py:data}`bux.export.plan.RESERVED` lists. The plan imports neither JAX nor
+  PyTorch, so that every exporter places the layers alike.
 - **The code** (`bux.export.codegen`) turns each scope of the plan into a class.
   `[f]` is `x + f(x)`, `f + g` and `f * g` add and multiply their branches, `f^n`
   loops over a `ModuleList`, and `@name` and `$name` push and read the forward pass's
@@ -222,7 +225,8 @@ one.
 ## Exporting an architecture
 
 Given a `.bux` file, `bux export` writes the file's model as an export with no
-weights: its code and its `config.json`, no `model.safetensors`. vLLM serves it on
+weights: its code and its `config.json`, no `model.safetensors` (it removes one an
+earlier export left in `OUT`). vLLM serves it on
 random weights (`--load-format dummy`), so an architecture's speed can be measured at
 any size before anything is trained. Settings after `OUT` change the file's as they
 do for `bux train`:

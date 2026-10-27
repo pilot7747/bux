@@ -33,6 +33,55 @@ from bux.lang import ir
 #: A node's place in its scope: the child indices from the scope's root to it.
 Pos = tuple[int, ...]
 
+#: Names no module of an export takes: those of what the generated classes and
+#: bux_vllm's blocks hold, ``shared`` among them, and the attributes their classes have
+#: in torch (``nn.Module``) and transformers (``PreTrainedModel``), which a module of
+#: the name would shadow, or be shadowed by. A label among them names its module as
+#: a taken name, ``forward_1``. The export writes them in its config
+#: (``bux_reserved``), from which bux_vllm's plan takes them, so that the two name
+#: the modules alike.
+RESERVED = frozenset(
+    """
+    embed_path head_path layers_by_path plan scope shared vllm_config
+    T_destination add_module apply bfloat16 buffers call_super_init children compile
+    cpu cuda double dump_patches eval extra_repr float forward get_buffer
+    get_extra_state get_parameter get_submodule half ipu load_state_dict modules
+    mtia named_buffers named_children named_modules named_parameters parameters
+    register_backward_hook register_buffer register_forward_hook
+    register_forward_pre_hook register_full_backward_hook
+    register_full_backward_pre_hook register_load_state_dict_post_hook
+    register_load_state_dict_pre_hook register_module register_parameter
+    register_state_dict_post_hook register_state_dict_pre_hook requires_grad_
+    set_extra_state set_submodule share_memory smart_apply state_dict to to_empty train
+    training type xpu zero_grad
+    active_adapters add_adapter add_model_tags all_tied_weights_keys
+    barrier_after_gathered_checkpoint_save base_model base_model_prefix can_generate
+    can_record_outputs config config_class delete_adapter dequantize device
+    disable_adapters disable_input_require_grads dtype dummy_inputs enable_adapters
+    enable_input_require_grads enable_peft_hotswap ep_plan from_pretrained fsdp_plan
+    fsdp_size gather_sharded_state_dict_for_save generation_config
+    generation_config_class get_adapter_state_dict get_compiled_call
+    get_correct_attn_implementation get_correct_experts_implementation get_decoder
+    get_encoder get_expanded_tied_weights_keys get_experts_implementation
+    get_init_context get_input_embeddings get_memory_footprint get_output_embeddings
+    get_parameter_or_buffer get_position_embeddings gradient_checkpointing_disable
+    gradient_checkpointing_enable init_parallel_plans init_weights
+    initialize_weights input_modalities is_backend_compatible is_custom_code
+    is_distributed_loading_by_transformers is_gradient_checkpointing is_remote_code
+    kernel_config load_adapter loss_function loss_type main_input_name
+    mark_tied_weights_as_initialized maybe_distribute_model model_tags name_or_path
+    named_non_persistent_buffers num_parameters post_init pp_plan
+    prepare_distribute_model push_to_hub register_for_auto_class
+    resize_position_embeddings resize_token_embeddings retrieve_modules_from_names
+    save_distributed_checkpoint save_pretrained set_adapter set_attn_implementation
+    set_decoder set_encoder set_experts_implementation set_input_embeddings
+    set_output_embeddings set_use_kernels should_save_on_this_rank
+    supports_context_parallel supports_gradient_checkpointing supports_pp_plan
+    supports_tp_plan tie_weights tp_plan tp_size use_kernels
+    warn_if_padding_and_no_attention_mask warnings_issued
+    """.split()  # noqa: SIM905 (as a list, a name a line)
+)
+
 #: What a layer type's exporter adds to its layers' `Site` extras, from the plan and
 #: the call: ``SITE_EXTRAS["engram"] = lambda plan, call: {"table_sizes": ...}``.
 SITE_EXTRAS: dict[str, Callable[["Plan", "LayerCall"], dict]] = {}
@@ -62,7 +111,7 @@ class Scope:
     def name(self, hint: str) -> str:
         """Return a fresh attribute name from `hint`: ``norm``, then ``norm_1``."""
         hint = hint if hint.isidentifier() and not keyword.iskeyword(hint) else "layer"
-        taken = set(self.names.values()) | {"shared"}
+        taken = set(self.names.values()) | RESERVED
         name, i = hint, 1
         while name in taken:
             name, i = f"{hint}_{i}", i + 1
@@ -124,22 +173,25 @@ class Plan:
     calls: list[LayerCall]
     branches: list[Branch] = field(default_factory=list)
 
-    def stop(self) -> int | None:
-        """Return the item of the graph's top sequence that runs the first head, if
-        any runs after it: a model asked for the first head's logits alone, as it
-        generates, stops after it. None when there is nothing to skip."""
-        root = self.arch.graph
+    def stop(self) -> Pos | None:
+        """Return the item that runs the first head, by its place in the sequences
+        around it from the graph's root (none of them shared), if anything runs
+        after it: a model asked for the first head's logits alone, as it generates,
+        stops after it. None when there is nothing to skip."""
         head = next((c for c in self.calls if c.layer.config.type == "head"), None)
-        if head is None or not isinstance(root, ir.Seq) or root.share is not None:
-            return None
-        item = head.trail[0]
-        return item if item < len(root.items) - 1 else None
+        node, at, after = self.arch.graph, (), False
+        for i in () if head is None else head.trail:
+            if not isinstance(node, ir.Seq) or node.share is not None:
+                break
+            at, after = (*at, i), after or i < len(node.items) - 1
+            node = node.items[i]
+        return at if after else None
 
     def generation(self) -> list[LayerCall]:
         """Return the calls a model runs for the first head's logits alone: those
         up to `stop`, which keep state in the cache as it generates."""
         stop = self.stop()
-        return [c for c in self.calls if stop is None or c.trail[0] <= stop]
+        return [c for c in self.calls if stop is None or c.trail[: len(stop)] <= stop]
 
     def sites(self) -> dict[str, dict]:
         """Return each module's site, by its path: its depth, how many layers of its

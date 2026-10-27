@@ -11,9 +11,9 @@ its module's read, the body, and its write back (`bux.export.hf.residual`), and 
 embedding's output widens. Each distinct layer config is a constant at the top of the
 file.
 
-The model's forward stops after the item of the graph that runs the first head
-(`bux.export.plan.Plan.stop`), unless asked for every head: generating needs none of
-what comes after, such as multi-token prediction.
+The model's forward stops after the item of the graph that runs the first head, in
+the sequences around it (`bux.export.plan.Plan.stop`), unless asked for every head:
+generating needs none of what comes after, such as multi-token prediction.
 """
 
 import importlib
@@ -98,6 +98,10 @@ class Generator:
     classes: list[str] = field(default_factory=list)
     constants: dict[str, str] = field(default_factory=dict)  # config source -> name
     imports: set[tuple[str, str]] = field(default_factory=set)  # (module, name)
+    stop: Pos | None = field(init=False)  # where the model's forward stops
+
+    def __post_init__(self) -> None:
+        self.stop = self.plan.stop()
 
     def constant(self, config: BaseModel, hint: str) -> str:
         """Return the name of the constant holding `config`, made once, named by
@@ -155,6 +159,8 @@ class Generator:
             case ir.Seq(items=items):
                 for i, item in enumerate(items):
                     x = self.emit(item, x, (*pos, i), s, c, depth)
+                    if s is self.plan.top and (*pos, i) == self.stop:
+                        c.body += STOP
                 return x
             case ir.Residual(body=body):
                 return self.residual(body, x, pos, s, c, depth)
@@ -234,16 +240,8 @@ class Generator:
     def model(self) -> _Class:
         """Generate the model's forward: its graph, which stops after the first head
         unless asked for every head (`bux.export.plan.Plan.stop`)."""
-        c, root, stop = _Class(), self.plan.top.root, self.plan.stop()
-        if stop is None:
-            self.emit(root, "x", (), self.plan.top, c, 0)  # the heads are the outputs
-            return c
-        assert isinstance(root, ir.Seq)
-        x = "x"
-        for i, item in enumerate(root.items):
-            x = self.emit(item, x, (i,), self.plan.top, c, 0)
-            if i == stop:
-                c.body += STOP
+        c = _Class()
+        self.emit(self.plan.top.root, "x", (), self.plan.top, c, 0)  # outputs: heads
         return c
 
     def shared(self) -> str:
@@ -392,8 +390,9 @@ def modeling(plan: Plan, masks: list[tuple[str, object]]) -> str:
 
     Args:
         plan: The exported model's module tree.
-        masks: The attention masks its layers read, as ``(kind, arg)``: the model
-            makes them before any layer runs, since they depend on the cache.
+        masks: The attention masks the layers it runs as it generates read, as
+            ``(kind, arg)``: the model makes them before any layer runs, since they
+            depend on the cache.
     """
     g = Generator(plan)
     shared = g.shared()
