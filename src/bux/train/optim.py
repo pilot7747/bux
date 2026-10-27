@@ -319,13 +319,19 @@ def _floats_in(tree: PyTree, dtype: DTypeLike) -> PyTree:
     return jax.tree.map(cast, tree)
 
 
-def _keys(path: tuple) -> tuple:
-    """A pytree path as plain keys, without the Variable's trailing `value`."""
-    keys = tuple(
-        next(getattr(k, a) for a in ("key", "idx", "name") if hasattr(k, a))
-        for k in path
-    )
-    return keys[:-1] if keys and keys[-1] == "value" else keys
+def path_keys(path: tuple) -> tuple:
+    """Return a pytree path as plain keys, dicts' keys, indices and attributes' names,
+    without the attribute ``value`` that an `nnx.Variable` flattens to: a state's
+    path to an array is its variable's, as a pure tree's is."""
+    if path and isinstance(path[-1], jax.tree_util.GetAttrKey):
+        path = path[:-1] if path[-1].name == "value" else path
+    return tuple(_plain(k) for k in path)
+
+
+def _plain(entry: object) -> object:
+    """A pytree path's entry as its key, index or name."""
+    found = (getattr(entry, a) for a in ("key", "idx", "name") if hasattr(entry, a))
+    return next(found, entry)
 
 
 def stacked_dims(model: nnx.Module) -> Callable[[tuple], int]:
@@ -351,7 +357,7 @@ def weight_decay_mask(model: nnx.Module) -> Callable[[PyTree], PyTree[bool]]:
     skip, lead = no_decay_paths(model), stacked_dims(model)
 
     def decays(path: tuple, x: Float[Array, "*_"]) -> bool:
-        keys = _keys(path)
+        keys = path_keys(path)
         return x.ndim - lead(keys) >= 2 and not any(keys[: len(s)] == s for s in skip)
 
     return lambda params: jax.tree_util.tree_map_with_path(decays, params)
@@ -408,12 +414,14 @@ def muon(
 
     def labels(params: PyTree[Float[Array, "*_"]]) -> PyTree[str]:
         return jax.tree_util.tree_map_with_path(
-            lambda p, _: "muon" if _keys(p) in dims else "adam", params
+            lambda p, _: "muon" if path_keys(p) in dims else "adam", params
         )
 
     # Muon sees only its own parameters; the others are masked out of its tree.
     def shapes(updates: PyTree[Float[Array, "*_"]]) -> PyTree[MuonDimensionNumbers]:
-        return jax.tree_util.tree_map_with_path(lambda p, _: dims[_keys(p)], updates)
+        return jax.tree_util.tree_map_with_path(
+            lambda p, _: dims[path_keys(p)], updates
+        )
 
     ns = newton_schulz(
         config.ns_steps,
@@ -484,7 +492,7 @@ def orthogonalized(
         params: PyTree[Float[Array, "*_"]] | None = None,
     ) -> PyTree[Float[Array, "*_"]]:
         leaves, tree = jax.tree_util.tree_flatten_with_path(updates)
-        keys = [_keys(path) for path, _ in leaves]
+        keys = [path_keys(path) for path, _ in leaves]
         shardings = shardings_by_path(model_params)
         states = shardings_by_path(model_params, as_state=True)
         orthogonal = parallel.method("orthogonalize")(
@@ -681,7 +689,7 @@ def shardings_by_path(
     if as_state:
         params = jax.tree.map(_as_state, params, is_leaf=_is_variable)
     found = jax.tree_util.tree_leaves_with_path(parallel.shardings(params))
-    return {_keys(path): s for path, s in found}
+    return {path_keys(path): s for path, s in found}
 
 
 def _as_state(param: nnx.Variable) -> nnx.OptState:

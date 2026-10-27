@@ -48,6 +48,7 @@ from bux.train.optim import (
     optimizer,
     optimizers,
     orthogonalized,
+    path_keys,
     schedules,
     weight_decay_mask,
     whole_matrix_spec,
@@ -140,6 +141,23 @@ def test_weight_decay_leaves_norms_and_engram_tables_alone_whatever_their_shape(
     }
     decays = {keys for keys, _, d in named if d}
     assert set(muon_matrices(m)) <= decays
+
+
+class Valued(nnx.Module):
+    """A parameter named as the attribute a Variable flattens to, as `scale`'s."""
+
+    def __init__(self):
+        self.value, self.w = nnx.Param(jnp.ones(3)), nnx.Param(jnp.ones((2, 2)))
+
+
+def test_a_state_s_paths_are_its_variables_as_a_pure_tree_s_are():
+    state = nnx.state(Valued(), nnx.Param)
+    pure = nnx.to_pure_dict(state)
+    paths = [
+        [path_keys(p) for p, _ in jax.tree_util.tree_leaves_with_path(tree)]
+        for tree in (state, pure)
+    ]
+    assert paths[0] == paths[1] == [("value",), ("w",)]
 
 
 # --- Muon split over devices: methods.orthogonalize ------------------------------------
