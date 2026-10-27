@@ -29,7 +29,7 @@ calls their methods:
   (`bux.parallel.tensor`).
 
 A layer calls the run's method through `method`, which outside
-`~bux.parallel.settings.use` gives the default.
+`~bux.parallel.settings.use` gives the default, and reads its name by `method_name`.
 """
 
 from collections.abc import Callable
@@ -133,8 +133,18 @@ def method(kind: str) -> Method:
         attend = parallel.method("attention")
         out = attend(q, k, v, args)
     """
+    return REGISTRIES[kind].find(method_name(kind))
+
+
+def method_name(kind: str) -> Any:
+    """Return what the run's ``methods`` sets for `kind`, or its default outside
+    `~bux.parallel.settings.use`: a name, as ``"auto"`` for attention.
+
+    Args:
+        kind: A field of ``methods``: a key of `REGISTRIES`.
+    """
     on = active()
-    return REGISTRIES[kind].find(getattr(on.methods if on else MethodsConfig(), kind))
+    return getattr(on.methods if on else MethodsConfig(), kind)
 
 
 def validate(config: MethodsConfig) -> None:
