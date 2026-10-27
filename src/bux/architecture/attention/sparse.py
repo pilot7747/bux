@@ -319,7 +319,7 @@ def _flash(q: Float[Array, "b t h dk"]) -> bool:
     """Return whether the parts run by tokamax: under `tokamax`, or `auto` on a GPU in
     bfloat16 or float16, which its kernels take. `xla` runs them by XLA; the other
     methods have no mask of kept keys."""
-    name = parallel.method_name("attention")
+    name = parallel.choice("attention")
     if name not in ("xla", "auto", "tokamax"):
         raise NotImplementedError(
             f"methods.attention = {name} has no {KEPT}; xla, tokamax and auto have"

@@ -153,7 +153,8 @@ class HyperConnections(nnx.Module):
     k mod n (``A_m = e_k``), keeps the streams (``A_r = I``) and adds f to every one
     (``B = 1``). Without f it is the read alone, which starts as the paper's sum of
     the streams (``A_m = 1``): ``merge``. With `single_pass`, f reads with the A_m
-    the branch before computed.
+    the branch before computed. Weight decay leaves the static A and B alone: A is a
+    matrix, but one that starts at ``[e_k, I]``, not at 0.
 
     Args:
         config: The algebra's settings.
@@ -161,6 +162,8 @@ class HyperConnections(nnx.Module):
         index: Which branch outside any other this is, from 0.
         body: The branch f; None for the read alone.
     """
+
+    no_weight_decay = ("static_alpha", "static_beta")
 
     def __init__(
         self,

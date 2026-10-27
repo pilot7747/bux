@@ -18,6 +18,7 @@ from jaxtyping import Array, Float
 
 from bux import config as cfg
 from bux import parallel
+from bux.architecture.common.functional import time_step_bias
 from bux.architecture.common.segments import Segments
 from bux.architecture.common.sharding import projection, shard_layer_input
 from bux.architecture.layers.conv import CausalConv
@@ -134,17 +135,6 @@ def stepwise(xs: Positions, shared: Shared, transition: bool) -> Chunk:
     return Chunk(y, state, P, None if reads is None else jnp.moveaxis(reads, 0, 1))
 
 
-def _dt_bias(
-    config: cfg.StateSpaceConfig, size: int, rngs: nnx.Rngs
-) -> Float[Array, " size"]:
-    """Return the time step bias as Mamba initializes it: softplus^-1 of steps
-    log-uniform between dt_min and dt_max, floored at 1e-4."""
-    low, high = math.log(config.dt_min), math.log(config.dt_max)
-    dt = jnp.exp(jax.random.uniform(rngs.params(), (size,), minval=low, maxval=high))
-    dt = jnp.maximum(dt, 1e-4)
-    return dt + jnp.log(-jnp.expm1(-dt))
-
-
 def _out(
     n: int, width: int, name: parallel.Name, bias: bool, rngs: nnx.Rngs
 ) -> nnx.Linear:
@@ -180,13 +170,16 @@ class Mamba(nnx.Module):
     D u added, the output is gated by SiLU(z) and projected back.
 
     A starts as S4D-real's, ``-(1, 2, ..., n)`` in every channel, D at 1, and the
-    time steps log-uniform in ``[dt_min, dt_max]``.
+    time steps log-uniform in ``[dt_min, dt_max]``. Weight decay leaves A_log alone,
+    as Mamba's code does: a matrix, but of decay rates.
 
     Args:
         config: Its settings (`bux.config.MambaConfig`).
         width: The width of the stream, d.
         rngs: The random streams the parameters start from.
     """
+
+    no_weight_decay = ("A_log",)
 
     def __init__(self, config: cfg.MambaConfig, width: int, rngs: nnx.Rngs):
         d_inner, n = config.expand * width, config.state_size
@@ -208,7 +201,8 @@ class Mamba(nnx.Module):
             rngs.params(), (r, d_inner), minval=-(r**-0.5), maxval=r**-0.5
         )
         self.dt_proj = nnx.Param(dt_proj, names=(None, "mlp"))
-        self.dt_bias = nnx.Param(_dt_bias(config, d_inner, rngs), names=("mlp",))
+        steps = time_step_bias(rngs.params(), d_inner, config.dt_min, config.dt_max)
+        self.dt_bias = nnx.Param(steps, names=("mlp",))
         norm = cfg.NormalizationConfig(type="rmsnorm", eps=1e-6)
         self.dt_norm = Norm(norm, r)
         self.b_norm, self.c_norm = Norm(norm, n), Norm(norm, n)
@@ -232,7 +226,8 @@ class Mamba(nnx.Module):
         u = jax.nn.silu(self.conv(u, taps))
         r, n = self.rank, self.state_size
         dt, B, C = jnp.split(self.x_proj(u), [r, r + n], axis=-1)
-        dt = jax.nn.softplus(self.dt_norm(dt) @ self.dt_proj[...] + self.dt_bias[...])
+        dt = (self.dt_norm(dt) @ self.dt_proj[...]).astype(jnp.float32)
+        dt = jax.nn.softplus(dt + self.dt_bias[...])
         B, C = self.b_norm(B)[:, :, None], self.c_norm(C)[:, :, None]
         A = -jnp.exp(self.A_log[...].astype(jnp.float32))
         y = selective_scan(u[..., None], dt, A, B, C, segments(taps))[..., 0]
@@ -256,7 +251,8 @@ class Mamba2(nnx.Module):
     as linear attention's does.
 
     A starts at ``-a`` for a uniform in [1, 16] per head (Mamba-2's A_init_range), D
-    at 1, and the time steps log-uniform in ``[dt_min, dt_max]``.
+    at 1, and the time steps log-uniform in ``[dt_min, dt_max]``. Weight decay leaves
+    A_log alone, as Mamba's.
 
     Args:
         config: Its settings (`bux.config.Mamba2Config`).
@@ -267,6 +263,8 @@ class Mamba2(nnx.Module):
         ValueError: The inner channels do not split into heads of head_dim, or the
             heads into num_groups groups.
     """
+
+    no_weight_decay = ("A_log",)
 
     def __init__(self, config: cfg.Mamba2Config, width: int, rngs: nnx.Rngs):
         d_inner, n, g = config.expand * width, config.state_size, config.num_groups
@@ -285,7 +283,8 @@ class Mamba2(nnx.Module):
         )
         # Over u, B and C side by side, as the projection gives them: whole.
         self.conv = CausalConv(d_inner + 2 * g * n, config.conv_size, True, rngs)
-        self.dt_bias = nnx.Param(_dt_bias(config, h, rngs), names=("heads",))
+        steps = time_step_bias(rngs.params(), h, config.dt_min, config.dt_max)
+        self.dt_bias = nnx.Param(steps, names=("heads",))
         # A = -a, with a uniform in [1, 16] per head (Mamba-2's A_init_range).
         a = jax.random.uniform(rngs.params(), (h,), minval=1.0, maxval=16.0)
         self.A_log = nnx.Param(jnp.log(a), names=("heads",))
@@ -313,7 +312,8 @@ class Mamba2(nnx.Module):
         u, B, C = jnp.split(ubc, [d_inner, d_inner + g * n], axis=-1)
         u = parallel.shard(u.reshape(b, t, self.heads, self.head_dim), *_HEADS, None)
         B, C = B.reshape(b, t, g, n), C.reshape(b, t, g, n)
-        dt = parallel.shard(jax.nn.softplus(dt + self.dt_bias[...]), *_HEADS)
+        dt = jax.nn.softplus(dt.astype(jnp.float32) + self.dt_bias[...])
+        dt = parallel.shard(dt, *_HEADS)
         A = -jnp.exp(self.A_log[...].astype(jnp.float32))[:, None]
         y = selective_scan(u, dt, A, B, C, segments(taps)) + u * self.D[...][:, None]
         y = y.reshape(b, t, d_inner) * jax.nn.silu(z)

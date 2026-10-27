@@ -62,12 +62,11 @@ def runs(dk: int, dv: int, dtype: Any, decays: int, floor: float | None) -> bool
     """Return whether a kernel runs a layer of these head dims, its q, k and v of
     `dtype` and `decays` log decays a head, never below `floor`, by the run's methods,
     here: 16-bit values only, and a decay per channel bounded at `FLOOR`."""
-    on = parallel.active()
-    method = on.methods.recurrence if on else "scan"
+    scan = parallel.choice("recurrence") == "scan"
     shapes = dk in DIMS and dv in DIMS and dtype in (jnp.bfloat16, jnp.float16)
     gates = decays == 1 or (floor is not None and floor >= FLOOR)
     here = kernels.gpu() and _sm()
-    return frost is not None and method == "scan" and shapes and gates and here
+    return frost is not None and scan and shapes and gates and here
 
 
 @functools.cache
@@ -325,11 +324,10 @@ def linear_runs(dk: int, dv: int, dtype: Any) -> bool:
     its q, k and v of `dtype`, by the run's methods, here: bfloat16 only. Where a tile
     of 16 positions decays a channel past exp(-83), the kernel runs all again by an
     exact path, many times slower; in float16, past exp(-9.7)."""
-    on = parallel.active()
-    method = on.methods.recurrence if on else "scan"
+    scan = parallel.choice("recurrence") == "scan"
     shapes = dk in DIMS and dv in DIMS and dtype == jnp.bfloat16
     here = kernels.gpu() and _sm()
-    return _has_gdn2() and method == "scan" and shapes and here
+    return _has_gdn2() and scan and shapes and here
 
 
 def gated_runs(dk: int, dv: int, dtype: Any, floor: float | None) -> bool:

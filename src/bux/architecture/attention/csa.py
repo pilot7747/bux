@@ -248,7 +248,7 @@ class CSA(Sparse):
         """Return whether the heads are wider than the dense kernels of
         ``methods.attention = auto`` take on a GPU (`DENSE_HEAD_DIMS`, as CSA's 512
         are)."""
-        auto = parallel.method_name("attention") == "auto"
+        auto = parallel.choice("attention") == "auto"
         return auto and kernels.gpu() and q.shape[-1] > DENSE_HEAD_DIMS
 
     def _sparse(

@@ -22,8 +22,7 @@ The package re-exports its modules' public names, as ``parallel.use``:
   ``splits``, ``shard``, ``shard_stream``, ``axes_of``.
 - `bux.parallel.place`, where state and batches live: ``shardings``, ``build``,
   ``shard_state``, ``shard_batch``, ``local_rows``, ``microbatches``.
-- `bux.parallel.methods`, one registry per kind of method: ``method``,
-  ``method_name``.
+- `bux.parallel.methods`, one registry per kind of method: ``method``, ``choice``.
 - `bux.parallel.gather`, a step's parameters gathered once and its gradients
   reduced once: ``whole``, ``rows``, ``splits``, ``gather``, ``scatter``, ``apart``.
 
@@ -59,7 +58,7 @@ from bux.parallel.layout import (
     splits,
 )
 from bux.parallel.mesh import AXES, active, mesh, sizes
-from bux.parallel.methods import method, method_name
+from bux.parallel.methods import choice, method
 from bux.parallel.place import (
     build,
     local_rows,
@@ -93,6 +92,7 @@ __all__ = [
     "axes_of",
     "build",
     "check",
+    "choice",
     "context",
     "experts",
     "flash",
@@ -100,7 +100,6 @@ __all__ = [
     "local_rows",
     "mesh",
     "method",
-    "method_name",
     "methods",
     "microbatches",
     "named",

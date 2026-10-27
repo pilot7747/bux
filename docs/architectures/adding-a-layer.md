@@ -405,7 +405,7 @@ Modules tell the optimizers how to treat their parameters with class attributes
 
 | Attribute | What it does | Used by |
 |-----------|--------------|---------|
-| `no_weight_decay = ("scale", "bias")` | weight decay skips these parameters, whatever their shape | norms, DyT, Engram's table |
+| `no_weight_decay = ("scale", "bias")` | weight decay skips these parameters, whatever their shape | norms, DyT, Engram's table, Mamba's `A_log`, RWKV-7's token shift, hc's static maps |
 | `no_muon = True` | under `muon`, the module and everything in it train by its `adam` | the embedding, the head |
 | `muon_axes = {"up": (1, 2)}` | Muon trains this parameter as matrices over these axes (reduction, output); the axes before are batch | the MoE's stacked experts |
 

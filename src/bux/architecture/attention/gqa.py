@@ -467,7 +467,7 @@ def require_xla(feature: str) -> None:
     Raises:
         NotImplementedError: under any other method.
     """
-    name = parallel.method_name("attention")
+    name = parallel.choice("attention")
     if name not in ("xla", "auto"):
         raise NotImplementedError(
             f"methods.attention = {name} has no {feature}; only xla has"

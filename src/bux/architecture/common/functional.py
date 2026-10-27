@@ -1,8 +1,10 @@
 """Stateless functions that several layers share."""
 
+import math
+
 import jax
 import jax.numpy as jnp
-from jaxtyping import Array, Float
+from jaxtyping import Array, Float, PRNGKeyArray
 
 from bux.parallel.context import softcap
 
@@ -36,3 +38,14 @@ def activation(name: str, x: Float[Array, "*shape"]) -> Float[Array, "*shape"]:
         case "situ":
             return softcap(x, 4.0) * jax.nn.sigmoid(x)
     raise ValueError(name)
+
+
+def time_step_bias(
+    key: PRNGKeyArray, n: int, low: float = 1e-3, high: float = 0.1
+) -> Float[Array, " n"]:
+    """Return softplus^-1 of n time steps log-uniform in [low, high], floored at 1e-4:
+    how Mamba starts its time steps' bias, and fla the dt_bias of Gated DeltaNet and
+    KDA."""
+    log_dt = jax.random.uniform(key, (n,), minval=math.log(low), maxval=math.log(high))
+    dt = jnp.maximum(jnp.exp(log_dt), 1e-4)
+    return dt + jnp.log(-jnp.expm1(-dt))

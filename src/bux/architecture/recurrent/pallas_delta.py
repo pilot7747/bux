@@ -75,10 +75,9 @@ def runs(dk: int, dv: int, dtype: Any, decays: int) -> bool:
     """Return whether the kernels run a layer of these head dims, its q, k and v of
     `dtype` and `decays` log decays a head, by the run's methods: on a GPU, a decay
     per channel and 16-bit values."""
-    on = parallel.active()
-    method = on.methods.recurrence if on else "scan"
+    scan = parallel.choice("recurrence") == "scan"
     shapes = dk in DIMS and dv in DIMS and dtype in (jnp.bfloat16, jnp.float16)
-    return kernels.gpu() and method == "scan" and shapes and decays == dk
+    return kernels.gpu() and scan and shapes and decays == dk
 
 
 def delta_rule(
@@ -122,15 +121,9 @@ def _rows(
     t = q.shape[1]
     q, k, v, g, beta, within = (_padded(x) for x in (q, k, v, g, beta, within))
     G = _summed(jnp.broadcast_to(g, k.shape).astype(jnp.float32))
-    out = _chunks(_keeps(), q, k, v, G, beta.astype(jnp.float32), _documents(within))
+    keep = parallel.choice("states") == "keep"  # the chunks' parts and states
+    out = _chunks(keep, q, k, v, G, beta.astype(jnp.float32), _documents(within))
     return out[:, :t]
-
-
-def _keeps() -> bool:
-    """Return whether the backward pass keeps the chunks' parts and states from the
-    forward pass, by the run's `methods.states`: keep, outside ``parallel.use``."""
-    on = parallel.active()
-    return on is None or on.methods.states == "keep"
 
 
 def _padded(x: Shaped[Array, "b t *e"]) -> Shaped[Array, "b _ *e"]:

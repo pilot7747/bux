@@ -60,7 +60,7 @@ except ImportError:
 def runs() -> bool:
     """Return whether the kernels run here: on a B200 or B300 with cudnn-frontend,
     under ``methods.attention = auto``, outside `bux.kernels.off`."""
-    auto = parallel.method_name("attention") == "auto"
+    auto = parallel.choice("attention") == "auto"
     return cutlass is not None and auto and kernels.gpu() and _sm()
 
 

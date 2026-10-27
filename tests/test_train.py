@@ -160,6 +160,24 @@ def test_a_state_s_paths_are_its_variables_as_a_pure_tree_s_are():
     assert paths[0] == paths[1] == [("value",), ("w",)]
 
 
+def test_weight_decay_leaves_decay_rates_mixes_and_static_maps_alone():
+    """Mamba's A_log, RWKV-7's token shift and r_k, and hc's static maps are matrices,
+    but of rates, mixes and maps that start away from 0, which their references never
+    decay. The projections around them do."""
+    rwkv7 = "rwkv7(num_heads=2, head_dim=8, decay_rank=4, a_rank=4, v_rank=4)"
+    mamba2 = "mamba2(state_size=4, head_dim=8)"
+    mixers = f"[norm mamba(state_size=4)] [norm {rwkv7}] [norm {mamba2}]"
+    source = f"residual = hc(expansion=2)\nmodel = embed {mixers} norm head\n"
+    m = Model(compile(ARCH + source), rngs=nnx.Rngs(0))
+    mask = weight_decay_mask(m)(nnx.state(m, nnx.Param))
+    flags = {path: v.get_value() for path, v in nnx.to_flat_state(mask)}
+    kept = ("A_log", "shift", "r_k", "static_alpha", "static_beta")
+    names = {path[-1] for path in flags}
+    assert set(kept) <= names
+    assert not any(d for path, d in flags.items() if path[-1] in kept)
+    assert all(d for path, d in flags.items() if path[-2:] == ("in_proj", "kernel"))
+
+
 # --- Muon split over devices: methods.orthogonalize ------------------------------------
 
 MOE = (

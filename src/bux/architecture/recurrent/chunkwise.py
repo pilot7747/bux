@@ -35,7 +35,7 @@ from jaxtyping import Array, Bool, Float, Int
 
 from bux import parallel
 from bux.architecture.recurrent import affine_scan
-from bux.parallel.recurrence import Chunk, Positions, Transition
+from bux.parallel.recurrence import Chunk, Positions, Transition, then
 
 SIZE = 64  # positions per chunk
 SUB = 16  # positions per block of a chunk, for a decay per key channel
@@ -407,11 +407,11 @@ def _across(
         S, P = carry
         R, O, A, B = at
         out = O + R @ S
-        S = _then(A, S) + B
+        S = then(A, S) + B
         if P is None:
             return (S, None), (out, None)
         reads = R @ P if P.ndim == 4 else R * P[..., None, :]
-        return (S, _then(A, P)), (out, reads)
+        return (S, then(A, P)), (out, reads)
 
     (S, P), (out, reads) = jax.lax.scan(step, (jnp.zeros_like(B[0]), P), (R, O, A, B))
     reads = None if reads is None else jnp.moveaxis(reads, 0, 1)
@@ -439,11 +439,3 @@ def _passed(
     total = jnp.cumsum(log, 1)
     starts = jnp.exp(jnp.pad(total, [(0, 0), (1, 0), (0, 0)])[:, :-1])
     return before, S, jnp.exp(total[:, -1, :, None]), starts
-
-
-def _then(A: Transition, S: Float[Array, "b h *rest"]) -> Float[Array, "b h *rest"]:
-    """Return A S, for a matrix A or its diagonal; S a state, or a map of A's
-    kind."""
-    if A.ndim == S.ndim:
-        return A @ S if A.ndim == 4 else A * S
-    return A[..., None] * S
