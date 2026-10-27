@@ -1332,13 +1332,11 @@ def _about(run: ir.Run, folder: Path, trainer: Trainer) -> list[str]:
     its model, its steps and tokens, its phases, and what it logs and saves."""
     t = run.train
     devices = parallel.mesh(t.mesh).devices
-    params = _si(num_params(trainer.model))
+    params = curriculum.si(num_params(trainer.model))
     how = f"{config_to_source(t.optimizer)}, {config_to_source(t.schedule)}"
-    tokens = _si(curriculum.tokens(curriculum.stretches(t), t.steps))
-    shape = "" if curriculum.varies(t) else f" × {t.batch} × {t.seq_len} tokens"
     lines = [
         f"{folder}, on {devices.size} × {devices.flat[0].device_kind}",
-        f"{params} parameters, {t.steps:,} steps{shape} = {tokens} tokens, {how}",
+        f"{params} parameters, {curriculum.summary(t)}, {how}",
         *curriculum.lines(t),
     ]
     watched = [f"log every {t.log.every}"]
@@ -1350,14 +1348,6 @@ def _about(run: ir.Run, folder: Path, trainer: Trainer) -> list[str]:
         watched.append(f"checkpoint every {t.checkpoint.every}")
     watched += [config_to_source(c) for c in t.log.trackers]
     return [*lines, ", ".join(watched)]
-
-
-def _si(n: float) -> str:
-    """Return `n` with an SI suffix, as ``bux plan`` shows it: 1.3B, 25.6k."""
-    for suffix, scale in (("", 1), ("k", 1e3), ("M", 1e6), ("B", 1e9)):
-        if "e" not in (shown := f"{n / scale:.3g}"):
-            return shown + suffix
-    return f"{n / 1e12:.3g}T"
 
 
 def _check_cpu_bfloat16(run: ir.Run) -> None:
