@@ -365,7 +365,9 @@ Gated DeltaNet hybrid (`"DDDA"^4`) and a 64-expert MoE (`E^16`, top 8), in bfloa
 
 What the table says:
 
-- `none` is the fastest; a policy buys rows, and `auto` takes the fastest that fits.
+- `none` is the fastest; a policy buys rows, and `auto` takes the first policy that
+  fits, in the order of [`remat=auto`](#rematauto-the-default): the one that
+  recomputes least.
 - `dots` runs flash attention's forward twice, and `save_attention` the matmuls of
   every layer. `dots_attention` runs neither: on the dense model it is 2% slower than
   `none` in 19% less memory, as is `remat(save=[attention, mlp])`.
