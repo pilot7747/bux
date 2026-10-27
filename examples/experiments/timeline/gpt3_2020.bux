@@ -1,0 +1,15 @@
+# The 2020 baseline of the timeline ablations, a family sized by d_model: GPT-3 small's
+# decoder (Brown et al., 2020) at any width. LayerNorms and projections with biases,
+# multi-head attention in heads of 64, a GELU MLP 4 times as wide as the stream, a head
+# tied to the embedding, and a layer for every 64 of the width (d_model = 768 is GPT-3
+# small: 12 layers of 12 heads). Positions are learned and absolute, up to 16k, because
+# every run ends with a 16k phase. The vocabulary is GPT-NeoX's, as the recipe's.
+d_model    = 768
+vocab_size = 50304
+layers     = d_model // 64
+
+norm  = layernorm(eps=1e-5, bias=true)
+attn  = gqa(num_heads=d_model // 64, num_kv_heads=d_model // 64, bias=true)
+ffn   = mlp(intermediate_size=4 * d_model, activation=gelu, bias=true)
+block = [norm attn] [norm ffn]
+model = embed(max_positions=16384) block^layers norm head(tied=true)

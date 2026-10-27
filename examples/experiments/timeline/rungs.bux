@@ -1,0 +1,14 @@
+# The rungs of the timeline ablations, zipped by their labels: four widths, each trained
+# on 20 tokens for every non-embedding parameter of the 2020 baseline at that width
+# (gpt3_2020.bux), so every variant at a rung reads the same tokens. The batch follows
+# DeepSeek LLM's batch-size law, B = 0.292 C^0.327 tokens, in rows of 2048 rounded to
+# 48; the long phase reads an eighth as many rows of 16k, which each mesh splits evenly.
+# Use it after the recipe, so that its settings replace the recipe's:
+#
+#   use gpt3_2020
+#   use timeline_code
+#   use rungs
+d_model = d512: 512  | d768: 768  | d1024: 1024  | d1280: 1280
+budget  = d512: 503M | d768: 1.7B | d1024: 4.03B | d1280: 7.86B
+batch   = d512: 48   | d768: 96   | d1024: 192   | d1280: 288
+mesh    = d512: mesh(data=1) | d768: mesh(data=1) | d1024: mesh(data=2) | d1280: mesh(data=4)
