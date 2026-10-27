@@ -103,8 +103,9 @@ editor's hover document it.
 - **Outside a search, a dimension takes its middle.** `bux check`, `bux plan`, `bux
   fmt` and `compile_runs` show the run halfway along each scale: the geometric mean
   of a `log_uniform`, the first option of a `choice`.
-- **A trial's values have three significant digits**, so its run is named for
-  exactly what it trains, and its `run.bux` compiles back to the same run:
+- **A trial's values have three significant digits**, but never past a bound, so
+  its run is named for exactly what it trains, and its `run.bux` compiles back to
+  the same run:
   `attention_search[mha, optimizer.lr=3.16e-4, optimizer.weight_decay=0.0712]`.
   A choice names it by its option's name, `block=par`, or as written, `ffn.activation=gelu`.
   Two trials that take the same values, as trials of a few options must, are one

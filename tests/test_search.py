@@ -214,6 +214,16 @@ def test_coordinates_decode_to_the_values_a_trial_takes_and_back():
     assert space.decode(space.encode(values)) == values
 
 
+def test_a_value_rounds_to_its_digits_within_its_bounds():
+    b2 = tcfg.UniformConfig(low=0.99, high=0.9999)
+    assert [b2.value(u) for u in (0, 0.5, 0.97, 1)] == [0.99, 0.995, 0.9999, 0.9999]
+    assert tcfg.LogUniformConfig(low=1.234e-4, high=1e-2).value(0) == 1.234e-4
+
+
+def test_a_search_seed_is_not_negative():
+    assert "greater than or equal to 0" in error(SOURCE + "search = search(seed=-1)\n")
+
+
 @pytest.mark.parametrize(
     "method", [tcfg.RandomSearch(), tcfg.HaltonSearch(), tcfg.SobolSearch()]
 )
