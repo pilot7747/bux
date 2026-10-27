@@ -287,8 +287,19 @@ OptimizerConfig = Annotated[AdamWConfig | MuonConfig, Field(discriminator="type"
 # A schedule multiplies the optimizer's lr at every step. Each starts with `warmup`
 # steps that rise linearly from lr / warmup at the first step to lr.
 
+
+def _from_zero(warmup: float) -> float:
+    if warmup < 0:
+        raise ValueError(
+            "a warmup is a count of steps from 0, or a share of them below 1"
+        )
+    return warmup
+
+
 # Steps of warmup, or below 1 a share of the steps, rounded to a number of them.
-Warmup = int | Annotated[float, Field(gt=0, lt=1)]
+Warmup = Annotated[
+    int | Annotated[float, Field(gt=0, lt=1)], AfterValidator(_from_zero)
+]
 
 # How a cooldown or a piece goes from where it starts to where it ends: sqrt is
 # 1 - sqrt(t) (Hägele et al., 2024); exp falls by e over it, moved to end where it
@@ -327,7 +338,16 @@ class CosineSchedule(Config):
     horizon: Annotated[float, Field(gt=0)] = 1.0
 
 
-class WSDSchedule(Config):
+class _Cooled(Config):
+    """A schedule whose cooldown takes the last `decay` of the steps, which its
+    subclasses declare."""
+
+    def cooldown(self, steps: int) -> int:
+        """Return the steps of the cooldown, in a run of `steps`."""
+        return round(getattr(self, "decay") * steps)  # noqa: B009
+
+
+class WSDSchedule(_Cooled):
     """Warmup-stable-decay (Hu et al., 2024): warmup, the peak, then a cooldown to
     `final` times the peak over the last `decay` of the steps. Checkpoints from the
     stable phase can be cooled down later, to study several run lengths at once."""
@@ -344,10 +364,6 @@ class WSDSchedule(Config):
         """Check that a geometric cooldown ends above 0."""
         _above_zero(self.shape, self.final)
         return self
-
-    def cooldown(self, steps: int) -> int:
-        """Return the steps of the cooldown, in a run of `steps`."""
-        return round(self.decay * steps)
 
 
 class LinearDecaySchedule(Config):
@@ -370,7 +386,7 @@ class MultiStepSchedule(Config):
     factor: float = 0.316  # what each drop multiplies by; 0.316 is 1 / sqrt(10)
 
 
-class PowerSchedule(Config):
+class PowerSchedule(_Cooled):
     """IBM's Power scheduler (Shen et al., 2024): warmup, then `a` times the batch
     times n to the `b`, n the tokens trained, capped at the peak; then a cooldown to
     `final` times where it starts, over the last `decay` of the steps. The warmup
@@ -391,10 +407,6 @@ class PowerSchedule(Config):
         """Check that a geometric cooldown ends above 0."""
         _above_zero(self.shape, self.final)
         return self
-
-    def cooldown(self, steps: int) -> int:
-        """Return the steps of the cooldown, in a run of `steps`."""
-        return round(self.decay * steps)
 
 
 class Piece(Config):
@@ -564,7 +576,8 @@ class EvalConfig(Config):
     data: DataConfig  # a source or a mixture, as `data` takes
     every: Positive = 1000  # steps between evaluations
     batches: Positive = 10  # batches an evaluation reads, the same ones each time
-    seq_len: Positive | None = None  # tokens a row; none: the run's seq_len
+    # Tokens a row, at least 2; none: the run's seq_len.
+    seq_len: Annotated[int, Field(ge=2)] | None = None
     batch: Positive | None = None  # rows a batch; none: the run's batch
 
 
@@ -1243,7 +1256,8 @@ class TrainConfig(Config):
     # of them; [] is none.
     curriculum: Phases = ()
     seed: int = 0  # of the model's initialization and of the data's order
-    clip: float | None = 1.0  # clip gradients to this global norm; none disables it
+    # Clip gradients to this global norm, above 0; none disables it.
+    clip: Annotated[float | None, Field(gt=0)] = 1.0
     loss: LossConfig = LossConfig()  # the loss's terms and their weights
     # Held-out loss and bits per byte every so many steps: an eval, or a list of them
     # under names of their own; none: no eval.

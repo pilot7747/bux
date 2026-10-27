@@ -60,10 +60,15 @@ def use(
         ACTIVE.reset(token)
 
 
-def check(batch: int, seq_len: int) -> None:
+def check(batch: int, seq_len: int, microbatches: int | None = None) -> None:
     """Raise unless `batch` rows of `seq_len` tokens split evenly: the rows into
-    ``methods.microbatches``, then over the batch axes, and the positions over the
-    seq and stream axes. Outside `use` it checks nothing.
+    `microbatches`, then over the batch axes, and the positions over the seq and
+    stream axes. Outside `use` it checks nothing.
+
+    Args:
+        batch: The rows.
+        seq_len: The tokens of each.
+        microbatches: The microbatches the rows go in; None: ``methods.microbatches``.
 
     Raises:
         ValueError: If they do not, with the multiple to make them.
@@ -71,7 +76,7 @@ def check(batch: int, seq_len: int) -> None:
     on = active()
     if on is None:
         return
-    n = on.methods.microbatches
+    n = on.methods.microbatches if microbatches is None else microbatches
     if batch % n:
         raise ValueError(
             f"batch = {batch} does not split into methods.microbatches = {n}"

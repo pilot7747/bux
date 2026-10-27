@@ -151,6 +151,23 @@ def tokens(stretches: Sequence[Stretch], steps: int) -> int:
     return total
 
 
+def si(n: float) -> str:
+    """Return `n` with an SI suffix, as ``bux check``, ``bux plan`` and a run's start
+    show it: 1.3B, 25.6k."""
+    for suffix, scale in (("", 1), ("k", 1e3), ("M", 1e6), ("B", 1e9)):
+        if "e" not in (shown := f"{n / scale:.3g}"):
+            return shown + suffix
+    return f"{n / 1e12:.3g}T"
+
+
+def summary(t: TrainConfig) -> str:
+    """Return the steps and tokens of `t`, as ``bux check`` and a run's start say
+    them: ``50 steps × 8 × 64 tokens = 25.6k tokens``, with no shape where its batches
+    change (`lines` says how)."""
+    shape = "" if varies(t) else f" × {t.batch} × {t.seq_len} tokens"
+    return f"{t.steps:,} steps{shape} = {si(tokens(stretches(t), t.steps))} tokens"
+
+
 def lines(t: TrainConfig) -> list[str]:
     """Return a line for each phase of `t`, from its own settings at step 0, with its
     batch ramp: what ``bux check`` and a run's start say of them; none for a run whose

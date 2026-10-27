@@ -59,13 +59,6 @@ if TYPE_CHECKING:  # imported where used: jax and the backend are slow to import
     from jax.sharding import AbstractMesh
 
 
-def _si(n: float) -> str:
-    for suffix, scale in (("", 1), ("k", 1e3), ("M", 1e6), ("B", 1e9)):
-        if "e" not in (shown := f"{n / scale:.3g}"):
-            return shown + suffix
-    return f"{n / 1e12:.3g}T"
-
-
 def _bytes(n: int | None) -> str:
     if n is None:
         return "?"
@@ -94,10 +87,9 @@ def training(run: Run) -> str:
     phases, its optimizer, schedule and data, and its tokenizer and packing if it has
     them."""
     t = run.train
-    shape = "" if curriculum.varies(t) else f" × {t.batch} × {t.seq_len} tokens"
     phases = "".join(f"{line}\n" for line in curriculum.lines(t))
     return (
-        f"{t.steps:,} steps{shape} = {_si(_tokens(t))} tokens\n{phases}"
+        f"{curriculum.summary(t)}\n{phases}"
         f"optimizer={config_to_source(t.optimizer)} "
         f"schedule={config_to_source(t.schedule)}\n"
         f"data={value_to_source(t.data)}"
@@ -137,7 +129,8 @@ def searching(run: Run, dims: list[Dimension]) -> str:
             for r in range(h.rungs)
         ]
         worth = h.rungs * search.trials / h.eta ** (h.rungs - 1)
-        line += f"\nhalving: rungs of {', '.join(map(_si, rungs))} steps, eta {h.eta}"
+        sizes = ", ".join(map(curriculum.si, rungs))
+        line += f"\nhalving: rungs of {sizes} steps, eta {h.eta}"
         line += f", about {worth:.3g} runs' steps in all"
     return line
 
@@ -268,10 +261,10 @@ def _row(run: Run, gpus: int, alone: bool) -> tuple[str, ...]:
     work = flops_per_token(run)
     return (
         run.id,
-        _si(n) if n else "?",
-        _si(tokens),
+        curriculum.si(n) if n else "?",
+        curriculum.si(tokens),
         f"{tokens / n:.1f}" if n else "?",
-        _si(work) if work else "?",
+        curriculum.si(work) if work else "?",
         str(used),
         _bytes(param_bytes),
         _bytes(opt_bytes),
@@ -518,8 +511,8 @@ def _export_file(args: argparse.Namespace) -> int:
 
     from bux.architecture import Model, num_params
 
-    n = num_params(nnx.eval_shape(lambda: Model(arch, rngs=nnx.Rngs(0))))
-    print(f"{args.run}: {_si(n)} parameters exported to {args.out}, without weights")
+    n = curriculum.si(num_params(nnx.eval_shape(lambda: Model(arch, rngs=nnx.Rngs(0)))))
+    print(f"{args.run}: {n} parameters exported to {args.out}, without weights")
     return 0
 
 

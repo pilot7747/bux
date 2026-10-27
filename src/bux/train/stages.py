@@ -44,12 +44,19 @@ def balanced(run: ir.Run) -> MethodsConfig:
     methods, n = t.methods, t.mesh.stage
     if n == 1 or methods.stages is not None or methods.rounds > 1:
         return methods
-    passes, work = _work(run)
     if methods.pipeline in schedule.TABLES:
+        passes, work = _work(run)
         split = pipeline.balanced(passes, n, work)
     else:
-        split = pipeline.even(passes, n)
+        split = pipeline.even(_passes(run), n)
     return methods.model_copy(update={"stages": list(split)})
+
+
+def _passes(run: ir.Run) -> int:
+    """Return the passes of the run's pipelined repeat, from shapes."""
+    with _on_stages(run):
+        model = nnx.eval_shape(lambda: Model(run.arch, rngs=nnx.Rngs(run.train.seed)))
+        return pipelined_repeat(model)[1].times
 
 
 def _work(run: ir.Run) -> tuple[int, pipeline.Work]:

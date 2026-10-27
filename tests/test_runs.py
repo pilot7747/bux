@@ -108,6 +108,9 @@ def test_an_architecture_alone_is_not_a_run():
             "data = 3",
             "'data' must be text(...), chat(...), tokens(...), synthetic(...) or a mix",
         ),
+        ("clip = 0", "'clip' must be greater than 0, found 0"),  # not off: no updates
+        ("schedule = wsd(warmup=-5)", "a warmup is a count of steps from 0"),
+        ("eval = eval(data=synthetic, seq_len=1)", "seq_len: Input should be greater"),
         ("schedule = wsd(warmup=90)", "the schedule takes 110 steps (90 of warmup"),
         ("schedule = power(warmup=0.95)", "takes 105 steps (95 of warmup and 10 of"),
         (

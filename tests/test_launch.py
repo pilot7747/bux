@@ -15,11 +15,12 @@ from types import SimpleNamespace
 import pytest
 
 import bux.launch
-from bux.__main__ import _bytes, _si, abstract, main, memory
+from bux.__main__ import _bytes, abstract, main, memory
 from bux.lang import compile_runs
 from bux.launch import Stop, fit, launch, need, processes, status, summary
 from bux.runtime import POOL, cache_dir, configure, xla_flags
 from bux.train.config import MeshConfig
+from bux.train.curriculum import si
 from bux.train.hooks import Hook
 from bux.train.trainer import Trainer, directory, train
 
@@ -465,8 +466,8 @@ def test_the_plan_says_each_runs_gpus_and_its_bytes_on_each(capsys):
 def test_the_plan_shows_three_digits_never_an_exponent():
     assert _bytes(1010 * 2**20) == "0.986GiB" and _bytes(609 * 2**10) == "609KiB"
     assert _bytes(512) == "512B" and _bytes(3 * 2**40) == "3TiB"
-    assert _si(999_600) == "1M" and _si(25_600) == "25.6k" and _si(512) == "512"
-    assert _si(10e9) == "10B" and _si(70.6e9) == "70.6B"
+    assert si(999_600) == "1M" and si(25_600) == "25.6k" and si(512) == "512"
+    assert si(10e9) == "10B" and si(70.6e9) == "70.6B"
 
 
 def test_the_plan_sizes_muons_state_on_a_mesh(capsys):

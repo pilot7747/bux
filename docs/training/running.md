@@ -192,9 +192,11 @@ NVIDIA's datasheets for the SXM parts ({py:data}`bux.train.flops.PEAK`):
 
 ### How FLOPs are counted
 
-The model's FLOPs are counted once, before training, from the program of its loss's
-gradient on a batch, traced on shapes alone with remat and kernels off
-({py:func}`bux.train.trainer.step_flops`, {py:mod}`bux.train.flops`):
+The model's FLOPs are counted once for each shape of batch, before training, from
+the program of its loss's gradient on a batch, traced on shapes alone with remat and
+kernels off, and on one device: under the run's mesh, a pipeline's program would hold
+a stage's share of them ({py:func}`bux.train.trainer.step_flops`,
+{py:mod}`bux.train.flops`):
 
 - 2·m·n·k for every matrix product and convolution, times the length of every scan
   around it;
@@ -244,7 +246,7 @@ the run has a `tokenizer`.
 | `data` | required | the held-out rows: any data a run takes, a mixture too |
 | `every` | `1000` | steps between evals |
 | `batches` | `10` | batches of `batch` rows each, the same ones every time |
-| `seq_len` | `none` | tokens a row; none: the run's `seq_len` |
+| `seq_len` | `none` | tokens a row, at least 2; none: the run's `seq_len` |
 | `batch` | `none` | rows a batch; none: the run's `batch` |
 
 An eval is a training step's forward on packed rows, with no backward. Each batch
@@ -297,8 +299,10 @@ eval = [eval(name="code", data=code_eval),
 ```
 
 `bux prepare` packs the held-out documents at the eval's `seq_len`, and the run checks
-before it trains that the eval's rows split over its mesh, as a phase's must. The
-eval's step compiles once more, for its shape.
+before it trains that the eval's rows split over its mesh, as a phase's must. Unlike
+a step, an eval runs its batch whole, so its rows need not split into
+`methods.microbatches`, except under a pipeline, which takes them in microbatches.
+The eval's step compiles once more, for its shape.
 
 ## Checkpoints
 

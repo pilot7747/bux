@@ -90,7 +90,7 @@ class Fitting:
         so they lower one at a time; XLA lets go of it, so they compile side by side,
         a thread each."""
         steps = {
-            policy: xla.jit(self._trying(policy), self.options, **self.jit_kwargs)
+            policy: xla.jit(trying(policy, self.step), self.options, **self.jit_kwargs)
             for policy in policies
         }
         lowered = [steps[policy].lower(*args) for policy in policies]
@@ -109,16 +109,17 @@ class Fitting:
             holds = held(lowered)
         return Tried(policy, holds, time.perf_counter() - start)
 
-    def _trying(self, policy: str) -> Callable[..., Any]:
-        """Return the step, traced under `policy`, by the step's own name, which
-        profiles and JAX's cache show."""
 
-        @functools.wraps(self.step)
-        def step(*args: Any) -> Any:
-            with remat.trying(policy):
-                return self.step(*args)
+def trying(policy: str, step: Callable[..., Any]) -> Callable[..., Any]:
+    """Return `step`, traced under the remat `policy`, by the step's own name, which
+    profiles and JAX's cache show."""
 
-        return step
+    @functools.wraps(step)
+    def under(*args: Any) -> Any:
+        with remat.trying(policy):
+            return step(*args)
+
+    return under
 
 
 def _settings_in_force() -> Callable[[], ContextManager]:
