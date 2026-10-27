@@ -285,25 +285,19 @@ def plot(best: dict[str, list[Point]], targets: dict[str, float], out: Path) -> 
             n = np.array([p.params for p in ps])
             seen = np.geomspace(n.min() / 1.3, n.max(), 100)
             ahead = np.geomspace(n.max(), targets[f], 100)
-            line = {"color": colors[f], "linewidth": 2, "solid_capstyle": "round"}
-            ax.plot(
-                seen, [predict(params, f, g) for g in seen], label=LABELS[f], **line
-            )
-            ax.plot(
-                ahead,
-                [predict(params, f, g) for g in ahead],
-                linestyle=(0, (4, 3)),
-                **line,
-            )
-            dots = {
-                "color": colors[f],
-                "edgecolors": surface,
-                "linewidths": 2,
-                "zorder": 3,
-            }
-            ax.scatter(n, [p.metrics["objective"] for p in ps], s=64, **dots)
+            for xs, style in ((seen, "solid"), (ahead, (0, (4, 3)))):
+                ys = [predict(params, f, g) for g in xs]
+                label = LABELS[f] if style == "solid" else None
+                ax.plot(xs, ys, color=colors[f], linewidth=2, linestyle=style,
+                        solid_capstyle="round", label=label)  # fmt: skip
             y = predict(params, f, targets[f])
-            ax.scatter([targets[f]], [y], marker="*", s=260, **dots)
+            rungs = [p.metrics["objective"] for p in ps]
+            for xs, ys, marker, size in (
+                (n, rungs, "o", 64),
+                ([targets[f]], [y], "*", 260),
+            ):
+                ax.scatter(xs, ys, s=size, marker=marker, color=colors[f],
+                           edgecolors=surface, linewidths=2, zorder=3)  # fmt: skip
             higher = y >= max(predict(params, g, targets[g]) for g in best if best[g])
             ax.annotate(
                 f"{y:.3f}",
