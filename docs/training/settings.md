@@ -45,7 +45,7 @@ fields and documents them on hover, as it does for layers
 | `seed` | an integer | `0` | the model's initial weights, the order of the data, and every random stream |
 | `clip` | a number above 0, or `none` | `1.0` | the global norm gradients are clipped to ([Clipping](optimizers.md#clipping)) |
 | `loss` | {bux}`loss` | `loss` | the weights of the z-loss and of multi-token prediction ([The loss](optimizers.md#the-loss)) |
-| `eval` | {bux}`eval`, a list of them, or `none` | `none` | held-out loss and bits per byte every so many steps, one held-out set per eval ([Eval](running.md#eval)) |
+| `eval` | {bux}`eval`, a list of them, or `none` | `none` | held-out loss and bits per byte every so many steps, one held-out set per eval, also by position ([Eval](running.md#eval)) |
 | `checkpoint` | {bux}`checkpoint`, or `none` | `none` | saves a run resumes from ([Checkpoints](running.md#checkpoints)) |
 | `log` | {bux}`log` | `log` | the metrics every `every` steps (10 by default), and the trackers they go to ([The log](running.md#the-log), [Trackers](observing.md#trackers)) |
 | `observe` | {bux}`observe`, or `none` | `none` | the model layer by layer every so many steps ([Observing a run](observing.md)) |

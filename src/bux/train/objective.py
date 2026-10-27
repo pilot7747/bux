@@ -317,13 +317,19 @@ def held_out(
     batch: Batch,
     nbytes: Int[np.ndarray | Array, "b t"] | None = None,
     offset: int = 1,
+    positions: Sequence[int] = (),
 ) -> dict[str, Ratio]:
     """Return what an eval measures of `head` on `batch`, each as a sum and what it
     is a mean of: its cross-entropy, `loss`, over the targets, and given each token's
-    bytes of text, its bits per byte, `bpb`.
+    bytes of text, its bits per byte, `bpb`; and each of them over the targets of
+    each bucket of `positions`, as ``loss_2k``.
 
     `bpb` sums the nats of the targets that stand for text, in bits, over their
     bytes: a special token stands for none, so it leaves it out, as nanochat does.
+    A target's position is the tokens of its document before it in the row, the
+    context it is predicted from; the buckets start at 0 and at each of
+    `positions`, and are named by their first (``tcfg.buckets``). The logits are
+    made once for all the sums.
 
     Args:
         head: The head's output on `batch`.
@@ -331,15 +337,48 @@ def held_out(
         nbytes: The bytes of text each token of `batch` stands for
             (``Tokenizer.token_bytes``); None leaves `bpb` out.
         offset: How far ahead the head predicts.
+        positions: Where buckets of targets by position start, after 0, in order;
+            none for no buckets.
 
     Returns:
-        ``{"loss": (nats, targets)}``, and ``"bpb": (bits, bytes)`` given `nbytes`.
+        ``{"loss": (nats, targets)}``, and ``"bpb": (bits, bytes)`` given `nbytes`,
+        then each by bucket: ``"loss_0"``, ``"loss_2k"``, ...
     """
     targets, mask = targets_ahead(batch, offset), _padded_mask(batch, offset)
-    loss = head.sums(targets, mask.astype(jnp.float32), False).ce
-    out = {"loss": (loss, jnp.sum(mask))}
+    counts = {"loss": mask.astype(jnp.int32)}
     if nbytes is not None:
-        counted = jnp.where(mask, _ahead(nbytes, offset), 0)
-        nats = head.sums(targets, (counted > 0).astype(jnp.float32), False).ce
-        out["bpb"] = (nats / np.log(2), jnp.sum(counted))
-    return out
+        counts["bpb"] = jnp.where(mask, _ahead(nbytes, offset), 0)
+    if positions:
+        counts |= _by_position(counts, batch, offset, positions)
+    nats = _ce_sums(head, targets, [c > 0 for c in counts.values()])
+    return {
+        k: (n / np.log(2) if k.startswith("bpb") else n, jnp.sum(c))
+        for (k, c), n in zip(counts.items(), nats, strict=True)
+    }
+
+
+def _by_position(
+    counts: dict[str, Int[Array, "b t"]],
+    batch: Batch,
+    offset: int,
+    positions: Sequence[int],
+) -> dict[str, Int[Array, "b t"]]:
+    """Return each of `counts` in each bucket of its targets' positions, by name."""
+    within = Segments.of(jnp.asarray(batch.position_ids)).within
+    at = _ahead(within, offset)
+    bucket = jnp.searchsorted(jnp.asarray(positions), at, "right", method="compare_all")
+    return {
+        f"{k}_{name}": jnp.where(bucket == i, c, 0)
+        for i, name in enumerate(tcfg.buckets(positions))
+        for k, c in counts.items()
+    }
+
+
+def _ce_sums(
+    head: HeadOutput, targets: Int[Array, "b t"], weights: list[Bool[Array, "b t"]]
+) -> Float[Array, " k"]:
+    """Return the cross-entropy of `targets` summed by each of `weights`, from one
+    pass over the logits: the sums map over the weights, which the logits do not
+    read."""
+    stacked = jnp.stack(weights).astype(jnp.float32)
+    return jax.vmap(lambda w: head.sums(targets, w, False).ce)(stacked)

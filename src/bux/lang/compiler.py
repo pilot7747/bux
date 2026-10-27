@@ -1858,20 +1858,23 @@ def _check_schedule(train: tcfg.TrainConfig, spans: dict[str, Span]) -> None:
 
 
 def _check_objective(train: tcfg.TrainConfig, spans: dict[str, Span]) -> None:
-    """An objective's metrics of an eval, ``web_bpb`` or ``web_loss``, are those of
-    the run's evals: bits per byte need a tokenizer."""
+    """An objective's metrics of an eval, ``web_bpb``, ``web_loss`` or one by
+    bucket of positions, ``web_bpb_2k``, are those of the run's evals: bits per byte
+    need a tokenizer."""
     if train.objective is None:
         return
-    logged = {f"{e.name}_loss" for e in tcfg.evals(train)}
-    if train.tokenizer is not None:
-        logged |= {f"{e.name}_bpb" for e in tcfg.evals(train)}
-    names = [e.name for e in tcfg.evals(train)]
+    evals = tcfg.evals(train)
+    logged = {m for e in evals for m in tcfg.metrics(e, train.tokenizer is not None)}
+    with_bpb = {m for e in evals for m in tcfg.metrics(e, True)}
+    names = "|".join(re.escape(e.name) for e in evals)
     for term in train.objective.terms:
         metric = term.metric
-        evaluated = metric.endswith("_bpb") or metric.removesuffix("_loss") in names
+        evaluated = metric.endswith("_bpb") or (
+            bool(names) and re.fullmatch(rf"({names})_(loss|bpb)(_\w+)?", metric)
+        )
         if metric in logged or not evaluated:
             continue
-        if metric.endswith("_bpb") and metric.removesuffix("_bpb") in names:
+        if metric in with_bpb:
             message = (
                 f"the objective reads {metric}, but bits per byte need a tokenizer"
             )

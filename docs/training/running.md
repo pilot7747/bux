@@ -252,6 +252,7 @@ step. It logs `eval_loss`, the first head's cross-entropy, and, where the run ha
 | `batches` | `10` | batches of `batch` rows each, the same ones every time |
 | `seq_len` | `none` | tokens per row, at least 2; none: the run's `seq_len` |
 | `batch` | `none` | rows per batch; none: the run's `batch` |
+| `positions` | `[]` | where buckets of targets by position start, after 0, in order: each bucket's loss and bits per byte are logged too ([By position](#by-position)) |
 
 An eval is a training step's forward on packed rows, with no backward. Each batch
 sums what it measures over its targets, and the eval adds up the sums:
@@ -308,6 +309,32 @@ trains, the run checks that the eval's rows split over its mesh, as a phase's mu
 Unlike a step, an eval runs its batch whole, so its rows need not split into
 `methods.microbatches`, except under a pipeline, which takes them in microbatches.
 The eval's step compiles once more, for its shape.
+
+### By position
+
+A long eval's mean hides where its targets are: most of a 16k row is far from the
+start of its document. `positions` cuts the targets into buckets by their position,
+and logs the loss and bits per byte of each bucket beside the eval's own:
+
+```bux
+eval = eval(name="repo", data=repos_eval, seq_len=16384, batch=8,
+            positions=[2048, 8192])
+```
+
+This eval logs `repo_bpb_0`, `repo_bpb_2k` and `repo_bpb_8k`: the targets at positions
+0 to 2047, 2048 to 8191, and 8192 on. It logs `repo_loss_0`, `repo_loss_2k` and
+`repo_loss_8k` as well. A target's position is the count of tokens of its document
+before it in the row, so it is the context the target is predicted from. A row of
+2048 tokens has every target in the first bucket.
+
+- **Names:** each bucket is named by its first position, in units of 1024 where the
+  position is a multiple of 1024 (`2048` is `2k`), else in full (`2000` is `2000`).
+  An `objective` can read them: `objective = repo_bpb_8k`
+  ([Searching](searching.md)).
+- **Cost:** the buckets add sums over the same pass, which makes the logits once
+  for every metric of the eval.
+- **Empty buckets:** a bucket that no target reaches logs NaN, as a 2k eval's `8k`
+  bucket would.
 
 ## Checkpoints
 
