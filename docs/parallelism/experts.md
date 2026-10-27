@@ -835,7 +835,7 @@ of its picks costs little. `all_to_all`'s dispatch already hides behind the expe
 Qwen3-30B-A3B on random tokens, on 8 B300s (2026-10-24). The router's own routing
 drifts uneven there, to a balance loss of 1.4 to 1.8 per layer, and `nccl_ep` at a
 capacity of 1.25 drops 10 to 15% of the picks. Routed by random logits
-([Random logits for benchmarks](../architectures/experts.md#random-logits)), the
+([Random logits for benchmarks](../architectures/experts.md#random-logits-for-benchmarks)), the
 balance loss is 1.00 and no pick drops (`dropped` 0.0 every step), with or without
 `moe_stream`:
 
