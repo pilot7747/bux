@@ -235,7 +235,8 @@ class Mamba(nnx.Module):
         u = jax.nn.silu(self.conv(u, taps))
         r, n = self.rank, self.state_size
         dt, B, C = jnp.split(self.x_proj(u), [r, r + n], axis=-1)
-        dt = jax.nn.softplus(self.dt_norm(dt) @ self.dt_proj[...] + self.dt_bias[...])
+        dt = (self.dt_norm(dt) @ self.dt_proj[...]).astype(jnp.float32)
+        dt = jax.nn.softplus(dt + self.dt_bias[...])
         B, C = self.b_norm(B)[:, :, None], self.c_norm(C)[:, :, None]
         A = -jnp.exp(self.A_log[...].astype(jnp.float32))
         y = selective_scan(u[..., None], dt, A, B, C, segments(taps))[..., 0]
@@ -319,7 +320,8 @@ class Mamba2(nnx.Module):
         u, B, C = jnp.split(ubc, [d_inner, d_inner + g * n], axis=-1)
         u = parallel.shard(u.reshape(b, t, self.heads, self.head_dim), *_HEADS, None)
         B, C = B.reshape(b, t, g, n), C.reshape(b, t, g, n)
-        dt = parallel.shard(jax.nn.softplus(dt + self.dt_bias[...]), *_HEADS)
+        dt = jax.nn.softplus(dt.astype(jnp.float32) + self.dt_bias[...])
+        dt = parallel.shard(dt, *_HEADS)
         A = -jnp.exp(self.A_log[...].astype(jnp.float32))[:, None]
         y = selective_scan(u, dt, A, B, C, segments(taps)) + u * self.D[...][:, None]
         y = y.reshape(b, t, d_inner) * jax.nn.silu(z)

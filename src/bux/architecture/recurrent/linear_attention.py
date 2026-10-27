@@ -781,8 +781,8 @@ class GatedDeltaNet(DeltaNet):
         self.dt_bias = nnx.Param(_dt_bias(rngs, hv), names=("heads",))
 
     def _log_decay(self, x: Float[Array, "b t d"]) -> Float[Array, "b t h 1"]:
-        rate = jax.nn.softplus(self.a(x) + self.dt_bias[...])
-        return (-jnp.exp(self.A_log[...]) * rate)[..., None]
+        rate = jax.nn.softplus(self.a(x).astype(jnp.float32) + self.dt_bias[...])
+        return (-jnp.exp(self.A_log[...].astype(jnp.float32)) * rate)[..., None]
 
     def _floor(self) -> float | None:
         return None  # -exp(A_log) softplus(...) is unbounded
@@ -812,7 +812,8 @@ class KimiDeltaAttention(DeltaNet):
 
     def _log_decay(self, x: Float[Array, "b t d"]) -> Float[Array, "b t h dk"]:
         b, t, _ = x.shape
-        f = (self.f(x) + self.dt_bias[...]).reshape(b, t, self.v_heads, self.head_dim)
+        f = self.f(x).astype(jnp.float32) + self.dt_bias[...]
+        f = f.reshape(b, t, self.v_heads, self.head_dim)
         return _channel_decay(f, self.A_log[...], self.lower_bound)
 
     def _floor(self) -> float | None:
@@ -835,10 +836,10 @@ def _channel_rates(
 def _channel_decay(
     f: Float[Array, "b t h dk"], A_log: Float[Array, " h"], lower_bound: float | None
 ) -> Float[Array, "b t h dk"]:
-    """Return KDA's log decay per key channel of ``f`` (its projection plus dt_bias):
-    ``-exp(A_log) softplus(f)``, or with a lower bound
-    ``lower_bound * sigmoid(exp(A_log) f)``."""
-    rate = jnp.exp(A_log)[:, None]
+    """Return KDA's log decay per key channel of ``f`` (its projection plus dt_bias,
+    in float32): ``-exp(A_log) softplus(f)``, or with a lower bound
+    ``lower_bound * sigmoid(exp(A_log) f)``, in float32."""
+    rate = jnp.exp(A_log.astype(jnp.float32))[:, None]
     if lower_bound is not None:
         return lower_bound * jax.nn.sigmoid(rate * f)
     return -rate * jax.nn.softplus(f)
@@ -902,7 +903,7 @@ class GatedDeltaNet2(LinearAttention):
         gate."""
         b, t, _ = x.shape
         h, dk = self.heads, self.head_dim
-        f = (self.f(x) + self.dt_bias[...]).reshape(b, t, h, dk)
+        f = (self.f(x).astype(jnp.float32) + self.dt_bias[...]).reshape(b, t, h, dk)
         g = _channel_decay(f, self.A_log[...], self.lower_bound)
         erase = self.erase_scale * jax.nn.sigmoid(self.erase(x).reshape(b, t, h, dk))
         write = jax.nn.sigmoid(self.write(x)).reshape(b, t, self.v_heads, -1)
@@ -939,7 +940,7 @@ class GatedLinearAttention(LinearAttention):
         b, t, _ = x.shape
         q, k, v = self._qkv(x, taps)
         f = self.f(x).reshape(b, t, self.v_heads, self.head_dim)
-        g = shard_heads(jax.nn.log_sigmoid(f) / 16)
+        g = shard_heads(jax.nn.log_sigmoid(f.astype(jnp.float32)) / 16)
         o = decayed(q * self.head_dim**-0.5, k, v, g, segments(taps))
         return self._output(x, o)
 

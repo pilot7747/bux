@@ -416,7 +416,9 @@ state across chunks. Every chunk's maps come from matmuls over all chunks at onc
 (`affine_scan`), by `lax.scan` elsewhere; for one decay a head, by a matmul. No
 exponent in it is positive, whatever the gate, but for RWKV-7, whose decay is
 bounded: it takes a chunk's pairs through its middle position, by one matmul each,
-in a third of the time. Recurrent states are float32, whatever the run computes in.
+in a third of the time. Recurrent states are float32, whatever the run computes in,
+and so are the log decays and time steps that make their decays, from the
+projections' outputs on.
 
 On a GPU, kernels run the delta rule, GLA and Lightning with q, k and v of 16 bits
 and heads of 64 or 128, under `methods.recurrence = scan`:

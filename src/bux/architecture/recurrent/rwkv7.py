@@ -185,7 +185,7 @@ class RWKV7(nnx.Module):
             mix = jax.nn.sigmoid(self.v_mix(xv)).reshape(v.shape)
             v = v + (read(taps, self.ports, "v") - v) * mix
         write(taps, self.ports, "v", v)
-        log_w = FLOOR * jax.nn.sigmoid(self.w(xw))
+        log_w = FLOOR * jax.nn.sigmoid(self.w(xw).astype(jnp.float32))
         a = jax.nn.sigmoid(self.a(xa))
         kk = k * self.k_k
         k = k * (1 + (a - 1) * self.k_a)

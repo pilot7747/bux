@@ -52,6 +52,7 @@ Some parts compute from what they are given in float32, and give back its dtype:
 | `Norm.normalize`, `l2norm` | the statistics, and the normalized values |
 | the MoE's router | its logits, scores and top-k, the balance loss and the bias; the weights go back to the stream's dtype |
 | `recurrence`, `delta_rule`, `selective_scan` | the recurrent state, and its decays |
+| the recurrent mixers' gates | their log decays and time steps, from the projection's output on, as fla's and Mamba's |
 | `rope.rotate` | the rotation |
 | the head | its matmul's accumulation, tied or not, and its log Z and loss; by chunks, the default `methods.loss`, its logits |
 

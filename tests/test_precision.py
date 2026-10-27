@@ -21,6 +21,7 @@ from bux.architecture.experts import grouped_blockscaled
 from bux.architecture.experts.moe import MoE
 from bux.architecture.layers.norm import Norm
 from bux.architecture.precision import blockscaled, matmuls, nvfp4
+from bux.architecture.recurrent import linear_attention, rwkv7, ssm
 from bux.architecture.recurrent.linear_attention import delta_rule, l2norm, recurrence
 from bux.architecture.recurrent.ssm import selective_scan
 from bux.architecture.registry import Taps
@@ -178,6 +179,37 @@ def _islands() -> dict:
         "delta_rule": (lambda *a: delta_rule(*a, None), (x, x, x, decay, beta)),
         "selective_scan": (selective_scan, (x, dt, A, x[:, :, :1], x[:, :, :1])),
     }
+
+
+# What each recurrence takes its log decays or time steps as: the function's module and
+# name, and the argument's position.
+GATED = (
+    (linear_attention, "delta_rule", 3),
+    (linear_attention, "gated_delta_2", 3),
+    (linear_attention, "decayed", 3),
+    (rwkv7, "recurrence", 3),
+    (ssm, "selective_scan", 1),
+)
+GATES = ["gdn", "kda", "gla", "rwkv7", "mamba", "mamba2", "gdn2"]
+
+
+@pytest.mark.parametrize("family", GATES)
+def test_a_bfloat16_forward_makes_the_recurrences_gates_in_float32(family, monkeypatch):
+    """From the projections' bfloat16 outputs on, as fla's and Mamba's do: in
+    bfloat16, a + dt_bias rounds the decays a token by up to 4%."""
+    seen: list = []
+    for module, name, at in GATED:
+        f = getattr(module, name)
+
+        def spied(*args, f=f, at=at, **kwargs):
+            seen.append(args[at].dtype)
+            return f(*args, **kwargs)
+
+        monkeypatch.setattr(module, name, spied)
+    gdn2 = _with("gdn2(num_heads=2, head_dim=8, gate_rank=4)")
+    model = cast(_trainer((FAMILIES | {"gdn2": gdn2})[family]).model, jnp.bfloat16)
+    forward(model, _batch())
+    assert seen and all(dtype == jnp.float32 for dtype in seen)
 
 
 @pytest.mark.parametrize("island", ISLANDS)
