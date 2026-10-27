@@ -42,7 +42,7 @@ def _listed(v: object) -> object:
 # A source is an endless stream of rows of `seq_len` tokens: `input_ids`,
 # `position_ids` (where each token is in its document, so one starts wherever they
 # stop increasing) and `loss_mask` (whether each token is a target), in a new order
-# every epoch. Documents, `text` and `chat`, become rows once, when bux.data tokenizes
+# every epoch. Documents (`text` and `chat`) become rows once, when bux.data tokenizes
 # and packs them; `tokens` and `synthetic` are rows already.
 
 
@@ -193,7 +193,7 @@ class ConcatPacking(Config):
 
 class GreedyPacking(Config):
     """Whole documents in their shuffled order, a row padded and closed when the next
-    one does not fit (classic SFT). `max_docs=1` is one document a row."""
+    one does not fit (classic SFT). `max_docs=1` puts one document in each row."""
 
     type: Literal["greedy"] = "greedy"
     doc_mask: bool = True  # positions start at every document, attention within it
@@ -564,8 +564,8 @@ class EvalConfig(Config):
     data: DataConfig  # a source or a mixture, as `data` takes
     every: Positive = 1000  # steps between evaluations
     batches: Positive = 10  # batches an evaluation reads, the same ones each time
-    seq_len: Positive | None = None  # tokens a row; none: the run's seq_len
-    batch: Positive | None = None  # rows a batch; none: the run's batch
+    seq_len: Positive | None = None  # tokens per row; none: the run's seq_len
+    batch: Positive | None = None  # rows per batch; none: the run's batch
 
 
 def _each(evals: EvalConfig | tuple[EvalConfig, ...] | None) -> tuple[EvalConfig, ...]:
@@ -865,8 +865,8 @@ class MethodsConfig(Config):
     a field."""
 
     type: Literal["methods"] = "methods"
-    # Attention: auto (the fastest kernel that takes the call), xla, cudnn, tokamax;
-    # with `seq` over `context`, also ring and ulysses.
+    # Attention: auto (the fastest kernel that takes the call), xla, cudnn, tokamax,
+    # fa4; with `seq` over `context`, also ring and ulysses.
     attention: str = "auto"
     # The MoE's experts: sorted or dense on each device's tokens; over the `expert`
     # axis, all_gather, all_to_all, ragged_all_to_all, ragged_tokens or nccl_ep.
@@ -895,8 +895,9 @@ class MethodsConfig(Config):
     # A policy by name, or as data: remat(save=[attention], first=8). auto: the first
     # of none, dots_attention, dots, save_attention and full whose step fits.
     remat: Annotated[str | RematConfig, BeforeValidator(_named_none)] = "auto"
-    # 1f1b, zbh1, gpipe or circular: 1f1b runs where gpipe does, but in rounds and
-    # where a layer outside the pipelined repeat learns from the whole batch.
+    # 1f1b, zbh1, gpipe or circular. 1f1b runs wherever gpipe does, except with rounds
+    # (circular) or a layer outside the pipelined repeat that learns from the whole
+    # batch (gpipe).
     pipeline: str = "1f1b"
     rounds: Positive = 1  # times a circular pipeline sends a microbatch round
     # The passes of the pipelined repeat each stage runs, first to last. None: under
@@ -917,10 +918,10 @@ class MethodsConfig(Config):
     # The microbatches a step takes its batch in, adding up their gradients; under a
     # pipeline, those it sends through its stages.
     microbatches: Positive = 1
-    # Each microbatch's forward beside the backward of the one before, a layer at a
-    # time, so that one's collectives run beside the other's compute. Off: it holds
-    # half a microbatch more and copies it across the loop, which pays only beside an
-    # exchange left exposed, as NCCL EP's with moe_stream
+    # Each microbatch's forward beside the backward of the one before, a piece of the
+    # model at a time, so that one's collectives run beside the other's compute. Off
+    # by default: it holds half a microbatch more and copies it across the loop, which
+    # pays only beside an exchange left exposed, such as NCCL EP's with moe_stream
     # (docs/parallelism/microbatches.md).
     interleave: bool = False
     # Where a step runs its layers more than once (microbatches, a pipeline's ticks),
@@ -1116,7 +1117,8 @@ class TPESearch(Config):
     `startup` quasi-random trials, the trials are split into the best ``gamma`` of
     them and the rest, a density is fit to each, and of `candidates` points drawn
     from the best's, the one most likely under it and least under the rest's is
-    tried. Trials still training count among the rest, so that trials at once differ.
+    tried. Trials still training count among the rest, so that concurrent trials
+    differ.
     It handles choices and many dimensions well, and costs nothing to fit."""
 
     type: Literal["tpe"] = "tpe"
@@ -1134,7 +1136,7 @@ class GPSearch(Config):
     a length scale for each dimension, is fit to the trials' objectives, and the point
     of most expected improvement over the best (log EI, Ament et al., 2023) is tried.
     Trials still training count as done at the GP's prediction for them (the kriging
-    believer), so that trials at once differ. The most of each trial in few
+    believer), so that concurrent trials differ. The most of each trial in few
     dimensions, for runs that take long."""
 
     type: Literal["gp"] = "gp"
@@ -1214,10 +1216,10 @@ class ObjectiveConfig(Config):
     """What a search minimizes, and what ranks the runs of a sweep: a weighted sum of
     metrics a run logs, each at its latest value, written as one:
     ``objective = 0.7 * web_bpb + 0.3 * code_bpb``, ``(web_bpb + code_bpb) / 2``, or
-    ``-tokens_per_s`` for the most tokens a second. Its names are the metrics, not
-    definitions, but for a definition of a number: ``w = 0.7`` makes ``w * web_bpb +
-    (1 - w) * code_bpb`` the same. A metric with a slash is a string,
-    ``"time/step_ms"``."""
+    ``-tokens_per_s`` for the most tokens per second. Its names are metrics, not
+    definitions, except for definitions of numbers: with ``w = 0.7``,
+    ``w * web_bpb + (1 - w) * code_bpb`` is the same objective. A metric with a slash
+    is a string, ``"time/step_ms"``."""
 
     type: Literal["objective"] = "objective"
     terms: Annotated[tuple[Term, ...], Field(min_length=1)]  # the metrics, weighted

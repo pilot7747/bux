@@ -1,9 +1,10 @@
 # Model zoo
 
-The model zoo is `examples/architectures/`: 62 `.bux` files, each a model you can
-`use` by name, shrink, sweep or train. This page says what the files are, how to use
-one, and how to add your own, then lists every model with its description, its
-layer counts and its source.
+The model zoo is `examples/architectures/`: 62 `.bux` files, each a published model
+you can `use` by name, then shrink, sweep or train. Start here to reproduce a model or
+to ablate one of its parts. This page says what the files are, how to use one and how
+to add your own, then lists every model with its description, its layer counts and
+its source.
 
 ```bux
 use qwen3_30b_a3b                 # the whole of Qwen3-30B-A3B's architecture
@@ -16,19 +17,20 @@ model   = embed block^12 norm head
 
 Each file transcribes a public model's configuration:
 
-- The files at the top of the folder are classics and primitives: GPT-2, GPT-J,
-  Llama 3, Gemma 3, DeepSeek-V3, Jamba, Qwen3-Next, and wiring studies such as
-  ResFormer, nGPT, mHC and modded-nanogpt. They transcribe public configs from
-  memory. Ones marked "-style" or "approximate" simplify details, so verify the
-  numbers before relying on them.
-- The folders, one per model family (`arcee/`, `cohere/`, `deepseek/`, `glm/`,
+- **Classics and primitives**, at the top of the folder: GPT-2, GPT-J, Llama 3,
+  Gemma 3, DeepSeek-V3, Jamba, Qwen3-Next, and wiring studies such as ResFormer,
+  nGPT, mHC and modded-nanogpt. They follow the papers and public configs but,
+  unlike the family folders, were not transcribed from a released `config.json`.
+  Files marked "-style" or "approximate" simplify details. Verify the numbers before
+  you rely on them.
+- **Model families**, one folder each (`arcee/`, `cohere/`, `deepseek/`, `glm/`,
   `inkling/`, `kimi/`, `laguna/`, `mellum/`, `mimo/`, `minimax/`, `muse/`,
-  `nemotron/`, `olmo/`, `qwen/`, `reflection/`, `smollm/`), transcribe releases from
+  `nemotron/`, `olmo/`, `qwen/`, `reflection/`, `smollm/`): releases transcribed from
   their published `config.json` and modeling code.
 
-A file's header comment says what the model is and what makes it different, and
-names what it leaves out (vision and audio encoders, speculative drafters) or
-approximates. Read it before you compare against the original.
+Each file's header comment says what the model is and what makes it different. It
+also names what the file leaves out (vision and audio encoders, speculative drafters)
+or approximates, so read it before you compare against the original.
 
 :::{note}
 A file describes an architecture, not a checkpoint: a run of it starts from fresh
@@ -40,18 +42,18 @@ parameters.
 ### By name
 
 `use name` brings in every definition of `name.bux`. A module is found by its name,
-never by a path: in the folder of the file that uses it, then under the folders that
-`[tool.bux] path` lists in the nearest `pyproject.toml` (bux's lists `examples`),
-then under those in `BUX_PATH` ([Modules](../language/modules.md)). A name that is not
-an identifier is a string:
+never by a path: first in the folder of the file that uses it, then under the
+folders that `[tool.bux] path` lists in the nearest `pyproject.toml` (bux's lists
+`examples`), then under those in `BUX_PATH` ([Modules](../language/modules.md)). A
+name that is not an identifier is written as a string:
 
 ```bux
 use "qwen3.8_27b"
 ```
 
 Definitions after the `use` replace the module's everywhere, including inside its
-own definitions. So changing `attn` changes the attention of the module's `block`,
-and an amendment changes one setting:
+own definitions. So redefining `attn` changes the attention inside the module's
+`block`, and an amendment changes one setting:
 
 ```bux
 use llama3_8b
@@ -63,7 +65,7 @@ attn.num_kv_heads = 1             # MQA in every block
 
 To train a zoo model on a laptop, shrink its width and depth and keep its wiring.
 This file keeps Qwen3-30B-A3B's block, a GQA with QK-norm and an MoE, at 1.05M
-parameters:
+parameters (`tiny_qwen.bux`):
 
 ```bux
 use qwen3_30b_a3b
@@ -98,8 +100,8 @@ tiny_qwen step 10/50  loss 6.2922  lr 3.00e-03  grad 0.785  ...
 tiny_qwen step 50/50  loss 6.2911  lr 3.00e-03  grad 0.545  ...
 ```
 
-Outside bux's own folder, point `BUX_PATH` at bux's `examples` folder for `use` to
-find the zoo. On random tokens (`synthetic`) the loss stays near $\ln 512 = 6.24$:
+Outside bux's own folder, point `BUX_PATH` at bux's `examples` folder so that `use`
+finds the zoo. On random tokens (`synthetic`) the loss stays near $\ln 512 = 6.24$;
 use real data to see a model learn ([Data](../data/index.md)).
 
 :::{tip}
@@ -109,12 +111,12 @@ transcription's shape. `bux render file.bux` draws its blocks.
 
 ## Adding a model
 
-1. **Write the file** under `examples/architectures/`, in the folder of its family
-   (a new folder makes a new section on this page). Its name must be unique: modules
-   are found by name.
+1. **Write the file** under `examples/architectures/`, in its family's folder (a new
+   folder makes a new section on this page). Its name must be unique, because
+   modules are found by name.
 2. **Start it with a header comment**: the model's name, its maker and year, what
    makes it different, and what the file leaves out or approximates. Mark a
-   simplification "-style" or say "Simplified:". This page shows the header as the
+   simplification "-style", or say "Simplified:". This page shows the header as the
    model's description:
 
    ```bux
@@ -125,15 +127,15 @@ transcription's shape. `bux render file.bux` draws its blocks.
    # gives each call LoRA adapters on q, k, v and the MLP; here it reads the stream alone.
    ```
 
-3. **Check it**: `bux check` counts its layers, which you can compare with the
+3. **Check it**: `bux check` counts its layers, to compare with the
    `config.json`'s, and `bux render` draws it.
-4. **Test it** (`tests/test_examples.py`). Every file builds and runs abstractly at
-   its full size, with no parameter allocated, by
-   `test_examples_build_and_run_at_full_size`, with nothing to add. To also run it for
-   real, add an entry to `SHRUNK`: the statements that shrink its layers to a few
-   dims, after `SMALL` sets `d_model = 32`, `vocab_size = 64` and a small `dense`
-   MLP. `test_examples_shrunk_run_and_are_causal` then runs it on CPU and checks that
-   its outputs are finite and causal:
+4. **Test it** (`tests/test_examples.py`). With nothing to add,
+   `test_examples_build_and_run_at_full_size` builds and runs every file abstractly
+   at its full size, with no parameter allocated. To also run it for real, add an
+   entry to `SHRUNK`: the statements that shrink its layers to a few dims, after
+   `SMALL` sets `d_model = 32`, `vocab_size = 64` and a small `dense` MLP.
+   `test_examples_shrunk_run_and_are_causal` then runs it on CPU and checks that its
+   outputs are finite and causal:
 
    ```python
    SHRUNK = {

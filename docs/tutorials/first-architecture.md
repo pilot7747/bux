@@ -1,9 +1,9 @@
 # Your first architecture
 
-In this tutorial you write a small GPT-2 from scratch in the `.bux` language, then
-evolve it step by step: a Llama-style block with RoPE, grouped-query attention and
-SwiGLU, SwiGLU written by hand, and a hybrid of Gated DeltaNet and attention. Along
-the way you use `bux check`, `bux render` and `bux fmt`, and learn to read the errors.
+Write a small GPT-2 in the `.bux` language, then evolve it one change at a time into
+a Llama-style model and a hybrid of Gated DeltaNet and attention. By the end you will
+have three models in `mine/`, and you will know how to check, draw and format a file,
+and how to read its errors.
 
 Nothing here trains, so nothing imports JAX: every command answers in about a second.
 The next tutorial, [Train on a laptop](train-on-a-laptop.md), trains what you build.
@@ -21,10 +21,10 @@ model = embed [attn] head
 ```
 
 Every file sets `d_model`, the width of the residual stream, and defines `model`.
-`attn = gqa(...)` defines a layer: grouped-query attention, with as many key and
-value heads as query heads, which is plain multi-head attention. `model` reads left to
+`attn = gqa(...)` defines a layer: grouped-query attention with as many key and value
+heads as query heads, which is plain multi-head attention. `model` reads left to
 right: embed the tokens, then `[attn]`, then the head that turns the stream into
-logits. The brackets are the residual connection: `[f]` means `x + f(x)`.
+logits. The brackets make a residual branch: `[f]` means `x + f(x)`.
 
 Check it, and draw it:
 
@@ -39,7 +39,7 @@ model
 ```
 
 `bux check` compiles the file and counts its layers by type. `bux render` draws the
-stream as a line: `[attn]` leaves it, runs `attn`, and adds back at `⊕`.
+stream as a line: `[attn]` branches off it, runs `attn`, and adds back in at `⊕`.
 
 ## 2. A GPT-2 block
 
@@ -62,13 +62,13 @@ model = embed(max_positions=1024) block^4 norm head(tied=true)
 What is new:
 
 - `norm`, `attn` and `ffn` are definitions. Each use of a definition is a fresh
-  layer with parameters of its own, so the two `norm`s in `block` are two LayerNorms.
+  layer with its own parameters, so the two `norm`s in `block` are two LayerNorms.
 - Settings are arithmetic over definitions: `4 * d_model` is 1024.
 - `block = [norm attn] [norm ffn]` is two residual branches in a row: a pre-norm
   Transformer block.
 - `block^4` is four fresh copies of `block` in a row.
-- `embed(max_positions=1024)` adds learned positions, as GPT-2 does; with none, the
-  model has no positions but what its attention's `rope` gives.
+- `embed(max_positions=1024)` adds learned positions, as GPT-2 does. Without it, the
+  only positions are the ones the attention's `rope` gives.
 - `head(tied=true)` reuses the embedding matrix as the output projection.
 
 ```console
@@ -85,7 +85,7 @@ block
 ```
 
 `bux render` draws each block once and refers to it by name. `--expand` draws it
-inline, inside a box for the repeat:
+inline instead, with a box around the repeat:
 
 ```console
 $ bux render mine/gpt.bux --expand
@@ -108,9 +108,10 @@ blocks, `d_model = 768`, and the queries, keys and values in one projection
 
 ## 3. Move the norms
 
-Where the norm goes is the wiring, and the wiring is the expression. The original
-Transformer normalizes after each residual add (post-norm). Try it from the command
-line, without editing the file: statements after the file redefine the file's own.
+Where the norm goes is part of the wiring, and the wiring is the expression. The
+original Transformer normalizes after each residual add (post-norm). Try it from the
+command line, without editing the file: statements after the file redefine the
+file's own.
 
 ```console
 $ bux render mine/gpt.bux 'block = [attn] norm [ffn] norm'
@@ -156,8 +157,8 @@ model = embed block^4 norm head(tied=true)
   change their base. There is no `max_positions` on `embed` now.
 - `num_kv_heads=2` shares each key and value head between two query heads.
 - `gated_mlp(..., activation=swish)` is SwiGLU. Its hidden width, 704, is about
-  8/3 of `d_model`, rounded up to a multiple of 64, so that its three projections have
-  about as many parameters as the two of a 4x MLP.
+  8/3 of `d_model`, rounded up to a multiple of 64. That gives its three projections
+  about as many parameters as the two projections of a 4x MLP.
 
 ```console
 $ bux check mine/llama.bux
@@ -167,10 +168,10 @@ rmsnorm×9  gqa×4  gated_mlp×4  embed×1  head×1
 
 ## 5. SwiGLU by hand
 
-`gated_mlp` is a layer, but you can also write it from smaller ones. SwiGLU is
+`gated_mlp` is a layer, but you can also build it from smaller ones. SwiGLU is
 `W2 (swish(W1 x) * W3 x)`: two projections side by side, one through a SiLU,
 multiplied, then projected back. In the language, `*` multiplies two parallel
-branches and composition binds tighter than `*`, so it reads as written. In
+branches, and composition binds tighter than `*`, so the formula reads as written. In
 `mine/llama.bux`, replace `ffn`:
 
 ```bux
@@ -194,18 +195,20 @@ ffn
   └─linear────────┘
 ```
 
-A `linear` maps to `features` wide, and the compiler follows every width: the two
-branches of `*` must agree, and a residual branch must come back to `d_model`, which
-the last `linear` does. Put `ffn = gated_mlp(...)` back before you go on.
+A `linear` maps the stream to `features` channels, and the compiler tracks every
+width. The two branches of `*` must agree, and a residual branch must come back to
+`d_model`; the last `linear` takes care of that. Put `ffn = gated_mlp(...)` back
+before you go on.
 
 ## 6. A hybrid pattern
 
 Recent models mix attention with linear-attention layers, which carry a state along
 the sequence instead of attending to every token. Qwen3-Next, for example, has three
-Gated DeltaNet layers to one attention layer. Create `mine/hybrid.bux`:
+Gated DeltaNet layers for every attention layer. This model has two. Create
+`mine/hybrid.bux`:
 
 ```bux
-# Two Gated DeltaNet layers to one attention layer, as Qwen3-Next mixes them.
+# A hybrid: two Gated DeltaNet layers to one attention layer.
 d_model    = 256
 vocab_size = 50257
 
@@ -245,8 +248,8 @@ A
 ```
 
 `bux fmt` prints the canonical source of what compiled, not your file: macros and
-numeric definitions inlined, patterns spelled out, comments dropped. It is a quick way
-to see what a macro or a pattern expanded to:
+numeric definitions inlined, patterns spelled out, comments dropped. Use it to see
+what a macro or a pattern expands to:
 
 ```console
 $ bux fmt mine/hybrid.bux
@@ -264,14 +267,15 @@ A = [norm attn] [norm ffn]
 model = embed (D D A)^2 norm head(tied=true)
 ```
 
-Patterns repeat and nest like anything else: `"mMmM aMmM"^4` is Jamba's 32 layers,
-spaces ignored. [Definitions](../language/definitions.md) covers macros, patterns and
-`shared` blocks, whose every use has the same parameters.
+Patterns repeat and nest like anything else: `"mMmM aMmM"^4` is Jamba's 32 layers
+(spaces are ignored). [Definitions](../language/definitions.md) covers macros,
+patterns and `shared` blocks, which reuse one set of parameters everywhere they
+appear.
 
 ## 7. Read the errors
 
-bux checks everything before anything runs and reports every error it finds, each at
-the line that made it. Create `mine/broken.bux` with three mistakes:
+bux checks everything before anything runs, and reports every error it finds at the
+line that caused it. Create `mine/broken.bux` with three mistakes:
 
 ```bux
 d_model    = 256
@@ -304,9 +308,9 @@ error: unknown name 'dmodel'
 ```
 
 Each error names the file, line and column, underlines the span, and suggests the
-nearest name it knows. The settings come from the layers' schemas, so a misspelled
+nearest name it knows. Settings come from each layer's schema, so a misspelled
 setting is caught for every layer. Fix the two (`num_kv_heads`, `d_model`) and check
-again; the third error was hidden behind the definitions that failed:
+again. The third error was hidden behind the two definitions that failed:
 
 ```console
 $ bux check mine/broken.bux
@@ -349,9 +353,10 @@ settings and documents them on hover ([Tooling](../language/tooling.md)).
 | `mine/llama.bux`  | the same size, Llama-style: RMSNorm, RoPE, GQA, SwiGLU  |
 | `mine/hybrid.bux` | two Gated DeltaNet layers to one attention, by a macro and a pattern |
 
-Next, [train one on a laptop](train-on-a-laptop.md). To go further with the
-language:
+## Next steps
 
+- [Train on a laptop](train-on-a-laptop.md): turn the Llama-style model into a run
+  and train it.
 - [Skip connections](../language/skip-connections.md): taps for long-range skips,
   U-nets and value residuals.
 - [Several outputs](../language/outputs.md): multi-token prediction heads.

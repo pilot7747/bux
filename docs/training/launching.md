@@ -1,45 +1,48 @@
 # Launching
 
-`bux launch` trains a file's runs to their end, however often it is stopped and
-started again. It is the command for a cluster, and the Docker image's entrypoint.
-This page covers how it gives runs GPUs, what it records, how it stops, array jobs,
-many hosts, and resuming. `bux train` ([Running](running.md)) trains in its own
-process, which suits a laptop and a debugger.
+`bux launch` trains a file's runs to their end, however often you stop it and start
+it again. It is the command for a cluster, and the Docker image's entrypoint. This
+page covers how it gives runs GPUs, what it records, how it stops, array jobs, many
+hosts, and resuming. For a laptop or a debugger, `bux train` ([Running](running.md))
+trains in its own process.
 
 ```sh
-bux launch examples/experiments/attention_ablation.bux             # all 6 runs, a GPU each
+bux launch examples/experiments/attention_ablation.bux             # all 6 runs, one GPU each
 bux launch examples/experiments/attention_ablation.bux --index 3   # the fourth, in an array job
 ```
 
-`bux launch` takes what `bux train` takes ([`bux train`](running.md#bux-train)), and
-`--workers N`, the processes that prepare data (one a core by default).
+`bux launch` takes the same arguments as [`bux train`](running.md#bux-train), plus
+`--workers N`, the number of processes that prepare data (one per core by default).
 
 | | `bux train` | `bux launch` |
 |---|---|---|
-| Runs of a sweep | one after another, in this process | side by side, a worker process each, on GPUs of its own |
+| Runs of a sweep | one after another, in this process | side by side, one worker process per run, each on its own GPUs |
 | A run that is done | trained again | skipped |
 | Its status | none | `status.json` in its directory |
 | SIGTERM, Ctrl-C | stop at once, losing the step | stop after the step, saving it with a `checkpoint` setting |
 | A failed run | stops the command | leaves the others training |
-| Many hosts | no | a run alone, under `srun`, `mpirun` or `JAX_*` |
+| Many hosts | no | one run, under `srun`, `mpirun` or `JAX_*` variables |
 
 ## What it does
 
 1. It skips the runs whose `status.json` says `done`.
 2. It checks that each run's mesh fits the GPUs it has, and that the tool its
-   `profile` names is installed, and records one that fails either as failed, at once.
+   `profile` names is installed. A run that fails either is recorded as failed, at
+   once.
 3. It prepares the datasets the runs read, once each ([Data](../data/index.md)).
-4. A run alone then trains in the launcher's process, on the first GPUs it needs.
-   A sweep trains in workers, a process a run. A run whose `profile` names nsys or
-   ncu trains under it: a run alone's process starts again under the tool first,
-   and a worker starts under it ([Profiling](../performance/profiling.md#nsight-systems-and-nsight-compute)).
+4. A run alone trains in the launcher's own process, on the first GPUs it needs. A
+   sweep trains in workers, one process per run. A run whose `profile` names nsys or
+   ncu trains under that tool: the launcher restarts itself under the tool first for
+   a run alone, and starts a sweep's worker under it
+   ([Profiling](../performance/profiling.md#nsight-systems-and-nsight-compute)).
 5. A sweep ends with a table of its runs.
 
 ## GPUs and workers
 
-A run needs the GPUs of its `mesh`: the product of its axes' sizes, where `data` unset
-is every visible GPU for a run alone, and one in a sweep. `bux plan` lists them. A run
-that needs more than there are fails before training. On a node of 8 GPUs:
+A run needs the GPUs of its `mesh`: the product of its axes' sizes, where an unset
+`data` means every visible GPU for a run alone, and one GPU in a sweep. `bux plan`
+lists them. A run that needs more GPUs than there are fails before training. On a
+node of 8 GPUs:
 
 ```console
 $ bux launch examples/experiments/smoke.bux 'mesh = mesh(fsdp=16)'
@@ -47,23 +50,24 @@ smoke: failed before training: mesh: needs 16 GPUs, but there are 8
 ```
 
 The visible GPUs are those `CUDA_VISIBLE_DEVICES` lists, or else every GPU that
-`nvidia-smi -L` finds. A sweep trains in workers, a process a run, each on a group of
-free GPUs that `CUDA_VISIBLE_DEVICES` gives it; the first pending run that fits starts
-first, and a group frees when its run ends. Without GPUs, as on a laptop, the runs
-train one at a time on the default device.
+`nvidia-smi -L` finds. A sweep trains in workers, one process per run, each on a group
+of free GPUs that it gets in `CUDA_VISIBLE_DEVICES`. The first pending run that fits
+starts first, and a group frees up when its run ends. Without GPUs, as on a laptop,
+the runs train one at a time on the default device.
 
 A worker's output goes to the console and to its run's `train.log`. A run that fails
-or runs out of memory leaves the others training, and the launcher names its log:
+or runs out of memory leaves the others training, and the launcher points at its log:
 `<run>: failed (exit 1); its output is in <its directory>/train.log`.
 
 A worker trains its run from the `run.json` the launcher wrote: the run as the
-launcher compiled it, whatever the files say by now.
+launcher compiled it at the start. Editing the file while a sweep trains changes none
+of its runs.
 
 ## Status and the summary
 
-A run's directory keeps a `status.json`: whether the run is `running`, `done`,
-`failed` or `stopped`, on what host and GPUs, since when, at what step, and its latest
-metrics:
+Each run's directory keeps a `status.json`: whether the run is `running`, `done`,
+`failed` or `stopped`, on which host and GPUs, since when, at what step, and its
+latest metrics (all except the per-layer ones, which stay in `metrics.jsonl`):
 
 ```json
 {
@@ -93,7 +97,7 @@ metrics:
 
 A run that is done is not trained again, and one that is not resumes from its latest
 checkpoint. So launching an experiment again, after a preemption, a crash or a fix,
-trains what is left of it. A sweep ends with a table of its runs, here a sweep of the
+trains what is left of it. A sweep ends with a table of its runs; here, a sweep of the
 smoke run on a laptop:
 
 ```console
@@ -124,20 +128,24 @@ done     3814/3814  3.0836  3.1302     width_sweep[m]
 stopped  2731/3814  3.0412  3.0815     width_sweep[l]
 ```
 
+`bux results FILE` prints the table again at any time, without training. A sweep that
+sets an `objective` gets a column for it ([The objective](searching.md#the-objective)).
+
 ## Signals
 
-SIGTERM or Ctrl-C (SIGINT) stops training after the step it is at, and saves that step
-if the run has a `checkpoint` setting. A second signal, a second or more later, stops
-it at once. (One sooner is the same signal delivered twice, to the launcher and to a
-parent such as `uv run` or `srun` that passes it on.) A sweep's launcher passes
-signals on to its workers.
+SIGTERM or Ctrl-C (SIGINT) stops training after the current step, and saves that step
+if the run has a `checkpoint` setting. A second signal, a second or more after the
+first, stops it at once. One that comes sooner is taken as the first delivered twice,
+to the launcher and to a parent that passes it on (such as `uv run` or `srun`), and is
+ignored. A signal before training starts stops at once. A sweep's launcher passes
+signals on to its workers, and starts no new run after one.
 
 The launcher exits with:
 
 | Code | When |
 |------|------|
 | `0` | every run is done |
-| `1` | a run failed |
+| `1` | a run failed, before or during training; many processes were given a sweep; or none of a search's trials has an objective that is a number |
 | `128 +` the signal's number | a signal stopped it: 143 for SIGTERM, 130 for SIGINT |
 
 A run stopped without a `checkpoint` setting starts over when launched again, and the
@@ -149,31 +157,30 @@ launcher says so.
 persistent cache, in `$XDG_CACHE_HOME/bux/jax` (`~/.cache/bux/jax`), and on GPUs the
 picks of XLA's GEMM autotuner with it. A run launched again, or the next run of a
 sweep with the same program, loads its step instead of compiling it: 0.5 s instead of
-29 for an MoE on 8 B300s. One that differs in a flag still finds the autotuner's
+29 s for an MoE on 8 B300s. A run that differs in a flag still finds the autotuner's
 picks (17 s).
 
-- `JAX_COMPILATION_CACHE_DIR` says where the cache goes instead, and set empty turns
-  it off.
-- bux puts its own XLA flags before `XLA_FLAGS`, and a flag that `XLA_FLAGS` sets
-  already keeps its value ([Environment variables](../reference/environment.md)).
-- In a job of many hosts only the first process writes the cache, so put it on a
-  filesystem they all mount: bux turns off one that is each host's own, and says so
-  ([The compile cache](../parallelism/multi-node.md#the-compile-cache)).
+- `JAX_COMPILATION_CACHE_DIR` puts the cache elsewhere, and set empty turns it off.
+- bux puts its own XLA flags before `XLA_FLAGS`, and a flag that `XLA_FLAGS` already
+  sets keeps its value ([Environment variables](../reference/environment.md)).
+- In a job of many hosts, only the first process writes the cache, so put it on a
+  filesystem they all mount: bux turns off a cache that is each host's own, and says
+  so ([The compile cache](../parallelism/multi-node.md#the-compile-cache)).
 
 ## Searches
 
 A file with dimensions is a search for each of its runs
 ([Searching hyperparameters](searching.md)). `bux launch` trains its trials as it
-trains a sweep, a worker each on the GPUs its mesh needs, and proposes each trial
-when GPUs free up, from the trials done and those still training. A search launched
-again goes on where it stopped: its trials are in its own directory, and a trial
-that is done is read, not trained again. A search trains many runs, so it launches on
-one host: an array job's `--index` takes one of a sweep's searches.
+trains a sweep, one worker per trial on the GPUs its mesh needs, and proposes each
+trial as GPUs free up, from the trials done and those still training. A search
+launched again goes on where it stopped: its trials are in its own directory, and a
+trial that is done is read, not trained again. A search trains many runs, so it
+launches on one host; in an array job, `--index` picks one of a sweep's searches.
 
 ## Array jobs
 
 `--index N` trains only the run at N, from 0, in the order `bux plan` lists them. So
-an array job trains a sweep a run a task:
+an array job trains a sweep with one run per task:
 
 ::::{tab-set}
 
@@ -206,7 +213,7 @@ spec:
 `--index` past the last run is an error: `--index 6, but the file makes 6 runs`.
 
 :::{tip}
-Tasks that read the same documents each prepare them, which is safe but wasted work:
+Tasks that read the same documents each prepare them. That is safe but wasted work:
 the first to finish keeps its dataset, and the others use it. Run `bux prepare` once
 beforehand.
 :::
@@ -217,25 +224,27 @@ A run alone trains on many hosts when the environment says how many processes th
 are:
 
 - under Slurm's `srun`, or Open MPI's `mpirun`;
-- or with `JAX_COORDINATOR_ADDRESS` (process 0's `host:port`), `JAX_NUM_PROCESSES` and
-  `JAX_PROCESS_ID` set on each.
+- or with `JAX_COORDINATOR_ADDRESS` (process 0's `host:port`), `JAX_NUM_PROCESSES`
+  and `JAX_PROCESS_ID` set on each process.
 
-Every process runs the same command, and they join through `jax.distributed`. Under
-Slurm and Open MPI, JAX gives each process the GPU of its local rank, so start a task a
-GPU:
+Every process runs the same command, and they join through `jax.distributed`. With
+`JAX_NUM_PROCESSES` set, those three variables say everything, and no cluster is
+detected; otherwise JAX reads Slurm's or Open MPI's environment. Under Slurm and Open
+MPI, JAX gives each process the GPU of its local rank, so start one task per GPU:
 
 ```sh
 srun --nodes=4 --ntasks-per-node=8 bux launch speedrun.bux   # 32 GPUs, one mesh
 ```
 
-- The first process alone writes the console, `metrics.jsonl`, `status.json`, the
-  trackers and the run's files, and every process writes its part of a checkpoint.
+- Only the first process writes the console, `metrics.jsonl`, `status.json`, the
+  trackers and the run's files. Every process writes its part of a checkpoint.
 - Each process reads only the rows of a batch that its devices hold
   ([Reading prepared data](../data/pipeline.md#reading-prepared-data)).
-- A signal to any of them stops them all after the same step.
-- A sweep does not train on many hosts: give each run a job of its own, with
-  `--index`. Launched with several runs, the launcher says
-  `8 processes train one run, not 6: use --index` and exits with 1.
+- A signal to any process stops them all after the same step.
+- A sweep does not train on many hosts: give each run its own job, with `--index`.
+  Launched with several runs, the launcher says
+  `8 processes train one run, not 6: use --index` and exits with 1. A search says
+  `a search trains many runs, each on one host: launch it on one`.
 
 How the mesh lays out over nodes is in [Many nodes](../parallelism/multi-node.md).
 
@@ -249,8 +258,8 @@ In a job of many processes, three folders must be the same folder on every host:
 | `--cache`, the prepared datasets | every process reads the rows it holds from them | |
 | `JAX_COMPILATION_CACHE_DIR` | the processes must all find a program, or all compile it | `bux launch`, as they join: it turns the cache off where it is each host's own |
 
-So `--out` is a folder every node sees, not a node's own disk or `/dev/shm`. The
-checkpoint hook's error says so:
+So `--out` must be a folder every node sees, not a node's local disk or `/dev/shm`.
+The checkpoint hook's error says so:
 
 ```text
 ValueError: the 16 processes of this job do not share <out>/<run>/checkpoints: one sees
@@ -258,15 +267,15 @@ ValueError: the 16 processes of this job do not share <out>/<run>/checkpoints: o
 run's directory (--out) where every node sees it
 ```
 
-Orbax alone waits at the first save for the parts it cannot see: on two nodes, each
-with a folder of its own, twenty minutes before it timed out.
+Without this check, orbax waits at the first save for the parts it cannot see: on
+two nodes with separate folders, it hung for twenty minutes before it timed out.
 
 ## Resuming
 
-A run launched again loads its latest checkpoint and trains on as if it had not
+A run launched again loads its latest checkpoint and trains on as if it had never
 stopped. Here the smoke run, stretched to 3000 steps with a checkpoint every 500, is
-stopped by SIGTERM just after step 1500 and launched again; it saves the step it
-stops at:
+stopped by SIGTERM just after step 1500 and launched again. It saves the step it stops
+at:
 
 ```console
 $ bux launch examples/experiments/smoke.bux steps=3000 'log = log(every=250)' 'checkpoint = checkpoint(every=500)'
@@ -288,24 +297,25 @@ smoke: done
 
 ### What makes a resume exact
 
-- The checkpoint holds the model's state and the optimizer's, random keys and an MoE's
-  router bias with them.
+- The checkpoint holds the model's state and the optimizer's, including random keys
+  and an MoE's router bias.
 - Batch `i` depends on the seed and `i` alone, so a run that resumes at step `i` reads
   what it would have read ([Mixtures](../data/sources.md#mixtures)).
-- `metrics.jsonl` drops the lines of any steps the run takes again, which a crash
-  after the checkpoint left.
-- A run's mesh, layout and methods are not in its id, so it resumes on another mesh or
-  another number of nodes too, orbax reading each array onto the shardings the new
-  mesh gives it.
+- `metrics.jsonl` drops the lines of any steps the run takes again, such as those a
+  crash after the checkpoint left behind.
+- A run's mesh, layout and methods are not in its id, so it also resumes on another
+  mesh or another number of nodes, with orbax reading each array onto the shardings
+  the new mesh gives it.
 
 ### Verified on B300s
 
-On one node of 8 B300s, two and four, with GEMM autotuning off and deterministic ops
-(`--xla_gpu_autotune_level=0 --xla_gpu_deterministic_ops=true`): a 0.2B Llama of 8
-layers and a 0.4B MoE (16 experts, top-2) on packed documents, in bfloat16 with
-donation, 8 rows of 2048 tokens a GPU, 30 steps with a checkpoint every 10. Each was
-stopped through `bux launch` by SIGTERM once step 15 was logged, or by SIGKILL as a
-crash would, and launched again. Against the run trained in one go, on its mesh:
+On one node of 8 B300s, on two nodes and on four (2026-10-24), with GEMM autotuning
+off and deterministic ops (`--xla_gpu_autotune_level=0
+--xla_gpu_deterministic_ops=true`): a 0.2B Llama of 8 layers and a 0.4B MoE (16
+experts, top-2) on packed documents, in bfloat16 with donation, 8 rows of 2048 tokens
+per GPU, 30 steps with a checkpoint every 10. Each was stopped through `bux launch` by
+SIGTERM once step 15 was logged, or by SIGKILL as a crash would, and launched again.
+Compared with the run trained in one go on its mesh:
 
 | Saved on | Resumed on | At | Restore | Losses after it |
 |----------|------------|----|---------|-----------------|
@@ -325,31 +335,29 @@ crash would, and launched again. Against the run trained in one go, on its mesh:
 | four nodes, fsdp=32, SIGKILL twice | the same, twice | 10, 30 | 1.9s | equal |
 | four nodes, fsdp=32 | two nodes, fsdp=16 | 10 | 2.1s | within 7e-4 (1e-3) |
 
-In brackets, how far apart the losses of the runs trained in one go on the two meshes
+In brackets: how far apart the losses of runs trained in one go on the two meshes
 are.
 
 - On two nodes, the SIGTERM went to the second node's process alone, and both stopped
   at the same step.
-- On four, 60 steps of the dense model: the third node's process was SIGKILLed as the
-  others saved step 20, and they ended by themselves 70 s later, when the first's
-  coordination service missed its heartbeats (`Task 2 heartbeat timeout`). Launched
-  again, the run resumed at 10.
-- Then the first node's process, which runs that service, was SIGKILLed as they saved
-  step 40: the others ended 9-10 s later, and the run resumed at 30.
+- When a process dies (SIGKILL), the others exit by themselves once the coordination
+  service misses its heartbeats (`Task 2 heartbeat timeout`): 70 s later on four
+  nodes, or 9-10 s later when the dead process is the first, which runs that service.
+  Launched again, the run resumed from its latest checkpoint each time.
 
 ### When a resume cannot work
 
-**A save that a crash left half written** (`20.orbax-checkpoint-tmp`) is deleted as
-the run starts again, and the run saves again only past its step. Orbax would save
-that step in a folder of the same name, and on four nodes the other nodes still saw
-it as the one deleted, failed to write their parts into it, and the save hung.
+**A save that a crash left half written** (`20.orbax-checkpoint-tmp`) is deleted when
+the run starts again, and the run saves again only past that step: saving the same
+step into a folder of the same name hung on four nodes, where the other nodes still
+saw the deleted one.
 
 **A checkpoint that does not hold the run's state** fails before it is read, and the
 error says what changed: the arrays' paths, dtypes and shapes, and the order of a
-pipeline's layers in them. `methods.repeat` (`scan` stacks a repeat's passes into one
-array), a circular pipeline's `rounds` (a stack a round) and an uneven pipeline's
-`stages` (each stage's passes, then copies of its first) change them, so a run resumes
-with those it was saved with:
+pipeline's layers in them. Three methods change them, so a run must resume with the
+values it was saved with: `methods.repeat` (`scan` stacks a repeat's passes into one
+array), a circular pipeline's `rounds` (one stack per round), and an uneven
+pipeline's `stages` (each stage's passes, then copies of its first):
 
 ```text
 ValueError: the checkpoint of step 16 does not hold this run's state: it was saved
@@ -359,7 +367,8 @@ pipeline's rounds and an uneven one's stages
 ```
 
 An even `gpipe` or `1f1b` pipeline keeps its layers in the order of `repeat=scan`, so
-it resumes on any number of stages, or on none ([Resuming on another pipeline](../parallelism/pipelines.md#resuming-on-another-pipeline)).
+it resumes on any number of stages, or on none
+([Resuming on another pipeline](../parallelism/pipelines.md#resuming-on-another-pipeline)).
 
-**A run directory each node sees alone** fails at once, before the first save
+**A run directory that each node sees alone** fails at once, before the first save
 ([Shared filesystems](#shared-filesystems)).

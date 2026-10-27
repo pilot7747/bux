@@ -1,13 +1,14 @@
 # Architectures
 
-This guide covers the building blocks bux implements: what each layer computes, the
-paper or model it comes from, how to write it in a `.bux` file, and the options that
-matter. Read it when you design a model, transcribe one from a paper or a
-`config.json`, or want to know exactly what a setting does before you sweep it.
+This section shows how to build a model in bux: what each layer computes, the paper or
+model it comes from, how to write it in a `.bux` file, and the settings that matter.
+Come here to design a model, to transcribe one from a paper or a `config.json`, or to
+learn exactly what a setting does before you sweep it.
 
-Every field of every layer is in the generated
-[language reference](../reference/language/layers.md); this guide links to an entry
-there with its name, as in {bux}`gqa`, rather than repeating the tables.
+To reproduce a published model, start from the [model zoo](model-zoo.md): 62 of them,
+each a file you can `use` and change. Every field of every layer is in the generated
+[language reference](../reference/language/layers.md); these pages link to its entries
+by name, as in {bux}`gqa`, instead of repeating its tables.
 
 ## How a model is assembled
 
@@ -52,34 +53,38 @@ Read the model left to right:
    can have several heads, one for each output (multi-token prediction, see
    [Outputs](../language/outputs.md)).
 
+Every layer bux has, by role and page:
+
 | Role | What it does | Layers |
 |------|--------------|--------|
-| Token mixer | mixes positions, causally | [`gqa`, `mla`, `csa`](attention.md); [`gla`, `deltanet`, `gdn`, `kda`, `gdn2`, `lightning`, `rwkv7`](recurrent.md); [`mamba`, `mamba2`, `conv`, `short_conv`](recurrent.md#state-space-models-and-convolutions) |
+| Token mixer | mixes positions, causally | [`gqa`, `mla`, `csa`](attention.md); [`gla`, `deltanet`, `gdn`, `kda`, `gdn2`, `lightning`, `rwkv7`](recurrent.md#linear-attention); [`mamba`, `mamba2`, `conv`, `short_conv`](recurrent.md#state-space-models-and-convolutions) |
 | Channel mixer | transforms each position | [`mlp`, `gated_mlp`](layers.md#mlps); [`moe`](experts.md) |
 | Normalization | rescales each position | [`rmsnorm`, `layernorm`, `dyt`](layers.md#normalization) |
-| Input and output | tokens in, logits out | [`embed`, `head`, `nextn`, `engram`](layers.md#embeddings-and-heads) |
-| Plumbing | elementwise and structural | [`linear`, `act`, `scale`, `dropout`, `merge`](layers.md#elementwise-layers) |
+| Input and output | tokens in, logits out | [`embed`, `head`, `nextn`](layers.md#embeddings-and-heads); [`engram`](layers.md#engram-hashed-n-gram-memory) |
+| Plumbing | elementwise and structural | [`linear`, `act`, `scale`, `dropout`](layers.md#elementwise-layers); [`merge`](layers.md#merge) |
 
 Every layer keeps the width of the stream it reads, except three: `embed` maps token
-ids to `d_model`, `linear` maps to its `features`, and `head` maps to logits. The
-compiler checks that every residual branch comes back to the width it started at.
+ids to `d_model`, `linear` maps to its `features`, and `head` maps to logits. (Under a
+residual algebra that widens the stream, `merge` and `nextn` also move between one
+stream and several.) The compiler checks that every residual branch comes back to the
+width it started at.
 
 A setting that is not a layer parametrizes one: {bux}`rope` and its scalings go in an
-attention's `rope=`, {bux}`indexer` in its `indexer=`, and the residual algebras
-(`hc`, `mhc`, `gr`, `attnres`, `vpgate`) in the top-level `residual =`, which changes
-what every `[f]` means ([Residual algebras](../language/residual-algebras.md)). The
-top-level `init =` says how the weight matrices start
+attention's `rope=`, and {bux}`indexer` in its `indexer=`. The top-level
+`residual =` picks a residual algebra (`hc`, `mhc`, `gr`, `attnres`, `vpgate`), which
+changes what every `[f]` means ([Residual algebras](../language/residual-algebras.md)).
+The top-level `init =` says how the weight matrices start
 ([Initialization](initialization.md)).
 
 :::{note}
-Rows can hold several packed documents. Given the positions of the tokens in their
-documents, every layer sees each document on its own: attention masks the others,
-convolutions and recurrent states start again at a document's start, and `nextn`
-and `engram` never look across one. A document starts wherever the positions stop
-increasing ({py:class}`bux.architecture.common.segments.Segments`).
+A row can hold several packed documents, and every layer sees each one on its own:
+attention masks the others, convolutions and recurrent states restart at each
+document's start, and `nextn` and `engram` never look across a boundary. A document
+starts wherever the token positions stop increasing
+({py:class}`bux.architecture.common.segments.Segments`).
 :::
 
-## Families of layers
+## The pages
 
 ::::{grid} 1 2 2 2
 :gutter: 3
@@ -96,8 +101,8 @@ scalings, shared keys and values, and sparse attention by an indexer.
 :link: recurrent
 :link-type: doc
 
-`gla`, `deltanet`, `gdn`, `kda`, `gdn2`, `lightning`, `rwkv7`, `mamba`, `mamba2`, `conv`
-and `short_conv`: the recurrence each computes, and hybrids with attention.
+`gla`, `deltanet`, `gdn`, `kda`, `gdn2`, `lightning`, `rwkv7`, `mamba`, `mamba2`,
+`conv` and `short_conv`: the recurrence each computes, and hybrids with attention.
 :::
 
 :::{grid-item-card} Mixture of experts
@@ -113,7 +118,15 @@ bias.
 :link-type: doc
 
 `rmsnorm`, `layernorm`, `dyt`, `mlp`, `gated_mlp`, `embed`, `head`, `nextn`,
-`engram`, and the elementwise layers.
+`engram`, `merge` and the elementwise layers.
+:::
+
+:::{grid-item-card} Initialization
+:link: initialization
+:link-type: doc
+
+The default normal of 0.02, the top-level `init` that changes it by role, recipes
+from GPT-2 to Mamba, and what the papers found.
 :::
 
 :::{grid-item-card} Model zoo
@@ -128,33 +141,18 @@ and shrink.
 :link: ir-and-backends
 :link-type: doc
 
-What a `.bux` file compiles to, how the Flax NNX backend builds it, and how to write
-another backend.
+What a `.bux` file compiles to, how to generate and print architectures from Python,
+how the Flax NNX backend builds a model, and how to write another backend.
 :::
 
 :::{grid-item-card} Adding a layer
 :link: adding-a-layer
 :link-type: doc
 
-The complete reference for extending the model: configs, builders, sharding names,
-precision roles, remat names and kernels.
+The reference for extending the model: configs, builders, sharding names, precision
+roles, remat names, kernels, export and tests.
 :::
 ::::
-
-## Every layer, by page
-
-| Layer | Page |
-|-------|------|
-| `gqa`, `mla`, `csa` | [Softmax attention](attention.md) |
-| `gla`, `deltanet`, `gdn`, `kda`, `gdn2`, `lightning`, `rwkv7` | [Linear attention](recurrent.md#linear-attention) |
-| `mamba`, `mamba2`, `conv`, `short_conv` | [State-space models and convolutions](recurrent.md#state-space-models-and-convolutions) |
-| `moe` | [Mixture of experts](experts.md) |
-| `layernorm`, `rmsnorm`, `dyt` | [Normalization](layers.md#normalization) |
-| `mlp`, `gated_mlp` | [MLPs](layers.md#mlps) |
-| `embed`, `head`, `nextn` | [Embeddings and heads](layers.md#embeddings-and-heads) |
-| `engram` | [Engram](layers.md#engram-hashed-n-gram-memory) |
-| `linear`, `act`, `scale`, `dropout` | [Elementwise layers](layers.md#elementwise-layers) |
-| `merge` | [Merge](layers.md#merge) |
 
 ```{toctree}
 :hidden:

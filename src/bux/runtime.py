@@ -44,7 +44,7 @@ from bux.train import profilers
 #: bux's XLA flags, which go before those of ``XLA_FLAGS``.
 #:
 #: GPU flags, which XLA takes on any backend and a CPU ignores. Without the first,
-#: ``ragged_all_to_all`` (expert parallelism's dispatch) hangs on B300s.
+#: ``ragged_all_to_all`` (expert parallelism's dispatch) hangs on B300s on jax 0.12.
 XLA_FLAGS = ("--xla_gpu_experimental_ragged_all_to_all_use_barrier_with_nccl=false",)
 #: NCCL EP's settings (``methods(moe=nccl_ep)``), where the environment sets none.
 #:

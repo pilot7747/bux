@@ -1,10 +1,10 @@
 (lang-grammar)=
 # Lexical rules and grammar
 
-This page is the exact syntax of a `.bux` file: its tokens, where statements end, the
-places where a space changes the meaning, and the grammar. It is checked against the
-parser, `bux/lang/syntax.py`. Read it when a line does not parse as you expect; the
-other pages explain what each construct means.
+This page is the exact syntax of a `.bux` file: its statements and tokens, where
+statements end, the places where a space changes the meaning, and the grammar. Read
+it when a line does not parse as you expect. The other pages of this guide explain
+what each construct means.
 
 ## Statements
 
@@ -18,16 +18,16 @@ A file is a sequence of statements:
 | an amendment | `attn.num_kv_heads = 1` |
 | a module | `use llama3_8b`, `use "qwen3.8_27b"` |
 
-A statement ends at a newline, unless the next line that is not blank or a comment
-is indented, or a bracket, `(` or `[`, is still open. A `;` also ends a statement,
+A statement ends at a newline, unless a bracket, `(` or `[`, is still open, or the
+next line that is not blank or a comment is indented. A `;` also ends a statement,
 so several fit on one line: `d_model = 512; vocab_size = 32000`.
 
 ```bux
 model = embed norm @x0
-        (block @skip)^6              # indented: the statement goes on
+        (block @skip)^6              # indented: the statement continues
         ([$skip! scale] block)^6
         norm head
-attn  = gqa(num_heads=8,             # an open bracket: the statement goes on
+attn  = gqa(num_heads=8,             # an open bracket: the statement continues
 num_kv_heads=2)
 ```
 
@@ -62,13 +62,16 @@ Four constructs need their punctuation right after a name, with no space:
 | `attn.num_heads`, `attn.num_heads = 8` | a field read, an amendment | `attn .num_heads` is an error |
 | `$h!` | read and pop | `$h !` is an error |
 
-A `-` between two items is a subtraction whatever the spacing: `f -g` is `f - g`. Only
-after an arrow does it negate: `f -> -g`.
+A `-` between two items of a composition is a subtraction whatever the spacing:
+`f -g` is `f - g`. Inside a composition, it negates only after an arrow: `f -> -g`.
+Elsewhere, such as at the start of an expression or after `+`, `*` or `(`, it
+negates: `-f g`, `f + -g`.
 
 ## Grammar
 
-Checked against `bux/lang/syntax.py`. `NAME`, `NUMBER` and `STRING` are the tokens
-above; `{ x }` repeats `x` zero or more times and `[ x ]` makes it optional.
+The grammar below matches the parser, `bux/lang/syntax.py`. `NAME`, `NUMBER` and
+`STRING` are the tokens above. `{ x }` repeats `x` zero or more times, and `[ x ]`
+makes it optional.
 
 ```text
 program    := [ item ] { ( NEWLINE | ";" ) [ item ] }
@@ -110,19 +113,3 @@ What a construct means, and the errors the compiler finds after parsing, are on 
 other pages: [Operators](operators.md), [Skip connections](skip-connections.md),
 [Definitions](definitions.md), [Settings and values](values.md),
 [Modules](modules.md) and [Sweeps](sweeps.md).
-
-## Changes from the earlier grammar
-
-The grammar in earlier versions of this guide differed from the parser in these
-places:
-
-- **Composition.** It had `chain := unary { ["->" | "→"] unary }`, which reads
-  `f -g` as `f` composed with `-g`. The parser reads it as `f - g`: without an arrow,
-  the items after the first cannot start with `-`.
-- **Macros.** It required at least one parameter. A macro may have none:
-  `pre() = [norm attn]`, called as `pre()`. It also allowed `shared` on a macro,
-  which is an error.
-- **Programs and tokens.** It gave no rule for how statements are separated, and
-  none for names, numbers and strings.
-- **Spacing.** Its lexical rules named the space-sensitive `(` and `.`, but not the
-  `!` of `$h!`, nor a macro's `(`.

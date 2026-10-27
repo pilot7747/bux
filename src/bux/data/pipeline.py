@@ -10,7 +10,7 @@ shuffle groups them by the top bits of their keys into a power of two of chunks
 the same two functions on Spark.
 
 `prepare` runs them here, in one process per core. The map spills each task's
-documents, sorted by key, as raw arrays, about 5 bytes a token of scratch space
+documents, sorted by key, as raw arrays, about 5 bytes per token of scratch space
 next to the cache; each reduce finds its keys in every spill by bisection and maps
 in only its own documents, so that the shuffle reads every byte once.
 

@@ -1,19 +1,18 @@
 # Your own data
 
-In this tutorial you train on text of your own. You write a small Parquet file of
-documents with pyarrow, point a run at it with `text(...)` and a tokenizer, and let
-`bux prepare` tokenize the documents and pack them into rows. You hold out a split
-of the documents for evaluation, compare the three packings, and train on a mixture
-of two sources.
+Train on text of your own. By the end you will have written a Parquet file of
+stories, tokenized and packed it with `bux prepare`, trained a model that actually
+learns it, evaluated on a held-out split, compared the three packings, and trained on
+a mixture of two sources.
 
 It builds on [Train on a laptop](train-on-a-laptop.md). The only download is GPT-2's
 tokenizer, a few megabytes from the Hugging Face Hub.
 
 ## 1. Write some documents
 
-bux reads documents from Parquet files: one document a row, its text in a column.
-Any tool that writes Parquet will do. This script makes 4000 tiny stories, in two
-files; save it as `make_stories.py` and run it from the checkout's root:
+bux reads documents from Parquet files: one document per row, its text in a column.
+Any tool that writes Parquet will do. This script writes 4000 tiny stories to two
+files. Save it as `make_stories.py` and run it from the checkout's root:
 
 ```python
 """Write a few thousand tiny stories to data/stories/, as Parquet files of one column."""
@@ -78,8 +77,8 @@ Once upon a time. The duck and the cat went home happy. The brave bear lived in 
 ```
 
 The stories are 1 to 12 sentences long, so they pack into rows unevenly, as real
-documents do, and their grammar is simple enough that a tiny model learns it in a
-couple of hundred steps.
+documents do. Their grammar is simple enough for a tiny model to learn in a couple of
+hundred steps.
 
 ## 2. Point a run at them
 
@@ -116,15 +115,16 @@ What is new:
 - `tokenizer(name="gpt2")` is a BPE tokenizer, run by
   [gigatoken](https://github.com/marcelroed/gigatoken): a Hugging Face Hub repo, as
   here, or a path to a `tokenizer.json`. `vocab_size` must hold every id it makes.
-- `text(path=...)` is raw text, one document a row of the Parquet files the glob
-  matches, relative to where you run `bux`. Its column is `text` unless you say
-  `column="..."`, and it ends every document with the tokenizer's end-of-text token
-  (`eos=true`, the default; `bos=true` would also start each with one).
+- `text(path=...)` is raw text: one document per row of the Parquet files that the
+  glob matches, relative to where you run `bux`. The column is `text` unless you set
+  `column="..."`. Every document ends with the tokenizer's end-of-text token
+  (`eos=true`, the default); `bos=true` would also start each one with a
+  beginning-of-text token.
 - `stories` is a definition like any other, so `stories(split=...)` calls it with one
   setting changed.
-- `split=[0, 0.95]` is the documents whose hash falls in the first 95% of [0, 1], and
-  `split=[0.95, 1]` the rest. They are disjoint and cover everything, whatever the
-  tokenizer or the packing, so a held-out set needs no file of its own.
+- `split=[0, 0.95]` selects the documents whose hash falls in the first 95% of
+  [0, 1], and `split=[0.95, 1]` the rest. The two are disjoint and cover everything,
+  whatever the tokenizer or the packing, so a held-out set needs no separate file.
 - `packing = best_fit` packs whole documents into rows, best fit decreasing.
 
 The reference has every setting of {bux}`tokenizer`, {bux}`text` and
@@ -142,9 +142,10 @@ tokenizer=tokenizer(name=gpt2) packing=best_fit
 
 ## 3. Prepare the data
 
-Documents become rows once, before training: a MapReduce job tokenizes them, shuffles
-them by their hashes and packs them, in a process per core. `bux prepare` runs it for
-every set of documents the run reads, here the training split and the eval split:
+Documents become rows once, before training. A MapReduce job tokenizes them,
+shuffles them by their hashes and packs them, with one process per core. `bux prepare`
+runs it for every set of documents the run reads, here the training split and the
+eval split:
 
 ```console
 $ bux prepare mine/stories.bux
@@ -154,18 +155,22 @@ text-f70d7968d0: 186 documents, 12,259 tokens -> 101 rows of 128, 94.8% filled, 
 data/packed/text-f70d7968d0
 ```
 
-Each line says how many documents and tokens went in, how many rows came out, how
-full the rows are (the rest is padding), the share of tokens that are targets of the
-loss, and how many tokens were lost to cuts. The 4000 stories split 3814 to 186, about
-95 to 5.
+Each line reports:
 
-`bux train` prepares what is missing before it trains, so `bux prepare` is only a way
-to do it ahead of time, or on another machine. Options: `--workers N` processes
-(default: one a core) and `--cache DIR` (default: `data/packed`).
+- how many documents and tokens went in, and how many rows came out;
+- how full the rows are (the rest is padding);
+- the share of tokens that are targets of the loss;
+- how many tokens were lost to cuts.
 
-A prepared dataset is a folder named for a hash of what made it: the documents'
-settings, the tokenizer, the packing and `seq_len`. So a run finds the one it needs,
-a changed setting makes another, and runs of a sweep share one:
+The 4000 stories split 3814 to 186, about 95 to 5.
+
+`bux train` prepares whatever is missing before it trains, so `bux prepare` is only
+for doing it ahead of time or on another machine. Its options are `--workers N`
+(default: one per core) and `--cache DIR` (default: `data/packed`).
+
+A prepared dataset is a folder named after a hash of its inputs: the documents'
+settings, the tokenizer, the packing and `seq_len`. A run finds the dataset it needs,
+a changed setting makes a new one, and the runs of a sweep share one:
 
 ```console
 $ ls data/packed/text-2f218c2bc9
@@ -173,8 +178,8 @@ dataset.json  part-00000.parquet
 ```
 
 `dataset.json`, written last, records the job, the input files, the parts and their
-statistics. The input files are not in the hash, so a cache outlives them; if you
-change the files under the same glob, delete the folder by hand.
+statistics. The input files themselves are not in the hash, so the cache outlives
+them. If you change the files under the same glob, delete the folder by hand.
 
 ## 4. Look at a row
 
@@ -199,11 +204,11 @@ position_ids [100, 101, 102, 103, 104, 105, 106, 0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 1
 loss_mask    [True, True, True, True, True, True, True, True, True, True, True, True, True, True, True, True, True, True, True, True, True, False, False, False, False, False, False, False]
 ```
 
-A 107-token story ends with `50256`, GPT-2's `<|endoftext|>`; the positions start
-again at 0 where the next, 14-token story begins; and 7 tokens of padding close the
-row, which are not targets. Positions say everything about the packing: the model
-attends, convolves and computes the loss only within each document, so a story never
-sees the one packed before it.
+A 107-token story ends with `50256`, GPT-2's `<|endoftext|>`. The positions restart
+at 0 where the next story, 14 tokens long, begins. Seven tokens of padding close the
+row, and they are not targets. The positions carry everything about the packing: the
+model attends, convolves and computes the loss only within each document, so a story
+never sees the one packed before it.
 
 ## 5. Train
 
@@ -224,21 +229,22 @@ stories step 200/200  loss 0.7169  lr 0.00e+00  grad 0.272  7,834 tok/s  ...
 stories step 200/200  eval loss 0.7289  eval bpb 0.2447
 ```
 
-This time the loss falls far below the random-token runs': the stories are mostly
-predictable, and the held-out stories, which the model never trained on, score as
-well as the training ones. The run is slower than the 512-token one because the head
-now projects to 50,304 logits a token.
+This time the loss falls far below the 6.24 of the random-token runs, because the
+stories are mostly predictable. The held-out stories, which the model never trained
+on, score as well as the training ones. The run is slower than `mine/tiny.bux`
+because the head now projects to 50,304 logits per token instead of 512.
 
-The eval also reports bits per byte, `eval bpb`: the held-out stories' nats over their
-bytes of text, in bits. A GPT-2 token here is about four bytes, so 0.73 nats a token
-are 0.24 bits a byte; unlike the loss, the number compares with a run in another
-tokenizer's tokens ([Eval](../training/running.md#eval)).
+The eval also reports bits per byte, `eval bpb`: the loss on the held-out stories,
+in bits, divided by their length in bytes of text. A GPT-2 token here is about four
+bytes, so 0.73 nats per token is about 0.24 bits per byte. Unlike the loss, bits per
+byte compare across tokenizers ([Eval](../training/running.md#eval)).
 
 ## 6. Choose a packing
 
-How documents become rows is the `packing` setting. All three shuffle the documents
-by their hashes and keep each document seeing only itself (`doc_mask`), except
-`concat`, which by default reads a row as one text, as GPT-2 did:
+The `packing` setting decides how documents become rows. All three packings shuffle
+the documents by their hashes. `greedy` and `best_fit` also keep each document from
+seeing the others in its row (`doc_mask`); `concat` by default reads a row as one
+text, as GPT-2 did:
 
 | packing    | rows                                                                   |
 |------------|------------------------------------------------------------------------|
@@ -246,7 +252,7 @@ by their hashes and keep each document seeing only itself (`doc_mask`), except
 | `greedy`   | whole documents in their shuffled order, a row padded and closed when the next does not fit; longer ones dropped (`long=drop`) |
 | `best_fit` | the longest first, each into the open row it leaves least room in: nearly no padding, and documents longer than a row split into pieces that fill gaps (`long=split`) |
 
-Compare them from the command line on the training split. At 128 tokens a row:
+Compare them from the command line on the training split. At 128 tokens per row:
 
 ```console
 $ bux prepare mine/stories.bux packing=concat
@@ -276,10 +282,11 @@ text-e8d97c415b: 3,814 documents, 249,643 tokens -> 1,470 rows of 64, 74.4% fill
 | `best_fit`, 64     | 3,985 | 98.6%  | 0          |
 | `greedy`, 64       | 1,470 | 74.4%  | 179,690    |
 
-`best_fit` fills rows nearly as densely as `concat` and keeps documents whole;
-`greedy` pads a quarter of every row and drops what does not fit, which suits chat
-data, where a cut conversation may lose its answer. Rows of `concat`, and pieces of a
-split document, overlap by a token, so that every token is a target once.
+`best_fit` fills rows nearly as densely as `concat` and keeps documents whole.
+`greedy` pads a quarter of every row and drops what does not fit; dropping suits chat
+data, where a cut conversation may lose its answer. Consecutive rows of `concat`, and
+the pieces of a split document, overlap by one token, so that every token is a target
+exactly once.
 
 [Packing](../data/packing.md) has every option (`long`, `max_docs`, `sort`,
 `doc_mask`, `chunk`).
@@ -287,8 +294,8 @@ split document, overlap by a token, so that every token is a target once.
 ## 7. Mix two sources
 
 A run can read several sources at once. `+` mixes them and `*` weights them, so every
-batch of `0.75 * a + 0.25 * b` has three quarters of its rows from `a`. Write a second
-source, sums written out as text, in a column named `content`. Save this as
+batch of `0.75 * a + 0.25 * b` takes three quarters of its rows from `a`. For a second
+source, write sums out as text, in a column named `content`. Save this as
 `make_facts.py` and run it:
 
 ```python
@@ -336,11 +343,11 @@ mixed step 200/200  loss 0.9384  lr 0.00e+00  grad 0.261  6,536 tok/s  ...
 mixed step 200/200  eval loss 0.7302  eval bpb 0.2456
 ```
 
-`bux train` prepared the one dataset that was missing, the sums, and reused the
-stories'. The training loss is now the mean over both sources; the eval, on held-out
-stories alone, lands close to the stories-only run. Every source is read in order,
-epoch after epoch, so batch `i` depends only on the seed and `i`: a run that resumes
-reads exactly what it would have read.
+`bux train` prepared the only missing dataset, the sums, and reused the stories.
+The training loss is now the mean over both sources. The eval, on held-out stories
+alone, lands close to the stories-only run. Every source is read in order, epoch
+after epoch, so batch `i` depends only on the seed and `i`: a run that resumes reads
+exactly the data it would have read.
 
 ## 8. Going bigger
 
@@ -351,20 +358,23 @@ The same settings scale to real corpora:
   ([Data](../data/index.md)).
 - `uv sync --extra spark` and `bux.data.spark.prepare` run the same job on Spark,
   and make the same rows ([Pipeline](../data/pipeline.md)).
-- `tokens(path=..., dtype=uint16)` reads shards of token ids that are tokenized
-  already, through memory maps, with no preparation
-  ([Sources](../data/sources.md)).
+- `tokens(path=..., dtype=uint16)` reads shards of token ids that are already
+  tokenized, through memory maps, with no preparation ([Sources](../data/sources.md)).
 
 ## What you learned
 
 | you wrote                                 | it does                                      |
 |-------------------------------------------|----------------------------------------------|
 | `tokenizer(name="gpt2")`                  | tokenizes with a Hub repo's BPE              |
-| `text(path="...*.parquet", column=...)`   | a document a row of Parquet                  |
+| `text(path="...*.parquet", column=...)`   | one document per Parquet row                 |
 | `split=[0, 0.95]` and `[0.95, 1]`         | a training set and a held-out set, by hash   |
 | `packing = best_fit`                      | whole documents, nearly no padding           |
 | `0.75 * a + 0.25 * b`                     | a mixture, by rows of every batch            |
 | `bux prepare`                             | tokenize and pack once, into `data/packed/`  |
 
-Next, [fine-tune on chat](fine-tuning-chat.md) trains on conversations, with the loss
-on the replies alone.
+## Next steps
+
+- [Fine-tuning on chat](fine-tuning-chat.md): train on conversations, with the loss
+  on the replies only.
+- [Data](../data/index.md): every source, packing option and the preparation
+  pipeline.

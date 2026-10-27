@@ -1,10 +1,9 @@
 # An ablation sweep
 
-In this tutorial you run an experiment the way bux is meant for: an architecture and
-a training recipe from other files, used by name, and a handful of lines that say
-what to vary. You plan the sweep, launch it, read the table it ends with, and compare
-the runs from their metrics. Then you tie two settings together with labels, and
-sweep the wiring itself.
+Run an experiment the way bux is meant to be used: borrow an architecture and a
+training recipe by name, then write only the lines that vary. By the end you will
+have planned, launched and compared a sweep of six runs over attention variants and
+learning rates, tied two settings together with labels, and swept the wiring itself.
 
 It builds on [Train on a laptop](train-on-a-laptop.md). The six runs train in about a
 minute on a laptop's CPU.
@@ -27,13 +26,13 @@ model = embed block^32 norm head
 ```
 
 `use llama3_8b` brings in its definitions. A module is found by its name, never by a
-path: in the using file's folder first, then under the folders that `[tool.bux]
-path` lists in `pyproject.toml`, which in bux's checkout is `examples/`.
+path: first in the using file's folder, then under the folders listed in
+`[tool.bux] path` of `pyproject.toml` (`examples/` in bux's checkout).
 
-Definitions after the `use` take the place of llama3_8b's **everywhere**, including
-inside its own definitions. So redefining `d_model`, or amending `attn`, changes the
-attention inside llama3_8b's `block`, which you never rewrite. An amendment,
-`attn.num_heads = 4`, changes one setting and keeps the rest: it means
+Definitions after the `use` replace llama3_8b's **everywhere**, including inside its
+own definitions. So redefining `d_model`, or amending `attn`, changes the attention
+inside llama3_8b's `block` without rewriting the block. An **amendment** such as
+`attn.num_heads = 4` changes one setting and keeps the rest: it means
 `attn = attn(num_heads=4)`.
 
 ## 2. Write a recipe
@@ -60,9 +59,9 @@ $ bux check mine/laptop_recipe.bux
 a module: it defines data, optimizer, schedule, seq_len, batch, steps, log, eval, checkpoint, and no model
 ```
 
-`examples/experiments/recipes/fineweb_wsd.bux` is a real one: an 80/20 mix of
-FineWeb-Edu and Stack-Edu in Llama 3's tokens, AdamW, a WSD schedule over a budget of
-10B tokens, evaluation and checkpoints. Swap `use laptop_recipe` for
+For a full-size recipe, see `examples/experiments/recipes/fineweb_wsd.bux`: an 80/20
+mix of FineWeb-Edu and Stack-Edu in Llama 3's tokens, AdamW, a WSD schedule over a
+budget of 10B tokens, evaluation and checkpoints. Swap `use laptop_recipe` for
 `use fineweb_wsd` once you have its data ([Your own data](your-own-data.md)).
 
 ## 3. Say what to vary
@@ -87,8 +86,8 @@ optimizer.lr      = 1e-3 | 3e-3
 The first block scales Llama 3 8B down: four blocks of width 128, a smaller MLP, a
 tied head. The last three lines are the experiment:
 
-- `|` separates **alternatives**, and each `|` as written is an axis of the sweep.
-  The axes cross, so this is 3 × 2 = 6 runs.
+- `|` separates **alternatives**. Each setting written with `|` is an axis of the
+  sweep, and the axes cross, so this is 3 × 2 = 6 runs.
 - `mha:`, `gqa:` and `mqa:` are **labels**. They name the alternatives, and the runs
   that take them.
 
@@ -102,9 +101,9 @@ data=synthetic()
 sweep: 6 runs over attn.num_kv_heads (mha | gqa | mqa) × optimizer.lr (1e-3 | 3e-3)
 ```
 
-`bux check` checks every alternative once, with the others at their first, and
-reports the first run. `bux fmt` prints every run as a file of its own, with nothing
-used and nothing to vary, which shows what each one inherited:
+`bux check` checks every alternative once, holding the other axes at their first
+alternative, and reports the first run. `bux fmt` prints every run as a standalone
+file, with no `use` and no alternatives, which shows what each run inherited:
 
 ```console
 $ bux fmt mine/ablation.bux
@@ -134,8 +133,8 @@ log = log(every=50)
 ...
 ```
 
-The attention kept llama3_8b's RoPE base and the norm its epsilon; only what the file
-says changed.
+The attention kept llama3_8b's RoPE base and the norm kept its epsilon: only what
+the file says changed.
 
 ## 4. Plan it
 
@@ -151,15 +150,16 @@ b42eb5ba19  804k    307k    0.4        5.21M      1     3.07MiB     6.13MiB    0
 f355634194  771k    307k    0.4        5.02M      1     2.94MiB     5.88MiB    0%      ablation[mqa, optimizer.lr=3e-3]
 ```
 
-The runs are in grid order, the first axis written varying slowest. Each is named
-for the file and what it took: a labeled alternative by its label, an unlabeled one
-by its setting and value. Fewer key and value heads make fewer parameters and FLOPs.
+The runs are in grid order, with the first axis varying slowest. Each run is named
+after the file and the alternatives it took: a labeled alternative by its label, an
+unlabeled one by its setting and value. Fewer key and value heads mean fewer
+parameters and FLOPs.
 
 ## 5. Launch it
 
 `bux launch` trains every run of the sweep that is not done yet. On a machine with
-GPUs it trains them side by side, each on the GPUs its mesh needs; with none, one at
-a time:
+GPUs, it trains them side by side, each on the GPUs its mesh needs. Without GPUs, it
+trains them one at a time:
 
 ```console
 $ bux launch mine/ablation.bux
@@ -183,10 +183,10 @@ done   300/300  6.2361  6.2444     ablation[mqa, optimizer.lr=1e-3]
 done   300/300  6.2363  6.2437     ablation[mqa, optimizer.lr=3e-3]
 ```
 
-The table at the end has each run's state, its step, and its latest loss and eval
-loss. Stop the launcher at any point (Ctrl-C) and launch it again: the runs that are
-done stay done, a stopped one resumes from its checkpoint, and the rest start. A run
-that fails leaves the others training.
+The closing table has each run's state, its step, and its latest loss and eval loss.
+Stop the launcher at any point (Ctrl-C) and launch it again: finished runs stay
+done, a stopped run resumes from its checkpoint, and the rest start. A run that
+fails does not stop the others.
 
 :::{note}
 On random tokens every run ends at log 512 ≈ 6.24, and the differences are noise.
@@ -194,8 +194,9 @@ The point here is the mechanics; with real data
 ([Your own data](your-own-data.md)) the same file compares the attentions.
 :::
 
-To train only some of the runs, `--only TEXT` keeps those whose name has `TEXT`, and
-`--index N` the run at `N` in the plan's order, from 0, as an array job's task does:
+To train only some of the runs, `--only TEXT` keeps the runs whose name contains
+`TEXT`. `--index N` keeps the run at position `N` of the plan, counting from 0, which
+is how an array job gives each task one run:
 
 ```sh
 bux launch mine/ablation.bux --only mqa      # the two MQA runs
@@ -204,7 +205,7 @@ bux launch mine/ablation.bux --index 3       # ablation[gqa, optimizer.lr=3e-3]
 
 ## 6. Compare the runs
 
-Each run has its own directory, `runs/<name>-<id>/`, with its `run.json` and its
+Each run has its own directory, `runs/<name>-<id>/`, with its `run.json` and
 `metrics.jsonl`:
 
 ```console
@@ -239,12 +240,12 @@ ablation[mqa, optimizer.lr=1e-3]    final eval loss 6.2444
 ablation[mqa, optimizer.lr=3e-3]    final eval loss 6.2437
 ```
 
-Every line also has `tokens` and `tokens_per_s`, so the same loop plots loss against
-tokens or compares speeds.
+Every line also has `tokens` and `tokens_per_s`, so the same loop can plot loss
+against tokens or compare speeds.
 
 ## 7. Tie settings together with labels
 
-Alternatives with the **same labels** are one axis: they are picked together, not
+Alternatives with the **same labels** form one axis: they are picked together, not
 crossed. A width sweep with a learning rate for each width is three runs, not nine.
 Create `mine/widths.bux`:
 
@@ -278,8 +279,8 @@ id          params  tokens  tok/param  flops/tok  gpus  params/gpu  optim/gpu  b
 46db229743  1.72M   307k    0.2        10.9M      1     6.57MiB     13.1MiB    0%      widths[l]
 ```
 
-Alternatives that share some labels but not all are an error, as a forgotten one
-would be:
+Alternatives that share some labels but not all are an error, so a forgotten label
+does not silently cross the axes:
 
 ```console
 $ bux check mine/widths.bux 'optimizer.lr = s: 4e-3 | m: 3e-3'
@@ -292,16 +293,16 @@ error: these alternatives share some labels with others, but not all: m, s again
 ```
 
 :::{tip}
-`name.field` reads a setting back, but as written in the definition the amendment
+`name.field` reads a setting back, but from the definition that the amendment
 replaces. In `widths.bux`, `attn.num_kv_heads = attn.num_heads // 2` would read
-llama3_8b's 32 heads, not `d_model // 32`; write both in terms of `d_model`, as above.
+llama3_8b's 32 heads, not `d_model // 32`. Write both in terms of `d_model`, as above.
 :::
 
 ## 8. Sweep the wiring
 
-`|` works anywhere a value or a block does, so the architecture itself is a setting
-like any other. Cross the ablation with two block shapes from the command line,
-pre-norm and a parallel block:
+`|` works anywhere a value or a block does, so the architecture itself can be swept
+like any other setting. From the command line, cross the ablation with two block
+shapes, pre-norm and a parallel block:
 
 ```console
 $ bux check mine/ablation.bux 'block = pre: [norm attn] [norm ffn] | par: [norm (attn + ffn)]'
@@ -309,21 +310,25 @@ $ bux check mine/ablation.bux 'block = pre: [norm attn] [norm ffn] | par: [norm 
 sweep: 12 runs over attn.num_kv_heads (mha | gqa | mqa) × optimizer.lr (1e-3 | 3e-3) × block (pre | par)
 ```
 
-The command line takes the same statements a file does, so `use`, amendments, the
-command line and alternatives are one mechanism: each gives a name another
-definition, and everything written in terms of that name follows.
+The command line takes the same statements a file does. `use`, amendments, the
+command line and alternatives are one mechanism: each gives a name a new definition,
+and everything written in terms of that name follows
+({ref}`Concepts <concepts-one-mechanism>`).
 
 ## What you learned
 
 | you wrote                        | it means                                          |
 |----------------------------------|---------------------------------------------------|
-| `use llama3_8b`                  | its definitions, found by name, under yours        |
+| `use llama3_8b`                  | its definitions, found by name, overridden by yours |
 | `attn.num_heads = 4`             | `attn = attn(num_heads=4)`, everywhere `attn` is used |
 | `a \| b \| c`                    | an axis of three runs, crossed with the others     |
 | `s: a \| m: b` twice             | one axis: the labels pick them together            |
-| `bux plan`, `bux launch`         | the runs and their sizes; train what is left of them |
+| `bux plan`, `bux launch`         | list the runs and their sizes; train the ones not done |
 
-Next, [your own data](your-own-data.md) replaces the random tokens with text that can
-be learned. See [Modules](../language/modules.md) and [Sweeps](../language/sweeps.md)
-for the rules, and [Launching](../training/launching.md) for sweeps on GPUs, array
-jobs and clusters.
+## Next steps
+
+- [Your own data](your-own-data.md): replace the random tokens with text that can be
+  learned.
+- [Modules](../language/modules.md) and [Sweeps](../language/sweeps.md): the rules
+  behind `use`, amendments, alternatives and labels.
+- [Launching](../training/launching.md): sweeps on GPUs, array jobs and clusters.

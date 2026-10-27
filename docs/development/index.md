@@ -1,8 +1,8 @@
 # Development
 
 How to work on bux itself: set it up, run the checks CI runs, find your way around the
-code, and keep the documentation in step with it. bux is a research tool, and it is
-meant to be changed: if something is hard to replace, that is a bug.
+code, and keep the documentation in step with it. bux is meant to be changed: if
+something is hard to replace, that is a bug.
 
 ## Setting up
 
@@ -27,16 +27,16 @@ uv sync          # Python 3.14, the dev tools and the docs' Sphinx
 | `make docs` | the documentation, as Read the Docs builds it: any warning fails it |
 | `make` | all four |
 
-The tests run every call with its arrays checked against their annotations
-(`tests/conftest.py` installs jaxtyping's import hook with beartype), so an array of
-the wrong dtype or shape fails where it goes in. `tests/test_typing.py` checks that
+The tests check every call's arrays against their annotations (`tests/conftest.py`
+installs jaxtyping's import hook with beartype), so an array of the wrong dtype or
+shape fails where it goes in. `tests/test_typing.py` checks that
 every array is annotated: write `Float[Array, "b t d"]`, not `jax.Array`. Every
 function says what it takes and returns (ruff's `ANN` rules).
 
 The whole suite takes a while on a laptop; while you work, run the files that cover
-what you changed, `uv run pytest tests/test_lang.py -q`. CI splits it over six
-runners by a hash of each test's id: `BUX_SHARD=2/6 make test` runs the third one's
-share ([environment variables](../reference/environment.md#bux)).
+what you changed, such as `uv run pytest tests/test_lang.py -q`. CI splits the suite
+over six runners by a hash of each test's id: `BUX_SHARD=2/6 make test` runs the
+third runner's share ([environment variables](../reference/environment.md#bux)).
 
 ## The code
 
@@ -79,7 +79,7 @@ the Makefile's `sphinx-build` command to rebuild everything.
 
 Much of the reference is generated from the code before every build, by
 `docs/_ext/bux_sphinx`, so it cannot fall out of date. Never edit the output; change
-its source:
+its source instead:
 
 | Page | Generated from |
 |------|----------------|
@@ -133,7 +133,31 @@ def lr_schedule(lr: float, multiplier: Schedule) -> Schedule:
   path, `[Resuming](../training/launching.md#resuming)`.
 - A new page goes in its section's `index.md` toctree.
 - Lead with what a page is for and an example; put measurements after the usage,
-  with the hardware and setup they were taken on.
+  with the hardware, setup and date they were taken on.
+
+(docs-voice)=
+### Voice
+
+Write like the docs of a mature project: confident, concrete, and quick to the
+point. Second person, present tense, active voice.
+
+- **Lead with the payoff.** A page opens with what it lets the reader do and when
+  they need it, then an example, then details, reference tables, and measurements
+  last.
+- **One idea per sentence.** Split comma-chains and nested "which" clauses into
+  sentences, lists or tables.
+- **Plain English over shorthand.** "8 rows per GPU", not "8 rows a GPU"; "40,769
+  for Megatron-Bridge", not "Megatron-Bridge's 40,769"; "every suite except X", not
+  "every suite but X".
+- **Say it once.** A concept, caveat or table lives on the page that owns it; other
+  pages link to it.
+- **No lab notebook.** Guides carry what a user needs: what a feature does, how to
+  use it, its defaults, constraints and errors, and the measurements behind a
+  recommendation. Development history (branches, commit hashes, before/after of an
+  internal change) belongs in git, and investigation logs in a short
+  "What doesn't help" list at most.
+- **Precise and real.** Show real commands with their real output, state every
+  default, and never write a number you didn't measure.
 
 (keeping-docs-in-sync)=
 ### Keeping the docs in sync

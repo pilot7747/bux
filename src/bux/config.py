@@ -312,9 +312,9 @@ class MoEConfig(Config):
 # --- Token mixers ---------------------------------------------------------------
 # Layers that mix information across positions, all causal: softmax attention
 # (`gqa`, `mla`, `csa`), linear attention with a matrix-valued state (`gla`,
-# `deltanet`, `gdn`, `kda`, `lightning`, `rwkv7`), state space models (`mamba`,
-# `mamba2`) and short causal convolutions (`conv`, `short_conv`). In a packed row,
-# each sees its own document alone.
+# `deltanet`, `gdn`, `kda`, `gdn2`, `lightning`, `rwkv7`), state space models
+# (`mamba`, `mamba2`) and short causal convolutions (`conv`, `short_conv`). In a
+# packed row, each sees its own document alone.
 
 
 class AttentionConfig(Config):
@@ -977,8 +977,8 @@ class FanInitConfig(InitConfig):
     each of a stack of experts' matrices has its own. An embedding table's fans are
     both its width, as `flax.nnx.Embed`'s are. ``fan_in(scale=1 / 3,
     distribution=uniform)`` is PyTorch's ``nn.Linear``'s init, and
-    ``fan_in(embed=fan_in(distribution=gaussian))`` how bux started every weight
-    matrix before ``normal`` (but routed experts, then sqrt(E) times smaller)."""
+    ``fan_in(embed=fan_in(distribution=gaussian))`` is LeCun's fan-in on every
+    weight matrix."""
 
     type: Literal["fan_in", "fan_out", "fan_avg"]
     scale: Annotated[float, Field(gt=0)] = 1.0  # The variance times the fan.
