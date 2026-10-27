@@ -312,11 +312,7 @@ def fake_wandb(monkeypatch) -> types.SimpleNamespace:
         calls.init.append(kwargs)
         return Run()
 
-    ids = itertools.count()
-
     class Wandb(types.ModuleType):
-        util = types.SimpleNamespace(generate_id=lambda: f"id{next(ids)}")
-
         @staticmethod
         def init(**kwargs):
             return init(**kwargs)
@@ -352,7 +348,8 @@ def test_wandb_logs_a_run_s_metrics_and_resumes_the_w_b_run_it_started(
     assert calls.logged[1][1]["act/hist/attn.00"][0] == "histogram"
     Wandb(WandbConfig(), run, tmp_path, start=10)  # resumes the W&B run it started
     Wandb(WandbConfig(), run, tmp_path, start=0)  # a fresh run starts its own
-    assert [c["id"] for c in calls.init] == ["id0", "id0", "id1"]
+    ids = [c["id"] for c in calls.init]
+    assert ids[0] == ids[1] != ids[2] and all(len(i) == 8 for i in ids)
 
 
 def events(folder) -> list:
