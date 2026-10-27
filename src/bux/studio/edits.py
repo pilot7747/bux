@@ -287,7 +287,7 @@ def _remove_arg(f: File, site: Site) -> list[Splice]:
         st = statement_of(f, site.arg.span)
         assert st is not None
         return [_remove_statement(f.own, st)]
-    return _remove_args(f.source, call, [site.arg])
+    return _remove_args(f.own, call, [site.arg])
 
 
 def _arg_span(source: str, arg: ast.Arg) -> Span:
@@ -320,7 +320,9 @@ def _cut(
 ) -> list[Splice]:
     """Remove the items `i` to `j` of a list written at `spans`, and a separator beside
     them, `sep`: on one line, the blanks to a neighbor; on lines of their own, those
-    lines. A comment goes with the item whose line it ends."""
+    lines. A comment goes with the item whose line it ends. `source` is the file's
+    own text (`File.own`), which ends where its last line does: the program's goes
+    on, past a newline, into the modules it uses."""
     first, last = spans[i], spans[j]
     before = spans[i - 1].end if i > 0 else None
     after = spans[j + 1].start if j + 1 < len(spans) else None
@@ -680,7 +682,7 @@ def _separator(source: str, seq: ast.Seq, expr: ast.Expr, after: bool) -> str:
 
 def _delete(f: File, op: dict) -> list[Splice]:
     found = expression(f, str(_field(op, "node")))
-    expr, parent, source = found.expr, found.parent, f.source
+    expr, parent, source = found.expr, found.parent, f.own
     if isinstance(parent, ast.Seq):
         spans = [extent(source, item) for item in parent.items]
         i = next(k for k, item in enumerate(parent.items) if item is expr)
@@ -834,7 +836,7 @@ def _drop_unknown(f: File, call: ast.Call, known: set[str]) -> list[Splice]:
             for arg in gone
             if (st := statement_of(f, arg.span)) is not None
         ]
-    return _remove_args(f.source, call, gone)
+    return _remove_args(f.own, call, gone)
 
 
 # --- axis -------------------------------------------------------------------------------
@@ -862,13 +864,13 @@ def _axis(f: File, op: dict) -> list[Splice]:
         return _end_sweep(f, found, texts[0])
     if any(labels) and not all(labels):
         raise EditError("label every alternative or none of them")
-    return _rewrite(f.source, found.expr, texts)
+    return _rewrite(f.own, found.expr, texts)
 
 
 def _end_sweep(f: File, found: Located, text: str) -> list[Splice]:
     """Replace the alternatives at `found` with the one `text`; one of them kept as
     it is keeps the comments it has, and so do its brackets."""
-    alt, source = found.expr, f.source
+    alt, source = found.expr, f.own
     assert isinstance(alt, ast.Alt)
     m = _LABELED.match(text)
     new = _snippet(m.group(2) if m else text)
