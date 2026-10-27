@@ -998,6 +998,11 @@ class _Range(Config):
             raise ValueError("low must be less than high")
         return self
 
+    def _rounded(self, x: float) -> float:
+        """Return `x` to `DIGITS` significant digits, but within the bounds."""
+        low, high = getattr(self, "low"), getattr(self, "high")  # noqa: B009
+        return min(max(significant(x), low), high)
+
 
 class UniformConfig(_Range):
     """A dimension of a search: a number between `low` and `high`, uniformly, as
@@ -1010,7 +1015,7 @@ class UniformConfig(_Range):
 
     def value(self, u: float) -> float:
         """Return the value a fraction `u` of the way from `low` to `high`."""
-        return significant(self.low + u * (self.high - self.low))
+        return self._rounded(self.low + u * (self.high - self.low))
 
     def unit(self, x: float) -> float:
         """Return how far `x` is from `low` to `high`, as a fraction: `value`'s inverse."""
@@ -1028,7 +1033,7 @@ class LogUniformConfig(_Range):
 
     def value(self, u: float) -> float:
         """Return the value a fraction `u` of the way from `low` to `high`, in logs."""
-        return significant(self.low * (self.high / self.low) ** u)
+        return self._rounded(self.low * (self.high / self.low) ** u)
 
     def unit(self, x: float) -> float:
         """Return how far `x` is from `low` to `high` in logs: `value`'s inverse."""
@@ -1213,7 +1218,8 @@ class SearchConfig(Config):
     parallel: Positive | None = None
     # Short runs first, and only the best trained to the end; none: every trial all.
     halving: HalvingConfig | None = None
-    seed: int = 0  # of the proposals, not of the runs, which keep the run's own
+    # Of the proposals, from 0, not of the runs, which keep the run's own.
+    seed: Annotated[int, Field(ge=0)] = 0
 
 
 class Term(Config):

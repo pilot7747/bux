@@ -7,7 +7,7 @@ first option, and an axis inside an option is met only once that option is picke
 so `traced` traces again until the axes it meets stop changing.
 """
 
-from collections.abc import Mapping
+from collections.abc import Iterable, Mapping
 
 from bux.lang.compiler import Axis, Trace, trace
 from bux.lang.syntax import Span
@@ -18,9 +18,21 @@ type Choices = dict[Span | frozenset[str], int | str]
 def axis_id(axis: Axis) -> str:
     """Return how the page names `axis`: its sorted labels, ``gqa|mha|mqa``, or where
     it is and its options as written, ``optimizer.lr=1e-3|3e-3``."""
-    if isinstance(axis.key, frozenset):
-        return "|".join(sorted(axis.key))
-    return f"{axis.where}={'|'.join(axis.options)}"
+    labels = axis.key if isinstance(axis.key, frozenset) else ()
+    return written_id(axis.where, labels, axis.options)
+
+
+def written_id(where: str, labels: Iterable[str], options: Iterable[str]) -> str:
+    """Return `axis_id` of alternatives written at `where`, by their labels if they
+    have them, else by their options as written."""
+    if labels := sorted(labels):
+        return "|".join(labels)
+    return f"{where}={'|'.join(options)}"
+
+
+def squeezed(source: str, span: Span) -> str:
+    """Return the text at `span`, its blanks squeezed as an axis's options are."""
+    return " ".join(source[span.start : span.end].split())
 
 
 def choices(axes: list[Axis], picks: Mapping[str, int]) -> Choices:

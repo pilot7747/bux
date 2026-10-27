@@ -34,6 +34,7 @@ from typing import Any, Literal
 from bux import config as cfg
 from bux.lang import ir
 from bux.lang.compiler import ACTIVATIONS, LAYERS, TYPES
+from bux.lang.printer import value_to_source
 from bux.lang.reference import activation_doc
 from bux.train.registry import Registry
 
@@ -241,6 +242,15 @@ def count(n: int) -> str:
 def many(n: int, unit: str) -> str:
     """Return `n` of `unit`, plural but for one: ``8 KV heads``, ``1 KV head``."""
     return f"{n:,} {unit}{'' if n == 1 else 's'}"
+
+
+def as_source(value: object) -> str:
+    """Return a setting's value as a file writes it, or as Python prints one that
+    the language has no syntax for."""
+    try:
+        return value_to_source(value)
+    except TypeError:
+        return repr(value)
 
 
 def _rope(rope: cfg.RoPEConfig | None) -> list[str]:

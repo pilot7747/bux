@@ -328,6 +328,8 @@ function inspectFromPanel(target) {
 
 /** Apply visual edit ops; resolves to an error message, or null when applied. */
 async function edit(ops) {
+  // The ops name nodes and axes of the drawing, which is of goodSource.
+  if (state.source !== state.goodSource) return "The drawing is of an earlier version of the code: fix its errors, or wait for it to redraw.";
   const sent = state.source;
   let reply;
   try {

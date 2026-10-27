@@ -175,6 +175,15 @@ def test_a_curriculums_phases():
     assert (f["title"], fields(f)["steps"]["written"]) == ("ramp", "20")
 
 
+def test_a_mix_of_data_inside_a_setting_is_a_field_of_text():
+    source = SMOKE.read_text() + "web = synthetic\ncode = synthetic\n"
+    source += 'eval = eval(name="mix", data=0.5 * web + 0.5 * code, every=10)\n'
+    f = inspect(source, {"setting": "eval"}, picks={}, path=str(SMOKE))
+    data = fields(f)["data"]
+    assert data["input"] == "text" and data["fields"] is None
+    assert data["written"] == "0.5 * web + 0.5 * code"
+
+
 def _layer_ids(f: File) -> list[str]:
     """Return the ids of the layers of `f`'s graph, one a place they are written."""
     found, seen = [], set()

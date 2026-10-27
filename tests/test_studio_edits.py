@@ -632,6 +632,20 @@ def test_an_axis_keeps_comments_and_nested_alternatives():
     )
 
 
+def test_the_last_line_of_a_file_that_uses_a_module_goes_without_a_final_newline(
+    tmp_path,
+):
+    (tmp_path / "base.bux").write_text(BASE)
+    path = str(tmp_path / "main.bux")
+    run = "use base\nnorm = rmsnorm\ndata = synthetic\noptimizer = adamw(lr=1e-3)\n"
+    run += "seq_len = 16\nbatch = 2\nsteps = 2\n"
+    model = run + "model = embed ->\n  norm ->\n  head"
+    assert on(model, delete("n.2"), path=path) == run + "model = embed ->\n  norm\n"
+    sweep = model + "\noptimizer.lr = 1e-3 |\n  3e-3 |\n  1e-2"
+    lr = axis("optimizer.lr=1e-3|3e-3|1e-2", "1e-3", "3e-3")
+    assert on(sweep, lr, path=path) == sweep.removesuffix(" |\n  1e-2") + "\n"
+
+
 # --- What an op means ------------------------------------------------------------------
 
 

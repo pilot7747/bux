@@ -103,10 +103,13 @@ editor's hover document it.
 - **Outside a search, a dimension takes its middle.** `bux check`, `bux plan`, `bux
   fmt` and `compile_runs` show the run halfway along each scale: the geometric mean
   of a `log_uniform`, the first option of a `choice`.
-- **A trial's values have three significant digits**, so its run is named for
-  exactly what it trains, and its `run.bux` compiles back to the same run:
+- **A trial's values have three significant digits**, but never past a bound, so
+  its run is named for exactly what it trains, and its `run.bux` compiles back to
+  the same run:
   `attention_search[mha, optimizer.lr=3.16e-4, optimizer.weight_decay=0.0712]`.
   A choice names it by its option's name, `block=par`, or as written, `ffn.activation=gelu`.
+  Two trials that take the same values, as trials of a few options must, are one
+  run, trained once.
 - **A dimension is named by where it is written**, as an unlabeled alternative is:
   `optimizer.lr`, or the name of a definition, `lr = log_uniform(1e-4, 1e-2)`,
   which other settings can then share: `optimizer = muon(lr=20 * lr, adam=adamw(lr=lr))`.
@@ -188,7 +191,7 @@ name in the `bux.search.methods.methods` registry
 model to every trial that has an objective. A trial still training, or with halving
 one trained only at a rung below the one they model, counts too: `gp` at its
 prediction for it (the kriging believer) and `tpe` among the worse (the constant
-liar), so trials that start together differ, and none is proposed twice.
+liar), so trials that start together differ.
 
 Which to use: the Deep Learning Tuning Playbook (Godbole et al., 2023) explores a new
 space with quasi-random search, which needs nothing of the trials' results and shows
@@ -299,7 +302,8 @@ and `seed`. So:
   `checkpoint` setting, and the method proposes the rest from all of them.
 - **More `trials` add trials** to the same search.
 - **Another space, method or seed is a search of its own**, in a directory of its
-  own; a trial at a point another search trained already is read from its run.
+  own; a trial at a point another search trained already is read from its run,
+  and one at a point another search is training waits for it.
 - **A trial that failed stays failed**, as information: its point is one to avoid.
   Delete its run's directory to try it again.
 - **The best trial is a file**: `bux train runs/<name>-search-<key>/best.bux` trains

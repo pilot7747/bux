@@ -103,7 +103,6 @@ class File:
         except BuxError as err:
             raise EditError(err.message) from None
         self.length = len(source)
-        self.path = path
 
     @property
     def source(self) -> str:
