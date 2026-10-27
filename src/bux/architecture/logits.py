@@ -216,10 +216,14 @@ def _others(
     logits: Float[Array, "*n vocab"], targets: Int[Array, "*n"]
 ) -> Float[Array, "*n"]:
     """Return the logsumexp of every logit but the target's, shifted by the largest of
-    all, the target's too, as a max that left it out would cost a mask."""
+    all, the target's too, as a max that left it out would cost a mask; -inf where
+    the target's margin underflows every other exp, whose log of 0 would make the
+    gradient NaN."""
     top = jax.lax.stop_gradient(jnp.max(logits, -1, keepdims=True))
     e = jnp.where(_is_target(logits, targets), 0, jnp.exp(logits - top))
-    return top[..., 0] + jnp.log(jnp.sum(e, -1))
+    total = jnp.sum(e, -1)
+    some = total > 0
+    return jnp.where(some, top[..., 0] + jnp.log(jnp.where(some, total, 1)), -jnp.inf)
 
 
 def _is_target(

@@ -157,6 +157,24 @@ def test_the_loss_and_its_gradient_hold_where_float32_rounds_the_targets_p_to_1(
 
 
 @pytest.mark.parametrize("loss", LOSSES)
+def test_the_gradients_are_0_where_every_other_logits_exp_underflows(loss):
+    # A margin of 120, past float32's exp(-104): the other logits' sum of exps is 0,
+    # whose log's gradient was NaN; the cross-entropy and the z-loss's are 0 there.
+    x = jnp.array([[[60.0, -60.0, -60.0]]])
+    head = logits.HeadOutput(x, logits.Projection(jnp.eye(3), None, None))
+    targets, weights = jnp.zeros((1, 1), jnp.int32), jnp.ones((1, 1))
+
+    def loss_of(x: Float[Array, "1 1 3"]) -> Float[Array, ""]:
+        sums = head._replace(hidden=x).sums(targets, weights, True)
+        return sums.ce + sums.z
+
+    with _use(ONE, loss):
+        value, grad = jax.jit(jax.value_and_grad(loss_of))(x)
+    np.testing.assert_allclose(value, 60.0**2, rtol=1e-6)
+    np.testing.assert_allclose(grad[0, 0], [120.0, 0.0, 0.0], atol=1e-6)
+
+
+@pytest.mark.parametrize("loss", LOSSES)
 @pytest.mark.parametrize("mesh", MESHES)
 @pytest.mark.parametrize("head", ["bias_softcap", "tied_bias_softcap"])
 def test_the_loss_split_over_devices_is_the_one_device_loss(
