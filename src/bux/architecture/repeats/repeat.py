@@ -25,7 +25,7 @@ from flax import nnx
 from jax.typing import DTypeLike
 
 from bux.architecture import observe, residual
-from bux.architecture.graph import Sequence, branches, build_node, names, run_branch
+from bux.architecture.graph import Sequence, branches, build_node, names, run_item
 from bux.architecture.precision import matmuls
 from bux.architecture.registry import Context, Stream, Taps
 from bux.architecture.repeats import pipelined, remat, stacked, tracing
@@ -68,8 +68,7 @@ def scan(body: ir.Node, times: int, ctx: Context) -> nnx.Module:
     passes = _passes(body, times, ctx)
     if scannable(passes):
         each = tracing.branches_of(body) if ctx.depth == 0 else 0
-        [is_branch] = branches((body,), ctx)
-        name = observe.item_name(body, is_branch)
+        [is_branch], [name] = branches((body,), ctx), names((body,), ctx)
         return Scanned(_stack(passes), len(passes), each, is_branch, name)
     bodies = (body,) * times
     return Passes(passes, branches(bodies, ctx), names(bodies, ctx))
@@ -81,14 +80,14 @@ def _passes(body: ir.Node, times: int, ctx: Context) -> list[nnx.Module]:
 
 class Passes(Sequence):
     """The passes of a repeat, run in a row, each traced as its pass
-    (``tracing.passes``), which the run's `remat(first=n)` counts. A pass that is a
-    branch outside any other runs as one (``graph.run_branch``)."""
+    (``tracing.passes``), which the run's `remat(first=n)` counts. A pass runs as an
+    item of a sequence does (``graph.run_item``)."""
 
     def __call__(self, x: Stream, taps: Taps) -> Stream:
         items = zip(self.items, self.branches, self.names, strict=True)
         for i, (item, branch, name) in enumerate(items):
             with tracing.passes(range(i, i + 1)):
-                x = run_branch(item, x, taps, name) if branch else item(x, taps)
+                x = run_item(item, branch, name, x, taps)
         return x
 
 
@@ -182,7 +181,8 @@ class Scanned(nnx.Module):
     def __call__(self, x: Stream, taps: Taps) -> Stream:
         """Run the passes on the stream x: scanned, a scan for each run of passes
         that trace alike, or pipelined."""
-        with observe.passes(self.branch_name()):
+        layer = None if self.is_branch else self.name  # a layer outside any branch
+        with observe.passes(self.branch_name()), observe.branch(layer):
             if self.rounds and pipeline.pipelined():
                 return self._pipelined(x, taps)
             return self._scanned(x, taps)
