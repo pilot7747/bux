@@ -33,7 +33,7 @@ from bux.lang.compiler import (
     check,
 )
 from bux.lang.syntax import BuxError, Span
-from bux.studio.picks import axis_id
+from bux.studio.picks import axis_id, squeezed
 from bux.studio.targets import (
     Count,
     EditError,
@@ -933,21 +933,17 @@ def _matched(source: str, alt: ast.Alt, texts: list[str]) -> list[int | None]:
     labels = alt.labels or (None,) * len(alt.options)
     known = []
     for label, o in zip(labels, alt.options, strict=True):
-        written = {_squeezed(source, s) for s in (o.span, extent(source, o))}
+        written = {squeezed(source, s) for s in (o.span, extent(source, o))}
         known.append({f"{label}: {t}" if label else t for t in written})
     found, used = [], set()
     for text in texts:
-        squeezed = " ".join(text.split())
+        blanks = " ".join(text.split())
         k = next(
-            (k for k, ks in enumerate(known) if k not in used and squeezed in ks), None
+            (k for k, ks in enumerate(known) if k not in used and blanks in ks), None
         )
         used.add(k)
         found.append(k)
     return found
-
-
-def _squeezed(source: str, span: Span) -> str:
-    return " ".join(source[span.start : span.end].split())
 
 
 def _add_options(source: str, spans: list[Span], k: int, texts: list[str]) -> Splice:

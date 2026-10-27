@@ -35,7 +35,7 @@ from bux.lang.compiler import (
 from bux.lang.printer import config_to_source
 from bux.lang.syntax import BuxError, Span
 from bux.studio import internals, palette, training
-from bux.studio.picks import axis_id, traced
+from bux.studio.picks import axis_id, squeezed, traced, written_id
 from bux.train import config as tcfg
 
 #: A JSON object, as the API sends it.
@@ -393,9 +393,7 @@ class _Alt:
 
     def id(self) -> str:
         """Return its axis's `axis_id`."""
-        if self.labels:
-            return "|".join(sorted(self.labels))
-        return f"{self.where}={'|'.join(self.texts)}"
+        return written_id(self.where, self.labels, self.texts)
 
     def written(self) -> list[str]:
         """Return its options as written, labeled ones with their label."""
@@ -416,13 +414,9 @@ def _alternatives(program: modules.Program) -> dict[Span, _Alt]:
     for st in _statements(program):
         for e in _exprs(st):
             if isinstance(e, ast.Alt):
-                texts = tuple(_squeezed(program.source, o.span) for o in e.options)
+                texts = tuple(squeezed(program.source, o.span) for o in e.options)
                 found[e.span] = _Alt(e.where, e.labels, texts)
     return found
-
-
-def _squeezed(source: str, span: Span) -> str:
-    return " ".join(source[span.start : span.end].split())
 
 
 def _live(axis: Axis, taken: set[str]) -> bool:

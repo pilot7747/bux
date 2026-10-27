@@ -19,7 +19,7 @@ from typing import Any
 from bux.lang import ir
 from bux.lang.compiler import TRAIN_SETTINGS, Trace, short
 from bux.lang.printer import config_to_source, value_to_source
-from bux.studio.palette import si
+from bux.studio.palette import as_source, si
 from bux.train import config as tcfg
 from bux.train import curriculum
 
@@ -201,7 +201,7 @@ def settings(t: Trace) -> list[Json]:
             found.append(
                 {
                     "name": field,
-                    "text": _source(getattr(train, field)),
+                    "text": as_source(getattr(train, field)),
                     "written": st is not None,
                     "group": group,
                     "origin": None if module is None else _stem(module),
@@ -212,13 +212,6 @@ def settings(t: Trace) -> list[Json]:
 
 def _stem(filename: str) -> str:
     return Path(filename).stem
-
-
-def _source(value: object) -> str:
-    try:
-        return value_to_source(value)
-    except TypeError:
-        return repr(value)
 
 
 # --- The schedule ----------------------------------------------------------------------
