@@ -186,7 +186,8 @@ def check(name: str, case: Case, context: int) -> bool:
         got_grads, got_aux = f(*split)
         ran = kernel(f, *split)
     shown = errors((got_aux, got_grads), (aux, grads))
-    wanted = "mosaic" if case.dk <= sparse.HEAD_DIMS else "xla"  # CSA's 512: XLA
+    widest = max(case.dk, case.dv)  # MLA's 192 and CSA's 512 run by XLA
+    wanted = "mosaic" if widest <= parallel.flash.TOKAMAX_HEAD_DIM else "xla"
     ok = max(shown) < TOLERANCE and ran == wanted
     print(
         f"context={context} {name:16} {ran:6} out, lse, grads "

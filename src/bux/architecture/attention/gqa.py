@@ -455,23 +455,6 @@ class Attention(SoftmaxAttention):
         return w * v + (1 - w) * v1
 
 
-def token_mask(
-    t: int, window: int | None, docs: Segments | None
-) -> Bool[Array, "*b t s"]:
-    """Return the causal mask of t queries over the t keys at their positions.
-
-    Args:
-        t: the positions, both the queries and the keys.
-        window: how many keys a query sees at most, itself among them; None for all.
-        docs: the documents packed into the rows, which no query looks across; None
-            when each row is one.
-
-    Returns:
-        Which keys each query sees, (t, s), or (b, t, s) given `docs`.
-    """
-    return causal_mask(t, window, None if docs is None else docs.ids)
-
-
 def require_xla(feature: str) -> None:
     """Raise unless the run's ``methods.attention`` is ``xla`` or ``auto``.
 
@@ -484,8 +467,7 @@ def require_xla(feature: str) -> None:
     Raises:
         NotImplementedError: under any other method.
     """
-    on = parallel.active()
-    name = on.methods.attention if on else "auto"
+    name = parallel.method_name("attention")
     if name not in ("xla", "auto"):
         raise NotImplementedError(
             f"methods.attention = {name} has no {feature}; only xla has"
@@ -618,7 +600,7 @@ class FullLogits(SoftmaxAttention):
         return index[:, None] - index[None, :]
 
     def _mask(self, docs: Segments | None, t: int) -> Bool[Array, "*b t s"]:
-        return token_mask(t, self.window, docs)
+        return causal_mask(t, self.window, None if docs is None else docs.ids)
 
 
 def indexer_config(
