@@ -1052,7 +1052,8 @@ class Trainer:
                 for (``Tokenizer.token_bytes``); None leaves `bpb` out.
 
         Returns:
-            Each metric's mean, by name; NaN for a mean of nothing.
+            Each metric's mean, by name; NaN for a mean of no targets, and none at
+            all for no batches.
 
         Example::
 
@@ -1151,6 +1152,8 @@ def _with_bytes(
 def _means(sums: Sequence[Mapping[str, Ratio]]) -> dict[str, float]:
     """Return each metric's sums added up over the batches, the first over the
     second: a mean over all of them. Reading them waits for each batch's step."""
+    if not sums:
+        return {}  # no batches, no metrics
     means = {}
     for name in sums[0]:
         total, count = (sum(float(s[name][i]) for s in sums) for i in (0, 1))

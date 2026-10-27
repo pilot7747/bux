@@ -973,6 +973,7 @@ def test_eval_launches_every_batch_before_it_reads_a_loss(monkeypatch):
     monkeypatch.setattr(trainer_module, "_means", read)
     assert set(trainer.evaluate([batch] * 3)) == {"loss"}
     assert events == ["launched"] * 3 + ["read"]
+    assert trainer.evaluate([]) == {}  # no batches, no means
 
 
 def test_held_out_sums_the_loss_over_targets_and_bits_over_their_bytes():
