@@ -170,13 +170,20 @@ Each tracker gets every metric and histogram, from the job's first process.
 
 **W&B** ({bux}`wandb`). Install it with `uv sync --extra wandb`, and log in
 (`wandb login`, or `WANDB_API_KEY`). Each run becomes a W&B run with the same name, in
-a group of its file's runs, with its settings and its sweep's `choices` as its config,
-so a sweep's runs group and filter by what they took. A run that resumes from a
-checkpoint goes on logging to the W&B run it started, whose id it keeps in its
-directory's `wandb_id`. That W&B run keeps the steps a crash logged past the
-checkpoint: W&B ignores a step below one it has, so the resumed run's own steps
-reach it only from there on. `mode="offline"` writes into the run's directory, for
-`wandb sync` later.
+a group of its file's runs, with its settings and its sweep's `choices` as its config.
+A run that resumes from a checkpoint goes on logging to the W&B run it started, whose
+id it keeps in its directory's `wandb_id`. That W&B run keeps the steps a crash logged
+past the checkpoint: W&B ignores a step below one it has, so the resumed run's own
+steps reach it only from there on. `mode="offline"` writes into the run's directory,
+for `wandb sync` later.
+
+The config's `axes` has what the run took on each axis of its sweep, by the axis's
+name: `{"variant": "rope", "d_model": "d768", "optimizer.lr": "2e-3"}`. An axis is
+named for the setting its first alternative is written at, so a sweep's runs group and
+filter by any one axis. The config also has `params`, and `active_params`: the
+parameters a token goes through, without the routed experts it skips. A run with an
+`objective` logs its value as `objective` at each eval that updates it, so W&B sorts
+runs by it.
 
 **TensorBoard** ({bux}`tensorboard`). Install it with `uv sync --extra tensorboard`.
 Event files go to the run's `tensorboard/`, and `tensorboard --logdir runs` shows every

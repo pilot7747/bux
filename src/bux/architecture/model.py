@@ -6,6 +6,7 @@ from jaxtyping import Array, Float, Int
 
 from bux import initializers
 from bux.architecture.common.segments import Segments
+from bux.architecture.experts.moe import MoE
 from bux.architecture.graph import build_node
 from bux.architecture.logits import HeadOutput
 from bux.architecture.registry import Context, Loss, Stream, Taps
@@ -142,3 +143,25 @@ def num_params(module: nnx.Module) -> int:
         two blocks in `bux.architecture`'s example.
     """
     return sum(x.size for x in jax.tree.leaves(nnx.state(module, nnx.Param)))
+
+
+def active_params(module: nnx.Module) -> int:
+    """Return how many parameters a token goes through: `num_params`, less the
+    routed experts that each MoE (`bux.architecture.experts.moe.MoE`) skips,
+    ``num_experts - top_k`` of every ``num_experts``.
+
+    Example:
+        A model whose MoE takes 2 of 8 experts counts its router, its shared
+        experts and a quarter of its routed experts.
+    """
+    idle = 0.0
+    for _, node in nnx.iter_graph(module):
+        if isinstance(node, MoE):
+            c = node.config
+            stacks = (getattr(node, name) for name in _ROUTED)
+            routed = sum(s.get_value().size for s in stacks if s is not None)
+            idle += routed * (c.num_experts - c.top_k) / c.num_experts
+    return num_params(module) - round(idle)
+
+
+_ROUTED = ("up", "down", "up_bias", "down_bias")  # an MoE's stacks of routed experts

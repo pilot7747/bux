@@ -76,6 +76,7 @@ def test_a_trial_takes_its_values_is_named_for_them_and_prints_back_the_same():
     assert again.id == run.id
     short = space.trial({"optimizer.lr": 3e-3}, steps=3)
     assert short.name.endswith("weight_decay=0.1, steps=3]") and short.train.steps == 3
+    assert short.axes == ("optimizer.lr", "optimizer.weight_decay", "steps")
 
 
 def test_a_choice_picks_any_value_or_block_and_names_its_trials_by_its_option():
@@ -114,6 +115,7 @@ def test_each_run_of_a_sweep_is_a_search_of_its_own():
     assert [s.run.name for s in found] == ["tune[mha]", "tune[mqa]"]
     trial = found[1].trial({"optimizer.lr": 2e-3})
     assert trial.name == "tune[mqa, optimizer.lr=2e-3]"
+    assert trial.axes == ("attn.num_kv_heads", "optimizer.lr")
 
 
 def test_a_macros_dimension_takes_one_value_at_every_call():

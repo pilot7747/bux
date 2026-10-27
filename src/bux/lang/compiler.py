@@ -2307,8 +2307,11 @@ def _run(f: _Explored, filename: str, more: tuple[str, ...] = ()) -> ir.Run:
     """Return the run that `f` compiled to, named for the alternatives it took and
     for `more`."""
     parts = tuple(axis.part(f.choices[axis.key]) for axis in f.reached) + more
+    axes = tuple(axis.where for axis in f.reached) + tuple(
+        part.partition("=")[0] for part in more
+    )
     name = _run_name(filename, parts)
-    return ir.Run(name=name, arch=f.arch, train=f.train, choices=parts)
+    return ir.Run(name=name, arch=f.arch, train=f.train, choices=parts, axes=axes)
 
 
 def _explore(
