@@ -100,7 +100,7 @@ by XLA instead, with the same values up to rounding. Outside a GPU, and inside
 | `fused_delta` | cudnn-frontend installed; a B200 or B300 (SM 10.0, 10.3); heads of 64 or 128 dims; bfloat16 or float16; `methods.recurrence = scan`; one decay a head (GDN, DeltaNet) or KDA with `gate_lower_bound` of -5 or more | `pallas_delta` for KDA, else `chunkwise` |
 | `pallas_delta` | KDA (a decay per key channel); heads of 64 or 128 dims; bfloat16 or float16; `methods.recurrence = scan` | `chunkwise` |
 | `pallas_conv` | q, k and v side by side (`CausalConv.side_by_side`); each device's positions, and the channels, in blocks of a power of two, 16 or more; a mesh that splits nothing but the rows | XLA's form of the backward; off a GPU, autodiff's |
-| `fused_delta`'s GDN-2 (GLA, Lightning) | cudnn-frontend's develop build, which the lock pins on Linux; a B200 or B300; heads of 64 or 128 dims; bfloat16; `methods.recurrence = scan` | `chunkwise` |
+| `fused_delta`'s GDN-2 (GLA, Lightning) | cudnn-frontend 1.32 or later; a B200 or B300; heads of 64 or 128 dims; bfloat16; `methods.recurrence = scan` | `chunkwise` |
 | `fused_delta`'s GDN-2 for Gated DeltaNet-2 | as for GLA and Lightning, and a `gate_lower_bound` of -5 or more | `chunkwise` |
 | `indexer_cudnn`'s top-k | a B200 or B300 with cudnn-frontend; up to 2048 picks a query | XLA counts the k-th highest score's bits |
 | `indexer_cudnn`'s loss | a B200 or B300 with cudnn-frontend; an indexer of 32 or 64 heads of 128 dims in bfloat16 (DSA's 64), its picks in multiples of 128 up to 2048 | `scoring`'s Pallas kernels, for heads and dims of powers of two; else XLA |
@@ -124,8 +124,8 @@ a gate of -20 a position took 45 ms a layer, not 3.7. GLA's own gate,
 $\log \sigma(f) / 16$, needs $f$ near -83 through a whole tile for that, and
 Lightning's decays never reach it.
 
-The lock pins cudnn-frontend's develop build (1.32.0.dev76547535) in place of 1.31.0,
-as a wheel from its GitHub release, on Linux for x86-64 and ARM.
+The `cuda` extra asks for cudnn-frontend 1.32 or later, the first release with
+GDN-2's kernel and the DSA indexer's deterministic top-k.
 
 ## Debugging with kernels off
 

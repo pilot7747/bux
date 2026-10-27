@@ -17,7 +17,7 @@ tree before, the DSL as the interface, tests on 8 fake CPU devices.
 | packed documents, windows, MLA and soft caps in softmax attention | FlashAttention-4's sm100 kernels (`parallel/fa4.py`, CuTe DSL by `cutlass.jax`), first in `auto` for rows of documents | 1.3B, rows of 4096: +5.1%; of 16384: +21%; MLA +4.7%; gpt-oss's attention +26% |
 | the DSA indexer's top-k and its loss | cuDNN's DSA kernels (`attention/indexer_cudnn.py`): a radix top-k, bitwise XLA's; the picks' scores recomputed, their backward by its GEMM | the DSA 1B 1.46-2.09x, 4k to 64k |
 | CSA's attention (DeepSeek-V4) | cuDNN's DSA sparse attention, forward and backward, and the target at the picks (`attention/sparse_cudnn.py`) | V4.1-Flash shrunk to a GPU 3.70k → 31.7k tok/s at 4k; 16k and 32k fit |
-| GLA and Lightning | cuDNN's Frost GDN-2 at a step of 0 (`fused_delta`), cudnn-frontend's develop build | GLA hybrid +53% (a node +39%), Lightning +5% |
+| GLA and Lightning | cuDNN's Frost GDN-2 at a step of 0 (`fused_delta`), cudnn-frontend 1.32 | GLA hybrid +53% (a node +39%), Lightning +5% |
 | RWKV-7 | its chunks take a pair's decay through the chunk's middle, its decay being bounded (`recurrence(floor=...)`) | +94%, a node +95% |
 | MoE experts' ReLU², clamped GeGLU, SiTU-GLU in MXFP8 | cuDNN's CuTe DSL grouped GEMMs with the activation in the epilogue, as SwiGLU was (`grouped_glu`) | Nemotron 3 Nano +5.1% in 14 GiB less; expert layers 1.04-1.31x |
 | a short conv's backward | a Pallas kernel for q, k and v (`layers/pallas_conv.py`), XLA from dy shifted ahead elsewhere | Mamba-2 hybrid +4.3%, GDN +2.7%, KDA +1.5-2.1% |
@@ -27,8 +27,9 @@ Also: mHC's single-pass read kept the stream in float32 (a float32 one-hot), so 
 DeepSeek-V4.1-Flash every projection multiplied in float32 and no 16-bit kernel ran;
 fixed.
 
-Dependencies: cudnn-frontend's develop build 1.32.0.dev76547535 (GDN-2, the
-deterministic top-k), pinned by URL to its GitHub release; flash-attn-4 4.0.0b36; and
+Dependencies: cudnn-frontend 1.32 (GDN-2, the deterministic top-k), first pinned to a
+develop build by its GitHub release's URL, which broke when NVIDIA released 1.32.0 and
+deleted the develop tags; flash-attn-4 4.0.0b36; and
 PyTorch's CPU build, which FlashAttention-4's and cuDNN's DSA modules import. With
 torch imported, cudnn-frontend's API classes ask torch whether CUDA is there, which its
 CPU build denies: build their kernels directly, as `grouped_cudnn` does.
@@ -65,8 +66,6 @@ in 214.5 GiB.
 
 ## Left open
 
-- cudnn-frontend's develop tags are deleted after 14 newer ones: move the pin to 1.32.0
-  when it is released, or mirror the wheel.
 - An RWKV-7 kernel (fla's takes 6.7 ms a layer against the chunks' 15.5) and
   Lightning's (2.1 against GDN-2's 3.5).
 - A Python-free launcher for cuDNN's graph kernels (GDN, GDN-2, Mamba-2), whose
