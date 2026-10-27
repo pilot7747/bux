@@ -1,6 +1,6 @@
 # Quickstart
 
-In ten minutes on a laptop, with no GPU: check a model, draw it, train it, read what
+Ten minutes, a laptop, no GPU. You will check a model, draw it, train it, read what
 the run wrote, change a setting from the command line, and plan a sweep. Every output
 below is real, from a laptop's CPU.
 
@@ -15,8 +15,8 @@ source .venv/bin/activate      # or prefix every command with `uv run`
 
 ## 1. Read a run
 
-`examples/experiments/smoke.bux` is a whole experiment: a tiny Llama-style model and
-how to train it, on random tokens.
+`examples/experiments/smoke.bux` is a complete experiment: a tiny Llama-style model,
+and how to train it on random tokens.
 
 ```bux
 d_model    = 64
@@ -38,8 +38,8 @@ steps     = 50
 
 The first half is the model. `[f]` means `x + f(x)`, a residual branch, so
 `[norm attn] [norm ffn]` is a pre-norm Transformer block and `block^2` is two of
-them. The second half says how to train it: the data, the optimizer, the learning
-rate schedule, and the shape of the batches.
+them. The second half is the training: the data, the optimizer, the learning rate
+schedule, and the shape of the batches.
 
 ## 2. Check it
 
@@ -54,8 +54,8 @@ optimizer=adamw(lr=0.003) schedule=wsd(warmup=10)
 data=synthetic()
 ```
 
-A mistake is reported at the line that made it, with a suggestion; see
-[Reading errors](../tutorials/first-architecture.md#7-read-the-errors).
+A mistake is reported at the line that made it, usually with a suggestion; see
+[Read the errors](../tutorials/first-architecture.md#7-read-the-errors).
 
 ## 3. Draw it
 
@@ -98,22 +98,25 @@ smoke step 40/50  loss 6.2478  lr 3.00e-03  grad 0.440  76,711 tok/s  ...
 smoke step 50/50  loss 6.2633  lr 0.00e+00  grad 0.418  75,557 tok/s  ...
 ```
 
-The first lines say where the run goes, its size and how often it logs. Then a line
-every 10 steps has the loss, the learning rate (the schedule's warmup, its peak, then
-its cooldown to 0), the gradient's norm before clipping, and the tokens a second. The
-first of them includes the time to compile the step. The tokens are random, so there
-is nothing to learn: the loss stays near log 512 = 6.24, a uniform guess's, where the
-model starts, its weights small ([Initialization](../architectures/initialization.md)).
+The header says where the run goes, how big it is and how often it logs. Then every
+10 steps a line shows the loss, the learning rate (warmup, peak, then cooldown to 0),
+the gradient norm before clipping, and the throughput. The first of these lines
+includes compiling the step, hence its low tokens/s.
+
+The tokens are random, so there is nothing to learn: the loss stays near
+ln 512 ≈ 6.24, the loss of a uniform guess. That is also where a freshly initialized
+model starts, because its weights are small
+([Initialization](../architectures/initialization.md)).
 
 :::{note}
-The first line, `remat=auto: none`, says which rematerialization policy the step
-chose as it compiled: `none`, which keeps every activation, because the step fits in
+The line `remat=auto: none in 1s` reports the rematerialization policy the step
+picked as it compiled: `none` keeps every activation, because the step fits in
 memory ([Remat](../parallelism/remat.md)).
 :::
 
 ## 5. Look at the run
 
-The run wrote a directory under `runs/`, named for the run and its id:
+The run wrote a directory under `runs/`, named after the run and its id:
 
 ```console
 $ ls runs/smoke-5a4f0f7d85
@@ -131,13 +134,13 @@ $ head -2 runs/smoke-5a4f0f7d85/metrics.jsonl
 
 The id, `5a4f0f7d85`, is a hash of what the run computes. Train the same file again
 and it lands in the same directory; change what it computes and it gets a new one.
-With a `checkpoint` setting, a run started again resumes from its latest checkpoint
+With a `checkpoint` setting, restarting a run resumes it from its latest checkpoint
 ([Train on a laptop](../tutorials/train-on-a-laptop.md)).
 
 ## 6. Change a setting from the command line
 
-Statements after the file redefine the file's own, as if you wrote them at its end.
-Train with Muon for 100 steps:
+Statements after the file override its definitions, as if you had appended them to
+it. Train with Muon for 100 steps:
 
 ```console
 $ bux train examples/experiments/smoke.bux 'optimizer = muon(lr=0.02)' steps=100
@@ -152,15 +155,14 @@ smoke step  90/100  loss 6.2389  lr 1.00e-02  grad 0.060  61,506 tok/s  ...
 smoke step 100/100  loss 6.2338  lr 0.00e+00  grad 0.058  57,780 tok/s  ...
 ```
 
-Quote a statement that has spaces or parentheses. `optimizer.lr=1e-2` changes one
-setting of the optimizer and keeps the rest; `'optimizer = muon(lr=0.02)'` replaces
-it.
+Quote statements that contain spaces or parentheses. `optimizer.lr=1e-2` changes
+one setting of the optimizer and keeps the rest; `'optimizer = muon(lr=0.02)'`
+replaces the optimizer.
 
 ## 7. Plan a sweep
 
 `|` separates alternatives, and a file with alternatives is several runs. Try three
-learning rates from the command line, and plan them with `bux plan`, which needs no
-GPU:
+learning rates from the command line, and plan them with `bux plan` (no GPU needed):
 
 ```console
 $ bux plan examples/experiments/smoke.bux 'optimizer.lr = 1e-3 | 3e-3 | 1e-2'
@@ -171,15 +173,16 @@ bcdf2abce8  156k    25.6k   0.2        984k       1     609KiB      1.19MiB    0
 54d678be8d  156k    25.6k   0.2        984k       1     609KiB      1.19MiB    0%      smoke[optimizer.lr=1e-2]
 ```
 
-Each run is named for what it took, and its directory is its name and its id.
-`smoke[optimizer.lr=3e-3]` computes what the file alone does, so it has the same id,
-`5a4f0f7d85`. The columns are each run's parameters, tokens, tokens a
-parameter, model FLOPs a token, GPUs, the bytes of its parameters and of its
-optimizer's state on each GPU, and the share of a step a pipeline's stages idle
-(`bubble`).
+Each run is named after the alternatives it took, and its directory is its name plus
+its id. `smoke[optimizer.lr=3e-3]` computes exactly what the file alone does, so it
+has the same id, `5a4f0f7d85`, and would reuse that run directory.
+
+Per run, the columns show parameters, training tokens, tokens per parameter, model
+FLOPs per token, GPUs, the memory of the parameters and of the optimizer state on each
+GPU, and the share of a step that pipeline stages sit idle (`bubble`).
 
 `bux train` trains a sweep's runs one after another; `bux launch` trains them side by
-side, a GPU each, and picks up where it stopped when launched again
+side, one GPU each, and picks up where it stopped when launched again
 ([Launching](../training/launching.md)).
 
 ## Next steps

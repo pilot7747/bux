@@ -52,5 +52,8 @@ its documentation is, in the same commit:
   `docs/reference/python/generated/`): change the code it comes from.
 - **Measurements** go to `docs/performance/` or the page of what was measured, with
   the hardware, setup and date.
+- **Write in the docs' voice** ("Voice" in `docs/development/index.md`): lead with
+  what the reader can do, one idea per sentence, "per GPU" not "a GPU", and no
+  development history (branches, commit hashes, investigation logs) in the guides.
 - **`make docs` passes**: it fails on any warning, such as a link to a heading that
   was renamed or a docstring that no longer renders. CI runs it.
