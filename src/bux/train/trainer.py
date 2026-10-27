@@ -612,7 +612,7 @@ class Trainer:
             step = self._on_values(self._observe_on_shards)
             chosen = getattr(self._train, "policy", None)
             if chosen is not None:
-                step = _with_policy(chosen, step)
+                step = fitting.trying(chosen, step)
             auto = remat.setting() == "auto" and chosen is None
             self._observed = (fitting.Fitting if auto else xla.jit)(
                 step, self._compiler_options, donate_argnums=0 if self._donate else ()
@@ -1172,17 +1172,6 @@ def _write(reported: list[tuple[int, Scalars | Later]], sinks: Sequence[Sink]) -
             sink.write(step, scalars)
             if histograms:
                 sink.histograms(step, histograms)
-
-
-def _with_policy(policy: str, step: Callable[..., Any]) -> Callable[..., Any]:
-    """Return `step`, traced under the remat `policy`, by its own name."""
-
-    @functools.wraps(step)
-    def under(*args: Any) -> Any:
-        with remat.trying(policy):
-            return step(*args)
-
-    return under
 
 
 class Timers:
