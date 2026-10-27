@@ -248,7 +248,7 @@ add an axis only when FSDP alone cannot fit the model or its rows:
 | layers too wide for FSDP alone | `mesh(tensor=8)` within a node, `layout(stream=tensor)`, FSDP or HSDP across | 4 of Llama 3 70B's layers at 219-222k tok/s on a node |
 | an MoE | `methods(moe=sorted)` under FSDP or HSDP | the baseline's MoE at 831k tok/s on a node, 1.59M on two |
 | an MoE whose experts should not be gathered | `mesh(expert=8)` within a node, `data` across | `nccl_ep` at 615k tok/s on a node, 1.19M on two |
-| long rows | `mesh(context=8)`, `methods.attention` at `auto`; `ring` for long packed rows | rows of 128k: `ring` 346k tok/s on packed documents, `ulysses` 197k on one document |
+| long rows | `mesh(context=8)`, `methods.attention` at `auto` | rows of 128k: `ulysses` 841k tok/s on packed documents, 213k on one document |
 | a model too large for a node, where FSDP across nodes would gather every layer between them | one pipeline stage per node: `mesh(stage=4, fsdp=8)`, `methods(repeat=scan, microbatches=16)` | 76k tok/s/GPU on 4 nodes and on 8: 54% of one node's FSDP per GPU, 58% of FSDP over the same 4 nodes |
 
 - **FSDP over many nodes** gathers every layer across them, forward and backward, and
@@ -263,9 +263,8 @@ add an axis only when FSDP alone cannot fit the model or its rows:
   wherever FSDP fits. Keep `tensor` within a node; the mesh does so by filling a node
   from `tensor` outward.
 - **Context parallelism.** `auto` takes `ulysses` where `context` divides a device's
-  heads, else `ring`. It cannot tell packed rows from rows of one document before a
-  batch comes, so give a run of long packed rows `methods(attention=ring)`: 1.5x
-  `ulysses` at 128k.
+  heads, else `ring`. Keep it: at 128k, `ulysses` is 2.3x `ring` on packed rows and
+  1.4x on rows of one document.
 - **Pipelines** lose their bubble and their microbatches' small GEMMs, not the sends
   between nodes: on four nodes, a GPU of the pipeline trains as fast as on one node's
   `stage=4, fsdp=2`. `1f1b` on stages balanced by FLOPs is the default, 21-24% faster

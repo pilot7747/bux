@@ -14,11 +14,8 @@ Which to choose:
   the fastest kernel that runs the call: cuDNN's, FlashAttention-4's or tokamax's.
 - **For rows too long for one device**, as rows of 32k to 128k tokens, split the
   positions over `context` and keep `auto`. It runs `ulysses` wherever `context`
-  divides a device's heads: the fastest at 32k tokens per row, and for rows of one
-  document at any length.
-- **On longer rows of packed documents**, as at 128k, set `methods(attention=ring)`.
-  There it trains 1.5x as fast as `ulysses`, and `auto` cannot tell packed rows from
-  rows of one document before a batch comes.
+  divides a device's heads, else `ring`. `ulysses` is the fastest at 32k and at
+  128k tokens per row, on rows of one document and of packed documents alike.
 
 The numbers behind these are in [Measurements](#measurements).
 
@@ -460,37 +457,32 @@ forward and backward, in ms (2026-10-23):
 
 On 8 B300s: 8 layers of `d_model = 1024`, 16 heads and 8 kv heads of 128 dims (218M),
 rows of 32k over `mesh(context=8)`, `remat=full`, 8 microbatches, in tokens/s
-(2026-10-23):
+(2026-10-27):
 
 | `methods.attention` | one document per row | packed documents (46 per row) |
 |---|---|---|
-| `ulysses`, `auto` | **252k** | **273k** |
-| `ring` | 175k | 221k |
-| `tokamax` | 200k | 211k |
+| `ulysses`, `auto` | **1.14M** | **1.48M** |
+| `ring` | 444k | 730k |
+| `tokamax` | 511k | 591k |
 
-- With sinks, `ulysses` trains at 243k, by tokamax's kernel.
-- `ulysses` is the faster here even with 45% of the batches past cuDNN's room for
-  documents, which tokamax then takes, so `auto` takes it. `ring` stays the method for
-  longer packed rows, as at 128k below.
+With sinks, `ulysses` trains at 1.13M.
 
 ### In a model, rows of 128k
 
 The baseline's dense 1.3B (16 layers of `d_model = 2048`, 16 heads and 8 kv heads of
 128) at 128k tokens per row over `mesh(context=8)`, one row per step, `remat=full`
-(2026-10-24). Packed documents of 64 to 4096 tokens (log-uniform), or one document per
+(2026-10-27). Packed documents of 64 to 4096 tokens (log-uniform), or one document per
 row. Tokens/s, the log's MFU of the keys each query sees, and the busiest GPU's peak
 memory:
 
 | `methods.attention` | packed documents | one document per row |
 |---|---|---|
-| `ring` | **346k**, 12.5%, 22 GiB | 91k, 16.1%, 22 GiB |
-| `ulysses`, `auto` | 227k, 8.2%, 25 GiB | **197k**, 34.9%, 25 GiB |
-| `tokamax` | 123k, 4.4%, 21 GiB | |
+| `ring` | 360k, 13.0%, 16.8 GiB | 151k, 26.7%, 16.8 GiB |
+| `ulysses`, `auto` | **841k**, 30.4%, 17.7 GiB | **213k**, 37.7%, 17.7 GiB |
+| `tokamax` | 126k, 4.6%, 9.2 GiB | |
 
-On long packed rows `ring` is 1.5x `ulysses`. Past cuDNN's room for documents (32 per
-row of 128k on a device's 2 heads), `ulysses`'s kernel is tokamax's, which does every
-block backward. `auto` cannot tell packed rows from rows of one document before a
-batch comes, so give such a run `methods(attention=ring)`.
+`ulysses` is 2.3x `ring` on packed rows and 1.4x on rows of one document, so `auto`,
+which runs it, is the method at either length.
 
 ::::{dropdown} On 8 CPU devices
 Two windowed GQA layers (4 heads, 2 kv heads) with sinks and a soft cap train on

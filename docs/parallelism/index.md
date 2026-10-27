@@ -25,7 +25,7 @@ rows. By the GPUs you have and the model you train:
 | | Dense | Mixture of experts | Long rows (32k tokens and up) |
 |---|---|---|---|
 | **One GPU** | nothing to set | nothing to set | nothing to set: `methods.attention` picks the fastest kernel |
-| **One node** | `mesh(fsdp=8)` | `mesh(fsdp=8)`, with `methods.moe = sorted`, the default | `mesh(context=8)`; `methods(attention=ring)` for very long packed rows; `methods(recurrence=pass_state)` for recurrent mixers |
+| **One node** | `mesh(fsdp=8)` | `mesh(fsdp=8)`, with `methods.moe = sorted`, the default | `mesh(context=8)`, `methods.attention` at `auto`; `methods(recurrence=pass_state)` for recurrent mixers |
 | **Many nodes** | `mesh(data=<nodes>, fsdp=8)` (HSDP) | HSDP and `sorted`; or EP inside a node, `mesh(data=<nodes>, expert=8)` and `methods(moe=nccl_ep)` | `mesh(data=<nodes>, context=8)`: `context` inside a node |
 
 With no `mesh` at all, `data` takes every device: plain data parallelism (DDP), each

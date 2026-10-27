@@ -27,7 +27,9 @@ This is the advanced tutorial. It runs on a node of 8 GPUs, not a laptop, and pu
 together pieces that the other tutorials introduce one at a time: sweeps and labels,
 searches, curricula, evals, exports and vLLM. All of it takes about 15 hours on one
 node ([Time and hardware](#time-and-hardware)). Every number here was measured as
-written, on nodes of 8 NVIDIA B300s, on 2026-10-26 and 2026-10-27.
+written, on nodes of 8 NVIDIA B300s, on 2026-10-26 and 2026-10-27, with the 2026
+family's Gated DeltaNet making its decays in bfloat16. bux makes them in float32,
+so a rerun of the 2026 family computes slightly differently.
 
 ## 1. Write the two families
 
