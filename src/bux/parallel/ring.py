@@ -12,10 +12,15 @@ the forward pass gathered, and sums each block's gradients onto its device in th
 keys' dtype: in bfloat16, half the bytes of float32's.
 
 In the positions' order a row of one document balances badly: device c - 1 attends
-to c blocks, device 0 to one. So without documents or a window the queries go zigzag:
-device i holds the i-th and the (2c-1-i)-th of 2c chunks, and attends to its own
-block and to half of every other's. Its keys and values stay in the positions' order,
-so its own block zigzag is the gathered one.
+to c blocks, device 0 to one. So where every row is one document, with no window, the
+queries go zigzag: device i holds the i-th and the (2c-1-i)-th of 2c chunks, and
+attends to its own block and to half of every other's. A run's rows have ids even
+without documents, all one, so a lax.cond asks. Its keys and values stay in the
+positions' order, so its own block zigzag is the gathered one.
+
+On a GPU the blocks attend by tokamax's kernel in heads of up to
+`~bux.parallel.flash.TOKAMAX_HEAD_DIM` channels, and by jnp's past them, all of a
+block's logits at once.
 """
 
 from collections.abc import Callable
@@ -57,17 +62,35 @@ def ring(
     args: AttentionArgs,
 ) -> Float[Array, "b t h dv"]:
     """Keep each device's queries, gather the keys and values, and attend to each
-    device's block of them by tokamax's kernel (jnp's on a CPU), merged by their
-    logsumexps; skip a block no query sees, and balance a row of one document by
-    zigzag queries. Sinks fold into the final logsumexp."""
+    device's block of them by tokamax's kernel (jnp's on a CPU, and past tokamax's
+    heads), merged by their logsumexps; skip a block no query sees, and balance rows
+    of one document by zigzag queries. Sinks fold into the final logsumexp."""
     on = active()
     if on is None:
         return whole_rows(q, k, v, args)
     kernel = flash.TOKAMAX if flash.tokamax_takes(q) else flash.JNP
+    static = Static(kernel, args.scale, args.softcap, zigzag=False)
     start = first_keys(args, *q.shape[:2])
-    zigzag = start is None and q.shape[1] // on.size(AXIS) % 2 == 0
-    static = Static(kernel, args.scale, args.softcap, zigzag)
-    return on_devices(partial(_device, static=static), q, k, v, start, args.sinks, True)
+    by_first_keys = partial(_on_devices, static, start, args.sinks)
+    if args.window is not None or q.shape[1] // on.size(AXIS) % 2:
+        return by_first_keys(q, k, v)
+    zigzag = partial(_on_devices, static._replace(zigzag=True), None, args.sinks)
+    if args.ids is None:
+        return zigzag(q, k, v)
+    one = flash.documents_in(args.ids) == 1  # as a run's rows are, without documents
+    return jax.lax.cond(one, zigzag, by_first_keys, q, k, v)
+
+
+def _on_devices(
+    static: Static,
+    start: Int[Array, "b t"] | None,
+    sinks: Float[Array, " h"] | None,
+    q: Float[Array, "b t h dk"],
+    k: Float[Array, "b s g dk"],
+    v: Float[Array, "b s g dv"],
+) -> Float[Array, "b t h dv"]:
+    """Run `ring` on each device's part of q, k and v, positions over `context`."""
+    return on_devices(partial(_device, static=static), q, k, v, start, sinks, True)
 
 
 def _device(

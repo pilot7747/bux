@@ -1,6 +1,7 @@
 """Pipelines that schedule their own backward (methods.pipeline = 1f1b, zbh1), against
 one device: their tables, the backward split in two, and the runs they train."""
 
+import re
 from collections import Counter
 
 import jax
@@ -331,6 +332,22 @@ def test_first_branches_inside_a_scheduled_pipeline_are_an_error(losses, name):
         losses(LLAMA, mesh="mesh(stage=2, data=1)", methods=_how(name, 2), **given)
 
 
+# Dropout before the pipelined repeat (the embedding's) and after it.
+DROPPED = "emb = embed(dropout=0.1)\nmodel = emb block^8 dropout(rate=0.1) norm head"
+DROPOUT = PRELUDE + DROPPED
+
+
+@pytest.mark.parametrize("name", PIPELINES)
+def test_dropout_outside_a_scheduled_pipeline_draws_a_mask_a_microbatch_and_step(
+    losses, name
+):
+    """As one device does in microbatches: the first stage runs the part before the
+    repeat a microbatch at a time, and the last stage the part after it."""
+    piped = losses(DROPOUT, mesh="mesh(stage=2, data=1)", methods=_how(name, 4))
+    one = losses(DROPOUT, mesh=ONE, methods="methods(repeat=scan, microbatches=4)")
+    assert np.allclose(piped, one, atol=1e-5)
+
+
 @pytest.mark.parametrize("name", PIPELINES)
 def test_a_scheduled_pipeline_counts_its_layers_losses_as_one_device(losses, name):
     piped = losses(MOE, mesh="mesh(stage=2, data=1)", methods=_how(name, 4))
@@ -430,6 +447,25 @@ def test_only_a_scheduled_pipeline_reduces_its_gradients_in_float32(name):
                 make()
         else:
             assert make().reduces_once
+
+
+def _matmul_dtypes(gather: str) -> Counter[tuple[str, ...]]:
+    """The dtypes of the operands of each matmul of a step of LLAMA under 1f1b in
+    bfloat16, gathering its parameters as `gather` says, by how many have them."""
+    run = _run(LLAMA, "mesh(stage=2, data=1)", _how("1f1b", 4, gather=gather))
+    t = run.train
+    with parallel.use(t.mesh, t.layout, t.methods):
+        model, tx, loss = _built(run)
+        trainer = Trainer(model, tx, loss, compute="bfloat16", gather=gather)
+        text = trainer.lower(parallel.shard_batch(plain(TOKENS))).as_text()
+    tensor = r"tensor<(?:\d+x)*(\w+)>"  # its dtype, after its dimensions
+    operands = rf"stablehlo\.dot_general.*?: \({tensor}, {tensor}\)"
+    return Counter(re.findall(operands, text))
+
+
+def test_a_scheduled_pipeline_multiplies_in_compute_however_it_gathers():
+    layer = _matmul_dtypes("layer")
+    assert layer[("bf16", "bf16")] > 0 and layer == _matmul_dtypes("step")
 
 
 def test_a_scheduled_pipeline_goes_round_the_stages_once():

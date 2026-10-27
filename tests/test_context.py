@@ -175,13 +175,17 @@ def test_every_method_takes_its_softmax_in_float32(kernels, method):
     assert found and set(found) == {"float32"}
 
 
-@pytest.mark.parametrize(("ids", "sends"), [(IDS, False), (None, True)])
-def test_ring_gathers_the_keys_and_sends_only_zigzag_queries(ids, sends):
-    """The keys and values are gathered, and nothing goes round; without documents or
-    a window the queries go zigzag and back by collective-permutes. (The documents'
-    starts, a prefix scan of their ids, send int32s round.)"""
+@pytest.mark.parametrize(
+    ("ids", "window", "sends"),
+    [(IDS, 5, False), (CASES["gqa_one_document"].ids, None, True), (None, None, True)],
+)
+def test_ring_gathers_the_keys_and_sends_only_zigzag_queries(ids, window, sends):
+    """The keys and values are gathered, and nothing goes round; with no window, rows
+    of one document send their queries zigzag and back by collective-permutes. A
+    run's rows have ids, all one without documents, so a lax.cond asks. (The
+    documents' starts, a prefix scan of their ids, send int32s round.)"""
     q, k, v, sinks, _ = attention(Case(4, 2))
-    seen = Case(4, 2, ids).visibility(sinks)
+    seen = Case(4, 2, ids, window).visibility(sinks)
     with parallel.use(tcfg.MeshConfig(context=4, fsdp=2)) as mesh:
         put = NamedSharding(mesh, P("fsdp", "context"))
         q, k, v = (jax.device_put(x, put) for x in (q, k, v))
@@ -218,11 +222,11 @@ def ungathered_products(jaxpr: Jaxpr, gathered: frozenset = frozenset()) -> int:
     return count
 
 
-@pytest.mark.parametrize(("ids", "own"), [(IDS, 2), (None, 0)])
-def test_ring_attends_to_its_own_block_while_the_others_are_gathered(ids, own):
+@pytest.mark.parametrize(("window", "own"), [(5, 2), (None, 0)])
+def test_ring_attends_to_its_own_block_while_the_others_are_gathered(window, own):
     """Its logits and weighted values; zigzag, its own block is a gathered one."""
     q, k, v, sinks, _ = attention(Case(4, 2))
-    seen = Case(4, 2, ids).visibility(sinks)
+    seen = Case(4, 2, window=window).visibility(sinks)
     with parallel.use(tcfg.MeshConfig(context=4, fsdp=2)):
         f = lambda q, k, v: methods.attention.find("ring")(q, k, v, seen)
         jaxpr = jax.make_jaxpr(f)(q, k, v).jaxpr
@@ -310,21 +314,38 @@ def test_rows_of_one_document_take_the_causal_kernel_by_a_cond(
     assert conds == (seen.window is None)
 
 
-@pytest.mark.parametrize("flags", ["", "--xla_gpu_deterministic_ops=true"])
-def test_cudnn_s_backward_is_tokamax_s_under_deterministic_ops(monkeypatch, flags):
-    """XLA builds cuDNN's attention backward no graph then, on a B300."""
-    q, k, v, _, dout = attention(Case(2, 2))
+@pytest.mark.parametrize(
+    ("flags", "widest", "by"),
+    [
+        ("", D, "cudnn"),
+        ("--xla_gpu_deterministic_ops=true", D, "tokamax"),
+        ("--xla_gpu_deterministic_ops=true", D // 2, "cudnn"),
+    ],
+)
+def test_cudnn_s_backward_is_tokamax_s_under_deterministic_ops(
+    monkeypatch, flags, widest, by
+):
+    """XLA builds cuDNN's attention backward no graph then, on a B300; but for heads
+    wider than tokamax takes (`widest`), whose backward it cannot compile."""
+    q, k, v, _, dout = (x.astype(jnp.bfloat16) for x in attention(Case(2, 2)))
     v, dout = v[..., :D], dout[..., :D]
     lse = jnp.zeros((B, 2, T))
-    by = {"tokamax": (q, k, v), "cudnn": (2 * q, 2 * k, 2 * v)}
+    made = {"tokamax": (q, k, v), "cudnn": (2 * q, 2 * k, 2 * v)}
     monkeypatch.setenv("XLA_FLAGS", flags)
     monkeypatch.setattr(flash, "tokamax_runs", lambda: True)
-    monkeypatch.setattr(flash, "_tokamax_backward", lambda *a: by["tokamax"])
+    monkeypatch.setattr(flash, "TOKAMAX_HEAD_DIM", widest)
+    monkeypatch.setattr(flash, "_tokamax_backward", lambda *a: made["tokamax"])
     monkeypatch.setattr(
-        flash.jax_internals, "cudnn_attention_backward", lambda *a: by["cudnn"]
+        flash.jax_internals, "cudnn_attention_backward", lambda *a: made["cudnn"]
     )
     grads = flash.CUDNN.backward(q, k, v, dout, dout, lse, flash.Keys(True), 1.0, None)
-    assert grads is by["tokamax" if flags else "cudnn"]
+    assert grads is made[by]
+
+
+def test_cudnn_s_causal_kernels_take_whole_causal_rows_alone():
+    q, k, v, _, _ = attention(Case(2, 2))
+    with pytest.raises(ValueError, match="whole causal rows"):
+        flash.CUDNN.forward(q, k, v[..., :D], flash.Keys(True, IDS), 1.0, None)
 
 
 # --- In a model --------------------------------------------------------------------

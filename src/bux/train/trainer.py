@@ -340,7 +340,13 @@ class _Cut:
         )
 
     def model(self, others: nnx.State, kept: nnx.State) -> Model:
-        return nnx.merge(self.graphdef, *self.stand_ins, others, kept)
+        """Return the cut model of `others` and `kept`, its variables new ones of the
+        trace it runs in: a forward changes them, as dropout counts its masks."""
+        return nnx.merge(self.graphdef, *self.stand_ins, others, kept, copy=True)
+
+    def _outside(self, model: Model) -> nnx.State:
+        """Return the state of `model`'s layers outside the repeat, but parameters."""
+        return nnx.state(model, nnx.All(nnx.Not(nnx.Param), nnx.Not(self._inside)))
 
     def first(
         self, others: nnx.State, kept: nnx.State, rows: _Micro
@@ -350,7 +356,7 @@ class _Cut:
         model, before = self.model(others, kept), []
         x = pipelined.stream_into(lambda: training_forward(model, rows.batch), before)
         self.before = [a.name for a in before if observing.is_observed(a.name)]
-        return x, nnx.state(model, nnx.All(nnx.Not(nnx.Param), nnx.Not(self._inside)))
+        return x, self._outside(model)
 
     def staged(
         self, params: nnx.State, rest: nnx.State, x: Stream, rows: _Micro
@@ -362,11 +368,13 @@ class _Cut:
 
     def last(
         self, others: nnx.State, kept: nnx.State, rows: _Micro, y: Stream
-    ) -> tuple[Float[Array, ""], Metrics]:
+    ) -> tuple[Float[Array, ""], Metrics, nnx.State]:
         """Run a microbatch from the stream leaving the repeat, `y`, to its share of
-        the step's loss, and that of its metrics."""
+        the step's loss and that of its metrics, and the state of the layers outside
+        the repeat as they leave it: the forward runs those before it too."""
+        model = self.model(others, kept)
         with pipelined.leaving(y):
-            heads, aux_losses = training_forward(self.model(others, kept), rows.batch)
+            heads, aux_losses = training_forward(model, rows.batch)
         per_token, per_row = self.objective(heads, rows.batch, reported(aux_losses))
         observed = [a for a in aux_losses if observing.is_observed(a.name)]
         self.after = [a.name for a in observed]
@@ -374,7 +382,8 @@ class _Cut:
         loss = share * per_token.loss + per_row.loss / self.all_microbatches
         metrics = _scaled(per_token.metrics, share)
         rows_metrics = per_row.metrics | self._numbered(observed, "after")
-        return loss, metrics | _scaled(rows_metrics, 1 / self.all_microbatches)
+        metrics |= _scaled(rows_metrics, 1 / self.all_microbatches)
+        return loss, metrics, self._outside(model)
 
     def observed(self, values: Float[Array, "n k"], names: list[str]) -> Metrics:
         """Return what the repeat's layers observed (``Parts.observed``), named as the
@@ -773,15 +782,20 @@ class Trainer:
         batch: Batch,
     ) -> tuple[nnx.State, Metrics, nnx.State]:
         """Return `_grads` of the whole batch from a pipeline that schedules its own
-        backward (``parallel.scheduled``), with the parameters cast and gathered once
-        (``_gathered``). It runs the model a microbatch at a time, cut at the
-        pipelined repeat (``_Cut``): the part before the repeat on the first stage,
-        and the part after it, to the loss, on the last."""
+        backward (``parallel.scheduled``), with the parameters cast to `compute` once,
+        and with `gather` "step" gathered once too (``_gathered``). It runs the model
+        a microbatch at a time, cut at the pipelined repeat (``_Cut``): the part
+        before the repeat on the first stage, and the part after it, to the loss, on
+        the last."""
         method = parallel.scheduled.active()
         assert method is not None
         n = method.table().microbatches
         apart = parallel.gather.rows() if self.reduces_once else ()
-        model = nnx.merge(graphdef, self._gathered(params), buffers)
+        if self.gather == "step":
+            used = self._gathered(params)
+        else:  # cast on their shards: nothing in the pipeline casts them
+            used = _shard_state(_cast_params(params, self.compute))
+        model = nnx.merge(graphdef, used, buffers)
         model.set_attributes(update_at_step_end=True, raise_if_not_found=False)
         cut = _Cut(model, self.objective, all_microbatches=n * _size(apart))
         shares = parallel.microbatches(_row_shares(batch), n)

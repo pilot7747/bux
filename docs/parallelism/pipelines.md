@@ -163,7 +163,10 @@ after another, so with one microbatch a pipeline computes what one device does:
   under gradient accumulation: in a training step the MoE has `update_at_step_end`,
   and the pipeline carries its `router_load` through the ticks it computes. A training
   forward outside a step moves it once a microbatch, each from that one's load.
-- **Dropout** draws a fresh mask for every microbatch.
+- **Dropout** draws a fresh mask for every microbatch, and every step. Outside the
+  repeat it does so under `1f1b` and `zbh1`, which run the rest of the model a
+  microbatch at a time; `gpipe` and `circular` draw one mask there for the whole
+  batch.
 
 ### Gathering and reducing
 
@@ -283,10 +286,14 @@ batch. What follows from that:
   means its metrics; the router bias moves once a step, as under gpipe.
 - A layer outside the repeat that learns from the whole batch, as an MoE's router
   does, is an error: it would learn a microbatch at a time.
+- The state of the layers outside the repeat, as dropout's count of its masks,
+  leaves the step as the last stage's forwards leave it: they run the model from
+  the start.
 - Gathered once and reduced once work as for gpipe: the parameters come in cast to
-  `compute` and gathered, and where the rows are apart each device runs its own and
-  every gradient sums over the rows' axes once, at the end. As every gradient sums in
-  float32 as it leaves, `precision(reduce=float32)` is no error here.
+  `compute`, and gathered too under `gather=step`, and where the rows are apart each
+  device runs its own and every gradient sums over the rows' axes once, at the end.
+  As every gradient sums in float32 as it leaves, `precision(reduce=float32)` is no
+  error here.
 - As under gpipe, `remat(first=n)` counts a stage's passes from its own first
   ([Remat](remat.md)), and precision's first and last branches multiply in `compute`
   before and after the pipelined repeat and are an error inside it.
