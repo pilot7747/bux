@@ -206,7 +206,8 @@ def test_the_gate_bias_adds_one_value_per_head_before_the_sigmoid():
     attn = gqa(gated=True, gate_head_bias=True)
     x = jax.random.normal(jax.random.key(1), (2, 8, D))
     assert attn.gate is not None and attn.gate_bias is not None
-    assert gqa(gate_head_bias=True).gate_bias is None  # no gate, no bias
+    with pytest.raises(ValueError, match="gate_head_bias set the gate"):
+        gqa(gate_head_bias=True)  # no gate to bias
     assert jnp.allclose(attn(x, Taps()), gqa(gated=True)(x, Taps()))  # from 0
     attn.gate_bias[...] = jnp.arange(H, dtype=jnp.float32)
     heads = jax.random.normal(jax.random.key(2), (2, 8, H, D // H))

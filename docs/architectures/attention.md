@@ -185,7 +185,7 @@ need `compress_ratio`; `o_groups` must divide `num_heads`.
 | `sliding_window_size` | `none` | each query sees its own and the `n - 1` keys before it | Mistral, Gemma |
 | `sinks` | `false` | a learned logit per head that takes a share of the softmax and attends to nothing | gpt-oss |
 | `gated` | `false` | an elementwise gate on the head outputs, before the output projection | Qwen3-Next (Qiu et al.'s G1) |
-| `gate_per_head` | `false` | one gate value per head instead | Laguna |
+| `gate_per_head` | `false` | one gate value per head instead (with `gated`, as the next two) | Laguna |
 | `gate_activation` | `sigmoid` | the gate's activation | Laguna: `softplus` |
 | `gate_head_bias` | `false` | a learned bias per head on the gate, before its activation | Beam |
 | `output_norm` | `none` | a norm of each head's output, before the gate | Muse Spark |
@@ -580,7 +580,7 @@ same for every head otherwise. With `relu=false` the dot products are plain.
 |---------|---------|--------------|
 | `num_heads`, `head_dim` | `64`, `128` | the indexer's query heads |
 | `top_k` | `2048` | keys each query keeps |
-| `block_size` | `1` | keep whole blocks of this many keys, scored as `pool` says |
+| `block_size` | `1` | keep whole blocks of this many keys, scored as `pool` says; at most `top_k` |
 | `pool` | `mean` | how a block scores: the mean of its keys (QSA), or the best score of those a query sees (MSA) |
 | `per_group` | `false` | a pick for each kv head's group of query heads, by a head of its own (MSA) |
 | `relu` | `true` | ReLU on the dot products (DSA); else plain ones (MSA) |

@@ -495,8 +495,9 @@ INDEXER = "indexer(num_heads=2, head_dim=8, "
             "false",
             "true",
         ),
-        (MLA, "gate_head_bias", "false", "true"),
-        (CSA, "gate_head_bias", "false", "true"),
+        # With the gate it biases, which they have not by default.
+        (MLA, "gate_head_bias", "false", "true, gated=true"),
+        (CSA, "gate_head_bias", "false", "true, gated=true"),
     ],
 )
 def test_a_layer_field_newer_than_ids_keeps_them_where_it_computes_as_before(

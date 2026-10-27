@@ -425,6 +425,56 @@ def test_residual_algebras_and_their_errors():
     assert "hc(...)" in err.message and "vpgate(...)" in err.message
 
 
+@pytest.mark.parametrize(
+    ("body", "message"),
+    [
+        (
+            "a = gqa(num_heads=2, num_kv_heads=2, gate_per_head=true)",
+            "gate_per_head set the gate, which gated=true adds",
+        ),
+        (
+            (
+                "a = gqa(num_heads=2, num_kv_heads=2, gate_head_bias=true,"
+                " gate_activation=softplus)"
+            ),
+            "gate_head_bias, gate_activation set the gate",
+        ),
+        (
+            (
+                "e = moe(num_experts=4, top_k=2, expert=ffn, shared_expert=ffn,"
+                " shared_expert_gate=true)"
+            ),
+            "shared_expert, shared_expert_gate set the shared experts, of which",
+        ),
+        (
+            "e = moe(num_experts=8, top_k=2, expert=ffn, num_groups=2, top_k_groups=4)",
+            "2 groups of 8 experts, 4 of them picked, cannot hold the top 2",
+        ),
+        ("e = moe(num_experts=8, top_k=2, expert=ffn, num_groups=0)", "greater than 0"),
+        (
+            (
+                "a = gqa(num_heads=2, num_kv_heads=2, indexer=indexer(top_k=2,"
+                " block_size=4))"
+            ),
+            "indexer keeps top_k // block_size blocks: top_k=2 is less than one block",
+        ),
+        ("e = engram(head_dim=4, table_size=31, max_ngram_size=1)", "greater than or"),
+        ("c = conv(size=0)", "greater than 0"),
+        ("c = short_conv(conv_size=0)", "greater than 0"),
+        ("c = mamba(conv_size=0)", "greater than 0"),
+        ("residual = hc(expansion=1)", "greater than or equal to 2"),
+        ("residual = mhc(sinkhorn_iters=0)", "greater than 0"),
+        ("residual = gr(rank=0)", "greater than 0"),
+        ("residual = gr(rank=4, expansion=0)", "greater than 0"),
+        ("residual = attnres(block_size=0)", "greater than 0"),
+        ("residual = vpgate(temperature=0)", "greater than 0"),
+        ("residual = vpgate(eps=0)", "greater than 0"),
+    ],
+)
+def test_settings_that_would_do_nothing_or_fail_later_are_errors(body, message):
+    assert message in error(body + "\nmodel = embed head").message
+
+
 def test_init_starts_the_model_by_role_and_its_errors():
     a = build("init = normal(std=0.5 * d_model ^ -0.5, truncate=3)\nmodel = embed head")
     assert a.init == cfg.NormalInitConfig(std=0.125, truncate=3)
