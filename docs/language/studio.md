@@ -98,6 +98,9 @@ through the compiler again before the page draws it.
   wrapped, repeated or followed by a layer without `b`. Write `a + -b` for that.
 - Editing an axis of the sweep rewrites only the alternatives you changed. The
   others keep their lines, alignment and comments.
+- The diagram and the panels edit what they drew. While the code has errors, or
+  before the drawing has caught up with what you typed, they make no edit and say
+  so.
 - Saving is explicit (Cmd-S or Ctrl-S). The studio writes the file in one step, and
   refuses to write it if the file changed on disk since the page loaded it, as
   another editor's save would. The page then offers what is on disk. If the file is
