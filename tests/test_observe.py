@@ -233,8 +233,10 @@ def test_a_layer_outside_any_branch_observes_by_its_name_as_its_parameters_are(
             _, reported = model.training_heads(jnp.zeros((2, 8), jnp.int32))
         where = observed.layers(model)
     seen = observe.named(r for r in reported if observe.is_observed(r.name))
+    loads = {k for k in seen if k.startswith("router/max_load/")}
     keys = {key for layer in where.values() for key in layer.keys}
-    assert layered(seen, "router/max_load").keys() == {"moe.00", "moe.01"} <= keys
+    assert loads == {"router/max_load/moe.00", "router/max_load/moe.01"}
+    assert {"moe.00", "moe.01"} <= keys
 
 
 def test_histograms_share_out_every_entry_of_a_layer(steps):
