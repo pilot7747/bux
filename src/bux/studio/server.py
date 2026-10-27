@@ -12,7 +12,6 @@ file; the ``Host`` header must name this machine, against DNS rebinding.
 """
 
 import bisect
-import importlib
 import json
 import os
 import secrets
@@ -25,15 +24,15 @@ from dataclasses import dataclass, field
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
-from types import ModuleType
 from typing import Any
 from urllib.parse import parse_qs, unquote, urlsplit
 
 from bux.lang.compiler import check
 from bux.lang.lsp import features
 from bux.lang.syntax import BuxError
-from bux.studio import palette, training
+from bux.studio import edits, forms, palette, training
 from bux.studio.picks import traced
+from bux.studio.targets import EditError
 from bux.studio.view import view
 
 #: A JSON object, as the API sends it.
@@ -197,20 +196,18 @@ class Studio:
 
     def inspect(self, body: Json, query: dict[str, str]) -> Json:
         """``POST /api/inspect``: the inspector's form of a target."""
-        forms, error = _module("forms"), _edit_error()
         target = body.get("target")
         if not isinstance(target, dict):
             raise _bad("target is an object: {node}, {setting} or {model}")
         source = _text(body, "source")
         try:
             form = forms.inspect(source, target, picks=_picks(body), path=self.where)
-        except (error, BuxError) as err:
+        except (EditError, BuxError) as err:
             raise _bad(_message(err)) from None
         return Units(source).spans(form)
 
     def edit(self, body: Json, query: dict[str, str]) -> Json:
         """``POST /api/edit``: the text with the ops applied."""
-        edits, error = _module("edits"), _edit_error()
         ops = body.get("ops")
         if not isinstance(ops, list):
             raise _bad("ops is a list of edits")
@@ -218,7 +215,7 @@ class Studio:
             new = edits.apply(
                 _text(body, "source"), ops, picks=_picks(body), path=self.where
             )
-        except (error, BuxError) as err:
+        except (EditError, BuxError) as err:
             raise _bad(_message(err)) from None
         return {"source": new}
 
@@ -302,24 +299,6 @@ def _context(source: str, filename: str) -> palette.Context:
     d_model = check(source, filename=filename).values.get("d_model")
     width = d_model if isinstance(d_model, int) and d_model > 0 else 768
     return palette.Context(d_model=width)
-
-
-def _module(name: str) -> ModuleType:
-    """Return ``bux.studio.<name>``, imported when first asked for."""
-    try:
-        return importlib.import_module(f"bux.studio.{name}")
-    except ModuleNotFoundError as err:
-        if err.name != f"bux.studio.{name}":
-            raise
-        raise _bad(f"bux.studio.{name} is not built yet", HTTPStatus.NOT_IMPLEMENTED)
-
-
-def _edit_error() -> type[Exception]:
-    """Return the error an edit or a form raises for the user: ``EditError``."""
-    try:
-        return _module("edits").EditError
-    except Reply:
-        return ValueError
 
 
 def _message(err: Exception) -> str:

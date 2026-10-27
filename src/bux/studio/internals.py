@@ -4,7 +4,7 @@ Raschka zooms into the feed-forward module of his figures.
 Each is a tree of the view's nodes (`bux.studio.view`), read-only, whose leaves are
 the layer's parts: its projections, activations, norms and products. A builder is
 registered by the layer's type and returns the tree without ids, from helpers that
-make each kind of node; `inside` numbers it under the layer's id::
+make each kind of node; `numbered` gives it ids under the layer's (``n.1:i.0``)::
 
     from bux.studio import internals
     from bux.studio.internals import op, seq
@@ -23,27 +23,12 @@ from bux import config as cfg
 from bux.studio.palette import Category, Context, count, glu, many, name, si
 from bux.train.registry import Registry
 
-#: A node of an inside diagram before `inside` numbers it: the view's `Node`
+#: A node of an inside diagram before `numbered` numbers it: the view's `Node`
 #: without ids.
 type Part = dict[str, Any]
 
 #: Inside diagrams by layer type: a function of the config and its `Context`.
 internals = Registry[Part]("inside diagram", "bux.studio.internals.internals")
-
-
-def inside(config: cfg.LayerConfig, ctx: Context, parent: str) -> dict[str, Any] | None:
-    """Return the inside diagram of a layer whose node is `parent`, its nodes' ids
-    ``<parent>:i`` and ``<parent>:i.0.1`` by their paths; None for a layer without
-    one.
-
-    Args:
-        config: The layer's config.
-        ctx: The model around it.
-        parent: The id of the layer's node.
-    """
-    if config.type not in internals.builders:
-        return None
-    return numbered(internals.build(config, ctx), f"{parent}:i")
 
 
 def numbered(part: Part, id: str) -> dict[str, Any]:

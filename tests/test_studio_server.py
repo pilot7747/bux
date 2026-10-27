@@ -5,9 +5,7 @@ import json
 import os
 import re
 import socket
-import sys
 import threading
-import types
 from collections.abc import Iterator
 from pathlib import Path
 from typing import Any
@@ -18,6 +16,7 @@ from bux.__main__ import studio_parser
 from bux.studio import server as studio_server
 from bux.studio import training
 from bux.studio.server import TEMPLATE, Server, Studio, Units, bind
+from bux.studio.targets import EditError
 
 EXAMPLES = Path(__file__).parent.parent / "examples"
 SOURCE = (EXAMPLES / "experiments/smoke.bux").read_text()
@@ -185,10 +184,7 @@ def test_completion_and_hover(client):
     assert client.call("/api/hover", {"source": SOURCE, "offset": 0})[1] is None
 
 
-def test_forms_and_edits_are_called_once_they_exist(client, monkeypatch):
-    class EditError(Exception):
-        pass
-
+def test_inspect_and_edit_pass_the_picks_and_say_why_they_refuse(client, monkeypatch):
     def inspect(source, target, *, picks, path):
         if "node" in target:
             raise EditError("no such node")
@@ -199,10 +195,8 @@ def test_forms_and_edits_are_called_once_they_exist(client, monkeypatch):
             raise EditError("nothing to do")
         return source + "# edited\n"
 
-    forms = types.SimpleNamespace(inspect=inspect)
-    edits = types.SimpleNamespace(apply=apply, EditError=EditError)
-    monkeypatch.setitem(sys.modules, "bux.studio.forms", forms)
-    monkeypatch.setitem(sys.modules, "bux.studio.edits", edits)
+    monkeypatch.setattr(studio_server.forms, "inspect", inspect)
+    monkeypatch.setattr(studio_server.edits, "apply", apply)
     body = {"source": "x", "picks": {"a": 1}, "target": {"model": True}}
     status, form, _ = client.call("/api/inspect", body)
     assert (
