@@ -133,7 +133,9 @@ See [Sweeps](sweeps.md).
 `bux check`, `bux render`, `bux fmt` and `bux json` compile a file and show what it
 means. Errors point at the line that caused them, and every error in a file is
 reported at once. `bux-lsp` brings the same checks, with completion and hover, into
-your editor. See [Tools and editor support](tooling.md).
+your editor. See [Tools and editor support](tooling.md). `bux studio` draws a file's
+model, training and sweep in a browser page and edits them in the file: see
+[bux studio](studio.md).
 
 ## Where to go next
 
@@ -159,6 +161,7 @@ residual-algebras
 modules
 sweeps
 tooling
+studio
 grammar
 design
 ```

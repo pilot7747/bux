@@ -55,6 +55,7 @@ def registries() -> list[tuple[str, str, list[Row]]]:
     from bux.lang.printer import config_to_source
     from bux.parallel import methods
     from bux.search import methods as search
+    from bux.studio import internals, palette
     from bux.train import data, optim, profilers, xla
 
     kinds = sorted(k for k, v in vars(methods).items() if hasattr(v, "builders"))
@@ -75,6 +76,10 @@ def registries() -> list[tuple[str, str, list[Row]]]:
         ("Matmul formats", matmuls.formats),
         ("Inits", initializers.inits),
         ("Search methods", search.methods),
+        ("Studio titles", palette.titles),
+        ("Studio chips", palette.chips),
+        ("Studio templates", palette.templates),
+        ("Studio inside diagrams", internals.internals),
     ]:
         found.append(
             (title, registry.where, builders(registry.builders, registry.docs))

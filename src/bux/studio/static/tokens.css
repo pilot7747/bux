@@ -1,0 +1,129 @@
+/* Design tokens of bux studio: every color, font, radius and shadow the page uses.
+   Components read these and define none of their own, so a theme is this file. */
+
+:root {
+  color-scheme: light;
+
+  --font-ui: "Inter", -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+  --font-mono: "JetBrains Mono", "SF Mono", ui-monospace, Menlo, Consolas, monospace;
+  --text-xs: 11px;
+  --text-sm: 12px;
+  --text-md: 13px;
+  --text-lg: 15px;
+  --text-xl: 18px;
+
+  --radius-sm: 4px;
+  --radius-md: 8px;
+  --radius-lg: 12px;
+  --space-1: 4px;
+  --space-2: 8px;
+  --space-3: 12px;
+  --space-4: 16px;
+  --space-6: 24px;
+
+  --bg: #f7f7f5;            /* the page */
+  --canvas: #fbfbfa;        /* behind the diagram and charts */
+  --canvas-dot: #e4e4e0;    /* the canvas's dot grid */
+  --surface: #ffffff;       /* panels, cards, popovers */
+  --surface-2: #f2f2ef;     /* inputs, hovered rows, containers */
+  --border: #e3e3df;
+  --border-strong: #cfcfca;
+  --text: #1f2328;
+  --text-2: #5b616b;        /* secondary */
+  --text-3: #8b9099;        /* hints, axis labels */
+  --accent: #4f6bed;        /* selection, focus, primary buttons */
+  --accent-soft: #e6eafd;
+  --danger: #d6453d;
+  --danger-soft: #fbe7e5;
+  --warning: #b7791f;
+  --success: #2f9e6e;
+  --shadow-sm: 0 1px 2px rgba(20, 22, 26, 0.06);
+  --shadow-md: 0 4px 14px rgba(20, 22, 26, 0.08), 0 1px 3px rgba(20, 22, 26, 0.06);
+
+  /* The diagram's wires and marks */
+  --wire: #8d929b;
+  --wire-strong: #5b616b;
+  --container: #f1f1ee;     /* a repeat or a block */
+  --container-border: #dcdcd7;
+
+  /* Layer categories, as Raschka colors them: a fill and a border each */
+  --cat-io-fill: #e8eef6;         --cat-io-line: #8fa6c4;
+  --cat-norm-fill: #fbf1d3;       --cat-norm-line: #d4b052;
+  --cat-attention-fill: #fce3d6;  --cat-attention-line: #e0916a;
+  --cat-recurrent-fill: #d9f0ea;  --cat-recurrent-line: #5aae96;
+  --cat-ffn-fill: #e9e2f7;        --cat-ffn-line: #957fcf;
+  --cat-experts-fill: #f3ddf0;    --cat-experts-line: #c077b4;
+  --cat-op-fill: #f0f0ed;         --cat-op-line: #a8a8a0;
+  --cat-other-fill: #eceff1;      --cat-other-line: #9aa5ad;
+
+  /* Series of charts, in order */
+  --series-1: #4f6bed;
+  --series-2: #e0916a;
+  --series-3: #5aae96;
+  --series-4: #957fcf;
+  --series-5: #d4b052;
+  --series-6: #c077b4;
+
+  /* Syntax highlighting of the code pane */
+  --syn-comment: #8b9099;
+  --syn-keyword: #a2479a;
+  --syn-number: #b35c1e;
+  --syn-string: #2f8a5b;
+  --syn-layer: #3653c9;     /* a builtin layer, config or activation */
+  --syn-def: #1f2328;       /* a definition's name where it is defined */
+  --syn-tap: #0f8a9d;
+  --syn-op: #5b616b;
+}
+
+:root[data-theme="dark"] {
+  color-scheme: dark;
+
+  --bg: #141518;
+  --canvas: #17181c;
+  --canvas-dot: #26282e;
+  --surface: #1d1f24;
+  --surface-2: #25272d;
+  --border: #2c2f36;
+  --border-strong: #3a3e47;
+  --text: #e6e7ea;
+  --text-2: #a3a8b2;
+  --text-3: #737985;
+  --accent: #7d93ff;
+  --accent-soft: #262d4d;
+  --danger: #f06a61;
+  --danger-soft: #3a2020;
+  --warning: #e0a443;
+  --success: #4cc08d;
+  --shadow-sm: 0 1px 2px rgba(0, 0, 0, 0.4);
+  --shadow-md: 0 6px 18px rgba(0, 0, 0, 0.45), 0 1px 3px rgba(0, 0, 0, 0.4);
+
+  --wire: #6d727c;
+  --wire-strong: #a3a8b2;
+  --container: #1f2126;
+  --container-border: #30333a;
+
+  --cat-io-fill: #233040;         --cat-io-line: #6f8db3;
+  --cat-norm-fill: #3a3220;       --cat-norm-line: #c9a447;
+  --cat-attention-fill: #40291f;  --cat-attention-line: #e0916a;
+  --cat-recurrent-fill: #1d3a33;  --cat-recurrent-line: #5aae96;
+  --cat-ffn-fill: #2e2843;        --cat-ffn-line: #a08ae0;
+  --cat-experts-fill: #3c2439;    --cat-experts-line: #cf86c3;
+  --cat-op-fill: #2a2b2f;         --cat-op-line: #80838b;
+  --cat-other-fill: #262b2f;      --cat-other-line: #7f8b93;
+
+  --series-1: #7d93ff;
+  --series-2: #e8a07c;
+  --series-3: #63bfa5;
+  --series-4: #a993e8;
+  --series-5: #d9b75e;
+  --series-6: #d08fc6;
+
+  --syn-comment: #737985;
+  --syn-keyword: #d189c9;
+  --syn-number: #e8a46a;
+  --syn-string: #74c79a;
+  --syn-layer: #8fa3ff;
+  --syn-def: #e6e7ea;
+  --syn-tap: #4fc0cf;
+  --syn-op: #a3a8b2;
+}

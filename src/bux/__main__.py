@@ -16,6 +16,7 @@ Usage::
 
     bux export RUN_DIR OUT [--step N] [--dtype DTYPE] [--check]
     bux export FILE.bux OUT [SETTING=VALUE ...] [--entry NAME]
+    bux studio FILE [--port PORT] [--host HOST] [--no-browser]
 
 Settings after the file override the file's own, as if written at its end:
 ``bux train speedrun.bux optimizer.lr=0.03 'steps = 2k'``. Alternatives there make a
@@ -34,7 +35,8 @@ A file with dimensions, ``optimizer.lr = log_uniform(1e-4, 1e-2)``, is a search
 ``bux export`` takes a trained run's directory and writes its model as a transformers
 model directory (`bux.export.runs`). Given a ``.bux`` file, it writes the file's model
 without weights, which vLLM serves on random ones (``--load-format dummy``): to time
-an architecture before training it.
+an architecture before training it. ``bux studio`` serves a page that draws a file's
+model, training and sweep, and edits them (`bux.studio`).
 """
 
 import argparse
@@ -325,7 +327,7 @@ def parser() -> argparse.ArgumentParser:
         prog="bux",
         description="Compile, inspect and train .bux models and runs.",
         epilog="bux export RUN_DIR OUT writes a trained run as a transformers model: "
-        "bux export --help",
+        "bux export --help. bux studio FILE edits a file in a browser: bux studio --help",
     )
     p.add_argument(
         "command",
@@ -426,6 +428,41 @@ def export_parser() -> argparse.ArgumentParser:
         "if they disagree",
     )
     return p
+
+
+def studio_parser() -> argparse.ArgumentParser:
+    """Return the parser of ``bux studio``."""
+    p = argparse.ArgumentParser(
+        prog="bux studio",
+        description="Serve a page that shows a .bux file's source, its model as a "
+        "diagram, and its training and sweep, and edits them all in the file.",
+    )
+    p.add_argument(
+        "file", metavar="FILE", help="the file; a new one starts from a template"
+    )
+    p.add_argument(
+        "--port",
+        type=int,
+        default=8765,
+        help="the port to try first, then the next few (default: 8765)",
+    )
+    p.add_argument(
+        "--host",
+        default="127.0.0.1",
+        help="the address to listen on (default: 127.0.0.1)",
+    )
+    p.add_argument(
+        "--no-browser",
+        action="store_true",
+        help="print the page's URL without opening a browser",
+    )
+    return p
+
+
+def _studio(args: argparse.Namespace) -> int:
+    from bux.studio.server import serve
+
+    return serve(args.file, host=args.host, port=args.port, browser=not args.no_browser)
 
 
 def _export(args: argparse.Namespace) -> int:
@@ -624,6 +661,8 @@ def main(argv: list[str] | None = None) -> int:
     argv = sys.argv[1:] if argv is None else argv
     if argv[:1] == ["export"]:
         return _export(export_parser().parse_args(argv[1:]))
+    if argv[:1] == ["studio"]:
+        return _studio(studio_parser().parse_args(argv[1:]))
     cli = parser()
     args = cli.parse_args(argv)
     for setting in args.settings:

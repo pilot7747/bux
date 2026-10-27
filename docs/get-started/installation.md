@@ -51,7 +51,7 @@ repeating it:
 
 | extra   | what it adds                                                         | where         |
 |---------|----------------------------------------------------------------------|---------------|
-| `cuda`  | JAX on CUDA 13 (`jax[cuda13]`), [tokamax](https://github.com/openxla/tokamax)'s GPU kernels and FlashAttention-4's, cudnn-frontend's develop build, and the CPU build of PyTorch, which FlashAttention-4 and cuDNN's DSA kernels import | Linux only    |
+| `cuda`  | JAX on CUDA 13 (`jax[cuda13]`), [tokamax](https://github.com/openxla/tokamax)'s GPU kernels and FlashAttention-4's, cudnn-frontend 1.32, and the CPU build of PyTorch, which FlashAttention-4 and cuDNN's DSA kernels import | Linux only    |
 | `lsp`   | pygls, which the language server `bux-lsp` runs on                   | anywhere      |
 | `spark` | PySpark and pandas, to prepare data on a Spark cluster               | anywhere      |
 

@@ -1,0 +1,219 @@
+/* The model diagram (diagram.js). Every color comes from tokens.css; the fonts
+   and sizes of its texts match FONT in diagram-layout.js, which measures them. */
+
+/* The host keeps its own position (diagram.js makes a static one relative). The
+   dot grid follows pan and zoom: diagram.js sets its size and position. */
+.dg-host {
+  overflow: hidden;
+  outline: none;
+  user-select: none;
+  -webkit-user-select: none;
+  touch-action: none;
+  font-family: var(--font-ui);
+  background-color: var(--canvas);
+  background-image: radial-gradient(circle, var(--canvas-dot) 1px, transparent 1.3px);
+  background-size: 20px 20px;
+}
+.dg-host.dg-panning { cursor: grabbing; }
+/* SVG's own defaults, against a page's rules for icon SVGs, which the drawing inherits */
+.dg-svg {
+  position: absolute; inset: 0; width: 100%; height: 100%; display: block;
+  fill: black; stroke: none; stroke-width: 1px; stroke-linecap: butt; stroke-linejoin: miter;
+}
+.dg-world { transition: opacity 0.2s, filter 0.2s; }
+.dg-dim .dg-world { opacity: 0.4; filter: saturate(0.2); }
+.dg-hit { cursor: pointer; }
+
+/* Wires */
+.dg-wire { fill: none; stroke: var(--wire); stroke-width: 1.25px; stroke-linejoin: round; }
+.dg-arrow { fill: var(--wire); stroke: none; }
+.dg-lane { fill: none; stroke: var(--wire); stroke-linejoin: round; }
+.dg-lane-gap { fill: none; stroke-linejoin: round; }
+.bg-canvas { stroke: var(--canvas); }
+.bg-container { stroke: var(--container); }
+.bg-surface { stroke: var(--surface); }
+
+/* Layers */
+.dg-box .dg-shape { stroke-width: 1px; transition: stroke-width 0.12s; }
+.dg-box:hover .dg-shape { stroke-width: 1.75px; }
+.dg-title { font: 600 13px var(--font-ui); fill: var(--text); text-anchor: middle; }
+.dg-chips { font: 400 11px var(--font-ui); fill: var(--text-2); }
+.dg-mid { text-anchor: middle; }
+.dg-label { font: 500 10.5px var(--font-mono); fill: var(--text-2); text-anchor: middle; }
+.dg-label-bg { fill-opacity: 0.2; stroke: none; }
+.dg-inserted { opacity: 0.55; }
+.dg-inserted .dg-shape { stroke-dasharray: 3 3; }
+
+.cat-io .dg-shape { fill: var(--cat-io-fill); stroke: var(--cat-io-line); }
+.cat-norm .dg-shape { fill: var(--cat-norm-fill); stroke: var(--cat-norm-line); }
+.cat-attention .dg-shape { fill: var(--cat-attention-fill); stroke: var(--cat-attention-line); }
+.cat-recurrent .dg-shape { fill: var(--cat-recurrent-fill); stroke: var(--cat-recurrent-line); }
+.cat-ffn .dg-shape { fill: var(--cat-ffn-fill); stroke: var(--cat-ffn-line); }
+.cat-experts .dg-shape { fill: var(--cat-experts-fill); stroke: var(--cat-experts-line); }
+.cat-op .dg-shape { fill: var(--cat-op-fill); stroke: var(--cat-op-line); }
+.cat-other .dg-shape { fill: var(--cat-other-fill); stroke: var(--cat-other-line); }
+.cat-io .dg-label-bg, .dg-dot.cat-io { fill: var(--cat-io-line); background: var(--cat-io-line); }
+.cat-norm .dg-label-bg, .dg-dot.cat-norm { fill: var(--cat-norm-line); background: var(--cat-norm-line); }
+.cat-attention .dg-label-bg, .dg-dot.cat-attention { fill: var(--cat-attention-line); background: var(--cat-attention-line); }
+.cat-recurrent .dg-label-bg, .dg-dot.cat-recurrent { fill: var(--cat-recurrent-line); background: var(--cat-recurrent-line); }
+.cat-ffn .dg-label-bg, .dg-dot.cat-ffn { fill: var(--cat-ffn-line); background: var(--cat-ffn-line); }
+.cat-experts .dg-label-bg, .dg-dot.cat-experts { fill: var(--cat-experts-line); background: var(--cat-experts-line); }
+.cat-op .dg-label-bg, .dg-dot.cat-op { fill: var(--cat-op-line); background: var(--cat-op-line); }
+.cat-other .dg-label-bg, .dg-dot.cat-other { fill: var(--cat-other-line); background: var(--cat-other-line); }
+
+/* Merges, marks, taps, tokens and logits */
+.dg-merge circle { fill: var(--surface); stroke: var(--wire-strong); stroke-width: 1.25px; }
+.dg-merge path { fill: none; stroke: var(--wire-strong); stroke-width: 1.4px; stroke-linecap: round; }
+.dg-merge:hover circle { stroke-width: 2px; }
+.dg-mark rect { fill: var(--surface); stroke: var(--border-strong); stroke-width: 1px; }
+.dg-mark text { font: 600 11px var(--font-ui); fill: var(--text-2); text-anchor: middle; }
+.dg-tag rect { fill: var(--surface); stroke: var(--syn-tap); stroke-width: 1px; }
+.dg-tag text { font: 500 11px var(--font-mono); fill: var(--syn-tap); text-anchor: middle; }
+.dg-tag.dg-hot rect { fill: var(--syn-tap); }
+.dg-tag.dg-hot text { fill: var(--surface); }
+.dg-tap-dot { fill: var(--syn-tap); }
+.dg-io rect { fill: var(--surface); stroke: var(--border-strong); stroke-width: 1px; }
+.dg-io text { font: 500 12px var(--font-ui); fill: var(--text-2); text-anchor: middle; }
+
+/* Repeats and blocks */
+.dg-cont { stroke: var(--container-border); stroke-width: 1px; }
+.dg-fill-container { fill: var(--container); }
+.dg-fill-canvas { fill: var(--canvas); }
+.dg-caption { cursor: pointer; }
+.dg-caption-text { font: 500 11.5px var(--font-mono); fill: var(--text-2); }
+.dg-caption-note { font: 400 11px var(--font-ui); fill: var(--text-3); }
+.dg-zoom-panel .dg-hit { cursor: default; }
+.dg-caption-hit { fill: transparent; }
+.dg-caption:hover .dg-caption-hit, .dg-card-toggle:hover .dg-caption-hit { fill: var(--surface-2); }
+.dg-chevron { fill: none; stroke: var(--text-3); stroke-width: 1.4px; stroke-linecap: round; stroke-linejoin: round; }
+.dg-badge { font: 700 16px var(--font-ui); fill: var(--text-3); text-anchor: middle; }
+.dg-badge[data-repeat], .dg-card-count[data-repeat] { cursor: text; }
+.dg-card .dg-shape { fill: var(--surface); stroke: var(--border-strong); stroke-width: 1px; }
+.dg-card:hover .dg-shape { stroke: var(--text-3); }
+.dg-card-stack { fill: var(--surface-2); stroke: var(--border-strong); stroke-width: 1px; }
+.dg-card-label { font: 600 12.5px var(--font-mono); fill: var(--text); }
+.dg-card-count { font: 700 12.5px var(--font-ui); fill: var(--text-3); }
+.dg-card-toggle { cursor: pointer; }
+
+/* Internals */
+.dg-zoom { cursor: zoom-in; }
+.dg-zoom.dg-open { cursor: zoom-out; }
+.dg-zoom path { fill: none; stroke: var(--text-3); stroke-width: 1.3px; stroke-linecap: round; stroke-linejoin: round; }
+.dg-zoom-hit { fill: transparent; }
+.dg-zoom:hover .dg-zoom-hit { fill: var(--surface); fill-opacity: 0.7; }
+.dg-zoom:hover path, .dg-zoom.dg-open path { stroke: var(--accent); }
+.dg-leader { fill: none; stroke: var(--text-3); stroke-width: 1px; stroke-dasharray: 4 3; }
+.dg-panel { fill: var(--surface); stroke: var(--border-strong); stroke-width: 1px; }
+.dg-panel-title { font: 600 12px var(--font-ui); fill: var(--text-2); }
+.dg-panel-close { cursor: pointer; }
+.dg-panel-close rect { fill: transparent; }
+.dg-panel-close:hover rect { fill: var(--surface-2); }
+.dg-panel-close path { fill: none; stroke: var(--text-3); stroke-width: 1.3px; stroke-linecap: round; }
+
+/* The header card */
+.dg-header-card { fill: var(--surface); stroke: var(--border); stroke-width: 1px; }
+.dg-header-name { font: 600 16px var(--font-ui); fill: var(--text); }
+.dg-header-key { font: 400 11px var(--font-ui); fill: var(--text-3); }
+.dg-header-value { font: 500 11px var(--font-mono); fill: var(--text); }
+.dg-header-value.dg-missing { fill: var(--text-3); }
+
+/* Selection */
+.dg-rings { pointer-events: none; }
+.dg-ring { fill: none; stroke: var(--accent); stroke-width: 2px; }
+.dg-ring-soft { stroke-width: 1.5px; stroke-opacity: 0.5; stroke-dasharray: 4 3; }
+
+/* Overlays */
+.dg-toolbar, .dg-palette, .dg-controls, .dg-count {
+  position: absolute;
+  top: 0;
+  left: 0;
+  font: 400 var(--text-sm) var(--font-ui);
+  color: var(--text);
+}
+.dg-toolbar, .dg-controls .dg-group, .dg-palette {
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-md);
+  box-shadow: var(--shadow-md);
+}
+.dg-toolbar { display: flex; gap: 1px; padding: 2px; z-index: 3; }
+.dg-toolbar .dg-btn { min-width: 24px; height: 24px; padding: 0 4px; }
+.dg-toolbar[hidden], .dg-palette[hidden], .dg-count[hidden] { display: none; }
+.dg-btn {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 4px;
+  min-width: 28px;
+  height: 28px;
+  padding: 0 6px;
+  border: 0;
+  border-radius: var(--radius-sm);
+  background: transparent;
+  color: var(--text-2);
+  font: 500 var(--text-xs) var(--font-ui);
+  cursor: pointer;
+}
+.dg-btn:hover { background: var(--surface-2); color: var(--text); }
+.dg-btn:focus-visible { outline: 2px solid var(--accent); outline-offset: -2px; }
+.dg-btn svg { fill: none; stroke: currentColor; stroke-width: 1.4; stroke-linecap: round; stroke-linejoin: round; }
+.dg-controls {
+  top: auto;
+  left: auto;
+  right: var(--space-3);
+  bottom: var(--space-3);
+  display: flex;
+  gap: var(--space-2);
+  z-index: 2;
+}
+.dg-controls .dg-group { display: flex; padding: 2px; }
+.dg-zoom-level { min-width: 46px; font-variant-numeric: tabular-nums; }
+
+.dg-palette { width: 300px; z-index: 4; overflow: hidden; }
+.dg-palette input {
+  box-sizing: border-box;
+  width: 100%;
+  padding: 9px 12px;
+  border: 0;
+  border-bottom: 1px solid var(--border);
+  outline: none;
+  background: transparent;
+  color: var(--text);
+  font: 400 var(--text-md) var(--font-ui);
+}
+.dg-palette-list { max-height: 320px; overflow-y: auto; padding: 4px; }
+.dg-palette-group {
+  padding: 8px 8px 3px;
+  color: var(--text-3);
+  font: 600 10px var(--font-ui);
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+}
+.dg-palette-item {
+  display: grid;
+  grid-template-columns: 8px auto 1fr;
+  align-items: center;
+  gap: 8px;
+  padding: 5px 8px;
+  border-radius: var(--radius-sm);
+  cursor: pointer;
+}
+.dg-palette-item.dg-active { background: var(--accent-soft); }
+.dg-palette-item code { font: 500 var(--text-sm) var(--font-mono); color: var(--text); }
+.dg-palette-item span { color: var(--text-3); overflow: hidden; white-space: nowrap; text-overflow: ellipsis; }
+.dg-palette-empty { padding: 10px; color: var(--text-3); }
+.dg-dot { width: 8px; height: 8px; border-radius: 50%; }
+
+.dg-count {
+  box-sizing: border-box;
+  height: 28px;
+  padding: 0 6px;
+  border: 1px solid var(--accent);
+  border-radius: var(--radius-sm);
+  outline: 3px solid var(--accent-soft);
+  background: var(--surface);
+  color: var(--text);
+  font: 700 15px var(--font-ui);
+  text-align: center;
+  z-index: 5;
+}
