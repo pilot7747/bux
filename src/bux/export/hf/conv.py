@@ -6,8 +6,8 @@ A conv of `size` taps and dilation r reads ``(size - 1) r`` inputs before each
 position. Decoding keeps them in the layer's cache slot, a ``LinearAttentionLayer``
 (``cache.update_conv_state``): a prefill convolves its own inputs, zero-padded on the
 left, and leaves the last of them; a decoding step convolves the kept ones and its
-own. Padded tokens of a left-padded batch are zeroed first, so that they leave
-nothing in the state.
+own (`history`). Padded tokens of a left-padded batch are zeroed first, so that they
+leave nothing in the state.
 
 A recurrent layer keeps its state in the same slot (`previous_state`, `keep_state`):
 none before its first call, a prefill, which starts from zero.
@@ -60,6 +60,22 @@ def keep_state(ctx: Ctx, slot: int, state: torch.Tensor) -> None:
         ctx.cache.update_recurrent_state(state, slot)
 
 
+def history(
+    x: torch.Tensor, ctx: Ctx, slot: int | None, state: int, keep: int
+) -> torch.Tensor:
+    """Return x, b t c, after the `keep` inputs before it, b keep+t c: zeros before a
+    prefill, or those the cache slot's conv state `state` kept, while decoding. It
+    keeps x's last `keep` there for the next call; without a slot or a cache, none."""
+    xs = F.pad(x, (0, 0, keep, 0))
+    if ctx.cache is None or slot is None or not keep:
+        return xs
+    decoding = ctx.cache.has_previous_state(slot, state)
+    full = ctx.cache.update_conv_state(
+        x.transpose(1, 2), slot, state, conv_kernel_size=keep
+    )
+    return full.transpose(1, 2) if decoding else xs
+
+
 class CausalConv(nn.Module):
     """bux's ``CausalConv``: each channel c of position t is
     ``sum_i w[i, c] x[t - (size - 1 - i) r, c]``, plus a bias, for the dilation r.
@@ -84,15 +100,7 @@ class CausalConv(nn.Module):
         conv state `state`); without a slot or a cache, as one whole sequence."""
         x = without_padding(x, ctx)
         t, r = x.shape[1], self.dilation
-        keep = (self.size - 1) * r
-        xs = F.pad(x, (0, 0, keep, 0))
-        if ctx.cache is not None and slot is not None and keep:
-            decoding = ctx.cache.has_previous_state(slot, state)
-            full = ctx.cache.update_conv_state(
-                x.transpose(1, 2), slot, state, conv_kernel_size=keep
-            )
-            if decoding:
-                xs = full.transpose(1, 2)
+        xs = history(x, ctx, slot, state, (self.size - 1) * r)
         y = sum(self.weight[i] * xs[:, i * r : i * r + t] for i in range(self.size))
         assert isinstance(y, torch.Tensor)
         return y if self.bias is None else y + self.bias
@@ -105,7 +113,7 @@ class Conv(CausalConv):
     bux_types = ("conv",)
 
     @staticmethod
-    def cache_type(c: dict) -> str:
+    def cache_type(c: dict, ports: list) -> str:
         """The cache layer it keeps, as ``config.layer_types`` names it."""
         return "conv"
 

@@ -18,7 +18,7 @@ import torch.nn.functional as F
 from torch import nn
 
 from .common import Ctx, Norm, Site
-from .conv import CausalConv
+from .conv import CausalConv, real_tokens
 
 
 class Engram(nn.Module):
@@ -36,7 +36,7 @@ class Engram(nn.Module):
     bux_types = ("engram",)
 
     @staticmethod
-    def cache_type(c: dict) -> str:
+    def cache_type(c: dict, ports: list) -> str:
         """The cache layer it keeps, as ``config.layer_types`` names it."""
         return "conv"
 
@@ -82,9 +82,9 @@ class Engram(nn.Module):
         them: 0 where there is none, before the sequence or in padding. Decoding,
         those are the ones the cache slot kept, and it keeps the last of these."""
         ids = ctx.tokens + 1
-        mask = ctx.attention_mask
-        if mask is not None and mask.ndim == 2:
-            ids = ids * mask[:, -ids.shape[1] :].to(ids.dtype)
+        keep = real_tokens(ctx, ids.shape[1])
+        if keep is not None:
+            ids = ids * keep.to(ids.dtype)
         before = ids.new_zeros(ids.shape[0], self.n - 1)
         cache = ctx.cache
         if cache is not None and cache.layers[slot].is_recurrent_states_initialized[0]:

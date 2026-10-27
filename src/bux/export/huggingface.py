@@ -2,8 +2,9 @@
 
 The directory holds:
 
-- ``config.json``: the IR, each layer's site, the cache layers' kinds, and the
-  ``auto_map`` that points transformers at the code;
+- ``config.json``: the IR, each layer's site, the cache layers' kinds, the names no
+  module takes (`bux.export.plan.RESERVED`), and the ``auto_map`` that points
+  transformers at the code;
 - ``configuration_bux.py`` and the exported layers' files (`bux.export.hf`), as they
   are in bux;
 - ``modeling_bux.py``, generated from the architecture (`bux.export.codegen`);
@@ -28,7 +29,7 @@ from safetensors.torch import save_file
 from bux.architecture import Model
 from bux.export import codegen, hf
 from bux.export.hf.common import KEEP_FLOAT32
-from bux.export.plan import Plan, plan
+from bux.export.plan import RESERVED, Plan, plan
 from bux.export.weights import Convert, Tensors, tensors
 from bux.lang import ir
 
@@ -49,8 +50,9 @@ def save(
     Args:
         arch: The architecture.
         model: Its bux model, whose weights to export, built with ``methods.repeat``
-            ``unroll``; None writes no weights, for vLLM to time the architecture
-            on random ones (``load_format="dummy"``).
+            ``unroll``; None writes no weights, and removes those an earlier export
+            left in `out`, for vLLM to time the architecture on random ones
+            (``load_format="dummy"``).
         out: The directory, made if missing; files in it of the same names are
             replaced.
         dtype: The weights' dtype in the checkpoint.
@@ -69,7 +71,9 @@ def save(
     out.mkdir(parents=True, exist_ok=True)
     layers = cache_layers(p)
     kinds = [kind for kind, _ in layers]
-    masks = sorted({m for call in p.calls for m in _masks(call.layer)}, key=repr)
+    # The masks of the layers it runs as it generates; those after them run without
+    # a cache, and make theirs as they need them.
+    masks = sorted({m for call in p.generation() for m in _masks(call.layer)}, key=repr)
     (out / "modeling_bux.py").write_text(codegen.modeling(p, masks))
     for f in Path(hf.__path__[0]).glob("*.py"):
         if f.name not in _NOT_COPIED:
@@ -92,14 +96,15 @@ def save(
         **({} if max_positions is None else {"max_position_embeddings": max_positions}),
         "bux": arch.model_dump(mode="json"),
         "bux_sites": p.sites(),
+        "bux_reserved": sorted(RESERVED),
     }
     (out / "config.json").write_text(json.dumps(config, indent=2) + "\n")
+    checkpoint = out / "model.safetensors"
     if model is None:
+        checkpoint.unlink(missing_ok=True)  # an earlier export's, of another model
         return p
     weights = tensors(p, model, _converter)
-    save_file(
-        _torch(weights, dtype), out / "model.safetensors", metadata={"format": "pt"}
-    )
+    save_file(_torch(weights, dtype), checkpoint, metadata={"format": "pt"})
     return p
 
 

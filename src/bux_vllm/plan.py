@@ -10,7 +10,7 @@ example architecture where `bux.export.plan` does.
 from __future__ import annotations
 
 import keyword
-from collections.abc import Iterator
+from collections.abc import Iterable, Iterator
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -59,17 +59,20 @@ class Scope:
         names: The attribute of each layer, repeat and residual algebra's branch in
             it, by its `Pos`.
         blocks: The scope of each repeat's body, by the repeat's `Pos`.
+        reserved: The names no module takes, as the export's config lists them
+            (``bux_reserved``, `bux.export.plan.RESERVED`).
     """
 
     root: Node
     key: str | None = None
     names: dict[Pos, str] = field(default_factory=dict)
     blocks: dict[Pos, Scope] = field(default_factory=dict)
+    reserved: frozenset[str] = frozenset()
 
     def name(self, hint: str) -> str:
         """Return a fresh attribute name from `hint`: ``norm``, then ``norm_1``."""
         hint = hint if hint.isidentifier() and not keyword.iskeyword(hint) else "layer"
-        taken = set(self.names.values()) | {"shared"}
+        taken = set(self.names.values()) | self.reserved
         name, i = hint, 1
         while name in taken:
             name, i = f"{hint}_{i}", i + 1
@@ -106,18 +109,21 @@ class Plan:
     calls: list[Call]
 
 
-def plan(arch: Node) -> Plan:
+def plan(arch: Node, reserved: Iterable[str] = ()) -> Plan:
     """Return the module tree of the IR `arch` (an architecture, as JSON), and the
-    calls of its layers."""
+    calls of its layers; `reserved` are the names no module takes, as the export's
+    config lists them (``bux_reserved``)."""
     graph = arch["graph"]
     algebra = (arch.get("residual") or {}).get("type")
     depths = _share_depths(graph, 0, {})
+    taken = frozenset(reserved)
     shared: dict[str, Scope] = {}
     for node in walk(graph):
         key = node.get("share")
         if key is not None and key not in shared:
-            shared[key] = scope(node, key, algebra=algebra, depth=depths[key])
-    top = scope(graph, graph.get("share"), top=True, algebra=algebra)
+            depth = depths[key]
+            shared[key] = scope(node, key, algebra=algebra, depth=depth, reserved=taken)
+    top = scope(graph, graph.get("share"), top=True, algebra=algebra, reserved=taken)
     out = Plan(top, shared, [])
     out.calls = list(_calls(out, graph, (), top, "model.", set(), True))
     return out
@@ -144,13 +150,14 @@ def scope(
     top: bool = False,
     algebra: str | None = None,
     depth: int = 0,
+    reserved: frozenset[str] = frozenset(),
 ) -> Scope:
     """Return the scope of the module computing `root`; `key` is the shared
     definition it is, whose root it names rather than calls. Under a residual
     `algebra`, a residual branch outside any other (`depth` counts those around
     `root`) is a module too, named by it. The model's scope (`top`) names its repeat
-    of the most passes ``layers``."""
-    s = Scope(root, key)
+    of the most passes ``layers``; no module takes a name of `reserved`."""
+    s = Scope(root, key, reserved=reserved)
     hints: dict[Pos, str] = {}
 
     def visit(node: Node, pos: Pos, depth: int) -> None:
@@ -164,7 +171,9 @@ def scope(
             if body.get("share") is None:
                 label = body.get("label")
                 hints[pos] = f"{label}s" if label else "blocks"
-                s.blocks[pos] = scope(body, None, algebra=algebra, depth=depth)
+                s.blocks[pos] = scope(
+                    body, None, algebra=algebra, depth=depth, reserved=reserved
+                )
         else:
             if kind == "residual" and algebra and depth == 0:
                 hints[pos] = algebra

@@ -13,8 +13,14 @@ import math
 import torch
 from torch import nn
 
-from .common import Ctx, Norm, Site
-from .conv import keep_state, previous_state, real_tokens, without_padding
+from .common import Ctx, Norm, Site, norm_config
+from .conv import (
+    history,
+    keep_state,
+    previous_state,
+    real_tokens,
+    without_padding,
+)
 from .linear_attention import LowRank, hold, l2norm, rank_one
 
 
@@ -31,7 +37,7 @@ class RWKV7(nn.Module):
     bux_types = ("rwkv7",)
 
     @staticmethod
-    def cache_type(c: dict) -> str:
+    def cache_type(c: dict, ports: list) -> str:
         """The cache layer it keeps, as ``config.layer_types`` names it."""
         return "linear_attention"
 
@@ -61,14 +67,7 @@ class RWKV7(nn.Module):
         self.k_k = nn.Parameter(torch.zeros(nk))
         self.k_a = nn.Parameter(torch.zeros(nk))
         self.r_k = nn.Parameter(torch.zeros(hv, dk))
-        norm = {
-            "type": "layernorm",
-            "eps": dv * c["norm_eps"],
-            "affine": True,
-            "bias": True,
-            "zero_centered": False,
-            "scale_input": False,
-        }
+        norm = norm_config("layernorm", dv * c["norm_eps"], bias=True)
         self.norm = Norm(norm, (hv, dv))
         self.o = nn.Linear(nv, width, bias=False)
 
@@ -109,12 +108,4 @@ class RWKV7(nn.Module):
     def previous(self, x: torch.Tensor, ctx: Ctx, slot: int) -> torch.Tensor:
         """Return every token's predecessor, zero before the first; while decoding,
         the one before this call's first, kept in the cache."""
-        first = torch.zeros_like(x[:, :1])
-        if ctx.cache is not None:
-            decoding = ctx.cache.has_previous_state(slot, 0)
-            kept = ctx.cache.update_conv_state(
-                x.transpose(1, 2), slot, 0, conv_kernel_size=1
-            )
-            if decoding:
-                first = kept[..., :1].transpose(1, 2)
-        return torch.cat([first, x[:, :-1]], 1)
+        return history(x, ctx, slot, 0, 1)[:, :-1]

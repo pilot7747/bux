@@ -16,11 +16,11 @@ from dataclasses import dataclass
 from typing import Any
 
 import torch
-import torch.nn.functional as F
 from torch import nn
 
 from .attention import SoftmaxAttention, reads, softmax_attention
 from .common import Ctx, Norm, Site
+from .conv import history
 from .rope import Rope, rotated_dims
 from .sparse import Indexer, key_positions
 
@@ -177,15 +177,7 @@ class CompressedSparseAttention(SoftmaxAttention):
         channel; the r - 1 last tokens stay in the cache layer's conv state."""
         r, t = self.ratio, both.shape[1]
         assert r is not None
-        keep = r - 1
-        xs = F.pad(both, (0, 0, keep, 0))
-        if ctx.cache is not None:
-            decoding = ctx.cache.has_previous_state(slot, 0)
-            full = ctx.cache.update_conv_state(
-                both.transpose(1, 2), slot, 0, conv_kernel_size=keep
-            )
-            if decoding:
-                xs = full.transpose(1, 2)
+        xs = history(both, ctx, slot, 0, r - 1)
         group = torch.stack([xs[:, i : i + t] for i in range(r)], 2)
         kv, gate = group.split(self.d, -1)
         return (kv * gate.softmax(2)).sum(2)

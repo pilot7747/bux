@@ -89,6 +89,10 @@ NEXTN = {
         "mhc(expansion=2, single_pass=true)",
         MTP + "mtp = $h nextn block out\nmodel = embed block^2 @h out mtp",
     ),
+    "in the head's definition": BLOCK
+    + "tail = rmsnorm head $h nextn block rmsnorm head\nmodel = embed block^2 @h tail",
+    "after a recurrent trunk": BLOCK + MTP + "mix = gdn(num_heads=2, head_dim=8)\n"
+    "model = embed [rmsnorm mix]^2 @h rmsnorm out $h nextn block rmsnorm out",
 }
 
 
@@ -120,6 +124,7 @@ ENGRAM = {
         "mem = engram(head_dim=4, table_size=50, conv_size=none)\n"
         "model = embed block mem block head",
     ),
+    "no attention": engram(model="embed mem [rmsnorm ffn] mem rmsnorm head"),
 }
 
 GRAPH = {
@@ -237,6 +242,10 @@ def test_generating_skips_multi_token_prediction() -> None:
     assert p.stop() is not None
     attention = [c for c in p.calls if c.layer.config.type == "gqa"]
     assert len(attention) == 4
+    assert [kind for kind, _ in cache_layers(p)] == ["full_attention"] * 2
+    # A head in a definition stops in it: what comes after it there is skipped too.
+    p = plan(compile(NEXTN["in the head's definition"]))
+    assert p.stop() == (3, 1)
     assert [kind for kind, _ in cache_layers(p)] == ["full_attention"] * 2
 
 

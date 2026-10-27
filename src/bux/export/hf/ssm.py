@@ -16,9 +16,9 @@ import torch
 import torch.nn.functional as F
 from torch import nn
 
-from .common import Ctx, Norm, Site
+from .common import Ctx, Norm, Site, norm_config
 from .conv import CausalConv, keep_state, previous_state, real_tokens, without_padding
-from .linear_attention import decayed, hold, rmsnorm, wide
+from .linear_attention import decayed, hold, wide
 
 
 def mamba_scan(
@@ -63,7 +63,7 @@ class Mamba(nn.Module):
     bux_types = ("mamba",)
 
     @staticmethod
-    def cache_type(c: dict) -> str:
+    def cache_type(c: dict, ports: list) -> str:
         """The cache layer it keeps, as ``config.layer_types`` names it."""
         return "linear_attention"
 
@@ -77,8 +77,9 @@ class Mamba(nn.Module):
         self.x_proj = nn.Linear(d_inner, r + 2 * n, bias=False)
         self.dt_proj = nn.Parameter(torch.zeros(r, d_inner))
         self.dt_bias = nn.Parameter(torch.zeros(d_inner))
-        self.dt_norm = Norm(rmsnorm(1e-6), r)
-        self.b_norm, self.c_norm = Norm(rmsnorm(1e-6), n), Norm(rmsnorm(1e-6), n)
+        rms = norm_config("rmsnorm")
+        self.dt_norm = Norm(rms, r)
+        self.b_norm, self.c_norm = Norm(rms, n), Norm(rms, n)
         self.A_log = nn.Parameter(torch.zeros(d_inner, n))
         self.D = nn.Parameter(torch.zeros(d_inner))
         self.out_proj = nn.Linear(d_inner, width, bias=False)
@@ -110,7 +111,7 @@ class Mamba2(nn.Module):
     bux_types = ("mamba2",)
 
     @staticmethod
-    def cache_type(c: dict) -> str:
+    def cache_type(c: dict, ports: list) -> str:
         """The cache layer it keeps, as ``config.layer_types`` names it."""
         return "linear_attention"
 
@@ -127,7 +128,7 @@ class Mamba2(nn.Module):
         self.dt_bias = nn.Parameter(torch.zeros(h))
         self.A_log = nn.Parameter(torch.zeros(h))
         self.D = nn.Parameter(torch.zeros(h))
-        self.norm = Norm(rmsnorm(1e-5), (g, d_inner // g))
+        self.norm = Norm(norm_config("rmsnorm", 1e-5), (g, d_inner // g))
         self.out_proj = nn.Linear(d_inner, width, bias=False)
 
     def forward(self, x: torch.Tensor, ctx: Ctx) -> torch.Tensor:
@@ -158,7 +159,7 @@ class ShortConv(nn.Module):
     bux_types = ("short_conv",)
 
     @staticmethod
-    def cache_type(c: dict) -> str:
+    def cache_type(c: dict, ports: list) -> str:
         """The cache layer it keeps, as ``config.layer_types`` names it."""
         return "conv"
 

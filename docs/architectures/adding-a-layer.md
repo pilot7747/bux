@@ -449,7 +449,7 @@ in full:
   `unsupported(c, ...)`; it is never ignored. Settings that only matter in training
   (dropout, a loss's weight) are, and its docstring says so.
 - **State while decoding.** A layer that keeps state says its cache's kind in
-  `cache_type(c)` and takes `ctx.cache_slot()` once per call; `hf/conv.py` is the
+  `cache_type(c, ports)` and takes `ctx.cache_slot()` once per call; `hf/conv.py` is the
   worked example, left padding included. A layer that reads attention masks lists
   them in `masks(c)`.
 - **Runs where transformers does.** It imports only torch, transformers and its

@@ -19,7 +19,7 @@ import torch
 import torch.nn.functional as F
 from torch import nn
 
-from .common import Ctx, Norm, Site
+from .common import Ctx, Norm, Site, norm_config
 
 #: In Sinkhorn's sums and added to mhc's read: DeepSeek-V4's hc_eps.
 EPS = 1e-6
@@ -39,18 +39,6 @@ def widening(residual: dict | None) -> int | None:
 def widen(x: torch.Tensor, n: int) -> torch.Tensor:
     """Return n copies of x, b t d: the widened stream that starts from it."""
     return x[:, :, None].expand(-1, -1, n, -1)
-
-
-def _norm(kind: str, eps: float, affine: bool = True) -> dict:
-    """Return the config of an algebra's own norm, as bux's ``NormalizationConfig``."""
-    return {
-        "type": kind,
-        "eps": eps,
-        "affine": affine,
-        "bias": False,
-        "zero_centered": False,
-        "scale_input": False,
-    }
 
 
 def mix(read: torch.Tensor, x: torch.Tensor) -> torch.Tensor:
@@ -95,7 +83,7 @@ class Dynamic(nn.Module):
 
     def __init__(self, d: int, columns: int, eps: float):
         super().__init__()
-        self.norm = Norm(_norm("layernorm", eps, affine=False), d)
+        self.norm = Norm(norm_config("layernorm", eps, affine=False), d)
         self.proj = nn.Parameter(torch.zeros(d, columns))
         self.scale = nn.Parameter(torch.tensor(0.01))
 
@@ -207,7 +195,7 @@ class GatedResidual(nn.Module):
     def __init__(self, c: dict, d: int, body: bool = True):
         super().__init__()
         n, rank = c["expansion"], c["rank"]
-        self.norm = Norm(_norm("rmsnorm", c["norm_eps"]), (n, d))
+        self.norm = Norm(norm_config("rmsnorm", c["norm_eps"]), (n, d))
         self.down = nn.Linear(n * d, rank, bias=False)
         self.up = nn.Linear(rank, n * d, bias=False)
         self.write = nn.Linear(n * d, n, bias=False) if body else None
@@ -254,7 +242,7 @@ class AttentionResidual(nn.Module):
     def __init__(self, c: dict, d: int, body: bool = True):
         super().__init__()
         self.query = nn.Parameter(torch.zeros(d))
-        self.key_norm = Norm(_norm("rmsnorm", c["norm_eps"]), d)
+        self.key_norm = Norm(norm_config("rmsnorm", c["norm_eps"]), d)
         self.block_size = c["block_size"]
 
     def read(self, x: torch.Tensor, ctx: Ctx) -> tuple[torch.Tensor, Any]:

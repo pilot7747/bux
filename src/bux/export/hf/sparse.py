@@ -20,18 +20,11 @@ from typing import Any
 import torch
 from torch import nn
 
-from .common import Ctx, Norm
+from .common import Ctx, Norm, norm_config
 from .rope import Rope
 
 #: DeepSeek-V3.2's indexer keys, projected from the layer's input, are layer-normalized.
-STREAM_KEY_NORM = {
-    "type": "layernorm",
-    "eps": 1e-06,
-    "affine": True,
-    "bias": True,
-    "zero_centered": False,
-    "scale_input": False,
-}
+STREAM_KEY_NORM = norm_config("layernorm", bias=True)
 
 
 def ordered(x: torch.Tensor) -> torch.Tensor:

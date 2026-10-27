@@ -267,7 +267,7 @@ class placeholders:
 def _kind_of(state: str) -> Any:
     """A placeholder's ``cache_type``: the cache layer `state` of every call."""
 
-    def cache_type(c: dict) -> str:
+    def cache_type(c: dict, ports: list) -> str:
         return state
 
     return cache_type

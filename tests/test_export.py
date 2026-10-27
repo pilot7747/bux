@@ -8,10 +8,14 @@ import typing
 from pathlib import Path
 
 import pytest
+from flax import nnx
+from transformers.modeling_utils import PreTrainedModel
 
 from bux import config as cfg
+from bux.architecture import Model
 from bux.export import check, codegen, hf
-from bux.export.plan import plan
+from bux.export.huggingface import save
+from bux.export.plan import RESERVED, plan
 from bux.lang import compile
 
 HEAD = "d_model = 64\nvocab_size = 256\n"
@@ -71,6 +75,31 @@ def test_a_shared_module_is_called_from_each_use() -> None:
     attn = [c for c in p.calls if c.layer.config.type == "gqa"]
     assert [c.path for c in attn] == ["model.shared.block.attn"] * 3
     assert [c.first for c in attn] == [True, False, False]
+
+
+def test_a_label_a_module_class_has_names_its_module_otherwise() -> None:
+    """Labels that torch's and transformers' module classes have as attributes take
+    a suffix, so that the generated classes keep theirs."""
+    source = HEAD + FFN.replace("ffn =", "forward =") + ATTN.replace("attn", "training")
+    arch = compile(
+        source
+        + "config = rmsnorm\nmodel = embed [config training] [config forward] head"
+    )
+    paths = [c.path for c in plan(arch).calls]
+    assert paths[1:4] == ["model.config_1", "model.training_1", "model.config_2"]
+    check.compare(arch, implementations=("eager",)).check()
+
+
+def test_the_reserved_names_cover_the_module_classes() -> None:
+    public = {n for n in dir(PreTrainedModel) if not n.startswith("_")}
+    assert public <= RESERVED, f"reserve {sorted(public - RESERVED)} in bux.export.plan"
+
+
+def test_an_export_without_weights_removes_an_earlier_one(tmp_path: Path) -> None:
+    arch = compile(HEAD + FFN + "model = embed [rmsnorm ffn] head")
+    save(arch, Model(arch, rngs=nnx.Rngs(0)), tmp_path)
+    save(arch, None, tmp_path)
+    assert not (tmp_path / "model.safetensors").exists()
 
 
 def test_a_config_constant_never_hides_a_layer_class() -> None:
