@@ -1280,7 +1280,7 @@ def train(
     stretches = curriculum.stretches(config)
     tokens = functools.partial(curriculum.tokens, stretches)
     log = Log(every=config.log.every, lr=lr, tokens=tokens, peak=peak)
-    work = functools.cache(functools.partial(step_flops, run)) if peak else None
+    work = _counted(run, stretches) if peak else None
     methods = stages.balanced(run)
     if methods.stages != config.methods.stages:
         echo(f"{run.name}: methods.stages = {methods.stages}")
@@ -1489,6 +1489,17 @@ def step_flops(
         graphdef, params, rest = nnx.split(abstract, nnx.Param, ...)
         ids = jax.ShapeDtypeStruct((rows, length), jnp.int32)
         return flops.count(gradient, params, rest, ids)
+
+
+def _counted(
+    run: ir.Run, stretches: Sequence[curriculum.Stretch]
+) -> Callable[[int, int], flops.Work]:
+    """Return the model FLOPs of a step of `run` on each shape of batch its `stretches`
+    take (`step_flops`), counted now, outside the run's mesh: under it, a pipeline's
+    program holds a stage's share of them, tick by tick."""
+    shapes = {(s.config.batch, s.config.seq_len) for s in stretches}
+    counted = {shape: step_flops(run, *shape) for shape in shapes}
+    return lambda rows, seq_len: counted[rows, seq_len]
 
 
 def _peak(run: ir.Run) -> float | None:

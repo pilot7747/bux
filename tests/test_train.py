@@ -799,6 +799,16 @@ class Steps(Sink):
         self.reports.append((step, set(scalars)))
 
 
+class Kept(Hook):
+    """Keeps the trainer a run makes."""
+
+    def start(self, trainer):
+        self.trainer = trainer
+
+    def __call__(self, trainer, metrics):
+        return None
+
+
 def test_a_trainer_takes_terms_hooks_and_sinks_of_ones_own():
     arch = compile(ARCH + "model = embed block norm head\n")
     loss = objective(tcfg.LossConfig(), arch)
@@ -855,6 +865,21 @@ def test_the_log_reports_mfu_where_the_devices_peak_is_known():
     flops_per_step = 3e6 + 2e6 * (8 + 1) / (2 * 8)
     assert trainer.flops == 2 * flops_per_step
     assert latest.metrics["mfu"] == pytest.approx(steps_per_s * flops_per_step / 1e9)
+
+
+def test_a_pipelined_step_s_flops_are_counted_outside_its_mesh(tmp_path, monkeypatch):
+    """Under it, a program of 2 stages holds a stage's share of each of its 3 ticks:
+    3/4 of the repeat's FLOPs, where the log's MFU counts them all."""
+    monkeypatch.setattr(trainer_module, "_peak", lambda run: 1e15)  # as a GPU's
+    run = smoke(
+        "steps = 1",
+        "mesh = mesh(stage=2)",
+        "methods = methods(repeat=scan, pipeline=gpipe, microbatches=2)",
+        "precision = precision(compute=float32)",  # XLA:CPU: no bfloat16 pipelines
+    )
+    kept = Kept()
+    train(run, tmp_path, echo=lambda _: None, hooks=[kept])
+    assert kept.trainer.flops == pytest.approx(step_flops(run).one_document(64))
 
 
 @pytest.mark.parametrize("donate", [False, True])

@@ -192,9 +192,11 @@ NVIDIA's datasheets for the SXM parts ({py:data}`bux.train.flops.PEAK`):
 
 ### How FLOPs are counted
 
-The model's FLOPs are counted once, before training, from the program of its loss's
-gradient on a batch, traced on shapes alone with remat and kernels off
-({py:func}`bux.train.trainer.step_flops`, {py:mod}`bux.train.flops`):
+The model's FLOPs are counted once for each shape of batch, before training, from
+the program of its loss's gradient on a batch, traced on shapes alone with remat and
+kernels off, and on one device: under the run's mesh, a pipeline's program would hold
+a stage's share of them ({py:func}`bux.train.trainer.step_flops`,
+{py:mod}`bux.train.flops`):
 
 - 2·m·n·k for every matrix product and convolution, times the length of every scan
   around it;
