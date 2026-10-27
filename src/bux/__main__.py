@@ -5,7 +5,7 @@ Usage::
     bux COMMAND FILE [SETTING=VALUE ...] [--entry NAME] [options]
 
     check     the model's layers, the run's training and the sweep's axes
-    plan      a line a run: parameters, tokens, FLOPs a token, GPUs, bytes a GPU
+    plan      a line per run: parameters, tokens, FLOPs per token, GPUs, bytes per GPU
     prepare   tokenize and pack the documents the runs read
     train     train the runs in this process, one after another
     launch    train what is left of the runs, a sweep's side by side on the GPUs
@@ -382,7 +382,7 @@ def parser() -> argparse.ArgumentParser:
     p.add_argument(
         "--workers",
         type=int,
-        help="prepare, launch: processes that prepare data (default: one a core)",
+        help="prepare, launch: processes that prepare data (default: one per core)",
     )
     return p
 

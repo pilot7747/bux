@@ -695,7 +695,7 @@ def launch(
         cache: Where prepared datasets go.
         gpus: The GPUs to train on, as ``CUDA_VISIBLE_DEVICES`` names them; None
             for every visible one (`visible_gpus`).
-        workers: Processes that prepare data: None for one a core.
+        workers: Processes that prepare data: None for one per core.
         echo: Where progress lines go.
 
     Returns:
@@ -770,7 +770,7 @@ def search(
         cache: Where prepared datasets go.
         gpus: The GPUs to train on, as ``CUDA_VISIBLE_DEVICES`` names them; None
             for every visible one (`visible_gpus`).
-        workers: Processes that prepare data: None for one a core.
+        workers: Processes that prepare data: None for one per core.
         here: Train in this process, as ``bux train`` does.
         echo: Where progress lines go.
 

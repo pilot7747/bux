@@ -1,6 +1,6 @@
 # Qwen3-30B-A3B (Alibaba, 2025): 48 layers of GQA with a norm on queries and keys, and
-# an MoE of 128 experts of 768, the top 8 a token, with no shared expert. 30.5B
-# parameters, 3.3B of them active a token.
+# an MoE of 128 experts of 768, the top 8 per token, with no shared expert. 30.5B
+# parameters, 3.3B of them active per token.
 d_model    = 2048
 vocab_size = 151936
 
