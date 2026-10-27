@@ -52,6 +52,15 @@ def kernels(monkeypatch):
     monkeypatch.setattr(flash, "tokamax_takes", lambda x: True)
 
 
+def test_tokamax_takes_heads_of_up_to_128_channels_in_half_precision(monkeypatch):
+    """Wider heads, Qwen3-Next's 256, go to cuDNN: tokamax's SM100 backward does not
+    fit them in a B300's shared memory."""
+    monkeypatch.setattr(flash, "tokamax_runs", lambda: True)
+    assert flash.tokamax_takes(jnp.zeros((1, 4, 2, 128), jnp.bfloat16))
+    assert not flash.tokamax_takes(jnp.zeros((1, 4, 2, 256), jnp.bfloat16))
+    assert not flash.tokamax_takes(jnp.zeros((1, 4, 2, 128), jnp.float32))
+
+
 def documents(positions: Int[np.ndarray, "b t"]) -> Int[Array, "b t"]:
     """The documents' ids of rows at `positions`, from 1, as Segments makes them."""
     start = np.concatenate(

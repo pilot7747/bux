@@ -289,3 +289,43 @@ def test_every_shape_a_run_takes_must_split_over_its_mesh(tmp_path):
     run = smoke("curriculum = phase(at=5, batch=4)")
     with pytest.raises(ValueError, match="from step 5, batch = 4 does not split"):
         train(run, tmp_path, echo=lambda _: None)
+
+
+def test_an_eval_of_its_own_shape_prepares_its_rows_and_reads_them(tmp_path):
+    held_out = tcfg.TextConfig(path="docs/*.parquet")
+    t = tcfg.TrainConfig(
+        data=held_out,
+        tokenizer=tcfg.TokenizerConfig(name="gpt2"),
+        optimizer=tcfg.AdamWConfig(lr=1e-3),
+        seq_len=64,
+        batch=4,
+        steps=10,
+        eval=(
+            tcfg.EvalConfig(name="short", data=held_out),
+            tcfg.EvalConfig(name="long", data=held_out, seq_len=256, batch=2),
+        ),
+    )
+    assert [job.seq_len for job in jobs(t)] == [64, 256]
+    short, long = (tcfg.evaluated(t, e) for e in tcfg.evals(t))
+    assert (long.batch, long.seq_len) == (2, 256)
+    assert short is t
+
+    run = smoke(
+        "steps = 4",
+        'eval = [eval(name="short", data=synthetic, every=2),'
+        ' eval(name="long", data=synthetic, every=2, seq_len=128, batch=8)]',
+    )
+    said: list[str] = []
+    train(run, tmp_path, echo=said.append)
+    assert any("short every 2, long every 2 of 8 × 128 tokens" in line for line in said)
+    lines = [
+        json.loads(line) for line in (directory(run, tmp_path) / "metrics.jsonl").open()
+    ]
+    assert [line["step"] for line in lines if "long_loss" in line] == [2, 4]
+
+
+def test_an_eval_of_its_own_shape_must_split_over_the_mesh(tmp_path):
+    """On the tests' 8 devices, an eval's 4 rows do not split: before anything runs."""
+    run = smoke('eval = eval(name="long", data=synthetic, seq_len=128, batch=4)')
+    with pytest.raises(ValueError, match="eval long: batch = 4 does not split"):
+        train(run, tmp_path, echo=lambda _: None)

@@ -161,10 +161,17 @@ def tokamax_runs() -> bool:
     return MOSAIC is not None and kernels.gpu()
 
 
+#: The widest heads tokamax's Mosaic kernels train: past 128 channels its SM100
+#: backward finds no tiling that fits a B300's 232 KB of shared memory (heads of 256,
+#: Qwen3-Next's, need 270 KB), and raises as it compiles.
+TOKAMAX_HEAD_DIM = 128
+
+
 def tokamax_takes(x: Float[Array, "*s"]) -> bool:
-    """Whether tokamax's Mosaic kernels run here and take `x`'s dtype: bfloat16 or
-    float16, not float32, which they reject."""
-    return tokamax_runs() and x.dtype in (jnp.bfloat16, jnp.float16)
+    """Whether tokamax's Mosaic kernels run here and take `x`: bfloat16 or float16,
+    not float32, which they reject, in heads of up to `TOKAMAX_HEAD_DIM` channels."""
+    dtype = x.dtype in (jnp.bfloat16, jnp.float16)
+    return tokamax_runs() and dtype and x.shape[-1] <= TOKAMAX_HEAD_DIM
 
 
 def triton_takes(x: Float[Array, "*s"]) -> bool:

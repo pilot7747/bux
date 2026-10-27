@@ -110,7 +110,9 @@ it left each source:
   ([Determinism](../data/sources.md#determinism)).
 
 An eval reads rows of the run's own `seq_len` and `batch`, whichever phase it is in,
-so its loss compares across phases.
+so its loss compares across phases; one that sets its own reads those
+([Long rows](running.md#long-rows)), as an eval of the long rows a long-context phase
+trains on.
 
 ## Compiles
 

@@ -172,6 +172,20 @@ def test_bux_export_writes_a_directory_that_loads_and_checks(trained, tmp_path, 
     assert "no checkpoint of step 1" in capsys.readouterr().err
 
 
+def test_bux_export_writes_a_files_model_without_weights(tmp_path, capsys):
+    """For vLLM's dummy weights: the code and config of any width, no checkpoint."""
+    file = Path(__file__).parent.parent / "examples" / "experiments" / "smoke.bux"
+    out = tmp_path / "out"
+    assert main(["export", str(file), str(out), "d_model = 32"]) == 0
+    assert "parameters exported to" in capsys.readouterr().out
+    config = json.loads((out / "config.json").read_text())
+    assert config["hidden_size"] == 32 and config["dtype"] == "bfloat16"
+    assert (out / "modeling_bux.py").exists()
+    assert not (out / "model.safetensors").exists()
+    assert main(["export", str(file), str(out), "--check"]) == 1
+    assert "no weights to --step or --check" in capsys.readouterr().err
+
+
 @pytest.fixture(scope="module")
 def tokenizer_json(tmp_path_factory) -> str:
     """conftest's byte-level BPE, saved by tokenizers, which transformers reads."""

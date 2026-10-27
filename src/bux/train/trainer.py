@@ -68,7 +68,13 @@ from bux.train import (
     trackers,
     xla,
 )
-from bux.train.config import PrecisionConfig, TrainConfig, evals
+from bux.train.config import (
+    EvalConfig,
+    PrecisionConfig,
+    TrainConfig,
+    evals,
+    evaluated,
+)
 from bux.train.data import Batch, batches, prefetch, training_batches
 from bux.train.hooks import Checkpoint, Eval, Hook, Later, Log, Profile
 from bux.train.objective import (
@@ -1279,7 +1285,7 @@ def train(
     if methods.stages != config.methods.stages:
         echo(f"{run.name}: methods.stages = {methods.stages}")
     with parallel.use(config.mesh, config.layout, methods):
-        _check_shapes(stretches)
+        _check_shapes(stretches, config)
         _check_cpu_bfloat16(run)
         model = parallel.build(lambda: Model(run.arch, rngs=nnx.Rngs(config.seed)))
         parallel.methods.prepare(run)
@@ -1347,7 +1353,7 @@ def _about(run: ir.Run, folder: Path, trainer: Trainer) -> list[str]:
     if t.observe is not None:
         more = " with histograms" if t.observe.histograms else ""
         watched.append(f"observe every {t.observe.every}{more}")
-    watched += [f"{e.name} every {e.every}" for e in evals(t)]
+    watched += [f"{e.name} every {e.every}{_eval_shape(t, e)}" for e in evals(t)]
     if t.checkpoint is not None:
         watched.append(f"checkpoint every {t.checkpoint.every}")
     watched += [config_to_source(c) for c in t.log.trackers]
@@ -1386,10 +1392,17 @@ def _check_cpu_bfloat16(run: ir.Run) -> None:
     )
 
 
-def _check_shapes(stretches: Sequence[curriculum.Stretch]) -> None:
-    """Raise unless every shape of batch the run takes splits over the mesh and the
-    microbatches (``parallel.check``), saying from which step where it is not the
-    first's."""
+def _eval_shape(t: TrainConfig, e: EvalConfig) -> str:
+    """Return the shape of eval `e`'s batches, ``" of 16 × 16384 tokens"``, where it
+    is its own; else nothing."""
+    shape = evaluated(t, e)
+    return "" if shape is t else f" of {shape.batch} × {shape.seq_len} tokens"
+
+
+def _check_shapes(stretches: Sequence[curriculum.Stretch], config: TrainConfig) -> None:
+    """Raise unless every shape of batch the run takes, and each eval of a shape of
+    its own, splits over the mesh and the microbatches (``parallel.check``), saying
+    from which step, or which eval, where it is not the first's."""
     for s in stretches:
         try:
             parallel.check(s.config.batch, s.config.seq_len)
@@ -1397,6 +1410,14 @@ def _check_shapes(stretches: Sequence[curriculum.Stretch]) -> None:
             raise ValueError(
                 f"from step {s.start}, {e}" if s.start else str(e)
             ) from None
+    for e in evals(config):
+        shape = evaluated(config, e)
+        if shape is config:
+            continue
+        try:
+            parallel.check(shape.batch, shape.seq_len)
+        except ValueError as err:
+            raise ValueError(f"eval {e.name}: {err}") from None
 
 
 def _reduce_dtype(precision: PrecisionConfig) -> str:
@@ -1492,7 +1513,8 @@ def _hooks(
     sets = evals(config)
     token_bytes = _token_bytes(config, run.arch.vocab_size) if sets else None
     for e in sets:
-        data = functools.partial(make_batches, e.data, held_out=True)
+        shape = evaluated(config, e)
+        data = functools.partial(make_batches, e.data, config=shape, held_out=True)
         hooks.append(
             Eval(
                 data,

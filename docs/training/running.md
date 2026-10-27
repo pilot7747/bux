@@ -244,6 +244,8 @@ the run has a `tokenizer`.
 | `data` | required | the held-out rows: any data a run takes, a mixture too |
 | `every` | `1000` | steps between evals |
 | `batches` | `10` | batches of `batch` rows each, the same ones every time |
+| `seq_len` | `none` | tokens a row; none: the run's `seq_len` |
+| `batch` | `none` | rows a batch; none: the run's `batch` |
 
 An eval is a training step's forward on packed rows, with no backward. Each batch
 sums what it measures over its targets, and the eval adds the sums up:
@@ -280,6 +282,23 @@ This run logs `web_loss`, `web_bpb`, `code_loss` and `code_bpb`, and the console
 shows each eval on a line of its own. An eval of a mixture measures the mixture as a
 whole; to measure each source, give each an eval. `bux launch`'s summary shows the
 first eval's loss.
+
+### Long rows
+
+An eval reads rows of the run's own `seq_len` and `batch` unless it sets its own, so
+that a model trained on short rows is held to long ones too, as after a
+long-context phase ([Curriculum](curriculum.md)):
+
+```bux
+seq_len    = 2048
+curriculum = phase(at=0.9, seq_len=16384, batch=batch // 8, data=repos)
+eval = [eval(name="code", data=code_eval),
+        eval(name="repo", data=repos_eval, seq_len=16384, batch=8)]
+```
+
+`bux prepare` packs the held-out documents at the eval's `seq_len`, and the run checks
+before it trains that the eval's rows split over its mesh, as a phase's must. The
+eval's step compiles once more, for its shape.
 
 ## Checkpoints
 
