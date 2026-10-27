@@ -161,10 +161,11 @@ def tokamax_runs() -> bool:
     return MOSAIC is not None and kernels.gpu()
 
 
-#: The widest heads tokamax's Mosaic kernels train: past 128 channels its SM100
-#: backward finds no tiling that fits a B300's 232 KB of shared memory (heads of 256,
-#: Qwen3-Next's, need 270 KB), and raises as it compiles.
-TOKAMAX_HEAD_DIM = 128
+#: The widest heads tokamax's Mosaic kernels train: MLA's of 192 (and values of 128)
+#: train on a B300 (132k tok/s, ``docs/performance/kernels.md``), but past them its
+#: SM100 backward finds no tiling that fits the 232 KB of shared memory (heads of
+#: 256, Qwen3-Next's, need 270 KB), and raises as it compiles.
+TOKAMAX_HEAD_DIM = 192
 
 
 def tokamax_takes(x: Float[Array, "*s"]) -> bool:

@@ -52,11 +52,12 @@ def kernels(monkeypatch):
     monkeypatch.setattr(flash, "tokamax_takes", lambda x: True)
 
 
-def test_tokamax_takes_heads_of_up_to_128_channels_in_half_precision(monkeypatch):
-    """Wider heads, Qwen3-Next's 256, go to cuDNN: tokamax's SM100 backward does not
-    fit them in a B300's shared memory."""
+def test_tokamax_takes_heads_of_up_to_192_channels_in_half_precision(monkeypatch):
+    """MLA's queries of 192 train by tokamax on a B300; wider heads, Qwen3-Next's 256,
+    go to cuDNN: tokamax's SM100 backward does not fit them in its shared memory."""
     monkeypatch.setattr(flash, "tokamax_runs", lambda: True)
     assert flash.tokamax_takes(jnp.zeros((1, 4, 2, 128), jnp.bfloat16))
+    assert flash.tokamax_takes(jnp.zeros((1, 4, 2, 192), jnp.bfloat16))
     assert not flash.tokamax_takes(jnp.zeros((1, 4, 2, 256), jnp.bfloat16))
     assert not flash.tokamax_takes(jnp.zeros((1, 4, 2, 128), jnp.float32))
 

@@ -83,8 +83,8 @@ rows:
 2. else, in rows of documents or with a window, FlashAttention-4's (`fa4`), which
    takes sinks, a soft cap and MLA's head dims;
 3. else cuDNN's packed layout, in rows of 8192 positions or more, or with a window;
-4. else tokamax's kernel, which takes sinks and a soft cap, in heads of up to 128
-   channels (past that its SM100 backward does not fit in shared memory);
+4. else tokamax's kernel, which takes sinks and a soft cap, in heads of up to 192
+   channels, MLA's (past that its SM100 backward does not fit in shared memory);
 5. in float32, tokamax's Triton kernel where there are no sinks;
 6. else cuDNN where it takes the call, else `xla`.
 
@@ -96,7 +96,7 @@ too for what only `xla` has ([below](#constraints-and-errors)).
 ### `ring`
 
 - Every key and value is gathered once over `context`. A device then makes a flash
-  call (tokamax's; jnp's on a CPU, and in heads wider than tokamax's 128 channels,
+  call (tokamax's; jnp's on a CPU, and in heads wider than tokamax's 192 channels,
   all of a block's logits at once) for each device's block of them, merged by their
   logsumexps.
 - A device's own block comes first, from its own keys and values, while the others'
@@ -117,10 +117,10 @@ too for what only `xla` has ([below](#constraints-and-errors)).
 |---|---|---|
 | `xla` | everything | |
 | `cudnn` | bfloat16 or float16; keys' and values' head dims equal, up to 256 in steps of 8 (its packed layout gets MLA's wrong) | `NotImplementedError` for a soft cap, sinks, positions over `context` (`ulysses` gives it whole rows), or a call it cannot take |
-| `tokamax` | a GPU, the `cuda` extra (Linux only), bfloat16 or float16; heads of up to 128 channels, past which its SM100 backward does not fit a B300's shared memory (`auto` passes wider ones by) | `NotImplementedError` otherwise |
+| `tokamax` | a GPU, the `cuda` extra (Linux only), bfloat16 or float16; heads of up to 192 channels, MLA's, past which its SM100 backward does not fit a B300's shared memory (`auto` passes wider ones by) | `NotImplementedError` otherwise |
 | `fa4` | a Blackwell GPU (SM 10.x), the `cuda` extra, bfloat16 or float16; keys' and values' head dims equal, up to 128 in steps of 8, or 192 and 128 (MLA) | `NotImplementedError` for positions over `context` (`ulysses` gives it whole rows), or a call it cannot take |
 | `ulysses` | `context` dividing a device's heads; kv heads it does not divide are repeated | `ValueError` naming both counts |
-| `ring` | documents, a window, a soft cap and sinks; tokamax's kernel on a GPU in heads of up to 128 channels, jnp's past them and on a CPU | |
+| `ring` | documents, a window, a soft cap and sinks; tokamax's kernel on a GPU in heads of up to 192 channels, jnp's past them and on a CPU | |
 
 - **What only `xla` has stays in the layer:** relative bias, length scale and
   attention dropout. A layer with one of them under a method other than `xla` or
@@ -210,11 +210,11 @@ Sparse attention (an indexer's top-k, CSA's compressed latents) attends by
 - On a GPU, tokamax's flash kernel runs each part with the kept keys as a boolean
   mask: dense compute, exact, and t² bits of mask forward and bytes backward. Keys
   kept for each group (MSA) run a group at a time, each with its group's mask. It
-  takes heads of up to 128 dims (`flash.TOKAMAX_HEAD_DIM`), dense attention's
-  limit: on a B300 its backward finds no tiling for heads of 256. Sparse attention
-  under this limit has not been run on a GPU.
+  takes heads of up to 192 dims (`flash.TOKAMAX_HEAD_DIM`), dense attention's
+  limit: on a B300 MLA's 192 train, and its backward finds no tiling for heads of
+  256. Sparse attention under this limit has not been run on a GPU since.
 - Under `xla`, off a GPU, in `bux.kernels.off()`, or for wider heads (Qwen3.8's
-  and GLM-5.3's 256, MLA's 192), XLA runs it a chunk of queries at a time.
+  and GLM-5.3's 256), XLA runs it a chunk of queries at a time.
 - Either way it is a `shard_map` that gives a device its rows, queries and heads, and
   every key: all-gather CP.
 - CSA's latents, 512 wide, run by cuDNN's DSA kernels on a B200 or B300 in the same
@@ -223,7 +223,7 @@ Sparse attention (an indexer's top-k, CSA's compressed latents) attends by
   runs by XLA.
 
 The indexer's loss takes the attention's probabilities once, from its logsumexp, a
-chunk of queries at a time (on a GPU by a kernel for heads of up to 128 dims). It
+chunk of queries at a time (on a GPU by a kernel for heads of up to 192 dims). It
 scores each query's picks in a `shard_map` that gives a device its rows and queries
 and every key: on a B200 or B300 by cuDNN's kernels (`indexer_cudnn`), the softmax of
 the picks' scores forward and GEMMs over blocks of 128 picks backward; on another GPU
@@ -266,7 +266,7 @@ The rows of a run without documents have ids too, all one document. So `auto` an
 :::{note}
 Under XLA's deterministic ops, XLA builds no graph for cuDNN's attention backward on a
 B300 ("No serialized cuDNN graph"), so there `flash.CUDNN`'s backward is tokamax's,
-in heads of up to 128 channels.
+in heads of up to 192 channels.
 :::
 
 ### Rows of documents

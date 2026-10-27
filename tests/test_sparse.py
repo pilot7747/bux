@@ -147,7 +147,7 @@ def test_tokamaxs_run_a_group_at_a_time_attends_as_one_run(monkeypatch):
 def test_tokamax_takes_the_heads_dense_attention_gives_it(monkeypatch, dims):
     """On a GPU, a part runs by tokamax's kernel in heads dense attention gives it, up
     to `flash.TOKAMAX_HEAD_DIM` (its backward finds no tiling for heads of 256 on a
-    B300); wider ones (MLA's 192, Qwen3.8's 256) run by XLA."""
+    B300); wider ones (Qwen3.8's and GLM-5.3's 256) run by XLA."""
     monkeypatch.setattr(kernels, "gpu", lambda: True)
     monkeypatch.setattr(sparse, "MOSAIC", object())
     monkeypatch.setattr(parallel.flash, "MOSAIC", object())

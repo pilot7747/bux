@@ -249,7 +249,7 @@ def attend(
 
     Under ``methods.attention`` ``auto`` or ``tokamax``, tokamax's flash kernel runs
     each part on a GPU in bfloat16 or float16 whose heads are
-    `~bux.parallel.flash.TOKAMAX_HEAD_DIM` (128) dims at most, as dense attention's
+    `~bux.parallel.flash.TOKAMAX_HEAD_DIM` (192) dims at most, as dense attention's
     do; XLA runs the others a chunk of queries at a time, as it runs every part
     under ``xla``. With ``seq`` over ``context`` a device has its queries and every key:
     all-gather context parallelism.
