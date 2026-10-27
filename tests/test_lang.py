@@ -547,6 +547,13 @@ def test_a_macro_call_in_a_sequence_prints_inline_and_round_trips():
     assert ir.strip(compile(source).graph) == ir.strip(arch.graph)
 
 
+def test_a_shared_definition_named_with_an_underscore_stays_shared():
+    arch = build("shared _blk = [norm attn]\nmodel = embed _blk _blk head")
+    source = to_source(arch)
+    assert "shared _blk = [norm attn]" in source
+    assert ir.strip(compile(source).graph) == ir.strip(arch.graph)
+
+
 FUZZ_PIECES = [
     "norm",
     "attn",

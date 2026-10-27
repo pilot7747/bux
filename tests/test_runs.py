@@ -536,6 +536,14 @@ def test_a_layer_field_newer_than_ids_keeps_them_where_it_computes_as_before(
     assert run_of(None).id == run_of(before).id == old != run_of(after).id
 
 
+def test_strings_that_name_a_setting_print_quoted():
+    """A bare `data` would be the run's data, not the mesh axis."""
+    [run] = runs(RUN + 'layout.batch = ["data", "expert"]')
+    assert 'layout(batch=["data", expert])' in run_to_source(run)
+    [again] = compile_runs(run_to_source(run))
+    assert again.train == run.train
+
+
 @pytest.mark.parametrize("path", EXPERIMENTS, ids=lambda p: p.stem)
 def test_experiments_compile_and_print_back_to_the_same_runs(path):
     report = check(path.read_text(), filename=str(path))
