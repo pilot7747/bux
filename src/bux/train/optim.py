@@ -160,12 +160,8 @@ def _(c: tcfg.CosineSchedule, train: tcfg.TrainConfig) -> Schedule:
     """A cosine decay from the peak after the warmup to `final` times it at the last
     step, or at the `horizon` of the steps."""
     steps, warmup = round(c.horizon * train.steps), tcfg.warmup_steps(c, train.steps)
-
-    def curve(step: Real[ArrayLike, ""]) -> Float[Array, ""]:
-        t = jnp.clip((step + 1 - warmup) / max(steps - warmup, 1), 0, 1)
-        return c.final + (1 - c.final) * 0.5 * (1 + jnp.cos(math.pi * t))
-
-    return curve
+    length = steps - warmup
+    return lambda step: _toward(1.0, c.final, "cosine", _through(step, warmup, length))
 
 
 @schedules.register("wsd")
