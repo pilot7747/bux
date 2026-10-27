@@ -1,0 +1,13 @@
+# The ladder of the 2026 family: four widths, each trained on 20 tokens for every
+# active parameter besides the embeddings, as its target at d_model = 3072 would be
+# (91B, 6.54B active, 131B tokens). The batch as in old_ladder.bux; the learning rate
+# of d512 and d768 their searches' best trial, of the wider rungs 2.6e-3, inside the
+# flat bottom of both searched widths.
+use new_2026
+use agentic_code
+
+d_model      = d512: 512  | d768: 768   | d1024: 1024 | d1280: 1280
+budget       = d512: 642M | d768: 2.12B | d1024: 4.96B | d1280: 9.62B
+batch        = d512: 64   | d768: 128   | d1024: 192   | d1280: 320
+optimizer.lr = d512: 2.31e-3 | d768: 1.24e-3 | d1024: 2.6e-3 | d1280: 2.6e-3
+mesh         = d512: mesh(data=1) | d768: mesh(data=2) | d1024: mesh(fsdp=8) | d1280: mesh(fsdp=8)

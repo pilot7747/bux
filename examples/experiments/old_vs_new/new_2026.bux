@@ -1,0 +1,24 @@
+# The 2026 decoder of the tutorial "Old against new at the same serving cost", laid out
+# as Qwen3-Next is: three Gated DeltaNet layers to one of gated attention, each
+# followed by a fine-grained MoE. The attention has 2 key and value heads of 256
+# dims, QK-norm, RoPE on a quarter of the channels at base 10M and a gate on its
+# output; the MoE has 256 experts a quarter of the width wide, 8 routed and 1 shared
+# for every token, as DeepSeek-V3 splits them; the norms are zero-centered RMSNorms.
+# One number sizes it, the width: a layer for each 64 of it.
+d_model    = 3072
+vocab_size = 50304                       # GPT-NeoX's 50277 tokens, padded
+
+norm    = rmsnorm(zero_centered=true)
+delta   = gdn(num_heads=d_model // 128, num_v_heads=d_model // 64, head_dim=128)
+attn    = gqa(num_heads=d_model // 128, num_kv_heads=2, head_dim=256, gated=true,
+              qk_norm=norm, rope=rope(base=10000000, fraction=0.25))
+experts = moe(num_experts=256, top_k=8, num_shared_experts=1, shared_expert_gate=true,
+              aux_loss_coef=1e-3,
+              expert=gated_mlp(intermediate_size=d_model // 4, activation=swish))
+
+layer(mixer) = [norm mixer] [norm experts]
+D = layer(delta)
+A = layer(attn)
+
+groups = d_model // 256
+model  = embed "DDDA"^groups norm head

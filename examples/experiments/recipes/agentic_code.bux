@@ -1,0 +1,41 @@
+# The training of the tutorial "Old against new at the same serving cost", with no
+# model of its own: code first, web text beside it, and a long-context phase over
+# whole Python repositories at the end. A ladder uses it beside a family:
+#
+#   use old_2022
+#   use agentic_code
+#   d_model = 1024
+#   budget  = 2B
+#
+# The data is Common Pile's Stack v2 Edu (scripts/old_vs_new/stack_edu.py), files and
+# repositories held out by repository, and FineWeb-Edu's 10BT sample.
+tokenizer  = tokenizer(name="EleutherAI/gpt-neox-20b")
+web        = text(path="data/fineweb-edu/sample/10BT/*.parquet")
+code       = text(path="data/stack-edu/files/train/*.parquet")
+code_eval  = text(path="data/stack-edu/files/eval/*.parquet")
+repos      = text(path="data/stack-edu/repos/train/*.parquet")
+repos_eval = text(path="data/stack-edu/repos/eval/*.parquet")
+packing    = best_fit
+
+data    = 0.6 * code + 0.4 * web(split=[0, 0.999])
+seq_len = 2048
+batch   = 256
+budget  = 10B                            # tokens
+steps   = budget // (batch * seq_len)
+
+# The last tenth of the tokens in rows of 16k, half of them whole repositories, as
+# many tokens a step as before. It falls inside the schedule's cooldown.
+long       = 0.5 * repos + 0.3 * code + 0.2 * web(split=[0, 0.999])
+curriculum = phase(at=0.9, seq_len=16384, batch=batch // 8, data=long)
+
+optimizer = adamw(lr=3e-3, weight_decay=0.1)
+schedule  = wsd(warmup=0.05, decay=0.2, shape=sqrt)
+loss      = loss(z=1e-4)
+
+# Held-out code and web text, 5.2M tokens each in rows of 2k, and held-out
+# repositories, 2.1M tokens in rows of 16k: the same rows whatever a run's batch.
+# What a search minimizes and the ladder fits, code weighed most.
+eval = [eval(name="code", data=code_eval, every=2k, batch=64, batches=40),
+        eval(name="web", data=web(split=[0.999, 1]), every=2k, batch=64, batches=40),
+        eval(name="repo", data=repos_eval, every=2k, seq_len=16384, batch=8, batches=16)]
+objective = 0.5 * code_bpb + 0.3 * repo_bpb + 0.2 * web_bpb

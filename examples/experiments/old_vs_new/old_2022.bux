@@ -1,0 +1,17 @@
+# The 2022 decoder of the tutorial "Old against new at the same serving cost", built as
+# OPT, GPT-NeoX and Pythia were: multi-head attention with RoPE at base 10k on every
+# channel, a LayerNorm before each branch, a GELU MLP four times the width, biases and
+# an untied head. One number sizes it, the width: a layer for each 128 of it, and a
+# head of 128 for each 128, so that d_model = 4096 is OPT-6.7B's shape, 32 layers of
+# 32 heads, 6.4B parameters besides the embeddings.
+d_model    = 4096
+vocab_size = 50304                       # GPT-NeoX's 50277 tokens, padded
+
+norm  = layernorm(eps=1e-5, bias=true)
+attn  = gqa(num_heads=d_model // 128, num_kv_heads=d_model // 128, bias=true,
+            rope=rope(base=10000))
+ffn   = mlp(intermediate_size=4 * d_model, activation=gelu, bias=true)
+block = [norm attn] [norm ffn]
+
+layers = d_model // 128
+model  = embed block^layers norm head

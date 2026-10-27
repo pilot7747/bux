@@ -1,7 +1,7 @@
 # Tutorials
 
 Complete walkthroughs, each a numbered list of steps you can follow on a laptop's
-CPU in a few minutes. Every command was run as written, and its output is pasted from
+CPU in a few minutes, but the last, which takes a node of GPUs. Every command was run as written, and its output is pasted from
 that run, trimmed where it repeats. Do them in order the first time: each builds on
 the files of the one before.
 
@@ -15,6 +15,7 @@ the files of the one before.
 | [Add a layer](add-a-layer.md) | Add a new layer to bux end to end: its config, its builder, its use in a `.bux` file, hover docs and a test. |
 | [Custom training](custom-training.md) | Replace an optimizer by registry, add a hook, a sink and a loss term, and drive a `Trainer` from a script. |
 | [Scale out](scale-out.md) | Split one run six ways over a CPU's fake devices, then see what changes on a GPU node and on many nodes. |
+| [Old against new at the same serving cost](old-vs-new.md) | On a node of 8 GPUs: price a 2022 7B and a 2026 hybrid MoE in vLLM under an agentic load, tune each family's learning rate by search, fit both scaling ladders and extrapolate. |
 
 ## Before you start
 
@@ -50,4 +51,5 @@ fine-tuning-chat
 add-a-layer
 custom-training
 scale-out
+old-vs-new
 ```

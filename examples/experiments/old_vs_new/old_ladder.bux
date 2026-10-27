@@ -1,0 +1,14 @@
+# The ladder of the 2022 family: five widths, each trained on 20 tokens for every
+# parameter besides the embeddings, as its 7B target would be (6.44B, 129B tokens).
+# The batch follows DeepSeek LLM's batch-size law, B = 0.292 C^0.327 tokens, rounded
+# to 32 rows. The learning rate of d512, d768 and d1024 is their searches' best trial;
+# d1280 and d1536 train within 5% of the optimum the three share, 1.5e-3 to 1.8e-3,
+# which does not move with width under the normal init.
+use old_2022
+use agentic_code
+
+d_model      = d512: 512  | d768: 768  | d1024: 1024 | d1280: 1280 | d1536: 1536
+budget       = d512: 252M | d768: 850M | d1024: 2.02B | d1280: 3.94B | d1536: 6.8B
+batch        = d512: 32   | d768: 64   | d1024: 128  | d1280: 192  | d1536: 256
+optimizer.lr = d512: 1.53e-3 | d768: 1.32e-3 | d1024: 2.26e-3 | d1280: 1.57e-3 | d1536: 1.43e-3
+mesh         = d512: mesh(data=1) | d768: mesh(data=1) | d1024: mesh(data=2) | d1280: mesh(data=4) | d1536: mesh(data=8)
