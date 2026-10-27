@@ -3,8 +3,8 @@ row, an E4M3 scale a block and a float32 scale a tensor. W quantizes in 16 x 16 
 so that W and W^T hold the same values; dy rounds stochastically; and x^T and dy^T,
 which dW multiplies, go through a random Hadamard transform of each 16 first.
 
-`twice` quantizes an operand and its transpose (a ``blockscaled.Twice``): on a GPU by
-Transformer Engine's kernels where they take it
+`twice` quantizes an operand and its transpose (a ``blockscaled.Twice``): on a
+Blackwell GPU by Transformer Engine's kernels where they take it
 (`~bux.architecture.precision.nvfp4_te`), else by two passes of Pallas kernels
 (`kernel_twice`), the first for the largest magnitudes, which set the tensor scales,
 the second writing both copies, rounded by Blackwell's E2M1 conversions; elsewhere by
@@ -39,6 +39,8 @@ from bux.parallel.layout import axes_of
 
 BLOCK = 16
 E2M1_MAX = 6.0  # float4 E2M1's largest value
+# The compute capability the kernels need, for the E2M1 conversions: Blackwell's on.
+CAPABILITY = 10.0
 
 
 def twice(
@@ -47,8 +49,8 @@ def twice(
     tiles: bool = False,
     stochastic: bool = False,
 ) -> tuple[Blocks, Blocks]:
-    """Return x and x^T in NVFP4: on a GPU by TE's kernels where they take x, else by
-    bux's; by XLA elsewhere.
+    """Return x and x^T in NVFP4: on a GPU of `CAPABILITY` or more by TE's kernels
+    where they take x, else by bux's; by XLA elsewhere.
 
     Args:
         x: the operand, (r, c).
@@ -60,7 +62,7 @@ def twice(
         x and x^T, each in blocks of 16 along its rows. x^T goes through the random
         Hadamard transform first, unless `tiles`.
     """
-    if not kernels.gpu():
+    if not kernels.gpu() or kernels.capability() < CAPABILITY:
         return xla_twice(x, seed, tiles, stochastic)
     from bux.architecture.precision import nvfp4_te  # which builds on this module
 

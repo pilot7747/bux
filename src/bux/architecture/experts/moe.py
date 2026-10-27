@@ -837,8 +837,9 @@ def grouped_product(
         w: the experts' matrices.
         sizes: how many rows each expert has.
         recipe: the block-scaled format to multiply in where x and w are whole blocks
-            of it (`~bux.architecture.experts.grouped_blockscaled`); None, or other
-            shapes, multiply in compute (`~bux.architecture.experts.grouped`).
+            of it (`~bux.architecture.experts.grouped_blockscaled`); None, other
+            shapes, or a precision whose ``passes`` name no GEMM multiply in compute
+            (`~bux.architecture.experts.grouped`).
         picked: where the rows were gathered from, for the format's quantizer to
             read them there; None to read `x`.
         summed: the tokens the rows sum into; None to return the rows.
@@ -846,13 +847,12 @@ def grouped_product(
     Returns:
         The products, (n, f), or with `summed` the tokens' sums, (t, f).
     """
-    if recipe is None or not grouped_blockscaled.fits(x, w):
+    passes = matmuls.in_force().passes
+    if recipe is None or not passes or not grouped_blockscaled.fits(x, w):
         y = checkpoint_name(ragged_dot(x, w, sizes), "experts")
         return y if summed is None else sums_of_tokens(y, summed)
-    precision, seed = matmuls.in_force(), matmuls.seed()
-    passes = precision.passes
     y = grouped_blockscaled.ragged_dot(
-        x, w, sizes, recipe, seed, passes, picked, summed
+        x, w, sizes, recipe, matmuls.seed(), passes, picked, summed
     )
     return checkpoint_name(y, "experts")
 
@@ -913,7 +913,7 @@ def _token_rows_forward(
 def _token_rows_backward(
     k: int, inverse: Int[Array, " M"], g: Float[Array, "m d"]
 ) -> tuple[Float[Array, "n d"], None, None]:
-    return _sum_by_token(g, inverse, k), None, None
+    return grouped_blockscaled.sum_by_token(g, inverse.reshape(-1, k)), None, None
 
 
 token_rows.defvjp(_token_rows_forward, _token_rows_backward)
@@ -943,13 +943,13 @@ def token_sums(
     Returns:
         The tokens' sums, (n, d), added up in float32.
     """
-    return _sum_by_token(x, inverse, k)
+    return grouped_blockscaled.sum_by_token(x, inverse.reshape(-1, k))
 
 
 def _token_sums_forward(
     x: Float[Array, "m d"], inverse: Int[Array, " M"], order: Int[Array, " m"], k: int
 ) -> tuple[Float[Array, "n d"], Int[Array, " m"]]:
-    return _sum_by_token(x, inverse, k), order
+    return grouped_blockscaled.sum_by_token(x, inverse.reshape(-1, k)), order
 
 
 def _token_sums_backward(
@@ -959,16 +959,6 @@ def _token_sums_backward(
 
 
 token_sums.defvjp(_token_sums_forward, _token_sums_backward)
-
-
-def _sum_by_token(
-    x: Float[Array, "m d"], inverse: Int[Array, " M"], k: int
-) -> Float[Array, "n d"]:
-    """Return each token's sum of its k picks' rows, in float32: x[inverse], 0 where
-    `inverse` is past the rows of x."""
-    picks = jnp.take(x, inverse, axis=0, mode="fill", fill_value=0)
-    summed = jnp.sum(picks.reshape(-1, k, x.shape[-1]), 1, dtype=jnp.float32)
-    return summed.astype(x.dtype)
 
 
 @register("moe")

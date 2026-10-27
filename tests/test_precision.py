@@ -15,7 +15,7 @@ from jax.sharding import PartitionSpec as P
 from jaxtyping import Array, Float
 
 from bux import config as cfg
-from bux import parallel
+from bux import kernels, parallel
 from bux.architecture import Model
 from bux.architecture.experts import grouped_blockscaled
 from bux.architecture.experts.moe import MoE
@@ -365,6 +365,36 @@ def test_the_nvfp4_kernels_quantize_as_xla_does_on_any_split(spec, kind):
         assert ours.tensor_scale == theirs.tensor_scale
 
 
+# A GPU's compute capability, and the quantizers whose kernels run on it: MXFP8's from
+# Ada on, for Triton's E4M3; NVFP4's on Blackwell, for its E2M1 conversions.
+KERNELS_ON = {8.0: [], 9.0: ["mxfp8"], 10.3: ["mxfp8", "nvfp4"]}
+
+
+@pytest.mark.parametrize("capability", KERNELS_ON)
+def test_the_quantizers_kernels_run_on_the_gpus_that_convert_to_their_formats(
+    monkeypatch, capability
+):
+    ran = []
+
+    def counted(module, name: str, fmt: str) -> None:
+        kernel = getattr(module, name)  # interpreted here, as off a GPU
+
+        def run(*args):
+            ran.append(fmt)
+            return kernel(*args)
+
+        monkeypatch.setattr(module, name, run)
+
+    counted(blockscaled, "mx_kernel_twice", "mxfp8")
+    counted(nvfp4, "kernel_twice", "nvfp4")
+    monkeypatch.setattr(kernels, "gpu", lambda: True)
+    monkeypatch.setattr(kernels, "capability", lambda: capability)
+    x = jnp.ones((64, 128))  # in float32, which TE's kernels do not take
+    blockscaled.mx_twice(x)
+    nvfp4.twice(x)
+    assert ran == KERNELS_ON[capability]
+
+
 def test_block_projections_multiply_in_the_format_and_the_router_and_head_in_compute():
     model = _trainer(ARCHITECTURES["moe"]).model
     linears = [(p, m) for p, m in nnx.iter_modules(model) if isinstance(m, nnx.Linear)]
@@ -646,6 +676,7 @@ GROUPED = {
     "matmuls=nvfp4": 0,  # else compute
     "matmuls=mxfp8, roles=roles(experts=compute)": 0,
     "roles=roles(experts=mxfp8), first=1": 2,  # the first MoE is the first branch
+    "roles=roles(experts=mxfp8), passes=[]": 0,  # no GEMM in the format
 }
 
 

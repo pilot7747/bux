@@ -131,7 +131,10 @@ scale each (`bux.architecture.precision.blockscaled`):
   the largest magnitudes that set its global scales
   (`bux.architecture.precision.nvfp4`).
 - **Elsewhere**, XLA dequantizes and multiplies, which computes the same values, so
-  the tests run the formats on a CPU.
+  the tests run the formats on a CPU. The `mxfp8` kernel quantizes on any GPU of
+  compute capability 8.9 or more (Ada, Hopper), which Triton's E4M3 needs; the
+  `nvfp4` kernels round by Blackwell's E2M1 conversions, and XLA quantizes for them
+  on an older GPU.
 - The forward keeps what the backward multiplies, x^T and W in the format, rather
   than x and W.
 

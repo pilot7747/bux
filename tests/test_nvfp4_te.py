@@ -33,6 +33,7 @@ def on_a_b300(monkeypatch):
     """TE's primitives by the stand-in, as on a B300 with TE installed."""
     monkeypatch.setattr(nvfp4_te, "_te", lambda: STAND_IN)
     monkeypatch.setattr(kernels, "gpu", lambda: True)
+    monkeypatch.setattr(kernels, "capability", lambda: 10.3)
 
 
 @pytest.mark.parametrize(
