@@ -1,11 +1,11 @@
 (lang-modules)=
 # Modules and amendments
 
-This page covers how a `.bux` file builds on others: `use` and how modules are found,
-how definitions from several files layer over each other, amendments that change one
-setting (`attn.num_kv_heads = 1`), statements on the command line, and when a file
-is a run or a module. Read it to write an experiment as the lines that differ from a
-baseline.
+Modules let you write an experiment as the few lines that differ from a baseline.
+`use` brings in another file by name, an amendment (`attn.num_kv_heads = 1`) changes
+one setting of what it brought in, and the command line takes the same statements.
+This page covers how modules are found, how definitions from several files layer over
+each other, and when a file is a run or a module.
 
 ## Example: an ablation on top of two files
 
@@ -27,14 +27,14 @@ budget = 3B
 ```
 
 This is `examples/experiments/attention_ablation.bux`. The architecture comes from
-`llama3_8b.bux` and the data, optimizer and schedule from the recipe
+`llama3_8b.bux`, and the data, optimizer and schedule from the recipe
 `fineweb_wsd.bux`. The file then changes what it needs:
 
-- `d_model = 768` replaces Llama's width, and everything written in terms of
+- `d_model = 768` replaces the width of Llama, and everything written in terms of
   `d_model` follows.
-- `attn.num_heads = 12` changes one setting of Llama's `attn`, and Llama's `block`,
-  which uses `attn`, picks it up.
-- `budget = 3B` replaces the recipe's budget, and the recipe's
+- `attn.num_heads = 12` changes one setting of Llama's `attn`. Llama's `block` uses
+  `attn`, so it picks up the change.
+- `budget = 3B` replaces the budget of the recipe, and the recipe's
   `steps = budget // (batch * seq_len)` follows.
 
 ```console
@@ -67,7 +67,7 @@ sweep: 6 runs over attn.num_kv_heads (mha | gqa | mqa) × optimizer.lr (1e-3 | 3
 
 - **Names that are not identifiers** are written as strings: `use "qwen3.8_27b"`.
 - **Anywhere in the file.** A module's definitions always sit below the file's own,
-  wherever the `use` is written; by convention it goes at the top.
+  wherever the `use` is written. By convention it goes at the top.
 - **Each module once.** A module used twice, directly or through other modules, is
   loaded once. Modules that use each other are an error:
   `modules use each other: model -> cyc_a -> cyc_b -> cyc_a`.
@@ -82,7 +82,7 @@ sweep: 6 runs over attn.num_kv_heads (mha | gqa | mqa) × optimizer.lr (1e-3 | 3
     = hint: did you mean 'llama3_8b'?
   ```
 
-  The names it might have defined are not reported as errors too.
+  The names the module would have defined are not reported again as unknown.
 
 (lang-module-path)=
 ## The module path
@@ -90,8 +90,8 @@ sweep: 6 runs over attn.num_kv_heads (mha | gqa | mqa) × optimizer.lr (1e-3 | 3
 A module is looked for, in order:
 
 1. in the folder of the file that has the `use`, without its subfolders;
-2. under every folder listed in `path` under `[tool.bux]` of the nearest
-   `pyproject.toml`, looking up from that folder, subfolders included. The folders
+2. under every folder listed in `path` under `[tool.bux]` in the nearest
+   `pyproject.toml` (looking up from that folder), subfolders included. The folders
    are relative to the `pyproject.toml`;
 3. under every folder in the environment variable `BUX_PATH` (separated by `:`, or
    `;` on Windows), subfolders included.
@@ -106,12 +106,12 @@ a module by its name.
 
 - **Folders organize files without becoming part of their names**, so moving a file
   into a subfolder breaks nothing.
-- **A name used twice under one folder of the path is an error**, since it would be
-  ambiguous: `there are 2 modules named 'twice' under ...: a/twice.bux, b/twice.bux`.
-  The first folder in the order above that has the name wins.
+- **A name used twice under one folder of the path is an error**, because it would
+  be ambiguous: `there are 2 modules named 'twice' under ...: a/twice.bux, b/twice.bux`.
+  Across folders, the first folder in the order above that has the name wins.
 - Hidden folders (starting with `.`), `__pycache__` and `node_modules` are skipped.
-- A file with no folder of its own, such as an editor's unsaved buffer, looks in the
-  working directory.
+- Source without a file name, such as a string compiled from Python or an unsaved
+  editor buffer, looks in the working directory.
 
 (lang-layering)=
 ## Layering and late binding
@@ -123,7 +123,7 @@ The definitions of a program form layers, the lowest first:
 2. the file itself;
 3. the command line: first the modules used there, then its statements.
 
-Within each file, its amendments form a layer of their own just above its other
+Within each file, the amendments form their own layer, just above the file's other
 definitions. For the ablation above, from the top:
 
 | Layer | Defines |
@@ -134,10 +134,10 @@ definitions. For the ablation above, from the top:
 | `fineweb_wsd.bux` | `tokenizer`, `data`, `optimizer`, `schedule`, `budget`, `steps`, ... |
 | `llama3_8b.bux` | `d_model`, `vocab_size`, `norm`, `attn`, `ffn`, `block`, `model` |
 
-A definition replaces the one below it **everywhere**, including inside the
-definitions it did not write. After `use llama3_8b`, defining `attn` changes the
-attention in llama3_8b's `block`. This is late binding: names are looked up in the
-program as a whole, after every layer is in place.
+A definition replaces the one below it **everywhere**, including inside definitions
+it did not write. After `use llama3_8b`, defining `attn` changes the attention in the
+`block` of llama3_8b. This is late binding: names are looked up in the program as a
+whole, after every layer is in place.
 
 Inside its own definition, a name means the definition it replaces. So
 `ffn = ffn(intermediate_size=2048)` changes one setting of the inherited `ffn`. With
@@ -166,11 +166,11 @@ The rules:
 - **Several amendments of one name in a file act as one.** Setting the same key
   twice is an error: `'num_heads' is given twice`.
 - **An amendment applies over the file's own definition** of the name, if it has
-  one, since a file's amendments are a layer above its definitions.
-- **A shared layer stays shared.** The amendment changes the one module. Writing
-  `shared` in front of an amendment is an error.
-- **Only configs have settings to amend.** Layers and settings do; to change a
-  block, redefine it:
+  one, because a file's amendments are a layer above its definitions.
+- **A shared layer stays shared.** The amendment changes the shared module itself.
+  Writing `shared` in front of an amendment is an error.
+- **Only layers and settings can be amended.** They are configs, with settings to
+  change. To change a block, redefine it:
 
   ```text
   error: 'block' is a block, which has no settings to amend
@@ -181,16 +181,17 @@ The rules:
     = hint: redefine it instead: block = ...
   ```
 
-- **Something must define the name.** `nothing defines 'norm2' for this to amend`,
-  unless the name is a builtin: `rmsnorm.eps = 1e-5` defines `rmsnorm` as
-  `rmsnorm(eps=1e-5)`, so every `rmsnorm` written anywhere in the program takes it.
-  A builtin with required settings cannot be amended this way.
+- **Something must define the name**, or the error is
+  `nothing defines 'norm2' for this to amend`. A builtin counts:
+  `rmsnorm.eps = 1e-5` defines `rmsnorm` as `rmsnorm(eps=1e-5)`, so every `rmsnorm`
+  written anywhere in the program takes it. A builtin with required settings cannot
+  be amended this way.
 
 (lang-command-line)=
 ## The command line
 
 Every command takes statements after the file. They redefine the file's
-definitions, as one more layer over it would:
+definitions, as one more layer on top of it:
 
 ```sh
 bux train examples/experiments/smoke.bux optimizer.lr=1e-2 'schedule = cosine(warmup=5)'
@@ -201,9 +202,9 @@ bux plan  examples/experiments/smoke.bux 'optimizer.lr = 1e-3 | 3e-3'  # and swe
 - Each statement is one argument: `name=value` needs no quotes, and anything with
   spaces does. A statement must contain `=` or start with `use `.
 - A module used on the command line goes above the file, so it replaces the file's
-  own definitions: `'use fineweb_wsd'` gives the smoke run the recipe's data,
-  optimizer, schedule and steps.
-- Errors in them point at `<command line>`:
+  own definitions: `'use fineweb_wsd'` gives the smoke run the data, optimizer,
+  schedule and steps of the recipe.
+- Errors in command-line statements point at `<command line>`:
 
   ```text
   error: unknown name 'stepz'
@@ -216,8 +217,8 @@ bux plan  examples/experiments/smoke.bux 'optimizer.lr = 1e-3 | 3e-3'  # and swe
 
 ### Four ways, one mechanism
 
-So there are four ways to vary an experiment: `use`, an amendment, the command line
-and an alternative ([Sweeps](sweeps.md)). They are one mechanism: each gives a name
+There are four ways to vary an experiment: `use`, an amendment, the command line and
+an alternative ([Sweeps](sweeps.md)). They are one mechanism. Each gives a name
 another definition, and everything written in terms of that name follows. In
 `examples/experiments/width_sweep.bux`, the heads follow the width in every run:
 
@@ -252,11 +253,11 @@ What a file is depends on what it defines:
   required ones: `data`, `optimizer`, `seq_len`, `batch` and `steps`. A missing one
   is an error that names it and suggests a value.
 - **A module is checked on its own.** Its settings are checked against their types,
-  but a run needs a model, so `bux check` only lists what it defines.
-- **An architecture does not train**: `bux plan`, `bux train` and `bux launch` say
-  `this file does not say how to train its model`. Add a recipe from the command
-  line to train it: `bux train model.bux 'use fineweb_wsd'`.
+  but a run needs a model, so `bux check` only lists what the module defines.
+- **An architecture does not train.** `bux plan`, `bux train` and `bux launch` say
+  `this file does not say how to train its model`. To train it, add a recipe on the
+  command line: `bux train model.bux 'use fineweb_wsd'`.
 
-[What is required](../training/settings.md#what-is-required) shows the error and what
-`bux check` says of a module, and [Settings](../training/settings.md) lists every
+[What is required](../training/settings.md#what-is-required) shows that error and
+what `bux check` prints for a module. [Settings](../training/settings.md) lists every
 training setting and its default.
