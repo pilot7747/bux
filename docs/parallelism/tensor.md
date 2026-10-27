@@ -72,7 +72,8 @@ is 5% faster, so use it there ([Measurements](#on-8-b300s)).
 - `chunked` falls back to `gspmd`'s collectives, projection by projection:
   - where it has nothing to overlap: without sequence parallelism, for the input
     projections;
-  - where a kernel splits otherwise than by `tensor`;
+  - where a kernel splits otherwise than by `tensor`, or `tensor` splits the layer's
+    rows or positions, as `layout(seq=tensor)` does;
   - where a device's share would multiply otherwise than the whole, in the format that
     projection takes in its branch (its role's, or `compute` in the `first` and `last`
     branches): in `mxfp8` and `mxfp8_2d` unless the chunk's tokens and the share are
