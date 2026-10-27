@@ -1,0 +1,9 @@
+# The reference of the one-change ablations past positions: the 2020 baseline
+# (gpt3_2020.bux) with 2021's RoPE in place of its learned positions, as GPT-J and
+# GPT-NeoX had it, positions.bux's `rope` arm. Learned positions train beyond 2k only in
+# the 16k phase, which leaves the baseline's long-context bits per byte to chance; with
+# RoPE, which the phase extends by YaRN, every other change is measured on a model
+# whose long context works.
+use gpt3_2020
+attn  = gqa(num_heads=d_model // 64, num_kv_heads=d_model // 64, bias=true, rope=rope())
+model = embed block^layers norm head(tied=true)

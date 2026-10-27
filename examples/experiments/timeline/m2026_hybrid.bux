@@ -1,0 +1,19 @@
+# Milestone 2026, the late-2026 consensus of the linear-attention camp (Kimi K3,
+# GLM-5.3-Flash, Qwen3.8, Nemotron 3), scaled down: the sliding-window family
+# (m2026_frontier.bux) with Kimi Delta Attention in place of its sliding-window layers,
+# so the two camps differ by that alone. KDA has query and key heads of 128 as wide
+# together as the stream, twice as many value heads, and its decay bounded at -5, as
+# Kimi K3's. The global layers stay without positions, as K3's; the MTP module is a
+# global layer.
+use m2026_frontier
+
+hy_delta = kda(num_heads=d_model // 128, num_v_heads=d_model // 64, head_dim=128,
+               gate_lower_bound=-5)
+
+hy_mtp = $h nextn(norm=fr_norm) fr_layer(fr_global) fr_norm fr_out
+
+frontier_hybrid = embed
+                  fr_layer(hy_delta, fr_dense) fr_layer(hy_delta)^2 fr_layer(fr_global)
+                  (fr_layer(hy_delta)^3 fr_layer(fr_global))^(layers // 4 - 1)
+                  fr_norm @h fr_out hy_mtp
+model           = frontier_hybrid

@@ -1,0 +1,34 @@
+# Milestone 2026, the late-2026 consensus of the sliding-window camp (Beam 1.0, Trinity,
+# Muse Spark, Command A+, North Mini Code, Laguna XS 2.1, Mellum2, MiMo-V2.6), scaled
+# down. Three sliding-window layers of 512 keys with RoPE for every global layer without
+# positions; QK-norm and a sigmoid gate on every head's output; a key and value head for
+# every 4 query heads of 64; RMSNorm, no biases, an untied head. The first layer is
+# dense; the rest route each token to 7 of 256 experts by sigmoid scores, balanced by a
+# bias, beside a shared expert, each an eighth of the dense families' SwiGLU, so a token
+# goes through as much MLP. One MTP module, a sliding-window layer.
+d_model    = 768
+vocab_size = 50304
+layers     = d_model // 64
+
+swiglu_width = (8 * d_model + 96) // 192 * 64
+
+fr_norm    = rmsnorm(eps=1e-5)
+fr_attn    = gqa(num_heads=d_model // 64, num_kv_heads=d_model // 256, qk_norm=fr_norm,
+                 gated=true)
+fr_local   = fr_attn(sliding_window_size=512, rope=rope())
+fr_global  = fr_attn
+fr_dense   = gated_mlp(intermediate_size=swiglu_width, activation=swish)
+fr_experts = moe(num_experts=256, top_k=7, num_shared_experts=1, router=sigmoid,
+                 routed_scaling_factor=2.5, load_balancing=aux_free, aux_loss_coef=1e-4,
+                 aux_loss_scope=sequence,
+                 expert=gated_mlp(intermediate_size=swiglu_width // 8, activation=swish))
+
+fr_layer(mixer, ffn=fr_experts) = [fr_norm mixer] [fr_norm ffn]
+
+shared fr_out = head
+fr_mtp = $h nextn(norm=fr_norm) fr_layer(fr_local) fr_norm fr_out
+
+frontier = embed fr_layer(fr_local, fr_dense) fr_layer(fr_local)^2 fr_layer(fr_global)
+           (fr_layer(fr_local)^3 fr_layer(fr_global))^(layers // 4 - 1)
+           fr_norm @h fr_out fr_mtp
+model    = frontier

@@ -1,0 +1,35 @@
+# Mixtures of experts in place of the MLP, one change at a time from the 2021 reference (gpt3_rope.bux: the 2020 baseline with RoPE)'s
+# GELU MLP 4 times as wide as the stream (gpt3_2020.bux), each at as many active
+# parameters: every token goes through 4 * d_model of expert width (8 * d_model^2
+# parameters), the latent arm's projections counted in it. The experts are the
+# baseline's MLP, narrower; only the routing and the split change. Arms: era, source,
+# what it was claimed for.
+use gpt3_rope
+use timeline_code
+use rungs
+
+expert(width) = mlp(intermediate_size=width, activation=gelu, bias=true)
+# DeepSeek-V3's routing: sigmoid scores, a bias that balances the loads, a light
+# sequence-wise balance loss, and the weights scaled by 2.5.
+dsv3 = moe(num_experts=128, top_k=7, num_shared_experts=1, router=sigmoid,
+           routed_scaling_factor=2.5, load_balancing=aux_free, aux_loss_coef=1e-4,
+           aux_loss_scope=sequence, expert=expert(d_model // 2))
+
+ffn = base:       ffn
+    # 2021 GShard, Switch, 2023 Mixtral: 8 experts of 2 * d_model, the top 2 by softmax,
+    # a balance loss; quality at equal FLOPs
+    | moe_8x2:    moe(num_experts=8, top_k=2, expert=expert(2 * d_model))
+    # 2024 DeepSeekMoE: 64 experts of d_model / 2, the top 7 and a shared one;
+    # specialization
+    | moe_fine:   moe(num_experts=64, top_k=7, num_shared_experts=1,
+                      expert=expert(d_model // 2))
+    # 2024 DeepSeek-V3: 128 experts, sigmoid routing, balanced by a bias (aux-loss-free);
+    # balance without the loss's cost in quality
+    | moe_dsv3:   dsv3
+    # 2026 Nemotron 3, Kimi K3, Muse Spark (LatentMoE): routed experts in a d_model / 2
+    # latent, twice as many of them, as many parameters; quality per FLOP
+    | moe_latent: dsv3(num_experts=256, top_k=12, latent_size=d_model // 2)
+
+# The experts' parameters and Adam's state, sharded at the wider rungs.
+mesh = d512: mesh(data=1) | d768: mesh(data=1)
+     | d1024: mesh(data=1, fsdp=2) | d1280: mesh(data=1, fsdp=4)

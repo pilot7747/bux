@@ -1,0 +1,36 @@
+# The embedding, the head and what reads the tokens beside them, one change at a time
+# from the 2021 reference (gpt3_rope.bux: the 2020 baseline with RoPE): a table tied to the head, and learned positions
+# (gpt3_2020.bux). Arms: era, source, what it was claimed for.
+use gpt3_rope
+use timeline_code
+use rungs
+
+pos = embed
+
+# MTP: a module that predicts the token after next from the last hidden state and the
+# next token's embedding, through one more block; it trains, and inference drops it.
+shared out = head(tied=true)
+mtp = $h nextn(norm=norm) block norm out
+
+# Engram: hashed embeddings of the 2- and 3-grams ending at each token, 8 hash heads
+# each, as wide together as the stream, before the second layer (as Qwen3.8's). Its
+# tables hold 3/4 of d_model^2 rows a head, 4 times the baseline's non-embedding
+# parameters, looked up and never multiplied.
+memory = engram(head_dim=d_model // 16, table_size=3 * d_model * d_model // 4)
+
+# Value residual: every layer after the first mixes the first layer's values into its
+# own, half and half.
+first = [norm attn(v=@v1)] [norm ffn]
+rest  = [norm attn(v=$v1)] [norm ffn]
+
+model = base:     model
+      # 2023 Llama, most models since: a head of its own; quality
+      | untied:   pos block^layers norm head
+      # 2024 DeepSeek-V3, 2026 Qwen3.8, GLM-5.3, MiMo-V2.6: one MTP module, weight 0.3;
+      # quality, speculative decoding
+      | mtp:      pos block^layers norm @h out mtp
+      # 2026 DeepSeek Engram, DeepSeek-V4.1, Qwen3.8-Flash-Next: conditional memory by
+      # lookup; quality at equal FLOPs, long-context retrieval
+      | engram:   pos block memory block^(layers - 1) norm head(tied=true)
+      # 2024 ResFormer, 2025 RWKV-7, modded-nanogpt: value residual learning; quality
+      | value_res: pos first rest^(layers - 1) norm head(tied=true)

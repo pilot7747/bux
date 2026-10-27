@@ -1,0 +1,9 @@
+# Milestone 2024, Llama 3 (Meta, 2024), dense: Llama 2's decoder (m2023_llama2.bux)
+# with RoPE at base 500k. Its grouped-query attention shares a key and value head among
+# 4 query heads, as Llama 3 8B's 8 among 32 do.
+use m2023_llama2
+
+l3_attn = l2_attn(rope=rope(base=500000))
+
+llama3 = embed ([l2_norm l3_attn] [l2_norm l2_ffn])^layers l2_norm head
+model  = llama3

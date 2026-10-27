@@ -1,0 +1,30 @@
+# Milestone 2024, DeepSeek-V3 (DeepSeek-AI, 2024): Llama 3's dense decoder
+# (m2024_llama3.bux) with multi-head latent attention, a fine-grained mixture of experts
+# and one multi-token prediction module. MLA makes keys and values from a 256-wide
+# latent and rotates 32 more dims of each head, queries at full rank (as V2-Lite's).
+# The first layer is dense; the rest route each token to 7 of 128 experts by sigmoid
+# scores, balanced by a bias (aux-loss-free), beside a shared expert. Every expert is an
+# eighth of the dense SwiGLU, so a token goes through as much MLP as in the dense
+# families. DeepSeek-V3 itself has 8 of 256 experts, 3 dense layers and q from a latent.
+d_model    = 768
+vocab_size = 50304
+layers     = d_model // 64
+
+swiglu_width = (8 * d_model + 96) // 192 * 64
+
+ds_norm    = rmsnorm(eps=1e-5)
+ds_attn    = mla(num_heads=d_model // 64, kv_lora_rank=256, qk_nope_head_dim=64,
+                 qk_rope_head_dim=32, v_head_dim=64, rope=rope())
+ds_dense   = gated_mlp(intermediate_size=swiglu_width, activation=swish)
+ds_experts = moe(num_experts=128, top_k=7, num_shared_experts=1, router=sigmoid,
+                 routed_scaling_factor=2.5, load_balancing=aux_free, aux_loss_coef=1e-4,
+                 aux_loss_scope=sequence,
+                 expert=gated_mlp(intermediate_size=swiglu_width // 8, activation=swish))
+
+ds_layer(ffn) = [ds_norm ds_attn] [ds_norm ffn]
+
+shared ds_out = head
+ds_mtp = $h nextn(norm=ds_norm) ds_layer(ds_experts) ds_norm ds_out
+
+dsv3  = embed ds_layer(ds_dense) ds_layer(ds_experts)^(layers - 1) ds_norm @h ds_out ds_mtp
+model = dsv3

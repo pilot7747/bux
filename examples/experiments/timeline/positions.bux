@@ -21,17 +21,19 @@ model = base:             model
       | rope_500k:        lm(attn(rope=rope(base=500000)))
       # 2025 Qwen3-Next, 2026 Qwen3.8: base 10M on a quarter of the dims; long context
       | rope_10m_partial: lm(attn(rope=rope(base=10000000, fraction=0.25)))
-      # 2023 Kazemnejad et al.; 2025-26 Kimi Linear, Nemotron 3: no positions; length generalization
+      # 2023 Kazemnejad et al., 2025-26 Kimi Linear, Nemotron 3: no positions; length
+      # generalization
       | nope:             lm(attn)
       # 2025 SmolLM3, Llama 4's iRoPE: NoPE every 4th layer, RoPE on the rest; long context
       | irope:            embed "RRRN"^(layers // 4) norm head(tied=true)
       # 2026 Beam 1.0: NoPE, queries scaled by (1 + n / 2048) ** 0.1; sharp at long range
       | nope_power:       lm(attn(power_scale=0.1))
-      # 2026 Inkling: a learned, data-dependent relative bias over 1024 offsets; extrapolation
+      # 2026 Inkling: a learned relative bias over 1024 offsets; extrapolation
       | relbias:          lm(attn(relative_bias=relbias(rank=16, extent=1024)))
       # RoPE as in `rope`, but the long phase keeps it as trained: what YaRN adds
       | rope_noyarn:      lm(attn(rope=rope()))
-      # 2023 Xiong et al., 2024 Llama 3 (ABF): the long phase raises RoPE's base to 500k instead of YaRN
+      # 2023 Xiong et al., 2024 Llama 3 (ABF): the long phase raises RoPE's base to 500k
+      # instead of YaRN
       | abf:              lm(attn(rope=rope()))
 
 curriculum = base: yarn_phase | rope: yarn_phase | rope_partial: yarn_phase

@@ -1,0 +1,17 @@
+# Milestone 2022, PaLM (Chowdhery et al., 2022): parallel blocks, multi-query attention,
+# RoPE on every dim, SwiGLU, and no biases in any projection or norm; the head stays
+# tied, as PaLM's. Heads of 64 and a layer for every 64 of the width, where PaLM has
+# heads of 256; its SwiGLU is 4 times as wide as the stream, this one 8/3 (to the nearest
+# 64), as many parameters as GPT-3's MLP.
+d_model    = 768
+vocab_size = 50304
+layers     = d_model // 64
+
+swiglu_width = (8 * d_model + 96) // 192 * 64
+
+palm_norm = layernorm(eps=1e-5)
+palm_attn = gqa(num_heads=d_model // 64, num_kv_heads=1, rope=rope())
+palm_ffn  = gated_mlp(intermediate_size=swiglu_width, activation=swish)
+
+palm  = embed [palm_norm (palm_attn + palm_ffn)]^layers palm_norm head(tied=true)
+model = palm
