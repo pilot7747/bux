@@ -9,12 +9,6 @@ resolution-markers = [
     "sys_platform == 'darwin'",
 ]
 
-[manifest]
-overrides = [
-    { name = "nvidia-cudnn-frontend", marker = "platform_machine == 'aarch64' and sys_platform == 'linux'", url = "https://github.com/NVIDIA/cudnn-frontend/releases/download/v1.32.0.dev76547535/nvidia_cudnn_frontend-1.32.0.dev76547535-cp314-cp314-manylinux_2_27_aarch64.manylinux_2_28_aarch64.whl" },
-    { name = "nvidia-cudnn-frontend", marker = "platform_machine == 'x86_64' and sys_platform == 'linux'", url = "https://github.com/NVIDIA/cudnn-frontend/releases/download/v1.32.0.dev76547535/nvidia_cudnn_frontend-1.32.0.dev76547535-cp314-cp314-manylinux_2_27_x86_64.manylinux_2_28_x86_64.whl" },
-]
-
 [[package]]
 name = "absl-py"
 version = "2.5.1"
@@ -438,6 +432,7 @@ dependencies = [
 cuda = [
     { name = "flash-attn-4", marker = "sys_platform == 'linux'" },
     { name = "jax", extra = ["cuda13"], marker = "sys_platform == 'linux'" },
+    { name = "nvidia-cudnn-frontend", marker = "sys_platform == 'linux'" },
     { name = "tokamax", extra = ["cuda"], marker = "sys_platform == 'linux'" },
     { name = "torch", version = "2.14.1+cpu", source = { registry = "https://download.pytorch.org/whl/cpu" }, marker = "sys_platform == 'linux'" },
 ]
@@ -497,6 +492,7 @@ requires-dist = [
     { name = "jinja2", specifier = ">=3.1.6" },
     { name = "matplotlib", specifier = ">=3.11.2" },
     { name = "numpy", specifier = ">=2.5.4" },
+    { name = "nvidia-cudnn-frontend", marker = "sys_platform == 'linux' and extra == 'cuda'", specifier = ">=1.32.0" },
     { name = "optax", specifier = ">=0.2.8" },
     { name = "orbax-checkpoint", specifier = ">=0.12.8" },
     { name = "pandas", marker = "extra == 'spark'", specifier = ">=2.2,<3" },
@@ -2799,55 +2795,18 @@ wheels = [
 
 [[package]]
 name = "nvidia-cudnn-frontend"
-version = "1.32.0.dev76547535"
-source = { url = "https://github.com/NVIDIA/cudnn-frontend/releases/download/v1.32.0.dev76547535/nvidia_cudnn_frontend-1.32.0.dev76547535-cp314-cp314-manylinux_2_27_aarch64.manylinux_2_28_aarch64.whl" }
-resolution-markers = [
-    "platform_machine == 'aarch64' and sys_platform == 'linux'",
-]
+version = "1.32.0"
+source = { registry = "https://pypi.org/simple" }
 dependencies = [
     { name = "apache-tvm-ffi" },
     { name = "nvidia-cutlass-dsl", extra = ["cu13"] },
 ]
 wheels = [
-    { url = "https://github.com/NVIDIA/cudnn-frontend/releases/download/v1.32.0.dev76547535/nvidia_cudnn_frontend-1.32.0.dev76547535-cp314-cp314-manylinux_2_27_aarch64.manylinux_2_28_aarch64.whl", hash = "sha256:603ec0907a1bf9d45403a4429b74adb6d4be842fc74c1d6a233ff1bec705f4a8" },
+    { url = "https://files.pythonhosted.org/packages/ac/21/71e020d5c82531a0ffcfc8f73adbf4a5984c6d91038537bc75240842ba1c/nvidia_cudnn_frontend-1.32.0-cp314-cp314-manylinux_2_27_aarch64.manylinux_2_28_aarch64.whl", hash = "sha256:26cf051ed2c3a8821f7db12ab264b81f7954662f2430874ec9410447b067826d", size = 11439506, upload-time = "2026-10-27T03:15:54.916Z" },
+    { url = "https://files.pythonhosted.org/packages/56/40/9de49a85c97317afa0cf2634d9487cedf67bdfb759d88c2ad14dd4322d8c/nvidia_cudnn_frontend-1.32.0-cp314-cp314-manylinux_2_27_x86_64.manylinux_2_28_x86_64.whl", hash = "sha256:4b206c8c3dd173dc29921f179fc599afa5dac187eb9163c54551679740534a81", size = 11620408, upload-time = "2026-10-27T03:16:14.906Z" },
+    { url = "https://files.pythonhosted.org/packages/41/31/3c22b15885c64d4872d3146f15a80acb7cd4731833c8dcb48790e97cd1c3/nvidia_cudnn_frontend-1.32.0-cp314-cp314t-manylinux_2_27_aarch64.manylinux_2_28_aarch64.whl", hash = "sha256:8e1eeb68e4c702c2ee60066e785ee07bbe64a64d4cc0e995ad2b1179eb934b4f", size = 11441695, upload-time = "2026-10-27T03:17:53.189Z" },
+    { url = "https://files.pythonhosted.org/packages/fe/77/3dfd81f4046289bc9b593e0d13a2e1e6fa5ece3b745e0cd85da49a7981eb/nvidia_cudnn_frontend-1.32.0-cp314-cp314t-manylinux_2_27_x86_64.manylinux_2_28_x86_64.whl", hash = "sha256:f5e94ac16ad30395cedc6850dfef4fef2f55cfa17695b5f744003cb5ba3c626d", size = 11621458, upload-time = "2026-10-27T03:18:47.11Z" },
 ]
-
-[package.metadata]
-requires-dist = [
-    { name = "apache-tvm-ffi", marker = "platform_machine != 'ARM64' or sys_platform != 'win32'", specifier = ">=0.1.11" },
-    { name = "cuda-python", marker = "extra == 'cutedsl'" },
-    { name = "cuda-tile", marker = "extra == 'cutile'", specifier = ">=1.4" },
-    { name = "nvidia-cutlass-dsl", extras = ["cu13"], marker = "platform_machine != 'ARM64' or sys_platform != 'win32'", specifier = ">=4.8.0" },
-    { name = "nvshmem4py-cu13", marker = "extra == 'comm'", specifier = ">=0.3.1" },
-    { name = "triton", marker = "python_full_version >= '3.10' and sys_platform == 'linux' and extra == 'triton'", specifier = ">=3.7.0" },
-]
-provides-extras = ["cutedsl", "comm", "cutile", "triton"]
-
-[[package]]
-name = "nvidia-cudnn-frontend"
-version = "1.32.0.dev76547535"
-source = { url = "https://github.com/NVIDIA/cudnn-frontend/releases/download/v1.32.0.dev76547535/nvidia_cudnn_frontend-1.32.0.dev76547535-cp314-cp314-manylinux_2_27_x86_64.manylinux_2_28_x86_64.whl" }
-resolution-markers = [
-    "platform_machine == 'x86_64' and sys_platform == 'linux'",
-]
-dependencies = [
-    { name = "apache-tvm-ffi" },
-    { name = "nvidia-cutlass-dsl", extra = ["cu13"] },
-]
-wheels = [
-    { url = "https://github.com/NVIDIA/cudnn-frontend/releases/download/v1.32.0.dev76547535/nvidia_cudnn_frontend-1.32.0.dev76547535-cp314-cp314-manylinux_2_27_x86_64.manylinux_2_28_x86_64.whl", hash = "sha256:bdc3489dfe585ef580fd2d4a3448c99e9dbb04a8a7ff658c8c2e0126af60a597" },
-]
-
-[package.metadata]
-requires-dist = [
-    { name = "apache-tvm-ffi", marker = "platform_machine != 'ARM64' or sys_platform != 'win32'", specifier = ">=0.1.11" },
-    { name = "cuda-python", marker = "extra == 'cutedsl'" },
-    { name = "cuda-tile", marker = "extra == 'cutile'", specifier = ">=1.4" },
-    { name = "nvidia-cutlass-dsl", extras = ["cu13"], marker = "platform_machine != 'ARM64' or sys_platform != 'win32'", specifier = ">=4.8.0" },
-    { name = "nvshmem4py-cu13", marker = "extra == 'comm'", specifier = ">=0.3.1" },
-    { name = "triton", marker = "python_full_version >= '3.10' and sys_platform == 'linux' and extra == 'triton'", specifier = ">=3.7.0" },
-]
-provides-extras = ["cutedsl", "comm", "cutile", "triton"]
 
 [[package]]
 name = "nvidia-cufft"
@@ -4543,8 +4502,7 @@ cuda = [
     { name = "jax", extra = ["cuda13"] },
     { name = "jax-triton" },
     { name = "nvidia-cudnn-cu13" },
-    { name = "nvidia-cudnn-frontend", version = "1.32.0.dev76547535", source = { url = "https://github.com/NVIDIA/cudnn-frontend/releases/download/v1.32.0.dev76547535/nvidia_cudnn_frontend-1.32.0.dev76547535-cp314-cp314-manylinux_2_27_aarch64.manylinux_2_28_aarch64.whl" }, marker = "platform_machine == 'aarch64'" },
-    { name = "nvidia-cudnn-frontend", version = "1.32.0.dev76547535", source = { url = "https://github.com/NVIDIA/cudnn-frontend/releases/download/v1.32.0.dev76547535/nvidia_cudnn_frontend-1.32.0.dev76547535-cp314-cp314-manylinux_2_27_x86_64.manylinux_2_28_x86_64.whl" }, marker = "platform_machine == 'x86_64'" },
+    { name = "nvidia-cudnn-frontend" },
     { name = "triton" },
 ]
 
