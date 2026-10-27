@@ -362,7 +362,8 @@ def test_a_search_trains_at_most_its_parallel_trials_at_once(tmp_path):
 def test_trials_at_the_same_point_are_one_run_trained_once(tmp_path):
     source = SOURCE.replace("log_uniform(1e-4, 1e-2)", "1e-3")
     source += "ffn.activation = choice(swish, gelu)\n"
-    s = Search(spaces(source + "search = search(method=halton, trials=4)\n")[0], tmp_path)
+    source += "search = search(method=halton, trials=4)\n"
+    s = Search(spaces(source)[0], tmp_path)
     runs = [run for _ in range(4) if (run := s.next()) is not None]
     assert len(s.trials) == 4 and len({r.id for r in runs}) == len(runs) == 2
     for run in runs:
