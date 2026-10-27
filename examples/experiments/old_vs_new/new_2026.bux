@@ -5,6 +5,8 @@
 # output; the MoE has 256 experts a quarter of the width wide, 8 routed and 1 shared
 # for every token, as DeepSeek-V3 splits them; the norms are zero-centered RMSNorms.
 # One number sizes it, the width: a layer for each 64 of it.
+use agentic_code
+
 d_model    = 3072
 vocab_size = 50304                       # GPT-NeoX's 50277 tokens, padded
 
@@ -22,3 +24,12 @@ A = layer(attn)
 
 groups = d_model // 256
 model  = embed "DDDA"^groups norm head
+
+# The target as it would train: 20 tokens for each of the 6.54B parameters a token goes
+# through besides the embeddings, a batch by DeepSeek LLM's law (3.7M tokens), the
+# learning rate of the 2026 ladder's wider rungs, its 91B parameters and AdamW's split
+# over 8 nodes by FSDP. new_ladder.bux sizes it down and sets each of these for its rungs.
+budget       = 131B
+batch        = 1792
+optimizer.lr = 2.6e-3
+mesh         = mesh(fsdp=64)
