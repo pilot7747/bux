@@ -96,15 +96,17 @@ too for what only `xla` has ([below](#constraints-and-errors)).
 ### `ring`
 
 - Every key and value is gathered once over `context`. A device then makes a flash
-  call (tokamax's; jnp's on a CPU) for each device's block of them, merged by their
+  call (tokamax's; jnp's on a CPU, and in heads wider than tokamax's 128 channels,
+  all of a block's logits at once) for each device's block of them, merged by their
   logsumexps.
 - A device's own block comes first, from its own keys and values, while the others'
   are gathered.
 - A block no query sees is skipped: one ahead of them all, or before every query's
   first key (its document's or its window's).
-- Without documents or a window, the queries go zigzag: device `i` holds chunks `i`
-  and `2c-1-i` of `2c`, so that every device attends to as much. Its keys and values
-  stay in the positions' order, so its own block is then a gathered one.
+- Where every row is one document, with no window, the queries go zigzag: device `i`
+  holds chunks `i` and `2c-1-i` of `2c`, so that every device attends to as much. A
+  run's rows have ids even without documents, all one, so a `lax.cond` asks. Its keys
+  and values stay in the positions' order, so its own block is then a gathered one.
 - The backward pass runs each block's kernel backward with the final output and
   logsumexp, on the blocks the forward pass gathered, and reduce-scatters the blocks'
   gradients in the keys' dtype: in bfloat16, half the bytes of float32's.
@@ -115,10 +117,10 @@ too for what only `xla` has ([below](#constraints-and-errors)).
 |---|---|---|
 | `xla` | everything | |
 | `cudnn` | bfloat16 or float16; keys' and values' head dims equal, up to 256 in steps of 8 (its packed layout gets MLA's wrong) | `NotImplementedError` for a soft cap, sinks, positions over `context` (`ulysses` gives it whole rows), or a call it cannot take |
-| `tokamax` | a GPU, the `cuda` extra (Linux only), bfloat16 or float16; on a B300, heads of up to 128 channels to train (`auto` passes wider ones by) | `NotImplementedError` otherwise; a wider head's backward fails to compile, out of shared memory |
+| `tokamax` | a GPU, the `cuda` extra (Linux only), bfloat16 or float16; heads of up to 128 channels, past which its SM100 backward does not fit a B300's shared memory (`auto` passes wider ones by) | `NotImplementedError` otherwise |
 | `fa4` | a Blackwell GPU (SM 10.x), the `cuda` extra, bfloat16 or float16; keys' and values' head dims equal, up to 128 in steps of 8, or 192 and 128 (MLA) | `NotImplementedError` for positions over `context` (`ulysses` gives it whole rows), or a call it cannot take |
 | `ulysses` | `context` dividing a device's heads; kv heads it does not divide are repeated | `ValueError` naming both counts |
-| `ring` | documents, a window, a soft cap and sinks; tokamax's kernel on a GPU, jnp's on a CPU | |
+| `ring` | documents, a window, a soft cap and sinks; tokamax's kernel on a GPU in heads of up to 128 channels, jnp's past them and on a CPU | |
 
 - **What only `xla` has stays in the layer:** relative bias, length scale and
   attention dropout. A layer with one of them under a method other than `xla` or
@@ -260,7 +262,8 @@ The rows of a run without documents have ids too, all one document. So `auto` an
 
 :::{note}
 Under XLA's deterministic ops, XLA builds no graph for cuDNN's attention backward on a
-B300 ("No serialized cuDNN graph"), so there `flash.CUDNN`'s backward is tokamax's.
+B300 ("No serialized cuDNN graph"), so there `flash.CUDNN`'s backward is tokamax's,
+in heads of up to 128 channels.
 :::
 
 ### Rows of documents
