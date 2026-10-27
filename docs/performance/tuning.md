@@ -377,12 +377,16 @@ NCCL channels, NCCL's symmetric buffers
 
 A GPU idles when it waits for the host to launch its next step. bux launches each step
 before it reads the last one's metrics, so the GPU waits only after a step the host
-itself must wait for: an eval, a checkpoint, or the start and stop of a profile's
-trace.
+itself must wait for: an eval, a checkpoint, the start and stop of a profile's
+trace, or a step that compiled.
 
 - **Logging** reads a step's metrics once the next step is launched, and computes its
   learning rate on the GPU behind its own step. Logging every step, the 1.3B's GPU 0
   idles 2.2 ms per step, against 2.1 ms logging every 5: log as often as you like.
+- **A step that compiled**, the first and any of a new batch shape or precision, is
+  waited for. A step that cannot run then raises at once, by its own name; read
+  later, its error would name the next program to read its outputs, the log's
+  `jit__stacked`.
 - **An eval, a checkpoint, or a trace's start and stop** waits for its step. The
   launch of a large step returns only when the GPU is nearly through it (100 to 170 ms
   before the end, for Qwen3-30B-A3B), so after one the GPU waits for the next launch:
@@ -438,6 +442,7 @@ export JAX_COMPILATION_CACHE_DIR=                    # or no cache at all
 | Symptom | Likely cause | What to set |
 |---------|--------------|-------------|
 | Out of memory at the first step | the step's activations | leave `methods.remat` at `auto`; fewer rows per GPU, or `methods(microbatches=n)`; `precision(matmuls=mxfp8)`; for recurrent mixers, `methods(states=recompute)` |
+| Out of memory in `jit__stacked`, the log's program | a step before the log ran out of memory, after the first | as for the first step |
 | Out of memory at the first step with `nccl_ep` | `remat=auto` estimates the step without NCCL EP's own buffers | name a `methods.remat` policy that keeps less |
 | Out of memory with many microbatches under FSDP | the whole model gathered once per step beside a microbatch | `methods(gather=layer)` |
 | Out of memory at the step after the first checkpoint | the old state kept beside the new | `methods.donate` at `true`, the default |
