@@ -287,17 +287,29 @@ def _option_of(cls: type[cfg.Config], key: tuple[str, ...], name: str) -> bool:
     return field is not None and name in _options(field.annotation)
 
 
+def _numeric(cls: type[cfg.Config], key: tuple[str, ...]) -> bool:
+    """Whether the setting `key` of `cls` takes numbers and no booleans, which it
+    would read as 0 and 1."""
+    field = cls.model_fields.get(key[0]) if len(key) == 1 else None
+    kinds = _kinds(field.annotation) if field is not None else ()
+    return bool not in kinds and (int in kinds or float in kinds)
+
+
 def _options(annotation: object) -> tuple[object, ...]:
     """Return the values of the Literals in `annotation`, through Annotated and
     unions."""
+    literals = (k for k in _kinds(annotation) if typing.get_origin(k) is typing.Literal)
+    return tuple(o for k in literals for o in typing.get_args(k))
+
+
+def _kinds(annotation: object) -> tuple[object, ...]:
+    """Return the types `annotation` is made of, through Annotated and unions."""
     origin = typing.get_origin(annotation)
-    if origin is typing.Literal:
-        return typing.get_args(annotation)
     if origin is typing.Annotated:
-        return _options(typing.get_args(annotation)[0])
+        return _kinds(typing.get_args(annotation)[0])
     if origin in (typing.Union, types.UnionType):
-        return tuple(o for m in typing.get_args(annotation) for o in _options(m))
-    return ()
+        return tuple(k for m in typing.get_args(annotation) for k in _kinds(m))
+    return (annotation,)
 
 
 def _is_number(value: object) -> bool:
@@ -333,7 +345,7 @@ def _describe(value: object) -> str:
             return "a string"
         case None:
             return "none"
-        case list():
+        case list() | tuple():
             return "a list"
         case cfg.Config() as config:
             return f"a {_tag(config)} config"
@@ -347,6 +359,27 @@ def _weighted(source: tcfg.DataConfig) -> tuple[tcfg.Weighted, ...]:
     if isinstance(source, tcfg.MixtureConfig):
         return source.sources
     return (tcfg.Weighted(weight=1.0, source=source),)
+
+
+def _new_key(arg: ast.Arg, seen: set[tuple[str, ...]]) -> tuple[str, ...]:
+    """Return the setting `arg` sets, and add it to `seen`: unless it is positional,
+    already set, or a whole one set after a key inside it (rope after rope.base),
+    which it would undo. A key inside one set before it changes it."""
+    key = arg.key
+    if key is None:
+        raise BuxError("layer settings are keyword arguments: name=value", arg.span)
+    if key in seen:
+        raise BuxError(f"'{'.'.join(key)}' is given twice", arg.span)
+    if inside := next((k for k in seen if k[: len(key)] == key), None):
+        whole, part = ".".join(key), ".".join(inside)
+        rest = part[len(whole) + 1 :]
+        raise BuxError(
+            f"'{whole}' is given after '{part}', which it would undo",
+            arg.span,
+            f"give '{whole}' first, or {rest} inside it: {whole}={whole}(..., {rest}=...)",
+        )
+    seen.add(key)
+    return key
 
 
 def _assign(data: dict, key: tuple[str, ...], value: object) -> None:
@@ -398,9 +431,8 @@ class _Evaluator:
             self.add_layer(layer, report)
         # The definition in effect for each name: the one in the highest layer.
         self.statements = {name: chain[-1] for name, chain in self.chain.items()}
-        self.values: dict[str, object] = {}
-        # Values of the definitions that later layers amend or replace.
-        self.replaced: dict[tuple[str, int], object] = {}
+        # The value of each definition evaluated, by its name and place in its chain.
+        self.cache: dict[tuple[str, int], object] = {}
         # The definitions being evaluated, with their places in their chains.
         self.evaluating: list[str] = []
         self.levels: list[int] = []
@@ -462,17 +494,15 @@ class _Evaluator:
         """Evaluate the definition of `name` in effect, or the one at `level` of its
         chain, once, and return its value."""
         chain = self.chain[name]
-        top = len(chain) - 1
-        level = top if level is None else level
+        level = len(chain) - 1 if level is None else level
         st = chain[level]
         if st.params is not None:
             return _Macro(st)
-        cached = name in self.values if level == top else (name, level) in self.replaced
-        if not cached:
+        if (name, level) not in self.cache:
             self.evaluating.append(name)
             self.levels.append(level)
             try:
-                value = (
+                self.cache[name, level] = (
                     self.objective(st.body)
                     if name == "objective"
                     else self.eval(st.body, {})
@@ -480,12 +510,29 @@ class _Evaluator:
             finally:
                 self.evaluating.pop()
                 self.levels.pop()
-            if level == top:
-                self.values[name] = value
-            else:
-                self.replaced[name, level] = value
-        value = self.values[name] if level == top else self.replaced[name, level]
-        return _Named(name, value, name if st.shared else None)
+        return _Named(name, self.cache[name, level], name if st.shared else None)
+
+    def evaluate_all(self, report: Callable[[BuxError], None] | None = None) -> None:
+        """Evaluate every definition but the macros, so that a mistake in any raises,
+        or goes to `report`."""
+        for name, st in self.statements.items():
+            if st.params is not None:
+                continue
+            try:
+                self.definition(name)
+            except BuxError as err:
+                if report is None:
+                    raise
+                report(err)
+
+    @property
+    def values(self) -> dict[str, object]:
+        """The values of the definitions in effect that evaluated so far, by name."""
+        return {
+            name: value
+            for (name, level), value in self.cache.items()
+            if level == len(self.chain[name]) - 1
+        }
 
     def lookup(self, name: str, span: Span, scope: dict[str, object]) -> object:
         if name in scope:
@@ -495,10 +542,13 @@ class _Evaluator:
         if name in self.statements:
             if name not in self.evaluating:
                 return self.definition(name)
-            # Inside its own definition a name means what it meant before it: the
-            # definition this one amends or replaces, else the builtin: mlp = mlp(...).
-            inner = len(self.evaluating) - 1 - self.evaluating[::-1].index(name)
-            level = self.levels[inner]
+            # Only inside its own definition does a name mean what it meant before
+            # it; a definition it uses that uses it back is a cycle.
+            if self.evaluating[-1] != name:
+                raise self.cycle(name, span)
+            # The definition this one amends or replaces, else the builtin:
+            # mlp = mlp(...).
+            level = self.levels[-1]
             if level > 0:
                 return self.definition(name, level - 1)
             if name not in TYPES and name not in ACTIVATIONS:
@@ -510,11 +560,17 @@ class _Evaluator:
                         span,
                         f"define it first: {name} = ...",
                     )
-                cycle = self.evaluating[self.evaluating.index(name) :] + [name]
-                raise BuxError(f"definition cycle: {' -> '.join(cycle)}", span)
+                raise self.cycle(name, span)
         if name in TYPES or name in ACTIVATIONS:
             return _Builtin(name, span)
         return _Bare(name)
+
+    def cycle(self, name: str, span: Span) -> BuxError:
+        """Return the error of a cycle from the innermost evaluation of `name` back
+        to it."""
+        inner = len(self.evaluating) - 1 - self.evaluating[::-1].index(name)
+        cycle = [*self.evaluating[inner:], name]
+        return BuxError(f"definition cycle: {' -> '.join(cycle)}", span)
 
     def unknown(
         self,
@@ -592,7 +648,8 @@ class _Evaluator:
         raise AssertionError(expr)
 
     def choose(self, alt: ast.Alt) -> ast.Expr:
-        """Return the alternative that `choices` picks, or the first."""
+        """Return the alternative that `choices` picks, or the axis's first: of a
+        labeled one, the label met first, wherever this `|` lists it."""
         key: Span | frozenset[str] = alt.span
         if alt.labels:
             key = frozenset(alt.labels)
@@ -608,7 +665,7 @@ class _Evaluator:
         if key not in self.axes:
             options = alt.labels or tuple(self.text(o.span) for o in alt.options)
             self.axes[key] = Axis(key, alt.where, options, alt.span)
-        pick = self.choices.get(key, 0)
+        pick = self.choices.get(key, self.axes[key].pick(0))
         return alt.options[alt.labels.index(pick) if isinstance(pick, str) else pick]
 
     def attr(self, expr: ast.Attr, scope: dict[str, object]) -> object:
@@ -683,6 +740,8 @@ class _Evaluator:
             return _ARITHMETIC[expr.op](a, b)
         except ZeroDivisionError:
             raise BuxError("division by zero", expr.span) from None
+        except OverflowError:
+            raise BuxError("this number is too large", expr.span) from None
 
     def branch_sum(self, expr: ast.BinOp, left: object, right: object) -> ir.Node:
         terms = [self.term(left, expr.left.span), self.term(right, expr.right.span)]
@@ -824,10 +883,15 @@ class _Evaluator:
     def pattern(self, text: str, span: Span) -> ir.Node:
         """Expand a pattern: "MMMA" is the sequence M M M A of one-letter names."""
         nodes = []
+        # Where a pattern is written as a string, each letter has its place; one
+        # reached through a name, as p in `model = embed p head`, has the name's.
+        quoted = self.source[span.start + 1 : span.end - 1] == text
         for k, letter in enumerate(text):
             if letter.isspace():
                 continue
-            letter_span = Span(span.start + 1 + k, span.start + 2 + k)
+            letter_span = (
+                Span(span.start + 1 + k, span.start + 2 + k) if quoted else span
+            )
             if letter in self.broken and letter not in self.statements:
                 raise _Reported()
             if not letter.isalpha() or letter not in self.statements:
@@ -852,6 +916,8 @@ class _Evaluator:
                 return name if name in ACTIVATIONS else self.bare_type(value, span)
             case _Bare(name=name):
                 return name
+            case tuple():  # a list setting, read off a config: web.split
+                return list(value)
             case None | bool() | int() | float() | str() | list() | cfg.Config():
                 return value
         raise BuxError(f"expected a value, found {_describe(value)}", span)
@@ -1067,29 +1133,28 @@ class _Evaluator:
         ports: list[ir.Port] = []
         seen: set[tuple[str, ...]] = set()
         for arg in expr.args:
-            if arg.key is None:
-                raise BuxError(
-                    "layer settings are keyword arguments: name=value", arg.span
-                )
-            if arg.key in seen:
-                raise BuxError(f"'{'.'.join(arg.key)}' is given twice", arg.span)
-            seen.add(arg.key)
-            if cls is tcfg.RematConfig and arg.key in _REMAT_NAMES:
-                fields.append((arg.key, self.names(arg.value), arg.span))
+            key = _new_key(arg, seen)
+            if cls is tcfg.RematConfig and key in _REMAT_NAMES:
+                fields.append((key, self.names(arg.value), arg.span))
                 continue
             value = self.eval(arg.value, scope)
             if isinstance(value, ir.Tap | ir.Ref):
-                ports.append(_port(arg.key, value, cls, arg.span))
+                ports.append(_port(key, value, cls, arg.span))
                 continue
+            if isinstance(_unwrap(value), bool) and _numeric(cls, key):
+                raise BuxError(
+                    f"'{'.'.join(key)}' takes a number, found a boolean",
+                    arg.value.span,
+                )
             # A macro body runs once per call, so the same argument can be a bare
             # name in one call and not in the next.
             if isinstance(value, _Bare):
                 self.bare[arg.span] = (value.name, arg.value.span, tuple(scope))
             else:
                 self.bare.pop(arg.span, None)
-            if isinstance(value, _Builtin) and _option_of(cls, arg.key, value.name):
+            if isinstance(value, _Builtin) and _option_of(cls, key, value.name):
                 value = value.name  # wsd(shape=cosine): the option, not the config
-            fields.append((arg.key, self.data(value, arg.value.span), arg.span))
+            fields.append((key, self.data(value, arg.value.span), arg.span))
         return fields, ports
 
     def names(self, expr: ast.Expr) -> list[str]:
@@ -1206,9 +1271,9 @@ class _Evaluator:
     ) -> object:
         macro_scope = self.bind(st, expr, scope)
         self.depth += 1
-        if self.depth > 64:
-            raise BuxError(f"'{st.name}' recurses too deeply", expr.span)
         try:
+            if self.depth > 64:
+                raise BuxError(f"'{st.name}' recurses too deeply", expr.span)
             return _Named(self.text(expr.span), self.eval(st.body, macro_scope))
         finally:
             self.depth -= 1
@@ -1296,7 +1361,8 @@ class _Lowering:
         self.depth = 0  # residual branches the node being lowered is inside
         self.stacks: dict[str, list[_Entry]] = {}
         self.frames: list[_Frame] = []
-        self.shared: dict[str, ir.Node] = {}
+        # Each shared definition's first use, and whether it was outside any branch.
+        self.shared: dict[str, tuple[ir.Node, bool]] = {}
         self.spans: list[Span] = []
         self.embeddings = 0
         # Layers that reuse the embedding matrix (tied heads, nextn), with their spans.
@@ -1346,15 +1412,45 @@ class _Lowering:
             if span is not None:
                 self.ev.node(typed, span)
             if node.share is not None:
-                first = self.shared.setdefault(node.share, typed)
-                if ir.strip(first, widths=False) != ir.strip(typed, widths=False):
-                    raise self.error(
-                        f"shared '{node.share}' is used where it would need different widths"
-                    )
+                shared = typed
+                # A layer that needed a merge came back as (merge, layer), and the
+                # merge is not part of what it shares.
+                if isinstance(node, ir.Layer) and isinstance(typed, ir.Seq):
+                    shared = typed.items[-1]
+                self.check_shared(node.share, shared)
             return typed, out
         finally:
             if span is not None:
                 self.spans.pop()
+
+    def check_shared(self, share: str, typed: ir.Node) -> None:
+        """Check that this use of the shared `share` builds the one module its first
+        use does: of the same widths and ports, and with its residual branches at the
+        same depth, as a branch outside any other is the residual algebra's."""
+        outside = self.depth == 0
+        first, first_outside = self.shared.setdefault(share, (typed, outside))
+        if ir.strip(first, widths=False) != ir.strip(typed, widths=False):
+            if (
+                isinstance(first, ir.Layer)
+                and isinstance(typed, ir.Layer)
+                and first.ports != typed.ports
+            ):
+                raise self.error(
+                    f"shared '{share}' is one module, so every use of it takes the "
+                    "same ports"
+                )
+            raise self.error(
+                f"shared '{share}' is used where it would need different widths"
+            )
+        if outside != first_outside and any(
+            isinstance(n, ir.Residual) for n in ir.walk(typed)
+        ):
+            raise self.error(
+                f"shared '{share}' has residual branches and is used both outside "
+                "residual branches and inside one, where its branches are built "
+                "another way",
+                "define a separate block for the uses inside branches",
+            )
 
     def _lower(self, node: ir.Node, width: ir.Width) -> tuple[ir.Node, ir.Width | None]:
         match node:
@@ -1388,17 +1484,10 @@ class _Lowering:
         typed = []
         for item in items:
             typed_item, out = self.lower(item, width)
-            # A layer that needed a merge came back as an unlabeled (merge, layer).
-            if (
-                isinstance(typed_item, ir.Seq)
-                and typed_item.label is None
-                and typed_item.share is None
-            ):
-                typed.extend(typed_item.items)
-            else:
-                typed.append(typed_item)
+            typed.append(typed_item)
             width = typing.cast(ir.Width, out)
-        return ir.replace_children(node, tuple(typed)), width
+        # A layer that needed a merge came back as an unlabeled (merge, layer).
+        return ir.replace_children(node, _flatten(typed, ir.Seq, "items")), width
 
     def residual(
         self, node: ir.Node, body: ir.Node, width: ir.Width
@@ -1652,6 +1741,8 @@ def _model_settings(ev: _Evaluator) -> dict[str, object]:
             not isinstance(value, expected) or isinstance(value, bool)
         ):
             raise BuxError(f"'{name}' must be {kind}, found {_describe(value)}", span)
+        if isinstance(value, int) and value < 1:  # d_model and vocab_size count
+            raise BuxError(f"'{name}' must be greater than 0, found {value}", span)
         settings[name] = value
     return settings
 
@@ -1818,18 +1909,31 @@ def _check_tokenizer(train: tcfg.TrainConfig, spans: dict[str, Span]) -> None:
             )
 
 
+def _longest(train: tcfg.TrainConfig) -> tuple[int, str]:
+    """Return the longest rows the run reads, in training or in an eval, and the
+    setting that makes them."""
+    longest = max(c.seq_len for _, c in curriculum.phases(train))
+    evals = [e.seq_len for e in tcfg.evals(train) if e.seq_len is not None]
+    if evals and max(evals) > longest:
+        return max(evals), "eval"
+    return longest, "seq_len" if longest == train.seq_len else "curriculum"
+
+
 def _check_positions(
     train: tcfg.TrainConfig, arch: ir.Architecture | None, spans: dict[str, Span]
 ) -> None:
-    longest = max(c.seq_len for _, c in curriculum.phases(train))
-    setting = "seq_len" if longest == train.seq_len else "curriculum"
+    longest, setting = _longest(train)
     for layer in arch.layers() if arch is not None else ():
         if isinstance(layer.config, cfg.EmbeddingConfig):
             positions = layer.config.max_positions
             if positions is not None and longest > positions:
                 hint = f"embed(max_positions={longest})"
-                if setting == "seq_len":
-                    hint = f"seq_len = {positions}, or {hint}"
+                shorter = {
+                    "seq_len": f"seq_len = {positions}",
+                    "eval": f"eval(..., seq_len={positions})",
+                }
+                if setting in shorter:
+                    hint = f"{shorter[setting]}, or {hint}"
                 raise BuxError(
                     f"sequences of {longest} tokens are longer than the "
                     f"{positions} positions the embedding learns",
@@ -1912,10 +2016,11 @@ def compile(
     program = _load(source, filename, overrides, modules, recover=False)
     try:
         ev = _Evaluator(program)
-        for name, st in ev.statements.items():
-            if st.params is None:
-                ev.definition(name)
-        return _compile(ev, entry)
+        # The model first, as compile_runs meets its alternatives: a labeled axis's
+        # first label is the one met first.
+        arch = _compile(ev, entry)
+        ev.evaluate_all()
+        return arch
     except BuxError as err:
         raise program.locate(err) from None
 
@@ -2230,9 +2335,7 @@ def _explore(
             for option in range(len(free[0].options)):
                 explore({**choices, free[0].key: free[0].pick(option)})
             return
-        for name, st in ev.statements.items():
-            if st.params is None:
-                ev.definition(name)
+        ev.evaluate_all()
         if train is None:
             raise BuxError(
                 "this file does not say how to train its model",
@@ -2313,6 +2416,9 @@ class Report:
         values: The definitions that evaluated, by name: numbers, strings, lists,
             configs or IR nodes.
         run: The first run of the sweep, when the file is a run and has no errors.
+            Its name takes a part from every axis it reaches, even one whose
+            alternatives all compute the same runs, which `compile_runs` leaves out
+            of names: telling those apart takes compiling every run.
         axes: The sweep's axes, in the order written, when the file has a model and
             no errors.
         dimensions: The first run's search dimensions, in the order met, when the
@@ -2394,16 +2500,18 @@ def check(
         for name, value in ev.values.items()
         if (public := _public(value)) is not None
     }
-    clean = not errors
     axes: list[Axis] = []
     dims: list[Dimension] = []
     run = None
-    if clean and arch is not None:
-        axes, dims = _reached(program, entry)
+    if not errors and arch is not None:
+        try:
+            arch, train, axes, dims = _first(program, entry)
+        except BuxError as err:  # a cycle that evaluating in another order hid
+            report(err)
+            train = None
         if train is not None:
-            parts = tuple(axis.part(axis.pick(0)) for axis in axes)
-            name = _run_name(filename, parts)
-            run = ir.Run(name=name, arch=arch, train=train, choices=parts)
+            first = {axis.key: axis.pick(0) for axis in axes}
+            run = _run(_Explored(first, axes, arch, train, dims), filename)
             if dims and (error := _check_rungs(program, entry, train)):
                 report(error)
                 run = None
@@ -2413,7 +2521,7 @@ def check(
     return Report(
         statements=program.main,
         errors=errors,
-        arch=arch if clean else None,
+        arch=arch if not errors else None,
         values=values,
         run=run,
         axes=axes,
@@ -2489,12 +2597,7 @@ def _ends(space: tcfg.Distribution) -> tuple[float, ...]:
 def _check_once(
     ev: _Evaluator, entry: str, report: Callable[[BuxError], None]
 ) -> tuple[ir.Architecture | None, tcfg.TrainConfig | None]:
-    for name, st in ev.statements.items():
-        if st.params is None:
-            try:
-                ev.definition(name)
-            except BuxError as err:
-                report(err)
+    ev.evaluate_all(report)
     arch = train = None
     if entry in ev.statements or "d_model" in ev.statements:
         try:
@@ -2508,15 +2611,17 @@ def _check_once(
     return arch, train
 
 
-def _reached(
+def _first(
     program: modules.Program, entry: str
-) -> tuple[list[Axis], list[Dimension]]:
-    # The sweep's axes are those the run reaches, which evaluating every definition,
-    # as check does, does not tell apart from the others; so are its dimensions.
+) -> tuple[ir.Architecture, tcfg.TrainConfig | None, list[Axis], list[Dimension]]:
+    """Return the first run of the sweep as `compile_runs` compiles it, and the axes
+    and dimensions it reaches: which evaluating every definition, as check does,
+    does not tell apart from the others."""
     ev = _Evaluator(program)
-    _train(ev, _compile(ev, entry), require=True)
+    arch = _compile(ev, entry)
+    train = _train(ev, arch, require=True)
     axes = sorted(ev.axes.values(), key=lambda axis: axis.span.start)
-    return axes, list(ev.dims.values())
+    return arch, train, axes, list(ev.dims.values())
 
 
 def _public(value: object) -> object | None:

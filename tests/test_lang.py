@@ -126,6 +126,30 @@ def test_arithmetic_and_constants():
     )
     widths = [layer.width for layer in a.layers()]
     assert widths == ["tokens", 16, 25, 16]
+    [err] = check("d_model = 10.0 ^ 400\nmodel = rmsnorm").errors
+    assert err.message == "this number is too large"
+
+
+@pytest.mark.parametrize(
+    ("source", "message"),
+    [
+        ("d_model = 0\nmodel = rmsnorm", "'d_model' must be greater than 0, found 0"),
+        (
+            "d_model = 16\nvocab_size = -1\nmodel = embed head",
+            "'vocab_size' must be greater than 0, found -1",
+        ),
+        (
+            "d_model = 16\nmodel = gqa(num_heads=true, num_kv_heads=1)",
+            "'num_heads' takes a number, found a boolean",
+        ),
+        (
+            "d_model = 16\nx = rope(base=false)\nmodel = rmsnorm",
+            "'base' takes a number",
+        ),
+    ],
+)
+def test_counts_and_numbers_are_not_zero_or_booleans(source, message):
+    assert message in str(check(source).errors[0])
 
 
 def test_overrides_including_dotted_keys():
@@ -156,6 +180,20 @@ def test_definitions_are_order_independent_and_cycles_are_errors():
     assert "cycle" in error("a = [b]\nb = [a]\nmodel = embed a head").message
 
 
+@pytest.mark.parametrize("heads_first", [True, False])
+def test_a_replaced_name_that_a_definition_uses_back_is_a_cycle(heads_first):
+    """Only in its own definition does `heads` mean the one it replaces: `attn`
+    means the new one, whichever is evaluated first."""
+    lines = ["heads = 2", "attn = gqa(num_heads=heads, num_kv_heads=heads)"]
+    lib = "\n".join(lines if heads_first else lines[::-1])
+    lib += "\nd_model = 16\nvocab_size = 32\nmodel = embed [attn] head"
+    source = "use lib\nheads = attn.num_heads * 2"
+    with pytest.raises(BuxError, match="definition cycle"):
+        compile(source, modules={"lib": lib})
+    errors = check(source, modules={"lib": lib}).errors
+    assert errors and all("definition cycle" in e.message for e in errors)
+
+
 def test_bare_names_in_settings_are_strings_unless_defined():
     a = build(
         "e = moe(num_experts=4, top_k=2, router=sigmoid, expert=ffn, load_balancing=aux_free)\nmodel = embed [e] head"
@@ -173,6 +211,10 @@ def test_patterns_expand_one_letter_definitions():
     a = build('A = [attn]\nF = [ffn]\nmodel = embed "AAF A"^2 head')
     assert unlabeled(a.graph) == "(embed (A A F A)^2 head)"
     assert "pattern letter 'Z'" in error('A = [attn]\nmodel = embed "AZ" head').message
+    # A pattern reached through a name points at the name, not past it.
+    err = error('A = [attn]\np = "AZA"\nmodel = embed p head')
+    assert err.span is not None and err.source is not None
+    assert err.source[err.span.start : err.span.end] == "p"
 
 
 def test_macros():
@@ -187,6 +229,14 @@ def test_macros():
     assert unlabeled(second) == "([(norm ffn)] [(norm attn)])"
     assert "missing" in error("layer(m) = [m]\nmodel = embed layer() head").message
     assert "is a macro" in error("layer(m) = [m]\nmodel = embed layer head").message
+
+
+def test_a_macro_that_recursed_too_deeply_leaves_the_depth_as_it_was():
+    # m63(x) calls 64 macros deep, which is the limit, after r's error.
+    chain = "".join(f"m{i}(x) = m{i - 1}(x)\n" for i in range(1, 64))
+    source = PRELUDE + "model = embed head\nr(x) = r(x)\nbad = r(1)\nm0(x) = x\n"
+    source += chain + "ok = m63(1)"
+    assert [e.message for e in check(source).errors] == ["'r' recurses too deeply"]
 
 
 def test_shared_definitions():
@@ -374,6 +424,31 @@ def test_shared_blocks_must_agree_on_width():
         "shared n = norm\nmodel = embed [n] [linear(features=8) n linear(features=16)] head"
     )
     assert "different widths" in err.message
+    err = error("shared a = attn\nmodel = embed [a(v=@v)] [a(v=$v)] head")
+    assert "every use of it takes the same ports" in err.message
+
+
+@pytest.mark.parametrize(
+    "residual", ["", "residual = hc(expansion=2)\n", "residual = vpgate\n"]
+)
+def test_a_shared_block_with_branches_stays_outside_branches_or_inside(residual):
+    # A branch outside any other is the residual algebra's, inside one x + f(x).
+    err = error(
+        residual + "shared blk = [norm attn]\nmodel = embed blk [blk] norm head"
+    )
+    assert "used both outside residual branches and inside one" in err.message
+    build(residual + "shared blk = [norm attn]\nmodel = embed blk blk norm head")
+    build(residual + "shared n = norm\nmodel = embed [n attn] [[n attn]] norm head")
+
+
+def test_a_shared_layer_is_shared_whether_or_not_a_merge_goes_before_it():
+    a = build(
+        "residual = gr(expansion=2, rank=4)\nshared out = head\n"
+        "mtp = $h nextn [attn] out\nmodel = embed [attn] @h merge out mtp"
+    )
+    heads = [l.width for l in a.layers() if l.config.type == "head"]
+    assert heads == [16, 16]
+    build("residual = hc(expansion=2)\nshared n = norm\nmodel = embed [n attn] n head")
 
 
 def test_heads_are_outputs_and_mtp_reads_on_from_a_tap():
