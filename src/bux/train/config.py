@@ -338,7 +338,16 @@ class CosineSchedule(Config):
     horizon: Annotated[float, Field(gt=0)] = 1.0
 
 
-class WSDSchedule(Config):
+class _Cooled(Config):
+    """A schedule whose cooldown takes the last `decay` of the steps, which its
+    subclasses declare."""
+
+    def cooldown(self, steps: int) -> int:
+        """Return the steps of the cooldown, in a run of `steps`."""
+        return round(getattr(self, "decay") * steps)  # noqa: B009
+
+
+class WSDSchedule(_Cooled):
     """Warmup-stable-decay (Hu et al., 2024): warmup, the peak, then a cooldown to
     `final` times the peak over the last `decay` of the steps. Checkpoints from the
     stable phase can be cooled down later, to study several run lengths at once."""
@@ -355,10 +364,6 @@ class WSDSchedule(Config):
         """Check that a geometric cooldown ends above 0."""
         _above_zero(self.shape, self.final)
         return self
-
-    def cooldown(self, steps: int) -> int:
-        """Return the steps of the cooldown, in a run of `steps`."""
-        return round(self.decay * steps)
 
 
 class LinearDecaySchedule(Config):
@@ -381,7 +386,7 @@ class MultiStepSchedule(Config):
     factor: float = 0.316  # what each drop multiplies by; 0.316 is 1 / sqrt(10)
 
 
-class PowerSchedule(Config):
+class PowerSchedule(_Cooled):
     """IBM's Power scheduler (Shen et al., 2024): warmup, then `a` times the batch
     times n to the `b`, n the tokens trained, capped at the peak; then a cooldown to
     `final` times where it starts, over the last `decay` of the steps. The warmup
@@ -402,10 +407,6 @@ class PowerSchedule(Config):
         """Check that a geometric cooldown ends above 0."""
         _above_zero(self.shape, self.final)
         return self
-
-    def cooldown(self, steps: int) -> int:
-        """Return the steps of the cooldown, in a run of `steps`."""
-        return round(self.decay * steps)
 
 
 class Piece(Config):
