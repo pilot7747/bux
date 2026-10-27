@@ -40,10 +40,12 @@ optimizer = adamw(lr=3e-4, b1=0.9, b2=0.95, weight_decay=0.1)
 
 **What decays.** Weight decay applies to matrices, and to stacks of them, only. It
 skips every vector (biases, norm scales) and what a layer names in its
-`no_weight_decay` attribute whatever its shape: norms' gains and biases, and Engram's
-tables. The stacked dimension of a scanned repeat does not count, so the stacked norm
-scales of `methods(repeat=scan)` are still vectors and do not decay
-({py:func}`bux.train.optim.weight_decay_mask`).
+`no_weight_decay` attribute whatever its shape: norms' gains and biases, Engram's
+tables, Mamba's and Mamba-2's `A_log` (Mamba's a matrix of decay rates), RWKV-7's
+token shift and `r_k`, and hyper-connections' static maps, which start at
+$[e_k, I]$ and 1 rather than at 0. The stacked dimension of a scanned repeat does not
+count, so the stacked norm scales of `methods(repeat=scan)` are still vectors and do
+not decay ({py:func}`bux.train.optim.weight_decay_mask`).
 
 ## Muon
 

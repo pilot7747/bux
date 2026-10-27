@@ -180,13 +180,16 @@ class Mamba(nnx.Module):
     D u added, the output is gated by SiLU(z) and projected back.
 
     A starts as S4D-real's, ``-(1, 2, ..., n)`` in every channel, D at 1, and the
-    time steps log-uniform in ``[dt_min, dt_max]``.
+    time steps log-uniform in ``[dt_min, dt_max]``. Weight decay leaves A_log alone,
+    as Mamba's code does: a matrix, but of decay rates.
 
     Args:
         config: Its settings (`bux.config.MambaConfig`).
         width: The width of the stream, d.
         rngs: The random streams the parameters start from.
     """
+
+    no_weight_decay = ("A_log",)
 
     def __init__(self, config: cfg.MambaConfig, width: int, rngs: nnx.Rngs):
         d_inner, n = config.expand * width, config.state_size
@@ -256,7 +259,8 @@ class Mamba2(nnx.Module):
     as linear attention's does.
 
     A starts at ``-a`` for a uniform in [1, 16] per head (Mamba-2's A_init_range), D
-    at 1, and the time steps log-uniform in ``[dt_min, dt_max]``.
+    at 1, and the time steps log-uniform in ``[dt_min, dt_max]``. Weight decay leaves
+    A_log alone, as Mamba's.
 
     Args:
         config: Its settings (`bux.config.Mamba2Config`).
@@ -267,6 +271,8 @@ class Mamba2(nnx.Module):
         ValueError: The inner channels do not split into heads of head_dim, or the
             heads into num_groups groups.
     """
+
+    no_weight_decay = ("A_log",)
 
     def __init__(self, config: cfg.Mamba2Config, width: int, rngs: nnx.Rngs):
         d_inner, n, g = config.expand * width, config.state_size, config.num_groups
