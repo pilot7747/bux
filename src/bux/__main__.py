@@ -136,10 +136,18 @@ def searching(run: Run, dims: list[Dimension]) -> str:
             halving.steps(h, run.train.steps, r) or run.train.steps
             for r in range(h.rungs)
         ]
-        worth = h.rungs * search.trials / h.eta ** (h.rungs - 1)
         line += f"\nhalving: rungs of {', '.join(map(_si, rungs))} steps, eta {h.eta}"
-        line += f", about {worth:.3g} runs' steps in all"
+        line += f", about {_worth(search):.3g} runs' steps in all"
     return line
+
+
+def _worth(search: cfg.SearchConfig) -> float:
+    """Return about how many runs' steps a search with halving takes in all: every
+    rung as many, of 1 / eta of the trials of the rung before, each for eta times the
+    steps."""
+    h = search.halving
+    assert h is not None
+    return h.rungs * search.trials / h.eta ** (h.rungs - 1)
 
 
 def _tokens(t: TrainConfig) -> int:
@@ -285,7 +293,7 @@ def plan(runs: list[Run], gpus: int | None = None) -> str:
     token, the GPUs it trains on out of `gpus` (default: the visible ones), the bytes
     of its parameters and of its optimizer state per GPU, and the share of a step its
     pipeline idles."""
-    from bux.launch import visible_gpus
+    from bux.launch import table, visible_gpus
 
     available = len(visible_gpus()) if gpus is None else gpus
     head = (
@@ -294,12 +302,8 @@ def plan(runs: list[Run], gpus: int | None = None) -> str:
     )
     alone = len(runs) == 1
     rows = [(*head, "run"), *(_row(run, available, alone) for run in runs)]
-    widths = [max(len(row[i]) for row in rows) for i in range(len(head))]
-    lines = [
-        "  ".join(cell.ljust(w) for cell, w in zip(row, widths)) + "  " + row[-1]
-        for row in rows
-    ]
-    return f"{len(runs)} run{'s' if len(runs) != 1 else ''}\n" + "\n".join(lines)
+    lines = "\n".join(table(rows))
+    return f"{len(runs)} run{'s' if len(runs) != 1 else ''}\n" + lines
 
 
 def plan_searches(spaces: list[Space]) -> str:
@@ -315,8 +319,7 @@ def plan_searches(spaces: list[Space]) -> str:
             f"{len(space.dimensions)} dimensions by {config_to_source(search.method)}"
         )
         if (h := search.halving) is not None:
-            worth = h.rungs * search.trials / h.eta ** (h.rungs - 1)
-            line += f", {h.rungs} rungs: about {worth:.3g} runs' steps"
+            line += f", {h.rungs} rungs: about {_worth(search):.3g} runs' steps"
         lines.append(line)
     return "\n".join(lines)
 

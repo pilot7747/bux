@@ -29,7 +29,7 @@ from jaxtyping import Float
 from bux.lang import ir
 from bux.lang.compiler import Space as Compiled
 from bux.lang.syntax import BuxError
-from bux.launch import Queue, status
+from bux.launch import Queue, status, table
 from bux.search import halving, methods
 from bux.search.halving import Trial
 from bux.search.space import Space
@@ -267,11 +267,7 @@ class Search:
             head += f"; best {best.top[1]:.4f}, trial {best.number}"
         rows = [("trial", "rung", "objective", "run")]
         rows += [self._row(t) for t in sorted(self.trials, key=_rank)]
-        widths = [max(len(row[i]) for row in rows) for i in range(3)]
-        lines = [
-            "  ".join(c.ljust(w) for c, w in zip(r, widths)) + "  " + r[3] for r in rows
-        ]
-        return head + "\n" + "\n".join(lines)
+        return head + "\n" + "\n".join(table(rows))
 
     def _row(self, t: Trial) -> tuple[str, str, str, str]:
         if t.top is None:

@@ -44,6 +44,7 @@ stopped them.
 
 import contextlib
 import datetime
+import functools
 import json
 import math
 import os
@@ -171,12 +172,21 @@ def join() -> None:
 def _largest(signum: int) -> Int[Array, ""]:
     """Return the largest `signum` of all processes, the same in each, once the
     devices compute it."""
-    grid = Mesh(np.array(jax.devices()), ("devices",))
-    sharding = NamedSharding(grid, P("devices"))
+    grid, largest = _every_device()
     local = np.full(jax.local_device_count(), signum, np.int32)  # one per device
-    signums = jax.make_array_from_process_local_data(sharding, local)
+    signums = jax.make_array_from_process_local_data(
+        NamedSharding(grid, P("devices")), local
+    )
     with jax.set_mesh(grid):
-        return jax.jit(jnp.max, out_shardings=NamedSharding(grid, P()))(signums)
+        return largest(signums)
+
+
+@functools.cache
+def _every_device() -> tuple[Mesh, Callable[[Int[Array, " n"]], Int[Array, ""]]]:
+    """Return the mesh of every device of the job, and the largest of an array split
+    over it, compiled once: `_largest` runs every step."""
+    grid = Mesh(np.array(jax.devices()), ("devices",))
+    return grid, jax.jit(jnp.max, out_shardings=NamedSharding(grid, P()))
 
 
 class Stop(Hook):
@@ -573,13 +583,19 @@ def summary(runs: Sequence[ir.Run], out: str | Path) -> str:
         step = f"{s.get('step', 0)}/{run.train.steps}"
         rows.append((s.get("state", "pending"), step, *losses, run.name))
     states = Counter(row[0] for row in rows[1:])
-    widths = [max(len(row[i]) for row in rows) for i in range(len(head))]
-    lines = [
+    head = ", ".join(f"{n} {state}" for state, n in states.most_common())
+    return f"{len(runs)} runs: {head}\n" + "\n".join(table(rows))
+
+
+def table(rows: Sequence[Sequence[str]]) -> list[str]:
+    """Return the lines of a table of `rows`, its head first: every cell but the last
+    of a row padded to the widest of its column, two spaces apart, and the last, a
+    run's name, as it is."""
+    widths = [max(len(row[i]) for row in rows) for i in range(len(rows[0]) - 1)]
+    return [
         "  ".join(c.ljust(w) for c, w in zip(row, widths)) + "  " + row[-1]
         for row in rows
     ]
-    head = ", ".join(f"{n} {state}" for state, n in states.most_common())
-    return f"{len(runs)} runs: {head}\n" + "\n".join(lines)
 
 
 def _objective(run: ir.Run, folder: Path, state: str | None) -> str:
