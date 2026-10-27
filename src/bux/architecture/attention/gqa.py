@@ -339,7 +339,7 @@ class Attention(SoftmaxAttention):
         self.value_residual = config.value_residual
         shape = (2,) if config.value_residual == "learned" else ()
         trained = reads(ports, "v") and config.value_residual != "fixed"
-        self.v_mix = nnx.Param(jnp.full(shape, 0.5)) if trained else None
+        self.v_mix = nnx.Param(jnp.full(shape, 0.5, jnp.float32)) if trained else None
 
     def __call__(self, x: Float[Array, "b t d"], taps: Taps) -> Float[Array, "b t d"]:
         """Attend each position to those before it in its document, and to itself.

@@ -128,11 +128,19 @@ def searching(run: Run, dims: list[Dimension]) -> str:
             halving.steps(h, run.train.steps, r) or run.train.steps
             for r in range(h.rungs)
         ]
-        worth = h.rungs * search.trials / h.eta ** (h.rungs - 1)
         sizes = ", ".join(map(curriculum.si, rungs))
         line += f"\nhalving: rungs of {sizes} steps, eta {h.eta}"
-        line += f", about {worth:.3g} runs' steps in all"
+        line += f", about {_worth(search):.3g} runs' steps in all"
     return line
+
+
+def _worth(search: cfg.SearchConfig) -> float:
+    """Return about how many runs' steps a search with halving takes in all: every
+    rung as many, of 1 / eta of the trials of the rung before, each for eta times the
+    steps."""
+    h = search.halving
+    assert h is not None
+    return h.rungs * search.trials / h.eta ** (h.rungs - 1)
 
 
 def _tokens(t: TrainConfig) -> int:
@@ -278,7 +286,7 @@ def plan(runs: list[Run], gpus: int | None = None) -> str:
     token, the GPUs it trains on out of `gpus` (default: the visible ones), the bytes
     of its parameters and of its optimizer state per GPU, and the share of a step its
     pipeline idles."""
-    from bux.launch import visible_gpus
+    from bux.launch import table, visible_gpus
 
     available = len(visible_gpus()) if gpus is None else gpus
     head = (
@@ -287,12 +295,8 @@ def plan(runs: list[Run], gpus: int | None = None) -> str:
     )
     alone = len(runs) == 1
     rows = [(*head, "run"), *(_row(run, available, alone) for run in runs)]
-    widths = [max(len(row[i]) for row in rows) for i in range(len(head))]
-    lines = [
-        "  ".join(cell.ljust(w) for cell, w in zip(row, widths)) + "  " + row[-1]
-        for row in rows
-    ]
-    return f"{len(runs)} run{'s' if len(runs) != 1 else ''}\n" + "\n".join(lines)
+    lines = "\n".join(table(rows))
+    return f"{len(runs)} run{'s' if len(runs) != 1 else ''}\n" + lines
 
 
 def plan_searches(spaces: list[Space]) -> str:
@@ -308,8 +312,7 @@ def plan_searches(spaces: list[Space]) -> str:
             f"{len(space.dimensions)} dimensions by {config_to_source(search.method)}"
         )
         if (h := search.halving) is not None:
-            worth = h.rungs * search.trials / h.eta ** (h.rungs - 1)
-            line += f", {h.rungs} rungs: about {worth:.3g} runs' steps"
+            line += f", {h.rungs} rungs: about {_worth(search):.3g} runs' steps"
         lines.append(line)
     return "\n".join(lines)
 
@@ -491,13 +494,13 @@ def _export(args: argparse.Namespace) -> int:
 def _export_file(args: argparse.Namespace) -> int:
     if args.step is not None or args.check:
         return _error("bux export: a .bux file has no weights to --step or --check")
+    if (source := _read(args.run)) is None:
+        return 1
     import torch
 
     from bux.export.huggingface import save
     from bux.lang import compile
 
-    with open(args.run, encoding="utf-8") as f:
-        source = f.read()
     try:
         arch = compile(
             source, entry=args.entry, filename=args.run, overrides=args.settings
@@ -519,6 +522,16 @@ def _export_file(args: argparse.Namespace) -> int:
 def _error(message: str) -> int:
     print(message, file=sys.stderr)
     return 1
+
+
+def _read(path: str) -> str | None:
+    """Return the text of the file at `path`; None, saying why, if it cannot be read."""
+    try:
+        with open(path, encoding="utf-8") as f:
+            return f.read()
+    except OSError as err:
+        _error(f"error: cannot read {path}: {err.strerror or err}")
+        return None
 
 
 def _check(report: Report, arch: Architecture, runs: list[Run]) -> None:
@@ -661,8 +674,8 @@ def main(argv: list[str] | None = None) -> int:
     for setting in args.settings:
         if "=" not in setting and not setting.startswith("use "):
             cli.error(f"settings are name=value or 'use module', not {setting!r}")
-    with open(args.file, encoding="utf-8") as f:
-        source = f.read()
+    if (source := _read(args.file)) is None:
+        return 1
     where = {"entry": args.entry, "filename": args.file, "overrides": args.settings}
     report = check(source, **where)
     if report.errors:

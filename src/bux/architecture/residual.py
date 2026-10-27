@@ -60,6 +60,20 @@ def widen(x: Float[Array, "b t d"], n: int) -> Float[Array, "b t n d"]:
     return jnp.repeat(x[:, :, None], n, axis=2)
 
 
+def weighted(
+    w: Float[Array, "b t n"], x: Float[Array, "b t n d"]
+) -> Float[Array, "b t d"]:
+    """Return the streams of x summed, each by its weight in w: ``sum_j w_j x_j``."""
+    return jnp.einsum("btn,btnd->btd", w, x)
+
+
+def mixed(
+    m: Float[Array, "b t n n"], x: Float[Array, "b t n d"]
+) -> Float[Array, "b t n d"]:
+    """Return the n streams of x mixed by m: stream k is ``sum_j m_jk x_j``."""
+    return jnp.einsum("btjk,btjd->btkd", m, x)
+
+
 def sinkhorn(
     logits: Float[Array, "*lead n n"], iters: int
 ) -> Float[Array, "*lead n n"]:
@@ -123,7 +137,7 @@ class _Dynamic(nnx.Module):
         layernorm = cfg.NormalizationConfig(type="layernorm", affine=False, eps=eps)
         self.norm = Norm(layernorm, d)
         self.proj = nnx.Param(jnp.zeros((d, columns)))
-        self.scale = nnx.Param(jnp.asarray(0.01))
+        self.scale = nnx.Param(jnp.asarray(0.01, jnp.float32))
 
     def __call__(self, x: Float[Array, "b t n d"]) -> Float[Array, "b t n k"]:
         return self.scale[...] * jnp.tanh(self.norm(x) @ self.proj[...])
@@ -173,7 +187,7 @@ class HyperConnections(nnx.Module):
 
     def read(self, x: Float[Array, "b t n d"]) -> Float[Array, "b t d"]:
         """Return what f reads of the n streams x: ``A_m^T x``."""
-        return jnp.einsum("btn,btnd->btd", self._alpha(x)[..., 0], x)
+        return weighted(self._alpha(x)[..., 0], x)
 
     def __call__(
         self, x: Float[Array, "b t n d"], taps: Taps
@@ -184,11 +198,11 @@ class HyperConnections(nnx.Module):
         read = alpha[..., 0]
         if self.single_pass:
             read = _single_pass_read(read, x, taps)
-        y = self.body(jnp.einsum("btn,btnd->btd", read, x), taps)
+        y = self.body(weighted(read, x), taps)
         beta = jnp.broadcast_to(self.static_beta[...], x.shape[:3])
         if self.dynamic_beta is not None:
             beta = beta + self.dynamic_beta(x)[..., 0]
-        kept = jnp.einsum("btjk,btjd->btkd", alpha[..., 1:], x)
+        kept = mixed(alpha[..., 1:], x)
         return shard_stream(kept + beta[..., None] * y[:, :, None])
 
 
@@ -226,11 +240,13 @@ class ManifoldHyperConnections(nnx.Module):
         n, write = config.expansion, body is not None
         self.body, self.single_pass = body, config.single_pass
         self.iters, self.norm_eps = config.sinkhorn_iters, config.norm_eps
-        pre = jnp.full(n, -math.log(max(n - 1, 1)))  # sigmoid(b_pre) = 1 / n
+        # sigmoid(b_pre) = 1 / n; float32, as every parameter here: a weakly typed one
+        # would turn strong at its first update, and the step compile again.
+        pre = jnp.full(n, -math.log(max(n - 1, 1)), jnp.float32)
         res = -8.0 * (1 - jnp.eye(n))
         bias = jnp.concatenate([pre, jnp.zeros(n), res.reshape(-1)]) if write else pre
         proj = jnp.zeros((n * d, bias.shape[0]))
-        scale = jnp.full(3 if write else 1, 0.01)
+        scale = jnp.full(3 if write else 1, 0.01, jnp.float32)
         self.proj = nnx.Param(proj) if config.dynamic else None  # W
         self.scale = nnx.Param(scale) if config.dynamic else None  # a
         self.bias = nnx.Param(bias)  # b
@@ -253,7 +269,7 @@ class ManifoldHyperConnections(nnx.Module):
 
     def read(self, x: Float[Array, "b t n d"]) -> Float[Array, "b t d"]:
         """Return what f reads of the n streams x: ``sum_j pre_j x_j``."""
-        return jnp.einsum("btn,btnd->btd", self._pre(self._logits(x), x.shape[2]), x)
+        return weighted(self._pre(self._logits(x), x.shape[2]), x)
 
     def __call__(
         self, x: Float[Array, "b t n d"], taps: Taps
@@ -268,8 +284,8 @@ class ManifoldHyperConnections(nnx.Module):
             read = _single_pass_read(read, x, taps)
         post = 2 * jax.nn.sigmoid(logits[..., n : 2 * n])
         res = sinkhorn(logits[..., 2 * n :].reshape(b, t, n, n), self.iters)
-        y = self.body(jnp.einsum("btn,btnd->btd", read, x), taps)
-        kept = jnp.einsum("btjk,btjd->btkd", res, x)
+        y = self.body(weighted(read, x), taps)
+        kept = mixed(res, x)
         return shard_stream(kept + post[..., None] * y[:, :, None])
 
 
@@ -360,7 +376,7 @@ class AttentionResidual(nnx.Module):
         outputs so far: the softmax-weighted sum of its sources."""
         v = sources(x, self.block_size)
         scores = jnp.einsum("btmd,d->btm", self.key_norm(v), self.query[...])
-        return jnp.einsum("btm,btmd->btd", softmax(scores, -1), v)
+        return weighted(softmax(scores, -1), v)
 
     def __call__(
         self, x: Float[Array, "b t s d"], taps: Taps
@@ -392,7 +408,8 @@ class ResidualGate(nnx.Module):
         self, config: cfg.ResidualGateConfig, d: int, index: int, body: nnx.Module
     ):
         b = 1 / math.sqrt(index + 2)
-        self.gate = nnx.Param(jnp.full(d, config.temperature * math.log(b / (1 - b))))
+        gate = config.temperature * math.log(b / (1 - b))
+        self.gate = nnx.Param(jnp.full(d, gate, jnp.float32))
         self.temperature, self.eps = config.temperature, config.eps
         self.body = body
 
@@ -429,7 +446,7 @@ class Merge(nnx.Module):
     def __call__(self, x: Float[Array, "b t s d"], taps: Taps) -> Float[Array, "b t d"]:
         """Return one stream, ``b t d``, read from the widened x."""
         if self.reader is None:
-            return jnp.einsum("btn,btnd->btd", _pending(taps, x), x)
+            return weighted(_pending(taps, x), x)
         return self.reader.read(x)
 
 

@@ -6,6 +6,7 @@ import sys
 import types
 from pathlib import Path
 
+import jax.numpy as jnp
 import numpy as np
 import optax
 import pytest
@@ -208,6 +209,34 @@ def test_layers_are_named_alike_unrolled_and_scanned():
     assert keys[0].keys() == keys[1].keys()
     for k in keys[0]:
         assert float(keys[0][k]) == pytest.approx(float(keys[1][k]), rel=1e-6)
+
+
+# A MoE outside any branch: a layer of its own, by its name.
+BARE_MOE = """
+d_model = 32
+vocab_size = 64
+norm = rmsnorm
+attn = gqa(num_heads=4, num_kv_heads=2, rope=rope())
+moe = moe(num_experts=4, top_k=2, expert=gated_mlp(intermediate_size=16, activation=swish))
+model = embed [norm attn] moe^2 norm head
+"""
+
+
+@pytest.mark.parametrize("repeat", ["unroll", "scan"])
+def test_a_layer_outside_any_branch_observes_by_its_name_as_its_parameters_are(
+    repeat,
+):
+    [run] = compile_runs(source(BARE_MOE, methods=f"methods(repeat={repeat})"))
+    with parallel.use(run.train.mesh, run.train.layout, run.train.methods):
+        model = Model(run.arch, rngs=nnx.Rngs(0))
+        with observe.use():
+            _, reported = model.training_heads(jnp.zeros((2, 8), jnp.int32))
+        where = observed.layers(model)
+    seen = observe.named(r for r in reported if observe.is_observed(r.name))
+    loads = {k for k in seen if k.startswith("router/max_load/")}
+    keys = {key for layer in where.values() for key in layer.keys}
+    assert loads == {"router/max_load/moe.00", "router/max_load/moe.01"}
+    assert {"moe.00", "moe.01"} <= keys
 
 
 def test_histograms_share_out_every_entry_of_a_layer(steps):

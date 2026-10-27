@@ -1,6 +1,7 @@
 """Every example architecture builds in the reference backend and runs: abstractly at
 its full size, and for real shrunk to a few dims."""
 
+import typing
 from pathlib import Path
 
 import jax
@@ -8,7 +9,8 @@ import jax.numpy as jnp
 import pytest
 from flax import nnx
 
-from bux.architecture import Model, num_params
+from bux import config as cfg
+from bux.architecture import Model, num_params, registry
 from bux.lang import compile, compile_file
 from bux.train.objective import prediction_offsets
 
@@ -20,9 +22,10 @@ D, V = 32, 64
 @pytest.mark.parametrize("path", EXAMPLES, ids=lambda p: p.stem)
 def test_examples_build_and_run_at_full_size(path):
     """No parameter is allocated and nothing is computed, but every layer is built and
-    traced with its shapes checked."""
+    traced with its shapes checked, and no parameter is weakly typed."""
     arch = compile_file(str(path))
     model = nnx.eval_shape(lambda: Model(arch, rngs=nnx.Rngs(0)))
+    assert not weak(model)
     graphdef, state = nnx.split(model)
     tokens = jax.ShapeDtypeStruct((2, 16), jnp.int32)
     positions = jax.ShapeDtypeStruct((2, 16), jnp.int32)  # packed documents
@@ -34,6 +37,52 @@ def test_examples_build_and_run_at_full_size(path):
     heads = len(prediction_offsets(arch))
     assert [o.shape for o in logits] == [(2, 16, arch.vocab_size)] * heads
     assert num_params(model) > 0
+
+
+def weak(model: nnx.Module) -> list[str]:
+    """Return the paths of `model`'s weakly typed parameters: each turns strong at its
+    first update, and the training step compiles again for it."""
+    params = jax.tree_util.tree_leaves_with_path(nnx.state(model, nnx.Param))
+    return [jax.tree_util.keystr(path) for path, x in params if x.weak_type]
+
+
+# Models of the layers and residual algebras that no example has, and of settings that
+# add parameters of their own (gqa's learned value residual).
+OTHERS = [
+    f"""
+d_model = {D}
+vocab_size = {V}
+norm = rmsnorm
+attn = gqa(num_heads=4, num_kv_heads=2)
+mix = gqa(num_heads=4, num_kv_heads=2, value_residual=learned)
+gla = gla(num_heads=2, head_dim=8, gate_rank=4)
+delta = deltanet(num_heads=2, head_dim=8)
+rwkv = rwkv7(num_heads=2, head_dim=8, decay_rank=4, a_rank=4, v_rank=4, gate_rank=4)
+mixers = [norm gla] [norm delta] [norm rwkv] [norm short_conv]
+model = embed [dyt attn(v=@v1)] [norm mix(v=$v1) dropout(rate=0.1)] mixers norm head
+""",
+    f"d_model = {D}\nvocab_size = {V}\nresidual = hc()\nmodel = embed [rmsnorm] head",
+]
+
+
+@pytest.mark.parametrize("source", OTHERS, ids=["layers", "hc"])
+def test_no_parameter_of_another_model_is_weakly_typed(source):
+    arch = compile(source)
+    assert not weak(nnx.eval_shape(lambda: Model(arch, rngs=nnx.Rngs(0))))
+
+
+def test_every_layer_and_residual_algebra_is_in_an_example_or_another_model():
+    """So that the checks of weak types above build every one."""
+    archs = [*map(compile_file, map(str, EXAMPLES)), *map(compile, OTHERS)]
+    layers = {layer.config.type for arch in archs for layer in arch.layers()}
+    residuals = {arch.residual.type for arch in archs if arch.residual is not None}
+    union, _ = typing.get_args(cfg.ResidualConfig)
+    algebras = [
+        typing.get_args(c.model_fields["type"].annotation)
+        for c in typing.get_args(union)
+    ]
+    assert set(registry._REGISTRY) <= layers
+    assert {t for types in algebras for t in types} <= residuals
 
 
 # Example architectures shrunk to a few dims, a statement a line; the layers' wiring
