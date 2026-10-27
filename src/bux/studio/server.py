@@ -17,7 +17,6 @@ import json
 import os
 import secrets
 import sys
-import tempfile
 import threading
 import typing
 import webbrowser
@@ -352,11 +351,13 @@ def _picks(body: Json) -> dict[str, int]:
 
 def _write(path: Path, source: str) -> None:
     """Write `source` over `path` at once: to a file beside it, then in its place,
-    keeping its permissions and its line endings, and making its folder."""
+    keeping its permissions and its line endings, and making its folder. A new file
+    gets the permissions the umask leaves, as an editor's would."""
     mode = path.stat().st_mode if path.exists() else None
     newline = _newline(path) if mode is not None else "\n"
     path.parent.mkdir(parents=True, exist_ok=True)
-    fd, temp = tempfile.mkstemp(dir=path.parent, prefix=f".{path.name}.", suffix=".tmp")
+    temp = path.with_name(f".{path.name}.{secrets.token_hex(4)}.tmp")
+    fd = os.open(temp, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o666)
     try:
         with os.fdopen(fd, "w", encoding="utf-8", newline=newline) as f:
             f.write(source.replace("\r\n", "\n"))
@@ -364,7 +365,7 @@ def _write(path: Path, source: str) -> None:
             os.chmod(temp, mode)
         os.replace(temp, path)
     except BaseException:
-        Path(temp).unlink(missing_ok=True)
+        temp.unlink(missing_ok=True)
         raise
 
 

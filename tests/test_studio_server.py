@@ -320,6 +320,9 @@ def test_the_first_save_makes_the_files_folder(tmp_path, static):
         status, saved, _ = client.call("/api/save", {"source": TEMPLATE, "mtime": None})
         assert status == 200 and path.read_text() == TEMPLATE
         assert saved["mtime"] == path.stat().st_mtime
+        umask = os.umask(0o022)
+        os.umask(umask)
+        assert path.stat().st_mode & 0o777 == 0o666 & ~umask  # not mkstemp's 0o600
     finally:
         server.shutdown()
         server.server_close()
