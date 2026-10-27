@@ -48,7 +48,10 @@ class Wandb(Sink):
     """Weights & Biases (`bux.train.config.WandbConfig`): a W&B run for the run,
     named as it is, in a group of its file's runs, with its settings as its config.
     A run that resumes goes on with the W&B run it started, whose id its directory
-    keeps in wandb_id; a fresh one starts a W&B run of its own.
+    keeps in wandb_id; a fresh one starts a W&B run of its own. Unlike metrics.jsonl
+    and TensorBoard's events, the W&B run keeps the steps that a crash logged past the
+    checkpoint: W&B ignores a step below one it has, so it takes the resumed run's
+    steps only from there on.
 
     Args:
         config: The tracker's settings.

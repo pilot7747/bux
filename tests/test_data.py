@@ -34,6 +34,16 @@ def test_special_tokens_in_documents_stay_text(byte_tokenizer, tok):
         tok.special("<|eot_id|>")
 
 
+def test_a_tokenizer_of_no_special_tokens_takes_its_bos_and_eos_from_added(tmp_path):
+    spec = byte_spec() | {"added_tokens": []}
+    (tmp_path / "tokenizer.json").write_text(json.dumps(spec))
+    name, added = str(tmp_path / "tokenizer.json"), ("<eos>",)
+    tok = Tokenizer(
+        tcfg.TokenizerConfig(name=name, added=added, bos="<eos>", eos="<eos>")
+    )
+    assert tok.eos == tok.bos == 256 and tok.vocab_size == 257
+
+
 def test_a_token_stands_for_its_bytes_of_text_and_a_special_one_for_none(tok):
     lengths = tok.token_bytes()
     assert lengths.tolist() == [1] * 256 + [0] * 3

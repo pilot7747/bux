@@ -44,6 +44,7 @@ from bux.architecture.registry import Loss
 from bux.architecture.repeats.repeat import Scanned
 from bux.parallel import pipeline
 from bux.train.objective import Metrics
+from bux.train.optim import path_keys
 from bux.train.sinks import Histogram, Scalars
 
 
@@ -151,23 +152,8 @@ def _shares(node: Scanned) -> tuple[int, ...] | None:
 
 def _flat(tree: Any) -> dict[tuple, Shaped[Array, "..."]]:
     """Return the arrays of `tree`, a state or the pure tree of one, by their paths."""
-
-    def is_leaf(x: object) -> bool:
-        return isinstance(x, nnx.Variable)
-
-    out = {}
-    for path, leaf in jax.tree_util.tree_leaves_with_path(tree, is_leaf=is_leaf):
-        value = leaf.get_value() if isinstance(leaf, nnx.Variable) else leaf
-        if isinstance(value, jax.Array):
-            out[tuple(_key(k) for k in path)] = value
-    return out
-
-
-def _key(entry: Any) -> Any:
-    for attr in ("key", "name", "idx"):
-        if hasattr(entry, attr):
-            return getattr(entry, attr)
-    return entry
+    leaves = jax.tree_util.tree_leaves_with_path(tree)
+    return {path_keys(p): x for p, x in leaves if isinstance(x, jax.Array)}
 
 
 def _owner(where: Layers, path: tuple) -> Layer:

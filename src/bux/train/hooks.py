@@ -26,6 +26,7 @@ import functools
 import itertools
 import random
 import shutil
+import socket
 import time
 from collections.abc import Callable, Iterator, Mapping
 from pathlib import Path
@@ -400,12 +401,13 @@ class Profile(Hook):
 
     def __call__(self, trainer: "Trainer", metrics: Metrics) -> Scalars | None:
         """Start or stop the trace once the step is done; after the last step traced,
-        return what the steps spent in communication, on GPUs."""
+        return what the steps spent in communication, on GPUs: by this host's trace,
+        not another's of the job, which may still be being written."""
         jax.block_until_ready(metrics)
         self._at(trainer.step)
         if trainer.step != self.last or self.tool != "jax":
             return None
-        if (file := trace.latest(self.folder)) is None:
+        if (file := trace.latest(self.folder, socket.gethostname())) is None:
             return None
         return trace.comm_ms(file, self.last - self.first)
 

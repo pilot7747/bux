@@ -181,6 +181,8 @@ Each tracker gets every metric and histogram, from the job's first process.
 its file's runs, with its settings and its sweep's `choices` as its config, so a
 sweep's runs group and filter by what they took. A run that resumes from a checkpoint
 goes on with the W&B run it started, whose id it keeps in its directory's `wandb_id`.
+That W&B run keeps the steps a crash logged past the checkpoint: W&B ignores a step
+below one it has, so the resumed run's own reach it only from there on.
 `mode="offline"` writes into the run's directory for `wandb sync` later.
 
 **TensorBoard** ({bux}`tensorboard`). Install it with `uv sync --extra tensorboard`.

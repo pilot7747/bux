@@ -66,8 +66,8 @@ class Tokenizer:
         self.config = config
         self.specials = {t["content"]: t["id"] for t in added if t.get("special")}
         self.encoder = _encoder(spec)
-        ends = (i + 1 for i in self.specials.values())
-        self.vocab_size: int = max(self.encoder.vocab_size, *ends)
+        ends = [i + 1 for i in self.specials.values()]  # none, in a tokenizer of none
+        self.vocab_size: int = max([self.encoder.vocab_size, *ends])
         for token in config.added:
             if token not in self.specials:
                 self.specials[token] = self.vocab_size
