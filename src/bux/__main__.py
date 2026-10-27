@@ -498,13 +498,13 @@ def _export(args: argparse.Namespace) -> int:
 def _export_file(args: argparse.Namespace) -> int:
     if args.step is not None or args.check:
         return _error("bux export: a .bux file has no weights to --step or --check")
+    if (source := _read(args.run)) is None:
+        return 1
     import torch
 
     from bux.export.huggingface import save
     from bux.lang import compile
 
-    with open(args.run, encoding="utf-8") as f:
-        source = f.read()
     try:
         arch = compile(
             source, entry=args.entry, filename=args.run, overrides=args.settings
@@ -526,6 +526,16 @@ def _export_file(args: argparse.Namespace) -> int:
 def _error(message: str) -> int:
     print(message, file=sys.stderr)
     return 1
+
+
+def _read(path: str) -> str | None:
+    """Return the text of the file at `path`; None, saying why, if it cannot be read."""
+    try:
+        with open(path, encoding="utf-8") as f:
+            return f.read()
+    except OSError as err:
+        _error(f"error: cannot read {path}: {err.strerror or err}")
+        return None
 
 
 def _check(report: Report, arch: Architecture, runs: list[Run]) -> None:
@@ -668,8 +678,8 @@ def main(argv: list[str] | None = None) -> int:
     for setting in args.settings:
         if "=" not in setting and not setting.startswith("use "):
             cli.error(f"settings are name=value or 'use module', not {setting!r}")
-    with open(args.file, encoding="utf-8") as f:
-        source = f.read()
+    if (source := _read(args.file)) is None:
+        return 1
     where = {"entry": args.entry, "filename": args.file, "overrides": args.settings}
     report = check(source, **where)
     if report.errors:

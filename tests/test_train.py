@@ -1000,6 +1000,14 @@ def test_a_run_reports_what_hooks_of_ones_own_return(tmp_path):
     assert "weight_norm" in last and "loss" in last
 
 
+def test_a_file_that_cannot_be_read_is_an_error_not_a_traceback(tmp_path, capsys):
+    missing = str(tmp_path / "missing.bux")
+    for argv in (["check", missing], ["export", missing, str(tmp_path / "out")]):
+        assert main(argv) == 1
+        said = capsys.readouterr().err
+        assert said == f"error: cannot read {missing}: No such file or directory\n"
+
+
 def test_the_command_line(tmp_path, capsys):
     assert main(["check", str(SMOKE)]) == 0
     assert "50 steps × 8 × 64 tokens = 25.6k tokens" in capsys.readouterr().out
