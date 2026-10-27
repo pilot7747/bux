@@ -1,0 +1,28 @@
+# QK-norm, taken apart and put together with what needs it, on the 2021 reference
+# (gpt3_rope.bux). Without it the reference's attention logits grow to hundreds early
+# in training and the lowest layers' attention collapses, the more so the higher the
+# learning rate. Post-branch norms and positions without RoPE each fail alone, and the
+# models that ship them also normalize queries and keys; gated attention and the
+# key-value conv help by other routes. Arms: era, source, the claim.
+use gpt3_rope
+use timeline_code
+use rungs
+
+lm(b) = embed b^layers norm head(tied=true)
+rms   = rmsnorm(eps=1e-5)
+
+model = base:          model
+      # 2024 OLMo 2: the output alone normalized, x + norm(f(x)), with QK-norm; stability
+      | olmo2:         lm([attn(qk_norm=rms) norm] [ffn norm])
+      # 2025 Kimi Linear, 2026 Nemotron 3: no positions, with QK-norm; length generalization
+      | nope_qk:       lm([norm attn(rope=none, qk_norm=rms)] [norm ffn])
+      # 2026 Beam 1.0: NoPE, queries scaled by (1 + n / 2048) ** 0.1, with QK-norm
+      | nope_power_qk: lm([norm attn(rope=none, power_scale=0.1, qk_norm=rms)] [norm ffn])
+      # QK-norm without its learned gains: is a learned temperature what helps?
+      | qknorm_fixed:  lm([norm attn(qk_norm=rmsnorm(eps=1e-5, affine=false))] [norm ffn])
+      # 2024 Gemma 2: attention logits soft-capped at 20, QK-norm's range: is a bound enough?
+      | attn_softcap:  lm([norm attn(softcap=20)] [norm ffn])
+      # 2025 Qwen3-Next, 2026 Kimi K3: gated attention and QK-norm together
+      | gated_qk:      lm([norm attn(gated=true, qk_norm=rms)] [norm ffn])
+      # QK-norm and Inkling's key-value conv together
+      | kvconv_qk:     lm([norm attn(kv_conv_size=4, qk_norm=rms)] [norm ffn])

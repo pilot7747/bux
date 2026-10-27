@@ -11,6 +11,8 @@ vocab_size = 50304
 layers     = d_model // 64
 
 swiglu_width = (8 * d_model + 96) // 192 * 64
+# An expert an eighth as wide, in whole blocks of 64, as the grouped GEMMs take them.
+expert_width = (swiglu_width + 256) // 512 * 64
 
 fr_norm    = rmsnorm(eps=1e-5)
 fr_attn    = gqa(num_heads=d_model // 64, num_kv_heads=d_model // 256, qk_norm=fr_norm,
@@ -21,7 +23,7 @@ fr_dense   = gated_mlp(intermediate_size=swiglu_width, activation=swish)
 fr_experts = moe(num_experts=256, top_k=7, num_shared_experts=1, router=sigmoid,
                  routed_scaling_factor=2.5, load_balancing=aux_free, aux_loss_coef=1e-4,
                  aux_loss_scope=sequence,
-                 expert=gated_mlp(intermediate_size=swiglu_width // 8, activation=swish))
+                 expert=gated_mlp(intermediate_size=expert_width, activation=swish))
 
 fr_layer(mixer, ffn=fr_experts) = [fr_norm mixer] [fr_norm ffn]
 

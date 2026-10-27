@@ -11,6 +11,8 @@ vocab_size = 50304
 layers     = d_model // 64
 
 swiglu_width = (8 * d_model + 96) // 192 * 64
+# An expert an eighth as wide, in whole blocks of 64, as the grouped GEMMs take them.
+expert_width = (swiglu_width + 256) // 512 * 64
 
 qn_norm    = rmsnorm(zero_centered=true)
 qn_delta   = gdn(num_heads=d_model // 128, num_v_heads=d_model // 64, head_dim=128)
@@ -18,7 +20,7 @@ qn_attn    = gqa(num_heads=d_model // 128, num_kv_heads=2, head_dim=256, gated=t
                  qk_norm=qn_norm, rope=rope(base=10000000, fraction=0.25))
 qn_experts = moe(num_experts=256, top_k=7, num_shared_experts=1, shared_expert_gate=true,
                  aux_loss_coef=1e-3,
-                 expert=gated_mlp(intermediate_size=swiglu_width // 8, activation=swish))
+                 expert=gated_mlp(intermediate_size=expert_width, activation=swish))
 
 qn_layer(mixer) = [qn_norm mixer] [qn_norm qn_experts]
 
