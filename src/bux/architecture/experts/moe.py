@@ -913,7 +913,7 @@ def _token_rows_forward(
 def _token_rows_backward(
     k: int, inverse: Int[Array, " M"], g: Float[Array, "m d"]
 ) -> tuple[Float[Array, "n d"], None, None]:
-    return _sum_by_token(g, inverse, k), None, None
+    return grouped_blockscaled.sum_by_token(g, inverse.reshape(-1, k)), None, None
 
 
 token_rows.defvjp(_token_rows_forward, _token_rows_backward)
@@ -943,13 +943,13 @@ def token_sums(
     Returns:
         The tokens' sums, (n, d), added up in float32.
     """
-    return _sum_by_token(x, inverse, k)
+    return grouped_blockscaled.sum_by_token(x, inverse.reshape(-1, k))
 
 
 def _token_sums_forward(
     x: Float[Array, "m d"], inverse: Int[Array, " M"], order: Int[Array, " m"], k: int
 ) -> tuple[Float[Array, "n d"], Int[Array, " m"]]:
-    return _sum_by_token(x, inverse, k), order
+    return grouped_blockscaled.sum_by_token(x, inverse.reshape(-1, k)), order
 
 
 def _token_sums_backward(
@@ -959,16 +959,6 @@ def _token_sums_backward(
 
 
 token_sums.defvjp(_token_sums_forward, _token_sums_backward)
-
-
-def _sum_by_token(
-    x: Float[Array, "m d"], inverse: Int[Array, " M"], k: int
-) -> Float[Array, "n d"]:
-    """Return each token's sum of its k picks' rows, in float32: x[inverse], 0 where
-    `inverse` is past the rows of x."""
-    picks = jnp.take(x, inverse, axis=0, mode="fill", fill_value=0)
-    summed = jnp.sum(picks.reshape(-1, k, x.shape[-1]), 1, dtype=jnp.float32)
-    return summed.astype(x.dtype)
 
 
 @register("moe")

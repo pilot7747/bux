@@ -272,14 +272,6 @@ def padded(
     return Padded(reads, lying, ends.astype(int32), sizes.astype(int32)), at
 
 
-def _sums(y: Float[Array, "p d"], picks: Int[Array, "t k"]) -> Float[Array, "t d"]:
-    """Return each token's sum of its rows of y at `picks`, in float32: a pick past y
-    adds 0."""
-    rows = jnp.take(y, picks.reshape(-1), axis=0, mode="fill", fill_value=0)
-    summed = jnp.sum(rows.reshape(*picks.shape, -1), 1, dtype=jnp.float32)
-    return summed.astype(y.dtype)
-
-
 # What the backward takes of the forward: x^T and the weights as their gradients'
 # GEMMs contract them, the product, h down its columns, the rows' weights and where
 # the rows lie.
@@ -378,7 +370,8 @@ def _outputs(a: Tiled, b: Tiled, layout: Padded, height: int) -> Float[Array, "t
         return grouped_mxfp8.rows(
             a, b, sizes, jnp.bfloat16, starts=starts, height=height
         )
-    return _sums(grouped_cudnn.rows(a, b, layout.ends), layout.picks)
+    rows = grouped_cudnn.rows(a, b, layout.ends)
+    return grouped_blockscaled.sum_by_token(rows, layout.picks)
 
 
 def _transposed(product: grouped_cudnn.Columns, gated: bool) -> Tiled:
