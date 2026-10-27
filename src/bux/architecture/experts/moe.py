@@ -837,8 +837,9 @@ def grouped_product(
         w: the experts' matrices.
         sizes: how many rows each expert has.
         recipe: the block-scaled format to multiply in where x and w are whole blocks
-            of it (`~bux.architecture.experts.grouped_blockscaled`); None, or other
-            shapes, multiply in compute (`~bux.architecture.experts.grouped`).
+            of it (`~bux.architecture.experts.grouped_blockscaled`); None, other
+            shapes, or a precision whose ``passes`` name no GEMM multiply in compute
+            (`~bux.architecture.experts.grouped`).
         picked: where the rows were gathered from, for the format's quantizer to
             read them there; None to read `x`.
         summed: the tokens the rows sum into; None to return the rows.
@@ -846,13 +847,12 @@ def grouped_product(
     Returns:
         The products, (n, f), or with `summed` the tokens' sums, (t, f).
     """
-    if recipe is None or not grouped_blockscaled.fits(x, w):
+    passes = matmuls.in_force().passes
+    if recipe is None or not passes or not grouped_blockscaled.fits(x, w):
         y = checkpoint_name(ragged_dot(x, w, sizes), "experts")
         return y if summed is None else sums_of_tokens(y, summed)
-    precision, seed = matmuls.in_force(), matmuls.seed()
-    passes = precision.passes
     y = grouped_blockscaled.ragged_dot(
-        x, w, sizes, recipe, seed, passes, picked, summed
+        x, w, sizes, recipe, matmuls.seed(), passes, picked, summed
     )
     return checkpoint_name(y, "experts")
 

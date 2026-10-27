@@ -676,6 +676,7 @@ GROUPED = {
     "matmuls=nvfp4": 0,  # else compute
     "matmuls=mxfp8, roles=roles(experts=compute)": 0,
     "roles=roles(experts=mxfp8), first=1": 2,  # the first MoE is the first branch
+    "roles=roles(experts=mxfp8), passes=[]": 0,  # no GEMM in the format
 }
 
 
