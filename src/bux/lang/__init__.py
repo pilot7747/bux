@@ -100,7 +100,8 @@ changes (``bux studio``)::
 
     from bux.lang import trace
 
-    t = trace(source, choices={report.axes[0].key: 1})  # its second alternative
+    axis = report.axes[0]
+    t = trace(source, choices={axis.key: axis.pick(1)})  # its second alternative
     t.nodes[()]  # the span of `model`: the root of t.arch.graph
     t.written(t.train.optimizer).span  # the span of adamw(...)
 

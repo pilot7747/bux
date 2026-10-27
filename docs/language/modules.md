@@ -141,7 +141,9 @@ program as a whole, after every layer is in place.
 
 Inside its own definition, a name means the definition it replaces. So
 `ffn = ffn(intermediate_size=2048)` changes one setting of the inherited `ffn`. With
-nothing below it, the name means the builtin, as `mlp = mlp(...)` does.
+nothing below it, the name means the builtin, as `mlp = mlp(...)` does. Only there:
+a definition that it uses means the new one, so `heads = attn.num_heads * 2` over a
+module's `attn = gqa(num_heads=heads, ...)` is a cycle.
 
 Errors point into the file they are in, and the editor shows errors in modules at
 the `use` that brought them in.
@@ -164,7 +166,10 @@ The rules:
 
 - **Dotted keys** reach into nested settings: `attn.rope.base = 1e6`.
 - **Several amendments of one name in a file act as one.** Setting the same key
-  twice is an error: `'num_heads' is given twice`.
+  twice is an error: `'num_heads' is given twice`. A key inside another changes it
+  when it comes after it, `attn.rope = rope(base=1e6)` then `attn.rope.fraction =
+  0.5`; before it, the whole one would undo it, so that is an error: `'rope' is given
+  after 'rope.fraction', which it would undo`. The same holds in a call.
 - **An amendment applies over the file's own definition** of the name, if it has
   one, since a file's amendments are a layer above its definitions.
 - **A shared layer stays shared.** The amendment changes the one module. Writing

@@ -207,7 +207,8 @@ error: text data is tokenized, so the run needs a tokenizer
   = hint: tokenizer = tokenizer(name="gpt2")
 ```
 
-Rows fit in the positions a learned positional embedding has:
+Rows fit in the positions a learned positional embedding has, the run's and every
+phase's and eval's:
 
 ```console
 $ bux check positions.bux

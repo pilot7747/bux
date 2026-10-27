@@ -155,7 +155,8 @@ Rules for ports:
   pops it. A layer reads its ports before it writes any.
 - Calling a definition with only ports keeps its name and its sharing: `attn(v=@v1)`
   is still `attn`, drawn as `attn(v=@v1)`, and a
-  [shared](definitions.md#sharing-shared) layer can take ports.
+  [shared](definitions.md#sharing-shared) layer can take ports, the same ones at
+  every use, as it is one module.
 - A config lists its ports in its class's `ports`; a new layer declares its own
   ([Adding a layer](../architectures/adding-a-layer.md)).
 
