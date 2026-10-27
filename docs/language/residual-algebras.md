@@ -1,11 +1,12 @@
 (lang-residual)=
 # Residual algebras
 
-This page covers the top-level setting `residual`, which keeps a model's wiring and
-changes what every residual branch `[f]` means: hyper-connections (`hc`, `mhc`), the
-gated residual (`gr`), attention residuals (`attnres`) and the variance-preserving
-gate (`vpgate`). It also covers what happens outside the brackets when the stream is
-widened, and the `merge` the compiler inserts.
+The top-level setting `residual` keeps a model's wiring and changes what every
+residual branch `[f]` means. One line turns a pre-norm Transformer into one with
+hyper-connections (`hc`, `mhc`), the gated residual (`gr`), attention residuals
+(`attnres`) or the variance-preserving gate (`vpgate`). This page lists the algebras
+and their settings, then covers what happens outside the brackets when the stream is
+widened, and the `merge` the compiler inserts there.
 
 ## Example: manifold-constrained hyper-connections
 
@@ -22,10 +23,10 @@ block = [norm attn] [norm ffn]
 model = embed block^24 norm head
 ```
 
-This is `examples/architectures/mhc.bux`: the usual pre-norm graph, with one more
-line. `residual = mhc(expansion=4)` widens the stream into 4 streams, and every
-residual branch reads them, writes them and mixes them through learned, doubly
-stochastic connections. The wiring is the same; only the meaning of `[...]` changes.
+This is `examples/architectures/mhc.bux`: the usual pre-norm graph, plus one line.
+`residual = mhc(expansion=4)` widens the stream into 4 streams. Every residual branch
+reads them, writes them and mixes them through learned, doubly stochastic
+connections. The wiring stays the same; only the meaning of `[...]` changes.
 
 `bux fmt` shows what the compiler added, a `merge` before the final norm:
 
@@ -36,10 +37,11 @@ model = embed block^24 merge norm head
 
 ## Why `[f]` and `_ + f` differ
 
-The IR keeps a `Residual` node apart from a sum with the identity for this reason.
-`[f]` is the residual stream's own connection, so a backend can replace it, while
-`_ + f` is plain arithmetic that no algebra touches. Write `[f]` for the residual
-branches of a model, and `_ + f` where you mean the sum itself.
+Under the plain residual stream, `[f]` and `_ + f` compute the same thing, but the IR
+keeps them apart. `[f]` is a `Residual` node, the residual stream's own connection,
+so an algebra can replace it. `_ + f` is plain arithmetic that no algebra touches.
+Write `[f]` for the residual branches of a model, and `_ + f` where you mean the sum
+itself.
 
 ## The algebras
 
@@ -49,7 +51,7 @@ branches of a model, and `_ + f` where you mean the sum itself.
 | `hc(expansion=4)` | hyper-connections: `expansion` streams with learned read, write and mix connections around every branch (Zhu et al., 2025) |
 | `mhc(expansion=4)` | the same, with the stream mixing projected onto doubly stochastic matrices by Sinkhorn (DeepSeek mHC, 2025) |
 | `gr(rank=320)` | a gated read of 4 normalized streams, and a weighted write to each; branches need no pre-norm (Qwen3.8-Flash-Next) |
-| `attnres(block_size=24)` | `f` reads a learned softmax over depth of earlier block outputs instead of their sum (Kimi K3) |
+| `attnres(block_size=24)` | `f` reads a learned softmax over depth of the embedding and the earlier branch outputs, instead of their sum (Kimi K3) |
 | `vpgate(temperature=0.3)` | `a x + b f(x)` with `a^2 + b^2 = 1` per channel (Muse Spark) |
 
 Their settings, with defaults:
@@ -66,12 +68,12 @@ Their settings, with defaults:
 | `temperature` | `vpgate` | 0.3 | `b = sigmoid(g / temperature)` |
 | `eps` | `vpgate` | 1e-3 | `a = sqrt(max(1 - b^2, eps))`: the stream is never cut off |
 
-Every algebra with a norm of its own takes `norm_eps`. See {bux}`hc`, {bux}`gr`,
+Every algebra with its own norm takes `norm_eps`. See {bux}`hc`, {bux}`gr`,
 {bux}`attnres` and {bux}`vpgate` in the reference for the full descriptions.
 
 ### Single-pass mHC
 
-`mhc(single_pass=true)` is DeepSeek-V4.1's variant. Each branch reads with the
+`mhc(single_pass=true)` is the variant from DeepSeek-V4.1. Each branch reads with the
 coefficients that the branch before it computed (the first reads stream 0 alone),
 and the read before the head has no parameters:
 
@@ -82,25 +84,25 @@ residual = mhc(expansion=4, single_pass=true, norm_eps=1e-20)
 (lang-outside-brackets)=
 ## Outside the brackets
 
-`hc`, `mhc`, `gr` and `attnres` widen the stream. Between the branches it is several
-copies of the stream (for `attnres`, the outputs so far), and only a few things act
+`hc`, `mhc`, `gr` and `attnres` widen the stream. Between the branches, the stream is
+several copies of itself (for `attnres`, the outputs so far). Only a few things act
 on it as a whole:
 
-- `embed` widens it, and so does `nextn` when its input is one stream;
-- residual branches `[f]` read it, run `f` on one stream and write back. Brackets
-  inside `f` are plain skips;
-- taps `@h` and `$h` save and restore it as it is;
-- `engram` adds its memory to every copy, with a key of its own, and `nextn` mixes
-  the next token's embedding into every copy (Qwen3.8-Flash-Next). Under `attnres`,
-  whose state is the outputs so far rather than copies, both need one stream.
+- `embed` widens it, and so does `nextn` when its input is one stream.
+- Residual branches `[f]` read it, run `f` on one stream, and write back. Brackets
+  inside `f` are plain skips.
+- Taps `@h` and `$h` save and restore it as it is.
+- `engram` adds its memory to every copy, gated by each copy's own key, and `nextn`
+  mixes the embedding into every copy (Qwen3.8-Flash-Next). Under `attnres`, whose
+  state is the outputs so far rather than copies, both need one stream.
 
 `vpgate` does not widen the stream, so none of this applies to it.
 
 ### `merge`
 
 Any other layer outside a branch, such as the final norm or the head, needs one
-stream. The compiler puts a {bux}`merge` before it: the read that a branch does,
-without the write. `bux fmt` prints it.
+stream. The compiler puts a {bux}`merge` before it: the read a branch does, without
+the write. `bux fmt` prints it.
 
 ```bux
 residual = gr(expansion=4, rank=320)
@@ -111,9 +113,10 @@ mtp = $h nextn(norm=norm) A out
 model = embed D ple "DDA" "DDDA"^11 @h out mtp      # = ... @h merge out $h nextn ...
 ```
 
-In Qwen3.8-Flash-Next (`examples/architectures/qwen/qwen3.8_flash_next.bux`), `ple`
-is an `engram` that adds to every copy, `@h` saves the widened stream, and a merge
-goes before each head:
+These lines are from Qwen3.8-Flash-Next
+(`examples/architectures/qwen/qwen3.8_flash_next.bux`). `ple` is an `engram` that
+adds to every copy, and `@h` saves the widened stream for the MTP layer. The compiler
+puts a merge before each head:
 
 ```console
 $ bux fmt examples/architectures/qwen/qwen3.8_flash_next.bux | tail -3
@@ -122,10 +125,10 @@ mtp = $h nextn(norm=rmsnorm(zero_centered=true)) A merge out
 model = embed D ple D D A (D D D A)^11 @h merge out mtp
 ```
 
-You can write `merge` yourself, to read the stream into one where you choose. Where
-the stream is not widened, a `merge` is an error.
+You can write `merge` yourself, to read the stream back into one where you choose.
+Where the stream is not widened, a `merge` is an error.
 
-`engram` is written bare, because it adds to the stream itself; `[engram]` is an
+`engram` is written bare, because it adds to the stream itself. `[engram]` is an
 error.
 
 ## Errors
@@ -152,7 +155,7 @@ error: tap 'h' holds the widened residual stream, which only exists outside resi
   = hint: read it back into one first: merge @h
 ```
 
-The others:
+The other errors:
 
 | Error | Cause |
 |-------|-------|

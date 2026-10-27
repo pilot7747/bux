@@ -1,24 +1,24 @@
 # Fine-tuning on chat
 
-In this tutorial you train on conversations: a Parquet file of chats in the OpenAI
-format, read by `chat(...)`, rendered with a chat template, and learned only where
-the assistant speaks. You look at exactly which tokens are targets, change that with
-`train_on`, and then read `examples/experiments/sft.bux`, bux's supervised
-fine-tuning example.
+Train on conversations in the OpenAI format, with the loss only where the assistant
+speaks. By the end you will have rendered a Parquet file of chats with a chat
+template, seen exactly which tokens are targets, changed them with `train_on`, and
+read `examples/experiments/sft.bux`, bux's supervised fine-tuning example.
 
-It builds on [Your own data](your-own-data.md), whose GPT-2 tokenizer it reuses.
+It builds on [Your own data](your-own-data.md), and reuses its GPT-2 tokenizer.
 
 :::{note}
-bux trains every model from its own initialization: it does not load weights trained
-by other frameworks. "Fine-tuning" here is supervised fine-tuning *data*:
-conversations, templates and loss masks. `sft.bux` trains a small model from scratch
-on SmolTalk's conversations.
+bux has no importer for weights trained by other frameworks: every run starts from
+bux's own initialization, or resumes from its own checkpoint. Export goes the other
+way ([Exporting models](../export/index.md)). "Fine-tuning" here means supervised
+fine-tuning *data*: conversations, templates and loss masks. `sft.bux` trains a small
+model from scratch on SmolTalk's conversations.
 :::
 
 ## 1. Write some conversations
 
 `chat(...)` reads a column of conversations, each a list of `{role, content}`
-messages, as the OpenAI API takes them. `content` is a string, or a list of
+messages, as the OpenAI API accepts them. `content` is a string, or a list of
 `{type: text, text}` parts. Save this as `make_chats.py` and run it:
 
 ```python
@@ -68,8 +68,8 @@ $ python make_chats.py
 ```
 
 Each conversation has a system prompt and one to three questions with their
-answers. The parts go in a file of their own, because Arrow cannot mix strings and
-lists in one column; the glob below reads both files.
+answers. The conversation made of parts goes in a separate file, because Arrow cannot
+mix strings and lists in one column. The glob below reads both files.
 
 ## 2. The run
 
@@ -106,17 +106,17 @@ log       = log(every=25)
 What is new:
 
 - `chat(path=..., template=...)` ({bux}`chat`) renders each conversation with a
-  Hugging Face tokenizer's chat template, as transformers does: the run's tokenizer's
-  own, or another's. GPT-2's has none, so `template` borrows SmolLM's, which is
-  ChatML. The column is `messages` unless you say `column="..."`.
+  Hugging Face chat template, as transformers does. By default it uses the run's
+  tokenizer's template; `template` borrows another's. GPT-2 has none, so this borrows
+  SmolLM's, which is ChatML. The column is `messages` unless you set `column="..."`.
 - A template writes special tokens, which the tokenizer must have. GPT-2 has none of
   ChatML's, so `added` appends them after its vocabulary, as ids 50257 and 50258;
-  `vocab_size = 50304` has room for them. A tokenizer with a chat template of its own,
-  as Qwen3's and SmolLM2's, needs neither `template` nor `added`.
-- `best_fit(long=drop)` drops a conversation longer than a row rather than split it,
-  as a split one may lose its answer. Conversations shorter than a row are packed
-  together, each seeing only itself.
-- `schedule = cosine(warmup=20)` decays the learning rate to a tenth of its peak at
+  `vocab_size = 50304` has room for them. A tokenizer that has its own chat template,
+  such as Qwen3's or SmolLM2's, needs neither `template` nor `added`.
+- `best_fit(long=drop)` drops a conversation longer than a row instead of splitting
+  it, because a split conversation may lose its answer. Shorter conversations are
+  packed together, each seeing only itself.
+- `schedule = cosine(warmup=20)` decays the learning rate to a tenth of its peak by
   the last step.
 
 ## 3. Prepare and look at the targets
@@ -129,9 +129,9 @@ chat-719b1bd2be: 158 documents, 8,851 tokens -> 83 rows of 128, 83.3% filled, 21
 data/packed/chat-719b1bd2be
 ```
 
-Only 21.9% of the tokens are targets: the replies. To see which, decode the first
-conversation of the first row and bracket the tokens whose `loss_mask` is true. Save
-this as `show_chat.py`:
+Only 21.9% of the tokens are targets: the replies. To see which ones, decode the
+first conversation of the first row and bracket the tokens whose `loss_mask` is true.
+Save this as `show_chat.py`:
 
 ```python
 """Print the first conversation of a packed row, its targets in [brackets]."""
@@ -172,8 +172,8 @@ What is 32 plus 95?<|im_end|>
 ```
 
 ChatML writes each message as `<|im_start|>role`, a newline, the content,
-`<|im_end|>` and a newline. The loss is on each reply **with the `<|im_end|>` that
-ends it**, so that the model learns to stop; the headers, the system prompt and the
+`<|im_end|>` and a newline. The loss covers each reply **and the `<|im_end|>` that
+ends it**, so that the model learns to stop. The headers, the system prompt and the
 user's turns are context only.
 
 ## 4. Choose what to learn
@@ -195,12 +195,12 @@ chat-e83ed8581f: 2,843 documents, 155,873 tokens -> 1,417 rows of 128, 85.9% fil
 ...
 ```
 
-`chats.train_on=last` is an amendment of the `chats` definition, from the command
-line. A conversation with nothing to learn (no reply, under `assistant` or `last`) is
-dropped.
+`chats.train_on=last` is an amendment of the `chats` definition, made from the
+command line. A conversation with nothing to learn (no reply, under `assistant` or
+`last`) is dropped.
 
-The loss is the mean over every target of the batch, so a row of many short replies
-weighs no more than a row of one long one.
+The loss is the mean over all targets in the batch, so every target token counts the
+same, whichever row it is in.
 
 ## 5. Train
 
@@ -221,18 +221,18 @@ chat step 200/200  loss 1.8125  lr 3.00e-04  grad 0.547  5,712 tok/s  ...
 chat step 200/200  eval loss 1.8404  eval bpb 1.0747
 ```
 
-The loss is over the replies alone. Repeating the question is easy, and the digits of
-the sum are the hard part, which 200 steps of a tiny model only begin to learn.
+The loss is over the replies only. Repeating the question is easy; the digits of the
+sum are the hard part, which 200 steps of a tiny model only begin to learn.
 
-The eval's bits per byte, `eval bpb`, are over the held-out replies' bytes of text:
-the `<|im_end|>` that ends each stands for none, so its nats are left out
+The eval's bits per byte, `eval bpb`, are over the bytes of the held-out replies. The
+`<|im_end|>` that closes each reply stands for no text, so its loss is left out
 ([Eval](../training/running.md#eval)).
 
 :::{tip}
-On the command line, `'tokenizer = tokenizer(name="gpt2")'` keeps the file's
-`added`: inside its own definition, a name means the definition it replaces, so this
-changes one setting and keeps the others. To drop the added tokens, write `'tokenizer.added = []'`;
-then preparing fails at once, as it should:
+On the command line, `'tokenizer = tokenizer(name="gpt2")'` keeps the file's `added`:
+inside its own definition, a name means the definition it replaces, so this changes
+one setting and keeps the others. To drop the added tokens, write
+`'tokenizer.added = []'`. Preparing then fails at once, as it should:
 `the tokenizer has no special token '<|im_start|>'; add it with tokenizer(added=['<|im_start|>']) if the model has room for it`.
 :::
 
@@ -268,9 +268,9 @@ steps     = 2k
 eval = eval(data=smoltalk(split=[0.99, 1]), every=250)
 ```
 
-It borrows Llama 3 8B's block and changes it into Qwen3's shape: 8 query heads and 2
-key-value heads, an RMSNorm on queries and keys (`qk_norm`), and a smaller MLP. A
-hundredth of the conversations is held out by hash.
+It borrows Llama 3 8B's block and reshapes it into Qwen3's: 8 query heads and 2
+key-value heads, an RMSNorm on queries and keys (`qk_norm`), and a smaller MLP. One
+percent of the conversations is held out by hash.
 
 ```console
 $ bux check examples/experiments/sft.bux
@@ -286,9 +286,10 @@ id          params  tokens  tok/param  flops/tok  gpus  params/gpu  optim/gpu  b
 ea9c47939b  114M    131M    1.1        759M       1     435MiB      870MiB     0%      sft
 ```
 
-To train it, download the data with the Hugging Face CLI (from the `huggingface_hub`
-package, which bux does not install; `uvx` runs it without installing), then prepare
-and train. It is meant for a GPU: 131M tokens of a 114M-parameter model.
+It is meant for a GPU: 131M tokens through a 114M-parameter model. Download the data
+with the Hugging Face CLI, then prepare and train. The CLI comes with the
+`huggingface_hub` package, which bux does not install; `uvx` runs it without
+installing it.
 
 ```sh
 uvx --from huggingface_hub hf download HuggingFaceTB/smol-smoltalk \
@@ -306,6 +307,8 @@ bux launch examples/experiments/sft.bux
 | `train_on=assistant`, `last`, `all`        | which messages are targets                    |
 | `best_fit(long=drop)`                      | drop what does not fit a row, pack the rest   |
 
-[Sources](../data/sources.md) documents `chat` and `text` in full, and
-[Packing](../data/packing.md) the packings. Next, [add a layer](add-a-layer.md) of
-your own to bux.
+## Next steps
+
+- [Add a layer](add-a-layer.md): extend bux with a layer of your own.
+- [Sources](../data/sources.md): `chat` and `text` in full.
+- [Packing](../data/packing.md): every packing and its options.

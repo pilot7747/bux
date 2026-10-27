@@ -1,8 +1,8 @@
 # Custom training
 
-In this tutorial you change how bux trains, from a Python script, without forking its
-trainer: you replace an optimizer through its registry, add a hook that measures the
-weights and a sink that writes a CSV, then add a term to the loss and drive a
+Change how bux trains from a Python script, without forking its trainer. By the end
+you will have replaced an optimizer through its registry, added a hook that measures
+the weights and a sink that writes a CSV, added a term to the loss, and driven a
 `Trainer` yourself. The same code runs in a notebook.
 
 `train(run)` is a few lines that put independent blocks together, so each change
@@ -18,8 +18,9 @@ replaces one block and keeps the rest:
 | hooks      | `bux/train/hooks.py`     | what happens every so many steps: log, eval, save | `train(run, hooks=[...])`    |
 | sinks      | `bux/train/sinks.py`     | where metrics go: the console, `metrics.jsonl`  | `train(run, sinks=[...])`      |
 
-It uses the stories run of [Your own data](your-own-data.md), whose data is prepared
-already. Run the scripts from the checkout's root with `uv run python script.py`.
+It uses `mine/stories.bux` from [Your own data](your-own-data.md), whose data is
+already prepared. Run the scripts from the checkout's root with
+`uv run python script.py`.
 
 ## 1. Compile a run in Python
 
@@ -38,18 +39,18 @@ from bux.train.trainer import train
 train(run)
 ```
 
-`filename` lets `use` find modules next to the file, and errors point into it. Before
-it trains, `bux train` also calls `bux.runtime.configure()`, which adds bux's XLA
-flags and keeps compiled steps in JAX's cache; call it first in a script to do the
-same. Code you register before `train` takes effect in this process; the `bux`
-command does not import your script.
+`filename` lets `use` find modules next to the file, and makes errors point into it.
+Before it trains, `bux train` also calls `bux.runtime.configure()`, which adds bux's
+XLA flags and keeps compiled steps in JAX's cache; call it first in a script to do
+the same. Code you register before `train` takes effect in this process only: the
+`bux` command does not import your script.
 
 ## 2. Replace an optimizer
 
 A config's `type` finds its builder in a registry, and registering under a taken name
-replaces the builder. So a variant of an optimizer is a function. An optimizer's
+replaces the builder. So a variant of an optimizer is just a function. An optimizer's
 builder gets its config, the schedule's multiplier and the model, and returns an
-optax transformation. Here is bux's `adamw` with Nesterov momentum, NAdamW:
+optax transformation. Here is bux's `adamw` with Nesterov momentum (NAdamW):
 
 ```python
 import optax
@@ -80,15 +81,15 @@ A new name, say `lion`, also needs its config in `bux/train/config.py`, in the
 optimizer union, where the compiler and the editor find it.
 
 :::{warning}
-A builder is code, not a setting, so it is not in the run's id: the stories run
-trained by NAdamW has the id of the one trained by AdamW. Give it another directory
-(`train(run, "runs-custom")`), or it would resume the other's checkpoints.
+A builder is code, not a setting, so it is not part of the run's id: the stories run
+trained with NAdamW has the same id as the one trained with AdamW. Give it another
+directory (`train(run, "runs-custom")`), or it resumes the AdamW run's checkpoints.
 :::
 
 ## 3. Add a hook
 
-A hook runs after every `every` steps and after the last, and returns scalars,
-metrics by name, that go to every sink. This one measures the global norm of the
+A hook runs every `every` steps and after the last step. It returns scalars (metrics
+by name), which go to every sink. This one measures the global norm of the
 parameters every 50 steps:
 
 ```python
@@ -107,14 +108,14 @@ class WeightNorm(Hook):
 ```
 
 A hook gets the `Trainer` and the step's metrics, still on the device. It may also
-define `start`, before the first step, `stop`, when training stops early (the
-checkpoint hook saves there), and `close`. The run's own hooks (log, eval,
+define `start` (before the first step), `stop` (when training stops early; the
+checkpoint hook saves there) and `close`. The run's own hooks (log, eval,
 checkpoint, profile) run first.
 
 :::{tip}
 `float(...)` waits for the step that made the value. bux's own log instead returns a
-function that reads its scalars (`hooks.Later`), which the loop calls once the next
-step is launched, so the device never waits for the host.
+function that reads its scalars (`hooks.Later`). The loop calls it once the next step
+is launched, so the device never waits for the host.
 :::
 
 ## 4. Add a sink
@@ -143,8 +144,8 @@ class CSV(Sink):
             self.file.close()
 ```
 
-In a job of many processes, every process computes every scalar, and a sink that
-writes checks `is_main_process()` so that only the first does.
+In a multi-process job, every process computes every scalar, so a sink that writes
+files checks `is_main_process()` to write from the first process only.
 
 ## 5. Train with all three
 
@@ -174,17 +175,17 @@ $ grep weight_norm metrics.csv
 200,weight_norm,234.0504608154297
 ```
 
-`train` returns the latest value of every metric. The console shows the metrics it
-has a format for, so `weight_norm` goes to the CSV and to `metrics.jsonl`, not to the
-screen; `Console(..., formats=...)` adds formats (step 6).
+`train` returns the latest value of every metric. The console shows only the metrics
+it has a format for, so `weight_norm` goes to the CSV and to `metrics.jsonl` but not
+to the screen; `Console(..., formats=...)` adds formats (step 6).
 
 ## 6. Add a loss term, and drive a Trainer
 
 `train(run)` builds the objective from the run's `loss` setting. To add a term to it,
 build the blocks yourself. A `Trainer` takes a model, an optax transformation and an
-objective; `fit` runs the loop with any hooks and sinks. This script trains the
-stories model with AdamW at a constant rate and a small penalty on the logits' size;
-save it as `loop.py`:
+objective, and `fit` runs the loop with any hooks and sinks. This script trains the
+stories model with AdamW at a constant rate, plus a small penalty on the size of the
+logits. Save it as `loop.py`:
 
 ```python
 """Train the stories model with a Trainer of our own: AdamW at a constant rate, and a
@@ -235,23 +236,23 @@ mine step 100/100  loss 0.9594  lr 1.00e-03  grad 0.457  7,083 tok/s  ...  l2 19
 What the pieces are:
 
 - `objective(t.loss, run.arch)` is the run's loss as named, weighted terms: `loss`,
-  the first head's cross-entropy, and `z_loss` and `mtp` where the run has them.
-  A `Term` is a weight and a function of every head's logits and the batch; its value
-  is also logged under its name, here `logit_l2`. `logits[0]` makes the first head's
-  logits whole, only because a term reads them.
+  the first head's cross-entropy, plus `z_loss` and `mtp` where the run has them.
+  A `Term` is a weight and a function of every head's logits and the batch. Its value
+  is also logged under its name, here `logit_l2`. `logits[0]` materializes the first
+  head's full logits; bux only does that when a term reads them.
 - `batches(data, config, vocab_size)` streams the run's batches; `held_out=True`
-  draws them apart from training's.
+  draws them separately from the training batches.
 - `trainer.evaluate(batches, token_bytes)` returns the first head's mean loss over
   the batches' targets and, given each token's bytes of text
   (`Tokenizer.token_bytes`), its bits per byte.
-- `Log` turns the step's metrics into the log's scalars, with the learning rate it is
-  given and the tokens a step; `Console` prints them.
+- `Log` turns the step's metrics into the log's scalars, given the learning rate and
+  the tokens per step; `Console` prints them.
 - The `Trainer` computes in float32 unless you pass `compute=jnp.bfloat16`, and does
-  nothing you do not give it: no clipping unless your optax chain clips, and no
+  nothing you do not ask for: no clipping unless your optax chain clips, and no
   checkpoints or eval unless you pass their hooks (`bux.train.hooks.Checkpoint`,
   `Eval`).
 
-A layer can add a term from its own forward as well:
+A layer can also add a term from its own forward:
 `report(taps, "my_loss", weight, value)` in `bux.architecture` adds `weight * value`
 to the training loss and logs the value, summed over the layers that report it.
 
@@ -271,10 +272,10 @@ with nothing to install:
 uv run jupyter lab
 ```
 
-Every snippet here runs in a cell as it is. A notebook's working directory is the
+Every snippet here runs in a cell as is. A notebook's working directory is the
 notebook's folder, so either start JupyterLab from the checkout's root, or give
-`compile_runs` and `batches` paths that reach `mine/` and `data/packed/` from there
-(`batches(..., cache="../data/packed")`).
+`compile_runs` and `batches` paths that reach `mine/` and `data/packed/` from the
+notebook (`batches(..., cache="../data/packed")`).
 
 ## What you learned
 
@@ -286,6 +287,8 @@ notebook's folder, so either start JupyterLab from the checkout's root, or give
 | the loss             | `objective(...).terms[name] = Term(weight, fn)`, with a `Trainer` |
 | the loop's blocks    | `Trainer(model, tx, objective).fit(batches, steps, hooks, sinks)` |
 
-[Extending the trainer](../training/extending.md) documents every block, and the
-[Python API](../reference/python/index.md) every function used here. Next,
-[scale out](scale-out.md) splits a run over many devices.
+## Next steps
+
+- [Scale out](scale-out.md): split a run over many devices.
+- [Extending the trainer](../training/extending.md): every block in detail.
+- [Python API](../reference/python/index.md): every function used here.

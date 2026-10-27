@@ -1,37 +1,36 @@
 (parallelism-multi-node)=
 # Many nodes
 
-A run alone trains on many hosts, one process each, with the same `.bux` file and the
-same command on every host. The mesh then spans every process's devices: each node
-holds a block of the innermost axes (`tensor` first), and the outer axes span the
-nodes. This page covers how the mesh lays out over nodes, the compile cache every
-process must share, and how FSDP, HSDP, EP and pipelines scale on two, four and eight
-nodes of 8 B300s.
+A run trains on many hosts with the same `.bux` file and the same command on every
+host, one process each. The mesh then spans every process's devices: each node holds
+a block of the innermost axes (`tensor` first), and the outer axes span the nodes.
+This page covers how the mesh lays out over nodes, the compile cache every process
+must share, the network NCCL needs, and how FSDP, HSDP, EP and pipelines scale on two,
+four and eight nodes of 8 B300s.
 
 :::{tip}
-Across nodes, prefer HSDP, `mesh(data=<nodes>, fsdp=8)`: it keeps 96-97% of a node's
-rate a GPU on four nodes and on eight, where FSDP over every GPU falls to 87% on eight
-([Four nodes and eight](#four-nodes-and-eight)).
+Across nodes, prefer HSDP, `mesh(data=<nodes>, fsdp=8)`. It keeps 96-97% of one
+node's per-GPU rate on four nodes and on eight, where FSDP over every GPU falls to 87%
+on eight ([Four nodes and eight](#four-nodes-and-eight)).
 :::
 
-## Turn it on
+## Quick start
+
+FSDP over two nodes of 8 GPUs:
 
 ```bux
-mesh = mesh(fsdp=16)            # FSDP over two nodes of 8 GPUs
+mesh = mesh(fsdp=16)
 ```
 
-or, sharded within a node and copied across nodes (HSDP):
+Or sharded within a node and copied across nodes (HSDP):
 
 ```bux
 mesh = mesh(data=2, fsdp=8)
 ```
 
-`examples/benchmarks/two_nodes.bux` and `four_nodes.bux` are the suites measured
-below, and `examples/experiments/parallel/tp_70b.bux`, `pp_70b.bux` and `ep_moe.bux`
-are runs across nodes ([Examples](index.md#examples)).
-
-Each host runs one process, the same command, with `JAX_COORDINATOR_ADDRESS` (the
-first host's `ip:port`), `JAX_NUM_PROCESSES` and `JAX_PROCESS_ID`:
+Each host runs one process, with the same command and three variables:
+`JAX_COORDINATOR_ADDRESS` (the first host's `ip:port`), `JAX_NUM_PROCESSES` and
+`JAX_PROCESS_ID`:
 
 ```sh
 JAX_COORDINATOR_ADDRESS=10.0.0.1:12355 JAX_NUM_PROCESSES=2 JAX_PROCESS_ID=0 \
@@ -40,89 +39,109 @@ JAX_COMPILATION_CACHE_DIR=/shared/bux-cache \
 ```
 
 Slurm and Open MPI set the processes up the same way
-([Launching](../training/launching.md)).
+([Launching](../training/launching.md)). `JAX_COMPILATION_CACHE_DIR` must be one
+folder that every host mounts ([below](#the-compile-cache)).
+
+`examples/benchmarks/two_nodes.bux` and `four_nodes.bux` are the suites measured
+below. `examples/experiments/parallel/tp_70b.bux`, `pp_70b.bux` and `ep_moe.bux` are
+runs across nodes ([Examples](index.md#examples)).
 
 ## How a mesh spans nodes
 
 XLA puts the GPUs of a node, or of an NVLink domain that spans nodes, in one slice
-(`slice_index`), and `jax.make_mesh` refuses devices of more than one. So
+(`slice_index`), and `jax.make_mesh` refuses devices from more than one slice. So
 `parallel.mesh` lays them out itself (`mesh.grid`), as MaxText's hybrid mesh does:
 
-1. A node holds a block of the innermost axes, filled from `tensor` outward
+1. Each node holds a block of the innermost axes, filled from `tensor` outward
    (`mesh.split`).
 2. The axes outside that block span nodes.
 
-On nodes of 8, `mesh(data=2, fsdp=8, tensor=2)` puts `tensor=2 × fsdp=4` in each
-node, and `data=2 × fsdp=2` across them.
+On nodes of 8, `mesh(data=2, fsdp=8, tensor=2)` puts `tensor=2 × fsdp=4` in each node,
+and `data=2 × fsdp=2` across them.
 
-Errors:
+These are errors:
 
-- A mesh that does not fill nodes so, such as `tensor=3` on nodes of 8, is an error
-  that names the axis.
-- Devices spread unevenly over nodes are an error: a mesh across nodes takes as many
-  on each.
+- A mesh that does not fill nodes this way, such as `tensor=3` on nodes of 8. The
+  error names the axis.
+- Devices spread unevenly over nodes: a mesh across nodes takes as many on each.
 
-Where devices have no slice, as CPUs do, a process is a node.
+Where devices have no slice, as CPUs do, each process is a node.
 
 ## Each process reads its own rows
 
-Each process reads the rows of a batch that its devices hold, and leaves the others 0
-(`parallel.local_rows`). No process reads the whole batch, and no source makes the
-permutation of a whole corpus ([Reading](../data/pipeline.md)).
-`tests/test_nodes.py` checks that processes reading their own rows of every kind of
-source make the batch one process does.
+Each process reads only the rows of a batch that its devices hold, and leaves the
+others 0 (`parallel.local_rows`). No process reads the whole batch, and no source
+makes the permutation of a whole corpus ([Reading](../data/pipeline.md)).
+`tests/test_nodes.py` checks that processes reading their own rows, from every kind of
+source, make the same batch one process does.
 
 ## The compile cache
 
-The processes of a job must all find a program in JAX's cache, or all compile it.
-On GPUs XLA's autotuner splits its work among the processes that compile a program,
-and each waits for the others' shares (`xla_gpu_shard_autotuning`): one that compiles
-a program another loads waits a day.
+The processes of a job must either all find a program in JAX's cache, or all compile
+it. On GPUs, XLA's autotuner splits its work among the processes that compile a
+program, and each waits for the others' shares (`xla_gpu_shard_autotuning`). A
+process that compiles a program while another loads it from the cache waits a day.
 
-Only the first process writes the cache, so the processes agree only where it is one
-folder for all of them, on a filesystem every host mounts:
+Only the first process writes the cache, so the processes agree only when it is one
+folder for all of them:
 
-- Set `JAX_COMPILATION_CACHE_DIR` to a folder on a filesystem every host mounts.
-- When the processes join, `runtime.agree_on_cache` checks that it is: the first
-  process makes a file there, and the others must see it.
-- Where they do not, bux turns the cache off and says so. Each launch then compiles
-  everything, together.
+- Set `JAX_COMPILATION_CACHE_DIR` to a folder on a filesystem every host mounts. The
+  default, `~/.cache/bux/jax`, is each host's own. A URL such as `gs://...` counts as
+  one folder for all.
+- When the processes join, `runtime.agree_on_cache` checks it: the first process
+  makes a file there, and the others must see it.
+- Where they do not, bux turns the cache off and warns. Every launch then compiles
+  everything, in every process together.
 
 :::{warning}
-JAX's `jax_share_binary_between_hosts` hangs the same way (the first process compiles
-alone and waits for the others' shares), so bux leaves it off.
+JAX's `jax_share_binary_between_hosts` hangs the same way: the first process
+compiles alone and waits for the others' autotuning shares. bux leaves it off.
 :::
 
-(multi-node-on-b300s)=
-## On B300s
+(multi-node-network)=
+## The network
 
 NCCL reaches InfiniBand through libibverbs and its mlx5 provider, which the Docker
-image installs. Without them it talks between nodes over TCP sockets: on two B300
-nodes, an all-reduce of 64 MiB a GPU across the nodes ran at a bus bandwidth of
+image installs. Without them, NCCL talks between nodes over TCP sockets. On two B300
+nodes, an all-reduce of 64 MiB per GPU across the nodes then ran at a bus bandwidth of
 1 GB/s, against 25 GB/s over InfiniBand (4 and 42 GB/s over all 16 GPUs).
-`NCCL_DEBUG=INFO` says which: `Using network IB`, not `Socket`.
 
-The 1.3B dense model, 8 rows of 4096 a GPU, bfloat16, the cache on a filesystem both
-nodes mount (launch: from its start to the fifth step):
+To check, run with `NCCL_DEBUG=INFO`: it should say `Using network IB`, not `Socket`.
 
-| Mesh | GPUs | tok/s | A GPU | Of one node's | Launch, cold / warm |
+A step of microbatches whose rows' axes span hosts adds up its gradients unreduced and
+reduces them once
+([Gathered once, reduced once](microbatches.md#gathered-once-reduced-once-methodsgather-methodsaccumulate)).
+EP across nodes is on [the experts' page](experts.md#transformerengines-nccl-ep).
+
+## Measurements
+
+(multi-node-on-b300s)=
+### Two nodes
+
+Two nodes of 8 B300s, 2026-10-23. The 1.3B dense model, 8 rows of 4096 tokens per
+GPU, bfloat16, with the cache on a filesystem both nodes mount. The launch time runs
+from the start to the fifth step.
+
+| Mesh | GPUs | tok/s | Per GPU | vs. one node | Launch, cold / warm |
 |---|---|---|---|---|---|
 | `fsdp=8` | 8 | 1,133k | 141.4k | | |
 | `fsdp=16` | 16 | 2,220k | 138.7k | 98.1% | 78 s / 42 s |
 | `data=2, fsdp=8` (HSDP) | 16 | 2,238k | 139.9k | 98.9% | 80 s / 42 s |
 
-Warm, both processes load the train step from the cache (0.3 s, where it compiles in
-16 s). With a cache on each node, which bux turns off, every launch is cold (76 s).
+Warm, both processes load the train step from the cache in 0.3 s, where compiling it
+takes 16 s. With a cache on each node, which bux turns off, every launch is cold
+(76 s).
 
-## Four nodes and eight
+### Four nodes and eight
 
-`examples/benchmarks/four_nodes.bux` trains the baseline on 32 GPUs of four nodes, 8
-rows of 4096 a GPU; on eight nodes the same runs took 64 GPUs and 512 rows. A GPU's
-rate is set against one node's: the one-node suite's, on each of four of the nodes
-alone, their mean (they spread by 4.5%). The launch is from its start to the fifth
-step, with the cache on a filesystem every node mounts, empty and then full:
+2026-10-24. `examples/benchmarks/four_nodes.bux` trains the baseline models on 32 GPUs
+of four nodes, 8 rows of 4096 tokens per GPU; on eight nodes the same runs took 64
+GPUs and 512 rows. "vs. one node" compares the per-GPU rate with the one-node suite's,
+averaged over four of the nodes alone (they spread by 4.5%). The launch runs from the
+start to the fifth step, with the cache on a filesystem every node mounts, empty and
+then full:
 
-| Run | Mesh | GPUs | tok/s | A GPU | Of one node's | Launch, cold / warm |
+| Run | Mesh | GPUs | tok/s | Per GPU | vs. one node | Launch, cold / warm |
 |---|---|---|---|---|---|---|
 | dense, FSDP | `fsdp=8` | 8 | 1,123k | 140.4k | | 75 s |
 | | `fsdp=32` | 32 | 4,235k | 132.3k | 94.3% | 74 s / 41 s |
@@ -141,19 +160,14 @@ step, with the cache on a filesystem every node mounts, empty and then full:
 What the table says:
 
 - **HSDP** gathers and reduces a parameter within a node, and adds up its gradient
-  across the nodes once a step, so it keeps 96-97% of a node's rate on four nodes and
-  on eight.
+  across nodes once a step. It keeps 96-97% of a node's rate on four nodes and on
+  eight.
 - **FSDP over all the GPUs** gathers every layer across the nodes, forward and
-  backward, and loses more as they grow: 98% of a node's rate on two, 94% on four, 87%
-  on eight.
+  backward, and loses more as they grow: 98% of a node's rate on two, 94% on four,
+  87% on eight.
 - **The MoE** keeps 90-93% either way.
-- **A pipeline of a stage a node**, here against one node's FSDP, keeps its rate a GPU
-  on eight nodes, as two copies of it
+- **A pipeline with one stage per node** runs at about 54% of one node's FSDP rate,
+  but keeps that rate per GPU on eight nodes, as two copies of it
   ([Stages](pipelines.md#stages-methodsstages)).
 - **Warm**, every process loads every program from the cache, and the launch takes
   half as long.
-
-Between nodes, a step of microbatches whose rows' axes span hosts adds its gradients
-up unreduced and reduces them once
-([Gathered once, reduced once](microbatches.md#gathered-once-reduced-once-methodsgather-methodsaccumulate)).
-EP across nodes is on [the experts' page](experts.md#transformerengines-nccl-ep).

@@ -1,12 +1,14 @@
 # Softmax attention
 
-This page covers bux's softmax attention layers, `gqa`, `mla` and `csa`, the options
-they share (windows, sinks, gates, norms, scales), positional encodings, sharing keys
-and values between layers, and sparse attention by an indexer. Read it to configure
-the attention of a model, or to find which setting reproduces a paper's variant.
+bux has three softmax attention layers: `gqa` for multi-head, grouped-query and
+multi-query attention, `mla` for DeepSeek's latent attention, and `csa` for
+DeepSeek-V4's compressed sparse attention. This page shows how to configure each one,
+which setting reproduces which paper's variant, how layers share keys, values and
+picks, and how an indexer makes any of them sparse. Qwen3-30B-A3B's attention is a
+typical modern GQA (`examples/architectures/qwen/qwen3_30b_a3b.bux`):
 
 ```bux
-# Qwen3-30B-A3B: 32 query heads over 4 kv heads of 128, QK-norm, RoPE at a base of 1M
+# 32 query heads over 4 kv heads of 128, QK-norm, RoPE at a base of 1M
 norm = rmsnorm(eps=1e-6)
 attn = gqa(num_heads=32, num_kv_heads=4, head_dim=128, qk_norm=norm,
            rope=rope(base=1000000))
@@ -18,9 +20,9 @@ it, within its document. Each has an entry in the reference with every field:
 
 | Layer | What it is | From |
 |-------|-----------|------|
-| [`gqa`](#gqa-multi-head-grouped-query-and-multi-query-attention) | multi-head attention with fewer key and value heads than query heads | MHA (Vaswani et al., 2017), GQA (Ainslie et al., 2023), MQA (Shazeer, 2019) |
-| [`mla`](#mla-multi-head-latent-attention) | keys and values projected up from one low-rank latent a token | DeepSeek-V2/V3, Kimi K2, Kimi Linear |
-| [`csa`](#csa-compressed-sparse-attention) | a sliding window of per-token latents plus a sparse pick of compressed ones | DeepSeek-V4 |
+| [`gqa`](#gqa-multi-head-grouped-query-and-multi-query-attention) | multi-head attention, with as many or fewer key and value heads than query heads | MHA (Vaswani et al., 2017), GQA (Ainslie et al., 2023), MQA (Shazeer, 2019) |
+| [`mla`](#mla-multi-head-latent-attention) | keys and values projected up from one low-rank latent per token | DeepSeek-V2/V3, Kimi K2, Kimi Linear |
+| [`csa`](#csa-compressed-sparse-attention) | a sliding window of per-token latents, plus a sparse pick of compressed ones | DeepSeek-V4 |
 
 ## `gqa`: multi-head, grouped-query and multi-query attention
 
@@ -73,8 +75,8 @@ attn = gqa(num_heads=128, num_kv_heads=8, head_dim=192, v_head_dim=128,
 
 :::{warning}
 `gqa` has **no positional encoding by default**: `rope` is `none` unless you set it.
-That is what Jamba and Nemotron 3 want, and what an unwary transcription of Llama
-does not. `mla` and `csa` default to `rope()`.
+That is what Jamba and Nemotron 3 want, and not what a transcription of Llama wants.
+`mla` and `csa` default to `rope()`.
 :::
 
 :::{note}
@@ -85,19 +87,9 @@ it ([Tensor parallelism](../parallelism/tensor.md)).
 
 ## `mla`: multi-head latent attention
 
-Multi-head latent attention (DeepSeek-V2/V3) compresses keys and values into one
-`kv_lora_rank` wide latent per token, and projects every head's keys and values up
-from it. Queries come from a `q_lora_rank` wide latent, or straight from the input at
-full rank. Both latents are RMS-normalized.
-
-Each query and key head has `qk_nope_head_dim` dims of its own and
-`qk_rope_head_dim` more. Only those are rotated by RoPE; for keys they are one vector
-that every head shares, projected from the input directly. With `rope=none` no dims
-are rotated (Kimi Linear's NoPE layers). The default scale is
-`(qk_nope_head_dim + qk_rope_head_dim) ** -0.5`. bux's MLA follows transformers'
-`DeepseekV3Attention`.
-
-DeepSeek-V3 (`examples/architectures/deepseek_v3.bux`):
+Multi-head latent attention (DeepSeek-V2/V3) shrinks the keys and values each token
+keeps to one small latent. The zoo's DeepSeek-V3 and R1, Kimi K2.5, K3 and Linear,
+and GLM-5.3 use it. DeepSeek-V3's (`examples/architectures/deepseek_v3.bux`):
 
 ```bux
 attn = mla(num_heads=128, q_lora_rank=1536, kv_lora_rank=512,
@@ -123,35 +115,29 @@ attn = mla(num_heads=64, q_lora_rank=2048, kv_lora_rank=512, qk_nope_head_dim=19
 | `v_head_dim` | `128` | the value head width |
 | `rope` | `rope()` | on the `qk_rope_head_dim` part; `none` for NoPE |
 
-Every head has keys and values of its own, so under tensor parallelism they split
-over `heads`, and the latents are named `latent`
-([Names](../parallelism/layout.md)). A remat policy that keeps `qkv` keeps the
-latents and the shared key dims, and computes the heads' projections up from them
-again, as DeepSeek's and Megatron's MLA do.
+How it works, following transformers' `DeepseekV3Attention`:
+
+- Keys and values come from one `kv_lora_rank` wide latent per token: every head's
+  keys and values are projected up from it. Queries come from a `q_lora_rank` wide
+  latent, or straight from the input at full rank. Both latents are RMS-normalized.
+- Each query and key head has `qk_nope_head_dim` dims of its own, plus
+  `qk_rope_head_dim` more. Only the `qk_rope_head_dim` dims rotate; for keys they are
+  one vector, shared by every head and projected straight from the input. With
+  `rope=none` no dims rotate (Kimi Linear's NoPE layers).
+- The default scale is `(qk_nope_head_dim + qk_rope_head_dim) ** -0.5`.
+
+Every head has its own keys and values, so under tensor parallelism they split over
+`heads`, and the latents are named `latent` ([Names](../parallelism/layout.md)). A
+remat policy that keeps `qkv` keeps the latents and the shared key dims, and
+recomputes the heads' projections from them, as DeepSeek's and Megatron's MLA do.
 
 ## `csa`: compressed sparse attention
 
-Compressed sparse attention (DeepSeek-V4) replaces keys and values with **latents**:
-a latent is a `head_dim` wide RMS-normalized projection of a token, the key and the
-value at once, a single kv head that every query head shares. Each query attends,
-in one softmax, to:
-
-1. the latents of a sliding window of tokens (`sliding_window_size`), and
-2. **compressed latents**: every `compress_ratio` tokens of a document pooled into
-   one, channel by channel under a softmax gate learned from the tokens, then
-   RMS-normalized. An indexer picks the `top_k` of them for each query; without one,
-   a query attends to all of them.
-
-A compressed latent is rotated to the position of its group's first token, and a
-query may attend to it from its group's last token on. The first `rope.fraction` of
-each query's and latent's dims are rotated, and since the values were rotated with
-the keys, the head outputs are rotated back by their query's position.
-`o_lora_rank` makes the output projection grouped and low-rank: `o_groups` groups of
-heads, each projected to `o_lora_rank`, then mixed back to the width.
-
-DeepSeek-V4.1-Flash (`examples/architectures/deepseek/deepseek_v4.1_flash.bux`) has
-window-only layers, layers that pool pairs of tokens, and layers of one latent a
-token:
+Compressed sparse attention (DeepSeek-V4) attends to a short window of tokens plus a
+sparse pick of compressed blocks of the past, so each query sees far back at a small
+cost. DeepSeek-V4.1-Flash
+(`examples/architectures/deepseek/deepseek_v4.1_flash.bux`) has window-only layers,
+layers that pool pairs of tokens, and layers of one latent per token:
 
 ```bux
 window = csa(num_heads=64, q_lora_rank=1280, o_lora_rank=1024, o_groups=8,
@@ -171,6 +157,22 @@ single = pairs(compress_ratio=1)
 | `compress_ratio` | `none` | tokens pooled into one compressed latent; `none` for the window only |
 | `rope` | `rope()` | on the first `rope.fraction` of the dims |
 | `latent_norm` | `rmsnorm` | the norm of the query latent, the latents, the compressed ones and the indexer's keys |
+
+How it works:
+
+- A **latent** is a `head_dim` wide, RMS-normalized projection of a token. It is the
+  key and the value at once: a single kv head that every query head shares.
+- Each query attends, in one softmax, to the latents of a sliding window of tokens
+  (`sliding_window_size`), and to **compressed latents**. Every `compress_ratio`
+  tokens of a document are pooled into one, channel by channel under a softmax gate
+  learned from the tokens, then RMS-normalized. An indexer picks the `top_k` of them
+  for each query; without one, a query attends to all of them.
+- A compressed latent is rotated to the position of its group's first token, and a
+  query may attend to it from its group's last token on. The first `rope.fraction` of
+  each query's and latent's dims rotate. Because the values rotated with the keys,
+  the head outputs are rotated back by their query's position.
+- `o_lora_rank` makes the output projection grouped and low-rank: `o_groups` groups of
+  heads, each projected to `o_lora_rank`, then mixed back to the width.
 
 Its ports share the compressed latents, the indexer's picks and a candidate pool
 between layers ([Ports](#sharing-between-layers-ports)). An indexer, and any port,
@@ -198,8 +200,8 @@ need `compress_ratio`; `o_groups` must divide `num_heads`.
 | `indexer` | `none` | sparse attention: an `indexer(...)` picks the keys each query sees | DeepSeek-V3.2 |
 
 :::{warning}
-`relative_bias`, `log_scale` and `attention_dropout` need all t by t logits, which
-only the `xla` method makes. Under `methods.attention = auto`, the default, a layer
+`relative_bias`, `log_scale` and `attention_dropout` need all t by t logits, and only
+the `xla` method makes them. Under `methods.attention = auto`, the default, a layer
 with one of them runs by `xla`; under any other method it raises
 `NotImplementedError` ([Context parallelism](../parallelism/attention.md)).
 :::
@@ -230,8 +232,8 @@ A window counts the query itself. Hymba's window of 1024 does not, so
 ### Attention sinks
 
 `sinks=true` gives each head a learned logit, starting at 0, that sits in the
-softmax beside the keys' and attends to no value: a query can put probability on it
-instead of on any key. MiMo-V2.6-Pro's sliding-window layers have one
+softmax beside the keys' logits and attends to no value: a query can put probability
+on it instead of on any key. MiMo-V2.6-Pro's sliding-window layers have one
 (`examples/architectures/mimo/mimo_v2.6_pro.bux`):
 
 ```bux
@@ -253,7 +255,7 @@ main ones:
              rope=rope(base=10000000, fraction=0.25))
   ```
 
-  Laguna XS 2.1 scales each head by a softplus of its own
+  Laguna XS 2.1 scales each head by its own softplus
   (`examples/architectures/laguna/laguna_xs_2.1.bux`):
 
   ```bux
@@ -261,8 +263,8 @@ main ones:
              gated=true, gate_per_head=true, gate_activation=softplus)
   ```
 
-  Beam 1.0 adds a learned bias per head, from 0, to its elementwise sigmoid gate
-  (`examples/architectures/reflection/beam_1.0_501b_a23b.bux`):
+  Beam 1.0 adds a learned bias per head, starting at 0, to its elementwise sigmoid
+  gate (`examples/architectures/reflection/beam_1.0_501b_a23b.bux`):
 
   ```bux
   attn = gqa(num_heads=48, num_kv_heads=8, head_dim=128, qk_norm=norm,
@@ -279,8 +281,8 @@ main ones:
 ### QK-norm and output norms
 
 `qk_norm=rmsnorm` normalizes every query head and key head on its own, before RoPE,
-with a gain per channel of the head. Qwen3-30B-A3B's is above. nGPT normalizes them
-with gains, so that the logits are a scaled cosine
+with a gain per channel of the head. Qwen3-30B-A3B's is at the top of this page. nGPT
+normalizes them with gains, so that the logits are a scaled cosine
 (`examples/architectures/ngpt.bux`):
 
 ```bux
@@ -288,10 +290,10 @@ attn = gqa(num_heads=16, num_kv_heads=16, qk_norm=rmsnorm, rope=rope(layout=inte
 ```
 
 `qk_norm_all_heads=true`, a setting of `gqa`, makes it one norm of all the heads
-together instead: of the queries' `num_heads * head_dim` channels, and one of the
-keys', each with a gain per channel, before they split into heads and RoPE turns them.
-MiniMax-M2 normalizes so (`examples/architectures/minimax/minimax_m2.bux`), as do
-OLMo 2 and 3 (`examples/architectures/olmo/`):
+together instead: one over the queries' `num_heads * head_dim` channels and one over
+the keys', each with a gain per channel, before they split into heads and RoPE turns
+them. MiniMax-M2 normalizes this way (`examples/architectures/minimax/minimax_m2.bux`),
+as do OLMo 2 and 3 (`examples/architectures/olmo/`):
 
 ```bux
 norm = rmsnorm(eps=1e-6)
@@ -313,8 +315,8 @@ attn = gqa(num_heads=128, num_kv_heads=16, head_dim=64, qk_norm=bare,
 ```
 
 :::{note}
-On a GPU, an RMSNorm of each head with a gain and no bias followed by RoPE in the
-`half` layout runs as one Pallas kernel a pass, forward and backward
+On a GPU, a per-head RMSNorm with a gain and no bias, followed by RoPE in the `half`
+layout, runs as one Pallas kernel per pass, forward and backward
 ([GPU kernels](../performance/kernels.md)).
 :::
 
@@ -330,8 +332,8 @@ attn = gqa(num_heads=6, num_kv_heads=6, head_dim=128, fused_qkv=true, qk_norm=no
            scale=0.12, rope=rope(base=1024, fraction=0.5))
 ```
 
-`softcap=c` caps the logits at `c * tanh(logits / c)`, after the scale, as Gemma 2
-does, at 50 (no file of the zoo uses it):
+`softcap=c` caps the logits at `c * tanh(logits / c)`, after the scale. Gemma 2 caps
+at 50 (no zoo file uses it):
 
 ```bux
 attn = gqa(num_heads=8, num_kv_heads=4, head_dim=256, softcap=50, rope=rope())
@@ -368,8 +370,8 @@ $$
 \left(1 + \frac{n}{\text{power\_scale\_length}}\right)^{p}.
 $$
 
-Beam 1.0's global layers have no RoPE and use it so that attention stays sharp as
-the context grows: by 1.07 at 2048 tokens and 1.87 at 1M
+Beam 1.0's global layers have no RoPE, and use it so that attention stays sharp as
+the context grows: the factor is 1.07 at 2048 tokens and 1.87 at 1M
 (`examples/architectures/reflection/beam_1.0_501b_a23b.bux`):
 
 ```bux
@@ -435,7 +437,7 @@ transformers' (the tests compare them).
 | {bux}`llama3` | Llama 3.1's: slow pairs divided by `factor`, fast ones kept, a ramp between | `factor`, `original_max_len=8192`, `low_freq_factor=1`, `high_freq_factor=4` |
 
 Gemma 3 interpolates its global layers' positions by 8 (above). Llama 3.1 extends
-Llama 3's RoPE by 8 (no file of the zoo uses it):
+Llama 3's RoPE by 8 (no zoo file uses it):
 
 ```bux
 attn = gqa(num_heads=32, num_kv_heads=8, rope=rope(base=500000, scaling=llama3(factor=8)))
@@ -455,18 +457,23 @@ $0.1 \ln(\text{factor}) + 1$; set `attention_factor=1` to turn it off.
 - `softmax` (DeepSeek's MLA): the softmax scale is multiplied by its square, so all
   of q . k scales.
 
-Laguna XS 2.1's global layers widen the fast band (`beta_fast=64`),
-Mellum2's stretch RoPE 16 times, and Olmo 3's 8 times while its sliding-window
-layers keep theirs as they were (`examples/architectures/olmo/olmo_3_7b.bux`):
+Laguna XS 2.1's global layers widen the fast band to `beta_fast=64`
+(`examples/architectures/laguna/laguna_xs_2.1.bux`):
 
 ```bux
 global = attn(num_heads=48, rope=rope(base=500000, fraction=0.5,
               scaling=yarn(factor=32, original_max_len=8192, beta_fast=64)))
 ```
 
+Mellum2's global layers stretch RoPE 16 times
+(`examples/architectures/mellum/mellum2_12b_a2.5b_thinking.bux`):
+
 ```bux
 global = attn(rope.scaling=yarn(factor=16, original_max_len=8192))
 ```
+
+Olmo 3's stretch it 8 times, while its sliding-window layers keep theirs unscaled
+(`examples/architectures/olmo/olmo_3_7b.bux`):
 
 ```bux
 local  = attn(sliding_window_size=4096, rope=rope(base=500000))
@@ -492,15 +499,15 @@ runs by `xla`.
 ## Sharing between layers: ports
 
 A layer can export an internal tensor to a tap, `attn(v=@v1)`, and a later layer can
-read it, `attn(v=$v1)`, or pop it, `attn(v=$v1!)`. The taps are the same stacks the
+read it, `attn(v=$v1)`, or pop it, `attn(v=$v1!)`. These taps are the same stacks the
 stream's `@name` and `$name` use ([Skip connections](../language/skip-connections.md)).
-A config lists its ports; using one it does not have is a compile error.
+A config lists its ports; using a port the layer does not have is a compile error.
 
 | Layer | Port | Writing it (`@t`) | Reading it (`$t`) |
 |-------|------|-------------------|-------------------|
 | `gqa` | `v` | pushes the value heads | mixes the tap's values into its own (value residual) |
 | `gqa` | `kv` | pushes the keys and values | uses them instead of projecting its own (cross-layer KV sharing, YOCO, CLA) |
-| `gqa`, `mla`, `csa` | `index` | pushes the keys the indexer kept for each query | attends to them, and runs no indexer of its own (IndexCache) |
+| `gqa`, `mla`, `csa` | `index` | pushes the keys the indexer kept for each query | attends to them, and runs no indexer (IndexCache) |
 | `csa` | `kv` | pushes the compressed latents, with the indexer's keys | uses them instead of compressing its own; an indexer it runs scores those keys |
 | `csa` | `candidates` | pushes a pool of coarse blocks of compressed positions | its indexer keeps keys only inside the pool |
 
@@ -541,13 +548,13 @@ model = embed F "WR"^7 F "WSR" "WR"^6 F norm head(tied=true)
 ```
 
 A layer that reads `kv` has no key and value projections, no key norm and no
-`kv_conv_size` conv of its own.
+`kv_conv_size` conv.
 
 ## Sparse attention: `indexer`
 
 DeepSeek Sparse Attention (DSA, DeepSeek-V3.2) adds a **lightning indexer** to a
 layer: a small attention that scores every key a query may attend to and keeps the
-`top_k` best, to which the layer then attends alone. Set `indexer=indexer(...)` on
+`top_k` best, which the layer then attends to alone. Set `indexer=indexer(...)` on
 `gqa`, `mla` or `csa` ({bux}`indexer`). DeepSeek-V3.2
 (`examples/architectures/deepseek/deepseek_v3.2.bux`):
 
@@ -558,37 +565,37 @@ attn = mla(num_heads=128, q_lora_rank=1536, kv_lora_rank=512, indexer=indexer(to
                                   attention_factor_on=softmax)))
 ```
 
-The indexer has `num_heads` query heads of `head_dim` and one key a token. It scores
-key $s$ for the query at $t$ by
-
-$$
-I_{t,s} = \sum_j w_{t,j}\,\mathrm{ReLU}(q_{t,j} \cdot k_s),
-$$
-
-with weights $w_{t,j}$ projected from the input when `weighted=true` (DSA), or the
-same for every head otherwise. With `relu=false` the dot products are plain.
-
-- Its queries come from the layer's query latent (`mla`, `csa`), or its input
-  (`gqa`, and `mla` at full rank).
-- Its keys, one a token, are projected from the layer's input and layer-normalized
-  (DSA) in `gqa` and `mla`; in `csa`, from the compressed latents, normalized by
-  `latent_norm`. `norm`, if set, replaces either norm.
-- Both rotate as many dims as the layer does. Where its keys are the tokens, it pairs
-  them as `rope_layout` says, whatever the layer's layout.
-
 | Setting | Default | What it does |
 |---------|---------|--------------|
 | `num_heads`, `head_dim` | `64`, `128` | the indexer's query heads |
 | `top_k` | `2048` | keys each query keeps |
 | `block_size` | `1` | keep whole blocks of this many keys, scored as `pool` says; at most `top_k` |
 | `pool` | `mean` | how a block scores: the mean of its keys (QSA), or the best score of those a query sees (MSA) |
-| `per_group` | `false` | a pick for each kv head's group of query heads, by a head of its own (MSA) |
+| `per_group` | `false` | a separate pick for each kv head's group of query heads, each by its own head (MSA) |
 | `relu` | `true` | ReLU on the dot products (DSA); else plain ones (MSA) |
 | `weighted` | `true` | learned per-head weights (DSA); else a plain sum |
 | `norm` | `none` | the norm of each query head and of the keys; `none`: no query norm, and the layer's own key norm (DSA: a LayerNorm) |
 | `rope_layout` | `half` | how it pairs RoPE dims when its keys are the tokens, whatever the layer's layout (DeepSeek-V3.2: `half`, GLM-5.3: `interleaved`) |
 | `candidate_block_size`, `candidate_top_k` | `8`, `2048` | what a `candidates` port exports |
 | `loss_weight` | `1.0` | the weight of [its loss](#the-indexers-loss), its only training signal |
+
+The indexer has `num_heads` query heads of `head_dim` and one key per token. It
+scores key $s$ for the query at $t$ by
+
+$$
+I_{t,s} = \sum_j w_{t,j}\,\mathrm{ReLU}(q_{t,j} \cdot k_s),
+$$
+
+with weights $w_{t,j}$ projected from the input when `weighted=true` (DSA), or equal
+for every head otherwise. With `relu=false` the dot products are plain.
+
+- Its queries come from the layer's query latent (`mla`, `csa`), or from its input
+  (`gqa`, and `mla` at full rank).
+- In `gqa` and `mla`, its keys are projected from the layer's input and
+  layer-normalized (DSA). In `csa`, they come from the compressed latents, normalized
+  by `latent_norm`. `norm`, if set, replaces either norm.
+- Queries and keys rotate as many dims as the layer does. Where its keys are the
+  tokens, it pairs them as `rope_layout` says, whatever the layer's layout.
 
 The indexer's inputs are detached and its pick passes no gradient, so only its loss
 trains it, and that loss trains nothing else.
@@ -597,10 +604,10 @@ trains it, and that loss trains nothing else.
 
 With `block_size=n` (and `pool=mean`), the indexer mean-pools the keys in blocks of
 `n`, normalizes each block's key and rotates it to the position of the block's first
-key, and keeps the `top_k // n` best whole blocks among those the query may attend
-to all of. It also keeps the keys of the query's own unfinished block. Blocks count
-from a document's first key, so none spans two documents. Qwen3.8-Flash-Next's QSA
-keeps the best 512 blocks of 4 (`examples/architectures/qwen/qwen3.8_flash_next.bux`):
+key. It keeps the `top_k // n` best whole blocks among those the query may attend to
+in full, plus the keys of the query's own unfinished block. Blocks count from a
+document's first key, so none spans two documents. Qwen3.8-Flash-Next's QSA keeps the
+best 512 blocks of 4 (`examples/architectures/qwen/qwen3.8_flash_next.bux`):
 
 ```bux
 attn = gqa(num_heads=24, num_kv_heads=2, head_dim=256, gated=true, qk_norm=norm,
@@ -613,18 +620,7 @@ attn = gqa(num_heads=24, num_kv_heads=2, head_dim=256, gated=true, qk_norm=norm,
 ### Blocks for each group: MSA
 
 MiniMax Sparse Attention (MSA, MiniMax-M3) keeps whole blocks too, but scores them
-by their keys, and picks them for each kv head's group of query heads apart:
-
-- `pool=max` scores a block by the best score of its keys the query sees, so a block
-  that the query sees part of counts too. The query always keeps its own block,
-  among the `top_k // n` it keeps.
-- `per_group=true` gives the indexer a head for each of `gqa`'s kv heads
-  (`num_heads` is the layer's `num_kv_heads`), and each head picks for its group by
-  its own scores, with `weighted=false`. The query heads of a group then attend,
-  exactly, to the keys of their group's blocks alone.
-- `relu=false` scores a key by the plain dot product, $q_r \cdot k_s / \sqrt{d}$ for
-  group $r$'s head.
-
+by their keys, and picks them separately for each kv head's group of query heads.
 MiniMax-M3 keeps 16 blocks of 128 keys for each of its 4 groups of 16 query heads
 (`examples/architectures/minimax/minimax_m3.bux`):
 
@@ -637,25 +633,31 @@ msa  = attn(indexer=indexer(num_heads=4, head_dim=128, top_k=2048, block_size=12
                             norm=norm))
 ```
 
-`pool=max` alone keeps one pick for all heads, of their summed scores; `per_group`
+- `pool=max` scores a block by the best score among its keys that the query sees, so
+  a block the query sees only part of counts too. The query always keeps its own
+  block, among the `top_k // n` it keeps.
+- `per_group=true` gives the indexer one head for each of `gqa`'s kv heads
+  (`num_heads` is the layer's `num_kv_heads`), and each head picks for its group by
+  its own scores, with `weighted=false`. The query heads of a group then attend,
+  exactly, to the keys of their group's blocks alone.
+- `relu=false` scores a key by the plain dot product, $q_r \cdot k_s / \sqrt{d}$ for
+  group $r$'s head.
+
+`pool=max` alone keeps one pick for all heads, by their summed scores; `per_group`
 without blocks picks keys for each group. A layer that reads a per-group `index`
 needs as many kv heads as it has groups. Under tensor parallelism the indexer's
-heads and their picks split with the kv heads. On a GPU tokamax's kernel attends a
-group at a time, each with its group's mask; the indexer's scores, top-k and loss run
-by XLA, as its kernels (`scoring`'s, and cuDNN's on a B200 or B300) sum the heads'
-ReLU'd dot products and pick once for all heads. Each of `pool=max`, `per_group` and
-`relu=false` keeps an indexer off them.
+heads and their picks split with the kv heads.
 
 :::{warning}
-`per_group` is `gqa`'s alone, and with blocks it takes `pool=max`. `pool=max` on
+`per_group` is `gqa`'s alone, and with blocks it needs `pool=max`. `pool=max` on
 `csa`'s compressed latents is not implemented.
 :::
 
 ### Sharing an index: IndexCache
 
-A layer that writes the `index` port exports its indexer's picks, and a layer that
-reads it attends to the same keys without an indexer of its own (and adds no loss).
-GLM-5.3 runs an indexer in layers 0, 1, 2, 6, 10, ..., 74 only
+A layer that writes the `index` port exports its indexer's picks. A layer that reads
+it attends to the same keys without running an indexer, and adds no loss. GLM-5.3
+runs an indexer in layers 0, 1, 2, 6, 10, ..., 74 only
 (`examples/architectures/glm/glm_5.3.bux`):
 
 ```bux
@@ -669,10 +671,10 @@ model = embed "AAA" "SSS" "FSSS"^18 norm @h out mtp^3
 ### Candidate pools
 
 In `csa`, a layer that writes `candidates` exports the `candidate_top_k` best blocks
-of `candidate_block_size` compressed positions, each scored by its best key, and
-always the block of the newest key a query may attend to. A layer whose indexer
-reads `candidates` keeps keys only inside that pool. DeepSeek-V4.1-Flash computes
-the latents and the pool once at layer 20, and every fourth layer from 24 indexes
+of `candidate_block_size` compressed positions, each scored by its best key, plus
+the block of the newest key a query may attend to. A layer whose indexer reads
+`candidates` keeps keys only inside that pool. DeepSeek-V4.1-Flash computes the
+latents and the pool once at layer 20, and every fourth layer from 24 on indexes
 again inside the pool:
 
 ```bux
@@ -690,7 +692,7 @@ set `indexer=indexer(...)` and do not read `index`. A candidate pool with
 (indexer-loss)=
 ### The indexer's loss
 
-The indexer learns from a loss of its own, as DeepSeek-V3.2's does:
+The indexer learns from its own loss, as DeepSeek-V3.2's does:
 `indexer(..., loss_weight=1)`. Each layer that runs one adds `loss_weight` times
 
 $$
@@ -698,51 +700,57 @@ $$
 $$
 
 taken over the keys the indexer kept and averaged over the queries. $I$ is its
-scores, and $p$ the layer's attention to those keys, summed over heads and
-normalized over them.
+scores, and $p$ is the layer's attention to those keys, summed over heads and
+normalized over the kept keys.
 
-- $p$ comes from the attention's logsumexp a chunk of queries at a time, and the
+- $p$ comes from the attention's logsumexp, a chunk of queries at a time, and the
   indexer scores each chunk again, so neither makes t × t floats.
 - With `block_size` (Qwen3.8 QSA), a block counts as its most attended key, and only
   the complete blocks kept count.
-- With `pool=max` or `per_group` (MiniMax MSA), it is over the tokens of the kept
-  blocks that the query sees, each key its own, and for each group apart: $p$ is
-  the attention of the group's heads, the mean of their probabilities once
-  normalized, and $I$ the group's head's scores. It is averaged over the queries and
-  the groups. A chunk of queries scores every key and takes $p$, and does both again
-  in its backward pass.
-- In CSA (DeepSeek-V4), the keys are the compressed latents, and $p$ comes from the
-  layer's one softmax over the window, the latents and the sinks: it keeps the share
-  the window and sinks take before it is normalized over the kept latents.
+- With `pool=max` or `per_group` (MiniMax MSA), the loss runs over the tokens of the
+  kept blocks that the query sees, each key on its own, and for each group
+  separately: $p$ is the mean of the group's heads' normalized probabilities, and $I$
+  the scores of the group's indexer head. It is averaged over the queries and the
+  groups.
+- In CSA (DeepSeek-V4), the keys are the compressed latents. $p$ is each kept
+  latent's probability in the layer's single softmax over the window, the latents
+  and the sinks, then normalized over the kept latents.
 - The indexer's inputs and $p$ are detached, so this loss trains the indexer alone,
   and the language-modeling loss trains the rest. The weight only scales the
   indexer's gradient, and its part of the norm that `clip` bounds.
 - A layer that reads `index` runs no indexer and adds nothing.
-- The log's `indexer_loss` is the sum over layers. Only a training step adds it: eval
-  does not.
+- The log's `indexer_loss` is the sum over layers. Only a training step adds it;
+  eval does not.
 
-DeepSeek's dense warm-up is a stage with `top_k` at least `seq_len`, where attention
-is dense and the loss covers every key the query sees. bux does not freeze the rest
-of the model for it. MSA's is the same stage with MSA's settings: every block kept,
-and the loss of each group over every key.
+For DeepSeek's dense warm-up, train with `top_k` at least `seq_len`: attention is then
+dense, and the loss covers every key the query sees. bux does not freeze the rest of
+the model for it. MSA's warm-up is the same with MSA's settings: every block kept,
+and each group's loss over every key.
 
 ## How attention runs
 
 The layers make q, k and v; the run's `methods.attention` computes the softmax
 (`auto` by default: cuDNN's kernels, FlashAttention-4's and tokamax's on a GPU, `xla`
-elsewhere). Sparse attention attends by `bux.architecture.attention.sparse`: on a
-GPU, tokamax's flash kernel with the kept keys as a mask, for heads of up to 192
-dims; elsewhere and for wider heads, XLA a chunk of queries at a time; neither makes
-t × t floats. The indexer ranks a chunk of queries
-at a time too, and picks its top-k by counting the bits of the k-th highest score
-rather than sorting, which on a GPU is 6 times faster at 32k keys.
+elsewhere). Sparse attention runs by `bux.architecture.attention.sparse`, which never
+makes t × t floats:
 
-`csa`'s latents are 512 wide, more than tokamax's kernels take. On a B200 or B300,
-cuDNN's DSA kernels (`bux.architecture.attention.sparse_cudnn`) attend each query to
-its window and the latents it keeps, and its sinks, in one softmax, forward and
-backward; the window-only layers too. Each query's list of slots holds its window's
-and its picks, so the cost is in the slots a query sees, not in the row's length. The
-indexer's loss then takes its target at the picks alone, by cuDNN's kernel too.
+- On a GPU, tokamax's flash kernel attends with the kept keys as a mask, in heads of
+  up to 192 dims. Under MSA's
+  per-group picks it attends one group at a time, each with its own mask.
+- Elsewhere, and for wider heads, XLA attends a chunk of queries at a time.
+- The indexer also ranks a chunk of queries at a time, and finds its top-k by
+  counting the bits of the k-th highest score instead of sorting.
+- The indexer's kernels sum all heads' ReLU'd dot products and pick once for all
+  heads. So an indexer with `pool=max`, `per_group` or `relu=false` (MSA) scores,
+  picks and takes its loss by XLA.
+- `csa`'s latents are 512 wide, more than tokamax's kernels take. On a B200 or B300,
+  cuDNN's DSA kernels (`bux.architecture.attention.sparse_cudnn`) attend each query
+  to its window, the latents it keeps and its sinks, in one softmax, forward and
+  backward; they run the window-only layers too. The cost grows with the slots a
+  query sees, not with the length of the row. The indexer's loss takes its target at
+  the picks alone, also by cuDNN.
+
+More on how attention runs:
 
 - Methods, context parallelism and how attention splits over devices:
   [Attention](../parallelism/attention.md).

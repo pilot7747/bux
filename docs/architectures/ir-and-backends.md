@@ -1,11 +1,11 @@
 # The IR and backends
 
-A `.bux` file compiles to a typed intermediate representation (IR), and a backend
-turns the IR into code that runs. This page describes the IR (`bux.lang.ir`), how to
-print it back to source, how bux's Flax NNX backend (`bux.architecture`) builds a
-model from it, and what another backend has to do. Read it to generate or mutate
-architectures from Python, to call a model outside the trainer, or to port bux's
-models to another framework.
+A `.bux` file compiles to a typed intermediate representation (IR): plain pydantic
+data, with no JAX in it. A backend turns the IR into code that runs. Read this page to
+generate or mutate architectures from Python, to call a model outside the trainer, or
+to port bux's models to another framework. It covers the IR (`bux.lang.ir`), printing
+it back to source, how bux's Flax NNX backend (`bux.architecture`) builds a model
+from it, and what another backend has to do.
 
 ```python
 from pathlib import Path
@@ -33,6 +33,7 @@ Seq ['Layer', 'Repeat', 'Layer', 'Layer']
 | `d_model` | the width of the residual stream |
 | `vocab_size` | the vocabulary, or `None` |
 | `residual` | the residual algebra (`hc`, `mhc`, `gr`, `attnres`, `vpgate`), or `None` for plain additive residuals |
+| `init` | how the weight matrices start, by role ([Initialization](initialization.md)), or `None` for the default |
 | `graph` | the model, a tree of nodes |
 
 `arch.layers()` yields every layer in execution order, with repeats unrolled;
@@ -77,17 +78,21 @@ not unrolled, so that a backend can scan identical blocks.
 ### Runs
 
 A file that says how to train its model compiles to runs
-({py:func}`bux.lang.compile_runs <bux.lang.compiler.compile_runs>`). A {py:class}`bux.lang.ir.Run` is one: its `name`
-(the file and the alternatives it took), its `arch`, its `train` settings
-({py:class}`bux.train.config.TrainConfig`), its `choices` along each axis of the
-sweep, and an `id`: a hash of what the run computes, not of how it is written,
-watched or split over devices ([Running](../training/running.md)).
+({py:func}`bux.lang.compile_runs <bux.lang.compiler.compile_runs>`), one per
+combination of alternatives. A {py:class}`bux.lang.ir.Run` holds:
+
+- `name`: the file and the alternatives it took;
+- `arch`: its `Architecture`;
+- `train`: its training settings ({py:class}`bux.train.config.TrainConfig`);
+- `choices`: what it took along each axis of the sweep;
+- `id`: a hash of what the run computes, not of how it is written, watched or split
+  over devices ([Running](../training/running.md)).
 
 ### JSON
 
-The IR is plain pydantic, so it serializes to JSON and back as it is. `bux json`
-prints it, and every run's directory keeps it beside its checkpoints, as `run.json`,
-with `run.bux`, the same run as source:
+The IR is plain pydantic, so it serializes to JSON and back unchanged. `bux json`
+prints it. Every run directory keeps it beside its checkpoints as `run.json`, next to
+`run.bux`, the same run as source:
 
 ```console
 $ bux json examples/architectures/gpt2.bux
@@ -95,6 +100,7 @@ $ bux json examples/architectures/gpt2.bux
   "d_model": 768,
   "vocab_size": 50257,
   "residual": null,
+  "init": null,
   "graph": {
     "label": "model",
     "share": null,
@@ -123,7 +129,7 @@ a run's.
 ## Printing IR back to source
 
 `bux.lang.printer.to_source(arch)` prints any IR as readable source, including IR
-that was generated or changed in Python, by an architecture search say. Every labeled
+that was generated or changed in Python, such as by an architecture search. Every labeled
 node becomes a definition: leaf definitions, then blocks in dependency order, then the
 model. Macro calls are inlined, since the IR keeps only what they produced.
 `compile(to_source(arch))` equals `arch` up to labels, and `run_to_source(run)`
@@ -214,7 +220,7 @@ print([y.shape for y in model.outputs(tokens)])  # every head's
 | `model(tokens)` | the first head's logits: the next-token prediction |
 | `model.outputs(tokens, positions=None)` | every head's logits, in execution order; head $j$ predicts the token $1 + k$ ahead, $k$ the `nextn` layers run before it |
 | `model.heads(tokens, positions=None)` | every head's input and projection (`HeadOutput`), from which the loss makes logits a chunk at a time |
-| `model.training_heads(tokens, positions=None)` | the heads, and the losses layers report: a training step's forward, in which layers also update state of their own (an MoE's router bias) |
+| `model.training_heads(tokens, positions=None)` | the heads, and the losses layers report: a training step's forward, in which layers also update their own state (an MoE's router bias) |
 
 `positions`, each token's offset in its document, packs several documents into a
 row: a document starts wherever the positions stop increasing, and each is attended
@@ -273,7 +279,7 @@ model's first and last in the compute dtype ([Precision](../training/precision.m
 ### Taps
 
 Modules are called as `module(x, taps)`. {py:class}`Taps <bux.architecture.registry.Taps>` is a dict
-of one forward pass's tap stacks, by name, with what else the pass carries:
+of one forward pass's tap stacks by name, plus the rest of what the pass carries:
 
 | Attribute | What it is |
 |-----------|-----------|

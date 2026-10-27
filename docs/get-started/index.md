@@ -1,10 +1,10 @@
 # Get started
 
-bux is a lightweight JAX framework for running architecture and data ablations fast.
-You write a language model as an algebra over the residual stream in a short `.bux`
-file, say in the same file how to train it, and turn any line into a sweep with `|`.
-bux checks every setting before anything runs and trains the result with Flax NNX, on
-a laptop's CPU or on many nodes of GPUs.
+bux is a JAX framework for architecture and data ablations. You write a language
+model as an algebra over the residual stream in a short `.bux` file, say in the same
+file how to train it, and turn any line into a sweep with `|`. bux checks every
+setting before anything runs, then trains with Flax NNX on a laptop's CPU or on many
+nodes of GPUs. Here is a complete experiment, two runs of a tiny Llama-style model:
 
 ```bux
 d_model    = 64
@@ -26,16 +26,19 @@ steps     = 50
 
 ## Who it is for
 
-bux is a research tool, not a production system. It suits you if you:
+bux is built for research: the shortest path from an idea to a trained, comparable
+run. Reach for it when you want to:
 
 - compare architectures: attention variants, linear attention and state-space
   models, mixtures of experts, residual wiring, normalization placement;
 - compare training recipes: optimizers, schedules, precision, data mixtures and
   packings;
-- want the comparison to be a few lines that differ, not a fork of a training script.
+- keep each comparison to the few lines that differ, not a fork of a training script;
+- take the winner from a laptop to a multi-node GPU cluster without rewriting it.
 
-It is not a serving stack, and it does not load weights trained by other frameworks:
-every model trains from its own initialization.
+bux trains models; it does not serve them. Export a trained model to transformers
+or vLLM for inference ([Exporting](../export/index.md)). Every model trains from its
+own initialization: bux does not load weights trained by other frameworks.
 
 ## In this section
 
@@ -46,7 +49,7 @@ every model trains from its own initialization.
 :link: installation
 :link-type: doc
 
-Python 3.14 and uv, the optional extras, GPUs, the Docker image, and checking that
+Python 3.14 and uv, the optional extras, GPUs, the Docker image, and a check that
 everything works.
 :::
 
@@ -61,12 +64,12 @@ Ten minutes from a fresh clone to a trained model on a laptop, and a sweep plann
 :link: concepts
 :link-type: doc
 
-The few ideas the rest of bux builds on, each with a short example and a link to its
-full page.
+The handful of ideas everything else builds on, each with a short example and a
+link to its full page.
 :::
 ::::
 
-When you have the basics, the [tutorials](../tutorials/index.md) walk through
+Once you have the basics, the [tutorials](../tutorials/index.md) walk through
 complete tasks step by step.
 
 ```{toctree}

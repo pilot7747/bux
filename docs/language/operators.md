@@ -1,9 +1,10 @@
 # Operators
 
-This page covers how a `.bux` expression combines layers: composition, parallel
-branches that are summed or multiplied, scaling, negation, repetition and the
-identity. It ends with how expressions parse and a catalogue of common block shapes.
-Read it when you write a block that is more than `[norm attn] [norm ffn]`.
+Operators combine layers into blocks: composition, parallel branches that are summed
+or multiplied, scaling, negation, repetition and the identity. With them, SwiGLU, a
+gated attention or nGPT's update is one line. Read this page when a block is more
+than `[norm attn] [norm ffn]`. It ends with how expressions parse and a catalogue of
+common block shapes.
 
 ## Example: SwiGLU and a gated attention from primitives
 
@@ -19,11 +20,11 @@ block = [rmsnorm gated_attn] [rmsnorm swiglu]
 model = embed block^8 rmsnorm head(tied=true)
 ```
 
-This is `examples/architectures/primitives.bux`. `swiglu` runs two projections side
-by side on the same input, multiplies them (one through `swish`), and projects the
-product back to `d_model`. Since composition binds tighter than `*`, `gated_attn`
-multiplies the attention by `sigmoid(linear(x))`. `bux render` draws each `*` as a
-fork that merges at `⊗`:
+This is `examples/architectures/primitives.bux`. `swiglu` runs two projections on the
+same input, multiplies them (one through `swish`), and projects the product back to
+`d_model`. Composition binds tighter than `*`, so `gated_attn` multiplies the
+attention by `sigmoid(linear(x))`. `bux render` draws each `*` as a fork that merges
+at `⊗`:
 
 ```text
 swiglu
@@ -61,11 +62,11 @@ On numbers, `+`, `-`, `*`, `/`, `//` and `^` are arithmetic
 ## Composition: `f g`
 
 Writing layers one after another applies them left to right: `norm attn` is
-`attn(norm(x))`. The arrows `->` and `→` mean the same and are optional, for when
-they read better: `norm -> attn`.
+`attn(norm(x))`. The arrows `->` and `→` mean the same thing. They are optional; use
+them where they read better: `norm -> attn`.
 
-A composition may span lines. A statement goes on while the next line is indented or
-a bracket is still open:
+A composition may span lines. A statement continues while the next line is indented
+or a bracket is still open:
 
 ```bux
 model = embed norm @x0
@@ -77,9 +78,9 @@ model = embed norm @x0
 ## Parallel branches: `+`, `-` and `*`
 
 `f + g` runs `f` and `g` on the same input and sums their outputs. `f - g` subtracts
-the second, and `f * g` multiplies them elementwise, which is how gates are written.
-Any number of branches can be combined, `f + g + h`, and the branches run left to
-right, which only matters when they read or write taps.
+the second, and `f * g` multiplies them elementwise: that is how you write a gate.
+Combine as many branches as you like, `f + g + h`. They run left to right, which
+matters only when they read or write taps.
 
 Every branch must return the same width ([Widths](values.md#widths)). `bux render`
 draws a sum as a fork merging at `⊕` and a product as one merging at `⊗`.
@@ -89,8 +90,8 @@ A number in a sum or a product is a constant:
 - `f * 0.5` scales the output of `f`;
 - `_ * 2.0 + attn` weights the skip around `attn` by 2 (DeepNorm-style).
 
-For a learned weight instead of a fixed one, compose with the layer {bux}`scale`, a
-learned multiplier: `f scale`, or `scale(per_channel=true)` for one per channel.
+For a learned weight instead of a fixed one, compose with {bux}`scale`, a learned
+multiplier: `f scale`, or `f scale(per_channel=true)` for one weight per channel.
 
 `/` and `//` only divide numbers. To scale a branch, multiply it:
 
@@ -122,8 +123,8 @@ The same holds for `3 * attn`. Write `3.0` (a float) to scale.
 ## Negation: `-f`
 
 `-f` negates the output of `f`, and `f - g` is `f + (-g)`. nGPT moves the stream
-toward each branch's normalized output, `h <- norm(h + a * (norm(f(h)) - h))`, and
-writes it with a subtraction of the identity:
+toward the normalized output of each branch, `h <- norm(h + a * (norm(f(h)) - h))`.
+In `.bux` that is a subtraction of the identity:
 
 ```bux
 unit  = rmsnorm(affine=false)
@@ -148,17 +149,17 @@ model = embed (M^5 block)^6 norm head      # 6 × (5 Mamba layers, then a block)
 ```
 
 A repeated block must return the width it started at. The IR keeps a repeat as one
-node rather than `n` copies, so a backend can scan over the identical blocks; the
+node rather than `n` copies, so a backend can scan over the identical blocks. The
 compiler still checks every pass, which matters for [taps](skip-connections.md).
 
 On numbers `^` is a power: `2^10` is 1024.
 
 ## Identity: `_`
 
-`_` returns its input. `[f]` and `(_ + f)` compute the same thing under the plain
-residual stream, but they are not the same in the IR: `[f]` is the residual stream's
-own connection, which a [residual algebra](residual-algebras.md) can replace, while
-`_ + f` is plain arithmetic that no algebra touches.
+`_` returns its input. Under the plain residual stream, `[f]` and `(_ + f)` compute
+the same thing, but only `[f]` changes under a
+[residual algebra](residual-algebras.md). Write `[f]` for a residual branch and
+`_ + f` for the sum itself.
 
 ## Precedence and associativity
 
@@ -175,8 +176,8 @@ From loosest to tightest:
 | atoms | names, calls, numbers, strings, `_`, taps, `( )`, `[ ]` | |
 
 Composition binds tighter than `*` and `+`, as concatenation does in regular
-expressions. So `norm attn + ffn` means `(norm attn) + ffn`, and a gate written
-`a b * c d` multiplies the two compositions. Worked parses:
+expressions. So `norm attn + ffn` means `(norm attn) + ffn`, and the gate `a b * c d`
+multiplies two compositions. Some worked parses:
 
 | Written | Parses as |
 |---------|-----------|
@@ -212,8 +213,8 @@ gqa(...) * (linear(features=d_model) sigmoid) # gated after o_proj instead (thei
 ```
 
 Here `attn`, `ffn` and `ssm` are definitions such as `gqa(...)`, `gated_mlp(...)`
-and `mamba(...)`, and `unit` and `step` are the nGPT definitions above. Some of them
-drawn by `bux render`:
+and `mamba(...)`, and `unit` and `step` are the nGPT definitions above. Four of them,
+as `bux render` draws them:
 
 ::::{tab-set}
 

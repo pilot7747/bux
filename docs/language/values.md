@@ -1,11 +1,13 @@
 (lang-values)=
 # Settings and values
 
-This page covers how layers and settings are configured: calling a config with
-keyword arguments, the values a setting can take (numbers, strings, lists, configs,
-arithmetic, settings read off other layers), how bare names are read, the top-level
-settings, and the width checks. Every layer's and setting's fields are listed in the
-[language reference](../reference/language/index.md).
+Layers and settings are configs, and you configure one by calling it with keyword
+arguments: `gqa(num_heads=32, num_kv_heads=8)`. A value can be a number, a string, a
+list, another config, arithmetic over other definitions, or a setting read off
+another layer. The compiler checks every one against its schema, and every width
+along the model, before anything runs. This page covers those values, how bare names
+are read, and the top-level settings. The fields of every layer and setting are in
+the [language reference](../reference/language/index.md).
 
 ## Example
 
@@ -32,9 +34,9 @@ model = embed (sw block)^16 norm head
 A call configures a layer or a setting: `gqa(num_heads=32, num_kv_heads=8)`. The
 rules:
 
-- **Keyword arguments.** Each argument names a field of the config, the pydantic
-  classes in `bux/config.py` and `bux/train/config.py`. Positional arguments are an
-  error: `layer settings are keyword arguments: name=value`.
+- **Keyword arguments.** Each argument names a field of the config. Configs are the
+  pydantic classes in `bux/config.py` and `bux/train/config.py`. Positional arguments
+  are an error: `layer settings are keyword arguments: name=value`.
 - **The name is the type.** Every config's `type` tag is its name in the language,
   so the type cannot be set as an argument.
 - **Dotted keys** reach into a nested setting: `gqa(..., rope.base=1e6)` changes
@@ -50,12 +52,12 @@ The names the language knows:
 | Kind | Names |
 |------|-------|
 | layers | `gqa`, `mla`, `csa`, `mamba`, `mamba2`, `gla`, `deltanet`, `gdn`, `kda`, `gdn2`, `lightning`, `rwkv7`, `conv`, `short_conv`, `mlp`, `gated_mlp`, `moe`, `layernorm`, `rmsnorm`, `dyt`, `linear`, `act`, `scale`, `dropout`, `embed`, `head`, `nextn`, `engram`, `merge` |
-| settings of a model | `rope`, `pi`, `yarn`, `llama3`, `relbias`, `indexer`; the residual algebras `hc`, `mhc`, `gr`, `attnres`, `vpgate` |
+| settings of a model | `rope`, `pi`, `yarn`, `llama3`, `relbias`, `indexer`; the residual algebras `hc`, `mhc`, `gr`, `attnres`, `vpgate`; the initializers `normal`, `fan_in`, `fan_out`, `fan_avg`, `zeros` |
 | training settings | `adamw`, `muon`, `wsd`, `text`, `tokenizer`, `mesh`, ... ([Training settings](../reference/language/training.md)) |
-| activations | `swish`, `gelu`, `gelu_tanh`, `relu`, `relu2`, `sigmoid`, `tanh`, `softplus`, `situ` |
+| activations | `swish`, `gelu`, `gelu_tanh`, `quick_gelu`, `relu`, `relu2`, `sigmoid`, `tanh`, `softplus`, `situ` |
 
-An activation is a layer that applies it elementwise, `linear(features=h) swish`, and
-also a value for the settings that take one, `activation=swish`.
+An activation is both a layer that applies it elementwise, `linear(features=h) swish`,
+and a value for the settings that take one, `activation=swish`.
 
 (lang-value-kinds)=
 ## Values
@@ -102,22 +104,22 @@ operators on blocks:
 | `a ^ b` | power: `2^10` is 1024 |
 
 Dividing by zero is an error. Settings are definitions, so arithmetic works on them
-too: `steps = budget // (batch * seq_len)`. Data sources are the one exception to
-numbers-only arithmetic: `0.8 * web + 0.2 * code` is a weighted mix
+too: `steps = budget // (batch * seq_len)`. Data sources are the one thing besides
+numbers that arithmetic works on: `0.8 * web + 0.2 * code` is a weighted mix
 ([Data sources](../data/sources.md)).
 
 (lang-bare-names)=
 ### Bare names are strings
 
-A name that nothing defines, and that is not a builtin, is a string when it is the
-value of a setting. So enumerated settings need no quotes: `layout=interleaved`,
-`load_balancing=aux_free`. Activation names are strings in the same way:
-`router=sigmoid`, `activation=swish`. So is a builtin config's name where the setting
-takes it as one of its options: `cosine` is a schedule, but `wsd(shape=cosine)` is
-the cooldown's shape.
+As the value of a setting, a name that nothing defines and that is not a builtin is a
+string. So enumerated settings need no quotes: `layout=interleaved`,
+`load_balancing=aux_free`. Activation names work the same way: `router=sigmoid`,
+`activation=swish`. So does the name of a builtin config where a setting takes it as
+one of its options: `cosine` is a schedule, but in `wsd(shape=cosine)` it is the
+shape of the cooldown.
 
 Where a setting wants something other than a string, or in arithmetic, an undefined
-name is a typo, and the compiler reports it as an unknown name with a suggestion:
+name is a typo. The compiler reports it as an unknown name, with a suggestion:
 
 ```text
 error: unknown name 'dmodel'
@@ -130,13 +132,13 @@ error: unknown name 'dmodel'
 
 :::{tip}
 In the editor, hovering a bare name tells you which it is: the definition it refers
-to, or that it is not defined and so is a string. Defining a name that you also use
-as a string changes what the string means.
+to, or a string because nothing defines it. Defining a name that you also use as a
+string changes what the string means.
 :::
 
-The settings `save` and `offload` of {bux}`remat` are an exception: they read the
-names of what layers make (`attention`, `attention.in`, `mlp`) as written, never as
-definitions, and `[attention]` is a list of one.
+The `save` and `offload` settings of {bux}`remat` are an exception. They take the
+names of tensors that layers make (`attention`, `attention.in`, `mlp`) as written,
+never as definitions, and there `[attention]` is a list of one.
 
 (lang-field-reads)=
 ### Reading a setting: `name.field`
@@ -158,9 +160,9 @@ base    = rope.base                          # a builtin's default: 10000.0
 
 ## Checking against the schema
 
-Every setting is checked against its config's schema where it is written, before
-anything runs. Unknown and missing settings, and values of the wrong type, are
-errors, with suggestions where there is a close match. `bux check` reports them all
+Every setting is checked against the schema of its config where it is written, before
+anything runs. Unknown settings, missing ones and values of the wrong type are
+errors, with a suggestion where there is a close match. `bux check` reports them all
 at once. For this file:
 
 ```bux
@@ -239,9 +241,9 @@ definitions you use elsewhere:
 | `data`, `optimizer`, `seq_len`, `batch`, `steps`, ... | training settings | setting any of them makes the file a run ([Training settings](../training/settings.md)) |
 
 Settings are definitions, so arithmetic, field reads and suffixes work on them, and
-other definitions can read them: `intermediate_size=4 * d_model`. They
-cannot be macros. A file that sets how to train is a run and needs every required
-training setting; one without a model is a module
+other definitions can read them: `intermediate_size=4 * d_model`. They cannot be
+macros. A file that sets how to train is a run and needs every required training
+setting, and a file without a model is a module
 ([Runs and modules](modules.md#runs-and-modules)). The full table is in
 [Top-level settings](../reference/language/top-level.md).
 
@@ -258,7 +260,7 @@ error: 'd_model' must be an integer, found a number
 (lang-widths)=
 ## Widths
 
-Every leaf knows the width of its input, and what it returns:
+Every layer knows the width it takes and the width it returns:
 
 | Layer | Takes | Returns |
 |-------|-------|---------|
@@ -267,7 +269,7 @@ Every leaf knows the width of its input, and what it returns:
 | `head` | hidden states | logits |
 | everything else | hidden states | the width it takes |
 
-A model may also start without an `embed`; it then takes hidden states of width
+A model may also start without an `embed`, and then it takes hidden states of width
 `d_model`. The compiler checks that:
 
 - a residual branch and a repeated block return to the width they started at;
@@ -294,5 +296,6 @@ error: parallel branches disagree on width: 2048, 512
   |                      ^^^^^^^^^
 ```
 
-Widths, like taps, are checked along the model that is built. A definition the model
-does not use has its settings checked, but not its widths.
+Widths, like [taps](skip-connections.md#how-taps-are-checked), are checked along the
+model that is built. A definition the model does not use has its settings checked,
+but not its widths.

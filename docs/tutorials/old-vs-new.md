@@ -1,35 +1,39 @@
 (tutorial-old-vs-new)=
 # Old against new at the same serving cost
 
-Is a 2026 architecture better than a 2022 one? At the same number of parameters the
-question is unfair to a mixture of experts, which holds many parameters and uses few
-of them per token. At the same training FLOPs it ignores what a model costs once it
-is trained. This tutorial compares the two at the **same serving cost**, under the load
-they are built for, agentic coding: long prompts, a few turns each, many sessions at
-once. Then it asks which one predicts code better, on a scaling ladder of small models
-extrapolated to the two at full size.
+Is a 2026 architecture better than a 2022 one? Comparing them at the same number of
+parameters is unfair to a mixture of experts, which holds many parameters and uses few
+of them per token. Comparing them at the same training FLOPs ignores what a model
+costs once it is trained. This tutorial compares the two at the **same serving
+cost**, under the load they are built for: agentic coding, with long prompts, a few
+turns per session and many sessions at once. Then a scaling ladder of small models,
+extrapolated to both at full size, says which one predicts code better.
 
-It is the advanced tutorial: it runs on a node of 8 GPUs, not on a laptop, and puts
-together pieces the others introduce one by one (sweeps and labels, searches,
-curricula, evals, exports, vLLM). The steps:
+By the end you will have the answer. A 2026 hybrid MoE of 91.1B parameters, 6.54B
+of them active per token, serves agents as fast as a 2022 dense 7B, and the ladders
+predict its bits per byte 6.7% lower on the objective, 6.3% on code files and 8.5% on
+whole repositories. Getting there takes seven steps:
 
 1. Write the two families, each sized by one number.
-2. Price them: export a family at several sizes without weights, time each in vLLM
-   under an agentic load, and find the 2026 model that serves as fast as a 2022 7B.
+2. Price them in vLLM under an agentic load, and find the 2026 model that serves as
+   fast as a 2022 7B.
 3. Get the data: code, whole repositories for long context, and web text.
-4. Tune the learning rate of each family on its small rungs, by search.
+4. Tune each family's learning rate on its small rungs, by search.
 5. Train both ladders.
-6. Fit a scaling law to each and extrapolate to the two targets.
-7. Read the result, and what it does not say.
+6. Fit a scaling law to each ladder and extrapolate to the two targets.
+7. Read the results and their caveats.
 
-Every number on this page was measured as written, on nodes of 8 NVIDIA B300s, on
-2026-10-26 and 27; [What it takes](#what-it-takes) says how long each step takes on one.
+This is the advanced tutorial. It runs on a node of 8 GPUs, not a laptop, and puts
+together pieces that the other tutorials introduce one at a time: sweeps and labels,
+searches, curricula, evals, exports and vLLM. All of it takes about 15 hours on one
+node ([Time and hardware](#time-and-hardware)). Every number here was measured as
+written, on nodes of 8 NVIDIA B300s, on 2026-10-26 and 2026-10-27.
 
-## 1. Two families
+## 1. Write the two families
 
-A family is a `.bux` file whose model a single number sizes: `d_model`. Everything
-else follows from it, so that a ladder of small models and its full-size target are
-the same design at different widths.
+A family is a `.bux` file whose model one number sizes: `d_model`. Everything else
+follows from it, so a ladder of small models and its full-size target are the same
+design at different widths.
 
 The **2022 family** is the decoder of OPT, GPT-NeoX and Pythia, in
 `examples/experiments/old_vs_new/old_2022.bux`:
@@ -55,12 +59,13 @@ optimizer.lr = 1.5e-3
 mesh         = mesh(fsdp=8)
 ```
 
-Multi-head attention (as many key and value heads as query heads), RoPE at base 10k on
-every channel, LayerNorms with biases, a GELU MLP four times as wide as the stream. A
-layer for every 128 of the width, so `d_model = 4096` is OPT-6.7B's shape: 32 layers of
-32 heads, 6.44B parameters besides the embeddings.
+It has multi-head attention (as many key and value heads as query heads), RoPE at
+base 10k on every channel, LayerNorms with biases, and a GELU MLP four times as wide
+as the stream. There is a layer for every 128 of the width, so `d_model = 4096` is
+the shape of OPT-6.7B: 32 layers of 32 heads, 6.44B parameters besides the
+embeddings.
 
-The **2026 family** is laid out as Qwen3-Next is, in
+The **2026 family** follows the layout of Qwen3-Next, in
 `examples/experiments/old_vs_new/new_2026.bux`:
 
 ```bux
@@ -90,20 +95,21 @@ optimizer.lr = 2.6e-3
 mesh         = mesh(fsdp=64)
 ```
 
-Three Gated DeltaNet layers to one attention layer; the attention has 2 key and value
-heads of 256 dims, QK-norm, a gate on its output and RoPE on a quarter of its channels;
-after each mixer a mixture of 256 experts a quarter of the width wide, 8 of them and a
-shared one for every token, as DeepSeek-V3 splits its experts. A layer for every 64 of
-the width.
+- Three Gated DeltaNet layers to one attention layer.
+- The attention has 2 key and value heads of 256 dims, QK-norm, a gate on its output,
+  and RoPE on a quarter of its channels.
+- After each mixer comes a mixture of 256 experts, each a quarter of the width wide.
+  Every token goes through 8 of them plus a shared one, as DeepSeek-V3 splits its
+  experts.
+- There is a layer for every 64 of the width.
 
-Each family file is also its target's run: the recipe of step 3 (`use agentic_code`),
-20 tokens for every parameter a token goes through, a batch by the law of step 5, and
-the learning rate step 4 finds. The ladders of step 5 use the files and set each of
-these for every rung. Both read the same tokenizer, GPT-NeoX's, so that only the
-architecture differs (bits per byte would compare across tokenizers anyway), and both
-start from bux's default init, every weight matrix from a normal of 0.02, as OPT and
-Qwen do ([Initialization](../architectures/initialization.md)). `bux check` reads
-either:
+Each family file is also its target's run: the recipe of step 3
+(`use agentic_code`), 20 tokens for every parameter a token goes through, the batch
+from the law in step 5, and the learning rate from step 4. The ladders of step 5 use
+these files and set each of these per rung. Both families use GPT-NeoX's tokenizer,
+so only the architecture differs, and both start from bux's default init, a normal of
+0.02 for every weight matrix, as OPT and Qwen do
+([Initialization](../architectures/initialization.md)). `bux check` reads either:
 
 ```console
 $ bux check examples/experiments/old_vs_new/new_2026.bux
@@ -117,7 +123,7 @@ data=0.6 * text(path="data/stack-edu/files/train/*.parquet") + 0.4 * text(path="
 tokenizer=tokenizer(name="EleutherAI/gpt-neox-20b") packing=best_fit
 ```
 
-`bux plan` prices the two targets' training:
+`bux plan` prices the training of the two targets:
 
 ```console
 $ bux plan examples/experiments/old_vs_new/old_2022.bux | tail -1
@@ -126,12 +132,13 @@ $ bux plan examples/experiments/old_vs_new/new_2026.bux | tail -1
 3354471942  91.1B   131B    1.4        43.7B      64    5.3GiB      10.6GiB    0%      new_2026
 ```
 
-43.5B and 43.7B FLOPs a token: the two cost the same to train a token, as they pass it
-through as many parameters. Neither trains here; the ladders stand in for them.
+43.5B and 43.7B FLOPs per token: the two cost the same to train per token, because a
+token passes through as many parameters in each. Neither target trains here; the
+ladders stand in for them.
 
-What a token costs is not what a model holds. The script `fit.py` of step 6 counts
-both, the parameters a token goes through (an MoE's routed experts by 8 of 256)
-besides the embeddings and the head:
+What a token costs is not what a model holds. `fit.py` (step 6) counts both: all the
+parameters, and the active ones a token goes through besides the embeddings and the
+head, where an MoE's routed experts count 8 of 256:
 
 | `d_model` | 2022: all | 2022: besides embeddings | 2026: all | 2026: active, besides embeddings |
 |-----------|-----------|--------------------------|-----------|----------------------------------|
@@ -141,28 +148,29 @@ besides the embeddings and the head:
 | 3072      |           |                          | 91.1B     | 6.54B                            |
 | 4096      | 6.86B     | 6.44B                    |           |                                  |
 
-At `d_model = 3072` the 2026 model holds 13 times the 2022 7B's parameters, and a
-token goes through as many of them as through the 7B's.
+At `d_model = 3072` the 2026 model holds 13 times as many parameters as the 2022 7B,
+and a token goes through as many of them.
 
-## 2. What a model costs to serve
+## 2. Measure the serving cost
 
 A model's serving cost is the GPU time a session takes, at a load that keeps the GPU
-busy. The load here is an agent at work on a repository, a session of 4 turns:
+busy. The load here is an agent working on a repository, in sessions of 4 turns:
 
-- a system prompt of 2k tokens that every session shares, then 14k tokens of the
-  session's own context, the repository's files: 16k tokens before the first turn;
-- each turn the model writes 512 tokens, and the next turn reads them back with a
-  tool's result of 2k tokens appended, so the last prompt is 24k tokens;
-- every prompt starts with the one before, so vLLM's prefix cache serves all of it but
-  the new tokens, as long as the session's cache was not evicted;
-- many sessions at once: a closed loop of C sessions, a new one starting as one ends.
+- Every session starts with a shared system prompt of 2k tokens, then 14k tokens of
+  its own context (the repository's files): 16k tokens before the first turn.
+- Each turn, the model writes 512 tokens. The next turn reads them back with a
+  2k-token tool result appended, so the last prompt is 24k tokens.
+- Every prompt extends the one before, so vLLM's prefix cache serves all of it except
+  the new tokens, as long as the session's cache was not evicted.
+- Many sessions run at once: a closed loop of C sessions, with a new one starting as
+  one ends.
 
-`scripts/old_vs_new/agentic.py` runs that load against vLLM's engine in-process, and
+`scripts/old_vs_new/agentic.py` runs this load against vLLM's engine in-process, and
 prints a JSON line for each concurrency. It needs no checkpoint: the weights are
 random (vLLM's `load_format="dummy"`), and only the time counts. `bux export` of a
 `.bux` file writes what vLLM needs, the model's code and config without weights
 ([Exporting an architecture](../export/index.md#exporting-an-architecture)), so a
-family exports at any width in seconds, a 116B model too:
+family exports at any width in seconds, even at 116B:
 
 ```console
 $ bux export examples/experiments/old_vs_new/old_2022.bux exported/old-4096
@@ -177,9 +185,9 @@ examples/experiments/old_vs_new/new_2026.bux: 91.1B parameters exported to expor
 examples/experiments/old_vs_new/new_2026.bux: 116B parameters exported to exported/new-3328, without weights
 ```
 
-vLLM and bux pin their own PyTorch, so vLLM gets an environment of its own, with bux's
-plugin ([Serving in vLLM](../export/vllm.md)); install it from outside the checkout,
-where `uv pip` would take bux's own settings:
+vLLM and bux pin different PyTorch versions, so vLLM gets its own environment, with
+bux's plugin. Create it from outside the checkout
+([Installing](../export/vllm.md#installing) says why):
 
 ```sh
 cd /tmp && uv venv --python 3.12 vllm-env
@@ -187,8 +195,8 @@ uv pip install --python vllm-env/bin/python vllm==0.32.0 ~/bux/src/bux_vllm
 cd ~/bux
 ```
 
-Then each model on a GPU of its own, at 8, 16, 32 and 64 sessions at once, twice as
-many sessions in all as at once:
+Then time each model on its own GPU at 8, 16, 32 and 64 sessions at once, running
+twice as many sessions in total as at once:
 
 ```sh
 export PATH=/tmp/vllm-env/bin:$PATH              # its ninja, for FlashInfer's kernels
@@ -201,19 +209,19 @@ for m in old-4096 new-1536 new-2048 new-2560 new-3072 new-3328; do
 done; wait
 ```
 
-`moe_backend="triton"` is for the B300: vLLM's default for an MoE there, FlashInfer's
-CUTLASS kernels, fails to build ([Serving in vLLM](../export/vllm.md#installing)).
-A line of the output, the 2026 model at `d_model = 3072`, 16 sessions at once:
+`moe_backend="triton"` is for the B300, where vLLM's default MoE kernels fail to build
+([Installing](../export/vllm.md#installing)). One line of the output, for the 2026
+model at `d_model = 3072` with 16 sessions at once:
 
 ```json
 {"tag": "new-3072", "concurrency": 16, "sessions": 32, "seconds": 86.45, "sessions_per_hour": 1332.5, "output_tok_s": 758.0, "prompt_tok_s": 29942.6, "prefilled_tok_s": 8536.1, "cache_hit": 0.7149, "ttft_p50": 0.387, "ttft_p90": 2.252, "tpot_p50_ms": 18.45, "kv_blocks": 3589, "block_size": 816}
 ```
 
-Sessions an hour, one GPU each (the 2022 7B also at 12, 20 and 24 sessions at once,
-to find its best):
+Sessions per hour, on one GPU each. The 2022 7B was also measured at 12, 20 and 24
+sessions at once, to find its best.
 
-| Model | parameters (active) | 8 at once | 16 | 32 | 64 | time a token, 8 at once |
-|-------|---------------------|-----------|----|----|----|-------------------------|
+| Model | parameters (active) | 8 at once | 16 | 32 | 64 | time per output token, 8 at once |
+|-------|---------------------|-----------|----|----|----|----------------------------------|
 | 2022, `d_model = 4096` | 6.86B | 892 | 992 | 873 | 881 | 15.2 ms |
 | 2026, 1536 | 11.5B (0.83B) | 2,672 | 4,338 | 5,736 | 7,433 | 4.0 ms |
 | 2026, 2048 | 27.1B (1.95B) | 1,817 | 2,709 | 3,647 | 4,808 | 6.7 ms |
@@ -221,40 +229,41 @@ to find its best):
 | **2026, 3072** | **91.1B (6.54B)** | **894** | 1,332 | 1,776 | 2,335 | 14.0 ms |
 | 2026, 3328 | 116B (8.31B) | 748 | 1,140 | 1,496 | 1,052 | 16.6 ms |
 
-What sets each model's cost is what it keeps for a session:
+Each model's cost comes down to what it keeps per session:
 
-- **The 2022 7B is bound by its KV cache.** Multi-head attention keeps 512 KB a token
-  (32 layers, keys and values of 4096 channels, in bfloat16), so the 234 GB vLLM
-  leaves it beside the weights hold 463k tokens: 19 sessions of 24k. It serves most,
-  1,012 sessions an hour, at 20 at once (956 at 12, 948 at 24). Past that the sessions no longer fit
-  between their turns: vLLM evicts the prefix of one to serve another, the cache hit
-  rate falls from 75% to 10%, and every turn prefills its whole prompt again; at 64 at
-  once the first token waits 45 s.
+- **The 2022 7B is bound by its KV cache.** Multi-head attention keeps 512 KB per
+  token (32 layers, keys and values of 4096 channels, in bfloat16). The 234 GB that
+  vLLM leaves beside the weights hold 463k tokens: 19 sessions of 24k. The 7B serves
+  the most sessions, 1,012 per hour, at 20 at once (956 at 12, 948 at 24). Beyond
+  that, sessions no longer fit between their turns: vLLM evicts one session's prefix
+  to serve another, the cache hit rate falls from 75% to 10%, and every turn prefills
+  its whole prompt again. At 64 at once, the first token waits 45 s.
 - **The 2026 model is bound by its weights.** It keeps 2 key and value heads of 256
-  in a quarter of its layers and a fixed state in the rest: 24 KB a token, a
-  twenty-first of the 7B's, and its cache holds 2.9M tokens at `d_model = 3072`. Its
-  cost is reading its weights each step, shared by every session in the batch, so
-  the more sessions at once the cheaper each: it serves 2.6 times as many at 64 at once as at 8. At 3328 the weights leave
-  room for 1.3M tokens of state, and at 64 at once it thrashes as the 7B does.
+  in a quarter of its layers, and a fixed-size state in the rest: 24 KB per token, a
+  twenty-first of the 7B's. At `d_model = 3072` its cache holds 2.9M tokens. Its cost
+  is reading its weights each step, shared by every session in the batch, so the more
+  sessions at once, the cheaper each one: it serves 2.6 times as many at 64 at once
+  as at 8. At 3328 the weights leave room for only 1.3M tokens of state, and at 64 at
+  once it thrashes as the 7B does.
 
-At 8 sessions at once, the 2026 model at `d_model = 3072` serves as many sessions an
-hour as the 2022 7B (894 against 892), each token as fast (14.0 ms against 15.2); at
-every load above, more. So it is the target: **as fast as the 7B at the lightest load,
-and faster at every other**, which favors the 7B, since a model as cheap as it under
-a heavy load would be larger still. It also passes as many parameters per token as
-the 7B (6.54B against 6.44B, besides the embeddings), so the two cost about the same
-to train a token, too. Its first token comes later at light load (0.39 s against
-0.14 s), and a little less of each prompt comes from the cache (71% against 75%): vLLM caches a hybrid's
-prefixes in blocks of 816 tokens, where its recurrent state is saved, against the
-7B's 16.
+At 8 sessions at once, the 2026 model at `d_model = 3072` serves as many sessions per
+hour as the 2022 7B (894 against 892), each token as fast (14.0 ms against 15.2). At
+every heavier load it serves more. So it is the target: **as fast as the 7B at the
+lightest load, and faster at every other**. This choice favors the 7B, because a 2026
+model only as cheap as the 7B under a heavy load would be larger still.
 
-## 3. The data
+The 2026 model pays in two places. Its first token comes later at light load (0.39 s against
+0.14 s), and a little less of each prompt comes from the cache (71% against 75%).
+vLLM caches a hybrid's prefixes in blocks of 816 tokens, where it saves the recurrent
+state, against blocks of 16 for the 7B.
+
+## 3. Get the data
 
 The models are for code, so the data is mostly code, and the long context they serve
-is repositories. `scripts/old_vs_new/stack_edu.py` downloads
-[Common Pile's Stack v2 Edu](https://huggingface.co/datasets/common-pile/stackv2_edu_filtered),
-source files from openly licensed repositories, filtered for educational value
-(Kandpal et al., 2025), and writes Parquet files for bux:
+is whole repositories. `scripts/old_vs_new/stack_edu.py` downloads
+[Common Pile's Stack v2 Edu](https://huggingface.co/datasets/common-pile/stackv2_edu_filtered)
+(Kandpal et al., 2025), source files from openly licensed repositories filtered for
+educational value, and writes Parquet files for bux:
 
 ```console
 $ python scripts/old_vs_new/stack_edu.py data/stack-edu
@@ -270,20 +279,19 @@ bucket 1: 88438 repos, 6759 + 44 long (1078M chars) (101s)
 ...
 ```
 
-On a node of 160 cores and a fast link, the 26 shards (24 GB) download and convert
-in under two minutes.
+On a node of 160 cores with a fast link, the 26 shards (24 GB) download and convert
+in under two minutes. The script writes:
 
-- `files/train/` and `files/eval/`: a source file a row, in 14 languages, Python
-  most: 13.7M files to train on, 137k held out.
-- `repos/train/` and `repos/eval/`: a Python repository a row, its files in path
-  order, each after a line `--- path ---`, for the repositories of at least 64k
-  characters (about 16k tokens): 108,935 to train on, 1,051 held out. The shards hold
-  files in no order, so the script puts each repository together from all twelve
-  Python shards.
+- `files/train/` and `files/eval/`: one source file per row, in 14 languages, mostly
+  Python. 13.7M files to train on, 137k held out.
+- `repos/train/` and `repos/eval/`: one Python repository per row, its files in path
+  order, each after a line `--- path ---`. Only repositories of at least 64k
+  characters (about 16k tokens) are kept: 108,935 to train on, 1,051 held out.
 
-A repository is held out whole, its files and its document, when the hash of its name
-falls in the last 1%: no file the evals read is trained on, even as part of a
-repository. Web text is FineWeb-Edu's 10BT sample:
+A repository is held out whole, both its files and its document, when the hash of its
+name falls in the last 1%. So no file the evals read is trained on, even as part of a
+repository. Web text is FineWeb-Edu's 10BT sample, downloaded with the Hugging Face
+CLI:
 
 ```sh
 hf download HuggingFaceFW/fineweb-edu --repo-type dataset --include "sample/10BT/*" --local-dir data/fineweb-edu
@@ -321,19 +329,19 @@ objective = 0.5 * code_bpb + 0.3 * repo_bpb + 0.2 * web_bpb
 ```
 
 - **A long-context phase.** Every run trains its last tenth of tokens on rows of 16k
-  tokens, half of them whole repositories, as many tokens a step as before
-  ([Curriculum](../training/curriculum.md)). It falls inside the cooldown of the
-  warmup-stable-decay schedule, as long-context extensions usually do.
+  tokens, half of them whole repositories, with as many tokens per step as before
+  ([Curriculum](../training/curriculum.md)). The phase falls inside the cooldown of
+  the warmup-stable-decay schedule, where long-context extensions usually go.
 - **Three held-out sets.** Code files and web text, 5.2M tokens each in rows of 2k,
-  and whole repositories, 2.1M tokens in rows of 16k: an eval with a `seq_len` of its
-  own ([Long rows](../training/running.md#long-rows)) holds the model to the length it
-  serves. Each eval has a `batch` of its own too, so that every rung, whatever its
-  batch, is measured on the same rows.
-- **One objective.** What the searches minimize and the ladders fit: bits per byte,
-  half of them on code files, 30% on repositories, 20% on web text.
+  and whole repositories, 2.1M tokens in rows of 16k. An eval with its own `seq_len`
+  ([Long rows](../training/running.md#long-rows)) holds the model to the length it
+  serves. Each eval also has its own `batch`, so every rung is measured on the same
+  rows, whatever its training batch.
+- **One objective.** The searches minimize it and the ladders fit it: bits per byte,
+  weighted 50% on code files, 30% on repositories and 20% on web text.
 
-`bux prepare` tokenizes and packs every dataset the runs read, at each `seq_len`
-they read it, once:
+`bux prepare` tokenizes and packs every dataset the runs read, once for each
+`seq_len` they read it at:
 
 ```console
 $ bux prepare examples/experiments/old_vs_new/old_ladder.bux
@@ -346,30 +354,30 @@ text-000e665c59: 9,842 documents, 9,928,901 tokens -> 4,853 rows of 2048, 99.9% 
 text-bc3bcef6e3: 1,051 documents, 50,093,111 tokens -> 3,070 rows of 16384, 99.6% filled, 99.6% targets, 0 tokens cut (4.4s)
 ```
 
-16.4B tokens of code files and 9.9B of web text to train on, packed at 2k and, for
-the long phase, at 16k, and 5.4B of whole repositories at 16k; held out, 169M tokens
-of code, 10M of web text and 50M of repositories. Eight datasets in 8 minutes on 150 workers, and
-`new_ladder.bux` reads the same ones. The largest rung trains on 9.6B tokens, so no
-row is read twice.
+That is 16.4B tokens of code files and 9.9B of web text to train on (packed at 2k,
+and at 16k for the long phase), and 5.4B of whole repositories at 16k. Held out are
+169M tokens of code, 10M of web text and 50M of repositories. The eight datasets take
+8 minutes on 150 workers, and `new_ladder.bux` reads the same ones. The largest rung
+trains on 9.6B tokens, so no row is read twice.
 
-## 4. A learning rate for each family
+## 4. Tune each family's learning rate
 
-A ladder is fair only if each rung trains at its own best learning rate: one rate for
-both families would favor whichever it suits, and one rate for every width would favor
-the widths it suits. bux's searches find it ([Searching
-hyperparameters](../training/searching.md)). A setting written as a distribution makes
-a run a search, and the command line can write it, so the ladder files need no edit:
-a rung of a ladder with its `optimizer.lr` a dimension is a search of that rung.
+A ladder is fair only if each rung trains at its own best learning rate. One rate for
+both families would favor whichever family it suits, and one rate for every width
+would favor the widths it suits. bux's searches find the best rate
+([Searching hyperparameters](../training/searching.md)). A setting written as a
+distribution turns a run into a search, and the command line can write it, so the
+ladder files need no edit:
 
 ```sh
 bux launch examples/experiments/old_vs_new/old_ladder.bux --only "[d512]" \
   'optimizer.lr = log_uniform(1e-3, 3e-2)' 'search = search(trials=12)'
 ```
 
-Twelve trials by the default method, a Gaussian process: quasi-random points first,
-then the points of most expected improvement, each a whole run of the rung, a GPU
-each. It ends with its table, which `bux results` prints again with the same
-arguments:
+This runs twelve trials with the default method, a Gaussian process: quasi-random
+points first, then the points of most expected improvement. Each trial is a whole run
+of the rung, on one GPU. The search ends with its table, which `bux results` prints
+again given the same arguments:
 
 ```console
 search old_ladder[d512]: 12 of 12 trials; objective = 0.5 * code_bpb + 0.3 * repo_bpb + 0.2 * web_bpb; best 0.8948, trial 10
@@ -389,8 +397,8 @@ trial  rung  objective  run
 ```
 
 **The best trial is at the edge of the range**, 1.04e-3 against a floor of 1e-3, so
-the range is too small. Another range is a search of its own, which keeps the first
-one's trials where they are:
+the range is too narrow. A search over another range is a new search, and the first
+search keeps its trials:
 
 ```console
 $ bux launch examples/experiments/old_vs_new/old_ladder.bux --only "[d512]" 'optimizer.lr = log_uniform(3e-4, 3e-3)' 'search = search(trials=8)'
@@ -408,18 +416,20 @@ trial  rung  objective  run
 ```
 
 The bottom is at 1.5e-3, and it is flat: 1e-3 to 2.7e-3 is within 1% of the best.
-Two trials 1% apart in learning rate, 2.02e-3 and 2.04e-3, came 0.001 apart: about
-what two runs at the same point differ by, and the resolution of every comparison on
-this page.
+Two trials 1% apart in learning rate, 2.02e-3 and 2.04e-3, landed 0.001 apart. That
+is about the noise between two runs at the same point, and the resolution of every
+comparison on this page.
 
-**The 2022 family diverges.** From 7e-3 up its runs blow up mid-way, and end near 3
-bits per byte, where the bottom is under 0.9. A diverged trial is information, but a
-costly kind for the Gaussian process, which models the objective as smooth: at d768,
-8 of its 12 trials landed above 6.5e-3, five of them its own picks after the first had
-diverged, around the cliff's edge. Once a search has found a cliff, cap the next
-range below it, as the second d768 search here does (`log_uniform(3e-4, 1.5e-3)`).
+**The 2022 family diverges.** From 7e-3 up, its runs blow up midway and end near 3
+bits per byte. Diverged trials waste a Gaussian process's budget, because it models
+the objective as smooth and keeps probing the cliff: 8 of the first d768 search's 12
+trials landed above 6.5e-3. Once a search has found a cliff, cap the next range below
+it, as the second d768 search does (`log_uniform(3e-4, 1.5e-3)`).
 
-The other searches, the same way:
+The other searches work the same way. Each bottom is flat to within the runs' noise,
+so the best trial alone could sit anywhere on it. A rung's best learning rate is
+therefore the vertex of a parabola in log learning rate, fitted through its trials
+within 3% of its best:
 
 | Rung | active parameters | trials | best trial | its objective | vertex |
 |------|-------------------|--------|------------|---------------|--------|
@@ -429,27 +439,22 @@ The other searches, the same way:
 | 2026, d512 | 32.1M | 12 | 2.31e-3 | 0.6715 | 2.20e-3 |
 | 2026, d768 | 106M | 9, halving | 1.24e-3 | 0.5594 | flat: 1.2e-3 to 3e-3 within 0.07% |
 
-A rung's best learning rate is the vertex of a parabola in log learning rate through
-its trials within 3% of its best: the bottom is flat to within the runs' noise, so the
-best trial alone could sit anywhere on it.
-
-- **For the 2022 family the best learning rate does not move with width**: 1.54e-3 at
-  d512, 1.58e-3 at d768, 1.79e-3 at d1024, a power law of exponent 0.07, which is
-  none within the noise. Under the standard parameterization it falls with
-  width when the init does (LeCun's, $1/\sqrt{d}$), but bux's default init is a normal
-  of 0.02 at every width ([Initialization](../architectures/initialization.md)),
-  which for these widths is the smaller one, and the optimum stays put. The wider
-  rungs, d1280 and d1536, trained at 1.57e-3 and 1.43e-3, within 5% of it: on a bottom
-  this flat, far less than the noise between two runs.
+- **For the 2022 family, the best learning rate does not move with width**: 1.54e-3
+  at d512, 1.58e-3 at d768, 1.79e-3 at d1024, a power law of exponent 0.07, which is
+  zero within the noise. The optimum falls with width when the init does (LeCun's,
+  $1/\sqrt{d}$), but bux's default init is a normal of 0.02 at every width
+  ([Initialization](../architectures/initialization.md)). The wider rungs, d1280 and
+  d1536, trained at 1.57e-3 and 1.43e-3, within 5% of the optimum, which on a bottom
+  this flat costs far less than the noise between two runs.
 - **The 2026 family does not diverge.** Its bottom spans 1e-3 to 7e-3 within 0.5%,
-  and at 2.6e-2, eleven times its best, it loses 7.5%. It has QK-norm and a gate on
-  attention's output, which were introduced for stable training at high learning
-  rates (Dehghani et al., 2023; Qiu et al., 2025), but a ladder of two whole families
-  cannot say which of its differences does it.
+  and at 2.6e-2, eleven times its best, it loses only 7.5%. It has QK-norm and a gate
+  on the attention output, both introduced for stable training at high learning rates
+  (Dehghani et al., 2023; Qiu et al., 2025). A ladder of two whole families cannot
+  say which of its differences is responsible.
 
-The 2026 d768 search halves ([Halving](../training/searching.md#halving)): nine
-trials of a third of the run, then the best three in full, so that a search of a rung
-of 2 GPUs and 79 minutes a run costs six runs, not nine:
+The 2026 d768 search uses halving ([Halving](../training/searching.md#halving)): nine
+trials of a third of the run, then the best three in full. This rung takes 2 GPUs and
+79 minutes per run, and halving makes its search cost six runs instead of nine:
 
 ```console
 search new_ladder[d768]: 9 of 9 trials; objective = 0.5 * code_bpb + 0.3 * repo_bpb + 0.2 * web_bpb; best 0.5594, trial 1
@@ -465,20 +470,18 @@ trial  rung  objective  run
 2      0/1   0.6568     new_ladder[d768, optimizer.lr=0.0172, steps=2696]
 ```
 
-The three that trained in full, from 1.2e-3 to 3e-3, are 0.0007 apart: within the
-noise, so this rung has no vertex to speak of, only a bottom that holds both searched
-widths' optima. The 2026 ladder trains its wider rungs at 2.6e-3, inside it at both.
+The three full trials, from 1.2e-3 to 3e-3, are 0.0007 apart, within the noise: this
+rung has a flat bottom but no vertex to speak of. The 2026 ladder trains its wider
+rungs at 2.6e-3, inside the bottom of both searched widths. The ladder files set every
+searched rung's learning rate to its best trial's, so the ladders train what the
+searches found.
 
-The ladder files write each searched rung's learning rate as its best trial's, and the
-wider rungs' as above, so that the ladders train what the searches found even where
-no search was run.
-
-## 5. The ladders
+## 5. Train the ladders
 
 A ladder is a family at a few widths, each trained as its target would be: on 20
-tokens for every active parameter besides the embeddings. The targets are 6.44B and
-6.54B of them, so both would train on about 130B tokens, which keeps the comparison at
-the same data too. `examples/experiments/old_vs_new/old_ladder.bux`:
+tokens for every active parameter besides the embeddings. The targets have 6.44B and
+6.54B of them, so both would train on about 130B tokens, which keeps the comparison
+at the same data too. `examples/experiments/old_vs_new/old_ladder.bux`:
 
 ```bux
 use old_2022
@@ -491,10 +494,11 @@ optimizer.lr = d512: 1.53e-3 | d768: 1.32e-3 | d1024: 2.26e-3 | d1280: 1.57e-3 |
 mesh         = d512: mesh(data=1) | d768: mesh(data=1) | d1024: mesh(data=2) | d1280: mesh(data=4) | d1536: mesh(data=8)
 ```
 
-The labels zip the five settings into one axis ([Labels zip
-axes](../language/sweeps.md#labels-zip-axes)): five runs, not 5^5. The batch follows the
-batch-size law of DeepSeek LLM (DeepSeek-AI, 2024), `B = 0.292 C^0.327` tokens for C
-FLOPs, rounded to 32 rows, and the mesh gives the wider rungs more GPUs. `new_ladder.bux` is the same for the 2026 family:
+The labels zip the five settings into one axis
+([Labels zip axes](../language/sweeps.md#labels-zip-axes)): five runs, not 5^5. The
+batch follows the batch-size law of DeepSeek LLM (DeepSeek-AI, 2024),
+`B = 0.292 C^0.327` tokens for C FLOPs, rounded to 32 rows, and the mesh gives the
+wider rungs more GPUs. `new_ladder.bux` does the same for the 2026 family:
 
 ```bux
 use new_2026
@@ -507,12 +511,11 @@ optimizer.lr = d512: 2.31e-3 | d768: 1.24e-3 | d1024: 2.6e-3 | d1280: 2.6e-3
 mesh         = d512: mesh(data=1) | d768: mesh(data=2) | d1024: mesh(fsdp=8) | d1280: mesh(fsdp=8)
 ```
 
-The 2026 model's MoE holds 3.5B parameters at `d_model = 1024` and 6.7B at 1280: a
-copy a GPU of them and of AdamW's state, 16 bytes a parameter, does not leave room for
-the 16k phase's activations (`d1024` ran out of memory on 8 copies as the phase began),
-so those rungs split them over the 8 GPUs by FSDP ([Scale out](scale-out.md)). A mesh
-is not in a run's id, so it changes nothing the run computes. `bux plan` shows the
-four:
+At `d_model = 1024` and 1280, the MoE holds 3.5B and 6.7B parameters. A copy of them
+and of AdamW's state on every GPU, at 16 bytes per parameter, leaves no room for the
+activations of the 16k phase (`d1024` ran out of memory when the phase began), so
+these rungs use FSDP over 8 GPUs ([Scale out](scale-out.md)). A mesh is not part of a
+run's id, so this changes nothing the run computes. `bux plan` shows the four rungs:
 
 ```console
 $ bux plan examples/experiments/old_vs_new/new_ladder.bux
@@ -524,20 +527,20 @@ a2652a6bf8  1.5B    2.12B   1.4        1.2B       2     5.59GiB     11.2GiB    0
 c727d3ecc8  6.7B    9.62B   1.4        4.04B      8     3.12GiB     6.24GiB    0%      new_ladder[d1280]
 ```
 
-`tok/param` counts all the parameters, the idle experts too; 20 a token's are the
-budget. Without the searches, launch both ladders whole, each rung at the learning rate
-its file gives:
+`tok/param` counts all the parameters, the idle experts too; the budget is 20 tokens
+per active parameter. If you skip the searches, launch both ladders whole, each rung
+at the learning rate its file gives:
 
 ```sh
 bux launch examples/experiments/old_vs_new/old_ladder.bux
 bux launch examples/experiments/old_vs_new/new_ladder.bux
 ```
 
-After the searches, a searched rung's best trial is already its point: it has the
-rung's id, though not its name, so `bux launch` would train it again in a directory of
-the ladder's name ([Run ids](../training/running.md#run-ids)). The fit of step 6 reads
-every run of a ladder's name, the trials too, and takes each rung's best; launch only
-the rungs no search trained:
+If you ran the searches, launch only the rungs that no search trained. A searched
+rung's best trial already is its point, but under the trial's name, so `bux launch`
+would train the rung again in a directory under the ladder's name
+([Run ids](../training/running.md#run-ids)). `fit.py` (step 6) reads every run with a
+ladder's name, trials included, and takes each rung's best:
 
 ```sh
 bux launch examples/experiments/old_vs_new/old_ladder.bux --only "[d1280]"
@@ -546,7 +549,8 @@ bux launch examples/experiments/old_vs_new/new_ladder.bux --only "[d1024]"
 bux launch examples/experiments/old_vs_new/new_ladder.bux --only "[d1280]"
 ```
 
-Each takes the GPUs of its mesh, and the next waits for room. On one node of 8 B300s:
+Each launch takes the GPUs of its mesh, and the next one waits until there is room. On
+one node of 8 B300s:
 
 | Ladder | rungs at once | wall-clock |
 |--------|---------------|------------|
@@ -567,23 +571,24 @@ Each rung's run, and its held-out bits per byte after its last step:
 | 2026, d1024 | 8 | 98 min | 248M | 0.5009 | 0.4256 | 0.3727 | 0.8814 |
 | 2026, d1280 | 8 | 245 min | 481M | 0.4597 | 0.3874 | 0.3370 | 0.8245 |
 
-The ladders alone already compare the families: at about 100M active parameters, the
-2026 rung's objective is 11% under the 2022 one's (0.5594 at 106M against 0.6268 at
-101M), and the 2026 d768 is better than the 2022 d1280 (0.5594 against 0.5722)
-with half its active parameters.
+The ladders alone already compare the families. At about 100M active parameters, the
+2026 rung scores 11% lower on the objective than the 2022 rung (0.5594 at 106M
+against 0.6268 at 101M). The 2026 d768 even beats the 2022 d1280 (0.5594 against
+0.5722) with half the active parameters.
 
-## 6. The fit, and the two targets
+## 6. Fit and extrapolate
 
 `scripts/old_vs_new/fit.py` reads every finished run under `runs/` whose name is a
-ladder's, the searches' trials too (not a halving rung's, which trains fewer steps),
-and takes each rung's best as its point. It fits each metric of each family as
+ladder's, including the searches' trials (except halving's shortened ones, which
+train fewer steps), and takes each rung's best as its point. It fits each metric of
+each family as
 
 $$L(N) = E + A N^{-\alpha},$$
 
-N the active parameters besides the embeddings, with E shared: the families read the
-same data, whose entropy neither can go below. It minimizes the Huber loss of log L,
-as Hoffmann et al. (2022) did, and gives each prediction the range of the fits that
-leave one rung out:
+where N is the active parameters besides the embeddings, and E is shared: both
+families read the same data, whose entropy neither can go below. It minimizes the
+Huber loss of log L, as Hoffmann et al. (2022) did, and gives each prediction the
+range of the fits that leave one rung out:
 
 ```console
 $ python scripts/old_vs_new/fit.py runs --old 4096 --new 3072 --plot ladder.png
@@ -621,10 +626,10 @@ plot: ladder.png
 plot: ladder-dark.png
 ```
 
-The script fits a learning-rate law to every family with two searched rungs; the 2026
-one goes through the vertex of three trials 0.0007 apart, which is noise, and the
-ladder does not use it. The 2022 prediction is at the top of its range: leaving any
-rung out lowers it, so the fit of all five is the less flattering to the 2022 family.
+The learning-rate laws are fits through the vertices. The 2026 one rests on three
+trials 0.0007 apart, which is noise, and no ladder uses it. The 2022 prediction sits
+at the top of its range: leaving out any rung lowers it, so the full fit is the less
+flattering one for the 2022 family.
 
 ```{image} old-vs-new/ladder.png
 :alt: Each family's objective against its active parameters, its rungs, its fit, and a star at its target
@@ -636,82 +641,91 @@ rung out lowers it, so the fit of all five is the less flattering to the 2022 fa
 :class: only-dark
 ```
 
-The rungs are the dots, each family's fit the line, solid where it has rungs and dashed
-where it extrapolates, and the stars the targets: the 2022 7B, 6.44B parameters a
-token, and the 2026 model of `d_model = 3072`, 91B parameters, 6.54B of them a token.
-Both would train on about 130B tokens, and serve agents as fast as each other.
+The dots are the rungs, the lines each family's fit (solid where it has rungs, dashed
+where it extrapolates), and the stars the targets: the 2022 7B with 6.44B parameters
+per token, and the 2026 model at `d_model = 3072` with 91B parameters, 6.54B of them
+per token. Both would train on about 130B tokens, and both serve agents equally fast.
 
-## 7. What it says, and what it does not
+## 7. Results and caveats
 
-At the same serving cost and the same training data, the ladders predict the 2026 model
-the better one by every measure:
+At the same serving cost and the same training data, the ladders predict that the
+2026 model is better on every measure:
 
 | | 2022, `d_model = 4096` | 2026, `d_model = 3072` | 2026 against 2022 |
 |---|---|---|---|
-| parameters (a token's) | 6.86B (6.44B) | 91.1B (6.54B) | |
-| sessions an hour, 8 at once on a B300 | 892 | 894 | the same |
+| parameters (per token) | 6.86B (6.44B) | 91.1B (6.54B) | |
+| sessions per hour, 8 at once on a B300 | 892 | 894 | the same |
 | objective | 0.410 [0.395, 0.410] | 0.382 [0.379, 0.386] | -6.7% |
 | code files | 0.345 [0.330, 0.345] | 0.323 [0.320, 0.327] | -6.3% |
 | repositories, rows of 16k | 0.307 [0.282, 0.310] | 0.281 [0.278, 0.289] | -8.5% |
 | web text | 0.714 [0.708, 0.718] | 0.663 [0.657, 0.681] | -7.1% |
 
-Bits per byte, each predicted by its family's fit, the leave-one-rung-out range in
-brackets. The ranges part on every measure but the repositories, where they touch.
+The values are bits per byte, each predicted by its family's fit, with the
+leave-one-rung-out range in brackets. The ranges separate on every measure except the
+repositories, where they touch.
 
-- **The gap narrows with scale, and stays.** By the fits, the 2026 family is 10%
-  under the 2022 one at 100M active parameters, and 6.7% at the targets: both near
-  the same entropy E, so the bits between them shrink, though the 2026 family's
-  exponent is the larger (0.33 against 0.30). A token goes through as many
+- **The gap narrows with scale, but stays.** By the fits, the 2026 family is 10%
+  below the 2022 one at 100M active parameters, and 6.7% below at the targets. Both
+  approach the same entropy E, so the bits between them shrink, even though the 2026
+  family's exponent is the larger (0.33 against 0.30). A token goes through as many
   parameters in both, but the 2026 model picks them from 13 times as many.
-- **It gains most on long context.** On whole repositories in rows of 16k its edge is
-  the largest, and it is not only its edge on code: every 2026 rung's bits per byte
-  on repositories are 87 to 89% of its bits on code files, every 2022 rung's 91 to
-  94%, so the 2026 rungs make more of the files before. Hybrid attention, RoPE on a
-  quarter of its channels at a base of 10M, and the Gated DeltaNet's state are all
-  built for it; the 2022 model has RoPE at 10k on every channel, which its long
-  phase has to stretch. The repositories are Python's alone, and the comparison
-  holds the data, not the length, fixed: an eval of the same repositories in rows of
-  2k would part what the long rows add.
-- **It trains more stably**: no learning rate up to 2.6e-2 diverged it, where the
+- **It gains most on long context.** Its edge is largest on whole repositories in
+  rows of 16k, beyond its edge on code. Every 2026 rung's bits per byte on
+  repositories are 87 to 89% of its bits on code files, against 91 to 94% for the
+  2022 rungs, so the 2026 rungs make more use of the files that come before. Hybrid
+  attention, RoPE on a quarter of the channels at base 10M and the DeltaNet's state
+  are built for this; the 2022 model's RoPE at 10k on every channel has to stretch.
+  The repositories are Python only, and an eval of the same repositories in rows of
+  2k would separate what the long rows add.
+- **It trains more stably.** No learning rate up to 2.6e-2 made it diverge, while the
   2022 family diverges above 7e-3.
 
-What the experiment does not say:
+The caveats:
 
-- **The targets are extrapolations**, 19 times past the 2022 ladder's widest rung and
-  14 times past the 2026 one's, from rungs of a single seed, 0.001 to 0.003 apart
-  between two runs at the same point. The leave-one-out ranges are the fits'
-  sensitivity to each rung, not a confidence interval.
+- **The targets are extrapolations**: 19 times past the widest rung of the 2022
+  ladder and 14 times past the widest of the 2026 ladder, from single-seed rungs,
+  where two runs at the same point differ by 0.001 to 0.003. The leave-one-out ranges
+  show the fits' sensitivity to each rung; they are not confidence intervals.
 - **The serving cost is one load on one GPU.** Under tensor parallelism, at other
-  lengths of context or turns, or on other kernels (vLLM's Triton MoE kernels here,
-  as FlashInfer's did not build), the 2026 model the same cost as the 7B would be
-  another width. It also needs 182 GB of the GPU's 275 for its weights, which a
-  smaller GPU does not have.
-- **Each family is one point of a design space.** The 2026 family changes the
-  attention, the mixer, the MoE, the norms and the positions at once; the ladders
+  context lengths or numbers of turns, or with other kernels (vLLM's Triton MoE
+  kernels here, because FlashInfer's did not build), the 2026 model that matches the
+  7B's cost would have another width. Its weights also take 182 GB of the GPU's
+  275 GB, which a smaller GPU does not have.
+- **Each family is one point in a design space.** The 2026 family changes the
+  attention, the mixer, the MoE, the norms and the positions at once. The ladders
   compare the two wholes, not what each change is worth. A sweep of one change at a
   time is the next experiment, and the same files run it.
-- **Only the learning rate is tuned**, per family; the batch follows DeepSeek's law
-  for both, and everything else is either family's own or the recipe's.
-- **Twenty tokens a parameter is a short training.** Models of this size now see
-  hundreds, and how each family's edge moves with the tokens a parameter, ladders all
-  at 20 do not measure.
+- **Only the learning rate is tuned**, per family. The batch follows DeepSeek's law
+  for both, and everything else comes from each family's file or the recipe.
+- **Twenty tokens per parameter is a short training.** Models of this size now see
+  hundreds, and ladders that all train at 20 cannot measure how each family's edge
+  moves with tokens per parameter.
 
-## What it takes
+## Time and hardware
 
 On one node of 8 B300s, each step as written:
 
 | Step | what | time |
 |------|------|------|
 | 3 | the data: Stack v2 Edu converted, FineWeb-Edu downloaded, both packed | 10 min |
-| 2 | the serving benchmark: six models, a GPU each, four loads | 22 min |
+| 2 | the serving benchmark: six models, one GPU each, four loads | 22 min |
 | 4 | the searches: 2022 d512 (20 trials), d768 (18), d1024 (8); 2026 d512 (12), d768 (9, halving) | 7 h 08 min |
 | 5 | the ladders' rungs that no search trained: 2022 d1280 and d1536, 2026 d1024 and d1280 | 7 h 36 min |
 | 6 | the fit | 1 min |
 
-About 15 hours for all of it, a third of them the 2026 family's two widest rungs. The
-searches' results are in the ladder files, so the ladders alone reproduce the fit, in
-9 hours; without the 2026 d1280 rung, the widest and four of those hours, in under 5,
-with a fit of three 2026 rungs.
+All of it takes about 15 hours, a third of them for the two widest rungs of the 2026
+family. The searches' results are already in the ladder files, so the ladders alone
+reproduce the fit in 9 hours. Without the 2026 d1280 rung, the widest and four of
+those hours, it takes under 5, with a fit of three 2026 rungs.
+
+## Next steps
+
+- Sweep one change of the 2026 family at a time on its ladder: the experiment the
+  caveats call for, with the same files.
+- [Searching hyperparameters](../training/searching.md): dimensions, methods and
+  halving.
+- [Exporting models](../export/index.md) and [Serving in vLLM](../export/vllm.md):
+  take a trained run to transformers and vLLM.
 
 ## References
 
@@ -724,7 +738,7 @@ with a fit of three 2026 rungs.
   [arXiv:2412.19437](https://arxiv.org/abs/2412.19437): 256 fine-grained experts, 8
   routed and 1 shared.
 - Hoffmann et al. (2022), *Training Compute-Optimal Large Language Models*,
-  [arXiv:2203.15556](https://arxiv.org/abs/2203.15556): 20 tokens a parameter, and
+  [arXiv:2203.15556](https://arxiv.org/abs/2203.15556): 20 tokens per parameter, and
   the fit.
 - Kandpal et al. (2025), *The Common Pile v0.1*,
   [arXiv:2506.05209](https://arxiv.org/abs/2506.05209): Stack v2 Edu.

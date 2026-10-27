@@ -1,10 +1,10 @@
 # Adding a layer
 
 This page is the reference for extending bux's model: everything a new layer can
-declare and use, from its config to its kernels. A new layer takes two pieces, a
-**config** in `bux/config.py` and a **builder** registered for its type, and then
-every `.bux` file can call it. For a guided walk through one, see the tutorial
-[Add a layer](../tutorials/add-a-layer.md); this page lists every hook it touches.
+declare and use, from its config to its kernels. A new layer is two pieces, a
+**config** in `bux/config.py` and a **builder** registered for its type; then every
+`.bux` file can call it. For a guided walk through one, see the tutorial
+[Add a layer](../tutorials/add-a-layer.md). This page lists every hook it touches.
 
 ## The two pieces at a glance
 
@@ -80,8 +80,8 @@ these docs all read it.
   it is the layer's name in `.bux`. One class may carry several tags, as
   `NormalizationConfig` does for `layernorm` and `rmsnorm`
   (`type: Literal["layernorm", "rmsnorm"]`).
-- Add the class to the `LayerConfig` union. The union is a pydantic discriminated
-  union that `ir.Layer` and the compiler fix as they load, so a layer config can only
+- Add the class to the `LayerConfig` union. It is a pydantic discriminated union
+  that `ir.Layer` and the compiler fix when they load, so a layer config can only
   come from `bux/config.py`.
 - A config that parametrizes layers but is not one, as `rope` or `indexer`, goes in
   the `SubConfig` union instead.
@@ -124,23 +124,22 @@ Field types are what the compiler checks values against, where they are written:
 
 A shared base class groups fields: `QuadraticAttentionConfig` holds what `gqa`,
 `mla` and `csa` share, and `LinearAttentionConfig` what the linear attentions
-share. Subclassing `AttentionConfig` marks a layer as a token mixer, which the
-layers that start their parameters by depth among the model's token mixers count
-(`lightning`, `rwkv7`).
+share. Subclassing `AttentionConfig` marks a layer as a token mixer. Layers that start
+their parameters by their depth among the model's token mixers (`lightning`,
+`rwkv7`) count it.
 
 Fields that must agree with each other are checked by a validator on the config,
-whose error the compiler reports at the setting: `gqa`'s `num_kv_heads` must divide
-its `num_heads`.
+and the compiler reports its error at the setting: `gqa`'s `num_kv_heads` must divide
+its `num_heads`, for example.
 
 ### A new field on an existing layer
 
-A run's id hashes its layers' settings, so a field added to a layer would change the
-id of every run that uses it, and a run of the tree before could not resume. Give the
-field a default that computes as the layer did before it, and list that default in
-`bux.lang.ir._NEWER_LAYER_FIELDS`: a field at that value is left out of the id. That
-is how `up_offset` (0), `router_bias` (false) and `mamba2`'s `num_heads` (none) came
-in, and every run of `examples/` kept its id ([Run ids](../training/running.md#run-ids)).
-A training setting's new field goes in `_NEWER_FIELDS` the same way.
+A run's id hashes its layers' settings, so a new field would change the id of every
+run that uses the layer, and those runs could no longer resume. Give the field a
+default that computes what the layer computed before, and list that default in
+`bux.lang.ir._NEWER_LAYER_FIELDS`: a field at that value is left out of the id, as
+`gated_mlp`'s `up_offset=0` is ([Run ids](../training/running.md#run-ids)). A training
+setting's new field goes in `_NEWER_FIELDS` the same way.
 
 ### Ports
 
@@ -277,17 +276,20 @@ from bux.architecture import observe
 observe.stat(taps, "mine/gate_mean", gate.mean())
 ```
 
-It is logged by layer, `mine/gate_mean/attn.03`, on the steps a run's `observe` setting
-picks, with no gradient, and the other steps hold no code of it. Work only an
-observation needs goes under `if observe.observing(taps):`.
+It is logged per layer, as `mine/gate_mean/attn.03`, on the steps a run's `observe`
+setting picks, with no gradient; the other steps compile without it. Put work that
+only an observation needs under `if observe.observing(taps):`.
 
 ### State that is not trained by gradients
 
 Keep it in an `nnx.Variable`, not an `nnx.Param`: no optimizer trains it, and
 checkpoints keep it. A module that updates it from the batch, as an MoE moves its
-router bias, follows the `StepEndUpdate` protocol of `bux.train.trainer`: a training
-step sets its `update_at_step_end`, its forwards only count what they see, and the
-trainer calls its `step_end_update()` once after all of a step's microbatches.
+router bias, follows the `StepEndUpdate` protocol of `bux.train.trainer`:
+
+- a training step sets its `update_at_step_end`;
+- its forward passes only count what they see;
+- the trainer calls its `step_end_update()` once, after all of a step's
+  microbatches.
 
 ## Names for sharding
 
@@ -306,12 +308,12 @@ self.sinks = nnx.Param(jnp.zeros(h), names=("heads",))
 q = parallel.shard(q, "batch", "seq", "heads", None)
 ```
 
-`parallel.named` starts a kernel as the model's `init` says, by the role its names
-give it: one whose last name is `embed` writes back to the stream, `out`
-([Initialization](initialization.md)). Pass `init=` for a start of the layer's own,
+`parallel.named` starts a kernel as the model's `init` says for the role its names
+give it: a kernel whose last name is `embed` writes back to the stream, so it is an
+`out` ([Initialization](initialization.md)). Pass `init=` for the layer's own start,
 such as zeros or a decay, which it keeps whatever the model's `init`. A weight matrix
-made by hand starts by `bux.initializers.weight(role)`, and
-`bux.initializers.weight(role, own=...)` starts one the layer's own way unless the
+made by hand starts by `bux.initializers.weight(role)`.
+`bux.initializers.weight(role, own=...)` starts it the layer's own way unless the
 file sets an `init`, as Gated DeltaNet-2 starts its projections from Xavier's.
 
 The names are the fields of `layout`, a closed set; any other is an error:
@@ -359,7 +361,7 @@ the fields of `roles`:
 | `mlp` | MLPs, the shared experts too |
 | `experts` | the routed experts |
 | `latent` | LatentMoE's projections to and from its latent |
-| `recurrence` | the recurrent mixers' projections, but the output |
+| `recurrence` | the recurrent mixers' projections, except the output |
 | `recurrence_out` | their output projection |
 | `mtp` | `nextn`'s projection, and every branch after the first head |
 
@@ -394,7 +396,7 @@ The names bux's layers use:
 | `experts` | an MoE's grouped products |
 
 A name covers those under it, so `attention` is all three of attention's. A new name
-works in `remat(save=[...])` as it is.
+works in `remat(save=[...])` with no other change.
 
 ## Optimizer attributes
 
@@ -447,17 +449,18 @@ in full:
   `unsupported(c, ...)`; it is never ignored. Settings that only matter in training
   (dropout, a loss's weight) are, and its docstring says so.
 - **State while decoding.** A layer that keeps state says its cache's kind in
-  `cache_type(c)` and takes `ctx.cache_slot()` once a call; `hf/conv.py` is the
+  `cache_type(c)` and takes `ctx.cache_slot()` once per call; `hf/conv.py` is the
   worked example, left padding included. A layer that reads attention masks lists
   them in `masks(c)`.
-- **Runs where transformers does.** It imports only torch and transformers, each
-  other relatively, and parses on Python 3.10: transformers loads it as remote code.
+- **Runs where transformers does.** It imports only torch, transformers and its
+  sibling modules (relatively), and parses on Python 3.10: transformers loads it as
+  remote code.
 
-`check.compare(arch).check()` tests it, against bux, on perturbed weights: the same
-logits, the same greedy tokens with and without the cache, and left-padded batches as
-each prompt alone. Each family of layers has its own `tests/test_export_*.py`, and
-`tests/test_export_zoo.py` keeps a table of the zoo's models that do not export yet,
-by what they lack: a model that comes to export leaves it.
+`check.compare(arch).check()` tests it against bux on perturbed weights: the same
+logits, the same greedy tokens with and without the cache, and left-padded batches
+that match each prompt run alone. Each family of layers has its own
+`tests/test_export_*.py`. `tests/test_export_zoo.py` keeps a table of the zoo's models
+that do not export yet, by what they lack; remove a model from it once it exports.
 
 ## Testing
 

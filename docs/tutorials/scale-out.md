@@ -1,10 +1,10 @@
 # Scale out
 
-In this tutorial you split one run over many devices. On your laptop, a CPU stands in
-for 8 devices, and you train a tiny hybrid model six ways: data parallel, FSDP,
-tensor, expert, context and pipeline parallel. All six end on the same loss. Then you
-read what changes on a node of GPUs and on many nodes: the same three settings, at
-other sizes, and a launcher that runs the same command on every host.
+Split one run over many devices. On your laptop, the CPU stands in for 8 devices,
+and you train a tiny hybrid model six ways: data, FSDP, tensor, expert, context and
+pipeline parallel. By the end you will have seen all six end on the same loss, and
+you will know what changes on a node of GPUs and on many nodes: the same three
+settings at other sizes, and the same command on every host.
 
 Only the laptop part runs here. It builds on [Train on a laptop](train-on-a-laptop.md).
 
@@ -18,14 +18,14 @@ A run splits over devices by three settings:
 | {bux}`layout`  | which mesh axes each named dimension (`batch`, `heads`, `mlp`, `experts`, ...) splits over | see [Layout](../parallelism/layout.md) |
 | {bux}`methods` | how each part that communicates is computed, by name             | the one-device code     |
 
-None of them changes what the run computes, so none is in its id: a sweep over meshes
-is several runs with one id, and a run resumes on another mesh. `data` takes the
-devices the other axes leave.
+None of them changes what the run computes, so none is part of its id. A sweep over
+meshes is several runs with one id, and a run can resume on another mesh. `data`
+takes whatever devices the other axes leave.
 
 ## 2. Give your CPU eight devices
 
-JAX sees one CPU device by default. An XLA flag makes it split the CPU into several,
-which is how bux's own tests check every kind of parallelism on a laptop:
+JAX sees one CPU device by default. An XLA flag splits the CPU into several, which
+is how bux's own tests check every kind of parallelism on a laptop:
 
 ```sh
 export XLA_FLAGS=--xla_force_host_platform_device_count=8
@@ -87,8 +87,8 @@ methods = dp:   methods
         | pp:   methods(repeat=scan, microbatches=4)
 ```
 
-The three settings share their labels, so they are one axis of six runs, each taking
-the mesh, layout and methods of its label:
+The three settings share their labels, so they form one axis of six runs. Each run
+takes the mesh, layout and methods of its label:
 
 | run    | mesh                     | what splits                                                   |
 |--------|--------------------------|---------------------------------------------------------------|
@@ -101,7 +101,7 @@ the mesh, layout and methods of its label:
 
 ## 4. Plan it
 
-`bux plan` builds each run's model from shapes alone over an abstract mesh, so it
+`bux plan` builds each run's model from shapes alone, over an abstract mesh, so it
 needs neither the devices nor the flag:
 
 ```console
@@ -117,11 +117,12 @@ id          params  tokens  tok/param  flops/tok  gpus  params/gpu  optim/gpu  b
 ```
 
 - Every run has the same id, `8944944995`: they compute the same thing.
-- `params/gpu` is what a device holds. DDP copies everything (1.89 MiB); FSDP splits
-  it 8 ways (243 KiB). Under `cp`, FSDP's axes take `context` too, so the 4 context
-  devices split the parameters and the 2 data copies keep them whole (485 KiB).
-- `bubble` is the share of a step a pipeline's stages idle: (S - 1) / (M + S - 1) =
-  1 / 5 for 2 stages and 4 microbatches.
+- `params/gpu` is what each device holds. DDP copies everything (1.89 MiB); FSDP
+  splits it 8 ways (243 KiB). Under `cp`, FSDP's axes include `context`, so the 4
+  context devices split the parameters, and each of the 2 data copies holds them
+  whole (485 KiB).
+- `bubble` is the share of a step that a pipeline's stages sit idle:
+  (S - 1) / (M + S - 1) = 1 / 5 for 2 stages and 4 microbatches.
 
 ## 5. Train it
 
@@ -143,10 +144,10 @@ laptop[pp] step 10/10  loss 6.2562  lr 1.00e-03  grad 0.800  5,679 tok/s  ...
 ```
 
 All six end on the same loss and gradient norm, to the digits printed. Rounding
-differs between splits, and an MoE's top-k picks amplify it as a run goes on, so
-longer runs drift apart slowly. `methods.stages = [1, 1]` is the split of the two
-`"DA"` passes into stages that training chose, balancing the stages' FLOPs. Each run
-trains into a directory of its own, as their names differ:
+differs between splits, and an MoE's top-k choices amplify it as a run goes on, so
+longer runs slowly drift apart. `methods.stages = [1, 1]` is how training split the
+two `"DA"` passes into stages, balancing their FLOPs. Each run trains into its own
+directory, because their names differ:
 
 ```console
 $ ls -1d runs/laptop*
@@ -159,22 +160,22 @@ runs/laptop_tp-8944944995
 ```
 
 :::{note}
-The run says `precision(compute=float32)` because XLA:CPU cannot compile the
-bfloat16 sums an MoE's methods (but `dense`) and a pipeline make across devices. bux
-stops with that advice before it would crash. On GPUs, train in bfloat16, the
-default.
+The run sets `precision(compute=float32)` because XLA:CPU cannot compile the
+bfloat16 sums across devices that a pipeline and every MoE method except `dense`
+make. bux stops with that advice before it would crash. On GPUs, train in bfloat16,
+the default.
 :::
 
 ## 6. On a node of GPUs
 
 On GPUs the settings are the same, at real sizes. `bux launch` gives a run the GPUs
 its mesh needs (`CUDA_VISIBLE_DEVICES` says which), and trains a sweep's runs side by
-side on groups of free GPUs. `bux plan` shows each run's bytes a GPU before you
+side on groups of free GPUs. `bux plan` shows each run's memory per GPU before you
 launch it, on any machine. Each file in `examples/experiments/parallel/` is a run:
 
-**FSDP.** `fsdp_8b.bux` trains Llama 3 8B at its full size over 8 GPUs, in bfloat16,
-its 32 blocks scanned (one compiled block) and rematerialized, each step in 4
-microbatches:
+**FSDP.** `fsdp_8b.bux` trains Llama 3 8B at full size over 8 GPUs, in bfloat16. Its
+32 blocks are scanned (one compiled block) and rematerialized, and each step runs in
+4 microbatches:
 
 ```bux
 use llama3_8b
@@ -192,8 +193,8 @@ id          params  tokens  tok/param  flops/tok  gpus  params/gpu  optim/gpu  b
 c548b8d54b  8.03B   10B     1.2        48.7B      8     3.74GiB     7.48GiB    0%      fsdp_8b
 ```
 
-**Which split is fastest?** `mesh_sweep.bux` trains a 1B Llama five ways over 8 GPUs
-with one id, so you compare their `tokens_per_s` in each run's `metrics.jsonl`:
+**Which split is fastest?** `mesh_sweep.bux` trains a 1B Llama five ways over 8 GPUs,
+all with one id, so you can compare `tokens_per_s` in each run's `metrics.jsonl`:
 
 ```console
 $ bux plan examples/experiments/parallel/mesh_sweep.bux
@@ -206,11 +207,11 @@ id          params  tokens  tok/param  flops/tok  gpus  params/gpu  optim/gpu  b
 03359bea6e  1.27B   13.1M   0.0        8.02B      8     605MiB      1.18GiB    0%      mesh_sweep[tp]
 ```
 
-ZeRO-1 (`layout(zero=1)`) splits only the optimizer's state, and HSDP
-(`mesh(data=2, fsdp=4)`) splits within groups of 4 and copies across 2.
+ZeRO-1 (`layout(zero=1)`) splits only the optimizer state. HSDP
+(`mesh(data=2, fsdp=4)`) splits within groups of 4 and keeps 2 copies.
 
-**Experts.** `ep_moe.bux` is a 16B DeepSeek-V3-shaped MoE over 16 GPUs (two nodes):
-each GPU of a node holds 8 of the 64 experts, and FSDP spans the nodes:
+**Experts.** `ep_moe.bux` is a 16B DeepSeek-V3-shaped MoE over 16 GPUs (two nodes).
+Each GPU of a node holds 8 of the 64 experts, and FSDP spans the nodes:
 
 ```bux
 mesh      = mesh(fsdp=2, expert=8)
@@ -223,8 +224,9 @@ methods   = methods(moe=all_gather, repeat=scan, remat=dots)
 `nccl_ep` ([Experts](../parallelism/experts.md)).
 
 **A pipeline.** `pp_70b.bux` puts Llama 3 70B on 4 nodes of 8 GPUs: tensor parallel
-within a node, and a circular pipeline of 4 stages across them, each node holding 20
-of the 80 blocks in two rounds of 10, a step's 256 rows in 16 microbatches:
+within a node, and a circular pipeline of 4 stages across the nodes. Each node holds
+20 of the 80 blocks, in two rounds of 10, and a step's 256 rows go through in 16
+microbatches:
 
 ```bux
 mesh      = mesh(stage=4, tensor=8)
@@ -241,8 +243,9 @@ id          params  tokens  tok/param  flops/tok  gpus  params/gpu  optim/gpu  b
 34e7f5a8ac  70.6B   10B     0.1        429B       32    8.95GiB     17.9GiB    9%      pp_70b
 ```
 
-A stage idles (S - 1) / (R·M + S - 1) = 3 / 35 of a step. `tp_70b.bux` trains the
-same model with FSDP across the nodes in place of the pipeline, and has the same id.
+A stage sits idle for (S - 1) / (R·M + S - 1) = 3 / 35 of a step. `tp_70b.bux` trains
+the same model with FSDP across the nodes instead of the pipeline, and has the same
+id.
 
 **Long rows.** `long_context.bux` splits each 64k-token row 8 ways over `context`:
 `methods(attention=ring, recurrence=pass_state)`.
@@ -257,17 +260,17 @@ same model with FSDP across the nodes in place of the pipeline, and has the same
 
 ## 7. On many nodes
 
-A run alone trains on many hosts when the environment says how many processes there
+A single run trains on many hosts when the environment says how many processes there
 are: under Slurm's `srun` or Open MPI's `mpirun`, or with `JAX_COORDINATOR_ADDRESS`
-(process 0's `host:port`), `JAX_NUM_PROCESSES` and `JAX_PROCESS_ID` set on each.
-Every process runs the same command, and they join through `jax.distributed`. Under
-Slurm and Open MPI, start a task a GPU:
+(the `host:port` of process 0), `JAX_NUM_PROCESSES` and `JAX_PROCESS_ID` set on each
+host. Every process runs the same command, and they join through `jax.distributed`.
+Under Slurm and Open MPI, start one task per GPU:
 
 ```sh
 srun --nodes=4 --ntasks-per-node=8 bux launch speedrun.bux   # 32 GPUs, one mesh
 ```
 
-or, with a process a host and the variables set by hand:
+or, with one process per host and the variables set by hand:
 
 ```sh
 JAX_COORDINATOR_ADDRESS=10.0.0.1:12355 JAX_NUM_PROCESSES=2 JAX_PROCESS_ID=0 \
@@ -277,19 +280,19 @@ JAX_COMPILATION_CACHE_DIR=/shared/bux-cache \
 
 What to know:
 
-- The mesh spans every process's devices, each node holding a block of the innermost
-  axes, so `tensor` stays within a node. `mesh(data=2, fsdp=8)` on two nodes of 8 is
-  HSDP: FSDP within a node, a copy on each.
+- The mesh spans the devices of every process. Each node holds a block of the
+  innermost axes, so `tensor` stays within a node. `mesh(data=2, fsdp=8)` on two
+  nodes of 8 is HSDP: FSDP within each node, and a copy on each.
 - Each process reads only the rows of a batch that its devices hold.
-- `--out` and `JAX_COMPILATION_CACHE_DIR` belong on a filesystem every host mounts:
-  every process writes its part of a checkpoint, and the processes must agree on
-  what the compile cache holds (bux turns off a cache that is each host's own).
+- `--out` and `JAX_COMPILATION_CACHE_DIR` belong on a filesystem that every host
+  mounts. Every process writes its part of a checkpoint, and the processes must agree
+  on what the compile cache holds (bux turns off a cache that is local to each host).
 - A signal to any process stops them all after the same step.
-- A sweep does not train on many hosts: give each run a job of its own with
-  `--index N`, as `--index $SLURM_ARRAY_TASK_ID` in an array job.
+- A sweep does not train across many hosts: give each run its own job with
+  `--index N`, such as `--index $SLURM_ARRAY_TASK_ID` in an array job.
 
 [Many nodes](../parallelism/multi-node.md) has the details and measurements, and
-[Launching](../training/launching.md) the launcher.
+[Launching](../training/launching.md) covers the launcher.
 
 ## What you learned
 
@@ -303,5 +306,9 @@ What to know:
 | `mesh(stage=2)`, `methods(repeat=scan, microbatches=4)` | a pipeline                              |
 | `srun ... bux launch run.bux`                    | one run over many hosts                        |
 
-The [parallelism guide](../parallelism/index.md) explains each method, and
-[Performance](../performance/index.md) how to make a run fast.
+## Next steps
+
+- [Old against new at the same serving cost](old-vs-new.md): the advanced tutorial,
+  which puts the earlier ones together on a node of 8 GPUs.
+- [Parallelism](../parallelism/index.md): each method in depth.
+- [Performance](../performance/index.md): how to make a run fast.

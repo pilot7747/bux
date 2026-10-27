@@ -1,9 +1,13 @@
 # Definitions, macros, patterns and sharing
 
-This page covers how a `.bux` file names things: definitions of layers, blocks and
-values; macros, which take parameters; patterns, which spell a sequence of
-one-letter definitions; `shared`, which makes every use of a definition one module;
-and tied heads. Read it to factor a model into reusable pieces.
+Definitions let you write each piece of a model once: a layer with its settings, a
+block, a value. On top of them:
+
+- a **macro** takes parameters and builds a new block at every call;
+- a **pattern** spells a sequence of one-letter definitions, `"DDDA"`;
+- **`shared`** makes every use of a definition one module, with one set of weights.
+
+Read this page to factor a model into reusable pieces. It ends with tied heads.
 
 ## Example: Qwen3-Next
 
@@ -29,7 +33,7 @@ model = embed "DDDA"^12 norm @h out mtp
 ```
 
 This is `examples/architectures/qwen3_next.bux`. `layer` is a macro that builds a
-block around any mixer. `D` and `A` are the two layers it makes, and the pattern
+block around any mixer, and `D` and `A` are the two layers it makes. The pattern
 `"DDDA"^12` lays out 12 groups of three Gated DeltaNet layers and one attention
 layer. `out` is `shared`, so the main head and the multi-token prediction head are
 one module.
@@ -62,24 +66,25 @@ hidden = 4 * d_model // 3                  # a number
   with its own parameters, unless the definition is [shared](#sharing-shared).
 - **Calling a definition overrides its settings.** `attn(sliding_window_size=1024)`
   is `attn` with one setting changed, and dotted keys reach into nested settings:
-  `attn(rope.base=1000000)`. Only layers and settings can be called this way. A block
-  that takes arguments is a [macro](#macros).
+  `attn(rope.base=1000000)`. Only layers and settings can be called this way. For a
+  block that takes arguments, write a [macro](#macros).
 - **Inside its own definition, a name means what it replaces.** `mlp = mlp(...)`
   calls the builtin `mlp`. When a [module](modules.md#layering-and-late-binding)
   defines `ffn`, `ffn = ffn(intermediate_size=2048)` changes one setting of that
-  `ffn`. With neither below it, a self-reference is a cycle.
+  `ffn`. With neither a builtin nor a module's definition to replace, a
+  self-reference is a cycle.
 - **One definition per name in a file.** Defining a name twice in one file is an
   error. Across files, and from the command line, a later definition replaces an
   earlier one ([Modules](modules.md)).
 - **Names.** A definition's name is any identifier except the keywords `true`,
   `false`, `none`, `shared` and `_`. It may shadow a builtin, as `mlp = mlp(...)`
-  does; then every `mlp` written anywhere in the program, modules included, means
-  the definition. A few names are settings with a meaning of their own: `model`,
+  does. Then every `mlp` written anywhere in the program, modules included, means
+  the definition. A few names are settings with their own meaning: `model`,
   `d_model`, `vocab_size`, `residual`, `init` and the training settings
   ([Top-level settings](values.md#top-level-settings)).
 
-A definition's name also labels what it builds: `bux render` draws a labeled block as
-`┤block├` and then draws the block itself below, and `bux fmt` prints it back as a
+A definition's name also labels what it builds. `bux render` draws a labeled block as
+`┤block├` and draws the block itself below, and `bux fmt` prints it back as a
 definition.
 
 (lang-macros)=
@@ -100,13 +105,14 @@ K = layer(attn_kv(16))
 The rules:
 
 - **Parameters.** Parameters without a default come first. A default can use the
-  parameters before it: `kv=n // 4`.
+  parameters before it: `kv=n // 4`. A macro may have none: `pre() = [norm attn]`,
+  called as `pre()`.
 - **Arguments.** Pass arguments by position, by name, or both: `layer(attn, dense)`,
   `layer(mixer=attn, ffn=dense)`. Too many arguments, an unknown name, a parameter
   given twice and a missing argument are errors.
 - **Fresh at every call.** Each call evaluates the body again, so each call has its
   own parameters.
-- **Scope.** The body sees its parameters and the program's definitions; a parameter
+- **Scope.** The body sees its parameters and the program's definitions. A parameter
   hides a definition of the same name.
 - **Macros are values.** A macro can be passed to another macro:
   `twice(f, x) = f(x) f(x)`, then `twice(layer, attn)`.
@@ -120,15 +126,15 @@ The rules:
     |               ^^^^^
   ```
 
-- **Blocks take no arguments.** Calling a plain block is an error, with the hint to
-  make it a macro: `'block' is a block and takes no arguments`.
-- **No recursion.** A macro that calls itself has no way to stop, and more than 64
+- **Blocks take no arguments.** Calling a plain block is an error,
+  `'block' is a block and takes no arguments`, with a hint to make it a macro.
+- **No recursion.** A macro that calls itself has no way to stop, so more than 64
   nested calls is an error.
 - **Reserved names.** `model`, `d_model`, `vocab_size`, `residual`, `init` and the
   training settings cannot be macros.
 
-A macro call is labeled by its text. `bux render` draws DeepSeek-V3's
-`layer(dense)^3 layer(experts)^58` as two blocks:
+A macro call is labeled by its text. `bux render` draws
+`layer(dense)^3 layer(experts)^58`, the model of DeepSeek-V3, as two blocks:
 
 ```text
 model
@@ -160,7 +166,7 @@ a = layer(attn, dense)
 model = embed "mMmM aMmM"^4 norm head      # Jamba: 1 attention in 8, MoE every other layer
 ```
 
-- Each letter is a top-level definition of one letter, upper or lower case.
+- Each letter names a one-letter top-level definition, upper or lower case.
 - Spaces inside a pattern are ignored; use them to group.
 - A pattern is a block like any other, so it repeats: `"DDDA"^12`.
 - As a setting's value, a string is a string, `tokenizer(name="gpt2")`, not a
@@ -181,8 +187,8 @@ error: pattern letter 'M' is not a one-letter definition
 (lang-shared)=
 ## Sharing: `shared`
 
-`shared` makes a definition a single module: every use of it, including each pass of
-a `^n`, has the same parameters. Each use of a plain definition gets fresh ones.
+`shared` makes a definition a single module. Every use of it, including each pass of
+a `^n`, has the same parameters, where each use of a plain definition gets fresh ones.
 
 ```bux
 m = [norm ssm]
@@ -192,10 +198,10 @@ h = [(_ + sa linear(features=d_model)) norm ssm]
 model = embed (m^5 h)^6 m^2 norm head(tied=true)
 ```
 
-This is Zamba2 (`examples/architectures/zamba2.bux`): one transformer block, `sa`,
-runs before every sixth Mamba-2 layer, each time with its own `linear` but always
-with the same weights in `sa`. ALBERT-style weight sharing is `shared block = ...`
-and `block^12`.
+This is Zamba2 (`examples/architectures/zamba2.bux`). One transformer block, `sa`,
+runs before every sixth Mamba-2 layer. Each time it has its own `linear`, but `sa`
+keeps the same weights. ALBERT-style weight sharing is `shared block = ...` and
+`block^12`.
 
 The rules:
 
@@ -215,7 +221,7 @@ The rules:
 
   Calling it with only [ports](skip-connections.md#internal-tensors-ports) is fine,
   if every use takes the same ones, and an [amendment](modules.md#amendments)
-  changes the one module.
+  changes the shared module itself.
 - **Same widths everywhere.** Every use of a shared block must see the same widths:
   `shared 'lin' is used where it would need different widths`. A merge that the
   compiler puts before a shared layer is not part of it.
@@ -238,4 +244,4 @@ a tied head needs exactly one `embed`:
 error: a tied head needs exactly one embedding, found 0
 ```
 
-The same holds for {bux}`nextn`, which also reads the embedding.
+{bux}`nextn` also reads the embedding, so it has the same rule.

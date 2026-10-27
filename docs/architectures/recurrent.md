@@ -1,14 +1,15 @@
 # Linear attention and state-space models
 
-This page covers bux's recurrent token mixers: linear attention (`gla`, `deltanet`,
-`gdn`, `kda`, `gdn2`, `lightning`), RWKV-7 (`rwkv7`), the state-space models `mamba`
-and `mamba2`, and the short convolutions `conv` and `short_conv`. Each keeps a state
-that it updates token by token, so its cost grows linearly with the sequence. Read it
-to choose a mixer, to see the recurrence a setting changes, or to build a hybrid with
-softmax attention.
+Recurrent token mixers keep a fixed-size state and update it token by token, so their
+cost grows linearly with the sequence instead of quadratically. bux has linear
+attention (`gla`, `deltanet`, `gdn`, `kda`, `gdn2`, `lightning`), RWKV-7 (`rwkv7`),
+the state-space models `mamba` and `mamba2`, and the short convolutions `conv` and
+`short_conv`. Read this page to choose a mixer, to see the recurrence a setting
+changes, or to build a hybrid with softmax attention. Qwen3-Next runs three Gated
+DeltaNet layers for every gated attention layer (abridged from
+`examples/architectures/qwen3_next.bux`):
 
 ```bux
-# Qwen3-Next: three Gated DeltaNet layers for every gated attention layer
 delta = gdn(num_heads=16, num_v_heads=32, head_dim=128)
 attn  = gqa(num_heads=16, num_kv_heads=2, head_dim=256, gated=true, qk_norm=norm,
             rope=rope(base=10000000, fraction=0.25))
@@ -34,8 +35,8 @@ model = embed "DDDA"^12 norm @h out mtp
 | [`conv`](#conv-causal-depthwise-convolution) | a causal depthwise convolution | | Canon layers; Inkling |
 | [`short_conv`](#short_conv-gated-short-convolution) | a double-gated short convolution | | LFM2 |
 
-Every state is zero at the start of every document, so a row packed with several
-documents gives each what it gives alone.
+Every state is zero at the start of every document, so each document in a packed row
+gets the same output it would get alone.
 
 ## Linear attention
 
@@ -50,7 +51,7 @@ S_t = \mathrm{diag}(w_t)\, S_{t-1} + b_t \left(a_t^\top S_{t-1}\right) + k_t v_t
 $$
 
 with a decay $w_t \in (0, 1]$ per key channel or one per head. Without $a$ and $b$ it
-is decayed linear attention. The $b\, a^\top$ term is how the delta rule writes over
+is decayed linear attention. The $b\, a^\top$ term is how the delta rule overwrites
 what $S$ holds at a key, and RWKV-7 generalizes it. The layers differ in how they make
 $q$, $k$, $v$, $w$, $a$ and $b$ from the input.
 
@@ -69,16 +70,26 @@ $q$, $k$, $v$, $w$, $a$ and $b$ from the input.
 | `output_gate` | `swish` | the gate on the output norm before the output projection, `swish` or `sigmoid`; `none` turns it off |
 | `norm_eps` | `1e-6` | the epsilon of the output norm (Qwen3-Next: 1e-6; Kimi Linear and fla: 1e-5) |
 
-A layer projects q, k and v from its input, convolves them (with `conv_size`) and
-applies SiLU, runs the recurrence, then RMS-normalizes each head's output, multiplies
-it by `output_gate`'s activation of a projection of the input (the gated norm of
-Qwen3-Next and fla), and projects back to the width. The defaults some layers change
-are in their sections.
+A layer runs in five steps:
+
+1. Project q, k and v from the input, convolve them (with `conv_size`), and apply
+   SiLU.
+2. Run the recurrence.
+3. RMS-normalize each head's output.
+4. Multiply it by `output_gate`'s activation of a projection of the input (the gated
+   norm of Qwen3-Next and fla).
+5. Project back to the width.
+
+Some layers change these defaults; their sections say how.
 
 ### `gla`: gated linear attention
 
 Gated linear attention (Yang et al., 2024), as fla has it: linear attention with a
-decay per key channel and no delta rule,
+decay per key channel and no delta rule ({bux}`gla`).
+
+```bux
+mixer = gla(num_heads=4, head_dim=64)
+```
 
 $$
 S_t = \mathrm{diag}(w_t)\, S_{t-1} + k_t v_t^\top, \qquad
@@ -87,16 +98,16 @@ $$
 
 where $f_t$ is a low-rank projection of the input with a bias (`gate_rank`, 16), and
 $q$ is scaled by $d_k^{-1/2}$. Its `conv_size` defaults to `none`, and without a conv
-q, k and v do not go through SiLU. See {bux}`gla`.
-
-```bux
-mixer = gla(num_heads=4, head_dim=64)
-```
+q, k and v skip the SiLU.
 
 ### `deltanet`
 
-DeltaNet (Schlag et al., 2021; Yang et al., 2024), as fla has it. Each token moves
-what the state holds at its key a step $\beta_t$ toward its value:
+DeltaNet (Schlag et al., 2021; Yang et al., 2024), as fla has it ({bux}`deltanet`).
+Each token moves what the state holds at its key a step $\beta_t$ toward its value:
+
+```bux
+mixer = deltanet(num_heads=4, head_dim=64)
+```
 
 $$
 S_t = \left(I - \beta_t k_t k_t^\top\right) S_{t-1} + \beta_t k_t v_t^\top,
@@ -104,16 +115,17 @@ S_t = \left(I - \beta_t k_t k_t^\top\right) S_{t-1} + \beta_t k_t v_t^\top,
 $$
 
 on L2-normalized $q$ and $k$, with $q$ scaled by $d_k^{-1/2}$ and one $\beta$ per value
-head. See {bux}`deltanet`.
-
-```bux
-mixer = deltanet(num_heads=4, head_dim=64)
-```
+head.
 
 ### `gdn`: Gated DeltaNet
 
 Gated DeltaNet (Yang et al., 2025), as transformers' Qwen3-Next and fla have it:
-DeltaNet with a decay per value head,
+DeltaNet with a decay per value head ({bux}`gdn`). Qwen3.8-27B's has 48 value heads
+over 16 q and k heads (`examples/architectures/qwen/qwen3.8_27b.bux`):
+
+```bux
+delta = gdn(num_heads=16, num_v_heads=48, head_dim=128)
+```
 
 $$
 S_t = \left(I - \beta_t k_t k_t^\top\right) \alpha_t S_{t-1} + \beta_t k_t v_t^\top,
@@ -123,19 +135,22 @@ $$
 
 with `A_log` and `dt_bias` learned per value head. `A_log` starts at the logs of
 draws uniform in [0.01, 16] (transformers), and `dt_bias` at Mamba's time steps (fla
-and the paper's code; transformers starts it at ones). See {bux}`gdn`.
-
-Qwen3.8-27B's, with 48 value heads over 16 q and k heads
-(`examples/architectures/qwen/qwen3.8_27b.bux`):
-
-```bux
-delta = gdn(num_heads=16, num_v_heads=48, head_dim=128)
-```
+and the paper's code; transformers starts it at ones).
 
 ### `kda`: Kimi Delta Attention
 
 Kimi Delta Attention (Kimi Linear, 2025), as transformers and fla have it: Gated
-DeltaNet with a decay per key channel,
+DeltaNet with a decay per key channel ({bux}`kda`). Kimi Linear's KDA, and Kimi K3's
+bounded one (`examples/architectures/kimi_linear.bux`,
+`examples/architectures/kimi/kimi_k3.bux`):
+
+```bux
+kda = kda(num_heads=32, head_dim=128, output_gate_rank=128, norm_eps=1e-5)
+```
+
+```bux
+kda = kda(num_heads=96, head_dim=128, gate_lower_bound=-5, norm_eps=1e-5)
+```
 
 $$
 S_t = \left(I - \beta_t k_t k_t^\top\right) \mathrm{diag}(w_t)\, S_{t-1} + \beta_t k_t v_t^\top,
@@ -145,7 +160,7 @@ $$
 
 where $f_t = W_{f2} W_{f1} x_t$ is a low-rank projection (`gate_rank`, by default
 `head_dim`) and `A_log` is per head. Its output gate is a `sigmoid` by default, and
-low-rank with `output_gate_rank`. See {bux}`kda`.
+low-rank with `output_gate_rank`.
 
 With `gate_lower_bound=L` (Kimi K3, GLM-5-Next), the decay is bounded:
 
@@ -156,29 +171,24 @@ $$
 and `A_log` starts at 0, as in fla's safe gate (K3's code starts it at
 $\log U(1, 16)$ either way).
 
-Kimi Linear's KDA, and Kimi K3's bounded one
-(`examples/architectures/kimi_linear.bux`, `examples/architectures/kimi/kimi_k3.bux`):
-
-```bux
-kda = kda(num_heads=32, head_dim=128, output_gate_rank=128, norm_eps=1e-5)
-```
-
-```bux
-kda = kda(num_heads=96, head_dim=128, gate_lower_bound=-5, norm_eps=1e-5)
-```
-
 :::{tip}
-`gate_lower_bound` also decides which kernel runs on a GPU: cuDNN's fused KDA kernel
-takes only a decay bounded at -5 or above, as `gate_lower_bound=-5` bounds it. On a
-B300 it runs 10 times as fast as the chunks, where bux's own Pallas kernels, which take
-any gate, run 2.6 times as fast ([How they run](#how-they-run)).
+`gate_lower_bound` also decides which kernel runs on a GPU. cuDNN's fused KDA kernel,
+the fastest, takes only a decay bounded at -5 or above, as `gate_lower_bound=-5`
+bounds it; any other gate runs by bux's Pallas kernels
+([How they run](#how-they-run)).
 :::
 
 ### `gdn2`: Gated DeltaNet-2
 
-Gated DeltaNet-2 (Hatamizadeh et al., 2026), as the paper's code and fla have it: KDA
-whose step $\beta_t$, which both erases and writes, becomes two gates per channel, an
-erase gate $b_t$ over the key channels and a write gate $w_t$ over the value channels,
+Gated DeltaNet-2 (Hatamizadeh et al., 2026), as the paper's code and fla have it
+({bux}`gdn2`). It is KDA with the step $\beta_t$, which both erases and writes, split
+into two gates per channel: an erase gate $b_t$ over the key channels and a write
+gate $w_t$ over the value channels. The paper's hybrid puts a `gdn2` layer before
+each sliding-window attention layer (`examples/architectures/gated_deltanet_2.bux`):
+
+```bux
+gdn2 = gdn2(num_heads=16, head_dim=128)
+```
 
 $$
 S_t = \left(I - k_t (b_t \odot k_t)^\top\right) \mathrm{diag}(e^{g_t})\, S_{t-1}
@@ -188,35 +198,37 @@ $$
 
 with KDA's decay per key channel, $g_t = -e^{A_{\log}}\, \mathrm{softplus}(f_t +
 \text{dt\_bias})$ of a low-rank $f_t$ (`gate_rank`, by default `v_head_dim`), and the
-same `gate_lower_bound`. At $b_t = w_t = \beta_t$ it is KDA. $g$, $b$ and `A_log` are a
-q and k head's, shared out to its value heads as q and k are; $w$ is a value head's.
-`negative_eigenvalues=true` doubles the erase gate, into $(0, 2)$. See {bux}`gdn2`.
+same `gate_lower_bound`. At $b_t = w_t = \beta_t$ it is KDA. $g$, $b$ and `A_log`
+belong to a q and k head and are shared out to its value heads, as q and k are; $w$
+belongs to a value head. `negative_eigenvalues=true` doubles the erase gate, into
+$(0, 2)$.
 
-It starts as the paper's code does: every projection from Xavier's uniform at a gain of
-$2^{-2.5}$, unless the file sets an `init` ([Initialization](initialization.md)), the
-output gate low rank (`output_gate_rank`, by default `v_head_dim`) with
-a bias from 0, `A_log` at $\log U(1, 16)$ and `dt_bias` at Mamba's time steps. Its
-output norm's gate is a `swish`, the paper's SiLU (fla's port has a `sigmoid`), and
+It starts as the paper's code does:
+
+- every projection from Xavier's uniform at a gain of $2^{-2.5}$, unless the file
+  sets an `init` ([Initialization](initialization.md));
+- the output gate low-rank (`output_gate_rank`, by default `v_head_dim`), with a bias
+  starting at 0;
+- `A_log` at $\log U(1, 16)$, and `dt_bias` at Mamba's time steps.
+
+Its output norm's gate is a `swish`, the paper's SiLU (fla's port has a `sigmoid`), and
 `norm_eps` is `1e-5`.
 
-The paper's hybrid, a `gdn2` layer before each sliding-window attention layer
-(`examples/architectures/gated_deltanet_2.bux`):
-
-```bux
-gdn2 = gdn2(num_heads=16, head_dim=128)
-```
-
 :::{tip}
-`gate_lower_bound=-5` lets cuDNN's GDN-2 kernel run the layer on a B200 or B300, 8.4
-times as fast as the chunks; the baseline's hybrid of it trains 2.1 times as fast. The
-paper's unbounded gate runs by the chunks ([How they run](#how-they-run)).
+`gate_lower_bound=-5` lets cuDNN's GDN-2 kernel run the layer on a B200 or B300,
+several times faster than the chunks. The paper's unbounded gate runs by the chunks
+([How they run](#how-they-run)).
 :::
 
 ### `lightning`: lightning attention
 
 Lightning attention (TransNormerLLM; MiniMax-01, as transformers has it): linear
 attention on SiLU'd, unscaled q, k and v, with a fixed decay $e^{-s_h}$ per head
-that weakens with depth,
+that weakens with depth ({bux}`lightning`):
+
+```bux
+mixer = lightning(num_heads=4, head_dim=64)
+```
 
 $$
 S_t = e^{-s_h} S_{t-1} + k_t v_t^\top, \qquad
@@ -225,12 +237,8 @@ $$
 
 for heads $h = 1, \dots, H$, where $\ell$ is the layer's index among the model's $L$
 token mixers (plus $10^{-5}$, as MiniMax has it). The last layer sums the past
-plainly. One RMSNorm covers all the heads together before the gate, which is a
-`sigmoid` by default; `conv_size` defaults to `none`. See {bux}`lightning`.
-
-```bux
-mixer = lightning(num_heads=4, head_dim=64)
-```
+without decay. One RMSNorm covers all the heads together before the gate, which is a
+`sigmoid` by default; `conv_size` defaults to `none`.
 
 MiniMax-Text-01 runs seven for every softmax attention layer, 80 layers in all, so
 its decays weaken over all 80 (`examples/architectures/minimax/minimax_text_01.bux`):
@@ -242,8 +250,14 @@ model = embed "LLLLLLLA"^10 norm head
 
 ### `rwkv7`: RWKV-7 "Goose"
 
-RWKV-7 time mixing (Peng et al., 2025), as the RWKV-LM reference has it. Its state
-follows the generalized delta rule,
+RWKV-7 time mixing (Peng et al., 2025), as the RWKV-LM reference has it
+({bux}`rwkv7`):
+
+```bux
+mixer = rwkv7(num_heads=4, head_dim=64)
+```
+
+Its state follows the generalized delta rule,
 
 $$
 S_t = \left(\mathrm{diag}(w_t) - (a_t \odot \kappa_t)\, \kappa_t^\top\right) S_{t-1}
@@ -252,12 +266,16 @@ S_t = \left(\mathrm{diag}(w_t) - (a_t \odot \kappa_t)\, \kappa_t^\top\right) S_{
 $$
 
 with $\kappa$ the normalized key it removes from, $a$ the in-context learning rate, and
-$\log w = -e^{-0.5}\, \sigma(\cdot)$ per key channel. Every projection reads the token
-moved toward the one before it by a learned amount per channel (token shift).
-Low-rank projections make $w$, $a$, the output gate $g$ and the value residual's mix.
-The output is a LayerNorm of each head, plus a bonus $(r \odot k \odot r_k)\, v$ per
-head, times $g$. Parameters start as RWKV-LM starts them, by the layer's depth among
-the model's token mixers. See {bux}`rwkv7`.
+$\log w = -e^{-0.5}\, \sigma(\cdot)$ per key channel.
+
+- **Token shift**: every projection reads the token moved toward the one before it,
+  by a learned amount per channel.
+- **Low-rank projections** make $w$, $a$, the output gate $g$ and the value
+  residual's mix.
+- **Output**: a LayerNorm of each head, plus a bonus $(r \odot k \odot r_k)\, v$ per
+  head, times $g$.
+- **Init**: parameters start as RWKV-LM starts them, by the layer's depth among the
+  model's token mixers.
 
 | Setting | Default | What it does |
 |---------|---------|--------------|
@@ -280,20 +298,13 @@ model = embed first rest^11 norm head
 
 ### `mamba`: selective SSM
 
-Mamba's selective state-space model (Gu and Dao, 2023) as Jamba has it, with the time
-steps, B and C RMS-normalized. The input projects to $u$ and a gate $z$, both
-`expand` times the width. $u$ is convolved over positions and SiLU'd, and projects to
-$B$ and $C$, which all its channels share, and to a time step $\Delta$ of rank
-`dt_rank`, projected up to one per channel. Every channel keeps a state of
-`state_size`, which decays at its own rate in each state dim:
+Mamba's selective state-space model (Gu and Dao, 2023), as Jamba has it, with the
+time steps, B and C RMS-normalized ({bux}`mamba`). Jamba runs Mamba in seven layers of
+eight (`examples/architectures/jamba.bux`):
 
-$$
-h_t = \exp(\Delta_t A)\, h_{t-1} + \Delta_t B_t\, u_t, \qquad y_t = C_t^\top h_t,
-$$
-
-with $A = -\exp(A_{\log})$, starting at $-(1, 2, \dots, n)$ in every channel
-(S4D-real). With $D u$ added, the output is gated by $\mathrm{SiLU}(z)$ and projected
-back. See {bux}`mamba`.
+```bux
+ssm = mamba(state_size=16)
+```
 
 | Setting | Default | What it does |
 |---------|---------|--------------|
@@ -303,21 +314,29 @@ back. See {bux}`mamba`.
 | `dt_rank` | `ceil(width / 16)` | the rank of the time step's projection |
 | `dt_min`, `dt_max` | `1e-3`, `1e-1` | the range the time steps start in, log-uniform |
 
-Jamba runs Mamba in seven layers of eight (`examples/architectures/jamba.bux`):
+The input projects to $u$ and a gate $z$, both `expand` times the width. $u$ is
+convolved over positions and SiLU'd. It then projects to $B$ and $C$, which all its
+channels share, and to a time step $\Delta$ of rank `dt_rank`, projected up to one
+per channel. Every channel keeps a state of `state_size`, which decays at its own
+rate in each state dim:
 
-```bux
-ssm = mamba(state_size=16)
-```
+$$
+h_t = \exp(\Delta_t A)\, h_{t-1} + \Delta_t B_t\, u_t, \qquad y_t = C_t^\top h_t,
+$$
+
+with $A = -\exp(A_{\log})$, starting at $-(1, 2, \dots, n)$ in every channel
+(S4D-real). With $D u$ added, the output is gated by $\mathrm{SiLU}(z)$ and projected
+back.
 
 ### `mamba2`: Mamba-2 (SSD)
 
 Mamba-2 (Dao and Gu, 2024), as transformers' Mamba-2, Zamba2 and Nemotron-H mixers
-compute it. The input projects to a gate $z$, to $u$, $B$ and $C$ (convolved over
-positions together and SiLU'd), and to one time step per head. $u$ splits into heads
-of `head_dim`, whose states decay by one rate per head, $A$ uniform in $-[1, 16]$ to
-start; $B$ and $C$ split into `num_groups` groups that the heads share, as kv heads
-are shared in GQA. With $D u$ added, the output is gated by $\mathrm{SiLU}(z)$,
-RMS-normalized one group of heads at a time, and projected back. See {bux}`mamba2`.
+compute it ({bux}`mamba2`). Nemotron 3's
+(`examples/architectures/nemotron/nemotron_3_ultra_550b_a55b.bux`):
+
+```bux
+ssm = mamba2(state_size=128, head_dim=64, num_groups=8)
+```
 
 | Setting | Default | What it does |
 |---------|---------|--------------|
@@ -327,13 +346,16 @@ RMS-normalized one group of heads at a time, and projected back. See {bux}`mamba
 | `num_groups` | `1` | groups of heads that share $B$ and $C$ |
 | `expand`, `conv_size`, `dt_min`, `dt_max` | `2`, `4`, `1e-3`, `1e-1` | as `mamba`'s |
 
+The input projects to a gate $z$, to $u$, $B$ and $C$ (convolved over positions
+together and SiLU'd), and to one time step per head. $u$ splits into heads of
+`head_dim`, whose states decay at one rate per head, with $A$ starting uniform in
+$-[1, 16]$. $B$ and $C$ split into `num_groups` groups that the heads share, as GQA's
+query heads share kv heads. With $D u$ added, the output is gated by
+$\mathrm{SiLU}(z)$, RMS-normalized one group of heads at a time, and projected back.
+
 `expand * width` must split into heads of `head_dim`, and the heads into
 `num_groups`. Where no whole `expand` gives a model's heads, set `num_heads`:
-Nemotron 3 Nano has 64 heads of 64 at a width of 2688. Nemotron 3's (`examples/architectures/nemotron/nemotron_3_ultra_550b_a55b.bux`):
-
-```bux
-ssm = mamba2(state_size=128, head_dim=64, num_groups=8)
-```
+Nemotron 3 Nano has 64 heads of 64 at a width of 2688.
 
 ### `conv`: causal depthwise convolution
 
@@ -348,9 +370,9 @@ layer(mixer, ffn) = [norm mixer [conv]] [norm ffn scale [conv]]
 
 ### `short_conv`: gated short convolution
 
-LFM2's double-gated short convolution (cf. H3, Hyena): the input projects to $B$,
-$C$ and $u$, and the output is $C \odot \mathrm{conv}(B \odot u)$, projected back.
-`conv_size` defaults to 3. See {bux}`short_conv`.
+LFM2's double-gated short convolution (cf. H3, Hyena) ({bux}`short_conv`). The input
+projects to $B$, $C$ and $u$, and the output is $C \odot \mathrm{conv}(B \odot u)$,
+projected back. `conv_size` defaults to 3.
 
 ```bux
 mixer = short_conv(conv_size=3)
@@ -359,7 +381,7 @@ mixer = short_conv(conv_size=3)
 ## Hybrids
 
 A hybrid is a pattern of one-letter blocks ([Definitions](../language/definitions.md)).
-The zoo's:
+The zoo has these:
 
 | Model | Pattern | File |
 |-------|---------|------|
@@ -383,8 +405,9 @@ a = layer(attn, dense)
 model = embed "mMmM aMmM"^4 norm head
 ```
 
-Zamba2 calls one shared block, whose output, through a linear layer of each call's
-own, adds to the input of the Mamba-2 layer after it (`examples/architectures/zamba2.bux`):
+Zamba2 calls one shared block. Each call passes the block's output through its own
+linear layer and adds it to the input of the Mamba-2 layer after it
+(`examples/architectures/zamba2.bux`):
 
 ```bux
 m = [norm ssm]
@@ -412,14 +435,14 @@ carry position: Kimi Linear's MLA layers set `rope=none`, and Jamba's and Nemotr
 The recurrence runs by **chunks** of 64 positions, as fla's chunked kernels run it
 (`bux.architecture.recurrent.chunkwise`): matmuls within a chunk, and a scan of the
 state across chunks. Every chunk's maps come from matmuls over all chunks at once
-(the WY form), and the state across them by a Pallas kernel on a GPU
-(`affine_scan`), by `lax.scan` elsewhere; for one decay a head, by a matmul. No
-exponent in it is positive, whatever the gate, but for RWKV-7, whose decay is
-bounded: it takes a chunk's pairs through its middle position, by one matmul each,
-in a third of the time. Recurrent states are float32, whatever the run computes in.
+(the WY form). The state passes across chunks by a Pallas kernel on a GPU
+(`affine_scan`), by `lax.scan` elsewhere, and by a matmul when there is one decay per
+head. No exponent in it is positive, whatever the gate; RWKV-7, whose decay is
+bounded, takes each pair through the chunk's middle position instead, in one matmul.
+Recurrent states are float32, whatever dtype the run computes in.
 
-On a GPU, kernels run the delta rule, GLA and Lightning with q, k and v of 16 bits
-and heads of 64 or 128, under `methods.recurrence = scan`:
+On a GPU, under `methods.recurrence = scan`, kernels run the delta rule, GLA and
+Lightning with q, k and v of 16 bits and heads of 64 or 128:
 
 | Layer | Kernel | Condition |
 |-------|--------|-----------|
@@ -429,20 +452,17 @@ and heads of 64 or 128, under `methods.recurrence = scan`:
 | `gdn2` with a `gate_lower_bound` of -5 or above | cuDNN's fused GDN-2 kernel (`fused_delta`) | a B200 or B300; bfloat16 |
 | `gdn2` otherwise | chunks | |
 | `gla`, `lightning` | cuDNN's fused GDN-2 kernel (`fused_delta`), its delta rule at a step of 0 | a B200 or B300; bfloat16 |
-| `rwkv7` | chunks, a pair product one matmul (its decay is bounded), the state across them by `affine_scan` | |
-| `mamba2` | chunks, the state across them by a matmul (one decay a head) | |
+| `rwkv7` | chunks, each pair product one matmul (its decay is bounded), the state across them by `affine_scan` | |
+| `mamba2` | chunks, the state across them by a matmul (one decay per head) | |
 | `mamba` | a scan over positions (one decay per channel and state dim) | |
 
-cuDNN's KDA kernel factors each decay through the start of a tile of 16 positions,
-so it loses precision where a tile decays a channel by $e^{-86}$, and overflows at
-$e^{-90}$. Within 12 steps of bux's start, KDA's unbounded gates are that steep in 30
-to 90% of the (row, head) pairs of most layers, so those, and gates bounded below -5,
-run by bux's kernels, which are exact at any gate.
-
-cuDNN's GDN-2 kernel factors its decays the same way, but is exact at any gate: where a
-tile decays a channel past $e^{-83}$ it runs the whole call again by a slower exact
-path. Unbounded gates soon take it there, as KDA's do, so `gdn2` runs by the kernel only
-with a `gate_lower_bound` of -5 or above, which keeps a tile within $e^{-80}$.
+cuDNN's KDA and GDN-2 kernels factor each decay through a tile of 16 positions. The
+KDA kernel loses precision where a tile decays a channel by $e^{-86}$ and overflows
+at $e^{-90}$; the GDN-2 kernel stays exact, but past $e^{-83}$ it reruns the whole
+call by a slower path. Unbounded gates get that steep within the first few training
+steps, so both kernels run only with a `gate_lower_bound` of -5 or above, which keeps
+a tile within $e^{-80}$. bux's Pallas kernels for KDA are exact at any gate
+([Recurrence](../parallelism/recurrence.md)).
 
 Settings that change how they run (none changes what they compute):
 

@@ -1,11 +1,13 @@
 (training-searching)=
 # Searching hyperparameters
 
-A sweep (`a | b`, [Sweeps](../language/sweeps.md)) trains every combination of its
-alternatives. A **search** trains a budget of **trials**, points of its
-**dimensions**, and lets a method choose each point from the trials so far. It ranks
-them by an **objective**, such as the bits per byte of held-out sets, weighted. A
-setting written as a distribution is a dimension, and the file is a search:
+A search finds good values of settings for you. Write a setting as a distribution
+and it becomes a **dimension**; the file is then a search. bux trains a budget of
+**trials**, each a point in the dimensions, and a method chooses each point from the
+trials so far. The trials are ranked by an **objective**, such as the weighted bits
+per byte of held-out sets. Where a sweep (`a | b`, [Sweeps](../language/sweeps.md))
+trains every combination you list, a search spends its budget where the results
+point:
 
 ```bux
 optimizer.lr           = log_uniform(1e-4, 1e-2)
@@ -62,8 +64,8 @@ halving: rungs of 636, 1.91k, 5.72k steps, eta 3, about 9 runs' steps in all
 sweep: 3 runs over attn.num_kv_heads (mha | gqa | mqa)
 ```
 
-The `|` makes three runs, and each is a search of its own: 27 trials of MHA, 27 of
-GQA, 27 of MQA. With halving, every trial trains 636 steps, the best third of those
+The `|` makes three runs, and each is its own search: 27 trials of MHA, 27 of GQA,
+27 of MQA. With halving, every trial trains 636 steps, the best third of those
 1.91k, and the best third of those the run's 5.72k, so each search costs about nine
 full runs, not 27. `bux plan` lists the three runs, each dimension at its middle, and
 a line for each search:
@@ -80,8 +82,9 @@ attention_search[gqa]: 27 trials of 2 dimensions by gp, 3 rungs: about 9 runs' s
 attention_search[mqa]: 27 trials of 2 dimensions by gp, 3 rungs: about 9 runs' steps
 ```
 
-`bux launch` trains the trials side by side, a GPU group each, and `bux results`
-prints each search's trials, the best first ([Training a search](#training-a-search)).
+`bux launch` trains the trials side by side, each on its own group of GPUs, and
+`bux results` prints each search's trials, the best first
+([Training a search](#training-a-search)).
 
 ## Dimensions
 
@@ -144,15 +147,15 @@ objective = eval_loss                         # one eval's loss
 objective = -tokens_per_s                     # the fastest, to tune `methods`, say
 ```
 
-- **Its names are metrics, not definitions**, but for a definition of a number:
+- **Its names are metrics, not definitions**, except for definitions of numbers:
   with `w = 0.8`, `w * web_bpb + (1 - w) * code_bpb` is the first line. A metric
   with a slash is a string: `"time/step_ms"`.
 - **An eval's metrics are checked against the run's evals**: `web_bpb` needs an eval
   named `web`, and bits per byte need a tokenizer ([Eval](running.md#eval)).
 - **Without one, the objective is the first eval's bits per byte** if the run has a
   tokenizer, else that eval's loss, else the training loss.
-- A trial that failed, or whose objective is not a number, as a run that diverged
-  has, counts as failed: the methods learn to avoid where it was.
+- A trial that failed, or whose objective is not a number (as when a run
+  diverges), counts as failed: the methods learn to avoid where it was.
 
 A sweep that sets an `objective` shows it in the table `bux launch` ends with, so the
 same line ranks the runs of a grid.
@@ -162,55 +165,82 @@ trial that a sweep, or another search, trained already is read, not trained agai
 
 ## A search for each run of a sweep
 
-The alternatives of a sweep stay a grid, and each run of it is a search of its own,
-over the dimensions it reaches. So `attn.num_kv_heads = mha: 12 | gqa: 4 | mqa: 1`
-with `optimizer.lr = log_uniform(1e-4, 1e-2)` compares three attentions, each at its
-best learning rate, which is the fair comparison when the best learning rate moves
-with the architecture: comparisons against a baseline tuned less carefully overstate
-the differences (Wen et al., 2025, for optimizers). The searches take turns at the
-GPUs.
+The alternatives of a sweep stay a grid, and each run of it is its own search, over
+the dimensions it reaches. So `attn.num_kv_heads = mha: 12 | gqa: 4 | mqa: 1` with
+`optimizer.lr = log_uniform(1e-4, 1e-2)` compares three attentions, each at its best
+learning rate. That is the fair comparison when the best learning rate moves with the
+architecture: comparisons against a baseline tuned less carefully overstate the
+differences (Wen et al., 2025, for optimizers). The searches take turns at the GPUs.
 
 To let the search choose the attention too, write it as a dimension:
 `attn.num_kv_heads = choice(12, 4, 1)`.
 
+## The search setting
+
+```bux
+search = search(method=tpe(startup=20), trials=64, parallel=8, halving=halving(eta=4))
+```
+
+| Field | Default | What it is |
+|-------|---------|------------|
+| `method` | `gp` | how the next trial is proposed ([Methods](#methods)) |
+| `trials` | `16` | the points it tries; with halving, the trials that start at the bottom rung |
+| `parallel` | `none` | the most trials of one search at once; none: as many as the GPUs hold |
+| `halving` | `none` | short runs first, and only the best trained to the end ([Halving](#halving)); none: every trial trains all the steps |
+| `seed` | `0` | of the proposals; every trial keeps the run's own `seed` |
+
 ## Methods
 
-`search.method` proposes the next trial from the trials so far. Each is found by
-name in the `bux.search.methods.methods` registry
+`search.method` proposes the next trial from the trials so far. Each method is found
+by name in the `bux.search.methods.methods` registry
 ([Registries](../reference/language/registries.md)):
 
 | Method | What it does | For |
 |--------|--------------|-----|
 | `gp` (the default) | Bayesian optimization: a Gaussian process with a Matérn-5/2 kernel, a length scale per dimension, fit to the trials; the next point has the most expected improvement (log EI) | few trials of long runs, in a few dimensions |
-| `tpe` | the tree-structured Parzen estimator, as Optuna 5's: densities of the best trials and of the rest; the next point is likeliest under the first and least under the second | many choices, dimensions inside choices, or more than about 50 trials |
+| `tpe` | the tree-structured Parzen estimator, as in Optuna: densities of the best trials and of the rest; the next point is likeliest under the first and least likely under the second | many choices, dimensions inside choices, or more than about 50 trials |
 | `halton` | quasi-random: a scrambled Halton sequence, even coverage for any number of trials | exploring a space, or a baseline |
 | `sobol` | quasi-random: a scrambled Sobol sequence, evenest when the trials are a power of two | the same, with 8, 16 or 32 trials |
 | `random` | uniformly random points | a baseline |
 
 `gp` and `tpe` start with quasi-random trials (`startup`: 5 and 10), then fit their
-model to every trial that has an objective. A trial still training, or with halving
-one trained only at a rung below the one they model, counts too: `gp` at its
-prediction for it (the kriging believer) and `tpe` among the worse (the constant
-liar), so trials that start together differ.
+model to every trial that has an objective. A trial still training counts too, as
+does, with halving, one trained only at a rung below the one they model: `gp` counts
+it at its prediction (the kriging believer) and `tpe` among the worse trials (the
+constant liar). So trials that start together differ.
 
-Which to use: the Deep Learning Tuning Playbook (Godbole et al., 2023) explores a new
-space with quasi-random search, which needs nothing of the trials' results and shows
-where the good region is, and turns to Bayesian optimization to exploit it: "if you
-can only run a few trials in parallel but many in sequence, Bayesian optimization
-becomes much more attractive". With 10 to 50 trials of a few dimensions, a GP is the
-most sample-efficient of these; TPE wins with many choices or many trials.
+| Method | Its fields |
+|--------|------------|
+| {bux}`gp` | `startup=5`; `acquisition=log_ei`, or `ucb` with `beta=2.0`, the weight of the deviation |
+| {bux}`tpe` | `startup=10`; `candidates=24`, the points drawn to pick from; `gamma=0.1`, the share of trials that count as best (at most 25); `multivariate=true`, one density over every dimension |
+| {bux}`halton`, {bux}`sobol`, {bux}`random` | none |
+
+**Which to use.** The Deep Learning Tuning Playbook (Godbole et al., 2023) explores
+a new space with quasi-random search, which needs nothing of the trials' results and
+shows where the good region is, then turns to Bayesian optimization to exploit it:
+"if you can only run a few trials in parallel but many in sequence, Bayesian
+optimization becomes much more attractive". With 10 to 50 trials of a few dimensions,
+a GP is the most sample-efficient of these; TPE wins with many choices or many
+trials.
 
 ## Halving
 
 `halving` trains every trial short first, and only the best longer: asynchronous
 successive halving, ASHA (Li et al., 2020). With `halving(eta=3, rungs=3)`, rung 0 is
-a ninth of the run's steps, rung 1 a third, rung 2 all of them. A trial that finished
-a rung goes up one when it is among the best third of those that finished it. A GPU
-that frees up takes the next trial up, the highest rung first, and if none has
-earned it, a new trial at the bottom: no rung waits for the rest of it.
+a ninth of the run's steps, rung 1 a third, and rung 2 all of them. A trial that
+finished a rung goes up one when it is among the best third of those that finished
+it. A GPU that frees up takes the next trial up, the highest rung first; if no trial
+has earned a promotion, it starts a new trial at the bottom. No rung waits for the
+rest of its trials.
 
-- **Each rung is a run of its own, from scratch**, with its schedule over its own
-  steps: a short run's cooldown is the long run's, shrunk, and so its objective is the
+| Field | Default | What it is |
+|-------|---------|------------|
+| `eta` | `3` | each rung trains the best `1 / eta` of the one below, `eta` times longer; at least 2 |
+| `rungs` | `3` | rungs of steps, the last the run's own: `steps / eta^(rungs - 1)`, ..., `steps`; at least 2 |
+| `brackets` | `1` | Hyperband's brackets, the rungs trials start at; at most `rungs` |
+
+- **Each rung is a separate run, from scratch**, with its schedule over its own
+  steps: a short run's cooldown is the long run's, shrunk, so its objective is the
   best that length reaches. Write what depends on the run's length as a share of
   it, as `schedule.warmup = 0.15`, or in terms of `steps`; `bux check` compiles the
   bottom rung, and says so if a warmup does not fit in it.
@@ -233,22 +263,22 @@ Hyperband's authors recommend an `eta` of 3 or 4.
 
 | | `bux train` | `bux launch` |
 |---|---|---|
-| Trials | one after another, in this process | side by side, a worker each, on the GPUs its mesh needs |
+| Trials | one after another, in this process | side by side, one worker per trial, on the GPUs its mesh needs |
 | The next trial | proposed as one ends | proposed as GPUs free up, from those done and those training |
 | A trial that is done | read, not trained again | read, not trained again |
 | SIGTERM, Ctrl-C | stops the trial after its step, saving it with a `checkpoint` setting, and the search | the same, in every worker |
 
-Each trial's rung is a run, with its own directory, `status.json` and metrics, as any
-run of a sweep ([Launching](launching.md)). `search.parallel` caps the trials one
+Each trial's rung is a run, with its own directory, `status.json` and metrics, like
+any run of a sweep ([Launching](launching.md)). `search.parallel` caps the trials one
 search trains at once; by default, as many as the GPUs hold. A search ends with its
 table, the best first, and `bux results FILE` prints it again at any time, without
-training. Settings on the command line change it as they change a run:
+training. Settings on the command line change a search as they change a run:
 `bux launch tune.bux 'search.trials = 32'`.
 
 A search can come from the command line, as any setting can. This one tunes the
-learning rate of `smoke.bux` on a laptop's CPU, by the default `gp`, with two rungs:
+learning rate of `smoke.bux` on a laptop CPU, by the default `gp`, with two rungs:
 17 steps, then the run's 50. The first trials are quasi-random, and each trains as a
-run of its own:
+separate run:
 
 ```console
 $ bux train examples/experiments/smoke.bux 'optimizer.lr = log_uniform(1e-3, 1e-1)' 'search = search(trials=9, halving=halving(rungs=2))'
@@ -277,13 +307,13 @@ trial  rung  objective  run
 2      0/1   6.4199     smoke[optimizer.lr=0.0821, steps=17]
 ```
 
-Nine trials trained 17 steps, and the five that earned it the full 50: 14 runs, a
-few seconds each. The table lists each trial at the highest rung it reached, the best
-first. The smoke run has no eval, so its objective is the training loss. On random
-tokens every loss tends to log 512 ≈ 6.24, near where a run at bux's default init
-starts, and the best learning rates are the ones that stray from it least; trial 8
-sits near the dimension's lower end, so on real data the next step would be to widen
-it ([Doing it well](#doing-it-well)).
+Nine trials trained 17 steps, and the five that earned it trained the full 50: 14
+runs, a few seconds each. The table lists each trial at the highest rung it reached,
+the best first. The smoke run has no eval, so its objective is the training loss. On
+random tokens every loss tends to log 512 ≈ 6.24, near where a run at bux's default
+init starts, so the best learning rates are the ones that stray from it least. Trial
+8 sits near the dimension's lower end, so on real data the next step would be to
+widen the dimension ([Doing it well](#doing-it-well)).
 
 ## The search directory
 
@@ -301,9 +331,9 @@ and `seed`. So:
   trial that a signal stopped trains again, from its checkpoint if it has a
   `checkpoint` setting, and the method proposes the rest from all of them.
 - **More `trials` add trials** to the same search.
-- **Another space, method or seed is a search of its own**, in a directory of its
-  own; a trial at a point another search trained already is read from its run,
-  and one at a point another search is training waits for it.
+- **Another space, method or seed is a separate search**, in its own directory; a
+  trial at a point another search already trained is read from its run, and one at
+  a point another search is training waits for it.
 - **A trial that failed stays failed**, as information: its point is one to avoid.
   Delete its run's directory to try it again.
 - **The best trial is a file**: `bux train runs/<name>-search-<key>/best.bux` trains
@@ -332,9 +362,9 @@ What the literature agrees on, for searches of expensive runs:
 
 ## A method of your own
 
-A method is a function registered under the name of its config's type, which gets the
-config, the space of coordinates (`bux.search.space`) and the history so far, and
-returns the next point. Registered under a taken name, it replaces bux's own:
+A method is a function registered under its config's type. It gets the config, the
+space of coordinates (`bux.search.space`) and the history so far, and returns the
+next point. Registered under a taken name, it replaces bux's own:
 
 ```python
 from bux.search.methods import History, Point, generator, methods

@@ -1,30 +1,30 @@
 # Packing
 
 The `packing` setting says how `text` and `chat` documents become rows of `seq_len`
-tokens: end to end and cut, or whole and padded, or whole and fitted together. This
-page compares the three packings, lists their settings, and explains how documents
-packed into one row stay apart.
+tokens. There are three choices: documents end to end and cut, whole documents
+padded, or whole documents fitted together. This page compares them, lists their
+settings, and explains how documents packed into one row stay apart.
 
 ```bux
 packing = best_fit                     # the default
-packing = greedy(long=drop)            # classic SFT: whole documents, a row padded
-packing = concat                       # GPT-2: end to end, cut every row
+packing = greedy(long=drop)            # classic SFT: whole documents, each row padded
+packing = concat                       # GPT-2: end to end, cut at every row
 ```
 
-Documents are shuffled by their hashes and packed `chunk` tokens at a time, each
-chunk a random sample of them, and each chunk's rows come out in a random order
-([The pipeline](pipeline.md)).
+Documents are shuffled by their hashes and packed `chunk` tokens at a time. Each
+chunk is a random sample of the documents, and each chunk's rows come out in a random
+order ([The pipeline](pipeline.md)).
 
 ## The three packings
 
 | Packing | Rows | `doc_mask` by default |
 |---------|------|-----------------------|
-| {bux}`concat` | documents end to end, cut every `seq_len - 1` tokens: no padding, and documents are whole only by chance (GPT-2, the speedrun's shards) | `false` |
-| {bux}`greedy` | whole documents in their shuffled order, a row padded and closed when the next does not fit (classic SFT); `max_docs=1` is one a row | `true` |
-| {bux}`best_fit` | best-fit decreasing (Ding et al., 2024): the longest first, each into the open row it leaves least room in; nearly no padding and nearly no cuts | `true` |
+| {bux}`concat` | documents end to end, cut every `seq_len - 1` tokens: no padding, and a document is whole only by chance (GPT-2, the speedrun's shards) | `false` |
+| {bux}`greedy` | whole documents in their shuffled order; a row is padded and closed when the next document does not fit (classic SFT). `max_docs=1` puts one document in each row | `true` |
+| {bux}`best_fit` | best-fit decreasing (Ding et al., 2024): longest documents first, each into the open row where it leaves the least room. Almost no padding and almost no cuts | `true` |
 
-The four documents of [Documents to rows](index.md#documents-to-rows), A of 5 tokens,
-B of 3, C of 10 and D of 2, in rows of 8 (`·` is padding):
+The four documents from [Documents to rows](index.md#documents-to-rows), A of 5
+tokens, B of 3, C of 10 and D of 2, in rows of 8 (`·` is padding):
 
 ```text
 concat                     AAAAABBB  BCCCCCCC              C's last 3 tokens and D cut
@@ -33,65 +33,72 @@ best_fit                   CCCDD···  CCCCCCCC  AAAAABBB    C split in two pie
 best_fit(long=truncate)    DD······  CCCCCCCC  AAAAABBB    C's last 2 tokens cut
 ```
 
-`concat`'s rows read as one text each, positions 0 to 7; the others' positions start
-again at every document.
+Each `concat` row reads as one text, with positions 0 to 7. In the other packings,
+positions start again at every document.
 
 ## Settings
 
 | Field | `concat` | `greedy` | `best_fit` | What it is |
 |-------|----------|----------|------------|------------|
 | `doc_mask` | `false` | `true` | `true` | positions start again at every document, and attention stays within it ([below](#documents-stay-apart)) |
-| `long` | | `drop` | `split` | a document longer than a row: `split` into pieces that fill gaps, `truncate` it, or `drop` it |
-| `max_docs` | | `none` | `none` | the most documents, and pieces of them, in a row |
+| `long` | | `drop` | `split` | what to do with a document longer than a row: `split` it into pieces that fill gaps, `truncate` it, or `drop` it |
+| `max_docs` | | `none` | `none` | the most documents, or pieces of them, in one row |
 | `sort` | | | `true` | longest first; `false` keeps the shuffled order (online best fit) |
-| `chunk` | `16_000_000` | `16_000_000` | `16_000_000` | tokens of documents packed together |
+| `chunk` | `16_000_000` | `16_000_000` | `16_000_000` | how many tokens of documents are packed together |
 
-- `greedy` and `best_fit` keep documents whole. `greedy` drops a long one by default,
-  as a cut conversation may lose its answer; `best_fit` splits it.
-- `max_docs` caps a row's documents and pieces, for attention kernels that take a
-  fixed number of them.
-- `best_fit(sort=false)` is online best fit, in the shuffled order: rows of mixed
-  lengths, rather than long documents together and short ones together.
+- `greedy` and `best_fit` keep documents whole. By default `greedy` drops a document
+  longer than a row, because a cut conversation may lose its answer; `best_fit`
+  splits it.
+- `max_docs` caps the documents and pieces in a row, for attention kernels that take
+  a fixed number of them.
+- `best_fit(sort=false)` is online best fit, in the shuffled order. Its rows mix long
+  and short documents, rather than grouping long documents together and short ones
+  together.
 
 ## Cuts lose no targets
 
-Rows of `concat`, and the pieces of a split document, overlap by a token. Its first
-copy is a target, and its second, at position 0, is not: nothing predicts the first
-token of a row or a document. So every token is a target once, but the first of every
-document.
+The rows of `concat`, and the pieces of a split document, overlap by one token. The
+first copy of that token is a target. The second, at position 0, is not, because
+nothing predicts the first token of a row or of a document. So every token is a
+target exactly once, except the first token of each document.
 
 ## Documents stay apart
 
-With `doc_mask`, positions start again at every document, and a document starts
-wherever positions stop increasing. RoPE and a learned positional embedding take the
-positions as they are. The model makes the rest from them once a forward pass
-({py:class}`~bux.architecture.common.segments.Segments`), none of it t × t:
+With `doc_mask`, positions start again at every document, and a new document starts
+wherever positions stop increasing. RoPE and learned positional embeddings take the
+positions as they are. From the positions, the model builds everything else once per
+forward pass ({py:class}`~bux.architecture.common.segments.Segments`), and none of
+it is t × t:
 
-- a document id per token: the segment ids that splash and Pallas flash attention take
-  in place of a t × t mask, so attention stays within a document and skips the blocks
-  no query sees;
-- how far each token is into its document: where causal convolutions, n-grams and
-  targets stop looking back;
-- where each query's first key is, for kernels that take that (tokamax's); the
-  `cu_seqlens` of varlen kernels are where the ids change.
+- **A document id per token.** These are the segment ids that splash attention and
+  Pallas flash attention take instead of a t × t mask. Attention stays within a
+  document, and the kernels skip blocks that no query sees.
+- **How far each token is into its document.** Causal convolutions, n-grams and
+  targets stop looking back there.
+- **Where each query's first key is**, for kernels that take it (tokamax's). The
+  `cu_seqlens` of varlen kernels are the points where the ids change.
 
-The loss is only on targets of the document that predicts them ([Rows](index.md#rows)).
-Without `doc_mask`, a row reads as one text, as GPT-2's did: positions run from 0 to
-`seq_len - 1`, and every token attends to every one before it in the row.
+The loss covers only targets in the same document as the position that predicts them
+([Rows](index.md#rows)). Without `doc_mask`, a row reads as one text, as in GPT-2:
+positions run from 0 to `seq_len - 1`, and every token attends to every token before
+it in the row.
 
 ## Measurements
 
-On FineWeb-Edu (53,248 documents, 55M GPT-2 tokens, `seq_len = 1024`):
+FineWeb-Edu, 53,248 documents (55M GPT-2 tokens), at `seq_len = 1024`:
 
 | Packing | Rows | Filled | Tokens cut |
 |---------|------|--------|------------|
 | `concat` | 54,080 | 100% | 2,161 (the ends of chunks) |
 | `best_fit` | 54,098 | 99.9% | 0 |
-| `greedy` | 25,016 | 74.7% | 36M (the documents over 1024) |
+| `greedy` | 25,016 | 74.7% | 36M (the documents over 1024 tokens) |
 
-On a laptop, 20,000 FineWeb documents (13.9M GPT-2 tokens) in rows of 1024, a
-hundredth held out, prepared by a sweep over the packings,
-`packing = concat | greedy | best_fit`:
+`best_fit` fills rows as well as `concat` without cutting a single document.
+`greedy` drops every document longer than a row, which here is most of the tokens.
+
+You can compare the packings on your own data with a sweep. Here is 20,000 FineWeb
+documents (13.9M GPT-2 tokens) in rows of 1024, with a hundredth held out, prepared
+on a laptop by `packing = concat | greedy | best_fit`:
 
 ```console
 $ bux prepare packings.bux --workers 4
@@ -109,11 +116,11 @@ text-c1beb61b0e: 209 documents, 141,267 tokens -> 139 rows of 1024, 99.3% filled
 data/packed/text-c1beb61b0e
 ```
 
-Each packing makes a dataset of its own, for training and for the held-out split
-alike. A line's figures:
+Each packing makes its own dataset, for the training split and the held-out split
+alike. The figures on each line:
 
 | Figure | What it counts |
 |--------|----------------|
 | filled | the share of the rows' tokens that are not padding |
-| targets | the share that are targets: in the loss mask, and not a document's first |
+| targets | the share that are targets: in the loss mask, and not the first token of a document |
 | tokens cut | tokens of documents that no row holds: dropped, truncated, or left at the end of a chunk by `concat` |

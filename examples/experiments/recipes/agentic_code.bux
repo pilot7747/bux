@@ -23,8 +23,8 @@ batch   = 256
 budget  = 10B                            # tokens
 steps   = budget // (batch * seq_len)
 
-# The last tenth of the tokens in rows of 16k, half of them whole repositories, as
-# many tokens a step as before. It falls inside the schedule's cooldown.
+# The last tenth of the tokens in rows of 16k, half of them whole repositories, with
+# as many tokens per step as before. It falls inside the schedule's cooldown.
 long       = 0.5 * repos + 0.3 * code + 0.2 * web(split=[0, 0.999])
 curriculum = phase(at=0.9, seq_len=16384, batch=batch // 8, data=long)
 

@@ -1,8 +1,8 @@
 # Which init? Five runs of a 12-layer Llama, in one file: the default, every weight
 # matrix from a normal of 0.02 (GPT-2, Megatron-LM); OLMo 2's, truncated at 3 sigma;
-# GPT-2's, with the residual branches' outputs scaled down by depth; LeCun's fan-in,
-# bux's default before; and the branches' outputs at zero, so that the model starts as
-# its embedding and head alone.
+# GPT-2's, with the residual branches' outputs scaled down by depth; LeCun's fan-in;
+# and the branches' outputs at zero, so that the model starts as its embedding and
+# head alone.
 #
 #   bux plan  examples/experiments/init_ablation.bux
 #   bux train examples/experiments/init_ablation.bux --only gpt2

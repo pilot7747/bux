@@ -1,8 +1,7 @@
 # Optimizers, schedules and the loss
 
-This page covers what turns a gradient into an update: the two optimizers, the
-learning-rate schedules, gradient clipping, and the loss the gradient is of. Each is
-one setting of a run.
+Four settings turn a gradient into an update: the optimizer, the learning-rate
+schedule, gradient clipping, and the loss the gradient comes from.
 
 ```bux
 optimizer = muon(lr=0.02)
@@ -19,8 +18,8 @@ loss      = loss(z=1e-4)
 | `loss` | {bux}`loss` | `loss(z=0, mtp=0.3)` |
 
 Both optimizers are optax transformations built from their configs
-({py:mod}`bux.train.optim`). A variant of one is a function registered under its name
-([Registries](extending.md#registries)).
+({py:mod}`bux.train.optim`). A variant of either is a function registered under its
+name ([Registries](extending.md#registries)).
 
 ## AdamW
 
@@ -33,16 +32,16 @@ optimizer = adamw(lr=3e-4, b1=0.9, b2=0.95, weight_decay=0.1)
 | Field | Default | What it is |
 |-------|---------|------------|
 | `lr` | required | the peak learning rate, which the schedule scales |
-| `b1` | `0.9` | the first moment's decay |
-| `b2` | `0.95` | the second moment's decay |
-| `eps` | `1e-8` | added to the second moment's root |
+| `b1` | `0.9` | the decay of the first moment |
+| `b2` | `0.95` | the decay of the second moment |
+| `eps` | `1e-8` | added to the square root of the second moment |
 | `weight_decay` | `0.1` | decoupled weight decay, times the learning rate |
 
-**What decays.** Weight decay applies to matrices, and to stacks of them, only. It
-skips every vector (biases, norm scales) and what a layer names in its
-`no_weight_decay` attribute whatever its shape: norms' gains and biases, and Engram's
-tables. The stacked dimension of a scanned repeat does not count, so the stacked norm
-scales of `methods(repeat=scan)` are still vectors and do not decay
+**What decays.** Weight decay applies only to matrices and stacks of them. It skips
+every vector (biases, norm scales) and anything a layer lists in its
+`no_weight_decay` attribute, whatever its shape: norm gains and biases, and Engram's
+tables. The stacked dimension of a scanned repeat does not count, so the norm scales
+that `methods(repeat=scan)` stacks are still vectors and do not decay
 ({py:func}`bux.train.optim.weight_decay_mask`).
 
 ## Muon
@@ -58,7 +57,7 @@ iterations, for the matrices inside the blocks, and AdamW for every other parame
 | Field | Default | What it is |
 |-------|---------|------------|
 | `lr` | required | the peak learning rate, which the schedule scales |
-| `momentum` | `0.95` | the momentum's decay |
+| `momentum` | `0.95` | the decay of the momentum |
 | `nesterov` | `true` | Nesterov's look-ahead |
 | `ns_steps` | `5` | Newton-Schulz iterations |
 | `ns_coefficients` | `jordan` | the quintics of the iterations, by name |
@@ -71,30 +70,31 @@ iterations, for the matrices inside the blocks, and AdamW for every other parame
 
 ### What Muon trains
 
-Muon trains, outside the embedding and the head:
+Outside the embedding and the head, Muon trains:
 
-- the kernel of every linear layer (`nnx.Linear`): attention's projections, the MLPs',
-  the router's, and the rest;
-- the routed experts' stacked weights, one expert at a time. In a gated MLP an
+- the kernel of every linear layer (`nnx.Linear`): attention's projections, the
+  MLPs', the router's, and the rest;
+- the routed experts' stacked weights, one expert at a time. In a gated MLP, an
   expert's up and gate projections are stacked side by side, and Muon orthogonalizes
-  the two apart;
-- what a layer names in its `muon_axes` attribute, each matrix's two axes by number.
+  each separately;
+- whatever a layer lists in its `muon_axes` attribute, giving each matrix's two axes
+  by number.
 
-A scanned repeat's stacked dimension leads, and Muon orthogonalizes each pass's
-matrix apart. Everything else trains with `adam`: the embedding, the head (whose
-layers set `no_muon`), norm scales, biases, convolutions and every other parameter
-that is not one of those matrices. `adam` defaults to `adamw(lr=lr)`, so it takes
-Muon's learning rate and AdamW's other defaults; the schedule scales both
+In a scanned repeat the stacked dimension comes first, and Muon orthogonalizes each
+pass's matrix separately. Everything else trains with `adam`: the embedding, the head
+(whose layers set `no_muon`), norm scales, biases, convolutions, and any other
+parameter that is not one of those matrices. `adam` defaults to `adamw(lr=lr)`: Muon's
+learning rate with AdamW's other defaults. The schedule scales both
 ({py:func}`bux.train.optim.muon_matrices`).
 
 ### Scaling the updates: `consistent_rms`
 
-An orthogonalized update has a size of its own, unlike Adam's. With
-`consistent_rms=0.2`, the default, Muon scales each update to an RMS of 0.2, as
-AdamW's roughly are, so that one learning rate suits both (Moonlight). With
-`consistent_rms=none`, it scales by `sqrt(max(1, fan_out / fan_in))`, as Keller
-Jordan's Muon does; such a run then wants a larger `lr` for Muon than for its `adam`,
-as `examples/experiments/speedrun.bux` sets.
+An orthogonalized update has its own scale, unlike Adam's. With `consistent_rms=0.2`,
+the default, Muon scales each update to an RMS of 0.2, roughly that of AdamW's
+updates, so one learning rate suits both (Moonlight). With `consistent_rms=none`, it
+scales by `sqrt(max(1, fan_out / fan_in))`, as Keller Jordan's Muon does. Such a run
+wants a larger `lr` for Muon than for its `adam`, as
+`examples/experiments/speedrun.bux` sets.
 
 ### Newton-Schulz
 
@@ -104,15 +104,16 @@ as `examples/experiments/speedrun.bux` sets.
 | Name | Its quintics |
 |------|--------------|
 | `jordan` | Keller Jordan's, `(3.4445, -4.7750, 2.0315)`, the same at every iteration: optax's default |
-| `polar_express` | Amsel et al.'s (2025), one for each iteration, closer to orthogonal in as many; the last one repeats past eight |
+| `polar_express` | Amsel et al. (2025): one per iteration, closer to orthogonal in the same number of iterations; the last repeats past eight |
 
-Newton-Schulz runs in `ns_dtype`, bfloat16 as in Keller Jordan's Muon, and the
-updates move between devices in it. Its result is within a few percent of float32's:
-on a B300, 240 steps of the 1.3B dense model on packed documents lose the same with
-either, within the difference between two float32 runs.
+Newton-Schulz runs in `ns_dtype`, bfloat16 by default as in Keller Jordan's Muon, and
+the updates move between devices in it. Its result is within a few percent of
+float32's. On a B300 (2026-10-23), 240 steps of the 1.3B dense model on packed
+documents reach the same loss either way, within the difference between two float32
+runs.
 
-How each matrix reaches a device whole for Newton-Schulz, when FSDP or tensor
-parallelism splits it, is `methods.orthogonalize` ([Muon](../parallelism/muon.md)).
+When FSDP or tensor parallelism splits a matrix, `methods.orthogonalize` says how it
+reaches one device whole for Newton-Schulz ([Muon](../parallelism/muon.md)).
 
 ### Gram Newton-Schulz
 
@@ -126,58 +127,62 @@ optimizer = muon(lr=0.02, ns_algorithm=gram, ns_coefficients=polar_express, ns_s
 
 | Name | How |
 |------|-----|
-| `standard` | optax's: the quintics of the matrix itself, three products an iteration, two of them by the matrix |
+| `standard` | optax's: the quintics of the matrix itself, three products per iteration, two of them by the matrix |
 | `gram` | Gram Newton-Schulz (Zhang, Amsel, Chen and Dao, 2026): the same quintics, on the Gram matrix of each matrix's shorter side |
 
-An iteration's quintic `a X + b (XXᵀ)X + c (XXᵀ)²X` is a polynomial of the Gram matrix
-`R = XXᵀ` times X. For an m×n matrix with m ≤ n, `gram` forms R once, iterates on
-m×m matrices (`Z = bR + cR²`, `Q ← Q(Z + aI)`, `R ← (Z + aI)R(Z + aI)`) and
-multiplies by X only at the end, and at its restarts: `QX`, the same orthogonalized
-matrix. The standard iteration multiplies by X twice an iteration. The further a
-matrix is from square, the more that saves. At 5 iterations, counting every product
-whole (XLA has no symmetric products), a Llama's MLP matrices (n ≈ 2.7m) take 22%
-fewer multiply-adds, a matrix four times as wide a third fewer, eight times 46%.
-Where it would not save any, below n = 1.5m and on square matrices, `gram` runs the
-standard iteration.
+For an m×n matrix X with m ≤ n, an iteration's quintic `a X + b (XXᵀ)X + c (XXᵀ)²X`
+is a polynomial of the Gram matrix `R = XXᵀ`, times X. `gram` forms R once, iterates
+on m×m matrices (`Z = bR + cR²`, `Q ← Q(Z + aI)`, `R ← (Z + aI)R(Z + aI)`), and
+multiplies by X only at the end and at its restarts, giving the same orthogonalized
+`QX`. The standard iteration multiplies by X twice per iteration, so the further a
+matrix is from square, the more `gram` saves. At 5 iterations, counting every product
+whole (XLA has no symmetric products):
 
-Under `gspmd`, a product by a matrix split along its longer side (FSDP's) is an
-all-reduce, so `gram` all-reduces less there too. Under `gather` and `owner` it runs
-on whole matrices, as the standard iteration does. Nothing about how matrices move
-changes ([Muon](../parallelism/muon.md)).
+| Matrix | Fewer multiply-adds |
+|--------|---------------------|
+| square, or n below 1.5m | none: `gram` runs the standard iteration |
+| a Llama MLP's, n ≈ 2.7m | 22% |
+| n = 4m | a third |
+| n = 8m | 46% |
 
-**Rounding.** The Gram matrix of a matrix near low rank has eigenvalues near zero,
-which rounding makes a little negative. Iterated on R, these grow until they blow
-up. So `gram` restarts: after each iteration in `ns_restarts` it multiplies X by
-the Q so far, forms R anew and starts Q again from I. That takes two more products by
-the matrix. Its authors restart five iterations once, after the second. `none`, the
-default, restarts after the second and every third after it (2, 5, 8, ...).
-Measured on CPU (2026-10-26) on 192×768 matrices of the authors' test spectra
-(decaying to 1e-9, or half zero), in bfloat16 and at 4 to 12 iterations of either
-quintic, that keeps the largest singular value within 0.07 of the standard
-iteration's. A single restart after the second drifts at six iterations and blows
-up from seven, past 10³ at eight. `ns_restarts=2` or `ns_restarts=[2, 4]` sets them.
+Under `gspmd`, a product by a matrix split along its longer side (as FSDP splits it)
+is an all-reduce, so `gram` also all-reduces less. Under `gather` and `owner` it runs
+on whole matrices, like the standard iteration. How matrices move does not change
+([Muon](../parallelism/muon.md)).
 
-In a 16-bit `ns_dtype`, `gram` normalizes in float32 and iterates in float16, as
-its authors do: bfloat16's 8 bits round the Gram matrix too coarsely. Its updates
-still move between devices in `ns_dtype`. Each `a` is added in float32 before the
-product is rounded, as a GEMM's epilogue adds: `Z + aI` rounded to 16 bits loses it,
-and a product rounded before `a` is added loses what cancels, which blows up eight
-iterations of Polar Express. The Gram matrix squares the condition number, so for an
-orthogonalization that needs more digits than Muon's do, use `standard` in float32.
+**Restarts.** The Gram matrix of a nearly low-rank matrix has eigenvalues near zero,
+which rounding pushes slightly negative. Iterated on R, they grow until they blow up.
+So `gram` restarts after each iteration in `ns_restarts`: it multiplies X by the Q so
+far, forms R anew, and resets Q to I, at the cost of two more products by the matrix.
+The default, `none`, restarts after the second iteration and every third after it
+(2, 5, 8, ...); `ns_restarts=2` or `ns_restarts=[2, 4]` sets others. On the authors'
+test spectra (192×768 matrices whose singular values decay to 1e-9, or are half
+zero; CPU, 2026-10-26), the default keeps the largest singular value within 0.07 of
+the standard iteration's, in bfloat16, at 4 to 12 iterations of either quintic. The
+authors' single restart, after the second iteration, drifts at six iterations and
+blows up from seven.
 
-On a B300, `gram` runs Newton-Schulz 1.05 to 1.4 times as fast as `standard` on
-matrices 2.75 to 8 times as wide as tall, and up to 12% slower at twice as wide. It
-is 6 to 8 times nearer float32's result than `standard` in bfloat16, and trains to
-the same loss. Muon's step and the run barely change: by `owner`, Newton-Schulz is a
-few milliseconds of a step. The authors' twice-as-fast needs symmetric GEMM kernels
-with fused epilogues, which XLA does not have
+**Dtypes.** In a 16-bit `ns_dtype`, `gram` normalizes in float32 and iterates in
+float16, as its authors do: bfloat16's 8 bits round the Gram matrix too coarsely. Its
+updates still move between devices in `ns_dtype`. Each `a` is added in float32
+before the product is rounded, as a GEMM epilogue would add it; rounded first, eight
+iterations of Polar Express blow up. The Gram matrix squares the condition number, so
+for an orthogonalization that needs more digits than Muon's, use `standard` in
+float32.
+
+**Speed.** On a B300 (2026-10-26), `gram` runs Newton-Schulz 1.05 to 1.4 times as
+fast as `standard` on matrices 2.75 to 8 times as wide as tall, and up to 12% slower
+at twice as wide. In bfloat16 it lands 6 to 8 times closer to float32's result than
+`standard` does, and trains to the same loss. A run's step barely changes, because
+under `owner` Newton-Schulz is a few milliseconds of it. The authors' 2x speedup needs
+symmetric GEMM kernels with fused epilogues, which XLA does not have
 ([measurements](../parallelism/muon.md#gram-newton-schulz-on-b300s)).
 
 ## Schedules
 
-A schedule multiplies the optimizer's `lr`. Each takes a linear `warmup`, then a
-curve of its own, and the multiplier at a step is their product. `warmup` is a number
-of steps, or below 1 a share of them: `warmup=0.01` is 1% of the steps.
+A schedule multiplies the optimizer's `lr`. Each starts with a linear `warmup` and
+then follows its own curve; the multiplier at a step is their product. `warmup` is a
+number of steps or, below 1, a share of them: `warmup=0.01` is 1% of the steps.
 
 | Schedule | Fields | After the warmup |
 |----------|--------|------------------|
@@ -191,9 +196,9 @@ of steps, or below 1 a share of them: `warmup=0.01` is 1% of the steps.
 
 ### The curves exactly
 
-Steps count from 0, the first step, to `steps - 1`, the last; write `s` for a step, `S`
-for `steps` and `W` for the steps of the warmup: `warmup`, or `round(warmup · S)`
-for a share.
+Steps count from 0, the first step, to `steps - 1`, the last. Below, `s` is a step,
+`S` is `steps`, and `W` is the number of warmup steps: `warmup`, or
+`round(warmup · S)` for a share.
 
 **Warmup.** The multiplier rises linearly from `1 / W` at step 0 to 1 at step `W - 1`:
 `min((s + 1) / W, 1)`. With `warmup=0` there is none.
@@ -201,32 +206,32 @@ for a share.
 **Cosine.** From the end of the warmup, `t = clip((s + 1 - W) / (H - W), 0, 1)`, with
 `H = round(horizon · S)`, runs from 0 to 1 at step `H - 1`, and the multiplier is
 `final + (1 - final) · ½ (1 + cos πt)`: the peak at the end of the warmup, `final` at
-the last step. With `horizon` above 1 the run stops before the cosine reaches
-`final`, as OLMo 2's and OLMo 3's do; below 1 it holds `final` from step `H - 1` on.
+the last step. With `horizon` above 1, the run stops before the cosine reaches
+`final`, as OLMo 2 and OLMo 3 do; below 1, it holds `final` from step `H - 1` on.
 
 **Warmup-stable-decay.** WSD (Hu et al., 2024) holds the peak, then cools down over
-the last `C = round(decay · S)` steps. There
-`t = clip((s + 1 - (S - C)) / C, 0, 1)` runs from 0 to 1 at the last step, and the
-multiplier is `final + (1 - final) · f(t)`, with `f` by `shape`:
+the last `C = round(decay · S)` steps. There, `t = clip((s + 1 - (S - C)) / C, 0, 1)`
+runs from 0 to 1 at the last step, and the multiplier is `final + (1 - final) · f(t)`,
+with `f` set by `shape`:
 
 | `shape` | `f(t)` |
 |---------|--------|
 | `linear` | `1 - t` |
 | `sqrt` | `1 - √t` (Hägele et al., 2024) |
 | `cosine` | `½ (1 + cos πt)` |
-| `exp` | `(e^-t - e^-1) / (1 - e^-1)`: it falls by e over the cooldown, moved to end at 0, as IBM's does |
+| `exp` | `(e^-t - e^-1) / (1 - e^-1)`: it falls by a factor of e over the cooldown, shifted to end at 0, as IBM's does |
 | `constant` | 0 from the cooldown's first step: `final` at once |
 
-`shape=geometric` is no `f`: the multiplier is `final^t`, falling by the same factor
+`shape=geometric` has no `f`: the multiplier is `final^t`, falling by the same factor
 at every step, as MiniCPM's exponential decay does, so its `final` must be above 0.
 
-So the last step of `cosine` and of `wsd` takes `final` times the peak: `wsd`'s
-default `final=0` takes a last step at a learning rate of 0, which the log shows as
-`lr 0.00e+00` at the end of the smoke run. Checkpoints from WSD's stable phase can be
-cooled down later, to study several run lengths at once.
+So the last step of `cosine` and of `wsd` runs at `final` times the peak. With
+`wsd`'s default `final=0`, the last step's learning rate is 0: the smoke run's log
+ends with `lr 0.00e+00`. Checkpoints from WSD's stable phase can be cooled down later,
+to study several run lengths at once.
 
 **Linear decay.** `linear_decay` decays from the end of the warmup:
-`t = clip((s + 1 - W) / (S - W), 0, 1)` and the multiplier is
+`t = clip((s + 1 - W) / (S - W), 0, 1)`, and the multiplier is
 `final + (1 - final) · (1 - t)`. With `final=0` it goes straight to zero, which
 Bergsma et al. (2025) find better than cosine and WSD.
 
@@ -236,22 +241,22 @@ tokens and to 10% at 90%: `multistep(warmup=2k, at=[0.8, 0.9], factor=0.316)`.
 
 **Power.** IBM's Power scheduler (Shen et al., 2024) sets the learning rate from the
 tokens trained through step `s`, `n = (s + 1) · batch · seq_len`:
-`p(s) = min(1, a · batch · n^b / lr)`, with `lr` the optimizer's peak. So `a` and `b`
-suit any batch and number of tokens, and `lr` only caps it: the paper's is 0.02,
-under µP. The warmup rises to `p(W - 1)` and holds `p` there; over the last
-`C = round(decay · S)` steps, the cooldown goes from `p(S - C - 1)` to `final` times
-it, as `wsd`'s goes from the peak. Under a `batch_ramp` or a
-[curriculum](curriculum.md), `n` counts the tokens of each step at its own batch and
-`seq_len`, and `batch` is the step's.
+`p(s) = min(1, a · batch · n^b / lr)`, where `lr` is the optimizer's peak. So `a` and
+`b` suit any batch and any number of tokens, and `lr` only caps the result: the
+paper's is 0.02, under µP. The warmup rises to `p(W - 1)` and holds `p` from there.
+Over the last `C = round(decay · S)` steps, the cooldown goes from `p(S - C - 1)` to
+`final` times it, as `wsd`'s goes from the peak. Under a `batch_ramp` or a
+[curriculum](curriculum.md), `n` counts each step's tokens at that step's batch and
+`seq_len`, and `batch` is the step's own.
 
-**Piecewise.** Piece `k` takes the steps from `b` to `e = round(until · S)`, where the
-first piece starts at `W` and every other where the one before ends. It goes from
-the multiplier `m` the piece before ended at (the peak, for the first) to its `to`
-(or stays at `m` with `to=none`) along its `shape`: `to + (m - to) · f(t)`, with
-`t = clip((s + 1 - b) / (e - b), 0, 1)`, and `m · (to / m)^t` for `geometric`. A
-piece's default `shape=constant` is at `to` from its first step. DeepSeek-V3 holds
+**Piecewise.** Piece `k` covers the steps from `b` to `e = round(until · S)`. The
+first piece starts at `W`, and every other where the one before it ends. A piece goes
+from the multiplier `m` where the piece before ended (the peak, for the first) to its
+`to`, or stays at `m` with `to=none`, along its `shape`: `to + (m - to) · f(t)`, with
+`t = clip((s + 1 - b) / (e - b), 0, 1)`, or `m · (to / m)^t` for `geometric`. A
+piece's default, `shape=constant`, is at `to` from its first step. DeepSeek-V3 holds
 the peak to 10T of its 14.8T tokens, decays along a cosine to 10% by 14.3T, holds
-that to 14.633T and drops to 3.3% for the rest:
+that to 14.633T, and drops to 3.3% for the rest:
 
 ```bux
 schedule = piecewise(warmup=2k, pieces=[piece(until=10 / 14.8),
@@ -261,17 +266,17 @@ schedule = piecewise(warmup=2k, pieces=[piece(until=10 / 14.8),
 ```
 
 :::{note}
-The warmup and the cooldown must fit in the steps: `bux check` fails a run whose
-warmup and cooldown, `round(decay · steps)` for `wsd` and `power`, take more than
-`steps`, and a `piecewise` whose warmup ends after its first piece, at the line of
-the schedule ([Checks](settings.md#checks)).
+The warmup and the cooldown must fit in the steps. `bux check` fails a run whose
+warmup plus cooldown (`round(decay · steps)` for `wsd` and `power`) is more than
+`steps`, and a `piecewise` whose warmup ends after its first piece. The error points
+at the schedule's line ([Checks](settings.md#checks)).
 :::
 
 ### Schedules from tech reports
 
 `examples/experiments/recipes/lr_schedules.bux` defines the pretraining schedules of
-25 tech reports by name (`deepseek_v3`, `kimi_k2`, `olmo_2`, ...), with what each
-leaves out. A run uses one, or sweeps them, next to its own optimizer, as
+25 tech reports by name (`deepseek_v3`, `kimi_k2`, `olmo_2`, ...), each with a note on
+what it leaves out. A run uses one, or sweeps several, next to its own optimizer, as
 `examples/experiments/schedule_sweep.bux` does:
 
 ```bux
@@ -279,7 +284,7 @@ use lr_schedules
 schedule = deepseek_v3 | kimi_k2 | olmo_2 | d2z
 ```
 
-Where a report gives tokens, the recipe has shares of its run, so a shorter run keeps
+Where a report gives tokens, the recipe uses shares of the run, so a shorter run keeps
 the shape. As of October 2026, the reports use these shapes:
 
 | Shape | Reports | In bux |
@@ -296,8 +301,8 @@ the shape. As of October 2026, the reports use these shapes:
 | Chained phases | DeepSeek-V3 and V4.1, MiMo-7B and V2-Flash, MiniMax-Text-01, GLM-5 | `piecewise(pieces=[...])` |
 | A re-warmup | Moonlight, Marin 8B, Trinity's context extension | a rising `piece(to=0.24, shape=linear)` |
 
-Moonlight's, whose re-warmup is 100 steps long, is written in a run that knows its
-steps:
+Moonlight's re-warmup is 100 steps long, so its schedule is written in a run that
+knows its steps:
 
 ```bux
 # A cosine to 10% by 5.2T of 5.7T tokens, back up to 24% in 100 steps, then
@@ -308,22 +313,27 @@ schedule = piecewise(warmup=2k, pieces=[piece(until=5.2 / 5.7, to=0.1, shape=cos
                                         piece(to=0, shape=linear)])
 ```
 
-Not in bux: Ling 2.0's WSM, which holds the peak and merges checkpoints instead of
-decaying; WSD-S's repeated cooldowns, which are as many pieces; Zamba's exponential
-anneal, whose time constant differs from `exp`'s; and modded-nanogpt's multipliers
-that step with its batch size. A long-context stage at the final learning rate is a
-run of its own at `constant`. Qwen3, Gemma 3 and 4, gpt-oss, Llama 4, Jamba, Kimi
-K2.5, MiniMax-M2 and M3, Inkling and Beam state no schedule.
+Not in bux:
+
+- Ling 2.0's WSM, which holds the peak and merges checkpoints instead of decaying;
+- WSD-S's repeated cooldowns, which would be as many pieces;
+- Zamba's exponential anneal, whose time constant differs from `exp`'s;
+- modded-nanogpt's multipliers, which step with its batch size.
+
+A long-context stage at the final learning rate is a separate run at `constant`.
+Qwen3, Gemma 3 and 4, gpt-oss, Llama 4, Jamba, Kimi K2.5, MiniMax-M2 and M3, Inkling
+and Beam state no schedule.
 
 The log's `lr` is the learning rate of the step just taken. A new schedule is a
 function registered under its name ([Registries](extending.md#registries)).
 
 ## Clipping
 
-`clip = 1.0`, the default, scales the gradient down to a global norm of 1 wherever its
-norm is larger, before the optimizer sees it (`optax.clip_by_global_norm`). `clip =
-none` turns it off; `clip = 0`, which some frameworks take for off, is an error, as
-a norm of 0 would leave the optimizer no gradient. The log's `grad_norm` is the norm before clipping.
+`clip = 1.0`, the default, scales the gradient down to a global norm of 1 whenever
+its norm is larger, before the optimizer sees it (`optax.clip_by_global_norm`).
+`clip = none` turns clipping off; `clip = 0`, which some frameworks take for off, is
+an error, as a norm of 0 would leave the optimizer no gradient. The log's
+`grad_norm` is the norm before clipping.
 
 ## The loss
 
@@ -340,19 +350,18 @@ The objective is the cross-entropy of the model's first head, plus these terms:
 
 Each head predicts one token further ahead for every `nextn` before it, so a model
 with heads after its first predicts several tokens at each position
-([Several outputs](../language/outputs.md)). Every term is a mean over the target
-tokens of the batch, not over rows, so a row of many short replies weighs no more than
-a row of one long one ([Rows](../data/index.md#rows)). The cross-entropy keeps its
-gradient where float32 rounds a target's probability to 1
+([Several outputs](../language/outputs.md)). Every term is a mean over the batch's
+target tokens, not over rows, so a row of many short replies weighs no more than a
+row of one long one ([Rows](../data/index.md#rows)). The cross-entropy keeps its
+gradient even where float32 rounds a target's probability to 1
 ([Softmax and cross-entropy at large margins](precision.md#softmax-and-cross-entropy-at-large-margins)).
 
-The log has each term by name: `loss`, the first head's cross-entropy alone, then
-`z_loss` with a z-loss and `mtp` with heads after the first. Layers add terms of
-their own, an MoE's balance loss and a sparse attention indexer's loss, which the log
-has by their names (`balance_loss`, `indexer_loss`): see
-[Experts](../architectures/experts.md) and [Attention](../architectures/attention.md).
-Eval leaves those out.
+The log names each term: `loss` is the first head's cross-entropy alone, then
+`z_loss` with a z-loss, and `mtp` with heads after the first. Layers add their own
+terms, such as an MoE's balance loss and a sparse attention indexer's loss, which the
+log names `balance_loss` and `indexer_loss` (see [Experts](../architectures/experts.md)
+and [Attention](../architectures/attention.md)). Eval leaves those out.
 
-How the loss takes a head's logits, by chunks of positions or whole, is
-`methods.loss` ([The loss's methods](extending.md#loss-methods)). A term of
-your own is a function ([Objective terms](extending.md#objective-terms)).
+Whether the loss takes a head's logits in chunks of positions or whole is
+`methods.loss` ([Loss methods](extending.md#loss-methods)). A term of your own is a
+function ([Objective terms](extending.md#objective-terms)).

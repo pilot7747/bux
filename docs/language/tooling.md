@@ -1,14 +1,15 @@
 (lang-tooling)=
 # Tools and editor support
 
-This page covers the commands that show what a `.bux` file means without training
-it, `bux check`, `bux render`, `bux fmt` and `bux json`; the format of the errors
-they report; and the language server `bux-lsp`, which brings the same checks,
-completion and hover into your editor. None of these import JAX, so they answer in
-well under a second. Training commands are in [Running](../training/running.md), and
-every option is in the [command-line reference](../reference/cli.md). To see a file
-drawn as a diagram, and to edit its model, training and sweep in a browser, use
-[bux studio](studio.md).
+Four commands show what a `.bux` file means without training it: `bux check`,
+`bux render`, `bux fmt` and `bux json`. None of them imports JAX, so each answers in
+well under a second. The language server `bux-lsp` brings the same checks, with
+completion and hover, into your editor. This page covers the commands, the errors
+they report, and how to set up your editor.
+
+Training commands are in [Running](../training/running.md), and every option is in
+the [command-line reference](../reference/cli.md). To see a file drawn as a diagram
+and edit it in a browser, use [bux studio](studio.md).
 
 ## Commands
 
@@ -20,14 +21,15 @@ bux json   examples/architectures/qwen3_next.bux  # the IR
 ```
 
 Every command takes [statements after the file](modules.md#the-command-line), which
-redefine the file's: `bux check model.bux d_model=1024 'attn.num_kv_heads = 1'`.
-`--entry NAME` builds another definition than `model`, for a look at one block:
+redefine the file's definitions:
+`bux check model.bux d_model=1024 'attn.num_kv_heads = 1'`. `--entry NAME` builds a
+definition other than `model`, to look at one block:
 `bux render model.bux --entry block`.
 
 ### `bux check`
 
 Compiles the file and prints a summary: the width, the vocabulary and the layers by
-type, then for a run its budget and settings, and for a sweep its axes.
+type. For a run it adds the budget and settings, and for a sweep the axes.
 
 ```console
 $ bux check examples/architectures/qwen3_next.bux
@@ -46,13 +48,13 @@ sweep: 2 runs over optimizer.lr (1e-3 | 3e-3)
 ```
 
 A file without a model is a module, and `bux check` lists what it defines
-([Runs and modules](modules.md#runs-and-modules)). With errors, it prints all of
-them and exits with status 1.
+([Runs and modules](modules.md#runs-and-modules)). When there are errors, it prints
+all of them and exits with status 1.
 
 ### `bux render`
 
-Draws the model as a circuit of the residual stream, then each labeled block it uses
-underneath:
+Draws the model as a circuit of the residual stream, with each labeled block it uses
+drawn underneath:
 
 ```console
 $ bux render examples/architectures/qwen3_next.bux
@@ -97,7 +99,7 @@ model
 
 ### `bux fmt`
 
-Prints the file in canonical form. It prints the compiled IR, not your file:
+Prints the file in canonical form. It prints the compiled IR, not your text:
 
 - macros are inlined, and numeric definitions replaced by their values;
 - patterns are spelled out, `"DDDA"^12` as `(D D D A)^12`;
@@ -124,14 +126,15 @@ mtp = $h nextn(norm=norm) A norm out
 model = embed (D D D A)^12 norm @h out mtp
 ```
 
-For a run, `bux fmt` prints the whole run as one file, with a header naming it and
-its id, no modules, no alternatives and every training setting resolved (those at
-their defaults left out). For a sweep it prints every run, one after another.
+For a run, `bux fmt` prints the whole run as one file. A header names the run and its
+id, and there are no modules and no alternatives: every training setting is resolved,
+and those at their defaults are left out. For a sweep it prints every run, one after
+another.
 
-Printing is exact: compiling the printed source gives the same IR up to labels, and
-a run's printed source compiles back to a run with the same id. The printer is
-{py:func}`bux.lang.printer.to_source`, and it prints any IR, including IR that a
-program generated or mutated, such as an architecture search.
+Printing is exact. Compiling the printed source gives the same IR up to labels, and a
+printed run compiles back to a run with the same id. The printer is
+{py:func}`bux.lang.printer.to_source`. It prints any IR, including IR that a program
+generated or mutated, such as an architecture search.
 
 ### `bux json`
 
@@ -145,7 +148,7 @@ $ bux json examples/architectures/llama3_8b.bux | head -5
   "d_model": 4096,
   "vocab_size": 128256,
   "residual": null,
-  "graph": {
+  "init": null,
 ```
 
 (lang-errors)=
@@ -165,8 +168,8 @@ error: gqa has no setting 'num_kv_head'
 Each error has:
 
 - the message, after `error:`;
-- the place, `file:line:column`, in the file the error is in (a module's error
-  points into the module, a statement on the command line at `<command line>`);
+- the place, `file:line:column`, in the file the error is in. An error in a module
+  points into the module, and one in a command-line statement at `<command line>`;
 - the line, with carets under the span at fault;
 - often a hint: a suggestion for a misspelled name, or how to write what was meant.
 
@@ -179,9 +182,9 @@ hint: d_model = 4096
 
 **Every command reports all the errors it finds**, not just the first:
 
-- a syntax error loses only its own statement: a statement starts at each line
-  that begins in the first column, unless the line is inside a bracket still open
-  and does not parse on its own, so an unclosed bracket costs one definition;
+- a syntax error loses only its own statement. A statement starts at each line that
+  begins in the first column, unless the line is inside a bracket still open and
+  does not parse on its own, so an unclosed bracket costs one definition;
 - each definition is checked on its own;
 - an error is not repeated at every use of a broken definition;
 - every alternative of a sweep is checked ([Checking a sweep](sweeps.md#checking-a-sweep)).
@@ -193,7 +196,7 @@ raises the first as a {py:class}`bux.lang.syntax.BuxError`.
 (lang-editor)=
 ## Editor support
 
-`bux-lsp` is a language server: it speaks the Language Server Protocol over stdio.
+`bux-lsp` is a language server that speaks the Language Server Protocol over stdio.
 It needs the `lsp` extra. In a checkout of bux:
 
 ```sh
@@ -221,10 +224,8 @@ It provides:
   - for a tap, where it is written, read and popped.
 
 Modules resolve as on the command line: from the file's own folder, then the module
-path ([The module path](modules.md#the-module-path)).
-
-The features are plain functions in `bux.lang.lsp.features`, so they can be tested
-without an editor.
+path ([The module path](modules.md#the-module-path)). The features are plain
+functions in `bux.lang.lsp.features`, so you can test them without an editor.
 
 ### PyCharm and other JetBrains IDEs
 
