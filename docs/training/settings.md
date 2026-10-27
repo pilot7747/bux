@@ -41,7 +41,7 @@ fields and documents them on hover, as it does for layers
 | `batch` | a positive integer | required | rows per step, over all devices |
 | `batch_ramp` | {bux}`ramp`, or `none` | `none` | a smaller batch at the first step that grows to `batch` ([Batch ramps](curriculum.md#batch-ramps)) |
 | `steps` | a positive integer | required | optimizer steps |
-| `curriculum` | {bux}`phase`, or a list of them | `[]` | phases that change `seq_len`, `batch` or `data` from a step on ([Curriculum](curriculum.md)) |
+| `curriculum` | {bux}`phase`, or a list of them | `[]` | phases that change `seq_len`, `batch`, `data` or full attention's RoPE from a step on ([Curriculum](curriculum.md)) |
 | `seed` | an integer | `0` | the model's initial weights, the order of the data, and every random stream |
 | `clip` | a number above 0, or `none` | `1.0` | the global norm gradients are clipped to ([Clipping](optimizers.md#clipping)) |
 | `loss` | {bux}`loss` | `loss` | the weights of the z-loss and of multi-token prediction ([The loss](optimizers.md#the-loss)) |

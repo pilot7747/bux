@@ -462,7 +462,9 @@ class Trainer:
     step of a `switch`, the steps take up its precision, and compile again; so they
     do at a batch of a new shape, as a curriculum's phase or a batch ramp makes, and
     under remat `auto` choose their policy again, for a longer row may not fit under
-    the one before's.
+    the one before's. From each step of `remodel` on, the model computes as another
+    of the same variables, as a phase's RoPE makes it, and the steps and the evals
+    compile again.
 
     Made inside `bux.parallel.use`, it puts its state on the shardings the layout
     gives it, and every step keeps it there. A step that runs its layers more than
@@ -502,6 +504,11 @@ class Trainer:
             format's name for all of them.
         switch: The step at which the steps take up another precision, and that
             precision (`bux.architecture.precision.matmuls.late`); None for none.
+        remodel: The steps from which the model computes as another does, in
+            order, each with a function that makes that one: a model of the same
+            variables, as the RoPE a curriculum's phase sets
+            (`bux.lang.ir.Run.arch_at`). From its step on, in training and in evals,
+            the model takes that one's graph, and keeps its variables.
         microbatches: The microbatches a step accumulates its gradients over; 1
             under a pipeline, which takes them through its stages.
         interleave: Run each microbatch's forward beside the one before's backward.
@@ -555,6 +562,7 @@ class Trainer:
         compute: DTypeLike = jnp.float32,
         matmuls: PrecisionConfig | str = "compute",
         switch: tuple[int, PrecisionConfig] | None = None,
+        remodel: Sequence[tuple[int, Callable[[], Model]]] = (),
         microbatches: int = 1,
         interleave: bool = False,
         gather: str = "step",
@@ -590,6 +598,8 @@ class Trainer:
         self._compiler_options = compiler_options or {}
         self._reductions = reductions
         self._shape: tuple[int, ...] | None = None  # of the batches the steps took
+        self._remodel, self._taken = list(remodel), 0  # how many the model took
+        self._graphs = {0: nnx.graphdef(model)}  # by how many of `remodel` are due
         self._compile()
 
     def _compile(self) -> None:
@@ -1016,6 +1026,7 @@ class Trainer:
             The step's metrics (`train_step`), still on the device.
         """
         self._switch_if_due()
+        self._remodel_if_due()
         self._compile_if_reshaped(batch.input_ids.shape)
         observes = self.observes(self.step + 1)
         step = self._observed_step() if observes else self._train
@@ -1041,6 +1052,19 @@ class Trainer:
         if self.switch is not None and self.step >= self.switch[0]:
             self.matmuls, self.switch = self.switch[1], None
             self._compile()
+
+    def _remodel_if_due(self) -> None:
+        """Take up the graph of the latest `remodel` due at `step`, the model's own
+        before the first, and make the steps again where it is new."""
+        due = sum(start <= self.step for start, _ in self._remodel)
+        if due == self._taken:
+            return
+        if due not in self._graphs:
+            make = self._remodel[due - 1][1]
+            self._graphs[due] = nnx.graphdef(nnx.eval_shape(make))
+        self.model = nnx.merge(self._graphs[due], nnx.state(self.model))
+        self._taken = due
+        self._compile()
 
     def _compile_if_reshaped(self, shape: tuple[int, ...]) -> None:
         """Make the steps again for batches of a new `shape`: under remat `auto`, so
@@ -1074,6 +1098,7 @@ class Trainer:
             held_out = batches(eval_data, run.train, vocab, held_out=True)
             trainer.evaluate(itertools.islice(held_out, 10))  # {"loss": 3.21}
         """
+        self._remodel_if_due()
         self.model.eval()
         try:
             sums = [
@@ -1306,6 +1331,7 @@ def train(
             compute=precision.compute,
             matmuls=precision,
             switch=matmuls.late(precision, config.steps),
+            remodel=_remodel(run),
             microbatches=_accumulated(config.methods.microbatches),
             interleave=config.methods.interleave,
             gather=config.methods.gather,
@@ -1339,6 +1365,21 @@ def train(
             ],
         )
     return latest.metrics
+
+
+def _remodel(run: ir.Run) -> list[tuple[int, Callable[[], Model]]]:
+    """Return the steps from which the run's model computes as another, by the RoPE
+    its phases set (`bux.lang.ir.Run.arch_at`), each with a function that makes it."""
+    found, before = [], run.arch
+    for start, _ in curriculum.ropes(run.train)[1:]:
+        if (arch := run.arch_at(start)) != before:
+            found.append((start, functools.partial(_model, arch, run.train.seed)))
+        before = arch
+    return found
+
+
+def _model(arch: ir.Architecture, seed: int) -> Model:
+    return Model(arch, rngs=nnx.Rngs(seed))
 
 
 def _about(run: ir.Run, folder: Path, trainer: Trainer) -> list[str]:

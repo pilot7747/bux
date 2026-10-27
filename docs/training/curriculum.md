@@ -2,7 +2,8 @@
 
 What a run reads can change as it trains. A `curriculum` is a list of phases, each of
 which takes rows of another `seq_len`, another `batch` or other `data` from a step
-on: a sequence-length ramp-up, a long-context extension at the end, an annealing mix.
+on, and may switch full attention's RoPE to YaRN: a sequence-length ramp-up, a
+long-context extension at the end, an annealing mix.
 A `batch_ramp` grows the batch over the first steps, as GPT-3's and DeepSeek-V3's do.
 
 ```bux
@@ -37,6 +38,8 @@ settings are in force.
 | `seq_len` | `none` | tokens per row; none: as before |
 | `batch` | `none` | rows per step; none: as before |
 | `data` | `none` | a source or a mixture; none: as before |
+| `rope_scaling` | `none` | the RoPE scaling of full-attention layers, `yarn(...)`, `pi(...)` or `llama3(...)`; none: as before ([Long-context extension](#long-context-extension)) |
+| `rope_base` | `none` | the RoPE base of full-attention layers; none: as before |
 
 A list of phases goes in the order they start. A phase may be written alone; a list
 of one is `[phase(...),]`, since `[phase(...)]` is a residual branch
@@ -69,6 +72,55 @@ data=synthetic()
 A gradual sequence-length warmup, with a new length every few steps, would compile
 one step and prepare one dataset per length ([Compiles](#compiles)). So bux writes it
 as a few phases, each a stretch of the run at one length.
+
+## Long-context extension
+
+A phase can extend the context the way DeepSeek-V3 and Qwen do: train the last
+stretch on long rows, with full attention's RoPE scaled by YaRN.
+
+```bux
+seq_len    = 2048
+curriculum = phase(at=0.9, seq_len=16384, batch=batch // 8, data=long,
+                   rope_scaling=yarn(factor=8, original_max_len=2048))
+```
+
+From the phase's first step on, every attention layer that rotates and has no
+`sliding_window_size` takes the phase's `rope_scaling` in place of its own: `gqa`,
+the rotated part of `mla`, and partial RoPE (`rope(fraction=...)`) alike. A sparse
+attention's indexer rotates as its layer does. Layers with a window, and layers
+without RoPE, are unchanged, so a hybrid of local and global attention scales its
+global layers alone, as Gemma 3 does. `rope_base` raises the base of the same
+layers instead, or as well (Llama 3's ABF):
+
+```bux
+curriculum = phase(at=0.9, seq_len=16384, rope_base=1e6)
+```
+
+Both stay in force through the phases after it, unless one sets its own. They apply
+to everything the model computes from the phase's start on:
+
+- the training steps of the phase, and of every phase after it;
+- every eval made at the phase's first step or later, the last one too, even at the
+  run's own `seq_len`; the evals before it compute without them;
+- a run resumed from a checkpoint before or inside the phase;
+- an export of a checkpoint from the phase's start on, whose model carries the
+  scaling ([Exporting](../export/index.md)).
+
+RoPE has no parameters, so the switch keeps every weight as it is: the steps and
+the evals compile again with the new frequencies. `bux check` shows the switch on
+the phase's line:
+
+```console
+$ bux check examples/experiments/smoke.bux steps=100 \
+    'curriculum = phase(at=0.9, seq_len=512, rope_scaling=yarn(factor=8, original_max_len=64))'
+d_model=64 vocab_size=512 layers=11
+rmsnorm×5  gqa×2  gated_mlp×2  embed×1  head×1
+100 steps = 87k tokens
+from step 0: 8 × 64 tokens
+phase 1, from step 90: 8 × 512 tokens, rope_scaling=yarn(factor=8.0, original_max_len=64)
+optimizer=adamw(lr=0.003) schedule=wsd(warmup=10)
+data=synthetic()
+```
 
 ## Batch ramps
 
@@ -109,13 +161,15 @@ before it left each source:
   ([Determinism](../data/sources.md#determinism)).
 
 An eval reads rows of the run's own `seq_len` and `batch`, whichever phase it is in,
-so its loss compares across phases. An eval that sets its own reads those instead
+so its loss compares across phases; it computes with the RoPE in force at its step
+([Long-context extension](#long-context-extension)). An eval that sets its own reads those instead
 ([Long rows](running.md#long-rows)): use one to measure the long rows a long-context
 phase trains on.
 
 ## Compiles
 
-The step compiles again wherever the shape of its batch changes. Under
+The step compiles again wherever the shape of its batch changes, and the step and
+the evals wherever a phase changes the RoPE. Under
 `methods(remat=auto)` it also chooses its remat policy again, since a longer row may
 not fit under the previous one ([Remat](../parallelism/remat.md)). The console's
 `compiled in`, in the log after each compile, says how long it took:
@@ -183,3 +237,16 @@ for s in stretches(run.train):
 A {py:class}`~bux.train.trainer.Trainer` in a script follows them when it trains
 on {py:func}`~bux.train.data.training_batches`, and compiles again at each new shape
 by itself ([A Trainer in a script](extending.md#a-trainer-in-a-script)).
+{py:meth}`bux.lang.ir.Run.arch_at` returns the model as it computes at a step, with
+the RoPE its phase sets; a `Trainer` takes it up from that step with `remodel`:
+
+```python
+from flax import nnx
+
+from bux.architecture import Model
+
+long = run.arch_at(run.train.steps)  # the RoPE of the last phase
+trainer = Trainer(
+    model, tx, loss, remodel=[(900, lambda: Model(long, rngs=nnx.Rngs(0)))]
+)
+```
