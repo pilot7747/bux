@@ -6,10 +6,11 @@ of those it keeps, by index, for all heads or for each kv head's group of them; 
 `Part` is keys and values with both. A layer's parts (CSA's window and its latents)
 share one softmax, and the sinks, merged by their logsumexp (`attend`).
 
-On a GPU, tokamax's flash kernel runs each part with its kept keys as a boolean mask:
-dense compute, exact, and t² bits of mask forward and bytes backward. Under
-``methods.attention = xla``, off a GPU, or inside `bux.kernels.off`, XLA runs it a
-chunk of queries at a time (`chunked`). Both return each query's logsumexp, from
+On a GPU, tokamax's flash kernel runs each part with its kept keys as a boolean mask,
+in heads of up to `~bux.parallel.flash.TOKAMAX_HEAD_DIM` dims: dense compute, exact,
+and t² bits of mask forward and bytes backward. Under ``methods.attention = xla``,
+off a GPU, inside `bux.kernels.off`, or for wider heads, XLA runs it a chunk of
+queries at a time (`chunked`). Both return each query's logsumexp, from
 which the backward pass computes the probabilities again, as `probabilities` does for
 the indexer's loss. CSA's latents, 512 wide, which tokamax's kernels do not take, run
 by cuDNN's DSA kernels on a B200 or B300 where they take them
@@ -30,12 +31,17 @@ from bux import jax_internals, kernels, parallel
 from bux.architecture.attention import scoring
 from bux.architecture.common.segments import Segments
 from bux.parallel.context import softcap
-from bux.parallel.flash import MOSAIC, finite, per_query_head, tokamax_lse
+from bux.parallel.flash import (
+    MOSAIC,
+    TOKAMAX_HEAD_DIM,
+    finite,
+    per_query_head,
+    tokamax_lse,
+)
 from bux.train import flops
 
 KEPT = "mask of kept keys (an indexer's top-k, or CSA's compression)"
 ELEMENTS = 1 << 27  # the most a chunk of queries makes of an intermediate
-HEAD_DIMS = 256  # the widest heads tokamax's kernels take
 F32 = jnp.float32
 
 
@@ -242,9 +248,10 @@ def attend(
     each part, the parts and the sinks in one softmax in float32.
 
     Under ``methods.attention`` ``auto`` or ``tokamax``, tokamax's flash kernel runs
-    each part on a GPU in bfloat16 or float16 whose heads are 256 dims at most; XLA
-    runs the others a chunk of queries at a time, as it runs every part under
-    ``xla``. With ``seq`` over ``context`` a device has its queries and every key:
+    each part on a GPU in bfloat16 or float16 whose heads are
+    `~bux.parallel.flash.TOKAMAX_HEAD_DIM` (192) dims at most, as dense attention's
+    do; XLA runs the others a chunk of queries at a time, as it runs every part
+    under ``xla``. With ``seq`` over ``context`` a device has its queries and every key:
     all-gather context parallelism.
 
     Args:
@@ -312,8 +319,7 @@ def _flash(q: Float[Array, "b t h dk"]) -> bool:
     """Return whether the parts run by tokamax: under `tokamax`, or `auto` on a GPU in
     bfloat16 or float16, which its kernels take. `xla` runs them by XLA; the other
     methods have no mask of kept keys."""
-    on = parallel.active()
-    name = on.methods.attention if on else "auto"
+    name = parallel.choice("attention")
     if name not in ("xla", "auto", "tokamax"):
         raise NotImplementedError(
             f"methods.attention = {name} has no {KEPT}; xla, tokamax and auto have"
@@ -384,11 +390,11 @@ def _forward(
 
 
 def _runs(part: Part, static: _Static) -> tuple[Callable, Callable]:
-    """Return the forward and backward of `part`: tokamax's, for heads it takes (its
-    kernels run out of shared memory past 256 dims, as CSA's 512 do), a group at a
-    time if it keeps slots for each; else XLA's. A part's forward and backward are
-    each exact alone."""
-    if static.flash and max(part.k.shape[-1], part.v.shape[-1]) <= HEAD_DIMS:
+    """Return the forward and backward of `part`: tokamax's, for heads up to dense
+    attention's `~bux.parallel.flash.TOKAMAX_HEAD_DIM` (on a B300 its backward finds
+    no tiling for heads of 256), a group at a time if it keeps slots for each; else
+    XLA's. A part's forward and backward are each exact alone."""
+    if static.flash and max(part.k.shape[-1], part.v.shape[-1]) <= TOKAMAX_HEAD_DIM:
         flash = _flash_fwd, _flash_bwd
         return by_group(*flash) if per_group(part) else flash
     return _xla_fwd, _xla_bwd

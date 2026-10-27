@@ -13,6 +13,7 @@ from dataclasses import dataclass
 
 from bux import config as cfg
 from bux.lang import ir
+from bux.lang.printer import port_to_source
 
 
 @dataclass(frozen=True)
@@ -115,7 +116,10 @@ def _starts_with_ref(node: ir.Node) -> bool:
 class _Renderer:
     def __init__(self, collapse: bool):
         self.collapse = collapse
-        self.blocks: dict[str, ir.Node] = {}  # labeled blocks met so far, in order
+        self.blocks: dict[str, ir.Node] = {}  # labeled blocks met so far, by title
+        # Each block's title, by its label and structure: two blocks of one label, as
+        # a macro call's text in two calls of another macro, are drawn apart.
+        self.titles: dict[str, str] = {}
 
     def leaf_text(self, node: ir.Layer) -> str:
         if node.label is not None:
@@ -125,19 +129,20 @@ class _Renderer:
         else:
             text = node.config.type
         if node.ports:
-            marks = {"write": "@", "read": "$", "pop": "$"}
-            text += (
-                "("
-                + ", ".join(f"{p.name}={marks[p.mode]}{p.tap}" for p in node.ports)
-                + ")"
-            )
+            text += f"({', '.join(port_to_source(p) for p in node.ports)})"
         return text
 
     def collapsed(self, node: ir.Node) -> str | None:
         if not self.collapse or node.label is None or isinstance(node, ir.Layer):
             return None
-        self.blocks.setdefault(node.label, node)
-        return f"┤{node.label}├"
+        key = ir.strip(node, labels=False).model_dump_json()
+        if (title := self.titles.get(key)) is None:
+            title, i = node.label, 2
+            while title in self.blocks:
+                title, i = f"{node.label}_{i}", i + 1
+            self.titles[key] = title
+            self.blocks[title] = node
+        return f"┤{title}├"
 
     def box(self, node: ir.Node) -> _Box:
         if (name := self.collapsed(node)) is not None:
@@ -203,7 +208,9 @@ def render(arch: ir.Architecture, *, expand: bool = False) -> str:
     A repeat is drawn once with its count (``┤block├×2``, or a frame marked ``×2``),
     and parallel branches are stacked between a fork and their merge. Taps show as
     ``@name`` and reads as ``$name``; a branch that starts by reading a tap is not
-    fed from the fork.
+    fed from the fork. Two different blocks of one label, such as a macro call that
+    another macro writes once and calls with two arguments, are drawn apart, the
+    second as ``name_2``.
 
     Args:
         arch: The architecture to draw.

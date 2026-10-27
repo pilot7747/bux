@@ -34,7 +34,8 @@ TRANSFORMERS_CACHE = (
 
 class BuxConfig(PreTrainedConfig):
     """A bux architecture as vLLM loads it: ``bux`` is its IR as JSON
-    (``bux json``), ``bux_sites`` each layer's place (`bux.export.plan`)."""
+    (``bux json``), ``bux_sites`` each layer's place (`bux.export.plan`), and
+    ``bux_reserved`` the names no module took, which the plan names them by too."""
 
     model_type = "bux"
 
@@ -42,6 +43,7 @@ class BuxConfig(PreTrainedConfig):
         self,
         bux: dict | None = None,
         bux_sites: dict | None = None,
+        bux_reserved: list | None = None,
         vocab_size: int = 0,
         hidden_size: int = 0,
         **kwargs: Any,
@@ -50,8 +52,9 @@ class BuxConfig(PreTrainedConfig):
             kwargs.pop(name, None)
         super().__init__(**kwargs)
         self.bux, self.bux_sites = bux, bux_sites
+        self.bux_reserved = bux_reserved or []
         self.vocab_size, self.hidden_size = vocab_size, hidden_size
-        calls = live(plan(bux).calls) if bux else []
+        calls = live(plan(bux, self.bux_reserved).calls) if bux else []
         self.layer_types = [
             STATES[c.layer["config"]["type"]]
             for c in calls

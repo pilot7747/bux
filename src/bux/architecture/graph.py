@@ -15,7 +15,8 @@
 
 Each residual branch outside any other is rematerialized as the run's
 ``methods.remat`` says (`bux.architecture.repeats.remat`), and observed by its name
-on the steps a run observes (`bux.architecture.observe`).
+on the steps a run observes (`bux.architecture.observe`), as is each layer outside
+any branch.
 """
 
 import functools
@@ -39,15 +40,16 @@ class Sequence(nnx.Module):
     Those that are residual branches outside any other are numbered, for the
     precision's first and last (`~bux.architecture.repeats.tracing.branch`),
     rematerialized as the run's ``methods.remat`` says
-    (`~bux.architecture.repeats.remat.rematted`), and observed by their names.
+    (`~bux.architecture.repeats.remat.rematted`), and observed by their names; so
+    are the layers outside any branch.
 
     Args:
         items: The modules, in the order they run.
         branches: For each item, whether it is a residual branch outside any other;
             none of them, by default.
-        names: For each item, what its metrics are named by
-            (`~bux.architecture.observe.item_name`): a branch's and a layer's, None
-            for an item whose own items are named; none, by default.
+        names: For each item, what its metrics are named by (`names`): a branch's
+            and a layer's outside any branch, None for an item whose own items are
+            named or are a branch's; none, by default.
     """
 
     def __init__(
@@ -64,8 +66,19 @@ class Sequence(nnx.Module):
         for item, branch, name in zip(
             self.items, self.branches, self.names, strict=True
         ):
-            x = run_branch(item, x, taps, name) if branch else item(x, taps)
+            x = run_item(item, branch, name, x, taps)
         return x
+
+
+def run_item(
+    item: nnx.Module, branch: bool, name: str | None, x: Stream, taps: Taps
+) -> Stream:
+    """Run an item of a sequence: as a branch outside any other (`run_branch`), or
+    observed as `name`, a layer's outside any branch, if it has one."""
+    if branch:
+        return run_branch(item, x, taps, name)
+    with observe.branch(name):
+        return item(x, taps)
 
 
 def run_branch(
@@ -221,6 +234,8 @@ def branches(nodes: tuple[ir.Node, ...], ctx: Context) -> tuple[bool, ...]:
 
 def names(nodes: tuple[ir.Node, ...], ctx: Context) -> tuple[str | None, ...]:
     """Return what the metrics of each of `nodes`, in a row, are named by
-    (`bux.architecture.observe.item_name`)."""
-    flags = branches(nodes, ctx)
-    return tuple(observe.item_name(n, b) for n, b in zip(nodes, flags, strict=True))
+    (`bux.architecture.observe.item_name`): outside any branch, a branch's or a
+    layer's; inside one, none, as what they observe is the branch's."""
+    if ctx.depth > 0:
+        return (None,) * len(nodes)
+    return tuple(observe.item_name(n, isinstance(n, ir.Residual)) for n in nodes)

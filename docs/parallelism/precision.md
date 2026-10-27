@@ -136,6 +136,7 @@ dtype:
 | `Norm.normalize`, `l2norm` | the statistics, and the normalized values |
 | the MoE's router | its logits, scores and top-k, the balance loss and the bias; the weights go back to the stream's dtype |
 | `recurrence`, `delta_rule`, `selective_scan` | the recurrent state, and its decays |
+| the recurrent mixers' gates | their log decays and time steps, from the projection's output on, as fla's and Mamba's |
 | `rope.rotate` | the rotation |
 | the head | its matmul's accumulation, tied or not, and its log Z and loss; by chunks, the default `methods.loss`, its logits |
 
@@ -167,7 +168,10 @@ one scale each (`bux.architecture.precision.blockscaled`):
   the largest magnitudes that set its global scales
   (`bux.architecture.precision.nvfp4`).
 - **Elsewhere**, XLA dequantizes and multiplies, which computes the same values, so
-  the tests run the formats on a CPU.
+  the tests run the formats on a CPU. The `mxfp8` kernel quantizes on any GPU of
+  compute capability 8.9 or more (Ada, Hopper), which Triton's E4M3 needs; the
+  `nvfp4` kernels round by Blackwell's E2M1 conversions, and XLA quantizes for them
+  on an older GPU.
 - The forward keeps what the backward multiplies, x^T and W in the format, rather
   than x and W.
 

@@ -107,6 +107,18 @@ def test_call_needs_adjacent_paren():
     )
 
 
+def test_numbers_and_dotted_names_take_no_stray_underscore_or_space():
+    for body, message in [
+        ("x = 1_", "a number's '_' goes between two digits: 1_000"),
+        ("x = 1__0", "a number's '_' goes between two digits: 1_000"),
+        ("attn. num_heads = 4", "expected a setting name right after '.', found"),
+        ("x = attn. num_heads", "expected a setting name right after '.', found"),
+        ("x = gqa(rope. base=1)", "expected a field name right after '.', found"),
+        ("x = gqa(rope .base=1)", "expected '=', found '.'"),
+    ]:
+        assert error(body).message.startswith(message), body
+
+
 def test_continuation_lines_comments_and_semicolons():
     a = compile(
         """
@@ -126,6 +138,30 @@ def test_arithmetic_and_constants():
     )
     widths = [layer.width for layer in a.layers()]
     assert widths == ["tokens", 16, 25, 16]
+    [err] = check("d_model = 10.0 ^ 400\nmodel = rmsnorm").errors
+    assert err.message == "this number is too large"
+
+
+@pytest.mark.parametrize(
+    ("source", "message"),
+    [
+        ("d_model = 0\nmodel = rmsnorm", "'d_model' must be greater than 0, found 0"),
+        (
+            "d_model = 16\nvocab_size = -1\nmodel = embed head",
+            "'vocab_size' must be greater than 0, found -1",
+        ),
+        (
+            "d_model = 16\nmodel = gqa(num_heads=true, num_kv_heads=1)",
+            "'num_heads' takes a number, found a boolean",
+        ),
+        (
+            "d_model = 16\nx = rope(base=false)\nmodel = rmsnorm",
+            "'base' takes a number",
+        ),
+    ],
+)
+def test_counts_and_numbers_are_not_zero_or_booleans(source, message):
+    assert message in str(check(source).errors[0])
 
 
 def test_overrides_including_dotted_keys():
@@ -156,6 +192,20 @@ def test_definitions_are_order_independent_and_cycles_are_errors():
     assert "cycle" in error("a = [b]\nb = [a]\nmodel = embed a head").message
 
 
+@pytest.mark.parametrize("heads_first", [True, False])
+def test_a_replaced_name_that_a_definition_uses_back_is_a_cycle(heads_first):
+    """Only in its own definition does `heads` mean the one it replaces: `attn`
+    means the new one, whichever is evaluated first."""
+    lines = ["heads = 2", "attn = gqa(num_heads=heads, num_kv_heads=heads)"]
+    lib = "\n".join(lines if heads_first else lines[::-1])
+    lib += "\nd_model = 16\nvocab_size = 32\nmodel = embed [attn] head"
+    source = "use lib\nheads = attn.num_heads * 2"
+    with pytest.raises(BuxError, match="definition cycle"):
+        compile(source, modules={"lib": lib})
+    errors = check(source, modules={"lib": lib}).errors
+    assert errors and all("definition cycle" in e.message for e in errors)
+
+
 def test_bare_names_in_settings_are_strings_unless_defined():
     a = build(
         "e = moe(num_experts=4, top_k=2, router=sigmoid, expert=ffn, load_balancing=aux_free)\nmodel = embed [e] head"
@@ -173,6 +223,10 @@ def test_patterns_expand_one_letter_definitions():
     a = build('A = [attn]\nF = [ffn]\nmodel = embed "AAF A"^2 head')
     assert unlabeled(a.graph) == "(embed (A A F A)^2 head)"
     assert "pattern letter 'Z'" in error('A = [attn]\nmodel = embed "AZ" head').message
+    # A pattern reached through a name points at the name, not past it.
+    err = error('A = [attn]\np = "AZA"\nmodel = embed p head')
+    assert err.span is not None and err.source is not None
+    assert err.source[err.span.start : err.span.end] == "p"
 
 
 def test_macros():
@@ -187,6 +241,14 @@ def test_macros():
     assert unlabeled(second) == "([(norm ffn)] [(norm attn)])"
     assert "missing" in error("layer(m) = [m]\nmodel = embed layer() head").message
     assert "is a macro" in error("layer(m) = [m]\nmodel = embed layer head").message
+
+
+def test_a_macro_that_recursed_too_deeply_leaves_the_depth_as_it_was():
+    # m63(x) calls 64 macros deep, which is the limit, after r's error.
+    chain = "".join(f"m{i}(x) = m{i - 1}(x)\n" for i in range(1, 64))
+    source = PRELUDE + "model = embed head\nr(x) = r(x)\nbad = r(1)\nm0(x) = x\n"
+    source += chain + "ok = m63(1)"
+    assert [e.message for e in check(source).errors] == ["'r' recurses too deeply"]
 
 
 def test_shared_definitions():
@@ -322,6 +384,15 @@ def test_check_reports_every_error_and_recovers_from_syntax_errors():
     ]
 
 
+def test_a_syntax_error_spares_a_call_continued_in_the_first_column():
+    report = check(
+        PRELUDE + "a = gqa(num_heads=2,\nnum_kv_heads=2)\nbad = (norm\n"
+        "model = embed [norm a] head\n"
+    )
+    assert [e.message for e in report.errors] == ["expected ')', found end of input"]
+    assert report.values["a"] == cfg.GQAConfig(num_heads=2, num_kv_heads=2)
+
+
 def test_integer_factor_is_rejected_with_a_hint():
     err = error("model = embed ([attn] * 3) head")
     assert "ambiguous" in err.message and "^3" in (err.hint or "")
@@ -374,6 +445,31 @@ def test_shared_blocks_must_agree_on_width():
         "shared n = norm\nmodel = embed [n] [linear(features=8) n linear(features=16)] head"
     )
     assert "different widths" in err.message
+    err = error("shared a = attn\nmodel = embed [a(v=@v)] [a(v=$v)] head")
+    assert "every use of it takes the same ports" in err.message
+
+
+@pytest.mark.parametrize(
+    "residual", ["", "residual = hc(expansion=2)\n", "residual = vpgate\n"]
+)
+def test_a_shared_block_with_branches_stays_outside_branches_or_inside(residual):
+    # A branch outside any other is the residual algebra's, inside one x + f(x).
+    err = error(
+        residual + "shared blk = [norm attn]\nmodel = embed blk [blk] norm head"
+    )
+    assert "used both outside residual branches and inside one" in err.message
+    build(residual + "shared blk = [norm attn]\nmodel = embed blk blk norm head")
+    build(residual + "shared n = norm\nmodel = embed [n attn] [[n attn]] norm head")
+
+
+def test_a_shared_layer_is_shared_whether_or_not_a_merge_goes_before_it():
+    a = build(
+        "residual = gr(expansion=2, rank=4)\nshared out = head\n"
+        "mtp = $h nextn [attn] out\nmodel = embed [attn] @h merge out mtp"
+    )
+    heads = [l.width for l in a.layers() if l.config.type == "head"]
+    assert heads == [16, 16]
+    build("residual = hc(expansion=2)\nshared n = norm\nmodel = embed [n attn] n head")
 
 
 def test_heads_are_outputs_and_mtp_reads_on_from_a_tap():
@@ -402,6 +498,56 @@ def test_residual_algebras_and_their_errors():
         assert len(merges) == (0 if setting == "vpgate" else 1)
     err = error("residual = rope()\nmodel = embed head")
     assert "hc(...)" in err.message and "vpgate(...)" in err.message
+
+
+@pytest.mark.parametrize(
+    ("body", "message"),
+    [
+        (
+            "a = gqa(num_heads=2, num_kv_heads=2, gate_per_head=true)",
+            "gate_per_head set the gate, which gated=true adds",
+        ),
+        (
+            (
+                "a = gqa(num_heads=2, num_kv_heads=2, gate_head_bias=true,"
+                " gate_activation=softplus)"
+            ),
+            "gate_head_bias, gate_activation set the gate",
+        ),
+        (
+            (
+                "e = moe(num_experts=4, top_k=2, expert=ffn, shared_expert=ffn,"
+                " shared_expert_gate=true)"
+            ),
+            "shared_expert, shared_expert_gate set the shared experts, of which",
+        ),
+        (
+            "e = moe(num_experts=8, top_k=2, expert=ffn, num_groups=2, top_k_groups=4)",
+            "2 groups of 8 experts, 4 of them picked, cannot hold the top 2",
+        ),
+        ("e = moe(num_experts=8, top_k=2, expert=ffn, num_groups=0)", "greater than 0"),
+        (
+            (
+                "a = gqa(num_heads=2, num_kv_heads=2, indexer=indexer(top_k=2,"
+                " block_size=4))"
+            ),
+            "indexer keeps top_k // block_size blocks: top_k=2 is less than one block",
+        ),
+        ("e = engram(head_dim=4, table_size=31, max_ngram_size=1)", "greater than or"),
+        ("c = conv(size=0)", "greater than 0"),
+        ("c = short_conv(conv_size=0)", "greater than 0"),
+        ("c = mamba(conv_size=0)", "greater than 0"),
+        ("residual = hc(expansion=1)", "greater than or equal to 2"),
+        ("residual = mhc(sinkhorn_iters=0)", "greater than 0"),
+        ("residual = gr(rank=0)", "greater than 0"),
+        ("residual = gr(rank=4, expansion=0)", "greater than 0"),
+        ("residual = attnres(block_size=0)", "greater than 0"),
+        ("residual = vpgate(temperature=0)", "greater than 0"),
+        ("residual = vpgate(eps=0)", "greater than 0"),
+    ],
+)
+def test_settings_that_would_do_nothing_or_fail_later_are_errors(body, message):
+    assert message in error(body + "\nmodel = embed head").message
 
 
 def test_init_starts_the_model_by_role_and_its_errors():
@@ -535,6 +681,18 @@ def test_render_draws_residual_branches_under_the_stream():
     )
 
 
+def test_render_draws_two_blocks_of_one_label_apart_and_pops_as_written():
+    arch = build(
+        "inner(f) = [norm f]\nouter(g) = inner(g) scale\n"
+        "model = embed outer(attn) outer(ffn) head"
+    )
+    drawn = render(arch)
+    assert "┤inner(g)_2├" in drawn and "norm──ffn" in drawn
+    assert "attn(v=$v!)" in render(
+        build("model = embed [attn(v=@v)] [attn(v=$v!)] head")
+    )
+
+
 def test_printer_keeps_negation_inside_sequences_unary():
     arch = build("model = embed (-attn) [ffn] head")
     assert "embed (-attn) [ffn] head" in to_source(arch)
@@ -544,6 +702,13 @@ def test_a_macro_call_in_a_sequence_prints_inline_and_round_trips():
     arch = build("layer(f) = [norm f] [norm ffn]\nmodel = embed layer(attn) norm head")
     source = to_source(arch)
     assert "model = embed [norm attn] [norm ffn] norm head" in source
+    assert ir.strip(compile(source).graph) == ir.strip(arch.graph)
+
+
+def test_a_shared_definition_named_with_an_underscore_stays_shared():
+    arch = build("shared _blk = [norm attn]\nmodel = embed _blk _blk head")
+    source = to_source(arch)
+    assert "shared _blk = [norm attn]" in source
     assert ir.strip(compile(source).graph) == ir.strip(arch.graph)
 
 

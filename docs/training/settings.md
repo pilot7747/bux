@@ -43,7 +43,7 @@ fields and documents them on hover, as it does for layers
 | `steps` | a positive integer | required | optimizer steps |
 | `curriculum` | {bux}`phase`, or a list of them | `[]` | phases that change `seq_len`, `batch` or `data` from a step on ([Curriculum](curriculum.md)) |
 | `seed` | an integer | `0` | the model's initial weights, the order of the data, and every random stream |
-| `clip` | a number, or `none` | `1.0` | the global norm gradients are clipped to ([Clipping](optimizers.md#clipping)) |
+| `clip` | a number above 0, or `none` | `1.0` | the global norm gradients are clipped to ([Clipping](optimizers.md#clipping)) |
 | `loss` | {bux}`loss` | `loss` | the weights of the z-loss and of multi-token prediction ([The loss](optimizers.md#the-loss)) |
 | `eval` | {bux}`eval`, a list of them, or `none` | `none` | held-out loss and bits per byte every so many steps, one held-out set per eval ([Eval](running.md#eval)) |
 | `checkpoint` | {bux}`checkpoint`, or `none` | `none` | saves a run resumes from ([Checkpoints](running.md#checkpoints)) |
@@ -170,7 +170,7 @@ Some fields check their values further:
 | `options` of `compiler` | each option written `--name=value` |
 | `switch.at` of `precision` | strictly between 0 and 1 |
 | `decay` of `wsd` and `power` | between 0 and 1 |
-| `warmup` of a schedule | a number of steps, or a share of them between 0 and 1 |
+| `warmup` of a schedule | a number of steps from 0, or a share of them between 0 and 1 |
 | `pieces` of `piecewise` | each ending later than the one before, the last at 1 |
 | `shape=geometric` | a cooldown or piece that starts and ends above 0 |
 | `at` of `phase` | a step above 0, or a share strictly between 0 and 1 |
@@ -215,7 +215,8 @@ error: text data is tokenized, so the run needs a tokenizer
   = hint: tokenizer = tokenizer(name="gpt2")
 ```
 
-Rows must fit in the positions a learned positional embedding has:
+Rows must fit in the positions a learned positional embedding has, the run's and
+every phase's and eval's:
 
 ```console
 $ bux check positions.bux

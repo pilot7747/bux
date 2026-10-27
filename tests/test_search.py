@@ -214,6 +214,16 @@ def test_coordinates_decode_to_the_values_a_trial_takes_and_back():
     assert space.decode(space.encode(values)) == values
 
 
+def test_a_value_rounds_to_its_digits_within_its_bounds():
+    b2 = tcfg.UniformConfig(low=0.99, high=0.9999)
+    assert [b2.value(u) for u in (0, 0.5, 0.97, 1)] == [0.99, 0.995, 0.9999, 0.9999]
+    assert tcfg.LogUniformConfig(low=1.234e-4, high=1e-2).value(0) == 1.234e-4
+
+
+def test_a_search_seed_is_not_negative():
+    assert "greater than or equal to 0" in error(SOURCE + "search = search(seed=-1)\n")
+
+
 @pytest.mark.parametrize(
     "method", [tcfg.RandomSearch(), tcfg.HaltonSearch(), tcfg.SobolSearch()]
 )
@@ -347,6 +357,32 @@ def test_a_search_trains_at_most_its_parallel_trials_at_once(tmp_path):
     ended(first, tmp_path, eval_loss=1.0)
     s.ended(first)
     assert started(s) not in (first, second)
+
+
+def test_trials_at_the_same_point_are_one_run_trained_once(tmp_path):
+    source = SOURCE.replace("log_uniform(1e-4, 1e-2)", "1e-3")
+    source += "ffn.activation = choice(swish, gelu)\n"
+    source += "search = search(method=halton, trials=4)\n"
+    s = Search(spaces(source)[0], tmp_path)
+    runs = [run for _ in range(4) if (run := s.next()) is not None]
+    assert len(s.trials) == 4 and len({r.id for r in runs}) == len(runs) == 2
+    for run in runs:
+        ended(run, tmp_path, eval_loss=1.0)
+        s.ended(run)
+    assert [t.results for t in s.trials] == [{0: 1.0}] * 4
+
+
+def test_searches_that_propose_the_same_run_train_it_once(tmp_path):
+    first, second = (
+        Search(spaces(SOURCE + f"search = search(method={m}, trials=1)\n")[0], tmp_path)
+        for m in ("halton", "tpe")  # tpe starts at halton's points
+    )
+    queue = Searches([first, second])
+    taken = queue.take(["0", "1"], lambda run: 1)
+    assert taken is not None and queue.take(["1"], lambda run: 1) is None
+    ended(taken[0], tmp_path, eval_loss=2.0)
+    queue.ended(taken[0])
+    assert first.trials[0].results == second.trials[0].results == {0: 2.0}
 
 
 def test_an_objective_is_read_from_the_latest_metrics(tmp_path):

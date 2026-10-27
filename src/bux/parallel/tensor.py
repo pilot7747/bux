@@ -115,7 +115,8 @@ class Chunked:
     """Each device's rows in chunks, in a shard_map over every axis, so that each
     chunk's collective runs beside another chunk's matmul. It is ``gspmd`` where
     there is nothing to overlap, where a projection splits otherwise than by
-    ``tensor``, and where a device's share would multiply otherwise than the whole:
+    ``tensor`` or the layer's rows or positions split over it, and where a device's
+    share would multiply otherwise than the whole:
     in NVFP4, which scales by the largest value of the whole operand, or in MXFP8
     where a chunk or a share is not whole blocks."""
 
@@ -186,13 +187,16 @@ class InputSplit(NamedTuple):
 
 def _input_split(x: Float[Array, "b t d"]) -> InputSplit | None:
     """Return how `x` splits, or None where `tensor` does not split the layer, as in
-    a shard_map already manual over it, or where the stream splits otherwise than the
-    layer's positions and then `tensor`."""
+    a shard_map already manual over it, or where it splits the layer's rows or
+    positions, or where the stream splits otherwise than the layer's positions and
+    then `tensor`."""
     on = active()
     if on is None or on.size(AXIS) == 1 or AXIS in manual_axes():
         return None
     rows, stream, _ = spec(("batch", "stream", None), x.shape)
     _, layer, _ = spec(("batch", "seq", None), x.shape)
+    if AXIS in (*as_split(rows), *as_split(layer)):
+        return None
     if as_split(stream) not in (as_split(layer), (*as_split(layer), AXIS)):
         return None
     rows_here = x.shape[0] // on.size(*as_split(rows))

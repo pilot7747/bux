@@ -161,10 +161,11 @@ def tokamax_runs() -> bool:
     return MOSAIC is not None and kernels.gpu()
 
 
-#: The widest heads tokamax's Mosaic kernels train: past 128 channels its SM100
-#: backward finds no tiling that fits a B300's 232 KB of shared memory (heads of 256,
-#: Qwen3-Next's, need 270 KB), and raises as it compiles.
-TOKAMAX_HEAD_DIM = 128
+#: The widest heads tokamax's Mosaic kernels train: MLA's of 192 (and values of 128)
+#: train on a B300 (132k tok/s, ``docs/performance/kernels.md``), but past them its
+#: SM100 backward finds no tiling that fits the 232 KB of shared memory (heads of
+#: 256, Qwen3-Next's, need 270 KB), and raises as it compiles.
+TOKAMAX_HEAD_DIM = 192
 
 
 def tokamax_takes(x: Float[Array, "*s"]) -> bool:
@@ -457,6 +458,14 @@ def cudnn_kernel_takes(
     return keys == Keys(True) and cudnn_takes(q, k, v, cap, None)
 
 
+def _check_whole_rows(keys: Keys, cap: float | None) -> None:
+    """Raise unless `keys` and `cap` are what `CUDNN` takes (`cudnn_kernel_takes`):
+    whole causal rows, with no first or last keys, and no soft cap."""
+    whole = keys.causal and keys.start is None and keys.end is None
+    if not whole or cap is not None:
+        raise ValueError("cuDNN's causal kernels take whole causal rows, no soft cap")
+
+
 def _cudnn_forward(
     q: Float[Array, "b t h dk"],
     k: Float[Array, "b t g dk"],
@@ -465,6 +474,7 @@ def _cudnn_forward(
     scale: float,
     cap: float | None,
 ) -> Output:
+    _check_whole_rows(keys, cap)
     return jax_internals.cudnn_attention_and_lse(q, k, v, scale)
 
 
@@ -481,8 +491,9 @@ def _cudnn_backward(
 ) -> Grads:
     """cuDNN's backward, or tokamax's where XLA_FLAGS asks for deterministic ops, for
     which XLA builds cuDNN's attention backward no graph on a B300 ("No serialized
-    cuDNN graph")."""
-    if deterministic() and tokamax_runs():
+    cuDNN graph"), and tokamax takes the heads."""
+    _check_whole_rows(keys, cap)
+    if deterministic() and tokamax_takes(q):
         return _tokamax_backward(q, k, v, out, dout, lse, keys, scale, cap)
     return jax_internals.cudnn_attention_backward(q, k, v, out, dout, lse, scale)
 

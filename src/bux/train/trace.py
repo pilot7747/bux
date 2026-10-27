@@ -53,9 +53,12 @@ def comm_ms(file: Path, steps: int) -> dict[str, float]:
     }
 
 
-def latest(folder: Path) -> Path | None:
-    """Return the newest trace under `folder`, which jax.profiler writes."""
-    traces = sorted(folder.rglob("*.xplane.pb"), key=lambda p: p.stat().st_mtime)
+def latest(folder: Path, host: str | None = None) -> Path | None:
+    """Return the newest trace under `folder`, which jax.profiler writes as
+    ``plugins/profile/<time>/<host>.xplane.pb``: `host`'s, or any host's for None.
+    Every host of a job writes its own into the run's directory, which they share."""
+    pattern = f"{'*' if host is None else host}.xplane.pb"
+    traces = sorted(folder.rglob(pattern), key=lambda p: p.stat().st_mtime)
     return traces[-1] if traces else None
 
 

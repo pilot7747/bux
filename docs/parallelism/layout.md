@@ -44,11 +44,12 @@ layout = ddp:   layout
 ## Names
 
 The names are the fields of {bux}`layout`, a closed set; any other name is an error
-that names the parameter. Each takes one axis, a list of axes, or `none`.
+that names the parameter. Each takes one axis, a list of axes, or `none`. In a run,
+a bare `data` is the run's data, so the axis is written as a string, `"data"`.
 
 | Name | What it is | Default axes |
 |---|---|---|
-| `batch` | rows | `[data, fsdp, expert]` |
+| `batch` | rows | `["data", fsdp, expert]` |
 | `seq` | positions, inside a layer | `context` |
 | `stream` | positions of the residual stream, between branches | `context` |
 | `embed` | the model's width | `none` |

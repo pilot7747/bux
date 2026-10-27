@@ -29,7 +29,7 @@ from jaxtyping import Float
 from bux.lang import ir
 from bux.lang.compiler import Space as Compiled
 from bux.lang.syntax import BuxError
-from bux.launch import Queue, status
+from bux.launch import Queue, status, table
 from bux.search import halving, methods
 from bux.search.halving import Trial
 from bux.search.space import Space
@@ -83,7 +83,10 @@ class Search:
         slug = re.sub(r"[^A-Za-z0-9_.=+-]+", "_", space.run.name).strip("_")
         self.folder = self.out / f"{slug}-search-{self.key}"
         self.trials: list[Trial] = []
-        self.runs: dict[str, tuple[Trial, int]] = {}  # by run id: its trial and rung
+        # By run id: the trials and rungs that are that run, by trial number; two
+        # trials whose values round alike are one run.
+        self.runs: dict[str, set[tuple[int, int]]] = {}
+        self.training: dict[str, tuple[Trial, int]] = {}  # runs `next` gave out
         self.redo: list[tuple[Trial, int]] = []  # rungs started that did not end
         self.names: dict[tuple[int, int], str] = {}  # each trial's run at each rung
         self._load()
@@ -152,7 +155,8 @@ class Search:
     def next(self) -> ir.Run | None:
         """Return the next run to train: a rung that did not end, a trial up a rung,
         or a new trial; None if none can start until a running one ends, or the
-        search is done. A run already done is read, not returned."""
+        search is done. A run already done is read, not returned, and one that
+        another trial's worker trains is waited for."""
         while True:
             if self.redo:
                 trial, rung = self.redo.pop(0)
@@ -170,11 +174,19 @@ class Search:
             if status(directory(run, self.out)).get("state") == "done":
                 self._finished(trial, rung, run)
                 continue
+            if run.id in self.training:  # its end ends this trial too
+                continue
+            self.training[run.id] = trial, rung
             return run
 
     def later(self, run: ir.Run) -> None:
         """Put `run`, which `next` returned but could not start, first in line."""
-        self.redo.insert(0, self.runs[run.id])
+        self.redo.insert(0, self.training.pop(run.id))
+
+    def shares(self, run: ir.Run) -> None:
+        """Let `run`, which `next` returned, wait for the worker of another search
+        that trains it already: its end ends this search's trials of it too."""
+        del self.training[run.id]
 
     def _full(self) -> bool:
         """Whether it trains as many trials at once as its ``parallel`` allows."""
@@ -233,19 +245,20 @@ class Search:
             self.echo(f"{self.space.run.name}: trial {trial.number} failed: {first}")
             trial.results[rung] = math.nan
             return None
-        self.runs[run.id] = trial, rung
+        self.runs.setdefault(run.id, set()).add((trial.number, rung))
         self.names[trial.number, rung] = run.name
         return run
 
     # --- What it found ---------------------------------------------------------------
 
     def ended(self, run: ir.Run) -> None:
-        """Read what `run`, one of its trials' rungs, found, once its worker ended:
-        its objective if it is done, NaN if it failed. A run a signal stopped stays
-        unfinished, to resume."""
-        trial, rung = self.runs[run.id]
+        """Read what `run`, the rung of one or more of its trials, found, once its
+        worker ended: its objective if it is done, NaN if it failed. A run a signal
+        stopped stays unfinished, to resume."""
+        self.training.pop(run.id, None)
         if status(directory(run, self.out)).get("state") in ("done", "failed"):
-            self._finished(trial, rung, run)
+            for number, rung in sorted(self.runs[run.id]):
+                self._finished(self.trials[number], rung, run)
 
     def _finished(self, trial: Trial, rung: int, run: ir.Run) -> None:
         folder = directory(run, self.out)
@@ -267,11 +280,7 @@ class Search:
             head += f"; best {best.top[1]:.4f}, trial {best.number}"
         rows = [("trial", "rung", "objective", "run")]
         rows += [self._row(t) for t in sorted(self.trials, key=_rank)]
-        widths = [max(len(row[i]) for row in rows) for i in range(3)]
-        lines = [
-            "  ".join(c.ljust(w) for c, w in zip(r, widths)) + "  " + r[3] for r in rows
-        ]
-        return head + "\n" + "\n".join(lines)
+        return head + "\n" + "\n".join(table(rows))
 
     def _row(self, t: Trial) -> tuple[str, str, str, str]:
         if t.top is None:
@@ -336,16 +345,18 @@ class Searches(Queue):
             if needs(run) > len(free):
                 search.later(run)
                 continue
+            if any(run.id in s.training for s in self.searches if s is not search):
+                search.shares(run)
+                continue
             self.turn = (self.turn + i + 1) % n
             return run, list(free[: needs(run)])
         return None
 
     def ended(self, run: ir.Run) -> None:
-        """Hand `run`'s end to the search it is a trial of."""
+        """Hand `run`'s end to each search it is a trial of."""
         for search in self.searches:
             if run.id in search.runs:
                 search.ended(run)
-                return
 
     def summary(self) -> str:
         """Return each search's table (`Search.table`)."""

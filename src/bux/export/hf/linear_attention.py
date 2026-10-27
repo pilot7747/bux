@@ -21,22 +21,10 @@ import torch
 import torch.nn.functional as F
 from torch import nn
 
-from .common import ACTIVATIONS, Ctx, Norm, Site
+from .common import ACTIVATIONS, Ctx, Norm, Site, norm_config
 from .conv import CausalConv, keep_state, previous_state, real_tokens, without_padding
 
 CHUNK = 64  # positions per chunk of a prefill
-
-
-def rmsnorm(eps: float) -> dict:
-    """Return the config of an RMSNorm with a gain, as a layer's own norm has it."""
-    return {
-        "type": "rmsnorm",
-        "eps": eps,
-        "affine": True,
-        "bias": False,
-        "zero_centered": False,
-        "scale_input": False,
-    }
 
 
 def wide(x: torch.Tensor) -> torch.Tensor:
@@ -332,7 +320,7 @@ class LinearAttention(nn.Module):
     """
 
     @staticmethod
-    def cache_type(c: dict) -> str:
+    def cache_type(c: dict, ports: list) -> str:
         """The cache layer it keeps, as ``config.layer_types`` names it."""
         return "linear_attention"
 
@@ -365,7 +353,8 @@ class LinearAttention(nn.Module):
                 else nn.Linear(width, hv * dv, bias=False)
             )
         self.norm_all_heads = norm_all_heads
-        self.norm = Norm(rmsnorm(c["norm_eps"]), hv * dv if norm_all_heads else dv)
+        norm = norm_config("rmsnorm", c["norm_eps"])
+        self.norm = Norm(norm, hv * dv if norm_all_heads else dv)
         self.o = nn.Linear(hv * dv, width, bias=False)
 
     def forward(self, x: torch.Tensor, ctx: Ctx) -> torch.Tensor:

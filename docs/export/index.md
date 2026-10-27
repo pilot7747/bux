@@ -107,8 +107,9 @@ only a tie between the two top logits closer than float32's error could flip one
 ## Exporting an architecture
 
 Given a `.bux` file instead of a run, `bux export` writes the file's model without
-weights: its code and `config.json`, but no `model.safetensors`. vLLM serves it on
-random weights (`--load-format dummy`), so you can measure an architecture's speed
+weights: its code and `config.json`, but no `model.safetensors` (it removes one an
+earlier export left in `OUT`). vLLM serves it on random weights
+(`--load-format dummy`), so you can measure an architecture's speed
 at any size before training anything. Settings after `OUT` redefine the file's, as
 they do for `bux train`:
 
@@ -195,7 +196,7 @@ of its own; and candidate pools of a `csa` indexer with `block_size > 1`.
 
 | File | What it is |
 |------|------------|
-| `config.json` | the IR, each layer's site, the kinds of cache layers, and the `auto_map` that points transformers at the code |
+| `config.json` | the IR, each layer's site, the kinds of cache layers, the names no module takes (`bux_reserved`), and the `auto_map` that points transformers at the code |
 | `modeling_bux.py` | the architecture's graph, generated: a class per repeated block, a line per node |
 | `common.py`, `attention.py`, ... | bux's layers in PyTorch, the same files for every model (`bux.export.hf`) |
 | `configuration_bux.py` | the config class |
@@ -231,8 +232,11 @@ class Block0(nn.Module):
   shared definition, once, at `model.shared.<key>`. A layer's path is the prefix of
   its weights, as in `model.layers.3.attn.q.weight`. Under a residual algebra, each
   outermost residual branch is a module too, named by the algebra and holding its
-  parameters: `model.layers.3.mhc.bias`. The plan imports neither JAX nor PyTorch,
-  so every exporter places the layers the same way.
+  parameters: `model.layers.3.mhc.bias`. A label that torch's or transformers'
+  module classes have as an attribute (`forward`, `config`, `training`) takes a
+  suffix, `forward_1`, from the names {py:data}`bux.export.plan.RESERVED` lists. The
+  plan imports neither JAX nor PyTorch, so every exporter places the layers the same
+  way.
 - **The code** (`bux.export.codegen`) turns each scope of the plan into a class.
   `[f]` is `x + f(x)`, `f + g` and `f * g` add and multiply their branches, `f^n`
   loops over a `ModuleList`, and `@name` and `$name` push and read the forward pass's

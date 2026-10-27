@@ -197,6 +197,28 @@ def on_devices(
     )(q, k, v, rows, sinks)
 
 
+def on_whole_rows(
+    attend: Callable[..., Float[Array, "b t h dv"]],
+    q: Float[Array, "b t h dk"],
+    k: Float[Array, "b s g dk"],
+    v: Float[Array, "b s g dv"],
+    args: AttentionArgs,
+) -> Float[Array, "b t h dv"]:
+    """Return attend(q, k, v, args) of each device's whole rows (`on_devices`), by
+    their ids and sinks."""
+
+    def body(
+        q: Float[Array, "b t h dk"],
+        k: Float[Array, "b t g dk"],
+        v: Float[Array, "b t g dv"],
+        ids: Int[Array, "b t"] | None,
+        sinks: Float[Array, " h"] | None,
+    ) -> Float[Array, "b t h dv"]:
+        return attend(q, k, v, args._replace(ids=ids, sinks=sinks))
+
+    return on_devices(body, q, k, v, args.ids, args.sinks, seq=False)
+
+
 # Rows up to this long run XLA's own cummax and cumsum, longer ones (long context, split
 # over `context`) a prefix scan of log2(t) steps. There XLA's take 2 and 25 ms a row of
 # 128k on a B300; in rows of 4096 the scan took a 1f1b pipeline of the 1.3B 1.6% slower.
@@ -461,8 +483,7 @@ def cudnn(
             "methods.attention = cudnn needs cuDNN on a GPU, bfloat16 or float16, "
             "and keys' and values' head dims equal, up to 256 in steps of 8"
         )
-    body = partial(_rows, args=args, attend=_cudnn_rows)
-    return on_devices(body, q, k, v, args.ids, None, seq=False)
+    return on_whole_rows(_cudnn_rows, q, k, v, args)
 
 
 def _cudnn_rows(
@@ -474,19 +495,6 @@ def _cudnn_rows(
     """Run `cudnn` on a device's whole rows: by `causal_kernel`'s where each row is
     one document, else in cuDNN's packed layout."""
     return by_documents(causal_kernel(q, k, v, args), _cudnn, q, k, v, args)
-
-
-def _rows(
-    q: Float[Array, "b t h dk"],
-    k: Float[Array, "b t g dk"],
-    v: Float[Array, "b t g dv"],
-    ids: Int[Array, "b t"] | None,
-    sinks: Float[Array, " h"] | None,
-    args: AttentionArgs,
-    attend: Callable[..., Float[Array, "b t h dv"]],
-) -> Float[Array, "b t h dv"]:
-    """Run `attend` on a device's whole rows, by their ids and sinks."""
-    return attend(q, k, v, args._replace(ids=ids, sinks=sinks))
 
 
 @methods.attention.register("tokamax")
@@ -503,7 +511,8 @@ def tokamax(
     if not flash.tokamax_takes(q):
         raise NotImplementedError(
             "methods.attention = tokamax needs tokamax's GPU kernels: a GPU, the cuda "
-            "extra (Linux), and bfloat16 or float16"
+            "extra (Linux), bfloat16 or float16, and heads of up to "
+            f"{flash.TOKAMAX_HEAD_DIM} channels"
         )
     return gathered(flash.TOKAMAX, q, k, v, args)
 
@@ -532,8 +541,7 @@ def flash_attention_4(
             "(Linux), bfloat16 or float16, and keys' and values' head dims equal up "
             "to 128 in steps of 8, or 192 and 128"
         )
-    body = partial(_rows, args=args, attend=_fa4_rows)
-    return on_devices(body, q, k, v, args.ids, args.sinks, seq=False)
+    return on_whole_rows(_fa4_rows, q, k, v, args)
 
 
 def _fa4_rows(
@@ -605,8 +613,7 @@ def auto(
         return xla(q, k, v, args)
     if splits_positions(q):
         return _context_parallel(q, k, v, args)
-    body = partial(_rows, args=args, attend=whole_rows)
-    return on_devices(body, q, k, v, args.ids, args.sinks, seq=False)
+    return on_whole_rows(whole_rows, q, k, v, args)
 
 
 def _context_parallel(

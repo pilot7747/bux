@@ -138,9 +138,9 @@ class Token:
 
 
 # A count can end in k, M, B or T: 128k, 1.5B, 10T. The suffix must end the token, so
-# 4kv is the number 4 followed by the name kv.
+# 4kv is the number 4 followed by the name kv. A "_" goes between two digits.
 _NUMBER = re.compile(
-    r"\d[\d_]*(\.\d[\d_]*)?([eE][+-]?\d+)?(?:([kKMBT])(?![A-Za-z0-9_]))?"
+    r"\d(?:_?\d)*(\.\d(?:_?\d)*)?([eE][+-]?\d+)?(?:([kKMBT])(?![A-Za-z0-9_]))?"
 )
 _SUFFIXES = {"k": 3, "K": 3, "M": 6, "B": 9, "T": 12}
 _NAME = re.compile(r"[A-Za-z_][A-Za-z0-9_]*")
@@ -190,6 +190,9 @@ def _token(
     src: str, i: int, stop: int, space: bool, fail: Callable[[BuxError], None]
 ) -> Token | None:
     if m := _NUMBER.match(src, i, stop):
+        if src.startswith("_", m.end()):
+            at = Span(m.end(), m.end() + 1)
+            fail(BuxError("a number's '_' goes between two digits: 1_000", at))
         return _number(m, space)
     if m := _NAME.match(src, i, stop):
         return Token("NAME", m.group(), Span(i, m.end()), space)
@@ -486,6 +489,10 @@ class _Parser:
         tok = self.peek()
         return tok.kind == "OP" and tok.text in ops
 
+    def attached(self, op: str) -> bool:
+        """Return whether `op` is next, with no space before it: f(x), a.b, $t!."""
+        return self.at(op) and not self.peek().space_before
+
     def expect(self, op: str) -> Token:
         if not self.at(op):
             raise self.unexpected(f"expected '{op}'")
@@ -496,6 +503,13 @@ class _Parser:
         if tok.kind != "NAME" or tok.text in KEYWORDS:
             raise self.unexpected(f"expected {what}")
         return self.next()
+
+    def field(self, what: str) -> Token:
+        """Read ``.name``, with no space after the dot: attn.num_heads."""
+        self.next()
+        if self.peek().space_before:
+            raise self.unexpected(f"expected {what} right after '.'")
+        return self.expect_name(what)
 
     def unexpected(self, message: str) -> BuxError:
         tok = self.peek()
@@ -534,7 +548,7 @@ class _Parser:
             self.next()
         name = self.expect_name("a definition name")
         self.context = [name.text]
-        if self.at(".") and not self.peek().space_before:
+        if self.attached("."):
             if shared:
                 raise BuxError(
                     "an amendment keeps whether the definition is shared",
@@ -543,7 +557,7 @@ class _Parser:
                 )
             return self.amendment(name)
         params, defaults, param_spans = None, (), ()
-        if self.at("(") and not self.peek().space_before:
+        if self.attached("("):
             if shared:
                 raise BuxError(
                     "a macro cannot be shared; share the blocks it builds instead",
@@ -592,9 +606,8 @@ class _Parser:
     # amendment := NAME "." NAME { "." NAME } "=" expr, which means NAME = NAME(key=expr)
     def amendment(self, name: Token) -> Statement:
         parts: list[Token] = []
-        while self.at(".") and not self.peek().space_before:
-            self.next()
-            parts.append(self.expect_name("a setting name after '.'"))
+        while self.attached("."):
+            parts.append(self.field("a setting name"))
         key = tuple(p.text for p in parts)
         self.context += key
         self.expect("=")
@@ -709,14 +722,13 @@ class _Parser:
                     raise BuxError(
                         "'shared' only starts a definition: shared name = ...", tok.span
                     )
-            if self.at("(") and not self.peek().space_before:
+            if self.attached("("):
                 node: Expr = self.call(tok)
             else:
                 node = Name(tok.span, tok.text)
             # name.field, with no space before the dot: attn.num_heads
-            while self.at(".") and not self.peek().space_before:
-                self.next()
-                field = self.expect_name("a setting name after '.'")
+            while self.attached("."):
+                field = self.field("a setting name")
                 node = Attr(node.span.to(field.span), node, field.text, field.span)
             return node
         if self.at("@"):
@@ -726,7 +738,7 @@ class _Parser:
         if self.at("$"):
             self.next()
             name = self.expect_name("a tap name after '$'")
-            end, pop = name.span, self.at("!") and not self.peek().space_before
+            end, pop = name.span, self.attached("!")
             if pop:
                 end = self.next().span
             return Ref(tok.span.to(end), name.text, pop)
@@ -765,9 +777,8 @@ class _Parser:
             key, key_spans = None, []
             if self.is_keyword():
                 parts = [self.next()]
-                while self.at("."):
-                    self.next()
-                    parts.append(self.expect_name("a field name"))
+                while self.attached("."):
+                    parts.append(self.field("a field name"))
                 self.expect("=")
                 key = tuple(p.text for p in parts)
                 key_spans = [p.span for p in parts]
@@ -845,10 +856,43 @@ _HEADER = re.compile(r"(?:shared[ \t]+)?([A-Za-z_][A-Za-z0-9_]*)")
 
 def statement_start(source: str, offset: int) -> int:
     """Return where the statement around `offset` starts, as `parse_file` recovers:
-    at the last line before it that begins in the first column."""
-    return max(
-        (m.start() for m in _STATEMENT_START.finditer(source, 0, offset)), default=0
+    the last start `_starts` finds before it."""
+    return _starts(source, 0, offset)[-1]
+
+
+def _starts(source: str, start: int, stop: int) -> list[int]:
+    """Return where the statements of ``source[start:stop]`` start, as a recovering
+    parse splits it: at each line that begins in the first column, but a line inside
+    a bracket still open that does not parse on its own, as ``num_kv_heads=2)``."""
+    lines = sorted(
+        {start} | {m.start() for m in _STATEMENT_START.finditer(source, start, stop)}
     )
+    starts = [lines[0]]
+    for line, end in zip(lines[1:], [*lines[2:], stop]):
+        if not unclosed(source, starts[-1], line) or _parses(source, line, end):
+            starts.append(line)
+    return starts
+
+
+def unclosed(source: str, start: int, stop: int) -> bool:
+    """Return whether a bracket of ``source[start:stop]`` is still open at its end."""
+    depth = 0
+    for tok in tokenize(source, start, stop, errors=[]):
+        if tok.kind == "OP" and tok.text in ("(", "["):
+            depth += 1
+        elif tok.kind == "OP" and tok.text in (")", "]"):
+            depth = max(0, depth - 1)
+    return depth > 0
+
+
+def _parses(source: str, start: int, stop: int) -> bool:
+    """Return whether ``source[start:stop]`` parses on its own."""
+    errors: list[BuxError] = []
+    try:
+        _Parser(tokenize(source, start, stop, errors)).program()
+    except BuxError:
+        return False
+    return not errors
 
 
 def parse_file(
@@ -858,26 +902,23 @@ def parse_file(
 
     Without `recover`, the first syntax error raises. With it, as much as possible is
     parsed, for editors: when the whole does not parse, every statement is parsed on
-    its own. A statement then starts at each line that begins in the first column, so
+    its own. A statement then starts at each line that begins in the first column,
+    unless the line is inside a bracket still open and does not parse on its own, so
     an unclosed bracket loses only its own statement.
     """
     stop = len(source) if stop is None else stop
-    if not recover:
-        parser = _Parser(tokenize(source, start, stop))
-        return Parsed(parser.program(), parser.uses)
     try:
         parser = _Parser(tokenize(source, start, stop))
         return Parsed(parser.program(), parser.uses)
     except BuxError as err:
-        whole = err
-    return _parse_each(source, start, stop, whole)
+        if not recover:
+            raise
+        return _parse_each(source, start, stop, err)
 
 
 def _parse_each(source: str, start: int, stop: int, whole: BuxError) -> Parsed:
     parsed = Parsed([], [])
-    starts = sorted(
-        {start} | {m.start() for m in _STATEMENT_START.finditer(source, start, stop)}
-    )
+    starts = _starts(source, start, stop)
     for begin, end in zip(starts, [*starts[1:], stop]):
         tokenizer_errors: list[BuxError] = []
         parser = _Parser(tokenize(source, begin, end, tokenizer_errors))
@@ -893,14 +934,3 @@ def _parse_each(source: str, start: int, stop: int, whole: BuxError) -> Parsed:
     # Every statement parsed on its own, but the whole did not: report why.
     parsed.errors = parsed.errors or [whole]
     return parsed
-
-
-def parse_recovering(source: str) -> tuple[list[Statement], list[BuxError], set[str]]:
-    """Parse as much as possible, for editors, as `parse_file` does with `recover`.
-
-    Returns:
-        The statements that parsed, the syntax errors, and the names of the
-        definitions that failed to parse.
-    """
-    parsed = parse_file(source, recover=True)
-    return parsed.statements, parsed.errors, parsed.broken

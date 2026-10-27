@@ -187,7 +187,8 @@ model = embed(scale_by_sqrt_dim=true) "LLLLLG"^5 "LLLL" norm head(tied=true)
 model = embed(norm=norm) "DD" "LLLG" "LLLLLG"^10 norm @h logits ...
 ```
 
-With `max_positions`, the compiler checks that the run's `seq_len` fits. Under a
+With `max_positions`, the compiler checks that the run's `seq_len` fits, and those
+of its curriculum's phases and of its evals. Under a
 residual algebra that widens the stream (`hc`, `mhc`, `gr`, `attnres`), `embed` widens
 its output ([Residual algebras](../language/residual-algebras.md)).
 

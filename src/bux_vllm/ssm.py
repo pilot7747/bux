@@ -167,7 +167,7 @@ def _recurrent(config: Any) -> tuple[str, dict, int] | None:
     Raises:
         NotImplementedError: Its recurrent layers differ.
     """
-    calls = live(plan(config.bux).calls)
+    calls = live(plan(config.bux, config.bux_reserved).calls)
     layers = [c.layer for c in calls if c.layer["config"]["type"] in RECURRENT]
     if len({repr((n["config"], n["width"])) for n in layers}) > 1:
         raise NotImplementedError("recurrent layers of several shapes not in vLLM yet")

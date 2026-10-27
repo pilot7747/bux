@@ -12,12 +12,10 @@ file; the ``Host`` header must name this machine, against DNS rebinding.
 """
 
 import bisect
-import importlib
 import json
 import os
 import secrets
 import sys
-import tempfile
 import threading
 import typing
 import webbrowser
@@ -26,15 +24,15 @@ from dataclasses import dataclass, field
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
-from types import ModuleType
 from typing import Any
 from urllib.parse import parse_qs, unquote, urlsplit
 
 from bux.lang.compiler import check
 from bux.lang.lsp import features
 from bux.lang.syntax import BuxError
-from bux.studio import palette, training
+from bux.studio import edits, forms, palette, training
 from bux.studio.picks import traced
+from bux.studio.targets import EditError
 from bux.studio.view import view
 
 #: A JSON object, as the API sends it.
@@ -198,20 +196,18 @@ class Studio:
 
     def inspect(self, body: Json, query: dict[str, str]) -> Json:
         """``POST /api/inspect``: the inspector's form of a target."""
-        forms, error = _module("forms"), _edit_error()
         target = body.get("target")
         if not isinstance(target, dict):
             raise _bad("target is an object: {node}, {setting} or {model}")
         source = _text(body, "source")
         try:
             form = forms.inspect(source, target, picks=_picks(body), path=self.where)
-        except (error, BuxError) as err:
+        except (EditError, BuxError) as err:
             raise _bad(_message(err)) from None
         return Units(source).spans(form)
 
     def edit(self, body: Json, query: dict[str, str]) -> Json:
         """``POST /api/edit``: the text with the ops applied."""
-        edits, error = _module("edits"), _edit_error()
         ops = body.get("ops")
         if not isinstance(ops, list):
             raise _bad("ops is a list of edits")
@@ -219,7 +215,7 @@ class Studio:
             new = edits.apply(
                 _text(body, "source"), ops, picks=_picks(body), path=self.where
             )
-        except (error, BuxError) as err:
+        except (EditError, BuxError) as err:
             raise _bad(_message(err)) from None
         return {"source": new}
 
@@ -305,24 +301,6 @@ def _context(source: str, filename: str) -> palette.Context:
     return palette.Context(d_model=width)
 
 
-def _module(name: str) -> ModuleType:
-    """Return ``bux.studio.<name>``, imported when first asked for."""
-    try:
-        return importlib.import_module(f"bux.studio.{name}")
-    except ModuleNotFoundError as err:
-        if err.name != f"bux.studio.{name}":
-            raise
-        raise _bad(f"bux.studio.{name} is not built yet", HTTPStatus.NOT_IMPLEMENTED)
-
-
-def _edit_error() -> type[Exception]:
-    """Return the error an edit or a form raises for the user: ``EditError``."""
-    try:
-        return _module("edits").EditError
-    except Reply:
-        return ValueError
-
-
 def _message(err: Exception) -> str:
     return err.message if isinstance(err, BuxError) else str(err)
 
@@ -352,11 +330,13 @@ def _picks(body: Json) -> dict[str, int]:
 
 def _write(path: Path, source: str) -> None:
     """Write `source` over `path` at once: to a file beside it, then in its place,
-    keeping its permissions and its line endings, and making its folder."""
+    keeping its permissions and its line endings, and making its folder. A new file
+    gets the permissions the umask leaves, as an editor's would."""
     mode = path.stat().st_mode if path.exists() else None
     newline = _newline(path) if mode is not None else "\n"
     path.parent.mkdir(parents=True, exist_ok=True)
-    fd, temp = tempfile.mkstemp(dir=path.parent, prefix=f".{path.name}.", suffix=".tmp")
+    temp = path.with_name(f".{path.name}.{secrets.token_hex(4)}.tmp")
+    fd = os.open(temp, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o666)
     try:
         with os.fdopen(fd, "w", encoding="utf-8", newline=newline) as f:
             f.write(source.replace("\r\n", "\n"))
@@ -364,7 +344,7 @@ def _write(path: Path, source: str) -> None:
             os.chmod(temp, mode)
         os.replace(temp, path)
     except BaseException:
-        Path(temp).unlink(missing_ok=True)
+        temp.unlink(missing_ok=True)
         raise
 
 

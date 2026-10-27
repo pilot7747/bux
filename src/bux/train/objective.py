@@ -209,6 +209,9 @@ def objective(config: tcfg.LossConfig, arch: ir.Architecture) -> Objective:
     terms = {"loss": Term(1.0, lambda heads, _: first(heads).ce)}
     if z:
         terms["z_loss"] = Term(config.z, lambda heads, _: first(heads).z)
+    # Each head and how far ahead it predicts; its metrics take its sums as the loss
+    # does, the first's with the z-loss's, so that they compute once.
+    each = _ahead_of(offsets)
     if len(offsets) > 1:
 
         def mtp(heads: Heads, _: Batch) -> Float[Array, ""]:
@@ -217,11 +220,7 @@ def objective(config: tcfg.LossConfig, arch: ir.Architecture) -> Objective:
             return jnp.mean(jnp.stack(losses))
 
         terms["mtp"] = Term(config.mtp, mtp)
-        heads = _ahead_of(offsets)  # the first's z as `loss` asks, so it computes once
-        terms |= {
-            f"lm_loss/{a}": Term(0.0, _ce(i, o, z and not i)) for i, o, a in heads
-        }
-    each = _ahead_of(offsets)  # as the loss asks for them, which has the z-loss's sums
+        terms |= {f"lm_loss/{a}": Term(0.0, _ce(i, o, z and not i)) for i, o, a in each}
     observed = {f"z_loss/{a}": Term(0.0, _z(i, o, z and not i)) for i, o, a in each}
     return Objective(terms, offsets[0], observed)
 

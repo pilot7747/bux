@@ -41,7 +41,6 @@ from bux.parallel.pipeline import (
     Stage,
     add_axes,
     at,
-    first,
     join_stages,
     put,
     send,
@@ -62,12 +61,13 @@ class Parts(NamedTuple):
     """A model cut at its pipelined repeat, each part a function of arrays alone, run
     on one microbatch's `rows`::
 
-        first(others, kept, rows) -> (x, kept)            up to the repeat
-        stage(params, rest, x, rows) -> (y, rest, losses)  a stage's share of it
-        last(others, kept, rows, y) -> (loss, metrics)    from the repeat to the loss
+        first(others, kept, rows) -> (x, kept)                 up to the repeat
+        stage(params, rest, x, rows) -> (y, rest, losses)       a stage's share of it
+        last(others, kept, rows, y) -> (loss, metrics, kept)   from the repeat on
 
     `others` are the parameters outside the repeat and `kept` the rest of their state,
-    which `first` may change, as dropout counts its masks. `reports` gives the names
+    which `first` and `last` may change, as dropout counts its masks: `last` runs the
+    forward from the start, the layers before the repeat too. `reports` gives the names
     and weights of the losses the stage's layers report, once `stage` has traced;
     `observed`, given the values the repeat's layers observed, a pass's slot of every
     stage a row, and their names, those values by their metrics' names
@@ -75,7 +75,9 @@ class Parts(NamedTuple):
 
     first: Callable[[PyTree, PyTree, PyTree], tuple[Stream, PyTree]]
     stage: Stage
-    last: Callable[[PyTree, PyTree, PyTree, Stream], tuple[Float[Array, ""], Metrics]]
+    last: Callable[
+        [PyTree, PyTree, PyTree, Stream], tuple[Float[Array, ""], Metrics, PyTree]
+    ]
     reports: Callable[[], list[tuple[str, float]]]
     observed: Callable[[Float[Array, "n k"], list[str]], Metrics] | None = None
 
@@ -156,7 +158,7 @@ class Scheduled:
             kept,
             rows,
         )
-        kept = first(kept)  # as the first stage leaves it
+        kept = jax.tree.map(lambda a: a[-1], kept)  # as the last stage leaves it
         return Gradients(join_stages(grads), outside, join_stages(rest), kept, metrics)
 
 
@@ -180,7 +182,9 @@ class Held(NamedTuple):
     first_residuals: list[Shaped[Array, "k ..."]]  # the first part's, on stage 0
     saved: list[Shaped[Array, "k ..."]]  # what a split backward saves for W
     rest: PyTree  # the layers' state
-    kept: PyTree  # the rest of the model's, which the part before the repeat changes
+    # The rest of the model's: on the first stage as the part before the repeat
+    # leaves it, on the last as the part after it does, which runs the whole forward.
+    kept: PyTree
     losses: Losses  # what the layers reported, summed over microbatches
     d_params: PyTree  # the gradient of the stage's parameters, in float32
     d_others: PyTree  # of the parameters outside the repeat, in float32
@@ -288,17 +292,23 @@ class Ticks:
         )
         return y, losses, vjp, after
 
-    def loss_gradients(self, rows: PyTree, y: Stream) -> tuple[Metrics, PyTree, Stream]:
-        """Run the part after the repeat on the stage's output, to the loss: its
-        metrics, and the loss's gradients with respect to the parameters outside the
-        repeat and to `y`."""
+    def loss_gradients(
+        self, kept: PyTree, rows: PyTree, y: Stream
+    ) -> tuple[Metrics, PyTree, Stream, PyTree]:
+        """Run the part after the repeat on the stage's output, to the loss, from the
+        rest of the model's state `kept`: its metrics, the loss's gradients with
+        respect to the parameters outside the repeat and to `y`, and that state
+        after."""
 
-        def loss(others: PyTree, y: Stream) -> tuple[Float[Array, ""], Metrics]:
-            return self.parts.last(others, self.kept, rows, y)
+        def loss(
+            others: PyTree, y: Stream
+        ) -> tuple[Float[Array, ""], tuple[Metrics, PyTree]]:
+            loss, metrics, after = self.parts.last(others, kept, rows, y)
+            return loss, (metrics, after)
 
         grad = jax.grad(loss, argnums=(0, 1), has_aux=True)
-        (d_others, dy), metrics = grad(self.others, y)
-        return metrics, d_others, dy
+        (d_others, dy), (metrics, after) = grad(self.others, y)
+        return metrics, d_others, dy, after
 
     def trace(self, rest: PyTree) -> Shapes:
         """Trace the parts on microbatch 0, for the shapes of what they leave."""
@@ -306,7 +316,7 @@ class Ticks:
         def parts(rest: PyTree, rows: PyTree) -> tuple:
             x, first, _ = self.first_with_vjp(self.kept, rows)
             y, losses, stage, _ = self.stage_with_vjp(rest, rows, x)
-            metrics, _, _ = self.loss_gradients(rows, y)
+            metrics, *_ = self.loss_gradients(self.kept, rows, y)
             return x, first, stage, losses, metrics
 
         return Shapes(*jax.eval_shape(parts, rest, at(self.rows, 0)))
@@ -401,10 +411,12 @@ class Ticks:
 
     def _to_the_loss(self, held: Held, j: Int[Array, ""], y: Stream) -> Held:
         """Run the part after the repeat on `y`, and keep the loss's gradient with
-        respect to `y` for this stage's backward."""
-        metrics, d_others, dy = self.loss_gradients(at(self.rows, j), y)
+        respect to `y` for this stage's backward, and the state it leaves."""
+        rows = at(self.rows, j)
+        metrics, d_others, dy, kept = self.loss_gradients(held.kept, rows, y)
         return held._replace(
             cotangents=put(held.cotangents, self.slot("cotangents", j), dy),
+            kept=kept,
             d_others=gather.added(held.d_others, d_others),
             metrics=gather.added(held.metrics, metrics),
         )

@@ -110,7 +110,8 @@ every kernel falls back.
 | `sparse_cudnn` | a B200 or B300 (SM 10.0, 10.3) with cudnn-frontend; `methods.attention = auto`; a CSA layer, its latents 512 wide; bfloat16 or float16; no soft cap; a window (`sliding_window_size`) and latents kept by an indexer one by one (not `block_size > 1`); at most 2^16 queries per device. Any number of heads: 64 per call, the last call padded. The indexer's target: bfloat16, its heads not split over devices, at most 128 | `sparse`, which runs 512 dims by XLA, and on a GPU under `auto` a window-only layer too; elsewhere a window-only layer runs by `methods.attention` |
 | `grouped_glu` | a Blackwell GPU with cudnn-frontend; an activation cuDNN fuses: `mlp` of `relu2`, `gated_mlp` of `swish` or `quick_gelu` (with or without `limit` and `up_offset`), or of `situ` with an `up_softcap`; no `bias` or `expert_norm`; `mxfp8` in every pass; a width of whole blocks of 64, and hidden units in multiples of 32 (padded to whole tiles of 128) | `grouped_mxfp8` |
 | `nvfp4_te` | a B200 or B300 with Transformer Engine's JAX bindings (bux's image); bfloat16 operands of whole tiles of 64 × 128 on each device (a split whose parts are not keeps the dimension whole); for x and dy, 8192 rows or more per device (`nvfp4_te.ROWS`) | `nvfp4`'s Pallas kernels |
-| `blockscaled`'s and `nvfp4`'s quantizers | a GPU | XLA quantizes |
+| `blockscaled`'s MXFP8 quantizer | a GPU of compute capability 8.9 or more (Ada, Hopper, Blackwell), for Triton's E4M3 | XLA quantizes |
+| `nvfp4`'s quantizers | a Blackwell GPU (compute capability 10 or more), for its E2M1 conversions (`cvt.rn`, `cvt.rs`) | XLA quantizes |
 | the block-scaled GEMMs (cuDNN's, `__cudnn$blockScaledDot`) | a Blackwell GPU | XLA dequantizes and multiplies, which computes the same values |
 
 `fused_delta` and `pallas_delta` take every position of a row. Under

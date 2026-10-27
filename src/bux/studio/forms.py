@@ -23,7 +23,8 @@ from bux import config as cfg
 from bux.lang import ir, reference
 from bux.lang import syntax as ast
 from bux.lang.compiler import SETTINGS, TRAIN_SETTINGS, Written
-from bux.lang.printer import field_order, value_to_source
+from bux.lang.printer import field_order
+from bux.studio.palette import as_source
 from bux.studio.targets import (
     EditError,
     File,
@@ -113,13 +114,6 @@ def _doc(cls: type) -> str:
     return " ".join(pyinspect.cleandoc(doc).split("\n\n")[0].split())
 
 
-def _source(value: object) -> str:
-    try:
-        return value_to_source(value)
-    except TypeError:
-        return str(value)
-
-
 def _default(info: FieldInfo) -> str | None:
     if info.is_required():
         return None
@@ -173,7 +167,7 @@ def _field(
         "doc": doc,
         "required": info.is_required() if info is not None else True,
         "default": _default(info) if info is not None else None,
-        "value": _source(value),
+        "value": as_source(value),
         "written": None,
         "where": None,
         "input": kind,
@@ -210,7 +204,7 @@ def _config_fields(
         editable, note = _editable(f, found, top, amend)
         nested = (
             _config_fields(f, value, top, amend, key, shown)
-            if isinstance(value, cfg.Config)
+            if isinstance(value, cfg.Config) and not isinstance(value, _WHOLE)
             else None
         )
         out.append(
@@ -278,7 +272,7 @@ def _node_form(f: File, node_id: str) -> dict:
     if st is not None and st.params is None:
         fields.append(_definition(f, st, "block"))
     if isinstance(node, ir.Residual) and f.trace.arch.residual is not None:
-        doc += f" It merges by {_source(f.trace.arch.residual)}."
+        doc += f" It merges by {as_source(f.trace.arch.residual)}."
     if node.label is not None:
         return _form(node.label, kind, doc, where, fields)
     return _form(kind, None, doc, where, fields)
@@ -408,7 +402,7 @@ def _mixture(f: File, name: str, info: FieldInfo, mix: tcfg.MixtureConfig) -> di
         _field(f"sources.{i}", str, "", doc=f"source {i + 1}, with its weight")
         | {
             "type": "source",
-            "value": f"{part.weight!r} * {_source(part.source)}",
+            "value": f"{part.weight!r} * {as_source(part.source)}",
             "editable": False,
             "note": "read-only: edit the mix",
         }

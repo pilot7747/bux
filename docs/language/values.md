@@ -67,7 +67,7 @@ and a value for the settings that take one, `activation=swish`.
 | integers | `4096`, `128_256`, `32k`, `1.5B` | `_` separates digits |
 | floats | `1e-5`, `0.02`, `5e5` | a number with a `.` or an exponent: `1e3` is the float 1000.0 |
 | strings | `"gpt2"`, `'data/*.parquet'` | either quote; no escapes; on one line |
-| booleans and none | `true`, `false`, `none` | |
+| booleans and none | `true`, `false`, `none` | a setting that takes a number takes no boolean |
 | lists | `[1, 2]`, `[0, 0.999]`, `[1,]`, `[]` | a list needs a comma or nothing: `[x]` is a [residual branch](skip-connections.md) |
 | configs | `rope(base=1e6)`, `rmsnorm` | a bare name is the config with its defaults |
 | definitions | `qk_norm=norm`, `expert=dense` | the value of another definition |
@@ -234,8 +234,8 @@ definitions you use elsewhere:
 | Name | Value | Notes |
 |------|-------|-------|
 | `model` | the block to build, `embed ... head` | required; `--entry` builds another definition instead |
-| `d_model` | an integer: the width of the residual stream | required |
-| `vocab_size` | an integer: the vocabulary of `embed` and `head` | required when the model has an `embed` or a `head` |
+| `d_model` | a positive integer: the width of the residual stream | required |
+| `vocab_size` | a positive integer: the vocabulary of `embed` and `head` | required when the model has an `embed` or a `head` |
 | `residual` | `hc(...)`, `mhc(...)`, `gr(...)`, `attnres(...)` or `vpgate(...)` | the residual algebra ([Residual algebras](residual-algebras.md)) |
 | `init` | `normal(...)`, `fan_in(...)`, `fan_out(...)`, `fan_avg(...)` or `zeros` | how the weight matrices start, by role; `normal(std=0.02)` unless set ([Initialization](../architectures/initialization.md)) |
 | `data`, `optimizer`, `seq_len`, `batch`, `steps`, ... | training settings | setting any of them makes the file a run ([Training settings](../training/settings.md)) |

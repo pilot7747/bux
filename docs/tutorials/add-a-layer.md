@@ -140,7 +140,7 @@ from bux.lang import ir
 
 class TokenShift(nnx.Module):
     def __init__(self, c: cfg.TokenShiftConfig, width: int):
-        self.mu = nnx.Param(jnp.full(width, c.init))
+        self.mu = nnx.Param(jnp.full(width, c.init, jnp.float32))
 
     def __call__(
         self, x: Float[Array, "b t d"], taps: Taps | None = None
@@ -163,6 +163,8 @@ def _(
   one document. `within` counts the tokens before each token in its document, so
   `within > 0` is false exactly at a document's start.
 - `x + mu * (before - x)` is $(1 - \mu) x_t + \mu x_{t-1}$.
+- `mu` starts in float32, not weakly typed as `jnp.full(width, c.init)` would be:
+  a weak type turns strong at the first update, and the step compiles again.
 - The annotations say each array's dtype and shape (`"b t d"`: rows, positions,
   width); bux's tests check them on every call.
 

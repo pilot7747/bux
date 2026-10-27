@@ -45,6 +45,22 @@ ACTIVATIONS: dict[str, Callable[[torch.Tensor], torch.Tensor]] = {
 }
 
 
+def norm_config(
+    kind: str, eps: float = 1e-6, *, affine: bool = True, bias: bool = False
+) -> dict:
+    """Return the config of a norm a layer makes of its own, as bux's
+    ``NormalizationConfig`` as JSON: a ``layernorm`` or ``rmsnorm`` of `eps`, its
+    gain (`affine`) and its `bias` if asked."""
+    return {
+        "type": kind,
+        "eps": eps,
+        "affine": affine,
+        "bias": bias,
+        "zero_centered": False,
+        "scale_input": False,
+    }
+
+
 def unsupported(c: dict, *names: str) -> None:
     """Raise if the config `c` sets any of `names` away from its default (None,
     False or 0), which this export does not implement yet."""
@@ -61,7 +77,6 @@ class Site:
         config: The model's config (``BuxConfig``), with the bux IR in ``config.bux``.
         path: The module's path, the prefix of its weights: ``model.layers.3.attn``.
         depth: How many residual branches are around the layer.
-        nth: How many layers of its type the model calls before it.
         ports: The taps it writes or reads internal tensors through, as
             ``(name, tap, mode)``.
         extra: What else its exporter computed for it (`bux.export.plan`).
@@ -70,7 +85,6 @@ class Site:
     config: Any
     path: str
     depth: int = 0
-    nth: int = 0
     ports: list = field(default_factory=list)
     extra: dict = field(default_factory=dict)
 

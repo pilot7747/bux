@@ -138,11 +138,11 @@ def _padded(a: Shaped[Array, "m ..."], rows: int) -> Shaped[Array, "r ..."]:
     return jnp.pad(a, [(0, rows - a.shape[0])] + [(0, 0)] * (a.ndim - 1))
 
 
-def _token_sums(
+def sum_by_token(
     y: Float[Array, "m n"], inverse: Int[Array, "t k"]
 ) -> Float[Array, "t n"]:
-    """Return each token's sum of its k rows of y, at `inverse`, in float32: a row
-    past y's adds 0."""
+    """Return each token's sum of its k rows of y, at `inverse`, added up in float32:
+    a row past y's adds 0. An MoE's picks sum into their tokens by it."""
     rows = jnp.take(y, inverse.reshape(-1), axis=0, mode="fill", fill_value=0)
     summed = jnp.sum(rows.reshape(*inverse.shape, -1), 1, dtype=jnp.float32)
     return summed.astype(y.dtype)
@@ -184,7 +184,7 @@ def _forward(
     w_n, w_k = _twice(recipe.w, w, seed, rows=dgrad, columns=fprop)
     y = _times(x_k, w_k, sizes, dtypes.y)
     if summed is not None:
-        y = _token_sums(y, summed.inverse)
+        y = sum_by_token(y, summed.inverse)
     return y, (x_m, w_n, sizes, seed, summed)
 
 

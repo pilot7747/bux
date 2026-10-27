@@ -82,9 +82,9 @@ the mean per step over the traced steps and the GPUs the process traced:
 
 ### How bux computes them
 
-{py:mod}`bux.train.trace` reads the newest `*.xplane.pb` under `profile/`
-({py:func}`bux.train.trace.latest`), and {py:func}`bux.train.trace.comm_ms` does the
-rest:
+{py:mod}`bux.train.trace` reads the newest `*.xplane.pb` of the process's host under
+`profile/` ({py:func}`bux.train.trace.latest`), where every host of a job writes its
+own, and {py:func}`bux.train.trace.comm_ms` does the rest:
 
 1. It takes each GPU's kernels from the trace's stream lines (`Stream #13(compute)`
    and the like).
@@ -103,7 +103,7 @@ from pathlib import Path
 
 from bux.train import trace
 
-file = trace.latest(Path("runs/my-run/profile"))
+file = trace.latest(Path("runs/my-run/profile"))  # any host's; host="node-0", its
 print(trace.comm_ms(file, steps=5))  # comm_ms, exposed_comm_ms, idle_ms
 ```
 

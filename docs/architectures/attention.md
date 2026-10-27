@@ -187,7 +187,7 @@ need `compress_ratio`; `o_groups` must divide `num_heads`.
 | `sliding_window_size` | `none` | each query sees its own and the `n - 1` keys before it | Mistral, Gemma |
 | `sinks` | `false` | a learned logit per head that takes a share of the softmax and attends to nothing | gpt-oss |
 | `gated` | `false` | an elementwise gate on the head outputs, before the output projection | Qwen3-Next (Qiu et al.'s G1) |
-| `gate_per_head` | `false` | one gate value per head instead | Laguna |
+| `gate_per_head` | `false` | one gate value per head instead (with `gated`, as the next two) | Laguna |
 | `gate_activation` | `sigmoid` | the gate's activation | Laguna: `softplus` |
 | `gate_head_bias` | `false` | a learned bias per head on the gate, before its activation | Beam |
 | `output_norm` | `none` | a norm of each head's output, before the gate | Muse Spark |
@@ -569,7 +569,7 @@ attn = mla(num_heads=128, q_lora_rank=1536, kv_lora_rank=512, indexer=indexer(to
 |---------|---------|--------------|
 | `num_heads`, `head_dim` | `64`, `128` | the indexer's query heads |
 | `top_k` | `2048` | keys each query keeps |
-| `block_size` | `1` | keep whole blocks of this many keys, scored as `pool` says |
+| `block_size` | `1` | keep whole blocks of this many keys, scored as `pool` says; at most `top_k` |
 | `pool` | `mean` | how a block scores: the mean of its keys (QSA), or the best score of those a query sees (MSA) |
 | `per_group` | `false` | a separate pick for each kv head's group of query heads, each by its own head (MSA) |
 | `relu` | `true` | ReLU on the dot products (DSA); else plain ones (MSA) |
@@ -734,9 +734,10 @@ The layers make q, k and v; the run's `methods.attention` computes the softmax
 elsewhere). Sparse attention runs by `bux.architecture.attention.sparse`, which never
 makes t × t floats:
 
-- On a GPU, tokamax's flash kernel attends with the kept keys as a mask. Under MSA's
+- On a GPU, tokamax's flash kernel attends with the kept keys as a mask, in heads of
+  up to 192 dims. Under MSA's
   per-group picks it attends one group at a time, each with its own mask.
-- Elsewhere, XLA attends a chunk of queries at a time.
+- Elsewhere, and for wider heads, XLA attends a chunk of queries at a time.
 - The indexer also ranks a chunk of queries at a time, and finds its top-k by
   counting the bits of the k-th highest score instead of sorting.
 - The indexer's kernels sum all heads' ReLU'd dot products and pick once for all

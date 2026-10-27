@@ -24,7 +24,8 @@ class Scale(nnx.Module):
     """
 
     def __init__(self, c: cfg.ScaleConfig, width: int):
-        self.value = nnx.Param(jnp.full(width if c.per_channel else (), c.init))
+        shape = width if c.per_channel else ()
+        self.value = nnx.Param(jnp.full(shape, c.init, jnp.float32))
 
     def __call__(self, x: Float[Array, "*shape"], taps: Taps) -> Float[Array, "*shape"]:
         """Return x times the multiplier."""

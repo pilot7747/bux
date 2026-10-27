@@ -72,7 +72,8 @@ the default ([Measurements](#on-8-b300s)).
 - `chunked` falls back to `gspmd`'s collectives, projection by projection:
   - where it has nothing to overlap: the input projections, without sequence
     parallelism;
-  - where a kernel splits other than by `tensor`;
+  - where a kernel splits other than by `tensor`, or `tensor` splits the layer's
+    rows or positions, as `layout(seq=tensor)` does;
   - where a device's share would not multiply the way the whole does in that
     projection's format (its role's, or `compute` in the `first` and `last`
     branches). In `mxfp8` and `mxfp8_2d` that is unless the chunk's tokens and the

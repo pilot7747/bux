@@ -50,7 +50,9 @@ class RWKV7(nnx.Module):
     ``log w = -e^-0.5 sigmoid(.)`` per key channel. Low-rank projections make w, a,
     the output gate g and the value residual's mix. The output is a layer norm of each
     head, plus a bonus ``(r k r_k) v`` per head, times g. Parameters start as RWKV-LM
-    starts them, by the layer's depth among the model's token mixers.
+    starts them, by the layer's depth among the model's token mixers. Weight decay
+    leaves the token shift's six mixes and r_k alone, vectors stacked into matrices,
+    as RWKV-LM does.
 
     Ports: ``v`` written pushes the values; read moves the values toward the tap's by
     a learned amount per channel, from a projection of rank `v_rank`. That is RWKV-7's
@@ -70,6 +72,8 @@ class RWKV7(nnx.Module):
             instead.
         ValueError: num_v_heads is not a multiple of num_heads.
     """
+
+    no_weight_decay = ("shift", "r_k")
 
     def __init__(
         self,
@@ -150,8 +154,9 @@ class RWKV7(nnx.Module):
             else None
         )
         self.k_k = nnx.Param(0.71 - linear * 0.1, names=(("heads", h),))
-        self.k_a = nnx.Param(jnp.full(nk, 1.02), names=(("heads", h),))
-        self.r_k = nnx.Param(jnp.full((hv, dk), -0.04), names=("heads", None))
+        self.k_a = nnx.Param(jnp.full(nk, 1.02, jnp.float32), names=(("heads", h),))
+        r_k = jnp.full((hv, dk), -0.04, jnp.float32)
+        self.r_k = nnx.Param(r_k, names=("heads", None))
         group = cfg.NormalizationConfig(
             type="layernorm", bias=True, eps=dv * config.norm_eps
         )
@@ -181,7 +186,7 @@ class RWKV7(nnx.Module):
             mix = jax.nn.sigmoid(self.v_mix(xv)).reshape(v.shape)
             v = v + (read(taps, self.ports, "v") - v) * mix
         write(taps, self.ports, "v", v)
-        log_w = FLOOR * jax.nn.sigmoid(self.w(xw))
+        log_w = FLOOR * jax.nn.sigmoid(self.w(xw).astype(jnp.float32))
         a = jax.nn.sigmoid(self.a(xa))
         kk = k * self.k_k
         k = k * (1 + (a - 1) * self.k_a)

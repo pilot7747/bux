@@ -66,12 +66,13 @@ class Recurrence(NamedTuple):
 
 
 def then(
-    transition: Transition, state: Float[Array, "b h dk dv"]
-) -> Float[Array, "b h dk dv"]:
-    """Return A S: a chunk's transition applied to the state it starts from."""
-    if transition.ndim == state.ndim:
-        return jnp.einsum("bhij,bhjv->bhiv", transition, state)
-    return transition[..., None] * state
+    transition: Transition, state: Float[Array, "b h *rest"]
+) -> Float[Array, "b h *rest"]:
+    """Return A S: a chunk's transition applied to the state it starts from, or to a
+    transition of its kind."""
+    if transition.ndim != state.ndim:
+        return transition[..., None] * state
+    return transition @ state if transition.ndim == 4 else transition * state
 
 
 # --- pass_state -----------------------------------------------------------------------

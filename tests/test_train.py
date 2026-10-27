@@ -48,6 +48,7 @@ from bux.train.optim import (
     optimizer,
     optimizers,
     orthogonalized,
+    path_keys,
     schedules,
     weight_decay_mask,
     whole_matrix_spec,
@@ -140,6 +141,41 @@ def test_weight_decay_leaves_norms_and_engram_tables_alone_whatever_their_shape(
     }
     decays = {keys for keys, _, d in named if d}
     assert set(muon_matrices(m)) <= decays
+
+
+class Valued(nnx.Module):
+    """A parameter named as the attribute a Variable flattens to, as `scale`'s."""
+
+    def __init__(self):
+        self.value, self.w = nnx.Param(jnp.ones(3)), nnx.Param(jnp.ones((2, 2)))
+
+
+def test_a_state_s_paths_are_its_variables_as_a_pure_tree_s_are():
+    state = nnx.state(Valued(), nnx.Param)
+    pure = nnx.to_pure_dict(state)
+    paths = [
+        [path_keys(p) for p, _ in jax.tree_util.tree_leaves_with_path(tree)]
+        for tree in (state, pure)
+    ]
+    assert paths[0] == paths[1] == [("value",), ("w",)]
+
+
+def test_weight_decay_leaves_decay_rates_mixes_and_static_maps_alone():
+    """Mamba's A_log, RWKV-7's token shift and r_k, and hc's static maps are matrices,
+    but of rates, mixes and maps that start away from 0, which their references never
+    decay. The projections around them do."""
+    rwkv7 = "rwkv7(num_heads=2, head_dim=8, decay_rank=4, a_rank=4, v_rank=4)"
+    mamba2 = "mamba2(state_size=4, head_dim=8)"
+    mixers = f"[norm mamba(state_size=4)] [norm {rwkv7}] [norm {mamba2}]"
+    source = f"residual = hc(expansion=2)\nmodel = embed {mixers} norm head\n"
+    m = Model(compile(ARCH + source), rngs=nnx.Rngs(0))
+    mask = weight_decay_mask(m)(nnx.state(m, nnx.Param))
+    flags = {path: v.get_value() for path, v in nnx.to_flat_state(mask)}
+    kept = ("A_log", "shift", "r_k", "static_alpha", "static_beta")
+    names = {path[-1] for path in flags}
+    assert set(kept) <= names
+    assert not any(d for path, d in flags.items() if path[-1] in kept)
+    assert all(d for path, d in flags.items() if path[-2:] == ("in_proj", "kernel"))
 
 
 # --- Muon split over devices: methods.orthogonalize ------------------------------------
@@ -799,6 +835,16 @@ class Steps(Sink):
         self.reports.append((step, set(scalars)))
 
 
+class Kept(Hook):
+    """Keeps the trainer a run makes."""
+
+    def start(self, trainer):
+        self.trainer = trainer
+
+    def __call__(self, trainer, metrics):
+        return None
+
+
 def test_a_trainer_takes_terms_hooks_and_sinks_of_ones_own():
     arch = compile(ARCH + "model = embed block norm head\n")
     loss = objective(tcfg.LossConfig(), arch)
@@ -855,6 +901,21 @@ def test_the_log_reports_mfu_where_the_devices_peak_is_known():
     flops_per_step = 3e6 + 2e6 * (8 + 1) / (2 * 8)
     assert trainer.flops == 2 * flops_per_step
     assert latest.metrics["mfu"] == pytest.approx(steps_per_s * flops_per_step / 1e9)
+
+
+def test_a_pipelined_step_s_flops_are_counted_outside_its_mesh(tmp_path, monkeypatch):
+    """Under it, a program of 2 stages holds a stage's share of each of its 3 ticks:
+    3/4 of the repeat's FLOPs, where the log's MFU counts them all."""
+    monkeypatch.setattr(trainer_module, "_peak", lambda run: 1e15)  # as a GPU's
+    run = smoke(
+        "steps = 1",
+        "mesh = mesh(stage=2)",
+        "methods = methods(repeat=scan, pipeline=gpipe, microbatches=2)",
+        "precision = precision(compute=float32)",  # XLA:CPU: no bfloat16 pipelines
+    )
+    kept = Kept()
+    train(run, tmp_path, echo=lambda _: None, hooks=[kept])
+    assert kept.trainer.flops == pytest.approx(step_flops(run).one_document(64))
 
 
 @pytest.mark.parametrize("donate", [False, True])
@@ -948,6 +1009,7 @@ def test_eval_launches_every_batch_before_it_reads_a_loss(monkeypatch):
     monkeypatch.setattr(trainer_module, "_means", read)
     assert set(trainer.evaluate([batch] * 3)) == {"loss"}
     assert events == ["launched"] * 3 + ["read"]
+    assert trainer.evaluate([]) == {}  # no batches, no means
 
 
 def test_held_out_sums_the_loss_over_targets_and_bits_over_their_bytes():
@@ -998,6 +1060,14 @@ def test_a_run_reports_what_hooks_of_ones_own_return(tmp_path):
     assert [s for s, keys in steps.reports if "weight_norm" in keys] == [2, 4]
     assert sum("weight_norm" in json.loads(line) for line in lines) == 2
     assert "weight_norm" in last and "loss" in last
+
+
+def test_a_file_that_cannot_be_read_is_an_error_not_a_traceback(tmp_path, capsys):
+    missing = str(tmp_path / "missing.bux")
+    for argv in (["check", missing], ["export", missing, str(tmp_path / "out")]):
+        assert main(argv) == 1
+        said = capsys.readouterr().err
+        assert said == f"error: cannot read {missing}: No such file or directory\n"
 
 
 def test_the_command_line(tmp_path, capsys):

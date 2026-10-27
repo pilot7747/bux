@@ -15,6 +15,7 @@ from bux import parallel
 from bux.architecture import Model
 from bux.architecture.precision import matmuls
 from bux.lang import compile
+from bux.parallel import tensor
 from bux.train import config as tcfg
 
 PRELUDE = """
@@ -197,6 +198,22 @@ def test_each_projection_by_chunks_multiplies_as_it_does_whole_in_its_format(
     # Each chunked branch reduce-scatters its output forward and its input's gradient
     # backward, in 2 chunks.
     assert counts["reduce-scatter"] == branches * 2 * 2
+
+
+@pytest.mark.parametrize("seq", ["tensor", ["context", "tensor"]])
+def test_chunked_is_gspmd_where_tensor_splits_the_layer_s_positions(seq):
+    """There `tensor` splits no projection's rows or columns of the layer's input."""
+    out = nnx.Linear(
+        16, 8, kernel_init=parallel.named("heads", "embed"), rngs=nnx.Rngs(0)
+    )
+    h = jax.random.normal(jax.random.key(0), (4, 8, 16))
+    with parallel.use(
+        tcfg.MeshConfig(context=2, tensor=2),
+        tcfg.LayoutConfig.model_validate({"seq": seq, "stream": seq}),
+        tcfg.MethodsConfig(tensor="chunked"),
+    ):
+        y = jax.jit(lambda h: tensor.project_out(h, out))(h)
+    assert_close(y, out(h))
 
 
 # Scanned and rematerialized, as a large run is; the MoE in one microbatch, as more

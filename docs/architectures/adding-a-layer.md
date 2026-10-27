@@ -43,7 +43,7 @@ from bux.lang import ir
 
 class Shift(nnx.Module):
     def __init__(self, width: int, bias: bool, rngs: nnx.Rngs):
-        self.mix = nnx.Param(jnp.full(width, 0.5), names=("embed",))
+        self.mix = nnx.Param(jnp.full(width, 0.5, jnp.float32), names=("embed",))
         self.proj = projection(width, width, "mlp", use_bias=bias, rngs=rngs)
 
     def __call__(self, x: Float[Array, "b t d"], taps: Taps) -> Float[Array, "b t d"]:
@@ -405,7 +405,7 @@ Modules tell the optimizers how to treat their parameters with class attributes
 
 | Attribute | What it does | Used by |
 |-----------|--------------|---------|
-| `no_weight_decay = ("scale", "bias")` | weight decay skips these parameters, whatever their shape | norms, DyT, Engram's table |
+| `no_weight_decay = ("scale", "bias")` | weight decay skips these parameters, whatever their shape | norms, DyT, Engram's table, Mamba's `A_log`, RWKV-7's token shift, hc's static maps |
 | `no_muon = True` | under `muon`, the module and everything in it train by its `adam` | the embedding, the head |
 | `muon_axes = {"up": (1, 2)}` | Muon trains this parameter as matrices over these axes (reduction, output); the axes before are batch | the MoE's stacked experts |
 
@@ -449,7 +449,7 @@ in full:
   `unsupported(c, ...)`; it is never ignored. Settings that only matter in training
   (dropout, a loss's weight) are, and its docstring says so.
 - **State while decoding.** A layer that keeps state says its cache's kind in
-  `cache_type(c)` and takes `ctx.cache_slot()` once per call; `hf/conv.py` is the
+  `cache_type(c, ports)` and takes `ctx.cache_slot()` once per call; `hf/conv.py` is the
   worked example, left padding included. A layer that reads attention masks lists
   them in `masks(c)`.
 - **Runs where transformers does.** It imports only torch, transformers and its
@@ -473,6 +473,13 @@ that do not export yet, by what they lack; remove a model from it once it export
   and runs them: a new option belongs in `test_new_layer_options_run`.
   `test_importing_the_backend_registers_every_layer` checks your builder is
   registered.
+- **Its parameters are float32.** Start each in a dtype of its own,
+  `jnp.full(width, 0.5, jnp.float32)`: one weakly typed, as `jnp.full(width, 0.5)`
+  and `jnp.asarray(0.5)` are, turns strong at its first update, and the training
+  step compiles again. `tests/test_examples.py` checks every layer's, of the zoo's
+  models and of `OTHERS`, its models of the layers the zoo lacks, which
+  `test_every_layer_and_residual_algebra_is_in_an_example_or_another_model` makes
+  you add yours to if no model of the zoo uses it.
 - **It splits.** The tests run on 8 CPU devices: the `losses(source, mesh=...)`
   fixture trains a few steps split over them, to compare with one device
   ([Parallelism](../parallelism/index.md)).

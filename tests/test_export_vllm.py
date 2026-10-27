@@ -42,7 +42,8 @@ vllm_parity = script("vllm_parity")
 def calls(arch) -> list[tuple[str, bool]]:
     """The plugin's calls of `arch`'s layers: each module's path, and whether it is
     the module's first call."""
-    return [(c.path, c.first) for c in plan.plan(arch.model_dump(mode="json")).calls]
+    tree = plan.plan(arch.model_dump(mode="json"), core.RESERVED)
+    return [(c.path, c.first) for c in tree.calls]
 
 
 @pytest.mark.parametrize("path", EXAMPLES, ids=lambda p: p.stem)
@@ -55,6 +56,17 @@ def test_layers_are_where_bux_export_puts_them(path: Path) -> None:
 def test_parity_cases_are_where_bux_export_puts_them(name: str) -> None:
     arch = compile(vllm_parity.CASES[name])
     assert calls(arch) == [(c.path, c.first) for c in core.plan(arch).calls]
+
+
+def test_reserved_labels_are_named_as_bux_export_names_them() -> None:
+    """The names bux.export reserves, which an export's config lists, rename the
+    layers of the plugin's plan as they rename bux.export's."""
+    arch = compile(
+        vllm_parity.LLAMA.replace("attn", "forward").replace("ffn", "scope")
+        + "model = embed block^2 rmsnorm head"
+    )
+    assert calls(arch) == [(c.path, c.first) for c in core.plan(arch).calls]
+    assert ("model.layers.0.forward_1", True) in calls(arch)
 
 
 def test_layers_after_the_first_head_are_not_live() -> None:

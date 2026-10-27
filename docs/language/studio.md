@@ -116,6 +116,8 @@ compiler again before the page draws it. A few edits have rules:
   negation itself, write `a + -b`.
 - Editing an axis of the sweep rewrites only the alternatives you changed. The
   others keep their lines, alignment and comments.
+- While the source has errors, or before the drawing has caught up with what you
+  typed, the diagram and the panels make no edit and say so.
 
 ### Saving and undo
 

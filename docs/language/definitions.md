@@ -220,9 +220,16 @@ The rules:
   ```
 
   Calling it with only [ports](skip-connections.md#internal-tensors-ports) is fine,
-  and an [amendment](modules.md#amendments) changes the shared module itself.
+  if every use takes the same ones, and an [amendment](modules.md#amendments)
+  changes the shared module itself.
 - **Same widths everywhere.** Every use of a shared block must see the same widths:
-  `shared 'lin' is used where it would need different widths`.
+  `shared 'lin' is used where it would need different widths`. A merge that the
+  compiler puts before a shared layer is not part of it.
+- **Branches at one depth.** A residual branch outside any other is the residual
+  algebra's, and one inside another is a plain `x + f(x)`, so a shared block with
+  branches is used either outside branches or inside them, not both:
+  `shared 'blk' has residual branches and is used both outside residual branches
+  and inside one`.
 - `shared` only starts a definition: `shared name = ...`.
 
 [Multi-token prediction](outputs.md) shares the head, and sometimes the whole MTP

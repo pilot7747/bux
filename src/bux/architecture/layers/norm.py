@@ -98,7 +98,7 @@ class DyT(nnx.Module):
     no_weight_decay = ("alpha", "weight", "bias")
 
     def __init__(self, c: cfg.DyTConfig, width: int):
-        self.alpha = nnx.Param(jnp.asarray(c.alpha_init))
+        self.alpha = nnx.Param(jnp.asarray(c.alpha_init, jnp.float32))
         self.weight = nnx.Param(jnp.ones(width))
         self.bias = nnx.Param(jnp.zeros(width))
 

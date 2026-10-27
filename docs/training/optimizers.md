@@ -39,10 +39,12 @@ optimizer = adamw(lr=3e-4, b1=0.9, b2=0.95, weight_decay=0.1)
 
 **What decays.** Weight decay applies only to matrices and stacks of them. It skips
 every vector (biases, norm scales) and anything a layer lists in its
-`no_weight_decay` attribute, whatever its shape: norm gains and biases, and Engram's
-tables. The stacked dimension of a scanned repeat does not count, so the norm scales
-that `methods(repeat=scan)` stacks are still vectors and do not decay
-({py:func}`bux.train.optim.weight_decay_mask`).
+`no_weight_decay` attribute, whatever its shape: norm gains and biases, Engram's
+tables, Mamba's and Mamba-2's `A_log` (Mamba's is a matrix of decay rates), RWKV-7's
+token shift and `r_k`, and hyper-connections' static maps, which start at
+$[e_k, I]$ and 1 rather than at 0. The stacked dimension of a scanned repeat does not
+count, so the norm scales that `methods(repeat=scan)` stacks are still vectors and
+do not decay ({py:func}`bux.train.optim.weight_decay_mask`).
 
 ## Muon
 
@@ -331,7 +333,9 @@ function registered under its name ([Registries](extending.md#registries)).
 
 `clip = 1.0`, the default, scales the gradient down to a global norm of 1 whenever
 its norm is larger, before the optimizer sees it (`optax.clip_by_global_norm`).
-`clip = none` turns clipping off. The log's `grad_norm` is the norm before clipping.
+`clip = none` turns clipping off; `clip = 0`, which some frameworks take for off, is
+an error, as a norm of 0 would leave the optimizer no gradient. The log's
+`grad_norm` is the norm before clipping.
 
 ## The loss
 

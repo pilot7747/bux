@@ -340,7 +340,13 @@ class _Cut:
         )
 
     def model(self, others: nnx.State, kept: nnx.State) -> Model:
-        return nnx.merge(self.graphdef, *self.stand_ins, others, kept)
+        """Return the cut model of `others` and `kept`, its variables new ones of the
+        trace it runs in: a forward changes them, as dropout counts its masks."""
+        return nnx.merge(self.graphdef, *self.stand_ins, others, kept, copy=True)
+
+    def _outside(self, model: Model) -> nnx.State:
+        """Return the state of `model`'s layers outside the repeat, but parameters."""
+        return nnx.state(model, nnx.All(nnx.Not(nnx.Param), nnx.Not(self._inside)))
 
     def first(
         self, others: nnx.State, kept: nnx.State, rows: _Micro
@@ -350,7 +356,7 @@ class _Cut:
         model, before = self.model(others, kept), []
         x = pipelined.stream_into(lambda: training_forward(model, rows.batch), before)
         self.before = [a.name for a in before if observing.is_observed(a.name)]
-        return x, nnx.state(model, nnx.All(nnx.Not(nnx.Param), nnx.Not(self._inside)))
+        return x, self._outside(model)
 
     def staged(
         self, params: nnx.State, rest: nnx.State, x: Stream, rows: _Micro
@@ -362,11 +368,13 @@ class _Cut:
 
     def last(
         self, others: nnx.State, kept: nnx.State, rows: _Micro, y: Stream
-    ) -> tuple[Float[Array, ""], Metrics]:
+    ) -> tuple[Float[Array, ""], Metrics, nnx.State]:
         """Run a microbatch from the stream leaving the repeat, `y`, to its share of
-        the step's loss, and that of its metrics."""
+        the step's loss and that of its metrics, and the state of the layers outside
+        the repeat as they leave it: the forward runs those before it too."""
+        model = self.model(others, kept)
         with pipelined.leaving(y):
-            heads, aux_losses = training_forward(self.model(others, kept), rows.batch)
+            heads, aux_losses = training_forward(model, rows.batch)
         per_token, per_row = self.objective(heads, rows.batch, reported(aux_losses))
         observed = [a for a in aux_losses if observing.is_observed(a.name)]
         self.after = [a.name for a in observed]
@@ -374,7 +382,8 @@ class _Cut:
         loss = share * per_token.loss + per_row.loss / self.all_microbatches
         metrics = _scaled(per_token.metrics, share)
         rows_metrics = per_row.metrics | self._numbered(observed, "after")
-        return loss, metrics | _scaled(rows_metrics, 1 / self.all_microbatches)
+        metrics |= _scaled(rows_metrics, 1 / self.all_microbatches)
+        return loss, metrics, self._outside(model)
 
     def observed(self, values: Float[Array, "n k"], names: list[str]) -> Metrics:
         """Return what the repeat's layers observed (``Parts.observed``), named as the
@@ -612,7 +621,7 @@ class Trainer:
             step = self._on_values(self._observe_on_shards)
             chosen = getattr(self._train, "policy", None)
             if chosen is not None:
-                step = _with_policy(chosen, step)
+                step = fitting.trying(chosen, step)
             auto = remat.setting() == "auto" and chosen is None
             self._observed = (fitting.Fitting if auto else xla.jit)(
                 step, self._compiler_options, donate_argnums=0 if self._donate else ()
@@ -773,15 +782,20 @@ class Trainer:
         batch: Batch,
     ) -> tuple[nnx.State, Metrics, nnx.State]:
         """Return `_grads` of the whole batch from a pipeline that schedules its own
-        backward (``parallel.scheduled``), with the parameters cast and gathered once
-        (``_gathered``). It runs the model a microbatch at a time, cut at the
-        pipelined repeat (``_Cut``): the part before the repeat on the first stage,
-        and the part after it, to the loss, on the last."""
+        backward (``parallel.scheduled``), with the parameters cast to `compute` once,
+        and with `gather` "step" gathered once too (``_gathered``). It runs the model
+        a microbatch at a time, cut at the pipelined repeat (``_Cut``): the part
+        before the repeat on the first stage, and the part after it, to the loss, on
+        the last."""
         method = parallel.scheduled.active()
         assert method is not None
         n = method.table().microbatches
         apart = parallel.gather.rows() if self.reduces_once else ()
-        model = nnx.merge(graphdef, self._gathered(params), buffers)
+        if self.gather == "step":
+            used = self._gathered(params)
+        else:  # cast on their shards: nothing in the pipeline casts them
+            used = _shard_state(_cast_params(params, self.compute))
+        model = nnx.merge(graphdef, used, buffers)
         model.set_attributes(update_at_step_end=True, raise_if_not_found=False)
         cut = _Cut(model, self.objective, all_microbatches=n * _size(apart))
         shares = parallel.microbatches(_row_shares(batch), n)
@@ -1052,7 +1066,8 @@ class Trainer:
                 for (``Tokenizer.token_bytes``); None leaves `bpb` out.
 
         Returns:
-            Each metric's mean, by name; NaN for a mean of nothing.
+            Each metric's mean, by name; NaN for a mean of no targets, and none at
+            all for no batches.
 
         Example::
 
@@ -1151,6 +1166,8 @@ def _with_bytes(
 def _means(sums: Sequence[Mapping[str, Ratio]]) -> dict[str, float]:
     """Return each metric's sums added up over the batches, the first over the
     second: a mean over all of them. Reading them waits for each batch's step."""
+    if not sums:
+        return {}  # no batches, no metrics
     means = {}
     for name in sums[0]:
         total, count = (sum(float(s[name][i]) for s in sums) for i in (0, 1))
@@ -1169,17 +1186,6 @@ def _write(reported: list[tuple[int, Scalars | Later]], sinks: Sequence[Sink]) -
             sink.write(step, scalars)
             if histograms:
                 sink.histograms(step, histograms)
-
-
-def _with_policy(policy: str, step: Callable[..., Any]) -> Callable[..., Any]:
-    """Return `step`, traced under the remat `policy`, by its own name."""
-
-    @functools.wraps(step)
-    def under(*args: Any) -> Any:
-        with remat.trying(policy):
-            return step(*args)
-
-    return under
 
 
 class Timers:
@@ -1280,7 +1286,7 @@ def train(
     stretches = curriculum.stretches(config)
     tokens = functools.partial(curriculum.tokens, stretches)
     log = Log(every=config.log.every, lr=lr, tokens=tokens, peak=peak)
-    work = functools.cache(functools.partial(step_flops, run)) if peak else None
+    work = _counted(run, stretches) if peak else None
     methods = stages.balanced(run)
     if methods.stages != config.methods.stages:
         echo(f"{run.name}: methods.stages = {methods.stages}")
@@ -1340,13 +1346,11 @@ def _about(run: ir.Run, folder: Path, trainer: Trainer) -> list[str]:
     its model, its steps and tokens, its phases, and what it logs and saves."""
     t = run.train
     devices = parallel.mesh(t.mesh).devices
-    params = _si(num_params(trainer.model))
+    params = curriculum.si(num_params(trainer.model))
     how = f"{config_to_source(t.optimizer)}, {config_to_source(t.schedule)}"
-    tokens = _si(curriculum.tokens(curriculum.stretches(t), t.steps))
-    shape = "" if curriculum.varies(t) else f" × {t.batch} × {t.seq_len} tokens"
     lines = [
         f"{folder}, on {devices.size} × {devices.flat[0].device_kind}",
-        f"{params} parameters, {t.steps:,} steps{shape} = {tokens} tokens, {how}",
+        f"{params} parameters, {curriculum.summary(t)}, {how}",
         *curriculum.lines(t),
     ]
     watched = [f"log every {t.log.every}"]
@@ -1358,14 +1362,6 @@ def _about(run: ir.Run, folder: Path, trainer: Trainer) -> list[str]:
         watched.append(f"checkpoint every {t.checkpoint.every}")
     watched += [config_to_source(c) for c in t.log.trackers]
     return [*lines, ", ".join(watched)]
-
-
-def _si(n: float) -> str:
-    """Return `n` with an SI suffix, as ``bux plan`` shows it: 1.3B, 25.6k."""
-    for suffix, scale in (("", 1), ("k", 1e3), ("M", 1e6), ("B", 1e9)):
-        if "e" not in (shown := f"{n / scale:.3g}"):
-            return shown + suffix
-    return f"{n / 1e12:.3g}T"
 
 
 def _check_cpu_bfloat16(run: ir.Run) -> None:
@@ -1402,7 +1398,8 @@ def _eval_shape(t: TrainConfig, e: EvalConfig) -> str:
 def _check_shapes(stretches: Sequence[curriculum.Stretch], config: TrainConfig) -> None:
     """Raise unless every shape of batch the run takes, and each eval of a shape of
     its own, splits over the mesh and the microbatches (``parallel.check``), saying
-    from which step, or which eval, where it is not the first's."""
+    from which step, or which eval, where it is not the first's. An eval runs its
+    batch whole, except under a pipeline, which takes it in microbatches."""
     for s in stretches:
         try:
             parallel.check(s.config.batch, s.config.seq_len)
@@ -1410,12 +1407,13 @@ def _check_shapes(stretches: Sequence[curriculum.Stretch], config: TrainConfig) 
             raise ValueError(
                 f"from step {s.start}, {e}" if s.start else str(e)
             ) from None
+    microbatches = None if parallel.pipeline.pipelined() else 1  # an eval's
     for e in evals(config):
         shape = evaluated(config, e)
         if shape is config:
             continue
         try:
-            parallel.check(shape.batch, shape.seq_len)
+            parallel.check(shape.batch, shape.seq_len, microbatches)
         except ValueError as err:
             raise ValueError(f"eval {e.name}: {err}") from None
 
@@ -1489,6 +1487,17 @@ def step_flops(
         graphdef, params, rest = nnx.split(abstract, nnx.Param, ...)
         ids = jax.ShapeDtypeStruct((rows, length), jnp.int32)
         return flops.count(gradient, params, rest, ids)
+
+
+def _counted(
+    run: ir.Run, stretches: Sequence[curriculum.Stretch]
+) -> Callable[[int, int], flops.Work]:
+    """Return the model FLOPs of a step of `run` on each shape of batch its `stretches`
+    take (`step_flops`), counted now, outside the run's mesh: under it, a pipeline's
+    program holds a stage's share of them, tick by tick."""
+    shapes = {(s.config.batch, s.config.seq_len) for s in stretches}
+    counted = {shape: step_flops(run, *shape) for shape in shapes}
+    return lambda rows, seq_len: counted[rows, seq_len]
 
 
 def _peak(run: ir.Run) -> float | None:

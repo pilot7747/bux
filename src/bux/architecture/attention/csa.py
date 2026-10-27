@@ -29,6 +29,10 @@ from bux.architecture.repeats import remat
 from bux.lang import ir
 from bux.softmax import softmax
 
+# The widest heads the dense kernels of methods.attention = auto take on a GPU,
+# cuDNN's; wider ones, as CSA's 512, attend by `sparse.attend` even in a window alone.
+DENSE_HEAD_DIMS = 256
+
 
 class Latents(NamedTuple):
     """Compressed latents, one slot per token: the latent of the group of
@@ -242,10 +246,10 @@ class CSA(Sparse):
 
     def _wide(self, q: Float[Array, "b t h dk"]) -> bool:
         """Return whether the heads are wider than the dense kernels of
-        ``methods.attention = auto`` take on a GPU (256 dims, as CSA's 512 are)."""
-        on = parallel.active()
-        auto = (on.methods.attention if on else "auto") == "auto"
-        return auto and kernels.gpu() and q.shape[-1] > sparse.HEAD_DIMS
+        ``methods.attention = auto`` take on a GPU (`DENSE_HEAD_DIMS`, as CSA's 512
+        are)."""
+        auto = parallel.choice("attention") == "auto"
+        return auto and kernels.gpu() and q.shape[-1] > DENSE_HEAD_DIMS
 
     def _sparse(
         self,

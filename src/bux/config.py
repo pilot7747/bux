@@ -26,6 +26,9 @@ from pydantic import (
     model_validator,
 )
 
+#: A count of one or more.
+Positive = Annotated[int, Field(gt=0)]
+
 
 class Config(BaseModel):
     """The base of every config: frozen pydantic data that rejects unknown fields.
@@ -258,8 +261,8 @@ class MoEConfig(Config):
     routed_scaling_factor: float = 1.0  # Multiplies the weights (DeepSeek-V3: 2.5).
     # Group-limited routing: pick top_k_groups of num_groups first (DeepSeek-V3).
     # Each group is scored by the sum of its best two experts' scores.
-    num_groups: int = 1
-    top_k_groups: int = 1  # Groups each token picks its experts from.
+    num_groups: Positive = 1
+    top_k_groups: Positive = 1  # Groups each token picks its experts from.
     # Load balancing by a loss, a bias or both. aux_free adds a bias per expert to the
     # scores that pick the top-k, not to the weights. Every training step moves it by
     # bias_update_rate: up for experts picked less than the mean, down for those picked
@@ -299,6 +302,36 @@ class MoEConfig(Config):
     # The shared experts are weighted by the router too, normalized with the top-k
     # (Inkling); otherwise they are added with weight 1.
     shared_expert_sink: bool = False
+
+    @model_validator(mode="after")
+    def _groups(self) -> Self:
+        """Check that the experts split into groups that hold the top-k."""
+        n, groups, picked = self.num_experts, self.num_groups, self.top_k_groups
+        if n % groups or picked > groups or self.top_k > picked * (n // groups):
+            raise ValueError(
+                f"{groups} groups of {n} experts, {picked} of them picked, cannot hold "
+                f"the top {self.top_k}"
+            )
+        return self
+
+    @model_validator(mode="after")
+    def _shared(self) -> Self:
+        """Check that the shared experts' settings come with shared experts."""
+        given = [
+            name
+            for name, on in (
+                ("shared_expert", self.shared_expert is not None),
+                ("shared_expert_gate", self.shared_expert_gate),
+                ("shared_expert_sink", self.shared_expert_sink),
+            )
+            if on
+        ]
+        if given and not self.num_shared_experts:
+            raise ValueError(
+                f"{', '.join(given)} set the shared experts, of which there are none: "
+                "set num_shared_experts"
+            )
+        return self
 
     @property
     def aux_loss_weight(self) -> float:
@@ -379,10 +412,10 @@ class SparseIndexerConfig(Config):
                 "indexer(per_group=true) with blocks takes pool=max: QSA's mean-pooled "
                 "blocks are one pick for all heads"
             )
-        if blocks and self.pool == "max" and self.top_k < self.block_size:
+        if blocks and self.top_k < self.block_size:
             raise ValueError(
-                f"indexer(pool=max) keeps top_k // block_size blocks, its own among "
-                f"them: top_k={self.top_k} is less than one block of {self.block_size}"
+                f"indexer keeps top_k // block_size blocks: top_k={self.top_k} is less "
+                f"than one block of {self.block_size}"
             )
         return self
 
@@ -434,6 +467,22 @@ class QuadraticAttentionConfig(AttentionConfig):
     relative_bias: RelativeBiasConfig | None = None  # A learned relative position bias.
     # A lightning indexer that picks the keys each query attends to; None: all of them.
     indexer: SparseIndexerConfig | None = None
+
+    @model_validator(mode="after")
+    def _gate(self) -> Self:
+        """Check that the gate's settings come with the gate."""
+        given = [
+            name
+            for name, on in (
+                ("gate_per_head", self.gate_per_head),
+                ("gate_head_bias", self.gate_head_bias),
+                ("gate_activation", self.gate_activation != "sigmoid"),
+            )
+            if on
+        ]
+        if given and not self.gated:
+            raise ValueError(f"{', '.join(given)} set the gate, which gated=true adds")
+        return self
 
     @model_validator(mode="after")
     def _indexer_groups(self) -> Self:
@@ -729,7 +778,7 @@ class StateSpaceConfig(AttentionConfig):
 
     state_size: int  # State dims of each inner channel: the N of the papers.
     expand: int = 2  # Inner channels, as a multiple of the width.
-    conv_size: int = 4  # Taps of the causal depthwise conv before the scan.
+    conv_size: Positive = 4  # Taps of the causal depthwise conv before the scan.
     # The least time step at the start: they start log-uniform in [dt_min, dt_max].
     dt_min: float = 1e-3
     dt_max: float = 1e-1  # The greatest time step at the start.
@@ -773,7 +822,7 @@ class ConvConfig(AttentionConfig):
     residual branch, ``[conv]`` is a short-conv shortcut (Inkling; Canon layers)."""
 
     type: Literal["conv"] = "conv"
-    size: int = 4  # Taps: each position sees itself and the size - 1 before it.
+    size: Positive = 4  # Taps: each position sees itself and the size - 1 before it.
     bias: bool = False  # A learned bias per channel.
 
 
@@ -785,7 +834,7 @@ class ShortConvConfig(AttentionConfig):
     """
 
     type: Literal["short_conv"] = "short_conv"
-    conv_size: int = 3  # Taps of the causal depthwise conv.
+    conv_size: Positive = 3  # Taps of the causal depthwise conv.
     bias: bool = False  # Biases on the projections and the conv.
 
 
@@ -898,7 +947,7 @@ class EngramConfig(Config):
     # Rows of each head's table: the least prime >= this that no earlier head (of any
     # engram layer) has taken.
     table_size: int
-    max_ngram_size: int = 3  # N-grams of 2 to this many tokens.
+    max_ngram_size: Annotated[int, Field(ge=2)] = 3  # N-grams of 2 to this many tokens.
     num_heads: int = 8  # Hash heads per n-gram size, each with a table of its own.
     # Of the stream (the query), of the keys, and of u before the conv.
     norm: NormalizationConfig = NormalizationConfig(type="rmsnorm")
@@ -1023,11 +1072,12 @@ class HyperConnectionsConfig(Config):
     before the head (DeepSeek-V4.1's Single-Pass mHC)."""
 
     type: Literal["hc", "mhc"]
-    expansion: int = 4  # Copies of the stream.
+    # Copies of the stream, 2 or more: one is the plain residual stream.
+    expansion: Annotated[int, Field(ge=2)] = 4
     # Coefficients that depend on the stream, by a projection that starts at 0, on
     # top of static ones; else static ones alone.
     dynamic: bool = True
-    sinkhorn_iters: int = 20  # Sinkhorn-Knopp rounds of mhc's mixing matrix.
+    sinkhorn_iters: Positive = 20  # Sinkhorn-Knopp rounds of mhc's mixing matrix.
     single_pass: bool = False  # Read with the coefficients the branch before computed.
     # Epsilon of the norm before the dynamic coefficients (DeepSeek-V4.1: 1e-20).
     norm_eps: float = 1e-6
@@ -1044,8 +1094,8 @@ class GatedResidualConfig(Config):
     """
 
     type: Literal["gr"] = "gr"
-    rank: int  # Rank of the read gate (Qwen3.8-Flash-Next: d_model / 8).
-    expansion: int = 4  # Copies of the stream.
+    rank: Positive  # Rank of the read gate (Qwen3.8-Flash-Next: d_model / 8).
+    expansion: Positive = 4  # Copies of the stream.
     norm_eps: float = 1e-6  # Epsilon of the streams' RMS norm.
 
 
@@ -1062,7 +1112,7 @@ class AttentionResidualConfig(Config):
 
     type: Literal["attnres"] = "attnres"
     # Branch outputs summed into one source; None -> each is its own source.
-    block_size: int | None = None
+    block_size: Positive | None = None
     norm_eps: float = 1e-6  # Epsilon of the keys' RMS norm (Kimi K3: 1e-5).
 
 
@@ -1077,8 +1127,10 @@ class ResidualGateConfig(Config):
     """
 
     type: Literal["vpgate"] = "vpgate"
-    temperature: float = 0.3  # Divides the learned g in the gate's sigmoid.
-    eps: float = 1e-3  # a = sqrt(max(1 - b^2, eps)): the stream is never cut off.
+    # Divides the learned g in the gate's sigmoid.
+    temperature: Annotated[float, Field(gt=0)] = 0.3
+    # a = sqrt(max(1 - b^2, eps)): the stream is never cut off.
+    eps: Annotated[float, Field(gt=0)] = 1e-3
 
 
 class MergeConfig(Config):

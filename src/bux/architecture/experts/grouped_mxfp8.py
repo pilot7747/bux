@@ -84,9 +84,7 @@ CONTRACT = Tiles(m=LANES, n=128, k=LANES, stages=7, sms=2)
 def runs() -> bool:
     """Return whether these kernels run here: on a Blackwell GPU (sm_100 on), outside
     `bux.kernels.off`."""
-    if not kernels.gpu():
-        return False
-    return float(getattr(jax.local_devices()[0], "compute_capability", 0)) >= 10
+    return kernels.gpu() and kernels.capability() >= 10
 
 
 # --- The operands, as the kernels load them ---------------------------------------

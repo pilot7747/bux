@@ -108,6 +108,9 @@ def test_an_architecture_alone_is_not_a_run():
             "data = 3",
             "'data' must be text(...), chat(...), tokens(...), synthetic(...) or a mix",
         ),
+        ("clip = 0", "'clip' must be greater than 0, found 0"),  # not off: no updates
+        ("schedule = wsd(warmup=-5)", "a warmup is a count of steps from 0"),
+        ("eval = eval(data=synthetic, seq_len=1)", "seq_len: Input should be greater"),
         ("schedule = wsd(warmup=90)", "the schedule takes 110 steps (90 of warmup"),
         ("schedule = power(warmup=0.95)", "takes 105 steps (95 of warmup and 10 of"),
         (
@@ -139,6 +142,11 @@ def test_a_run_lists_what_it_lacks():
 def test_sequences_must_fit_learned_positions():
     source = ARCH.replace("embed block", "embed(max_positions=8) block") + TRAIN
     assert "longer than the 8 positions the embedding learns" in error(source)
+    # An eval's own rows too, which would read past the table.
+    learned = ARCH.replace("embed block", "embed(max_positions=16) block") + TRAIN
+    text = error(learned + "eval = eval(data=synthetic, seq_len=64)")
+    assert "sequences of 64 tokens are longer than the 16 positions" in text
+    assert "eval = eval(data=synthetic, seq_len=64)" in text  # where the error is
 
 
 def test_a_training_config_is_not_a_layer():
@@ -230,6 +238,10 @@ def test_an_amendment_applies_over_the_same_files_definition():
     [run] = runs(ARCH + TRAIN + "attn.rope = rope(base=1e6)")
     rope = layer(run, cfg.GQAConfig).rope
     assert rope is not None and rope.base == 1e6
+    # A key inside one set before it changes it.
+    [run] = runs(ARCH + TRAIN + "attn.rope = rope(base=1e6)\nattn.rope.fraction = 0.5")
+    rope = layer(run, cfg.GQAConfig).rope
+    assert rope is not None and (rope.base, rope.fraction) == (1e6, 0.5)
 
 
 def test_an_amendment_keeps_a_layer_shared():
@@ -263,6 +275,10 @@ def test_an_amendment_reaches_a_layer_or_setting_defined_by_a_bare_type():
         ("block.bar = 1", "'block' is a block, which has no settings to amend"),
         ("act = gelu\nact.x = 1", "'act' is an activation, which has no settings"),
         ("optimizer.lr = 1\noptimizer.lr = 2", "'lr' is given twice"),
+        (
+            "attn.rope.fraction = 0.5\nattn.rope = rope(base=1e6)",
+            "'rope' is given after 'rope.fraction', which it would undo",
+        ),
     ],
 )
 def test_amendment_errors(source, message):
@@ -297,6 +313,17 @@ def test_alternatives_with_the_same_labels_are_picked_together():
     source = RUN + "d_model = s: 16 | l: 32\noptimizer.lr = l: 1e-3 | s: 3e-3"
     picked = {r.name: (r.arch.d_model, r.train.optimizer.lr) for r in runs(source)}
     assert picked == {"exp[s]": (16, 3e-3), "exp[l]": (32, 1e-3)}
+    # Outside the grid, each place takes the label met first, wherever it lists it.
+    assert check(source, filename="exp.bux", modules=MODULES).run == runs(source)[0]
+
+
+def test_outside_the_grid_labels_start_where_the_grid_does():
+    # steps comes first in the file's definitions, d_model first in compiling a run.
+    source = "use recipe\nuse arch\nsteps = l: 10 | s: 20\nd_model = s: 16 | l: 32"
+    first = runs(source)[0]
+    assert (first.name, first.arch.d_model, first.train.steps) == ("exp[s]", 16, 20)
+    assert check(source, filename="exp.bux", modules=MODULES).run == first
+    assert compile(source, modules=MODULES) == first.arch
 
 
 def test_alternatives_can_change_the_architecture():
@@ -370,6 +397,16 @@ def test_data_mixes_as_a_weighted_sum():
     assert isinstance(data, tcfg.MixtureConfig)
     assert [w.weight for w in data.sources] == [0.25, 0.25, 0.5]
     assert [w.source.type for w in data.sources] == ["tokens", "synthetic", "tokens"]
+
+
+def test_a_list_setting_reads_off_a_config():
+    source = (
+        RUN
+        + 'tokenizer = tokenizer(name="gpt2")\nweb = text(path="w", split=[0, 0.9])\n'
+    )
+    [run] = runs(source + 'data = text(path="v", split=web.split)')
+    assert isinstance(run.train.data, tcfg.TextConfig)
+    assert run.train.data.split == (0.0, 0.9)
 
 
 @pytest.mark.parametrize(
@@ -495,8 +532,9 @@ INDEXER = "indexer(num_heads=2, head_dim=8, "
             "false",
             "true",
         ),
-        (MLA, "gate_head_bias", "false", "true"),
-        (CSA, "gate_head_bias", "false", "true"),
+        # With the gate it biases, which they have not by default.
+        (MLA, "gate_head_bias", "false", "true, gated=true"),
+        (CSA, "gate_head_bias", "false", "true, gated=true"),
     ],
 )
 def test_a_layer_field_newer_than_ids_keeps_them_where_it_computes_as_before(
@@ -534,6 +572,14 @@ def test_a_layer_field_newer_than_ids_keeps_them_where_it_computes_as_before(
         ("gqa", "per_group"): "73f1c2e501",
     }[layer.split("(")[0], field]
     assert run_of(None).id == run_of(before).id == old != run_of(after).id
+
+
+def test_strings_that_name_a_setting_print_quoted():
+    """A bare `data` would be the run's data, not the mesh axis."""
+    [run] = runs(RUN + 'layout.batch = ["data", "expert"]')
+    assert 'layout(batch=["data", expert])' in run_to_source(run)
+    [again] = compile_runs(run_to_source(run))
+    assert again.train == run.train
 
 
 @pytest.mark.parametrize("path", EXPERIMENTS, ids=lambda p: p.stem)
@@ -579,6 +625,15 @@ def test_editor_knows_inherited_definitions(tmp_path):
         for c in features.complete(source + "x = attn(num_", len(source) + 13, path)
     ]
     assert labels[:2] == ["num_heads", "num_kv_heads"]
+
+
+def test_editor_quotes_an_option_that_names_a_definition():
+    source = (
+        ARCH + TRAIN + "e = moe(num_experts=4, top_k=2, expert=ffn, aux_loss_scope="
+    )
+    items = {c.label: c for c in features.complete(source, len(source))}
+    assert items["batch"].insert_text == '"batch"'  # a bare batch is the batch size
+    assert items["sequence"].insert_text is None
 
 
 @pytest.mark.parametrize("path", EXPERIMENTS[::2], ids=lambda p: p.stem)
