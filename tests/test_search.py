@@ -183,6 +183,22 @@ def test_an_objective_reads_only_what_the_run_logs(objective, message):
     assert message in error(SOURCE + f"objective = {objective}\n")
 
 
+def test_an_objective_reads_an_eval_s_buckets_of_positions():
+    assert tcfg.buckets([2048, 8192, 10000]) == ["0", "2k", "8k", "10000"]
+    one = "eval = eval(data=synthetic, every=100, batches=1)"
+    source = SOURCE.replace(one, "eval = eval(data=synthetic, positions=[4, 2048])")
+    [run] = compile_runs(source + "objective = eval_loss_2k\n", filename="tune.bux")
+    assert run.train.objective is not None
+    assert run.train.objective.terms[0].metric == "eval_loss_2k"
+    listed = "they log eval_loss, eval_loss_0, eval_loss_2k, eval_loss_4"
+    assert listed in error(source + "objective = eval_loss_8k\n")
+    assert "bits per byte need a tokenizer" in error(
+        source + "objective = eval_bpb_4\n"
+    )
+    unordered = SOURCE.replace(one, "eval = eval(data=synthetic, positions=[8, 4])")
+    assert "positions go up, one after another: [8, 4]" in error(unordered)
+
+
 def test_the_editor_shows_a_dimension_and_an_objective_on_hover():
     source = SOURCE + "objective = 0.5 * eval_loss + 0.5 * loss\n"
     shown = features.hover(source, source.index("log_uniform") + 1)

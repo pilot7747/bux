@@ -616,7 +616,7 @@ class Trainer:
         )
         self._observed: Any = None  # compiled at the first step that observes
         self._launched: set[bool] = set()  # which steps have compiled: observed or not
-        self._eval = nnx.jit(self.eval_step)
+        self._eval = nnx.jit(self.eval_step, static_argnums=3)  # positions
 
     def observes(self, step: int) -> bool:
         """Return whether the step that takes the trainer to `step` observes the
@@ -997,17 +997,19 @@ class Trainer:
         model: Model,
         batch: Batch,
         nbytes: Int32[np.ndarray | Array, "b t"] | None = None,
+        positions: tuple[int, ...] = (),
     ) -> dict[str, Ratio]:
         """Return what an eval measures of the first head on `batch`, each metric a
         sum and what it is a mean of (`bux.train.objective.held_out`): its loss, and
-        given each token's bytes of text, `nbytes`, its bits per byte. It computes in
-        `compute`, its projections multiplied as the precision's `eval` says.
+        given each token's bytes of text, `nbytes`, its bits per byte; each by bucket
+        of the targets' `positions` too. It computes in `compute`, its projections
+        multiplied as the precision's `eval` says.
 
         It is compiled once, by `evaluate`; override it to change what an evaluation
         measures: every name it returns is a metric."""
         with matmuls.use(matmuls.evaluating(self.matmuls)):
             heads = forward(cast(model, self.compute), batch)
-        return held_out(heads[0], batch, nbytes, self.objective.offset)
+        return held_out(heads[0], batch, nbytes, self.objective.offset, positions)
 
     def train_on_batch(self, batch: Batch) -> Metrics:
         """Take one training step on `batch`, and return its metrics.
@@ -1077,10 +1079,14 @@ class Trainer:
         self,
         batches: Iterable[Batch],
         token_bytes: Int32[np.ndarray, " vocab"] | None = None,
+        positions: Sequence[int] = (),
     ) -> dict[str, float]:
         """Return the mean of each metric of `eval_step` over `batches`, in eval mode:
         the first head's `loss`, and given each token id's bytes of text, its bits
-        per byte, `bpb`. A mean weighs every target alike, whichever batch it is in.
+        per byte, `bpb`; and with `positions`, each over the targets of each bucket
+        of positions in their documents, as `loss_2k`
+        (`bux.train.objective.held_out`). A mean weighs every target alike,
+        whichever batch it is in.
         Every batch's step is launched before any is read, so the GPU runs one as the
         host launches the next.
 
@@ -1088,6 +1094,8 @@ class Trainer:
             batches: The held-out batches, on the host; a finite number of them.
             token_bytes: The bytes of text each id of the model's vocabulary stands
                 for (``Tokenizer.token_bytes``); None leaves `bpb` out.
+            positions: Where buckets of targets by position start, after 0, in
+                order; none for no buckets.
 
         Returns:
             Each metric's mean, by name; NaN for a mean of no targets, and none at
@@ -1103,7 +1111,9 @@ class Trainer:
         try:
             sums = [
                 self._eval(
-                    self.model, *parallel.shard_batch(_with_bytes(b, token_bytes))
+                    self.model,
+                    *parallel.shard_batch(_with_bytes(b, token_bytes)),
+                    tuple(positions),
                 )
                 for b in batches
             ]
@@ -1572,6 +1582,7 @@ def _hooks(
                 batches=e.batches,
                 name=e.name,
                 token_bytes=token_bytes,
+                positions=e.positions,
             )
         )
     if (saves := config.checkpoint) is not None:

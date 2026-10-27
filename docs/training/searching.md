@@ -144,6 +144,7 @@ at its latest value, which for an eval is the one after the last step.
 objective = 0.8 * web_bpb + 0.2 * code_bpb   # held-out bits per byte, weighted
 objective = (web_bpb + code_bpb) / 2         # their mean
 objective = eval_loss                         # one eval's loss
+objective = repo_bpb_8k                       # a long eval's targets from 8192 on
 objective = -tokens_per_s                     # the fastest, to tune `methods`, say
 ```
 
@@ -151,7 +152,8 @@ objective = -tokens_per_s                     # the fastest, to tune `methods`, 
   with `w = 0.8`, `w * web_bpb + (1 - w) * code_bpb` is the first line. A metric
   with a slash is a string: `"time/step_ms"`.
 - **An eval's metrics are checked against the run's evals**: `web_bpb` needs an eval
-  named `web`, and bits per byte need a tokenizer ([Eval](running.md#eval)).
+  named `web`, `repo_bpb_8k` one whose `positions` start a bucket at 8192, and bits
+  per byte need a tokenizer ([Eval](running.md#eval)).
 - **Without one, the objective is the first eval's bits per byte** if the run has a
   tokenizer, else that eval's loss, else the training loss.
 - A trial that failed, or whose objective is not a number (as when a run

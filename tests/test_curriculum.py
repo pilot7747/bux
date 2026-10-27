@@ -419,7 +419,8 @@ def test_an_eval_of_its_own_shape_prepares_its_rows_and_reads_them(tmp_path):
     run = smoke(
         "steps = 4",
         'eval = [eval(name="short", data=synthetic, every=2),'
-        ' eval(name="long", data=synthetic, every=2, seq_len=128, batch=8)]',
+        ' eval(name="long", data=synthetic, every=2, seq_len=128, batch=8,'
+        " positions=[64, 1024])]",
     )
     said: list[str] = []
     train(run, tmp_path, echo=said.append)
@@ -428,6 +429,10 @@ def test_an_eval_of_its_own_shape_prepares_its_rows_and_reads_them(tmp_path):
         json.loads(line) for line in (directory(run, tmp_path) / "metrics.jsonl").open()
     ]
     assert [line["step"] for line in lines if "long_loss" in line] == [2, 4]
+    [last] = [line for line in lines if line["step"] == 4 and "long_loss" in line]
+    short, long = last["long_loss_0"], last["long_loss_64"]
+    assert min(short, long) <= last["long_loss"] <= max(short, long)
+    assert np.isnan(last["long_loss_1k"]) and "short_loss_0" not in last
 
 
 def test_an_eval_runs_its_batch_whole_but_in_a_pipeline_s_microbatches(tmp_path):
