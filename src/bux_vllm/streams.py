@@ -29,7 +29,9 @@ import triton
 import triton.language as tl
 from vllm.utils.torch_utils import direct_register_custom_op
 
-BLOCK_D = 128  # the channels a kernel takes at once
+BLOCK_D = 512  # the channels a kernel takes at once, of each stream
+MHC_BLOCK = 128  # those mhc's read takes, beside a tile of its projection
+SOURCES_BLOCK = 256  # those attnres's read takes, of every source
 EPS = 1e-6  # in Sinkhorn's sums and added to mhc's read: bux_vllm.residual.EPS
 #: How a read weighs the streams: by its own coefficients, by those the branch
 #: before computed (single-pass), or stream 0 alone (single-pass, the first).
@@ -121,18 +123,18 @@ def _hc_read_kernel(
                 mask=on_j[:, None] & on_i[None, :],
                 other=0.0,
             ).to(tl.float32)
-            w = tl.load(
-                wa_ptr + i[:, None] * K + c[None, :],
-                mask=on_i[:, None] & alpha[None, :],
-                other=0.0,
-            ).to(tl.float32)
-            if BETA:
-                wb = tl.load(wb_ptr + i, mask=on_i, other=0.0).to(tl.float32)
-                w += tl.where(beta[None, :], wb[:, None], 0.0)
             s1 += tl.sum(x, 1)
             s2 += tl.sum(x * x, 1)
-            dots += tl.sum(x[:, :, None] * w[None, :, :], 1)
-            wsum += tl.sum(w, 0)
+            for col in tl.static_range(K + BETA):  # A's columns, then B's
+                if col < K:
+                    w = tl.load(wa_ptr + i * K + col, mask=on_i, other=0.0)
+                else:
+                    w = tl.load(wb_ptr + i, mask=on_i, other=0.0)
+                w = w.to(tl.float32)
+                dots += tl.where(
+                    c[None, :] == col, tl.sum(x * w[None, :], 1)[:, None], 0.0
+                )
+                wsum += tl.where(c == col, tl.sum(w, 0), 0.0)
         mean = s1 / d
         rstd = tl.rsqrt(tl.maximum(s2 / d - mean * mean, 0.0) + eps)
         z = rstd[:, None] * (dots - mean[:, None] * wsum[None, :])
@@ -291,7 +293,7 @@ def mhc_read(
         KP=logits.shape[1],
         DYNAMIC=proj is not None,
         MODE=mode,
-        BLOCK=BLOCK_D,
+        BLOCK=MHC_BLOCK,
         num_warps=4,
     )
 
@@ -351,13 +353,12 @@ def _mix_write_kernel(
     for start in range(0, d, BLOCK):
         i = start + tl.arange(0, BLOCK)
         on_i = i < d
-        x = tl.load(
-            x_ptr + t * sx_t + j[:, None] * sx_n + i[None, :],
-            mask=(j[:, None] < N) & on_i[None, :],
-            other=0.0,
-        ).to(tl.float32)
         y = tl.load(y_ptr + t * sy_t + i, mask=on_i, other=0.0).to(tl.float32)
-        out = tl.sum(m[:, :, None] * x[:, None, :], 0) + b[:, None] * y[None, :]
+        out = b[:, None] * y[None, :]
+        for stream in tl.static_range(N):  # stream j's share of each stream k
+            x = tl.load(x_ptr + t * sx_t + stream * sx_n + i, mask=on_i, other=0.0)
+            row = tl.sum(tl.where(j[:, None] == stream, m, 0.0), 0)
+            out += row[:, None] * x.to(tl.float32)[None, :]
         tl.store(
             out_ptr + t * so_t + k[:, None] * so_n + i[None, :],
             out.to(out_ptr.dtype.element_ty),
@@ -498,7 +499,7 @@ def attnres_read(
         eps,
         MP=pad(m),
         PARTIAL=partial is not None,
-        BLOCK=BLOCK_D,
+        BLOCK=SOURCES_BLOCK,
         num_warps=4,
     )
 
