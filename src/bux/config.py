@@ -513,10 +513,11 @@ class GQAConfig(QuadraticAttentionConfig):
 
     Ports: ``v`` exports the value heads, or imports them for value-residual mixing
     (ResFormer); ``kv`` exports keys and values, or imports them instead of computing
-    its own (cross-layer KV sharing, YOCO / CLA); ``index`` shares the indexer's top-k.
+    its own (cross-layer KV sharing, YOCO / CLA); ``index`` shares the indexer's top-k;
+    ``ve`` imports a `ValueEmbeddingConfig` table's rows, added to the values.
     """
 
-    ports: ClassVar[frozenset[str]] = frozenset({"v", "kv", "index"})
+    ports: ClassVar[frozenset[str]] = frozenset({"v", "kv", "index", "ve"})
 
     type: Literal["gqa"] = "gqa"
     num_heads: int  # query heads
@@ -560,6 +561,10 @@ class GQAConfig(QuadraticAttentionConfig):
     # a v + b v1 starting from a = b = 0.5: "fixed" keeps a and b (ResFormer's code),
     # "learned" learns both (Learnable-ResFormer), "convex" learns a, with b = 1 - a.
     value_residual: Literal["fixed", "learned", "convex"] = "fixed"
+    # A layer that reads the ve port adds its rows e to its values by a gate per kv
+    # head, v + 2 sigmoid(W [x[:n], e[:n]]) e, from the first n channels of its input
+    # x and of e, W starting at 0 (modded-nanogpt: 6); None: no gate, v + e.
+    value_embed_gate: Positive | None = 6
 
 
 class MLAConfig(QuadraticAttentionConfig):
@@ -896,6 +901,27 @@ class EmbeddingConfig(Config):
     dropout: float = 0.0  # Dropout rate of the embedding, in training.
 
 
+class ValueEmbeddingConfig(Config):
+    """Value embeddings (modded-nanogpt): a table of `vocab_size` rows of `features`,
+    each input token's row pushed to the ``ve`` port for a ``gqa`` layer to add to its
+    values: ``value_embed(features=128, ve=@ve1)``.
+
+    It leaves the stream as it is, so it goes bare, on a widened stream too, or
+    inside a branch before the layer that reads it. Several layers may read one table.
+
+    Ports: ``ve`` exports the rows of the input tokens.
+    """
+
+    ports: ClassVar[frozenset[str]] = frozenset({"ve"})
+
+    type: Literal["value_embed"] = "value_embed"
+    # Width of a row: the kv heads times the value head dim of the layers that read it.
+    features: Positive
+    # Std of the rows' normal init (modded-nanogpt: 0.01), where the model sets no
+    # init; one that does starts them as its embedding.
+    std: float = 0.01
+
+
 class LMHeadConfig(Config):
     """The language-model head: the stream to logits over the vocabulary,
     ``softcap(x W + b)``. Every head is an output of the model; nothing follows one
@@ -1181,6 +1207,7 @@ LayerConfig = Annotated[
     | ScaleConfig
     | DropoutConfig
     | EmbeddingConfig
+    | ValueEmbeddingConfig
     | LMHeadConfig
     | NextNConfig
     | EngramConfig
