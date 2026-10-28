@@ -57,13 +57,15 @@ LATENT = (
 def states(c: dict, layer_ports: list | None = None) -> list[str]:
     """The kinds of state a call of the layer `c`, with the ports `layer_ports`,
     keeps, in order: its type's (`STATES`), then a ``gqa`` layer's conv state under
-    ``kv_conv_size`` and its indexer's keys (``index``) with an indexer, or an
-    ``engram``'s conv's; none for a layer that keeps none. A ``gqa`` layer that
-    reads its ``kv`` port names an attention layer of its own, over its writer's
-    cache, and keeps nothing else; one that reads its ``index`` port keeps no
-    indexer's keys."""
+    ``kv_conv_size`` and its indexer's keys (``index``) with an indexer, or a
+    ``conv`` layer's or an ``engram``'s conv's; none for a layer that keeps none.
+    A ``gqa`` layer that reads its ``kv`` port names an attention layer of its own,
+    over its writer's cache, and keeps nothing else; one that reads its ``index``
+    port keeps no indexer's keys."""
     if c["type"] == "engram":
         return ["conv"] if c["conv_size"] else []
+    if c["type"] == "conv":
+        return ["conv"]
     if c["type"] not in STATES:
         return []
     if c["type"] == "gqa" and reads(layer_ports or [], "kv"):

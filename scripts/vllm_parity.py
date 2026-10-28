@@ -296,6 +296,13 @@ CASES = {
     + "local = attn(sliding_window_size=8, relative_bias.extent=8, log_scale=none)\n"
     + "model = embed [rmsnorm local] [rmsnorm ffn] [rmsnorm attn] [rmsnorm ffn]"
     " rmsnorm head",
+    # Inkling's shortcut: a conv on every branch's output, y + conv(y).
+    "conv": HEAD
+    + ATTN
+    + FFN
+    + "shortcut = conv(size=4, bias=true)\n"
+    + "model = embed [rmsnorm attn [shortcut]] [rmsnorm ffn [shortcut]]"
+    " [rmsnorm attn [shortcut]] [rmsnorm ffn] rmsnorm head",
     "dyt": HEAD
     + ATTN
     + FFN

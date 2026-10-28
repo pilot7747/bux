@@ -52,6 +52,7 @@ LAYER_MODULES = (
     "common",
     "basic",
     "attention",
+    "conv",
     "mla",
     "csa",
     "moe",

@@ -1,6 +1,6 @@
 """A causal depthwise conv over the sequence whose state, each sequence's last
 inputs, vLLM keeps in its Mamba cache: the conv of ``gqa``'s ``kv_conv_size`` on its
-keys and values.
+keys and values, and bux's ``conv`` layer (`Conv`).
 
 It is one of vLLM's short convs: a layer of its own, with a conv state in each
 sequence's cache slot (``MambaBase``), which makes the model a hybrid for vLLM. A
@@ -32,6 +32,7 @@ from vllm.model_executor.layers.mamba.ops.causal_conv1d import (
 from vllm.v1.attention.backends.registry import MambaAttentionBackendEnum
 
 from . import kv
+from .common import Ctx, Layer, Site
 from .config import states
 from .plan import live, plan, ports
 
@@ -48,6 +49,9 @@ def state_shapes(vllm_config: Any) -> list[tuple]:
         for n in layers
         if "conv" in states(n["config"], ports(n))
     }
+    for call in calls:  # the conv layers', on the whole stream
+        if call.layer["config"]["type"] == "conv":
+            convs.add((call.layer["width"], call.layer["config"]["size"]))
     return [state_shape(vllm_config, *conv) for conv in sorted(convs)]
 
 
@@ -166,3 +170,33 @@ class CausalConv(nn.Module, MambaBase):
             NotImplementedError: Always.
         """
         raise NotImplementedError("bux's kv conv runs on GPUs only in vLLM")
+
+
+class Conv(Layer):
+    """bux's ``conv``: a causal depthwise conv over positions as a layer, a bias per
+    channel after it, each call's last inputs in vLLM's Mamba cache by its short
+    conv (`CausalConv`); the whole stream, on every rank."""
+
+    bux_types = ("conv",)
+    stateful = True
+
+    def __init__(self, c: dict, width: int, site: Site):
+        super().__init__()
+        self.path = site.path
+        convs = [CausalConv(width, c["size"], site.vllm_config, n) for n in site.caches]
+        self.weight = convs[0].weight
+        for other in convs[1:]:
+            other.weight = self.weight
+        self.convs = nn.ModuleList(convs)
+        bias = torch.zeros(width) if c["bias"] else None
+        self.bias = None if bias is None else nn.Parameter(bias, requires_grad=False)
+
+    def load(self, name: str, tensor: torch.Tensor) -> list[nn.Parameter]:
+        if name == "weight":  # bux's taps, (size, channels), as vLLM's rows
+            self.weight.data.copy_(tensor.T)
+            return [self.weight]
+        return super().load(name, tensor)
+
+    def forward(self, x: torch.Tensor, ctx: Ctx) -> torch.Tensor:
+        y = self.convs[ctx.call(self.path)](x)
+        return y if self.bias is None else y + self.bias.to(y.dtype)
