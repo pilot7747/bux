@@ -1,0 +1,34 @@
+# The late-2026 hybrid (m2026_hybrid.bux) with Gated DeltaNet-2 in place of every KDA
+# layer, alone and with the factorial's candidate's winners (factorial.bux's
+# r1v1k1f0p0s0: hc, the value residual and the key-value conv on the global layers).
+# GDN-2 decouples KDA's step into an erase and a write gate per channel; it takes
+# KDA's heads, value heads, decay bound and conv, as mixers.bux's gdn2 does on the
+# reference, where it led KDA at d512 and trailed it at d768. The global layers, the
+# experts and the MTP module stay the hybrid's. Arms: era, source, what it was
+# claimed for.
+use m2026_hybrid
+use timeline_code
+use rungs
+
+# 2026 Gated DeltaNet-2 (Hatamizadeh et al.): query and key heads of 128, as wide
+# together as the stream, twice as many value heads, the decay bounded at -5.
+hy_delta = gdn2(num_heads=d_model // 128, num_v_heads=d_model // 64, head_dim=128,
+                gate_lower_bound=-5)
+
+# factorial.bux's vres(g_k, fr_experts): the first global layer's values mixed into
+# every later one's, and a causal conv of 4 taps on their keys and values.
+g_k      = fr_global(kv_conv_size=4)
+vres_g_k = embed
+           fr_layer(hy_delta, fr_dense) fr_layer(hy_delta)^2 fr_layer(g_k(v=@v1))
+           (fr_layer(hy_delta)^3 fr_layer(g_k(v=$v1)))^(layers // 4 - 1)
+           fr_norm @h fr_out hy_mtp
+
+model = # 2026 Gated DeltaNet-2: the hybrid with GDN-2's layers; recall
+        gdn2:     frontier_hybrid
+      # the same with the candidate's hc, value residual and key-value conv
+      | gdn2_hvk: vres_g_k
+
+residual = gdn2: none | gdn2_hvk: hc(expansion=4)
+
+# The hybrid's best at d512 (milestones.bux's scan), for every arm.
+optimizer.lr = 2e-3
