@@ -321,7 +321,7 @@ CSA_SETTINGS = {
     "relative bias, log scale, gate": CSA + ", compress_ratio=2, gated=true,"
     " relative_bias=relbias(rank=2, extent=4), log_scale=0.5, log_scale_floor=2)",
     "indexer blocks": CSA + f", compress_ratio=1, {SMALL_INDEXER}, block_size=2))",
-    # The timeline's: groups of 4, half the dims rotated in halves, a top 2 of 3.
+    # Groups of 4, half the dims rotated in halves, a top 2 of 3.
     "compressed by 4, indexer": "csa(num_heads=4, head_dim=16,"
     " sliding_window_size=4, compress_ratio=4, sinks=true, rope=rope(fraction=0.5),"
     " indexer=indexer(num_heads=2, head_dim=8, top_k=2))",

@@ -40,18 +40,27 @@ ACTIVATIONS = {
 #: SwiGLU: ``act(min(gate, limit)) * (clip(up, limit) + offset)``.
 SIGMOID_GATES = {"swish": 1.0, "quick_gelu": 1.702}
 FLOAT32_MAX = 3.4028234e38  # a limit that clips nothing
+#: bux's situ, ``4 tanh(x / 4) sigmoid(x)``: vLLM's SiTU of this beta.
+SITU_BETA = 4.0
 
 
 def experts_activation(expert: dict) -> dict:
     """vLLM's activation of the routed experts `expert` (an MLP's config), with its
-    clamp and offset, as `FusedMoEFactory`'s arguments.
+    clamp and offset, or SiTU-GLU's soft cap of up, as `FusedMoEFactory`'s
+    arguments.
 
     Raises:
         NotImplementedError: vLLM has no such activation.
     """
-    unsupported(expert, "up_softcap")
     kind = (expert["type"], expert["activation"])
     clamped = expert["limit"] is not None or expert["up_offset"]
+    if kind == ("gated_mlp", "situ") and not clamped:
+        return {
+            "activation": "situ",  # Kimi's SiTU-GLU, the gate first as w13 holds it
+            "activation_situ_beta": SITU_BETA,
+            "activation_situ_linear_beta": expert["up_softcap"],
+        }
+    unsupported(expert, "up_softcap")
     if not clamped and kind in ACTIVATIONS:
         return {"activation": ACTIVATIONS[kind]}
     if kind[0] != "gated_mlp" or kind[1] not in SIGMOID_GATES:

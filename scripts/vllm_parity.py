@@ -59,7 +59,7 @@ LINEAR_HYBRID = (
     "model = embed [rmsnorm delta] [rmsnorm ffn] [rmsnorm delta] [rmsnorm ffn]"
     " [rmsnorm attn] [rmsnorm ffn] rmsnorm head"
 )
-#: The timeline's MLA (examples/experiments/timeline/attention.bux), on 4 heads.
+#: MLA with a latent of 256 and 32 rotated dims, on 4 heads.
 LATENT = (
     "attn = mla(num_heads=4, kv_lora_rank=256, qk_nope_head_dim=64,"
     " qk_rope_head_dim=32, v_head_dim=64, rope=rope())\n"
@@ -78,8 +78,8 @@ SPARSE_MLA = (
     " head_dim=16, top_k=8))\n"
     "local = attn(sliding_window_size=16, sinks=true, softcap=20)\n"
 )
-#: The timeline's csa (examples/experiments/timeline/sparse.bux) at d_model 128, its
-#: window and top-k shrunk so that the prompts and their decoding cross both.
+#: csa compressing groups of 4 with half the dims rotated, at d_model 128, its
+#: window and top-k small enough that the prompts and their decoding cross both.
 SPARSE = (
     "attn = csa(num_heads=2, head_dim=64, compress_ratio=4, sliding_window_size=16,"
     " sinks=true, rope=rope(fraction=0.5), indexer=indexer(num_heads=4, head_dim=64,"
@@ -207,6 +207,14 @@ CASES = {
     " load_balancing=aux_free, expert=dense)\n"
     + MOE_BLOCK
     + "model = embed block^2 rmsnorm head",
+    # Kimi K3's SiTU-GLU experts, up soft-capped (low, so that the cap bites).
+    "moe-situ": HEAD
+    + ATTN
+    + "experts = moe(num_experts=8, top_k=2, num_shared_experts=1, router=sigmoid,"
+    " load_balancing=aux_free, expert=gated_mlp(intermediate_size=64,"
+    " activation=situ, up_softcap=0.5))\n"
+    + MOE_BLOCK
+    + "model = embed block^2 rmsnorm head",
     # Muse Spark's routed experts: each one's output normalized, in a latent.
     "moe-norm": HEAD
     + ATTN
@@ -220,6 +228,27 @@ CASES = {
     "engram": LLAMA
     + "memory = engram(head_dim=8, table_size=12288)\n"
     + "model = embed block memory block rmsnorm head(tied=true)",
+    # MiniMax-01's lightning attention, its decay by depth, beside softmax attention.
+    "lightning": HEAD
+    + ATTN
+    + FFN
+    + "mix = lightning(num_heads=2, head_dim=64)\n"
+    + "model = embed [rmsnorm mix] [rmsnorm ffn] [rmsnorm mix] [rmsnorm ffn]"
+    " [rmsnorm attn] [rmsnorm ffn] rmsnorm head",
+    # Lightning attention beyond MiniMax-01's: a conv, value heads of their own.
+    "lightning-conv": HEAD
+    + ATTN
+    + FFN
+    + "mix = lightning(num_heads=2, num_v_heads=4, head_dim=32, v_head_dim=16,"
+    " conv_size=4)\n"
+    + "model = embed [rmsnorm mix] [rmsnorm ffn] [rmsnorm mix] [rmsnorm ffn]"
+    " [rmsnorm attn] [rmsnorm ffn] rmsnorm head",
+    "mamba": HEAD
+    + ATTN
+    + FFN
+    + "ssm = mamba(state_size=16)\n"
+    + "model = embed [rmsnorm ssm] [rmsnorm ffn] [rmsnorm attn] [rmsnorm ffn]"
+    " [rmsnorm ssm] [rmsnorm ffn] rmsnorm head",
     "mamba2": HEAD
     + ATTN
     + FFN
@@ -235,7 +264,7 @@ CASES = {
     "kda-kimi": GATED_HEAD
     + "delta = kda(num_heads=4, head_dim=32, output_gate_rank=32, norm_eps=1e-5)\n"
     + LINEAR_HYBRID,
-    # The timeline's hybrid at widths no multiple of 8: KDA's fused projection is
+    # A hybrid at a width no multiple of 8: KDA's fused projection is
     # 550 wide (padded to 576), beside gated attention and a sigmoid MoE.
     "kda-odd": GATED_HEAD.replace("d_model = 128", "d_model = 136")
     + EXPERT
@@ -250,6 +279,28 @@ CASES = {
     "gdn2-paper": GATED_HEAD
     + "delta = gdn2(num_heads=4, head_dim=32, gate_rank=8, output_gate_rank=16,"
     " negative_eigenvalues=true, output_gate=sigmoid)\n" + LINEAR_HYBRID,
+    "deltanet": GATED_HEAD
+    + "delta = deltanet(num_heads=2, num_v_heads=4, head_dim=32)\n"
+    + LINEAR_HYBRID,
+    # Gated linear attention, without a conv (its default) and with one.
+    "gla": GATED_HEAD
+    + "delta = gla(num_heads=2, num_v_heads=4, head_dim=32, gate_rank=8)\n"
+    + LINEAR_HYBRID,
+    "gla-conv": GATED_HEAD
+    + "delta = gla(num_heads=2, head_dim=32, conv_size=4, output_gate=sigmoid)\n"
+    + LINEAR_HYBRID,
+    # GDN and KDA beyond vLLM's kernels, by bux's own rule: no conv or output gate,
+    # values narrower than q and k, a lower bound under -5.
+    "gdn-plain": GATED_HEAD
+    + "delta = gdn(num_heads=2, num_v_heads=4, head_dim=32, conv_size=none,"
+    " output_gate=none)\n" + LINEAR_HYBRID,
+    "kda-plain": GATED_HEAD
+    + "delta = kda(num_heads=2, num_v_heads=4, head_dim=32, v_head_dim=16,"
+    " conv_size=none, output_gate_rank=16, gate_lower_bound=-8)\n" + LINEAR_HYBRID,
+    # GDN-2 without a conv: q, k and v SiLU'd alone.
+    "gdn2-plain": GATED_HEAD
+    + "delta = gdn2(num_heads=2, num_v_heads=4, head_dim=32, conv_size=none)\n"
+    + LINEAR_HYBRID,
     "rwkv7": GATED_HEAD + "delta = rwkv7(num_heads=2, head_dim=64)\n" + LINEAR_HYBRID,
     "rwkv7-residual": GATED_HEAD
     + "mix = rwkv7(num_heads=4, num_v_heads=8, head_dim=32, decay_rank=16, a_rank=16,"
@@ -278,6 +329,34 @@ CASES = {
     # Hymba's cross-layer KV sharing: a windowed layer's keys and values read by
     # the next one or two, then a full layer's by one with a window of its own.
     "kv-share": HEAD + SHARING + "model = embed F W S R W R G R rmsnorm head",
+    # Inkling's attention: a relative bias, a conv on keys and values, no RoPE, and
+    # a length scale on the global layer's logits, its window-only layers biased
+    # over their window.
+    "relbias": HEAD
+    + FFN
+    + "attn = gqa(num_heads=4, num_kv_heads=2, qk_norm=rmsnorm, kv_conv_size=4,"
+    " relative_bias=relbias(rank=4, extent=16), log_scale=0.5, log_scale_floor=8)\n"
+    + "local = attn(sliding_window_size=8, relative_bias.extent=8, log_scale=none)\n"
+    + "model = embed [rmsnorm local] [rmsnorm ffn] [rmsnorm attn] [rmsnorm ffn]"
+    " rmsnorm head",
+    # Inkling's shortcut: a conv on every branch's output, y + conv(y).
+    "conv": HEAD
+    + ATTN
+    + FFN
+    + "shortcut = conv(size=4, bias=true)\n"
+    + "model = embed [rmsnorm attn [shortcut]] [rmsnorm ffn [shortcut]]"
+    " [rmsnorm attn [shortcut]] [rmsnorm ffn] rmsnorm head",
+    # LFM2's double-gated short conv beside attention.
+    "short-conv": HEAD
+    + ATTN
+    + FFN
+    + "mix = short_conv(conv_size=3, bias=true)\n"
+    + "model = embed [rmsnorm mix] [rmsnorm ffn] [rmsnorm attn] [rmsnorm ffn]"
+    " [rmsnorm mix] [rmsnorm ffn] rmsnorm head",
+    "dyt": HEAD
+    + ATTN
+    + FFN
+    + "model = embed [dyt attn] [dyt ffn] [dyt attn] [dyt ffn] dyt head",
     "mla": HEAD + LATENT + FFN + BLOCK + "model = embed block^2 rmsnorm head",
     "mla-moe": HEAD
     + LATENT
@@ -367,6 +446,18 @@ CASES = {
     + "model = embed [rmsnorm attn(v=@v1)] [rmsnorm ffn] [rmsnorm local]"
     " [rmsnorm ffn] [rmsnorm attn(v=$v1!)] rmsnorm head",
     "csa": HEAD + SPARSE + FFN + BLOCK + "model = embed block^2 rmsnorm head",
+    # DeepSeek-V4.1's ports: a layer that compresses pairs, indexes them and makes a
+    # candidate pool; one that reads its latents and picks; one that re-indexes
+    # them inside the pool.
+    "csa-ports": HEAD
+    + "pairs = csa(num_heads=2, head_dim=64, compress_ratio=2, sliding_window_size=16,"
+    " sinks=true, rope=rope(fraction=0.5), indexer=indexer(num_heads=4, head_dim=64,"
+    " top_k=8, candidate_block_size=2, candidate_top_k=4))\n"
+    + FFN
+    + "model = embed [rmsnorm pairs(kv=@kv, index=@topk, candidates=@pool)]"
+    " [rmsnorm ffn] [rmsnorm pairs(kv=$kv, index=$topk)] [rmsnorm ffn]"
+    " [rmsnorm pairs(kv=$kv!, index=@topk, candidates=$pool!)] [rmsnorm ffn]"
+    " rmsnorm head",
     "csa-latent": HEAD
     + SPARSE_LATENT
     + FFN

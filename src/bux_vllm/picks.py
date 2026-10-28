@@ -264,13 +264,15 @@ def attend(
     softcap: float | None = None,
     sinks: torch.Tensor | None = None,
     latent: int = 0,
+    logits_of: Any = None,
 ) -> torch.Tensor:
     """Softmax attention of each query over its picked keys alone, in float32 as
     bux's ``softmax_attention``; zeros for a query that keeps none.
 
     Args:
         q: The queries, (Q, h, dk), each kv head's group of query heads together.
-        kv: The picked keys and values, (Q, g, K, dk + dv).
+        kv: The picked keys and values, (Q, g, K, dk + dv), or (g, K, dk + dv)
+            that all queries share.
         valid: Which picks are keys, (Q, g, K), or (Q, 1, K) for all heads.
         dk: The keys' dims, before the values' in `kv`.
         scale: What every logit is multiplied by.
@@ -278,15 +280,20 @@ def attend(
         sinks: A logit per head beside the keys', on no value, (h,); None for none.
         latent: For MLA's latents, which are keys and values at once: the values
             are the keys' first `latent` dims, and `kv` holds the keys alone.
+        logits_of: Changes the scaled logits, (Q, g, h / g, K), before soft-capping
+            (a relative bias); None for none.
 
     Returns:
         The heads' outputs, (Q, h, dv), in the values' dtype.
     """
     n, h, _ = q.shape
-    g = kv.shape[1]
+    g, shared = kv.shape[-3], kv.ndim == 3
     k, v = kv[..., :dk], (kv[..., :latent] if latent else kv[..., dk:])
     groups = q.view(n, g, h // g, dk).float()
-    logits = torch.einsum("qgrd,qgkd->qgrk", groups, k.float()) * scale
+    spec = "qgrd,gkd->qgrk" if shared else "qgrd,qgkd->qgrk"
+    logits = torch.einsum(spec, groups, k.float()) * scale
+    if logits_of is not None:
+        logits = logits_of(logits)
     if softcap is not None:
         logits = softcap * torch.tanh(logits / softcap)
     keep = valid[:, :, None, :]
@@ -297,7 +304,8 @@ def attend(
         sink = sinks.float().view(1, g, h // g, 1).expand(n, g, h // g, 1)
         probs = torch.cat([logits, sink], -1).softmax(-1)[..., :-1]
     probs = probs.masked_fill(~keep, 0)
-    out = torch.einsum("qgrk,qgkd->qgrd", probs.to(v.dtype), v)
+    spec = "qgrk,gkd->qgrd" if shared else "qgrk,qgkd->qgrd"
+    out = torch.einsum(spec, probs.to(v.dtype), v)
     return out.reshape(n, h, -1)
 
 
@@ -413,6 +421,78 @@ def choose(
     if size > 1:
         return best_blocks(s, see, positions, size, spec.top_k)
     return tokens(s, see, spec.top_k)
+
+
+def relative(
+    r: torch.Tensor,
+    table: torch.Tensor,
+    gain: torch.Tensor | None,
+    positions: torch.Tensor,
+) -> Any:
+    """A relative bias on the logits of queries at `positions`, (Q,), over keys at
+    0 to K - 1, as `attend` takes it: the bias of a query for the key j positions
+    behind it, ``<r_h, table[:, j]>`` for j below the table's extent, none farther,
+    then the logits times `gain`, (Q,), as bux's length scale; both in float32.
+
+    Args:
+        r: Each query head's projection, (Q, h, rank).
+        table: The bias table, (rank, extent).
+        gain: Each query's length scale; None for none.
+        positions: The queries' positions.
+    """
+    each = torch.einsum("qhr,re->qhe", r.float(), table.float())
+
+    def change(logits: torch.Tensor) -> torch.Tensor:
+        n, g, per, k = logits.shape
+        offsets = positions[:, None] - torch.arange(k, device=positions.device)
+        near = (offsets >= 0) & (offsets < table.shape[1])
+        index = offsets.clamp(0, table.shape[1] - 1)[:, None].expand(-1, g * per, -1)
+        bias = each.gather(-1, index) * near[:, None]
+        out = logits + bias.view(n, g, per, k)
+        return out if gain is None else out * gain.float()[:, None, None, None]
+
+    return change
+
+
+def attend_all(
+    spec: Sparse,
+    q: torch.Tensor,
+    bias: tuple[torch.Tensor, torch.Tensor, torch.Tensor | None],
+    positions: torch.Tensor,
+    cache: torch.Tensor,
+    rows: torch.Tensor,
+    n: int,
+) -> torch.Tensor:
+    """A segment's outputs, (Q, h, dv), over every key its queries see, with a
+    relative bias and a length scale (`relative`), a chunk of queries at a time.
+
+    Args:
+        spec: The layer's settings; its window, scale, softcap, dims and sinks.
+        q: The queries, (Q, h, dk).
+        bias: Each query head's projection, (Q, h, rank), the bias table, and each
+            query's length scale, (Q,), or None.
+        positions: The queries' positions, (Q,).
+        cache: The layer's cache of keys and values.
+        rows: Its block tables' rows of the queries' requests, (Q, blocks), or
+            (1, blocks) for one request's.
+        n: How many key positions the requests have, at least.
+    """
+    keys = torch.arange(n, device=q.device)
+    shared = rows.shape[0] == 1
+    kv = gather(cache, rows, keys[None])[0] if shared else None
+    per = q.shape[1] * n * (1 if shared else cache.shape[3])
+    chunk, (r, table, gain), parts = max(1, BUDGET // per), bias, []
+    for a in range(0, q.shape[0], chunk):
+        cut = slice(a, a + chunk)
+        pos = positions[cut]
+        mine = (
+            kv if kv is not None else gather(cache, rows[cut], keys.expand(len(pos), n))
+        )
+        change = relative(r[cut], table, None if gain is None else gain[cut], pos)
+        see = seen(pos, n, spec.window)[:, None]
+        args = (spec.dk, spec.scale, spec.softcap, spec.sinks)
+        parts.append(attend(q[cut], mine, see, *args, logits_of=change))
+    return torch.cat(parts)
 
 
 @dataclass

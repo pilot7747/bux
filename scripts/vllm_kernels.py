@@ -216,8 +216,8 @@ def compare_csa_picks(relu: bool, dtype: torch.dtype, decoding: bool) -> bool:
     settings = compressed.Settings(16, ratio, top_k, relu, i**-0.5, None)
     q = torch.randn(len(positions), heads, i, device="cuda", dtype=dtype)
     w = torch.randn(len(positions), heads, device="cuda", dtype=dtype)
-    want = compressed.select(caches, steps, settings, q, w)
-    got = kernels.csa_select(caches, steps, settings, q, w)
+    want, _ = compressed.select(caches, steps, settings, q, w)
+    got, _ = kernels.csa_select(caches, steps, settings, q, w)
     same = torch.equal(want, got)
     layout = "decoding" if decoding else "prefill"
     name = "csa picks" + ("" if relu else ", plain dots")

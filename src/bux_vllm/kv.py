@@ -144,15 +144,30 @@ def conv_rows(taps: torch.Tensor, dims: int, first: int, n: int) -> torch.Tensor
 
 
 def query_scale(c: dict, positions: torch.Tensor) -> torch.Tensor | None:
-    """The factor on each query, (T,) in float32, at its position n counted from 1:
-    ``(1 + n / power_scale_length) ** power_scale`` (Beam), times ``1 + log_scale
-    ln(max(n / log_scale_floor, 1))`` (Inkling), which bux puts on the logits before
-    soft-capping and so scales them as on the queries; None for neither."""
-    n, out = positions.float() + 1, None
-    if c["power_scale"] is not None:
-        out = torch.exp(c["power_scale"] * torch.log1p(n / c["power_scale_length"]))
-    if c["log_scale"] is not None:
-        ahead = (n / c["log_scale_floor"]).clamp(min=1.0)
-        gain = 1 + c["log_scale"] * torch.log(ahead)
-        out = gain if out is None else out * gain
-    return out
+    """The factor on each query, (T,) in float32: `power_scale`'s times
+    `length_scale`'s, which bux puts on the logits before soft-capping and so
+    scales them as on the queries; None for neither. With a relative bias, which
+    the length scale multiplies too, the attention takes that one itself."""
+    power, length = power_scale(c, positions), length_scale(c, positions)
+    if power is None or length is None:
+        return power if length is None else length
+    return power * length
+
+
+def power_scale(c: dict, positions: torch.Tensor) -> torch.Tensor | None:
+    """Beam's factor on each query, ``(1 + n / power_scale_length) ** power_scale``
+    at its position n counted from 1, (T,) in float32; None without one."""
+    if c["power_scale"] is None:
+        return None
+    n = positions.float() + 1
+    return torch.exp(c["power_scale"] * torch.log1p(n / c["power_scale_length"]))
+
+
+def length_scale(c: dict, positions: torch.Tensor) -> torch.Tensor | None:
+    """Inkling's factor on each query's logits, ``1 + log_scale ln(max(n /
+    log_scale_floor, 1))`` at its position n counted from 1, (T,) in float32;
+    None without one."""
+    if c["log_scale"] is None:
+        return None
+    ahead = ((positions.float() + 1) / c["log_scale_floor"]).clamp(min=1.0)
+    return 1 + c["log_scale"] * torch.log(ahead)

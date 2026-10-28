@@ -31,6 +31,7 @@ from vllm.model_executor.layers.mamba.ops.gather_initial_states import (
 from vllm.third_party.flash_linear_attention.ops.kda import FusedRMSNormGated
 from vllm.utils.torch_utils import direct_register_custom_op
 
+from . import deltanet
 from .common import Ctx, Layer, Site
 from .linear import kda_projection, linear_dims, to_value_heads, zero_padding
 from .recurrent import Recurrent, float32, low_rank_tensor, split_op
@@ -42,25 +43,24 @@ OP = "bux_kda"
 LOWEST_BOUND = -5.0
 
 
-def check(c: dict) -> None:
-    """Raise if vLLM's kernels cannot run the ``kda`` config `c`.
-
-    Raises:
-        NotImplementedError: No conv or no output gate, value heads of another
-            width than q and k's, or a lower bound under `LOWEST_BOUND`.
-    """
-    if c["conv_size"] is None or c["output_gate"] is None:
-        raise NotImplementedError("kda: no conv or no output gate not in vLLM yet")
-    if (c["v_head_dim"] or c["head_dim"]) != c["head_dim"]:
-        raise NotImplementedError("kda: v_head_dim other than head_dim not in vLLM yet")
+def takes(c: dict) -> bool:
+    """Whether vLLM's kernels run the ``kda`` config `c`: with a conv and an output
+    gate, value heads as wide as q and k's, and a lower bound of `LOWEST_BOUND` or
+    none; the delta rule of bux's own runs the others (`bux_vllm.deltanet`)."""
     bound = c["gate_lower_bound"]
-    if bound is not None and bound < LOWEST_BOUND:
-        raise NotImplementedError(f"kda: gate_lower_bound under {LOWEST_BOUND}")
+    return (
+        c["conv_size"] is not None
+        and c["output_gate"] is not None
+        and (c["v_head_dim"] or c["head_dim"]) == c["head_dim"]
+        and (bound is None or bound >= LOWEST_BOUND)
+    )
 
 
 def state_shape(c: dict, width: int, tp: int) -> tuple:
     """The shapes of a ``kda`` layer's state on one of `tp` ranks: its conv's last
     inputs of q, k and v, and each value head's (dv, dk) state."""
+    if not takes(c):
+        return deltanet.state_shape(c, width, tp)
     h, hv, dk, dv = linear_dims(c)
     return MambaStateShapeCalculator.kda_state_shape(
         tp, hv, dv, h, dk, conv_kernel_size=c["conv_size"]
@@ -97,13 +97,12 @@ class Mixer(Recurrent):
     projections in the compiled graph and `mix` out of it.
 
     Raises:
-        NotImplementedError: Speculative decoding, or what `check` raises for.
+        NotImplementedError: Speculative decoding.
     """
 
     what = "kda"
 
     def __init__(self, c: dict, width: int, vllm_config: Any, prefix: str):
-        check(c)
         super().__init__(vllm_config, prefix)
         split_op(vllm_config.compilation_config, OP)
         self.c = c
@@ -237,17 +236,21 @@ class KimiDeltaAttention(Layer):
     (``-exp(A_log) softplus(f + dt_bias)``, or ``lower_bound * sigmoid(exp(A_log)
     (f + dt_bias))``, f low rank) and ``sigmoid(b)`` steps, each value head's
     RMSNorm times the gate's activation (a dense gate, or a low-rank one), and the
-    output projection."""
+    output projection; by bux's own rule where vLLM's kernels do not take the
+    config (`takes`)."""
 
     bux_types = ("kda",)
     stateful = once = True
 
     def __init__(self, c: dict, width: int, site: Site):
         super().__init__()
-        self.mixer = Mixer(c, width, site.vllm_config, site.caches[0])
+        own = deltanet.Mixer if not takes(c) else Mixer
+        self.mixer = own(c, width, site.vllm_config, site.caches[0])
 
     def targets(self) -> dict[str, tuple[nn.Parameter, tuple]]:
         m = self.mixer
+        if isinstance(m, deltanet.Mixer):
+            return m.targets()
         merged = ["q.weight", "k.weight", "v.weight"]
         merged += ["gate.weight"] if m.dense_gate else []
         out: dict[str, tuple[nn.Parameter, tuple]] = {
@@ -268,6 +271,8 @@ class KimiDeltaAttention(Layer):
         return out
 
     def load(self, name: str, tensor: torch.Tensor) -> list[nn.Parameter]:
+        if isinstance(self.mixer, deltanet.Mixer):
+            return deltanet.load(self, self.mixer, name, tensor)
         if name == "conv.weight":
             return [self.mixer.load_conv(tensor)]
         return super().load(name, low_rank_tensor(name, tensor))

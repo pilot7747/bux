@@ -33,10 +33,14 @@ STATES = {
     "gqa": "full_attention",
     "mla": "full_attention",
     "csa": "full_attention",
+    "mamba": "mamba",
     "mamba2": "mamba",
     "gdn": "linear_attention",
     "kda": "linear_attention",
+    "lightning": "linear_attention",
     "gdn2": "linear_attention",
+    "deltanet": "linear_attention",
+    "gla": "linear_attention",
     "rwkv7": "linear_attention",
 }
 
@@ -57,12 +61,14 @@ LATENT = (
 def states(c: dict, layer_ports: list | None = None) -> list[str]:
     """The kinds of state a call of the layer `c`, with the ports `layer_ports`,
     keeps, in order: its type's (`STATES`), then a ``gqa`` layer's conv state under
-    ``kv_conv_size``, or an ``engram``'s conv's; none for a layer that keeps none.
-    An indexer's keys are in its attention's cache (`bux_vllm.sparse`). A ``gqa``
-    layer that reads its ``kv`` port names an attention layer of its own, over its
-    writer's cache, and keeps nothing else."""
+    ``kv_conv_size``, or a ``conv`` layer's or an ``engram``'s conv's; none for a
+    layer that keeps none. An indexer's keys are in its attention's cache
+    (`bux_vllm.sparse`). A ``gqa`` layer that reads its ``kv`` port names an
+    attention layer of its own, over its writer's cache, and keeps nothing else."""
     if c["type"] == "engram":
         return ["conv"] if c["conv_size"] else []
+    if c["type"] in ("conv", "short_conv"):
+        return ["conv"]
     if c["type"] not in STATES:
         return []
     if c["type"] == "gqa" and reads(layer_ports or [], "kv"):

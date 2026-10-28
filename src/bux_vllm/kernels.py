@@ -1055,16 +1055,20 @@ def csa_select(
     s: compressed.Settings,
     q: torch.Tensor,
     w: torch.Tensor,
-) -> torch.Tensor:
+    picks_of: compressed.Picks | None = None,
+) -> tuple[torch.Tensor, torch.Tensor | None]:
     """`bux_vllm.compressed.select` by the kernels, which read the indexer keys in
     place: the decoded tokens' scores by `scores`, ranked by PyTorch, and each
     prompt chunk's ranking keys by `prompt_scores`; (T, top_k) by index, -1 for
-    none."""
+    none, and no candidate pool. A call that picks inside a pool, or makes one
+    (`picks_of`), picks by PyTorch's `bux_vllm.compressed.select`."""
+    if picks_of is not None and (picks_of.inside is not None or picks_of.pooled):
+        return compressed.select(caches, steps, s, q, w, picks_of)
     assert caches.index is not None and s.ratio is not None and s.top_k
     seen = (steps.positions + 1) // s.ratio
     most = steps.longest // s.ratio
     if most <= s.top_k:
-        return compressed.every(seen, most)
+        return compressed.every(seen, most), None
     kept = seen.new_full((seen.shape[0], s.top_k), -1)
     index = caches.index
     keys = picks.Cache(index.cache.unsqueeze(1), 0, index.cache.shape[-1])
@@ -1084,7 +1088,7 @@ def csa_select(
         picked, ok = picks.best_of(ranks, s.top_k)
         picked = torch.where(ok, picked, -1)
         kept[c] = F.pad(picked, (0, s.top_k - picked.shape[1]), value=-1)
-    return kept
+    return kept, None
 
 
 def attend_segment(

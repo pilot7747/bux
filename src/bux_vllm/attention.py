@@ -31,7 +31,6 @@ from .common import (
     Site,
     logit_gain,
     sharded_loader,
-    unsupported,
 )
 from .config import states
 from .conv import CausalConv
@@ -51,7 +50,9 @@ class Attention(Layer):
     bux's do (DSA, and its blocks: QSA's, MSA's), by the plugin's sparse attention
     op over vLLM's paged caches (`bux_vllm.sparse`). The ``index`` port passes the
     picks on: a layer that reads it attends to the keys another's indexer picked,
-    of those its own window sees, and runs no indexer.
+    of those its own window sees, and runs no indexer. With a relative bias, each
+    query attends to every key it sees, the bias and the length scale on its
+    logits, by the plugin's op over a paged cache of its own.
 
     Each call of the layer keeps a KV cache of its own, a conv state beside it with
     ``kv_conv_size``, and its indexer's keys with an indexer: a shared layer that
@@ -66,8 +67,10 @@ class Attention(Layer):
 
     def __init__(self, c: dict, width: int, site: Site):
         super().__init__()
-        unsupported(c, "relative_bias")
         kv.check_ports(c, site.ports)
+        self.rel, self.rel_proj, self.rel_table = c["relative_bias"], None, None
+        if self.rel and (c["indexer"] or site.ports):
+            raise NotImplementedError("gqa: a relative bias beside an indexer or ports")
         self.reads_kv = kv.reads(site.ports, "kv") is not None
         self.reads_index = kv.reads(site.ports, "index") is not None
         tp = get_tensor_model_parallel_world_size()
@@ -87,6 +90,8 @@ class Attention(Layer):
         self.indexer = None
         if c["indexer"] or self.reads_index:
             self._sparse_caches(c, width, site, names)
+        elif self.rel:
+            self._biased_caches(c, width, site, names)
         else:
             shares = site.shares or [None] * len(names["full_attention"])
             self._caches(c, site, names["full_attention"], shares)
@@ -189,6 +194,28 @@ class Attention(Layer):
             site.vllm_config,
         )
 
+    def _biased_caches(
+        self, c: dict, width: int, site: Site, names: dict[str, list[str]]
+    ) -> None:
+        """Make the relative bias, each head's projection (column-parallel by head)
+        and the table every rank keeps, and each call's paged cache of keys and
+        values, which the biased attention op reads (`bux_vllm.sparse`)."""
+        rank, extent = self.rel["rank"], self.rel["extent"]
+        self.rel_proj = ColumnParallelLinear(
+            width,
+            c["num_heads"] * rank,
+            bias=c["bias"],
+            return_bias=False,
+            prefix=f"{site.path}.rel_proj",
+        )
+        table = torch.zeros(rank, extent)
+        self.rel_table = nn.Parameter(table, requires_grad=False)
+        settings = (c["sliding_window_size"], self.scale, c["softcap"], self.sinks)
+        spec = picks.layer_spec(None, None, settings, self.dk, (self.kv_first, self.g))
+        self.caches = sparse.layer_caches(
+            spec, self.g, self.dk + self.dv, 0, names, site.vllm_config
+        )
+
     def _convs(self, c: dict, site: Site, names: list[str]) -> None:
         """Make each call's conv on keys and values, with its state, under
         ``kv_conv_size``: all calls' over the same weights."""
@@ -233,7 +260,7 @@ class Attention(Layer):
             if (fused := getattr(self.qkv, kind, None)) is not None:
                 shards = {"qkv": None} if self.fused else {s: s for s in "qkv"}
                 out |= {f"{n}.{kind}": (fused, (s,)) for n, s in shards.items()}
-            for name in ("q", "gate", "o"):
+            for name in ("q", "gate", "o", "rel_proj"):
                 layer = getattr(self, name)
                 if layer is not None and getattr(layer, kind) is not None:
                     out[f"{name}.{kind}"] = (getattr(layer, kind), ())
@@ -249,6 +276,8 @@ class Attention(Layer):
         if self.indexer is not None:
             params = self.indexer.named_parameters()
             out |= {f"indexer.{name}": (p, ()) for name, p in params}
+        if self.rel_table is not None:
+            out["rel_table"] = (self.rel_table, ())
         return out
 
     def load(self, name: str, tensor: torch.Tensor) -> list[nn.Parameter]:
@@ -281,6 +310,8 @@ class Attention(Layer):
             k = self.rope(k, ctx.positions)
         if self.indexer is not None or self.reads_index:
             out = self._sparse(x, q, k, v, call, ctx)
+        elif self.rel:
+            out = self._biased(x, q, k, v, call, ctx)
         else:
             q, k = q.reshape(t, -1).contiguous(), k.reshape(t, -1).contiguous()
             out = self.caches[call](q, k, v.contiguous()).view(t, self.h, self.dv)
@@ -293,7 +324,8 @@ class Attention(Layer):
         q = self._normed(q, self.q_norm, self.h)
         if self.rope is not None:
             q = self.rope(q, ctx.positions)
-        if (scale := kv.query_scale(self.c, ctx.positions)) is not None:
+        scales = kv.power_scale if self.rel else kv.query_scale  # biased: its op's
+        if (scale := scales(self.c, ctx.positions)) is not None:
             q = (q * scale[:, None, None]).to(q.dtype)
         return q
 
@@ -328,6 +360,31 @@ class Attention(Layer):
         values = v.view(-1, self.g, self.dv)
         cache = self.caches[call]
         return sparse.attend((q, k, values), index, out, cache, self.ports, ctx)
+
+    def _biased(
+        self,
+        x: torch.Tensor,
+        q: torch.Tensor,
+        k: torch.Tensor,
+        v: torch.Tensor,
+        call: int,
+        ctx: Ctx,
+    ) -> torch.Tensor:
+        """The heads' outputs, (T, h, dv), of attending to every key with the
+        relative bias, then the length scale, on the logits, by the biased op over
+        the `call`-th call's cache."""
+        assert self.rel_proj is not None and self.rel_table is not None
+        t, at = q.shape[0], ctx.positions
+        r = self.rel_proj(x).view(t, self.h, -1)
+        gain = kv.length_scale(self.c, at)
+        gain = q.new_empty(0) if gain is None else gain
+        out = q.new_empty(t, self.h, self.dv)
+        values = v.view(-1, self.g, self.dv)
+        tensors = (q, k, values, r, self.rel_table, gain)
+        torch.ops.vllm.bux_biased_attention(
+            *(t.contiguous() for t in tensors), at, out, self.caches[call].prefix
+        )
+        return out
 
     def _project(self, x: torch.Tensor, call: int) -> list[torch.Tensor]:
         """q, k and v of x, (T, _) each, with the conv added to k and v (by the

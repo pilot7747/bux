@@ -76,14 +76,12 @@ def check(c: dict, site: Site) -> None:
     """Raise for what the plugin's ``csa`` does not run.
 
     Raises:
-        NotImplementedError: Ports, a relative bias, a length scale, an indexer of
+        NotImplementedError: A relative bias, a length scale, an indexer of
             blocks, ``o_groups`` or heads that the ranks do not split, speculative
             decoding, decode context parallelism, or a KV cache dtype other than
             the model's.
     """
     unsupported(c, "relative_bias", "log_scale")
-    if site.ports:
-        raise NotImplementedError("csa: the kv, index and candidates ports")
     ix = c["indexer"]
     if ix and ix["block_size"] > 1:
         raise NotImplementedError("csa: an indexer of blocks (block_size > 1)")
@@ -278,8 +276,9 @@ class Call(Rows):
         prefix: str,
         dtype: torch.dtype,
         vllm_config: Any,
+        ports: list | None = None,
     ):
-        rows = compressed.cache_rows(c)
+        rows = compressed.cache_rows(c, ports)
         super().__init__(prefix, *rows["window"], dtype, vllm_config)
         self.settings = settings
         self.compressed, self.index, self.state = (
@@ -289,13 +288,18 @@ class Call(Rows):
             for name in ("compressed", "index", "state")
         )
 
-    def caches(self, meta: dict, n: int) -> compressed.Caches:
-        """Its caches in the batch of `meta`, of n tokens."""
+    def caches(
+        self, meta: dict, n: int, writer: "Call | None" = None
+    ) -> compressed.Caches:
+        """Its caches in the batch of `meta`, of n tokens: with the compressed
+        latents and indexer keys of the call `writer`, where it reads its ``kv``
+        port."""
         out = compressed.Caches(self.paged(meta), meta[self.prefix].slot_mapping[:n])
-        if self.compressed is not None:
-            out.compressed = self.compressed.paged(meta)
-        if self.index is not None:
-            out.index = self.index.paged(meta)
+        latents = self if writer is None else writer
+        if latents.compressed is not None:
+            out.compressed = latents.compressed.paged(meta)
+        if latents.index is not None:
+            out.index = latents.index.paged(meta)
         if self.state is not None:
             out.state = self.state.paged(meta)
             out.state_slots = meta[self.state.prefix].slot_mapping[:n]
@@ -340,12 +344,21 @@ def attend_op(
     index_w: torch.Tensor | None,
     positions: torch.Tensor,
     sinks: torch.Tensor | None,
+    picked: torch.Tensor | None,
+    inside: torch.Tensor | None,
     out: torch.Tensor,
+    kept: torch.Tensor,
+    pool: torch.Tensor,
     layer_name: str,
+    writer: str,
 ) -> None:
     """`ATTEND`: write the token latents and compressed rows to the call's caches,
-    pick the compressed latents each query keeps, and attend to them and the
-    window; the heads' outputs to `out` (T, h, d) (`compressed.mix`)."""
+    pick the compressed latents each query keeps (or take the `picked` its
+    ``index`` port reads, or pick inside the pool its ``candidates`` port reads),
+    and attend to them and the window; the heads' outputs to `out` (T, h, d)
+    (`compressed.mix`), and the picks and the pool made to `kept` (T, top_k) and
+    `pool` (T, k), unless they are empty. A call that reads its ``kv`` port reads
+    the compressed latents of the call `writer`."""
     call, meta = _batch(layer_name, q.device)
     if meta is None:
         return
@@ -354,9 +367,15 @@ def attend_op(
     index = None
     if index_q is not None and index_w is not None:
         index = (index_q[:n], index_w[:n])
+    picks = compressed.Picks(
+        None if picked is None else picked[:n],
+        None if inside is None else inside[:n],
+        pool.numel() > 0,
+    )
+    theirs = get_forward_context().no_compile_layers[writer] if writer else None
     kernel = kernels.takes_csa(q.dtype, q.shape[-1])
-    out[:n] = compressed.mix(
-        call.caches(meta, n),
+    out[:n], own, made = compressed.mix(
+        call.caches(meta, n, theirs),
         m.steps(positions),
         call.settings,
         q[:n],
@@ -364,13 +383,22 @@ def attend_op(
         None if rows is None else rows[:n],
         index,
         sinks,
+        picks,
         kernels.csa_attend if kernel else None,
         kernels.csa_select if kernel else None,
     )
+    if kept.numel() and own is not None:
+        kept[:n] = torch.nn.functional.pad(
+            own, (0, kept.shape[1] - own.shape[1]), value=-1
+        )
+    if pool.numel() and made is not None:
+        pool[:n] = made
 
 
 direct_register_custom_op(op_name=POOL, op_func=pool_op, mutates_args=["pooled"])
-direct_register_custom_op(op_name=ATTEND, op_func=attend_op, mutates_args=["out"])
+direct_register_custom_op(
+    op_name=ATTEND, op_func=attend_op, mutates_args=["out", "kept", "pool"]
+)
 
 
 def _register(compilation: Any, prefix: str, layer: nn.Module) -> None:
@@ -404,6 +432,12 @@ class CompressedSparseAttention(Layer):
     The query heads split over tensor-parallel ranks, and the output projection's
     groups with them; the latents, the compressed latents and the indexer are every
     rank's, as bux's are. Each call keeps caches of its own, over the same weights.
+
+    Its ports share the compressed latents with later layers, DeepSeek-V4.1's: one
+    that reads ``kv`` attends to the compressed latents (and their indexer keys) of
+    the call that wrote it, keeping its window alone; one that reads ``index``
+    takes that call's picks; one that reads ``candidates`` picks inside its
+    candidate pool, which a call that writes ``candidates`` makes.
     """
 
     bux_types = ("csa",)
@@ -414,8 +448,10 @@ class CompressedSparseAttention(Layer):
         check(c, site)
         tp = get_tensor_model_parallel_world_size()
         self.path, self.d, self.ratio = site.path, c["head_dim"], c["compress_ratio"]
-        self.h = c["num_heads"] // tp
-        self.parts = compressed.Parts(c)
+        self.h, self.ports = c["num_heads"] // tp, site.ports
+        if not compressed.compresses(c, site.ports):
+            self.ratio = None  # its own: the compressed latents are the kv port's
+        self.parts = compressed.Parts(c, site.ports)
         self._inputs(c, width, site.path)
         self._outputs(c, width, site.path, tp)
         self.sinks = _sharded(self.h, dtype=torch.float32) if c["sinks"] else None
@@ -424,9 +460,14 @@ class CompressedSparseAttention(Layer):
             compressed.Settings.of(c, scale),
             cache_dtype(site.vllm_config),
         )
-        self.names = list(site.caches)
+        self.names, self.shares, self.settings = (
+            list(site.caches),
+            site.shares,
+            settings,
+        )
         self.calls = nn.ModuleList(
-            Call(c, settings, name, dtype, site.vllm_config) for name in site.caches
+            Call(c, settings, name, dtype, site.vllm_config, site.ports)
+            for name in site.caches
         )
 
     def _inputs(self, c: dict, width: int, path: str) -> None:
@@ -434,7 +475,7 @@ class CompressedSparseAttention(Layer):
         rank's by one GEMM (`down`): the query latent's, the token latent's, the
         compressed latent's and its gate's, and the indexer's head weights."""
         d, latent, ix = c["head_dim"], c["q_lora_rank"], c["indexer"]
-        self.down_parts, self.down_split = compressed.down(c)
+        self.down_parts, self.down_split = compressed.down(c, self.ports)
         sizes, split = aligned(
             [n for _, n in self.down_parts], [n for _, n in self.down_split], 1
         )
@@ -457,7 +498,7 @@ class CompressedSparseAttention(Layer):
             prefix=f"{path}.q",
         )
         self.index_q = None
-        if ix:
+        if ix and not compressed.reads(self.ports, "index"):
             self.index_q = ReplicatedLinear(
                 latent or width,
                 ix["num_heads"] * ix["head_dim"],
@@ -518,11 +559,58 @@ class CompressedSparseAttention(Layer):
         latent = self.parts.latents(down["kv"], pos)
         rows = self._compressed(down, pos, name)
         index_q, index_w = self._index(down, query, pos)
+        picked, inside = self._read(ctx, "index"), self._read(ctx, "candidates")
+        kept, pool = self._made(q, "index"), self._made(q, "candidates")
         out = x.new_zeros(t, self.h, self.d)
         torch.ops.vllm.bux_csa(
-            q, latent, rows, index_q, index_w, pos, self.sinks, out, name
+            q,
+            latent,
+            rows,
+            index_q,
+            index_w,
+            pos,
+            self.sinks,
+            picked,
+            inside,
+            out,
+            kept,
+            pool,
+            name,
+            self._writer(name),
         )
+        self._write(ctx, "index", picked if picked is not None else kept)
+        self._write(ctx, "candidates", pool)
         return self._output(x, self.parts.unrotate(out, pos))
+
+    def _writer(self, name: str) -> str:
+        """The call whose compressed latents the call `name` reads through its
+        ``kv`` port, by vLLM's name; empty for its own."""
+        if not self.shares:
+            return ""
+        return self.shares[self.names.index(name)] or ""
+
+    def _read(self, ctx: Ctx, port: str) -> torch.Tensor | None:
+        """What the layer reads from its port `port`; None if it reads none."""
+        tap = next(
+            ((t, m == "pop") for n, t, m in self.ports if n == port and m != "write"),
+            None,
+        )
+        return None if tap is None else ctx.read(*tap)
+
+    def _made(self, q: torch.Tensor, port: str) -> torch.Tensor:
+        """Where the op writes what the layer pushes to its port `port` (its picks,
+        or its candidate pool), (T, k) by index; empty if it writes none."""
+        s = self.settings
+        if not compressed.writes(self.ports, port):
+            return q.new_zeros(0, dtype=torch.long)
+        width = s.top_k if port == "index" else s.pool[1] if s.pool else 0
+        return q.new_full((q.shape[0], width or 0), -1, dtype=torch.long)
+
+    def _write(self, ctx: Ctx, port: str, x: torch.Tensor | None) -> None:
+        """Push `x` to the taps of the layer's port `port`."""
+        for n, tap, mode in self.ports:
+            if n == port and mode == "write" and x is not None:
+                ctx.push(tap, x)
 
     def _down(self, x: torch.Tensor) -> dict[str, torch.Tensor]:
         """The parts of `down`'s output, by name (``down_split``)."""

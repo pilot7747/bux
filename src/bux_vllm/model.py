@@ -30,7 +30,7 @@ from vllm.model_executor.models.interfaces import IsHybrid
 from vllm.sequence import IntermediateTensors
 from vllm.v1.kv_cache_interface import MambaSpec
 
-from . import conv, engram, kv, residual, ssm
+from . import compressed, conv, engram, kv, residual, ssm
 from .common import Ctx, Layer, Site
 from .config import states
 from .plan import (
@@ -52,12 +52,16 @@ LAYER_MODULES = (
     "common",
     "basic",
     "attention",
+    "conv",
     "mla",
     "csa",
     "moe",
     "ssm",
     "kda",
+    "lightning",
     "gdn2",
+    "deltanet",
+    "gla",
     "rwkv7",
     "residual",
     "engram",
@@ -127,10 +131,20 @@ def kv_shares(
     out: dict[str, list[str | None]] = {}
     for call, source in zip(calls, kv.sources([ports(c.layer) for c in calls])):
         if source is not None:
-            writer = calls[source].layer
-            kv.check_shared(call.layer["config"], writer["config"], writer["width"])
+            _check_shared(call.layer, calls[source].layer)
         out.setdefault(call.path, []).append(None if source is None else own[source])
     return out
+
+
+def _check_shared(reader: Node, writer: Node) -> None:
+    """Raise for what `reader`, a layer's IR node, cannot read of `writer`'s through
+    its ``kv`` port: a ``gqa``'s keys and values, or a ``csa``'s compressed
+    latents (`bux_vllm.kv.check_shared`, `bux_vllm.compressed.check_shared`)."""
+    c, theirs = reader["config"], writer["config"]
+    if c["type"] == "csa":
+        compressed.check_shared(c, theirs, ports(reader))
+    else:
+        kv.check_shared(c, theirs, writer["width"])
 
 
 def build_layers(vllm_config: VllmConfig, p: Plan) -> dict[str, nn.Module]:

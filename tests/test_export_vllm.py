@@ -38,7 +38,7 @@ from bux.export.hf import moe as hf_moe
 from bux.export.hf import residual as hf_residual
 from bux.export.hf import rwkv7 as hf_rwkv7
 from bux.export.huggingface import save
-from bux.lang import compile, compile_file, compile_runs, ir
+from bux.lang import compile, compile_file, ir
 from bux_vllm import (
     common,
     compressed,
@@ -57,11 +57,6 @@ from bux_vllm import (
 
 ROOT = Path(__file__).parent.parent
 EXAMPLES = sorted((ROOT / "examples" / "architectures").rglob("*.bux"))
-TIMELINE = ROOT / "examples" / "experiments" / "timeline"
-#: The timeline's files whose arms set a residual algebra.
-ALGEBRA_ARMS = [
-    p for p in sorted(TIMELINE.glob("*.bux")) if "\nresidual" in p.read_text()
-]
 FILES = sorted(Path(plan.__file__).parent.glob("*.py"))
 
 
@@ -105,16 +100,6 @@ def test_layers_are_where_bux_export_puts_them(path: Path) -> None:
 @pytest.mark.parametrize("name", vllm_parity.CASES)
 def test_parity_cases_are_where_bux_export_puts_them(name: str) -> None:
     assert_placed_as_bux_export(compile(vllm_parity.CASES[name]))
-
-
-@pytest.mark.parametrize("path", ALGEBRA_ARMS, ids=lambda p: p.stem)
-def test_the_timeline_residual_arms_are_where_bux_export_puts_them(path: Path) -> None:
-    """Every arm of a timeline file that sets a residual algebra, at every rung."""
-    runs = compile_runs(path.read_text(), filename=str(path))
-    archs = {r.arch.model_dump_json(): r.arch for r in runs if r.arch.residual}
-    assert archs
-    for arch in archs.values():
-        assert_placed_as_bux_export(arch)
 
 
 def test_reserved_labels_are_named_as_bux_export_names_them() -> None:
@@ -174,6 +159,13 @@ def test_a_sparse_cache_s_rows_hold_the_indexer_keys_beside_the_kv() -> None:
     torch.testing.assert_close(cache.keys(table, at[None])[0], index)
     got = picks.gather(cache.kv, table, at[None])[0].transpose(0, 1)
     torch.testing.assert_close(got, kv)
+
+
+def test_a_conv_layer_keeps_a_conv_state() -> None:
+    c = bux_config(vllm_parity.CASES["conv"])
+    assert c.layer_types == ["full_attention", "conv", "conv", "full_attention", "conv"]
+    c = bux_config(vllm_parity.CASES["short-conv"])
+    assert c.layer_types == ["conv", "full_attention", "conv"]
 
 
 def test_a_conv_on_keys_and_values_keeps_a_state_beside_the_kv_cache() -> None:
@@ -480,6 +472,29 @@ def twins(theirs: torch.nn.Module, mine: common.Layer) -> None:
     assert {n for n, _ in mine.named_parameters()} == {
         n for n, _ in theirs.named_parameters()
     }
+
+
+def test_lightning_decays_as_the_export_by_the_depth_the_export_gives() -> None:
+    """The decay rates by the layer's depth among the token mixers, which the
+    export's sites carry (bux_sites' extra)."""
+    arch = compile(vllm_parity.CASES["lightning"])
+    sites = core.plan(arch).sites()
+    depths = [s["extra"] for s in sites.values() if s["extra"]]
+    assert depths == [{"layer": 0, "layers": 3}, {"layer": 1, "layers": 3}]
+    for depth in depths:
+        want = hf_linear.slopes(2, depth["layer"], depth["layers"])
+        torch.testing.assert_close(linear.slopes(2, *depth.values()), want)
+
+
+def test_dyt_computes_what_the_export_does() -> None:
+    from bux.export.hf import basic as hf_basic
+
+    c = cfg.DyTConfig().model_dump(mode="json")
+    theirs, mine = hf_basic.DyT(c, 16), common.DyT(c, 16)
+    torch.manual_seed(0)
+    twins(theirs, mine)
+    x = torch.randn(5, 16) * 3
+    torch.testing.assert_close(mine(x), theirs(x))
 
 
 def through(branches: list, x: Any, ctx: Any, body: torch.Tensor) -> tuple[list, Any]:
@@ -951,6 +966,135 @@ def test_gdn2_feeds_the_rule_what_the_export_does(mixer: str) -> None:
     torch.testing.assert_close(m.o(o), m(x[None], no_cache())[0])
 
 
+def test_deltanet_feeds_the_rule_what_the_export_does() -> None:
+    """The plugin's DeltaNet between its projections and its output, on the
+    export's weights and conv, is the export's layer."""
+    m, c = exported("deltanet(num_heads=2, num_v_heads=4, head_dim=16)")
+    x = torch.randn(100, 64)
+    qkv = torch.cat([m.q(x), m.k(x), m.v(x)], -1)
+    qkv = torch.nn.functional.silu(m.conv(qkv[None], no_cache())[0])
+    heads = linear.linear_dims(c)
+    xs = feeds.deltanet_rule(heads, qkv, m.b(x))
+    o = by_chunks(xs, heads, 0.0)
+    o = m.norm(o).flatten(1) * common.ACTIVATIONS[c["output_gate"]](m.gate(x))
+    torch.testing.assert_close(m.o(o), m(x[None], no_cache())[0])
+
+
+def projected(m: Any, x: torch.Tensor, silu: bool = True) -> torch.Tensor:
+    """The export's q, k and v of x side by side, convolved and SiLU'd, or SiLU'd
+    alone (if `silu`) without a conv, as the plugin's layers take them."""
+    qkv = torch.cat([m.q(x), m.k(x), m.v(x)], -1)
+    if m.conv is not None:
+        return torch.nn.functional.silu(m.conv(qkv[None], no_cache())[0])
+    return torch.nn.functional.silu(qkv) if silu else qkv
+
+
+@pytest.mark.parametrize("conv", [4, None], ids=["conv", "no conv"])
+def test_linear_layers_without_a_conv_feed_the_rule_what_the_export_does(
+    conv: int | None,
+) -> None:
+    """DeltaNet and GDN-2 with or without a conv (q, k and v SiLU'd alone) are the
+    export's layers."""
+    size = "none" if conv is None else conv
+    m, c = exported(f"deltanet(num_heads=2, head_dim=16, conv_size={size})")
+    x = torch.randn(70, 64)
+    heads = linear.linear_dims(c)
+    o = by_chunks(feeds.deltanet_rule(heads, projected(m, x), m.b(x)), heads, 0.0)
+    o = m.norm(o).flatten(1) * common.ACTIVATIONS[c["output_gate"]](m.gate(x))
+    torch.testing.assert_close(m.o(o), m(x[None], no_cache())[0])
+    m, c = exported(f"gdn2(num_heads=2, head_dim=16, conv_size={size})")
+    gates = (m.f(x), m.erase(x), m.write(x))
+    xs = feeds.gdn2_rule(c, heads, projected(m, x), gates, m.A_log, m.dt_bias)
+    o = m.norm(by_chunks(xs, heads, None)).flatten(1)
+    o = o * common.ACTIVATIONS[c["output_gate"]](m.gate(x))
+    torch.testing.assert_close(m.o(o), m(x[None], no_cache())[0])
+
+
+OWN_RULE = {
+    "gdn": "gdn(num_heads=2, num_v_heads=4, head_dim=16, conv_size=none,"
+    " output_gate=none)",
+    "kda": "kda(num_heads=2, num_v_heads=4, head_dim=16, v_head_dim=8,"
+    " conv_size=none, output_gate_rank=4, gate_lower_bound=-8)",
+    "kda, conv": "kda(num_heads=2, head_dim=16, v_head_dim=8)",
+}
+
+
+@pytest.mark.parametrize("mixer", OWN_RULE.values(), ids=OWN_RULE.keys())
+def test_gdn_and_kda_beyond_vllms_kernels_feed_the_rule_what_the_export_does(
+    mixer: str,
+) -> None:
+    """GDN and KDA that vLLM's own kernels do not take (no conv or output gate,
+    values of other widths than q and k's, a lower bound under -5) run bux's own
+    rule (bux_vllm.deltanet): between their projections and their output, on the
+    export's weights, the export's layers."""
+    m, c = exported(mixer)
+    x = torch.randn(70, 64)
+    heads = linear.linear_dims(c)
+    if c["type"] == "gdn":
+        g = feeds.gdn_decay(m.a(x), m.A_log, m.dt_bias, heads[2])
+        floor = None
+    else:
+        g = feeds.kda_decay(m.f(x), m.A_log, m.dt_bias, c)
+        floor = -c["gate_lower_bound"] if c["gate_lower_bound"] else None
+    xs = feeds.deltanet_rule(heads, projected(m, x), m.b(x), g)
+    o = m.norm(by_chunks(xs, heads, floor)).flatten(1)
+    if m.gate is not None:
+        o = o * common.ACTIVATIONS[c["output_gate"]](m.gate(x))
+    torch.testing.assert_close(m.o(o), m(x[None], no_cache())[0])
+
+
+GLA = {
+    "gla": "gla(num_heads=2, num_v_heads=4, head_dim=16, gate_rank=4)",
+    "gla, conv": "gla(num_heads=2, head_dim=16, v_head_dim=8, conv_size=4,"
+    " output_gate=sigmoid)",
+}
+
+
+LIGHTNING = {
+    "lightning": "lightning(num_heads=2, head_dim=16)",
+    "conv, value heads": "lightning(num_heads=2, num_v_heads=4, head_dim=16,"
+    " v_head_dim=8, conv_size=4)",
+}
+
+
+@pytest.mark.parametrize("mixer", LIGHTNING.values(), ids=LIGHTNING.keys())
+def test_lightning_feeds_the_rule_what_the_export_does(mixer: str) -> None:
+    """The plugin's lightning attention between its projections and its output, on
+    the export's weights, is the export's layer: q, k and v SiLU'd (convolved first
+    with a conv), a fixed decay per value head by the layer's depth, the rule with
+    no rank-one term, and the RMSNorm of all heads."""
+    layer = next(compile(f"d_model = 64\nmodel = {mixer}").layers())
+    c = layer.config.model_dump(mode="json")
+    site = hf_common.Site(None, "mix", extra={"layer": 1, "layers": 3})
+    m = hf_linear.LightningAttention(c, 64, site)
+    torch.manual_seed(0)
+    with torch.no_grad():
+        for p in m.parameters():
+            p.normal_(0, 0.3)
+    x = torch.randn(70, 64)
+    heads = linear.linear_dims(c)
+    rates = linear.slopes(heads[1], 1, 3)
+    xs = feeds.lightning_rule(heads, projected(m, x), rates)
+    o = m.norm(by_chunks(xs, heads, None).flatten(1))
+    assert m.gate is not None
+    o = o * common.ACTIVATIONS[c["output_gate"]](m.gate(x))
+    torch.testing.assert_close(m.o(o), m(x[None], no_cache())[0])
+
+
+@pytest.mark.parametrize("mixer", GLA.values(), ids=GLA.keys())
+def test_gla_feeds_the_rule_what_the_export_does(mixer: str) -> None:
+    """The plugin's GLA between its projections and its output, on the export's
+    weights (and conv), is the export's layer: q, k and v SiLU'd after a conv alone,
+    and the rule with no rank-one term."""
+    m, c = exported(mixer)
+    x = torch.randn(100, 64)
+    heads = linear.linear_dims(c)
+    xs = feeds.gla_rule(heads, projected(m, x, silu=False), m.f(x))
+    o = m.norm(by_chunks(xs, heads, None)).flatten(1)
+    o = o * common.ACTIVATIONS[c["output_gate"]](m.gate(x))
+    torch.testing.assert_close(m.o(o), m(x[None], no_cache())[0])
+
+
 def test_rwkv7_feeds_the_rule_what_the_export_does() -> None:
     """The plugin's RWKV-7 between its projections and its output, on the export's
     weights, is the export's layer."""
@@ -1186,6 +1330,48 @@ def test_sparse_attention_in_the_latent_space_is_bux_s(name: str, window: int | 
     )
 
 
+@pytest.mark.parametrize("window", [None, 6], ids=["causal", "window"])
+@pytest.mark.parametrize("log_scale", [None, 0.5], ids=["plain", "log scale"])
+def test_attention_with_a_relative_bias_over_paged_caches_is_bux_s(
+    window: int | None, log_scale: float | None
+) -> None:
+    """Every key a query sees, read from paged caches, with the relative bias and
+    the length scale on its logits (bux_vllm.picks.attend_all), gives what the
+    export's softmax gives with its bias and gain, for one request's queries
+    together and one at a time."""
+    from bux.export.hf import attention as hf_attention
+    from bux_vllm import picks
+
+    torch.manual_seed(0)
+    width, s, h, g, dk, rank, extent = 16, 23, 4, 2, 8, 3, 7
+    x, at = torch.randn(1, s, width), torch.arange(s)
+    proj = torch.nn.Linear(width, h * rank)
+    table = torch.randn(rank, extent)
+    layer = stand_in(rel_proj=proj, rel_table=table, h=h, log_scale=log_scale)
+    layer.log_scale_floor = 4
+    offsets = at[:, None] - at[None]
+    bias = hf_attention.SoftmaxAttention._relative_bias(layer, x, offsets)
+    gain = hf_attention.SoftmaxAttention._length_scale(
+        layer, stand_in(positions=at[None])
+    )
+    q, k, v = (torch.randn(1, n, s, dk) for n in (h, g, g))
+    keep = picks.seen(at, s, window)[None, None]
+    sinks = torch.randn(h)
+    want = hf_attention.softmax_attention(q, k, v, keep, 0.3, 4.0, sinks, bias, gain)[0]
+    block, blocks = 4, 9
+    table_rows = torch.randperm(blocks)[None]
+    cache = torch.zeros(blocks, g, block, 2 * dk)
+    slots = table_rows[0, at // block] * block + at % block
+    picks.write(cache, slots, torch.cat([k[0], v[0]], -1).transpose(0, 1))
+    spec = picks.layer_spec(None, None, (window, 0.3, 4.0, sinks), dk, (0, g))
+    r = proj(x[0]).view(s, h, rank)
+    lengths = None if gain is None else gain[0, 0, :, 0]
+    qs = q[0].transpose(0, 1)
+    for rows in (table_rows, table_rows.expand(s, -1)):
+        got = picks.attend_all(spec, qs, (r, table, lengths), at, cache, rows, s)
+        torch.testing.assert_close(got, want, rtol=1e-5, atol=1e-5)
+
+
 def test_the_step_splits_into_its_decoded_tokens_and_prompt_chunks() -> None:
     """The decoded tokens, which vLLM puts first, attend together, as slices that a
     CUDA graph of the step fixes; each prompt chunk on its own."""
@@ -1382,7 +1568,7 @@ def test_fla_takes_the_rule_as_its_kernels_take_it(
 #: csa settings the plugin runs, on 4 heads of 16 dims: each step below crosses
 #: windows of 5 and 6, a compressed latent of 2 to 4 tokens and an indexer's top 3.
 CSA = {
-    "the timeline's": "csa(num_heads=4, head_dim=16, sliding_window_size=6,"
+    "groups of 4": "csa(num_heads=4, head_dim=16, sliding_window_size=6,"
     " compress_ratio=4, sinks=true, rope=rope(fraction=0.5),"
     " indexer=indexer(num_heads=2, head_dim=8, top_k=3))",
     "window": "csa(num_heads=4, head_dim=16, sliding_window_size=5, sinks=true,"
@@ -1427,11 +1613,11 @@ class PagedCsa:
     `lengths`: blocks of `CSA_BLOCK` tokens, shuffled, block 0 (vLLM's null block)
     left out."""
 
-    def __init__(self, c: dict, lengths: list[int]):
+    def __init__(self, c: dict, lengths: list[int], ports: list | None = None):
         self.paged: dict[str, compressed.Paged] = {}
         per_seq = -(-CSA_MAX_LEN // CSA_BLOCK)
         gen = torch.Generator().manual_seed(0)
-        for name, (width, per, _) in compressed.cache_rows(c).items():
+        for name, (width, per, _) in compressed.cache_rows(c, ports).items():
             ids = torch.randperm(len(lengths) * per_seq, generator=gen) + 1
             cache = torch.zeros(len(ids) + 1, CSA_BLOCK // per, width)
             table = ids.view(len(lengths), per_seq)
@@ -1483,15 +1669,18 @@ def csa_steps(step: list[tuple[int, int, int]]) -> compressed.Steps:
     return compressed.Steps(positions, seq, decodes, prompts, longest)
 
 
-def csa_layer(m: Any, parts: Any, s: Any, caches: Any, steps: Any, x: Any) -> Any:
+def csa_layer(
+    m: Any, parts: Any, s: Any, caches: Any, steps: Any, x: Any, picks: Any = None
+) -> Any:
     """A step of the plugin's csa layer (bux_vllm.csa) on x (T, width), with the
-    export's module `m` for the projections it makes by vLLM's layers."""
+    export's module `m` for the projections it makes by vLLM's layers; its output,
+    and the picks and candidate pool it makes (`compressed.mix`)."""
     t, pos = x.shape[0], steps.positions
     query = x if m.q_a is None else parts.q_a_norm(m.q_a(x))
     q = parts.queries(m.q(query).view(t, m.h, m.d), pos)
     latent = parts.latents(m.kv(x), pos)
     rows = index = None
-    if m.ratio is not None:
+    if m.compress_kv is not None:
         kv = m.compress_kv(x)
         if m.compress_gate is not None:
             both = torch.cat([kv, m.compress_gate(x)], -1)
@@ -1502,15 +1691,19 @@ def csa_layer(m: Any, parts: Any, s: Any, caches: Any, steps: Any, x: Any) -> An
         index = parts.indexer.queries(
             m.indexer.q(query), None if w is None else w(x), pos
         )
-    out = compressed.mix(caches, steps, s, q, latent, rows, index, m.sinks)
-    return m.output(x[None], parts.unrotate(out, pos)[None])[0]
+    out, kept, pool = compressed.mix(
+        caches, steps, s, q, latent, rows, index, m.sinks, picks
+    )
+    return m.output(x[None], parts.unrotate(out, pos)[None])[0], kept, pool
 
 
-def csa_weights(c: dict, parts: Any) -> set[str]:
+def csa_weights(c: dict, parts: Any, ports: list | None = None) -> set[str]:
     """The checkpoint's names of a csa's weights that the plugin's layer loads
     (bux_vllm.csa's targets): its GEMM's parts, its `parts`, and its own."""
-    down, _ = compressed.down(c)
+    down, _ = compressed.down(c, ports)
     ix, rank = c["indexer"], c["o_lora_rank"]
+    if compressed.reads(ports, "index"):
+        ix = None
     own = {
         "q.weight": True,
         "indexer.q.weight": ix,
@@ -1558,7 +1751,9 @@ def test_csa_computes_on_paged_caches_what_the_export_does(
             steps = csa_steps(step)
             pad = steps.positions.shape[0] - sum(n for *_, n in step)
             rows = torch.cat([x[s : s + n] for _, s, n in step] + [x[:pad]])
-            out = csa_layer(m, parts, settings, paged.caches(steps, pad), steps, rows)
+            out, _, _ = csa_layer(
+                m, parts, settings, paged.caches(steps, pad), steps, rows
+            )
             real = out[: out.shape[0] - pad].split([n for *_, n in step])
             for (q, start, n), y in zip(step, real):
                 got[q][start : start + n] = y
@@ -1566,7 +1761,80 @@ def test_csa_computes_on_paged_caches_what_the_export_does(
     torch.testing.assert_close(got[1], want[:25], atol=2e-5, rtol=2e-5)
 
 
-serving = script("timeline/serving")
+#: DeepSeek-V4.1's ports, small: a layer that compresses pairs, indexes them and
+#: makes a candidate pool; one that reads its latents and picks; and one that reads
+#: its latents and re-indexes them inside the pool.
+CSA_PORTS = (
+    "d_model = 64\nvocab_size = 64\n"
+    "pairs = csa(num_heads=4, head_dim=16, sliding_window_size=6, compress_ratio=2,"
+    " sinks=true, rope=rope(fraction=0.5), indexer=indexer(num_heads=2, head_dim=8,"
+    " top_k=4, candidate_block_size=2, candidate_top_k=3))\n"
+    "model = embed [rmsnorm pairs(kv=@kv, index=@topk, candidates=@pool)]"
+    " [rmsnorm pairs(kv=$kv, index=$topk)]"
+    " [rmsnorm pairs(kv=$kv!, index=@topk, candidates=$pool!)] head"
+)
+
+
+def test_csa_ports_compute_on_paged_caches_what_the_export_does(
+    tmp_path: Path,
+) -> None:
+    """A csa writer and two readers of its kv port, step by step over paged caches:
+    the second takes the first's picks (index), the third picks inside the first's
+    candidate pool (candidates); each gives what the export's layer gives."""
+    arch = compile(CSA_PORTS)
+    save(arch, check.perturbed(Model(arch, rngs=nnx.Rngs(0)), 1), tmp_path)
+    hf = check._load(tmp_path, "eager")
+    mods = [x for x in hf.modules() if type(x).__name__ == "CompressedSparseAttention"]
+    seen: dict[int, list[torch.Tensor]] = {}
+    for i, m in enumerate(mods):
+        m.register_forward_hook(
+            lambda mod, args, out, i=i: seen.update({i: [args[0][0], out[0]]})
+        )
+    with torch.no_grad():
+        hf.model(
+            torch.randint(0, 64, (1, 40), generator=torch.Generator().manual_seed(1))
+        )
+    layers = [n for n in arch.layers() if n.config.type == "csa"]
+    c = layers[0].config.model_dump(mode="json")
+    calls = []
+    for node, m in zip(layers, mods, strict=True):
+        ports = [[p.name, p.tap, p.mode] for p in node.ports]
+        parts = compressed.Parts(c, ports)
+        state = {k: v for k, v in m.state_dict().items() if k in parts.state_dict()}
+        parts.load_state_dict(state)
+        assert set(m.state_dict()) == csa_weights(c, parts, ports)
+        own = PagedCsa(c, [40, 25], ports)
+        calls.append((m, parts, own))
+    settings = compressed.Settings.of(c, mods[0].scale)
+    got = [
+        (torch.zeros_like(seen[i][1]), torch.zeros_like(seen[i][1][:25]))
+        for i in range(3)
+    ]
+    with torch.no_grad():
+        for step in CSA_STEPS:
+            steps = csa_steps(step)
+            pad = steps.positions.shape[0] - sum(n for *_, n in step)
+            writer = calls[0][2].caches(steps, pad)
+            kept = pool = None
+            for i, (m, parts, own) in enumerate(calls):
+                x = seen[i][0]
+                rows = torch.cat([x[s : s + n] for _, s, n in step] + [x[:pad]])
+                caches = own.caches(steps, pad)
+                caches.compressed, caches.index = writer.compressed, writer.index
+                picks = compressed.Picks(
+                    kept if i == 1 else None, pool if i == 2 else None, i == 0
+                )
+                out, made, pooled = csa_layer(
+                    m, parts, settings, caches, steps, rows, picks
+                )
+                if i == 0:
+                    kept, pool = made, pooled
+                real = out[: out.shape[0] - pad].split([n for *_, n in step])
+                for (q, start, n), y in zip(step, real):
+                    got[i][q][start : start + n] = y
+    for i in range(3):
+        torch.testing.assert_close(got[i][0], seen[i][1], atol=2e-5, rtol=2e-5)
+        torch.testing.assert_close(got[i][1], seen[i][1][:25], atol=2e-5, rtol=2e-5)
 
 
 def test_the_config_gives_vllm_the_heads_of_csa() -> None:
@@ -1578,35 +1846,29 @@ def test_the_config_gives_vllm_the_heads_of_csa() -> None:
 
 
 @pytest.mark.parametrize("name", ["csa", "csa-latent"])
-def test_csa_caches_what_the_serving_model_prices(name: str) -> None:
-    """Each csa call keeps what scripts/timeline/serving.py prices: a window of
-    token latents, and a compressed latent with its indexer key for each
-    compress_ratio tokens; and, for a sequence, the projections of the last
-    compress_ratio tokens, which the next compressed latent pools. Each block of
-    each is a power of two bytes, so that vLLM lays them side by side."""
+def test_csa_caches_a_window_and_compressed_latents(name: str) -> None:
+    """Each csa call keeps a window of token latents, and a compressed latent with
+    its indexer key for each compress_ratio tokens; and, for a sequence, the
+    projections of the last compress_ratio tokens, which the next compressed latent
+    pools. Each block of each is a power of two bytes, so that vLLM lays them side
+    by side."""
     for layer in compile(vllm_parity.CASES[name]).layers():
         c = layer.config
         if c.type != "csa":
             continue
         rows = compressed.cache_rows(c.model_dump(mode="json"))
         for width, per, _ in rows.values():
-            page = compressed.block_size(16, per) // per * width * serving.BF16
+            page = compressed.block_size(16, per) // per * width * 2  # in bfloat16
             assert page & (page - 1) == 0, (width, per)
-        priced = serving._csa(c)
-        width, per, window = rows["window"]
-        assert (width * serving.BF16 / per, window) == (
-            priced[0].token,
-            priced[0].window,
-        )
-        if c.compress_ratio is None:
-            assert len(priced) == 1 and "compressed" not in rows
+        assert rows["window"] == (c.head_dim, 1, c.sliding_window_size)
+        r = c.compress_ratio
+        if r is None:
+            assert set(rows) == {"window"}
             continue
-        kept, index = rows["compressed"], rows.get("index", (0, 1, None))
-        cache = priced[1]
-        assert kept[0] * serving.BF16 / kept[1] == cache.token
-        assert index[0] * serving.BF16 / index[1] == cache.index
-        assert kept[2] is None and index[2] is None and cache.window is None
-        assert rows["state"] == (2 * c.head_dim, 1, c.compress_ratio)
+        assert rows["compressed"] == (c.head_dim, r, None)
+        if c.indexer is not None:
+            assert rows["index"] == (c.indexer.head_dim, r, None)
+        assert rows.get("state") == ((2 * c.head_dim, 1, r) if r > 1 else None)
 
 
 def test_the_sparse_ops_read_only_what_a_paged_cache_has() -> None:
@@ -1654,9 +1916,9 @@ def test_each_layer_type_has_one_class() -> None:
     assert 'vars(value).get("bux_types"' in (FILES[0].parent / "model.py").read_text()
 
 
-def timeline(kind: str, d_model: int) -> str:
-    """The timeline's delta-rule mixer `kind` at `d_model`: q/k heads of 128, as
-    wide together as the stream, twice as many value heads, the gate bound at -5."""
+def wide_mixer(kind: str, d_model: int) -> str:
+    """A hybrid's delta-rule mixer `kind` at `d_model`: q/k heads of 128, as wide
+    together as the stream, twice as many value heads, the gate bound at -5."""
     heads = d_model // 128
     return (
         f"{kind}(num_heads={heads}, num_v_heads={2 * heads}, head_dim=128,"
@@ -1664,10 +1926,14 @@ def timeline(kind: str, d_model: int) -> str:
     )
 
 
-# The timeline's hybrids around their target (d_model 2816: KDA's projection 17068
-# wide unpadded), and shapes of odd widths.
+# Hybrids at widths whose fused projections are no multiple of 64 (d_model 2816:
+# KDA's projection 17068 wide unpadded), and shapes of odd widths.
 FUSED = {
-    **{f"{k} {d}": timeline(k, d) for k in ("kda", "gdn2") for d in (2816, 3584, 4096)},
+    **{
+        f"{k} {d}": wide_mixer(k, d)
+        for k in ("kda", "gdn2")
+        for d in (2816, 3584, 4096)
+    },
     "kda odd": "kda(num_heads=2, num_v_heads=6, head_dim=32)",
     "kda low rank": "kda(num_heads=4, num_v_heads=12, head_dim=16, output_gate_rank=8)",
     "gdn2 odd": "gdn2(num_heads=4, num_v_heads=12, head_dim=24, v_head_dim=8)",
