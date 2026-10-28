@@ -63,19 +63,51 @@ def gdn2_rule(
 
 
 def deltanet_rule(
-    heads: Heads, qkv: torch.Tensor, beta: torch.Tensor
+    heads: Heads,
+    qkv: torch.Tensor,
+    beta: torch.Tensor,
+    log_decay: torch.Tensor | None = None,
 ) -> list[torch.Tensor]:
-    """DeltaNet's q, k, v, log decay, a and b at the value heads, (T, hv, d), from
-    its convolved q, k and v, (T, C), and the projection of its step, (T, hv): q
-    and k L2-normalized, q scaled by ``dk ** -0.5``, no decay, ``a = -beta k``
-    written at k, and the values ``beta v``."""
+    """The gated delta rule's q, k, v, log decay, a and b at the value heads, (T,
+    hv, d), from its convolved q, k and v, (T, C), the projection of its step, (T,
+    hv), and its log decay g, (T, hv, dk) in float32 (none for DeltaNet's): q and k
+    L2-normalized, q scaled by ``dk ** -0.5``, ``a = -exp(g) beta k`` written at k,
+    and the values ``beta v``."""
     h, hv, dk, dv = heads
     q, k, v = qkv.split([h * dk, h * dk, hv * dv], -1)
     q, k = shared(q, heads), shared(k, heads)
     q, k = l2norm(q) * dk**-0.5, l2norm(k)
     step = wide(torch.sigmoid(beta))[..., None]
-    zero = torch.zeros(q.shape, dtype=torch.float32, device=q.device)
-    return [q, k, step * wide(v.unflatten(-1, (hv, dv))), zero, -step * wide(k), k]
+    g = log_decay
+    if g is None:
+        g = torch.zeros(q.shape, dtype=torch.float32, device=q.device)
+    return [
+        q,
+        k,
+        step * wide(v.unflatten(-1, (hv, dv))),
+        g,
+        -g.exp() * step * wide(k),
+        k,
+    ]
+
+
+def gdn_decay(
+    a: torch.Tensor, A_log: torch.Tensor, dt_bias: torch.Tensor, dk: int
+) -> torch.Tensor:
+    """Gated DeltaNet's log decay of each value head, ``-exp(A_log) softplus(a +
+    dt_bias)`` from its projection a, (T, hv), the same for each key channel, (T,
+    hv, dk), in float32."""
+    g = -wide(A_log).exp() * F.softplus(wide(a) + wide(dt_bias))
+    return g[..., None].expand(*g.shape, dk)
+
+
+def kda_decay(
+    f: torch.Tensor, A_log: torch.Tensor, dt_bias: torch.Tensor, c: dict
+) -> torch.Tensor:
+    """KDA's log decay per key channel of each value head, (T, hv, dk), from its
+    low-rank projection f, (T, hv dk), in float32 (`channel_decay`)."""
+    f = (wide(f) + wide(dt_bias)).unflatten(-1, (A_log.shape[0], c["head_dim"]))
+    return channel_decay(f, A_log, c["gate_lower_bound"])
 
 
 def gla_rule(heads: Heads, qkv: torch.Tensor, f: torch.Tensor) -> list[torch.Tensor]:

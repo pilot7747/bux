@@ -864,6 +864,39 @@ def test_linear_layers_without_a_conv_feed_the_rule_what_the_export_does(
     torch.testing.assert_close(m.o(o), m(x[None], no_cache())[0])
 
 
+OWN_RULE = {
+    "gdn": "gdn(num_heads=2, num_v_heads=4, head_dim=16, conv_size=none,"
+    " output_gate=none)",
+    "kda": "kda(num_heads=2, num_v_heads=4, head_dim=16, v_head_dim=8,"
+    " conv_size=none, output_gate_rank=4, gate_lower_bound=-8)",
+    "kda, conv": "kda(num_heads=2, head_dim=16, v_head_dim=8)",
+}
+
+
+@pytest.mark.parametrize("mixer", OWN_RULE.values(), ids=OWN_RULE.keys())
+def test_gdn_and_kda_beyond_vllms_kernels_feed_the_rule_what_the_export_does(
+    mixer: str,
+) -> None:
+    """GDN and KDA that vLLM's own kernels do not take (no conv or output gate,
+    values of other widths than q and k's, a lower bound under -5) run bux's own
+    rule (bux_vllm.deltanet): between their projections and their output, on the
+    export's weights, the export's layers."""
+    m, c = exported(mixer)
+    x = torch.randn(70, 64)
+    heads = linear.linear_dims(c)
+    if c["type"] == "gdn":
+        g = feeds.gdn_decay(m.a(x), m.A_log, m.dt_bias, heads[2])
+        floor = None
+    else:
+        g = feeds.kda_decay(m.f(x), m.A_log, m.dt_bias, c)
+        floor = -c["gate_lower_bound"] if c["gate_lower_bound"] else None
+    xs = feeds.deltanet_rule(heads, projected(m, x), m.b(x), g)
+    o = m.norm(by_chunks(xs, heads, floor)).flatten(1)
+    if m.gate is not None:
+        o = o * common.ACTIVATIONS[c["output_gate"]](m.gate(x))
+    torch.testing.assert_close(m.o(o), m(x[None], no_cache())[0])
+
+
 GLA = {
     "gla": "gla(num_heads=2, num_v_heads=4, head_dim=16, gate_rank=4)",
     "gla, conv": "gla(num_heads=2, head_dim=16, v_head_dim=8, conv_size=4,"

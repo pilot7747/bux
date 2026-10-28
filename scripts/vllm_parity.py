@@ -289,6 +289,14 @@ CASES = {
     "gla-conv": GATED_HEAD
     + "delta = gla(num_heads=2, head_dim=32, conv_size=4, output_gate=sigmoid)\n"
     + LINEAR_HYBRID,
+    # GDN and KDA beyond vLLM's kernels, by bux's own rule: no conv or output gate,
+    # values narrower than q and k, a lower bound under -5.
+    "gdn-plain": GATED_HEAD
+    + "delta = gdn(num_heads=2, num_v_heads=4, head_dim=32, conv_size=none,"
+    " output_gate=none)\n" + LINEAR_HYBRID,
+    "kda-plain": GATED_HEAD
+    + "delta = kda(num_heads=2, num_v_heads=4, head_dim=32, v_head_dim=16,"
+    " conv_size=none, output_gate_rank=16, gate_lower_bound=-8)\n" + LINEAR_HYBRID,
     # GDN-2 without a conv: q, k and v SiLU'd alone.
     "gdn2-plain": GATED_HEAD
     + "delta = gdn2(num_heads=2, num_v_heads=4, head_dim=32, conv_size=none)\n"

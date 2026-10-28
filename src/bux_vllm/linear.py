@@ -118,11 +118,12 @@ def gdn2_projection(c: dict, ranks: int) -> Projection:
 
 
 def deltanet_projection(c: dict, ranks: int) -> Projection:
-    """DeltaNet's fused input projection over `ranks`: q, k, v and the step; a
-    rank's parts: q, k and v together, the step."""
+    """DeltaNet's fused input projection over `ranks`: q, k, v and the step, and a
+    ``gdn``'s decay; a rank's parts: q, k and v together, the step, the decay."""
     _, hv, _, _ = linear_dims(c)
-    sizes = [*conv_channels(c), hv]
-    split = [sum(conv_channels(c)) // ranks, hv // ranks]
+    steps = [hv, hv] if c["type"] == "gdn" else [hv]
+    sizes = [*conv_channels(c), *steps]
+    split = [sum(conv_channels(c)) // ranks, *(n // ranks for n in steps)]
     return Projection(*aligned(sizes, split, ranks), len(split))
 
 
