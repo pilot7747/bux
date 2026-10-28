@@ -29,6 +29,10 @@ from bux_vllm import common, config, plan, residual, routing
 ROOT = Path(__file__).parent.parent
 EXAMPLES = sorted((ROOT / "examples" / "architectures").rglob("*.bux"))
 TIMELINE = ROOT / "examples" / "experiments" / "timeline"
+#: The timeline's files whose arms set a residual algebra.
+ALGEBRA_ARMS = [
+    p for p in sorted(TIMELINE.glob("*.bux")) if "\nresidual" in p.read_text()
+]
 FILES = sorted(Path(plan.__file__).parent.glob("*.py"))
 
 
@@ -74,14 +78,13 @@ def test_parity_cases_are_where_bux_export_puts_them(name: str) -> None:
     assert_placed_as_bux_export(compile(vllm_parity.CASES[name]))
 
 
-def test_the_timeline_residual_arms_are_where_bux_export_puts_them() -> None:
-    """Every residual algebra of the timeline's ablation, at its smallest rung."""
-    path = TIMELINE / "residuals.bux"
-    arms: dict = {}
-    for run in compile_runs(path.read_text(), filename=str(path)):
-        arms.setdefault(run.arch.residual and run.arch.residual.type, run.arch)
-    assert set(arms) == {None, "hc", "mhc", "attnres", "gr", "vpgate"}
-    for arch in arms.values():
+@pytest.mark.parametrize("path", ALGEBRA_ARMS, ids=lambda p: p.stem)
+def test_the_timeline_residual_arms_are_where_bux_export_puts_them(path: Path) -> None:
+    """Every arm of a timeline file that sets a residual algebra, at every rung."""
+    runs = compile_runs(path.read_text(), filename=str(path))
+    archs = {r.arch.model_dump_json(): r.arch for r in runs if r.arch.residual}
+    assert archs
+    for arch in archs.values():
         assert_placed_as_bux_export(arch)
 
 
