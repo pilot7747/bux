@@ -102,6 +102,13 @@ SPARSE_LATENT = (
     " top_k=12))\n"
 )
 
+#: The hybrid's global layer, as the timeline's candidate has it, and a value
+#: embedding of its 2 kv heads of 32.
+GLOBAL = (
+    "glob = gqa(num_heads=4, num_kv_heads=2, qk_norm=rmsnorm, gated=true,"
+    " kv_conv_size=4)\nve = value_embed(features=64)\n"
+)
+
 #: Hymba's blocks: attention without a window (F) and with one, which writes its
 #: keys and values to the tap kv (W), reads them (S) or takes them off (R); and one
 #: without a window that writes them (G).
@@ -485,6 +492,21 @@ CASES = {
     + "ln = rms(qk_norm=layernorm(bias=true))\n"
     + "model = embed [rmsnorm rms] [rmsnorm ffn] [rmsnorm ln] [rmsnorm ffn]"
     " rmsnorm head",
+    # Value embeddings on the hybrid's global layer (QK-norm, a gate, the conv on
+    # keys and values, no positions): a table a layer, gated, beside the value
+    # residual; then one table two layers read, ungated, under hc.
+    "value-embed": HEAD
+    + FFN
+    + GLOBAL
+    + "model = embed ve(ve=@t) [rmsnorm glob(v=@v1, ve=$t!)] [rmsnorm ffn]"
+    " [rmsnorm ve(ve=@u) glob(v=$v1!, ve=$u!)] [rmsnorm ffn] rmsnorm head",
+    "value-embed-shared": HEAD
+    + "residual = hc(expansion=2)\n"
+    + FFN
+    + GLOBAL
+    + "plain = glob(value_embed_gate=none)\n"
+    + "model = embed ve(ve=@t) [rmsnorm plain(ve=$t)] [rmsnorm ffn]"
+    " [rmsnorm plain(ve=$t!)] [rmsnorm ffn] rmsnorm head",
     "kv-conv": HEAD
     + FFN
     + "attn = gqa(num_heads=4, num_kv_heads=2, kv_conv_size=4, rope=rope())\n"
