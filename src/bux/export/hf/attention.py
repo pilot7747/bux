@@ -19,7 +19,11 @@ from typing import Any
 
 import torch
 from torch import nn
-from transformers.cache_utils import CacheLayerMixin
+from transformers.cache_utils import (
+    CacheLayerMixin,
+    DynamicIndexedLayer,
+    LinearAttentionAndFullAttentionLayer,
+)
 from transformers.masking_utils import (
     create_causal_mask,
     create_sliding_window_causal_mask,
@@ -32,14 +36,78 @@ from .conv import CausalConv
 from .rope import Rope, logit_gain, rotated_dims
 from .sparse import Indexer, key_positions
 
-__all__ = ["Attention", "Rope", "SoftmaxAttention", "make_mask", "softmax_attention"]
+__all__ = [
+    "Attention",
+    "IndexedHybridLayer",
+    "Rope",
+    "SoftmaxAttention",
+    "make_mask",
+    "softmax_attention",
+]
 
 #: The cache layers whose keys a mask of each kind is sized by.
 FAMILIES = {
-    "full_attention": ("full_attention", "hybrid", "indexed_attention"),
+    "full_attention": (
+        "full_attention",
+        "hybrid",
+        "indexed_attention",
+        "indexed_hybrid",
+    ),
     "sliding_attention": ("sliding_attention", "hybrid_sliding"),
 }
 MIN = torch.finfo(torch.float32).min  # the logit of a masked key, as bux's
+
+
+# --- cache layers ---------------------------------------------------------------------
+
+
+class IndexedHybridLayer(LinearAttentionAndFullAttentionLayer):
+    """transformers' cache layer of a sparse layer with a conv on its keys and values,
+    ``indexed_hybrid``: its keys and values, the conv's two states (as a ``hybrid``
+    layer keeps them) and the indexer's keys (as an ``indexed_attention`` layer)."""
+
+    _layer_type = "indexed_hybrid"  # registers it with transformers' caches
+    update_indexer = DynamicIndexedLayer.update_indexer
+    lazy_initialization_indexer = DynamicIndexedLayer.lazy_initialization_indexer
+
+    def __init__(self, number_of_states: int = 2, **kwargs: Any):
+        super().__init__(number_of_states=number_of_states)
+        self.indexer_keys: torch.Tensor | None = None
+        self.is_indexer_initialized = False
+
+    def _indexer(self, change: Any) -> None:
+        """Replace the indexer's keys by `change` of them, once there are some."""
+        if self.indexer_keys is not None and self.indexer_keys.numel() > 0:
+            self.indexer_keys = change(self.indexer_keys)
+
+    def offload(self) -> None:
+        super().offload()
+        self._indexer(lambda k: k.to("cpu", non_blocking=True))
+
+    def prefetch(self) -> None:
+        super().prefetch()
+        self._indexer(lambda k: k.to(self.device, non_blocking=True))
+
+    def reset(self) -> None:
+        super().reset()
+        self.indexer_keys, self.is_indexer_initialized = None, False
+
+    def reorder_cache(self, beam_idx: torch.LongTensor) -> None:
+        super().reorder_cache(beam_idx)
+        self._indexer(lambda k: k.index_select(0, beam_idx.to(k.device)))
+
+    def crop(self, tokens_to_remove: int) -> None:
+        super().crop(tokens_to_remove)
+        if tokens_to_remove:
+            self._indexer(lambda k: k[:, : -abs(tokens_to_remove)])
+
+    def batch_repeat_interleave(self, repeats: int) -> None:
+        super().batch_repeat_interleave(repeats)
+        self._indexer(lambda k: k.repeat_interleave(repeats, dim=0))
+
+    def batch_select_indices(self, indices: torch.Tensor) -> None:
+        super().batch_select_indices(indices)
+        self._indexer(lambda k: k[indices])
 
 
 # --- masks ----------------------------------------------------------------------------
@@ -267,7 +335,8 @@ def cache_layer(c: dict, ports: list) -> tuple[str, dict] | None:
     A sparse layer keeps every key, which its kept keys index (an indexer's in an
     ``indexed_attention`` layer, which keeps the indexer's keys too); a layer with a
     sliding window keeps that window (``sliding_attention``); one with a conv on its
-    keys and values keeps the conv's two states beside them (``hybrid``).
+    keys and values keeps the conv's two states beside them (``hybrid``, and
+    ``indexed_hybrid`` with an indexer of its own, `IndexedHybridLayer`).
     """
     if reads(ports, "kv"):
         return None
@@ -276,9 +345,7 @@ def cache_layer(c: dict, ports: list) -> tuple[str, dict] | None:
     if sparse(c, ports):
         if reads(ports, "index"):
             return ("hybrid" if conv else "full_attention"), conv
-        if conv:
-            raise NotImplementedError(f"{c['type']}: an indexer with kv_conv_size")
-        return "indexed_attention", {}
+        return ("indexed_hybrid", conv) if conv else ("indexed_attention", {})
     if window is None:
         return ("hybrid" if conv else "full_attention"), conv
     kind = "hybrid_sliding" if conv else "sliding_attention"
