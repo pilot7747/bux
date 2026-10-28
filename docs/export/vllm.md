@@ -172,13 +172,12 @@ once:
 | Model | `fp8` | `fp8_per_channel` | `fp8_per_block`, CUTLASS | `fp8_per_block`, Triton |
 |-------|-------|-------------------|--------------------------|-------------------------|
 | dense, 6.7B class (`d_model` 4096) | 1924 | 1925 | 1757 (28) | 1212 (20) |
-| hybrid of 256 experts (`d_model` 2816) | 3683 | 3301 | 3069 (64) | 2516 (64), over 30 ms |
-| the same with `hc` (`d_model` 3584) | 1737 | 1515 | 1389 (32) | 1110 (32), over 30 ms |
+| hybrid of 256 experts (`d_model` 2816) | 3683 | 3301 | 3069 (64) | 2376 (51) |
+| the same with `hc` (`d_model` 3584) | 1737 | 1515 | 1389 (32) | 928 (20) |
 
 Per channel serves as many sessions as per tensor on the dense model, and 10 to
-13 % fewer on the hybrids. Per block on CUTLASS serves 9 to 20 % fewer. On Triton's
-block GEMM the hybrids did not keep within 30 ms; their figures are at the load
-given.
+13 % fewer on the hybrids. Per block serves 9 to 20 % fewer on CUTLASS's GEMM, and
+35 to 47 % fewer on Triton's.
 
 ## FP8 KV cache
 
