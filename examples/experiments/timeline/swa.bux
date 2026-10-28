@@ -1,0 +1,68 @@
+# The late-2026 sliding-window frontier (m2026_frontier.bux: 3 layers of 512 keys with
+# RoPE for every gated global layer without positions, a fine-grained MoE, MTP) with
+# the hybrid's winners stacked on it (factorial.bux's r1v1k1f0p0s0: hc, the value
+# residual, the key-value conv), and with a leaner window. The hybrid's KDA layers take
+# no value port, so its value residual reaches its global layers alone; every layer
+# here is attention, so it can reach them all, as ResFormer's does. Arms: era, source,
+# what it was claimed for.
+use m2026_frontier
+use timeline_code
+use rungs
+
+g_k = fr_global(kv_conv_size=4)
+
+# The frontier with local layers l, n of them for every global layer g, in two groups
+# or more; plain1, in one.
+plain(l, g, n)  = embed
+                  fr_layer(l, fr_dense) fr_layer(l)^(n - 1) fr_layer(g)
+                  (fr_layer(l)^n fr_layer(g))^(layers // (n + 1) - 1)
+                  fr_norm @h fr_out fr_mtp
+plain1(l, g, n) = embed fr_layer(l, fr_dense) fr_layer(l)^(n - 1) fr_layer(g)
+                  fr_norm @h fr_out fr_mtp
+# factorial.bux's value residual: the first global layer's values mixed into every
+# later global layer's.
+vres_global(l, g) = embed
+                    fr_layer(l, fr_dense) fr_layer(l)^2 fr_layer(g(v=@v1))
+                    (fr_layer(l)^3 fr_layer(g(v=$v1)))^(layers // 4 - 1)
+                    fr_norm @h fr_out fr_mtp
+# ResFormer's value residual: the first layer's values mixed into every later one's.
+vres_all(l, g, n)  = embed
+                     fr_layer(l(v=@v1), fr_dense) fr_layer(l(v=$v1))^(n - 1)
+                     fr_layer(g(v=$v1))
+                     (fr_layer(l(v=$v1))^n fr_layer(g(v=$v1)))^(layers // (n + 1) - 1)
+                     fr_norm @h fr_out fr_mtp
+vres_all1(l, g, n) = embed
+                     fr_layer(l(v=@v1), fr_dense) fr_layer(l(v=$v1))^(n - 1)
+                     fr_layer(g(v=$v1))
+                     fr_norm @h fr_out fr_mtp
+
+# The sparsest ratio of local to global layers that the depth divides: 7:1 in the 8
+# layers of d512 (MiMo-V2.6-Pro), one group; 5:1 in the 12 of d768 (MiMo-V2-Flash,
+# Gemma 3); 7:1 and 9:1 at d1024 and d1280.
+lean_plain = d512: plain1(fr_local, fr_global, 7) | d768: plain(fr_local, fr_global, 5)
+           | d1024: plain(fr_local, fr_global, 7) | d1280: plain(fr_local, fr_global, 9)
+lean_vres  = d512: vres_all1(fr_local, g_k, 7) | d768: vres_all(fr_local, g_k, 5)
+           | d1024: vres_all(fr_local, g_k, 7) | d1280: vres_all(fr_local, g_k, 9)
+
+# The local layers, the MTP module's too: the frontier's, or 128 keys and a learned
+# sink logit per head (gpt-oss, MiMo-V2-Flash).
+fr_local = swa_hvk: fr_local | swa_hv1k: fr_local
+         | lean: fr_attn(sliding_window_size=128, sinks=true, rope=rope())
+         | lean_hv1k: fr_attn(sliding_window_size=128, sinks=true, rope=rope())
+
+model = # 2025 Zhu et al., ResFormer, 2026 Inkling: the hybrid's candidate on the
+        # frontier, hc and the value residual and key-value conv on the global layers
+        swa_hvk:   vres_global(fr_local, g_k)
+      # the same, the first layer's values mixed into every later layer's; quality
+      | swa_hv1k:  vres_all(fr_local, g_k, 3)
+      # 2025 gpt-oss, MiMo-V2-Flash, 2026 MiMo-V2.6-Pro: windows of 128 with sinks and
+      # the sparsest ratio, alone; KV cache, throughput
+      | lean:      lean_plain
+      # the lean frontier with swa_hv1k's winners
+      | lean_hv1k: lean_vres
+
+residual = swa_hvk: hc(expansion=4) | swa_hv1k: hc(expansion=4) | lean: none
+         | lean_hv1k: hc(expansion=4)
+
+# The frontier's best at d512 (milestones.bux's scan), for every arm.
+optimizer.lr = 2e-3
