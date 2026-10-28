@@ -162,7 +162,30 @@ def targets(fams: dict[str, dict[int, Width]], likes: dict[str, str]) -> dict:
         }
         if via:
             entry["via"] = via
+        if len({w.tp for w in curve.values()}) > 1:
+            entry["by_gpus"] = by_gpus(curve, budget)
         out[family] = entry
+    return out
+
+
+def by_gpus(ws: dict[int, Width], budget: float) -> dict[str, dict]:
+    """A family whose widths take different GPU counts, each count apart: its
+    widths' costs, and their own match where two or more widths have it. Tensor
+    parallelism comes in steps, so the family's cost jumps between them."""
+    out: dict[str, dict] = {}
+    for gpus in sorted({w.tp for w in ws.values()}):
+        group = {d: w for d, w in ws.items() if w.tp == gpus}
+        entry: dict = {
+            "sessions_per_hour": {str(d): round(w.cost(), 1) for d, w in group.items()}
+        }
+        for d, w in group.items():
+            entry.setdefault("widths", {})[str(d)] = {
+                "N_active": w.active,
+                "N_total": w.params,
+            }
+        if len(group) > 1:
+            entry["match"] = match(group, budget)
+        out[str(gpus)] = entry
     return out
 
 
@@ -230,6 +253,8 @@ def _row(family: str, ws: dict[int, Width], e: dict, a: dict) -> str:
         model = f", model {w.model:.0f}" if w.model else ""
         cells.append(f"{d}: {w.cost():.0f} ({c}{tp}{model})")
     via = f" via {e['via']}" if "via" in e else ""
+    if "by_gpus" in e:
+        via += f" (across {'/'.join(e['by_gpus'])} GPUs: a step)"
     if "N_active" in e:
         tp = f", {e['tp']} GPUs" if e["tp"] > 1 else ""
         flag = (
