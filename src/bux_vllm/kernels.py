@@ -1,15 +1,14 @@
 """Triton kernels for the plugin's sparse attention (`bux_vllm.sparse`), which read
 vLLM's paged caches in place where the PyTorch path (`bux_vllm.picks`) gathers the
 keys into memory first: the indexer's score of every key of each query's request
-(`scores`), and each query's softmax over the keys it picked (`attend`), in float32.
+(`scores`, and `prompt_scores` for a prompt's queries, a tile of them for each key
+read), and each query's softmax over the keys it picked (`attend`), in float32.
 
 They run by default in a 16-bit model, and under ``BUX_VLLM_SPARSE_KERNELS=triton``
 in any (``torch`` keeps the PyTorch path), for the settings they take
 (`takes`): DSA's single keys, MSA's blocks and picks per group, QSA's blocks (its
 scores PyTorch's), weighted or summed heads, keys and values of up to 256 dims, not
-MLA's latents. A prompt's queries, which share their keys, score them by PyTorch's
-GEMM; decoded tokens, each over its own request's keys, by the kernel. The picks stay
-PyTorch's, as bux ranks the scores. ``scripts/vllm_kernels.py`` checks them against
+MLA's latents. The picks stay PyTorch's, as bux ranks the scores. ``scripts/vllm_kernels.py`` checks them against
 the PyTorch path on a GPU.
 """
 
@@ -161,6 +160,168 @@ def scores(
         relu=relu,
         groups=count,
         block_h=_block(q.shape[1]),
+        block_i=_block(q.shape[2]),
+        block_s=block_s,
+    )
+    return out
+
+
+@triton.jit
+def _prompt_scores_kernel(
+    q_ptr,
+    w_ptr,
+    cache_ptr,
+    table_ptr,
+    out_ptr,
+    stride_qt,
+    stride_qh,
+    stride_wt,
+    stride_cb,
+    stride_cg,
+    stride_cs,
+    stride_ot,
+    stride_og,
+    pos_ptr,
+    window,
+    n_queries,
+    n_keys,
+    first,
+    start,
+    heads: tl.constexpr,
+    dims: tl.constexpr,
+    share: tl.constexpr,
+    page: tl.constexpr,
+    relu: tl.constexpr,
+    groups: tl.constexpr,
+    ranked: tl.constexpr,
+    block_t: tl.constexpr,
+    block_i: tl.constexpr,
+    block_s: tl.constexpr,
+):
+    """A tile of one request's queries' scores of a tile of its keys, ``sum_j w_j
+    ReLU(q_j . k_s)``, or each of the `groups` heads' from `first` on: each head's
+    dots by the tensor cores in the inputs' dtype, summed in float32. `ranked`
+    stores their ranking keys (`_ranks`) instead."""
+    part_t, part_s = tl.program_id(0), tl.program_id(1)
+    t = part_t * block_t + tl.arange(0, block_t)
+    s = part_s * block_s + tl.arange(0, block_s)
+    i = tl.arange(0, block_i)
+    on_t, on_s, on_i = t < n_queries, s < n_keys, i < dims
+    spread = (i // share) * stride_cg + start + i % share
+    block = tl.load(table_ptr + s // page, mask=on_s, other=0)
+    rows = block.to(tl.int64) * stride_cb + (s % page) * stride_cs
+    k = tl.load(
+        cache_ptr + rows[:, None] + spread[None, :],
+        mask=on_s[:, None] & on_i[None, :],
+        other=0.0,
+    ).to(q_ptr.dtype.element_ty)
+    acc = tl.zeros([block_t, block_s], tl.float32)
+    for j in tl.static_range(heads):
+        q = tl.load(
+            q_ptr + t[:, None] * stride_qt + j * stride_qh + i[None, :],
+            mask=on_t[:, None] & on_i[None, :],
+            other=0.0,
+        )
+        dots = tl.dot(q, tl.trans(k), input_precision="ieee")
+        if relu:
+            dots = tl.maximum(dots, 0.0)
+        w = tl.load(w_ptr + t * stride_wt + j, mask=on_t, other=0.0).to(tl.float32)
+        if groups:  # each of this rank's groups by its own head
+            if (j >= first) & (j < first + groups):
+                at = out_ptr + t[:, None] * stride_ot + (j - first) * stride_og
+                mine = dots * w[:, None]
+                if ranked:
+                    mine = _ranks(mine, pos_ptr, t, s, on_t, window)
+                tl.store(at + s[None, :], mine, mask=on_t[:, None] & on_s[None, :])
+        else:
+            acc += dots * w[:, None]
+    if not groups:
+        if ranked:
+            acc = _ranks(acc, pos_ptr, t, s, on_t, window)
+        tl.store(
+            out_ptr + t[:, None] * stride_ot + s[None, :],
+            acc,
+            mask=on_t[:, None] & on_s[None, :],
+        )
+
+
+@triton.jit
+def _ranks(score, pos_ptr, t, s, on_t, window):
+    """The ranking keys of a tile of scores, as `bux_vllm.picks.top` makes them: the
+    score's ordered bits above the key's index's complement, -1 for a key the query
+    does not see (after it, or out of its `window`; none below 0)."""
+    u = score.to(tl.int32, bitcast=True).to(tl.int64) & 0xFFFFFFFF
+    order = tl.where((u >> 31) == 1, ~u & 0xFFFFFFFF, u | 0x80000000)
+    key = (order << 31) | (0x7FFFFFFF - s[None, :].to(tl.int64))
+    p = tl.load(pos_ptr + t, mask=on_t, other=0)[:, None]
+    seen = s[None, :] <= p
+    seen = seen & ((window < 0) | (p - s[None, :] < window))
+    return tl.where(seen, key, -1)
+
+
+def prompt_scores(
+    q: torch.Tensor,
+    w: torch.Tensor,
+    cache: picks.Cache,
+    rows: torch.Tensor,
+    n: int,
+    relu: bool,
+    groups: tuple[int, int] | None = None,
+    seen: tuple[torch.Tensor, int | None] | None = None,
+) -> torch.Tensor:
+    """`scores` of one request's queries, which share its keys: tiles of queries by
+    tiles of keys, each key read once a tile of queries; or, with `seen`, their
+    ranking keys, as `bux_vllm.picks.top` ranks them, in int64.
+
+    Args:
+        q: The indexer's queries, (Q, H, i), the last axis contiguous.
+        w: Their heads' weights, (Q, H), contiguous.
+        cache: The request's paged cache, its indexer keys beside its keys and
+            values.
+        rows: The request's block table, (1, blocks).
+        n: How many keys to score.
+        relu: Whether to ReLU the dot products.
+        groups: The first of this rank's groups and how many, picking apart; None
+            for all heads' scores summed.
+        seen: The queries' positions, (Q,), and the layer's window (None for
+            none), by which a query sees a key: to rank, -1 for a key it does not.
+    """
+    first, count = groups or (0, 0)
+    shape = (q.shape[0], count, n) if groups else (q.shape[0], n)
+    dtype = torch.float32 if seen is None else torch.int64
+    out = torch.empty(shape, dtype=dtype, device=q.device)
+    positions, window = seen if seen is not None else (rows, None)
+    block_t = block_s = 64
+    pages = cache.cache
+    grid = (triton.cdiv(q.shape[0], block_t), triton.cdiv(n, block_s))
+    _prompt_scores_kernel[grid](
+        q,
+        w,
+        pages,
+        rows,
+        out,
+        q.stride(0),
+        q.stride(1),
+        w.stride(0),
+        pages.stride(0),
+        pages.stride(1),
+        pages.stride(2),
+        out.stride(0),
+        out.stride(1) if groups else 0,
+        positions,
+        -1 if window is None else window,
+        q.shape[0],
+        n,
+        first,
+        cache.channels,
+        heads=q.shape[1],
+        dims=q.shape[2],
+        share=pages.shape[3] - cache.channels,
+        page=pages.shape[2],
+        relu=relu,
+        groups=count,
+        ranked=seen is not None,
+        block_t=block_t,
         block_i=_block(q.shape[2]),
         block_s=block_s,
     )
@@ -334,13 +495,13 @@ def attend_segment(
     count, shared = q.shape[0], rows.shape[0] == 1
     table = rows.expand(count, -1)
     span = torch.arange(n, device=q.device)
-    keys = cache.keys(rows, span[None])[0] if shared else None
+    keys = cache.keys(rows, span[None])[0] if shared and spec.mean else None
     per = picks._per_query(spec, q, index[0], cache.kv, n, shared or not spec.mean)
     chunk, outs, kept = max(1, picks.BUDGET // per), [], []
     for a in range(0, count, chunk):
         cut = slice(a, a + chunk)
         iq, iw = (t[cut].contiguous() for t in index)
-        where = (positions[cut], table[cut], n)
+        where = (positions[cut], rows if shared else table[cut], n)
         picked = _choose(spec, (iq, iw), cache, keys, where)
         outs.append(attend(spec, q[cut].contiguous(), cache.kv, table[cut], picked))
         kept.append(picks.padded(picked, picks.most(spec)))
@@ -376,19 +537,26 @@ def _choose(
     where: tuple[torch.Tensor, torch.Tensor, int],
 ) -> Picked:
     """The keys the queries keep, as bux picks them, from the indexer's queries and
-    weights `index`: scored by PyTorch over `keys`, (n, i), which a request's
-    queries share, or over each query's request's gathered (QSA's blocks, which
-    PyTorch pools); else by `scores`. `where` are the queries' positions, their
-    requests' block tables and the keys' count."""
+    weights `index`: QSA's blocks scored by PyTorch, which pools them, over `keys`,
+    (n, i), which a request's queries share, or each query's request's gathered;
+    else by `prompt_scores` for one request's queries, `scores` for single queries
+    of several. `where` are the queries' positions, their requests' block tables
+    (one row for one request's) and the keys' count."""
     positions, table, n = where
-    see = picks.seen(positions, n, spec.window)
-    if keys is None and spec.mean:
-        span = torch.arange(n, device=positions.device)
-        keys = cache.keys(table, span.expand(positions.shape[0], n))
-    if keys is not None:
-        return picks.choose(spec, *index, keys, see, positions)
     groups = spec.groups if spec.per_group else None
-    s = scores(*index, cache, table, n, spec.relu, groups)
+    one = table.shape[0] == 1
+    if one and spec.block_size == 1:  # DSA's, ranked in the kernel
+        at = (positions.contiguous(), spec.window)
+        ranks = prompt_scores(*index, cache, table, n, spec.relu, groups, at)
+        return picks.best_of(ranks, spec.top_k)
+    see = picks.seen(positions, n, spec.window)
+    if spec.mean:
+        if keys is None:
+            span = torch.arange(n, device=positions.device)
+            keys = cache.keys(table, span.expand(positions.shape[0], n))
+        return picks.choose(spec, *index, keys, see, positions)
+    score = prompt_scores if one else scores
+    s = score(*index, cache, table, n, spec.relu, groups)
     if spec.block_size > 1:
         return picks.best_blocks(s, see, positions, spec.block_size, spec.top_k)
     return picks.tokens(s, see, spec.top_k)
