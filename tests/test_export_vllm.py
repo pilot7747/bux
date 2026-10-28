@@ -193,6 +193,23 @@ def test_the_config_gives_vllm_the_latent_of_mla() -> None:
     assert not config.latent(bux_config(vllm_parity.CASES["llama"]))
 
 
+def test_a_model_of_sparse_mla_alone_is_no_mla_model_for_vllm() -> None:
+    """Sparse MLA keeps its latents in caches of the plugin's own, one head each,
+    so vLLM runs no MLA; beside MLA that vLLM runs, it raises as other attention."""
+    c = bux_config(vllm_parity.CASES["mla-share"])
+    assert not config.latent(c)
+    assert (c.num_attention_heads, c.num_key_value_heads, c.head_dim) == (4, 1, 80)
+    assert c.layer_types == ["full_attention"] * 3
+    source = (
+        vllm_parity.HEAD
+        + vllm_parity.LATENT
+        + "other = attn(indexer=indexer(num_heads=2, head_dim=16, top_k=8))\n"
+        + "model = embed [rmsnorm attn] [rmsnorm other] rmsnorm head"
+    )
+    with pytest.raises(NotImplementedError, match="model-wide"):
+        bux_config(source)
+
+
 MIXED = {
     "gqa beside mla": "gqa(num_heads=4, num_kv_heads=2)",
     "other dims": "mla(num_heads=2, kv_lora_rank=128, rope=rope())",
@@ -896,6 +913,73 @@ def test_sparse_attention_over_paged_caches_is_bux_s(c: dict, window: int | None
             reader, q2[0].transpose(0, 1), picked, at, kv_cache, r, s
         )
         torch.testing.assert_close(got, want, rtol=1e-5, atol=1e-5)
+
+
+@pytest.mark.parametrize("window", [None, 5], ids=["causal", "window"])
+@pytest.mark.parametrize(
+    "name", [k for k, c in INDEXERS.items() if not c.get("per_group")]
+)
+def test_sparse_attention_in_the_latent_space_is_bux_s(name: str, window: int | None):
+    """MLA's sparse attention as the plugin computes it, over paged latents, each
+    head's queries absorbing its key projection (bux_vllm.picks.absorbed), gives
+    what the export's indexer (its queries from the query latent) and softmax give
+    over the keys and values projected up; and so does a layer that reads its picks
+    and attends over latents of its own, by a window of its own."""
+    from bux.export.hf import attention as hf_attention
+    from bux.export.hf import sparse as hf_sparse
+    from bux_vllm import indexer as plugin_indexer
+    from bux_vllm import picks
+
+    torch.manual_seed(0)
+    ix = cfg.SparseIndexerConfig.model_validate(INDEXERS[name]).model_dump(mode="json")
+    rope = cfg.RoPEConfig().model_dump(mode="json")
+    width, latent, s, h, n, r, dv, rank = 16, 12, 23, 4, 8, 4, 8, 10
+    theirs = hf_sparse.Indexer(ix, width, latent, rope, r)
+    for p in theirs.parameters():
+        p.data.normal_()
+    ours = plugin_indexer.Indexer(ix, width, rope, r, latent)
+    ours.load_state_dict(theirs.state_dict())
+    x, query, at = torch.randn(s, width), torch.randn(s, latent), torch.arange(s)
+    see = picks.seen(at, s, window)
+    keys = theirs.keys(x[None], at[None])
+    kept, _ = theirs(x[None], query[None], at[None], keys, see[None], at[None])
+    kv_b = torch.randn(h * (n + dv), rank) / rank**0.5
+    sinks = torch.randn(h)
+    block, blocks = 4, 9
+    table = torch.randperm(blocks)[None]
+    slots = table[0, at // block] * block + at % block
+    index_cache = torch.zeros(blocks, 1, block, ix["head_dim"])
+    picks.write(index_cache, slots, ours.keys(x, at)[:, None])
+
+    def mla(
+        window: int | None, softcap: float | None = None, sinks: Any = None
+    ) -> tuple[Any, ...]:
+        """Random latents in a paged cache, queries, and the export's output."""
+        c, k_pe, q = torch.randn(s, rank), torch.randn(s, r), torch.randn(s, h, n + r)
+        up = (c @ kv_b.T).view(s, h, n + dv)
+        k = torch.cat([up[..., :n], k_pe[:, None].expand(s, h, r)], -1)
+        keep = picks.seen(at, s, window)[None, None] & hf_attention.per_head(kept, h)
+        qh, kh, vh = (t.transpose(0, 1)[None] for t in (q, k, up[..., n:]))
+        want = hf_attention.softmax_attention(qh, kh, vh, keep, 0.3, softcap, sinks)
+        want = want[0]
+        cache = torch.zeros(blocks, 1, block, rank + r)
+        picks.write(cache, slots, torch.cat([c, k_pe], -1)[:, None])
+        return picks.absorbed(q, kv_b, n), cache, want
+
+    queries, cache, want = mla(window, 4.0, sinks)
+    spec = picks.layer_spec(ix, ours, (window, 0.3, 4.0, sinks), rank + r, (0, 1), rank)
+    index = (ours.queries(query, at), ours.head_weights(x))
+    caches, rows = (cache, index_cache), (table, table)
+    out, picked = picks.attend_segment(spec, queries, index, at, caches, rows, s)
+    torch.testing.assert_close(
+        picks.projected(out, kv_b, n), want, rtol=1e-5, atol=1e-5
+    )
+    queries, cache, want = mla(3)
+    reader = picks.layer_spec(None, None, (3, 0.3, None, None), rank + r, (0, 1), rank)
+    out = picks.attend_picked(reader, queries, picked, at, cache, table, s)
+    torch.testing.assert_close(
+        picks.projected(out, kv_b, n), want, rtol=1e-5, atol=1e-5
+    )
 
 
 def test_the_step_splits_into_single_queries_and_requests() -> None:

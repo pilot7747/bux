@@ -70,6 +70,14 @@ DEEPSEEK = (
     "layout=interleaved, scaling=yarn(factor=4, original_max_len=16,"
     " attention_factor_on=softmax)))\n"
 )
+#: MLA with DeepSeek-V3.2's indexer, on 4 heads, a query latent of 64 and a latent
+#: of 64; and the same with a window of 16, sinks and a softcap (local).
+SPARSE_MLA = (
+    "attn = mla(num_heads=4, q_lora_rank=64, kv_lora_rank=64, qk_nope_head_dim=32,"
+    " qk_rope_head_dim=16, v_head_dim=32, rope=rope(), indexer=indexer(num_heads=2,"
+    " head_dim=16, top_k=8))\n"
+    "local = attn(sliding_window_size=16, sinks=true, softcap=20)\n"
+)
 #: The timeline's csa (examples/experiments/timeline/sparse.bux) at d_model 128, its
 #: window and top-k shrunk so that the prompts and their decoding cross both.
 SPARSE = (
@@ -285,6 +293,19 @@ CASES = {
     + FFN
     + "model = embed [rmsnorm attn] [rmsnorm ffn] [rmsnorm gated] [rmsnorm ffn]"
     " rmsnorm head",
+    # DeepSeek-V3.2's sparse MLA: the indexer's queries from the query latent.
+    "mla-dsa": HEAD
+    + SPARSE_MLA
+    + FFN
+    + "model = embed [rmsnorm attn] [rmsnorm ffn] [rmsnorm local] [rmsnorm ffn]"
+    " rmsnorm head",
+    # GLM-5.3's: one layer's picks shared with the next two.
+    "mla-share": HEAD
+    + SPARSE_MLA
+    + FFN
+    + "model = embed [rmsnorm attn(index=@topk)] [rmsnorm ffn]"
+    " [rmsnorm attn(index=$topk)] [rmsnorm ffn] [rmsnorm local(index=$topk!)]"
+    " [rmsnorm ffn] rmsnorm head",
     "query-scale": HEAD
     + FFN
     + "beam = gqa(num_heads=4, num_kv_heads=2, power_scale=0.5, power_scale_length=8,"
