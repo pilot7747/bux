@@ -45,7 +45,10 @@ class Patches(nnx.Module):
     def __call__(self, x: UInt8[Array, "b n p"], taps: Taps) -> Float[Array, "b n d"]:
         """Return the embeddings of the patches x, each 3 * size * size bytes."""
         mean, std = jnp.asarray(self.mean), jnp.asarray(self.std)
-        y = self.proj((x.astype(jnp.float32) / 255 - mean) / std)
+        # Note: in the weights' dtype, the run's compute, so that the encoder after
+        # computes in it too, and its attention runs by the flash kernel.
+        normed = (x.astype(jnp.float32) / 255 - mean) / std
+        y = self.proj(normed.astype(self.proj.kernel[...].dtype))
         if self.positions is None or self.grid is None:
             return y
         images = taps.images

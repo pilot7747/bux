@@ -1,6 +1,7 @@
 """Vision encoders and images in the stream: multi-axis RoPE, the patch layers, and
 image(...), each against what transformers' Qwen3.5 computes."""
 
+import jax
 import jax.numpy as jnp
 import numpy as np
 import pytest
@@ -416,3 +417,18 @@ def test_merge_patches_by_mean_averages_a_block():
     x = jnp.arange(2 * 8 * 3, dtype=jnp.float32).reshape(2, 8, 3)
     y = MergePatches(cfg.MergePatchesConfig(size=2, pool="mean"))(x, Taps())
     np.testing.assert_allclose(y, x.reshape(2, 2, 4, 3).mean(2))
+
+
+def test_patches_compute_in_their_weights_dtype():
+    """The encoder after computes as the run does, and its attention runs by the
+    flash kernel, which takes no float32."""
+    from flax import nnx
+
+    from bux.architecture import Taps
+    from bux.architecture.layers.vision import Patches
+
+    layer = Patches(cfg.PatchesConfig(size=2, features=8), nnx.Rngs(0))
+    params = nnx.state(layer, nnx.Param)
+    nnx.update(layer, jax.tree.map(lambda p: p.astype(jnp.bfloat16), params))
+    x = jnp.zeros((1, 4, 12), jnp.uint8)
+    assert layer(x, Taps()).dtype == jnp.bfloat16
