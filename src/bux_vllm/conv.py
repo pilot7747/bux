@@ -1,6 +1,7 @@
 """A causal depthwise conv over the sequence whose state, each sequence's last
 inputs, vLLM keeps in its Mamba cache: the conv of ``gqa``'s ``kv_conv_size`` on its
-keys and values, and bux's ``conv`` layer (`Conv`).
+keys and values, bux's ``conv`` layer (`Conv`) and LFM2's ``short_conv``
+(`ShortConv`).
 
 It is one of vLLM's short convs: a layer of its own, with a conv state in each
 sequence's cache slot (``MambaBase``), which makes the model a hybrid for vLLM. A
@@ -18,7 +19,15 @@ from typing import Any
 import torch
 import vllm.model_executor.layers.mamba.short_conv  # noqa: F401  (its op)
 from torch import nn
+from vllm.distributed import (
+    get_tensor_model_parallel_rank,
+    get_tensor_model_parallel_world_size,
+)
 from vllm.forward_context import get_forward_context
+from vllm.model_executor.layers.linear import (
+    MergedColumnParallelLinear,
+    RowParallelLinear,
+)
 from vllm.model_executor.layers.mamba.abstract import MambaBase
 from vllm.model_executor.layers.mamba.mamba_utils import (
     MambaStateDtypeCalculator,
@@ -49,9 +58,12 @@ def state_shapes(vllm_config: Any) -> list[tuple]:
         for n in layers
         if "conv" in states(n["config"], ports(n))
     }
-    for call in calls:  # the conv layers', on the whole stream
-        if call.layer["config"]["type"] == "conv":
-            convs.add((call.layer["width"], call.layer["config"]["size"]))
+    for call in calls:  # the conv layers', on the whole stream, and short convs'
+        c, width = call.layer["config"], call.layer["width"]
+        if c["type"] == "conv":
+            convs.add((width, c["size"]))
+        if c["type"] == "short_conv":
+            convs.add((width // tp, c["conv_size"]))
     return [state_shape(vllm_config, *conv) for conv in sorted(convs)]
 
 
@@ -200,3 +212,57 @@ class Conv(Layer):
     def forward(self, x: torch.Tensor, ctx: Ctx) -> torch.Tensor:
         y = self.convs[ctx.call(self.path)](x)
         return y if self.bias is None else y + self.bias.to(y.dtype)
+
+
+class ShortConv(Layer):
+    """bux's ``short_conv``, LFM2's: B, C and u by one column-parallel projection,
+    ``C * conv(B u)`` by vLLM's short-conv kernels (`CausalConv`) with a bias per
+    channel, each call's last inputs in vLLM's Mamba cache, and the row-parallel
+    output projection; the channels split over ranks."""
+
+    bux_types = ("short_conv",)
+    stateful = True
+
+    def __init__(self, c: dict, width: int, site: Site):
+        super().__init__()
+        self.path, bias = site.path, c["bias"]
+        self.channels = width // get_tensor_model_parallel_world_size()
+        self.in_proj = MergedColumnParallelLinear(
+            width, [width] * 3, bias=bias, return_bias=False, prefix=f"{self.path}.in"
+        )
+        size, vllm = c["conv_size"], site.vllm_config
+        convs = [CausalConv(self.channels, size, vllm, n) for n in site.caches]
+        self.weight = convs[0].weight
+        for other in convs[1:]:
+            other.weight = self.weight
+        self.convs = nn.ModuleList(convs)
+        b = torch.zeros(self.channels) if bias else None
+        self.conv_bias = None if b is None else nn.Parameter(b, requires_grad=False)
+        self.out_proj = RowParallelLinear(
+            width, width, bias=bias, return_bias=False, prefix=f"{self.path}.out"
+        )
+
+    def targets(self) -> dict[str, tuple[nn.Parameter, tuple]]:
+        out: dict[str, tuple[nn.Parameter, tuple]] = {}
+        for name in ("in_proj", "out_proj"):
+            for kind in ("weight", "bias"):
+                if (p := getattr(getattr(self, name), kind)) is not None:
+                    out[f"{name}.{kind}"] = (p, ())
+        return out
+
+    def load(self, name: str, tensor: torch.Tensor) -> list[nn.Parameter]:
+        if name not in ("conv.weight", "conv.bias"):
+            return super().load(name, tensor)
+        first = get_tensor_model_parallel_rank() * self.channels
+        mine = tensor[..., first : first + self.channels]  # this rank's channels
+        param = self.weight if name == "conv.weight" else self.conv_bias
+        assert param is not None
+        param.data.copy_(mine.T if name == "conv.weight" else mine)
+        return [param]
+
+    def forward(self, x: torch.Tensor, ctx: Ctx) -> torch.Tensor:
+        B, C, u = self.in_proj(x).chunk(3, -1)
+        y = self.convs[ctx.call(self.path)]((B * u).contiguous())
+        if self.conv_bias is not None:
+            y = y + self.conv_bias.to(y.dtype)
+        return self.out_proj(C * y)

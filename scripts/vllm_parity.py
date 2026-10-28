@@ -316,6 +316,13 @@ CASES = {
     + "shortcut = conv(size=4, bias=true)\n"
     + "model = embed [rmsnorm attn [shortcut]] [rmsnorm ffn [shortcut]]"
     " [rmsnorm attn [shortcut]] [rmsnorm ffn] rmsnorm head",
+    # LFM2's double-gated short conv beside attention.
+    "short-conv": HEAD
+    + ATTN
+    + FFN
+    + "mix = short_conv(conv_size=3, bias=true)\n"
+    + "model = embed [rmsnorm mix] [rmsnorm ffn] [rmsnorm attn] [rmsnorm ffn]"
+    " [rmsnorm mix] [rmsnorm ffn] rmsnorm head",
     "dyt": HEAD
     + ATTN
     + FFN

@@ -66,7 +66,7 @@ def states(c: dict, layer_ports: list | None = None) -> list[str]:
     port keeps no indexer's keys."""
     if c["type"] == "engram":
         return ["conv"] if c["conv_size"] else []
-    if c["type"] == "conv":
+    if c["type"] in ("conv", "short_conv"):
         return ["conv"]
     if c["type"] not in STATES:
         return []
