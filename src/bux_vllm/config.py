@@ -14,7 +14,9 @@ A model whose attention is ``mla`` also carries the latent's dims, as DeepSeek's
 configs do (`LATENT`): vLLM reads them to size the latent KV cache, pick its MLA
 backends and check them (`bux_vllm.arch` tells vLLM the model is MLA). They are one
 set for the model, so its ``mla`` layers must agree on them, and vLLM runs all of a
-model's softmax attention as MLA or none of it, so ``mla`` mixes with no other.
+model's softmax attention as MLA or none of it, so ``mla`` mixes with no other. An
+``mla`` layer that attends to picked keys (`sparse`) keeps its latents in caches of
+the plugin's own, so a model of those alone is no MLA model for vLLM.
 """
 
 from __future__ import annotations
@@ -23,7 +25,8 @@ from typing import Any
 
 from transformers.configuration_utils import PreTrainedConfig
 
-from .plan import live, plan
+from .kv import reads
+from .plan import live, plan, ports
 
 #: The kind of state each stateful layer type keeps, as vLLM's ``layer_types``.
 STATES = {
@@ -51,23 +54,38 @@ LATENT = (
 )
 
 
-def states(c: dict) -> list[str]:
-    """The kinds of state a call of the layer `c` keeps, in order: its type's
-    (`STATES`), then a ``gqa`` layer's conv state under ``kv_conv_size`` and its
-    indexer's keys (``index``) with an indexer, or an ``engram``'s conv's; none
-    for a layer that keeps none."""
+def states(c: dict, layer_ports: list | None = None) -> list[str]:
+    """The kinds of state a call of the layer `c`, with the ports `layer_ports`,
+    keeps, in order: its type's (`STATES`), then a ``gqa`` layer's conv state under
+    ``kv_conv_size`` and its indexer's keys (``index``) with an indexer, or an
+    ``engram``'s conv's; none for a layer that keeps none. A ``gqa`` layer that
+    reads its ``kv`` port names an attention layer of its own, over its writer's
+    cache, and keeps nothing else; one that reads its ``index`` port keeps no
+    indexer's keys."""
     if c["type"] == "engram":
         return ["conv"] if c["conv_size"] else []
     if c["type"] not in STATES:
         return []
+    if c["type"] == "gqa" and reads(layer_ports or [], "kv"):
+        return [STATES["gqa"]]
     conv = ["conv"] if c.get("kv_conv_size") else []
-    return [STATES[c["type"]], *conv, *(["index"] if c.get("indexer") else [])]
+    own = c.get("indexer") and not reads(layer_ports or [], "index")
+    return [STATES[c["type"]], *conv, *(["index"] if own else [])]
 
 
-def layer_types(c: dict) -> list[str]:
-    """The kinds of state of a call of the layer `c` as vLLM's ``layer_types``
-    lists them: an indexer's keys are its attention's, as DeepSeek-V3.2's are."""
-    return [kind for kind in states(c) if kind != "index"]
+def sparse(c: dict, layer_ports: list | None = None) -> bool:
+    """Whether the softmax attention layer `c`, with the ports `layer_ports`,
+    attends to picked keys alone: it has an indexer, or reads another layer's picks
+    from its ``index`` port."""
+    return bool(c.get("indexer")) or reads(layer_ports or [], "index") is not None
+
+
+def layer_types(layer: dict) -> list[str]:
+    """The kinds of state of a call of `layer` (its IR node) as vLLM's
+    ``layer_types`` lists them: an indexer's keys are its attention's, as
+    DeepSeek-V3.2's are."""
+    kinds = states(layer["config"], ports(layer))
+    return [kind for kind in kinds if kind != "index"]
 
 
 #: What ``config.json`` says of transformers' cache layers, which vLLM reads
@@ -105,7 +123,7 @@ class BuxConfig(PreTrainedConfig):
         self.bux_reserved = bux_reserved or []
         self.vocab_size, self.hidden_size = vocab_size, hidden_size
         calls = live(plan(bux, self.bux_reserved).calls) if bux else []
-        self.layer_types = [k for c in calls for k in layer_types(c.layer["config"])]
+        self.layer_types = [k for c in calls for k in layer_types(c.layer)]
         self.num_hidden_layers = len(self.layer_types)
         layers = [c.layer for c in calls]
         self._set_heads(layers)
@@ -115,22 +133,28 @@ class BuxConfig(PreTrainedConfig):
 
     def _set_heads(self, layers: list[dict]) -> None:
         """Set the attention heads vLLM sizes the KV cache by, from the first
-        attention layer (none for a model without one), and an MLA's latent dims.
+        attention layer (none for a model without one), and an MLA's latent dims:
+        a sparse ``mla`` layer's latents are one head of its own caches.
 
         Raises:
-            NotImplementedError: The model mixes ``mla`` with other softmax
-                attention, or its ``mla`` layers differ in their heads or dims.
+            NotImplementedError: The model mixes ``mla`` that vLLM runs as MLA with
+                other softmax attention, or its ``mla`` layers differ in their heads
+                or dims.
         """
         attn = [n for n in layers if n["config"]["type"] in ATTENTION]
-        kinds = {n["config"]["type"] for n in attn}
-        if "mla" in kinds and len(kinds) > 1:
-            raise NotImplementedError("mla beside gqa or csa: MLA is model-wide")
+        dense = [n["config"] for n in attn if _dense_mla(n)]
+        if dense and len(dense) < len(attn):
+            raise NotImplementedError("mla beside other attention: MLA is model-wide")
         if not attn:
             self.num_attention_heads = self.num_key_value_heads = self.head_dim = 0
             return
+        if dense:
+            self._set_latent(dense)
+            return
         c = attn[0]["config"]
         if c["type"] == "mla":
-            self._set_latent([n["config"] for n in attn])
+            self.num_attention_heads, self.num_key_value_heads = c["num_heads"], 1
+            self.head_dim = c["kv_lora_rank"] + c["qk_rope_head_dim"]
             return
         heads, kv = c["num_heads"], c.get("num_kv_heads", 1)  # csa: one latent head
         self.num_attention_heads, self.num_key_value_heads = heads, kv
@@ -151,6 +175,12 @@ class BuxConfig(PreTrainedConfig):
             setattr(self, name, c[name])
         self.num_attention_heads = self.num_key_value_heads = c["num_heads"]
         self.head_dim = c["qk_nope_head_dim"] + c["qk_rope_head_dim"]
+
+
+def _dense_mla(layer: dict) -> bool:
+    """Whether `layer` is an ``mla`` layer that vLLM runs as MLA: not `sparse`."""
+    c = layer["config"]
+    return c["type"] == "mla" and not sparse(c, ports(layer))
 
 
 def latent(config: Any) -> bool:

@@ -5,7 +5,10 @@ kernels take them, and the queries' scale by their position.
 
 A port is ``[name, tap, mode]``, as ``bux.export.plan`` writes it: ``attn(v=@v1)``
 writes the layer's values to the tap ``v1`` (``write``), ``attn(v=$v1)`` reads them
-(``read``; ``pop`` takes them off with ``$v1!``).
+(``read``; ``pop`` takes them off with ``$v1!``). The ``kv`` port shares a layer's
+KV cache with the layers that read it, which attend to the writer's keys and values
+and keep none of their own: which cache each call reads is known before the model
+runs (`sources`), as vLLM's cross-layer KV sharing needs it.
 """
 
 from __future__ import annotations
@@ -13,7 +16,7 @@ from __future__ import annotations
 import torch
 
 #: The ports a ``gqa`` layer runs in vLLM.
-PORTS = ("v",)
+PORTS = ("v", "kv", "index")
 
 
 def reads(ports: list, name: str) -> tuple[str, bool] | None:
@@ -34,16 +37,59 @@ def writes(ports: list, name: str) -> list[str]:
     return [tap for n, tap, mode in ports if n == name and mode == "write"]
 
 
-def check_ports(ports: list) -> None:
-    """Raise for the ports of a ``gqa`` layer that vLLM does not run.
+def check_ports(c: dict, ports: list) -> None:
+    """Raise for the ports of the ``gqa`` layer `c` that vLLM does not run.
 
     Raises:
-        NotImplementedError: It has a ``kv`` (cross-layer KV sharing) or ``index``
-            port.
+        NotImplementedError: It reads ``kv`` and has a ``v`` port or an indexer, as
+            the export does not take either, or reads ``index`` too, whose sparse
+            attention over another's keys vLLM does not share.
     """
     others = sorted({name for name, _, _ in ports} - set(PORTS))
     if others:
         raise NotImplementedError(f"gqa: the {', '.join(others)} port not in vLLM yet")
+    if not reads(ports, "kv"):
+        return
+    if any(n == "v" for n, _, _ in ports) or c["indexer"] or reads(ports, "index"):
+        raise NotImplementedError("gqa: a v port or an indexer beside reading kv")
+
+
+def sources(ports: list[list]) -> list[int | None]:
+    """The call each call attends to the keys and values of through its ``kv``
+    port, by its index, from each call's ports in the order the calls run: the one
+    whose push the tap it reads holds, as bux's taps run (``$kv`` the last push,
+    ``$kv!`` taken off); None for a call that reads none. A reader that writes the
+    port too pushes its writer's keys and values on."""
+    stacks: dict[str, list[int]] = {}
+    out: list[int | None] = []
+    for i, call in enumerate(ports):
+        source, read = None, reads(call, "kv")
+        if read is not None:
+            stack = stacks[read[0]]
+            source = stack.pop() if read[1] else stack[-1]
+        for tap in writes(call, "kv"):
+            stacks.setdefault(tap, []).append(i if source is None else source)
+        out.append(source)
+    return out
+
+
+def check_shared(reader: dict, writer: dict, width: int) -> None:
+    """Raise for keys and values of the ``writer`` layer's call that vLLM cannot
+    share with the ``reader``'s (their configs, on a stream `width` wide).
+
+    Raises:
+        NotImplementedError: The writer is no dense ``gqa`` (vLLM shares the KV
+            caches of its own attention layers alone), their kv heads or dims
+            differ, or the writer keeps fewer keys than the reader's window.
+    """
+    if writer["type"] != "gqa" or writer["indexer"]:
+        raise NotImplementedError("gqa: a kv port from other than a dense gqa layer")
+    heads = [(c["num_kv_heads"], *head_dims(c, width)) for c in (reader, writer)]
+    if heads[0] != heads[1]:
+        raise NotImplementedError(f"gqa: a kv port of {heads[1]} to {heads[0]} heads")
+    mine, kept = reader["sliding_window_size"], writer["sliding_window_size"]
+    if kept is not None and (mine is None or mine > kept):
+        raise NotImplementedError(f"gqa: a window of {mine} over {kept} shared keys")
 
 
 def mix_values(

@@ -4,8 +4,11 @@ MoE kernels (`FusedMoEFactory`), routed by bux's own rule.
 The router runs as bux's does (`bux_vllm.routing`): vLLM takes the picks and
 weights from it (``custom_routing_function``) and runs the experts. In LatentMoE
 the experts run in the latent, as vLLM's fused MoE of the latent's width, between
-the projections to and from it. Under tensor parallelism each rank keeps every
-expert's share of the hidden units, as vLLM splits them, and the projections whole.
+the projections to and from it. Under ``expert_norm`` each expert's output is
+normalized before the router weighs it: each of a token's picks runs as a row of its
+own, which vLLM's fused MoE leaves unsummed (`bux_vllm.routing.apart`). Under tensor
+parallelism each rank keeps every expert's share of the hidden units, as vLLM splits
+them, and the projections whole.
 """
 
 from __future__ import annotations
@@ -18,7 +21,7 @@ from vllm.model_executor.layers.linear import ReplicatedLinear
 
 from .basic import MLP
 from .common import Ctx, Layer, Norm, Site, unsupported
-from .routing import Router, expert_shards
+from .routing import Router, apart, expert_shards, pick_rows
 
 #: vLLM's MoE activations, by a bux expert's type and activation, without a limit
 #: or an offset.
@@ -67,8 +70,9 @@ class MoE(Layer):
     fused kernels, in LatentMoE's latent (`latent_size`) with its norms, and the
     shared experts as one MLP, gated by a sigmoid under ``shared_expert_gate``, or
     each one's share of the hidden units weighted by its score under
-    ``shared_expert_sink``. Training's settings (the balance loss, the bias's
-    update, random logits) change nothing here."""
+    ``shared_expert_sink``; with ``expert_norm``, each routed expert's output
+    normalized before its weight (`apart`). Training's settings (the balance loss,
+    the bias's update, random logits) change nothing here."""
 
     bux_types = ("moe",)
     once = True
@@ -76,10 +80,11 @@ class MoE(Layer):
 
     def __init__(self, c: dict, width: int, site: Site):
         super().__init__()
-        unsupported(c, "expert_norm")
         expert, self.top_k = c["expert"], c["top_k"]
         n, self.gated = c["num_experts"], expert["type"] == "gated_mlp"
         latent = c["latent_size"] or width
+        self.num_experts, self.expert_norm = n, _norm(c["expert_norm"], latent)
+        apart_ = self.expert_norm is not None  # each pick a row of its own
         self.to_latent, self.from_latent = _latent(c, width, site.path)
         self.latent_input_norm = _norm(c["latent_input_norm"], latent)
         self.latent_output_norm = _norm(c["latent_output_norm"], latent)
@@ -94,12 +99,12 @@ class MoE(Layer):
         )
         self.experts = FusedMoEFactory(
             num_experts=n,
-            top_k=c["top_k"],
+            top_k=1 if apart_ else c["top_k"],
             hidden_size=latent,
             intermediate_size=expert["intermediate_size"],
             renormalize=c["normalize_top_k"],
             prefix=f"{site.path}.experts",
-            custom_routing_function=self.router,
+            custom_routing_function=pick_rows if apart_ else self.router,
             **experts_activation(expert),
             has_bias=expert["bias"],
             router_logits_dtype=torch.float32,
@@ -134,6 +139,9 @@ class MoE(Layer):
         for name in ("latent_input_norm", "latent_output_norm"):
             if (norm := getattr(self, name)) is not None:
                 out |= {f"{name}.{k}": v for k, v in norm.targets().items()}
+        if self.expert_norm is not None:  # the export's name of it
+            norm = self.expert_norm.targets().items()
+            out |= {f"experts.post_expert_norm.{k}": v for k, v in norm}
         return out
 
     def load(self, name: str, tensor: torch.Tensor) -> list[nn.Parameter]:
@@ -175,11 +183,16 @@ class MoE(Layer):
 
     def routed(self, x: torch.Tensor, logits: torch.Tensor) -> torch.Tensor:
         """The routed experts' output, by the router's `logits`: in LatentMoE, run
-        on x projected to the latent and normalized, and projected back."""
+        on x projected to the latent and normalized, and projected back; each
+        expert's normalized before its weight under ``expert_norm``."""
         z = x if self.to_latent is None else self.to_latent(x)
         if self.latent_input_norm is not None:
             z = self.latent_input_norm(z)
-        y = self.experts(z, logits)
+        if self.expert_norm is None:
+            y = self.experts(z, logits)
+        else:
+            weights, idx, _ = self.router.route(logits, self.top_k)
+            y = apart(self.experts, self.expert_norm, z, weights, idx, self.num_experts)
         if self.latent_output_norm is not None:
             y = self.latent_output_norm(y)
         return y if self.from_latent is None else self.from_latent(y)
