@@ -45,6 +45,7 @@ class Options:
     e: float | None = None  # E held at this value; None: fit
     seed_sigma: float = 0.0  # the spread of the seeds' shifts, shared by every family
     drop_scan: tuple[str, ...] = ()  # families whose token scans are left out
+    e_range: tuple[float, float] | None = None  # bounds of E where it is fit
 
 
 @dataclass
@@ -98,7 +99,7 @@ def analyze(
     """Fit `metric`'s laws, and say what they say with their uncertainty."""
     kept = [p for p in points if p.ladder or p.family not in o.drop_scan]
     fams = families(kept, metric, parents, o.root, o.share)
-    laws = fit_metric(fams, o.root, o.joint, None, o.e)
+    laws = fit_metric(fams, o.root, o.joint, None, o.e, o.e_range)
     a = Analysis(
         metric,
         fams,
@@ -109,12 +110,21 @@ def analyze(
         o.seed_sigma,
     )
     for f in fams:
-        others = leave_one_rung_out(fams, f, laws, o.root, o.joint, o.e)
+        others = leave_one_rung_out(fams, f, laws, o.root, o.joint, o.e, o.e_range)
         qs = [one(f, fams, {**laws, f: law}, targets, o.root) for law in others]
         a.loro[f] = spread(qs, 0, 100)
     if o.reps:
         reps = bootstrap(
-            fams, laws, o.root, o.joint, o.sigma, o.reps, o.seed, o.e, o.seed_sigma
+            fams,
+            laws,
+            o.root,
+            o.joint,
+            o.sigma,
+            o.reps,
+            o.seed,
+            o.e,
+            o.seed_sigma,
+            o.e_range,
         )
         qs = [quantities(fb, lb, targets, o.root) for fb, lb in reps]
         a.boot = {f: spread([q[f] for q in qs if f in q], 5, 95) for f in fams}

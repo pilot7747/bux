@@ -138,6 +138,7 @@ def fit_metric(
     joint: bool = True,
     start: dict | None = None,
     e: float | None = None,
+    e_range: tuple[float, float] | None = None,
 ) -> dict[str, Law]:
     """Every family's law. From `start`, or from the staged fits and a grid of
     the root's: jointly, E (unless `e` holds it), the root's terms and every
@@ -145,12 +146,12 @@ def fit_metric(
     shares them); else staged."""
     order = topological(fams, root)
     if not joint:
-        return staged(fams, order, start, e)
-    starts = [start] if start else [staged(fams, order, None, e)]
+        return staged(fams, order, start, e, e_range)
+    starts = [start] if start else [staged(fams, order, None, e, e_range)]
     if not start:
         grid = root_starts(fams, [root], e)
         starts += [spread(fams, order, s[root]) for s in grid]
-    return fit_group(fams, order, {NO_DATA: FLAT}, e, starts)
+    return fit_group(fams, order, {NO_DATA: FLAT}, e, starts, e_range)
 
 
 def staged(
@@ -158,11 +159,12 @@ def staged(
     order: list[str],
     start: dict | None = None,
     e: float | None = None,
+    e_range: tuple[float, float] | None = None,
 ) -> dict:
     """The root's law alone, then each family's with its parent's and E held."""
     root = order[0]
     starts = [start] if start else root_starts(fams, [root], e)
-    laws = fit_group(fams, [root], {NO_DATA: FLAT}, e, starts)
+    laws = fit_group(fams, [root], {NO_DATA: FLAT}, e, starts, e_range)
     for f in order[1:]:
         laws[f] = fit_one(fams, f, laws, start)
     return laws
@@ -209,9 +211,11 @@ def fit_group(
     fixed: dict[str, Law],
     e: float | None,
     starts: list[dict[str, Law]],
+    e_range: tuple[float, float] | None = None,
 ) -> dict[str, Law]:
     """The laws of `group` that fit its points best from any of `starts`: E too
-    unless `e` holds it, each family's own terms, the rest from its parent."""
+    unless `e` holds it (within `e_range` if given), each family's own terms, the
+    rest from its parent."""
     with_e = e is None
     src, owners = _sources(fams, group, fixed, with_e)
 
@@ -237,7 +241,7 @@ def fit_group(
         )
 
     floor = min(float(fams[f].y.min()) for f in group)
-    lo, hi = _bounds(owners, with_e, floor)
+    lo, hi = _bounds(owners, with_e, floor, e_range)
     sols = [
         least_squares(
             residuals, x0, jac=jacobian, loss="huber", f_scale=DELTA, bounds=(lo, hi)
@@ -303,9 +307,12 @@ def _encode(
     return np.array(x, float)
 
 
-def _bounds(owners: list, with_e: bool, floor: float) -> tuple:
-    lo = [math.log(1e-4)] if with_e else []
-    hi = [math.log(floor * 0.999)] if with_e else []
+def _bounds(
+    owners: list, with_e: bool, floor: float, e_range: tuple | None = None
+) -> tuple:
+    e_lo, e_hi = e_range or (1e-4, math.inf)
+    lo = [math.log(e_lo)] if with_e else []
+    hi = [math.log(min(e_hi, floor * 0.999))] if with_e else []
     for _, t in owners:
         lo.append(-40.0 if t in LOGGED else 0.01)
         hi.append(40.0 if t in LOGGED else 3.0)
@@ -339,6 +346,7 @@ def leave_one_rung_out(
     root: str,
     joint: bool,
     e: float | None = None,
+    e_range: tuple[float, float] | None = None,
 ) -> list[Law]:
     """`f`'s laws fit without each of its rungs in turn (its other points kept), its
     parent's held; the root's with E refit."""
@@ -348,7 +356,7 @@ def leave_one_rung_out(
         if len(set(fewer.width[fewer.ladder])) < (2 if f == root else 1):
             continue
         if f == root:
-            out.append(fit_metric({**fams, f: fewer}, root, joint, laws, e)[f])
+            out.append(fit_metric({**fams, f: fewer}, root, joint, laws, e, e_range)[f])
         else:
             out.append(fit_one({**fams, f: fewer}, f, laws))
     return out
@@ -364,6 +372,7 @@ def bootstrap(
     seed: int = 0,
     e: float | None = None,
     seed_sigma: float = 0.0,
+    e_range: tuple[float, float] | None = None,
 ) -> list[tuple[dict[str, Family], dict[str, Law]]]:
     """`reps` refits of every family, each from the full fit, with each point off
     by its runs' noise (`sigma`) and by its seeds' shifts, drawn once per refit
@@ -376,5 +385,5 @@ def bootstrap(
     for _ in range(reps):
         shifts = {s: seed_sigma * rng.standard_normal() for s in seeds}
         noisy = {f: fam.noisy(rng, sigma, shifts) for f, fam in fams.items()}
-        out.append((noisy, fit_metric(noisy, root, joint, laws, e)))
+        out.append((noisy, fit_metric(noisy, root, joint, laws, e, e_range)))
     return out

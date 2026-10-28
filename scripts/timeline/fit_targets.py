@@ -89,6 +89,24 @@ def _precisions(raw: dict) -> list[str]:
     return ["fp8", "bf16"] if fp8 else ["bf16"]
 
 
+def budgets(path: Path) -> dict[str, float]:
+    """The serving budget (sessions/h per GPU of the budget model) each precision's
+    targets were matched at: its entries' most common ``budget``."""
+    raw = json.loads(path.read_text())
+    if "rows" in raw:
+        return {}
+    out = {}
+    for p in _precisions(raw):
+        values = [
+            round(v["budget"], 2)
+            for v in served(raw, p).values()
+            if isinstance(v, dict) and v.get("budget") and not v.get("fallback")
+        ]
+        if values:
+            out[p] = max(set(values), key=values.count)
+    return out
+
+
 def served(raw: dict, serve: str) -> dict:
     """The entries of one serving precision (`serve`), from a file keyed by
     precision (``{"fp8": {family: ...}, "bf16": ...}``) or by family, each entry
