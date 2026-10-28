@@ -636,8 +636,8 @@ parentheses is bux's own bfloat16 error, against the same reference:
 | `rwkv7-residual` | RWKV-7's value residual through its `v` port, low ranks | 1.3e-5 | 0.11 (0.25) | - |
 | `hc` | hyper-connections, 4 streams | 8.1e-6 | 0.079 (0.10) | 0.086 |
 | `attnres` | attention residuals in blocks of 3 | 8.6e-6 | 0.098 (0.17) | 0.14 |
-| `mhc` | manifold-constrained hyper-connections | 8.1e-6 | 0.097 (0.11) | 0.11 |
-| `mhc-single` | mhc, single-pass | 6.7e-6 | 0.11 (0.10) | - |
+| `mhc` | manifold-constrained hyper-connections | 1.1e-5 | 0.097 (0.11) | 0.086 |
+| `mhc-single` | mhc, single-pass | 8.6e-6 | 0.095 (0.14) | 0.11 |
 | `gr` | `gr`'s residual algebra | 1.9e-6 | 0.018 (0.025) | - |
 | `vpgate` | `vpgate`'s residual algebra | 9.5e-6 | 0.072 (0.13) | - |
 | `engram` | Engram's memory between two blocks, a tied head | 1.4e-5 | 0.097 (0.11) | 0.074 |
