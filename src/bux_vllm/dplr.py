@@ -71,7 +71,8 @@ def prompts(
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """The rule over prompts side by side, ``xs`` (N, h, d) with sequence i from
     ``starts[i]``, from their states (B, h, dk, dv), by fla's chunked kernel; with a
-    `floor` on the log decay, its bound licenses fla's tensor-core scheme. Returns
+    `floor` on the log decay above 0, its bound licenses fla's tensor-core scheme
+    (fla takes no bound of 0, which DeltaNet's, with no decay, would be). Returns
     the outputs, (N, h, dv), and the last states."""
     found = kernels()
     assert found is not None
@@ -81,6 +82,6 @@ def prompts(
         initial_state=state,
         output_final_state=True,
         cu_seqlens=starts,
-        lower_bound=None if floor is None else -floor,
+        lower_bound=-floor if floor else None,
     )
     return o[0], after

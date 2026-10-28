@@ -28,13 +28,20 @@ from vllm.model_executor.layers.mamba.mamba_utils import (
     MambaStateShapeCalculator,
 )
 
-from . import gdn2, kda, recurrent, rwkv7
+from . import deltanet, gdn2, gla, kda, lightning, recurrent, rwkv7
 from .common import Ctx, Layer, Site
-from .linear import conv_weight, linear_dims
+from .linear import conv_kernel, conv_weight, linear_dims
 from .plan import live, plan
 
 #: The recurrent layer types the plugin computes itself, by their modules.
-OWN = {"kda": kda, "gdn2": gdn2, "rwkv7": rwkv7}
+OWN = {
+    "kda": kda,
+    "gdn2": gdn2,
+    "rwkv7": rwkv7,
+    "deltanet": deltanet,
+    "gla": gla,
+    "lightning": lightning,
+}
 
 #: The recurrent layer types, which keep their state in vLLM's Mamba cache.
 RECURRENT = ("mamba", "mamba2", "gdn", *OWN)
@@ -167,15 +174,17 @@ class GatedDeltaNet(Layer):
     k and v convolved with SiLU, q and k L2-normalized, q scaled by
     ``head_dim ** -0.5``, the delta rule with ``exp(-exp(A_log) softplus(a +
     dt_bias))`` decay and ``sigmoid(b)`` steps, each value head's RMSNorm times the
-    gate's activation, and the output projection."""
+    gate's activation, and the output projection; by bux's own rule without a conv
+    or an output gate, which vLLM's layer has (`bux_vllm.deltanet`)."""
 
     bux_types = ("gdn",)
     stateful = once = True
 
     def __init__(self, c: dict, width: int, site: Site):
         super().__init__()
-        if c["conv_size"] is None or c["output_gate"] is None:
-            raise NotImplementedError("gdn: no conv or no output gate not in vLLM yet")
+        if own_gdn(c):
+            self.mixer = deltanet.Mixer(c, width, site.vllm_config, site.caches[0])
+            return
         h, hv, dk, dv = linear_dims(c)
         config = SimpleNamespace(
             hidden_size=width,
@@ -196,6 +205,8 @@ class GatedDeltaNet(Layer):
 
     def targets(self) -> dict[str, tuple[nn.Parameter, tuple]]:
         m = self.mixer
+        if isinstance(m, deltanet.Mixer):
+            return m.targets()
         qkvz, ba = m.in_proj_qkvz.weight, m.in_proj_ba.weight
         return {
             "q.weight": (qkvz, (0,)),
@@ -212,12 +223,20 @@ class GatedDeltaNet(Layer):
         }
 
     def load(self, name: str, tensor: torch.Tensor) -> list[nn.Parameter]:
+        if isinstance(self.mixer, deltanet.Mixer):
+            return deltanet.load(self, self.mixer, name, tensor)
         if name == "conv.weight":
             tensor = conv_weight(tensor)
         return super().load(name, tensor)
 
     def forward(self, x: torch.Tensor, ctx: Ctx | None = None) -> torch.Tensor:
         return self.mixer(x)
+
+
+def own_gdn(c: dict) -> bool:
+    """Whether bux's own rule runs the ``gdn`` config `c`: one without a conv or an
+    output gate, which vLLM's Gated DeltaNet has."""
+    return c["conv_size"] is None or c["output_gate"] is None
 
 
 def _recurrent(config: Any) -> tuple[str, dict, int] | None:
@@ -250,7 +269,7 @@ def state_shapes(vllm_config: Any) -> tuple:
     if kind == "gdn":
         h, hv, dk, dv = linear_dims(c)
         return MambaStateShapeCalculator.gated_delta_net_state_shape(
-            tp, h, hv, dk, dv, c["conv_size"], spec
+            tp, h, hv, dk, dv, conv_kernel(c), spec
         )
     if kind == "mamba":
         if spec:
@@ -276,7 +295,9 @@ def state_dtypes(vllm_config: Any) -> tuple:
     """The dtypes of the state of each of the model's recurrent layers."""
     cache = vllm_config.cache_config
     found = _recurrent(vllm_config.model_config.hf_config)
-    if found is not None and found[0] in OWN:
+    if found is not None and (
+        found[0] in OWN or found[0] == "gdn" and own_gdn(found[1])
+    ):
         return recurrent.state_dtype(vllm_config.model_config, cache)
     if found is not None and found[0] == "mamba":
         return MambaStateDtypeCalculator.mamba1_state_dtype(
