@@ -110,12 +110,12 @@ class Mixer(Recurrent):
         raw = (self.w(xw), self.a(xa))
         v = self._values(xv, ctx)
         xs = feeds.rwkv7_rule(heads, self.r(xr), self.k(xk), v, raw, self.k_k, self.k_a)
+        # The bonus and the gate before the op, so that only they cross it.
+        bonus = feeds.rwkv7_bonus(xs[0], xs[1], v, self.r_k)
+        gate = None if self.g is None else self.g(xg)
         o = self.run("recur", xs, x.new_zeros(x.shape[0], self.hv, self.dv))
-        o = self.norm(o) + feeds.rwkv7_bonus(xs[0], xs[1], v, self.r_k)
-        o = o.flatten(1)
-        if self.g is not None:
-            o = o * self.g(xg)
-        return self.o(o)
+        o = (self.norm(o) + bonus).flatten(1)
+        return self.o(o if gate is None else o * gate)
 
     def _values(self, xv: torch.Tensor, ctx: Ctx) -> torch.Tensor:
         """The values, (T, hv, dv), with those the ``v`` port reads mixed in by the

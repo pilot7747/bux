@@ -32,7 +32,7 @@ from vllm.third_party.flash_linear_attention.ops.kda import FusedRMSNormGated
 from vllm.utils.torch_utils import direct_register_custom_op
 
 from .common import Ctx, Layer, Site
-from .linear import conv_channels, linear_dims, to_value_heads
+from .linear import kda_projection, linear_dims, to_value_heads, zero_padding
 from .recurrent import Recurrent, float32, low_rank_tensor, split_op
 
 #: The op the conv and recurrence run in, outside the compiled graph.
@@ -127,19 +127,17 @@ class Mixer(Recurrent):
         _, hv, dk, dv = linear_dims(c)
         rank = c["gate_rank"] or dk
         self.dense_gate = c["output_gate_rank"] is None
-        gate = [hv * dv] if self.dense_gate else []
-        sizes = [*conv_channels(c), *gate, rank, hv]
-        self.split = [sum(conv_channels(c)) // self.tp, *(s // self.tp for s in gate)]
-        self.split += [rank, hv // self.tp]
+        sizes, self.split, self.parts = kda_projection(c, self.tp)
         self.in_proj = _KimiGDNMergedColumnParallelLinear(
             width,
             sizes,
-            replicated_shard_id=len(sizes) - 2,
+            replicated_shard_id=self.parts - 2,  # the decay's down projection
             tp_size=self.tp,
             bias=False,
             return_bias=False,
             prefix=f"{self.prefix}.in_proj",
         )
+        zero_padding(self.in_proj, sum(self.split[self.parts :]))
         self.f_up = ColumnParallelLinear(
             rank, hv * dk, bias=False, return_bias=False, prefix=f"{self.prefix}.f_up"
         )
@@ -158,13 +156,12 @@ class Mixer(Recurrent):
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         """The layer's output, (T, width), from the tokens' inputs."""
         n = x.shape[0]
-        qkv, *rest = self.in_proj(x).split(self.split, -1)
-        if self.dense_gate:
-            gate, f, beta = rest
-        else:
-            (f, beta), gate = rest, self.gate_up(self.gate_down(x))
+        qkv, *rest = self.in_proj(x).split(self.split, -1)[: self.parts]
+        gate, f, beta = rest if self.dense_gate else (None, *rest)
         out = x.new_zeros(n, self.hv, self.dv)
         torch.ops.vllm.bux_kda(qkv, self.f_up(f), beta, out, self.prefix)
+        if gate is None:  # made after the op, so that no matmul's output crosses it
+            gate = self.gate_up(self.gate_down(x))
         out = self.norm(out, gate.unflatten(-1, (self.hv, self.dv)))
         return self.o(out.flatten(1))
 
