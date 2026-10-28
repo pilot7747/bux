@@ -37,6 +37,7 @@ from bux_vllm import (
     common,
     config,
     delta,
+    dplr,
     feeds,
     kv,
     linear,
@@ -902,3 +903,58 @@ def test_single_queries_of_several_requests_attend_to_their_own_keys() -> None:
             int(at[r]) + 1,
         )
         torch.testing.assert_close(both[r : r + 1], alone)
+
+
+def fla_like(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    a: torch.Tensor,
+    b: torch.Tensor,
+    gk: torch.Tensor,
+    scale: float,
+    initial_state: torch.Tensor,
+    output_final_state: bool,
+    cu_seqlens: torch.Tensor | None = None,
+    lower_bound: float | None = None,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """fla's DPLR kernels' API, (B, T, H, D) and variable lengths by cu_seqlens, and
+    its rule as fla's reference has it (``S = exp(gk) S + b (a^T S) + k v^T``, ``o =
+    scale q^T S``), by the export's rule."""
+    assert output_final_state and (lower_bound is None or gk.min() >= lower_bound)
+    if cu_seqlens is None:
+        rows = [(i, slice(None)) for i in range(q.shape[0])]
+    else:
+        ends = cu_seqlens.tolist()
+        rows = [(0, slice(ends[i], ends[i + 1])) for i in range(len(ends) - 1)]
+    outs, lasts = [], []
+    for n, (row, span) in enumerate(rows):
+        xs = [x[row : row + 1, span] for x in (q * scale, k, v, gk, a, b)]
+        o, last = hf_linear.rank_one(*xs, state=initial_state[n : n + 1])
+        outs.append(o)
+        lasts.append(last)
+    return torch.cat(outs, 1 if cu_seqlens is not None else 0), torch.cat(lasts)
+
+
+def test_fla_takes_the_rule_as_its_kernels_take_it(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Prompts and decoding steps on fla's kernels (here as fla's API defines them)
+    give what the plugin's PyTorch rule does: bux's a, b and log decay as fla's,
+    a scale of 1, prompts by cu_seqlens."""
+    monkeypatch.setattr(dplr, "kernels", lambda: (fla_like, fla_like))
+    torch.manual_seed(0)
+    starts = torch.tensor([0, 3, 67, 367])
+    xs = rule_inputs(367, 5.0)
+    before = torch.randn(3, 2, 8, 4)
+    got, after = dplr.prompts(xs, starts, before, torch.float32, 5.0)
+    padded = [delta.padded(x, starts, 300) for x in xs]
+    want, last = delta.rank_one(*padded, before, floor=5.0)
+    torch.testing.assert_close(got, delta.unpadded(want, starts, 367))
+    torch.testing.assert_close(after, last)
+    one = rule_inputs(3, 5.0)
+    got, after = dplr.step(one, before, torch.float32)
+    want, last = delta.step(*one, before)
+    torch.testing.assert_close(got, want)
+    torch.testing.assert_close(after, last)
+    assert dplr.runs(torch.bfloat16) and not dplr.runs(torch.float32)

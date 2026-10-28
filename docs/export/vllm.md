@@ -152,7 +152,7 @@ ones, `--load-format dummy`, to time it.
 | `moe` | softmax, sigmoid and `sqrtsoftplus` routers, `router_logit_scale`, groups, the aux-free bias, a router bias, shared experts and their gate, gated and plain experts (`swish`, `gelu`, `gelu_tanh`, `relu2`) with biases, a `limit` and `up_offset` on `swish` and `quick_gelu` gates (gpt-oss's), LatentMoE with its norms (vLLM's fused experts at the latent's width), and shared experts the router scores (`shared_expert_sink`). Not yet: `expert_norm`, or the experts' `up_softcap` |
 | `mamba2`, `gdn` | by vLLM's own layers, with one type and shape of recurrent layer per model; `gdn` in bfloat16 only, and with its short conv and output gate. Under tensor parallelism, vLLM 0.32's Mamba-2 failed with one group (its fused all-reduce), and in bfloat16 where a rank's share of the input projection is not a multiple of 8 wide |
 | `kda` | by vLLM's KDA kernels, Kimi Linear's (by chunks for a prompt, the recurrence for each decoded token) and its causal conv, with one type and shape of recurrent layer per model: value heads (`num_v_heads`), the decay's rank, `gate_lower_bound` of -5 and above, and a dense or low-rank output gate. Not yet: no conv, no output gate, a `v_head_dim` other than `head_dim`, or speculative decoding |
-| `gdn2`, `rwkv7` | the delta rule in PyTorch ([Delta rules in PyTorch](#delta-rules-in-pytorch)), the rest by vLLM's layers and causal conv, with one type and shape of recurrent layer per model: every setting, and `rwkv7`'s `v` port (the value residual). Not yet: `gdn2` without its conv, or speculative decoding |
+| `gdn2`, `rwkv7` | the delta rule on fla's kernels where they are installed, else in PyTorch ([DPLR delta rules](#dplr-delta-rules)), the rest by vLLM's layers and causal conv, with one type and shape of recurrent layer per model: every setting, and `rwkv7`'s `v` port (the value residual). Not yet: `gdn2` without its conv, or speculative decoding |
 | `engram` | every setting, on a single or a widened stream: the n-gram sizes and hash heads, the norms, the dilated conv or none, `vocab_classes` and `boundary_token`. Not yet: speculative decoding, a conv of one tap, or vLLM's V1 model runner |
 | residual algebras, `merge` | `hc`, `mhc`, `gr`, `attnres`, `vpgate`, with every setting, single-pass included |
 | the graph | everything; a shared MoE or recurrent layer may run only once per forward pass |
@@ -167,13 +167,32 @@ a layer of its own: q and k are projected and convolved at their own heads, as b
 computes them, and repeated out to the value heads only for the kernels. Its weights
 and its state per sequence are bux's.
 
-## Delta rules in PyTorch
+## DPLR delta rules
 
 vLLM has no kernel for the delta rules of `gdn2` and `rwkv7`. Their erase term is
-a rank-one map of two different vectors, which makes them DPLR rules, not KDA's. The
-plugin runs them in PyTorch, in float32, as bux does: each value head keeps a state of
-`head_dim` by `v_head_dim` in vLLM's Mamba cache, beside the conv's last inputs
-(`gdn2`) or the token before (`rwkv7`, for its token shift).
+a rank-one map of two different vectors, which makes them DPLR rules, not KDA's.
+Each value head keeps a state of `head_dim` by `v_head_dim` in vLLM's Mamba cache,
+in float32, beside the conv's last inputs (`gdn2`) or the token before (`rwkv7`,
+for its token shift). The projections, convs and norms run on vLLM's layers and
+kernels, as for the other layers.
+
+**On fla's kernels.** Install
+[flash-linear-attention](https://github.com/fla-org/flash-linear-attention) into
+vLLM's environment, and a model in bfloat16 or float16 runs the rule on its DPLR
+kernels: by chunks for the prompts, by its recurrent kernel for decoding.
+
+```sh
+pip install flash-linear-attention==0.6.0
+```
+
+fla's rule is bux's, with bux's vectors and decay as fla's `a`, `b` and `gk`, and a
+scale of 1. Its kernels take the rule's inputs in the model's dtype, where bux keeps
+some of them in float32 (`gdn2`'s gated values and erase term), so they round as a
+bfloat16 run of bux does. The decay and the state stay in float32. A bound on the
+decay (`gate_lower_bound`, and `rwkv7`'s own) lets fla run its tensor-core scheme.
+
+**In PyTorch.** Without fla, or in float32, the plugin runs the rule in PyTorch, in
+float32, as bux does:
 
 - **A prompt** runs by chunks of 64 tokens, with matmuls within a chunk and the
   state carried across, as fla's chunked kernels compute it. The batch's prompts run
@@ -185,10 +204,9 @@ plugin runs them in PyTorch, in float32, as bux does: each value head keeps a st
   `gdn2` at -5 blocks of 16 rows. An unbounded decay runs one chunk after another.
 - **Decoding** takes one step of every sequence at once, which CUDA graphs capture.
 
-The projections, convs and norms run on vLLM's layers and kernels, as for the other
-layers. The rule computes in float32 on CUDA cores, so a prompt costs several times
-what a fused kernel would. A test checks both paths against the export's layers,
-on the CPU.
+This rule computes in float32 on CUDA cores, so a prompt costs several times what a
+fused kernel would. Tests check both paths against the export's layers on the CPU,
+the PyTorch rule as computed and fla's as its API defines it.
 
 ## Sparse attention
 
