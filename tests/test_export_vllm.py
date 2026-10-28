@@ -516,7 +516,8 @@ def exported(source: str) -> tuple[Any, dict]:
 
 def no_cache() -> Any:
     """The export's context of one whole sequence, without a cache."""
-    return hf_common.Ctx(None, None, None, None, torch.nn.ModuleDict(), lambda *_: None)
+    none = torch.zeros(1, 0)  # neither tokens nor positions are read
+    return hf_common.Ctx(none, none, None, None, torch.nn.ModuleDict(), lambda *_: None)
 
 
 def by_chunks(xs: list[torch.Tensor], heads: tuple) -> torch.Tensor:
