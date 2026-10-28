@@ -36,7 +36,23 @@ SETTINGS = {
     "msa blocks of 16": {"block_size": 16, "top_k": 64, "window": 200},
     "msa blocks of 16 per group": {"block_size": 16, "top_k": 64, "per_group": True},
     "qsa blocks, window": {"block_size": 4, "top_k": 32, "mean": True, "window": 64},
+    "qsa blocks, interleaved rope, layernorm": {
+        "block_size": 4,
+        "top_k": 32,
+        "mean": True,
+        "rope": "interleaved",
+        "norm": {"type": "layernorm", "bias": True, "zero_centered": False},
+    },
+    "qsa blocks, half rope, zero-centered rmsnorm": {
+        "block_size": 4,
+        "top_k": 32,
+        "mean": True,
+        "rope": "half",
+        "norm": {"type": "rmsnorm", "bias": False, "zero_centered": True},
+    },
 }
+#: A rope of the layer's, which the indexer pairs by its own layout.
+ROPE = {"base": 10000.0, "scaling": None, "fraction": 1.0, "layout": "half"}
 
 
 def spec(h: int, g: int, dk: int, heads: int, settings: dict) -> picks.Sparse:
@@ -47,8 +63,16 @@ def spec(h: int, g: int, dk: int, heads: int, settings: dict) -> picks.Sparse:
     pooling = None
     if mean:
         ix = {"num_heads": heads, "head_dim": 32, "block_size": size, "pool": "mean"}
-        ix |= {"weighted": True, "norm": None, "rope_layout": "half"}
-        pooling = indexer.Indexer(ix, 64, None, 0).cuda()
+        norm = settings.get("norm")
+        if norm is not None:
+            norm = {"eps": 1e-5, "affine": True, "scale_input": False} | norm
+        ix |= {"weighted": True, "norm": norm}
+        ix |= {"rope_layout": settings.get("rope", "half")}
+        rope = ROPE if settings.get("rope") else None
+        pooling = indexer.Indexer(ix, 64, rope, 16 if rope else 0).cuda()
+        with torch.no_grad():
+            for p in pooling.k_norm.parameters():  # gains and biases away from 1, 0
+                p.normal_()
     return picks.Sparse(
         settings.get("top_k", 16),
         size,

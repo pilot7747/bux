@@ -164,6 +164,19 @@ def mean_blocks(
     query's own block while it is unfinished; their keys, (Q, K)."""
     full = full_blocks(positions, s.shape[-1], size, window)
     blocks, ok = top(s, full, top_k // size)
+    return with_own_block(blocks, ok, see, positions, window, size)
+
+
+def with_own_block(
+    blocks: torch.Tensor,
+    ok: torch.Tensor,
+    see: torch.Tensor,
+    positions: torch.Tensor,
+    window: int | None,
+    size: int,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """QSA's picks from its best complete `blocks` and which are valid, (Q, k): those
+    and the query's own block while it is unfinished; their keys, (Q, K)."""
     own = (positions // size)[:, None]
     finished = (own + 1) * size - 1 <= positions[:, None]
     if window is not None:
