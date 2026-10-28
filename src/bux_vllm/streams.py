@@ -160,12 +160,12 @@ def hc_read(
     h: torch.Tensor,
     coef: torch.Tensor,
     eps: float,
-    mode: int,
+    weighing: int,
 ) -> None:
     """hc's read of the streams x, (T, n, d), into `h`, (T, d), and its coefficients
     into `coef`, (T, pad(n), pad(k + 1)) in float32: A's k columns (static, plus
     the dynamic term of `wa` and `scale_a` where given), then B (of `static_beta`,
-    `wb`, `scale_b`) where given. `mode` weighs the read (`OWN`, `PENDING`: by
+    `wb`, `scale_b`) where given. `weighing` weighs the read (`OWN`, `PENDING`: by
     `pending`, (T, n), or `FIRST`)."""
     t, n, d = x.shape
     k = static_alpha.shape[1]
@@ -193,7 +193,7 @@ def hc_read(
         KP=coef.shape[2],
         BETA=static_beta is not None,
         DYNAMIC=wa is not None,
-        MODE=mode,
+        MODE=weighing,
         BLOCK=BLOCK_D,
         num_warps=4,
     )
@@ -264,12 +264,12 @@ def mhc_read(
     logits: torch.Tensor,
     read: torch.Tensor,
     eps: float,
-    mode: int,
+    weighing: int,
 ) -> None:
     """mhc's read of the streams x, (T, n, d), into `h`, its logits ``a r W + b``
     (``b`` alone without `proj`) into `logits`, (T, pad(k)), and the coefficients
     its read computed, ``sigmoid(pre) + EPS``, into `read`, (T, pad(n)), in float32;
-    `mode` weighs the read as `hc_read`'s does."""
+    `weighing` weighs the read as `hc_read`'s does."""
     t, n, d = x.shape
     sp = (0, 0) if pending is None else pending.stride()
     _mhc_read_kernel[(t,)](
@@ -292,7 +292,7 @@ def mhc_read(
         K=bias.shape[0],
         KP=logits.shape[1],
         DYNAMIC=proj is not None,
-        MODE=mode,
+        MODE=weighing,
         BLOCK=MHC_BLOCK,
         num_warps=4,
     )
