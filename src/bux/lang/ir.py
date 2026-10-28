@@ -326,6 +326,8 @@ _NEWER_LAYER_FIELDS = {
         "center_bias": False,
         "bias_softclamp": 2.0,
         "bias_momentum": 0.5,
+        "num_zero_experts": 0,
+        "ffn_experts_per_token": None,
     },
     "mamba2": {"num_heads": None},
     "gqa": {

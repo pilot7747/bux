@@ -229,7 +229,8 @@ class MoEConfig(Config):
     shared experts, if any, take every token. A loss, a bias or both balance the
     experts' loads (`load_balancing`). The run's ``methods.moe`` says how the experts
     run: every expert on every token (``dense``), each on its own tokens
-    (``sorted``, the default), or over devices by expert parallelism.
+    (``sorted``, the default), or over devices by expert parallelism. Zero experts
+    (`num_zero_experts`, LongCat-Flash) let a token go through fewer FFN experts.
     """
 
     type: Literal["moe"] = "moe"
@@ -269,6 +270,9 @@ class MoEConfig(Config):
     # more (DeepSeek-V3). smebu moves the same bias by a step that shrinks as an expert's
     # load nears the mean: tanh(bias_softclamp * (mean - load) / mean) times the rate,
     # centered over the experts and averaged by a momentum of bias_momentum (Trinity).
+    # With zero experts, aux_free moves each FFN expert's bias by LongCat-Flash's rule
+    # instead, the rate times (1 - load / target) toward ffn_experts_per_token's share
+    # of the picks, and the zero experts' bias stays 0.
     load_balancing: Literal["aux_loss", "aux_free", "smebu"] = "aux_loss"
     # How far the bias moves each training step, for each expert: aux_free's step, and
     # SMEBU's largest (Trinity Large: 5e-4).
@@ -283,7 +287,8 @@ class MoEConfig(Config):
     bias_momentum: Annotated[float, Field(ge=0, lt=1)] = 0.5
     # Weight of each layer's balance loss, E * sum_e f_e P_e, where f_e is the fraction
     # of top-k picks that go to expert e and P_e its mean score, normalized over the
-    # experts (Switch; DeepSeek-V3, eqs. 17-20). None -> 1e-2, or 0 with a bias. Every
+    # experts (Switch; DeepSeek-V3, eqs. 17-20); with zero experts, LongCat-Flash's,
+    # the zero experts one more group (eqs. 3-5). None -> 1e-2, or 0 with a bias. Every
     # layer adds its own, as in Megatron-LM. transformers pools the layers into one loss
     # and counts tokens, not picks, so its coefficient c is about c * top_k / layers.
     aux_loss_coef: Annotated[float, Field(ge=0)] | None = None
@@ -302,12 +307,59 @@ class MoEConfig(Config):
     # The shared experts are weighted by the router too, normalized with the top-k
     # (Inkling); otherwise they are added with weight 1.
     shared_expert_sink: bool = False
+    # Zero-computation experts (LongCat-Flash): identity experts the router scores
+    # after the routed ones, each the token as it is, times its weight. A token picks
+    # its top_k among both, so it goes through fewer FFN experts than top_k.
+    num_zero_experts: Annotated[int, Field(ge=0)] = 0
+    # The FFN experts a token goes through on average, which aux_free's bias steers
+    # toward and the balance loss weighs by (LongCat's K_e); None -> top_k *
+    # num_experts / (num_experts + num_zero_experts), what uniform picks give.
+    ffn_experts_per_token: float | None = None
+
+    @model_validator(mode="after")
+    def _zero_experts(self) -> Self:
+        """Check the zero experts' settings, and that they balance by a rule that
+        keeps them."""
+        if not self.num_zero_experts:
+            if self.ffn_experts_per_token is not None:
+                raise ValueError("ffn_experts_per_token needs num_zero_experts")
+            return self
+        budget = self.ffn_budget
+        if not 0 < budget < self.top_k:
+            raise ValueError(
+                f"ffn_experts_per_token={budget} is not between 0 and top_k={self.top_k}"
+            )
+        refused = [
+            name
+            for name, on in (
+                ("load_balancing=smebu", self.load_balancing == "smebu"),
+                ("center_bias", self.center_bias),
+                ("num_groups", self.num_groups > 1),
+            )
+            if on
+        ]
+        if refused:
+            raise ValueError(
+                f"num_zero_experts with {', '.join(refused)}: the zero experts' bias "
+                "stays 0, which centering would move, and they are in no group"
+            )
+        return self
+
+    @property
+    def ffn_budget(self) -> float:
+        """`ffn_experts_per_token`, or its default: the FFN experts' share of the
+        top-k, ``top_k`` without zero experts."""
+        if self.ffn_experts_per_token is not None:
+            return self.ffn_experts_per_token
+        n = self.num_experts
+        return self.top_k * n / (n + self.num_zero_experts)
 
     @model_validator(mode="after")
     def _groups(self) -> Self:
         """Check that the experts split into groups that hold the top-k."""
         n, groups, picked = self.num_experts, self.num_groups, self.top_k_groups
-        if n % groups or picked > groups or self.top_k > picked * (n // groups):
+        scored = n + self.num_zero_experts  # in one group, with zero experts
+        if n % groups or picked > groups or self.top_k > picked * (scored // groups):
             raise ValueError(
                 f"{groups} groups of {n} experts, {picked} of them picked, cannot hold "
                 f"the top {self.top_k}"
