@@ -7,6 +7,12 @@ attention heads (``num_attention_heads``, ``num_key_value_heads``, ``head_dim``)
 they are its first attention layer's. ``layer_types`` lists the kind of state of each
 call that keeps one, in the order they run, which tells vLLM whether the model is a
 hybrid of attention and recurrent layers.
+
+A model whose attention is ``mla`` also carries the latent's dims, as DeepSeek's
+configs do (`LATENT`): vLLM reads them to size the latent KV cache, pick its MLA
+backends and check them (`bux_vllm.arch` tells vLLM the model is MLA). They are one
+set for the model, so its ``mla`` layers must agree on them, and vLLM runs all of a
+model's softmax attention as MLA or none of it, so ``mla`` and ``gqa`` do not mix.
 """
 
 from __future__ import annotations
@@ -20,10 +26,24 @@ from .plan import live, plan
 #: The kind of state each stateful layer type keeps, as vLLM's ``layer_types``.
 STATES = {
     "gqa": "full_attention",
+    "mla": "full_attention",
     "mamba2": "mamba",
     "gdn": "linear_attention",
     "kda": "linear_attention",
 }
+
+#: The softmax attention layer types, whose first sets the heads vLLM reads.
+ATTENTION = ("gqa", "mla")
+
+#: The dims of an ``mla`` layer that vLLM reads from the config, as DeepSeek's name
+#: them: the query and key-value latents' widths, and each head's dims.
+LATENT = (
+    "q_lora_rank",
+    "kv_lora_rank",
+    "qk_nope_head_dim",
+    "qk_rope_head_dim",
+    "v_head_dim",
+)
 
 #: What ``config.json`` says of transformers' cache layers, which vLLM reads
 #: otherwise (a model-wide ``sliding_window`` would window every layer): the layers'
@@ -74,14 +94,46 @@ class BuxConfig(PreTrainedConfig):
 
     def _set_heads(self, layers: list[dict]) -> None:
         """Set the attention heads vLLM sizes the KV cache by, from the first
-        attention layer: none for a model without one."""
-        attn = next((n for n in layers if n["config"]["type"] == "gqa"), None)
-        if attn is None:
+        attention layer (none for a model without one), and an MLA's latent dims.
+
+        Raises:
+            NotImplementedError: The model mixes ``gqa`` and ``mla``, or its ``mla``
+                layers differ in their heads or dims.
+        """
+        attn = [n for n in layers if n["config"]["type"] in ATTENTION]
+        if len({n["config"]["type"] for n in attn}) > 1:
+            raise NotImplementedError("gqa beside mla not in vLLM: MLA is model-wide")
+        if not attn:
             self.num_attention_heads = self.num_key_value_heads = self.head_dim = 0
             return
-        c = attn["config"]
+        c = attn[0]["config"]
+        if c["type"] == "mla":
+            self._set_latent([n["config"] for n in attn])
+            return
         self.num_attention_heads, self.num_key_value_heads = (
             c["num_heads"],
             c["num_kv_heads"],
         )
-        self.head_dim = c["head_dim"] or attn["width"] // c["num_heads"]
+        self.head_dim = c["head_dim"] or attn[0]["width"] // c["num_heads"]
+
+    def _set_latent(self, attn: list[dict]) -> None:
+        """Set the heads and `LATENT` dims of the ``mla`` layers `attn`: every head
+        has keys and values of its own, as in DeepSeek's configs.
+
+        Raises:
+            NotImplementedError: They differ in their heads or dims.
+        """
+        dims = {tuple(c[n] for n in ("num_heads", *LATENT)) for c in attn}
+        if len(dims) > 1:
+            raise NotImplementedError("mla layers of different dims not in vLLM yet")
+        c = attn[0]
+        for name in LATENT:
+            setattr(self, name, c[name])
+        self.num_attention_heads = self.num_key_value_heads = c["num_heads"]
+        self.head_dim = c["qk_nope_head_dim"] + c["qk_rope_head_dim"]
+
+
+def latent(config: Any) -> bool:
+    """Whether vLLM runs the model of `config` as multi-head latent attention: its
+    attention is ``mla``, whose latent's dims `BuxConfig` sets."""
+    return getattr(config, "kv_lora_rank", None) is not None
