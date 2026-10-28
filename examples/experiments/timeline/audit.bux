@@ -1,0 +1,37 @@
+# The factorial's candidate (factorial.bux's r1v1k1f0p0s0: the late-2026 hybrid with
+# hyper-connections, the value residual and the key-value conv) against variants that
+# cost less to serve. hc costs the candidate a sixth of its sessions per GPU in vLLM,
+# and its gain on the 2021 reference shrinks at d1024, where AttnRes's holds. Each arm
+# keeps the value residual and the conv on the global layers and changes one thing:
+# the residual stream (every branch's, the MTP module's too), or the experts' count.
+# Arms: era, source, what it was claimed for.
+use m2026_hybrid
+use timeline_code
+use rungs
+
+# factorial.bux's vres(g_k, fr_experts): the first global layer's values mixed into
+# every later one's, and a causal conv of 4 taps on their keys and values.
+g_k   = fr_global(kv_conv_size=4)
+model = embed
+        fr_layer(hy_delta, fr_dense) fr_layer(hy_delta)^2 fr_layer(g_k(v=@v1))
+        (fr_layer(hy_delta)^3 fr_layer(g_k(v=$v1)))^(layers // 4 - 1)
+        fr_norm @h fr_out hy_mtp
+
+residual = # 2026 Kimi Attention Residuals, Kimi K3: a softmax over depth, 8 blocks of
+           # branches, in place of hc; quality (PreNorm dilution), one stream to serve
+           attnres_vk: attnres(block_size=layers // 4)
+         # 2025 Zhu et al. (hyper-connections): 2 copies of the stream, not 4, which
+         # their expansion ablation finds carry most of 4's gain; half the stream that
+         # every branch reads and writes
+         | hc2_vk:     hc(expansion=2)
+         # the candidate's own hc
+         | moe128_vk:  hc(expansion=4)
+
+fr_experts = attnres_vk: fr_experts | hc2_vk: fr_experts
+           # 2024 DeepSeek-V2/V3's 128 routed experts, 2025 Ludziejewski et al.
+           # (memory-efficient MoE): half the experts, each as wide, the same 7 a token;
+           # half the expert weights that a decoding step reads at an agent's batch
+           | moe128_vk: fr_experts(num_experts=128)
+
+# The hybrid's best at d512 (milestones.bux's scan), for every arm.
+optimizer.lr = 2e-3
