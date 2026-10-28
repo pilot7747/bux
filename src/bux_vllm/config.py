@@ -50,7 +50,9 @@ LATENT = (
 def states(c: dict) -> list[str]:
     """The kinds of state a call of the layer `c` keeps, in order: its type's
     (`STATES`), and a conv state after a ``gqa`` layer's KV cache under
-    ``kv_conv_size``; none for a layer that keeps none."""
+    ``kv_conv_size``, or an ``engram``'s conv's; none for a layer that keeps none."""
+    if c["type"] == "engram":
+        return ["conv"] if c["conv_size"] else []
     if c["type"] not in STATES:
         return []
     return [STATES[c["type"]], *(["conv"] if c.get("kv_conv_size") else [])]

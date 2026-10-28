@@ -30,13 +30,23 @@ from vllm.model_executor.models.interfaces import IsHybrid
 from vllm.sequence import IntermediateTensors
 from vllm.v1.kv_cache_interface import MambaSpec
 
-from . import conv, residual, ssm
+from . import conv, engram, residual, ssm
 from .common import Ctx, Layer, Site
 from .config import states
 from .plan import Call, Node, Plan, Pos, Scope, at, children, is_call, live, plan
 
 #: The modules of this package that hold layers.
-LAYER_MODULES = ("common", "basic", "attention", "mla", "moe", "ssm", "kda", "residual")
+LAYER_MODULES = (
+    "common",
+    "basic",
+    "attention",
+    "mla",
+    "moe",
+    "ssm",
+    "kda",
+    "residual",
+    "engram",
+)
 
 
 @cache
@@ -288,8 +298,12 @@ class BuxModel(Scoped):
         positions: torch.Tensor,
         intermediate_tensors: IntermediateTensors | None = None,
         inputs_embeds: torch.Tensor | None = None,
+        query_start_loc: torch.Tensor | None = None,
+        ngram_context: torch.Tensor | None = None,
     ) -> torch.Tensor:
         ctx = Ctx(positions, self.shared, inputs_embeds, self.plan)
+        ctx.input_ids, ctx.query_start_loc = input_ids, query_start_loc
+        ctx.ngram_context = ngram_context
         run(self, self.plan.top.root, (), input_ids, ctx, 0)
         assert ctx.hidden is not None, "the model ran no head"
         return ctx.hidden
@@ -304,11 +318,18 @@ class BuxForCausalLM(nn.Module, IsHybrid):
     """
 
     is_hybrid: ClassVar = True
+    requires_raw_input_tokens: ClassVar = True  # engram hashes them
 
     def __init__(self, *, vllm_config: VllmConfig, prefix: str = ""):
         super().__init__()
         self.config = vllm_config.model_config.hf_config
+        self.vllm_config = vllm_config
         self.model = BuxModel(vllm_config=vllm_config, prefix="model")
+
+    def get_model_state_cls(self) -> type:
+        """vLLM's model runner state for the model (V2's): its own, which also gives
+        an engram the ids before each step (`bux_vllm.engram.model_state`)."""
+        return engram.model_state(self.vllm_config)
 
     def embed_input_ids(self, input_ids: torch.Tensor) -> torch.Tensor:
         return self.model.embed_input_ids(input_ids)
@@ -321,7 +342,14 @@ class BuxForCausalLM(nn.Module, IsHybrid):
         inputs_embeds: torch.Tensor | None = None,
         **kwargs: Any,
     ) -> torch.Tensor:
-        return self.model(input_ids, positions, intermediate_tensors, inputs_embeds)
+        return self.model(
+            input_ids,
+            positions,
+            intermediate_tensors,
+            inputs_embeds,
+            kwargs.get("query_start_loc"),
+            kwargs.get("ngram_context"),
+        )
 
     def compute_logits(self, hidden_states: torch.Tensor) -> torch.Tensor | None:
         return self.model.layers_by_path[self.model.head_path].logits(hidden_states)
@@ -354,12 +382,13 @@ class BuxForCausalLM(nn.Module, IsHybrid):
     @classmethod
     def get_mamba_specs_from_config(cls, vllm_config: VllmConfig) -> tuple:
         """Every shape of state the model keeps in vLLM's Mamba cache, by which vLLM
-        sizes its pages: its recurrent layers', and its convs' on keys and values."""
+        sizes its pages: its recurrent layers', its convs' on keys and values, and
+        its engrams' convs'."""
         shapes = ssm.state_shapes(vllm_config)
         dtypes = ssm.state_dtypes(vllm_config) if shapes else ()
         specs = [MambaSpec(shapes=shapes, dtypes=dtypes, block_size=-1)]
         dtype = conv.state_dtype(vllm_config)
-        for shape in conv.state_shapes(vllm_config):
+        for shape in conv.state_shapes(vllm_config) + engram.state_shapes(vllm_config):
             specs.append(MambaSpec(shapes=shape, dtypes=dtype, block_size=-1))
         return tuple(specs)
 
