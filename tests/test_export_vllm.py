@@ -1317,9 +1317,9 @@ def test_each_layer_type_has_one_class() -> None:
     assert 'vars(value).get("bux_types"' in (FILES[0].parent / "model.py").read_text()
 
 
-def timeline(kind: str, d_model: int) -> str:
-    """The timeline's delta-rule mixer `kind` at `d_model`: q/k heads of 128, as
-    wide together as the stream, twice as many value heads, the gate bound at -5."""
+def wide_mixer(kind: str, d_model: int) -> str:
+    """A hybrid's delta-rule mixer `kind` at `d_model`: q/k heads of 128, as wide
+    together as the stream, twice as many value heads, the gate bound at -5."""
     heads = d_model // 128
     return (
         f"{kind}(num_heads={heads}, num_v_heads={2 * heads}, head_dim=128,"
@@ -1327,10 +1327,14 @@ def timeline(kind: str, d_model: int) -> str:
     )
 
 
-# The timeline's hybrids around their target (d_model 2816: KDA's projection 17068
-# wide unpadded), and shapes of odd widths.
+# Hybrids at widths whose fused projections are no multiple of 64 (d_model 2816:
+# KDA's projection 17068 wide unpadded), and shapes of odd widths.
 FUSED = {
-    **{f"{k} {d}": timeline(k, d) for k in ("kda", "gdn2") for d in (2816, 3584, 4096)},
+    **{
+        f"{k} {d}": wide_mixer(k, d)
+        for k in ("kda", "gdn2")
+        for d in (2816, 3584, 4096)
+    },
     "kda odd": "kda(num_heads=2, num_v_heads=6, head_dim=32)",
     "kda low rank": "kda(num_heads=4, num_v_heads=12, head_dim=16, output_gate_rank=8)",
     "gdn2 odd": "gdn2(num_heads=4, num_v_heads=12, head_dim=24, v_head_dim=8)",

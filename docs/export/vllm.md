@@ -369,8 +369,10 @@ parentheses is bux's own bfloat16 error, against the same reference:
 | `msa` | MSA's max-pooled blocks of 4, picks per group, plain dots, summed heads, the indexer's norm | 6.2e-6 | 3.5 (3.3) | 3.6 |
 | `msa-share` | MSA's picks shared through the `index` port | 8.1e-6 | 4.6 (4.7) | 4.7 |
 | `qsa` | QSA's mean-pooled blocks of 4, partial RoPE | 8.1e-6 | 4.4 (3.0), differs | - |
-| `csa` | compressed sparse attention: groups of 4, a window of 16, the indexer's top 8, sinks | 6.7e-6 | 2.0 (1.2) | - |
-| `csa-latent` | DeepSeek-V4.1's wiring of csa: a window-only layer and one compressing pairs, a query latent, a grouped low-rank output | 5.7e-6 | - | - |
+| `csa` | compressed sparse attention: groups of 4, a window of 16, the indexer's top 8, sinks | 6.7e-6 | 2.0 (1.2) | 0.62 |
+| `csa-latent` | DeepSeek-V4.1's wiring of csa: a window-only layer and one compressing pairs, a query latent, a grouped low-rank output | 6.2e-6 | 0.33 (0.88) | - |
+| `mla` | MLA with a latent of 256 and 32 rotated dims (Triton's MLA) | - | 0.10 (0.10) | 0.097 |
+| `mla-moe` | the same MLA beside a sigmoid MoE | - | 1.6 (0.093), differs | 1.4 |
 | `mla-deepseek` | MLA at DeepSeek-V3's dims (FlashInfer's), a query latent, interleaved YaRN, a gate per head, an output norm | - | 0.089 (0.14) | - |
 | `moe` | a softmax router, unnormalized top-2 of 8, a gated shared expert | 6.7e-6 | 0.68 (1.2) | - |
 | `moe-grouped` | a sigmoid router, 4 groups, the aux-free bias, a scaling of 2.5 | 8.6e-6 | 2.1 (3.8) | 1.8 |
@@ -381,7 +383,8 @@ parentheses is bux's own bfloat16 error, against the same reference:
 | `moe-norm` | Muse Spark's experts: each one's output normalized before its weight, in a latent of 32 | 9.1e-6 | 1.7 (2.1) | 2.0 |
 | `mamba2` | Mamba-2 of 16 heads in 2 groups, beside attention | 7.6e-6 | 0.078 (0.13) | 0.076 |
 | `gdn` | Gated DeltaNet of 2 q/k heads and 4 value heads, beside gated attention | - | 0.27 (0.23) | 0.28 |
-| `kda` | KDA of 2 q/k heads and 4 value heads, its gate's lower bound of -5 | - | - | 0.19 |
+| `kda` | KDA of 2 q/k heads and 4 value heads, its gate's lower bound of -5 | - | 0.13 (0.24) | 0.19 |
+| `kda-odd` | KDA of 2 q/k heads and 6 value heads at a width of 136, its fused projection no multiple of 64 wide, beside an MoE | - | 2.1 (2.5) | 2.1 |
 | `kda-kimi` | Kimi Linear's KDA: 4 heads, a low-rank output gate | - | 0.13 (0.43) | - |
 | `gdn2` | Gated DeltaNet-2 of 2 q/k heads and 4 value heads | 1.1e-5 | 0.15 (0.23) | 0.14 |
 | `gdn2-paper` | the paper's gdn2: low-rank gates, negative eigenvalues, a sigmoid output gate | 8.6e-6 | 0.12 (0.20) | - |
@@ -393,15 +396,17 @@ parentheses is bux's own bfloat16 error, against the same reference:
 | `mhc-single` | mhc, single-pass | 6.7e-6 | 0.081 (0.10) | - |
 | `gr` | `gr`'s residual algebra | 1.9e-6 | 0.018 (0.025) | - |
 | `vpgate` | `vpgate`'s residual algebra | 9.5e-6 | 0.072 (0.13) | - |
+| `engram` | Engram's memory between two blocks, a tied head | 1.4e-5 | 0.097 (0.11) | 0.074 |
 
 Every float32 run decoded bux's greedy tokens exactly. In bfloat16 an MoE's and a
 sparse layer's errors are large, and so are bux's own: where two experts' or two
 keys' scores are within bfloat16's rounding of each other, a token's picks change,
-and so does its output. Two cases differ: in bfloat16 `qsa` picks a token 3.5 below
-the best, past bux's own error of 3.0, and `moe-sink` at TP=2 one 1.8 below it, at
-bux's own 1.8. `gdn`, the `kda` cases and `mla-deepseek` run in bfloat16 only. A `-`
-marks a case not measured that way; `mla` and `mla-moe` (MLA with a latent of 256 and
-32 rotated dims, on Triton's MLA), `engram` and `kda` on one GPU did not run.
+and so does its output. Three cases differ: in bfloat16 `qsa` picks a token 3.5
+below the best, past bux's own error of 3.0; `moe-sink` at TP=2 one 1.8 below it, at
+bux's own 1.8; and `mla-moe` on one GPU is off by 1.6, where bux's own bfloat16 run
+is off by 0.093 (at TP=2, by 1.4 against bux's own 1.1).
+`gdn`, the `kda` and `mla` cases run in bfloat16 only. A `-` marks a case not
+measured that way.
 
 On the CPU, `tests/test_export_vllm.py` runs the plugin's sparse and compressed
 attention on paged caches of its own, prompts in chunks beside decoded tokens,
