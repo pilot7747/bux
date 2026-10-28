@@ -433,6 +433,50 @@ def check_plugin(decoding: bool) -> bool:
     return best and error < 2e-2 and error8 < 0.25
 
 
+def check_repeats(times: int = 5) -> bool:
+    """Whether the native prompt path picks the same keys on every run of the same
+    inputs, and DeepGEMM's logits are the same and PyTorch's where queries see
+    keys: where not, how many rows differ, to tell a race from a tie."""
+    from vllm.utils import deep_gemm
+
+    from bux_vllm import dsa
+
+    torch.manual_seed(0)
+    heads, dims, top_k, n = 4, 64, 64, 700
+    cache, _, table = plugin_case([n], dims, 2)
+    region = dsa.Region(cache, 2, dims)
+    positions = torch.arange(n, device="cuda")
+    iq = torch.randn(n, heads, dims, device="cuda", dtype=torch.bfloat16)
+    iw = torch.randn(n, heads, device="cuda")
+    index = dsa.queries(iq, iw, dsa.padded_heads(heads))
+    runs = [
+        dsa.prompt(region, index, table[:1], n, positions + 1, top_k)
+        for _ in range(times)
+    ]
+    rows = sum(
+        int((r.sort(-1).values != runs[0].sort(-1).values).any(-1).sum()) for r in runs
+    )
+    keys = region.dequantized(table[:1], n)
+    k8, sf = dsa.quantized(keys)  # its own rounding again: exact on FP8 values
+    start = torch.zeros(n, dtype=torch.int32, device="cuda")
+    end = (positions + 1).int()
+    logits = [
+        deep_gemm.fp8_fp4_mqa_logits(index, (k8, sf), index[1], start, end, False)[
+            :, :n
+        ]
+        for _ in range(2)
+    ]
+    see = torch.arange(n, device="cuda") <= positions[:, None]
+    want = reference(index[0].float(), index[1], k8.float() * sf[:, None])
+    apart = (logits[0] - logits[1]).abs().masked_fill(~see, 0).max().item()
+    error = (logits[0] - want).abs().masked_fill(~see, 0).max().item()
+    print(
+        f"repeats: {rows} rows of {times} runs' picks apart; logits apart {apart:.1e}, "
+        f"from PyTorch's {error:.1e} (largest {want.abs().max().item():.1e})"
+    )
+    return rows == 0 and apart == 0
+
+
 def check_qsa(decoding: bool) -> bool:
     """QSA on the plugin's native path: blocks of 4 pooled into the FP8 keys by
     `bux_vllm.dsa.pooled` as each completes, picked by the kernels, against the
@@ -627,6 +671,7 @@ def main() -> int:
             lambda h=heads, d=dims, k=top_k: check_decode(h, d, k, [20000] * 64, 32768),
         )
     attempt("triton", lambda: time_triton(4, 64, 2048, 16384, 64, 20000, 32768))
+    results.append(attempt("repeats", check_repeats))
     for decoding in (False, True):
         results.append(attempt("plugin", lambda d=decoding: check_plugin(d)))
         results.append(attempt("plugin qsa", lambda d=decoding: check_qsa(d)))
