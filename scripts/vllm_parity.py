@@ -8,7 +8,7 @@ three steps:
     JAX_PLATFORMS=cpu python scripts/vllm_parity.py export DIR [--dtype bfloat16]
     # vLLM's, with the plugin (pip install src/bux_vllm): decode them
     python scripts/vllm_parity.py run DIR [--tp 2] [--eager] [--moe-backend triton]
-        [--mamba-ssm-cache-dtype float32] [--tag TAG]
+        [--mamba-ssm-cache-dtype float32] [--attention-backend TRITON_MLA] [--tag TAG]
     # bux's again: compare
     JAX_PLATFORMS=cpu python scripts/vllm_parity.py compare DIR [--tag TAG]
 
@@ -58,6 +58,17 @@ GATED_HEAD = (
 LINEAR_HYBRID = (
     "model = embed [rmsnorm delta] [rmsnorm ffn] [rmsnorm delta] [rmsnorm ffn]"
     " [rmsnorm attn] [rmsnorm ffn] rmsnorm head"
+)
+#: MLA with a latent of 256 and 32 rotated dims, on 4 heads.
+LATENT = (
+    "attn = mla(num_heads=4, kv_lora_rank=256, qk_nope_head_dim=64,"
+    " qk_rope_head_dim=32, v_head_dim=64, rope=rope())\n"
+)
+#: DeepSeek-V3's MLA, its dims and RoPE, on 4 heads and a query latent of 64.
+DEEPSEEK = (
+    "attn = mla(num_heads=4, q_lora_rank=64, kv_lora_rank=512, rope=rope("
+    "layout=interleaved, scaling=yarn(factor=4, original_max_len=16,"
+    " attention_factor_on=softmax)))\n"
 )
 
 #: The cases, by name: a model each, as bux source.
@@ -186,6 +197,21 @@ CASES = {
     + "one = attn(value_residual=convex)\n"
     + "model = embed [rmsnorm attn(v=@v1)] [rmsnorm ffn] [rmsnorm attn(v=$v1)]"
     " [rmsnorm both(v=$v1)] [rmsnorm ffn] [rmsnorm one(v=$v1!)] rmsnorm head",
+    "mla": HEAD + LATENT + FFN + BLOCK + "model = embed block^2 rmsnorm head",
+    "mla-moe": HEAD
+    + LATENT
+    + FFN
+    + EXPERT
+    + "experts = moe(num_experts=8, top_k=2, num_shared_experts=1, router=sigmoid,"
+    " routed_scaling_factor=2.5, load_balancing=aux_free, expert=dense)\n"
+    + "model = embed [rmsnorm attn] [rmsnorm ffn] [rmsnorm attn] [rmsnorm experts]"
+    " rmsnorm head",
+    "mla-deepseek": HEAD
+    + DEEPSEEK
+    + "gated = attn(gated=true, gate_per_head=true, output_norm=rmsnorm)\n"
+    + FFN
+    + "model = embed [rmsnorm attn] [rmsnorm ffn] [rmsnorm gated] [rmsnorm ffn]"
+    " rmsnorm head",
 }
 
 LENGTHS = (3, 17, 40, 64)  # the prompts', in one batch: within and past a window
@@ -208,6 +234,7 @@ def main() -> None:
         sub.choices[name].add_argument("--eager", action="store_true")
         sub.choices[name].add_argument("--moe-backend", default="auto")
         sub.choices[name].add_argument("--mamba-ssm-cache-dtype", default="auto")
+        sub.choices[name].add_argument("--attention-backend", default=None)
     sub.choices["compare"].add_argument("--tolerance", type=float, default=1e-3)
     sub.choices["compare"].add_argument("--margin", type=float, default=0.0)
     args = p.parse_args()
@@ -343,6 +370,8 @@ def run_alone(args: argparse.Namespace, name: str) -> None:
     cmd = [sys.executable, __file__, "run-one", str(args.dir), "--only", name]
     cmd += ["--tag", args.tag, "--tp", str(args.tp), "--moe-backend", args.moe_backend]
     cmd += ["--mamba-ssm-cache-dtype", args.mamba_ssm_cache_dtype]
+    if args.attention_backend is not None:
+        cmd += ["--attention-backend", args.attention_backend]
     subprocess.run(cmd + ["--eager"] * args.eager, check=False)
 
 
@@ -353,6 +382,7 @@ def engine(args: argparse.Namespace) -> dict:
         "enforce_eager": args.eager,
         "moe_backend": args.moe_backend,
         "mamba_ssm_cache_dtype": args.mamba_ssm_cache_dtype,
+        "attention_backend": args.attention_backend,
     }
 
 

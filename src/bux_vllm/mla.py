@@ -1,0 +1,233 @@
+"""Multi-head latent attention in vLLM: bux's ``mla`` by vLLM's own MLA layer
+(``MLAAttention``), its latent KV cache and its MLA backends.
+
+vLLM caches what bux's MLA projects keys and values up from: each token's normalized
+``kv_lora_rank`` latent and the ``qk_rope_head_dim`` key dims all heads share,
+rotated, as one head of ``kv_lora_rank + qk_rope_head_dim``. It attends to a
+prompt's new tokens with the keys and values projected up by ``kv_b`` (its MLA
+prefill backend), and decodes in the latent space, with ``kv_b``'s halves absorbed
+into the queries and the output (its MLA decode backend), as DeepSeek's MLA runs in
+vLLM. The layer computes the rest as bux does: the query (from the input, or from
+its normalized latent), the latents' norms and RoPE in float32, by bux's
+frequencies, the scale, and the norm and gate of the heads' outputs.
+
+vLLM picks the backends by the model's MLA dims, which it reads from the config
+(`bux_vllm.config`, `bux_vllm.arch`), and the GPU. Its MLA prefill backends take a
+few dims alone (DeepSeek's, among them); for other dims the layer attends to new
+tokens by FlashAttention's prefill, which takes any.
+"""
+
+from __future__ import annotations
+
+from typing import Any
+
+import torch
+from torch import nn
+from vllm.distributed import get_tensor_model_parallel_world_size
+from vllm.model_executor.layers.attention import MLAAttention
+from vllm.model_executor.layers.linear import (
+    ColumnParallelLinear,
+    MergedColumnParallelLinear,
+    ReplicatedLinear,
+    RowParallelLinear,
+)
+from vllm.v1.attention.backends.mla.prefill.flash_attn import FlashAttnPrefillBackend
+from vllm.v1.attention.backends.mla.prefill.selector import get_mla_prefill_backend
+
+from .common import ACTIVATIONS, Ctx, Layer, Norm, Rope, Site, logit_gain, unsupported
+from .config import LATENT
+
+#: The norm of MLA's latents: bux's default ``rmsnorm``.
+LATENT_NORM = {
+    "type": "rmsnorm",
+    "eps": 1e-6,
+    "affine": True,
+    "bias": False,
+    "zero_centered": False,
+    "scale_input": False,
+}
+
+
+def check(c: dict, site: Site) -> None:
+    """Raise for what vLLM's MLA does not run, or the model's config does not say.
+
+    Raises:
+        NotImplementedError: A setting that needs the keys projected up while
+            decoding (QK-norm), or that vLLM's MLA backends do not take (a window,
+            soft-capping, sinks, a relative bias, a length scale, an indexer, the
+            gate's head bias, ports); dims other than the config's; a dtype other
+            than bfloat16 or float16; or vLLM not running the model as MLA.
+    """
+    unsupported(c, "qk_norm", "sliding_window_size", "softcap", "sinks")
+    unsupported(c, "relative_bias", "log_scale", "indexer", "gate_head_bias")
+    if site.ports:
+        raise NotImplementedError("mla: ports not in vLLM yet")
+    if any(c[n] != getattr(site.config, n, None) for n in LATENT):
+        raise NotImplementedError("mla: dims other than the config's not in vLLM")
+    model = site.vllm_config.model_config
+    if model.dtype not in (torch.bfloat16, torch.float16):
+        raise NotImplementedError(f"mla in {model.dtype}: vLLM's MLA takes 16 bits")
+    if not model.use_mla:
+        raise NotImplementedError("mla: vLLM runs the model without MLA")
+
+
+def prefill_backend(vllm_config: Any) -> type | None:
+    """The MLA prefill backend for the model's dims: None, vLLM's own pick, where it
+    has one; FlashAttention's otherwise.
+
+    Raises:
+        ValueError: The engine's config names a prefill backend that does not take
+            the dims.
+    """
+    try:
+        get_mla_prefill_backend(vllm_config)
+    except ValueError:
+        if vllm_config.attention_config.mla_prefill_backend is not None:
+            raise
+        return FlashAttnPrefillBackend
+    return None
+
+
+class LatentAttention(Layer):
+    """bux's ``mla``: queries from the input or a normalized latent, keys and values
+    from a normalized latent, by vLLM's MLA attention and its latent cache, then
+    each head's output norm and gate, and the row-parallel output projection.
+
+    The heads split over tensor-parallel ranks; the latents are every rank's. Each
+    call keeps a cache of its own, over the same weights.
+    """
+
+    bux_types = ("mla",)
+    stateful = True
+
+    def __init__(self, c: dict, width: int, site: Site):
+        super().__init__()
+        check(c, site)
+        tp = get_tensor_model_parallel_world_size()
+        h, n, r = c["num_heads"], c["qk_nope_head_dim"], c["qk_rope_head_dim"]
+        dv, rank, latent = c["v_head_dim"], c["kv_lora_rank"], c["q_lora_rank"]
+        self.path, self.h, self.n, self.r, self.dv = site.path, h // tp, n, r, dv
+        self.rank, self.latent = rank, latent
+        self._down(width, site.path)
+        self.q = ColumnParallelLinear(
+            latent or width,
+            h * (n + r),
+            bias=False,
+            return_bias=False,
+            prefix=f"{site.path}.q",
+        )
+        # It returns its bias too, as vLLM's MLA calls it.
+        self.kv_b = ColumnParallelLinear(
+            rank, h * (n + dv), bias=False, prefix=f"{site.path}.kv_b"
+        )
+        self.o = RowParallelLinear(
+            h * dv, width, bias=False, return_bias=False, prefix=f"{site.path}.o"
+        )
+        self.q_a_norm = Norm(LATENT_NORM, latent) if latent else None
+        self.kv_a_norm = Norm(LATENT_NORM, rank)
+        self.rope = Rope(c["rope"], r) if c["rope"] else None
+        self._gate(c, width, h * dv, site.path)
+        self.out_norm = Norm(c["output_norm"], dv) if c["output_norm"] else None
+        self.caches = nn.ModuleList(self._cache(c, name, site) for name in site.caches)
+
+    def _down(self, width: int, path: str) -> None:
+        """Make the down projections, every rank's: the query latent's and the key
+        and value latent's by one GEMM where there is a query latent."""
+        self.qkv_a = self.kv_a = None
+        out = self.rank + self.r
+        if self.latent:
+            self.qkv_a = MergedColumnParallelLinear(
+                width,
+                [self.latent, out],
+                bias=False,
+                return_bias=False,
+                disable_tp=True,
+                prefix=f"{path}.qkv_a",
+            )
+        else:
+            self.kv_a = ReplicatedLinear(
+                width, out, bias=False, return_bias=False, prefix=f"{path}.kv_a"
+            )
+
+    def _gate(self, c: dict, width: int, heads_dv: int, path: str) -> None:
+        """Make the gate on the heads' outputs, ``act(W_g x)``, a value a channel or
+        a head (``gate_per_head``), column-parallel by head; None without one."""
+        self.gate = None
+        self.gate_activation = ACTIVATIONS[c["gate_activation"]]
+        if c["gated"]:
+            n = c["num_heads"] if c["gate_per_head"] else heads_dv
+            self.gate = ColumnParallelLinear(
+                width, n, bias=False, return_bias=False, prefix=f"{path}.gate"
+            )
+
+    def _cache(self, c: dict, name: str, site: Site) -> MLAAttention:
+        """vLLM's MLA attention of one call, its latent cache named `name`."""
+        scale = (c["scale"] or (self.n + self.r) ** -0.5) * logit_gain(c["rope"])
+        return MLAAttention(
+            num_heads=self.h,
+            scale=scale,
+            qk_nope_head_dim=self.n,
+            qk_rope_head_dim=self.r,
+            v_head_dim=self.dv,
+            q_lora_rank=self.latent,
+            kv_lora_rank=self.rank,
+            kv_b_proj=self.kv_b,
+            cache_config=site.vllm_config.cache_config,
+            prefix=name,
+            prefill_backend_cls=prefill_backend(site.vllm_config),
+        )
+
+    def targets(self) -> dict[str, tuple[nn.Parameter, tuple]]:
+        out: dict[str, tuple[nn.Parameter, tuple]] = {}
+        if self.qkv_a is not None:
+            out["q_a.weight"] = (self.qkv_a.weight, (0,))
+            out["kv_a.weight"] = (self.qkv_a.weight, (1,))
+        if self.kv_a is not None:
+            out["kv_a.weight"] = (self.kv_a.weight, ())
+        for name in ("q", "kv_b", "o", "gate"):
+            if (layer := getattr(self, name)) is not None:
+                out[f"{name}.weight"] = (layer.weight, ())
+        for name in ("q_a_norm", "kv_a_norm", "out_norm"):
+            if (norm := getattr(self, name)) is not None:
+                out |= {f"{name}.{k}": v for k, v in norm.targets().items()}
+        return out
+
+    def forward(self, x: torch.Tensor, ctx: Ctx) -> torch.Tensor:
+        t = x.shape[0]
+        query, kv = self._latents(x)
+        kv_c, k_pe = kv.split([self.rank, self.r], -1)
+        q = self.q(query).view(t, self.h, self.n + self.r)
+        q, k_pe = self._rotate(q, k_pe[:, None], ctx)
+        attend = self.caches[ctx.call(self.path)]
+        out = attend(q, self.kv_a_norm(kv_c), k_pe, output_shape=(t, self.h * self.dv))
+        out = self._gated(x, out.view(t, self.h, self.dv))
+        return self.o(out.reshape(t, -1))
+
+    def _latents(self, x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        """What the queries come from (the normalized query latent, or x), and the
+        key and value latent with the shared key dims, (T, kv_lora_rank + r)."""
+        if self.kv_a is not None:
+            return x, self.kv_a(x)
+        assert self.qkv_a is not None and self.q_a_norm is not None
+        q_c, kv = self.qkv_a(x).split([self.latent, self.rank + self.r], -1)
+        return self.q_a_norm(q_c), kv
+
+    def _rotate(
+        self, q: torch.Tensor, k_pe: torch.Tensor, ctx: Ctx
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Rotate the queries' last r dims, (T, h, n + r), and the shared key dims,
+        (T, 1, r), by the positions."""
+        if self.rope is None:
+            return q, k_pe
+        q_pe = self.rope(q[..., self.n :], ctx.positions)
+        q = torch.cat([q[..., : self.n], q_pe], -1)
+        return q, self.rope(k_pe, ctx.positions)
+
+    def _gated(self, x: torch.Tensor, out: torch.Tensor) -> torch.Tensor:
+        """The heads' outputs, (T, h, dv), normalized and gated."""
+        if self.out_norm is not None:
+            out = self.out_norm(out)
+        if self.gate is None:
+            return out
+        gate = self.gate_activation(self.gate(x))
+        return out * gate.view(out.shape[0], self.h, -1)
