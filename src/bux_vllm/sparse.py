@@ -304,7 +304,7 @@ def _kernels(cache: PagedCache) -> bool:
     """Whether the Triton kernels attend over the call's `cache` (`bux_vllm.kernels`)."""
     assert cache.sparse is not None
     dims = (cache.sparse.dk, cache.channels - cache.sparse.dk)
-    return kernels.takes(cache.sparse, dims)
+    return kernels.takes(cache.sparse, dims, cache.kv_cache.dtype)
 
 
 def _segments(cache: PagedCache) -> Any:

@@ -3,7 +3,8 @@ vLLM's paged caches in place where the PyTorch path (`bux_vllm.picks`) gathers t
 keys into memory first: the indexer's score of every key of each query's request
 (`scores`), and each query's softmax over the keys it picked (`attend`), in float32.
 
-They run under ``BUX_VLLM_SPARSE_KERNELS=triton``, for the settings they take
+They run by default in a 16-bit model, and under ``BUX_VLLM_SPARSE_KERNELS=triton``
+in any (``torch`` keeps the PyTorch path), for the settings they take
 (`takes`): DSA's single keys, MSA's blocks and picks per group, QSA's blocks (its
 scores PyTorch's), weighted or summed heads, keys and values of up to 256 dims, not
 MLA's latents. A prompt's queries, which share their keys, score them by PyTorch's
@@ -23,15 +24,20 @@ import triton.language as tl
 from . import picks
 from .picks import Picked, Sparse
 
-#: Whether the sparse ops run these kernels, read once.
-ENABLED = os.environ.get("BUX_VLLM_SPARSE_KERNELS", "torch") == "triton"
+#: Which path the sparse ops take: ``triton``, ``torch``, or unset for the kernels
+#: in 16-bit models alone; read once.
+CHOICE = os.environ.get("BUX_VLLM_SPARSE_KERNELS")
 MOST_DIMS = 256  # the widest key or value head the kernels take
 
 
-def takes(spec: Sparse, dims: tuple[int, int]) -> bool:
+def takes(spec: Sparse, dims: tuple[int, int], dtype: torch.dtype) -> bool:
     """Whether the kernels compute the layer of `spec`, its key and value heads of
-    `dims`: not MLA's latents."""
-    return ENABLED and max(dims) <= MOST_DIMS and not spec.latent
+    `dims` in a cache of `dtype`: not MLA's latents, and by `CHOICE`."""
+    if CHOICE is None:
+        on = dtype in (torch.bfloat16, torch.float16)
+    else:
+        on = CHOICE == "triton"
+    return on and max(dims) <= MOST_DIMS and not spec.latent
 
 
 def _block(n: int) -> int:
