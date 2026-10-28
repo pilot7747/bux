@@ -4,8 +4,8 @@ Hands-on walkthroughs, from a first `.bux` file to a scaling study on a node of 
 Each is a short sequence of numbered steps. Every command was run as written, and its
 output is pasted from that run, trimmed where it repeats.
 
-The first eight run on a laptop's CPU, each in a few minutes. The last needs a node
-of 8 GPUs. Do them in order the first time: later tutorials reuse the files that
+The first eight run on a laptop's CPU, each in a few minutes. The last two need
+nodes of 8 GPUs. Do them in order the first time: later tutorials reuse the files that
 earlier ones create.
 
 | tutorial | what you do |
@@ -19,6 +19,7 @@ earlier ones create.
 | [Custom training](custom-training.md) | Swap an optimizer, add a hook, a sink and a loss term, and drive a `Trainer` from Python. |
 | [Scale out](scale-out.md) | Split one run six ways over fake CPU devices, then see what changes on GPU nodes. |
 | [Old against new at the same serving cost](old-vs-new.md) | Compare a 2022 7B with a 2026 hybrid MoE that serves as fast, by tuned scaling ladders. Needs 8 GPUs. |
+| [2020 to 2026, one change at a time](timeline.md) | Measure what each architecture change since GPT-3 is worth at equal serving cost, with unlimited data and with limited data. Needs nodes of 8 GPUs. |
 
 ## Before you start
 
@@ -55,4 +56,5 @@ add-a-layer
 custom-training
 scale-out
 old-vs-new
+timeline
 ```

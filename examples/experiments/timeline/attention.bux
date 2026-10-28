@@ -1,6 +1,7 @@
-# Attention, one change at a time from the 2021 reference (gpt3_rope.bux: the 2020 baseline with RoPE)'s multi-head attention: as many
-# key and value heads as query heads of 64, biases, and learned absolute positions, which
-# every arm keeps (gpt3_2020.bux). Arms: era, source, what it was claimed for.
+# Attention, one change at a time from the 2021 reference, GPT-3's decoder with RoPE
+# (gpt3_rope.bux). Its attention is multi-head: as many key and value heads as query
+# heads of 64, with biases. Every arm keeps RoPE. Arms: era, source, what it was
+# claimed for.
 use gpt3_rope
 use timeline_code
 use rungs

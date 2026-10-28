@@ -308,7 +308,9 @@ What to know:
 
 ## Next steps
 
-- [Old against new at the same serving cost](old-vs-new.md): the advanced tutorial,
-  which puts the earlier ones together on a node of 8 GPUs.
+- [Old against new at the same serving cost](old-vs-new.md): the first advanced
+  tutorial, which puts the earlier ones together on a node of 8 GPUs.
+- [2020 to 2026, one change at a time](timeline.md): the second, which builds on the
+  first to measure each architecture change since GPT-3, on nodes of 8 GPUs.
 - [Parallelism](../parallelism/index.md): each method in depth.
 - [Performance](../performance/index.md): how to make a run fast.

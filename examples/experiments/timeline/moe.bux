@@ -1,9 +1,9 @@
-# Mixtures of experts in place of the MLP, one change at a time from the 2021 reference (gpt3_rope.bux: the 2020 baseline with RoPE)'s
-# GELU MLP 4 times as wide as the stream (gpt3_2020.bux), each at as many active
-# parameters: every token goes through 4 * d_model of expert width (8 * d_model^2
-# parameters), the latent arm's projections counted in it. The experts are the
-# baseline's MLP, narrower; only the routing and the split change. Arms: era, source,
-# what it was claimed for.
+# Mixtures of experts in place of the MLP, one change at a time from the 2021
+# reference, GPT-3's decoder with RoPE (gpt3_rope.bux). Its MLP is 4 times as wide
+# as the stream, with GELU. Every arm has as many active parameters: each token goes
+# through 4 * d_model of expert width (8 * d_model^2 parameters), the latent arm's
+# projections counted in it. The experts are the reference's MLP, narrower, so only
+# the routing and the split change. Arms: era, source, what it was claimed for.
 use gpt3_rope
 use timeline_code
 use rungs
@@ -23,8 +23,8 @@ ffn = base:       ffn
     # specialization
     | moe_fine:   moe(num_experts=64, top_k=7, num_shared_experts=1,
                       expert=expert(d_model // 2))
-    # 2024 DeepSeek-V3: 128 experts, sigmoid routing, balanced by a bias (aux-loss-free);
-    # balance without the loss's cost in quality
+    # 2024 DeepSeek-V3: 128 experts, sigmoid routing, balanced by a bias
+    # (aux-loss-free); balance without the loss's cost in quality
     | moe_dsv3:   dsv3
     # 2026 Nemotron 3, Kimi K3, Muse Spark (LatentMoE): routed experts in a d_model / 2
     # latent, twice as many of them, as many parameters; quality per FLOP

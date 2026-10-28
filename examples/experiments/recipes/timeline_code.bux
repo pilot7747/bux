@@ -5,13 +5,16 @@
 #   use timeline_code
 #   use rungs
 #
-# It is agentic_code's (docs/tutorials/old-vs-new.md): code files, whole repositories
-# and web text in rows of 2k, then the last tenth in rows of 16k, half of them whole
-# repositories. Two things differ. The long phase switches full-attention RoPE to YaRN,
-# 8 times the 2k it trained at. The repository eval also logs bits per byte by each
-# token's position in its document (repo_bpb_0, _2k, _8k): how much the long context
-# helps. An ablation of the extension itself replaces curriculum with long_phase (no
-# YaRN), or with long_phase(rope_base=...) (Llama 3's ABF).
+# Its data are agentic_code's (docs/tutorials/old-vs-new.md): code files and web text
+# in rows of 2k, then the last tenth in rows of 16k, half of them whole repositories.
+# Five things differ. The learning rate is 2e-3, not 3e-3, a default that each
+# variant's scan replaces. The long phase switches full-attention RoPE to YaRN, 8
+# times the 2k it trained at. An ablation of the extension itself replaces curriculum
+# with long_phase (no YaRN), or with long_phase(rope_base=...) (Llama 3's ABF). The
+# repository eval also logs bits per byte by each token's position in its document
+# (repo_bpb_0, _2k, _8k): how much the long context helps. Every 500 steps, observe
+# logs the model's stream, attention logits and gradients. Every run logs to the W&B
+# project bux-timeline.
 tokenizer  = tokenizer(name="EleutherAI/gpt-neox-20b")
 web        = text(path="data/fineweb-edu/sample/10BT/*.parquet")
 code       = text(path="data/stack-edu/files/train/*.parquet")

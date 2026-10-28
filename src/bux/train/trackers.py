@@ -131,7 +131,9 @@ def _run_id(path: Path, start: int) -> str:
     from now on. (wandb 0.31 no longer has ``wandb.util.generate_id``.)"""
     if start and path.exists():
         return path.read_text(encoding="utf-8").strip()
-    made = "".join(secrets.choice(string.ascii_lowercase + string.digits) for _ in range(8))
+    made = "".join(
+        secrets.choice(string.ascii_lowercase + string.digits) for _ in range(8)
+    )
     path.write_text(made + "\n", encoding="utf-8")
     return made
 

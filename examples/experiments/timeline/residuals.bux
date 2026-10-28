@@ -1,6 +1,7 @@
-# The residual stream, one change at a time from the 2021 reference (gpt3_rope.bux: the 2020 baseline with RoPE)'s plain sum,
-# x + f(x) (gpt3_2020.bux): residual algebras that widen it, mix it or weigh it, each
-# set for every branch of the model. Arms: era, source, what it was claimed for.
+# The residual stream, one change at a time from the 2021 reference, GPT-3's decoder
+# with RoPE (gpt3_rope.bux). Its stream is a plain sum, x + f(x). Each arm is a
+# residual algebra that widens, mixes or weighs it, set for every branch of the
+# model. Arms: era, source, what it was claimed for.
 use gpt3_rope
 use timeline_code
 use rungs
@@ -9,8 +10,8 @@ residual = base: none
          # 2025 Zhu et al. (hyper-connections): 4 copies of the stream, learned reads,
          # writes and mixing; quality
          | hc: hc(expansion=4)
-         # 2026 DeepSeek mHC, DeepSeek-V4.1, GLM-5.3-Flash: the mixing doubly stochastic;
-         # stability at scale
+         # 2026 DeepSeek mHC, DeepSeek-V4.1, GLM-5.3-Flash: the mixing doubly
+         # stochastic; stability at scale
          | mhc: mhc(expansion=4)
          # 2026 Kimi Attention Residuals, Kimi K3: a softmax over depth, 8 blocks of
          # branches; quality (PreNorm dilution)

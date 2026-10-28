@@ -1,9 +1,9 @@
-# Hybrids: three layers of every four with a linear-time token mixer in place of
-# attention, the fourth the baseline's attention, every MLP the baseline's
-# (gpt3_2020.bux). The learned positions give way to RoPE (base 10k) in the attention
-# layers, so each hybrid is one change from positions.bux's `rope` arm. The delta-rule
-# mixers have query and key heads of 128 as wide together as the stream, and twice as
-# many value heads (Qwen3-Next's shape). Arms: era, source, what it was claimed for.
+# Hybrids, one change at a time from the 2021 reference, GPT-3's decoder with RoPE
+# (gpt3_rope.bux). In three layers of every four, a linear-time token mixer takes
+# the place of attention. The fourth keeps the reference's attention, with RoPE, and
+# every MLP is the reference's. The delta-rule mixers have query and key heads of 128,
+# as wide together as the stream, and twice as many value heads (Qwen3-Next's shape).
+# Arms: era, source, what it was claimed for.
 use gpt3_rope
 use timeline_code
 use rungs
@@ -13,18 +13,19 @@ hybrid(m) = embed (layer(m)^3 layer(attn(rope=rope())))^(layers // 4) norm head(
 heads     = d_model // 128
 
 model = base:   model
-      # 2024 Mamba-2 (SSD), Jamba, 2025 Nemotron-H, 2026 Nemotron 3: a state-space model;
-      # throughput, KV cache
+      # 2024 Mamba-2 (SSD), Jamba, 2025 Nemotron-H, 2026 Nemotron 3: a state-space
+      # model; throughput, KV cache
       | mamba2: hybrid(mamba2(state_size=128, head_dim=64))
       # 2025 Gated DeltaNet, Qwen3-Next, 2026 Qwen3.8: the delta rule, a decay per head;
       # long context, KV cache
       | gdn:    hybrid(gdn(num_heads=heads, num_v_heads=2 * heads, head_dim=128))
-      # 2025 Kimi Linear, 2026 Kimi K3, GLM-5.3-Flash: a decay per channel, bounded at -5
-      # as K3's; long context, KV cache
+      # 2025 Kimi Linear, 2026 Kimi K3, GLM-5.3-Flash: a decay per channel, bounded
+      # at -5 as K3's; long context, KV cache
       | kda:    hybrid(kda(num_heads=heads, num_v_heads=2 * heads, head_dim=128,
                            gate_lower_bound=-5))
       # 2026 Gated DeltaNet-2: erase and write gates of their own, bounded at -5; recall
       | gdn2:   hybrid(gdn2(num_heads=heads, num_v_heads=2 * heads, head_dim=128,
                             gate_lower_bound=-5))
-      # 2025 RWKV-7 Goose: a generalized delta rule, heads of 64; throughput, state tracking
+      # 2025 RWKV-7 Goose: a generalized delta rule, heads of 64; throughput, state
+      # tracking
       | rwkv7:  hybrid(rwkv7(num_heads=d_model // 64, head_dim=64))

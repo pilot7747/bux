@@ -1,5 +1,7 @@
-# The 2020 baseline of the timeline ablations at every rung: the run every
-# one-change variant is compared with. The axis files' `base` arms are this run.
+# The 2020 baseline of the timeline ablations (gpt3_2020.bux) at every rung. The
+# arms of positions.bux and the milestones are measured from it: it is the same run
+# as positions.bux's `base` and milestones.bux's `m2020_gpt3`. The other axis files
+# start from the 2021 reference, gpt3_rope.bux.
 use gpt3_2020
 use timeline_code
 use rungs

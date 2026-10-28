@@ -1,10 +1,12 @@
 # The embedding, the head and what reads the tokens beside them, one change at a time
-# from the 2021 reference (gpt3_rope.bux: the 2020 baseline with RoPE): a table tied to the head, and learned positions
-# (gpt3_2020.bux). Arms: era, source, what it was claimed for.
+# from the 2021 reference, GPT-3's decoder with RoPE (gpt3_rope.bux). Its embedding is
+# a table of tokens tied to the head, and RoPE gives the positions. Arms: era, source,
+# what it was claimed for.
 use gpt3_rope
 use timeline_code
 use rungs
 
+# The plain embedding, a table of tokens alone: the reference learns no positions.
 pos = embed
 
 # MTP: a module that predicts the token after next from the last hidden state and the

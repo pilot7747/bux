@@ -1,7 +1,8 @@
-# Norms and biases, one change at a time from the 2021 reference (gpt3_rope.bux: the 2020 baseline with RoPE) (gpt3_2020.bux): a
-# pre-norm stream with LayerNorms that have biases, and biases on every projection.
-# Arms: era, source, what it was claimed for. Gemma's and Qwen3-Next's zero-centered
-# gain is not an arm: weight decay leaves every gain alone, so it trains as the plain one.
+# Norms and biases, one change at a time from the 2021 reference, GPT-3's decoder
+# with RoPE (gpt3_rope.bux). Its blocks are pre-norm, and its LayerNorms and
+# projections have biases. Arms: era, source, what it was claimed for. Gemma's and
+# Qwen3-Next's zero-centered gain is not an arm: weight decay leaves every gain
+# alone, so it trains as the plain one.
 use gpt3_rope
 use timeline_code
 use rungs

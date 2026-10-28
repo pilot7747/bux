@@ -1,9 +1,10 @@
 # QK-norm, taken apart and put together with what needs it, on the 2021 reference
-# (gpt3_rope.bux). Without it the reference's attention logits grow to hundreds early
-# in training and the lowest layers' attention collapses, the more so the higher the
-# learning rate. Post-branch norms and positions without RoPE each fail alone, and the
-# models that ship them also normalize queries and keys; gated attention and the
-# key-value conv help by other routes. Arms: era, source, the claim.
+# (gpt3_rope.bux). Without QK-norm, the reference's attention logits grow early in
+# training, the more so the higher the learning rate. The attention entropy of the
+# middle layers collapses with them, and both recover within a few thousand steps.
+# Post-branch norms and positions without RoPE each fail alone, and the models that
+# ship them also normalize queries and keys. Gated attention and the key-value conv
+# help by other routes. Arms: era, source, the claim.
 use gpt3_rope
 use timeline_code
 use rungs
