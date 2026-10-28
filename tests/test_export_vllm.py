@@ -225,6 +225,13 @@ RESIDUALS = {
     "attnres": "attnres()",
     "attnres blocks": "attnres(block_size=2)",
     "attnres block under way": "attnres(block_size=4, norm_eps=1e-5)",
+    "mhc": "mhc(expansion=2)",
+    "mhc static": "mhc(expansion=4, dynamic=false, sinkhorn_iters=3)",
+    "mhc single pass": "mhc(expansion=4, single_pass=true, norm_eps=1e-20)",
+    "gr": "gr(expansion=2, rank=8)",
+    "gr eps": "gr(expansion=3, rank=4, norm_eps=1e-3)",
+    "vpgate": "vpgate(temperature=0.5)",
+    "vpgate clamped": "vpgate(eps=0.6)",
 }
 
 

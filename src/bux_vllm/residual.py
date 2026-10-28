@@ -17,6 +17,7 @@ from dataclasses import dataclass
 from typing import Any
 
 import torch
+import torch.nn.functional as F
 from torch import nn
 
 from .common import Ctx, Layer, Norm, Site
@@ -207,6 +208,92 @@ class Dynamic(nn.Module):
         return self.scale * torch.tanh(self.norm(x) @ self.proj)
 
 
+class ManifoldHyperConnections(Branch):
+    """bux's ``mhc``: with r the n streams flattened and RMS-normalized, f reads
+    ``sum_j pre_j x_j`` and stream k becomes ``sum_j res_jk x_j + post_k f(h)``, the
+    coefficients ``a r W + b`` (b alone without `dynamic`) through a sigmoid, twice
+    a sigmoid, and `sinkhorn`. Single-pass, f reads with the pre the branch before
+    computed. Without a body, it is the read alone, merge's."""
+
+    bux_residuals = ("mhc",)
+
+    def __init__(self, c: dict, d: int, body: bool = True):
+        super().__init__()
+        n = c["expansion"]
+        self.n, self.single_pass = n, c["single_pass"]
+        self.iters, self.norm_eps = c["sinkhorn_iters"], c["norm_eps"]
+        columns = 2 * n + n * n if body else n
+        dynamic = c["dynamic"]
+        self.proj = _param(n * d, columns) if dynamic else None
+        self.scale = _param(3 if body else 1) if dynamic else None
+        self.bias = _param(columns)
+
+    def _logits(self, x: torch.Tensor) -> torch.Tensor:
+        """Return ``a r W + b``, (T, k): the columns of pre, then of post, then of
+        res row by row."""
+        if self.proj is None or self.scale is None:
+            return self.bias.expand(*x.shape[:-2], -1)
+        n, d = x.shape[-2:]
+        flat = x.reshape(*x.shape[:-2], n * d)
+        rms = torch.rsqrt(flat.square().mean(-1, keepdim=True) + self.norm_eps)
+        widths = (n, n, n * n)
+        a = torch.cat([s.expand(w) for s, w in zip(self.scale, widths)])
+        return (flat @ self.proj) * rms * a + self.bias
+
+    def read(self, x: torch.Tensor, ctx: Ctx) -> tuple[torch.Tensor, Any]:
+        """Return what f reads of the n streams x, and what `write_back` needs."""
+        logits = self._logits(x)
+        read = torch.sigmoid(logits[..., : self.n]) + EPS
+        if self.single_pass:
+            read = _single_pass_read(read, x, ctx)
+        return mix(read, x), (x, logits)
+
+    def write_back(self, kept: Any, y: torch.Tensor) -> torch.Tensor:
+        """Return the n streams after the branch, of f's output y."""
+        x, logits = kept
+        n = self.n
+        post = 2 * torch.sigmoid(logits[..., n : 2 * n])
+        res = logits[..., 2 * n :].reshape(*logits.shape[:-1], n, n)
+        return mixed(sinkhorn(res, self.iters), x) + post[..., None] * y[..., None, :]
+
+
+class GatedResidual(Branch):
+    """bux's ``gr``: of the n streams, each RMS-normalized with a gain of its own into
+    r_j, f reads ``mean_j g_j r_j`` for the gate ``g = sigmoid(W_u silu(W_d r / n))``,
+    and the branch adds f to stream j by ``2 sigmoid(W_w r / n)_j``. Without a body,
+    it is the read alone, merge's."""
+
+    bux_residuals = ("gr",)
+
+    def __init__(self, c: dict, d: int, body: bool = True):
+        super().__init__()
+        n, rank = c["expansion"], c["rank"]
+        self.norm = _norm("rmsnorm", c["norm_eps"], (n, d))
+        self.down = _linear(n * d, rank)
+        self.up = _linear(rank, n * d)
+        self.write = _linear(n * d, n) if body else None
+
+    def read(self, x: torch.Tensor, ctx: Ctx) -> tuple[torch.Tensor, Any]:
+        """Return what f reads of the n streams x, and what `write_back` needs."""
+        r = self.norm(x)
+        n, d = r.shape[-2:]
+        gate = self.up(F.silu(self.down(r.reshape(*r.shape[:-2], n * d)) / n))
+        return (torch.sigmoid(gate).reshape(r.shape) * r).mean(-2), (x, r)
+
+    def write_back(self, kept: Any, y: torch.Tensor) -> torch.Tensor:
+        """Return the n streams after the branch, of f's output y."""
+        assert self.write is not None
+        x, r = kept
+        n, d = x.shape[-2:]
+        weight = 2 * torch.sigmoid(self.write(r.reshape(*r.shape[:-2], n * d)) / n)
+        return x + weight[..., None] * y[..., None, :]
+
+
+def _linear(features: int, out: int) -> nn.Linear:
+    """A projection without a bias, whole on every rank, that the checkpoint fills."""
+    return nn.Linear(features, out, bias=False).requires_grad_(False)
+
+
 class AttentionResidual(Branch):
     """bux's ``attnres``: f reads the softmax over the sources v (`Sources`) of their
     scores ``dot(w, rmsnorm(v))``, for a query w of its own, and its output joins
@@ -231,10 +318,40 @@ class AttentionResidual(Branch):
         return kept.add(y, self.block_size)
 
 
+class ResidualGate(Branch):
+    """bux's ``vpgate``: x becomes ``a x + b f(x)`` per channel, for
+    ``b = sigmoid(g / temperature)`` and ``a = sqrt(max(1 - b^2, eps))``."""
+
+    bux_residuals = ("vpgate",)
+
+    def __init__(self, c: dict, d: int, body: bool = True):
+        super().__init__()
+        self.gate = _param(d)
+        self.temperature, self.eps = c["temperature"], c["eps"]
+
+    def read(self, x: torch.Tensor, ctx: Ctx) -> tuple[torch.Tensor, Any]:
+        """Return what f reads, the stream, and what `write_back` needs, the same."""
+        return x, x
+
+    def write_back(self, kept: Any, y: torch.Tensor) -> torch.Tensor:
+        """Return the stream after the branch, ``a x + b y``, ``1 - b^2`` computed as
+        ``(1 - b)(1 + b)``."""
+        w = self.gate / self.temperature
+        b = torch.sigmoid(w)
+        a = torch.sqrt(torch.clamp(torch.sigmoid(-w) * (1 + b), min=self.eps))
+        return a * kept + b * y
+
+
 #: The algebras' branches, by the residual setting's type.
 ALGEBRAS: dict[str, type[Branch]] = {
     kind: cls
-    for cls in (HyperConnections, AttentionResidual)
+    for cls in (
+        HyperConnections,
+        ManifoldHyperConnections,
+        GatedResidual,
+        AttentionResidual,
+        ResidualGate,
+    )
     for kind in cls.bux_residuals
 }
 

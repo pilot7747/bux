@@ -150,6 +150,15 @@ CASES = {
     "hc": LLAMA + "residual = hc(expansion=4)\nmodel = embed block^2 rmsnorm head",
     "attnres": LLAMA
     + "residual = attnres(block_size=3)\nmodel = embed block^2 rmsnorm head",
+    "mhc": LLAMA + "residual = mhc(expansion=4)\nmodel = embed block^2 rmsnorm head",
+    "mhc-single": LLAMA + "residual = mhc(expansion=4, single_pass=true)\n"
+    "model = embed block^2 rmsnorm head",
+    "gr": HEAD
+    + ATTN
+    + FFN
+    + "residual = gr(expansion=4, rank=16)\nmodel = embed ([attn] [ffn])^2 head(tied=true)",
+    "vpgate": LLAMA
+    + "residual = vpgate(temperature=0.3)\nmodel = embed block^2 rmsnorm head",
 }
 
 LENGTHS = (3, 17, 40, 64)  # the prompts', in one batch: within and past a window
