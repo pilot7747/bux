@@ -142,7 +142,7 @@ class Mixer(Recurrent):
         idx = m.non_spec_state_indices_tensor[: m.num_prefills + m.num_decodes]
         before, last = cache[idx], x
         if m.num_prefills:
-            has = m.has_initial_state[:, None]
+            has = m.has_initial_state[: idx.shape[0], None]
             before = torch.where(has, before, torch.zeros_like(before))
             starts = m.non_spec_query_start_loc[: idx.shape[0] + 1].long()
             before, last = delta.previous(x, starts, before), x[starts[1:] - 1]

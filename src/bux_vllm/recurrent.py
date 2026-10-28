@@ -206,8 +206,8 @@ class Recurrent(nn.Module, MambaBase):
         state = self.states()
         idx = m.non_spec_state_indices_tensor[: m.num_prefills + m.num_decodes]
         before = state[idx]
-        if m.num_prefills:
-            has = m.has_initial_state[:, None, None, None]
+        if m.num_prefills:  # vLLM's empty requests, if any, come last
+            has = m.has_initial_state[: idx.shape[0], None, None, None]
             before = torch.where(has, before, torch.zeros_like(before))
         steps = m.num_decodes
         outs, afters = [], []
