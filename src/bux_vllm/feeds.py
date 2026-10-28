@@ -1,4 +1,4 @@
-"""What ``gdn2`` and ``rwkv7`` feed bux's delta rule (`bux_vllm.delta`) from their
+"""What ``gdn2``, ``deltanet`` and ``rwkv7`` feed bux's delta rule (`bux_vllm.delta`) from their
 projections, and what they make of its outputs, in plain PyTorch, as
 `bux.export.hf` computes it: the plugin's layers run it on vLLM's projections, and a
 test checks it against the export without vLLM.
@@ -60,6 +60,22 @@ def gdn2_rule(
     w = wide(torch.sigmoid(write)).unflatten(-1, (hv, dv))
     a = -g.exp() * b * wide(k)
     return [q, k, w * wide(v.unflatten(-1, (hv, dv))), g, a, k]
+
+
+def deltanet_rule(
+    heads: Heads, qkv: torch.Tensor, beta: torch.Tensor
+) -> list[torch.Tensor]:
+    """DeltaNet's q, k, v, log decay, a and b at the value heads, (T, hv, d), from
+    its convolved q, k and v, (T, C), and the projection of its step, (T, hv): q
+    and k L2-normalized, q scaled by ``dk ** -0.5``, no decay, ``a = -beta k``
+    written at k, and the values ``beta v``."""
+    h, hv, dk, dv = heads
+    q, k, v = qkv.split([h * dk, h * dk, hv * dv], -1)
+    q, k = shared(q, heads), shared(k, heads)
+    q, k = l2norm(q) * dk**-0.5, l2norm(k)
+    step = wide(torch.sigmoid(beta))[..., None]
+    zero = torch.zeros(q.shape, dtype=torch.float32, device=q.device)
+    return [q, k, step * wide(v.unflatten(-1, (hv, dv))), zero, -step * wide(k), k]
 
 
 def rwkv7_mixes(x: torch.Tensor, prev: torch.Tensor, shift: torch.Tensor) -> tuple:

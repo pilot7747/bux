@@ -28,13 +28,13 @@ from vllm.model_executor.layers.mamba.mamba_utils import (
     MambaStateShapeCalculator,
 )
 
-from . import gdn2, kda, lightning, recurrent, rwkv7
+from . import deltanet, gdn2, kda, lightning, recurrent, rwkv7
 from .common import Ctx, Layer, Site
 from .linear import conv_weight, linear_dims
 from .plan import live, plan
 
 #: The recurrent layer types the plugin computes itself, by their modules.
-OWN = {"kda": kda, "gdn2": gdn2, "rwkv7": rwkv7}
+OWN = {"kda": kda, "gdn2": gdn2, "rwkv7": rwkv7, "deltanet": deltanet}
 
 #: The recurrent layer types, which keep their state in vLLM's Mamba cache.
 RECURRENT = ("mamba", "mamba2", "gdn", "lightning", *OWN)

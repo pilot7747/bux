@@ -85,6 +85,16 @@ def gdn2_projection(c: dict, ranks: int) -> tuple[list[int], list[int], int]:
     return (*aligned(sizes, split, ranks), len(split))
 
 
+def deltanet_projection(c: dict, ranks: int) -> tuple[list[int], list[int], int]:
+    """DeltaNet's fused input projection: its output sizes over all `ranks` (q, k,
+    v and the step), a rank's parts of its output (`aligned`), and how many are
+    used."""
+    _, hv, _, _ = linear_dims(c)
+    sizes = [*conv_channels(c), hv]
+    split = [sum(conv_channels(c)) // ranks, hv // ranks]
+    return (*aligned(sizes, split, ranks), len(split))
+
+
 def zero_padding(layer: nn.Module, columns: int) -> None:
     """Zero the weights of a fused projection's last `columns` outputs, its padding
     (`bux_vllm.linear.aligned`), which no checkpoint holds."""

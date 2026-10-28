@@ -765,6 +765,20 @@ def test_gdn2_feeds_the_rule_what_the_export_does(mixer: str) -> None:
     torch.testing.assert_close(m.o(o), m(x[None], no_cache())[0])
 
 
+def test_deltanet_feeds_the_rule_what_the_export_does() -> None:
+    """The plugin's DeltaNet between its projections and its output, on the
+    export's weights and conv, is the export's layer."""
+    m, c = exported("deltanet(num_heads=2, num_v_heads=4, head_dim=16)")
+    x = torch.randn(100, 64)
+    qkv = torch.cat([m.q(x), m.k(x), m.v(x)], -1)
+    qkv = torch.nn.functional.silu(m.conv(qkv[None], no_cache())[0])
+    heads = linear.linear_dims(c)
+    xs = feeds.deltanet_rule(heads, qkv, m.b(x))
+    o = by_chunks(xs, heads, 0.0)
+    o = m.norm(o).flatten(1) * common.ACTIVATIONS[c["output_gate"]](m.gate(x))
+    torch.testing.assert_close(m.o(o), m(x[None], no_cache())[0])
+
+
 def test_rwkv7_feeds_the_rule_what_the_export_does() -> None:
     """The plugin's RWKV-7 between its projections and its output, on the export's
     weights, is the export's layer."""
