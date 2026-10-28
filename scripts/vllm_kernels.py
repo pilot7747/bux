@@ -172,6 +172,35 @@ def compare_csa(name: str, c: dict, dtype: torch.dtype, decoding: bool) -> bool:
     return error <= TOLERANCE[dtype]
 
 
+def compare_csa_picks(relu: bool, dtype: torch.dtype, decoding: bool) -> bool:
+    """Whether the csa kernels' picks are compressed.select's (in float32; a near
+    tie in bfloat16 may pick another latent)."""
+    torch.manual_seed(0)
+    heads, i, ratio, top_k = 4, 64, 4, 24
+    lengths = [300, 97, 1, 513] if decoding else [300]
+    index = paged([n // ratio + 1 for n in lengths], 4, i, dtype)
+    caches = compressed.Caches(index, torch.zeros(1), index, index)
+    if decoding:
+        positions = torch.tensor([n - 1 for n in lengths], device="cuda")
+        seq = torch.arange(len(lengths), device="cuda")
+        steps = compressed.Steps(positions, seq, len(lengths), [], max(lengths))
+    else:
+        positions = torch.arange(lengths[0], device="cuda")
+        seq = torch.zeros_like(positions)
+        prompts = [(0, lengths[0], 0, lengths[0])]
+        steps = compressed.Steps(positions, seq, 0, prompts, lengths[0])
+    settings = compressed.Settings(16, ratio, top_k, relu, i**-0.5, None)
+    q = torch.randn(len(positions), heads, i, device="cuda", dtype=dtype)
+    w = torch.randn(len(positions), heads, device="cuda", dtype=dtype)
+    want = compressed.select(caches, steps, settings, q, w)
+    got = kernels.csa_select(caches, steps, settings, q, w)
+    same = torch.equal(want, got)
+    layout = "decoding" if decoding else "prefill"
+    name = "csa picks" + ("" if relu else ", plain dots")
+    print(f"{name:32} {dtype!s:15} {layout:9} picks {same}")
+    return same or dtype != torch.float32
+
+
 def main() -> int:
     """Compare every setting, dtype and layout; 1 if any differ."""
     results = [
@@ -183,6 +212,12 @@ def main() -> int:
     results += [
         compare_csa(name, c, dtype, decoding)
         for name, c in CSA.items()
+        for dtype in TOLERANCE
+        for decoding in (False, True)
+    ]
+    results += [
+        compare_csa_picks(relu, dtype, decoding)
+        for relu in (True, False)
         for dtype in TOLERANCE
         for decoding in (False, True)
     ]

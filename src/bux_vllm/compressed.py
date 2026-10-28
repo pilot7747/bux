@@ -370,12 +370,14 @@ def mix(
     index: tuple[torch.Tensor, torch.Tensor] | None,
     sinks: torch.Tensor | None,
     attend_by: Callable[..., torch.Tensor] | None = None,
+    select_by: Callable[..., torch.Tensor] | None = None,
 ) -> torch.Tensor:
     """A step of a ``csa`` call: write its token latents (T, d) and compressed rows
     (T, width, for the tokens that end a group), pick the compressed latents each
     query keeps (by the indexer's queries and weights, `index`), and attend the
-    queries q (T, h, d) to them and their windows, by `attend` or `attend_by` (the
-    plugin's kernel, `bux_vllm.kernels.csa_attend`); (T, h, d)."""
+    queries q (T, h, d) to them and their windows; (T, h, d). `attend_by` and
+    `select_by` attend and pick in place of `attend` and `select`: the plugin's
+    kernels (`bux_vllm.kernels.csa_attend`, `bux_vllm.kernels.csa_select`)."""
     caches.window.write(caches.slots, latent)
     kept = None
     if s.ratio is not None and rows is not None:
@@ -383,7 +385,7 @@ def mix(
         seen = (steps.positions + 1) // s.ratio
         kept = every(seen, steps.longest // s.ratio)
         if index is not None:
-            kept = select(caches, steps, s, *index)
+            kept = (select_by or select)(caches, steps, s, *index)
     return (attend_by or attend)(caches, steps, s, q, kept, sinks)
 
 
