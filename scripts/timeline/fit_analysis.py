@@ -25,6 +25,7 @@ from fit_targets import Target
 
 LIMITED = (130e9, 1e12, 10e12)  # tokens of the limited-data regime
 REFERENCES = ("20tpp", "1T")  # the reference target at 20 tokens a parameter, and at 1T
+VERDICT = 2  # sigmas of a delta between two runs that make it a measurable one
 #: A family with this many children has its own alpha if it has two rungs: the
 #: children's rungs, which share it, tell it apart.
 ANCHOR = 3
@@ -40,6 +41,7 @@ class Options:
     reps: int = 100
     seed: int = 0
     share: tuple[str, ...] = ()  # terms no family but the root has of its own
+    sigma_from: str = "--noise"  # where sigma comes from
 
 
 @dataclass
@@ -50,6 +52,8 @@ class Analysis:
     fams: dict[str, Family]
     laws: dict[str, Law]
     q: dict[str, dict]
+    sigma: float = 0.002  # the relative noise of a run
+    sigma_from: str = "--noise"
     loro: dict[str, dict] = field(default_factory=dict)
     boot: dict[str, dict] = field(default_factory=dict)
 
@@ -85,7 +89,14 @@ def analyze(
     """Fit `metric`'s laws, and say what they say with their uncertainty."""
     fams = families(points, metric, parents, o.root, o.share)
     laws = fit_metric(fams, o.root, o.joint)
-    a = Analysis(metric, fams, laws, quantities(fams, laws, targets, o.root))
+    a = Analysis(
+        metric,
+        fams,
+        laws,
+        quantities(fams, laws, targets, o.root),
+        o.sigma,
+        o.sigma_from,
+    )
     for f in fams:
         others = leave_one_rung_out(fams, f, laws, o.root, o.joint)
         qs = [one(f, fams, {**laws, f: law}, targets, o.root) for law in others]
@@ -225,3 +236,21 @@ def spread(qs: list[dict], lo: float, hi: float) -> dict[tuple, tuple[float, flo
         for p, v in values.items()
         if all(math.isfinite(x) for x in v)
     }
+
+
+def verdict(q: dict, sigma: float) -> str:
+    """Whether a family differs from its parent at its rungs beyond the noise: "no
+    measurable difference" if every |delta| < VERDICT sigmas of a delta between two
+    runs, else "better" or "worse" if every delta has that sign, else "mixed"."""
+    deltas = [r["delta"] for r in q.get("rungs", {}).values() if "delta" in r]
+    if not deltas:
+        return ""
+    if all(abs(d) < 100 * VERDICT * math.sqrt(2) * sigma for d in deltas):
+        return "no measurable difference"
+    return (
+        "better"
+        if all(d < 0 for d in deltas)
+        else "worse"
+        if all(d > 0 for d in deltas)
+        else "mixed"
+    )

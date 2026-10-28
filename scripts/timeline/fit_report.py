@@ -8,13 +8,13 @@ JSON and the laws' table).
 import math
 from typing import Any
 
-from fit_analysis import LIMITED, REFERENCES, Analysis, tokens_label
+from fit_analysis import LIMITED, REFERENCES, Analysis, tokens_label, verdict
 from fit_points import Point
 
 #: The leaderboard's columns: header, key, format.
 LEADERBOARD = [
     ("variant", "family", "s"), ("era", "era", "s"), ("change", "change", "s"),
-    ("claim", "claim", "s"), ("Δ d512 %", "delta_512", "+.2f"),
+    ("claim", "claim", "s"), ("verdict", "verdict", "s"), ("Δ d512 %", "delta_512", "+.2f"),
     ("Δ d768 %", "delta_768", "+.2f"), ("Δ d1024 %", "delta_1024", "+.2f"),
     ("multiplier", "mult", ".3g"), ("slope", "mult_slope", "+.3f"),
     ("× at target", "mult_target", ".3g"), ("vs", "reference", "s"),
@@ -25,11 +25,16 @@ LEADERBOARD = [
 UNLIMITED = [
     ("family", "family", "s"), ("metric", "metric", "s"), ("N active", "N_active", "si"),
     ("N total", "N_total", "si"), ("FLOPs/token", "flops_per_token", "si"), ("MFU", "mfu", ".2f"),
-    ("measured", "mfu_measured", "s"), ("loss, unlimited tokens", "asymptote", ".4f"),
+    ("MFU from", "mfu_from", "s"), ("loss, unlimited tokens", "asymptote", ".4f"),
     ("vs", "reference", "s"),
     ("GPU-h to vs@20tpp", "hours_20tpp", "si"), ("speedup", "speedup_20tpp", ".3g"),
     ("GPU-h to vs@1T", "hours_1T", "si"), ("speedup", "speedup_1T", ".3g"),
     ("Δ at vs@1T GPU-h %", "delta_hours_1T", "+.2f"),
+]  # fmt: skip
+LEARNING_RATES = [
+    ("family", "family", "s"), ("rung", "rung", "s"), ("trials", "trials", "s"),
+    ("learning rates", "lrs", "s"), ("best", "best", ".3g"), ("vertex", "vertex", ".3g"),
+    ("best at the scan's edge", "edge", "s"),
 ]  # fmt: skip
 LIMITED_COLUMNS = [
     ("family", "family", "s"), ("metric", "metric", "s"), ("tokens", "tokens", "s"),
@@ -68,6 +73,7 @@ def leaderboard(a: Analysis, notes: dict[str, dict], root: str) -> list[dict]:
         boot(a, f, ("limited", "1T", "delta_parent"), row, "delta_1T")
         boot(a, f, ("limited", "1T", "delta"), row, "delta_1T_root")
         row["reference"] = a.q.get(f, {}).get("reference")
+        row["verdict"] = verdict(a.q.get(f, {}), a.sigma)
         rows.append(row)
     rest = sorted(rows[1:], key=lambda r: -(r.get("mult_target") or r.get("mult") or 0))
     return rows[:1] + rest
@@ -101,7 +107,7 @@ def unlimited(analyses: list[Analysis], targets: dict) -> list[dict]:
             t = targets[f]
             row = {"family": f, "metric": a.metric, "N_active": t.n_active,
                    "N_total": t.n_total, "flops_per_token": t.flops, "mfu": t.mfu,
-                   "mfu_measured": t.mfu_measured, "reference": a.q[f].get("reference")}  # fmt: skip
+                   "mfu_from": t.mfu_from, "reference": a.q[f].get("reference")}  # fmt: skip
             boot(a, f, ("asymptote", "loss"), row, "asymptote")
             boot(a, f, ("asymptote", "delta"), row, "asymptote_delta")
             for ref in REFERENCES:

@@ -1,14 +1,14 @@
-"""fit.py's self-test: RESULT lines drawn from known laws, fit back.
+"""fit.py's self-test: runs drawn from known laws, fit back.
 
-A baseline (an lr scan at d512, a token scan t5-t80 at d512, four rungs, and an
-axis file's base arm as its replicate) and three variants: ``const13``, the
-baseline with 1.3 times its parameters, at two rungs; ``growing``, whose multiplier
-grows from 1.1 at d512 as N^0.15, at three rungs with its best lr at the scan's
-edge; and ``moe``, twice the baseline's parameters a token goes through, 0.6 of
-them active and 3.5 times as many in all, with a data term 0.8 times the
-baseline's, at four rungs and a token scan. Once without noise (the fit must give
-back the laws), once with the noise of real runs (the truth must sit in the
-bootstrap's range).
+A baseline (an lr scan at d512, a token scan t5-t80 at d512, four rungs, an axis
+file's base arm and seeds 1-3 as its replicates) and three variants:
+``const13``, the baseline with 1.3 times its parameters, at two rungs;
+``growing``, whose multiplier grows from 1.1 at d512 as N^0.15, at three rungs with
+its best lr at the scan's edge; and ``moe``, twice the baseline's parameters a
+token goes through, 0.6 of them active and 3.5 times as many in all, with a data
+term 0.8 times the baseline's, at four rungs and a token scan. Once without noise,
+read from RESULT lines (the fit must give back the laws), once with the noise of
+real runs, read from run directories (the truth must sit in the bootstrap's range).
 """
 
 import json
@@ -71,39 +71,67 @@ def runs_of(family: str) -> list[tuple[int, int, float]]:
     return out + ([(512, t, best) for t in (5, 10, 40, 80)] if scan else [])
 
 
-def lines(sigma: float, seed: int) -> list[str]:
-    """The RESULT lines of every family's runs, each loss off by `sigma`; the
-    baseline's d512 and d768 again as an axis file's base arm."""
+def rows(sigma: float, seed: int) -> list[dict]:
+    """Every run's name and final metrics, each loss off by `sigma`: the baseline's
+    d512 and d768 again as an axis file's base arm, and d512 to d1024 as seeds 1-3."""
     rng = np.random.default_rng(seed)
-    runs = [(f, *FAMILIES[f][:2], *run) for f in FAMILIES for run in runs_of(f)]
-    runs += [("baseline", "synth", "base", w, 20, LR_BEST) for w in (512, 768)]
+    runs = [(f, *FAMILIES[f][:2], *run, 0) for f in FAMILIES for run in runs_of(f)]
+    runs += [("baseline", "synth", "base", w, 20, LR_BEST, 0) for w in (512, 768)]
+    runs += [
+        ("baseline", "baseline", "", w, 20, LR_BEST, s)
+        for w in WIDTHS[:3]
+        for s in (1, 2, 3)
+    ]
     out = []
-    for i, (family, stem, arm, w, t, lr) in enumerate(runs):
+    for family, stem, arm, w, t, lr, s in runs:
         active, best = FAMILIES[family][2], FAMILIES[family][6]
         n, d = active * n_base(w), TOKENS[w] * t / 20
         off = 1 + PENALTY * math.log2(lr / best) ** 2
         noise = np.exp(sigma * rng.standard_normal(len(LAWS)))
-        row = {
+        metrics = {
             m: float(true_law(family, m).loss(n, d)) * off * e
             for m, e in zip(LAWS, noise, strict=True)
         }
         labels = [x for x in (arm, f"d{w}", f"t{t}" if t != 20 else "") if x]
         labels += [f"optimizer.lr={lr:g}"] if w == 512 and t == 20 else []
-        name = f"{slug(stem, labels)}-{i:010x}"
+        labels += [f"seed={s}"] if s else []
         out.append(
-            "RESULT "
-            + json.dumps(
-                {
-                    "dir": name,
-                    "state": "done",
-                    "lr": lr,
-                    "budget": d,
-                    "d_model": w,
-                    **row,
-                }
-            )
+            {"name": f"{stem}[{', '.join(labels)}]", "lr": lr, "tokens": d, **metrics}
         )
     return out
+
+
+def lines(rows: list[dict]) -> list[str]:
+    """The runs as RESULT lines, named by their directories."""
+    out = []
+    for i, r in enumerate(rows):
+        stem, labels = r["name"].rstrip("]").split("[")
+        metrics = {k: v for k, v in r.items() if k in LAWS}
+        row = {
+            "dir": f"{slug(stem, labels.split(', '))}-{i:010x}",
+            "state": "done",
+            "lr": r["lr"],
+            "budget": r["tokens"],
+        }
+        out.append("RESULT " + json.dumps(row | metrics))
+    return out
+
+
+def run_dirs(folder: Path, rows: list[dict]) -> None:
+    """The runs as bux writes them: status.json, run.json and metrics.jsonl."""
+    for i, r in enumerate(rows):
+        stem, labels = r["name"].rstrip("]").split("[")
+        d = folder / f"{slug(stem, labels.split(', '))}-{i:010x}"
+        d.mkdir(parents=True, exist_ok=True)
+        (d / "status.json").write_text(json.dumps({"state": "done"}))
+        (d / "run.json").write_text(
+            json.dumps({"name": r["name"], "train": {"optimizer": {"lr": r["lr"]}}})
+        )
+        early = {"step": 1, "tokens": r["tokens"] / 2, **{m: 2 * r[m] for m in LAWS}}
+        final = {"step": 2, "tokens": r["tokens"], "lr": 0.0, **{m: r[m] for m in LAWS}}
+        (d / "metrics.jsonl").write_text(
+            json.dumps(early) + "\n" + json.dumps(final) + "\n"
+        )
 
 
 def slug(stem: str, labels: list[str]) -> str:
@@ -126,14 +154,18 @@ def counts() -> dict:
     return out
 
 
-def write(folder: Path, sigma: float, seed: int) -> list[str]:
-    """Write the RESULT lines, the counts and the targets to `folder`; return the
-    arguments of fit.py that read them."""
+def write(folder: Path, sigma: float, seed: int, dirs: bool = False) -> list[str]:
+    """Write the runs (as RESULT lines, or as run directories if `dirs`), the
+    counts and the targets to `folder`; return the arguments of fit.py that read
+    them."""
     (folder / "files").mkdir(parents=True, exist_ok=True)
-    (folder / "results.txt").write_text("\n".join(lines(sigma, seed)) + "\n")
+    runs = rows(sigma, seed)
+    (folder / "results.txt").write_text("\n".join(lines(runs)) + "\n")
+    run_dirs(folder / "runs", runs)
     (folder / "counts.json").write_text(json.dumps(counts()))
     (folder / "targets.json").write_text(json.dumps(TARGETS))
-    return [str(folder / "results.txt"), "--out", str(folder / "fit"), "--cache", str(folder / "counts.json"),
+    source = folder / ("runs" if dirs else "results.txt")
+    return [str(source), "--out", str(folder / "fit"), "--cache", str(folder / "counts.json"),
             "--targets", str(folder / "targets.json"), "--files", str(folder / "files")]  # fmt: skip
 
 
@@ -144,7 +176,7 @@ def truth(metric: str) -> dict[str, dict]:
 
     laws = {f: true_law(f, metric) for f in FAMILIES}
     targets = {
-        f: target(_raw(v), v["flops_per_token"], FAMILIES[f][1] == "moe", None)
+        f: target(_raw(v), v["flops_per_token"], FAMILIES[f][1] == "moe", None, "")
         for f, v in TARGETS.items()
     }
     out = {}
@@ -217,7 +249,7 @@ def run(out: Path, reps: int, sigma: float = 0.002) -> int:
 
     rows = []
     for noise, tolerance in ((0.0, EXACT), (sigma, NOISY)):
-        args = write(out / f"noise-{noise:g}", noise, seed=1)
+        args = write(out / f"noise-{noise:g}", noise, seed=1, dirs=bool(noise))
         args += ["--reps", str(reps if noise else 0), "--noise", str(sigma)]
         report = fit.run(fit.parser().parse_args(args))
         result = json.loads(report["json"].read_text())

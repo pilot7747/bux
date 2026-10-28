@@ -46,7 +46,7 @@ if TYPE_CHECKING:  # imported where used: JAX is slow to import
 ROOT = Path(__file__).resolve().parents[2]
 OVN = ROOT / "examples" / "experiments" / "old_vs_new"
 TIMELINE = ROOT / "examples" / "experiments" / "timeline"
-RESULTS = Path.home() / "bux-cluster" / "res" / "timeline"
+RESULTS = Path("serving-out")  # where the table goes, under the working directory
 BF16 = 2
 #: Sessions at once that `cost` reports, and the grid `best` searches.
 REPORTED = (8, 16, 32, 64, 128)

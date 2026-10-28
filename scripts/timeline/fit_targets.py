@@ -27,7 +27,7 @@ class Target:
     n_total: float
     flops: float  # per training token
     mfu: float
-    mfu_measured: bool
+    mfu_from: str  # "measured", "kin <family>", "ancestor <family>" or "placeholder"
     d_model: float | None = None
 
     def hours(self, tokens: float) -> float:
@@ -124,19 +124,28 @@ def mfus(path: Path | None) -> dict[str, dict]:
     return {f: v if isinstance(v, dict) else {"mfu": v} for f, v in raw.items()}
 
 
-def target(raw: dict, flops: float, sparse: bool, measured: dict | None) -> Target:
-    """A target from its counts, its FLOPs per token and its measured MFU, if any."""
-    mfu, real = (MFU_SPARSE if sparse else MFU_DENSE), False
+def target(
+    raw: dict, flops: float, sparse: bool, measured: dict | None, source: str
+) -> Target:
+    """A target from its counts, its FLOPs per token and the measured MFU it takes
+    (from `source`), or the placeholder for its kind."""
+    mfu = MFU_SPARSE if sparse else MFU_DENSE
     if measured and "mfu" in measured:
-        mfu, real = float(measured["mfu"]), True
+        mfu = float(measured["mfu"])
     elif measured and "tokens_per_second_per_gpu" in measured:
-        mfu, real = float(measured["tokens_per_second_per_gpu"]) * flops / PEAK, True
+        mfu = (
+            float(measured["tokens_per_second_per_gpu"])
+            * measured.get("flops_per_token", flops)
+            / PEAK
+        )
+    else:
+        source = "placeholder"
     return Target(
         n_active=float(raw["n_active"]),
         n_total=float(raw.get("n_total") or math.nan),
         flops=flops,
         mfu=mfu,
-        mfu_measured=real,
+        mfu_from=source,
         d_model=raw.get("d_model"),
     )
 

@@ -1,19 +1,17 @@
-"""Read the timeline's RESULT lines into points: one per family, rung and token
-budget, at its best learning rate.
+"""Turn the timeline's runs into points: one per family, rung and token budget, at
+its best learning rate (runs are read by fit_inputs.py).
 
-A RESULT line is ``RESULT {"dir": "positions[rope, d768]-<id>", "state": "done",
-"lr": ..., "budget": ..., <final metrics>}``. The run's name gives its family (the
-file's stem and its arm labels), its rung (a label ``d512``), its token budget (a
-label ``t40``: 40 tokens per baseline parameter; none is the rung's 20) and the
-settings a scan added (``optimizer.lr=2e-3``).
+A run's name gives its family (the file's stem and its arm labels), its rung (a
+label ``d512``), its token budget (a label ``t40``: 40 tokens per baseline
+parameter; none is the rung's 20) and the settings a scan or a seed added
+(``optimizer.lr=2e-3``, ``seed=1``). A name is the run's own
+(``positions[rope, d768]``) or its directory's (``positions_rope_d768-<id>``).
 """
 
-import json
 import math
 import re
 from collections import defaultdict
 from dataclasses import dataclass, field
-from pathlib import Path
 from typing import Any
 
 import numpy as np
@@ -50,6 +48,7 @@ class Run:
     lr: float | None
     tokens: float
     metrics: dict[str, float]
+    replicate: bool = False  # a seed's run, or a base arm's: another run of a point
 
     @property
     def family(self) -> str:
@@ -132,21 +131,8 @@ def classify(labels: list[str]) -> tuple[int | None, int, dict[str, str], tuple]
     return width, per_param, settings, tuple(arms)
 
 
-def read(paths: list[Path]) -> list[Run]:
-    """Every finished run of the RESULT lines in `paths`."""
-    runs = []
-    for path in paths:
-        for line in path.read_text().splitlines():
-            if (at := line.find("RESULT {")) >= 0:
-                row = json.JSONDecoder().raw_decode(line, at + len("RESULT "))[0]
-                run = parse_row(row)
-                if run is not None:
-                    runs.append(run)
-    return runs
-
-
 def parse_row(row: dict) -> Run | None:
-    """A RESULT line's run, or None if it did not finish or has no rung."""
+    """A RESULT row's run, or None if it did not finish or has no rung."""
     if row.get("state") not in ("done", None):
         return None
     stem, labels = parse_name(row["dir"])
@@ -158,7 +144,8 @@ def parse_row(row: dict) -> Run | None:
     tokens = number(row.get("budget")) or RUNG_TOKENS.get(width, math.nan) * (
         per_param / LADDER
     )
-    return Run(stem, arms, width, per_param, lr, tokens, final_metrics(row))
+    seeded = settings.get("seed", "0") != "0"
+    return Run(stem, arms, width, per_param, lr, tokens, final_metrics(row), seeded)
 
 
 def final_metrics(row: dict) -> dict[str, float]:
@@ -173,15 +160,32 @@ def final_metrics(row: dict) -> dict[str, float]:
     return out
 
 
-def points(runs: list[Run], pick: str = "min") -> list[Point]:
+def points(runs: list[Run], pick: str = "min", average: bool = False) -> list[Point]:
     """One point per family, rung and token budget: its runs at each learning rate
-    averaged, then the best learning rate by the objective (`pick` "min"), or the
-    vertex of a parabola in log lr through the best and its neighbours ("vertex")."""
+    (the first of each, replicates only where it has none; all of them averaged if
+    `average`), then the best learning rate by the objective (`pick` "min"), or the
+    vertex of a parabola in log lr through the best and its neighbours ("vertex").
+
+    Every family is a best of as many single runs so: averaging one family's seeds
+    would leave it the only one without the best-of-lrs selection's luck."""
     groups: dict[tuple, dict] = defaultdict(lambda: defaultdict(list))
-    for r in runs:
+    for r in firsts(runs, average):
         if "objective" in r.metrics:
             groups[(r.family, r.width, r.per_param)][r.lr].append(r)
     return [_best(by_lr, pick) for _, by_lr in sorted(groups.items())]
+
+
+def firsts(runs: list[Run], average: bool = False) -> list[Run]:
+    """The runs a point is made of: at each family, rung, budget and lr, those that
+    are not replicates, or the replicates where none is; all of them if `average`."""
+    if average:
+        return runs
+    have = {(r.family, r.width, r.per_param, r.lr) for r in runs if not r.replicate}
+    return [
+        r
+        for r in runs
+        if not r.replicate or (r.family, r.width, r.per_param, r.lr) not in have
+    ]
 
 
 def _best(by_lr: dict[float | None, list[Run]], pick: str) -> Point:
@@ -270,3 +274,39 @@ def _worse(p: Point, ps: list[Point], slack: float) -> bool:
         )
     ]
     return bool(smaller) and p.metrics["objective"] > (1 + slack) * min(smaller)
+
+
+NEAR = 1.03  # the trials a learning rate's parabola fits: within 3% of the best
+
+
+def lr_vertices(runs: list[Run]) -> list[dict]:
+    """Each family's best learning rate at each rung it scanned: the vertex of a
+    parabola in log lr through its trials within `NEAR` of the best (or through the
+    best and its two neighbours), and whether the best is at the scan's edge."""
+    groups: dict[tuple, dict] = defaultdict(lambda: defaultdict(list))
+    for r in firsts(runs):
+        if r.per_param == LADDER and r.lr and "objective" in r.metrics:
+            groups[(r.family, r.width)][r.lr].append(r.metrics["objective"])
+    return [
+        _vertex_row(f, w, by_lr)
+        for (f, w), by_lr in sorted(groups.items())
+        if len(by_lr) > 1
+    ]
+
+
+def _vertex_row(family: str, width: int, by_lr: dict) -> dict:
+    lrs = sorted(by_lr)
+    x, y = np.log(lrs), np.array([np.mean(by_lr[lr]) for lr in lrs])
+    i = int(np.argmin(y))
+    near = y <= NEAR * y.min()
+    fit = (
+        near
+        if near.sum() >= 3
+        else (np.abs(np.arange(len(lrs)) - i) <= 1 if 0 < i < len(lrs) - 1 else None)
+    )
+    vertex = lrs[i]
+    if fit is not None:
+        c2, c1, _ = np.polyfit(x[fit], y[fit], 2)
+        vertex = math.exp(-c1 / (2 * c2)) if c2 > 0 else vertex
+    return {"family": family, "rung": width, "trials": len(lrs), "best": lrs[i], "vertex": vertex,
+            "edge": i in (0, len(lrs) - 1), "lrs": " ".join(f"{lr:g}" for lr in lrs)}  # fmt: skip
