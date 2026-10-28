@@ -337,6 +337,22 @@ def anchored(ws: dict[int, Width], ref: dict[int, Width], budget: float) -> dict
     return {} if "error" in m else m | {"model_ratio": w.model / r.model}
 
 
+def served_as(entry: dict, variant: dict, name: str) -> dict:
+    """A family whose cost is its served variant's (dims vLLM's fast kernels take):
+    the variant's match in the family's parameters, its own timing kept beside."""
+    kept = (
+        "N_active",
+        "N_total",
+        "d_model",
+        "tp",
+        "interpolation",
+        "sessions_per_hour",
+    )
+    out = {k: variant[k] for k in ("d_model", "tp", "interpolation", "budget")}
+    out |= variant["as_trained"] | {"measured": True, "via": name}
+    return out | {"as_timed": {k: entry[k] for k in kept if k in entry}}
+
+
 def kernel_limited(
     entry: dict, model: dict | None, reason: str, anchor: dict | None = None
 ) -> dict:
@@ -376,6 +392,8 @@ def main() -> None:
     for variant, base in (x.split("=", 1) for x in a.trained_as):
         if variant in out and base in fams:
             out[variant] = as_trained(out[variant], fams[base])
+            if "as_trained" in out[variant]:
+                out[base] = served_as(out[base], out[variant], variant)
     budget = statistics.mean(w.cost() for w in fams[BUDGET].values())
     for family, reason in (x.split("=", 1) for x in a.kernel_limited):
         ref = likes.get(family)
