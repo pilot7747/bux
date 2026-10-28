@@ -31,6 +31,8 @@ from .picks import Picked, Sparse
 CHOICE = os.environ.get("BUX_VLLM_SPARSE_KERNELS")
 MOST_DIMS = 256  # the widest key or value head the kernels take
 BLOCKS = (16, 32, 64, 128)  # MSA's blocks whose best a prompt's kernel finds
+BLOCK_K = int(os.environ.get("BUX_VLLM_SPARSE_BLOCK_K", "64"))  # picks a tile
+STAGES = int(os.environ.get("BUX_VLLM_SPARSE_STAGES", "3"))  # tiles in flight
 
 
 def enabled(dtype: torch.dtype) -> bool:
@@ -706,17 +708,13 @@ def prompt_scores(
 def _attend_kernel(
     q_ptr,
     cache_ptr,
-    table_ptr,
-    keys_ptr,
+    rows_ptr,
     valid_ptr,
     sinks_ptr,
     out_ptr,
     stride_qt,
     stride_qh,
-    stride_cb,
     stride_cg,
-    stride_cs,
-    stride_tt,
     stride_kt,
     stride_kg,
     stride_ot,
@@ -728,19 +726,23 @@ def _attend_kernel(
     heads_per: tl.constexpr,
     dk: tl.constexpr,
     dv: tl.constexpr,
-    page: tl.constexpr,
     capped: tl.constexpr,
     sunk: tl.constexpr,
     fp8: tl.constexpr,
+    low: tl.constexpr,
     block_h: tl.constexpr,
     block_dk: tl.constexpr,
     block_dv: tl.constexpr,
     block_k: tl.constexpr,
+    stages: tl.constexpr,
 ):
-    """One query's heads of one kv head's group, over its picked keys: an online
-    softmax of the scaled, capped logits, the sinks beside them. An `fp8` cache's
-    values take bfloat16's tensor cores, their scale `v_scale` on the output (its
-    keys' is in `scale`)."""
+    """One query's heads of one kv head's group, over its picked keys, at the row
+    offsets `rows_ptr` (`offsets`): an online softmax of the scaled, capped logits,
+    the sinks beside them. Each tile's keys and values load together, the loop
+    pipelined over `stages` tiles; in a 16-bit model (`low`) the dots take the
+    tensor cores in the queries' dtype, else float32. An `fp8` cache's values go
+    through bfloat16, their scale `v_scale` on the output (its keys' is in
+    `scale`)."""
     t, g = tl.program_id(0), tl.program_id(1)
     h = tl.arange(0, block_h)
     head = g * heads_per + h
@@ -750,25 +752,33 @@ def _attend_kernel(
         q_ptr + t * stride_qt + head[:, None] * stride_qh + d[None, :],
         mask=on_h[:, None] & (d[None, :] < dk),
         other=0.0,
-    ).to(tl.float32)
+    )
+    if not low:
+        q = q.to(tl.float32)
     top = tl.full([block_h], float("-inf"), tl.float32)
     total = tl.zeros([block_h], tl.float32)
     acc = tl.zeros([block_h, block_dv], tl.float32)
-    for start in range(0, n_picks, block_k):
+    for start in tl.range(0, n_picks, block_k, num_stages=stages):
         j = start + tl.arange(0, block_k)
         inside = j < n_picks
         pick = t * stride_kt + g * stride_kg + j  # a group's own picks, or all's
-        at = tl.load(keys_ptr + pick, mask=inside, other=0)
-        ok = tl.load(valid_ptr + pick, mask=inside, other=0) != 0
-        ok = ok & inside
-        block = tl.load(table_ptr + t * stride_tt + at // page, mask=ok, other=0)
-        rows = block.to(tl.int64) * stride_cb + g * stride_cg + (at % page) * stride_cs
+        rows = tl.load(rows_ptr + pick, mask=inside, other=0) + g * stride_cg
+        ok = inside & (tl.load(valid_ptr + pick, mask=inside, other=0) != 0)
         k = tl.load(
             cache_ptr + rows[:, None] + d[None, :],
             mask=ok[:, None] & (d[None, :] < dk),
             other=0.0,
-        ).to(tl.float32)
-        logits = tl.dot(q, tl.trans(k), input_precision="ieee") * scale
+        )
+        v = tl.load(
+            cache_ptr + rows[:, None] + dk + e[None, :],
+            mask=ok[:, None] & (e[None, :] < dv),
+            other=0.0,
+        )
+        if low:
+            logits = tl.dot(q, tl.trans(k.to(q.dtype)))
+        else:
+            logits = tl.dot(q, tl.trans(k.to(tl.float32)), input_precision="ieee")
+        logits = logits * scale
         if capped:
             logits = softcap * (2.0 * tl.sigmoid(2.0 * logits / softcap) - 1.0)
         logits = tl.where(ok[None, :], logits, float("-inf"))
@@ -777,15 +787,13 @@ def _attend_kernel(
         p = tl.exp(logits - safe[:, None])
         fade = tl.exp(top - safe)
         total = total * fade + tl.sum(p, axis=1)
-        v = tl.load(
-            cache_ptr + rows[:, None] + dk + e[None, :],
-            mask=ok[:, None] & (e[None, :] < dv),
-            other=0.0,
-        )
         if fp8:
             v = v.to(tl.bfloat16)
-        step = tl.dot(p.to(v.dtype), v, input_precision="ieee").to(tl.float32)
-        acc = acc * fade[:, None] + step
+        if low:
+            step = tl.dot(p.to(v.dtype), v)
+        else:
+            step = tl.dot(p.to(v.dtype), v, input_precision="ieee")
+        acc = acc * fade[:, None] + step.to(tl.float32)
         top = new
     acc = acc * v_scale
     kept = total > 0
@@ -800,6 +808,19 @@ def _attend_kernel(
         out.to(out_ptr.dtype.element_ty),
         mask=on_h[:, None] & (e[None, :] < dv),
     )
+
+
+def offsets(
+    cache: torch.Tensor, rows: torch.Tensor, keys: torch.Tensor
+) -> torch.Tensor:
+    """Each picked key's offset in the paged `cache`, (blocks, g, block_size, C),
+    from its position, `keys` (Q, K) or (Q, g, K): its block by its query's
+    request's block table `rows`, (Q, blocks), at kv head 0; in int64, as `keys`."""
+    page = cache.shape[2]
+    flat = keys.flatten(1)
+    block = rows.gather(1, (flat // page).clamp(0, rows.shape[1] - 1)).long()
+    out = block * cache.stride(0) + (flat % page) * cache.stride(2)
+    return out.view_as(keys).contiguous()
 
 
 def attend(
@@ -824,28 +845,26 @@ def attend(
         scales: An FP8 cache's scales of its keys and values, which it holds
             divided by them.
     """
-    keys, valid = (t.contiguous() for t in picked)
+    keys, valid = picked[0], picked[1].contiguous()
     n, h, dk = q.shape
     g, dv = cache.shape[1], cache.shape[3] - spec.dk
+    rows = offsets(cache, rows, keys)
     out = torch.empty(n, h, dv, dtype=q.dtype, device=q.device)
     fp8 = cache.dtype in (torch.float8_e4m3fn, torch.float8_e5m2)
+    low = q.dtype in (torch.bfloat16, torch.float16)
     sinks = spec.sinks if spec.sinks is not None else q.new_zeros(1)
     _attend_kernel[(n, g)](
         q,
         cache,
         rows,
-        keys,
         valid.view(torch.int8),
         sinks,
         out,
         q.stride(0),
         q.stride(1),
-        cache.stride(0),
         cache.stride(1),
-        cache.stride(2),
         rows.stride(0),
-        keys.stride(0),
-        keys.stride(1) if keys.ndim == 3 else 0,
+        rows.stride(1) if rows.ndim == 3 else 0,
         out.stride(0),
         out.stride(1),
         keys.shape[-1],
@@ -855,14 +874,15 @@ def attend(
         heads_per=h // g,
         dk=dk,
         dv=dv,
-        page=cache.shape[2],
         capped=spec.softcap is not None,
         sunk=spec.sinks is not None,
         fp8=fp8,
+        low=low,
         block_h=_block(h // g),
         block_dk=_block(dk),
         block_dv=_block(dv),
-        block_k=32,
+        block_k=BLOCK_K,
+        stages=STAGES,
     )
     return out
 

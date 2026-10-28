@@ -30,6 +30,8 @@ SHAPES = {
     "deepseek": (64, 128, 2048),
 }
 PAGE = 64  # tokens a kernel block, as DeepGEMM's paged kernel takes them
+#: The attention's tiles timed: picks a tile and tiles in flight, the default first.
+TILES = ((64, 3), (32, 1), (32, 3), (64, 2), (64, 4), (128, 2), (128, 3))
 
 
 def timed(run: Callable[[], object], repeats: int = 10) -> float:
@@ -533,11 +535,15 @@ def time_attention(n: int, b: int, ctx: int) -> None:
         kept = (keys, keys <= pos[:, None])
         q = torch.randn(count, h, dk, device="cuda", dtype=torch.bfloat16)
         args = (q, table, kept)
-        bf16 = timed(lambda c=cache, a=args: kernels.attend(spec, a[0], c, *a[1:]))
-        f8 = timed(lambda c=fp8, a=args: kernels.attend(spec, a[0], c, *a[1:]))
-        print(
-            f"attention {what} of {count}: bfloat16 {bf16:.2f} ms, FP8 KV {f8:.2f} ms"
-        )
+        for kernels.BLOCK_K, kernels.STAGES in TILES:
+            run = kernels.attend
+            bf16 = timed(lambda c=cache, a=args, f=run: f(spec, a[0], c, *a[1:]))
+            f8 = timed(lambda c=fp8, a=args, f=run: f(spec, a[0], c, *a[1:]))
+            print(
+                f"attention {what} of {count}, {kernels.BLOCK_K} picks a tile in "
+                f"{kernels.STAGES} stages: bfloat16 {bf16:.2f} ms, FP8 KV {f8:.2f} ms"
+            )
+        kernels.BLOCK_K, kernels.STAGES = TILES[0]
 
 
 def attempt(name: str, check: Callable[[], bool | None]) -> bool:
