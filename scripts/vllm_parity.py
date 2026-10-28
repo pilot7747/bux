@@ -220,6 +220,23 @@ CASES = {
     " softcap=20, rope=rope())\n"
     + "model = embed [rmsnorm beam] [rmsnorm ffn] [rmsnorm inkling] [rmsnorm ffn]"
     " rmsnorm head",
+    "dsa": HEAD + FFN + "attn = gqa(num_heads=4, num_kv_heads=2, rope=rope(),"
+    " indexer=indexer(num_heads=2, head_dim=16, top_k=8))\n"
+    + "local = attn(sliding_window_size=16, sinks=true, softcap=20)\n"
+    + "model = embed [rmsnorm attn] [rmsnorm ffn] [rmsnorm local] [rmsnorm ffn]"
+    " rmsnorm head",
+    "msa": HEAD
+    + FFN
+    + "attn = gqa(num_heads=4, num_kv_heads=2, rope=rope(), indexer=indexer("
+    "num_heads=2, head_dim=16, top_k=16, block_size=4, pool=max, per_group=true,"
+    " relu=false, weighted=false, norm=rmsnorm))\n"
+    + BLOCK
+    + "model = embed block^2 rmsnorm head",
+    "qsa": HEAD
+    + FFN
+    + "attn = gqa(num_heads=4, num_kv_heads=2, rope=rope(fraction=0.5),"
+    " indexer=indexer(num_heads=2, head_dim=16, top_k=16, block_size=4,"
+    " weighted=false, norm=rmsnorm))\n" + BLOCK + "model = embed block^2 rmsnorm head",
     "kv-conv": HEAD
     + FFN
     + "attn = gqa(num_heads=4, num_kv_heads=2, kv_conv_size=4, rope=rope())\n"
