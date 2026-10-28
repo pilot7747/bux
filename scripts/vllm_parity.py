@@ -179,6 +179,13 @@ CASES = {
     + "residual = gr(expansion=4, rank=16)\nmodel = embed ([attn] [ffn])^2 head(tied=true)",
     "vpgate": LLAMA
     + "residual = vpgate(temperature=0.3)\nmodel = embed block^2 rmsnorm head",
+    "value-residual": HEAD
+    + ATTN
+    + FFN
+    + "both = attn(value_residual=learned)\n"
+    + "one = attn(value_residual=convex)\n"
+    + "model = embed [rmsnorm attn(v=@v1)] [rmsnorm ffn] [rmsnorm attn(v=$v1)]"
+    " [rmsnorm both(v=$v1)] [rmsnorm ffn] [rmsnorm one(v=$v1!)] rmsnorm head",
 }
 
 LENGTHS = (3, 17, 40, 64)  # the prompts', in one batch: within and past a window
