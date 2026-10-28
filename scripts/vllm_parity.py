@@ -274,6 +274,17 @@ CASES = {
     "deltanet": GATED_HEAD
     + "delta = deltanet(num_heads=2, num_v_heads=4, head_dim=32)\n"
     + LINEAR_HYBRID,
+    # Gated linear attention, without a conv (its default) and with one.
+    "gla": GATED_HEAD
+    + "delta = gla(num_heads=2, num_v_heads=4, head_dim=32, gate_rank=8)\n"
+    + LINEAR_HYBRID,
+    "gla-conv": GATED_HEAD
+    + "delta = gla(num_heads=2, head_dim=32, conv_size=4, output_gate=sigmoid)\n"
+    + LINEAR_HYBRID,
+    # GDN-2 without a conv: q, k and v SiLU'd alone.
+    "gdn2-plain": GATED_HEAD
+    + "delta = gdn2(num_heads=2, num_v_heads=4, head_dim=32, conv_size=none)\n"
+    + LINEAR_HYBRID,
     "rwkv7": GATED_HEAD + "delta = rwkv7(num_heads=2, head_dim=64)\n" + LINEAR_HYBRID,
     "rwkv7-residual": GATED_HEAD
     + "mix = rwkv7(num_heads=4, num_v_heads=8, head_dim=32, decay_rank=16, a_rank=16,"

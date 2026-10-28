@@ -35,6 +35,12 @@ def conv_channels(c: dict) -> list[int]:
     return [h * dk, h * dk, hv * dv]
 
 
+def conv_kernel(c: dict) -> int:
+    """The taps of a linear attention's conv, as vLLM sizes its state by them: 1 for
+    no conv, a state of no positions."""
+    return c["conv_size"] or 1
+
+
 def conv_weight(tensor: torch.Tensor) -> torch.Tensor:
     """bux's conv taps, (k, C), as vLLM's conv weight, (C, 1, k)."""
     return tensor.T.unsqueeze(1).contiguous()
@@ -117,6 +123,14 @@ def deltanet_projection(c: dict, ranks: int) -> Projection:
     sizes = [*conv_channels(c), hv]
     split = [sum(conv_channels(c)) // ranks, hv // ranks]
     return Projection(*aligned(sizes, split, ranks), len(split))
+
+
+def gla_projection(c: dict, ranks: int) -> Projection:
+    """GLA's fused input projection over `ranks`: q, k and v; a rank's part: q, k
+    and v together."""
+    return Projection(
+        *aligned(conv_channels(c), [sum(conv_channels(c)) // ranks], ranks), 1
+    )
 
 
 def zero_padding(layer: nn.Module, columns: int) -> None:

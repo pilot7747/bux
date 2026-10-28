@@ -61,6 +61,7 @@ LAYER_MODULES = (
     "lightning",
     "gdn2",
     "deltanet",
+    "gla",
     "rwkv7",
     "residual",
     "engram",

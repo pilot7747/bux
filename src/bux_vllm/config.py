@@ -40,6 +40,7 @@ STATES = {
     "lightning": "linear_attention",
     "gdn2": "linear_attention",
     "deltanet": "linear_attention",
+    "gla": "linear_attention",
     "rwkv7": "linear_attention",
 }
 

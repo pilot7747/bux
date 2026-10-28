@@ -1,7 +1,7 @@
 """DeltaNet in vLLM: bux's ``deltanet``, its projections by vLLM's parallel layers,
-its conv by vLLM's causal conv kernels, and its delta rule by bux's own
-(`bux_vllm.delta`, fla's kernels where they run), with no decay, its state in vLLM's
-Mamba cache (`Recurrent`).
+its conv (if it has one) by vLLM's causal conv kernels, and its delta rule by bux's
+own (`bux_vllm.delta`, fla's kernels where they run), with no decay, its state in
+vLLM's Mamba cache (`Recurrent`).
 """
 
 from typing import Any
@@ -23,19 +23,17 @@ from .recurrent import Recurrent
 
 class Mixer(Recurrent):
     """vLLM's layer of one ``deltanet`` call: q, k, v and the step by one merged
-    projection, the conv and the rule (`Recurrent.convolve`, `Recurrent.recur`) out
-    of the compiled graph, and the rest in it.
+    projection, the conv if it has one and the rule (`Recurrent.convolved`,
+    `Recurrent.recur`) out of the compiled graph, and the rest in it.
 
     Raises:
-        NotImplementedError: No conv, or speculative decoding.
+        NotImplementedError: Speculative decoding.
     """
 
     what = "deltanet"
     floor = 0.0  # no decay
 
     def __init__(self, c: dict, width: int, vllm_config: Any, prefix: str):
-        if c["conv_size"] is None:
-            raise NotImplementedError("deltanet: no conv not in vLLM yet")
         super().__init__(vllm_config, prefix)
         self.c = c
         h, hv, dk, dv = linear_dims(c)
@@ -67,7 +65,7 @@ class Mixer(Recurrent):
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         """The layer's output, (T, width), from the tokens' inputs."""
         qkv, beta = self.in_proj(x).split(self.split, -1)[:2]
-        qkv = self.run("convolve", [qkv], qkv.new_zeros(qkv.shape))
+        qkv = self.convolved(qkv)
         heads = (self.h, self.hv, self.dk, self.dv)
         xs = feeds.deltanet_rule(heads, qkv, beta)
         o = self.run("recur", xs, x.new_zeros(x.shape[0], self.hv, self.dv))
@@ -78,10 +76,10 @@ class Mixer(Recurrent):
 
 
 class DeltaNet(Layer):
-    """bux's ``deltanet`` (`Mixer`): q, k and v convolved with SiLU, q and k
-    L2-normalized and shared out to their value heads, q scaled by ``dk ** -0.5``,
-    ``S_t = (I - beta_t k_t k_t^T) S_{t-1} + beta_t k_t v_t^T`` with a step
-    ``beta = sigmoid(W_b x)`` per value head, each value head's RMSNorm, the
+    """bux's ``deltanet`` (`Mixer`): q, k and v convolved (if it has a conv) and
+    SiLU'd, q and k L2-normalized and shared out to their value heads, q scaled by
+    ``dk ** -0.5``, ``S_t = (I - beta_t k_t k_t^T) S_{t-1} + beta_t k_t v_t^T`` with
+    a step ``beta = sigmoid(W_b x)`` per value head, each value head's RMSNorm, the
     output gate, and the output projection."""
 
     bux_types = ("deltanet",)
