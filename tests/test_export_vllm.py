@@ -872,3 +872,33 @@ def test_engram_computes_in_steps_what_the_export_does(
         done = [done[i] + step[i] for i in range(2)]
     for i in range(2):
         torch.testing.assert_close(torch.cat(got[i]), want[i])
+
+
+def test_single_queries_of_several_requests_attend_to_their_own_keys() -> None:
+    """A decoding step's queries, one a request, read their own requests' blocks."""
+    from bux_vllm import picks
+
+    torch.manual_seed(1)
+    g, dk, i, block = 2, 8, 8, 4
+    kv_cache, index_cache = (
+        torch.randn(12, g, block, 2 * dk),
+        torch.randn(12, 1, block, i),
+    )
+    tables = torch.tensor([[3, 7, 1, 0, 0], [9, 2, 11, 5, 4]])
+    at = torch.tensor([9, 16])  # the last positions of requests of 10 and 17 keys
+    spec = picks.Sparse(4, 1, False, False, True, None, 0.3, None, dk, (0, g))
+    q, iq, iw = torch.randn(2, 4, dk), torch.randn(2, 2, i), torch.randn(2, 2)
+    caches = (kv_cache, index_cache)
+    both = picks.attend_segment(spec, q, (iq, iw), at, caches, (tables, tables), 17)
+    for r in range(2):
+        rows = (tables[r : r + 1], tables[r : r + 1])
+        alone = picks.attend_segment(
+            spec,
+            q[r : r + 1],
+            (iq[r : r + 1], iw[r : r + 1]),
+            at[r : r + 1],
+            caches,
+            rows,
+            int(at[r]) + 1,
+        )
+        torch.testing.assert_close(both[r : r + 1], alone)
