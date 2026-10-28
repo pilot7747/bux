@@ -241,12 +241,14 @@ layer: a window, sinks, a softcap, and a `gqa` layer's conv on keys and values a
   values, are gathered into memory before they are reduced, so a step moves several
   times the bytes that a fused kernel such as DeepSeek-V3.2's would read. Time
   sparse layers knowing that they run slower than tuned kernels would.
-- **Triton kernels.** With `BUX_VLLM_SPARSE_KERNELS=triton`, two Triton kernels
-  read the paged caches in place instead: one scores every key of a query's
-  request, one attends over its picks, both in float32; the picks stay PyTorch's,
-  ranked as bux ranks them. They take DSA's keys and MSA's blocks, without picks per
-  group, and heads of up to 256 dims; other settings keep the PyTorch path.
-  `scripts/vllm_kernels.py` compares both paths on a GPU.
+- **Triton kernels.** With `BUX_VLLM_SPARSE_KERNELS=triton`, Triton kernels read
+  the paged caches in place instead: one attends over each query's picks, one
+  scores every key of a decoded token's request; a prompt's queries, which share
+  their keys, score them by PyTorch's matmul, and QSA's blocks are pooled and
+  scored by PyTorch. All of it in float32, the picks ranked as bux ranks them. They
+  take DSA's keys, MSA's blocks with picks per group or not, and QSA's blocks, heads
+  of up to 256 dims; MLA's latents keep the PyTorch path. `scripts/vllm_kernels.py`
+  compares both paths on a GPU.
 - **Latents.** A sparse `mla` layer caches what vLLM's MLA does: each token's
   normalized latent and its rotated key dims, one head of `kv_lora_rank +
   qk_rope_head_dim`. Each head's queries take in its key projection, attend to the
