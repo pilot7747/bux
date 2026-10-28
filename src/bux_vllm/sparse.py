@@ -50,7 +50,7 @@ from vllm.v1.kv_cache_interface import (
 )
 from vllm.v1.kv_cache_layout import KVCacheLayout
 
-from . import compressed, dsa, kernels, picks
+from . import compressed, dsa, kernels, msa, picks
 from .common import own_cache_dtype
 from .kv import reads, writes
 
@@ -82,6 +82,8 @@ class Batch:
         decoding: Its decoded tokens as vLLM's DSA kernels take them, by the
             indexer's block size (their keys or blocks), for an `IndexedBackend`'s
             caches; None without.
+        seq_lens: Each request's keys, (requests,) int32, as MSA's kernels read
+            them.
     """
 
     slot_mapping: torch.Tensor
@@ -89,6 +91,7 @@ class Batch:
     num_actual_tokens: int
     segments: list[picks.Segment]
     decoding: dict[int, dsa.Decoding] | None = None
+    seq_lens: torch.Tensor | None = None
 
 
 class PagedMetadataBuilder(AttentionMetadataBuilder[Batch]):
@@ -126,9 +129,11 @@ class PagedMetadataBuilder(AttentionMetadataBuilder[Batch]):
         decodes, _, decode_tokens, _ = split_decodes_and_prefills(cm)
         chunks = _prompts(cm, decodes) if decodes < cm.num_reqs else []
         segments = picks.segments(decode_tokens, chunks, longest)
-        return Batch(
+        batch = Batch(
             cm.slot_mapping, cm.block_table_tensor, cm.num_actual_tokens, segments
         )
+        batch.seq_lens = cm.seq_lens
+        return batch
 
 
 class IndexedMetadataBuilder(PagedMetadataBuilder):
@@ -222,6 +227,24 @@ class IndexedBackend(PagedBackend):
         return (KVCacheLayout.LBHNC, KVCacheLayout.BLHNC)
 
 
+class BlockedBackend(PagedBackend):
+    """The backend of a `PagedCache` whose indexer and attention run on vLLM's MSA
+    kernels (`bux_vllm.msa`): its blocks of 128 tokens, one of MSA's to a page, and
+    a layout that keeps a block's head slots together, where the index keys lie."""
+
+    @staticmethod
+    def get_name() -> str:
+        return "BUX_PAGED_MSA"
+
+    @staticmethod
+    def get_supported_kernel_block_sizes(kv_cache_spec: Any = None) -> list:
+        return [msa.BLOCK]
+
+    @classmethod
+    def supported_kv_cache_layouts(cls) -> tuple[KVCacheLayout, ...]:
+        return (KVCacheLayout.LBHNC, KVCacheLayout.BLHNC)
+
+
 class PagedCache(nn.Module, AttentionLayerBase):
     """A sparse call's `heads` vectors of `channels` a token, and its indexer's keys
     of `index_dims`, in vLLM's paged KV cache, allocated as for full attention, which
@@ -240,6 +263,7 @@ class PagedCache(nn.Module, AttentionLayerBase):
             picks from its ``index`` port.
         what: The layer, as its errors name it.
         native: Whether vLLM's DSA kernels pick its keys (`bux_vllm.dsa.takes`).
+        blocked: Whether vLLM's MSA kernels pick and attend (`bux_vllm.msa.takes`).
         fp8: Whether its ops read an FP8 KV cache (the Triton kernels' do, over
             keys and values alone or with FP8 indexer keys).
 
@@ -259,15 +283,17 @@ class PagedCache(nn.Module, AttentionLayerBase):
         what: str = "a sparse layer",
         native: bool = False,
         fp8: bool = False,
+        blocked: bool = False,
     ):
         super().__init__()
         self.model_dtype = vllm_config.model_config.dtype
         self.dtype, self.fp8 = cache_dtype(vllm_config, what, fp8)
         self.heads, self.channels, self.prefix = heads, channels, prefix
         self.index_dims, self.native, self.sparse = index_dims, native, sparse
-        self.share = 0 if native else -(-index_dims // heads)
-        size, mean = self.dtype.itemsize, native and sparse.mean
-        self.raw_slots = dsa.raw_slots(index_dims, channels * size) if mean else 0
+        self.blocked = blocked
+        self.share = 0 if native or blocked else -(-index_dims // heads)
+        size, raw = self.dtype.itemsize, (native and sparse.mean) or blocked
+        self.raw_slots = dsa.raw_slots(index_dims, channels * size) if raw else 0
         keys = dsa.slots(index_dims, channels, size) if native else 0
         self.slots = self.raw_slots + keys
         self.scales = (1.0, 1.0)  # an FP8 cache's keys' and values' scales
@@ -283,6 +309,8 @@ class PagedCache(nn.Module, AttentionLayerBase):
         context[prefix] = self
 
     def get_attn_backend(self) -> type[AttentionBackend]:
+        if self.blocked:
+            return BlockedBackend
         return IndexedBackend if self.native else PagedBackend
 
     def get_kv_cache_spec(self, vllm_config: Any) -> FullAttentionSpec:
@@ -300,7 +328,7 @@ class PagedCache(nn.Module, AttentionLayerBase):
     @property
     def rows(self) -> picks.Cache:
         """The cache, its keys and values apart from its indexer keys."""
-        if self.native:
+        if self.slots:
             return picks.Cache(self.kv_cache[:, : self.heads], self.channels)
         return picks.Cache(self.kv_cache, self.channels, self.index_dims)
 
@@ -319,7 +347,8 @@ class PagedCache(nn.Module, AttentionLayerBase):
 
     @property
     def raw(self) -> dsa.Raw:
-        """QSA's indexer keys as projected, where vLLM's DSA kernels pick."""
+        """QSA's indexer keys as projected, where vLLM's DSA kernels pick; MSA's
+        index keys, where its kernels do."""
         return dsa.Raw(self.kv_cache, self.heads, self.index_dims)
 
     def write(self, slots: torch.Tensor, rows: torch.Tensor) -> None:
@@ -352,15 +381,23 @@ def cache_dtype(
 
 
 def paths(
-    spec: picks.Sparse, ix: dict | None, dims: tuple[int, int], dtype: torch.dtype
-) -> tuple[bool, bool]:
+    spec: picks.Sparse,
+    ix: dict | None,
+    dims: tuple[int, int],
+    dtype: torch.dtype,
+    kv_heads: int = 0,
+) -> tuple[bool, bool, bool]:
     """Whether vLLM's DSA kernels pick a call's keys, by its indexer's config `ix`
-    (`bux_vllm.dsa.takes`), in a model of `dtype`; and whether its ops take an FP8
-    KV cache: theirs, and the Triton kernels' over keys and values alone, of heads
-    of `dims` (a layer that reads its ``index`` port), but not MLA's latents."""
+    (`bux_vllm.dsa.takes`), in a model of `dtype`; whether its MSA kernels pick and
+    attend instead (`bux_vllm.msa.takes`, the layer of `kv_heads`); and whether its
+    ops take an FP8 KV cache: theirs, and the Triton kernels' over keys and values
+    alone, of heads of `dims` (a layer that reads its ``index`` port), but not MLA's
+    latents."""
     native = ix is not None and dsa.takes(spec, ix["head_dim"], ix["num_heads"], dtype)
+    blocked = ix is not None and not native and dims[0] == dims[1]
+    blocked = blocked and msa.takes(spec, ix, kv_heads, dims[0], dtype)
     alone = ix is None and kernels.takes(spec, dims, dtype)
-    return native, (native or alone) and not spec.latent
+    return native, blocked, (native or blocked or alone) and not spec.latent
 
 
 def layer_caches(
@@ -373,16 +410,17 @@ def layer_caches(
     what: str,
     native: bool = False,
     fp8: bool = False,
+    blocked: bool = False,
 ) -> nn.ModuleList:
     """Each call's `PagedCache` of the layer `what`, by the names of its states: its
     keys and values, `heads` vectors of `channels` a token, attended with `spec`,
     and its indexer's keys, `index_dims` a token (0 for a layer that reads its
     picks from its ``index`` port), FP8 ones where vLLM's DSA kernels pick them
-    (`native`); in an FP8 KV cache where the call's ops take it (`fp8`)."""
+    (`native`), or bfloat16 ones where its MSA kernels do (`blocked`); in an FP8 KV
+    cache where the call's ops take it (`fp8`)."""
+    args = (spec, index_dims, what, native, fp8, blocked)
     caches = nn.ModuleList(
-        PagedCache(
-            heads, channels, vllm_config, name, spec, index_dims, what, native, fp8
-        )
+        PagedCache(heads, channels, vllm_config, name, *args)
         for name in names["full_attention"]
     )
     split_graphs(vllm_config)
@@ -471,6 +509,8 @@ def sparse_attention(
         output.zero_()
         if cache.native:
             dsa.reserve(q.device, cache.longest, cache.index_dims)
+        if cache.blocked:
+            msa.reserve(q, cache.sparse.groups[1], cache.longest)
         return
     meta = metas[layer_name]
     n = meta.num_actual_tokens
@@ -486,6 +526,12 @@ def sparse_attention(
         at = part.tokens
         q_, iq, iw, pos = (t[at] for t in tensors)
         rows = table[part.requests]
+        if cache.blocked:
+            out, chosen = _blocked(cache, meta, part, q_, iq, rows)
+            output[at] = out.to(output.dtype)
+            if picked_keys.numel():
+                picked_keys[at], picked_valid[at] = msa.as_picks(chosen, pos)
+            continue
         out, (kept, valid) = _segment(cache, meta, part, q_, (iq, iw), pos, rows)
         output[at] = out.to(output.dtype)
         if picked_keys.numel():
@@ -498,14 +544,37 @@ def _written(
     """Write the step's keys and values, (n, g, C), and its indexer keys, (n, i),
     into `cache`: in FP8 where vLLM's DSA kernels pick, else spread over the rows."""
     slots = meta.slot_mapping[: kv.shape[0]]
-    if not cache.native:
+    if not (cache.native or cache.blocked):
         picks.write(cache.kv_cache, slots, picks.merged(kv, index_k))
         return
     cache.write(slots, kv)
-    if cache.sparse.mean:
+    if cache.sparse.mean or cache.blocked:
         cache.raw.write(slots, index_k)
     else:
         cache.region.write(slots, index_k)
+
+
+def _blocked(
+    cache: PagedCache,
+    meta: Batch,
+    part: picks.Segment,
+    q: torch.Tensor,
+    iq: torch.Tensor,
+    rows: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """A segment's outputs, (Q, h, dv), and picks, (g, Q, k) block ids, by vLLM's MSA
+    kernels (`bux_vllm.msa`): its index queries `iq`, (Q, H, i), of this rank's kv
+    heads' groups, over the call's index keys, and its queries over its kv heads."""
+    spec = cache.sparse
+    first, count = spec.groups
+    iq = iq[:, first : first + count].contiguous()
+    attending = (spec.top_k // msa.BLOCK, spec.scale, cache.scales)
+    keys, kv = cache.raw.keys, cache.kv
+    if part.decoding:
+        assert meta.seq_lens is not None, "decoded tokens have their keys' lengths"
+        lens = meta.seq_lens[: q.shape[0]]
+        return msa.decode(keys, iq, q, kv, rows, lens, cache.longest, attending)
+    return msa.prompt(keys, iq, q, kv, rows, part.keys, attending)
 
 
 def _pooled(cache: PagedCache, meta: Batch, positions: torch.Tensor) -> None:

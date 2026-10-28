@@ -170,8 +170,8 @@ the plugin's attention kernel reads e4m3 and e5m2 ([Sparse attention](#sparse-at
 | Layers | FP8 KV cache |
 |--------|--------------|
 | `gqa` | yes, by vLLM's attention: sliding windows, sinks, soft-capping, gates, QK-norm, `kv_conv_size` (its conv state stays in the model's dtype), the `v` port, and the `kv` port (a reader attends to its writer's FP8 cache). On SM 10.x, see the note on FlashAttention below |
-| `gqa` with an indexer on vLLM's DSA kernels (DSA's, QSA's), or reading the `index` port | yes, by the plugin's attention kernel, in a 16-bit model: its keys and values in FP8 beside the indexer's FP8 keys ([DSA on vLLM's kernels](#dsa-on-vllms-kernels)) |
-| `gqa` with another indexer (MSA's, one with a window) or a relative bias | refused: its cache is the plugin's ([Sparse attention](#sparse-attention)) |
+| `gqa` with an indexer on vLLM's DSA or MSA kernels (DSA's, QSA's, MSA's), or reading the `index` port | yes, in a 16-bit model: its keys and values in FP8 beside the indexer's keys ([DSA on vLLM's kernels](#dsa-on-vllms-kernels), [MSA on vLLM's kernels](#msa-on-vllms-kernels)) |
+| `gqa` with another indexer (one with a window, say) or a relative bias | refused: its cache is the plugin's ([Sparse attention](#sparse-attention)) |
 | `mla` | yes, by vLLM's MLA backends that take FP8: Triton's (a latent of 256 and 32 rotated dims), FlashInfer's on SM 10.x (DeepSeek's dims). A prompt's cached context is dequantized as it is gathered, by vLLM's kernel or, for the latent sizes it lacks, the plugin's. Where no prefill backend of vLLM's takes the dims, the prefill is FlashAttention's, in the model's dtype |
 | `mla` with an indexer or the `index` port | refused: its cache is the plugin's |
 | `csa` | refused: its caches are the plugin's ([Compressed sparse attention](#compressed-sparse-attention)) |
@@ -465,7 +465,8 @@ where they take its settings: single keys, ReLU'd dots summed over the heads (no
 heads at most, no window, and a `top_k` of 2048 at most. It takes DeepGEMM, which
 vLLM installs, on an SM 9.0 or 10.x GPU. QSA's indexer (mean-pooled blocks of a
 size that divides 64) runs on them as DSA's over its blocks, with `top_k /
-block_size` blocks. MSA's (plain dots, picks per group) and the rest keep the
+block_size` blocks. MSA's (plain dots, picks per group) runs on vLLM's MiniMax-M3
+kernels ([MSA on vLLM's kernels](#msa-on-vllms-kernels)), and the rest keep the
 plugin's own kernels above. So does a sparse `mla` layer's indexer, unless
 `BUX_VLLM_SPARSE_KERNELS=native`: its FP8 keys would take a head slot as wide as a
 latent, which doubles the layer's cache.
@@ -504,6 +505,26 @@ query picks another key than bux's where two scores are within FP8's rounding.
 scores), `torch` the PyTorch path, and `native` runs vLLM's kernels in a float32
 model too. `scripts/vllm_native.py` checks the kernels on a GPU against PyTorch, on
 the keys as the plugin caches them, and times them beside the plugin's own.
+
+### MSA on vLLM's kernels
+
+In a bfloat16 model, MSA's indexer and attention run on the Triton kernels vLLM
+runs MiniMax-M3's sparse layers on, where they take its settings: blocks of 128
+keys (`block_size=128`, `pool=max`, `per_group=true`), plain dots, unweighted
+heads, an index head for each kv head, index and attention heads of a power of two
+of dims (keys and values alike), fewer than 64 blocks a query, and no window, sinks
+or softcap. MiniMax-M3's own settings are these.
+
+- **Keys.** Each token's index key, normalized and rotated, is cached in bfloat16
+  in head slots after the call's kv heads. The cache takes blocks of 128 tokens, a
+  block of MSA's to a page, as the kernels read them.
+- **Picks.** Each index head scores the blocks its query sees by their best key,
+  and keeps its group's best `top_k / 128`, the query's own block among them.
+- **Attention.** Each kv head's group of query heads attends to its group's
+  blocks, reading the paged keys and values in place, in bfloat16 or FP8 (e4m3 or
+  e5m2, as under `--kv-cache-dtype fp8`).
+
+The picks are bux's, but for ties, which the kernels break their own way.
 
 A `gqa` layer with a relative bias (Inkling's) runs the same way, as no attention
 kernel of vLLM's adds a bias that depends on how far behind its query a key is: its

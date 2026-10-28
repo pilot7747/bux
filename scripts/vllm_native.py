@@ -561,6 +561,69 @@ def check_qsa(decoding: bool) -> bool:
     return best
 
 
+def check_msa(decoding: bool) -> bool:
+    """MSA on vLLM's MiniMax-M3 kernels (`bux_vllm.msa`): its picks of blocks of
+    128 per kv head's group against bux's (`bux_vllm.picks.choose`), which must
+    agree but at ties, and its attention against PyTorch's over the same picks."""
+    from bux_vllm import dsa, msa, picks
+
+    torch.manual_seed(0)
+    h, g, dk, dims, top_k, block = 8, 2, 64, 64, 512, 128
+    lengths = [300, 97, 3, 1000] if decoding else [1000]
+    blocks = sum(-(-n // block) for n in lengths) + 1
+    raw_slots = dsa.raw_slots(dims, 256)
+    cache = torch.zeros(blocks, g + raw_slots, block, 2 * dk, device="cuda").bfloat16()
+    raw = dsa.Raw(cache, g, dims)
+    width = -(-max(lengths) // block)
+    table = torch.zeros(len(lengths), width, dtype=torch.int32, device="cuda")
+    order, at, keys = torch.randperm(blocks - 1, device="cuda") + 1, 0, []
+    for r, n in enumerate(lengths):
+        count = -(-n // block)
+        table[r, :count] = order[at : at + count].int()
+        at += count
+        pos = torch.arange(n, device="cuda")
+        slots = table[r, pos // block].long() * block + pos % block
+        picks.write(cache[:, :g], slots, torch.randn(n, g, 2 * dk, device="cuda"))
+        k = torch.randn(n, dims, device="cuda")
+        raw.write(slots, k)
+        keys.append(raw.at(table[r : r + 1], pos[None])[0])
+    count = len(lengths) if decoding else lengths[0]
+    q = torch.randn(count, h, dk, device="cuda", dtype=torch.bfloat16)
+    iq = torch.randn(count, g, dims, device="cuda", dtype=torch.bfloat16)
+    scale = dk**-0.5
+    attending = (top_k // block, scale, (1.0, 1.0))
+    kv = cache[:, :g]
+    if decoding:
+        positions = torch.tensor([n - 1 for n in lengths], device="cuda")
+        lens = torch.tensor(lengths, dtype=torch.int32, device="cuda")
+        out, chosen = msa.decode(raw.keys, iq, q, kv, table, lens, 1024, attending)
+        rows = list(range(len(lengths)))
+    else:
+        positions = torch.arange(lengths[0], device="cuda")
+        out, chosen = msa.prompt(raw.keys, iq, q, kv, table[:1], lengths[0], attending)
+        rows = [0] * count
+    kept = msa.as_picks(chosen, positions)
+    spec = picks.Sparse(top_k, block, False, True, False, None, scale, None, dk, (0, g))
+    agree = []
+    for t, r in enumerate(rows):
+        p = positions[t : t + 1]
+        see = picks.seen(p, lengths[r], None)
+        w = torch.full((1, g), dims**-0.5, device="cuda")
+        theirs = picks.choose(spec, iq[t : t + 1].float(), w, keys[r], see, p)
+        a = torch.where(kept[1][t], kept[0][t], -1).sort(-1).values
+        b = torch.where(theirs[1][0], theirs[0][0], -1).sort(-1).values
+        agree.append((a == b).float().mean().item())
+    gathered = picks.gather(kv, table[rows], kept[0])
+    want = picks.attend(q, gathered, kept[1], dk, scale)
+    error = (out.float() - want.float()).abs().max().item()
+    share = sum(agree) / len(agree)
+    layout = "decoding" if decoding else "prefill"
+    print(
+        f"plugin msa {layout}: picks agreeing with bux's {share:.3f}, output error {error:.1e}"
+    )
+    return share > 0.95 and error < 2e-2
+
+
 def time_heads(n: int, b: int, ctx: int) -> None:
     """Qwen4's QSA kernel and the plugin's at groups of one query head (MHA, as the
     timeline's GPT-3-style arms) and of two, at heads of 64: whether it compiles,
@@ -712,6 +775,7 @@ def main() -> int:
     for decoding in (False, True):
         results.append(attempt("plugin", lambda d=decoding: check_plugin(d)))
         results.append(attempt("plugin qsa", lambda d=decoding: check_qsa(d)))
+        results.append(attempt("plugin msa", lambda d=decoding: check_msa(d)))
     attempt("attention", lambda: time_attention(16384, 64, 20000))
     attempt("heads", lambda: time_heads(16384, 64, 20000))
     print("all agree" if all(results) else "MISMATCH")

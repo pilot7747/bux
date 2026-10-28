@@ -190,7 +190,8 @@ class Attention(Layer):
         spec = picks.layer_spec(ix, self.indexer, settings, self.dk, groups)
         what = "gqa with an indexer" if ix else "gqa reading its index port"
         dtype = site.vllm_config.model_config.dtype
-        native, fp8 = sparse.paths(spec, ix, (self.dk, self.dv), dtype)
+        dims, heads = (self.dk, self.dv), c["num_kv_heads"]
+        native, blocked, fp8 = sparse.paths(spec, ix, dims, dtype, heads)
         self.caches = sparse.layer_caches(
             spec,
             self.g,
@@ -201,6 +202,7 @@ class Attention(Layer):
             what,
             native,
             fp8,
+            blocked,
         )
 
     def _biased_caches(

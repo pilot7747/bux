@@ -462,6 +462,16 @@ CASES = {
     + "attn = gqa(num_heads=4, num_kv_heads=2, rope=rope(fraction=0.5),"
     " indexer=indexer(num_heads=2, head_dim=16, top_k=16, block_size=4,"
     " weighted=false, norm=rmsnorm))\n" + BLOCK + "model = embed block^2 rmsnorm head",
+    # MSA on vLLM's MiniMax-M3 kernels: blocks of 128, an index head a kv head.
+    # The prompts fit in a block, so this checks their attention, not their picks
+    # (scripts/vllm_native.py checks those).
+    "msa-native": HEAD
+    + FFN
+    + "attn = gqa(num_heads=4, num_kv_heads=2, rope=rope(fraction=0.5), indexer=indexer("
+    "num_heads=2, head_dim=32, top_k=256, block_size=128, pool=max, per_group=true,"
+    " relu=false, weighted=false, norm=rmsnorm))\n"
+    + BLOCK
+    + "model = embed block^2 rmsnorm head",
     # QSA on vLLM's DSA kernels: blocks of 4, the timeline's 4 heads of 64.
     "qsa-native": HEAD
     + FFN

@@ -339,6 +339,39 @@ def test_vllm_s_sparse_gqa_attention_takes_plain_bfloat16_groups() -> None:
     assert not dsa.attends(sunk, q, kv)
 
 
+def test_msa_takes_minimax_s_settings_alone() -> None:
+    """vLLM's MiniMax-M3 kernels take MSA of blocks of 128, an unweighted index head
+    a kv head, plain dots, heads of a power of two of dims and fewer than 64 blocks
+    a query, in bfloat16; their picks of blocks are bux's keys of them."""
+    from bux_vllm import msa, picks
+
+    def spec(**c: Any) -> picks.Sparse:
+        top_k, size = c.get("top_k", 2048), c.get("block_size", 128)
+        relu, window = c.get("relu", False), c.get("window")
+        return picks.Sparse(
+            top_k, size, False, True, relu, window, 1.0, None, 64, (0, 4)
+        )
+
+    ix = {"num_heads": 4, "head_dim": 128, "weighted": False}
+    with pytest.MonkeyPatch.context() as mp:
+        mp.setattr(msa, "available", lambda: True)
+        assert msa.takes(spec(), ix, 4, 128, torch.bfloat16)
+        assert not msa.takes(spec(), ix, 4, 128, torch.float16)
+        assert not msa.takes(spec(), ix, 8, 128, torch.bfloat16)
+        assert not msa.takes(spec(), ix | {"weighted": True}, 4, 128, torch.bfloat16)
+        assert not msa.takes(spec(), ix | {"head_dim": 96}, 4, 128, torch.bfloat16)
+        assert not msa.takes(spec(block_size=64), ix, 4, 128, torch.bfloat16)
+        assert not msa.takes(spec(relu=True), ix, 4, 128, torch.bfloat16)
+        assert not msa.takes(spec(window=512), ix, 4, 128, torch.bfloat16)
+        assert not msa.takes(spec(top_k=128 * 64), ix, 4, 128, torch.bfloat16)
+    blocks = torch.tensor([[[2, -1]], [[0, 1]]], dtype=torch.int32)  # (g, Q, k)
+    keys, valid = msa.as_picks(blocks, torch.tensor([300]))
+    assert keys.shape == (1, 2, 256)
+    assert keys[0, 0, :2].tolist() == [256, 257] and not valid[0, 0, 128:].any()
+    assert valid[0, 0, :45].all() and not valid[0, 0, 45:].any()  # 256..300 seen
+    assert valid[0, 1].all()
+
+
 def test_native_picks_are_bux_s_picks() -> None:
     """bux_vllm.dsa.as_picks turns the kernels' picks, int32 positions with -1 for
     none, into bux_vllm.picks' positions and mask."""
@@ -2521,6 +2554,7 @@ OWN_CACHES = {
     **dict.fromkeys(("dsa", "dsa-conv", "msa", "qsa"), "gqa with an indexer"),
     **dict.fromkeys(("dsa-share", "msa-share"), "gqa with an indexer"),
     **dict.fromkeys(("dsa-native", "dsa-hybrid", "qsa-native"), "gqa with an indexer"),
+    "msa-native": "gqa with an indexer",
     "relbias": "gqa with a relative bias",
     **dict.fromkeys(("mla-dsa", "mla-share"), "mla with an indexer"),
     "mla-dsa-native": "mla with an indexer",
@@ -2553,10 +2587,12 @@ def test_native_dsa_takes_an_fp8_kv_cache(
     """Where vLLM's DSA kernels pick (as on a B300), a gqa layer's indexer keeps its
     FP8 keys in head slots after its kv heads (two, of 64 bytes, for 64 FP8 dims and
     their scale), and its cache, and that of a layer that reads its picks, take an
-    FP8 KV cache; so does QSA's, its keys as projected in bfloat16 in slots of their
-    own; sparse MLA's latents refuse it."""
+    FP8 KV cache; so do QSA's, its keys as projected in bfloat16 in slots of their
+    own, and MSA's on vLLM's MiniMax-M3 kernels; sparse MLA's latents refuse it."""
     dsa = importlib.import_module("bux_vllm.dsa")
     monkeypatch.setattr(dsa, "available", lambda: True)
+    msa = importlib.import_module("bux_vllm.msa")
+    monkeypatch.setattr(msa, "available", lambda: True)
     model = built(vllm_parity.CASES["dsa-native"], tmp_path, stood_in, None, "fp8")
     caches = [m for m in model.modules() if type(m).__name__ == "PagedCache"]
     e4m3 = torch.float8_e4m3fn
@@ -2568,6 +2604,12 @@ def test_native_dsa_takes_an_fp8_kv_cache(
     )
     caches = [m for m in model.modules() if type(m).__name__ == "PagedCache"]
     assert [(c.native, c.raw_slots, c.slots) for c in caches] == [(True, 2, 4)] * 2
+    source = vllm_parity.CASES["msa-native"]
+    model = built(source, tmp_path / "msa", stood_in, None, "fp8")
+    caches = [m for m in model.modules() if type(m).__name__ == "PagedCache"]
+    assert [(c.blocked, c.native, c.raw_slots, c.slots) for c in caches] == [
+        (True, False, 1, 1)
+    ] * 2
     with pytest.raises(NotImplementedError, match="mla with an indexer: kv_cache"):
         source = vllm_parity.CASES["mla-dsa-native"]
         built(source, tmp_path / "mla", stood_in, None, "fp8")
