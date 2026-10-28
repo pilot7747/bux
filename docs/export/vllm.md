@@ -110,9 +110,10 @@ ones, `--load-format dummy`, to time it.
   is a module named by the algebra, `model.layers.3.hc`, which holds its parameters,
   as in the export. It reads the stream for the branch's body and writes the body's
   output back, per token: the n copies of hc, mhc and gr are a (tokens, n, d)
-  tensor. attnres keeps the embedding, the sum of each finished block of branch
-  outputs and the sum of the block under way, which is what bux's softmax over depth
-  reads; it does not keep every output. Nothing of it is cached between steps.
+  tensor. attnres keeps the embedding and the sum of each finished block of branch
+  outputs side by side, and the sum of the block under way, which is what bux's
+  softmax over depth reads; it does not keep every output. Nothing of it is cached
+  between steps. See [Residual algebras](#residual-algebras) for how they run.
 - **The layers** are vLLM's: column- and row-parallel projections, the vocabulary
   split over ranks, vLLM's attention with its KV cache, its MLA with the latent
   cache, `FusedMoEFactory` for the routed experts, vLLM's Mamba-2 and Gated
@@ -218,6 +219,45 @@ This rule computes in float32 on CUDA cores, so a prompt costs several times wha
 fused kernel would. Tests check both paths against the export's layers on the CPU,
 the PyTorch rule as computed and fla's as its API defines it.
 
+## Residual algebras
+
+A residual algebra widens the stream: hc, mhc and gr into n copies of it, attnres
+into the embedding and the sums of blocks of branch outputs. Each outermost branch
+reads it for its body and writes the body's output back into it, and the widened
+stream is n times (or as many sources as) the plain one, so what a branch costs is
+how often it moves it.
+
+- **Kernels.** In a 16-bit model, hc's, mhc's and attnres's reads and writes run
+  fused Triton kernels (`bux_vllm.streams`), in float32 from the stream's dtype. A
+  branch reads its streams in one kernel and writes them in another, so it moves
+  the widened stream once into the read, and once in and once out of the write.
+  Each token's program takes its whole row at once, up to 4096 channels of each
+  stream, so that a decoding step's few tokens each make one round of loads:
+  - hc's read computes the token's coefficients, A and B, static plus the dynamic
+    term ``s tanh(norm(x_j) W)``, the norm's statistics and its dot products with
+    W in one pass (``norm(x) W`` as ``rstd (x W - mean sum(W))``), then the read.
+  - mhc's read computes its logits ``a r W + b`` of the flattened streams, and the
+    read; its write computes Sinkhorn's matrix of them, for each token.
+  - The write is ``x'_k = sum_j M_jk x_j + b_k y`` for a token's n streams.
+  - attnres's read computes the softmax of every source's ``rmsnorm(v) . w`` and
+    their mix; a finished block's sum joins its sources, the block under way's
+    sum stays in float32.
+- **PyTorch.** A float32 model, and any under `BUX_VLLM_RESIDUAL_KERNELS=torch`,
+  takes the PyTorch path, which computes what the export does, term by term: a
+  branch moves the widened stream about ten times (its norms, the projections, the
+  read and the mix as batched matrix products of n rows, the add), and mhc runs
+  Sinkhorn's rounds as two reductions each. `BUX_VLLM_RESIDUAL_KERNELS=triton`
+  runs the kernels in float32 too. `gr` and `vpgate` always take PyTorch's path,
+  as torch.compile compiles it.
+- **Checks.** A CPU test runs the fused path with each kernel's computation in
+  PyTorch against the export, and `scripts/vllm_residual.py` compares the kernels
+  with the PyTorch path on a GPU and times a branch both ways.
+
+The kernels are custom ops that stay inside vLLM's CUDA graphs: the graphs split at
+attention and the recurrent and MoE layers' ops, not at these. On an NVIDIA B300
+(2026-10-28, vLLM 0.32.0, a step of 8 tokens in a CUDA graph), an `hc` branch's read
+and write take 0.013 ms fused against 0.094 ms in PyTorch.
+
 ## Sparse attention
 
 A `gqa` or `mla` layer with an indexer attends to the keys its indexer picks, as
@@ -243,16 +283,17 @@ layer: a window, sinks, a softcap, and a `gqa` layer's conv on keys and values a
   for DSA's keys, MSA's blocks with picks per group or not, and QSA's blocks, heads
   of up to 256 dims. One attends over each query's picks. One scores every key of
   a decoded token's request. One scores a prompt's keys for a tile of its queries
-  at a time, each head's dots on the tensor cores and their sum in float32, and
-  ranks DSA's keys, or finds each of MSA's blocks' best score, in place. QSA pools
-  and scores its blocks by PyTorch, and the picks are ranked as bux ranks them.
+  at a time, each head's dots on the tensor cores and their sum in float32. Both
+  rank DSA's keys, or find each of MSA's blocks' best score, in place. One pools a
+  decoded token's QSA blocks, normalizes and rotates their keys and scores them; a
+  prompt's are pooled once by PyTorch. The picks are ranked as bux ranks them.
   MLA's latents, and a float32 model unless `BUX_VLLM_SPARSE_KERNELS=triton`, take
   the PyTorch path, which gathers each query's scores, keys and values into memory
   first and so moves several times the bytes (`BUX_VLLM_SPARSE_KERNELS=torch` asks
   for it). `scripts/vllm_kernels.py` compares the two on a GPU. Either way the work
-  runs in ops that vLLM runs eagerly between its CUDA graphs: a model with a sparse
-  layer runs vLLM's piecewise CUDA graphs, never a whole decoding step as one
-  graph.
+  runs in ops that vLLM's piecewise CUDA graphs run between their pieces, and a
+  step of decoded tokens alone is one CUDA graph: as captured, its tokens read up
+  to `max_model_len` keys, which every replay of it may have.
 - **Latents.** A sparse `mla` layer caches what vLLM's MLA does: each token's
   normalized latent and its rotated key dims, one head of `kv_lora_rank +
   qk_rope_head_dim`. Each head's queries take in its key projection, attend to the
@@ -331,13 +372,13 @@ frees and prefix-caches them. vLLM lays the caches' blocks side by side when the
 sizes divide one another, as they do where the dims are powers of two.
 
 A step writes its tokens' rows, then reads every key from the caches. The indexer
-scores, in float32, the compressed latents a query sees, its sequence's gathered
-once for a prompt's chunk, and keeps the top-k, the first of equal scores as bux
-does; while there are no more than `top_k`, it keeps them all. One softmax in
-float32 covers the window, the kept latents and the sinks: in a 16-bit model by a
-Triton kernel that reads the latents in place, as for the other sparse layers
-(`BUX_VLLM_SPARSE_KERNELS`), else in PyTorch, in chunks of bounded size, with no
-loop over tokens.
+scores, in float32, the compressed latents a query sees, and keeps the top-k, the
+first of equal scores as bux does; while there are no more than `top_k`, it keeps
+them all. One softmax in float32 covers the window, the kept latents and the
+sinks. In a 16-bit model both run by Triton kernels that read the caches in place,
+as for the other sparse layers (`BUX_VLLM_SPARSE_KERNELS`), but for picks inside a
+candidate pool; else in PyTorch, a prompt chunk's keys gathered once, in chunks of
+bounded size, with no loop over tokens.
 
 vLLM's own DeepSeek-V4 layers compute something else. At a ratio of 4 their
 compressor pools overlapping windows of 8 tokens, with a learned position bias.
@@ -408,14 +449,14 @@ parentheses is bux's own bfloat16 error, against the same reference:
 | `short-conv` | LFM2's double-gated short conv beside attention | 6.7e-6 | 0.11 (0.13) | - |
 | `kv-share` | Hymba's cross-layer KV sharing: a windowed layer's keys and values read by the next one or two, a full layer's by one with a window of its own | 1.1e-5 | 0.13 (0.19) | 0.20 |
 | `relbias` | Inkling's attention: a relative bias, a conv on keys and values, a length scale, window-only layers biased over their window | 6.2e-6 | 0.080 (0.10) | 0.075 |
-| `dsa` | DSA's top 8 of the keys, a window, sinks and a softcap | 6.7e-6 | 2.4 (2.0) | 2.4 |
+| `dsa` | DSA's top 8 of the keys, a window, sinks and a softcap | 7.6e-6 | 2.4 (2.0) | 2.4 |
 | `dsa-conv` | an indexer beside the conv on keys and values, QK-norm, a gate, the `v` port | 6.2e-6 | 3.3 (3.1) | 3.3 |
 | `dsa-share` | DSA's picks shared through the `index` port with two layers, the last with a window | 7.2e-6 | 3.9 (4.2) | 3.9 |
-| `msa` | MSA's max-pooled blocks of 4, picks per group, plain dots, summed heads, the indexer's norm | 6.2e-6 | 3.5 (3.3) | 3.6 |
-| `msa-share` | MSA's picks shared through the `index` port | 8.1e-6 | 4.6 (4.7) | 4.7 |
+| `msa` | MSA's max-pooled blocks of 4, picks per group, plain dots, summed heads, the indexer's norm | 5.7e-6 | 3.5 (3.3) | 3.6 |
+| `msa-share` | MSA's picks shared through the `index` port | 8.1e-6 | 4.7 (4.7) | 4.7 |
 | `qsa` | QSA's mean-pooled blocks of 4, partial RoPE | 8.1e-6 | 0.63 (3.1) | - |
-| `csa` | compressed sparse attention: groups of 4, a window of 16, the indexer's top 8, sinks | 6.7e-6 | 2.0 (1.2) | 0.62 |
-| `csa-latent` | DeepSeek-V4.1's wiring of csa: a window-only layer and one compressing pairs, a query latent, a grouped low-rank output | 6.2e-6 | 0.33 (0.88) | - |
+| `csa` | compressed sparse attention: groups of 4, a window of 16, the indexer's top 8, sinks | 6.7e-6 | 0.42 (2.7) | 0.62 |
+| `csa-latent` | DeepSeek-V4.1's wiring of csa: a window-only layer and one compressing pairs, a query latent, a grouped low-rank output | 6.2e-6 | 0.31 (0.88) | - |
 | `csa-ports` | DeepSeek-V4.1's ports: a layer that compresses pairs, indexes them and makes a candidate pool, one that reads its latents and picks, one that re-indexes inside the pool | 8.1e-6 | 0.87 (1.4) | - |
 | `mla` | MLA with a latent of 256 and 32 rotated dims (Triton's MLA) | - | 0.10 (0.10) | 0.097 |
 | `mla-moe` | the same MLA beside a sigmoid MoE | - | 1.6 (0.093), differs | 1.4 |
@@ -441,10 +482,10 @@ parentheses is bux's own bfloat16 error, against the same reference:
 | `gdn2-paper` | the paper's gdn2: low-rank gates, negative eigenvalues, a sigmoid output gate | 8.6e-6 | 0.12 (0.20) | - |
 | `rwkv7` | RWKV-7 of 2 heads of 64 | 3.4e-5 | 0.17 (1.0) | 0.70 |
 | `rwkv7-residual` | RWKV-7's value residual through its `v` port, low ranks | 1.3e-5 | 0.11 (0.25) | - |
-| `hc` | hyper-connections, 4 streams | 8.1e-6 | 0.087 (0.10) | 0.088 |
-| `attnres` | attention residuals in blocks of 3 | 8.6e-6 | 0.11 (0.17) | 0.15 |
-| `mhc` | manifold-constrained hyper-connections | 8.1e-6 | 0.093 (0.11) | - |
-| `mhc-single` | mhc, single-pass | 6.7e-6 | 0.081 (0.10) | - |
+| `hc` | hyper-connections, 4 streams | 8.1e-6 | 0.079 (0.10) | 0.086 |
+| `attnres` | attention residuals in blocks of 3 | 8.6e-6 | 0.098 (0.17) | 0.14 |
+| `mhc` | manifold-constrained hyper-connections | 8.1e-6 | 0.097 (0.11) | 0.11 |
+| `mhc-single` | mhc, single-pass | 6.7e-6 | 0.11 (0.10) | - |
 | `gr` | `gr`'s residual algebra | 1.9e-6 | 0.018 (0.025) | - |
 | `vpgate` | `vpgate`'s residual algebra | 9.5e-6 | 0.072 (0.13) | - |
 | `engram` | Engram's memory between two blocks, a tied head | 1.4e-5 | 0.097 (0.11) | 0.074 |

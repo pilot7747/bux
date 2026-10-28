@@ -373,7 +373,7 @@ def attend_op(
         pool.numel() > 0,
     )
     theirs = get_forward_context().no_compile_layers[writer] if writer else None
-    by = kernels.csa_attend if kernels.takes_csa(q.dtype, q.shape[-1]) else None
+    kernel = kernels.takes_csa(q.dtype, q.shape[-1])
     out[:n], own, made = compressed.mix(
         call.caches(meta, n, theirs),
         m.steps(positions),
@@ -384,7 +384,8 @@ def attend_op(
         index,
         sinks,
         picks,
-        by,
+        kernels.csa_attend if kernel else None,
+        kernels.csa_select if kernel else None,
     )
     if kept.numel() and own is not None:
         kept[:n] = torch.nn.functional.pad(
