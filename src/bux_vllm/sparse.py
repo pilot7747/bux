@@ -30,6 +30,7 @@ from vllm.v1.attention.backend import (
 from vllm.v1.kv_cache_interface import FullAttentionSpec
 
 from . import picks
+from .kv import reads, writes
 
 #: The ops, as vLLM's compilation names them.
 OPS = ("vllm::bux_sparse_attention", "vllm::bux_picked_attention")
@@ -127,6 +128,81 @@ class PagedCache(nn.Module, AttentionLayerBase):
             head_size_v=half,
             dtype=self.dtype,
         )
+
+
+def layer_caches(
+    spec: picks.Sparse,
+    heads: int,
+    channels: int,
+    index_dims: int,
+    names: dict[str, list[str]],
+    vllm_config: Any,
+) -> tuple[nn.ModuleList, nn.ModuleList]:
+    """Each call's caches of a sparse layer, by the names of its states: of its keys
+    and values, `heads` vectors of `channels` a token, attended with `spec`, and of
+    its indexer's keys, `index_dims` a token (none for 0, a layer that reads its
+    picks from its ``index`` port)."""
+    main = names["full_attention"]
+    index = names["index"] if index_dims else [""] * len(main)
+    caches = nn.ModuleList(
+        PagedCache(heads, channels, vllm_config, name, spec, index_name)
+        for name, index_name in zip(main, index, strict=True)
+    )
+    index_caches = nn.ModuleList(
+        PagedCache(1, index_dims, vllm_config, name) for name in index if index_dims
+    )
+    split_graphs(vllm_config)
+    return caches, index_caches
+
+
+def attend(
+    tensors: tuple[torch.Tensor, torch.Tensor, torch.Tensor],
+    index: tuple[torch.Tensor, ...] | None,
+    out: torch.Tensor,
+    cache: Any,
+    ports: list,
+    ctx: Any,
+) -> torch.Tensor:
+    """A sparse layer's call: its queries, keys and values (`tensors`) attend into
+    `out` by the indexer's picks, `index` its queries, head weights and keys of the
+    step's tokens, or by the picks its ``index`` port reads (None), over the call's
+    `PagedCache` `cache`; the picks go on to the taps of the port it writes. Returns
+    `out`."""
+    q, k, v = (t.contiguous() for t in tensors)
+    taps = writes(ports, "index")
+    if index is None:
+        read = reads(ports, "index")
+        assert read is not None, "a sparse layer reads its picks or has an indexer"
+        kept = ctx.read(*read)
+        torch.ops.vllm.bux_picked_attention(
+            q, k, v, *kept, ctx.positions, out, cache.prefix
+        )
+    else:
+        kept = _no_picks(cache.spec, q, len(taps))
+        torch.ops.vllm.bux_sparse_attention(
+            q,
+            k,
+            v,
+            *(t.contiguous() for t in index),
+            ctx.positions,
+            out,
+            *kept,
+            cache.prefix,
+        )
+    for tap in taps:
+        ctx.push(tap, kept)
+    return out
+
+
+def _no_picks(
+    spec: picks.Sparse | None, q: torch.Tensor, taps: int
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Where the sparse op writes the step's picks, (T, [G,] K): none unless the
+    layer pushes them to `taps`."""
+    assert spec is not None
+    groups = (spec.groups[1],) if spec.per_group else ()
+    shape = (q.shape[0] if taps else 0, *groups, picks.most(spec))
+    return q.new_zeros(shape, dtype=torch.long), q.new_zeros(shape, dtype=torch.bool)
 
 
 def split_graphs(vllm_config: Any) -> None:
