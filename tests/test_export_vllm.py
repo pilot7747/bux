@@ -183,12 +183,17 @@ ROUTERS = {
     " top_k_groups=2, routed_scaling_factor=2.5, load_balancing=aux_free, expert=e)",
     "sqrtsoftplus": "moe(num_experts=8, top_k=2, router=sqrtsoftplus,"
     " router_logit_scale=2, router_bias=true, expert=e)",
+    "shared expert sinks": "moe(num_experts=8, top_k=2, num_shared_experts=2,"
+    " shared_expert_sink=true, router=sigmoid, routed_scaling_factor=2.5, expert=e)",
+    "unnormalized sinks": "moe(num_experts=8, top_k=2, num_shared_experts=2,"
+    " shared_expert_sink=true, normalize_top_k=false, expert=e)",
 }
 
 
 @pytest.mark.parametrize("source", ROUTERS.values(), ids=ROUTERS.keys())
 def test_the_router_picks_and_weighs_as_bux(source: str) -> None:
-    """The plugin's router, which vLLM's fused MoE takes the picks from, is bux's."""
+    """The plugin's router, which vLLM's fused MoE takes the picks from, is bux's,
+    and so are the shared experts' weights where it scores them."""
     arch = compile(
         "d_model = 64\ne = gated_mlp(intermediate_size=16, activation=swish)\n"
         f"model = {source}"
@@ -202,11 +207,14 @@ def test_the_router_picks_and_weighs_as_bux(source: str) -> None:
         moe.router_bias[...] = bias
         router.bias.data = torch.from_numpy(np.array(bias))
     x = jax.random.normal(jax.random.key(2), (1, 32, 64))
-    idx, weights, _ = moe._route(x)
+    idx, weights, sinks = moe._route(x)
     logits = torch.from_numpy(np.array(moe._logits(x))[0])
     got_w, got_idx = router(None, logits, c.top_k, c.normalize_top_k)
     assert got_idx.tolist() == np.asarray(idx)[0].tolist()
     np.testing.assert_allclose(got_w.numpy(), np.asarray(weights)[0], rtol=1e-6)
+    got_sinks = router.route(logits, c.top_k)[2].numpy()
+    want = np.zeros((32, 0)) if sinks is None else np.asarray(sinks)[0]
+    np.testing.assert_allclose(got_sinks, want, rtol=1e-6)
 
 
 ROPES = {

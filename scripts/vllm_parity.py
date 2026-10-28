@@ -163,6 +163,14 @@ CASES = {
     " expert=mlp(intermediate_size=64, activation=gelu, bias=true))\n"
     + MOE_BLOCK
     + "model = embed block^2 rmsnorm head",
+    "moe-sink": HEAD
+    + ATTN
+    + EXPERT
+    + "experts = moe(num_experts=8, top_k=2, num_shared_experts=2,"
+    " shared_expert_sink=true, router=sigmoid, routed_scaling_factor=2.5,"
+    " load_balancing=aux_free, expert=dense)\n"
+    + MOE_BLOCK
+    + "model = embed block^2 rmsnorm head",
     "mamba2": HEAD
     + ATTN
     + FFN
