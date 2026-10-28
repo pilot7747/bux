@@ -86,8 +86,9 @@ ones, `--load-format dummy`, to time it.
   `gdn` or `mla` layers runs in bfloat16 only, because vLLM's Gated DeltaNet and MLA
   kernels take nothing else (MLA also takes float16).
 - **Recurrent state** is kept in the model's dtype, unless
-  `--mamba-ssm-cache-dtype float32` keeps it in float32, as bux does. A `kda`
-  layer's state is float32 either way, as vLLM keeps Kimi Linear's.
+  `--mamba-ssm-cache-dtype float32` keeps it in float32, as bux does. The state of
+  `kda`, `gdn2` and `rwkv7` layers is float32 either way, as vLLM keeps Kimi
+  Linear's.
 - **Heads.** The model's output is its first head. Layers after it, such as a
   multi-token prediction module, are not built, and vLLM skips their weights. (vLLM
   drafts tokens by MTP only for the model types it knows.)
@@ -143,19 +144,42 @@ ones, `--load-format dummy`, to time it.
 | `moe` | softmax, sigmoid and `sqrtsoftplus` routers, `router_logit_scale`, groups, the aux-free bias, a router bias, shared experts and their gate, gated and plain experts (`swish`, `gelu`, `gelu_tanh`, `relu2`) with biases, a `limit` and `up_offset` on `swish` and `quick_gelu` gates (gpt-oss's), LatentMoE with its norms (vLLM's fused experts at the latent's width), and shared experts the router scores (`shared_expert_sink`). Not yet: `expert_norm`, or the experts' `up_softcap` |
 | `mamba2`, `gdn` | by vLLM's own layers, with one type and shape of recurrent layer per model; `gdn` in bfloat16 only, and with its short conv and output gate. Under tensor parallelism, vLLM 0.32's Mamba-2 failed with one group (its fused all-reduce), and in bfloat16 where a rank's share of the input projection is not a multiple of 8 wide |
 | `kda` | by vLLM's KDA kernels, Kimi Linear's (by chunks for a prompt, the recurrence for each decoded token) and its causal conv, with one type and shape of recurrent layer per model: value heads (`num_v_heads`), the decay's rank, `gate_lower_bound` of -5 and above, and a dense or low-rank output gate. Not yet: no conv, no output gate, a `v_head_dim` other than `head_dim`, or speculative decoding |
+| `gdn2`, `rwkv7` | the delta rule in PyTorch ([Delta rules in PyTorch](#delta-rules-in-pytorch)), the rest by vLLM's layers and causal conv, with one type and shape of recurrent layer per model: every setting, and `rwkv7`'s `v` port (the value residual). Not yet: `gdn2` without its conv, or speculative decoding |
 | residual algebras, `merge` | `hc`, `mhc`, `gr`, `attnres`, `vpgate`, with every setting, single-pass included |
 | the graph | everything; a shared MoE or recurrent layer may run only once per forward pass |
 
 Every other layer type is not in vLLM yet: among them `csa`, `dyt`, `conv`,
-`short_conv`, `mamba`, `rwkv7`, `engram`, and the linear attentions other than `gdn`
-and `kda` (`gdn2`, `deltanet`, `gla`, `lightning`). Serve those models with
-transformers ([Exporting models](index.md)).
+`short_conv`, `mamba`, `engram`, and the linear attentions `deltanet`, `gla` and
+`lightning`. Serve those models with transformers ([Exporting models](index.md)).
 
 vLLM's own KDA layer gives every value head a q and a k head of its own. bux's
 `kda` shares one among a group of value heads, so the plugin runs vLLM's kernels in
 a layer of its own: q and k are projected and convolved at their own heads, as bux
 computes them, and repeated out to the value heads only for the kernels. Its weights
 and its state per sequence are bux's.
+
+## Delta rules in PyTorch
+
+vLLM has no kernel for the delta rules of `gdn2` and `rwkv7`. Their erase term is
+a rank-one map of two different vectors, which makes them DPLR rules, not KDA's. The
+plugin runs them in PyTorch, in float32, as bux does: each value head keeps a state of
+`head_dim` by `v_head_dim` in vLLM's Mamba cache, beside the conv's last inputs
+(`gdn2`) or the token before (`rwkv7`, for its token shift).
+
+- **A prompt** runs by chunks of 64 tokens, with matmuls within a chunk and the
+  state carried across, as fla's chunked kernels compute it. The batch's prompts run
+  side by side, each padded to the longest, and padding leaves a state as it was.
+- **Chunks side by side.** Where the decay is bounded below (`rwkv7`'s always,
+  `gdn2`'s with `gate_lower_bound`), the decay between two tokens factors into
+  matmuls, and every chunk of a block of tokens runs at once: only the state each
+  chunk starts from runs one chunk after another. `rwkv7` factors whole chunks,
+  `gdn2` at -5 blocks of 16 rows. An unbounded decay runs one chunk after another.
+- **Decoding** takes one step of every sequence at once, which CUDA graphs capture.
+
+The projections, convs and norms run on vLLM's layers and kernels, as for the other
+layers. The rule computes in float32 on CUDA cores, so a prompt costs several times
+what a fused kernel would. A test checks both paths against the export's layers,
+on the CPU.
 
 ## Multi-head latent attention
 
