@@ -16,17 +16,16 @@ from vllm.model_executor.layers.mamba.mamba_utils import MambaStateShapeCalculat
 
 from . import feeds
 from .common import ACTIVATIONS, Ctx, Layer, Norm, Site
-from .linear import conv_kernel, gdn2_projection, linear_dims, zero_padding
+from .linear import gdn2_projection, linear_dims, zero_padding
 from .recurrent import LowRank, Recurrent, float32, low_rank_tensor
 
 
 def state_shape(c: dict, width: int, tp: int) -> tuple:
-    """The shapes of a ``gdn2`` layer's state on one of `tp` ranks (or a
-    ``deltanet``'s or a ``gla``'s): its conv's last inputs of q, k and v (none
-    without a conv), and each value head's (dv, dk) state."""
+    """The shapes of a ``gdn2`` layer's state on one of `tp` ranks: its conv's last
+    inputs of q, k and v, and each value head's (dv, dk) state."""
     h, hv, dk, dv = linear_dims(c)
     return MambaStateShapeCalculator.gated_delta_net_state_shape(
-        tp, h, hv, dk, dv, conv_kernel(c)
+        tp, h, hv, dk, dv, c["conv_size"]
     )
 
 
@@ -45,16 +44,18 @@ def rms(eps: float) -> dict:
 class Mixer(Recurrent):
     """vLLM's layer of one ``gdn2`` call: q, k, v and the erase and write gates by
     one merged projection, the decay's and the output gate's low-rank ones, the conv
-    if it has one and the rule (`Recurrent.convolved`, `Recurrent.recur`) out of the
-    compiled graph, and the rest in it.
+    and the rule (`Recurrent.convolve`, `Recurrent.recur`) out of the compiled
+    graph, and the rest in it.
 
     Raises:
-        NotImplementedError: Speculative decoding.
+        NotImplementedError: No conv, or speculative decoding.
     """
 
     what = "gdn2"
 
     def __init__(self, c: dict, width: int, vllm_config: Any, prefix: str):
+        if c["conv_size"] is None:
+            raise NotImplementedError("gdn2: no conv not in vLLM yet")
         super().__init__(vllm_config, prefix)
         self.c = c
         bound = c["gate_lower_bound"]
@@ -89,7 +90,7 @@ class Mixer(Recurrent):
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         """The layer's output, (T, width), from the tokens' inputs."""
         qkv, erase, write = self.in_proj(x).split(self.split, -1)[:3]
-        qkv = self.convolved(qkv)
+        qkv = self.run("convolve", [qkv], qkv.new_zeros(qkv.shape))
         heads = (self.h, self.hv, self.dk, self.dv)
         gates = (self.f(x), erase, write)
         xs = feeds.gdn2_rule(self.c, heads, qkv, gates, self.A_log, self.dt_bias)
@@ -101,9 +102,8 @@ class Mixer(Recurrent):
 
 
 class GatedDeltaNet2(Layer):
-    """bux's ``gdn2`` (`Mixer`): q, k and v convolved (if it has a conv) and SiLU'd,
-    q and k L2-normalized and shared out to their value heads, q scaled by
-    ``dk ** -0.5``,
+    """bux's ``gdn2`` (`Mixer`): q, k and v convolved with SiLU, q and k
+    L2-normalized and shared out to their value heads, q scaled by ``dk ** -0.5``,
     ``S_t = (I - k_t (b_t * k_t)^T) diag(exp(g_t)) S_{t-1} + k_t (w_t * v_t)^T`` with
     KDA's decay, the erase gate b (times 2 with negative eigenvalues) and the write
     gate w, each value head's RMSNorm, the low-rank output gate, and the output

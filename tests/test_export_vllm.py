@@ -473,18 +473,6 @@ def twins(theirs: torch.nn.Module, mine: common.Layer) -> None:
     }
 
 
-def test_lightning_decays_as_the_export_by_the_depth_the_export_gives() -> None:
-    """The decay rates by the layer's depth among the token mixers, which the
-    export's sites carry (bux_sites' extra)."""
-    arch = compile(vllm_parity.CASES["lightning"])
-    sites = core.plan(arch).sites()
-    depths = [s["extra"] for s in sites.values() if s["extra"]]
-    assert depths == [{"layer": 0, "layers": 3}, {"layer": 1, "layers": 3}]
-    for depth in depths:
-        want = hf_linear.slopes(2, depth["layer"], depth["layers"])
-        torch.testing.assert_close(linear.slopes(2, *depth.values()), want)
-
-
 def test_dyt_computes_what_the_export_does() -> None:
     from bux.export.hf import basic as hf_basic
 
@@ -817,71 +805,6 @@ def test_gdn2_feeds_the_rule_what_the_export_does(mixer: str) -> None:
     bound = c["gate_lower_bound"]
     o = by_chunks(xs, heads, None if bound is None else -bound)
     o = m.norm(o).flatten(1) * common.ACTIVATIONS[c["output_gate"]](m.gate(x))
-    torch.testing.assert_close(m.o(o), m(x[None], no_cache())[0])
-
-
-def test_deltanet_feeds_the_rule_what_the_export_does() -> None:
-    """The plugin's DeltaNet between its projections and its output, on the
-    export's weights and conv, is the export's layer."""
-    m, c = exported("deltanet(num_heads=2, num_v_heads=4, head_dim=16)")
-    x = torch.randn(100, 64)
-    qkv = torch.cat([m.q(x), m.k(x), m.v(x)], -1)
-    qkv = torch.nn.functional.silu(m.conv(qkv[None], no_cache())[0])
-    heads = linear.linear_dims(c)
-    xs = feeds.deltanet_rule(heads, qkv, m.b(x))
-    o = by_chunks(xs, heads, 0.0)
-    o = m.norm(o).flatten(1) * common.ACTIVATIONS[c["output_gate"]](m.gate(x))
-    torch.testing.assert_close(m.o(o), m(x[None], no_cache())[0])
-
-
-def projected(m: Any, x: torch.Tensor, silu: bool = True) -> torch.Tensor:
-    """The export's q, k and v of x side by side, convolved and SiLU'd, or SiLU'd
-    alone (if `silu`) without a conv, as the plugin's layers take them."""
-    qkv = torch.cat([m.q(x), m.k(x), m.v(x)], -1)
-    if m.conv is not None:
-        return torch.nn.functional.silu(m.conv(qkv[None], no_cache())[0])
-    return torch.nn.functional.silu(qkv) if silu else qkv
-
-
-@pytest.mark.parametrize("conv", [4, None], ids=["conv", "no conv"])
-def test_linear_layers_without_a_conv_feed_the_rule_what_the_export_does(
-    conv: int | None,
-) -> None:
-    """DeltaNet and GDN-2 with or without a conv (q, k and v SiLU'd alone) are the
-    export's layers."""
-    size = "none" if conv is None else conv
-    m, c = exported(f"deltanet(num_heads=2, head_dim=16, conv_size={size})")
-    x = torch.randn(70, 64)
-    heads = linear.linear_dims(c)
-    o = by_chunks(feeds.deltanet_rule(heads, projected(m, x), m.b(x)), heads, 0.0)
-    o = m.norm(o).flatten(1) * common.ACTIVATIONS[c["output_gate"]](m.gate(x))
-    torch.testing.assert_close(m.o(o), m(x[None], no_cache())[0])
-    m, c = exported(f"gdn2(num_heads=2, head_dim=16, conv_size={size})")
-    gates = (m.f(x), m.erase(x), m.write(x))
-    xs = feeds.gdn2_rule(c, heads, projected(m, x), gates, m.A_log, m.dt_bias)
-    o = m.norm(by_chunks(xs, heads, None)).flatten(1)
-    o = o * common.ACTIVATIONS[c["output_gate"]](m.gate(x))
-    torch.testing.assert_close(m.o(o), m(x[None], no_cache())[0])
-
-
-GLA = {
-    "gla": "gla(num_heads=2, num_v_heads=4, head_dim=16, gate_rank=4)",
-    "gla, conv": "gla(num_heads=2, head_dim=16, v_head_dim=8, conv_size=4,"
-    " output_gate=sigmoid)",
-}
-
-
-@pytest.mark.parametrize("mixer", GLA.values(), ids=GLA.keys())
-def test_gla_feeds_the_rule_what_the_export_does(mixer: str) -> None:
-    """The plugin's GLA between its projections and its output, on the export's
-    weights (and conv), is the export's layer: q, k and v SiLU'd after a conv alone,
-    and the rule with no rank-one term."""
-    m, c = exported(mixer)
-    x = torch.randn(100, 64)
-    heads = linear.linear_dims(c)
-    xs = feeds.gla_rule(heads, projected(m, x, silu=False), m.f(x))
-    o = m.norm(by_chunks(xs, heads, None)).flatten(1)
-    o = o * common.ACTIVATIONS[c["output_gate"]](m.gate(x))
     torch.testing.assert_close(m.o(o), m(x[None], no_cache())[0])
 
 

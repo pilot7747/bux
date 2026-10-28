@@ -1,8 +1,7 @@
-"""What the plugin's own recurrent layers share (``kda``, ``gdn2``, ``rwkv7``,
-``deltanet``, ``gla``): a vLLM layer per call, its state in vLLM's Mamba cache as
-Gated DeltaNet's is (the conv's last inputs, of no positions without a conv, and a
-state per value head), its steps that read or write the state run outside the
-compiled graph, and bux's low-rank projections. The delta rule
+"""What the plugin's own recurrent layers share (``kda``, ``gdn2``, ``rwkv7``): a
+vLLM layer per call, its state in vLLM's Mamba cache as Gated DeltaNet's is (the
+conv's last inputs, and a state per value head), its steps that read or write the
+state run outside the compiled graph, and bux's low-rank projections. The delta rule
 runs on fla's kernels where they are installed (`bux_vllm.dplr`), else in PyTorch
 (`bux_vllm.delta`).
 
@@ -15,7 +14,6 @@ a step leaves the padding's outputs at zero.
 from typing import Any
 
 import torch
-import torch.nn.functional as F
 from torch import nn
 from vllm.distributed import (
     get_tensor_model_parallel_rank,
@@ -115,12 +113,9 @@ class Recurrent(nn.Module, MambaBase):
         return state_dtype(self.model_config, self.cache_config)
 
     def conv_taps(self, c: dict) -> None:
-        """Make the conv's taps over q, k and v: this rank's channels, (C, 1, k);
-        none without a conv."""
-        self.c_conv = c
-        if c["conv_size"] is None:
-            return
+        """Make the conv's taps over q, k and v: this rank's channels, (C, 1, k)."""
         channels = sum(conv_channels(c)) // self.tp
+        self.c_conv = c
         self.conv = nn.Parameter(
             torch.empty(channels, 1, c["conv_size"]), requires_grad=False
         )
@@ -138,13 +133,6 @@ class Recurrent(nn.Module, MambaBase):
         `out`, which it fills."""
         torch.ops.vllm.bux_mix(xs, out, self.prefix, what)
         return out
-
-    def convolved(self, qkv: torch.Tensor, silu: bool = True) -> torch.Tensor:
-        """q, k and v side by side, (T, C), through the conv and SiLU (`convolve`);
-        without a conv, SiLU'd if `silu`, as bux's layers take them then."""
-        if self.conv is None:
-            return F.silu(qkv) if silu else qkv
-        return self.run("convolve", [qkv], qkv.new_zeros(qkv.shape))
 
     def batch(self) -> Any:
         """This step's metadata of the layer (vLLM's GDN metadata); None in a run
