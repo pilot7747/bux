@@ -1,0 +1,8 @@
+blank_issues_enabled: true
+contact_links:
+  - name: Documentation
+    url: https://bux.readthedocs.io
+    about: Guides, tutorials, and the reference of every layer, setting and command.
+  - name: Report a security vulnerability
+    url: https://github.com/pilot7747/bux/security/advisories/new
+    about: Report it privately, not as an issue.

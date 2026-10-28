@@ -1,0 +1,11 @@
+# Keeps the workflows' pinned actions current: one pull request a month for all of them.
+# The Python dependencies are bumped by hand, with uv.lock.
+version: 2
+updates:
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: monthly
+    groups:
+      actions:
+        patterns: ["*"]
