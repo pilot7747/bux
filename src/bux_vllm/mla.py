@@ -12,27 +12,34 @@ its normalized latent), the latents' norms and RoPE in float32, by bux's
 frequencies, the scale, and the norm and gate of the heads' outputs.
 
 vLLM picks the backends by the model's MLA dims, which it reads from the config
-(`bux_vllm.config`, `bux_vllm.arch`), and the GPU. Its MLA prefill backends take a
-few dims alone (DeepSeek's, among them); for other dims the layer attends to new
-tokens by FlashAttention's prefill, which takes any.
+(`bux_vllm.config`, `bux_vllm.arch`), and the GPU. Two of its checks hold every
+model to a few dims (DeepSeek's among them), whatever the backend takes: the MLA
+metadata's head size (the latent and the rotated dims), and the prefill backends'
+dims. For other dims, the layer gives vLLM's MLA the decoding backend vLLM picks,
+its metadata checked by that backend's own head sizes (`any_head_size`), and
+FlashAttention's prefill, which takes any dims up to 128 (`prefill_backend`).
 """
 
 from __future__ import annotations
 
+from functools import cache
 from typing import Any
 
 import torch
 from torch import nn
 from vllm.distributed import get_tensor_model_parallel_world_size
 from vllm.model_executor.layers.attention import MLAAttention
+from vllm.model_executor.layers.attention.mla_attention import MLACommonBackend
 from vllm.model_executor.layers.linear import (
     ColumnParallelLinear,
     MergedColumnParallelLinear,
     ReplicatedLinear,
     RowParallelLinear,
 )
+from vllm.v1.attention.backend import subclass_attention_backend
 from vllm.v1.attention.backends.mla.prefill.flash_attn import FlashAttnPrefillBackend
 from vllm.v1.attention.backends.mla.prefill.selector import get_mla_prefill_backend
+from vllm.v1.attention.selector import get_attn_backend
 
 from .common import ACTIVATIONS, Ctx, Layer, Norm, Rope, Site, logit_gain, unsupported
 from .config import LATENT
@@ -86,6 +93,45 @@ def prefill_backend(vllm_config: Any) -> type | None:
             raise
         return FlashAttnPrefillBackend
     return None
+
+
+def decode_backend(head_size: int, heads: int, cache_config: Any) -> Any:
+    """The MLA backend for a latent cache of `head_size` a token: None, vLLM's own
+    pick, where MLA's metadata takes the size; vLLM's pick by `any_head_size`
+    otherwise, as `MLAAttention` would pick it (``--attention-backend`` too)."""
+    if MLACommonBackend.supports_head_size(head_size):
+        return None
+    dtype, cache_dtype = torch.get_default_dtype(), cache_config.cache_dtype
+    picked = get_attn_backend(
+        head_size, dtype, cache_dtype, use_mla=True, num_heads=heads
+    )
+    return any_head_size(picked)
+
+
+@cache
+def any_head_size(backend: Any) -> Any:
+    """`backend`, its metadata checked by the head sizes it takes itself rather
+    than by every MLA backend's few (``MLACommonMetadata``'s check): vLLM's own
+    subclass of a backend with a builder of its own, as for chunked attention."""
+
+    class Builder(backend.get_builder_cls()):
+        def __init__(self, *args: Any, **kwargs: Any):
+            super().__init__(*args, **kwargs)
+            self.metadata_cls = checked_by(self.metadata_cls, backend)
+
+    return subclass_attention_backend("Bux", backend, Builder)
+
+
+@cache
+def checked_by(metadata: type, backend: Any) -> type:
+    """The MLA metadata class `metadata`, its head size checked by `backend`'s."""
+
+    def check(self: Any) -> None:
+        size = self.head_dim
+        if size is not None and not backend.supports_head_size(size):
+            raise ValueError(f"{backend.get_name()} takes no head size {size}")
+
+    return type(metadata.__name__, (metadata,), {"__post_init__": check})
 
 
 class LatentAttention(Layer):
@@ -174,6 +220,9 @@ class LatentAttention(Layer):
             kv_b_proj=self.kv_b,
             cache_config=site.vllm_config.cache_config,
             prefix=name,
+            attn_backend=decode_backend(
+                self.rank + self.r, self.h, site.vllm_config.cache_config
+            ),
             prefill_backend_cls=prefill_backend(site.vllm_config),
         )
 
