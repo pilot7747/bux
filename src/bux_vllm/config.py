@@ -4,16 +4,17 @@ what vLLM asks of every model, derived from it.
 The plugin registers it for ``model_type`` ``bux``, so vLLM loads an export without
 its remote code. vLLM sizes the KV cache and checks tensor parallelism by the model's
 attention heads (``num_attention_heads``, ``num_key_value_heads``, ``head_dim``):
-they are its first attention layer's. ``layer_types`` lists the kinds of state of
-each call that keeps any, in the order they run, which tells vLLM whether the model
-is a hybrid of attention and recurrent layers (or convs, which keep their last
-inputs).
+they are its first attention layer's (a ``csa`` layer's latents are one key-value
+head, which its own caches keep, `bux_vllm.csa`). ``layer_types`` lists the kinds
+of state of each call that keeps any, in the order they run, which tells vLLM
+whether the model is a hybrid of attention and recurrent layers (or convs, which
+keep their last inputs).
 
 A model whose attention is ``mla`` also carries the latent's dims, as DeepSeek's
 configs do (`LATENT`): vLLM reads them to size the latent KV cache, pick its MLA
 backends and check them (`bux_vllm.arch` tells vLLM the model is MLA). They are one
 set for the model, so its ``mla`` layers must agree on them, and vLLM runs all of a
-model's softmax attention as MLA or none of it, so ``mla`` and ``gqa`` do not mix.
+model's softmax attention as MLA or none of it, so ``mla`` mixes with no other.
 """
 
 from __future__ import annotations
@@ -28,6 +29,7 @@ from .plan import live, plan
 STATES = {
     "gqa": "full_attention",
     "mla": "full_attention",
+    "csa": "full_attention",
     "mamba2": "mamba",
     "gdn": "linear_attention",
     "kda": "linear_attention",
@@ -36,7 +38,7 @@ STATES = {
 }
 
 #: The softmax attention layer types, whose first sets the heads vLLM reads.
-ATTENTION = ("gqa", "mla")
+ATTENTION = ("gqa", "mla", "csa")
 
 #: The dims of an ``mla`` layer that vLLM reads from the config, as DeepSeek's name
 #: them: the query and key-value latents' widths, and each head's dims.
@@ -116,12 +118,13 @@ class BuxConfig(PreTrainedConfig):
         attention layer (none for a model without one), and an MLA's latent dims.
 
         Raises:
-            NotImplementedError: The model mixes ``gqa`` and ``mla``, or its ``mla``
-                layers differ in their heads or dims.
+            NotImplementedError: The model mixes ``mla`` with other softmax
+                attention, or its ``mla`` layers differ in their heads or dims.
         """
         attn = [n for n in layers if n["config"]["type"] in ATTENTION]
-        if len({n["config"]["type"] for n in attn}) > 1:
-            raise NotImplementedError("gqa beside mla not in vLLM: MLA is model-wide")
+        kinds = {n["config"]["type"] for n in attn}
+        if "mla" in kinds and len(kinds) > 1:
+            raise NotImplementedError("mla beside gqa or csa: MLA is model-wide")
         if not attn:
             self.num_attention_heads = self.num_key_value_heads = self.head_dim = 0
             return
@@ -129,11 +132,9 @@ class BuxConfig(PreTrainedConfig):
         if c["type"] == "mla":
             self._set_latent([n["config"] for n in attn])
             return
-        self.num_attention_heads, self.num_key_value_heads = (
-            c["num_heads"],
-            c["num_kv_heads"],
-        )
-        self.head_dim = c["head_dim"] or attn[0]["width"] // c["num_heads"]
+        heads, kv = c["num_heads"], c.get("num_kv_heads", 1)  # csa: one latent head
+        self.num_attention_heads, self.num_key_value_heads = heads, kv
+        self.head_dim = c["head_dim"] or attn[0]["width"] // heads
 
     def _set_latent(self, attn: list[dict]) -> None:
         """Set the heads and `LATENT` dims of the ``mla`` layers `attn`: every head
