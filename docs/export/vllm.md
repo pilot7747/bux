@@ -715,20 +715,25 @@ parentheses is bux's own bfloat16 error, against the same reference:
 | `kv-share` | Hymba's cross-layer KV sharing: a windowed layer's keys and values read by the next one or two, a full layer's by one with a window of its own | 1.1e-5 | 0.13 (0.19) | 0.20 |
 | `relbias` | Inkling's attention: a relative bias, a conv on keys and values, a length scale, window-only layers biased over their window | 6.2e-6 | 0.080 (0.10) | 0.075 |
 | `dsa` | DSA's top 8 of the keys, a window, sinks and a softcap | 7.6e-6 | 2.4 (2.0) | 2.4 |
-| `dsa-conv` | an indexer beside the conv on keys and values, QK-norm, a gate, the `v` port | 6.2e-6 | 3.3 (3.1) | 3.3 |
-| `dsa-share` | DSA's picks shared through the `index` port with two layers, the last with a window | 7.2e-6 | 3.9 (4.2) | 3.9 |
+| `dsa-conv` | an indexer beside the conv on keys and values, QK-norm, a gate, the `v` port | 6.2e-6 | 3.3 (3.1) | 4.1 |
+| `dsa-share` | DSA's picks shared through the `index` port with two layers, the last with a window | 6.7e-6 | 3.9 (4.2) | 3.9 |
 | `msa` | MSA's max-pooled blocks of 4, picks per group, plain dots, summed heads, the indexer's norm | 5.7e-6 | 3.5 (3.3) | 3.6 |
-| `msa-share` | MSA's picks shared through the `index` port | 8.1e-6 | 4.7 (4.7) | 4.7 |
-| `qsa` | QSA's mean-pooled blocks of 4, partial RoPE | 8.1e-6 | 0.63 (3.1) | - |
-| `csa` | compressed sparse attention: groups of 4, a window of 16, the indexer's top 8, sinks | 6.7e-6 | 0.42 (2.7) | 0.62 |
+| `msa-share` | MSA's picks shared through the `index` port | 8.6e-6 | 4.7 (4.7) | 4.7 |
+| `qsa` | QSA's mean-pooled blocks of 4, partial RoPE | 7.6e-6 | 0.63 (3.1) | - |
+| `csa` | compressed sparse attention: groups of 4, a window of 16, the indexer's top 8, sinks | 6.7e-6 | 0.42 (2.7) | 2.0 |
+| `dsa-native` | DSA on vLLM's DSA kernels: an indexer of 4 heads of 64, its top 16, one layer that reads its picks | - | 3.8 (4.9) | 3.8 |
+| `dsa-hybrid` | the same on the hybrid's global layer (QK-norm, a gate, the conv on keys and values), beside KDA | - | 0.39 (0.65) | 0.41 |
+| `qsa-native` | QSA on vLLM's DSA kernels: blocks of 4, 4 heads of 64, partial RoPE | - | 3.1 (5.1) | 3.1 |
+| `msa-native` | MSA on vLLM's MiniMax-M3 kernels: blocks of 128, an index head a kv head | - | 0.088 (0.094) | 0.067 |
+| `mla-dsa-native` | sparse MLA with its indexer on vLLM's DSA kernels (`BUX_VLLM_SPARSE_KERNELS=native`) | - | 3.1 (3.5) | - |
 | `csa-latent` | DeepSeek-V4.1's wiring of csa: a window-only layer and one compressing pairs, a query latent, a grouped low-rank output | 6.2e-6 | 0.31 (0.88) | - |
 | `csa-ports` | DeepSeek-V4.1's ports: a layer that compresses pairs, indexes them and makes a candidate pool, one that reads its latents and picks, one that re-indexes inside the pool | 8.1e-6 | 0.87 (1.4) | - |
 | `mla` | MLA with a latent of 256 and 32 rotated dims (Triton's MLA) | - | 0.10 (0.10) | 0.097 |
 | `mla-moe` | the same MLA beside a sigmoid MoE | - | 1.6 (0.093), differs | 1.4 |
 | `mla-chunked` | the same MLA prefilled 16 tokens per step (`max_num_batched_tokens=16`), each later chunk attending to the latents the earlier ones cached | - | 0.078 (0.10) | 0.085 |
 | `mla-deepseek` | MLA at DeepSeek-V3's dims (FlashInfer's), a query latent, interleaved YaRN, a gate per head, an output norm | - | 0.089 (0.14) | - |
-| `mla-dsa` | sparse MLA, DeepSeek-V3.2's: an indexer, a window, sinks and a softcap | 6.7e-6 | 2.6 (2.7) | - |
-| `mla-share` | sparse MLA, GLM-5.3's: picks shared through the `index` port | 8.1e-6 | 3.3 (2.8) | - |
+| `mla-dsa` | sparse MLA, DeepSeek-V3.2's: an indexer, a window, sinks and a softcap | 7.6e-6 | 2.6 (2.7) | - |
+| `mla-share` | sparse MLA, GLM-5.3's: picks shared through the `index` port | 8.6e-6 | 3.3 (2.8) | - |
 | `moe` | a softmax router, unnormalized top-2 of 8, a gated shared expert | 6.7e-6 | 0.68 (1.2) | - |
 | `moe-grouped` | a sigmoid router, 4 groups, the aux-free bias, a scaling of 2.5 | 8.6e-6 | 2.1 (3.8) | 1.8 |
 | `moe-relu2` | a `sqrtsoftplus` router, plain relu2 experts | 5.7e-6 | 1.8 (1.4) | - |
@@ -769,6 +774,13 @@ keys' scores are within bfloat16's rounding of each other, a token's picks chang
 and so does its output. Two cases differ: `moe-sink` at TP=2 picks a token 1.8
 below the best, at bux's own 1.8; and `mla-moe` on one GPU is off by 1.6, where
 bux's own bfloat16 run is off by 0.093 (at TP=2, by 1.4 against bux's own 1.1).
+The `-native` cases run vLLM's sparse kernels, in bfloat16 alone. Those on its DSA
+kernels are compared with bux's indexer scoring in FP8 too (`--fp8-indexer`). In
+float32, with the kernels forced (`BUX_VLLM_SPARSE_KERNELS=native`), they differ
+from that reference by up to 3.4: FP8 scores often tie exactly, and vLLM's top-k
+breaks a tie its own way, where bux keeps the first key.
+`msa-native`'s prompts fit in one block of 128, so it checks the kernels' attention
+and plumbing; `scripts/vllm_native.py` checks their picks, which agree with bux's.
 `gdn`, `kda`, `kda-odd`, `kda-kimi` and the `mla` cases run in bfloat16 only, and
 `gla` without a conv in float32 alone. A `-` marks a case not measured that way.
 
