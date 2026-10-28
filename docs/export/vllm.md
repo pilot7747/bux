@@ -117,7 +117,12 @@ weight's scale per output channel (llm-compressor's FP8_DYNAMIC), and
 FP8). Emulated on the `gpt3`, `llama` and `frontier` models of
 [Checking FP8](#checking-fp8), they come within 0.002 of cosine of `fp8`: the
 rounding of the inputs, which all three scale as they run, is most of what FP8
-costs.
+costs. On a B300 (SM 10.3), `fp8_per_channel` runs, its routed experts on Triton's
+kernels. `fp8_per_block` does not with its default GEMM, DeepGEMM's, whose JIT
+fails there (CUDA error 719). To serve it by another GEMM, name the GEMM in the
+engine's `kernel_config`, as in
+`kernel_config={"linear_backend_per_quant": {"fp8_block_w8a8": "cutlass"}}` (or
+`"triton"`). Those are not measured yet.
 
 - **Quantized:** every projection the plugin runs on vLLM's linear layers, and the
   routed and shared experts. That is attention's q, k, v, gate and output
@@ -162,12 +167,21 @@ in bfloat16.
 
 | Layers | FP8 KV cache |
 |--------|--------------|
-| `gqa` | yes, by vLLM's attention: sliding windows, sinks, soft-capping, gates, QK-norm, `kv_conv_size` (its conv state stays in the model's dtype), the `v` port, and the `kv` port (a reader attends to its writer's FP8 cache) |
+| `gqa` | yes, by vLLM's attention: sliding windows, sinks, soft-capping, gates, QK-norm, `kv_conv_size` (its conv state stays in the model's dtype), the `v` port, and the `kv` port (a reader attends to its writer's FP8 cache). On SM 10.x, see the note on FlashAttention below |
 | `gqa` with an indexer, the `index` port or a relative bias | refused: its cache is the plugin's ([Sparse attention](#sparse-attention)) |
-| `mla` | yes, by vLLM's MLA backends that take FP8: Triton's, FlashInfer's on SM 10.x. A prompt's cached context is dequantized as it is gathered, by vLLM's kernel or, for the latent sizes it lacks, the plugin's |
+| `mla` | yes, by vLLM's MLA backends that take FP8: Triton's (a latent of 256 and 32 rotated dims), FlashInfer's on SM 10.x (DeepSeek's dims). A prompt's cached context is dequantized as it is gathered, by vLLM's kernel or, for the latent sizes it lacks, the plugin's. Where no prefill backend of vLLM's takes the dims, the prefill is FlashAttention's, in the model's dtype |
 | `mla` with an indexer or the `index` port | refused: its cache is the plugin's |
 | `csa` | refused: its caches are the plugin's ([Compressed sparse attention](#compressed-sparse-attention)) |
 | `mamba`, `mamba2`, `gdn`, `kda`, `gdn2`, `rwkv7`, `deltanet`, `gla`, `lightning`, `conv`, `short_conv`, `engram` | no KV cache: their states follow `--mamba-cache-dtype` and `--mamba-ssm-cache-dtype` |
+
+:::{warning}
+On a B300 (SM 10.x), vLLM 0.32 attends with FlashAttention (its FA4) where
+FlashInfer does not take a layer, such as at heads of 32 dims. FA4 with an FP8 KV
+cache fails where a rank keeps one KV head ("Expected strides[leading_dim] == 1"):
+under tensor parallelism, or with one KV head to begin with. It also served the
+`kv-conv` case wrong, which crashed on a device-side assert. Pass
+`--attention-backend TRITON_ATTN`, under which both run.
+:::
 
 ## Checking FP8
 
@@ -202,7 +216,7 @@ exports has no transformers model to emulate, and its accuracy goes unchecked.
 
 These tiny models of random weights lose far more to FP8 than a trained model
 does. The mean cosine at the prompts' positions, emulated on the CPU and measured
-on one B300 with vLLM 0.32.0 on 2026-10-28:
+on one B300 with vLLM 0.32.0 on 2026-10-28, with Triton's MoE kernels:
 
 | Case | Emulated: weights | vLLM: weights | Emulated: weights and KV cache | vLLM: weights and KV cache |
 |------|-------------------|---------------|--------------------------------|----------------------------|
@@ -210,6 +224,18 @@ on one B300 with vLLM 0.32.0 on 2026-10-28:
 | `llama` | 0.9797 | 0.9803 | 0.9749 | 0.9746 |
 | `frontier` | 0.9629 | 0.9631 | 0.9584 | 0.9599 |
 | `hybrid` | 0.9709 | 0.9714 | 0.9706 | 0.9715 |
+
+Every case passed that day:
+- **The four milestones:** in FP8 at TP=1 and TP=2, with an FP8 KV cache at TP=1,
+  and for `frontier` and `hybrid` at TP=2 too, and under `fp8_per_channel`.
+- **`kv-conv-64`**, with an FP8 KV cache.
+- **The MLA cases**, with an FP8 KV cache: `mla`, `mla-chunked`, `mla-moe` and
+  `mla-deepseek`.
+- **On Triton's attention, with an FP8 KV cache:** `kv-conv`, and `kv-share` and
+  `gpt-oss` at TP=2.
+
+At the prompts' positions, vLLM's mean cosine was within 0.006 of the emulation's
+in every run.
 
 ## How it works
 
