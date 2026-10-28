@@ -25,7 +25,13 @@ extensions = [
     "bux_sphinx",
 ]
 
-exclude_patterns = ["_build", "_generated", "Thumbs.db", ".DS_Store"]
+exclude_patterns = [
+    "_build",
+    "_generated",
+    "tutorials/timeline/tables",
+    "Thumbs.db",
+    ".DS_Store",
+]
 templates_path = ["_templates"]
 default_role = "py:obj"  # `name` is code, and a link where it names something
 highlight_language = "text"
