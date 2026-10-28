@@ -339,6 +339,7 @@ CASES = {
     " routed_scaling_factor=2.5, load_balancing=aux_free, expert=dense)\n"
     + "model = embed [rmsnorm attn] [rmsnorm ffn] [rmsnorm attn] [rmsnorm experts]"
     " rmsnorm head",
+    "mla-chunked": HEAD + LATENT + FFN + BLOCK + "model = embed block^2 rmsnorm head",
     "mla-deepseek": HEAD
     + DEEPSEEK
     + "gated = attn(gated=true, gate_per_head=true, output_norm=rmsnorm)\n"
@@ -436,6 +437,11 @@ CASES = {
     + "model = embed [rmsnorm window] [rmsnorm ffn] [rmsnorm pairs] [rmsnorm ffn]"
     " rmsnorm head",
 }
+
+#: The engine settings of a case of its own: mla-chunked prefills 16 tokens a step,
+#: so that each later chunk of a prompt attends to the latents its earlier ones
+#: cached (vLLM's chunked-context prefill, as a cached prefix does).
+ENGINES = {"mla-chunked": {"max_num_batched_tokens": 16, "max_num_seqs": 4}}
 
 LENGTHS = (3, 17, 40, 64)  # the prompts', in one batch: within and past a window
 STEPS = 16  # tokens decoded after each
@@ -611,8 +617,8 @@ def engine(args: argparse.Namespace) -> dict:
 
 def run(where: Path, tag: str, engine: dict) -> None:
     """Decode the prompts of the export at `where` greedily with vLLM, its engine
-    made with the arguments `engine`; keep the tokens and every position's
-    log-probabilities in ``<tag>.npz``."""
+    made with the arguments `engine` and the case's own (`ENGINES`); keep the
+    tokens and every position's log-probabilities in ``<tag>.npz``."""
     from vllm import LLM, SamplingParams
     from vllm.inputs import TokensPrompt
 
@@ -626,7 +632,7 @@ def run(where: Path, tag: str, engine: dict) -> None:
         max_logprobs=vocab,
         gpu_memory_utilization=0.5,
         seed=0,
-        **engine,
+        **engine | ENGINES.get(meta["name"], {}),
     )
     params = SamplingParams(
         temperature=0.0,

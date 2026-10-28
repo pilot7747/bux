@@ -296,6 +296,9 @@ by those dims and the GPU. On a B300 (SM 10.x):
   them), and vLLM picks among them. For any other dims the plugin uses
   FlashAttention's MLA prefill, which on a B300 (FlashAttention 4) takes query, key
   and value heads of 8 to 128 dims.
+- **Cached context.** A prompt's chunk attends to the latents its earlier chunks
+  cached, or a cached prefix's, by gathering them first. vLLM's gather kernel takes
+  320, 512 or 576 values per token; the plugin gathers other sizes in PyTorch.
 
 To pick the decoding backend yourself, name it, as for any model:
 
@@ -445,6 +448,8 @@ measured that way.
 
 These cases check further settings, not yet measured:
 
+- `mla-chunked`: `mla` prefilled 16 tokens per step (`max_num_batched_tokens=16`),
+  so that each later chunk attends to the latents the earlier ones cached.
 - `dyt`: Dynamic Tanh in place of every norm.
 - `conv`: Inkling's shortcut, a conv on branch outputs, `y + conv(y)`.
 - `short-conv`: LFM2's double-gated short conv beside attention.
