@@ -20,6 +20,7 @@ export (``bux.export.hf.csa``) on paged caches of their own.
 from __future__ import annotations
 
 import math
+from collections.abc import Callable
 from dataclasses import dataclass
 
 import torch
@@ -368,11 +369,13 @@ def mix(
     rows: torch.Tensor | None,
     index: tuple[torch.Tensor, torch.Tensor] | None,
     sinks: torch.Tensor | None,
+    attend_by: Callable[..., torch.Tensor] | None = None,
 ) -> torch.Tensor:
     """A step of a ``csa`` call: write its token latents (T, d) and compressed rows
     (T, width, for the tokens that end a group), pick the compressed latents each
     query keeps (by the indexer's queries and weights, `index`), and attend the
-    queries q (T, h, d) to them and their windows; (T, h, d)."""
+    queries q (T, h, d) to them and their windows, by `attend` or `attend_by` (the
+    plugin's kernel, `bux_vllm.kernels.csa_attend`); (T, h, d)."""
     caches.window.write(caches.slots, latent)
     kept = None
     if s.ratio is not None and rows is not None:
@@ -381,7 +384,7 @@ def mix(
         kept = every(seen, steps.longest // s.ratio)
         if index is not None:
             kept = select(caches, steps, s, *index)
-    return attend(caches, steps, s, q, kept, sinks)
+    return (attend_by or attend)(caches, steps, s, q, kept, sinks)
 
 
 # --- the layer's own arithmetic ----------------------------------------------------
