@@ -147,6 +147,9 @@ CASES = {
     + "delta = gdn(num_heads=2, num_v_heads=4, head_dim=32)\n"
     + "model = embed [rmsnorm delta] [rmsnorm ffn] [rmsnorm delta] [rmsnorm ffn]"
     " [rmsnorm attn] [rmsnorm ffn] rmsnorm head",
+    "hc": LLAMA + "residual = hc(expansion=4)\nmodel = embed block^2 rmsnorm head",
+    "attnres": LLAMA
+    + "residual = attnres(block_size=3)\nmodel = embed block^2 rmsnorm head",
 }
 
 LENGTHS = (3, 17, 40, 64)  # the prompts', in one batch: within and past a window

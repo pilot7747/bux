@@ -1,13 +1,16 @@
 """bux's vLLM plugin (bux_vllm) builds what bux.export names: it places every
-layer of every example architecture where bux.export.plan does, imports nothing of
-bux, and reads an export's config.json as vLLM needs it. Whether vLLM then computes
-what bux does takes a GPU: scripts/vllm_parity.py checks it."""
+layer and residual algebra's branch of every example architecture where
+bux.export.plan does, imports nothing of bux, reads an export's config.json as vLLM
+needs it, and its plain PyTorch pieces (the router, RoPE, the residual algebras)
+compute what the export does. Whether vLLM then computes what bux does takes a GPU:
+scripts/vllm_parity.py checks it."""
 
 import ast
 import importlib.util
 import json
 from pathlib import Path
-from types import ModuleType
+from types import ModuleType, SimpleNamespace
+from typing import Any
 
 import jax
 import numpy as np
@@ -19,8 +22,9 @@ from bux import config as cfg
 from bux.architecture.attention import rope as bux_rope
 from bux.architecture.experts.moe import MoE
 from bux.export import plan as core
+from bux.export.hf import residual as hf_residual
 from bux.lang import compile, compile_file
-from bux_vllm import common, config, plan, routing
+from bux_vllm import common, config, plan, residual, routing
 
 ROOT = Path(__file__).parent.parent
 EXAMPLES = sorted((ROOT / "examples" / "architectures").rglob("*.bux"))
@@ -46,16 +50,27 @@ def calls(arch) -> list[tuple[str, bool]]:
     return [(c.path, c.first) for c in tree.calls]
 
 
+def assert_placed_as_bux_export(arch) -> None:
+    """Assert that the plugin places `arch`'s layers and residual algebra's
+    branches, in the order they run, where bux.export.plan does."""
+    tree = plan.plan(arch.model_dump(mode="json"), core.RESERVED)
+    theirs = core.plan(arch)
+    assert calls(arch) == [(c.path, c.first) for c in theirs.calls]
+    assert [(b.path, b.first) for b in tree.branches] == [
+        (b.path, b.first) for b in theirs.branches
+    ]
+    starts = [sum(c.trail < b.trail for c in theirs.calls) for b in theirs.branches]
+    assert [b.calls for b in tree.branches] == starts
+
+
 @pytest.mark.parametrize("path", EXAMPLES, ids=lambda p: p.stem)
 def test_layers_are_where_bux_export_puts_them(path: Path) -> None:
-    arch = compile_file(str(path))
-    assert calls(arch) == [(c.path, c.first) for c in core.plan(arch).calls]
+    assert_placed_as_bux_export(compile_file(str(path)))
 
 
 @pytest.mark.parametrize("name", vllm_parity.CASES)
 def test_parity_cases_are_where_bux_export_puts_them(name: str) -> None:
-    arch = compile(vllm_parity.CASES[name])
-    assert calls(arch) == [(c.path, c.first) for c in core.plan(arch).calls]
+    assert_placed_as_bux_export(compile(vllm_parity.CASES[name]))
 
 
 def test_reserved_labels_are_named_as_bux_export_names_them() -> None:
@@ -188,3 +203,98 @@ def test_experts_load_alike_from_bux_and_transformers(gated: bool) -> None:
         assert [s for s, _ in a] == [s for s, _ in b]
         for (_, x), (_, y) in zip(a, b, strict=True):
             torch.testing.assert_close(x, y)
+
+
+HEAD = "d_model = 16\nvocab_size = 64\n"
+RESIDUALS = {
+    "hc": "hc(expansion=2)",
+    "hc static": "hc(expansion=3, dynamic=false)",
+    "hc single pass": "hc(expansion=2, single_pass=true, norm_eps=1e-3)",
+    "attnres": "attnres()",
+    "attnres blocks": "attnres(block_size=2)",
+    "attnres block under way": "attnres(block_size=4, norm_eps=1e-5)",
+}
+
+
+def algebra(setting: str) -> dict:
+    """The residual algebra `setting`, as config.json holds it."""
+    arch = compile(f"{HEAD}residual = {setting}\nmodel = embed [rmsnorm] head")
+    assert arch.residual is not None
+    return arch.residual.model_dump(mode="json")
+
+
+def stand_in(**attributes: Any) -> Any:
+    """A forward pass's context, or a layer's site, of `attributes` alone."""
+    return SimpleNamespace(**attributes)
+
+
+def twins(theirs: torch.nn.Module, mine: common.Layer) -> None:
+    """Give the export's module `theirs` random parameters, and `mine` the same by
+    their names, as the plugin loads the checkpoint."""
+    for name, param in theirs.named_parameters():
+        param.data = torch.randn_like(param) / 2
+        mine.load(name, param.data)
+    assert {n for n, _ in mine.named_parameters()} == {
+        n for n, _ in theirs.named_parameters()
+    }
+
+
+def through(branches: list, x: Any, ctx: Any, body: torch.Tensor) -> tuple[list, Any]:
+    """Run the stream `x` through `branches`, each body ``tanh(h body)``; return what
+    each read, and the stream after them."""
+    reads = []
+    for branch in branches:
+        h, kept = branch.read(x, ctx)
+        reads.append(h)
+        x = branch.write_back(kept, torch.tanh(h @ body))
+    return reads, x
+
+
+@pytest.mark.parametrize("setting", RESIDUALS.values(), ids=RESIDUALS.keys())
+def test_residual_branches_compute_what_the_export_does(setting: str) -> None:
+    """Six branches of the algebra, then a merge, of one row of tokens: the
+    plugin's, on the tokens side by side, read what the export's do."""
+    c, d = algebra(setting), 16
+    torch.manual_seed(0)
+    theirs = [hf_residual.ALGEBRAS[c["type"]](c, d) for _ in range(6)]
+    mine = [residual.ALGEBRAS[c["type"]](c, d) for _ in range(6)]
+    for a, b in zip(theirs, mine, strict=True):
+        twins(a, b)
+    tokens, body = torch.randn(5, d), torch.randn(d, d) / d**0.5
+    copies = hf_residual.widening(c)
+    x = tokens[None] if copies is None else hf_residual.widen(tokens[None], copies)
+    ctx, ctx_mine = (
+        SimpleNamespace(pending_read=None),
+        SimpleNamespace(pending_read=None),
+    )
+    reads, x = through(theirs, x, ctx, body)
+    got, y = through(mine, residual.widen(c, tokens), ctx_mine, body)
+    for g, h in zip(got, reads, strict=True):
+        torch.testing.assert_close(g, h[0])
+    if copies is None:  # one stream, which nothing merges
+        torch.testing.assert_close(y, x[0])
+        return
+    config = stand_in(bux={"residual": c, "d_model": d}, hidden_size=d)
+    merge = hf_residual.Merge({}, "streams", stand_in(config=config))
+    merge_mine = residual.Merge({}, "streams", stand_in(config=config))
+    twins(merge, merge_mine)
+    torch.testing.assert_close(merge_mine(y, ctx_mine), merge(x, ctx)[0])
+
+
+def test_attnres_states_sum_and_scale_as_the_exports() -> None:
+    """attnres's states, summed and scaled as a graph may, read as the export's
+    stacked ones do."""
+    c, d = algebra("attnres(block_size=2)"), 16
+    torch.manual_seed(0)
+    theirs, mine = hf_residual.AttentionResidual(c, d), residual.AttentionResidual(c, d)
+    twins(theirs, mine)
+    rows = torch.randn(2, 5, 4, d)  # 2 states of 5 tokens: the embedding, 3 outputs
+    states = []
+    for row in rows:
+        state = residual.Sources((row[:, 0],))
+        for i in (1, 2, 3):
+            state = state.add(row[:, i], c["block_size"])
+        states.append(state)
+    ctx = stand_in(pending_read=None)
+    want = theirs.read((rows[0] * 0.5 + -rows[1])[None], ctx)[0][0]
+    torch.testing.assert_close(mine.read(states[0] * 0.5 + -states[1], ctx)[0], want)

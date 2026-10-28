@@ -80,6 +80,8 @@ class Ctx:
         embedding: The model's first embedding, once it ran.
         hidden: The first head's input, once it ran: the hidden states vLLM takes
             logits of.
+        pending_read: The read coefficients, (T, n), the last single-pass hc or mhc
+            branch computed for the next one; None before the first.
     """
 
     def __init__(
@@ -94,6 +96,7 @@ class Ctx:
         self.taps: dict[str, list] = {}
         self.embedding: Any = None
         self.hidden: torch.Tensor | None = None
+        self.pending_read: torch.Tensor | None = None
         self._calls: dict[str, int] = {}
 
     def push(self, name: str, x: Any) -> Any:
