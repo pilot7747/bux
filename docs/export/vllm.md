@@ -288,9 +288,9 @@ layer: a window, sinks, a softcap, and a `gqa` layer's conv on keys and values a
   the PyTorch path, which gathers each query's scores, keys and values into memory
   first and so moves several times the bytes (`BUX_VLLM_SPARSE_KERNELS=torch` asks
   for it). `scripts/vllm_kernels.py` compares the two on a GPU. Either way the work
-  runs in ops that vLLM runs eagerly between its CUDA graphs: a model with a sparse
-  layer runs vLLM's piecewise CUDA graphs, never a whole decoding step as one
-  graph.
+  runs in ops that vLLM's piecewise CUDA graphs run between their pieces, and a
+  step of decoded tokens alone is one CUDA graph: as captured, its tokens read up
+  to `max_model_len` keys, which every replay of it may have.
 - **Latents.** A sparse `mla` layer caches what vLLM's MLA does: each token's
   normalized latent and its rotated key dims, one head of `kv_lora_rank +
   qk_rope_head_dim`. Each head's queries take in its key projection, attend to the
