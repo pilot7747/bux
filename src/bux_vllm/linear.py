@@ -137,11 +137,23 @@ def gla_projection(c: dict, ranks: int) -> Projection:
 
 def zero_padding(layer: nn.Module, columns: int) -> None:
     """Zero the weights of a fused projection's last `columns` outputs, its padding
-    (`bux_vllm.linear.aligned`), which no checkpoint holds."""
+    (`bux_vllm.linear.aligned`), which no checkpoint holds: by the weight's loader,
+    as its last shard, where it has one. vLLM's online quantization makes the
+    weight on the meta device and fills it only once its loader has loaded all of
+    it, so the padding must go through the loader too, or its garbage would set the
+    weight's scale."""
     weight = layer.weight
     assert isinstance(weight, torch.Tensor)
-    if columns:
+    loader = getattr(weight, "weight_loader", None)
+    if not columns:
+        return
+    if loader is None:
         weight.data[-columns:].zero_()
+        return
+    sizes = layer.output_sizes  # all ranks', the padding last
+    assert isinstance(sizes, (list, tuple))
+    zeros = torch.zeros(sizes[-1], weight.shape[1], dtype=weight.dtype, device="cpu")
+    loader(weight, zeros, len(sizes) - 1)
 
 
 def slopes(heads: int, layer: int, layers: int) -> torch.Tensor:

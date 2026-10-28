@@ -95,6 +95,62 @@ ones, `--load-format dummy`, to time it.
 - **Unsupported layers.** A layer or setting the plugin does not run raises
   `NotImplementedError` as the model is built, naming it ([What runs](#what-runs)).
 
+## FP8 weights
+
+Serve a bfloat16 export with FP8 weights by vLLM's online quantization. The
+checkpoint stays as it is: vLLM quantizes each weight as it loads it.
+
+```sh
+vllm serve exported/ --dtype bfloat16 --quantization fp8 --moe-backend triton
+```
+
+```python
+llm = LLM(model="exported/", dtype="bfloat16", quantization="fp8", moe_backend="triton")
+```
+
+vLLM 0.32 takes `fp8`, on a checkpoint without FP8 weights, as its `fp8_per_tensor`:
+each weight in FP8 (e4m3) with one scale per tensor, and each GEMM's input
+quantized to FP8 per token as it runs. Its other online schemes, such as
+`fp8_per_block`, reach the same layers.
+
+- **Quantized:** every projection the plugin runs on vLLM's linear layers, and the
+  routed and shared experts. That is attention's q, k, v, gate and output
+  projections (`gqa`, `mla`, `csa`), the MLPs and `linear`, LatentMoE's
+  projections, and the projections of `kda`, `gdn2`, `deltanet`, `gla`,
+  `lightning`, `rwkv7` and `short_conv`, their low-rank ones included. vLLM's own
+  `gdn` layer quantizes its projections too, and so does its Mamba-2, where tensor
+  parallelism splits its groups.
+- **Kept in the model's dtype:** the embeddings and the heads, the routers (which
+  the plugin computes in float32), the shared experts' gate, the norms and convs,
+  the residual algebras, the indexers, `engram`, `mamba` (vLLM's Mamba layer takes
+  no quantization), and the KV cache (`--kv-cache-dtype` sets that). So are the
+  weights the plugin reads itself: a sparse `mla`'s `kv_b`, which its sparse
+  attention reads, and `csa`'s grouped low-rank output.
+- **Dtype.** vLLM's FP8 takes bfloat16 and float16 models only.
+- **Random weights.** `--load-format dummy` quantizes the random weights, so a
+  `.bux` file's export times in FP8 too.
+- **Tensor parallelism.** The layers split over ranks as they do in bfloat16, and
+  each weight's scale is the largest over its ranks' shares.
+
+`scripts/vllm_fp8.py` checks it on a GPU. It serves the same export, with weights,
+in bfloat16 and in FP8, for a llama and for the timeline's milestones at a width of
+256: GPT-3's, and 2026's two, a sliding-window stack and its KDA hybrid, both with
+gates and an MoE of 256 experts. It prints the quantization method vLLM picked for
+each kind of layer, the routed experts' backend, and how close the FP8 logits are to
+bfloat16's:
+
+```sh
+JAX_PLATFORMS=cpu python scripts/vllm_fp8.py export runs/fp8   # bux's environment
+python scripts/vllm_fp8.py run runs/fp8 --moe-backend triton  # vLLM's
+```
+
+A case passes if the cosine of its FP8 logits with bfloat16's is 0.99 or more on
+average, at the prompts' positions and at the decoding steps. FP8 rounds each
+weight and each activation to 3 bits of mantissa, about 3 % RMS, so a matmul's
+output is off by about 4 % and the logits by a few percent, a cosine above 0.995. A
+cosine under 0.99 is an error of over 14 % RMS: a weight loaded in the wrong place,
+or quantized with the wrong scale.
+
 ## How it works
 
 - **The module tree.** `bux_vllm.plan` places every layer where

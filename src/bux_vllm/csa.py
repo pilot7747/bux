@@ -452,8 +452,9 @@ class CompressedSparseAttention(Layer):
         if not compressed.compresses(c, site.ports):
             self.ratio = None  # its own: the compressed latents are the kv port's
         self.parts = compressed.Parts(c, site.ports)
-        self._inputs(c, width, site.path)
-        self._outputs(c, width, site.path, tp)
+        kw = {"bias": False, "return_bias": False, "quant_config": site.quant}
+        self._inputs(c, width, site.path, kw)
+        self._outputs(c, width, site.path, tp, kw)
         self.sinks = _sharded(self.h, dtype=torch.float32) if c["sinks"] else None
         scale = (c["scale"] or self.d**-0.5) * logit_gain(c["rope"])
         settings, dtype = (
@@ -470,10 +471,11 @@ class CompressedSparseAttention(Layer):
             for name in site.caches
         )
 
-    def _inputs(self, c: dict, width: int, path: str) -> None:
-        """The projections of the input: the queries', split by head, and every
-        rank's by one GEMM (`down`): the query latent's, the token latent's, the
-        compressed latent's and its gate's, and the indexer's head weights."""
+    def _inputs(self, c: dict, width: int, path: str, kw: dict) -> None:
+        """The projections of the input, of the linear layers' arguments `kw`: the
+        queries', split by head, and every rank's by one GEMM (`down`): the query
+        latent's, the token latent's, the compressed latent's and its gate's, and
+        the indexer's head weights."""
         d, latent, ix = c["head_dim"], c["q_lora_rank"], c["indexer"]
         self.down_parts, self.down_split = compressed.down(c, self.ports)
         sizes, split = aligned(
@@ -482,53 +484,37 @@ class CompressedSparseAttention(Layer):
         if len(split) > len(self.down_split):  # a part of its own, which none reads
             self.down_split = [*self.down_split, ("padding", split[-1])]
         self.down = MergedColumnParallelLinear(
-            width,
-            sizes,
-            bias=False,
-            return_bias=False,
-            disable_tp=True,
-            prefix=f"{path}.down",
+            width, sizes, disable_tp=True, prefix=f"{path}.down", **kw
         )
         zero_padding(self.down, sum(sizes) - sum(n for _, n in self.down_parts))
         self.q = ColumnParallelLinear(
-            latent or width,
-            c["num_heads"] * d,
-            bias=False,
-            return_bias=False,
-            prefix=f"{path}.q",
+            latent or width, c["num_heads"] * d, prefix=f"{path}.q", **kw
         )
         self.index_q = None
         if ix and not compressed.reads(self.ports, "index"):
             self.index_q = ReplicatedLinear(
                 latent or width,
                 ix["num_heads"] * ix["head_dim"],
-                bias=False,
-                return_bias=False,
                 prefix=f"{path}.indexer.q",
+                **kw,
             )
 
-    def _outputs(self, c: dict, width: int, path: str, tp: int) -> None:
+    def _outputs(self, c: dict, width: int, path: str, tp: int, kw: dict) -> None:
         """The gate on the heads' outputs, by head, and its head bias; the output
         projection, row-parallel, after a grouped low-rank one (``o_a``, its groups
-        split by rank) where ``o_lora_rank`` sets it."""
+        split by rank, in the model's dtype) where ``o_lora_rank`` sets it."""
         h, d, rank = c["num_heads"], self.d, c["o_lora_rank"]
         self.gate = self.gate_bias = None
         self.gate_activation = ACTIVATIONS[c["gate_activation"]]
         if c["gated"]:
             n = h if c["gate_per_head"] else h * d
-            self.gate = ColumnParallelLinear(
-                width, n, bias=False, return_bias=False, prefix=f"{path}.gate"
-            )
+            self.gate = ColumnParallelLinear(width, n, prefix=f"{path}.gate", **kw)
             if c["gate_head_bias"]:
                 self.gate_bias = _sharded(self.h)
         groups = c["o_groups"]
         self.o_a = _sharded(groups // tp, h * d // groups, rank) if rank else None
         self.o = RowParallelLinear(
-            groups * rank if rank else h * d,
-            width,
-            bias=False,
-            return_bias=False,
-            prefix=f"{path}.o",
+            groups * rank if rank else h * d, width, prefix=f"{path}.o", **kw
         )
 
     def targets(self) -> dict[str, tuple[nn.Parameter, tuple]]:

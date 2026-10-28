@@ -17,6 +17,7 @@ from typing import Any
 
 import torch
 from torch import nn
+from vllm.distributed import get_tensor_model_parallel_world_size
 from vllm.model_executor.layers.mamba.gdn.qwen_gdn_linear_attn import (
     QwenGatedDeltaNetAttention,
 )
@@ -63,7 +64,8 @@ class Mamba(Layer):
     """bux's ``mamba`` by vLLM's ``MambaMixer``, as Jamba runs it: u and the gate z
     projected, u convolved with a bias and SiLU'd, the time steps of rank
     ``dt_rank``, B and C RMS-normalized (eps 1e-6), the selective scan with D u, the
-    SiLU(z) gate, and the output projection."""
+    SiLU(z) gate, and the output projection; in the model's dtype, as vLLM's layer
+    takes no quantization config."""
 
     bux_types = ("mamba",)
     stateful = once = True
@@ -120,7 +122,10 @@ class Mamba(Layer):
 class Mamba2(Layer):
     """bux's ``mamba2`` by vLLM's ``MambaMixer2``: the same projection of z, u, B, C
     and dt, conv with a bias and SiLU, SSD scan, D skip, SiLU(z) gate and RMSNorm
-    of each group of heads (eps 1e-5), and output projection."""
+    of each group of heads (eps 1e-5), and output projection. Its projections take
+    the engine's quantization config where the ranks split its groups: where they
+    do not, vLLM gives the input projection a loader of its own, past the one
+    vLLM's online quantization wraps."""
 
     bux_types = ("mamba2",)
     stateful = once = True
@@ -128,7 +133,7 @@ class Mamba2(Layer):
     def __init__(self, c: dict, width: int, site: Site):
         super().__init__()
         inner, heads = mamba2_dims(c, width)
-        vllm = site.vllm_config
+        vllm, tp = site.vllm_config, get_tensor_model_parallel_world_size()
         self.mixer = MambaMixer2(
             hidden_size=width,
             ssm_state_size=c["state_size"],
@@ -142,6 +147,7 @@ class Mamba2(Layer):
             rms_norm_eps=1e-5,
             model_config=vllm.model_config,
             cache_config=vllm.cache_config,
+            quant_config=site.quant if c["num_groups"] % tp == 0 else None,
             prefix=site.caches[0],
         )
 
@@ -175,7 +181,8 @@ class GatedDeltaNet(Layer):
     ``head_dim ** -0.5``, the delta rule with ``exp(-exp(A_log) softplus(a +
     dt_bias))`` decay and ``sigmoid(b)`` steps, each value head's RMSNorm times the
     gate's activation, and the output projection; by bux's own rule without a conv
-    or an output gate, which vLLM's layer has (`bux_vllm.deltanet`)."""
+    or an output gate, which vLLM's layer has (`bux_vllm.deltanet`). vLLM's layer
+    takes the engine's quantization config itself."""
 
     bux_types = ("gdn",)
     stateful = once = True

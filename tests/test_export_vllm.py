@@ -6,10 +6,13 @@ compute what the export does. Whether vLLM then computes what bux does takes a G
 scripts/vllm_parity.py checks it."""
 
 import ast
+import importlib.abc
 import importlib.util
 import itertools
 import json
 import math
+import sys
+from collections.abc import Iterator
 from functools import cache
 from pathlib import Path
 from types import ModuleType, SimpleNamespace
@@ -61,15 +64,17 @@ FILES = sorted(Path(plan.__file__).parent.glob("*.py"))
 
 
 def script(name: str) -> ModuleType:
-    """Import scripts/`name`.py, which is no package's."""
+    """Import scripts/`name`.py, which is no package's, as the module `name`, which
+    the scripts imported after it import."""
     spec = importlib.util.spec_from_file_location(name, ROOT / "scripts" / f"{name}.py")
     assert spec is not None and spec.loader is not None
-    module = importlib.util.module_from_spec(spec)
+    module = sys.modules[name] = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
     return module
 
 
 vllm_parity = script("vllm_parity")
+vllm_fp8 = script("vllm_fp8")
 
 
 def calls(arch) -> list[tuple[str, bool]]:
@@ -1995,3 +2000,309 @@ def test_engram_rows_stay_in_its_tables_on_any_inputs(before: str) -> None:
     rows = ngram.ngram_rows(window, mine.hashes, mine.classes, mine.boundary)
     assert rows.min() >= 0 and rows.max() < mine.table.shape[0]
     assert mine(torch.randn(t, d), ctx).shape == (t, d)
+
+
+# --- vLLM's online FP8 weights, on stand-ins of vLLM's layers ------------------------
+
+
+def counted(param: torch.nn.Parameter) -> torch.nn.Parameter:
+    """`param`, its weight loader counting the elements it loads, as vLLM's online
+    quantization counts them before it fills and quantizes the weight."""
+    param.loaded = 0  # ty: ignore[unresolved-attribute]
+
+    def load(p: Any, tensor: torch.Tensor, *shard: Any) -> None:
+        p.loaded += tensor.numel()
+
+    param.weight_loader = load  # ty: ignore[unresolved-attribute]
+    return param
+
+
+def zeros(*shape: int) -> torch.nn.Parameter:
+    """A parameter of zeros, its loader counting (`counted`)."""
+    return counted(torch.nn.Parameter(torch.zeros(*shape), requires_grad=False))
+
+
+class StubLinear(torch.nn.Module):
+    """vLLM's linear layers on one rank: a weight (out, in) and a bias, their
+    loaders counting, and the quantization config they were made with."""
+
+    def __init__(self, input_size, output_size, bias=False, quant_config=None, **_):
+        super().__init__()
+        self.quant_config = quant_config
+        self.weight = zeros(output_size, input_size)
+        self.bias = zeros(output_size) if bias else None
+
+
+class StubMerged(StubLinear):
+    """vLLM's merged column-parallel layers, of their outputs side by side."""
+
+    def __init__(self, input_size, output_sizes, *_, **kwargs):
+        super().__init__(input_size, sum(output_sizes), **kwargs)
+        self.output_sizes = list(output_sizes)
+
+
+class StubQKV(StubLinear):
+    """vLLM's ``QKVParallelLinear``: q, k and v's heads side by side."""
+
+    def __init__(self, width, dk, heads, kv_heads, v_head_size=None, **kwargs):
+        dv = v_head_size or dk
+        super().__init__(width, heads * dk + kv_heads * (dk + dv), **kwargs)
+
+
+class StubTable(torch.nn.Module):
+    """vLLM's embedding and head, split by vocabulary, and their quantization
+    config."""
+
+    def __init__(self, vocab, width, bias=False, quant_config=None, **_):
+        super().__init__()
+        self.quant_config = quant_config
+        self.weight = torch.nn.Parameter(torch.zeros(vocab, width), requires_grad=False)
+        self.bias = zeros(vocab) if bias else None
+
+    def tie_weights(self, embedding: torch.nn.Module) -> "StubTable":
+        self.weight = embedding.weight
+        return self
+
+
+class StubExperts(torch.nn.Module):
+    """vLLM's routed experts (`FusedMoEFactory`'s): their stacked weights, whose
+    loaders count, and their quantization config."""
+
+    def __init__(self, num_experts, hidden_size, intermediate_size, **kwargs):
+        super().__init__()
+        self.quant_config = kwargs.get("quant_config")
+        shards = 2 if kwargs["ckpt_names"][2] is not None else 1
+        self.w13_weight = zeros(num_experts, shards * intermediate_size, hidden_size)
+        self.w2_weight = zeros(num_experts, hidden_size, intermediate_size)
+        if kwargs["has_bias"]:
+            self.w13_bias = zeros(num_experts, shards * intermediate_size)
+            self.w2_bias = zeros(num_experts, hidden_size)
+
+    def weight_loader(self, *args: Any) -> None:
+        """The layer's own loader, which loads nothing here: vLLM's online
+        quantization wraps the parameters' loaders, not it."""
+
+
+class StubRunner(torch.nn.Module):
+    """What vLLM's ``FusedMoEFactory`` makes: its routed experts, on one rank."""
+
+    def __init__(self, **kwargs):
+        super().__init__()
+        self.routed_experts = StubExperts(**kwargs)
+        rank = SimpleNamespace(tp_rank=0)
+        self.moe_config = SimpleNamespace(moe_parallel_config=rank)
+
+
+class StubModule(torch.nn.Module):
+    """A vLLM module the test does not look into, such as its attention."""
+
+    def __init__(self, *args, **kwargs):
+        super().__init__()
+
+
+class StubNorm(torch.nn.Module):
+    """vLLM's gated RMSNorm (KDA's)."""
+
+    def __init__(self, width, **_):
+        super().__init__()
+        self.weight = torch.nn.Parameter(torch.ones(width), requires_grad=False)
+
+
+class Faked(type):
+    """The type of `Fake`s: any name a fake is asked for (an enum's member, a
+    static method) is a fake too, but not of the classes that subclass one."""
+
+    def __getattr__(cls, name: str) -> Any:
+        if name.startswith("__") or "fake" not in vars(cls):
+            raise AttributeError(name)
+        return fake(name)
+
+
+class Fake(metaclass=Faked):
+    """A name of vLLM's or Triton's that no layer here builds: a class that takes
+    anything, and a decorator."""
+
+    def __init__(self, *args, **kwargs):
+        pass
+
+    def __class_getitem__(cls, item):
+        return cls
+
+    def __call__(self, *args, **kwargs):
+        return self
+
+
+def fake(name: str) -> type:
+    """A `Fake` class named `name`."""
+    return Faked(name, (Fake,), {"fake": True})
+
+
+#: The stand-ins of vLLM's names, by name.
+STUBS: dict[str, Any] = {
+    "ColumnParallelLinear": StubLinear,
+    "RowParallelLinear": StubLinear,
+    "ReplicatedLinear": StubLinear,
+    "MergedColumnParallelLinear": StubMerged,
+    "_KimiGDNMergedColumnParallelLinear": StubMerged,
+    "QKVParallelLinear": StubQKV,
+    "VocabParallelEmbedding": StubTable,
+    "ParallelLMHead": StubTable,
+    "FusedMoEFactory": StubRunner,
+    "Attention": StubModule,
+    "MLAAttention": StubModule,
+    "FusedRMSNormGated": StubNorm,
+    "get_tensor_model_parallel_world_size": lambda: 1,
+    "get_tensor_model_parallel_rank": lambda: 0,
+    "support_torch_compile": lambda **_: lambda cls: cls,
+}
+
+
+class Stubbed(ModuleType):
+    """A module of vLLM's or Triton's, of stand-ins: `STUBS`, a `Fake` else."""
+
+    def __getattr__(self, name: str) -> Any:
+        if name.startswith("__"):
+            raise AttributeError(name)
+        value = STUBS.get(name) or fake(name)
+        setattr(self, name, value)
+        return value
+
+
+class StandIn(importlib.abc.MetaPathFinder, importlib.abc.Loader):
+    """Finds every module of vLLM and Triton, which the test's environment has not,
+    as a `Stubbed` package."""
+
+    def find_spec(self, name, path=None, target=None):
+        if name.split(".")[0] not in ("vllm", "triton"):
+            return None
+        return importlib.util.spec_from_loader(name, self, is_package=True)
+
+    def create_module(self, spec):
+        return Stubbed(spec.name)
+
+    def exec_module(self, module):
+        pass
+
+
+@pytest.fixture
+def stood_in(monkeypatch: pytest.MonkeyPatch) -> Iterator[ModuleType]:
+    """bux_vllm.model, importing stand-ins of vLLM and Triton (`StandIn`); the
+    stand-ins and the plugin's modules that imported them are gone after the
+    test."""
+    before = set(sys.modules)
+    monkeypatch.setattr(sys, "meta_path", [StandIn(), *sys.meta_path])
+    yield importlib.import_module("bux_vllm.model")
+    roots = ("bux_vllm", "vllm", "triton")
+    for name in {n for n in sys.modules if n.split(".")[0] in roots} - before:
+        module = sys.modules.pop(name)
+        parent, _, child = name.rpartition(".")
+        if getattr(sys.modules.get(parent), child, None) is module:
+            delattr(sys.modules[parent], child)
+
+
+def engine_config(where: Path, quant: Any) -> Any:
+    """vLLM's config of an engine serving the export at `where` under the
+    quantization config `quant`, as the plugin's layers read it."""
+    hf = config.BuxConfig.from_dict(json.loads((where / "config.json").read_text()))
+    model = {"dtype": torch.bfloat16, "max_model_len": 128}
+    cache = {"cache_dtype": "auto", "block_size": 16}
+    return SimpleNamespace(
+        model_config=SimpleNamespace(hf_config=hf, use_mla=config.latent(hf), **model),
+        cache_config=SimpleNamespace(**cache),
+        parallel_config=SimpleNamespace(decode_context_parallel_size=1),
+        compilation_config=SimpleNamespace(static_forward_context={}, splitting_ops=[]),
+        quant_config=quant,
+        num_speculative_tokens=0,
+    )
+
+
+def served(source: str, where: Path, module: ModuleType, quant: Any) -> Any:
+    """The plugin's model (`module`'s, on stand-ins) of the model `source`, exported
+    to `where`, its weights loaded, under the quantization config `quant`."""
+    from safetensors.torch import load_file
+
+    arch = compile(source)
+    with vllm_parity.placeholders(arch):
+        save(arch, Model(arch, rngs=nnx.Rngs(0)), where)
+    model = module.BuxForCausalLM(vllm_config=engine_config(where, quant))
+    model.load_weights(load_file(where / "model.safetensors").items())
+    return model
+
+
+def kept(model: Any, path: str) -> bool:
+    """Whether the plugin keeps the vLLM linear layer at `path` in the model's
+    dtype: an MoE's shared experts' gate of one output, as vLLM keeps Qwen's, and
+    a sparse MLA's ``kv_b``, whose weight the sparse ops read."""
+    owner, _, name = path.rpartition(".")
+    if name == "shared_gate":
+        return True
+    return name == "kv_b" and model.get_submodule(owner).spec is not None
+
+
+def assert_quantized(model: Any, quant: Any) -> list:
+    """Assert that every vLLM linear layer and routed experts of `model` take the
+    quantization config `quant` (but those `kept`), and that their weights, padding
+    included, load whole through their loaders; that the embeddings and heads, and
+    the routers' weights, take none. Return the layers that take it."""
+    layers = [
+        (path, m)
+        for path, m in model.named_modules()
+        if isinstance(m, (StubLinear, StubExperts))
+    ]
+    for path, m in layers:
+        assert m.quant_config is (None if kept(model, path) else quant), path
+        for p in m.parameters(recurse=False):
+            assert p.loaded == p.numel(), (path, p.shape, p.loaded)
+    modules = list(model.modules())
+    assert all(m.quant_config is None for m in modules if isinstance(m, StubTable))
+    quantized = [m for path, m in layers if not kept(model, path)]
+    held = {id(p) for m in quantized for p in m.parameters()}
+    routers = [m.router_weight for m in modules if type(m).__name__ == "MoE"]
+    assert not held & {id(p) for p in routers}
+    return quantized
+
+
+#: The kinds of vLLM layers that each milestone quantizes, and its MoE layers.
+MILESTONES = {
+    "gpt3": ({"StubQKV", "StubLinear"}, 0),
+    "llama": ({"StubQKV", "StubLinear", "StubMerged"}, 0),
+    "frontier": ({"StubQKV", "StubLinear", "StubMerged", "StubExperts"}, 3),
+    "hybrid": ({"StubQKV", "StubLinear", "StubMerged", "StubExperts"}, 3),
+}
+
+
+@pytest.mark.parametrize("name", vllm_fp8.CASES)
+def test_fp8_weights_quantize_every_projection_and_expert_alone(
+    name: str, stood_in: ModuleType, tmp_path: Path
+) -> None:
+    """Under vLLM's online FP8 weights, every vLLM linear layer and routed experts
+    of the timeline's milestones (scripts/vllm_fp8.py's, with 8 experts) take the
+    engine's quantization config, and the embeddings, the heads and the routers
+    none. Each such layer's weight, its padding included, loads whole through its
+    loader, which vLLM's online quantization counts before it quantizes it."""
+    source = vllm_fp8.CASES[name].replace("num_experts=256", "num_experts=8")
+    quant = SimpleNamespace(name="fp8")
+    model = served(source, tmp_path, stood_in, quant)
+    kinds, moes = MILESTONES[name]
+    assert {type(m).__name__ for m in assert_quantized(model, quant)} == kinds
+    modules = list(model.modules())
+    assert sum(isinstance(m, StubTable) for m in modules) == 2
+    assert sum(type(m).__name__ == "MoE" for m in modules) == moes
+
+
+#: The parity cases of vLLM's own recurrent layers, which have no stand-ins (vLLM's
+#: Gated DeltaNet takes the quantization config itself), and gla without a conv,
+#: which a 16-bit model refuses.
+OWN_LAYERS = ("mamba", "mamba2", "gdn", "gla")
+
+
+@pytest.mark.parametrize("name", [n for n in vllm_parity.CASES if n not in OWN_LAYERS])
+def test_fp8_weights_quantize_every_layer_s_projections(
+    name: str, stood_in: ModuleType, tmp_path: Path
+) -> None:
+    """Every family of layers the plugin runs gives its vLLM linear layers and its
+    routed experts the quantization config, but those it keeps in the model's
+    dtype (`kept`); their weights load whole through their loaders."""
+    quant = SimpleNamespace(name="fp8")
+    model = served(vllm_parity.CASES[name], tmp_path, stood_in, quant)
+    assert assert_quantized(model, quant)

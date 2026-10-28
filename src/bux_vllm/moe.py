@@ -8,7 +8,11 @@ the projections to and from it. Under ``expert_norm`` each expert's output is
 normalized before the router weighs it: each of a token's picks runs as a row of its
 own, which vLLM's fused MoE leaves unsummed (`bux_vllm.routing.apart`). Under tensor
 parallelism each rank keeps every expert's share of the hidden units, as vLLM splits
-them, and the projections whole.
+them, and the projections whole. The routed experts, the shared experts and the
+latent's projections take the engine's quantization config
+(`bux_vllm.common.quantization`); the router, which the layer computes itself in
+float32, and the shared experts' gate of one output stay in the model's dtype, as
+vLLM keeps Qwen's.
 """
 
 from __future__ import annotations
@@ -94,7 +98,7 @@ class MoE(Layer):
         latent = c["latent_size"] or width
         self.num_experts, self.expert_norm = n, _norm(c["expert_norm"], latent)
         apart_ = self.expert_norm is not None  # each pick a row of its own
-        self.to_latent, self.from_latent = _latent(c, width, site.path)
+        self.to_latent, self.from_latent = _latent(c, width, site)
         self.latent_input_norm = _norm(c["latent_input_norm"], latent)
         self.latent_output_norm = _norm(c["latent_output_norm"], latent)
         self.router = Router(c)
@@ -112,6 +116,7 @@ class MoE(Layer):
             hidden_size=latent,
             intermediate_size=expert["intermediate_size"],
             renormalize=c["normalize_top_k"],
+            quant_config=site.quant,
             prefix=f"{site.path}.experts",
             custom_routing_function=pick_rows if apart_ else self.router,
             **experts_activation(expert),
@@ -126,7 +131,7 @@ class MoE(Layer):
             size = shared["intermediate_size"] * c["num_shared_experts"]
             inner = Site(f"{site.path}.shared", site.vllm_config, site.config)
             self.shared = MLP(shared, width, inner, size=size)
-        self.shared_gate = (
+        self.shared_gate = (  # unquantized, as vLLM's Qwen MoE keeps its own
             ReplicatedLinear(width, 1, bias=False, return_bias=False)
             if c["shared_expert_gate"]
             else None
@@ -167,7 +172,8 @@ class MoE(Layer):
         for shard, stacked in shards:
             for e in range(stacked.shape[0]):
                 where = f"experts.{e}.{shard}.{'bias' if bias else 'weight'}"
-                routed.weight_loader(param, stacked[e].contiguous(), where, shard, e)
+                # The parameter's loader: vLLM's online quantization wraps it
+                param.weight_loader(param, stacked[e].contiguous(), where, shard, e)
         return [param]
 
     def forward(self, x: torch.Tensor, ctx: Ctx | None = None) -> torch.Tensor:
@@ -207,18 +213,16 @@ class MoE(Layer):
         return y if self.from_latent is None else self.from_latent(y)
 
 
-def _latent(c: dict, width: int, path: str) -> tuple[nn.Module | None, ...]:
+def _latent(c: dict, width: int, site: Site) -> tuple[nn.Module | None, ...]:
     """LatentMoE's projections to the latent and back, whole on every rank, or
     none without a latent."""
     latent = c["latent_size"]
     if latent is None:
         return None, None
-    to = ReplicatedLinear(
-        width, latent, bias=False, return_bias=False, prefix=f"{path}.to_latent"
-    )
-    back = ReplicatedLinear(
-        latent, width, bias=False, return_bias=False, prefix=f"{path}.from_latent"
-    )
+    path, kw = site.path, {"bias": False, "return_bias": False}
+    kw["quant_config"] = site.quant
+    to = ReplicatedLinear(width, latent, prefix=f"{path}.to_latent", **kw)
+    back = ReplicatedLinear(latent, width, prefix=f"{path}.from_latent", **kw)
     return to, back
 
 

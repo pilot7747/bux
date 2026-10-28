@@ -227,8 +227,9 @@ class ShortConv(Layer):
         super().__init__()
         self.path, bias = site.path, c["bias"]
         self.channels = width // get_tensor_model_parallel_world_size()
+        kw = {"bias": bias, "return_bias": False, "quant_config": site.quant}
         self.in_proj = MergedColumnParallelLinear(
-            width, [width] * 3, bias=bias, return_bias=False, prefix=f"{self.path}.in"
+            width, [width] * 3, prefix=f"{self.path}.in", **kw
         )
         size, vllm = c["conv_size"], site.vllm_config
         convs = [CausalConv(self.channels, size, vllm, n) for n in site.caches]
@@ -238,9 +239,7 @@ class ShortConv(Layer):
         self.convs = nn.ModuleList(convs)
         b = torch.zeros(self.channels) if bias else None
         self.conv_bias = None if b is None else nn.Parameter(b, requires_grad=False)
-        self.out_proj = RowParallelLinear(
-            width, width, bias=bias, return_bias=False, prefix=f"{self.path}.out"
-        )
+        self.out_proj = RowParallelLinear(width, width, prefix=f"{self.path}.out", **kw)
 
     def targets(self) -> dict[str, tuple[nn.Parameter, tuple]]:
         out: dict[str, tuple[nn.Parameter, tuple]] = {}
