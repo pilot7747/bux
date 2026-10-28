@@ -1,0 +1,15 @@
+# How mhc starts, on the 2021 reference (residuals.bux's mhc). Each arm sets the
+# streams apart from the first step, where residuals.bux's mhc started them alike and
+# they trained as one stream. Arms: what they start as.
+use gpt3_rope
+use timeline_code
+use rungs
+
+         # mHC-lite's start: the k-th branch reads and writes stream k mod n most
+residual = mhc: mhc(expansion=4)
+         # f written to every stream alike: the plain residual stream at the start,
+         # whose streams the gradients set apart, as under hc
+         | write_alike: mhc(expansion=4, post_bias=0)
+         # the mixing 5% off the identity, e^-4 per entry, where e^-8 hardly moves in
+         # a run this short
+         | loose_mix: mhc(expansion=4, res_bias=-4)

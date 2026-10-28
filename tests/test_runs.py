@@ -574,6 +574,20 @@ def test_a_layer_field_newer_than_ids_keeps_them_where_it_computes_as_before(
     assert run_of(None).id == run_of(before).id == old != run_of(after).id
 
 
+def test_hc_keeps_its_ids_and_mhc_gets_new_ones_with_its_biases():
+    """mhc's streams started alike before its biases could be set, at no value of
+    theirs; hc has none."""
+
+    def id_of(residual: str) -> str:
+        [run] = runs(LECUN + f"residual = {residual}\n" + ARCH + TRAIN)
+        return run.id
+
+    assert id_of("hc(expansion=4)") == "3abf98537b"  # the ids before the biases
+    assert id_of("hc(expansion=2, dynamic=false)") == "9201c69cf2"
+    assert id_of("mhc(expansion=4)") not in ("66b96516db", id_of("mhc(pre_bias=0.5)"))
+    assert id_of("mhc(res_bias=-8)") == id_of("mhc") != id_of("mhc(res_bias=-4)")
+
+
 def test_strings_that_name_a_setting_print_quoted():
     """A bare `data` would be the run's data, not the mesh axis."""
     [run] = runs(RUN + 'layout.batch = ["data", "expert"]')

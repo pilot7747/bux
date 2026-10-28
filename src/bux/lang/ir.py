@@ -374,6 +374,10 @@ _NEWER_LAYER_FIELDS = {
     "layernorm": {"gain_init": 1.0},
     "rmsnorm": {"gain_init": 1.0},
     "normal": {"embed": None, "head": None, "out": None},  # the model's init
+    # hc has no biases. mhc's read and write ones started alike on every stream
+    # before, at no value of theirs, so that its ids are new.
+    "hc": {"pre_bias": 1.0, "post_bias": 1.0, "res_bias": -8.0},
+    "mhc": {"res_bias": -8.0},
 }
 # How every weight matrix started before the model's `init` was a normal, and before
 # it could be set, as flax's layers start them: runs that set it keep their ids. But

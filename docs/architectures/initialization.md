@@ -138,8 +138,10 @@ whatever `init` says:
   attentions' decays and time steps, as their papers start them;
 - RWKV-7's projections, uniform; its low-rank ones, orthogonal; and its output, at 0;
 - Engram's tables, at unit variance;
-- the residual algebras' connections, which start as the plain stream, and gates and
-  scales (`scale(init=...)`), attention sinks and value mixes.
+- the residual algebras' connections, which start near the plain stream (mhc's by
+  its own `pre_bias`, `post_bias` and `res_bias`,
+  [Residual algebras](../language/residual-algebras.md#how-hc-and-mhc-start)), and
+  gates and scales (`scale(init=...)`), attention sinks and value mixes.
 
 ## Adding an init
 
