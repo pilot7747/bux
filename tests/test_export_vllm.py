@@ -1209,3 +1209,23 @@ def test_csa_caches_what_the_serving_model_prices(name: str) -> None:
         assert index[0] * serving.BF16 / index[1] == cache.index
         assert kept[2] is None and index[2] is None and cache.window is None
         assert rows["state"] == (2 * c.head_dim, 1, c.compress_ratio)
+
+
+def test_each_layer_type_has_one_class() -> None:
+    """Every bux layer type is named by one class's own ``bux_types``, which is
+    all the registry reads: a subclass of a layer does not take over its types."""
+    names: dict[str, list[str]] = {}
+    for path in FILES:
+        for node in ast.parse(path.read_text()).body:
+            if not isinstance(node, ast.ClassDef):
+                continue
+            for item in node.body:
+                if (
+                    isinstance(item, ast.Assign)
+                    and any(getattr(t, "id", None) == "bux_types" for t in item.targets)
+                    and isinstance(item.value, ast.Tuple)
+                ):
+                    for kind in item.value.elts:
+                        names.setdefault(ast.literal_eval(kind), []).append(node.name)
+    assert {k: v for k, v in names.items() if len(v) > 1} == {}
+    assert 'vars(value).get("bux_types"' in (FILES[0].parent / "model.py").read_text()
