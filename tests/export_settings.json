@@ -61,6 +61,7 @@
   "gated",
   "head_dim",
   "indexer",
+  "k_eq_v",
   "kv_conv_size",
   "log_scale",
   "log_scale_floor",

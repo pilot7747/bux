@@ -58,6 +58,9 @@ GQA_SETTINGS = {
     "mqa": "gqa(num_heads=4, num_kv_heads=1, rope=rope())",
     "no rope": "gqa(num_heads=4, num_kv_heads=2)",
     "window": GQA + ", sliding_window_size=4)",
+    "keys as values": GQA + ", k_eq_v=true, qk_norm=rmsnorm(eps=1e-5))",
+    "keys as values, the hybrid's global layer": "gqa(num_heads=4, num_kv_heads=2, k_eq_v=true,"
+    " qk_norm=rmsnorm, gated=true, kv_conv_size=3, fused_qkv=true)",
     "sinks": GQA + ", sinks=true)",
     "sinks, window": GQA + ", sinks=true, sliding_window_size=3)",
     "softcap": GQA + ", softcap=2.0)",
@@ -129,6 +132,11 @@ PORTS = {
     ),
     "value residual, convex": wired(
         GQA + ", value_residual=convex, kv_conv_size=2)", "attn(v=@v1)", "attn(v=$v1!)"
+    ),
+    "keys as values, value residual": wired(
+        "gqa(num_heads=4, num_kv_heads=2, k_eq_v=true, qk_norm=rmsnorm, kv_conv_size=2)",
+        "attn(v=@v1)",
+        "attn(v=$v1!)",
     ),
     "kv sharing": wired(
         GQA + ", qk_norm=rmsnorm)",
