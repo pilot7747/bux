@@ -613,6 +613,7 @@ def check_msa(decoding: bool) -> bool:
         see = picks.seen(p, lengths[r], None)
         w = torch.full((1, g), dims**-0.5, device="cuda")
         theirs = picks.choose(spec, iq[t : t + 1].float(), w, keys[r], see, p)
+        theirs = picks.padded(theirs, kept[0].shape[-1])  # fewer blocks than k
         a = torch.where(kept[1][t], kept[0][t], -1).sort(-1).values
         b = torch.where(theirs[1][0], theirs[0][0], -1).sort(-1).values
         agree.append((a == b).float().mean().item())
