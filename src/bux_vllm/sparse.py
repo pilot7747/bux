@@ -178,7 +178,7 @@ def attend(
             q, k, v, *kept, ctx.positions, out, cache.prefix
         )
     else:
-        kept = _no_picks(cache.spec, q, len(taps))
+        kept = _no_picks(cache.sparse, q, len(taps))
         torch.ops.vllm.bux_sparse_attention(
             q,
             k,

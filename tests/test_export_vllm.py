@@ -1405,6 +1405,31 @@ def test_csa_caches_what_the_serving_model_prices(name: str) -> None:
         assert rows["state"] == (2 * c.head_dim, 1, c.compress_ratio)
 
 
+def test_the_sparse_ops_read_only_what_a_paged_cache_has() -> None:
+    """Every attribute bux_vllm.sparse reads of a cache, ``cache.<name>``, is one a
+    PagedCache sets or defines: vLLM's compiler traces those reads."""
+    tree = ast.parse((FILES[0].parent / "sparse.py").read_text())
+    paged = next(
+        n for n in tree.body if isinstance(n, ast.ClassDef) and n.name == "PagedCache"
+    )
+    has = {n.name for n in paged.body if isinstance(n, ast.FunctionDef)}
+    for node in ast.walk(paged):
+        if isinstance(node, ast.Assign):
+            for target in node.targets:
+                elts = target.elts if isinstance(target, ast.Tuple) else [target]
+                has |= {e.attr for e in elts if isinstance(e, ast.Attribute)}
+    outside = [n for n in tree.body if n is not paged]  # its own reads a config
+    reads = {
+        n.attr
+        for top in outside
+        for n in ast.walk(top)
+        if isinstance(n, ast.Attribute)
+        and isinstance(n.value, ast.Name)
+        and n.value.id == "cache"
+    }
+    assert reads <= has, reads - has
+
+
 def test_each_layer_type_has_one_class() -> None:
     """Every bux layer type is named by one class's own ``bux_types``, which is
     all the registry reads: a subclass of a layer does not take over its types."""
