@@ -94,7 +94,7 @@ def compare(name: str, settings: dict, dtype: torch.dtype, decoding: bool) -> bo
     iq = torch.randn(len(positions), heads, i, device="cuda", dtype=dtype)
     iw = torch.randn(len(positions), heads, device="cuda", dtype=torch.float32)
     layer = spec(h, g, dk, heads, settings)
-    assert kernels.takes(layer, (dk, dk))
+    assert kernels.takes(layer, (dk, dk), dtype)
     n = max(lengths)
     args = (layer, q, (iq, iw), positions, (kv, index), rows, n)
     want, (kept, valid) = picks.attend_segment(*args)
