@@ -431,6 +431,86 @@ def check_plugin(decoding: bool) -> bool:
     return best and error < 2e-2 and error8 < 0.25
 
 
+def check_qsa(decoding: bool) -> bool:
+    """QSA on the plugin's native path: blocks of 4 pooled into the FP8 keys by
+    `bux_vllm.dsa.pooled` as each completes, picked by the kernels, against the
+    best of the same FP8 scores of the pooled keys by PyTorch, and bux's float32
+    picks of blocks (`bux_vllm.picks.choose`) they agree with."""
+    from bux_vllm import dsa, picks
+    from bux_vllm import indexer as plugin_indexer
+
+    torch.manual_seed(0)
+    g, heads, dims, size, top_k = 2, 4, 64, 4, 64
+    c: dict[str, Any] = {"num_heads": heads, "head_dim": dims, "top_k": top_k}
+    c |= {"block_size": size, "pool": "mean", "weighted": False, "norm": None}
+    c |= {"rope_layout": "half"}
+    rope = {"base": 10000.0, "scaling": None, "fraction": 1.0, "layout": "half"}
+    ix = plugin_indexer.Indexer(c, 128, rope, 32).cuda()
+    lengths = [300, 97, 3, 513] if decoding else [700]
+    blocks = sum(-(-n // PAGE) for n in lengths) + 1
+    raw_slots = dsa.raw_slots(dims, 256)
+    cache = torch.zeros(blocks, g + raw_slots + 1, PAGE, 128, device="cuda")
+    cache = cache.bfloat16()
+    raw, region = dsa.Raw(cache, g, dims), dsa.Region(cache, g + raw_slots, dims)
+    table = torch.zeros(len(lengths), -(-max(lengths) // PAGE), dtype=torch.int32)
+    table, order, at = table.cuda(), torch.randperm(blocks - 1, device="cuda") + 1, 0
+    keys = []
+    for r, n in enumerate(lengths):
+        count = -(-n // PAGE)
+        table[r, :count] = order[at : at + count].int()
+        at += count
+        pos = torch.arange(n, device="cuda")
+        rows = table[r : r + 1].expand(n, -1)
+        x = torch.randn(n, 128, device="cuda")
+        slots = table[r, pos // PAGE].long() * PAGE + pos % PAGE
+        raw.write(slots, ix.keys(x, pos))
+        dsa.pooled(raw, region, ix, rows, pos, size)
+        keys.append(raw.at(rows[:1], pos[None])[0])
+    q = torch.randn(
+        len(lengths) if decoding else lengths[0], heads, dims, device="cuda"
+    )
+    w = ix.head_weights(torch.zeros(len(q), 128, device="cuda"))
+    index = dsa.queries(q.bfloat16(), w, dsa.padded_heads(heads))
+    if decoding:
+        positions = torch.tensor([n - 1 for n in lengths], device="cuda")
+        lens = ((positions + 1) // size).int()[:, None].contiguous()
+        step = dsa.Decoding(lens, dsa.schedule(lens, PAGE), 1024 // size)
+        chosen = dsa.decode(region, index, table, step, top_k // size, "auto")
+        rows = [r for r in range(len(lengths))]
+    else:
+        positions = torch.arange(lengths[0], device="cuda")
+        ends = (positions + 1) // size
+        chosen = dsa.prompt(
+            region, index, table[:1], lengths[0] // size, ends, top_k // size
+        )
+        rows = [0] * len(positions)
+    best, agree = True, []
+    for t, r in enumerate(rows):
+        n = lengths[r] // size
+        p = positions[t : t + 1]
+        if n == 0:
+            best &= bool((chosen[t] < 0).all())
+            continue
+        q8 = (index[0][t : t + 1], index[1][t : t + 1])
+        scores = fp8_scores(region, q8, table[r : r + 1], (p + 1) // size - 1, n)
+        best &= picked_as_best(chosen[t : t + 1], scores)
+        spec = picks.Sparse(
+            top_k, size, True, False, True, None, 1.0, None, 64, (0, 1), indexer=ix
+        )
+        see = picks.seen(p, lengths[r], None)
+        theirs = picks.choose(spec, q[t : t + 1], w[t : t + 1], keys[r], see, p)
+        ours = dsa.block_picks(chosen[t : t + 1], p, size)
+        a = torch.where(ours[1], ours[0], -1).sort(-1).values
+        b = torch.where(theirs[1], theirs[0], -1).sort(-1).values
+        agree.append((a == b).float().mean().item())
+    layout = "decoding" if decoding else "prefill"
+    share = sum(agree) / max(len(agree), 1)
+    print(
+        f"plugin qsa {layout}: picks as FP8's best {best}, agreeing with bux's {share:.3f}"
+    )
+    return best
+
+
 def time_attention(n: int, b: int, ctx: int) -> None:
     """The Triton attention over each query's top 2048 at the timeline's width
     2816 (44 query heads of 64 over 11 kv heads), for a prompt of `n` tokens and a
@@ -505,6 +585,7 @@ def main() -> int:
     attempt("triton", lambda: time_triton(4, 64, 2048, 16384, 64, 20000, 32768))
     for decoding in (False, True):
         results.append(attempt("plugin", lambda d=decoding: check_plugin(d)))
+        results.append(attempt("plugin qsa", lambda d=decoding: check_qsa(d)))
     attempt("attention", lambda: time_attention(16384, 64, 20000))
     print("all agree" if all(results) else "MISMATCH")
     return 0 if all(results) else 1
