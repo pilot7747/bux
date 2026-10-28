@@ -5,13 +5,21 @@ scored by DeepGEMM's MQA logits over the request's keys as vLLM gathers them
 (``fp8_fp4_paged_mqa_logits``), and the best ``top_k`` kept by vLLM's top-k kernels.
 
 bux's DSA indexer is DeepSeek's: a query scores a key ``sum_j w_j ReLU(q_j . k)``
-and keeps the best ``top_k`` it sees. The kernels take it where its keys are single
-(no blocks), its dots ReLU'd, its heads' scores summed (no picks per group), its
-head dim 32, 64 or 128, its heads 128 at most, no window, and a top-k of 2048 at
-most (`takes`). They score FP8 keys and queries, with a float32 scale for each key
-and each query head, as vLLM's DeepSeek-V3.2 does, so a pick differs from bux's
-float32 one where two scores are within FP8's rounding. They run in a 16-bit model;
-a float32 one keeps the exact path (`bux_vllm.picks`).
+and keeps the best ``top_k`` it sees. The kernels take it where its keys are single,
+its dots ReLU'd, its heads' scores summed (no picks per group), its head dim 32, 64
+or 128, its heads 128 at most, no window, and a top-k of 2048 at most (`takes`).
+They score FP8 keys and queries, with a float32 scale for each key and each query
+head, as vLLM's DeepSeek-V3.2 does, so a pick differs from bux's float32 one where
+two scores are within FP8's rounding. They run in a 16-bit model; a float32 one
+keeps the exact path (`bux_vllm.picks`).
+
+QSA's indexer (Qwen3.8's, mean-pooled blocks) is DSA's over its blocks: a complete
+block's key is the mean of its keys as projected, normalized and rotated to its
+first position, and a query keeps the best ``top_k / block_size`` of the complete
+blocks it sees, and its own block while that is unfinished. The keys as projected
+are cached in the model's dtype (`Raw`); a block's key is written when its last
+token comes, at the position of its index among the request's blocks (`pooled`), so
+the kernels score a request's blocks as DSA's keys.
 
 The keys live in the call's own cache (`bux_vllm.sparse.PagedCache`), in head slots
 after its kv heads' (`Region`): each block's FP8 keys, then their scales, so that
@@ -24,6 +32,7 @@ from __future__ import annotations
 import functools
 import os
 from dataclasses import dataclass
+from typing import Any
 
 import torch
 import torch.nn.functional as F
@@ -38,6 +47,7 @@ MOST_TOP_K = 2048  # the most keys vLLM's top-k kernels keep
 FP8 = torch.float8_e4m3fn
 FP8_MAX = torch.finfo(FP8).max
 SCALE_BYTES = 4  # a key's float32 scale, after a block's keys
+PAGE = 64  # the tokens of a block that DeepGEMM's paged kernel reads
 
 
 def takes(spec: Sparse, dims: int, heads: int, dtype: torch.dtype) -> bool:
@@ -48,8 +58,10 @@ def takes(spec: Sparse, dims: int, heads: int, dtype: torch.dtype) -> bool:
         if CHOICE is None
         else CHOICE == "native"
     )
-    fits = spec.block_size == 1 and spec.relu and not spec.per_group
-    fits = fits and spec.window is None and 0 < spec.top_k <= MOST_TOP_K
+    size = spec.block_size  # DSA's keys, or QSA's blocks within a cache block
+    blocks = size == 1 or (spec.mean and PAGE % size == 0)
+    fits = blocks and spec.relu and not spec.per_group and spec.window is None
+    fits = fits and 0 < spec.top_k // spec.block_size <= MOST_TOP_K
     if not (on and fits and dims in DIMS and available()):
         return False
     return heads <= max(_head_sizes())
@@ -171,33 +183,117 @@ class Region:
         return values.view(FP8).float() * scales
 
 
+@dataclass(frozen=True)
+class Raw:
+    """QSA's indexer keys as projected, in a call's cache, ``[blocks, heads,
+    block_size, C]``, in its head slots from `first` on (together within a block):
+    a block's ``block_size`` keys of `dims` in bfloat16.
+
+    Attributes:
+        cache: The call's cache.
+        first: Its first slot of keys.
+        dims: The keys' dims.
+    """
+
+    cache: torch.Tensor
+    first: int
+    dims: int
+
+    @property
+    def keys(self) -> torch.Tensor:
+        """The keys, (blocks, block_size, dims); a view, or an error."""
+        c = self.cache.shape[3] * self.cache.dtype.itemsize
+        part = self.cache[:, self.first : self.first + raw_slots(self.dims, c)]
+        raw = part.view(torch.uint8)
+        raw = raw.view(raw.shape[0], -1)[:, : self.cache.shape[2] * self.dims * 2]
+        return raw.view(torch.bfloat16).unflatten(1, (self.cache.shape[2], self.dims))
+
+    def write(self, slots: torch.Tensor, keys: torch.Tensor) -> None:
+        """Write the tokens' keys, (T, dims), at vLLM's `slots`, (T,)."""
+        slots, size = slots.clamp(min=0), self.cache.shape[2]
+        self.keys[slots // size, slots % size] = keys.to(torch.bfloat16)
+
+    def at(self, rows: torch.Tensor, positions: torch.Tensor) -> torch.Tensor:
+        """The keys at `positions`, (T, S), of the requests whose block tables are
+        `rows`, (T, blocks), in float32: (T, S, dims)."""
+        size = self.cache.shape[2]
+        block = rows.gather(1, positions // size).long()
+        return self.keys[block, positions % size].float()
+
+
+def raw_slots(dims: int, channels_bytes: int) -> int:
+    """The head slots of `channels_bytes` a token that a `Raw` of `dims` takes."""
+    return -(-(2 * dims) // channels_bytes)
+
+
+def pooled(
+    raw: Raw,
+    region: Region,
+    indexer: Any,
+    rows: torch.Tensor,
+    positions: torch.Tensor,
+    size: int,
+) -> None:
+    """Write the keys of the blocks of `size` that the tokens at `positions`, (T,),
+    of the requests whose block tables are `rows`, (T, blocks), complete into
+    `region`, at the position of each block's index: the mean of its keys as
+    projected, from `raw`, normalized and rotated by `indexer` to the block's first
+    position, as bux pools them; nothing for a token that completes none."""
+    first = positions // size * size
+    keys = raw.at(rows, first[:, None] + torch.arange(size, device=rows.device))
+    mean = indexer.k_norm(keys.mean(1))  # in float32, as bux pools them
+    key = indexer._rotate(mean[:, None], first)[:, 0]
+    at = positions // size
+    slot = rows.gather(1, (at // region.size)[:, None])[:, 0].long() * region.size
+    slot = slot + at % region.size
+    done = (positions + 1) % size == 0
+    region.write(torch.where(done, slot, -1), key)
+
+
+def block_picks(
+    blocks: torch.Tensor, positions: torch.Tensor, size: int
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """QSA's picks as `bux_vllm.picks` keeps them, (Q, (k + 1) size): the keys of
+    the picked complete `blocks`, (Q, k) int32 (-1 for none), and of the query's own
+    block while it is unfinished, those it sees valid."""
+    own = positions // size
+    finished = (positions + 1) % size == 0
+    own = torch.where(finished, -1, own)[:, None]
+    blocks = torch.cat([blocks.long(), own], -1)
+    keys = blocks[..., None] * size + torch.arange(size, device=blocks.device)
+    seen = (blocks >= 0)[..., None] & (keys <= positions[:, None, None])
+    return keys.flatten(1).clamp(min=0), seen.flatten(1)
+
+
 def prompt(
     region: Region,
     index: tuple[torch.Tensor, torch.Tensor],
     rows: torch.Tensor,
     n: int,
-    positions: torch.Tensor,
+    ends: torch.Tensor,
     top_k: int,
 ) -> torch.Tensor:
     """One request's queries' picks, (Q, top_k) int32 key positions, -1 for none:
     its first `n` keys gathered by vLLM from `region` by its block table `rows`,
     (1, blocks), scored by DeepGEMM's MQA logits a chunk of queries at a time, and
-    the best a query at `positions`, (Q,), sees kept by vLLM's top-k. `index` are
-    the queries and weights `queries` gives."""
+    the best of the first `ends`, (Q,), each query sees kept by vLLM's top-k.
+    `index` are the queries and weights `queries` gives."""
     from vllm import _custom_ops as ops
     from vllm.utils.deep_gemm import fp8_fp4_mqa_logits
 
     q8, weights = index
+    out = torch.full((len(ends), top_k), -1, dtype=torch.int32, device=q8.device)
+    if n == 0:
+        return out
     keys = q8.new_empty(n, region.dims)
     scales = torch.empty(n, SCALE_BYTES, dtype=torch.uint8, device=q8.device)
-    ends = torch.tensor([0, n], dtype=torch.int32, device=q8.device)
-    ops.cp_gather_indexer_k_quant_cache(region.gathered(), keys, scales, rows, ends)
+    bounds = torch.tensor([0, n], dtype=torch.int32, device=q8.device)
+    ops.cp_gather_indexer_k_quant_cache(region.gathered(), keys, scales, rows, bounds)
     kv = (keys, scales.view(torch.float32).squeeze(-1))
-    start = torch.zeros_like(positions, dtype=torch.int32)
-    end = (positions + 1).to(torch.int32)
-    out = torch.empty(len(positions), top_k, dtype=torch.int32, device=q8.device)
+    start = torch.zeros_like(ends, dtype=torch.int32)
+    end = ends.to(torch.int32)
     chunk = max(1, BUDGET // n)
-    for a in range(0, len(positions), chunk):
+    for a in range(0, len(ends), chunk):
         c = slice(a, a + chunk)
         logits = fp8_fp4_mqa_logits(
             (q8[c], None), kv, weights[c], start[c], end[c], False

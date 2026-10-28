@@ -267,6 +267,53 @@ def test_a_step_s_decoded_tokens_are_one_segment() -> None:
     ]
 
 
+def test_native_qsa_pools_its_blocks_as_bux_s_indexer() -> None:
+    """For QSA on vLLM's DSA kernels, bux_vllm.dsa caches the keys as projected
+    (Raw), and a token that completes a block writes the block's key (`pooled`) at
+    the position of the block's index: what bux's indexer pools (block_keys), within
+    FP8's rounding; `block_picks` adds the query's unfinished block as bux does."""
+    from bux_vllm import dsa, picks
+    from bux_vllm import indexer as plugin_indexer
+
+    torch.manual_seed(0)
+    ix = cfg.SparseIndexerConfig.model_validate(
+        {"num_heads": 4, "head_dim": 64, "top_k": 8, "block_size": 4}
+        | {"weighted": False, "norm": {"type": "rmsnorm"}}
+    ).model_dump(mode="json")
+    rope = cfg.RoPEConfig().model_dump(mode="json")
+    ours = plugin_indexer.Indexer(ix, 32, rope, 16)
+    for p in ours.parameters():
+        p.data.normal_()
+    g, block, blocks, c, s, size = 2, 8, 6, 32, 23, 4
+    raw_slots = dsa.raw_slots(64, c * 4)
+    cache = torch.zeros(blocks, g + raw_slots + dsa.slots(64, c, 4), block, c)
+    table = (torch.randperm(blocks - 1) + 1)[None]
+    at = torch.arange(s)
+    slots = table[0, at // block] * block + at % block
+    x = torch.randn(s, 32)
+    raw = dsa.Raw(cache, g, 64)
+    raw.write(slots, ours.keys(x, at))
+    region = dsa.Region(cache, g + raw_slots, 64)
+    rows = table.expand(s, -1)
+    dsa.pooled(raw, region, ours, rows, at, size)
+    keys = raw.at(rows[:1], at[None])[0]
+    torch.testing.assert_close(keys, ours.keys(x, at).bfloat16().float())
+    want = ours.block_keys(picks.pooled(keys, size), size)  # bux's, of 5 blocks
+    got = region.dequantized(table, s // size)
+    near = 1e-3 * want.abs().max().item()
+    torch.testing.assert_close(got, want, rtol=0.07, atol=near)
+    blocks_ = torch.tensor([[1, -1], [0, 1]], dtype=torch.int32)
+    positions = torch.tensor([9, 11])
+    keys_, valid = dsa.block_picks(blocks_, positions, size)
+    see = picks.seen(positions, 12, None)
+    theirs = picks.with_own_block(
+        blocks_.long().clamp(min=0), blocks_ >= 0, see, positions, None, size
+    )
+    ours_ = torch.where(valid, keys_, -1).sort(-1).values
+    want_ = torch.where(theirs[1], theirs[0], -1).sort(-1).values
+    assert torch.equal(ours_, want_)
+
+
 def test_native_picks_are_bux_s_picks() -> None:
     """bux_vllm.dsa.as_picks turns the kernels' picks, int32 positions with -1 for
     none, into bux_vllm.picks' positions and mask."""
@@ -2448,7 +2495,7 @@ def test_fp8_weights_quantize_every_layer_s_projections(
 OWN_CACHES = {
     **dict.fromkeys(("dsa", "dsa-conv", "msa", "qsa"), "gqa with an indexer"),
     **dict.fromkeys(("dsa-share", "msa-share"), "gqa with an indexer"),
-    **dict.fromkeys(("dsa-native", "dsa-hybrid"), "gqa with an indexer"),
+    **dict.fromkeys(("dsa-native", "dsa-hybrid", "qsa-native"), "gqa with an indexer"),
     "relbias": "gqa with a relative bias",
     **dict.fromkeys(("mla-dsa", "mla-share"), "mla with an indexer"),
     "mla-dsa-native": "mla with an indexer",
@@ -2481,7 +2528,8 @@ def test_native_dsa_takes_an_fp8_kv_cache(
     """Where vLLM's DSA kernels pick (as on a B300), a gqa layer's indexer keeps its
     FP8 keys in head slots after its kv heads (two, of 64 bytes, for 64 FP8 dims and
     their scale), and its cache, and that of a layer that reads its picks, take an
-    FP8 KV cache; sparse MLA's latents refuse it."""
+    FP8 KV cache; so does QSA's, its keys as projected in bfloat16 in slots of their
+    own; sparse MLA's latents refuse it."""
     dsa = importlib.import_module("bux_vllm.dsa")
     monkeypatch.setattr(dsa, "available", lambda: True)
     model = built(vllm_parity.CASES["dsa-native"], tmp_path, stood_in, None, "fp8")
@@ -2490,6 +2538,11 @@ def test_native_dsa_takes_an_fp8_kv_cache(
     want = [(True, e4m3, 2), (True, e4m3, 2), (False, e4m3, 0)]
     assert [(c.native, c.fp8, c.slots) for c in caches] == want
     assert all(c.dtype is torch.uint8 and c.share == 0 for c in caches)
+    model = built(
+        vllm_parity.CASES["qsa-native"], tmp_path / "qsa", stood_in, None, "fp8"
+    )
+    caches = [m for m in model.modules() if type(m).__name__ == "PagedCache"]
+    assert [(c.native, c.raw_slots, c.slots) for c in caches] == [(True, 2, 4)] * 2
     with pytest.raises(NotImplementedError, match="mla with an indexer: kv_cache"):
         source = vllm_parity.CASES["mla-dsa-native"]
         built(source, tmp_path / "mla", stood_in, None, "fp8")

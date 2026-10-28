@@ -459,6 +459,12 @@ CASES = {
     + "attn = gqa(num_heads=4, num_kv_heads=2, rope=rope(fraction=0.5),"
     " indexer=indexer(num_heads=2, head_dim=16, top_k=16, block_size=4,"
     " weighted=false, norm=rmsnorm))\n" + BLOCK + "model = embed block^2 rmsnorm head",
+    # QSA on vLLM's DSA kernels: blocks of 4, the timeline's 4 heads of 64.
+    "qsa-native": HEAD
+    + FFN
+    + "attn = gqa(num_heads=4, num_kv_heads=2, rope=rope(fraction=0.5),"
+    " indexer=indexer(num_heads=4, head_dim=64, top_k=16, block_size=4,"
+    " weighted=false, norm=rmsnorm))\n" + BLOCK + "model = embed block^2 rmsnorm head",
     "qk-norm-all-heads": HEAD
     + FFN
     + "rms = gqa(num_heads=4, num_kv_heads=2, qk_norm=rmsnorm, qk_norm_all_heads=true,"

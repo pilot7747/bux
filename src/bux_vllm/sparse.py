@@ -66,7 +66,7 @@ FP8_CACHES = {
     "fp8_e4m3": torch.float8_e4m3fn,
     "fp8_e5m2": torch.float8_e5m2,
 }
-PAGE = 64  # the tokens of a block that DeepGEMM's paged kernel reads
+PAGE = dsa.PAGE
 
 
 @dataclass
@@ -79,15 +79,16 @@ class Batch:
         num_actual_tokens: The step's tokens, padding left out.
         segments: Its queries by `bux_vllm.picks.Segment`: its decoded tokens, one
             a request, then each prompt chunk.
-        decoding: Its decoded tokens as vLLM's DSA kernels take them, for an
-            `IndexedBackend`'s caches; None without.
+        decoding: Its decoded tokens as vLLM's DSA kernels take them, by the
+            indexer's block size (their keys or blocks), for an `IndexedBackend`'s
+            caches; None without.
     """
 
     slot_mapping: torch.Tensor
     block_table_tensor: torch.Tensor
     num_actual_tokens: int
     segments: list[picks.Segment]
-    decoding: dsa.Decoding | None = None
+    decoding: dict[int, dsa.Decoding] | None = None
 
 
 class PagedMetadataBuilder(AttentionMetadataBuilder[Batch]):
@@ -139,22 +140,35 @@ class IndexedMetadataBuilder(PagedMetadataBuilder):
         self, kv_cache_spec: Any, layer_names: list[str], vllm_config: Any, device: Any
     ):
         super().__init__(kv_cache_spec, layer_names, vllm_config, device)
+        context = vllm_config.compilation_config.static_forward_context
+        self.sizes = sorted({context[name].sparse.block_size for name in layer_names})
         most = vllm_config.scheduler_config.max_num_batched_tokens
-        self.lens = torch.zeros(most, 1, dtype=torch.int32, device=device)
-        self.plan: torch.Tensor | None = None
+        shape = (most, 1)
+        self.lens = {
+            n: torch.zeros(shape, dtype=torch.int32, device=device) for n in self.sizes
+        }
+        self.plans: dict[int, torch.Tensor] = {}
 
     def _batch(self, cm: CommonAttentionMetadata, longest: int) -> Batch:
         batch = super()._batch(cm, longest)
         decoding = [part for part in batch.segments if part.decoding]
         if decoding:
-            lens = self.lens[: decoding[0].tokens.stop]
-            lens[:, 0].copy_(cm.seq_lens[: len(lens)])
-            plan = dsa.schedule(lens, PAGE)
-            if self.plan is None:
-                self.plan = torch.empty_like(plan)
-            self.plan.copy_(plan)
-            batch.decoding = dsa.Decoding(lens, self.plan, self.longest)
+            count = decoding[0].tokens.stop
+            batch.decoding = {n: self._decoding(cm, count, n) for n in self.sizes}
         return batch
+
+    def _decoding(
+        self, cm: CommonAttentionMetadata, count: int, size: int
+    ) -> dsa.Decoding:
+        """The step's `count` decoded tokens over their keys, or their complete
+        blocks of `size`: how many each sees, and DeepGEMM's schedule of them."""
+        lens = self.lens[size][:count]
+        lens[:, 0].copy_(cm.seq_lens[:count] // size)
+        plan = dsa.schedule(lens, PAGE)
+        if size not in self.plans:
+            self.plans[size] = torch.empty_like(plan)
+        self.plans[size].copy_(plan)
+        return dsa.Decoding(lens, self.plans[size], self.longest // size)
 
 
 def _prompts(cm: CommonAttentionMetadata, decodes: int) -> list:
@@ -252,8 +266,10 @@ class PagedCache(nn.Module, AttentionLayerBase):
         self.heads, self.channels, self.prefix = heads, channels, prefix
         self.index_dims, self.native, self.sparse = index_dims, native, sparse
         self.share = 0 if native else -(-index_dims // heads)
-        size = self.dtype.itemsize
-        self.slots = dsa.slots(index_dims, channels, size) if native else 0
+        size, mean = self.dtype.itemsize, native and sparse.mean
+        self.raw_slots = dsa.raw_slots(index_dims, channels * size) if mean else 0
+        keys = dsa.slots(index_dims, channels, size) if native else 0
+        self.slots = self.raw_slots + keys
         self.scales = (1.0, 1.0)  # an FP8 cache's keys' and values' scales
         self.longest = vllm_config.model_config.max_model_len
         kernel = getattr(vllm_config, "kernel_config", None)
@@ -297,8 +313,14 @@ class PagedCache(nn.Module, AttentionLayerBase):
 
     @property
     def region(self) -> dsa.Region:
-        """The FP8 indexer keys, where vLLM's DSA kernels pick."""
-        return dsa.Region(self.kv_cache, self.heads, self.index_dims)
+        """The FP8 indexer keys (QSA's blocks'), where vLLM's DSA kernels pick."""
+        first = self.heads + self.raw_slots
+        return dsa.Region(self.kv_cache, first, self.index_dims)
+
+    @property
+    def raw(self) -> dsa.Raw:
+        """QSA's indexer keys as projected, where vLLM's DSA kernels pick."""
+        return dsa.Raw(self.kv_cache, self.heads, self.index_dims)
 
     def write(self, slots: torch.Tensor, rows: torch.Tensor) -> None:
         """Write the tokens' keys and values, (T, heads, channels), at vLLM's
@@ -454,10 +476,12 @@ def sparse_attention(
     n = meta.num_actual_tokens
     output[n:].zero_()
     _written(cache, meta, torch.cat([k, v], -1)[:n], index_k[:n])
+    table, tensors = meta.block_table_tensor, (q, index_q, index_w, positions)
     if cache.native:
+        _pooled(cache, meta, positions)
         heads = dsa.padded_heads(index_q.shape[1])
         index_q, index_w = dsa.queries(index_q, index_w, heads)
-    table, tensors = meta.block_table_tensor, (q, index_q, index_w, positions)
+        tensors = (q, index_q, index_w, positions)
     for part in meta.segments:
         at = part.tokens
         q_, iq, iw, pos = (t[at] for t in tensors)
@@ -474,11 +498,27 @@ def _written(
     """Write the step's keys and values, (n, g, C), and its indexer keys, (n, i),
     into `cache`: in FP8 where vLLM's DSA kernels pick, else spread over the rows."""
     slots = meta.slot_mapping[: kv.shape[0]]
-    if cache.native:
-        cache.write(slots, kv)
-        cache.region.write(slots, index_k)
-    else:
+    if not cache.native:
         picks.write(cache.kv_cache, slots, picks.merged(kv, index_k))
+        return
+    cache.write(slots, kv)
+    if cache.sparse.mean:
+        cache.raw.write(slots, index_k)
+    else:
+        cache.region.write(slots, index_k)
+
+
+def _pooled(cache: PagedCache, meta: Batch, positions: torch.Tensor) -> None:
+    """Write the keys of the blocks the step's tokens complete, for QSA's indexer
+    on vLLM's DSA kernels (`bux_vllm.dsa.pooled`), before any query picks."""
+    spec = cache.sparse
+    if not spec.mean:
+        return
+    table = meta.block_table_tensor
+    for part in meta.segments:
+        pos = positions[part.tokens]
+        rows = table[part.requests].expand(len(pos), -1)
+        dsa.pooled(cache.raw, cache.region, spec.indexer, rows, pos, spec.block_size)
 
 
 def _segment(
@@ -508,17 +548,22 @@ def _native(
     rows: torch.Tensor,
 ) -> tuple[torch.Tensor, picks.Picked]:
     """A segment's picks by vLLM's DSA kernels (decoded tokens' over their paged
-    keys, a prompt chunk's over its request's gathered ones), padded to the top-k,
-    and its attention over them: by the Triton kernel, or by PyTorch over MLA's
-    latents."""
-    spec, region = cache.sparse, cache.region
+    keys, a prompt chunk's over its request's gathered ones; QSA's over its blocks,
+    and its own unfinished block), padded to `bux_vllm.picks.most`, and its
+    attention over them: by the Triton kernel, or by PyTorch over MLA's latents."""
+    spec, region, size = cache.sparse, cache.region, cache.sparse.block_size
+    top_k = spec.top_k // size
     if part.decoding:
         assert meta.decoding is not None, "decoded tokens have their keys' lengths"
-        args = (meta.decoding, spec.top_k, cache.topk_backend)
-        chosen = dsa.decode(region, index, rows, *args)
+        step = meta.decoding[size]
+        chosen = dsa.decode(region, index, rows, step, top_k, cache.topk_backend)
     else:
-        chosen = dsa.prompt(region, index, rows, part.keys, positions, spec.top_k)
-    kept = dsa.as_picks(chosen)
+        ends = (positions + 1) // size  # the keys, or complete blocks, each sees
+        chosen = dsa.prompt(region, index, rows, part.keys // size, ends, top_k)
+    if spec.mean:
+        kept = dsa.block_picks(chosen, positions, size)
+    else:
+        kept = dsa.as_picks(chosen)
     if spec.latent:
         kv = cache.rows.kv
         return picks.attend_picked(spec, q, kept, positions, kv, rows, part.keys), kept

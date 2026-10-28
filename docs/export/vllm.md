@@ -170,8 +170,8 @@ the plugin's attention kernel reads e4m3 and e5m2 ([Sparse attention](#sparse-at
 | Layers | FP8 KV cache |
 |--------|--------------|
 | `gqa` | yes, by vLLM's attention: sliding windows, sinks, soft-capping, gates, QK-norm, `kv_conv_size` (its conv state stays in the model's dtype), the `v` port, and the `kv` port (a reader attends to its writer's FP8 cache). On SM 10.x, see the note on FlashAttention below |
-| `gqa` with an indexer on vLLM's DSA kernels, or reading the `index` port | yes, by the plugin's attention kernel, in a 16-bit model: its keys and values in FP8 beside the indexer's FP8 keys ([DSA on vLLM's kernels](#dsa-on-vllms-kernels)) |
-| `gqa` with another indexer (QSA's, MSA's, a window) or a relative bias | refused: its cache is the plugin's ([Sparse attention](#sparse-attention)) |
+| `gqa` with an indexer on vLLM's DSA kernels (DSA's, QSA's), or reading the `index` port | yes, by the plugin's attention kernel, in a 16-bit model: its keys and values in FP8 beside the indexer's FP8 keys ([DSA on vLLM's kernels](#dsa-on-vllms-kernels)) |
+| `gqa` with another indexer (MSA's, one with a window) or a relative bias | refused: its cache is the plugin's ([Sparse attention](#sparse-attention)) |
 | `mla` | yes, by vLLM's MLA backends that take FP8: Triton's (a latent of 256 and 32 rotated dims), FlashInfer's on SM 10.x (DeepSeek's dims). A prompt's cached context is dequantized as it is gathered, by vLLM's kernel or, for the latent sizes it lacks, the plugin's. Where no prefill backend of vLLM's takes the dims, the prefill is FlashAttention's, in the model's dtype |
 | `mla` with an indexer or the `index` port | refused: its cache is the plugin's |
 | `csa` | refused: its caches are the plugin's ([Compressed sparse attention](#compressed-sparse-attention)) |
@@ -460,11 +460,13 @@ vLLM's kernels.
 ### DSA on vLLM's kernels
 
 In a 16-bit model, DSA's indexer runs on the kernels vLLM runs DeepSeek-V3.2's on,
-where they take its settings: single keys (no `block_size`), ReLU'd dots summed
-over the heads (no `per_group`), weighted or summed heads, an indexer head of 32,
-64 or 128 dims, 128 heads at most, no window, and a `top_k` of 2048 at most. It
-takes DeepGEMM, which vLLM installs, on an SM 9.0 or 10.x GPU. Other DSA layers, and
-QSA's and MSA's, keep the plugin's own kernels above.
+where they take its settings: single keys, ReLU'd dots summed over the heads (no
+`per_group`), weighted or summed heads, an indexer head of 32, 64 or 128 dims, 128
+heads at most, no window, and a `top_k` of 2048 at most. It takes DeepGEMM, which
+vLLM installs, on an SM 9.0 or 10.x GPU. QSA's indexer (mean-pooled blocks of a
+size that divides 64) runs on them as DSA's over its blocks, with `top_k /
+block_size` blocks. MSA's (plain dots, picks per group) and the rest keep the
+plugin's own kernels above.
 
 - **Keys.** Each token's indexer key is cached in FP8 (e4m3) with a float32 scale,
   in head slots of the call's cache after its kv heads: each block's keys, then
@@ -476,8 +478,15 @@ QSA's and MSA's, keep the plugin's own kernels above.
   score theirs in place, by its paged MQA logits. Queries are FP8 too, with a scale
   for each head that joins the head's weight; heads are padded to a count DeepGEMM
   takes (4 or more, a power of two, on SM 10.x), with weights of 0.
-- **Picks.** vLLM's top-k kernels keep each query's best `top_k` of the keys it
-  sees, as DeepSeek-V3.2's do; the plugin's Triton kernel attends over them.
+- **QSA's blocks.** Its keys as projected are cached in bfloat16, in slots of their
+  own. The token that completes a block writes the block's key, the mean of its
+  keys normalized and rotated to its first position, as bux pools it, into the FP8
+  keys at the position of the block's index, so the kernels score a request's
+  complete blocks as DSA's keys. A query also keeps its own block while that is
+  unfinished.
+- **Picks.** vLLM's top-k kernels keep each query's best `top_k` of the keys (or
+  blocks) it sees, as DeepSeek-V3.2's do; the plugin's Triton kernel attends over
+  them.
 - **FP8 KV cache.** Under `--kv-cache-dtype fp8`, such a call keeps its keys and
   values in FP8 (e4m3, at a scale of 1, as vLLM's attention does), and so does a
   layer that reads its `index` port. The attention kernel reads them as they are,
