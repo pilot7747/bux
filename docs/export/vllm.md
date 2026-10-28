@@ -370,13 +370,13 @@ frees and prefix-caches them. vLLM lays the caches' blocks side by side when the
 sizes divide one another, as they do where the dims are powers of two.
 
 A step writes its tokens' rows, then reads every key from the caches. The indexer
-scores, in float32, the compressed latents a query sees, its sequence's gathered
-once for a prompt's chunk, and keeps the top-k, the first of equal scores as bux
-does; while there are no more than `top_k`, it keeps them all. One softmax in
-float32 covers the window, the kept latents and the sinks: in a 16-bit model by a
-Triton kernel that reads the latents in place, as for the other sparse layers
-(`BUX_VLLM_SPARSE_KERNELS`), else in PyTorch, in chunks of bounded size, with no
-loop over tokens.
+scores, in float32, the compressed latents a query sees, and keeps the top-k, the
+first of equal scores as bux does; while there are no more than `top_k`, it keeps
+them all. One softmax in float32 covers the window, the kept latents and the
+sinks. In a 16-bit model both run by Triton kernels that read the caches in place,
+as for the other sparse layers (`BUX_VLLM_SPARSE_KERNELS`), but for picks inside a
+candidate pool; else in PyTorch, a prompt chunk's keys gathered once, in chunks of
+bounded size, with no loop over tokens.
 
 vLLM's own DeepSeek-V4 layers compute something else. At a ratio of 4 their
 compressor pools overlapping windows of 8 tokens, with a learned position bias.
