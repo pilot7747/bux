@@ -6,7 +6,7 @@ Run it where the plugin and Triton are installed, with a CUDA GPU::
     python scripts/vllm_kernels.py
 
 For each setting (DSA's top-k, MSA's blocks and picks per group, QSA's blocks, a
-window, sinks, a softcap), dtype
+window, sinks, a softcap, indexer keys that pad their rows), dtype
 (float32, bfloat16) and layout (one request's prefill, a decoding step of several
 requests), it compares the picks, which must be equal in float32, and the outputs,
 which must agree within 1e-4 in float32 and 2e-2 in bfloat16 (where a near tie may
@@ -29,6 +29,7 @@ SETTINGS = {
     "dsa": {},
     "dsa, window, sinks, softcap": {"window": 40, "softcap": 20.0, "sinks": True},
     "dsa, plain dots": {"relu": False},
+    "dsa, odd index dims": {"index_dims": 31},
     "msa blocks": {"block_size": 4, "top_k": 32},
     "msa blocks per group": {"block_size": 4, "top_k": 32, "per_group": True},
     "qsa blocks, window": {"block_size": 4, "top_k": 32, "mean": True, "window": 64},
@@ -62,11 +63,11 @@ def spec(h: int, g: int, dk: int, heads: int, settings: dict) -> picks.Sparse:
 
 
 def caches(lengths: list[int], g: int, dk: int, i: int, dtype: torch.dtype) -> tuple:
-    """Random paged caches of keys and values and of index keys, 16 tokens a block,
-    and each request's block table, its blocks shuffled."""
+    """A random paged cache of keys, values and index keys (`bux_vllm.picks.Cache`),
+    16 tokens a block, and each request's block table, its blocks shuffled."""
     page, blocks = 16, sum(-(-n // 16) for n in lengths) + 1
-    kv = torch.randn(blocks, g, page, 2 * dk, device="cuda", dtype=dtype)
-    index = torch.randn(blocks, 1, page, i, device="cuda", dtype=dtype)
+    row = 2 * dk + -(-i // g)
+    pages = torch.randn(blocks, g, page, row, device="cuda", dtype=dtype)
     order = torch.randperm(blocks - 1, device="cuda") + 1  # block 0 is vLLM's null
     width = max(-(-n // page) for n in lengths)
     table = torch.zeros(len(lengths), width, dtype=torch.int32, device="cuda")
@@ -75,28 +76,27 @@ def caches(lengths: list[int], g: int, dk: int, i: int, dtype: torch.dtype) -> t
         count = -(-n // page)
         table[r, :count] = order[at : at + count]
         at += count
-    return (kv, index), table
+    return picks.Cache(pages, 2 * dk, i), table
 
 
 def compare(name: str, settings: dict, dtype: torch.dtype, decoding: bool) -> bool:
     """Whether the kernels' picks and outputs are the PyTorch path's."""
     torch.manual_seed(0)
-    h, g, dk, i = 8, 2, 64, 32
+    h, g, dk, i = 8, 2, 64, settings.get("index_dims", 32)
     heads = g if settings.get("per_group") else 4  # a group a head, picking apart
     lengths = [300, 97, 1, 513] if decoding else [300]
-    (kv, index), table = caches(lengths, g, dk, i, dtype)
+    cache, table = caches(lengths, g, dk, i, dtype)
     if decoding:
         positions = torch.tensor([n - 1 for n in lengths], device="cuda")
     else:
         positions = torch.arange(lengths[0], device="cuda")
-    rows = (table, table)
     q = torch.randn(len(positions), h, dk, device="cuda", dtype=dtype)
     iq = torch.randn(len(positions), heads, i, device="cuda", dtype=dtype)
     iw = torch.randn(len(positions), heads, device="cuda", dtype=torch.float32)
     layer = spec(h, g, dk, heads, settings)
     assert kernels.takes(layer, (dk, dk), dtype)
     n = max(lengths)
-    args = (layer, q, (iq, iw), positions, (kv, index), rows, n)
+    args = (layer, q, (iq, iw), positions, cache, table, n)
     want, (kept, valid) = picks.attend_segment(*args)
     got, (kept2, valid2) = kernels.attend_segment(*args)
     same = torch.equal(kept[valid], kept2[valid2]) and torch.equal(valid, valid2)
