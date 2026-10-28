@@ -207,6 +207,14 @@ CASES = {
     " load_balancing=aux_free, expert=dense)\n"
     + MOE_BLOCK
     + "model = embed block^2 rmsnorm head",
+    # Kimi K3's SiTU-GLU experts, up soft-capped (low, so that the cap bites).
+    "moe-situ": HEAD
+    + ATTN
+    + "experts = moe(num_experts=8, top_k=2, num_shared_experts=1, router=sigmoid,"
+    " load_balancing=aux_free, expert=gated_mlp(intermediate_size=64,"
+    " activation=situ, up_softcap=0.5))\n"
+    + MOE_BLOCK
+    + "model = embed block^2 rmsnorm head",
     # Muse Spark's routed experts: each one's output normalized, in a latent.
     "moe-norm": HEAD
     + ATTN
