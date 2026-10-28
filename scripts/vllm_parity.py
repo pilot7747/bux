@@ -171,6 +171,9 @@ CASES = {
     " load_balancing=aux_free, expert=dense)\n"
     + MOE_BLOCK
     + "model = embed block^2 rmsnorm head",
+    "engram": LLAMA
+    + "memory = engram(head_dim=8, table_size=12288)\n"
+    + "model = embed block memory block rmsnorm head(tied=true)",
     "mamba2": HEAD
     + ATTN
     + FFN

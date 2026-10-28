@@ -28,11 +28,23 @@ from bux.architecture.experts.moe import MoE
 from bux.architecture.layers.conv import CausalConv
 from bux.export import plan as core
 from bux.export.hf import common as hf_common
+from bux.export.hf import engram as hf_engram
 from bux.export.hf import linear_attention as hf_linear
 from bux.export.hf import residual as hf_residual
 from bux.export.hf import rwkv7 as hf_rwkv7
 from bux.lang import compile, compile_file, ir
-from bux_vllm import common, config, delta, feeds, kv, linear, plan, residual, routing
+from bux_vllm import (
+    common,
+    config,
+    delta,
+    feeds,
+    kv,
+    linear,
+    ngram,
+    plan,
+    residual,
+    routing,
+)
 
 ROOT = Path(__file__).parent.parent
 EXAMPLES = sorted((ROOT / "examples" / "architectures").rglob("*.bux"))
@@ -763,3 +775,100 @@ def test_the_step_splits_into_single_queries_and_requests() -> None:
     assert [p.tokens.tolist() for p in parts] == [[0, 5], [1, 2, 3, 4], [6, 7, 8]]
     assert [p.requests.tolist() for p in parts] == [[0, 2], [1], [3]]
     assert [p.keys for p in parts] == [7, 30, 12]
+
+
+ENGRAMS = {
+    "engram": ("engram(head_dim=4, table_size=50)", None),
+    "4-grams, boundary, classes": (
+        (
+            "engram(head_dim=4, table_size=50, max_ngram_size=4, num_heads=2,"
+            " conv_size=2, boundary_token=5, vocab_classes=11)"
+        ),
+        None,
+    ),
+    "no conv": ("engram(head_dim=4, table_size=50, conv_size=none)", None),
+    "on the streams": ("engram(head_dim=4, table_size=50)", "hc(expansion=2)"),
+}
+
+#: A step's tokens of each of two sequences, of 11 and 7 tokens: a prefill of each,
+#: then the first's in a decoding step and a chunk, the second's in none.
+STEPS = [(4, 7), (1, 0), (6, 0)]
+
+
+class Stepped(ngram.EngramCore):
+    """The plugin's engram, its conv's state kept here between steps, of R
+    sequences, as vLLM's cache keeps it."""
+
+    def __init__(self, c: dict, d: int, copies: int, hashes: dict, r: int):
+        super().__init__(c, d, copies, hashes)
+        self.conv = torch.nn.ParameterDict()
+        if c["conv_size"]:
+            channels, keep = copies * d, (c["conv_size"] - 1) * self.n
+            self.conv["weight"] = torch.zeros(c["conv_size"], channels)
+            self.past = torch.zeros(r, keep, channels)
+
+    def convolve(self, x: torch.Tensor, ctx: Any) -> torch.Tensor:
+        taps = self.conv["weight"]
+        y, self.past = ngram.dilated_conv(
+            x, taps, self.n, ctx.query_start_loc, self.past
+        )
+        return y
+
+
+def engram_twins(setting: str, residual: str | None) -> tuple:
+    """The export's engram and the plugin's, of the same random weights, and the
+    model width."""
+    head = HEAD + (f"residual = {residual}\n" if residual else "")
+    arch = compile(f"{head}mem = {setting}\nmodel = embed mem head")
+    tree = core.plan(arch)
+    call = next(c for c in tree.calls if c.layer.config.type == "engram")
+    extra = tree.sites()[call.path]["extra"]
+    bux = arch.model_dump(mode="json")
+    config = stand_in(bux=bux, hidden_size=arch.d_model)
+    c, width = call.layer.config.model_dump(mode="json"), call.layer.width
+    theirs = hf_engram.Engram(c, width, hf_common.Site(config, call.path, extra=extra))
+    copies = 2 if residual else 1
+    mine = Stepped(c, arch.d_model, copies, extra, len(STEPS[0]))
+    twins(theirs, mine)
+    return theirs, mine, arch.d_model, copies
+
+
+@pytest.mark.parametrize(("setting", "residual"), ENGRAMS.values(), ids=ENGRAMS.keys())
+def test_engram_computes_in_steps_what_the_export_does(
+    setting: str, residual: str | None
+) -> None:
+    """Two sequences in steps of vLLM's kinds, the ids before each step given and
+    the conv's state kept, add to the stream what the export's engram adds to each
+    sequence whole."""
+    torch.manual_seed(0)
+    theirs, mine, d, copies = engram_twins(setting, residual)
+    lengths = [sum(s[i] for s in STEPS) for i in range(2)]
+    ids = [torch.randint(0, 12, (n,)) for n in lengths]
+    ids[0][3] = 5  # a boundary token, where there is one
+    xs = [torch.randn(n, copies, d) if residual else torch.randn(n, d) for n in lengths]
+    want = []
+    for tokens, x in zip(ids, xs, strict=True):
+        at = torch.arange(len(tokens))[None]
+        ctx = hf_common.Ctx(
+            tokens[None], at, None, None, torch.nn.ModuleDict(), stand_in()
+        )
+        want.append(theirs(x[None], ctx)[0])
+    got: list[list[torch.Tensor]] = [[], []]
+    done = [0, 0]
+    for step in STEPS:
+        parts = [range(done[i], done[i] + step[i]) for i in range(2)]
+        before = [
+            [ids[i][j].item() if j >= 0 else -1 for j in range(done[i] - 4, done[i])]
+            for i in range(2)
+        ]
+        ctx = stand_in(
+            input_ids=torch.cat([ids[i][list(parts[i])] for i in range(2)]),
+            query_start_loc=torch.tensor([0, step[0], step[0] + step[1]]),
+            ngram_context=torch.tensor(before),
+        )
+        y = mine(torch.cat([xs[i][list(parts[i])] for i in range(2)]), ctx)
+        got[0].append(y[: step[0]])
+        got[1].append(y[step[0] :])
+        done = [done[i] + step[i] for i in range(2)]
+    for i in range(2):
+        torch.testing.assert_close(torch.cat(got[i]), want[i])

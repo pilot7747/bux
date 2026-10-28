@@ -129,6 +129,14 @@ ones, `--load-format dummy`, to time it.
   short-conv kernels, so the model is a hybrid for vLLM. vLLM pads each state to a
   page of the attention's KV cache, a block of tokens (16 by default) per sequence,
   and with prefix caching keeps the states at block boundaries (its `align` mode).
+- **Engram.** An `engram` layer hashes each token's n-grams from the step's token
+  ids and, for those that reach back before the step, each sequence's last
+  `max_ngram_size - 1` ids, which vLLM's model runner reads from the tokens it holds
+  and passes to the model, as it does for Qwen4Exp's n-gram embeddings. Nothing of
+  them is cached, and vLLM's V2 model runner (its default) is needed. Its conv
+  keeps each sequence's last `(conv_size - 1) max_ngram_size` inputs in vLLM's Mamba
+  cache, like a conv on keys and values. The whole layer, its tables included, is
+  on every rank.
 - **Ports.** A layer's ports go through the forward pass's taps, as in bux: a `gqa`
   layer that reads the `v` port mixes those values into its own before they enter
   its KV cache, and one that writes it pushes its values, mixed or not.
@@ -145,11 +153,12 @@ ones, `--load-format dummy`, to time it.
 | `mamba2`, `gdn` | by vLLM's own layers, with one type and shape of recurrent layer per model; `gdn` in bfloat16 only, and with its short conv and output gate. Under tensor parallelism, vLLM 0.32's Mamba-2 failed with one group (its fused all-reduce), and in bfloat16 where a rank's share of the input projection is not a multiple of 8 wide |
 | `kda` | by vLLM's KDA kernels, Kimi Linear's (by chunks for a prompt, the recurrence for each decoded token) and its causal conv, with one type and shape of recurrent layer per model: value heads (`num_v_heads`), the decay's rank, `gate_lower_bound` of -5 and above, and a dense or low-rank output gate. Not yet: no conv, no output gate, a `v_head_dim` other than `head_dim`, or speculative decoding |
 | `gdn2`, `rwkv7` | the delta rule in PyTorch ([Delta rules in PyTorch](#delta-rules-in-pytorch)), the rest by vLLM's layers and causal conv, with one type and shape of recurrent layer per model: every setting, and `rwkv7`'s `v` port (the value residual). Not yet: `gdn2` without its conv, or speculative decoding |
+| `engram` | every setting, on a single or a widened stream: the n-gram sizes and hash heads, the norms, the dilated conv or none, `vocab_classes` and `boundary_token`. Not yet: speculative decoding, a conv of one tap, or vLLM's V1 model runner |
 | residual algebras, `merge` | `hc`, `mhc`, `gr`, `attnres`, `vpgate`, with every setting, single-pass included |
 | the graph | everything; a shared MoE or recurrent layer may run only once per forward pass |
 
 Every other layer type is not in vLLM yet: among them `csa`, `dyt`, `conv`,
-`short_conv`, `mamba`, `engram`, and the linear attentions `deltanet`, `gla` and
+`short_conv`, `mamba`, and the linear attentions `deltanet`, `gla` and
 `lightning`. Serve those models with transformers ([Exporting models](index.md)).
 
 vLLM's own KDA layer gives every value head a q and a k head of its own. bux's
