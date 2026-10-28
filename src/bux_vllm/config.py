@@ -31,6 +31,8 @@ STATES = {
     "mamba2": "mamba",
     "gdn": "linear_attention",
     "kda": "linear_attention",
+    "gdn2": "linear_attention",
+    "rwkv7": "linear_attention",
 }
 
 #: The softmax attention layer types, whose first sets the heads vLLM reads.
