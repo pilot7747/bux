@@ -58,7 +58,8 @@ def states(c: dict, layer_ports: list | None = None) -> list[str]:
     ``kv_conv_size`` and its indexer's keys (``index``) with an indexer, or an
     ``engram``'s conv's; none for a layer that keeps none. A ``gqa`` layer that
     reads its ``kv`` port names an attention layer of its own, over its writer's
-    cache, and keeps nothing else."""
+    cache, and keeps nothing else; one that reads its ``index`` port keeps no
+    indexer's keys."""
     if c["type"] == "engram":
         return ["conv"] if c["conv_size"] else []
     if c["type"] not in STATES:
@@ -66,7 +67,8 @@ def states(c: dict, layer_ports: list | None = None) -> list[str]:
     if c["type"] == "gqa" and reads(layer_ports or [], "kv"):
         return [STATES["gqa"]]
     conv = ["conv"] if c.get("kv_conv_size") else []
-    return [STATES[c["type"]], *conv, *(["index"] if c.get("indexer") else [])]
+    own = c.get("indexer") and not reads(layer_ports or [], "index")
+    return [STATES[c["type"]], *conv, *(["index"] if own else [])]
 
 
 def layer_types(layer: dict) -> list[str]:
