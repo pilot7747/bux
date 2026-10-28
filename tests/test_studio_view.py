@@ -17,6 +17,9 @@ from bux.studio.view import RUNS, view
 EXAMPLES = Path(__file__).parent.parent / "examples"
 LLAMA = EXAMPLES / "architectures/llama3_8b.bux"
 ABLATION = EXAMPLES / "experiments/attention_ablation.bux"
+#: Examples that compile only where others use them, after a model: the
+#: timeline's rungs set d_model, so alone they are a model file without a model.
+PARTS = {"experiments/timeline/rungs.bux"}
 
 
 def view_of(path: Path, picks: dict[str, int] | None = None) -> dict:
@@ -42,7 +45,13 @@ def text(source: str, span: list[int]) -> str:
 
 
 @pytest.mark.parametrize(
-    "path", sorted(EXAMPLES.rglob("*.bux")), ids=lambda p: str(p.relative_to(EXAMPLES))
+    "path",
+    [
+        p
+        for p in sorted(EXAMPLES.rglob("*.bux"))
+        if str(p.relative_to(EXAMPLES)) not in PARTS
+    ],
+    ids=lambda p: str(p.relative_to(EXAMPLES)),
 )
 def test_every_example_has_a_view(path):
     v = view_of(path)

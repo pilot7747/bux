@@ -14,6 +14,9 @@ from bux.train import config as tcfg
 
 ROOT = Path(__file__).parent.parent
 EXPERIMENTS = sorted(ROOT.joinpath("examples", "experiments").rglob("*.bux"))
+#: Files that compile only where others use them, after a model: the timeline's
+#: rungs set d_model, so alone they are a model file without a model.
+PARTS = {"rungs"}
 
 ARCH = """
 d_model = 16
@@ -596,11 +599,13 @@ def test_strings_that_name_a_setting_print_quoted():
     assert again.train == run.train
 
 
-@pytest.mark.parametrize("path", EXPERIMENTS, ids=lambda p: p.stem)
+@pytest.mark.parametrize(
+    "path", [p for p in EXPERIMENTS if p.stem not in PARTS], ids=lambda p: p.stem
+)
 def test_experiments_compile_and_print_back_to_the_same_runs(path):
     report = check(path.read_text(), filename=str(path))
     assert report.errors == []
-    if report.arch is None:  # a recipe: settings without a model
+    if report.run is None:  # a recipe, or an architecture that others train
         return
     for run in compile_runs(path.read_text(), filename=str(path)):
         [again] = compile_runs(run_to_source(run))
