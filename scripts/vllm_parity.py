@@ -70,6 +70,22 @@ DEEPSEEK = (
     "layout=interleaved, scaling=yarn(factor=4, original_max_len=16,"
     " attention_factor_on=softmax)))\n"
 )
+#: The timeline's csa (examples/experiments/timeline/sparse.bux) at d_model 128, its
+#: window and top-k shrunk so that the prompts and their decoding cross both.
+SPARSE = (
+    "attn = csa(num_heads=2, head_dim=64, compress_ratio=4, sliding_window_size=16,"
+    " sinks=true, rope=rope(fraction=0.5), indexer=indexer(num_heads=4, head_dim=64,"
+    " top_k=8))\n"
+)
+#: DeepSeek-V4.1's wiring of csa: a window-only layer, and one compressing pairs of
+#: tokens, from a query latent, through a grouped low-rank output of 2 groups.
+SPARSE_LATENT = (
+    "window = csa(num_heads=4, head_dim=64, q_lora_rank=64, o_lora_rank=32,"
+    " o_groups=2, sliding_window_size=8, sinks=true, rope=rope(fraction=0.25,"
+    " layout=interleaved))\n"
+    "pairs = window(compress_ratio=2, indexer=indexer(num_heads=2, head_dim=32,"
+    " top_k=12))\n"
+)
 
 #: The cases, by name: a model each, as bux source.
 CASES = {
@@ -211,6 +227,12 @@ CASES = {
     + "gated = attn(gated=true, gate_per_head=true, output_norm=rmsnorm)\n"
     + FFN
     + "model = embed [rmsnorm attn] [rmsnorm ffn] [rmsnorm gated] [rmsnorm ffn]"
+    " rmsnorm head",
+    "csa": HEAD + SPARSE + FFN + BLOCK + "model = embed block^2 rmsnorm head",
+    "csa-latent": HEAD
+    + SPARSE_LATENT
+    + FFN
+    + "model = embed [rmsnorm window] [rmsnorm ffn] [rmsnorm pairs] [rmsnorm ffn]"
     " rmsnorm head",
 }
 
