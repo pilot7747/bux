@@ -45,10 +45,11 @@ class Counts:
         self._runs: dict[tuple, list] = {}
 
     def at(self, stem: str, arms: tuple[str, ...], width: int) -> dict:
-        """The counts of `stem`'s arm at the rung labelled ``d<width>``."""
-        key = f"{stem}|{'+'.join(arms)}|{width}"
+        """The counts of `stem`'s arm at the rung labelled ``d<width>``, cached by
+        its architecture (by its name where its file is not at hand)."""
+        run = self.rung(stem, arms, width)
+        key = f"arch|{digest(run.arch)}" if run else f"{stem}|{'+'.join(arms)}|{width}"
         if key not in self.table:
-            run = self.rung(stem, arms, width)
             self._store(key, lambda: count(run.arch) if run else {"error": "no run"})
         return self.table[key]
 
@@ -56,20 +57,28 @@ class Counts:
         """The FLOPs per training token and active parameters at the valid width
         nearest `d_model`, the multiple of 128 the family's rules accept."""
         for width in _near(d_model):
-            key = f"{stem}|{'+'.join(arms)}|{width}|flops"
+            run = self.sized(stem, arms, width)
+            key = (
+                f"arch|{digest(run.arch)}|flops"
+                if run
+                else f"{stem}|{'+'.join(arms)}|{width}|flops"
+            )
             if key not in self.table:
-                self._store(key, lambda w=width: _flops(self.sized(stem, arms, w)))
+                self._store(key, lambda r=run: _flops(r))
             if "error" not in self.table[key]:
                 return self.table[key]
         return {"error": f"no width near {d_model:.0f} compiles"}
 
     def rung_flops(self, stem: str, arms: tuple[str, ...], width: int) -> dict:
         """The FLOPs per training token of `stem`'s arm at its rung ``d<width>``."""
-        key = f"{stem}|{'+'.join(arms)}|{width}|rung_flops"
+        run = self.rung(stem, arms, width)
+        key = (
+            f"arch|{digest(run.arch)}|rung_flops"
+            if run
+            else f"{stem}|{'+'.join(arms)}|{width}|rung_flops"
+        )
         if key not in self.table:
-            self._store(
-                key, lambda: {"flops": _flops(self.rung(stem, arms, width))["flops"]}
-            )
+            self._store(key, lambda: {"flops": _flops(run)["flops"]})
         return self.table[key]
 
     def rung(self, stem: str, arms: tuple[str, ...], width: int) -> Any | None:
@@ -88,18 +97,24 @@ class Counts:
         return None
 
     def runs(self, stem: str, overrides: tuple[str, ...]) -> list:
+        """`stem`'s file's runs under `overrides`; none if it has no file or the
+        overrides break its rules (a width whose heads do not divide)."""
         if (stem, overrides) not in self._runs:
-            from bux.lang import compile_runs
-
-            file = find(stem, self.folders)
-            self._runs[(stem, overrides)] = (
-                compile_runs(
-                    file.read_text(), filename=str(file), overrides=list(overrides)
-                )
-                if file
-                else []
-            )
+            self._runs[(stem, overrides)] = self._compile(stem, overrides)
         return self._runs[(stem, overrides)]
+
+    def _compile(self, stem: str, overrides: tuple[str, ...]) -> list:
+        from bux.lang import compile_runs
+
+        file = find(stem, self.folders)
+        if file is None:
+            return []
+        try:
+            return compile_runs(
+                file.read_text(), filename=str(file), overrides=list(overrides)
+            )
+        except Exception:  # noqa: BLE001  (a width the family's rules reject)
+            return []
 
     def _store(self, key: str, make: Any) -> None:
         try:
@@ -158,8 +173,13 @@ def count(arch: Any) -> dict:
         "active": total - dropped - idle,
         "moe": "moe" in types,
         "hybrid": bool(types & LINEAR),
-        "arch": hashlib.sha1(arch.model_dump_json().encode()).hexdigest()[:12],
+        "arch": digest(arch),
     }
+
+
+def digest(arch: Any) -> str:
+    """A short hash of an architecture: what its counts and cost depend on."""
+    return hashlib.sha1(arch.model_dump_json().encode()).hexdigest()[:12]
 
 
 def _param_sizes(module: Any) -> dict[int, int]:

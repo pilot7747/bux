@@ -32,7 +32,7 @@ import statistics
 import sys
 import traceback
 from collections import Counter, OrderedDict
-from collections.abc import Callable
+from collections.abc import Callable, Iterable
 from dataclasses import asdict, dataclass, field, replace
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
@@ -411,7 +411,8 @@ def layer_caches(call: "LayerCall") -> list[Cache]:
     """What a layer call keeps in vLLM's cache.
 
     Raises:
-        Unpriced: A token mixer of a type this model does not know.
+        Unpriced: A token mixer of a type this model does not know, or on a widened
+            residual stream.
     """
     from bux.config import AttentionConfig
 
@@ -422,6 +423,8 @@ def layer_caches(call: "LayerCall") -> list[Cache]:
         return []  # only token mixers keep a cache
     if any(port.name == "kv" and port.mode != "write" for port in call.layer.ports):
         return []  # it reads another layer's keys and values
+    if not isinstance(width, int):
+        raise Unpriced(f"no cache model of {c.type!r} on {width!r}")
     match c.type:
         case "gqa":
             dk = c.head_dim or width // c.num_heads
@@ -495,7 +498,7 @@ def vllm_support(arch: "Architecture", calls: list["LayerCall"]) -> str:
         for name in VLLM_UNSUPPORTED.get(c.type, ()):
             value = getattr(c, name, None)
             if value not in (None, False) and not (
-                name == "gate_head_bias" and not c.gated
+                name == "gate_head_bias" and not getattr(c, "gated", False)
             ):
                 return f"{c.type} {name}"
         if c.type == "moe" and c.expert.up_softcap is not None:
@@ -559,7 +562,7 @@ def layout(p: Profile, hw: Hardware, e: Engine) -> Layout:
     )
 
 
-def _grouped(items: list) -> tuple:
+def _grouped(items: Iterable[tuple]) -> tuple:
     """(key..., bytes) items with their bytes summed by key, zeros left out."""
     out: dict = {}
     for *key, b in items:
@@ -1016,7 +1019,7 @@ def step_times(rows: np.ndarray, w: np.ndarray) -> np.ndarray:
     t = rows * w
 
     def total(*names: str) -> np.ndarray:
-        return sum(t[:, F[n]] for n in names)
+        return sum((t[:, F[n]] for n in names), np.zeros(len(t)))
 
     fixed = total("step", "light", "heavy", "prefill", "allreduce", "nvlink")
     memory = total("dense", "experts", "kv")
@@ -1252,7 +1255,8 @@ def price(
 def _best(points: list[Point], slo_ms: float) -> dict | None:
     """The point of the most sessions per hour within the SLO; None if none is."""
     ok = [pt for pt in points if pt.tpot_ms <= slo_ms]
-    return asdict(max(ok, key=lambda pt: pt.sessions_per_hour)) if ok else None
+    top = max(ok, key=lambda pt: pt.sessions_per_hour, default=None)
+    return asdict(top) if top is not None else None
 
 
 def cost(

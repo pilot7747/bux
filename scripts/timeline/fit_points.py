@@ -34,7 +34,19 @@ SLUG = re.compile(
 )
 SI = {"": 1, "k": 1e3, "K": 1e3, "M": 1e6, "B": 1e9, "G": 1e9, "T": 1e12}
 #: Keys of a RESULT line that are not final metrics.
-SETTINGS = {"dir", "state", "lr", "budget", "steps", "d_model", "step", "batch"}
+SETTINGS = {
+    "dir",
+    "name",
+    "state",
+    "lr",
+    "budget",
+    "tokens",
+    "steps",
+    "d_model",
+    "step",
+    "batch",
+}
+SHORT = 0.97  # a run that trained on less of its rung's budget was cut short
 
 
 @dataclass
@@ -135,17 +147,30 @@ def parse_row(row: dict) -> Run | None:
     """A RESULT row's run, or None if it did not finish or has no rung."""
     if row.get("state") not in ("done", None):
         return None
-    stem, labels = parse_name(row["dir"])
+    stem, labels = parse_name(row.get("name") or row["dir"])
     width, per_param, settings, arms = classify(labels)
     width = width or int(number(row.get("d_model")) or 0)
     if not width:
         return None
     lr = number(row.get("lr")) or number(settings.get("optimizer.lr"))
-    tokens = number(row.get("budget")) or RUNG_TOKENS.get(width, math.nan) * (
-        per_param / LADDER
+    tokens = (
+        number(row.get("tokens"))
+        or number(row.get("budget"))
+        or RUNG_TOKENS.get(width, math.nan) * (per_param / LADDER)
     )
     seeded = settings.get("seed", "0") != "0"
     return Run(stem, arms, width, per_param, lr, tokens, final_metrics(row), seeded)
+
+
+def cut_short(runs: list[Run]) -> tuple[list[Run], list[Run]]:
+    """The runs kept, and those that trained on less than `SHORT` of their rung's
+    budget (rungs.bux's, by tokens per baseline parameter): they stopped early."""
+
+    def short(r: Run) -> bool:
+        want = RUNG_TOKENS.get(r.width, math.nan) * r.per_param / LADDER
+        return r.tokens < SHORT * want
+
+    return [r for r in runs if not short(r)], [r for r in runs if short(r)]
 
 
 def final_metrics(row: dict) -> dict[str, float]:
@@ -160,26 +185,22 @@ def final_metrics(row: dict) -> dict[str, float]:
     return out
 
 
-def points(runs: list[Run], pick: str = "min", average: bool = False) -> list[Point]:
-    """One point per family, rung and token budget: its runs at each learning rate
-    (the first of each, replicates only where it has none; all of them averaged if
-    `average`), then the best learning rate by the objective (`pick` "min"), or the
-    vertex of a parabola in log lr through the best and its neighbours ("vertex").
-
-    Every family is a best of as many single runs so: averaging one family's seeds
-    would leave it the only one without the best-of-lrs selection's luck."""
+def points(runs: list[Run], pick: str = "min", average: bool = True) -> list[Point]:
+    """One point per family, rung and token budget. Its best learning rate is
+    chosen on its first runs (replicates only where an lr has none), by the
+    objective (`pick` "min"), or at the vertex of a parabola in log lr through the
+    best and its neighbours ("vertex"); its value is the mean of every run at that
+    lr if `average` (the seeds run at the best lr), else of its first runs."""
     groups: dict[tuple, dict] = defaultdict(lambda: defaultdict(list))
-    for r in firsts(runs, average):
+    for r in runs:
         if "objective" in r.metrics:
             groups[(r.family, r.width, r.per_param)][r.lr].append(r)
-    return [_best(by_lr, pick) for _, by_lr in sorted(groups.items())]
+    return [_best(by_lr, pick, average) for _, by_lr in sorted(groups.items())]
 
 
-def firsts(runs: list[Run], average: bool = False) -> list[Run]:
-    """The runs a point is made of: at each family, rung, budget and lr, those that
-    are not replicates, or the replicates where none is; all of them if `average`."""
-    if average:
-        return runs
+def firsts(runs: list[Run]) -> list[Run]:
+    """At each family, rung, budget and lr, the runs that are not replicates, or
+    the replicates where none is."""
     have = {(r.family, r.width, r.per_param, r.lr) for r in runs if not r.replicate}
     return [
         r
@@ -188,15 +209,18 @@ def firsts(runs: list[Run], average: bool = False) -> list[Run]:
     ]
 
 
-def _best(by_lr: dict[float | None, list[Run]], pick: str) -> Point:
+def _best(by_lr: dict[float | None, list[Run]], pick: str, average: bool) -> Point:
     lrs = sorted(by_lr, key=lambda x: x or 0.0)
-    means = {lr: _mean([r.metrics for r in rs]) for lr, rs in by_lr.items()}
+    chosen = {lr: firsts(rs) for lr, rs in by_lr.items()}
+    means = {lr: _mean([r.metrics for r in rs]) for lr, rs in chosen.items()}
     best = min(lrs, key=lambda lr: means[lr]["objective"])
     i = lrs.index(best)
-    first = by_lr[best][0]
-    metrics = means[best]
-    if pick == "vertex" and 0 < i < len(lrs) - 1 and None not in lrs:
-        metrics = _vertex([lrs[i - 1], best, lrs[i + 1]], means)
+    used = by_lr[best] if average else chosen[best]
+    metrics = _mean([r.metrics for r in used])
+    known = [lr for lr in lrs if lr is not None]
+    if pick == "vertex" and 0 < i < len(lrs) - 1 and len(known) == len(lrs):
+        metrics = _vertex(known[i - 1 : i + 2], means | {best: metrics})
+    first = used[0]
     return Point(
         family=first.family,
         stem=first.stem,
@@ -206,9 +230,9 @@ def _best(by_lr: dict[float | None, list[Run]], pick: str) -> Point:
         tokens=float(np.median([r.tokens for rs in by_lr.values() for r in rs])),
         metrics=metrics,
         lr=best,
-        lrs=tuple(lr for lr in lrs if lr is not None),
+        lrs=tuple(known),
         edge=len(lrs) > 1 and i in (0, len(lrs) - 1),
-        replicates=len(by_lr[best]),
+        replicates=len(used),
     )
 
 

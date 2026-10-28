@@ -1,12 +1,13 @@
 """Fit the timeline's ablations and extrapolate every family to a target of equal
 agentic serving cost.
 
-It reads RESULT lines (one per finished run, see fit_points.py) and keeps one point
-per family, rung and token budget, at its best learning rate. The parameters come
-from compiling each family's arm at its rung (fit_counts.py, cached). The baseline's
-law L(N, D) = E + A N^-alpha + B D^-beta fits its ladder and its token scan; every
-other family is fit relative to its parent (fit_law.py), and says its
-effective-parameter multiplier at each rung. Each target, from serving.py's
+It reads runs (run directories, or files of RESULT lines: fit_inputs.py) and keeps
+one point per family, rung and token budget, at its best learning rate, its seeds
+averaged. The parameters come from compiling each family's arm at its rung
+(fit_counts.py, cached). The root's law L(N, D) = E + A N^-alpha + B D^-beta (the
+baseline's, or --root's) fits its ladder and its token scan; every other family is
+fit relative to its parent, read from its file (fit_family.py), and says its
+effective-parameter multiplier at each rung (fit_law.py). Each target, from serving.py's
 matches, is predicted under unlimited data (by training GPU-hours on B300s) and
 limited data (130B, 1T and 10T tokens), with the leave-one-rung-out range and a
 noise bootstrap (fit_analysis.py). Tables, a JSON of everything and plots go to
@@ -15,12 +16,15 @@ noise bootstrap (fit_analysis.py). Tables, a JSON of everything and plots go to
     python scripts/timeline/fit.py results.txt --targets serving-table.json --out fit
     python scripts/timeline/fit.py results.txt --match B1b --mfu mfu.json --wandb
     python scripts/timeline/fit.py results.txt --match B1b --parents p.json --share B,beta
+    python scripts/timeline/fit.py results.jsonl --root positions/rope --drop-scan baseline \\
+        --fix-e objective=0.3204,code_bpb=0.2808,repo_bpb=0.2448,web_bpb=0.3832
     python scripts/timeline/fit.py --selftest --out /tmp/fit-selftest
 """
 
 import argparse
 import json
 import math
+import shlex
 import sys
 from pathlib import Path
 from typing import Any
@@ -38,6 +42,14 @@ HERE = Path(__file__).resolve().parent
 MIN_DOF = 2  # replicates' degrees of freedom to trust their noise over --noise
 
 
+ARGV = sys.argv[1:]  # the fit's arguments, as the report repeats them
+
+
+def command() -> str:
+    """How this fit was run."""
+    return shlex.join(["python", "scripts/timeline/fit.py", *ARGV])
+
+
 def main() -> None:
     a = parser().parse_args()
     if a.selftest:
@@ -52,13 +64,13 @@ def main() -> None:
 
 def run(a: argparse.Namespace) -> dict:
     """Read, fit and write; return what was written."""
-    runs = fit_inputs.read(a.results)
+    runs, short = fit_points.cut_short(fit_inputs.read(a.results))
     counts = Counts(a.cache or a.out / "counts.json", tuple(a.files))
-    parents = family_parents(a, runs)
+    parents = family_parents(a, runs, counts)
     if not a.keep_base:
         runs = fit_family.alias_bases(runs, counts, parents, a.root)
     points, diverged = fit_points.monotone(
-        fit_points.points(runs, a.pick, a.average_seeds)
+        fit_points.points(runs, a.pick, not a.no_average_seeds)
     )
     points = attach(points, counts, a.rung_flops)
     if not any(p.family == a.root for p in points):
@@ -71,30 +83,46 @@ def run(a: argparse.Namespace) -> dict:
     )
     noise = {m: fit_points.noise(runs, m) for m in metrics}
     analyses = [
-        fit_analysis.analyze(points, m, parents, targets, options(a, noise[m]))
+        fit_analysis.analyze(points, m, parents, targets, options(a, noise[m], m))
         for m in metrics
     ]
     tables = tables_of(analyses, points, metrics, targets, a)
-    tables["learning_rates"] = fit_points.lr_vertices(runs)
+    tables["lr"] = tables["learning_rates"] = fit_points.lr_vertices(runs)
+    tables["long_context"] = fit_report.long_context(analyses)
+    tables["long_summary"] = fit_report.long_summary(tables["long_context"])
+    tables["unlimited_summary"] = fit_report.unlimited_summary(analyses, targets)
+    tables["limited_summary"] = fit_report.limited_summary(analyses)
     facts = {
         "noise": noise,
         "diverged": diverged,
         "points": points,
         "analyses": analyses,
+        "short": short,
     }
     out = write(a, analyses, targets, tables, facts)
     if a.wandb:
-        log_wandb(tables, out["plots"], a.project)
+        log_wandb(tables, out["plots"], a.project, a.out)
     return out
 
 
-def family_parents(a: argparse.Namespace, runs: list) -> dict[str, str]:
-    """Each family's parent: read from its file's modules, --parents over them."""
-    found = fit_family.infer_parents({r.family for r in runs}, tuple(a.files), a.root)
+def family_parents(a: argparse.Namespace, runs: list, counts: Counts) -> dict[str, str]:
+    """Each family's parent: read from its file's modules (by its kind where the
+    file uses two), --parents over them."""
+    first = {}
+    for r in sorted(runs, key=lambda r: r.width):
+        first.setdefault(r.family, r)
+
+    def kind_of(f: str) -> str | None:
+        r = first.get(f)
+        return fit_family.kind(counts.at(r.stem, r.arms, r.width)) if r else None
+
+    found = fit_family.infer_parents(set(first), tuple(a.files), a.root, kind_of)
     return found | (json.loads(a.parents.read_text()) if a.parents else {})
 
 
-def options(a: argparse.Namespace, noise: tuple | None) -> fit_analysis.Options:
+def options(
+    a: argparse.Namespace, noise: tuple | None, metric: str
+) -> fit_analysis.Options:
     """The fit's options for a metric: its bootstrap noise the replicates', if they
     have `MIN_DOF` degrees of freedom, else --noise."""
     measured = noise is not None and noise[1] >= MIN_DOF
@@ -102,9 +130,16 @@ def options(a: argparse.Namespace, noise: tuple | None) -> fit_analysis.Options:
         (noise[0], f"replicates, {noise[1]} dof") if measured else (a.noise, "--noise")
     )
     share = tuple(a.share.split(",")) if a.share else ()
-    return fit_analysis.Options(
-        a.root, not a.no_joint, sigma, a.reps, a.seed, share, source
+    e = (
+        dict(kv.split("=") for kv in a.fix_e.split(",")).get(metric)
+        if a.fix_e
+        else None
     )
+    drop = tuple(a.drop_scan.split(",")) if a.drop_scan else ()
+    return fit_analysis.Options(
+        a.root, not a.no_joint, sigma, a.reps, a.seed, share, source,
+        None if e is None else float(e), drop,
+    )  # fmt: skip
 
 
 def attach(
@@ -138,15 +173,15 @@ def build_targets(
     if a.match:
         sys.path.insert(0, str(HERE))
         for f, p in first.items():
-            if f not in raw and (file := find(p.stem, tuple(a.files))):
-                arch = lambda p=p: counts.sized(p.stem, p.arms, 1024).arch
-                raw[f] = fit_targets.match(file, f, arch, a.match, counts.table)
+            file, run = find(p.stem, tuple(a.files)), counts.sized(p.stem, p.arms, 1024)
+            if f not in raw and file and run:
+                raw[f] = fit_targets.match(file, run.arch, a.match, counts.table)
                 counts.save()
     if a.targets:
         sys.path.insert(0, str(HERE))
         for f, p in first.items():
             if f not in raw and (file := find(p.stem, tuple(a.files))):
-                arch = lambda p=p: counts.sized(p.stem, p.arms, 1024).arch
+                arch = lambda p=p: served_arch(counts, p)
                 raw[f] = fit_targets.by_architecture(raw, file, arch) or {}
     raw = {f: r for f, r in raw.items() if r.get("n_active")}
     same = {(first[f].width, first[f].counts["arch"]): f for f in raw if f in first}
@@ -161,6 +196,18 @@ def build_targets(
             entry, source = fit_family.mfu_source(f, measured, parents, kinds)
             out[f] = make_target(r, first[f], counts, entry, source)
     return out
+
+
+def served_arch(counts: Counts, p: fit_points.Point) -> Any:
+    """`p`'s architecture at ``d_model = 1024``, by which serving.py's arm is found.
+
+    Raises:
+        LookupError: If its file has no such arm.
+    """
+    run = counts.sized(p.stem, p.arms, 1024)
+    if run is None:
+        raise LookupError(f"{p.family}: no arm at d_model = 1024")
+    return run.arch
 
 
 def make_target(
@@ -207,11 +254,12 @@ def write(
     """Write report.md, fit.json and the plots to --out."""
     a.out.mkdir(parents=True, exist_ok=True)
     plots = []
+    first = next((x for x in analyses if x.laws), None)
+    wanted = a.plot.split(",") if a.plot else None
+    # one family per colour slot in every plot: chosen once, on the first metric
+    fams = fit_plots.chosen(first, targets, a.root, wanted) if first else []
     for x in analyses:
         if x.metric in a.plot_metrics.split(",") and x.laws:
-            fams = fit_plots.chosen(
-                x, targets, a.root, a.plot.split(",") if a.plot else None
-            )
             plots += fit_plots.ladder(x, fams, targets, a.out)
             if a.root in targets:
                 plots += fit_plots.hours(x, fams, targets, a.root, a.out)
@@ -259,13 +307,29 @@ def assumptions(a: argparse.Namespace, targets: dict, facts: dict) -> list[str]:
     )
     out = [
         f"N is the parameters a token goes through besides the embeddings; points at the best of their learning rates ({a.pick}), "
-        + ("seeds averaged in." if a.average_seeds else "each of one run: seeds and base arms only measure the noise."),
+        + ("its lr chosen on its first runs, then every run at that lr averaged (the seeds)." if not a.no_average_seeds else "each of its first runs only: seeds and base arms only measure the noise."),
         f"E is shared by every family; {fit}" + (f"; {a.share} pooled: only the root has them of its own." if a.share else "."),
         noise_line(facts["analyses"], a.reps),
         f"Targets: {a.targets or ('serving.py match at ' + a.match if a.match else 'none')} (budget {a.budget}).",
         (f"GPU-hours = tokens x FLOPs/token / (MFU x {fit_targets.PEAK:.3g} x 3600); MFU measured, else a measured kin's "
          "(an MoE or hybrid of its file), else its nearest measured ancestor's (the (a) table's 'MFU from')."),
     ]  # fmt: skip
+    if a.fix_e:
+        out.append(f"E held (not fit) for {a.fix_e}; the other metrics fit it.")
+    if a.drop_scan:
+        out.append(
+            f"Token scans left out for {a.drop_scan}: they take their parent's data term."
+        )
+    if short := facts.get("short"):
+        names = ", ".join(
+            sorted(
+                f"{r.family} d{r.width} t{r.per_param} ({r.tokens / 1e9:.3g}B tokens)"
+                for r in short
+            )
+        )
+        out.append(
+            f"Left out as cut short (under {fit_points.SHORT:.0%} of their rung's tokens): {names}."
+        )
     if gone := facts["diverged"]:
         names = ", ".join(sorted(f"{p.family} d{p.width} t{p.per_param}" for p in gone))
         out.append(
@@ -289,15 +353,17 @@ def noise_line(analyses: list, reps: int) -> str:
     """Each metric's noise per run, where it comes from, and the verdict's rule."""
     each = ", ".join(f"{x.metric} {x.sigma:.2%} ({x.sigma_from})" for x in analyses)
     return (
-        f"Noise per run: {each}. The bootstrap refits {reps} times with each point off by it; "
-        f"a rung's delta against its parent is two runs apart, so 'no measurable difference' "
-        f"means |delta| < {fit_analysis.VERDICT} x sqrt(2) x sigma at every rung."
+        f"Noise per run: {each}. The bootstrap refits {reps} times with each point off by it "
+        f"over the root of the runs it averages; 'no measurable difference' means "
+        f"|delta| < {fit_analysis.VERDICT} sigmas of the delta at every rung, "
+        f"sigma x sqrt(1/n + 1/n_parent) for points of n and n_parent runs."
     )
 
 
 def markdown(a: argparse.Namespace, tables: dict, targets: dict, facts: dict) -> str:
     parts = [
         "# Timeline fit\n",
+        f"Command, from the repository's root: `{command()}`\n",
         *(f"- {s}" for s in assumptions(a, targets, facts)),
         "",
     ]
@@ -311,18 +377,20 @@ def markdown(a: argparse.Namespace, tables: dict, targets: dict, facts: dict) ->
                 fit_report.markdown(tables[key], fit_report.LEADERBOARD),
             ]
     parts += [
-        "## (a) Unlimited data: GPU-hours to the reference target's losses (vs: the parent's, or the root's)\n",
-        fit_report.markdown(tables["extrapolation_unlimited"], fit_report.UNLIMITED),
+        "## (a) Unlimited data: GPU-hours to the reference target's 1T-token loss (vs: the parent's, or the root's; every metric in fit.json)\n",
+        fit_report.markdown(tables["unlimited_summary"], fit_report.UNLIMITED_SUMMARY),
     ]
     parts += [
         "## Learning rates (vertex of a parabola in log lr, trials within 3% of the best)\n",
         fit_report.markdown(tables["learning_rates"], fit_report.LEARNING_RATES),
     ]
     parts += [
-        "## (b) Limited data: loss on the same tokens\n",
-        fit_report.markdown(
-            tables["extrapolation_limited"], fit_report.LIMITED_COLUMNS
-        ),
+        "## Long context: repositories after 8k tokens against their first tokens (means over the rungs)\n",
+        fit_report.markdown(tables["long_summary"], fit_report.LONG_SUMMARY),
+    ]
+    parts += [
+        "## (b) Limited data: loss on the same tokens (objective; every metric in fit.json)\n",
+        fit_report.markdown(tables["limited_summary"], fit_report.LIMITED_SUMMARY),
     ]
     for key, title in (
         ("multipliers", "Effective-parameter multipliers at each rung"),
@@ -333,12 +401,17 @@ def markdown(a: argparse.Namespace, tables: dict, targets: dict, facts: dict) ->
     return "\n".join(parts)
 
 
-def log_wandb(tables: dict, plots: list[Path], project: str) -> None:
-    """Log the tables as W&B Tables, and the plots, in a run named ``analysis``."""
+def log_wandb(tables: dict, plots: list[Path], project: str, out: Path) -> None:
+    """Log the tables as W&B Tables, and the plots, in a run named ``analysis``
+    whose local files go under `out`."""
     import wandb
 
     run = wandb.init(
-        project=project, name="analysis", group="analysis", job_type="analysis"
+        project=project,
+        name="analysis",
+        group="analysis",
+        job_type="analysis",
+        dir=str(out),
     )
     for name in (
         "leaderboard",
@@ -347,8 +420,10 @@ def log_wandb(tables: dict, plots: list[Path], project: str) -> None:
         "multipliers",
         "laws",
         "points",
+        "lr",
+        "long_context",
     ):
-        rows = tables[name]
+        rows = tables.get(name, [])
         columns = list(dict.fromkeys(k for r in rows for k in r))
         data = [[_cell(r.get(c)) for c in columns] for r in rows]
         run.log({name: wandb.Table(columns=columns, data=data)})
@@ -366,7 +441,12 @@ def _cell(v: Any) -> Any:
 
 def parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
-    p.add_argument("results", nargs="*", type=Path, help="files of RESULT lines")
+    p.add_argument(
+        "results",
+        nargs="*",
+        type=Path,
+        help="run directories, folders of them, or files of RESULT lines",
+    )
     p.add_argument(
         "--out",
         type=Path,
@@ -400,9 +480,9 @@ def parser() -> argparse.ArgumentParser:
         "--pick", choices=("min", "vertex"), default="min", help="a point's best lr"
     )
     p.add_argument(
-        "--average-seeds",
+        "--no-average-seeds",
         action="store_true",
-        help="average a point's seeds into it; else they only measure the noise",
+        help="a point is its first runs only; its seeds only measure the noise",
     )
     p.add_argument(
         "--metrics",
@@ -435,6 +515,14 @@ def parser() -> argparse.ArgumentParser:
     p.add_argument(
         "--share",
         help="terms only the root has of its own, as alpha,B,beta: pooled over every family",
+    )
+    p.add_argument(
+        "--fix-e",
+        help="hold E, as objective=0.3204,code_bpb=0.2808 (metrics not named: fit)",
+    )
+    p.add_argument(
+        "--drop-scan",
+        help="comma-separated families whose token scans are left out: they take their parent's data term",
     )
     p.add_argument(
         "--noise", type=float, default=0.002, help="the bootstrap's relative noise"

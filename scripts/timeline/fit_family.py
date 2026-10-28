@@ -5,6 +5,7 @@ training MFU a family without its own takes.
 
 import re
 from pathlib import Path
+from typing import Any
 
 from fit_counts import Counts, find
 from fit_points import ROOT, Run
@@ -15,26 +16,42 @@ MILESTONE = re.compile(r"m\d{4}_\w+")  # a milestone's module, an arm of milesto
 
 
 def infer_parents(
-    families: set[str], folders: tuple[Path, ...], root: str
+    families: set[str], folders: tuple[Path, ...], root: str, kind_of: Any = None
 ) -> dict[str, str]:
     """Each family's parent, from the modules its file uses: one milestone's
-    (``use m2026_hybrid``: that milestone), else `MODULES`' (``use gpt3_rope``:
-    ``positions/rope``), else the root, as for milestones.bux, which uses them all."""
+    (``use m2026_hybrid``: that milestone), `MODULES`' (``use gpt3_rope``:
+    ``positions/rope``), or the baseline, as for milestones.bux, which uses them
+    all. A file that uses two (sparse.bux: gpt3_rope and m2026_hybrid) gives each
+    arm the one of its kind (`kind_of`: dense, MoE or hybrid), else the first. A
+    family that would be its own parent gets `root` (the baseline, if the root is
+    another)."""
     out = {}
     for f in families - {root}:
         file = find(f.partition("/")[0], folders)
-        parent = file_parent(file.read_text(), root) if file else root
+        options = file_parents(file.read_text()) if file else [ROOT]
+        parent = pick(f, options, kind_of) if len(options) > 1 else options[0]
         out[f] = root if parent == f else parent
     return out
 
 
-def file_parent(text: str, root: str) -> str:
-    """The family a file's arms change, from the modules it uses."""
+def file_parents(text: str) -> list[str]:
+    """The families a file's arms may change, from the modules it uses, in order."""
     uses = re.findall(r"^use\s+(\w+)", text, re.MULTILINE)
     milestones = [u for u in uses if MILESTONE.fullmatch(u)]
-    if len(milestones) == 1:
-        return f"milestones/{milestones[0]}"
-    return next((MODULES[u] for u in uses if u in MODULES), root)
+    if len(milestones) > 1:  # the milestones' own sweep
+        return [ROOT]
+    found = [
+        f"milestones/{u}" if MILESTONE.fullmatch(u) else MODULES.get(u) for u in uses
+    ]
+    return list(dict.fromkeys(f for f in found if f)) or [ROOT]
+
+
+def pick(f: str, options: list[str], kind_of: Any) -> str:
+    """The option of `f`'s kind, if just one is; else the first."""
+    if kind_of is None:
+        return options[0]
+    same = [o for o in options if kind_of(o) == kind_of(f)]
+    return same[0] if len(same) == 1 else options[0]
 
 
 def alias_bases(runs: list[Run], counts: Counts, parents: dict, root: str) -> list[Run]:

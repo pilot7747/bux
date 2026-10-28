@@ -12,7 +12,7 @@ from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Any
 
-from fit_points import ROOT, classify, family_key, parse_name
+from fit_points import classify, family_key, parse_name
 
 PEAK = 2.25e15  # a B300's dense bf16 FLOP/s
 #: Placeholder MFUs where no measured throughput is given: dense, and MoE or hybrid.
@@ -51,9 +51,8 @@ def load(path: Path, budget: str = "B1b") -> dict[str, dict]:
         match = row.get(budget) or {}
         if "d_model" in match and "active" in match:
             row_of = {"file": row["file"], "arm": row["arm"]}
-            out.setdefault(
-                serving_family(row["file"], row["arm"]), _aliases(match) | row_of
-            )
+            if family := serving_family(row["file"], row["arm"]):
+                out.setdefault(family, _aliases(match) | row_of)
     return out
 
 
@@ -84,22 +83,26 @@ def _aliases(v: dict) -> dict:
 
 
 def serving_family(file: str, arm: str) -> str:
-    """The family of a serving table's row: its file's stem and its arm's labels."""
+    """The family of a serving table's row: its file's stem and its arm's labels;
+    none for an axis file's base arm, which repeats its axis' parent's row."""
     stem, labels = parse_name(arm)
     arms = classify(labels)[3]
     stem = Path(file).stem if not labels else stem
-    return ROOT if arms == ("base",) else family_key(stem, arms)
+    return "" if arms == ("base",) else family_key(stem, arms)
 
 
-def match(file: Path, family: str, arch: Any, budget: str, cache: dict) -> dict:
-    """The target of `file`'s arm whose architecture is `arch()` (at ``d_model =
-    1024``), at `budget`, by serving.py's match: cached in `cache` by `family`."""
-    key = f"{family}|{budget}|match"
+def match(file: Path, arch: Any, budget: str, cache: dict) -> dict:
+    """The target of `file`'s arm whose architecture is `arch` (at ``d_model =
+    1024``), at `budget`, by serving.py's match: cached in `cache` by that
+    architecture, so a file that changes is matched again."""
+    from fit_counts import digest
+
+    key = f"match|{digest(arch)}|{budget}"
     if key not in cache:
         import serving
 
         try:
-            name = arm_named(serving.compile_arms(file, ("d_model = 1024",)), arch())
+            name = arm_named(serving.compile_arms(file, ("d_model = 1024",)), arch)
             cache[key] = _aliases(serving.match(file, budget, arm=name))
         except Exception as err:  # noqa: BLE001  (an arm serving.py cannot price)
             cache[key] = {"error": f"{type(err).__name__}: {str(err)[:200]}"}

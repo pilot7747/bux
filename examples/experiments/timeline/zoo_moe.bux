@@ -1,0 +1,25 @@
+# The routing of the late-2026 frontier's experts, one change at a time from the
+# milestone (m2026_frontier.bux): 256 experts, the top 7 by sigmoid scores, balanced
+# by a bias with a light sequence-wise loss, beside a shared expert. The zoo agrees on
+# fine-grained experts and splits on the rest; every arm keeps the experts and as
+# many active parameters, and changes them in every MoE layer, the MTP module's too.
+# Arms: era, source, what it was claimed for.
+use m2026_frontier
+use timeline_code
+use rungs
+
+fr_experts = # 2025 gpt-oss, Qwen3, 2026 Muse Spark, Mellum2: no shared expert, the top
+             # 8 instead; capacity for the routed experts
+             noshared:     fr_experts(num_shared_experts=0, top_k=8)
+           # 2025 Qwen3-Next, 2026 Qwen3.8, Mellum2: Qwen's routing, a softmax and a
+           # balance loss over the batch (1e-3), no bias and no scaling; balance as
+           # a loss, the camp that kept it
+           | softmax:      fr_experts(router=softmax, routed_scaling_factor=1.0,
+                                      load_balancing=aux_loss, aux_loss_coef=1e-3,
+                                      aux_loss_scope="batch")
+           # 2026 DeepSeek-V4, V4.1-Flash: scores by sqrt(softplus(logit)) in place
+           # of the sigmoid; quality, routing stability
+           | sqrtsoftplus: fr_experts(router=sqrtsoftplus)
+           # 2026 Trinity (SMEBU): the bias moved by a soft-clamped, centered and
+           # averaged step, Trinity Large's rate; stability of the balancing
+           | smebu:        fr_experts(load_balancing=smebu, bias_update_rate=5e-4)
