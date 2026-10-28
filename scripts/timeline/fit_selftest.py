@@ -13,6 +13,7 @@ bootstrap's range).
 
 import json
 import math
+import re
 from pathlib import Path
 
 import numpy as np
@@ -88,7 +89,7 @@ def lines(sigma: float, seed: int) -> list[str]:
         }
         labels = [x for x in (arm, f"d{w}", f"t{t}" if t != 20 else "") if x]
         labels += [f"optimizer.lr={lr:g}"] if w == 512 and t == 20 else []
-        name = f"{stem}[{', '.join(labels)}]-{i:010x}"
+        name = f"{slug(stem, labels)}-{i:010x}"
         out.append(
             "RESULT "
             + json.dumps(
@@ -105,9 +106,17 @@ def lines(sigma: float, seed: int) -> list[str]:
     return out
 
 
+def slug(stem: str, labels: list[str]) -> str:
+    """A run's directory name, as ``bux.train.trainer.directory`` makes it."""
+    return re.sub(r"[^A-Za-z0-9_.=+-]+", "_", f"{stem}[{', '.join(labels)}]").strip("_")
+
+
 def counts() -> dict:
-    """The counts the compiler would give, for fit_counts' cache."""
-    out = {}
+    """The counts the compiler would give, for fit_counts' cache: the base arm's
+    those of the baseline it repeats."""
+    out = {
+        f"synth|base|{w}": {"active": n_base(w), "arch": "baseline"} for w in (512, 768)
+    }
     for family, (stem, arm, active, total, widths, *_) in FAMILIES.items():
         for w in widths:
             n = n_base(w)

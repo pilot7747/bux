@@ -40,7 +40,8 @@ class Counts:
     def __init__(self, path: Path, folders: tuple[Path, ...] = (FOLDER,)) -> None:
         self.path = path
         self.folders = folders
-        self.table: dict = json.loads(path.read_text()) if path.exists() else {}
+        saved = json.loads(path.read_text()) if path.exists() else {}
+        self.table: dict = {k: v for k, v in saved.items() if "error" not in v}
         self._runs: dict[tuple, list] = {}
 
     def at(self, stem: str, arms: tuple[str, ...], width: int) -> dict:
@@ -75,14 +76,14 @@ class Counts:
         """The compiled run of `stem`'s arm at its rung ``d<width>``."""
         for run in self.runs(stem, ()):
             w, _, _, a = classify(parse_name(run.name)[1])
-            if w == width and a == arms:
+            if w == width and "_".join(a) == "_".join(arms):
                 return run
         return self.sized(stem, arms, width)
 
     def sized(self, stem: str, arms: tuple[str, ...], d_model: int) -> Any | None:
         """A compiled run of `stem`'s arm with ``d_model = <d_model>`` set."""
         for run in self.runs(stem, (f"d_model = {d_model}",)):
-            if classify(parse_name(run.name)[1])[3] == arms:
+            if "_".join(classify(parse_name(run.name)[1])[3]) == "_".join(arms):
                 return run
         return None
 
@@ -108,8 +109,11 @@ class Counts:
         self.save()
 
     def save(self) -> None:
+        """Write the counts to the cache; errors are not kept, so a file that did
+        not compile is tried again on the next run."""
+        kept = {k: v for k, v in self.table.items() if "error" not in v}
         self.path.parent.mkdir(parents=True, exist_ok=True)
-        self.path.write_text(json.dumps(self.table, indent=1, sort_keys=True))
+        self.path.write_text(json.dumps(kept, indent=1, sort_keys=True))
 
 
 def find(stem: str, folders: tuple[Path, ...]) -> Path | None:

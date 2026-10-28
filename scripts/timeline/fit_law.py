@@ -1,11 +1,12 @@
 """Scaling laws L(N, D) = E + A N^-alpha + B D^-beta of families of points, fit by the
 Huber loss of log L (Hoffmann et al., 2022).
 
-The root family (the baseline) has every term of its own. Every other family has
-its parent's terms but those its points can tell apart: A always, alpha with three
-rungs or more, B and beta with a token scan. E is the data's, shared by every
-family: it is fit jointly with the root and the families that have every term of
-their own (the milestones' full ladders), and the rest are fit with it held.
+The root family has every term of its own. Every other family has its parent's
+terms but those its points can tell apart: A always, alpha with three rungs or
+more, B and beta with a token scan (``share`` takes some of them from the parent
+whatever the points). E is the data's, shared by every family. All families are fit
+at once, so a term many families share rests on all of their points; the staged
+fit (the root alone, then each family with its parent held) is its start.
 """
 
 import math
@@ -67,10 +68,16 @@ class Family:
     width: np.ndarray
     per_param: np.ndarray
     parent: str  # NO_DATA for the root
+    share: tuple[str, ...] = ()  # terms it takes from its parent whatever its points
+    extra: tuple[str, ...] = ()  # terms of its own its children's points tell apart
     free: tuple[str, ...] = ()
 
     def __post_init__(self) -> None:
-        self.free = own_terms(self.width, self.per_param, self.parent == NO_DATA)
+        root = self.parent == NO_DATA
+        own = set(own_terms(self.width, self.per_param, root)) | set(self.extra)
+        self.free = tuple(
+            t for t in SHAPES if t in own and (root or t not in self.share)
+        )
 
     @property
     def ladder(self) -> np.ndarray:
@@ -88,7 +95,7 @@ class Family:
 
     def _take(self, keep: np.ndarray, y: np.ndarray) -> "Family":
         n, d, w, t = (v[keep] for v in (self.n, self.d, self.width, self.per_param))
-        return Family(n, d, y, w, t, self.parent)
+        return Family(n, d, y, w, t, self.parent, self.share, self.extra)
 
 
 def own_terms(width: np.ndarray, per_param: np.ndarray, root: bool) -> tuple[str, ...]:
@@ -103,19 +110,41 @@ def own_terms(width: np.ndarray, per_param: np.ndarray, root: bool) -> tuple[str
 def fit_metric(
     fams: dict[str, Family], root: str, joint: bool = True, start: dict | None = None
 ) -> dict[str, Law]:
-    """Every family's law: the root's group jointly, E with it, then the others
-    in order, each with its parent's law and E held."""
+    """Every family's law. From `start`, or from the staged fits and a grid of
+    the root's: jointly, E, the root's terms and every family's own at once (the
+    terms a family shares then rest on every family that shares them); else staged."""
     order = topological(fams, root)
-    group = [root]
-    for f in order[1:] if joint else ():
-        if set(fams[f].free) == set(SHAPES) and fams[f].parent in group:
-            group.append(f)
-    starts = [start] if start else root_starts(fams, group)
-    laws = fit_group(fams, group, {NO_DATA: FLAT}, None, starts)
-    for f in order:
-        if f not in laws:
-            laws[f] = fit_one(fams, f, laws, start)
+    if not joint:
+        return staged(fams, order, start)
+    starts = [start] if start else [staged(fams, order)]
+    if not start:
+        starts += [spread(fams, order, s[root]) for s in root_starts(fams, [root])]
+    return fit_group(fams, order, {NO_DATA: FLAT}, None, starts)
+
+
+def staged(
+    fams: dict[str, Family], order: list[str], start: dict | None = None
+) -> dict:
+    """The root's law alone, then each family's with its parent's and E held."""
+    root = order[0]
+    starts = [start] if start else root_starts(fams, [root])
+    laws = fit_group(fams, [root], {NO_DATA: FLAT}, None, starts)
+    for f in order[1:]:
+        laws[f] = fit_one(fams, f, laws, start)
     return laws
+
+
+def spread(fams: dict[str, Family], order: list[str], law: Law) -> dict[str, Law]:
+    """A start for every family from one law: its terms, each family's A what its
+    points need beside them."""
+    out = {}
+    for f in order:
+        fam = fams[f]
+        rest = (fam.y - law.E - law.B * fam.d**-law.beta) * fam.n**law.alpha
+        out[f] = replace(
+            law, A=float(np.median(rest)) if np.median(rest) > 0 else law.A
+        )
+    return out
 
 
 def topological(fams: dict[str, Family], root: str) -> list[str]:
@@ -149,18 +178,14 @@ def fit_group(
 ) -> dict[str, Law]:
     """The laws of `group` that fit its points best from any of `starts`: E too
     unless `e` holds it, each family's own terms, the rest from its parent."""
-    floor = min(float(fams[f].y.min()) for f in group)
+    with_e = e is None
+    src, owners = _sources(fams, group, fixed, with_e)
 
     def unpack(x: np.ndarray) -> dict[str, Law]:
-        values = iter(x[1:] if e is None else x)
-        laws: dict[str, Law] = {}
-        E = math.exp(x[0]) if e is None else e
-        for f in group:
-            parent = laws.get(fams[f].parent) or fixed[fams[f].parent]
-            own = {s: _decode(s, next(values)) for s in fams[f].free}
-            terms = {s: own.get(s, getattr(parent, s)) for s in SHAPES}
-            laws[f] = Law(E, **terms)
-        return laws
+        E = math.exp(x[0]) if with_e else e
+        return {
+            f: Law(E, **{t: _term(t, c, x) for t, c in src[f].items()}) for f in group
+        }
 
     def residuals(x: np.ndarray) -> np.ndarray:
         laws = unpack(x)
@@ -171,15 +196,62 @@ def fit_group(
             ]
         )
 
-    lo, hi = _bounds(fams, group, e is None, floor)
+    def jacobian(x: np.ndarray) -> np.ndarray:
+        laws = unpack(x)
+        return np.concatenate(
+            [_rows(fams[f], laws[f], src[f], len(x), with_e) for f in group]
+        )
+
+    floor = min(float(fams[f].y.min()) for f in group)
+    lo, hi = _bounds(owners, with_e, floor)
     sols = [
-        least_squares(residuals, x0, loss="huber", f_scale=DELTA, bounds=(lo, hi))
+        least_squares(
+            residuals, x0, jac=jacobian, loss="huber", f_scale=DELTA, bounds=(lo, hi)
+        )
         for x0 in (
-            np.clip(_encode(fams, group, s, e is None), lo + 1e-9, hi - 1e-9)
+            np.clip(_encode(owners, s, with_e, fams, group), lo + 1e-9, hi - 1e-9)
             for s in starts
         )
     ]
     return unpack(min(sols, key=lambda sol: sol.cost).x)
+
+
+def _rows(fam: Family, law: Law, src: dict, cols: int, with_e: bool) -> np.ndarray:
+    """The Jacobian's rows of a family's residuals, log L - log y, in the fit's
+    columns: logs of E, A and B, and the exponents."""
+    a, b = law.A * fam.n**-law.alpha, law.B * fam.d**-law.beta
+    loss = law.E + a + b
+    parts = {"A": a, "alpha": -a * np.log(fam.n), "B": b, "beta": -b * np.log(fam.d)}
+    rows = np.zeros((len(fam.y), cols))
+    if with_e:
+        rows[:, 0] = law.E / loss
+    for t, c in src.items():
+        if isinstance(c, int):
+            rows[:, c] = parts[t] / loss
+    return rows
+
+
+def _sources(
+    fams: dict, group: list[str], fixed: dict[str, Law], with_e: bool
+) -> tuple:
+    """For each family and term, the column of x that holds it or the held law it
+    comes from; and the family and term of each column."""
+    src: dict[str, dict] = {}
+    owners: list[tuple[str, str]] = []
+    for f in group:
+        parent = fams[f].parent
+        src[f] = {}
+        for t in SHAPES:
+            if t in fams[f].free:
+                src[f][t] = len(owners) + int(with_e)
+                owners.append((f, t))
+            else:
+                src[f][t] = src[parent][t] if parent in src else fixed[parent]
+    return src, owners
+
+
+def _term(name: str, c: int | Law, x: np.ndarray) -> float:
+    return _decode(name, x[c]) if isinstance(c, int) else getattr(c, name)
 
 
 def _decode(name: str, v: float) -> float:
@@ -187,26 +259,22 @@ def _decode(name: str, v: float) -> float:
 
 
 def _encode(
-    fams: dict, group: list[str], start: dict[str, Law], with_e: bool
+    owners: list, start: dict[str, Law], with_e: bool, fams: dict, group: list[str]
 ) -> np.ndarray:
-    first = start[group[0]]
+    first = start.get(group[0]) or next(iter(start.values()))
     x = [math.log(first.E)] if with_e else []
-    for f in group:
+    for f, t in owners:
         law = start.get(f) or start.get(fams[f].parent) or first
-        x += [
-            math.log(getattr(law, s)) if s in LOGGED else getattr(law, s)
-            for s in fams[f].free
-        ]
+        x.append(math.log(getattr(law, t)) if t in LOGGED else getattr(law, t))
     return np.array(x, float)
 
 
-def _bounds(fams: dict, group: list[str], with_e: bool, floor: float) -> tuple:
+def _bounds(owners: list, with_e: bool, floor: float) -> tuple:
     lo = [math.log(1e-4)] if with_e else []
     hi = [math.log(floor * 0.999)] if with_e else []
-    for f in group:
-        for s in fams[f].free:
-            lo.append(-40.0 if s in LOGGED else 0.01)
-            hi.append(40.0 if s in LOGGED else 3.0)
+    for _, t in owners:
+        lo.append(-40.0 if t in LOGGED else 0.01)
+        hi.append(40.0 if t in LOGGED else 3.0)
     return np.array(lo), np.array(hi)
 
 

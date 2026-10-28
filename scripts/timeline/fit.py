@@ -14,6 +14,7 @@ noise bootstrap (fit_analysis.py). Tables, a JSON of everything and plots go to
 
     python scripts/timeline/fit.py results.txt --targets serving-table.json --out fit
     python scripts/timeline/fit.py results.txt --match B1b --mfu mfu.json --wandb
+    python scripts/timeline/fit.py results.txt --match B1b --parents p.json --share B,beta
     python scripts/timeline/fit.py --selftest --out /tmp/fit-selftest
 """
 
@@ -48,22 +49,50 @@ def main() -> None:
 
 def run(a: argparse.Namespace) -> dict:
     """Read, fit and write; return what was written."""
-    runs = fit_points.read(a.results, alias_base=not a.keep_base)
-    points = fit_points.points(runs, a.pick)
+    runs = fit_points.read(a.results)
     counts = Counts(a.cache or a.out / "counts.json", tuple(a.files))
-    points = attach(points, counts, a.rung_flops)
     parents = json.loads(a.parents.read_text()) if a.parents else {}
+    if not a.keep_base:
+        runs = alias_bases(runs, counts, parents, a.root)
+    points, diverged = fit_points.monotone(fit_points.points(runs, a.pick))
+    points = attach(points, counts, a.rung_flops)
+    if not any(p.family == a.root for p in points):
+        sys.exit(
+            f"no points of the root family {a.root!r}; families: {sorted({p.family for p in points})}"
+        )
     targets = build_targets(a, points, counts)
     metrics = (
         a.metrics.split(",") if a.metrics else fit_points.metrics_of(points, a.root)
     )
-    o = fit_analysis.Options(a.root, not a.no_joint, a.noise, a.reps, a.seed)
+    share = tuple(a.share.split(",")) if a.share else ()
+    o = fit_analysis.Options(a.root, not a.no_joint, a.noise, a.reps, a.seed, share)
     analyses = [fit_analysis.analyze(points, m, parents, targets, o) for m in metrics]
     tables = tables_of(analyses, points, metrics, targets, a)
-    out = write(a, analyses, points, targets, tables, fit_points.noise(runs))
+    facts = {"noise": fit_points.noise(runs), "diverged": diverged, "points": points}
+    out = write(a, analyses, targets, tables, facts)
     if a.wandb:
         log_wandb(tables, out["plots"], a.project)
     return out
+
+
+def alias_bases(runs: list, counts: Counts, parents: dict, root: str) -> list:
+    """`runs` with each axis file's ``base`` arm as the run it repeats: the parent
+    of the axis' other arms (the root if --parents names none), where the two have
+    one architecture at that rung."""
+    for r in runs:
+        if r.arms != ("base",):
+            continue
+        axis = [v for f, v in parents.items() if f.startswith(f"{r.stem}/")]
+        parent = max(set(axis), key=axis.count) if axis else root
+        stem, _, arm = parent.partition("/")
+        arms = (arm,) if arm else ()
+        mine, theirs = (
+            counts.at(r.stem, r.arms, r.width),
+            counts.at(stem, arms, r.width),
+        )
+        if mine.get("arch") and mine.get("arch") == theirs.get("arch"):
+            r.stem, r.arms = stem, arms
+    return runs
 
 
 def attach(
@@ -157,12 +186,7 @@ def tables_of(
 
 
 def write(
-    a: argparse.Namespace,
-    analyses: list,
-    points: list,
-    targets: dict,
-    tables: dict,
-    noise: tuple | None,
+    a: argparse.Namespace, analyses: list, targets: dict, tables: dict, facts: dict
 ) -> dict:
     """Write report.md, fit.json and the plots to --out."""
     a.out.mkdir(parents=True, exist_ok=True)
@@ -176,10 +200,10 @@ def write(
             if a.root in targets:
                 plots += fit_plots.hours(x, fams, targets, a.root, a.out)
             plots += fit_plots.bars(x, a.root, a.out)
-    text = markdown(a, tables, targets, noise, points)
+    text = markdown(a, tables, targets, facts)
     (a.out / "report.md").write_text(text)
     everything = {
-        "assumptions": assumptions(a, targets, noise, points),
+        "assumptions": assumptions(a, targets, facts),
         "targets": {f: fit_targets.as_dict(t) for f, t in targets.items()},
         "metrics": {x.metric: as_json(x) for x in analyses},
         "tables": tables,
@@ -208,14 +232,19 @@ def _json(v: Any) -> Any:
     return v.item() if hasattr(v, "item") else str(v)
 
 
-def assumptions(
-    a: argparse.Namespace, targets: dict, noise: tuple | None, points: list
-) -> list[str]:
-    """What the numbers rest on, said beside them."""
+def assumptions(a: argparse.Namespace, targets: dict, facts: dict) -> list[str]:
+    """What the numbers rest on, said beside them: `facts` has the replicates'
+    noise, the points dropped as diverged and the points kept."""
+    noise, points = facts["noise"], facts["points"]
     placeholder = sorted(f for f, t in targets.items() if not t.mfu_measured)
     out = [
         f"N is the parameters a token goes through besides the embeddings; points at the best of their learning rates ({a.pick}).",
-        f"E is shared by every family, fit {'jointly with every family that has all of its terms' if not a.no_joint else 'with the root alone'}.",
+        f"E is shared by every family; {'all families fit at once' if not a.no_joint else 'the root fit alone, then each family with its parent held'}"
+        + (
+            f"; {a.share} pooled: only the root has them of its own."
+            if a.share
+            else "."
+        ),
         f"Bootstrap: {a.reps} refits with each point off by a relative noise of {a.noise:g}"
         + (
             f"; replicate runs measured {noise[0]:.2%} ({noise[1]} degrees of freedom)."
@@ -225,6 +254,11 @@ def assumptions(
         f"Targets: {a.targets or ('serving.py match at ' + a.match if a.match else 'none')} (budget {a.budget}).",
         f"GPU-hours = tokens x FLOPs/token / (MFU x {fit_targets.PEAK:.3g} x 3600).",
     ]
+    if gone := facts["diverged"]:
+        names = ", ".join(sorted(f"{p.family} d{p.width} t{p.per_param}" for p in gone))
+        out.append(
+            f"Dropped as diverged (worse than a smaller rung or fewer tokens): {names}."
+        )
     if edges := sorted({f"{p.family} d{p.width}" for p in points if p.edge}):
         out.append(
             f"Best lr at the edge of its scan (scan further): {', '.join(edges)}."
@@ -237,16 +271,10 @@ def assumptions(
     return out
 
 
-def markdown(
-    a: argparse.Namespace,
-    tables: dict,
-    targets: dict,
-    noise: tuple | None,
-    points: list,
-) -> str:
+def markdown(a: argparse.Namespace, tables: dict, targets: dict, facts: dict) -> str:
     parts = [
         "# Timeline fit\n",
-        *(f"- {s}" for s in assumptions(a, targets, noise, points)),
+        *(f"- {s}" for s in assumptions(a, targets, facts)),
         "",
     ]
     for key, title in (
@@ -259,7 +287,7 @@ def markdown(
                 fit_report.markdown(tables[key], fit_report.LEADERBOARD),
             ]
     parts += [
-        "## (a) Unlimited data: GPU-hours to the baseline target's losses\n",
+        "## (a) Unlimited data: GPU-hours to the reference target's losses (vs: the parent's, or the root's)\n",
         fit_report.markdown(tables["extrapolation_unlimited"], fit_report.UNLIMITED),
     ]
     parts += [
@@ -366,7 +394,15 @@ def parser() -> argparse.ArgumentParser:
         action="store_true",
         help="count each rung's FLOPs per token too",
     )
-    p.add_argument("--no-joint", action="store_true", help="fit E with the root alone")
+    p.add_argument(
+        "--no-joint",
+        action="store_true",
+        help="fit the root alone, then each family with its parent held",
+    )
+    p.add_argument(
+        "--share",
+        help="terms only the root has of its own, as alpha,B,beta: pooled over every family",
+    )
     p.add_argument(
         "--noise", type=float, default=0.002, help="the bootstrap's relative noise"
     )

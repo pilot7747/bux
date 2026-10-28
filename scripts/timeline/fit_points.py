@@ -26,6 +26,14 @@ OBJECTIVE = {"code_bpb": 0.5, "repo_bpb": 0.3, "web_bpb": 0.2}
 RUNG_TOKENS = {512: 503e6, 768: 1.7e9, 1024: 4.03e9, 1280: 7.86e9}
 LADDER = 20  # tokens per baseline parameter of a rung's own budget
 NAME = re.compile(r"^(?P<stem>[^\[\]]+?)(?:\[(?P<labels>[^\]]*)\])?(?:-[0-9a-f]{6,})?$")
+#: A run's directory as bux names it (``bux.train.trainer.directory``): its name
+#: with what a path cannot hold as "_", then its id. The stem has no "_"; the rung
+#: is the first "_d<width>" after the arm that only labels follow.
+LABEL = r"(?:t\d+|[A-Za-z][\w.]*=[^_]*)"
+SLUG = re.compile(
+    rf"^(?P<stem>[A-Za-z0-9.+=-]+?)(?:_(?P<arm>.+?))?_(?P<rung>d\d+)"
+    rf"(?P<rest>(?:_{LABEL})*)$"
+)
 SI = {"": 1, "k": 1e3, "K": 1e3, "M": 1e6, "B": 1e9, "G": 1e9, "T": 1e12}
 #: Keys of a RESULT line that are not final metrics.
 SETTINGS = {"dir", "state", "lr", "budget", "steps", "d_model", "step", "batch"}
@@ -76,8 +84,9 @@ class Point:
 
 
 def family_key(stem: str, arms: tuple[str, ...]) -> str:
-    """``baseline``, ``positions/rope``: a file's stem and its run's arm labels."""
-    return "/".join((stem, "+".join(arms))) if arms else stem
+    """``baseline``, ``positions/rope``: a file's stem and its run's arm labels,
+    joined by "_" as a run's directory joins them."""
+    return f"{stem}/{'_'.join(arms)}" if arms else stem
 
 
 def number(value: Any) -> float | None:
@@ -91,8 +100,16 @@ def number(value: Any) -> float | None:
 
 
 def parse_name(name: str) -> tuple[str, list[str]]:
-    """The stem and the labels of a run's directory name."""
-    m = NAME.match(name.strip())
+    """The stem and the labels of a run's name (``positions[rope, d768]``) or of
+    its directory (``positions_rope_d768-6d3db7e680``)."""
+    name = name.strip()
+    if "[" not in name and (m := SLUG.match(re.sub(r"-[0-9a-f]{10}$", "", name))):
+        rest = re.findall(rf"_({LABEL})", m.group("rest"))
+        return m.group("stem"), [
+            *filter(None, [m.group("arm"), m.group("rung")]),
+            *rest,
+        ]
+    m = NAME.match(name)
     if m is None:
         return name, []
     labels = [s.strip() for s in (m.group("labels") or "").split(",") if s.strip()]
@@ -115,20 +132,20 @@ def classify(labels: list[str]) -> tuple[int | None, int, dict[str, str], tuple]
     return width, per_param, settings, tuple(arms)
 
 
-def read(paths: list[Path], alias_base: bool = True) -> list[Run]:
+def read(paths: list[Path]) -> list[Run]:
     """Every finished run of the RESULT lines in `paths`."""
     runs = []
     for path in paths:
         for line in path.read_text().splitlines():
             if (at := line.find("RESULT {")) >= 0:
                 row = json.JSONDecoder().raw_decode(line, at + len("RESULT "))[0]
-                run = parse_row(row, alias_base)
+                run = parse_row(row)
                 if run is not None:
                     runs.append(run)
     return runs
 
 
-def parse_row(row: dict, alias_base: bool = True) -> Run | None:
+def parse_row(row: dict) -> Run | None:
     """A RESULT line's run, or None if it did not finish or has no rung."""
     if row.get("state") not in ("done", None):
         return None
@@ -137,8 +154,6 @@ def parse_row(row: dict, alias_base: bool = True) -> Run | None:
     width = width or int(number(row.get("d_model")) or 0)
     if not width:
         return None
-    if alias_base and arms == ("base",):  # an axis file's base arm is the baseline
-        stem, arms = ROOT, ()
     lr = number(row.get("lr")) or number(settings.get("optimizer.lr"))
     tokens = number(row.get("budget")) or RUNG_TOKENS.get(width, math.nan) * (
         per_param / LADDER
@@ -227,7 +242,31 @@ def noise(runs: list[Run], metric: str = "objective") -> tuple[float, int] | Non
 
 def metrics_of(ps: list[Point], root: str = ROOT) -> list[str]:
     """The metrics to fit: the four, and the repository's by position, as far as the
-    root family's points have them."""
-    have = set.intersection(*(set(p.metrics) for p in ps if p.family == root))
+    root family's points (or, with none, any point) have them."""
+    mine = [set(p.metrics) for p in ps if p.family == root] or [
+        set(p.metrics) for p in ps
+    ]
+    have = set.intersection(*mine) if mine else set()
     extra = sorted(k for k in have if re.fullmatch(r"repo_bpb_\w+", k))
     return [m for m in METRICS if m in have] + extra
+
+
+def monotone(ps: list[Point], slack: float = 0.005) -> tuple[list[Point], list[Point]]:
+    """The points kept, and those dropped as diverged: a point whose objective is
+    over `slack` above that of the same family at a smaller rung with as many tokens
+    per parameter, or at the same rung on fewer tokens."""
+    dropped = {id(p) for p in ps if _worse(p, ps, slack)}
+    return [p for p in ps if id(p) not in dropped], [p for p in ps if id(p) in dropped]
+
+
+def _worse(p: Point, ps: list[Point], slack: float) -> bool:
+    smaller = [
+        q.metrics["objective"]
+        for q in ps
+        if q.family == p.family
+        and (
+            (q.per_param == p.per_param and q.width < p.width)
+            or (q.width == p.width and q.per_param < p.per_param)
+        )
+    ]
+    return bool(smaller) and p.metrics["objective"] > (1 + slack) * min(smaller)
