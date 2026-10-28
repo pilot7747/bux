@@ -225,6 +225,12 @@ CASES = {
     + "local = attn(sliding_window_size=16, sinks=true, softcap=20)\n"
     + "model = embed [rmsnorm attn] [rmsnorm ffn] [rmsnorm local] [rmsnorm ffn]"
     " rmsnorm head",
+    "dsa-conv": HEAD
+    + FFN
+    + "attn = gqa(num_heads=4, num_kv_heads=2, kv_conv_size=4, qk_norm=rmsnorm,"
+    " gated=true, indexer=indexer(num_heads=2, head_dim=16, top_k=8))\n"
+    + "model = embed [rmsnorm attn(v=@v1)] [rmsnorm ffn] [rmsnorm attn(v=$v1!)]"
+    " [rmsnorm ffn] rmsnorm head",
     "msa": HEAD
     + FFN
     + "attn = gqa(num_heads=4, num_kv_heads=2, rope=rope(), indexer=indexer("
@@ -237,6 +243,13 @@ CASES = {
     + "attn = gqa(num_heads=4, num_kv_heads=2, rope=rope(fraction=0.5),"
     " indexer=indexer(num_heads=2, head_dim=16, top_k=16, block_size=4,"
     " weighted=false, norm=rmsnorm))\n" + BLOCK + "model = embed block^2 rmsnorm head",
+    "qk-norm-all-heads": HEAD
+    + FFN
+    + "rms = gqa(num_heads=4, num_kv_heads=2, qk_norm=rmsnorm, qk_norm_all_heads=true,"
+    " rope=rope())\n"
+    + "ln = rms(qk_norm=layernorm(bias=true))\n"
+    + "model = embed [rmsnorm rms] [rmsnorm ffn] [rmsnorm ln] [rmsnorm ffn]"
+    " rmsnorm head",
     "kv-conv": HEAD
     + FFN
     + "attn = gqa(num_heads=4, num_kv_heads=2, kv_conv_size=4, rope=rope())\n"

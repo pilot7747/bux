@@ -138,7 +138,7 @@ ones, `--load-format dummy`, to time it.
 |--------|---------|
 | `embed`, `head` | the vocabulary split over ranks; learned positions, `scale_by_sqrt_dim`, `norm`; tied or untied, a bias, soft-capping |
 | `rmsnorm`, `layernorm`, `mlp`, `gated_mlp`, `linear`, `act`, `scale`, `dropout` | yes, with the MLPs' `limit`, `up_softcap` and `up_offset` |
-| `gqa` | RoPE (`pi`, `llama3`, `yarn`), QK-norm, GQA and MQA, biases, `fused_qkv`, sliding windows, soft-capping, sinks, its scale, `gated` (a gate per channel or per head, with `gate_head_bias`), `output_norm`, `power_scale` and `log_scale` (on the queries, which scales the logits as bux does), the conv on keys and values (`kv_conv_size`), an indexer ([Sparse attention](#sparse-attention)), and the `v` port: the value residual, fixed, learned or convex. Not yet: a relative bias, QK-norm across all heads (`qk_norm_all_heads`), or the `kv` and `index` ports |
+| `gqa` | RoPE (`pi`, `llama3`, `yarn`), QK-norm, GQA and MQA, biases, `fused_qkv`, sliding windows, soft-capping, sinks, its scale, `gated` (a gate per channel or per head, with `gate_head_bias`), `output_norm`, `power_scale` and `log_scale` (on the queries, which scales the logits as bux does), the conv on keys and values (`kv_conv_size`), an indexer ([Sparse attention](#sparse-attention)), and the `v` port: the value residual, fixed, learned or convex. QK-norm runs across all heads too (`qk_norm_all_heads`), its statistics summed over the ranks, where each rank keeps kv heads of its own. Not yet: a relative bias, or the `kv` and `index` ports |
 | `mla` | by vLLM's MLA and its latent cache ([Multi-head latent attention](#multi-head-latent-attention)): queries at full rank or from a latent, RoPE (`pi`, `llama3`, `yarn`; partial, interleaved) or none, its scale, `gated` (a gate per channel or per head), `output_norm`; in bfloat16 or float16. Not yet: QK-norm, sliding windows, soft-capping, sinks, an indexer, a relative bias, `log_scale`, `gate_head_bias`, ports, `mla` beside `gqa`, or `mla` layers of different dims or heads |
 | `moe` | softmax, sigmoid and `sqrtsoftplus` routers, `router_logit_scale`, groups, the aux-free bias, a router bias, shared experts and their gate, gated and plain experts (`swish`, `gelu`, `gelu_tanh`, `relu2`) with biases, and a `limit` and `up_offset` on `swish` and `quick_gelu` gates (gpt-oss's), and LatentMoE with its norms (vLLM's fused experts at the latent's width). Not yet: `expert_norm`, `shared_expert_sink`, or the experts' `up_softcap` |
 | `mamba2`, `gdn` | by vLLM's own layers, with one type and shape of recurrent layer per model; `gdn` in bfloat16 only, and with its short conv and output gate. Under tensor parallelism, vLLM 0.32's Mamba-2 failed with one group (its fused all-reduce), and in bfloat16 where a rank's share of the input projection is not a multiple of 8 wide |
@@ -162,7 +162,9 @@ and its state per sequence are bux's.
 A `gqa` layer with an indexer attends to the keys its indexer picks, as bux's does:
 DSA's top-k keys, QSA's mean-pooled blocks (`block_size` with `pool=mean`), MSA's
 max-pooled blocks and picks per group (`pool=max`, `per_group=true`), with plain or
-ReLU'd dot products, weighted or summed heads, and the indexer's own norm.
+ReLU'd dot products, weighted or summed heads, and the indexer's own norm. The
+layer's other settings apply as in a dense layer: a window, sinks, a softcap, the
+conv on keys and values, the `v` port.
 
 - **Caches.** Each call keeps its keys and values in vLLM's paged KV cache, as a
   dense layer does, and its indexer's keys beside them: one vector of the

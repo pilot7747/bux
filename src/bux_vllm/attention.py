@@ -10,6 +10,7 @@ from torch import nn
 from vllm.distributed import (
     get_tensor_model_parallel_rank,
     get_tensor_model_parallel_world_size,
+    tensor_model_parallel_all_reduce,
 )
 from vllm.model_executor.layers.attention import Attention as PagedAttention
 from vllm.model_executor.layers.linear import (
@@ -61,12 +62,12 @@ class Attention(Layer):
     def __init__(self, c: dict, width: int, site: Site):
         super().__init__()
         unsupported(c, "relative_bias")
-        if c["qk_norm"] and c["qk_norm_all_heads"]:
-            # Its statistics would sum over every rank's heads under tensor parallelism.
-            raise NotImplementedError("gqa: qk_norm_all_heads not in vLLM yet")
         kv.check_ports(site.ports)
         tp = get_tensor_model_parallel_world_size()
         h, g = c["num_heads"], c["num_kv_heads"]
+        self.all_heads = bool(c["qk_norm"] and c["qk_norm_all_heads"])
+        if self.all_heads and g % tp:
+            raise NotImplementedError("gqa: qk_norm_all_heads with kv heads copied")
         dk = c["head_dim"] or width // h
         dv = c["v_head_dim"] or dk
         self.path, self.dk, self.dv, self.fused = site.path, dk, dv, c["fused_qkv"]
@@ -87,8 +88,11 @@ class Attention(Layer):
             h * dv, width, bias=out_bias, return_bias=False, prefix=f"{site.path}.o"
         )
         qk, out = c["qk_norm"], c["output_norm"]
-        self.q_norm = Norm(qk, dk) if qk else None
-        self.k_norm = Norm(qk, dk) if qk else None
+        if self.all_heads:
+            self.q_norm, self.k_norm = AllHeads(qk, h, dk, tp), AllHeads(qk, g, dk, tp)
+        else:
+            self.q_norm = Norm(qk, dk) if qk else None
+            self.k_norm = Norm(qk, dk) if qk else None
         self.out_norm = Norm(out, dv) if out else None
         self.rope = Rope(c["rope"], dk) if c["rope"] else None
         self.c = c
@@ -240,7 +244,10 @@ class Attention(Layer):
         v = self._v_port(v, ctx)
         q, k = q.view(t, self.h, self.dk), k.view(t, self.g, self.dk)
         if self.q_norm is not None and self.k_norm is not None:
+            if self.all_heads:  # of the projections, before they split into heads
+                q, k = q.flatten(1), k.flatten(1)
             q, k = self.q_norm(q), self.k_norm(k)
+            q, k = q.view(t, self.h, self.dk), k.view(t, self.g, self.dk)
         if self.rope is not None:
             q, k = self.rope(q, ctx.positions), self.rope(k, ctx.positions)
         if (scale := kv.query_scale(self.c, ctx.positions)) is not None:
@@ -310,6 +317,40 @@ class Attention(Layer):
         if self.gate_bias is not None:
             gate = gate + self.gate_bias.to(gate.dtype)[:, None]
         return out * self.gate_activation(gate)
+
+
+class AllHeads(Norm):
+    """bux's QK-norm of all heads together (``qk_norm_all_heads``): statistics over
+    every rank's heads, summed across ranks under tensor parallelism, and this
+    rank's share of the gain and bias, a channel each.
+
+    Args:
+        c: The norm's config, as JSON.
+        heads: The heads it normalizes together, on all ranks.
+        dims: Each head's dims.
+        tp: The ranks they split over.
+    """
+
+    def __init__(self, c: dict, heads: int, dims: int, tp: int):
+        super().__init__(c, heads // tp * dims)
+        self.total = heads * dims
+        for p in (self.weight, self.bias):
+            if p is not None:
+                p.weight_loader = sharded_loader(0)  # ty: ignore[unresolved-attribute]
+
+    def normalize(self, x: torch.Tensor) -> torch.Tensor:
+        """x, (T, this rank's channels), over the RMS of all ranks' channels, centered
+        first for a layernorm, in float32."""
+        y = x.float()
+        if self.kind == "layernorm":
+            y = y - _ranks_sum(y) / self.total
+        y = y * torch.rsqrt(_ranks_sum(y.square()) / self.total + self.eps)
+        return y.to(x.dtype)
+
+
+def _ranks_sum(x: torch.Tensor) -> torch.Tensor:
+    """The sum of x's last axis, (T, 1), over every rank's share of it."""
+    return tensor_model_parallel_all_reduce(x.sum(-1, keepdim=True))
 
 
 def _sinks(heads: int) -> nn.Parameter:
