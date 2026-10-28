@@ -117,12 +117,7 @@ weight's scale per output channel (llm-compressor's FP8_DYNAMIC), and
 FP8). Emulated on the `gpt3`, `llama` and `frontier` models of
 [Checking FP8](#checking-fp8), they come within 0.002 of cosine of `fp8`: the
 rounding of the inputs, which all three scale as they run, is most of what FP8
-costs. On a B300 (SM 10.3), `fp8_per_channel` runs, its routed experts on Triton's
-kernels. `fp8_per_block` does not with its default GEMM, DeepGEMM's, whose JIT
-fails there (CUDA error 719). To serve it by another GEMM, name the GEMM in the
-engine's `kernel_config`, as in
-`kernel_config={"linear_backend_per_quant": {"fp8_block_w8a8": "cutlass"}}` (or
-`"triton"`). Those are not measured yet.
+costs. On a B300, serve with `fp8` ([Schemes on a B300](#schemes-on-a-b300)).
 
 - **Quantized:** every projection the plugin runs on vLLM's linear layers, and the
   routed and shared experts. That is attention's q, k, v, gate and output
@@ -145,6 +140,45 @@ engine's `kernel_config`, as in
   experts' scales vLLM reduces over its expert-parallel group, which it builds for
   a model whose config names experts: the plugin's names them as Mixtral's does
   (`num_experts`, `num_experts_per_tok`).
+
+### Schemes on a B300
+
+Serve FP8 weights on a B300 with `--quantization fp8`, one scale per tensor. It is
+the fastest of vLLM's online schemes there, and as accurate as the others on the
+models of [Checking FP8](#checking-fp8). `fp8_per_channel` runs as it is, and is
+slower on MoE models. `fp8_per_block` runs only on a fallback GEMM. vLLM 0.32 picks
+DeepGEMM's for it, and the DeepGEMM in vLLM's wheel fails to load its kernel on
+SM 10.3 (CUDA error 719). Name CUTLASS's instead:
+
+```python
+llm = LLM(
+    model="exported/",
+    dtype="bfloat16",
+    quantization="fp8_per_block",
+    kernel_config={"linear_backend_per_quant": {"fp8_block_w8a8": "cutlass"}},
+    moe_backend="triton",
+)
+```
+
+Blocks of 128 take MLPs, and experts, whose hidden units are a multiple of 128.
+
+The table gives the sessions per hour per GPU of an agentic load, the most that
+keep the median time per output token within 30 ms. Each session shares a prompt
+of 2k tokens with the others, adds 14k of its own, and runs 4 turns, each 512
+tokens out and 2k of tool output back. Measured on one B300 (TP=1) with vLLM
+0.32.0 and an FP8 KV cache, on 2026-10-28. In parentheses are the sessions at
+once:
+
+| Model | `fp8` | `fp8_per_channel` | `fp8_per_block`, CUTLASS | `fp8_per_block`, Triton |
+|-------|-------|-------------------|--------------------------|-------------------------|
+| dense, 6.7B class (`d_model` 4096) | 1924 | 1925 | 1757 (28) | 1212 (20) |
+| hybrid of 256 experts (`d_model` 2816) | 3683 | 3301 | 3069 (64) | 2516 (64), over 30 ms |
+| the same with `hc` (`d_model` 3584) | 1737 | 1515 | 1389 (32) | 1110 (32), over 30 ms |
+
+Per channel serves as many sessions as per tensor on the dense model, and 10 to
+13 % fewer on the hybrids. Per block on CUTLASS serves 9 to 20 % fewer. On Triton's
+block GEMM the hybrids did not keep within 30 ms; their figures are at the load
+given.
 
 ## FP8 KV cache
 
