@@ -131,8 +131,10 @@ class Region:
 
     @property
     def raw(self) -> torch.Tensor:
-        """Each block's bytes of the slots, (blocks, bytes); a view, or an error."""
-        part = self.cache[:, self.first :].view(torch.uint8)
+        """Each block's bytes of its slots, (blocks, bytes); a view, or an error."""
+        c = self.cache.shape[3] * self.cache.dtype.itemsize
+        part = self.cache[:, self.first : self.first + slots(self.dims, c, 1)]
+        part = part.view(torch.uint8)
         return part.view(part.shape[0], -1)
 
     def write(self, slots: torch.Tensor, keys: torch.Tensor) -> None:
