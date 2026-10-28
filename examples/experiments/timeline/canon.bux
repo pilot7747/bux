@@ -1,0 +1,46 @@
+# Canon layers on the factorial's candidate (factorial.bux's r1v1k1f0p0s0: the late-2026
+# hybrid with hyper-connections, the value residual and the key-value conv), and on its
+# AttnRes co-candidate (audit.bux's attnres_vk). A Canon layer is a causal depthwise
+# conv of 4 taps with its own skip, y + conv(y), on a branch's normed input: before the
+# mixer (Canon-A) or before the MLP (Canon-C). KDA convolves its own queries, keys and
+# values, and the candidate its global layers' keys and values (Canon-B), so A and C
+# are what it lacks: every token's neighbours mixed in before the router and before
+# KDA's projections. Under hc and AttnRes, a bracket inside a branch is a plain skip.
+# Arms: era, source, what it was claimed for.
+use m2026_hybrid
+use timeline_code
+use rungs
+
+g_k = fr_global(kv_conv_size=4)
+
+# The candidate's layer with a Canon layer before the MLP, or before both.
+canon_c(mixer, ffn=fr_experts)  = [fr_norm mixer] [fr_norm [conv] ffn]
+canon_ac(mixer, ffn=fr_experts) = [fr_norm [conv] mixer] [fr_norm [conv] ffn]
+
+# factorial.bux's vres(g_k, fr_experts) with those layers. The MTP module keeps the
+# hybrid's layer.
+ac = embed
+     canon_ac(hy_delta, fr_dense) canon_ac(hy_delta)^2 canon_ac(g_k(v=@v1))
+     (canon_ac(hy_delta)^3 canon_ac(g_k(v=$v1)))^(layers // 4 - 1)
+     fr_norm @h fr_out hy_mtp
+c  = embed
+     canon_c(hy_delta, fr_dense) canon_c(hy_delta)^2 canon_c(g_k(v=@v1))
+     (canon_c(hy_delta)^3 canon_c(g_k(v=$v1)))^(layers // 4 - 1)
+     fr_norm @h fr_out hy_mtp
+
+model = # 2025 Allen-Zhu (Physics of Language Models 4.1, arXiv 2512.17351), 2026
+        # MSAR (arXiv 2610.13630), modded-nanogpt's smear: Canon-A and -C on every
+        # layer; reasoning depth, NoPE lifted to RoPE's level; about 6% of the step
+        canon_ac:    ac
+      # Canon-C alone, before the MLP and the router: the place the candidate has
+      # no conv yet
+      | canon_c:     c
+      # AttnRes with Canon-A and -C: MSAR's token convs, on the stream's sources
+      # instead (MSAR beat AttnRes + mHC, and lost most of its edge without them)
+      | ar_canon_ac: ac
+
+residual = canon_ac: hc(expansion=4) | canon_c: hc(expansion=4)
+         | ar_canon_ac: attnres(block_size=layers // 4)
+
+# The hybrid's best at d512 (milestones.bux's scan), for every arm.
+optimizer.lr = 2e-3

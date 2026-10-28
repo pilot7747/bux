@@ -1,0 +1,85 @@
+# One more change on the factorial's candidate (factorial.bux's r1v1k1f0p0s0: the
+# late-2026 hybrid with hyper-connections, the value residual and the key-value conv on
+# its global layers), each a setting of bux the study had not used. The residual is
+# hc in every arm, every branch's, the MTP module's too; the MTP module keeps the
+# hybrid's layer. Arms: era, source, what it was claimed for.
+use m2026_hybrid
+use timeline_code
+use rungs
+
+g_k = fr_global(kv_conv_size=4)
+
+# factorial.bux's vres(g, e), with x as the embedding: the first global layer's values
+# mixed into every later one's.
+best(x, g, e) = x
+                fr_layer(hy_delta, fr_dense) fr_layer(hy_delta, e)^2 fr_layer(g(v=@v1), e)
+                (fr_layer(hy_delta, e)^3 fr_layer(g(v=$v1), e))^(layers // 4 - 1)
+                fr_norm @h fr_out hy_mtp
+
+# GatedNorm: every branch's norm times a gate of rank 16 on its own output,
+# sigmoid(W2 swish(W1 y)).
+gated_norm = fr_norm (_ * (linear(features=16) swish linear(features=d_model) sigmoid))
+gn_layer(mixer, ffn=fr_experts) = [gated_norm mixer] [gated_norm ffn]
+gn_best = embed
+          gn_layer(hy_delta, fr_dense) gn_layer(hy_delta)^2 gn_layer(g_k(v=@v1))
+          (gn_layer(hy_delta)^3 gn_layer(g_k(v=$v1)))^(layers // 4 - 1)
+          fr_norm @h fr_out hy_mtp
+
+# Engram as embeddings.bux's, before the second layer.
+memory = engram(head_dim=d_model // 16, table_size=3 * d_model * d_model // 4)
+engram_best = embed fr_layer(hy_delta, fr_dense) memory
+              fr_layer(hy_delta)^2 fr_layer(g_k(v=@v1))
+              (fr_layer(hy_delta)^3 fr_layer(g_k(v=$v1)))^(layers // 4 - 1)
+              fr_norm @h fr_out hy_mtp
+
+# The first global layer's keys and values, its conv's too, used by every later global
+# layer in place of its own; their values are the first's, so the value residual has
+# nothing to mix.
+kvshare_best = embed
+               fr_layer(hy_delta, fr_dense) fr_layer(hy_delta)^2 fr_layer(g_k(kv=@kv1))
+               (fr_layer(hy_delta)^3 fr_layer(fr_global(kv=$kv1)))^(layers // 4 - 1)
+               fr_norm @h fr_out hy_mtp
+
+# Global heads of 128: half as many query heads, and a key and value head of 128 for
+# every 512 of the stream, as many key and value dims as heads of 64 at d512 and
+# d1024, fewer at d768 and d1280.
+g_h128 = fr_global(num_heads=d_model // 128, num_kv_heads=d_model // 512, head_dim=128,
+                   kv_conv_size=4)
+
+model = # 2026 Qwen (GatedNorm, arXiv 2601.22966), Qwen3.8-Next (arXiv 2608.30320):
+        # a low-rank gate after every norm; -0.004 loss on top of AttnRes, fewer
+        # spikes, outliers that quantize
+        gnorm:        gn_best
+      # 2026 LongCat (arXiv 2601.21204), modded-nanogpt's x0 = norm(embed): the
+      # embedding normed, at the branches' scale instead of 0.02; -0.02 loss at
+      # 280M-1.3B
+      | emb_norm:     best(embed(norm=fr_norm), g_k, fr_experts)
+      # 2024 Qwen2-MoE, 2025 Qwen3-Next: a sigmoid gate on the shared expert, per
+      # token; used, not ablated
+      | seg:          best(embed, g_k, fr_experts(shared_expert_gate=true))
+      # 2025 Forgetting Transformer's Pro block (arXiv 2503.02130), 2026 Muse Spark:
+      # every global head's output normed before its gate; perplexity 6.69 -> 6.62 at
+      # 360M, 16k
+      | onorm:        best(embed, fr_global(kv_conv_size=4, output_norm=fr_norm),
+                           fr_experts)
+      # 2024 Learnable-ResFormer, modded-nanogpt: the value residual's two weights
+      # learned, from 0.5 each
+      | vres_learned: best(embed, fr_global(kv_conv_size=4, value_residual=learned),
+                           fr_experts)
+      # 2025 Su (kexue.fm/archives/10907), Gemma 3 and 4, Qwen3: global heads of 128
+      # at the same key-value cache; retrieval needs wide heads more than many
+      | ghead128:     best(embed, g_h128, fr_experts)
+      # 2026 DeepSeek Engram (arXiv 2601.07372), DeepSeek-V4.1, Qwen3.8-Flash-Next:
+      # Engram on the candidate, which no arm has stacked; -2.1% on the 2021
+      # reference (embeddings.bux)
+      | engram:       engram_best
+      # 2024 CLA (Brandon et al., arXiv 2405.12981), YOCO, Hymba: one key-value cache
+      # for every global layer; KV cache halved at d512, a third at d768
+      | kvshare:      kvshare_best
+
+residual = gnorm: hc(expansion=4) | emb_norm: hc(expansion=4) | seg: hc(expansion=4)
+         | onorm: hc(expansion=4) | vres_learned: hc(expansion=4)
+         | ghead128: hc(expansion=4) | engram: hc(expansion=4) | kvshare: hc(expansion=4)
+
+# The hybrid's best at d512 (milestones.bux's scan), for every arm.
+optimizer.lr = 2e-3

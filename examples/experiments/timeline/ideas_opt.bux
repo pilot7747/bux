@@ -1,0 +1,27 @@
+# Training options on the factorial's candidate (factorial.bux's r1v1k1f0p0s0: the
+# late-2026 hybrid with hyper-connections, the value residual and the key-value conv),
+# its model unchanged: how its weights start, and the optimizer. The study's recipe is
+# AdamW from normal(0.02), so these are options beside it, not architecture. Arms:
+# era, source, what it was claimed for.
+use m2026_hybrid
+use timeline_code
+use rungs
+
+g_k   = fr_global(kv_conv_size=4)
+model = embed
+        fr_layer(hy_delta, fr_dense) fr_layer(hy_delta)^2 fr_layer(g_k(v=@v1))
+        (fr_layer(hy_delta)^3 fr_layer(g_k(v=$v1)))^(layers // 4 - 1)
+        fr_norm @h fr_out hy_mtp
+residual = hc(expansion=4)
+
+init = # 2019 Fixup, SkipInit, modded-nanogpt: every projection back to the stream (the
+       # mixers' outputs, the MLPs' and experts' down) starts at 0, so each branch
+       # starts as nothing
+       zero_out: normal(out=zeros)
+       # 2024 Jordan et al., 2025 Moonlight, Kimi K2 (MuonClip's optimizer),
+       # DeepSeek-V4: Muon for the matrices in the blocks, at Moonlight's update RMS
+       # of 0.2, so AdamW's learning rate suits it; AdamW for the rest
+     | muon: none
+
+optimizer = zero_out: adamw(lr=2e-3, weight_decay=0.1)
+          | muon: muon(lr=2e-3, weight_decay=0.1, adam=adamw(lr=2e-3, weight_decay=0.1))
