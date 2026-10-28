@@ -40,7 +40,7 @@ class Width:
     """A family at one width: its best point within the SLO per lane (seed)."""
 
     d_model: int
-    tp: int
+    tp: int  # GPUs of the engines: tensor parallel times data parallel
     params: float
     active: float
     best: list[dict] = field(default_factory=list)
@@ -68,7 +68,8 @@ def widths(rows: list[dict], slo: float) -> dict[str, dict[int, Width]]:
     out: dict[str, dict[int, Width]] = defaultdict(dict)
     for (family, d, _), points in lanes.items():
         first = points[0]
-        w = out[family].setdefault(d, Width(d, first["tp"], *_params(first)))
+        gpus = first.get("gpus", first["tp"])
+        w = out[family].setdefault(d, Width(d, gpus, *_params(first)))
         w.model = (first.get("predicted_best") or {}).get("sessions_per_hour")
         ok = [p["measured"] for p in points if p["measured"]["tpot_p50_ms"] <= slo]
         w.best.append(max(ok, key=lambda m: m["sessions_per_hour"], default={}))
@@ -180,14 +181,14 @@ def markdown(fams: dict, out: dict, analytic: dict, slo: float) -> str:
         f"Budget: old_2022 at d_model 4096 (GPT-3 6.7B's serving shape), its best "
         f"{budget:.0f} sessions/h per B300 at p50 TPOT <= {slo:g} ms: the mean of "
         f"{len(lanes)} lanes ({seeds}; spread {spread:.1%}). Each width: its best "
-        "sessions/h per GPU within the SLO (at sessions at once per GPU, its TP; the "
+        "sessions/h per GPU within the SLO (at sessions at once per GPU, its GPUs; the "
         "model's best there). "
         "Match: where the family's cost crosses the budget, in log-log against active "
         "parameters. Analytic: serving.py's match to its own budget (985/h), the "
         "targets the fits took before.\n"
     )
     head = (
-        "| family | widths: best s/h per GPU (c, TP) | match: d, active / total, TP "
+        "| family | widths: best s/h per GPU (c per GPU, GPUs) | match: d, active / total, GPUs "
         "| analytic: d, active | active, measured / analytic |"
     )
     lines = [
@@ -225,7 +226,7 @@ def _row(family: str, ws: dict[int, Width], e: dict, a: dict) -> str:
     for d, w in sorted(ws.items()):
         best = [b for b in w.best if b]
         c = "/".join(str(b["concurrency"] // w.tp) for b in best) or "-"
-        tp = f", tp {w.tp}" if w.tp > 1 else ""
+        tp = f", {w.tp} GPUs" if w.tp > 1 else ""
         model = f", model {w.model:.0f}" if w.model else ""
         cells.append(f"{d}: {w.cost():.0f} ({c}{tp}{model})")
     via = f" via {e['via']}" if "via" in e else ""
