@@ -1278,11 +1278,11 @@ class PagedCsa:
     `lengths`: blocks of `CSA_BLOCK` tokens, shuffled, block 0 (vLLM's null block)
     left out."""
 
-    def __init__(self, c: dict, lengths: list[int]):
+    def __init__(self, c: dict, lengths: list[int], ports: list | None = None):
         self.paged: dict[str, compressed.Paged] = {}
         per_seq = -(-CSA_MAX_LEN // CSA_BLOCK)
         gen = torch.Generator().manual_seed(0)
-        for name, (width, per, _) in compressed.cache_rows(c).items():
+        for name, (width, per, _) in compressed.cache_rows(c, ports).items():
             ids = torch.randperm(len(lengths) * per_seq, generator=gen) + 1
             cache = torch.zeros(len(ids) + 1, CSA_BLOCK // per, width)
             table = ids.view(len(lengths), per_seq)
@@ -1334,15 +1334,18 @@ def csa_steps(step: list[tuple[int, int, int]]) -> compressed.Steps:
     return compressed.Steps(positions, seq, decodes, prompts, longest)
 
 
-def csa_layer(m: Any, parts: Any, s: Any, caches: Any, steps: Any, x: Any) -> Any:
+def csa_layer(
+    m: Any, parts: Any, s: Any, caches: Any, steps: Any, x: Any, picks: Any = None
+) -> Any:
     """A step of the plugin's csa layer (bux_vllm.csa) on x (T, width), with the
-    export's module `m` for the projections it makes by vLLM's layers."""
+    export's module `m` for the projections it makes by vLLM's layers; its output,
+    and the picks and candidate pool it makes (`compressed.mix`)."""
     t, pos = x.shape[0], steps.positions
     query = x if m.q_a is None else parts.q_a_norm(m.q_a(x))
     q = parts.queries(m.q(query).view(t, m.h, m.d), pos)
     latent = parts.latents(m.kv(x), pos)
     rows = index = None
-    if m.ratio is not None:
+    if m.compress_kv is not None:
         kv = m.compress_kv(x)
         if m.compress_gate is not None:
             both = torch.cat([kv, m.compress_gate(x)], -1)
@@ -1353,15 +1356,19 @@ def csa_layer(m: Any, parts: Any, s: Any, caches: Any, steps: Any, x: Any) -> An
         index = parts.indexer.queries(
             m.indexer.q(query), None if w is None else w(x), pos
         )
-    out = compressed.mix(caches, steps, s, q, latent, rows, index, m.sinks)
-    return m.output(x[None], parts.unrotate(out, pos)[None])[0]
+    out, kept, pool = compressed.mix(
+        caches, steps, s, q, latent, rows, index, m.sinks, picks
+    )
+    return m.output(x[None], parts.unrotate(out, pos)[None])[0], kept, pool
 
 
-def csa_weights(c: dict, parts: Any) -> set[str]:
+def csa_weights(c: dict, parts: Any, ports: list | None = None) -> set[str]:
     """The checkpoint's names of a csa's weights that the plugin's layer loads
     (bux_vllm.csa's targets): its GEMM's parts, its `parts`, and its own."""
-    down, _ = compressed.down(c)
+    down, _ = compressed.down(c, ports)
     ix, rank = c["indexer"], c["o_lora_rank"]
+    if compressed.reads(ports, "index"):
+        ix = None
     own = {
         "q.weight": True,
         "indexer.q.weight": ix,
@@ -1409,12 +1416,90 @@ def test_csa_computes_on_paged_caches_what_the_export_does(
             steps = csa_steps(step)
             pad = steps.positions.shape[0] - sum(n for *_, n in step)
             rows = torch.cat([x[s : s + n] for _, s, n in step] + [x[:pad]])
-            out = csa_layer(m, parts, settings, paged.caches(steps, pad), steps, rows)
+            out, _, _ = csa_layer(
+                m, parts, settings, paged.caches(steps, pad), steps, rows
+            )
             real = out[: out.shape[0] - pad].split([n for *_, n in step])
             for (q, start, n), y in zip(step, real):
                 got[q][start : start + n] = y
     torch.testing.assert_close(got[0], want, atol=2e-5, rtol=2e-5)
     torch.testing.assert_close(got[1], want[:25], atol=2e-5, rtol=2e-5)
+
+
+#: DeepSeek-V4.1's ports, small: a layer that compresses pairs, indexes them and
+#: makes a candidate pool; one that reads its latents and picks; and one that reads
+#: its latents and re-indexes them inside the pool.
+CSA_PORTS = (
+    "d_model = 64\nvocab_size = 64\n"
+    "pairs = csa(num_heads=4, head_dim=16, sliding_window_size=6, compress_ratio=2,"
+    " sinks=true, rope=rope(fraction=0.5), indexer=indexer(num_heads=2, head_dim=8,"
+    " top_k=4, candidate_block_size=2, candidate_top_k=3))\n"
+    "model = embed [rmsnorm pairs(kv=@kv, index=@topk, candidates=@pool)]"
+    " [rmsnorm pairs(kv=$kv, index=$topk)]"
+    " [rmsnorm pairs(kv=$kv!, index=@topk, candidates=$pool!)] head"
+)
+
+
+def test_csa_ports_compute_on_paged_caches_what_the_export_does(
+    tmp_path: Path,
+) -> None:
+    """A csa writer and two readers of its kv port, step by step over paged caches:
+    the second takes the first's picks (index), the third picks inside the first's
+    candidate pool (candidates); each gives what the export's layer gives."""
+    arch = compile(CSA_PORTS)
+    save(arch, check.perturbed(Model(arch, rngs=nnx.Rngs(0)), 1), tmp_path)
+    hf = check._load(tmp_path, "eager")
+    mods = [x for x in hf.modules() if type(x).__name__ == "CompressedSparseAttention"]
+    seen: dict[int, list[torch.Tensor]] = {}
+    for i, m in enumerate(mods):
+        m.register_forward_hook(
+            lambda mod, args, out, i=i: seen.update({i: [args[0][0], out[0]]})
+        )
+    with torch.no_grad():
+        hf.model(
+            torch.randint(0, 64, (1, 40), generator=torch.Generator().manual_seed(1))
+        )
+    layers = [n for n in arch.layers() if n.config.type == "csa"]
+    c = layers[0].config.model_dump(mode="json")
+    calls = []
+    for node, m in zip(layers, mods, strict=True):
+        ports = [[p.name, p.tap, p.mode] for p in node.ports]
+        parts = compressed.Parts(c, ports)
+        state = {k: v for k, v in m.state_dict().items() if k in parts.state_dict()}
+        parts.load_state_dict(state)
+        assert set(m.state_dict()) == csa_weights(c, parts, ports)
+        own = PagedCsa(c, [40, 25], ports)
+        calls.append((m, parts, own))
+    settings = compressed.Settings.of(c, mods[0].scale)
+    got = [
+        (torch.zeros_like(seen[i][1]), torch.zeros_like(seen[i][1][:25]))
+        for i in range(3)
+    ]
+    with torch.no_grad():
+        for step in CSA_STEPS:
+            steps = csa_steps(step)
+            pad = steps.positions.shape[0] - sum(n for *_, n in step)
+            writer = calls[0][2].caches(steps, pad)
+            kept = pool = None
+            for i, (m, parts, own) in enumerate(calls):
+                x = seen[i][0]
+                rows = torch.cat([x[s : s + n] for _, s, n in step] + [x[:pad]])
+                caches = own.caches(steps, pad)
+                caches.compressed, caches.index = writer.compressed, writer.index
+                picks = compressed.Picks(
+                    kept if i == 1 else None, pool if i == 2 else None, i == 0
+                )
+                out, made, pooled = csa_layer(
+                    m, parts, settings, caches, steps, rows, picks
+                )
+                if i == 0:
+                    kept, pool = made, pooled
+                real = out[: out.shape[0] - pad].split([n for *_, n in step])
+                for (q, start, n), y in zip(step, real):
+                    got[i][q][start : start + n] = y
+    for i in range(3):
+        torch.testing.assert_close(got[i][0], seen[i][1], atol=2e-5, rtol=2e-5)
+        torch.testing.assert_close(got[i][1], seen[i][1][:25], atol=2e-5, rtol=2e-5)
 
 
 def test_the_config_gives_vllm_the_heads_of_csa() -> None:

@@ -408,6 +408,18 @@ CASES = {
     + "model = embed [rmsnorm attn(v=@v1)] [rmsnorm ffn] [rmsnorm local]"
     " [rmsnorm ffn] [rmsnorm attn(v=$v1!)] rmsnorm head",
     "csa": HEAD + SPARSE + FFN + BLOCK + "model = embed block^2 rmsnorm head",
+    # DeepSeek-V4.1's ports: a layer that compresses pairs, indexes them and makes a
+    # candidate pool; one that reads its latents and picks; one that re-indexes
+    # them inside the pool.
+    "csa-ports": HEAD
+    + "pairs = csa(num_heads=2, head_dim=64, compress_ratio=2, sliding_window_size=16,"
+    " sinks=true, rope=rope(fraction=0.5), indexer=indexer(num_heads=4, head_dim=64,"
+    " top_k=8, candidate_block_size=2, candidate_top_k=4))\n"
+    + FFN
+    + "model = embed [rmsnorm pairs(kv=@kv, index=@topk, candidates=@pool)]"
+    " [rmsnorm ffn] [rmsnorm pairs(kv=$kv, index=$topk)] [rmsnorm ffn]"
+    " [rmsnorm pairs(kv=$kv!, index=@topk, candidates=$pool!)] [rmsnorm ffn]"
+    " rmsnorm head",
     "csa-latent": HEAD
     + SPARSE_LATENT
     + FFN

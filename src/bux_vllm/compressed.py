@@ -20,6 +20,7 @@ export (``bux.export.hf.csa``) on paged caches of their own.
 from __future__ import annotations
 
 import math
+from collections.abc import Callable
 from dataclasses import dataclass
 
 import torch
@@ -34,12 +35,32 @@ CHUNK = 1 << 25
 MIN = torch.finfo(torch.float32).min
 
 
-def cache_rows(c: dict) -> dict[str, tuple[int, int, int | None]]:
+def reads(ports: list | None, name: str) -> bool:
+    """Whether a layer of `ports`, ``[name, tap, mode]`` each, reads its port
+    `name`."""
+    return any(n == name and m != "write" for n, _, m in ports or [])
+
+
+def writes(ports: list | None, name: str) -> bool:
+    """Whether a layer of `ports` writes its port `name`."""
+    return any(n == name and m == "write" for n, _, m in ports or [])
+
+
+def compresses(c: dict, ports: list | None = None) -> bool:
+    """Whether a ``csa`` layer makes compressed latents of its own: it has a
+    ``compress_ratio``, and reads no others' through its ``kv`` port."""
+    return c["compress_ratio"] is not None and not reads(ports, "kv")
+
+
+def cache_rows(
+    c: dict, ports: list | None = None
+) -> dict[str, tuple[int, int, int | None]]:
     """The caches a ``csa`` call keeps, by name: the values of a row, the tokens a
-    row is for, and the last tokens it keeps (None for all of them)."""
+    row is for, and the last tokens it keeps (None for all of them). One that reads
+    its ``kv`` port keeps its window of token latents alone."""
     d, r, w = c["head_dim"], c["compress_ratio"], c["sliding_window_size"]
     out: dict[str, tuple[int, int, int | None]] = {"window": (d, 1, w)}
-    if r is None:
+    if r is None or not compresses(c, ports):
         return out
     out["compressed"] = (d, r, None)
     if c["indexer"]:
@@ -168,6 +189,8 @@ class Settings:
         relu: Whether the indexer ReLUs its dot products.
         scale: What a logit is multiplied by.
         softcap: The logits' soft cap; None for none.
+        pool: The indexer's candidate pools, its blocks' latents and how many
+            blocks, which its ``candidates`` port passes on; None without one.
     """
 
     window: int | None
@@ -176,12 +199,14 @@ class Settings:
     relu: bool
     scale: float
     softcap: float | None
+    pool: tuple[int, int] | None = None
 
     @classmethod
     def of(cls, c: dict, scale: float) -> Settings:
         """The settings of the ``csa`` config `c`, its logits multiplied by
         `scale`."""
         ix = c["indexer"]
+        pool = (ix["candidate_block_size"], ix["candidate_top_k"]) if ix else None
         return cls(
             c["sliding_window_size"],
             c["compress_ratio"],
@@ -189,7 +214,26 @@ class Settings:
             bool(ix and ix["relu"]),
             scale,
             c["softcap"],
+            pool,
         )
+
+
+@dataclass
+class Picks:
+    """What a ``csa`` call's ports give it of its picks, or ask of them.
+
+    Attributes:
+        kept: The compressed latents each token keeps, (T, top_k) by index (-1 for
+            none), which its ``index`` port reads; None to pick its own.
+        inside: The candidate pool its picks must lie in, (T, k) by block index,
+            which its ``candidates`` port reads; None for none.
+        pooled: Whether to make a candidate pool, which its ``candidates`` port
+            writes.
+    """
+
+    kept: torch.Tensor | None = None
+    inside: torch.Tensor | None = None
+    pooled: bool = False
 
 
 def rotated(d: int, rope: dict | None) -> int:
@@ -244,16 +288,59 @@ def ordered(x: torch.Tensor) -> torch.Tensor:
     return torch.where(u >> 31 == 1, ~u & 0xFFFFFFFF, u | (1 << 31))
 
 
-def top(scores: torch.Tensor, seen: torch.Tensor, k: int) -> torch.Tensor:
-    """The indices of each row's k highest scores among its first `seen`, (rows,):
-    the first of equal ones, as bux keeps them, and -1 past them, (rows, k)."""
+def top(
+    scores: torch.Tensor,
+    seen: torch.Tensor,
+    k: int,
+    inside: torch.Tensor | None = None,
+) -> torch.Tensor:
+    """The indices of each row's k highest scores among its first `seen`, (rows,),
+    and of those `inside` (rows, s) where given: the first of equal ones, as bux
+    keeps them, and -1 past them, (rows, k)."""
+    s = scores.shape[-1]
+    index = torch.arange(s, device=scores.device)
+    valid = index < seen[:, None]
+    return top_of(scores, valid if inside is None else valid & inside, k)
+
+
+def top_of(scores: torch.Tensor, valid: torch.Tensor, k: int) -> torch.Tensor:
+    """The indices of each row's k highest `valid` scores, the first of equal ones,
+    and -1 past them, (rows, k)."""
     s = scores.shape[-1]
     index = torch.arange(s, device=scores.device)
     key = ordered(scores) * (1 << 31) + (s - 1 - index)  # equal: the first wins
-    key = key.masked_fill(index >= seen[:, None], -1)
-    best, at = key.topk(min(k, s), -1)
+    best, at = key.masked_fill(~valid, -1).topk(min(k, s), -1)
     kept = at.masked_fill(best < 0, -1)
     return torch.nn.functional.pad(kept, (0, k - kept.shape[-1]), value=-1)
+
+
+def candidates(
+    scores: torch.Tensor, seen: torch.Tensor, size: int, k: int
+) -> torch.Tensor:
+    """The candidate pool of rows of `scores` (rows, s) of the compressed latents,
+    each row's first `seen` of them its own: the k best blocks of `size` latents,
+    each scored by its best latent, and always the block of the newest a row sees;
+    by block index, -1 past them, (rows, k), as bux's ``_candidates``."""
+    rows, s = scores.shape
+    count = -(-s // size)
+    index = torch.arange(s, device=scores.device)
+    ranked = scores.float().masked_fill(index >= seen[:, None], -torch.inf)
+    ranked = torch.nn.functional.pad(ranked, (0, count * size - s), value=-torch.inf)
+    best = ranked.view(rows, count, size).amax(-1)
+    newest = ((seen - 1) // size).clamp(min=0)[:, None]
+    best = best.scatter(
+        -1, newest, torch.where(seen[:, None] > 0, torch.inf, -torch.inf)
+    )
+    return top_of(best, best > -torch.inf, k)
+
+
+def within(pool: torch.Tensor, s: int, size: int) -> torch.Tensor:
+    """Which of s compressed latents (rows, s) are in the candidate pool's blocks of
+    `size`, `pool` (rows, k) by block index, -1 for none."""
+    count = -(-s // size)
+    blocks = torch.zeros(pool.shape[0], count + 1, dtype=torch.bool, device=pool.device)
+    blocks.scatter_(1, pool.clamp(min=-1) + 1, True)  # -1 to a column of its own
+    return blocks[:, 1:][:, torch.arange(s, device=pool.device) // size]
 
 
 def every(seen: torch.Tensor, k: int) -> torch.Tensor:
@@ -280,29 +367,57 @@ def select(
     s: Settings,
     q: torch.Tensor,
     w: torch.Tensor,
-) -> torch.Tensor:
+    picks: Picks | None = None,
+) -> tuple[torch.Tensor, torch.Tensor | None]:
     """The compressed latents each token keeps, by index, (T, K): the indexer's
-    top-k of those of groups it ends or follows, from queries q (T, h, i) weighed
-    by w (T, h); every one of them while there are no more than top_k."""
+    top-k of those of groups it ends or follows (and in its candidate pool, where
+    `picks` give one), from queries q (T, h, i) weighed by w (T, h); every one of
+    them while there are no more than top_k. And the candidate pool it makes,
+    (T, k) by block index, where `picks` ask for one; else None."""
     assert caches.index is not None and s.ratio is not None and s.top_k
+    picks, top_k = picks or Picks(), s.top_k
     seen = (steps.positions + 1) // s.ratio
     most = steps.longest // s.ratio
-    if most <= s.top_k:
-        return every(seen, most)
-    kept = seen.new_full((seen.shape[0], s.top_k), -1)
-    keys = caches.index
-    heads = max(q.shape[1], q.shape[2])
-    every_latent = torch.arange(most, device=seen.device)
+    if most <= s.top_k and picks.inside is None and not picks.pooled:
+        return every(seen, most), None
+    kept = seen.new_full((seen.shape[0], top_k), -1)
+    pool = None
+    if picks.pooled:
+        assert s.pool is not None
+        pool = seen.new_full((seen.shape[0], s.pool[1]), -1)
+
+    def pick(c: slice, keys: torch.Tensor) -> None:
+        """Pick for the tokens `c` among `keys`, (c or 1, latents, i)."""
+        sc = scores(q[c], w[c], keys, s.relu)
+        inside = None
+        if picks.inside is not None and s.pool is not None:
+            inside = within(picks.inside[c], sc.shape[-1], s.pool[0])
+        kept[c] = top(sc, seen[c], top_k, inside)
+        if pool is not None and s.pool is not None:
+            pool[c] = candidates(sc, seen[c], *s.pool)
+
+    _each(caches.index, steps, s.ratio, max(q.shape[1], q.shape[2]), most, pick)
+    return kept, pool
+
+
+def _each(
+    keys: Paged,
+    steps: Steps,
+    ratio: int,
+    heads: int,
+    most: int,
+    pick: Callable[[slice, torch.Tensor], None],
+) -> None:
+    """Call ``pick(tokens, keys)`` on chunks of the batch: its decoded tokens, each
+    with its sequence's keys, then each prompt's, sharing theirs."""
+    every_latent = torch.arange(most, device=steps.positions.device)
     for c in chunks(steps.decodes, most * heads):
-        k = keys.read(steps.seq[c, None], every_latent[None])
-        kept[c] = top(scores(q[c], w[c], k, s.relu), seen[c], s.top_k)
+        pick(c, keys.read(steps.seq[c, None], every_latent[None]))
     for start, n, seq, length in steps.prompts:
-        own = torch.arange(length // s.ratio, device=seen.device)
+        own = torch.arange(length // ratio, device=steps.positions.device)
         k = keys.read(torch.full_like(own, seq), own)[None]
         for c in chunks(n, own.shape[0] * heads):
-            c = slice(start + c.start, start + c.stop)
-            kept[c] = top(scores(q[c], w[c], k, s.relu), seen[c], s.top_k)
-    return kept
+            pick(slice(start + c.start, start + c.stop), k)
 
 
 # --- attention ---------------------------------------------------------------------
@@ -368,20 +483,27 @@ def mix(
     rows: torch.Tensor | None,
     index: tuple[torch.Tensor, torch.Tensor] | None,
     sinks: torch.Tensor | None,
-) -> torch.Tensor:
+    picks: Picks | None = None,
+) -> tuple[torch.Tensor, torch.Tensor | None, torch.Tensor | None]:
     """A step of a ``csa`` call: write its token latents (T, d) and compressed rows
-    (T, width, for the tokens that end a group), pick the compressed latents each
-    query keeps (by the indexer's queries and weights, `index`), and attend the
-    queries q (T, h, d) to them and their windows; (T, h, d)."""
+    (T, width, for the tokens that end a group; None for a call that reads another's
+    through its ``kv`` port, whose caches `caches` hold), pick the compressed latents
+    each query keeps (by the indexer's queries and weights, `index`, or as its ports'
+    `picks` say), and attend the queries q (T, h, d) to them and their windows.
+    Returns the outputs, (T, h, d), the picks and the candidate pool made, if any."""
     caches.window.write(caches.slots, latent)
-    kept = None
-    if s.ratio is not None and rows is not None:
-        store(caches, steps, rows, s.ratio)
+    picks, kept, pool = picks or Picks(), None, None
+    if s.ratio is not None:
+        if rows is not None:
+            store(caches, steps, rows, s.ratio)
         seen = (steps.positions + 1) // s.ratio
-        kept = every(seen, steps.longest // s.ratio)
-        if index is not None:
-            kept = select(caches, steps, s, *index)
-    return attend(caches, steps, s, q, kept, sinks)
+        if picks.kept is not None:
+            kept = picks.kept
+        elif index is not None:
+            kept, pool = select(caches, steps, s, *index, picks)
+        else:
+            kept = every(seen, steps.longest // s.ratio)
+    return attend(caches, steps, s, q, kept, sinks), kept, pool
 
 
 # --- the layer's own arithmetic ----------------------------------------------------
@@ -392,19 +514,22 @@ class IndexerParts(nn.Module):
     projection from the compressed latents, its norms and RoPE, as the export names
     them (``indexer.k``, ``indexer.q_norm``, ``indexer.k_norm``)."""
 
-    def __init__(self, ix: dict, d: int, rope: dict | None, norm: dict):
+    def __init__(
+        self, ix: dict, d: int, rope: dict | None, norm: dict, keys: bool = True
+    ):
         super().__init__()
         i = ix["head_dim"]
         self.heads, self.dim, self.weighted = ix["num_heads"], i, ix["weighted"]
-        self.k = nn.Linear(d, i, bias=False)
+        self.k = nn.Linear(d, i, bias=False) if keys else None
         self.q_norm = Norm(ix["norm"], i) if ix["norm"] else None
-        self.k_norm = Norm(ix["norm"] or norm, i)
+        self.k_norm = Norm(ix["norm"] or norm, i) if keys else None
         n = min(rotated(d, rope), i) // 2 * 2
         own = {**rope, "fraction": 1.0} if rope else None
         self.rope = Rope(own, n) if own and n else None
 
     def keys(self, latent: torch.Tensor, positions: torch.Tensor) -> torch.Tensor:
         """The keys of compressed latents (T, d), rotated to `positions`, (T, i)."""
+        assert self.k is not None and self.k_norm is not None
         k = self.k_norm(self.k(latent))[:, None]
         return (k if self.rope is None else self.rope(k, positions))[:, 0]
 
@@ -432,18 +557,18 @@ class Parts(nn.Module):
     (``q_a_norm``, ``q_norm``, ``kv_norm``, ``compress_norm``, ``out_norm``,
     ``indexer.*``)."""
 
-    def __init__(self, c: dict):
+    def __init__(self, c: dict, ports: list | None = None):
         super().__init__()
         d, latent, norm = c["head_dim"], c["q_lora_rank"], c["latent_norm"]
-        self.ratio = c["compress_ratio"]
+        self.ratio, own = c["compress_ratio"], compresses(c, ports)
         self.q_a_norm = Norm(norm, latent) if latent else None
         self.q_norm = Norm(c["qk_norm"], d) if c["qk_norm"] else None
         self.kv_norm = Norm(norm, d)
-        self.compress_norm = Norm(norm, d) if self.ratio else None
+        self.compress_norm = Norm(norm, d) if own else None
         self.out_norm = Norm(c["output_norm"], d) if c["output_norm"] else None
         self.rope = Rope(c["rope"], d) if c["rope"] else None
-        ix = c["indexer"]
-        self.indexer = IndexerParts(ix, d, c["rope"], norm) if ix else None
+        ix = None if reads(ports, "index") else c["indexer"]
+        self.indexer = IndexerParts(ix, d, c["rope"], norm, own) if ix else None
 
     def rotate(self, x: torch.Tensor, positions: torch.Tensor) -> torch.Tensor:
         """Rotate the first rope.fraction dims of x, (T, h, d)."""
@@ -478,18 +603,18 @@ class Parts(nn.Module):
         return torch.cat([back[..., :n] / self.rope.gain**2, back[..., n:]], -1)
 
 
-def down(c: dict) -> tuple[list[tuple[str, int]], list[tuple[str, int]]]:
+def down(
+    c: dict, ports: list | None = None
+) -> tuple[list[tuple[str, int]], list[tuple[str, int]]]:
     """The projections of a ``csa``'s input that every rank makes by one GEMM: the
-    query latent's, the token latent's, the compressed latent's and its gate's, and
-    the indexer's head weights, each by its weight's name and width; and the parts
-    of their output, the compressed latent's projection and gate together
-    (``compress``)."""
-    d, latent, r, ix = (
-        c["head_dim"],
-        c["q_lora_rank"],
-        c["compress_ratio"],
-        c["indexer"],
-    )
+    query latent's, the token latent's, the compressed latent's and its gate's
+    (none for a layer that reads its ``kv`` port), and the indexer's head weights
+    (none for one that reads its ``index`` port), each by its weight's name and
+    width; and the parts of their output, the compressed latent's projection and
+    gate together (``compress``)."""
+    d, latent, ix = c["head_dim"], c["q_lora_rank"], c["indexer"]
+    r = c["compress_ratio"] if compresses(c, ports) else None
+    ix = None if reads(ports, "index") else ix
     gate = d if r and r > 1 else 0
     weights = ix["num_heads"] if ix and ix["weighted"] else 0
     parts = [("q_a", latent), ("kv", d), ("compress_kv", d if r else 0)]
@@ -497,6 +622,26 @@ def down(c: dict) -> tuple[list[tuple[str, int]], list[tuple[str, int]]]:
     split = [("q_a", latent), ("kv", d), ("compress", d + gate if r else 0)]
     split += [("indexer.weights", weights)]
     return [(n, w) for n, w in parts if w], [(n, w) for n, w in split if w]
+
+
+def check_shared(reader: dict, writer: dict, ports: list) -> None:
+    """Raise for the compressed latents of the `writer`'s call that a ``csa`` layer,
+    `reader` with the ports `ports`, cannot read through its ``kv`` port.
+
+    Raises:
+        NotImplementedError: The writer is no ``csa`` that compresses latents of
+            the reader's width and ratio, or keeps no indexer keys of the width of
+            the indexer the reader runs.
+    """
+    if writer["type"] != "csa" or writer["compress_ratio"] is None:
+        raise NotImplementedError("csa: a kv port from other than a compressing csa")
+    dims = [(c["head_dim"], c["compress_ratio"]) for c in (reader, writer)]
+    if dims[0] != dims[1]:
+        raise NotImplementedError(f"csa: a kv port of {dims[1]} to {dims[0]}")
+    ix, theirs = reader["indexer"], writer["indexer"]
+    own = ix and not reads(ports, "index")
+    if own and (not theirs or theirs["head_dim"] != ix["head_dim"]):
+        raise NotImplementedError("csa: an indexer without its writer's keys")
 
 
 def block_size(tokens: int, ratio: int) -> int:
