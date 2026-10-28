@@ -215,8 +215,9 @@ kernels take heads of 512, the last 64 dims rotated. bux pools each group alone,
 projects its indexer keys from the compressed latents, and takes any head width.
 
 What reads or writes the caches runs outside the compiled graph, in two ops of the
-plugin's, as vLLM's attention does. Their metadata has no CUDA graph of its own, so
-vLLM captures the rest of the model piecewise (`cudagraph_mode=PIECEWISE`).
+plugin's, as vLLM's attention does. A step of decoded tokens alone is one CUDA graph:
+its shapes are those of `max_model_len`, not of its longest sequence. A step with
+a prompt runs the ops between the graph's pieces.
 
 ## How it was checked
 

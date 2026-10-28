@@ -491,6 +491,8 @@ CSA = {
 
 #: The tokens of a block of every csa cache: 12 hold whole groups of 1 to 4.
 CSA_BLOCK = 12
+#: The longest sequence the csa tests' caches take, as vLLM's max_model_len.
+CSA_MAX_LEN = 48
 
 #: Steps of two sequences, the second the first's first 25 tokens: each a list of
 #: (sequence, first token, tokens), decoded tokens first, as vLLM orders them.
@@ -509,7 +511,7 @@ class PagedCsa:
 
     def __init__(self, c: dict, lengths: list[int]):
         self.paged: dict[str, sparse.Paged] = {}
-        per_seq = -(-max(lengths) // CSA_BLOCK)
+        per_seq = -(-CSA_MAX_LEN // CSA_BLOCK)
         gen = torch.Generator().manual_seed(0)
         for name, (width, per, _) in sparse.cache_rows(c).items():
             ids = torch.randperm(len(lengths) * per_seq, generator=gen) + 1
@@ -545,7 +547,9 @@ def csa_steps(step: list[tuple[int, int, int]]) -> sparse.Steps:
     decodes = sum(n == 1 for *_, n in step)
     chunks = sparse.prompt_chunks(starts, lengths, decodes)  # by request: a sequence
     prompts = [(start, n, step[i][0], length) for start, n, i, length in chunks]
-    return sparse.Steps(positions, seq, decodes, prompts, max(lengths))
+    # Decoded tokens alone read up to the longest a model takes, as in a CUDA graph.
+    longest = max(lengths) if prompts else CSA_MAX_LEN
+    return sparse.Steps(positions, seq, decodes, prompts, longest)
 
 
 def csa_layer(m: Any, parts: Any, s: Any, caches: Any, steps: Any, x: Any) -> Any:

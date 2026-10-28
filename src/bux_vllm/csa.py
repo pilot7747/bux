@@ -18,8 +18,9 @@ the compressed latents and their indexer keys (each one vector a
 projections the next compressed latent pools (a window of ``compress_ratio``
 tokens), as vLLM keeps DeepSeek-V4's. Its projections run in the compiled graph; what reads or writes the
 caches runs in two ops of its own outside it (`POOL`, `ATTEND`), which split the
-graph, as vLLM's attention does. Their metadata has no CUDA graph of its own, so
-vLLM captures the rest of the model piecewise.
+graph, as vLLM's attention does. A batch of decoded tokens alone has shapes of
+``max_model_len``, not its longest sequence's, so that vLLM captures its steps in
+one CUDA graph; a batch with prompts runs the ops between the graph's pieces.
 """
 
 from dataclasses import dataclass
@@ -123,7 +124,8 @@ class Metadata:
         num_actual_tokens: The tokens of the batch, padding left out.
         decode_tokens: How many of the first tokens are decoded ones.
         prompts: Each prompt chunk's first token, tokens, sequence and length.
-        max_seq_len: The longest sequence's length, or more.
+        max_seq_len: The longest sequence's length, or more: ``max_model_len`` for
+            a batch of decoded tokens alone, whose shapes a CUDA graph fixes.
     """
 
     slot_mapping: torch.Tensor
@@ -160,9 +162,12 @@ def prompts(
 
 class Builder(AttentionMetadataBuilder[Metadata]):
     """The metadata of a call's caches: vLLM's slot mapping and block table, each
-    token's sequence, and the batch's decoded tokens first (it reorders them so)."""
+    token's sequence, and the batch's decoded tokens first (it reorders them so).
+    A batch of decoded tokens alone is one CUDA graph."""
 
-    _cudagraph_support: ClassVar[AttentionCGSupport] = AttentionCGSupport.NEVER
+    _cudagraph_support: ClassVar[AttentionCGSupport] = (
+        AttentionCGSupport.UNIFORM_SINGLE_TOKEN_DECODE
+    )
 
     def __init__(
         self,
@@ -175,6 +180,7 @@ class Builder(AttentionMetadataBuilder[Metadata]):
         self._init_reorder_batch_threshold(1)
         tokens = vllm_config.scheduler_config.max_num_batched_tokens
         self.requests = torch.zeros(tokens, dtype=torch.int32, device=device)
+        self.longest = vllm_config.model_config.max_model_len
 
     def build(
         self,
@@ -184,14 +190,15 @@ class Builder(AttentionMetadataBuilder[Metadata]):
     ) -> Metadata:
         cm = common_attn_metadata
         decodes, _, decode_tokens, _ = split_decodes_and_prefills(cm)
+        chunks = prompts(cm, decodes)
         return Metadata(
             cm.slot_mapping,
             cm.block_table_tensor,
             cm.token_to_req_indices(self.requests),
             cm.num_actual_tokens,
             decode_tokens,
-            prompts(cm, decodes),
-            cm.max_seq_len,
+            chunks,
+            cm.max_seq_len if chunks else self.longest,
         )
 
 
