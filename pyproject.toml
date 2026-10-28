@@ -133,4 +133,4 @@ include = ["src/bux/export/**", "src/bux_vllm/**", "tests/test_export*.py"]
 rules = { invalid-mutable-override = "ignore" }
 
 [tool.ty.analysis]
-allowed-unresolved-imports = ["vllm.**", "pyspark.**", "tokamax.**", "cudnn.**", "cutlass.**", "triton.**", "jax_triton.**", "flash_attn.**", "transformer_engine.**"]  # the `spark` and `cuda` extras, the image's TE, and vLLM (its plugin, bux_vllm)
+allowed-unresolved-imports = ["vllm.**", "pyspark.**", "tokamax.**", "cudnn.**", "cutlass.**", "triton.**", "jax_triton.**", "flash_attn.**", "transformer_engine.**", "fla.**"]  # the `spark` and `cuda` extras, the image's TE, and vLLM and fla (its plugin, bux_vllm)
