@@ -31,7 +31,7 @@ from .common import Ctx, Layer, Site
 from .plan import Call, Node, Plan, Pos, Scope, at, children, is_call, live, plan
 
 #: The modules of this package that hold layers.
-LAYER_MODULES = ("common", "basic", "attention", "moe", "ssm")
+LAYER_MODULES = ("common", "basic", "attention", "mla", "moe", "ssm")
 
 
 @cache

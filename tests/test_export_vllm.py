@@ -88,6 +88,46 @@ def test_the_config_gives_vllm_its_heads_and_layer_kinds() -> None:
     assert c.num_hidden_layers == 3
 
 
+def bux_config(source: str) -> config.BuxConfig:
+    """The plugin's config of the model `source`, as vLLM reads its export."""
+    bux = json.loads(compile(source).model_dump_json())
+    return config.BuxConfig(bux=bux, vocab_size=256, hidden_size=128)
+
+
+def test_the_config_gives_vllm_the_latent_of_mla() -> None:
+    """vLLM reads an MLA's dims from the config, DeepSeek's names, and runs it as
+    MLA where they are set (bux_vllm.arch)."""
+    c = bux_config(vllm_parity.CASES["mla-moe"])
+    assert c.layer_types == ["full_attention"] * 2
+    dims = (c.q_lora_rank, c.kv_lora_rank, c.qk_nope_head_dim, c.qk_rope_head_dim)
+    assert (*dims, c.v_head_dim) == (None, 256, 64, 32, 64)
+    assert (c.num_attention_heads, c.num_key_value_heads, c.head_dim) == (2, 2, 96)
+    assert config.latent(c)
+    assert config.latent(bux_config(vllm_parity.CASES["mla-deepseek"]))
+    assert not config.latent(bux_config(vllm_parity.CASES["llama"]))
+
+
+MIXED = {
+    "gqa beside mla": "gqa(num_heads=4, num_kv_heads=2)",
+    "other dims": "mla(num_heads=2, kv_lora_rank=128, rope=rope())",
+    "other heads": "mla(num_heads=4, kv_lora_rank=256, qk_nope_head_dim=64,"
+    " qk_rope_head_dim=32, v_head_dim=64)",
+}
+
+
+@pytest.mark.parametrize("other", MIXED.values(), ids=MIXED.keys())
+def test_a_config_of_mla_and_other_attention_raises(other: str) -> None:
+    """vLLM runs all of a model's attention as MLA of one set of dims, or none."""
+    source = (
+        vllm_parity.HEAD
+        + vllm_parity.LATENT
+        + f"other = {other}\n"
+        + "model = embed [rmsnorm attn] [rmsnorm other] rmsnorm head"
+    )
+    with pytest.raises(NotImplementedError, match="mla"):
+        bux_config(source)
+
+
 @pytest.mark.parametrize("path", FILES, ids=lambda p: p.name)
 def test_plugin_files_import_nothing_of_bux(path: Path) -> None:
     """The plugin installs alone, as bux_vllm, where vLLM runs: Python 3.10 on."""
