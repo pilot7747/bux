@@ -19,7 +19,8 @@ COLUMNS = [
     ("× per parameter", "mult", ".2f"), ("(a) speedup to vs's 1T loss", "speedup", ".3g"),
     ("(a) Δ at vs's 1T GPU-h %", "delta_hours", "+.2f"),
     *((f"(b) Δ {d} %", f"delta_{d}", "+.2f") for d in map(tokens_label, LIMITED)),
-    ("(b) Δ 1T, E fit %", "delta_1T_efree", "+.2f"),
+    ("(b) Δ 1T, E in [0.25, 0.35] %", "delta_1T_ebound", "+.2f"),
+    ("(b) Δ 1T, E fit (unidentified, → 0) %", "delta_1T_efree", "+.2f"),
     ("(b) Δ 1T, lower cost %", "delta_1T_lower", "+.2f"),
     ("(b) Δ 1T range %", "range_1T", "s"),
 ]  # fmt: skip
@@ -31,6 +32,7 @@ def rows(
     candidates: list[str],
     targets: dict,
     points: list,
+    bounded: Analysis | None = None,
 ) -> list[dict]:
     """A row per candidate and reference (its parent, then the baseline)."""
     out = []
@@ -38,7 +40,7 @@ def rows(
         for ref in dict.fromkeys([a.fams[f].parent, ROOT]):
             if ref in a.laws and ref in targets:
                 out.append(
-                    row(a, free, f, ref, targets)
+                    row(a, free, f, ref, targets, bounded)
                     | {"paired": paired_text(points, f, ref, a.metric)}
                 )
     return out
@@ -79,19 +81,27 @@ def paired_text(points: list, f: str, ref: str, metric: str) -> str:
     return "; ".join(parts)
 
 
-def row(a: Analysis, free: Analysis | None, f: str, ref: str, targets: dict) -> dict:
-    """One candidate against one reference."""
+def row(
+    a: Analysis,
+    free: Analysis | None,
+    f: str,
+    ref: str,
+    targets: dict,
+    bounded: Analysis | None = None,
+) -> dict:
+    """One candidate against one reference: E held, E fit within its bounds, E fit
+    freely (the E range's far end), and at the serving cost's lower bound."""
     out = {"candidate": f, "vs": ref} | per_parameter(a, f, ref)
     out |= serving(a.laws, f, ref, targets)
     if (lower := targets[f].lower) is not None:
         out["delta_1T_lower"] = serving(a.laws, f, ref, {**targets, f: lower})[
             "delta_1T"
         ]
-    if free is not None and f in free.laws and ref in free.laws:
-        out["delta_1T_efree"] = serving(free.laws, f, ref, targets)["delta_1T"]
-    ends = [
-        out[k] for k in ("delta_1T", "delta_1T_lower", "delta_1T_efree") if k in out
-    ]
+    for key, other in (("delta_1T_efree", free), ("delta_1T_ebound", bounded)):
+        if other is not None and f in other.laws and ref in other.laws:
+            out[key] = serving(other.laws, f, ref, targets)["delta_1T"]
+    keys = ("delta_1T", "delta_1T_lower", "delta_1T_ebound", "delta_1T_efree")
+    ends = [out[k] for k in keys if k in out]
     out["range_1T"] = f"[{min(ends):+.2f}, {max(ends):+.2f}]"
     return out
 
@@ -210,7 +220,8 @@ def verdict(table: list[dict], targets: dict) -> str:
     text = (
         f"Today's best architecture is {best['candidate']}: at equal measured serving cost{served} it "
         f"predicts {best['delta_1T']:+.1f}% on the objective against {best['vs']} on 1T tokens "
-        f"(range {best['range_1T']} over the serving cost and E"
+        f"(range {best['range_1T']} over the serving cost and E, from E held at 0.3204 to E fit, "
+        f"which is unidentified and goes to 0"
         + "".join(f"; {r['serve']}: {r['delta_1T']:+.1f}%" for r in alt)
         + ")"
     )
@@ -223,5 +234,42 @@ def verdict(table: list[dict], targets: dict) -> str:
 
 
 def free_e(options: Options) -> Options:
-    """The options of the E range's other end: E fit, no bootstrap."""
+    """The options of the E range's far end: E fit, no bootstrap."""
     return replace(options, e=None, reps=0)
+
+
+E_BOUNDS = (
+    0.25,
+    0.35,
+)  # bits per byte: where an irreducible entropy of code and text can be
+
+
+def bounded_e(options: Options) -> Options:
+    """The options of a fit with E within `E_BOUNDS`, no bootstrap."""
+    return replace(options, e=None, reps=0, e_range=E_BOUNDS)
+
+
+def e_line(free: Analysis | None, bounded: Analysis | None) -> str:
+    """Where E lands when it is fit: freely, and within `E_BOUNDS`."""
+
+    def e_of(x: Analysis) -> float:
+        root = next(f for f, fam in x.fams.items() if fam.parent == NO_DATA)
+        return x.laws[root].E
+
+    parts = []
+    if free is not None:
+        parts.append(
+            f"E fit freely lands at {e_of(free):.4f}, unidentified: shown only as the far end of the E range"
+        )
+    if bounded is not None:
+        e = e_of(bounded)
+        lo, hi = E_BOUNDS
+        on = (
+            " (on its lower bound)"
+            if abs(e - lo) < 1e-3
+            else " (on its upper bound)"
+            if abs(e - hi) < 1e-3
+            else ""
+        )
+        parts.append(f"fit within [{lo}, {hi}] it lands at {e:.4f}{on}")
+    return "; ".join(parts) + "." if parts else ""

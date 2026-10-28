@@ -37,6 +37,7 @@ import fit_plots
 import fit_points
 import fit_report
 import fit_targets
+import numpy as np
 from fit_counts import FOLDER, Counts, find, notes
 
 HERE = Path(__file__).resolve().parent
@@ -61,7 +62,7 @@ def main() -> None:
         sys.exit("give a file of RESULT lines, or --selftest")
     report = run(a)
     print(report["markdown"])
-    if a.fix_e and not a.no_e_free:
+    if a.fix_e and a.e_free_variant:
         free_variant(a)
 
 
@@ -73,7 +74,13 @@ def free_variant(a: argparse.Namespace) -> dict:
     ARGV = e_free_argv(main, a.out / "e-free")
     try:
         variant = argparse.Namespace(
-            **{**vars(a), "fix_e": None, "out": a.out / "e-free", "wandb": False}
+            **{
+                **vars(a),
+                "fix_e": None,
+                "out": a.out / "e-free",
+                "wandb": False,
+                "far_end": True,
+            }
         )
         return run(variant)
     finally:
@@ -151,6 +158,7 @@ def run(a: argparse.Namespace) -> dict:
         "points": points,
         "analyses": analyses,
         "short": short,
+        "others": others,
         "wild": wild,
         "excluded": excluded,
         "objective": next(
@@ -178,17 +186,26 @@ def best_rows(
     main = next((x for x in analyses if x.metric == "objective"), None)
     if not a.candidates or main is None:
         return []
-    free = None
+    free = bounded = None
     if a.fix_e:
-        o = fit_best.free_e(options(a, noise["objective"], "objective"))
-        free = fit_analysis.analyze(points, "objective", parents, targets, o)
+        o = options(a, noise["objective"], "objective")
+        free = fit_analysis.analyze(
+            points, "objective", parents, targets, fit_best.free_e(o)
+        )
+        bounded = fit_analysis.analyze(
+            points, "objective", parents, targets, fit_best.bounded_e(o)
+        )
     cands = a.candidates.split(",")
+    line = fit_best.e_line(free, bounded)
     rows = [
-        r | {"serve": serving_precision(a)}
-        for r in fit_best.rows(main, free, cands, targets, points)
+        r | {"serve": serving_precision(a), "e_line": line}
+        for r in fit_best.rows(main, free, cands, targets, points, bounded)
     ]
     for p, t in (others or {}).items():
-        rows += [r | {"serve": p} for r in fit_best.rows(main, free, cands, t, points)]
+        rows += [
+            r | {"serve": p, "e_line": line}
+            for r in fit_best.rows(main, free, cands, t, points, bounded)
+        ]
     return rows
 
 
@@ -442,6 +459,7 @@ def assumptions(a: argparse.Namespace, targets: dict, facts: dict) -> list[str]:
         else "the root fit alone, then each family with its parent held"
     )
     out = [
+        *(["THE FAR END OF THE E RANGE, not a variant to quote: E fit, unidentified (→ 0); the main fit holds E at 0.3204."] if getattr(a, "far_end", False) else []),
         f"N is the parameters a token goes through besides the embeddings; points at the best of their learning rates ({a.pick}), "
         + ("its lr chosen on its first runs, then every run at that lr averaged (the seeds)." if not a.no_average_seeds else "each of its first runs only: seeds and base arms only measure the noise."),
         f"E is shared by every family; {fit}" + (f"; {a.share} pooled: only the root has them of its own." if a.share else "."),
@@ -496,6 +514,7 @@ def assumptions(a: argparse.Namespace, targets: dict, facts: dict) -> list[str]:
             f"Best lr at the edge of its scan (scan further): {', '.join(edges)}."
         )
     out += cost_lines(targets)
+    out += budget_lines(a, targets, facts.get("others") or {})
     if placeholder := sorted(
         f for f, t in targets.items() if t.mfu_from == "placeholder"
     ):
@@ -504,6 +523,30 @@ def assumptions(a: argparse.Namespace, targets: dict, facts: dict) -> list[str]:
             f"no measured family above it, for: {', '.join(placeholder)}."
         )
     return out
+
+
+def budget_lines(a: argparse.Namespace, targets: dict, others: dict) -> list[str]:
+    """The serving budgets at each precision, and how the targets move between them."""
+    found = fit_targets.budgets(a.targets) if a.targets else {}
+    if len(found) < 2:
+        return []
+    main = serving_precision(a)
+    text = (
+        "Serving budgets of the budget model (old_2022 at d_model 4096), sessions/h per GPU: "
+        + ", ".join(f"{p} {b:.0f}" for p, b in found.items())
+    )
+    for p, t in others.items():
+        both = [
+            targets[f].n_active / t[f].n_active
+            for f in targets
+            if f in t and " only (" not in targets[f].cost_from
+        ]
+        if both and p in found and main in found:
+            text += (
+                f". The budget model serves {found[main] / found[p]:.2f}× faster in {main} than in {p}, more than "
+                f"the families gain, so the {main} targets are smaller: N active ×{float(np.median(both)):.2f} theirs in {p} (median)"
+            )
+    return [text + "."]
 
 
 def cost_lines(targets: dict) -> list[str]:
@@ -559,7 +602,9 @@ def markdown(a: argparse.Namespace, tables: dict, targets: dict, facts: dict) ->
         parts += ["## Today's best architecture\n", fit_best.verdict(tables["best"], targets) + "\n",
                   fit_report.markdown(tables["best"], fit_best.COLUMNS),
                   *(f"- {line}" for line in fit_best.scale_lines(facts["objective"], a.candidates.split(","), facts["points"], tables["learning_rates"])), "",
-                  ("Against each reference's target of equal measured serving cost; the range spans E held and E fit, "
+                  *([f"- {tables['best'][0]['e_line']}"] if tables["best"][0].get("e_line") else []),
+                  ("Against each reference's target of equal measured serving cost. The main numbers hold E at 0.3204; "
+                  "the range spans E held at 0.3204 … E fit (unidentified, → 0), E fit within [0.25, 0.35] between them, "
                   "and the serving cost's lower bound where it is measured as an upper one.\n")]  # fmt: skip
     for key, title in (
         ("leaderboard_objective", "One-change leaderboard (objective)"),
@@ -746,9 +791,9 @@ def parser() -> argparse.ArgumentParser:
         help="families left out of every table, each with its reason: fam=why,fam2=why",
     )
     p.add_argument(
-        "--no-e-free",
+        "--e-free-variant",
         action="store_true",
-        help="with --fix-e, skip the E-free variant in OUT/e-free/",
+        help="with --fix-e, also write the fit with E free to OUT/e-free/: the E range's far end, not a variant to quote",
     )
     p.add_argument(
         "--wandb", action="store_true", help="log the tables to W&B (env: WANDB_*)"
