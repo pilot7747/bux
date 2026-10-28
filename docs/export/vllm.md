@@ -163,7 +163,7 @@ ones, `--load-format dummy`, to time it.
 | `moe` | softmax, sigmoid and `sqrtsoftplus` routers, `router_logit_scale`, groups, the aux-free bias, a router bias, shared experts and their gate, gated and plain experts (`swish`, `gelu`, `gelu_tanh`, `relu2`) with biases, a `limit` and `up_offset` on `swish` and `quick_gelu` gates (gpt-oss's), SiTU-GLU experts (`situ` with an `up_softcap`, Kimi K3's, by vLLM's own), LatentMoE with its norms (vLLM's fused experts at the latent's width), shared experts the router scores (`shared_expert_sink`), and each routed expert's output normalized before its weight (`expert_norm`; each of a token's picks a row of its own in vLLM's fused MoE, so that their outputs come back apart, summed over the ranks, for the norm). Not yet: an `up_softcap` on experts other than `situ` ones |
 | `mamba`, `mamba2`, `gdn` | by vLLM's own layers (`mamba` as Jamba's, without speculative decoding), with one type and shape of recurrent layer per model; `gdn` in bfloat16 only, and without a short conv or an output gate by bux's own rule ([DPLR delta rules](#dplr-delta-rules)). Under tensor parallelism, vLLM 0.32's Mamba-2 failed with one group (its fused all-reduce), and in bfloat16 where a rank's share of the input projection is not a multiple of 8 wide |
 | `kda` | by vLLM's KDA kernels, Kimi Linear's (by chunks for a prompt, the recurrence for each decoded token) and its causal conv, with one type and shape of recurrent layer per model: value heads (`num_v_heads`), the decay's rank, `gate_lower_bound` of -5 and above, and a dense or low-rank output gate; by bux's own rule ([DPLR delta rules](#dplr-delta-rules)) without a conv or an output gate, with a `v_head_dim` other than `head_dim`, or a lower bound under -5. Not yet: speculative decoding |
-| `gdn2`, `rwkv7`, `deltanet`, `gla`, `lightning` | the delta rule on fla's kernels where they are installed, else in PyTorch ([DPLR delta rules](#dplr-delta-rules)), the rest by vLLM's layers and causal conv, with one type and shape of recurrent layer per model: every setting, with a conv or none, `lightning`'s decay by the layer's depth among the token mixers and its RMSNorm of all heads, its statistics summed over the ranks, and `rwkv7`'s `v` port (the value residual). Not yet: speculative decoding |
+| `gdn2`, `rwkv7`, `deltanet`, `gla`, `lightning` | the delta rule on fla's kernels where they are installed, else in PyTorch ([DPLR delta rules](#dplr-delta-rules)), the rest by vLLM's layers and causal conv, with one type and shape of recurrent layer per model: every setting, with a conv or none, `lightning`'s decay by the layer's depth among the token mixers and its RMSNorm of all heads, its statistics summed over the ranks, and `rwkv7`'s `v` port (the value residual). Not yet: `gla` without a conv in a 16-bit model, or speculative decoding |
 | `engram` | every setting, on a single or a widened stream: the n-gram sizes and hash heads, the norms, the dilated conv or none, `vocab_classes` and `boundary_token`. Not yet: speculative decoding, a conv of one tap, or vLLM's V1 model runner |
 | residual algebras, `merge` | `hc`, `mhc`, `gr`, `attnres`, `vpgate`, with every setting, single-pass included |
 | the graph | everything; a shared MoE or recurrent layer may run only once per forward pass |
@@ -477,11 +477,19 @@ parentheses is bux's own bfloat16 error, against the same reference:
 | `mamba` | Jamba's Mamba beside attention | 9.5e-6 | 0.11 (0.14) | 0.096 |
 | `mamba2` | Mamba-2 of 16 heads in 2 groups, beside attention | 7.6e-6 | 0.078 (0.13) | 0.076 |
 | `gdn` | Gated DeltaNet of 2 q/k heads and 4 value heads, beside gated attention | - | 0.27 (0.23) | 0.28 |
+| `gdn-plain` | GDN without a conv or an output gate, by bux's own rule | 2.2e-5 | 0.39 (0.41) | - |
 | `kda` | KDA of 2 q/k heads and 4 value heads, its gate's lower bound of -5 | - | 0.13 (0.24) | 0.19 |
 | `kda-odd` | KDA of 2 q/k heads and 6 value heads at a width of 136, its fused projection no multiple of 64 wide, beside an MoE | - | 2.1 (2.5) | 2.1 |
 | `kda-kimi` | Kimi Linear's KDA: 4 heads, a low-rank output gate | - | 0.13 (0.43) | - |
+| `kda-plain` | KDA without a conv, its values narrower than q and k, a low-rank gate and a lower bound of -8, by bux's own rule | 1.1e-5 | 0.14 (0.17) | - |
 | `gdn2` | Gated DeltaNet-2 of 2 q/k heads and 4 value heads | 1.1e-5 | 0.15 (0.23) | 0.14 |
 | `gdn2-paper` | the paper's gdn2: low-rank gates, negative eigenvalues, a sigmoid output gate | 8.6e-6 | 0.12 (0.20) | - |
+| `gdn2-plain` | GDN-2 without a conv, its q, k and v SiLU'd alone | 9.1e-6 | 0.24 (0.23) | - |
+| `deltanet` | DeltaNet of 2 q/k heads and 4 value heads, beside gated attention | 1.6e-5 | 0.18 (0.22) | - |
+| `gla` | gated linear attention of 2 q/k heads and 4 value heads, without a conv | 8.1e-6 | - | - |
+| `gla-conv` | gated linear attention with a conv and a sigmoid gate | 8.1e-6 | 0.14 (0.18) | - |
+| `lightning` | MiniMax-01's lightning attention, two layers of their own depths | 6.7e-6 | 0.075 (0.17) | 0.11 |
+| `lightning-conv` | lightning with a conv and value heads of their own | 1.0e-5 | 0.20 (0.18) | - |
 | `rwkv7` | RWKV-7 of 2 heads of 64 | 3.4e-5 | 0.17 (1.0) | 0.70 |
 | `rwkv7-residual` | RWKV-7's value residual through its `v` port, low ranks | 1.3e-5 | 0.11 (0.25) | - |
 | `hc` | hyper-connections, 4 streams | 8.1e-6 | 0.079 (0.10) | 0.086 |
@@ -498,20 +506,8 @@ keys' scores are within bfloat16's rounding of each other, a token's picks chang
 and so does its output. Two cases differ: `moe-sink` at TP=2 picks a token 1.8
 below the best, at bux's own 1.8; and `mla-moe` on one GPU is off by 1.6, where
 bux's own bfloat16 run is off by 0.093 (at TP=2, by 1.4 against bux's own 1.1).
-`gdn`, the `kda` and `mla` cases run in bfloat16 only. A `-` marks a case not
-measured that way.
-
-These cases check further settings, not yet measured:
-
-- `deltanet`: DeltaNet of 2 q/k heads and 4 value heads, beside gated attention.
-- `lightning`: MiniMax-01's lightning attention, two layers of their own depths.
-- `lightning-conv`: lightning with a conv and value heads of their own.
-- `gla`, `gla-conv`: gated linear attention without a conv, its default, and with
-  one.
-- `gdn2-plain`: GDN-2 without a conv, its q, k and v SiLU'd alone.
-- `gdn-plain`, `kda-plain`: GDN without a conv or an output gate, and KDA without
-  a conv, its values narrower than q and k, a low-rank gate and a lower bound of
-  -8, by bux's own rule.
+`gdn`, `kda`, `kda-odd`, `kda-kimi` and the `mla` cases run in bfloat16 only, and
+`gla` without a conv in float32 alone. A `-` marks a case not measured that way.
 
 On the CPU, `tests/test_export_vllm.py` runs the plugin's sparse and compressed
 attention on paged caches of its own, prompts in chunks beside decoded tokens,

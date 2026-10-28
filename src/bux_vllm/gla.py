@@ -28,12 +28,16 @@ class Mixer(Recurrent):
     rest in it.
 
     Raises:
-        NotImplementedError: Speculative decoding.
+        NotImplementedError: Speculative decoding, or no conv in a 16-bit model,
+            whose outputs fla's kernels took far from bux's on a GPU.
     """
 
     what = "gla"
 
     def __init__(self, c: dict, width: int, vllm_config: Any, prefix: str):
+        half = vllm_config.model_config.dtype in (torch.bfloat16, torch.float16)
+        if c["conv_size"] is None and half:
+            raise NotImplementedError("gla: no conv in 16 bits not in vLLM yet")
         super().__init__(vllm_config, prefix)
         self.c = c
         h, hv, dk, dv = linear_dims(c)
