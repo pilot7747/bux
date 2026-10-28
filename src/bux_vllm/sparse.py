@@ -11,6 +11,10 @@ around it (`split_graphs`), as around attention, and captures no whole-step grap
 of a model with one (`PagedMetadataBuilder`). The op also gives the keys each query
 picked, which a layer that reads them through its ``index`` port attends over with
 ``vllm::bux_picked_attention``, keeping no indexer keys of its own.
+
+A layer with a relative bias attends to every key it sees, the bias on its logits,
+in ``vllm::bux_biased_attention`` over a cache of the same kind: no attention kernel
+of vLLM's adds a bias that depends on the query and on how far behind it a key is.
 """
 
 from __future__ import annotations
@@ -33,7 +37,11 @@ from . import picks
 from .kv import reads, writes
 
 #: The ops, as vLLM's compilation names them.
-OPS = ("vllm::bux_sparse_attention", "vllm::bux_picked_attention")
+OPS = (
+    "vllm::bux_sparse_attention",
+    "vllm::bux_picked_attention",
+    "vllm::bux_biased_attention",
+)
 
 
 class PagedMetadataBuilder(AttentionMetadataBuilder[CommonAttentionMetadata]):
@@ -299,6 +307,43 @@ def picked_attention(
         output[at] = out.to(output.dtype)
 
 
+def biased_attention(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    r: torch.Tensor,
+    table: torch.Tensor,
+    gain: torch.Tensor,
+    positions: torch.Tensor,
+    output: torch.Tensor,
+    layer_name: str,
+) -> None:
+    """The op of a call with a relative bias: write the step's keys and values,
+    (T, g, dk) and (T, g, dv), into the cache of the call `layer_name`, then write
+    each query's attention over every key it sees into `output`, (T, h, dv), the
+    bias of its heads' projections `r`, (T, h, rank), and the bias `table` on its
+    logits, then its length scale `gain`, (T,), unless empty; zeros in vLLM's
+    profiling run, which has no metadata."""
+    metas = _metadata()
+    if metas is None or layer_name not in metas:
+        output.zero_()
+        return
+    cache = get_forward_context().no_compile_layers[layer_name]
+    meta = metas[layer_name]
+    n = meta.num_actual_tokens
+    output[n:].zero_()
+    picks.write(cache.kv_cache, meta.slot_mapping[:n], torch.cat([k, v], -1)[:n])
+    table_rows = meta.block_table_tensor
+    for part in picks.segments(*_bounds(meta), q.device):
+        at = part.tokens
+        bias = (r[at], table, gain[at] if gain.numel() else None)
+        rows = table_rows[part.requests]
+        out = picks.attend_all(
+            cache.sparse, q[at], bias, positions[at], cache.kv_cache, rows, part.keys
+        )
+        output[at] = out.to(output.dtype)
+
+
 def _metadata() -> dict | None:
     """The step's attention metadata by layer name; None in vLLM's profiling run."""
     metas = get_forward_context().attn_metadata
@@ -351,6 +396,28 @@ direct_register_custom_op(
     op_func=sparse_attention,
     mutates_args=["output", "picked_keys", "picked_valid"],
     fake_impl=_fake,
+)
+
+
+def _fake_biased(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    r: torch.Tensor,
+    table: torch.Tensor,
+    gain: torch.Tensor,
+    positions: torch.Tensor,
+    output: torch.Tensor,
+    layer_name: str,
+) -> None:
+    """The biased op as torch.compile traces it: it writes `output` alone."""
+
+
+direct_register_custom_op(
+    op_name="bux_biased_attention",
+    op_func=biased_attention,
+    mutates_args=["output"],
+    fake_impl=_fake_biased,
 )
 direct_register_custom_op(
     op_name="bux_picked_attention",

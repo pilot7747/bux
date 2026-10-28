@@ -978,6 +978,48 @@ def test_sparse_attention_in_the_latent_space_is_bux_s(name: str, window: int | 
     )
 
 
+@pytest.mark.parametrize("window", [None, 6], ids=["causal", "window"])
+@pytest.mark.parametrize("log_scale", [None, 0.5], ids=["plain", "log scale"])
+def test_attention_with_a_relative_bias_over_paged_caches_is_bux_s(
+    window: int | None, log_scale: float | None
+) -> None:
+    """Every key a query sees, read from paged caches, with the relative bias and
+    the length scale on its logits (bux_vllm.picks.attend_all), gives what the
+    export's softmax gives with its bias and gain, for one request's queries
+    together and one at a time."""
+    from bux.export.hf import attention as hf_attention
+    from bux_vllm import picks
+
+    torch.manual_seed(0)
+    width, s, h, g, dk, rank, extent = 16, 23, 4, 2, 8, 3, 7
+    x, at = torch.randn(1, s, width), torch.arange(s)
+    proj = torch.nn.Linear(width, h * rank)
+    table = torch.randn(rank, extent)
+    layer = stand_in(rel_proj=proj, rel_table=table, h=h, log_scale=log_scale)
+    layer.log_scale_floor = 4
+    offsets = at[:, None] - at[None]
+    bias = hf_attention.SoftmaxAttention._relative_bias(layer, x, offsets)
+    gain = hf_attention.SoftmaxAttention._length_scale(
+        layer, stand_in(positions=at[None])
+    )
+    q, k, v = (torch.randn(1, n, s, dk) for n in (h, g, g))
+    keep = picks.seen(at, s, window)[None, None]
+    sinks = torch.randn(h)
+    want = hf_attention.softmax_attention(q, k, v, keep, 0.3, 4.0, sinks, bias, gain)[0]
+    block, blocks = 4, 9
+    table_rows = torch.randperm(blocks)[None]
+    cache = torch.zeros(blocks, g, block, 2 * dk)
+    slots = table_rows[0, at // block] * block + at % block
+    picks.write(cache, slots, torch.cat([k[0], v[0]], -1).transpose(0, 1))
+    spec = picks.layer_spec(None, None, (window, 0.3, 4.0, sinks), dk, (0, g))
+    r = proj(x[0]).view(s, h, rank)
+    lengths = None if gain is None else gain[0, 0, :, 0]
+    qs = q[0].transpose(0, 1)
+    for rows in (table_rows, table_rows.expand(s, -1)):
+        got = picks.attend_all(spec, qs, (r, table, lengths), at, cache, rows, s)
+        torch.testing.assert_close(got, want, rtol=1e-5, atol=1e-5)
+
+
 def test_the_step_splits_into_single_queries_and_requests() -> None:
     from bux_vllm import picks
 

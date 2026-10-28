@@ -286,6 +286,16 @@ CASES = {
     # Hymba's cross-layer KV sharing: a windowed layer's keys and values read by
     # the next one or two, then a full layer's by one with a window of its own.
     "kv-share": HEAD + SHARING + "model = embed F W S R W R G R rmsnorm head",
+    # Inkling's attention: a relative bias, a conv on keys and values, no RoPE, and
+    # a length scale on the global layer's logits, its window-only layers biased
+    # over their window.
+    "relbias": HEAD
+    + FFN
+    + "attn = gqa(num_heads=4, num_kv_heads=2, qk_norm=rmsnorm, kv_conv_size=4,"
+    " relative_bias=relbias(rank=4, extent=16), log_scale=0.5, log_scale_floor=8)\n"
+    + "local = attn(sliding_window_size=8, relative_bias.extent=8, log_scale=none)\n"
+    + "model = embed [rmsnorm local] [rmsnorm ffn] [rmsnorm attn] [rmsnorm ffn]"
+    " rmsnorm head",
     "dyt": HEAD
     + ATTN
     + FFN
