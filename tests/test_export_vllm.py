@@ -7,6 +7,7 @@ scripts/vllm_parity.py checks it."""
 
 import ast
 import importlib.util
+import itertools
 import json
 import math
 from pathlib import Path
@@ -32,6 +33,7 @@ from bux.export import plan as core
 from bux.export.hf import common as hf_common
 from bux.export.hf import engram as hf_engram
 from bux.export.hf import linear_attention as hf_linear
+from bux.export.hf import moe as hf_moe
 from bux.export.hf import residual as hf_residual
 from bux.export.hf import rwkv7 as hf_rwkv7
 from bux.export.huggingface import save
@@ -296,6 +298,50 @@ def test_experts_load_alike_from_bux_and_transformers(gated: bool) -> None:
         assert [s for s, _ in a] == [s for s, _ in b]
         for (_, x), (_, y) in zip(a, b, strict=True):
             torch.testing.assert_close(x, y)
+
+
+EXPERT_NORMS = {
+    "rmsnorm": "rmsnorm",
+    "rescale": "rmsnorm(eps=1e-8, zero_centered=true, scale_input=true)",
+    "layernorm": "layernorm(bias=true)",
+}
+
+
+@pytest.mark.parametrize("norm", EXPERT_NORMS.values(), ids=EXPERT_NORMS.keys())
+def test_experts_normalized_apart_compute_what_the_export_does(norm: str) -> None:
+    """Under expert_norm each of a token's picks runs through its expert as a row
+    of its own, as vLLM's fused MoE of one pick a row runs it (`pick_rows`), then
+    the norm and the weights: the export's experts' output."""
+    arch = compile(
+        "d_model = 16\ne = gated_mlp(intermediate_size=8, activation=swish)\n"
+        f"model = moe(num_experts=4, top_k=2, expert=e, expert_norm={norm})"
+    )
+    c = next(arch.layers()).config.model_dump(mode="json")
+    torch.manual_seed(0)
+    args = (SimpleNamespace(), c["expert"], 4, 16)
+    theirs = hf_moe.Experts(*args, c["expert_norm"]).configure()
+    bare = hf_moe.Experts(*args, None).configure()  # the experts, unnormalized
+    for name in ("gate_up_proj", "down_proj"):
+        param = getattr(theirs, name)
+        param.data = torch.randn(param.shape) / 2
+    bare.load_state_dict(theirs.state_dict(), strict=False)
+    mine = common.Norm(c["expert_norm"], 16)
+    assert theirs.post_expert_norm is not None
+    twins(theirs.post_expert_norm, mine)
+    z, weights = torch.randn(6, 16), torch.rand(6, 2)
+    idx = torch.stack([torch.randperm(4)[:2] for _ in range(6)])
+
+    def fused(rows: torch.Tensor, logits: torch.Tensor) -> torch.Tensor:
+        _, ids = routing.pick_rows(rows, logits, 1, False)
+        return torch.cat(
+            [bare.expert(r[None], int(e)) for r, e in zip(rows, ids[:, 0])]
+        )
+
+    got = routing.apart(fused, mine, z, weights, idx, 4)
+    want = torch.zeros(6, 16)
+    for t, j in itertools.product(range(6), range(2)):
+        want[t] += weights[t, j] * theirs.expert(z[t : t + 1], int(idx[t, j]))[0]
+    torch.testing.assert_close(got, want)
 
 
 HEAD = "d_model = 16\nvocab_size = 64\n"
