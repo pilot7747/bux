@@ -110,9 +110,10 @@ ones, `--load-format dummy`, to time it.
   is a module named by the algebra, `model.layers.3.hc`, which holds its parameters,
   as in the export. It reads the stream for the branch's body and writes the body's
   output back, per token: the n copies of hc, mhc and gr are a (tokens, n, d)
-  tensor. attnres keeps the embedding, the sum of each finished block of branch
-  outputs and the sum of the block under way, which is what bux's softmax over depth
-  reads; it does not keep every output. Nothing of it is cached between steps.
+  tensor. attnres keeps the embedding and the sum of each finished block of branch
+  outputs side by side, and the sum of the block under way, which is what bux's
+  softmax over depth reads; it does not keep every output. Nothing of it is cached
+  between steps. See [Residual algebras](#residual-algebras) for how they run.
 - **The layers** are vLLM's: column- and row-parallel projections, the vocabulary
   split over ranks, vLLM's attention with its KV cache, its MLA with the latent
   cache, `FusedMoEFactory` for the routed experts, vLLM's Mamba-2 and Gated
@@ -217,6 +218,41 @@ float32, as bux does:
 This rule computes in float32 on CUDA cores, so a prompt costs several times what a
 fused kernel would. Tests check both paths against the export's layers on the CPU,
 the PyTorch rule as computed and fla's as its API defines it.
+
+## Residual algebras
+
+A residual algebra widens the stream: hc, mhc and gr into n copies of it, attnres
+into the embedding and the sums of blocks of branch outputs. Each outermost branch
+reads it for its body and writes the body's output back into it, and the widened
+stream is n times (or as many sources as) the plain one, so what a branch costs is
+how often it moves it.
+
+- **Kernels.** In a 16-bit model, hc's, mhc's and attnres's reads and writes run
+  fused Triton kernels (`bux_vllm.streams`), in float32 from the stream's dtype. A
+  branch reads its streams in one kernel and writes them in another, so it moves
+  the widened stream once into the read, and once in and once out of the write:
+  - hc's read computes the token's coefficients, A and B, static plus the dynamic
+    term ``s tanh(norm(x_j) W)``, the norm's statistics and its dot products with
+    W in one pass (``norm(x) W`` as ``rstd (x W - mean sum(W))``), then the read.
+  - mhc's read computes its logits ``a r W + b`` of the flattened streams, and the
+    read; its write computes Sinkhorn's matrix of them, for each token.
+  - The write is ``x'_k = sum_j M_jk x_j + b_k y`` for a token's n streams.
+  - attnres's read computes the softmax of every source's ``rmsnorm(v) . w`` and
+    their mix; a finished block's sum joins its sources, the block under way's
+    sum stays in float32.
+- **PyTorch.** A float32 model, and any under `BUX_VLLM_RESIDUAL_KERNELS=torch`,
+  takes the PyTorch path, which computes what the export does, term by term: a
+  branch moves the widened stream about ten times (its norms, the projections, the
+  read and the mix as batched matrix products of n rows, the add), and mhc runs
+  Sinkhorn's rounds as two reductions each. `BUX_VLLM_RESIDUAL_KERNELS=triton`
+  runs the kernels in float32 too. `gr` and `vpgate` always take PyTorch's path,
+  as torch.compile compiles it.
+- **Checks.** A CPU test runs the fused path with each kernel's computation in
+  PyTorch against the export, and `scripts/vllm_residual.py` compares the kernels
+  with the PyTorch path on a GPU and times a branch both ways.
+
+The kernels are custom ops that stay inside vLLM's CUDA graphs: the graphs split at
+attention and the recurrent and MoE layers' ops, not at these.
 
 ## Sparse attention
 
