@@ -228,6 +228,12 @@ CASES = {
     "engram": LLAMA
     + "memory = engram(head_dim=8, table_size=12288)\n"
     + "model = embed block memory block rmsnorm head(tied=true)",
+    "mamba": HEAD
+    + ATTN
+    + FFN
+    + "ssm = mamba(state_size=16)\n"
+    + "model = embed [rmsnorm ssm] [rmsnorm ffn] [rmsnorm attn] [rmsnorm ffn]"
+    " [rmsnorm ssm] [rmsnorm ffn] rmsnorm head",
     "mamba2": HEAD
     + ATTN
     + FFN

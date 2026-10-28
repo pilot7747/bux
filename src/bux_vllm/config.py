@@ -33,6 +33,7 @@ STATES = {
     "gqa": "full_attention",
     "mla": "full_attention",
     "csa": "full_attention",
+    "mamba": "mamba",
     "mamba2": "mamba",
     "gdn": "linear_attention",
     "kda": "linear_attention",
