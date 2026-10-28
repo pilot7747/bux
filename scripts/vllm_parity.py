@@ -134,6 +134,14 @@ CASES = {
     + "experts = moe(num_experts=8, top_k=2, router_bias=true, num_shared_experts=1,"
     " expert=gated_mlp(intermediate_size=64, activation=quick_gelu, bias=true,"
     " limit=1.0, up_offset=1.0))\n" + MOE_BLOCK + "model = embed block^2 rmsnorm head",
+    "moe-latent": HEAD
+    + ATTN
+    + "experts = moe(num_experts=8, top_k=3, num_shared_experts=1, router=sigmoid,"
+    " routed_scaling_factor=2.5, load_balancing=aux_free, latent_size=64,"
+    " latent_input_norm=rmsnorm, latent_output_norm=rmsnorm,"
+    " expert=mlp(intermediate_size=64, activation=gelu, bias=true))\n"
+    + MOE_BLOCK
+    + "model = embed block^2 rmsnorm head",
     "mamba2": HEAD
     + ATTN
     + FFN
