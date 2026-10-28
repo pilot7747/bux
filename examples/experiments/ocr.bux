@@ -1,0 +1,24 @@
+# Fine-tune Qwen3.5-0.8B for OCR, from its released weights: conversations whose user
+# turn is a page and whose reply is its text, in the OpenAI format. Each image part
+# is {type: image, image: <path or bytes>}. Only the replies are learned. The sweep
+# compares training everything against freezing the vision encoder.
+#
+#   bux prepare examples/experiments/ocr.bux
+#   bux train   examples/experiments/ocr.bux
+use "qwen3.5_0.8b"
+
+tokenizer = tokenizer(name="Qwen/Qwen3.5-0.8B", eos="<|im_end|>")
+pages     = chat(path="data/ocr/*.parquet", images=images(max_pixels=1048576))
+packing   = best_fit(long=drop)
+weights   = hf(name="Qwen/Qwen3.5-0.8B")
+
+data      = pages(split=[0, 0.99])
+patches_per_row = 16384              # 4 pages of 1024 x 1024 pixels
+seq_len   = 8192
+batch     = 32
+steps     = 2k
+optimizer = adamw(lr=1e-5, weight_decay=0.0)
+schedule  = cosine(warmup=50)
+frozen    = all: [] | encoder: [vision]
+
+eval = eval(data=pages(split=[0.99, 1]), every=250)

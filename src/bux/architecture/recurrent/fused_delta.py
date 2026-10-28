@@ -91,7 +91,7 @@ def delta_rule(
     than the kernel's cu_seqlens holds, and positions split over devices, run by
     `otherwise` instead."""
     docs = docs or Segments.of(jnp.broadcast_to(jnp.arange(q.shape[1]), q.shape[:2]))
-    xs = (q, k, v, log_decay, beta, *docs)
+    xs = (q, k, v, log_decay, beta, docs.positions, docs.ids, docs.within)
     rule = functools.partial(_rows, otherwise)
     if parallel.active() is None:
         return rule(*xs)
@@ -365,7 +365,7 @@ def gated(
     documents than the kernel's cu_seqlens holds, and positions split over devices,
     run by `otherwise` instead."""
     docs = docs or Segments.of(jnp.broadcast_to(jnp.arange(q.shape[1]), q.shape[:2]))
-    xs = (q, k, v, log_decay, erase, write, *docs)
+    xs = (q, k, v, log_decay, erase, write, docs.positions, docs.ids, docs.within)
     rule = functools.partial(_gated_rows, otherwise)
     if parallel.active() is None:
         return rule(*xs)

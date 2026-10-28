@@ -46,6 +46,8 @@ class AttentionArgs(NamedTuple):
     scale: float  #: What every logit is multiplied by.
     softcap: float | None  #: Logits go to ``softcap * tanh(logits / softcap)``.
     sinks: Float[Array, " h"] | None  #: A logit per head beside the keys', on no value.
+    #: Whether a query sees no key ahead of it; else every key of its document.
+    causal: bool = True
 
 
 def causal_mask_at(
@@ -53,11 +55,13 @@ def causal_mask_at(
     q_index: Int[Array, " t"],
     k_index: Int[Array, " s"],
     ids: tuple[Int[Array, "b t"], Int[Array, "b s"]] | None = None,
+    causal: bool = True,
 ) -> Bool[Array, "*b t s"]:
     """Return which keys each query may attend to, by their indices in the row: none
-    ahead of it, none `window` or more behind, none of another document by `ids`."""
+    ahead of it if `causal`, none `window` or more behind, none of another document by
+    `ids`."""
     offset = q_index[:, None] - k_index[None, :]
-    mask = offset >= 0
+    mask = offset >= 0 if causal else jnp.ones(offset.shape, bool)
     if window is not None:
         mask &= offset < window
     if ids is None:
@@ -66,11 +70,12 @@ def causal_mask_at(
 
 
 def causal_mask(
-    t: int, window: int | None, ids: Int[Array, "b t"] | None
+    t: int, window: int | None, ids: Int[Array, "b t"] | None, causal: bool = True
 ) -> Bool[Array, "*b t t"]:
     """Return `causal_mask_at` for t queries and the t keys at their positions."""
     index = jnp.arange(t)
-    return causal_mask_at(window, index, index, None if ids is None else (ids, ids))
+    docs = None if ids is None else (ids, ids)
+    return causal_mask_at(window, index, index, docs, causal)
 
 
 def softcap(x: Float[Array, "*s"], cap: float | None) -> Float[Array, "*s"]:
@@ -137,10 +142,58 @@ def xla(
     `seq` over `context`, a device has its queries' rows of the logits and every key
     and value: all-gather context parallelism."""
     t = q.shape[1]
-    mask = causal_mask(t, args.window, args.ids)[..., None, :, :]
+    mask = causal_mask(t, args.window, args.ids, args.causal)[..., None, :, :]
     with flops.attention(args.window), flops.over_keys():  # for MFU
         logits = softcap(scaled_logits(q, k, args.scale), args.softcap)
         return weighted_values(masked_softmax(logits, mask, args.sinks), v)
+
+
+def bidirectional(
+    q: Float[Array, "b t h dk"],
+    k: Float[Array, "b s g dk"],
+    v: Float[Array, "b s g dv"],
+    args: AttentionArgs,
+) -> Float[Array, "b t h dv"]:
+    """Attend to every key of each query's document, ahead of it too, whatever the
+    run's ``methods.attention``: by tokamax's flash kernel on each device's whole rows
+    where it runs, its keys from the document's first to its last, else by `xla`.
+
+    Raises:
+        NotImplementedError: The layout splits the positions over `context`.
+    """
+    assert not args.causal and args.window is None
+    if splits_positions(q):
+        raise NotImplementedError(
+            "attention with causal=false runs on whole rows: lay seq out on no "
+            "context axis"
+        )
+    if not flash.tokamax_takes(q):
+        return xla(q, k, v, args)
+
+    def attend(
+        q: Float[Array, "b t h dk"],
+        k: Float[Array, "b t g dk"],
+        v: Float[Array, "b t g dv"],
+        args: AttentionArgs,
+    ) -> Float[Array, "b t h dv"]:
+        keys = Keys(False, *document_spans(args.ids, *q.shape[:2]))
+        return flash.attend(
+            flash.TOKAMAX, q, k, v, keys, args.sinks, args.scale, args.softcap
+        )
+
+    return on_whole_rows(attend, q, k, v, args)
+
+
+def document_spans(
+    ids: Int[Array, "b t"] | None, b: int, t: int
+) -> tuple[Int[Array, "b t"] | None, Int[Array, "b t"] | None]:
+    """Return the index of the first token of each token's document, and of the token
+    after its last; (None, None) for rows of one document each."""
+    if ids is None:
+        return None, None
+    start = document_starts(ids)
+    end = t - jnp.flip(document_starts(jnp.flip(ids, 1)), 1)
+    return start, end
 
 
 # --- on each device -----------------------------------------------------------------

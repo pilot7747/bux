@@ -1,6 +1,6 @@
 # Model zoo
 
-The model zoo is `examples/architectures/`: 62 `.bux` files, each a published model
+The model zoo is `examples/architectures/`: 64 `.bux` files, each a published model
 you can `use` by name, then shrink, sweep or train. Start here to reproduce a model or
 to ablate one of its parts. This page says what the files are, how to use one and how
 to add your own, then lists every model with its description, its layer counts and

@@ -5,10 +5,11 @@ So a split by key holds out the same documents whatever the tokenizer, and the
 documents a reduce gets, sorted by key, do not depend on the engine.
 
 `text` maps a batch of raw text and `chat` a batch of conversations, each to a
-record batch of documents in `SCHEMA`. `~bux.data.pipeline.Job.map` picks the one
-its source needs.
+record batch of documents in `SCHEMA`; a chat source with images, in `IMAGE_SCHEMA`.
+`~bux.data.pipeline.Job.map` picks the one its source needs.
 """
 
+import base64
 import bisect
 import hashlib
 import itertools
@@ -16,14 +17,16 @@ import json
 import re
 from collections.abc import Buffer, Callable, Iterable
 from dataclasses import dataclass
-from typing import Literal
+from pathlib import Path
+from typing import Literal, NamedTuple
 
 import numpy as np
 import pyarrow as pa
 from jaxtyping import Bool, Int32, Int64, Integer
 
-from bux.data import templates
+from bux.data import images, templates
 from bux.data.tokenizer import Tokenizer, utf8
+from bux.export.hf import pixels
 from bux.train import config as tcfg
 
 #: The documents the map makes, a row each.
@@ -38,6 +41,29 @@ SCHEMA = pa.schema(
         ("input_ids", pa.list_(pa.int32())),
         ("loss_mask", pa.list_(pa.bool_())),
     ]
+)
+
+#: The documents of a chat source with images: `SCHEMA`, and each token's image.
+#:
+#: ``image`` is the key of the image each token stands for, 0 for a token of text;
+#: ``images`` the document's images in order, each its key, its bytes, and its rows
+#: and columns of patches.
+#:
+#: :meta hide-value:
+IMAGE_SCHEMA = SCHEMA.append(pa.field("image", pa.list_(pa.int64()))).append(
+    pa.field(
+        "images",
+        pa.list_(
+            pa.struct(
+                [
+                    ("key", pa.int64()),
+                    ("data", pa.binary()),
+                    ("rows", pa.int32()),
+                    ("cols", pa.int32()),
+                ]
+            )
+        ),
+    )
 )
 
 
@@ -140,25 +166,183 @@ def chat(
             roles do not alternate.
     """
     conversations = batch.column(config.column).to_pylist()
-    keys = _keys(json.dumps(m, sort_keys=True).encode() for m in conversations)
+    pictures = [_images(c, config.images) for c in conversations]
+    keys = _keys(
+        json.dumps(_keyed(m, p), sort_keys=True).encode()
+        for m, p in zip(conversations, pictures, strict=True)
+    )
     keep = _in_split(keys, config.split)
     template = templates.load(config.template or tok.config.name)
-    specials = _Specials.of(tok, template)
-    docs, kept = [], []
-    for key, conversation in zip(keys[keep], itertools.compress(conversations, keep)):
+    specials = _Specials.of(tok, template, config.images)
+    docs, kept, shown = [], [], []
+    for key, conversation, mine in zip(
+        keys[keep],
+        itertools.compress(conversations, keep),
+        itertools.compress(pictures, keep),
+        strict=True,
+    ):
         text, starts = _render(template, specials.hide(conversation), config.train_on)
         doc = _cut(text, starts, specials.find, config.train_on == "all")
         if any(learned for _, _, learned in doc):  # without a reply, nothing to learn
             docs.append(doc)
             kept.append(key)
-    return record_batch(np.array(kept, np.int64), *_encode(docs, tok, specials.show))
+            shown.append(mine)
+    ids, offsets, mask = _encode(docs, tok, specials.show)
+    out = record_batch(np.array(kept, np.int64), ids, offsets, mask)
+    if config.images is None:
+        return out
+    return _with_images(out, ids, offsets, shown, tok.special(config.images.token))
+
+
+def _with_images(
+    docs: pa.RecordBatch,
+    ids: Int32[np.ndarray, " tokens"],
+    offsets: Int64[np.ndarray, " _"],
+    pictures: list[list["Picture"]],
+    token: int,
+) -> pa.RecordBatch:
+    """Return `docs` in `IMAGE_SCHEMA`: each image's token repeated once for each of
+    its blocks, those tokens no targets, and each token's image."""
+    parts, masks, keys, ends = [], [], [], [0]
+    mask = docs.column("loss_mask").flatten().to_numpy(zero_copy_only=False)
+    for d, mine in enumerate(pictures):
+        doc, learned = (
+            ids[offsets[d] : offsets[d + 1]],
+            mask[offsets[d] : offsets[d + 1]],
+        )
+        at = np.flatnonzero(doc == token)
+        if len(at) != len(mine):
+            raise ValueError(
+                f"a conversation has {len(mine)} images, but its template wrote "
+                f"{len(at)} image tokens"
+            )
+        counts = np.ones(len(doc), np.int64)
+        counts[at] = [p.tokens for p in mine]
+        key = np.zeros(len(doc), np.int64)
+        key[at] = [p.key for p in mine]
+        parts.append(np.repeat(doc, counts))
+        masks.append(np.repeat(learned & (doc != token), counts))
+        keys.append(np.repeat(key, counts))
+        ends.append(ends[-1] + int(counts.sum()))
+    bounds = pa.array(np.array(ends, np.int32))
+    images_type = IMAGE_SCHEMA.field("images").type
+    columns = [
+        docs.column("key"),
+        *(
+            pa.ListArray.from_arrays(
+                bounds, pa.array(np.concatenate([np.zeros(0, t), *xs]), a)
+            )
+            for xs, t, a in (
+                (parts, np.int32, pa.int32()),
+                (masks, bool, pa.bool_()),
+                (keys, np.int64, pa.int64()),
+            )
+        ),
+        pa.array(
+            [
+                [
+                    {"key": p.key, "data": p.data, "rows": p.rows, "cols": p.cols}
+                    for p in ps
+                ]
+                for ps in pictures
+            ],
+            images_type,
+        ),
+    ]
+    return pa.RecordBatch.from_arrays(columns, schema=IMAGE_SCHEMA)
+
+
+class Picture(NamedTuple):
+    """An image of a conversation: its key, a hash of its bytes, its bytes, its rows
+    and columns of patches, and the tokens it is written with."""
+
+    key: int
+    data: bytes
+    rows: int
+    cols: int
+    tokens: int
+
+
+def _images(
+    conversation: list[dict], config: tcfg.ImagesConfig | None
+) -> list[Picture]:
+    """Return the images of a conversation, in order, sized as `config` says.
+
+    Raises:
+        ValueError: The conversation has images, and the source no `images`.
+    """
+    found = [_image_bytes(p) for m in conversation for p in _parts(m) if _is_image(p)]
+    if found and config is None:
+        raise ValueError(
+            "a conversation has images, but its source reads none: "
+            "chat(..., images=images())"
+        )
+    out = []
+    for data in found:
+        assert config is not None
+        h, w = images.size(data)
+        hh, ww = pixels.resized(
+            h,
+            w,
+            size=config.size,
+            merge=config.merge,
+            min_pixels=config.min_pixels,
+            max_pixels=config.max_pixels,
+        )
+        rows, cols = hh // config.size, ww // config.size
+        key = int.from_bytes(hashlib.blake2b(data, digest_size=8).digest()) >> 1
+        out.append(Picture(key or 1, data, rows, cols, rows * cols // config.merge**2))
+    return out
+
+
+def _parts(message: dict) -> list:
+    content = message.get("content") or ""
+    return [] if isinstance(content, str) else content
+
+
+def _is_image(part: dict) -> bool:
+    return part.get("type") in ("image", "image_url")
+
+
+def _image_bytes(part: dict) -> bytes:
+    """Return an image part's bytes: from its path, its bytes, Hugging Face datasets'
+    ``{bytes, path}``, or a base64 ``data:`` URL."""
+    value = part.get("image") if part.get("type") == "image" else part["image_url"]
+    if isinstance(value, dict):
+        value = value.get("bytes") or value.get("url") or value.get("path")
+    if isinstance(value, bytes):
+        return value
+    if not isinstance(value, str):
+        raise TypeError(f"an image part holds no image: {part!r}")
+    if value.startswith("data:"):
+        return base64.b64decode(value.split(",", 1)[1])
+    return Path(value).read_bytes()
+
+
+def _keyed(conversation: list[dict], pictures: list[Picture]) -> list[dict]:
+    """Return a conversation with its images as their keys, which a hash takes."""
+    if not pictures:
+        return conversation
+    keys = iter(p.key for p in pictures)
+    return [
+        {
+            **m,
+            "content": [
+                {"type": "image", "image": next(keys)} if _is_image(p) else p
+                for p in _parts(m)
+            ]
+            or m.get("content"),
+        }
+        for m in conversation
+    ]
 
 
 def _content(message: dict) -> str:
     content = message.get("content") or ""
     if isinstance(content, str):
         return content
-    return "".join(part.get("text") or "" for part in content)  # parts of a message
+    # The parts of a message, an image as `_IMAGE`, which `_Specials.hide` writes out.
+    return "".join(_IMAGE if _is_image(p) else p.get("text") or "" for p in content)
 
 
 # A special token written in a message stays text: while the template renders, it is
@@ -166,6 +350,8 @@ def _content(message: dict) -> str:
 # written twice.
 _ESCAPE = "\U000f0000"
 _ESCAPED = re.compile(f"{_ESCAPE}(.)", re.DOTALL)
+# Where an image goes in a message's text, until it is written as its special tokens.
+_IMAGE = "\U000ffffd"
 
 
 @dataclass(frozen=True)
@@ -177,23 +363,35 @@ class _Specials:
     escapes: re.Pattern  # the special tokens and the escape character
     codes: dict[str, str]  # the escape of each
     texts: dict[str, str]  # what each character after the escape stands for
+    image: str  # what an image is written as, special tokens
 
     @classmethod
-    def of(cls, tok: Tokenizer, template: templates.ChatTemplate) -> "_Specials":
+    def of(
+        cls,
+        tok: Tokenizer,
+        template: templates.ChatTemplate,
+        images: tcfg.ImagesConfig | None = None,
+    ) -> "_Specials":
         tokens = sorted(tok.specials.keys() | template.specials, key=len, reverse=True)
         codes = {
             t: _ESCAPE + chr(ord(_ESCAPE) + i) for i, t in enumerate([_ESCAPE, *tokens])
         }
         find = re.compile("|".join(map(re.escape, tokens)))  # the longest first
         escapes = re.compile(f"{re.escape(_ESCAPE)}|{find.pattern}")
-        return cls(find, escapes, codes, {c[1]: t for t, c in codes.items()})
+        texts = {c[1]: t for t, c in codes.items()}
+        return cls(find, escapes, codes, texts, images.text if images else "")
 
     def hide(self, conversation: list[dict]) -> list[dict]:
-        """Return the messages, their contents joined and special tokens escaped."""
+        """Return the messages, their contents joined, special tokens escaped, and
+        images written as their special tokens."""
         return [
-            {**m, "content": self.escapes.sub(lambda t: self.codes[t[0]], _content(m))}
+            {**m, "content": self.escape(_content(m)).replace(_IMAGE, self.image)}
             for m in conversation
         ]
+
+    def escape(self, text: str) -> str:
+        """Return `text` with its special tokens escaped."""
+        return self.escapes.sub(lambda t: self.codes[t[0]], text)
 
     def show(self, text: str) -> str:
         """Return rendered text whose escaped special tokens are text again."""

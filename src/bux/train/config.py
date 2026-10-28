@@ -76,6 +76,30 @@ class TextConfig(Config):
     split: Split = (0.0, 1.0)
 
 
+class ImagesConfig(Config):
+    """How a chat source's images become tokens and patches, as Qwen2-VL's processor
+    makes them. Each image is resized, keeping its aspect ratio, to between
+    `min_pixels` and `max_pixels` pixels, its sides multiples of ``size * merge``, and
+    cut into patches of `size` pixels on a side. It is written into the conversation
+    as `text`, whose `token` is repeated once for each ``merge`` x ``merge`` block of
+    patches. ``chat(path=..., images=images(max_pixels=1048576))``."""
+
+    type: Literal["images"] = "images"
+    size: Positive = 16  # Pixels on a side of a patch: the model's patches(size=...).
+    merge: Positive = 2  # Patches on a side of a block: its merge_patches(size=...).
+    # The fewest pixels an image is resized to (Qwen3.5: 65536, 256 x 256).
+    min_pixels: Positive = 65536
+    # The most pixels an image is resized to (Qwen3.5: 16777216, 4096 x 4096); fewer
+    # make fewer tokens and patches.
+    max_pixels: Positive = 16777216
+    # What an image is written as in the conversation, special tokens of the
+    # tokenizer (Qwen's).
+    text: str = "<|vision_start|><|image_pad|><|vision_end|>"
+    # The special token of `text` that is repeated once for each block of patches:
+    # the model's image(token=...).
+    token: str = "<|image_pad|>"
+
+
 class ChatConfig(Config):
     """Conversations in the OpenAI format: a list of `{role, content}` messages per row
     of Parquet files, `content` a string or a list of `{type: text, text}` parts,
@@ -86,7 +110,13 @@ class ChatConfig(Config):
     the replies `train_on` picks, each from where the template's prompt for it ends
     through the special token that ends it (`<|im_end|>`, `<|eot_id|>`), so that the
     model learns to stop. A conversation with nothing to learn is dropped. Like
-    `text`, it is prepared once into rows by the run's `packing`."""
+    `text`, it is prepared once into rows by the run's `packing`.
+
+    With `images`, a part ``{type: image, image: ...}`` of a message is an image: a
+    path, relative to the working directory, its bytes, or Hugging Face datasets'
+    ``{bytes, path}``; ``{type: image_url, image_url: {url}}`` takes a path or a
+    base64 ``data:`` URL. Its bytes are kept with the rows, and each row's images fit
+    in the run's ``patches_per_row``."""
 
     type: Literal["chat"] = "chat"
     path: str  # a glob of Parquet files, relative to the working directory
@@ -98,6 +128,9 @@ class ChatConfig(Config):
     # and template too.
     train_on: Literal["assistant", "last", "all"] = "assistant"
     split: Split = (0.0, 1.0)  # the conversations whose hash falls in [start, end)
+    # How images in the messages become tokens and patches; none: a conversation's
+    # images are an error.
+    images: ImagesConfig | None = None
 
 
 class TokensConfig(Config):
@@ -611,6 +644,24 @@ class CheckpointConfig(Config):
     type: Literal["checkpoint"] = "checkpoint"
     every: Positive = 1000  # steps between saves
     keep: Positive = 2  # the most recent checkpoints to keep
+
+
+class PretrainedConfig(Config):
+    """Released weights a run starts from: a Hugging Face checkpoint, a Hub repo or a
+    folder, loaded layer by layer into the model (`bux.pretrained`).
+    ``hf(name="Qwen/Qwen3.5-0.8B")``.
+
+    The model's layers that hold parameters take the checkpoint's in the order they
+    run, and must match them in type and shape. A layer in `skip`, by type or by its
+    definition's name, keeps its fresh parameters instead, so a model can swap a
+    layer type for another, or add a layer, and load the rest. A run that resumes from its own checkpoint loads that one instead."""
+
+    type: Literal["hf"] = "hf"
+    name: str  # a Hub repo, "Qwen/Qwen3.5-0.8B", or a folder of a checkpoint
+    # The model's layers that start fresh, by type, as [gla] for a model whose
+    # attention is swapped for gated linear attention, or by definition, as [pool]
+    # for pool = linear(...).
+    skip: tuple[str, ...] = ()
 
 
 class WandbConfig(Config):
@@ -1256,6 +1307,9 @@ class TrainConfig(Config):
     optimizer: OptimizerConfig  # the update rule, with its peak learning rate
     schedule: ScheduleConfig = ConstantSchedule()  # the learning rate's multiplier
     seq_len: Annotated[int, Field(ge=2)]  # tokens per row
+    # Patches of images per row, which the rows of chat sources with images are packed
+    # to fit; none for data without images.
+    patches_per_row: Positive | None = None
     batch: Positive  # rows per step, over all devices
     # A smaller batch at the first steps, which grows to `batch`; none: none.
     batch_ramp: RampConfig | None = None
@@ -1271,6 +1325,11 @@ class TrainConfig(Config):
     # under names of their own; none: no eval.
     eval: Evals = None
     checkpoint: CheckpointConfig | None = None  # saves a run resumes from; none: none
+    # Released weights the run starts from; none: fresh ones, by the model's init.
+    weights: PretrainedConfig | None = None
+    # Definitions whose parameters do not train, by name: frozen = [vision] trains all
+    # but the vision encoder. Their gradients are still computed, and not applied.
+    frozen: tuple[str, ...] = ()
     log: LogConfig = LogConfig()  # metrics to the console, metrics.jsonl and trackers
     # Metrics of the model by layer every so many steps; none: none.
     observe: ObserveConfig | None = None
@@ -1291,6 +1350,7 @@ class TrainConfig(Config):
 Setting = Annotated[
     TextConfig
     | ChatConfig
+    | ImagesConfig
     | TokensConfig
     | SyntheticConfig
     | TokenizerConfig
@@ -1312,6 +1372,7 @@ Setting = Annotated[
     | LossConfig
     | EvalConfig
     | CheckpointConfig
+    | PretrainedConfig
     | LogConfig
     | WandbConfig
     | TensorBoardConfig

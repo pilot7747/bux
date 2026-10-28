@@ -132,7 +132,7 @@ type Model = {
 type Node = {                   // a node of the IR graph, as drawn
   id: string,                   // "n" for the root, "n.0.2" for child 2 of child 0
   kind: "layer"|"seq"|"residual"|"sum"|"prod"|"neg"|"const"|"identity"
-      | "repeat"|"tap"|"ref",
+      | "repeat"|"tap"|"ref"|"image",
   label: string | null,         // the definition it came from; a labeled non-layer
                                 // node is a block: drawn as a container, collapsible
   shared: boolean,              // `shared name = ...`: one module at every use
@@ -144,16 +144,17 @@ type Node = {                   // a node of the IR graph, as drawn
   title?: string,               // "Grouped-query attention"
   category?: Category,
   chips?: string[],             // ["32 heads", "8 KV heads", "RoPE 500k"]
-  width?: number | "tokens" | "streams",
+  width?: number | "tokens" | "pixels" | "streams",
   ports?: {name: string, tap: string, mode: "write"|"read"|"pop"}[],
   written?: [number, number] | null,  // where its config is written (the call)
   internals?: Node | null,      // what is inside it, Raschka's zoom; same schema
   inserted?: boolean,           // a merge the compiler inserted
-  // seq: items; sum: terms; prod: factors; residual/neg/repeat: body
+  // seq: items; sum: terms; prod: factors; residual/neg/repeat/image: body
   items?: Node[], terms?: Node[], factors?: Node[], body?: Node,
   times?: number,               // repeat
   value?: number,               // const
   name?: string, pop?: boolean, // tap, ref
+  token?: number,               // image: the id of its image tokens
 }
 type Category = "io"|"norm"|"attention"|"recurrent"|"ffn"|"experts"|"op"|"other"
 type Run = {

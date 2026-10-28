@@ -143,6 +143,69 @@ it on ChatML, add the template's tokens after the vocabulary
 `chat(path=..., template="HuggingFaceTB/SmolLM-135M-Instruct")`.
 :::
 
+### Images
+
+A chat source with `images=images(...)` reads conversations about images, for a
+vision-language model ([Vision encoders](../architectures/vision.md)). A part
+`{"type": "image", "image": ...}` of a message is an image, given as:
+
+- a path, relative to the working directory;
+- its bytes; or
+- Hugging Face datasets' `{"bytes": ..., "path": ...}`.
+
+A part `{"type": "image_url", "image_url": {"url": ...}}` takes a path or a base64
+`data:` URL.
+
+`bux prepare` resizes each image, keeping its aspect ratio, to between `min_pixels`
+and `max_pixels` pixels, with sides that are multiples of `size * merge`. The image is
+written into the conversation as `text`, and its `token` repeats once for each
+`merge` x `merge` block of patches. With Qwen's defaults, a page of 640 x 320 pixels
+is 40 x 20 patches of 16 pixels, and 200 tokens. The image tokens are never targets.
+The image's bytes are kept with the dataset, and the loader decodes and cuts them
+into patches as batches load.
+
+| Setting | Default | What it does |
+|---------|---------|--------------|
+| `size` | `16` | pixels on a side of a patch: the model's `patches(size=...)` |
+| `merge` | `2` | patches on a side of a block: the model's `merge_patches(size=...)` |
+| `min_pixels` | `65536` | the fewest pixels an image is resized to |
+| `max_pixels` | `16777216` | the most pixels an image is resized to; fewer make fewer tokens and patches |
+| `text` | `<\|vision_start\|><\|image_pad\|><\|vision_end\|>` | what an image is written as |
+| `token` | `<\|image_pad\|>` | the token of `text` that repeats, the model's `image(token=...)` |
+
+A run with images sets `patches_per_row`, the patches of images a row has room for.
+Rows are packed so that their images fit ([Packing](packing.md#documents-with-images)).
+This run fine-tunes Qwen3.5-0.8B on pages of text:
+
+```bux
+use "qwen3.5_0.8b"
+
+tokenizer = tokenizer(name="Qwen/Qwen3.5-0.8B", eos="<|im_end|>")
+data      = chat(path="pages.parquet", images=images(max_pixels=262144))
+patches_per_row = 2048
+seq_len   = 1024
+batch     = 8
+steps     = 100
+optimizer = adamw(lr=1e-5)
+weights   = hf(name="Qwen/Qwen3.5-0.8B")
+```
+
+```console
+$ bux prepare ocr.bux
+chat-617de057f4: 3 documents, 711 tokens -> 2 rows of 1024, 34.7% filled, 2.2% targets, 0 tokens cut (1.2s)
+data/packed/chat-617de057f4
+```
+
+Each page is 200 image tokens and 800 patches, so a row of 2048 patches holds two of
+them. The compiler checks that the model reads images, `image(...)`, and that its
+`patches` and `merge_patches` cut them as the data does. The run checks at its start
+that the tokenizer's id for `token` is the model's `image(token=...)`.
+
+:::{note}
+`bux prepare` keeps images; the Spark engine does not yet. A run with images trains
+without pipeline stages and without `methods(interleave=true)`.
+:::
+
 ## Token shards
 
 ```bux

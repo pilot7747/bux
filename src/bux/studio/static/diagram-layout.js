@@ -272,6 +272,8 @@ class Planner {
         return this.prod(node, c);
       case "neg":
         return this.chain([this.build(node.body, c), mark(node, "−", true, c)]);
+      case "image":
+        return this.chain([this.build(node.body, c), mark(node, "image", true, c)]);
       case "const":
         return mark(node, fmt(node.value), false, c);
       case "repeat":

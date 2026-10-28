@@ -26,6 +26,7 @@ run's directory or a file, and `bux studio` takes a file and no statements.
 
 ```sh
 bux export RUN_DIR OUT [--step N] [--dtype DTYPE] [--check]
+bux export RUN_DIR OUT --released [--step N]
 bux export FILE.bux OUT [SETTING=VALUE ...] [--entry NAME] [--dtype DTYPE]
 ```
 
@@ -39,6 +40,7 @@ bux export FILE.bux OUT [SETTING=VALUE ...] [--entry NAME] [--dtype DTYPE]
 | `--step N` | the latest | the checkpoint to export |
 | `--dtype DTYPE` | the parameters' dtype (`float32`); `bfloat16` for a file | the weights' dtype: `float32`, `bfloat16` or `float16` |
 | `--check` | | compare the export with bux on the run's weights, print what it measured, and exit 1 if they disagree ([What the check checks](../export/index.md#what-the-check-checks)) |
+| `--released` | | write the run as the released checkpoint its `weights = hf(...)` came from, for transformers' and vLLM's own code of the family ([As the released checkpoint](../export/index.md#as-the-released-checkpoint)) |
 
 It needs PyTorch, transformers and safetensors: the `export` extra, which a checkout
 installs by default. A model with a layer that does not export yet fails with the

@@ -70,6 +70,9 @@ ACTIVATIONS = frozenset(typing.get_args(cfg.Activation))
 #:
 #: :meta hide-value:
 RESIDUALS = _tags(cfg.ResidualConfig)
+#: The call that writes an encoder's outputs over a row's image tokens,
+#: ``image(vision, token=...)`` (`ir.Image`).
+IMAGE = "image"
 #: The inits that ``init = ...`` takes, by name.
 #:
 #: :meta hide-value:
@@ -86,6 +89,14 @@ _REQUIRED = tuple(
 # Settings of names that layers give what they make, which the compiler reads as
 # written (``_Evaluator.names``).
 _REMAT_NAMES = (("save",), ("offload",))
+# Settings of configs that name things, which they read as written: remat's names of
+# what layers make, and hf(skip=[gla, pool]): layer types and definitions.
+_NAMES: dict[type, tuple[tuple[str, ...], ...]] = {
+    tcfg.RematConfig: _REMAT_NAMES,
+    tcfg.PretrainedConfig: (("skip",),),
+}
+# Training settings that name definitions, which they read as written: frozen = [vision].
+_NAMED_SETTINGS = ("frozen",)
 _EXAMPLES = {
     "data": 'data = text(path="data/fineweb/*.parquet")',
     "optimizer": "optimizer = adamw(lr=3e-4)",
@@ -516,7 +527,7 @@ class _Evaluator:
         """Evaluate every definition but the macros, so that a mistake in any raises,
         or goes to `report`."""
         for name, st in self.statements.items():
-            if st.params is not None:
+            if st.params is not None or name in _NAMED_SETTINGS:
                 continue
             try:
                 self.definition(name)
@@ -925,6 +936,8 @@ class _Evaluator:
     # --- Calls ----------------------------------------------------------------------
 
     def call(self, expr: ast.Call, scope: dict[str, object]) -> object:
+        if expr.name == IMAGE and IMAGE not in scope and IMAGE not in self.statements:
+            return self.image(expr, scope)
         callee = self.lookup(expr.name, expr.name_span, scope)
         match callee:
             case _Macro(statement=st):
@@ -960,6 +973,24 @@ class _Evaluator:
             case _Bare(name=name):
                 raise self.unknown(name, expr.name_span, called=True)
         raise self.not_callable(expr, callee)
+
+    def image(self, expr: ast.Call, scope: dict[str, object]) -> ir.Node:
+        """Return ``image(encoder, token=...)``: the stream, its image tokens replaced
+        by the encoder's outputs on the row's images (`ir.Image`)."""
+        hint = "image(vision, token=248056): an encoder, and the image tokens' id"
+        body, token = None, None
+        for arg in expr.args:
+            if arg.key is None and body is None:
+                body = self.graph(self.eval(arg.value, scope), arg.value.span)
+            elif arg.key == ("token",):
+                token = _unwrap(self.eval(arg.value, scope))
+                if not isinstance(token, int) or isinstance(token, bool) or token < 0:
+                    raise BuxError("token is a token id, an integer from 0", arg.span)
+            else:
+                raise BuxError("image takes an encoder and token=...", arg.span, hint)
+        if body is None or token is None:
+            raise BuxError("image needs an encoder and token=...", expr.span, hint)
+        return self.node(ir.Image(body=body, token=token), expr.span)
 
     # --- Search dimensions and objectives ---------------------------------------------
 
@@ -1134,7 +1165,7 @@ class _Evaluator:
         seen: set[tuple[str, ...]] = set()
         for arg in expr.args:
             key = _new_key(arg, seen)
-            if cls is tcfg.RematConfig and key in _REMAT_NAMES:
+            if key in _NAMES.get(cls, ()):
                 fields.append((key, self.names(arg.value), arg.span))
                 continue
             value = self.eval(arg.value, scope)
@@ -1320,6 +1351,8 @@ class _Evaluator:
             raise _Reported()
         if st is None:
             return None, None
+        if name in _NAMED_SETTINGS:  # names of definitions, as written
+            return self.names(st.body), st.body.span
         return self.data(self.definition(name), st.body.span), st.body.span
 
 
@@ -1476,7 +1509,28 @@ class _Lowering:
                 return node, width
             case ir.Ref(name=name, pop=pop):
                 return node, self.read_hidden(name, pop)
+            case ir.Image(body=body):
+                return self.image(node, body, width)
         raise AssertionError(node)
+
+    def image(
+        self, node: ir.Node, body: ir.Node, width: ir.Width
+    ) -> tuple[ir.Node, ir.Width]:
+        if self.widened:
+            raise self.error("image(...) does not run under a residual algebra")
+        if width != self.d_model:
+            raise self.error(
+                f"image(...) writes over the stream's tokens, d_model = {self.d_model} "
+                f"wide, but the stream here is {width}",
+                "write it after the embedding: embed image(...) ...",
+            )
+        typed, out = self.lower(body, "pixels")
+        if out != self.d_model:
+            raise self.error(
+                f"an encoder ends d_model = {self.d_model} wide, but this one ends {out}",
+                f"end it with linear(features={self.d_model})",
+            )
+        return ir.replace_children(node, (typed,)), width
 
     def seq(
         self, node: ir.Node, items: tuple[ir.Node, ...], width: ir.Width
@@ -1650,11 +1704,26 @@ class _Lowering:
                 raise self.error("an embedding takes token ids, so it must come first")
             self.embeddings += 1
             return "streams" if self.widened and self.depth == 0 else self.d_model
+        if isinstance(config, cfg.PatchesConfig):
+            if width != "pixels":
+                raise self.error(
+                    "patches embeds an image's pixels, so it starts an encoder",
+                    "image(patches(...) ..., token=...)",
+                )
+            return config.features
         if width == "tokens":
             raise self.error(
                 f"{config.type} needs hidden states, but receives token ids",
                 "start with an embedding",
             )
+        if width == "pixels":
+            raise self.error(
+                f"{config.type} needs hidden states, but receives pixels",
+                "start an encoder with patches(...)",
+            )
+        if isinstance(config, cfg.MergePatchesConfig):
+            assert isinstance(width, int)
+            return width if config.pool == "mean" else width * config.size**2
         if isinstance(config, cfg.LMHeadConfig):
             self.heads += 1
             if config.tied and self.spans:
@@ -1801,6 +1870,8 @@ def _train(
     _check_schedule(train, spans)
     _check_curriculum(train, spans)
     _check_tokenizer(train, spans)
+    _check_images(train, arch, spans)
+    _check_frozen(train, arch, spans)
     _check_positions(train, arch, spans)
     _check_objective(train, spans)
     return train
@@ -1906,6 +1977,112 @@ def _check_tokenizer(train: tcfg.TrainConfig, spans: dict[str, Span]) -> None:
                 f"{' and '.join(kinds)} data is tokenized, so the run needs a tokenizer",
                 spans[name],
                 'tokenizer = tokenizer(name="gpt2")',
+            )
+
+
+def _check_images(
+    train: tcfg.TrainConfig, arch: ir.Architecture | None, spans: dict[str, Span]
+) -> None:
+    """Check that a run whose chat sources have images has room for their patches,
+    in whole blocks, packs them whole, and has an encoder whose patches and blocks
+    are theirs; and that a run with room for patches has an encoder."""
+    reads = [("data", train.data)] + [("eval", e.data) for e in tcfg.evals(train)]
+    reads += [("curriculum", p.data) for p in train.curriculum if p.data is not None]
+    found = [
+        (name, s.images)
+        for name, data in reads
+        for s in tcfg.leaves(data)
+        if isinstance(s, tcfg.ChatConfig) and s.images is not None
+    ]
+    encoders = encoders_of(arch)
+    if train.patches_per_row is not None and arch is not None and not encoders:
+        raise BuxError(
+            "patches_per_row makes room for images, but the model reads none",
+            spans["patches_per_row"],
+            "write them into the stream: model = embed image(vision, token=...) ...",
+        )
+    if not found:
+        if train.patches_per_row is not None:
+            raise BuxError(
+                "patches_per_row makes room for images, but the data has none",
+                spans["patches_per_row"],
+                "patches_per_row = none",
+            )
+        return
+    name = found[0][0]
+    if train.patches_per_row is None:
+        raise BuxError(
+            "the data has images, so each row needs room for their patches",
+            spans[name],
+            "patches_per_row = 16384",
+        )
+    if isinstance(train.packing, tcfg.ConcatPacking):
+        raise BuxError(
+            "documents with images are packed whole, not cut into windows",
+            spans.get("packing", spans[name]),
+            "packing = best_fit",
+        )
+    if not encoders:
+        raise BuxError(
+            "the data has images, but the model reads none",
+            spans[name],
+            "write them into the stream: model = embed image(vision, token=...) ...",
+        )
+    size, merge = cut_of(encoders[0])
+    for name, images in found:
+        for setting, theirs, ours in (
+            ("size", images.size, size),
+            ("merge", images.merge, merge),
+        ):
+            if theirs != ours:
+                raise BuxError(
+                    f"the data's images(...) cut {setting} = {theirs}, but the "
+                    f"model's encoder {setting} = {ours}",
+                    spans[name],
+                    f"images({setting}={ours})",
+                )
+    if train.patches_per_row % (merge * merge):
+        raise BuxError(
+            f"patches_per_row = {train.patches_per_row} is not whole blocks of "
+            f"{merge} x {merge} patches",
+            spans["patches_per_row"],
+            f"patches_per_row = {train.patches_per_row // merge**2 * merge**2}",
+        )
+
+
+def encoders_of(arch: ir.Architecture | None) -> list[ir.Image]:
+    """Return the image(...) nodes of `arch`, in the order written."""
+    if arch is None:
+        return []
+    return [n for n in ir.walk(arch.graph) if isinstance(n, ir.Image)]
+
+
+def cut_of(encoder: ir.Image) -> tuple[int, int]:
+    """Return how an encoder cuts images: the pixels on a side of its patches, and the
+    patches on a side of the blocks it merges, 1 without merge_patches."""
+    size, merge = 0, 1
+    for layer in ir.unrolled_layers(encoder.body):
+        if isinstance(layer.config, cfg.PatchesConfig):
+            size = layer.config.size
+        elif isinstance(layer.config, cfg.MergePatchesConfig):
+            merge *= layer.config.size
+    return size, merge
+
+
+def _check_frozen(
+    train: tcfg.TrainConfig, arch: ir.Architecture | None, spans: dict[str, Span]
+) -> None:
+    """Check that every name `frozen` gives is a definition of the model."""
+    if not train.frozen or arch is None:
+        return
+    labels = {n.label for n in ir.walk(arch.graph) if n.label is not None}
+    for name in train.frozen:
+        if name not in labels:
+            close = difflib.get_close_matches(name, sorted(labels), n=1)
+            raise BuxError(
+                f"frozen names '{name}', which no definition of the model is",
+                spans["frozen"],
+                f"did you mean '{close[0]}'?" if close else None,
             )
 
 

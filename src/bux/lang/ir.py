@@ -14,10 +14,12 @@ each a function of the incoming stream ``x``::
     Repeat      body applied `times` times     fresh parameters each time
     Tap         x, and pushes x onto the tap   @name
     Ref         top of the tap, ignoring x     $name; $name! also pops it
+    Image       x, image tokens replaced       image(encoder, token=...): the
+                by body(the row's patches)     encoder reads the images
 
 Branches of `Sum` and `Prod` run left to right, which only matters for taps. Every
-`Layer` knows its input `width`: an int, ``"tokens"`` for embeddings, or
-``"streams"`` for layers that act on a residual stream widened by the residual
+`Layer` knows its input `width`: an int, ``"tokens"`` for embeddings, ``"pixels"`` for
+an encoder's patch embedding, or ``"streams"`` for layers that act on a residual stream widened by the residual
 algebra. ``Residual`` is kept distinct from ``_ + body`` so that backends can swap
 the residual algebra (e.g. hyper-connections) for it alone.
 
@@ -41,10 +43,11 @@ from bux.train.config import PrecisionConfig, TrainConfig
 
 #: What a layer reads, as the compiler infers it.
 #:
-#: A width, ``"tokens"`` (ids, for an embedding), ``"logits"`` (after the LM head,
+#: A width, ``"tokens"`` (ids, for an embedding), ``"pixels"`` (patches, for a
+#: patch embedding), ``"logits"`` (after the LM head,
 #: which nothing follows), or ``"streams"``, a residual stream widened by the
 #: residual algebra (hc, mhc, gr, attnres).
-Width = int | Literal["tokens", "logits", "streams"]
+Width = int | Literal["tokens", "pixels", "logits", "streams"]
 
 
 class _Node(BaseModel):
@@ -161,14 +164,50 @@ class Ref(_Node):
     pop: bool = False
 
 
+class Image(_Node):
+    """``image(encoder, token=...)``: the stream, with each token whose id is `token`
+    replaced by the next of what `body`, the encoder, makes of the row's images.
+
+    The encoder reads the images' patches, in place of the stream, and returns one
+    vector, ``d_model`` wide, for each image token of the row, in order."""
+
+    kind: Literal["image"] = "image"
+    body: Node
+    token: int  # the id of the token each image's tokens are written with
+
+
 #: Any node of a graph, told apart by its ``kind`` when it is read from JSON.
 Node = Annotated[
-    Layer | Seq | Residual | Sum | Prod | Neg | Const | Identity | Repeat | Tap | Ref,
+    Layer
+    | Seq
+    | Residual
+    | Sum
+    | Prod
+    | Neg
+    | Const
+    | Identity
+    | Repeat
+    | Tap
+    | Ref
+    | Image,
     Field(discriminator="kind"),
 ]
 
 #: Every class of node, for ``isinstance(value, NODE_TYPES)``.
-NODE_TYPES = (Layer, Seq, Residual, Sum, Prod, Neg, Const, Identity, Repeat, Tap, Ref)
+NODE_TYPES = (
+    Layer,
+    Seq,
+    Residual,
+    Sum,
+    Prod,
+    Neg,
+    Const,
+    Identity,
+    Repeat,
+    Tap,
+    Ref,
+    Image,
+)
 
 for _cls in NODE_TYPES:
     _cls.model_rebuild()
@@ -221,7 +260,9 @@ def children(node: Node) -> tuple[Node, ...]:
             return items
         case Sum(terms=items) | Prod(factors=items):
             return items
-        case Residual(body=body) | Neg(body=body) | Repeat(body=body):
+        case (
+            Residual(body=body) | Neg(body=body) | Repeat(body=body) | Image(body=body)
+        ):
             return (body,)
         case _:
             return ()
@@ -256,7 +297,7 @@ def replace_children(node: Node, new: tuple[Node, ...]) -> Node:
             return node.model_copy(update={"terms": new})
         case Prod():
             return node.model_copy(update={"factors": new})
-        case Residual() | Neg() | Repeat():
+        case Residual() | Neg() | Repeat() | Image():
             return node.model_copy(update={"body": new[0]})
         case _:
             return node
@@ -294,7 +335,13 @@ _UNCOMPUTED |= {"objective", "search"}  # how a search ranks and proposes runs
 _NEWER = {"precision": PrecisionConfig(compute="float32")}
 # Settings newer than run ids that are not configs, at the values runs computed with
 # before them, dumped.
-_NEWER_VALUES = {"batch_ramp": None, "curriculum": []}
+_NEWER_VALUES = {
+    "batch_ramp": None,
+    "curriculum": [],
+    "weights": None,
+    "patches_per_row": None,
+    "frozen": [],
+}
 # Fields of a setting newer than run ids, by what runs computed before them.
 _NEWER_FIELDS = {
     "precision": {
@@ -333,7 +380,9 @@ _NEWER_LAYER_FIELDS = {
         "power_scale": None,
         "power_scale_length": 2048,
         "qk_norm_all_heads": False,
+        "causal": True,
     },
+    "rope": {"sections": None, "sections_layout": "blocks", "axial": None},
     "mla": {"gate_head_bias": False},
     "csa": {"gate_head_bias": False},
     "indexer": {"pool": "mean", "per_group": False, "relu": True},
@@ -341,6 +390,9 @@ _NEWER_LAYER_FIELDS = {
     "rmsnorm": {"gain_init": 1.0},
     "normal": {"embed": None, "head": None, "out": None},  # the model's init
 }
+# Fields of a data source newer than run ids, by its type, at what they read before
+# them.
+_NEWER_SOURCE_FIELDS = {"chat": {"images": None}}
 # How every weight matrix started before the model's `init` was a normal, and before
 # it could be set, as flax's layers start them: runs that set it keep their ids. But
 # routed experts', which started sqrt(E) times smaller, so that an MoE's id is new.
@@ -382,16 +434,19 @@ def _without_newer_fields(train: dict) -> dict:
     return train
 
 
-def _without_newer_layer_fields(node: Any) -> Any:
-    """`node`, part of an architecture dumped, without the `_NEWER_LAYER_FIELDS` that
-    compute as layers did before, at any depth: an MoE's experts are inside it."""
+def _without_newer_layer_fields(
+    node: Any, newer: dict[str, dict] = _NEWER_LAYER_FIELDS
+) -> Any:
+    """`node`, part of an architecture dumped, without the `newer` fields that compute
+    as layers did before, at any depth: an MoE's experts are inside it. With
+    `_NEWER_SOURCE_FIELDS`, the same of training settings' data sources."""
     if isinstance(node, list):
-        return [_without_newer_layer_fields(n) for n in node]
+        return [_without_newer_layer_fields(n, newer) for n in node]
     if not isinstance(node, dict):
         return node
-    before = _NEWER_LAYER_FIELDS.get(node.get("type"), {})
+    before = newer.get(node.get("type"), {})
     return {
-        k: _without_newer_layer_fields(v)
+        k: _without_newer_layer_fields(v, newer)
         for k, v in node.items()
         if not (k in before and v == before[k])
     }
@@ -437,7 +492,9 @@ class Run(BaseModel):
         # did before it, so that ids made before it resume.
         dumped = self.train.model_dump(mode="json", exclude=_UNCOMPUTED)
         dumped = _experts_as_they_run(self.arch, self.train, dumped)
-        train = _without_newer_fields(dumped)
+        train = _without_newer_layer_fields(
+            _without_newer_fields(dumped), _NEWER_SOURCE_FIELDS
+        )
         for setting, before in _NEWER.items():
             old = _without_newer_fields({setting: before.model_dump(mode="json")})
             if train[setting] == old[setting]:

@@ -55,6 +55,7 @@ from bux.architecture.repeats import remat
 from bux.lang import ir
 from bux.parallel.context import (
     AttentionArgs,
+    bidirectional,
     causal_mask,
     causal_mask_at,
     masked_softmax,
@@ -131,6 +132,7 @@ class SoftmaxAttention(nnx.Module):
         self.scale = (config.scale or qk_head_dim**-0.5) * logit_gain(config.rope)
         self.softcap = config.softcap
         self.window = config.sliding_window_size
+        self.causal = getattr(config, "causal", True)
         self.sinks = (
             nnx.Param(jnp.zeros(heads), names=("heads",)) if config.sinks else None
         )
@@ -161,7 +163,8 @@ class SoftmaxAttention(nnx.Module):
         (``remat.named``); `x` is for `FullLogits`."""
         ids = None if docs is None else docs.ids
         args = AttentionArgs(ids, self.window, self.scale, self.softcap, self._sinks())
-        method = parallel.method("attention")
+        method = parallel.method("attention") if self.causal else bidirectional
+        args = args._replace(causal=self.causal)
 
         def attend(
             q: Float[Array, "b t h dk"],
@@ -202,7 +205,7 @@ class SoftmaxAttention(nnx.Module):
         n = min(SAMPLED, t)
         at = jnp.arange(n) * (t // n) + t // n - 1
         ids = None if docs is None else (docs.ids[:, at], docs.ids)
-        mask = causal_mask_at(self.window, at, jnp.arange(s), ids)
+        mask = causal_mask_at(self.window, at, jnp.arange(s), ids, self.causal)
         mask = mask if mask.ndim == 2 else mask[:, None]  # b 1 n s, as the logits
         logits = softcap(scaled_logits(q[:, at], k, self.scale), self.softcap)
         probs = masked_softmax(logits, mask, self._sinks())
@@ -366,7 +369,7 @@ class Attention(SoftmaxAttention):
         """Return the queries, keys and values of the `projected` input, with the v
         port's values mixed in; the keys and values from the kv port if the layer
         reads it."""
-        pos = None if docs is None else docs.positions
+        pos = None if docs is None else docs.rotary
         q, *kv = projected
         q = self._queries(q, pos)
         if kv:
@@ -395,14 +398,14 @@ class Attention(SoftmaxAttention):
         return x, [checkpoint_name(p, "qkv") for p in projected]
 
     def _queries(
-        self, q: Float[Array, "b t _"], pos: Int[Array, "b t"] | None
+        self, q: Float[Array, "b t _"], pos: Int[Array, "b t *a"] | None
     ) -> Float[Array, "b t h dk"]:
         """Split the projected queries into heads with QK-norm and RoPE
         (`_split_normed`), then apply the power scale."""
         t = q.shape[1]
         q = self._split_normed(q, self.heads, self.q_norm, pos, "heads")
         if self.power_scale is not None:
-            at = jnp.arange(t) if pos is None else pos
+            at = jnp.arange(t) if pos is None else pos if pos.ndim == 2 else pos[..., 0]
             scale = _power_scale(at, self.power_scale, self.power_scale_length)
             q = (q * scale).astype(q.dtype)
         return shard_heads(q)
@@ -411,7 +414,7 @@ class Attention(SoftmaxAttention):
         self,
         k: Float[Array, "b s _"],
         v: Float[Array, "b s _"],
-        pos: Int[Array, "b s"] | None,
+        pos: Int[Array, "b s *a"] | None,
         taps: Taps,
     ) -> tuple[Float[Array, "b s g dk"], Float[Array, "b s g dv"]]:
         """Add the causal conv to the projected keys and values, and split them into
@@ -428,7 +431,7 @@ class Attention(SoftmaxAttention):
         x: Float[Array, "b t _"],
         heads: int,
         norm: Norm | None,
-        pos: Int[Array, "b t"] | None,
+        pos: Int[Array, "b t *a"] | None,
         name: parallel.Name,
     ) -> Float[Array, "b t n dk"]:
         """Split projected queries or keys into `heads` heads, then apply `norm` and
@@ -600,7 +603,8 @@ class FullLogits(SoftmaxAttention):
         return index[:, None] - index[None, :]
 
     def _mask(self, docs: Segments | None, t: int) -> Bool[Array, "*b t s"]:
-        return causal_mask(t, self.window, None if docs is None else docs.ids)
+        ids = None if docs is None else docs.ids
+        return causal_mask(t, self.window, ids, self.causal)
 
 
 def indexer_config(

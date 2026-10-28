@@ -54,6 +54,7 @@
  "GQAConfig": [
   "attention_dropout",
   "bias",
+  "causal",
   "fused_qkv",
   "gate_activation",
   "gate_head_bias",
@@ -298,10 +299,13 @@
   "type"
  ],
  "RoPEConfig": [
+  "axial",
   "base",
   "fraction",
   "layout",
   "scaling",
+  "sections",
+  "sections_layout",
   "type"
  ],
  "PositionInterpolationConfig": [
@@ -389,6 +393,19 @@
   "embed",
   "head",
   "out",
+  "type"
+ ],
+ "PatchesConfig": [
+  "features",
+  "grid",
+  "mean",
+  "size",
+  "std",
+  "type"
+ ],
+ "MergePatchesConfig": [
+  "pool",
+  "size",
   "type"
  ]
 }

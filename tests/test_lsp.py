@@ -50,6 +50,9 @@ def test_completes_the_settings_of_a_layer():
         "fraction",
         "layout",
         "scaling",
+        "sections",
+        "sections_layout",
+        "axial",
     ]
     item = next(
         c

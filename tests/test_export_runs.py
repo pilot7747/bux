@@ -183,7 +183,7 @@ def test_bux_export_writes_a_files_model_without_weights(tmp_path, capsys):
     assert (out / "modeling_bux.py").exists()
     assert not (out / "model.safetensors").exists()
     assert main(["export", str(file), str(out), "--check"]) == 1
-    assert "no weights to --step or --check" in capsys.readouterr().err
+    assert "no weights to --step, --check or --released" in capsys.readouterr().err
 
 
 @pytest.fixture(scope="module")

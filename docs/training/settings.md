@@ -38,6 +38,7 @@ fields and documents them on hover, as it does for layers
 | `optimizer` | {bux}`adamw` or {bux}`muon` | required | the update rule ([Optimizers](optimizers.md)) |
 | `schedule` | {bux}`constant`, {bux}`cosine`, {bux}`wsd`, {bux}`linear_decay`, {bux}`multistep`, {bux}`power` or {bux}`piecewise` | `constant` | what multiplies the learning rate at each step ([Schedules](optimizers.md#schedules)) |
 | `seq_len` | an integer, at least 2 | required | tokens per row |
+| `patches_per_row` | a positive integer, or `none` | `none` | patches of images per row, for chat data with images ([Images](../data/sources.md#images)) |
 | `batch` | a positive integer | required | rows per step, over all devices |
 | `batch_ramp` | {bux}`ramp`, or `none` | `none` | a smaller batch at the first step that grows to `batch` ([Batch ramps](curriculum.md#batch-ramps)) |
 | `steps` | a positive integer | required | optimizer steps |
@@ -47,6 +48,8 @@ fields and documents them on hover, as it does for layers
 | `loss` | {bux}`loss` | `loss` | the weights of the z-loss and of multi-token prediction ([The loss](optimizers.md#the-loss)) |
 | `eval` | {bux}`eval`, a list of them, or `none` | `none` | held-out loss and bits per byte every so many steps, one held-out set per eval ([Eval](running.md#eval)) |
 | `checkpoint` | {bux}`checkpoint`, or `none` | `none` | saves a run resumes from ([Checkpoints](running.md#checkpoints)) |
+| `weights` | {bux}`hf`, or `none` | `none` | released weights the run starts from ([Starting from released weights](pretrained.md)) |
+| `frozen` | a list of definitions | `[]` | definitions whose parameters do not train ([Training part of a model](pretrained.md#training-part-of-a-model)) |
 | `log` | {bux}`log` | `log` | the metrics every `every` steps (10 by default), and the trackers they go to ([The log](running.md#the-log), [Trackers](observing.md#trackers)) |
 | `observe` | {bux}`observe`, or `none` | `none` | the model layer by layer every so many steps ([Observing a run](observing.md)) |
 | `profile` | {bux}`profile`, or `none` | `none` | a trace of a few steps, by jax.profiler, nsys or ncu ([Profiling](../performance/profiling.md)) |

@@ -8,6 +8,7 @@ The model is a tree of scopes, each a module of its own (a generated class):
 
 - the model's, at ``model.``;
 - each repeat's body, a list of them at ``<scope>.<name>.<pass>.``;
+- each ``image(...)``'s encoder, at ``<scope>.<name>.``, named by its label;
 - each shared definition's, once, at ``model.shared.<key>``, which every use calls.
 
 A scope names its layers and repeats by their labels (``attn``, ``norm_1``), and the
@@ -96,7 +97,8 @@ class Scope:
         names: The attribute of each layer, repeat and residual algebra's branch in
             it, by its `Pos`; a shared node in it is a call of ``model.shared``, not
             named here.
-        blocks: The scope of each repeat's body, by the repeat's `Pos`; none for a
+        blocks: The scope of each repeat's body, and of each image(...)'s encoder,
+            by the node's `Pos`; none for a
             repeat of a shared body, which calls it each pass.
         depth: How many residual branches are around its root: for a shared
             definition, around its first use, where bux builds it.
@@ -264,6 +266,9 @@ def scope(
                 if body.share is None:
                     hints[pos] = f"{body.label}s" if body.label else "blocks"
                     s.blocks[pos] = scope(body, own=False, algebra=algebra, depth=depth)
+            case ir.Image(body=body):
+                hints[pos] = body.label or "encoder"
+                s.blocks[pos] = scope(body, own=False, algebra=algebra, depth=depth)
             case _:
                 if isinstance(node, ir.Residual) and algebra and depth == 0:
                     hints[pos] = algebra
@@ -272,19 +277,26 @@ def scope(
                     visit(child, (*pos, i), inner)
 
     visit(root, (), depth)
-    if top and s.blocks and "layers" not in hints.values():
-        hints[max(s.blocks, key=lambda p: _passes(root, p))] = "layers"
+    repeats = [p for p in s.blocks if isinstance(_node_at(root, p), ir.Repeat)]
+    if top and repeats and "layers" not in hints.values():
+        hints[max(repeats, key=lambda p: _passes(root, p))] = "layers"
     for pos, hint in hints.items():
         s.names[pos] = s.name(hint)
     return s
 
 
-def _passes(root: ir.Node, pos: Pos) -> int:
-    """Return how many passes the repeat at `pos` under `root` makes."""
+def _node_at(root: ir.Node, pos: Pos) -> ir.Node:
+    """Return the node at `pos` under `root`."""
     for i in pos:
         root = ir.children(root)[i]
-    assert isinstance(root, ir.Repeat)
-    return root.times
+    return root
+
+
+def _passes(root: ir.Node, pos: Pos) -> int:
+    """Return how many passes the repeat at `pos` under `root` makes."""
+    node = _node_at(root, pos)
+    assert isinstance(node, ir.Repeat)
+    return node.times
 
 
 def _calls(
@@ -333,6 +345,11 @@ def _calls(
                         seen,
                         first,
                     )
+        case ir.Image(body=body):
+            inner = f"{prefix}{s.names[pos]}."
+            yield from _calls(
+                p, body, (), s.blocks[pos], (*trail, 0), inner, depth, seen, first
+            )
         case _:
             if isinstance(node, ir.Residual) and pos in s.names:
                 yield Branch(prefix + s.names[pos], trail, first)

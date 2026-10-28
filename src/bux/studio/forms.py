@@ -63,6 +63,13 @@ _KINDS = {
     ir.Repeat: ("repeat", "Fresh copies of a block in sequence: block^n."),
     ir.Tap: ("tap", "@name pushes the stream onto a tap."),
     ir.Ref: ("read", "$name reads the top of a tap, and $name! pops it."),
+    ir.Image: (
+        "image",
+        (
+            "An encoder of the row's images, image(f, token=...): its outputs replace "
+            "the image tokens."
+        ),
+    ),
 }
 
 

@@ -5,7 +5,7 @@ model it comes from, how to write it in a `.bux` file, and the settings that mat
 Come here to design a model, to transcribe one from a paper or a `config.json`, or to
 learn exactly what a setting does before you sweep it.
 
-To reproduce a published model, start from the [model zoo](model-zoo.md): 62 of them,
+To reproduce a published model, start from the [model zoo](model-zoo.md): 64 of them,
 each a file you can `use` and change. Every field of every layer is in the generated
 [language reference](../reference/language/layers.md); these pages link to its entries
 by name, as in {bux}`gqa`, instead of repeating its tables.
@@ -61,10 +61,13 @@ Every layer bux has, by role and page:
 | Channel mixer | transforms each position | [`mlp`, `gated_mlp`](layers.md#mlps); [`moe`](experts.md) |
 | Normalization | rescales each position | [`rmsnorm`, `layernorm`, `dyt`](layers.md#normalization) |
 | Input and output | tokens in, logits out | [`embed`, `head`, `nextn`](layers.md#embeddings-and-heads); [`engram`](layers.md#engram-hashed-n-gram-memory) |
+| Vision encoder | images in, written over image tokens | [`patches`, `merge_patches`, `image(...)`](vision.md) |
 | Plumbing | elementwise and structural | [`linear`, `act`, `scale`, `dropout`](layers.md#elementwise-layers); [`merge`](layers.md#merge) |
 
-Every layer keeps the width of the stream it reads, except three: `embed` maps token
-ids to `d_model`, `linear` maps to its `features`, and `head` maps to logits. (Under a
+Every layer keeps the width of the stream it reads, except five: `embed` maps token
+ids to `d_model`, `patches` maps pixels to its `features`, `merge_patches` joins
+patches into wider vectors, `linear` maps to its `features`, and `head` maps to
+logits. (Under a
 residual algebra that widens the stream, `merge` and `nextn` also move between one
 stream and several.) The compiler checks that every residual branch comes back to the
 width it started at.
@@ -121,6 +124,14 @@ bias.
 `engram`, `merge` and the elementwise layers.
 :::
 
+:::{grid-item-card} Vision encoders
+:link: vision
+:link-type: doc
+
+`image(...)`, `patches` and `merge_patches`: an encoder of images written over the
+image tokens, attention to the whole image, axial RoPE and M-RoPE.
+:::
+
 :::{grid-item-card} Initialization
 :link: initialization
 :link-type: doc
@@ -133,7 +144,7 @@ from GPT-2 to Mamba, and what the papers found.
 :link: model-zoo
 :link-type: doc
 
-62 example architectures, from GPT-2 to 2026's releases, each a file to `use`
+64 example architectures, from GPT-2 to 2026's releases, each a file to `use`
 and shrink.
 :::
 
@@ -162,6 +173,7 @@ attention
 recurrent
 experts
 layers
+vision
 initialization
 model-zoo
 ir-and-backends

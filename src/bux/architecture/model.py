@@ -1,6 +1,7 @@
 """The whole model: an Architecture built into one module from tokens to logits."""
 
 import jax
+import jax.numpy as jnp
 from flax import nnx
 from jaxtyping import Array, Float, Int
 
@@ -8,7 +9,7 @@ from bux import initializers
 from bux.architecture.common.segments import Segments
 from bux.architecture.graph import build_node
 from bux.architecture.logits import HeadOutput
-from bux.architecture.registry import Context, Loss, Stream, Taps
+from bux.architecture.registry import Context, Images, Loss, Stream, Taps
 from bux.architecture.repeats import tracing
 from bux.architecture.repeats.repeat import pipe_longest
 from bux.lang import ir
@@ -53,7 +54,10 @@ class Model(nnx.Module):
         self.main_branches = tracing.main_branches(arch.graph)  # precision.last
 
     def outputs(
-        self, tokens: Int[Array, "b t"], positions: Int[Array, "b t"] | None = None
+        self,
+        tokens: Int[Array, "b t"],
+        positions: Int[Array, "b t"] | None = None,
+        images: Images | None = None,
     ) -> list[Float[Array, "b t vocab"]]:
         """Return every head's logits, all at once; the graph's output if it has no
         head.
@@ -63,16 +67,21 @@ class Model(nnx.Module):
             positions: Each token's position in its document, from which the
                 documents packed into each row follow; None when each row is one
                 document.
+            images: The rows' images, which image(...) writes over their image
+                tokens; None for rows of text.
 
         Returns:
             The logits of every head, in the order the heads run, in the dtype the
             stream has; or, for a graph without a head, its output.
         """
-        y, taps = self._forward(tokens, positions, training=False)
+        y, taps = self._forward(tokens, positions, images, training=False)
         return [head.logits() for head in taps.heads] or [y]
 
     def heads(
-        self, tokens: Int[Array, "b t"], positions: Int[Array, "b t"] | None = None
+        self,
+        tokens: Int[Array, "b t"],
+        positions: Int[Array, "b t"] | None = None,
+        images: Images | None = None,
     ) -> list[HeadOutput]:
         """Return every head's output, from which the objective makes its logits a
         chunk at a time.
@@ -81,14 +90,18 @@ class Model(nnx.Module):
             tokens: The token ids, b rows of t.
             positions: Each token's position in its document; None when each row is
                 one document.
+            images: The rows' images; None for rows of text.
 
         Returns:
             Each head's input and projection, in the order the heads run.
         """
-        return self._forward(tokens, positions, training=False)[1].heads
+        return self._forward(tokens, positions, images, training=False)[1].heads
 
     def training_heads(
-        self, tokens: Int[Array, "b t"], positions: Int[Array, "b t"] | None = None
+        self,
+        tokens: Int[Array, "b t"],
+        positions: Int[Array, "b t"] | None = None,
+        images: Images | None = None,
     ) -> tuple[list[HeadOutput], list[Loss]]:
         """Return the heads' outputs, and the losses the layers report: a training
         step's forward.
@@ -101,23 +114,28 @@ class Model(nnx.Module):
             tokens: The token ids, b rows of t.
             positions: Each token's position in its document; None when each row is
                 one document.
+            images: The rows' images; None for rows of text.
 
         Returns:
             Each head's output, in the order the heads run, and the losses the
             layers reported, in the order they ran.
         """
-        taps = self._forward(tokens, positions, training=True)[1]
+        taps = self._forward(tokens, positions, images, training=True)[1]
         return taps.heads, taps.losses
 
     def _forward(
         self,
         tokens: Int[Array, "b t"],
         positions: Int[Array, "b t"] | None,
+        images: Images | None,
         training: bool,
     ) -> tuple[Stream, Taps]:
         """Run the graph; return its output, and the taps it leaves."""
         docs = None if positions is None else Segments.of(positions)
-        taps = Taps(tokens=tokens, segments=docs, training=training)
+        if images is not None:  # the text's RoPE positions are M-RoPE's
+            at = jnp.broadcast_to(jnp.arange(tokens.shape[1]), tokens.shape)
+            docs = (docs or Segments.of(at))._replace(axes=images.rope)
+        taps = Taps(tokens=tokens, segments=docs, training=training, images=images)
         with tracing.forward(self.main_branches):
             return self.graph(tokens, taps), taps
 

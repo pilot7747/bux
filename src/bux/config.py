@@ -181,6 +181,24 @@ class RoPEConfig(Config):
     # Llama), "interleaved" rotates dim 2i with 2i + 1 (GPT-J, Cohere).
     layout: Literal["half", "interleaved"] = "half"
     scaling: RoPEScalingConfig | None = None  # Context extension; None: none.
+    # Multimodal RoPE (M-RoPE, Qwen2-VL): how many of the rotated pairs turn by each
+    # axis of a token's position, in order (time, height, width): (11, 11, 10) in
+    # Qwen3.5. A token of text has one position on every axis. None: one axis.
+    sections: tuple[int, ...] | None = None
+    # How M-RoPE deals the pairs out: "blocks", each axis's pairs in a run (Qwen2-VL),
+    # or "interleaved", pair i to axis i mod the axes while that axis has pairs left
+    # (Qwen3-VL, Qwen3.5).
+    sections_layout: Literal["blocks", "interleaved"] = "blocks"
+    # Axial RoPE (a ViT's): the rotated pairs split into this many runs, each a RoPE
+    # of its own over one axis of the position, as rows then columns (2 in Qwen2-VL's
+    # vision encoder). None: one axis.
+    axial: Annotated[int, Field(ge=2)] | None = None
+
+    @model_validator(mode="after")
+    def _one_kind_of_axes(self) -> Self:
+        if self.sections is not None and self.axial is not None:
+            raise ValueError("a RoPE has sections (M-RoPE) or axial, not both")
+        return self
 
 
 class RelativeBiasConfig(Config):
@@ -534,6 +552,16 @@ class GQAConfig(QuadraticAttentionConfig):
             )
         return kv
 
+    @model_validator(mode="after")
+    def _bidirectional(self) -> Self:
+        """Check that attention to every key of a document has no window and no
+        indexer, whose selection of keys is causal."""
+        if not self.causal and self.sliding_window_size is not None:
+            raise ValueError("causal=false sees the whole document: it takes no window")
+        if not self.causal and self.indexer is not None:
+            raise ValueError("causal=false takes no indexer, whose keys are causal")
+        return self
+
     # Dims of each value head; None -> head_dim (MiMo-V2: 128 against 192).
     v_head_dim: int | None = None
     # Biases on the projections of the input: q, k, v and the gate (GPT-2, Qwen2).
@@ -547,6 +575,9 @@ class GQAConfig(QuadraticAttentionConfig):
     # head_dim channels and one of the keys', each with a gain per channel, before they
     # split into heads (MiniMax-M2, OLMo 2). Without qk_norm it does nothing.
     qk_norm_all_heads: bool = False
+    # Each query sees only the keys at and before it; false: every key of its document,
+    # as a vision encoder's patches see their whole image.
+    causal: bool = True
     rope: RoPEConfig | None = None  # Rotary embedding of q and k; None: no positions.
     # Queries scaled by (1 + n / power_scale_length) ** power_scale at their position n,
     # counted from 1, so that attention without RoPE stays sharp at long range (Beam's
@@ -896,6 +927,43 @@ class EmbeddingConfig(Config):
     dropout: float = 0.0  # Dropout rate of the embedding, in training.
 
 
+class PatchesConfig(Config):
+    """A patch embedding, the first layer of a vision encoder (Qwen2-VL, Qwen3.5):
+    each patch's pixels, normalized per channel, projected to `features` channels,
+    plus a learned position of its row and column. An encoder starts with one and is
+    the body of ``image(...)``, which runs it on the images of the row:
+    ``patches(size=16, features=768, grid=48)``."""
+
+    type: Literal["patches"] = "patches"
+    size: Positive  # Pixels on a side of a patch; each is 3 * size * size bytes.
+    features: Positive  # Output channels: the encoder's width.
+    # Learned positions: a grid x grid table, bilinearly resized to each image's grid
+    # of patches (Qwen3.5: 48); None: none.
+    grid: Positive | None = None
+    # Each channel's mean, of pixels from 0 to 1, subtracted before the projection
+    # (Qwen: 0.5).
+    mean: tuple[float, float, float] = (0.5, 0.5, 0.5)
+    # Each channel's standard deviation, which it is divided by (Qwen: 0.5, so that
+    # pixels span [-1, 1]).
+    std: tuple[float, float, float] = (0.5, 0.5, 0.5)
+
+
+class MergePatchesConfig(Config):
+    """Each square block of an image's patches joined into one: their channels side
+    by side, ``size * size`` times as wide (Qwen2-VL's merger), or their mean. The
+    encoder's output then has a token for each block. ``merge_patches(size=2)``.
+
+    The patches of a block come in Z-order (`bux.export.hf.pixels.patches`), so
+    ``merge_patches(size=2)`` twice merges the blocks ``merge_patches(size=4)`` does,
+    and the data's ``images(merge=...)`` is their product."""
+
+    type: Literal["merge_patches"] = "merge_patches"
+    size: Positive = 2  # Patches on a side of a block.
+    # concat: the patches' channels side by side, size * size times as wide; mean:
+    # their mean, as wide as a patch.
+    pool: Literal["concat", "mean"] = "concat"
+
+
 class LMHeadConfig(Config):
     """The language-model head: the stream to logits over the vocabulary,
     ``softcap(x W + b)``. Every head is an output of the model; nothing follows one
@@ -1181,6 +1249,8 @@ LayerConfig = Annotated[
     | ScaleConfig
     | DropoutConfig
     | EmbeddingConfig
+    | PatchesConfig
+    | MergePatchesConfig
     | LMHeadConfig
     | NextNConfig
     | EngramConfig

@@ -1,0 +1,110 @@
+# SkyPilot task that fine-tunes Qwen3.5-0.8B for OCR on rendered pages
+# (sky/ocr_smoke.bux), exports both runs of its sweep as Qwen3.5 checkpoints
+# (bux export --released), and reads 200 new pages with each, and with the released
+# model, in vLLM (sky/ocr_eval.py).
+#
+#   sky jobs launch sky/sky_ocr_eval.yaml
+#
+# Syncs the working directory, installs bux, runs `bux launch` on the target
+# cluster. Outputs go to node-local /cache; add an R2/S3 sync step to persist.
+#
+# If your base image already has CUDA-enabled JAX, remove the `uv pip install`
+# line and rely on `uv sync` alone.
+
+name: bux-ocr-eval
+
+workdir: .
+
+resources:
+  # Adjust to your quota: T4:1 for dev, A100:8 / H100:8 / B200:4 for real runs.
+  infra: k8s
+  accelerators: B200:1
+  cpus: 16
+  memory: 128
+  labels: {priority: normal}
+
+envs:
+  BUX_CACHE: /cache/bux
+  JAX_COMPILATION_CACHE_DIR: /cache/bux/jax
+
+setup: |
+  set -e
+
+  # Install bux and locked deps into /opt/venv.
+  uv sync --frozen --inexact
+
+  # Upgrade JAX to the CUDA wheel if the lockfile had the CPU-only version.
+  # Remove this if your base image already ships CUDA-enabled JAX.
+  uv pip install -U "jax[cuda12]"
+
+  # --- Export nvidia pip-package libraries ----------------------------------
+  # The nvidia-*-cu12 pip packages install .so files into site-packages.
+  # JAX's plugin needs them all on LD_LIBRARY_PATH (libcusparse depends on
+  # libnvjitlink, libcudart, etc. in other nvidia sub-packages).
+  /opt/venv/bin/python -c \
+    "import os,sysconfig,glob;site=sysconfig.get_paths()['purelib'];" \
+    "paths=glob.glob(os.path.join(site,'nvidia','*','lib'));" \
+    "print(':'.join(paths)+':'+os.environ.get('LD_LIBRARY_PATH',''))" \
+    > /tmp/jax_ld_path.txt
+
+  export LD_LIBRARY_PATH="$(cat /tmp/jax_ld_path.txt)"
+
+  # Verify GPU is visible.
+  /opt/venv/bin/python -c "import jax; print('JAX devices:', jax.devices())"
+
+run: |
+  set -euo pipefail
+
+  # Re-export nvidia libraries (setup env does not carry over to run).
+  /opt/venv/bin/python -c \
+    "import os,sysconfig,glob;site=sysconfig.get_paths()['purelib'];" \
+    "paths=glob.glob(os.path.join(site,'nvidia','*','lib'));" \
+    "print(':'.join(paths)+':'+os.environ.get('LD_LIBRARY_PATH',''))" \
+    > /tmp/jax_ld_path.txt
+
+  export LD_LIBRARY_PATH="$(cat /tmp/jax_ld_path.txt)"
+
+  export BUX_PATH=examples/architectures/qwen
+  OUT_DIR="/cache/bux/ocr/smoke"  # /cache outlives a job: a later one resumes it
+  mkdir -p "${OUT_DIR}" data/ocr
+
+  echo "=== vLLM and transformers, each in an environment of its own ==="
+  # The nodes' driver runs CUDA 12.8 (12.9 by minor version compatibility):
+  # vLLM's CUDA 12.9 build, and PyTorch's for 12.8.
+  uv venv /opt/vllm --python 3.12
+  uv pip install --python /opt/vllm/bin/python vllm==0.32.0 pyarrow \
+    --extra-index-url https://wheels.vllm.ai/0.32.0/cu129 \
+    --torch-backend=cu129 --index-strategy unsafe-best-match || true
+  uv venv /opt/hf --python 3.12
+  uv pip install --python /opt/hf/bin/python torch torchvision transformers \
+    pillow pyarrow accelerate --torch-backend=cu128
+
+  echo "=== train ==="
+  /opt/venv/bin/python sky/pages.py data/ocr/pages.parquet 2048
+  /opt/venv/bin/python sky/pages.py data/ocr/held_out.parquet 200 1
+  bux prepare sky/ocr_smoke.bux --cache "${BUX_CACHE}"
+  bux launch sky/ocr_smoke.bux --out "${OUT_DIR}" --cache "${BUX_CACHE}"
+  bux results sky/ocr_smoke.bux --out "${OUT_DIR}" || true
+
+  echo "=== export: as Qwen3.5 is, and as bux's own code ==="
+  for run in "${OUT_DIR}"/ocr_smoke_*/; do
+    bux export "${run}" "${OUT_DIR}/exported/$(basename "${run%/}")" --released
+    bux export "${run}" "${OUT_DIR}/own/$(basename "${run%/}")"
+  done
+  /opt/venv/bin/python -c "import pyarrow.parquet as pq; pq.write_table(pq.read_table('data/ocr/held_out.parquet').slice(0, 50), 'data/ocr/held_out_50.parquet')"
+
+  echo "=== read 200 new pages: transformers, then vLLM ==="
+  export VLLM_WORKER_MULTIPROC_METHOD=spawn  # CUDA is up before vLLM forks
+  models="Qwen/Qwen3.5-0.8B $(ls -d "${OUT_DIR}"/exported/*)"
+  for out in ${models}; do
+    /opt/hf/bin/python sky/ocr_eval.py "${out}" data/ocr/held_out.parquet "$(basename "${out}")" transformers
+  done
+  for out in "${OUT_DIR}"/own/*; do  # one page at a time: 50 of them
+    /opt/hf/bin/python sky/ocr_eval.py "${out}" data/ocr/held_out_50.parquet "$(basename "${out}") as bux's code" bux
+  done
+  for out in "${OUT_DIR}"/exported/*; do  # the same 50, for the comparison
+    /opt/hf/bin/python sky/ocr_eval.py "${out}" data/ocr/held_out_50.parquet "$(basename "${out}") as Qwen3.5" transformers
+  done
+  for out in ${models}; do
+    /opt/vllm/bin/python sky/ocr_eval.py "${out}" data/ocr/held_out.parquet "$(basename "${out}")" vllm || true
+  done

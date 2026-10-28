@@ -269,7 +269,7 @@ def cache_layer(c: dict, ports: list) -> tuple[str, dict] | None:
     sliding window keeps that window (``sliding_attention``); one with a conv on its
     keys and values keeps the conv's two states beside them (``hybrid``).
     """
-    if reads(ports, "kv"):
+    if reads(ports, "kv") or c.get("causal") is False:  # an encoder's keeps none
         return None
     conv = {"number_of_conv_states": 2} if c.get("kv_conv_size") else {}
     window = c["sliding_window_size"]
@@ -324,6 +324,8 @@ class SoftmaxAttention(nn.Module):
         """The masks it reads, as ``ctx.mask`` takes them."""
         if computes_logits(c):
             return [("sizes", None)]
+        if c.get("causal") is False:  # the encoder's own, of its images
+            return []
         w = c["sliding_window_size"]
         return [
             ("sizes", None),
@@ -416,6 +418,11 @@ class SoftmaxAttention(nn.Module):
         where the layer computes its logits, keeps some keys, or reads keys a cache
         layer of another window keeps."""
         q = q.transpose(1, 2)
+        if not self.is_causal:  # every key of its image
+            keep = ctx.mask("bidirectional")
+            return softmax_attention(
+                q, kv.k, kv.v, keep, self.scale, self.softcap, self.sinks
+            )
         if self.computes_logits or kept is not None or self._foreign(kv, ctx):
             mask = ctx.mask("dense", (kv.slot, self.window))
             keep = mask.keep if kept is None else mask.keep & per_head(kept, self.h)
@@ -528,6 +535,7 @@ class Attention(SoftmaxAttention):
         dv = c["v_head_dim"] or dk
         super().__init__(c, width, site, h, dk, dv, c["bias"])
         self.g, self.dk = g, dk
+        self.is_causal = c["causal"]
         self.reads_kv = reads(site.ports, "kv")
         if self.reads_kv:
             check_reader(c, site.ports)
@@ -600,7 +608,7 @@ class Attention(SoftmaxAttention):
         then apply RoPE and the power scale."""
         q = self._split_normed(q, self.h, self.q_norm)
         if self.rope is not None:
-            q = self.rope(q, ctx.positions)
+            q = self.rope(q, ctx.rope_positions())
         power, length = self.power_scale
         if power is None:
             return q
@@ -618,7 +626,7 @@ class Attention(SoftmaxAttention):
         if self.k_conv is not None and self.v_conv is not None:
             k, v = k + self.k_conv(k, ctx, slot, 0), v + self.v_conv(v, ctx, slot, 1)
         k, v = self._split_normed(k, self.g, self.k_norm), v.view(b, t, self.g, self.dv)
-        return (k if self.rope is None else self.rope(k, ctx.positions)), v
+        return (k if self.rope is None else self.rope(k, ctx.rope_positions())), v
 
     def _split_normed(
         self, x: torch.Tensor, heads: int, norm: Norm | None

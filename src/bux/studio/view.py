@@ -203,6 +203,8 @@ class _Drawer:
                 out |= {"body": kids[0], "times": times}
             case ir.Residual() | ir.Neg():
                 out["body"] = kids[0]
+            case ir.Image(token=token):
+                out |= {"body": kids[0], "token": token}
             case ir.Const(value=value):
                 out["value"] = value
             case ir.Tap(name=name):

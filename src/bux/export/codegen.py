@@ -182,6 +182,8 @@ class Generator:
                 return c.let(f"ctx.read({name!r}, {pop})")
             case ir.Repeat():
                 return self.repeat(node, x, pos, s, c)
+            case ir.Image():
+                return self.image(node, x, pos, s, c)
         raise AssertionError(node)
 
     def residual(
@@ -235,6 +237,16 @@ class Generator:
         c.init.append(f"self.{attr} = nn.ModuleList({passes})")
         c.body += [f"for block in self.{attr}:", f"    {y} = block({y}, ctx)"]
         return y
+
+    def image(self, node: ir.Image, x: str, pos: Pos, s: Scope, c: _Class) -> str:
+        """``image(encoder, token=...)``: the encoder, a class of its own, and its
+        outputs spliced over the image tokens (`bux.export.hf.vision.splice`)."""
+        attr = s.names[pos]
+        label = node.body.label or "an image encoder"
+        cls = self.scope(s.blocks[pos], f"Encoder{len(self.classes)}", label)
+        c.init.append(f"self.{attr} = {cls}(config, prefix + {attr + '.'!r})")
+        self.imports |= {("vision", "splice"), ("vision", "rope_positions")}
+        return c.let(f"splice({x}, self.{attr}, ctx, {node.token})")
 
     def model(self) -> _Class:
         """Generate the model's forward: its graph, which stops after the first head
@@ -333,6 +345,7 @@ class BuxModel(BuxPreTrainedModel):
         past_key_values: Any = None,
         use_cache: bool | None = None,
         all_heads: bool = False,
+        images: Any = None,
         **kwargs: Any,
     ) -> tuple[list[torch.Tensor], Any]:
         b, t = input_ids.shape
@@ -344,6 +357,7 @@ class BuxModel(BuxPreTrainedModel):
             position_ids = position_ids[None].expand(b, t)
         ctx = Ctx(input_ids, position_ids, attention_mask, past_key_values, self.shared, make_mask)
         ctx.dtype, ctx.config = self.dtype, self.config
+        {images}
         for kind, arg in MASKS:
             ctx.mask(kind, arg)
         x = input_ids
@@ -374,14 +388,27 @@ class BuxForCausalLM(BuxPreTrainedModel, GenerationMixin):
         past_key_values: Any = None,
         use_cache: bool | None = None,
         logits_to_keep: int = 0,
+        images: Any = None,
         **kwargs: Any,
     ) -> CausalLMOutputWithPast:
         heads, cache = self.model(
-            input_ids, attention_mask, position_ids, past_key_values, use_cache, **kwargs
+            input_ids,
+            attention_mask,
+            position_ids,
+            past_key_values,
+            use_cache,
+            images=images,
+            **kwargs,
         )
         logits = heads[0][:, -logits_to_keep:] if logits_to_keep else heads[0]
         return CausalLMOutputWithPast(logits=logits, past_key_values=cache)
 '''
+
+
+#: What a model that reads images does before its graph: it takes the pass's images
+#: (on a generation's first pass), and the M-RoPE positions of its tokens.
+IMAGES = """ctx.images = images if images is not None and seen == 0 else None
+        ctx.rotary = rope_positions(ctx, images, seen)"""
 
 
 def modeling(plan: Plan, masks: list[tuple[str, object]]) -> str:
@@ -399,6 +426,7 @@ def modeling(plan: Plan, masks: list[tuple[str, object]]) -> str:
     code = MODEL.replace("{shared}", shared)
     code = code.replace("{init}", "\n        ".join(top.init) or "pass")
     code = code.replace("{body}", "\n        ".join(top.body))
+    code = code.replace("{images}", IMAGES if ("vision", "splice") in g.imports else "")
     used = {(c.__module__.rsplit(".", 1)[1], c.__name__) for c in _used(plan)}
     imports = sorted(used | g.imports)
     lines = [f"from .{m} import {n}" for m, n in imports]

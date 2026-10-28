@@ -104,6 +104,32 @@ above is within 3e-7 of bux, and so is its bfloat16 export (Mac CPU, normal init
 faster ([Float32 and depth](#float32-and-depth)). Greedy tokens must match exactly;
 only a tie between the two top logits closer than float32's error could flip one.
 
+### As the released checkpoint
+
+A run that started from released weights (`weights = hf(...)`,
+[Starting from released weights](../training/pretrained.md)) exports as that
+checkpoint is: its tensors under the released names and in the released dtype,
+beside the released config, tokenizer, chat template and processor files.
+transformers and vLLM then load it with their own code of the family, with no remote
+code:
+
+```console
+$ bux export runs/ocr_all-382fec0951 exported/ --released
+```
+
+```python
+from transformers import Qwen3_5ForConditionalGeneration
+
+model = Qwen3_5ForConditionalGeneration.from_pretrained("exported/")
+```
+
+The model must still be of the released architecture: its layers that hold
+parameters are the checkpoint's, in order, by type, name and shape. A run that
+changed it, as one that swaps attention for `gla`, fails with the first layer that
+differs, and exports as above instead, with its encoder
+([Models that read images](#models-that-read-images)). A part of the checkpoint the model leaves out,
+as Qwen3.5's MTP module, is written as released, and `bux export` says so.
+
 ## Exporting an architecture
 
 Given a `.bux` file instead of a run, `bux export` writes the file's model without
@@ -174,7 +200,7 @@ naming the layer or the setting.
 |--------|--------------|
 | `embed`, `head`, `mlp`, `gated_mlp`, `linear`, `act`, `scale`, `dropout`, `layernorm`, `rmsnorm`, `dyt` | every setting and activation |
 | `moe` | every setting inference reads: the routers, group-limited routing, the load-balancing bias (`aux_free`, `smebu`), shared experts, LatentMoE, the expert norm, and experts of either MLP type. The routed experts run on transformers' experts implementations |
-| `gqa` | every setting and port: RoPE (`pi`, `llama3`, `yarn`; partial, interleaved), QK-norm per head or across all heads, biases, fused or separate projections, head dims, scale, sliding windows, sinks, softcap, gates, output norm, length scale, relative bias, the conv on keys and values, and the indexer; the `v`, `kv` and `index` ports. Dropout applies only in training |
+| `gqa` | every setting and port: RoPE (`pi`, `llama3`, `yarn`; partial, interleaved; M-RoPE's sections and axial RoPE), attention to the whole document (`causal=false`, an encoder's, which keeps no cache), QK-norm per head or across all heads, biases, fused or separate projections, head dims, scale, sliding windows, sinks, softcap, gates, output norm, length scale, relative bias, the conv on keys and values, and the indexer; the `v`, `kv` and `index` ports. Dropout applies only in training |
 | `indexer` | every setting inference reads: DSA's top-k keys, QSA's mean-pooled blocks, MSA's max-pooled blocks and per-group picks, plain or ReLU'd dot products, weighted or summed. Its loss applies only in training |
 | `mla` | every setting, the indexer and the `index` port; keys and values are cached as projected up from the latents |
 | `csa` | every setting, its candidate pools and the `kv`, `index` and `candidates` ports; the indexer, except max-pooled blocks, which bux does not build on compressed latents either. Every token's latents are cached, and the window is a mask over them |
@@ -185,12 +211,56 @@ naming the layer or the setting.
 | `engram` | on a single or a widened stream; its last tokens and its conv's input tail stay in the cache while decoding. A token's class is its id mod `vocab_classes`, as in bux |
 | `nextn` | on a single or a widened stream; every head's logits on whole sequences (`all_heads=True`), skipped during generation |
 | `merge` | yes |
+| `patches`, `merge_patches`, `image(...)` | every setting: an encoder of the row's images, its outputs over the image tokens ([Models that read images](#models-that-read-images)) |
 | residual algebras | `hc`, `mhc`, `gr`, `attnres`, `vpgate`, with every setting, single-pass included |
-| the graph | sequences, residual branches, sums, products, constants, negations, repeats, taps, shared definitions |
+| the graph | sequences, residual branches, sums, products, constants, negations, repeats, taps, shared definitions, `image(...)` |
 
 A few combinations of exported settings raise: an indexer together with
 `kv_conv_size`; a layer that reads a `kv` port and also has a `v` port or an indexer
 of its own; and candidate pools of a `csa` indexer with `block_size > 1`.
+
+## Models that read images
+
+A model with `image(...)` ([Vision encoders](../architectures/vision.md)) exports with
+its encoder, as a class of its own whose weights are under the encoder's name, as
+`model.vision.layers.3.vattn.q.weight`. The model then takes its images beside the
+token ids, as `images=`, in bux's layout (`vision.Images`). `vision.inputs` makes
+them from a prompt and its images, cut as the run's data cut them (`bux_images` in the
+config): each image resized and cut into patches, its image token repeated once for
+each block of patches, and the tokens' M-RoPE positions.
+
+```python
+import importlib
+
+import numpy as np
+from PIL import Image
+from transformers import AutoModelForCausalLM, AutoTokenizer
+
+model = AutoModelForCausalLM.from_pretrained("exported/", trust_remote_code=True)
+vision = importlib.import_module(type(model).__module__.rsplit(".", 1)[0] + ".vision")
+tokenizer = AutoTokenizer.from_pretrained("exported/")
+token = tokenizer.convert_tokens_to_ids("<|image_pad|>")
+prompt = tokenizer(
+    "<|im_start|>user\n<|vision_start|><|image_pad|><|vision_end|>"
+    "Read the text in the image.<|im_end|>\n<|im_start|>assistant\n"
+).input_ids
+page = np.asarray(Image.open("page.png").convert("RGB"))
+ids, images = vision.inputs(prompt, [page], token, model.config.bux_images)
+out = model.generate(input_ids=ids, images=images, max_new_tokens=256)
+```
+
+The encoder runs on the first pass of a generation, with the prompt. Each token after
+the prompt is at its index plus the prompt's M-RoPE offset on every axis, as Qwen2-VL
+places them, which the cache keeps between passes. A batch of prompts takes their
+images padded to as many patches per row, as bux's batches hold them. `--check`
+compares the export with bux on text alone; `tests/test_export_vision.py` compares
+their logits on a row of text and images, and their greedy generation from it.
+
+A model of Qwen3.5's architecture that started from its released weights also exports
+as the released checkpoint ([As the released checkpoint](#as-the-released-checkpoint)),
+for transformers' and vLLM's own code. A model whose architecture changed, as one
+whose attention is swapped for `gla`, exports here, with its encoder. Its vLLM plugin
+does not read images yet.
 
 ## What an export holds
 

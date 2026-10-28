@@ -44,7 +44,7 @@ from jax.typing import DTypeLike
 from jaxtyping import Array, Float, Int32, Shaped
 
 from bux import kernels, parallel, passes
-from bux.architecture import Model, Scanned, num_params
+from bux.architecture import Images, Model, Scanned, num_params
 from bux.architecture import observe as observing
 from bux.architecture.common.segments import Segments
 from bux.architecture.logits import HeadOutput
@@ -69,11 +69,14 @@ from bux.train import (
     xla,
 )
 from bux.train.config import (
+    ChatConfig,
     EvalConfig,
     PrecisionConfig,
+    PretrainedConfig,
     TrainConfig,
     evals,
     evaluated,
+    leaves,
 )
 from bux.train.data import Batch, batches, prefetch, training_batches
 from bux.train.hooks import Checkpoint, Eval, Hook, Later, Log, Profile
@@ -86,7 +89,7 @@ from bux.train.objective import (
     reported,
     target_mask,
 )
-from bux.train.optim import lr_multiplier, lr_schedule, optimizer
+from bux.train.optim import frozen_paths, lr_multiplier, lr_schedule, optimizer
 from bux.train.sinks import (
     JSONL,
     Console,
@@ -116,13 +119,21 @@ def forward(model: Model, batch: Batch) -> list[HeadOutput]:
 
         logits = forward(model, plain(ids))[0].logits()
     """
-    return model.heads(jnp.asarray(batch.input_ids), jnp.asarray(batch.position_ids))
+    tokens, positions = jnp.asarray(batch.input_ids), jnp.asarray(batch.position_ids)
+    return model.heads(tokens, positions, _images(batch))
 
 
 def training_forward(model: Model, batch: Batch) -> tuple[list[HeadOutput], list[Loss]]:
     """Return `forward`'s outputs in a training step, and the losses layers report."""
     tokens, positions = jnp.asarray(batch.input_ids), jnp.asarray(batch.position_ids)
-    return model.training_heads(tokens, positions)
+    return model.training_heads(tokens, positions, _images(batch))
+
+
+def _images(batch: Batch) -> Images | None:
+    """Return the batch's images as the model takes them; None for rows of text."""
+    if batch.images is None:
+        return None
+    return Images(*(jnp.asarray(x) for x in batch.images))
 
 
 def cast[M: nnx.Module](model: M, dtype: DTypeLike) -> M:
@@ -1293,11 +1304,15 @@ def train(
     with parallel.use(config.mesh, config.layout, methods):
         _check_shapes(stretches, config)
         _check_cpu_bfloat16(run)
+        _check_images(run)
         model = parallel.build(lambda: Model(run.arch, rngs=nnx.Rngs(config.seed)))
+        if (weights := config.weights) is not None and not _resumes(run, folder):
+            _load_weights(run, model, weights, echo)
         parallel.methods.prepare(run)
         precision = config.precision
+        frozen = frozen_paths(model, run.arch, config.frozen)
         tx = optimizer(
-            config.optimizer, multiplier, model, config.clip, precision.moments
+            config.optimizer, multiplier, model, config.clip, precision.moments, frozen
         )
         trainer = Trainer(
             model,
@@ -1362,6 +1377,34 @@ def _about(run: ir.Run, folder: Path, trainer: Trainer) -> list[str]:
         watched.append(f"checkpoint every {t.checkpoint.every}")
     watched += [config_to_source(c) for c in t.log.trackers]
     return [*lines, ", ".join(watched)]
+
+
+def _check_images(run: ir.Run) -> None:
+    """Raise for a run with images under methods that run the model in pieces of
+    their own, which do not carry the images (pipelines, interleaved microbatches)."""
+    config = run.train
+    if config.patches_per_row is None:
+        return
+    if parallel.pipeline.pipelined() or config.methods.interleave:
+        raise NotImplementedError(
+            "a run with images trains without pipeline stages and without "
+            "methods(interleave=true)"
+        )
+    from bux.data.tokenizer import load
+
+    found = [
+        s.images
+        for s in leaves(config.data)
+        if isinstance(s, ChatConfig) and s.images is not None
+    ]
+    encoders = [n for n in ir.walk(run.arch.graph) if isinstance(n, ir.Image)]
+    if found and encoders and config.tokenizer is not None:
+        token = load(config.tokenizer).special(found[0].token)
+        if token != encoders[0].token:
+            raise ValueError(
+                f"the tokenizer writes images with {found[0].token}, id {token}, but "
+                f"the model's image(...) reads token={encoders[0].token}"
+            )
 
 
 def _check_cpu_bfloat16(run: ir.Run) -> None:
@@ -1550,6 +1593,33 @@ def _hooks(
         )
         hooks.append(profile)
     return hooks
+
+
+def _resumes(run: ir.Run, folder: Path) -> bool:
+    """Return whether the run in `folder` resumes from a checkpoint of its own, which
+    replaces what its released weights would load."""
+    saves = folder / "checkpoints"
+    return (
+        run.train.checkpoint is not None
+        and saves.is_dir()
+        and any(p.name.isdigit() for p in saves.iterdir())
+    )
+
+
+def _load_weights(
+    run: ir.Run, model: Model, weights: PretrainedConfig, echo: Callable[[str], None]
+) -> None:
+    """Load the released weights `weights` into `model`, built from ``run.arch``."""
+    from bux import pretrained
+
+    if run.train.methods.repeat != "unroll":
+        raise ValueError(
+            f"weights load into unrolled repeats, but methods.repeat is "
+            f"{run.train.methods.repeat!r}; set methods = methods(repeat=unroll)"
+        )
+    start = time.perf_counter()
+    pretrained.load(model, run.arch, pretrained.read(weights.name), weights.skip)
+    echo(f"{run.name}: loaded {weights.name} in {time.perf_counter() - start:.1f}s")
 
 
 def _token_bytes(

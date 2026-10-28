@@ -146,6 +146,13 @@ Every training setting, its default, what is required, and the checks before
 anything runs.
 :::
 
+:::{grid-item-card} Starting from released weights
+:link: pretrained
+:link-type: doc
+
+Fine-tune a released checkpoint, or change part of one and train the rest.
+:::
+
 :::{grid-item-card} Optimizers and schedules
 :link: optimizers
 :link-type: doc
@@ -218,6 +225,7 @@ Why a run is a `.bux` file, and the config systems considered instead.
 :hidden:
 
 settings
+pretrained
 optimizers
 precision
 curriculum

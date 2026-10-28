@@ -41,7 +41,7 @@ Seq ['Layer', 'Repeat', 'Layer', 'Layer']
 
 ### Nodes
 
-A graph is a tree of 11 kinds of node, each a function of the incoming stream $x$:
+A graph is a tree of 12 kinds of node, each a function of the incoming stream $x$:
 
 | Node | Computes | Written |
 |------|----------|---------|
@@ -56,6 +56,7 @@ A graph is a tree of 11 kinds of node, each a function of the incoming stream $x
 | `Repeat` | `body` applied `times` times, fresh parameters each time | `f^n` |
 | `Tap` | `x`, and pushes `x` onto the tap | `@name` |
 | `Ref` | the top of the tap, ignoring `x`; with `pop`, also pops it | `$name`, `$name!` |
+| `Image` | `x`, each token `token` replaced by the next output of `body`, the encoder, on the row's images | `image(vision, token=248056)` |
 
 Besides its own fields, every node has:
 
@@ -64,8 +65,9 @@ Besides its own fields, every node has:
 
 A `Layer` also has:
 
-- `width`: the width of what it reads, an int, `"tokens"` for an embedding, or
-  `"streams"` for a stream widened by the residual algebra.
+- `width`: the width of what it reads, an int, `"tokens"` for an embedding,
+  `"pixels"` for an encoder's `patches`, or `"streams"` for a stream widened by the
+  residual algebra.
 - `ports`: the taps it writes or reads internal tensors through, each a
   {py:class}`bux.lang.ir.Port` of a `name` (the layer's port, as `v`), a `tap`, and a
   `mode` (`write`, `read` or `pop`).
@@ -239,6 +241,7 @@ to, convolved and embedded on its own.
 | `Neg`, `Const`, `Identity` | `Negate`, `Constant` (a scalar in the stream's dtype), `Identity` |
 | `Repeat` | the run's `methods.repeat` method |
 | `Tap`, `Ref` | `TapWrite` pushes the stream; `TapRead` returns the top, or pops it |
+| `Image` | `ImageSplice`: the encoder on the forward pass's images, its outputs over the image tokens ([Vision encoders](vision.md)) |
 
 A node with a share key is built once, and every use returns the same module. A
 builder gets a {py:class}`Context <bux.architecture.registry.Context>`, which counts the residual

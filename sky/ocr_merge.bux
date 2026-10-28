@@ -1,0 +1,35 @@
+# Fewer image tokens for OCR: Qwen3.5-0.8B fine-tuned on CORD-v2's receipts
+# (sky/cord.py), with an image token for each 2 x 2 patches, as released, or for each
+# 4 x 4: a quarter of the tokens. Two ways to join the released merger's tokens
+# 2 x 2 into one:
+#
+#   base:     as released, a token for each 2 x 2 patches;
+#   learned:  a new linear layer of their four, side by side (pool), from scratch;
+#   mean:     their mean, no new weights, so it starts near the released model.
+#
+#   bux launch sky/ocr_merge.bux
+use "qwen3.5_0.8b"
+
+pool   = linear(features=d_model, bias=true)
+tail   = base: _ | learned: merge_patches(size=2) pool | mean: merge_patches(size=2, pool=mean)
+vision = (patches(size=16, features=768, grid=48) ([vnorm vattn] [vnorm vffn])^12
+          vnorm merge_patches(size=2) linear(features=3072, bias=true) gelu
+          linear(features=d_model, bias=true) tail)
+
+tokenizer = tokenizer(name="Qwen/Qwen3.5-0.8B", eos="<|im_end|>")
+cut       = images(merge=base: 2 | learned: 4 | mean: 4, max_pixels=524288)
+train     = chat(path="data/cord/train.parquet", images=cut)
+held_out  = chat(path="data/cord/validation.parquet", images=cut)
+weights   = hf(name="Qwen/Qwen3.5-0.8B", skip=[pool])
+
+data      = train
+packing   = best_fit(long=drop)
+patches_per_row = 4096
+seq_len   = 2048
+batch     = 8
+steps     = 200
+optimizer = adamw(lr=1e-5, weight_decay=0.0)
+schedule  = cosine(warmup=10)
+log       = log(every=10)
+eval      = eval(data=held_out, every=50)
+checkpoint = checkpoint(every=200)

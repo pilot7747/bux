@@ -3,7 +3,7 @@
     from pyspark.sql import SparkSession
 
     from bux.data import spark
-    from bux.data.pipeline import jobs
+    from bux.data.pipeline import jobs, images_of
     from bux.lang import compile_runs
 
     [run] = compile_runs(open("examples/experiments/speedrun.bux").read())
@@ -23,7 +23,7 @@ from pyspark.sql import DataFrame, SparkSession
 from pyspark.sql import functions as F
 
 from bux.data import documents, packing
-from bux.data.pipeline import Job, shift
+from bux.data.pipeline import Job, images_of, shift
 from bux.data.tokenizer import load
 
 
@@ -50,7 +50,12 @@ def rows(job: Job, records: DataFrame) -> tuple[DataFrame, dict]:
     Returns:
         A DataFrame of rows in `bux.data.packing.SCHEMA`, and a dict of
         ``docs`` and ``tokens``.
+
+    Raises:
+        NotImplementedError: The source has images, which only `bux prepare` keeps.
     """
+    if images_of(job.source) is not None:
+        raise NotImplementedError("a source with images is prepared by bux prepare")
     docs = records.select(job.source.column).mapInArrow(job.map, _ddl(documents.SCHEMA))
     docs = docs.persist()
     counted = docs.agg(F.count("*"), F.sum(F.size("input_ids"))).first()

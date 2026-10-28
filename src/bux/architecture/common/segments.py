@@ -36,6 +36,15 @@ class Segments(NamedTuple):
     ids: Int[Array, "b t"]
     #: How many tokens of its document come before each token.
     within: Int[Array, "b t"]
+    #: The positions RoPE turns by where they have several axes, the last dimension:
+    #: M-RoPE's time, height and width, an encoder's rows and columns
+    #: (`~bux.architecture.attention.rope.angles`); None: `positions`.
+    axes: Int[Array, "b t a"] | None = None
+
+    @property
+    def rotary(self) -> Int[Array, "b t"] | Int[Array, "b t a"]:
+        """Return the positions RoPE turns by: `axes`, else `positions`."""
+        return self.positions if self.axes is None else self.axes
 
     @classmethod
     def of(cls, positions: Int[Array, "b t"]) -> "Segments":

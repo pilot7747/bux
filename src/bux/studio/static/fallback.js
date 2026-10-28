@@ -5,7 +5,7 @@
 import { h } from "./dom.js";
 import { children } from "./nodes.js";
 
-const KIND_TEXT = { residual: "[ ]  residual", sum: "+  sum", prod: "×  product", neg: "−  negation", seq: "sequence", identity: "_  identity" };
+const KIND_TEXT = { residual: "[ ]  residual", sum: "+  sum", prod: "×  product", neg: "−  negation", image: "image", seq: "sequence", identity: "_  identity" };
 
 function missing(file) {
   return h("div.fb-note", {}, h("code", {}, file), " is not loaded: a plain outline stands in.");

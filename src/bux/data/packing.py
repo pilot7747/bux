@@ -7,6 +7,10 @@ one gather, so a chunk is written one row group at a time.
 `Docs.of` reads a chunk's documents, `plan` packs them as the run's packing says
 (``concat``, ``greedy`` or ``best_fit``), and `materialize` writes the planned rows
 in `SCHEMA`.
+
+Documents with images (`bux.data.documents.IMAGE_SCHEMA`) are packed whole: a row
+also holds no more patches than its room for them, and a document that fits in no
+row is dropped. Their rows, in `IMAGE_SCHEMA`, say which image each token stands for.
 """
 
 import itertools
@@ -35,6 +39,12 @@ SCHEMA = pa.schema(
     ]
 )
 
+#: The rows of a dataset with images: `SCHEMA`, and ``image``, the key of the image
+#: each token stands for, 0 for a token of text (`bux.data.images.Store`).
+#:
+#: :meta hide-value:
+IMAGE_SCHEMA = SCHEMA.append(pa.field("image", pa.list_(pa.int64())))
+
 
 def flat(
     column: pa.ChunkedArray,
@@ -55,26 +65,41 @@ class Docs:
         positions: Each token's position in its document, or in the padding.
         offsets: n + 1 offsets: where each document starts, and then where the
             padding does.
+        image: Each token's image's key, 0 for text, then the padding's 0; None for
+            documents without images.
+        patches: Each document's patches; None without images.
     """
 
     ids: Int32[np.ndarray, " tokens"]
     mask: Bool[np.ndarray, " tokens"]
     positions: Int32[np.ndarray, " tokens"]
     offsets: Int64[np.ndarray, " _"]
+    image: Int64[np.ndarray, " tokens"] | None = None
+    patches: Int64[np.ndarray, " docs"] | None = None
 
     @classmethod
-    def of(cls, table: pa.Table, length: int) -> "Docs":
+    def of(cls, table: pa.Table, length: int, merge: int | None = None) -> "Docs":
         """Return the documents of `table` (in the map's schema, in any order),
-        sorted by key, with a row of `length` tokens of padding after them."""
+        sorted by key, with a row of `length` tokens of padding after them; with
+        `merge`, the patches on a side of a block an image token stands for, their
+        images too."""
         table = table.sort_by("key")  # whatever order an engine delivered them in
         ids, offsets = flat(table["input_ids"])
         mask, _ = flat(table["loss_mask"])
         positions = np.arange(len(ids)) - np.repeat(offsets[:-1], np.diff(offsets))
+        image = patches = None
+        if merge is not None:
+            image = flat(table["image"])[0].astype(np.int64)
+            tokens = np.add.reduceat(image != 0, offsets[:-1]) if len(ids) else []
+            patches = np.asarray(tokens, np.int64)[: len(offsets) - 1] * merge * merge
+            image = np.concatenate([image, np.zeros(length, np.int64)])
         return cls(
             np.concatenate([ids, np.zeros(length, np.int32)]),
             np.concatenate([mask, np.zeros(length, bool)]),
             np.concatenate([positions, np.arange(length)]).astype(np.int32),
             offsets,
+            image,
+            patches,
         )
 
 
@@ -168,6 +193,38 @@ def _best_fit(
     return rows
 
 
+def _fit_both(
+    sizes: Int[np.ndarray, " pieces"],
+    patches: Int[np.ndarray, " pieces"],
+    length: int,
+    room: int,
+    max_docs: int | None,
+    sort: bool,
+) -> list[list[int]]:
+    """Put each piece, longest first unless not `sort`, into the open row with the
+    least room for its tokens that also has room for its patches."""
+    order = np.argsort(-sizes, kind="stable") if sort else np.arange(len(sizes))
+    rows: list[list[int]] = []
+    open_rows: list[tuple[int, int]] = []  # (tokens of room, row), ascending
+    left: dict[int, int] = {}  # each open row's patches of room
+    for piece in order.tolist():
+        n, m = int(sizes[piece]), int(patches[piece])
+        i = bisect_left(open_rows, (n, -1))
+        while i < len(open_rows) and left[open_rows[i][1]] < m:
+            i += 1  # rows with room for the tokens, but not the patches
+        if i < len(open_rows):
+            tokens, row = open_rows.pop(i)
+        else:
+            tokens, row = length, len(rows)
+            rows.append([])
+            left[row] = room
+        rows[row].append(piece)
+        tokens, left[row] = tokens - n, left[row] - m
+        if tokens and len(rows[row]) != max_docs:
+            insort(open_rows, (tokens, row))
+    return rows
+
+
 def _layout(
     rows: list[list[int]],
     starts: Int[np.ndarray, " pieces"],
@@ -190,7 +247,36 @@ def _layout(
     )
 
 
-def plan(docs: Docs, config: tcfg.PackingConfig, length: int, seed: int) -> Plan:
+def _plan_with_images(
+    docs: Docs,
+    config: tcfg.PackingConfig,
+    length: int,
+    room: int | None,
+    rng: np.random.Generator,
+    stats: Counter,
+) -> Plan:
+    """Plan rows of whole documents with images, each row within `length` tokens and
+    `room` patches; a document that fits in no row is dropped."""
+    # The compiler checks both (`_check_images`).
+    assert docs.patches is not None and room is not None
+    assert not isinstance(config, tcfg.ConcatPacking)
+    sizes = np.diff(docs.offsets)
+    fit = (sizes <= length) & (docs.patches <= room)
+    stats.update(dropped=int((~fit).sum()), cut=int(sizes[~fit].sum()))
+    starts, lengths, patches = docs.offsets[:-1][fit], sizes[fit], docs.patches[fit]
+    sort = isinstance(config, tcfg.BestFitPacking) and config.sort
+    rows = _fit_both(lengths, patches, length, room, config.max_docs, sort)
+    rows = [rows[i] for i in rng.permutation(len(rows))]
+    return _layout(rows, starts, lengths, length, int(docs.offsets[-1]), stats)
+
+
+def plan(
+    docs: Docs,
+    config: tcfg.PackingConfig,
+    length: int,
+    seed: int,
+    patches: int | None = None,
+) -> Plan:
     """Plan the rows of the documents in `docs`, in a random order.
 
     ``concat`` cuts the documents, end to end, into windows of `length` that
@@ -207,6 +293,8 @@ def plan(docs: Docs, config: tcfg.PackingConfig, length: int, seed: int) -> Plan
         config: The run's packing.
         length: The tokens of a row: the run's ``seq_len``.
         seed: Seeds the order of the rows; the pipeline passes the chunk's index.
+        patches: The patches of images a row has room for, for documents with
+            images.
 
     Returns:
         The plan, with its statistics so far.
@@ -220,6 +308,8 @@ def plan(docs: Docs, config: tcfg.PackingConfig, length: int, seed: int) -> Plan
         stats.update(rows=n, cut=tokens - (n * (length - 1) + 1 if n else 0))
         starts = rng.permutation(n) * (length - 1)
         return Plan(starts, np.full(n, length), np.arange(n + 1), stats)
+    if docs.patches is not None:  # whole documents, in rows of room for both
+        return _plan_with_images(docs, config, length, patches, rng, stats)
     starts, lengths, cuts = _pieces(docs, config.long, length)
     if isinstance(config, tcfg.BestFitPacking):
         rows = _best_fit(lengths, length, config.max_docs, config.sort)
@@ -265,7 +355,9 @@ def materialize(
         plan.stats["targets"] += int((mask & (positions > 0)).sum())
         bounds = pa.array(np.arange(0, len(at) + 1, length, dtype=np.int32))
         columns = [docs.ids[index], positions.astype(np.int32), mask]
+        if docs.image is not None:
+            columns.append(docs.image[index])
         yield pa.RecordBatch.from_arrays(
             [pa.ListArray.from_arrays(bounds, pa.array(c)) for c in columns],
-            schema=SCHEMA,
+            schema=SCHEMA if docs.image is None else IMAGE_SCHEMA,
         )

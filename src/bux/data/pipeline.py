@@ -42,7 +42,7 @@ import numpy as np
 import pyarrow as pa
 import pyarrow.parquet as pq
 
-from bux.data import documents, packing
+from bux.data import documents, images, packing
 from bux.data.tokenizer import load
 from bux.train import config as tcfg
 from bux.train import curriculum
@@ -71,6 +71,8 @@ class Job:
         tokenizer: The run's tokenizer.
         packing: The run's packing.
         seq_len: The tokens of a row.
+        patches_per_row: The patches of images a row has room for, for a chat source
+            with images; else None.
 
     Example::
 
@@ -83,6 +85,7 @@ class Job:
     tokenizer: tcfg.TokenizerConfig
     packing: tcfg.PackingConfig
     seq_len: int
+    patches_per_row: int | None = None
 
     @classmethod
     def of(
@@ -90,17 +93,24 @@ class Job:
     ) -> "Job":
         """Return the job that makes `source`'s dataset for a run of `config`."""
         assert config.tokenizer is not None, "the compiler requires one for documents"
-        return cls(source, config.tokenizer, config.packing, config.seq_len)
+        patches = config.patches_per_row if images_of(source) else None
+        return cls(source, config.tokenizer, config.packing, config.seq_len, patches)
 
     def describe(self) -> dict:
         """Return the job as JSON data, which `name` hashes and dataset.json keeps."""
-        return {
+        source = self.source.model_dump(mode="json")
+        if source.get("images", 0) is None:  # as a chat source was before images
+            del source["images"]
+        out = {
             "version": VERSION,
-            "source": self.source.model_dump(mode="json"),
+            "source": source,
             "tokenizer": self.tokenizer.model_dump(mode="json"),
             "packing": self.packing.model_dump(mode="json"),
             "seq_len": self.seq_len,
         }
+        if self.patches_per_row is not None:
+            out["patches_per_row"] = self.patches_per_row
+        return out
 
     @property
     def name(self) -> str:
@@ -147,12 +157,20 @@ class Job:
             `bux.data.packing.SCHEMA`, and the statistics, complete once every
             batch is read.
         """
-        d = packing.Docs.of(docs, self.seq_len)
-        plan = packing.plan(d, self.packing, self.seq_len, seed=chunk)
+        images = images_of(self.source)
+        d = packing.Docs.of(docs, self.seq_len, images.merge if images else None)
+        plan = packing.plan(
+            d, self.packing, self.seq_len, seed=chunk, patches=self.patches_per_row
+        )
         rows = packing.materialize(
             d, plan, self.seq_len, self.packing.doc_mask, self.group_rows
         )
         return rows, plan.stats
+
+
+def images_of(source: tcfg.TextConfig | tcfg.ChatConfig) -> tcfg.ImagesConfig | None:
+    """Return how a source's images become tokens and patches; None without images."""
+    return getattr(source, "images", None)
 
 
 def shift(chunks: int) -> int:
@@ -199,7 +217,8 @@ def _splits(path: str, size: int = 1 << 28) -> list[list[int]]:
 
 
 # A spill holds one map task's documents sorted by key, as raw arrays, so that a
-# reduce finds its keys by bisection and memory-maps only its own documents.
+# reduce finds its keys by bisection and memory-maps only its own documents. With
+# images, each token's image too, and the task's images (`bux.data.images.write_part`).
 _SPILLED = ("key", "offsets", "ids", "mask")
 
 
@@ -209,16 +228,25 @@ def _map(job: Job, task: tuple[str, list[int]], spill: Path) -> int:
     records = pq.ParquetFile(path).iter_batches(
         batch_size=4096, row_groups=groups, columns=[job.source.column]
     )
-    docs = pa.Table.from_batches(job.map(records), documents.SCHEMA).sort_by("key")
+    schema = documents.IMAGE_SCHEMA if images_of(job.source) else documents.SCHEMA
+    docs = pa.Table.from_batches(job.map(records), schema).sort_by("key")
     ids, offsets = packing.flat(docs["input_ids"])
     mask, _ = packing.flat(docs["loss_mask"])
     spill.mkdir()
     for name, a in zip(_SPILLED, (docs["key"].to_numpy(), offsets, ids, mask)):
         np.save(spill / f"{name}.npy", a)
+    if images_of(job.source):
+        np.save(spill / "image.npy", packing.flat(docs["image"])[0])
+        found = {
+            p["key"]: (p["key"], p["data"], (p["rows"], p["cols"]))
+            for ps in docs["images"].to_pylist()
+            for p in ps
+        }
+        images.write_part(spill, list(found.values()))
     return len(ids)
 
 
-def _take(spill: Path, chunk: int, chunks: int) -> pa.RecordBatch:
+def _take(spill: Path, chunk: int, chunks: int) -> pa.Table:
     """Read a chunk's documents from a spill."""
     key, offsets, ids, mask = (
         np.load(spill / f"{name}.npy", mmap_mode="r") for name in _SPILLED
@@ -230,11 +258,22 @@ def _take(spill: Path, chunk: int, chunks: int) -> pa.RecordBatch:
         else len(key)
     )
     lo, hi = offsets[a], offsets[b]
-    return documents.record_batch(
-        np.array(key[a:b]),
-        np.array(ids[lo:hi]),
-        offsets[a : b + 1] - lo,
-        np.array(mask[lo:hi]),
+    docs = pa.Table.from_batches(
+        [
+            documents.record_batch(
+                np.array(key[a:b]),
+                np.array(ids[lo:hi]),
+                offsets[a : b + 1] - lo,
+                np.array(mask[lo:hi]),
+            )
+        ]
+    )
+    if not (spill / "image.npy").exists():
+        return docs
+    image = np.array(np.load(spill / "image.npy", mmap_mode="r")[lo:hi])
+    bounds = pa.array((offsets[a : b + 1] - lo).astype(np.int32))
+    return docs.append_column(
+        "image", pa.ListArray.from_arrays(bounds, pa.array(image))
     )
 
 
@@ -242,9 +281,10 @@ def _reduce(
     job: Job, chunk: int, chunks: int, spills: list[Path], part: Path
 ) -> Counter:
     """Pack a chunk's documents, from every spill, into a Parquet file of rows."""
-    pieces = [_take(spill, chunk, chunks) for spill in spills]
-    rows, stats = job.reduce(chunk, pa.Table.from_batches(pieces, documents.SCHEMA))
-    with pq.ParquetWriter(part, packing.SCHEMA, compression="zstd") as out:
+    docs = pa.concat_tables([_take(spill, chunk, chunks) for spill in spills])
+    rows, stats = job.reduce(chunk, docs)
+    schema = packing.IMAGE_SCHEMA if images_of(job.source) else packing.SCHEMA
+    with pq.ParquetWriter(part, schema, compression="zstd") as out:
         for batch in rows:
             out.write_batch(batch)
     return stats
@@ -331,6 +371,8 @@ def prepare(
             ),
             Counter(),
         )
+        if images_of(job.source):
+            images.write_store(out, spills)
         meta = {"job": job.describe(), "files": files, "parts": parts} | {
             "vocab_size": load(job.tokenizer).vocab_size,
             "stats": stats,

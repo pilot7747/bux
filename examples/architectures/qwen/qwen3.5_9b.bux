@@ -1,0 +1,31 @@
+# Qwen3.5-9B (Alibaba, 2026): three Gated DeltaNet layers for every gated attention
+# layer, each followed by a dense SwiGLU MLP, with twice as many value heads as query
+# and key heads in the Gated DeltaNet. A ViT of 27 blocks reads the images, and
+# image(...) writes each one over its image tokens; the text's RoPE is M-RoPE, by
+# time, height and width. One MTP layer predicts the token after next.
+# `weights = hf(name="Qwen/Qwen3.5-9B")` starts a run from the released weights.
+d_model    = 4096
+vocab_size = 248320
+
+norm  = rmsnorm(zero_centered=true)
+delta = gdn(num_heads=16, num_v_heads=32, head_dim=128)
+attn  = gqa(num_heads=16, num_kv_heads=4, head_dim=256, gated=true, qk_norm=norm,
+            rope=rope(base=10000000, fraction=0.25, sections=[11, 11, 10],
+                      sections_layout=interleaved))
+ffn   = gated_mlp(intermediate_size=12288, activation=swish)
+
+vnorm  = layernorm(bias=true)
+vattn  = gqa(num_heads=16, num_kv_heads=16, bias=true, causal=false, rope=rope(axial=2))
+vffn   = mlp(intermediate_size=4304, activation=gelu_tanh, bias=true)
+vision = (patches(size=16, features=1152, grid=48) ([vnorm vattn] [vnorm vffn])^27
+          vnorm merge_patches(size=2) linear(features=4608, bias=true) gelu
+          linear(features=d_model, bias=true))
+
+layer(mixer) = [norm mixer] [norm ffn]
+D = layer(delta)
+A = layer(attn)
+
+shared out = head
+mtp = $h nextn(norm=norm) A norm out
+
+model = embed image(vision, token=248056) "DDDA"^8 norm @h out mtp

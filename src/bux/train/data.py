@@ -2,7 +2,8 @@
 
 A row is ``seq_len`` tokens: ``input_ids``, ``position_ids`` (where each token is in
 its document, so one starts wherever they stop increasing) and ``loss_mask`` (whether
-each token is a target). Every source is an endless stream of rows, each epoch in a
+each token is a target). A run with ``patches_per_row`` also reads each row's images
+(`Batch.images`), decoded and cut into patches as batches load. Every source is an endless stream of rows, each epoch in a
 new order. Batch i holds rows ``i * n`` to ``(i + 1) * n`` of each source, n of them
 in proportion to its weight, so it depends only on the seed and i: a run that resumes
 at step i reads what it would have read had it never stopped. Where the run's
@@ -18,6 +19,7 @@ through `prefetch`, which loads the next ones as a step runs::
 """
 
 import bisect
+import concurrent.futures
 import contextlib
 import functools
 import glob
@@ -34,11 +36,15 @@ import pyarrow.parquet as pq
 from jaxtyping import Array, Bool, Int, Int32, Integer, UInt64
 
 from bux import parallel
+from bux.data import images as pictures
 from bux.data.pipeline import DEFAULT_CACHE, Job
 from bux.train import config as tcfg
 from bux.train import curriculum
 from bux.train.curriculum import Stretch
 from bux.train.registry import Registry
+
+#: The threads that decode a batch's images, a row each.
+_DECODERS = concurrent.futures.ThreadPoolExecutor(8)
 
 
 class Batch(NamedTuple):
@@ -52,11 +58,21 @@ class Batch(NamedTuple):
     #: and wherever they stop increasing.
     position_ids: Int32[np.ndarray | Array, "b t"]
     loss_mask: Bool[np.ndarray | Array, "b t"]  #: Whether each token is a target.
+    #: The rows' images, which the model's image(...) reads; None for rows of text.
+    images: pictures.Rows | None = None
 
     @classmethod
     def concat(cls, parts: Sequence["Batch"]) -> "Batch":
         """Return the rows of `parts`, one after another, on the host."""
-        return cls(*(np.concatenate(c) for c in zip(*parts, strict=True)))
+        ids, positions, mask = (
+            np.concatenate(c) for c in zip(*(p[:3] for p in parts), strict=True)
+        )
+        if parts[0].images is None:
+            return cls(ids, positions, mask)
+        rows = [p.images for p in parts]
+        assert all(r is not None for r in rows), "every part has images or none"
+        joined = (np.concatenate(c) for c in zip(*rows, strict=True))
+        return cls(ids, positions, mask, pictures.Rows(*joined))
 
 
 def plain(ids: Integer[np.ndarray, "b t"]) -> Batch:
@@ -122,7 +138,8 @@ def _hash(z: UInt64[np.ndarray, " k"]) -> UInt64[np.ndarray, " k"]:
 
 
 class Prepared:
-    """A dataset bux.data prepared: its row groups, each epoch in a new order."""
+    """A dataset bux.data prepared: its row groups, each epoch in a new order; a
+    dataset with images, their images too (`bux.data.images.row`)."""
 
     def __init__(
         self, folder: Path, vocab_size: int, seq_len: int, seed: tuple[int, ...]
@@ -149,18 +166,41 @@ class Prepared:
         if not self.total:
             raise ValueError(f"{folder} has no rows: its documents fill none")
         self.seq_len, self.seed = seq_len, seed
-        self.last: tuple[int, Batch] | None = None  # rows are read in order
+        job = meta["job"]
+        self.images = job["source"].get("images")  # how they are cut, or None
+        self.room = job.get("patches_per_row")
+        self.store = pictures.Store(folder) if self.images else None
+        self.last: tuple[int, tuple] | None = None  # rows are read in order
 
-    def _group(self, i: int) -> Batch:
+    def _group(self, i: int) -> tuple:
+        """Return row group i's columns, each a row of seq_len values a row."""
         if self.last is None or self.last[0] != i:
             f, g = self.groups[i]
             table = self.files[f].read_row_group(g)
+            names = [*Batch._fields[:3], *(["image"] if self.store else [])]
             columns = (
                 table[name].combine_chunks().flatten().to_numpy(zero_copy_only=False)
-                for name in Batch._fields
+                for name in names
             )
-            self.last = i, Batch(*(c.reshape(-1, self.seq_len) for c in columns))
+            self.last = i, tuple(c.reshape(-1, self.seq_len) for c in columns)
         return self.last[1]
+
+    def _batch(self, columns: tuple) -> Batch:
+        """Return rows of the columns `_group` reads, their images decoded."""
+        if self.store is None:
+            return Batch(*columns)
+        ids, positions, mask, keys = columns
+        cut = functools.partial(
+            pictures.row,
+            store=self.store,
+            size=self.images["size"],
+            merge=self.images["merge"],
+            patches_per_row=self.room,
+        )
+        rows = list(_DECODERS.map(cut, keys, positions))
+        return Batch(
+            ids, positions, mask, pictures.Rows(*(np.stack(c) for c in zip(*rows)))
+        )
 
     def rows(self, start: int, n: int) -> Batch:
         """Return rows `start` to ``start + n``, from the row groups in their order
@@ -174,7 +214,7 @@ class Prepared:
             first = at - int(ends[k] - self.sizes[order[k]])
             take = min(n, int(ends[k]) - at)
             group = self._group(int(order[k]))
-            parts.append(Batch(*(c[first : first + take] for c in group)))
+            parts.append(self._batch(tuple(c[first : first + take] for c in group)))
             start, n = start + take, n - take
         return Batch.concat(parts)
 
@@ -500,7 +540,8 @@ def _batches(
         at = i - plan.start
         firsts = [b + at * n for b, n in zip(plan.before, plan.counts, strict=True)]
         parts = [streams[n] for n in plan.streams]
-        batch = _read(parts, plan.counts, firsts, own[k], plan.config.seq_len)
+        room = image_room(plan.config)
+        batch = _read(parts, plan.counts, firsts, own[k], plan.config.seq_len, room)
         if (top := int(batch.input_ids.max())) >= vocab_size:
             raise ValueError(
                 f"token id {top} is outside the vocabulary of {vocab_size}"
@@ -514,21 +555,65 @@ def _read(
     firsts: Sequence[int],
     rows: Int[np.ndarray, " n"],
     seq_len: int,
+    room: tuple[int, int] | None = None,
 ) -> Batch:
     """A batch of `counts[k]` rows of each stream in turn, from its row `firsts[k]`, of
-    which only `rows` are read; the others stay 0."""
+    which only `rows` are read; the others stay 0. With `room` for n patches of p
+    bytes a row, its images too."""
     shape = (sum(counts), seq_len)
     batch = Batch(
         np.zeros(shape, np.int32), np.zeros(shape, np.int32), np.zeros(shape, bool)
     )
+    if room is not None:
+        batch = batch._replace(images=_no_images(shape, room))
+    seen = np.zeros(shape[0], bool)  # the rows whose images a stream gave
     first = 0  # the stream's first row in the batch
     for stream, n, start in zip(streams, counts, firsts, strict=True):
         own = rows[(first <= rows) & (rows < first + n)] - first
         for at, m in _runs(own):
-            for whole, part in zip(batch, stream.rows(start + at, m), strict=True):
+            got = stream.rows(start + at, m)
+            for whole, part in zip(batch[:3], got[:3], strict=True):
                 whole[first + at : first + at + m] = part
+            if got.images is not None and batch.images is not None:
+                for whole, part in zip(batch.images, got.images, strict=True):
+                    whole[first + at : first + at + m] = part
+                seen[first + at : first + at + m] = True
         first += n
+    if batch.images is not None:  # a row of text is at its position on every axis
+        rope = np.repeat(batch.position_ids[~seen][..., None], 3, -1)
+        batch.images.rope[~seen] = rope
     return batch
+
+
+def _no_images(shape: tuple[int, int], room: tuple[int, int]) -> pictures.Rows:
+    """Return the images of `shape`'s rows of text, with `room` for n patches of p
+    bytes: no patch, each its own image, and no image tokens."""
+    b, t = shape
+    n, p = room
+    return pictures.Rows(
+        np.zeros((b, n, p), np.uint8),
+        np.zeros((b, n), np.int32),
+        np.zeros((b, n, 2), np.int32),
+        np.ones((b, n, 2), np.int32),
+        np.zeros((b, t, 3), np.int32),
+    )
+
+
+def image_room(config: tcfg.TrainConfig) -> tuple[int, int] | None:
+    """Return the patches of a row of a run with images, and the bytes of a patch;
+    None for a run of text."""
+    if config.patches_per_row is None:
+        return None
+    sources = [*tcfg.leaves(config.data)]
+    sources += [s for e in tcfg.evals(config) for s in tcfg.leaves(e.data)]
+    sources += [s for p in config.curriculum if p.data for s in tcfg.leaves(p.data)]
+    # The compiler checks that some source has images, each cut as the model's are.
+    [size, *_] = [
+        s.images.size
+        for s in sources
+        if isinstance(s, tcfg.ChatConfig) and s.images is not None
+    ]
+    return config.patches_per_row, 3 * size**2
 
 
 def _runs(rows: Int[np.ndarray, " n"]) -> list[tuple[int, int]]:

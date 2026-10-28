@@ -31,7 +31,7 @@ from typing import (
 )
 
 from flax import nnx
-from jaxtyping import Array, Float, Int, Shaped
+from jaxtyping import Array, Float, Int, Shaped, UInt8
 
 from bux.architecture.common.segments import Segments
 from bux.lang import ir
@@ -55,6 +55,23 @@ class Loss(NamedTuple):
     value: Float[Array, ""]  #: The term, a scalar.
 
 
+class Images(NamedTuple):
+    """The images of a forward pass, as image(...)'s encoder reads them: the patches
+    of each row's images, one image after another, each in the order
+    `bux.export.hf.pixels.patches` cuts it, then padding to n."""
+
+    pixels: UInt8[Array, "b n p"]  #: Each patch's pixels, ``3 * size * size`` bytes.
+    #: Each patch's index in its image, from 0: an image starts wherever they stop
+    #: increasing, as a document does (`Segments`).
+    positions: Int[Array, "b n"]
+    grid: Int[Array, "b n 2"]  #: Each patch's row and column in its image's grid.
+    sizes: Int[Array, "b n 2"]  #: The rows and columns of each patch's image's grid.
+    #: Each token's M-RoPE position, its time, height and width: a token of text is at
+    #: its position on all three, an image's at its row and column past where it
+    #: starts (`bux.export.hf.pixels.mrope`).
+    rope: Int[Array, "b t 3"]
+
+
 class Taps(dict[str, list]):
     """The tap stacks of one forward pass, by name, and what else the pass carries.
 
@@ -69,11 +86,13 @@ class Taps(dict[str, list]):
             tokens (nextn, engram) read.
         segments: The documents packed into the rows; None when each row is one.
         training: Whether this is a training step's forward, which collects losses.
+        images: The rows' images, which image(...) reads; None for rows of text.
 
     Attributes:
         tokens: The pass's input token ids.
         segments: The documents packed into the rows, or None.
         training: Whether this is a training step's forward.
+        images: The rows' images, or None.
         losses: The losses layers reported (`report`), in the order they ran.
         heads: The output of every head run so far, in order
             (`~bux.architecture.logits.HeadOutput`).
@@ -90,9 +109,11 @@ class Taps(dict[str, list]):
         tokens: Int[Array, "b t"] | None = None,
         segments: Segments | None = None,
         training: bool = False,
+        images: Images | None = None,
     ):
         super().__init__(stacks or {})
         self.tokens, self.segments, self.training = tokens, segments, training
+        self.images = images
         self.losses: list[Loss] = []
         self.heads: list[HeadOutput] = []
         self.nextn_runs = 0

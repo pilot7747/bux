@@ -14,7 +14,7 @@ Usage::
     fmt       print the file back, a run at a time, with nothing left to resolve
     json      print the runs' IR (or the model's) as JSON
 
-    bux export RUN_DIR OUT [--step N] [--dtype DTYPE] [--check]
+    bux export RUN_DIR OUT [--step N] [--dtype DTYPE] [--check] [--released]
     bux export FILE.bux OUT [SETTING=VALUE ...] [--entry NAME]
     bux studio FILE [--port PORT] [--host HOST] [--no-browser]
 
@@ -423,6 +423,12 @@ def export_parser() -> argparse.ArgumentParser:
         help="compare the export with bux on the run's weights, in float32, and fail "
         "if they disagree",
     )
+    p.add_argument(
+        "--released",
+        action="store_true",
+        help="write the run as the released checkpoint its weights = hf(...) came "
+        "from, for transformers' and vLLM's own code of the family",
+    )
     return p
 
 
@@ -466,6 +472,8 @@ def _export(args: argparse.Namespace) -> int:
         return _export_file(args)
     if args.settings:
         return _error("bux export: settings go with a .bux file, not a run")
+    if args.released:
+        return _export_released(args)
     from transformers.utils import logging
 
     from bux.export.runs import describe, export
@@ -491,9 +499,31 @@ def _export(args: argparse.Namespace) -> int:
     return 0
 
 
+def _export_released(args: argparse.Namespace) -> int:
+    if args.dtype is not None or args.check:
+        return _error("bux export: --released writes the released dtype, unchecked")
+    from bux.export.runs import export_released
+
+    try:
+        restored, left = export_released(args.run, args.out, step=args.step)
+    except (FileNotFoundError, ValueError) as err:
+        return _error(f"bux export: {err}")
+    run, step = restored.run, restored.step
+    weights = run.train.weights
+    assert weights is not None
+    print(f"{run.name}: step {step} exported to {args.out} as {weights.name} is")
+    if left:
+        print(
+            f"{run.name}: its model leaves out {', '.join(left)}, written as released"
+        )
+    return 0
+
+
 def _export_file(args: argparse.Namespace) -> int:
-    if args.step is not None or args.check:
-        return _error("bux export: a .bux file has no weights to --step or --check")
+    if args.step is not None or args.check or args.released:
+        return _error(
+            "bux export: a .bux file has no weights to --step, --check or --released"
+        )
     if (source := _read(args.run)) is None:
         return 1
     import torch

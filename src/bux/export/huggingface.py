@@ -44,6 +44,7 @@ def save(
     *,
     dtype: torch.dtype = torch.float32,
     max_positions: int | None = None,
+    images: dict | None = None,
 ) -> Plan:
     """Write `model`, built from `arch`, to the directory `out` as a transformers model.
 
@@ -59,6 +60,9 @@ def save(
         max_positions: The longest sequence the model is known to take, as
             ``max_position_embeddings``, which vLLM serves up to by default; None
             says nothing of it.
+        images: How the model's images are cut, the ``images(...)`` of the data it
+            trained on, as ``bux_images``, which ``vision.inputs`` takes; None says
+            nothing of it.
 
     Returns:
         The exported model's plan.
@@ -94,6 +98,7 @@ def save(
         "tie_word_embeddings": False,
         "dtype": str(dtype).removeprefix("torch."),  # what dtype="auto" loads in
         **({} if max_positions is None else {"max_position_embeddings": max_positions}),
+        **({} if images is None else {"bux_images": images}),
         "bux": arch.model_dump(mode="json"),
         "bux_sites": p.sites(),
         "bux_reserved": sorted(RESERVED),

@@ -185,6 +185,10 @@ class _Renderer:
                 return _text(f"@{name}")
             case ir.Ref(name=name, pop=pop):
                 return _text(f"${name}{'!' if pop else ''}")
+            case ir.Image(body=body):
+                inner = self.collapsed(body)
+                box = _text(inner) if inner is not None else self.box(body)
+                return _frame(box, " image ")
         raise AssertionError(node)
 
     def parallel(self, terms: Sequence[ir.Node], merge: str) -> _Box:

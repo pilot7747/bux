@@ -102,12 +102,14 @@ from bux.architecture.attention.mla import MLA
 from bux.architecture.common.segments import Segments
 from bux.architecture.experts.moe import MoE
 from bux.architecture.graph import build_node
+from bux.architecture.image import ImageSplice
 from bux.architecture.layers.conv import CausalConv
 from bux.architecture.layers.elementwise import Activation, Dropout, Linear, Scale
 from bux.architecture.layers.embedding import Embedding, Head, NextN
 from bux.architecture.layers.engram import Engram
 from bux.architecture.layers.mlp import MLP
 from bux.architecture.layers.norm import DyT, Norm
+from bux.architecture.layers.vision import MergePatches, Patches
 from bux.architecture.model import Model, num_params
 from bux.architecture.recurrent.linear_attention import (
     DeltaNet,
@@ -122,6 +124,7 @@ from bux.architecture.registry import (
     Builder,
     Built,
     Context,
+    Images,
     Loss,
     Taps,
     positions,
@@ -162,6 +165,8 @@ __all__ = [
     "GatedResidual",
     "Head",
     "HyperConnections",
+    "ImageSplice",
+    "Images",
     "Indexer",
     "KimiDeltaAttention",
     "LightningAttention",
@@ -171,10 +176,12 @@ __all__ = [
     "Mamba2",
     "ManifoldHyperConnections",
     "Merge",
+    "MergePatches",
     "MoE",
     "Model",
     "NextN",
     "Norm",
+    "Patches",
     "ResidualGate",
     "Scale",
     "Scanned",

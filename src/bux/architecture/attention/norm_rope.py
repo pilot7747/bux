@@ -41,7 +41,7 @@ def norm_and_rotate(
     x: Float[Array, "b t h d"],
     norm: Norm | None,
     rope: cfg.RoPEConfig | None,
-    positions: Int[Array, "b t"] | None,
+    positions: Int[Array, "b t"] | Int[Array, "b t a"] | None,
     heads: parallel.Name,
 ) -> Float[Array, "b t h d"]:
     """Return x's heads normalized by `norm`, then rotated by `rope`, each if given.
@@ -54,7 +54,8 @@ def norm_and_rotate(
         x: queries or keys: b rows of t tokens, h heads of d dims.
         norm: QK-norm, a norm of each head's d dims; None for none.
         rope: the RoPE settings; None for no rotation.
-        positions: each token's position in its document; None for its index in the
+        positions: each token's position in its document, of one axis or several
+            (`~bux.architecture.attention.rope.angles`); None for its index in the
             row.
         heads: the name of x's third dimension, ``heads`` or ``kv_heads``, as the
             layout splits it (`bux.parallel`).
@@ -67,6 +68,8 @@ def norm_and_rotate(
         return x if rope is None else rotate(x, rope, positions)
     if positions is None:
         positions = jnp.broadcast_to(jnp.arange(x.shape[1]), x.shape[:2])
+    if positions.ndim == 3:  # a RoPE of one axis turns by the first
+        positions = positions[..., 0]
     run = partial(_fused, rope=rope, eps=norm.eps)
     if parallel.active() is None:
         return run(x, _gain(norm), positions)
@@ -82,12 +85,14 @@ def takes(
 
     They take one on a GPU outside any shard_map, of 16-bit x whose head dim (32 to
     256) and heads on each device are powers of two, an RMSNorm with no bias and a
-    scale after it (not ``scale_input``), and RoPE by halves of every dim.
+    scale after it (not ``scale_input``), and RoPE by halves of every dim, of
+    positions of one axis.
     """
     _, _, h, d = x.shape
     local = h // parallel.splits(("batch", "seq", heads, None), x.shape)[2]
     rms = norm.kind == "rmsnorm" and norm.scale is not None and norm.bias is None
     halves = rope.layout == "half" and rotated_dims(d, rope) == d
+    one_axis = rope.sections is None and rope.axial is None
     return (
         kernels.gpu()
         and not manual_axes()
@@ -98,6 +103,7 @@ def takes(
         and rms
         and not norm.scale_input
         and halves
+        and one_axis
     )
 
 

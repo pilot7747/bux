@@ -83,6 +83,16 @@ The loss covers only targets in the same document as the position that predicts 
 positions run from 0 to `seq_len - 1`, and every token attends to every token before
 it in the row.
 
+## Documents with images
+
+Documents with images are packed whole. `concat` would cut an image's tokens, so a
+run with images packs by `greedy` or `best_fit`. A row also has room for
+`patches_per_row` patches of images, and a document goes only into a row with room for
+both its tokens and its patches. A document that fits in no row, by its tokens or by
+its patches, is dropped, whatever `long` says, and the summary line counts its tokens
+as cut. `best_fit` puts each document, longest first, into the open row with the
+least room left for its tokens that also has room for its patches.
+
 ## Measurements
 
 FineWeb-Edu, 53,248 documents (55M GPT-2 tokens), at `seq_len = 1024`:

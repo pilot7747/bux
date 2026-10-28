@@ -153,6 +153,8 @@ class _Printer:
                 return f"@{name}", ATOM
             case ir.Ref(name=name, pop=pop):
                 return f"${name}{'!' if pop else ''}", ATOM
+            case ir.Image(body=body, token=token):
+                return f"image({self.expr(body)[0]}, token={token})", ATOM
         raise AssertionError(node)
 
     def spliced(self, items: tuple[ir.Node, ...]) -> list[ir.Node]:

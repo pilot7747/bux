@@ -11,8 +11,9 @@ layers'.
 """
 
 from collections.abc import Callable, Iterator
-from typing import Any
+from typing import Any, NamedTuple
 
+import jax
 import numpy as np
 from flax import nnx
 from jaxtyping import Shaped
@@ -54,20 +55,40 @@ def tensors(
         if not call.first:
             continue
         module = module_at(plan.arch.graph, model.graph, call.trail)
-        own = dict(_named(module, "", seen))
+        own = {name: ref.array() for name, ref in refs(module, "", seen)}
         if (fn := convert(call.layer.config.type)) is not None:
             own = fn(own, call.layer.config.model_dump(mode="json"))
         out |= {f"{call.path}.{name}": array for name, array in own.items()}
     for branch in plan.branches:
         if branch.first:
             module = module_at(plan.arch.graph, model.graph, branch.trail)
-            out |= {f"{branch.path}.{k}": v for k, v in _algebra(module, seen)}
+            out |= {f"{branch.path}.{k}": r.array() for k, r in _algebra(module, seen)}
     return out
 
 
-def _algebra(
-    m: nnx.Module, seen: set[int]
-) -> Iterator[tuple[str, Shaped[np.ndarray, "..."]]]:
+class Ref(NamedTuple):
+    """A variable the rule names, and whether its exported tensor is its transpose (a
+    ``nnx.Linear``'s kernel)."""
+
+    variable: nnx.Variable
+    transposed: bool = False
+
+    def array(self) -> Shaped[np.ndarray, "..."]:
+        """Return the variable as the rule exports it."""
+        x = np.asarray(self.variable[...])
+        return x.T if self.transposed else x
+
+    def set(self, x: Shaped[np.ndarray, "..."]) -> None:
+        """Set the variable from `x`, as the rule exports it, in the variable's dtype."""
+        old = self.variable[...]
+        x, want = np.asarray(x), old.shape[::-1] if self.transposed else old.shape
+        if x.shape != want:
+            raise ValueError(f"a tensor of shape {x.shape}, where {want} goes")
+        x = np.asarray(x.T if self.transposed else x, old.dtype)
+        self.variable[...] = jax.device_put(x, old.sharding)
+
+
+def _algebra(m: nnx.Module, seen: set[int]) -> Iterator[tuple[str, Ref]]:
     """Yield the parameters of a residual algebra's branch, by the rule, but its
     body's, which are its layers'."""
     for name, value in vars(m).items():
@@ -77,15 +98,15 @@ def _algebra(
 
 def module_at(node: ir.Node, module: Any, trail: tuple[int, ...]) -> nnx.Module:
     """Return the module of the node at `trail` under `node`, whose module is `module`:
-    a sequence's items, a sum's or product's branches, a residual's or negation's body,
-    and a repeat's passes, as `bux.architecture.graph` builds them."""
+    a sequence's items, a sum's or product's branches, a residual's, negation's or
+    image's body, and a repeat's passes, as `bux.architecture.graph` builds them."""
     for i in trail:
         match node:
             case ir.Seq(items=items):
                 node, module = items[i], module.items[i]
             case ir.Sum(terms=items) | ir.Prod(factors=items):
                 node, module = items[i], module.branches[i]
-            case ir.Residual(body=body) | ir.Neg(body=body):
+            case ir.Residual(body=body) | ir.Neg(body=body) | ir.Image(body=body):
                 node, module = body, module.body
             case ir.Repeat(body=body):
                 node, module = body, module.items[i]
@@ -94,41 +115,37 @@ def module_at(node: ir.Node, module: Any, trail: tuple[int, ...]) -> nnx.Module:
     return module
 
 
-def _named(
-    m: object, prefix: str, seen: set[int]
-) -> Iterator[tuple[str, Shaped[np.ndarray, "..."]]]:
-    """Yield the parameters of `m` by the rule, each module's once."""
+def refs(m: object, prefix: str, seen: set[int]) -> Iterator[tuple[str, Ref]]:
+    """Yield the variables of `m` by the rule, each module's once."""
     if id(m) in seen:
         return
     seen.add(id(m))
     match m:
         case nnx.Linear():
-            yield f"{prefix}weight", np.asarray(m.kernel[...]).T
+            yield f"{prefix}weight", Ref(m.kernel, transposed=True)
             if m.bias is not None:
-                yield f"{prefix}bias", np.asarray(m.bias[...])
+                yield f"{prefix}bias", Ref(m.bias)
         case nnx.Embed():
-            yield f"{prefix}weight", np.asarray(m.embedding[...])
+            yield f"{prefix}weight", Ref(m.embedding)
         case Norm():
             for name, p in (("weight", m.scale), ("bias", m.bias)):
                 if p is not None:
-                    yield f"{prefix}{name}", np.asarray(p[...])
+                    yield f"{prefix}{name}", Ref(p)
         case _:
             state = STATE.get(type(m), ())
             for name, value in vars(m).items():
                 if name in state and isinstance(value, nnx.Variable):
-                    yield f"{prefix}{name}", np.asarray(value[...])
+                    yield f"{prefix}{name}", Ref(value)
                 else:
                     yield from _attribute(value, f"{prefix}{name}", seen)
 
 
-def _attribute(
-    value: object, name: str, seen: set[int]
-) -> Iterator[tuple[str, Shaped[np.ndarray, "..."]]]:
-    """Yield the parameters an attribute holds: itself, a module's, or a list's."""
+def _attribute(value: object, name: str, seen: set[int]) -> Iterator[tuple[str, Ref]]:
+    """Yield the variables an attribute holds: itself, a module's, or a list's."""
     if isinstance(value, nnx.Param):
-        yield name, np.asarray(value[...])
+        yield name, Ref(value)
     elif isinstance(value, nnx.Module):
-        yield from _named(value, f"{name}.", seen)
+        yield from refs(value, f"{name}.", seen)
     elif isinstance(value, list | tuple | nnx.List):
         for i, item in enumerate(value):
             yield from _attribute(item, f"{name}.{i}", seen)

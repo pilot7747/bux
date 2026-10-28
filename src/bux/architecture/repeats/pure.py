@@ -69,7 +69,11 @@ def _copy(taps: Taps, carry: Changes) -> Taps:
     """Copy `taps`, with `carry`'s values in place of its own, and no losses yet."""
     stacks = {k: list(v) for k, v in (dict(taps) | carry.stacks).items()}
     local = Taps(
-        stacks, tokens=taps.tokens, segments=taps.segments, training=taps.training
+        stacks,
+        tokens=taps.tokens,
+        segments=taps.segments,
+        training=taps.training,
+        images=taps.images,
     )
     local.heads = list(taps.heads if carry.heads is None else carry.heads)
     local.pending_read = (

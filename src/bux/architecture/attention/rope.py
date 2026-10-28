@@ -5,6 +5,12 @@ scaling.
 positions, in pairs as ``rope.layout`` says, at the inverse frequencies `frequencies`
 gives under ``rope.scaling``. The softmax attention layers rotate by it, and so does
 sparse attention's indexer.
+
+A position may have several axes, ``b t k``: an image's patch has a row and a column,
+and Qwen's M-RoPE gives every token a time, a height and a width. ``rope.sections``
+deals the pairs out to the axes (M-RoPE), and ``rope.axial`` makes each axis a RoPE of
+its own over a run of the pairs (a ViT's). A position of one axis, ``b t``, is the
+same on every axis (`angles`).
 """
 
 import math
@@ -89,10 +95,68 @@ def logit_gain(rope: cfg.RoPEConfig | None) -> float:
     return 1.0
 
 
+def angles(
+    rope: cfg.RoPEConfig, positions: Int[Array, "*lead a"], dims: int
+) -> tuple[Float[Array, "*lead pairs"], float]:
+    """Return the angle each of the ``dims / 2`` rotated pairs turns by at each
+    position, and the factor on cos and sin.
+
+    Args:
+        rope: the RoPE settings.
+        positions: each token's position on its a axes, the last dimension: as many
+            as ``rope.sections`` or ``rope.axial`` has, or one, the same on all. A
+            RoPE of one axis turns by the first.
+        dims: how many dims rotate, an even number.
+
+    Raises:
+        ValueError: The positions have another number of axes than the rope;
+            ``rope.sections`` do not sum to the pairs, or ``rope.axial`` does not
+            divide them.
+    """
+    pairs, axes = dims // 2, len(rope.sections or ()) or rope.axial or 1
+    if axes == 1:
+        positions = positions[..., :1]
+    elif positions.shape[-1] == 1:
+        positions = jnp.repeat(positions, axes, -1)  # one axis: all alike
+    elif positions.shape[-1] != axes:
+        raise ValueError(
+            f"positions of {positions.shape[-1]} axes, for a RoPE of {axes}"
+        )
+    if rope.axial is not None:
+        if pairs % rope.axial:
+            raise ValueError(f"rope(axial={rope.axial}) splits {pairs} pairs unevenly")
+        inv_freq, gain = frequencies(rope, dims // rope.axial)
+        turns = positions[..., :, None] * inv_freq  # each axis its own RoPE
+        return turns.reshape(*positions.shape[:-1], pairs), gain
+    inv_freq, gain = frequencies(rope, dims)
+    axis = jnp.asarray(_axis_of_pairs(rope, pairs))
+    return jnp.take(positions, axis, -1) * inv_freq, gain
+
+
+def _axis_of_pairs(rope: cfg.RoPEConfig, pairs: int) -> list[int]:
+    """Return the axis each pair turns by under M-RoPE: 0 for every pair without."""
+    if rope.sections is None:
+        return [0] * pairs
+    if sum(rope.sections) != pairs:
+        raise ValueError(
+            f"rope(sections={rope.sections}) deals out {sum(rope.sections)} pairs, "
+            f"but {pairs} rotate"
+        )
+    k = len(rope.sections)
+    if rope.sections_layout == "blocks":
+        return [a for a, n in enumerate(rope.sections) for _ in range(n)]
+    # Pair i goes to axis i mod k while that axis has pairs left; the rest to axis 0.
+    return [
+        a if a and i < rope.sections[a] * k else 0
+        for i in range(pairs)
+        for a in [i % k]
+    ]
+
+
 def rotate(
     x: Float[Array, "b t h k"],
     rope: cfg.RoPEConfig,
-    positions: Int[Array, "b t"] | None = None,
+    positions: Int[Array, "b t"] | Int[Array, "b t a"] | None = None,
 ) -> Float[Array, "b t h k"]:
     """Rotate the first ``rope.fraction`` of each head's dims by the tokens' positions.
 
@@ -103,7 +167,8 @@ def rotate(
     Args:
         x: queries or keys: b rows of t tokens, h heads of k dims.
         rope: the RoPE settings.
-        positions: each token's position in its document; None for its index in the
+        positions: each token's position in its document, of one axis or of a, as
+            the rope's sections or axial say (`angles`); None for its index in the
             row.
 
     Returns:
@@ -112,13 +177,14 @@ def rotate(
     dims = rotated_dims(x.shape[-1], rope)
     if dims == 0:
         return x
-    inv_freq, gain = frequencies(rope, dims)
     if positions is None:
         positions = jnp.arange(x.shape[1])
-    angles = positions[..., None] * inv_freq
+    if positions.ndim < 3:  # of one axis
+        positions = positions[..., None]
+    turns, gain = angles(rope, positions, dims)
     sin, cos = (
-        gain * jnp.sin(angles)[..., None, :],
-        gain * jnp.cos(angles)[..., None, :],
+        gain * jnp.sin(turns)[..., None, :],
+        gain * jnp.cos(turns)[..., None, :],
     )
     x, rest = x[..., :dims], x[..., dims:]
     if rope.layout == "interleaved":

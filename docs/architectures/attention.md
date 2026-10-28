@@ -53,6 +53,7 @@ model = embed block^12 norm head(tied=true)
 | `output_bias` | `bias` | a bias on the output projection (GPT-2 has one, Qwen2 has none) |
 | `fused_qkv` | `false` | make q, k and v with one projection and split it: the same function and init, held as one matrix (GPT-2, MiMo-V2.6-Pro) |
 | `qk_norm_all_heads` | `false` | `qk_norm` of all the heads together, not of each ([below](#qk-norm-and-output-norms)) (MiniMax-M2, OLMo 2) |
+| `causal` | `true` | each query sees only the keys at and before it; `false`: every key of its document, as a vision encoder's patches see their image ([Vision encoders](vision.md#the-encoders-layers)) |
 | `rope` | `none` | rotary position embeddings ([below](#rotary-position-embeddings-rope)) |
 | `power_scale`, `power_scale_length` | `none`, `2048` | queries scaled up with a power of the position ([below](#power-scaling-at-long-range)) (Beam) |
 | `kv_conv_size` | `none` | a causal depthwise conv on keys and values, added to them: `k + conv(k)` (Inkling) |
@@ -396,6 +397,9 @@ to the token's position in its document ({bux}`rope`). It goes in an attention's
 | `fraction` | `1.0` | the share of each head's dims that rotate, in whole pairs; the rest do not (partial rotary: GPT-J, GLM, Qwen3-Next) |
 | `layout` | `half` | `half` pairs dim $i$ with $i + d/2$ (GPT-NeoX, Llama); `interleaved` pairs $2i$ with $2i + 1$ (GPT-J, Cohere) |
 | `scaling` | `none` | a context extension: `pi`, `yarn` or `llama3` |
+| `sections` | `none` | M-RoPE: how many pairs turn by each axis of a position, time, height and width ([Vision encoders](vision.md#m-rope-in-the-text)) |
+| `sections_layout` | `blocks` | how M-RoPE deals the pairs out: a run per axis, or `interleaved` |
+| `axial` | `none` | axial RoPE: the pairs split into this many runs, each a RoPE of its own over one axis, as a ViT's rows and columns ([Vision encoders](vision.md#the-encoders-layers)) |
 
 `gqa` and `csa` rotate the first `fraction` of each head's dims; `mla` rotates its
 `qk_rope_head_dim` dims. GPT-J rotates a quarter of each head, in interleaved pairs

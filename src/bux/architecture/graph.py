@@ -12,6 +12,7 @@
   (`bux.architecture.repeats.repeat`).
 - ``ir.Layer``: what the builder registered for its config's type builds
   (`bux.architecture.registry`).
+- ``ir.Image``, ``image(encoder, token=...)``: `~bux.architecture.image.ImageSplice`.
 
 Each residual branch outside any other is rematerialized as the run's
 ``methods.remat`` says (`bux.architecture.repeats.remat`), and observed by its name
@@ -28,6 +29,7 @@ from jaxtyping import Array, Shaped
 
 from bux import parallel
 from bux.architecture import observe, residual
+from bux.architecture.image import ImageSplice
 from bux.architecture.registry import Context, Stream, Taps, build_layer
 from bux.architecture.repeats import remat, tracing
 from bux.lang import ir
@@ -212,6 +214,8 @@ def _build(node: ir.Node, ctx: Context) -> nnx.Module:
             return TapWrite(name)
         case ir.Ref(name=name, pop=pop):
             return TapRead(name, pop)
+        case ir.Image(body=body, token=token):
+            return ImageSplice(build_node(body, ctx), token)
     raise AssertionError(node)
 
 

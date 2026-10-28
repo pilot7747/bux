@@ -352,7 +352,7 @@ def test_prepared_rows_come_epoch_after_epoch_and_resume(tmp_path, byte_tokenize
     assert sorted(map(tuple, first)) == expected == sorted(map(tuple, second))
     assert not (first == second).all()  # in another order
     again = next(batches(t.data, t, 260, cache=tmp_path / "cache", start=5))
-    assert all((a == b).all() for a, b in zip(again, epoch[5]))
+    assert all((a == b).all() for a, b in zip(again[:3], epoch[5][:3], strict=True))
     with pytest.raises(ValueError, match="more than the model's vocab_size of 100"):
         next(batches(t.data, t, 100, cache=tmp_path / "cache"))
 

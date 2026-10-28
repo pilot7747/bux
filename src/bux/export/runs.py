@@ -37,6 +37,7 @@ from bux.export.plan import plan
 from bux.lang import ir
 from bux.lang.printer import run_to_source
 from bux.train import hooks
+from bux.train.config import ChatConfig, leaves
 from bux.train.stages import balanced
 
 #: The name of the model's part of a checkpoint, which keeps
@@ -335,7 +336,14 @@ def export(
     run, model, out = restored.run, restored.model, Path(out)
     dtype = dtype or param_dtype(model)
     torch_dtype, length = getattr(torch, dtype), run.train.seq_len
-    huggingface.save(run.arch, model, out, dtype=torch_dtype, max_positions=length)
+    huggingface.save(
+        run.arch,
+        model,
+        out,
+        dtype=torch_dtype,
+        max_positions=length,
+        images=_images(run),
+    )
     if (config := run.train.tokenizer) is not None:
         assert run.arch.vocab_size is not None, "a run has a vocabulary"
         tokenizer.save(config, out, run.arch.vocab_size)
@@ -345,6 +353,56 @@ def export(
         with jax.default_device(jax.devices("cpu")[0]):
             report = compare(run.arch, rounded(model, dtype))
     return Exported(restored, out, dtype, report)
+
+
+def export_released(
+    folder: Path | str, out: Path | str, *, step: int | None = None
+) -> tuple[Restored, list[str]]:
+    """Write the model of the run in `folder`, from its checkpoint of `step`, as the
+    released checkpoint its ``weights`` came from is written (`bux.pretrained.save`):
+    its tensors under the released names and in their dtype, beside the released
+    config, tokenizer and processor files, for transformers' and vLLM's own code of
+    the family.
+
+    Args:
+        folder: The run's directory, ``runs/<name>-<id>``.
+        out: The directory to write, made if missing.
+        step: The checkpoint's step; None for the latest.
+
+    Returns:
+        The run and its model, and the optional groups of the checkpoint its model
+        leaves out, written as released.
+
+    Raises:
+        FileNotFoundError: `folder` is not a run's directory, or has no checkpoint
+            (of `step`).
+        ValueError: The run started from no released weights, or its model is not of
+            their architecture.
+    """
+    from bux import pretrained
+
+    run = read_run(folder)
+    if run.train.weights is None:
+        raise ValueError(
+            f"{run.name} started from no released weights (weights = hf(...)), so it "
+            "has no released format to be written in"
+        )
+    restored = restore(folder, step)
+    left = pretrained.save(
+        restored.model, restored.run.arch, run.train.weights.name, out
+    )
+    return restored, left
+
+
+def _images(run: ir.Run) -> dict | None:
+    """Return how the run's data cut its images, its first image source's
+    ``images(...)``; None for a run of text."""
+    found = [
+        s.images.model_dump(mode="json")
+        for s in leaves(run.train.data)
+        if isinstance(s, ChatConfig) and s.images is not None
+    ]
+    return found[0] if found else None
 
 
 def _source(folder: Path | str) -> str:

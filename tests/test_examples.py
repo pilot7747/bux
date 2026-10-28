@@ -110,7 +110,26 @@ YARN = (
     " attention_factor_on=softmax))"
 )
 INDEXER = ", indexer=indexer(num_heads=2, head_dim=8, top_k=4)"
+#: Qwen3.5's token mixers, shrunk, and its vision encoder, shallow and narrow.
+QWEN3_5 = [
+    "delta = gdn(num_heads=2, num_v_heads=4, head_dim=8)",
+    (
+        "attn = gqa(num_heads=4, num_kv_heads=2, head_dim=32, gated=true,"
+        " qk_norm=norm, rope=rope(base=10000000, fraction=0.25, sections=[2, 1, 1],"
+        " sections_layout=interleaved))"
+    ),
+    "ffn = dense",
+    "vattn = gqa(num_heads=2, num_kv_heads=2, bias=true, causal=false, rope=rope(axial=2))",
+    "vffn = mlp(intermediate_size=16, activation=gelu_tanh, bias=true)",
+    (
+        "vision = (patches(size=16, features=16, grid=4) ([vnorm vattn] [vnorm vffn])^2"
+        " vnorm merge_patches(size=2) linear(features=64, bias=true) gelu"
+        " linear(features=d_model, bias=true))"
+    ),
+]
 SHRUNK = {
+    "qwen/qwen3.5_0.8b.bux": QWEN3_5,
+    "qwen/qwen3.5_9b.bux": QWEN3_5,
     "deepseek_v3.bux": [f"attn = {MLA}{YARN})", GROUPED],
     "deepseek/deepseek_v3.2_exp.bux": [f"attn = {MLA}{YARN}{INDEXER})", GROUPED],
     "glm/glm_5.3.bux": [

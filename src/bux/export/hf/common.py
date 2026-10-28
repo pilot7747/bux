@@ -116,6 +116,10 @@ class Ctx:
             ahead.
         pending_read: The read coefficients, b t n, the last single-pass hc or mhc
             branch computed for the next one; None before the first.
+        images: The rows' images, which image(...) reads (`vision.Images`); None
+            for rows of text, and while generating past them.
+        rotary: The positions RoPE turns by where they have several axes, b t a:
+            M-RoPE's, an encoder's rows and columns; None for `positions`.
     """
 
     def __init__(
@@ -136,7 +140,13 @@ class Ctx:
         self.config: Any = None
         self.nextn_runs = 0
         self.pending_read: torch.Tensor | None = None
+        self.images: Any = None
+        self.rotary: torch.Tensor | None = None
         self._masks, self._made, self._slots = masks, {}, 0
+
+    def rope_positions(self) -> torch.Tensor:
+        """Return the positions RoPE turns by: `rotary`, else `positions`."""
+        return self.positions if self.rotary is None else self.rotary
 
     def push(self, name: str, x: Any) -> Any:
         """``@name``: push `x` onto the tap `name`, and return it."""

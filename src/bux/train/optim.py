@@ -27,6 +27,7 @@ import itertools
 import math
 import typing
 from collections.abc import Callable, Sequence
+from typing import Any
 
 import jax
 import jax.numpy as jnp
@@ -46,6 +47,7 @@ from optax.contrib._muon import (
 
 from bux import parallel
 from bux.architecture import Scanned
+from bux.lang import ir
 from bux.parallel import methods
 from bux.parallel.layout import Split, as_split, partition
 from bux.train import config as tcfg
@@ -254,10 +256,11 @@ def optimizer(
     model: nnx.Module,
     clip: float | None = None,
     moments: DTypeLike = jnp.float32,
+    frozen: Sequence[tuple] = (),
 ) -> optax.GradientTransformation:
     """Return the update rule of `config`, its learning rate scaled by `multiplier`,
     after clipping gradients to the global norm `clip`, its moments kept in
-    `moments`.
+    `moments`; the parameters under the modules at `frozen` do not change.
 
     Args:
         config: The run's ``optimizer`` setting, built by its builder in `optimizers`.
@@ -268,6 +271,8 @@ def optimizer(
         clip: The global norm gradients are clipped to; None does not clip.
         moments: The dtype the optimizer's state is kept in between steps
             (`kept_in`).
+        frozen: The paths of modules whose parameters do not train
+            (`frozen_paths`).
 
     Returns:
         An optax transformation of the model's parameters' gradients.
@@ -282,9 +287,71 @@ def optimizer(
         trainer = Trainer(model, tx, objective(run.train.loss, run.arch))
     """
     tx = kept_in(optimizers.build(config, multiplier, model), moments)
-    if clip is None:
+    if clip is not None:
+        tx = optax.chain(optax.clip_by_global_norm(clip), tx)
+    if not frozen:
         return tx
-    return optax.chain(optax.clip_by_global_norm(clip), tx)
+    # The frozen parameters' gradients count toward no norm, and they keep no state.
+    return optax.partition(
+        {"train": tx, "frozen": optax.set_to_zero()}, _frozen_labels(frozen)
+    )
+
+
+def frozen_paths(
+    model: Any, arch: ir.Architecture, names: Sequence[str]
+) -> list[tuple]:
+    """Return the paths of the modules that the definitions `names` built: those of
+    the nodes of ``arch.graph`` labeled one of them, as ``model.graph`` holds them.
+
+    Raises:
+        NotImplementedError: The model is built otherwise than its graph, as a
+            pipeline builds its repeat.
+    """
+    if not names:
+        return []
+    found: set[int] = set()
+
+    def visit(node: ir.Node, module: Any) -> None:
+        if node.label in names:
+            found.add(id(module))
+            return
+        for child, sub in _built(node, module):
+            visit(child, sub)
+
+    try:
+        visit(arch.graph, model.graph)
+    except AttributeError:
+        raise NotImplementedError(
+            "frozen definitions under a pipeline are not supported yet"
+        ) from None
+    return [path for path, m in nnx.iter_graph(model) if id(m) in found]
+
+
+def _built(node: ir.Node, module: Any) -> list[tuple[ir.Node, Any]]:
+    """Return the children of `node`, each with the module built for it."""
+    match node:
+        case ir.Seq(items=items):
+            return list(zip(items, module.items, strict=True))
+        case ir.Sum(terms=items) | ir.Prod(factors=items):
+            return list(zip(items, module.branches, strict=True))
+        case ir.Residual(body=body) | ir.Neg(body=body) | ir.Image(body=body):
+            return [(body, module.body)]
+        case ir.Repeat(body=body) if isinstance(module, Scanned):
+            return [(body, module.layers)]  # every pass's parameters, stacked
+        case ir.Repeat(body=body):
+            return [(body, m) for m in module.items]
+    return []
+
+
+def _frozen_labels(frozen: Sequence[tuple]) -> Callable[[PyTree], PyTree[str]]:
+    """Return what labels each parameter "frozen", under one of the modules at
+    `frozen`, or "train"."""
+
+    def label(path: tuple, x: Float[Array, "*_"]) -> str:
+        keys = path_keys(path)
+        return "frozen" if any(keys[: len(p)] == p for p in frozen) else "train"
+
+    return lambda params: jax.tree_util.tree_map_with_path(label, params)
 
 
 def kept_in(

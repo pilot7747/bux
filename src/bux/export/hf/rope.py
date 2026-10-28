@@ -1,5 +1,6 @@
 """Rotary position embeddings, exported: bux's `bux.architecture.attention.rope`, with
-position interpolation, YaRN and Llama 3's scaling, in float32."""
+position interpolation, YaRN and Llama 3's scaling, in float32; and positions of
+several axes: M-RoPE's sections and a ViT's axial RoPE."""
 
 from __future__ import annotations
 
@@ -48,6 +49,21 @@ def _yarn(rope: dict, inv: torch.Tensor, dims: int) -> tuple[torch.Tensor, float
     return inv / s["factor"] * ramp + inv * (1 - ramp), gain
 
 
+def axis_of_pairs(rope: dict, pairs: int) -> list[int]:
+    """Return the axis of the position each pair turns by, as
+    `bux.architecture.attention.rope.angles` deals them out: M-RoPE's sections in
+    runs or interleaved, an axial RoPE's runs, else axis 0."""
+    sections, axial = rope.get("sections"), rope.get("axial")
+    if axial:
+        return [a for a in range(axial) for _ in range(pairs // axial)]
+    if not sections:
+        return [0] * pairs
+    k = len(sections)
+    if rope.get("sections_layout") == "interleaved":
+        return [i % k if i % k and i < sections[i % k] * k else 0 for i in range(pairs)]
+    return [a for a, n in enumerate(sections) for _ in range(n)]
+
+
 def rope_frequencies(rope: dict, dims: int) -> tuple[torch.Tensor, float]:
     """Return the inverse frequencies of `dims` rotated dims' pairs, and the gain on
     cos and sin, as `bux.architecture.attention.rope.frequencies` makes them."""
@@ -72,25 +88,46 @@ class Rope(nn.Module):
     paired ``half`` (NeoX) or ``interleaved`` (GPT-J), in float32."""
 
     inv_freq: torch.Tensor
+    axis: torch.Tensor
 
     def __init__(self, rope: dict, head_dim: int):
         super().__init__()
         self.config, self.layout = rope, rope["layout"]
         self.dims = rotated_dims(head_dim, rope)
-        inv, self.gain = rope_frequencies(rope, self.dims)
+        self.axes = len(rope.get("sections") or ()) or rope.get("axial") or 1
+        inv, self.gain = self._frequencies()
         self.register_buffer("inv_freq", inv.float(), persistent=False)
+        axis = axis_of_pairs(rope, self.dims // 2)
+        self.register_buffer("axis", torch.tensor(axis), persistent=False)
+
+    def _frequencies(self) -> tuple[torch.Tensor, float]:
+        """Return the inverse frequencies of every pair: an axial RoPE's, each axis's
+        own over its run of the pairs."""
+        if self.config.get("axial"):
+            inv, gain = rope_frequencies(self.config, self.dims // self.axes)
+            return inv.repeat(self.axes), gain
+        return rope_frequencies(self.config, self.dims)
 
     def reset(self) -> None:
         """Recompute the frequencies, which transformers' meta-device init leaves
         unset (``BuxPreTrainedModel._init_weights`` calls it)."""
         with torch.no_grad():
-            self.inv_freq.copy_(rope_frequencies(self.config, self.dims)[0].float())
+            self.inv_freq.copy_(self._frequencies()[0].float())
+            pairs = self.dims // 2
+            self.axis.copy_(torch.tensor(axis_of_pairs(self.config, pairs)))
 
     def forward(self, x: torch.Tensor, positions: torch.Tensor) -> torch.Tensor:
-        """Rotate x, b t h k, at positions, b t."""
+        """Rotate x, b t h k, at positions, b t, or b t a of the rope's a axes (one
+        axis turns every axis alike; a RoPE of one axis turns by the first)."""
         if self.dims == 0:
             return x
-        angles = positions[..., None].float() * self.inv_freq
+        if positions.ndim == 2:
+            positions = positions[..., None]
+        if self.axes == 1:
+            positions = positions[..., :1]
+        positions = positions.expand(*positions.shape[:2], self.axes)
+        turn = positions.gather(-1, self.axis.expand(*positions.shape[:2], -1))
+        angles = turn.float() * self.inv_freq
         sin = (self.gain * angles.sin())[..., None, :]
         cos = (self.gain * angles.cos())[..., None, :]
         y, rest = x[..., : self.dims].float(), x[..., self.dims :]

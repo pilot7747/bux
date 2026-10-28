@@ -1,0 +1,80 @@
+# SkyPilot task that checks bux's vision-language support on a GPU: the vision and
+# pretrained tests, Qwen3.5-0.8B's logits with an image against transformers, and a
+# smoke run of OCR fine-tuning (sky/ocr_smoke.bux).
+#
+#   sky jobs launch sky/sky_vision.yaml
+#
+# Syncs the working directory, installs bux, runs `bux launch` on the target
+# cluster. Outputs go to node-local /cache; add an R2/S3 sync step to persist.
+#
+# If your base image already has CUDA-enabled JAX, remove the `uv pip install`
+# line and rely on `uv sync` alone.
+
+name: bux-vision
+
+workdir: .
+
+resources:
+  # Adjust to your quota: T4:1 for dev, A100:8 / H100:8 / B200:4 for real runs.
+  infra: k8s
+  accelerators: B200:1
+  cpus: 16
+  memory: 128
+  labels: {priority: normal}
+
+envs:
+  BUX_CACHE: /cache/bux
+  JAX_COMPILATION_CACHE_DIR: /cache/bux/jax
+
+setup: |
+  set -e
+
+  # Install bux and locked deps into /opt/venv.
+  uv sync --frozen --inexact
+
+  # Upgrade JAX to the CUDA wheel if the lockfile had the CPU-only version.
+  # Remove this if your base image already ships CUDA-enabled JAX.
+  uv pip install -U "jax[cuda12]"
+
+  # --- Export nvidia pip-package libraries ----------------------------------
+  # The nvidia-*-cu12 pip packages install .so files into site-packages.
+  # JAX's plugin needs them all on LD_LIBRARY_PATH (libcusparse depends on
+  # libnvjitlink, libcudart, etc. in other nvidia sub-packages).
+  /opt/venv/bin/python -c \
+    "import os,sysconfig,glob;site=sysconfig.get_paths()['purelib'];" \
+    "paths=glob.glob(os.path.join(site,'nvidia','*','lib'));" \
+    "print(':'.join(paths)+':'+os.environ.get('LD_LIBRARY_PATH',''))" \
+    > /tmp/jax_ld_path.txt
+
+  export LD_LIBRARY_PATH="$(cat /tmp/jax_ld_path.txt)"
+
+  # Verify GPU is visible.
+  /opt/venv/bin/python -c "import jax; print('JAX devices:', jax.devices())"
+
+run: |
+  set -euo pipefail
+
+  # Re-export nvidia libraries (setup env does not carry over to run).
+  /opt/venv/bin/python -c \
+    "import os,sysconfig,glob;site=sysconfig.get_paths()['purelib'];" \
+    "paths=glob.glob(os.path.join(site,'nvidia','*','lib'));" \
+    "print(':'.join(paths)+':'+os.environ.get('LD_LIBRARY_PATH',''))" \
+    > /tmp/jax_ld_path.txt
+
+  export LD_LIBRARY_PATH="$(cat /tmp/jax_ld_path.txt)"
+
+  export BUX_PATH=examples/architectures/qwen
+  OUT_DIR="/cache/bux/runs"
+  mkdir -p "${OUT_DIR}" data/ocr
+
+  echo "=== tests ==="
+  /opt/venv/bin/python -m pytest tests/test_vision.py tests/test_pretrained.py -q -p no:cacheprovider || true
+
+  echo "=== Qwen3.5-0.8B with an image, against transformers ==="
+  /opt/venv/bin/python sky/vision_parity.py Qwen/Qwen3.5-0.8B examples/architectures/qwen/qwen3.5_0.8b.bux || true
+
+  echo "=== OCR smoke run ==="
+  /opt/venv/bin/python sky/pages.py data/ocr/pages.parquet 2048
+  bux prepare sky/ocr_smoke.bux --cache "${BUX_CACHE}"
+  bux launch sky/ocr_smoke.bux --out "${OUT_DIR}" --cache "${BUX_CACHE}"
+  bux results sky/ocr_smoke.bux --out "${OUT_DIR}" || true

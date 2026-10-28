@@ -31,6 +31,7 @@ call against them.
 | {py:mod}`bux.initializers` | How weight matrices start, by the model's `init` and each one's role |
 | {py:mod}`bux.architecture` | The reference Flax NNX backend: layers, kernels, residual algebras, repeats |
 | {py:mod}`bux.export` | Exporting models to transformers, with their weights, and checking them |
+| {py:mod}`bux.pretrained` | Loading released checkpoints into bux models, by a family's importer |
 | {py:mod}`bux.train` | Training configs, the trainer, optimizers, objectives, hooks, sinks |
 | {py:mod}`bux.parallel` | The mesh, the layout, and the methods of each kind of parallelism |
 | {py:mod}`bux.data` | Tokenizing, shuffling and packing documents into rows |
@@ -53,6 +54,7 @@ call against them.
    bux.initializers
    bux.architecture
    bux.export
+   bux.pretrained
    bux.train
    bux.parallel
    bux.data
