@@ -1,0 +1,38 @@
+# The western hybrid: the sliding-window frontier (m2026_frontier.bux: 3 layers of 512
+# keys with RoPE for every gated global layer, a fine-grained MoE, MTP) with other
+# global layers. Its own global layers are GQA without positions; these arms give them
+# a quarter of RoPE's dims, or make them MLA, with or without its decoupled RoPE. Each
+# arm changes the global layers alone: the local layers, the experts and the MTP
+# module stay the frontier's. Arms: era, source, what it was claimed for.
+use m2026_frontier
+use timeline_code
+use rungs
+
+# The frontier with g in its global layers.
+west(g) = embed
+          fr_layer(fr_local, fr_dense) fr_layer(fr_local)^2 fr_layer(g)
+          (fr_layer(fr_local)^3 fr_layer(g))^(layers // 4 - 1)
+          fr_norm @h fr_out fr_mtp
+
+# m2024_dsv3.bux's MLA: keys and values from a 256-wide latent, 32 more dims of each
+# query and key that all heads' keys share, queries at full rank; gated as the
+# frontier's global layers. No QK-norm: it would normalize keys that decoding never
+# makes (it reads the latent), so bux's vLLM plugin refuses it; MLA normalizes its
+# latent instead. Serving prices it at DeepSeek's dims (512 + 64), as attention/mla
+# and m2024_dsv3: as trained, it runs on a slower MLA kernel.
+latent = mla(num_heads=d_model // 64, kv_lora_rank=256, qk_nope_head_dim=64,
+             qk_rope_head_dim=32, v_head_dim=64, gated=true)
+
+model = # 2025 Qwen3-Next, 2026 Qwen3.8, MiMo-V2.6, MiniMax-M3: a quarter of the global
+        # layers' dims rotated at base 10M, which YaRN extends at 16k; the best global
+        # layer of the reference's sliding-window arms (zoo.bux's swa_prope)
+        west_prope:    west(fr_global(rope=rope(base=10000000, fraction=0.25)))
+      # 2025 Kimi Linear, 2026 Kimi K3: MLA without positions, its shared 32 dims not
+      # rotated; KV cache
+      | west_mla_nope: west(latent(rope=none))
+      # 2024 DeepSeek-V2/V3, 2026 GLM-5.3: MLA with its decoupled RoPE, which YaRN
+      # extends at 16k; KV cache
+      | west_mla:      west(latent(rope=rope()))
+
+# The frontier's best at d512 (milestones.bux's scan), for every arm.
+optimizer.lr = 2e-3
