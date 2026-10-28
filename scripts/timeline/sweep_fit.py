@@ -44,6 +44,7 @@ class Width:
     params: float
     active: float
     best: list[dict] = field(default_factory=list)
+    model: float | None = None  # the model's best sessions per hour per GPU
 
     def cost(self) -> float:
         """Sessions per hour per GPU, the mean of its lanes' bests (0 if none)."""
@@ -68,6 +69,7 @@ def widths(rows: list[dict], slo: float) -> dict[str, dict[int, Width]]:
     for (family, d, _), points in lanes.items():
         first = points[0]
         w = out[family].setdefault(d, Width(d, first["tp"], *_params(first)))
+        w.model = (first.get("predicted_best") or {}).get("sessions_per_hour")
         ok = [p["measured"] for p in points if p["measured"]["tpot_p50_ms"] <= slo]
         w.best.append(max(ok, key=lambda m: m["sessions_per_hour"], default={}))
     return out
@@ -178,7 +180,8 @@ def markdown(fams: dict, out: dict, analytic: dict, slo: float) -> str:
         f"Budget: old_2022 at d_model 4096 (GPT-3 6.7B's serving shape), its best "
         f"{budget:.0f} sessions/h per B300 at p50 TPOT <= {slo:g} ms: the mean of "
         f"{len(lanes)} lanes ({seeds}; spread {spread:.1%}). Each width: its best "
-        "sessions/h per GPU within the SLO (at sessions at once per GPU, its TP). "
+        "sessions/h per GPU within the SLO (at sessions at once per GPU, its TP; the "
+        "model's best there). "
         "Match: where the family's cost crosses the budget, in log-log against active "
         "parameters. Analytic: serving.py's match to its own budget (985/h), the "
         "targets the fits took before.\n"
@@ -195,7 +198,26 @@ def markdown(fams: dict, out: dict, analytic: dict, slo: float) -> str:
     ]
     for family, entry in out.items():
         lines.append(_row(family, fams[family], entry, analytic.get(family, {})))
-    return "\n".join(lines) + "\n"
+    return "\n".join([*lines, "", errors(fams)]) + "\n"
+
+
+def errors(fams: dict[str, dict[int, Width]]) -> str:
+    """The model's error: measured over modelled best sessions per hour, by width."""
+    ratios = {
+        f"{family} {d}": w.cost() / w.model
+        for family, ws in fams.items()
+        for d, w in ws.items()
+        if w.model and w.cost()
+    }
+    if not ratios:
+        return ""
+    values = sorted(ratios.values())
+    worst = sorted(ratios.items(), key=lambda kv: -abs(math.log(kv[1])))[:8]
+    return (
+        f"Measured over modelled best sessions/h, {len(values)} widths: median "
+        f"{statistics.median(values):.2f}, from {values[0]:.2f} to {values[-1]:.2f}; "
+        "farthest: " + ", ".join(f"{k} {v:.2f}" for k, v in worst) + "."
+    )
 
 
 def _row(family: str, ws: dict[int, Width], e: dict, a: dict) -> str:
@@ -204,7 +226,8 @@ def _row(family: str, ws: dict[int, Width], e: dict, a: dict) -> str:
         best = [b for b in w.best if b]
         c = "/".join(str(b["concurrency"] // w.tp) for b in best) or "-"
         tp = f", tp {w.tp}" if w.tp > 1 else ""
-        cells.append(f"{d}: {w.cost():.0f} ({c}{tp})")
+        model = f", model {w.model:.0f}" if w.model else ""
+        cells.append(f"{d}: {w.cost():.0f} ({c}{tp}{model})")
     via = f" via {e['via']}" if "via" in e else ""
     if "N_active" in e:
         tp = f", {e['tp']} GPUs" if e["tp"] > 1 else ""
