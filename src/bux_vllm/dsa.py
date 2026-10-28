@@ -52,12 +52,13 @@ PAGE = 64  # the tokens of a block that DeepGEMM's paged kernel reads
 
 def takes(spec: Sparse, dims: int, heads: int, dtype: torch.dtype) -> bool:
     """Whether the kernels pick the keys of a layer of `spec`, whose indexer has
-    `heads` of `dims`, in a model of `dtype` (by `CHOICE`)."""
-    on = (
-        dtype in (torch.bfloat16, torch.float16)
-        if CHOICE is None
-        else CHOICE == "native"
-    )
+    `heads` of `dims`, in a model of `dtype` (by `CHOICE`). MLA's take them under
+    ``native`` alone: their keys would take a head slot as wide as a latent, which
+    doubles its cache."""
+    if CHOICE is None:
+        on = dtype in (torch.bfloat16, torch.float16) and not spec.latent
+    else:
+        on = CHOICE == "native"
     size = spec.block_size  # DSA's keys, or QSA's blocks within a cache block
     blocks = size == 1 or (spec.mean and PAGE % size == 0)
     fits = blocks and spec.relu and not spec.per_group and spec.window is None

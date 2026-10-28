@@ -222,7 +222,7 @@ def test_native_indexer_queries_score_as_bux_s_indexer() -> None:
 def test_native_indexer_takes_deepseek_s_settings_alone() -> None:
     """vLLM's DSA kernels take single keys, ReLU'd dots summed over the heads, head
     dims of 32, 64 or 128, no window and a top-k of 2048 at most, in 16-bit
-    models."""
+    models; not MLA's latents unless asked for."""
     from bux_vllm import dsa, picks
 
     def spec(**c: Any) -> picks.Sparse:
@@ -238,6 +238,7 @@ def test_native_indexer_takes_deepseek_s_settings_alone() -> None:
             None,
             64,
             (0, 1),
+            latent=settings.get("latent", 0),
         )
         return sparse
 
@@ -254,6 +255,7 @@ def test_native_indexer_takes_deepseek_s_settings_alone() -> None:
         assert not dsa.takes(spec(relu=False), 64, 4, torch.bfloat16)
         assert not dsa.takes(spec(window=16), 64, 4, torch.bfloat16)
         assert not dsa.takes(spec(per_group=True), 64, 4, torch.bfloat16)
+        assert not dsa.takes(spec(latent=64), 64, 4, torch.bfloat16)
     assert dsa.padded_heads(3) >= 3
 
 

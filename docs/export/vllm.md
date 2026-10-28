@@ -466,7 +466,9 @@ heads at most, no window, and a `top_k` of 2048 at most. It takes DeepGEMM, whic
 vLLM installs, on an SM 9.0 or 10.x GPU. QSA's indexer (mean-pooled blocks of a
 size that divides 64) runs on them as DSA's over its blocks, with `top_k /
 block_size` blocks. MSA's (plain dots, picks per group) and the rest keep the
-plugin's own kernels above.
+plugin's own kernels above. So does a sparse `mla` layer's indexer, unless
+`BUX_VLLM_SPARSE_KERNELS=native`: its FP8 keys would take a head slot as wide as a
+latent, which doubles the layer's cache.
 
 - **Keys.** Each token's indexer key is cached in FP8 (e4m3) with a float32 scale,
   in head slots of the call's cache after its kv heads: each block's keys, then
