@@ -1317,44 +1317,53 @@ def test_each_layer_type_has_one_class() -> None:
     assert 'vars(value).get("bux_types"' in (FILES[0].parent / "model.py").read_text()
 
 
-# The timeline's hybrid at d_model 2816 (22 q/k heads, 44 value heads), whose KDA
-# projection is 17068 wide unpadded, and the parity case of odd widths.
+def timeline(kind: str, d_model: int) -> str:
+    """The timeline's delta-rule mixer `kind` at `d_model`: q/k heads of 128, as
+    wide together as the stream, twice as many value heads, the gate bound at -5."""
+    heads = d_model // 128
+    return (
+        f"{kind}(num_heads={heads}, num_v_heads={2 * heads}, head_dim=128,"
+        " gate_lower_bound=-5)"
+    )
+
+
+# The timeline's hybrids around their target (d_model 2816: KDA's projection 17068
+# wide unpadded), and shapes of odd widths.
 FUSED = {
-    "kda 2816": "kda(num_heads=22, num_v_heads=44, head_dim=128, gate_lower_bound=-5)",
+    **{f"{k} {d}": timeline(k, d) for k in ("kda", "gdn2") for d in (2816, 3584, 4096)},
     "kda odd": "kda(num_heads=2, num_v_heads=6, head_dim=32)",
-    "kda low rank": "kda(num_heads=3, num_v_heads=9, head_dim=16, output_gate_rank=8)",
-    "gdn2 odd": "gdn2(num_heads=3, num_v_heads=9, head_dim=24, v_head_dim=8)",
+    "kda low rank": "kda(num_heads=4, num_v_heads=12, head_dim=16, output_gate_rank=8)",
+    "gdn2 odd": "gdn2(num_heads=4, num_v_heads=12, head_dim=24, v_head_dim=8)",
 }
 
 
-@pytest.mark.parametrize("ranks", [1, 3])
+@pytest.mark.parametrize("ranks", [1, 2, 4])
 @pytest.mark.parametrize("mixer", FUSED.values(), ids=FUSED.keys())
-def test_a_ranks_fused_projection_is_padded_to_an_aligned_width(
+def test_a_ranks_fused_projection_is_laid_out_as_vllm_lays_it(
     mixer: str, ranks: int
 ) -> None:
-    """A rank's fused input projection of KDA and GDN-2 is a multiple of 64 wide, so
-    that inductor pads none of its matmuls, whose parts would otherwise cross the
-    graph's splits strided as vLLM did not trace them; its parts keep their widths,
-    and the padding's columns are each rank's share of the sizes'."""
-    c = next(compile(f"d_model = 72\nmodel = {mixer}").layers()).config
+    """KDA's and GDN-2's fused input projection on each rank: its parts, which the
+    layer splits its output by, are as wide as vLLM's merged layer makes the rank's
+    output (KDA's decay down projection whole on every rank), a multiple of 64 so
+    that inductor pads none of its matmuls, and the parts keep their widths."""
+    c = next(compile(f"d_model = 64\nmodel = {mixer}").layers()).config
     c = c.model_dump(mode="json")
     if c["num_heads"] % ranks:
         pytest.skip("heads that the ranks do not split")
-    projection = linear.kda_projection if c["type"] == "kda" else linear.gdn2_projection
-    sizes, split, parts = projection(c, ranks)
-    assert sum(split) % linear.ALIGN == 0
     h, hv, dk, dv = linear.linear_dims(c)
     want = [sum(linear.conv_channels(c)) // ranks]
     if c["type"] == "gdn2":
+        p = linear.gdn2_projection(c, ranks)
         want += [h * dk // ranks, hv * dv // ranks]
     else:
+        p = linear.kda_projection(c, ranks)
         gated = c["output_gate_rank"] is None
         want += [hv * dv // ranks] * gated + [c["gate_rank"] or dk, hv // ranks]
-    assert split[:parts] == want
-    if len(split) > parts:
-        assert sizes[-1] == split[-1] * ranks  # q, k and v are a size each
+        assert p.whole is not None and p.sizes[p.whole] == (c["gate_rank"] or dk)
+    assert p.split[: p.parts] == want
+    assert p.width(ranks) == sum(p.split) and sum(p.split) % linear.ALIGN == 0
     if mixer == FUSED["kda 2816"] and ranks == 1:
-        assert sum(split[:parts]) == 17068 and sum(split) == 17088
+        assert sum(want) == 17068 and sum(p.split) == 17088
 
 
 def test_padding_columns_are_zero() -> None:
