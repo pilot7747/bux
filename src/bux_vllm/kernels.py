@@ -2,7 +2,9 @@
 vLLM's paged caches in place where the PyTorch path (`bux_vllm.picks`) gathers the
 keys into memory first: the indexer's score of every key of each query's request
 (`scores`, and `prompt_scores` for a prompt's queries, a tile of them for each key
-read), and each query's softmax over the keys it picked (`attend`), in float32.
+read), each query's softmax over the keys it picked (`attend`), and a ``csa``
+query's over its window and the compressed latents it keeps (`csa_attend`), in
+float32.
 
 They run by default in a 16-bit model, and under ``BUX_VLLM_SPARSE_KERNELS=triton``
 in any (``torch`` keeps the PyTorch path), for the settings they take
@@ -20,7 +22,7 @@ import torch
 import triton
 import triton.language as tl
 
-from . import picks
+from . import compressed, picks
 from .picks import Picked, Sparse
 
 #: Which path the sparse ops take: ``triton``, ``torch``, or unset for the kernels
@@ -505,6 +507,205 @@ def attend(
         block_h=_block(h // g),
         block_dk=_block(dk),
         block_dv=_block(dv),
+        block_k=32,
+    )
+    return out
+
+
+@triton.jit
+def _online(
+    q,
+    cache_ptr,
+    rows,
+    ok,
+    d,
+    on_d,
+    top,
+    total,
+    acc,
+    scale,
+    softcap,
+    capped: tl.constexpr,
+):
+    """An online softmax's step over a tile of keys, which are the values too (csa's
+    latents), at `rows` of the cache where `ok`: the new running max, sum and
+    output."""
+    k = tl.load(
+        cache_ptr + rows[:, None] + d[None, :],
+        mask=ok[:, None] & on_d[None, :],
+        other=0.0,
+    )
+    logits = tl.dot(q, tl.trans(k.to(tl.float32)), input_precision="ieee") * scale
+    if capped:
+        logits = softcap * (2.0 * tl.sigmoid(2.0 * logits / softcap) - 1.0)
+    logits = tl.where(ok[None, :], logits, float("-inf"))
+    new = tl.maximum(top, tl.max(logits, axis=1))
+    safe = tl.where(new == float("-inf"), 0.0, new)
+    p = tl.exp(logits - safe[:, None])
+    fade = tl.exp(top - safe)
+    total = total * fade + tl.sum(p, axis=1)
+    step = tl.dot(p.to(k.dtype), k, input_precision="ieee").to(tl.float32)
+    return new, total, acc * fade[:, None] + step
+
+
+@triton.jit
+def _csa_kernel(
+    q_ptr,
+    window_ptr,
+    window_table_ptr,
+    latents_ptr,
+    latents_table_ptr,
+    kept_ptr,
+    seq_ptr,
+    pos_ptr,
+    sinks_ptr,
+    out_ptr,
+    stride_qt,
+    stride_qh,
+    stride_wb,
+    stride_wr,
+    stride_wt,
+    stride_lb,
+    stride_lr,
+    stride_lt,
+    stride_kt,
+    stride_ot,
+    stride_oh,
+    span,
+    n_kept,
+    scale,
+    softcap,
+    heads: tl.constexpr,
+    dims: tl.constexpr,
+    page: tl.constexpr,
+    per_block: tl.constexpr,
+    capped: tl.constexpr,
+    sunk: tl.constexpr,
+    block_h: tl.constexpr,
+    block_d: tl.constexpr,
+    block_k: tl.constexpr,
+):
+    """One token's heads of a tile: an online softmax over its window of `span`
+    token latents, then the `n_kept` compressed latents it keeps (-1 for none), the
+    sinks beside them; the latents are the keys and the values."""
+    t, part = tl.program_id(0), tl.program_id(1)
+    head = part * block_h + tl.arange(0, block_h)
+    on_h = head < heads
+    d = tl.arange(0, block_d)
+    on_d = d < dims
+    q = tl.load(
+        q_ptr + t * stride_qt + head[:, None] * stride_qh + d[None, :],
+        mask=on_h[:, None] & on_d[None, :],
+        other=0.0,
+    ).to(tl.float32)
+    seq, p = tl.load(seq_ptr + t).to(tl.int64), tl.load(pos_ptr + t)
+    top = tl.full([block_h], float("-inf"), tl.float32)
+    total = tl.zeros([block_h], tl.float32)
+    acc = tl.zeros([block_h, block_d], tl.float32)
+    for start in range(0, span, block_k):
+        j = start + tl.arange(0, block_k)
+        near = p - (span - 1 - j)
+        ok = (j < span) & (near >= 0)
+        at = window_table_ptr + seq * stride_wt + near // page
+        block = tl.load(at, mask=ok, other=0).to(tl.int64)
+        rows = block * stride_wb + (near % page) * stride_wr
+        top, total, acc = _online(
+            q, window_ptr, rows, ok, d, on_d, top, total, acc, scale, softcap, capped
+        )
+    for start in range(0, n_kept, block_k):
+        j = start + tl.arange(0, block_k)
+        inside = j < n_kept
+        kept = tl.load(kept_ptr + t * stride_kt + j, mask=inside, other=-1)
+        ok = inside & (kept >= 0)
+        at = latents_table_ptr + seq * stride_lt + kept // per_block
+        block = tl.load(at, mask=ok, other=0).to(tl.int64)
+        rows = block * stride_lb + (kept % per_block) * stride_lr
+        top, total, acc = _online(
+            q, latents_ptr, rows, ok, d, on_d, top, total, acc, scale, softcap, capped
+        )
+    kept_any = total > 0
+    if sunk:
+        sink = tl.load(sinks_ptr + head, mask=on_h, other=0.0).to(tl.float32)
+        most = tl.maximum(top, sink)
+        fade = tl.exp(top - most)
+        total, acc = total * fade + tl.exp(sink - most), acc * fade[:, None]
+    out = tl.where(
+        kept_any[:, None], acc / tl.where(kept_any, total, 1.0)[:, None], 0.0
+    )
+    tl.store(
+        out_ptr + t * stride_ot + head[:, None] * stride_oh + d[None, :],
+        out.to(out_ptr.dtype.element_ty),
+        mask=on_h[:, None] & on_d[None, :],
+    )
+
+
+def takes_csa(dtype: torch.dtype, dims: int) -> bool:
+    """Whether the kernel attends a ``csa`` call of heads of `dims` in a cache of
+    `dtype` (`csa_attend`), by `CHOICE`."""
+    on = (
+        dtype in (torch.bfloat16, torch.float16)
+        if CHOICE is None
+        else CHOICE == "triton"
+    )
+    return on and dims <= MOST_DIMS
+
+
+def csa_attend(
+    caches: compressed.Caches,
+    steps: compressed.Steps,
+    s: compressed.Settings,
+    q: torch.Tensor,
+    kept: torch.Tensor | None,
+    sinks: torch.Tensor | None,
+) -> torch.Tensor:
+    """`bux_vllm.compressed.attend` by a kernel, which reads the window's and the
+    compressed latents in place: each query, q (T, h, d), over its window of token
+    latents and the compressed latents it keeps (`kept`, by index, -1 for none), in
+    one softmax with the sinks; (T, h, d)."""
+    q = q.contiguous()
+    n, h, d = q.shape
+    span = min(s.window or steps.longest, steps.longest)
+    window = caches.window
+    latents = caches.compressed if kept is not None else None
+    if latents is None or kept is None:
+        latents, kept = window, q.new_full((n, 0), -1, dtype=torch.long)
+    kept = kept.contiguous()
+    out = torch.empty_like(q)
+    block_h = min(_block(h), 64)
+    _csa_kernel[(n, triton.cdiv(h, block_h))](
+        q,
+        window.cache,
+        window.block_table,
+        latents.cache,
+        latents.block_table,
+        kept,
+        steps.seq.contiguous(),
+        steps.positions.contiguous(),
+        sinks if sinks is not None else q.new_zeros(1),
+        out,
+        q.stride(0),
+        q.stride(1),
+        window.cache.stride(0),
+        window.cache.stride(1),
+        window.block_table.stride(0),
+        latents.cache.stride(0),
+        latents.cache.stride(1),
+        latents.block_table.stride(0),
+        kept.stride(0),
+        out.stride(0),
+        out.stride(1),
+        span,
+        kept.shape[1],
+        s.scale,
+        s.softcap or 1.0,
+        heads=h,
+        dims=d,
+        page=window.cache.shape[1],
+        per_block=latents.cache.shape[1],
+        capped=s.softcap is not None,
+        sunk=sinks is not None,
+        block_h=block_h,
+        block_d=_block(d),
         block_k=32,
     )
     return out

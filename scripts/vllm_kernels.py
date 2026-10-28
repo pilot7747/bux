@@ -1,5 +1,6 @@
 """Check the vLLM plugin's Triton kernels for sparse attention (`bux_vllm.kernels`)
-against its PyTorch path (`bux_vllm.picks`) on a GPU, on random paged caches.
+against its PyTorch paths (`bux_vllm.picks`, and `bux_vllm.compressed` for csa) on a
+GPU, on random paged caches.
 
 Run it where the plugin and Triton are installed, with a CUDA GPU::
 
@@ -22,7 +23,7 @@ os.environ["BUX_VLLM_SPARSE_KERNELS"] = "triton"
 
 import torch
 
-from bux_vllm import indexer, kernels, picks
+from bux_vllm import compressed, indexer, kernels, picks
 
 TOLERANCE = {torch.float32: 1e-4, torch.bfloat16: 2e-2}
 SETTINGS = {
@@ -110,11 +111,73 @@ def compare(name: str, settings: dict, dtype: torch.dtype, decoding: bool) -> bo
     return ok
 
 
+#: csa's settings: a window, sinks, a softcap, and compressed latents or none.
+CSA = {
+    "csa": {"window": 16, "sinks": True},
+    "csa, softcap, no window": {"window": None, "softcap": 30.0},
+    "csa, window alone": {"window": 16, "sinks": True, "kept": False},
+}
+
+
+def paged(
+    lengths: list[int], per: int, width: int, dtype: torch.dtype
+) -> compressed.Paged:
+    """A random `compressed.Paged` cache of rows of `width`, `per` rows a block,
+    for sequences of `lengths` rows, its blocks shuffled."""
+    blocks = sum(-(-n // per) for n in lengths) + 1
+    cache = torch.randn(blocks, per, width, device="cuda", dtype=dtype)
+    order = torch.randperm(blocks - 1, device="cuda") + 1
+    table = torch.zeros(len(lengths), max(-(-n // per) for n in lengths) + 1)
+    table = table.to(device="cuda", dtype=torch.int32)
+    at = 0
+    for r, n in enumerate(lengths):
+        count = -(-n // per)
+        table[r, :count] = order[at : at + count]
+        at += count
+    return compressed.Paged(cache, table)
+
+
+def compare_csa(name: str, c: dict, dtype: torch.dtype, decoding: bool) -> bool:
+    """Whether the csa kernel's outputs are compressed.attend's."""
+    torch.manual_seed(0)
+    h, d, ratio, top_k = 8, 64, 4, 24
+    lengths = [300, 97, 1, 513] if decoding else [300]
+    window = paged(lengths, 16, d, dtype)
+    latents = paged([n // ratio + 1 for n in lengths], 4, d, dtype)
+    caches = compressed.Caches(window, torch.zeros(1), latents)
+    if decoding:
+        positions = torch.tensor([n - 1 for n in lengths], device="cuda")
+        seq = torch.arange(len(lengths), device="cuda")
+    else:
+        positions = torch.arange(lengths[0], device="cuda")
+        seq = torch.zeros_like(positions)
+    steps = compressed.Steps(positions, seq, 0, [], max(lengths))
+    seen = (positions + 1) // ratio
+    scores = torch.rand(len(positions), max(lengths) // ratio, device="cuda")
+    kept = compressed.top(scores, seen, top_k) if c.get("kept", True) else None
+    softcap = c.get("softcap")
+    settings = compressed.Settings(c["window"], ratio, top_k, True, d**-0.5, softcap)
+    sinks = torch.randn(h, device="cuda") if c.get("sinks") else None
+    q = torch.randn(len(positions), h, d, device="cuda", dtype=dtype)
+    want = compressed.attend(caches, steps, settings, q, kept, sinks)
+    got = kernels.csa_attend(caches, steps, settings, q, kept, sinks)
+    error = (got.float() - want.float()).abs().max().item()
+    layout = "decoding" if decoding else "prefill"
+    print(f"{name:32} {dtype!s:15} {layout:9} error {error:.2e}")
+    return error <= TOLERANCE[dtype]
+
+
 def main() -> int:
     """Compare every setting, dtype and layout; 1 if any differ."""
     results = [
         compare(name, settings, dtype, decoding)
         for name, settings in SETTINGS.items()
+        for dtype in TOLERANCE
+        for decoding in (False, True)
+    ]
+    results += [
+        compare_csa(name, c, dtype, decoding)
+        for name, c in CSA.items()
         for dtype in TOLERANCE
         for decoding in (False, True)
     ]

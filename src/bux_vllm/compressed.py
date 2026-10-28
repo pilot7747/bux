@@ -484,12 +484,14 @@ def mix(
     index: tuple[torch.Tensor, torch.Tensor] | None,
     sinks: torch.Tensor | None,
     picks: Picks | None = None,
+    attend_by: Callable[..., torch.Tensor] | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor | None, torch.Tensor | None]:
     """A step of a ``csa`` call: write its token latents (T, d) and compressed rows
     (T, width, for the tokens that end a group; None for a call that reads another's
     through its ``kv`` port, whose caches `caches` hold), pick the compressed latents
     each query keeps (by the indexer's queries and weights, `index`, or as its ports'
-    `picks` say), and attend the queries q (T, h, d) to them and their windows.
+    `picks` say), and attend the queries q (T, h, d) to them and their windows, by
+    `attend` or `attend_by` (the plugin's kernel, `bux_vllm.kernels.csa_attend`).
     Returns the outputs, (T, h, d), the picks and the candidate pool made, if any."""
     caches.window.write(caches.slots, latent)
     picks, kept, pool = picks or Picks(), None, None
@@ -503,7 +505,7 @@ def mix(
             kept, pool = select(caches, steps, s, *index, picks)
         else:
             kept = every(seen, steps.longest // s.ratio)
-    return attend(caches, steps, s, q, kept, sinks), kept, pool
+    return (attend_by or attend)(caches, steps, s, q, kept, sinks), kept, pool
 
 
 # --- the layer's own arithmetic ----------------------------------------------------
