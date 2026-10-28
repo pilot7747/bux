@@ -187,6 +187,16 @@ CASES = {
     " load_balancing=aux_free, expert=dense)\n"
     + MOE_BLOCK
     + "model = embed block^2 rmsnorm head",
+    # Muse Spark's routed experts: each one's output normalized, in a latent.
+    "moe-norm": HEAD
+    + ATTN
+    + EXPERT
+    + "experts = moe(num_experts=8, top_k=2, num_shared_experts=1, router=sigmoid,"
+    " routed_scaling_factor=2.5, load_balancing=aux_free, latent_size=32,"
+    " latent_input_norm=rmsnorm, expert_norm=rmsnorm(eps=1e-8, zero_centered=true,"
+    " scale_input=true), expert=dense)\n"
+    + MOE_BLOCK
+    + "model = embed block^2 rmsnorm head",
     "engram": LLAMA
     + "memory = engram(head_dim=8, table_size=12288)\n"
     + "model = embed block memory block rmsnorm head(tied=true)",
