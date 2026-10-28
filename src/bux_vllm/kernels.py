@@ -56,14 +56,17 @@ def _scores_kernel(
     stride_qh,
     stride_wt,
     stride_cb,
+    stride_cg,
     stride_cs,
     stride_tt,
     stride_ot,
     stride_og,
     n_keys,
     first,
+    start,
     heads: tl.constexpr,
     dims: tl.constexpr,
+    share: tl.constexpr,
     page: tl.constexpr,
     relu: tl.constexpr,
     groups: tl.constexpr,
@@ -72,11 +75,13 @@ def _scores_kernel(
     block_s: tl.constexpr,
 ):
     """One query's scores of `block_s` keys: ``sum_j w_j ReLU(q_j . k_s)``, or each
-    of the `groups` heads' from `first` on, ``w_j ReLU(q_j . k_s)``, with `groups`."""
+    of the `groups` heads' from `first` on, ``w_j ReLU(q_j . k_s)``, with `groups`;
+    a key's channels `share` a kv head, from channel `start` of its row on."""
     t, part = tl.program_id(0), tl.program_id(1)
     s = part * block_s + tl.arange(0, block_s)
     h, i = tl.arange(0, block_h), tl.arange(0, block_i)
     on_h, on_i, inside = h < heads, i < dims, s < n_keys
+    spread = (i // share) * stride_cg + start + i % share
     q = tl.load(
         q_ptr + t * stride_qt + h[:, None] * stride_qh + i[None, :],
         mask=on_h[:, None] & on_i[None, :],
@@ -86,7 +91,7 @@ def _scores_kernel(
     block = tl.load(table_ptr + t * stride_tt + s // page, mask=inside, other=0)
     rows = block.to(tl.int64) * stride_cb + (s % page) * stride_cs
     k = tl.load(
-        cache_ptr + rows[:, None] + i[None, :],
+        cache_ptr + rows[:, None] + spread[None, :],
         mask=inside[:, None] & on_i[None, :],
         other=0.0,
     ).to(tl.float32)
@@ -105,7 +110,7 @@ def _scores_kernel(
 def scores(
     q: torch.Tensor,
     w: torch.Tensor,
-    cache: torch.Tensor,
+    cache: picks.Cache,
     rows: torch.Tensor,
     n: int,
     relu: bool,
@@ -118,7 +123,8 @@ def scores(
     Args:
         q: The indexer's queries, (Q, H, i), the last axis contiguous.
         w: Their heads' weights, (Q, H).
-        cache: The paged index cache, (blocks, 1, block_size, i).
+        cache: The call's paged cache, its indexer keys beside its keys and
+            values.
         rows: Each query's request's block table, (Q, blocks).
         n: How many keys to score.
         relu: Whether to ReLU the dot products.
@@ -128,27 +134,30 @@ def scores(
     first, count = groups or (0, 0)
     shape = (q.shape[0], count, n) if groups else (q.shape[0], n)
     out = torch.empty(shape, dtype=torch.float32, device=q.device)
-    block_s = 64
+    block_s, pages = 64, cache.cache
     grid = (q.shape[0], triton.cdiv(n, block_s))
     _scores_kernel[grid](
         q,
         w,
-        cache,
+        pages,
         rows,
         out,
         q.stride(0),
         q.stride(1),
         w.stride(0),
-        cache.stride(0),
-        cache.stride(2),
+        pages.stride(0),
+        pages.stride(1),
+        pages.stride(2),
         rows.stride(0),
         out.stride(0),
         out.stride(1) if groups else 0,
         n,
         first,
+        cache.channels,
         heads=q.shape[1],
         dims=q.shape[2],
-        page=cache.shape[2],
+        share=pages.shape[3] - cache.channels,
+        page=pages.shape[2],
         relu=relu,
         groups=count,
         block_h=_block(q.shape[1]),
@@ -315,25 +324,25 @@ def attend_segment(
     q: torch.Tensor,
     index: tuple[torch.Tensor, torch.Tensor],
     positions: torch.Tensor,
-    caches: tuple[torch.Tensor, torch.Tensor],
-    rows: tuple[torch.Tensor, torch.Tensor],
+    cache: picks.Cache,
+    rows: torch.Tensor,
     n: int,
 ) -> tuple[torch.Tensor, Picked]:
     """`bux_vllm.picks.attend_segment` by the kernels: each chunk of queries' scores
     (`scores`), its picks as bux ranks them, and its attention over them (`attend`);
     the outputs, and the picks padded to `bux_vllm.picks.most` keys a query."""
-    count, shared = q.shape[0], rows[0].shape[0] == 1
-    table, index_table = (r.expand(count, -1) for r in rows)
+    count, shared = q.shape[0], rows.shape[0] == 1
+    table = rows.expand(count, -1)
     span = torch.arange(n, device=q.device)
-    keys = picks.gather(caches[1], rows[1], span[None])[0, 0] if shared else None
-    per = picks._per_query(spec, q, index[0], caches[0], n, shared or not spec.mean)
+    keys = cache.keys(rows, span[None])[0] if shared else None
+    per = picks._per_query(spec, q, index[0], cache.kv, n, shared or not spec.mean)
     chunk, outs, kept = max(1, picks.BUDGET // per), [], []
     for a in range(0, count, chunk):
         cut = slice(a, a + chunk)
         iq, iw = (t[cut].contiguous() for t in index)
-        where = (positions[cut], index_table[cut], n)
-        picked = _choose(spec, (iq, iw), caches[1], keys, where)
-        outs.append(attend(spec, q[cut].contiguous(), caches[0], table[cut], picked))
+        where = (positions[cut], table[cut], n)
+        picked = _choose(spec, (iq, iw), cache, keys, where)
+        outs.append(attend(spec, q[cut].contiguous(), cache.kv, table[cut], picked))
         kept.append(picks.padded(picked, picks.most(spec)))
     out_keys, valid = zip(*kept, strict=True)
     return torch.cat(outs), (torch.cat(out_keys), torch.cat(valid))
@@ -362,7 +371,7 @@ def attend_picked(
 def _choose(
     spec: Sparse,
     index: tuple[torch.Tensor, torch.Tensor],
-    cache: torch.Tensor,
+    cache: picks.Cache,
     keys: torch.Tensor | None,
     where: tuple[torch.Tensor, torch.Tensor, int],
 ) -> Picked:
@@ -375,7 +384,7 @@ def _choose(
     see = picks.seen(positions, n, spec.window)
     if keys is None and spec.mean:
         span = torch.arange(n, device=positions.device)
-        keys = picks.gather(cache, table, span.expand(positions.shape[0], n))[:, 0]
+        keys = cache.keys(table, span.expand(positions.shape[0], n))
     if keys is not None:
         return picks.choose(spec, *index, keys, see, positions)
     groups = spec.groups if spec.per_group else None

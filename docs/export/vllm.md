@@ -227,10 +227,12 @@ layer: a window, sinks, a softcap, and a `gqa` layer's conv on keys and values a
 `v` port.
 
 - **Caches.** Each call keeps its keys and values in vLLM's paged KV cache, as a
-  dense layer does, and its indexer's keys beside them: one vector of the
+  dense layer does, and its indexer's keys in the same rows: one vector of the
   indexer's `head_dim` per token, normalized and rotated (QSA's as projected,
-  pooled again at each step). vLLM allocates both as for full attention, so they
-  grow with the sequence and take part in prefix caching.
+  pooled again at each step), split over the kv heads. vLLM allocates the cache
+  as for full attention, so it grows with the sequence, in blocks of as many
+  tokens as the model's other attention caches, and prefix caching hits as often
+  as in a dense model.
 - **Picks.** Each query scores every key it sees by the indexer, in float32, and
   keeps the best as bux ranks them: by the floats' bits, the first of equal ones.
   It attends to those keys alone, read from the paged cache by the block table,
