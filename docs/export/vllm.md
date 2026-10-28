@@ -142,6 +142,11 @@ ones, `--load-format dummy`, to time it.
 - **Ports.** A layer's ports go through the forward pass's taps, as in bux: a `gqa`
   layer that reads the `v` port mixes those values into its own before they enter
   its KV cache, and one that writes it pushes its values, mixed or not.
+- **Shared KV caches.** A `gqa` layer that reads the `kv` port keeps no KV cache:
+  vLLM shares its writer's with it (its cross-layer KV sharing, as Gemma 3n's), and
+  it projects its queries alone. The plugin finds each reader's writer before the
+  model runs, by the taps' pushes and pops in the order the layers run, so a model
+  that shares its caches serves more tokens in the same memory.
 
 ## What runs
 
@@ -149,7 +154,7 @@ ones, `--load-format dummy`, to time it.
 |--------|---------|
 | `embed`, `head` | the vocabulary split over ranks; learned positions, `scale_by_sqrt_dim`, `norm`; tied or untied, a bias, soft-capping |
 | `rmsnorm`, `layernorm`, `mlp`, `gated_mlp`, `linear`, `act`, `scale`, `dropout` | yes, with the MLPs' `limit`, `up_softcap` and `up_offset` |
-| `gqa` | RoPE (`pi`, `llama3`, `yarn`), QK-norm, GQA and MQA, biases, `fused_qkv`, sliding windows, soft-capping, sinks, its scale, `gated` (a gate per channel or per head, with `gate_head_bias`), `output_norm`, `power_scale` and `log_scale` (on the queries, which scales the logits as bux does), the conv on keys and values (`kv_conv_size`), an indexer ([Sparse attention](#sparse-attention)), and the `v` port: the value residual, fixed, learned or convex. QK-norm runs across all heads too (`qk_norm_all_heads`), its statistics summed over the ranks, where each rank keeps kv heads of its own. Not yet: a relative bias, or the `kv` and `index` ports |
+| `gqa` | RoPE (`pi`, `llama3`, `yarn`), QK-norm, GQA and MQA, biases, `fused_qkv`, sliding windows, soft-capping, sinks, its scale, `gated` (a gate per channel or per head, with `gate_head_bias`), `output_norm`, `power_scale` and `log_scale` (on the queries, which scales the logits as bux does), the conv on keys and values (`kv_conv_size`), an indexer ([Sparse attention](#sparse-attention)), the `v` port: the value residual, fixed, learned or convex, and the `kv` port: cross-layer KV sharing, by vLLM's own, between layers of the same kv heads, the reader's window no longer than the writer's. QK-norm runs across all heads too (`qk_norm_all_heads`), its statistics summed over the ranks, where each rank keeps kv heads of its own. Not yet: a relative bias, the `index` port, or the `kv` port of a sparse layer |
 | `mla` | by vLLM's MLA and its latent cache ([Multi-head latent attention](#multi-head-latent-attention)): queries at full rank or from a latent, RoPE (`pi`, `llama3`, `yarn`; partial, interleaved) or none, its scale, `gated` (a gate per channel or per head), `output_norm`; in bfloat16 or float16. Not yet: QK-norm, sliding windows, soft-capping, sinks, an indexer, a relative bias, `log_scale`, `gate_head_bias`, ports, `mla` beside `gqa`, or `mla` layers of different dims or heads |
 | `csa` | bux's arithmetic on vLLM's paged caches ([Compressed sparse attention](#compressed-sparse-attention)): a sliding window or every token, compressed latents of any `compress_ratio`, the indexer's top-k (ReLU'd or plain dots, weighted or summed, its norm), queries at full rank or from a latent, QK-norm, RoPE (`pi`, `llama3`, `yarn`; partial, interleaved), sinks, soft-capping, its scale, `gated` (a gate per channel or per head, `gate_head_bias`), `output_norm`, and a dense or grouped low-rank output; in float32 or bfloat16. Not yet: the `kv`, `index` and `candidates` ports, an indexer of blocks, a relative bias, `log_scale`, speculative decoding, decode context parallelism, or an FP8 KV cache |
 | `moe` | softmax, sigmoid and `sqrtsoftplus` routers, `router_logit_scale`, groups, the aux-free bias, a router bias, shared experts and their gate, gated and plain experts (`swish`, `gelu`, `gelu_tanh`, `relu2`) with biases, a `limit` and `up_offset` on `swish` and `quick_gelu` gates (gpt-oss's), LatentMoE with its norms (vLLM's fused experts at the latent's width), shared experts the router scores (`shared_expert_sink`), and each routed expert's output normalized before its weight (`expert_norm`; each of a token's picks a row of its own in vLLM's fused MoE, so that their outputs come back apart, summed over the ranks, for the norm). Not yet: the experts' `up_softcap` |
@@ -381,4 +386,6 @@ On the CPU, `tests/test_export_vllm.py` runs the plugin's arithmetic on paged ca
 of its own, prompts in chunks beside decoded tokens, against the export's layer.
 
 The script's `moe-norm` case checks Muse Spark's routed experts, each one's output
-normalized before its weight, in a latent of 32. The table above does not cover it.
+normalized before its weight, in a latent of 32, and `kv-share` Hymba's cross-layer
+KV sharing: a windowed layer's keys and values read by the next layer or two, and a
+full layer's by one with a window of its own. The table above does not cover them.

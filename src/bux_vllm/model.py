@@ -30,7 +30,7 @@ from vllm.model_executor.models.interfaces import IsHybrid
 from vllm.sequence import IntermediateTensors
 from vllm.v1.kv_cache_interface import MambaSpec
 
-from . import conv, engram, residual, ssm
+from . import conv, engram, kv, residual, ssm
 from .common import Ctx, Layer, Site
 from .config import states
 from .plan import (
@@ -97,11 +97,39 @@ def state_names(calls: list[Call]) -> dict[str, list[str]]:
     out: dict[str, list[str]] = {}
     for call in calls:
         if _class(call).stateful:
-            kinds = states(call.layer["config"]) or ["state"]
+            kinds = states(call.layer["config"], ports(call.layer)) or ["state"]
             names = out.setdefault(call.path, [])
             for i, kind in enumerate(kinds):
                 path = call.path if i == 0 else f"{call.path}.{kind}"
                 names.append(cache_name(sum(map(len, out.values())), path))
+    return out
+
+
+def kv_shares(
+    calls: list[Call], names: dict[str, list[str]]
+) -> dict[str, list[str | None]]:
+    """The KV cache each call of a layer attends to instead of its own, by the
+    layer's path: the first state of the call whose ``kv`` port it reads
+    (`bux_vllm.kv.sources`), by its name in `names` (`state_names`); None for its
+    own.
+
+    Raises:
+        NotImplementedError: vLLM cannot share those keys and values with it
+            (`bux_vllm.kv.check_shared`).
+    """
+    own: list[str | None] = []
+    count: Counter[str] = Counter()
+    for call in calls:
+        kinds = len(states(call.layer["config"], ports(call.layer))) or 1
+        mine = names.get(call.path)
+        own.append(mine[count[call.path] * kinds] if mine else None)
+        count[call.path] += 1
+    out: dict[str, list[str | None]] = {}
+    for call, source in zip(calls, kv.sources([ports(c.layer) for c in calls])):
+        if source is not None:
+            writer = calls[source].layer
+            kv.check_shared(call.layer["config"], writer["config"], writer["width"])
+        out.setdefault(call.path, []).append(None if source is None else own[source])
     return out
 
 
@@ -115,6 +143,7 @@ def build_layers(vllm_config: VllmConfig, p: Plan) -> dict[str, nn.Module]:
     config = vllm_config.model_config.hf_config
     calls = live(p.calls)
     states, count = state_names(calls), Counter(c.path for c in calls)
+    shares = kv_shares(calls, states)
     layers: dict[str, nn.Module] = {}
     embedding = None
     for call in (c for c in p.calls if c.first):
@@ -131,6 +160,7 @@ def build_layers(vllm_config: VllmConfig, p: Plan) -> dict[str, nn.Module]:
             states.get(call.path, []),
             embedding,
             ports(node),
+            shares.get(call.path, []),
         )
         layer = layers[call.path] = cls(node["config"], node["width"], site)
         if embedding is None and node["config"]["type"] == "embed":
