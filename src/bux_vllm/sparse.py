@@ -2,15 +2,22 @@
 indexer's keys in vLLM's paged KV cache, and each query's attention over the keys
 its indexer picks, as bux computes them (`bux_vllm.picks`).
 
-Each call of a sparse layer keeps two of vLLM's caches, `PagedCache`: its keys and
-values, as a dense layer's, and its indexer's keys, one vector a token. vLLM
-allocates their blocks as for full attention, so they grow with the sequence and
-serve prefix caching. The plugin writes and reads them itself, in one op,
-``vllm::bux_sparse_attention``, which runs eagerly: vLLM splits its CUDA graphs
-around it (`split_graphs`), as around attention, and captures no whole-step graph
-of a model with one (`PagedMetadataBuilder`). The op also gives the keys each query
-picked, which a layer that reads them through its ``index`` port attends over with
-``vllm::bux_picked_attention``, keeping no indexer keys of its own.
+Each call of a sparse layer keeps one of vLLM's caches, `PagedCache`: its keys and
+values, as a dense layer's, each kv head's row with its share of the indexer's key
+beside them (`bux_vllm.picks.Cache`). vLLM allocates its blocks as for full
+attention, so they grow with the sequence, and in blocks of as many tokens as the
+model's other attention caches, so they serve prefix caching as those do (a cache
+of indexer keys alone, smaller a token, would get blocks of more tokens, which a
+prefix would have to fill to be cached). The plugin writes and reads it itself, in
+one op, ``vllm::bux_sparse_attention``, which runs eagerly: vLLM splits its CUDA
+graphs around it (`split_graphs`), as around attention, and captures no whole-step
+graph of a model with one (`PagedMetadataBuilder`). The op also gives the keys each
+query picked, which a layer that reads them through its ``index`` port attends over
+with ``vllm::bux_picked_attention``, keeping no indexer keys of its own.
+
+A layer with a relative bias attends to every key it sees, the bias on its logits,
+in ``vllm::bux_biased_attention`` over a cache of the same kind: no attention kernel
+of vLLM's adds a bias that depends on the query and on how far behind it a key is.
 """
 
 from __future__ import annotations
@@ -29,10 +36,15 @@ from vllm.v1.attention.backend import (
 )
 from vllm.v1.kv_cache_interface import FullAttentionSpec
 
-from . import picks
+from . import kernels, picks
+from .kv import reads, writes
 
 #: The ops, as vLLM's compilation names them.
-OPS = ("vllm::bux_sparse_attention", "vllm::bux_picked_attention")
+OPS = (
+    "vllm::bux_sparse_attention",
+    "vllm::bux_picked_attention",
+    "vllm::bux_biased_attention",
+)
 
 
 class PagedMetadataBuilder(AttentionMetadataBuilder[CommonAttentionMetadata]):
@@ -73,18 +85,19 @@ class PagedBackend(AttentionBackend):
 
 
 class PagedCache(nn.Module, AttentionLayerBase):
-    """`heads` vectors of `channels` a token in vLLM's paged KV cache, allocated as
-    for full attention, which `kv_cache` views as ``[blocks, heads, block_size,
-    channels]``.
+    """A sparse call's `heads` vectors of `channels` a token, and its indexer's key
+    of `index_dims` spread over them, in vLLM's paged KV cache, allocated as for
+    full attention, which `kv_cache` views as ``[blocks, heads, block_size,
+    channels + ceil(index_dims / heads)]`` (`bux_vllm.picks.Cache`).
 
     Args:
-        heads: The vectors of a token.
-        channels: Each vector's channels: a key's and a value's, or an indexer key's.
+        heads: The kv heads of a token.
+        channels: Each head's channels: a key's and a value's, or MLA's latent.
         vllm_config: vLLM's config of the engine.
         prefix: vLLM's name of the cache, unique in the model.
-        sparse: The settings of the layer's call whose keys and values it keeps,
-            which the op attends with; None for an indexer's cache.
-        index_name: The name of that call's indexer cache.
+        sparse: The settings of the call, which the op attends with.
+        index_dims: The channels of its indexer's key; 0 for a call that reads its
+            picks from its ``index`` port.
 
     Raises:
         NotImplementedError: The KV cache is quantized, which the plugin's sparse
@@ -97,8 +110,8 @@ class PagedCache(nn.Module, AttentionLayerBase):
         channels: int,
         vllm_config: Any,
         prefix: str,
-        sparse: picks.Sparse | None = None,
-        index_name: str = "",
+        sparse: picks.Sparse,
+        index_dims: int = 0,
     ):
         super().__init__()
         cache = vllm_config.cache_config
@@ -107,8 +120,9 @@ class PagedCache(nn.Module, AttentionLayerBase):
                 f"gqa: an indexer with a {cache.cache_dtype} KV cache"
             )
         self.heads, self.channels, self.prefix = heads, channels, prefix
+        self.index_dims, self.share = index_dims, -(-index_dims // heads)
         self.dtype = vllm_config.model_config.dtype
-        self.sparse, self.index_name = sparse, index_name
+        self.sparse = sparse
         self.kv_cache = torch.tensor([])
         context = vllm_config.compilation_config.static_forward_context
         if prefix in context:
@@ -119,14 +133,89 @@ class PagedCache(nn.Module, AttentionLayerBase):
         return PagedBackend
 
     def get_kv_cache_spec(self, vllm_config: Any) -> FullAttentionSpec:
-        half = self.channels // 2  # a key's and a value's dims, as vLLM sums them
+        row = self.channels + self.share
+        half = row // 2  # a key's and a value's dims, as vLLM sums them
         return FullAttentionSpec(
             block_size=vllm_config.cache_config.block_size,
             num_kv_heads=self.heads,
-            head_size=self.channels - half,
+            head_size=row - half,
             head_size_v=half,
             dtype=self.dtype,
         )
+
+    @property
+    def rows(self) -> picks.Cache:
+        """The cache, its keys and values apart from its indexer keys."""
+        return picks.Cache(self.kv_cache, self.channels, self.index_dims)
+
+
+def layer_caches(
+    spec: picks.Sparse,
+    heads: int,
+    channels: int,
+    index_dims: int,
+    names: dict[str, list[str]],
+    vllm_config: Any,
+) -> nn.ModuleList:
+    """Each call's `PagedCache` of a sparse layer, by the names of its states: its
+    keys and values, `heads` vectors of `channels` a token, attended with `spec`,
+    and its indexer's keys, `index_dims` a token (0 for a layer that reads its
+    picks from its ``index`` port)."""
+    caches = nn.ModuleList(
+        PagedCache(heads, channels, vllm_config, name, spec, index_dims)
+        for name in names["full_attention"]
+    )
+    split_graphs(vllm_config)
+    return caches
+
+
+def attend(
+    tensors: tuple[torch.Tensor, torch.Tensor, torch.Tensor],
+    index: tuple[torch.Tensor, ...] | None,
+    out: torch.Tensor,
+    cache: Any,
+    ports: list,
+    ctx: Any,
+) -> torch.Tensor:
+    """A sparse layer's call: its queries, keys and values (`tensors`) attend into
+    `out` by the indexer's picks, `index` its queries, head weights and keys of the
+    step's tokens, or by the picks its ``index`` port reads (None), over the call's
+    `PagedCache` `cache`; the picks go on to the taps of the port it writes. Returns
+    `out`."""
+    q, k, v = (t.contiguous() for t in tensors)
+    taps = writes(ports, "index")
+    if index is None:
+        read = reads(ports, "index")
+        assert read is not None, "a sparse layer reads its picks or has an indexer"
+        kept = ctx.read(*read)
+        torch.ops.vllm.bux_picked_attention(
+            q, k, v, *kept, ctx.positions, out, cache.prefix
+        )
+    else:
+        kept = _no_picks(cache.sparse, q, len(taps))
+        torch.ops.vllm.bux_sparse_attention(
+            q,
+            k,
+            v,
+            *(t.contiguous() for t in index),
+            ctx.positions,
+            out,
+            *kept,
+            cache.prefix,
+        )
+    for tap in taps:
+        ctx.push(tap, kept)
+    return out
+
+
+def _no_picks(
+    spec: picks.Sparse, q: torch.Tensor, taps: int
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Where the sparse op writes the step's picks, (T, [G,] K): none unless the
+    layer pushes them to `taps`."""
+    groups = (spec.groups[1],) if spec.per_group else ()
+    shape = (q.shape[0] if taps else 0, *groups, picks.most(spec))
+    return q.new_zeros(shape, dtype=torch.long), q.new_zeros(shape, dtype=torch.bool)
 
 
 def split_graphs(vllm_config: Any) -> None:
@@ -151,7 +240,7 @@ def sparse_attention(
     layer_name: str,
 ) -> None:
     """The op: write the step's keys and values, (T, g, dk) and (T, g, dv), and its
-    indexer keys, (T, i), into the caches of the call `layer_name`, then write each
+    indexer keys, (T, i), into the cache of the call `layer_name`, then write each
     query's attention over the keys it picks into `output`, (T, h, dv), and its
     picks into `picked_keys` and `picked_valid`, (T, [G,] K), unless they are
     empty; zeros in vLLM's profiling run, which has no metadata."""
@@ -160,23 +249,18 @@ def sparse_attention(
     if metas is None or layer_name not in metas:
         output.zero_()
         return
-    context = get_forward_context()
-    cache = context.no_compile_layers[layer_name]
-    index = context.no_compile_layers[cache.index_name]
-    meta, index_meta = metas[layer_name], metas[cache.index_name]
+    cache = get_forward_context().no_compile_layers[layer_name]
+    meta = metas[layer_name]
     n = meta.num_actual_tokens
     output[n:].zero_()
-    picks.write(cache.kv_cache, meta.slot_mapping[:n], torch.cat([k, v], -1)[:n])
-    picks.write(index.kv_cache, index_meta.slot_mapping[:n], index_k[:n, None])
-    caches = (cache.kv_cache, index.kv_cache)
-    tables = (meta.block_table_tensor, index_meta.block_table_tensor)
-    tensors = (q, index_q, index_w, positions)
+    rows = picks.merged(torch.cat([k, v], -1)[:n], index_k[:n])
+    picks.write(cache.kv_cache, meta.slot_mapping[:n], rows)
+    table, tensors = meta.block_table_tensor, (q, index_q, index_w, positions)
     for part in picks.segments(*_bounds(meta), q.device):
-        rows = (tables[0][part.requests], tables[1][part.requests])
         at = part.tokens
         q_, iq, iw, pos = (t[at] for t in tensors)
-        out, (kept, valid) = picks.attend_segment(
-            cache.sparse, q_, (iq, iw), pos, caches, rows, part.keys
+        out, (kept, valid) = _segments(cache)(
+            cache.sparse, q_, (iq, iw), pos, cache.rows, table[part.requests], part.keys
         )
         output[at] = out.to(output.dtype)
         if picked_keys.numel():
@@ -211,16 +295,66 @@ def picked_attention(
     for part in picks.segments(*_bounds(meta), q.device):
         at = part.tokens
         picked = (picked_keys[at], picked_valid[at])
-        out = picks.attend_picked(
+        attend = kernels.attend_picked if _kernels(cache) else picks.attend_picked
+        out = attend(
             cache.sparse,
             q[at],
             picked,
             positions[at],
-            cache.kv_cache,
+            cache.rows.kv,
             table[part.requests],
             part.keys,
         )
         output[at] = out.to(output.dtype)
+
+
+def biased_attention(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    r: torch.Tensor,
+    table: torch.Tensor,
+    gain: torch.Tensor,
+    positions: torch.Tensor,
+    output: torch.Tensor,
+    layer_name: str,
+) -> None:
+    """The op of a call with a relative bias: write the step's keys and values,
+    (T, g, dk) and (T, g, dv), into the cache of the call `layer_name`, then write
+    each query's attention over every key it sees into `output`, (T, h, dv), the
+    bias of its heads' projections `r`, (T, h, rank), and the bias `table` on its
+    logits, then its length scale `gain`, (T,), unless empty; zeros in vLLM's
+    profiling run, which has no metadata."""
+    metas = _metadata()
+    if metas is None or layer_name not in metas:
+        output.zero_()
+        return
+    cache = get_forward_context().no_compile_layers[layer_name]
+    meta = metas[layer_name]
+    n = meta.num_actual_tokens
+    output[n:].zero_()
+    picks.write(cache.kv_cache, meta.slot_mapping[:n], torch.cat([k, v], -1)[:n])
+    table_rows = meta.block_table_tensor
+    for part in picks.segments(*_bounds(meta), q.device):
+        at = part.tokens
+        bias = (r[at], table, gain[at] if gain.numel() else None)
+        rows = table_rows[part.requests]
+        out = picks.attend_all(
+            cache.sparse, q[at], bias, positions[at], cache.kv_cache, rows, part.keys
+        )
+        output[at] = out.to(output.dtype)
+
+
+def _kernels(cache: PagedCache) -> bool:
+    """Whether the Triton kernels attend over the call's `cache` (`bux_vllm.kernels`)."""
+    dims = (cache.sparse.dk, cache.channels - cache.sparse.dk)
+    return kernels.takes(cache.sparse, dims, cache.kv_cache.dtype)
+
+
+def _segments(cache: PagedCache) -> Any:
+    """How a segment of the call's queries picks and attends: by the kernels where
+    they take its settings, else by PyTorch."""
+    return kernels.attend_segment if _kernels(cache) else picks.attend_segment
 
 
 def _metadata() -> dict | None:
@@ -275,6 +409,28 @@ direct_register_custom_op(
     op_func=sparse_attention,
     mutates_args=["output", "picked_keys", "picked_valid"],
     fake_impl=_fake,
+)
+
+
+def _fake_biased(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    r: torch.Tensor,
+    table: torch.Tensor,
+    gain: torch.Tensor,
+    positions: torch.Tensor,
+    output: torch.Tensor,
+    layer_name: str,
+) -> None:
+    """The biased op as torch.compile traces it: it writes `output` alone."""
+
+
+direct_register_custom_op(
+    op_name="bux_biased_attention",
+    op_func=biased_attention,
+    mutates_args=["output"],
+    fake_impl=_fake_biased,
 )
 direct_register_custom_op(
     op_name="bux_picked_attention",

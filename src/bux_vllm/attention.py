@@ -21,7 +21,7 @@ from vllm.model_executor.layers.linear import (
     RowParallelLinear,
 )
 
-from . import kv, picks
+from . import kv, picks, sparse
 from .common import (
     ACTIVATIONS,
     Ctx,
@@ -31,12 +31,10 @@ from .common import (
     Site,
     logit_gain,
     sharded_loader,
-    unsupported,
 )
 from .config import states
 from .conv import CausalConv
 from .indexer import Indexer, rotated
-from .sparse import PagedCache, split_graphs
 
 
 class Attention(Layer):
@@ -52,7 +50,9 @@ class Attention(Layer):
     bux's do (DSA, and its blocks: QSA's, MSA's), by the plugin's sparse attention
     op over vLLM's paged caches (`bux_vllm.sparse`). The ``index`` port passes the
     picks on: a layer that reads it attends to the keys another's indexer picked,
-    of those its own window sees, and runs no indexer.
+    of those its own window sees, and runs no indexer. With a relative bias, each
+    query attends to every key it sees, the bias and the length scale on its
+    logits, by the plugin's op over a paged cache of its own.
 
     Each call of the layer keeps a KV cache of its own, a conv state beside it with
     ``kv_conv_size``, and its indexer's keys with an indexer: a shared layer that
@@ -67,8 +67,10 @@ class Attention(Layer):
 
     def __init__(self, c: dict, width: int, site: Site):
         super().__init__()
-        unsupported(c, "relative_bias")
         kv.check_ports(c, site.ports)
+        self.rel, self.rel_proj, self.rel_table = c["relative_bias"], None, None
+        if self.rel and (c["indexer"] or site.ports):
+            raise NotImplementedError("gqa: a relative bias beside an indexer or ports")
         self.reads_kv = kv.reads(site.ports, "kv") is not None
         self.reads_index = kv.reads(site.ports, "index") is not None
         tp = get_tensor_model_parallel_world_size()
@@ -82,12 +84,14 @@ class Attention(Layer):
         self._norms(c, tp)
         self.rope = Rope(c["rope"], dk) if c["rope"] else None
         self._value_residual(c, site.ports)
-        self.sinks = _sinks(self.h) if c["sinks"] else None
+        self.sinks = sink_logits(self.h) if c["sinks"] else None
         kinds = states(c, site.ports)  # a call's states, side by side in site.caches
         names = {kind: site.caches[i :: len(kinds)] for i, kind in enumerate(kinds)}
         self.indexer = None
         if c["indexer"] or self.reads_index:
             self._sparse_caches(c, width, site, names)
+        elif self.rel:
+            self._biased_caches(c, width, site, names)
         else:
             shares = site.shares or [None] * len(names["full_attention"])
             self._caches(c, site, names["full_attention"], shares)
@@ -171,39 +175,46 @@ class Attention(Layer):
     def _sparse_caches(
         self, c: dict, width: int, site: Site, names: dict[str, list[str]]
     ) -> None:
-        """Make the indexer, and each call's caches of keys and values and of the
-        indexer's keys, which the sparse attention ops read (`bux_vllm.sparse`):
-        the keys and values alone for a layer that reads its ``index`` port."""
+        """Make the indexer, and each call's cache of keys, values and indexer keys,
+        which the sparse attention ops read (`bux_vllm.sparse`): of keys and values
+        alone for a layer that reads its ``index`` port."""
         ix = None if self.reads_index else c["indexer"]
         if ix is not None:
             rotated_dims = rotated(self.dk, c["rope"])
             self.indexer = Indexer(ix, width, c["rope"], rotated_dims)
-        spec = picks.Sparse(
-            ix["top_k"] if ix else 0,
-            ix["block_size"] if ix else 1,
-            self.indexer is not None and self.indexer.mean,
-            bool(ix and ix["per_group"]),
-            bool(ix and ix["relu"]),
-            c["sliding_window_size"],
-            self.scale,
-            c["softcap"],
-            self.dk,
-            (self.kv_first, self.g),
-            self.sinks,
-            self.indexer,
+        settings = (c["sliding_window_size"], self.scale, c["softcap"], self.sinks)
+        groups = (self.kv_first, self.g)
+        spec = picks.layer_spec(ix, self.indexer, settings, self.dk, groups)
+        self.caches = sparse.layer_caches(
+            spec,
+            self.g,
+            self.dk + self.dv,
+            ix["head_dim"] if ix else 0,
+            names,
+            site.vllm_config,
         )
-        self.spec, vllm = spec, site.vllm_config
-        main = names["full_attention"]
-        index = names["index"] if ix else [""] * len(main)  # none for a reader
-        self.index_caches = nn.ModuleList(
-            PagedCache(1, ix["head_dim"], vllm, name) for name in index if ix
+
+    def _biased_caches(
+        self, c: dict, width: int, site: Site, names: dict[str, list[str]]
+    ) -> None:
+        """Make the relative bias, each head's projection (column-parallel by head)
+        and the table every rank keeps, and each call's paged cache of keys and
+        values, which the biased attention op reads (`bux_vllm.sparse`)."""
+        rank, extent = self.rel["rank"], self.rel["extent"]
+        self.rel_proj = ColumnParallelLinear(
+            width,
+            c["num_heads"] * rank,
+            bias=c["bias"],
+            return_bias=False,
+            prefix=f"{site.path}.rel_proj",
         )
-        channels = self.dk + self.dv
-        self.caches = nn.ModuleList(
-            PagedCache(self.g, channels, vllm, name, spec, index_name)
-            for name, index_name in zip(main, index, strict=True)
+        table = torch.zeros(rank, extent)
+        self.rel_table = nn.Parameter(table, requires_grad=False)
+        settings = (c["sliding_window_size"], self.scale, c["softcap"], self.sinks)
+        spec = picks.layer_spec(None, None, settings, self.dk, (self.kv_first, self.g))
+        self.caches = sparse.layer_caches(
+            spec, self.g, self.dk + self.dv, 0, names, site.vllm_config
         )
-        split_graphs(vllm)
 
     def _convs(self, c: dict, site: Site, names: list[str]) -> None:
         """Make each call's conv on keys and values, with its state, under
@@ -249,7 +260,7 @@ class Attention(Layer):
             if (fused := getattr(self.qkv, kind, None)) is not None:
                 shards = {"qkv": None} if self.fused else {s: s for s in "qkv"}
                 out |= {f"{n}.{kind}": (fused, (s,)) for n, s in shards.items()}
-            for name in ("q", "gate", "o"):
+            for name in ("q", "gate", "o", "rel_proj"):
                 layer = getattr(self, name)
                 if layer is not None and getattr(layer, kind) is not None:
                     out[f"{name}.{kind}"] = (getattr(layer, kind), ())
@@ -265,6 +276,8 @@ class Attention(Layer):
         if self.indexer is not None:
             params = self.indexer.named_parameters()
             out |= {f"indexer.{name}": (p, ()) for name, p in params}
+        if self.rel_table is not None:
+            out["rel_table"] = (self.rel_table, ())
         return out
 
     def load(self, name: str, tensor: torch.Tensor) -> list[nn.Parameter]:
@@ -295,10 +308,10 @@ class Attention(Layer):
         q, k = self._queries(q, ctx), self._normed(k, self.k_norm, self.g)
         if self.rope is not None:
             k = self.rope(k, ctx.positions)
-        if self.reads_index:
-            out = self._picked(q, k, v, call, ctx)
-        elif self.indexer is not None:
+        if self.indexer is not None or self.reads_index:
             out = self._sparse(x, q, k, v, call, ctx)
+        elif self.rel:
+            out = self._biased(x, q, k, v, call, ctx)
         else:
             q, k = q.reshape(t, -1).contiguous(), k.reshape(t, -1).contiguous()
             out = self.caches[call](q, k, v.contiguous()).view(t, self.h, self.dv)
@@ -311,7 +324,8 @@ class Attention(Layer):
         q = self._normed(q, self.q_norm, self.h)
         if self.rope is not None:
             q = self.rope(q, ctx.positions)
-        if (scale := kv.query_scale(self.c, ctx.positions)) is not None:
+        scales = kv.power_scale if self.rel else kv.query_scale  # biased: its op's
+        if (scale := scales(self.c, ctx.positions)) is not None:
             q = (q * scale[:, None, None]).to(q.dtype)
         return q
 
@@ -335,58 +349,41 @@ class Attention(Layer):
         ctx: Ctx,
     ) -> torch.Tensor:
         """The heads' outputs, (T, h, dv), of attending to the keys the indexer
-        picks, by the sparse attention op over the `call`-th call's caches; the
-        picks pushed to the taps of the ``index`` port it writes."""
-        assert self.indexer is not None
-        at, index, taps = ctx.positions, self.indexer, kv.writes(self.ports, "index")
+        picks, or the ``index`` port's picks, by the sparse attention ops over the
+        `call`-th call's caches (`bux_vllm.sparse.attend`)."""
+        index = None
+        if self.indexer is not None:
+            at = ctx.positions
+            ix = self.indexer
+            index = (ix.queries(x, at), ix.head_weights(x), ix.keys(x, at))
         out = q.new_empty(q.shape[0], self.h, self.dv)
-        shape = (q.shape[0] if taps else 0, *self._pick_shape())
-        kept = (
-            q.new_zeros(shape, dtype=torch.long),
-            q.new_zeros(shape, dtype=torch.bool),
-        )
-        torch.ops.vllm.bux_sparse_attention(
-            q.contiguous(),
-            k.contiguous(),
-            v.view(-1, self.g, self.dv).contiguous(),
-            index.queries(x, at).contiguous(),
-            index.head_weights(x).contiguous(),
-            index.keys(x, at).contiguous(),
-            at,
-            out,
-            *kept,
-            self.caches[call].prefix,
-        )
-        for tap in taps:
-            ctx.push(tap, kept)
-        return out
+        values = v.view(-1, self.g, self.dv)
+        cache = self.caches[call]
+        return sparse.attend((q, k, values), index, out, cache, self.ports, ctx)
 
-    def _pick_shape(self) -> tuple[int, ...]:
-        """The shape of a query's picks: ([this rank's kv heads,] keys)."""
-        groups = (self.g,) if self.spec.per_group else ()
-        return (*groups, picks.most(self.spec))
-
-    def _picked(
-        self, q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, call: int, ctx: Ctx
+    def _biased(
+        self,
+        x: torch.Tensor,
+        q: torch.Tensor,
+        k: torch.Tensor,
+        v: torch.Tensor,
+        call: int,
+        ctx: Ctx,
     ) -> torch.Tensor:
-        """The heads' outputs, (T, h, dv), of attending to the keys another call's
-        indexer picked, which the ``index`` port reads, by the reader's op over the
-        `call`-th call's cache; the picks pushed on to the taps it writes."""
-        read = kv.reads(self.ports, "index")
-        assert read is not None, "a layer that reads its index port"
-        kept = ctx.read(*read)
-        out = q.new_empty(q.shape[0], self.h, self.dv)
-        torch.ops.vllm.bux_picked_attention(
-            q.contiguous(),
-            k.contiguous(),
-            v.view(-1, self.g, self.dv).contiguous(),
-            *kept,
-            ctx.positions,
-            out,
-            self.caches[call].prefix,
+        """The heads' outputs, (T, h, dv), of attending to every key with the
+        relative bias, then the length scale, on the logits, by the biased op over
+        the `call`-th call's cache."""
+        assert self.rel_proj is not None and self.rel_table is not None
+        t, at = q.shape[0], ctx.positions
+        r = self.rel_proj(x).view(t, self.h, -1)
+        gain = kv.length_scale(self.c, at)
+        gain = q.new_empty(0) if gain is None else gain
+        out = q.new_empty(t, self.h, self.dv)
+        values = v.view(-1, self.g, self.dv)
+        tensors = (q, k, values, r, self.rel_table, gain)
+        torch.ops.vllm.bux_biased_attention(
+            *(t.contiguous() for t in tensors), at, out, self.caches[call].prefix
         )
-        for tap in kv.writes(self.ports, "index"):
-            ctx.push(tap, kept)
         return out
 
     def _project(self, x: torch.Tensor, call: int) -> list[torch.Tensor]:
@@ -459,7 +456,7 @@ def _ranks_sum(x: torch.Tensor) -> torch.Tensor:
     return tensor_model_parallel_all_reduce(sums)[:, :1]
 
 
-def _sinks(heads: int) -> nn.Parameter:
+def sink_logits(heads: int) -> nn.Parameter:
     """This rank's heads' sink logits, in float32 as bux's softmax takes them."""
     sinks = nn.Parameter(torch.empty(heads, dtype=torch.float32), requires_grad=False)
     sinks.weight_loader = sharded_loader(0)  # ty: ignore[unresolved-attribute]

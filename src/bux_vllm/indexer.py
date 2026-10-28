@@ -1,5 +1,6 @@
-"""The lightning indexer of a ``gqa`` layer in plain PyTorch, as bux's ``Indexer``
-makes it from the layer's input (``from_stream``): its queries, their heads'
+"""The lightning indexer of a ``gqa`` or ``mla`` layer in plain PyTorch, as bux's
+``Indexer`` makes it from the layer's input (``from_stream``): its queries (from an
+``mla`` layer's query latent where it has one, as DeepSeek-V3.2's), their heads'
 weights, and the keys it caches, one per token.
 
 The keys are normalized and rotated as they are cached, but where the indexer
@@ -34,8 +35,8 @@ def rotated(head_dim: int, rope: dict | None) -> int:
 
 
 class Indexer(nn.Module):
-    """bux's indexer of a ``gqa`` layer: `num_heads` query heads and one key of
-    `head_dim` per token, from the layer's input.
+    """bux's indexer of a ``gqa`` or ``mla`` layer: `num_heads` query heads and one
+    key of `head_dim` per token, from the layer's input.
 
     Args:
         c: The indexer's config (``SparseIndexerConfig``), as JSON.
@@ -43,14 +44,23 @@ class Indexer(nn.Module):
         rope: The layer's RoPE config, or None.
         rope_dims: How many of the layer's head dims it rotates; the indexer rotates
             as many of its own first dims, at most its head dim.
+        query_width: The width of what its queries come from: an ``mla`` layer's
+            query latent; None for the input.
     """
 
-    def __init__(self, c: dict, width: int, rope: dict | None, rope_dims: int):
+    def __init__(
+        self,
+        c: dict,
+        width: int,
+        rope: dict | None,
+        rope_dims: int,
+        query_width: int | None = None,
+    ):
         super().__init__()
         h, i = c["num_heads"], c["head_dim"]
         self.heads, self.head_dim = h, i
         self.mean = c["block_size"] > 1 and c["pool"] == "mean"
-        self.q = nn.Linear(width, h * i, bias=False)
+        self.q = nn.Linear(query_width or width, h * i, bias=False)
         self.k = nn.Linear(width, i, bias=False)
         self.weights = nn.Linear(width, h, bias=False) if c["weighted"] else None
         self.q_norm = Norm(c["norm"], i) if c["norm"] else None
@@ -60,8 +70,8 @@ class Indexer(nn.Module):
         self.rope = Rope(own, n) if own is not None and n else None
 
     def queries(self, x: torch.Tensor, positions: torch.Tensor) -> torch.Tensor:
-        """The query heads of the tokens x, (T, H, i): projected, normalized and
-        rotated by their positions."""
+        """The query heads of the tokens x (or their query latents), (T, H, i):
+        projected, normalized and rotated by their positions."""
         q = self.q(x).view(x.shape[0], self.heads, self.head_dim)
         if self.q_norm is not None:
             q = self.q_norm(q)

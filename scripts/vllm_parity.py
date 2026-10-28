@@ -70,6 +70,14 @@ DEEPSEEK = (
     "layout=interleaved, scaling=yarn(factor=4, original_max_len=16,"
     " attention_factor_on=softmax)))\n"
 )
+#: MLA with DeepSeek-V3.2's indexer, on 4 heads, a query latent of 64 and a latent
+#: of 64; and the same with a window of 16, sinks and a softcap (local).
+SPARSE_MLA = (
+    "attn = mla(num_heads=4, q_lora_rank=64, kv_lora_rank=64, qk_nope_head_dim=32,"
+    " qk_rope_head_dim=16, v_head_dim=32, rope=rope(), indexer=indexer(num_heads=2,"
+    " head_dim=16, top_k=8))\n"
+    "local = attn(sliding_window_size=16, sinks=true, softcap=20)\n"
+)
 #: csa compressing groups of 4 with half the dims rotated, at d_model 128, its
 #: window and top-k small enough that the prompts and their decoding cross both.
 SPARSE = (
@@ -199,6 +207,14 @@ CASES = {
     " load_balancing=aux_free, expert=dense)\n"
     + MOE_BLOCK
     + "model = embed block^2 rmsnorm head",
+    # Kimi K3's SiTU-GLU experts, up soft-capped (low, so that the cap bites).
+    "moe-situ": HEAD
+    + ATTN
+    + "experts = moe(num_experts=8, top_k=2, num_shared_experts=1, router=sigmoid,"
+    " load_balancing=aux_free, expert=gated_mlp(intermediate_size=64,"
+    " activation=situ, up_softcap=0.5))\n"
+    + MOE_BLOCK
+    + "model = embed block^2 rmsnorm head",
     # Muse Spark's routed experts: each one's output normalized, in a latent.
     "moe-norm": HEAD
     + ATTN
@@ -212,6 +228,12 @@ CASES = {
     "engram": LLAMA
     + "memory = engram(head_dim=8, table_size=12288)\n"
     + "model = embed block memory block rmsnorm head(tied=true)",
+    "mamba": HEAD
+    + ATTN
+    + FFN
+    + "ssm = mamba(state_size=16)\n"
+    + "model = embed [rmsnorm ssm] [rmsnorm ffn] [rmsnorm attn] [rmsnorm ffn]"
+    " [rmsnorm ssm] [rmsnorm ffn] rmsnorm head",
     "mamba2": HEAD
     + ATTN
     + FFN
@@ -270,6 +292,34 @@ CASES = {
     # Hymba's cross-layer KV sharing: a windowed layer's keys and values read by
     # the next one or two, then a full layer's by one with a window of its own.
     "kv-share": HEAD + SHARING + "model = embed F W S R W R G R rmsnorm head",
+    # Inkling's attention: a relative bias, a conv on keys and values, no RoPE, and
+    # a length scale on the global layer's logits, its window-only layers biased
+    # over their window.
+    "relbias": HEAD
+    + FFN
+    + "attn = gqa(num_heads=4, num_kv_heads=2, qk_norm=rmsnorm, kv_conv_size=4,"
+    " relative_bias=relbias(rank=4, extent=16), log_scale=0.5, log_scale_floor=8)\n"
+    + "local = attn(sliding_window_size=8, relative_bias.extent=8, log_scale=none)\n"
+    + "model = embed [rmsnorm local] [rmsnorm ffn] [rmsnorm attn] [rmsnorm ffn]"
+    " rmsnorm head",
+    # Inkling's shortcut: a conv on every branch's output, y + conv(y).
+    "conv": HEAD
+    + ATTN
+    + FFN
+    + "shortcut = conv(size=4, bias=true)\n"
+    + "model = embed [rmsnorm attn [shortcut]] [rmsnorm ffn [shortcut]]"
+    " [rmsnorm attn [shortcut]] [rmsnorm ffn] rmsnorm head",
+    # LFM2's double-gated short conv beside attention.
+    "short-conv": HEAD
+    + ATTN
+    + FFN
+    + "mix = short_conv(conv_size=3, bias=true)\n"
+    + "model = embed [rmsnorm mix] [rmsnorm ffn] [rmsnorm attn] [rmsnorm ffn]"
+    " [rmsnorm mix] [rmsnorm ffn] rmsnorm head",
+    "dyt": HEAD
+    + ATTN
+    + FFN
+    + "model = embed [dyt attn] [dyt ffn] [dyt attn] [dyt ffn] dyt head",
     "mla": HEAD + LATENT + FFN + BLOCK + "model = embed block^2 rmsnorm head",
     "mla-moe": HEAD
     + LATENT
@@ -279,12 +329,26 @@ CASES = {
     " routed_scaling_factor=2.5, load_balancing=aux_free, expert=dense)\n"
     + "model = embed [rmsnorm attn] [rmsnorm ffn] [rmsnorm attn] [rmsnorm experts]"
     " rmsnorm head",
+    "mla-chunked": HEAD + LATENT + FFN + BLOCK + "model = embed block^2 rmsnorm head",
     "mla-deepseek": HEAD
     + DEEPSEEK
     + "gated = attn(gated=true, gate_per_head=true, output_norm=rmsnorm)\n"
     + FFN
     + "model = embed [rmsnorm attn] [rmsnorm ffn] [rmsnorm gated] [rmsnorm ffn]"
     " rmsnorm head",
+    # DeepSeek-V3.2's sparse MLA: the indexer's queries from the query latent.
+    "mla-dsa": HEAD
+    + SPARSE_MLA
+    + FFN
+    + "model = embed [rmsnorm attn] [rmsnorm ffn] [rmsnorm local] [rmsnorm ffn]"
+    " rmsnorm head",
+    # GLM-5.3's: one layer's picks shared with the next two.
+    "mla-share": HEAD
+    + SPARSE_MLA
+    + FFN
+    + "model = embed [rmsnorm attn(index=@topk)] [rmsnorm ffn]"
+    " [rmsnorm attn(index=$topk)] [rmsnorm ffn] [rmsnorm local(index=$topk!)]"
+    " [rmsnorm ffn] rmsnorm head",
     "query-scale": HEAD
     + FFN
     + "beam = gqa(num_heads=4, num_kv_heads=2, power_scale=0.5, power_scale_length=8,"
@@ -345,12 +409,29 @@ CASES = {
     + "model = embed [rmsnorm attn(v=@v1)] [rmsnorm ffn] [rmsnorm local]"
     " [rmsnorm ffn] [rmsnorm attn(v=$v1!)] rmsnorm head",
     "csa": HEAD + SPARSE + FFN + BLOCK + "model = embed block^2 rmsnorm head",
+    # DeepSeek-V4.1's ports: a layer that compresses pairs, indexes them and makes a
+    # candidate pool; one that reads its latents and picks; one that re-indexes
+    # them inside the pool.
+    "csa-ports": HEAD
+    + "pairs = csa(num_heads=2, head_dim=64, compress_ratio=2, sliding_window_size=16,"
+    " sinks=true, rope=rope(fraction=0.5), indexer=indexer(num_heads=4, head_dim=64,"
+    " top_k=8, candidate_block_size=2, candidate_top_k=4))\n"
+    + FFN
+    + "model = embed [rmsnorm pairs(kv=@kv, index=@topk, candidates=@pool)]"
+    " [rmsnorm ffn] [rmsnorm pairs(kv=$kv, index=$topk)] [rmsnorm ffn]"
+    " [rmsnorm pairs(kv=$kv!, index=@topk, candidates=$pool!)] [rmsnorm ffn]"
+    " rmsnorm head",
     "csa-latent": HEAD
     + SPARSE_LATENT
     + FFN
     + "model = embed [rmsnorm window] [rmsnorm ffn] [rmsnorm pairs] [rmsnorm ffn]"
     " rmsnorm head",
 }
+
+#: The engine settings of a case of its own: mla-chunked prefills 16 tokens a step,
+#: so that each later chunk of a prompt attends to the latents its earlier ones
+#: cached (vLLM's chunked-context prefill, as a cached prefix does).
+ENGINES = {"mla-chunked": {"max_num_batched_tokens": 16, "max_num_seqs": 4}}
 
 LENGTHS = (3, 17, 40, 64)  # the prompts', in one batch: within and past a window
 STEPS = 16  # tokens decoded after each
@@ -526,8 +607,8 @@ def engine(args: argparse.Namespace) -> dict:
 
 def run(where: Path, tag: str, engine: dict) -> None:
     """Decode the prompts of the export at `where` greedily with vLLM, its engine
-    made with the arguments `engine`; keep the tokens and every position's
-    log-probabilities in ``<tag>.npz``."""
+    made with the arguments `engine` and the case's own (`ENGINES`); keep the
+    tokens and every position's log-probabilities in ``<tag>.npz``."""
     from vllm import LLM, SamplingParams
     from vllm.inputs import TokensPrompt
 
@@ -541,7 +622,7 @@ def run(where: Path, tag: str, engine: dict) -> None:
         max_logprobs=vocab,
         gpu_memory_utilization=0.5,
         seed=0,
-        **engine,
+        **engine | ENGINES.get(meta["name"], {}),
     )
     params = SamplingParams(
         temperature=0.0,

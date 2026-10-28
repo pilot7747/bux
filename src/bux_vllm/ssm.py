@@ -1,5 +1,5 @@
-"""Recurrent layers in vLLM, by its own Mamba-2 and Gated DeltaNet layers: bux's
-``mamba2`` and ``gdn``, their state in vLLM's Mamba cache, as the plugin's own
+"""Recurrent layers in vLLM, by its own Mamba, Mamba-2 and Gated DeltaNet layers:
+bux's ``mamba``, ``mamba2`` and ``gdn``, their state in vLLM's Mamba cache, as the plugin's own
 recurrent layers' is (``kda``, ``gdn2``, ``rwkv7``: `bux_vllm.recurrent`).
 
 A model with them is a hybrid, whose class tells vLLM the shape and dtype of a
@@ -11,6 +11,7 @@ channels, (k, C), and vLLM by channels, (C, 1, k).
 
 from __future__ import annotations
 
+import math
 from types import SimpleNamespace
 from typing import Any
 
@@ -19,6 +20,7 @@ from torch import nn
 from vllm.model_executor.layers.mamba.gdn.qwen_gdn_linear_attn import (
     QwenGatedDeltaNetAttention,
 )
+from vllm.model_executor.layers.mamba.mamba_mixer import MambaMixer
 from vllm.model_executor.layers.mamba.mamba_mixer2 import MambaMixer2
 from vllm.model_executor.layers.mamba.mamba_utils import (
     MambaStateCopyFuncCalculator,
@@ -35,7 +37,7 @@ from .plan import live, plan
 OWN = {"kda": kda, "gdn2": gdn2, "rwkv7": rwkv7}
 
 #: The recurrent layer types, which keep their state in vLLM's Mamba cache.
-RECURRENT = ("mamba2", "gdn", *OWN)
+RECURRENT = ("mamba", "mamba2", "gdn", *OWN)
 
 
 def mamba2_dims(c: dict, width: int) -> tuple[int, int]:
@@ -43,6 +45,69 @@ def mamba2_dims(c: dict, width: int) -> tuple[int, int]:
     splits them."""
     inner = c["num_heads"] * c["head_dim"] if c["num_heads"] else c["expand"] * width
     return inner, inner // c["head_dim"]
+
+
+def mamba_dims(c: dict, width: int) -> tuple[int, int]:
+    """Mamba's inner channels and the rank of its time steps, as bux's."""
+    return c["expand"] * width, c["dt_rank"] or math.ceil(width / 16)
+
+
+class Mamba(Layer):
+    """bux's ``mamba`` by vLLM's ``MambaMixer``, as Jamba runs it: u and the gate z
+    projected, u convolved with a bias and SiLU'd, the time steps of rank
+    ``dt_rank``, B and C RMS-normalized (eps 1e-6), the selective scan with D u, the
+    SiLU(z) gate, and the output projection."""
+
+    bux_types = ("mamba",)
+    stateful = once = True
+
+    def __init__(self, c: dict, width: int, site: Site):
+        super().__init__()
+        inner, rank = mamba_dims(c, width)
+        vllm = site.vllm_config
+        self.mixer = MambaMixer(
+            hidden_size=width,
+            ssm_state_size=c["state_size"],
+            conv_kernel_size=c["conv_size"],
+            intermediate_size=inner,
+            time_step_rank=rank,
+            use_conv_bias=True,
+            use_bias=False,
+            use_rms_norm=True,
+            rms_norm_eps=1e-6,
+            model_config=vllm.model_config,
+            cache_config=vllm.cache_config,
+            prefix=site.caches[0],
+        )
+
+    def targets(self) -> dict[str, tuple[nn.Parameter, tuple]]:
+        m = self.mixer
+        out = {
+            "in_proj.weight": (m.in_proj.weight, ()),
+            "conv.weight": (m.conv1d.weight, ()),
+            "conv.bias": (m.conv1d.bias, ()),
+            "x_proj.weight": (m.x_proj.weight, ()),
+            "dt_proj": (m.dt_proj.weight, ()),
+            "dt_bias": (m.dt_proj.bias, ()),
+            "A_log": (m.A, ()),  # its loader takes -exp(A_log)
+            "D": (m.D, ()),
+            "out_proj.weight": (m.out_proj.weight, ()),
+        }
+        for x in ("dt", "b", "c"):  # bux's dt_norm, vLLM's dt_layernorm
+            out[f"{x}_norm.weight"] = (getattr(m, f"{x}_layernorm").weight, ())
+        return out
+
+    def load(self, name: str, tensor: torch.Tensor) -> list[nn.Parameter]:
+        if name == "conv.weight":
+            tensor = conv_weight(tensor)
+        if name == "dt_proj":  # bux's is (rank, inner); vLLM's (inner, rank)
+            tensor = tensor.T.contiguous()
+        return super().load(name, tensor)
+
+    def forward(self, x: torch.Tensor, ctx: Ctx | None = None) -> torch.Tensor:
+        out = torch.empty_like(x)
+        self.mixer(x, out)
+        return out
 
 
 class Mamba2(Layer):
@@ -187,6 +252,13 @@ def state_shapes(vllm_config: Any) -> tuple:
         return MambaStateShapeCalculator.gated_delta_net_state_shape(
             tp, h, hv, dk, dv, c["conv_size"], spec
         )
+    if kind == "mamba":
+        if spec:
+            raise NotImplementedError("mamba: speculative decoding")
+        inner, _ = mamba_dims(c, width)
+        return MambaStateShapeCalculator.mamba1_state_shape(
+            tp, inner, c["state_size"], c["conv_size"]
+        )
     inner, heads = mamba2_dims(c, width)
     return MambaStateShapeCalculator.mamba2_state_shape(
         tp_world_size=tp,
@@ -206,6 +278,12 @@ def state_dtypes(vllm_config: Any) -> tuple:
     found = _recurrent(vllm_config.model_config.hf_config)
     if found is not None and found[0] in OWN:
         return recurrent.state_dtype(vllm_config.model_config, cache)
+    if found is not None and found[0] == "mamba":
+        return MambaStateDtypeCalculator.mamba1_state_dtype(
+            vllm_config.model_config.dtype,
+            cache.mamba_cache_dtype,
+            cache.mamba_ssm_cache_dtype,
+        )
     return MambaStateDtypeCalculator.mamba2_state_dtype(
         vllm_config.model_config.dtype,
         cache.mamba_cache_dtype,
@@ -214,9 +292,11 @@ def state_dtypes(vllm_config: Any) -> tuple:
 
 
 def copy_funcs(kind: str) -> tuple:
-    """How vLLM copies the state of a layer of vLLM's `kind` (``MAMBA2``,
-    ``GDN_ATTN``: ``gdn``'s and the plugin's own recurrent layers', or
+    """How vLLM copies the state of a layer of vLLM's `kind` (``MAMBA1``,
+    ``MAMBA2``, ``GDN_ATTN``: ``gdn``'s and the plugin's own recurrent layers', or
     ``SHORT_CONV``: a conv on keys and values) for prefix caching."""
+    if kind == "MAMBA1":
+        return MambaStateCopyFuncCalculator.mamba1_state_copy_func()
     if kind == "GDN_ATTN":
         return MambaStateCopyFuncCalculator.gated_delta_net_state_copy_func()
     if kind == "SHORT_CONV":

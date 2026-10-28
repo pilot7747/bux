@@ -3,7 +3,8 @@ a ``gqa`` layer with an indexer keeps, and its softmax over exactly those keys.
 
 A cache is vLLM's logical view of a layer's pages, ``[blocks, heads, block_size,
 channels]``: a request's token at position p is in block ``rows[p // block_size]``
-of its block table, at ``p % block_size``. A query at position p sees the keys at 0
+of its block table, at ``p % block_size``. A sparse call keeps its indexer's keys in
+the same rows as its keys and values (`Cache`). A query at position p sees the keys at 0
 to p, the last ``sliding_window_size`` of them with a window. What it keeps is
 bux's (`bux.export.hf.sparse`): the top-k of the keys it sees by its indexer's
 scores, ranked by the floats' bits, the first of equal ones; with ``block_size``,
@@ -43,10 +44,15 @@ def top(
     """The indices of each row's `k` highest `scores` among the `valid` ones, the
     first of equal ones (as bux's ``_top``), and which of them are valid: a row
     with fewer valid entries keeps them all."""
-    n = scores.shape[-1]
-    index = torch.arange(n, device=scores.device)
-    key = torch.where(valid, (ordered(scores) << 31) | (LOW - index), -1)
-    best = key.topk(min(k, n), dim=-1).values
+    index = torch.arange(scores.shape[-1], device=scores.device)
+    return best_of(torch.where(valid, (ordered(scores) << 31) | (LOW - index), -1), k)
+
+
+def best_of(key: torch.Tensor, k: int) -> tuple[torch.Tensor, torch.Tensor]:
+    """The indices of each row's `k` highest ranking keys, a score's `ordered` bits
+    above its index's complement (`top`'s), -1 for an invalid entry; and which of
+    them are valid."""
+    best = key.topk(min(k, key.shape[-1]), dim=-1).values
     return LOW - (best & LOW), best >= 0
 
 
@@ -116,8 +122,20 @@ def best_blocks(
     masked = s.masked_fill(~view, -torch.inf)
     masked = F.pad(masked, (0, count * size - n), value=-torch.inf)
     best = masked.unflatten(-1, (count, size)).amax(-1)
-    own = F.one_hot(positions // size, count).bool()
-    best = best.masked_fill(own if s.ndim == 2 else own[:, None], torch.inf)
+    return blocks_of_best(best, see, positions, size, top_k)
+
+
+def blocks_of_best(
+    best: torch.Tensor,
+    see: torch.Tensor,
+    positions: torch.Tensor,
+    size: int,
+    top_k: int,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """`best_blocks`' picks from each block's best score a query sees, (Q, [G,]
+    blocks), -inf for a block it sees none of."""
+    own = F.one_hot(positions // size, best.shape[-1]).bool()
+    best = best.masked_fill(own if best.ndim == 2 else own[:, None], torch.inf)
     blocks, ok = top(best, best > -torch.inf, top_k // size)
     return block_keys(blocks, ok, size, see)
 
@@ -171,6 +189,45 @@ def write(cache: torch.Tensor, slots: torch.Tensor, rows: torch.Tensor) -> None:
     cache[slots // size, :, slots % size] = rows.to(cache.dtype)
 
 
+def merged(kv: torch.Tensor, index: torch.Tensor) -> torch.Tensor:
+    """The rows of tokens in a `Cache`, (T, g, C + e), from their keys and values,
+    (T, g, C), and their indexer keys, (T, i)."""
+    t, g, _ = kv.shape
+    e = -(-index.shape[-1] // g)
+    spread = F.pad(index, (0, g * e - index.shape[-1])).view(t, g, e)
+    return torch.cat([kv, spread.to(kv.dtype)], -1)
+
+
+@dataclass(frozen=True)
+class Cache:
+    """A sparse call's paged cache, ``[blocks, g, block_size, C + e]``: each kv
+    head's key and value (or MLA's latent), C channels, then its share of the
+    indexer key, e = ceil(i / g) channels, head j's the key's channels j e to
+    (j + 1) e. The indexer's keys so page with the attention's, in blocks of the
+    same tokens, as vLLM's prefix caching needs of every cache of a model.
+
+    Attributes:
+        cache: The pages.
+        channels: C.
+        dims: i; 0 for a call that keeps no indexer keys.
+    """
+
+    cache: torch.Tensor
+    channels: int
+    dims: int = 0
+
+    @property
+    def kv(self) -> torch.Tensor:
+        """The keys and values, ``[blocks, g, block_size, C]``."""
+        return self.cache[..., : self.channels]
+
+    def keys(self, rows: torch.Tensor, keys: torch.Tensor) -> torch.Tensor:
+        """The indexer keys at the positions `keys`, (Q, K), of the requests whose
+        block tables are `rows`, (Q, blocks): (Q, K, i)."""
+        parts = gather(self.cache[..., self.channels :], rows, keys)
+        return parts.transpose(1, 2).flatten(2)[..., : self.dims]
+
+
 def gather(cache: torch.Tensor, rows: torch.Tensor, keys: torch.Tensor) -> torch.Tensor:
     """The cache's rows at the key positions `keys`, of the requests whose block
     tables are `rows`, (Q, blocks): (Q, heads, K, channels) for keys (Q, K) of all
@@ -193,27 +250,37 @@ def attend(
     scale: float,
     softcap: float | None = None,
     sinks: torch.Tensor | None = None,
+    latent: int = 0,
+    logits_of: Any = None,
 ) -> torch.Tensor:
     """Softmax attention of each query over its picked keys alone, in float32 as
     bux's ``softmax_attention``; zeros for a query that keeps none.
 
     Args:
         q: The queries, (Q, h, dk), each kv head's group of query heads together.
-        kv: The picked keys and values, (Q, g, K, dk + dv).
+        kv: The picked keys and values, (Q, g, K, dk + dv), or (g, K, dk + dv)
+            that all queries share.
         valid: Which picks are keys, (Q, g, K), or (Q, 1, K) for all heads.
         dk: The keys' dims, before the values' in `kv`.
         scale: What every logit is multiplied by.
         softcap: Logits go to ``softcap * tanh(logits / softcap)``; None for none.
         sinks: A logit per head beside the keys', on no value, (h,); None for none.
+        latent: For MLA's latents, which are keys and values at once: the values
+            are the keys' first `latent` dims, and `kv` holds the keys alone.
+        logits_of: Changes the scaled logits, (Q, g, h / g, K), before soft-capping
+            (a relative bias); None for none.
 
     Returns:
         The heads' outputs, (Q, h, dv), in the values' dtype.
     """
     n, h, _ = q.shape
-    g = kv.shape[1]
-    k, v = kv[..., :dk], kv[..., dk:]
+    g, shared = kv.shape[-3], kv.ndim == 3
+    k, v = kv[..., :dk], (kv[..., :latent] if latent else kv[..., dk:])
     groups = q.view(n, g, h // g, dk).float()
-    logits = torch.einsum("qgrd,qgkd->qgrk", groups, k.float()) * scale
+    spec = "qgrd,gkd->qgrk" if shared else "qgrd,qgkd->qgrk"
+    logits = torch.einsum(spec, groups, k.float()) * scale
+    if logits_of is not None:
+        logits = logits_of(logits)
     if softcap is not None:
         logits = softcap * torch.tanh(logits / softcap)
     keep = valid[:, :, None, :]
@@ -224,7 +291,8 @@ def attend(
         sink = sinks.float().view(1, g, h // g, 1).expand(n, g, h // g, 1)
         probs = torch.cat([logits, sink], -1).softmax(-1)[..., :-1]
     probs = probs.masked_fill(~keep, 0)
-    out = torch.einsum("qgrk,qgkd->qgrd", probs.to(v.dtype), v)
+    spec = "qgrk,gkd->qgrd" if shared else "qgrk,qgkd->qgrd"
+    out = torch.einsum(spec, probs.to(v.dtype), v)
     return out.reshape(n, h, -1)
 
 
@@ -246,6 +314,8 @@ class Sparse:
         groups: The first of this rank's kv heads among the layer's, and how many.
         sinks: The rank's heads' sink logits; None for none.
         indexer: The indexer, which normalizes and rotates pooled block keys.
+        latent: For MLA's latent cache, the dims of a latent, which are the values
+            and the keys' first dims at once (`attend`); 0 for keys and values.
     """
 
     top_k: int
@@ -260,6 +330,59 @@ class Sparse:
     groups: tuple[int, int]
     sinks: torch.Tensor | None = None
     indexer: Any = None
+    latent: int = 0
+
+
+def absorbed(q: torch.Tensor, kv_b: torch.Tensor, n: int) -> torch.Tensor:
+    """MLA's queries in the latent space, (T, h, kv_lora_rank + r) in float32, from
+    its queries (T, h, n + r): each head's first `n` dims through its key
+    projection, the rows of ``kv_b`` (h (n + dv), kv_lora_rank) that make its keys,
+    then its rotated dims as they are."""
+    w = _heads_of(kv_b, q.shape[1])
+    nope = torch.einsum("thn,hnr->thr", q[..., :n].float(), w[:, :n])
+    return torch.cat([nope, q[..., n:].float()], -1)
+
+
+def projected(out: torch.Tensor, kv_b: torch.Tensor, n: int) -> torch.Tensor:
+    """MLA's heads' outputs, (T, h, dv) in float32, from the latents they weigh,
+    (T, h, kv_lora_rank): each head's value projection, the rows of ``kv_b`` after
+    its first `n`."""
+    w = _heads_of(kv_b, out.shape[1])
+    return torch.einsum("thr,hvr->thv", out.float(), w[:, n:])
+
+
+def _heads_of(kv_b: torch.Tensor, heads: int) -> torch.Tensor:
+    """``kv_b``'s weight by head, (h, n + dv, kv_lora_rank), in float32."""
+    return kv_b.float().view(heads, -1, kv_b.shape[-1])
+
+
+def layer_spec(
+    ix: dict | None,
+    indexer: Any,
+    attention: tuple[int | None, float, float | None, torch.Tensor | None],
+    dk: int,
+    groups: tuple[int, int],
+    latent: int = 0,
+) -> Sparse:
+    """A sparse layer's `Sparse` settings: its indexer's config `ix` and module
+    (None for a layer that reads its picks from its ``index`` port), and its
+    `attention`'s window, scale, softcap and sinks."""
+    window, scale, softcap, sinks = attention
+    return Sparse(
+        ix["top_k"] if ix else 0,
+        ix["block_size"] if ix else 1,
+        bool(indexer is not None and indexer.mean),
+        bool(ix and ix["per_group"]),
+        bool(ix and ix["relu"]),
+        window,
+        scale,
+        softcap,
+        dk,
+        groups,
+        sinks,
+        indexer,
+        latent,
+    )
 
 
 def choose(
@@ -274,7 +397,8 @@ def choose(
     indexer's queries `q`, weights `w` and cached `keys`, (S, i) or (Q, S, i)."""
     size = spec.block_size
     if spec.mean:
-        pooled_keys = spec.indexer.block_keys(pooled(keys, size), size)
+        # In float32 from the cache's keys on, as bux's reference pools them.
+        pooled_keys = spec.indexer.block_keys(pooled(keys.float(), size), size)
         s = scores(q, w, pooled_keys, spec.relu, per_group=False)
         return mean_blocks(s, see, positions, spec.window, size, spec.top_k)
     s = scores(q, w, keys, spec.relu, spec.per_group)
@@ -284,6 +408,78 @@ def choose(
     if size > 1:
         return best_blocks(s, see, positions, size, spec.top_k)
     return tokens(s, see, spec.top_k)
+
+
+def relative(
+    r: torch.Tensor,
+    table: torch.Tensor,
+    gain: torch.Tensor | None,
+    positions: torch.Tensor,
+) -> Any:
+    """A relative bias on the logits of queries at `positions`, (Q,), over keys at
+    0 to K - 1, as `attend` takes it: the bias of a query for the key j positions
+    behind it, ``<r_h, table[:, j]>`` for j below the table's extent, none farther,
+    then the logits times `gain`, (Q,), as bux's length scale; both in float32.
+
+    Args:
+        r: Each query head's projection, (Q, h, rank).
+        table: The bias table, (rank, extent).
+        gain: Each query's length scale; None for none.
+        positions: The queries' positions.
+    """
+    each = torch.einsum("qhr,re->qhe", r.float(), table.float())
+
+    def change(logits: torch.Tensor) -> torch.Tensor:
+        n, g, per, k = logits.shape
+        offsets = positions[:, None] - torch.arange(k, device=positions.device)
+        near = (offsets >= 0) & (offsets < table.shape[1])
+        index = offsets.clamp(0, table.shape[1] - 1)[:, None].expand(-1, g * per, -1)
+        bias = each.gather(-1, index) * near[:, None]
+        out = logits + bias.view(n, g, per, k)
+        return out if gain is None else out * gain.float()[:, None, None, None]
+
+    return change
+
+
+def attend_all(
+    spec: Sparse,
+    q: torch.Tensor,
+    bias: tuple[torch.Tensor, torch.Tensor, torch.Tensor | None],
+    positions: torch.Tensor,
+    cache: torch.Tensor,
+    rows: torch.Tensor,
+    n: int,
+) -> torch.Tensor:
+    """A segment's outputs, (Q, h, dv), over every key its queries see, with a
+    relative bias and a length scale (`relative`), a chunk of queries at a time.
+
+    Args:
+        spec: The layer's settings; its window, scale, softcap, dims and sinks.
+        q: The queries, (Q, h, dk).
+        bias: Each query head's projection, (Q, h, rank), the bias table, and each
+            query's length scale, (Q,), or None.
+        positions: The queries' positions, (Q,).
+        cache: The layer's cache of keys and values.
+        rows: Its block tables' rows of the queries' requests, (Q, blocks), or
+            (1, blocks) for one request's.
+        n: How many key positions the requests have, at least.
+    """
+    keys = torch.arange(n, device=q.device)
+    shared = rows.shape[0] == 1
+    kv = gather(cache, rows, keys[None])[0] if shared else None
+    per = q.shape[1] * n * (1 if shared else cache.shape[3])
+    chunk, (r, table, gain), parts = max(1, BUDGET // per), bias, []
+    for a in range(0, q.shape[0], chunk):
+        cut = slice(a, a + chunk)
+        pos = positions[cut]
+        mine = (
+            kv if kv is not None else gather(cache, rows[cut], keys.expand(len(pos), n))
+        )
+        change = relative(r[cut], table, None if gain is None else gain[cut], pos)
+        see = seen(pos, n, spec.window)[:, None]
+        args = (spec.dk, spec.scale, spec.softcap, spec.sinks)
+        parts.append(attend(q[cut], mine, see, *args, logits_of=change))
+    return torch.cat(parts)
 
 
 @dataclass
@@ -343,8 +539,8 @@ def attend_segment(
     q: torch.Tensor,
     index: tuple[torch.Tensor, torch.Tensor],
     positions: torch.Tensor,
-    caches: tuple[torch.Tensor, torch.Tensor],
-    rows: tuple[torch.Tensor, torch.Tensor],
+    cache: Cache,
+    rows: torch.Tensor,
     n: int,
 ) -> tuple[torch.Tensor, Picked]:
     """A segment's outputs, (Q, h, dv), a chunk of queries at a time, and its picks
@@ -355,19 +551,19 @@ def attend_segment(
         q: The queries, (Q, h, dk).
         index: The indexer's queries and weights, (Q, H, i) and (Q, H).
         positions: The queries' positions, (Q,).
-        caches: The cache of keys and values, and the indexer's.
-        rows: Their block tables' rows of the queries' requests, (Q, blocks), or
+        cache: The call's cache of keys, values and indexer keys.
+        rows: Its block table's rows of the queries' requests, (Q, blocks), or
             (1, blocks) for one request's.
         n: How many key positions to read.
     """
-    shared = rows[0].shape[0] == 1
-    chunk = max(1, BUDGET // _per_query(spec, q, index[0], caches[0], n, shared))
+    shared = rows.shape[0] == 1
+    chunk = max(1, BUDGET // _per_query(spec, q, index[0], cache.kv, n, shared))
     parts, picks = [], []
     for a in range(0, q.shape[0], chunk):
         cut = slice(a, a + chunk)
-        part = rows if shared else (rows[0][cut], rows[1][cut])
+        part = rows if shared else rows[cut]
         tensors = (q[cut], index[0][cut], index[1][cut], positions[cut])
-        out, picked = _attend_chunk(spec, *tensors, caches, part, n)
+        out, picked = _attend_chunk(spec, *tensors, cache, part, n)
         parts.append(out)
         picks.append(padded(picked, most(spec)))
     keys, valid = zip(*picks, strict=True)
@@ -425,7 +621,9 @@ def _attend_picked(
     valid = valid & view.gather(-1, keys)
     kv = gather(cache, rows.expand(q.shape[0], -1), keys)
     valid = valid[:, None] if valid.ndim == 2 else valid
-    return attend(q, kv, valid, spec.dk, spec.scale, spec.softcap, spec.sinks)
+    return attend(
+        q, kv, valid, spec.dk, spec.scale, spec.softcap, spec.sinks, spec.latent
+    )
 
 
 def _per_query(
@@ -449,20 +647,21 @@ def _attend_chunk(
     iq: torch.Tensor,
     iw: torch.Tensor,
     positions: torch.Tensor,
-    caches: tuple[torch.Tensor, torch.Tensor],
-    rows: tuple[torch.Tensor, torch.Tensor],
+    cache: Cache,
+    rows: torch.Tensor,
     n: int,
 ) -> tuple[torch.Tensor, Picked]:
     """A chunk's outputs: its picks, then its attention over them; and the picks."""
-    kv_cache, index_cache = caches
     span = torch.arange(n, device=q.device)
-    if rows[1].shape[0] == 1:
-        keys = gather(index_cache, rows[1], span[None])[0, 0]
+    if rows.shape[0] == 1:
+        keys = cache.keys(rows, span[None])[0]
     else:
-        keys = gather(index_cache, rows[1], span.expand(q.shape[0], n))[:, 0]
+        keys = cache.keys(rows, span.expand(q.shape[0], n))
     see = seen(positions, n, spec.window)
     picks, valid = choose(spec, iq, iw, keys, see, positions)
-    kv = gather(kv_cache, rows[0].expand(q.shape[0], -1), picks)
+    kv = gather(cache.kv, rows.expand(q.shape[0], -1), picks)
     each = valid[:, None] if valid.ndim == 2 else valid
-    out = attend(q, kv, each, spec.dk, spec.scale, spec.softcap, spec.sinks)
+    out = attend(
+        q, kv, each, spec.dk, spec.scale, spec.softcap, spec.sinks, spec.latent
+    )
     return out, (picks, valid)

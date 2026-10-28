@@ -46,6 +46,7 @@ from bux_vllm import (
     dplr,
     feeds,
     kv,
+    latent,
     linear,
     ngram,
     plan,
@@ -121,24 +122,49 @@ def test_layers_after_the_first_head_are_not_live() -> None:
     assert sum(c.layer["config"]["type"] == "gqa" for c in live) == 1
 
 
-def test_a_sparse_layer_keeps_its_indexer_keys_beside_its_kv_cache() -> None:
-    arch = compile(vllm_parity.CASES["dsa"])
-    layer = next(n for n in arch.layers() if n.config.type == "gqa")
-    assert config.states(layer.config.model_dump(mode="json")) == [
-        "full_attention",
-        "index",
-    ]
-    c = config.BuxConfig(bux=json.loads(arch.model_dump_json()))
-    assert c.layer_types == ["full_attention"] * 2
-
-
-def test_a_layer_that_reads_another_s_picks_keeps_no_indexer_keys() -> None:
-    """The index port's readers attend over the writer's picks and their own keys."""
-    arch = compile(vllm_parity.CASES["dsa-share"])
+@pytest.mark.parametrize("name", ["dsa", "dsa-share", "csa", "mla-dsa"])
+def test_a_sparse_layer_keeps_its_indexer_keys_in_its_kv_cache(name: str) -> None:
+    """One cache a call, whose blocks vLLM sizes as the other attention caches',
+    so that prefix caching hits as often (a cache of indexer keys alone would get
+    blocks of more tokens)."""
+    arch = compile(vllm_parity.CASES[name])
     calls = plan.plan(arch.model_dump(mode="json")).calls
-    layers = [c.layer for c in calls if c.layer["config"]["type"] == "gqa"]
-    kept = [config.states(n["config"], plan.ports(n)) for n in layers]
-    assert kept == [["full_attention", "index"]] + [["full_attention"]] * 2
+    layers = [c.layer for c in calls if config.sparse(c.layer["config"])]
+    assert layers
+    for n in layers:
+        assert config.states(n["config"], plan.ports(n)) == ["full_attention"]
+
+
+def test_a_sparse_cache_s_rows_hold_the_indexer_keys_beside_the_kv() -> None:
+    """picks.Cache gives back the keys, values and indexer keys picks.merged
+    wrote, a key's channels spread over the kv heads (padded where they do not
+    divide), in pages padded apart as vLLM pads a smaller page to a larger one."""
+    from bux_vllm import picks
+
+    torch.manual_seed(0)
+    g, c, i, block, blocks, s = 3, 10, 8, 4, 6, 17
+    kv, index = torch.randn(s, g, c), torch.randn(s, i)
+    rows = picks.merged(kv, index)
+    assert rows.shape == (s, g, c + 3)
+    page = g * block * (c + 3)
+    raw = torch.zeros(blocks * (page + 5))
+    pages = raw.as_strided(
+        (blocks, g, block, c + 3), (page + 5, block * (c + 3), c + 3, 1)
+    )
+    table = torch.randperm(blocks - 1)[None] + 1
+    at = torch.arange(s)
+    picks.write(pages, table[0, at // block] * block + at % block, rows)
+    cache = picks.Cache(pages, c, i)
+    torch.testing.assert_close(cache.keys(table, at[None])[0], index)
+    got = picks.gather(cache.kv, table, at[None])[0].transpose(0, 1)
+    torch.testing.assert_close(got, kv)
+
+
+def test_a_conv_layer_keeps_a_conv_state() -> None:
+    c = bux_config(vllm_parity.CASES["conv"])
+    assert c.layer_types == ["full_attention", "conv", "conv", "full_attention", "conv"]
+    c = bux_config(vllm_parity.CASES["short-conv"])
+    assert c.layer_types == ["conv", "full_attention", "conv"]
 
 
 def test_a_conv_on_keys_and_values_keeps_a_state_beside_the_kv_cache() -> None:
@@ -176,6 +202,59 @@ def test_the_config_gives_vllm_the_latent_of_mla() -> None:
     assert config.latent(c)
     assert config.latent(bux_config(vllm_parity.CASES["mla-deepseek"]))
     assert not config.latent(bux_config(vllm_parity.CASES["llama"]))
+
+
+def test_a_model_of_sparse_mla_alone_is_no_mla_model_for_vllm() -> None:
+    """Sparse MLA keeps its latents in caches of the plugin's own, one head each,
+    so vLLM runs no MLA; beside MLA that vLLM runs, it raises as other attention."""
+    c = bux_config(vllm_parity.CASES["mla-share"])
+    assert not config.latent(c)
+    assert (c.num_attention_heads, c.num_key_value_heads, c.head_dim) == (4, 1, 80)
+    assert c.layer_types == ["full_attention"] * 3
+    source = (
+        vllm_parity.HEAD
+        + vllm_parity.LATENT
+        + "other = attn(indexer=indexer(num_heads=2, head_dim=16, top_k=8))\n"
+        + "model = embed [rmsnorm attn] [rmsnorm other] rmsnorm head"
+    )
+    with pytest.raises(NotImplementedError, match="model-wide"):
+        bux_config(source)
+
+
+def naive_gather(cache, table, lens, starts) -> torch.Tensor:
+    """Each request's cached context, token by token, from its blocks."""
+    size, rows = cache.shape[1], []
+    for r, (n, start) in enumerate(zip(lens, starts, strict=True)):
+        for t in range(start, start + n):
+            rows.append(cache[table[r, t // size], t % size])
+    return torch.stack(rows)
+
+
+@pytest.mark.parametrize("dtype", ["auto", "fp8"])
+def test_the_latent_context_gathers_as_vllms_kernel(dtype: str) -> None:
+    """bux_vllm.latent gathers a chunk's cached latents as vLLM's kernel does for
+    the sizes it takes: from each request's blocks, from where the chunk starts in
+    its context (here also off a block's start), from a cache of padded pages, an
+    fp8 cache's times its scale."""
+    torch.manual_seed(0)
+    padded = torch.randn(10, 4, 288 + 32)  # pages padded, as hybrids' are
+    cache = padded[..., :288]
+    if dtype == "fp8":
+        cache = cache.to(torch.float8_e4m3fn)
+    table = torch.tensor([[3, 7, 1, 0], [9, 2, 5, 8], [4, 6, 0, 0]], dtype=torch.int32)
+    lens, starts = [6, 9, 2], [0, 5, 4]
+    cu = torch.tensor([0, 6, 15, 17], dtype=torch.int32)
+    to_seq = torch.repeat_interleave(
+        torch.arange(3, dtype=torch.int32), torch.tensor(lens)
+    )
+    dst = torch.zeros(20, 288)
+    scale = torch.tensor(0.5)
+    seq_starts = torch.tensor(starts, dtype=torch.int32)
+    latent.gather(cache, dst, table, cu, to_seq, 17, dtype, scale, seq_starts)
+    want = naive_gather(cache, table, lens, starts).float()
+    want = want * 0.5 if dtype == "fp8" else want
+    torch.testing.assert_close(dst[:17], want)
+    assert not dst[17:].any()
 
 
 MIXED = {
@@ -392,6 +471,17 @@ def twins(theirs: torch.nn.Module, mine: common.Layer) -> None:
     assert {n for n, _ in mine.named_parameters()} == {
         n for n, _ in theirs.named_parameters()
     }
+
+
+def test_dyt_computes_what_the_export_does() -> None:
+    from bux.export.hf import basic as hf_basic
+
+    c = cfg.DyTConfig().model_dump(mode="json")
+    theirs, mine = hf_basic.DyT(c, 16), common.DyT(c, 16)
+    torch.manual_seed(0)
+    twins(theirs, mine)
+    x = torch.randn(5, 16) * 3
+    torch.testing.assert_close(mine(x), theirs(x))
 
 
 def through(branches: list, x: Any, ctx: Any, body: torch.Tensor) -> tuple[list, Any]:
@@ -838,13 +928,13 @@ def test_sparse_attention_over_paged_caches_is_bux_s(c: dict, window: int | None
     keep = see[None, None] & hf_attention.per_head(kept, h)
     sinks = torch.randn(h)
     want = hf_attention.softmax_attention(q, k, v, keep, 0.3, 4.0, sinks)[0]
-    block, blocks = 4, 9
+    block, blocks, i = 4, 9, ix["head_dim"]
     table = torch.randperm(blocks)[None]
-    kv_cache = torch.zeros(blocks, g, block, 2 * dk)
-    index_cache = torch.zeros(blocks, 1, block, ix["head_dim"])
+    pages = torch.zeros(blocks, g, block, 2 * dk + -(-i // g))
     slots = table[0, at // block] * block + at % block
-    picks.write(kv_cache, slots, torch.cat([k[0], v[0]], -1).transpose(0, 1))
-    picks.write(index_cache, slots, ours.keys(x, at)[:, None])
+    kv = torch.cat([k[0], v[0]], -1).transpose(0, 1)
+    picks.write(pages, slots, picks.merged(kv, ours.keys(x, at)))
+    cache = picks.Cache(pages, 2 * dk, i)
     spec = picks.Sparse(
         ix["top_k"],
         ix["block_size"],
@@ -861,12 +951,9 @@ def test_sparse_attention_over_paged_caches_is_bux_s(c: dict, window: int | None
     )
     index = (ours.queries(x, at), ours.head_weights(x))
     qs = q[0].transpose(0, 1)
-    caches = (kv_cache, index_cache)
-    together, picked = picks.attend_segment(
-        spec, qs, index, at, caches, (table, table), s
-    )
+    together, picked = picks.attend_segment(spec, qs, index, at, cache, table, s)
     rows = table.expand(s, -1)
-    alone, _ = picks.attend_segment(spec, qs, index, at, caches, (rows, rows), s)
+    alone, _ = picks.attend_segment(spec, qs, index, at, cache, rows, s)
     torch.testing.assert_close(together, want, rtol=1e-5, atol=1e-5)
     torch.testing.assert_close(alone, want, rtol=1e-5, atol=1e-5)
     # A layer that reads these picks (the index port), with a window of its own.
@@ -874,12 +961,127 @@ def test_sparse_attention_over_paged_caches_is_bux_s(c: dict, window: int | None
     reader_see = picks.seen(at, s, 3)
     keep = reader_see[None, None] & hf_attention.per_head(kept, h)
     want = hf_attention.softmax_attention(q2, k2, v2, keep, 0.3, None, None)[0]
+    kv_cache = torch.zeros(blocks, g, block, 2 * dk)
     picks.write(kv_cache, slots, torch.cat([k2[0], v2[0]], -1).transpose(0, 1))
     reader = picks.Sparse(0, 1, False, False, False, 3, 0.3, None, dk, (0, g))
     for r in (table, rows):
         got = picks.attend_picked(
             reader, q2[0].transpose(0, 1), picked, at, kv_cache, r, s
         )
+        torch.testing.assert_close(got, want, rtol=1e-5, atol=1e-5)
+
+
+@pytest.mark.parametrize("window", [None, 5], ids=["causal", "window"])
+@pytest.mark.parametrize(
+    "name", [k for k, c in INDEXERS.items() if not c.get("per_group")]
+)
+def test_sparse_attention_in_the_latent_space_is_bux_s(name: str, window: int | None):
+    """MLA's sparse attention as the plugin computes it, over paged latents, each
+    head's queries absorbing its key projection (bux_vllm.picks.absorbed), gives
+    what the export's indexer (its queries from the query latent) and softmax give
+    over the keys and values projected up; and so does a layer that reads its picks
+    and attends over latents of its own, by a window of its own."""
+    from bux.export.hf import attention as hf_attention
+    from bux.export.hf import sparse as hf_sparse
+    from bux_vllm import indexer as plugin_indexer
+    from bux_vllm import picks
+
+    torch.manual_seed(0)
+    ix = cfg.SparseIndexerConfig.model_validate(INDEXERS[name]).model_dump(mode="json")
+    rope = cfg.RoPEConfig().model_dump(mode="json")
+    width, latent, s, h, n, r, dv, rank = 16, 12, 23, 4, 8, 4, 8, 10
+    theirs = hf_sparse.Indexer(ix, width, latent, rope, r)
+    for p in theirs.parameters():
+        p.data.normal_()
+    ours = plugin_indexer.Indexer(ix, width, rope, r, latent)
+    ours.load_state_dict(theirs.state_dict())
+    x, query, at = torch.randn(s, width), torch.randn(s, latent), torch.arange(s)
+    see = picks.seen(at, s, window)
+    keys = theirs.keys(x[None], at[None])
+    kept, _ = theirs(x[None], query[None], at[None], keys, see[None], at[None])
+    kv_b = torch.randn(h * (n + dv), rank) / rank**0.5
+    sinks = torch.randn(h)
+    block, blocks = 4, 9
+    table = torch.randperm(blocks)[None]
+    slots = table[0, at // block] * block + at % block
+    index_keys = ours.keys(x, at)
+
+    def mla(
+        window: int | None,
+        softcap: float | None = None,
+        sinks: Any = None,
+        indexed: bool = False,
+    ) -> tuple[Any, ...]:
+        """Random latents in a paged cache (with the indexer's keys beside them if
+        `indexed`), queries, and the export's output."""
+        c, k_pe, q = torch.randn(s, rank), torch.randn(s, r), torch.randn(s, h, n + r)
+        up = (c @ kv_b.T).view(s, h, n + dv)
+        k = torch.cat([up[..., :n], k_pe[:, None].expand(s, h, r)], -1)
+        keep = picks.seen(at, s, window)[None, None] & hf_attention.per_head(kept, h)
+        qh, kh, vh = (t.transpose(0, 1)[None] for t in (q, k, up[..., n:]))
+        want = hf_attention.softmax_attention(qh, kh, vh, keep, 0.3, softcap, sinks)
+        want = want[0]
+        rows = torch.cat([c, k_pe], -1)[:, None]
+        rows = picks.merged(rows, index_keys) if indexed else rows
+        pages = torch.zeros(blocks, 1, block, rows.shape[-1])
+        picks.write(pages, slots, rows)
+        cache = picks.Cache(pages, rank + r, index_keys.shape[-1] if indexed else 0)
+        return picks.absorbed(q, kv_b, n), cache, want
+
+    queries, cache, want = mla(window, 4.0, sinks, indexed=True)
+    spec = picks.layer_spec(ix, ours, (window, 0.3, 4.0, sinks), rank + r, (0, 1), rank)
+    index = (ours.queries(query, at), ours.head_weights(x))
+    out, picked = picks.attend_segment(spec, queries, index, at, cache, table, s)
+    torch.testing.assert_close(
+        picks.projected(out, kv_b, n), want, rtol=1e-5, atol=1e-5
+    )
+    queries, cache, want = mla(3)
+    reader = picks.layer_spec(None, None, (3, 0.3, None, None), rank + r, (0, 1), rank)
+    out = picks.attend_picked(reader, queries, picked, at, cache.kv, table, s)
+    torch.testing.assert_close(
+        picks.projected(out, kv_b, n), want, rtol=1e-5, atol=1e-5
+    )
+
+
+@pytest.mark.parametrize("window", [None, 6], ids=["causal", "window"])
+@pytest.mark.parametrize("log_scale", [None, 0.5], ids=["plain", "log scale"])
+def test_attention_with_a_relative_bias_over_paged_caches_is_bux_s(
+    window: int | None, log_scale: float | None
+) -> None:
+    """Every key a query sees, read from paged caches, with the relative bias and
+    the length scale on its logits (bux_vllm.picks.attend_all), gives what the
+    export's softmax gives with its bias and gain, for one request's queries
+    together and one at a time."""
+    from bux.export.hf import attention as hf_attention
+    from bux_vllm import picks
+
+    torch.manual_seed(0)
+    width, s, h, g, dk, rank, extent = 16, 23, 4, 2, 8, 3, 7
+    x, at = torch.randn(1, s, width), torch.arange(s)
+    proj = torch.nn.Linear(width, h * rank)
+    table = torch.randn(rank, extent)
+    layer = stand_in(rel_proj=proj, rel_table=table, h=h, log_scale=log_scale)
+    layer.log_scale_floor = 4
+    offsets = at[:, None] - at[None]
+    bias = hf_attention.SoftmaxAttention._relative_bias(layer, x, offsets)
+    gain = hf_attention.SoftmaxAttention._length_scale(
+        layer, stand_in(positions=at[None])
+    )
+    q, k, v = (torch.randn(1, n, s, dk) for n in (h, g, g))
+    keep = picks.seen(at, s, window)[None, None]
+    sinks = torch.randn(h)
+    want = hf_attention.softmax_attention(q, k, v, keep, 0.3, 4.0, sinks, bias, gain)[0]
+    block, blocks = 4, 9
+    table_rows = torch.randperm(blocks)[None]
+    cache = torch.zeros(blocks, g, block, 2 * dk)
+    slots = table_rows[0, at // block] * block + at % block
+    picks.write(cache, slots, torch.cat([k[0], v[0]], -1).transpose(0, 1))
+    spec = picks.layer_spec(None, None, (window, 0.3, 4.0, sinks), dk, (0, g))
+    r = proj(x[0]).view(s, h, rank)
+    lengths = None if gain is None else gain[0, 0, :, 0]
+    qs = q[0].transpose(0, 1)
+    for rows in (table_rows, table_rows.expand(s, -1)):
+        got = picks.attend_all(spec, qs, (r, table, lengths), at, cache, rows, s)
         torch.testing.assert_close(got, want, rtol=1e-5, atol=1e-5)
 
 
@@ -995,25 +1197,20 @@ def test_single_queries_of_several_requests_attend_to_their_own_keys() -> None:
 
     torch.manual_seed(1)
     g, dk, i, block = 2, 8, 8, 4
-    kv_cache, index_cache = (
-        torch.randn(12, g, block, 2 * dk),
-        torch.randn(12, 1, block, i),
-    )
+    cache = picks.Cache(torch.randn(12, g, block, 2 * dk + i // g), 2 * dk, i)
     tables = torch.tensor([[3, 7, 1, 0, 0], [9, 2, 11, 5, 4]])
     at = torch.tensor([9, 16])  # the last positions of requests of 10 and 17 keys
     spec = picks.Sparse(4, 1, False, False, True, None, 0.3, None, dk, (0, g))
     q, iq, iw = torch.randn(2, 4, dk), torch.randn(2, 2, i), torch.randn(2, 2)
-    caches = (kv_cache, index_cache)
-    both, _ = picks.attend_segment(spec, q, (iq, iw), at, caches, (tables, tables), 17)
+    both, _ = picks.attend_segment(spec, q, (iq, iw), at, cache, tables, 17)
     for r in range(2):
-        rows = (tables[r : r + 1], tables[r : r + 1])
         alone, _ = picks.attend_segment(
             spec,
             q[r : r + 1],
             (iq[r : r + 1], iw[r : r + 1]),
             at[r : r + 1],
-            caches,
-            rows,
+            cache,
+            tables[r : r + 1],
             int(at[r]) + 1,
         )
         torch.testing.assert_close(both[r : r + 1], alone)
@@ -1124,11 +1321,11 @@ class PagedCsa:
     `lengths`: blocks of `CSA_BLOCK` tokens, shuffled, block 0 (vLLM's null block)
     left out."""
 
-    def __init__(self, c: dict, lengths: list[int]):
+    def __init__(self, c: dict, lengths: list[int], ports: list | None = None):
         self.paged: dict[str, compressed.Paged] = {}
         per_seq = -(-CSA_MAX_LEN // CSA_BLOCK)
         gen = torch.Generator().manual_seed(0)
-        for name, (width, per, _) in compressed.cache_rows(c).items():
+        for name, (width, per, _) in compressed.cache_rows(c, ports).items():
             ids = torch.randperm(len(lengths) * per_seq, generator=gen) + 1
             cache = torch.zeros(len(ids) + 1, CSA_BLOCK // per, width)
             table = ids.view(len(lengths), per_seq)
@@ -1180,15 +1377,18 @@ def csa_steps(step: list[tuple[int, int, int]]) -> compressed.Steps:
     return compressed.Steps(positions, seq, decodes, prompts, longest)
 
 
-def csa_layer(m: Any, parts: Any, s: Any, caches: Any, steps: Any, x: Any) -> Any:
+def csa_layer(
+    m: Any, parts: Any, s: Any, caches: Any, steps: Any, x: Any, picks: Any = None
+) -> Any:
     """A step of the plugin's csa layer (bux_vllm.csa) on x (T, width), with the
-    export's module `m` for the projections it makes by vLLM's layers."""
+    export's module `m` for the projections it makes by vLLM's layers; its output,
+    and the picks and candidate pool it makes (`compressed.mix`)."""
     t, pos = x.shape[0], steps.positions
     query = x if m.q_a is None else parts.q_a_norm(m.q_a(x))
     q = parts.queries(m.q(query).view(t, m.h, m.d), pos)
     latent = parts.latents(m.kv(x), pos)
     rows = index = None
-    if m.ratio is not None:
+    if m.compress_kv is not None:
         kv = m.compress_kv(x)
         if m.compress_gate is not None:
             both = torch.cat([kv, m.compress_gate(x)], -1)
@@ -1199,15 +1399,19 @@ def csa_layer(m: Any, parts: Any, s: Any, caches: Any, steps: Any, x: Any) -> An
         index = parts.indexer.queries(
             m.indexer.q(query), None if w is None else w(x), pos
         )
-    out = compressed.mix(caches, steps, s, q, latent, rows, index, m.sinks)
-    return m.output(x[None], parts.unrotate(out, pos)[None])[0]
+    out, kept, pool = compressed.mix(
+        caches, steps, s, q, latent, rows, index, m.sinks, picks
+    )
+    return m.output(x[None], parts.unrotate(out, pos)[None])[0], kept, pool
 
 
-def csa_weights(c: dict, parts: Any) -> set[str]:
+def csa_weights(c: dict, parts: Any, ports: list | None = None) -> set[str]:
     """The checkpoint's names of a csa's weights that the plugin's layer loads
     (bux_vllm.csa's targets): its GEMM's parts, its `parts`, and its own."""
-    down, _ = compressed.down(c)
+    down, _ = compressed.down(c, ports)
     ix, rank = c["indexer"], c["o_lora_rank"]
+    if compressed.reads(ports, "index"):
+        ix = None
     own = {
         "q.weight": True,
         "indexer.q.weight": ix,
@@ -1255,12 +1459,90 @@ def test_csa_computes_on_paged_caches_what_the_export_does(
             steps = csa_steps(step)
             pad = steps.positions.shape[0] - sum(n for *_, n in step)
             rows = torch.cat([x[s : s + n] for _, s, n in step] + [x[:pad]])
-            out = csa_layer(m, parts, settings, paged.caches(steps, pad), steps, rows)
+            out, _, _ = csa_layer(
+                m, parts, settings, paged.caches(steps, pad), steps, rows
+            )
             real = out[: out.shape[0] - pad].split([n for *_, n in step])
             for (q, start, n), y in zip(step, real):
                 got[q][start : start + n] = y
     torch.testing.assert_close(got[0], want, atol=2e-5, rtol=2e-5)
     torch.testing.assert_close(got[1], want[:25], atol=2e-5, rtol=2e-5)
+
+
+#: DeepSeek-V4.1's ports, small: a layer that compresses pairs, indexes them and
+#: makes a candidate pool; one that reads its latents and picks; and one that reads
+#: its latents and re-indexes them inside the pool.
+CSA_PORTS = (
+    "d_model = 64\nvocab_size = 64\n"
+    "pairs = csa(num_heads=4, head_dim=16, sliding_window_size=6, compress_ratio=2,"
+    " sinks=true, rope=rope(fraction=0.5), indexer=indexer(num_heads=2, head_dim=8,"
+    " top_k=4, candidate_block_size=2, candidate_top_k=3))\n"
+    "model = embed [rmsnorm pairs(kv=@kv, index=@topk, candidates=@pool)]"
+    " [rmsnorm pairs(kv=$kv, index=$topk)]"
+    " [rmsnorm pairs(kv=$kv!, index=@topk, candidates=$pool!)] head"
+)
+
+
+def test_csa_ports_compute_on_paged_caches_what_the_export_does(
+    tmp_path: Path,
+) -> None:
+    """A csa writer and two readers of its kv port, step by step over paged caches:
+    the second takes the first's picks (index), the third picks inside the first's
+    candidate pool (candidates); each gives what the export's layer gives."""
+    arch = compile(CSA_PORTS)
+    save(arch, check.perturbed(Model(arch, rngs=nnx.Rngs(0)), 1), tmp_path)
+    hf = check._load(tmp_path, "eager")
+    mods = [x for x in hf.modules() if type(x).__name__ == "CompressedSparseAttention"]
+    seen: dict[int, list[torch.Tensor]] = {}
+    for i, m in enumerate(mods):
+        m.register_forward_hook(
+            lambda mod, args, out, i=i: seen.update({i: [args[0][0], out[0]]})
+        )
+    with torch.no_grad():
+        hf.model(
+            torch.randint(0, 64, (1, 40), generator=torch.Generator().manual_seed(1))
+        )
+    layers = [n for n in arch.layers() if n.config.type == "csa"]
+    c = layers[0].config.model_dump(mode="json")
+    calls = []
+    for node, m in zip(layers, mods, strict=True):
+        ports = [[p.name, p.tap, p.mode] for p in node.ports]
+        parts = compressed.Parts(c, ports)
+        state = {k: v for k, v in m.state_dict().items() if k in parts.state_dict()}
+        parts.load_state_dict(state)
+        assert set(m.state_dict()) == csa_weights(c, parts, ports)
+        own = PagedCsa(c, [40, 25], ports)
+        calls.append((m, parts, own))
+    settings = compressed.Settings.of(c, mods[0].scale)
+    got = [
+        (torch.zeros_like(seen[i][1]), torch.zeros_like(seen[i][1][:25]))
+        for i in range(3)
+    ]
+    with torch.no_grad():
+        for step in CSA_STEPS:
+            steps = csa_steps(step)
+            pad = steps.positions.shape[0] - sum(n for *_, n in step)
+            writer = calls[0][2].caches(steps, pad)
+            kept = pool = None
+            for i, (m, parts, own) in enumerate(calls):
+                x = seen[i][0]
+                rows = torch.cat([x[s : s + n] for _, s, n in step] + [x[:pad]])
+                caches = own.caches(steps, pad)
+                caches.compressed, caches.index = writer.compressed, writer.index
+                picks = compressed.Picks(
+                    kept if i == 1 else None, pool if i == 2 else None, i == 0
+                )
+                out, made, pooled = csa_layer(
+                    m, parts, settings, caches, steps, rows, picks
+                )
+                if i == 0:
+                    kept, pool = made, pooled
+                real = out[: out.shape[0] - pad].split([n for *_, n in step])
+                for (q, start, n), y in zip(step, real):
+                    got[i][q][start : start + n] = y
+    for i in range(3):
+        torch.testing.assert_close(got[i][0], seen[i][1], atol=2e-5, rtol=2e-5)
+        torch.testing.assert_close(got[i][1], seen[i][1][:25], atol=2e-5, rtol=2e-5)
 
 
 def test_the_config_gives_vllm_the_heads_of_csa() -> None:
@@ -1295,6 +1577,31 @@ def test_csa_caches_a_window_and_compressed_latents(name: str) -> None:
         if c.indexer is not None:
             assert rows["index"] == (c.indexer.head_dim, r, None)
         assert rows.get("state") == ((2 * c.head_dim, 1, r) if r > 1 else None)
+
+
+def test_the_sparse_ops_read_only_what_a_paged_cache_has() -> None:
+    """Every attribute bux_vllm.sparse reads of a cache, ``cache.<name>``, is one a
+    PagedCache sets or defines: vLLM's compiler traces those reads."""
+    tree = ast.parse((FILES[0].parent / "sparse.py").read_text())
+    paged = next(
+        n for n in tree.body if isinstance(n, ast.ClassDef) and n.name == "PagedCache"
+    )
+    has = {n.name for n in paged.body if isinstance(n, ast.FunctionDef)}
+    for node in ast.walk(paged):
+        if isinstance(node, ast.Assign):
+            for target in node.targets:
+                elts = target.elts if isinstance(target, ast.Tuple) else [target]
+                has |= {e.attr for e in elts if isinstance(e, ast.Attribute)}
+    outside = [n for n in tree.body if n is not paged]  # its own reads a config
+    reads = {
+        n.attr
+        for top in outside
+        for n in ast.walk(top)
+        if isinstance(n, ast.Attribute)
+        and isinstance(n.value, ast.Name)
+        and n.value.id == "cache"
+    }
+    assert reads <= has, reads - has
 
 
 def test_each_layer_type_has_one_class() -> None:
