@@ -315,7 +315,7 @@ def _pooled_kernel(
     t, part = tl.program_id(0), tl.program_id(1)
     b = part * block_b + tl.arange(0, block_b)
     on_b = b < n_blocks
-    half: tl.constexpr = rotated // 2
+    half = rotated // 2
     j, r = tl.arange(0, block_j), tl.arange(0, block_r)
     on_j, on_r = j < half, r < dims - rotated
     if interleaved:
