@@ -86,7 +86,8 @@ ones, `--load-format dummy`, to time it.
   `gdn` layers runs in bfloat16 only, because vLLM's Gated DeltaNet kernels take
   nothing else.
 - **Recurrent state** is kept in the model's dtype, unless
-  `--mamba-ssm-cache-dtype float32` keeps it in float32, as bux does.
+  `--mamba-ssm-cache-dtype float32` keeps it in float32, as bux does. A `kda`
+  layer's state is float32 either way, as vLLM keeps Kimi Linear's.
 - **Heads.** The model's output is its first head. Layers after it, such as a
   multi-token prediction module, are not built, and vLLM skips their weights. (vLLM
   drafts tokens by MTP only for the model types it knows.)
@@ -113,10 +114,10 @@ ones, `--load-format dummy`, to time it.
   reads; it does not keep every output. Nothing of it is cached between steps.
 - **The layers** are vLLM's: column- and row-parallel projections, the vocabulary
   split over ranks, vLLM's attention with its KV cache, `FusedMoEFactory` for the
-  routed experts, and vLLM's Mamba-2 and Gated DeltaNet layers. Each layer loads its
-  own weights from bux's names (q, k and v into one projection, an MoE's stacked
-  experts into vLLM's layout), and every weight in the checkpoint must find a
-  parameter.
+  routed experts, vLLM's Mamba-2 and Gated DeltaNet layers, and its KDA kernels.
+  Each layer loads its own weights from bux's names (q, k and v into one projection,
+  an MoE's stacked experts into vLLM's layout), and every weight in the checkpoint
+  must find a parameter.
 - **State.** Each call of a layer that keeps state is a separate vLLM layer, named
   `caches.<i>.<path>` by its place among them. A shared attention layer called three
   times keeps three KV caches over one set of weights. A model with recurrent layers
@@ -131,13 +132,20 @@ ones, `--load-format dummy`, to time it.
 | `gqa` | RoPE (`pi`, `llama3`, `yarn`), QK-norm, GQA and MQA, biases, `fused_qkv`, sliding windows, soft-capping, sinks, its scale, `gated` (a gate per channel or per head), `output_norm`. Not yet: `kv_conv_size`, an indexer, a relative bias, `log_scale`, `power_scale`, `gate_head_bias`, QK-norm across all heads (`qk_norm_all_heads`), or ports |
 | `moe` | softmax, sigmoid and `sqrtsoftplus` routers, `router_logit_scale`, groups, the aux-free bias, a router bias, shared experts and their gate, gated and plain experts (`swish`, `gelu`, `gelu_tanh`, `relu2`) with biases, and a `limit` and `up_offset` on `swish` and `quick_gelu` gates (gpt-oss's), and LatentMoE with its norms (vLLM's fused experts at the latent's width). Not yet: `expert_norm`, `shared_expert_sink`, or the experts' `up_softcap` |
 | `mamba2`, `gdn` | by vLLM's own layers, with one type and shape of recurrent layer per model; `gdn` in bfloat16 only, and with its short conv and output gate. Under tensor parallelism, vLLM 0.32's Mamba-2 failed with one group (its fused all-reduce), and in bfloat16 where a rank's share of the input projection is not a multiple of 8 wide |
+| `kda` | by vLLM's KDA kernels, Kimi Linear's (by chunks for a prompt, the recurrence for each decoded token) and its causal conv, with one type and shape of recurrent layer per model: value heads (`num_v_heads`), the decay's rank, `gate_lower_bound` of -5 and above, and a dense or low-rank output gate. Not yet: no conv, no output gate, a `v_head_dim` other than `head_dim`, or speculative decoding |
 | residual algebras, `merge` | `hc`, `mhc`, `gr`, `attnres`, `vpgate`, with every setting, single-pass included |
 | the graph | everything; a shared MoE or recurrent layer may run only once per forward pass |
 
 Every other layer type is not in vLLM yet: among them `mla`, `csa`, `dyt`, `conv`,
 `short_conv`, `mamba`, `rwkv7`, `engram`, and the linear attentions other than `gdn`
-(`kda`, `gdn2`, `deltanet`, `gla`, `lightning`). Serve those models with
+and `kda` (`gdn2`, `deltanet`, `gla`, `lightning`). Serve those models with
 transformers ([Exporting models](index.md)).
+
+vLLM's own KDA layer gives every value head a q and a k head of its own. bux's
+`kda` shares one among a group of value heads, so the plugin runs vLLM's kernels in
+a layer of its own: q and k are projected and convolved at their own heads, as bux
+computes them, and repeated out to the value heads only for the kernels. Its weights
+and its state per sequence are bux's.
 
 ## How it was checked
 
