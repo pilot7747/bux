@@ -49,14 +49,14 @@ BLOCK = "block = [rmsnorm attn] [rmsnorm ffn]\n"
 LLAMA = HEAD + ATTN + FFN + BLOCK
 EXPERT = "dense = gated_mlp(intermediate_size=64, activation=swish)\n"
 MOE_BLOCK = "block = [rmsnorm attn] [rmsnorm experts]\n"
-#: The timeline's MLA (examples/experiments/timeline/attention.bux), on 2 heads.
+#: The timeline's MLA (examples/experiments/timeline/attention.bux), on 4 heads.
 LATENT = (
-    "attn = mla(num_heads=2, kv_lora_rank=256, qk_nope_head_dim=64,"
+    "attn = mla(num_heads=4, kv_lora_rank=256, qk_nope_head_dim=64,"
     " qk_rope_head_dim=32, v_head_dim=64, rope=rope())\n"
 )
-#: DeepSeek-V3's MLA, its dims and RoPE, on 2 heads and a query latent of 64.
+#: DeepSeek-V3's MLA, its dims and RoPE, on 4 heads and a query latent of 64.
 DEEPSEEK = (
-    "attn = mla(num_heads=2, q_lora_rank=64, kv_lora_rank=512, rope=rope("
+    "attn = mla(num_heads=4, q_lora_rank=64, kv_lora_rank=512, rope=rope("
     "layout=interleaved, scaling=yarn(factor=4, original_max_len=16,"
     " attention_factor_on=softmax)))\n"
 )

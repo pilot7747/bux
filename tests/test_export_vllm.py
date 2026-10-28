@@ -101,7 +101,7 @@ def test_the_config_gives_vllm_the_latent_of_mla() -> None:
     assert c.layer_types == ["full_attention"] * 2
     dims = (c.q_lora_rank, c.kv_lora_rank, c.qk_nope_head_dim, c.qk_rope_head_dim)
     assert (*dims, c.v_head_dim) == (None, 256, 64, 32, 64)
-    assert (c.num_attention_heads, c.num_key_value_heads, c.head_dim) == (2, 2, 96)
+    assert (c.num_attention_heads, c.num_key_value_heads, c.head_dim) == (4, 4, 96)
     assert config.latent(c)
     assert config.latent(bux_config(vllm_parity.CASES["mla-deepseek"]))
     assert not config.latent(bux_config(vllm_parity.CASES["llama"]))
@@ -110,7 +110,7 @@ def test_the_config_gives_vllm_the_latent_of_mla() -> None:
 MIXED = {
     "gqa beside mla": "gqa(num_heads=4, num_kv_heads=2)",
     "other dims": "mla(num_heads=2, kv_lora_rank=128, rope=rope())",
-    "other heads": "mla(num_heads=4, kv_lora_rank=256, qk_nope_head_dim=64,"
+    "other heads": "mla(num_heads=2, kv_lora_rank=256, qk_nope_head_dim=64,"
     " qk_rope_head_dim=32, v_head_dim=64)",
 }
 

@@ -148,8 +148,8 @@ dims and heads, and all its softmax attention is `mla`. vLLM picks an MLA backen
 by those dims and the GPU. On a B300 (SM 10.x):
 
 - **Decoding.** FlashInfer's MLA (`FLASHINFER_MLA`) takes DeepSeek's dims, a latent
-  of 512 and 64 rotated dims, among a few others. Other dims, such as a latent of
-  256 and 32 rotated dims, run on Triton's (`TRITON_MLA`), which takes any.
+  of 512 and 64 rotated dims. A latent of 256 and 32 rotated dims runs on Triton's
+  (`TRITON_MLA`), the one MLA backend that takes any dims.
 - **Prefill.** vLLM's MLA prefill backends take a few sets of dims (DeepSeek's, among
   them), and vLLM picks among them. For any other dims the plugin uses
   FlashAttention's MLA prefill.
