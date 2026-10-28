@@ -82,6 +82,11 @@ def caches(lengths: list[int], g: int, dk: int, i: int, dtype: torch.dtype) -> t
     return picks.Cache(pages, 2 * dk, i), table
 
 
+def picked(keys: torch.Tensor, valid: torch.Tensor) -> torch.Tensor:
+    """Each query's picks as a set: its valid keys in order, -1 for the rest."""
+    return torch.sort(torch.where(valid, keys, -1), dim=-1).values
+
+
 def compare(name: str, settings: dict, dtype: torch.dtype, decoding: bool) -> bool:
     """Whether the kernels' picks and outputs are the PyTorch path's."""
     torch.manual_seed(0)
@@ -102,7 +107,7 @@ def compare(name: str, settings: dict, dtype: torch.dtype, decoding: bool) -> bo
     args = (layer, q, (iq, iw), positions, cache, table, n)
     want, (kept, valid) = picks.attend_segment(*args)
     got, (kept2, valid2) = kernels.attend_segment(*args)
-    same = torch.equal(kept[valid], kept2[valid2]) and torch.equal(valid, valid2)
+    same = torch.equal(picked(kept, valid), picked(kept2, valid2))
     error = (got.float() - want.float()).abs().max().item()
     # bfloat16's scores may round apart at a near tie, and pick another key.
     ok = (same or dtype != torch.float32) and error <= TOLERANCE[dtype]
