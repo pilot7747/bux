@@ -65,27 +65,30 @@ def experts_activation(expert: dict) -> dict:
 class MoE(Layer):
     """bux's ``moe``: the router (bux's rule, `Router`), the routed experts by vLLM's
     fused kernels, in LatentMoE's latent (`latent_size`) with its norms, and the
-    shared experts as one MLP, gated by a sigmoid under ``shared_expert_gate``.
-    Training's settings (the balance loss, the bias's update, random logits) change
-    nothing here."""
+    shared experts as one MLP, gated by a sigmoid under ``shared_expert_gate``, or
+    each one's share of the hidden units weighted by its score under
+    ``shared_expert_sink``. Training's settings (the balance loss, the bias's
+    update, random logits) change nothing here."""
 
     bux_types = ("moe",)
     once = True
+    sink_of: torch.Tensor | None
 
     def __init__(self, c: dict, width: int, site: Site):
         super().__init__()
-        unsupported(c, "shared_expert_sink", "expert_norm")
-        expert = c["expert"]
+        unsupported(c, "expert_norm")
+        expert, self.top_k = c["expert"], c["top_k"]
         n, self.gated = c["num_experts"], expert["type"] == "gated_mlp"
         latent = c["latent_size"] or width
         self.to_latent, self.from_latent = _latent(c, width, site.path)
         self.latent_input_norm = _norm(c["latent_input_norm"], latent)
         self.latent_output_norm = _norm(c["latent_output_norm"], latent)
         self.router = Router(c)
-        weight = torch.empty(n, width)
+        scored = n + (c["num_shared_experts"] if c["shared_expert_sink"] else 0)
+        weight = torch.empty(scored, width)
         self.router_weight = nn.Parameter(weight, requires_grad=False)
         self.router_proj_bias = (
-            nn.Parameter(torch.empty(n), requires_grad=False)
+            nn.Parameter(torch.empty(scored), requires_grad=False)
             if c["router_bias"]
             else None
         )
@@ -114,6 +117,8 @@ class MoE(Layer):
             if c["shared_expert_gate"]
             else None
         )
+        sinks = _sink_of(c) if c["shared_expert_sink"] else None
+        self.register_buffer("sink_of", sinks, persistent=False)
 
     def targets(self) -> dict[str, tuple[nn.Parameter, tuple]]:
         out = {"router.weight": (self.router_weight, ())}
@@ -153,11 +158,19 @@ class MoE(Layer):
         if self.router_proj_bias is not None:
             logits = logits + self.router_proj_bias.float()
         y = self.routed(x, logits)
-        if self.shared is not None:
-            shared = self.shared(x)
-            if self.shared_gate is not None:
-                shared = shared * torch.sigmoid(self.shared_gate(x))
-            y = y + shared
+        return y if self.shared is None else y + self._shared(x, logits)
+
+    def _shared(self, x: torch.Tensor, logits: torch.Tensor) -> torch.Tensor:
+        """The shared experts' output; where the router scores them, each one's share
+        of the hidden units weighted by its score."""
+        assert self.shared is not None
+        if self.sink_of is None:
+            y = self.shared(x)
+        else:
+            sinks = self.router.route(logits, self.top_k)[2].to(x.dtype)
+            y = self.shared.down(self.shared.hidden(x) * sinks[..., self.sink_of])
+        if self.shared_gate is not None:
+            y = y * torch.sigmoid(self.shared_gate(x))
         return y
 
     def routed(self, x: torch.Tensor, logits: torch.Tensor) -> torch.Tensor:
@@ -185,6 +198,21 @@ def _latent(c: dict, width: int, path: str) -> tuple[nn.Module | None, ...]:
         latent, width, bias=False, return_bias=False, prefix=f"{path}.from_latent"
     )
     return to, back
+
+
+def _sink_of(c: dict) -> torch.Tensor:
+    """The shared expert of each of this rank's shared hidden units, as the
+    column-parallel projections of `MLP` split them: a rank holds a slice of each."""
+    from vllm.distributed import (
+        get_tensor_model_parallel_rank,
+        get_tensor_model_parallel_world_size,
+    )
+
+    shared = c["shared_expert"] or c["expert"]
+    each = shared["intermediate_size"]
+    units = each * c["num_shared_experts"] // get_tensor_model_parallel_world_size()
+    start = get_tensor_model_parallel_rank() * units
+    return torch.arange(start, start + units) // each
 
 
 def _norm(c: dict | None, width: int) -> Norm | None:

@@ -17,12 +17,14 @@ import jax
 import numpy as np
 import pytest
 import torch
+import torch.nn.functional as F
 from flax import nnx
 
 from bux import config as cfg
 from bux.architecture.attention import rope as bux_rope
 from bux.architecture.attention.gqa import Attention as BuxAttention
 from bux.architecture.experts.moe import MoE
+from bux.architecture.layers.conv import CausalConv
 from bux.export import plan as core
 from bux.export.hf import common as hf_common
 from bux.export.hf import linear_attention as hf_linear
@@ -34,6 +36,10 @@ from bux_vllm import common, config, delta, feeds, kv, linear, plan, residual, r
 ROOT = Path(__file__).parent.parent
 EXAMPLES = sorted((ROOT / "examples" / "architectures").rglob("*.bux"))
 TIMELINE = ROOT / "examples" / "experiments" / "timeline"
+#: The timeline's files whose arms set a residual algebra.
+ALGEBRA_ARMS = [
+    p for p in sorted(TIMELINE.glob("*.bux")) if "\nresidual" in p.read_text()
+]
 FILES = sorted(Path(plan.__file__).parent.glob("*.py"))
 
 
@@ -79,14 +85,13 @@ def test_parity_cases_are_where_bux_export_puts_them(name: str) -> None:
     assert_placed_as_bux_export(compile(vllm_parity.CASES[name]))
 
 
-def test_the_timeline_residual_arms_are_where_bux_export_puts_them() -> None:
-    """Every residual algebra of the timeline's ablation, at its smallest rung."""
-    path = TIMELINE / "residuals.bux"
-    arms: dict = {}
-    for run in compile_runs(path.read_text(), filename=str(path)):
-        arms.setdefault(run.arch.residual and run.arch.residual.type, run.arch)
-    assert set(arms) == {None, "hc", "mhc", "attnres", "gr", "vpgate"}
-    for arch in arms.values():
+@pytest.mark.parametrize("path", ALGEBRA_ARMS, ids=lambda p: p.stem)
+def test_the_timeline_residual_arms_are_where_bux_export_puts_them(path: Path) -> None:
+    """Every arm of a timeline file that sets a residual algebra, at every rung."""
+    runs = compile_runs(path.read_text(), filename=str(path))
+    archs = {r.arch.model_dump_json(): r.arch for r in runs if r.arch.residual}
+    assert archs
+    for arch in archs.values():
         assert_placed_as_bux_export(arch)
 
 
@@ -109,6 +114,12 @@ def test_layers_after_the_first_head_are_not_live() -> None:
     live = plan.live(plan.plan(arch.model_dump(mode="json")).calls)
     assert [c.path for c in live][-1] == "model.shared.out"
     assert sum(c.layer["config"]["type"] == "gqa" for c in live) == 1
+
+
+def test_a_conv_on_keys_and_values_keeps_a_state_beside_the_kv_cache() -> None:
+    arch = compile(vllm_parity.CASES["kv-conv"])
+    c = config.BuxConfig(bux=json.loads(arch.model_dump_json()))
+    assert c.layer_types == ["full_attention", "conv"] * 3
 
 
 @pytest.mark.parametrize("name", ["gdn", "kda", "kda-kimi"])
@@ -190,12 +201,17 @@ ROUTERS = {
     " top_k_groups=2, routed_scaling_factor=2.5, load_balancing=aux_free, expert=e)",
     "sqrtsoftplus": "moe(num_experts=8, top_k=2, router=sqrtsoftplus,"
     " router_logit_scale=2, router_bias=true, expert=e)",
+    "shared expert sinks": "moe(num_experts=8, top_k=2, num_shared_experts=2,"
+    " shared_expert_sink=true, router=sigmoid, routed_scaling_factor=2.5, expert=e)",
+    "unnormalized sinks": "moe(num_experts=8, top_k=2, num_shared_experts=2,"
+    " shared_expert_sink=true, normalize_top_k=false, expert=e)",
 }
 
 
 @pytest.mark.parametrize("source", ROUTERS.values(), ids=ROUTERS.keys())
 def test_the_router_picks_and_weighs_as_bux(source: str) -> None:
-    """The plugin's router, which vLLM's fused MoE takes the picks from, is bux's."""
+    """The plugin's router, which vLLM's fused MoE takes the picks from, is bux's,
+    and so are the shared experts' weights where it scores them."""
     arch = compile(
         "d_model = 64\ne = gated_mlp(intermediate_size=16, activation=swish)\n"
         f"model = {source}"
@@ -209,11 +225,14 @@ def test_the_router_picks_and_weighs_as_bux(source: str) -> None:
         moe.router_bias[...] = bias
         router.bias.data = torch.from_numpy(np.array(bias))
     x = jax.random.normal(jax.random.key(2), (1, 32, 64))
-    idx, weights, _ = moe._route(x)
+    idx, weights, sinks = moe._route(x)
     logits = torch.from_numpy(np.array(moe._logits(x))[0])
     got_w, got_idx = router(None, logits, c.top_k, c.normalize_top_k)
     assert got_idx.tolist() == np.asarray(idx)[0].tolist()
     np.testing.assert_allclose(got_w.numpy(), np.asarray(weights)[0], rtol=1e-6)
+    got_sinks = router.route(logits, c.top_k)[2].numpy()
+    want = np.zeros((32, 0)) if sinks is None else np.asarray(sinks)[0]
+    np.testing.assert_allclose(got_sinks, want, rtol=1e-6)
 
 
 ROPES = {
@@ -458,6 +477,20 @@ def test_each_rank_keeps_its_kv_heads(
     kv_heads: int, tp: int, want: list[tuple[int, int]]
 ) -> None:
     assert [kv.kv_heads(kv_heads, tp, rank) for rank in range(tp)] == want
+
+
+def test_the_kv_conv_taps_go_where_vllm_convolves_them() -> None:
+    """bux's taps on 4 kv heads of 8, cut to rank 1 of 2's heads and laid out as
+    vLLM's conv weight, (channels, taps), convolve as bux does: vLLM's kernels take
+    the last tap on the token itself, as F.conv1d over the left-padded tokens."""
+    conv = CausalConv(32, 3, False, nnx.Rngs(0))
+    x = jax.random.normal(jax.random.key(1), (1, 10, 32))
+    want = np.asarray(conv(x))[0, :, 16:]
+    first, n = kv.kv_heads(4, 2, 1)
+    w = kv.conv_rows(torch.from_numpy(np.array(conv.weight[...])), 8, first, n)
+    xs = torch.from_numpy(np.array(x)[0, :, 16:]).T
+    got = F.conv1d(F.pad(xs, (2, 0))[None], w[:, None], groups=16)[0].T
+    np.testing.assert_allclose(got.numpy(), want, rtol=1e-5, atol=1e-6)
 
 
 def rule_inputs(

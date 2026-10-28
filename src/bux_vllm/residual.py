@@ -119,7 +119,7 @@ class Sources:
 
     def __mul__(self, other: float) -> Sources:
         """The state times a constant."""
-        if not isinstance(other, int | float):
+        if not isinstance(other, (int, float)):
             raise NotImplementedError("attnres: a product of its states in vLLM")
         partial = None if self.partial is None else self.partial * other
         return Sources(tuple(v * other for v in self.done), partial, self.count)

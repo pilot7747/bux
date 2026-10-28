@@ -4,7 +4,8 @@ kernels take them: plain PyTorch, which `bux_vllm.moe` hands vLLM.
 The router runs as bux's does (`bux.architecture.experts.moe`): logits in float32,
 scored by a softmax, a sigmoid or ``sqrt(softplus)``, the aux-free bias added to the
 scores that pick, groups limited by their best two experts' sum, the top-k weights
-normalized and scaled.
+normalized (with the shared experts' scores, where the router scores them) and
+scaled.
 """
 
 from __future__ import annotations
@@ -51,15 +52,29 @@ class Router(nn.Module):
         topk: int,
         renormalize: bool,
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        scores = self.scores(gating_output)
+        weights, idx, _ = self.route(gating_output, topk)
+        return weights, idx
+
+    def route(
+        self, logits: torch.Tensor, k: int
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Each token's top-k experts and their weights, from the router's logits,
+        and the weights of the shared experts that the router scores too, last,
+        under ``shared_expert_sink`` (none, otherwise): normalized together and
+        scaled, in float32."""
+        n = self.c["num_experts"]
+        scores = self.scores(logits)
+        scores, sinks = scores[..., :n], scores[..., n:]
         choice = scores if self.bias is None else scores + self.bias
         if self.c["num_groups"] > 1:
             choice = self.limit_groups(choice)
-        idx = choice.topk(topk, -1).indices
+        idx = choice.topk(k, -1).indices
         weights = scores.gather(-1, idx)
         if self.c["normalize_top_k"]:
-            weights = weights / weights.sum(-1, keepdim=True)
-        return weights * self.c["routed_scaling_factor"], idx
+            total = weights.sum(-1, keepdim=True) + sinks.sum(-1, keepdim=True)
+            weights, sinks = weights / total, sinks / total
+        scale = self.c["routed_scaling_factor"]
+        return weights * scale, idx, sinks * scale
 
 
 def expert_shards(

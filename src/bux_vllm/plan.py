@@ -116,7 +116,8 @@ class Branch:
 
 @dataclass
 class Plan:
-    """A graph's module tree, and the calls of its layers.
+    """A graph's module tree, and the calls of its layers and residual algebra's
+    branches.
 
     Attributes:
         top: The model's scope.
