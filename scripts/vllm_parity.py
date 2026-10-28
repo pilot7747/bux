@@ -386,14 +386,14 @@ CASES = {
     + FFN
     + "model = embed [rmsnorm attn] [rmsnorm ffn] [rmsnorm local] [rmsnorm ffn]"
     " rmsnorm head",
-    # DeepSeek-V3.2's indexer on vLLM's kernels, beside one with a window that
-    # they do not take.
+    # DeepSeek-V3.2's indexer on vLLM's kernels (under
+    # BUX_VLLM_SPARSE_KERNELS=native), in two layers.
     "mla-dsa-native": HEAD
     + SPARSE_MLA.replace(
         "indexer=indexer(num_heads=2, head_dim=16, top_k=8)", NATIVE_INDEXER
     )
     + FFN
-    + "model = embed [rmsnorm attn] [rmsnorm ffn] [rmsnorm local] [rmsnorm ffn]"
+    + "model = embed [rmsnorm attn] [rmsnorm ffn] [rmsnorm attn] [rmsnorm ffn]"
     " rmsnorm head",
     # GLM-5.3's: one layer's picks shared with the next two.
     "mla-share": HEAD
