@@ -2,7 +2,8 @@
 
 How to work on bux itself: set it up, run the checks CI runs, find your way around the
 code, and keep the documentation in step with it. bux is meant to be changed: if
-something is hard to replace, that is a bug.
+something is hard to replace, that is a bug. To report a bug or send a pull request,
+see [CONTRIBUTING.md](https://github.com/pilot7747/bux/blob/main/CONTRIBUTING.md).
 
 ## Setting up
 
@@ -180,6 +181,7 @@ A change to bux is done when its documentation is. Update, in the same change:
 | an environment variable | `docs/reference/environment.md` |
 | an example architecture | its header comment (the zoo regenerates) and `tests/test_examples.py` |
 | an example run or recipe | the tutorial or guide that uses it |
+| the checks, or what a pull request needs | `CONTRIBUTING.md` and `.github/pull_request_template.md` |
 
 Then run `make docs`: a link to a heading you renamed, a reference to a setting you
 removed, or a docstring that no longer renders fails it.
