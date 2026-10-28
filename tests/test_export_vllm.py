@@ -1410,3 +1410,49 @@ def test_each_layer_type_has_one_class() -> None:
                         names.setdefault(ast.literal_eval(kind), []).append(node.name)
     assert {k: v for k, v in names.items() if len(v) > 1} == {}
     assert 'vars(value).get("bux_types"' in (FILES[0].parent / "model.py").read_text()
+
+
+# The timeline's hybrid at d_model 2816 (22 q/k heads, 44 value heads), whose KDA
+# projection is 17068 wide unpadded, and the parity case of odd widths.
+FUSED = {
+    "kda 2816": "kda(num_heads=22, num_v_heads=44, head_dim=128, gate_lower_bound=-5)",
+    "kda odd": "kda(num_heads=2, num_v_heads=6, head_dim=32)",
+    "kda low rank": "kda(num_heads=3, num_v_heads=9, head_dim=16, output_gate_rank=8)",
+    "gdn2 odd": "gdn2(num_heads=3, num_v_heads=9, head_dim=24, v_head_dim=8)",
+}
+
+
+@pytest.mark.parametrize("ranks", [1, 3])
+@pytest.mark.parametrize("mixer", FUSED.values(), ids=FUSED.keys())
+def test_a_ranks_fused_projection_is_padded_to_an_aligned_width(
+    mixer: str, ranks: int
+) -> None:
+    """A rank's fused input projection of KDA and GDN-2 is a multiple of 64 wide, so
+    that inductor pads none of its matmuls, whose parts would otherwise cross the
+    graph's splits strided as vLLM did not trace them; its parts keep their widths,
+    and the padding's columns are each rank's share of the sizes'."""
+    c = next(compile(f"d_model = 72\nmodel = {mixer}").layers()).config
+    c = c.model_dump(mode="json")
+    if c["num_heads"] % ranks:
+        pytest.skip("heads that the ranks do not split")
+    projection = linear.kda_projection if c["type"] == "kda" else linear.gdn2_projection
+    sizes, split, parts = projection(c, ranks)
+    assert sum(split) % linear.ALIGN == 0
+    h, hv, dk, dv = linear.linear_dims(c)
+    want = [sum(linear.conv_channels(c)) // ranks]
+    if c["type"] == "gdn2":
+        want += [h * dk // ranks, hv * dv // ranks]
+    else:
+        gated = c["output_gate_rank"] is None
+        want += [hv * dv // ranks] * gated + [c["gate_rank"] or dk, hv // ranks]
+    assert split[:parts] == want
+    if len(split) > parts:
+        assert sizes[-1] == split[-1] * ranks  # q, k and v are a size each
+    if mixer == FUSED["kda 2816"] and ranks == 1:
+        assert sum(split[:parts]) == 17068 and sum(split) == 17088
+
+
+def test_padding_columns_are_zero() -> None:
+    layer = torch.nn.Linear(4, 10, bias=False)
+    linear.zero_padding(layer, 3)
+    assert not layer.weight[-3:].any() and layer.weight[:-3].any()
