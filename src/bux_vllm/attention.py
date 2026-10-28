@@ -1,11 +1,18 @@
 """Softmax attention in vLLM: bux's ``gqa``, its projections split by head under
-tensor parallelism, attending by vLLM's attention layer and its paged KV cache."""
+tensor parallelism, attending by vLLM's attention layer and its paged KV cache, with
+its ``v`` port (the value residual, `bux_vllm.kv`), its conv on keys and values
+(`bux_vllm.conv`) and its indexer, which picks the keys each query attends to
+(`bux_vllm.sparse`)."""
 
 from __future__ import annotations
 
 import torch
 from torch import nn
-from vllm.distributed import get_tensor_model_parallel_world_size
+from vllm.distributed import (
+    get_tensor_model_parallel_rank,
+    get_tensor_model_parallel_world_size,
+    tensor_model_parallel_all_reduce,
+)
 from vllm.model_executor.layers.attention import Attention as PagedAttention
 from vllm.model_executor.layers.linear import (
     ColumnParallelLinear,
@@ -13,6 +20,7 @@ from vllm.model_executor.layers.linear import (
     RowParallelLinear,
 )
 
+from . import kv, picks
 from .common import (
     ACTIVATIONS,
     Ctx,
@@ -24,16 +32,29 @@ from .common import (
     sharded_loader,
     unsupported,
 )
+from .config import states
+from .conv import CausalConv
+from .indexer import Indexer, rotated
+from .sparse import PagedCache, split_graphs
 
 
 class Attention(Layer):
-    """bux's ``gqa``: q, k and v by one column-parallel projection, QK-norm then
-    RoPE (in float32, as bux), causal softmax attention with its sliding window,
-    soft-capping and sinks by vLLM's attention layer, each head's output norm and
-    gate, and the row-parallel output projection.
+    """bux's ``gqa``: q, k and v by one column-parallel projection, the causal conv
+    on k and v added to them (``kv_conv_size``), the values mixed with those of its
+    ``v`` port (the value residual) and pushed to it, QK-norm then RoPE (in float32,
+    as bux), the queries scaled by their position (``power_scale``, ``log_scale``),
+    causal softmax attention with its sliding window, soft-capping and sinks by
+    vLLM's attention layer, each head's output norm and gate (with a bias per head),
+    and the row-parallel output projection.
 
-    Each call of the layer keeps a KV cache of its own: a shared layer that runs
-    three times makes three of vLLM's attention layers, over the same weights.
+    With an indexer, each query attends to the keys the indexer picks alone, as
+    bux's do (DSA, and its blocks: QSA's, MSA's), by the plugin's sparse attention
+    op over vLLM's paged caches (`bux_vllm.sparse`).
+
+    Each call of the layer keeps a KV cache of its own, a conv state beside it with
+    ``kv_conv_size``, and its indexer's keys with an indexer: a shared layer that
+    runs three times makes three of vLLM's attention layers (and convs), over the
+    same weights.
     """
 
     bux_types = ("gqa",)
@@ -41,19 +62,33 @@ class Attention(Layer):
 
     def __init__(self, c: dict, width: int, site: Site):
         super().__init__()
-        unsupported(c, "kv_conv_size", "indexer", "relative_bias", "log_scale")
-        unsupported(c, "power_scale", *(("gate_head_bias",) if c["gated"] else ()))
-        if c["qk_norm"] and c["qk_norm_all_heads"]:
-            # Its statistics would sum over every rank's heads under tensor parallelism.
-            raise NotImplementedError("gqa: qk_norm_all_heads not in vLLM yet")
-        if site.ports:
-            raise NotImplementedError("gqa: ports not in vLLM yet")
+        unsupported(c, "relative_bias")
+        kv.check_ports(site.ports)
         tp = get_tensor_model_parallel_world_size()
         h, g = c["num_heads"], c["num_kv_heads"]
-        dk = c["head_dim"] or width // h
-        dv = c["v_head_dim"] or dk
+        dk, dv = kv.head_dims(c, width)
         self.path, self.dk, self.dv, self.fused = site.path, dk, dv, c["fused_qkv"]
         self.h, self.g = h // tp, max(1, g // tp)  # this rank's
+        self.kv_first = kv.kv_heads(g, tp, get_tensor_model_parallel_rank())[0]
+        self.c, self.scale = c, (c["scale"] or dk**-0.5) * logit_gain(c["rope"])
+        self._projections(c, width, site.path)
+        self._norms(c, tp)
+        self.rope = Rope(c["rope"], dk) if c["rope"] else None
+        self._value_residual(c, site.ports)
+        self.sinks = _sinks(self.h) if c["sinks"] else None
+        kinds = states(c)  # a call's states, side by side in site.caches
+        names = {kind: site.caches[i :: len(kinds)] for i, kind in enumerate(kinds)}
+        self.indexer = None
+        if c["indexer"]:
+            self._sparse_caches(c, width, site, names)
+        else:
+            self._caches(c, site, names["full_attention"])
+        self._convs(c, site, names.get("conv", []))
+
+    def _projections(self, c: dict, width: int, path: str) -> None:
+        """Make q, k and v's projection, column-parallel by head, the gate's, and
+        the row-parallel output projection."""
+        h, g, dk, dv = c["num_heads"], c["num_kv_heads"], self.dk, self.dv
         self.qkv = QKVParallelLinear(
             width,
             dk,
@@ -62,46 +97,126 @@ class Attention(Layer):
             bias=c["bias"],
             v_head_size=dv,
             return_bias=False,
-            prefix=f"{site.path}.qkv",
+            prefix=f"{path}.qkv",
         )
-        self._gate(c, width, h * dv, site.path)
+        self._gate(c, width, h * dv, path)
         out_bias = c["bias"] if c["output_bias"] is None else c["output_bias"]
         self.o = RowParallelLinear(
-            h * dv, width, bias=out_bias, return_bias=False, prefix=f"{site.path}.o"
+            h * dv, width, bias=out_bias, return_bias=False, prefix=f"{path}.o"
         )
-        qk, out = c["qk_norm"], c["output_norm"]
-        self.q_norm = Norm(qk, dk) if qk else None
-        self.k_norm = Norm(qk, dk) if qk else None
-        self.out_norm = Norm(out, dv) if out else None
-        self.rope = Rope(c["rope"], dk) if c["rope"] else None
-        self.sinks = _sinks(self.h) if c["sinks"] else None
-        scale = (c["scale"] or dk**-0.5) * logit_gain(c["rope"])
+
+    def _norms(self, c: dict, tp: int) -> None:
+        """Make the QK-norm, of each head or of all heads together, and the norm of
+        each head's output.
+
+        Raises:
+            NotImplementedError: QK-norm of all heads where ranks copy kv heads.
+        """
+        qk, out, h, g = (
+            c["qk_norm"],
+            c["output_norm"],
+            c["num_heads"],
+            c["num_kv_heads"],
+        )
+        self.all_heads = bool(qk and c["qk_norm_all_heads"])
+        if self.all_heads and g % tp:
+            raise NotImplementedError("gqa: qk_norm_all_heads with kv heads copied")
+        if self.all_heads:
+            self.q_norm = AllHeads(qk, h, self.dk, tp)
+            self.k_norm = AllHeads(qk, g, self.dk, tp)
+        else:
+            self.q_norm = Norm(qk, self.dk) if qk else None
+            self.k_norm = Norm(qk, self.dk) if qk else None
+        self.out_norm = Norm(out, self.dv) if out else None
+
+    def _caches(self, c: dict, site: Site, names: list[str]) -> None:
+        """Make each call's vLLM attention layer, with its KV cache."""
         self.caches = nn.ModuleList(
             PagedAttention(
                 self.h,
-                dk,
-                scale,
+                self.dk,
+                self.scale,
                 num_kv_heads=self.g,
                 cache_config=site.vllm_config.cache_config,
                 logits_soft_cap=c["softcap"],
                 per_layer_sliding_window=c["sliding_window_size"],
                 prefix=name,
                 sinks=self.sinks,
-                head_size_v=dv,
+                head_size_v=self.dv,
             )
-            for name in site.caches
+            for name in names
         )
+
+    def _sparse_caches(
+        self, c: dict, width: int, site: Site, names: dict[str, list[str]]
+    ) -> None:
+        """Make the indexer, and each call's caches of keys and values and of the
+        indexer's keys, which the sparse attention op reads (`bux_vllm.sparse`)."""
+        ix = c["indexer"]
+        self.indexer = Indexer(ix, width, c["rope"], rotated(self.dk, c["rope"]))
+        spec = picks.Sparse(
+            ix["top_k"],
+            ix["block_size"],
+            self.indexer.mean,
+            ix["per_group"],
+            ix["relu"],
+            c["sliding_window_size"],
+            self.scale,
+            c["softcap"],
+            self.dk,
+            (self.kv_first, self.g),
+            self.sinks,
+            self.indexer,
+        )
+        vllm = site.vllm_config
+        main, index = names["full_attention"], names["index"]
+        self.index_caches = nn.ModuleList(
+            PagedCache(1, ix["head_dim"], vllm, name) for name in index
+        )
+        channels = self.dk + self.dv
+        self.caches = nn.ModuleList(
+            PagedCache(self.g, channels, vllm, name, spec, index_name)
+            for name, index_name in zip(main, index, strict=True)
+        )
+        split_graphs(vllm)
+
+    def _convs(self, c: dict, site: Site, names: list[str]) -> None:
+        """Make each call's conv on keys and values, with its state, under
+        ``kv_conv_size``: all calls' over the same weights."""
+        self.convs, self.conv_weight = None, None
+        if size := c["kv_conv_size"]:
+            channels = self.g * (self.dk + self.dv)
+            convs = [
+                CausalConv(channels, size, site.vllm_config, name) for name in names
+            ]
+            self.conv_weight = convs[0].weight
+            for other in convs[1:]:
+                other.weight = self.conv_weight
+            self.convs = nn.ModuleList(convs)
 
     def _gate(self, c: dict, width: int, heads_dv: int, path: str) -> None:
         """Make the gate on the heads' outputs, ``act(W_g x)``, a value a channel or
         a head (``gate_per_head``), column-parallel by head; None without one."""
-        self.gate = None
+        self.gate, self.gate_bias = None, None
         self.gate_activation = ACTIVATIONS[c["gate_activation"]]
         if c["gated"]:
             n = c["num_heads"] if c["gate_per_head"] else heads_dv
             self.gate = ColumnParallelLinear(
                 width, n, bias=c["bias"], return_bias=False, prefix=f"{path}.gate"
             )
+        if c["gated"] and c["gate_head_bias"]:
+            self.gate_bias = nn.Parameter(torch.zeros(self.h), requires_grad=False)
+            self.gate_bias.weight_loader = sharded_loader(0)  # ty: ignore[unresolved-attribute]
+
+    def _value_residual(self, c: dict, layer_ports: list) -> None:
+        """Keep the layer's ports, and the learned weights of its value residual
+        where it reads the ``v`` port and ``value_residual`` learns them."""
+        self.ports, self.mix = layer_ports, c["value_residual"]
+        self.v_mix = None
+        if kv.reads(layer_ports, "v") and self.mix != "fixed":
+            shape = (2,) if self.mix == "learned" else ()
+            w = torch.full(shape, 0.5, dtype=torch.float32)
+            self.v_mix = nn.Parameter(w, requires_grad=False)
 
     def targets(self) -> dict[str, tuple[nn.Parameter, tuple]]:
         out: dict[str, tuple[nn.Parameter, tuple]] = {}
@@ -118,22 +233,99 @@ class Attention(Layer):
                 out |= {f"{name}.{k}": v for k, v in norm.targets().items()}
         if self.sinks is not None:
             out["sinks"] = (self.sinks, ())
+        if self.v_mix is not None:
+            out["v_mix"] = (self.v_mix, ())
+        if self.gate_bias is not None:
+            out["gate_bias"] = (self.gate_bias, ())
+        if self.indexer is not None:
+            params = self.indexer.named_parameters()
+            out |= {f"indexer.{name}": (p, ()) for name, p in params}
         return out
 
+    def load(self, name: str, tensor: torch.Tensor) -> list[nn.Parameter]:
+        if name in ("k_conv.weight", "v_conv.weight") and self.conv_weight is not None:
+            return self._load_conv(self.conv_weight, name[0], tensor)
+        return super().load(name, tensor)
+
+    def _load_conv(
+        self, weight: nn.Parameter, which: str, taps: torch.Tensor
+    ) -> list[nn.Parameter]:
+        """Load bux's taps of the conv on the keys (`which` ``k``) or the values
+        (``v``) into this rank's rows of the conv's `weight`: its kv heads' keys,
+        then their values."""
+        dims, start = (self.dk, 0) if which == "k" else (self.dv, self.g * self.dk)
+        rows = kv.conv_rows(taps, dims, self.kv_first, self.g)
+        weight.data[start : start + rows.shape[0]].copy_(rows)
+        return [weight]
+
     def forward(self, x: torch.Tensor, ctx: Ctx) -> torch.Tensor:
-        t = x.shape[0]
-        q, k, v = self.qkv(x).split(
-            [self.h * self.dk, self.g * self.dk, self.g * self.dv], -1
-        )
+        t, call = x.shape[0], ctx.call(self.path)
+        q, k, v = self._project(x, call)
+        v = self._v_port(v, ctx)
         q, k = q.view(t, self.h, self.dk), k.view(t, self.g, self.dk)
         if self.q_norm is not None and self.k_norm is not None:
+            if self.all_heads:  # of the projections, before they split into heads
+                q, k = q.flatten(1), k.flatten(1)
             q, k = self.q_norm(q), self.k_norm(k)
+            q, k = q.view(t, self.h, self.dk), k.view(t, self.g, self.dk)
         if self.rope is not None:
             q, k = self.rope(q, ctx.positions), self.rope(k, ctx.positions)
-        attend = self.caches[ctx.call(self.path)]
-        q, k = q.reshape(t, -1).contiguous(), k.reshape(t, -1).contiguous()
-        out = attend(q, k, v.contiguous()).view(t, self.h, self.dv)
+        if (scale := kv.query_scale(self.c, ctx.positions)) is not None:
+            q = (q * scale[:, None, None]).to(q.dtype)
+        if self.indexer is not None:
+            out = self._sparse(x, q, k, v, call, ctx)
+        else:
+            q, k = q.reshape(t, -1).contiguous(), k.reshape(t, -1).contiguous()
+            out = self.caches[call](q, k, v.contiguous()).view(t, self.h, self.dv)
         return self.o(self._gated(x, out).reshape(t, -1))
+
+    def _sparse(
+        self,
+        x: torch.Tensor,
+        q: torch.Tensor,
+        k: torch.Tensor,
+        v: torch.Tensor,
+        call: int,
+        ctx: Ctx,
+    ) -> torch.Tensor:
+        """The heads' outputs, (T, h, dv), of attending to the keys the indexer
+        picks, by the sparse attention op over the `call`-th call's caches."""
+        assert self.indexer is not None
+        at = ctx.positions
+        index = self.indexer
+        out = q.new_empty(q.shape[0], self.h, self.dv)
+        torch.ops.vllm.bux_sparse_attention(
+            q.contiguous(),
+            k.contiguous(),
+            v.view(-1, self.g, self.dv).contiguous(),
+            index.queries(x, at).contiguous(),
+            index.head_weights(x).contiguous(),
+            index.keys(x, at).contiguous(),
+            at,
+            out,
+            self.caches[call].prefix,
+        )
+        return out
+
+    def _project(self, x: torch.Tensor, call: int) -> list[torch.Tensor]:
+        """q, k and v of x, (T, _) each, with the conv added to k and v (by the
+        `call`-th call's state) under ``kv_conv_size``."""
+        q, keys_values = self.qkv(x).split(
+            [self.h * self.dk, self.g * (self.dk + self.dv)], -1
+        )
+        if self.convs is not None:
+            keys_values = keys_values + self.convs[call](keys_values)
+        return [q, *keys_values.split([self.g * self.dk, self.g * self.dv], -1)]
+
+    def _v_port(self, v: torch.Tensor, ctx: Ctx) -> torch.Tensor:
+        """The values, (T, g dv), with those the ``v`` port reads mixed in, pushed
+        to the taps it writes, as bux mixes and pushes them."""
+        read = kv.reads(self.ports, "v")
+        if read is not None:
+            v = kv.mix_values(self.mix, self.v_mix, v, ctx.read(*read))
+        for tap in kv.writes(self.ports, "v"):
+            ctx.push(tap, v)
+        return v
 
     def _gated(self, x: torch.Tensor, out: torch.Tensor) -> torch.Tensor:
         """The heads' outputs, (T, h, dv), normalized and gated."""
@@ -141,8 +333,44 @@ class Attention(Layer):
             out = self.out_norm(out)
         if self.gate is None:
             return out
-        gate = self.gate_activation(self.gate(x))
-        return out * gate.view(out.shape[0], self.h, -1)
+        gate = self.gate(x).view(out.shape[0], self.h, -1)
+        if self.gate_bias is not None:
+            gate = gate + self.gate_bias.to(gate.dtype)[:, None]
+        return out * self.gate_activation(gate)
+
+
+class AllHeads(Norm):
+    """bux's QK-norm of all heads together (``qk_norm_all_heads``): statistics over
+    every rank's heads, summed across ranks under tensor parallelism, and this
+    rank's share of the gain and bias, a channel each.
+
+    Args:
+        c: The norm's config, as JSON.
+        heads: The heads it normalizes together, on all ranks.
+        dims: Each head's dims.
+        tp: The ranks they split over.
+    """
+
+    def __init__(self, c: dict, heads: int, dims: int, tp: int):
+        super().__init__(c, heads // tp * dims)
+        self.total = heads * dims
+        for p in (self.weight, self.bias):
+            if p is not None:
+                p.weight_loader = sharded_loader(0)  # ty: ignore[unresolved-attribute]
+
+    def normalize(self, x: torch.Tensor) -> torch.Tensor:
+        """x, (T, this rank's channels), over the RMS of all ranks' channels, centered
+        first for a layernorm, in float32."""
+        y = x.float()
+        if self.kind == "layernorm":
+            y = y - _ranks_sum(y) / self.total
+        y = y * torch.rsqrt(_ranks_sum(y.square()) / self.total + self.eps)
+        return y.to(x.dtype)
+
+
+def _ranks_sum(x: torch.Tensor) -> torch.Tensor:
+    """The sum of x's last axis, (T, 1), over every rank's share of it."""
+    return tensor_model_parallel_all_reduce(x.sum(-1, keepdim=True))
 
 
 def _sinks(heads: int) -> nn.Parameter:
