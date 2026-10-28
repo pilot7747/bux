@@ -18,7 +18,12 @@ from transformers.configuration_utils import PreTrainedConfig
 from .plan import live, plan
 
 #: The kind of state each stateful layer type keeps, as vLLM's ``layer_types``.
-STATES = {"gqa": "full_attention", "mamba2": "mamba", "gdn": "linear_attention"}
+STATES = {
+    "gqa": "full_attention",
+    "mamba2": "mamba",
+    "gdn": "linear_attention",
+    "kda": "linear_attention",
+}
 
 #: What ``config.json`` says of transformers' cache layers, which vLLM reads
 #: otherwise (a model-wide ``sliding_window`` would window every layer): the layers'

@@ -22,9 +22,10 @@ from bux import config as cfg
 from bux.architecture.attention import rope as bux_rope
 from bux.architecture.experts.moe import MoE
 from bux.export import plan as core
+from bux.export.hf import linear_attention as hf_linear
 from bux.export.hf import residual as hf_residual
 from bux.lang import compile, compile_file, compile_runs
-from bux_vllm import common, config, plan, residual, routing
+from bux_vllm import common, config, linear, plan, residual, routing
 
 ROOT = Path(__file__).parent.parent
 EXAMPLES = sorted((ROOT / "examples" / "architectures").rglob("*.bux"))
@@ -106,8 +107,11 @@ def test_layers_after_the_first_head_are_not_live() -> None:
     assert sum(c.layer["config"]["type"] == "gqa" for c in live) == 1
 
 
-def test_the_config_gives_vllm_its_heads_and_layer_kinds() -> None:
-    arch = compile(vllm_parity.CASES["gdn"])
+@pytest.mark.parametrize("name", ["gdn", "kda", "kda-kimi"])
+def test_the_config_gives_vllm_its_heads_and_layer_kinds(name: str) -> None:
+    """Linear attention beside softmax attention is a hybrid for vLLM, as Qwen3-Next
+    and Kimi Linear are."""
+    arch = compile(vllm_parity.CASES[name])
     bux = json.loads(arch.model_dump_json())
     c = config.BuxConfig(bux=bux, vocab_size=256, hidden_size=128)
     assert c.layer_types == ["linear_attention"] * 2 + ["full_attention"]
@@ -317,3 +321,57 @@ def test_attnres_states_sum_and_scale_as_the_exports() -> None:
     ctx = stand_in(pending_read=None)
     want = theirs.read((rows[0] * 0.5 + -rows[1])[None], ctx)[0][0]
     torch.testing.assert_close(mine.read(states[0] * 0.5 + -states[1], ctx)[0], want)
+
+
+LINEAR = {
+    "kda": "kda(num_heads=2, num_v_heads=4, head_dim=16)",
+    "kda low rank": "kda(num_heads=2, head_dim=16, gate_rank=4, output_gate_rank=4)",
+    "gdn": "gdn(num_heads=2, num_v_heads=4, head_dim=16, v_head_dim=8)",
+}
+
+
+#: The export's linear-attention layers, by type.
+EXPORTED = {
+    kind: cls
+    for cls in vars(hf_linear).values()
+    if isinstance(cls, type)
+    for kind in getattr(cls, "bux_types", ())
+}
+
+
+@pytest.mark.parametrize("mixer", LINEAR.values(), ids=LINEAR.keys())
+def test_linear_attention_convolves_the_exports_channels(mixer: str) -> None:
+    """The plugin's q, k and v, which its conv runs over, are the export's."""
+    layer = next(compile(f"d_model = 64\nmodel = {mixer}").layers())
+    c = layer.config.model_dump(mode="json")
+    m = EXPORTED[c["type"]](c, 64)
+    sizes = [m.q.weight.shape[0], m.k.weight.shape[0], m.v.weight.shape[0]]
+    assert linear.conv_channels(c) == sizes
+    assert m.conv is not None and m.conv.weight.shape == (c["conv_size"], sum(sizes))
+
+
+def test_a_rank_convolves_its_share_of_q_k_and_v() -> None:
+    """Under tensor parallelism a rank's conv taps are its q, k and v channels in
+    turn, as its share of the merged input projection gives them."""
+    sizes = [8, 8, 16]
+    taps = torch.randn(4, sum(sizes))
+    whole = linear.conv_shard(taps, sizes, 0, 1)
+    torch.testing.assert_close(whole, linear.conv_weight(taps))
+    q, k, v = whole.split(sizes)
+    for rank in range(2):
+        mine = [x.chunk(2)[rank] for x in (q, k, v)]
+        torch.testing.assert_close(
+            linear.conv_shard(taps, sizes, rank, 2), torch.cat(mine)
+        )
+
+
+def test_q_and_k_heads_serve_their_groups_of_value_heads() -> None:
+    """Each q/k head, repeated for the kernels, serves the value heads next to it,
+    as the export shares it out."""
+    x = torch.randn(5, 2 * 3)  # T, heads * d
+    got = linear.to_value_heads(x, 2, 2)
+    assert got.shape == (1, 5, 4, 3)
+    for v_head in range(4):
+        torch.testing.assert_close(
+            got[0, :, v_head], x.reshape(5, 2, 3)[:, v_head // 2]
+        )

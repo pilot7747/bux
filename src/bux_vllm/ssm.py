@@ -1,5 +1,6 @@
 """Recurrent layers in vLLM, by its own Mamba-2 and Gated DeltaNet layers: bux's
-``mamba2`` and ``gdn``, their state in vLLM's Mamba cache.
+``mamba2`` and ``gdn``, their state in vLLM's Mamba cache, as ``kda``'s is
+(`bux_vllm.kda`).
 
 A model with them is a hybrid, whose class tells vLLM the shape and dtype of a
 layer's state from the config, before it builds the model (`state_shapes`,
@@ -25,11 +26,13 @@ from vllm.model_executor.layers.mamba.mamba_utils import (
     MambaStateShapeCalculator,
 )
 
+from . import kda
 from .common import Ctx, Layer, Site
+from .linear import conv_weight, linear_dims
 from .plan import live, plan
 
 #: The recurrent layer types, which keep their state in vLLM's Mamba cache.
-RECURRENT = ("mamba2", "gdn")
+RECURRENT = ("mamba2", "gdn", "kda")
 
 
 def mamba2_dims(c: dict, width: int) -> tuple[int, int]:
@@ -37,17 +40,6 @@ def mamba2_dims(c: dict, width: int) -> tuple[int, int]:
     splits them."""
     inner = c["num_heads"] * c["head_dim"] if c["num_heads"] else c["expand"] * width
     return inner, inner // c["head_dim"]
-
-
-def gdn_dims(c: dict) -> tuple[int, int, int, int]:
-    """Gated DeltaNet's q/k heads, value heads, and their dims."""
-    h, dk = c["num_heads"], c["head_dim"]
-    return h, c["num_v_heads"] or h, dk, c["v_head_dim"] or dk
-
-
-def conv_weight(tensor: torch.Tensor) -> torch.Tensor:
-    """bux's conv taps, (k, C), as vLLM's conv weight, (C, 1, k)."""
-    return tensor.T.unsqueeze(1).contiguous()
 
 
 class Mamba2(Layer):
@@ -116,7 +108,7 @@ class GatedDeltaNet(Layer):
         super().__init__()
         if c["conv_size"] is None or c["output_gate"] is None:
             raise NotImplementedError("gdn: no conv or no output gate not in vLLM yet")
-        h, hv, dk, dv = gdn_dims(c)
+        h, hv, dk, dv = linear_dims(c)
         config = SimpleNamespace(
             hidden_size=width,
             hidden_act="silu",
@@ -185,8 +177,10 @@ def state_shapes(vllm_config: Any) -> tuple:
     kind, c, width = found
     tp = vllm_config.parallel_config.tensor_parallel_size
     spec = vllm_config.num_speculative_tokens
+    if kind == "kda":
+        return kda.state_shape(c, tp)
     if kind == "gdn":
-        h, hv, dk, dv = gdn_dims(c)
+        h, hv, dk, dv = linear_dims(c)
         return MambaStateShapeCalculator.gated_delta_net_state_shape(
             tp, h, hv, dk, dv, c["conv_size"], spec
         )
@@ -206,6 +200,9 @@ def state_shapes(vllm_config: Any) -> tuple:
 def state_dtypes(vllm_config: Any) -> tuple:
     """The dtypes of the state of each of the model's recurrent layers."""
     cache = vllm_config.cache_config
+    found = _recurrent(vllm_config.model_config.hf_config)
+    if found is not None and found[0] == "kda":
+        return kda.state_dtype(vllm_config.model_config, cache)
     return MambaStateDtypeCalculator.mamba2_state_dtype(
         vllm_config.model_config.dtype,
         cache.mamba_cache_dtype,
@@ -215,7 +212,7 @@ def state_dtypes(vllm_config: Any) -> tuple:
 
 def copy_funcs(kind: str) -> tuple:
     """How vLLM copies the state of a recurrent layer of vLLM's `kind`
-    (``MAMBA2`` or ``GDN_ATTN``) for prefix caching."""
+    (``MAMBA2``, or ``GDN_ATTN``: ``gdn``'s and ``kda``'s) for prefix caching."""
     if kind == "GDN_ATTN":
         return MambaStateCopyFuncCalculator.gated_delta_net_state_copy_func()
     return MambaStateCopyFuncCalculator.mamba2_state_copy_func()

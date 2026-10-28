@@ -49,6 +49,16 @@ BLOCK = "block = [rmsnorm attn] [rmsnorm ffn]\n"
 LLAMA = HEAD + ATTN + FFN + BLOCK
 EXPERT = "dense = gated_mlp(intermediate_size=64, activation=swish)\n"
 MOE_BLOCK = "block = [rmsnorm attn] [rmsnorm experts]\n"
+# Qwen3-Next's attention beside linear attention (`delta`), which the case defines.
+GATED_HEAD = (
+    HEAD
+    + "attn = gqa(num_heads=4, num_kv_heads=2, qk_norm=rmsnorm(zero_centered=true),"
+    " gated=true, rope=rope(fraction=0.25))\n" + FFN
+)
+LINEAR_HYBRID = (
+    "model = embed [rmsnorm delta] [rmsnorm ffn] [rmsnorm delta] [rmsnorm ffn]"
+    " [rmsnorm attn] [rmsnorm ffn] rmsnorm head"
+)
 
 #: The cases, by name: a model each, as bux source.
 CASES = {
@@ -148,13 +158,15 @@ CASES = {
     + "ssm = mamba2(state_size=16, head_dim=16, num_groups=2)\n"
     + "model = embed [rmsnorm ssm] [rmsnorm ffn] [rmsnorm attn] [rmsnorm ffn]"
     " [rmsnorm ssm] [rmsnorm ffn] rmsnorm head",
-    "gdn": HEAD
-    + "attn = gqa(num_heads=4, num_kv_heads=2, qk_norm=rmsnorm(zero_centered=true),"
-    " gated=true, rope=rope(fraction=0.25))\n"
-    + FFN
+    "gdn": GATED_HEAD
     + "delta = gdn(num_heads=2, num_v_heads=4, head_dim=32)\n"
-    + "model = embed [rmsnorm delta] [rmsnorm ffn] [rmsnorm delta] [rmsnorm ffn]"
-    " [rmsnorm attn] [rmsnorm ffn] rmsnorm head",
+    + LINEAR_HYBRID,
+    "kda": GATED_HEAD
+    + "delta = kda(num_heads=2, num_v_heads=4, head_dim=32, gate_lower_bound=-5)\n"
+    + LINEAR_HYBRID,
+    "kda-kimi": GATED_HEAD
+    + "delta = kda(num_heads=4, head_dim=32, output_gate_rank=32, norm_eps=1e-5)\n"
+    + LINEAR_HYBRID,
     "hc": LLAMA + "residual = hc(expansion=4)\nmodel = embed block^2 rmsnorm head",
     "attnres": LLAMA
     + "residual = attnres(block_size=3)\nmodel = embed block^2 rmsnorm head",
