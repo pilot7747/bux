@@ -556,8 +556,9 @@ In a bfloat16 model, MSA's indexer and attention run on the Triton kernels vLLM
 runs MiniMax-M3's sparse layers on, where they take its settings: blocks of 128
 keys (`block_size=128`, `pool=max`, `per_group=true`), plain dots, unweighted
 heads, an index head for each kv head, index and attention heads of a power of two
-of dims (keys and values alike), fewer than 64 blocks a query, and no window, sinks
-or softcap. MiniMax-M3's own settings are these.
+of dims (keys and values alike), a power of two of kv heads on a GPU, fewer than 64
+blocks a query, and no window, sinks or softcap. MiniMax-M3's own settings are
+these.
 
 - **Keys.** Each token's index key, normalized and rotated, is cached in bfloat16
   in head slots after the call's kv heads. The cache takes blocks of 128 tokens, a

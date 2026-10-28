@@ -9,7 +9,8 @@ it sees by a plain dot product, a block of 128 keys by its best, and the kv head
 group of query heads attends to the group's best ``top_k / 128`` blocks, its own
 block among them. The kernels take it where its blocks are 128 keys and its heads
 unweighted, with no window, sinks or softcap, index and attention heads of a power
-of two of dims, and fewer than 64 blocks a query (`takes`). They rank the blocks as
+of two of dims, a power of two of kv heads on a rank, and fewer than 64 blocks a
+query (`takes`). They rank the blocks as
 bux does, but break ties their own way.
 
 The index keys, normalized and rotated, are cached in bfloat16 in head slots after
@@ -41,13 +42,14 @@ def takes(spec: Sparse, ix: dict, kv_heads: int, dims: int, dtype: torch.dtype) 
     plain = not spec.relu and not ix["weighted"] and spec.window is None
     plain = plain and spec.sinks is None and spec.softcap is None and not spec.latent
     heads = ix["num_heads"] == kv_heads and _power(ix["head_dim"]) and _power(dims)
+    heads = heads and _power(spec.groups[1], 1)  # a rank's index heads, an arange
     count = 0 < spec.top_k // BLOCK < MOST_BLOCKS
     return on and blocks and plain and heads and count and available()
 
 
-def _power(n: int) -> bool:
-    """Whether `n` is a power of two of 16 or more."""
-    return n >= 16 and n & (n - 1) == 0
+def _power(n: int, least: int = 16) -> bool:
+    """Whether `n` is a power of two of `least` or more."""
+    return n >= least and n & (n - 1) == 0
 
 
 @functools.cache
