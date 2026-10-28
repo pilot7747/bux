@@ -194,14 +194,17 @@ a scale for its keys and one for its values, which vLLM reads from a checkpoint.
 export has none, so both are 1.0: the keys and values are cached as they are, to 3
 bits of mantissa, and clip past ±448, FP8's largest value. A model whose keys or
 values reach further needs scales of its own, which the export does not write yet.
-The layers whose cache is the plugin's own refuse an FP8 cache as the model is built
-(`NotImplementedError`, naming the layer and `kv_cache_dtype`), rather than keep it
-in bfloat16.
+Most layers whose cache is the plugin's own refuse an FP8 cache as the model is
+built (`NotImplementedError`, naming the layer and `kv_cache_dtype`), rather than
+keep it in bfloat16. A sparse `gqa` layer whose indexer runs on vLLM's DSA kernels,
+and one that reads its `index` port, keep theirs in FP8 at the same scale of 1, as
+the plugin's attention kernel reads e4m3 and e5m2 ([Sparse attention](#sparse-attention)).
 
 | Layers | FP8 KV cache |
 |--------|--------------|
 | `gqa` | yes, by vLLM's attention: sliding windows, sinks, soft-capping, gates, QK-norm, `kv_conv_size` (its conv state stays in the model's dtype), the `v` port, and the `kv` port (a reader attends to its writer's FP8 cache). On SM 10.x, see the note on FlashAttention below |
-| `gqa` with an indexer, the `index` port or a relative bias | refused: its cache is the plugin's ([Sparse attention](#sparse-attention)) |
+| `gqa` with an indexer on vLLM's DSA or MSA kernels (DSA's, QSA's, MSA's), or reading the `index` port | yes, in a 16-bit model: its keys and values in FP8 beside the indexer's keys ([DSA on vLLM's kernels](#dsa-on-vllms-kernels), [MSA on vLLM's kernels](#msa-on-vllms-kernels)) |
+| `gqa` with another indexer (one with a window, say) or a relative bias | refused: its cache is the plugin's ([Sparse attention](#sparse-attention)) |
 | `mla` | yes, by vLLM's MLA backends that take FP8: Triton's (a latent of 256 and 32 rotated dims), FlashInfer's on SM 10.x (DeepSeek's dims). A prompt's cached context is dequantized as it is gathered, by vLLM's kernel or, for the latent sizes it lacks, the plugin's. Where no prefill backend of vLLM's takes the dims, the prefill is FlashAttention's, in the model's dtype |
 | `mla` with an indexer or the `index` port | refused: its cache is the plugin's |
 | `csa` | refused: its caches are the plugin's ([Compressed sparse attention](#compressed-sparse-attention)) |
@@ -332,8 +335,8 @@ in every run.
 | `rmsnorm`, `layernorm`, `dyt`, `mlp`, `gated_mlp`, `linear`, `act`, `scale`, `dropout` | yes, with the MLPs' `limit`, `up_softcap` and `up_offset` |
 | `conv` | by vLLM's short-conv kernels, its last inputs in vLLM's Mamba cache, as the conv on keys and values; the whole stream on every rank |
 | `short_conv` | LFM2's, `C * conv(B u)`, by the same kernels and state, its channels split over ranks, with or without biases |
-| `gqa` | RoPE (`pi`, `llama3`, `yarn`), QK-norm, GQA and MQA, biases, `fused_qkv`, sliding windows, soft-capping, sinks, its scale, `gated` (a gate per channel or per head, with `gate_head_bias`), `output_norm`, `power_scale` and `log_scale` (on the queries, which scales the logits as bux does), the conv on keys and values (`kv_conv_size`), an indexer ([Sparse attention](#sparse-attention)), a relative bias (Inkling's, by the plugin's own op, as an indexer), the `v` port: the value residual, fixed, learned or convex, the `kv` port: cross-layer KV sharing, by vLLM's own, between layers of the same kv heads, the reader's window no longer than the writer's, and the `index` port: one layer's picks shared with others ([Sparse attention](#sparse-attention)). QK-norm runs across all heads too (`qk_norm_all_heads`), its statistics summed over the ranks, where each rank keeps kv heads of its own. Not yet: the `kv` port of a sparse layer, or a relative bias beside an indexer or ports |
-| `mla` | by vLLM's MLA and its latent cache ([Multi-head latent attention](#multi-head-latent-attention)): queries at full rank or from a latent, RoPE (`pi`, `llama3`, `yarn`; partial, interleaved) or none, its scale, `gated` (a gate per channel or per head), `output_norm`; in bfloat16 or float16. With an indexer (DeepSeek-V3.2's) or the `index` port's picks, sparse attention in the latent space by the plugin's ops ([Sparse attention](#sparse-attention)), with a window, soft-capping and sinks too, in any dtype. Not yet: QK-norm, a window, soft-capping or sinks without an indexer, a relative bias, `log_scale`, `gate_head_bias`, the `kv` port, an indexer that picks per group, `mla` that vLLM runs as MLA beside other attention, or such `mla` layers of different dims or heads |
+| `gqa` | RoPE (`pi`, `llama3`, `yarn`), QK-norm, GQA and MQA, biases, `fused_qkv`, sliding windows, soft-capping, sinks, its scale, `gated` (a gate per channel or per head, with `gate_head_bias`), `output_norm`, `power_scale` and `log_scale` (on the queries, which scales the logits as bux does), the conv on keys and values (`kv_conv_size`), an indexer ([Sparse attention](#sparse-attention); DeepSeek-V3.2's on vLLM's DSA kernels, [DSA on vLLM's kernels](#dsa-on-vllms-kernels)), a relative bias (Inkling's, by the plugin's own op, as an indexer), the `v` port: the value residual, fixed, learned or convex, the `kv` port: cross-layer KV sharing, by vLLM's own, between layers of the same kv heads, the reader's window no longer than the writer's, and the `index` port: one layer's picks shared with others ([Sparse attention](#sparse-attention)). QK-norm runs across all heads too (`qk_norm_all_heads`), its statistics summed over the ranks, where each rank keeps kv heads of its own. Not yet: the `kv` port of a sparse layer, or a relative bias beside an indexer or ports |
+| `mla` | by vLLM's MLA and its latent cache ([Multi-head latent attention](#multi-head-latent-attention)): queries at full rank or from a latent, RoPE (`pi`, `llama3`, `yarn`; partial, interleaved) or none, its scale, `gated` (a gate per channel or per head), `output_norm`; in bfloat16 or float16. With an indexer (DeepSeek-V3.2's, its picks by vLLM's DSA kernels where they take it) or the `index` port's picks, sparse attention in the latent space by the plugin's ops ([Sparse attention](#sparse-attention)), with a window, soft-capping and sinks too, in any dtype. Not yet: QK-norm, a window, soft-capping or sinks without an indexer, a relative bias, `log_scale`, `gate_head_bias`, the `kv` port, an indexer that picks per group, `mla` that vLLM runs as MLA beside other attention, or such `mla` layers of different dims or heads |
 | `csa` | bux's arithmetic on vLLM's paged caches ([Compressed sparse attention](#compressed-sparse-attention)): a sliding window or every token, compressed latents of any `compress_ratio`, the indexer's top-k (ReLU'd or plain dots, weighted or summed, its norm), queries at full rank or from a latent, QK-norm, RoPE (`pi`, `llama3`, `yarn`; partial, interleaved), sinks, soft-capping, its scale, `gated` (a gate per channel or per head, `gate_head_bias`), `output_norm`, a dense or grouped low-rank output, and its `kv`, `index` and `candidates` ports; in float32 or bfloat16. Not yet: an indexer of blocks, a relative bias, `log_scale`, speculative decoding, decode context parallelism, or an FP8 KV cache |
 | `moe` | softmax, sigmoid and `sqrtsoftplus` routers, `router_logit_scale`, groups, the aux-free bias, a router bias, shared experts and their gate, gated and plain experts (`swish`, `gelu`, `gelu_tanh`, `relu2`) with biases, a `limit` and `up_offset` on `swish` and `quick_gelu` gates (gpt-oss's), SiTU-GLU experts (`situ` with an `up_softcap`, Kimi K3's, by vLLM's own), LatentMoE with its norms (vLLM's fused experts at the latent's width), shared experts the router scores (`shared_expert_sink`), and each routed expert's output normalized before its weight (`expert_norm`; each of a token's picks a row of its own in vLLM's fused MoE, so that their outputs come back apart, summed over the ranks, for the norm). Not yet: an `up_softcap` on experts other than `situ` ones |
 | `mamba`, `mamba2`, `gdn` | by vLLM's own layers (`mamba` as Jamba's, without speculative decoding), with one type and shape of recurrent layer per model; `gdn` in bfloat16 only, and without a short conv or an output gate by bux's own rule ([DPLR delta rules](#dplr-delta-rules)). Under tensor parallelism, vLLM 0.32's Mamba-2 failed with one group (its fused all-reduce), and in bfloat16 where a rank's share of the input projection is not a multiple of 8 wide |
@@ -484,7 +487,89 @@ layer: a window, sinks, a softcap, and a `gqa` layer's conv on keys and values a
 - **Tensor parallelism.** Every rank computes the whole indexer and picks the same
   keys. With picks per group, a rank keeps its own kv heads' picks.
 
-The KV cache must be unquantized (`--kv-cache-dtype auto`).
+The KV cache must be unquantized (`--kv-cache-dtype auto`), but where DSA runs on
+vLLM's kernels.
+
+### DSA on vLLM's kernels
+
+In a 16-bit model, DSA's indexer runs on the kernels vLLM runs DeepSeek-V3.2's on,
+where they take its settings: single keys, ReLU'd dots summed over the heads (no
+`per_group`), weighted or summed heads, an indexer head of 32, 64 or 128 dims, 128
+heads at most, no window, and a `top_k` of 2048 at most. It takes DeepGEMM, which
+vLLM installs, on an SM 9.0 or 10.x GPU. QSA's indexer (mean-pooled blocks of a
+size that divides 64) runs on them as DSA's over its blocks, with `top_k /
+block_size` blocks. MSA's (plain dots, picks per group) runs on vLLM's MiniMax-M3
+kernels ([MSA on vLLM's kernels](#msa-on-vllms-kernels)), and the rest keep the
+plugin's own kernels above. So does a sparse `mla` layer's indexer, unless
+`BUX_VLLM_SPARSE_KERNELS=native`: its FP8 keys would take a head slot as wide as a
+latent, which doubles the layer's cache.
+
+- **Keys.** Each token's indexer key is cached in FP8 (e4m3) with a float32 scale,
+  in head slots of the call's cache after its kv heads: each block's keys, then
+  their scales, as DeepGEMM's paged kernel reads them. They page with the keys and
+  values, one cache a call, so prefix caching hits as in a dense model. The cache
+  takes blocks of 64 tokens, which vLLM sets (or splits larger blocks into).
+- **Scores.** A prompt chunk's queries score the keys of its request, as vLLM
+  gathers them, by DeepGEMM's MQA logits (`fp8_fp4_mqa_logits`); decoded tokens
+  score theirs in place, by its paged MQA logits. Queries are FP8 too, with a scale
+  for each head that joins the head's weight; heads are padded to a count DeepGEMM
+  takes (4 or more, a power of two, on SM 10.x), with weights of 0.
+- **QSA's blocks.** Its keys as projected are cached in the model's dtype, in slots of their
+  own. The token that completes a block writes the block's key, the mean of its
+  keys normalized and rotated to its first position, as bux pools it, into the FP8
+  keys at the position of the block's index, so the kernels score a request's
+  complete blocks as DSA's keys. A query also keeps its own block while that is
+  unfinished.
+- **Picks.** vLLM's top-k kernels keep each query's best `top_k` of the keys (or
+  blocks) it sees, as DeepSeek-V3.2's do.
+- **Attention.** vLLM's own sparse GQA attention, the kernel it runs Qwen4's QSA
+  on, attends over the picks, reading the paged keys and values in place: in a
+  bfloat16 model, at heads of a power of two of dims, in groups of 4 query heads or
+  more, without sinks or a softcap. Other layers attend by the plugin's Triton
+  kernel, and MLA's latents by PyTorch.
+- **FP8 KV cache.** Under `--kv-cache-dtype fp8`, such a call keeps its keys and
+  values in FP8 (e4m3, at a scale of 1, as vLLM's attention does), and so does a
+  layer that reads its `index` port. The attention kernel reads them as they are,
+  its values through bfloat16 into its dots.
+
+The indexer scores in FP8, as DeepSeek's does, where bux's scores in float32, so a
+query picks another key than bux's where two scores are within FP8's rounding.
+`BUX_VLLM_SPARSE_KERNELS=triton` keeps the plugin's own kernels (and its float32
+scores), `torch` the PyTorch path, and `native` runs vLLM's kernels in a float32
+model too. `scripts/vllm_native.py` checks the kernels on a GPU against PyTorch, on
+the keys as the plugin caches them, and times them beside the plugin's own.
+
+On an NVIDIA B300 (2026-10-28, vLLM 0.32.0), for an indexer of 4 heads of 64 and a
+top 2048, a 16k-token prompt's scores and picks take 0.73 ms a layer on vLLM's
+kernels against 6.8 ms on the plugin's, and a decoding step of 64 requests of 20k
+keys 0.07 ms against 0.82 ms. Attending over the picks at a width of 2816 (44 query
+heads of 64 over 11 kv heads), vLLM's kernel takes 13 ms for the 16k prompt and
+0.13 ms for the step, the plugin's 39 ms and 0.35 ms. Under an agentic coding load
+(prompts of 16k tokens, four turns), the hybrid with DSA global layers at that
+width serves 2793 sessions an hour on one B300 within a TPOT of 30 ms in bfloat16,
+and 2952 with FP8 weights and an FP8 KV cache, against 1692 on the plugin's own
+kernels, at a TTFT of 0.46 s against 0.74 s.
+
+### MSA on vLLM's kernels
+
+In a bfloat16 model, MSA's indexer and attention run on the Triton kernels vLLM
+runs MiniMax-M3's sparse layers on, where they take its settings: blocks of 128
+keys (`block_size=128`, `pool=max`, `per_group=true`), plain dots, unweighted
+heads, an index head for each kv head, index and attention heads of a power of two
+of dims (keys and values alike), a power of two of kv heads on a GPU, fewer than 64
+blocks a query, and no window, sinks or softcap. MiniMax-M3's own settings are
+these.
+
+- **Keys.** Each token's index key, normalized and rotated, is cached in bfloat16
+  in head slots after the call's kv heads. The cache takes blocks of 128 tokens, a
+  block of MSA's to a page, as the kernels read them.
+- **Picks.** Each index head scores the blocks its query sees by their best key,
+  and keeps its group's best `top_k / 128`, the query's own block among them.
+- **Attention.** Each kv head's group of query heads attends to its group's
+  blocks, reading the paged keys and values in place, in bfloat16 or FP8 (e4m3 or
+  e5m2, as under `--kv-cache-dtype fp8`).
+
+The picks are bux's, but for ties, which the kernels break their own way.
 
 A `gqa` layer with a relative bias (Inkling's) runs the same way, as no attention
 kernel of vLLM's adds a bias that depends on how far behind its query a key is: its
@@ -597,6 +682,9 @@ JAX_PLATFORMS=cpu python scripts/vllm_parity.py compare runs/parity/float32  # b
   to measure how far bfloat16 moves bux itself. vLLM passes if it is off by no more
   than twice that, and if it picks a token other than bux's only within that
   distance of the best: a near tie that two bfloat16 runs may break either way.
+- **On vLLM's DSA kernels**, the indexer scores in FP8 and picks other keys than
+  bux's float32 scores do, so those cases are compared with bux's indexer scoring
+  in FP8 too (`compare --fp8-indexer`), and the rest checked as above.
 
 Measured on 2026-10-28 on one and two (TP=2) NVIDIA B300 GPUs, with vLLM 0.32.0,
 PyTorch 2.13.0 (CUDA 13.0), flash-linear-attention 0.6.0 and Python 3.12; bux's
@@ -627,20 +715,25 @@ parentheses is bux's own bfloat16 error, against the same reference:
 | `kv-share` | Hymba's cross-layer KV sharing: a windowed layer's keys and values read by the next one or two, a full layer's by one with a window of its own | 1.1e-5 | 0.13 (0.19) | 0.20 |
 | `relbias` | Inkling's attention: a relative bias, a conv on keys and values, a length scale, window-only layers biased over their window | 6.2e-6 | 0.080 (0.10) | 0.075 |
 | `dsa` | DSA's top 8 of the keys, a window, sinks and a softcap | 7.6e-6 | 2.4 (2.0) | 2.4 |
-| `dsa-conv` | an indexer beside the conv on keys and values, QK-norm, a gate, the `v` port | 6.2e-6 | 3.3 (3.1) | 3.3 |
-| `dsa-share` | DSA's picks shared through the `index` port with two layers, the last with a window | 7.2e-6 | 3.9 (4.2) | 3.9 |
+| `dsa-conv` | an indexer beside the conv on keys and values, QK-norm, a gate, the `v` port | 6.2e-6 | 3.3 (3.1) | 4.1 |
+| `dsa-share` | DSA's picks shared through the `index` port with two layers, the last with a window | 6.7e-6 | 3.9 (4.2) | 3.9 |
 | `msa` | MSA's max-pooled blocks of 4, picks per group, plain dots, summed heads, the indexer's norm | 5.7e-6 | 3.5 (3.3) | 3.6 |
-| `msa-share` | MSA's picks shared through the `index` port | 8.1e-6 | 4.7 (4.7) | 4.7 |
-| `qsa` | QSA's mean-pooled blocks of 4, partial RoPE | 8.1e-6 | 0.63 (3.1) | - |
-| `csa` | compressed sparse attention: groups of 4, a window of 16, the indexer's top 8, sinks | 6.7e-6 | 0.42 (2.7) | 0.62 |
+| `msa-share` | MSA's picks shared through the `index` port | 8.6e-6 | 4.7 (4.7) | 4.7 |
+| `qsa` | QSA's mean-pooled blocks of 4, partial RoPE | 7.6e-6 | 0.63 (3.1) | - |
+| `csa` | compressed sparse attention: groups of 4, a window of 16, the indexer's top 8, sinks | 6.7e-6 | 0.42 (2.7) | 2.0 |
+| `dsa-native` | DSA on vLLM's DSA kernels: an indexer of 4 heads of 64, its top 16, one layer that reads its picks | - | 3.8 (4.9) | 3.8 |
+| `dsa-hybrid` | the same on the hybrid's global layer (QK-norm, a gate, the conv on keys and values), beside KDA | - | 0.39 (0.65) | 0.41 |
+| `qsa-native` | QSA on vLLM's DSA kernels: blocks of 4, 4 heads of 64, partial RoPE | - | 3.1 (5.1) | 3.1 |
+| `msa-native` | MSA on vLLM's MiniMax-M3 kernels: blocks of 128, an index head a kv head | - | 0.088 (0.094) | 0.067 |
+| `mla-dsa-native` | sparse MLA with its indexer on vLLM's DSA kernels (`BUX_VLLM_SPARSE_KERNELS=native`) | - | 3.1 (3.5) | - |
 | `csa-latent` | DeepSeek-V4.1's wiring of csa: a window-only layer and one compressing pairs, a query latent, a grouped low-rank output | 6.2e-6 | 0.31 (0.88) | - |
 | `csa-ports` | DeepSeek-V4.1's ports: a layer that compresses pairs, indexes them and makes a candidate pool, one that reads its latents and picks, one that re-indexes inside the pool | 8.1e-6 | 0.87 (1.4) | - |
 | `mla` | MLA with a latent of 256 and 32 rotated dims (Triton's MLA) | - | 0.10 (0.10) | 0.097 |
 | `mla-moe` | the same MLA beside a sigmoid MoE | - | 1.6 (0.093), differs | 1.4 |
 | `mla-chunked` | the same MLA prefilled 16 tokens per step (`max_num_batched_tokens=16`), each later chunk attending to the latents the earlier ones cached | - | 0.078 (0.10) | 0.085 |
 | `mla-deepseek` | MLA at DeepSeek-V3's dims (FlashInfer's), a query latent, interleaved YaRN, a gate per head, an output norm | - | 0.089 (0.14) | - |
-| `mla-dsa` | sparse MLA, DeepSeek-V3.2's: an indexer, a window, sinks and a softcap | 6.7e-6 | 2.6 (2.7) | - |
-| `mla-share` | sparse MLA, GLM-5.3's: picks shared through the `index` port | 8.1e-6 | 3.3 (2.8) | - |
+| `mla-dsa` | sparse MLA, DeepSeek-V3.2's: an indexer, a window, sinks and a softcap | 7.6e-6 | 2.6 (2.7) | - |
+| `mla-share` | sparse MLA, GLM-5.3's: picks shared through the `index` port | 8.6e-6 | 3.3 (2.8) | - |
 | `moe` | a softmax router, unnormalized top-2 of 8, a gated shared expert | 6.7e-6 | 0.68 (1.2) | - |
 | `moe-grouped` | a sigmoid router, 4 groups, the aux-free bias, a scaling of 2.5 | 8.6e-6 | 2.1 (3.8) | 1.8 |
 | `moe-relu2` | a `sqrtsoftplus` router, plain relu2 experts | 5.7e-6 | 1.8 (1.4) | - |
@@ -681,6 +774,13 @@ keys' scores are within bfloat16's rounding of each other, a token's picks chang
 and so does its output. Two cases differ: `moe-sink` at TP=2 picks a token 1.8
 below the best, at bux's own 1.8; and `mla-moe` on one GPU is off by 1.6, where
 bux's own bfloat16 run is off by 0.093 (at TP=2, by 1.4 against bux's own 1.1).
+The `-native` cases run vLLM's sparse kernels, in bfloat16 alone. Those on its DSA
+kernels are compared with bux's indexer scoring in FP8 too (`--fp8-indexer`). In
+float32, with the kernels forced (`BUX_VLLM_SPARSE_KERNELS=native`), they differ
+from that reference by up to 3.4: FP8 scores often tie exactly, and vLLM's top-k
+breaks a tie its own way, where bux keeps the first key.
+`msa-native`'s prompts fit in one block of 128, so it checks the kernels' attention
+and plumbing; `scripts/vllm_native.py` checks their picks, which agree with bux's.
 `gdn`, `kda`, `kda-odd`, `kda-kimi` and the `mla` cases run in bfloat16 only, and
 `gla` without a conv in float32 alone. A `-` marks a case not measured that way.
 

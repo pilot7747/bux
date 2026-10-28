@@ -11,6 +11,7 @@ three steps:
         [--mamba-ssm-cache-dtype float32] [--attention-backend TRITON_MLA] [--tag TAG]
     # bux's again: compare
     JAX_PLATFORMS=cpu python scripts/vllm_parity.py compare DIR [--tag TAG]
+        [--fp8-indexer]
 
 `run` decodes every case's prompts greedily in one batch of different lengths and
 keeps vLLM's log-probabilities of the whole vocabulary at every position: the
@@ -28,7 +29,9 @@ plugin runs; `--only` picks some by name. In bfloat16 the export's weights are
 bfloat16, and bux's reference computes in float32 from the same rounded weights, so
 that the difference is vLLM's arithmetic alone; bux computes in bfloat16 too, and
 vLLM may be off by up to twice as much as bux is from itself, and break near ties
-that close either way.
+that close either way. An indexer on vLLM's DSA kernels scores in FP8, which picks
+other keys than bux's float32 scores do: ``--fp8-indexer`` has bux's reference
+score in FP8 too (`fp8_indexer`), so that the rest is checked as for other cases.
 """
 
 import argparse
@@ -78,6 +81,10 @@ SPARSE_MLA = (
     " head_dim=16, top_k=8))\n"
     "local = attn(sliding_window_size=16, sinks=true, softcap=20)\n"
 )
+#: DSA's indexer as vLLM's DeepSeek-V3.2 kernels take it, the timeline's: 4 heads of
+#: 64, its top 16 of the keys, so that the prompts and their decoding pick.
+NATIVE_INDEXER = "indexer=indexer(num_heads=4, head_dim=64, top_k=16)"
+NATIVE = f"attn = gqa(num_heads=4, num_kv_heads=2, rope=rope(), {NATIVE_INDEXER})\n"
 #: csa compressing groups of 4 with half the dims rotated, at d_model 128, its
 #: window and top-k small enough that the prompts and their decoding cross both.
 SPARSE = (
@@ -379,6 +386,15 @@ CASES = {
     + FFN
     + "model = embed [rmsnorm attn] [rmsnorm ffn] [rmsnorm local] [rmsnorm ffn]"
     " rmsnorm head",
+    # DeepSeek-V3.2's indexer on vLLM's kernels (under
+    # BUX_VLLM_SPARSE_KERNELS=native), in two layers.
+    "mla-dsa-native": HEAD
+    + SPARSE_MLA.replace(
+        "indexer=indexer(num_heads=2, head_dim=16, top_k=8)", NATIVE_INDEXER
+    )
+    + FFN
+    + "model = embed [rmsnorm attn] [rmsnorm ffn] [rmsnorm attn] [rmsnorm ffn]"
+    " rmsnorm head",
     # GLM-5.3's: one layer's picks shared with the next two.
     "mla-share": HEAD
     + SPARSE_MLA
@@ -412,6 +428,20 @@ CASES = {
     + "model = embed [rmsnorm attn(index=@topk)] [rmsnorm ffn] [rmsnorm attn(index=$topk)]"
     " [rmsnorm ffn] [rmsnorm attn(sliding_window_size=16, index=$topk!)] [rmsnorm ffn]"
     " rmsnorm head",
+    # DSA on vLLM's DeepSeek-V3.2 kernels (in 16-bit models): the timeline's
+    # indexer of 4 heads of 64, a layer that reads its picks, one that indexes its own.
+    "dsa-native": HEAD
+    + FFN
+    + NATIVE
+    + "model = embed [rmsnorm attn(index=@topk)] [rmsnorm ffn] [rmsnorm attn]"
+    " [rmsnorm ffn] [rmsnorm attn(index=$topk!)] [rmsnorm ffn] rmsnorm head",
+    # The factorial's S arms: DSA on the hybrid's global layer (QK-norm, a gate, the
+    # conv on keys and values) beside KDA, which takes blocks of many tokens.
+    "dsa-hybrid": HEAD
+    + FFN
+    + NATIVE.replace("rope=rope()", "kv_conv_size=4, qk_norm=rmsnorm, gated=true")
+    + "delta = kda(num_heads=2, num_v_heads=4, head_dim=32, gate_lower_bound=-5)\n"
+    + LINEAR_HYBRID,
     # MSA's picks, of blocks and per kv head's group, shared likewise.
     "msa-share": HEAD
     + FFN
@@ -431,6 +461,22 @@ CASES = {
     + FFN
     + "attn = gqa(num_heads=4, num_kv_heads=2, rope=rope(fraction=0.5),"
     " indexer=indexer(num_heads=2, head_dim=16, top_k=16, block_size=4,"
+    " weighted=false, norm=rmsnorm))\n" + BLOCK + "model = embed block^2 rmsnorm head",
+    # MSA on vLLM's MiniMax-M3 kernels: blocks of 128, an index head a kv head.
+    # The prompts fit in a block, so this checks their attention, not their picks
+    # (scripts/vllm_native.py checks those).
+    "msa-native": HEAD
+    + FFN
+    + "attn = gqa(num_heads=4, num_kv_heads=2, rope=rope(fraction=0.5), indexer=indexer("
+    "num_heads=2, head_dim=32, top_k=256, block_size=128, pool=max, per_group=true,"
+    " relu=false, weighted=false, norm=rmsnorm))\n"
+    + BLOCK
+    + "model = embed block^2 rmsnorm head",
+    # QSA on vLLM's DSA kernels: blocks of 4, the timeline's 4 heads of 64.
+    "qsa-native": HEAD
+    + FFN
+    + "attn = gqa(num_heads=4, num_kv_heads=2, rope=rope(fraction=0.5),"
+    " indexer=indexer(num_heads=4, head_dim=64, top_k=16, block_size=4,"
     " weighted=false, norm=rmsnorm))\n" + BLOCK + "model = embed block^2 rmsnorm head",
     "qk-norm-all-heads": HEAD
     + FFN
@@ -493,7 +539,10 @@ def main() -> None:
         sub.choices[name].add_argument("--attention-backend", default=None)
     sub.choices["compare"].add_argument("--tolerance", type=float, default=1e-3)
     sub.choices["compare"].add_argument("--margin", type=float, default=0.0)
+    sub.choices["compare"].add_argument("--fp8-indexer", action="store_true")
     args = p.parse_args()
+    if getattr(args, "fp8_indexer", False):
+        fp8_indexer()
     cases = [c for c in CASES if args.only is None or c in args.only]
     match args.step:
         case "export":
@@ -707,6 +756,34 @@ def _dense(rows: list[dict], vocab: int) -> np.ndarray:
 
 
 # --- compare, in bux's environment ---------------------------------------------------
+
+
+def fp8_indexer() -> None:
+    """Have bux's indexer score as vLLM's DSA kernels do (``compare
+    --fp8-indexer``, for the cases they run): each query head and each key it
+    ranks by (QSA's pooled block keys among them) rounded to FP8 e4m3 at a scale of
+    its largest magnitude over 448, as DeepSeek-V3.2's indexer quantizes them
+    (`bux_vllm.dsa`)."""
+    import jax.numpy as jnp
+
+    from bux.architecture.attention import indexer
+
+    queries, ranking = indexer.Indexer._queries, indexer.Indexer._ranking
+
+    def rounded(x: Any) -> Any:
+        scale = jnp.maximum(jnp.abs(x).max(-1, keepdims=True), 1e-4) / 448
+        return (x / scale).astype(jnp.float8_e4m3fn).astype(x.dtype) * scale
+
+    def fp8_queries(self: Any, query: Any, pos: Any) -> Any:
+        return rounded(queries(self, query, pos))
+
+    def fp8_ranking(
+        self: Any, x: Any, query: Any, pos: Any, keys: Any, end: Any
+    ) -> Any:
+        return ranking(self, x, query, pos, rounded(keys), end)
+
+    indexer.Indexer._queries = fp8_queries
+    indexer.Indexer._ranking = fp8_ranking
 
 
 def compare(name: str, args: argparse.Namespace) -> bool:
