@@ -92,3 +92,11 @@ def zero_padding(layer: nn.Module, columns: int) -> None:
     assert isinstance(weight, torch.Tensor)
     if columns:
         weight.data[-columns:].zero_()
+
+
+def slopes(heads: int, layer: int, layers: int) -> torch.Tensor:
+    """Lightning attention's decay rates, MiniMax's ``2 ** (-8 i / heads)`` for heads
+    i = 1 to heads, scaled by ``1 - layer / (layers - 1)`` (and 1e-5 more), for the
+    `layer`-th of a model's `layers` token mixers, as bux's ``slopes``."""
+    factor = 1 - layer / (layers - 1 + 1e-5) + 1e-5
+    return 2 ** (-8 / heads * torch.arange(1, heads + 1, dtype=torch.float32)) * factor

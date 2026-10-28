@@ -28,7 +28,7 @@ from vllm.model_executor.layers.mamba.mamba_utils import (
     MambaStateShapeCalculator,
 )
 
-from . import gdn2, kda, recurrent, rwkv7
+from . import gdn2, kda, lightning, recurrent, rwkv7
 from .common import Ctx, Layer, Site
 from .linear import conv_weight, linear_dims
 from .plan import live, plan
@@ -37,7 +37,7 @@ from .plan import live, plan
 OWN = {"kda": kda, "gdn2": gdn2, "rwkv7": rwkv7}
 
 #: The recurrent layer types, which keep their state in vLLM's Mamba cache.
-RECURRENT = ("mamba", "mamba2", "gdn", *OWN)
+RECURRENT = ("mamba", "mamba2", "gdn", "lightning", *OWN)
 
 
 def mamba2_dims(c: dict, width: int) -> tuple[int, int]:
@@ -252,6 +252,8 @@ def state_shapes(vllm_config: Any) -> tuple:
         return MambaStateShapeCalculator.gated_delta_net_state_shape(
             tp, h, hv, dk, dv, c["conv_size"], spec
         )
+    if kind == "lightning":
+        return lightning.state_shape(c, tp)
     if kind == "mamba":
         if spec:
             raise NotImplementedError("mamba: speculative decoding")
@@ -278,6 +280,8 @@ def state_dtypes(vllm_config: Any) -> tuple:
     found = _recurrent(vllm_config.model_config.hf_config)
     if found is not None and found[0] in OWN:
         return recurrent.state_dtype(vllm_config.model_config, cache)
+    if found is not None and found[0] == "lightning":
+        return (torch.float32,)  # as bux keeps it
     if found is not None and found[0] == "mamba":
         return MambaStateDtypeCalculator.mamba1_state_dtype(
             vllm_config.model_config.dtype,
@@ -293,10 +297,12 @@ def state_dtypes(vllm_config: Any) -> tuple:
 
 def copy_funcs(kind: str) -> tuple:
     """How vLLM copies the state of a layer of vLLM's `kind` (``MAMBA1``,
-    ``MAMBA2``, ``GDN_ATTN``: ``gdn``'s and the plugin's own recurrent layers', or
+    ``MAMBA2``, ``LINEAR``: ``lightning``'s, ``GDN_ATTN``: ``gdn``'s and the plugin's own recurrent layers', or
     ``SHORT_CONV``: a conv on keys and values) for prefix caching."""
     if kind == "MAMBA1":
         return MambaStateCopyFuncCalculator.mamba1_state_copy_func()
+    if kind == "LINEAR":
+        return MambaStateCopyFuncCalculator.linear_attention_state_copy_func()
     if kind == "GDN_ATTN":
         return MambaStateCopyFuncCalculator.gated_delta_net_state_copy_func()
     if kind == "SHORT_CONV":

@@ -228,6 +228,13 @@ CASES = {
     "engram": LLAMA
     + "memory = engram(head_dim=8, table_size=12288)\n"
     + "model = embed block memory block rmsnorm head(tied=true)",
+    # MiniMax-01's lightning attention, its decay by depth, beside softmax attention.
+    "lightning": HEAD
+    + ATTN
+    + FFN
+    + "mix = lightning(num_heads=2, head_dim=64)\n"
+    + "model = embed [rmsnorm mix] [rmsnorm ffn] [rmsnorm mix] [rmsnorm ffn]"
+    " [rmsnorm attn] [rmsnorm ffn] rmsnorm head",
     "mamba": HEAD
     + ATTN
     + FFN

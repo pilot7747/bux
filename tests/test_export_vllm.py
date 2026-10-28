@@ -416,6 +416,18 @@ def twins(theirs: torch.nn.Module, mine: common.Layer) -> None:
     }
 
 
+def test_lightning_decays_as_the_export_by_the_depth_the_export_gives() -> None:
+    """The decay rates by the layer's depth among the token mixers, which the
+    export's sites carry (bux_sites' extra)."""
+    arch = compile(vllm_parity.CASES["lightning"])
+    sites = core.plan(arch).sites()
+    depths = [s["extra"] for s in sites.values() if s["extra"]]
+    assert depths == [{"layer": 0, "layers": 3}, {"layer": 1, "layers": 3}]
+    for depth in depths:
+        want = hf_linear.slopes(2, depth["layer"], depth["layers"])
+        torch.testing.assert_close(linear.slopes(2, *depth.values()), want)
+
+
 def test_dyt_computes_what_the_export_does() -> None:
     from bux.export.hf import basic as hf_basic
 

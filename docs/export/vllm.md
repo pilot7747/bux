@@ -162,12 +162,13 @@ ones, `--load-format dummy`, to time it.
 | `mamba`, `mamba2`, `gdn` | by vLLM's own layers (`mamba` as Jamba's, without speculative decoding), with one type and shape of recurrent layer per model; `gdn` in bfloat16 only, and with its short conv and output gate. Under tensor parallelism, vLLM 0.32's Mamba-2 failed with one group (its fused all-reduce), and in bfloat16 where a rank's share of the input projection is not a multiple of 8 wide |
 | `kda` | by vLLM's KDA kernels, Kimi Linear's (by chunks for a prompt, the recurrence for each decoded token) and its causal conv, with one type and shape of recurrent layer per model: value heads (`num_v_heads`), the decay's rank, `gate_lower_bound` of -5 and above, and a dense or low-rank output gate. Not yet: no conv, no output gate, a `v_head_dim` other than `head_dim`, or speculative decoding |
 | `gdn2`, `rwkv7` | the delta rule on fla's kernels where they are installed, else in PyTorch ([DPLR delta rules](#dplr-delta-rules)), the rest by vLLM's layers and causal conv, with one type and shape of recurrent layer per model: every setting, and `rwkv7`'s `v` port (the value residual). Not yet: `gdn2` without its conv, or speculative decoding |
+| `lightning` | by vLLM's lightning kernels, as vLLM runs MiniMax-Text-01, with one type and shape of recurrent layer per model: its decay by the layer's depth among the token mixers, the RMSNorm of all heads, its statistics summed over the ranks, and the gate; its state in float32. Not yet: a conv, value heads other than the q and k heads, or heads of a width that is no multiple of 64 |
 | `engram` | every setting, on a single or a widened stream: the n-gram sizes and hash heads, the norms, the dilated conv or none, `vocab_classes` and `boundary_token`. Not yet: speculative decoding, a conv of one tap, or vLLM's V1 model runner |
 | residual algebras, `merge` | `hc`, `mhc`, `gr`, `attnres`, `vpgate`, with every setting, single-pass included |
 | the graph | everything; a shared MoE or recurrent layer may run only once per forward pass |
 
 Every other layer type is not in vLLM yet: among them `short_conv` and the linear
-attentions `deltanet`, `gla` and `lightning`. Serve those models with
+attentions `deltanet` and `gla`. Serve those models with
 transformers ([Exporting models](index.md)).
 
 vLLM's own KDA layer gives every value head a q and a k head of its own. bux's
@@ -416,6 +417,7 @@ These cases check further settings, which the table above does not cover either:
 - `dyt`: Dynamic Tanh in place of every norm.
 - `conv`: Inkling's shortcut, a conv on branch outputs, `y + conv(y)`.
 - `mamba`: Jamba's Mamba beside attention.
+- `lightning`: MiniMax-01's lightning attention, two layers of their own depths.
 - `relbias`: Inkling's attention: a relative bias, a conv on keys and values, a
   length scale, and window-only layers biased over their window.
 - `moe-situ`: Kimi K3's SiTU-GLU experts, their up projection soft-capped.

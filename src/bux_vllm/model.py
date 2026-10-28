@@ -58,6 +58,7 @@ LAYER_MODULES = (
     "moe",
     "ssm",
     "kda",
+    "lightning",
     "gdn2",
     "rwkv7",
     "residual",
