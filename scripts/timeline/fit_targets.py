@@ -81,35 +81,36 @@ def precisions(path: Path) -> list[str]:
 def _precisions(raw: dict) -> list[str]:
     if "rows" in raw:
         return ["bf16"]
-    found = {p for p in PRECISIONS if isinstance(raw.get(p), dict)}
-    found |= {
-        p
-        for v in raw.values()
-        if isinstance(v, dict)
-        for p in PRECISIONS
-        if isinstance(v.get(p), dict)
-    }
-    return [p for p in PRECISIONS if p in found] or ["bf16"]
+    if any(isinstance(raw.get(p), dict) for p in PRECISIONS):
+        return [p for p in PRECISIONS if isinstance(raw.get(p), dict)]
+    fp8 = any(
+        isinstance(v, dict) and isinstance(v.get("fp8"), dict) for v in raw.values()
+    )
+    return ["fp8", "bf16"] if fp8 else ["bf16"]
 
 
 def served(raw: dict, serve: str) -> dict:
     """The entries of one serving precision (`serve`), from a file keyed by
-    precision (``{"fp8": {family: ...}, "bf16": ...}``) or by family
-    (``{family: {"fp8": ..., "bf16": ...}}``); an entry without that precision keeps
-    the one it has, marked. A file of one precision is bf16's."""
+    precision (``{"fp8": {family: ...}, "bf16": ...}``) or by family, each entry
+    its bf16 measurement with the fp8 one under ``fp8`` (``{family: {..., "fp8":
+    {...}}}``); an entry without that precision keeps bf16's, marked."""
     if any(isinstance(raw.get(p), dict) for p in PRECISIONS):
         return raw.get(serve, {})
     out = {}
     for f, v in raw.items():
-        have = [
-            p for p in PRECISIONS if isinstance(v, dict) and isinstance(v.get(p), dict)
-        ]
-        if not have:
-            out[f] = v if serve == "bf16" else {**v, "fallback": "bf16"}
-        elif serve in have:
+        if not isinstance(v, dict):
+            continue
+        bf16 = (
+            v["bf16"]
+            if isinstance(v.get("bf16"), dict)
+            else {k: x for k, x in v.items() if not k.startswith("fp8")}
+        )
+        if serve == "bf16":
+            out[f] = bf16
+        elif isinstance(v.get(serve), dict):
             out[f] = v[serve]
         else:
-            out[f] = v[have[0]] | {"fallback": have[0]}
+            out[f] = bf16 | {"fallback": "bf16"}
     return out
 
 

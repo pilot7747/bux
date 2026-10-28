@@ -11,7 +11,7 @@ parameter; none is the rung's 20) and the settings a scan or a seed added
 import math
 import re
 from collections import defaultdict
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from typing import Any
 
 import numpy as np
@@ -327,6 +327,23 @@ def seed_noise(runs: list[Run], metric: str = "objective") -> dict | None:
     spread = float(np.var(list(effects.values()), ddof=1)) if len(effects) > 1 else 0.0
     seed_sigma = math.sqrt(max(spread - sigma**2 / per_seed, 0.0))
     return {"sigma": sigma, "seed_sigma": seed_sigma, "effects": effects, "dof": dof}
+
+
+def seed_adjusted(runs: list[Run], blocks: dict[str, dict | None]) -> list[Run]:
+    """`runs` on seed 0's scale: each metric divided by its seed's shift against
+    seed 0's (`blocks`, by metric, `seed_noise`'s), so a point averaged over seeds
+    0-2 and one of seed 0 alone are alike."""
+    out = []
+    for r in runs:
+        metrics = dict(r.metrics)
+        for m, b in blocks.items():
+            e = (b or {}).get("effects", {})
+            if m in metrics and r.seed in e and 0 in e:
+                metrics[m] *= math.exp(-(e[r.seed] - e[0]))
+        if all(k in metrics for k in OBJECTIVE):
+            metrics["objective"] = sum(w * metrics[k] for k, w in OBJECTIVE.items())
+        out.append(replace(r, metrics=metrics))
+    return out
 
 
 def _blocks(cells: list[dict[int, float]]) -> tuple[dict[int, float], list[float]]:

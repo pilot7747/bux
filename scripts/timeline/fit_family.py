@@ -28,22 +28,35 @@ def infer_parents(
     out = {}
     for f in families - {root}:
         file = find(f.partition("/")[0], folders)
-        options = file_parents(file.read_text()) if file else [ROOT]
+        options = file_parents(file.read_text(), folders) if file else [ROOT]
         parent = pick(f, options, kind_of) if len(options) > 1 else options[0]
         out[f] = root if parent == f else parent
     return out
 
 
-def file_parents(text: str) -> list[str]:
-    """The families a file's arms may change, from the modules it uses, in order."""
+def file_parents(
+    text: str, folders: tuple[Path, ...] = (), seen: frozenset = frozenset()
+) -> list[str]:
+    """The families a file's arms may change, from the modules it uses, in order;
+    through a module that is no family (factorial_mhc.bux's ``use factorial``), the
+    families that module's file names."""
     uses = re.findall(r"^use\s+(\w+)", text, re.MULTILINE)
     milestones = [u for u in uses if MILESTONE.fullmatch(u)]
     if len(milestones) > 1:  # the milestones' own sweep
         return [ROOT]
-    found = [
-        f"milestones/{u}" if MILESTONE.fullmatch(u) else MODULES.get(u) for u in uses
-    ]
-    return list(dict.fromkeys(f for f in found if f)) or [ROOT]
+    found: list[str] = []
+    for u in uses:
+        if MILESTONE.fullmatch(u):
+            found.append(f"milestones/{u}")
+        elif u in MODULES:
+            found.append(MODULES[u])
+        elif u not in seen and (file := find(u, folders)):
+            found += [
+                f
+                for f in file_parents(file.read_text(), folders, seen | {u})
+                if f != ROOT
+            ]
+    return list(dict.fromkeys(found)) or [ROOT]
 
 
 def pick(f: str, options: list[str], kind_of: Any) -> str:
