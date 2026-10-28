@@ -168,8 +168,8 @@ ones, `--load-format dummy`, to time it.
 | the graph | everything; a shared MoE or recurrent layer may run only once per forward pass |
 
 Every other layer type is not in vLLM yet: among them the linear attentions
-`deltanet`, `gla` and `lightning`. Serve those models with
-transformers ([Exporting models](index.md)).
+`deltanet`, `gla` and `lightning`. Serve those models with transformers
+([Exporting models](index.md)).
 
 vLLM's own KDA layer gives every value head a q and a k head of its own. bux's
 `kda` shares one among a group of value heads, so the plugin runs vLLM's kernels in
@@ -399,29 +399,39 @@ parentheses is bux's own bfloat16 error, against the same reference:
 | `mqa` | one KV head (each rank's copy under TP), head dim 64, a head bias | 7.6e-6 | 0.062 (0.10) | - |
 | `graph` | a shared block run three times (three KV caches), taps, a sum, a scale, a linear | 1.1e-5 | 0.10 (0.10) | - |
 | `extras` | gates on attention (per channel, per head), an output norm, fused qkv, an embedding norm, a clamped SwiGLU, a capped relu2 MLP | 3.8e-6 | 0.043 (0.065) | - |
+| `dyt` | Dynamic Tanh in place of every norm | 9.5e-7 | 0.0030 (0.0035) | - |
 | `value-residual` | the `v` port: fixed, learned and convex value residuals | 7.6e-6 | 0.088 (0.11) | 0.089 |
 | `query-scale` | `power_scale` and `log_scale` on the queries, a gate's bias per head | 1.2e-5 | 0.13 (0.15) | - |
 | `qk-norm-all-heads` | QK-norm across all heads | 5.7e-6 | 0.057 (0.075) | - |
 | `kv-conv` | the conv on keys and values | 8.6e-6 | 0.12 (0.13) | 0.10 |
+| `conv` | Inkling's shortcut, a conv on branch outputs, `y + conv(y)` | 5.7e-6 | 0.055 (0.085) | - |
+| `short-conv` | LFM2's double-gated short conv beside attention | 6.7e-6 | 0.11 (0.13) | - |
 | `kv-share` | Hymba's cross-layer KV sharing: a windowed layer's keys and values read by the next one or two, a full layer's by one with a window of its own | 1.1e-5 | 0.13 (0.19) | 0.20 |
+| `relbias` | Inkling's attention: a relative bias, a conv on keys and values, a length scale, window-only layers biased over their window | 6.2e-6 | 0.080 (0.10) | 0.075 |
 | `dsa` | DSA's top 8 of the keys, a window, sinks and a softcap | 6.7e-6 | 2.4 (2.0) | 2.4 |
 | `dsa-conv` | an indexer beside the conv on keys and values, QK-norm, a gate, the `v` port | 6.2e-6 | 3.3 (3.1) | 3.3 |
 | `dsa-share` | DSA's picks shared through the `index` port with two layers, the last with a window | 7.2e-6 | 3.9 (4.2) | 3.9 |
 | `msa` | MSA's max-pooled blocks of 4, picks per group, plain dots, summed heads, the indexer's norm | 6.2e-6 | 3.5 (3.3) | 3.6 |
 | `msa-share` | MSA's picks shared through the `index` port | 8.1e-6 | 4.6 (4.7) | 4.7 |
-| `qsa` | QSA's mean-pooled blocks of 4, partial RoPE | 8.1e-6 | 4.4 (3.0), differs | - |
+| `qsa` | QSA's mean-pooled blocks of 4, partial RoPE | 8.1e-6 | 0.63 (3.1) | - |
 | `csa` | compressed sparse attention: groups of 4, a window of 16, the indexer's top 8, sinks | 6.7e-6 | 2.0 (1.2) | 0.62 |
 | `csa-latent` | DeepSeek-V4.1's wiring of csa: a window-only layer and one compressing pairs, a query latent, a grouped low-rank output | 6.2e-6 | 0.33 (0.88) | - |
+| `csa-ports` | DeepSeek-V4.1's ports: a layer that compresses pairs, indexes them and makes a candidate pool, one that reads its latents and picks, one that re-indexes inside the pool | 8.1e-6 | 0.87 (1.4) | - |
 | `mla` | MLA with a latent of 256 and 32 rotated dims (Triton's MLA) | - | 0.10 (0.10) | 0.097 |
 | `mla-moe` | the same MLA beside a sigmoid MoE | - | 1.6 (0.093), differs | 1.4 |
+| `mla-chunked` | the same MLA prefilled 16 tokens per step (`max_num_batched_tokens=16`), each later chunk attending to the latents the earlier ones cached | - | 0.078 (0.10) | 0.085 |
 | `mla-deepseek` | MLA at DeepSeek-V3's dims (FlashInfer's), a query latent, interleaved YaRN, a gate per head, an output norm | - | 0.089 (0.14) | - |
+| `mla-dsa` | sparse MLA, DeepSeek-V3.2's: an indexer, a window, sinks and a softcap | 6.7e-6 | 2.6 (2.7) | - |
+| `mla-share` | sparse MLA, GLM-5.3's: picks shared through the `index` port | 8.1e-6 | 3.3 (2.8) | - |
 | `moe` | a softmax router, unnormalized top-2 of 8, a gated shared expert | 6.7e-6 | 0.68 (1.2) | - |
 | `moe-grouped` | a sigmoid router, 4 groups, the aux-free bias, a scaling of 2.5 | 8.6e-6 | 2.1 (3.8) | 1.8 |
 | `moe-relu2` | a `sqrtsoftplus` router, plain relu2 experts | 5.7e-6 | 1.8 (1.4) | - |
 | `moe-clamped` | gpt-oss's experts (a `quick_gelu` gate, a limit, an offset, biases), a router bias | 5.7e-6 | 0.81 (0.72) | 0.83 |
+| `moe-situ` | Kimi K3's SiTU-GLU experts, their up projection soft-capped | 5.3e-6 | 0.70 (1.7) | - |
 | `moe-latent` | LatentMoE with its norms, a sigmoid router | 3.8e-6 | 1.9 (1.9) | 0.054 |
 | `moe-sink` | shared experts the router scores (`shared_expert_sink`) | 8.6e-6 | 2.3 (1.7) | 3.2, differs |
 | `moe-norm` | Muse Spark's experts: each one's output normalized before its weight, in a latent of 32 | 9.1e-6 | 1.7 (2.1) | 2.0 |
+| `mamba` | Jamba's Mamba beside attention | 9.5e-6 | 0.11 (0.14) | 0.096 |
 | `mamba2` | Mamba-2 of 16 heads in 2 groups, beside attention | 7.6e-6 | 0.078 (0.13) | 0.076 |
 | `gdn` | Gated DeltaNet of 2 q/k heads and 4 value heads, beside gated attention | - | 0.27 (0.23) | 0.28 |
 | `kda` | KDA of 2 q/k heads and 4 value heads, its gate's lower bound of -5 | - | 0.13 (0.24) | 0.19 |
@@ -442,29 +452,11 @@ parentheses is bux's own bfloat16 error, against the same reference:
 Every float32 run decoded bux's greedy tokens exactly. In bfloat16 an MoE's and a
 sparse layer's errors are large, and so are bux's own: where two experts' or two
 keys' scores are within bfloat16's rounding of each other, a token's picks change,
-and so does its output. Three cases differ: in bfloat16 `qsa` picks a token 3.5
-below the best, past bux's own error of 3.0; `moe-sink` at TP=2 one 1.8 below it, at
-bux's own 1.8; and `mla-moe` on one GPU is off by 1.6, where bux's own bfloat16 run
-is off by 0.093 (at TP=2, by 1.4 against bux's own 1.1).
+and so does its output. Two cases differ: `moe-sink` at TP=2 picks a token 1.8
+below the best, at bux's own 1.8; and `mla-moe` on one GPU is off by 1.6, where
+bux's own bfloat16 run is off by 0.093 (at TP=2, by 1.4 against bux's own 1.1).
 `gdn`, the `kda` and `mla` cases run in bfloat16 only. A `-` marks a case not
 measured that way.
-
-These cases check further settings, not yet measured:
-
-- `mla-chunked`: `mla` prefilled 16 tokens per step (`max_num_batched_tokens=16`),
-  so that each later chunk attends to the latents the earlier ones cached.
-- `dyt`: Dynamic Tanh in place of every norm.
-- `conv`: Inkling's shortcut, a conv on branch outputs, `y + conv(y)`.
-- `short-conv`: LFM2's double-gated short conv beside attention.
-- `mamba`: Jamba's Mamba beside attention.
-- `relbias`: Inkling's attention: a relative bias, a conv on keys and values, a
-  length scale, and window-only layers biased over their window.
-- `moe-situ`: Kimi K3's SiTU-GLU experts, their up projection soft-capped.
-- `mla-dsa`, `mla-share`: sparse MLA, DeepSeek-V3.2's and GLM-5.3's, one layer with
-  a window, sinks and a softcap.
-- `csa-ports`: DeepSeek-V4.1's ports: a layer that compresses pairs, indexes them
-  and makes a candidate pool, one that reads its latents and picks, and one that
-  re-indexes inside the pool.
 
 On the CPU, `tests/test_export_vllm.py` runs the plugin's sparse and compressed
 attention on paged caches of its own, prompts in chunks beside decoded tokens,
