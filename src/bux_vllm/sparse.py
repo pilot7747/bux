@@ -223,10 +223,12 @@ def pool(caches: Caches, steps: Steps, both: torch.Tensor, ratio: int) -> torch.
 
 def store(caches: Caches, steps: Steps, rows: torch.Tensor, ratio: int) -> None:
     """Write the compressed latents and their indexer keys, side by side in `rows`
-    (T, d + i), of the tokens that end a group of `ratio`."""
+    (T, d + i), of the tokens that end a group of `ratio`; none of padding, which
+    writes no token latent either (a slot below 0)."""
     assert caches.compressed is not None
     p, d = steps.positions, caches.compressed.cache.shape[-1]
-    index = torch.where((p + 1) % ratio == 0, p // ratio, -1)
+    ends = ((p + 1) % ratio == 0) & (caches.slots >= 0)
+    index = torch.where(ends, p // ratio, -1)
     caches.compressed.put(steps.seq, index, rows[:, :d])
     if caches.index is not None:
         caches.index.put(steps.seq, index, rows[:, d:])

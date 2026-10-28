@@ -521,25 +521,36 @@ class PagedCsa:
 
     def slots(self, name: str, seq: torch.Tensor, pos: torch.Tensor) -> torch.Tensor:
         """vLLM's slot mapping of the tokens at `pos` of sequences `seq`."""
-        table = self.paged[name].block_table
+        table = self.paged.get(name, self.paged["window"]).block_table
         return table[seq, pos // CSA_BLOCK] * CSA_BLOCK + pos % CSA_BLOCK
 
-    def caches(self, steps: sparse.Steps) -> sparse.Caches:
-        """The caches of a batch of `steps`."""
+    def caches(self, steps: sparse.Steps, pad: int) -> sparse.Caches:
+        """The caches of a batch of `steps`, its last `pad` tokens padding."""
         seq, pos = steps.seq, steps.positions
         state = self.paged.get("state")
+        slots = {name: self.slots(name, seq, pos) for name in ("window", "state")}
+        for name in ("window", "state") if pad else ():
+            slots[name][-pad:] = -1
         return sparse.Caches(
             self.paged["window"],
-            self.slots("window", seq, pos),
+            slots["window"],
             self.paged.get("compressed"),
             self.paged.get("index"),
             state,
-            None if state is None else self.slots("state", seq, pos),
+            None if state is None else slots["state"],
         )
 
 
+#: Padding after a step of decoded tokens alone, as a CUDA graph of a larger batch
+#: replays it: each a (sequence, position) of stale metadata, which ends a group of
+#: 1, 2 or 4, and writes nothing (slots of -1).
+CSA_PADDING = [(0, 3), (1, 7)]
+
+
 def csa_steps(step: list[tuple[int, int, int]]) -> sparse.Steps:
-    """The batch of a step of `CSA_STEPS`."""
+    """The batch of a step of `CSA_STEPS`, padded where it decodes alone."""
+    padding = CSA_PADDING if all(n == 1 for *_, n in step) else []
+    step = step + [(q, p, 1) for q, p in padding]
     positions = torch.cat([torch.arange(s, s + n) for _, s, n in step])
     seq = torch.cat([torch.full((n,), q) for q, _, n in step])
     starts = np.cumsum([0] + [n for *_, n in step]).tolist()
@@ -625,9 +636,11 @@ def test_csa_computes_on_paged_caches_what_the_export_does(
     with torch.no_grad():
         for step in CSA_STEPS:
             steps = csa_steps(step)
-            rows = torch.cat([x[s : s + n] for _, s, n in step])
-            out = csa_layer(m, parts, settings, paged.caches(steps), steps, rows)
-            for (q, start, n), y in zip(step, out.split([n for *_, n in step])):
+            pad = steps.positions.shape[0] - sum(n for *_, n in step)
+            rows = torch.cat([x[s : s + n] for _, s, n in step] + [x[:pad]])
+            out = csa_layer(m, parts, settings, paged.caches(steps, pad), steps, rows)
+            real = out[: out.shape[0] - pad].split([n for *_, n in step])
+            for (q, start, n), y in zip(step, real):
                 got[q][start : start + n] = y
     torch.testing.assert_close(got[0], want, atol=2e-5, rtol=2e-5)
     torch.testing.assert_close(got[1], want[:25], atol=2e-5, rtol=2e-5)
