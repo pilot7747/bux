@@ -16,9 +16,15 @@ import torch
 #: (``csrc/cache_kernels.cu``).
 KERNEL_SIZES = (320, 512, 576)
 
-#: The cache dtypes kept as they are, and those dequantized by the scale.
+#: The cache dtypes kept as they are, and the fp8 ones dequantized by the scale, by
+#: the format of their bytes: vLLM keeps an fp8 cache as uint8, which CUDA's kernels
+#: read as e4m3 (``fp8``, ``fp8_e4m3``) or e5m2.
 PLAIN = ("auto", "bfloat16", "float16")
-FP8 = ("fp8", "fp8_e4m3", "fp8_e5m2")
+FP8 = {
+    "fp8": torch.float8_e4m3fn,
+    "fp8_e4m3": torch.float8_e4m3fn,
+    "fp8_e5m2": torch.float8_e5m2,
+}
 
 
 def gather(
@@ -69,8 +75,8 @@ def gather(
 def _values(
     rows: torch.Tensor, kv_cache_dtype: str, scale: torch.Tensor
 ) -> torch.Tensor:
-    """The cache's `rows` as values: as they are, or an fp8 cache's times its
-    scale, in float32.
+    """The cache's `rows` as values: as they are, or an fp8 cache's bytes read in
+    its format (`FP8`) and times its scale, in float32.
 
     Raises:
         NotImplementedError: The cache's dtype is neither plain nor fp8.
@@ -78,5 +84,5 @@ def _values(
     if kv_cache_dtype in PLAIN:
         return rows
     if kv_cache_dtype in FP8:
-        return rows.float() * scale.float()
+        return rows.view(FP8[kv_cache_dtype]).float() * scale.float()
     raise NotImplementedError(f"an MLA cache of {kv_cache_dtype} not in vLLM yet")

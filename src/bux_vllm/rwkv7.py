@@ -74,7 +74,12 @@ class Mixer(Recurrent):
             assert p is not None
             p.weight_loader = sharded_loader(0)  # ty: ignore[unresolved-attribute]
         self.o = RowParallelLinear(
-            hv * dv, width, bias=False, return_bias=False, prefix=f"{prefix}.o"
+            hv * dv,
+            width,
+            bias=False,
+            return_bias=False,
+            quant_config=self.quant,
+            prefix=f"{prefix}.o",
         )
 
     def _projections(self, c: dict, width: int, prefix: str) -> None:
@@ -83,21 +88,30 @@ class Mixer(Recurrent):
         h, hv, dk, dv = linear_dims(c)
         nk, nv = h * dk, hv * dv
 
+        quant = self.quant
+
         def column(name: str, n: int) -> ColumnParallelLinear:
             return ColumnParallelLinear(
-                width, n, bias=False, return_bias=False, prefix=f"{prefix}.{name}"
+                width,
+                n,
+                bias=False,
+                return_bias=False,
+                quant_config=quant,
+                prefix=f"{prefix}.{name}",
             )
 
+        def low(name: str, rank: str, n: int, *args: Any) -> LowRank:
+            return LowRank(width, c[rank], n, f"{prefix}.{name}", *args, quant=quant)
+
         self.r, self.k, self.v = column("r", nk), column("k", nk), column("v", nv)
-        self.w = LowRank(width, c["decay_rank"], nk, f"{prefix}.w", "tanh", True)
-        self.a = LowRank(width, c["a_rank"], nk, f"{prefix}.a", bias=True)
+        self.w = low("w", "decay_rank", nk, "tanh", True)
+        self.a = low("a", "a_rank", nk, None, True)
         self.v_mix = None
         if self.reads is not None:
-            self.v_mix = LowRank(width, c["v_rank"], nv, f"{prefix}.v_mix", bias=True)
+            self.v_mix = low("v_mix", "v_rank", nv, None, True)
         self.g = None
         if c["output_gate"] is not None:
-            gate = c["output_gate"]
-            self.g = LowRank(width, c["gate_rank"], nv, f"{prefix}.g", gate)
+            self.g = low("g", "gate_rank", nv, c["output_gate"])
 
     def get_state_shape(self) -> tuple:
         return state_shape(self.c, self.width, self.tp)

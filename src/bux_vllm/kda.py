@@ -116,15 +116,20 @@ class Mixer(Recurrent):
             dv, eps=c["norm_eps"], activation=c["output_gate"]
         )
         self.o = RowParallelLinear(
-            hv * dv, width, bias=False, return_bias=False, prefix=f"{prefix}.o"
+            hv * dv, width, prefix=f"{prefix}.o", **self._linear()
         )
+
+    def _linear(self) -> dict:
+        """The arguments every projection of the layer takes: no bias, no bias
+        returned, the engine's quantization config."""
+        return {"bias": False, "return_bias": False, "quant_config": self.quant}
 
     def _projections(self, c: dict, width: int) -> None:
         """q, k, v, a dense output gate, the decay's down projection (on every rank)
         and beta, by one merged projection; the decay's up projection, and a
         low-rank output gate's two."""
         _, hv, dk, dv = linear_dims(c)
-        rank = c["gate_rank"] or dk
+        rank, kw, prefix = c["gate_rank"] or dk, self._linear(), self.prefix
         self.dense_gate = c["output_gate_rank"] is None
         projection = kda_projection(c, self.tp)
         self.split, self.parts = projection.split, projection.parts
@@ -133,21 +138,16 @@ class Mixer(Recurrent):
             projection.sizes,
             replicated_shard_id=projection.whole,  # the decay's down projection
             tp_size=self.tp,
-            bias=False,
-            return_bias=False,
-            prefix=f"{self.prefix}.in_proj",
+            prefix=f"{prefix}.in_proj",
+            **kw,
         )
         zero_padding(self.in_proj, sum(self.split[self.parts :]))
-        self.f_up = ColumnParallelLinear(
-            rank, hv * dk, bias=False, return_bias=False, prefix=f"{self.prefix}.f_up"
-        )
+        self.f_up = ColumnParallelLinear(rank, hv * dk, prefix=f"{prefix}.f_up", **kw)
         if not self.dense_gate:
             r = c["output_gate_rank"]
-            self.gate_down = ReplicatedLinear(
-                width, r, bias=False, return_bias=False, prefix=f"{self.prefix}.g_a"
-            )
+            self.gate_down = ReplicatedLinear(width, r, prefix=f"{prefix}.g_a", **kw)
             self.gate_up = ColumnParallelLinear(
-                r, hv * dv, bias=False, return_bias=False, prefix=f"{self.prefix}.g_b"
+                r, hv * dv, prefix=f"{prefix}.g_b", **kw
             )
 
     def get_state_shape(self) -> tuple:

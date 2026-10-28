@@ -2,7 +2,10 @@
 
 Under tensor parallelism the embedding and the head split the vocabulary, an MLP its
 hidden units (a column-parallel up and gate, a row-parallel down), and the other
-layers are whole on every rank.
+layers are whole on every rank. Under vLLM's online FP8 weights the MLPs' and
+``linear``'s projections take the engine's quantization config
+(`bux_vllm.common.quantization`); the embedding and the head stay in the model's
+dtype, as vLLM keeps its own models'.
 """
 
 from __future__ import annotations
@@ -124,17 +127,15 @@ class MLP(Layer):
         self.limit, self.cap, self.offset = c["limit"], c["up_softcap"], c["up_offset"]
         self.gated = c["type"] == "gated_mlp"
         prefix = site.path if site is not None else ""
+        kw = {"bias": bias, "return_bias": False}
+        kw["quant_config"] = site.quant if site is not None else None
         if self.gated:
             self.up: nn.Module = MergedColumnParallelLinear(
-                width, [n, n], bias=bias, return_bias=False, prefix=f"{prefix}.up"
+                width, [n, n], prefix=f"{prefix}.up", **kw
             )
         else:
-            self.up = ColumnParallelLinear(
-                width, n, bias=bias, return_bias=False, prefix=f"{prefix}.up"
-            )
-        self.down = RowParallelLinear(
-            n, width, bias=bias, return_bias=False, prefix=f"{prefix}.down"
-        )
+            self.up = ColumnParallelLinear(width, n, prefix=f"{prefix}.up", **kw)
+        self.down = RowParallelLinear(n, width, prefix=f"{prefix}.down", **kw)
 
     def targets(self) -> dict[str, tuple[nn.Parameter, tuple]]:
         out: dict[str, tuple[nn.Parameter, tuple]] = {}
@@ -181,6 +182,7 @@ class Linear(Layer):
             c["features"],
             bias=c["bias"],
             return_bias=False,
+            quant_config=site.quant,
             prefix=f"{site.path}.proj",
         )
 
