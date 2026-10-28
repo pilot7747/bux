@@ -540,7 +540,7 @@ def hc_read(
     h: torch.Tensor,
     coef: torch.Tensor,
     eps: float,
-    mode: int,
+    weighing: int,
 ) -> None:
     """What `bux_vllm.streams.hc_read` computes, in PyTorch: the layernorm's dot
     products as ``rstd (x W - mean sum(W))``, A's columns and then B's."""
@@ -561,15 +561,15 @@ def hc_read(
         out += scale * torch.tanh(rstd * (xf @ w - mean * w.sum(0)))
     coef.zero_()
     coef[:, :n] = out
-    mix_into(h, x, out[..., 0], pending, mode)
+    mix_into(h, x, out[..., 0], pending, weighing)
 
 
 def mix_into(
-    h: torch.Tensor, x: torch.Tensor, own: torch.Tensor, pending: Any, mode: int
+    h: torch.Tensor, x: torch.Tensor, own: torch.Tensor, pending: Any, weighing: int
 ) -> None:
-    """A fused read's ``sum_j r_j x_j`` into `h`, r as `mode` says."""
-    r = own if mode == residual.OWN else pending
-    if mode == residual.FIRST:
+    """A fused read's ``sum_j r_j x_j`` into `h`, r as `weighing` says."""
+    r = own if weighing == residual.OWN else pending
+    if weighing == residual.FIRST:
         r = torch.zeros_like(own)
         r[:, 0] = 1
     h.copy_((r.float()[..., None] * x.float()).sum(1))
@@ -585,7 +585,7 @@ def mhc_read(
     logits: torch.Tensor,
     read: torch.Tensor,
     eps: float,
-    mode: int,
+    weighing: int,
 ) -> None:
     """What `bux_vllm.streams.mhc_read` computes, in PyTorch."""
     t, n, d = x.shape
@@ -601,7 +601,7 @@ def mhc_read(
     logits[:, :k] = out
     read.zero_()
     read[:, :n] = torch.sigmoid(out[:, :n]) + residual.EPS
-    mix_into(h, x, read[:, :n], pending, mode)
+    mix_into(h, x, read[:, :n], pending, weighing)
 
 
 def mix_write(
