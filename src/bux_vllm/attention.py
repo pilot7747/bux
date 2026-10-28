@@ -7,6 +7,7 @@ its ``v`` port (the value residual, `bux_vllm.kv`), its conv on keys and values
 from __future__ import annotations
 
 import torch
+import torch.nn.functional as F
 from torch import nn
 from vllm.distributed import (
     get_tensor_model_parallel_rank,
@@ -451,8 +452,11 @@ class AllHeads(Norm):
 
 
 def _ranks_sum(x: torch.Tensor) -> torch.Tensor:
-    """The sum of x's last axis, (T, 1), over every rank's share of it."""
-    return tensor_model_parallel_all_reduce(x.sum(-1, keepdim=True))
+    """The sum of x's last axis, (T, 1), over every rank's share of it: reduced as
+    4 columns, the sum and zeros, as vLLM's custom all-reduce takes rows of 16
+    bytes at least."""
+    sums = F.pad(x.sum(-1, keepdim=True), (0, 3))
+    return tensor_model_parallel_all_reduce(sums)[:, :1]
 
 
 def _sinks(heads: int) -> nn.Parameter:
