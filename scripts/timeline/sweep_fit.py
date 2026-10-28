@@ -45,11 +45,15 @@ class Width:
     active: float
     best: list[dict] = field(default_factory=list)
     model: float | None = None  # the model's best sessions per hour per GPU
+    seeds: bool = False  # whether its lanes are seeds of one model (the budget's)
 
     def cost(self) -> float:
-        """Sessions per hour per GPU, the mean of its lanes' bests (0 if none)."""
+        """Sessions per hour per GPU, the best of its lanes' bests (0 if none): a lane
+        timed again by a faster implementation supersedes the slower one. The
+        budget's lanes are seeds of one model, and their mean is its cost."""
         values = [b["sessions_per_hour"] / self.tp for b in self.best if b]
-        return statistics.mean(values) if values else 0.0
+        pool = statistics.mean if self.seeds else max
+        return pool(values) if values else 0.0
 
 
 def read(paths: list[Path]) -> list[dict]:
@@ -70,6 +74,7 @@ def widths(rows: list[dict], slo: float) -> dict[str, dict[int, Width]]:
         first = points[0]
         gpus = first.get("gpus", first["tp"])
         w = out[family].setdefault(d, Width(d, gpus, *_params(first)))
+        w.seeds = family == BUDGET
         w.model = (first.get("predicted_best") or {}).get("sessions_per_hour")
         ok = [p["measured"] for p in points if p["measured"]["tpot_p50_ms"] <= slo]
         w.best.append(max(ok, key=lambda m: m["sessions_per_hour"], default={}))
