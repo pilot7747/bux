@@ -127,11 +127,12 @@ class Mixer(Recurrent):
         _, hv, dk, dv = linear_dims(c)
         rank = c["gate_rank"] or dk
         self.dense_gate = c["output_gate_rank"] is None
-        sizes, self.split, self.parts = kda_projection(c, self.tp)
+        projection = kda_projection(c, self.tp)
+        self.split, self.parts = projection.split, projection.parts
         self.in_proj = _KimiGDNMergedColumnParallelLinear(
             width,
-            sizes,
-            replicated_shard_id=self.parts - 2,  # the decay's down projection
+            projection.sizes,
+            replicated_shard_id=projection.whole,  # the decay's down projection
             tp_size=self.tp,
             bias=False,
             return_bias=False,
