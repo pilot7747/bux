@@ -332,7 +332,8 @@ def choose(
     indexer's queries `q`, weights `w` and cached `keys`, (S, i) or (Q, S, i)."""
     size = spec.block_size
     if spec.mean:
-        pooled_keys = spec.indexer.block_keys(pooled(keys, size), size)
+        # In float32 from the cache's keys on, as bux's reference pools them.
+        pooled_keys = spec.indexer.block_keys(pooled(keys.float(), size), size)
         s = scores(q, w, pooled_keys, spec.relu, per_group=False)
         return mean_blocks(s, see, positions, spec.window, size, spec.top_k)
     s = scores(q, w, keys, spec.relu, spec.per_group)
