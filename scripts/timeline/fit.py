@@ -61,6 +61,46 @@ def main() -> None:
         sys.exit("give a file of RESULT lines, or --selftest")
     report = run(a)
     print(report["markdown"])
+    if a.fix_e and not a.no_e_free:
+        free_variant(a)
+
+
+def free_variant(a: argparse.Namespace) -> dict:
+    """The fit again with E fit (--fix-e dropped) into OUT/e-free/, without W&B:
+    the E-free variant readers take beside the main fit."""
+    global ARGV
+    main = ARGV
+    ARGV = e_free_argv(main, a.out / "e-free")
+    try:
+        variant = argparse.Namespace(
+            **{**vars(a), "fix_e": None, "out": a.out / "e-free", "wandb": False}
+        )
+        return run(variant)
+    finally:
+        ARGV = main
+
+
+def e_free_argv(argv: list[str], out: Path) -> list[str]:
+    """`argv` without --fix-e and --wandb, writing to `out`."""
+    out_argv, skip = [], False
+    for i, x in enumerate(argv):
+        if skip:
+            skip = False
+        elif x in ("--fix-e", "--out"):
+            skip = True
+            if x == "--out":
+                out_argv += ["--out", str(out)]
+        elif x.startswith("--fix-e=") or x == "--wandb":
+            continue
+        elif x.startswith("--out="):
+            out_argv.append(f"--out={out}")
+        else:
+            out_argv.append(x)
+    return out_argv + (
+        []
+        if "--out" in out_argv or any(x.startswith("--out=") for x in out_argv)
+        else ["--out", str(out)]
+    )
 
 
 def run(a: argparse.Namespace) -> dict:
@@ -658,6 +698,11 @@ def parser() -> argparse.ArgumentParser:
     p.add_argument("--seed", type=int, default=0)
     p.add_argument("--plot", help="comma-separated families to plot beside the root")
     p.add_argument("--plot-metrics", default="objective,repo_bpb")
+    p.add_argument(
+        "--no-e-free",
+        action="store_true",
+        help="with --fix-e, skip the E-free variant in OUT/e-free/",
+    )
     p.add_argument(
         "--wandb", action="store_true", help="log the tables to W&B (env: WANDB_*)"
     )
