@@ -287,10 +287,18 @@ def test_index_port(source: str) -> None:
     check.compare(compile(source)).check()
 
 
-def test_an_indexer_beside_a_conv_says_so() -> None:
-    source = stack(GQA + f", kv_conv_size=2, {INDEXER}))")
-    with pytest.raises(NotImplementedError, match="kv_conv_size"):
-        check.compare(compile(source))
+CONV_INDEXERS = {
+    "dsa": f"{INDEXER}))",
+    "mean blocks": f"{INDEXER}, block_size=2))",
+    "msa, window": f"sliding_window_size=5, {MSA}))",
+}
+
+
+@pytest.mark.parametrize("indexer", CONV_INDEXERS.values(), ids=CONV_INDEXERS.keys())
+def test_an_indexer_beside_a_conv_on_keys_and_values(indexer: str) -> None:
+    """The cache keeps the conv's states and the indexer's keys in one layer
+    (``indexed_hybrid``)."""
+    check.compare(compile(stack(GQA + f", kv_conv_size=3, {indexer}"))).check()
 
 
 CSA = (
