@@ -370,6 +370,9 @@ def main() -> None:
     likes = dict(x.split("=", 1) for x in a.like)
     out = targets(fams, likes)
     analytic = {f: m for path in a.analytic for f, m in analytic_matches(path).items()}
+    for family, ref in (x.split("=", 1) for x in a.same):
+        if ref in out and family not in out:
+            out[family] = out[ref] | {"via": ref, "same_architecture": True}
     for variant, base in (x.split("=", 1) for x in a.trained_as):
         if variant in out and base in fams:
             out[variant] = as_trained(out[variant], fams[base])
@@ -409,6 +412,13 @@ def parser() -> argparse.ArgumentParser:
         default=[],
         metavar="FAMILY=REFERENCE",
         help="a family timed at one width, with REFERENCE's serving shape",
+    )
+    p.add_argument(
+        "--same",
+        action="append",
+        default=[],
+        metavar="FAMILY=REFERENCE",
+        help="a family of REFERENCE's architecture (only its training differs)",
     )
     p.add_argument(
         "--trained-as",
