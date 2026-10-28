@@ -107,10 +107,10 @@ ones, `--load-format dummy`, to time it.
 - **Residual algebras.** Under a residual algebra, each outermost residual branch
   is a module named by the algebra, `model.layers.3.hc`, which holds its parameters,
   as in the export. It reads the stream for the branch's body and writes the body's
-  output back, per token: hc's n copies of the stream are a (tokens, n, d) tensor.
-  attnres keeps the embedding, the sum of each finished block of branch outputs and
-  the sum of the block under way, which is what bux's softmax over depth reads; it
-  does not keep every output. Nothing of it is cached between steps.
+  output back, per token: the n copies of hc, mhc and gr are a (tokens, n, d)
+  tensor. attnres keeps the embedding, the sum of each finished block of branch
+  outputs and the sum of the block under way, which is what bux's softmax over depth
+  reads; it does not keep every output. Nothing of it is cached between steps.
 - **The layers** are vLLM's: column- and row-parallel projections, the vocabulary
   split over ranks, vLLM's attention with its KV cache, `FusedMoEFactory` for the
   routed experts, and vLLM's Mamba-2 and Gated DeltaNet layers. Each layer loads its
@@ -131,7 +131,7 @@ ones, `--load-format dummy`, to time it.
 | `gqa` | RoPE (`pi`, `llama3`, `yarn`), QK-norm, GQA and MQA, biases, `fused_qkv`, sliding windows, soft-capping, sinks, its scale, `gated` (a gate per channel or per head), `output_norm`. Not yet: `kv_conv_size`, an indexer, a relative bias, `log_scale`, `power_scale`, `gate_head_bias`, QK-norm across all heads (`qk_norm_all_heads`), or ports |
 | `moe` | softmax, sigmoid and `sqrtsoftplus` routers, `router_logit_scale`, groups, the aux-free bias, a router bias, shared experts and their gate, gated and plain experts (`swish`, `gelu`, `gelu_tanh`, `relu2`) with biases, and a `limit` and `up_offset` on `swish` and `quick_gelu` gates (gpt-oss's). Not yet: LatentMoE, `expert_norm`, `shared_expert_sink`, or the experts' `up_softcap` |
 | `mamba2`, `gdn` | by vLLM's own layers, with one type and shape of recurrent layer per model; `gdn` in bfloat16 only, and with its short conv and output gate. Under tensor parallelism, vLLM 0.32's Mamba-2 failed with one group (its fused all-reduce), and in bfloat16 where a rank's share of the input projection is not a multiple of 8 wide |
-| residual algebras, `merge` | `hc` and `attnres`, with every setting, single-pass included. Not yet: `mhc`, `gr`, `vpgate` |
+| residual algebras, `merge` | `hc`, `mhc`, `gr`, `attnres`, `vpgate`, with every setting, single-pass included |
 | the graph | everything; a shared MoE or recurrent layer may run only once per forward pass |
 
 Every other layer type is not in vLLM yet: among them `mla`, `csa`, `dyt`, `conv`,
