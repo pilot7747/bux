@@ -38,9 +38,10 @@ class Attention(Layer):
     """bux's ``gqa``: q, k and v by one column-parallel projection, the causal conv
     on k and v added to them (``kv_conv_size``), the values mixed with those of its
     ``v`` port (the value residual) and pushed to it, QK-norm then RoPE (in float32,
-    as bux), causal softmax attention with its sliding window, soft-capping and sinks
-    by vLLM's attention layer, each head's output norm and gate, and the
-    row-parallel output projection.
+    as bux), the queries scaled by their position (``power_scale``, ``log_scale``),
+    causal softmax attention with its sliding window, soft-capping and sinks by
+    vLLM's attention layer, each head's output norm and gate (with a bias per head),
+    and the row-parallel output projection.
 
     Each call of the layer keeps a KV cache of its own, and a conv state beside it
     with ``kv_conv_size``: a shared layer that runs three times makes three of
@@ -52,8 +53,7 @@ class Attention(Layer):
 
     def __init__(self, c: dict, width: int, site: Site):
         super().__init__()
-        unsupported(c, "indexer", "relative_bias", "log_scale")
-        unsupported(c, "power_scale", *(("gate_head_bias",) if c["gated"] else ()))
+        unsupported(c, "indexer", "relative_bias")
         if c["qk_norm"] and c["qk_norm_all_heads"]:
             # Its statistics would sum over every rank's heads under tensor parallelism.
             raise NotImplementedError("gqa: qk_norm_all_heads not in vLLM yet")
@@ -84,6 +84,7 @@ class Attention(Layer):
         self.k_norm = Norm(qk, dk) if qk else None
         self.out_norm = Norm(out, dv) if out else None
         self.rope = Rope(c["rope"], dk) if c["rope"] else None
+        self.c = c
         self._value_residual(c, site.ports)
         self.sinks = _sinks(self.h) if c["sinks"] else None
         self.kv_first = kv.kv_heads(g, tp, get_tensor_model_parallel_rank())[0]
@@ -125,13 +126,16 @@ class Attention(Layer):
     def _gate(self, c: dict, width: int, heads_dv: int, path: str) -> None:
         """Make the gate on the heads' outputs, ``act(W_g x)``, a value a channel or
         a head (``gate_per_head``), column-parallel by head; None without one."""
-        self.gate = None
+        self.gate, self.gate_bias = None, None
         self.gate_activation = ACTIVATIONS[c["gate_activation"]]
         if c["gated"]:
             n = c["num_heads"] if c["gate_per_head"] else heads_dv
             self.gate = ColumnParallelLinear(
                 width, n, bias=c["bias"], return_bias=False, prefix=f"{path}.gate"
             )
+        if c["gated"] and c["gate_head_bias"]:
+            self.gate_bias = nn.Parameter(torch.zeros(self.h), requires_grad=False)
+            self.gate_bias.weight_loader = sharded_loader(0)  # ty: ignore[unresolved-attribute]
 
     def _value_residual(self, c: dict, layer_ports: list) -> None:
         """Keep the layer's ports, and the learned weights of its value residual
@@ -160,6 +164,8 @@ class Attention(Layer):
             out["sinks"] = (self.sinks, ())
         if self.v_mix is not None:
             out["v_mix"] = (self.v_mix, ())
+        if self.gate_bias is not None:
+            out["gate_bias"] = (self.gate_bias, ())
         return out
 
     def load(self, name: str, tensor: torch.Tensor) -> list[nn.Parameter]:
@@ -187,6 +193,8 @@ class Attention(Layer):
             q, k = self.q_norm(q), self.k_norm(k)
         if self.rope is not None:
             q, k = self.rope(q, ctx.positions), self.rope(k, ctx.positions)
+        if (scale := kv.query_scale(self.c, ctx.positions)) is not None:
+            q = (q * scale[:, None, None]).to(q.dtype)
         q, k = q.reshape(t, -1).contiguous(), k.reshape(t, -1).contiguous()
         out = self.caches[call](q, k, v.contiguous()).view(t, self.h, self.dv)
         return self.o(self._gated(x, out).reshape(t, -1))
@@ -217,8 +225,10 @@ class Attention(Layer):
             out = self.out_norm(out)
         if self.gate is None:
             return out
-        gate = self.gate_activation(self.gate(x))
-        return out * gate.view(out.shape[0], self.h, -1)
+        gate = self.gate(x).view(out.shape[0], self.h, -1)
+        if self.gate_bias is not None:
+            gate = gate + self.gate_bias.to(gate.dtype)[:, None]
+        return out * self.gate_activation(gate)
 
 
 def _sinks(heads: int) -> nn.Parameter:

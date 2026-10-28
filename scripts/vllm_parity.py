@@ -212,6 +212,14 @@ CASES = {
     + FFN
     + "model = embed [rmsnorm attn] [rmsnorm ffn] [rmsnorm gated] [rmsnorm ffn]"
     " rmsnorm head",
+    "query-scale": HEAD
+    + FFN
+    + "beam = gqa(num_heads=4, num_kv_heads=2, power_scale=0.5, power_scale_length=8,"
+    " gated=true, gate_head_bias=true)\n"
+    + "inkling = gqa(num_heads=4, num_kv_heads=2, log_scale=0.5, log_scale_floor=8,"
+    " softcap=20, rope=rope())\n"
+    + "model = embed [rmsnorm beam] [rmsnorm ffn] [rmsnorm inkling] [rmsnorm ffn]"
+    " rmsnorm head",
     "kv-conv": HEAD
     + FFN
     + "attn = gqa(num_heads=4, num_kv_heads=2, kv_conv_size=4, rope=rope())\n"

@@ -20,6 +20,7 @@ import torch.nn.functional as F
 from flax import nnx
 
 from bux import config as cfg
+from bux.architecture.attention import gqa as bux_gqa
 from bux.architecture.attention import rope as bux_rope
 from bux.architecture.attention.gqa import Attention as BuxAttention
 from bux.architecture.experts.moe import MoE
@@ -476,3 +477,16 @@ def test_the_kv_conv_taps_go_where_vllm_convolves_them() -> None:
     xs = torch.from_numpy(np.array(x)[0, :, 16:]).T
     got = F.conv1d(F.pad(xs, (2, 0))[None], w[:, None], groups=16)[0].T
     np.testing.assert_allclose(got.numpy(), want, rtol=1e-5, atol=1e-6)
+
+
+def test_queries_scale_by_their_position_as_bux_scales_them() -> None:
+    c = {"power_scale": 0.3, "power_scale_length": 8}
+    c |= {"log_scale": 0.5, "log_scale_floor": 4}
+    at = jax.numpy.arange(40)
+    power = bux_gqa._power_scale(at, 0.3, 8)[:, 0, 0]
+    length = bux_gqa._length_scale(at, 0.5, 4)[:, 0]
+    got = kv.query_scale(c, torch.arange(40))
+    assert got is not None
+    np.testing.assert_allclose(got.numpy(), np.asarray(power * length), rtol=1e-6)
+    none = {"power_scale": None, "log_scale": None}
+    assert kv.query_scale(none, torch.arange(4)) is None
