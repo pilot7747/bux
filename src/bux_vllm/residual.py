@@ -101,8 +101,8 @@ def pending(ctx: Ctx, x: torch.Tensor) -> torch.Tensor:
     computed, or stream 0 alone before any branch."""
     if ctx.pending_read is not None:
         return ctx.pending_read
-    first = torch.zeros(x.shape[-2], dtype=x.dtype, device=x.device)
-    first[0] = 1
+    # stream 0's one-hot, made on the device: a CPU scalar write would copy in a graph
+    first = (torch.arange(x.shape[-2], device=x.device) == 0).to(x.dtype)
     return first.expand(x.shape[:-1])
 
 
