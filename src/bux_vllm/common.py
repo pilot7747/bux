@@ -71,6 +71,36 @@ class Site:
     ports: list = field(default_factory=list)
     shares: list[str | None] = field(default_factory=list)
 
+    @property
+    def quant(self) -> Any:
+        """The engine's quantization config (`quantization`)."""
+        return quantization(self.vllm_config)
+
+
+def own_cache_dtype(vllm_config: Any, what: str) -> torch.dtype:
+    """The dtype of a KV cache the plugin keeps and reads itself, for the layer
+    `what`: the model's, as vLLM's ``kv_cache_dtype`` must leave it.
+
+    Raises:
+        NotImplementedError: ``kv_cache_dtype`` asks for another, such as fp8, which
+            the plugin's own caches do not hold.
+    """
+    model, name = vllm_config.model_config.dtype, vllm_config.cache_config.cache_dtype
+    if name not in ("auto", str(model).removeprefix("torch.")):
+        raise NotImplementedError(
+            f"{what}: kv_cache_dtype={name} not in vLLM yet (its own cache keeps "
+            f"the model's {str(model).removeprefix('torch.')})"
+        )
+    return model
+
+
+def quantization(vllm_config: Any) -> Any:
+    """The engine's quantization config, which every vLLM linear layer the plugin
+    runs as a module takes, and the routed experts: vLLM's online FP8 weights under
+    ``quantization="fp8"``, None for none. The embeddings, the heads, the routers and
+    every weight the plugin reads itself take none, and stay in the model's dtype."""
+    return vllm_config.quant_config
+
 
 class Ctx:
     """One forward pass: the tokens' positions, bux's taps, the shared modules, and

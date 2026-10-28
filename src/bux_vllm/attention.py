@@ -2,7 +2,9 @@
 tensor parallelism, attending by vLLM's attention layer and its paged KV cache, with
 its ``v`` port (the value residual, `bux_vllm.kv`), its conv on keys and values
 (`bux_vllm.conv`) and its indexer, which picks the keys each query attends to
-(`bux_vllm.sparse`)."""
+(`bux_vllm.sparse`). Its projections take the engine's quantization config
+(`bux_vllm.common.quantization`); its norms, conv and indexer stay in the model's
+dtype."""
 
 from __future__ import annotations
 
@@ -80,7 +82,7 @@ class Attention(Layer):
         self.h, self.g = h // tp, max(1, g // tp)  # this rank's
         self.kv_first = kv.kv_heads(g, tp, get_tensor_model_parallel_rank())[0]
         self.c, self.scale = c, (c["scale"] or dk**-0.5) * logit_gain(c["rope"])
-        self._projections(c, width, site.path)
+        self._projections(c, width, site)
         self._norms(c, tp)
         self.rope = Rope(c["rope"], dk) if c["rope"] else None
         self._value_residual(c, site.ports)
@@ -97,15 +99,16 @@ class Attention(Layer):
             self._caches(c, site, names["full_attention"], shares)
         self._convs(c, site, names.get("conv", []))
 
-    def _projections(self, c: dict, width: int, path: str) -> None:
+    def _projections(self, c: dict, width: int, site: Site) -> None:
         """Make q, k and v's projection, column-parallel by head (q's alone for a
         layer that reads its ``kv`` port), the gate's, and the row-parallel output
-        projection."""
+        projection, each with the engine's quantization config."""
         h, g, dk, dv = c["num_heads"], c["num_kv_heads"], self.dk, self.dv
+        path, kw = site.path, {"return_bias": False, "quant_config": site.quant}
         self.qkv, self.q = None, None
         if self.reads_kv:
             self.q = ColumnParallelLinear(
-                width, h * dk, bias=c["bias"], return_bias=False, prefix=f"{path}.q"
+                width, h * dk, bias=c["bias"], prefix=f"{path}.q", **kw
             )
         else:
             self.qkv = QKVParallelLinear(
@@ -115,13 +118,13 @@ class Attention(Layer):
                 g,
                 bias=c["bias"],
                 v_head_size=dv,
-                return_bias=False,
                 prefix=f"{path}.qkv",
+                **kw,
             )
-        self._gate(c, width, h * dv, path)
+        self._gate(c, width, h * dv, site)
         out_bias = c["bias"] if c["output_bias"] is None else c["output_bias"]
         self.o = RowParallelLinear(
-            h * dv, width, bias=out_bias, return_bias=False, prefix=f"{path}.o"
+            h * dv, width, bias=out_bias, prefix=f"{path}.o", **kw
         )
 
     def _norms(self, c: dict, tp: int) -> None:
@@ -185,6 +188,7 @@ class Attention(Layer):
         settings = (c["sliding_window_size"], self.scale, c["softcap"], self.sinks)
         groups = (self.kv_first, self.g)
         spec = picks.layer_spec(ix, self.indexer, settings, self.dk, groups)
+        what = "gqa with an indexer" if ix else "gqa reading its index port"
         self.caches = sparse.layer_caches(
             spec,
             self.g,
@@ -192,6 +196,7 @@ class Attention(Layer):
             ix["head_dim"] if ix else 0,
             names,
             site.vllm_config,
+            what,
         )
 
     def _biased_caches(
@@ -206,6 +211,7 @@ class Attention(Layer):
             c["num_heads"] * rank,
             bias=c["bias"],
             return_bias=False,
+            quant_config=site.quant,
             prefix=f"{site.path}.rel_proj",
         )
         table = torch.zeros(rank, extent)
@@ -213,7 +219,13 @@ class Attention(Layer):
         settings = (c["sliding_window_size"], self.scale, c["softcap"], self.sinks)
         spec = picks.layer_spec(None, None, settings, self.dk, (self.kv_first, self.g))
         self.caches = sparse.layer_caches(
-            spec, self.g, self.dk + self.dv, 0, names, site.vllm_config
+            spec,
+            self.g,
+            self.dk + self.dv,
+            0,
+            names,
+            site.vllm_config,
+            "gqa with a relative bias",
         )
 
     def _convs(self, c: dict, site: Site, names: list[str]) -> None:
@@ -230,7 +242,7 @@ class Attention(Layer):
                 other.weight = self.conv_weight
             self.convs = nn.ModuleList(convs)
 
-    def _gate(self, c: dict, width: int, heads_dv: int, path: str) -> None:
+    def _gate(self, c: dict, width: int, heads_dv: int, site: Site) -> None:
         """Make the gate on the heads' outputs, ``act(W_g x)``, a value a channel or
         a head (``gate_per_head``), column-parallel by head; None without one."""
         self.gate, self.gate_bias = None, None
@@ -238,7 +250,12 @@ class Attention(Layer):
         if c["gated"]:
             n = c["num_heads"] if c["gate_per_head"] else heads_dv
             self.gate = ColumnParallelLinear(
-                width, n, bias=c["bias"], return_bias=False, prefix=f"{path}.gate"
+                width,
+                n,
+                bias=c["bias"],
+                return_bias=False,
+                quant_config=site.quant,
+                prefix=f"{site.path}.gate",
             )
         if c["gated"] and c["gate_head_bias"]:
             self.gate_bias = nn.Parameter(torch.zeros(self.h), requires_grad=False)

@@ -26,6 +26,11 @@ With an indexer (DeepSeek-V3.2's), or reading another layer's picks through its
 ``index`` port, each query attends to the picked keys alone, in the latent space,
 by the plugin's sparse attention ops over caches of its own (`bux_vllm.sparse`):
 the same latent and shared key dims a token, beside the indexer's keys.
+
+The projections take the engine's quantization config
+(`bux_vllm.common.quantization`), as vLLM's DeepSeek's do: its MLA dequantizes
+``kv_b``'s halves to absorb them. A sparse layer's ``kv_b`` stays in the model's
+dtype, since the sparse ops read its weight themselves.
 """
 
 from __future__ import annotations
@@ -37,7 +42,7 @@ import torch
 from torch import nn
 from vllm import _custom_ops as ops
 from vllm.distributed import get_tensor_model_parallel_world_size
-from vllm.model_executor.layers.attention import MLAAttention
+from vllm.model_executor.layers.attention import MLAAttention, mla_attention
 from vllm.model_executor.layers.attention.mla_attention import MLACommonBackend
 from vllm.model_executor.layers.linear import (
     ColumnParallelLinear,
@@ -110,8 +115,27 @@ def prefill_backend(vllm_config: Any) -> type | None:
     except ValueError:
         if vllm_config.attention_config.mla_prefill_backend is not None:
             raise
+        answer_fp8_prefill()
         return FlashAttnPrefillBackend
     return None
+
+
+def answer_fp8_prefill() -> None:
+    """Make vLLM's check of whether MLA's prefill takes FP8 queries, which its
+    metadata asks under an FP8 KV cache, answer no where no prefill backend of
+    vLLM's takes the dims, rather than raise: the prefill is then FlashAttention's
+    (`prefill_backend`), which takes the model's dtype."""
+    check = mla_attention.backend_supports_prefill_query_quantization
+    if check.__module__ == __name__:
+        return
+
+    def supports() -> bool:
+        try:
+            return check()
+        except ValueError:
+            return False
+
+    mla_attention.backend_supports_prefill_query_quantization = supports
 
 
 def decode_backend(head_size: int, heads: int, cache_config: Any) -> Any:
@@ -195,54 +219,58 @@ class LatentAttention(Layer):
         dv, rank, latent = c["v_head_dim"], c["kv_lora_rank"], c["q_lora_rank"]
         self.path, self.h, self.n, self.r, self.dv = site.path, h // tp, n, r, dv
         self.rank, self.latent = rank, latent
-        self._down(width, site.path)
+        path, kw = site.path, {"bias": False, "quant_config": site.quant}
+        self._down(width, path, kw)
         self.q = ColumnParallelLinear(
-            latent or width,
-            h * (n + r),
-            bias=False,
-            return_bias=False,
-            prefix=f"{site.path}.q",
+            latent or width, h * (n + r), return_bias=False, prefix=f"{path}.q", **kw
         )
-        # It returns its bias too, as vLLM's MLA calls it.
+        # It returns its bias too, as vLLM's MLA calls it. The sparse ops read its
+        # weight (`_sparse`), which stays in the model's dtype for them.
+        sparse_ = is_sparse(c, site.ports)
         self.kv_b = ColumnParallelLinear(
-            rank, h * (n + dv), bias=False, prefix=f"{site.path}.kv_b"
+            rank,
+            h * (n + dv),
+            bias=False,
+            quant_config=None if sparse_ else site.quant,
+            prefix=f"{path}.kv_b",
         )
         self.o = RowParallelLinear(
-            h * dv, width, bias=False, return_bias=False, prefix=f"{site.path}.o"
+            h * dv, width, return_bias=False, prefix=f"{path}.o", **kw
         )
         self.q_a_norm = Norm(LATENT_NORM, latent) if latent else None
         self.kv_a_norm = Norm(LATENT_NORM, rank)
         self.rope = Rope(c["rope"], r) if c["rope"] else None
-        self._gate(c, width, h * dv, site.path)
+        self._gate(c, width, h * dv, path, kw)
         self.out_norm = Norm(c["output_norm"], dv) if c["output_norm"] else None
         self.scale = (c["scale"] or (n + r) ** -0.5) * logit_gain(c["rope"])
         self.sinks = sink_logits(self.h) if c["sinks"] else None
         self.ports, self.spec, self.indexer = site.ports, None, None
-        if is_sparse(c, site.ports):
+        if sparse_:
             self._sparse_caches(c, width, site)
         else:
             self.caches = nn.ModuleList(self._cache(name, site) for name in site.caches)
 
-    def _down(self, width: int, path: str) -> None:
-        """Make the down projections, every rank's: the query latent's and the key
-        and value latent's by one GEMM where there is a query latent."""
+    def _down(self, width: int, path: str, kw: dict) -> None:
+        """Make the down projections, every rank's, of the linear layers' arguments
+        `kw`: the query latent's and the key and value latent's by one GEMM where
+        there is a query latent."""
         self.qkv_a = self.kv_a = None
         out = self.rank + self.r
         if self.latent:
             self.qkv_a = MergedColumnParallelLinear(
                 width,
                 [self.latent, out],
-                bias=False,
                 return_bias=False,
                 disable_tp=True,
                 prefix=f"{path}.qkv_a",
+                **kw,
             )
         else:
             self.kv_a = ReplicatedLinear(
-                width, out, bias=False, return_bias=False, prefix=f"{path}.kv_a"
+                width, out, return_bias=False, prefix=f"{path}.kv_a", **kw
             )
 
-    def _gate(self, c: dict, width: int, heads_dv: int, path: str) -> None:
+    def _gate(self, c: dict, width: int, heads_dv: int, path: str, kw: dict) -> None:
         """Make the gate on the heads' outputs, ``act(W_g x)``, a value a channel or
         a head (``gate_per_head``), column-parallel by head; None without one."""
         self.gate = None
@@ -250,7 +278,7 @@ class LatentAttention(Layer):
         if c["gated"]:
             n = c["num_heads"] if c["gate_per_head"] else heads_dv
             self.gate = ColumnParallelLinear(
-                width, n, bias=False, return_bias=False, prefix=f"{path}.gate"
+                width, n, return_bias=False, prefix=f"{path}.gate", **kw
             )
 
     def _cache(self, name: str, site: Site) -> MLAAttention:
@@ -289,8 +317,10 @@ class LatentAttention(Layer):
         self.spec = picks.layer_spec(
             ix, self.indexer, settings, dims, (0, 1), self.rank
         )
+        what = "mla with an indexer" if ix else "mla reading its index port"
+        index_dims = ix["head_dim"] if ix else 0
         self.caches = sparse.layer_caches(
-            self.spec, 1, dims, ix["head_dim"] if ix else 0, names, site.vllm_config
+            self.spec, 1, dims, index_dims, names, site.vllm_config, what
         )
 
     def targets(self) -> dict[str, tuple[nn.Parameter, tuple]]:

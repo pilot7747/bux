@@ -512,14 +512,15 @@ def main() -> None:
 # --- export, in bux's environment ---------------------------------------------------
 
 
-def export(name: str, out: Path, dtype: str) -> None:
-    """Export case `name`'s model to `out` in `dtype`, with its prompts."""
+def export(name: str, out: Path, dtype: str, cases: dict[str, str] = CASES) -> None:
+    """Export case `name`'s model, from `cases`, to `out` in `dtype`, with its
+    prompts."""
     import torch
 
     from bux.export.huggingface import save
     from bux.lang import compile
 
-    arch = compile(CASES[name])
+    arch = compile(cases[name])
     model = reference_model(arch, dtype)
     with placeholders(arch):
         save(arch, model, out, dtype=getattr(torch, dtype))
@@ -644,14 +645,19 @@ def engine(args: argparse.Namespace) -> dict:
 
 def run(where: Path, tag: str, engine: dict) -> None:
     """Decode the prompts of the export at `where` greedily with vLLM, its engine
-    made with the arguments `engine` and the case's own (`ENGINES`); keep the
-    tokens and every position's log-probabilities in ``<tag>.npz``."""
-    from vllm import LLM, SamplingParams
-    from vllm.inputs import TokensPrompt
+    made with the arguments `engine` (`serve`); keep the tokens and every
+    position's log-probabilities in ``<tag>.npz``."""
+    decode(serve(where, engine), where, tag)
+
+
+def serve(where: Path, engine: dict) -> Any:
+    """vLLM's engine of the export at `where`, made with the arguments `engine` and
+    the case's own (`ENGINES`)."""
+    from vllm import LLM
 
     meta = json.loads((where / "parity.json").read_text())
     vocab = json.loads((where / "config.json").read_text())["vocab_size"]
-    llm = LLM(
+    return LLM(
         model=str(where),
         dtype=meta["dtype"],
         skip_tokenizer_init=True,
@@ -661,6 +667,16 @@ def run(where: Path, tag: str, engine: dict) -> None:
         seed=0,
         **engine | ENGINES.get(meta["name"], {}),
     )
+
+
+def decode(llm: Any, where: Path, tag: str) -> None:
+    """Decode the prompts of the export at `where` greedily with `llm`; keep the
+    tokens and every position's log-probabilities in ``<tag>.npz``."""
+    from vllm import SamplingParams
+    from vllm.inputs import TokensPrompt
+
+    meta = json.loads((where / "parity.json").read_text())
+    vocab = json.loads((where / "config.json").read_text())["vocab_size"]
     params = SamplingParams(
         temperature=0.0,
         max_tokens=meta["steps"],

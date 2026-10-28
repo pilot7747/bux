@@ -40,6 +40,7 @@ from vllm.v1.attention.backends.utils import split_decodes_and_prefills
 from vllm.v1.kv_cache_interface import FullAttentionSpec
 
 from . import compressed, kernels, picks
+from .common import own_cache_dtype
 from .kv import reads, writes
 
 #: The ops, as vLLM's compilation names them.
@@ -149,10 +150,11 @@ class PagedCache(nn.Module, AttentionLayerBase):
         sparse: The settings of the call, which the op attends with.
         index_dims: The channels of its indexer's key; 0 for a call that reads its
             picks from its ``index`` port.
+        what: The layer, as its errors name it.
 
     Raises:
-        NotImplementedError: The KV cache is quantized, which the plugin's sparse
-            attention does not read.
+        NotImplementedError: ``kv_cache_dtype`` is other than the model's, such as
+            fp8, which the plugin's ops do not read (`own_cache_dtype`).
     """
 
     def __init__(
@@ -163,16 +165,12 @@ class PagedCache(nn.Module, AttentionLayerBase):
         prefix: str,
         sparse: picks.Sparse,
         index_dims: int = 0,
+        what: str = "a sparse layer",
     ):
         super().__init__()
-        cache = vllm_config.cache_config
-        if cache.cache_dtype not in ("auto", "bfloat16", "float16", "float32"):
-            raise NotImplementedError(
-                f"gqa: an indexer with a {cache.cache_dtype} KV cache"
-            )
+        self.dtype = own_cache_dtype(vllm_config, what)
         self.heads, self.channels, self.prefix = heads, channels, prefix
         self.index_dims, self.share = index_dims, -(-index_dims // heads)
-        self.dtype = vllm_config.model_config.dtype
         self.sparse = sparse
         self.kv_cache = torch.tensor([])
         context = vllm_config.compilation_config.static_forward_context
@@ -207,13 +205,14 @@ def layer_caches(
     index_dims: int,
     names: dict[str, list[str]],
     vllm_config: Any,
+    what: str,
 ) -> nn.ModuleList:
-    """Each call's `PagedCache` of a sparse layer, by the names of its states: its
+    """Each call's `PagedCache` of the layer `what`, by the names of its states: its
     keys and values, `heads` vectors of `channels` a token, attended with `spec`,
     and its indexer's keys, `index_dims` a token (0 for a layer that reads its
     picks from its ``index`` port)."""
     caches = nn.ModuleList(
-        PagedCache(heads, channels, vllm_config, name, spec, index_dims)
+        PagedCache(heads, channels, vllm_config, name, spec, index_dims, what)
         for name in names["full_attention"]
     )
     split_graphs(vllm_config)
