@@ -15,6 +15,12 @@ alone as one graph (`PagedMetadataBuilder`). The op also gives the keys each que
 picked, which a layer that reads them through its ``index`` port attends over with
 ``vllm::bux_picked_attention``, keeping no indexer keys of its own.
 
+Where vLLM's DeepSeek-V3.2 kernels take a layer's indexer (`bux_vllm.dsa`), its
+keys are FP8 in head slots of their own after the kv heads', in DeepGEMM's paged
+layout, in blocks of 64 tokens (`IndexedBackend`). Such a cache, and one of a layer
+that reads its ``index`` port, takes an FP8 KV cache: its keys and values in e4m3
+or e5m2, at a scale of 1, as vLLM's attention keeps them.
+
 A layer with a relative bias attends to every key it sees, the bias on its logits,
 in ``vllm::bux_biased_attention`` over a cache of the same kind: no attention kernel
 of vLLM's adds a bias that depends on the query and on how far behind it a key is.
@@ -37,9 +43,14 @@ from vllm.v1.attention.backend import (
     CommonAttentionMetadata,
 )
 from vllm.v1.attention.backends.utils import split_decodes_and_prefills
-from vllm.v1.kv_cache_interface import FullAttentionSpec
+from vllm.v1.kv_cache_interface import (
+    FullAttentionSpec,
+    KVQuantMode,
+    get_kv_quant_mode,
+)
+from vllm.v1.kv_cache_layout import KVCacheLayout
 
-from . import compressed, kernels, picks
+from . import compressed, dsa, kernels, picks
 from .common import own_cache_dtype
 from .kv import reads, writes
 
@@ -49,6 +60,13 @@ OPS = (
     "vllm::bux_picked_attention",
     "vllm::bux_biased_attention",
 )
+#: The FP8 KV caches a sparse call's cache takes, by vLLM's ``kv_cache_dtype``.
+FP8_CACHES = {
+    "fp8": torch.float8_e4m3fn,
+    "fp8_e4m3": torch.float8_e4m3fn,
+    "fp8_e5m2": torch.float8_e5m2,
+}
+PAGE = 64  # the tokens of a block that DeepGEMM's paged kernel reads
 
 
 @dataclass
@@ -61,12 +79,15 @@ class Batch:
         num_actual_tokens: The step's tokens, padding left out.
         segments: Its queries by `bux_vllm.picks.Segment`: its decoded tokens, one
             a request, then each prompt chunk.
+        decoding: Its decoded tokens as vLLM's DSA kernels take them, for an
+            `IndexedBackend`'s caches; None without.
     """
 
     slot_mapping: torch.Tensor
     block_table_tensor: torch.Tensor
     num_actual_tokens: int
     segments: list[picks.Segment]
+    decoding: dsa.Decoding | None = None
 
 
 class PagedMetadataBuilder(AttentionMetadataBuilder[Batch]):
@@ -109,6 +130,33 @@ class PagedMetadataBuilder(AttentionMetadataBuilder[Batch]):
         )
 
 
+class IndexedMetadataBuilder(PagedMetadataBuilder):
+    """A `PagedMetadataBuilder` for caches whose indexer runs on vLLM's DSA kernels
+    (`IndexedBackend`): with each decoded token's keys and DeepGEMM's schedule of
+    them, in buffers that a CUDA graph's replays read in place."""
+
+    def __init__(
+        self, kv_cache_spec: Any, layer_names: list[str], vllm_config: Any, device: Any
+    ):
+        super().__init__(kv_cache_spec, layer_names, vllm_config, device)
+        most = vllm_config.scheduler_config.max_num_batched_tokens
+        self.lens = torch.zeros(most, 1, dtype=torch.int32, device=device)
+        self.plan: torch.Tensor | None = None
+
+    def _batch(self, cm: CommonAttentionMetadata, longest: int) -> Batch:
+        batch = super()._batch(cm, longest)
+        decoding = [part for part in batch.segments if part.decoding]
+        if decoding:
+            lens = self.lens[: decoding[0].tokens.stop]
+            lens[:, 0].copy_(cm.seq_lens[: len(lens)])
+            plan = dsa.schedule(lens, PAGE)
+            if self.plan is None:
+                self.plan = torch.empty_like(plan)
+            self.plan.copy_(plan)
+            batch.decoding = dsa.Decoding(lens, self.plan, self.longest)
+        return batch
+
+
 def _prompts(cm: CommonAttentionMetadata, decodes: int) -> list:
     """Each prompt chunk of the step after its `decodes` decoded requests: its first
     token, tokens, request and the request's length with it."""
@@ -122,6 +170,7 @@ class PagedBackend(AttentionBackend):
     """The backend of a `PagedCache`: its metadata alone, as the plugin attends."""
 
     supported_dtypes: ClassVar = [torch.float16, torch.bfloat16, torch.float32]
+    supported_kv_cache_dtypes: ClassVar = ["auto", "float16", "bfloat16", *FP8_CACHES]
 
     @staticmethod
     def get_name() -> str:
@@ -136,11 +185,36 @@ class PagedBackend(AttentionBackend):
         return PagedMetadataBuilder
 
 
+class IndexedBackend(PagedBackend):
+    """The backend of a `PagedCache` whose indexer runs on vLLM's DSA kernels: its
+    blocks of `PAGE` tokens, as DeepGEMM's paged kernel reads them (vLLM splits
+    larger blocks into such), and a layout that keeps a block's head slots
+    together, where the indexer keys lie."""
+
+    @staticmethod
+    def get_name() -> str:
+        return "BUX_PAGED_DSA"
+
+    @staticmethod
+    def get_builder_cls() -> type[IndexedMetadataBuilder]:
+        return IndexedMetadataBuilder
+
+    @staticmethod
+    def get_supported_kernel_block_sizes(kv_cache_spec: Any = None) -> list:
+        return [PAGE]
+
+    @classmethod
+    def supported_kv_cache_layouts(cls) -> tuple[KVCacheLayout, ...]:
+        return (KVCacheLayout.LBHNC, KVCacheLayout.BLHNC)
+
+
 class PagedCache(nn.Module, AttentionLayerBase):
-    """A sparse call's `heads` vectors of `channels` a token, and its indexer's key
-    of `index_dims` spread over them, in vLLM's paged KV cache, allocated as for
-    full attention, which `kv_cache` views as ``[blocks, heads, block_size,
-    channels + ceil(index_dims / heads)]`` (`bux_vllm.picks.Cache`).
+    """A sparse call's `heads` vectors of `channels` a token, and its indexer's keys
+    of `index_dims`, in vLLM's paged KV cache, allocated as for full attention, which
+    `kv_cache` views as ``[blocks, slots, block_size, row]``: each kv head's
+    channels, and the indexer key's spread over them (`bux_vllm.picks.Cache`), or,
+    where vLLM's DSA kernels pick (`native`), the FP8 keys in slots of their own
+    after the kv heads' (`bux_vllm.dsa.Region`).
 
     Args:
         heads: The kv heads of a token.
@@ -151,10 +225,13 @@ class PagedCache(nn.Module, AttentionLayerBase):
         index_dims: The channels of its indexer's key; 0 for a call that reads its
             picks from its ``index`` port.
         what: The layer, as its errors name it.
+        native: Whether vLLM's DSA kernels pick its keys (`bux_vllm.dsa.takes`).
+        fp8: Whether its ops read an FP8 KV cache (the Triton kernels' do, over
+            keys and values alone or with FP8 indexer keys).
 
     Raises:
-        NotImplementedError: ``kv_cache_dtype`` is other than the model's, such as
-            fp8, which the plugin's ops do not read (`own_cache_dtype`).
+        NotImplementedError: ``kv_cache_dtype`` is other than the model's, but for
+            fp8 where the call takes it (`cache_dtype`).
     """
 
     def __init__(
@@ -166,12 +243,23 @@ class PagedCache(nn.Module, AttentionLayerBase):
         sparse: picks.Sparse,
         index_dims: int = 0,
         what: str = "a sparse layer",
+        native: bool = False,
+        fp8: bool = False,
     ):
         super().__init__()
-        self.dtype = own_cache_dtype(vllm_config, what)
+        self.model_dtype = vllm_config.model_config.dtype
+        self.dtype, self.fp8 = cache_dtype(vllm_config, what, fp8)
         self.heads, self.channels, self.prefix = heads, channels, prefix
-        self.index_dims, self.share = index_dims, -(-index_dims // heads)
-        self.sparse = sparse
+        self.index_dims, self.native, self.sparse = index_dims, native, sparse
+        self.share = 0 if native else -(-index_dims // heads)
+        size = self.dtype.itemsize
+        self.slots = dsa.slots(index_dims, channels, size) if native else 0
+        self.scales = (1.0, 1.0)  # an FP8 cache's keys' and values' scales
+        self.longest = vllm_config.model_config.max_model_len
+        kernel = getattr(vllm_config, "kernel_config", None)
+        self.topk_backend = getattr(kernel, "sparse_indexer_topk_backend", "auto")
+        quant = get_kv_quant_mode(vllm_config.cache_config.cache_dtype)
+        self.quant = quant if self.fp8 is not None else KVQuantMode.NONE
         self.kv_cache = torch.tensor([])
         context = vllm_config.compilation_config.static_forward_context
         if prefix in context:
@@ -179,23 +267,78 @@ class PagedCache(nn.Module, AttentionLayerBase):
         context[prefix] = self
 
     def get_attn_backend(self) -> type[AttentionBackend]:
-        return PagedBackend
+        return IndexedBackend if self.native else PagedBackend
 
     def get_kv_cache_spec(self, vllm_config: Any) -> FullAttentionSpec:
         row = self.channels + self.share
         half = row // 2  # a key's and a value's dims, as vLLM sums them
         return FullAttentionSpec(
             block_size=vllm_config.cache_config.block_size,
-            num_kv_heads=self.heads,
+            num_kv_heads=self.heads + self.slots,
             head_size=row - half,
             head_size_v=half,
             dtype=self.dtype,
+            kv_quant_mode=self.quant,
         )
 
     @property
     def rows(self) -> picks.Cache:
         """The cache, its keys and values apart from its indexer keys."""
+        if self.native:
+            return picks.Cache(self.kv_cache[:, : self.heads], self.channels)
         return picks.Cache(self.kv_cache, self.channels, self.index_dims)
+
+    @property
+    def kv(self) -> torch.Tensor:
+        """The keys and values, ``[blocks, heads, block_size, channels]``, as FP8
+        in an FP8 cache."""
+        kv = self.rows.kv
+        return kv if self.fp8 is None else kv.view(self.fp8)
+
+    @property
+    def region(self) -> dsa.Region:
+        """The FP8 indexer keys, where vLLM's DSA kernels pick."""
+        return dsa.Region(self.kv_cache, self.heads, self.index_dims)
+
+    def write(self, slots: torch.Tensor, rows: torch.Tensor) -> None:
+        """Write the tokens' keys and values, (T, heads, channels), at vLLM's
+        `slots`, (T,): in FP8, divided by their scales, in an FP8 cache."""
+        if self.fp8 is not None:  # its bytes, as indexing writes them
+            most = torch.finfo(self.fp8).max
+            dk = self.sparse.dk
+            k, v = rows[..., :dk] / self.scales[0], rows[..., dk:] / self.scales[1]
+            rows = torch.cat([k, v], -1).float().clamp(-most, most)
+            rows = rows.to(self.fp8).view(torch.uint8)
+        picks.write(self.rows.kv, slots, rows)
+
+
+def cache_dtype(
+    vllm_config: Any, what: str, fp8: bool
+) -> tuple[torch.dtype, torch.dtype | None]:
+    """The dtype a sparse call's cache keeps, as vLLM allocates it, and its FP8
+    dtype or None: under ``kv_cache_dtype`` fp8 (or fp8_e4m3, fp8_e5m2), bytes read
+    as e4m3 (e5m2) where the call takes it (`fp8`), else the model's.
+
+    Raises:
+        NotImplementedError: ``kv_cache_dtype`` is other than the model's, where
+            the call does not take it (`bux_vllm.common.own_cache_dtype`).
+    """
+    name = vllm_config.cache_config.cache_dtype
+    if fp8 and name in FP8_CACHES:
+        return torch.uint8, FP8_CACHES[name]
+    return own_cache_dtype(vllm_config, what), None
+
+
+def paths(
+    spec: picks.Sparse, ix: dict | None, dims: tuple[int, int], dtype: torch.dtype
+) -> tuple[bool, bool]:
+    """Whether vLLM's DSA kernels pick a call's keys, by its indexer's config `ix`
+    (`bux_vllm.dsa.takes`), in a model of `dtype`; and whether its ops take an FP8
+    KV cache: theirs, and the Triton kernels' over keys and values alone, of heads
+    of `dims` (a layer that reads its ``index`` port), but not MLA's latents."""
+    native = ix is not None and dsa.takes(spec, ix["head_dim"], ix["num_heads"], dtype)
+    alone = ix is None and kernels.takes(spec, dims, dtype)
+    return native, (native or alone) and not spec.latent
 
 
 def layer_caches(
@@ -206,13 +349,18 @@ def layer_caches(
     names: dict[str, list[str]],
     vllm_config: Any,
     what: str,
+    native: bool = False,
+    fp8: bool = False,
 ) -> nn.ModuleList:
     """Each call's `PagedCache` of the layer `what`, by the names of its states: its
     keys and values, `heads` vectors of `channels` a token, attended with `spec`,
     and its indexer's keys, `index_dims` a token (0 for a layer that reads its
-    picks from its ``index`` port)."""
+    picks from its ``index`` port), FP8 ones where vLLM's DSA kernels pick them
+    (`native`); in an FP8 KV cache where the call's ops take it (`fp8`)."""
     caches = nn.ModuleList(
-        PagedCache(heads, channels, vllm_config, name, spec, index_dims, what)
+        PagedCache(
+            heads, channels, vllm_config, name, spec, index_dims, what, native, fp8
+        )
         for name in names["full_attention"]
     )
     split_graphs(vllm_config)
@@ -296,25 +444,87 @@ def sparse_attention(
     empty; zeros in vLLM's profiling run, which has no metadata."""
     metas = _metadata()
     picked_valid.zero_()
+    cache = get_forward_context().no_compile_layers[layer_name]
     if metas is None or layer_name not in metas:
         output.zero_()
+        if cache.native:
+            dsa.reserve(q.device, cache.longest, cache.index_dims)
         return
-    cache = get_forward_context().no_compile_layers[layer_name]
     meta = metas[layer_name]
     n = meta.num_actual_tokens
     output[n:].zero_()
-    rows = picks.merged(torch.cat([k, v], -1)[:n], index_k[:n])
-    picks.write(cache.kv_cache, meta.slot_mapping[:n], rows)
+    _written(cache, meta, torch.cat([k, v], -1)[:n], index_k[:n])
+    if cache.native:
+        heads = dsa.padded_heads(index_q.shape[1])
+        index_q, index_w = dsa.queries(index_q, index_w, heads)
     table, tensors = meta.block_table_tensor, (q, index_q, index_w, positions)
     for part in meta.segments:
         at = part.tokens
         q_, iq, iw, pos = (t[at] for t in tensors)
-        out, (kept, valid) = _segments(cache)(
-            cache.sparse, q_, (iq, iw), pos, cache.rows, table[part.requests], part.keys
-        )
+        rows = table[part.requests]
+        out, (kept, valid) = _segment(cache, meta, part, q_, (iq, iw), pos, rows)
         output[at] = out.to(output.dtype)
         if picked_keys.numel():
             picked_keys[at], picked_valid[at] = kept, valid
+
+
+def _written(
+    cache: PagedCache, meta: Batch, kv: torch.Tensor, index_k: torch.Tensor
+) -> None:
+    """Write the step's keys and values, (n, g, C), and its indexer keys, (n, i),
+    into `cache`: in FP8 where vLLM's DSA kernels pick, else spread over the rows."""
+    slots = meta.slot_mapping[: kv.shape[0]]
+    if cache.native:
+        cache.write(slots, kv)
+        cache.region.write(slots, index_k)
+    else:
+        picks.write(cache.kv_cache, slots, picks.merged(kv, index_k))
+
+
+def _segment(
+    cache: PagedCache,
+    meta: Batch,
+    part: picks.Segment,
+    q: torch.Tensor,
+    index: tuple[torch.Tensor, torch.Tensor],
+    positions: torch.Tensor,
+    rows: torch.Tensor,
+) -> tuple[torch.Tensor, picks.Picked]:
+    """A segment's outputs, (Q, h, dv), and its picks: by vLLM's DSA kernels where
+    they pick (`_native`), else by the Triton kernels or PyTorch (`_segments`)."""
+    if cache.native:
+        return _native(cache, meta, part, q, index, positions, rows)
+    run = _segments(cache)
+    return run(cache.sparse, q, index, positions, cache.rows, rows, part.keys)
+
+
+def _native(
+    cache: PagedCache,
+    meta: Batch,
+    part: picks.Segment,
+    q: torch.Tensor,
+    index: tuple[torch.Tensor, torch.Tensor],
+    positions: torch.Tensor,
+    rows: torch.Tensor,
+) -> tuple[torch.Tensor, picks.Picked]:
+    """A segment's picks by vLLM's DSA kernels (decoded tokens' over their paged
+    keys, a prompt chunk's over its request's gathered ones), padded to the top-k,
+    and its attention over them: by the Triton kernel, or by PyTorch over MLA's
+    latents."""
+    spec, region = cache.sparse, cache.region
+    if part.decoding:
+        assert meta.decoding is not None, "decoded tokens have their keys' lengths"
+        args = (meta.decoding, spec.top_k, cache.topk_backend)
+        chosen = dsa.decode(region, index, rows, *args)
+    else:
+        chosen = dsa.prompt(region, index, rows, part.keys, positions, spec.top_k)
+    kept = dsa.as_picks(chosen)
+    if spec.latent:
+        kv = cache.rows.kv
+        return picks.attend_picked(spec, q, kept, positions, kv, rows, part.keys), kept
+    table = rows.expand(q.shape[0], -1)
+    out = kernels.attend(spec, q.contiguous(), cache.kv, table, kept, cache.scales)
+    return out, kept
 
 
 def picked_attention(
@@ -340,21 +550,17 @@ def picked_attention(
     meta = metas[layer_name]
     n = meta.num_actual_tokens
     output[n:].zero_()
-    picks.write(cache.kv_cache, meta.slot_mapping[:n], torch.cat([k, v], -1)[:n])
+    cache.write(meta.slot_mapping[:n], torch.cat([k, v], -1)[:n])
     table = meta.block_table_tensor
     for part in meta.segments:
         at = part.tokens
         picked = (picked_keys[at], picked_valid[at])
-        attend = kernels.attend_picked if _kernels(cache) else picks.attend_picked
-        out = attend(
-            cache.sparse,
-            q[at],
-            picked,
-            positions[at],
-            cache.rows.kv,
-            table[part.requests],
-            part.keys,
-        )
+        args = (cache.sparse, q[at], picked, positions[at])
+        rows = table[part.requests]
+        if _kernels(cache):
+            out = kernels.attend_picked(*args, cache.kv, rows, part.keys, cache.scales)
+        else:
+            out = picks.attend_picked(*args, cache.rows.kv, rows, part.keys)
         output[at] = out.to(output.dtype)
 
 
@@ -398,7 +604,7 @@ def biased_attention(
 def _kernels(cache: PagedCache) -> bool:
     """Whether the Triton kernels attend over the call's `cache` (`bux_vllm.kernels`)."""
     dims = (cache.sparse.dk, cache.channels - cache.sparse.dk)
-    return kernels.takes(cache.sparse, dims, cache.kv_cache.dtype)
+    return kernels.takes(cache.sparse, dims, cache.model_dtype)
 
 
 def _segments(cache: PagedCache) -> Any:

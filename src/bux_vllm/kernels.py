@@ -33,14 +33,18 @@ MOST_DIMS = 256  # the widest key or value head the kernels take
 BLOCKS = (16, 32, 64, 128)  # MSA's blocks whose best a prompt's kernel finds
 
 
+def enabled(dtype: torch.dtype) -> bool:
+    """Whether the kernels run in a model of `dtype`, by `CHOICE`: in a 16-bit one
+    unless it names a path, in any under ``triton`` or ``native``."""
+    if CHOICE is None:
+        return dtype in (torch.bfloat16, torch.float16)
+    return CHOICE in ("triton", "native")
+
+
 def takes(spec: Sparse, dims: tuple[int, int], dtype: torch.dtype) -> bool:
     """Whether the kernels compute the layer of `spec`, its key and value heads of
-    `dims` in a cache of `dtype`: not MLA's latents, and by `CHOICE`."""
-    if CHOICE is None:
-        on = dtype in (torch.bfloat16, torch.float16)
-    else:
-        on = CHOICE == "triton"
-    return on and max(dims) <= MOST_DIMS and not spec.latent
+    `dims`, in a model of `dtype`: not MLA's latents, and by `enabled`."""
+    return enabled(dtype) and max(dims) <= MOST_DIMS and not spec.latent
 
 
 def _block(n: int) -> int:
@@ -720,19 +724,23 @@ def _attend_kernel(
     n_picks,
     scale,
     softcap,
+    v_scale,
     heads_per: tl.constexpr,
     dk: tl.constexpr,
     dv: tl.constexpr,
     page: tl.constexpr,
     capped: tl.constexpr,
     sunk: tl.constexpr,
+    fp8: tl.constexpr,
     block_h: tl.constexpr,
     block_dk: tl.constexpr,
     block_dv: tl.constexpr,
     block_k: tl.constexpr,
 ):
     """One query's heads of one kv head's group, over its picked keys: an online
-    softmax of the scaled, capped logits, the sinks beside them."""
+    softmax of the scaled, capped logits, the sinks beside them. An `fp8` cache's
+    values take bfloat16's tensor cores, their scale `v_scale` on the output (its
+    keys' is in `scale`)."""
     t, g = tl.program_id(0), tl.program_id(1)
     h = tl.arange(0, block_h)
     head = g * heads_per + h
@@ -774,10 +782,12 @@ def _attend_kernel(
             mask=ok[:, None] & (e[None, :] < dv),
             other=0.0,
         )
-        acc = acc * fade[:, None] + tl.dot(p.to(v.dtype), v, input_precision="ieee").to(
-            tl.float32
-        )
+        if fp8:
+            v = v.to(tl.bfloat16)
+        step = tl.dot(p.to(v.dtype), v, input_precision="ieee").to(tl.float32)
+        acc = acc * fade[:, None] + step
         top = new
+    acc = acc * v_scale
     kept = total > 0
     if sunk:
         sink = tl.load(sinks_ptr + head, mask=on_h, other=0.0).to(tl.float32)
@@ -798,22 +808,27 @@ def attend(
     cache: torch.Tensor,
     rows: torch.Tensor,
     picked: tuple[torch.Tensor, torch.Tensor],
+    scales: tuple[float, float] = (1.0, 1.0),
 ) -> torch.Tensor:
-    """Each query's heads' outputs over the keys it picked, (Q, h, dv) in the cache's
-    dtype, as `bux_vllm.picks.attend` gives them.
+    """Each query's heads' outputs over the keys it picked, (Q, h, dv) in the
+    queries' dtype, as `bux_vllm.picks.attend` gives them.
 
     Args:
         spec: The layer's settings: the key dims, scale, softcap and sinks.
         q: The queries, (Q, h, dk), the last axis contiguous.
-        cache: The paged cache of keys and values, (blocks, g, block_size, dk + dv).
+        cache: The paged cache of keys and values, (blocks, g, block_size, dk + dv),
+            in the model's dtype or FP8 (e4m3 or e5m2).
         rows: Each query's request's block table, (Q, blocks).
         picked: The picked keys' positions and which are valid, (Q, K) each, or
             (Q, g, K) for each kv head's group.
+        scales: An FP8 cache's scales of its keys and values, which it holds
+            divided by them.
     """
     keys, valid = (t.contiguous() for t in picked)
     n, h, dk = q.shape
     g, dv = cache.shape[1], cache.shape[3] - spec.dk
-    out = torch.empty(n, h, dv, dtype=cache.dtype, device=q.device)
+    out = torch.empty(n, h, dv, dtype=q.dtype, device=q.device)
+    fp8 = cache.dtype in (torch.float8_e4m3fn, torch.float8_e5m2)
     sinks = spec.sinks if spec.sinks is not None else q.new_zeros(1)
     _attend_kernel[(n, g)](
         q,
@@ -834,14 +849,16 @@ def attend(
         out.stride(0),
         out.stride(1),
         keys.shape[-1],
-        spec.scale,
+        spec.scale * scales[0],
         spec.softcap or 1.0,
+        scales[1],
         heads_per=h // g,
         dk=dk,
         dv=dv,
         page=cache.shape[2],
         capped=spec.softcap is not None,
         sunk=spec.sinks is not None,
+        fp8=fp8,
         block_h=_block(h // g),
         block_dk=_block(dk),
         block_dv=_block(dv),
@@ -978,14 +995,9 @@ def _csa_kernel(
 
 
 def takes_csa(dtype: torch.dtype, dims: int) -> bool:
-    """Whether the kernel attends a ``csa`` call of heads of `dims` in a cache of
-    `dtype` (`csa_attend`), by `CHOICE`."""
-    on = (
-        dtype in (torch.bfloat16, torch.float16)
-        if CHOICE is None
-        else CHOICE == "triton"
-    )
-    return on and dims <= MOST_DIMS
+    """Whether the kernel attends a ``csa`` call of heads of `dims` in a model of
+    `dtype` (`csa_attend`), by `enabled`."""
+    return enabled(dtype) and dims <= MOST_DIMS
 
 
 def csa_attend(
@@ -1144,16 +1156,17 @@ def attend_picked(
     cache: torch.Tensor,
     rows: torch.Tensor,
     n: int,
+    scales: tuple[float, float] = (1.0, 1.0),
 ) -> torch.Tensor:
     """`bux_vllm.picks.attend_picked` by the kernels: the queries' attention over the
-    keys another call picked, of those their own window sees."""
+    keys another call picked, of those their own window sees; `scales` an FP8
+    cache's (`attend`)."""
     keys, valid = picked[0].clamp(0, n - 1), picked[1]
     see = picks.seen(positions, n, spec.window)
     view = see if keys.ndim == 2 else see[:, None].expand(-1, keys.shape[1], -1)
     table = rows.expand(q.shape[0], -1)
-    return attend(
-        spec, q.contiguous(), cache, table, (keys, valid & view.gather(-1, keys))
-    )
+    kept = (keys, valid & view.gather(-1, keys))
+    return attend(spec, q.contiguous(), cache, table, kept, scales)
 
 
 def _choose(

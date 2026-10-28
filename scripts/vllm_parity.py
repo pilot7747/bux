@@ -78,6 +78,10 @@ SPARSE_MLA = (
     " head_dim=16, top_k=8))\n"
     "local = attn(sliding_window_size=16, sinks=true, softcap=20)\n"
 )
+#: DSA's indexer as vLLM's DeepSeek-V3.2 kernels take it, the timeline's: 4 heads of
+#: 64, its top 16 of the keys, so that the prompts and their decoding pick.
+NATIVE_INDEXER = "indexer=indexer(num_heads=4, head_dim=64, top_k=16)"
+NATIVE = f"attn = gqa(num_heads=4, num_kv_heads=2, rope=rope(), {NATIVE_INDEXER})\n"
 #: csa compressing groups of 4 with half the dims rotated, at d_model 128, its
 #: window and top-k small enough that the prompts and their decoding cross both.
 SPARSE = (
@@ -379,6 +383,15 @@ CASES = {
     + FFN
     + "model = embed [rmsnorm attn] [rmsnorm ffn] [rmsnorm local] [rmsnorm ffn]"
     " rmsnorm head",
+    # DeepSeek-V3.2's indexer on vLLM's kernels, beside one with a window that
+    # they do not take.
+    "mla-dsa-native": HEAD
+    + SPARSE_MLA.replace(
+        "indexer=indexer(num_heads=2, head_dim=16, top_k=8)", NATIVE_INDEXER
+    )
+    + FFN
+    + "model = embed [rmsnorm attn] [rmsnorm ffn] [rmsnorm local] [rmsnorm ffn]"
+    " rmsnorm head",
     # GLM-5.3's: one layer's picks shared with the next two.
     "mla-share": HEAD
     + SPARSE_MLA
@@ -412,6 +425,20 @@ CASES = {
     + "model = embed [rmsnorm attn(index=@topk)] [rmsnorm ffn] [rmsnorm attn(index=$topk)]"
     " [rmsnorm ffn] [rmsnorm attn(sliding_window_size=16, index=$topk!)] [rmsnorm ffn]"
     " rmsnorm head",
+    # DSA on vLLM's DeepSeek-V3.2 kernels (in 16-bit models): the timeline's
+    # indexer of 4 heads of 64, a layer that reads its picks, one that indexes its own.
+    "dsa-native": HEAD
+    + FFN
+    + NATIVE
+    + "model = embed [rmsnorm attn(index=@topk)] [rmsnorm ffn] [rmsnorm attn]"
+    " [rmsnorm ffn] [rmsnorm attn(index=$topk!)] [rmsnorm ffn] rmsnorm head",
+    # The factorial's S arms: DSA on the hybrid's global layer (QK-norm, a gate, the
+    # conv on keys and values) beside KDA, which takes blocks of many tokens.
+    "dsa-hybrid": HEAD
+    + FFN
+    + NATIVE.replace("rope=rope()", "kv_conv_size=4, qk_norm=rmsnorm, gated=true")
+    + "delta = kda(num_heads=2, num_v_heads=4, head_dim=32, gate_lower_bound=-5)\n"
+    + LINEAR_HYBRID,
     # MSA's picks, of blocks and per kv head's group, shared likewise.
     "msa-share": HEAD
     + FFN

@@ -19,6 +19,7 @@ from __future__ import annotations
 import sys
 import traceback
 from collections.abc import Callable
+from typing import Any
 
 import torch
 
@@ -300,6 +301,165 @@ def time_triton(
     )
 
 
+def plugin_case(lengths: list[int], dims: int, g: int) -> tuple:
+    """A paged cache of the plugin's native layout (`bux_vllm.dsa.Region` after `g`
+    kv heads of 64 dims a key and a value), random keys, values and indexer keys
+    of requests of `lengths`, and the same in its PyTorch layout (spread rows)."""
+    from bux_vllm import dsa, picks
+
+    blocks = sum(-(-n // PAGE) for n in lengths) + 1
+    cache = torch.zeros(blocks, g + 1, PAGE, 128, dtype=torch.bfloat16, device="cuda")
+    spread = torch.zeros(blocks, g, PAGE, 128 + -(-dims // g), device="cuda")
+    table = torch.zeros(len(lengths), -(-max(lengths) // PAGE), dtype=torch.int32)
+    table = table.cuda()
+    order, at = torch.randperm(blocks - 1, device="cuda") + 1, 0
+    for r, n in enumerate(lengths):
+        count = -(-n // PAGE)
+        table[r, :count] = order[at : at + count].int()
+        at += count
+        pos = torch.arange(n, device="cuda")
+        slots = table[r, pos // PAGE].long() * PAGE + pos % PAGE
+        kv = torch.randn(n, g, 128, device="cuda", dtype=torch.bfloat16)
+        keys = torch.randn(n, dims, device="cuda", dtype=torch.bfloat16)
+        picks.write(cache[:, :g], slots, kv)
+        dsa.Region(cache, g, dims).write(slots, keys)
+        picks.write(spread, slots, picks.merged(kv.float(), keys.float()))
+    return cache, spread, table
+
+
+def fp8_scores(
+    region: Any,
+    index: tuple[torch.Tensor, torch.Tensor],
+    rows: torch.Tensor,
+    positions: torch.Tensor,
+    n: int,
+) -> torch.Tensor:
+    """The scores the kernels pick by, by PyTorch over the same FP8 keys and
+    queries, (Q, n): -inf for a key a query does not see."""
+    q8, w = index
+    scores = reference(q8.float(), w, region.dequantized(rows, n))
+    see = torch.arange(n, device="cuda") <= positions[:, None]
+    return scores.masked_fill(~see, float("-inf"))
+
+
+def picked_as_best(chosen: torch.Tensor, scores: torch.Tensor) -> bool:
+    """Whether the picks `chosen`, (Q, K) with -1 for none, score as the best K of
+    `scores` do, within float32's rounding of them (two top-k's may break a near
+    tie apart)."""
+    k = min(chosen.shape[1], scores.shape[1])
+    got = scores.gather(1, chosen.clamp(min=0).long())
+    got = got.masked_fill(chosen < 0, float("-inf")).sort(-1, descending=True).values
+    want = scores.topk(k, -1).values
+    finite = want > float("-inf")
+    close = (got[:, :k] - want).abs() <= 1e-4 * scores.abs().nan_to_num(0, 0, 0).max()
+    return bool((close | ~finite).all() and (got[:, :k].isinf() == ~finite).all())
+
+
+def check_plugin(decoding: bool) -> bool:
+    """The plugin's native path, `bux_vllm.dsa`'s picks and `bux_vllm.kernels`'
+    attention over them, against PyTorch: its picks against the best of the same
+    FP8 scores, its output against PyTorch's attention over them, and the share of
+    bux's float32 picks (`bux_vllm.picks`) it agrees with; then the attention over
+    an FP8 KV cache against the bfloat16 one's."""
+    from bux_vllm import dsa, kernels, picks
+
+    torch.manual_seed(0)
+    h, g, dk, heads, dims, top_k = 8, 2, 64, 4, 64, 64
+    lengths = [300, 97, 1, 513] if decoding else [700]
+    cache, spread, table = plugin_case(lengths, dims, g)
+    n = max(lengths)
+    if decoding:
+        positions = torch.tensor([m - 1 for m in lengths], device="cuda")
+        rows = table
+    else:
+        positions = torch.arange(n, device="cuda")
+        rows = table[:1].expand(n, -1)
+    q = torch.randn(len(positions), h, dk, device="cuda", dtype=torch.bfloat16)
+    iq = torch.randn(len(positions), heads, dims, device="cuda", dtype=torch.bfloat16)
+    iw = torch.randn(len(positions), heads, device="cuda")
+    region = dsa.Region(cache, g, dims)
+    index = dsa.queries(iq, iw, dsa.padded_heads(heads))
+    if decoding:
+        lens = (positions + 1).int()[:, None].contiguous()
+        step = dsa.Decoding(lens, dsa.schedule(lens, PAGE), 1024)
+        chosen = dsa.decode(region, index, table, step, top_k, "auto")
+        best = all(
+            picked_as_best(
+                chosen[r : r + 1],
+                fp8_scores(
+                    region,
+                    (index[0][r : r + 1], index[1][r : r + 1]),
+                    table[r : r + 1],
+                    positions[r : r + 1],
+                    m,
+                ),
+            )
+            for r, m in enumerate(lengths)
+        )
+    else:
+        chosen = dsa.prompt(region, index, table[:1], n, positions, top_k)
+        best = picked_as_best(
+            chosen, fp8_scores(region, index, table[:1], positions, n)
+        )
+    spec = picks.Sparse(top_k, 1, False, False, True, None, dk**-0.5, None, dk, (0, g))
+    kept = dsa.as_picks(chosen)
+    got = kernels.attend(spec, q, cache[:, :g], rows, kept)
+    kv = picks.gather(cache[:, :g], rows, kept[0])
+    ref = picks.attend(q, kv, kept[1][:, None], dk, spec.scale)
+    error = (got.float() - ref.float()).abs().max().item()
+    bux = picks.attend_segment(
+        spec,
+        q.float(),
+        (iq.float(), iw),
+        positions,
+        picks.Cache(spread, 128, dims),
+        table[:1] if not decoding else table,
+        n,
+    )[1]
+    ours = torch.where(kept[1], kept[0], -1).sort(-1).values
+    theirs = torch.where(bux[1], bux[0], -1).sort(-1).values
+    agree = (ours == theirs).float().mean().item()
+    fp8 = cache[:, :g].float().clamp(-448, 448).to(torch.float8_e4m3fn)
+    got8 = kernels.attend(spec, q, fp8, rows, kept)
+    error8 = (got8.float() - got.float()).abs().max().item()
+    layout = "decoding" if decoding else "prefill"
+    print(
+        f"plugin native {layout}: picks as FP8's best {best}, output error "
+        f"{error:.1e}, agreeing with bux's float32 picks {agree:.3f}; "
+        f"FP8 KV error {error8:.1e}"
+    )
+    return best and error < 2e-2 and error8 < 0.25
+
+
+def time_attention(n: int, b: int, ctx: int) -> None:
+    """The Triton attention over each query's top 2048 at the timeline's width
+    2816 (44 query heads of 64 over 11 kv heads), for a prompt of `n` tokens and a
+    decoding step of `b` requests of `ctx`, in bfloat16 and over an FP8 cache."""
+    from bux_vllm import kernels, picks
+
+    h, g, dk, top_k = 44, 11, 64, 2048
+    blocks = -(-max(n, ctx) // PAGE) * b + 1
+    cache = torch.randn(blocks, g, PAGE, 2 * dk, device="cuda", dtype=torch.bfloat16)
+    fp8 = cache.clamp(-448, 448).to(torch.float8_e4m3fn)
+    spec = picks.Sparse(top_k, 1, False, False, True, None, dk**-0.5, None, dk, (0, g))
+    for what, count, length in (("prompt", n, n), ("decode", b, ctx)):
+        requests = 1 if what == "prompt" else count  # a prompt's queries share one
+        width = -(-length // PAGE)
+        table = torch.randint(1, blocks, (requests, width), device="cuda").int()
+        table = table.expand(count, -1)
+        pos = torch.arange(count, device="cuda") % length if what == "prompt" else None
+        pos = torch.full((count,), length - 1, device="cuda") if pos is None else pos
+        keys = (torch.rand(count, top_k, device="cuda") * (pos[:, None] + 1)).long()
+        kept = (keys, keys <= pos[:, None])
+        q = torch.randn(count, h, dk, device="cuda", dtype=torch.bfloat16)
+        args = (q, table, kept)
+        bf16 = timed(lambda c=cache, a=args: kernels.attend(spec, a[0], c, *a[1:]))
+        f8 = timed(lambda c=fp8, a=args: kernels.attend(spec, a[0], c, *a[1:]))
+        print(
+            f"attention {what} of {count}: bfloat16 {bf16:.2f} ms, FP8 KV {f8:.2f} ms"
+        )
+
+
 def attempt(name: str, check: Callable[[], bool | None]) -> bool:
     """Run `check`, printing what it raises; whether it passed."""
     try:
@@ -343,6 +503,9 @@ def main() -> int:
             lambda h=heads, d=dims, k=top_k: check_decode(h, d, k, [20000] * 64, 32768),
         )
     attempt("triton", lambda: time_triton(4, 64, 2048, 16384, 64, 20000, 32768))
+    for decoding in (False, True):
+        results.append(attempt("plugin", lambda d=decoding: check_plugin(d)))
+    attempt("attention", lambda: time_attention(16384, 64, 20000))
     print("all agree" if all(results) else "MISMATCH")
     return 0 if all(results) else 1
 

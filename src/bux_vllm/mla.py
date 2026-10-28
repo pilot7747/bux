@@ -319,9 +319,10 @@ class LatentAttention(Layer):
         )
         what = "mla with an indexer" if ix else "mla reading its index port"
         index_dims = ix["head_dim"] if ix else 0
-        self.caches = sparse.layer_caches(
-            self.spec, 1, dims, index_dims, names, site.vllm_config, what
-        )
+        dtype = site.vllm_config.model_config.dtype
+        native, _ = sparse.paths(self.spec, ix, (dims, dims), dtype)
+        args = (names, site.vllm_config, what, native)
+        self.caches = sparse.layer_caches(self.spec, 1, dims, index_dims, *args)
 
     def targets(self) -> dict[str, tuple[nn.Parameter, tuple]]:
         out: dict[str, tuple[nn.Parameter, tuple]] = {}
