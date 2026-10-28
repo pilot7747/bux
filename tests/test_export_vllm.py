@@ -10,6 +10,7 @@ import importlib.util
 import itertools
 import json
 import math
+from functools import cache
 from pathlib import Path
 from types import ModuleType, SimpleNamespace
 from typing import Any
@@ -492,8 +493,7 @@ def through(branches: list, x: Any, ctx: Any, body: torch.Tensor) -> tuple[list,
     return reads, x
 
 
-@pytest.mark.parametrize("setting", RESIDUALS.values(), ids=RESIDUALS.keys())
-def test_residual_branches_compute_what_the_export_does(setting: str) -> None:
+def compare_branches(setting: str) -> None:
     """Six branches of the algebra, then a merge, of one row of tokens: the
     plugin's, on the tokens side by side, read what the export's do."""
     c, d = algebra(setting), 16
@@ -505,10 +505,7 @@ def test_residual_branches_compute_what_the_export_does(setting: str) -> None:
     tokens, body = torch.randn(5, d), torch.randn(d, d) / d**0.5
     copies = hf_residual.widening(c)
     x = tokens[None] if copies is None else hf_residual.widen(tokens[None], copies)
-    ctx, ctx_mine = (
-        SimpleNamespace(pending_read=None),
-        SimpleNamespace(pending_read=None),
-    )
+    ctx, ctx_mine = stand_in(pending_read=None), stand_in(pending_read=None)
     reads, x = through(theirs, x, ctx, body)
     got, y = through(mine, residual.widen(c, tokens), ctx_mine, body)
     for g, h in zip(got, reads, strict=True):
@@ -523,6 +520,155 @@ def test_residual_branches_compute_what_the_export_does(setting: str) -> None:
     torch.testing.assert_close(merge_mine(y, ctx_mine), merge(x, ctx)[0])
 
 
+@pytest.mark.parametrize("setting", RESIDUALS.values(), ids=RESIDUALS.keys())
+def test_residual_branches_compute_what_the_export_does(setting: str) -> None:
+    compare_branches(setting)
+
+
+def hc_read(
+    x: torch.Tensor,
+    static_alpha: torch.Tensor,
+    static_beta: torch.Tensor | None,
+    wa: torch.Tensor | None,
+    wb: torch.Tensor | None,
+    scale_a: torch.Tensor | None,
+    scale_b: torch.Tensor | None,
+    pending: torch.Tensor | None,
+    h: torch.Tensor,
+    coef: torch.Tensor,
+    eps: float,
+    mode: int,
+) -> None:
+    """What `bux_vllm.streams.hc_read` computes, in PyTorch: the layernorm's dot
+    products as ``rstd (x W - mean sum(W))``, A's columns and then B's."""
+    t, n, d = x.shape
+    k, columns = static_alpha.shape[1], coef.shape[2]
+    out = torch.zeros(t, n, columns)
+    out[..., :k] = static_alpha.float()
+    if static_beta is not None:
+        out[..., k] = static_beta.float()
+    if wa is not None and scale_a is not None:
+        w, scale = torch.zeros(d, columns), torch.full((columns,), float(scale_a))
+        w[:, :k] = wa.float()
+        if wb is not None and scale_b is not None:
+            w[:, k], scale[k] = wb.float()[:, 0], float(scale_b)
+        xf = x.float()
+        mean, square = xf.mean(-1, keepdim=True), xf.square().mean(-1, keepdim=True)
+        rstd = torch.rsqrt((square - mean**2).clamp(min=0) + eps)
+        out += scale * torch.tanh(rstd * (xf @ w - mean * w.sum(0)))
+    coef.zero_()
+    coef[:, :n] = out
+    mix_into(h, x, out[..., 0], pending, mode)
+
+
+def mix_into(
+    h: torch.Tensor, x: torch.Tensor, own: torch.Tensor, pending: Any, mode: int
+) -> None:
+    """A fused read's ``sum_j r_j x_j`` into `h`, r as `mode` says."""
+    r = own if mode == residual.OWN else pending
+    if mode == residual.FIRST:
+        r = torch.zeros_like(own)
+        r[:, 0] = 1
+    h.copy_((r.float()[..., None] * x.float()).sum(1))
+
+
+def mhc_read(
+    x: torch.Tensor,
+    proj: torch.Tensor | None,
+    scale: torch.Tensor | None,
+    bias: torch.Tensor,
+    pending: torch.Tensor | None,
+    h: torch.Tensor,
+    logits: torch.Tensor,
+    read: torch.Tensor,
+    eps: float,
+    mode: int,
+) -> None:
+    """What `bux_vllm.streams.mhc_read` computes, in PyTorch."""
+    t, n, d = x.shape
+    k = bias.shape[0]
+    out = bias.float().expand(t, k)
+    if proj is not None and scale is not None:
+        flat = x.float().reshape(t, n * d)
+        rms = torch.rsqrt(flat.square().mean(-1, keepdim=True) + eps)
+        widths = [n, n, n * n][: scale.shape[0]]
+        a = torch.cat([s.float().expand(w) for s, w in zip(scale, widths)])
+        out = flat @ proj.float() * rms * a[:k] + bias.float()
+    logits.zero_()
+    logits[:, :k] = out
+    read.zero_()
+    read[:, :n] = torch.sigmoid(out[:, :n]) + residual.EPS
+    mix_into(h, x, read[:, :n], pending, mode)
+
+
+def mix_write(
+    x: torch.Tensor,
+    y: torch.Tensor,
+    m: torch.Tensor,
+    b: torch.Tensor,
+    out: torch.Tensor,
+    iters: int,
+) -> None:
+    """What `bux_vllm.streams.mix_write` computes, in PyTorch."""
+    m, b = m.float(), b.float()
+    if iters:
+        m, b = residual.sinkhorn(m, iters), 2 * torch.sigmoid(b)
+    mixed = (
+        torch.einsum("tjk,tjd->tkd", m, x.float()) + b[..., None] * y.float()[:, None]
+    )
+    out.copy_(mixed)
+
+
+def attnres_read(
+    done: torch.Tensor,
+    partial: torch.Tensor | None,
+    gain: torch.Tensor,
+    query: torch.Tensor,
+    h: torch.Tensor,
+    eps: float,
+) -> None:
+    """What `bux_vllm.streams.attnres_read` computes, in PyTorch."""
+    v = done.float()
+    if partial is not None:
+        v = torch.cat([v, partial.to(done.dtype).float()[:, None]], 1)
+    rstd = torch.rsqrt(v.square().mean(-1) + eps)
+    scores = rstd * (v * (gain * query).float()).sum(-1)
+    h.copy_((scores.softmax(-1)[..., None] * v).sum(1))
+
+
+@cache
+def kernels_in_pytorch() -> torch.library.Library:
+    """Register the plugin's fused ops (`bux_vllm.streams`) as their computations in
+    PyTorch, on the CPU, as vLLM does them with Triton on a GPU; return their
+    library, which the cache keeps alive as long as the ops."""
+    library = torch.library.Library("vllm", "FRAGMENT")
+    ops = {
+        "bux_hc_read": (hc_read, ["h", "coef"]),
+        "bux_mhc_read": (mhc_read, ["h", "logits", "read"]),
+        "bux_mix_write": (mix_write, ["out"]),
+        "bux_attnres_read": (attnres_read, ["h"]),
+    }
+    for name, (fn, mutated) in ops.items():
+        library.define(name + torch.library.infer_schema(fn, mutates_args=mutated))
+        library.impl(name, fn, "CPU")
+    return library
+
+
+FUSED = {k: v for k, v in RESIDUALS.items() if k.split()[0] in ("hc", "mhc", "attnres")}
+
+
+@pytest.mark.parametrize("setting", FUSED.values(), ids=FUSED.keys())
+def test_fused_branches_compute_what_the_export_does(
+    setting: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The fused path, each kernel's computation in PyTorch: the coefficients'
+    layout, the views the writes take of them, single-pass reads, attnres's
+    stacked sources, and the merge, as the export computes them."""
+    kernels_in_pytorch()
+    monkeypatch.setattr(residual, "fused", lambda: True)
+    compare_branches(setting)
+
+
 def test_attnres_states_sum_and_scale_as_the_exports() -> None:
     """attnres's states, summed and scaled as a graph may, read as the export's
     stacked ones do."""
@@ -533,7 +679,7 @@ def test_attnres_states_sum_and_scale_as_the_exports() -> None:
     rows = torch.randn(2, 5, 4, d)  # 2 states of 5 tokens: the embedding, 3 outputs
     states = []
     for row in rows:
-        state = residual.Sources((row[:, 0],))
+        state = residual.widen(c, row[:, 0])
         for i in (1, 2, 3):
             state = state.add(row[:, i], c["block_size"])
         states.append(state)
