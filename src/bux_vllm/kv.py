@@ -1,7 +1,7 @@
-"""What a ``gqa`` layer does to its keys and values besides attending, in plain
-PyTorch: its ports, the value residual of its ``v`` port, the kv heads a rank keeps
-under tensor parallelism, and its conv's taps (``kv_conv_size``) as vLLM's conv
-kernels take them.
+"""What a ``gqa`` layer does to its queries, keys and values besides attending, in
+plain PyTorch: its ports, the value residual of its ``v`` port, the kv heads a rank
+keeps under tensor parallelism, its conv's taps (``kv_conv_size``) as vLLM's conv
+kernels take them, and the queries' scale by their position.
 
 A port is ``[name, tap, mode]``, as ``bux.export.plan`` writes it: ``attn(v=@v1)``
 writes the layer's values to the tap ``v1`` (``write``), ``attn(v=$v1)`` reads them
@@ -95,3 +95,18 @@ def conv_rows(taps: torch.Tensor, dims: int, first: int, n: int) -> torch.Tensor
     """bux's taps of a conv on keys or values, (k, g dims), cut to the `n` kv heads
     from `first` on, as rows of vLLM's conv weight, (n dims, k)."""
     return taps[:, first * dims : (first + n) * dims].T.contiguous()
+
+
+def query_scale(c: dict, positions: torch.Tensor) -> torch.Tensor | None:
+    """The factor on each query, (T,) in float32, at its position n counted from 1:
+    ``(1 + n / power_scale_length) ** power_scale`` (Beam), times ``1 + log_scale
+    ln(max(n / log_scale_floor, 1))`` (Inkling), which bux puts on the logits before
+    soft-capping and so scales them as on the queries; None for neither."""
+    n, out = positions.float() + 1, None
+    if c["power_scale"] is not None:
+        out = torch.exp(c["power_scale"] * torch.log1p(n / c["power_scale_length"]))
+    if c["log_scale"] is not None:
+        ahead = (n / c["log_scale_floor"]).clamp(min=1.0)
+        gain = 1 + c["log_scale"] * torch.log(ahead)
+        out = gain if out is None else out * gain
+    return out

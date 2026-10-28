@@ -21,6 +21,7 @@ import torch.nn.functional as F
 from flax import nnx
 
 from bux import config as cfg
+from bux.architecture.attention import gqa as bux_gqa
 from bux.architecture.attention import rope as bux_rope
 from bux.architecture.attention.gqa import Attention as BuxAttention
 from bux.architecture.experts.moe import MoE
@@ -114,6 +115,17 @@ def test_layers_after_the_first_head_are_not_live() -> None:
     live = plan.live(plan.plan(arch.model_dump(mode="json")).calls)
     assert [c.path for c in live][-1] == "model.shared.out"
     assert sum(c.layer["config"]["type"] == "gqa" for c in live) == 1
+
+
+def test_a_sparse_layer_keeps_its_indexer_keys_beside_its_kv_cache() -> None:
+    arch = compile(vllm_parity.CASES["dsa"])
+    layer = next(n for n in arch.layers() if n.config.type == "gqa")
+    assert config.states(layer.config.model_dump(mode="json")) == [
+        "full_attention",
+        "index",
+    ]
+    c = config.BuxConfig(bux=json.loads(arch.model_dump_json()))
+    assert c.layer_types == ["full_attention"] * 2
 
 
 def test_a_conv_on_keys_and_values_keeps_a_state_beside_the_kv_cache() -> None:
@@ -634,3 +646,135 @@ def test_a_layers_ports_are_as_the_exports_sites_give_them(name: str) -> None:
     for call in (c for c in tree.calls if c.first):
         assert plan.ports(call.layer) == sites[call.path]["ports"]
     assert any(plan.ports(c.layer) for c in tree.calls)
+
+
+def test_queries_scale_by_their_position_as_bux_scales_them() -> None:
+    c = {"power_scale": 0.3, "power_scale_length": 8}
+    c |= {"log_scale": 0.5, "log_scale_floor": 4}
+    at = jax.numpy.arange(40)
+    power = bux_gqa._power_scale(at, 0.3, 8)[:, 0, 0]
+    length = bux_gqa._length_scale(at, 0.5, 4)[:, 0]
+    got = kv.query_scale(c, torch.arange(40))
+    assert got is not None
+    np.testing.assert_allclose(got.numpy(), np.asarray(power * length), rtol=1e-6)
+    none = {"power_scale": None, "log_scale": None}
+    assert kv.query_scale(none, torch.arange(4)) is None
+
+
+INDEXERS = {
+    "dsa": {"num_heads": 2, "head_dim": 8, "top_k": 4},
+    "plain sum, norm": {
+        "num_heads": 2,
+        "head_dim": 8,
+        "top_k": 5,
+        "weighted": False,
+        "norm": {"type": "rmsnorm"},
+    },
+    "plain dots": {"num_heads": 2, "head_dim": 8, "top_k": 4, "relu": False},
+    "mean blocks": {"num_heads": 2, "head_dim": 8, "top_k": 4, "block_size": 2},
+    "mean blocks of 3": {
+        "num_heads": 2,
+        "head_dim": 8,
+        "top_k": 6,
+        "block_size": 3,
+        "weighted": False,
+        "norm": {"type": "rmsnorm"},
+    },
+    "max blocks": {
+        "num_heads": 2,
+        "head_dim": 8,
+        "top_k": 4,
+        "block_size": 2,
+        "pool": "max",
+    },
+    "per group": {
+        "num_heads": 2,
+        "head_dim": 8,
+        "top_k": 4,
+        "per_group": True,
+        "weighted": False,
+    },
+    "msa": {
+        "num_heads": 2,
+        "head_dim": 8,
+        "top_k": 6,
+        "block_size": 3,
+        "pool": "max",
+        "per_group": True,
+        "relu": False,
+        "weighted": False,
+        "norm": {"type": "rmsnorm", "zero_centered": True},
+    },
+}
+
+
+@pytest.mark.parametrize("window", [None, 5], ids=["causal", "window"])
+@pytest.mark.parametrize("c", INDEXERS.values(), ids=INDEXERS.keys())
+def test_sparse_attention_over_paged_caches_is_bux_s(c: dict, window: int | None):
+    """The plugin's indexer and its attention over the picked keys of paged caches
+    (bux_vllm.picks) give what the export's indexer and softmax give over all keys
+    with its mask, for one request's queries together and one at a time."""
+    from bux.export.hf import attention as hf_attention
+    from bux.export.hf import sparse as hf_sparse
+    from bux_vllm import indexer as plugin_indexer
+    from bux_vllm import picks
+
+    torch.manual_seed(0)
+    ix = cfg.SparseIndexerConfig.model_validate(c).model_dump(mode="json")
+    rope = cfg.RoPEConfig().model_dump(mode="json")
+    width, s, h, g, dk = 16, 23, 4, 2, 8
+    theirs = hf_sparse.Indexer(ix, width, width, rope, dk)
+    for p in theirs.parameters():
+        p.data.normal_()
+    ours = plugin_indexer.Indexer(ix, width, rope, dk)
+    ours.load_state_dict(theirs.state_dict())
+    x, at = torch.randn(s, width), torch.arange(s)
+    see = picks.seen(at, s, window)
+    keys = theirs.keys(x[None], at[None])
+    kept, _ = theirs(x[None], x[None], at[None], keys, see[None], at[None])
+    q, k, v = (
+        torch.randn(1, h, s, dk),
+        torch.randn(1, g, s, dk),
+        torch.randn(1, g, s, dk),
+    )
+    keep = see[None, None] & hf_attention.per_head(kept, h)
+    sinks = torch.randn(h)
+    want = hf_attention.softmax_attention(q, k, v, keep, 0.3, 4.0, sinks)[0]
+    block, blocks = 4, 9
+    table = torch.randperm(blocks)[None]
+    kv_cache = torch.zeros(blocks, g, block, 2 * dk)
+    index_cache = torch.zeros(blocks, 1, block, ix["head_dim"])
+    slots = table[0, at // block] * block + at % block
+    picks.write(kv_cache, slots, torch.cat([k[0], v[0]], -1).transpose(0, 1))
+    picks.write(index_cache, slots, ours.keys(x, at)[:, None])
+    spec = picks.Sparse(
+        ix["top_k"],
+        ix["block_size"],
+        ix["block_size"] > 1 and ix["pool"] == "mean",
+        ix["per_group"],
+        ix["relu"],
+        window,
+        0.3,
+        4.0,
+        dk,
+        (0, g),
+        sinks,
+        ours,
+    )
+    index = (ours.queries(x, at), ours.head_weights(x))
+    qs = q[0].transpose(0, 1)
+    caches = (kv_cache, index_cache)
+    together = picks.attend_segment(spec, qs, index, at, caches, (table, table), s)
+    rows = table.expand(s, -1)
+    alone = picks.attend_segment(spec, qs, index, at, caches, (rows, rows), s)
+    torch.testing.assert_close(together, want, rtol=1e-5, atol=1e-5)
+    torch.testing.assert_close(alone, want, rtol=1e-5, atol=1e-5)
+
+
+def test_the_step_splits_into_single_queries_and_requests() -> None:
+    from bux_vllm import picks
+
+    parts = picks.segments([0, 1, 5, 6, 9], [7, 30, 2, 12], "cpu")
+    assert [p.tokens.tolist() for p in parts] == [[0, 5], [1, 2, 3, 4], [6, 7, 8]]
+    assert [p.requests.tolist() for p in parts] == [[0, 2], [1], [3]]
+    assert [p.keys for p in parts] == [7, 30, 12]

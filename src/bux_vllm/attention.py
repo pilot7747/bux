@@ -18,7 +18,7 @@ from vllm.model_executor.layers.linear import (
     RowParallelLinear,
 )
 
-from . import kv
+from . import kv, picks
 from .common import (
     ACTIVATIONS,
     Ctx,
@@ -32,19 +32,27 @@ from .common import (
 )
 from .config import states
 from .conv import CausalConv
+from .indexer import Indexer, rotated
+from .sparse import PagedCache, split_graphs
 
 
 class Attention(Layer):
     """bux's ``gqa``: q, k and v by one column-parallel projection, the causal conv
     on k and v added to them (``kv_conv_size``), the values mixed with those of its
     ``v`` port (the value residual) and pushed to it, QK-norm then RoPE (in float32,
-    as bux), causal softmax attention with its sliding window, soft-capping and sinks
-    by vLLM's attention layer, each head's output norm and gate, and the
-    row-parallel output projection.
+    as bux), the queries scaled by their position (``power_scale``, ``log_scale``),
+    causal softmax attention with its sliding window, soft-capping and sinks by
+    vLLM's attention layer, each head's output norm and gate (with a bias per head),
+    and the row-parallel output projection.
 
-    Each call of the layer keeps a KV cache of its own, and a conv state beside it
-    with ``kv_conv_size``: a shared layer that runs three times makes three of
-    vLLM's attention layers (and convs), over the same weights.
+    With an indexer, each query attends to the keys the indexer picks alone, as
+    bux's do (DSA, and its blocks: QSA's, MSA's), by the plugin's sparse attention
+    op over vLLM's paged caches (`bux_vllm.sparse`).
+
+    Each call of the layer keeps a KV cache of its own, a conv state beside it with
+    ``kv_conv_size``, and its indexer's keys with an indexer: a shared layer that
+    runs three times makes three of vLLM's attention layers (and convs), over the
+    same weights.
     """
 
     bux_types = ("gqa",)
@@ -52,8 +60,7 @@ class Attention(Layer):
 
     def __init__(self, c: dict, width: int, site: Site):
         super().__init__()
-        unsupported(c, "indexer", "relative_bias", "log_scale")
-        unsupported(c, "power_scale", *(("gate_head_bias",) if c["gated"] else ()))
+        unsupported(c, "relative_bias")
         if c["qk_norm"] and c["qk_norm_all_heads"]:
             # Its statistics would sum over every rank's heads under tensor parallelism.
             raise NotImplementedError("gqa: qk_norm_all_heads not in vLLM yet")
@@ -84,22 +91,27 @@ class Attention(Layer):
         self.k_norm = Norm(qk, dk) if qk else None
         self.out_norm = Norm(out, dv) if out else None
         self.rope = Rope(c["rope"], dk) if c["rope"] else None
+        self.c = c
         self._value_residual(c, site.ports)
         self.sinks = _sinks(self.h) if c["sinks"] else None
         self.kv_first = kv.kv_heads(g, tp, get_tensor_model_parallel_rank())[0]
-        self._caches(c, site)
+        self.scale = (c["scale"] or dk**-0.5) * logit_gain(c["rope"])
+        kinds = states(c)  # a call's states, side by side in site.caches
+        names = {kind: site.caches[i :: len(kinds)] for i, kind in enumerate(kinds)}
+        self.indexer = None
+        if c["indexer"]:
+            self._sparse_caches(c, width, site, names)
+        else:
+            self._caches(c, site, names["full_attention"])
+        self._convs(c, site, names.get("conv", []))
 
-    def _caches(self, c: dict, site: Site) -> None:
-        """Make each call's state: vLLM's attention layer with its KV cache, and the
-        conv on keys and values with its state under ``kv_conv_size``, all calls'
-        over the same weights."""
-        scale = (c["scale"] or self.dk**-0.5) * logit_gain(c["rope"])
-        n = len(states(c))  # a call's states, side by side in site.caches
+    def _caches(self, c: dict, site: Site, names: list[str]) -> None:
+        """Make each call's vLLM attention layer, with its KV cache."""
         self.caches = nn.ModuleList(
             PagedAttention(
                 self.h,
                 self.dk,
-                scale,
+                self.scale,
                 num_kv_heads=self.g,
                 cache_config=site.vllm_config.cache_config,
                 logits_soft_cap=c["softcap"],
@@ -108,14 +120,50 @@ class Attention(Layer):
                 sinks=self.sinks,
                 head_size_v=self.dv,
             )
-            for name in site.caches[::n]
+            for name in names
         )
+
+    def _sparse_caches(
+        self, c: dict, width: int, site: Site, names: dict[str, list[str]]
+    ) -> None:
+        """Make the indexer, and each call's caches of keys and values and of the
+        indexer's keys, which the sparse attention op reads (`bux_vllm.sparse`)."""
+        ix = c["indexer"]
+        self.indexer = Indexer(ix, width, c["rope"], rotated(self.dk, c["rope"]))
+        spec = picks.Sparse(
+            ix["top_k"],
+            ix["block_size"],
+            self.indexer.mean,
+            ix["per_group"],
+            ix["relu"],
+            c["sliding_window_size"],
+            self.scale,
+            c["softcap"],
+            self.dk,
+            (self.kv_first, self.g),
+            self.sinks,
+            self.indexer,
+        )
+        vllm = site.vllm_config
+        main, index = names["full_attention"], names["index"]
+        self.index_caches = nn.ModuleList(
+            PagedCache(1, ix["head_dim"], vllm, name) for name in index
+        )
+        channels = self.dk + self.dv
+        self.caches = nn.ModuleList(
+            PagedCache(self.g, channels, vllm, name, spec, index_name)
+            for name, index_name in zip(main, index, strict=True)
+        )
+        split_graphs(vllm)
+
+    def _convs(self, c: dict, site: Site, names: list[str]) -> None:
+        """Make each call's conv on keys and values, with its state, under
+        ``kv_conv_size``: all calls' over the same weights."""
         self.convs, self.conv_weight = None, None
         if size := c["kv_conv_size"]:
             channels = self.g * (self.dk + self.dv)
             convs = [
-                CausalConv(channels, size, site.vllm_config, name)
-                for name in site.caches[1::n]
+                CausalConv(channels, size, site.vllm_config, name) for name in names
             ]
             self.conv_weight = convs[0].weight
             for other in convs[1:]:
@@ -125,13 +173,16 @@ class Attention(Layer):
     def _gate(self, c: dict, width: int, heads_dv: int, path: str) -> None:
         """Make the gate on the heads' outputs, ``act(W_g x)``, a value a channel or
         a head (``gate_per_head``), column-parallel by head; None without one."""
-        self.gate = None
+        self.gate, self.gate_bias = None, None
         self.gate_activation = ACTIVATIONS[c["gate_activation"]]
         if c["gated"]:
             n = c["num_heads"] if c["gate_per_head"] else heads_dv
             self.gate = ColumnParallelLinear(
                 width, n, bias=c["bias"], return_bias=False, prefix=f"{path}.gate"
             )
+        if c["gated"] and c["gate_head_bias"]:
+            self.gate_bias = nn.Parameter(torch.zeros(self.h), requires_grad=False)
+            self.gate_bias.weight_loader = sharded_loader(0)  # ty: ignore[unresolved-attribute]
 
     def _value_residual(self, c: dict, layer_ports: list) -> None:
         """Keep the layer's ports, and the learned weights of its value residual
@@ -160,6 +211,11 @@ class Attention(Layer):
             out["sinks"] = (self.sinks, ())
         if self.v_mix is not None:
             out["v_mix"] = (self.v_mix, ())
+        if self.gate_bias is not None:
+            out["gate_bias"] = (self.gate_bias, ())
+        if self.indexer is not None:
+            params = self.indexer.named_parameters()
+            out |= {f"indexer.{name}": (p, ()) for name, p in params}
         return out
 
     def load(self, name: str, tensor: torch.Tensor) -> list[nn.Parameter]:
@@ -187,9 +243,42 @@ class Attention(Layer):
             q, k = self.q_norm(q), self.k_norm(k)
         if self.rope is not None:
             q, k = self.rope(q, ctx.positions), self.rope(k, ctx.positions)
-        q, k = q.reshape(t, -1).contiguous(), k.reshape(t, -1).contiguous()
-        out = self.caches[call](q, k, v.contiguous()).view(t, self.h, self.dv)
+        if (scale := kv.query_scale(self.c, ctx.positions)) is not None:
+            q = (q * scale[:, None, None]).to(q.dtype)
+        if self.indexer is not None:
+            out = self._sparse(x, q, k, v, call, ctx)
+        else:
+            q, k = q.reshape(t, -1).contiguous(), k.reshape(t, -1).contiguous()
+            out = self.caches[call](q, k, v.contiguous()).view(t, self.h, self.dv)
         return self.o(self._gated(x, out).reshape(t, -1))
+
+    def _sparse(
+        self,
+        x: torch.Tensor,
+        q: torch.Tensor,
+        k: torch.Tensor,
+        v: torch.Tensor,
+        call: int,
+        ctx: Ctx,
+    ) -> torch.Tensor:
+        """The heads' outputs, (T, h, dv), of attending to the keys the indexer
+        picks, by the sparse attention op over the `call`-th call's caches."""
+        assert self.indexer is not None
+        at = ctx.positions
+        index = self.indexer
+        out = q.new_empty(q.shape[0], self.h, self.dv)
+        torch.ops.vllm.bux_sparse_attention(
+            q.contiguous(),
+            k.contiguous(),
+            v.view(-1, self.g, self.dv).contiguous(),
+            index.queries(x, at).contiguous(),
+            index.head_weights(x).contiguous(),
+            index.keys(x, at).contiguous(),
+            at,
+            out,
+            self.caches[call].prefix,
+        )
+        return out
 
     def _project(self, x: torch.Tensor, call: int) -> list[torch.Tensor]:
         """q, k and v of x, (T, _) each, with the conv added to k and v (by the
@@ -217,8 +306,10 @@ class Attention(Layer):
             out = self.out_norm(out)
         if self.gate is None:
             return out
-        gate = self.gate_activation(self.gate(x))
-        return out * gate.view(out.shape[0], self.h, -1)
+        gate = self.gate(x).view(out.shape[0], self.h, -1)
+        if self.gate_bias is not None:
+            gate = gate + self.gate_bias.to(gate.dtype)[:, None]
+        return out * self.gate_activation(gate)
 
 
 def _sinks(heads: int) -> nn.Parameter:
