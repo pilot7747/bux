@@ -265,6 +265,9 @@ by those dims and the GPU. On a B300 (SM 10.x):
   them), and vLLM picks among them. For any other dims the plugin uses
   FlashAttention's MLA prefill, which on a B300 (FlashAttention 4) takes query, key
   and value heads of 8 to 128 dims.
+- **Cached context.** A prompt's chunk attends to the latents its earlier chunks
+  cached, or a cached prefix's, by gathering them first. vLLM's gather kernel takes
+  320, 512 or 576 values per token; the plugin gathers other sizes in PyTorch.
 
 To pick the decoding backend yourself, name it, as for any model:
 
@@ -371,9 +374,11 @@ it was.
 
 The script's `mla` cases check multi-head latent attention, in bfloat16 only:
 `mla` with a latent of 256 and 32 rotated dims (Triton's MLA), `mla-moe` the same
-beside a sigmoid MoE, and `mla-deepseek` at DeepSeek-V3's dims (FlashInfer's), with
-a query latent, interleaved YaRN, a gate per head and an output norm. The table
-above does not cover them.
+beside a sigmoid MoE, `mla-chunked` the same prefilled 16 tokens per step
+(`max_num_batched_tokens=16`), so that each later chunk attends to the cached
+latents, and `mla-deepseek` at DeepSeek-V3's dims (FlashInfer's), with a query
+latent, interleaved YaRN, a gate per head and an output norm. The table above does
+not cover them.
 
 The script's `csa` cases check compressed sparse attention, in float32 and
 bfloat16: `csa` the timeline's layer on 2 heads of 64, its window of 16 and its

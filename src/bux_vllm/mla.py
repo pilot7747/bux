@@ -17,7 +17,10 @@ model to a few dims (DeepSeek's among them), whatever the backend takes: the MLA
 metadata's head size (the latent and the rotated dims), and the prefill backends'
 dims. For other dims, the layer gives vLLM's MLA the decoding backend vLLM picks,
 its metadata checked by that backend's own head sizes (`any_head_size`), and
-FlashAttention's prefill, which takes any dims up to 128 (`prefill_backend`).
+FlashAttention's prefill, which takes any dims up to 128 (`prefill_backend`). A
+prefill that attends to cached context (a prompt's earlier chunks, a cached prefix)
+gathers its latents by vLLM's op, whose kernel takes the same few sizes: for the
+others the plugin gathers them in PyTorch (`extend_gather`, `bux_vllm.latent`).
 """
 
 from __future__ import annotations
@@ -27,6 +30,7 @@ from typing import Any
 
 import torch
 from torch import nn
+from vllm import _custom_ops as ops
 from vllm.distributed import get_tensor_model_parallel_world_size
 from vllm.model_executor.layers.attention import MLAAttention
 from vllm.model_executor.layers.attention.mla_attention import MLACommonBackend
@@ -41,6 +45,7 @@ from vllm.v1.attention.backends.mla.prefill.flash_attn import FlashAttnPrefillBa
 from vllm.v1.attention.backends.mla.prefill.selector import get_mla_prefill_backend
 from vllm.v1.attention.selector import get_attn_backend
 
+from . import latent
 from .common import ACTIVATIONS, Ctx, Layer, Norm, Rope, Site, logit_gain, unsupported
 from .config import LATENT
 
@@ -114,6 +119,8 @@ def any_head_size(backend: Any) -> Any:
     than by every MLA backend's few (``MLACommonMetadata``'s check): vLLM's own
     subclass of a backend with a builder of its own, as for chunked attention."""
 
+    extend_gather()
+
     class Builder(backend.get_builder_cls()):
         def __init__(self, *args: Any, **kwargs: Any):
             super().__init__(*args, **kwargs)
@@ -132,6 +139,25 @@ def checked_by(metadata: type, backend: Any) -> type:
             raise ValueError(f"{backend.get_name()} takes no head size {size}")
 
     return type(metadata.__name__, (metadata,), {"__post_init__": check})
+
+
+def extend_gather() -> None:
+    """Make vLLM's ``gather_and_maybe_dequant_cache``, which every MLA prefill with
+    cached context calls (and DCP's, and sparse MLA's), take a cache of any size:
+    its kernel for `latent.KERNEL_SIZES`, `latent.gather` for the others."""
+    kernel = ops.gather_and_maybe_dequant_cache
+    if kernel.__module__ == __name__:
+        return
+
+    def gather(
+        src_cache: torch.Tensor, dst: torch.Tensor, *args: Any, **kw: Any
+    ) -> None:
+        if src_cache.shape[-1] in latent.KERNEL_SIZES:
+            kernel(src_cache, dst, *args, **kw)
+        else:
+            latent.gather(src_cache, dst, *args, **kw)
+
+    ops.gather_and_maybe_dequant_cache = gather
 
 
 class LatentAttention(Layer):

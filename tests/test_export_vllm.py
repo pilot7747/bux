@@ -44,6 +44,7 @@ from bux_vllm import (
     dplr,
     feeds,
     kv,
+    latent,
     linear,
     ngram,
     plan,
@@ -180,6 +181,42 @@ def test_the_config_gives_vllm_the_latent_of_mla() -> None:
     assert config.latent(c)
     assert config.latent(bux_config(vllm_parity.CASES["mla-deepseek"]))
     assert not config.latent(bux_config(vllm_parity.CASES["llama"]))
+
+
+def naive_gather(cache, table, lens, starts) -> torch.Tensor:
+    """Each request's cached context, token by token, from its blocks."""
+    size, rows = cache.shape[1], []
+    for r, (n, start) in enumerate(zip(lens, starts, strict=True)):
+        for t in range(start, start + n):
+            rows.append(cache[table[r, t // size], t % size])
+    return torch.stack(rows)
+
+
+@pytest.mark.parametrize("dtype", ["auto", "fp8"])
+def test_the_latent_context_gathers_as_vllms_kernel(dtype: str) -> None:
+    """bux_vllm.latent gathers a chunk's cached latents as vLLM's kernel does for
+    the sizes it takes: from each request's blocks, from where the chunk starts in
+    its context (here also off a block's start), from a cache of padded pages, an
+    fp8 cache's times its scale."""
+    torch.manual_seed(0)
+    padded = torch.randn(10, 4, 288 + 32)  # pages padded, as hybrids' are
+    cache = padded[..., :288]
+    if dtype == "fp8":
+        cache = cache.to(torch.float8_e4m3fn)
+    table = torch.tensor([[3, 7, 1, 0], [9, 2, 5, 8], [4, 6, 0, 0]], dtype=torch.int32)
+    lens, starts = [6, 9, 2], [0, 5, 4]
+    cu = torch.tensor([0, 6, 15, 17], dtype=torch.int32)
+    to_seq = torch.repeat_interleave(
+        torch.arange(3, dtype=torch.int32), torch.tensor(lens)
+    )
+    dst = torch.zeros(20, 288)
+    scale = torch.tensor(0.5)
+    seq_starts = torch.tensor(starts, dtype=torch.int32)
+    latent.gather(cache, dst, table, cu, to_seq, 17, dtype, scale, seq_starts)
+    want = naive_gather(cache, table, lens, starts).float()
+    want = want * 0.5 if dtype == "fp8" else want
+    torch.testing.assert_close(dst[:17], want)
+    assert not dst[17:].any()
 
 
 MIXED = {
