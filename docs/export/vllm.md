@@ -110,8 +110,14 @@ llm = LLM(model="exported/", dtype="bfloat16", quantization="fp8", moe_backend="
 
 vLLM 0.32 takes `fp8`, on a checkpoint without FP8 weights, as its `fp8_per_tensor`:
 each weight in FP8 (e4m3) with one scale per tensor, and each GEMM's input
-quantized to FP8 per token as it runs. Its other online schemes, such as
-`fp8_per_block`, reach the same layers.
+quantized to FP8 as it runs, with a scale per token (per tensor for the routed
+experts). Its other online schemes reach the same layers: `fp8_per_channel`, a
+weight's scale per output channel (llm-compressor's FP8_DYNAMIC), and
+`fp8_per_block`, per block of 128 by 128 with inputs per group of 128 (DeepSeek's
+FP8). Emulated on the `gpt3`, `llama` and `frontier` models of
+[Checking FP8](#checking-fp8), they come within 0.002 of cosine of `fp8`: the
+rounding of the inputs, which all three scale as they run, is most of what FP8
+costs.
 
 - **Quantized:** every projection the plugin runs on vLLM's linear layers, and the
   routed and shared experts. That is attention's q, k, v, gate and output
@@ -130,7 +136,10 @@ quantized to FP8 per token as it runs. Its other online schemes, such as
 - **Random weights.** `--load-format dummy` quantizes the random weights, so a
   `.bux` file's export times in FP8 too.
 - **Tensor parallelism.** The layers split over ranks as they do in bfloat16, and
-  each weight's scale is the largest over its ranks' shares.
+  each weight's scale is the largest over its ranks' shares. For the routed
+  experts' scales vLLM reduces over its expert-parallel group, which it builds for
+  a model whose config names experts: the plugin's names them as Mixtral's does
+  (`num_experts`, `num_experts_per_tok`).
 
 ## FP8 KV cache
 
@@ -176,19 +185,30 @@ python scripts/vllm_fp8.py run runs/fp8 --moe-backend triton  # vLLM's: weights
 python scripts/vllm_fp8.py run runs/fp8 --moe-backend triton --kv-cache-dtype fp8
 ```
 
-A case passes if the cosine of its FP8 logits with bfloat16's is 0.99 or more on
-average, at the prompts' positions and at the decoding steps. FP8 rounds each
-weight and each activation to 3 bits of mantissa, about 3 % RMS, so a matmul's
-output is off by about 4 % and the logits by a few percent, a cosine above 0.995. A
-cosine under 0.99 is an error of over 14 % RMS: a weight loaded in the wrong place,
-or quantized with the wrong scale.
+What FP8 costs is the model's own, so the check holds vLLM to an emulation of it.
+`export` runs each case's transformers model in float32 with FP8's rounding
+emulated, as vLLM rounds it: each linear layer that vLLM quantizes, its weight per
+tensor and its input per token; the routed experts' weights per expert and their
+input per tensor; and, for an FP8 KV cache, the attention's queries, keys and values
+at a scale of 1. A case passes if the mean cosine of vLLM's FP8 logits with its
+bfloat16 logits, at the prompts' positions and at the decoding steps, loses no more
+than twice the emulation's loss, plus 0.002. That is the rule
+`scripts/vllm_parity.py` holds bfloat16 to against bux. vLLM compares with
+bfloat16 rather than float32, and the emulation leaves the experts' hidden units
+unrounded, so the two differ a little. A weight loaded in the wrong place, or a
+scale set by garbage, costs many times more. A case of layers that only the plugin
+exports has no transformers model to emulate, and its accuracy goes unchecked.
 
-With an FP8 KV cache too, a case passes at 0.98. The cache rounds the keys and
-values in the same way, and so do the queries where the backend quantizes them to
-match. The softmax turns the scores' error of about 5 % into a larger one on the
-values' weights, by the scores' spread, so each attention layer's output is off by
-5 to 10 % more. 0.98 allows 20 % RMS. Bytes read in the wrong format, or a scale off
-by a power of two, are far beyond it.
+These tiny models of random weights lose far more to FP8 than a trained model
+does. The mean cosine at the prompts' positions, emulated on the CPU and measured
+on one B300 with vLLM 0.32.0 on 2026-10-28:
+
+| Case | Emulated: weights | vLLM: weights | Emulated: weights and KV cache | vLLM: weights and KV cache |
+|------|-------------------|---------------|--------------------------------|----------------------------|
+| `gpt3` | 0.9915 | 0.9919 | 0.9897 | 0.9895 |
+| `llama` | 0.9797 | 0.9803 | 0.9749 | 0.9746 |
+| `frontier` | 0.9629 | 0.9631 | 0.9584 | 0.9599 |
+| `hybrid` | 0.9709 | 0.9714 | 0.9706 | 0.9715 |
 
 ## How it works
 

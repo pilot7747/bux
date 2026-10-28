@@ -5,7 +5,8 @@ in bfloat16 and with ``quantization="fp8"`` (and ``kv_cache_dtype="fp8"``).
 It runs in two steps, as `scripts/vllm_parity.py` does (bux and vLLM do not share an
 environment):
 
-    # bux's environment: export each case in bfloat16, its weights perturbed
+    # bux's environment: export each case in bfloat16, its weights perturbed, and
+    # emulate FP8 on it
     JAX_PLATFORMS=cpu python scripts/vllm_fp8.py export DIR
     # vLLM's, with the plugin (pip install src/bux_vllm): serve each twice, compare
     python scripts/vllm_fp8.py run DIR [--quantization fp8] [--kv-cache-dtype fp8]
@@ -24,29 +25,34 @@ bfloat16's at the prompts' positions and at the decoding steps up to the first
 token the two runs pick differently (the steps whose prefixes they share): the
 cosine of the logits, centered at each position (as the log-probabilities are),
 its mean and its least, and the largest error relative to the largest bfloat16
-logit of its position. It exits with 1 if a mean cosine is under `MIN_COSINE` (or
-`MIN_COSINE_KV`), if nothing was quantized, if a head was, or if no attention layer
-of a model with some kept the KV cache asked for.
+logit of its position. It exits with 1 if vLLM's FP8 is further off than `RATIO`
+times what FP8's rounding alone costs the model (`emulate`), if nothing was
+quantized, if a head was, or if no attention layer of a model with some kept the
+KV cache asked for.
 
-`MIN_COSINE` is 0.99. FP8 (e4m3) keeps 3 bits of mantissa: it rounds each weight and
-each activation by 3 % RMS, so a matmul's output errs by about 4 %, and the
-logits by a few percent, whose cosine is above 0.995; the head stays in bfloat16. A
-cosine under 0.99 is an RMS error over 14 %, more than the rounding: a weight loaded
-in the wrong place, a wrong scale, or a scale set by garbage.
-
-`MIN_COSINE_KV` is 0.98, for FP8 weights and an FP8 KV cache together. The cache
-rounds the keys and values the same way, at a scale of 1 (a bfloat16 checkpoint has
-none of its own), and so do the queries where the backend quantizes them to match.
-The softmax turns the scores' 5 % error into a larger one on the weights it gives
-the values, by the scores' spread: about 5 to 10 % more on each attention layer's
-output, in quadrature with the weights' error. 0.98 allows 20 % RMS. Bytes read in
-the wrong format, or a scale off by a power of two, are far beyond it.
+What FP8's rounding costs is the model's own: these tiny models of random weights
+lose far more to it than a trained one, from 0.008 of cosine (GPT-3's) to 0.04 (the
+sliding-window milestone's), and at the scale of a weight (per tensor, per channel
+or per block of 128) all the same. So ``export`` emulates vLLM's FP8 on the
+export's transformers model in float32 (`emulate`): every linear layer vLLM
+quantizes rounded to e4m3 per tensor, its inputs per token, the routed experts'
+weights per expert and their inputs per tensor, and with an FP8 KV cache the
+attention's queries, keys and values at a scale of 1. It writes the cosines of the
+emulated logits with the model's own to ``expected.json``. vLLM may be off by up to
+`RATIO` (2) times that, plus `FLOOR`, as `scripts/vllm_parity.py` holds bfloat16
+to twice bux's own error: vLLM compares with bfloat16 rather than float32, and the
+emulation leaves the experts' hidden units and the norms and RoPE after the keys
+unrounded. Weights loaded in the wrong place, a scale set by garbage or bytes read
+in the wrong format are many times further off. A case whose transformers model
+does not run (one of the layers only the plugin exports) has no emulation, and its
+accuracy goes unchecked.
 
 The cases are the timeline's milestones at d_model 256 and a vocabulary of 256, the
 first group of four layers of their stacks: GPT-3's (2020), a llama, and 2026's two
 (the sliding-window camp's, and the hybrid with KDA in place of its windows).
 ``--only`` picks some of them, or any case of `scripts/vllm_parity.py` by its name
-(its ``llama`` is this one), to check the other families of layers. On a B300 (SM
+(its ``llama`` is this one), or ``kv-conv-64``, the conv on keys and values at heads
+of 64, to check the other families of layers. On a B300 (SM
 10.3), FlashInfer's CUTLASS MoE kernels fail, so ``run`` takes vLLM's Triton kernels
 by default.
 """
@@ -129,10 +135,19 @@ CASES = {
     " fr_layer(fr_global) fr_norm @h fr_out hy_mtp",
 }
 
-#: Every case ``--only`` takes: these, and the parity cases.
-POOL = vllm_parity.CASES | CASES
-MIN_COSINE = 0.99  # of the FP8 logits with bfloat16's, on average (see above)
-MIN_COSINE_KV = 0.98  # likewise, with an FP8 KV cache too
+#: The conv on keys and values at heads of 64 (FlashInfer's, on a B300) beside the
+#: value residual, as the serving lanes' global layers have it.
+KV_CONV = (
+    "attn = gqa(num_heads=4, num_kv_heads=2, kv_conv_size=4, rope=rope())\n"
+    "ffn = gated_mlp(intermediate_size=swiglu_width, activation=swish)\n"
+    "model = embed [rmsnorm attn(v=@v1)] [rmsnorm ffn] [rmsnorm attn(v=$v1!)]"
+    " [rmsnorm ffn] rmsnorm head"
+)
+
+#: Every case ``--only`` takes: these, the parity cases, and ``kv-conv-64``.
+POOL = vllm_parity.CASES | CASES | {"kv-conv-64": HEAD + WIDTHS + KV_CONV}
+RATIO = 2.0  # how many times FP8's own error (emulated) vLLM's may be
+FLOOR = 0.002  # and the cosine it may lose besides, where that error is next to none
 TAGS = ("bf16", "fp8")  # the two runs of a case, by the name of their files
 
 
@@ -162,11 +177,130 @@ def main() -> None:
         case "export":
             for name in cases:
                 vllm_parity.export(name, args.dir / name, "bfloat16", POOL)
+                expect(args.dir / name, POOL[name])
         case "run":
             bad = [n for n in cases if not run(args, n)]
             sys.exit(1 if bad else 0)
         case "run-one":
             run_one(args, args.dir / cases[0])
+
+
+# --- export, in bux's environment: FP8's rounding, emulated ------------------------
+
+E4M3, E4M3_MAX = "float8_e4m3fn", 448.0  # FP8's format, and its largest value
+
+
+def expect(where: Path, source: str) -> None:
+    """Write ``expected.json`` at the export `where` of the model `source`: the mean
+    cosine of its logits with FP8 emulated (`emulate`) against its own, in float32
+    at the prompts' positions, without an FP8 KV cache (``fp8``) and with one
+    (``fp8+kv``); null for a model of layers only the plugin exports, which
+    transformers does not run."""
+    from bux.lang import compile
+
+    missing = vllm_parity.placeholders(compile(source)).added
+    if missing:
+        print(f"no emulation of {where.name}: {', '.join(missing)} only in vLLM")
+        (where / "expected.json").write_text("null")
+        return
+    prompts = json.loads((where / "parity.json").read_text())["prompts"]
+    own = _logits(where, prompts, None)
+    out = {"fp8": False, "fp8+kv": True}
+    out = {k: _cosine(_logits(where, prompts, kv), own) for k, kv in out.items()}
+    (where / "expected.json").write_text(json.dumps(out))
+
+
+def _logits(where: Path, prompts: list, kv: bool | None) -> np.ndarray:
+    """The logits, (n, vocab), of the export at `where`'s transformers model on
+    `prompts` in float32: FP8 emulated (`emulate`, with an FP8 KV cache if `kv`),
+    or not (None)."""
+    import torch
+    from transformers import AutoModelForCausalLM
+
+    model = AutoModelForCausalLM.from_pretrained(
+        where, trust_remote_code=True, dtype=torch.float32
+    ).eval()
+    if kv is not None:
+        emulate(model, kv)
+    with torch.no_grad():
+        rows = [model(torch.tensor([p])).logits[0, :-1] for p in prompts]
+    return torch.cat(rows).double().numpy()
+
+
+def _cosine(got: np.ndarray, want: np.ndarray) -> float:
+    """The mean cosine of the logits `got` with `want`, (n, vocab), centered."""
+    c = Closeness()
+    c.add(got, want)
+    return c.summary()[0]
+
+
+def emulate(model: Any, kv: bool) -> None:
+    """Round `model` (an export's transformers model) as vLLM's online FP8 does: each
+    linear layer vLLM quantizes (`_quantized`) its weight per tensor and its input
+    per token, the routed experts' weights per expert and their input per tensor;
+    with `kv`, attention's queries, keys and values (MLA's latents) at a scale of 1,
+    as an FP8 KV cache keeps them."""
+    for name, m in list(model.named_modules()):
+        if type(m).__name__ == "Linear" and _quantized(model, name):
+            m.weight.data = _rounded(m.weight.data, _scale(m.weight.data))
+            m.register_forward_pre_hook(lambda _, a: (_per_token(a[0]),))
+        if type(m).__name__ == "Experts":
+            for p in m.parameters(recurse=False):
+                if p.dim() == 3:  # per expert
+                    p.data = _stack([_rounded(w, _scale(w)) for w in p.data])
+            m.register_forward_pre_hook(
+                lambda _, a: (_rounded(a[0], _scale(a[0])), *a[1:])
+            )
+        if kv and type(m).__name__ in ("Attention", "LatentAttention"):
+            for part in ("q", "k", "v", "kv_a", "kv_a_norm"):
+                if getattr(m, part, None) is not None:
+                    getattr(m, part).register_forward_hook(
+                        lambda *a: _rounded(a[2], 1.0)
+                    )
+
+
+def _quantized(model: Any, name: str) -> bool:
+    """Whether vLLM quantizes the linear layer `name` of an export's model: not a
+    head's or an embedding's, a router, a shared experts' gate, a sparse MLA's
+    ``kv_b``, or one of an indexer's, an engram's or a residual algebra's, which
+    the plugin keeps in the model's dtype."""
+    kept = ("Head", "TokenEmbedding", "Indexer", "Engram")
+    parts = name.split(".")
+    owners = [model.get_submodule(".".join(parts[:i])) for i in range(len(parts))]
+    if any(
+        type(o).__name__ in kept or "residual" in type(o).__module__ for o in owners
+    ):
+        return False
+    if parts[-1] == "kv_b" and getattr(owners[-1], "indexer", None) is not None:
+        return False
+    return parts[-1] not in ("router", "shared_gate")
+
+
+def _scale(x: Any) -> Any:
+    """An FP8 scale of the whole of `x`: its largest magnitude over `E4M3_MAX`."""
+    return (x.float().abs().max() / E4M3_MAX).clamp_min(1e-12)
+
+
+def _per_token(x: Any) -> Any:
+    """`x` rounded to FP8 by a scale per token (its last axis)."""
+    scale = (x.float().abs().amax(-1, keepdim=True) / E4M3_MAX).clamp_min(1e-12)
+    return _rounded(x, scale)
+
+
+def _rounded(x: Any, scale: Any) -> Any:
+    """`x` rounded to FP8 by `scale`, saturating as vLLM's kernels do, in its
+    dtype."""
+    import torch
+
+    y = (x.float() / scale).clamp(-E4M3_MAX, E4M3_MAX).to(getattr(torch, E4M3))
+    return (y.float() * scale).to(x.dtype)
+
+
+def _stack(xs: list) -> Any:
+    """`xs` stacked."""
+    import torch
+
+    return torch.stack(xs)
 
 
 # --- run, in vLLM's environment ------------------------------------------------------
@@ -192,9 +326,11 @@ def run(args: argparse.Namespace, name: str) -> bool:
 
 def run_one(args: argparse.Namespace, where: Path) -> None:
     """Serve the export at `where` in bfloat16 or quantized (by ``--tag``), decode
-    the prompts (`vllm_parity.decode`), and keep the layers' quantization methods
-    and KV caches (`quantized`) in ``<tag>.json``, with the KV cache dtype asked
-    for."""
+    the prompts (`vllm_parity.decode`), and keep what serves its layers
+    (`bux_vllm.served.survey`, which vLLM's workers import) in ``<tag>.json``, with
+    the KV cache dtype asked for."""
+    from bux_vllm.served import survey
+
     engine = vllm_parity.engine(args)
     kv = args.kv_cache_dtype if args.tag == "fp8" else None
     if args.tag == "fp8":
@@ -203,41 +339,8 @@ def run_one(args: argparse.Namespace, where: Path) -> None:
         engine["kv_cache_dtype"] = kv
     llm = vllm_parity.serve(where, engine)
     vllm_parity.decode(llm, where, args.tag)
-    layers = llm.apply_model(quantized)[0] | {"kv_cache_dtype": kv}
+    layers = llm.apply_model(survey)[0] | {"kv_cache_dtype": kv}
     (where / f"{args.tag}.json").write_text(json.dumps(layers))
-
-
-def quantized(model: Any) -> dict:
-    """Each kind of layer of `model` (its vLLM class and the last part of its name)
-    with the quantization method vLLM picked for it and its FP8 GEMM, counted; its
-    attention layers' KV cache dtypes and backends, counted; and the routed
-    experts' backends, counted. It runs in vLLM's workers (``LLM.apply_model``)."""
-    from collections import Counter
-
-    methods: Counter = Counter()
-    backends: Counter = Counter()
-    caches: Counter = Counter()
-    for name, module in model.named_modules():
-        if (kv := getattr(module, "kv_cache_dtype", None)) is not None:
-            backend = getattr(module, "attn_backend", None)
-            backend = backend.get_name() if backend is not None else None
-            caches[f"{type(module).__name__}: kv {kv} ({backend})"] += 1
-        method = getattr(module, "quant_method", None)
-        if method is None:
-            continue
-        gemm = getattr(method, "fp8_linear", None)
-        how = type(method).__name__ + (f" ({type(gemm).__name__})" if gemm else "")
-        methods[f"{type(module).__name__} {name.rsplit('.', 1)[-1]}: {how}"] += 1
-        backend = getattr(method, "fp8_backend", None)
-        backend = backend or getattr(method, "unquantized_backend", None)
-        if backend is not None:
-            experts = getattr(getattr(method, "experts_cls", None), "__name__", None)
-            backends[f"{getattr(backend, 'value', backend)} ({experts})"] += 1
-    return {
-        "methods": dict(methods),
-        "backends": dict(backends),
-        "caches": dict(caches),
-    }
 
 
 # --- compare ---------------------------------------------------------------------------
@@ -302,16 +405,30 @@ def report(where: Path, name: str) -> bool:
         for backend, n in layers[tag]["backends"].items():
             print(f"  {tag} MoE: {n} x {backend}")
     prompts, steps = closeness(where)
-    least = MIN_COSINE if kv is None else MIN_COSINE_KV
-    close = min(prompts.summary()[0], steps.summary()[0]) >= least
+    close = _close(where, kv, [prompts.summary()[0], steps.summary()[0]])
     ok = close and _quantizes(fp8["methods"]) and _caches(fp8["caches"], kv)
     print(f"  {prompts.line('prompts')}")
     print(f"  {steps.line('decoding')}  {'ok' if ok else 'DIFFERS'}")
     return ok
 
 
+def _close(where: Path, kv: str | None, cosines: list[float]) -> bool:
+    """Whether vLLM's mean `cosines` are within `RATIO` times FP8's own error, and
+    `FLOOR`, of the emulation's (``expected.json``, by `kv`); say which. True,
+    unchecked, without an emulation."""
+    file = where / "expected.json"
+    expected = json.loads(file.read_text()) if file.exists() else None
+    if expected is None:
+        print("  no emulation: accuracy unchecked")
+        return True
+    own = expected["fp8" if kv is None else "fp8+kv"]
+    least = 1 - RATIO * (1 - own) - FLOOR
+    print(f"  FP8 emulated: cosine {own:.5f}, so at least {least:.5f}")
+    return min(cosines) >= least
+
+
 def _quantizes(methods: dict[str, int]) -> bool:
-    """Whether vLLM quantized some layers by `methods` (`quantized`'s), online, and
+    """Whether vLLM quantized some layers by `methods` (`survey`'s), online, and
     neither an embedding nor a head; say so if not."""
     online = [k for k in methods if "Online" in k.split(": ")[-1]]
     heads = [k for k in online if "Embedding" in k or "LMHead" in k]
@@ -321,7 +438,7 @@ def _quantizes(methods: dict[str, int]) -> bool:
 
 
 def _caches(caches: dict[str, int], kv: str | None) -> bool:
-    """Whether an attention layer of `caches` (`quantized`'s) kept its KV cache in
+    """Whether an attention layer of `caches` (`survey`'s) kept its KV cache in
     `kv`, if asked for one and the model has some; say so if not."""
     if kv is None or not caches:
         return True

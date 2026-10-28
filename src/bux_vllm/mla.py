@@ -42,7 +42,7 @@ import torch
 from torch import nn
 from vllm import _custom_ops as ops
 from vllm.distributed import get_tensor_model_parallel_world_size
-from vllm.model_executor.layers.attention import MLAAttention
+from vllm.model_executor.layers.attention import MLAAttention, mla_attention
 from vllm.model_executor.layers.attention.mla_attention import MLACommonBackend
 from vllm.model_executor.layers.linear import (
     ColumnParallelLinear,
@@ -115,8 +115,27 @@ def prefill_backend(vllm_config: Any) -> type | None:
     except ValueError:
         if vllm_config.attention_config.mla_prefill_backend is not None:
             raise
+        answer_fp8_prefill()
         return FlashAttnPrefillBackend
     return None
+
+
+def answer_fp8_prefill() -> None:
+    """Make vLLM's check of whether MLA's prefill takes FP8 queries, which its
+    metadata asks under an FP8 KV cache, answer no where no prefill backend of
+    vLLM's takes the dims, rather than raise: the prefill is then FlashAttention's
+    (`prefill_backend`), which takes the model's dtype."""
+    check = mla_attention.backend_supports_prefill_query_quantization
+    if check.__module__ == __name__:
+        return
+
+    def supports() -> bool:
+        try:
+            return check()
+        except ValueError:
+            return False
+
+    mla_attention.backend_supports_prefill_query_quantization = supports
 
 
 def decode_backend(head_size: int, heads: int, cache_config: Any) -> Any:

@@ -56,6 +56,7 @@ from bux_vllm import (
     plan,
     residual,
     routing,
+    served,
 )
 
 ROOT = Path(__file__).parent.parent
@@ -189,6 +190,20 @@ def test_the_config_gives_vllm_its_heads_and_layer_kinds(name: str) -> None:
     assert c.layer_types == ["linear_attention"] * 2 + ["full_attention"]
     assert (c.num_attention_heads, c.num_key_value_heads, c.head_dim) == (4, 2, 32)
     assert c.num_hidden_layers == 3
+
+
+@pytest.mark.parametrize("name", ["moe", "moe-latent", "llama"])
+def test_the_config_gives_vllm_its_experts(name: str) -> None:
+    """An MoE model gives vLLM its experts and picks (Mixtral's names), by which
+    vLLM builds the expert-parallel group that FP8 experts reduce their scales
+    over under tensor parallelism; a dense model none."""
+    c = bux_config(vllm_parity.CASES[name])
+    layers = compile(vllm_parity.CASES[name]).layers()
+    moes = [n.config for n in layers if n.config.type == "moe"]
+    experts = max((m.num_experts for m in moes), default=0)
+    picks = max((m.top_k for m in moes), default=0)
+    assert (c.num_experts, c.num_experts_per_tok) == (experts, picks)
+    assert (experts > 0) == (name != "llama")
 
 
 def bux_config(source: str) -> config.BuxConfig:
@@ -2221,7 +2236,7 @@ def engine_config(where: Path, quant: Any, cache_dtype: str = "auto") -> Any:
     )
 
 
-def served(
+def built(
     source: str, where: Path, module: ModuleType, quant: Any, cache_dtype: str = "auto"
 ) -> Any:
     """The plugin's model (`module`'s, on stand-ins) of the model `source`, exported
@@ -2291,7 +2306,7 @@ def test_fp8_weights_quantize_every_projection_and_expert_alone(
     loader, which vLLM's online quantization counts before it quantizes it."""
     source = vllm_fp8.CASES[name].replace("num_experts=256", "num_experts=8")
     quant = SimpleNamespace(name="fp8")
-    model = served(source, tmp_path, stood_in, quant)
+    model = built(source, tmp_path, stood_in, quant)
     kinds, moes = MILESTONES[name]
     assert {type(m).__name__ for m in assert_quantized(model, quant)} == kinds
     modules = list(model.modules())
@@ -2313,7 +2328,7 @@ def test_fp8_weights_quantize_every_layer_s_projections(
     routed experts the quantization config, but those it keeps in the model's
     dtype (`kept`); their weights load whole through their loaders."""
     quant = SimpleNamespace(name="fp8")
-    model = served(vllm_parity.CASES[name], tmp_path, stood_in, quant)
+    model = built(vllm_parity.CASES[name], tmp_path, stood_in, quant)
     assert assert_quantized(model, quant)
 
 
@@ -2339,10 +2354,10 @@ def test_an_fp8_kv_cache_is_vllm_s_or_refused(
     quant, source = SimpleNamespace(name="fp8"), vllm_parity.CASES[name]
     if name in OWN_CACHES:
         with pytest.raises(NotImplementedError, match="kv_cache_dtype=fp8") as e:
-            served(source, tmp_path, stood_in, quant, "fp8")
+            built(source, tmp_path, stood_in, quant, "fp8")
         assert str(e.value).startswith(OWN_CACHES[name]), e.value
         return
-    model = served(source, tmp_path, stood_in, quant, "fp8")
+    model = built(source, tmp_path, stood_in, quant, "fp8")
     caches = [m for m in model.modules() if isinstance(m, StubModule)]
     assert all(m.kwargs["cache_config"].cache_dtype == "fp8" for m in caches)
 
@@ -2362,3 +2377,89 @@ def test_the_plugin_s_own_caches_keep_the_model_s_dtype_alone() -> None:
     for name in ("fp8", "fp8_e5m2", "float16"):
         with pytest.raises(NotImplementedError, match=f"csa: kv_cache_dtype={name} "):
             common.own_cache_dtype(engine(name), "csa")
+
+
+def test_the_survey_counts_what_serves_each_kind_of_layer() -> None:
+    """bux_vllm.served.survey, which vLLM's workers run on the model, counts each
+    kind of layer's quantization method and FP8 GEMM, each attention layer's KV
+    cache and backend, and the routed experts' backend."""
+    gemm = type("CutlassFP8ScaledMMLinearKernel", (), {})()
+    linear = type("Fp8PerTensorOnlineLinearMethod", (), {"fp8_linear": gemm})()
+    experts = type(
+        "Fp8PerTensorOnlineMoEMethod",
+        (),
+        {
+            "fp8_backend": SimpleNamespace(value="TRITON"),
+            "experts_cls": type("TritonExperts", (), {}),
+        },
+    )()
+    backend = SimpleNamespace(get_name=lambda: "FLASHINFER")
+
+    def layer(kind: str, **attributes: Any) -> torch.nn.Module:
+        module = type(kind, (torch.nn.Module,), {})()
+        vars(module).update(attributes)
+        return module
+
+    model = torch.nn.Module()
+    model.qkv = layer("QKVParallelLinear", quant_method=linear)
+    model.experts = layer("RoutedExperts", quant_method=experts)
+    model.cache = layer("Attention", kv_cache_dtype="fp8", attn_backend=backend)
+    assert served.survey(model) == {
+        "methods": {
+            "QKVParallelLinear qkv: Fp8PerTensorOnlineLinearMethod"
+            " (CutlassFP8ScaledMMLinearKernel)": 1,
+            "RoutedExperts experts: Fp8PerTensorOnlineMoEMethod": 1,
+        },
+        "caches": {"Attention: kv fp8 (FLASHINFER)": 1},
+        "backends": {"TRITON (TritonExperts)": 1},
+    }
+
+
+def test_mla_of_dims_vllm_s_prefills_lack_takes_no_fp8_queries(
+    stood_in: ModuleType, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Where no MLA prefill backend of vLLM's takes the dims, the plugin's is
+    FlashAttention's, and vLLM's check of whether the prefill takes FP8 queries,
+    which an FP8 KV cache makes its metadata ask, answers no instead of raising."""
+    mla = importlib.import_module("bux_vllm.mla")
+
+    def no_backend(*args: Any) -> None:
+        raise ValueError("No valid MLA prefill backend found")
+
+    monkeypatch.setattr(mla, "get_mla_prefill_backend", no_backend)
+    monkeypatch.setattr(
+        mla.mla_attention, "backend_supports_prefill_query_quantization", no_backend
+    )
+    engine = SimpleNamespace(attention_config=SimpleNamespace(mla_prefill_backend=None))
+    assert mla.prefill_backend(engine) is mla.FlashAttnPrefillBackend
+    assert mla.mla_attention.backend_supports_prefill_query_quantization() is False
+
+
+def test_the_fp8_emulation_rounds_what_vllm_quantizes(tmp_path: Path) -> None:
+    """scripts/vllm_fp8.py's emulation of vLLM's FP8 rounds the weights of the
+    linear layers and routed experts vLLM quantizes to FP8's grid, and keeps the
+    head's, the embedding's and the router's as they are."""
+    from transformers import AutoModelForCausalLM
+
+    arch = compile(
+        vllm_fp8.CASES["frontier"].replace("num_experts=256", "num_experts=8")
+    )
+    save(arch, Model(arch, rngs=nnx.Rngs(0)), tmp_path)
+    load = AutoModelForCausalLM.from_pretrained
+    model = load(tmp_path, trust_remote_code=True, dtype=torch.float32)
+    before = {n: p.detach().clone() for n, p in model.named_parameters()}
+    vllm_fp8.emulate(model, kv=True)
+    for name, p in model.named_parameters():
+        kept = any(k in name for k in ("embed", "fr_out", "router", "norm", "conv"))
+        if kept or p.dim() < 2:
+            assert torch.equal(p, before[name]), name
+            continue
+        w = p.detach()
+        scales = (
+            [vllm_fp8._scale(x) for x in w] if w.dim() == 3 else [vllm_fp8._scale(w)]
+        )
+        again = [
+            vllm_fp8._rounded(x, s) for x, s in zip(w if w.dim() == 3 else [w], scales)
+        ]
+        assert all(torch.equal(a, x) for a, x in zip(again, w if w.dim() == 3 else [w]))
+        assert not torch.equal(p, before[name]), name
