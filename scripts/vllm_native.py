@@ -399,7 +399,7 @@ def check_plugin(decoding: bool) -> bool:
             for r, m in enumerate(lengths)
         )
     else:
-        chosen = dsa.prompt(region, index, table[:1], n, positions, top_k)
+        chosen = dsa.prompt(region, index, table[:1], n, positions + 1, top_k)
         best = picked_as_best(
             chosen, fp8_scores(region, index, table[:1], positions, n)
         )
