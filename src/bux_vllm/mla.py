@@ -248,10 +248,10 @@ class LatentAttention(Layer):
         )
 
     def _sparse_caches(self, c: dict, width: int, site: Site) -> None:
-        """Make the indexer, and each call's caches of its latents (one head of
-        ``kv_lora_rank + qk_rope_head_dim`` a token, as vLLM's MLA keeps them) and of
-        the indexer's keys, which the sparse attention ops read: the latents alone
-        for a layer that reads its ``index`` port."""
+        """Make the indexer, and each call's cache of its latents (one head of
+        ``kv_lora_rank + qk_rope_head_dim`` a token, as vLLM's MLA keeps them) with
+        the indexer's keys beside them, which the sparse attention ops read: of the
+        latents alone for a layer that reads its ``index`` port."""
         kinds = states(c, site.ports)  # a call's states, side by side in site.caches
         names = {kind: site.caches[i :: len(kinds)] for i, kind in enumerate(kinds)}
         ix = None if kv.reads(site.ports, "index") else c["indexer"]
@@ -264,7 +264,7 @@ class LatentAttention(Layer):
         self.spec = picks.layer_spec(
             ix, self.indexer, settings, dims, (0, 1), self.rank
         )
-        self.caches, self.index_caches = sparse.layer_caches(
+        self.caches = sparse.layer_caches(
             self.spec, 1, dims, ix["head_dim"] if ix else 0, names, site.vllm_config
         )
 

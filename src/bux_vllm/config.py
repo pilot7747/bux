@@ -60,11 +60,10 @@ LATENT = (
 def states(c: dict, layer_ports: list | None = None) -> list[str]:
     """The kinds of state a call of the layer `c`, with the ports `layer_ports`,
     keeps, in order: its type's (`STATES`), then a ``gqa`` layer's conv state under
-    ``kv_conv_size`` and its indexer's keys (``index``) with an indexer, or a
-    ``conv`` layer's or an ``engram``'s conv's; none for a layer that keeps none.
-    A ``gqa`` layer that reads its ``kv`` port names an attention layer of its own,
-    over its writer's cache, and keeps nothing else; one that reads its ``index``
-    port keeps no indexer's keys."""
+    ``kv_conv_size``, or a ``conv`` layer's or an ``engram``'s conv's; none for a
+    layer that keeps none. An indexer's keys are in its attention's cache
+    (`bux_vllm.sparse`). A ``gqa`` layer that reads its ``kv`` port names an
+    attention layer of its own, over its writer's cache, and keeps nothing else."""
     if c["type"] == "engram":
         return ["conv"] if c["conv_size"] else []
     if c["type"] in ("conv", "short_conv"):
@@ -74,8 +73,7 @@ def states(c: dict, layer_ports: list | None = None) -> list[str]:
     if c["type"] == "gqa" and reads(layer_ports or [], "kv"):
         return [STATES["gqa"]]
     conv = ["conv"] if c.get("kv_conv_size") else []
-    own = c.get("indexer") and not reads(layer_ports or [], "index")
-    return [STATES[c["type"]], *conv, *(["index"] if own else [])]
+    return [STATES[c["type"]], *conv]
 
 
 def sparse(c: dict, layer_ports: list | None = None) -> bool:
@@ -83,14 +81,6 @@ def sparse(c: dict, layer_ports: list | None = None) -> bool:
     attends to picked keys alone: it has an indexer, or reads another layer's picks
     from its ``index`` port."""
     return bool(c.get("indexer")) or reads(layer_ports or [], "index") is not None
-
-
-def layer_types(layer: dict) -> list[str]:
-    """The kinds of state of a call of `layer` (its IR node) as vLLM's
-    ``layer_types`` lists them: an indexer's keys are its attention's, as
-    DeepSeek-V3.2's are."""
-    kinds = states(layer["config"], ports(layer))
-    return [kind for kind in kinds if kind != "index"]
 
 
 #: What ``config.json`` says of transformers' cache layers, which vLLM reads
@@ -128,7 +118,9 @@ class BuxConfig(PreTrainedConfig):
         self.bux_reserved = bux_reserved or []
         self.vocab_size, self.hidden_size = vocab_size, hidden_size
         calls = live(plan(bux, self.bux_reserved).calls) if bux else []
-        self.layer_types = [k for c in calls for k in layer_types(c.layer)]
+        self.layer_types = [
+            k for c in calls for k in states(c.layer["config"], ports(c.layer))
+        ]
         self.num_hidden_layers = len(self.layer_types)
         layers = [c.layer for c in calls]
         self._set_heads(layers)

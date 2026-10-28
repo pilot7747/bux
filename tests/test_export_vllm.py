@@ -121,24 +121,42 @@ def test_layers_after_the_first_head_are_not_live() -> None:
     assert sum(c.layer["config"]["type"] == "gqa" for c in live) == 1
 
 
-def test_a_sparse_layer_keeps_its_indexer_keys_beside_its_kv_cache() -> None:
-    arch = compile(vllm_parity.CASES["dsa"])
-    layer = next(n for n in arch.layers() if n.config.type == "gqa")
-    assert config.states(layer.config.model_dump(mode="json")) == [
-        "full_attention",
-        "index",
-    ]
-    c = config.BuxConfig(bux=json.loads(arch.model_dump_json()))
-    assert c.layer_types == ["full_attention"] * 2
-
-
-def test_a_layer_that_reads_another_s_picks_keeps_no_indexer_keys() -> None:
-    """The index port's readers attend over the writer's picks and their own keys."""
-    arch = compile(vllm_parity.CASES["dsa-share"])
+@pytest.mark.parametrize("name", ["dsa", "dsa-share", "csa", "mla-dsa"])
+def test_a_sparse_layer_keeps_its_indexer_keys_in_its_kv_cache(name: str) -> None:
+    """One cache a call, whose blocks vLLM sizes as the other attention caches',
+    so that prefix caching hits as often (a cache of indexer keys alone would get
+    blocks of more tokens)."""
+    arch = compile(vllm_parity.CASES[name])
     calls = plan.plan(arch.model_dump(mode="json")).calls
-    layers = [c.layer for c in calls if c.layer["config"]["type"] == "gqa"]
-    kept = [config.states(n["config"], plan.ports(n)) for n in layers]
-    assert kept == [["full_attention", "index"]] + [["full_attention"]] * 2
+    layers = [c.layer for c in calls if config.sparse(c.layer["config"])]
+    assert layers
+    for n in layers:
+        assert config.states(n["config"], plan.ports(n)) == ["full_attention"]
+
+
+def test_a_sparse_cache_s_rows_hold_the_indexer_keys_beside_the_kv() -> None:
+    """picks.Cache gives back the keys, values and indexer keys picks.merged
+    wrote, a key's channels spread over the kv heads (padded where they do not
+    divide), in pages padded apart as vLLM pads a smaller page to a larger one."""
+    from bux_vllm import picks
+
+    torch.manual_seed(0)
+    g, c, i, block, blocks, s = 3, 10, 8, 4, 6, 17
+    kv, index = torch.randn(s, g, c), torch.randn(s, i)
+    rows = picks.merged(kv, index)
+    assert rows.shape == (s, g, c + 3)
+    page = g * block * (c + 3)
+    raw = torch.zeros(blocks * (page + 5))
+    pages = raw.as_strided(
+        (blocks, g, block, c + 3), (page + 5, block * (c + 3), c + 3, 1)
+    )
+    table = torch.randperm(blocks - 1)[None] + 1
+    at = torch.arange(s)
+    picks.write(pages, table[0, at // block] * block + at % block, rows)
+    cache = picks.Cache(pages, c, i)
+    torch.testing.assert_close(cache.keys(table, at[None])[0], index)
+    got = picks.gather(cache.kv, table, at[None])[0].transpose(0, 1)
+    torch.testing.assert_close(got, kv)
 
 
 def test_a_conv_layer_keeps_a_conv_state() -> None:
@@ -899,13 +917,13 @@ def test_sparse_attention_over_paged_caches_is_bux_s(c: dict, window: int | None
     keep = see[None, None] & hf_attention.per_head(kept, h)
     sinks = torch.randn(h)
     want = hf_attention.softmax_attention(q, k, v, keep, 0.3, 4.0, sinks)[0]
-    block, blocks = 4, 9
+    block, blocks, i = 4, 9, ix["head_dim"]
     table = torch.randperm(blocks)[None]
-    kv_cache = torch.zeros(blocks, g, block, 2 * dk)
-    index_cache = torch.zeros(blocks, 1, block, ix["head_dim"])
+    pages = torch.zeros(blocks, g, block, 2 * dk + -(-i // g))
     slots = table[0, at // block] * block + at % block
-    picks.write(kv_cache, slots, torch.cat([k[0], v[0]], -1).transpose(0, 1))
-    picks.write(index_cache, slots, ours.keys(x, at)[:, None])
+    kv = torch.cat([k[0], v[0]], -1).transpose(0, 1)
+    picks.write(pages, slots, picks.merged(kv, ours.keys(x, at)))
+    cache = picks.Cache(pages, 2 * dk, i)
     spec = picks.Sparse(
         ix["top_k"],
         ix["block_size"],
@@ -922,12 +940,9 @@ def test_sparse_attention_over_paged_caches_is_bux_s(c: dict, window: int | None
     )
     index = (ours.queries(x, at), ours.head_weights(x))
     qs = q[0].transpose(0, 1)
-    caches = (kv_cache, index_cache)
-    together, picked = picks.attend_segment(
-        spec, qs, index, at, caches, (table, table), s
-    )
+    together, picked = picks.attend_segment(spec, qs, index, at, cache, table, s)
     rows = table.expand(s, -1)
-    alone, _ = picks.attend_segment(spec, qs, index, at, caches, (rows, rows), s)
+    alone, _ = picks.attend_segment(spec, qs, index, at, cache, rows, s)
     torch.testing.assert_close(together, want, rtol=1e-5, atol=1e-5)
     torch.testing.assert_close(alone, want, rtol=1e-5, atol=1e-5)
     # A layer that reads these picks (the index port), with a window of its own.
@@ -935,6 +950,7 @@ def test_sparse_attention_over_paged_caches_is_bux_s(c: dict, window: int | None
     reader_see = picks.seen(at, s, 3)
     keep = reader_see[None, None] & hf_attention.per_head(kept, h)
     want = hf_attention.softmax_attention(q2, k2, v2, keep, 0.3, None, None)[0]
+    kv_cache = torch.zeros(blocks, g, block, 2 * dk)
     picks.write(kv_cache, slots, torch.cat([k2[0], v2[0]], -1).transpose(0, 1))
     reader = picks.Sparse(0, 1, False, False, False, 3, 0.3, None, dk, (0, g))
     for r in (table, rows):
@@ -977,13 +993,16 @@ def test_sparse_attention_in_the_latent_space_is_bux_s(name: str, window: int | 
     block, blocks = 4, 9
     table = torch.randperm(blocks)[None]
     slots = table[0, at // block] * block + at % block
-    index_cache = torch.zeros(blocks, 1, block, ix["head_dim"])
-    picks.write(index_cache, slots, ours.keys(x, at)[:, None])
+    index_keys = ours.keys(x, at)
 
     def mla(
-        window: int | None, softcap: float | None = None, sinks: Any = None
+        window: int | None,
+        softcap: float | None = None,
+        sinks: Any = None,
+        indexed: bool = False,
     ) -> tuple[Any, ...]:
-        """Random latents in a paged cache, queries, and the export's output."""
+        """Random latents in a paged cache (with the indexer's keys beside them if
+        `indexed`), queries, and the export's output."""
         c, k_pe, q = torch.randn(s, rank), torch.randn(s, r), torch.randn(s, h, n + r)
         up = (c @ kv_b.T).view(s, h, n + dv)
         k = torch.cat([up[..., :n], k_pe[:, None].expand(s, h, r)], -1)
@@ -991,21 +1010,23 @@ def test_sparse_attention_in_the_latent_space_is_bux_s(name: str, window: int | 
         qh, kh, vh = (t.transpose(0, 1)[None] for t in (q, k, up[..., n:]))
         want = hf_attention.softmax_attention(qh, kh, vh, keep, 0.3, softcap, sinks)
         want = want[0]
-        cache = torch.zeros(blocks, 1, block, rank + r)
-        picks.write(cache, slots, torch.cat([c, k_pe], -1)[:, None])
+        rows = torch.cat([c, k_pe], -1)[:, None]
+        rows = picks.merged(rows, index_keys) if indexed else rows
+        pages = torch.zeros(blocks, 1, block, rows.shape[-1])
+        picks.write(pages, slots, rows)
+        cache = picks.Cache(pages, rank + r, index_keys.shape[-1] if indexed else 0)
         return picks.absorbed(q, kv_b, n), cache, want
 
-    queries, cache, want = mla(window, 4.0, sinks)
+    queries, cache, want = mla(window, 4.0, sinks, indexed=True)
     spec = picks.layer_spec(ix, ours, (window, 0.3, 4.0, sinks), rank + r, (0, 1), rank)
     index = (ours.queries(query, at), ours.head_weights(x))
-    caches, rows = (cache, index_cache), (table, table)
-    out, picked = picks.attend_segment(spec, queries, index, at, caches, rows, s)
+    out, picked = picks.attend_segment(spec, queries, index, at, cache, table, s)
     torch.testing.assert_close(
         picks.projected(out, kv_b, n), want, rtol=1e-5, atol=1e-5
     )
     queries, cache, want = mla(3)
     reader = picks.layer_spec(None, None, (3, 0.3, None, None), rank + r, (0, 1), rank)
-    out = picks.attend_picked(reader, queries, picked, at, cache, table, s)
+    out = picks.attend_picked(reader, queries, picked, at, cache.kv, table, s)
     torch.testing.assert_close(
         picks.projected(out, kv_b, n), want, rtol=1e-5, atol=1e-5
     )
@@ -1165,25 +1186,20 @@ def test_single_queries_of_several_requests_attend_to_their_own_keys() -> None:
 
     torch.manual_seed(1)
     g, dk, i, block = 2, 8, 8, 4
-    kv_cache, index_cache = (
-        torch.randn(12, g, block, 2 * dk),
-        torch.randn(12, 1, block, i),
-    )
+    cache = picks.Cache(torch.randn(12, g, block, 2 * dk + i // g), 2 * dk, i)
     tables = torch.tensor([[3, 7, 1, 0, 0], [9, 2, 11, 5, 4]])
     at = torch.tensor([9, 16])  # the last positions of requests of 10 and 17 keys
     spec = picks.Sparse(4, 1, False, False, True, None, 0.3, None, dk, (0, g))
     q, iq, iw = torch.randn(2, 4, dk), torch.randn(2, 2, i), torch.randn(2, 2)
-    caches = (kv_cache, index_cache)
-    both, _ = picks.attend_segment(spec, q, (iq, iw), at, caches, (tables, tables), 17)
+    both, _ = picks.attend_segment(spec, q, (iq, iw), at, cache, tables, 17)
     for r in range(2):
-        rows = (tables[r : r + 1], tables[r : r + 1])
         alone, _ = picks.attend_segment(
             spec,
             q[r : r + 1],
             (iq[r : r + 1], iw[r : r + 1]),
             at[r : r + 1],
-            caches,
-            rows,
+            cache,
+            tables[r : r + 1],
             int(at[r]) + 1,
         )
         torch.testing.assert_close(both[r : r + 1], alone)

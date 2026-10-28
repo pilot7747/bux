@@ -175,9 +175,9 @@ class Attention(Layer):
     def _sparse_caches(
         self, c: dict, width: int, site: Site, names: dict[str, list[str]]
     ) -> None:
-        """Make the indexer, and each call's caches of keys and values and of the
-        indexer's keys, which the sparse attention ops read (`bux_vllm.sparse`):
-        the keys and values alone for a layer that reads its ``index`` port."""
+        """Make the indexer, and each call's cache of keys, values and indexer keys,
+        which the sparse attention ops read (`bux_vllm.sparse`): of keys and values
+        alone for a layer that reads its ``index`` port."""
         ix = None if self.reads_index else c["indexer"]
         if ix is not None:
             rotated_dims = rotated(self.dk, c["rope"])
@@ -185,7 +185,7 @@ class Attention(Layer):
         settings = (c["sliding_window_size"], self.scale, c["softcap"], self.sinks)
         groups = (self.kv_first, self.g)
         spec = picks.layer_spec(ix, self.indexer, settings, self.dk, groups)
-        self.caches, self.index_caches = sparse.layer_caches(
+        self.caches = sparse.layer_caches(
             spec,
             self.g,
             self.dk + self.dv,
@@ -212,8 +212,7 @@ class Attention(Layer):
         self.rel_table = nn.Parameter(table, requires_grad=False)
         settings = (c["sliding_window_size"], self.scale, c["softcap"], self.sinks)
         spec = picks.layer_spec(None, None, settings, self.dk, (self.kv_first, self.g))
-        names = {"full_attention": names["full_attention"]}
-        self.caches, _ = sparse.layer_caches(
+        self.caches = sparse.layer_caches(
             spec, self.g, self.dk + self.dv, 0, names, site.vllm_config
         )
 
