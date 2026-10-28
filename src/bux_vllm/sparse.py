@@ -29,7 +29,7 @@ from vllm.v1.attention.backend import (
 )
 from vllm.v1.kv_cache_interface import FullAttentionSpec
 
-from . import picks
+from . import kernels, picks
 from .kv import reads, writes
 
 #: The ops, as vLLM's compilation names them.
@@ -251,7 +251,7 @@ def sparse_attention(
         rows = (tables[0][part.requests], tables[1][part.requests])
         at = part.tokens
         q_, iq, iw, pos = (t[at] for t in tensors)
-        out, (kept, valid) = picks.attend_segment(
+        out, (kept, valid) = _segments(cache)(
             cache.sparse, q_, (iq, iw), pos, caches, rows, part.keys
         )
         output[at] = out.to(output.dtype)
@@ -287,7 +287,8 @@ def picked_attention(
     for part in picks.segments(*_bounds(meta), q.device):
         at = part.tokens
         picked = (picked_keys[at], picked_valid[at])
-        out = picks.attend_picked(
+        attend = kernels.attend_picked if _kernels(cache) else picks.attend_picked
+        out = attend(
             cache.sparse,
             q[at],
             picked,
@@ -297,6 +298,19 @@ def picked_attention(
             part.keys,
         )
         output[at] = out.to(output.dtype)
+
+
+def _kernels(cache: PagedCache) -> bool:
+    """Whether the Triton kernels attend over the call's `cache` (`bux_vllm.kernels`)."""
+    assert cache.sparse is not None
+    dims = (cache.sparse.dk, cache.channels - cache.sparse.dk)
+    return kernels.takes(cache.sparse, dims)
+
+
+def _segments(cache: PagedCache) -> Any:
+    """How a segment of the call's queries picks and attends: by the kernels where
+    they take its settings, else by PyTorch."""
+    return kernels.attend_segment if _kernels(cache) else picks.attend_segment
 
 
 def _metadata() -> dict | None:
