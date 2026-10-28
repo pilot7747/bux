@@ -1,6 +1,6 @@
 """Check the vLLM plugin's fused kernels of the residual algebras
 (`bux_vllm.streams`) against its PyTorch path (`bux_vllm.residual`) on a GPU, on
-random streams, and time both.
+random streams, and time both at decoding steps of 8 and 64 tokens.
 
 Run it where the plugin, vLLM and Triton are installed, with a CUDA GPU::
 
@@ -8,11 +8,16 @@ Run it where the plugin, vLLM and Triton are installed, with a CUDA GPU::
 
 For each setting (hc with dynamic weights or static ones, single-pass; mhc
 likewise; attnres in blocks, the block under way or not, and without blocks), dtype
-(float32, bfloat16) and stream (a fresh embedding's copies, or written by a branch),
-it runs six branches of the algebra and a merge both ways, on the same weights and
-a body of ``tanh(h W)``, and compares every read and the merge: within 1e-4 in
-float32 and 3e-2 in bfloat16 of the largest value. It prints each, with the time of
-a branch both ways at the width given, and exits nonzero if any differ.
+(float32, bfloat16) and width, it runs six branches of the algebra and a merge,
+from a fresh embedding's copies, on the same weights and a body of ``tanh(h W)``,
+three ways: the PyTorch path in float32 (the reference), the PyTorch path in the
+dtype, and the kernels in it. Every read and the merge are measured against the
+reference, relative to its largest value. In float32 the kernels must agree within
+1e-4. In bfloat16 they must be off by no more than twice what the PyTorch path is,
+which rounds every term of the export where the kernels round their results once:
+the rule `scripts/vllm_parity.py` holds vLLM to against bux in bfloat16. It prints
+each, with the time of a branch both ways at the width given, at 8 and 64 tokens,
+and exits nonzero if any differ.
 """
 
 from __future__ import annotations
@@ -26,7 +31,7 @@ import torch
 
 from bux_vllm import residual
 
-TOLERANCE = {torch.float32: 1e-4, torch.bfloat16: 3e-2}
+TOLERANCE = 1e-4  # the kernels' in float32, of the reference's largest value
 SETTINGS = {
     "hc": {"type": "hc", "expansion": 4, "dynamic": True, "single_pass": False},
     "hc of 3": {"type": "hc", "expansion": 3, "dynamic": True, "single_pass": False},
@@ -56,6 +61,7 @@ SETTINGS = {
 }
 DEFAULTS = {"norm_eps": 1e-6, "sinkhorn_iters": 20}
 BRANCHES = 6
+TIMED = (8, 64)  # the tokens of the decoding steps a branch is timed at
 
 
 def context() -> Any:
@@ -69,53 +75,65 @@ def build(c: dict, d: int, choice: str, body: bool = True) -> residual.Branch:
     return residual.ALGEBRAS[c["type"]](c, d, body=body).cuda()
 
 
-def twins(c: dict, d: int, dtype: torch.dtype, body: bool = True) -> tuple:
-    """The two paths' branches of the same random weights, in `dtype`."""
-    torch.set_default_dtype(dtype)
-    torch_path, fused = build(c, d, "torch", body), build(c, d, "triton", body)
+def paths(c: dict, d: int, dtype: torch.dtype, body: bool = True) -> dict:
+    """The reference's, the PyTorch path's and the kernels' branches of the same
+    random weights, rounded to `dtype`: the first in float32, the others in it."""
+    ways = {"reference": (torch.float32, "torch"), "torch": (dtype, "torch")}
+    ways["fused"] = (dtype, "triton")
+    out = {}
+    for way, (kind, choice) in ways.items():
+        torch.set_default_dtype(kind)
+        out[way] = build(c, d, choice, body)
     torch.set_default_dtype(torch.float32)
-    for (_, a), (_, b) in zip(
-        torch_path.named_parameters(), fused.named_parameters(), strict=True
-    ):
-        a.data = (torch.randn_like(a) / 2).to(dtype)
-        b.data.copy_(a.data)
-    return torch_path, fused
+    for params in zip(*(m.parameters() for m in out.values()), strict=True):
+        value = (torch.randn_like(params[0]) / 2).to(dtype)
+        for param in params:
+            param.data.copy_(value)
+    return out
 
 
 def through(branches: list, x: Any, body: torch.Tensor) -> tuple[list, Any, Any]:
     """Run the stream x through `branches`, each body ``tanh(h body)``; return what
     each read, the stream after them, and the pass's context."""
-    ctx, reads = context(), []
+    ctx, got = context(), []
     for branch in branches:
         h, kept = branch.read(x, ctx)
-        reads.append(h)
-        x = branch.write_back(kept, torch.tanh(h @ body))
-    return reads, x, ctx
+        got.append(h)
+        x = branch.write_back(kept, torch.tanh(h @ body.to(h.dtype)))
+    return got, x, ctx
 
 
-def merge(c: dict, d: int, dtype: torch.dtype) -> tuple:
-    """The two paths' merges, or None for single-pass hc and mhc."""
-    if c.get("single_pass"):
-        return None, None
-    return twins(c, d, dtype, body=False)
+def reads(c: dict, d: int, tokens: int, dtype: torch.dtype) -> dict[str, list]:
+    """Every read of six branches and the merge's (single-pass hc and mhc have no
+    reader of their own), each way of `paths`, of one embedding."""
+    branches = [paths(c, d, dtype) for _ in range(BRANCHES)]
+    readers = None if c.get("single_pass") else paths(c, d, dtype, body=False)
+    x0 = torch.randn(tokens, d, device="cuda").to(dtype)
+    body = (torch.randn(d, d, device="cuda") / d**0.5).to(dtype)
+    out = {}
+    for way in branches[0]:
+        start = residual.widen(c, x0.to(torch.float32 if way == "reference" else dtype))
+        got, x, ctx = through([b[way] for b in branches], start, body)
+        if readers is not None:
+            got.append(readers[way].read(x, ctx)[0])
+        out[way] = got
+    return out
 
 
 def check(name: str, c: dict, d: int, tokens: int, dtype: torch.dtype) -> bool:
-    """Compare the paths on `name`'s setting; print a line, return whether they
-    agree."""
-    c = DEFAULTS | c
-    pairs = [twins(c, d, dtype) for _ in range(BRANCHES)]
-    x0 = torch.randn(tokens, d, device="cuda", dtype=dtype)
-    body = (torch.randn(d, d, device="cuda") / d**0.5).to(dtype)
-    want, x, ctx = through([p[0] for p in pairs], residual.widen(c, x0), body)
-    got, y, ctx_fused = through([p[1] for p in pairs], residual.widen(c, x0), body)
-    readers = merge(c, d, dtype)
-    if readers[0] is not None:
-        want.append(readers[0].read(x, ctx)[0])
-        got.append(readers[1].read(y, ctx_fused)[0])
-    worst = max(_error(g, w) for g, w in zip(got, want, strict=True))
-    ok = worst <= TOLERANCE[dtype]
-    print(f"{name:22s} {dtype!s:15s} worst {worst:.2e}  {'ok' if ok else 'DIFFERS'}")
+    """Measure the paths against the reference on `name`'s setting; print a line,
+    return whether the kernels pass."""
+    got = reads(DEFAULTS | c, d, tokens, dtype)
+    error = {
+        way: max(_error(g, w) for g, w in zip(got[way], got["reference"], strict=True))
+        for way in ("torch", "fused")
+    }
+    bound = TOLERANCE if dtype == torch.float32 else 2 * error["torch"]
+    ok = error["fused"] <= bound
+    print(
+        f"{name:22s} {dtype!s:15s} d={d:5d} kernels {error['fused']:.2e} "
+        f"(PyTorch's {error['torch']:.2e})  {'ok' if ok else 'DIFFERS'}"
+    )
     return ok
 
 
@@ -130,7 +148,8 @@ def timed(c: dict, d: int, tokens: int) -> tuple[float, float]:
     `tokens` tokens."""
     c = DEFAULTS | c
     out = []
-    for branch in twins(c, d, torch.bfloat16):
+    ways = paths(c, d, torch.bfloat16)
+    for branch in (ways["torch"], ways["fused"]):
         x = residual.widen(
             c, torch.randn(tokens, d, device="cuda", dtype=torch.bfloat16)
         )
@@ -145,20 +164,27 @@ def _step(branch: residual.Branch, x: Any, y: torch.Tensor) -> Any:
     return branch.write_back(kept, y)
 
 
-def _milliseconds(fn: Any, repeats: int = 50) -> float:
-    """The mean time of `fn` on the GPU, after warming up."""
+def _milliseconds(fn: Any, repeats: int = 20, steps: int = 10) -> float:
+    """The mean time of `fn` on the GPU, replayed in a CUDA graph of `steps` calls,
+    as vLLM's decoding steps run, after warming up (Triton compiles then)."""
     for _ in range(3):
         fn()
+    torch.cuda.synchronize()
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        for _ in range(steps):
+            fn()
+    graph.replay()
     start, end = (
         torch.cuda.Event(enable_timing=True),
         torch.cuda.Event(enable_timing=True),
     )
     start.record()
     for _ in range(repeats):
-        fn()
+        graph.replay()
     end.record()
     torch.cuda.synchronize()
-    return start.elapsed_time(end) / repeats
+    return start.elapsed_time(end) / (repeats * steps)
 
 
 def main() -> None:
@@ -176,10 +202,12 @@ def main() -> None:
         if not check(name, c, d, args.tokens, dtype)
     ]
     for name, c in SETTINGS.items():
-        slow, fast = timed(c, args.width, args.tokens)
-        print(
-            f"{name:22s} a branch at d={args.width}: torch {slow:.3f} ms, fused {fast:.3f} ms"
-        )
+        for tokens in TIMED:
+            slow, fast = timed(c, args.width, tokens)
+            print(
+                f"{name:22s} a branch at d={args.width}, {tokens:3d} tokens: "
+                f"torch {slow:.3f} ms, fused {fast:.3f} ms"
+            )
     sys.exit(1 if bad else 0)
 
 

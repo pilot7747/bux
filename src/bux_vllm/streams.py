@@ -15,7 +15,9 @@ branch reads it in one kernel and writes it in another:
 - `attnres_read`: attnres's softmax over its sources of
   ``rmsnorm(v) . w``, and their mix.
 
-They compute in float32 from the stream's dtype; ``scripts/vllm_residual.py``
+A token's program takes its whole row at once, up to `ROW` channels of each stream,
+so that the few programs of a decoding step each make one round of loads. They
+compute in float32 from the stream's dtype; ``scripts/vllm_residual.py``
 checks them against PyTorch's path on a GPU. They run in a 16-bit model by
 default, and under ``BUX_VLLM_RESIDUAL_KERNELS=triton`` in any (``torch`` keeps
 PyTorch's path: `bux_vllm.residual.fused`). Each is one of vLLM's custom ops, which
@@ -29,9 +31,12 @@ import triton
 import triton.language as tl
 from vllm.utils.torch_utils import direct_register_custom_op
 
-BLOCK_D = 512  # the channels a kernel takes at once, of each stream
-MHC_BLOCK = 128  # those mhc's read takes, beside a tile of its projection
-SOURCES_BLOCK = 256  # those attnres's read takes, of every source
+#: The most channels of each stream a token's program takes at once: a whole row
+#: of a model up to that wide, so that a decoding step's few programs each make
+#: one round of loads rather than a loop of them.
+ROW = 4096
+SOURCES_ROW = 1024  # the most of every attnres source's, all of them at once
+MHC_BLOCK = 256  # those mhc's read takes beside a tile of its projection
 EPS = 1e-6  # in Sinkhorn's sums and added to mhc's read: bux_vllm.residual.EPS
 #: How a read weighs the streams: by its own coefficients, by those the branch
 #: before computed (single-pass), or stream 0 alone (single-pass, the first).
@@ -41,6 +46,13 @@ OWN, PENDING, FIRST = 0, 1, 2
 def pad(n: int) -> int:
     """The power of two that holds `n` in a kernel, 2 at least."""
     return max(2, triton.next_power_of_2(n))
+
+
+def row(d: int, most: int = ROW) -> dict:
+    """The block of a token's program over d channels, the row whole up to `most`,
+    and the warps that hold it: 4 for 1024 channels at most, up to 16."""
+    block = min(triton.next_power_of_2(d), most)
+    return {"BLOCK": block, "num_warps": max(4, min(16, block // 256))}
 
 
 @triton.jit
@@ -194,8 +206,7 @@ def hc_read(
         BETA=static_beta is not None,
         DYNAMIC=wa is not None,
         MODE=weighing,
-        BLOCK=BLOCK_D,
-        num_warps=4,
+        **row(d),
     )
 
 
@@ -223,15 +234,17 @@ def _mhc_read_kernel(
     DYNAMIC: tl.constexpr,
     MODE: tl.constexpr,
     BLOCK: tl.constexpr,
+    READ_BLOCK: tl.constexpr,
 ):
     """A token's mhc logits, (KP,), its read's coefficients ``sigmoid(pre) + EPS``,
-    (NP,), and its read."""
+    (NP,), and its read, of `READ_BLOCK` channels at once."""
     t = tl.program_id(0).to(tl.int64)
     j, c = tl.arange(0, NP), tl.arange(0, KP)
     on_j, on_c = j < N, c < K
     logits = tl.load(bias_ptr + c, mask=on_c, other=0.0).to(tl.float32)
-    if DYNAMIC:
-        squares, dots = tl.zeros((BLOCK,), tl.float32), tl.zeros((KP,), tl.float32)
+    if DYNAMIC:  # each lane's sums, reduced once at the end
+        squares = tl.zeros((BLOCK,), tl.float32)
+        dots = tl.zeros((BLOCK, KP), tl.float32)
         for stream in tl.static_range(N):
             for start in range(0, d, BLOCK):
                 i = start + tl.arange(0, BLOCK)
@@ -241,17 +254,17 @@ def _mhc_read_kernel(
                 rows = (stream * d + i)[:, None] * K + c[None, :]
                 p = tl.load(p_ptr + rows, mask=on_i[:, None] & on_c[None, :], other=0.0)
                 squares += x * x
-                dots += tl.sum(x[:, None] * p.to(tl.float32), 0)
+                dots += x[:, None] * p.to(tl.float32)
         rms = tl.rsqrt(tl.sum(squares, 0) / (N * d) + eps)
         group = tl.where(c < N, 0, tl.where(c < 2 * N, 1, 2))
         a = tl.load(scale_ptr + group, mask=on_c, other=0.0).to(tl.float32)
-        logits += dots * rms * a
+        logits += tl.sum(dots, 0) * rms * a
     tl.store(logits_ptr + t * KP + c, logits)
     pre = tl.sum(tl.where(c[None, :] == j[:, None], logits[None, :], 0.0), 1)
     own = tl.where(on_j, tl.sigmoid(pre) + 1e-6, 0.0)
     tl.store(read_ptr + t * NP + j, own)
     r = _read_weights(own, pend_ptr, sp_t, sp_n, t, j, on_j, MODE)
-    _mix_read(x_ptr, sx_t, sx_n, h_ptr, sh_t, r, t, j, on_j, d, BLOCK)
+    _mix_read(x_ptr, sx_t, sx_n, h_ptr, sh_t, r, t, j, on_j, d, READ_BLOCK)
 
 
 def mhc_read(
@@ -294,7 +307,8 @@ def mhc_read(
         DYNAMIC=proj is not None,
         MODE=weighing,
         BLOCK=MHC_BLOCK,
-        num_warps=4,
+        READ_BLOCK=min(triton.next_power_of_2(d), ROW // 2),
+        num_warps=8,
     )
 
 
@@ -398,8 +412,7 @@ def mix_write(
         NP=pad(n),
         SINKHORN=iters > 0,
         ITERS=max(iters, 1),
-        BLOCK=BLOCK_D,
-        num_warps=4,
+        **row(d),
     )
 
 
@@ -499,8 +512,7 @@ def attnres_read(
         eps,
         MP=pad(m),
         PARTIAL=partial is not None,
-        BLOCK=SOURCES_BLOCK,
-        num_warps=4,
+        **row(d, SOURCES_ROW),
     )
 
 
