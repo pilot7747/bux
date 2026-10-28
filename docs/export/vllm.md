@@ -254,7 +254,9 @@ how often it moves it.
   with the PyTorch path on a GPU and times a branch both ways.
 
 The kernels are custom ops that stay inside vLLM's CUDA graphs: the graphs split at
-attention and the recurrent and MoE layers' ops, not at these.
+attention and the recurrent and MoE layers' ops, not at these. On an NVIDIA B300
+(2026-10-28, vLLM 0.32.0, a step of 8 tokens in a CUDA graph), an `hc` branch's read
+and write take 0.013 ms fused against 0.094 ms in PyTorch.
 
 ## Sparse attention
 
