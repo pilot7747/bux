@@ -28,9 +28,11 @@ from vllm.compilation.decorators import support_torch_compile
 from vllm.config import VllmConfig
 from vllm.model_executor.models.interfaces import IsHybrid
 from vllm.sequence import IntermediateTensors
+from vllm.v1.kv_cache_interface import MambaSpec
 
-from . import residual, ssm
+from . import conv, residual, ssm
 from .common import Ctx, Layer, Site
+from .config import states
 from .plan import Call, Node, Plan, Pos, Scope, at, children, is_call, live, plan
 
 #: The modules of this package that hold layers.
@@ -57,18 +59,23 @@ class Unused(Layer):
 
 
 def cache_name(slot: int, path: str) -> str:
-    """vLLM's name of the state of the `slot`-th call that keeps one, of the layer
-    at `path`: with one integer, the slot, as vLLM orders its caches by it."""
+    """vLLM's name of the `slot`-th state the model keeps, of the layer at `path`:
+    with one integer, the slot, as vLLM orders its caches by it."""
     return f"caches.{slot}.{path.replace('.', '_')}"
 
 
 def state_names(calls: list[Call]) -> dict[str, list[str]]:
-    """The names of the states of each stateful layer's calls, by its path."""
+    """The names of the states of each stateful layer's calls, by its path: each
+    call's in turn, its first named by the path, the others by the path and their
+    kind (`bux_vllm.config.states`)."""
     out: dict[str, list[str]] = {}
     for call in calls:
         if _class(call).stateful:
+            kinds = states(call.layer["config"]) or ["state"]
             names = out.setdefault(call.path, [])
-            names.append(cache_name(sum(map(len, out.values())), call.path))
+            for i, kind in enumerate(kinds):
+                path = call.path if i == 0 else f"{call.path}.{kind}"
+                names.append(cache_name(sum(map(len, out.values())), path))
     return out
 
 
@@ -290,9 +297,9 @@ class BuxModel(Scoped):
 class BuxForCausalLM(nn.Module, IsHybrid):
     """A bux model in vLLM: `BuxModel`, and its first head's logits.
 
-    It is a hybrid for vLLM where it has recurrent layers (``config.layer_types``
-    says so), whose state's shape and dtype it gives from the config
-    (`bux_vllm.ssm`).
+    It is a hybrid for vLLM where it has recurrent layers or convs on keys and
+    values (``config.layer_types`` says so), whose states' shapes and dtypes it
+    gives from the config (`bux_vllm.ssm`, `bux_vllm.conv`).
     """
 
     is_hybrid: ClassVar = True
@@ -342,6 +349,18 @@ class BuxForCausalLM(nn.Module, IsHybrid):
     @classmethod
     def get_mamba_state_dtype_from_config(cls, vllm_config: VllmConfig) -> tuple:
         return ssm.state_dtypes(vllm_config)
+
+    @classmethod
+    def get_mamba_specs_from_config(cls, vllm_config: VllmConfig) -> tuple:
+        """Every shape of state the model keeps in vLLM's Mamba cache, by which vLLM
+        sizes its pages: its recurrent layers', and its convs' on keys and values."""
+        shapes = ssm.state_shapes(vllm_config)
+        dtypes = ssm.state_dtypes(vllm_config) if shapes else ()
+        specs = [MambaSpec(shapes=shapes, dtypes=dtypes, block_size=-1)]
+        dtype = conv.state_dtype(vllm_config)
+        for shape in conv.state_shapes(vllm_config):
+            specs.append(MambaSpec(shapes=shape, dtypes=dtype, block_size=-1))
+        return tuple(specs)
 
     @classmethod
     def get_mamba_state_copy_func(cls) -> tuple:

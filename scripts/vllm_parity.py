@@ -212,6 +212,12 @@ CASES = {
     + FFN
     + "model = embed [rmsnorm attn] [rmsnorm ffn] [rmsnorm gated] [rmsnorm ffn]"
     " rmsnorm head",
+    "kv-conv": HEAD
+    + FFN
+    + "attn = gqa(num_heads=4, num_kv_heads=2, kv_conv_size=4, rope=rope())\n"
+    + "local = attn(sliding_window_size=8, qk_norm=rmsnorm)\n"
+    + "model = embed [rmsnorm attn(v=@v1)] [rmsnorm ffn] [rmsnorm local]"
+    " [rmsnorm ffn] [rmsnorm attn(v=$v1!)] rmsnorm head",
 }
 
 LENGTHS = (3, 17, 40, 64)  # the prompts', in one batch: within and past a window
