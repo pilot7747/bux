@@ -1052,6 +1052,52 @@ def test_a_value_residual_mixes_the_taps_values_into_the_layers(kind, learned, w
     assert jnp.allclose(v, a * own + b * first, atol=1e-6)
 
 
+KV_WRITE = ir.Port(name="kv", tap="kv", mode="write")
+
+
+def rms(x, eps):
+    return x * jax.lax.rsqrt(jnp.mean(x * x, -1, keepdims=True) + eps)
+
+
+@pytest.mark.parametrize("conv", [None, 3], ids=["plain", "conv"])
+@pytest.mark.parametrize("fused", [False, True], ids=["split", "fused"])
+def test_values_from_the_keys_are_each_heads_key_rms_normalized(conv, fused):
+    """Gemma 4's K=V: v = rmsnorm(W_k x) per head, with no gain and no RoPE, at the
+    key norm's eps; the keys go on through their norm and RoPE."""
+    kw = {
+        "qk_norm": cfg.NormalizationConfig(type="rmsnorm", eps=1e-5),
+        "kv_conv_size": conv,
+    }
+    attn = gqa((KV_WRITE,), k_eq_v=True, fused_qkv=fused, **kw)
+    assert attn.v is None and attn.v_conv is None and attn.v_norm is not None
+    x = inputs()
+    taps = Taps()
+    attn(x, taps)
+    [(k, v)] = taps["kv"]
+    raw = attn.qkv(x)[..., 32:] if attn.qkv is not None else attn.k(x)
+    assert raw.shape == (2, 12, 16)
+    if attn.k_conv is not None:
+        raw = raw + attn.k_conv(raw, Taps())
+    heads = raw.reshape(2, 12, 2, 8)
+    assert jnp.allclose(v, rms(heads, 1e-5), atol=1e-5)
+    assert attn.k_norm is not None and attn.rope is not None
+    assert jnp.allclose(k, rotate(attn.k_norm(heads), attn.rope), atol=1e-5)
+
+
+def test_values_from_the_keys_take_no_parameters_and_default_off_changes_nothing():
+    plain, same = gqa(), gqa(k_eq_v=False)
+    shared = gqa(k_eq_v=True)
+    params = lambda m: jax.tree.leaves(nnx.state(m, nnx.Param))
+    assert all(jnp.array_equal(a, b) for a, b in zip(params(plain), params(same)))
+    assert num_params(plain) - num_params(shared) == 32 * 16  # no v projection
+    x = inputs()
+    assert jnp.array_equal(plain(x, Taps()), same(x, Taps()))
+    with pytest.raises(ValueError, match="v_head_dim"):
+        cfg.GQAConfig(
+            num_heads=4, num_kv_heads=2, head_dim=8, v_head_dim=4, k_eq_v=True
+        )
+
+
 # --- Split over devices (bux.parallel) -------------------------------------------------
 
 ONE = "mesh(data=1)"

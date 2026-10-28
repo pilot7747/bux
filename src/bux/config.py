@@ -560,6 +560,21 @@ class GQAConfig(QuadraticAttentionConfig):
     # a v + b v1 starting from a = b = 0.5: "fixed" keeps a and b (ResFormer's code),
     # "learned" learns both (Learnable-ResFormer), "convex" learns a, with b = 1 - a.
     value_residual: Literal["fixed", "learned", "convex"] = "fixed"
+    # Values from the key projection, no v projection of their own (Gemma 4's global
+    # layers, attention_k_eq_v): each head's projected key, after the conv with
+    # kv_conv_size, RMS-normalized without a gain, at qk_norm's eps (1e-6 without
+    # one), and not rotated; the keys go on through qk_norm and RoPE.
+    k_eq_v: bool = False
+
+    @model_validator(mode="after")
+    def _k_eq_v(self) -> Self:
+        """Check that values from the keys have the keys' width."""
+        if self.k_eq_v and self.v_head_dim not in (None, self.head_dim):
+            raise ValueError(
+                "gqa(k_eq_v=true) makes the values from the keys, so v_head_dim is "
+                f"head_dim: give no v_head_dim (got {self.v_head_dim})"
+            )
+        return self
 
 
 class MLAConfig(QuadraticAttentionConfig):
