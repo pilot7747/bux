@@ -8,6 +8,9 @@ with a tool's result of ``--tool`` tokens appended. So each turn's prompt starts
 the last one, and vLLM's prefix cache serves it. ``--concurrency`` sessions run at a
 time, ``--sessions`` times as many in all: a closed loop, a new session starting as
 one ends. Each concurrency in a list runs in turn, from an empty prefix cache.
+With ``--slo``, a concurrency whose median time per output token passes it ends the
+list, and ``--refine`` more concurrencies are timed between the one of the most
+sessions per hour within it and the next one timed.
 
 Tokens are random ids: the weights are too (``load_format="dummy"``), so only the
 time counts. It prints a JSON line of the totals. The tutorial "Old against new at
@@ -77,6 +80,10 @@ def parser() -> argparse.ArgumentParser:
     p.add_argument("--max-num-batched-tokens", type=int, default=16384)
     p.add_argument("--tp", type=int, default=1)
     p.add_argument("--seed", type=int, default=0)
+    p.add_argument("--slo", type=float, help="ms per output token, p50: none past it")
+    p.add_argument(
+        "--refine", type=int, default=0, help="with --slo: concurrencies to add"
+    )
     p.add_argument("--tag", default="", help="a name for the JSON line")
     p.add_argument(
         "--engine",
@@ -109,11 +116,40 @@ async def run(a: argparse.Namespace) -> None:
     vocab = engine.model_config.get_vocab_size()
     system = _tokens(random.Random(a.seed), vocab, a.system)
     await _session(engine, a, system, random.Random(-1), vocab, "warmup", Totals(), 1)
+    done: dict[int, dict] = {}
     for c in a.concurrency:
-        await engine.reset_prefix_cache()
-        totals = await _load(engine, a, system, vocab, c)
-        print(json.dumps(_summary(a, engine, totals, c)), flush=True)
+        done[c] = await _timed(engine, a, system, vocab, c)
+        if a.slo is not None and done[c]["tpot_p50_ms"] > a.slo:
+            break
+    for c in _between(done, a.slo, a.refine):
+        done[c] = await _timed(engine, a, system, vocab, c)
     engine.shutdown()
+
+
+async def _timed(
+    engine: AsyncLLM, a: argparse.Namespace, system: list[int], vocab: int, c: int
+) -> dict:
+    """Time `c` sessions at once from an empty prefix cache, and print the line."""
+    await engine.reset_prefix_cache()
+    line = _summary(a, engine, await _load(engine, a, system, vocab, c), c)
+    print(json.dumps(line), flush=True)
+    return line
+
+
+def _between(done: dict[int, dict], slo: float | None, n: int) -> list[int]:
+    """`n` concurrencies spaced evenly in log between the one of the most sessions
+    per hour within `slo` and the next one timed; none without both."""
+    ok = [
+        c for c, line in done.items() if slo is not None and line["tpot_p50_ms"] <= slo
+    ]
+    if not ok or n < 1:
+        return []
+    best = max(ok, key=lambda c: done[c]["sessions_per_hour"])
+    nxt = min((c for c in done if c > best), default=None)
+    if nxt is None:
+        return []
+    steps = (round(best * (nxt / best) ** (i / (n + 1))) for i in range(1, n + 1))
+    return sorted({c for c in steps if best < c < nxt})
 
 
 async def _load(
