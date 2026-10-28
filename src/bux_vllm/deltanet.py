@@ -40,21 +40,16 @@ class Mixer(Recurrent):
         self.h, self.hv, self.dk, self.dv = h // self.tp, hv // self.tp, dk, dv
         projection = deltanet_projection(c, self.tp)  # q, k, v, step[, decay]
         self.split, self.parts = projection.split, projection.parts
+        kw = {"bias": False, "return_bias": False, "quant_config": self.quant}
         self.in_proj = MergedColumnParallelLinear(
-            width,
-            projection.sizes,
-            bias=False,
-            return_bias=False,
-            prefix=f"{prefix}.in_proj",
+            width, projection.sizes, prefix=f"{prefix}.in_proj", **kw
         )
         zero_padding(self.in_proj, sum(self.split[self.parts :]))
         self._decay(c, width)
         self._gate(c, width)
         self.conv_taps(c)
         self.norm = Norm(rms(c["norm_eps"]), dv)
-        self.o = RowParallelLinear(
-            hv * dv, width, bias=False, return_bias=False, prefix=f"{prefix}.o"
-        )
+        self.o = RowParallelLinear(hv * dv, width, prefix=f"{prefix}.o", **kw)
 
     def _decay(self, c: dict, width: int) -> None:
         """The decay's parameters: none for ``deltanet``, a rate per value head for
@@ -66,7 +61,7 @@ class Mixer(Recurrent):
             self.A_log, self.dt_bias = float32(self.hv), float32(self.hv)
         if c["type"] == "kda":
             rank = c["gate_rank"] or dk
-            self.f = LowRank(width, rank, hv * dk, f"{self.prefix}.f")
+            self.f = LowRank(width, rank, hv * dk, f"{self.prefix}.f", quant=self.quant)
             self.A_log, self.dt_bias = float32(self.hv), float32(self.hv * dk)
             bound = c["gate_lower_bound"]
             self.floor = None if bound is None else -bound
@@ -77,12 +72,18 @@ class Mixer(Recurrent):
         self.gate: nn.Module | None = None
         if c["output_gate"] is None:
             return
+        prefix = f"{self.prefix}.gate"
         if c.get("output_gate_rank"):
             rank = c["output_gate_rank"]
-            self.gate = LowRank(width, rank, hv * dv, f"{self.prefix}.gate")
+            self.gate = LowRank(width, rank, hv * dv, prefix, quant=self.quant)
             return
         self.gate = ColumnParallelLinear(
-            width, hv * dv, bias=False, return_bias=False, prefix=f"{self.prefix}.gate"
+            width,
+            hv * dv,
+            bias=False,
+            return_bias=False,
+            quant_config=self.quant,
+            prefix=prefix,
         )
 
     def get_state_shape(self) -> tuple:

@@ -125,9 +125,19 @@ class BuxConfig(PreTrainedConfig):
         self.num_hidden_layers = len(self.layer_types)
         layers = [c.layer for c in calls]
         self._set_heads(layers)
+        self._set_experts(layers)
         embed = next((n for n in layers if n["config"]["type"] == "embed"), None)
         if embed is not None and embed["config"]["max_positions"]:
             self.max_position_embeddings = embed["config"]["max_positions"]
+
+    def _set_experts(self, layers: list[dict]) -> None:
+        """Set the routed experts and picks vLLM reads an MoE by (Mixtral's names),
+        the most of any ``moe`` layer's; 0 for a model without one. vLLM builds its
+        expert-parallel group for a model with experts alone, which FP8 experts
+        under tensor parallelism reduce their scales over."""
+        moes = [n["config"] for n in layers if n["config"]["type"] == "moe"]
+        self.num_experts = max((c["num_experts"] for c in moes), default=0)
+        self.num_experts_per_tok = max((c["top_k"] for c in moes), default=0)
 
     def _set_heads(self, layers: list[dict]) -> None:
         """Set the attention heads vLLM sizes the KV cache by, from the first

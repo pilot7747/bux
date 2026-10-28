@@ -63,25 +63,22 @@ class Mixer(Recurrent):
         self.h, self.hv, self.dk, self.dv = h // self.tp, hv // self.tp, dk, dv
         projection = gdn2_projection(c, self.tp)  # q, k, v, erase, write
         self.split = projection.split
+        kw = {"bias": False, "return_bias": False, "quant_config": self.quant}
         self.in_proj = MergedColumnParallelLinear(
-            width,
-            projection.sizes,
-            bias=False,
-            return_bias=False,
-            prefix=f"{prefix}.in_proj",
+            width, projection.sizes, prefix=f"{prefix}.in_proj", **kw
         )
         zero_padding(self.in_proj, sum(self.split[3:]))
-        self.f = LowRank(width, c["gate_rank"] or dv, h * dk, f"{prefix}.f")
+        rank, quant = c["gate_rank"] or dv, self.quant
+        self.f = LowRank(width, rank, h * dk, f"{prefix}.f", quant=quant)
         self.gate = None
         if c["output_gate"] is not None:
             rank = c["output_gate_rank"] or dv
-            self.gate = LowRank(width, rank, hv * dv, f"{prefix}.gate", bias=True)
+            gate = f"{prefix}.gate"
+            self.gate = LowRank(width, rank, hv * dv, gate, bias=True, quant=quant)
         self.conv_taps(c)
         self.A_log, self.dt_bias = float32(self.h), float32(self.h * dk)
         self.norm = Norm(rms(c["norm_eps"]), dv)
-        self.o = RowParallelLinear(
-            hv * dv, width, bias=False, return_bias=False, prefix=f"{prefix}.o"
-        )
+        self.o = RowParallelLinear(hv * dv, width, prefix=f"{prefix}.o", **kw)
 
     def get_state_shape(self) -> tuple:
         return state_shape(self.c, 0, self.tp)

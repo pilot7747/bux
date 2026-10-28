@@ -61,24 +61,19 @@ class Mixer(Recurrent):
         self.register_buffer("rates", rates, persistent=False)
         projection = gla_projection(c, self.tp)  # q, k and v
         self.split = projection.split
+        kw = {"bias": False, "return_bias": False, "quant_config": self.quant}
         self.in_proj = MergedColumnParallelLinear(
-            width,
-            projection.sizes,
-            bias=False,
-            return_bias=False,
-            prefix=f"{prefix}.in_proj",
+            width, projection.sizes, prefix=f"{prefix}.in_proj", **kw
         )
         zero_padding(self.in_proj, sum(self.split[1:]))
         self.gate = None
         if c["output_gate"] is not None:
             self.gate = ColumnParallelLinear(
-                width, hv * dv, bias=False, return_bias=False, prefix=f"{prefix}.gate"
+                width, hv * dv, prefix=f"{prefix}.gate", **kw
             )
         self.conv_taps(c)
         self.norm = AllHeads(rms(c["norm_eps"]), hv, dv, self.tp)
-        self.o = RowParallelLinear(
-            hv * dv, width, bias=False, return_bias=False, prefix=f"{prefix}.o"
-        )
+        self.o = RowParallelLinear(hv * dv, width, prefix=f"{prefix}.o", **kw)
 
     def get_state_shape(self) -> tuple:
         return state_shape(self.c, 0, self.tp)

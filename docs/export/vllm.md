@@ -95,6 +95,148 @@ ones, `--load-format dummy`, to time it.
 - **Unsupported layers.** A layer or setting the plugin does not run raises
   `NotImplementedError` as the model is built, naming it ([What runs](#what-runs)).
 
+## FP8 weights
+
+Serve a bfloat16 export with FP8 weights by vLLM's online quantization. The
+checkpoint stays as it is: vLLM quantizes each weight as it loads it.
+
+```sh
+vllm serve exported/ --dtype bfloat16 --quantization fp8 --moe-backend triton
+```
+
+```python
+llm = LLM(model="exported/", dtype="bfloat16", quantization="fp8", moe_backend="triton")
+```
+
+vLLM 0.32 takes `fp8`, on a checkpoint without FP8 weights, as its `fp8_per_tensor`:
+each weight in FP8 (e4m3) with one scale per tensor, and each GEMM's input
+quantized to FP8 as it runs, with a scale per token (per tensor for the routed
+experts). Its other online schemes reach the same layers: `fp8_per_channel`, a
+weight's scale per output channel (llm-compressor's FP8_DYNAMIC), and
+`fp8_per_block`, per block of 128 by 128 with inputs per group of 128 (DeepSeek's
+FP8). Emulated on the `gpt3`, `llama` and `frontier` models of
+[Checking FP8](#checking-fp8), they come within 0.002 of cosine of `fp8`: the
+rounding of the inputs, which all three scale as they run, is most of what FP8
+costs. On a B300 (SM 10.3), `fp8_per_channel` runs, its routed experts on Triton's
+kernels. `fp8_per_block` does not with its default GEMM, DeepGEMM's, whose JIT
+fails there (CUDA error 719). To serve it by another GEMM, name the GEMM in the
+engine's `kernel_config`, as in
+`kernel_config={"linear_backend_per_quant": {"fp8_block_w8a8": "cutlass"}}` (or
+`"triton"`). Those are not measured yet.
+
+- **Quantized:** every projection the plugin runs on vLLM's linear layers, and the
+  routed and shared experts. That is attention's q, k, v, gate and output
+  projections (`gqa`, `mla`, `csa`), the MLPs and `linear`, LatentMoE's
+  projections, and the projections of `kda`, `gdn2`, `deltanet`, `gla`,
+  `lightning`, `rwkv7` and `short_conv`, their low-rank ones included. vLLM's own
+  `gdn` layer quantizes its projections too, and so does its Mamba-2, where tensor
+  parallelism splits its groups.
+- **Kept in the model's dtype:** the embeddings and the heads, the routers (which
+  the plugin computes in float32), the shared experts' gate, the norms and convs,
+  the residual algebras, the indexers, `engram`, `mamba` (vLLM's Mamba layer takes
+  no quantization), and the KV cache (`--kv-cache-dtype` sets that). So are the
+  weights the plugin reads itself: a sparse `mla`'s `kv_b`, which its sparse
+  attention reads, and `csa`'s grouped low-rank output.
+- **Dtype.** vLLM's FP8 takes bfloat16 and float16 models only.
+- **Random weights.** `--load-format dummy` quantizes the random weights, so a
+  `.bux` file's export times in FP8 too.
+- **Tensor parallelism.** The layers split over ranks as they do in bfloat16, and
+  each weight's scale is the largest over its ranks' shares. For the routed
+  experts' scales vLLM reduces over its expert-parallel group, which it builds for
+  a model whose config names experts: the plugin's names them as Mixtral's does
+  (`num_experts`, `num_experts_per_tok`).
+
+## FP8 KV cache
+
+Keep the KV cache in FP8 too, with FP8 weights or without:
+
+```sh
+vllm serve exported/ --dtype bfloat16 --quantization fp8 --kv-cache-dtype fp8 \
+  --moe-backend triton
+```
+
+The layers that attend by vLLM's own attention keep their cache in FP8 (e4m3), by
+vLLM's backends: it quantizes the keys and values as it caches them. Each layer has
+a scale for its keys and one for its values, which vLLM reads from a checkpoint. An
+export has none, so both are 1.0: the keys and values are cached as they are, to 3
+bits of mantissa, and clip past ±448, FP8's largest value. A model whose keys or
+values reach further needs scales of its own, which the export does not write yet.
+The layers whose cache is the plugin's own refuse an FP8 cache as the model is built
+(`NotImplementedError`, naming the layer and `kv_cache_dtype`), rather than keep it
+in bfloat16.
+
+| Layers | FP8 KV cache |
+|--------|--------------|
+| `gqa` | yes, by vLLM's attention: sliding windows, sinks, soft-capping, gates, QK-norm, `kv_conv_size` (its conv state stays in the model's dtype), the `v` port, and the `kv` port (a reader attends to its writer's FP8 cache). On SM 10.x, see the note on FlashAttention below |
+| `gqa` with an indexer, the `index` port or a relative bias | refused: its cache is the plugin's ([Sparse attention](#sparse-attention)) |
+| `mla` | yes, by vLLM's MLA backends that take FP8: Triton's (a latent of 256 and 32 rotated dims), FlashInfer's on SM 10.x (DeepSeek's dims). A prompt's cached context is dequantized as it is gathered, by vLLM's kernel or, for the latent sizes it lacks, the plugin's. Where no prefill backend of vLLM's takes the dims, the prefill is FlashAttention's, in the model's dtype |
+| `mla` with an indexer or the `index` port | refused: its cache is the plugin's |
+| `csa` | refused: its caches are the plugin's ([Compressed sparse attention](#compressed-sparse-attention)) |
+| `mamba`, `mamba2`, `gdn`, `kda`, `gdn2`, `rwkv7`, `deltanet`, `gla`, `lightning`, `conv`, `short_conv`, `engram` | no KV cache: their states follow `--mamba-cache-dtype` and `--mamba-ssm-cache-dtype` |
+
+:::{warning}
+On a B300 (SM 10.x), vLLM 0.32 attends with FlashAttention (its FA4) where
+FlashInfer does not take a layer, such as at heads of 32 dims. FA4 with an FP8 KV
+cache fails where a rank keeps one KV head ("Expected strides[leading_dim] == 1"):
+under tensor parallelism, or with one KV head to begin with. It also served the
+`kv-conv` case wrong, which crashed on a device-side assert. Pass
+`--attention-backend TRITON_ATTN`, under which both run.
+:::
+
+## Checking FP8
+
+`scripts/vllm_fp8.py` checks FP8 weights, and an FP8 KV cache, on a GPU. It serves
+the same export, with weights, in bfloat16 and in FP8, for a llama and for the
+timeline's milestones at a width of 256: GPT-3's, and 2026's two, a sliding-window
+stack and its KDA hybrid, both with gates and an MoE of 256 experts. `--only` takes
+the cases of `scripts/vllm_parity.py` too. It prints the quantization method vLLM
+picked for each kind of layer, each attention layer's KV cache dtype and backend,
+the routed experts' backend, and how close the FP8 logits are to bfloat16's:
+
+```sh
+JAX_PLATFORMS=cpu python scripts/vllm_fp8.py export runs/fp8   # bux's environment
+python scripts/vllm_fp8.py run runs/fp8 --moe-backend triton  # vLLM's: weights
+python scripts/vllm_fp8.py run runs/fp8 --moe-backend triton --kv-cache-dtype fp8
+```
+
+What FP8 costs is the model's own, so the check holds vLLM to an emulation of it.
+`export` runs each case's transformers model in float32 with FP8's rounding
+emulated, as vLLM rounds it: each linear layer that vLLM quantizes, its weight per
+tensor and its input per token; the routed experts' weights per expert and their
+input per tensor; and, for an FP8 KV cache, the attention's queries, keys and values
+at a scale of 1. A case passes if the cosine of vLLM's FP8 logits with its bfloat16
+logits loses no more than twice the emulation's loss, plus 0.002: their mean at the
+prompts' positions, and their median at the decoding steps, few, of which one may
+pick an expert or a sparse layer's key differently and fall far. That is the rule
+`scripts/vllm_parity.py` holds bfloat16 to against bux. vLLM compares with
+bfloat16 rather than float32, and the emulation leaves the experts' hidden units
+unrounded, so the two differ a little. A weight loaded in the wrong place, or a
+scale set by garbage, costs many times more. A case of layers that only the plugin
+exports has no transformers model to emulate, and its accuracy goes unchecked.
+
+These tiny models of random weights lose far more to FP8 than a trained model
+does. The mean cosine at the prompts' positions, emulated on the CPU and measured
+on one B300 with vLLM 0.32.0 on 2026-10-28, with Triton's MoE kernels:
+
+| Case | Emulated: weights | vLLM: weights | Emulated: weights and KV cache | vLLM: weights and KV cache |
+|------|-------------------|---------------|--------------------------------|----------------------------|
+| `gpt3` | 0.9915 | 0.9919 | 0.9897 | 0.9895 |
+| `llama` | 0.9797 | 0.9803 | 0.9749 | 0.9746 |
+| `frontier` | 0.9629 | 0.9631 | 0.9584 | 0.9599 |
+| `hybrid` | 0.9709 | 0.9714 | 0.9706 | 0.9715 |
+
+Every case passed that day:
+- **The four milestones:** in FP8 at TP=1 and TP=2, with an FP8 KV cache at TP=1,
+  and for `frontier` and `hybrid` at TP=2 too, and under `fp8_per_channel`.
+- **`kv-conv-64`**, with an FP8 KV cache.
+- **The MLA cases**, with an FP8 KV cache: `mla`, `mla-chunked`, `mla-moe` and
+  `mla-deepseek`.
+- **On Triton's attention, with an FP8 KV cache:** `kv-conv`, and `kv-share` and
+  `gpt-oss` at TP=2.
+
+At the prompts' positions, vLLM's mean cosine was within 0.006 of the emulation's
+in every run.
+
 ## How it works
 
 - **The module tree.** `bux_vllm.plan` places every layer where

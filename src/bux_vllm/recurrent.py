@@ -36,7 +36,7 @@ from vllm.utils.torch_utils import direct_register_custom_op
 from vllm.v1.attention.backends.registry import MambaAttentionBackendEnum
 
 from . import delta, dplr
-from .common import ACTIVATIONS, sharded_loader
+from .common import ACTIVATIONS, quantization, sharded_loader
 from .linear import conv_channels, conv_shard
 
 #: The op a recurrent layer's steps run in, out of the compiled graph.
@@ -80,7 +80,9 @@ def float32(*shape: int) -> nn.Parameter:
 
 class Recurrent(nn.Module, MambaBase):
     """vLLM's layer of one call of a recurrent layer: registered under `prefix`, its
-    state in the Mamba cache, its conv's taps if it has one.
+    state in the Mamba cache, its conv's taps if it has one. Its projections take
+    the engine's quantization config, ``quant``; its conv, norms and decay's
+    parameters stay in their dtypes.
 
     Raises:
         NotImplementedError: Speculative decoding, which no layer here keeps the
@@ -96,7 +98,7 @@ class Recurrent(nn.Module, MambaBase):
             raise NotImplementedError(
                 f"{self.what}: speculative decoding not in vLLM yet"
             )
-        self.prefix = prefix
+        self.prefix, self.quant = prefix, quantization(vllm_config)
         self.model_config = vllm_config.model_config
         self.cache_config = vllm_config.cache_config
         self.tp = get_tensor_model_parallel_world_size()
@@ -282,6 +284,8 @@ class LowRank(nn.Module):
         prefix: vLLM's name of the module.
         activation: The activation between, by name; None for none.
         bias: Whether to add a bias c.
+        quant: The engine's quantization config, which A and B take
+            (`bux_vllm.common.quantization`).
     """
 
     def __init__(
@@ -292,13 +296,15 @@ class LowRank(nn.Module):
         prefix: str,
         activation: str | None = None,
         bias: bool = False,
+        quant: Any = None,
     ):
         super().__init__()
+        kw = {"return_bias": False, "quant_config": quant}
         self.down = ReplicatedLinear(
-            n_in, rank, bias=False, return_bias=False, prefix=f"{prefix}.down"
+            n_in, rank, bias=False, prefix=f"{prefix}.down", **kw
         )
         self.up = ColumnParallelLinear(
-            rank, n_out, bias=bias, return_bias=False, prefix=f"{prefix}.up"
+            rank, n_out, bias=bias, prefix=f"{prefix}.up", **kw
         )
         self.activation = activation
 
