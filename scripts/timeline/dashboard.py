@@ -19,15 +19,23 @@ A bux run's config has ``axes``, what it took on each axis by the axis's name
 (``{"model": "rope", "d_model": "d768"}``), ``params``, ``active_params`` and its
 settings under ``train`` and ``arch``. The results' panels read the W&B Tables and
 images (`TABLES`, `PLOTS`) of the newest finished run of the group ``analysis``.
-``--notes`` fills the report's text from a Markdown file of ``## name`` sections:
-``intro``, ``headline``, ``winners``, ``eras``, ``axes``, ``caveats``, and
-``axis: <file>`` for each file's.
+``--notes`` fills the report's text from a Markdown file of ``## name`` sections,
+as dashboard_notes.py writes them: ``intro``, ``headline``, ``best``, ``factorial``,
+``swa``, ``stability``, ``winners``, ``long``, ``eras``, ``results``, ``axes``,
+``caveats``, ``axis: <file>`` for each file's, and ``secondary: ...`` for the
+secondary metrics'.
+
+The report opens on the story: today's best architecture (the candidates and the
+hybrid at each rung, seed by seed), the factorial screen, the sliding-window
+frontier against the hybrid, and the stability findings, before the leaderboard
+and a section per axis file.
 """
 
 import argparse
 import contextlib
 import json
 import re
+import tempfile
 from collections.abc import Iterable
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -59,20 +67,45 @@ FILES = {
     "residuals": "residual",
     "structure": "shape",
     "interactions": "model",
+    "zoo": "model",
+    "zoo_moe": "fr_experts",
+    "sparse": "model",
     "milestones": "model",
     "stacks": "model",
+    "stacks2": "residual",
+    "factorial": "residual",
+    "audit": "residual",
+    "swa": "residual",
     "baseline": None,
 }
-REFERENCE = ("positions", "rope")  # the parent of an axis file's variants: file, label
-# Each file's parent family, (file, label), where it is not REFERENCE.
-PARENTS: dict[str, tuple[str, str | None] | None] = {
-    "positions": ("baseline", None),
-    "milestones": ("baseline", None),
-    "stacks": ("milestones", "m2026_hybrid"),
+REFERENCE = "positions/rope"  # the parent of an axis file's variants: file/label
+# Each file's parent family where the analysis's leaderboard does not name one.
+PARENTS: dict[str, str | None] = {
+    **dict.fromkeys(("positions", "milestones"), "baseline"),
+    **dict.fromkeys(
+        ("stacks", "stacks2", "factorial", "audit"), "milestones/m2026_hybrid"
+    ),
+    **dict.fromkeys(("swa", "zoo_moe"), "milestones/m2026_frontier"),
     "baseline": None,
 }
+HYBRID = ("milestones/m2026_hybrid", "factorial/r0v0k0f0p0s0")  # one model, two files
+CANDIDATES = ("factorial/r1v1k1f0p0s0", "factorial/r1v1k0f0p0s0")
+FRONTIER = ("milestones/m2026_frontier",)
+SWA = ("swa",)  # a file alone is every family of it
+FIXED_LR = "2e-3"  # the factorial's learning rate, which the comparisons hold
+HIGH_LR = "8e-3"  # the top of the stability claims' scans
+# The stability findings' families: who survives 8e-3, logit growth, massive
+# activations, and the switch to rows of 16k.
+SURVIVORS = ("norms/qknorm", "attention/gated", "residuals/hc", "residuals/mhc")
+SURVIVORS += ("norms/sandwich", "norms/postnorm")
+LOGITS = ("positions/rope", "norms/qknorm")
+CREST = ("positions/rope", "attention/gated", "interactions/gated_qk")
+CREST += ("milestones/m2026_hybrid", "factorial/r1v1k1f0p0s0")
+SWITCH = ("positions/rope", "positions/rope_noyarn", "sparse/csa")
 ANALYSIS = "analysis"  # the group of the runs that log the results' tables
 TABLES = {
+    "best": "Today's best architecture at equal serving cost, against the hybrid and 2020",
+    "factorial": "The factorial's main effects",
     "leaderboard": "Every change at its target: Δ by rung, multiplier, (a), (b)",
     "extrapolation_unlimited": "(a) Unlimited data: GPU-hours to the parent's loss",
     "extrapolation_limited": "(b) Limited data: loss on the same tokens",
@@ -121,14 +154,19 @@ class File:
 @dataclass
 class Study:
     """What the project has runs of: its axis files, where each rung's long phase
-    starts and ends in tokens, the runs the views hide, the token scans' labels, and
-    the newest analysis run."""
+    starts and ends in tokens, the runs the views hide, the token scans' labels, the
+    newest analysis run with its tables and each family's parent, and each family's
+    learning rates."""
 
     files: dict[str, File] = field(default_factory=dict)
     phases: dict[str, tuple[float | None, float | None]] = field(default_factory=dict)
     hidden: set[str] = field(default_factory=set)
     scans: set[str] = field(default_factory=set)
     analysis: str | None = None
+    tables: set[str] = field(default_factory=set)  # the analysis run's
+    refs: dict[str, str] = field(default_factory=dict)  # each family's parent
+    lrs: dict[str, set[str]] = field(default_factory=dict)  # each family's lr labels
+    seeds: set[str] = field(default_factory=set)  # the seed axis's labels
 
 
 def study(api: wandb.Api, path: str, keep: set[str]) -> Study:
@@ -141,7 +179,9 @@ def study(api: wandb.Api, path: str, keep: set[str]) -> Study:
         named.setdefault(run.name, []).append(run)
         _add(found, run)
     if analyses:
-        found.analysis = max(analyses, key=lambda r: r.created_at).id
+        newest = max(analyses, key=lambda r: r.created_at)
+        found.analysis, found.tables = newest.id, set(_tables(newest))
+        found.refs = _refs(newest)
     for runs in named.values():
         runs.sort(key=lambda r: (_complete(r), r.id in keep, r.created_at))
         found.hidden |= {r.id for r in runs[:-1]}
@@ -157,12 +197,40 @@ def study(api: wandb.Api, path: str, keep: set[str]) -> Study:
     return found
 
 
+def _tables(run: Any) -> list[str]:
+    """The names of the W&B Tables `run` logged."""
+    logged = run.summary.items()
+    return [
+        k
+        for k, v in logged
+        if getattr(v, "get", None) and v.get("_type") == "table-file"
+    ]
+
+
+def _refs(run: Any) -> dict[str, str]:
+    """Each family's parent, from the leaderboard table `run` logged."""
+    table = run.summary.get("leaderboard")
+    if not table:
+        return {}
+    with tempfile.TemporaryDirectory() as folder:
+        path = run.file(table["path"]).download(root=folder, replace=True).name
+        logged = json.loads(Path(path).read_text())
+    family, ref = (logged["columns"].index(c) for c in ("family", "reference"))
+    return {row[family]: row[ref] for row in logged["data"] if row[ref]}
+
+
 def _add(found: Study, run: Any) -> None:
-    """Add what `run` says of its file: its variants' axis, its rung, its scan."""
+    """Add what `run` says of its file: its variants' axis, its rung, its scan, its
+    learning rate and its seed."""
     axes = run.config.get("axes") or {}
     rung = next((k for k, v in axes.items() if re.fullmatch(r"d\d+", v)), None)
     rest = [k for k in axes if k != rung and k not in NOT_VARIANTS]
     f = found.files.setdefault(run.group, File(next(iter(rest), None)))
+    if f.variant and f.variant in axes:
+        lrs = found.lrs.setdefault(f"{run.group}/{axes[f.variant]}", set())
+        lrs.add(axes.get("optimizer.lr", FIXED_LR))
+    if "seed" in axes:
+        found.seeds.add(axes["seed"])
     if SCAN in axes:
         f.scans = True
         found.scans.add(axes[SCAN])
@@ -220,18 +288,44 @@ def shown(s: Study) -> str:
     return " and ".join(rules)
 
 
-def group_is(file: str, s: Study) -> str:
-    """The filter of an axis file's runs, or its parent's variant's: `PARENTS`."""
-    mine = f"Metric('Group') = '{file}'"
-    parent = PARENTS.get(file, REFERENCE)
-    if parent is None:
-        return mine
-    group, label = parent
-    theirs = f"Metric('Group') = '{group}'"
+def family(name: str, s: Study) -> str:
+    """The filter of a family's runs, ``milestones/m2026_hybrid``, or of a whole
+    file's, ``swa``."""
+    group, _, label = name.partition("/")
+    mine = f"Metric('Group') = '{group}'"
     variant = s.files[group].variant if group in s.files else FILES.get(group)
-    if label is not None and variant:
-        theirs = f"({theirs} and Config('axes.{variant}') = '{label}')"
-    return f"({mine} or {theirs})"
+    if not label or not variant:
+        return mine
+    return f"({mine} and Config('axes.{variant}') = '{label}')"
+
+
+def families(names: Iterable[str], s: Study) -> str:
+    """The filter of the runs of any of the families `names`."""
+    return "(" + " or ".join(family(n, s) for n in names) + ")"
+
+
+def parents(file: str, s: Study) -> set[str]:
+    """The families an axis file's variants are measured against: the analysis's
+    leaderboard's, else `PARENTS`, else `REFERENCE`."""
+    named = {ref for fam, ref in s.refs.items() if fam.split("/")[0] == file}
+    named -= {fam for fam in s.refs if fam.split("/")[0] == file}
+    if named:
+        return named
+    parent = PARENTS.get(file, REFERENCE)
+    return set() if parent is None else {parent}
+
+
+def group_is(file: str, s: Study) -> str:
+    """The filter of an axis file's runs and its parents'."""
+    return families([file, *sorted(parents(file, s))], s)
+
+
+def one_lr(s: Study) -> str:
+    """The filter of the runs at `FIXED_LR`, or with no learning-rate axis."""
+    others = {lr for lrs in s.lrs.values() for lr in lrs} - {FIXED_LR}
+    return " and ".join(
+        f"Config('axes.optimizer.lr') != '{lr}'" for lr in sorted(others)
+    )
 
 
 def at_rung(file: str, s: Study, rung: str | None) -> str:
@@ -330,9 +424,9 @@ def speed(**kw: Any) -> list[wr.LinePlot | wr.BarPlot]:
     ]
 
 
-def results() -> list[wr.WeavePanelSummaryTable | wr.MediaBrowser]:
-    """The analysis's tables and plots."""
-    tables = [wr.WeavePanelSummaryTable(table_name=t) for t in TABLES]
+def results(s: Study) -> list[wr.WeavePanelSummaryTable | wr.MediaBrowser]:
+    """The analysis's tables that it logs, and its plots."""
+    tables = [wr.WeavePanelSummaryTable(table_name=t) for t in TABLES if t in s.tables]
     plots = wr.MediaBrowser(title="fits", media_keys=PLOTS, num_columns=2)
     return [*tables, plots]
 
@@ -372,7 +466,7 @@ def workspace(entity: str, project: str, s: Study) -> ws.Workspace:
             section("Stability", stability()),
             section("LR sensitivity", [lr_scatter(), lr_scatter("repo_bpb")]),
             section("Throughput", speed(**LEAST)),
-            section("Results", results()),
+            section("Results", results(s)),
         ],
         settings=ws.WorkspaceSettings(x_axis=X, max_runs=100),
         runset_settings=ws.RunsetSettings(
@@ -456,8 +550,8 @@ def per_file(e: str, p: str, s: Study, n: dict[str, str]) -> list:
     """A collapsed heading per axis file: its note, a grid per rung, its scans."""
     blocks: list = [wr.H1(text="Per axis")]
     for file, f in s.files.items():
-        parent = PARENTS.get(file, REFERENCE)
-        beside = "" if parent is None else f", beside {'/'.join(filter(None, parent))}"
+        against = ", ".join(sorted(parents(file, s)))
+        beside = f", beside {against}" if against else ""
         how = f"A line per {f.variant or 'run'}{beside}: its best run at each point."
         inner: list = [text(n, f"axis: {file}", f"what {file} found."), wr.P(text=how)]
         for rung in f.rungs or [None]:
@@ -470,7 +564,7 @@ def per_file(e: str, p: str, s: Study, n: dict[str, str]) -> list:
 
 def unstable(e: str, p: str, s: Study) -> list:
     """A collapsed heading per axis file, with its runs' signs of instability."""
-    blocks: list = [wr.H1(text="Stability")]
+    blocks: list = [wr.H1(text="Stability by axis")]
     for file in s.files:
         panels = [
             curve("loss", "loss, raw: spikes"),
@@ -487,6 +581,234 @@ def unstable(e: str, p: str, s: Study) -> list:
     return blocks
 
 
+def kept_at(s: Study, rung: str | None, *rules: str, show: bool = True) -> str:
+    """The filter of the runs at `FIXED_LR`, at `rung` if given, that `rules` keep
+    too; of the shown ones alone with `show`."""
+    rung_rule = f"Config('axes.{RUNG}') = '{rung}'" if rung else ""
+    kept = (shown(s) if show else "", one_lr(s), rung_rule, *rules)
+    return " and ".join(r for r in kept if r)
+
+
+def by_seed(e: str, p: str, name: str, filters: str) -> wr.Runset:
+    """A runset of `filters`'s runs, seed by seed, so that a seed's runs sit side by
+    side."""
+    order = [wr.OrderBy(wr.Config("axes.seed"), ascending=True)]
+    order.append(wr.OrderBy(wr.Metric("Name"), ascending=True))
+    return wr.Runset(entity=e, project=p, name=name, filters=filters, order=order)
+
+
+def table(name: str, s: Study, e: str, p: str) -> list:
+    """A grid of the analysis's table `name`, where the analysis logs one."""
+    if name not in s.tables:
+        return []
+    runs = runset(e, p, ANALYSIS, f"Metric('ID') = '{s.analysis}'")
+    return [grid(runs, [wr.WeavePanelSummaryTable(table_name=name)], columns=1)]
+
+
+def best(e: str, p: str, s: Study, n: dict[str, str]) -> list:
+    """Today's best architecture: the analysis's table, and the candidates' and the
+    hybrid's runs at each rung, seed by seed, and across the rungs."""
+    arms = families((*CANDIDATES, *HYBRID), s)
+    rungs = s.files["factorial"].rungs if "factorial" in s.files else list(RUNGS)
+    blocks: list = [
+        wr.H1(text="Today's best architecture"),
+        text(n, "best", "the best."),
+        *([text(n, "secondary: flags", "")] if "secondary: flags" in n else []),
+    ]
+    blocks += table("best", s, e, p)
+    note = "The candidates and the hybrid (factorial r0v0k0f0p0s0 and milestones "
+    note += f"m2026_hybrid, one model), at lr {FIXED_LR}, a run per seed, seed by seed."
+    blocks.append(wr.P(text=note))
+    for rung in rungs:
+        panels = [
+            curve(OBJECTIVE, "objective"),
+            curve("repo_bpb_8k", "repo_bpb past 8k"),
+            curve("loss", "loss", smoothing_type="exponential", smoothing_factor=0.8),
+            bars([OBJECTIVE], "final objective, seed by seed"),
+            bars(["repo_bpb_8k"], "final repo_bpb past 8k, seed by seed"),
+            bars(EVALS, "final code, repo, web bpb"),
+        ]
+        runs = by_seed(e, p, f"candidates {rung}", kept_at(s, rung, arms))
+        blocks += [wr.H3(text=rung), grid(runs, panels)]
+    across = [
+        scatter(wr.Config("arch.d_model"), OBJECTIVE, "objective by width"),
+        scatter(wr.Config("arch.d_model"), "repo_bpb_8k", "repo_bpb past 8k by width"),
+        bars(["repo_bpb_8k"], "repo_bpb past 8k, by rung", aggregate=True),
+    ]
+    group = [f"config.axes.{RUNG}", "Group", "config.axes.residual"]
+    runs = runset(e, p, "candidates by rung", kept_at(s, None, arms), groupby=group)
+    blocks += [wr.H3(text="by rung"), grid(runs, across)]
+    return blocks
+
+
+def factorial(e: str, p: str, s: Study, n: dict[str, str]) -> list:
+    """The factorial screen: its note and main effects, and each arm's finals at
+    d512 over its seeds."""
+    blocks: list = [
+        wr.H1(text="The factorial screen"),
+        text(n, "factorial", "the factorial."),
+    ]
+    blocks += table("factorial", s, e, p)
+    arms = families(("factorial", HYBRID[0]), s)
+    mean = {"aggregate": True, "groupby_aggfunc": "mean", "groupby_rangefunc": "minmax"}
+    panels = [
+        bars([OBJECTIVE], "final objective, mean over seeds", **mean),
+        bars(["repo_bpb_8k"], "final repo_bpb past 8k", **mean),
+        bars(EVALS, "final code, repo, web bpb", **mean),
+        curve(OBJECTIVE, "objective", **mean),
+    ]
+    group = ["Group", "config.axes.residual"]
+    runs = runset(e, p, "factorial d512", kept_at(s, "d512", arms), groupby=group)
+    note = "Every arm at d512, the mean of its seeds; milestones is the hybrid's arm."
+    return [*blocks, wr.P(text=note), grid(runs, panels)]
+
+
+def frontier(e: str, p: str, s: Study, n: dict[str, str]) -> list:
+    """The sliding-window frontier against the KDA hybrid: the frontier, its arms,
+    the hybrid and the candidates at each rung, the mean of their seeds."""
+    blocks: list = [
+        wr.H1(text="Sliding windows against the hybrid"),
+        text(n, "swa", "SWA."),
+    ]
+    arms = families((*FRONTIER, *SWA, HYBRID[0], *CANDIDATES), s)
+    mean = {"aggregate": True, "groupby_aggfunc": "mean", "groupby_rangefunc": "minmax"}
+    group = ["Group", "config.axes.model", "config.axes.residual"]
+    rungs = s.files["swa"].rungs if "swa" in s.files else list(RUNGS)[:2]
+    for rung in rungs:
+        panels = [
+            curve(OBJECTIVE, "objective", **mean),
+            curve("repo_bpb", "repo_bpb, rows of 16k", **mean),
+            curve("repo_bpb_8k", "repo_bpb past 8k", **mean),
+            bars([OBJECTIVE, "repo_bpb_8k"], "final objective and past 8k", **mean),
+            bars(["tokens_per_s", "mfu"], "tokens/s and MFU", **mean),
+        ]
+        runs = runset(e, p, f"windows {rung}", kept_at(s, rung, arms), groupby=group)
+        blocks += [wr.H3(text=rung), grid(runs, panels)]
+    return blocks
+
+
+def claims(e: str, p: str, s: Study, n: dict[str, str]) -> list:
+    """The stability section: the secondary metrics' notes, and a grid for each of
+    their findings, at d512 on seed 0 but where a rung is named."""
+    blocks: list = [wr.H1(text="Stability"), text(n, "stability", "stability.")]
+    blocks.append(text(n, "secondary: summary", "the secondary metrics."))
+    others = sorted(s.seeds - {"0"})
+    seed0 = " and ".join(f"Config('axes.seed') != '{x}'" for x in others)
+    for title, notes_, grids in _findings(s, seed0):
+        blocks += [wr.H2(text=title), *(text(n, k, title) for k in notes_ if k in n)]
+        for subtitle, rules, panels in grids:
+            runs = by_seed(e, p, subtitle, f"{shown(s)} and {rules}")
+            blocks += [wr.H3(text=subtitle), grid(runs, panels, 2)]
+    return blocks
+
+
+def _findings(s: Study, seed0: str) -> list[tuple[str, tuple[str, ...], list]]:
+    """Each stability finding: its title, its notes, and its grids, each a title, the
+    filter of its runs and its panels."""
+
+    def at(lr: str) -> str:
+        return f"Config('axes.optimizer.lr') = '{lr}'"
+
+    def rung(r: str) -> str:
+        return f"Config('axes.{RUNG}') = '{r}'"
+
+    # An OR of ANDs: W&B's filters take one level of parentheses.
+    ends = [(name, HIGH_LR) for name in SURVIVORS] + [(REFERENCE, FIXED_LR)]
+    survive = " or ".join(f"({family(name, s)} and {at(lr)})" for name, lr in ends)
+    survive = f"({survive})"
+    logits = f"{families(LOGITS, s)} and ({at('2e-3')} or {at('4e-3')})"
+    early = {"range_x": (0, 3000)}
+    switch = s.phases.get("d512", (None, None))[1]
+    near = {"range_x": (0.85 * switch, switch)} if switch else {}
+    candidates = families((*CANDIDATES, HYBRID[0], HYBRID[1]), s)
+    return [
+        (
+            "8e-3: who survives",
+            ("secondary: stability",),
+            [
+                (
+                    f"d512 at {HIGH_LR}, the reference at {FIXED_LR}",
+                    f"{rung('d512')} and {survive}",
+                    [
+                        curve("loss", "8e-3: who survives, loss"),
+                        curve("grad_norm", "8e-3: who survives, grad_norm"),
+                    ],
+                )
+            ],
+        ),
+        (
+            "Attention logit growth",
+            (),
+            [
+                (
+                    "the reference and QK-norm at 2e-3 and 4e-3, d512",
+                    f"{rung('d512')} and {logits} and {seed0}",
+                    [
+                        layers_at(
+                            "attn/logit_max/.*", "attn/logit_max, every layer", early
+                        ),
+                        layers_at(
+                            "attn/entropy/.*", "attn/entropy, every layer", early
+                        ),
+                    ],
+                )
+            ],
+        ),
+        (
+            "Massive activations",
+            ("secondary: fp8",),
+            [
+                (
+                    "the stream's largest entry and its rms, d512",
+                    kept_at(s, "d512", families(CREST, s), seed0, show=False),
+                    [
+                        layers("act/max_abs/.*", "act/max_abs, every branch"),
+                        layers("act/rms/.*", "act/rms, every branch"),
+                    ],
+                )
+            ],
+        ),
+        (
+            "The candidates against the hybrid",
+            ("secondary: candidates", "secondary: moe"),
+            [
+                (
+                    f"candidates and the hybrid, {r}, seed 0",
+                    kept_at(s, r, candidates, seed0, show=False),
+                    [
+                        curve("grad_norm", "grad_norm: hc clips more"),
+                        layers("act/rms/.*", "act/rms of the stream, every branch"),
+                        layers("router/max_load/.*", "router/max_load, every MoE"),
+                        layers("router/dead/.*", "router/dead, every MoE"),
+                    ],
+                )
+                for r in ("d512", "d1024")
+            ],
+        ),
+        (
+            "The 16k switch",
+            ("secondary: switch",),
+            [
+                (
+                    "rope, rope without YaRN, and CSA, d512, around 90% of training",
+                    kept_at(s, "d512", families(SWITCH, s), show=False),
+                    [
+                        curve("loss", "loss at the switch", **near),
+                        curve("repo_bpb_8k", "repo_bpb past 8k"),
+                    ],
+                )
+            ],
+        ),
+    ]
+
+
+def layers_at(pattern: str, title: str, kw: dict) -> wr.LinePlot:
+    """`layers`, over a range of steps."""
+    panel = layers(pattern, title)
+    panel.range_x = kw.get("range_x", (None, None))
+    return panel
+
+
 def report(e: str, p: str, s: Study, n: dict[str, str], api: wandb.Api) -> wr.Report:
     """The report: the headline, the leaderboard, each axis file, long context,
     stability, speed and the results; an existing report of the same title is
@@ -501,6 +823,10 @@ def report(e: str, p: str, s: Study, n: dict[str, str], api: wandb.Api) -> wr.Re
             n, "intro", "the question, the baseline, the recipe and how to read this."
         ),
         text(n, "headline", "the headline."),
+        *best(e, p, s, n),
+        *factorial(e, p, s, n),
+        *frontier(e, p, s, n),
+        *claims(e, p, s, n),
         wr.H1(text="Leaderboard"),
         text(n, "winners", "the winners at equal serving cost."),
         wr.P(text="Each axis file at each rung: its best run's objective."),
@@ -529,19 +855,21 @@ def report(e: str, p: str, s: Study, n: dict[str, str], api: wandb.Api) -> wr.Re
                 ),
             ],
         ),
+        text(n, "long", "long context."),
         *unstable(e, p, s),
         wr.H1(text="Throughput and cost"),
         grid(runset(e, p, "every run", every), speed()),
         wr.H1(text="Results"),
         text(n, "eras", "each era's milestone under both regimes."),
+        text(n, "results", "each change alone."),
         text(n, "axes", "each axis's best change."),
         wr.H2(text="The analysis's tables"),
         wr.P(
             text="From the newest analysis run: "
-            + "; ".join(f"{k}: {v}" for k, v in TABLES.items())
+            + "; ".join(f"{k}: {v}" for k, v in TABLES.items() if k in s.tables)
             + "."
         ),
-        grid(runset(e, p, ANALYSIS, analysis), results(), columns=1),
+        grid(runset(e, p, ANALYSIS, analysis), results(s), columns=1),
         wr.H2(text="Caveats"),
         text(n, "caveats", "the caveats."),
     ]
