@@ -241,7 +241,8 @@ class NGramInputs:
         reqs = input_batch.idx_mapping[:n].long()
         end = req_states.num_computed_tokens.gpu[reqs].long()
         at = end[:, None] + self.ngram_offsets
-        ids = req_states.all_token_ids.gpu[reqs[:, None], at.clamp(min=0)].long()
+        tokens = req_states.all_token_ids.gpu
+        ids = tokens[reqs[:, None], at.clamp(0, tokens.shape[1] - 1)].long()
         out[:n].copy_(torch.where(at >= 0, ids, -1))
         return out
 

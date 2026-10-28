@@ -40,9 +40,14 @@ class Mixer(Recurrent):
         self.c = c
         h, hv, dk, dv = linear_dims(c)
         self.h, self.hv, self.dk, self.dv = h // self.tp, hv // self.tp, dk, dv
-        sizes, self.split, _ = deltanet_projection(c, self.tp)  # q, k, v, step
+        projection = deltanet_projection(c, self.tp)  # q, k, v, step
+        self.split = projection.split
         self.in_proj = MergedColumnParallelLinear(
-            width, sizes, bias=False, return_bias=False, prefix=f"{prefix}.in_proj"
+            width,
+            projection.sizes,
+            bias=False,
+            return_bias=False,
+            prefix=f"{prefix}.in_proj",
         )
         zero_padding(self.in_proj, sum(self.split[2:]))
         self.gate = None

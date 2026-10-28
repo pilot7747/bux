@@ -256,7 +256,7 @@ CASES = {
     "kda-kimi": GATED_HEAD
     + "delta = kda(num_heads=4, head_dim=32, output_gate_rank=32, norm_eps=1e-5)\n"
     + LINEAR_HYBRID,
-    # The timeline's hybrid at widths no multiple of 8: KDA's fused projection is
+    # A hybrid at a width no multiple of 8: KDA's fused projection is
     # 550 wide (padded to 576), beside gated attention and a sigmoid MoE.
     "kda-odd": GATED_HEAD.replace("d_model = 128", "d_model = 136")
     + EXPERT
