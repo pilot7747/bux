@@ -1,6 +1,6 @@
 """Recurrent layers in vLLM, by its own Mamba-2 and Gated DeltaNet layers: bux's
-``mamba2`` and ``gdn``, their state in vLLM's Mamba cache, as ``kda``'s is
-(`bux_vllm.kda`).
+``mamba2`` and ``gdn``, their state in vLLM's Mamba cache, as the plugin's own
+recurrent layers' is (``kda``, ``gdn2``, ``rwkv7``: `bux_vllm.recurrent`).
 
 A model with them is a hybrid, whose class tells vLLM the shape and dtype of a
 layer's state from the config, before it builds the model (`state_shapes`,
@@ -26,13 +26,16 @@ from vllm.model_executor.layers.mamba.mamba_utils import (
     MambaStateShapeCalculator,
 )
 
-from . import kda
+from . import gdn2, kda, recurrent, rwkv7
 from .common import Ctx, Layer, Site
 from .linear import conv_weight, linear_dims
 from .plan import live, plan
 
+#: The recurrent layer types the plugin computes itself, by their modules.
+OWN = {"kda": kda, "gdn2": gdn2, "rwkv7": rwkv7}
+
 #: The recurrent layer types, which keep their state in vLLM's Mamba cache.
-RECURRENT = ("mamba2", "gdn", "kda")
+RECURRENT = ("mamba2", "gdn", *OWN)
 
 
 def mamba2_dims(c: dict, width: int) -> tuple[int, int]:
@@ -177,8 +180,8 @@ def state_shapes(vllm_config: Any) -> tuple:
     kind, c, width = found
     tp = vllm_config.parallel_config.tensor_parallel_size
     spec = vllm_config.num_speculative_tokens
-    if kind == "kda":
-        return kda.state_shape(c, tp)
+    if kind in OWN:
+        return OWN[kind].state_shape(c, width, tp)
     if kind == "gdn":
         h, hv, dk, dv = linear_dims(c)
         return MambaStateShapeCalculator.gated_delta_net_state_shape(
@@ -201,8 +204,8 @@ def state_dtypes(vllm_config: Any) -> tuple:
     """The dtypes of the state of each of the model's recurrent layers."""
     cache = vllm_config.cache_config
     found = _recurrent(vllm_config.model_config.hf_config)
-    if found is not None and found[0] == "kda":
-        return kda.state_dtype(vllm_config.model_config, cache)
+    if found is not None and found[0] in OWN:
+        return recurrent.state_dtype(vllm_config.model_config, cache)
     return MambaStateDtypeCalculator.mamba2_state_dtype(
         vllm_config.model_config.dtype,
         cache.mamba_cache_dtype,
@@ -212,7 +215,8 @@ def state_dtypes(vllm_config: Any) -> tuple:
 
 def copy_funcs(kind: str) -> tuple:
     """How vLLM copies the state of a recurrent layer of vLLM's `kind`
-    (``MAMBA2``, or ``GDN_ATTN``: ``gdn``'s and ``kda``'s) for prefix caching."""
+    (``MAMBA2``, or ``GDN_ATTN``: ``gdn``'s, and the plugin's own layers') for
+    prefix caching."""
     if kind == "GDN_ATTN":
         return MambaStateCopyFuncCalculator.gated_delta_net_state_copy_func()
     return MambaStateCopyFuncCalculator.mamba2_state_copy_func()

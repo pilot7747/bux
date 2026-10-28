@@ -15,38 +15,25 @@ from typing import Any
 
 import torch
 from torch import nn
-from vllm.distributed import (
-    get_tensor_model_parallel_rank,
-    get_tensor_model_parallel_world_size,
-)
 from vllm.forward_context import get_forward_context
 from vllm.model_executor.layers.linear import (
     ColumnParallelLinear,
     ReplicatedLinear,
     RowParallelLinear,
 )
-from vllm.model_executor.layers.mamba.abstract import MambaBase
 from vllm.model_executor.layers.mamba.gdn.kimi_gdn_linear_attn import (
     _KimiGDNMergedColumnParallelLinear,
 )
-from vllm.model_executor.layers.mamba.mamba_utils import (
-    MambaStateDtypeCalculator,
-    MambaStateShapeCalculator,
-    is_conv_state_dim_first,
-)
-from vllm.model_executor.layers.mamba.ops.causal_conv1d import (
-    causal_conv1d_fn,
-    causal_conv1d_update,
-)
+from vllm.model_executor.layers.mamba.mamba_utils import MambaStateShapeCalculator
 from vllm.model_executor.layers.mamba.ops.gather_initial_states import (
     gather_initial_states,
 )
 from vllm.third_party.flash_linear_attention.ops.kda import FusedRMSNormGated
 from vllm.utils.torch_utils import direct_register_custom_op
-from vllm.v1.attention.backends.registry import MambaAttentionBackendEnum
 
-from .common import Ctx, Layer, Site, sharded_loader
-from .linear import conv_channels, conv_shard, linear_dims, to_value_heads
+from .common import Ctx, Layer, Site
+from .linear import conv_channels, linear_dims, to_value_heads
+from .recurrent import Recurrent, float32, low_rank_tensor, split_op
 
 #: The op the conv and recurrence run in, outside the compiled graph.
 OP = "bux_kda"
@@ -71,22 +58,12 @@ def check(c: dict) -> None:
         raise NotImplementedError(f"kda: gate_lower_bound under {LOWEST_BOUND}")
 
 
-def state_shape(c: dict, tp: int) -> tuple:
+def state_shape(c: dict, width: int, tp: int) -> tuple:
     """The shapes of a ``kda`` layer's state on one of `tp` ranks: its conv's last
     inputs of q, k and v, and each value head's (dv, dk) state."""
     h, hv, dk, dv = linear_dims(c)
     return MambaStateShapeCalculator.kda_state_shape(
         tp, hv, dv, h, dk, conv_kernel_size=c["conv_size"]
-    )
-
-
-def state_dtype(model_config: Any, cache_config: Any) -> tuple:
-    """The dtypes of a ``kda`` layer's state: the conv's the model's (or the cache's),
-    the recurrence's float32 (or ``mamba_ssm_cache_dtype``)."""
-    return MambaStateDtypeCalculator.kda_state_dtype(
-        model_config.dtype,
-        cache_config.mamba_cache_dtype,
-        cache_config.mamba_ssm_cache_dtype,
     )
 
 
@@ -115,37 +92,33 @@ def kda_op(
 direct_register_custom_op(op_name=OP, op_func=kda_op, mutates_args=["out"])
 
 
-class Mixer(nn.Module, MambaBase):
-    """vLLM's layer of one ``kda`` call: its weights by rank, its state in the Mamba
-    cache under `prefix`, the projections in the compiled graph and `mix` out of it.
+class Mixer(Recurrent):
+    """vLLM's layer of one ``kda`` call (`Recurrent`): its weights by rank, the
+    projections in the compiled graph and `mix` out of it.
 
     Raises:
         NotImplementedError: Speculative decoding, or what `check` raises for.
     """
 
+    what = "kda"
+
     def __init__(self, c: dict, width: int, vllm_config: Any, prefix: str):
-        super().__init__()
         check(c)
-        if vllm_config.num_speculative_tokens:
-            raise NotImplementedError("kda: speculative decoding not in vLLM yet")
-        self.c, self.prefix = c, prefix
-        self.model_config, self.cache_config = (
-            vllm_config.model_config,
-            vllm_config.cache_config,
-        )
-        self.tp = get_tensor_model_parallel_world_size()
+        super().__init__(vllm_config, prefix)
+        split_op(vllm_config.compilation_config, OP)
+        self.c = c
         h, hv, dk, dv = linear_dims(c)
         self.h, self.hv, self.dk, self.dv = h // self.tp, hv // self.tp, dk, dv
         self.group = hv // h
         self._projections(c, width)
-        self._weights(c)
+        self.conv_taps(c)
+        self.A_log, self.dt_bias = float32(self.hv), float32(self.hv * dk)
         self.norm = FusedRMSNormGated(
             dv, eps=c["norm_eps"], activation=c["output_gate"]
         )
         self.o = RowParallelLinear(
             hv * dv, width, bias=False, return_bias=False, prefix=f"{prefix}.o"
         )
-        _register(vllm_config.compilation_config, prefix, self)
 
     def _projections(self, c: dict, width: int) -> None:
         """q, k, v, a dense output gate, the decay's down projection (on every rank)
@@ -179,35 +152,8 @@ class Mixer(nn.Module, MambaBase):
                 r, hv * dv, bias=False, return_bias=False, prefix=f"{self.prefix}.g_b"
             )
 
-    def _weights(self, c: dict) -> None:
-        """The conv's taps, A_log and dt_bias (float32, as vLLM's KDA keeps them)."""
-        channels = sum(conv_channels(c)) // self.tp
-        self.conv = nn.Parameter(
-            torch.empty(channels, 1, c["conv_size"]), requires_grad=False
-        )
-        f32 = torch.float32
-        self.A_log = nn.Parameter(torch.empty(self.hv, dtype=f32), requires_grad=False)
-        self.dt_bias = nn.Parameter(
-            torch.empty(self.hv * self.dk, dtype=f32), requires_grad=False
-        )
-        for p in (self.A_log, self.dt_bias):
-            p.weight_loader = sharded_loader(0)  # ty: ignore[unresolved-attribute]
-
-    @property
-    def mamba_type(self) -> MambaAttentionBackendEnum:
-        return MambaAttentionBackendEnum.GDN_ATTN
-
     def get_state_shape(self) -> tuple:
-        return state_shape(self.c, self.tp)
-
-    def get_state_dtype(self) -> tuple:
-        return state_dtype(self.model_config, self.cache_config)
-
-    def load_conv(self, tensor: torch.Tensor) -> nn.Parameter:
-        """Load bux's conv taps, (k, C), as this rank's; return the parameter."""
-        rank = get_tensor_model_parallel_rank()
-        self.conv.data.copy_(conv_shard(tensor, conv_channels(self.c), rank, self.tp))
-        return self.conv
+        return state_shape(self.c, 0, self.tp)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         """The layer's output, (T, width), from the tokens' inputs."""
@@ -228,18 +174,19 @@ class Mixer(nn.Module, MambaBase):
         """Convolve q, k and v and run the delta rule from each sequence's state, its
         decay from `g` and step from `beta`: write the heads' outputs, (T, hv, dv),
         to `out`. In a run without metadata (vLLM's profiling), nothing."""
-        meta = get_forward_context().attn_metadata
-        m = meta.get(self.prefix) if isinstance(meta, dict) else None
-        if m is None or m.num_prefills + m.num_decodes == 0:
+        m = self.batch()
+        if m is None:
             return
-        conv_state, state = self.kv_cache
-        if not is_conv_state_dim_first():  # the kernels take (C, taps)
-            conv_state = conv_state.transpose(-1, -2)
-        n = m.num_actual_tokens if m.num_prefills else m.num_decodes
-        gates = (g[:n].unflatten(-1, (self.hv, self.dk))[None], beta[:n][None])
-        step = self._prefill if m.num_prefills else self._decode
-        o = step(qkv[:n], gates, m, conv_state, state)
-        out[:n] = o[0]
+        n = self.tokens(m)
+        q, k, v = self._heads(self.conv_tokens(m, qkv[:n]))
+        gates = {
+            "raw_g": g[:n].unflatten(-1, (self.hv, self.dk))[None],
+            "raw_beta": beta[:n][None],
+            "A_log": self.A_log,
+            "lower_bound": self.c["gate_lower_bound"],
+        }
+        run = self._chunked if m.num_prefills else self._recurrent
+        out[:n] = run(m, q, k, v, gates)[0]
 
     def _heads(self, x: torch.Tensor) -> tuple[torch.Tensor, ...]:
         """q and k at the value heads, and v, each (1, T, hv, d)."""
@@ -248,88 +195,41 @@ class Mixer(nn.Module, MambaBase):
         q, k = (to_value_heads(y, h, self.group) for y in (q, k))
         return q, k, v.reshape(1, -1, self.hv, self.dv).contiguous()
 
-    def _gates(self) -> dict:
-        """What both kernels take of the decay: A_log, dt_bias and the bound."""
-        return {"A_log": self.A_log, "lower_bound": self.c["gate_lower_bound"]}
-
-    def _prefill(
-        self, x: torch.Tensor, gates: tuple, m: Any, conv_state: Any, state: Any
-    ) -> torch.Tensor:
-        """A batch with prompts: the conv and KDA by chunks, from each sequence's
-        state (zero for a new one), keeping the last."""
+    def _chunked(self, m: Any, q: Any, k: Any, v: Any, gates: dict) -> torch.Tensor:
+        """A batch with prompts: KDA by chunks, from each sequence's state (zero for
+        a new one), keeping the last."""
+        state = self.kv_cache[1]
         idx, has = m.non_spec_state_indices_tensor, m.has_initial_state
-        x = causal_conv1d_fn(
-            x.transpose(0, 1),
-            self.conv.flatten(1),
-            None,
-            conv_states=conv_state,
-            query_start_loc=m.non_spec_query_start_loc,
-            cache_indices=idx,
-            has_initial_state=has,
-            activation="silu",
-            metadata=m,
-        ).transpose(0, 1)
-        q, k, v = self._heads(x)
         chunked, _ = kernels()
         o, last = chunked(
             q=q,
             k=k,
             v=v,
-            raw_g=gates[0],
-            raw_beta=gates[1],
             g_bias=self.dt_bias,
             initial_state=gather_initial_states(state, idx, has),
             output_final_state=True,
             use_qk_l2norm_in_kernel=True,
             cu_seqlens=m.non_spec_query_start_loc,
-            **self._gates(),
+            **gates,
         )
         state[idx] = last.to(state.dtype)
         return o
 
-    def _decode(
-        self, x: torch.Tensor, gates: tuple, m: Any, conv_state: Any, state: Any
-    ) -> torch.Tensor:
-        """A batch of decoding steps: the conv's step and KDA's, in place on each
-        sequence's state."""
+    def _recurrent(self, m: Any, q: Any, k: Any, v: Any, gates: dict) -> torch.Tensor:
+        """A batch of decoding steps: KDA's step, in place on each sequence's state."""
         n = m.num_decodes
-        idx = m.non_spec_state_indices_tensor[:n]
-        y = torch.empty(x.shape, dtype=x.dtype, device=x.device)
-        x = causal_conv1d_update(
-            x,
-            conv_state,
-            self.conv.flatten(1),
-            None,
-            activation="silu",
-            conv_state_indices=idx,
-            validate_data=True,
-            out=y,
-        )
-        q, k, v = self._heads(x)
         _, recurrent = kernels()
         o, _ = recurrent(
             q=q,
             k=k,
             v=v,
-            raw_g=gates[0],
-            raw_beta=gates[1],
             dt_bias=self.dt_bias,
-            initial_state=state,
+            initial_state=self.kv_cache[1],
             cu_seqlens=m.non_spec_query_start_loc[: n + 1],
-            ssm_state_indices=idx,
-            **self._gates(),
+            ssm_state_indices=m.non_spec_state_indices_tensor[:n],
+            **gates,
         )
         return o
-
-
-def _register(compilation: Any, prefix: str, layer: nn.Module) -> None:
-    """Make `layer` vLLM's layer `prefix`, and `OP` a place the graph splits at."""
-    if prefix in compilation.static_forward_context:
-        raise ValueError(f"Duplicate layer name: {prefix}")
-    compilation.static_forward_context[prefix] = layer
-    ops = compilation.splitting_ops
-    if ops is not None and f"vllm::{OP}" not in ops:
-        ops.append(f"vllm::{OP}")
 
 
 class KimiDeltaAttention(Layer):
@@ -372,9 +272,7 @@ class KimiDeltaAttention(Layer):
     def load(self, name: str, tensor: torch.Tensor) -> list[nn.Parameter]:
         if name == "conv.weight":
             return [self.mixer.load_conv(tensor)]
-        if name.endswith((".down", ".up")):  # bux's x A B; vLLM's layers hold A^T, B^T
-            tensor = tensor.T
-        return super().load(name, tensor)
+        return super().load(name, low_rank_tensor(name, tensor))
 
     def forward(self, x: torch.Tensor, ctx: Ctx | None = None) -> torch.Tensor:
         return self.mixer(x)

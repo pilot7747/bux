@@ -178,6 +178,18 @@ CASES = {
     "kda-kimi": GATED_HEAD
     + "delta = kda(num_heads=4, head_dim=32, output_gate_rank=32, norm_eps=1e-5)\n"
     + LINEAR_HYBRID,
+    "gdn2": GATED_HEAD
+    + "delta = gdn2(num_heads=2, num_v_heads=4, head_dim=32, gate_lower_bound=-5)\n"
+    + LINEAR_HYBRID,
+    "gdn2-paper": GATED_HEAD
+    + "delta = gdn2(num_heads=4, head_dim=32, gate_rank=8, output_gate_rank=16,"
+    " negative_eigenvalues=true, output_gate=sigmoid)\n" + LINEAR_HYBRID,
+    "rwkv7": GATED_HEAD + "delta = rwkv7(num_heads=2, head_dim=64)\n" + LINEAR_HYBRID,
+    "rwkv7-residual": GATED_HEAD
+    + "mix = rwkv7(num_heads=4, num_v_heads=8, head_dim=32, decay_rank=16, a_rank=16,"
+    " v_rank=8, gate_rank=32)\n"
+    + "model = embed [rmsnorm mix(v=@v0)] [rmsnorm ffn] [rmsnorm attn] [rmsnorm ffn]"
+    " [rmsnorm mix(v=$v0)] [rmsnorm ffn] [rmsnorm mix(v=$v0!)] rmsnorm head",
     "hc": LLAMA + "residual = hc(expansion=4)\nmodel = embed block^2 rmsnorm head",
     "attnres": LLAMA
     + "residual = attnres(block_size=3)\nmodel = embed block^2 rmsnorm head",

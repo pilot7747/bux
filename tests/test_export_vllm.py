@@ -23,10 +23,12 @@ from bux.architecture.attention import rope as bux_rope
 from bux.architecture.attention.gqa import Attention as BuxAttention
 from bux.architecture.experts.moe import MoE
 from bux.export import plan as core
+from bux.export.hf import common as hf_common
 from bux.export.hf import linear_attention as hf_linear
 from bux.export.hf import residual as hf_residual
+from bux.export.hf import rwkv7 as hf_rwkv7
 from bux.lang import compile, compile_file, compile_runs, ir
-from bux_vllm import common, config, kv, linear, plan, residual, routing
+from bux_vllm import common, config, delta, kv, linear, plan, residual, routing
 
 ROOT = Path(__file__).parent.parent
 EXAMPLES = sorted((ROOT / "examples" / "architectures").rglob("*.bux"))
@@ -374,7 +376,8 @@ LINEAR = {
 #: The export's linear-attention layers, by type.
 EXPORTED = {
     kind: cls
-    for cls in vars(hf_linear).values()
+    for module in (hf_linear, hf_rwkv7)
+    for cls in vars(module).values()
     if isinstance(cls, type)
     for kind in getattr(cls, "bux_types", ())
 }
@@ -454,3 +457,107 @@ def test_each_rank_keeps_its_kv_heads(
     kv_heads: int, tp: int, want: list[tuple[int, int]]
 ) -> None:
     assert [kv.kv_heads(kv_heads, tp, rank) for rank in range(tp)] == want
+
+
+def rule_inputs(n: int, h: int = 2, dk: int = 8, dv: int = 4) -> list[torch.Tensor]:
+    """q, k, v, log decay, a and b of n tokens, as GDN-2 makes them: k
+    L2-normalized, a decay per channel, an erase gate in (0, 1)."""
+    q, k = (delta.l2norm(torch.randn(n, h, dk)) for _ in range(2))
+    g = -torch.nn.functional.softplus(torch.randn(n, h, dk))
+    erase = torch.rand(n, h, dk)
+    return [q, k, torch.randn(n, h, dv), g, -g.exp() * erase * k, k]
+
+
+def test_the_delta_rule_of_a_batch_is_the_exports_of_each_prompt() -> None:
+    """Prompts of different lengths, padded side by side (across chunks), each
+    give the export's outputs and last state of that prompt alone, from its own
+    state; a decoding step of each is the export's step."""
+    torch.manual_seed(0)
+    lengths = [3, 64, 100]
+    starts = torch.tensor([0, 3, 67, 167])
+    xs = rule_inputs(167)
+    before = torch.randn(3, 2, 8, 4)
+    padded = [delta.padded(x, starts, max(lengths)) for x in xs]
+    out, after = delta.rank_one(*padded, before)
+    out = delta.unpadded(out, starts, 167)
+    for i in range(3):
+        mine = [x[None, starts[i] : starts[i + 1]] for x in xs]
+        want, last = hf_linear.rank_one(*mine, state=before[i : i + 1])
+        torch.testing.assert_close(out[starts[i] : starts[i + 1]], want[0])
+        torch.testing.assert_close(after[i], last[0])
+    one = rule_inputs(3)
+    got, state = delta.step(*one, before)
+    q, k, v, g, a, b = (x[:, None] for x in one)
+    want, last = hf_linear.recurrence(q, k, v, g, before, a, b)
+    torch.testing.assert_close(got, want[:, 0])
+    torch.testing.assert_close(state, last)
+
+
+def test_a_token_shift_reads_the_token_before_in_its_sequence() -> None:
+    x = torch.arange(6.0)[:, None]
+    starts = torch.tensor([0, 2, 6])
+    before = torch.tensor([[10.0], [20.0]])
+    got = delta.previous(x, starts, before)
+    assert got[:, 0].tolist() == [10, 0, 20, 2, 3, 4]
+
+
+def exported(source: str) -> tuple[Any, dict]:
+    """The export's layer of `source`, in a stream of 64, its weights drawn, and its
+    config."""
+    layer = next(compile(f"d_model = 64\nmodel = {source}").layers())
+    c = layer.config.model_dump(mode="json")
+    m = EXPORTED[c["type"]](c, 64, SimpleNamespace(ports=[], port=lambda *_: None))
+    torch.manual_seed(0)
+    with torch.no_grad():
+        for p in m.parameters():
+            p.normal_(0, 0.3)
+    return m, c
+
+
+def no_cache() -> Any:
+    """The export's context of one whole sequence, without a cache."""
+    return hf_common.Ctx(None, None, None, None, torch.nn.ModuleDict(), lambda *_: None)
+
+
+def by_chunks(xs: list[torch.Tensor], heads: tuple) -> torch.Tensor:
+    """The plugin's rule over one prompt of tokens, from a zero state."""
+    _, hv, dk, dv = heads
+    out, _ = delta.rank_one(*(x[None] for x in xs), torch.zeros(1, hv, dk, dv))
+    return out[0]
+
+
+GDN2 = {
+    "gdn2": "gdn2(num_heads=2, num_v_heads=4, head_dim=16, gate_lower_bound=-5)",
+    "gdn2 paper": "gdn2(num_heads=2, head_dim=16, v_head_dim=8, gate_rank=4,"
+    " negative_eigenvalues=true, output_gate=sigmoid)",
+}
+
+
+@pytest.mark.parametrize("mixer", GDN2.values(), ids=GDN2.keys())
+def test_gdn2_feeds_the_rule_what_the_export_does(mixer: str) -> None:
+    """The plugin's GDN-2 between its projections and its output, on the export's
+    weights and conv (vLLM's kernel convolves the same), is the export's layer."""
+    m, c = exported(mixer)
+    x = torch.randn(100, 64)
+    qkv = torch.cat([m.q(x), m.k(x), m.v(x)], -1)
+    qkv = torch.nn.functional.silu(m.conv(qkv[None], no_cache())[0])
+    heads = linear.linear_dims(c)
+    gates = (m.f(x), m.erase(x), m.write(x))
+    o = by_chunks(delta.gdn2_rule(c, heads, qkv, gates, m.A_log, m.dt_bias), heads)
+    o = m.norm(o).flatten(1) * common.ACTIVATIONS[c["output_gate"]](m.gate(x))
+    torch.testing.assert_close(m.o(o), m(x[None], no_cache())[0])
+
+
+def test_rwkv7_feeds_the_rule_what_the_export_does() -> None:
+    """The plugin's RWKV-7 between its projections and its output, on the export's
+    weights, is the export's layer."""
+    m, c = exported("rwkv7(num_heads=4, num_v_heads=8, head_dim=8, decay_rank=8)")
+    x = torch.randn(100, 64)
+    prev = delta.previous(x, torch.tensor([0, 100]), torch.zeros(1, 64))
+    xr, xw, xk, xv, xa, xg = delta.rwkv7_mixes(x, prev, m.shift)
+    heads = linear.linear_dims(c)
+    v = m.v(xv).unflatten(-1, heads[1::2])
+    raw = (m.w(xw), m.a(xa))
+    xs = delta.rwkv7_rule(heads, m.r(xr), m.k(xk), v, raw, m.k_k, m.k_a)
+    o = m.norm(by_chunks(xs, heads)) + delta.rwkv7_bonus(xs[0], xs[1], v, m.r_k)
+    torch.testing.assert_close(m.o(o.flatten(1) * m.g(xg)), m(x[None], no_cache())[0])
