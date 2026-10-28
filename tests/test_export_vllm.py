@@ -539,9 +539,50 @@ def test_ports_are_read_and_written_as_bux_lists_them() -> None:
     assert kv.reads(ports, "v") == ("v1", True)
     assert kv.reads([["v", "v1", "write"]], "v") is None
     assert kv.writes(ports, "v") == ["v2", "v3"]
-    kv.check_ports(ports)
-    with pytest.raises(NotImplementedError, match="kv port"):
-        kv.check_ports([["kv", "kv", "write"]])
+    gqa = {"indexer": None}
+    kv.check_ports(gqa, ports)
+    kv.check_ports(gqa, [["kv", "kv", "write"], ["v", "v1", "write"]])
+    with pytest.raises(NotImplementedError, match="index port"):
+        kv.check_ports(gqa, [["index", "topk", "write"]])
+    with pytest.raises(NotImplementedError, match="beside reading kv"):
+        kv.check_ports(gqa, [["kv", "kv", "read"], ["v", "v1", "write"]])
+
+
+def test_kv_readers_attend_to_the_cache_of_the_call_their_tap_holds() -> None:
+    """Hymba's wiring: each call that reads the kv port shares the KV cache of the
+    call whose push its tap holds, the last one; ``$kv!`` takes it off, and a
+    reader that writes the port pushes its writer's on."""
+    arch = compile(vllm_parity.CASES["kv-share"])
+    calls = plan.plan(arch.model_dump(mode="json")).calls
+    gqa = [i for i, c in enumerate(calls) if c.layer["config"]["type"] == "gqa"]
+    sources = kv.sources([plan.ports(c.layer) for c in calls])
+    _, w1, s1, _, w2, _, g, r = gqa
+    assert [sources[i] for i in gqa] == [None, None, w1, w1, None, w2, None, g]
+    for reader, writer in [(s1, w1), (r, g)]:
+        node, mine = calls[writer].layer, calls[reader].layer
+        kv.check_shared(mine["config"], node["config"], node["width"])
+        assert config.states(mine["config"], plan.ports(mine)) == ["full_attention"]
+
+
+KV_REFUSED = {
+    "a longer window": ("sliding_window_size=16", "window of 16 over 8"),
+    "no window": ("sliding_window_size=none", "window of None over 8"),
+    "other heads": ("num_kv_heads=4", "heads"),
+}
+
+
+@pytest.mark.parametrize(("setting", "match"), KV_REFUSED.values(), ids=KV_REFUSED)
+def test_kv_readers_that_vllm_cannot_share_with_say_so(
+    setting: str, match: str
+) -> None:
+    """A reader that attends past the writer's window, or reads other heads."""
+    arch = compile(
+        "d_model = 64\nlocal = gqa(num_heads=4, num_kv_heads=2, sliding_window_size=8)\n"
+        f"model = local(kv=@kv) local({setting}, kv=$kv)"
+    )
+    writer, mine = (n.config.model_dump(mode="json") for n in arch.layers())
+    with pytest.raises(NotImplementedError, match=match):
+        kv.check_shared(mine, writer, 64)
 
 
 @pytest.mark.parametrize(
