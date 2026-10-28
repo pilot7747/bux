@@ -49,7 +49,9 @@ class Attention(Layer):
 
     With an indexer, each query attends to the keys the indexer picks alone, as
     bux's do (DSA, and its blocks: QSA's, MSA's), by the plugin's sparse attention
-    op over vLLM's paged caches (`bux_vllm.sparse`).
+    op over vLLM's paged caches (`bux_vllm.sparse`). The ``index`` port passes the
+    picks on: a layer that reads it attends to the keys another's indexer picked,
+    of those its own window sees, and runs no indexer.
 
     Each call of the layer keeps a KV cache of its own, a conv state beside it with
     ``kv_conv_size``, and its indexer's keys with an indexer: a shared layer that
@@ -67,6 +69,7 @@ class Attention(Layer):
         unsupported(c, "relative_bias")
         kv.check_ports(c, site.ports)
         self.reads_kv = kv.reads(site.ports, "kv") is not None
+        self.reads_index = kv.reads(site.ports, "index") is not None
         tp = get_tensor_model_parallel_world_size()
         h, g = c["num_heads"], c["num_kv_heads"]
         dk, dv = kv.head_dims(c, width)
@@ -82,7 +85,7 @@ class Attention(Layer):
         kinds = states(c, site.ports)  # a call's states, side by side in site.caches
         names = {kind: site.caches[i :: len(kinds)] for i, kind in enumerate(kinds)}
         self.indexer = None
-        if c["indexer"]:
+        if c["indexer"] or self.reads_index:
             self._sparse_caches(c, width, site, names)
         else:
             shares = site.shares or [None] * len(names["full_attention"])
@@ -168,15 +171,18 @@ class Attention(Layer):
         self, c: dict, width: int, site: Site, names: dict[str, list[str]]
     ) -> None:
         """Make the indexer, and each call's caches of keys and values and of the
-        indexer's keys, which the sparse attention op reads (`bux_vllm.sparse`)."""
-        ix = c["indexer"]
-        self.indexer = Indexer(ix, width, c["rope"], rotated(self.dk, c["rope"]))
+        indexer's keys, which the sparse attention ops read (`bux_vllm.sparse`):
+        the keys and values alone for a layer that reads its ``index`` port."""
+        ix = None if self.reads_index else c["indexer"]
+        if ix is not None:
+            rotated_dims = rotated(self.dk, c["rope"])
+            self.indexer = Indexer(ix, width, c["rope"], rotated_dims)
         spec = picks.Sparse(
-            ix["top_k"],
-            ix["block_size"],
-            self.indexer.mean,
-            ix["per_group"],
-            ix["relu"],
+            ix["top_k"] if ix else 0,
+            ix["block_size"] if ix else 1,
+            self.indexer is not None and self.indexer.mean,
+            bool(ix and ix["per_group"]),
+            bool(ix and ix["relu"]),
             c["sliding_window_size"],
             self.scale,
             c["softcap"],
@@ -185,10 +191,11 @@ class Attention(Layer):
             self.sinks,
             self.indexer,
         )
-        vllm = site.vllm_config
-        main, index = names["full_attention"], names["index"]
+        self.spec, vllm = spec, site.vllm_config
+        main = names["full_attention"]
+        index = names["index"] if ix else [""] * len(main)  # none for a reader
         self.index_caches = nn.ModuleList(
-            PagedCache(1, ix["head_dim"], vllm, name) for name in index
+            PagedCache(1, ix["head_dim"], vllm, name) for name in index if ix
         )
         channels = self.dk + self.dv
         self.caches = nn.ModuleList(
@@ -287,7 +294,9 @@ class Attention(Layer):
         q, k = self._queries(q, ctx), self._normed(k, self.k_norm, self.g)
         if self.rope is not None:
             k = self.rope(k, ctx.positions)
-        if self.indexer is not None:
+        if self.reads_index:
+            out = self._picked(q, k, v, call, ctx)
+        elif self.indexer is not None:
             out = self._sparse(x, q, k, v, call, ctx)
         else:
             q, k = q.reshape(t, -1).contiguous(), k.reshape(t, -1).contiguous()
@@ -325,11 +334,16 @@ class Attention(Layer):
         ctx: Ctx,
     ) -> torch.Tensor:
         """The heads' outputs, (T, h, dv), of attending to the keys the indexer
-        picks, by the sparse attention op over the `call`-th call's caches."""
+        picks, by the sparse attention op over the `call`-th call's caches; the
+        picks pushed to the taps of the ``index`` port it writes."""
         assert self.indexer is not None
-        at = ctx.positions
-        index = self.indexer
+        at, index, taps = ctx.positions, self.indexer, kv.writes(self.ports, "index")
         out = q.new_empty(q.shape[0], self.h, self.dv)
+        shape = (q.shape[0] if taps else 0, *self._pick_shape())
+        kept = (
+            q.new_zeros(shape, dtype=torch.long),
+            q.new_zeros(shape, dtype=torch.bool),
+        )
         torch.ops.vllm.bux_sparse_attention(
             q.contiguous(),
             k.contiguous(),
@@ -339,8 +353,39 @@ class Attention(Layer):
             index.keys(x, at).contiguous(),
             at,
             out,
+            *kept,
             self.caches[call].prefix,
         )
+        for tap in taps:
+            ctx.push(tap, kept)
+        return out
+
+    def _pick_shape(self) -> tuple[int, ...]:
+        """The shape of a query's picks: ([this rank's kv heads,] keys)."""
+        groups = (self.g,) if self.spec.per_group else ()
+        return (*groups, picks.most(self.spec))
+
+    def _picked(
+        self, q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, call: int, ctx: Ctx
+    ) -> torch.Tensor:
+        """The heads' outputs, (T, h, dv), of attending to the keys another call's
+        indexer picked, which the ``index`` port reads, by the reader's op over the
+        `call`-th call's cache; the picks pushed on to the taps it writes."""
+        read = kv.reads(self.ports, "index")
+        assert read is not None, "a layer that reads its index port"
+        kept = ctx.read(*read)
+        out = q.new_empty(q.shape[0], self.h, self.dv)
+        torch.ops.vllm.bux_picked_attention(
+            q.contiguous(),
+            k.contiguous(),
+            v.view(-1, self.g, self.dv).contiguous(),
+            *kept,
+            ctx.positions,
+            out,
+            self.caches[call].prefix,
+        )
+        for tap in kv.writes(self.ports, "index"):
+            ctx.push(tap, kept)
         return out
 
     def _project(self, x: torch.Tensor, call: int) -> list[torch.Tensor]:

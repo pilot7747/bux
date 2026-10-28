@@ -10,7 +10,9 @@ scores, ranked by the floats' bits, the first of equal ones; with ``block_size``
 whole blocks counted from the request's first token, mean-pooled (QSA) or each
 scored by its best key (MSA); with ``per_group``, a pick for each kv head's group
 of query heads. Picks are key positions with a mask of the valid ones, ``(Q, [G,]
-K)``, so that attending gathers those keys alone.
+K)``, so that attending gathers those keys alone. A layer that reads another's picks
+(the ``index`` port) attends to those it sees itself, by its own window, over its
+own keys (`attend_picked`).
 """
 
 from __future__ import annotations
@@ -318,6 +320,24 @@ def segments(starts: list[int], bounds: list[int], device: Any) -> list[Segment]
     return out
 
 
+#: The keys each query keeps, (Q, [G,] K), and which of them are valid.
+Picked = tuple[torch.Tensor, torch.Tensor]
+
+
+def most(spec: Sparse) -> int:
+    """The most keys a query keeps: the top-k, in whole blocks with blocks, and its
+    own block beside them in QSA's."""
+    size = spec.block_size
+    return spec.top_k if size == 1 else (spec.top_k // size + spec.mean) * size
+
+
+def padded(picked: Picked, k: int) -> Picked:
+    """`picked` padded to `k` keys a query, the padding invalid."""
+    keys, valid = picked
+    pad = keys.new_zeros((*keys.shape[:-1], k - keys.shape[-1]))
+    return torch.cat([keys, pad], -1), torch.cat([valid, pad.bool()], -1)
+
+
 def attend_segment(
     spec: Sparse,
     q: torch.Tensor,
@@ -326,8 +346,9 @@ def attend_segment(
     caches: tuple[torch.Tensor, torch.Tensor],
     rows: tuple[torch.Tensor, torch.Tensor],
     n: int,
-) -> torch.Tensor:
-    """A segment's outputs, (Q, h, dv), a chunk of queries at a time.
+) -> tuple[torch.Tensor, Picked]:
+    """A segment's outputs, (Q, h, dv), a chunk of queries at a time, and its picks
+    padded to `most` keys a query, which the ``index`` port passes on.
 
     Args:
         spec: The layer's settings.
@@ -341,13 +362,70 @@ def attend_segment(
     """
     shared = rows[0].shape[0] == 1
     chunk = max(1, BUDGET // _per_query(spec, q, index[0], caches[0], n, shared))
-    parts = []
+    parts, picks = [], []
     for a in range(0, q.shape[0], chunk):
         cut = slice(a, a + chunk)
         part = rows if shared else (rows[0][cut], rows[1][cut])
         tensors = (q[cut], index[0][cut], index[1][cut], positions[cut])
-        parts.append(_attend_chunk(spec, *tensors, caches, part, n))
+        out, picked = _attend_chunk(spec, *tensors, caches, part, n)
+        parts.append(out)
+        picks.append(padded(picked, most(spec)))
+    keys, valid = zip(*picks, strict=True)
+    return torch.cat(parts), (torch.cat(keys), torch.cat(valid))
+
+
+def attend_picked(
+    spec: Sparse,
+    q: torch.Tensor,
+    picked: Picked,
+    positions: torch.Tensor,
+    cache: torch.Tensor,
+    rows: torch.Tensor,
+    n: int,
+) -> torch.Tensor:
+    """A segment's outputs, (Q, h, dv), over the keys another call's indexer
+    `picked` for its queries (the ``index`` port), of those they see by the layer's
+    own window, a chunk of queries at a time.
+
+    Args:
+        spec: The layer's settings; its window, scale, softcap, dims and sinks.
+        q: The queries, (Q, h, dk).
+        picked: The keys the other call kept for each query, (Q, [G,] K).
+        positions: The queries' positions, (Q,).
+        cache: The layer's own cache of keys and values.
+        rows: Its block tables' rows of the queries' requests, (Q, blocks), or
+            (1, blocks) for one request's.
+        n: How many key positions the requests have, at least.
+    """
+    keys, valid = picked
+    per = cache.shape[1] * keys.shape[-1] * max(cache.shape[3], q.shape[1])
+    chunk = max(1, BUDGET // per)
+    parts = []
+    for a in range(0, q.shape[0], chunk):
+        cut = slice(a, a + chunk)
+        part = rows if rows.shape[0] == 1 else rows[cut]
+        mine = (keys[cut], valid[cut])
+        parts.append(_attend_picked(spec, q[cut], mine, positions[cut], cache, part, n))
     return torch.cat(parts)
+
+
+def _attend_picked(
+    spec: Sparse,
+    q: torch.Tensor,
+    picked: Picked,
+    positions: torch.Tensor,
+    cache: torch.Tensor,
+    rows: torch.Tensor,
+    n: int,
+) -> torch.Tensor:
+    """A chunk's outputs over the picked keys it sees."""
+    keys, valid = picked[0].clamp(0, n - 1), picked[1]
+    see = seen(positions, n, spec.window)
+    view = see if keys.ndim == 2 else see[:, None].expand(-1, keys.shape[1], -1)
+    valid = valid & view.gather(-1, keys)
+    kv = gather(cache, rows.expand(q.shape[0], -1), keys)
+    valid = valid[:, None] if valid.ndim == 2 else valid
+    return attend(q, kv, valid, spec.dk, spec.scale, spec.softcap, spec.sinks)
 
 
 def _per_query(
@@ -374,8 +452,8 @@ def _attend_chunk(
     caches: tuple[torch.Tensor, torch.Tensor],
     rows: tuple[torch.Tensor, torch.Tensor],
     n: int,
-) -> torch.Tensor:
-    """A chunk's outputs: its picks, then its attention over them."""
+) -> tuple[torch.Tensor, Picked]:
+    """A chunk's outputs: its picks, then its attention over them; and the picks."""
     kv_cache, index_cache = caches
     span = torch.arange(n, device=q.device)
     if rows[1].shape[0] == 1:
@@ -385,5 +463,6 @@ def _attend_chunk(
     see = seen(positions, n, spec.window)
     picks, valid = choose(spec, iq, iw, keys, see, positions)
     kv = gather(kv_cache, rows[0].expand(q.shape[0], -1), picks)
-    valid = valid[:, None] if valid.ndim == 2 else valid
-    return attend(q, kv, valid, spec.dk, spec.scale, spec.softcap, spec.sinks)
+    each = valid[:, None] if valid.ndim == 2 else valid
+    out = attend(q, kv, each, spec.dk, spec.scale, spec.softcap, spec.sinks)
+    return out, (picks, valid)

@@ -132,6 +132,15 @@ def test_a_sparse_layer_keeps_its_indexer_keys_beside_its_kv_cache() -> None:
     assert c.layer_types == ["full_attention"] * 2
 
 
+def test_a_layer_that_reads_another_s_picks_keeps_no_indexer_keys() -> None:
+    """The index port's readers attend over the writer's picks and their own keys."""
+    arch = compile(vllm_parity.CASES["dsa-share"])
+    calls = plan.plan(arch.model_dump(mode="json")).calls
+    layers = [c.layer for c in calls if c.layer["config"]["type"] == "gqa"]
+    kept = [config.states(n["config"], plan.ports(n)) for n in layers]
+    assert kept == [["full_attention", "index"]] + [["full_attention"]] * 2
+
+
 def test_a_conv_on_keys_and_values_keeps_a_state_beside_the_kv_cache() -> None:
     arch = compile(vllm_parity.CASES["kv-conv"])
     c = config.BuxConfig(bux=json.loads(arch.model_dump_json()))
@@ -527,10 +536,10 @@ def test_ports_are_read_and_written_as_bux_lists_them() -> None:
     gqa = {"indexer": None}
     kv.check_ports(gqa, ports)
     kv.check_ports(gqa, [["kv", "kv", "write"], ["v", "v1", "write"]])
-    with pytest.raises(NotImplementedError, match="index port"):
-        kv.check_ports(gqa, [["index", "topk", "write"]])
-    with pytest.raises(NotImplementedError, match="beside reading kv"):
-        kv.check_ports(gqa, [["kv", "kv", "read"], ["v", "v1", "write"]])
+    kv.check_ports(gqa, [["kv", "kv", "write"], ["index", "topk", "read"]])
+    for other in (["v", "v1", "write"], ["index", "topk", "read"]):
+        with pytest.raises(NotImplementedError, match="beside reading kv"):
+            kv.check_ports(gqa, [["kv", "kv", "read"], other])
 
 
 def test_kv_readers_attend_to_the_cache_of_the_call_their_tap_holds() -> None:
@@ -853,11 +862,25 @@ def test_sparse_attention_over_paged_caches_is_bux_s(c: dict, window: int | None
     index = (ours.queries(x, at), ours.head_weights(x))
     qs = q[0].transpose(0, 1)
     caches = (kv_cache, index_cache)
-    together = picks.attend_segment(spec, qs, index, at, caches, (table, table), s)
+    together, picked = picks.attend_segment(
+        spec, qs, index, at, caches, (table, table), s
+    )
     rows = table.expand(s, -1)
-    alone = picks.attend_segment(spec, qs, index, at, caches, (rows, rows), s)
+    alone, _ = picks.attend_segment(spec, qs, index, at, caches, (rows, rows), s)
     torch.testing.assert_close(together, want, rtol=1e-5, atol=1e-5)
     torch.testing.assert_close(alone, want, rtol=1e-5, atol=1e-5)
+    # A layer that reads these picks (the index port), with a window of its own.
+    q2, k2, v2 = (torch.randn(1, n, s, dk) for n in (h, g, g))
+    reader_see = picks.seen(at, s, 3)
+    keep = reader_see[None, None] & hf_attention.per_head(kept, h)
+    want = hf_attention.softmax_attention(q2, k2, v2, keep, 0.3, None, None)[0]
+    picks.write(kv_cache, slots, torch.cat([k2[0], v2[0]], -1).transpose(0, 1))
+    reader = picks.Sparse(0, 1, False, False, False, 3, 0.3, None, dk, (0, g))
+    for r in (table, rows):
+        got = picks.attend_picked(
+            reader, q2[0].transpose(0, 1), picked, at, kv_cache, r, s
+        )
+        torch.testing.assert_close(got, want, rtol=1e-5, atol=1e-5)
 
 
 def test_the_step_splits_into_single_queries_and_requests() -> None:
@@ -981,10 +1004,10 @@ def test_single_queries_of_several_requests_attend_to_their_own_keys() -> None:
     spec = picks.Sparse(4, 1, False, False, True, None, 0.3, None, dk, (0, g))
     q, iq, iw = torch.randn(2, 4, dk), torch.randn(2, 2, i), torch.randn(2, 2)
     caches = (kv_cache, index_cache)
-    both = picks.attend_segment(spec, q, (iq, iw), at, caches, (tables, tables), 17)
+    both, _ = picks.attend_segment(spec, q, (iq, iw), at, caches, (tables, tables), 17)
     for r in range(2):
         rows = (tables[r : r + 1], tables[r : r + 1])
-        alone = picks.attend_segment(
+        alone, _ = picks.attend_segment(
             spec,
             q[r : r + 1],
             (iq[r : r + 1], iw[r : r + 1]),
