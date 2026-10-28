@@ -241,18 +241,20 @@ layer: a window, sinks, a softcap, and a `gqa` layer's conv on keys and values a
   keeps the best as bux ranks them: by the floats' bits, the first of equal ones.
   It attends to those keys alone, read from the paged cache by the block table,
   with the layer's scale, softcap and sinks, in float32.
-- **Kernels.** In a 16-bit model, Triton kernels read the paged caches in place:
-  one attends over each query's picks, one scores every key of a decoded token's
-  request, and one scores a prompt's keys for a tile of its queries at a time, each
-  head's dots on the tensor cores and their sum in float32. QSA pools and scores
-  its blocks by PyTorch, and the picks are ranked as bux ranks them. They take DSA's keys, MSA's blocks with picks per group
-  or not, and QSA's blocks, heads of up to 256 dims. MLA's latents, and a float32
-  model unless `BUX_VLLM_SPARSE_KERNELS=triton`, take the PyTorch path, which
-  gathers each query's scores, keys and values into memory first and so moves
-  several times the bytes (`BUX_VLLM_SPARSE_KERNELS=torch` asks for it).
-  `scripts/vllm_kernels.py` compares the two on a GPU. Either way the work runs in
-  ops that vLLM runs eagerly between its CUDA graphs: a model with a sparse layer
-  runs vLLM's piecewise CUDA graphs, never a whole decoding step as one graph.
+- **Kernels.** In a 16-bit model, Triton kernels read the paged caches in place,
+  for DSA's keys, MSA's blocks with picks per group or not, and QSA's blocks, heads
+  of up to 256 dims. One attends over each query's picks. One scores every key of
+  a decoded token's request. One scores a prompt's keys for a tile of its queries
+  at a time, each head's dots on the tensor cores and their sum in float32, and
+  ranks DSA's keys, or finds each of MSA's blocks' best score, in place. QSA pools
+  and scores its blocks by PyTorch, and the picks are ranked as bux ranks them.
+  MLA's latents, and a float32 model unless `BUX_VLLM_SPARSE_KERNELS=triton`, take
+  the PyTorch path, which gathers each query's scores, keys and values into memory
+  first and so moves several times the bytes (`BUX_VLLM_SPARSE_KERNELS=torch` asks
+  for it). `scripts/vllm_kernels.py` compares the two on a GPU. Either way the work
+  runs in ops that vLLM runs eagerly between its CUDA graphs: a model with a sparse
+  layer runs vLLM's piecewise CUDA graphs, never a whole decoding step as one
+  graph.
 - **Latents.** A sparse `mla` layer caches what vLLM's MLA does: each token's
   normalized latent and its rotated key dims, one head of `kv_lora_rank +
   qk_rope_head_dim`. Each head's queries take in its key projection, attend to the
@@ -316,7 +318,7 @@ backends: the plugin's sparse attention attends to its picks in the latent space
 
 ## Compressed sparse attention
 
-The plugin runs `csa` with bux's arithmetic, in PyTorch, on vLLM's paged caches.
+The plugin runs `csa` with bux's arithmetic on vLLM's paged caches.
 Each call keeps, for each sequence:
 
 - **Its window:** the latents of its last `sliding_window_size` tokens, `head_dim`
