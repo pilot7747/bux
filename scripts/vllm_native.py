@@ -544,6 +544,44 @@ def time_attention(n: int, b: int, ctx: int) -> None:
                 f"{kernels.STAGES} stages: bfloat16 {bf16:.2f} ms, FP8 KV {f8:.2f} ms"
             )
         kernels.BLOCK_K, kernels.STAGES = TILES[0]
+        attempt("qwen4's", lambda a=args, w=what: time_qwen4(spec, cache, fp8, a, w))
+
+
+def time_qwen4(
+    spec: Any, cache: torch.Tensor, fp8: torch.Tensor, args: tuple, what: str
+) -> None:
+    """vLLM's own sparse GQA attention, Qwen4's QSA kernel, over the same picks and
+    caches, beside the plugin's: its error, and its time in bfloat16 and FP8."""
+    from vllm.models.qwen4_exp.nvidia.ops.qsa import qsa_sparse_paged_attention
+
+    from bux_vllm import kernels
+
+    q, table, (keys, valid) = args
+    dk = spec.dk
+    picked = torch.where(valid, keys, -1).int()
+    count = torch.full((len(q), 1), picked.shape[1], dtype=torch.int32, device="cuda")
+    indices = torch.cat([picked, count], 1).contiguous()
+    prompt = what == "prompt"
+    rows = table[:1].contiguous() if prompt else table.contiguous()
+    req = torch.zeros(len(q), dtype=torch.int32, device="cuda")
+    req = req if prompt else torch.arange(len(q), dtype=torch.int32, device="cuda")
+    gate = torch.full_like(q, float("inf"))
+
+    def run(c: torch.Tensor) -> torch.Tensor:
+        nhd = c.transpose(1, 2)
+        k, v = nhd[..., :dk], nhd[..., dk:]
+        scales = (1.0, 1.0) if c.dtype == torch.float8_e4m3fn else (None, None)
+        return qsa_sparse_paged_attention(
+            q, k, v, indices, rows, req, prompt, None, *scales, output_gate=gate
+        )
+
+    ours = kernels.attend(spec, q, cache, table, (keys, valid))
+    error = (run(cache).float() - ours.float()).abs().max().item()
+    bf16, f8 = timed(lambda: run(cache)), timed(lambda: run(fp8))
+    print(
+        f"attention {what} of {len(q)} by Qwen4's QSA kernel: error {error:.1e} "
+        f"against the plugin's, bfloat16 {bf16:.2f} ms, FP8 KV {f8:.2f} ms"
+    )
 
 
 def attempt(name: str, check: Callable[[], bool | None]) -> bool:
