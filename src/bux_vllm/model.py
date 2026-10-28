@@ -53,6 +53,7 @@ LAYER_MODULES = (
     "basic",
     "attention",
     "mla",
+    "csa",
     "moe",
     "ssm",
     "kda",

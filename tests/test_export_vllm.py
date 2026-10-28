@@ -21,20 +21,24 @@ import torch.nn.functional as F
 from flax import nnx
 
 from bux import config as cfg
+from bux.architecture import Model
 from bux.architecture.attention import gqa as bux_gqa
 from bux.architecture.attention import rope as bux_rope
 from bux.architecture.attention.gqa import Attention as BuxAttention
 from bux.architecture.experts.moe import MoE
 from bux.architecture.layers.conv import CausalConv
+from bux.export import check
 from bux.export import plan as core
 from bux.export.hf import common as hf_common
 from bux.export.hf import engram as hf_engram
 from bux.export.hf import linear_attention as hf_linear
 from bux.export.hf import residual as hf_residual
 from bux.export.hf import rwkv7 as hf_rwkv7
+from bux.export.huggingface import save
 from bux.lang import compile, compile_file, compile_runs, ir
 from bux_vllm import (
     common,
+    compressed,
     config,
     delta,
     dplr,
@@ -973,3 +977,235 @@ def test_fla_takes_the_rule_as_its_kernels_take_it(
     torch.testing.assert_close(got, want)
     torch.testing.assert_close(after, last)
     assert dplr.runs(torch.bfloat16) and not dplr.runs(torch.float32)
+
+
+# --- compressed sparse attention (bux_vllm.compressed) ----------------------------------
+
+#: csa settings the plugin runs, on 4 heads of 16 dims: each step below crosses
+#: windows of 5 and 6, a compressed latent of 2 to 4 tokens and an indexer's top 3.
+CSA = {
+    "the timeline's": "csa(num_heads=4, head_dim=16, sliding_window_size=6,"
+    " compress_ratio=4, sinks=true, rope=rope(fraction=0.5),"
+    " indexer=indexer(num_heads=2, head_dim=8, top_k=3))",
+    "window": "csa(num_heads=4, head_dim=16, sliding_window_size=5, sinks=true,"
+    " rope=rope(fraction=0.25, layout=interleaved))",
+    "every token, low-rank queries and output": "csa(num_heads=4, head_dim=16,"
+    " q_lora_rank=8, o_lora_rank=4, o_groups=2, rope=rope(fraction=0.5))",
+    "compressed by 3, no indexer, yarn, qk norm, softcap": "csa(num_heads=4,"
+    " head_dim=16, sliding_window_size=5, compress_ratio=3, qk_norm=rmsnorm,"
+    " softcap=3.0, rope=rope(fraction=0.5, scaling=yarn(factor=4,"
+    " original_max_len=8)))",
+    "single, plain unweighted dots, gated": "csa(num_heads=4, head_dim=16,"
+    " sliding_window_size=6, compress_ratio=1, gated=true, gate_per_head=true,"
+    " output_norm=rmsnorm, rope=rope(fraction=0.25, layout=interleaved),"
+    " indexer=indexer(num_heads=2, head_dim=8, top_k=3, relu=false, weighted=false,"
+    " norm=rmsnorm))",
+    "compressed by 2, a latent query": "csa(num_heads=4, head_dim=16,"
+    " sliding_window_size=6, compress_ratio=2, q_lora_rank=8, sinks=true,"
+    " rope=rope(fraction=0.5), indexer=indexer(num_heads=2, head_dim=8, top_k=4))",
+    "the parity case's": vllm_parity.SPARSE.removeprefix("attn = ").strip(),
+    "a gate's head bias, a grouped output": "csa(num_heads=4, head_dim=16,"
+    " sliding_window_size=5, compress_ratio=2, o_lora_rank=4, o_groups=2,"
+    " gated=true, gate_head_bias=true, rope=rope(fraction=0.5))",
+}
+
+#: The tokens of a block of every csa cache: 12 hold whole groups of 1 to 4.
+CSA_BLOCK = 12
+#: The longest sequence the csa tests' caches take, as vLLM's max_model_len.
+CSA_MAX_LEN = 48
+
+#: Steps of two sequences, the second the first's first 25 tokens: each a list of
+#: (sequence, first token, tokens), decoded tokens first, as vLLM orders them.
+CSA_STEPS = [
+    [(0, 0, 13), (1, 0, 7)],
+    [(1, 7, 1), (0, 13, 17)],
+    [(0, 30, 1), (1, 8, 17)],
+    *([[(0, p, 1)] for p in range(31, 40)]),
+]
+
+
+class PagedCsa:
+    """A csa call's paged caches, as vLLM keeps them for the sequences of
+    `lengths`: blocks of `CSA_BLOCK` tokens, shuffled, block 0 (vLLM's null block)
+    left out."""
+
+    def __init__(self, c: dict, lengths: list[int]):
+        self.paged: dict[str, compressed.Paged] = {}
+        per_seq = -(-CSA_MAX_LEN // CSA_BLOCK)
+        gen = torch.Generator().manual_seed(0)
+        for name, (width, per, _) in compressed.cache_rows(c).items():
+            ids = torch.randperm(len(lengths) * per_seq, generator=gen) + 1
+            cache = torch.zeros(len(ids) + 1, CSA_BLOCK // per, width)
+            table = ids.view(len(lengths), per_seq)
+            self.paged[name] = compressed.Paged(cache, table)
+
+    def slots(self, name: str, seq: torch.Tensor, pos: torch.Tensor) -> torch.Tensor:
+        """vLLM's slot mapping of the tokens at `pos` of sequences `seq`."""
+        table = self.paged.get(name, self.paged["window"]).block_table
+        return table[seq, pos // CSA_BLOCK] * CSA_BLOCK + pos % CSA_BLOCK
+
+    def caches(self, steps: compressed.Steps, pad: int) -> compressed.Caches:
+        """The caches of a batch of `steps`, its last `pad` tokens padding."""
+        seq, pos = steps.seq, steps.positions
+        state = self.paged.get("state")
+        slots = {name: self.slots(name, seq, pos) for name in ("window", "state")}
+        for name in ("window", "state") if pad else ():
+            slots[name][-pad:] = -1
+        return compressed.Caches(
+            self.paged["window"],
+            slots["window"],
+            self.paged.get("compressed"),
+            self.paged.get("index"),
+            state,
+            None if state is None else slots["state"],
+        )
+
+
+#: Padding after a step of decoded tokens alone, as a CUDA graph of a larger batch
+#: replays it: each a (sequence, position) of stale metadata, which ends a group of
+#: 1, 2 or 4, and writes nothing (slots of -1).
+CSA_PADDING = [(0, 3), (1, 7)]
+
+
+def csa_steps(step: list[tuple[int, int, int]]) -> compressed.Steps:
+    """The batch of a step of `CSA_STEPS`, padded where it decodes alone."""
+    padding = CSA_PADDING if all(n == 1 for *_, n in step) else []
+    step = step + [(q, p, 1) for q, p in padding]
+    positions = torch.cat([torch.arange(s, s + n) for _, s, n in step])
+    seq = torch.cat([torch.full((n,), q) for q, _, n in step])
+    starts = np.cumsum([0] + [n for *_, n in step]).tolist()
+    lengths = [s + n for _, s, n in step]
+    decodes = sum(n == 1 for *_, n in step)
+    chunks = compressed.prompt_chunks(
+        starts, lengths, decodes
+    )  # by request: a sequence
+    prompts = [(start, n, step[i][0], length) for start, n, i, length in chunks]
+    # Decoded tokens alone read up to the longest a model takes, as in a CUDA graph.
+    longest = max(lengths) if prompts else CSA_MAX_LEN
+    return compressed.Steps(positions, seq, decodes, prompts, longest)
+
+
+def csa_layer(m: Any, parts: Any, s: Any, caches: Any, steps: Any, x: Any) -> Any:
+    """A step of the plugin's csa layer (bux_vllm.csa) on x (T, width), with the
+    export's module `m` for the projections it makes by vLLM's layers."""
+    t, pos = x.shape[0], steps.positions
+    query = x if m.q_a is None else parts.q_a_norm(m.q_a(x))
+    q = parts.queries(m.q(query).view(t, m.h, m.d), pos)
+    latent = parts.latents(m.kv(x), pos)
+    rows = index = None
+    if m.ratio is not None:
+        kv = m.compress_kv(x)
+        if m.compress_gate is not None:
+            both = torch.cat([kv, m.compress_gate(x)], -1)
+            kv = compressed.pool(caches, steps, both, m.ratio)
+        rows = parts.compressed(kv, pos)
+    if parts.indexer is not None:
+        w = m.indexer.weights
+        index = parts.indexer.queries(
+            m.indexer.q(query), None if w is None else w(x), pos
+        )
+    out = compressed.mix(caches, steps, s, q, latent, rows, index, m.sinks)
+    return m.output(x[None], parts.unrotate(out, pos)[None])[0]
+
+
+def csa_weights(c: dict, parts: Any) -> set[str]:
+    """The checkpoint's names of a csa's weights that the plugin's layer loads
+    (bux_vllm.csa's targets): its GEMM's parts, its `parts`, and its own."""
+    down, _ = compressed.down(c)
+    ix, rank = c["indexer"], c["o_lora_rank"]
+    own = {
+        "q.weight": True,
+        "indexer.q.weight": ix,
+        "gate.weight": c["gated"],
+        "gate_bias": c["gated"] and c["gate_head_bias"],
+        "o_a": rank,
+        "o.weight": True,
+        "sinks": c["sinks"],
+    }
+    names = {f"{n}.weight" for n, _ in down} | {n for n, on in own.items() if on}
+    return names | {n for n, _ in parts.named_parameters()}
+
+
+@pytest.mark.parametrize("attn", CSA.values(), ids=CSA.keys())
+def test_csa_computes_on_paged_caches_what_the_export_does(
+    attn: str, tmp_path: Path
+) -> None:
+    """The plugin's csa, step by step over paged caches (prompts in chunks beside
+    decoded tokens, two sequences in a batch), gives what the export's layer gives
+    over each whole sequence."""
+    arch = compile(
+        f"d_model = 64\nvocab_size = 64\nmodel = embed [rmsnorm {attn}] head"
+    )
+    save(arch, check.perturbed(Model(arch, rngs=nnx.Rngs(0)), 1), tmp_path)
+    hf = check._load(tmp_path, "eager")
+    m = next(x for x in hf.modules() if type(x).__name__ == "CompressedSparseAttention")
+    seen: list[torch.Tensor] = []
+    m.register_forward_hook(lambda mod, args, out: seen.extend([args[0], out]))
+    with torch.no_grad():
+        hf.model(
+            torch.randint(0, 64, (1, 40), generator=torch.Generator().manual_seed(1))
+        )
+    x, want = seen[0][0], seen[1][0]
+    c = next(n.config for n in arch.layers() if n.config.type == "csa")
+    c = c.model_dump(mode="json")
+    parts = compressed.Parts(c)
+    state = {k: v for k, v in m.state_dict().items() if k in parts.state_dict()}
+    parts.load_state_dict(state)
+    assert set(m.state_dict()) == csa_weights(c, parts)
+    settings = compressed.Settings.of(c, m.scale)
+    paged = PagedCsa(c, [40, 25])
+    got = torch.zeros_like(want), torch.zeros_like(want[:25])
+    with torch.no_grad():
+        for step in CSA_STEPS:
+            steps = csa_steps(step)
+            pad = steps.positions.shape[0] - sum(n for *_, n in step)
+            rows = torch.cat([x[s : s + n] for _, s, n in step] + [x[:pad]])
+            out = csa_layer(m, parts, settings, paged.caches(steps, pad), steps, rows)
+            real = out[: out.shape[0] - pad].split([n for *_, n in step])
+            for (q, start, n), y in zip(step, real):
+                got[q][start : start + n] = y
+    torch.testing.assert_close(got[0], want, atol=2e-5, rtol=2e-5)
+    torch.testing.assert_close(got[1], want[:25], atol=2e-5, rtol=2e-5)
+
+
+serving = script("timeline/serving")
+
+
+def test_the_config_gives_vllm_the_heads_of_csa() -> None:
+    """A csa's query heads and its one head of latents, as vLLM reads them."""
+    c = bux_config(vllm_parity.CASES["csa"])
+    assert c.layer_types == ["full_attention"] * 2
+    assert (c.num_attention_heads, c.num_key_value_heads, c.head_dim) == (2, 1, 64)
+    assert not config.latent(c)
+
+
+@pytest.mark.parametrize("name", ["csa", "csa-latent"])
+def test_csa_caches_what_the_serving_model_prices(name: str) -> None:
+    """Each csa call keeps what scripts/timeline/serving.py prices: a window of
+    token latents, and a compressed latent with its indexer key for each
+    compress_ratio tokens; and, for a sequence, the projections of the last
+    compress_ratio tokens, which the next compressed latent pools. Each block of
+    each is a power of two bytes, so that vLLM lays them side by side."""
+    for layer in compile(vllm_parity.CASES[name]).layers():
+        c = layer.config
+        if c.type != "csa":
+            continue
+        rows = compressed.cache_rows(c.model_dump(mode="json"))
+        for width, per, _ in rows.values():
+            page = compressed.block_size(16, per) // per * width * serving.BF16
+            assert page & (page - 1) == 0, (width, per)
+        priced = serving._csa(c)
+        width, per, window = rows["window"]
+        assert (width * serving.BF16 / per, window) == (
+            priced[0].token,
+            priced[0].window,
+        )
+        if c.compress_ratio is None:
+            assert len(priced) == 1 and "compressed" not in rows
+            continue
+        kept, index = rows["compressed"], rows.get("index", (0, 1, None))
+        cache = priced[1]
+        assert kept[0] * serving.BF16 / kept[1] == cache.token
+        assert index[0] * serving.BF16 / index[1] == cache.index
+        assert kept[2] is None and index[2] is None and cache.window is None
+        assert rows["state"] == (2 * c.head_dim, 1, c.compress_ratio)
