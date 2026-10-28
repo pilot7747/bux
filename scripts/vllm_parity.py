@@ -51,6 +51,10 @@ ATTN = "attn = gqa(num_heads=4, num_kv_heads=2, rope=rope())\n"
 BLOCK = "block = [rmsnorm attn] [rmsnorm ffn]\n"
 LLAMA = HEAD + ATTN + FFN + BLOCK
 EXPERT = "dense = gated_mlp(intermediate_size=64, activation=swish)\n"
+#: A model 256 wide, as vLLM's kernel of zero experts' output takes, and its
+#: attention and experts.
+ZERO_HEAD = "d_model = 256\nvocab_size = 256\n"
+ZERO_EXPERTS = "attn = gqa(num_heads=4, num_kv_heads=2, rope=rope())\n" + EXPERT
 MOE_BLOCK = "block = [rmsnorm attn] [rmsnorm experts]\n"
 # Qwen3-Next's attention beside linear attention (`delta`), which the case defines.
 GATED_HEAD = (
@@ -220,6 +224,26 @@ CASES = {
     + "experts = moe(num_experts=8, top_k=2, num_shared_experts=1, router=sigmoid,"
     " load_balancing=aux_free, expert=gated_mlp(intermediate_size=64,"
     " activation=situ, up_softcap=0.5))\n"
+    + MOE_BLOCK
+    + "model = embed block^2 rmsnorm head",
+    # Zero experts, which vLLM's kernel of their output takes 256 wide or more: the
+    # timeline's experts (a shared one, sigmoid, aux-free), LongCat-Flash's (softmax,
+    # unnormalized, scaled, no bias), and beside an expert norm, which routes apart.
+    "moe-zero": ZERO_HEAD
+    + ZERO_EXPERTS
+    + "experts = moe(num_experts=8, top_k=3, num_zero_experts=4, num_shared_experts=1,"
+    " router=sigmoid, routed_scaling_factor=2.5, load_balancing=aux_free,"
+    " expert=dense)\n" + MOE_BLOCK + "model = embed block^2 rmsnorm head",
+    "moe-zero-longcat": ZERO_HEAD
+    + ZERO_EXPERTS
+    + "experts = moe(num_experts=8, top_k=3, num_zero_experts=4,"
+    " normalize_top_k=false, routed_scaling_factor=6, expert=dense)\n"
+    + MOE_BLOCK
+    + "model = embed block^2 rmsnorm head",
+    "moe-zero-norm": ZERO_HEAD
+    + ZERO_EXPERTS
+    + "experts = moe(num_experts=8, top_k=3, num_zero_experts=4, router=sigmoid,"
+    " load_balancing=aux_free, expert_norm=rmsnorm, expert=dense)\n"
     + MOE_BLOCK
     + "model = embed block^2 rmsnorm head",
     # Muse Spark's routed experts: each one's output normalized, in a latent.

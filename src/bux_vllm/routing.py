@@ -5,7 +5,8 @@ The router runs as bux's does (`bux.architecture.experts.moe`): logits in float3
 scored by a softmax, a sigmoid or ``sqrt(softplus)``, the aux-free bias added to the
 scores that pick, groups limited by their best two experts' sum, the top-k weights
 normalized (with the shared experts' scores, where the router scores them) and
-scaled.
+scaled. Zero experts are scored after the routed ones, and `zero_split` passes
+their picks on as vLLM's ``ZeroExpertRouter`` does.
 """
 
 from __future__ import annotations
@@ -25,7 +26,8 @@ class Router(nn.Module):
         super().__init__()
         self.c = c
         by_bias = c["load_balancing"] != "aux_loss"  # aux_free, smebu
-        bias = torch.zeros(c["num_experts"], dtype=torch.float32)
+        scored = c["num_experts"] + c["num_zero_experts"]
+        bias = torch.zeros(scored, dtype=torch.float32)
         self.bias = nn.Parameter(bias, requires_grad=False) if by_bias else None
 
     def scores(self, logits: torch.Tensor) -> torch.Tensor:
@@ -63,8 +65,8 @@ class Router(nn.Module):
         """Each token's top-k experts and their weights, from the router's logits,
         and the weights of the shared experts that the router scores too, last,
         under ``shared_expert_sink`` (none, otherwise): normalized together and
-        scaled, in float32."""
-        n = self.c["num_experts"]
+        scaled, in float32. A pick of ``num_experts`` or more is a zero expert's."""
+        n = self.c["num_experts"] + self.c["num_zero_experts"]
         scores = self.scores(logits)
         scores, sinks = scores[..., :n], scores[..., n:]
         choice = scores if self.bias is None else scores + self.bias
@@ -77,6 +79,27 @@ class Router(nn.Module):
             weights, sinks = weights / total, sinks / total
         scale = self.c["routed_scaling_factor"]
         return weights * scale, idx, sinks * scale
+
+
+def zero_split(
+    z: torch.Tensor, weights: torch.Tensor, idx: torch.Tensor, num_experts: int
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """What vLLM's ``ZeroExpertRouter`` makes of a token's picks: the zero experts'
+    output, each token times its zero picks' weights summed, and the picks the
+    routed experts run, a zero expert's as expert 0 of weight 0.
+
+    Args:
+        z: The tokens as the experts take them, (T, d).
+        weights: The router's weights of each token's picks, (T, k).
+        idx: The picks, (T, k), zero experts' from `num_experts` on.
+        num_experts: The routed experts.
+
+    Returns:
+        The zero experts' output, (T, d), and the routed experts' weights and picks.
+    """
+    zero = idx >= num_experts
+    output = z * (weights * zero).sum(-1, keepdim=True).to(z.dtype)
+    return output, weights.masked_fill(zero, 0), idx.masked_fill(zero, 0)
 
 
 def pick_rows(

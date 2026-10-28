@@ -19,6 +19,7 @@ from types import ModuleType, SimpleNamespace
 from typing import Any
 
 import jax
+import jax.numpy as jnp
 import numpy as np
 import pytest
 import torch
@@ -30,6 +31,7 @@ from bux.architecture import Model
 from bux.architecture.attention import gqa as bux_gqa
 from bux.architecture.attention import rope as bux_rope
 from bux.architecture.attention.gqa import Attention as BuxAttention
+from bux.architecture.experts import moe as bux_moe
 from bux.architecture.experts.moe import MoE
 from bux.architecture.layers.conv import CausalConv
 from bux.export import check
@@ -551,6 +553,10 @@ ROUTERS = {
     " shared_expert_sink=true, router=sigmoid, routed_scaling_factor=2.5, expert=e)",
     "unnormalized sinks": "moe(num_experts=8, top_k=2, num_shared_experts=2,"
     " shared_expert_sink=true, normalize_top_k=false, expert=e)",
+    "zero experts": "moe(num_experts=8, top_k=3, num_zero_experts=4, router=sigmoid,"
+    " routed_scaling_factor=2.5, load_balancing=aux_free, expert=e)",
+    "zero experts, longcat": "moe(num_experts=8, top_k=3, num_zero_experts=4,"
+    " normalize_top_k=false, routed_scaling_factor=6, expert=e)",
 }
 
 
@@ -567,7 +573,7 @@ def test_the_router_picks_and_weighs_as_bux(source: str) -> None:
     moe = MoE(c, 64, rngs=nnx.Rngs(0))
     router = routing.Router(c.model_dump(mode="json"))
     if moe.router_bias is not None and router.bias is not None:
-        bias = 0.1 * jax.random.normal(jax.random.key(1), (c.num_experts,))
+        bias = 0.1 * jax.random.normal(jax.random.key(1), moe.router_bias[...].shape)
         moe.router_bias[...] = bias
         router.bias.data = torch.from_numpy(np.array(bias))
     x = jax.random.normal(jax.random.key(2), (1, 32, 64))
@@ -579,6 +585,35 @@ def test_the_router_picks_and_weighs_as_bux(source: str) -> None:
     got_sinks = router.route(logits, c.top_k)[2].numpy()
     want = np.zeros((32, 0)) if sinks is None else np.asarray(sinks)[0]
     np.testing.assert_allclose(got_sinks, want, rtol=1e-6)
+
+
+def test_zero_experts_split_as_bux_runs_them() -> None:
+    """What vLLM's ZeroExpertRouter makes of the picks (`zero_split`): bux's zero
+    experts' output, and picks of the routed experts that weigh them as bux's."""
+    c = cfg.MoEConfig.model_validate(
+        {
+            "num_experts": 4,
+            "top_k": 3,
+            "num_zero_experts": 2,
+            "router": "sigmoid",
+            "expert": {
+                "type": "gated_mlp",
+                "intermediate_size": 8,
+                "activation": "swish",
+            },
+        }
+    )
+    moe = MoE(c, 16, rngs=nnx.Rngs(0))
+    x = jax.random.normal(jax.random.key(2), (1, 32, 16))
+    idx, weights, _ = moe._route(x)
+    assert (np.asarray(idx) >= 4).any()
+    as_torch = (torch.from_numpy(np.array(a)[0]) for a in (x, weights, idx))
+    zero, w, picks = routing.zero_split(*as_torch, 4)
+    want = bux_moe.zero_experts(x, idx, weights, 4)[0]
+    np.testing.assert_allclose(zero.numpy(), np.asarray(want), rtol=1e-6)
+    dense = bux_moe.dense_weights(idx, weights, 4)[0]
+    got = bux_moe.dense_weights(jnp.asarray(picks.numpy()), jnp.asarray(w.numpy()), 4)
+    np.testing.assert_allclose(np.asarray(got), np.asarray(dense), rtol=1e-6)
 
 
 ROPES = {
