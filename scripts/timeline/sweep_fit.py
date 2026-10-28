@@ -394,15 +394,22 @@ def main() -> None:
             out[variant] = as_trained(out[variant], fams[base])
             if "as_trained" in out[variant]:
                 out[base] = served_as(out[base], out[variant], variant)
+    budget = statistics.mean(w.cost() for w in fams[BUDGET].values())
     for family, note in (x.split("=", 1) for x in a.upper_bound):
         if family in out:
             out[family] |= {"upper_bound": True, "note": note}
+            ref = likes.get(family)
+            if (
+                ref
+                and family in fams
+                and (anchor := anchored(fams[family], fams[ref], budget))
+            ):
+                out[family]["anchored"] = anchor
     for family, entry in out.items():
         m = analytic.get(family)
         if m is not None and "analytic" not in entry:
             entry["analytic"] = {"N_active": m["active"], "N_total": m["params"]}
             entry["analytic"]["d_model"] = m["d_model"]
-    budget = statistics.mean(w.cost() for w in fams[BUDGET].values())
     for family, reason in (x.split("=", 1) for x in a.kernel_limited):
         ref = likes.get(family)
         anchor = (
