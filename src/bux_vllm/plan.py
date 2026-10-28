@@ -256,6 +256,12 @@ def _calls(
             yield from _calls(p, child, (*pos, i), s, prefix, seen, first)
 
 
+def ports(layer: Node) -> list[list[str]]:
+    """A layer's ports as `bux.export.plan` gives its sites': ``[name, tap, mode]``
+    each, from the IR's ``{"name", "tap", "mode"}``."""
+    return [[p["name"], p["tap"], p["mode"]] for p in layer["ports"]]
+
+
 def live(calls: list[Call]) -> list[Call]:
     """Return the calls up to the first head's, which make the model's output: the
     layers after it (a multi-token prediction module's) change nothing vLLM samples.
