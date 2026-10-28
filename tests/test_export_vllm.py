@@ -1315,3 +1315,84 @@ def test_each_layer_type_has_one_class() -> None:
                         names.setdefault(ast.literal_eval(kind), []).append(node.name)
     assert {k: v for k, v in names.items() if len(v) > 1} == {}
     assert 'vars(value).get("bux_types"' in (FILES[0].parent / "model.py").read_text()
+
+
+def wide_mixer(kind: str, d_model: int) -> str:
+    """A hybrid's delta-rule mixer `kind` at `d_model`: q/k heads of 128, as wide
+    together as the stream, twice as many value heads, the gate bound at -5."""
+    heads = d_model // 128
+    return (
+        f"{kind}(num_heads={heads}, num_v_heads={2 * heads}, head_dim=128,"
+        " gate_lower_bound=-5)"
+    )
+
+
+# Hybrids at widths whose fused projections are no multiple of 64 (d_model 2816:
+# KDA's projection 17068 wide unpadded), and shapes of odd widths.
+FUSED = {
+    **{
+        f"{k} {d}": wide_mixer(k, d)
+        for k in ("kda", "gdn2")
+        for d in (2816, 3584, 4096)
+    },
+    "kda odd": "kda(num_heads=2, num_v_heads=6, head_dim=32)",
+    "kda low rank": "kda(num_heads=4, num_v_heads=12, head_dim=16, output_gate_rank=8)",
+    "gdn2 odd": "gdn2(num_heads=4, num_v_heads=12, head_dim=24, v_head_dim=8)",
+}
+
+
+@pytest.mark.parametrize("ranks", [1, 2, 4])
+@pytest.mark.parametrize("mixer", FUSED.values(), ids=FUSED.keys())
+def test_a_ranks_fused_projection_is_laid_out_as_vllm_lays_it(
+    mixer: str, ranks: int
+) -> None:
+    """KDA's and GDN-2's fused input projection on each rank: its parts, which the
+    layer splits its output by, are as wide as vLLM's merged layer makes the rank's
+    output (KDA's decay down projection whole on every rank), a multiple of 64 so
+    that inductor pads none of its matmuls, and the parts keep their widths."""
+    c = next(compile(f"d_model = 64\nmodel = {mixer}").layers()).config
+    c = c.model_dump(mode="json")
+    if c["num_heads"] % ranks:
+        pytest.skip("heads that the ranks do not split")
+    h, hv, dk, dv = linear.linear_dims(c)
+    want = [sum(linear.conv_channels(c)) // ranks]
+    if c["type"] == "gdn2":
+        p = linear.gdn2_projection(c, ranks)
+        want += [h * dk // ranks, hv * dv // ranks]
+    else:
+        p = linear.kda_projection(c, ranks)
+        gated = c["output_gate_rank"] is None
+        want += [hv * dv // ranks] * gated + [c["gate_rank"] or dk, hv // ranks]
+        assert p.whole is not None and p.sizes[p.whole] == (c["gate_rank"] or dk)
+    assert p.split[: p.parts] == want
+    assert p.width(ranks) == sum(p.split) and sum(p.split) % linear.ALIGN == 0
+    if mixer == FUSED["kda 2816"] and ranks == 1:
+        assert sum(want) == 17068 and sum(p.split) == 17088
+
+
+def test_padding_columns_are_zero() -> None:
+    layer = torch.nn.Linear(4, 10, bias=False)
+    linear.zero_padding(layer, 3)
+    assert not layer.weight[-3:].any() and layer.weight[:-3].any()
+
+
+@pytest.mark.parametrize("before", ["none", "garbage"])
+def test_engram_rows_stay_in_its_tables_on_any_inputs(before: str) -> None:
+    """vLLM's dummy runs and its compiler's benchmarks run the model on ids, starts
+    and ids before the step of no request (-1s, zeros or garbage): every gather of
+    the engram stays in range, and so do its rows."""
+    torch.manual_seed(0)
+    _, mine, d, _ = engram_twins(ENGRAMS["4-grams, boundary, classes"][0], None)
+    t, big = 9, 2**40
+    context = torch.full((2, 4), -1)  # two sequences, as the conv's state holds
+    if before == "garbage":
+        context = torch.randint(-big, big, (2, 4))
+    ctx = stand_in(
+        input_ids=torch.randint(-big, big, (t,)),
+        query_start_loc=torch.tensor([5, -7, 2**30]),
+        ngram_context=context,
+    )
+    window = ngram.windows(ctx.input_ids, ctx.query_start_loc, context, mine.n)
+    rows = ngram.ngram_rows(window, mine.hashes, mine.classes, mine.boundary)
+    assert rows.min() >= 0 and rows.max() < mine.table.shape[0]
+    assert mine(torch.randn(t, d), ctx).shape == (t, d)

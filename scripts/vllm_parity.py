@@ -227,6 +227,15 @@ CASES = {
     "kda-kimi": GATED_HEAD
     + "delta = kda(num_heads=4, head_dim=32, output_gate_rank=32, norm_eps=1e-5)\n"
     + LINEAR_HYBRID,
+    # A hybrid at a width no multiple of 8: KDA's fused projection is
+    # 550 wide (padded to 576), beside gated attention and a sigmoid MoE.
+    "kda-odd": GATED_HEAD.replace("d_model = 128", "d_model = 136")
+    + EXPERT
+    + "experts = moe(num_experts=8, top_k=2, num_shared_experts=1, router=sigmoid,"
+    " load_balancing=aux_free, expert=dense)\n"
+    + "delta = kda(num_heads=2, num_v_heads=6, head_dim=32, gate_lower_bound=-5)\n"
+    + "model = embed [rmsnorm delta] [rmsnorm experts] [rmsnorm delta] [rmsnorm ffn]"
+    " [rmsnorm attn] [rmsnorm experts] rmsnorm head",
     "gdn2": GATED_HEAD
     + "delta = gdn2(num_heads=2, num_v_heads=4, head_dim=32, gate_lower_bound=-5)\n"
     + LINEAR_HYBRID,

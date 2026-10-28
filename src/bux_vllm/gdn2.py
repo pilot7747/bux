@@ -16,7 +16,7 @@ from vllm.model_executor.layers.mamba.mamba_utils import MambaStateShapeCalculat
 
 from . import feeds
 from .common import ACTIVATIONS, Ctx, Layer, Norm, Site
-from .linear import conv_channels, linear_dims
+from .linear import gdn2_projection, linear_dims, zero_padding
 from .recurrent import LowRank, Recurrent, float32, low_rank_tensor
 
 
@@ -62,11 +62,16 @@ class Mixer(Recurrent):
         self.floor = None if bound is None else -bound
         h, hv, dk, dv = linear_dims(c)
         self.h, self.hv, self.dk, self.dv = h // self.tp, hv // self.tp, dk, dv
-        sizes = [*conv_channels(c), h * dk, hv * dv]  # q, k, v, erase, write
-        self.split = [sum(conv_channels(c)) // self.tp, self.h * dk, self.hv * dv]
+        projection = gdn2_projection(c, self.tp)  # q, k, v, erase, write
+        self.split = projection.split
         self.in_proj = MergedColumnParallelLinear(
-            width, sizes, bias=False, return_bias=False, prefix=f"{prefix}.in_proj"
+            width,
+            projection.sizes,
+            bias=False,
+            return_bias=False,
+            prefix=f"{prefix}.in_proj",
         )
+        zero_padding(self.in_proj, sum(self.split[3:]))
         self.f = LowRank(width, c["gate_rank"] or dv, h * dk, f"{prefix}.f")
         self.gate = None
         if c["output_gate"] is not None:
@@ -84,7 +89,7 @@ class Mixer(Recurrent):
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         """The layer's output, (T, width), from the tokens' inputs."""
-        qkv, erase, write = self.in_proj(x).split(self.split, -1)
+        qkv, erase, write = self.in_proj(x).split(self.split, -1)[:3]
         qkv = self.run("convolve", [qkv], qkv.new_zeros(qkv.shape))
         heads = (self.h, self.hv, self.dk, self.dv)
         gates = (self.f(x), erase, write)

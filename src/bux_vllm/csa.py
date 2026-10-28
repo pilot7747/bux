@@ -62,6 +62,7 @@ from .common import (
     sharded_loader,
     unsupported,
 )
+from .linear import aligned, zero_padding
 
 #: The ops that pool the compressed latents, and that attend, outside the graph.
 POOL, ATTEND = "bux_csa_pool", "bux_csa"
@@ -431,14 +432,20 @@ class CompressedSparseAttention(Layer):
         compressed latent's and its gate's, and the indexer's head weights."""
         d, latent, ix = c["head_dim"], c["q_lora_rank"], c["indexer"]
         self.down_parts, self.down_split = compressed.down(c)
+        sizes, split = aligned(
+            [n for _, n in self.down_parts], [n for _, n in self.down_split], 1
+        )
+        if len(split) > len(self.down_split):  # a part of its own, which none reads
+            self.down_split = [*self.down_split, ("padding", split[-1])]
         self.down = MergedColumnParallelLinear(
             width,
-            [n for _, n in self.down_parts],
+            sizes,
             bias=False,
             return_bias=False,
             disable_tp=True,
             prefix=f"{path}.down",
         )
+        zero_padding(self.down, sum(sizes) - sum(n for _, n in self.down_parts))
         self.q = ColumnParallelLinear(
             latent or width,
             c["num_heads"] * d,
