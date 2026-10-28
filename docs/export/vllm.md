@@ -110,9 +110,10 @@ ones, `--load-format dummy`, to time it.
   is a module named by the algebra, `model.layers.3.hc`, which holds its parameters,
   as in the export. It reads the stream for the branch's body and writes the body's
   output back, per token: the n copies of hc, mhc and gr are a (tokens, n, d)
-  tensor. attnres keeps the embedding, the sum of each finished block of branch
-  outputs and the sum of the block under way, which is what bux's softmax over depth
-  reads; it does not keep every output. Nothing of it is cached between steps.
+  tensor. attnres keeps the embedding and the sum of each finished block of branch
+  outputs side by side, and the sum of the block under way, which is what bux's
+  softmax over depth reads; it does not keep every output. Nothing of it is cached
+  between steps. See [Residual algebras](#residual-algebras) for how they run.
 - **The layers** are vLLM's: column- and row-parallel projections, the vocabulary
   split over ranks, vLLM's attention with its KV cache, its MLA with the latent
   cache, `FusedMoEFactory` for the routed experts, vLLM's Mamba-2 and Gated
@@ -216,6 +217,43 @@ This rule computes in float32 on CUDA cores, so a prompt costs several times wha
 fused kernel would. Tests check both paths against the export's layers on the CPU,
 the PyTorch rule as computed and fla's as its API defines it.
 
+## Residual algebras
+
+A residual algebra widens the stream: hc, mhc and gr into n copies of it, attnres
+into the embedding and the sums of blocks of branch outputs. Each outermost branch
+reads it for its body and writes the body's output back into it, and the widened
+stream is n times (or as many sources as) the plain one, so what a branch costs is
+how often it moves it.
+
+- **Kernels.** In a 16-bit model, hc's, mhc's and attnres's reads and writes run
+  fused Triton kernels (`bux_vllm.streams`), in float32 from the stream's dtype. A
+  branch reads its streams in one kernel and writes them in another, so it moves
+  the widened stream once into the read, and once in and once out of the write.
+  Each token's program takes its whole row at once, up to 4096 channels of each
+  stream, so that a decoding step's few tokens each make one round of loads:
+  - hc's read computes the token's coefficients, A and B, static plus the dynamic
+    term ``s tanh(norm(x_j) W)``, the norm's statistics and its dot products with
+    W in one pass (``norm(x) W`` as ``rstd (x W - mean sum(W))``), then the read.
+  - mhc's read computes its logits ``a r W + b`` of the flattened streams, and the
+    read; its write computes Sinkhorn's matrix of them, for each token.
+  - The write is ``x'_k = sum_j M_jk x_j + b_k y`` for a token's n streams.
+  - attnres's read computes the softmax of every source's ``rmsnorm(v) . w`` and
+    their mix; a finished block's sum joins its sources, the block under way's
+    sum stays in float32.
+- **PyTorch.** A float32 model, and any under `BUX_VLLM_RESIDUAL_KERNELS=torch`,
+  takes the PyTorch path, which computes what the export does, term by term: a
+  branch moves the widened stream about ten times (its norms, the projections, the
+  read and the mix as batched matrix products of n rows, the add), and mhc runs
+  Sinkhorn's rounds as two reductions each. `BUX_VLLM_RESIDUAL_KERNELS=triton`
+  runs the kernels in float32 too. `gr` and `vpgate` always take PyTorch's path,
+  as torch.compile compiles it.
+- **Checks.** A CPU test runs the fused path with each kernel's computation in
+  PyTorch against the export, and `scripts/vllm_residual.py` compares the kernels
+  with the PyTorch path on a GPU and times a branch both ways.
+
+The kernels are custom ops that stay inside vLLM's CUDA graphs: the graphs split at
+attention and the recurrent and MoE layers' ops, not at these.
+
 ## Sparse attention
 
 A `gqa` or `mla` layer with an indexer attends to the keys its indexer picks, as
@@ -237,18 +275,21 @@ layer: a window, sinks, a softcap, and a `gqa` layer's conv on keys and values a
   keeps the best as bux ranks them: by the floats' bits, the first of equal ones.
   It attends to those keys alone, read from the paged cache by the block table,
   with the layer's scale, softcap and sinks, in float32.
-- **Kernels.** In a 16-bit model, Triton kernels read the paged caches in place:
-  one attends over each query's picks, one scores every key of a decoded token's
-  request, in float32. A prompt's queries, which share their keys, score them by
-  PyTorch's matmul, QSA pools and scores its blocks by PyTorch, and the picks are
-  ranked as bux ranks them. They take DSA's keys, MSA's blocks with picks per group
-  or not, and QSA's blocks, heads of up to 256 dims. MLA's latents, and a float32
-  model unless `BUX_VLLM_SPARSE_KERNELS=triton`, take the PyTorch path, which
-  gathers each query's scores, keys and values into memory first and so moves
-  several times the bytes (`BUX_VLLM_SPARSE_KERNELS=torch` asks for it).
-  `scripts/vllm_kernels.py` compares the two on a GPU. Either way the work runs in
-  ops that vLLM runs eagerly between its CUDA graphs: a model with a sparse layer
-  runs vLLM's piecewise CUDA graphs, never a whole decoding step as one graph.
+- **Kernels.** In a 16-bit model, Triton kernels read the paged caches in place,
+  for DSA's keys, MSA's blocks with picks per group or not, and QSA's blocks, heads
+  of up to 256 dims. One attends over each query's picks. One scores every key of
+  a decoded token's request. One scores a prompt's keys for a tile of its queries
+  at a time, each head's dots on the tensor cores and their sum in float32. Both
+  rank DSA's keys, or find each of MSA's blocks' best score, in place. One pools a
+  decoded token's QSA blocks, normalizes and rotates their keys and scores them; a
+  prompt's are pooled once by PyTorch. The picks are ranked as bux ranks them.
+  MLA's latents, and a float32 model unless `BUX_VLLM_SPARSE_KERNELS=triton`, take
+  the PyTorch path, which gathers each query's scores, keys and values into memory
+  first and so moves several times the bytes (`BUX_VLLM_SPARSE_KERNELS=torch` asks
+  for it). `scripts/vllm_kernels.py` compares the two on a GPU. Either way the work
+  runs in ops that vLLM's piecewise CUDA graphs run between their pieces, and a
+  step of decoded tokens alone is one CUDA graph: as captured, its tokens read up
+  to `max_model_len` keys, which every replay of it may have.
 - **Latents.** A sparse `mla` layer caches what vLLM's MLA does: each token's
   normalized latent and its rotated key dims, one head of `kv_lora_rank +
   qk_rope_head_dim`. Each head's queries take in its key projection, attend to the
@@ -322,11 +363,13 @@ frees and prefix-caches them. vLLM lays the caches' blocks side by side when the
 sizes divide one another, as they do where the dims are powers of two.
 
 A step writes its tokens' rows, then reads every key from the caches. The indexer
-scores, in float32, the compressed latents a query sees, its sequence's gathered
-once for a prompt's chunk, and keeps the top-k, the first of equal scores as bux
-does; while there are no more than `top_k`, it keeps them all. One softmax in
-float32 covers the window, the kept latents and the sinks. The work goes in chunks
-of bounded size, with no loop over tokens.
+scores, in float32, the compressed latents a query sees, and keeps the top-k, the
+first of equal scores as bux does; while there are no more than `top_k`, it keeps
+them all. One softmax in float32 covers the window, the kept latents and the
+sinks. In a 16-bit model both run by Triton kernels that read the caches in place,
+as for the other sparse layers (`BUX_VLLM_SPARSE_KERNELS`), but for picks inside a
+candidate pool; else in PyTorch, a prompt chunk's keys gathered once, in chunks of
+bounded size, with no loop over tokens.
 
 vLLM's own DeepSeek-V4 layers compute something else. At a ratio of 4 their
 compressor pools overlapping windows of 8 tokens, with a learned position bias.
