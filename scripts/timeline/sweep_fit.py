@@ -322,15 +322,36 @@ def as_trained(entry: dict, base: dict[int, Width]) -> dict:
     return entry | {"as_trained": trained}
 
 
-def kernel_limited(entry: dict, model: dict | None, reason: str) -> dict:
+def anchored(ws: dict[int, Width], ref: dict[int, Width], budget: float) -> dict:
+    """A family timed only by an implementation slower than its architecture, at one
+    width beside a reference: the reference's measured curve scaled by the model's
+    ratio of the two there, matched to the budget."""
+    w = next(iter(ws.values()))
+    r = ref.get(w.d_model)
+    if r is None or not (w.model and r.model):
+        return {}
+    scaled = like(w, ref)
+    for d, x in scaled.items():
+        x.best = [{"sessions_per_hour": ref[d].cost() * x.tp * w.model / r.model}]
+    m = match(scaled, budget)
+    return {} if "error" in m else m | {"model_ratio": w.model / r.model}
+
+
+def kernel_limited(
+    entry: dict, model: dict | None, reason: str, anchor: dict | None = None
+) -> dict:
     """A family whose timing measures today's plugin rather than its architecture
-    (`reason`): the model's target in its place (``analytic``, and at the top for
-    the fit), the measurement kept beside it as an upper bound of its cost."""
+    (`reason`): in its place, the measured reference scaled by the model's ratio
+    (``anchored``) where it has one, else the model's own target (``analytic``),
+    at the top for the fit; the measurement kept beside them as an upper bound."""
     out: dict = {"measured": False, "kernel_limited": True, "reason": reason}
     if model is not None:
         analytic = {"N_active": model["active"], "N_total": model["params"]}
         analytic["d_model"] = model["d_model"]
         out |= analytic | {"analytic": analytic}
+    if anchor:
+        out |= {k: anchor[k] for k in ("N_active", "N_total", "d_model", "tp")}
+        out["anchored"] = anchor
     kept = (
         "N_active",
         "N_total",
@@ -349,11 +370,23 @@ def main() -> None:
     likes = dict(x.split("=", 1) for x in a.like)
     out = targets(fams, likes)
     analytic = {f: m for path in a.analytic for f, m in analytic_matches(path).items()}
+    for family, ref in (x.split("=", 1) for x in a.same):
+        if ref in out and family not in out:
+            out[family] = out[ref] | {"via": ref, "same_architecture": True}
     for variant, base in (x.split("=", 1) for x in a.trained_as):
         if variant in out and base in fams:
             out[variant] = as_trained(out[variant], fams[base])
+    budget = statistics.mean(w.cost() for w in fams[BUDGET].values())
     for family, reason in (x.split("=", 1) for x in a.kernel_limited):
-        out[family] = kernel_limited(out.get(family, {}), analytic.get(family), reason)
+        ref = likes.get(family)
+        anchor = (
+            anchored(fams[family], fams[ref], budget)
+            if ref and family in fams
+            else None
+        )
+        out[family] = kernel_limited(
+            out.get(family, {}), analytic.get(family), reason, anchor
+        )
     a.out.write_text(json.dumps(out, indent=1) + "\n")
     if a.markdown:
         a.markdown.write_text(markdown(fams, out, analytic, a.slo))
@@ -379,6 +412,13 @@ def parser() -> argparse.ArgumentParser:
         default=[],
         metavar="FAMILY=REFERENCE",
         help="a family timed at one width, with REFERENCE's serving shape",
+    )
+    p.add_argument(
+        "--same",
+        action="append",
+        default=[],
+        metavar="FAMILY=REFERENCE",
+        help="a family of REFERENCE's architecture (only its training differs)",
     )
     p.add_argument(
         "--trained-as",
