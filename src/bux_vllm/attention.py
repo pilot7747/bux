@@ -1,7 +1,8 @@
 """Softmax attention in vLLM: bux's ``gqa``, its projections split by head under
 tensor parallelism, attending by vLLM's attention layer and its paged KV cache, with
-its ``v`` port (the value residual, `bux_vllm.kv`) and its conv on keys and values
-(`bux_vllm.conv`)."""
+its ``v`` port (the value residual, `bux_vllm.kv`), its conv on keys and values
+(`bux_vllm.conv`) and its indexer, which picks the keys each query attends to
+(`bux_vllm.sparse`)."""
 
 from __future__ import annotations
 
@@ -65,41 +66,16 @@ class Attention(Layer):
         kv.check_ports(site.ports)
         tp = get_tensor_model_parallel_world_size()
         h, g = c["num_heads"], c["num_kv_heads"]
-        self.all_heads = bool(c["qk_norm"] and c["qk_norm_all_heads"])
-        if self.all_heads and g % tp:
-            raise NotImplementedError("gqa: qk_norm_all_heads with kv heads copied")
-        dk = c["head_dim"] or width // h
-        dv = c["v_head_dim"] or dk
+        dk, dv = kv.head_dims(c, width)
         self.path, self.dk, self.dv, self.fused = site.path, dk, dv, c["fused_qkv"]
         self.h, self.g = h // tp, max(1, g // tp)  # this rank's
-        self.qkv = QKVParallelLinear(
-            width,
-            dk,
-            h,
-            g,
-            bias=c["bias"],
-            v_head_size=dv,
-            return_bias=False,
-            prefix=f"{site.path}.qkv",
-        )
-        self._gate(c, width, h * dv, site.path)
-        out_bias = c["bias"] if c["output_bias"] is None else c["output_bias"]
-        self.o = RowParallelLinear(
-            h * dv, width, bias=out_bias, return_bias=False, prefix=f"{site.path}.o"
-        )
-        qk, out = c["qk_norm"], c["output_norm"]
-        if self.all_heads:
-            self.q_norm, self.k_norm = AllHeads(qk, h, dk, tp), AllHeads(qk, g, dk, tp)
-        else:
-            self.q_norm = Norm(qk, dk) if qk else None
-            self.k_norm = Norm(qk, dk) if qk else None
-        self.out_norm = Norm(out, dv) if out else None
+        self.kv_first = kv.kv_heads(g, tp, get_tensor_model_parallel_rank())[0]
+        self.c, self.scale = c, (c["scale"] or dk**-0.5) * logit_gain(c["rope"])
+        self._projections(c, width, site.path)
+        self._norms(c, tp)
         self.rope = Rope(c["rope"], dk) if c["rope"] else None
-        self.c = c
         self._value_residual(c, site.ports)
         self.sinks = _sinks(self.h) if c["sinks"] else None
-        self.kv_first = kv.kv_heads(g, tp, get_tensor_model_parallel_rank())[0]
-        self.scale = (c["scale"] or dk**-0.5) * logit_gain(c["rope"])
         kinds = states(c)  # a call's states, side by side in site.caches
         names = {kind: site.caches[i :: len(kinds)] for i, kind in enumerate(kinds)}
         self.indexer = None
@@ -108,6 +84,50 @@ class Attention(Layer):
         else:
             self._caches(c, site, names["full_attention"])
         self._convs(c, site, names.get("conv", []))
+
+    def _projections(self, c: dict, width: int, path: str) -> None:
+        """Make q, k and v's projection, column-parallel by head, the gate's, and
+        the row-parallel output projection."""
+        h, g, dk, dv = c["num_heads"], c["num_kv_heads"], self.dk, self.dv
+        self.qkv = QKVParallelLinear(
+            width,
+            dk,
+            h,
+            g,
+            bias=c["bias"],
+            v_head_size=dv,
+            return_bias=False,
+            prefix=f"{path}.qkv",
+        )
+        self._gate(c, width, h * dv, path)
+        out_bias = c["bias"] if c["output_bias"] is None else c["output_bias"]
+        self.o = RowParallelLinear(
+            h * dv, width, bias=out_bias, return_bias=False, prefix=f"{path}.o"
+        )
+
+    def _norms(self, c: dict, tp: int) -> None:
+        """Make the QK-norm, of each head or of all heads together, and the norm of
+        each head's output.
+
+        Raises:
+            NotImplementedError: QK-norm of all heads where ranks copy kv heads.
+        """
+        qk, out, h, g = (
+            c["qk_norm"],
+            c["output_norm"],
+            c["num_heads"],
+            c["num_kv_heads"],
+        )
+        self.all_heads = bool(qk and c["qk_norm_all_heads"])
+        if self.all_heads and g % tp:
+            raise NotImplementedError("gqa: qk_norm_all_heads with kv heads copied")
+        if self.all_heads:
+            self.q_norm = AllHeads(qk, h, self.dk, tp)
+            self.k_norm = AllHeads(qk, g, self.dk, tp)
+        else:
+            self.q_norm = Norm(qk, self.dk) if qk else None
+            self.k_norm = Norm(qk, self.dk) if qk else None
+        self.out_norm = Norm(out, self.dv) if out else None
 
     def _caches(self, c: dict, site: Site, names: list[str]) -> None:
         """Make each call's vLLM attention layer, with its KV cache."""
