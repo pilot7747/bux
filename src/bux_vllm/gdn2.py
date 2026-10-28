@@ -62,9 +62,14 @@ class Mixer(Recurrent):
         self.floor = None if bound is None else -bound
         h, hv, dk, dv = linear_dims(c)
         self.h, self.hv, self.dk, self.dv = h // self.tp, hv // self.tp, dk, dv
-        sizes, self.split, _ = gdn2_projection(c, self.tp)  # q, k, v, erase, write
+        projection = gdn2_projection(c, self.tp)  # q, k, v, erase, write
+        self.split = projection.split
         self.in_proj = MergedColumnParallelLinear(
-            width, sizes, bias=False, return_bias=False, prefix=f"{prefix}.in_proj"
+            width,
+            projection.sizes,
+            bias=False,
+            return_bias=False,
+            prefix=f"{prefix}.in_proj",
         )
         zero_padding(self.in_proj, sum(self.split[3:]))
         self.f = LowRank(width, c["gate_rank"] or dv, h * dk, f"{prefix}.f")
