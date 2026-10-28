@@ -1,12 +1,16 @@
 """Softmax attention in vLLM: bux's ``gqa``, its projections split by head under
-tensor parallelism, attending by vLLM's attention layer and its paged KV cache, and
-its ``v`` port (the value residual, `bux_vllm.kv`)."""
+tensor parallelism, attending by vLLM's attention layer and its paged KV cache, with
+its ``v`` port (the value residual, `bux_vllm.kv`) and its conv on keys and values
+(`bux_vllm.conv`)."""
 
 from __future__ import annotations
 
 import torch
 from torch import nn
-from vllm.distributed import get_tensor_model_parallel_world_size
+from vllm.distributed import (
+    get_tensor_model_parallel_rank,
+    get_tensor_model_parallel_world_size,
+)
 from vllm.model_executor.layers.attention import Attention as PagedAttention
 from vllm.model_executor.layers.linear import (
     ColumnParallelLinear,
@@ -26,17 +30,21 @@ from .common import (
     sharded_loader,
     unsupported,
 )
+from .config import states
+from .conv import CausalConv
 
 
 class Attention(Layer):
-    """bux's ``gqa``: q, k and v by one column-parallel projection, the values mixed
-    with those of its ``v`` port (the value residual) and pushed to it, QK-norm then
-    RoPE (in float32, as bux), causal softmax attention with its sliding window,
-    soft-capping and sinks by vLLM's attention layer, each head's output norm and
-    gate, and the row-parallel output projection.
+    """bux's ``gqa``: q, k and v by one column-parallel projection, the causal conv
+    on k and v added to them (``kv_conv_size``), the values mixed with those of its
+    ``v`` port (the value residual) and pushed to it, QK-norm then RoPE (in float32,
+    as bux), causal softmax attention with its sliding window, soft-capping and sinks
+    by vLLM's attention layer, each head's output norm and gate, and the
+    row-parallel output projection.
 
-    Each call of the layer keeps a KV cache of its own: a shared layer that runs
-    three times makes three of vLLM's attention layers, over the same weights.
+    Each call of the layer keeps a KV cache of its own, and a conv state beside it
+    with ``kv_conv_size``: a shared layer that runs three times makes three of
+    vLLM's attention layers (and convs), over the same weights.
     """
 
     bux_types = ("gqa",)
@@ -44,7 +52,7 @@ class Attention(Layer):
 
     def __init__(self, c: dict, width: int, site: Site):
         super().__init__()
-        unsupported(c, "kv_conv_size", "indexer", "relative_bias", "log_scale")
+        unsupported(c, "indexer", "relative_bias", "log_scale")
         unsupported(c, "power_scale", *(("gate_head_bias",) if c["gated"] else ()))
         if c["qk_norm"] and c["qk_norm_all_heads"]:
             # Its statistics would sum over every rank's heads under tensor parallelism.
@@ -78,11 +86,19 @@ class Attention(Layer):
         self.rope = Rope(c["rope"], dk) if c["rope"] else None
         self._value_residual(c, site.ports)
         self.sinks = _sinks(self.h) if c["sinks"] else None
-        scale = (c["scale"] or dk**-0.5) * logit_gain(c["rope"])
+        self.kv_first = kv.kv_heads(g, tp, get_tensor_model_parallel_rank())[0]
+        self._caches(c, site)
+
+    def _caches(self, c: dict, site: Site) -> None:
+        """Make each call's state: vLLM's attention layer with its KV cache, and the
+        conv on keys and values with its state under ``kv_conv_size``, all calls'
+        over the same weights."""
+        scale = (c["scale"] or self.dk**-0.5) * logit_gain(c["rope"])
+        n = len(states(c))  # a call's states, side by side in site.caches
         self.caches = nn.ModuleList(
             PagedAttention(
                 self.h,
-                dk,
+                self.dk,
                 scale,
                 num_kv_heads=self.g,
                 cache_config=site.vllm_config.cache_config,
@@ -90,10 +106,21 @@ class Attention(Layer):
                 per_layer_sliding_window=c["sliding_window_size"],
                 prefix=name,
                 sinks=self.sinks,
-                head_size_v=dv,
+                head_size_v=self.dv,
             )
-            for name in site.caches
+            for name in site.caches[::n]
         )
+        self.convs, self.conv_weight = None, None
+        if size := c["kv_conv_size"]:
+            channels = self.g * (self.dk + self.dv)
+            convs = [
+                CausalConv(channels, size, site.vllm_config, name)
+                for name in site.caches[1::n]
+            ]
+            self.conv_weight = convs[0].weight
+            for other in convs[1:]:
+                other.weight = self.conv_weight
+            self.convs = nn.ModuleList(convs)
 
     def _gate(self, c: dict, width: int, heads_dv: int, path: str) -> None:
         """Make the gate on the heads' outputs, ``act(W_g x)``, a value a channel or
@@ -135,21 +162,44 @@ class Attention(Layer):
             out["v_mix"] = (self.v_mix, ())
         return out
 
+    def load(self, name: str, tensor: torch.Tensor) -> list[nn.Parameter]:
+        if name in ("k_conv.weight", "v_conv.weight") and self.conv_weight is not None:
+            return self._load_conv(self.conv_weight, name[0], tensor)
+        return super().load(name, tensor)
+
+    def _load_conv(
+        self, weight: nn.Parameter, which: str, taps: torch.Tensor
+    ) -> list[nn.Parameter]:
+        """Load bux's taps of the conv on the keys (`which` ``k``) or the values
+        (``v``) into this rank's rows of the conv's `weight`: its kv heads' keys,
+        then their values."""
+        dims, start = (self.dk, 0) if which == "k" else (self.dv, self.g * self.dk)
+        rows = kv.conv_rows(taps, dims, self.kv_first, self.g)
+        weight.data[start : start + rows.shape[0]].copy_(rows)
+        return [weight]
+
     def forward(self, x: torch.Tensor, ctx: Ctx) -> torch.Tensor:
-        t = x.shape[0]
-        q, k, v = self.qkv(x).split(
-            [self.h * self.dk, self.g * self.dk, self.g * self.dv], -1
-        )
+        t, call = x.shape[0], ctx.call(self.path)
+        q, k, v = self._project(x, call)
         v = self._v_port(v, ctx)
         q, k = q.view(t, self.h, self.dk), k.view(t, self.g, self.dk)
         if self.q_norm is not None and self.k_norm is not None:
             q, k = self.q_norm(q), self.k_norm(k)
         if self.rope is not None:
             q, k = self.rope(q, ctx.positions), self.rope(k, ctx.positions)
-        attend = self.caches[ctx.call(self.path)]
         q, k = q.reshape(t, -1).contiguous(), k.reshape(t, -1).contiguous()
-        out = attend(q, k, v.contiguous()).view(t, self.h, self.dv)
+        out = self.caches[call](q, k, v.contiguous()).view(t, self.h, self.dv)
         return self.o(self._gated(x, out).reshape(t, -1))
+
+    def _project(self, x: torch.Tensor, call: int) -> list[torch.Tensor]:
+        """q, k and v of x, (T, _) each, with the conv added to k and v (by the
+        `call`-th call's state) under ``kv_conv_size``."""
+        q, keys_values = self.qkv(x).split(
+            [self.h * self.dk, self.g * (self.dk + self.dv)], -1
+        )
+        if self.convs is not None:
+            keys_values = keys_values + self.convs[call](keys_values)
+        return [q, *keys_values.split([self.g * self.dk, self.g * self.dv], -1)]
 
     def _v_port(self, v: torch.Tensor, ctx: Ctx) -> torch.Tensor:
         """The values, (T, g dv), with those the ``v`` port reads mixed in, pushed

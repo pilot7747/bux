@@ -211,8 +211,11 @@ def state_dtypes(vllm_config: Any) -> tuple:
 
 
 def copy_funcs(kind: str) -> tuple:
-    """How vLLM copies the state of a recurrent layer of vLLM's `kind`
-    (``MAMBA2``, or ``GDN_ATTN``: ``gdn``'s and ``kda``'s) for prefix caching."""
+    """How vLLM copies the state of a layer of vLLM's `kind` (``MAMBA2``,
+    ``GDN_ATTN``: ``gdn``'s and ``kda``'s, or ``SHORT_CONV``: a conv on keys and
+    values) for prefix caching."""
     if kind == "GDN_ATTN":
         return MambaStateCopyFuncCalculator.gated_delta_net_state_copy_func()
+    if kind == "SHORT_CONV":
+        return MambaStateCopyFuncCalculator.short_conv_state_copy_func()
     return MambaStateCopyFuncCalculator.mamba2_state_copy_func()

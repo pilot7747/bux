@@ -16,12 +16,14 @@ import jax
 import numpy as np
 import pytest
 import torch
+import torch.nn.functional as F
 from flax import nnx
 
 from bux import config as cfg
 from bux.architecture.attention import rope as bux_rope
 from bux.architecture.attention.gqa import Attention as BuxAttention
 from bux.architecture.experts.moe import MoE
+from bux.architecture.layers.conv import CausalConv
 from bux.export import plan as core
 from bux.export.hf import linear_attention as hf_linear
 from bux.export.hf import residual as hf_residual
@@ -94,6 +96,12 @@ def test_layers_after_the_first_head_are_not_live() -> None:
     live = plan.live(plan.plan(arch.model_dump(mode="json")).calls)
     assert [c.path for c in live][-1] == "model.shared.out"
     assert sum(c.layer["config"]["type"] == "gqa" for c in live) == 1
+
+
+def test_a_conv_on_keys_and_values_keeps_a_state_beside_the_kv_cache() -> None:
+    arch = compile(vllm_parity.CASES["kv-conv"])
+    c = config.BuxConfig(bux=json.loads(arch.model_dump_json()))
+    assert c.layer_types == ["full_attention", "conv"] * 3
 
 
 @pytest.mark.parametrize("name", ["gdn", "kda", "kda-kimi"])
@@ -442,3 +450,17 @@ def test_each_rank_keeps_its_kv_heads(
     kv_heads: int, tp: int, want: list[tuple[int, int]]
 ) -> None:
     assert [kv.kv_heads(kv_heads, tp, rank) for rank in range(tp)] == want
+
+
+def test_the_kv_conv_taps_go_where_vllm_convolves_them() -> None:
+    """bux's taps on 4 kv heads of 8, cut to rank 1 of 2's heads and laid out as
+    vLLM's conv weight, (channels, taps), convolve as bux does: vLLM's kernels take
+    the last tap on the token itself, as F.conv1d over the left-padded tokens."""
+    conv = CausalConv(32, 3, False, nnx.Rngs(0))
+    x = jax.random.normal(jax.random.key(1), (1, 10, 32))
+    want = np.asarray(conv(x))[0, :, 16:]
+    first, n = kv.kv_heads(4, 2, 1)
+    w = kv.conv_rows(torch.from_numpy(np.array(conv.weight[...])), 8, first, n)
+    xs = torch.from_numpy(np.array(x)[0, :, 16:]).T
+    got = F.conv1d(F.pad(xs, (2, 0))[None], w[:, None], groups=16)[0].T
+    np.testing.assert_allclose(got.numpy(), want, rtol=1e-5, atol=1e-6)
