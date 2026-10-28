@@ -116,7 +116,7 @@ TABLES = {
     ), (
         Col("paired Δ by rung %", "measured, paired by seed"), Col("× per parameter", "× per parameter"),
         Col("(a) speedup to vs's 1T loss", "GPU-hours, speedup"), Col("(b) Δ 130B %", "130B tokens"),
-        Col("(b) Δ 1T %", "1T tokens"), Col("(b) Δ 1T, E fit %", "1T tokens, E fit"),
+        Col("(b) Δ 1T %", "1T tokens"), Col("(b) Δ 1T, E fit %", "1T tokens, E free"),
     ), key=2),
     "factorial": Table("factorial", "objective", (
         ("hc", "hyper-connections (R = hc)"), ("attnres", "AttnRes (R = AttnRes)"),

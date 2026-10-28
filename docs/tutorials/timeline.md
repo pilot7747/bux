@@ -379,11 +379,10 @@ Engram's tables and the MTP module (an MoE's routed experts count `top_k` of
   `--share B,beta` pools those over every family.
 - **Parents come from each file's modules**: the reference, the baseline, or the
   2026 hybrid that the file uses.
-- **E is shared by every family**: the data's entropy. `--fix-e` holds it at the
-  values Old against new's ladders fit on the same data, 0.3204 bits per byte for
-  the objective. Fitted free on this timeline's rungs, it comes out at 0.3229.
-
-% Interim: the E fit's value.
+- **E is shared by every family**: the data's entropy. `--fix-e` fixes it at the
+  values Old against new's ladders fit on the same data: 0.3204 bits per byte for
+  the objective. A fit with E free lands at 0.3229, so the extrapolation does not
+  hinge on it.
 
 All families fit at once, by the Huber loss of log L, as Hoffmann et al. (2022) fit
 theirs. The token scans train the reference and every milestone at `d512` on 5, 10,
@@ -528,11 +527,14 @@ and 4e-3.
 Per parameter the candidate is worth 1.8 times the hybrid, and yet at equal serving
 cost it gains only 0.3% to 0.5% on the hybrid, 9.0% on 2020. Two things shrink it:
 
-- **The hybrid's fitted exponent is steep**: α = 0.42 to 0.49, as E is held or fit,
+- **The hybrid's fitted exponent is steep**: α = 0.42 to 0.49, as E is fixed or free,
   against the reference's 0.25. At the hybrid's 12.8B parameters per token, its
-  parameter term A N^-α is then about 2% of the predicted loss with E held (0.0076
-  of 0.354 bits per byte), and about 1% with E fit. A multiplier of 1.8 lowers that
-  term by 1.8^0.42, about 1.28 times: a few tenths of a percent of the loss.
+  parameter term A N^-α is then about 2% of the predicted loss with E fixed (0.0076
+  of 0.354 bits per byte). A multiplier of 1.8 lowers that term by 1.8^0.42, about
+  1.28 times: a few tenths of a percent of the loss.
+
+% Interim: the A and B terms' shares, with E fixed and free.
+
 - **`hc` costs serving**: the candidate's target holds 11.5B parameters per token as
   measured, against the hybrid's 12.8B.
 
@@ -575,8 +577,9 @@ with those of a repository's first 2k, against its parent, averaged over the run
   `d512`, 1 at `d1280`.
 - **A window as long as the training rows hurts.** `swa_2048` loses 11% past 8k:
   in the 16k phase its local layers still see 2048 keys.
-- **The sparse attentions lose past 8k**: CSA misses the long phase's YaRN, and MSA
-  matches the reference at 2k but not beyond.
+- **The sparse attentions lose at long context.** Against the reference, CSA is
+  9.9% worse in a repository's first 2k and 17.2% past 8k; MSA matches the reference
+  in the first 2k but not beyond.
 - **The reference's `d768` point sits low**: most arms' differences there are 1 to
   7 points above those at their other rungs.
 
@@ -627,8 +630,8 @@ from their observed metrics.
   baseline, four milestones and 11 arms), 17 three, 51 two, and 25 one, most of the
   factorial among them. A family with fewer than three takes its parent's exponent,
   so its gain is one multiplier at every scale.
-- **E is held, not fit.** Fitted free, it comes out at 0.3229, next to the 0.3204
-  held, and the candidates' predictions move by 0.03 points.
+- **E is fixed at 0.3204.** A fit with E free lands at 0.3229, and moves the
+  candidates' predictions by 0.03 points, so the extrapolation does not hinge on it.
 - **The targets are far.** A dense target at the reference's cost has 4.4B parameters
   per token, 50 times past `d768`; the 2026 families' have 12B. The ranges are not
   confidence intervals.
