@@ -2,12 +2,15 @@
 ``config.json`` alone.
 
 The model is the plan's tree of blocks (`bux_vllm.plan`): the model's, each
-repeat's body, each shared definition's, with every layer at the path its weights
-have in the checkpoint. Its forward runs the IR graph over the batch's tokens, as
-the generated ``modeling_bux.py`` does over a batch's rows, up to the first head: it
-returns the head's input, and vLLM takes the head's logits of the tokens it samples
-(``compute_logits``). The layers after the first head (multi-token prediction's)
-are not built, and their weights are skipped.
+repeat's body, each shared definition's, with every layer, and every branch of a
+residual algebra, at the path its weights have in the checkpoint. Its forward runs
+the IR graph over the batch's tokens, as the generated ``modeling_bux.py`` does over
+a batch's rows, up to the first head: it returns the head's input, and vLLM takes the
+head's logits of the tokens it samples (``compute_logits``). Under a residual
+algebra, a branch outside any other is its module's read, the body, and its write
+back (`bux_vllm.residual`), and the embedding's output outside any branch widens.
+The layers after the first head (multi-token prediction's) are not built, and their
+weights are skipped.
 """
 
 from __future__ import annotations
@@ -27,13 +30,13 @@ from vllm.model_executor.models.interfaces import IsHybrid
 from vllm.sequence import IntermediateTensors
 from vllm.v1.kv_cache_interface import MambaSpec
 
-from . import conv, ssm
+from . import conv, residual, ssm
 from .common import Ctx, Layer, Site
 from .config import states
 from .plan import Call, Node, Plan, Pos, Scope, at, children, is_call, live, plan
 
 #: The modules of this package that hold layers.
-LAYER_MODULES = ("common", "basic", "attention", "moe", "ssm")
+LAYER_MODULES = ("common", "basic", "attention", "mla", "moe", "ssm", "kda", "residual")
 
 
 @cache
@@ -106,7 +109,25 @@ def build_layers(vllm_config: VllmConfig, p: Plan) -> dict[str, nn.Module]:
         layer = layers[call.path] = cls(node["config"], node["width"], site)
         if embedding is None and node["config"]["type"] == "embed":
             embedding = layer
-    return layers
+    return layers | build_branches(config.bux, p, len(calls))
+
+
+def build_branches(arch: Node, p: Plan, calls: int) -> dict[str, nn.Module]:
+    """Build the module of each residual algebra's branch of `p`, by its path: those
+    that run before the first head, the first `calls` layer calls; the others are
+    not built.
+
+    Raises:
+        NotImplementedError: The residual algebra is not in vLLM yet.
+    """
+    out: dict[str, nn.Module] = {}
+    algebra = arch["residual"]
+    for b in (b for b in p.branches if b.first):
+        if b.calls < calls:
+            out[b.path] = residual.algebra(algebra)(algebra, arch["d_model"])
+        else:
+            out[b.path] = Unused()
+    return out
 
 
 def _class(call: Call) -> type[Layer]:
@@ -145,34 +166,56 @@ class Scoped(nn.Module):
 class Block(Scoped):
     """A repeat's body or a shared definition: its scope's graph on the stream."""
 
-    def forward(self, x: torch.Tensor, ctx: Ctx) -> torch.Tensor:
-        return run(self, self.scope.root, (), x, ctx)
+    def forward(self, x: Any, ctx: Ctx) -> Any:
+        return run(self, self.scope.root, (), x, ctx, self.scope.depth)
 
 
-def run(block: Scoped, node: Node, pos: Pos, x: Any, ctx: Ctx) -> Any:
-    """Run `node`, at `pos` in `block`'s scope, on `x`: nothing once the first head
-    has run."""
+def run(block: Scoped, node: Node, pos: Pos, x: Any, ctx: Ctx, depth: int) -> Any:
+    """Run `node`, at `pos` in `block`'s scope inside `depth` residual branches, on
+    `x`: nothing once the first head has run."""
     if ctx.hidden is not None:
         return x
     if is_call(ctx.plan, block.scope, node, pos):
-        return ctx.shared[node["share"]](x, ctx)
+        y = ctx.shared[node["share"]](x, ctx)
+        return _widened(node, y, ctx.plan.shared[node["share"]].depth, ctx)
     kind = node["kind"]
     if kind == "layer":
-        return getattr(block, block.scope.names[pos])(x, ctx)
+        y = getattr(block, block.scope.names[pos])(x, ctx)
+        return _widened(node, y, depth, ctx)
     if kind == "repeat":
         return _repeat(block, node, pos, x, ctx)
     if kind == "seq":
         for i, item in enumerate(node["items"]):
-            x = run(block, item, (*pos, i), x, ctx)
+            x = run(block, item, (*pos, i), x, ctx, depth)
         return x
+    if kind == "residual" and pos in block.scope.names:
+        return _branch(block, node, pos, x, ctx)
     if kind in LEAVES:
         return LEAVES[kind](node, x, ctx)
-    ys = [run(block, c, (*pos, i), x, ctx) for i, c in enumerate(children(node))]
+    inner = depth + (kind == "residual")
+    ys = [run(block, c, (*pos, i), x, ctx, inner) for i, c in enumerate(children(node))]
     if kind == "residual":
         return x + ys[0]
     if kind == "neg":
         return -ys[0]
     return reduce(operator.add if kind == "sum" else operator.mul, ys)
+
+
+def _branch(block: Scoped, node: Node, pos: Pos, x: Any, ctx: Ctx) -> Any:
+    """A residual algebra's branch: its module's read of the stream `x`, the body on
+    it, and its write back."""
+    algebra = getattr(block, block.scope.names[pos])
+    h, kept = algebra.read(x, ctx)
+    y = run(block, node["body"], (*pos, 0), h, ctx, 1)  # inside this one branch
+    return algebra.write_back(kept, y)
+
+
+def _widened(node: Node, y: Any, depth: int, ctx: Ctx) -> Any:
+    """`y`, the output of `node`, widened by the residual algebra if `node` is an
+    embedding outside any branch, as bux's embed widens it."""
+    if node["kind"] != "layer" or node["config"]["type"] != "embed" or depth > 0:
+        return y
+    return residual.widen(ctx.plan.residual, y)
 
 
 #: The nodes that read no layer: ``value``, ``_``, ``@name``, ``$name``.
@@ -216,11 +259,7 @@ class BuxModel(Scoped):
 
     def __init__(self, *, vllm_config: VllmConfig, prefix: str = ""):
         config = vllm_config.model_config.hf_config
-        arch = config.bux
-        if arch.get("residual") is not None:
-            kind = arch["residual"]["type"]
-            raise NotImplementedError(f"the residual algebra {kind!r} not in vLLM yet")
-        p = plan(arch, config.bux_reserved)
+        p = plan(config.bux, config.bux_reserved)
         layers = build_layers(vllm_config, p)
         super().__init__(p.top, "model.", layers)
         self.plan = p
@@ -250,7 +289,7 @@ class BuxModel(Scoped):
         inputs_embeds: torch.Tensor | None = None,
     ) -> torch.Tensor:
         ctx = Ctx(positions, self.shared, inputs_embeds, self.plan)
-        run(self, self.plan.top.root, (), input_ids, ctx)
+        run(self, self.plan.top.root, (), input_ids, ctx, 0)
         assert ctx.hidden is not None, "the model ran no head"
         return ctx.hidden
 

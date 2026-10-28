@@ -5,5 +5,5 @@
 # 64 of the width.
 use gpt3_2020
 
-gpt3  = embed(max_positions=16384) block^layers norm head(tied=true)
+gpt3  = embed(max_positions=positions) block^layers norm head(tied=true)
 model = gpt3

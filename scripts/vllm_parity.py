@@ -8,7 +8,7 @@ three steps:
     JAX_PLATFORMS=cpu python scripts/vllm_parity.py export DIR [--dtype bfloat16]
     # vLLM's, with the plugin (pip install src/bux_vllm): decode them
     python scripts/vllm_parity.py run DIR [--tp 2] [--eager] [--moe-backend triton]
-        [--mamba-ssm-cache-dtype float32] [--tag TAG]
+        [--mamba-ssm-cache-dtype float32] [--attention-backend TRITON_MLA] [--tag TAG]
     # bux's again: compare
     JAX_PLATFORMS=cpu python scripts/vllm_parity.py compare DIR [--tag TAG]
 
@@ -49,6 +49,27 @@ BLOCK = "block = [rmsnorm attn] [rmsnorm ffn]\n"
 LLAMA = HEAD + ATTN + FFN + BLOCK
 EXPERT = "dense = gated_mlp(intermediate_size=64, activation=swish)\n"
 MOE_BLOCK = "block = [rmsnorm attn] [rmsnorm experts]\n"
+# Qwen3-Next's attention beside linear attention (`delta`), which the case defines.
+GATED_HEAD = (
+    HEAD
+    + "attn = gqa(num_heads=4, num_kv_heads=2, qk_norm=rmsnorm(zero_centered=true),"
+    " gated=true, rope=rope(fraction=0.25))\n" + FFN
+)
+LINEAR_HYBRID = (
+    "model = embed [rmsnorm delta] [rmsnorm ffn] [rmsnorm delta] [rmsnorm ffn]"
+    " [rmsnorm attn] [rmsnorm ffn] rmsnorm head"
+)
+#: The timeline's MLA (examples/experiments/timeline/attention.bux), on 4 heads.
+LATENT = (
+    "attn = mla(num_heads=4, kv_lora_rank=256, qk_nope_head_dim=64,"
+    " qk_rope_head_dim=32, v_head_dim=64, rope=rope())\n"
+)
+#: DeepSeek-V3's MLA, its dims and RoPE, on 4 heads and a query latent of 64.
+DEEPSEEK = (
+    "attn = mla(num_heads=4, q_lora_rank=64, kv_lora_rank=512, rope=rope("
+    "layout=interleaved, scaling=yarn(factor=4, original_max_len=16,"
+    " attention_factor_on=softmax)))\n"
+)
 
 #: The cases, by name: a model each, as bux source.
 CASES = {
@@ -134,19 +155,41 @@ CASES = {
     + "experts = moe(num_experts=8, top_k=2, router_bias=true, num_shared_experts=1,"
     " expert=gated_mlp(intermediate_size=64, activation=quick_gelu, bias=true,"
     " limit=1.0, up_offset=1.0))\n" + MOE_BLOCK + "model = embed block^2 rmsnorm head",
+    "moe-latent": HEAD
+    + ATTN
+    + "experts = moe(num_experts=8, top_k=3, num_shared_experts=1, router=sigmoid,"
+    " routed_scaling_factor=2.5, load_balancing=aux_free, latent_size=64,"
+    " latent_input_norm=rmsnorm, latent_output_norm=rmsnorm,"
+    " expert=mlp(intermediate_size=64, activation=gelu, bias=true))\n"
+    + MOE_BLOCK
+    + "model = embed block^2 rmsnorm head",
     "mamba2": HEAD
     + ATTN
     + FFN
     + "ssm = mamba2(state_size=16, head_dim=16, num_groups=2)\n"
     + "model = embed [rmsnorm ssm] [rmsnorm ffn] [rmsnorm attn] [rmsnorm ffn]"
     " [rmsnorm ssm] [rmsnorm ffn] rmsnorm head",
-    "gdn": HEAD
-    + "attn = gqa(num_heads=4, num_kv_heads=2, qk_norm=rmsnorm(zero_centered=true),"
-    " gated=true, rope=rope(fraction=0.25))\n"
-    + FFN
+    "gdn": GATED_HEAD
     + "delta = gdn(num_heads=2, num_v_heads=4, head_dim=32)\n"
-    + "model = embed [rmsnorm delta] [rmsnorm ffn] [rmsnorm delta] [rmsnorm ffn]"
-    " [rmsnorm attn] [rmsnorm ffn] rmsnorm head",
+    + LINEAR_HYBRID,
+    "kda": GATED_HEAD
+    + "delta = kda(num_heads=2, num_v_heads=4, head_dim=32, gate_lower_bound=-5)\n"
+    + LINEAR_HYBRID,
+    "kda-kimi": GATED_HEAD
+    + "delta = kda(num_heads=4, head_dim=32, output_gate_rank=32, norm_eps=1e-5)\n"
+    + LINEAR_HYBRID,
+    "hc": LLAMA + "residual = hc(expansion=4)\nmodel = embed block^2 rmsnorm head",
+    "attnres": LLAMA
+    + "residual = attnres(block_size=3)\nmodel = embed block^2 rmsnorm head",
+    "mhc": LLAMA + "residual = mhc(expansion=4)\nmodel = embed block^2 rmsnorm head",
+    "mhc-single": LLAMA + "residual = mhc(expansion=4, single_pass=true)\n"
+    "model = embed block^2 rmsnorm head",
+    "gr": HEAD
+    + ATTN
+    + FFN
+    + "residual = gr(expansion=4, rank=16)\nmodel = embed ([attn] [ffn])^2 head(tied=true)",
+    "vpgate": LLAMA
+    + "residual = vpgate(temperature=0.3)\nmodel = embed block^2 rmsnorm head",
     "value-residual": HEAD
     + ATTN
     + FFN
@@ -154,6 +197,21 @@ CASES = {
     + "one = attn(value_residual=convex)\n"
     + "model = embed [rmsnorm attn(v=@v1)] [rmsnorm ffn] [rmsnorm attn(v=$v1)]"
     " [rmsnorm both(v=$v1)] [rmsnorm ffn] [rmsnorm one(v=$v1!)] rmsnorm head",
+    "mla": HEAD + LATENT + FFN + BLOCK + "model = embed block^2 rmsnorm head",
+    "mla-moe": HEAD
+    + LATENT
+    + FFN
+    + EXPERT
+    + "experts = moe(num_experts=8, top_k=2, num_shared_experts=1, router=sigmoid,"
+    " routed_scaling_factor=2.5, load_balancing=aux_free, expert=dense)\n"
+    + "model = embed [rmsnorm attn] [rmsnorm ffn] [rmsnorm attn] [rmsnorm experts]"
+    " rmsnorm head",
+    "mla-deepseek": HEAD
+    + DEEPSEEK
+    + "gated = attn(gated=true, gate_per_head=true, output_norm=rmsnorm)\n"
+    + FFN
+    + "model = embed [rmsnorm attn] [rmsnorm ffn] [rmsnorm gated] [rmsnorm ffn]"
+    " rmsnorm head",
     "kv-conv": HEAD
     + FFN
     + "attn = gqa(num_heads=4, num_kv_heads=2, kv_conv_size=4, rope=rope())\n"
@@ -182,6 +240,7 @@ def main() -> None:
         sub.choices[name].add_argument("--eager", action="store_true")
         sub.choices[name].add_argument("--moe-backend", default="auto")
         sub.choices[name].add_argument("--mamba-ssm-cache-dtype", default="auto")
+        sub.choices[name].add_argument("--attention-backend", default=None)
     sub.choices["compare"].add_argument("--tolerance", type=float, default=1e-3)
     sub.choices["compare"].add_argument("--margin", type=float, default=0.0)
     args = p.parse_args()
@@ -317,6 +376,8 @@ def run_alone(args: argparse.Namespace, name: str) -> None:
     cmd = [sys.executable, __file__, "run-one", str(args.dir), "--only", name]
     cmd += ["--tag", args.tag, "--tp", str(args.tp), "--moe-backend", args.moe_backend]
     cmd += ["--mamba-ssm-cache-dtype", args.mamba_ssm_cache_dtype]
+    if args.attention_backend is not None:
+        cmd += ["--attention-backend", args.attention_backend]
     subprocess.run(cmd + ["--eager"] * args.eager, check=False)
 
 
@@ -327,6 +388,7 @@ def engine(args: argparse.Namespace) -> dict:
         "enforce_eager": args.eager,
         "moe_backend": args.moe_backend,
         "mamba_ssm_cache_dtype": args.mamba_ssm_cache_dtype,
+        "attention_backend": args.attention_backend,
     }
 
 

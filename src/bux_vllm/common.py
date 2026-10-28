@@ -14,7 +14,6 @@ calls, named as `Site.caches` says.
 from __future__ import annotations
 
 import math
-import os
 from collections.abc import Callable
 from dataclasses import dataclass, field
 from typing import Any
@@ -44,21 +43,6 @@ def unsupported(c: dict, *names: str) -> None:
     on = [n for n in names if c.get(n) not in (None, False, 0, 0.0)]
     if on:
         raise NotImplementedError(f"{c['type']}: {', '.join(on)} not in vLLM yet")
-
-
-#: Set to 1 to build the stand-ins: layers that cost what bux's do in vLLM (the
-#: same weights, state and kernels) without computing what they compute.
-TIMING = "BUX_VLLM_TIMING"
-
-
-def timing_only(what: str) -> None:
-    """Allow `what`, a stand-in for timing, only where `TIMING` is set.
-
-    Raises:
-        NotImplementedError: `TIMING` is not set to 1.
-    """
-    if os.environ.get(TIMING) != "1":
-        raise NotImplementedError(f"{what} not in vLLM yet ({TIMING}=1 times it)")
 
 
 @dataclass
@@ -96,6 +80,8 @@ class Ctx:
         embedding: The model's first embedding, once it ran.
         hidden: The first head's input, once it ran: the hidden states vLLM takes
             logits of.
+        pending_read: The read coefficients, (T, n), the last single-pass hc or mhc
+            branch computed for the next one; None before the first.
     """
 
     def __init__(
@@ -110,6 +96,7 @@ class Ctx:
         self.taps: dict[str, list] = {}
         self.embedding: Any = None
         self.hidden: torch.Tensor | None = None
+        self.pending_read: torch.Tensor | None = None
         self._calls: dict[str, int] = {}
 
     def push(self, name: str, x: Any) -> Any:
