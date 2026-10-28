@@ -394,6 +394,14 @@ def main() -> None:
             out[variant] = as_trained(out[variant], fams[base])
             if "as_trained" in out[variant]:
                 out[base] = served_as(out[base], out[variant], variant)
+    for family, note in (x.split("=", 1) for x in a.upper_bound):
+        if family in out:
+            out[family] |= {"upper_bound": True, "note": note}
+    for family, entry in out.items():
+        m = analytic.get(family)
+        if m is not None and "analytic" not in entry:
+            entry["analytic"] = {"N_active": m["active"], "N_total": m["params"]}
+            entry["analytic"]["d_model"] = m["d_model"]
     budget = statistics.mean(w.cost() for w in fams[BUDGET].values())
     for family, reason in (x.split("=", 1) for x in a.kernel_limited):
         ref = likes.get(family)
@@ -430,6 +438,13 @@ def parser() -> argparse.ArgumentParser:
         default=[],
         metavar="FAMILY=REFERENCE",
         help="a family timed at one width, with REFERENCE's serving shape",
+    )
+    p.add_argument(
+        "--upper-bound",
+        action="append",
+        default=[],
+        metavar="FAMILY=NOTE",
+        help="a family whose measured cost bounds its architecture's from above",
     )
     p.add_argument(
         "--same",
