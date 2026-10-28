@@ -239,9 +239,9 @@ layer: a window, sinks, a softcap, and a `gqa` layer's conv on keys and values a
   with the layer's scale, softcap and sinks, in float32.
 - **Kernels.** In a 16-bit model, Triton kernels read the paged caches in place:
   one attends over each query's picks, one scores every key of a decoded token's
-  request, in float32. A prompt's queries, which share their keys, score them by
-  PyTorch's matmul, QSA pools and scores its blocks by PyTorch, and the picks are
-  ranked as bux ranks them. They take DSA's keys, MSA's blocks with picks per group
+  request, and one scores a prompt's keys for a tile of its queries at a time, each
+  head's dots on the tensor cores and their sum in float32. QSA pools and scores
+  its blocks by PyTorch, and the picks are ranked as bux ranks them. They take DSA's keys, MSA's blocks with picks per group
   or not, and QSA's blocks, heads of up to 256 dims. MLA's latents, and a float32
   model unless `BUX_VLLM_SPARSE_KERNELS=triton`, take the PyTorch path, which
   gathers each query's scores, keys and values into memory first and so moves

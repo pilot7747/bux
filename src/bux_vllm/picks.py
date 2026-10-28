@@ -44,10 +44,15 @@ def top(
     """The indices of each row's `k` highest `scores` among the `valid` ones, the
     first of equal ones (as bux's ``_top``), and which of them are valid: a row
     with fewer valid entries keeps them all."""
-    n = scores.shape[-1]
-    index = torch.arange(n, device=scores.device)
-    key = torch.where(valid, (ordered(scores) << 31) | (LOW - index), -1)
-    best = key.topk(min(k, n), dim=-1).values
+    index = torch.arange(scores.shape[-1], device=scores.device)
+    return best_of(torch.where(valid, (ordered(scores) << 31) | (LOW - index), -1), k)
+
+
+def best_of(key: torch.Tensor, k: int) -> tuple[torch.Tensor, torch.Tensor]:
+    """The indices of each row's `k` highest ranking keys, a score's `ordered` bits
+    above its index's complement (`top`'s), -1 for an invalid entry; and which of
+    them are valid."""
+    best = key.topk(min(k, key.shape[-1]), dim=-1).values
     return LOW - (best & LOW), best >= 0
 
 
