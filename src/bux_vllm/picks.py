@@ -18,7 +18,6 @@ own keys (`attend_picked`).
 
 from __future__ import annotations
 
-import itertools
 from dataclasses import dataclass
 from typing import Any
 
@@ -51,8 +50,8 @@ def top(
 def best_of(key: torch.Tensor, k: int) -> tuple[torch.Tensor, torch.Tensor]:
     """The indices of each row's `k` highest ranking keys, a score's `ordered` bits
     above its index's complement (`top`'s), -1 for an invalid entry; and which of
-    them are valid."""
-    best = key.topk(min(k, key.shape[-1]), dim=-1).values
+    them are valid. In no order: they are a set, which attention reads as one."""
+    best = key.topk(min(k, key.shape[-1]), dim=-1, sorted=False).values
     return LOW - (best & LOW), best >= 0
 
 
@@ -134,7 +133,8 @@ def blocks_of_best(
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """`best_blocks`' picks from each block's best score a query sees, (Q, [G,]
     blocks), -inf for a block it sees none of."""
-    own = F.one_hot(positions // size, best.shape[-1]).bool()
+    blocks = torch.arange(best.shape[-1], device=best.device)
+    own = (positions // size)[:, None] == blocks  # one_hot checks on the CPU
     best = best.masked_fill(own if best.ndim == 2 else own[:, None], torch.inf)
     blocks, ok = top(best, best > -torch.inf, top_k // size)
     return block_keys(blocks, ok, size, see)
@@ -164,6 +164,19 @@ def mean_blocks(
     query's own block while it is unfinished; their keys, (Q, K)."""
     full = full_blocks(positions, s.shape[-1], size, window)
     blocks, ok = top(s, full, top_k // size)
+    return with_own_block(blocks, ok, see, positions, window, size)
+
+
+def with_own_block(
+    blocks: torch.Tensor,
+    ok: torch.Tensor,
+    see: torch.Tensor,
+    positions: torch.Tensor,
+    window: int | None,
+    size: int,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """QSA's picks from its best complete `blocks` and which are valid, (Q, k): those
+    and the query's own block while it is unfinished; their keys, (Q, K)."""
     own = (positions // size)[:, None]
     finished = (own + 1) * size - 1 <= positions[:, None]
     if window is not None:
@@ -181,10 +194,10 @@ def pooled(raw: torch.Tensor, size: int) -> torch.Tensor:
 
 
 def write(cache: torch.Tensor, slots: torch.Tensor, rows: torch.Tensor) -> None:
-    """Write `rows`, (T, heads, channels), into the cache at vLLM's `slots`, (T,),
-    skipping padding (slot -1)."""
-    keep = slots >= 0
-    slots, rows = slots[keep], rows[keep]
+    """Write `rows`, (T, heads, channels), into the cache at vLLM's `slots`, (T,):
+    padding's (slot -1) into vLLM's null block, block 0, which no request holds, so
+    that a CUDA graph of the step reads nothing on the CPU."""
+    slots = slots.clamp(min=0)
     size = cache.shape[2]
     cache[slots // size, :, slots % size] = rows.to(cache.dtype)
 
@@ -488,31 +501,25 @@ class Segment:
     single queries of several requests.
 
     Attributes:
-        tokens: The queries' indices in the step's tokens, (Q,).
-        requests: Their requests' indices in the batch, (Q,) or (1,) if shared.
+        tokens: The queries among the step's tokens.
+        requests: Their requests among the batch's, one for one request's.
         keys: How many key positions of its requests to read, at least.
     """
 
-    tokens: torch.Tensor
-    requests: torch.Tensor
+    tokens: slice
+    requests: slice
     keys: int
 
 
-def segments(starts: list[int], bounds: list[int], device: Any) -> list[Segment]:
-    """The step's queries by `Segment`: those of the requests with one query
-    together, then each other request's; `starts` are the requests' first queries
-    and the end, and `bounds` the most keys each request has."""
-    lens = [b - a for a, b in itertools.pairwise(starts)]
-    single = [r for r, n in enumerate(lens) if n == 1]
-    out = []
-    if single:
-        at = torch.tensor([starts[r] for r in single], device=device)
-        ids = torch.tensor(single, device=device)
-        out.append(Segment(at, ids, max(bounds[r] for r in single)))
-    for r, n in enumerate(lens):
-        if n > 1:
-            at = torch.arange(starts[r], starts[r] + n, device=device)
-            out.append(Segment(at, torch.tensor([r], device=device), bounds[r]))
+def segments(
+    decodes: int, prompts: list[tuple[int, int, int, int]], longest: int
+) -> list[Segment]:
+    """The step's queries by `Segment`: its first `decodes` tokens, one a request
+    (vLLM puts the decoded ones first), together over `longest` keys at most; then
+    each prompt chunk's, from its first token, tokens, request and keys."""
+    out = [Segment(slice(0, decodes), slice(0, decodes), longest)] if decodes else []
+    for start, n, request, keys in prompts:
+        out.append(Segment(slice(start, start + n), slice(request, request + 1), keys))
     return out
 
 

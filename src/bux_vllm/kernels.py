@@ -2,7 +2,7 @@
 vLLM's paged caches in place where the PyTorch path (`bux_vllm.picks`) gathers the
 keys into memory first: the indexer's score of every key of each query's request
 (`scores`, and `prompt_scores` for a prompt's queries, a tile of them for each key
-read), each query's softmax over the keys it picked (`attend`), and a ``csa``
+read, and `pooled_ranks` for QSA's decoded tokens), each query's softmax over the keys it picked (`attend`), and a ``csa``
 query's over its window and the compressed latents it keeps (`csa_attend`), in
 float32.
 
@@ -19,6 +19,7 @@ from __future__ import annotations
 import os
 
 import torch
+import torch.nn.functional as F
 import triton
 import triton.language as tl
 
@@ -63,6 +64,8 @@ def _scores_kernel(
     stride_tt,
     stride_ot,
     stride_og,
+    pos_ptr,
+    window,
     n_keys,
     first,
     start,
@@ -72,13 +75,17 @@ def _scores_kernel(
     page: tl.constexpr,
     relu: tl.constexpr,
     groups: tl.constexpr,
+    ranked: tl.constexpr,
+    best: tl.constexpr,
     block_h: tl.constexpr,
     block_i: tl.constexpr,
     block_s: tl.constexpr,
 ):
     """One query's scores of `block_s` keys: ``sum_j w_j ReLU(q_j . k_s)``, or each
     of the `groups` heads' from `first` on, ``w_j ReLU(q_j . k_s)``, with `groups`;
-    a key's channels `share` a kv head, from channel `start` of its row on."""
+    a key's channels `share` a kv head, from channel `start` of its row on.
+    `ranked` stores their ranking keys instead, and `best` the best a query sees
+    of the tile's keys, a block of MSA's (as `_prompt_scores_kernel`)."""
     t, part = tl.program_id(0), tl.program_id(1)
     s = part * block_s + tl.arange(0, block_s)
     h, i = tl.arange(0, block_h), tl.arange(0, block_i)
@@ -101,12 +108,29 @@ def _scores_kernel(
     if relu:
         dots = tl.maximum(dots, 0.0)
     weighted = dots * w[:, None]
+    seen = inside
+    if ranked or best:
+        seen = inside & _sees(tl.load(pos_ptr + t), s, window)
     if groups:  # each of this rank's groups by its own head
         mine = on_h & (h >= first) & (h < first + groups)
-        at = out_ptr + t * stride_ot + (h - first)[:, None] * stride_og + s[None, :]
-        tl.store(at, weighted, mask=mine[:, None] & inside[None, :])
+        rows_at = out_ptr + t * stride_ot + (h - first) * stride_og
+        if best:
+            top = tl.max(tl.where(seen[None, :], weighted, float("-inf")), axis=1)
+            tl.store(rows_at + part, top, mask=mine)
+        else:
+            if ranked:
+                weighted = tl.where(seen[None, :], _order(weighted, s[None, :]), -1)
+            keep = mine[:, None] & inside[None, :]
+            tl.store(rows_at[:, None] + s[None, :], weighted, mask=keep)
     else:
-        tl.store(out_ptr + t * stride_ot + s, tl.sum(weighted, axis=0), mask=inside)
+        total = tl.sum(weighted, axis=0)
+        if best:
+            top = tl.max(tl.where(seen, total, float("-inf")), axis=0)
+            tl.store(out_ptr + t * stride_ot + part, top)
+        else:
+            if ranked:
+                total = tl.where(seen, _order(total, s), -1)
+            tl.store(out_ptr + t * stride_ot + s, total, mask=inside)
 
 
 def scores(
@@ -117,10 +141,14 @@ def scores(
     n: int,
     relu: bool,
     groups: tuple[int, int] | None = None,
+    seen: tuple[torch.Tensor, int | None] | None = None,
+    best: int = 0,
 ) -> torch.Tensor:
     """Each query's indexer score of each of its request's first `n` keys, (Q, n) in
     float32, as `bux_vllm.picks.scores` gives it summed over the heads; or each
-    head's of this rank's groups, (Q, G, n), as it gives them with `per_group`.
+    head's of this rank's groups, (Q, G, n), as it gives them with `per_group`; or
+    with `seen` and `best`, their ranking keys or blocks' best, as `prompt_scores`
+    gives them.
 
     Args:
         q: The indexer's queries, (Q, H, i), the last axis contiguous.
@@ -132,11 +160,17 @@ def scores(
         relu: Whether to ReLU the dot products.
         groups: The first of this rank's groups and how many, picking apart; None
             for all heads' scores summed.
+        seen: The queries' positions, (Q,), and the layer's window, as
+            `prompt_scores` takes them.
+        best: The keys of MSA's blocks, as `prompt_scores` takes them.
     """
     first, count = groups or (0, 0)
-    shape = (q.shape[0], count, n) if groups else (q.shape[0], n)
-    out = torch.empty(shape, dtype=torch.float32, device=q.device)
-    block_s, pages = 64, cache.cache
+    block_s, pages = best or 64, cache.cache
+    columns = triton.cdiv(n, block_s) if best else n
+    shape = (q.shape[0], count, columns) if groups else (q.shape[0], columns)
+    dtype = torch.int64 if seen is not None and not best else torch.float32
+    out = torch.empty(shape, dtype=dtype, device=q.device)
+    positions, window = seen if seen is not None else (rows, None)
     grid = (q.shape[0], triton.cdiv(n, block_s))
     _scores_kernel[grid](
         q,
@@ -153,6 +187,8 @@ def scores(
         rows.stride(0),
         out.stride(0),
         out.stride(1) if groups else 0,
+        positions,
+        -1 if window is None else window,
         n,
         first,
         cache.channels,
@@ -162,9 +198,300 @@ def scores(
         page=pages.shape[2],
         relu=relu,
         groups=count,
+        ranked=seen is not None,
+        best=bool(best),
         block_h=_block(q.shape[1]),
         block_i=_block(q.shape[2]),
         block_s=block_s,
+    )
+    return out
+
+
+@triton.jit
+def _pooled_part(
+    cache_ptr,
+    table_ptr,
+    t,
+    stride_tt,
+    stride_cb,
+    stride_cg,
+    stride_cs,
+    b,
+    on_b,
+    c,
+    on_c,
+    start,
+    share: tl.constexpr,
+    page: tl.constexpr,
+    size: tl.constexpr,
+    block_b: tl.constexpr,
+    block_c: tl.constexpr,
+):
+    """The mean of each block's `size` raw indexer keys at the channels c, (B, C),
+    in float32, from the blocks b of query t's request."""
+    spread = (c // share) * stride_cg + start + c % share
+    out = tl.zeros([block_b, block_c], tl.float32)
+    for r in tl.static_range(size):
+        at = b * size + r
+        block = tl.load(table_ptr + t * stride_tt + at // page, mask=on_b, other=0)
+        rows = block.to(tl.int64) * stride_cb + (at % page) * stride_cs
+        out += tl.load(
+            cache_ptr + rows[:, None] + spread[None, :],
+            mask=on_b[:, None] & on_c[None, :],
+            other=0.0,
+        ).to(tl.float32)
+    return out / size
+
+
+@triton.jit
+def _gained(x, gain_ptr, c, on_c, zero_centered: tl.constexpr):
+    """x, (B, C), times the norm's gain at the channels c: its weight, or 1 + it
+    zero-centered, made in the weight's dtype, as `bux_vllm.common.Norm` makes it."""
+    w = tl.load(gain_ptr + c, mask=on_c, other=0.0)
+    if zero_centered:
+        w = w + 1.0
+    return x * w.to(tl.float32)[None, :]
+
+
+@triton.jit
+def _head_dots(q_ptr, t, stride_qt, stride_qh, h, on_h, c, on_c, k):
+    """Each head's dots with the keys k, (B, C), over the channels c: (H, B)."""
+    q = tl.load(
+        q_ptr + t * stride_qt + h[:, None] * stride_qh + c[None, :],
+        mask=on_h[:, None] & on_c[None, :],
+        other=0.0,
+    ).to(tl.float32)
+    return tl.dot(q, tl.trans(k), input_precision="ieee")
+
+
+@triton.jit
+def _pooled_kernel(
+    q_ptr,
+    w_ptr,
+    cache_ptr,
+    table_ptr,
+    out_ptr,
+    pos_ptr,
+    gain_ptr,
+    bias_ptr,
+    freq_ptr,
+    stride_qt,
+    stride_qh,
+    stride_wt,
+    stride_cb,
+    stride_cg,
+    stride_cs,
+    stride_tt,
+    stride_ot,
+    n_blocks,
+    start,
+    window,
+    eps,
+    rope_gain,
+    heads: tl.constexpr,
+    dims: tl.constexpr,
+    share: tl.constexpr,
+    page: tl.constexpr,
+    size: tl.constexpr,
+    rotated: tl.constexpr,
+    interleaved: tl.constexpr,
+    centered: tl.constexpr,
+    gained: tl.constexpr,
+    zero_centered: tl.constexpr,
+    scale_input: tl.constexpr,
+    biased: tl.constexpr,
+    relu: tl.constexpr,
+    block_h: tl.constexpr,
+    block_j: tl.constexpr,
+    block_r: tl.constexpr,
+    block_b: tl.constexpr,
+):
+    """One decoded token's ranking keys of a tile of QSA's complete blocks, as
+    `bux_vllm.picks.choose` scores them: each block's `size` raw keys pooled, the
+    indexer's key norm and RoPE at the block's first key (pairs of its first
+    `rotated` channels), then ``sum_j w_j ReLU(q_j . k)``; -1 for a block it does
+    not see all of. The channels go in three parts, each pair's first and second
+    and the rest, so that RoPE pairs them in place."""
+    t, part = tl.program_id(0), tl.program_id(1)
+    b = part * block_b + tl.arange(0, block_b)
+    on_b = b < n_blocks
+    half = rotated // 2
+    j, r = tl.arange(0, block_j), tl.arange(0, block_r)
+    on_j, on_r = j < half, r < dims - rotated
+    if interleaved:
+        ca, cb = 2 * j, 2 * j + 1
+    else:
+        ca, cb = j, j + half
+    cr = rotated + r
+    ka = _pooled_part(
+        cache_ptr,
+        table_ptr,
+        t,
+        stride_tt,
+        stride_cb,
+        stride_cg,
+        stride_cs,
+        b,
+        on_b,
+        ca,
+        on_j,
+        start,
+        share,
+        page,
+        size,
+        block_b,
+        block_j,
+    )
+    kb = _pooled_part(
+        cache_ptr,
+        table_ptr,
+        t,
+        stride_tt,
+        stride_cb,
+        stride_cg,
+        stride_cs,
+        b,
+        on_b,
+        cb,
+        on_j,
+        start,
+        share,
+        page,
+        size,
+        block_b,
+        block_j,
+    )
+    kr = _pooled_part(
+        cache_ptr,
+        table_ptr,
+        t,
+        stride_tt,
+        stride_cb,
+        stride_cg,
+        stride_cs,
+        b,
+        on_b,
+        cr,
+        on_r,
+        start,
+        share,
+        page,
+        size,
+        block_b,
+        block_r,
+    )
+    if gained and scale_input:
+        ka = _gained(ka, gain_ptr, ca, on_j, zero_centered)
+        kb = _gained(kb, gain_ptr, cb, on_j, zero_centered)
+        kr = _gained(kr, gain_ptr, cr, on_r, zero_centered)
+    if centered:
+        mean = (tl.sum(ka, 1) + tl.sum(kb, 1) + tl.sum(kr, 1)) / dims
+        ka = tl.where(on_j[None, :], ka - mean[:, None], 0.0)
+        kb = tl.where(on_j[None, :], kb - mean[:, None], 0.0)
+        kr = tl.where(on_r[None, :], kr - mean[:, None], 0.0)
+    square = tl.sum(ka * ka, 1) + tl.sum(kb * kb, 1) + tl.sum(kr * kr, 1)
+    scale = tl.rsqrt(square / dims + eps)[:, None]
+    ka, kb, kr = ka * scale, kb * scale, kr * scale
+    if gained and not scale_input:
+        ka = _gained(ka, gain_ptr, ca, on_j, zero_centered)
+        kb = _gained(kb, gain_ptr, cb, on_j, zero_centered)
+        kr = _gained(kr, gain_ptr, cr, on_r, zero_centered)
+    if biased:
+        ka += tl.load(bias_ptr + ca, mask=on_j, other=0.0).to(tl.float32)[None, :]
+        kb += tl.load(bias_ptr + cb, mask=on_j, other=0.0).to(tl.float32)[None, :]
+        kr += tl.load(bias_ptr + cr, mask=on_r, other=0.0).to(tl.float32)[None, :]
+    h = tl.arange(0, block_h)
+    on_h = h < heads
+    dots = _head_dots(q_ptr, t, stride_qt, stride_qh, h, on_h, cr, on_r, kr)
+    if rotated:
+        freq = tl.load(freq_ptr + j, mask=on_j, other=0.0)
+        angles = (b * size).to(tl.float32)[:, None] * freq[None, :]
+        sin, cos = rope_gain * tl.sin(angles), rope_gain * tl.cos(angles)
+        ka, kb = ka * cos - kb * sin, kb * cos + ka * sin
+        dots += _head_dots(q_ptr, t, stride_qt, stride_qh, h, on_h, ca, on_j, ka)
+        dots += _head_dots(q_ptr, t, stride_qt, stride_qh, h, on_h, cb, on_j, kb)
+    if relu:
+        dots = tl.maximum(dots, 0.0)
+    w = tl.load(w_ptr + t * stride_wt + h, mask=on_h, other=0.0).to(tl.float32)
+    score = tl.sum(dots * w[:, None], axis=0)
+    p = tl.load(pos_ptr + t)
+    first = b * size
+    full = on_b & (first + size - 1 <= p) & ((window < 0) | (p - first < window))
+    tl.store(
+        out_ptr + t * stride_ot + b, tl.where(full, _order(score, b), -1), mask=on_b
+    )
+
+
+def pooled_ranks(
+    spec: Sparse,
+    index: tuple[torch.Tensor, torch.Tensor],
+    cache: picks.Cache,
+    rows: torch.Tensor,
+    positions: torch.Tensor,
+    n: int,
+) -> torch.Tensor:
+    """Each decoded token's ranking keys of QSA's complete blocks of its request's
+    first `n` keys, (Q, n // block_size) in int64, as `bux_vllm.picks.top` ranks
+    `bux_vllm.picks.choose`'s scores of their pooled keys, -1 for a block it does not
+    see all of: the pooling, the key norm and RoPE, in float32, in the kernel.
+
+    Args:
+        spec: The layer's settings, its indexer among them.
+        index: The indexer's queries and weights, (Q, H, i) and (Q, H).
+        cache: The call's paged cache, its indexer keys beside its keys and
+            values.
+        rows: Each token's request's block table, (Q, blocks).
+        positions: The tokens' positions, (Q,).
+        n: How many keys to read.
+    """
+    q, w = (x.contiguous() for x in index)
+    ix, size, pages = spec.indexer, spec.block_size, cache.cache
+    norm, rope = ix.k_norm, ix.rope
+    count = n // size
+    out = torch.empty(q.shape[0], count, dtype=torch.int64, device=q.device)
+    zero = q.new_zeros(1, dtype=torch.float32)
+    rotated = rope.dims if rope is not None else 0
+    block_b = 16
+    _pooled_kernel[(q.shape[0], triton.cdiv(max(count, 1), block_b))](
+        q,
+        w,
+        pages,
+        rows,
+        out,
+        positions.contiguous(),
+        norm.weight if norm.weight is not None else zero,
+        norm.bias if norm.bias is not None else zero,
+        rope.inv_freq if rope is not None else zero,
+        q.stride(0),
+        q.stride(1),
+        w.stride(0),
+        pages.stride(0),
+        pages.stride(1),
+        pages.stride(2),
+        rows.stride(0),
+        out.stride(0),
+        count,
+        cache.channels,
+        -1 if spec.window is None else spec.window,
+        norm.eps,
+        rope.gain if rope is not None else 1.0,
+        heads=q.shape[1],
+        dims=q.shape[2],
+        share=pages.shape[3] - cache.channels,
+        page=pages.shape[2],
+        size=size,
+        rotated=rotated,
+        interleaved=rope is not None and rope.layout == "interleaved",
+        centered=norm.kind == "layernorm",
+        gained=norm.weight is not None,
+        zero_centered=norm.zero_centered,
+        scale_input=norm.scale_input,
+        biased=norm.bias is not None,
+        relu=spec.relu,
+        block_h=_block(q.shape[1]),
+        block_j=_block(rotated // 2),
+        block_r=_block(q.shape[2] - rotated),
+        block_b=block_b,
     )
     return out
 
@@ -258,12 +585,27 @@ def _prompt_scores_kernel(
 
 
 @triton.jit
+def _sees(p, s, window):
+    """Whether a query at position p sees the keys at s, broadcast: those up to it,
+    and in its `window` (none below 0)."""
+    return (s <= p) & ((window < 0) | (p - s < window))
+
+
+@triton.jit
+def _order(score, s):
+    """The ranking keys of scores at the keys s, broadcast, as
+    `bux_vllm.picks.top` makes them: the score's ordered bits above the key's
+    index's complement."""
+    u = score.to(tl.int32, bitcast=True).to(tl.int64) & 0xFFFFFFFF
+    order = tl.where((u >> 31) == 1, ~u & 0xFFFFFFFF, u | 0x80000000)
+    return (order << 31) | (0x7FFFFFFF - s.to(tl.int64))
+
+
+@triton.jit
 def _seen(pos_ptr, t, s, on_t, window):
-    """Which keys of a tile each query sees: those up to it, and in its `window`
-    (none below 0)."""
+    """Which keys of a tile each query of a tile sees (`_sees`)."""
     p = tl.load(pos_ptr + t, mask=on_t, other=0)[:, None]
-    seen = s[None, :] <= p
-    return seen & ((window < 0) | (p - s[None, :] < window))
+    return _sees(p, s[None, :], window)
 
 
 @triton.jit
@@ -275,13 +617,9 @@ def _best(score, pos_ptr, t, s, on_t, on_s, window):
 
 @triton.jit
 def _ranks(score, pos_ptr, t, s, on_t, window):
-    """The ranking keys of a tile of scores, as `bux_vllm.picks.top` makes them: the
-    score's ordered bits above the key's index's complement, -1 for a key the query
-    does not see (after it, or out of its `window`; none below 0)."""
-    u = score.to(tl.int32, bitcast=True).to(tl.int64) & 0xFFFFFFFF
-    order = tl.where((u >> 31) == 1, ~u & 0xFFFFFFFF, u | 0x80000000)
-    key = (order << 31) | (0x7FFFFFFF - s[None, :].to(tl.int64))
-    return tl.where(_seen(pos_ptr, t, s, on_t, window), key, -1)
+    """The ranking keys of a tile of scores (`_order`), -1 for a key the query does
+    not see (`_seen`)."""
+    return tl.where(_seen(pos_ptr, t, s, on_t, window), _order(score, s[None, :]), -1)
 
 
 def prompt_scores(
@@ -711,6 +1049,48 @@ def csa_attend(
     return out
 
 
+def csa_select(
+    caches: compressed.Caches,
+    steps: compressed.Steps,
+    s: compressed.Settings,
+    q: torch.Tensor,
+    w: torch.Tensor,
+    picks_of: compressed.Picks | None = None,
+) -> tuple[torch.Tensor, torch.Tensor | None]:
+    """`bux_vllm.compressed.select` by the kernels, which read the indexer keys in
+    place: the decoded tokens' scores by `scores`, ranked by PyTorch, and each
+    prompt chunk's ranking keys by `prompt_scores`; (T, top_k) by index, -1 for
+    none, and no candidate pool. A call that picks inside a pool, or makes one
+    (`picks_of`), picks by PyTorch's `bux_vllm.compressed.select`."""
+    if picks_of is not None and (picks_of.inside is not None or picks_of.pooled):
+        return compressed.select(caches, steps, s, q, w, picks_of)
+    assert caches.index is not None and s.ratio is not None and s.top_k
+    seen = (steps.positions + 1) // s.ratio
+    most = steps.longest // s.ratio
+    if most <= s.top_k:
+        return compressed.every(seen, most), None
+    kept = seen.new_full((seen.shape[0], s.top_k), -1)
+    index = caches.index
+    keys = picks.Cache(index.cache.unsqueeze(1), 0, index.cache.shape[-1])
+    q, w = q.contiguous(), w.contiguous()
+    if steps.decodes:
+        c = slice(0, steps.decodes)
+        rows = index.block_table[steps.seq[c]]
+        sc = scores(q[c], w[c], keys, rows, most, s.relu)
+        kept[c] = compressed.top(sc, seen[c], s.top_k)
+    for start, n, seq, length in steps.prompts:
+        c = slice(start, start + n)
+        rows = index.block_table[seq : seq + 1]
+        at = ((seen[c] - 1).contiguous(), None)  # a latent seen is one before seen
+        ranks = prompt_scores(
+            q[c], w[c], keys, rows, length // s.ratio, s.relu, None, at
+        )
+        picked, ok = picks.best_of(ranks, s.top_k)
+        picked = torch.where(ok, picked, -1)
+        kept[c] = F.pad(picked, (0, s.top_k - picked.shape[1]), value=-1)
+    return kept, None
+
+
 def attend_segment(
     spec: Sparse,
     q: torch.Tensor,
@@ -742,16 +1122,16 @@ def attend_segment(
 
 def _per_query(spec: Sparse, iq: torch.Tensor, n: int, one: bool) -> int:
     """The elements of a query's largest intermediate on the kernels' path, of `n`
-    keys, its request's alone if `one`: its picks, and its ranking keys (DSA's in a
-    prompt), its blocks' best scores and mask (MSA's), PyTorch's scores of every head
-    and gathered keys (QSA's), or its scores, their mask and ranking keys."""
+    keys, its request's alone if `one`: its picks, and its ranking keys (DSA's), its
+    blocks' best scores and mask (MSA's), PyTorch's scores of every head and
+    gathered keys (QSA's), or its scores, their mask and ranking keys."""
     groups = spec.groups[1] if spec.per_group else 1
     most = 2 * groups * picks.most(spec)  # int64 positions
     if spec.mean:
         return max(most, iq.shape[1] * n, 0 if one else n * iq.shape[2])
-    if one and spec.block_size == 1:
+    if spec.block_size == 1:
         return max(most, 2 * groups * n)
-    if one and spec.block_size in BLOCKS:
+    if spec.block_size in BLOCKS:
         return max(most, n + groups * -(-n // spec.block_size))
     return max(most, 3 * groups * n)
 
@@ -784,29 +1164,32 @@ def _choose(
     where: tuple[torch.Tensor, torch.Tensor, int],
 ) -> Picked:
     """The keys the queries keep, as bux picks them, from the indexer's queries and
-    weights `index`: QSA's blocks scored by PyTorch, which pools them, over `keys`,
-    (n, i), which a request's queries share, or each query's request's gathered;
-    else by `prompt_scores` for one request's queries, `scores` for single queries
-    of several. `where` are the queries' positions, their requests' block tables
-    (one row for one request's) and the keys' count."""
+    weights `index`: by `prompt_scores` for one request's queries, `scores` for
+    single queries of several, DSA's keys ranked and MSA's blocks' best found in
+    them; QSA's blocks scored by PyTorch, which pools them, over `keys`, (n, i),
+    which a request's queries share, or each query's request's gathered. `where`
+    are the queries' positions, their requests' block tables (one row for one
+    request's) and the keys' count."""
     positions, table, n = where
     groups = spec.groups if spec.per_group else None
     one = table.shape[0] == 1
     at, size = (positions.contiguous(), spec.window), spec.block_size
-    if one and size == 1:  # DSA's, ranked in the kernel
-        ranks = prompt_scores(*index, cache, table, n, spec.relu, groups, at)
+    kernel = prompt_scores if one else scores
+    if size == 1:  # DSA's, ranked in the kernel
+        ranks = kernel(*index, cache, table, n, spec.relu, groups, at)
         return picks.best_of(ranks, spec.top_k)
     see = picks.seen(positions, n, spec.window)
-    if one and not spec.mean and size in BLOCKS:  # MSA's blocks' best, by the kernel
-        best = prompt_scores(*index, cache, table, n, spec.relu, groups, at, size)
+    if spec.mean and not one:  # QSA's decoded tokens, pooled in the kernel
+        ranks = pooled_ranks(spec, index, cache, table, positions, n)
+        blocks, ok = picks.best_of(ranks, spec.top_k // size)
+        return picks.with_own_block(blocks, ok, see, positions, spec.window, size)
+    if not spec.mean and size in BLOCKS:  # MSA's blocks' best, by the kernel
+        best = kernel(*index, cache, table, n, spec.relu, groups, at, size)
         return picks.blocks_of_best(best, see, positions, size, spec.top_k)
     if spec.mean:
         if keys is None:
             span = torch.arange(n, device=positions.device)
             keys = cache.keys(table, span.expand(positions.shape[0], n))
         return picks.choose(spec, *index, keys, see, positions)
-    score = prompt_scores if one else scores
-    s = score(*index, cache, table, n, spec.relu, groups)
-    if spec.block_size > 1:
-        return picks.best_blocks(s, see, positions, spec.block_size, spec.top_k)
-    return picks.tokens(s, see, spec.top_k)
+    s = kernel(*index, cache, table, n, spec.relu, groups)  # MSA's other blocks
+    return picks.best_blocks(s, see, positions, size, spec.top_k)
