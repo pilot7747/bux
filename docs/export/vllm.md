@@ -506,6 +506,17 @@ scores), `torch` the PyTorch path, and `native` runs vLLM's kernels in a float32
 model too. `scripts/vllm_native.py` checks the kernels on a GPU against PyTorch, on
 the keys as the plugin caches them, and times them beside the plugin's own.
 
+On an NVIDIA B300 (2026-10-28, vLLM 0.32.0), for an indexer of 4 heads of 64 and a
+top 2048, a 16k-token prompt's scores and picks take 0.73 ms a layer on vLLM's
+kernels against 6.8 ms on the plugin's, and a decoding step of 64 requests of 20k
+keys 0.07 ms against 0.82 ms. Attending over the picks at a width of 2816 (44 query
+heads of 64 over 11 kv heads), vLLM's kernel takes 13 ms for the 16k prompt and
+0.13 ms for the step, the plugin's 39 ms and 0.35 ms. Under an agentic coding load
+(prompts of 16k tokens, four turns), the hybrid with DSA global layers at that
+width serves 2793 sessions an hour on one B300 within a TPOT of 30 ms in bfloat16,
+and 2952 with FP8 weights and an FP8 KV cache, against 1692 on the plugin's own
+kernels, at a TTFT of 0.46 s against 0.74 s.
+
 ### MSA on vLLM's kernels
 
 In a bfloat16 model, MSA's indexer and attention run on the Triton kernels vLLM
