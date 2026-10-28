@@ -438,9 +438,10 @@ def check_plugin(decoding: bool) -> bool:
 
 
 def check_repeats(times: int = 5) -> bool:
-    """Whether the native prompt path picks the same keys on every run of the same
-    inputs, and DeepGEMM's logits are the same and PyTorch's where queries see
-    keys: where not, how many rows differ, to tell a race from a tie."""
+    """Whether DeepGEMM's logits are the same on every run of the same inputs, and
+    PyTorch's where queries see keys, and every run's picks the best of them: how
+    many rows' picks differ between runs, which vLLM's top-k may do where scores
+    tie (FP8's products tie often), tells a race from a tie."""
     from vllm.utils import deep_gemm
 
     from bux_vllm import dsa
@@ -478,7 +479,9 @@ def check_repeats(times: int = 5) -> bool:
         f"repeats: {rows} rows of {times} runs' picks apart; logits apart {apart:.1e}, "
         f"from PyTorch's {error:.1e} (largest {want.abs().max().item():.1e})"
     )
-    return rows == 0 and apart == 0
+    scores = logits[0].masked_fill(~see, float("-inf"))
+    best = all(picked_as_best(r, scores) for r in runs)
+    return best and apart == 0
 
 
 def check_qsa(decoding: bool) -> bool:
