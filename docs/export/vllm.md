@@ -163,10 +163,17 @@ plugin runs them in PyTorch, in float32, as bux does: each value head keeps a st
 - **A prompt** runs by chunks of 64 tokens, with matmuls within a chunk and the
   state carried across, as fla's chunked kernels compute it. The batch's prompts run
   side by side, each padded to the longest, and padding leaves a state as it was.
+- **Chunks side by side.** Where the decay is bounded below (`rwkv7`'s always,
+  `gdn2`'s with `gate_lower_bound`), the decay between two tokens factors into
+  matmuls, and every chunk of a block of tokens runs at once: only the state each
+  chunk starts from runs one chunk after another. `rwkv7` factors whole chunks,
+  `gdn2` at -5 blocks of 16 rows. An unbounded decay runs one chunk after another.
 - **Decoding** takes one step of every sequence at once, which CUDA graphs capture.
 
 The projections, convs and norms run on vLLM's layers and kernels, as for the other
-layers. A test checks both paths against the export's layers, on the CPU.
+layers. The rule computes in float32 on CUDA cores, so a prompt costs several times
+what a fused kernel would. A test checks both paths against the export's layers,
+on the CPU.
 
 ## Multi-head latent attention
 

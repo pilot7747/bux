@@ -14,7 +14,7 @@ from vllm.model_executor.layers.linear import (
 )
 from vllm.model_executor.layers.mamba.mamba_utils import MambaStateShapeCalculator
 
-from . import delta
+from . import feeds
 from .common import ACTIVATIONS, Ctx, Layer, Norm, Site
 from .linear import conv_channels, linear_dims
 from .recurrent import LowRank, Recurrent, float32, low_rank_tensor
@@ -58,6 +58,8 @@ class Mixer(Recurrent):
             raise NotImplementedError("gdn2: no conv not in vLLM yet")
         super().__init__(vllm_config, prefix)
         self.c = c
+        bound = c["gate_lower_bound"]
+        self.floor = None if bound is None else -bound
         h, hv, dk, dv = linear_dims(c)
         self.h, self.hv, self.dk, self.dv = h // self.tp, hv // self.tp, dk, dv
         sizes = [*conv_channels(c), h * dk, hv * dv]  # q, k, v, erase, write
@@ -86,7 +88,7 @@ class Mixer(Recurrent):
         qkv = self.run("convolve", [qkv], qkv.new_zeros(qkv.shape))
         heads = (self.h, self.hv, self.dk, self.dv)
         gates = (self.f(x), erase, write)
-        xs = delta.gdn2_rule(self.c, heads, qkv, gates, self.A_log, self.dt_bias)
+        xs = feeds.gdn2_rule(self.c, heads, qkv, gates, self.A_log, self.dt_bias)
         o = self.run("recur", xs, x.new_zeros(x.shape[0], self.hv, self.dv))
         o = self.norm(o).flatten(1)
         if self.gate is not None:

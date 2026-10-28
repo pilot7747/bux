@@ -5,6 +5,7 @@ token before, which the token shift reads, as a conv state of one position, and
 each value head's (dv, dk) state.
 """
 
+import math
 from typing import Any
 
 import torch
@@ -12,7 +13,7 @@ from torch import nn
 from vllm.model_executor.layers.linear import ColumnParallelLinear, RowParallelLinear
 from vllm.model_executor.layers.mamba.mamba_utils import MambaStateShapeCalculator
 
-from . import delta, kv
+from . import delta, feeds, kv
 from .common import Ctx, Layer, Norm, Site, sharded_loader
 from .linear import linear_dims
 from .recurrent import LowRank, Recurrent, low_rank_tensor
@@ -55,6 +56,7 @@ class Mixer(Recurrent):
     """
 
     what = "rwkv7"
+    floor = math.exp(-0.5)  # log w = -exp(-0.5) sigmoid(.)
 
     def __init__(self, c: dict, width: int, vllm_config: Any, prefix: str, ports: list):
         if c["conv_size"] is not None:
@@ -104,13 +106,13 @@ class Mixer(Recurrent):
     def forward(self, x: torch.Tensor, ctx: Ctx) -> torch.Tensor:
         """The layer's output, (T, width), from the tokens' inputs."""
         prev = self.run("shifted", [x], torch.zeros_like(x))
-        xr, xw, xk, xv, xa, xg = delta.rwkv7_mixes(x, prev, self.shift)
+        xr, xw, xk, xv, xa, xg = feeds.rwkv7_mixes(x, prev, self.shift)
         heads = (self.h, self.hv, self.dk, self.dv)
         raw = (self.w(xw), self.a(xa))
         v = self._values(xv, ctx)
-        xs = delta.rwkv7_rule(heads, self.r(xr), self.k(xk), v, raw, self.k_k, self.k_a)
+        xs = feeds.rwkv7_rule(heads, self.r(xr), self.k(xk), v, raw, self.k_k, self.k_a)
         o = self.run("recur", xs, x.new_zeros(x.shape[0], self.hv, self.dv))
-        o = self.norm(o) + delta.rwkv7_bonus(xs[0], xs[1], v, self.r_k)
+        o = self.norm(o) + feeds.rwkv7_bonus(xs[0], xs[1], v, self.r_k)
         o = o.flatten(1)
         if self.g is not None:
             o = o * self.g(xg)

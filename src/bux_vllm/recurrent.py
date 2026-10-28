@@ -84,6 +84,7 @@ class Recurrent(nn.Module, MambaBase):
     """
 
     what = ""  # the bux layer type, for errors
+    floor: float | None = None  # how far a position's log decay may fall, if bounded
 
     def __init__(self, vllm_config: Any, prefix: str):
         super().__init__()
@@ -199,25 +200,47 @@ class Recurrent(nn.Module, MambaBase):
         out[:n] = self.rule(m, *(x[:n] for x in xs))
 
     def rule(self, m: Any, *xs: torch.Tensor) -> torch.Tensor:
-        """The delta rule over the batch's tokens: by chunks for a prefill, its
-        sequences padded to the longest, else a step of each sequence."""
-        state = self.kv_cache[1]  # (slots, hv, dv, dk), as vLLM's GDN keeps it
+        """The delta rule over the batch's tokens, from each sequence's state, which
+        it keeps: a step of each decoding sequence (vLLM puts them first), and the
+        prompts by chunks (`prompts`)."""
+        state = self.states()
         idx = m.non_spec_state_indices_tensor[: m.num_prefills + m.num_decodes]
-        before = state[idx].transpose(-1, -2)
+        before = state[idx]
         if m.num_prefills:
             has = m.has_initial_state[:, None, None, None]
             before = torch.where(has, before, torch.zeros_like(before))
-            starts = m.non_spec_query_start_loc[: idx.shape[0] + 1].long()
-            longest = int((starts[1:] - starts[:-1]).max())
-            ys = [delta.padded(x, starts, longest) for x in xs]
-            o, after = delta.rank_one(*ys, before)
-            o = delta.unpadded(o, starts, xs[0].shape[0])
-        else:
-            o, after = delta.step(*xs, before)
+        steps = m.num_decodes
+        outs, afters = [], []
+        if steps:
+            o, after = delta.step(*(x[:steps] for x in xs), before[:steps])
+            outs.append(o)
+            afters.append(after)
+        if m.num_prefills:
+            o, after = self.prompts(m, [x[steps:] for x in xs], before[steps:])
+            outs.append(o)
+            afters.append(after)
+        after = torch.cat(afters).to(state.dtype)
         kept = (idx > 0)[:, None, None, None]  # padding's slots stay as they were
-        after = torch.where(kept, after.transpose(-1, -2).to(state.dtype), state[idx])
-        state[idx] = after
-        return o
+        state[idx] = torch.where(kept, after, before)
+        return torch.cat(outs)
+
+    def states(self) -> torch.Tensor:
+        """Every slot's state, (slots, hv, dk, dv): vLLM's GDN shape, (hv, dv, dk),
+        holds it in bux's layout, which only this layer reads."""
+        state = self.kv_cache[1]
+        return state.view(*state.shape[:2], state.shape[3], state.shape[2])
+
+    def prompts(
+        self, m: Any, xs: list[torch.Tensor], before: torch.Tensor
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """The rule over the batch's prompts, after its decoding sequences: by
+        chunks, each padded to the longest; their outputs and last states."""
+        starts = m.non_spec_query_start_loc[m.num_decodes :].long()
+        starts = starts[: before.shape[0] + 1] - starts[0]
+        longest = int((starts[1:] - starts[:-1]).max())
+        ys = [delta.padded(x, starts, longest) for x in xs]
+        o, after = delta.rank_one(*ys, before, floor=self.floor)
+        return delta.unpadded(o, starts, xs[0].shape[0]), after
 
 
 class LowRank(nn.Module):
