@@ -139,7 +139,7 @@ ones, `--load-format dummy`, to time it.
 |--------|---------|
 | `embed`, `head` | the vocabulary split over ranks; learned positions, `scale_by_sqrt_dim`, `norm`; tied or untied, a bias, soft-capping |
 | `rmsnorm`, `layernorm`, `mlp`, `gated_mlp`, `linear`, `act`, `scale`, `dropout` | yes, with the MLPs' `limit`, `up_softcap` and `up_offset` |
-| `gqa` | RoPE (`pi`, `llama3`, `yarn`), QK-norm, GQA and MQA, biases, `fused_qkv`, sliding windows, soft-capping, sinks, its scale, `gated` (a gate per channel or per head), `output_norm`, the conv on keys and values (`kv_conv_size`), and the `v` port: the value residual, fixed, learned or convex. Not yet: an indexer, a relative bias, `log_scale`, `power_scale`, `gate_head_bias`, QK-norm across all heads (`qk_norm_all_heads`), or the `kv` and `index` ports |
+| `gqa` | RoPE (`pi`, `llama3`, `yarn`), QK-norm, GQA and MQA, biases, `fused_qkv`, sliding windows, soft-capping, sinks, its scale, `gated` (a gate per channel or per head, with `gate_head_bias`), `output_norm`, `power_scale` and `log_scale` (on the queries, which scales the logits as bux does), the conv on keys and values (`kv_conv_size`), an indexer ([Sparse attention](#sparse-attention)), and the `v` port: the value residual, fixed, learned or convex. Not yet: a relative bias, QK-norm across all heads (`qk_norm_all_heads`), or the `kv` and `index` ports |
 | `mla` | by vLLM's MLA and its latent cache ([Multi-head latent attention](#multi-head-latent-attention)): queries at full rank or from a latent, RoPE (`pi`, `llama3`, `yarn`; partial, interleaved) or none, its scale, `gated` (a gate per channel or per head), `output_norm`; in bfloat16 or float16. Not yet: QK-norm, sliding windows, soft-capping, sinks, an indexer, a relative bias, `log_scale`, `gate_head_bias`, ports, `mla` beside `gqa`, or `mla` layers of different dims or heads |
 | `moe` | softmax, sigmoid and `sqrtsoftplus` routers, `router_logit_scale`, groups, the aux-free bias, a router bias, shared experts and their gate, gated and plain experts (`swish`, `gelu`, `gelu_tanh`, `relu2`) with biases, a `limit` and `up_offset` on `swish` and `quick_gelu` gates (gpt-oss's), LatentMoE with its norms (vLLM's fused experts at the latent's width), and shared experts the router scores (`shared_expert_sink`). Not yet: `expert_norm`, or the experts' `up_softcap` |
 | `mamba2`, `gdn` | by vLLM's own layers, with one type and shape of recurrent layer per model; `gdn` in bfloat16 only, and with its short conv and output gate. Under tensor parallelism, vLLM 0.32's Mamba-2 failed with one group (its fused all-reduce), and in bfloat16 where a rank's share of the input projection is not a multiple of 8 wide |
@@ -180,6 +180,34 @@ The projections, convs and norms run on vLLM's layers and kernels, as for the ot
 layers. The rule computes in float32 on CUDA cores, so a prompt costs several times
 what a fused kernel would. A test checks both paths against the export's layers,
 on the CPU.
+
+## Sparse attention
+
+A `gqa` layer with an indexer attends to the keys its indexer picks, as bux's does:
+DSA's top-k keys, QSA's mean-pooled blocks (`block_size` with `pool=mean`), MSA's
+max-pooled blocks and picks per group (`pool=max`, `per_group=true`), with plain or
+ReLU'd dot products, weighted or summed heads, and the indexer's own norm.
+
+- **Caches.** Each call keeps its keys and values in vLLM's paged KV cache, as a
+  dense layer does, and its indexer's keys beside them: one vector of the
+  indexer's `head_dim` per token, normalized and rotated (QSA's as projected,
+  pooled again at each step). vLLM allocates both as for full attention, so they
+  grow with the sequence and take part in prefix caching.
+- **Picks.** Each query scores every key it sees by the indexer, in float32, and
+  keeps the best as bux ranks them: by the floats' bits, the first of equal ones.
+  It attends to those keys alone, read from the paged cache by the block table,
+  with the layer's scale, softcap and sinks, in float32.
+- **Kernels.** All of this is PyTorch, in one op that vLLM runs eagerly between its
+  CUDA graphs. A model with a sparse layer runs vLLM's piecewise CUDA graphs, never
+  a whole decoding step as one graph. Each query's scores, and its picked keys and
+  values, are gathered into memory before they are reduced, so a step moves several
+  times the bytes that a fused kernel such as DeepSeek-V3.2's would read. Time
+  sparse layers knowing that they run slower than tuned kernels would.
+- **Tensor parallelism.** Every rank computes the whole indexer and picks the same
+  keys. With picks per group, a rank keeps its own kv heads' picks.
+
+The KV cache must be unquantized (`--kv-cache-dtype auto`). The `index` port, which
+shares picks across layers, is not in vLLM yet.
 
 ## Multi-head latent attention
 

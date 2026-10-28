@@ -51,11 +51,18 @@ LATENT = (
 
 def states(c: dict) -> list[str]:
     """The kinds of state a call of the layer `c` keeps, in order: its type's
-    (`STATES`), and a conv state after a ``gqa`` layer's KV cache under
-    ``kv_conv_size``; none for a layer that keeps none."""
+    (`STATES`), then a ``gqa`` layer's conv state under ``kv_conv_size`` and its
+    indexer's keys (``index``) with an indexer; none for a layer that keeps none."""
     if c["type"] not in STATES:
         return []
-    return [STATES[c["type"]], *(["conv"] if c.get("kv_conv_size") else [])]
+    conv = ["conv"] if c.get("kv_conv_size") else []
+    return [STATES[c["type"]], *conv, *(["index"] if c.get("indexer") else [])]
+
+
+def layer_types(c: dict) -> list[str]:
+    """The kinds of state of a call of the layer `c` as vLLM's ``layer_types``
+    lists them: an indexer's keys are its attention's, as DeepSeek-V3.2's are."""
+    return [kind for kind in states(c) if kind != "index"]
 
 
 #: What ``config.json`` says of transformers' cache layers, which vLLM reads
@@ -93,7 +100,7 @@ class BuxConfig(PreTrainedConfig):
         self.bux_reserved = bux_reserved or []
         self.vocab_size, self.hidden_size = vocab_size, hidden_size
         calls = live(plan(bux, self.bux_reserved).calls) if bux else []
-        self.layer_types = [kind for c in calls for kind in states(c.layer["config"])]
+        self.layer_types = [k for c in calls for k in layer_types(c.layer["config"])]
         self.num_hidden_layers = len(self.layer_types)
         layers = [c.layer for c in calls]
         self._set_heads(layers)
