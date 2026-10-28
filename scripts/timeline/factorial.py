@@ -5,11 +5,19 @@ least squares over its runs, with standard errors from the spread of the seeds.
 An arm's label gives its levels: ``r1v0k1f0p1s0`` is hyper-connections (R: 0 plain,
 1 hc, 2 AttnRes) with the key-value conv (K) and RoPE (P) on. Effects are in percent:
 the fit is of 100 ln(metric), each column centered, so a main effect is the average
-change from switching its factor on. For each metric it prints the effects with their
-t (|t| > 2 is significant), the interactions with what they are aliased with, and
-then, from the main effects and the significant interactions, the predicted best of
-the 96 combinations, its change against the hybrid (every factor off), and the
-combination of the significant gains alone.
+change from switching its factor on. For each metric it prints the run noise, each
+arm's measured change against the hybrid, the effects with their t (|t| > 2 is
+significant), the interactions with what they are aliased with, and then, from the
+main effects and the significant interactions, the predicted best of the 96
+combinations, its change against the hybrid (every factor off), and the combination
+of the significant gains alone.
+
+A seed is a block: every arm of a seed reads the same data in the same order, so a
+seed's runs share an offset (seed 2's objective is about 1.3% above seed 0's in every
+arm). The fit pairs the runs by seed, an effect of each seed beside the terms, and an
+arm's measured change is its mean against the hybrid's over the seeds both have. The
+noise is printed paired and unpaired; ``--no-pair`` fits without the seeds' effects,
+an arm's change then the difference of the two means.
 
     python scripts/timeline/factorial.py results.jsonl runs/ [--reuse] [--extra]
     python scripts/timeline/factorial.py --selftest
@@ -188,20 +196,56 @@ def estimable(arms: list[str]) -> tuple[list[str], dict[str, list[tuple[str, flo
     return kept, aliases
 
 
-class Fit:
-    """Least squares of 100 ln(metric) on some terms; the variance of a run from the
-    seeds' spread around their arm's mean (the pure error)."""
+#: A run: (arm, seed, metric).
+Obs = tuple[str, int, float]
 
-    def __init__(self, obs: list[tuple[str, float]], terms: list[str]) -> None:
-        arms = [a for a, _ in obs]
-        y = np.array([100 * math.log(v) for _, v in obs])
-        self.design = Design(arms, terms)
-        x = self.design.x
+
+def logs(obs: list[Obs]) -> np.ndarray:
+    return np.array([100 * math.log(v) for _, _, v in obs])
+
+
+def blocks(obs: list[Obs], seeds: list[int]) -> np.ndarray:
+    """A column for each seed but the first: 1 where the run is of that seed."""
+    return np.array([[float(s == k) for k in seeds[1:]] for _, s, _ in obs]).reshape(
+        len(obs), max(len(seeds) - 1, 0)
+    )
+
+
+def indicators(obs: list[Obs]) -> np.ndarray:
+    """A column for each arm: 1 where the run is of that arm."""
+    arms = sorted({a for a, _, _ in obs})
+    return np.array([[float(a == b) for b in arms] for a, _, _ in obs])
+
+
+def residual_variance(x: np.ndarray, y: np.ndarray) -> tuple[float, int]:
+    """The variance of y around its least squares on x's columns, and its dof."""
+    beta, *_ = np.linalg.lstsq(x, y, rcond=None)
+    dof = len(y) - int(np.linalg.matrix_rank(x))
+    return (float(np.sum((y - x @ beta) ** 2)) / dof if dof else 0.0), dof
+
+
+def pure_error(obs: list[Obs], paired: bool) -> tuple[float, int]:
+    """The pooled variance of the runs around their arm's mean, beside an effect of
+    each seed if paired, and its dof."""
+    seeds = sorted({s for _, s, _ in obs}) if paired else []
+    return residual_variance(
+        np.hstack([indicators(obs), blocks(obs, seeds)]), logs(obs)
+    )
+
+
+class Fit:
+    """Least squares of 100 ln(metric) on some terms and, paired, an effect of each
+    seed; the variance of a run from the pure error, paired the same way."""
+
+    def __init__(self, obs: list[Obs], terms: list[str], paired: bool = True) -> None:
+        self.design = Design([a for a, _, _ in obs], terms)
+        self.seeds = sorted({s for _, s, _ in obs}) if paired else []
+        x, y = np.hstack([self.design.x, blocks(obs, self.seeds)]), logs(obs)
         self.beta, *_ = np.linalg.lstsq(x, y, rcond=None)
-        self.s2, self.dof = pure_error(arms, y)
+        self.s2, self.dof = pure_error(obs, paired)
         if self.dof == 0:  # no seeds: the residuals' variance instead
-            self.dof = max(len(y) - np.linalg.matrix_rank(x), 1)
-            self.s2 = float(np.sum((y - x @ self.beta) ** 2) / self.dof)
+            self.s2, self.dof = residual_variance(x, y)
+            self.dof = max(self.dof, 1)
         self.cov = self.s2 * np.linalg.pinv(x.T @ x)
 
     def effects(self) -> list[tuple[str, float, float]]:
@@ -211,20 +255,17 @@ class Fit:
             (t, self.beta[i + 1], se[i + 1]) for i, t in enumerate(self.design.terms)
         ]
 
+    def seed_effects(self) -> list[tuple[int, float]]:
+        """Each seed but the first, and its runs' offset against the first's."""
+        start = 1 + len(self.design.terms)
+        return [(s, float(self.beta[start + i])) for i, s in enumerate(self.seeds[1:])]
+
     def delta(self, arm: str, against: str = BASE) -> tuple[float, float]:
-        """`arm`'s predicted change against `against`, in percent, and its error."""
+        """`arm`'s predicted change against `against` at the same seed, in percent,
+        and its error."""
         c = (self.design.code([arm]) - self.design.code([against]))[0]
+        c = np.concatenate([c, np.zeros(len(self.beta) - len(c))])
         return float(c @ self.beta), float(math.sqrt(max(c @ self.cov @ c, 0.0)))
-
-
-def pure_error(arms: list[str], y: np.ndarray) -> tuple[float, int]:
-    """The pooled variance of the runs around their arm's mean, and its dof."""
-    groups: dict[str, list[float]] = {}
-    for a, v in zip(arms, y):
-        groups.setdefault(a, []).append(v)
-    ss = sum(float(np.sum((np.array(g) - np.mean(g)) ** 2)) for g in groups.values())
-    dof = len(y) - len(groups)
-    return (ss / dof if dof else 0.0), dof
 
 
 def t_of(est: float, se: float) -> float:
@@ -263,32 +304,73 @@ def significant_gains(fit: Fit) -> str:
     return label_of(r, tuple(int(gain[f]) for f in FACTORS))
 
 
-def measured(obs: list[tuple[str, float]]) -> list[str]:
-    """Each arm's runs and their mean's change against the hybrid's, in percent."""
-    by: dict[str, list[float]] = {}
-    for a, v in obs:
-        by.setdefault(a, []).append(100 * math.log(v))
-    base = np.mean(by[BASE]) if BASE in by else math.nan
-    return ["Measured:"] + [
-        f"  {describe(a):40} {len(v)} runs {np.mean(v) - base:+6.2f}%"
-        for a, v in sorted(by.items())
-    ]
+def by_seed(obs: list[Obs]) -> dict[str, dict[int, float]]:
+    """Each arm's 100 ln(metric) at each of its seeds."""
+    by: dict[str, dict[int, float]] = {}
+    for a, s, v in obs:
+        by.setdefault(a, {})[s] = 100 * math.log(v)
+    return by
 
 
-def report(metric: str, data: dict[tuple[str, int], dict]) -> list[str]:
-    obs = [(a, m[metric]) for (a, _), m in data.items() if m.get(metric, 0) > 0]
-    arms = sorted({a for a, _ in obs})
+def change(
+    runs: dict[int, float], base: dict[int, float], paired: bool, s2: float
+) -> tuple[float, float, int]:
+    """An arm's change against the hybrid, its error and the runs it pairs: over the
+    seeds both have if paired, else the difference of their means."""
+    if not paired:
+        d = np.mean(list(runs.values())) - np.mean(list(base.values()))
+        return float(d), math.sqrt(s2 * (1 / len(runs) + 1 / len(base))), len(runs)
+    common = sorted(set(runs) & set(base))
+    if not common:
+        return math.nan, math.nan, 0
+    d = np.mean([runs[s] - base[s] for s in common])
+    return float(d), math.sqrt(2 * s2 / len(common)), len(common)
+
+
+def measured(obs: list[Obs], paired: bool, s2: float) -> list[str]:
+    """Each arm's runs and their change against the hybrid's, in percent."""
+    by = by_seed(obs)
+    base = by.get(BASE, {})
+    how = "paired by seed" if paired else "unpaired"
+    lines = [f"Measured ({how}):"]
+    for a, runs in sorted(by.items()):
+        d, se, n = change(runs, base, paired, s2) if base else (math.nan, math.nan, 0)
+        pairs = f", {n} paired" if paired else ""
+        err = "" if a == BASE else f" ± {se:.2f}"
+        lines.append(f"  {describe(a):40} {len(runs)} runs{pairs} {d:+6.2f}{err}%")
+    return lines
+
+
+def noise(obs: list[Obs]) -> str:
+    """A run's noise paired by seed and unpaired, the pure errors' roots."""
+    (p, dp), (u, du) = pure_error(obs, True), pure_error(obs, False)
+    return (
+        f"a run's noise {math.sqrt(p):.2f}% paired by seed ({dp} dof), "
+        f"{math.sqrt(u):.2f}% unpaired ({du} dof)"
+    )
+
+
+def seed_line(fit: Fit) -> list[str]:
+    if not fit.seeds:
+        return []
+    offsets = ", ".join(f"seed {s} {v:+.2f}%" for s, v in fit.seed_effects())
+    return [f"Seeds against seed {fit.seeds[0]}: {offsets}"]
+
+
+def report(metric: str, data: dict[tuple[str, int], dict], paired: bool) -> list[str]:
+    obs = [(a, s, m[metric]) for (a, s), m in data.items() if m.get(metric, 0) > 0]
+    arms = sorted({a for a, _, _ in obs})
     if len(arms) < 8:
         return [f"## {metric}: {len(arms)} arms, too few to fit"]
-    main = Fit(obs, main_terms())
+    main = Fit(obs, main_terms(), paired)
     kept, notes = estimable(arms)
-    full = Fit(obs, main_terms() + kept)
+    full = Fit(obs, main_terms() + kept, paired)
     sig = [t for t, e, s in full.effects() if t in kept and abs(t_of(e, s)) > 2]
-    final = Fit(obs, main_terms() + sig)
-    noise = f"a run's noise {math.sqrt(main.s2):.2f}% ({main.dof} dof)"
+    final = Fit(obs, main_terms() + sig, paired)
     lines = [
-        f"## {metric}: {len(obs)} runs of {len(arms)} arms; {noise}",
-        *measured(obs),
+        f"## {metric}: {len(obs)} runs of {len(arms)} arms; {noise(obs)}",
+        *seed_line(main),
+        *measured(obs, paired, main.s2),
         "Main effects:",
         *table(main),
         "With the interactions the design tells apart:",
@@ -316,6 +398,9 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("--metrics", default=",".join(METRICS))
     p.add_argument("--reuse", action="store_true", help="runs of the same configs")
     p.add_argument("--extra", action="store_true", help="stacks.bux's other arms")
+    p.add_argument(
+        "--no-pair", dest="paired", action="store_false", help="no effect of the seeds"
+    )
     p.add_argument("--selftest", action="store_true")
     args = p.parse_args(argv)
     if args.selftest:
@@ -323,7 +408,7 @@ def main(argv: list[str] | None = None) -> int:
     data = collect(args.paths, args.reuse, args.extra)
     print(f"{len(data)} runs: " + ", ".join(sorted({a for a, _ in data})))
     for metric in args.metrics.split(","):
-        print("\n".join(report(metric, data)) + "\n")
+        print("\n".join(report(metric, data, args.paired)) + "\n")
     return 0
 
 
@@ -345,11 +430,22 @@ def truth(arm: str) -> float:
     return float(total)
 
 
+#: Every arm's offset at each seed, in percent: the seeds' shared data order.
+SEED_OFFSET = {0: 0.0, 1: -0.5, 2: 1.3}
+#: Runs the self-test leaves out, so that the seeds are unbalanced and a fit that
+#: ignores their offsets errs.
+MISSING = {("r0v1k1f0p0s1", 2), ("r2v0k0f0p1s1", 2), ("r1v0k0f1p0s1", 1)}
+
+
 def synthetic(path: Path, noise: float, rng: np.random.Generator) -> None:
-    """RESULT lines of the design's 48 runs; the hybrid's as milestones.bux's runs."""
+    """RESULT lines of the design's runs, 3 seeds an arm but `MISSING`, with each
+    seed's offset; the hybrid's as milestones.bux's runs."""
     lines = []
     for arm, seed in itertools.product(DESIGN, range(3)):
-        v = {m: math.exp(math.log(base) + (truth(arm) + noise * rng.normal()) / 100)
+        if (arm, seed) in MISSING:
+            continue
+        shift = truth(arm) + SEED_OFFSET[seed]
+        v = {m: math.exp(math.log(base) + (shift + noise * rng.normal()) / 100)
              for m, base in (("objective", 0.68), ("repo_bpb", 0.53), ("repo_bpb_8k", 0.50))}  # fmt: skip
         if arm == BASE:
             label = "optimizer.lr=2e-3" if seed == 0 else f"seed={seed}"
@@ -361,29 +457,51 @@ def synthetic(path: Path, noise: float, rng: np.random.Generator) -> None:
     path.write_text("\n".join(lines) + "\n")
 
 
+def objective(data: dict[tuple[str, int], dict]) -> list[Obs]:
+    return [(a, s, m["objective"]) for (a, s), m in data.items()]
+
+
+def check_noiseless(obs: list[Obs]) -> list[tuple[str, float, float]]:
+    """Check the paired fit and changes exact, the seeds' offsets recovered and the
+    unpaired fit off; return the exact effects with V×K."""
+    kept, _ = estimable(DESIGN)
+    assert "V×K" in kept, kept
+    fit = Fit(obs, main_terms() + kept)
+    worst = max(abs(fit.delta(a)[0] - truth(a)) for a in every_arm())
+    assert worst < 1e-6, f"noiseless fit off by {worst}"
+    for s, v in fit.seed_effects():
+        assert abs(v - SEED_OFFSET[s] + SEED_OFFSET[0]) < 1e-6, (s, v)
+    by = by_seed(obs)
+    worst = max(abs(change(by[a], by[BASE], True, 0.0)[0] - truth(a)) for a in DESIGN)
+    assert worst < 1e-6, f"paired changes off by {worst}"
+    unpaired = Fit(obs, main_terms() + kept, paired=False)
+    off = max(abs(unpaired.delta(a)[0] - truth(a)) for a in every_arm())
+    assert off > 0.05, f"the seeds' offsets should bias the unpaired fit, {off}"
+    return Fit(obs, main_terms() + ["V×K"]).effects()
+
+
+def check_noisy(obs: list[Obs], exact: list[tuple[str, float, float]]) -> None:
+    """Check the paired noise is the runs' own and the effects near the exact ones."""
+    fit = Fit(obs, main_terms() + ["V×K"])
+    assert 0.25 < math.sqrt(fit.s2) < 0.6, fit.s2
+    assert pure_error(obs, False)[0] > 2 * fit.s2, "unpaired, the offsets are noise"
+    for (term, est, se), (_, want, _) in zip(fit.effects(), exact):
+        assert abs(est - want) < 4 * se, (term, est, se, want)
+
+
 def selftest() -> int:
     rng = np.random.default_rng(0)
     with tempfile.TemporaryDirectory() as tmp:
         path = Path(tmp) / "results.txt"
         synthetic(path, 0.0, rng)
-        assert len(collect([path], False, False)) == 45, "the hybrid's runs are reused"
+        assert len(collect([path], False, False)) == 42, "the hybrid's runs are reused"
         exact = collect([path], True, False)
-        assert len(exact) == 48
-        obs = [(a, m["objective"]) for (a, _), m in exact.items()]
-        kept, _ = estimable(DESIGN)
-        assert "V×K" in kept, kept
-        fit = Fit(obs, main_terms() + kept)
-        worst = max(abs(fit.delta(a)[0] - truth(a)) for a in every_arm())
-        assert worst < 1e-6, f"noiseless fit off by {worst}"
-        exact = Fit(obs, main_terms() + ["V×K"]).effects()
-        synthetic(path, 0.9, rng)
+        assert len(exact) == 45
+        effects = check_noiseless(objective(exact))
+        synthetic(path, 0.4, rng)
         noisy = collect([path], True, False)
-        obs = [(a, m["objective"]) for (a, _), m in noisy.items()]
-        fit = Fit(obs, main_terms() + ["V×K"])
-        assert 0.6 < math.sqrt(fit.s2) < 1.2, fit.s2
-        for (term, est, se), (_, want, _) in zip(fit.effects(), exact):
-            assert abs(est - want) < 4 * se, (term, est, se, want)
-        print("\n".join(report("objective", noisy)))
+        check_noisy(objective(noisy), effects)
+        print("\n".join(report("objective", noisy, True)))
     print("selftest: ok")
     return 0
 
