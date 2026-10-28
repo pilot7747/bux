@@ -26,7 +26,7 @@ from jax.ad_checkpoint import checkpoint_name
 from jaxtyping import Array, Bool, Float, Int
 
 from bux import config as cfg
-from bux import parallel
+from bux import initializers, parallel
 from bux.architecture import observe
 from bux.architecture.attention import sparse
 from bux.architecture.attention.indexer import Indexer, Scored, Target, from_stream
@@ -74,7 +74,8 @@ class SoftmaxAttention(nnx.Module):
     """What the softmax attention layers share once they have q, k and v.
 
     It holds the attention method's settings (the scale, softcap, sliding window and
-    sinks) and the output's norm, gate, projection and dropout. A layer makes its own
+    sinks) and the output's norm, gate (with HyGA's, `_gate`), projection and dropout.
+    A layer makes its own
     projections, `o` among them, before it calls this constructor, so that a seed
     draws them first. Its forward then makes q, k and v and calls `_attend` and
     `_output`.
@@ -113,7 +114,8 @@ class SoftmaxAttention(nnx.Module):
     ):
         self.heads, self.kv_heads = heads, kv_heads
         self.ports = tuple(ports)
-        gate_width = heads if config.gate_per_head else heads * v_head_dim
+        gate_dims = config.gate_input_rank or v_head_dim
+        gate_width = heads if config.gate_per_head else heads * gate_dims
         names = ("embed", ("heads", heads))
 
         # The randomly initialized layers, after the layer's own projections.
@@ -143,6 +145,27 @@ class SoftmaxAttention(nnx.Module):
             Norm(config.output_norm, v_head_dim) if config.output_norm else None
         )
         self.gate_activation = config.gate_activation
+        self._init_hybrid_gate(config, v_head_dim, bias, rngs)
+
+    def _init_hybrid_gate(
+        self, config: SoftmaxConfig, dv: int, bias: bool, rngs: nnx.Rngs
+    ) -> None:
+        """Make HyGA's parts of the gate (`_gate`): each head's up projection of a
+        low-rank input gate, its down and up projections of its own output, and the
+        gate of each head from all of them."""
+        h, init = self.heads, initializers.weight(batch_axis=(0,))
+
+        def per_head(n_in: int, n_out: int) -> nnx.Param:
+            shape = (h, n_in, n_out)
+            return nnx.Param(init(rngs.params(), shape), names=("heads", None, None))
+
+        rank, own = config.gate_input_rank, config.gate_output_rank
+        self.gate_up = per_head(rank, dv) if rank else None
+        self.output_gate_down = per_head(dv, own) if own else None
+        self.output_gate_up = per_head(own, dv) if own else None
+        names = (("heads", h), None)
+        cross = config.gate_cross_head
+        self.cross_gate = linear(h * dv, h, names, bias, rngs) if cross else None
 
     def _init_logit_layers(
         self, config: SoftmaxConfig, width: int, bias: bool, rngs: nnx.Rngs
@@ -218,19 +241,47 @@ class SoftmaxAttention(nnx.Module):
     def _output(
         self, x: Float[Array, "b t d"], out: Float[Array, "b t h dv"]
     ) -> Float[Array, "b t d"]:
-        """Normalize and gate the head outputs (the gate plus its bias per head, if
-        any), then project them back to the width."""
-        b, t, _ = x.shape
+        """Normalize and gate the head outputs (`_gate`), then project them back to
+        the width."""
         out = checkpoint_name(out, "attention.out")
         if self.out_norm is not None:
             out = self.out_norm(out)
         if self.gate is not None:
-            gate = self.gate(x).reshape(b, t, self.heads, -1)
-            if self.gate_bias is not None:
-                gate = gate + self.gate_bias[...].astype(gate.dtype)[:, None]
-            out = out * activation(self.gate_activation, gate)
+            out = out * self._gate(x, out)
         y = self._project(shard_heads(out))
         return y if self.output_dropout is None else self.output_dropout(y)
+
+    def _gate(
+        self, x: Float[Array, "b t d"], out: Float[Array, "b t h dv"]
+    ) -> Float[Array, "b t h _"]:
+        """Return the gate on the heads' outputs `out`: ``act(x W + b_h)``, `x` the
+        layer's input and b_h a bias per head, if any.
+
+        HyGA (Zhou et al., 2026, arXiv 2608.11805) adds to it, each part a setting:
+        the input's projection low-rank, ``SiLU(x W_d) W_u`` (its X-gate); the head's
+        own output in the logits, ``+ SiLU(o W_d) W_u`` (its H-gate, added before the
+        activation, the paper's fused form); and a gate of each head from all heads'
+        outputs, ``sigmoid(o W_c)``, which multiplies the first (its C-gate). Each
+        head has its own W_u, and its own W_d of its output. The paper's gate reads
+        the heads' outputs as attention made them; here they are what the gate
+        multiplies, after ``output_norm``. It sets no init: its matrices start as the
+        model's others.
+        """
+        assert self.gate is not None
+        b, t, _ = x.shape
+        logits = self.gate(x).reshape(b, t, self.heads, -1)
+        if self.gate_up is not None:
+            logits = _by_head(jax.nn.silu(logits), self.gate_up)
+        if self.output_gate_down is not None and self.output_gate_up is not None:
+            low = jax.nn.silu(_by_head(out, self.output_gate_down))
+            logits = logits + _by_head(low, self.output_gate_up)
+        if self.gate_bias is not None:
+            logits = logits + self.gate_bias[...].astype(logits.dtype)[:, None]
+        gate = activation(self.gate_activation, logits)
+        if self.cross_gate is None:
+            return gate
+        heads = jax.nn.sigmoid(self.cross_gate(out.reshape(b, t, -1)))
+        return gate * heads[..., None]
 
     def _project(self, out: Float[Array, "b t h dv"]) -> Float[Array, "b t d"]:
         """Project the heads back to the width."""
@@ -514,6 +565,11 @@ def exclusive(
     if strength is not None:
         along = along * strength.astype(jnp.float32)[:, None]
     return (y - along).astype(out.dtype)
+
+
+def _by_head(x: Float[Array, "b t h i"], w: nnx.Param) -> Float[Array, "b t h o"]:
+    """Return each head's `x` times its own matrix of `w`, h by i by o."""
+    return jnp.einsum("bthi,hio->btho", x, w[...].astype(x.dtype))
 
 
 def require_xla(feature: str) -> None:

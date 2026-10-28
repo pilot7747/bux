@@ -90,6 +90,11 @@ GQA_SETTINGS = {
     "head dims": GQA + ", head_dim=12, v_head_dim=8)",
     "kv conv": GQA + ", kv_conv_size=3)",
     "xsa": GQA + ", exclusive=true)",
+    "hyga": GQA + ", gated=true, gate_output_rank=8, gate_cross_head=true, sinks=true)",
+    "hyga, low-rank, head bias, softplus": GQA + ", gated=true, gate_input_rank=4,"
+    " gate_output_rank=4, gate_head_bias=true, gate_activation=softplus)",
+    "hyga, xsa, output norm": GQA + ", gated=true, gate_input_rank=4,"
+    " gate_cross_head=true, exclusive=learned, output_norm=rmsnorm)",
     "xsa, learned, mqa, window, sinks": "gqa(num_heads=4, num_kv_heads=1,"
     " exclusive=learned, sliding_window_size=3, sinks=true, rope=rope())",
     "xsa, relative bias": GQA + ", exclusive=true, relative_bias=relbias(rank=2,"
@@ -193,6 +198,8 @@ MLA_SETTINGS = {
     " original_max_len=8, attention_factor_on=softmax)))",
     "partial rope": MLA + ", rope=rope(fraction=0.5))",
     "qk norm, gated": MLA + ", qk_norm=rmsnorm, gated=true, gate_per_head=true)",
+    "hyga": MLA + ", gated=true, gate_input_rank=4, gate_output_rank=4,"
+    " gate_cross_head=true)",
     "window, sinks": MLA + ", sliding_window_size=4, sinks=true)",
     "softcap, scale": MLA + ", softcap=2.0, scale=0.2)",
     "relative bias, log scale": MLA
@@ -325,6 +332,8 @@ CSA_SETTINGS = {
     "no window, low-rank queries and output": "csa(num_heads=4, head_dim=16,"
     " q_lora_rank=8, o_lora_rank=4, o_groups=2, rope=rope(fraction=0.5))",
     "compressed": CSA + ", compress_ratio=2)",
+    "compressed, hyga": CSA + ", compress_ratio=2, gated=true, gate_output_rank=4,"
+    " gate_cross_head=true)",
     "compressed, indexer": CSA + f", compress_ratio=2, {SMALL_INDEXER}))",
     "single, indexer": CSA + f", compress_ratio=1, {SMALL_INDEXER}, weighted=false))",
     "compressed, indexer of plain dots": CSA

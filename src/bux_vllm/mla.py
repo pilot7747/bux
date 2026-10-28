@@ -80,12 +80,14 @@ def check(c: dict, site: Site) -> None:
     Raises:
         NotImplementedError: A setting that needs the keys projected up while
             decoding (QK-norm), or that neither takes (a relative bias, a length
-            scale, the gate's head bias, ports but a sparse layer's ``index``);
+            scale, the gate's head bias or HyGA's gates, ports but a sparse layer's
+            ``index``);
             for vLLM's MLA, a window, soft-capping or sinks, dims other than the
             config's, a dtype other than bfloat16 or float16, or vLLM not running
             the model as MLA.
     """
     unsupported(c, "qk_norm", "relative_bias", "log_scale", "gate_head_bias")
+    unsupported(c, "gate_input_rank", "gate_output_rank", "gate_cross_head")
     sparse_ = is_sparse(c, site.ports)
     names = {name for name, _, _ in site.ports} - ({"index"} if sparse_ else set())
     if names:

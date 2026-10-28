@@ -191,6 +191,9 @@ need `compress_ratio`; `o_groups` must divide `num_heads`.
 | `gate_per_head` | `false` | one gate value per head instead (with `gated`, as the next two) | Laguna |
 | `gate_activation` | `sigmoid` | the gate's activation | Laguna: `softplus` |
 | `gate_head_bias` | `false` | a learned bias per head on the gate, before its activation | Beam |
+| `gate_input_rank` | `none` | the gate's projection of the input low-rank, `SiLU(x W_d) W_u` ([Gated attention](#gated-attention)) | HyGA |
+| `gate_output_rank` | `none` | the gate also reads each head's own output, by a rank of this many dims | HyGA |
+| `gate_cross_head` | `false` | a second gate, a value a head, from all the heads' outputs | HyGA |
 | `output_norm` | `none` | a norm of each head's output, before the gate | Muse Spark |
 | `qk_norm` | `none` | a norm of each query and key head, before RoPE | Qwen3, Gemma 3 |
 | `softcap` | `none` | `c * tanh(logits / c)` on the logits | Gemma 2 |
@@ -271,6 +274,30 @@ main ones:
   attn = gqa(num_heads=48, num_kv_heads=8, head_dim=128, qk_norm=norm,
              gated=true, gate_head_bias=true)
   ```
+
+- **G1 by HyGA** (Zhou et al., 2026, arXiv 2608.11805): the gate of head $i$ also
+  reads the head's output $o_i$, and a gate of each head from all of them multiplies
+  it:
+
+  $$
+  o_i' = o_i \odot \sigma\big(x W_i + \mathrm{SiLU}(o_i W^d_i) W^u_i\big)
+  \odot \sigma\big((o W_c)_i\big).
+  $$
+
+  `gate_output_rank=r` adds the second term, $W^d_i$ and $W^u_i$ of rank $r$ each
+  head's own (the H-gate). `gate_cross_head=true` adds the last factor, $o$ all the
+  heads' outputs side by side (the C-gate). `gate_input_rank=r` makes the first term
+  low-rank, $\mathrm{SiLU}(x \bar W^d_i) \bar W^u_i$ (the paper's cheaper X-gate). The
+  paper's main runs have the H-gate as wide as the head, the X-gate full and learned
+  sinks:
+
+  ```bux
+  attn = gqa(num_heads=8, num_kv_heads=2, gated=true, gate_output_rank=64,
+             gate_cross_head=true, sinks=true)
+  ```
+
+  The H-gate reads the outputs the gate multiplies: after `output_norm`, under one.
+  The paper sets no init for the new matrices; they start as the model's others.
 
 - **G5**, after the output projection: write the gate with the algebra, as
   `examples/architectures/primitives.bux` does:

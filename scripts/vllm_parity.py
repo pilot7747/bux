@@ -430,6 +430,26 @@ CASES = {
     + "residual = hc(expansion=4)\n"
     + "model = embed [rmsnorm delta] [rmsnorm ffn] [rmsnorm attn(v=@v1)] [rmsnorm ffn]"
     " [rmsnorm delta] [rmsnorm ffn] [rmsnorm attn(v=$v1)] [rmsnorm ffn] rmsnorm head",
+    # HyGA's gates: as the paper's main runs have them (the input's gate, the head's
+    # own output's at its width, the cross-head gate, sinks), and low-rank with a
+    # head bias.
+    "hyga": HEAD
+    + FFN
+    + "attn = gqa(num_heads=4, num_kv_heads=2, gated=true, gate_output_rank=32,"
+    " gate_cross_head=true, sinks=true, rope=rope())\n"
+    + "low = attn(gate_input_rank=8, gate_output_rank=8, gate_head_bias=true,"
+    " sinks=false)\n"
+    + "model = embed [rmsnorm attn] [rmsnorm ffn] [rmsnorm low] [rmsnorm ffn]"
+    " rmsnorm head",
+    # xsa-hybrid with HyGA's gates on its global layers too.
+    "hyga-hybrid": HEAD
+    + FFN
+    + "attn = gqa(num_heads=4, num_kv_heads=1, qk_norm=rmsnorm, gated=true,"
+    " gate_output_rank=32, gate_cross_head=true, kv_conv_size=4, exclusive=learned)\n"
+    + "delta = kda(num_heads=2, num_v_heads=4, head_dim=32, gate_lower_bound=-5)\n"
+    + "residual = hc(expansion=4)\n"
+    + "model = embed [rmsnorm delta] [rmsnorm ffn] [rmsnorm attn(v=@v1)] [rmsnorm ffn]"
+    " [rmsnorm delta] [rmsnorm ffn] [rmsnorm attn(v=$v1)] [rmsnorm ffn] rmsnorm head",
     "dsa": HEAD + FFN + "attn = gqa(num_heads=4, num_kv_heads=2, rope=rope(),"
     " indexer=indexer(num_heads=2, head_dim=16, top_k=8))\n"
     + "local = attn(sliding_window_size=16, sinks=true, softcap=20)\n"

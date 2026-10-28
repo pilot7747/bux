@@ -1,10 +1,12 @@
 """What a ``gqa`` layer does to its heads' outputs between attending and its output
-projection, in plain PyTorch: exclusive self-attention (XSA). The model's forward
-runs it under torch.compile, which fuses it into the kernels around it."""
+projection, in plain PyTorch: exclusive self-attention (XSA), and the logits of
+HyGA's gates. The model's forward runs them under torch.compile, which fuses them
+into the kernels around them."""
 
 from __future__ import annotations
 
 import torch
+import torch.nn.functional as F
 
 
 def exclusive(
@@ -32,3 +34,37 @@ def exclusive(
     if strength is not None:
         along = along * strength.float().view(g, h // g, 1)
     return (y - along).view(t, h, dv).to(out.dtype)
+
+
+def by_head(x: torch.Tensor, w: torch.Tensor) -> torch.Tensor:
+    """Each head's x, (T, h, i), times its own matrix of w, (h, i, o)."""
+    return torch.einsum("thi,hio->tho", x, w.to(x.dtype))
+
+
+def hybrid_logits(
+    logits: torch.Tensor,
+    out: torch.Tensor,
+    up: torch.Tensor | None = None,
+    down: torch.Tensor | None = None,
+    own_up: torch.Tensor | None = None,
+) -> torch.Tensor:
+    """The gate's logits with HyGA's X- and H-gates, as bux's ``_gate`` makes them.
+
+    Args:
+        logits: The input's projection by the gate, (T, h, _): x W, or x W_d under
+            a low-rank input gate.
+        out: The heads' outputs the gate multiplies, (T, h, dv).
+        up: Each head's W_u of a low-rank input gate, (h, r, dv), which makes the
+            logits SiLU(x W_d) W_u; None for none.
+        down: Each head's W_d of its own output, (h, dv, r'), for the H-gate.
+        own_up: Each head's W_u of it, (h, r', dv); the H-gate adds
+            SiLU(o W_d) W_u to the logits.
+
+    Returns:
+        The logits, (T, h, _), before the gate's head bias and activation.
+    """
+    if up is not None:
+        logits = by_head(F.silu(logits), up)
+    if down is not None and own_up is not None:
+        logits = logits + by_head(F.silu(by_head(out, down)), own_up)
+    return logits

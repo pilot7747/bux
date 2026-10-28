@@ -217,6 +217,41 @@ def test_the_gate_bias_adds_one_value_per_head_before_the_sigmoid():
     assert jnp.allclose(attn._output(x, heads), expected, atol=1e-5)
 
 
+def test_hyga_gates_as_the_paper_writes_it():
+    """HyGA's output, H_i * sigmoid(SiLU(x Wd_i) Wu_i + SiLU(H_i Wd'_i) Wu'_i) *
+    sigmoid((H W_c)_i): its low-rank X-gate, its H-gate and its C-gate."""
+    attn = gqa(gated=True, gate_input_rank=3, gate_output_rank=5, gate_cross_head=True)
+    assert attn.gate is not None and attn.cross_gate is not None
+    up, down, own = attn.gate_up, attn.output_gate_down, attn.output_gate_up
+    assert up is not None and down is not None and own is not None
+    x = jax.random.normal(jax.random.key(1), (2, 8, D))
+    heads = jax.random.normal(jax.random.key(2), (2, 8, H, D // H))
+    silu = jax.nn.silu
+    xg = jnp.einsum("bthr,hrd->bthd", silu(attn.gate(x).reshape(2, 8, H, 3)), up[...])
+    hg = jnp.einsum(
+        "bthr,hrd->bthd", silu(jnp.einsum("bthd,hdr->bthr", heads, down[...])), own[...]
+    )
+    cg = jax.nn.sigmoid(attn.cross_gate(heads.reshape(2, 8, -1)))[..., None]
+    expected = attn.o((heads * jax.nn.sigmoid(xg + hg) * cg).reshape(2, 8, -1))
+    assert jnp.allclose(attn._output(x, heads), expected, atol=1e-5)
+
+
+def test_hyga_s_gates_take_the_gate_and_are_new_parameters_alone():
+    def params(attn: Attention) -> dict:
+        return dict(nnx.to_flat_state(nnx.state(attn, nnx.Param)))
+
+    plain, hyga = params(gqa(gated=True)), params(gqa(gated=True, gate_output_rank=4))
+    assert {k[0] for k in hyga.keys() - plain.keys()} == {
+        "output_gate_down",
+        "output_gate_up",
+    }
+    assert all(jnp.array_equal(plain[k][...], hyga[k][...]) for k in plain)
+    with pytest.raises(ValueError, match="gate_cross_head set the gate"):
+        gqa(gate_cross_head=True)
+    with pytest.raises(ValueError, match="gate_per_head"):
+        gqa(gated=True, gate_per_head=True, gate_output_rank=4)
+
+
 def test_xsa_removes_each_heads_part_along_its_own_value():
     """y - (y . v) v / |v|^2, the paper's formula: nothing left along v, the rest
     of y kept; a query head takes its group's value. Learned, tanh(a) of it."""

@@ -1033,6 +1033,36 @@ def test_xsa_takes_out_what_bux_takes_out(learned: bool, groups: int) -> None:
     np.testing.assert_allclose(got.numpy(), np.asarray(want), rtol=1e-5, atol=1e-6)
 
 
+def test_hyga_s_gate_is_bux_s() -> None:
+    c = cfg.GQAConfig(
+        num_heads=4,
+        num_kv_heads=2,
+        gated=True,
+        gate_input_rank=3,
+        gate_output_rank=5,
+        gate_cross_head=True,
+        gate_head_bias=True,
+    )
+    attn = BuxAttention(c, 64, (), rngs=nnx.Rngs(0))
+    assert attn.gate is not None and attn.cross_gate is not None
+    assert attn.gate_up is not None and attn.gate_bias is not None
+    attn.gate_bias[...] = jax.random.normal(jax.random.key(3), (4,))
+    assert attn.output_gate_down is not None and attn.output_gate_up is not None
+    x = jax.random.normal(jax.random.key(1), (1, 8, 64))
+    out = jax.random.normal(jax.random.key(2), (1, 8, 4, 16))
+    want = attn._gate(x, out)[0]
+
+    def t(a: Any) -> torch.Tensor:
+        return torch.from_numpy(np.array(a))
+
+    weights = (attn.gate_up, attn.output_gate_down, attn.output_gate_up)
+    logits = t(attn.gate(x)[0]).view(8, 4, -1)
+    logits = outputs.hybrid_logits(logits, t(out[0]), *(t(w[...]) for w in weights))
+    gate = torch.sigmoid(logits + t(attn.gate_bias[...])[:, None])
+    cross = torch.sigmoid(t(attn.cross_gate(out.reshape(1, 8, -1))[0]))[..., None]
+    np.testing.assert_allclose((gate * cross).numpy(), np.asarray(want), atol=1e-6)
+
+
 def test_ports_are_read_and_written_as_bux_lists_them() -> None:
     ports = [["v", "v1", "pop"], ["v", "v2", "write"], ["v", "v3", "write"]]
     assert kv.reads(ports, "v") == ("v1", True)
@@ -2490,10 +2520,11 @@ def built(
 
 def kept(model: Any, path: str) -> bool:
     """Whether the plugin keeps the vLLM linear layer at `path` in the model's
-    dtype: an MoE's shared experts' gate of one output, as vLLM keeps Qwen's, and
-    a sparse MLA's ``kv_b``, whose weight the sparse ops read."""
+    dtype: an MoE's shared experts' gate of one output, as vLLM keeps Qwen's,
+    HyGA's cross-head gate of an output a head, and a sparse MLA's ``kv_b``, whose
+    weight the sparse ops read."""
     owner, _, name = path.rpartition(".")
-    if name == "shared_gate":
+    if name in ("shared_gate", "cross_gate"):
         return True
     return name == "kv_b" and model.get_submodule(owner).spec is not None
 

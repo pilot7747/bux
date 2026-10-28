@@ -442,6 +442,17 @@ class QuadraticAttentionConfig(AttentionConfig):
     # A learned bias per head on the gate, before its activation, shared by the head's
     # dims and starting at 0 (Beam).
     gate_head_bias: bool = False
+    # The gate's projection of the input made low-rank, SiLU(x W_d) W_u, W_d of this
+    # many columns for each head and W_u each head's own (HyGA's low-rank X-gate);
+    # None: one projection.
+    gate_input_rank: int | None = None
+    # The gate also reads the head's output o: SiLU(o W_d) W_u of this rank, by the
+    # head's own matrices, added to its logits from the input before the activation
+    # (HyGA's H-gate; the paper's main runs make it as wide as the head); None: none.
+    gate_output_rank: int | None = None
+    # A second gate, one value a head, sigmoid(o W_c) of all the heads' outputs
+    # together, times the first (HyGA's C-gate).
+    gate_cross_head: bool = False
     # A norm of each head's output, before the gate (Muse); None: none.
     output_norm: NormalizationConfig | None = None
     # Norm of each query and key head, before RoPE (Qwen3); gqa's qk_norm_all_heads
@@ -477,11 +488,20 @@ class QuadraticAttentionConfig(AttentionConfig):
                 ("gate_per_head", self.gate_per_head),
                 ("gate_head_bias", self.gate_head_bias),
                 ("gate_activation", self.gate_activation != "sigmoid"),
+                ("gate_input_rank", self.gate_input_rank is not None),
+                ("gate_output_rank", self.gate_output_rank is not None),
+                ("gate_cross_head", self.gate_cross_head),
             )
             if on
         ]
         if given and not self.gated:
             raise ValueError(f"{', '.join(given)} set the gate, which gated=true adds")
+        ranks = self.gate_input_rank is not None or self.gate_output_rank is not None
+        if ranks and self.gate_per_head:
+            raise ValueError(
+                "gate_input_rank and gate_output_rank gate each dim of a head: not with "
+                "gate_per_head"
+            )
         return self
 
     @model_validator(mode="after")

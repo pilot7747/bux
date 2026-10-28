@@ -510,6 +510,18 @@ INDEXER = "indexer(num_heads=2, head_dim=8, "
             "true",
         ),
         (
+            "gqa(num_heads=2, num_kv_heads=2, gated=true)",
+            "gate_output_rank",
+            "none",
+            "4",
+        ),
+        (
+            "gqa(num_heads=2, num_kv_heads=2, gated=true)",
+            "gate_cross_head",
+            "false",
+            "true",
+        ),
+        (
             "gqa(num_heads=2, num_kv_heads=2, qk_norm=norm)",
             "qk_norm_all_heads",
             "false",
@@ -536,6 +548,7 @@ INDEXER = "indexer(num_heads=2, head_dim=8, "
         # With the gate it biases, which they have not by default.
         (MLA, "gate_head_bias", "false", "true, gated=true"),
         (CSA, "gate_head_bias", "false", "true, gated=true"),
+        (MLA, "gate_input_rank", "none", "2, gated=true"),
     ],
 )
 def test_a_layer_field_newer_than_ids_keeps_them_where_it_computes_as_before(
@@ -566,6 +579,9 @@ def test_a_layer_field_newer_than_ids_keeps_them_where_it_computes_as_before(
         ("gqa", "power_scale"): "4de8bfe6fd",
         ("gqa", "exclusive"): "4de8bfe6fd",
         ("gqa", "gate_head_bias"): "370e873062",
+        ("gqa", "gate_output_rank"): "370e873062",
+        ("gqa", "gate_cross_head"): "370e873062",
+        ("mla", "gate_input_rank"): "fa0bdd5558",
         ("gqa", "qk_norm_all_heads"): "9a5d6c3ed2",
         ("mla", "gate_head_bias"): "fa0bdd5558",
         ("csa", "gate_head_bias"): "e1e9cc3d90",
