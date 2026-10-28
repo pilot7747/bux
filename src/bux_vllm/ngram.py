@@ -12,7 +12,9 @@ over them.
 
 from __future__ import annotations
 
+import itertools
 import math
+from dataclasses import dataclass
 from typing import Any
 
 import torch
@@ -57,6 +59,11 @@ def ngram_rows(
     ``XOR_{i <= j} id_i * m_i`` in wrapping uint32 arithmetic, an id at or before the
     last boundary or missing one counting as the boundary's (or 0's).
 
+    The rows are in the tables whatever the ids, even those of vLLM's dummy runs and
+    its compiler's benchmarks: the primes are constants of the code, not inputs a
+    benchmark fills with zeros, and the rows are clamped to the tables, which leaves
+    every real row as it is.
+
     Args:
         window: Each token's ids, newest first, -1 for none.
         hashes: What the layer hashes by.
@@ -75,25 +82,35 @@ def ngram_rows(
     for i, m in enumerate(hashes.multipliers):
         h = h ^ ((ids[:, i] * m) & 0xFFFFFFFF)
         if i:
-            rows.append(h[:, None] % hashes.primes[i - 1] + hashes.offsets[i - 1])
-    return torch.cat(rows, -1)
+            heads = zip(hashes.primes[i - 1], hashes.offsets[i - 1], strict=True)
+            rows += [h % prime + offset for prime, offset in heads]
+    return torch.stack(rows, -1).clamp(0, hashes.rows - 1)
 
 
-class Hashes(nn.Module):
-    """What an engram hashes by, from its site (`bux.export.plan.engram_hashes`):
-    the odd ``multipliers`` of its n ids, and the prime size of each n-gram size's
-    and head's table, (n - 1, heads), with where each table starts among the rows."""
+@dataclass(frozen=True)
+class Hashes:
+    """What an engram hashes by, from its site (`bux.export.plan.engram_hashes`).
 
-    primes: torch.Tensor
-    offsets: torch.Tensor
+    Attributes:
+        multipliers: The odd multipliers of its n ids.
+        primes: The prime size of each n-gram size's and head's table.
+        offsets: Where each of those tables starts among the rows.
+        rows: The rows of all its tables.
+    """
 
-    def __init__(self, extra: dict):
-        super().__init__()
-        self.multipliers: list[int] = extra["multipliers"]
-        primes = torch.tensor(extra["primes"])
-        offsets = F.pad(primes.flatten().cumsum(0)[:-1], (1, 0)).view(primes.shape)
-        self.register_buffer("primes", primes, persistent=False)
-        self.register_buffer("offsets", offsets, persistent=False)
+    multipliers: list[int]
+    primes: list[list[int]]
+    offsets: list[list[int]]
+    rows: int
+
+    @classmethod
+    def of(cls, extra: dict) -> Hashes:
+        """The hashes of the site's `extra`: its ``primes`` and ``multipliers``."""
+        primes, heads = extra["primes"], len(extra["primes"][0])
+        flat = [p for row in primes for p in row]
+        starts = [0, *itertools.accumulate(flat)]
+        offsets = [starts[i : i + heads] for i in range(0, len(flat), heads)]
+        return cls(extra["multipliers"], primes, offsets, starts[-1])
 
 
 def dilated_conv(
@@ -117,6 +134,8 @@ def dilated_conv(
 
     Returns:
         The conv, (T, C), and each sequence's last inputs after the step, as `past`.
+        Starts of no real step (a dummy run's) read and keep the wrong inputs, but
+        none past the ends.
     """
     t, r, keep = x.shape[0], past.shape[0], past.shape[1]
     size = weight.shape[0]
@@ -124,13 +143,14 @@ def dilated_conv(
     at = torch.arange(t, device=x.device)
     pos = at - query_start_loc[req]
     inputs = torch.cat([past.reshape(r * keep, -1), x])
+    last = inputs.shape[0] - 1
     y: Any = 0
     for i in range(size):
         back = (size - 1 - i) * dilation
         early = pos - back
         index = torch.where(early >= 0, r * keep + at - back, req * keep + keep + early)
-        y = y + weight[i] * inputs[index]
-    return y, inputs[_last(query_start_loc, r, keep)]
+        y = y + weight[i] * inputs[index.clamp(0, last)]
+    return y, inputs[_last(query_start_loc, r, keep).clamp(0, last)]
 
 
 def _last(query_start_loc: torch.Tensor, r: int, keep: int) -> torch.Tensor:
@@ -163,10 +183,9 @@ class EngramCore(Layer):
     def __init__(self, c: dict, d: int, copies: int, hashes: dict):
         super().__init__()
         self.n, self.copies, self.d = c["max_ngram_size"], copies, d
-        self.hashes = Hashes(hashes)
+        self.hashes = Hashes.of(hashes)
         self.classes, self.boundary = c["vocab_classes"], c["boundary_token"]
-        rows = sum(p for row in hashes["primes"] for p in row)
-        tables = (self.n - 1) * c["num_heads"]
+        tables, rows = (self.n - 1) * c["num_heads"], self.hashes.rows
         self.table = nn.Parameter(torch.empty(rows, c["head_dim"]), requires_grad=False)
         self.kv = nn.Linear(tables * c["head_dim"], (copies + 1) * d, bias=False)
         self.kv.requires_grad_(False)

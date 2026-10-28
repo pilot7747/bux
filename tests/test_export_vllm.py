@@ -1385,3 +1385,25 @@ def test_padding_columns_are_zero() -> None:
     layer = torch.nn.Linear(4, 10, bias=False)
     linear.zero_padding(layer, 3)
     assert not layer.weight[-3:].any() and layer.weight[:-3].any()
+
+
+@pytest.mark.parametrize("before", ["none", "garbage"])
+def test_engram_rows_stay_in_its_tables_on_any_inputs(before: str) -> None:
+    """vLLM's dummy runs and its compiler's benchmarks run the model on ids, starts
+    and ids before the step of no request (-1s, zeros or garbage): every gather of
+    the engram stays in range, and so do its rows."""
+    torch.manual_seed(0)
+    _, mine, d, _ = engram_twins(ENGRAMS["4-grams, boundary, classes"][0], None)
+    t, big = 9, 2**40
+    context = torch.full((2, 4), -1)  # two sequences, as the conv's state holds
+    if before == "garbage":
+        context = torch.randint(-big, big, (2, 4))
+    ctx = stand_in(
+        input_ids=torch.randint(-big, big, (t,)),
+        query_start_loc=torch.tensor([5, -7, 2**30]),
+        ngram_context=context,
+    )
+    window = ngram.windows(ctx.input_ids, ctx.query_start_loc, context, mine.n)
+    rows = ngram.ngram_rows(window, mine.hashes, mine.classes, mine.boundary)
+    assert rows.min() >= 0 and rows.max() < mine.table.shape[0]
+    assert mine(torch.randn(t, d), ctx).shape == (t, d)
