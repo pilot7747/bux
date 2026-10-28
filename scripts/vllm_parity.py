@@ -147,6 +147,13 @@ CASES = {
     + "delta = gdn(num_heads=2, num_v_heads=4, head_dim=32)\n"
     + "model = embed [rmsnorm delta] [rmsnorm ffn] [rmsnorm delta] [rmsnorm ffn]"
     " [rmsnorm attn] [rmsnorm ffn] rmsnorm head",
+    "value-residual": HEAD
+    + ATTN
+    + FFN
+    + "both = attn(value_residual=learned)\n"
+    + "one = attn(value_residual=convex)\n"
+    + "model = embed [rmsnorm attn(v=@v1)] [rmsnorm ffn] [rmsnorm attn(v=$v1)]"
+    " [rmsnorm both(v=$v1)] [rmsnorm ffn] [rmsnorm one(v=$v1!)] rmsnorm head",
 }
 
 LENGTHS = (3, 17, 40, 64)  # the prompts', in one batch: within and past a window

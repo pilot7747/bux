@@ -17,10 +17,11 @@ from flax import nnx
 
 from bux import config as cfg
 from bux.architecture.attention import rope as bux_rope
+from bux.architecture.attention.gqa import Attention as BuxAttention
 from bux.architecture.experts.moe import MoE
 from bux.export import plan as core
-from bux.lang import compile, compile_file
-from bux_vllm import common, config, plan, routing
+from bux.lang import compile, compile_file, ir
+from bux_vllm import common, config, kv, plan, routing
 
 ROOT = Path(__file__).parent.parent
 EXAMPLES = sorted((ROOT / "examples" / "architectures").rglob("*.bux"))
@@ -188,3 +189,41 @@ def test_experts_load_alike_from_bux_and_transformers(gated: bool) -> None:
         assert [s for s, _ in a] == [s for s, _ in b]
         for (_, x), (_, y) in zip(a, b, strict=True):
             torch.testing.assert_close(x, y)
+
+
+@pytest.mark.parametrize("kind", ["fixed", "learned", "convex"])
+def test_the_value_residual_mixes_as_bux(kind: str) -> None:
+    c = cfg.GQAConfig.model_validate(
+        {"num_heads": 4, "num_kv_heads": 2, "value_residual": kind}
+    )
+    port = ir.Port(name="v", tap="v1", mode="read")
+    attn = BuxAttention(c, 64, (port,), rngs=nnx.Rngs(0))
+    w = None
+    if attn.v_mix is not None:
+        attn.v_mix[...] = jax.random.uniform(jax.random.key(1), attn.v_mix[...].shape)
+        w = torch.from_numpy(np.array(attn.v_mix[...]))
+    v, v1 = jax.random.normal(jax.random.key(2), (2, 1, 8, 2, 16))
+    want = attn._mix_values(v, v1)[0].reshape(8, 32)
+    flat = [torch.from_numpy(np.array(a)[0].reshape(8, 32)) for a in (v, v1)]
+    got = kv.mix_values(kind, w, *flat)
+    np.testing.assert_allclose(got.numpy(), np.asarray(want), rtol=1e-6)
+
+
+def test_ports_are_read_and_written_as_bux_lists_them() -> None:
+    ports = [["v", "v1", "pop"], ["v", "v2", "write"], ["v", "v3", "write"]]
+    assert kv.reads(ports, "v") == ("v1", True)
+    assert kv.reads([["v", "v1", "write"]], "v") is None
+    assert kv.writes(ports, "v") == ["v2", "v3"]
+    kv.check_ports(ports)
+    with pytest.raises(NotImplementedError, match="kv port"):
+        kv.check_ports([["kv", "kv", "write"]])
+
+
+@pytest.mark.parametrize(
+    ("kv_heads", "tp", "want"),
+    [(8, 2, [(0, 4), (4, 4)]), (2, 4, [(0, 1), (0, 1), (1, 1), (1, 1)])],
+)
+def test_each_rank_keeps_its_kv_heads(
+    kv_heads: int, tp: int, want: list[tuple[int, int]]
+) -> None:
+    assert [kv.kv_heads(kv_heads, tp, rank) for rank in range(tp)] == want

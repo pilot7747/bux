@@ -114,6 +114,9 @@ ones, `--load-format dummy`, to time it.
   `caches.<i>.<path>` by its place among them. A shared attention layer called three
   times keeps three KV caches over one set of weights. A model with recurrent layers
   is a hybrid for vLLM, as the `layer_types` in its config say.
+- **Ports.** A layer's ports go through the forward pass's taps, as in bux: a `gqa`
+  layer that reads the `v` port mixes those values into its own before they enter
+  its KV cache, and one that writes it pushes its values, mixed or not.
 
 ## What runs
 
@@ -121,7 +124,7 @@ ones, `--load-format dummy`, to time it.
 |--------|---------|
 | `embed`, `head` | the vocabulary split over ranks; learned positions, `scale_by_sqrt_dim`, `norm`; tied or untied, a bias, soft-capping |
 | `rmsnorm`, `layernorm`, `mlp`, `gated_mlp`, `linear`, `act`, `scale`, `dropout` | yes, with the MLPs' `limit`, `up_softcap` and `up_offset` |
-| `gqa` | RoPE (`pi`, `llama3`, `yarn`), QK-norm, GQA and MQA, biases, `fused_qkv`, sliding windows, soft-capping, sinks, its scale, `gated` (a gate per channel or per head), `output_norm`. Not yet: `kv_conv_size`, an indexer, a relative bias, `log_scale`, `power_scale`, `gate_head_bias`, QK-norm across all heads (`qk_norm_all_heads`), or ports |
+| `gqa` | RoPE (`pi`, `llama3`, `yarn`), QK-norm, GQA and MQA, biases, `fused_qkv`, sliding windows, soft-capping, sinks, its scale, `gated` (a gate per channel or per head), `output_norm`, and the `v` port: the value residual, fixed, learned or convex. Not yet: `kv_conv_size`, an indexer, a relative bias, `log_scale`, `power_scale`, `gate_head_bias`, QK-norm across all heads (`qk_norm_all_heads`), or the `kv` and `index` ports |
 | `moe` | softmax, sigmoid and `sqrtsoftplus` routers, `router_logit_scale`, groups, the aux-free bias, a router bias, shared experts and their gate, gated and plain experts (`swish`, `gelu`, `gelu_tanh`, `relu2`) with biases, and a `limit` and `up_offset` on `swish` and `quick_gelu` gates (gpt-oss's). Not yet: LatentMoE, `expert_norm`, `shared_expert_sink`, or the experts' `up_softcap` |
 | `mamba2`, `gdn` | by vLLM's own layers, with one type and shape of recurrent layer per model; `gdn` in bfloat16 only, and with its short conv and output gate. Under tensor parallelism, vLLM 0.32's Mamba-2 failed with one group (its fused all-reduce), and in bfloat16 where a rank's share of the input projection is not a multiple of 8 wide |
 | the graph | everything except residual algebras; a shared MoE or recurrent layer may run only once per forward pass |
