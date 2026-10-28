@@ -27,6 +27,7 @@ from .picks import Picked, Sparse
 #: in 16-bit models alone; read once.
 CHOICE = os.environ.get("BUX_VLLM_SPARSE_KERNELS")
 MOST_DIMS = 256  # the widest key or value head the kernels take
+BLOCKS = (16, 32, 64, 128)  # MSA's blocks whose best a prompt's kernel finds
 
 
 def takes(spec: Sparse, dims: tuple[int, int], dtype: torch.dtype) -> bool:
@@ -194,6 +195,7 @@ def _prompt_scores_kernel(
     relu: tl.constexpr,
     groups: tl.constexpr,
     ranked: tl.constexpr,
+    best: tl.constexpr,
     block_t: tl.constexpr,
     block_i: tl.constexpr,
     block_s: tl.constexpr,
@@ -201,7 +203,8 @@ def _prompt_scores_kernel(
     """A tile of one request's queries' scores of a tile of its keys, ``sum_j w_j
     ReLU(q_j . k_s)``, or each of the `groups` heads' from `first` on: each head's
     dots by the tensor cores in the inputs' dtype, summed in float32. `ranked`
-    stores their ranking keys (`_ranks`) instead."""
+    stores their ranking keys (`_ranks`) instead, and `best` the best a query sees
+    of the tile's keys, a block of MSA's (`_best`)."""
     part_t, part_s = tl.program_id(0), tl.program_id(1)
     t = part_t * block_t + tl.arange(0, block_t)
     s = part_s * block_s + tl.arange(0, block_s)
@@ -228,21 +231,44 @@ def _prompt_scores_kernel(
         w = tl.load(w_ptr + t * stride_wt + j, mask=on_t, other=0.0).to(tl.float32)
         if groups:  # each of this rank's groups by its own head
             if (j >= first) & (j < first + groups):
-                at = out_ptr + t[:, None] * stride_ot + (j - first) * stride_og
+                at = out_ptr + t * stride_ot + (j - first) * stride_og
                 mine = dots * w[:, None]
-                if ranked:
-                    mine = _ranks(mine, pos_ptr, t, s, on_t, window)
-                tl.store(at + s[None, :], mine, mask=on_t[:, None] & on_s[None, :])
+                if best:
+                    top = _best(mine, pos_ptr, t, s, on_t, on_s, window)
+                    tl.store(at + part_s, top, mask=on_t)
+                else:
+                    if ranked:
+                        mine = _ranks(mine, pos_ptr, t, s, on_t, window)
+                    keep = on_t[:, None] & on_s[None, :]
+                    tl.store(at[:, None] + s[None, :], mine, mask=keep)
         else:
             acc += dots * w[:, None]
     if not groups:
-        if ranked:
-            acc = _ranks(acc, pos_ptr, t, s, on_t, window)
-        tl.store(
-            out_ptr + t[:, None] * stride_ot + s[None, :],
-            acc,
-            mask=on_t[:, None] & on_s[None, :],
-        )
+        at = out_ptr + t * stride_ot
+        if best:
+            top = _best(acc, pos_ptr, t, s, on_t, on_s, window)
+            tl.store(at + part_s, top, mask=on_t)
+        else:
+            if ranked:
+                acc = _ranks(acc, pos_ptr, t, s, on_t, window)
+            keep = on_t[:, None] & on_s[None, :]
+            tl.store(at[:, None] + s[None, :], acc, mask=keep)
+
+
+@triton.jit
+def _seen(pos_ptr, t, s, on_t, window):
+    """Which keys of a tile each query sees: those up to it, and in its `window`
+    (none below 0)."""
+    p = tl.load(pos_ptr + t, mask=on_t, other=0)[:, None]
+    seen = s[None, :] <= p
+    return seen & ((window < 0) | (p - s[None, :] < window))
+
+
+@triton.jit
+def _best(score, pos_ptr, t, s, on_t, on_s, window):
+    """Each query's best score of the tile's keys it sees, -inf for none."""
+    seen = _seen(pos_ptr, t, s, on_t, window) & on_s[None, :]
+    return tl.max(tl.where(seen, score, float("-inf")), axis=1)
 
 
 @triton.jit
@@ -253,10 +279,7 @@ def _ranks(score, pos_ptr, t, s, on_t, window):
     u = score.to(tl.int32, bitcast=True).to(tl.int64) & 0xFFFFFFFF
     order = tl.where((u >> 31) == 1, ~u & 0xFFFFFFFF, u | 0x80000000)
     key = (order << 31) | (0x7FFFFFFF - s[None, :].to(tl.int64))
-    p = tl.load(pos_ptr + t, mask=on_t, other=0)[:, None]
-    seen = s[None, :] <= p
-    seen = seen & ((window < 0) | (p - s[None, :] < window))
-    return tl.where(seen, key, -1)
+    return tl.where(_seen(pos_ptr, t, s, on_t, window), key, -1)
 
 
 def prompt_scores(
@@ -268,10 +291,13 @@ def prompt_scores(
     relu: bool,
     groups: tuple[int, int] | None = None,
     seen: tuple[torch.Tensor, int | None] | None = None,
+    best: int = 0,
 ) -> torch.Tensor:
     """`scores` of one request's queries, which share its keys: tiles of queries by
     tiles of keys, each key read once a tile of queries; or, with `seen`, their
-    ranking keys, as `bux_vllm.picks.top` ranks them, in int64.
+    ranking keys, as `bux_vllm.picks.top` ranks them, in int64, or with `best` too
+    the best score each query sees of each block of `best` keys (MSA's, `BLOCKS`),
+    -inf for none, in float32.
 
     Args:
         q: The indexer's queries, (Q, H, i), the last axis contiguous.
@@ -285,13 +311,16 @@ def prompt_scores(
             for all heads' scores summed.
         seen: The queries' positions, (Q,), and the layer's window (None for
             none), by which a query sees a key: to rank, -1 for a key it does not.
+        best: The keys of MSA's blocks, to find each block's best score a query
+            sees (with `seen`); 0 for none.
     """
     first, count = groups or (0, 0)
-    shape = (q.shape[0], count, n) if groups else (q.shape[0], n)
-    dtype = torch.float32 if seen is None else torch.int64
+    block_t, block_s = 64, best or 64
+    columns = triton.cdiv(n, block_s) if best else n
+    shape = (q.shape[0], count, columns) if groups else (q.shape[0], columns)
+    dtype = torch.int64 if seen is not None and not best else torch.float32
     out = torch.empty(shape, dtype=dtype, device=q.device)
     positions, window = seen if seen is not None else (rows, None)
-    block_t = block_s = 64
     pages = cache.cache
     grid = (triton.cdiv(q.shape[0], block_t), triton.cdiv(n, block_s))
     _prompt_scores_kernel[grid](
@@ -321,6 +350,7 @@ def prompt_scores(
         relu=relu,
         groups=count,
         ranked=seen is not None,
+        best=bool(best),
         block_t=block_t,
         block_i=_block(q.shape[2]),
         block_s=block_s,
@@ -545,11 +575,14 @@ def _choose(
     positions, table, n = where
     groups = spec.groups if spec.per_group else None
     one = table.shape[0] == 1
-    if one and spec.block_size == 1:  # DSA's, ranked in the kernel
-        at = (positions.contiguous(), spec.window)
+    at, size = (positions.contiguous(), spec.window), spec.block_size
+    if one and size == 1:  # DSA's, ranked in the kernel
         ranks = prompt_scores(*index, cache, table, n, spec.relu, groups, at)
         return picks.best_of(ranks, spec.top_k)
     see = picks.seen(positions, n, spec.window)
+    if one and not spec.mean and size in BLOCKS:  # MSA's blocks' best, by the kernel
+        best = prompt_scores(*index, cache, table, n, spec.relu, groups, at, size)
+        return picks.blocks_of_best(best, see, positions, size, spec.top_k)
     if spec.mean:
         if keys is None:
             span = torch.arange(n, device=positions.device)

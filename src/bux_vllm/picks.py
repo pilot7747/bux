@@ -122,8 +122,20 @@ def best_blocks(
     masked = s.masked_fill(~view, -torch.inf)
     masked = F.pad(masked, (0, count * size - n), value=-torch.inf)
     best = masked.unflatten(-1, (count, size)).amax(-1)
-    own = F.one_hot(positions // size, count).bool()
-    best = best.masked_fill(own if s.ndim == 2 else own[:, None], torch.inf)
+    return blocks_of_best(best, see, positions, size, top_k)
+
+
+def blocks_of_best(
+    best: torch.Tensor,
+    see: torch.Tensor,
+    positions: torch.Tensor,
+    size: int,
+    top_k: int,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """`best_blocks`' picks from each block's best score a query sees, (Q, [G,]
+    blocks), -inf for a block it sees none of."""
+    own = F.one_hot(positions // size, best.shape[-1]).bool()
+    best = best.masked_fill(own if best.ndim == 2 else own[:, None], torch.inf)
     blocks, ok = top(best, best > -torch.inf, top_k // size)
     return block_keys(blocks, ok, size, see)
 
