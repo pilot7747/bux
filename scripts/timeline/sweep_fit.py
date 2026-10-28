@@ -255,7 +255,9 @@ def _row(family: str, ws: dict[int, Width], e: dict, a: dict) -> str:
     via = f" via {e['via']}" if "via" in e else ""
     if "by_gpus" in e:
         via += f" (across {'/'.join(e['by_gpus'])} GPUs: a step)"
-    if "N_active" in e:
+    if e.get("kernel_limited"):
+        got = f"kernel-limited ({e['reason']}); the model's target used"
+    elif "N_active" in e:
         tp = f", {e['tp']} GPUs" if e["tp"] > 1 else ""
         flag = (
             "" if e["interpolation"] == "interpolated" else f" ({e['interpolation']})"
@@ -266,7 +268,7 @@ def _row(family: str, ws: dict[int, Width], e: dict, a: dict) -> str:
     ana = f"{a['d_model']:.0f}, {_si(a['active'])}" if "active" in a else "-"
     ratio = (
         f"{e['N_active'] / a['active']:.2f}"
-        if "N_active" in e and "active" in a
+        if "N_active" in e and "active" in a and not e.get("kernel_limited")
         else "-"
     )
     return f"| {family} | {'; '.join(cells)} | {got} | {ana} | {ratio} |"
@@ -279,15 +281,17 @@ def _si(n: float) -> str:
     return f"{n:.3g}"
 
 
-def analytic_matches(path: Path | None) -> dict[str, dict]:
+def analytic_matches(path: Path) -> dict[str, dict]:
     """The model's matches by family: a fit's ``fit.json`` (its targets), or
     serving.py table's ``serving-table.json`` (its B1b matches)."""
-    if path is None:
-        return {}
     raw = json.loads(path.read_text())
     if "targets" in raw:
         return {
-            f: {"d_model": t["d_model"], "active": t["n_active"]}
+            f: {
+                "d_model": t["d_model"],
+                "active": t["n_active"],
+                "params": t["n_total"],
+            }
             for f, t in raw["targets"].items()
             if t.get("d_model")
         }
@@ -301,12 +305,55 @@ def analytic_matches(path: Path | None) -> dict[str, dict]:
     return out
 
 
+def as_trained(entry: dict, base: dict[int, Width]) -> dict:
+    """A variant served with other dims than the family trains (`base`): its
+    match's width in the trained family's parameters, log-log in d_model between
+    the base's two nearest widths."""
+    if "d_model" not in entry or len(base) < 2:
+        return entry
+    d = entry["d_model"]
+    ws = sorted(base.values(), key=lambda w: abs(math.log(w.d_model / d)))[:2]
+    lo, hi = sorted(ws, key=lambda w: w.d_model)
+    t = math.log(d / lo.d_model) / math.log(hi.d_model / lo.d_model)
+    trained = {
+        "N_active": _lerp(lo.active, hi.active, t),
+        "N_total": _lerp(lo.params, hi.params, t),
+    }
+    return entry | {"as_trained": trained}
+
+
+def kernel_limited(entry: dict, model: dict | None, reason: str) -> dict:
+    """A family whose timing measures today's plugin rather than its architecture
+    (`reason`): the model's target in its place (``analytic``, and at the top for
+    the fit), the measurement kept beside it as an upper bound of its cost."""
+    out: dict = {"measured": False, "kernel_limited": True, "reason": reason}
+    if model is not None:
+        analytic = {"N_active": model["active"], "N_total": model["params"]}
+        analytic["d_model"] = model["d_model"]
+        out |= analytic | {"analytic": analytic}
+    kept = (
+        "N_active",
+        "N_total",
+        "d_model",
+        "tp",
+        "interpolation",
+        "sessions_per_hour",
+    )
+    out["as_timed"] = {k: entry[k] for k in kept if k in entry}
+    return out
+
+
 def main() -> None:
     a = parser().parse_args()
     fams = widths(read(a.sweeps), a.slo)
     likes = dict(x.split("=", 1) for x in a.like)
     out = targets(fams, likes)
-    analytic = analytic_matches(a.analytic)
+    analytic = {f: m for path in a.analytic for f, m in analytic_matches(path).items()}
+    for variant, base in (x.split("=", 1) for x in a.trained_as):
+        if variant in out and base in fams:
+            out[variant] = as_trained(out[variant], fams[base])
+    for family, reason in (x.split("=", 1) for x in a.kernel_limited):
+        out[family] = kernel_limited(out.get(family, {}), analytic.get(family), reason)
     a.out.write_text(json.dumps(out, indent=1) + "\n")
     if a.markdown:
         a.markdown.write_text(markdown(fams, out, analytic, a.slo))
@@ -318,7 +365,13 @@ def parser() -> argparse.ArgumentParser:
     p.add_argument("sweeps", nargs="+", type=Path, help="sweep.jsonl files")
     p.add_argument("--out", type=Path, default=Path("targets-measured.json"))
     p.add_argument("--markdown", type=Path, help="where the table goes")
-    p.add_argument("--analytic", type=Path, help="a fit.json, or serving-table.json")
+    p.add_argument(
+        "--analytic",
+        type=Path,
+        action="append",
+        default=[],
+        help="a fit.json, or serving-table.json; several, the later's matches first",
+    )
     p.add_argument("--slo", type=float, default=30.0, help="p50 TPOT limit, ms")
     p.add_argument(
         "--like",
@@ -326,6 +379,20 @@ def parser() -> argparse.ArgumentParser:
         default=[],
         metavar="FAMILY=REFERENCE",
         help="a family timed at one width, with REFERENCE's serving shape",
+    )
+    p.add_argument(
+        "--trained-as",
+        action="append",
+        default=[],
+        metavar="VARIANT=FAMILY",
+        help="a variant served with other dims: its match in FAMILY's parameters",
+    )
+    p.add_argument(
+        "--kernel-limited",
+        action="append",
+        default=[],
+        metavar="FAMILY=REASON",
+        help="a family whose timing measures today's plugin: the model's target",
     )
     return p
 

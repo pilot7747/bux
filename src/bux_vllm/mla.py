@@ -17,7 +17,15 @@ model to a few dims (DeepSeek's among them), whatever the backend takes: the MLA
 metadata's head size (the latent and the rotated dims), and the prefill backends'
 dims. For other dims, the layer gives vLLM's MLA the decoding backend vLLM picks,
 its metadata checked by that backend's own head sizes (`any_head_size`), and
-FlashAttention's prefill, which takes any dims up to 128 (`prefill_backend`).
+FlashAttention's prefill, which takes any dims up to 128 (`prefill_backend`). A
+prefill that attends to cached context (a prompt's earlier chunks, a cached prefix)
+gathers its latents by vLLM's op, whose kernel takes the same few sizes: for the
+others the plugin gathers them in PyTorch (`extend_gather`, `bux_vllm.latent`).
+
+With an indexer (DeepSeek-V3.2's), or reading another layer's picks through its
+``index`` port, each query attends to the picked keys alone, in the latent space,
+by the plugin's sparse attention ops over caches of its own (`bux_vllm.sparse`):
+the same latent and shared key dims a token, beside the indexer's keys.
 """
 
 from __future__ import annotations
@@ -27,6 +35,7 @@ from typing import Any
 
 import torch
 from torch import nn
+from vllm import _custom_ops as ops
 from vllm.distributed import get_tensor_model_parallel_world_size
 from vllm.model_executor.layers.attention import MLAAttention
 from vllm.model_executor.layers.attention.mla_attention import MLACommonBackend
@@ -41,8 +50,12 @@ from vllm.v1.attention.backends.mla.prefill.flash_attn import FlashAttnPrefillBa
 from vllm.v1.attention.backends.mla.prefill.selector import get_mla_prefill_backend
 from vllm.v1.attention.selector import get_attn_backend
 
+from . import kv, latent, picks, sparse
+from .attention import sink_logits
 from .common import ACTIVATIONS, Ctx, Layer, Norm, Rope, Site, logit_gain, unsupported
-from .config import LATENT
+from .config import LATENT, states
+from .config import sparse as is_sparse
+from .indexer import Indexer, rotated
 
 #: The norm of MLA's latents: bux's default ``rmsnorm``.
 LATENT_NORM = {
@@ -56,19 +69,25 @@ LATENT_NORM = {
 
 
 def check(c: dict, site: Site) -> None:
-    """Raise for what vLLM's MLA does not run, or the model's config does not say.
+    """Raise for what vLLM's MLA, or the plugin's sparse attention in the latent
+    space, does not run, or the model's config does not say.
 
     Raises:
         NotImplementedError: A setting that needs the keys projected up while
-            decoding (QK-norm), or that vLLM's MLA backends do not take (a window,
-            soft-capping, sinks, a relative bias, a length scale, an indexer, the
-            gate's head bias, ports); dims other than the config's; a dtype other
-            than bfloat16 or float16; or vLLM not running the model as MLA.
+            decoding (QK-norm), or that neither takes (a relative bias, a length
+            scale, the gate's head bias, ports but a sparse layer's ``index``);
+            for vLLM's MLA, a window, soft-capping or sinks, dims other than the
+            config's, a dtype other than bfloat16 or float16, or vLLM not running
+            the model as MLA.
     """
-    unsupported(c, "qk_norm", "sliding_window_size", "softcap", "sinks")
-    unsupported(c, "relative_bias", "log_scale", "indexer", "gate_head_bias")
-    if site.ports:
-        raise NotImplementedError("mla: ports not in vLLM yet")
+    unsupported(c, "qk_norm", "relative_bias", "log_scale", "gate_head_bias")
+    sparse_ = is_sparse(c, site.ports)
+    names = {name for name, _, _ in site.ports} - ({"index"} if sparse_ else set())
+    if names:
+        raise NotImplementedError(f"mla: the {', '.join(sorted(names))} port")
+    if sparse_:
+        return
+    unsupported(c, "sliding_window_size", "softcap", "sinks")
     if any(c[n] != getattr(site.config, n, None) for n in LATENT):
         raise NotImplementedError("mla: dims other than the config's not in vLLM")
     model = site.vllm_config.model_config
@@ -114,6 +133,8 @@ def any_head_size(backend: Any) -> Any:
     than by every MLA backend's few (``MLACommonMetadata``'s check): vLLM's own
     subclass of a backend with a builder of its own, as for chunked attention."""
 
+    extend_gather()
+
     class Builder(backend.get_builder_cls()):
         def __init__(self, *args: Any, **kwargs: Any):
             super().__init__(*args, **kwargs)
@@ -134,13 +155,33 @@ def checked_by(metadata: type, backend: Any) -> type:
     return type(metadata.__name__, (metadata,), {"__post_init__": check})
 
 
+def extend_gather() -> None:
+    """Make vLLM's ``gather_and_maybe_dequant_cache``, which every MLA prefill with
+    cached context calls (and DCP's, and sparse MLA's), take a cache of any size:
+    its kernel for `latent.KERNEL_SIZES`, `latent.gather` for the others."""
+    kernel = ops.gather_and_maybe_dequant_cache
+    if kernel.__module__ == __name__:
+        return
+
+    def gather(
+        src_cache: torch.Tensor, dst: torch.Tensor, *args: Any, **kw: Any
+    ) -> None:
+        if src_cache.shape[-1] in latent.KERNEL_SIZES:
+            kernel(src_cache, dst, *args, **kw)
+        else:
+            latent.gather(src_cache, dst, *args, **kw)
+
+    ops.gather_and_maybe_dequant_cache = gather
+
+
 class LatentAttention(Layer):
     """bux's ``mla``: queries from the input or a normalized latent, keys and values
     from a normalized latent, by vLLM's MLA attention and its latent cache, then
     each head's output norm and gate, and the row-parallel output projection.
 
     The heads split over tensor-parallel ranks; the latents are every rank's. Each
-    call keeps a cache of its own, over the same weights.
+    call keeps a cache of its own, over the same weights. A sparse layer (an
+    indexer, or the ``index`` port) attends by the plugin's ops instead (`_sparse`).
     """
 
     bux_types = ("mla",)
@@ -174,7 +215,13 @@ class LatentAttention(Layer):
         self.rope = Rope(c["rope"], r) if c["rope"] else None
         self._gate(c, width, h * dv, site.path)
         self.out_norm = Norm(c["output_norm"], dv) if c["output_norm"] else None
-        self.caches = nn.ModuleList(self._cache(c, name, site) for name in site.caches)
+        self.scale = (c["scale"] or (n + r) ** -0.5) * logit_gain(c["rope"])
+        self.sinks = sink_logits(self.h) if c["sinks"] else None
+        self.ports, self.spec, self.indexer = site.ports, None, None
+        if is_sparse(c, site.ports):
+            self._sparse_caches(c, width, site)
+        else:
+            self.caches = nn.ModuleList(self._cache(name, site) for name in site.caches)
 
     def _down(self, width: int, path: str) -> None:
         """Make the down projections, every rank's: the query latent's and the key
@@ -206,12 +253,11 @@ class LatentAttention(Layer):
                 width, n, bias=False, return_bias=False, prefix=f"{path}.gate"
             )
 
-    def _cache(self, c: dict, name: str, site: Site) -> MLAAttention:
+    def _cache(self, name: str, site: Site) -> MLAAttention:
         """vLLM's MLA attention of one call, its latent cache named `name`."""
-        scale = (c["scale"] or (self.n + self.r) ** -0.5) * logit_gain(c["rope"])
         return MLAAttention(
             num_heads=self.h,
-            scale=scale,
+            scale=self.scale,
             qk_nope_head_dim=self.n,
             qk_rope_head_dim=self.r,
             v_head_dim=self.dv,
@@ -224,6 +270,27 @@ class LatentAttention(Layer):
                 self.rank + self.r, self.h, site.vllm_config.cache_config
             ),
             prefill_backend_cls=prefill_backend(site.vllm_config),
+        )
+
+    def _sparse_caches(self, c: dict, width: int, site: Site) -> None:
+        """Make the indexer, and each call's caches of its latents (one head of
+        ``kv_lora_rank + qk_rope_head_dim`` a token, as vLLM's MLA keeps them) and of
+        the indexer's keys, which the sparse attention ops read: the latents alone
+        for a layer that reads its ``index`` port."""
+        kinds = states(c, site.ports)  # a call's states, side by side in site.caches
+        names = {kind: site.caches[i :: len(kinds)] for i, kind in enumerate(kinds)}
+        ix = None if kv.reads(site.ports, "index") else c["indexer"]
+        if ix is not None:
+            unsupported(ix, "per_group")  # its groups are kv heads, which MLA's are not
+            dims = rotated(self.r, c["rope"])
+            self.indexer = Indexer(ix, width, c["rope"], dims, self.latent or width)
+        settings = (c["sliding_window_size"], self.scale, c["softcap"], self.sinks)
+        dims = self.rank + self.r
+        self.spec = picks.layer_spec(
+            ix, self.indexer, settings, dims, (0, 1), self.rank
+        )
+        self.caches, self.index_caches = sparse.layer_caches(
+            self.spec, 1, dims, ix["head_dim"] if ix else 0, names, site.vllm_config
         )
 
     def targets(self) -> dict[str, tuple[nn.Parameter, tuple]]:
@@ -239,6 +306,11 @@ class LatentAttention(Layer):
         for name in ("q_a_norm", "kv_a_norm", "out_norm"):
             if (norm := getattr(self, name)) is not None:
                 out |= {f"{name}.{k}": v for k, v in norm.targets().items()}
+        if self.sinks is not None:
+            out["sinks"] = (self.sinks, ())
+        if self.indexer is not None:
+            params = self.indexer.named_parameters()
+            out |= {f"indexer.{name}": (p, ()) for name, p in params}
         return out
 
     def forward(self, x: torch.Tensor, ctx: Ctx) -> torch.Tensor:
@@ -247,10 +319,42 @@ class LatentAttention(Layer):
         kv_c, k_pe = kv.split([self.rank, self.r], -1)
         q = self.q(query).view(t, self.h, self.n + self.r)
         q, k_pe = self._rotate(q, k_pe[:, None], ctx)
-        attend = self.caches[ctx.call(self.path)]
-        out = attend(q, self.kv_a_norm(kv_c), k_pe, output_shape=(t, self.h * self.dv))
+        call, latent = ctx.call(self.path), self.kv_a_norm(kv_c)
+        if self.spec is not None:
+            keys = torch.cat([latent, k_pe[:, 0]], -1)[:, None]  # one head of both
+            out = self._sparse(x, query, q, keys, call, ctx)
+        else:
+            shape = (t, self.h * self.dv)
+            out = self.caches[call](q, latent, k_pe, output_shape=shape)
         out = self._gated(x, out.view(t, self.h, self.dv))
         return self.o(out.reshape(t, -1))
+
+    def _sparse(
+        self,
+        x: torch.Tensor,
+        query: torch.Tensor,
+        q: torch.Tensor,
+        keys: torch.Tensor,
+        call: int,
+        ctx: Ctx,
+    ) -> torch.Tensor:
+        """The heads' outputs, (T, h, dv), of attending in the latent space to the
+        keys the indexer picks (or the ``index`` port's), `keys` the step's latents
+        with their shared rotated dims, (T, 1, kv_lora_rank + r): each head's
+        queries absorb its key projection (``kv_b``'s first ``qk_nope_head_dim``
+        rows of it), and its value projection takes the latents they weigh, in
+        float32, as DeepSeek's MLA decodes."""
+        t, w = q.shape[0], self.kv_b.weight
+        queries = picks.absorbed(q, w, self.n)
+        index = None
+        if self.indexer is not None:
+            at, ix = ctx.positions, self.indexer
+            index = (ix.queries(query, at), ix.head_weights(x), ix.keys(x, at))
+        out = queries.new_empty(t, self.h, self.rank)
+        values = keys.new_empty(t, 1, 0)  # the latents are the values too
+        tensors = (queries, keys, values)
+        sparse.attend(tensors, index, out, self.caches[call], self.ports, ctx)
+        return picks.projected(out, w, self.n).to(x.dtype)
 
     def _latents(self, x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
         """What the queries come from (the normalized query latent, or x), and the

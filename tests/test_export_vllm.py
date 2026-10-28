@@ -7,6 +7,7 @@ scripts/vllm_parity.py checks it."""
 
 import ast
 import importlib.util
+import itertools
 import json
 import math
 from pathlib import Path
@@ -32,6 +33,7 @@ from bux.export import plan as core
 from bux.export.hf import common as hf_common
 from bux.export.hf import engram as hf_engram
 from bux.export.hf import linear_attention as hf_linear
+from bux.export.hf import moe as hf_moe
 from bux.export.hf import residual as hf_residual
 from bux.export.hf import rwkv7 as hf_rwkv7
 from bux.export.huggingface import save
@@ -44,6 +46,7 @@ from bux_vllm import (
     dplr,
     feeds,
     kv,
+    latent,
     linear,
     ngram,
     plan,
@@ -145,6 +148,15 @@ def test_a_sparse_layer_keeps_its_indexer_keys_beside_its_kv_cache() -> None:
     assert c.layer_types == ["full_attention"] * 2
 
 
+def test_a_layer_that_reads_another_s_picks_keeps_no_indexer_keys() -> None:
+    """The index port's readers attend over the writer's picks and their own keys."""
+    arch = compile(vllm_parity.CASES["dsa-share"])
+    calls = plan.plan(arch.model_dump(mode="json")).calls
+    layers = [c.layer for c in calls if c.layer["config"]["type"] == "gqa"]
+    kept = [config.states(n["config"], plan.ports(n)) for n in layers]
+    assert kept == [["full_attention", "index"]] + [["full_attention"]] * 2
+
+
 def test_a_conv_on_keys_and_values_keeps_a_state_beside_the_kv_cache() -> None:
     arch = compile(vllm_parity.CASES["kv-conv"])
     c = config.BuxConfig(bux=json.loads(arch.model_dump_json()))
@@ -180,6 +192,59 @@ def test_the_config_gives_vllm_the_latent_of_mla() -> None:
     assert config.latent(c)
     assert config.latent(bux_config(vllm_parity.CASES["mla-deepseek"]))
     assert not config.latent(bux_config(vllm_parity.CASES["llama"]))
+
+
+def test_a_model_of_sparse_mla_alone_is_no_mla_model_for_vllm() -> None:
+    """Sparse MLA keeps its latents in caches of the plugin's own, one head each,
+    so vLLM runs no MLA; beside MLA that vLLM runs, it raises as other attention."""
+    c = bux_config(vllm_parity.CASES["mla-share"])
+    assert not config.latent(c)
+    assert (c.num_attention_heads, c.num_key_value_heads, c.head_dim) == (4, 1, 80)
+    assert c.layer_types == ["full_attention"] * 3
+    source = (
+        vllm_parity.HEAD
+        + vllm_parity.LATENT
+        + "other = attn(indexer=indexer(num_heads=2, head_dim=16, top_k=8))\n"
+        + "model = embed [rmsnorm attn] [rmsnorm other] rmsnorm head"
+    )
+    with pytest.raises(NotImplementedError, match="model-wide"):
+        bux_config(source)
+
+
+def naive_gather(cache, table, lens, starts) -> torch.Tensor:
+    """Each request's cached context, token by token, from its blocks."""
+    size, rows = cache.shape[1], []
+    for r, (n, start) in enumerate(zip(lens, starts, strict=True)):
+        for t in range(start, start + n):
+            rows.append(cache[table[r, t // size], t % size])
+    return torch.stack(rows)
+
+
+@pytest.mark.parametrize("dtype", ["auto", "fp8"])
+def test_the_latent_context_gathers_as_vllms_kernel(dtype: str) -> None:
+    """bux_vllm.latent gathers a chunk's cached latents as vLLM's kernel does for
+    the sizes it takes: from each request's blocks, from where the chunk starts in
+    its context (here also off a block's start), from a cache of padded pages, an
+    fp8 cache's times its scale."""
+    torch.manual_seed(0)
+    padded = torch.randn(10, 4, 288 + 32)  # pages padded, as hybrids' are
+    cache = padded[..., :288]
+    if dtype == "fp8":
+        cache = cache.to(torch.float8_e4m3fn)
+    table = torch.tensor([[3, 7, 1, 0], [9, 2, 5, 8], [4, 6, 0, 0]], dtype=torch.int32)
+    lens, starts = [6, 9, 2], [0, 5, 4]
+    cu = torch.tensor([0, 6, 15, 17], dtype=torch.int32)
+    to_seq = torch.repeat_interleave(
+        torch.arange(3, dtype=torch.int32), torch.tensor(lens)
+    )
+    dst = torch.zeros(20, 288)
+    scale = torch.tensor(0.5)
+    seq_starts = torch.tensor(starts, dtype=torch.int32)
+    latent.gather(cache, dst, table, cu, to_seq, 17, dtype, scale, seq_starts)
+    want = naive_gather(cache, table, lens, starts).float()
+    want = want * 0.5 if dtype == "fp8" else want
+    torch.testing.assert_close(dst[:17], want)
+    assert not dst[17:].any()
 
 
 MIXED = {
@@ -311,6 +376,50 @@ def test_experts_load_alike_from_bux_and_transformers(gated: bool) -> None:
         assert [s for s, _ in a] == [s for s, _ in b]
         for (_, x), (_, y) in zip(a, b, strict=True):
             torch.testing.assert_close(x, y)
+
+
+EXPERT_NORMS = {
+    "rmsnorm": "rmsnorm",
+    "rescale": "rmsnorm(eps=1e-8, zero_centered=true, scale_input=true)",
+    "layernorm": "layernorm(bias=true)",
+}
+
+
+@pytest.mark.parametrize("norm", EXPERT_NORMS.values(), ids=EXPERT_NORMS.keys())
+def test_experts_normalized_apart_compute_what_the_export_does(norm: str) -> None:
+    """Under expert_norm each of a token's picks runs through its expert as a row
+    of its own, as vLLM's fused MoE of one pick a row runs it (`pick_rows`), then
+    the norm and the weights: the export's experts' output."""
+    arch = compile(
+        "d_model = 16\ne = gated_mlp(intermediate_size=8, activation=swish)\n"
+        f"model = moe(num_experts=4, top_k=2, expert=e, expert_norm={norm})"
+    )
+    c = next(arch.layers()).config.model_dump(mode="json")
+    torch.manual_seed(0)
+    args = (SimpleNamespace(), c["expert"], 4, 16)
+    theirs = hf_moe.Experts(*args, c["expert_norm"]).configure()
+    bare = hf_moe.Experts(*args, None).configure()  # the experts, unnormalized
+    for name in ("gate_up_proj", "down_proj"):
+        param = getattr(theirs, name)
+        param.data = torch.randn(param.shape) / 2
+    bare.load_state_dict(theirs.state_dict(), strict=False)
+    mine = common.Norm(c["expert_norm"], 16)
+    assert theirs.post_expert_norm is not None
+    twins(theirs.post_expert_norm, mine)
+    z, weights = torch.randn(6, 16), torch.rand(6, 2)
+    idx = torch.stack([torch.randperm(4)[:2] for _ in range(6)])
+
+    def fused(rows: torch.Tensor, logits: torch.Tensor) -> torch.Tensor:
+        _, ids = routing.pick_rows(rows, logits, 1, False)
+        return torch.cat(
+            [bare.expert(r[None], int(e)) for r, e in zip(rows, ids[:, 0])]
+        )
+
+    got = routing.apart(fused, mine, z, weights, idx, 4)
+    want = torch.zeros(6, 16)
+    for t, j in itertools.product(range(6), range(2)):
+        want[t] += weights[t, j] * theirs.expert(z[t : t + 1], int(idx[t, j]))[0]
+    torch.testing.assert_close(got, want)
 
 
 HEAD = "d_model = 16\nvocab_size = 64\n"
@@ -493,9 +602,50 @@ def test_ports_are_read_and_written_as_bux_lists_them() -> None:
     assert kv.reads(ports, "v") == ("v1", True)
     assert kv.reads([["v", "v1", "write"]], "v") is None
     assert kv.writes(ports, "v") == ["v2", "v3"]
-    kv.check_ports(ports)
-    with pytest.raises(NotImplementedError, match="kv port"):
-        kv.check_ports([["kv", "kv", "write"]])
+    gqa = {"indexer": None}
+    kv.check_ports(gqa, ports)
+    kv.check_ports(gqa, [["kv", "kv", "write"], ["v", "v1", "write"]])
+    kv.check_ports(gqa, [["kv", "kv", "write"], ["index", "topk", "read"]])
+    for other in (["v", "v1", "write"], ["index", "topk", "read"]):
+        with pytest.raises(NotImplementedError, match="beside reading kv"):
+            kv.check_ports(gqa, [["kv", "kv", "read"], other])
+
+
+def test_kv_readers_attend_to_the_cache_of_the_call_their_tap_holds() -> None:
+    """Hymba's wiring: each call that reads the kv port shares the KV cache of the
+    call whose push its tap holds, the last one; ``$kv!`` takes it off, and a
+    reader that writes the port pushes its writer's on."""
+    arch = compile(vllm_parity.CASES["kv-share"])
+    calls = plan.plan(arch.model_dump(mode="json")).calls
+    gqa = [i for i, c in enumerate(calls) if c.layer["config"]["type"] == "gqa"]
+    sources = kv.sources([plan.ports(c.layer) for c in calls])
+    _, w1, s1, _, w2, _, g, r = gqa
+    assert [sources[i] for i in gqa] == [None, None, w1, w1, None, w2, None, g]
+    for reader, writer in [(s1, w1), (r, g)]:
+        node, mine = calls[writer].layer, calls[reader].layer
+        kv.check_shared(mine["config"], node["config"], node["width"])
+        assert config.states(mine["config"], plan.ports(mine)) == ["full_attention"]
+
+
+KV_REFUSED = {
+    "a longer window": ("sliding_window_size=16", "window of 16 over 8"),
+    "no window": ("sliding_window_size=none", "window of None over 8"),
+    "other heads": ("num_kv_heads=4", "heads"),
+}
+
+
+@pytest.mark.parametrize(("setting", "match"), KV_REFUSED.values(), ids=KV_REFUSED)
+def test_kv_readers_that_vllm_cannot_share_with_say_so(
+    setting: str, match: str
+) -> None:
+    """A reader that attends past the writer's window, or reads other heads."""
+    arch = compile(
+        "d_model = 64\nlocal = gqa(num_heads=4, num_kv_heads=2, sliding_window_size=8)\n"
+        f"model = local(kv=@kv) local({setting}, kv=$kv)"
+    )
+    writer, mine = (n.config.model_dump(mode="json") for n in arch.layers())
+    with pytest.raises(NotImplementedError, match=match):
+        kv.check_shared(mine, writer, 64)
 
 
 @pytest.mark.parametrize(
@@ -781,11 +931,92 @@ def test_sparse_attention_over_paged_caches_is_bux_s(c: dict, window: int | None
     index = (ours.queries(x, at), ours.head_weights(x))
     qs = q[0].transpose(0, 1)
     caches = (kv_cache, index_cache)
-    together = picks.attend_segment(spec, qs, index, at, caches, (table, table), s)
+    together, picked = picks.attend_segment(
+        spec, qs, index, at, caches, (table, table), s
+    )
     rows = table.expand(s, -1)
-    alone = picks.attend_segment(spec, qs, index, at, caches, (rows, rows), s)
+    alone, _ = picks.attend_segment(spec, qs, index, at, caches, (rows, rows), s)
     torch.testing.assert_close(together, want, rtol=1e-5, atol=1e-5)
     torch.testing.assert_close(alone, want, rtol=1e-5, atol=1e-5)
+    # A layer that reads these picks (the index port), with a window of its own.
+    q2, k2, v2 = (torch.randn(1, n, s, dk) for n in (h, g, g))
+    reader_see = picks.seen(at, s, 3)
+    keep = reader_see[None, None] & hf_attention.per_head(kept, h)
+    want = hf_attention.softmax_attention(q2, k2, v2, keep, 0.3, None, None)[0]
+    picks.write(kv_cache, slots, torch.cat([k2[0], v2[0]], -1).transpose(0, 1))
+    reader = picks.Sparse(0, 1, False, False, False, 3, 0.3, None, dk, (0, g))
+    for r in (table, rows):
+        got = picks.attend_picked(
+            reader, q2[0].transpose(0, 1), picked, at, kv_cache, r, s
+        )
+        torch.testing.assert_close(got, want, rtol=1e-5, atol=1e-5)
+
+
+@pytest.mark.parametrize("window", [None, 5], ids=["causal", "window"])
+@pytest.mark.parametrize(
+    "name", [k for k, c in INDEXERS.items() if not c.get("per_group")]
+)
+def test_sparse_attention_in_the_latent_space_is_bux_s(name: str, window: int | None):
+    """MLA's sparse attention as the plugin computes it, over paged latents, each
+    head's queries absorbing its key projection (bux_vllm.picks.absorbed), gives
+    what the export's indexer (its queries from the query latent) and softmax give
+    over the keys and values projected up; and so does a layer that reads its picks
+    and attends over latents of its own, by a window of its own."""
+    from bux.export.hf import attention as hf_attention
+    from bux.export.hf import sparse as hf_sparse
+    from bux_vllm import indexer as plugin_indexer
+    from bux_vllm import picks
+
+    torch.manual_seed(0)
+    ix = cfg.SparseIndexerConfig.model_validate(INDEXERS[name]).model_dump(mode="json")
+    rope = cfg.RoPEConfig().model_dump(mode="json")
+    width, latent, s, h, n, r, dv, rank = 16, 12, 23, 4, 8, 4, 8, 10
+    theirs = hf_sparse.Indexer(ix, width, latent, rope, r)
+    for p in theirs.parameters():
+        p.data.normal_()
+    ours = plugin_indexer.Indexer(ix, width, rope, r, latent)
+    ours.load_state_dict(theirs.state_dict())
+    x, query, at = torch.randn(s, width), torch.randn(s, latent), torch.arange(s)
+    see = picks.seen(at, s, window)
+    keys = theirs.keys(x[None], at[None])
+    kept, _ = theirs(x[None], query[None], at[None], keys, see[None], at[None])
+    kv_b = torch.randn(h * (n + dv), rank) / rank**0.5
+    sinks = torch.randn(h)
+    block, blocks = 4, 9
+    table = torch.randperm(blocks)[None]
+    slots = table[0, at // block] * block + at % block
+    index_cache = torch.zeros(blocks, 1, block, ix["head_dim"])
+    picks.write(index_cache, slots, ours.keys(x, at)[:, None])
+
+    def mla(
+        window: int | None, softcap: float | None = None, sinks: Any = None
+    ) -> tuple[Any, ...]:
+        """Random latents in a paged cache, queries, and the export's output."""
+        c, k_pe, q = torch.randn(s, rank), torch.randn(s, r), torch.randn(s, h, n + r)
+        up = (c @ kv_b.T).view(s, h, n + dv)
+        k = torch.cat([up[..., :n], k_pe[:, None].expand(s, h, r)], -1)
+        keep = picks.seen(at, s, window)[None, None] & hf_attention.per_head(kept, h)
+        qh, kh, vh = (t.transpose(0, 1)[None] for t in (q, k, up[..., n:]))
+        want = hf_attention.softmax_attention(qh, kh, vh, keep, 0.3, softcap, sinks)
+        want = want[0]
+        cache = torch.zeros(blocks, 1, block, rank + r)
+        picks.write(cache, slots, torch.cat([c, k_pe], -1)[:, None])
+        return picks.absorbed(q, kv_b, n), cache, want
+
+    queries, cache, want = mla(window, 4.0, sinks)
+    spec = picks.layer_spec(ix, ours, (window, 0.3, 4.0, sinks), rank + r, (0, 1), rank)
+    index = (ours.queries(query, at), ours.head_weights(x))
+    caches, rows = (cache, index_cache), (table, table)
+    out, picked = picks.attend_segment(spec, queries, index, at, caches, rows, s)
+    torch.testing.assert_close(
+        picks.projected(out, kv_b, n), want, rtol=1e-5, atol=1e-5
+    )
+    queries, cache, want = mla(3)
+    reader = picks.layer_spec(None, None, (3, 0.3, None, None), rank + r, (0, 1), rank)
+    out = picks.attend_picked(reader, queries, picked, at, cache, table, s)
+    torch.testing.assert_close(
+        picks.projected(out, kv_b, n), want, rtol=1e-5, atol=1e-5
+    )
 
 
 def test_the_step_splits_into_single_queries_and_requests() -> None:
@@ -909,10 +1140,10 @@ def test_single_queries_of_several_requests_attend_to_their_own_keys() -> None:
     spec = picks.Sparse(4, 1, False, False, True, None, 0.3, None, dk, (0, g))
     q, iq, iw = torch.randn(2, 4, dk), torch.randn(2, 2, i), torch.randn(2, 2)
     caches = (kv_cache, index_cache)
-    both = picks.attend_segment(spec, q, (iq, iw), at, caches, (tables, tables), 17)
+    both, _ = picks.attend_segment(spec, q, (iq, iw), at, caches, (tables, tables), 17)
     for r in range(2):
         rows = (tables[r : r + 1], tables[r : r + 1])
-        alone = picks.attend_segment(
+        alone, _ = picks.attend_segment(
             spec,
             q[r : r + 1],
             (iq[r : r + 1], iw[r : r + 1]),
@@ -1209,6 +1440,31 @@ def test_csa_caches_what_the_serving_model_prices(name: str) -> None:
         assert index[0] * serving.BF16 / index[1] == cache.index
         assert kept[2] is None and index[2] is None and cache.window is None
         assert rows["state"] == (2 * c.head_dim, 1, c.compress_ratio)
+
+
+def test_the_sparse_ops_read_only_what_a_paged_cache_has() -> None:
+    """Every attribute bux_vllm.sparse reads of a cache, ``cache.<name>``, is one a
+    PagedCache sets or defines: vLLM's compiler traces those reads."""
+    tree = ast.parse((FILES[0].parent / "sparse.py").read_text())
+    paged = next(
+        n for n in tree.body if isinstance(n, ast.ClassDef) and n.name == "PagedCache"
+    )
+    has = {n.name for n in paged.body if isinstance(n, ast.FunctionDef)}
+    for node in ast.walk(paged):
+        if isinstance(node, ast.Assign):
+            for target in node.targets:
+                elts = target.elts if isinstance(target, ast.Tuple) else [target]
+                has |= {e.attr for e in elts if isinstance(e, ast.Attribute)}
+    outside = [n for n in tree.body if n is not paged]  # its own reads a config
+    reads = {
+        n.attr
+        for top in outside
+        for n in ast.walk(top)
+        if isinstance(n, ast.Attribute)
+        and isinstance(n.value, ast.Name)
+        and n.value.id == "cache"
+    }
+    assert reads <= has, reads - has
 
 
 def test_each_layer_type_has_one_class() -> None:
