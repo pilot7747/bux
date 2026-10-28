@@ -86,6 +86,7 @@ intersphinx_mapping = {
 
 html_theme = "pydata_sphinx_theme"
 html_title = "bux"
+html_favicon = "_static/logo-mark.svg"
 html_static_path = ["_static"]
 html_css_files = ["bux.css"]
 html_show_sourcelink = False
@@ -96,6 +97,11 @@ html_context = {
     "doc_path": "docs",
 }
 html_theme_options = {
+    "logo": {
+        "image_light": "_static/logo-light.svg",
+        "image_dark": "_static/logo-dark.svg",
+        "alt_text": "bux",
+    },
     "github_url": "https://github.com/pilot7747/bux",
     "use_edit_page_button": True,
     "navigation_with_keys": True,

@@ -1,0 +1,23 @@
+name: Feature request
+description: A layer, setting, kernel, data source or command that bux should have.
+labels: [enhancement]
+body:
+  - type: textarea
+    id: experiment
+    attributes:
+      label: What you want to run
+      description: The experiment, written in `.bux` as you would like to write it, if you can.
+    validations:
+      required: true
+  - type: textarea
+    id: why
+    attributes:
+      label: Why
+      description: What it lets you test, with links to the paper, model or code it comes from.
+    validations:
+      required: true
+  - type: textarea
+    id: today
+    attributes:
+      label: How you do it today
+      description: A workaround, another framework, or nothing yet.

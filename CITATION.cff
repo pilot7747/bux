@@ -1,0 +1,21 @@
+cff-version: 1.2.0
+message: If you use bux in your research, please cite it as below.
+type: software
+title: "bux: architecture and data ablations in a few lines"
+abstract: >-
+  bux is a JAX framework for comparing language models. A model is an algebra over
+  the residual stream, written in a short .bux file that also says how to train it,
+  and any line of the file becomes a sweep.
+authors:
+  - family-names: Pavlichenko
+    given-names: Nikita
+repository-code: https://github.com/pilot7747/bux
+url: https://bux.readthedocs.io
+license: Apache-2.0
+version: 0.1.0
+keywords:
+  - jax
+  - flax
+  - language models
+  - ablations
+  - deep learning
