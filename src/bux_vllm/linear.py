@@ -35,6 +35,13 @@ def conv_channels(c: dict) -> list[int]:
     return [h * dk, h * dk, hv * dv]
 
 
+def conv_kernel(c: dict) -> int:
+    """The taps of a linear attention's conv, as vLLM sizes its state by them: 2 for
+    no conv, a state of one position that nothing reads, as vLLM shapes no state of
+    none."""
+    return c["conv_size"] or 2
+
+
 def conv_weight(tensor: torch.Tensor) -> torch.Tensor:
     """bux's conv taps, (k, C), as vLLM's conv weight, (C, 1, k)."""
     return tensor.T.unsqueeze(1).contiguous()
@@ -110,6 +117,23 @@ def gdn2_projection(c: dict, ranks: int) -> Projection:
     return Projection(*aligned(sizes, split, ranks), len(split))
 
 
+def deltanet_projection(c: dict, ranks: int) -> Projection:
+    """DeltaNet's fused input projection over `ranks`: q, k, v and the step; a
+    rank's parts: q, k and v together, the step."""
+    _, hv, _, _ = linear_dims(c)
+    sizes = [*conv_channels(c), hv]
+    split = [sum(conv_channels(c)) // ranks, hv // ranks]
+    return Projection(*aligned(sizes, split, ranks), len(split))
+
+
+def gla_projection(c: dict, ranks: int) -> Projection:
+    """GLA's fused input projection over `ranks`: q, k and v; a rank's part: q, k
+    and v together."""
+    return Projection(
+        *aligned(conv_channels(c), [sum(conv_channels(c)) // ranks], ranks), 1
+    )
+
+
 def zero_padding(layer: nn.Module, columns: int) -> None:
     """Zero the weights of a fused projection's last `columns` outputs, its padding
     (`bux_vllm.linear.aligned`), which no checkpoint holds."""
@@ -117,3 +141,11 @@ def zero_padding(layer: nn.Module, columns: int) -> None:
     assert isinstance(weight, torch.Tensor)
     if columns:
         weight.data[-columns:].zero_()
+
+
+def slopes(heads: int, layer: int, layers: int) -> torch.Tensor:
+    """Lightning attention's decay rates, MiniMax's ``2 ** (-8 i / heads)`` for heads
+    i = 1 to heads, scaled by ``1 - layer / (layers - 1)`` (and 1e-5 more), for the
+    `layer`-th of a model's `layers` token mixers, as bux's ``slopes``."""
+    factor = 1 - layer / (layers - 1 + 1e-5) + 1e-5
+    return 2 ** (-8 / heads * torch.arange(1, heads + 1, dtype=torch.float32)) * factor
