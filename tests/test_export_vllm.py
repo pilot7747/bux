@@ -29,7 +29,7 @@ from bux.export.hf import linear_attention as hf_linear
 from bux.export.hf import residual as hf_residual
 from bux.export.huggingface import save
 from bux.lang import compile, compile_file, compile_runs, ir
-from bux_vllm import common, config, kv, linear, plan, residual, routing, sparse
+from bux_vllm import common, compressed, config, kv, linear, plan, residual, routing
 
 ROOT = Path(__file__).parent.parent
 EXAMPLES = sorted((ROOT / "examples" / "architectures").rglob("*.bux"))
@@ -459,7 +459,7 @@ def test_each_rank_keeps_its_kv_heads(
     assert [kv.kv_heads(kv_heads, tp, rank) for rank in range(tp)] == want
 
 
-# --- compressed sparse attention (bux_vllm.sparse) ----------------------------------
+# --- compressed sparse attention (bux_vllm.compressed) ----------------------------------
 
 #: csa settings the plugin runs, on 4 heads of 16 dims: each step below crosses
 #: windows of 5 and 6, a compressed latent of 2 to 4 tokens and an indexer's top 3.
@@ -510,28 +510,28 @@ class PagedCsa:
     left out."""
 
     def __init__(self, c: dict, lengths: list[int]):
-        self.paged: dict[str, sparse.Paged] = {}
+        self.paged: dict[str, compressed.Paged] = {}
         per_seq = -(-CSA_MAX_LEN // CSA_BLOCK)
         gen = torch.Generator().manual_seed(0)
-        for name, (width, per, _) in sparse.cache_rows(c).items():
+        for name, (width, per, _) in compressed.cache_rows(c).items():
             ids = torch.randperm(len(lengths) * per_seq, generator=gen) + 1
             cache = torch.zeros(len(ids) + 1, CSA_BLOCK // per, width)
             table = ids.view(len(lengths), per_seq)
-            self.paged[name] = sparse.Paged(cache, table)
+            self.paged[name] = compressed.Paged(cache, table)
 
     def slots(self, name: str, seq: torch.Tensor, pos: torch.Tensor) -> torch.Tensor:
         """vLLM's slot mapping of the tokens at `pos` of sequences `seq`."""
         table = self.paged.get(name, self.paged["window"]).block_table
         return table[seq, pos // CSA_BLOCK] * CSA_BLOCK + pos % CSA_BLOCK
 
-    def caches(self, steps: sparse.Steps, pad: int) -> sparse.Caches:
+    def caches(self, steps: compressed.Steps, pad: int) -> compressed.Caches:
         """The caches of a batch of `steps`, its last `pad` tokens padding."""
         seq, pos = steps.seq, steps.positions
         state = self.paged.get("state")
         slots = {name: self.slots(name, seq, pos) for name in ("window", "state")}
         for name in ("window", "state") if pad else ():
             slots[name][-pad:] = -1
-        return sparse.Caches(
+        return compressed.Caches(
             self.paged["window"],
             slots["window"],
             self.paged.get("compressed"),
@@ -547,7 +547,7 @@ class PagedCsa:
 CSA_PADDING = [(0, 3), (1, 7)]
 
 
-def csa_steps(step: list[tuple[int, int, int]]) -> sparse.Steps:
+def csa_steps(step: list[tuple[int, int, int]]) -> compressed.Steps:
     """The batch of a step of `CSA_STEPS`, padded where it decodes alone."""
     padding = CSA_PADDING if all(n == 1 for *_, n in step) else []
     step = step + [(q, p, 1) for q, p in padding]
@@ -556,11 +556,13 @@ def csa_steps(step: list[tuple[int, int, int]]) -> sparse.Steps:
     starts = np.cumsum([0] + [n for *_, n in step]).tolist()
     lengths = [s + n for _, s, n in step]
     decodes = sum(n == 1 for *_, n in step)
-    chunks = sparse.prompt_chunks(starts, lengths, decodes)  # by request: a sequence
+    chunks = compressed.prompt_chunks(
+        starts, lengths, decodes
+    )  # by request: a sequence
     prompts = [(start, n, step[i][0], length) for start, n, i, length in chunks]
     # Decoded tokens alone read up to the longest a model takes, as in a CUDA graph.
     longest = max(lengths) if prompts else CSA_MAX_LEN
-    return sparse.Steps(positions, seq, decodes, prompts, longest)
+    return compressed.Steps(positions, seq, decodes, prompts, longest)
 
 
 def csa_layer(m: Any, parts: Any, s: Any, caches: Any, steps: Any, x: Any) -> Any:
@@ -575,21 +577,21 @@ def csa_layer(m: Any, parts: Any, s: Any, caches: Any, steps: Any, x: Any) -> An
         kv = m.compress_kv(x)
         if m.compress_gate is not None:
             both = torch.cat([kv, m.compress_gate(x)], -1)
-            kv = sparse.pool(caches, steps, both, m.ratio)
+            kv = compressed.pool(caches, steps, both, m.ratio)
         rows = parts.compressed(kv, pos)
     if parts.indexer is not None:
         w = m.indexer.weights
         index = parts.indexer.queries(
             m.indexer.q(query), None if w is None else w(x), pos
         )
-    out = sparse.mix(caches, steps, s, q, latent, rows, index, m.sinks)
+    out = compressed.mix(caches, steps, s, q, latent, rows, index, m.sinks)
     return m.output(x[None], parts.unrotate(out, pos)[None])[0]
 
 
 def csa_weights(c: dict, parts: Any) -> set[str]:
     """The checkpoint's names of a csa's weights that the plugin's layer loads
     (bux_vllm.csa's targets): its GEMM's parts, its `parts`, and its own."""
-    down, _ = sparse.down(c)
+    down, _ = compressed.down(c)
     ix, rank = c["indexer"], c["o_lora_rank"]
     own = {
         "q.weight": True,
@@ -626,11 +628,11 @@ def test_csa_computes_on_paged_caches_what_the_export_does(
     x, want = seen[0][0], seen[1][0]
     c = next(n.config for n in arch.layers() if n.config.type == "csa")
     c = c.model_dump(mode="json")
-    parts = sparse.Parts(c)
+    parts = compressed.Parts(c)
     state = {k: v for k, v in m.state_dict().items() if k in parts.state_dict()}
     parts.load_state_dict(state)
     assert set(m.state_dict()) == csa_weights(c, parts)
-    settings = sparse.Settings.of(c, m.scale)
+    settings = compressed.Settings.of(c, m.scale)
     paged = PagedCsa(c, [40, 25])
     got = torch.zeros_like(want), torch.zeros_like(want[:25])
     with torch.no_grad():
@@ -668,9 +670,9 @@ def test_csa_caches_what_the_serving_model_prices(name: str) -> None:
         c = layer.config
         if c.type != "csa":
             continue
-        rows = sparse.cache_rows(c.model_dump(mode="json"))
+        rows = compressed.cache_rows(c.model_dump(mode="json"))
         for width, per, _ in rows.values():
-            page = sparse.block_size(16, per) // per * width * serving.BF16
+            page = compressed.block_size(16, per) // per * width * serving.BF16
             assert page & (page - 1) == 0, (width, per)
         priced = serving._csa(c)
         width, per, window = rows["window"]

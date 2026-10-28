@@ -1,5 +1,5 @@
 """Compressed sparse attention in vLLM: bux's ``csa``, its latents in paged caches
-of vLLM's own kinds, attending by `bux_vllm.sparse`.
+of vLLM's own kinds, attending by `bux_vllm.compressed`.
 
 vLLM 0.32 serves DeepSeek-V4 by layers and kernels of its own
 (``vllm.models.deepseek_v4``), which bux's ``csa`` does not map onto. At a ratio of 4
@@ -52,7 +52,7 @@ from vllm.v1.kv_cache_interface import (
     SlidingWindowMLASpec,
 )
 
-from . import sparse
+from . import compressed
 from .common import (
     ACTIVATIONS,
     Ctx,
@@ -68,7 +68,7 @@ POOL, ATTEND = "bux_csa_pool", "bux_csa"
 
 #: The bytes the ops' chunks of queries take at most, which vLLM's profiling run,
 #: which gives them no metadata, sets aside.
-WORKSPACE = 20 * sparse.CHUNK
+WORKSPACE = 20 * compressed.CHUNK
 
 
 def check(c: dict, site: Site) -> None:
@@ -136,11 +136,11 @@ class Metadata:
     prompts: list[tuple[int, int, int, int]]
     max_seq_len: int
 
-    def steps(self, positions: torch.Tensor) -> sparse.Steps:
+    def steps(self, positions: torch.Tensor) -> compressed.Steps:
         """The batch's tokens at `positions`, padding left out."""
         n = self.num_actual_tokens
         seq = self.token_to_req[:n].long()
-        return sparse.Steps(
+        return compressed.Steps(
             positions[:n].long(),
             seq,
             self.decode_tokens,
@@ -157,7 +157,7 @@ def prompts(
     lengths = cm.seq_lens_cpu_upper_bound
     lengths = cm.seq_lens.cpu() if lengths is None else lengths
     starts = cm.query_start_loc_cpu[: cm.num_reqs + 1].tolist()
-    return sparse.prompt_chunks(starts, lengths.tolist(), decodes)
+    return compressed.prompt_chunks(starts, lengths.tolist(), decodes)
 
 
 class Builder(AttentionMetadataBuilder[Metadata]):
@@ -251,7 +251,7 @@ class Rows(nn.Module, AttentionLayerBase):
                 block_size=tokens, sliding_window=self.window, dtype=self.dtype, **one
             )
         return MLAAttentionSpec(
-            block_size=sparse.block_size(tokens, self.per),
+            block_size=compressed.block_size(tokens, self.per),
             tokens_per_state=self.per,
             dtype=self.dtype,
             **one,
@@ -260,25 +260,25 @@ class Rows(nn.Module, AttentionLayerBase):
     def get_attn_backend(self) -> type[AttentionBackend]:
         return Backend
 
-    def paged(self, meta: dict) -> sparse.Paged:
+    def paged(self, meta: dict) -> compressed.Paged:
         """The cache in the batch of `meta`, vLLM's metadata by layer."""
-        return sparse.Paged(self.kv_cache, meta[self.prefix].block_table)
+        return compressed.Paged(self.kv_cache, meta[self.prefix].block_table)
 
 
 class Call(Rows):
     """A ``csa`` call's caches: the token latents' window, vLLM's layer `prefix`,
     with the compressed latents', their indexer keys' and the pooling's beside it
-    (`sparse.cache_rows`), and the `settings` its ops attend by."""
+    (`compressed.cache_rows`), and the `settings` its ops attend by."""
 
     def __init__(
         self,
         c: dict,
-        settings: sparse.Settings,
+        settings: compressed.Settings,
         prefix: str,
         dtype: torch.dtype,
         vllm_config: Any,
     ):
-        rows = sparse.cache_rows(c)
+        rows = compressed.cache_rows(c)
         super().__init__(prefix, *rows["window"], dtype, vllm_config)
         self.settings = settings
         self.compressed, self.index, self.state = (
@@ -288,9 +288,9 @@ class Call(Rows):
             for name in ("compressed", "index", "state")
         )
 
-    def caches(self, meta: dict, n: int) -> sparse.Caches:
+    def caches(self, meta: dict, n: int) -> compressed.Caches:
         """Its caches in the batch of `meta`, of n tokens."""
-        out = sparse.Caches(self.paged(meta), meta[self.prefix].slot_mapping[:n])
+        out = compressed.Caches(self.paged(meta), meta[self.prefix].slot_mapping[:n])
         if self.compressed is not None:
             out.compressed = self.compressed.paged(meta)
         if self.index is not None:
@@ -328,7 +328,7 @@ def pool_op(
     n, ratio = m.num_actual_tokens, call.settings.ratio
     assert ratio is not None
     steps = m.steps(positions)
-    pooled[:n] = sparse.pool(call.caches(meta, n), steps, both[:n], ratio)
+    pooled[:n] = compressed.pool(call.caches(meta, n), steps, both[:n], ratio)
 
 
 def attend_op(
@@ -344,7 +344,7 @@ def attend_op(
 ) -> None:
     """`ATTEND`: write the token latents and compressed rows to the call's caches,
     pick the compressed latents each query keeps, and attend to them and the
-    window; the heads' outputs to `out` (T, h, d) (`sparse.mix`)."""
+    window; the heads' outputs to `out` (T, h, d) (`compressed.mix`)."""
     call, meta = _batch(layer_name, q.device)
     if meta is None:
         return
@@ -353,7 +353,7 @@ def attend_op(
     index = None
     if index_q is not None and index_w is not None:
         index = (index_q[:n], index_w[:n])
-    out[:n] = sparse.mix(
+    out[:n] = compressed.mix(
         call.caches(meta, n),
         m.steps(positions),
         call.settings,
@@ -411,12 +411,15 @@ class CompressedSparseAttention(Layer):
         tp = get_tensor_model_parallel_world_size()
         self.path, self.d, self.ratio = site.path, c["head_dim"], c["compress_ratio"]
         self.h = c["num_heads"] // tp
-        self.parts = sparse.Parts(c)
+        self.parts = compressed.Parts(c)
         self._inputs(c, width, site.path)
         self._outputs(c, width, site.path, tp)
         self.sinks = _sharded(self.h, dtype=torch.float32) if c["sinks"] else None
         scale = (c["scale"] or self.d**-0.5) * logit_gain(c["rope"])
-        settings, dtype = sparse.Settings.of(c, scale), cache_dtype(site.vllm_config)
+        settings, dtype = (
+            compressed.Settings.of(c, scale),
+            cache_dtype(site.vllm_config),
+        )
         self.names = list(site.caches)
         self.calls = nn.ModuleList(
             Call(c, settings, name, dtype, site.vllm_config) for name in site.caches
@@ -427,7 +430,7 @@ class CompressedSparseAttention(Layer):
         rank's by one GEMM (`down`): the query latent's, the token latent's, the
         compressed latent's and its gate's, and the indexer's head weights."""
         d, latent, ix = c["head_dim"], c["q_lora_rank"], c["indexer"]
-        self.down_parts, self.down_split = sparse.down(c)
+        self.down_parts, self.down_split = compressed.down(c)
         self.down = MergedColumnParallelLinear(
             width,
             [n for _, n in self.down_parts],
@@ -519,7 +522,7 @@ class CompressedSparseAttention(Layer):
     def _compressed(
         self, down: dict[str, torch.Tensor], pos: torch.Tensor, name: str
     ) -> torch.Tensor | None:
-        """The rows of the compressed cache (`sparse.Parts.compressed`), from the
+        """The rows of the compressed cache (`compressed.Parts.compressed`), from the
         projection of each token, or of the group of compress_ratio it ends, pooled
         by `POOL`; None without compressed latents."""
         if self.ratio is None:
