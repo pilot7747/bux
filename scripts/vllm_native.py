@@ -461,9 +461,9 @@ def check_repeats(times: int = 5) -> bool:
     start = torch.zeros(n, dtype=torch.int32, device="cuda")
     end = (positions + 1).int()
     logits = [
-        deep_gemm.fp8_fp4_mqa_logits(index, (k8, sf), index[1], start, end, False)[
-            :, :n
-        ]
+        deep_gemm.fp8_fp4_mqa_logits(
+            (index[0], None), (k8, sf), index[1], start, end, False
+        )[:, :n]
         for _ in range(2)
     ]
     see = torch.arange(n, device="cuda") <= positions[:, None]
