@@ -190,9 +190,10 @@ What FP8 costs is the model's own, so the check holds vLLM to an emulation of it
 emulated, as vLLM rounds it: each linear layer that vLLM quantizes, its weight per
 tensor and its input per token; the routed experts' weights per expert and their
 input per tensor; and, for an FP8 KV cache, the attention's queries, keys and values
-at a scale of 1. A case passes if the mean cosine of vLLM's FP8 logits with its
-bfloat16 logits, at the prompts' positions and at the decoding steps, loses no more
-than twice the emulation's loss, plus 0.002. That is the rule
+at a scale of 1. A case passes if the cosine of vLLM's FP8 logits with its bfloat16
+logits loses no more than twice the emulation's loss, plus 0.002: their mean at the
+prompts' positions, and their median at the decoding steps, few, of which one may
+pick an expert or a sparse layer's key differently and fall far. That is the rule
 `scripts/vllm_parity.py` holds bfloat16 to against bux. vLLM compares with
 bfloat16 rather than float32, and the emulation leaves the experts' hidden units
 unrounded, so the two differ a little. A weight loaded in the wrong place, or a

@@ -11,6 +11,8 @@ environment):
     # vLLM's, with the plugin (pip install src/bux_vllm): serve each twice, compare
     python scripts/vllm_fp8.py run DIR [--quantization fp8] [--kv-cache-dtype fp8]
         [--moe-backend triton] [--tp 2] [--eager] [--only CASE ...]
+    # either: judge the runs at DIR again, without serving them
+    python scripts/vllm_fp8.py report DIR [--only CASE ...]
 
 `run` serves each case's export twice, each in a process of its own: in bfloat16,
 and under ``--quantization`` (``fp8`` by default: vLLM 0.32 quantizes the bfloat16
@@ -24,9 +26,9 @@ experts' backend; and how the FP8 logits compare with
 bfloat16's at the prompts' positions and at the decoding steps up to the first
 token the two runs pick differently (the steps whose prefixes they share): the
 cosine of the logits, centered at each position (as the log-probabilities are),
-its mean and its least, and the largest error relative to the largest bfloat16
-logit of its position. It exits with 1 if vLLM's FP8 is further off than `RATIO`
-times what FP8's rounding alone costs the model (`emulate`), if nothing was
+its mean, its median and its least, and the largest error relative to the largest
+bfloat16 logit of its position. It exits with 1 if vLLM's FP8 is further off than
+`RATIO` times what FP8's rounding alone costs the model (`emulate`), if nothing was
 quantized, if a head was, or if no attention layer of a model with some kept the
 KV cache asked for.
 
@@ -42,10 +44,14 @@ emulated logits with the model's own to ``expected.json``. vLLM may be off by up
 `RATIO` (2) times that, plus `FLOOR`, as `scripts/vllm_parity.py` holds bfloat16
 to twice bux's own error: vLLM compares with bfloat16 rather than float32, and the
 emulation leaves the experts' hidden units and the norms and RoPE after the keys
-unrounded. Weights loaded in the wrong place, a scale set by garbage or bytes read
-in the wrong format are many times further off. A case whose transformers model
-does not run (one of the layers only the plugin exports) has no emulation, and its
-accuracy goes unchecked.
+unrounded. The prompts' mean cosine counts, as the emulation measures it, and the
+decoding steps' median: a case decodes few steps up to its first difference, and
+where FP8 flips a pick (an expert, an indexer's key) at one of them, that step's
+cosine falls far, as it does where the emulation flips one at a prompt's position.
+Weights loaded in the wrong place, a scale set by garbage or bytes read in the
+wrong format are many times further off. A case whose transformers model does not
+run (one of the layers only the plugin exports) has no emulation, and its accuracy
+goes unchecked.
 
 The cases are the timeline's milestones at d_model 256 and a vocabulary of 256, the
 first group of four layers of their stacks: GPT-3's (2020), a llama, and 2026's two
@@ -155,7 +161,7 @@ def main() -> None:
     """Parse the command line and run its step."""
     p = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
     sub = p.add_subparsers(dest="step", required=True)
-    for name in ("export", "run", "run-one"):
+    for name in ("export", "run", "run-one", "report"):
         s = sub.add_parser(name)
         s.add_argument("dir", type=Path)
         s.add_argument("--only", nargs="*", default=None)
@@ -180,6 +186,9 @@ def main() -> None:
                 expect(args.dir / name, POOL[name])
         case "run":
             bad = [n for n in cases if not run(args, n)]
+            sys.exit(1 if bad else 0)
+        case "report":
+            bad = [n for n in cases if not report(args.dir / n, n)]
             sys.exit(1 if bad else 0)
         case "run-one":
             run_one(args, args.dir / cases[0])
@@ -366,17 +375,19 @@ class Closeness:
             peak = np.abs(b).max(-1)
             self.error = max(self.error, float((np.abs(a - b).max(-1) / peak).max()))
 
-    def summary(self) -> tuple[float, float, int]:
-        """The mean and the least cosine, and the positions measured."""
+    def summary(self) -> tuple[float, float, float, int]:
+        """The mean, the median and the least cosine, and the positions measured."""
         c = np.concatenate(self.cosines) if self.cosines else np.ones(0)
-        return (float(c.mean()), float(c.min()), len(c)) if len(c) else (1.0, 1.0, 0)
+        if not len(c):
+            return 1.0, 1.0, 1.0, 0
+        return float(c.mean()), float(np.median(c)), float(c.min()), len(c)
 
     def line(self, what: str) -> str:
         """The comparison as a line of `what` it measured."""
-        mean, least, n = self.summary()
+        mean, median, least, n = self.summary()
         return (
-            f"{what} ({n}): cosine {mean:.5f} (least {least:.5f}),"
-            f" max rel. error {self.error:.3f}"
+            f"{what} ({n}): cosine {mean:.5f} (median {median:.5f}, least"
+            f" {least:.5f}), max rel. error {self.error:.3f}"
         )
 
 
@@ -390,7 +401,7 @@ def _centered(logprobs: np.ndarray) -> np.ndarray:
 def report(where: Path, name: str) -> bool:
     """Print how case `name`'s FP8 run at `where` compares with its bfloat16 run: the
     methods vLLM picked, the experts' backends, the logits' closeness; return
-    whether its mean cosines reach `MIN_COSINE`."""
+    whether it agrees (`_close`, `_quantizes`, `_caches`)."""
     if not all((where / f"{t}.{e}").exists() for t in TAGS for e in ("npz", "json")):
         print(f"{name:10s} no run")
         return False
@@ -405,7 +416,9 @@ def report(where: Path, name: str) -> bool:
         for backend, n in layers[tag]["backends"].items():
             print(f"  {tag} MoE: {n} x {backend}")
     prompts, steps = closeness(where)
-    close = _close(where, kv, [prompts.summary()[0], steps.summary()[0]])
+    # The prompts' mean, as the emulation measures it; the decoding steps' median,
+    # which a pick that one of their few steps flips does not move
+    close = _close(where, kv, [prompts.summary()[0], steps.summary()[1]])
     ok = close and _quantizes(fp8["methods"]) and _caches(fp8["caches"], kv)
     print(f"  {prompts.line('prompts')}")
     print(f"  {steps.line('decoding')}  {'ok' if ok else 'DIFFERS'}")
@@ -413,7 +426,7 @@ def report(where: Path, name: str) -> bool:
 
 
 def _close(where: Path, kv: str | None, cosines: list[float]) -> bool:
-    """Whether vLLM's mean `cosines` are within `RATIO` times FP8's own error, and
+    """Whether vLLM's `cosines` are within `RATIO` times FP8's own error, and
     `FLOOR`, of the emulation's (``expected.json``, by `kv`); say which. True,
     unchecked, without an emulation."""
     file = where / "expected.json"
