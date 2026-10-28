@@ -31,7 +31,7 @@ SHAPES = {
 }
 PAGE = 64  # tokens a kernel block, as DeepGEMM's paged kernel takes them
 #: The attention's tiles timed: picks a tile and tiles in flight, the default first.
-TILES = ((64, 3), (32, 1), (32, 3), (64, 2), (64, 4), (128, 2), (128, 3))
+TILES = ((128, 3), (128, 2), (64, 3))
 
 
 def timed(run: Callable[[], object], repeats: int = 10) -> float:
@@ -409,6 +409,10 @@ def check_plugin(decoding: bool) -> bool:
     kv = picks.gather(cache[:, :g], rows, kept[0])
     ref = picks.attend(q, kv, kept[1][:, None], dk, spec.scale)
     error = (got.float() - ref.float()).abs().max().item()
+    assert dsa.attends(spec, q, cache[:, :g])
+    table_rows = table if decoding else table[:1]
+    vllms = dsa.attend(spec, q, cache[:, :g], table_rows, chosen, not decoding, (1, 1))
+    error = max(error, (vllms.float() - ref.float()).abs().max().item())
     bux = picks.attend_segment(
         spec,
         q.float(),
@@ -557,6 +561,39 @@ def check_qsa(decoding: bool) -> bool:
     return best
 
 
+def time_heads(n: int, b: int, ctx: int) -> None:
+    """Qwen4's QSA kernel and the plugin's at groups of one query head (MHA, as the
+    timeline's GPT-3-style arms) and of two, at heads of 64: whether it compiles,
+    its error and its time."""
+    from bux_vllm import picks
+
+    for h, g in ((44, 44), (44, 22)):
+        dk, top_k = 64, 2048
+        blocks = -(-max(n, ctx) // PAGE) * b + 1
+        cache = torch.randn(blocks, g, PAGE, 2 * dk, device="cuda").bfloat16()
+        spec = picks.Sparse(
+            top_k, 1, False, False, True, None, dk**-0.5, None, dk, (0, g)
+        )
+        for what, count, length in (("prompt", n, n), ("decode", b, ctx)):
+            requests = 1 if what == "prompt" else count
+            table = torch.randint(
+                1, blocks, (requests, -(-length // PAGE)), device="cuda"
+            )
+            table = table.int().expand(count, -1)
+            if what == "prompt":
+                pos = torch.arange(count, device="cuda") % length
+            else:
+                pos = torch.full((count,), length - 1, device="cuda")
+            keys = (torch.rand(count, top_k, device="cuda") * (pos[:, None] + 1)).long()
+            q = torch.randn(count, h, dk, device="cuda", dtype=torch.bfloat16)
+            args = (q, table, (keys, keys <= pos[:, None]))
+            print(f"heads {h} over {g}:", end=" ")
+            attempt(
+                "qwen4's",
+                lambda a=args, w=what, c=cache, s=spec: time_qwen4(s, c, c, a, w),
+            )
+
+
 def time_attention(n: int, b: int, ctx: int) -> None:
     """The Triton attention over each query's top 2048 at the timeline's width
     2816 (44 query heads of 64 over 11 kv heads), for a prompt of `n` tokens and a
@@ -676,6 +713,7 @@ def main() -> int:
         results.append(attempt("plugin", lambda d=decoding: check_plugin(d)))
         results.append(attempt("plugin qsa", lambda d=decoding: check_qsa(d)))
     attempt("attention", lambda: time_attention(16384, 64, 20000))
+    attempt("heads", lambda: time_heads(16384, 64, 20000))
     print("all agree" if all(results) else "MISMATCH")
     return 0 if all(results) else 1
 

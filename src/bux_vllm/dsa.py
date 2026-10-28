@@ -361,6 +361,59 @@ def decode(
     return out
 
 
+def attends(spec: Sparse, q: torch.Tensor, kv: torch.Tensor) -> bool:
+    """Whether vLLM's own sparse GQA attention, Qwen4's QSA kernel (`attend`),
+    attends a layer of `spec` over its picks: bfloat16 queries, keys and values of
+    the same power of two of dims, 16 or more, a bfloat16 or e4m3 cache, groups of
+    4 query heads or more (as measured), and no sinks, softcap or latents, which it
+    has not."""
+    h, dk = q.shape[1], q.shape[2]
+    group = h // kv.shape[1]
+    dims = kv.shape[3] == 2 * dk and dk >= 16 and dk & (dk - 1) == 0
+    cache = kv.dtype in (torch.bfloat16, FP8)
+    plain = spec.sinks is None and spec.softcap is None and not spec.latent
+    return q.dtype == torch.bfloat16 and dims and cache and plain and group >= 4
+
+
+def attend(
+    spec: Sparse,
+    q: torch.Tensor,
+    kv: torch.Tensor,
+    rows: torch.Tensor,
+    picked: torch.Tensor,
+    prompt: bool,
+    scales: tuple[float, float],
+) -> torch.Tensor:
+    """Each query's heads' outputs, (Q, h, d), over its `picked` keys, (Q, K) int32
+    positions with -1 for none, by vLLM's own sparse GQA attention (Qwen4's QSA
+    kernel), which reads the paged `kv`, (blocks, g, block_size, 2 d), in place by
+    the block table `rows`: one request's, (1, blocks), for a prompt's queries,
+    else each one's. DSA's picks have their valid ones first, as the kernel bounds
+    a query's tiles by their count; QSA's are read whole. Its output gate is passed
+    open, and a scale other than ``d ** -0.5`` goes on the queries."""
+    from vllm.models.qwen4_exp.nvidia.ops.qsa import qsa_sparse_paged_attention
+
+    n, _, dk = q.shape
+    if spec.scale != dk**-0.5:
+        q = (q.float() * (spec.scale * dk**0.5)).to(q.dtype)
+    if spec.mean:  # its own block's keys after the other blocks', some past it
+        count = picked.new_full((n, 1), picked.shape[1])
+    else:
+        count = (picked >= 0).sum(-1, keepdim=True, dtype=torch.int32)
+    indices = torch.cat([picked.to(torch.int32), count], -1).contiguous()
+    if prompt:
+        req = torch.zeros(n, dtype=torch.int32, device=q.device)
+    else:
+        req = torch.arange(n, dtype=torch.int32, device=q.device)
+    nhd = kv.transpose(1, 2)
+    k, v = nhd[..., :dk], nhd[..., dk:]
+    fp8 = (scales[0], scales[1]) if kv.dtype == FP8 else (None, None)
+    gate = torch.full_like(q, torch.inf)  # sigmoid(+inf) = 1: no gate
+    return qsa_sparse_paged_attention(
+        q.contiguous(), k, v, indices, rows, req, prompt, None, *fp8, output_gate=gate
+    )
+
+
 def reserve(device: torch.device, longest: int, dims: int) -> None:
     """Claim, in vLLM's profiling run, what a step's kernels take beyond it: the
     top-k's workspace, and a prompt chunk's logits and gathered keys at their most,

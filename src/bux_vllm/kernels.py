@@ -31,7 +31,7 @@ from .picks import Picked, Sparse
 CHOICE = os.environ.get("BUX_VLLM_SPARSE_KERNELS")
 MOST_DIMS = 256  # the widest key or value head the kernels take
 BLOCKS = (16, 32, 64, 128)  # MSA's blocks whose best a prompt's kernel finds
-BLOCK_K = int(os.environ.get("BUX_VLLM_SPARSE_BLOCK_K", "64"))  # picks a tile
+BLOCK_K = int(os.environ.get("BUX_VLLM_SPARSE_BLOCK_K", "128"))  # picks a tile
 STAGES = int(os.environ.get("BUX_VLLM_SPARSE_STAGES", "3"))  # tiles in flight
 
 

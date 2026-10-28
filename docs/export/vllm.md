@@ -485,8 +485,12 @@ plugin's own kernels above.
   complete blocks as DSA's keys. A query also keeps its own block while that is
   unfinished.
 - **Picks.** vLLM's top-k kernels keep each query's best `top_k` of the keys (or
-  blocks) it sees, as DeepSeek-V3.2's do; the plugin's Triton kernel attends over
-  them.
+  blocks) it sees, as DeepSeek-V3.2's do.
+- **Attention.** vLLM's own sparse GQA attention, the kernel it runs Qwen4's QSA
+  on, attends over the picks, reading the paged keys and values in place: in a
+  bfloat16 model, at heads of a power of two of dims, in groups of 4 query heads or
+  more, without sinks or a softcap. Other layers attend by the plugin's Triton
+  kernel, and MLA's latents by PyTorch.
 - **FP8 KV cache.** Under `--kv-cache-dtype fp8`, such a call keeps its keys and
   values in FP8 (e4m3, at a scale of 1, as vLLM's attention does), and so does a
   layer that reads its `index` port. The attention kernel reads them as they are,
@@ -610,6 +614,9 @@ JAX_PLATFORMS=cpu python scripts/vllm_parity.py compare runs/parity/float32  # b
   to measure how far bfloat16 moves bux itself. vLLM passes if it is off by no more
   than twice that, and if it picks a token other than bux's only within that
   distance of the best: a near tie that two bfloat16 runs may break either way.
+- **On vLLM's DSA kernels**, the indexer scores in FP8 and picks other keys than
+  bux's float32 scores do, so those cases are compared with bux's indexer scoring
+  in FP8 too (`compare --fp8-indexer`), and the rest checked as above.
 
 Measured on 2026-10-28 on one and two (TP=2) NVIDIA B300 GPUs, with vLLM 0.32.0,
 PyTorch 2.13.0 (CUDA 13.0), flash-linear-attention 0.6.0 and Python 3.12; bux's

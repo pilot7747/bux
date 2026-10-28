@@ -314,6 +314,29 @@ def test_native_qsa_pools_its_blocks_as_bux_s_indexer() -> None:
     assert torch.equal(ours_, want_)
 
 
+def test_vllm_s_sparse_gqa_attention_takes_plain_bfloat16_groups() -> None:
+    """vLLM's own sparse GQA attention (Qwen4's QSA kernel) attends where it takes
+    the layer: bfloat16 queries, keys and values of a power of two of dims, a
+    bfloat16 or e4m3 cache, groups of 4 query heads or more, no sinks or softcap."""
+    from bux_vllm import dsa, picks
+
+    spec = picks.Sparse(16, 1, False, False, True, None, 0.125, None, 64, (0, 2))
+    q = torch.zeros(3, 8, 64, dtype=torch.bfloat16)
+    kv = torch.zeros(5, 2, 64, 128, dtype=torch.bfloat16)
+    assert dsa.attends(spec, q, kv)
+    assert dsa.attends(spec, q, kv.view(torch.uint8)[..., :128].view(dsa.FP8))
+    assert not dsa.attends(
+        spec, q, kv.view(torch.uint8)[..., :128].view(torch.float8_e5m2)
+    )
+    assert not dsa.attends(spec, q.float(), kv.float())
+    assert not dsa.attends(spec, q, torch.zeros(5, 8, 64, 128, dtype=torch.bfloat16))
+    assert not dsa.attends(spec, q[..., :48], kv[..., :96])
+    sunk = picks.Sparse(
+        16, 1, False, False, True, None, 0.1, None, 64, (0, 2), torch.ones(8)
+    )
+    assert not dsa.attends(sunk, q, kv)
+
+
 def test_native_picks_are_bux_s_picks() -> None:
     """bux_vllm.dsa.as_picks turns the kernels' picks, int32 positions with -1 for
     none, into bux_vllm.picks' positions and mask."""

@@ -550,7 +550,9 @@ def _native(
     """A segment's picks by vLLM's DSA kernels (decoded tokens' over their paged
     keys, a prompt chunk's over its request's gathered ones; QSA's over its blocks,
     and its own unfinished block), padded to `bux_vllm.picks.most`, and its
-    attention over them: by the Triton kernel, or by PyTorch over MLA's latents."""
+    attention over them: by vLLM's own sparse GQA attention where it takes the
+    layer (`bux_vllm.dsa.attends`), else by the plugin's Triton kernel, or by
+    PyTorch over MLA's latents."""
     spec, region, size = cache.sparse, cache.region, cache.sparse.block_size
     top_k = spec.top_k // size
     if part.decoding:
@@ -567,6 +569,10 @@ def _native(
     if spec.latent:
         kv = cache.rows.kv
         return picks.attend_picked(spec, q, kept, positions, kv, rows, part.keys), kept
+    if dsa.attends(spec, q, cache.kv):
+        mine = torch.where(kept[1], kept[0], -1) if spec.mean else chosen
+        out = dsa.attend(spec, q, cache.kv, rows, mine, not part.decoding, cache.scales)
+        return out, kept
     table = rows.expand(q.shape[0], -1)
     out = kernels.attend(spec, q.contiguous(), cache.kv, table, kept, cache.scales)
     return out, kept
