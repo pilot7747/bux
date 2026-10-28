@@ -4,8 +4,10 @@ keys into memory first: the indexer's score of every key of each query's request
 (`scores`), and each query's softmax over the keys it picked (`attend`), in float32.
 
 They run under ``BUX_VLLM_SPARSE_KERNELS=triton``, for the settings they take
-(`takes`): DSA's single keys and MSA's blocks scored by their best key, weighted or
-summed heads, keys and values of up to 256 dims, not MLA's latents. The picks stay
+(`takes`): DSA's single keys, MSA's blocks and picks per group, QSA's blocks (its
+scores PyTorch's), weighted or summed heads, keys and values of up to 256 dims, not
+MLA's latents. A prompt's queries, which share their keys, score them by PyTorch's
+GEMM; decoded tokens, each over its own request's keys, by the kernel. The picks stay
 PyTorch's, as bux ranks the scores. ``scripts/vllm_kernels.py`` checks them against
 the PyTorch path on a GPU.
 """
@@ -28,9 +30,8 @@ MOST_DIMS = 256  # the widest key or value head the kernels take
 
 def takes(spec: Sparse, dims: tuple[int, int]) -> bool:
     """Whether the kernels compute the layer of `spec`, its key and value heads of
-    `dims`: no mean-pooled blocks (QSA), no picks per group, no MLA latents."""
-    narrow = max(dims) <= MOST_DIMS
-    return ENABLED and narrow and not (spec.mean or spec.per_group or spec.latent)
+    `dims`: not MLA's latents."""
+    return ENABLED and max(dims) <= MOST_DIMS and not spec.latent
 
 
 def _block(n: int) -> int:
@@ -52,16 +53,20 @@ def _scores_kernel(
     stride_cs,
     stride_tt,
     stride_ot,
+    stride_og,
     n_keys,
+    first,
     heads: tl.constexpr,
     dims: tl.constexpr,
     page: tl.constexpr,
     relu: tl.constexpr,
+    groups: tl.constexpr,
     block_h: tl.constexpr,
     block_i: tl.constexpr,
     block_s: tl.constexpr,
 ):
-    """One query's scores of `block_s` keys: ``sum_j w_j ReLU(q_j . k_s)``."""
+    """One query's scores of `block_s` keys: ``sum_j w_j ReLU(q_j . k_s)``, or each
+    of the `groups` heads' from `first` on, ``w_j ReLU(q_j . k_s)``, with `groups`."""
     t, part = tl.program_id(0), tl.program_id(1)
     s = part * block_s + tl.arange(0, block_s)
     h, i = tl.arange(0, block_h), tl.arange(0, block_i)
@@ -82,8 +87,13 @@ def _scores_kernel(
     dots = tl.dot(q, tl.trans(k), input_precision="ieee")
     if relu:
         dots = tl.maximum(dots, 0.0)
-    score = tl.sum(dots * w[:, None], axis=0)
-    tl.store(out_ptr + t * stride_ot + s, score, mask=inside)
+    weighted = dots * w[:, None]
+    if groups:  # each of this rank's groups by its own head
+        mine = on_h & (h >= first) & (h < first + groups)
+        at = out_ptr + t * stride_ot + (h - first)[:, None] * stride_og + s[None, :]
+        tl.store(at, weighted, mask=mine[:, None] & inside[None, :])
+    else:
+        tl.store(out_ptr + t * stride_ot + s, tl.sum(weighted, axis=0), mask=inside)
 
 
 def scores(
@@ -93,9 +103,11 @@ def scores(
     rows: torch.Tensor,
     n: int,
     relu: bool,
+    groups: tuple[int, int] | None = None,
 ) -> torch.Tensor:
     """Each query's indexer score of each of its request's first `n` keys, (Q, n) in
-    float32, as `bux_vllm.picks.scores` gives it summed over the heads.
+    float32, as `bux_vllm.picks.scores` gives it summed over the heads; or each
+    head's of this rank's groups, (Q, G, n), as it gives them with `per_group`.
 
     Args:
         q: The indexer's queries, (Q, H, i), the last axis contiguous.
@@ -104,8 +116,12 @@ def scores(
         rows: Each query's request's block table, (Q, blocks).
         n: How many keys to score.
         relu: Whether to ReLU the dot products.
+        groups: The first of this rank's groups and how many, picking apart; None
+            for all heads' scores summed.
     """
-    out = torch.empty(q.shape[0], n, dtype=torch.float32, device=q.device)
+    first, count = groups or (0, 0)
+    shape = (q.shape[0], count, n) if groups else (q.shape[0], n)
+    out = torch.empty(shape, dtype=torch.float32, device=q.device)
     block_s = 64
     grid = (q.shape[0], triton.cdiv(n, block_s))
     _scores_kernel[grid](
@@ -121,11 +137,14 @@ def scores(
         cache.stride(2),
         rows.stride(0),
         out.stride(0),
+        out.stride(1) if groups else 0,
         n,
+        first,
         heads=q.shape[1],
         dims=q.shape[2],
         page=cache.shape[2],
         relu=relu,
+        groups=count,
         block_h=_block(q.shape[1]),
         block_i=_block(q.shape[2]),
         block_s=block_s,
@@ -149,6 +168,7 @@ def _attend_kernel(
     stride_cs,
     stride_tt,
     stride_kt,
+    stride_kg,
     stride_ot,
     stride_oh,
     n_picks,
@@ -183,8 +203,9 @@ def _attend_kernel(
     for start in range(0, n_picks, block_k):
         j = start + tl.arange(0, block_k)
         inside = j < n_picks
-        at = tl.load(keys_ptr + t * stride_kt + j, mask=inside, other=0)
-        ok = tl.load(valid_ptr + t * stride_kt + j, mask=inside, other=0) != 0
+        pick = t * stride_kt + g * stride_kg + j  # a group's own picks, or all's
+        at = tl.load(keys_ptr + pick, mask=inside, other=0)
+        ok = tl.load(valid_ptr + pick, mask=inside, other=0) != 0
         ok = ok & inside
         block = tl.load(table_ptr + t * stride_tt + at // page, mask=ok, other=0)
         rows = block.to(tl.int64) * stride_cb + g * stride_cg + (at % page) * stride_cs
@@ -240,7 +261,8 @@ def attend(
         q: The queries, (Q, h, dk), the last axis contiguous.
         cache: The paged cache of keys and values, (blocks, g, block_size, dk + dv).
         rows: Each query's request's block table, (Q, blocks).
-        picked: The picked keys' positions and which are valid, (Q, K) each.
+        picked: The picked keys' positions and which are valid, (Q, K) each, or
+            (Q, g, K) for each kv head's group.
     """
     keys, valid = (t.contiguous() for t in picked)
     n, h, dk = q.shape
@@ -262,9 +284,10 @@ def attend(
         cache.stride(2),
         rows.stride(0),
         keys.stride(0),
+        keys.stride(1) if keys.ndim == 3 else 0,
         out.stride(0),
         out.stride(1),
-        keys.shape[1],
+        keys.shape[-1],
         spec.scale,
         spec.softcap or 1.0,
         heads_per=h // g,
@@ -293,18 +316,21 @@ def attend_segment(
     """`bux_vllm.picks.attend_segment` by the kernels: each chunk of queries' scores
     (`scores`), its picks as bux ranks them, and its attention over them (`attend`);
     the outputs, and the picks padded to `bux_vllm.picks.most` keys a query."""
-    count = q.shape[0]
+    count, shared = q.shape[0], rows[0].shape[0] == 1
     table, index_table = (r.expand(count, -1) for r in rows)
-    chunk, outs, kept = max(1, picks.BUDGET // max(n, 1)), [], []
+    span = torch.arange(n, device=q.device)
+    keys = picks.gather(caches[1], rows[1], span[None])[0, 0] if shared else None
+    per = picks._per_query(spec, q, index[0], caches[0], n, shared or not spec.mean)
+    chunk, outs, kept = max(1, picks.BUDGET // per), [], []
     for a in range(0, count, chunk):
         cut = slice(a, a + chunk)
         iq, iw = (t[cut].contiguous() for t in index)
-        s = scores(iq, iw, caches[1], index_table[cut], n, spec.relu)
-        picked = _pick(spec, s, positions[cut], n)
+        where = (positions[cut], index_table[cut], n)
+        picked = _choose(spec, (iq, iw), caches[1], keys, where)
         outs.append(attend(spec, q[cut].contiguous(), caches[0], table[cut], picked))
         kept.append(picks.padded(picked, picks.most(spec)))
-    keys, valid = zip(*kept, strict=True)
-    return torch.cat(outs), (torch.cat(keys), torch.cat(valid))
+    out_keys, valid = zip(*kept, strict=True)
+    return torch.cat(outs), (torch.cat(out_keys), torch.cat(valid))
 
 
 def attend_picked(
@@ -319,15 +345,35 @@ def attend_picked(
     """`bux_vllm.picks.attend_picked` by the kernels: the queries' attention over the
     keys another call picked, of those their own window sees."""
     keys, valid = picked[0].clamp(0, n - 1), picked[1]
-    valid = valid & picks.seen(positions, n, spec.window).gather(-1, keys)
-    table = rows.expand(q.shape[0], -1)
-    return attend(spec, q.contiguous(), cache, table, (keys, valid))
-
-
-def _pick(spec: Sparse, s: torch.Tensor, positions: torch.Tensor, n: int) -> Picked:
-    """The keys the queries keep by their scores `s`, (Q, n), as bux picks them:
-    DSA's top-k, or MSA's blocks by their best key."""
     see = picks.seen(positions, n, spec.window)
+    view = see if keys.ndim == 2 else see[:, None].expand(-1, keys.shape[1], -1)
+    table = rows.expand(q.shape[0], -1)
+    return attend(
+        spec, q.contiguous(), cache, table, (keys, valid & view.gather(-1, keys))
+    )
+
+
+def _choose(
+    spec: Sparse,
+    index: tuple[torch.Tensor, torch.Tensor],
+    cache: torch.Tensor,
+    keys: torch.Tensor | None,
+    where: tuple[torch.Tensor, torch.Tensor, int],
+) -> Picked:
+    """The keys the queries keep, as bux picks them, from the indexer's queries and
+    weights `index`: scored by PyTorch over `keys`, (n, i), which a request's
+    queries share, or over each query's request's gathered (QSA's blocks, which
+    PyTorch pools); else by `scores`. `where` are the queries' positions, their
+    requests' block tables and the keys' count."""
+    positions, table, n = where
+    see = picks.seen(positions, n, spec.window)
+    if keys is None and spec.mean:
+        span = torch.arange(n, device=positions.device)
+        keys = picks.gather(cache, table, span.expand(positions.shape[0], n))[:, 0]
+    if keys is not None:
+        return picks.choose(spec, *index, keys, see, positions)
+    groups = spec.groups if spec.per_group else None
+    s = scores(*index, cache, table, n, spec.relu, groups)
     if spec.block_size > 1:
         return picks.best_blocks(s, see, positions, spec.block_size, spec.top_k)
     return picks.tokens(s, see, spec.top_k)

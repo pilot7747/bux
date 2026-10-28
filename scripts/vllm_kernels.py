@@ -5,7 +5,8 @@ Run it where the plugin and Triton are installed, with a CUDA GPU::
 
     python scripts/vllm_kernels.py
 
-For each setting (DSA's top-k, MSA's blocks, a window, sinks, a softcap), dtype
+For each setting (DSA's top-k, MSA's blocks and picks per group, QSA's blocks, a
+window, sinks, a softcap), dtype
 (float32, bfloat16) and layout (one request's prefill, a decoding step of several
 requests), it compares the picks, which must be equal in float32, and the outputs,
 which must agree within 1e-4 in float32 and 2e-2 in bfloat16 (where a near tie may
@@ -21,7 +22,7 @@ os.environ["BUX_VLLM_SPARSE_KERNELS"] = "triton"
 
 import torch
 
-from bux_vllm import kernels, picks
+from bux_vllm import indexer, kernels, picks
 
 TOLERANCE = {torch.float32: 1e-4, torch.bfloat16: 2e-2}
 SETTINGS = {
@@ -29,18 +30,26 @@ SETTINGS = {
     "dsa, window, sinks, softcap": {"window": 40, "softcap": 20.0, "sinks": True},
     "dsa, plain dots": {"relu": False},
     "msa blocks": {"block_size": 4, "top_k": 32},
+    "msa blocks per group": {"block_size": 4, "top_k": 32, "per_group": True},
+    "qsa blocks, window": {"block_size": 4, "top_k": 32, "mean": True, "window": 64},
 }
 
 
-def spec(h: int, g: int, dk: int, settings: dict) -> picks.Sparse:
+def spec(h: int, g: int, dk: int, heads: int, settings: dict) -> picks.Sparse:
     """A layer's settings: a top 16 of single keys, ReLU'd dots and a scale, unless
-    `settings` say otherwise."""
+    `settings` say otherwise; QSA's with an indexer of `heads` that pools blocks."""
     sinks = torch.randn(h, device="cuda") if settings.get("sinks") else None
+    mean, size = settings.get("mean", False), settings.get("block_size", 1)
+    pooling = None
+    if mean:
+        ix = {"num_heads": heads, "head_dim": 32, "block_size": size, "pool": "mean"}
+        ix |= {"weighted": True, "norm": None, "rope_layout": "half"}
+        pooling = indexer.Indexer(ix, 64, None, 0).cuda()
     return picks.Sparse(
         settings.get("top_k", 16),
-        settings.get("block_size", 1),
-        False,
-        False,
+        size,
+        mean,
+        settings.get("per_group", False),
         settings.get("relu", True),
         settings.get("window"),
         dk**-0.5,
@@ -48,6 +57,7 @@ def spec(h: int, g: int, dk: int, settings: dict) -> picks.Sparse:
         dk,
         (0, g),
         sinks,
+        pooling,
     )
 
 
@@ -71,7 +81,8 @@ def caches(lengths: list[int], g: int, dk: int, i: int, dtype: torch.dtype) -> t
 def compare(name: str, settings: dict, dtype: torch.dtype, decoding: bool) -> bool:
     """Whether the kernels' picks and outputs are the PyTorch path's."""
     torch.manual_seed(0)
-    h, g, dk, i, heads = 8, 2, 64, 32, 4
+    h, g, dk, i = 8, 2, 64, 32
+    heads = g if settings.get("per_group") else 4  # a group a head, picking apart
     lengths = [300, 97, 1, 513] if decoding else [300]
     (kv, index), table = caches(lengths, g, dk, i, dtype)
     if decoding:
@@ -82,7 +93,7 @@ def compare(name: str, settings: dict, dtype: torch.dtype, decoding: bool) -> bo
     q = torch.randn(len(positions), h, dk, device="cuda", dtype=dtype)
     iq = torch.randn(len(positions), heads, i, device="cuda", dtype=dtype)
     iw = torch.randn(len(positions), heads, device="cuda", dtype=torch.float32)
-    layer = spec(h, g, dk, settings)
+    layer = spec(h, g, dk, heads, settings)
     assert kernels.takes(layer, (dk, dk))
     n = max(lengths)
     args = (layer, q, (iq, iw), positions, (kv, index), rows, n)
