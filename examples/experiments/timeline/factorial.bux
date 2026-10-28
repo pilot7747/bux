@@ -94,6 +94,10 @@ model = r0v0k0f0p0s0: plain(fr_global, fr_experts)
       | r0v0k1f0p0s1: plain(g_ks, fr_experts)
       | r0v0k0f1p1s0: plain(g_p, relu2_e)
       | r0v1k1f1p1s1: vres(g_kps, relu2_e)
+      # Off the design: the screen's predicted best (hc, V, K), and the same without
+      # the key-value conv, whose conv state costs serving throughput in vLLM.
+      | r1v1k1f0p0s0: vres(g_k, fr_experts)
+      | r1v1k0f0p0s0: vres(fr_global, fr_experts)
 
 residual = r0v0k0f0p0s0: none      | r0v1k1f0p0s1: none
          | r0v1k0f1p1s0: none      | r0v0k1f1p1s1: none
@@ -103,6 +107,7 @@ residual = r0v0k0f0p0s0: none      | r0v1k1f0p0s1: none
          | r1v0k0f1p0s1: hc_r      | r1v1k1f1p0s0: hc_r
          | r0v1k0f0p0s0: none      | r0v0k1f0p0s1: none
          | r0v0k0f1p1s0: none      | r0v1k1f1p1s1: none
+         | r1v1k1f0p0s0: hc_r      | r1v1k0f0p0s0: hc_r
 
 # The hybrid's best at d512 (milestones.bux's scan), for every arm.
 optimizer.lr = 2e-3
