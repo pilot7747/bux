@@ -57,6 +57,7 @@ model = embed block^12 norm head(tied=true)
 | `power_scale`, `power_scale_length` | `none`, `2048` | queries scaled up with a power of the position ([below](#power-scaling-at-long-range)) (Beam) |
 | `kv_conv_size` | `none` | a causal depthwise conv on keys and values, added to them: `k + conv(k)` (Inkling) |
 | `value_residual` | `fixed` | how a layer that reads the `v` port mixes in its values ([Ports](#sharing-between-layers-ports)) |
+| `k_eq_v` | `false` | values made from the key projection, with no projection of their own ([below](#values-from-the-keys)) (Gemma 4) |
 
 GPT-2 small is MHA with biases and one fused projection
 (`examples/architectures/gpt2.bux`):
@@ -84,6 +85,21 @@ A fused projection's split points between q, k and v do not fall on head
 boundaries, so under tensor parallelism it stays whole, and every device computes
 it ([Tensor parallelism](../parallelism/tensor.md)).
 :::
+
+### Values from the keys
+
+Gemma 4's global layers make their values from the key projection
+(`attention_k_eq_v`), and have no value projection:
+
+```bux
+glob = gqa(num_heads=16, num_kv_heads=4, head_dim=128, qk_norm=rmsnorm, k_eq_v=true)
+```
+
+Each head's projected key $k$, after the conv with `kv_conv_size`, is the value
+$v = k / \mathrm{rms}(k)$: an RMSNorm without a gain, at the eps of `qk_norm` (1e-6
+without one), and not rotated. The keys go on through `qk_norm` and RoPE. The
+values' head is the keys', so `v_head_dim` stays unset. A `v` port mixes and pushes
+these values as any others.
 
 ## `mla`: multi-head latent attention
 

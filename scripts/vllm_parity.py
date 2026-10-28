@@ -485,6 +485,22 @@ CASES = {
     + "ln = rms(qk_norm=layernorm(bias=true))\n"
     + "model = embed [rmsnorm rms] [rmsnorm ffn] [rmsnorm ln] [rmsnorm ffn]"
     " rmsnorm head",
+    # Gemma 4's values from the keys: with RoPE, a window and a fused projection,
+    # beside the value residual; then on the hybrid's global layer (QK-norm, a gate,
+    # the conv on keys and values, no positions).
+    "k-eq-v": HEAD
+    + FFN
+    + "attn = gqa(num_heads=4, num_kv_heads=2, k_eq_v=true, qk_norm=rmsnorm,"
+    " rope=rope())\n"
+    + "local = attn(sliding_window_size=8, fused_qkv=true)\n"
+    + "model = embed [rmsnorm attn(v=@v1)] [rmsnorm ffn] [rmsnorm local]"
+    " [rmsnorm ffn] [rmsnorm attn(v=$v1!)] rmsnorm head",
+    "k-eq-v-nope": HEAD
+    + FFN
+    + "glob = gqa(num_heads=4, num_kv_heads=2, k_eq_v=true, qk_norm=rmsnorm,"
+    " gated=true, kv_conv_size=4)\n"
+    + "model = embed [rmsnorm glob] [rmsnorm ffn] [rmsnorm glob] [rmsnorm ffn]"
+    " rmsnorm head",
     "kv-conv": HEAD
     + FFN
     + "attn = gqa(num_heads=4, num_kv_heads=2, kv_conv_size=4, rope=rope())\n"

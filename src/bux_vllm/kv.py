@@ -115,6 +115,14 @@ def mix_values(
     return (a * v.float() + b * v1.float()).to(v.dtype)
 
 
+def value_norm(qk: dict | None) -> dict:
+    """The config of the norm of values made from the keys (``k_eq_v``): Gemma 4's
+    RMSNorm without a gain, at the eps of the layer's QK-norm `qk`, or 1e-6."""
+    eps = 1e-6 if qk is None else qk["eps"]
+    flags = ("affine", "bias", "zero_centered", "scale_input")
+    return {"type": "rmsnorm", "eps": eps} | dict.fromkeys(flags, False)
+
+
 def kv_heads(kv: int, tp: int, rank: int) -> tuple[int, int]:
     """The first kv head of `kv` a rank of `tp` keeps, and how many: a share each,
     or one head copied on each of ``tp // kv`` ranks where there are fewer heads
@@ -132,9 +140,10 @@ def head_dims(c: dict, width: int) -> tuple[int, int]:
 
 def conv_channels(c: dict, width: int, tp: int) -> int:
     """The channels of the conv on keys and values a rank of `tp` keeps: its kv
-    heads' keys, then their values."""
+    heads' keys, then their values; the keys alone for values made from them
+    (``k_eq_v``)."""
     dk, dv = head_dims(c, width)
-    return kv_heads(c["num_kv_heads"], tp, 0)[1] * (dk + dv)
+    return kv_heads(c["num_kv_heads"], tp, 0)[1] * (dk + (0 if c.get("k_eq_v") else dv))
 
 
 def conv_rows(taps: torch.Tensor, dims: int, first: int, n: int) -> torch.Tensor:
