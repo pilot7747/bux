@@ -30,6 +30,7 @@ from pathlib import Path
 from typing import Any
 
 import fit_analysis
+import fit_best
 import fit_family
 import fit_inputs
 import fit_plots
@@ -65,6 +66,7 @@ def main() -> None:
 def run(a: argparse.Namespace) -> dict:
     """Read, fit and write; return what was written."""
     runs, short = fit_points.cut_short(fit_inputs.read(a.results))
+    runs, wild = fit_points.diverged_seeds(runs)
     counts = Counts(a.cache or a.out / "counts.json", tuple(a.files))
     parents = family_parents(a, runs, counts)
     if not a.keep_base:
@@ -78,15 +80,22 @@ def run(a: argparse.Namespace) -> dict:
             f"no points of the root family {a.root!r}; families: {sorted({p.family for p in points})}"
         )
     targets = build_targets(a, points, counts, parents)
+    other = [
+        p
+        for p in (fit_targets.precisions(a.targets) if a.targets else [])
+        if p != serving_precision(a)
+    ]
+    others = {p: build_targets(a, points, counts, parents, p) for p in other}
     metrics = (
         a.metrics.split(",") if a.metrics else fit_points.metrics_of(points, a.root)
     )
-    noise = {m: fit_points.noise(runs, m) for m in metrics}
+    noise = {m: fit_points.seed_noise(runs, m) for m in metrics}
     analyses = [
         fit_analysis.analyze(points, m, parents, targets, options(a, noise[m], m))
         for m in metrics
     ]
     tables = tables_of(analyses, points, metrics, targets, a)
+    tables["best"] = best_rows(a, analyses, points, parents, targets, noise, others)
     tables["lr"] = tables["learning_rates"] = fit_points.lr_vertices(runs)
     tables["long_context"] = fit_report.long_context(analyses)
     tables["long_summary"] = fit_report.long_summary(tables["long_context"])
@@ -98,11 +107,51 @@ def run(a: argparse.Namespace) -> dict:
         "points": points,
         "analyses": analyses,
         "short": short,
+        "wild": wild,
+        "objective": next(
+            (x for x in analyses if x.metric == "objective"), analyses[0]
+        ),
     }
     out = write(a, analyses, targets, tables, facts)
     if a.wandb:
         log_wandb(tables, out["plots"], a.project, a.out)
     return out
+
+
+def best_rows(
+    a: argparse.Namespace,
+    analyses: list,
+    points: list,
+    parents: dict,
+    targets: dict,
+    noise: dict,
+    others: dict | None = None,
+) -> list[dict]:
+    """The candidates' rows of "Today's best architecture", the objective's, at
+    the serving precision of `targets` and at each of `others`', with the E range's
+    other end fit with E free if --fix-e holds it."""
+    main = next((x for x in analyses if x.metric == "objective"), None)
+    if not a.candidates or main is None:
+        return []
+    free = None
+    if a.fix_e:
+        o = fit_best.free_e(options(a, noise["objective"], "objective"))
+        free = fit_analysis.analyze(points, "objective", parents, targets, o)
+    cands = a.candidates.split(",")
+    rows = [
+        r | {"serve": serving_precision(a)}
+        for r in fit_best.rows(main, free, cands, targets, points)
+    ]
+    for p, t in (others or {}).items():
+        rows += [r | {"serve": p} for r in fit_best.rows(main, free, cands, t, points)]
+    return rows
+
+
+def serving_precision(a: argparse.Namespace) -> str:
+    """The serving precision of the targets: --serve, else the file's default."""
+    if a.serve:
+        return a.serve
+    return fit_targets.precisions(a.targets)[0] if a.targets else "bf16"
 
 
 def family_parents(a: argparse.Namespace, runs: list, counts: Counts) -> dict[str, str]:
@@ -121,14 +170,16 @@ def family_parents(a: argparse.Namespace, runs: list, counts: Counts) -> dict[st
 
 
 def options(
-    a: argparse.Namespace, noise: tuple | None, metric: str
+    a: argparse.Namespace, noise: dict | None, metric: str
 ) -> fit_analysis.Options:
-    """The fit's options for a metric: its bootstrap noise the replicates', if they
-    have `MIN_DOF` degrees of freedom, else --noise."""
-    measured = noise is not None and noise[1] >= MIN_DOF
-    sigma, source = (
-        (noise[0], f"replicates, {noise[1]} dof") if measured else (a.noise, "--noise")
+    """The fit's options for a metric: its noise the replicates' (a run's own, and
+    the seeds' shared shifts), if they have `MIN_DOF` degrees of freedom, else
+    --noise for a run's own and none shared."""
+    measured = noise is not None and noise["dof"] >= MIN_DOF
+    sigma, seed_sigma = (
+        (noise["sigma"], noise["seed_sigma"]) if measured else (a.noise, 0.0)
     )
+    source = f"replicates, {noise['dof']} dof" if measured else "--noise"
     share = tuple(a.share.split(",")) if a.share else ()
     e = (
         dict(kv.split("=") for kv in a.fix_e.split(",")).get(metric)
@@ -137,8 +188,8 @@ def options(
     )
     drop = tuple(a.drop_scan.split(",")) if a.drop_scan else ()
     return fit_analysis.Options(
-        a.root, not a.no_joint, sigma, a.reps, a.seed, share, source,
-        None if e is None else float(e), drop,
+        root=a.root, joint=not a.no_joint, sigma=sigma, reps=a.reps, seed=a.seed, share=share,
+        sigma_from=source, e=None if e is None else float(e), drop_scan=drop, seed_sigma=seed_sigma,
     )  # fmt: skip
 
 
@@ -162,11 +213,20 @@ def attach(
 
 
 def build_targets(
-    a: argparse.Namespace, points: list, counts: Counts, parents: dict
+    a: argparse.Namespace,
+    points: list,
+    counts: Counts,
+    parents: dict,
+    serve: str | None = None,
 ) -> dict:
-    """Each family's target: from --targets, or serving.py's match at --match; a
-    family with no target of its own takes that of one with its architecture."""
-    raw = fit_targets.load(a.targets, a.budget) if a.targets else {}
+    """Each family's target: from --targets at `serve`'s precision (--serve's by
+    default), or serving.py's match at --match; a family with no target of its own
+    takes that of one with its architecture."""
+    raw = (
+        fit_targets.load(a.targets, a.budget, serve or serving_precision(a))
+        if a.targets
+        else {}
+    )
     first: dict[str, fit_points.Point] = {}
     for p in sorted(points, key=lambda p: p.width):
         first.setdefault(p.family, p)
@@ -213,8 +273,21 @@ def served_arch(counts: Counts, p: fit_points.Point) -> Any:
 def make_target(
     raw: dict, p: fit_points.Point, counts: Counts, measured: dict | None, source: str
 ) -> fit_targets.Target:
-    """A target, its FLOPs per token from the compiler where its row has none: its
-    FLOPs per active parameter at the nearest valid width, times its own."""
+    """A target, its FLOPs per token from the compiler where its row has none (its
+    FLOPs per active parameter at the nearest valid width, times its own), how its
+    size was had (analytic where nothing says), and its size at its lower-bound
+    cost if it has one."""
+    t = _target(raw, p, counts, measured, source)
+    t.cost_from = raw.get("cost_from", "analytic")
+    t.reason = raw.get("reason")
+    if raw.get("lower"):
+        t.lower = _target(raw["lower"], p, counts, measured, source)
+    return t
+
+
+def _target(
+    raw: dict, p: fit_points.Point, counts: Counts, measured: dict | None, source: str
+) -> fit_targets.Target:
     flops = raw.get("flops")
     if not flops and raw.get("d_model"):
         c = counts.flops(p.stem, p.arms, raw["d_model"])
@@ -310,7 +383,7 @@ def assumptions(a: argparse.Namespace, targets: dict, facts: dict) -> list[str]:
         + ("its lr chosen on its first runs, then every run at that lr averaged (the seeds)." if not a.no_average_seeds else "each of its first runs only: seeds and base arms only measure the noise."),
         f"E is shared by every family; {fit}" + (f"; {a.share} pooled: only the root has them of its own." if a.share else "."),
         noise_line(facts["analyses"], a.reps),
-        f"Targets: {a.targets or ('serving.py match at ' + a.match if a.match else 'none')} (budget {a.budget}).",
+        f"Targets: {a.targets or 'none'}" + (f", served in {serving_precision(a)}" if a.targets else "") + (f"; the families it lacks: serving.py's analytic match at {a.match}." if a.match else "."),
         (f"GPU-hours = tokens x FLOPs/token / (MFU x {fit_targets.PEAK:.3g} x 3600); MFU measured, else a measured kin's "
          "(an MoE or hybrid of its file), else its nearest measured ancestor's (the (a) table's 'MFU from')."),
     ]  # fmt: skip
@@ -319,6 +392,11 @@ def assumptions(a: argparse.Namespace, targets: dict, facts: dict) -> list[str]:
     if a.drop_scan:
         out.append(
             f"Token scans left out for {a.drop_scan}: they take their parent's data term."
+        )
+    if wild := facts.get("wild"):
+        names = ", ".join(sorted(f"{r.family} d{r.width} seed {r.seed}" for r in wild))
+        out.append(
+            f"Seeds left out as diverged (over {fit_points.DIVERGED - 1:.0%} above their point's best run): {names}."
         )
     if short := facts.get("short"):
         names = ", ".join(
@@ -339,6 +417,7 @@ def assumptions(a: argparse.Namespace, targets: dict, facts: dict) -> list[str]:
         out.append(
             f"Best lr at the edge of its scan (scan further): {', '.join(edges)}."
         )
+    out += cost_lines(targets)
     if placeholder := sorted(
         f for f, t in targets.items() if t.mfu_from == "placeholder"
     ):
@@ -349,14 +428,45 @@ def assumptions(a: argparse.Namespace, targets: dict, facts: dict) -> list[str]:
     return out
 
 
+def cost_lines(targets: dict) -> list[str]:
+    """How the targets' sizes were had, where not measured outright, and why."""
+    say = {
+        "analytic": "Sized by the analytic serving model (no measured match)",
+        "measured, DeepSeek dims": "Sized at the DeepSeek-dims point, the architecture's cost (as trained it serves slower)",
+        "measured upper bound of cost": "Cost measured with fused residual kernels, an upper bound: the 'lower cost' columns give the other end",
+        "kernel-limited, anchored": "KERNEL-LIMITED (the plugin's kernels, not the architecture, set the timing): extrapolated at the anchored size",
+        "kernel-limited, analytic": "KERNEL-LIMITED: extrapolated at the analytic size",
+    }  # fmt: skip
+    groups: dict[str, list[str]] = {}
+    for f, t in sorted(targets.items()):
+        if t.cost_from in say:
+            groups.setdefault(t.cost_from, []).append(f)
+    out = [f"{say[k]}: {', '.join(v)}." for k, v in groups.items()]
+    fallback = sorted(f for f, t in targets.items() if " only (" in t.cost_from)
+    if fallback:
+        out.append(
+            f"Served at the other precision, with none measured at this one: {', '.join(fallback)}."
+        )
+    return out + [
+        f"Why kernel-limited: {r}"
+        for r in sorted(
+            {t.reason for t in targets.values() if t.reason and "kernel" in t.cost_from}
+        )
+    ]
+
+
 def noise_line(analyses: list, reps: int) -> str:
-    """Each metric's noise per run, where it comes from, and the verdict's rule."""
-    each = ", ".join(f"{x.metric} {x.sigma:.2%} ({x.sigma_from})" for x in analyses)
+    """Each metric's noise, where it comes from, and the verdict's rule."""
+    each = ", ".join(
+        f"{x.metric} {x.sigma:.2%} own and {x.seed_sigma:.2%} by seed ({x.sigma_from})"
+        for x in analyses
+    )
     return (
-        f"Noise per run: {each}. The bootstrap refits {reps} times with each point off by it "
-        f"over the root of the runs it averages; 'no measurable difference' means "
-        f"|delta| < {fit_analysis.VERDICT} sigmas of the delta at every rung, "
-        f"sigma x sqrt(1/n + 1/n_parent) for points of n and n_parent runs."
+        f"Noise of a run, seeds as blocks (a seed shifts every family's run alike): {each}. "
+        f"The bootstrap refits {reps} times with each point off by its runs' own noise over the root "
+        f"of their number and by its seeds' shifts, drawn once a refit for every family. "
+        f"'No measurable difference' means |delta| < {fit_analysis.VERDICT} sigmas of the delta at every "
+        f"rung: own sigma x sqrt(1/n + 1/n_parent) for points on the same seeds, the seeds' spread added otherwise."
     )
 
 
@@ -367,6 +477,12 @@ def markdown(a: argparse.Namespace, tables: dict, targets: dict, facts: dict) ->
         *(f"- {s}" for s in assumptions(a, targets, facts)),
         "",
     ]
+    if tables.get("best"):
+        parts += ["## Today's best architecture\n", fit_best.verdict(tables["best"], targets) + "\n",
+                  fit_report.markdown(tables["best"], fit_best.COLUMNS),
+                  *(f"- {line}" for line in fit_best.scale_lines(facts["objective"], a.candidates.split(","), facts["points"], tables["learning_rates"])), "",
+                  ("Against each reference's target of equal measured serving cost; the range spans E held and E fit, "
+                  "and the serving cost's lower bound where it is measured as an upper one.\n")]  # fmt: skip
     for key, title in (
         ("leaderboard_objective", "One-change leaderboard (objective)"),
         ("leaderboard_repo_bpb", "Leaderboard (repositories, 16k)"),
@@ -422,6 +538,7 @@ def log_wandb(tables: dict, plots: list[Path], project: str, out: Path) -> None:
         "points",
         "lr",
         "long_context",
+        "best",
     ):
         rows = tables.get(name, [])
         columns = list(dict.fromkeys(k for r in rows for k in r))
@@ -489,7 +606,14 @@ def parser() -> argparse.ArgumentParser:
         help="comma-separated; default: the four and repo_bpb_* the root has",
     )
     p.add_argument(
-        "--targets", type=Path, help="targets JSON, or serving.py's serving-table.json"
+        "--targets",
+        type=Path,
+        help="targets JSON (targets-measured.json's flags read), or serving.py's serving-table.json",
+    )
+    p.add_argument(
+        "--serve",
+        choices=fit_targets.PRECISIONS,
+        help="the targets' serving precision; default: fp8 once the file has it",
     )
     p.add_argument(
         "--budget", default="B1b", help="the serving budget of a serving-table.json"
@@ -515,6 +639,9 @@ def parser() -> argparse.ArgumentParser:
     p.add_argument(
         "--share",
         help="terms only the root has of its own, as alpha,B,beta: pooled over every family",
+    )
+    p.add_argument(
+        "--candidates", help='comma-separated families for "Today\'s best architecture"'
     )
     p.add_argument(
         "--fix-e",

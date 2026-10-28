@@ -29,6 +29,10 @@ class Target:
     mfu: float
     mfu_from: str  # "measured", "kin <family>", "ancestor <family>" or "placeholder"
     d_model: float | None = None
+    cost_from: str = ""  # how its size was had: measured, via a copy, kernel-limited...
+    # its size at its lower-bound cost, where its own size bounds the cost from above
+    lower: "Target | None" = None
+    reason: str | None = None  # why its size is not measured outright
 
     def hours(self, tokens: float) -> float:
         """B300 GPU-hours to train on `tokens`."""
@@ -39,13 +43,21 @@ class Target:
         return hours * self.mfu * PEAK * 3600 / self.flops
 
 
-def load(path: Path, budget: str = "B1b") -> dict[str, dict]:
+PRECISIONS = ("fp8", "bf16")  # serving precisions a targets file may hold
+
+
+def load(path: Path, budget: str = "B1b", serve: str | None = None) -> dict[str, dict]:
     """The targets by family from a JSON file: ``{family: {"N_active", "N_total",
-    "flops_per_token"?, "d_model"?}}``, or ``serving.py table``'s
-    ``serving-table.json`` (its matches at `budget`)."""
+    "flops_per_token"?, "d_model"?}}`` (targets-measured.json's, with ``measured``
+    and its flags: see `measured`), or ``serving.py table``'s ``serving-table.json``
+    (its matches at `budget`). A file of several serving precisions (`serve`, see
+    `served`) gives that precision's."""
     raw = json.loads(path.read_text())
     if "rows" not in raw:
-        return {f: _aliases(v) for f, v in raw.items()}
+        chosen = serve or _precisions(raw)[0]
+        return {
+            f: _entry(v) for f, v in served(raw, chosen).items() if isinstance(v, dict)
+        }
     out: dict[str, dict] = {}
     for row in raw["rows"]:
         match = row.get(budget) or {}
@@ -53,6 +65,51 @@ def load(path: Path, budget: str = "B1b") -> dict[str, dict]:
             row_of = {"file": row["file"], "arm": row["arm"]}
             if family := serving_family(row["file"], row["arm"]):
                 out.setdefault(family, _aliases(match) | row_of)
+    return out
+
+
+def _entry(v: dict) -> dict:
+    return measured(v) if "measured" in v else _aliases(v)
+
+
+def precisions(path: Path) -> list[str]:
+    """The serving precisions a targets file holds, the default first: fp8 once
+    present, else bf16 (a file of one precision holds bf16's)."""
+    return _precisions(json.loads(path.read_text()))
+
+
+def _precisions(raw: dict) -> list[str]:
+    if "rows" in raw:
+        return ["bf16"]
+    found = {p for p in PRECISIONS if isinstance(raw.get(p), dict)}
+    found |= {
+        p
+        for v in raw.values()
+        if isinstance(v, dict)
+        for p in PRECISIONS
+        if isinstance(v.get(p), dict)
+    }
+    return [p for p in PRECISIONS if p in found] or ["bf16"]
+
+
+def served(raw: dict, serve: str) -> dict:
+    """The entries of one serving precision (`serve`), from a file keyed by
+    precision (``{"fp8": {family: ...}, "bf16": ...}``) or by family
+    (``{family: {"fp8": ..., "bf16": ...}}``); an entry without that precision keeps
+    the one it has, marked. A file of one precision is bf16's."""
+    if any(isinstance(raw.get(p), dict) for p in PRECISIONS):
+        return raw.get(serve, {})
+    out = {}
+    for f, v in raw.items():
+        have = [
+            p for p in PRECISIONS if isinstance(v, dict) and isinstance(v.get(p), dict)
+        ]
+        if not have:
+            out[f] = v if serve == "bf16" else {**v, "fallback": "bf16"}
+        elif serve in have:
+            out[f] = v[serve]
+        else:
+            out[f] = v[have[0]] | {"fallback": have[0]}
     return out
 
 
@@ -71,6 +128,39 @@ def by_architecture(raw: dict, file: Path, arch: Any) -> dict | None:
     except LookupError, AttributeError:
         return None
     return next((r for r in rows if r["arm"] == name), None)
+
+
+def measured(v: dict) -> dict:
+    """A target of targets-measured.json: its top-level size (the measured match, or
+    for a kernel-limited family the anchored or analytic one), how it was had, and,
+    where the top level bounds the cost from above (fused-residual families), the
+    size at the lower bound."""
+    out = _aliases(v) | {
+        "cost_from": cost_label(v),
+        "reason": v.get("reason") or v.get("note"),
+    }
+    if v.get("upper_bound") and v.get("anchored"):
+        out["lower"] = _aliases(v["anchored"])
+    return out
+
+
+def cost_label(v: dict) -> str:
+    """How a measured target's size was had, in a few words."""
+    if v.get("fallback"):
+        return f"{v['fallback']} only ({_label(v)})"
+    return _label(v)
+
+
+def _label(v: dict) -> str:
+    if v.get("kernel_limited"):
+        return "kernel-limited, " + ("anchored" if v.get("anchored") else "analytic")
+    if "+dsdims" in str(v.get("via", "")):
+        return "measured, DeepSeek dims"
+    if v.get("upper_bound"):
+        return "measured upper bound of cost"
+    if v.get("via"):
+        return f"measured via {v['via']}"
+    return "measured" if v.get("measured") else "analytic"
 
 
 def _aliases(v: dict) -> dict:

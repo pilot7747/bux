@@ -54,27 +54,63 @@ def pick(f: str, options: list[str], kind_of: Any) -> str:
     return same[0] if len(same) == 1 else options[0]
 
 
+#: Settings of a run that do not change what it computes, left out of "same config".
+INERT = {"log", "checkpoint", "mesh", "methods", "observe", "seed", "search"}
+
+
 def alias_bases(runs: list[Run], counts: Counts, parents: dict, root: str) -> list[Run]:
-    """`runs` with each axis file's ``base`` arm as the run it repeats: the parent
-    of the axis' other arms, where the two have one architecture at that rung."""
+    """`runs` with every run that repeats another family's as that family's
+    replicate, where the two have one architecture and one training at that rung:
+    an axis file's ``base`` arm, as the parent of the axis' other arms; and any
+    family's run, as its parent (the factorial's all-zeros arm is the hybrid)."""
     for r in runs:
-        if r.arms != ("base",):
-            continue
-        axis = [
-            v
-            for f, v in parents.items()
-            if f.startswith(f"{r.stem}/") and f != r.family
-        ]
-        parent = max(set(axis), key=axis.count) if axis else root
-        stem, _, arm = parent.partition("/")
-        arms = (arm,) if arm else ()
-        mine, theirs = (
-            counts.at(r.stem, r.arms, r.width),
-            counts.at(stem, arms, r.width),
-        )
-        if mine.get("arch") and mine.get("arch") == theirs.get("arch"):
-            r.stem, r.arms, r.replicate = stem, arms, True
+        if r.arms == ("base",):
+            axis = [
+                v
+                for f, v in parents.items()
+                if f.startswith(f"{r.stem}/") and f != r.family
+            ]
+            parent = max(set(axis), key=axis.count) if axis else root
+            same = _same_config(counts, r, parent, base=True)
+        else:
+            parent = parents.get(r.family)
+            same = parent is not None and _same_config(counts, r, parent)
+        if same and parent is not None:
+            stem, _, arm = parent.partition("/")
+            r.stem, r.arms, r.replicate = stem, (arm,) if arm else (), True
     return runs
+
+
+def _same_config(counts: Counts, r: Run, family: str, base: bool = False) -> bool:
+    """Whether `r`'s family and `family` compile to one run at `r`'s rung: one
+    architecture (its source's labels aside) and one training. A base arm whose
+    files are not at hand is matched by its counted architecture alone."""
+    stem, _, arm = family.partition("/")
+    arms = (arm,) if arm else ()
+    mine, theirs = (
+        counts.rung(r.stem, r.arms, r.width),
+        counts.rung(stem, arms, r.width),
+    )
+    if mine is None or theirs is None:
+        ours, other = counts.at(r.stem, r.arms, r.width), counts.at(stem, arms, r.width)
+        return base and bool(ours.get("arch")) and ours.get("arch") == other.get("arch")
+    same_arch = _unlabelled(mine.arch.model_dump(mode="json")) == _unlabelled(
+        theirs.arch.model_dump(mode="json")
+    )
+    return same_arch and _train(mine) == _train(theirs)
+
+
+def _unlabelled(x: Any) -> Any:
+    """`x` without its ``label`` keys: the source text a layer came from."""
+    if isinstance(x, dict):
+        return {k: _unlabelled(v) for k, v in x.items() if k != "label"}
+    return [_unlabelled(v) for v in x] if isinstance(x, list) else x
+
+
+def _train(run: Any) -> dict:
+    return {
+        k: v for k, v in run.train.model_dump(mode="json").items() if k not in INERT
+    }
 
 
 def kind(counts: dict) -> str:

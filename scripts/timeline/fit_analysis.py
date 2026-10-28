@@ -43,6 +43,7 @@ class Options:
     share: tuple[str, ...] = ()  # terms no family but the root has of its own
     sigma_from: str = "--noise"  # where sigma comes from
     e: float | None = None  # E held at this value; None: fit
+    seed_sigma: float = 0.0  # the spread of the seeds' shifts, shared by every family
     drop_scan: tuple[str, ...] = ()  # families whose token scans are left out
 
 
@@ -54,8 +55,9 @@ class Analysis:
     fams: dict[str, Family]
     laws: dict[str, Law]
     q: dict[str, dict]
-    sigma: float = 0.002  # the relative noise of a run
+    sigma: float = 0.002  # the relative noise of a run, besides its seed's shift
     sigma_from: str = "--noise"
+    seed_sigma: float = 0.0  # the spread of the seeds' shifts
     loro: dict[str, dict] = field(default_factory=dict)
     boot: dict[str, dict] = field(default_factory=dict)
 
@@ -77,7 +79,10 @@ def families(
         anchor = kids[f] >= ANCHOR and len({p.width for p in ps if p.ladder}) > 1
         count = np.array([p.replicates for p in ps], float)
         extra = ("alpha",) if anchor else ()
-        out[f] = Family(n, d, y, width, per_param, parent[f], share, extra, count)
+        seeds = [tuple(p.by_seed) or (0,) for p in ps]
+        out[f] = Family(
+            n, d, y, width, per_param, parent[f], share, extra, count, seeds
+        )
     kept = topological(out, root) if root in out else []
     if dropped := sorted(set(out) - set(kept)):
         print(
@@ -101,13 +106,16 @@ def analyze(
         quantities(fams, laws, targets, o.root),
         o.sigma,
         o.sigma_from,
+        o.seed_sigma,
     )
     for f in fams:
         others = leave_one_rung_out(fams, f, laws, o.root, o.joint, o.e)
         qs = [one(f, fams, {**laws, f: law}, targets, o.root) for law in others]
         a.loro[f] = spread(qs, 0, 100)
     if o.reps:
-        reps = bootstrap(fams, laws, o.root, o.joint, o.sigma, o.reps, o.seed, o.e)
+        reps = bootstrap(
+            fams, laws, o.root, o.joint, o.sigma, o.reps, o.seed, o.e, o.seed_sigma
+        )
         qs = [quantities(fb, lb, targets, o.root) for fb, lb in reps]
         a.boot = {f: spread([q[f] for q in qs if f in q], 5, 95) for f in fams}
     return a
@@ -123,6 +131,10 @@ def one(f: str, fams: dict, laws: dict, targets: dict[str, Target], root: str) -
     q = {"law": asdict(laws[f]), "rungs": rows, **trend(rows)}
     if f in targets and root in targets:
         q |= at_target(f, fams[f].parent, laws, targets, root)
+        if (lower := targets[f].lower) is not None:
+            q["lower_cost"] = at_target(
+                f, fams[f].parent, laws, {**targets, f: lower}, root
+            )
     return q
 
 
@@ -142,6 +154,7 @@ def rungs(f: str, fams: dict[str, Family], laws: dict[str, Law]) -> dict[int, di
             if (j := np.flatnonzero(pf.ladder & (pf.width == w))).size:
                 row["delta"] = pct(y, pf.y[j[0]])
                 row["parent_runs"] = _runs(pf, int(j[0]))
+                row["paired"] = _seeds(fam, i) == _seeds(pf, int(j[0]))
         rows[w] = row
     return rows
 
@@ -244,11 +257,15 @@ def spread(qs: list[dict], lo: float, hi: float) -> dict[tuple, tuple[float, flo
     }
 
 
+def _seeds(fam: Family, i: int) -> tuple:
+    return tuple(fam.seeds[i]) if fam.seeds else (0,)
+
+
 def _runs(fam: Family, i: int) -> int:
     return 1 if fam.count is None else int(fam.count[i])
 
 
-def verdict(q: dict, sigma: float) -> str:
+def verdict(q: dict, sigma: float, seed_sigma: float = 0.0) -> str:
     """Whether a family differs from its parent at its rungs beyond the noise: "no
     measurable difference" if every |delta| < VERDICT sigmas of that delta (from
     the runs each side averages), else "better" or "worse" if every delta has that
@@ -256,7 +273,7 @@ def verdict(q: dict, sigma: float) -> str:
     rows = [r for r in q.get("rungs", {}).values() if "delta" in r]
     if not rows:
         return ""
-    if all(abs(r["delta"]) < VERDICT * delta_sigma(r, sigma) for r in rows):
+    if all(abs(r["delta"]) < VERDICT * delta_sigma(r, sigma, seed_sigma) for r in rows):
         return "no measurable difference"
     deltas = [r["delta"] for r in rows]
     return (
@@ -268,8 +285,9 @@ def verdict(q: dict, sigma: float) -> str:
     )
 
 
-def delta_sigma(row: dict, sigma: float) -> float:
-    """The noise of a rung's delta in percent: each side's runs average theirs."""
-    return (
-        100 * sigma * math.sqrt(1 / row.get("runs", 1) + 1 / row.get("parent_runs", 1))
-    )
+def delta_sigma(row: dict, sigma: float, seed_sigma: float = 0.0) -> float:
+    """The noise of a rung's delta in percent: each side's runs average theirs; on
+    the same seeds (paired) their seeds' shifts cancel, else they add."""
+    share = 1 / row.get("runs", 1) + 1 / row.get("parent_runs", 1)
+    block = 0.0 if row.get("paired", True) else seed_sigma**2
+    return 100 * math.sqrt((sigma**2 + block) * share)

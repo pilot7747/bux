@@ -77,6 +77,7 @@ class Family:
     share: tuple[str, ...] = ()  # terms it takes from its parent whatever its points
     extra: tuple[str, ...] = ()  # terms of its own its children's points tell apart
     count: np.ndarray | None = None  # the runs each point averages (1 if None)
+    seeds: list | None = None  # each point's seeds (seed 0 alone if None)
     free: tuple[str, ...] = ()
 
     def __post_init__(self) -> None:
@@ -95,17 +96,31 @@ class Family:
         keep = np.arange(len(self.y)) != i
         return self._take(keep, self.y[keep])
 
-    def noisy(self, rng: np.random.Generator, sigma: float) -> "Family":
-        """This family with each point's loss off by a relative noise of `sigma`
-        over the root of the runs it averages."""
+    def noisy(
+        self, rng: np.random.Generator, sigma: float, shifts: dict | None = None
+    ) -> "Family":
+        """This family with each point's loss off by its runs' own noise, `sigma`
+        over the root of the runs it averages, and by the mean of its seeds'
+        `shifts` (log), which every family's runs of a seed share."""
         count = np.ones(len(self.y)) if self.count is None else self.count
-        y = self.y * np.exp(sigma / np.sqrt(count) * rng.standard_normal(len(self.y)))
+        seeds = self.seeds or [(0,)] * len(self.y)
+        block = np.array(
+            [np.mean([(shifts or {}).get(s, 0.0) for s in ss]) for ss in seeds]
+        )
+        y = self.y * np.exp(
+            block + sigma / np.sqrt(count) * rng.standard_normal(len(self.y))
+        )
         return self._take(np.ones(len(self.y), bool), y)
 
     def _take(self, keep: np.ndarray, y: np.ndarray) -> "Family":
         n, d, w, t = (v[keep] for v in (self.n, self.d, self.width, self.per_param))
         count = None if self.count is None else self.count[keep]
-        return Family(n, d, y, w, t, self.parent, self.share, self.extra, count)
+        seeds = (
+            None
+            if self.seeds is None
+            else [s for s, k in zip(self.seeds, keep, strict=True) if k]
+        )
+        return Family(n, d, y, w, t, self.parent, self.share, self.extra, count, seeds)
 
 
 def own_terms(width: np.ndarray, per_param: np.ndarray, root: bool) -> tuple[str, ...]:
@@ -348,12 +363,18 @@ def bootstrap(
     reps: int,
     seed: int = 0,
     e: float | None = None,
+    seed_sigma: float = 0.0,
 ) -> list[tuple[dict[str, Family], dict[str, Law]]]:
-    """`reps` refits of every family with each point's loss off by a relative
-    noise of `sigma`, each from the full fit."""
+    """`reps` refits of every family, each from the full fit, with each point off
+    by its runs' noise (`sigma`) and by its seeds' shifts, drawn once per refit
+    for every family (`seed_sigma`): seeds act alike across families."""
     rng = np.random.default_rng(seed)
+    seeds = sorted(
+        {s for fam in fams.values() for ss in (fam.seeds or [(0,)]) for s in ss}
+    )
     out = []
     for _ in range(reps):
-        noisy = {f: fam.noisy(rng, sigma) for f, fam in fams.items()}
+        shifts = {s: seed_sigma * rng.standard_normal() for s in seeds}
+        noisy = {f: fam.noisy(rng, sigma, shifts) for f, fam in fams.items()}
         out.append((noisy, fit_metric(noisy, root, joint, laws, e)))
     return out

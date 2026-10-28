@@ -34,7 +34,7 @@ UNLIMITED = [
 LEARNING_RATES = [
     ("family", "family", "s"), ("rung", "rung", "s"), ("trials", "trials", "s"),
     ("learning rates", "lrs", "s"), ("best", "best", ".3g"), ("vertex", "vertex", ".3g"),
-    ("best at the scan's edge", "edge", "s"),
+    ("best at the scan's edge", "edge", "s"), ("at the next lr up %", "above", "+.2f"),
 ]  # fmt: skip
 LIMITED_COLUMNS = [
     ("family", "family", "s"), ("metric", "metric", "s"), ("tokens", "tokens", "s"),
@@ -73,7 +73,7 @@ def leaderboard(a: Analysis, notes: dict[str, dict], root: str) -> list[dict]:
         boot(a, f, ("limited", "1T", "delta_parent"), row, "delta_1T")
         boot(a, f, ("limited", "1T", "delta"), row, "delta_1T_root")
         row["reference"] = a.q.get(f, {}).get("reference")
-        row["verdict"] = verdict(a.q.get(f, {}), a.sigma)
+        row["verdict"] = verdict(a.q.get(f, {}), a.sigma, a.seed_sigma)
         rows.append(row)
     rest = sorted(rows[1:], key=lambda r: -(r.get("mult_target") or r.get("mult") or 0))
     return rows[:1] + rest
@@ -107,7 +107,7 @@ def unlimited(analyses: list[Analysis], targets: dict) -> list[dict]:
             t = targets[f]
             row = {"family": f, "metric": a.metric, "N_active": t.n_active,
                    "N_total": t.n_total, "flops_per_token": t.flops, "mfu": t.mfu,
-                   "mfu_from": t.mfu_from, "reference": a.q[f].get("reference")}  # fmt: skip
+                   "mfu_from": t.mfu_from, "cost_from": t.cost_from, "reference": a.q[f].get("reference")}  # fmt: skip
             boot(a, f, ("asymptote", "loss"), row, "asymptote")
             boot(a, f, ("asymptote", "delta"), row, "asymptote_delta")
             for ref in REFERENCES:
@@ -261,10 +261,12 @@ def _long_row(f: str, w: int, r0: dict, r8: dict, a0: Analysis, a8: Analysis) ->
 UNLIMITED_SUMMARY = [
     ("family", "family", "s"), ("vs", "reference", "s"), ("N active", "N_active", "si"),
     ("N total", "N_total", "si"), ("FLOPs/token", "flops_per_token", "si"), ("MFU", "mfu", ".2f"),
-    ("MFU from", "mfu_from", "s"), ("objective: speedup to vs@1T", "speedup_objective", ".3g"),
+    ("MFU from", "mfu_from", "s"), ("size from", "cost_from", "s"),
+    ("objective: speedup to vs@1T", "speedup_objective", ".3g"),
     ("Δ at vs@1T GPU-h %", "delta_hours_objective", "+.2f"),
     ("repo: speedup to vs@1T", "speedup_repo_bpb", ".3g"),
     ("Δ at vs@1T GPU-h %", "delta_hours_repo_bpb", "+.2f"),
+    ("objective Δ at vs@1T GPU-h, at the lower cost %", "delta_hours_lower", "+.2f"),
 ]  # fmt: skip
 LIMITED_SUMMARY = [
     ("family", "family", "s"), ("vs", "reference", "s"), ("objective at 1T", "loss_1T", ".4f"),
@@ -272,6 +274,7 @@ LIMITED_SUMMARY = [
     ("Δ 1T %", "delta_1T", "+.2f"), ("Δ 10T %", "delta_10T", "+.2f"),
     ("Δ 1T vs root %", "delta_1T_root", "+.2f"), ("repo Δ 1T %", "repo_delta_1T", "+.2f"),
     ("repo after 8k Δ 1T %", "repo8k_delta_1T", "+.2f"),
+    ("Δ 1T at the lower cost %", "delta_1T_lower", "+.2f"),
 ]  # fmt: skip
 LONG_SUMMARY = [
     ("family", "family", "s"), ("vs", "parent", "s"), ("rungs", "rungs", "s"),
@@ -291,7 +294,8 @@ def unlimited_summary(analyses: list[Analysis], targets: dict) -> list[dict]:
             continue
         t = targets[f]
         row = {"family": f, "reference": main.q[f].get("reference"), "N_active": t.n_active,
-               "N_total": t.n_total, "flops_per_token": t.flops, "mfu": t.mfu, "mfu_from": t.mfu_from}  # fmt: skip
+               "N_total": t.n_total, "flops_per_token": t.flops, "mfu": t.mfu, "mfu_from": t.mfu_from,
+               "cost_from": t.cost_from}  # fmt: skip
         for m in ("objective", "repo_bpb"):
             if m in by:
                 boot(by[m], f, ("unlimited", "1T", "speedup"), row, f"speedup_{m}")
@@ -302,6 +306,13 @@ def unlimited_summary(analyses: list[Analysis], targets: dict) -> list[dict]:
                     row,
                     f"delta_hours_{m}",
                 )
+        boot(
+            main,
+            f,
+            ("lower_cost", "unlimited", "1T", "delta_equal_hours"),
+            row,
+            "delta_hours_lower",
+        )
         rows.append(row)
     return rows
 
@@ -322,6 +333,13 @@ def limited_summary(analyses: list[Analysis]) -> list[dict]:
         for d in map(tokens_label, LIMITED):
             boot(main, f, ("limited", d, "delta_parent"), row, f"delta_{d}")
         boot(main, f, ("limited", "1T", "delta"), row, "delta_1T_root")
+        boot(
+            main,
+            f,
+            ("lower_cost", "limited", "1T", "delta_parent"),
+            row,
+            "delta_1T_lower",
+        )
         for m, key in (
             ("repo_bpb", "repo_delta_1T"),
             ("repo_bpb_8k", "repo8k_delta_1T"),

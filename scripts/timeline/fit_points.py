@@ -61,6 +61,7 @@ class Run:
     tokens: float
     metrics: dict[str, float]
     replicate: bool = False  # a seed's run, or a base arm's: another run of a point
+    seed: int = 0  # its training seed: seeds act alike across families (a block)
 
     @property
     def family(self) -> str:
@@ -83,6 +84,7 @@ class Point:
     edge: bool = False  # the best learning rate is the scan's highest or lowest
     replicates: int = 1
     counts: dict = field(default_factory=dict)  # total, nonembed, active (fit_counts)
+    by_seed: dict = field(default_factory=dict)  # each seed's metrics at its lr
 
     @property
     def n(self) -> float:
@@ -158,8 +160,10 @@ def parse_row(row: dict) -> Run | None:
         or number(row.get("budget"))
         or RUNG_TOKENS.get(width, math.nan) * (per_param / LADDER)
     )
-    seeded = settings.get("seed", "0") != "0"
-    return Run(stem, arms, width, per_param, lr, tokens, final_metrics(row), seeded)
+    seed = int(settings.get("seed", "0"))
+    return Run(
+        stem, arms, width, per_param, lr, tokens, final_metrics(row), seed != 0, seed
+    )
 
 
 def cut_short(runs: list[Run]) -> tuple[list[Run], list[Run]]:
@@ -233,7 +237,16 @@ def _best(by_lr: dict[float | None, list[Run]], pick: str, average: bool) -> Poi
         lrs=tuple(known),
         edge=len(lrs) > 1 and i in (0, len(lrs) - 1),
         replicates=len(used),
+        by_seed=_by_seed(used),
     )
+
+
+def _by_seed(runs: list[Run]) -> dict[int, dict[str, float]]:
+    """The runs' metrics by seed, a seed's runs averaged."""
+    seeds: dict[int, list[dict]] = defaultdict(list)
+    for r in runs:
+        seeds[r.seed].append(r.metrics)
+    return {s: _mean(ms) for s, ms in sorted(seeds.items())}
 
 
 def _mean(rows: list[dict[str, float]]) -> dict[str, float]:
@@ -254,18 +267,82 @@ def _vertex(lrs: list[float], means: dict) -> dict[str, float]:
     }
 
 
+DIVERGED = 1.05  # a run this much worse than its point's best run diverged
+
+
+def diverged_seeds(runs: list[Run]) -> tuple[list[Run], list[Run]]:
+    """The runs kept, and those more than `DIVERGED` times their point's best run
+    (same family, rung, budget and lr) on the objective: a seed that diverged."""
+    best: dict[tuple, float] = {}
+    for r in runs:
+        if "objective" in r.metrics:
+            k = (r.family, r.width, r.per_param, r.lr)
+            best[k] = min(best.get(k, math.inf), r.metrics["objective"])
+
+    def bad(r: Run) -> bool:
+        k = (r.family, r.width, r.per_param, r.lr)
+        return "objective" in r.metrics and r.metrics["objective"] > DIVERGED * best[k]
+
+    return [r for r in runs if not bad(r)], [r for r in runs if bad(r)]
+
+
 def noise(runs: list[Run], metric: str = "objective") -> tuple[float, int] | None:
-    """The relative standard deviation of `metric` between runs at the same point
-    and learning rate, pooled, and how many such pairs of runs there were."""
-    groups: dict[tuple, list[float]] = defaultdict(list)
+    """The relative noise of `metric` between runs at the same point and learning
+    rate, seeds' blocks left in, and its degrees of freedom."""
+    block = seed_noise(runs, metric)
+    return (
+        (math.hypot(block["sigma"], block["seed_sigma"]), block["dof"])
+        if block
+        else None
+    )
+
+
+def seed_noise(runs: list[Run], metric: str = "objective") -> dict | None:
+    """The noise of `metric` between runs at one point and lr, seeds as blocks: a
+    seed shifts every family's run alike (its ``effects``, log, mean 0), the rest is
+    the run's own (``sigma``). ``seed_sigma`` is the spread of the seeds' shifts,
+    their estimates' own noise taken out."""
+    groups: dict[tuple, dict[int, list[float]]] = defaultdict(lambda: defaultdict(list))
     for r in runs:
         if metric in r.metrics:
-            groups[(r.family, r.width, r.per_param, r.lr)].append(r.metrics[metric])
-    devs = [np.log(v) - np.mean(np.log(v)) for v in groups.values() if len(v) > 1]
-    if not devs:
+            groups[(r.family, r.width, r.per_param, r.lr)][r.seed].append(
+                math.log(r.metrics[metric])
+            )
+    cells = [
+        {s: float(np.mean(v)) for s, v in g.items()}
+        for g in groups.values()
+        if len(g) > 1
+    ]
+    if not cells:
         return None
-    dof = sum(len(d) - 1 for d in devs)
-    return float(math.sqrt(sum(float(np.sum(d**2)) for d in devs) / dof)), dof
+    effects, means = _blocks(cells)
+    resid = [
+        y - means[i] - effects[s] for i, c in enumerate(cells) for s, y in c.items()
+    ]
+    dof = len(resid) - len(cells) - (len(effects) - 1)
+    if dof < 1:
+        return None
+    sigma = math.sqrt(sum(r * r for r in resid) / dof)
+    per_seed = np.mean([sum(s in c for c in cells) for s in effects])
+    spread = float(np.var(list(effects.values()), ddof=1)) if len(effects) > 1 else 0.0
+    seed_sigma = math.sqrt(max(spread - sigma**2 / per_seed, 0.0))
+    return {"sigma": sigma, "seed_sigma": seed_sigma, "effects": effects, "dof": dof}
+
+
+def _blocks(cells: list[dict[int, float]]) -> tuple[dict[int, float], list[float]]:
+    """Seed shifts and cell means of an additive model, fit by alternation."""
+    seeds = sorted({s for c in cells for s in c})
+    effects = dict.fromkeys(seeds, 0.0)
+    means = [0.0] * len(cells)
+    for _ in range(50):
+        means = [float(np.mean([y - effects[s] for s, y in c.items()])) for c in cells]
+        effects = {
+            s: float(np.mean([c[s] - means[i] for i, c in enumerate(cells) if s in c]))
+            for s in seeds
+        }
+        shift = float(np.mean(list(effects.values())))
+        effects = {s: e - shift for s, e in effects.items()}
+    return effects, means
 
 
 def metrics_of(ps: list[Point], root: str = ROOT) -> list[str]:
@@ -333,4 +410,5 @@ def _vertex_row(family: str, width: int, by_lr: dict) -> dict:
         c2, c1, _ = np.polyfit(x[fit], y[fit], 2)
         vertex = math.exp(-c1 / (2 * c2)) if c2 > 0 else vertex
     return {"family": family, "rung": width, "trials": len(lrs), "best": lrs[i], "vertex": vertex,
-            "edge": i in (0, len(lrs) - 1), "lrs": " ".join(f"{lr:g}" for lr in lrs)}  # fmt: skip
+            "edge": i in (0, len(lrs) - 1), "lrs": " ".join(f"{lr:g}" for lr in lrs),
+            "above": 100 * (y[i + 1] / y[i] - 1) if i + 1 < len(lrs) else math.nan}  # fmt: skip
