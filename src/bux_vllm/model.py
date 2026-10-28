@@ -66,13 +66,14 @@ LAYER_MODULES = (
 
 @cache
 def layer_classes() -> dict[str, type[Layer]]:
-    """Return every layer's class, by the bux layer type it implements."""
+    """Return every layer's class, by the bux layer type it implements: a class
+    that names its ``bux_types`` itself, not one that inherits them."""
     out = {}
     for name in LAYER_MODULES:
         module = importlib.import_module(f"{__package__}.{name}")
         for value in vars(module).values():
             if isinstance(value, type) and value.__module__ == module.__name__:
-                out |= dict.fromkeys(getattr(value, "bux_types", ()), value)
+                out |= dict.fromkeys(vars(value).get("bux_types", ()), value)
     return out
 
 
