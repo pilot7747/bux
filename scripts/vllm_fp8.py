@@ -10,14 +10,16 @@ environment):
     JAX_PLATFORMS=cpu python scripts/vllm_fp8.py export DIR
     # vLLM's, with the plugin (pip install src/bux_vllm): serve each twice, compare
     python scripts/vllm_fp8.py run DIR [--quantization fp8] [--kv-cache-dtype fp8]
-        [--moe-backend triton] [--tp 2] [--eager] [--only CASE ...]
+        [--moe-backend triton] [--linear-backend cutlass] [--tp 2] [--eager]
+        [--only CASE ...]
     # either: judge the runs at DIR again, without serving them
     python scripts/vllm_fp8.py report DIR [--only CASE ...]
 
 `run` serves each case's export twice, each in a process of its own: in bfloat16,
 and under ``--quantization`` (``fp8`` by default: vLLM 0.32 quantizes the bfloat16
 weights as it loads them, its ``fp8_per_tensor``), and with ``--kv-cache-dtype``
-its KV cache in that dtype too. Each decodes the prompts of
+its KV cache in that dtype too; ``--linear-backend`` picks its FP8 GEMMs' kernels
+(vLLM's ``linear_backend``: ``cutlass``, ``triton``, ``deep_gemm``...). Each decodes the prompts of
 `scripts/vllm_parity.py` greedily and keeps the log-probabilities of the whole
 vocabulary at every position. For each case it prints the quantization methods vLLM
 picked, counted by kind of layer (its class and the last part of its name), with
@@ -169,6 +171,7 @@ def main() -> None:
         s = sub.choices[name]
         s.add_argument("--quantization", default="fp8")
         s.add_argument("--kv-cache-dtype", default=None)
+        s.add_argument("--linear-backend", default=None)
         s.add_argument("--tp", type=int, default=1)
         s.add_argument("--eager", action="store_true")
         s.add_argument("--moe-backend", default="triton")
@@ -323,8 +326,9 @@ def run(args: argparse.Namespace, name: str) -> bool:
             old.unlink()
         cmd = [sys.executable, __file__, "run-one", str(args.dir), "--only", name]
         cmd += ["--tag", tag, "--quantization", args.quantization]
-        if args.kv_cache_dtype is not None:
-            cmd += ["--kv-cache-dtype", args.kv_cache_dtype]
+        for flag in ("kv_cache_dtype", "linear_backend"):
+            if (value := getattr(args, flag)) is not None:
+                cmd += [f"--{flag.replace('_', '-')}", value]
         cmd += ["--tp", str(args.tp), "--moe-backend", args.moe_backend]
         cmd += ["--mamba-ssm-cache-dtype", args.mamba_ssm_cache_dtype]
         if args.attention_backend is not None:
@@ -346,6 +350,8 @@ def run_one(args: argparse.Namespace, where: Path) -> None:
         engine["quantization"] = args.quantization
     if kv is not None:
         engine["kv_cache_dtype"] = kv
+    if args.tag == "fp8" and args.linear_backend is not None:
+        engine["linear_backend"] = args.linear_backend  # the FP8 GEMMs' kernels
     llm = vllm_parity.serve(where, engine)
     vllm_parity.decode(llm, where, args.tag)
     layers = llm.apply_model(survey)[0] | {"kv_cache_dtype": kv}
