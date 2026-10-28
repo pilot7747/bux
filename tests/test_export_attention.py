@@ -156,6 +156,23 @@ PORTS = {
 }
 
 
+#: The hybrid's global layer, beside value embeddings of its 2 kv heads of 16.
+VALUE_EMBED = (
+    HEAD + FFN + "attn = gqa(num_heads=4, num_kv_heads=2, qk_norm=rmsnorm, gated=true,"
+    " kv_conv_size=2)\nve = value_embed(features=32)\n"
+    + "block(mixer) = [rmsnorm mixer] [rmsnorm ffn]\n"
+)
+PORTS |= {
+    "value embeddings": VALUE_EMBED
+    + "model = embed ve(ve=@t) block(attn(v=@v1, ve=$t))"
+    " [rmsnorm ve(ve=@u) attn(v=$v1, ve=$u!)] [rmsnorm ffn] rmsnorm head",
+    "value embeddings, one table, no gate, hc": "residual = hc(expansion=2)\n"
+    + VALUE_EMBED
+    + "model = embed ve(ve=@t) block(attn(ve=$t, value_embed_gate=none))"
+    " block(attn(ve=$t!, value_embed_gate=none)) rmsnorm head",
+}
+
+
 @pytest.mark.parametrize("source", PORTS.values(), ids=PORTS.keys())
 def test_gqa_ports(source: str) -> None:
     check.compare(compile(source)).check()
