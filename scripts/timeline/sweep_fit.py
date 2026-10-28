@@ -45,11 +45,15 @@ class Width:
     active: float
     best: list[dict] = field(default_factory=list)
     model: float | None = None  # the model's best sessions per hour per GPU
+    seeds: bool = False  # whether its lanes are seeds of one model (the budget's)
 
     def cost(self) -> float:
-        """Sessions per hour per GPU, the mean of its lanes' bests (0 if none)."""
+        """Sessions per hour per GPU, the best of its lanes' bests (0 if none): a lane
+        timed again by a faster implementation supersedes the slower one. The
+        budget's lanes are seeds of one model, and their mean is its cost."""
         values = [b["sessions_per_hour"] / self.tp for b in self.best if b]
-        return statistics.mean(values) if values else 0.0
+        pool = statistics.mean if self.seeds else max
+        return pool(values) if values else 0.0
 
 
 def read(paths: list[Path]) -> list[dict]:
@@ -70,6 +74,7 @@ def widths(rows: list[dict], slo: float) -> dict[str, dict[int, Width]]:
         first = points[0]
         gpus = first.get("gpus", first["tp"])
         w = out[family].setdefault(d, Width(d, gpus, *_params(first)))
+        w.seeds = family == BUDGET
         w.model = (first.get("predicted_best") or {}).get("sessions_per_hour")
         ok = [p["measured"] for p in points if p["measured"]["tpot_p50_ms"] <= slo]
         w.best.append(max(ok, key=lambda m: m["sessions_per_hour"], default={}))
@@ -337,6 +342,22 @@ def anchored(ws: dict[int, Width], ref: dict[int, Width], budget: float) -> dict
     return {} if "error" in m else m | {"model_ratio": w.model / r.model}
 
 
+def served_as(entry: dict, variant: dict, name: str) -> dict:
+    """A family whose cost is its served variant's (dims vLLM's fast kernels take):
+    the variant's match in the family's parameters, its own timing kept beside."""
+    kept = (
+        "N_active",
+        "N_total",
+        "d_model",
+        "tp",
+        "interpolation",
+        "sessions_per_hour",
+    )
+    out = {k: variant[k] for k in ("d_model", "tp", "interpolation", "budget")}
+    out |= variant["as_trained"] | {"measured": True, "via": name}
+    return out | {"as_timed": {k: entry[k] for k in kept if k in entry}}
+
+
 def kernel_limited(
     entry: dict, model: dict | None, reason: str, anchor: dict | None = None
 ) -> dict:
@@ -376,7 +397,24 @@ def main() -> None:
     for variant, base in (x.split("=", 1) for x in a.trained_as):
         if variant in out and base in fams:
             out[variant] = as_trained(out[variant], fams[base])
+            if "as_trained" in out[variant]:
+                out[base] = served_as(out[base], out[variant], variant)
     budget = statistics.mean(w.cost() for w in fams[BUDGET].values())
+    for family, note in (x.split("=", 1) for x in a.upper_bound):
+        if family in out:
+            out[family] |= {"upper_bound": True, "note": note}
+            ref = likes.get(family)
+            if (
+                ref
+                and family in fams
+                and (anchor := anchored(fams[family], fams[ref], budget))
+            ):
+                out[family]["anchored"] = anchor
+    for family, entry in out.items():
+        m = analytic.get(family)
+        if m is not None and "analytic" not in entry:
+            entry["analytic"] = {"N_active": m["active"], "N_total": m["params"]}
+            entry["analytic"]["d_model"] = m["d_model"]
     for family, reason in (x.split("=", 1) for x in a.kernel_limited):
         ref = likes.get(family)
         anchor = (
@@ -412,6 +450,13 @@ def parser() -> argparse.ArgumentParser:
         default=[],
         metavar="FAMILY=REFERENCE",
         help="a family timed at one width, with REFERENCE's serving shape",
+    )
+    p.add_argument(
+        "--upper-bound",
+        action="append",
+        default=[],
+        metavar="FAMILY=NOTE",
+        help="a family whose measured cost bounds its architecture's from above",
     )
     p.add_argument(
         "--same",

@@ -52,7 +52,7 @@ from vllm.v1.kv_cache_interface import (
     SlidingWindowMLASpec,
 )
 
-from . import compressed
+from . import compressed, kernels
 from .common import (
     ACTIVATIONS,
     Ctx,
@@ -354,6 +354,7 @@ def attend_op(
     index = None
     if index_q is not None and index_w is not None:
         index = (index_q[:n], index_w[:n])
+    kernel = kernels.takes_csa(q.dtype, q.shape[-1])
     out[:n] = compressed.mix(
         call.caches(meta, n),
         m.steps(positions),
@@ -363,6 +364,8 @@ def attend_op(
         None if rows is None else rows[:n],
         index,
         sinks,
+        kernels.csa_attend if kernel else None,
+        kernels.csa_select if kernel else None,
     )
 
 

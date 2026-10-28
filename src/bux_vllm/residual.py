@@ -8,11 +8,15 @@ gives the body its input, and ``branch.write_back(kept, f(h))`` the stream after
 branch. hc, mhc and gr widen the stream into n copies, (T, n, d); attnres holds the
 embedding and the branch outputs so far as `Sources`; vpgate keeps one stream. All of
 it is per token, so decoding keeps no state of its own. Plain PyTorch, which
-`bux_vllm.model` runs and a CPU test checks against the export.
+`bux_vllm.model` runs and a CPU test checks against the export; in a 16-bit model
+hc's, mhc's and attnres's reads and writes run `bux_vllm.streams`' fused kernels
+instead (`fused`), which read and write a branch's streams once each.
 """
 
 from __future__ import annotations
 
+import importlib
+import os
 from dataclasses import dataclass
 from typing import Any
 
@@ -24,6 +28,38 @@ from .common import Ctx, Layer, Norm, Site
 
 #: In Sinkhorn's sums and added to mhc's read: DeepSeek-V4's hc_eps.
 EPS = 1e-6
+#: Which path hc's, mhc's and attnres's reads and writes take: ``triton``
+#: (`bux_vllm.streams`), ``torch``, or unset for the kernels in a 16-bit model on a
+#: GPU; read once.
+CHOICE = os.environ.get("BUX_VLLM_RESIDUAL_KERNELS")
+#: How a fused read weighs the streams (`bux_vllm.streams`): by its own
+#: coefficients, by those the branch before computed, or stream 0 alone.
+OWN, PENDING, FIRST = 0, 1, 2
+
+
+def fused() -> bool:
+    """Whether a branch built now runs `bux_vllm.streams`' kernels, by `CHOICE` and
+    the dtype vLLM builds the model in, torch's default then."""
+    if CHOICE is None:
+        sixteen = torch.get_default_dtype() in (torch.bfloat16, torch.float16)
+        on = sixteen and torch.cuda.is_available()
+    else:
+        on = CHOICE == "triton"
+    if on:
+        importlib.import_module(f"{__package__}.streams")  # its ops
+    return on
+
+
+def _pad(n: int) -> int:
+    """The power of two a kernel holds `n` in, 2 at least (`bux_vllm.streams.pad`)."""
+    return max(2, 1 << (n - 1).bit_length())
+
+
+def _how(single_pass: bool, ctx: Ctx) -> tuple[int, torch.Tensor | None]:
+    """How a fused read weighs the streams, and the coefficients it reads by."""
+    if not single_pass:
+        return OWN, None
+    return (FIRST, None) if ctx.pending_read is None else (PENDING, ctx.pending_read)
 
 
 def _param(*shape: int, fill: float = 0.0) -> nn.Parameter:
@@ -65,8 +101,8 @@ def pending(ctx: Ctx, x: torch.Tensor) -> torch.Tensor:
     computed, or stream 0 alone before any branch."""
     if ctx.pending_read is not None:
         return ctx.pending_read
-    first = torch.zeros(x.shape[-2], dtype=x.dtype, device=x.device)
-    first[0] = 1
+    # stream 0's one-hot, made on the device: a CPU scalar write would copy in a graph
+    first = (torch.arange(x.shape[-2], device=x.device) == 0).to(x.dtype)
     return first.expand(x.shape[:-1])
 
 
@@ -81,48 +117,48 @@ def _single_pass_read(computed: torch.Tensor, x: torch.Tensor, ctx: Ctx) -> Any:
 @dataclass
 class Sources:
     """attnres's state: the embedding and each finished block's sum of branch
-    outputs (each output alone without blocks), and the sum of the block under way,
-    in float32, of its `count` outputs.
+    outputs (each output alone without blocks), side by side, (T, m, d), and the sum
+    of the block under way, in float32, of its `count` outputs.
 
     It is what the export's state, the embedding and every output so far, reads
     as (`bux.export.hf.residual.sources`), kept as it grows: a branch adds its output
     to the block under way rather than to a list of every output.
     """
 
-    done: tuple[torch.Tensor, ...]
+    done: torch.Tensor
     partial: torch.Tensor | None = None
     count: int = 0
 
     def add(self, y: torch.Tensor, block_size: int | None) -> Sources:
         """Return the state after a branch's output y."""
         if block_size is None:
-            return Sources((*self.done, y))
+            return Sources(torch.cat([self.done, y[:, None]], 1))
         partial = y.float() if self.partial is None else self.partial + y.float()
         if self.count + 1 == block_size:
-            return Sources((*self.done, partial.to(y.dtype)))
+            return Sources(torch.cat([self.done, partial.to(y.dtype)[:, None]], 1))
         return Sources(self.done, partial, self.count + 1)
 
     def values(self) -> torch.Tensor:
         """Return the sources, (T, m, d): the done ones, then the block under way."""
-        dtype = self.done[0].dtype
-        under_way = () if self.partial is None else (self.partial.to(dtype),)
-        return torch.stack([*self.done, *under_way], -2)
+        if self.partial is None:
+            return self.done
+        under_way = self.partial.to(self.done.dtype)[:, None]
+        return torch.cat([self.done, under_way], 1)
 
     def __add__(self, other: Sources) -> Sources:
         """Two states of as many outputs, summed source by source."""
         if not isinstance(other, Sources):
             return NotImplemented
-        done = tuple(a + b for a, b in zip(self.done, other.done, strict=True))
         if self.partial is None or other.partial is None:
-            return Sources(done)
-        return Sources(done, self.partial + other.partial, self.count)
+            return Sources(self.done + other.done)
+        return Sources(self.done + other.done, self.partial + other.partial, self.count)
 
     def __mul__(self, other: float) -> Sources:
         """The state times a constant."""
         if not isinstance(other, (int, float)):
             raise NotImplementedError("attnres: a product of its states in vLLM")
         partial = None if self.partial is None else self.partial * other
-        return Sources(tuple(v * other for v in self.done), partial, self.count)
+        return Sources(self.done * other, partial, self.count)
 
     __rmul__ = __mul__
 
@@ -164,7 +200,7 @@ class HyperConnections(Branch):
         super().__init__()
         n, eps = c["expansion"], c["norm_eps"]
         columns = n + 1 if body else 1
-        self.single_pass = c["single_pass"]
+        self.single_pass, self.eps, self.kernels = c["single_pass"], eps, fused()
         self.static_alpha = _param(n, columns)
         self.static_beta = _param(n, fill=1.0) if body else None
         dynamic = c["dynamic"]
@@ -178,6 +214,8 @@ class HyperConnections(Branch):
 
     def read(self, x: torch.Tensor, ctx: Ctx) -> tuple[torch.Tensor, Any]:
         """Return what f reads of the n streams x, and what `write_back` needs."""
+        if self.kernels:
+            return self._fused_read(x, ctx)
         alpha = self._alpha(x)
         read = alpha[..., 0]
         if self.single_pass:
@@ -188,10 +226,49 @@ class HyperConnections(Branch):
         """Return the n streams after the branch, of f's output y."""
         assert self.static_beta is not None
         x, alpha = kept
+        if self.kernels:  # alpha holds A, then B in column n + 1
+            n = x.shape[1]
+            return _write(x, y, alpha[:, :n, 1 : n + 1], alpha[:, :n, n + 1], 0)
         beta = self.static_beta.expand(x.shape[:-1])
         if self.dynamic_beta is not None:
             beta = beta + self.dynamic_beta(x)[..., 0]
         return mixed(alpha[..., 1:], x) + beta[..., None] * y[..., None, :]
+
+    def _fused_read(self, x: torch.Tensor, ctx: Ctx) -> tuple[torch.Tensor, Any]:
+        """`read` by `bux_vllm.streams.hc_read`: the coefficients, (T, pad(n),
+        pad(k + 1)) in float32, A's and then B's, and the read, in one kernel."""
+        t, n, d = x.shape
+        k = self.static_alpha.shape[1]
+        coef = x.new_empty((t, _pad(n), _pad(k + 1)), dtype=torch.float32)
+        h, (how, before) = x.new_empty((t, d)), _how(self.single_pass, ctx)
+        a, b = self.dynamic_alpha, self.dynamic_beta
+        torch.ops.vllm.bux_hc_read(
+            x,
+            self.static_alpha,
+            self.static_beta,
+            None if a is None else a.proj,
+            None if b is None else b.proj,
+            None if a is None else a.scale,
+            None if b is None else b.scale,
+            before,
+            h,
+            coef,
+            self.eps,
+            how,
+        )
+        if self.single_pass:
+            ctx.pending_read = coef[:, :n, 0]
+        return h, (x, coef)
+
+
+def _write(
+    x: torch.Tensor, y: torch.Tensor, m: torch.Tensor, b: torch.Tensor, iters: int
+) -> torch.Tensor:
+    """The streams after a branch by `bux_vllm.streams.mix_write`, of the streams x
+    and the body's output y."""
+    out = torch.empty_like(x, memory_format=torch.contiguous_format)
+    torch.ops.vllm.bux_mix_write(x, y, m, b, out, iters)
+    return out
 
 
 class Dynamic(nn.Module):
@@ -223,7 +300,7 @@ class ManifoldHyperConnections(Branch):
         self.n, self.single_pass = n, c["single_pass"]
         self.iters, self.norm_eps = c["sinkhorn_iters"], c["norm_eps"]
         columns = 2 * n + n * n if body else n
-        dynamic = c["dynamic"]
+        dynamic, self.kernels = c["dynamic"], fused()
         self.proj = _param(n * d, columns) if dynamic else None
         self.scale = _param(3 if body else 1) if dynamic else None
         self.bias = _param(columns)
@@ -242,6 +319,8 @@ class ManifoldHyperConnections(Branch):
 
     def read(self, x: torch.Tensor, ctx: Ctx) -> tuple[torch.Tensor, Any]:
         """Return what f reads of the n streams x, and what `write_back` needs."""
+        if self.kernels:
+            return self._fused_read(x, ctx)
         logits = self._logits(x)
         read = torch.sigmoid(logits[..., : self.n]) + EPS
         if self.single_pass:
@@ -252,9 +331,35 @@ class ManifoldHyperConnections(Branch):
         """Return the n streams after the branch, of f's output y."""
         x, logits = kept
         n = self.n
+        if self.kernels:  # Sinkhorn's rounds in the kernel
+            res = logits[:, 2 * n : 2 * n + n * n].view(-1, n, n)
+            return _write(x, y, res, logits[:, n : 2 * n], self.iters)
         post = 2 * torch.sigmoid(logits[..., n : 2 * n])
         res = logits[..., 2 * n :].reshape(*logits.shape[:-1], n, n)
         return mixed(sinkhorn(res, self.iters), x) + post[..., None] * y[..., None, :]
+
+    def _fused_read(self, x: torch.Tensor, ctx: Ctx) -> tuple[torch.Tensor, Any]:
+        """`read` by `bux_vllm.streams.mhc_read`: the logits, (T, pad(k)) in float32,
+        the coefficients the read computed, and the read, in one kernel."""
+        t, n, d = x.shape
+        logits = x.new_empty((t, _pad(self.bias.shape[0])), dtype=torch.float32)
+        computed = x.new_empty((t, _pad(n)), dtype=torch.float32)
+        h, (how, before) = x.new_empty((t, d)), _how(self.single_pass, ctx)
+        torch.ops.vllm.bux_mhc_read(
+            x,
+            self.proj,
+            self.scale,
+            self.bias,
+            before,
+            h,
+            logits,
+            computed,
+            self.norm_eps,
+            how,
+        )
+        if self.single_pass:
+            ctx.pending_read = computed[:, :n]
+        return h, (x, logits)
 
 
 class GatedResidual(Branch):
@@ -305,10 +410,17 @@ class AttentionResidual(Branch):
         super().__init__()
         self.query = _param(d)
         self.key_norm = _norm("rmsnorm", c["norm_eps"], d)
-        self.block_size = c["block_size"]
+        self.block_size, self.kernels = c["block_size"], fused()
 
     def read(self, x: Sources, ctx: Ctx) -> tuple[torch.Tensor, Any]:
-        """Return what f reads of the state x, and what `write_back` needs."""
+        """Return what f reads of the state x, and what `write_back` needs; by
+        `bux_vllm.streams.attnres_read` with the kernels."""
+        if self.kernels:
+            t, _, d = x.done.shape
+            h = x.done.new_empty((t, d))
+            gain, eps = self.key_norm.weight, self.key_norm.eps
+            torch.ops.vllm.bux_attnres_read(x.done, x.partial, gain, self.query, h, eps)
+            return h, x
         v = x.values()
         scores = torch.einsum("...md,d->...m", self.key_norm(v), self.query)
         return torch.einsum("...m,...md->...d", scores.softmax(-1), v), x
@@ -375,7 +487,7 @@ def widen(residual: dict | None, x: torch.Tensor) -> Any:
     kind = None if residual is None else residual["type"]
     if residual is not None and kind in ("hc", "mhc", "gr"):
         return x[..., None, :].expand(*x.shape[:-1], residual["expansion"], -1)
-    return Sources((x,)) if kind == "attnres" else x
+    return Sources(x[:, None]) if kind == "attnres" else x
 
 
 class Merge(Layer):
@@ -393,6 +505,6 @@ class Merge(Layer):
         self.reader: Branch | None = None if single else cls(residual, d, body=False)
 
     def forward(self, x: Any, ctx: Ctx) -> torch.Tensor:
-        if self.reader is None:
-            return mix(pending(ctx, x), x)
+        if self.reader is None:  # the kernels' coefficients are float32
+            return mix(pending(ctx, x).to(x.dtype), x)
         return self.reader.read(x, ctx)[0]
