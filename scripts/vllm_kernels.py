@@ -32,6 +32,8 @@ SETTINGS = {
     "dsa, odd index dims": {"index_dims": 31},
     "msa blocks": {"block_size": 4, "top_k": 32},
     "msa blocks per group": {"block_size": 4, "top_k": 32, "per_group": True},
+    "msa blocks of 16": {"block_size": 16, "top_k": 64, "window": 200},
+    "msa blocks of 16 per group": {"block_size": 16, "top_k": 64, "per_group": True},
     "qsa blocks, window": {"block_size": 4, "top_k": 32, "mean": True, "window": 64},
 }
 
