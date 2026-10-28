@@ -727,7 +727,7 @@ def attend_segment(
     table = rows.expand(count, -1)
     span = torch.arange(n, device=q.device)
     keys = cache.keys(rows, span[None])[0] if shared and spec.mean else None
-    per = picks._per_query(spec, q, index[0], cache.kv, n, shared or not spec.mean)
+    per = _per_query(spec, index[0], n, shared)
     chunk, outs, kept = max(1, picks.BUDGET // per), [], []
     for a in range(0, count, chunk):
         cut = slice(a, a + chunk)
@@ -738,6 +738,22 @@ def attend_segment(
         kept.append(picks.padded(picked, picks.most(spec)))
     out_keys, valid = zip(*kept, strict=True)
     return torch.cat(outs), (torch.cat(out_keys), torch.cat(valid))
+
+
+def _per_query(spec: Sparse, iq: torch.Tensor, n: int, one: bool) -> int:
+    """The elements of a query's largest intermediate on the kernels' path, of `n`
+    keys, its request's alone if `one`: its picks, and its ranking keys (DSA's in a
+    prompt), its blocks' best scores and mask (MSA's), PyTorch's scores of every head
+    and gathered keys (QSA's), or its scores, their mask and ranking keys."""
+    groups = spec.groups[1] if spec.per_group else 1
+    most = 2 * groups * picks.most(spec)  # int64 positions
+    if spec.mean:
+        return max(most, iq.shape[1] * n, 0 if one else n * iq.shape[2])
+    if one and spec.block_size == 1:
+        return max(most, 2 * groups * n)
+    if one and spec.block_size in BLOCKS:
+        return max(most, n + groups * -(-n // spec.block_size))
+    return max(most, 3 * groups * n)
 
 
 def attend_picked(
