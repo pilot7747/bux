@@ -349,6 +349,9 @@
   "dynamic",
   "expansion",
   "norm_eps",
+  "post_bias",
+  "pre_bias",
+  "res_bias",
   "single_pass",
   "sinkhorn_iters",
   "type"
