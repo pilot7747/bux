@@ -19,6 +19,10 @@ G        = block
 # in the 8 layers of d512 (MiMo-V2.6), 5:1 in the 12 of d768 (Inkling, Beam 1.0).
 sparse = d512: 7 | d768: 5 | d1024: 7 | d1280: 9
 
+# DyT in place of every norm after the embedding e, alpha from a.
+dyt_lm(e, a) = e ([dyt(alpha_init=a) attn] [dyt(alpha_init=a) ffn])^layers
+               dyt(alpha_init=a) head(tied=true)
+
 # mixers.bux's KDA: query and key heads of 128, as wide together as the stream, twice
 # as many value heads, the decay bounded at -5 as Kimi K3's.
 K = layer(kda(num_heads=d_model // 128, num_v_heads=d_model // 64, head_dim=128,
@@ -56,6 +60,15 @@ model = # 2026 Trinity, Beam 1.0, Muse Spark, Command A+, North Mini Code: swa's
       # 2025 Zhu et al. (DyT): tanh(alpha x) with a gain and a bias in place of every
       # LayerNorm, no statistics; throughput
       | dyt:        embed ([dyt attn] [dyt ffn])^layers dyt head(tied=true)
+      # dyt with alpha starting at 0.05, 0.1 and 0.2: the paper's LLMs take a smaller
+      # one the wider they are; does a smaller one train?
+      | dyt_a005:   dyt_lm(embed, 0.05)
+      | dyt_a01:    dyt_lm(embed, 0.1)
+      | dyt_a02:    dyt_lm(embed, 0.2)
+      # dyt with the embedding scaled by sqrt(d_model), so that the tanh reads inputs
+      # of order 1 where a norm would (embeddings start at 0.02); alpha from 0.5 and 0.2
+      | dyt_emb:    dyt_lm(embed(scale_by_sqrt_dim=true), 0.5)
+      | dyt_emb_a02: dyt_lm(embed(scale_by_sqrt_dim=true), 0.2)
       # 2024 Gemma 2's ratio, 2025 Kimi Linear's 1:1 ablation: KDA in every other
       # layer; quality, the hybrid's cost of attention
       | kda_1to1:   embed (K G)^(layers // 2) norm head(tied=true)
