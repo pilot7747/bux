@@ -1,6 +1,7 @@
 """What a ``gqa`` layer does to its keys and values besides attending, in plain
-PyTorch: its ports, the value residual of its ``v`` port, and the kv heads a rank
-keeps under tensor parallelism.
+PyTorch: its ports, the value residual of its ``v`` port, the kv heads a rank keeps
+under tensor parallelism, and its conv's taps (``kv_conv_size``) as vLLM's conv
+kernels take them.
 
 A port is ``[name, tap, mode]``, as ``bux.export.plan`` writes it: ``attn(v=@v1)``
 writes the layer's values to the tap ``v1`` (``write``), ``attn(v=$v1)`` reads them
@@ -75,3 +76,22 @@ def kv_heads(kv: int, tp: int, rank: int) -> tuple[int, int]:
     if kv >= tp:
         return rank * (kv // tp), kv // tp
     return rank // (tp // kv), 1
+
+
+def head_dims(c: dict, width: int) -> tuple[int, int]:
+    """The dims of a key head and of a value head of the ``gqa`` layer `c`."""
+    dk = c["head_dim"] or width // c["num_heads"]
+    return dk, c["v_head_dim"] or dk
+
+
+def conv_channels(c: dict, width: int, tp: int) -> int:
+    """The channels of the conv on keys and values a rank of `tp` keeps: its kv
+    heads' keys, then their values."""
+    dk, dv = head_dims(c, width)
+    return kv_heads(c["num_kv_heads"], tp, 0)[1] * (dk + dv)
+
+
+def conv_rows(taps: torch.Tensor, dims: int, first: int, n: int) -> torch.Tensor:
+    """bux's taps of a conv on keys or values, (k, g dims), cut to the `n` kv heads
+    from `first` on, as rows of vLLM's conv weight, (n dims, k)."""
+    return taps[:, first * dims : (first + n) * dims].T.contiguous()
