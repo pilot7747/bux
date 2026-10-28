@@ -1,6 +1,6 @@
 """Check the vLLM plugin's fused kernels of the residual algebras
 (`bux_vllm.streams`) against its PyTorch path (`bux_vllm.residual`) on a GPU, on
-random streams, and time both.
+random streams, and time both at decoding steps of 8 and 64 tokens.
 
 Run it where the plugin, vLLM and Triton are installed, with a CUDA GPU::
 
@@ -16,8 +16,8 @@ reference, relative to its largest value. In float32 the kernels must agree with
 1e-4. In bfloat16 they must be off by no more than twice what the PyTorch path is,
 which rounds every term of the export where the kernels round their results once:
 the rule `scripts/vllm_parity.py` holds vLLM to against bux in bfloat16. It prints
-each, with the time of a branch both ways at the width given, and exits nonzero if
-any differ.
+each, with the time of a branch both ways at the width given, at 8 and 64 tokens,
+and exits nonzero if any differ.
 """
 
 from __future__ import annotations
@@ -61,6 +61,7 @@ SETTINGS = {
 }
 DEFAULTS = {"norm_eps": 1e-6, "sinkhorn_iters": 20}
 BRANCHES = 6
+TIMED = (8, 64)  # the tokens of the decoding steps a branch is timed at
 
 
 def context() -> Any:
@@ -163,20 +164,27 @@ def _step(branch: residual.Branch, x: Any, y: torch.Tensor) -> Any:
     return branch.write_back(kept, y)
 
 
-def _milliseconds(fn: Any, repeats: int = 50) -> float:
-    """The mean time of `fn` on the GPU, after warming up."""
+def _milliseconds(fn: Any, repeats: int = 20, steps: int = 10) -> float:
+    """The mean time of `fn` on the GPU, replayed in a CUDA graph of `steps` calls,
+    as vLLM's decoding steps run, after warming up (Triton compiles then)."""
     for _ in range(3):
         fn()
+    torch.cuda.synchronize()
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        for _ in range(steps):
+            fn()
+    graph.replay()
     start, end = (
         torch.cuda.Event(enable_timing=True),
         torch.cuda.Event(enable_timing=True),
     )
     start.record()
     for _ in range(repeats):
-        fn()
+        graph.replay()
     end.record()
     torch.cuda.synchronize()
-    return start.elapsed_time(end) / repeats
+    return start.elapsed_time(end) / (repeats * steps)
 
 
 def main() -> None:
@@ -194,10 +202,12 @@ def main() -> None:
         if not check(name, c, d, args.tokens, dtype)
     ]
     for name, c in SETTINGS.items():
-        slow, fast = timed(c, args.width, args.tokens)
-        print(
-            f"{name:22s} a branch at d={args.width}: torch {slow:.3f} ms, fused {fast:.3f} ms"
-        )
+        for tokens in TIMED:
+            slow, fast = timed(c, args.width, tokens)
+            print(
+                f"{name:22s} a branch at d={args.width}, {tokens:3d} tokens: "
+                f"torch {slow:.3f} ms, fused {fast:.3f} ms"
+            )
     sys.exit(1 if bad else 0)
 
 
