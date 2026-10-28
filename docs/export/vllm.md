@@ -242,8 +242,9 @@ layer: a window, sinks, a softcap, and a `gqa` layer's conv on keys and values a
   of up to 256 dims. One attends over each query's picks. One scores every key of
   a decoded token's request. One scores a prompt's keys for a tile of its queries
   at a time, each head's dots on the tensor cores and their sum in float32. Both
-  rank DSA's keys, or find each of MSA's blocks' best score, in place. QSA pools
-  and scores its blocks by PyTorch, and the picks are ranked as bux ranks them.
+  rank DSA's keys, or find each of MSA's blocks' best score, in place. One pools a
+  decoded token's QSA blocks, normalizes and rotates their keys and scores them; a
+  prompt's are pooled once by PyTorch. The picks are ranked as bux ranks them.
   MLA's latents, and a float32 model unless `BUX_VLLM_SPARSE_KERNELS=triton`, take
   the PyTorch path, which gathers each query's scores, keys and values into memory
   first and so moves several times the bytes (`BUX_VLLM_SPARSE_KERNELS=torch` asks
