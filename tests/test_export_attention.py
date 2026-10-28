@@ -287,10 +287,18 @@ def test_index_port(source: str) -> None:
     check.compare(compile(source)).check()
 
 
-def test_an_indexer_beside_a_conv_says_so() -> None:
-    source = stack(GQA + f", kv_conv_size=2, {INDEXER}))")
-    with pytest.raises(NotImplementedError, match="kv_conv_size"):
-        check.compare(compile(source))
+CONV_INDEXERS = {
+    "dsa": f"{INDEXER}))",
+    "mean blocks": f"{INDEXER}, block_size=2))",
+    "msa, window": f"sliding_window_size=5, {MSA}))",
+}
+
+
+@pytest.mark.parametrize("indexer", CONV_INDEXERS.values(), ids=CONV_INDEXERS.keys())
+def test_an_indexer_beside_a_conv_on_keys_and_values(indexer: str) -> None:
+    """The cache keeps the conv's states and the indexer's keys in one layer
+    (``indexed_hybrid``)."""
+    check.compare(compile(stack(GQA + f", kv_conv_size=3, {indexer}"))).check()
 
 
 CSA = (
@@ -313,6 +321,10 @@ CSA_SETTINGS = {
     "relative bias, log scale, gate": CSA + ", compress_ratio=2, gated=true,"
     " relative_bias=relbias(rank=2, extent=4), log_scale=0.5, log_scale_floor=2)",
     "indexer blocks": CSA + f", compress_ratio=1, {SMALL_INDEXER}, block_size=2))",
+    # The timeline's: groups of 4, half the dims rotated in halves, a top 2 of 3.
+    "compressed by 4, indexer": "csa(num_heads=4, head_dim=16,"
+    " sliding_window_size=4, compress_ratio=4, sinks=true, rope=rope(fraction=0.5),"
+    " indexer=indexer(num_heads=2, head_dim=8, top_k=2))",
 }
 
 

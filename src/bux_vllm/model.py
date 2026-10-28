@@ -2,12 +2,15 @@
 ``config.json`` alone.
 
 The model is the plan's tree of blocks (`bux_vllm.plan`): the model's, each
-repeat's body, each shared definition's, with every layer at the path its weights
-have in the checkpoint. Its forward runs the IR graph over the batch's tokens, as
-the generated ``modeling_bux.py`` does over a batch's rows, up to the first head: it
-returns the head's input, and vLLM takes the head's logits of the tokens it samples
-(``compute_logits``). The layers after the first head (multi-token prediction's)
-are not built, and their weights are skipped.
+repeat's body, each shared definition's, with every layer, and every branch of a
+residual algebra, at the path its weights have in the checkpoint. Its forward runs
+the IR graph over the batch's tokens, as the generated ``modeling_bux.py`` does over
+a batch's rows, up to the first head: it returns the head's input, and vLLM takes the
+head's logits of the tokens it samples (``compute_logits``). Under a residual
+algebra, a branch outside any other is its module's read, the body, and its write
+back (`bux_vllm.residual`), and the embedding's output outside any branch widens.
+The layers after the first head (multi-token prediction's) are not built, and their
+weights are skipped.
 """
 
 from __future__ import annotations
@@ -25,24 +28,52 @@ from vllm.compilation.decorators import support_torch_compile
 from vllm.config import VllmConfig
 from vllm.model_executor.models.interfaces import IsHybrid
 from vllm.sequence import IntermediateTensors
+from vllm.v1.kv_cache_interface import MambaSpec
 
-from . import ssm
+from . import conv, engram, residual, ssm
 from .common import Ctx, Layer, Site
-from .plan import Call, Node, Plan, Pos, Scope, at, children, is_call, live, plan
+from .config import states
+from .plan import (
+    Call,
+    Node,
+    Plan,
+    Pos,
+    Scope,
+    at,
+    children,
+    is_call,
+    live,
+    plan,
+    ports,
+)
 
 #: The modules of this package that hold layers.
-LAYER_MODULES = ("common", "basic", "attention", "moe", "ssm")
+LAYER_MODULES = (
+    "common",
+    "basic",
+    "attention",
+    "mla",
+    "csa",
+    "moe",
+    "ssm",
+    "kda",
+    "gdn2",
+    "rwkv7",
+    "residual",
+    "engram",
+)
 
 
 @cache
 def layer_classes() -> dict[str, type[Layer]]:
-    """Return every layer's class, by the bux layer type it implements."""
+    """Return every layer's class, by the bux layer type it implements: a class
+    that names its ``bux_types`` itself, not one that inherits them."""
     out = {}
     for name in LAYER_MODULES:
         module = importlib.import_module(f"{__package__}.{name}")
         for value in vars(module).values():
             if isinstance(value, type) and value.__module__ == module.__name__:
-                out |= dict.fromkeys(getattr(value, "bux_types", ()), value)
+                out |= dict.fromkeys(vars(value).get("bux_types", ()), value)
     return out
 
 
@@ -54,18 +85,23 @@ class Unused(Layer):
 
 
 def cache_name(slot: int, path: str) -> str:
-    """vLLM's name of the state of the `slot`-th call that keeps one, of the layer
-    at `path`: with one integer, the slot, as vLLM orders its caches by it."""
+    """vLLM's name of the `slot`-th state the model keeps, of the layer at `path`:
+    with one integer, the slot, as vLLM orders its caches by it."""
     return f"caches.{slot}.{path.replace('.', '_')}"
 
 
 def state_names(calls: list[Call]) -> dict[str, list[str]]:
-    """The names of the states of each stateful layer's calls, by its path."""
+    """The names of the states of each stateful layer's calls, by its path: each
+    call's in turn, its first named by the path, the others by the path and their
+    kind (`bux_vllm.config.states`)."""
     out: dict[str, list[str]] = {}
     for call in calls:
         if _class(call).stateful:
+            kinds = states(call.layer["config"]) or ["state"]
             names = out.setdefault(call.path, [])
-            names.append(cache_name(sum(map(len, out.values())), call.path))
+            for i, kind in enumerate(kinds):
+                path = call.path if i == 0 else f"{call.path}.{kind}"
+                names.append(cache_name(sum(map(len, out.values())), path))
     return out
 
 
@@ -94,12 +130,30 @@ def build_layers(vllm_config: VllmConfig, p: Plan) -> dict[str, nn.Module]:
             config,
             states.get(call.path, []),
             embedding,
-            node["ports"],
+            ports(node),
         )
         layer = layers[call.path] = cls(node["config"], node["width"], site)
         if embedding is None and node["config"]["type"] == "embed":
             embedding = layer
-    return layers
+    return layers | build_branches(config.bux, p, len(calls))
+
+
+def build_branches(arch: Node, p: Plan, calls: int) -> dict[str, nn.Module]:
+    """Build the module of each residual algebra's branch of `p`, by its path: those
+    that run before the first head, the first `calls` layer calls; the others are
+    not built.
+
+    Raises:
+        NotImplementedError: The residual algebra is not in vLLM yet.
+    """
+    out: dict[str, nn.Module] = {}
+    algebra = arch["residual"]
+    for b in (b for b in p.branches if b.first):
+        if b.calls < calls:
+            out[b.path] = residual.algebra(algebra)(algebra, arch["d_model"])
+        else:
+            out[b.path] = Unused()
+    return out
 
 
 def _class(call: Call) -> type[Layer]:
@@ -115,7 +169,8 @@ def _class(call: Call) -> type[Layer]:
 
 
 class Scoped(nn.Module):
-    """A module of a scope of the plan: its layers and repeats by their names."""
+    """A module of a scope of the plan: its layers, repeats and residual algebra's
+    branches by their names."""
 
     def __init__(self, scope: Scope, prefix: str, layers: dict[str, nn.Module]):
         super().__init__()
@@ -138,34 +193,56 @@ class Scoped(nn.Module):
 class Block(Scoped):
     """A repeat's body or a shared definition: its scope's graph on the stream."""
 
-    def forward(self, x: torch.Tensor, ctx: Ctx) -> torch.Tensor:
-        return run(self, self.scope.root, (), x, ctx)
+    def forward(self, x: Any, ctx: Ctx) -> Any:
+        return run(self, self.scope.root, (), x, ctx, self.scope.depth)
 
 
-def run(block: Scoped, node: Node, pos: Pos, x: Any, ctx: Ctx) -> Any:
-    """Run `node`, at `pos` in `block`'s scope, on `x`: nothing once the first head
-    has run."""
+def run(block: Scoped, node: Node, pos: Pos, x: Any, ctx: Ctx, depth: int) -> Any:
+    """Run `node`, at `pos` in `block`'s scope inside `depth` residual branches, on
+    `x`: nothing once the first head has run."""
     if ctx.hidden is not None:
         return x
     if is_call(ctx.plan, block.scope, node, pos):
-        return ctx.shared[node["share"]](x, ctx)
+        y = ctx.shared[node["share"]](x, ctx)
+        return _widened(node, y, ctx.plan.shared[node["share"]].depth, ctx)
     kind = node["kind"]
     if kind == "layer":
-        return getattr(block, block.scope.names[pos])(x, ctx)
+        y = getattr(block, block.scope.names[pos])(x, ctx)
+        return _widened(node, y, depth, ctx)
     if kind == "repeat":
         return _repeat(block, node, pos, x, ctx)
     if kind == "seq":
         for i, item in enumerate(node["items"]):
-            x = run(block, item, (*pos, i), x, ctx)
+            x = run(block, item, (*pos, i), x, ctx, depth)
         return x
+    if kind == "residual" and pos in block.scope.names:
+        return _branch(block, node, pos, x, ctx)
     if kind in LEAVES:
         return LEAVES[kind](node, x, ctx)
-    ys = [run(block, c, (*pos, i), x, ctx) for i, c in enumerate(children(node))]
+    inner = depth + (kind == "residual")
+    ys = [run(block, c, (*pos, i), x, ctx, inner) for i, c in enumerate(children(node))]
     if kind == "residual":
         return x + ys[0]
     if kind == "neg":
         return -ys[0]
     return reduce(operator.add if kind == "sum" else operator.mul, ys)
+
+
+def _branch(block: Scoped, node: Node, pos: Pos, x: Any, ctx: Ctx) -> Any:
+    """A residual algebra's branch: its module's read of the stream `x`, the body on
+    it, and its write back."""
+    algebra = getattr(block, block.scope.names[pos])
+    h, kept = algebra.read(x, ctx)
+    y = run(block, node["body"], (*pos, 0), h, ctx, 1)  # inside this one branch
+    return algebra.write_back(kept, y)
+
+
+def _widened(node: Node, y: Any, depth: int, ctx: Ctx) -> Any:
+    """`y`, the output of `node`, widened by the residual algebra if `node` is an
+    embedding outside any branch, as bux's embed widens it."""
+    if node["kind"] != "layer" or node["config"]["type"] != "embed" or depth > 0:
+        return y
+    return residual.widen(ctx.plan.residual, y)
 
 
 #: The nodes that read no layer: ``value``, ``_``, ``@name``, ``$name``.
@@ -209,11 +286,7 @@ class BuxModel(Scoped):
 
     def __init__(self, *, vllm_config: VllmConfig, prefix: str = ""):
         config = vllm_config.model_config.hf_config
-        arch = config.bux
-        if arch.get("residual") is not None:
-            kind = arch["residual"]["type"]
-            raise NotImplementedError(f"the residual algebra {kind!r} not in vLLM yet")
-        p = plan(arch, config.bux_reserved)
+        p = plan(config.bux, config.bux_reserved)
         layers = build_layers(vllm_config, p)
         super().__init__(p.top, "model.", layers)
         self.plan = p
@@ -241,9 +314,13 @@ class BuxModel(Scoped):
         positions: torch.Tensor,
         intermediate_tensors: IntermediateTensors | None = None,
         inputs_embeds: torch.Tensor | None = None,
+        query_start_loc: torch.Tensor | None = None,
+        ngram_context: torch.Tensor | None = None,
     ) -> torch.Tensor:
         ctx = Ctx(positions, self.shared, inputs_embeds, self.plan)
-        run(self, self.plan.top.root, (), input_ids, ctx)
+        ctx.input_ids, ctx.query_start_loc = input_ids, query_start_loc
+        ctx.ngram_context = ngram_context
+        run(self, self.plan.top.root, (), input_ids, ctx, 0)
         assert ctx.hidden is not None, "the model ran no head"
         return ctx.hidden
 
@@ -251,17 +328,24 @@ class BuxModel(Scoped):
 class BuxForCausalLM(nn.Module, IsHybrid):
     """A bux model in vLLM: `BuxModel`, and its first head's logits.
 
-    It is a hybrid for vLLM where it has recurrent layers (``config.layer_types``
-    says so), whose state's shape and dtype it gives from the config
-    (`bux_vllm.ssm`).
+    It is a hybrid for vLLM where it has recurrent layers or convs on keys and
+    values (``config.layer_types`` says so), whose states' shapes and dtypes it
+    gives from the config (`bux_vllm.ssm`, `bux_vllm.conv`).
     """
 
     is_hybrid: ClassVar = True
+    requires_raw_input_tokens: ClassVar = True  # engram hashes them
 
     def __init__(self, *, vllm_config: VllmConfig, prefix: str = ""):
         super().__init__()
         self.config = vllm_config.model_config.hf_config
+        self.vllm_config = vllm_config
         self.model = BuxModel(vllm_config=vllm_config, prefix="model")
+
+    def get_model_state_cls(self) -> type:
+        """vLLM's model runner state for the model (V2's): its own, which also gives
+        an engram the ids before each step (`bux_vllm.engram.model_state`)."""
+        return engram.model_state(self.vllm_config)
 
     def embed_input_ids(self, input_ids: torch.Tensor) -> torch.Tensor:
         return self.model.embed_input_ids(input_ids)
@@ -274,7 +358,14 @@ class BuxForCausalLM(nn.Module, IsHybrid):
         inputs_embeds: torch.Tensor | None = None,
         **kwargs: Any,
     ) -> torch.Tensor:
-        return self.model(input_ids, positions, intermediate_tensors, inputs_embeds)
+        return self.model(
+            input_ids,
+            positions,
+            intermediate_tensors,
+            inputs_embeds,
+            kwargs.get("query_start_loc"),
+            kwargs.get("ngram_context"),
+        )
 
     def compute_logits(self, hidden_states: torch.Tensor) -> torch.Tensor | None:
         return self.model.layers_by_path[self.model.head_path].logits(hidden_states)
@@ -303,6 +394,19 @@ class BuxForCausalLM(nn.Module, IsHybrid):
     @classmethod
     def get_mamba_state_dtype_from_config(cls, vllm_config: VllmConfig) -> tuple:
         return ssm.state_dtypes(vllm_config)
+
+    @classmethod
+    def get_mamba_specs_from_config(cls, vllm_config: VllmConfig) -> tuple:
+        """Every shape of state the model keeps in vLLM's Mamba cache, by which vLLM
+        sizes its pages: its recurrent layers', its convs' on keys and values, and
+        its engrams' convs'."""
+        shapes = ssm.state_shapes(vllm_config)
+        dtypes = ssm.state_dtypes(vllm_config) if shapes else ()
+        specs = [MambaSpec(shapes=shapes, dtypes=dtypes, block_size=-1)]
+        dtype = conv.state_dtype(vllm_config)
+        for shape in conv.state_shapes(vllm_config) + engram.state_shapes(vllm_config):
+            specs.append(MambaSpec(shapes=shape, dtypes=dtype, block_size=-1))
+        return tuple(specs)
 
     @classmethod
     def get_mamba_state_copy_func(cls) -> tuple:

@@ -11,7 +11,7 @@ from __future__ import annotations
 
 import keyword
 from collections.abc import Iterable, Iterator
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from typing import Any
 
 #: An IR node as JSON: a dict with its ``kind``, ``label`` and ``share``.
@@ -61,6 +61,8 @@ class Scope:
         blocks: The scope of each repeat's body, by the repeat's `Pos`.
         reserved: The names no module takes, as the export's config lists them
             (``bux_reserved``, `bux.export.plan.RESERVED`).
+        depth: How many residual branches are around its root: for a shared
+            definition, around its first use, where bux builds it.
     """
 
     root: Node
@@ -68,6 +70,7 @@ class Scope:
     names: dict[Pos, str] = field(default_factory=dict)
     blocks: dict[Pos, Scope] = field(default_factory=dict)
     reserved: frozenset[str] = frozenset()
+    depth: int = 0
 
     def name(self, hint: str) -> str:
         """Return a fresh attribute name from `hint`: ``norm``, then ``norm_1``."""
@@ -94,19 +97,41 @@ class Call:
     first: bool
 
 
+@dataclass(frozen=True)
+class Branch:
+    """A residual branch the residual algebra makes, whose module holds the
+    algebra's parameters around the branch's body (`bux.export.plan.Branch`).
+
+    Attributes:
+        path: The module's path, ``model.layers.3.hc``.
+        first: Whether this is its module's first call.
+        calls: How many layer calls run before it: it runs before the first head
+            if that many are `live`.
+    """
+
+    path: str
+    first: bool
+    calls: int
+
+
 @dataclass
 class Plan:
-    """A graph's module tree, and the calls of its layers.
+    """A graph's module tree, and the calls of its layers and residual algebra's
+    branches.
 
     Attributes:
         top: The model's scope.
         shared: The scope of each shared definition, by its key.
         calls: Every layer call, in the order they run.
+        branches: Every residual algebra's branch, in the order they run.
+        residual: The residual algebra's settings, if any.
     """
 
     top: Scope
     shared: dict[str, Scope]
     calls: list[Call]
+    branches: list[Branch] = field(default_factory=list)
+    residual: Node | None = None
 
 
 def plan(arch: Node, reserved: Iterable[str] = ()) -> Plan:
@@ -124,8 +149,12 @@ def plan(arch: Node, reserved: Iterable[str] = ()) -> Plan:
             depth = depths[key]
             shared[key] = scope(node, key, algebra=algebra, depth=depth, reserved=taken)
     top = scope(graph, graph.get("share"), top=True, algebra=algebra, reserved=taken)
-    out = Plan(top, shared, [])
-    out.calls = list(_calls(out, graph, (), top, "model.", set(), True))
+    out = Plan(top, shared, [], residual=arch.get("residual"))
+    for item in _calls(out, graph, (), top, "model.", set(), True):
+        if isinstance(item, Call):
+            out.calls.append(item)
+        else:
+            out.branches.append(replace(item, calls=len(out.calls)))
     return out
 
 
@@ -157,7 +186,7 @@ def scope(
     `algebra`, a residual branch outside any other (`depth` counts those around
     `root`) is a module too, named by it. The model's scope (`top`) names its repeat
     of the most passes ``layers``; no module takes a name of `reserved`."""
-    s = Scope(root, key, reserved=reserved)
+    s = Scope(root, key, reserved=reserved, depth=depth)
     hints: dict[Pos, str] = {}
 
     def visit(node: Node, pos: Pos, depth: int) -> None:
@@ -197,9 +226,9 @@ def is_call(p: Plan, s: Scope, node: Node, pos: Pos) -> bool:
 
 def _calls(
     p: Plan, node: Node, pos: Pos, s: Scope, prefix: str, seen: set[str], first: bool
-) -> Iterator[Call]:
-    """Yield the calls of the layers under `node`, at `pos` in scope `s` whose
-    modules' paths start with `prefix`."""
+) -> Iterator[Call | Branch]:
+    """Yield the calls of the layers and the algebra's branches under `node`, at
+    `pos` in scope `s` whose modules' paths start with `prefix`."""
     key = node.get("share")
     if key is not None and not (s is p.shared.get(key) and pos == ()):
         again = key in seen
@@ -221,8 +250,16 @@ def _calls(
                 inner = f"{prefix}{s.names[pos]}.{i}."
                 yield from _calls(p, body, (), s.blocks[pos], inner, seen, first)
     else:
+        if kind == "residual" and pos in s.names:
+            yield Branch(prefix + s.names[pos], first, 0)
         for i, child in enumerate(children(node)):
             yield from _calls(p, child, (*pos, i), s, prefix, seen, first)
+
+
+def ports(layer: Node) -> list[list[str]]:
+    """A layer's ports as `bux.export.plan` gives its sites': ``[name, tap, mode]``
+    each, from the IR's ``{"name", "tap", "mode"}``."""
+    return [[p["name"], p["tap"], p["mode"]] for p in layer["ports"]]
 
 
 def live(calls: list[Call]) -> list[Call]:

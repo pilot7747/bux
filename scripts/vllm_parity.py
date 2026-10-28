@@ -8,7 +8,7 @@ three steps:
     JAX_PLATFORMS=cpu python scripts/vllm_parity.py export DIR [--dtype bfloat16]
     # vLLM's, with the plugin (pip install src/bux_vllm): decode them
     python scripts/vllm_parity.py run DIR [--tp 2] [--eager] [--moe-backend triton]
-        [--mamba-ssm-cache-dtype float32] [--tag TAG]
+        [--mamba-ssm-cache-dtype float32] [--attention-backend TRITON_MLA] [--tag TAG]
     # bux's again: compare
     JAX_PLATFORMS=cpu python scripts/vllm_parity.py compare DIR [--tag TAG]
 
@@ -49,6 +49,43 @@ BLOCK = "block = [rmsnorm attn] [rmsnorm ffn]\n"
 LLAMA = HEAD + ATTN + FFN + BLOCK
 EXPERT = "dense = gated_mlp(intermediate_size=64, activation=swish)\n"
 MOE_BLOCK = "block = [rmsnorm attn] [rmsnorm experts]\n"
+# Qwen3-Next's attention beside linear attention (`delta`), which the case defines.
+GATED_HEAD = (
+    HEAD
+    + "attn = gqa(num_heads=4, num_kv_heads=2, qk_norm=rmsnorm(zero_centered=true),"
+    " gated=true, rope=rope(fraction=0.25))\n" + FFN
+)
+LINEAR_HYBRID = (
+    "model = embed [rmsnorm delta] [rmsnorm ffn] [rmsnorm delta] [rmsnorm ffn]"
+    " [rmsnorm attn] [rmsnorm ffn] rmsnorm head"
+)
+#: The timeline's MLA (examples/experiments/timeline/attention.bux), on 4 heads.
+LATENT = (
+    "attn = mla(num_heads=4, kv_lora_rank=256, qk_nope_head_dim=64,"
+    " qk_rope_head_dim=32, v_head_dim=64, rope=rope())\n"
+)
+#: DeepSeek-V3's MLA, its dims and RoPE, on 4 heads and a query latent of 64.
+DEEPSEEK = (
+    "attn = mla(num_heads=4, q_lora_rank=64, kv_lora_rank=512, rope=rope("
+    "layout=interleaved, scaling=yarn(factor=4, original_max_len=16,"
+    " attention_factor_on=softmax)))\n"
+)
+#: The timeline's csa (examples/experiments/timeline/sparse.bux) at d_model 128, its
+#: window and top-k shrunk so that the prompts and their decoding cross both.
+SPARSE = (
+    "attn = csa(num_heads=2, head_dim=64, compress_ratio=4, sliding_window_size=16,"
+    " sinks=true, rope=rope(fraction=0.5), indexer=indexer(num_heads=4, head_dim=64,"
+    " top_k=8))\n"
+)
+#: DeepSeek-V4.1's wiring of csa: a window-only layer, and one compressing pairs of
+#: tokens, from a query latent, through a grouped low-rank output of 2 groups.
+SPARSE_LATENT = (
+    "window = csa(num_heads=4, head_dim=64, q_lora_rank=64, o_lora_rank=32,"
+    " o_groups=2, sliding_window_size=8, sinks=true, rope=rope(fraction=0.25,"
+    " layout=interleaved))\n"
+    "pairs = window(compress_ratio=2, indexer=indexer(num_heads=2, head_dim=32,"
+    " top_k=12))\n"
+)
 
 #: The cases, by name: a model each, as bux source.
 CASES = {
@@ -134,19 +171,145 @@ CASES = {
     + "experts = moe(num_experts=8, top_k=2, router_bias=true, num_shared_experts=1,"
     " expert=gated_mlp(intermediate_size=64, activation=quick_gelu, bias=true,"
     " limit=1.0, up_offset=1.0))\n" + MOE_BLOCK + "model = embed block^2 rmsnorm head",
+    "moe-latent": HEAD
+    + ATTN
+    + "experts = moe(num_experts=8, top_k=3, num_shared_experts=1, router=sigmoid,"
+    " routed_scaling_factor=2.5, load_balancing=aux_free, latent_size=64,"
+    " latent_input_norm=rmsnorm, latent_output_norm=rmsnorm,"
+    " expert=mlp(intermediate_size=64, activation=gelu, bias=true))\n"
+    + MOE_BLOCK
+    + "model = embed block^2 rmsnorm head",
+    "moe-sink": HEAD
+    + ATTN
+    + EXPERT
+    + "experts = moe(num_experts=8, top_k=2, num_shared_experts=2,"
+    " shared_expert_sink=true, router=sigmoid, routed_scaling_factor=2.5,"
+    " load_balancing=aux_free, expert=dense)\n"
+    + MOE_BLOCK
+    + "model = embed block^2 rmsnorm head",
+    "engram": LLAMA
+    + "memory = engram(head_dim=8, table_size=12288)\n"
+    + "model = embed block memory block rmsnorm head(tied=true)",
     "mamba2": HEAD
     + ATTN
     + FFN
     + "ssm = mamba2(state_size=16, head_dim=16, num_groups=2)\n"
     + "model = embed [rmsnorm ssm] [rmsnorm ffn] [rmsnorm attn] [rmsnorm ffn]"
     " [rmsnorm ssm] [rmsnorm ffn] rmsnorm head",
-    "gdn": HEAD
-    + "attn = gqa(num_heads=4, num_kv_heads=2, qk_norm=rmsnorm(zero_centered=true),"
-    " gated=true, rope=rope(fraction=0.25))\n"
-    + FFN
+    "gdn": GATED_HEAD
     + "delta = gdn(num_heads=2, num_v_heads=4, head_dim=32)\n"
-    + "model = embed [rmsnorm delta] [rmsnorm ffn] [rmsnorm delta] [rmsnorm ffn]"
-    " [rmsnorm attn] [rmsnorm ffn] rmsnorm head",
+    + LINEAR_HYBRID,
+    "kda": GATED_HEAD
+    + "delta = kda(num_heads=2, num_v_heads=4, head_dim=32, gate_lower_bound=-5)\n"
+    + LINEAR_HYBRID,
+    "kda-kimi": GATED_HEAD
+    + "delta = kda(num_heads=4, head_dim=32, output_gate_rank=32, norm_eps=1e-5)\n"
+    + LINEAR_HYBRID,
+    # The timeline's hybrid at widths no multiple of 8: KDA's fused projection is
+    # 550 wide (padded to 576), beside gated attention and a sigmoid MoE.
+    "kda-odd": GATED_HEAD.replace("d_model = 128", "d_model = 136")
+    + EXPERT
+    + "experts = moe(num_experts=8, top_k=2, num_shared_experts=1, router=sigmoid,"
+    " load_balancing=aux_free, expert=dense)\n"
+    + "delta = kda(num_heads=2, num_v_heads=6, head_dim=32, gate_lower_bound=-5)\n"
+    + "model = embed [rmsnorm delta] [rmsnorm experts] [rmsnorm delta] [rmsnorm ffn]"
+    " [rmsnorm attn] [rmsnorm experts] rmsnorm head",
+    "gdn2": GATED_HEAD
+    + "delta = gdn2(num_heads=2, num_v_heads=4, head_dim=32, gate_lower_bound=-5)\n"
+    + LINEAR_HYBRID,
+    "gdn2-paper": GATED_HEAD
+    + "delta = gdn2(num_heads=4, head_dim=32, gate_rank=8, output_gate_rank=16,"
+    " negative_eigenvalues=true, output_gate=sigmoid)\n" + LINEAR_HYBRID,
+    "rwkv7": GATED_HEAD + "delta = rwkv7(num_heads=2, head_dim=64)\n" + LINEAR_HYBRID,
+    "rwkv7-residual": GATED_HEAD
+    + "mix = rwkv7(num_heads=4, num_v_heads=8, head_dim=32, decay_rank=16, a_rank=16,"
+    " v_rank=8, gate_rank=32)\n"
+    + "model = embed [rmsnorm mix(v=@v0)] [rmsnorm ffn] [rmsnorm attn] [rmsnorm ffn]"
+    " [rmsnorm mix(v=$v0)] [rmsnorm ffn] [rmsnorm mix(v=$v0!)] rmsnorm head",
+    "hc": LLAMA + "residual = hc(expansion=4)\nmodel = embed block^2 rmsnorm head",
+    "attnres": LLAMA
+    + "residual = attnres(block_size=3)\nmodel = embed block^2 rmsnorm head",
+    "mhc": LLAMA + "residual = mhc(expansion=4)\nmodel = embed block^2 rmsnorm head",
+    "mhc-single": LLAMA + "residual = mhc(expansion=4, single_pass=true)\n"
+    "model = embed block^2 rmsnorm head",
+    "gr": HEAD
+    + ATTN
+    + FFN
+    + "residual = gr(expansion=4, rank=16)\nmodel = embed ([attn] [ffn])^2 head(tied=true)",
+    "vpgate": LLAMA
+    + "residual = vpgate(temperature=0.3)\nmodel = embed block^2 rmsnorm head",
+    "value-residual": HEAD
+    + ATTN
+    + FFN
+    + "both = attn(value_residual=learned)\n"
+    + "one = attn(value_residual=convex)\n"
+    + "model = embed [rmsnorm attn(v=@v1)] [rmsnorm ffn] [rmsnorm attn(v=$v1)]"
+    " [rmsnorm both(v=$v1)] [rmsnorm ffn] [rmsnorm one(v=$v1!)] rmsnorm head",
+    "mla": HEAD + LATENT + FFN + BLOCK + "model = embed block^2 rmsnorm head",
+    "mla-moe": HEAD
+    + LATENT
+    + FFN
+    + EXPERT
+    + "experts = moe(num_experts=8, top_k=2, num_shared_experts=1, router=sigmoid,"
+    " routed_scaling_factor=2.5, load_balancing=aux_free, expert=dense)\n"
+    + "model = embed [rmsnorm attn] [rmsnorm ffn] [rmsnorm attn] [rmsnorm experts]"
+    " rmsnorm head",
+    "mla-deepseek": HEAD
+    + DEEPSEEK
+    + "gated = attn(gated=true, gate_per_head=true, output_norm=rmsnorm)\n"
+    + FFN
+    + "model = embed [rmsnorm attn] [rmsnorm ffn] [rmsnorm gated] [rmsnorm ffn]"
+    " rmsnorm head",
+    "query-scale": HEAD
+    + FFN
+    + "beam = gqa(num_heads=4, num_kv_heads=2, power_scale=0.5, power_scale_length=8,"
+    " gated=true, gate_head_bias=true)\n"
+    + "inkling = gqa(num_heads=4, num_kv_heads=2, log_scale=0.5, log_scale_floor=8,"
+    " softcap=20, rope=rope())\n"
+    + "model = embed [rmsnorm beam] [rmsnorm ffn] [rmsnorm inkling] [rmsnorm ffn]"
+    " rmsnorm head",
+    "dsa": HEAD + FFN + "attn = gqa(num_heads=4, num_kv_heads=2, rope=rope(),"
+    " indexer=indexer(num_heads=2, head_dim=16, top_k=8))\n"
+    + "local = attn(sliding_window_size=16, sinks=true, softcap=20)\n"
+    + "model = embed [rmsnorm attn] [rmsnorm ffn] [rmsnorm local] [rmsnorm ffn]"
+    " rmsnorm head",
+    "dsa-conv": HEAD
+    + FFN
+    + "attn = gqa(num_heads=4, num_kv_heads=2, kv_conv_size=4, qk_norm=rmsnorm,"
+    " gated=true, indexer=indexer(num_heads=2, head_dim=16, top_k=8))\n"
+    + "model = embed [rmsnorm attn(v=@v1)] [rmsnorm ffn] [rmsnorm attn(v=$v1!)]"
+    " [rmsnorm ffn] rmsnorm head",
+    "msa": HEAD
+    + FFN
+    + "attn = gqa(num_heads=4, num_kv_heads=2, rope=rope(), indexer=indexer("
+    "num_heads=2, head_dim=16, top_k=16, block_size=4, pool=max, per_group=true,"
+    " relu=false, weighted=false, norm=rmsnorm))\n"
+    + BLOCK
+    + "model = embed block^2 rmsnorm head",
+    "qsa": HEAD
+    + FFN
+    + "attn = gqa(num_heads=4, num_kv_heads=2, rope=rope(fraction=0.5),"
+    " indexer=indexer(num_heads=2, head_dim=16, top_k=16, block_size=4,"
+    " weighted=false, norm=rmsnorm))\n" + BLOCK + "model = embed block^2 rmsnorm head",
+    "qk-norm-all-heads": HEAD
+    + FFN
+    + "rms = gqa(num_heads=4, num_kv_heads=2, qk_norm=rmsnorm, qk_norm_all_heads=true,"
+    " rope=rope())\n"
+    + "ln = rms(qk_norm=layernorm(bias=true))\n"
+    + "model = embed [rmsnorm rms] [rmsnorm ffn] [rmsnorm ln] [rmsnorm ffn]"
+    " rmsnorm head",
+    "kv-conv": HEAD
+    + FFN
+    + "attn = gqa(num_heads=4, num_kv_heads=2, kv_conv_size=4, rope=rope())\n"
+    + "local = attn(sliding_window_size=8, qk_norm=rmsnorm)\n"
+    + "model = embed [rmsnorm attn(v=@v1)] [rmsnorm ffn] [rmsnorm local]"
+    " [rmsnorm ffn] [rmsnorm attn(v=$v1!)] rmsnorm head",
+    "csa": HEAD + SPARSE + FFN + BLOCK + "model = embed block^2 rmsnorm head",
+    "csa-latent": HEAD
+    + SPARSE_LATENT
+    + FFN
+    + "model = embed [rmsnorm window] [rmsnorm ffn] [rmsnorm pairs] [rmsnorm ffn]"
+    " rmsnorm head",
 }
 
 LENGTHS = (3, 17, 40, 64)  # the prompts', in one batch: within and past a window
@@ -169,6 +332,7 @@ def main() -> None:
         sub.choices[name].add_argument("--eager", action="store_true")
         sub.choices[name].add_argument("--moe-backend", default="auto")
         sub.choices[name].add_argument("--mamba-ssm-cache-dtype", default="auto")
+        sub.choices[name].add_argument("--attention-backend", default=None)
     sub.choices["compare"].add_argument("--tolerance", type=float, default=1e-3)
     sub.choices["compare"].add_argument("--margin", type=float, default=0.0)
     args = p.parse_args()
@@ -304,6 +468,8 @@ def run_alone(args: argparse.Namespace, name: str) -> None:
     cmd = [sys.executable, __file__, "run-one", str(args.dir), "--only", name]
     cmd += ["--tag", args.tag, "--tp", str(args.tp), "--moe-backend", args.moe_backend]
     cmd += ["--mamba-ssm-cache-dtype", args.mamba_ssm_cache_dtype]
+    if args.attention_backend is not None:
+        cmd += ["--attention-backend", args.attention_backend]
     subprocess.run(cmd + ["--eager"] * args.eager, check=False)
 
 
@@ -314,6 +480,7 @@ def engine(args: argparse.Namespace) -> dict:
         "enforce_eager": args.eager,
         "moe_backend": args.moe_backend,
         "mamba_ssm_cache_dtype": args.mamba_ssm_cache_dtype,
+        "attention_backend": args.attention_backend,
     }
 
 

@@ -61,12 +61,12 @@ STATELESS = {
 }  # fmt: skip
 LINEAR = {"gla", "deltanet", "gdn", "kda", "gdn2", "lightning", "rwkv7"}
 #: What bux_vllm runs (docs/export/vllm.md, "What runs").
-VLLM_TYPES = STATELESS - {"dyt", "nextn"} | {"gqa", "mamba2", "gdn"}
-VLLM_UNSUPPORTED = {
-    "gqa": ("kv_conv_size", "indexer", "relative_bias", "log_scale", "power_scale",
-            "gate_head_bias", "qk_norm_all_heads"),
-    "moe": ("latent_size", "expert_norm", "shared_expert_sink"),
+VLLM_TYPES = STATELESS - {"dyt", "nextn"} | {
+    "gqa", "mla", "csa", "mamba2", "gdn", "kda", "gdn2", "rwkv7", "engram", "merge",
 }  # fmt: skip
+VLLM_UNSUPPORTED = {"gqa": ("relative_bias",), "moe": ("expert_norm",)}
+#: The recurrent layers vLLM keeps in its Mamba cache, of one type and shape a model.
+VLLM_RECURRENT = ("mamba2", "gdn", "kda", "gdn2", "rwkv7")
 
 
 class Unpriced(Exception):
@@ -485,16 +485,14 @@ def _linear_state(c: Any, width: int) -> float:
 def vllm_support(arch: "Architecture", calls: list["LayerCall"]) -> str:
     """Return "" if bux_vllm builds every layer `arch` serves with, else why not
     (as docs/export/vllm.md lists them)."""
-    if arch.residual is not None:
-        return f"residual algebra {arch.residual.type}"
     recurrent = set()
     once = Counter(call.path for call in calls)
     for call in calls:
         c = call.layer.config
         if c.type not in VLLM_TYPES:
             return f"{c.type}"
-        if call.layer.ports and c.type == "gqa":
-            return "gqa ports"
+        if c.type == "gqa" and any(port.name != "v" for port in call.layer.ports):
+            return "gqa kv or index ports"
         for name in VLLM_UNSUPPORTED.get(c.type, ()):
             value = getattr(c, name, None)
             if value not in (None, False) and not (
@@ -503,9 +501,9 @@ def vllm_support(arch: "Architecture", calls: list["LayerCall"]) -> str:
                 return f"{c.type} {name}"
         if c.type == "moe" and c.expert.up_softcap is not None:
             return "moe experts' up_softcap"
-        if c.type in ("moe", "gdn", "mamba2") and once[call.path] > 1:
+        if c.type in ("moe", *VLLM_RECURRENT) and once[call.path] > 1:
             return f"{c.type} called more than once"
-        if c.type in ("gdn", "mamba2"):
+        if c.type in VLLM_RECURRENT:
             recurrent.add(c.model_dump_json())
             if c.type == "gdn" and (c.conv_size is None or c.output_gate is None):
                 return "gdn without conv or gate"

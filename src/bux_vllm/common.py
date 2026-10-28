@@ -80,6 +80,13 @@ class Ctx:
         embedding: The model's first embedding, once it ran.
         hidden: The first head's input, once it ran: the hidden states vLLM takes
             logits of.
+        pending_read: The read coefficients, (T, n), the last single-pass hc or mhc
+            branch computed for the next one; None before the first.
+        input_ids: The step's token ids, (T,), which engram hashes.
+        query_start_loc: Where each sequence's tokens start in the step, (R + 1,),
+            as vLLM's model runner gives them to a model that asks (engram's).
+        ngram_context: Each sequence's last ids before the step, (R, C), -1 for
+            none, likewise.
     """
 
     def __init__(
@@ -94,6 +101,10 @@ class Ctx:
         self.taps: dict[str, list] = {}
         self.embedding: Any = None
         self.hidden: torch.Tensor | None = None
+        self.pending_read: torch.Tensor | None = None
+        self.input_ids: torch.Tensor | None = None
+        self.query_start_loc: torch.Tensor | None = None
+        self.ngram_context: torch.Tensor | None = None
         self._calls: dict[str, int] = {}
 
     def push(self, name: str, x: Any) -> Any:

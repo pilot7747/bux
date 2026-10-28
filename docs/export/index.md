@@ -191,9 +191,9 @@ naming the layer or the setting.
 | residual algebras | `hc`, `mhc`, `gr`, `attnres`, `vpgate`, with every setting, single-pass included |
 | the graph | sequences, residual branches, sums, products, constants, negations, repeats, taps, shared definitions |
 
-A few combinations of exported settings raise: an indexer together with
-`kv_conv_size`; a layer that reads a `kv` port and also has a `v` port or an indexer
-of its own; and candidate pools of a `csa` indexer with `block_size > 1`.
+A few combinations of exported settings raise: a layer that reads a `kv` port and
+also has a `v` port or an indexer of its own, and candidate pools of a `csa` indexer
+with `block_size > 1`.
 
 ## What an export holds
 
@@ -278,6 +278,8 @@ always computes its own softmax, over its window and its compressed latents at o
   keeps none of its own. Its window may be no longer than the writer's.
 - **Sparse attention.** The indexer's keys are cached beside the layer's, in an
   `indexed_attention` cache layer, so each decoding step can rank every earlier key.
+  With a conv on the keys and values too, the cache layer also keeps the conv's
+  states (`indexed_hybrid`, a kind of cache layer of the export's own).
   A sparse layer caches every key and selects with a mask over them, which the
   `index` port passes on; its window applies on top. Ties rank as in bux: by the
   floats' bits, the first of equal ones winning.
