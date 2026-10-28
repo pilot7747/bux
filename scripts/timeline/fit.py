@@ -107,12 +107,16 @@ def run(a: argparse.Namespace) -> dict:
     """Read, fit and write; return what was written."""
     runs, short = fit_points.cut_short(fit_inputs.read(a.results))
     runs, wild = fit_points.diverged_seeds(runs)
+    excluded = excluded_families(a)
+    runs = [r for r in runs if r.family not in excluded]
     counts = Counts(a.cache or a.out / "counts.json", tuple(a.files))
     parents = family_parents(a, runs, counts)
     if not a.keep_base:
         runs = fit_family.alias_bases(runs, counts, parents, a.root)
+    blocks = {m: fit_points.seed_noise(runs, m) for m in metric_names(runs)}
+    on_seed0 = runs if a.no_seed_adjust else fit_points.seed_adjusted(runs, blocks)
     points, diverged = fit_points.monotone(
-        fit_points.points(runs, a.pick, not a.no_average_seeds)
+        fit_points.points(on_seed0, a.pick, not a.no_average_seeds)
     )
     points = attach(points, counts, a.rung_flops)
     if not any(p.family == a.root for p in points):
@@ -129,7 +133,7 @@ def run(a: argparse.Namespace) -> dict:
     metrics = (
         a.metrics.split(",") if a.metrics else fit_points.metrics_of(points, a.root)
     )
-    noise = {m: fit_points.seed_noise(runs, m) for m in metrics}
+    noise = {m: blocks.get(m) or fit_points.seed_noise(runs, m) for m in metrics}
     analyses = [
         fit_analysis.analyze(points, m, parents, targets, options(a, noise[m], m))
         for m in metrics
@@ -148,6 +152,7 @@ def run(a: argparse.Namespace) -> dict:
         "analyses": analyses,
         "short": short,
         "wild": wild,
+        "excluded": excluded,
         "objective": next(
             (x for x in analyses if x.metric == "objective"), analyses[0]
         ),
@@ -192,6 +197,24 @@ def serving_precision(a: argparse.Namespace) -> str:
     if a.serve:
         return a.serve
     return fit_targets.precisions(a.targets)[0] if a.targets else "bf16"
+
+
+def metric_names(runs: list) -> list[str]:
+    """The metrics a fit may read: the four and the repositories' by position."""
+    keys = {k for r in runs for k in r.metrics}
+    return [
+        k for k in sorted(keys) if k in fit_points.METRICS or k.startswith("repo_bpb_")
+    ]
+
+
+def excluded_families(a: argparse.Namespace) -> dict[str, str]:
+    """--exclude's families, each with its reason: ``residuals/mhc=collapsed init``."""
+    out = {}
+    for item in (a.exclude or "").split(","):
+        if item.strip():
+            f, _, why = item.partition("=")
+            out[f.strip()] = why.strip()
+    return out
 
 
 def family_parents(a: argparse.Namespace, runs: list, counts: Counts) -> dict[str, str]:
@@ -432,6 +455,21 @@ def assumptions(a: argparse.Namespace, targets: dict, facts: dict) -> list[str]:
     if a.drop_scan:
         out.append(
             f"Token scans left out for {a.drop_scan}: they take their parent's data term."
+        )
+    if not a.no_seed_adjust and (b := facts["noise"].get("objective")):
+        shifts = ", ".join(
+            f"seed {s} {100 * (e - b['effects'][0]):+.2f}%"
+            for s, e in sorted(b["effects"].items())
+            if s
+        )
+        out.append(
+            f"Points are on seed 0's scale: a run's metrics divided by its seed's shift against seed 0's (objective: {shifts})."
+        )
+    if excluded := facts.get("excluded"):
+        out.append(
+            "Left out of every table: "
+            + ", ".join(f"{f} ({why})" if why else f for f, why in excluded.items())
+            + "."
         )
     if wild := facts.get("wild"):
         names = ", ".join(sorted(f"{r.family} d{r.width} seed {r.seed}" for r in wild))
@@ -698,6 +736,15 @@ def parser() -> argparse.ArgumentParser:
     p.add_argument("--seed", type=int, default=0)
     p.add_argument("--plot", help="comma-separated families to plot beside the root")
     p.add_argument("--plot-metrics", default="objective,repo_bpb")
+    p.add_argument(
+        "--no-seed-adjust",
+        action="store_true",
+        help="average seeds as they are, not on seed 0's scale",
+    )
+    p.add_argument(
+        "--exclude",
+        help="families left out of every table, each with its reason: fam=why,fam2=why",
+    )
     p.add_argument(
         "--no-e-free",
         action="store_true",
