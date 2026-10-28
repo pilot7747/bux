@@ -188,6 +188,7 @@ class Attention(Layer):
         settings = (c["sliding_window_size"], self.scale, c["softcap"], self.sinks)
         groups = (self.kv_first, self.g)
         spec = picks.layer_spec(ix, self.indexer, settings, self.dk, groups)
+        what = "gqa with an indexer" if ix else "gqa reading its index port"
         self.caches = sparse.layer_caches(
             spec,
             self.g,
@@ -195,6 +196,7 @@ class Attention(Layer):
             ix["head_dim"] if ix else 0,
             names,
             site.vllm_config,
+            what,
         )
 
     def _biased_caches(
@@ -217,7 +219,13 @@ class Attention(Layer):
         settings = (c["sliding_window_size"], self.scale, c["softcap"], self.sinks)
         spec = picks.layer_spec(None, None, settings, self.dk, (self.kv_first, self.g))
         self.caches = sparse.layer_caches(
-            spec, self.g, self.dk + self.dv, 0, names, site.vllm_config
+            spec,
+            self.g,
+            self.dk + self.dv,
+            0,
+            names,
+            site.vllm_config,
+            "gqa with a relative bias",
         )
 
     def _convs(self, c: dict, site: Site, names: list[str]) -> None:

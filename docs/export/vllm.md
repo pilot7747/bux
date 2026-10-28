@@ -132,16 +132,48 @@ quantized to FP8 per token as it runs. Its other online schemes, such as
 - **Tensor parallelism.** The layers split over ranks as they do in bfloat16, and
   each weight's scale is the largest over its ranks' shares.
 
-`scripts/vllm_fp8.py` checks it on a GPU. It serves the same export, with weights,
-in bfloat16 and in FP8, for a llama and for the timeline's milestones at a width of
-256: GPT-3's, and 2026's two, a sliding-window stack and its KDA hybrid, both with
-gates and an MoE of 256 experts. It prints the quantization method vLLM picked for
-each kind of layer, the routed experts' backend, and how close the FP8 logits are to
-bfloat16's:
+## FP8 KV cache
+
+Keep the KV cache in FP8 too, with FP8 weights or without:
+
+```sh
+vllm serve exported/ --dtype bfloat16 --quantization fp8 --kv-cache-dtype fp8 \
+  --moe-backend triton
+```
+
+The layers that attend by vLLM's own attention keep their cache in FP8 (e4m3), by
+vLLM's backends: it quantizes the keys and values as it caches them. Each layer has
+a scale for its keys and one for its values, which vLLM reads from a checkpoint. An
+export has none, so both are 1.0: the keys and values are cached as they are, to 3
+bits of mantissa, and clip past ±448, FP8's largest value. A model whose keys or
+values reach further needs scales of its own, which the export does not write yet.
+The layers whose cache is the plugin's own refuse an FP8 cache as the model is built
+(`NotImplementedError`, naming the layer and `kv_cache_dtype`), rather than keep it
+in bfloat16.
+
+| Layers | FP8 KV cache |
+|--------|--------------|
+| `gqa` | yes, by vLLM's attention: sliding windows, sinks, soft-capping, gates, QK-norm, `kv_conv_size` (its conv state stays in the model's dtype), the `v` port, and the `kv` port (a reader attends to its writer's FP8 cache) |
+| `gqa` with an indexer, the `index` port or a relative bias | refused: its cache is the plugin's ([Sparse attention](#sparse-attention)) |
+| `mla` | yes, by vLLM's MLA backends that take FP8: Triton's, FlashInfer's on SM 10.x. A prompt's cached context is dequantized as it is gathered, by vLLM's kernel or, for the latent sizes it lacks, the plugin's |
+| `mla` with an indexer or the `index` port | refused: its cache is the plugin's |
+| `csa` | refused: its caches are the plugin's ([Compressed sparse attention](#compressed-sparse-attention)) |
+| `mamba`, `mamba2`, `gdn`, `kda`, `gdn2`, `rwkv7`, `deltanet`, `gla`, `lightning`, `conv`, `short_conv`, `engram` | no KV cache: their states follow `--mamba-cache-dtype` and `--mamba-ssm-cache-dtype` |
+
+## Checking FP8
+
+`scripts/vllm_fp8.py` checks FP8 weights, and an FP8 KV cache, on a GPU. It serves
+the same export, with weights, in bfloat16 and in FP8, for a llama and for the
+timeline's milestones at a width of 256: GPT-3's, and 2026's two, a sliding-window
+stack and its KDA hybrid, both with gates and an MoE of 256 experts. `--only` takes
+the cases of `scripts/vllm_parity.py` too. It prints the quantization method vLLM
+picked for each kind of layer, each attention layer's KV cache dtype and backend,
+the routed experts' backend, and how close the FP8 logits are to bfloat16's:
 
 ```sh
 JAX_PLATFORMS=cpu python scripts/vllm_fp8.py export runs/fp8   # bux's environment
-python scripts/vllm_fp8.py run runs/fp8 --moe-backend triton  # vLLM's
+python scripts/vllm_fp8.py run runs/fp8 --moe-backend triton  # vLLM's: weights
+python scripts/vllm_fp8.py run runs/fp8 --moe-backend triton --kv-cache-dtype fp8
 ```
 
 A case passes if the cosine of its FP8 logits with bfloat16's is 0.99 or more on
@@ -150,6 +182,13 @@ weight and each activation to 3 bits of mantissa, about 3 % RMS, so a matmul's
 output is off by about 4 % and the logits by a few percent, a cosine above 0.995. A
 cosine under 0.99 is an error of over 14 % RMS: a weight loaded in the wrong place,
 or quantized with the wrong scale.
+
+With an FP8 KV cache too, a case passes at 0.98. The cache rounds the keys and
+values in the same way, and so do the queries where the backend quantizes them to
+match. The softmax turns the scores' error of about 5 % into a larger one on the
+values' weights, by the scores' spread, so each attention layer's output is off by
+5 to 10 % more. 0.98 allows 20 % RMS. Bytes read in the wrong format, or a scale off
+by a power of two, are far beyond it.
 
 ## How it works
 

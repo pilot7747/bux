@@ -1,6 +1,6 @@
-"""Check vLLM's online FP8 weights on bux's exports, served by bux's vLLM plugin
-(`bux_vllm`): the same export, its weights in bfloat16, served in bfloat16 and with
-``quantization="fp8"``.
+"""Check vLLM's online FP8 weights, and its FP8 KV cache, on bux's exports served
+by bux's vLLM plugin (`bux_vllm`): the same export, its weights in bfloat16, served
+in bfloat16 and with ``quantization="fp8"`` (and ``kv_cache_dtype="fp8"``).
 
 It runs in two steps, as `scripts/vllm_parity.py` does (bux and vLLM do not share an
 environment):
@@ -8,27 +8,39 @@ environment):
     # bux's environment: export each case in bfloat16, its weights perturbed
     JAX_PLATFORMS=cpu python scripts/vllm_fp8.py export DIR
     # vLLM's, with the plugin (pip install src/bux_vllm): serve each twice, compare
-    python scripts/vllm_fp8.py run DIR [--quantization fp8] [--moe-backend triton]
-        [--tp 2] [--eager] [--only CASE ...]
+    python scripts/vllm_fp8.py run DIR [--quantization fp8] [--kv-cache-dtype fp8]
+        [--moe-backend triton] [--tp 2] [--eager] [--only CASE ...]
 
 `run` serves each case's export twice, each in a process of its own: in bfloat16,
 and under ``--quantization`` (``fp8`` by default: vLLM 0.32 quantizes the bfloat16
-weights as it loads them, its ``fp8_per_tensor``). Each decodes the prompts of
+weights as it loads them, its ``fp8_per_tensor``), and with ``--kv-cache-dtype``
+its KV cache in that dtype too. Each decodes the prompts of
 `scripts/vllm_parity.py` greedily and keeps the log-probabilities of the whole
 vocabulary at every position. For each case it prints the quantization methods vLLM
 picked, counted by kind of layer (its class and the last part of its name), with
-their FP8 GEMM; the routed experts' backend; and how the FP8 logits compare with
+their FP8 GEMM; its attention layers' KV cache dtypes and backends; the routed
+experts' backend; and how the FP8 logits compare with
 bfloat16's at the prompts' positions and at the decoding steps up to the first
 token the two runs pick differently (the steps whose prefixes they share): the
 cosine of the logits, centered at each position (as the log-probabilities are),
 its mean and its least, and the largest error relative to the largest bfloat16
-logit of its position. It exits with 1 if a mean cosine is under `MIN_COSINE`.
+logit of its position. It exits with 1 if a mean cosine is under `MIN_COSINE` (or
+`MIN_COSINE_KV`), if nothing was quantized, if a head was, or if no attention layer
+of a model with some kept the KV cache asked for.
 
 `MIN_COSINE` is 0.99. FP8 (e4m3) keeps 3 bits of mantissa: it rounds each weight and
 each activation by 3 % RMS, so a matmul's output errs by about 4 %, and the
 logits by a few percent, whose cosine is above 0.995; the head stays in bfloat16. A
 cosine under 0.99 is an RMS error over 14 %, more than the rounding: a weight loaded
 in the wrong place, a wrong scale, or a scale set by garbage.
+
+`MIN_COSINE_KV` is 0.98, for FP8 weights and an FP8 KV cache together. The cache
+rounds the keys and values the same way, at a scale of 1 (a bfloat16 checkpoint has
+none of its own), and so do the queries where the backend quantizes them to match.
+The softmax turns the scores' 5 % error into a larger one on the weights it gives
+the values, by the scores' spread: about 5 to 10 % more on each attention layer's
+output, in quadrature with the weights' error. 0.98 allows 20 % RMS. Bytes read in
+the wrong format, or a scale off by a power of two, are far beyond it.
 
 The cases are the timeline's milestones at d_model 256 and a vocabulary of 256, the
 first group of four layers of their stacks: GPT-3's (2020), a llama, and 2026's two
@@ -120,6 +132,7 @@ CASES = {
 #: Every case ``--only`` takes: these, and the parity cases.
 POOL = vllm_parity.CASES | CASES
 MIN_COSINE = 0.99  # of the FP8 logits with bfloat16's, on average (see above)
+MIN_COSINE_KV = 0.98  # likewise, with an FP8 KV cache too
 TAGS = ("bf16", "fp8")  # the two runs of a case, by the name of their files
 
 
@@ -134,6 +147,7 @@ def main() -> None:
     for name in ("run", "run-one"):
         s = sub.choices[name]
         s.add_argument("--quantization", default="fp8")
+        s.add_argument("--kv-cache-dtype", default=None)
         s.add_argument("--tp", type=int, default=1)
         s.add_argument("--eager", action="store_true")
         s.add_argument("--moe-backend", default="triton")
@@ -166,6 +180,8 @@ def run(args: argparse.Namespace, name: str) -> bool:
             old.unlink()
         cmd = [sys.executable, __file__, "run-one", str(args.dir), "--only", name]
         cmd += ["--tag", tag, "--quantization", args.quantization]
+        if args.kv_cache_dtype is not None:
+            cmd += ["--kv-cache-dtype", args.kv_cache_dtype]
         cmd += ["--tp", str(args.tp), "--moe-backend", args.moe_backend]
         cmd += ["--mamba-ssm-cache-dtype", args.mamba_ssm_cache_dtype]
         if args.attention_backend is not None:
@@ -177,25 +193,35 @@ def run(args: argparse.Namespace, name: str) -> bool:
 def run_one(args: argparse.Namespace, where: Path) -> None:
     """Serve the export at `where` in bfloat16 or quantized (by ``--tag``), decode
     the prompts (`vllm_parity.decode`), and keep the layers' quantization methods
-    (`quantized`) in ``<tag>.json``."""
+    and KV caches (`quantized`) in ``<tag>.json``, with the KV cache dtype asked
+    for."""
     engine = vllm_parity.engine(args)
+    kv = args.kv_cache_dtype if args.tag == "fp8" else None
     if args.tag == "fp8":
         engine["quantization"] = args.quantization
+    if kv is not None:
+        engine["kv_cache_dtype"] = kv
     llm = vllm_parity.serve(where, engine)
     vllm_parity.decode(llm, where, args.tag)
-    (where / f"{args.tag}.json").write_text(json.dumps(llm.apply_model(quantized)[0]))
+    layers = llm.apply_model(quantized)[0] | {"kv_cache_dtype": kv}
+    (where / f"{args.tag}.json").write_text(json.dumps(layers))
 
 
 def quantized(model: Any) -> dict:
     """Each kind of layer of `model` (its vLLM class and the last part of its name)
-    with the quantization method vLLM picked for it and its FP8 GEMM, counted; and
-    the routed experts' backends, counted. It runs in vLLM's workers
-    (``LLM.apply_model``)."""
+    with the quantization method vLLM picked for it and its FP8 GEMM, counted; its
+    attention layers' KV cache dtypes and backends, counted; and the routed
+    experts' backends, counted. It runs in vLLM's workers (``LLM.apply_model``)."""
     from collections import Counter
 
     methods: Counter = Counter()
     backends: Counter = Counter()
+    caches: Counter = Counter()
     for name, module in model.named_modules():
+        if (kv := getattr(module, "kv_cache_dtype", None)) is not None:
+            backend = getattr(module, "attn_backend", None)
+            backend = backend.get_name() if backend is not None else None
+            caches[f"{type(module).__name__}: kv {kv} ({backend})"] += 1
         method = getattr(module, "quant_method", None)
         if method is None:
             continue
@@ -207,7 +233,11 @@ def quantized(model: Any) -> dict:
         if backend is not None:
             experts = getattr(getattr(method, "experts_cls", None), "__name__", None)
             backends[f"{getattr(backend, 'value', backend)} ({experts})"] += 1
-    return {"methods": dict(methods), "backends": dict(backends)}
+    return {
+        "methods": dict(methods),
+        "backends": dict(backends),
+        "caches": dict(caches),
+    }
 
 
 # --- compare ---------------------------------------------------------------------------
@@ -262,15 +292,19 @@ def report(where: Path, name: str) -> bool:
         print(f"{name:10s} no run")
         return False
     layers = {t: json.loads((where / f"{t}.json").read_text()) for t in TAGS}
+    fp8, kv = layers["fp8"], layers["fp8"]["kv_cache_dtype"]
     print(f"{name:10s} {where}")
-    for kind, n in sorted(layers["fp8"]["methods"].items()):
+    for kind, n in sorted(fp8["methods"].items()):
+        print(f"  {n:4d} {kind}")
+    for kind, n in sorted(fp8["caches"].items()):
         print(f"  {n:4d} {kind}")
     for tag in TAGS:
         for backend, n in layers[tag]["backends"].items():
             print(f"  {tag} MoE: {n} x {backend}")
     prompts, steps = closeness(where)
-    close = min(prompts.summary()[0], steps.summary()[0]) >= MIN_COSINE
-    ok = close and _quantizes(layers["fp8"]["methods"])
+    least = MIN_COSINE if kv is None else MIN_COSINE_KV
+    close = min(prompts.summary()[0], steps.summary()[0]) >= least
+    ok = close and _quantizes(fp8["methods"]) and _caches(fp8["caches"], kv)
     print(f"  {prompts.line('prompts')}")
     print(f"  {steps.line('decoding')}  {'ok' if ok else 'DIFFERS'}")
     return ok
@@ -284,6 +318,17 @@ def _quantizes(methods: dict[str, int]) -> bool:
     if not online or heads:
         print(f"  quantized: {online or 'nothing'}, heads among them: {heads}")
     return bool(online) and not heads
+
+
+def _caches(caches: dict[str, int], kv: str | None) -> bool:
+    """Whether an attention layer of `caches` (`quantized`'s) kept its KV cache in
+    `kv`, if asked for one and the model has some; say so if not."""
+    if kv is None or not caches:
+        return True
+    if not any(f": kv {kv} " in k for k in caches):
+        print(f"  no attention layer kept a {kv} KV cache")
+        return False
+    return True
 
 
 def closeness(where: Path) -> tuple[Closeness, Closeness]:

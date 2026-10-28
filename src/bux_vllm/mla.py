@@ -298,8 +298,10 @@ class LatentAttention(Layer):
         self.spec = picks.layer_spec(
             ix, self.indexer, settings, dims, (0, 1), self.rank
         )
+        what = "mla with an indexer" if ix else "mla reading its index port"
+        index_dims = ix["head_dim"] if ix else 0
         self.caches = sparse.layer_caches(
-            self.spec, 1, dims, ix["head_dim"] if ix else 0, names, site.vllm_config
+            self.spec, 1, dims, index_dims, names, site.vllm_config, what
         )
 
     def targets(self) -> dict[str, tuple[nn.Parameter, tuple]]:

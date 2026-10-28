@@ -236,17 +236,19 @@ def naive_gather(cache, table, lens, starts) -> torch.Tensor:
     return torch.stack(rows)
 
 
-@pytest.mark.parametrize("dtype", ["auto", "fp8"])
+@pytest.mark.parametrize("dtype", ["auto", "fp8", "fp8_e5m2"])
 def test_the_latent_context_gathers_as_vllms_kernel(dtype: str) -> None:
     """bux_vllm.latent gathers a chunk's cached latents as vLLM's kernel does for
     the sizes it takes: from each request's blocks, from where the chunk starts in
     its context (here also off a block's start), from a cache of padded pages, an
-    fp8 cache's times its scale."""
+    fp8 cache's bytes (uint8, as vLLM keeps them) read as e4m3 or e5m2, times its
+    scale."""
     torch.manual_seed(0)
     padded = torch.randn(10, 4, 288 + 32)  # pages padded, as hybrids' are
-    cache = padded[..., :288]
-    if dtype == "fp8":
-        cache = cache.to(torch.float8_e4m3fn)
+    cache = values = padded[..., :288]
+    if dtype != "auto":
+        fp8 = padded.to(latent.FP8[dtype])
+        cache, values = fp8.view(torch.uint8)[..., :288], fp8[..., :288]
     table = torch.tensor([[3, 7, 1, 0], [9, 2, 5, 8], [4, 6, 0, 0]], dtype=torch.int32)
     lens, starts = [6, 9, 2], [0, 5, 4]
     cu = torch.tensor([0, 6, 15, 17], dtype=torch.int32)
@@ -257,8 +259,8 @@ def test_the_latent_context_gathers_as_vllms_kernel(dtype: str) -> None:
     scale = torch.tensor(0.5)
     seq_starts = torch.tensor(starts, dtype=torch.int32)
     latent.gather(cache, dst, table, cu, to_seq, 17, dtype, scale, seq_starts)
-    want = naive_gather(cache, table, lens, starts).float()
-    want = want * 0.5 if dtype == "fp8" else want
+    want = naive_gather(values, table, lens, starts).float()
+    want = want if dtype == "auto" else want * 0.5
     torch.testing.assert_close(dst[:17], want)
     assert not dst[17:].any()
 
@@ -2094,10 +2096,12 @@ class StubRunner(torch.nn.Module):
 
 
 class StubModule(torch.nn.Module):
-    """A vLLM module the test does not look into, such as its attention."""
+    """A vLLM module the test does not look into, such as its attention, and the
+    arguments it was made with."""
 
     def __init__(self, *args, **kwargs):
         super().__init__()
+        self.kwargs = kwargs
 
 
 class StubNorm(torch.nn.Module):
@@ -2200,12 +2204,13 @@ def stood_in(monkeypatch: pytest.MonkeyPatch) -> Iterator[ModuleType]:
             delattr(sys.modules[parent], child)
 
 
-def engine_config(where: Path, quant: Any) -> Any:
+def engine_config(where: Path, quant: Any, cache_dtype: str = "auto") -> Any:
     """vLLM's config of an engine serving the export at `where` under the
-    quantization config `quant`, as the plugin's layers read it."""
+    quantization config `quant` and the KV cache dtype `cache_dtype`, as the
+    plugin's layers read it."""
     hf = config.BuxConfig.from_dict(json.loads((where / "config.json").read_text()))
     model = {"dtype": torch.bfloat16, "max_model_len": 128}
-    cache = {"cache_dtype": "auto", "block_size": 16}
+    cache = {"cache_dtype": cache_dtype, "block_size": 16}
     return SimpleNamespace(
         model_config=SimpleNamespace(hf_config=hf, use_mla=config.latent(hf), **model),
         cache_config=SimpleNamespace(**cache),
@@ -2216,15 +2221,19 @@ def engine_config(where: Path, quant: Any) -> Any:
     )
 
 
-def served(source: str, where: Path, module: ModuleType, quant: Any) -> Any:
+def served(
+    source: str, where: Path, module: ModuleType, quant: Any, cache_dtype: str = "auto"
+) -> Any:
     """The plugin's model (`module`'s, on stand-ins) of the model `source`, exported
-    to `where`, its weights loaded, under the quantization config `quant`."""
+    to `where`, its weights loaded, under the quantization config `quant` and the
+    KV cache dtype `cache_dtype`."""
     from safetensors.torch import load_file
 
     arch = compile(source)
     with vllm_parity.placeholders(arch):
         save(arch, Model(arch, rngs=nnx.Rngs(0)), where)
-    model = module.BuxForCausalLM(vllm_config=engine_config(where, quant))
+    vllm_config = engine_config(where, quant, cache_dtype)
+    model = module.BuxForCausalLM(vllm_config=vllm_config)
     model.load_weights(load_file(where / "model.safetensors").items())
     return model
 
@@ -2306,3 +2315,50 @@ def test_fp8_weights_quantize_every_layer_s_projections(
     quant = SimpleNamespace(name="fp8")
     model = served(vllm_parity.CASES[name], tmp_path, stood_in, quant)
     assert assert_quantized(model, quant)
+
+
+#: The parity cases whose attention keeps a cache of the plugin's own
+#: (bux_vllm.sparse's, csa's), which takes no FP8 KV cache, by the layer it names.
+OWN_CACHES = {
+    **dict.fromkeys(("dsa", "dsa-conv", "msa", "qsa"), "gqa with an indexer"),
+    **dict.fromkeys(("dsa-share", "msa-share"), "gqa with an indexer"),
+    "relbias": "gqa with a relative bias",
+    **dict.fromkeys(("mla-dsa", "mla-share"), "mla with an indexer"),
+    **dict.fromkeys(("csa", "csa-ports", "csa-latent"), "csa"),
+}
+
+
+@pytest.mark.parametrize("name", [n for n in vllm_parity.CASES if n not in OWN_LAYERS])
+def test_an_fp8_kv_cache_is_vllm_s_or_refused(
+    name: str, stood_in: ModuleType, tmp_path: Path
+) -> None:
+    """Under ``kv_cache_dtype="fp8"`` (beside FP8 weights) every attention layer on
+    vLLM's own (gqa's, a dense mla's) gets the engine's cache config, from which
+    vLLM keeps its cache in fp8; a layer whose cache is the plugin's own refuses as
+    it is built, naming itself and the dtype, rather than keep bfloat16."""
+    quant, source = SimpleNamespace(name="fp8"), vllm_parity.CASES[name]
+    if name in OWN_CACHES:
+        with pytest.raises(NotImplementedError, match="kv_cache_dtype=fp8") as e:
+            served(source, tmp_path, stood_in, quant, "fp8")
+        assert str(e.value).startswith(OWN_CACHES[name]), e.value
+        return
+    model = served(source, tmp_path, stood_in, quant, "fp8")
+    caches = [m for m in model.modules() if isinstance(m, StubModule)]
+    assert all(m.kwargs["cache_config"].cache_dtype == "fp8" for m in caches)
+
+
+def test_the_plugin_s_own_caches_keep_the_model_s_dtype_alone() -> None:
+    """A cache the plugin keeps itself takes ``kv_cache_dtype`` auto, or the
+    model's own, and refuses any other: fp8, or float16 in a bfloat16 model."""
+
+    def engine(cache_dtype: str) -> Any:
+        return SimpleNamespace(
+            model_config=SimpleNamespace(dtype=torch.bfloat16),
+            cache_config=SimpleNamespace(cache_dtype=cache_dtype),
+        )
+
+    for name in ("auto", "bfloat16"):
+        assert common.own_cache_dtype(engine(name), "csa") is torch.bfloat16
+    for name in ("fp8", "fp8_e5m2", "float16"):
+        with pytest.raises(NotImplementedError, match=f"csa: kv_cache_dtype={name} "):
+            common.own_cache_dtype(engine(name), "csa")

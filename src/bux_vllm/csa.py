@@ -59,6 +59,7 @@ from .common import (
     Layer,
     Site,
     logit_gain,
+    own_cache_dtype,
     sharded_loader,
     unsupported,
 )
@@ -94,19 +95,7 @@ def check(c: dict, site: Site) -> None:
         raise NotImplementedError("csa: speculative decoding")
     if vllm.parallel_config.decode_context_parallel_size > 1:
         raise NotImplementedError("csa: decode context parallelism")
-    cache_dtype(vllm)
-
-
-def cache_dtype(vllm_config: Any) -> torch.dtype:
-    """The caches' dtype: the model's.
-
-    Raises:
-        NotImplementedError: The engine asks for another (an FP8 KV cache).
-    """
-    model, name = vllm_config.model_config.dtype, vllm_config.cache_config.cache_dtype
-    if name not in ("auto", str(model).removeprefix("torch.")):
-        raise NotImplementedError(f"csa: a {name} KV cache")
-    return model
+    own_cache_dtype(vllm, "csa")
 
 
 # --- the caches, their backend and metadata ----------------------------------------
@@ -459,7 +448,7 @@ class CompressedSparseAttention(Layer):
         scale = (c["scale"] or self.d**-0.5) * logit_gain(c["rope"])
         settings, dtype = (
             compressed.Settings.of(c, scale),
-            cache_dtype(site.vllm_config),
+            own_cache_dtype(site.vllm_config, "csa"),
         )
         self.names, self.shares, self.settings = (
             list(site.caches),
