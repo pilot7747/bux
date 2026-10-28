@@ -19,6 +19,7 @@ from types import ModuleType, SimpleNamespace
 from typing import Any
 
 import jax
+import jax.numpy as jnp
 import numpy as np
 import pytest
 import torch
@@ -53,6 +54,7 @@ from bux_vllm import (
     latent,
     linear,
     ngram,
+    outputs,
     plan,
     residual,
     routing,
@@ -1015,6 +1017,20 @@ def test_the_value_residual_mixes_as_bux(kind: str) -> None:
     flat = [torch.from_numpy(np.array(a)[0].reshape(8, 32)) for a in (v, v1)]
     got = kv.mix_values(kind, w, *flat)
     np.testing.assert_allclose(got.numpy(), np.asarray(want), rtol=1e-6)
+
+
+@pytest.mark.parametrize("learned", [False, True], ids=["fixed", "learned"])
+@pytest.mark.parametrize("groups", [1, 2, 4])
+def test_xsa_takes_out_what_bux_takes_out(learned: bool, groups: int) -> None:
+    y = jax.random.normal(jax.random.key(1), (1, 8, 4, 16))
+    v = jax.random.normal(jax.random.key(2), (1, 8, groups, 16))
+    s = jax.random.normal(jax.random.key(3), (4,)) if learned else None
+    want = bux_gqa.exclusive(y, v, None if s is None else jnp.tanh(s))[0]
+    strength = None if s is None else torch.from_numpy(np.array(s)).tanh()
+    got = outputs.exclusive(
+        *(torch.from_numpy(np.array(a)[0]) for a in (y, v)), strength
+    )
+    np.testing.assert_allclose(got.numpy(), np.asarray(want), rtol=1e-5, atol=1e-6)
 
 
 def test_ports_are_read_and_written_as_bux_lists_them() -> None:

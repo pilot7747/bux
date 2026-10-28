@@ -62,6 +62,7 @@ from bux.parallel.context import (
     softcap,
     weighted_values,
 )
+from bux.parallel.flash import per_query_head
 from bux.train import flops
 
 Names = tuple[parallel.Name, parallel.Name]  # a projection's input and output
@@ -246,8 +247,10 @@ class Attention(SoftmaxAttention):
     to k and v under ``kv_conv_size`` (Inkling), applies QK-norm (of each head, or of
     all heads together under ``qk_norm_all_heads``: MiniMax-M2) and then RoPE, scales
     the queries by their position under ``power_scale`` (Beam), and attends by the
-    run's ``methods.attention`` (`bux.parallel.context`). The heads' outputs then go
-    through `SoftmaxAttention`'s norm, gate, output projection and dropout.
+    run's ``methods.attention`` (`bux.parallel.context`). Under ``exclusive`` (XSA)
+    each head's output loses its part along the query's own value (`exclusive`).
+    The heads' outputs then go through `SoftmaxAttention`'s norm, gate, output
+    projection and dropout.
     `build_gqa` makes this class, or `FullLogitsAttention` or `SparseAttention` where
     the config needs them.
 
@@ -340,6 +343,24 @@ class Attention(SoftmaxAttention):
         shape = (2,) if config.value_residual == "learned" else ()
         trained = reads(ports, "v") and config.value_residual != "fixed"
         self.v_mix = nnx.Param(jnp.full(shape, 0.5, jnp.float32)) if trained else None
+        self._exclusion(config, projects_kv)
+
+    def _exclusion(self, config: cfg.GQAConfig, projects_kv: bool) -> None:
+        """Keep XSA's setting, and its strength for each head where it learns them.
+
+        Raises:
+            ValueError: XSA in a layer that reads its kv port, whose values are
+                another layer's.
+        """
+        self.exclusive = config.exclusive
+        if self.exclusive and not projects_kv:
+            raise ValueError(
+                "gqa: exclusive (XSA) takes the layer's own values, which a layer that "
+                "reads the kv port does not make"
+            )
+        learned = config.exclusive == "learned"
+        zeros = jnp.zeros(self.heads)
+        self.xsa_alpha = nnx.Param(zeros, names=("heads",)) if learned else None
 
     def __call__(self, x: Float[Array, "b t d"], taps: Taps) -> Float[Array, "b t d"]:
         """Attend each position to those before it in its document, and to itself.
@@ -356,7 +377,17 @@ class Attention(SoftmaxAttention):
         x, projected = self._projections(x)
         q, k, v = self._heads(projected, docs, taps)
         self._observe(q, k, docs, taps)
-        return self._output(x, self._attend(x, q, k, v, docs))
+        return self._output(x, self._exclude(self._attend(x, q, k, v, docs), v))
+
+    def _exclude(
+        self, out: Float[Array, "b t h dv"], v: Float[Array, "b t g dv"]
+    ) -> Float[Array, "b t h dv"]:
+        """Return the heads' outputs by XSA (`exclusive`) under ``exclusive``, else
+        as they are."""
+        if not self.exclusive:
+            return out
+        strength = None if self.xsa_alpha is None else jnp.tanh(self.xsa_alpha[...])
+        return exclusive(out, v, strength)
 
     def _heads(
         self, projected: list[Float[Array, "b t _"]], docs: Segments | None, taps: Taps
@@ -453,6 +484,36 @@ class Attention(SoftmaxAttention):
         if self.value_residual == "learned":
             return w[0] * v + w[1] * v1
         return w * v + (1 - w) * v1
+
+
+def exclusive(
+    out: Float[Array, "b t h dv"],
+    v: Float[Array, "b t g dv"],
+    strength: Float[Array, " h"] | None = None,
+) -> Float[Array, "b t h dv"]:
+    """Return each head's output y less its part along its query's own value v:
+    exclusive self-attention (XSA; Zhai, 2026, arXiv 2603.09078).
+
+    ``y - s (y . u) u`` with ``u = v / max(norm(v), 1e-12)``, as ``F.normalize`` makes it,
+    computed in float32. A query head takes the value of its group's kv head at its
+    own position. The paper removes the whole part, s = 1; modded-nanogpt's learned
+    XSA scales it by ``s = tanh(a)`` for each head (`strength`).
+
+    Args:
+        out: The heads' outputs, of t queries.
+        v: The values the heads attended to at the same t positions.
+        strength: The share s of the part removed for each head; None for all of it.
+
+    Returns:
+        The outputs, in their dtype.
+    """
+    y = out.astype(jnp.float32)
+    u = per_query_head(v, out.shape[2]).astype(jnp.float32)
+    u = u * jax.lax.rsqrt(jnp.maximum(jnp.sum(u * u, -1, keepdims=True), 1e-24))
+    along = jnp.sum(y * u, -1, keepdims=True) * u
+    if strength is not None:
+        along = along * strength.astype(jnp.float32)[:, None]
+    return (y - along).astype(out.dtype)
 
 
 def require_xla(feature: str) -> None:
@@ -916,7 +977,8 @@ class SparseAttention(Sparse, Attention):
         docs = segments(taps)
         x, projected = self._projections(x)
         heads = self._heads(projected, docs, taps)
-        return self._output(x, self._attend_tokens(x, x, heads, docs, taps))
+        out = self._attend_tokens(x, x, heads, docs, taps)
+        return self._output(x, self._exclude(out, heads[2]))
 
 
 def pick[L: SoftmaxAttention](

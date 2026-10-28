@@ -54,6 +54,7 @@
  "GQAConfig": [
   "attention_dropout",
   "bias",
+  "exclusive",
   "fused_qkv",
   "gate_activation",
   "gate_head_bias",

@@ -89,6 +89,11 @@ GQA_SETTINGS = {
     " layout=interleaved, base=500))",
     "head dims": GQA + ", head_dim=12, v_head_dim=8)",
     "kv conv": GQA + ", kv_conv_size=3)",
+    "xsa": GQA + ", exclusive=true)",
+    "xsa, learned, mqa, window, sinks": "gqa(num_heads=4, num_kv_heads=1,"
+    " exclusive=learned, sliding_window_size=3, sinks=true, rope=rope())",
+    "xsa, relative bias": GQA + ", exclusive=true, relative_bias=relbias(rank=2,"
+    " extent=4))",
     "kv conv, window": GQA + ", kv_conv_size=3, sliding_window_size=4)",
     "dropouts": GQA + ", attention_dropout=0.1, output_dropout=0.1)",
     "everything at once": "gqa(num_heads=4, num_kv_heads=2, head_dim=8, v_head_dim=12,"
@@ -129,6 +134,14 @@ PORTS = {
     ),
     "value residual, convex": wired(
         GQA + ", value_residual=convex, kv_conv_size=2)", "attn(v=@v1)", "attn(v=$v1!)"
+    ),
+    # The timeline's global layer: no positions, QK-norm, a gate, a conv on keys
+    # and values, the value residual, and XSA over the values it mixed.
+    "value residual, xsa": wired(
+        "gqa(num_heads=4, num_kv_heads=1, qk_norm=rmsnorm, gated=true, kv_conv_size=2,"
+        " exclusive=learned)",
+        "attn(v=@v1)",
+        "attn(v=$v1)",
     ),
     "kv sharing": wired(
         GQA + ", qk_norm=rmsnorm)",
@@ -202,6 +215,7 @@ SPARSE = {
     "blocks, plain sum": GQA
     + f", {INDEXER}, block_size=3, weighted=false, norm=rmsnorm))",
     "window, sinks": GQA + f", sliding_window_size=5, sinks=true, {INDEXER}))",
+    "xsa": GQA + f", exclusive=true, {INDEXER}))",
     "relative bias": GQA + f", relative_bias=relbias(rank=2, extent=4), {INDEXER}))",
     "plain dots": GQA + f", {INDEXER}, relu=false))",
     "plain dots, plain sum": GQA + f", {INDEXER}, relu=false, weighted=false))",

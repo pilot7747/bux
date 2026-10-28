@@ -57,6 +57,7 @@ model = embed block^12 norm head(tied=true)
 | `power_scale`, `power_scale_length` | `none`, `2048` | queries scaled up with a power of the position ([below](#power-scaling-at-long-range)) (Beam) |
 | `kv_conv_size` | `none` | a causal depthwise conv on keys and values, added to them: `k + conv(k)` (Inkling) |
 | `value_residual` | `fixed` | how a layer that reads the `v` port mixes in its values ([Ports](#sharing-between-layers-ports)) |
+| `exclusive` | `false` | each head's output less its part along the token's own value: `true` or `learned` ([below](#exclusive-self-attention-xsa)) (XSA) |
 
 GPT-2 small is MHA with biases and one fused projection
 (`examples/architectures/gpt2.bux`):
@@ -381,6 +382,33 @@ global = attn(power_scale=0.1, power_scale_length=2048)
 
 It scales the queries, not the logits, so unlike `log_scale` it runs under every
 attention method.
+
+### Exclusive self-attention (XSA)
+
+`exclusive=true`, a setting of `gqa`, takes out of each head's output $y_i$ its part
+along the token's own value $v_i$, before the output's norm and gate (Zhai, 2026,
+arXiv 2603.09078):
+
+$$
+z_i = y_i - \frac{y_i^\top v_i}{\lVert v_i \rVert^2}\, v_i.
+$$
+
+Attention then passes on only what the context adds to the token, and a query can
+park attention on its own key, as on a sink. A query head takes the value of its
+group's kv head. The paper finds the gain grows with the sequence length. It adds no
+parameters, and runs after the attention, so under every attention method and with
+an indexer.
+
+`exclusive=learned` takes a learned share of that part, $\tanh(a)$ for each head,
+from $a = 0$, so that the layer starts as plain attention (modded-nanogpt's learned
+XSA):
+
+```bux
+global = attn(exclusive=learned)
+```
+
+XSA reads the values the layer attends to: those its `v` port mixed in, under a value
+residual. A layer that reads the `kv` port has no values of its own, and raises.
 
 ## Positions
 

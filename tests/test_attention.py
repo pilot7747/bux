@@ -1068,6 +1068,9 @@ SPLIT = {
         "gqa(num_heads=4, num_kv_heads=2, gated=true, gate_head_bias=true,"
         " power_scale=0.5, power_scale_length=2)"
     ),
+    # XSA, learned: each query head takes its group's value, which on tensor=4 stays
+    # whole
+    "xsa": "gqa(num_heads=4, num_kv_heads=2, gated=true, exclusive=learned)",
     # MiniMax-M2's QK-norm of all heads together, whose mean square spans the devices
     "qk_norm_all_heads": (
         "gqa(num_heads=4, num_kv_heads=2, qk_norm=norm, qk_norm_all_heads=true,"
@@ -1116,7 +1119,7 @@ def test_attention_split_by_head_trains_the_same_and_rematerializes_nothing(
     trains_the_same(losses, involuntary, layer, BY_HEAD)
 
 
-@pytest.mark.parametrize("layer", ["gqa", "power_scale", "mla", "msa", "csa"])
+@pytest.mark.parametrize("layer", ["gqa", "power_scale", "xsa", "mla", "msa", "csa"])
 def test_attention_trains_the_same_with_the_positions_split(losses, involuntary, layer):
     trains_the_same(losses, involuntary, SPLIT[layer], BY_POSITION)
 

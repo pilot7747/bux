@@ -565,6 +565,21 @@ class SoftmaxAttention(nn.Module):
         return self.o(out.flatten(2))
 
 
+def exclusive(
+    out: torch.Tensor, v: torch.Tensor, strength: torch.Tensor | None
+) -> torch.Tensor:
+    """Return each head's output y, b t h dv, less its part along its query's own
+    value v, b t g dv, by XSA: ``y - s (y @ u) u`` with ``u = v / max(norm(v),
+    1e-12)``, in float32; s = 1, or `strength` for each head."""
+    y = out.float()
+    u = v.float().repeat_interleave(out.shape[2] // v.shape[2], dim=2)
+    u = u * u.square().sum(-1, keepdim=True).clamp(min=1e-24).rsqrt()
+    along = (y * u).sum(-1, keepdim=True) * u
+    if strength is not None:
+        along = along * strength.float()[:, None]
+    return (y - along).to(out.dtype)
+
+
 def check_reader(c: dict, ports: list) -> None:
     """Raise for what a layer that reads kv does not export: a v port (its values are
     the writer's, all of them while decoding) or an indexer of its own (whose keys it
@@ -573,13 +588,16 @@ def check_reader(c: dict, ports: list) -> None:
         raise NotImplementedError("gqa: the v port of a layer that reads kv")
     if c["indexer"] and not reads(ports, "index"):
         raise NotImplementedError("gqa: an indexer in a layer that reads kv")
+    if c["exclusive"]:
+        raise NotImplementedError("gqa: exclusive (XSA) in a layer that reads kv")
 
 
 class Attention(SoftmaxAttention):
     """bux's ``gqa``, every setting: q, k and v projections (one each, or fused), a
     causal conv on k and v, QK-norm (of each head, or of all heads together under
     ``qk_norm_all_heads``) then RoPE, and its ports: ``v`` (value residual), ``kv``
-    (cross-layer KV sharing) and ``index`` (an indexer's kept keys).
+    (cross-layer KV sharing) and ``index`` (an indexer's kept keys); and XSA, each
+    head's output less its part along the query's own value (`exclusive`).
 
     A layer that reads ``kv`` attends to the writer's keys and values as the writer's
     cache layer keeps them, all of them while decoding, and keeps none of its own; it
@@ -614,6 +632,9 @@ class Attention(SoftmaxAttention):
         self.indexer = (
             Indexer(c["indexer"], width, width, c["rope"], rotated) if index else None
         )
+        self.exclusive = c["exclusive"]
+        learned = self.exclusive == "learned"
+        self.xsa_alpha = nn.Parameter(torch.zeros(h)) if learned else None
 
     def _projections(
         self, c: dict, width: int, h: int, g: int, dk: int, dv: int
@@ -649,7 +670,11 @@ class Attention(SoftmaxAttention):
             kv = self.cached(k, v, ctx, slot)
         self.write(ctx, "kv", kv)
         kept = self.kept(x, x, ctx, kv)
-        return self.output(x, self.attend(x, q, kv, ctx, kept))
+        out = self.attend(x, q, kv, ctx, kept)
+        if self.exclusive:
+            strength = None if self.xsa_alpha is None else self.xsa_alpha.tanh()
+            out = exclusive(out, v, strength)
+        return self.output(x, out)
 
     def _project(self, x: torch.Tensor) -> list[Any]:
         """Project x to q, k and v, b t _; k and v are None if the layer reads kv."""

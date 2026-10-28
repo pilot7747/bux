@@ -560,6 +560,12 @@ class GQAConfig(QuadraticAttentionConfig):
     # a v + b v1 starting from a = b = 0.5: "fixed" keeps a and b (ResFormer's code),
     # "learned" learns both (Learnable-ResFormer), "convex" learns a, with b = 1 - a.
     value_residual: Literal["fixed", "learned", "convex"] = "fixed"
+    # Exclusive self-attention (XSA): each head's output y less its part along the
+    # query's own value v, y - (y . v) v / (v . v), before the output's norm and gate,
+    # so that attention carries only what the token lacks (Zhai, 2026). "learned"
+    # takes tanh(a) of that part, a learned for each head from 0 (modded-nanogpt).
+    # The values are those the layer attends to: not with its kv port read.
+    exclusive: bool | Literal["learned"] = False
 
 
 class MLAConfig(QuadraticAttentionConfig):

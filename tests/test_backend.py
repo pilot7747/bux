@@ -30,6 +30,7 @@ from bux.architecture import (
     registry,
 )
 from bux.architecture.attention import norm_rope
+from bux.architecture.attention.gqa import exclusive
 from bux.architecture.attention.rope import frequencies, rotate
 from bux.architecture.experts.moe import dense_weights
 from bux.architecture.graph import Sequence
@@ -214,6 +215,37 @@ def test_the_gate_bias_adds_one_value_per_head_before_the_sigmoid():
     gate = attn.gate(x).reshape(2, 8, H, -1) + jnp.arange(H)[:, None]
     expected = attn.o((heads * jax.nn.sigmoid(gate)).reshape(2, 8, -1))
     assert jnp.allclose(attn._output(x, heads), expected, atol=1e-5)
+
+
+def test_xsa_removes_each_heads_part_along_its_own_value():
+    """y - (y . v) v / |v|^2, the paper's formula: nothing left along v, the rest
+    of y kept; a query head takes its group's value. Learned, tanh(a) of it."""
+    y = jax.random.normal(jax.random.key(1), (2, 8, H, 6))
+    v = jax.random.normal(jax.random.key(2), (2, 8, 2, 6))
+    vh = jnp.repeat(v, H // 2, axis=2)
+    dots = jnp.sum(y * vh, -1, keepdims=True)
+    want = y - dots * vh / jnp.sum(vh * vh, -1, keepdims=True)
+    got = exclusive(y, v)
+    assert jnp.allclose(got, want, atol=1e-5)
+    assert jnp.allclose(jnp.sum(got * vh, -1), 0, atol=1e-5)
+    s = jnp.linspace(-0.5, 1, H)
+    assert jnp.allclose(exclusive(y, v, s), y - s[:, None] * (y - want), atol=1e-5)
+
+
+def test_xsa_learned_starts_as_attention_and_grows_into_xsa():
+    x = jax.random.normal(jax.random.key(1), (2, 8, D))
+    plain, full = gqa(gated=True), gqa(gated=True, exclusive=True)
+    learned = gqa(gated=True, exclusive="learned")
+    assert plain.xsa_alpha is None and full.xsa_alpha is None
+    assert learned.xsa_alpha is not None
+    assert jnp.array_equal(learned(x, Taps()), plain(x, Taps()))  # tanh(0) = 0
+    assert not jnp.allclose(full(x, Taps()), plain(x, Taps()), atol=1e-3)
+    learned.xsa_alpha[...] = jnp.full(H, 20.0)  # tanh(20) = 1
+    assert jnp.allclose(learned(x, Taps()), full(x, Taps()), atol=1e-6)
+    reader = (ir.Port(name="kv", tap="kv", mode="read"),)
+    config = cfg.GQAConfig(num_heads=H, num_kv_heads=2, exclusive=True)
+    with pytest.raises(ValueError, match="exclusive"):
+        Attention(config, D, reader, nnx.Rngs(0))
 
 
 def qk_normed_over_all_heads() -> Attention:

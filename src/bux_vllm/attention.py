@@ -23,7 +23,7 @@ from vllm.model_executor.layers.linear import (
     RowParallelLinear,
 )
 
-from . import kv, picks, sparse
+from . import kv, outputs, picks, sparse
 from .common import (
     ACTIVATIONS,
     Ctx,
@@ -45,8 +45,9 @@ class Attention(Layer):
     ``v`` port (the value residual) and pushed to it, QK-norm then RoPE (in float32,
     as bux), the queries scaled by their position (``power_scale``, ``log_scale``),
     causal softmax attention with its sliding window, soft-capping and sinks by
-    vLLM's attention layer, each head's output norm and gate (with a bias per head),
-    and the row-parallel output projection.
+    vLLM's attention layer, XSA on each head's output (``exclusive``,
+    `bux_vllm.outputs`), its norm and gate (with a bias per head), and the
+    row-parallel output projection.
 
     With an indexer, each query attends to the keys the indexer picks alone, as
     bux's do (DSA, and its blocks: QSA's, MSA's), by the plugin's sparse attention
@@ -87,6 +88,7 @@ class Attention(Layer):
         self.rope = Rope(c["rope"], dk) if c["rope"] else None
         self._value_residual(c, site.ports)
         self.sinks = sink_logits(self.h) if c["sinks"] else None
+        self._exclusion(c)
         kinds = states(c, site.ports)  # a call's states, side by side in site.caches
         names = {kind: site.caches[i :: len(kinds)] for i, kind in enumerate(kinds)}
         self.indexer = None
@@ -267,6 +269,22 @@ class Attention(Layer):
             self.gate_bias = nn.Parameter(torch.zeros(self.h), requires_grad=False)
             self.gate_bias.weight_loader = sharded_loader(0)  # ty: ignore[unresolved-attribute]
 
+    def _exclusion(self, c: dict) -> None:
+        """Keep XSA's setting (``exclusive``), and this rank's heads' strengths
+        where it learns them, in float32 as bux keeps them.
+
+        Raises:
+            NotImplementedError: XSA in a layer that reads its ``kv`` port, which
+                has no values of its own.
+        """
+        self.exclusive, self.xsa_alpha = c["exclusive"], None
+        if self.exclusive and self.reads_kv:
+            raise NotImplementedError("gqa: exclusive (XSA) in a layer that reads kv")
+        if self.exclusive == "learned":
+            alpha = torch.zeros(self.h, dtype=torch.float32)
+            self.xsa_alpha = nn.Parameter(alpha, requires_grad=False)
+            self.xsa_alpha.weight_loader = sharded_loader(0)  # ty: ignore[unresolved-attribute]
+
     def _value_residual(self, c: dict, layer_ports: list) -> None:
         """Keep the layer's ports, and the learned weights of its value residual
         where it reads the ``v`` port and ``value_residual`` learns them."""
@@ -296,6 +314,8 @@ class Attention(Layer):
             out["v_mix"] = (self.v_mix, ())
         if self.gate_bias is not None:
             out["gate_bias"] = (self.gate_bias, ())
+        if self.xsa_alpha is not None:
+            out["xsa_alpha"] = (self.xsa_alpha, ())
         if self.indexer is not None:
             params = self.indexer.named_parameters()
             out |= {f"indexer.{name}": (p, ()) for name, p in params}
@@ -338,7 +358,17 @@ class Attention(Layer):
         else:
             q, k = q.reshape(t, -1).contiguous(), k.reshape(t, -1).contiguous()
             out = self.caches[call](q, k, v.contiguous()).view(t, self.h, self.dv)
-        return self.o(self._gated(x, out).reshape(t, -1))
+        return self.o(self._gated(x, self._exclude(out, v)).reshape(t, -1))
+
+    def _exclude(self, out: torch.Tensor, v: torch.Tensor) -> torch.Tensor:
+        """The heads' outputs, (T, h, dv), by XSA under ``exclusive``: each less
+        its part along its token's own value, of the values v, (T, g dv), the layer
+        attended to."""
+        if not self.exclusive:
+            return out
+        alpha = self.xsa_alpha
+        strength = None if alpha is None else alpha.tanh()
+        return outputs.exclusive(out, v.view(-1, self.g, self.dv), strength)
 
     def _queries(self, q: torch.Tensor, ctx: Ctx) -> torch.Tensor:
         """The projected queries, (T, h dk), as heads, (T, h, dk): QK-norm then RoPE
