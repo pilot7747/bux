@@ -42,6 +42,8 @@ class Options:
     seed: int = 0
     share: tuple[str, ...] = ()  # terms no family but the root has of its own
     sigma_from: str = "--noise"  # where sigma comes from
+    e: float | None = None  # E held at this value; None: fit
+    drop_scan: tuple[str, ...] = ()  # families whose token scans are left out
 
 
 @dataclass
@@ -71,9 +73,11 @@ def families(
     kids = Counter(parent.values())
     out = {}
     for f, ps in by.items():
-        arrays = [np.array(v, float) for v in zip(*[(p.n, p.tokens, p.metrics[metric], p.width, p.per_param) for p in ps], strict=True)]  # fmt: skip
+        n, d, y, width, per_param = [np.array(v, float) for v in zip(*[(p.n, p.tokens, p.metrics[metric], p.width, p.per_param) for p in ps], strict=True)]  # fmt: skip
         anchor = kids[f] >= ANCHOR and len({p.width for p in ps if p.ladder}) > 1
-        out[f] = Family(*arrays, parent[f], share, ("alpha",) if anchor else ())
+        count = np.array([p.replicates for p in ps], float)
+        extra = ("alpha",) if anchor else ()
+        out[f] = Family(n, d, y, width, per_param, parent[f], share, extra, count)
     kept = topological(out, root) if root in out else []
     if dropped := sorted(set(out) - set(kept)):
         print(
@@ -87,8 +91,9 @@ def analyze(
     points: list[Point], metric: str, parents: dict, targets: dict, o: Options
 ) -> Analysis:
     """Fit `metric`'s laws, and say what they say with their uncertainty."""
-    fams = families(points, metric, parents, o.root, o.share)
-    laws = fit_metric(fams, o.root, o.joint)
+    kept = [p for p in points if p.ladder or p.family not in o.drop_scan]
+    fams = families(kept, metric, parents, o.root, o.share)
+    laws = fit_metric(fams, o.root, o.joint, None, o.e)
     a = Analysis(
         metric,
         fams,
@@ -98,11 +103,11 @@ def analyze(
         o.sigma_from,
     )
     for f in fams:
-        others = leave_one_rung_out(fams, f, laws, o.root, o.joint)
+        others = leave_one_rung_out(fams, f, laws, o.root, o.joint, o.e)
         qs = [one(f, fams, {**laws, f: law}, targets, o.root) for law in others]
         a.loro[f] = spread(qs, 0, 100)
     if o.reps:
-        reps = bootstrap(fams, laws, o.root, o.joint, o.sigma, o.reps, o.seed)
+        reps = bootstrap(fams, laws, o.root, o.joint, o.sigma, o.reps, o.seed, o.e)
         qs = [quantities(fb, lb, targets, o.root) for fb, lb in reps]
         a.boot = {f: spread([q[f] for q in qs if f in q], 5, 95) for f in fams}
     return a
@@ -126,9 +131,9 @@ def rungs(f: str, fams: dict[str, Family], laws: dict[str, Law]) -> dict[int, di
     from its loss (``mult``) and from its law (``mult_law``)."""
     fam, parent = fams[f], fams[f].parent
     rows: dict[int, dict] = {}
-    for i in np.flatnonzero(fam.ladder):
+    for i in np.flatnonzero(fam.ladder).tolist():
         w, n, d, y = int(fam.width[i]), fam.n[i], fam.d[i], fam.y[i]
-        row = {"loss": float(y), "n": float(n), "d": float(d)}
+        row = {"loss": float(y), "n": float(n), "d": float(d), "runs": _runs(fam, i)}
         if parent != NO_DATA:
             p = laws[parent]
             row["mult"] = p.n_for(y, d) / n
@@ -136,6 +141,7 @@ def rungs(f: str, fams: dict[str, Family], laws: dict[str, Law]) -> dict[int, di
             pf = fams[parent]
             if (j := np.flatnonzero(pf.ladder & (pf.width == w))).size:
                 row["delta"] = pct(y, pf.y[j[0]])
+                row["parent_runs"] = _runs(pf, int(j[0]))
         rows[w] = row
     return rows
 
@@ -238,19 +244,32 @@ def spread(qs: list[dict], lo: float, hi: float) -> dict[tuple, tuple[float, flo
     }
 
 
+def _runs(fam: Family, i: int) -> int:
+    return 1 if fam.count is None else int(fam.count[i])
+
+
 def verdict(q: dict, sigma: float) -> str:
     """Whether a family differs from its parent at its rungs beyond the noise: "no
-    measurable difference" if every |delta| < VERDICT sigmas of a delta between two
-    runs, else "better" or "worse" if every delta has that sign, else "mixed"."""
-    deltas = [r["delta"] for r in q.get("rungs", {}).values() if "delta" in r]
-    if not deltas:
+    measurable difference" if every |delta| < VERDICT sigmas of that delta (from
+    the runs each side averages), else "better" or "worse" if every delta has that
+    sign, else "mixed"."""
+    rows = [r for r in q.get("rungs", {}).values() if "delta" in r]
+    if not rows:
         return ""
-    if all(abs(d) < 100 * VERDICT * math.sqrt(2) * sigma for d in deltas):
+    if all(abs(r["delta"]) < VERDICT * delta_sigma(r, sigma) for r in rows):
         return "no measurable difference"
+    deltas = [r["delta"] for r in rows]
     return (
         "better"
         if all(d < 0 for d in deltas)
         else "worse"
         if all(d > 0 for d in deltas)
         else "mixed"
+    )
+
+
+def delta_sigma(row: dict, sigma: float) -> float:
+    """The noise of a rung's delta in percent: each side's runs average theirs."""
+    return (
+        100 * sigma * math.sqrt(1 / row.get("runs", 1) + 1 / row.get("parent_runs", 1))
     )

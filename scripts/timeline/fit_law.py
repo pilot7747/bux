@@ -45,14 +45,20 @@ class Law:
     def n_for(self, loss: float, d: float) -> float:
         """The parameters at which this law reaches `loss` on `d` tokens."""
         rest = loss - self.E - self.B * d**-self.beta
-        return (rest / self.A) ** (-1 / self.alpha) if rest > 0 else math.inf
+        return _root(rest / self.A, self.alpha) if rest > 0 else math.inf
 
     def d_for(self, loss: float, n: float) -> float:
         """The tokens on which `n` parameters reach `loss`."""
         rest = loss - self.asymptote(n)
         if self.B <= 0:
             return 0.0 if rest >= 0 else math.inf
-        return (rest / self.B) ** (-1 / self.beta) if rest > 0 else math.inf
+        return _root(rest / self.B, self.beta) if rest > 0 else math.inf
+
+
+def _root(x: float, power: float) -> float:
+    """x^(-1/power), inf where it overflows."""
+    log = -math.log(x) / power
+    return math.exp(log) if log < 700 else math.inf
 
 
 FLAT = Law(0.0, 1.0, 0.3, 0.0, 1.0)  # NO_DATA's terms
@@ -70,6 +76,7 @@ class Family:
     parent: str  # NO_DATA for the root
     share: tuple[str, ...] = ()  # terms it takes from its parent whatever its points
     extra: tuple[str, ...] = ()  # terms of its own its children's points tell apart
+    count: np.ndarray | None = None  # the runs each point averages (1 if None)
     free: tuple[str, ...] = ()
 
     def __post_init__(self) -> None:
@@ -89,13 +96,16 @@ class Family:
         return self._take(keep, self.y[keep])
 
     def noisy(self, rng: np.random.Generator, sigma: float) -> "Family":
-        """This family with each point's loss off by a relative noise of `sigma`."""
-        y = self.y * np.exp(sigma * rng.standard_normal(len(self.y)))
+        """This family with each point's loss off by a relative noise of `sigma`
+        over the root of the runs it averages."""
+        count = np.ones(len(self.y)) if self.count is None else self.count
+        y = self.y * np.exp(sigma / np.sqrt(count) * rng.standard_normal(len(self.y)))
         return self._take(np.ones(len(self.y), bool), y)
 
     def _take(self, keep: np.ndarray, y: np.ndarray) -> "Family":
         n, d, w, t = (v[keep] for v in (self.n, self.d, self.width, self.per_param))
-        return Family(n, d, y, w, t, self.parent, self.share, self.extra)
+        count = None if self.count is None else self.count[keep]
+        return Family(n, d, y, w, t, self.parent, self.share, self.extra, count)
 
 
 def own_terms(width: np.ndarray, per_param: np.ndarray, root: bool) -> tuple[str, ...]:
@@ -108,27 +118,36 @@ def own_terms(width: np.ndarray, per_param: np.ndarray, root: bool) -> tuple[str
 
 
 def fit_metric(
-    fams: dict[str, Family], root: str, joint: bool = True, start: dict | None = None
+    fams: dict[str, Family],
+    root: str,
+    joint: bool = True,
+    start: dict | None = None,
+    e: float | None = None,
 ) -> dict[str, Law]:
     """Every family's law. From `start`, or from the staged fits and a grid of
-    the root's: jointly, E, the root's terms and every family's own at once (the
-    terms a family shares then rest on every family that shares them); else staged."""
+    the root's: jointly, E (unless `e` holds it), the root's terms and every
+    family's own at once (the terms a family shares then rest on every family that
+    shares them); else staged."""
     order = topological(fams, root)
     if not joint:
-        return staged(fams, order, start)
-    starts = [start] if start else [staged(fams, order)]
+        return staged(fams, order, start, e)
+    starts = [start] if start else [staged(fams, order, None, e)]
     if not start:
-        starts += [spread(fams, order, s[root]) for s in root_starts(fams, [root])]
-    return fit_group(fams, order, {NO_DATA: FLAT}, None, starts)
+        grid = root_starts(fams, [root], e)
+        starts += [spread(fams, order, s[root]) for s in grid]
+    return fit_group(fams, order, {NO_DATA: FLAT}, e, starts)
 
 
 def staged(
-    fams: dict[str, Family], order: list[str], start: dict | None = None
+    fams: dict[str, Family],
+    order: list[str],
+    start: dict | None = None,
+    e: float | None = None,
 ) -> dict:
     """The root's law alone, then each family's with its parent's and E held."""
     root = order[0]
-    starts = [start] if start else root_starts(fams, [root])
-    laws = fit_group(fams, [root], {NO_DATA: FLAT}, None, starts)
+    starts = [start] if start else root_starts(fams, [root], e)
+    laws = fit_group(fams, [root], {NO_DATA: FLAT}, e, starts)
     for f in order[1:]:
         laws[f] = fit_one(fams, f, laws, start)
     return laws
@@ -182,7 +201,7 @@ def fit_group(
     src, owners = _sources(fams, group, fixed, with_e)
 
     def unpack(x: np.ndarray) -> dict[str, Law]:
-        E = math.exp(x[0]) if with_e else e
+        E = math.exp(x[0]) if e is None else e
         return {
             f: Law(E, **{t: _term(t, c, x) for t, c in src[f].items()}) for f in group
         }
@@ -278,17 +297,19 @@ def _bounds(owners: list, with_e: bool, floor: float) -> tuple:
     return np.array(lo), np.array(hi)
 
 
-def root_starts(fams: dict[str, Family], group: list[str]) -> list[dict[str, Law]]:
-    """A grid of starts for the root's group: E a share of the lowest loss, the
-    exponents at a few values, A and B sharing the rest at the median point."""
+def root_starts(
+    fams: dict[str, Family], group: list[str], e: float | None = None
+) -> list[dict[str, Law]]:
+    """A grid of starts for the root's group: E a share of the lowest loss (or
+    `e`), the exponents at a few values, A and B sharing the rest at the median
+    point."""
     r = fams[group[0]]
     n, d, y = (float(np.median(v)) for v in (r.n, r.d, r.y))
     floor = float(min(fams[f].y.min() for f in group))
     starts = []
-    for share in (0.3, 0.6, 0.85):
+    for E in [share * floor for share in (0.3, 0.6, 0.85)] if e is None else [e]:
         for alpha in (0.15, 0.3, 0.5):
             for beta in (0.2, 0.4):
-                E = share * floor
                 law = Law(
                     E, 0.8 * (y - E) * n**alpha, alpha, 0.2 * (y - E) * d**beta, beta
                 )
@@ -297,7 +318,12 @@ def root_starts(fams: dict[str, Family], group: list[str]) -> list[dict[str, Law
 
 
 def leave_one_rung_out(
-    fams: dict[str, Family], f: str, laws: dict[str, Law], root: str, joint: bool
+    fams: dict[str, Family],
+    f: str,
+    laws: dict[str, Law],
+    root: str,
+    joint: bool,
+    e: float | None = None,
 ) -> list[Law]:
     """`f`'s laws fit without each of its rungs in turn (its other points kept), its
     parent's held; the root's with E refit."""
@@ -307,7 +333,7 @@ def leave_one_rung_out(
         if len(set(fewer.width[fewer.ladder])) < (2 if f == root else 1):
             continue
         if f == root:
-            out.append(fit_metric({**fams, f: fewer}, root, joint, laws)[f])
+            out.append(fit_metric({**fams, f: fewer}, root, joint, laws, e)[f])
         else:
             out.append(fit_one({**fams, f: fewer}, f, laws))
     return out
@@ -321,6 +347,7 @@ def bootstrap(
     sigma: float,
     reps: int,
     seed: int = 0,
+    e: float | None = None,
 ) -> list[tuple[dict[str, Family], dict[str, Law]]]:
     """`reps` refits of every family with each point's loss off by a relative
     noise of `sigma`, each from the full fit."""
@@ -328,5 +355,5 @@ def bootstrap(
     out = []
     for _ in range(reps):
         noisy = {f: fam.noisy(rng, sigma) for f, fam in fams.items()}
-        out.append((noisy, fit_metric(noisy, root, joint, laws)))
+        out.append((noisy, fit_metric(noisy, root, joint, laws, e)))
     return out

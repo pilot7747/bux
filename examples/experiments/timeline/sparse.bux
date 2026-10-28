@@ -1,0 +1,53 @@
+# Sparse attention, one change at a time from the 2021 reference, GPT-3's decoder with
+# RoPE (gpt3_rope.bux), and in the global layers of the late-2026 hybrid
+# (m2026_hybrid.bux). An indexer, trained by a loss of its own towards the
+# attention, picks the keys each query attends to. Every arm keeps all a query sees
+# in rows of 2k, or nearly, and a fraction of it in the 16k phase. Each indexer has
+# query heads of 64, as the attention's. Arms: era, source, what it was claimed for.
+use gpt3_rope
+use m2026_hybrid
+use timeline_code
+use rungs
+
+lm(a) = embed ([norm a] [norm ffn])^layers norm head(tied=true)
+rms   = rmsnorm(eps=1e-5)
+
+# CSA's query heads share one latent as wide as a head, the key and the value at
+# once. Each query sees a window of 128 tokens' latents and the indexer's top 512 of
+# the compressed ones, a latent for every 4 tokens; half of each head's dims rotate.
+compressed = csa(num_heads=d_model // 64, head_dim=64, compress_ratio=4,
+                 sliding_window_size=128, sinks=true, latent_norm=rms,
+                 rope=rope(fraction=0.5),
+                 indexer=indexer(num_heads=4, head_dim=64, top_k=512))
+
+# MSA's indexer has a head for each kv head, here each head: it scores every key by a
+# plain dot product, and each head attends to its best 16 blocks of 128 keys, its
+# own block among them.
+blocks = attn(indexer=indexer(num_heads=d_model // 64, head_dim=64, top_k=2048,
+                              block_size=128, pool=max, per_group=true, relu=false,
+                              weighted=false, norm=rms))
+
+# QSA's indexer of 4 heads scores keys pooled in blocks of 4 and keeps the best 512
+# complete blocks, beside the query's own unfinished block.
+pooled = attn(indexer=indexer(num_heads=4, head_dim=64, top_k=2048, block_size=4,
+                              weighted=false, norm=rms))
+
+# DSA in the hybrid's global layers, with attention.bux's indexer; its MTP module's
+# layer stays dense.
+hy_sparse  = fr_global(indexer=indexer(num_heads=4, head_dim=64, top_k=2048))
+hybrid_dsa = embed
+             fr_layer(hy_delta, fr_dense) fr_layer(hy_delta)^2 fr_layer(hy_sparse)
+             (fr_layer(hy_delta)^3 fr_layer(hy_sparse))^(layers // 4 - 1)
+             fr_norm @h fr_out hy_mtp
+
+model = # 2026 DeepSeek-V4, V4.1-Flash (CSA): compressed latents and a window, the
+        # indexer over the latents; long-context cost, KV cache
+        csa:        lm(compressed)
+      # 2026 MiniMax-M3, M3.1-Flash (MSA): a pick of blocks for each kv head's group;
+      # long-context cost
+      | msa:        lm(blocks)
+      # 2026 Qwen3.8-Flash-Next (QSA): an indexer over blocks of keys; long-context cost
+      | qsa:        lm(pooled)
+      # 2025 DeepSeek-V3.2 (DSA), 2026 GLM-5.3: the late-2026 hybrid, its global
+      # layers sparse; long-context cost
+      | hybrid_dsa: hybrid_dsa

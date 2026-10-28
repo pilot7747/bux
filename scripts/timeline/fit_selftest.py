@@ -1,7 +1,7 @@
 """fit.py's self-test: runs drawn from known laws, fit back.
 
 A baseline (an lr scan at d512, a token scan t5-t80 at d512, four rungs, an axis
-file's base arm and seeds 1-3 as its replicates) and three variants:
+file's base arm and seeds 1-3 as its replicates; every family has seeds at d512) and three variants:
 ``const13``, the baseline with 1.3 times its parameters, at two rungs;
 ``growing``, whose multiplier grows from 1.1 at d512 as N^0.15, at three rungs with
 its best lr at the scan's edge; and ``moe``, twice the baseline's parameters a
@@ -15,6 +15,7 @@ import json
 import math
 import re
 from pathlib import Path
+from typing import Any
 
 import numpy as np
 from fit_law import Law
@@ -73,13 +74,19 @@ def runs_of(family: str) -> list[tuple[int, int, float]]:
 
 def rows(sigma: float, seed: int) -> list[dict]:
     """Every run's name and final metrics, each loss off by `sigma`: the baseline's
-    d512 and d768 again as an axis file's base arm, and d512 to d1024 as seeds 1-3."""
+    d512 and d768 again as an axis file's base arm and its d768 and d1024 as seeds
+    1-3, and every family's d512 as seeds 1-3 at its best lr, as the campaign ran."""
     rng = np.random.default_rng(seed)
     runs = [(f, *FAMILIES[f][:2], *run, 0) for f in FAMILIES for run in runs_of(f)]
     runs += [("baseline", "synth", "base", w, 20, LR_BEST, 0) for w in (512, 768)]
     runs += [
         ("baseline", "baseline", "", w, 20, LR_BEST, s)
-        for w in WIDTHS[:3]
+        for w in WIDTHS[1:3]
+        for s in (1, 2, 3)
+    ]
+    runs += [
+        (f, *FAMILIES[f][:2], 512, 20, FAMILIES[f][6], s)
+        for f in FAMILIES
         for s in (1, 2, 3)
     ]
     out = []
@@ -189,7 +196,7 @@ def truth(metric: str) -> dict[str, dict]:
             n, d = active * n_base(w), TOKENS[w]
             y = float(law.loss(n, d))
             q["rungs"][w] = {"mult": laws["baseline"].n_for(y, d) / n,
-                             "delta": pct(y, laws["baseline"].loss(n_base(w), d))}  # fmt: skip
+                             "delta": pct(y, float(laws["baseline"].loss(n_base(w), d)))}  # fmt: skip
         out[f] = q
     return out
 
@@ -229,7 +236,7 @@ def checks(fit: dict, metric: str, tolerance: dict) -> list[dict]:
     return rows
 
 
-def _at(q: dict, path: str) -> float:
+def _at(q: Any, path: str) -> float:
     for k in path.split("/"):
         q = q[int(k)] if k.isdigit() and int(k) in q else q[k]
     return float(q)
@@ -251,6 +258,7 @@ def run(out: Path, reps: int, sigma: float = 0.002) -> int:
     for noise, tolerance in ((0.0, EXACT), (sigma, NOISY)):
         args = write(out / f"noise-{noise:g}", noise, seed=1, dirs=bool(noise))
         args += ["--reps", str(reps if noise else 0), "--noise", str(sigma)]
+        fit.ARGV = args
         report = fit.run(fit.parser().parse_args(args))
         result = json.loads(report["json"].read_text())
         for metric in LAWS:

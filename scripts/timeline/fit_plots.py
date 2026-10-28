@@ -70,7 +70,8 @@ def ladder(a: Analysis, families: list[str], targets: dict, out: Path) -> list[P
     def paint(ax: Any, theme: tuple) -> None:
         surface, _, muted, _, colors = theme
         for f, color in zip(families, colors, strict=False):
-            _family_curve(ax, a, f, targets.get(f), color, surface)
+            if f in a.laws:
+                _family_curve(ax, a, f, targets.get(f), color, surface)
         ax.set_xscale("log")
         ax.set_xlabel(
             "parameters a token goes through, besides the embeddings", color=muted
@@ -127,7 +128,7 @@ def hours(
     def paint(ax: Any, theme: tuple) -> None:
         surface, ink, muted, _, colors = theme
         for f, color in zip(families, colors, strict=False):
-            if (t := targets.get(f)) is not None:
+            if (t := targets.get(f)) is not None and f in a.laws:
                 ax.plot(
                     grid,
                     a.laws[f].loss(t.n_active, t.tokens(grid)),
