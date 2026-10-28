@@ -270,6 +270,11 @@ def _row(family: str, ws: dict[int, Width], e: dict, a: dict) -> str:
         got = f"{e['d_model']:.0f}, {_si(e['N_active'])} / {_si(e['N_total'])}{tp}{flag}{via}"
     else:
         got = e.get("error", "-")
+    if e.get("upper_bound") and (low := e.get("anchored")):
+        got += (
+            f"; at the model's price of the algebra: {low['d_model']:.0f}, "
+            f"{_si(low['N_active'])} / {_si(low['N_total'])}"
+        )
     ana = f"{a['d_model']:.0f}, {_si(a['active'])}" if "active" in a else "-"
     ratio = (
         f"{e['N_active'] / a['active']:.2f}"
@@ -328,18 +333,33 @@ def as_trained(entry: dict, base: dict[int, Width]) -> dict:
 
 
 def anchored(ws: dict[int, Width], ref: dict[int, Width], budget: float) -> dict:
-    """A family timed only by an implementation slower than its architecture, at one
-    width beside a reference: the reference's measured curve scaled by the model's
-    ratio of the two there, matched to the budget."""
-    w = next(iter(ws.values()))
-    r = ref.get(w.d_model)
-    if r is None or not (w.model and r.model):
+    """A family timed only by an implementation slower than its architecture, beside a
+    reference: the reference's measured cost at each of the family's widths, scaled by
+    the model's ratio of the two there, matched to the budget. A family timed at one
+    width takes the reference's other widths too, in its own parameters (`like`)."""
+    ratios: dict[int, float]
+    if len(ws) == 1:
+        w = next(iter(ws.values()))
+        one = _ratio(w, ref.get(w.d_model))
+        curve = like(w, ref) if one else {}
+        ratios = dict.fromkeys(curve, one or 0.0)
+    else:
+        ratios = {d: x for d, w in ws.items() if (x := _ratio(w, ref.get(d)))}
+        curve = {d: Width(d, ws[d].tp, ws[d].params, ws[d].active) for d in ratios}
+    for d, x in curve.items():
+        x.best = [{"sessions_per_hour": ref[d].cost() * x.tp * ratios[d]}]
+    m = match(curve, budget)
+    if "error" in m:
         return {}
-    scaled = like(w, ref)
-    for d, x in scaled.items():
-        x.best = [{"sessions_per_hour": ref[d].cost() * x.tp * w.model / r.model}]
-    m = match(scaled, budget)
-    return {} if "error" in m else m | {"model_ratio": w.model / r.model}
+    timed = {str(d): round(x, 4) for d, x in ratios.items() if d in ws}
+    return m | {"model_ratio": timed}
+
+
+def _ratio(w: Width, r: Width | None) -> float | None:
+    """The model's sessions per hour of `w` over its reference's at that width."""
+    if r is None or not (w.model and r.model and r.cost()):
+        return None
+    return w.model / r.model
 
 
 def served_as(entry: dict, variant: dict, name: str) -> dict:
@@ -390,6 +410,7 @@ def main() -> None:
     fams = widths(read(a.sweeps), a.slo)
     likes = dict(x.split("=", 1) for x in a.like)
     out = targets(fams, likes)
+    refs = likes | dict(x.split("=", 1) for x in a.anchor)
     analytic = {f: m for path in a.analytic for f, m in analytic_matches(path).items()}
     for family, ref in (x.split("=", 1) for x in a.same):
         if ref in out and family not in out:
@@ -403,7 +424,7 @@ def main() -> None:
     for family, note in (x.split("=", 1) for x in a.upper_bound):
         if family in out:
             out[family] |= {"upper_bound": True, "note": note}
-            ref = likes.get(family)
+            ref = refs.get(family)
             if (
                 ref
                 and family in fams
@@ -416,7 +437,7 @@ def main() -> None:
             entry["analytic"] = {"N_active": m["active"], "N_total": m["params"]}
             entry["analytic"]["d_model"] = m["d_model"]
     for family, reason in (x.split("=", 1) for x in a.kernel_limited):
-        ref = likes.get(family)
+        ref = refs.get(family)
         anchor = (
             anchored(fams[family], fams[ref], budget)
             if ref and family in fams
@@ -450,6 +471,13 @@ def parser() -> argparse.ArgumentParser:
         default=[],
         metavar="FAMILY=REFERENCE",
         help="a family timed at one width, with REFERENCE's serving shape",
+    )
+    p.add_argument(
+        "--anchor",
+        action="append",
+        default=[],
+        metavar="FAMILY=REFERENCE",
+        help="the reference an upper-bound family timed at several widths is anchored to",
     )
     p.add_argument(
         "--upper-bound",
