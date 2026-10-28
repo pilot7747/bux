@@ -295,6 +295,21 @@ CASES = {
     " gated=true, indexer=indexer(num_heads=2, head_dim=16, top_k=8))\n"
     + "model = embed [rmsnorm attn(v=@v1)] [rmsnorm ffn] [rmsnorm attn(v=$v1!)]"
     " [rmsnorm ffn] rmsnorm head",
+    # Shared picks, as GLM-5.3's: one layer's indexer picks the keys the next two
+    # attend over, the last with a window of its own.
+    "dsa-share": HEAD + FFN + "attn = gqa(num_heads=4, num_kv_heads=2, rope=rope(),"
+    " indexer=indexer(num_heads=2, head_dim=16, top_k=8))\n"
+    + "model = embed [rmsnorm attn(index=@topk)] [rmsnorm ffn] [rmsnorm attn(index=$topk)]"
+    " [rmsnorm ffn] [rmsnorm attn(sliding_window_size=16, index=$topk!)] [rmsnorm ffn]"
+    " rmsnorm head",
+    # MSA's picks, of blocks and per kv head's group, shared likewise.
+    "msa-share": HEAD
+    + FFN
+    + "attn = gqa(num_heads=4, num_kv_heads=2, rope=rope(), indexer=indexer("
+    "num_heads=2, head_dim=16, top_k=16, block_size=4, pool=max, per_group=true,"
+    " relu=false, weighted=false, norm=rmsnorm))\n"
+    + "model = embed [rmsnorm attn(index=@topk)] [rmsnorm ffn]"
+    " [rmsnorm attn(index=$topk!)] [rmsnorm ffn] rmsnorm head",
     "msa": HEAD
     + FFN
     + "attn = gqa(num_heads=4, num_kv_heads=2, rope=rope(), indexer=indexer("

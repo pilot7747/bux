@@ -16,7 +16,7 @@ from __future__ import annotations
 import torch
 
 #: The ports a ``gqa`` layer runs in vLLM.
-PORTS = ("v", "kv")
+PORTS = ("v", "kv", "index")
 
 
 def reads(ports: list, name: str) -> tuple[str, bool] | None:
@@ -41,13 +41,16 @@ def check_ports(c: dict, ports: list) -> None:
     """Raise for the ports of the ``gqa`` layer `c` that vLLM does not run.
 
     Raises:
-        NotImplementedError: It has an ``index`` port; or it reads ``kv`` and has a
-            ``v`` port or an indexer, as the export does not take either.
+        NotImplementedError: It reads ``kv`` and has a ``v`` port or an indexer, as
+            the export does not take either, or reads ``index`` too, whose sparse
+            attention over another's keys vLLM does not share.
     """
     others = sorted({name for name, _, _ in ports} - set(PORTS))
     if others:
         raise NotImplementedError(f"gqa: the {', '.join(others)} port not in vLLM yet")
-    if reads(ports, "kv") and (any(n == "v" for n, _, _ in ports) or c["indexer"]):
+    if not reads(ports, "kv"):
+        return
+    if any(n == "v" for n, _, _ in ports) or c["indexer"] or reads(ports, "index"):
         raise NotImplementedError("gqa: a v port or an indexer beside reading kv")
 
 
