@@ -230,7 +230,9 @@ how often it moves it.
 - **Kernels.** In a 16-bit model, hc's, mhc's and attnres's reads and writes run
   fused Triton kernels (`bux_vllm.streams`), in float32 from the stream's dtype. A
   branch reads its streams in one kernel and writes them in another, so it moves
-  the widened stream once into the read, and once in and once out of the write:
+  the widened stream once into the read, and once in and once out of the write.
+  Each token's program takes its whole row at once, up to 4096 channels of each
+  stream, so that a decoding step's few tokens each make one round of loads:
   - hc's read computes the token's coefficients, A and B, static plus the dynamic
     term ``s tanh(norm(x_j) W)``, the norm's statistics and its dot products with
     W in one pass (``norm(x) W`` as ``rstd (x W - mean sum(W))``), then the read.
