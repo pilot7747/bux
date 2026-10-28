@@ -226,13 +226,14 @@ def test_native_indexer_takes_deepseek_s_settings_alone() -> None:
     from bux_vllm import dsa, picks
 
     def spec(**c: Any) -> picks.Sparse:
-        settings = {"top_k": 2048, "block_size": 1, "relu": True} | c
-        sparse = picks.Sparse(
+        settings: dict[str, Any] = {"top_k": 2048, "block_size": 1, "relu": True}
+        settings |= c
+        return picks.Sparse(
             settings["top_k"],
             settings["block_size"],
             False,
-            settings.get("per_group", False),
-            settings["relu"],
+            bool(settings.get("per_group", False)),
+            bool(settings["relu"]),
             settings.get("window"),
             1.0,
             None,
@@ -240,7 +241,6 @@ def test_native_indexer_takes_deepseek_s_settings_alone() -> None:
             (0, 1),
             latent=settings.get("latent", 0),
         )
-        return sparse
 
     with pytest.MonkeyPatch.context() as mp:
         mp.setattr(dsa, "available", lambda: True)
