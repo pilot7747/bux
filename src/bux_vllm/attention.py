@@ -1,5 +1,6 @@
 """Softmax attention in vLLM: bux's ``gqa``, its projections split by head under
-tensor parallelism, attending by vLLM's attention layer and its paged KV cache."""
+tensor parallelism, attending by vLLM's attention layer and its paged KV cache, and
+its ``v`` port (the value residual, `bux_vllm.kv`)."""
 
 from __future__ import annotations
 
@@ -13,6 +14,7 @@ from vllm.model_executor.layers.linear import (
     RowParallelLinear,
 )
 
+from . import kv
 from .common import (
     ACTIVATIONS,
     Ctx,
@@ -27,7 +29,8 @@ from .common import (
 
 
 class Attention(Layer):
-    """bux's ``gqa``: q, k and v by one column-parallel projection, QK-norm then
+    """bux's ``gqa``: q, k and v by one column-parallel projection, the values mixed
+    with those of its ``v`` port (the value residual) and pushed to it, QK-norm then
     RoPE (in float32, as bux), causal softmax attention with its sliding window,
     soft-capping and sinks by vLLM's attention layer, each head's output norm and
     gate, and the row-parallel output projection.
@@ -46,8 +49,7 @@ class Attention(Layer):
         if c["qk_norm"] and c["qk_norm_all_heads"]:
             # Its statistics would sum over every rank's heads under tensor parallelism.
             raise NotImplementedError("gqa: qk_norm_all_heads not in vLLM yet")
-        if site.ports:
-            raise NotImplementedError("gqa: ports not in vLLM yet")
+        kv.check_ports(site.ports)
         tp = get_tensor_model_parallel_world_size()
         h, g = c["num_heads"], c["num_kv_heads"]
         dk = c["head_dim"] or width // h
@@ -74,6 +76,7 @@ class Attention(Layer):
         self.k_norm = Norm(qk, dk) if qk else None
         self.out_norm = Norm(out, dv) if out else None
         self.rope = Rope(c["rope"], dk) if c["rope"] else None
+        self._value_residual(c, site.ports)
         self.sinks = _sinks(self.h) if c["sinks"] else None
         scale = (c["scale"] or dk**-0.5) * logit_gain(c["rope"])
         self.caches = nn.ModuleList(
@@ -103,6 +106,16 @@ class Attention(Layer):
                 width, n, bias=c["bias"], return_bias=False, prefix=f"{path}.gate"
             )
 
+    def _value_residual(self, c: dict, layer_ports: list) -> None:
+        """Keep the layer's ports, and the learned weights of its value residual
+        where it reads the ``v`` port and ``value_residual`` learns them."""
+        self.ports, self.mix = layer_ports, c["value_residual"]
+        self.v_mix = None
+        if kv.reads(layer_ports, "v") and self.mix != "fixed":
+            shape = (2,) if self.mix == "learned" else ()
+            w = torch.full(shape, 0.5, dtype=torch.float32)
+            self.v_mix = nn.Parameter(w, requires_grad=False)
+
     def targets(self) -> dict[str, tuple[nn.Parameter, tuple]]:
         out: dict[str, tuple[nn.Parameter, tuple]] = {}
         for kind in ("weight", "bias"):
@@ -118,6 +131,8 @@ class Attention(Layer):
                 out |= {f"{name}.{k}": v for k, v in norm.targets().items()}
         if self.sinks is not None:
             out["sinks"] = (self.sinks, ())
+        if self.v_mix is not None:
+            out["v_mix"] = (self.v_mix, ())
         return out
 
     def forward(self, x: torch.Tensor, ctx: Ctx) -> torch.Tensor:
@@ -125,6 +140,7 @@ class Attention(Layer):
         q, k, v = self.qkv(x).split(
             [self.h * self.dk, self.g * self.dk, self.g * self.dv], -1
         )
+        v = self._v_port(v, ctx)
         q, k = q.view(t, self.h, self.dk), k.view(t, self.g, self.dk)
         if self.q_norm is not None and self.k_norm is not None:
             q, k = self.q_norm(q), self.k_norm(k)
@@ -134,6 +150,16 @@ class Attention(Layer):
         q, k = q.reshape(t, -1).contiguous(), k.reshape(t, -1).contiguous()
         out = attend(q, k, v.contiguous()).view(t, self.h, self.dv)
         return self.o(self._gated(x, out).reshape(t, -1))
+
+    def _v_port(self, v: torch.Tensor, ctx: Ctx) -> torch.Tensor:
+        """The values, (T, g dv), with those the ``v`` port reads mixed in, pushed
+        to the taps it writes, as bux mixes and pushes them."""
+        read = kv.reads(self.ports, "v")
+        if read is not None:
+            v = kv.mix_values(self.mix, self.v_mix, v, ctx.read(*read))
+        for tap in kv.writes(self.ports, "v"):
+            ctx.push(tap, v)
+        return v
 
     def _gated(self, x: torch.Tensor, out: torch.Tensor) -> torch.Tensor:
         """The heads' outputs, (T, h, dv), normalized and gated."""
