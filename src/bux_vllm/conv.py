@@ -32,7 +32,8 @@ from vllm.model_executor.layers.mamba.ops.causal_conv1d import (
 from vllm.v1.attention.backends.registry import MambaAttentionBackendEnum
 
 from . import kv
-from .plan import live, plan
+from .config import states
+from .plan import live, plan, ports
 
 
 def state_shapes(vllm_config: Any) -> list[tuple]:
@@ -41,11 +42,11 @@ def state_shapes(vllm_config: Any) -> list[tuple]:
     config = vllm_config.model_config.hf_config
     tp = vllm_config.parallel_config.tensor_parallel_size
     calls = live(plan(config.bux, config.bux_reserved).calls)
-    layers = [(c.layer["config"], c.layer["width"]) for c in calls]
+    layers = [c.layer for c in calls if c.layer["config"]["type"] == "gqa"]
     convs = {
-        (kv.conv_channels(c, width, tp), c["kv_conv_size"])
-        for c, width in layers
-        if c["type"] == "gqa" and c.get("kv_conv_size")
+        (kv.conv_channels(n["config"], n["width"], tp), n["config"]["kv_conv_size"])
+        for n in layers
+        if "conv" in states(n["config"], ports(n))
     }
     return [state_shape(vllm_config, *conv) for conv in sorted(convs)]
 

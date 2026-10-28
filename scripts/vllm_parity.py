@@ -87,6 +87,18 @@ SPARSE_LATENT = (
     " top_k=12))\n"
 )
 
+#: Hymba's blocks: attention without a window (F) and with one, which writes its
+#: keys and values to the tap kv (W), reads them (S) or takes them off (R); and one
+#: without a window that writes them (G).
+SHARING = (
+    "local = gqa(num_heads=4, num_kv_heads=2, sliding_window_size=8, rope=rope())\n"
+    "full = local(sliding_window_size=none)\n"
+    + FFN
+    + "layer(attn) = [rmsnorm attn] [rmsnorm ffn]\n"
+    "F = layer(full)\nW = layer(local(kv=@kv))\nS = layer(local(kv=$kv))\n"
+    "R = layer(local(kv=$kv!))\nG = layer(full(kv=@kv))\n"
+)
+
 #: The cases, by name: a model each, as bux source.
 CASES = {
     "llama": LLAMA + "model = embed block^2 rmsnorm head",
@@ -246,6 +258,9 @@ CASES = {
     + "one = attn(value_residual=convex)\n"
     + "model = embed [rmsnorm attn(v=@v1)] [rmsnorm ffn] [rmsnorm attn(v=$v1)]"
     " [rmsnorm both(v=$v1)] [rmsnorm ffn] [rmsnorm one(v=$v1!)] rmsnorm head",
+    # Hymba's cross-layer KV sharing: a windowed layer's keys and values read by
+    # the next one or two, then a full layer's by one with a window of its own.
+    "kv-share": HEAD + SHARING + "model = embed F W S R W R G R rmsnorm head",
     "mla": HEAD + LATENT + FFN + BLOCK + "model = embed block^2 rmsnorm head",
     "mla-moe": HEAD
     + LATENT
