@@ -589,3 +589,15 @@ def test_rwkv7_feeds_the_rule_what_the_export_does() -> None:
     o = m.norm(by_chunks(xs, heads, math.exp(-0.5)))
     o = o + feeds.rwkv7_bonus(xs[0], xs[1], v, m.r_k)
     torch.testing.assert_close(m.o(o.flatten(1) * m.g(xg)), m(x[None], no_cache())[0])
+
+
+@pytest.mark.parametrize("name", ["value-residual", "rwkv7-residual"])
+def test_a_layers_ports_are_as_the_exports_sites_give_them(name: str) -> None:
+    """The plugin's layers read their ports as [name, tap, mode], as the export's
+    sites list them, from the IR's."""
+    arch = compile(vllm_parity.CASES[name])
+    sites = core.plan(arch).sites()
+    tree = plan.plan(arch.model_dump(mode="json"), core.RESERVED)
+    for call in (c for c in tree.calls if c.first):
+        assert plan.ports(call.layer) == sites[call.path]["ports"]
+    assert any(plan.ports(c.layer) for c in tree.calls)

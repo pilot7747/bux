@@ -31,7 +31,19 @@ from vllm.sequence import IntermediateTensors
 
 from . import residual, ssm
 from .common import Ctx, Layer, Site
-from .plan import Call, Node, Plan, Pos, Scope, at, children, is_call, live, plan
+from .plan import (
+    Call,
+    Node,
+    Plan,
+    Pos,
+    Scope,
+    at,
+    children,
+    is_call,
+    live,
+    plan,
+    ports,
+)
 
 #: The modules of this package that hold layers.
 LAYER_MODULES = (
@@ -108,7 +120,7 @@ def build_layers(vllm_config: VllmConfig, p: Plan) -> dict[str, nn.Module]:
             config,
             states.get(call.path, []),
             embedding,
-            node["ports"],
+            ports(node),
         )
         layer = layers[call.path] = cls(node["config"], node["width"], site)
         if embedding is None and node["config"]["type"] == "embed":
