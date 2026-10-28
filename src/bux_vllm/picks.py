@@ -50,8 +50,8 @@ def top(
 def best_of(key: torch.Tensor, k: int) -> tuple[torch.Tensor, torch.Tensor]:
     """The indices of each row's `k` highest ranking keys, a score's `ordered` bits
     above its index's complement (`top`'s), -1 for an invalid entry; and which of
-    them are valid."""
-    best = key.topk(min(k, key.shape[-1]), dim=-1).values
+    them are valid. In no order: they are a set, which attention reads as one."""
+    best = key.topk(min(k, key.shape[-1]), dim=-1, sorted=False).values
     return LOW - (best & LOW), best >= 0
 
 
