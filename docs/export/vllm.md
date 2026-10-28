@@ -266,10 +266,13 @@ by those dims and the GPU. On a B300 (SM 10.x):
 
 - **Decoding.** FlashInfer's MLA (`FLASHINFER_MLA`) takes DeepSeek's dims, a latent
   of 512 and 64 rotated dims. A latent of 256 and 32 rotated dims runs on Triton's
-  (`TRITON_MLA`), the one MLA backend that takes any dims.
+  (`TRITON_MLA`), the one MLA backend that takes any dims. vLLM's MLA metadata
+  takes only a latent and rotated dims of 320, 512 or 576 in all, whatever the
+  backend; for other sizes the plugin checks them by the backend's own sizes.
 - **Prefill.** vLLM's MLA prefill backends take a few sets of dims (DeepSeek's, among
   them), and vLLM picks among them. For any other dims the plugin uses
-  FlashAttention's MLA prefill.
+  FlashAttention's MLA prefill, which on a B300 (FlashAttention 4) takes query, key
+  and value heads of 8 to 128 dims.
 
 To pick the decoding backend yourself, name it, as for any model:
 
