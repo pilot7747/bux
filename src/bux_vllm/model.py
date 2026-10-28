@@ -143,7 +143,8 @@ def _class(call: Call) -> type[Layer]:
 
 
 class Scoped(nn.Module):
-    """A module of a scope of the plan: its layers and repeats by their names."""
+    """A module of a scope of the plan: its layers, repeats and residual algebra's
+    branches by their names."""
 
     def __init__(self, scope: Scope, prefix: str, layers: dict[str, nn.Module]):
         super().__init__()
