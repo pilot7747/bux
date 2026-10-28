@@ -9,12 +9,11 @@ attention, so they grow with the sequence, and in blocks of as many tokens as th
 model's other attention caches, so they serve prefix caching as those do (a cache
 of indexer keys alone, smaller a token, would get blocks of more tokens, which a
 prefix would have to fill to be cached). The plugin writes and reads it itself, in
-one op,
-``vllm::bux_sparse_attention``, which runs eagerly: vLLM splits its CUDA graphs
-around it (`split_graphs`), as around attention, and captures no whole-step graph
-of a model with one (`PagedMetadataBuilder`). The op also gives the keys each query
-picked, which a layer that reads them through its ``index`` port attends over with
-``vllm::bux_picked_attention``, keeping no indexer keys of its own.
+one op, ``vllm::bux_sparse_attention``, which runs eagerly: vLLM splits its CUDA
+graphs around it (`split_graphs`), as around attention, and captures no whole-step
+graph of a model with one (`PagedMetadataBuilder`). The op also gives the keys each
+query picked, which a layer that reads them through its ``index`` port attends over
+with ``vllm::bux_picked_attention``, keeping no indexer keys of its own.
 """
 
 from __future__ import annotations
