@@ -219,6 +219,24 @@ class Norm(Layer):
         return y.to(x.dtype)
 
 
+class DyT(Layer):
+    """bux's ``dyt``: ``weight * tanh(alpha * x) + bias``, a norm without statistics,
+    in float32, the result in x's dtype."""
+
+    bux_types = ("dyt",)
+
+    def __init__(self, c: dict, width: Any, site: Site | None = None):
+        super().__init__()
+        alpha = torch.tensor(float(c["alpha_init"]))
+        self.alpha = nn.Parameter(alpha, requires_grad=False)
+        self.weight = nn.Parameter(torch.ones(width), requires_grad=False)
+        self.bias = nn.Parameter(torch.zeros(width), requires_grad=False)
+
+    def forward(self, x: torch.Tensor, ctx: Ctx | None = None) -> torch.Tensor:
+        y = torch.tanh(self.alpha.float() * x.float())
+        return (y * self.weight.float() + self.bias.float()).to(x.dtype)
+
+
 def _yarn_factor(s: dict) -> float:
     """YaRN's attention factor: as given, else 0.1 ln(factor) + 1."""
     if s["attention_factor"] is not None:

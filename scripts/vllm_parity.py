@@ -277,6 +277,10 @@ CASES = {
     # Hymba's cross-layer KV sharing: a windowed layer's keys and values read by
     # the next one or two, then a full layer's by one with a window of its own.
     "kv-share": HEAD + SHARING + "model = embed F W S R W R G R rmsnorm head",
+    "dyt": HEAD
+    + ATTN
+    + FFN
+    + "model = embed [dyt attn] [dyt ffn] [dyt attn] [dyt ffn] dyt head",
     "mla": HEAD + LATENT + FFN + BLOCK + "model = embed block^2 rmsnorm head",
     "mla-moe": HEAD
     + LATENT

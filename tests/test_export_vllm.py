@@ -411,6 +411,17 @@ def twins(theirs: torch.nn.Module, mine: common.Layer) -> None:
     }
 
 
+def test_dyt_computes_what_the_export_does() -> None:
+    from bux.export.hf import basic as hf_basic
+
+    c = cfg.DyTConfig().model_dump(mode="json")
+    theirs, mine = hf_basic.DyT(c, 16), common.DyT(c, 16)
+    torch.manual_seed(0)
+    twins(theirs, mine)
+    x = torch.randn(5, 16) * 3
+    torch.testing.assert_close(mine(x), theirs(x))
+
+
 def through(branches: list, x: Any, ctx: Any, body: torch.Tensor) -> tuple[list, Any]:
     """Run the stream `x` through `branches`, each body ``tanh(h body)``; return what
     each read, and the stream after them."""
