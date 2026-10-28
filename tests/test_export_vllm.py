@@ -1040,13 +1040,18 @@ def test_sparse_attention_in_the_latent_space_is_bux_s(name: str, window: int | 
     )
 
 
-def test_the_step_splits_into_single_queries_and_requests() -> None:
+def test_the_step_splits_into_its_decoded_tokens_and_prompt_chunks() -> None:
+    """The decoded tokens, which vLLM puts first, attend together, as slices that a
+    CUDA graph of the step fixes; each prompt chunk on its own."""
     from bux_vllm import picks
 
-    parts = picks.segments([0, 1, 5, 6, 9], [7, 30, 2, 12], "cpu")
-    assert [p.tokens.tolist() for p in parts] == [[0, 5], [1, 2, 3, 4], [6, 7, 8]]
-    assert [p.requests.tolist() for p in parts] == [[0, 2], [1], [3]]
-    assert [p.keys for p in parts] == [7, 30, 12]
+    parts = picks.segments(2, [(2, 4, 2, 30), (6, 3, 3, 12)], 64)
+    assert [(p.tokens, p.requests, p.keys) for p in parts] == [
+        (slice(0, 2), slice(0, 2), 64),
+        (slice(2, 6), slice(2, 3), 30),
+        (slice(6, 9), slice(3, 4), 12),
+    ]
+    assert picks.segments(0, [], 64) == []
 
 
 ENGRAMS = {

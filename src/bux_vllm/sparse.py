@@ -9,15 +9,16 @@ attention, so they grow with the sequence, and in blocks of as many tokens as th
 model's other attention caches, so they serve prefix caching as those do (a cache
 of indexer keys alone, smaller a token, would get blocks of more tokens, which a
 prefix would have to fill to be cached). The plugin writes and reads it itself, in
-one op, ``vllm::bux_sparse_attention``, which runs eagerly: vLLM splits its CUDA
-graphs around it (`split_graphs`), as around attention, and captures no whole-step
-graph of a model with one (`PagedMetadataBuilder`). The op also gives the keys each
-query picked, which a layer that reads them through its ``index`` port attends over
-with ``vllm::bux_picked_attention``, keeping no indexer keys of its own.
+one op, ``vllm::bux_sparse_attention``: vLLM splits its piecewise CUDA graphs around
+it (`split_graphs`), as around attention, and captures a step of decoded tokens
+alone as one graph (`PagedMetadataBuilder`). The op also gives the keys each query
+picked, which a layer that reads them through its ``index`` port attends over with
+``vllm::bux_picked_attention``, keeping no indexer keys of its own.
 """
 
 from __future__ import annotations
 
+from dataclasses import dataclass
 from typing import Any, ClassVar
 
 import torch
@@ -27,35 +28,85 @@ from vllm.model_executor.layers.attention_layer_base import AttentionLayerBase
 from vllm.utils.torch_utils import direct_register_custom_op
 from vllm.v1.attention.backend import (
     AttentionBackend,
+    AttentionCGSupport,
     AttentionMetadataBuilder,
     CommonAttentionMetadata,
 )
+from vllm.v1.attention.backends.utils import split_decodes_and_prefills
 from vllm.v1.kv_cache_interface import FullAttentionSpec
 
-from . import kernels, picks
+from . import compressed, kernels, picks
 from .kv import reads, writes
 
 #: The ops, as vLLM's compilation names them.
 OPS = ("vllm::bux_sparse_attention", "vllm::bux_picked_attention")
 
 
-class PagedMetadataBuilder(AttentionMetadataBuilder[CommonAttentionMetadata]):
-    """Gives a `PagedCache` the step's common metadata as it is: its block table,
-    slots, sequence lengths and queries' starts. It supports no CUDA graph of a
-    whole step (the builders' default), as the op reads them on the CPU."""
+@dataclass
+class Batch:
+    """A step's tokens, as a `PagedCache`'s ops read them.
+
+    Attributes:
+        slot_mapping: Each token's slot, (T,); -1 for padding.
+        block_table_tensor: Each request's blocks, (requests, blocks).
+        num_actual_tokens: The step's tokens, padding left out.
+        segments: Its queries by `bux_vllm.picks.Segment`: its decoded tokens, one
+            a request, then each prompt chunk.
+    """
+
+    slot_mapping: torch.Tensor
+    block_table_tensor: torch.Tensor
+    num_actual_tokens: int
+    segments: list[picks.Segment]
+
+
+class PagedMetadataBuilder(AttentionMetadataBuilder[Batch]):
+    """Gives a `PagedCache` the step's `Batch`, its decoded tokens first (it has vLLM
+    order them so). A step of decoded tokens alone is one CUDA graph: as captured,
+    they read up to ``max_model_len`` keys, which every replay may have, not the
+    capture's longest request's, and the ops read nothing on the CPU."""
+
+    _cudagraph_support: ClassVar[AttentionCGSupport] = (
+        AttentionCGSupport.UNIFORM_SINGLE_TOKEN_DECODE
+    )
 
     def __init__(
         self, kv_cache_spec: Any, layer_names: list[str], vllm_config: Any, device: Any
     ):
         super().__init__(kv_cache_spec, layer_names, vllm_config, device)
+        self._init_reorder_batch_threshold(1)
+        self.longest = vllm_config.model_config.max_model_len
 
     def build(
         self,
         common_prefix_len: int,
         common_attn_metadata: CommonAttentionMetadata,
         fast_build: bool = False,
-    ) -> CommonAttentionMetadata:
-        return common_attn_metadata
+    ) -> Batch:
+        return self._batch(common_attn_metadata, common_attn_metadata.max_seq_len)
+
+    def build_for_cudagraph_capture(
+        self, common_attn_metadata: CommonAttentionMetadata
+    ) -> Batch:
+        return self._batch(common_attn_metadata, self.longest)
+
+    def _batch(self, cm: CommonAttentionMetadata, longest: int) -> Batch:
+        """The step `cm`, its decoded tokens over `longest` keys at most."""
+        decodes, _, decode_tokens, _ = split_decodes_and_prefills(cm)
+        chunks = _prompts(cm, decodes) if decodes < cm.num_reqs else []
+        segments = picks.segments(decode_tokens, chunks, longest)
+        return Batch(
+            cm.slot_mapping, cm.block_table_tensor, cm.num_actual_tokens, segments
+        )
+
+
+def _prompts(cm: CommonAttentionMetadata, decodes: int) -> list:
+    """Each prompt chunk of the step after its `decodes` decoded requests: its first
+    token, tokens, request and the request's length with it."""
+    lengths = cm.seq_lens_cpu_upper_bound
+    lengths = cm.seq_lens.cpu() if lengths is None else lengths
+    starts = cm.query_start_loc_cpu[: cm.num_reqs + 1].tolist()
+    return compressed.prompt_chunks(starts, lengths.tolist(), decodes)
 
 
 class PagedBackend(AttentionBackend):
@@ -248,7 +299,7 @@ def sparse_attention(
     rows = picks.merged(torch.cat([k, v], -1)[:n], index_k[:n])
     picks.write(cache.kv_cache, meta.slot_mapping[:n], rows)
     table, tensors = meta.block_table_tensor, (q, index_q, index_w, positions)
-    for part in picks.segments(*_bounds(meta), q.device):
+    for part in meta.segments:
         at = part.tokens
         q_, iq, iw, pos = (t[at] for t in tensors)
         out, (kept, valid) = _segments(cache)(
@@ -284,7 +335,7 @@ def picked_attention(
     output[n:].zero_()
     picks.write(cache.kv_cache, meta.slot_mapping[:n], torch.cat([k, v], -1)[:n])
     table = meta.block_table_tensor
-    for part in picks.segments(*_bounds(meta), q.device):
+    for part in meta.segments:
         at = part.tokens
         picked = (picked_keys[at], picked_valid[at])
         attend = kernels.attend_picked if _kernels(cache) else picks.attend_picked
@@ -318,16 +369,6 @@ def _metadata() -> dict | None:
     if isinstance(metas, list):
         metas = metas[0]
     return metas if isinstance(metas, dict) else None
-
-
-def _bounds(meta: CommonAttentionMetadata) -> tuple[list[int], list[int]]:
-    """The requests' first queries and the end, and the most keys of each, on the
-    CPU."""
-    upper = meta.seq_lens_cpu_upper_bound
-    if upper is None:
-        upper = meta.seq_lens.cpu()
-    reqs = meta.num_reqs
-    return meta.query_start_loc_cpu[: reqs + 1].tolist(), upper[:reqs].tolist()
 
 
 def _fake(
