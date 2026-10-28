@@ -87,6 +87,18 @@ SPARSE_LATENT = (
     " top_k=12))\n"
 )
 
+#: Hymba's blocks: attention without a window (F) and with one, which writes its
+#: keys and values to the tap kv (W), reads them (S) or takes them off (R); and one
+#: without a window that writes them (G).
+SHARING = (
+    "local = gqa(num_heads=4, num_kv_heads=2, sliding_window_size=8, rope=rope())\n"
+    "full = local(sliding_window_size=none)\n"
+    + FFN
+    + "layer(attn) = [rmsnorm attn] [rmsnorm ffn]\n"
+    "F = layer(full)\nW = layer(local(kv=@kv))\nS = layer(local(kv=$kv))\n"
+    "R = layer(local(kv=$kv!))\nG = layer(full(kv=@kv))\n"
+)
+
 #: The cases, by name: a model each, as bux source.
 CASES = {
     "llama": LLAMA + "model = embed block^2 rmsnorm head",
@@ -187,6 +199,16 @@ CASES = {
     " load_balancing=aux_free, expert=dense)\n"
     + MOE_BLOCK
     + "model = embed block^2 rmsnorm head",
+    # Muse Spark's routed experts: each one's output normalized, in a latent.
+    "moe-norm": HEAD
+    + ATTN
+    + EXPERT
+    + "experts = moe(num_experts=8, top_k=2, num_shared_experts=1, router=sigmoid,"
+    " routed_scaling_factor=2.5, load_balancing=aux_free, latent_size=32,"
+    " latent_input_norm=rmsnorm, expert_norm=rmsnorm(eps=1e-8, zero_centered=true,"
+    " scale_input=true), expert=dense)\n"
+    + MOE_BLOCK
+    + "model = embed block^2 rmsnorm head",
     "engram": LLAMA
     + "memory = engram(head_dim=8, table_size=12288)\n"
     + "model = embed block memory block rmsnorm head(tied=true)",
@@ -236,6 +258,9 @@ CASES = {
     + "one = attn(value_residual=convex)\n"
     + "model = embed [rmsnorm attn(v=@v1)] [rmsnorm ffn] [rmsnorm attn(v=$v1)]"
     " [rmsnorm both(v=$v1)] [rmsnorm ffn] [rmsnorm one(v=$v1!)] rmsnorm head",
+    # Hymba's cross-layer KV sharing: a windowed layer's keys and values read by
+    # the next one or two, then a full layer's by one with a window of its own.
+    "kv-share": HEAD + SHARING + "model = embed F W S R W R G R rmsnorm head",
     "mla": HEAD + LATENT + FFN + BLOCK + "model = embed block^2 rmsnorm head",
     "mla-moe": HEAD
     + LATENT
@@ -270,6 +295,21 @@ CASES = {
     " gated=true, indexer=indexer(num_heads=2, head_dim=16, top_k=8))\n"
     + "model = embed [rmsnorm attn(v=@v1)] [rmsnorm ffn] [rmsnorm attn(v=$v1!)]"
     " [rmsnorm ffn] rmsnorm head",
+    # Shared picks, as GLM-5.3's: one layer's indexer picks the keys the next two
+    # attend over, the last with a window of its own.
+    "dsa-share": HEAD + FFN + "attn = gqa(num_heads=4, num_kv_heads=2, rope=rope(),"
+    " indexer=indexer(num_heads=2, head_dim=16, top_k=8))\n"
+    + "model = embed [rmsnorm attn(index=@topk)] [rmsnorm ffn] [rmsnorm attn(index=$topk)]"
+    " [rmsnorm ffn] [rmsnorm attn(sliding_window_size=16, index=$topk!)] [rmsnorm ffn]"
+    " rmsnorm head",
+    # MSA's picks, of blocks and per kv head's group, shared likewise.
+    "msa-share": HEAD
+    + FFN
+    + "attn = gqa(num_heads=4, num_kv_heads=2, rope=rope(), indexer=indexer("
+    "num_heads=2, head_dim=16, top_k=16, block_size=4, pool=max, per_group=true,"
+    " relu=false, weighted=false, norm=rmsnorm))\n"
+    + "model = embed [rmsnorm attn(index=@topk)] [rmsnorm ffn]"
+    " [rmsnorm attn(index=$topk!)] [rmsnorm ffn] rmsnorm head",
     "msa": HEAD
     + FFN
     + "attn = gqa(num_heads=4, num_kv_heads=2, rope=rope(), indexer=indexer("

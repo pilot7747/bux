@@ -8,7 +8,9 @@ allocates their blocks as for full attention, so they grow with the sequence and
 serve prefix caching. The plugin writes and reads them itself, in one op,
 ``vllm::bux_sparse_attention``, which runs eagerly: vLLM splits its CUDA graphs
 around it (`split_graphs`), as around attention, and captures no whole-step graph
-of a model with one (`PagedMetadataBuilder`).
+of a model with one (`PagedMetadataBuilder`). The op also gives the keys each query
+picked, which a layer that reads them through its ``index`` port attends over with
+``vllm::bux_picked_attention``, keeping no indexer keys of its own.
 """
 
 from __future__ import annotations
@@ -29,8 +31,8 @@ from vllm.v1.kv_cache_interface import FullAttentionSpec
 
 from . import picks
 
-#: The op, as vLLM's compilation names it.
-OP = "vllm::bux_sparse_attention"
+#: The ops, as vLLM's compilation names them.
+OPS = ("vllm::bux_sparse_attention", "vllm::bux_picked_attention")
 
 
 class PagedMetadataBuilder(AttentionMetadataBuilder[CommonAttentionMetadata]):
@@ -128,11 +130,11 @@ class PagedCache(nn.Module, AttentionLayerBase):
 
 
 def split_graphs(vllm_config: Any) -> None:
-    """Have vLLM split its compiled graphs at the op, as at attention, where it
+    """Have vLLM split its compiled graphs at the ops, as at attention, where it
     splits them at all."""
     ops = vllm_config.compilation_config.splitting_ops
-    if ops and OP not in ops:
-        ops.append(OP)
+    if ops:
+        ops.extend(op for op in OPS if op not in ops)
 
 
 def sparse_attention(
@@ -144,19 +146,21 @@ def sparse_attention(
     index_k: torch.Tensor,
     positions: torch.Tensor,
     output: torch.Tensor,
+    picked_keys: torch.Tensor,
+    picked_valid: torch.Tensor,
     layer_name: str,
 ) -> None:
     """The op: write the step's keys and values, (T, g, dk) and (T, g, dv), and its
     indexer keys, (T, i), into the caches of the call `layer_name`, then write each
-    query's attention over the keys it picks into `output`, (T, h, dv); zeros in
-    vLLM's profiling run, which has no metadata."""
-    context = get_forward_context()
-    metas = context.attn_metadata
-    if isinstance(metas, list):
-        metas = metas[0]
-    if not isinstance(metas, dict) or layer_name not in metas:
+    query's attention over the keys it picks into `output`, (T, h, dv), and its
+    picks into `picked_keys` and `picked_valid`, (T, [G,] K), unless they are
+    empty; zeros in vLLM's profiling run, which has no metadata."""
+    metas = _metadata()
+    picked_valid.zero_()
+    if metas is None or layer_name not in metas:
         output.zero_()
         return
+    context = get_forward_context()
     cache = context.no_compile_layers[layer_name]
     index = context.no_compile_layers[cache.index_name]
     meta, index_meta = metas[layer_name], metas[cache.index_name]
@@ -171,10 +175,60 @@ def sparse_attention(
         rows = (tables[0][part.requests], tables[1][part.requests])
         at = part.tokens
         q_, iq, iw, pos = (t[at] for t in tensors)
-        out = picks.attend_segment(
+        out, (kept, valid) = picks.attend_segment(
             cache.sparse, q_, (iq, iw), pos, caches, rows, part.keys
         )
         output[at] = out.to(output.dtype)
+        if picked_keys.numel():
+            picked_keys[at], picked_valid[at] = kept, valid
+
+
+def picked_attention(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    picked_keys: torch.Tensor,
+    picked_valid: torch.Tensor,
+    positions: torch.Tensor,
+    output: torch.Tensor,
+    layer_name: str,
+) -> None:
+    """The op of a call that reads its ``index`` port: write the step's keys and
+    values, (T, g, dk) and (T, g, dv), into the cache of the call `layer_name`, then
+    write each query's attention over the keys another call picked for it,
+    `picked_keys` and `picked_valid` (T, [G,] K), into `output`, (T, h, dv); zeros
+    in vLLM's profiling run, which has no metadata."""
+    metas = _metadata()
+    if metas is None or layer_name not in metas:
+        output.zero_()
+        return
+    cache = get_forward_context().no_compile_layers[layer_name]
+    meta = metas[layer_name]
+    n = meta.num_actual_tokens
+    output[n:].zero_()
+    picks.write(cache.kv_cache, meta.slot_mapping[:n], torch.cat([k, v], -1)[:n])
+    table = meta.block_table_tensor
+    for part in picks.segments(*_bounds(meta), q.device):
+        at = part.tokens
+        picked = (picked_keys[at], picked_valid[at])
+        out = picks.attend_picked(
+            cache.sparse,
+            q[at],
+            picked,
+            positions[at],
+            cache.kv_cache,
+            table[part.requests],
+            part.keys,
+        )
+        output[at] = out.to(output.dtype)
+
+
+def _metadata() -> dict | None:
+    """The step's attention metadata by layer name; None in vLLM's profiling run."""
+    metas = get_forward_context().attn_metadata
+    if isinstance(metas, list):
+        metas = metas[0]
+    return metas if isinstance(metas, dict) else None
 
 
 def _bounds(meta: CommonAttentionMetadata) -> tuple[list[int], list[int]]:
@@ -196,14 +250,35 @@ def _fake(
     index_k: torch.Tensor,
     positions: torch.Tensor,
     output: torch.Tensor,
+    picked_keys: torch.Tensor,
+    picked_valid: torch.Tensor,
     layer_name: str,
 ) -> None:
-    """The op as torch.compile traces it: it writes `output` alone."""
+    """The op as torch.compile traces it: it writes `output` and the picks alone."""
+
+
+def _fake_picked(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    picked_keys: torch.Tensor,
+    picked_valid: torch.Tensor,
+    positions: torch.Tensor,
+    output: torch.Tensor,
+    layer_name: str,
+) -> None:
+    """The reader's op as torch.compile traces it: it writes `output` alone."""
 
 
 direct_register_custom_op(
     op_name="bux_sparse_attention",
     op_func=sparse_attention,
-    mutates_args=["output"],
+    mutates_args=["output", "picked_keys", "picked_valid"],
     fake_impl=_fake,
+)
+direct_register_custom_op(
+    op_name="bux_picked_attention",
+    op_func=picked_attention,
+    mutates_args=["output"],
+    fake_impl=_fake_picked,
 )

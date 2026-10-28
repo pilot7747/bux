@@ -10,6 +10,8 @@ scaled.
 
 from __future__ import annotations
 
+from collections.abc import Callable
+
 import torch
 import torch.nn.functional as F
 from torch import nn
@@ -75,6 +77,53 @@ class Router(nn.Module):
             weights, sinks = weights / total, sinks / total
         scale = self.c["routed_scaling_factor"]
         return weights * scale, idx, sinks * scale
+
+
+def pick_rows(
+    hidden_states: torch.Tensor,
+    gating_output: torch.Tensor,
+    topk: int,
+    renormalize: bool,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """vLLM's custom routing of rows that each name one expert by one-hot logits
+    (`apart`): that expert, weighted 1."""
+    ids = gating_output.argmax(-1, keepdim=True)
+    return torch.ones(ids.shape, dtype=torch.float32, device=ids.device), ids
+
+
+def apart(
+    experts: Callable[[torch.Tensor, torch.Tensor], torch.Tensor],
+    norm: Callable[[torch.Tensor], torch.Tensor],
+    z: torch.Tensor,
+    weights: torch.Tensor,
+    idx: torch.Tensor,
+    num_experts: int,
+) -> torch.Tensor:
+    """The routed experts' output where each expert's is normalized before the
+    router weighs it (``expert_norm``), which a fused MoE's sum over a token's
+    picks leaves no room for: each pick is a row of its own, which `experts` runs
+    through its one expert and returns whole, then `norm`, the weights and their
+    sum.
+
+    Args:
+        experts: vLLM's fused MoE of one pick a row, routed by `pick_rows`, called
+            as ``experts(rows, logits)``: under tensor parallelism it sums each
+            row's output over the ranks, as the norm needs it.
+        norm: The expert norm.
+        z: The tokens, (T, d).
+        weights: The router's weights of each token's picks, (T, k).
+        idx: The picks, (T, k).
+        num_experts: The routed experts, the one-hot logits' width.
+
+    Returns:
+        Each token's weighted sum of its experts' normalized outputs, (T, d), in
+        z's dtype, summed in float32.
+    """
+    k = idx.shape[-1]
+    rows = z.repeat_interleave(k, 0)
+    logits = F.one_hot(idx.reshape(-1).long(), num_experts).float()
+    y = norm(experts(rows, logits)).float().view(-1, k, z.shape[-1])
+    return (y * weights[..., None].float()).sum(1).to(z.dtype)
 
 
 def expert_shards(
