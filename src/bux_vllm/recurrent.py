@@ -1,7 +1,9 @@
 """What the plugin's own recurrent layers share (``kda``, ``gdn2``, ``rwkv7``): a
 vLLM layer per call, its state in vLLM's Mamba cache as Gated DeltaNet's is (the
-conv's last inputs, and a (dv, dk) state per value head), its steps that read or
-write the state run outside the compiled graph, and bux's low-rank projections.
+conv's last inputs, and a state per value head), its steps that read or write the
+state run outside the compiled graph, and bux's low-rank projections. The delta rule
+runs on fla's kernels where they are installed (`bux_vllm.dplr`), else in PyTorch
+(`bux_vllm.delta`).
 
 A step is one op, ``vllm::bux_mix`` (`MIX`), which calls a method of the layer by
 name (`Recurrent.convolve`, `Recurrent.recur` or a layer's own) on the batch's tokens:
@@ -31,7 +33,7 @@ from vllm.model_executor.layers.mamba.ops.causal_conv1d import (
 from vllm.utils.torch_utils import direct_register_custom_op
 from vllm.v1.attention.backends.registry import MambaAttentionBackendEnum
 
-from . import delta
+from . import delta, dplr
 from .common import ACTIVATIONS, sharded_loader
 from .linear import conv_channels, conv_shard
 
@@ -212,7 +214,7 @@ class Recurrent(nn.Module, MambaBase):
         steps = m.num_decodes
         outs, afters = [], []
         if steps:
-            o, after = delta.step(*(x[:steps] for x in xs), before[:steps])
+            o, after = self.steps([x[:steps] for x in xs], before[:steps])
             outs.append(o)
             afters.append(after)
         if m.num_prefills:
@@ -230,13 +232,27 @@ class Recurrent(nn.Module, MambaBase):
         state = self.kv_cache[1]
         return state.view(*state.shape[:2], state.shape[3], state.shape[2])
 
+    def steps(
+        self, xs: list[torch.Tensor], before: torch.Tensor
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """A step of each decoding sequence, by fla's recurrent kernel where it runs
+        (`bux_vllm.dplr`), else in PyTorch; the outputs and new states."""
+        dtype = self.model_config.dtype
+        if dplr.runs(dtype):
+            return dplr.step(xs, before, dtype)
+        return delta.step(*xs, before)
+
     def prompts(
         self, m: Any, xs: list[torch.Tensor], before: torch.Tensor
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        """The rule over the batch's prompts, after its decoding sequences: by
-        chunks, each padded to the longest; their outputs and last states."""
+        """The rule over the batch's prompts, after its decoding sequences, by
+        chunks: by fla's kernel where it runs (`bux_vllm.dplr`), else in PyTorch,
+        each prompt padded to the longest; their outputs and last states."""
         starts = m.non_spec_query_start_loc[m.num_decodes :].long()
         starts = starts[: before.shape[0] + 1] - starts[0]
+        dtype = self.model_config.dtype
+        if dplr.runs(dtype):
+            return dplr.prompts(xs, starts, before, dtype, self.floor)
         longest = int((starts[1:] - starts[:-1]).max())
         ys = [delta.padded(x, starts, longest) for x in xs]
         o, after = delta.rank_one(*ys, before, floor=self.floor)

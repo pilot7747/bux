@@ -5,7 +5,6 @@ token before, which the token shift reads, as a conv state of one position, and
 each value head's (dv, dk) state.
 """
 
-import math
 from typing import Any
 
 import torch
@@ -56,7 +55,7 @@ class Mixer(Recurrent):
     """
 
     what = "rwkv7"
-    floor = math.exp(-0.5)  # log w = -exp(-0.5) sigmoid(.)
+    floor = 0.61  # log w = -exp(-0.5) sigmoid(.), above -0.61 rounded to bfloat16
 
     def __init__(self, c: dict, width: int, vllm_config: Any, prefix: str, ports: list):
         if c["conv_size"] is not None:
