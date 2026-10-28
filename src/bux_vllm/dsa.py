@@ -188,31 +188,33 @@ class Region:
 class Raw:
     """QSA's indexer keys as projected, in a call's cache, ``[blocks, heads,
     block_size, C]``, in its head slots from `first` on (together within a block):
-    a block's ``block_size`` keys of `dims` in bfloat16.
+    a block's ``block_size`` keys of `dims` in `dtype`, the model's.
 
     Attributes:
         cache: The call's cache.
         first: Its first slot of keys.
         dims: The keys' dims.
+        dtype: Their dtype.
     """
 
     cache: torch.Tensor
     first: int
     dims: int
+    dtype: torch.dtype = torch.bfloat16
 
     @property
     def keys(self) -> torch.Tensor:
         """The keys, (blocks, block_size, dims); a view, or an error."""
-        c = self.cache.shape[3] * self.cache.dtype.itemsize
-        part = self.cache[:, self.first : self.first + raw_slots(self.dims, c)]
+        c, size = self.cache.shape[3] * self.cache.dtype.itemsize, self.dtype.itemsize
+        part = self.cache[:, self.first : self.first + raw_slots(self.dims, c, size)]
         raw = part.view(torch.uint8)
-        raw = raw.view(raw.shape[0], -1)[:, : self.cache.shape[2] * self.dims * 2]
-        return raw.view(torch.bfloat16).unflatten(1, (self.cache.shape[2], self.dims))
+        raw = raw.view(raw.shape[0], -1)[:, : self.cache.shape[2] * self.dims * size]
+        return raw.view(self.dtype).unflatten(1, (self.cache.shape[2], self.dims))
 
     def write(self, slots: torch.Tensor, keys: torch.Tensor) -> None:
         """Write the tokens' keys, (T, dims), at vLLM's `slots`, (T,)."""
         slots, size = slots.clamp(min=0), self.cache.shape[2]
-        self.keys[slots // size, slots % size] = keys.to(torch.bfloat16)
+        self.keys[slots // size, slots % size] = keys.to(self.dtype)
 
     def at(self, rows: torch.Tensor, positions: torch.Tensor) -> torch.Tensor:
         """The keys at `positions`, (T, S), of the requests whose block tables are
@@ -222,9 +224,10 @@ class Raw:
         return self.keys[block, positions % size].float()
 
 
-def raw_slots(dims: int, channels_bytes: int) -> int:
-    """The head slots of `channels_bytes` a token that a `Raw` of `dims` takes."""
-    return -(-(2 * dims) // channels_bytes)
+def raw_slots(dims: int, channels_bytes: int, itemsize: int = 2) -> int:
+    """The head slots of `channels_bytes` a token that a `Raw` of `dims` of
+    `itemsize` bytes takes."""
+    return -(-(itemsize * dims) // channels_bytes)
 
 
 def pooled(

@@ -293,7 +293,8 @@ class PagedCache(nn.Module, AttentionLayerBase):
         self.blocked = blocked
         self.share = 0 if native or blocked else -(-index_dims // heads)
         size, raw = self.dtype.itemsize, (native and sparse.mean) or blocked
-        self.raw_slots = dsa.raw_slots(index_dims, channels * size) if raw else 0
+        item = self.model_dtype.itemsize
+        self.raw_slots = dsa.raw_slots(index_dims, channels * size, item) if raw else 0
         keys = dsa.slots(index_dims, channels, size) if native else 0
         self.slots = self.raw_slots + keys
         self.scales = (1.0, 1.0)  # an FP8 cache's keys' and values' scales
@@ -349,7 +350,7 @@ class PagedCache(nn.Module, AttentionLayerBase):
     def raw(self) -> dsa.Raw:
         """QSA's indexer keys as projected, where vLLM's DSA kernels pick; MSA's
         index keys, where its kernels do."""
-        return dsa.Raw(self.kv_cache, self.heads, self.index_dims)
+        return dsa.Raw(self.kv_cache, self.heads, self.index_dims, self.model_dtype)
 
     def write(self, slots: torch.Tensor, rows: torch.Tensor) -> None:
         """Write the tokens' keys and values, (T, heads, channels), at vLLM's

@@ -760,25 +760,30 @@ def _dense(rows: list[dict], vocab: int) -> np.ndarray:
 
 def fp8_indexer() -> None:
     """Have bux's indexer score as vLLM's DSA kernels do (``compare
-    --fp8-indexer``, for the cases they run): each query head and each key rounded
-    to FP8 e4m3 at a scale of its largest magnitude over 448, as DeepSeek-V3.2's
-    indexer quantizes them (`bux_vllm.dsa`)."""
-    import torch
+    --fp8-indexer``, for the cases they run): each query head and each key it
+    ranks by (QSA's pooled block keys among them) rounded to FP8 e4m3 at a scale of
+    its largest magnitude over 448, as DeepSeek-V3.2's indexer quantizes them
+    (`bux_vllm.dsa`)."""
+    import jax.numpy as jnp
 
-    from bux.export.hf import sparse
+    from bux.architecture.attention import indexer
 
-    scores = sparse.Indexer._scores
+    queries, ranking = indexer.Indexer._queries, indexer.Indexer._ranking
 
-    def rounded(x: torch.Tensor) -> torch.Tensor:
-        scale = x.abs().amax(-1, keepdim=True).clamp(min=1e-4) / 448
-        return (x / scale).to(torch.float8_e4m3fn).to(x.dtype) * scale
+    def rounded(x: Any) -> Any:
+        scale = jnp.maximum(jnp.abs(x).max(-1, keepdims=True), 1e-4) / 448
+        return (x / scale).astype(jnp.float8_e4m3fn).astype(x.dtype) * scale
 
-    def in_fp8(
-        self: Any, q: torch.Tensor, w: torch.Tensor, keys: torch.Tensor
-    ) -> torch.Tensor:
-        return scores(self, rounded(q), w, rounded(keys))
+    def fp8_queries(self: Any, query: Any, pos: Any) -> Any:
+        return rounded(queries(self, query, pos))
 
-    sparse.Indexer._scores = in_fp8
+    def fp8_ranking(
+        self: Any, x: Any, query: Any, pos: Any, keys: Any, end: Any
+    ) -> Any:
+        return ranking(self, x, query, pos, rounded(keys), end)
+
+    indexer.Indexer._queries = fp8_queries
+    indexer.Indexer._ranking = fp8_ranking
 
 
 def compare(name: str, args: argparse.Namespace) -> bool:

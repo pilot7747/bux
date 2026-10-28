@@ -514,7 +514,7 @@ latent, which doubles the layer's cache.
   score theirs in place, by its paged MQA logits. Queries are FP8 too, with a scale
   for each head that joins the head's weight; heads are padded to a count DeepGEMM
   takes (4 or more, a power of two, on SM 10.x), with weights of 0.
-- **QSA's blocks.** Its keys as projected are cached in bfloat16, in slots of their
+- **QSA's blocks.** Its keys as projected are cached in the model's dtype, in slots of their
   own. The token that completes a block writes the block's key, the mean of its
   keys normalized and rotated to its first position, as bux pools it, into the FP8
   keys at the position of the block's index, so the kernels score a request's
