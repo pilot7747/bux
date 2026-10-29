@@ -10,10 +10,14 @@ to the request's tokens before it and a sink (`pointed`), and `mixed` turns the
 head's logits into the log of the mixture, which vLLM then samples:
 
     p(y) = p_lm(y) (1 - a (1 - a_sink)) + a p_copy(y)
+
+For prompt logprobs vLLM asks for the logits of rows of a prompt too, after the
+sampled rows' (`Prompts`): the pointer then attends from each of them (`prompted`).
 """
 
 from __future__ import annotations
 
+from bisect import bisect_right
 from dataclasses import dataclass
 
 import torch
@@ -174,6 +178,100 @@ def pointed(
     copy = torch.zeros(r, vocab, dtype=torch.float32, device=q.device)
     copy.scatter_add_(-1, tokens.clamp(0, vocab - 1), every[:, :-1])
     return copy, every[:, -1]
+
+
+#: The most scores or probabilities of a chunk of prompt rows (`prompted`).
+CHUNK = 2**24
+
+
+@dataclass(frozen=True)
+class Rows:
+    """Where a tensor's rows lie in memory: what tells the head's input, of which
+    vLLM's prompt logprobs take slices, from the rows it gathers to sample, which
+    lie elsewhere (in ``inference_mode`` a slice keeps no ``_base``).
+
+    Attributes:
+        start: The address of its first row.
+        rows: Its rows.
+        row_bytes: The bytes from a row to the next.
+    """
+
+    start: int
+    rows: int
+    row_bytes: int
+
+    @classmethod
+    def of(cls, x: torch.Tensor) -> Rows:
+        """Where `x`'s rows lie."""
+        return cls(x.data_ptr(), x.shape[0], x.stride(0) * x.element_size())
+
+    def at(self, rows: torch.Tensor) -> int | None:
+        """The row at which `rows` start, if they are some of these rows; None
+        for any other tensor."""
+        if rows.stride(0) * rows.element_size() != self.row_bytes:
+            return None
+        at, rest = divmod(rows.data_ptr() - self.start, self.row_bytes)
+        return at if not rest and 0 <= at <= self.rows - rows.shape[0] else None
+
+
+@dataclass
+class Prompts:
+    """A step the op ran on the host, which a CUDA graph's replay does not, as the
+    head's logits find its prompt rows: vLLM asks for the sampled rows' logits
+    first, then for those of slices of the head's input, for prompt logprobs.
+
+    Attributes:
+        rows: Where the step's head input lay.
+        steps: The step's metadata.
+        sampled: The calls for sampled rows since the op ran; a step's prompt rows
+            come after its first.
+    """
+
+    rows: Rows
+    steps: Steps
+    sampled: int = 0
+
+
+def prompted(
+    q: torch.Tensor,
+    sink: torch.Tensor,
+    cache: torch.Tensor,
+    steps: Steps,
+    first: int,
+    vocab: int,
+    fp8: torch.dtype | None,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """The pointer's p_copy, (n, vocab), and a_sink, (n,), at the step's tokens
+    `first`, ..., `first` + n - 1, of queries `q`, (n, c), and sinks `sink`, (n,):
+    each attends to its request's tokens before it, the step's and those of its
+    earlier steps or cached prefix, in float32, `CHUNK` scores at a time. It reads
+    the step's lengths on the host: vLLM asks for prompt rows outside its graphs.
+    Rows past the step's requests, padding, point at nothing."""
+    n, dim = q.shape
+    ends = steps.query_start_loc[1:].tolist()
+    lens = steps.seq_lens.tolist()
+    p_copy = torch.zeros(n, vocab, dtype=torch.float32, device=q.device)
+    a_sink = torch.ones(n, dtype=torch.float32, device=q.device)
+    i = 0
+    while i < n and (r := bisect_right(ends, first + i)) < len(ends):
+        stop = min(n, ends[r] - first)  # the request's rows among these
+        start = lens[r] - (ends[r] - first - i)  # row i's position
+        table = steps.block_table_tensor[r : r + 1]
+        length = max(start + stop - i - 1, 1)  # the keys before its last row
+        keys, tokens = decode(gathered(cache, table, length), dim, fp8)
+        keys, tokens = keys[0], tokens[0].clamp(0, vocab - 1)
+        chunk = max(1, CHUNK // max(length, vocab))
+        for a in range(i, stop, chunk):
+            b = min(stop, a + chunk)
+            at = torch.arange(start + a - i, start + b - i, device=q.device)
+            scores = q[a:b].float() @ keys.T * dim**-0.5
+            seen = torch.arange(length, device=q.device) < at[:, None]
+            scores = scores.masked_fill(~seen, -torch.inf)
+            every = torch.cat([scores, sink[a:b].float()[:, None]], -1).softmax(-1)
+            p_copy[a:b].scatter_add_(-1, tokens.expand(b - a, -1), every[:, :-1])
+            a_sink[a:b] = every[:, -1]
+        i = stop
+    return p_copy, a_sink
 
 
 def rows_of(

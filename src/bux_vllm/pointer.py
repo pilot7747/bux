@@ -107,6 +107,8 @@ class PointerCache(nn.Module, AttentionLayerBase):
         self.longest = vllm_config.model_config.max_model_len  # positions a query sees
         self.dtype, self.fp8 = sparse.cache_dtype(vllm_config, "a copy pointer", True)
         self.kv_cache = torch.tensor([])
+        self.stash: copying.Prompts | None = None  # the last step run on the host
+        self.graphed: list[copying.Rows] = []  # the head inputs of full graphs
         ops = vllm_config.compilation_config.splitting_ops
         if ops and OP not in ops:  # split the graphs at it, as at attention
             ops.append(OP)
@@ -136,6 +138,7 @@ class PointerCache(nn.Module, AttentionLayerBase):
 
 
 def copy_pointer(
+    x: torch.Tensor,
     q: torch.Tensor,
     k: torch.Tensor,
     tokens: torch.Tensor,
@@ -147,12 +150,19 @@ def copy_pointer(
     """The op: write the step's keys, (T, c), and `tokens`, (T,), into the cache of
     `layer_name`, then each request's p_copy and a_sink, for its last token of the
     step, into the first rows of `p_copy`, (R_max, vocab), and `a_sink`, (R_max,);
-    nothing in vLLM's profiling run, which has no metadata."""
+    nothing in vLLM's profiling run, which has no metadata. It keeps where the
+    head's input `x` lies, for the logits of prompt rows (`bux_vllm.copying.Prompts`).
+    """
     metas = sparse._metadata()
     if metas is None or layer_name not in metas:
         return
     cache = get_forward_context().no_compile_layers[layer_name]
     steps: copying.Steps = metas[layer_name]
+    if torch.cuda.is_current_stream_capturing():  # a full graph, replayed in place
+        if (rows := copying.Rows.of(x)) not in cache.graphed:
+            cache.graphed.append(rows)
+    else:
+        cache.stash = copying.Prompts(copying.Rows.of(x), steps)
     # Every request's, but past the buffers' rows, which vLLM's runs within
     # max_num_seqs never reach.
     requests = min(steps.requests, p_copy.shape[0])
@@ -297,6 +307,7 @@ def _pointer_kernel(
 
 
 def _fake(
+    x: torch.Tensor,
     q: torch.Tensor,
     k: torch.Tensor,
     tokens: torch.Tensor,

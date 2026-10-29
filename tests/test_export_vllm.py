@@ -3205,6 +3205,97 @@ def test_the_pointer_s_steps_replayed_as_a_graph_sample_bux_s_mixture() -> None:
         check_rows(point(graph, [(0, a), (1, b)]), (a, b))
 
 
+def test_slices_of_the_head_input_are_found_and_gathered_rows_are_not() -> None:
+    """vLLM runs in ``inference_mode``, where a slice keeps no ``_base``: the rows of
+    a prompt are told from the rows gathered to sample by where they lie."""
+    with torch.inference_mode():
+        x = torch.randn(10, 8)
+        rows = copying.Rows.of(x)
+        assert rows.at(x[:7][2:5]) == 2 and rows.at(x) == 0
+        assert rows.at(x[torch.tensor([1, 3])]) is None
+        assert rows.at(torch.randn(3, 8)) is None
+        assert rows.at(x[:, :4]) == 0  # rows of the same stride
+
+
+def test_prompt_rows_mix_as_bux_s_mixture_at_every_position(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """vLLM's prompt logprobs over two steps: a prompt and a first chunk of another,
+    then its second chunk over the keys the first wrote, and padding. Each slice of
+    the head's input, within a request or across two as vLLM's runners take them,
+    points at every position as bux's mixture does, a few rows at a time."""
+    from bux.architecture import copy as bux_copy
+
+    monkeypatch.setattr(copying, "CHUNK", 2 * 64)  # two rows a chunk
+    source = (
+        "d_model = 32\nvocab_size = 64\n"
+        "attn = gqa(num_heads=2, num_kv_heads=2, rope=rope())\n"
+        "model = embed [rmsnorm attn] rmsnorm head(pointer=copy_pointer(dim=24))"
+    )
+    model = check.perturbed(Model(compile(source), rngs=nnx.Rngs(0)), 1)
+    tokens = jax.random.randint(jax.random.key(2), (2, 10), 0, 6)
+    [head] = model.heads(tokens)
+    pointer = head.pointer
+    assert pointer is not None
+    want = np.asarray(bux_copy.log_probs(head))
+    q, k, sink = (
+        torch.from_numpy(np.array(a, np.float32))
+        for a in (pointer.query, pointer.key, pointer.sink)
+    )
+    logits = torch.from_numpy(np.array(head.projection(head.hidden), np.float32))
+    ids = torch.from_numpy(np.array(tokens))
+    size = 4
+    cache = torch.zeros(8, 1, size, copying.row_width(24))
+    table = torch.tensor([[5, 2, 7], [1, 6, 3]], dtype=torch.int32)
+
+    def step(at: list[tuple[int, int]], slices: list[slice]) -> None:
+        """Run the op on the step of the (request, position) `at` and a padded
+        token, then check the mixture of each slice of its rows."""
+        flat = [r * 10 + p for r, p in at]
+        last = {r: i for i, (r, _) in enumerate(at)}  # the step's requests, in order
+        ends = [i + 1 for i in last.values()]
+        lens = [at[i][1] + 1 for i in last.values()]
+        slots = [int(table[r, p // size]) * size + p % size for r, p in at]
+        steps = copying.Steps(
+            torch.tensor([*slots, -1]),
+            table[list(last)],
+            len(at),
+            torch.tensor([0, *ends], dtype=torch.int32),
+            torch.tensor(lens, dtype=torch.int32),
+        )
+        x = torch.zeros(len(at) + 1, 32)  # the head's input, padding last
+        stash = copying.Prompts(copying.Rows.of(x), steps)
+        rows = [q.reshape(20, -1)[flat], k.reshape(20, -1)[flat], ids.reshape(20)[flat]]
+        copying.stepped(cache, steps, *rows, sink.reshape(20)[flat], len(last), None)
+        for part in slices:
+            first = stash.rows.at(x[part])
+            assert first is not None and first == part.start
+            picked = [flat[i] for i in range(part.start, min(part.stop, len(at)))]
+            pad = part.stop - part.start - len(picked)
+            q_, sink_ = q.reshape(20, -1)[picked], sink.reshape(20)[picked]
+            q_ = torch.cat([q_, q_.new_zeros(pad, 24)])
+            sink_ = torch.cat([sink_, sink_.new_zeros(pad)])
+            p_copy, a_sink = copying.prompted(q_, sink_, cache, steps, first, 64, None)
+            assert torch.equal(p_copy[len(picked) :], p_copy.new_zeros(pad, 64))
+            got = copying.mixed(
+                logits.reshape(20, -1)[picked],
+                *(t[: len(picked)] for t in (p_copy, a_sink)),
+                63,
+            )
+            for row, i in zip(got.numpy(), range(part.start, part.start + len(got))):
+                r, p = at[i]
+                finite = np.isfinite(want[r, p])
+                assert (np.isfinite(row) == finite).all()
+                np.testing.assert_allclose(
+                    row[finite], want[r, p][finite], rtol=1e-5, atol=1e-5
+                )
+
+    first = [(0, p) for p in range(8)] + [(1, p) for p in range(5)]
+    step(first, [slice(0, 7), slice(8, 13), slice(0, 13), slice(5, 14)])
+    second = [(1, p) for p in range(5, 10)]  # its first five keys from the first
+    step(second, [slice(0, 5), slice(2, 6)])
+
+
 def test_rows_past_the_pointer_s_buffers_take_the_softmax_but_copy() -> None:
     """vLLM's dummy sampler run asks compute_logits for more rows than max_num_seqs:
     those rows mix no pointer, the head's softmax over every row but <copy>."""

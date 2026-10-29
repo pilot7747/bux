@@ -142,12 +142,12 @@ class Head(Layer):
 
     def logits(self, hidden: torch.Tensor) -> torch.Tensor | None:
         """The logits of `hidden`, the head's input, gathered over the ranks: with a
-        copy pointer, the log of its mixture, of the requests' rows the forward
-        pointed for, in order, as vLLM samples one a request."""
+        copy pointer, the log of its mixture (`Pointer.mixed`), of the rows vLLM
+        samples, one a request, or of a prompt's rows, for prompt logprobs."""
         logits = self.processor(self.lm_head, hidden, self.lm_head.bias)
         if self.pointer is None or logits is None:
             return logits
-        return self.pointer.mixed(logits)
+        return self.pointer.mixed(logits, hidden)
 
 
 class Pointer(Layer):
@@ -198,13 +198,36 @@ class Pointer(Layer):
         k = _rms_normed(self.k(x))
         sink = (q.float() @ self.sink.float()) * self.dim**-0.5
         torch.ops.vllm.bux_copy_pointer(
-            q, k, ctx.input_ids, sink, self.p_copy, self.a_sink, self.cache.prefix
+            x, q, k, ctx.input_ids, sink, self.p_copy, self.a_sink, self.cache.prefix
         )
 
-    def mixed(self, logits: torch.Tensor) -> torch.Tensor:
-        """The log of the mixture, of the head's `logits` of each request's row."""
-        p_copy, a_sink = copying.rows_of(self.p_copy, self.a_sink, logits.shape[0])
+    def mixed(self, logits: torch.Tensor, hidden: torch.Tensor) -> torch.Tensor:
+        """The log of the mixture, of the head's `logits` of its input `hidden`:
+        each request's sampled row, which the forward pointed for; or, for prompt
+        logprobs, rows of the step's head input, which it points for now
+        (`bux_vllm.copying.prompted`), or of a full graph's step, whose every token
+        is its request's last (`bux_vllm.copying.Prompts`)."""
+        stash, n = self.cache.stash, logits.shape[0]
+        fresh = stash is not None and stash.sampled == 1
+        if fresh and (first := stash.rows.at(hidden)) is not None:
+            q = _rms_normed(self.q(hidden)) * self.gain.to(hidden.dtype)
+            sink = (q.float() @ self.sink.float()) * self.dim**-0.5
+            rows, fp8 = self.cache.rows, self.cache.fp8
+            p_copy, a_sink = copying.prompted(
+                q, sink, rows, stash.steps, first, logits.shape[1], fp8
+            )
+        elif (at := _row_in(self.cache.graphed, hidden)) is not None:
+            p_copy, a_sink = copying.rows_of(self.p_copy[at:], self.a_sink[at:], n)
+        else:  # the rows vLLM samples, gathered
+            if stash is not None:
+                stash.sampled += 1
+            p_copy, a_sink = copying.rows_of(self.p_copy, self.a_sink, n)
         return copying.mixed(logits, p_copy, a_sink, self.copy).to(logits.dtype)
+
+
+def _row_in(graphs: list[copying.Rows], hidden: torch.Tensor) -> int | None:
+    """The row of a full graph's head input at which `hidden` starts, if any."""
+    return next((at for g in graphs if (at := g.at(hidden)) is not None), None)
 
 
 def _rms_normed(x: torch.Tensor) -> torch.Tensor:

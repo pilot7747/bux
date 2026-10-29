@@ -384,9 +384,12 @@ from its mixture, as bux's loss scores it
 - **The logits** that vLLM samples are the log of the mixture, the head's
   soft-capped logits mixed with the pointer's row, in float32; the `<copy>` row's
   are $-\infty$. The log-probabilities of the tokens vLLM samples are the
-  mixture's. A prompt's (`prompt_logprobs`) are not: the pointer points for each
-  request's sampled row alone. Rows past `max_num_seqs`, which vLLM's dummy runs
-  ask for, take the head's softmax over the vocabulary but `<copy>`.
+  mixture's, and so are a prompt's (`prompt_logprobs`): for those rows the head
+  points from each one to its request's tokens before it, the cached prefix's
+  among them, in PyTorch, a chunk of rows at a time. That costs a dense pointer
+  per row vLLM asks prompt logprobs of, outside CUDA graphs, in the steps of
+  requests that ask for them alone. Rows past `max_num_seqs`, which vLLM's dummy runs ask for, take the
+  head's softmax over the vocabulary but `<copy>`.
 - **Weights:** the pointer's projections stay in the model's dtype, whole on every
   rank, under FP8 weights too. Each rank computes the pointer.
 
@@ -861,8 +864,7 @@ attention and multi-stream attention residuals (`xsa`, `hyga`, `diff`, `msar`,
 their `-hybrid` cases, `value-embed`, `value-embed-shared`, `k-eq-v` and
 `k-eq-v-nope`) and of zero experts (`moe-zero`, `moe-zero-longcat`,
 `moe-zero-norm`) and of the document-local copy feature (`doc-copy`,
-`doc-copy-hybrid`) and of the copy pointer (`cplm`, `cplm-128`, over the rows vLLM
-samples) were measured the same way on 2026-10-29, and so were the sparse
+`doc-copy-hybrid`) and of the copy pointer (`cplm`, `cplm-128`) were measured the same way on 2026-10-29, and so were the sparse
 `gqa` and `mla` rows (all but `csa`'s), with each `gqa` indexer's projections in
 one GEMM.
 
@@ -920,8 +922,8 @@ parentheses is bux's own bfloat16 error, against the same reference:
 | `mla-deepseek` | MLA at DeepSeek-V3's dims (FlashInfer's), a query latent, interleaved YaRN, a gate per head, an output norm | - | 0.089 (0.14) | - |
 | `mla-dsa` | sparse MLA, DeepSeek-V3.2's: an indexer, a window, sinks and a softcap | 7.6e-6 | 2.6 (2.7) | - |
 | `mla-share` | sparse MLA, GLM-5.3's: picks shared through the `index` port | 8.6e-6 | 3.3 (2.8) | - |
-| `cplm` | a copy pointer on the head: its mixture, the pointer's keys and tokens in a paged cache of the head's own; the sampled rows alone | 7.1e-4 | 0.068 (0.076) | 0.082 |
-| `cplm-128` | the same pointer at its default width of 128 | 2.3e-4 | 0.068 (0.076) | 0.082 |
+| `cplm` | a copy pointer on the head: its mixture, the pointer's keys and tokens in a paged cache of the head's own, at the rows vLLM samples and the prompts' | - | - | - |
+| `cplm-128` | the same pointer at its default width of 128 | - | - | - |
 | `moe` | a softmax router, unnormalized top-2 of 8, a gated shared expert | 6.7e-6 | 0.68 (1.2) | - |
 | `moe-grouped` | a sigmoid router, 4 groups, the aux-free bias, a scaling of 2.5 | 8.6e-6 | 2.1 (3.8) | 1.8 |
 | `moe-relu2` | a `sqrtsoftplus` router, plain relu2 experts | 5.7e-6 | 1.8 (1.4) | - |
