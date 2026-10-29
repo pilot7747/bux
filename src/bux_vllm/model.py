@@ -102,8 +102,9 @@ def state_names(calls: list[Call]) -> dict[str, list[str]]:
     kind (`bux_vllm.config.states`)."""
     out: dict[str, list[str]] = {}
     for call in calls:
-        if _class(call).stateful:
-            kinds = states(call.layer["config"], ports(call.layer)) or ["state"]
+        kinds = states(call.layer["config"], ports(call.layer))
+        if _class(call).stateful or kinds:  # a head with a copy pointer
+            kinds = kinds or ["state"]
             names = out.setdefault(call.path, [])
             for i, kind in enumerate(kinds):
                 path = call.path if i == 0 else f"{call.path}.{kind}"
