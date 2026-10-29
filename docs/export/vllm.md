@@ -829,7 +829,8 @@ The rows of XSA, HyGA, value embeddings, values from the keys, differential
 attention and multi-stream attention residuals (`xsa`, `hyga`, `diff`, `msar`,
 their `-hybrid` cases, `value-embed`, `value-embed-shared`, `k-eq-v` and
 `k-eq-v-nope`) and of zero experts (`moe-zero`, `moe-zero-longcat`,
-`moe-zero-norm`) were measured the same way on 2026-10-29, and so were the sparse
+`moe-zero-norm`) and of the document-local copy feature (`doc-copy`,
+`doc-copy-hybrid`) were measured the same way on 2026-10-29, and so were the sparse
 `gqa` and `mla` rows (all but `csa`'s), with each `gqa` indexer's projections in
 one GEMM.
 
@@ -925,8 +926,8 @@ parentheses is bux's own bfloat16 error, against the same reference:
 | `gr` | `gr`'s residual algebra | 1.9e-6 | 0.018 (0.025) | - |
 | `vpgate` | `vpgate`'s residual algebra | 9.5e-6 | 0.072 (0.13) | - |
 | `engram` | Engram's memory between two blocks, a tied head | 1.4e-5 | 0.097 (0.11) | 0.074 |
-| `doc-copy` | the document-local copy feature at its two sites, over 16 tokens | - | - | - |
-| `doc-copy-hybrid` | the same on the hybrid's shape under `hc`, contexts of up to 3 tokens | - | - | - |
+| `doc-copy` | the document-local copy feature at its two sites, over 16 tokens | 4.3e-6 | 0.051 (0.056) | 0.046 |
+| `doc-copy-hybrid` | the same on the hybrid's shape under `hc`, contexts of up to 3 tokens | - | 0.13 (0.41) | 0.16 |
 
 Every float32 run decoded bux's greedy tokens exactly. In bfloat16 an MoE's and a
 sparse layer's errors are large, and so are bux's own: where two experts' or two
